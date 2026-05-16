@@ -1,0 +1,343 @@
+// =============================================================================
+// Gold Range Sweep Reversion Strategy
+// -----------------------------------------------------------------------------
+// 目的:
+//   XAUUSD のレンジ内で、レンジ端の Liquidity Sweep 後に戻る動きだけを狙う。
+//   - 上限 Sweep -> 戻り確認 -> SELL
+//   - 下限 Sweep -> 戻り確認 -> BUY
+//   - RR 1 : 0.5 (TP=10$, SL=20$) 固定で勝率重視。
+//
+// 注意:
+//   万能型ではありません。
+//   強トレンド中は逆張りしない / レンジ幅が狭い場合は入らない /
+//   中央まで 10$ ない場合は入らない / 障害物がない場所では入らない。
+// =============================================================================
+
+//@version=5
+strategy("Gold Range Sweep Reversion Strategy",
+     overlay              = true,
+     pyramiding           = 0,
+     calc_on_order_fills  = false,
+     calc_on_every_tick   = false,
+     process_orders_on_close = true,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     initial_capital      = 10000,
+     commission_type      = strategy.commission.cash_per_contract,
+     commission_value     = 0.0)
+
+// =============================================================================
+// 1) Inputs
+// =============================================================================
+grpRange   = "1) Range Detection"
+rangeLen          = input.int(40,   "Range Lookback (bars)",     minval=5,  group=grpRange)
+adxLen            = input.int(14,   "ADX Length",                minval=2,  group=grpRange)
+adxRangeMax       = input.float(20, "ADX Max for Range",         minval=1,  group=grpRange)
+atrLen            = input.int(14,   "ATR Length",                minval=2,  group=grpRange)
+atrMaLen          = input.int(100,  "ATR MA Length",             minval=2,  group=grpRange)
+rangeAtrMultMax   = input.float(3.0,"Range Width / ATR Max",     minval=0.1,step=0.1, group=grpRange)
+maFastLen         = input.int(20,   "MA Fast Len",               minval=1,  group=grpRange)
+maMidLen          = input.int(50,   "MA Mid Len",                minval=1,  group=grpRange)
+maSlowLen         = input.int(100,  "MA Slow Len",               minval=1,  group=grpRange)
+maCompressionMax  = input.float(8.0,"MA Compression Max ($)",    minval=0.1,step=0.1, group=grpRange)
+
+grpSweep   = "2) Sweep Conditions"
+sweepMin          = input.float(1.0, "Sweep Minimum Distance ($)", minval=0.0, step=0.1, group=grpSweep)
+wickRatioMin      = input.float(0.4, "Wick Ratio Minimum",         minval=0.0, maxval=1.0, step=0.05, group=grpSweep)
+
+grpObstacle = "3) Obstacle Filter"
+useObstacleFilter = input.bool(true,  "Use Obstacle Filter",      group=grpObstacle)
+obstacleMaxDist   = input.float(5.0,  "Obstacle Max Distance ($)",minval=0.1, step=0.1, group=grpObstacle)
+swingLen          = input.int(10,     "Swing Pivot Lookback",     minval=2, group=grpObstacle)
+
+grpWin     = "4) Win Zone / TP-SL"
+tpDollars         = input.float(10.0, "TP ($)", minval=0.1, step=0.1, group=grpWin)
+slDollars         = input.float(20.0, "SL ($)", minval=0.1, step=0.1, group=grpWin)
+
+grpTrend   = "5) Trend Filter"
+useTrendBlock     = input.bool(true,  "Block Counter-Trend Entries", group=grpTrend)
+trendAdxMax       = input.float(28.0, "Trend Block ADX",             minval=1.0, group=grpTrend)
+
+grpSession = "6) Session Filter (Asia/Tokyo time)"
+useTokyoSession   = input.bool(true,  "Tokyo  09:00-16:00",     group=grpSession)
+useLondonSession  = input.bool(true,  "London 16:00-21:00",     group=grpSession)
+useNYSession      = input.bool(false, "NY     22:00-02:00",     group=grpSession)
+manualNewsBlock   = input.bool(false, "Manual News Block (OFF=trade, ON=no trade)", group=grpSession)
+
+grpDisp    = "7) Display"
+showRange         = input.bool(true,  "Show Range Lines",       group=grpDisp)
+showBgRange       = input.bool(true,  "Color Background on Range",group=grpDisp)
+showSweepMarks    = input.bool(true,  "Show Sweep Marks",       group=grpDisp)
+showEntryLabels   = input.bool(true,  "Show Entry/SL/TP Labels",group=grpDisp)
+
+// =============================================================================
+// 2) Core Calculations (Range / ADX / ATR / MAs)
+// =============================================================================
+
+// --- Range high/low/mid -------------------------------------------------------
+rangeHigh  = ta.highest(high, rangeLen)
+rangeLow   = ta.lowest(low,   rangeLen)
+rangeWidth = rangeHigh - rangeLow
+rangeMid   = (rangeHigh + rangeLow) / 2.0
+
+// --- ATR ----------------------------------------------------------------------
+atrVal     = ta.atr(atrLen)
+atrMa      = ta.sma(atrVal, atrMaLen)
+
+// --- MAs (compression) --------------------------------------------------------
+maFast = ta.ema(close, maFastLen)
+maMid  = ta.ema(close, maMidLen)
+maSlow = ta.ema(close, maSlowLen)
+
+maMax = math.max(math.max(maFast, maMid), maSlow)
+maMin = math.min(math.min(maFast, maMid), maSlow)
+maCompression = maMax - maMin
+
+// --- ADX (manual, v5) ---------------------------------------------------------
+// Wilder's DMI + ADX
+upMove     = high - high[1]
+downMove   = low[1] - low
+plusDM     = (upMove > downMove and upMove > 0) ? upMove : 0.0
+minusDM    = (downMove > upMove and downMove > 0) ? downMove : 0.0
+trVal      = ta.tr(true)
+atrAdx     = ta.rma(trVal,   adxLen)
+plusDI     = 100.0 * ta.rma(plusDM,  adxLen) / (atrAdx == 0 ? 1.0 : atrAdx)
+minusDI    = 100.0 * ta.rma(minusDM, adxLen) / (atrAdx == 0 ? 1.0 : atrAdx)
+dx         = 100.0 * math.abs(plusDI - minusDI) / ((plusDI + minusDI) == 0 ? 1.0 : (plusDI + minusDI))
+adxVal     = ta.rma(dx, adxLen)
+
+// =============================================================================
+// 3) Range State
+// =============================================================================
+// レンジ判定:
+//   ADX <= adxRangeMax かつ
+//   rangeWidth <= ATR * rangeAtrMultMax かつ
+//   MA 収縮 <= maCompressionMax
+isRange = adxVal <= adxRangeMax
+       and rangeWidth <= atrVal * rangeAtrMultMax
+       and maCompression <= maCompressionMax
+
+// =============================================================================
+// 4) Sweep Detection
+// =============================================================================
+candleRange   = math.max(high - low, 0.0001)   // 0除算回避
+upperWickRatio = (high - math.max(open, close)) / candleRange
+lowerWickRatio = (math.min(open, close) - low) / candleRange
+
+// SELL Sweep: 高値がレンジ上限を上抜け / 終値はレンジ内に戻る / 上ヒゲ十分
+sweepHighOver  = high - rangeHigh
+sellSweep = (high > rangeHigh)
+         and (close < rangeHigh)
+         and (sweepHighOver >= sweepMin)
+         and (upperWickRatio >= wickRatioMin)
+
+// BUY Sweep: 安値がレンジ下限を下抜け / 終値はレンジ内に戻る / 下ヒゲ十分
+sweepLowUnder  = rangeLow - low
+buySweep = (low < rangeLow)
+        and (close > rangeLow)
+        and (sweepLowUnder >= sweepMin)
+        and (lowerWickRatio >= wickRatioMin)
+
+// =============================================================================
+// 5) Obstacle Filter
+//   - 前日 高/安、当日 高/安、直近スイング 高/安
+// =============================================================================
+// 前日高安 (lookahead_off で repaint 防止)
+prevDayHigh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_off)
+prevDayLow  = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_off)
+
+// 当日高安 (現在日)
+todayHigh = request.security(syminfo.tickerid, "D", high, lookahead = barmerge.lookahead_off)
+todayLow  = request.security(syminfo.tickerid, "D", low,  lookahead = barmerge.lookahead_off)
+
+// 直近スイング高安 (確定済みピボット)
+pivotHigh = ta.pivothigh(high, swingLen, swingLen)
+pivotLow  = ta.pivotlow(low,   swingLen, swingLen)
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+if not na(pivotHigh)
+    lastSwingHigh := pivotHigh
+if not na(pivotLow)
+    lastSwingLow  := pivotLow
+
+// SELL: 現在価格より上の障害物が obstacleMaxDist 以内にあるか
+f_obstacleAbove(_priceRef) =>
+    bool found = false
+    if not na(prevDayHigh)   and prevDayHigh   > _priceRef and (prevDayHigh   - _priceRef) <= obstacleMaxDist
+        found := true
+    if not na(todayHigh)     and todayHigh     > _priceRef and (todayHigh     - _priceRef) <= obstacleMaxDist
+        found := true
+    if not na(lastSwingHigh) and lastSwingHigh > _priceRef and (lastSwingHigh - _priceRef) <= obstacleMaxDist
+        found := true
+    found
+
+// BUY: 現在価格より下の障害物が obstacleMaxDist 以内にあるか
+f_obstacleBelow(_priceRef) =>
+    bool found = false
+    if not na(prevDayLow)   and prevDayLow   < _priceRef and (_priceRef - prevDayLow)   <= obstacleMaxDist
+        found := true
+    if not na(todayLow)     and todayLow     < _priceRef and (_priceRef - todayLow)     <= obstacleMaxDist
+        found := true
+    if not na(lastSwingLow) and lastSwingLow < _priceRef and (_priceRef - lastSwingLow) <= obstacleMaxDist
+        found := true
+    found
+
+obstacleOkSell = not useObstacleFilter or f_obstacleAbove(close)
+obstacleOkBuy  = not useObstacleFilter or f_obstacleBelow(close)
+
+// 障害物までの最短距離 (アラート用)
+f_nearestAboveDist(_p) =>
+    float d = na
+    if not na(prevDayHigh)   and prevDayHigh   > _p
+        d := na(d) ? prevDayHigh   - _p : math.min(d, prevDayHigh   - _p)
+    if not na(todayHigh)     and todayHigh     > _p
+        d := na(d) ? todayHigh     - _p : math.min(d, todayHigh     - _p)
+    if not na(lastSwingHigh) and lastSwingHigh > _p
+        d := na(d) ? lastSwingHigh - _p : math.min(d, lastSwingHigh - _p)
+    d
+
+f_nearestBelowDist(_p) =>
+    float d = na
+    if not na(prevDayLow)   and prevDayLow   < _p
+        d := na(d) ? _p - prevDayLow   : math.min(d, _p - prevDayLow)
+    if not na(todayLow)     and todayLow     < _p
+        d := na(d) ? _p - todayLow     : math.min(d, _p - todayLow)
+    if not na(lastSwingLow) and lastSwingLow < _p
+        d := na(d) ? _p - lastSwingLow : math.min(d, _p - lastSwingLow)
+    d
+
+// =============================================================================
+// 6) Win Zone (中央まで TP 分の余地があるか)
+// =============================================================================
+winZoneSell = (close - rangeMid) >= tpDollars
+winZoneBuy  = (rangeMid - close) >= tpDollars
+
+// =============================================================================
+// 7) Trend Filter (強トレンド中は逆張り禁止)
+// =============================================================================
+perfectUp   = maFast > maMid and maMid > maSlow
+perfectDown = maFast < maMid and maMid < maSlow
+
+trendBlockSell = useTrendBlock and perfectUp   and adxVal > trendAdxMax
+trendBlockBuy  = useTrendBlock and perfectDown and adxVal > trendAdxMax
+
+// =============================================================================
+// 8) Session Filter (Asia/Tokyo time)
+// =============================================================================
+// Tokyo 09:00-16:00 / London 16:00-21:00 / NY 22:00-02:00 (翌日跨ぎ)
+inTokyo  = not na(time(timeframe.period, "0900-1600", "Asia/Tokyo"))
+inLondon = not na(time(timeframe.period, "1600-2100", "Asia/Tokyo"))
+inNY     = not na(time(timeframe.period, "2200-0200", "Asia/Tokyo"))
+
+sessionOk =
+     (useTokyoSession  and inTokyo)  or
+     (useLondonSession and inLondon) or
+     (useNYSession     and inNY)
+
+// 何もONになっていない場合は常時許可にしない (明示OFFを尊重)
+noSessionSelected = not useTokyoSession and not useLondonSession and not useNYSession
+sessionFinal = noSessionSelected ? false : sessionOk
+
+newsOk = not manualNewsBlock
+
+// =============================================================================
+// 9) Entry Conditions
+// =============================================================================
+baseOk = barstate.isconfirmed and isRange and sessionFinal and newsOk
+
+sellEntry = baseOk
+         and sellSweep
+         and obstacleOkSell
+         and winZoneSell
+         and not trendBlockSell
+
+buyEntry  = baseOk
+         and buySweep
+         and obstacleOkBuy
+         and winZoneBuy
+         and not trendBlockBuy
+
+// =============================================================================
+// 10) Strategy Orders (TP=10$ / SL=20$  RR=1:0.5)
+// =============================================================================
+if sellEntry and strategy.position_size == 0
+    entryPrice = close
+    tpPrice    = entryPrice - tpDollars
+    slPrice    = entryPrice + slDollars
+    strategy.entry("SELL", strategy.short)
+    strategy.exit("Exit SELL", from_entry="SELL", limit=tpPrice, stop=slPrice)
+
+if buyEntry and strategy.position_size == 0
+    entryPrice = close
+    tpPrice    = entryPrice + tpDollars
+    slPrice    = entryPrice - slDollars
+    strategy.entry("BUY", strategy.long)
+    strategy.exit("Exit BUY", from_entry="BUY", limit=tpPrice, stop=slPrice)
+
+// =============================================================================
+// 11) Plot / Display
+// =============================================================================
+pRangeHigh = plot(showRange ? rangeHigh : na, "Range High",  color=color.new(color.red,   0), linewidth=1)
+pRangeLow  = plot(showRange ? rangeLow  : na, "Range Low",   color=color.new(color.green, 0), linewidth=1)
+plot(showRange ? rangeMid : na,                "Range Mid",  color=color.new(color.gray, 0),  style=plot.style_linebr)
+
+// レンジ背景色
+bgcolor(showBgRange and isRange ? color.new(color.yellow, 92) : na, title="Range BG")
+
+// Sweep マーク
+plotshape(showSweepMarks and sellSweep, title="SELL Sweep",
+     style=shape.triangledown, location=location.abovebar, color=color.new(color.red,   0), size=size.tiny)
+plotshape(showSweepMarks and buySweep,  title="BUY Sweep",
+     style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+
+// Entry ラベル & SL/TP 価格
+if showEntryLabels and sellEntry
+    label.new(bar_index, high,
+         text  = "SELL\nE=" + str.tostring(close, "#.##") +
+                 "\nSL=" + str.tostring(close + slDollars, "#.##") +
+                 "\nTP=" + str.tostring(close - tpDollars, "#.##"),
+         style = label.style_label_down,
+         color = color.new(color.red, 0),
+         textcolor = color.white,
+         size  = size.small)
+
+if showEntryLabels and buyEntry
+    label.new(bar_index, low,
+         text  = "BUY\nE=" + str.tostring(close, "#.##") +
+                 "\nSL=" + str.tostring(close - slDollars, "#.##") +
+                 "\nTP=" + str.tostring(close + tpDollars, "#.##"),
+         style = label.style_label_up,
+         color = color.new(color.green, 0),
+         textcolor = color.white,
+         size  = size.small)
+
+// =============================================================================
+// 12) Alerts
+// =============================================================================
+obsDistSell = f_nearestAboveDist(close)
+obsDistBuy  = f_nearestBelowDist(close)
+
+alertcondition(sellEntry, title="SELL Sweep Entry",
+     message="SELL Sweep | E={{close}} SL=+20$ TP=-10$ RangeWidth Check ADX/Obstacle in chart")
+alertcondition(buyEntry,  title="BUY Sweep Entry",
+     message="BUY Sweep | E={{close}} SL=-20$ TP=+10$ RangeWidth Check ADX/Obstacle in chart")
+
+if sellEntry
+    alert("SELL Sweep | Dir=SELL"
+         + " E="  + str.tostring(close, "#.##")
+         + " SL=" + str.tostring(close + slDollars, "#.##")
+         + " TP=" + str.tostring(close - tpDollars, "#.##")
+         + " RW=" + str.tostring(rangeWidth, "#.##")
+         + " ADX="+ str.tostring(adxVal,    "#.##")
+         + " ObsDist=" + (na(obsDistSell) ? "NA" : str.tostring(obsDistSell, "#.##")),
+         alert.freq_once_per_bar_close)
+
+if buyEntry
+    alert("BUY Sweep | Dir=BUY"
+         + " E="  + str.tostring(close, "#.##")
+         + " SL=" + str.tostring(close - slDollars, "#.##")
+         + " TP=" + str.tostring(close + tpDollars, "#.##")
+         + " RW=" + str.tostring(rangeWidth, "#.##")
+         + " ADX="+ str.tostring(adxVal,    "#.##")
+         + " ObsDist=" + (na(obsDistBuy) ? "NA" : str.tostring(obsDistBuy, "#.##")),
+         alert.freq_once_per_bar_close)
