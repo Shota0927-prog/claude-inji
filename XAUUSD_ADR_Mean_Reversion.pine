@@ -1,0 +1,309 @@
+//@version=5
+// =============================================================================
+// XAUUSD ADR Mean Reversion Strategy
+// -----------------------------------------------------------------------------
+// 基本思想：
+//   XAUUSD で当日値幅が ADR に対して伸びすぎた場面を狙う平均回帰戦略。
+//   上方向に伸びすぎ → SELL / 下方向に伸びすぎ → BUY。
+//
+// 使用 Core（必要最低限）：
+//   1. ADR        2. 当日高値/安値   3. ADR到達率   4. 反転確認ローソク
+//   5. ATR比率SL  6. 可変TP          7. MA壁調整    8. 建値移動
+//
+// 禁止：DXY / US10Y / RSI / MACD / ストキャス / FVG / VPVR / スコア制 など
+// =============================================================================
+strategy(
+     title              = "XAUUSD ADR Mean Reversion Strategy",
+     overlay            = true,
+     initial_capital    = 1000,            // 初期資金 1000ドル
+     calc_on_every_tick = false,           // 足確定ベースで計算（リペイント抑制）
+     process_orders_on_close = true,       // 足の終値で約定
+     pyramiding         = 0,               // 複数ポジション禁止
+     default_qty_type   = strategy.fixed,
+     default_qty_value  = 1,
+     commission_type    = strategy.commission.percent,
+     commission_value   = 0)
+
+// =============================================================================
+// 【入力：ADR / Entry】
+// =============================================================================
+grpADR = "1. ADR / Entry 条件"
+adrLen     = input.int(14,   "ADR 期間（日数）",        group = grpADR, minval = 1)
+adrTrigger = input.float(0.8,"ADR到達率トリガー",       group = grpADR, step = 0.05)
+entryZone  = input.float(3.0,"当日高安付近の許容幅(ドル)",group = grpADR, step = 0.1)
+
+// =============================================================================
+// 【入力：SL（ATR比率）】
+// =============================================================================
+grpSL = "5. SL (ATR比率)"
+atrLen    = input.int(14,   "ATR 期間",         group = grpSL, minval = 1)
+slAtrMult = input.float(1.5,"SL = ATR × 倍率",   group = grpSL, step = 0.1)
+minSl     = input.float(5.0,"最小SL幅(ドル)",    group = grpSL, step = 0.5)
+maxSl     = input.float(30.0,"最大SL幅(ドル)※超過でエントリー不可", group = grpSL, step = 0.5)
+
+// =============================================================================
+// 【入力：TP（可変RR）】
+// =============================================================================
+grpTP = "6. TP (可変)"
+rr = input.float(1.0, "リスクリワード比 (TP = SL × RR)", group = grpTP, step = 0.1)
+
+// =============================================================================
+// 【入力：MA壁調整】
+// =============================================================================
+grpMA = "7. MA壁調整"
+useMaWallAdjust = input.bool(true, "MA壁調整を使う",                  group = grpMA)
+maWallRatio     = input.float(0.3, "近接判定 = SL幅 × この比率",       group = grpMA, step = 0.05)
+maWallBuffer    = input.float(1.0, "MAから置く余白(ドル)",            group = grpMA, step = 0.1)
+
+// =============================================================================
+// 【入力：建値移動】
+// =============================================================================
+grpBE = "8. 建値移動"
+useBreakeven = input.bool(true, "建値移動を使う",                 group = grpBE)
+beTriggerR   = input.float(0.8, "建値移動するR到達率",            group = grpBE, step = 0.05)
+
+// =============================================================================
+// 【入力：ロット計算（単利）】
+// =============================================================================
+grpLot = "9. ロット計算 (単利)"
+initCap    = input.float(1000, "基準資金(ドル)",          group = grpLot, step = 100)
+riskPct    = input.float(3.0,  "1トレード損失率(%)",      group = grpLot, step = 0.1)
+unitPerLot = input.float(1.0,  "1ロットあたりの数量係数", group = grpLot, step = 0.1)
+
+// =============================================================================
+// 【入力：時間フィルター】
+// =============================================================================
+grpTime = "10. 時間フィルター (Asia/Tokyo)"
+useTimeFilter = input.bool(true,        "時間フィルターを使う", group = grpTime)
+session       = input.session("1000-0300", "セッション(翌日跨ぎ対応)", group = grpTime)
+
+// =============================================================================
+// 【1. ADR / 当日高安 / ADR到達率】
+//   ・request.security は全て lookahead_off（リペイント防止）
+//   ・ADR は「前日までに確定した adrLen 日」の平均値幅（[1] で当日を除外）
+//   ・当日高安は lookahead_off により当日の確定済み高安として更新される
+// =============================================================================
+adr     = request.security(syminfo.tickerid, "D", ta.sma(high - low, adrLen)[1], lookahead = barmerge.lookahead_off)
+dayHigh = request.security(syminfo.tickerid, "D", high, lookahead = barmerge.lookahead_off)
+dayLow  = request.security(syminfo.tickerid, "D", low,  lookahead = barmerge.lookahead_off)
+
+dayRangeToday = dayHigh - dayLow
+adrReach      = (not na(adr) and adr > 0) ? dayRangeToday / adr : 0.0   // ADR到達率
+
+// =============================================================================
+// 【5. ATR（SL算出用）】
+// =============================================================================
+atrVal = ta.atr(atrLen)
+rawSl  = atrVal * slAtrMult              // 素のSL幅（ATR×倍率）
+slW    = math.max(rawSl, minSl)          // 最小SL補正
+skipBig = rawSl > maxSl                  // 最大SL超過 → エントリー不可
+
+// =============================================================================
+// 【7. MA壁調整：10本のMAを取得（全て lookahead_off）】
+//   1000EMA / 3000EMA を 1m / 5m / 15m / 1h / 4h で取得
+// =============================================================================
+f_ema(_tf, _len) => request.security(syminfo.tickerid, _tf, ta.ema(close, _len), lookahead = barmerge.lookahead_off)
+
+ema1000_1m  = f_ema("1",   1000)
+ema3000_1m  = f_ema("1",   3000)
+ema1000_5m  = f_ema("5",   1000)
+ema3000_5m  = f_ema("5",   3000)
+ema1000_15m = f_ema("15",  1000)
+ema3000_15m = f_ema("15",  3000)
+ema1000_1h  = f_ema("60",  1000)
+ema3000_1h  = f_ema("60",  3000)
+ema1000_4h  = f_ema("240", 1000)
+ema3000_4h  = f_ema("240", 3000)
+
+// 当該足で全MAをまとめた配列（毎足生成）
+maArr = array.from(ema1000_1m, ema3000_1m, ema1000_5m, ema3000_5m, ema1000_15m,
+                   ema3000_15m, ema1000_1h, ema3000_1h, ema1000_4h, ema3000_4h)
+
+// 指定価格に最も近いMAを返す（しきい値 _maxDist 以内）。無ければ na。
+f_nearest(_price, _maxDist, _arr) =>
+    float best = na
+    float bd   = _maxDist
+    sz = array.size(_arr)
+    if sz > 0
+        for i = 0 to sz - 1
+            m = array.get(_arr, i)
+            if not na(m)
+                d = math.abs(m - _price)
+                if d <= bd
+                    bd   := d
+                    best := m
+    best
+
+// 方向別に SL / TP を算出し、MA壁調整を適用。
+//   戻り値: [SL価格, TP価格, 調整後SL幅, MA調整フラグ]
+f_levels(_isLong, _entry, _slW, _arr) =>
+    float slP = _isLong ? _entry - _slW       : _entry + _slW
+    float tpP = _isLong ? _entry + _slW * rr  : _entry - _slW * rr
+    bool  adj = false
+    if useMaWallAdjust
+        float maxDist = _slW * maWallRatio
+        float nSL = f_nearest(slP, maxDist, _arr)
+        float nTP = f_nearest(tpP, maxDist, _arr)
+        // SL側：BUYはMAの少し下／SELLはMAの少し上に置く（壁の外側）
+        if not na(nSL)
+            slP := _isLong ? nSL - maWallBuffer : nSL + maWallBuffer
+            adj := true
+        // TP側：MAの手前で利確（BUYはMAの少し下／SELLはMAの少し上）
+        if not na(nTP)
+            tpP := _isLong ? nTP - maWallBuffer : nTP + maWallBuffer
+            adj := true
+    float slWAdj = math.abs(_entry - slP)    // 調整後SL幅（ロット計算に使用）
+    [slP, tpP, slWAdj, adj]
+
+// =============================================================================
+// 【3-4. 反転確認ローソク】
+//   SELL：陰線確定 かつ 終値が前足安値を下回る
+//   BUY ：陽線確定 かつ 終値が前足高値を上回る
+// =============================================================================
+bearRev = close < open and close < low[1]    // SELL用 反転確認
+bullRev = close > open and close > high[1]    // BUY用 反転確認
+
+// =============================================================================
+// 【当日高安付近の判定】
+// =============================================================================
+nearHigh = close >= dayHigh - entryZone       // 当日高値付近
+nearLow  = close <= dayLow  + entryZone        // 当日安値付近
+
+// =============================================================================
+// 【10. 時間フィルター（Asia/Tokyo, 翌日跨ぎ対応）】
+// =============================================================================
+inSession = useTimeFilter ? not na(time(timeframe.period, session, "Asia/Tokyo")) : true
+
+// =============================================================================
+// 【9. ロット計算（単利）】
+//   riskUSD = 基準資金 × 損失率
+//   lots = round(riskUSD / 調整後SL幅) , lots < 1 はエントリー不可
+// =============================================================================
+riskUSD   = initCap * riskPct / 100.0
+entryPrice = close                              // process_orders_on_close → 終値約定
+
+// 両方向の SL/TP/SL幅/調整フラグ を事前計算
+[lSL, lTP, lSLW, lAdj] = f_levels(true,  entryPrice, slW, maArr)
+[sSL, sTP, sSLW, sAdj] = f_levels(false, entryPrice, slW, maArr)
+
+lLots = lSLW > 0 ? math.round(riskUSD / lSLW) : 0   // BUY ロット（整数, 四捨五入）
+sLots = sSLW > 0 ? math.round(riskUSD / sSLW) : 0   // SELL ロット（整数, 四捨五入）
+
+// =============================================================================
+// 【最終 Entry 条件】（ラベル・アラートと完全一致させる）
+// =============================================================================
+flat = strategy.position_size == 0
+
+buyCond  = inSession and adrReach >= adrTrigger and nearLow  and bullRev and flat and not skipBig and lLots >= 1
+sellCond = inSession and adrReach >= adrTrigger and nearHigh and bearRev and flat and not skipBig and sLots >= 1
+
+// =============================================================================
+// 【ポジション状態の保持用変数】
+// =============================================================================
+var float curEntry  = na
+var float curSL     = na
+var float curTP     = na
+var float curRisk   = na     // 調整後SL幅（建値移動のR基準）
+var bool  curIsLong = false
+var bool  beMoved   = false  // 建値移動済みフラグ
+var bool  curAdj    = false  // MA調整発生フラグ
+var float curLots   = na
+
+// =============================================================================
+// 【エントリー実行】barstate.isconfirmed 基準でラベルのズレを防止
+// =============================================================================
+if buyCond and barstate.isconfirmed
+    strategy.entry("Long", strategy.long, qty = lLots * unitPerLot)
+    curEntry  := entryPrice
+    curSL     := lSL
+    curTP     := lTP
+    curRisk   := lSLW
+    curIsLong := true
+    beMoved   := false
+    curAdj    := lAdj
+    curLots   := lLots
+    // ラベル（BUY / Entry / SL / TP / Lots / ADR% / MA調整）
+    label.new(bar_index, low,
+         text  = "BUY\nE:"  + str.tostring(curEntry, "#.##") +
+                 "\nSL:"    + str.tostring(curSL,    "#.##") +
+                 "\nTP:"    + str.tostring(curTP,    "#.##") +
+                 "\nLot:"   + str.tostring(curLots,  "#")    +
+                 "\nADR:"   + str.tostring(adrReach * 100, "#.#") + "%" +
+                 (curAdj ? "\nMA調整" : ""),
+         color = color.new(color.green, 0), textcolor = color.white,
+         style = label.style_label_up, size = size.small)
+    alert("BUY Entry | E=" + str.tostring(entryPrice, "#.##") +
+          " SL=" + str.tostring(lSL, "#.##") + " TP=" + str.tostring(lTP, "#.##") +
+          " Lots=" + str.tostring(lLots, "#") +
+          " ADR%=" + str.tostring(adrReach * 100, "#.#"), alert.freq_once_per_bar_close)
+
+if sellCond and barstate.isconfirmed
+    strategy.entry("Short", strategy.short, qty = sLots * unitPerLot)
+    curEntry  := entryPrice
+    curSL     := sSL
+    curTP     := sTP
+    curRisk   := sSLW
+    curIsLong := false
+    beMoved   := false
+    curAdj    := sAdj
+    curLots   := sLots
+    label.new(bar_index, high,
+         text  = "SELL\nE:" + str.tostring(curEntry, "#.##") +
+                 "\nSL:"    + str.tostring(curSL,    "#.##") +
+                 "\nTP:"    + str.tostring(curTP,    "#.##") +
+                 "\nLot:"   + str.tostring(curLots,  "#")    +
+                 "\nADR:"   + str.tostring(adrReach * 100, "#.#") + "%" +
+                 (curAdj ? "\nMA調整" : ""),
+         color = color.new(color.red, 0), textcolor = color.white,
+         style = label.style_label_down, size = size.small)
+    alert("SELL Entry | E=" + str.tostring(entryPrice, "#.##") +
+          " SL=" + str.tostring(sSL, "#.##") + " TP=" + str.tostring(sTP, "#.##") +
+          " Lots=" + str.tostring(sLots, "#") +
+          " ADR%=" + str.tostring(adrReach * 100, "#.#"), alert.freq_once_per_bar_close)
+
+// =============================================================================
+// 【8. 建値移動 + 決済（SL/TP）管理】
+//   含み益がR換算で beTriggerR に到達 → SLを建値へ。TPは維持。
+// =============================================================================
+if strategy.position_size != 0
+    if useBreakeven and not beMoved
+        if curIsLong and high >= curEntry + curRisk * beTriggerR
+            beMoved := true
+        if (not curIsLong) and low <= curEntry - curRisk * beTriggerR
+            beMoved := true
+    float exitStop = beMoved ? curEntry : curSL
+    if curIsLong
+        strategy.exit("Long Exit",  "Long",  stop = exitStop, limit = curTP)
+    else
+        strategy.exit("Short Exit", "Short", stop = exitStop, limit = curTP)
+
+// 建値移動が発生した瞬間に BE ラベルを表示
+if beMoved and not beMoved[1] and barstate.isconfirmed
+    label.new(bar_index, curEntry, text = "BE",
+         color = color.new(color.blue, 0), textcolor = color.white,
+         style = label.style_label_left, size = size.small)
+
+// フラットに戻ったらフラグをリセット
+if strategy.position_size == 0
+    beMoved := false
+
+// =============================================================================
+// 【11. 表示】当日高値/安値ライン
+// =============================================================================
+plot(dayHigh, "当日高値", color = color.new(color.red,   0), linewidth = 1, style = plot.style_linebr)
+plot(dayLow,  "当日安値", color = color.new(color.green, 0), linewidth = 1, style = plot.style_linebr)
+
+// 情報パネル（ADR到達率など）
+var table info = table.new(position.top_right, 1, 4, border_width = 1)
+if barstate.islast
+    table.cell(info, 0, 0, "ADR到達率: " + str.tostring(adrReach * 100, "#.#") + "%",
+         text_color = color.white, bgcolor = adrReach >= adrTrigger ? color.new(color.green, 0) : color.new(color.gray, 0))
+    table.cell(info, 0, 1, "当日高値: " + str.tostring(dayHigh, "#.##"), text_color = color.white, bgcolor = color.new(color.red,   30))
+    table.cell(info, 0, 2, "当日安値: " + str.tostring(dayLow,  "#.##"), text_color = color.white, bgcolor = color.new(color.green, 30))
+    table.cell(info, 0, 3, "ADR: "      + str.tostring(adr,     "#.##"), text_color = color.white, bgcolor = color.new(color.blue,  30))
+
+// =============================================================================
+// 【12. アラート】alertcondition（静的）＋ 上記 alert()（動的内容）
+// =============================================================================
+alertcondition(buyCond,  title = "BUY Entry",  message = "XAUUSD ADR MR: BUY Entry シグナル")
+alertcondition(sellCond, title = "SELL Entry", message = "XAUUSD ADR MR: SELL Entry シグナル")
