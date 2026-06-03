@@ -1,0 +1,463 @@
+//@version=5
+// =============================================================================
+// XAUUSD HTF Head and Shoulders Neckline Retest Strategy
+// -----------------------------------------------------------------------------
+// 思想:
+//   上位足(HTF)で 三尊 / 逆三尊 を検知し、ネックラインを終値でブレイクした後、
+//   ネックライン付近まで戻ってきたところで、5分足(=チャート足)の反転ローソクを
+//   確認してEntryする「Pattern Reversal + Neckline Retest」型ストラテジー。
+//
+//   三尊  -> ネック下抜け -> ネック戻り -> 5分反転陰線 -> SELL
+//   逆三尊-> ネック上抜け -> ネック戻り -> 5分反転陽線 -> BUY
+//
+//   形だけではEntryせず、必ず「ネックラインブレイク後の戻り」を待つ。
+// =============================================================================
+strategy(title               = "XAUUSD HTF H&S Neckline Retest",
+         shorttitle          = "XAU H&S Retest",
+         overlay             = true,
+         initial_capital     = 1000,
+         calc_on_every_tick  = true,
+         process_orders_on_close = true,
+         pyramiding          = 0,
+         default_qty_type    = strategy.fixed,
+         default_qty_value   = 1)
+
+// =============================================================================
+// 【1】Inputs - 時間足 / ピボット
+// =============================================================================
+grpTf   = "1. 時間足 / ピボット"
+patternTf = input.timeframe("60", "Pattern timeframe (上位足)", group = grpTf) // 初期値=1時間足。15分等にも変更可
+pivotLen  = input.int(3, "Pivot length", minval = 1, group = grpTf)            // pivot high/low の左右本数
+
+// =============================================================================
+// 【2】Inputs - 三尊 / 逆三尊
+// =============================================================================
+grpPat = "2. 三尊 / 逆三尊"
+shoulderTolerancePct = input.float(0.006, "Shoulder tolerance (左右肩の許容率)", step = 0.001, group = grpPat)
+
+// =============================================================================
+// 【3】Inputs - ブレイク / 戻り
+// =============================================================================
+grpRet = "3. ブレイク / 戻り"
+setupValidBars = input.int(48, "Setup valid bars (ブレイク後の有効本数)", minval = 1, group = grpRet)
+retestAtrLen   = input.int(14, "Retest ATR length", minval = 1, group = grpRet)
+retestAtrMult  = input.float(0.3, "Retest ATR mult (戻り許容幅)", step = 0.1, group = grpRet)
+
+// =============================================================================
+// 【4】Inputs - SL (ATR比率)
+// =============================================================================
+grpSl = "4. SL (ATR比率)"
+atrLen    = input.int(14, "ATR length", minval = 1, group = grpSl)
+slAtrMult = input.float(1.5, "SL ATR mult", step = 0.1, group = grpSl)
+minSl     = input.float(5.0, "Min SL width ($)", step = 0.5, group = grpSl)
+maxSl     = input.float(35.0, "Max SL width ($)", step = 0.5, group = grpSl)
+slBuffer  = input.float(1.0, "SL buffer (肩の外側余白 $)", step = 0.1, group = grpSl)
+
+// =============================================================================
+// 【5】Inputs - TP
+// =============================================================================
+grpTp = "5. TP"
+rr = input.float(2.0, "Risk Reward (TP = Risk x RR)", step = 0.1, group = grpTp)
+
+// =============================================================================
+// 【6】Inputs - MA壁調整
+// =============================================================================
+grpMa = "6. MA壁調整"
+useMaWallAdjust = input.bool(true, "Use MA wall adjust", group = grpMa)
+maWallRatio     = input.float(0.3, "MA wall ratio (SL幅×この比率以内で壁判定)", step = 0.05, group = grpMa)
+maWallBuffer    = input.float(1.0, "MA wall buffer ($)", step = 0.1, group = grpMa)
+
+// =============================================================================
+// 【7】Inputs - 建値移動 (Breakeven)
+// =============================================================================
+grpBe = "7. 建値移動"
+useBreakeven = input.bool(true, "Use breakeven", group = grpBe)
+beTriggerR   = input.float(0.8, "BE trigger (R)", step = 0.1, group = grpBe)
+
+// =============================================================================
+// 【8】Inputs - ロット計算
+// =============================================================================
+grpLot = "8. ロット計算"
+initCap    = input.float(1000, "Initial capital ($)", group = grpLot)
+riskPct    = input.float(3.0, "Risk per trade (%)", step = 0.1, group = grpLot)
+unitPerLot = input.float(1.0, "Unit per lot", step = 0.1, group = grpLot)
+
+// =============================================================================
+// 【9】Inputs - 時間フィルター
+// =============================================================================
+grpTime = "9. 時間フィルター"
+useTimeFilter = input.bool(true, "Use time filter", group = grpTime)
+session       = input.session("1000-0300", "Session (Asia/Tokyo, 翌日跨ぎ対応)", group = grpTime)
+
+// 単利ベースの 1トレード許容損失 ($)
+riskUSD = initCap * riskPct / 100.0
+
+// =============================================================================
+// 【10】上位足データ取得 (request.security, lookahead_off)
+//   - 確定済みピボットのみ使用するため lookahead_off。
+//   - ta.pivothigh/low を HTF 上で計算し、確定値だけを受け取る。
+// =============================================================================
+[htfPh, htfPl, htfClose, htfTime] = request.security(
+     syminfo.tickerid, patternTf,
+     [ta.pivothigh(pivotLen, pivotLen), ta.pivotlow(pivotLen, pivotLen), close, time],
+     lookahead = barmerge.lookahead_off)
+
+// 新しい HTF バーがチャート上で確定したか
+newHTF = na(htfTime[1]) ? false : (htfTime != htfTime[1])
+
+// =============================================================================
+// 【11】MA壁用 EMA (各時間足の 1000EMA / 3000EMA) - lookahead_off
+// =============================================================================
+ema1000_1m  = request.security(syminfo.tickerid, "1",   ta.ema(close, 1000), lookahead = barmerge.lookahead_off)
+ema3000_1m  = request.security(syminfo.tickerid, "1",   ta.ema(close, 3000), lookahead = barmerge.lookahead_off)
+ema1000_5m  = request.security(syminfo.tickerid, "5",   ta.ema(close, 1000), lookahead = barmerge.lookahead_off)
+ema3000_5m  = request.security(syminfo.tickerid, "5",   ta.ema(close, 3000), lookahead = barmerge.lookahead_off)
+ema1000_15m = request.security(syminfo.tickerid, "15",  ta.ema(close, 1000), lookahead = barmerge.lookahead_off)
+ema3000_15m = request.security(syminfo.tickerid, "15",  ta.ema(close, 3000), lookahead = barmerge.lookahead_off)
+ema1000_1h  = request.security(syminfo.tickerid, "60",  ta.ema(close, 1000), lookahead = barmerge.lookahead_off)
+ema3000_1h  = request.security(syminfo.tickerid, "60",  ta.ema(close, 3000), lookahead = barmerge.lookahead_off)
+ema1000_4h  = request.security(syminfo.tickerid, "240", ta.ema(close, 1000), lookahead = barmerge.lookahead_off)
+ema3000_4h  = request.security(syminfo.tickerid, "240", ta.ema(close, 3000), lookahead = barmerge.lookahead_off)
+
+// 毎バー MA 配列を構築 (壁判定に使用)
+maArr = array.from(ema1000_1m, ema3000_1m, ema1000_5m, ema3000_5m, ema1000_15m,
+                   ema3000_15m, ema1000_1h, ema3000_1h, ema1000_4h, ema3000_4h)
+
+// =============================================================================
+// 【12】共通関数
+// =============================================================================
+// 指定インデックス範囲 (lo, hi) の間にある最も新しいピボット値を返す
+f_findBetween(_vals, _idxs, _lo, _hi) =>
+    float _res = na
+    if array.size(_vals) > 0
+        for i = 0 to array.size(_vals) - 1
+            _id = array.get(_idxs, i)
+            if _id > _lo and _id < _hi
+                _res := array.get(_vals, i)   // 昇順ループ -> 最後に残るのが最新
+    _res
+
+// レベル付近(SL幅×maWallRatio 以内)で最も近い MA を壁として、調整後レベルを返す
+// SELL(short): MAの少し上(= _m + buffer) / BUY(long): MAの少し下(= _m - buffer)
+f_maNear(_level, _slWidth, _isLong) =>
+    float _adj   = _level
+    bool  _found = false
+    float _best  = _slWidth * maWallRatio
+    if useMaWallAdjust
+        for i = 0 to array.size(maArr) - 1
+            _m = array.get(maArr, i)
+            if not na(_m)
+                _d = math.abs(_m - _level)
+                if _d <= _slWidth * maWallRatio and _d <= _best
+                    _best  := _d
+                    _found := true
+                    _adj   := _isLong ? _m - maWallBuffer : _m + maWallBuffer
+    [_adj, _found]
+
+// トレード計算: entry/SL/TP/risk/lots/valid/maAdjusted を返す
+//   _isLong   : true=BUY, false=SELL
+//   _neckline : ネックライン (未使用だが意味付けのため受け取り。entry=close)
+//   _shoulder : 右肩の高(SELL) / 安(BUY)
+//   _atr      : ATR(atrLen)
+f_trade(_isLong, _shoulder, _atr) =>
+    float _entry = close
+    // 1) ATR比率SL幅 (min補正 / max超過は無効)
+    float _slWidth = _atr * slAtrMult
+    _slWidth := math.max(_slWidth, minSl)
+    bool  _tooWide = _slWidth > maxSl
+    // 2) 基本SL: 右肩高安を考慮し「より遠い方」を採用
+    float _sl = _isLong ? math.min(_entry - _slWidth, _shoulder - slBuffer)
+                        : math.max(_entry + _slWidth, _shoulder + slBuffer)
+    // 3) MA壁調整 (SL側)
+    [_slAdj, _slFound] = f_maNear(_sl, _slWidth, _isLong)
+    _sl := (useMaWallAdjust and _slFound) ? _slAdj : _sl
+    // 4) 最終リスク幅を SL から再計算
+    float _risk = math.abs(_entry - _sl)
+    // 5) TP (RR) 算出
+    float _tp = _isLong ? _entry + _risk * rr : _entry - _risk * rr
+    // 6) MA壁調整 (TP側)
+    [_tpAdj, _tpFound] = f_maNear(_tp, _slWidth, _isLong)
+    _tp := (useMaWallAdjust and _tpFound) ? _tpAdj : _tp
+    bool _maAdjusted = useMaWallAdjust and (_slFound or _tpFound)
+    // 7) ロット計算 (単利, 四捨五入, 1未満は無効)
+    float _lotsRaw = _risk > 0 ? riskUSD / _risk : 0.0
+    float _lots = math.round(_lotsRaw)
+    bool  _valid = (not _tooWide) and _risk > 0 and _lots >= 1
+    [_entry, _sl, _tp, _risk, _lots, _valid, _maAdjusted]
+
+// =============================================================================
+// 【13】ピボット履歴 (確定済みのみ蓄積)
+// =============================================================================
+var float[] phVals = array.new_float()
+var int[]   phIdx  = array.new_int()
+var float[] plVals = array.new_float()
+var int[]   plIdx  = array.new_int()
+var int htfCount = 0
+
+// =============================================================================
+// 【14】セットアップ状態 (三尊SELL / 逆三尊BUY)
+// =============================================================================
+var float necklineSell        = na
+var float sellRightShoulderHigh = na
+var bool  sellPatternFound    = false
+var bool  sellBreakDone       = false
+var int   sellBreakBar        = na
+var bool  sellProvFired       = false
+var line  sellNeckLine        = na
+
+var float necklineBuy         = na
+var float buyRightShoulderLow = na
+var bool  buyPatternFound     = false
+var bool  buyBreakDone        = false
+var int   buyBreakBar         = na
+var bool  buyProvFired        = false
+var line  buyNeckLine         = na
+
+// ポジション管理用
+var float curEntry = na
+var float curSL    = na
+var float curTP    = na
+var float curRisk  = na
+var bool  curIsLong = false
+var bool  beDone    = false
+
+// 表示用マーカー (毎バー false 初期化)
+bool sellPatternNewBar = false
+bool buyPatternNewBar  = false
+bool sellBreakMark     = false
+bool buyBreakMark      = false
+bool sellRetestMark    = false
+bool buyRetestMark     = false
+bool beMark            = false
+
+// 今バー処理で新ピボット追加されたか
+bool justAddedPh = false
+bool justAddedPl = false
+
+// =============================================================================
+// 【15】新HTFバー確定時: ピボット蓄積 + パターン検知 + ブレイク判定
+// =============================================================================
+if newHTF
+    htfCount += 1
+    // --- ピボット蓄積 (確定値のみ) ---
+    if not na(htfPh)
+        array.push(phVals, htfPh)
+        array.push(phIdx, htfCount - pivotLen)   // 実際のピーク位置を近似
+        if array.size(phVals) > 6
+            array.shift(phVals)
+            array.shift(phIdx)
+        justAddedPh := true
+    if not na(htfPl)
+        array.push(plVals, htfPl)
+        array.push(plIdx, htfCount - pivotLen)
+        if array.size(plVals) > 6
+            array.shift(plVals)
+            array.shift(plIdx)
+        justAddedPl := true
+
+    // --- 三尊 SELL 検知 (直近3つのpivot high) ---
+    int nH = array.size(phVals)
+    if justAddedPh and nH >= 3
+        float ls  = array.get(phVals, nH - 3)
+        float hd  = array.get(phVals, nH - 2)
+        float rs  = array.get(phVals, nH - 1)
+        int   lsI = array.get(phIdx, nH - 3)
+        int   hdI = array.get(phIdx, nH - 2)
+        int   rsI = array.get(phIdx, nH - 1)
+        // ネックライン: 左肩-頭 / 頭-右肩 の間の pivot low
+        float nl1 = f_findBetween(plVals, plIdx, lsI, hdI)
+        float nl2 = f_findBetween(plVals, plIdx, hdI, rsI)
+        bool okShape = hd > ls and hd > rs and
+                       (math.abs(ls - rs) / hd <= shoulderTolerancePct) and
+                       not na(nl1) and not na(nl2)
+        if okShape
+            necklineSell          := (nl1 + nl2) / 2.0
+            sellRightShoulderHigh := rs
+            sellPatternFound      := true
+            sellBreakDone         := false
+            sellProvFired         := false   // 新セットアップ -> 仮シグナルリセット
+            sellPatternNewBar     := true
+            if not na(sellNeckLine)
+                line.delete(sellNeckLine)
+            sellNeckLine := line.new(bar_index, necklineSell, bar_index + 1, necklineSell,
+                                     extend = extend.right, color = color.new(color.red, 0), width = 1)
+
+    // --- 逆三尊 BUY 検知 (直近3つのpivot low) ---
+    int nL = array.size(plVals)
+    if justAddedPl and nL >= 3
+        float lsb  = array.get(plVals, nL - 3)
+        float hdb  = array.get(plVals, nL - 2)
+        float rsb  = array.get(plVals, nL - 1)
+        int   lsbI = array.get(plIdx, nL - 3)
+        int   hdbI = array.get(plIdx, nL - 2)
+        int   rsbI = array.get(plIdx, nL - 1)
+        float nh1 = f_findBetween(phVals, phIdx, lsbI, hdbI)
+        float nh2 = f_findBetween(phVals, phIdx, hdbI, rsbI)
+        bool okShapeB = hdb < lsb and hdb < rsb and
+                        (math.abs(lsb - rsb) / hdb <= shoulderTolerancePct) and
+                        not na(nh1) and not na(nh2)
+        if okShapeB
+            necklineBuy         := (nh1 + nh2) / 2.0
+            buyRightShoulderLow := rsb
+            buyPatternFound     := true
+            buyBreakDone        := false
+            buyProvFired        := false
+            buyPatternNewBar    := true
+            if not na(buyNeckLine)
+                line.delete(buyNeckLine)
+            buyNeckLine := line.new(bar_index, necklineBuy, bar_index + 1, necklineBuy,
+                                    extend = extend.right, color = color.new(color.green, 0), width = 1)
+
+    // --- ネックライン終値ブレイク判定 (HTF確定終値) ---
+    if sellPatternFound and not sellBreakDone and not na(htfClose) and htfClose < necklineSell
+        sellBreakDone := true
+        sellBreakBar  := bar_index
+        sellBreakMark := true
+    if buyPatternFound and not buyBreakDone and not na(htfClose) and htfClose > necklineBuy
+        buyBreakDone := true
+        buyBreakBar  := bar_index
+        buyBreakMark := true
+
+// =============================================================================
+// 【16】セットアップ有効期限切れ (チャート足基準)
+// =============================================================================
+if sellPatternFound and sellBreakDone and (bar_index - sellBreakBar > setupValidBars)
+    sellPatternFound := false
+    sellProvFired    := false
+if buyPatternFound and buyBreakDone and (bar_index - buyBreakBar > setupValidBars)
+    buyPatternFound := false
+    buyProvFired    := false
+
+// =============================================================================
+// 【17】戻り判定 / 反転ローソク / 時間 / セットアップ有効
+// =============================================================================
+atr   = ta.atr(atrLen)
+atrRe = ta.atr(retestAtrLen)
+retestRange = atrRe * retestAtrMult
+
+sellSetupValid = sellPatternFound and sellBreakDone and (bar_index - sellBreakBar <= setupValidBars)
+buySetupValid  = buyPatternFound  and buyBreakDone  and (bar_index - buyBreakBar  <= setupValidBars)
+
+// 戻り (ネックライン付近)
+sellRetest = sellSetupValid and high >= necklineSell - retestRange and close <= necklineSell + retestRange
+buyRetest  = buySetupValid  and low  <= necklineBuy  + retestRange and close >= necklineBuy  - retestRange
+
+// 5分足(チャート足) 反転ローソク
+sellReversal = (close < open and open >= close[1] and close <= open[1]) or (close < open and close < low[1])
+buyReversal  = (close > open and open <= close[1] and close >= open[1]) or (close > open and close > high[1])
+
+// 時間フィルター (Asia/Tokyo, 翌日跨ぎ対応)
+inTrade = (not useTimeFilter) or (not na(time(timeframe.period, session, "Asia/Tokyo")))
+
+flat = strategy.position_size == 0
+
+// マーカー (戻り成立)
+if sellRetest
+    sellRetestMark := true
+if buyRetest
+    buyRetestMark := true
+
+// =============================================================================
+// 【18】確定シグナル (足確定時に1回だけ)
+// =============================================================================
+bool tookTrade = false
+if barstate.isconfirmed and flat
+    // --- SELL ---
+    if sellSetupValid and sellRetest and sellReversal and inTrade
+        [e, sl, tp, risk, lots, valid, maAdj] = f_trade(false, sellRightShoulderHigh, atr)
+        if valid
+            float qty = lots * unitPerLot
+            strategy.entry("SELL", strategy.short, qty = qty)
+            strategy.exit("EXIT", stop = sl, limit = tp)
+            curEntry := e
+            curSL    := sl
+            curTP    := tp
+            curRisk  := risk
+            curIsLong := false
+            beDone   := false
+            string lbl = "SELL\nE: " + str.tostring(e, "#.##") + "\nSL: " + str.tostring(sl, "#.##") +
+                         "\nTP: " + str.tostring(tp, "#.##") + (maAdj ? "\nMA調整" : "")
+            label.new(bar_index, high, lbl, style = label.style_label_down,
+                      color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+            alert("確定SELL | Entry=" + str.tostring(e, "#.##") + " | SL=" + str.tostring(sl, "#.##") +
+                  " | TP=" + str.tostring(tp, "#.##") + " | RiskWidth=" + str.tostring(risk, "#.##") +
+                  " | BE=" + (useBreakeven ? "ON" : "OFF") + " | Lots=" + str.tostring(int(lots)),
+                  alert.freq_once_per_bar)
+            sellPatternFound := false   // セットアップ消費
+            sellProvFired    := false
+            tookTrade := true
+    // --- BUY ---
+    if (not tookTrade) and buySetupValid and buyRetest and buyReversal and inTrade
+        [e, sl, tp, risk, lots, valid, maAdj] = f_trade(true, buyRightShoulderLow, atr)
+        if valid
+            float qty = lots * unitPerLot
+            strategy.entry("BUY", strategy.long, qty = qty)
+            strategy.exit("EXIT", stop = sl, limit = tp)
+            curEntry := e
+            curSL    := sl
+            curTP    := tp
+            curRisk  := risk
+            curIsLong := true
+            beDone   := false
+            string lbl = "BUY\nE: " + str.tostring(e, "#.##") + "\nSL: " + str.tostring(sl, "#.##") +
+                         "\nTP: " + str.tostring(tp, "#.##") + (maAdj ? "\nMA調整" : "")
+            label.new(bar_index, low, lbl, style = label.style_label_up,
+                      color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+            alert("確定BUY | Entry=" + str.tostring(e, "#.##") + " | SL=" + str.tostring(sl, "#.##") +
+                  " | TP=" + str.tostring(tp, "#.##") + " | RiskWidth=" + str.tostring(risk, "#.##") +
+                  " | BE=" + (useBreakeven ? "ON" : "OFF") + " | Lots=" + str.tostring(int(lots)),
+                  alert.freq_once_per_bar)
+            buyPatternFound := false
+            buyProvFired    := false
+            tookTrade := true
+
+// =============================================================================
+// 【19】仮シグナル (足未確定 / 1セットアップ1回 / alertのみ・ラベルなし)
+// =============================================================================
+if (not barstate.isconfirmed) and flat and inTrade
+    // --- 仮SELL: 戻り成立かつ下向きに動き始め ---
+    if sellSetupValid and sellRetest and close < open and not sellProvFired
+        [e, sl, tp, risk, lots, valid, maAdj] = f_trade(false, sellRightShoulderHigh, atr)
+        if valid
+            alert("仮SELL | Entry≈" + str.tostring(e, "#.##") + " | SL≈" + str.tostring(sl, "#.##") +
+                  " | TP≈" + str.tostring(tp, "#.##") + " | RiskWidth≈" + str.tostring(risk, "#.##") +
+                  " | BE=" + (useBreakeven ? "ON" : "OFF") + " | Lots=" + str.tostring(int(lots)),
+                  alert.freq_once_per_bar)
+            sellProvFired := true
+    // --- 仮BUY: 戻り成立かつ上向きに動き始め ---
+    if buySetupValid and buyRetest and close > open and not buyProvFired
+        [e, sl, tp, risk, lots, valid, maAdj] = f_trade(true, buyRightShoulderLow, atr)
+        if valid
+            alert("仮BUY | Entry≈" + str.tostring(e, "#.##") + " | SL≈" + str.tostring(sl, "#.##") +
+                  " | TP≈" + str.tostring(tp, "#.##") + " | RiskWidth≈" + str.tostring(risk, "#.##") +
+                  " | BE=" + (useBreakeven ? "ON" : "OFF") + " | Lots=" + str.tostring(int(lots)),
+                  alert.freq_once_per_bar)
+            buyProvFired := true
+
+// =============================================================================
+// 【20】ポジション管理: 建値移動 + Exit更新
+// =============================================================================
+if strategy.position_size != 0
+    if useBreakeven and not beDone
+        if curIsLong and high >= curEntry + curRisk * beTriggerR
+            curSL  := curEntry
+            beDone := true
+            beMark := true
+        if (not curIsLong) and low <= curEntry - curRisk * beTriggerR
+            curSL  := curEntry
+            beDone := true
+            beMark := true
+    // 建値移動後も TP は維持。毎バー Exit を更新。
+    strategy.exit("EXIT", stop = curSL, limit = curTP)
+else
+    beDone := false
+
+// =============================================================================
+// 【21】表示 (重すぎないよう plotshape のみ)
+// =============================================================================
+plotshape(sellPatternNewBar, title = "三尊", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),    text = "H&S",  size = size.tiny)
+plotshape(buyPatternNewBar,  title = "逆三尊", style = shape.triangleup,  location = location.belowbar, color = color.new(color.green, 0),  text = "iH&S", size = size.tiny)
+plotshape(sellBreakMark,     title = "SELL Break",  style = shape.xcross,  location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
+plotshape(buyBreakMark,      title = "BUY Break",   style = shape.xcross,  location = location.belowbar, color = color.new(color.orange, 0), size = size.tiny)
+plotshape(sellRetestMark,    title = "SELL Retest", style = shape.circle,  location = location.abovebar, color = color.new(color.maroon, 0), size = size.tiny)
+plotshape(buyRetestMark,     title = "BUY Retest",  style = shape.circle,  location = location.belowbar, color = color.new(color.teal, 0),   size = size.tiny)
+plotshape(beMark,            title = "BE",          style = shape.diamond, location = location.belowbar, color = color.new(color.blue, 0),   text = "BE",   size = size.tiny)
