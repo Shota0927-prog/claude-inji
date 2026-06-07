@@ -1,0 +1,252 @@
+//@version=5
+strategy("London Liquidity Sweep Reversal", overlay=true, initial_capital=1000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=1, pyramiding=0, process_orders_on_close=true)
+
+// ========== Inputs ==========
+// ===== 00. ボラ基準 =====
+atrLenBase     = input.int(14, "基準ATR本数", minval=1, group="00. Vol Base")
+atrTfBase      = input.timeframe("", "基準ATR時間足(空=チャート)", group="00. Vol Base")
+useVolAdaptive = input.bool(true, "全$パラメータをボラ連動にする", group="00. Vol Base")
+baseAtr = atrTfBase == "" ? ta.atr(atrLenBase) : request.security(syminfo.tickerid, atrTfBase, ta.atr(atrLenBase)[1], lookahead=barmerge.lookahead_on)
+useCompound = input.bool(false, "複利ON（現在の総資金ベース）")
+// ===== 係数（ATR=5.3基準で元の値を再現）=====
+kBe       = input.float(2.5, "建値発動 ×ATR",    step=0.01, group="00. Vol Coef")
+kMaSl     = input.float(0.94, "MA余白SL ×ATR",    step=0.01, group="00. Vol Coef")
+kMaTp     = input.float(0.19, "MA余白TP ×ATR",    step=0.01, group="00. Vol Coef")
+kMinGuard = input.float(0.57, "MA後最小SL ×ATR",  step=0.01, group="00. Vol Coef")
+
+tz          = input.string("Asia/Tokyo", "タイムゾーン")
+initCapital = input.float(1000.0, "初期資金(USD)", minval=1)
+riskPct     = input.float(3.0,    "1トレード損失率(%) ※単利", minval=0.01)
+ozPerLot    = input.float(100.0,  "1ロットのオンス数 (XAUUSD標準=100)", minval=0.01)
+lotStep     = input.float(0.01,   "ロット刻み", minval=0.0001)
+minLot      = input.float(0.01,   "最小ロット(これ未満は見送り)", minval=0.0)
+rr          = input.float(2.0,    "RR (TP = SL幅 × RR)", minval=0.1)
+minBody     = input.float(0.2,    "Impulse bodyRatio下限", minval=0.0, maxval=1.0)
+closeEnd    = input.bool(false,   "トレード時間外(03:00 JST)で強制決済")
+
+// --- SLバッファ（固定$ ⇄ ATR連動）---
+useATRBuffer = input.bool(true, "SLバッファをATR基準にする(OFF=固定$)", group="SL Buffer")
+slBuffer     = input.float(5.0,  "固定SLバッファ($)", minval=0.0, group="SL Buffer")
+slAtrLen     = input.int(14,     "ATR期間", minval=1, group="SL Buffer")
+slAtrMult    = input.float(1.0,  "ATR倍率", minval=0.0, step=0.1, group="SL Buffer")
+
+// --- 質フィルター ---
+oneTradePerSession = input.bool(true, "1セッション1トレードに制限")
+maxBarsAfterSweep  = input.int(6,   "Sweep後Reclaimまでの最大バー数", minval=1)
+minSweepPct        = input.float(0.10, "最小Sweep深さ(レンジ比 0.05=5%)", minval=0.0, step=0.01)
+
+// --- ① 上位足トレンドフィルター (Supertrend) ---
+useTrend = input.bool(true,  "上位足トレンドフィルター(Supertrend)", group="Trend")
+trendTF  = input.timeframe("60", "トレンド判定の時間足", group="Trend")
+stFactor = input.float(3.0, "Supertrend Factor(大=鈍/小=敏感)", minval=0.1, step=0.1, group="Trend")
+stATR    = input.int(10, "Supertrend ATR期間", minval=1, group="Trend")
+
+// --- ② 建値ストップ（ドル建て・据え置き） ---
+beOn         = input.bool(true, "建値ストップを使う", group="Breakeven")
+beTriggerUSDIn = input.float(10.0, "建値移動の発動($動いたら)", minval=0.01, group="Breakeven")
+beTriggerUSD   = useVolAdaptive ? baseAtr * kBe : beTriggerUSDIn
+beOffset     = input.float(0.0,  "建値オフセット($)", minval=0.0, group="Breakeven")
+
+// --- ③ 方向ON/OFF ---
+allowLong  = input.bool(true, "ロングを取る", group="Direction")
+allowShort = input.bool(true, "ショートを取る", group="Direction")
+
+asiaStartH  = input.int(10, "Asiaレンジ開始(時)", minval=0, maxval=23)
+asiaEndH    = input.int(16, "Asiaレンジ終了(時)", minval=0, maxval=23)
+lonStartH   = input.int(16, "Londonエントリー開始(時)", minval=0, maxval=23)
+lonEndH     = input.int(21, "Londonエントリー終了(時)", minval=0, maxval=23)
+twStartH    = input.int(10, "トレード可能開始(時)", minval=0, maxval=23)
+twEndH      = input.int(3,  "トレード可能終了(時)", minval=0, maxval=23)
+
+useMaSLTP    = input.bool(true,  "MAでSL/TP調整", group="MA Snap")
+maNearPct    = input.float(0.20, "MA近接判定（リスク幅の割合）", minval=0.01, maxval=1.0, step=0.01, group="MA Snap")
+
+maSlBufferIn = input.float(5.0, "MAスナップ余白：SL($)", minval=0.0, step=0.1, group="MA Snap")
+maSlBuffer   = useVolAdaptive ? baseAtr * kMaSl : maSlBufferIn
+
+maTpBufferIn = input.float(1.0, "MAスナップ余白：TP($)", minval=0.0, step=0.1, group="MA Snap")
+maTpBuffer   = useVolAdaptive ? baseAtr * kMaTp : maTpBufferIn
+
+minRiskGuardIn = input.float(3.0, "MAスナップ後の最小SL($)", minval=0.1, step=0.1, group="MA Snap")
+minRiskGuard   = useVolAdaptive ? baseAtr * kMinGuard : minRiskGuardIn
+// ========== Time ==========
+h = hour(time, tz)
+inAsia   = h >= asiaStartH and h < asiaEndH
+inLondon = h >= lonStartH and h < lonEndH
+inTrade  = twStartH <= twEndH ? (h >= twStartH and h < twEndH) : (h >= twStartH or h < twEndH)
+
+// ========== ATR & SLバッファ確定 ==========
+atrVal = useVolAdaptive ? baseAtr : ta.atr(slAtrLen)
+slBuf  = useATRBuffer ? atrVal * slAtrMult : slBuffer
+
+// ========== 上位足トレンド (Supertrend) ==========
+f_st() =>
+    [v, d] = ta.supertrend(stFactor, stATR)
+    [v[1], d[1]]
+[stVal, stDir] = request.security(syminfo.tickerid, trendTF, f_st(), lookahead=barmerge.lookahead_on)
+upTrend = not useTrend or stDir < 0   // stDir<0 = 上昇トレンド(価格がSupertrendの上)
+dnTrend = not useTrend or stDir > 0   // stDir>0 = 下降トレンド
+
+ema_1m_1000  = request.security(syminfo.tickerid, "1",   ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_1m_3000  = request.security(syminfo.tickerid, "1",   ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+ema_5m_1000  = request.security(syminfo.tickerid, "5",   ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_5m_3000  = request.security(syminfo.tickerid, "5",   ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+ema_15m_1000 = request.security(syminfo.tickerid, "15",  ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_15m_3000 = request.security(syminfo.tickerid, "15",  ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+ema_1h_1000  = request.security(syminfo.tickerid, "60",  ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_1h_3000  = request.security(syminfo.tickerid, "60",  ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+ema_4h_1000  = request.security(syminfo.tickerid, "240", ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_4h_3000  = request.security(syminfo.tickerid, "240", ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+maArr = array.from(ema_1m_1000, ema_1m_3000, ema_5m_1000, ema_5m_3000, ema_15m_1000, ema_15m_3000, ema_1h_1000, ema_1h_3000, ema_4h_1000, ema_4h_3000)
+
+// ========== Asia Range ==========
+var float asiaHigh = na
+var float asiaLow  = na
+newAsia = inAsia and not inAsia[1]
+if newAsia
+    asiaHigh := high
+    asiaLow  := low
+else if inAsia
+    asiaHigh := math.max(asiaHigh, high)
+    asiaLow  := math.min(asiaLow, low)
+
+// ========== Sweep tracking (reset at London open) ==========
+var bool  sweptLow       = false
+var bool  sweptHigh      = false
+var float sweepLowPrice  = na
+var float sweepHighPrice = na
+var int   sweepLowBar    = na
+var int   sweepHighBar   = na
+var bool  tradedSession  = false
+if inLondon and not inLondon[1]
+    sweptLow := false
+    sweptHigh := false
+    sweepLowPrice := na
+    sweepHighPrice := na
+    sweepLowBar := na
+    sweepHighBar := na
+    tradedSession := false
+
+if inLondon and not na(asiaLow) and not na(asiaHigh)
+    if low < asiaLow
+        sweptLow := true
+        sweepLowPrice := na(sweepLowPrice) ? low : math.min(sweepLowPrice, low)
+        sweepLowBar := bar_index
+    if high > asiaHigh
+        sweptHigh := true
+        sweepHighPrice := na(sweepHighPrice) ? high : math.max(sweepHighPrice, high)
+        sweepHighBar := bar_index
+
+// ========== Impulse / Reclaim + 質フィルター ==========
+rng       = math.max(high - low, syminfo.mintick)
+bodyRatio = math.abs(close - open) / rng
+rangeSize = (not na(asiaHigh) and not na(asiaLow)) ? asiaHigh - asiaLow : na
+
+freshLow  = not na(sweepLowBar)  and (bar_index - sweepLowBar  <= maxBarsAfterSweep)
+freshHigh = not na(sweepHighBar) and (bar_index - sweepHighBar <= maxBarsAfterSweep)
+depthLow  = not na(sweepLowPrice)  and not na(rangeSize) and (asiaLow - sweepLowPrice)   >= rangeSize * minSweepPct
+depthHigh = not na(sweepHighPrice) and not na(rangeSize) and (sweepHighPrice - asiaHigh) >= rangeSize * minSweepPct
+
+buyReclaim  = sweptLow  and close > asiaLow  and close > open and bodyRatio > minBody and freshLow  and depthLow  and upTrend
+sellReclaim = sweptHigh and close < asiaHigh and close < open and bodyRatio > minBody and freshHigh and depthHigh and dnTrend
+
+// ========== Sizing (単利: 常に初期資金ベース / 複利: 現在資金ベース) ==========
+equityNow = strategy.initial_capital + strategy.netprofit
+riskUSD   = (useCompound ? equityNow : initCapital) * riskPct / 100.0
+calcLots(slDist) =>
+    raw = slDist > 0 ? riskUSD / (slDist * ozPerLot) : 0.0
+    math.round(raw / lotStep) * lotStep
+
+// ========== 建値ストップ用の保有状態 ==========
+var float tEntry  = na
+var float tStop   = na
+var float tTP     = na
+var bool  tIsLong = na
+var bool  beDone  = false
+
+f_adjust_sl_tp(_dir, _entry, _slRaw, _tpRaw) =>
+    _risk0 = math.abs(_entry - _slRaw)
+    _thr   = _risk0 * maNearPct
+    _slOut = _slRaw
+    _tpOut = _tpRaw
+    if useMaSLTP and _risk0 > 0 and array.size(maArr) > 0
+        _slMA = float(na)
+        _slBest = float(na)
+        _tpMA = float(na)
+        _tpBest = float(na)
+        for _i = 0 to array.size(maArr) - 1
+            _m = array.get(maArr, _i)
+            if not na(_m)
+                _dSL = math.abs(_m - _slRaw)
+                if _dSL <= _thr and (na(_slBest) or _dSL < _slBest)
+                    _slBest := _dSL
+                    _slMA := _m
+                _dTP = math.abs(_m - _tpRaw)
+                if _dTP <= _thr and (na(_tpBest) or _dTP < _tpBest)
+                    _tpBest := _dTP
+                    _tpMA := _m
+        if _dir == 1
+            if not na(_slMA)
+                _slOut := math.min(_slMA - maSlBuffer, _entry - minRiskGuard)
+            if not na(_tpMA) and (_tpMA - maTpBuffer) > _entry
+                _tpOut := _tpMA - maTpBuffer
+        else
+            if not na(_slMA)
+                _slOut := math.max(_slMA + maSlBuffer, _entry + minRiskGuard)
+            if not na(_tpMA) and (_tpMA + maTpBuffer) < _entry
+                _tpOut := _tpMA + maTpBuffer
+    [_slOut, _tpOut]
+
+// ========== Entries ==========
+canEnter = inLondon and strategy.position_size == 0 and not na(asiaHigh) and not na(asiaLow) and (not oneTradePerSession or not tradedSession)
+
+if canEnter and buyReclaim and not sellReclaim and allowLong
+    sl     = sweepLowPrice - slBuf
+    slDist = close - sl
+    tp     = close + rr * slDist
+    [slA, tpA] = f_adjust_sl_tp(1, close, sl, tp)
+    slDistA = close - slA
+    lots   = calcLots(slDistA)
+    if lots >= minLot and slDistA > 0
+        strategy.entry("Long", strategy.long, qty=lots * ozPerLot)
+        strategy.exit("L-Exit", "Long", stop=slA, limit=tpA)
+        tEntry := close, tStop := slA, tTP := tpA, tIsLong := true, beDone := false
+        sweptLow := false
+        tradedSession := true
+
+if canEnter and sellReclaim and not buyReclaim and allowShort
+    sl     = sweepHighPrice + slBuf
+    slDist = sl - close
+    tp     = close - rr * slDist
+    [slA, tpA] = f_adjust_sl_tp(-1, close, sl, tp)
+    slDistA = slA - close
+    lots   = calcLots(slDistA)
+    if lots >= minLot and slDistA > 0
+        strategy.entry("Short", strategy.short, qty=lots * ozPerLot)
+        strategy.exit("S-Exit", "Short", stop=slA, limit=tpA)
+        tEntry := close, tStop := slA, tTP := tpA, tIsLong := false, beDone := false
+        sweptHigh := false
+        tradedSession := true
+
+// ========== 建値ストップ管理（ドル建てトリガー） ==========
+if beOn and strategy.position_size != 0 and not beDone and not na(tEntry)
+    trig = tIsLong ? (high >= tEntry + beTriggerUSD) : (low <= tEntry - beTriggerUSD)
+    if trig
+        tStop := tIsLong ? tEntry + beOffset : tEntry - beOffset
+        beDone := true
+        if tIsLong
+            strategy.exit("L-Exit", "Long", stop=tStop, limit=tTP)
+        else
+            strategy.exit("S-Exit", "Short", stop=tStop, limit=tTP)
+
+// ========== Force close outside trade window ==========
+if closeEnd and strategy.position_size != 0 and not inTrade
+    strategy.close_all(comment="TimeExit")
+
+// ========== Plots ==========
+plot(asiaHigh, "Asia High", color=color.new(color.red,   0), style=plot.style_linebr)
+plot(asiaLow,  "Asia Low",  color=color.new(color.green, 0), style=plot.style_linebr)
+plot(useTrend ? stVal : na, "Supertrend", color = stDir < 0 ? color.new(color.green,0) : color.new(color.red,0), style=plot.style_linebr)
+bgcolor(inLondon ? color.new(color.blue, 92) : na, title="London")
+plotshape(buyReclaim  and canEnter and allowLong,  "BUY",  shape.triangleup,   location.belowbar, color.new(color.green,0), size=size.small)
+plotshape(sellReclaim and canEnter and allowShort, "SELL", shape.triangledown, location.abovebar, color.new(color.red,0),   size=size.small)
