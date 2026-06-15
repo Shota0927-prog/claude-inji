@@ -1,68 +1,490 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
-// © your_username
 
 //@version=5
-indicator(
-     title       = "My FX Indicator",
-     shorttitle  = "MyFX",
-     overlay     = true,       // true: ローソク足に重ねて表示 / false: 別パネルに表示
-     max_bars_back = 500
- )
+indicator("XAUUSD BOS Pullback Continuation v3 (Indicator)",
+     overlay = true, max_labels_count = 500, max_bars_back = 500)
 
-// ============================================================
-// 入力パラメーター
-// ============================================================
-grp_ma = "移動平均線"
-ma_len  = input.int(20,  title = "MA 期間",  minval = 1, group = grp_ma)
-ma_type = input.string("EMA", title = "MA 種別",
-             options = ["SMA", "EMA", "WMA", "VWMA"], group = grp_ma)
+// ============================================================================
+// 概要
+//  ・元の strategy をインジケーター化(発注/建値移動/ロット計算/再エントリーの
+//    実行ロジックは削除。フィルター群はトグルとして温存)。
+//  ・シグナルは 5分足 のみで、ポジション保有中は出さない(ピラミッティング0相当)。
+//  ・確定シグナル … 足確定時に1回だけ(アラート + ラベル)
+//  ・仮シグナル   … 足が閉じる前に条件が揃ったら1回だけ(アラートのみ)
+//                   ※ alert.freq_once_per_bar により1バー1回。確定が出れば
+//                     ポジション保有へ移行して以後は出ない(=確定でリセット)。
+// ============================================================================
 
-grp_disp = "表示設定"
-show_ma   = input.bool(true, title = "MA を表示", group = grp_disp)
-ma_color  = input.color(color.new(color.blue, 0), title = "MA カラー", group = grp_disp)
+// ===================== 基本 / 構造 =====================
+gB = "基本 / 構造"
+pivotLen = input.int(10, "スイング(ピボット)長さ", minval=1, group=gB)
+contLookback = input.int(2, "継続ブレイク参照本数(押し目スイング)", minval=1, group=gB,
+     tooltip="BOS後、直近この本数の押し目高安を割ったら継続エントリー。小さいほど早く・浅い押しで入る。")
 
-// ============================================================
-// 計算ロジック
-// ============================================================
-float ma_value = switch ma_type
-    "SMA"  => ta.sma(close,  ma_len)
-    "EMA"  => ta.ema(close,  ma_len)
-    "WMA"  => ta.wma(close,  ma_len)
-    "VWMA" => ta.vwma(close, ma_len)
-    =>        ta.ema(close,  ma_len)
+// ===================== 決済(SL/TP) =====================
+gE = "決済(SL/TP)"
+slMode  = input.string("構造+MAスナップ", "SL方式",
+     options=["構造+MAスナップ", "ATR可変", "固定$"], group=gE,
+     tooltip="構造+MAスナップ: 壊した高安と押し安値/戻り高値を基準にSLを置き、外側に節目EMAがあればそこへ隠す(案A)。")
+atrLen  = input.int(14,    "ATR期間", group=gE)
+atrMult = input.float(1.5, "ATR×倍(SL距離・ATR可変時)", group=gE)
+slFixed = input.float(15.0, "固定SL距離($・固定時)", group=gE)
+rr      = input.float(1.5, "リスクリワード(TP=リスク×RR)", minval=0.1, group=gE)
 
-// トレンド方向（MA が上向き = 上昇トレンド）
-bool uptrend   = ma_value > ma_value[1]
-bool downtrend = ma_value < ma_value[1]
+// --- 構造ベースSL(構造+MAスナップ時) ---
+structSlMult = input.float(0.1, "構造からの余白(ATR×)", minval=0.0, group=gE,
+     tooltip="アンカー(壊した高安と押し安値/戻り高値の低い/高い方)からATR×この値だけ外側にSLを置く。")
+minRiskMult  = input.float(1.0, "最小リスク(ATR×)", minval=0.0, group=gE,
+     tooltip="SLがこれより近いと最小リスクまで広げる。")
+maxRiskMult  = input.float(2.0, "最大リスク(ATR×・超で見送り)", minval=0.1, group=gE,
+     tooltip="構造が遠くSLがこの距離を超える場合はシグナルを見送る。")
 
-// ============================================================
-// プロット
-// ============================================================
-plot(
-     show_ma ? ma_value : na,
-     title     = "MA",
-     color     = uptrend ? color.lime : downtrend ? color.red : ma_color,
-     linewidth = 2
- )
+// --- MAスナップ(案A: 構造の外側のみ) ---
+gS = "決済 / MAスナップ"
+useMaSnap     = input.bool(true,  "MAスナップを使う(外側のみ)", group=gS,
+     tooltip="構造SLのさらに外側に節目EMAがあれば、その手前までSLを隠す。内側(タイト化)はしない=構造が底。")
+maSnapMaxMult = input.float(1.5, "スナップ許容(生リスク×)", minval=1.0, group=gS,
+     tooltip="スナップ後リスクが生リスク×この値を超えるなら採用しない(外へ伸ばし過ぎ防止)。")
+maSlBufMult   = input.float(0.5, "EMA手前バッファ(ATR×)", minval=0.0, group=gS)
+useTf1m  = input.bool(true, "1m  EMA1000/3000",  inline="t1m",  group=gS)
+useTf5m  = input.bool(true, "5m  EMA1000/3000",  inline="t5m",  group=gS)
+useTf15m = input.bool(true, "15m EMA1000/3000",  inline="t15m", group=gS)
+useTf1h  = input.bool(true, "1h  EMA1000/3000",  inline="t1h",  group=gS)
+useTf4h  = input.bool(true, "4h  EMA1000/3000",  inline="t4h",  group=gS)
+showSnapEma = input.bool(false, "スナップ対象EMAを表示", group=gS)
 
-// 背景色でトレンドをハイライト
-bgcolor(
-     uptrend   ? color.new(color.green, 95) :
-     downtrend ? color.new(color.red,   95) : na,
-     title = "トレンド背景"
- )
+// --- TPのMAスナップ(RR下限つき) ---
+useMaTP     = input.bool(false,  "TPをMAへスナップ(RR下限つき)", group=gS,
+     tooltip="まずリスク×RRでTP仮置き。その外側に節目EMAがあればそこへ伸ばす。RR未満には縮めない。")
+maTpMaxMult = input.float(1.0, "TP最大(リスク×)", minval=0.1, group=gS,
+     tooltip="TPを伸ばす上限。リスク×この値を超える遠いEMAへはスナップしない。")
 
-// ============================================================
-// アラート
-// ============================================================
-alertcondition(
-     ta.crossover(close, ma_value),
-     title   = "価格が MA を上抜け",
-     message = "{{ticker}} : 価格が MA を上抜けました ({{close}})"
- )
+// ===================== ⑤ 時間帯(日本時間 JST) =====================
+gT = "⑤ 時間帯(日本時間 JST)"
+useTime = input.bool(true, "時間フィルターを使う", group=gT)
+sess    = input.session("1000-0300", "取引時間", group=gT)
+tz = "Asia/Tokyo"
 
-alertcondition(
-     ta.crossunder(close, ma_value),
-     title   = "価格が MA を下抜け",
-     message = "{{ticker}} : 価格が MA を下抜けました ({{close}})"
- )
+// ===================== ① Impulse BOS =====================
+g1 = "① Impulse BOS"
+useImpulse = input.bool(true, "① 強いBOSのみ", group=g1)
+impBodyMin = input.float(0.4, "  実体比 >", group=g1)
+impAtrMult = input.float(0.1, "  抜け幅 > ATR×", group=g1)
+
+// ===================== ② Compression後限定 =====================
+g2 = "② Compression後限定"
+useComp     = input.bool(false, "② 溜めを待つ", group=g2)
+compMult    = input.float(0.6, "  小レンジ判定 < ATR×", group=g2)
+compMinBars = input.int(4,     "  必要な溜め本数", minval=1, group=g2)
+
+// ===================== ③ Reacceleration entry =====================
+g3 = "③ Reacceleration entry"
+useReaccel     = input.bool(false, "③ 再加速で入る", group=g3)
+reaccelBodyMin = input.float(0.2, "  実体比 >", group=g3)
+
+// ===================== ④ EMA slope =====================
+g4 = "④ EMA slope"
+useEmaSlope = input.bool(true, "④ EMA傾きフィルター", group=g4)
+emaLen      = input.int(200, "  EMA期間", group=g4)
+emaSlopeLB  = input.int(10,  "  傾き参照本数", group=g4)
+
+// ===================== ⑥ ATR expansion =====================
+g6 = "⑥ ATR expansion"
+useAtrExp = input.bool(true, "⑥ ボラ拡大時のみ", group=g6)
+atrSmaLen = input.int(20, "  ATR平均期間", group=g6)
+
+// ===================== ⑦ 浅押し限定 =====================
+g7 = "⑦ 浅押し限定"
+usePbDepth = input.bool(false, "⑦ 深い押し目を除外", group=g7)
+pbMult     = input.float(0.8,  "  許容深さ < ATR×", group=g7)
+
+// ===================== ⑧ BOS freshness =====================
+g8 = "⑧ BOS freshness"
+useFresh = input.bool(false, "⑧ BOS直後のみ", group=g8)
+maxFresh = input.int(10, "  BOS後の有効本数", group=g8)
+
+// ===================== ⑨ Liquidity sweep後 =====================
+g9 = "⑨ Liquidity sweep後"
+useSweep = input.bool(false, "⑨ 流動性狩り後のみ", group=g9)
+sweepLen = input.int(10, "  sweep参照本数", group=g9)
+
+// ===================== ⑩ FVG付き限定 =====================
+g10 = "⑩ FVG付き限定"
+useFVG = input.bool(false, "⑩ imbalance必須", group=g10)
+
+// ===================== ⑪ 上位足Supertrend 順張り =====================
+g11 = "⑪ 上位足Supertrend 順張り"
+useHST  = input.bool(true,   "⑪ 上位足トレンド方向のみ", group=g11)
+hstTF   = input.timeframe("60", "上位足", group=g11)
+hstLen  = input.int(10,      "Supertrend ATR期間", group=g11)
+hstMult = input.float(3.0,   "Supertrend 係数", group=g11)
+
+// ===================== ⑫ MTF EMAトレンド整合 =====================
+g12 = "⑫ MTF EMAトレンド整合"
+useMtfAlign = input.bool(false, "⑫ 上位足EMAと同方向のみ", group=g12,
+     tooltip="価格が上位足の大EMAより上ならLongのみ/下ならShortのみ。")
+alignTf1h = input.bool(true, "  1h EMAと整合", group=g12)
+alignTf4h = input.bool(true, "  4h EMAと整合", group=g12)
+alignEma  = input.string("1000", "  整合に使うEMA", options=["1000", "3000", "両方"], group=g12,
+     tooltip="1000=速い大EMA / 3000=遅い大EMA / 両方=両者とも同方向(最も厳しい)。")
+
+// ===================== アラート文言(表示用) =====================
+gA = "アラート文言(表示用)"
+riskPctTxt   = input.float(3.0, "リスク(%) ※文言表示", group=gA)
+reentryMaxTxt= input.int(2,     "再エントリー回数 ※文言表示", group=gA)
+
+// ===================== 共通計算 =====================
+atr      = ta.atr(atrLen)
+atrAvg   = ta.sma(atr, atrSmaLen)
+atrExpand= atr > atrAvg
+rng      = high - low
+body     = math.abs(close - open)
+bodyRatio= rng > 0 ? body / rng : 0.0
+ema      = ta.ema(close, emaLen)
+emaBull  = ema > ema[emaSlopeLB]
+emaBear  = ema < ema[emaSlopeLB]
+
+// 継続ブレイク用の直近スイング高安
+recentHigh = ta.highest(high, contLookback)[1]
+recentLow  = ta.lowest(low,  contLookback)[1]
+
+// スナップ対象EMA = MTF EMA(1000/3000) ※非リペイント(確定足参照)
+ema_1m_1000  = request.security(syminfo.tickerid, "1",   ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_1m_3000  = request.security(syminfo.tickerid, "1",   ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+ema_5m_1000  = request.security(syminfo.tickerid, "5",   ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_5m_3000  = request.security(syminfo.tickerid, "5",   ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+ema_15m_1000 = request.security(syminfo.tickerid, "15",  ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_15m_3000 = request.security(syminfo.tickerid, "15",  ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+ema_1h_1000  = request.security(syminfo.tickerid, "60",  ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_1h_3000  = request.security(syminfo.tickerid, "60",  ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+ema_4h_1000  = request.security(syminfo.tickerid, "240", ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_4h_3000  = request.security(syminfo.tickerid, "240", ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+
+// ⑫ MTF EMAトレンド整合の判定
+a1hBull = (not alignTf1h) or (alignEma == "1000" ? close > ema_1h_1000 : alignEma == "3000" ? close > ema_1h_3000 : (close > ema_1h_1000 and close > ema_1h_3000))
+a4hBull = (not alignTf4h) or (alignEma == "1000" ? close > ema_4h_1000 : alignEma == "3000" ? close > ema_4h_3000 : (close > ema_4h_1000 and close > ema_4h_3000))
+a1hBear = (not alignTf1h) or (alignEma == "1000" ? close < ema_1h_1000 : alignEma == "3000" ? close < ema_1h_3000 : (close < ema_1h_1000 and close < ema_1h_3000))
+a4hBear = (not alignTf4h) or (alignEma == "1000" ? close < ema_4h_1000 : alignEma == "3000" ? close < ema_4h_3000 : (close < ema_4h_1000 and close < ema_4h_3000))
+mtfBull = (not useMtfAlign) or (a1hBull and a4hBull)
+mtfBear = (not useMtfAlign) or (a1hBear and a4hBear)
+
+// 構造SL/MAスナップ用のATR換算
+realMaSlBuf = atr * maSlBufMult
+realMinRisk = atr * minRiskMult
+realMaxRisk = atr * maxRiskMult
+
+bullFVG  = low  > high[2]
+bearFVG  = high < low[2]
+lowestPrev  = ta.lowest(low,  sweepLen)[1]
+highestPrev = ta.highest(high, sweepLen)[1]
+bullSwp  = low  < lowestPrev  and close > open
+bearSwp  = high > highestPrev and close < open
+
+// ⑪ 上位足Supertrend方向(リペイント防止: 確定足のみ参照)
+hstDirFn() =>
+    [_st, _dir] = ta.supertrend(hstMult, hstLen)
+    _dir[1]
+htfDir  = request.security(syminfo.tickerid, hstTF, hstDirFn(), lookahead = barmerge.lookahead_off)
+htfBull = htfDir < 0
+htfBear = htfDir > 0
+
+// 時間フィルター
+inSession = not na(time(timeframe.period, sess, tz))
+canTrade  = (not useTime) or inSession
+
+// ===================== MAスナップ関数 (案A: 外側のみ) =====================
+f_snap_sl(dir, entry, slRaw, rawRisk, es, buf, maxMult) =>
+    float bestEma = na
+    if array.size(es) > 0
+        for i = 0 to array.size(es) - 1
+            e = array.get(es, i)
+            if not na(e)
+                if dir == 1
+                    if e < slRaw and (na(bestEma) or e > bestEma)
+                        bestEma := e
+                else
+                    if e > slRaw and (na(bestEma) or e < bestEma)
+                        bestEma := e
+    float chosen = slRaw
+    if not na(bestEma)
+        cand     = dir == 1 ? bestEma - buf : bestEma + buf
+        candRisk = dir == 1 ? entry - cand : cand - entry
+        if candRisk > 0 and candRisk <= rawRisk * maxMult
+            chosen := cand
+    chosen
+
+f_snap_tp(dir, entry, tpRaw, baseRisk, es, buf, maxMult) =>
+    float best = na
+    if array.size(es) > 0
+        for i = 0 to array.size(es) - 1
+            e = array.get(es, i)
+            if not na(e)
+                cand = dir == 1 ? e - buf : e + buf
+                ok   = dir == 1 ? cand >= tpRaw : cand <= tpRaw
+                if ok
+                    if na(best) or (dir == 1 ? cand < best : cand > best)
+                        best := cand
+    float chosen = tpRaw
+    if not na(best)
+        tpDist = dir == 1 ? best - entry : entry - best
+        if tpDist <= baseRisk * maxMult
+            chosen := best
+    chosen
+
+// ===================== メッセージ / ラベル 文字列 =====================
+f_alertMsg(kind, dir, e, sl, tp) =>
+    d = dir == 1 ? "LONG" : "SHORT"
+    w = math.abs(e - sl)
+    kind + " " + d + " | " + syminfo.ticker + " 5m\n" +
+         "エントリー: " + str.tostring(e,  format.mintick) + "\n" +
+         "SL: "        + str.tostring(sl, format.mintick) + "\n" +
+         "TP: "        + str.tostring(tp, format.mintick) + "\n" +
+         "エントリーとSLの幅: " + str.tostring(w, "#.##") + "\n" +
+         "建値移動なし / 再エントリー" + str.tostring(reentryMaxTxt) + "回 / リスク" + str.tostring(riskPctTxt) + "%"
+
+f_labelTxt(dir, e, sl, tp) =>
+    d = dir == 1 ? "LONG" : "SHORT"
+    "確定 " + d + "\n" +
+         "E:  " + str.tostring(e,  format.mintick) + "\n" +
+         "SL: " + str.tostring(sl, format.mintick) + "\n" +
+         "TP: " + str.tostring(tp, format.mintick)
+
+// 構造(スイング高安)
+ph = ta.pivothigh(pivotLen, pivotLen)
+pl = ta.pivotlow(pivotLen, pivotLen)
+var float lastPH = na
+var float lastPL = na
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+
+// ① BOS判定(Impulse切替)
+rawBull    = not na(lastPH) and close > lastPH
+rawBear    = not na(lastPL) and close < lastPL
+strongBull = rawBull and bodyRatio > impBodyMin and (close - lastPH) > atr * impAtrMult
+strongBear = rawBear and bodyRatio > impBodyMin and (lastPL - close) > atr * impAtrMult
+bullBOS    = useImpulse ? strongBull : rawBull
+bearBOS    = useImpulse ? strongBear : rawBear
+
+// ===================== ステートマシン =====================
+var int   state   = 0
+var int   bosBar  = 0
+var int   compCnt = 0
+var bool  sawFVG  = false
+var bool  sawSwp  = false
+var float hiSince = na
+var float loSince = na
+var float bosLvl  = na
+
+longEntry  = false
+shortEntry = false
+
+if bearBOS and state >= 0
+    state := -1
+    bosBar := bar_index
+    compCnt := 0
+    sawFVG := false
+    sawSwp := false
+    hiSince := high
+    loSince := low
+    bosLvl := lastPL
+else if bullBOS and state <= 0
+    state := 1
+    bosBar := bar_index
+    compCnt := 0
+    sawFVG := false
+    sawSwp := false
+    hiSince := high
+    loSince := low
+    bosLvl := lastPH
+
+// ----- 上昇セットアップ管理 -----
+if state == 1
+    hiSince := math.max(hiSince, high)
+    loSince := math.min(loSince, low)
+    if rng < atr * compMult
+        compCnt += 1
+    if bullFVG
+        sawFVG := true
+    if bullSwp
+        sawSwp := true
+    if useFresh and bar_index - bosBar > maxFresh
+        state := 0
+    if close < bosLvl
+        state := 0
+    if state == 1 and bar_index > bosBar
+        trig  = close > recentHigh and close > open
+        cComp = (not useComp)     or compCnt >= compMinBars
+        cReac = (not useReaccel)  or (close > ema and bodyRatio > reaccelBodyMin)
+        cSlp  = (not useEmaSlope) or emaBull
+        cAtr  = (not useAtrExp)   or atrExpand
+        cPb   = (not usePbDepth)  or (loSince >= bosLvl - atr * pbMult)
+        cFvg  = (not useFVG)      or sawFVG
+        cSwp  = (not useSweep)    or sawSwp
+        cHst  = (not useHST)      or htfBull
+        cMtf  = mtfBull
+        if trig and cComp and cReac and cSlp and cAtr and cPb and cFvg and cSwp and cHst and cMtf
+            longEntry := true
+            state := 0
+
+// ----- 下降セットアップ管理 -----
+if state == -1
+    hiSince := math.max(hiSince, high)
+    loSince := math.min(loSince, low)
+    if rng < atr * compMult
+        compCnt += 1
+    if bearFVG
+        sawFVG := true
+    if bearSwp
+        sawSwp := true
+    if useFresh and bar_index - bosBar > maxFresh
+        state := 0
+    if close > bosLvl
+        state := 0
+    if state == -1 and bar_index > bosBar
+        trig  = close < recentLow and close < open
+        cComp = (not useComp)     or compCnt >= compMinBars
+        cReac = (not useReaccel)  or (close < ema and bodyRatio > reaccelBodyMin)
+        cSlp  = (not useEmaSlope) or emaBear
+        cAtr  = (not useAtrExp)   or atrExpand
+        cPb   = (not usePbDepth)  or (hiSince <= bosLvl + atr * pbMult)
+        cFvg  = (not useFVG)      or sawFVG
+        cSwp  = (not useSweep)    or sawSwp
+        cHst  = (not useHST)      or htfBear
+        cMtf  = mtfBear
+        if trig and cComp and cReac and cSlp and cAtr and cPb and cFvg and cSwp and cHst and cMtf
+            shortEntry := true
+            state := 0
+
+// ===================== SL / TP 計算 =====================
+useStruct = slMode == "構造+MAスナップ"
+
+// スナップ対象EMAを配列化
+snapArr = array.new_float()
+if useTf1m
+    array.push(snapArr, ema_1m_1000)
+    array.push(snapArr, ema_1m_3000)
+if useTf5m
+    array.push(snapArr, ema_5m_1000)
+    array.push(snapArr, ema_5m_3000)
+if useTf15m
+    array.push(snapArr, ema_15m_1000)
+    array.push(snapArr, ema_15m_3000)
+if useTf1h
+    array.push(snapArr, ema_1h_1000)
+    array.push(snapArr, ema_1h_3000)
+if useTf4h
+    array.push(snapArr, ema_4h_1000)
+    array.push(snapArr, ema_4h_3000)
+
+// 旧モード(対称SL距離)
+slDistOld = slMode == "固定$" ? slFixed : atr * atrMult
+
+// --- ロング SL/TP ---
+anchorL  = math.min(bosLvl, loSince)
+slRawL   = anchorL - atr * structSlMult
+rawRiskL = close - slRawL
+slStructL = useMaSnap ? f_snap_sl(1, close, slRawL, rawRiskL, snapArr, realMaSlBuf, maSnapMaxMult) : slRawL
+slStructL := math.min(slStructL, slRawL)
+slStructL := math.min(slStructL, close - realMinRisk)
+longSL   = useStruct ? slStructL : close - slDistOld
+longRisk = close - longSL
+tpRawL   = close + longRisk * rr
+longTP   = (useStruct and useMaTP) ? f_snap_tp(1, close, tpRawL, longRisk, snapArr, realMaSlBuf, maTpMaxMult) : tpRawL
+
+// --- ショート SL/TP ---
+anchorS  = math.max(bosLvl, hiSince)
+slRawS   = anchorS + atr * structSlMult
+rawRiskS = slRawS - close
+slStructS = useMaSnap ? f_snap_sl(-1, close, slRawS, rawRiskS, snapArr, realMaSlBuf, maSnapMaxMult) : slRawS
+slStructS := math.max(slStructS, slRawS)
+slStructS := math.max(slStructS, close + realMinRisk)
+shortSL  = useStruct ? slStructS : close + slDistOld
+shortRisk = shortSL - close
+tpRawS   = close - shortRisk * rr
+shortTP  = (useStruct and useMaTP) ? f_snap_tp(-1, close, tpRawS, shortRisk, snapArr, realMaSlBuf, maTpMaxMult) : tpRawS
+
+// ===================== シグナル(5分足のみ / ポジション中は出さない) =====================
+isConf  = barstate.isconfirmed
+validTF = timeframe.period == "5"
+
+// 最大リスク見送り(構造モードのみ)。1ロット未満の見送り等のロット判定は撤去。
+riskOKL = (not useStruct) or (longRisk  > 0 and longRisk  <= realMaxRisk)
+riskOKS = (not useStruct) or (shortRisk > 0 and shortRisk <= realMaxRisk)
+gateL = validTF and canTrade and longRisk  > 0 and riskOKL
+gateS = validTF and canTrade and shortRisk > 0 and riskOKS
+
+// 仮想ポジション(ピラミッティング0: 保有中は新規シグナルを出さない)
+var bool  inPos    = false
+var int   posDir   = 0
+var float posEntry = na
+var float posSL    = na
+var float posTP    = na
+
+// --- 仮シグナル: 足が閉じる前に条件が揃ったらアラートのみ(1バー1回) ---
+if longEntry and not isConf and gateL and not inPos
+    alert(f_alertMsg("⚠️仮", 1, close, longSL, longTP), alert.freq_once_per_bar)
+if shortEntry and not isConf and gateS and not inPos
+    alert(f_alertMsg("⚠️仮", -1, close, shortSL, shortTP), alert.freq_once_per_bar)
+
+// --- 確定シグナル / ポジション管理: 足確定時のみ ---
+confLong  = false
+confShort = false
+if isConf
+    // 1) 保有中なら SL/TP 到達で決済(同バー再エントリーはしない=ピラミッティング0)
+    if inPos
+        if posDir == 1 and (low <= posSL or high >= posTP)
+            inPos  := false
+            posDir := 0
+        else if posDir == -1 and (high >= posSL or low <= posTP)
+            inPos  := false
+            posDir := 0
+    // 2) フラットなら確定エントリー
+    if not inPos
+        if longEntry and gateL
+            confLong := true
+            inPos    := true
+            posDir   := 1
+            posEntry := close
+            posSL    := longSL
+            posTP    := longTP
+        else if shortEntry and gateS
+            confShort := true
+            inPos     := true
+            posDir    := -1
+            posEntry  := close
+            posSL     := shortSL
+            posTP     := shortTP
+
+// 確定アラート(1回だけ)
+if confLong
+    alert(f_alertMsg("✅確定", 1, posEntry, posSL, posTP), alert.freq_once_per_bar)
+if confShort
+    alert(f_alertMsg("✅確定", -1, posEntry, posSL, posTP), alert.freq_once_per_bar)
+
+// 確定ラベル(エントリー / SL / TP)
+if confLong
+    label.new(bar_index, low, f_labelTxt(1, posEntry, posSL, posTP),
+         yloc=yloc.belowbar, style=label.style_label_up,
+         color=color.new(color.teal, 0), textcolor=color.white, size=size.small)
+if confShort
+    label.new(bar_index, high, f_labelTxt(-1, posEntry, posSL, posTP),
+         yloc=yloc.abovebar, style=label.style_label_down,
+         color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+
+// ===================== 表示 =====================
+plot(useEmaSlope or useReaccel ? ema : na, "EMA", color=color.new(color.orange, 0))
+plot(showSnapEma and useTf1m  ? ema_1m_1000  : na, "1m1000",  color=color.new(color.gray, 60))
+plot(showSnapEma and useTf1m  ? ema_1m_3000  : na, "1m3000",  color=color.new(color.gray, 65))
+plot(showSnapEma and useTf5m  ? ema_5m_1000  : na, "5m1000",  color=color.new(color.gray, 60))
+plot(showSnapEma and useTf5m  ? ema_5m_3000  : na, "5m3000",  color=color.new(color.gray, 65))
+plot(showSnapEma and useTf15m ? ema_15m_1000 : na, "15m1000", color=color.new(color.gray, 60))
+plot(showSnapEma and useTf15m ? ema_15m_3000 : na, "15m3000", color=color.new(color.gray, 65))
+plot(showSnapEma and useTf1h  ? ema_1h_1000  : na, "1h1000",  color=color.new(color.aqua, 55))
+plot(showSnapEma and useTf1h  ? ema_1h_3000  : na, "1h3000",  color=color.new(color.aqua, 60))
+plot(showSnapEma and useTf4h  ? ema_4h_1000  : na, "4h1000",  color=color.new(color.yellow, 55))
+plot(showSnapEma and useTf4h  ? ema_4h_3000  : na, "4h3000",  color=color.new(color.yellow, 60))
+plotshape(confLong,  title="確定Long",  style=shape.triangleup,   location=location.belowbar, color=color.teal, size=size.tiny)
+plotshape(confShort, title="確定Short", style=shape.triangledown, location=location.abovebar, color=color.red,  size=size.tiny)
+bgcolor(useHST ? (htfBull ? color.new(color.teal, 92) : htfBear ? color.new(color.red, 92) : na) : na, title="HTF bias")
