@@ -48,6 +48,12 @@ useSnap4 = input.bool(true, "対象EMA④ 使う", inline="s4", group=gS)
 snapEma4 = input.int(200, "期間", inline="s4", group=gS)
 showSnapEma = input.bool(false, "スナップ対象EMAを表示", group=gS)
 
+// --- TPのMAスナップ(RR下限つき) ---
+useMaTP     = input.bool(true,  "TPをMAへスナップ(RR下限つき)", group=gS,
+     tooltip="まずリスク×RRでTP仮置き。その外側に節目EMAがあればそこへ伸ばす。RR未満には縮めない(最低RRは確保)。")
+maTpMaxMult = input.float(4.0, "TP最大(リスク×)", minval=0.1, group=gS,
+     tooltip="TPを伸ばす上限。リスク×この値を超える遠いEMAへはスナップしない。")
+
 // ⑤ Session
 gT = "⑤ 時間帯(日本時間 JST)"
 useTime = input.bool(true, "時間フィルターを使う", group=gT)
@@ -119,6 +125,9 @@ beTrig = input.float(15.0, "発動: 含み益 +$ (固定$時)", group=gBE,
      tooltip="XAUUSDの価格(oz単価)が この$ だけ有利に動いたらSLを建値へ。")
 beOff  = input.float(0.0,  "建値オフセット $ (固定$時)", group=gBE,
      tooltip="建値+この$ にSLを置く。スプレッド/手数料分を残したいとき>0に。")
+useBEReentry = input.bool(false, "建値で切れたら同方向に即再エントリー", group=gBE,
+     tooltip="建値SLに当たって決済された場合のみ、同方向に再度エントリーする。TP決済時は再エントリーしない。")
+beReentryMax = input.int(1, "再エントリー回数の上限(1トレードあたり)", minval=1, group=gBE)
 
 // ===================== 共通計算 =====================
 atr      = ta.atr(atrLen)
@@ -188,6 +197,27 @@ f_snap_sl(dir, entry, slRaw, rawRisk, es, buf, maxMult) =>
         candRisk = dir == 1 ? entry - cand : cand - entry
         if candRisk > 0 and candRisk <= rawRisk * maxMult
             chosen := cand
+    chosen
+
+// TPのMAスナップ(RR下限つき)
+// tpRaw : リスク×RR で仮置きした最低TP。tpRaw より外側で最も近いEMA手前へ伸ばす。
+// 内側(RR未満)には縮めない。TP距離が baseRisk*maxMult を超える遠いEMAは採用しない。
+f_snap_tp(dir, entry, tpRaw, baseRisk, es, buf, maxMult) =>
+    float best = na
+    if array.size(es) > 0
+        for i = 0 to array.size(es) - 1
+            e = array.get(es, i)
+            if not na(e)
+                cand = dir == 1 ? e - buf : e + buf
+                ok   = dir == 1 ? cand >= tpRaw : cand <= tpRaw
+                if ok
+                    if na(best) or (dir == 1 ? cand < best : cand > best)
+                        best := cand
+    float chosen = tpRaw
+    if not na(best)
+        tpDist = dir == 1 ? best - entry : entry - best
+        if tpDist <= baseRisk * maxMult
+            chosen := best
     chosen
 
 // 構造(スイング高安)
@@ -321,6 +351,9 @@ slStructL := math.min(slStructL, slRawL)
 slStructL := math.min(slStructL, close - realMinRisk)
 longSL   = useStruct ? slStructL : close - slDistOld
 longRisk = close - longSL
+// ロングTP: リスク×RRで仮置き→MAスナップ(RR下限つき)
+tpRawL = close + longRisk * rr
+longTP = (useStruct and useMaTP) ? f_snap_tp(1, close, tpRawL, longRisk, snapArr, realMaSlBuf, maTpMaxMult) : tpRawL
 
 // --- ショート SL --- (ロングの鏡: アンカー = max(壊した安値, 戻り高値))
 anchorS  = math.max(bosLvl, hiSince)
@@ -331,6 +364,9 @@ slStructS := math.max(slStructS, slRawS)
 slStructS := math.max(slStructS, close + realMinRisk)
 shortSL  = useStruct ? slStructS : close + slDistOld
 shortRisk = shortSL - close
+// ショートTP
+tpRawS = close - shortRisk * rr
+shortTP = (useStruct and useMaTP) ? f_snap_tp(-1, close, tpRawS, shortRisk, snapArr, realMaSlBuf, maTpMaxMult) : tpRawS
 
 // --- ロット & リスク上限(構造モードのみ最大リスク見送り) ---
 riskUSD    = initCap * riskPct
@@ -343,34 +379,75 @@ sizeOK     = lotsRaw >= 1.0 and qty > 0 and riskCapOK
 
 // --- 発注 ---
 flat = strategy.position_size == 0
-var float beEntry = na
-var float beTP    = na
-var bool  beArmed = false
-var int   beDir   = 0
+var float beEntry  = na
+var float beTP     = na
+var bool  beArmed  = false   // BE発動待ち(まだ建値へ動かしていない)
+var int   beDir    = 0
+var bool  beMoved  = false   // SLを建値へ動かした
+var float beStop   = na      // 建値SLの価格(再エントリー判定用)
+var int   beReCnt  = 0       // このトレード起点の再エントリー回数
 if flat
     beArmed := false
+
+// 新規エントリー(シグナル) … 再エントリー回数をリセット
 if longEntry and canTrade and sizeOK and flat
     strategy.entry("Long", strategy.long, qty=qty)
-    strategy.exit("L-exit", from_entry="Long", stop=longSL, limit=close + longRisk * rr)
+    strategy.exit("L-exit", from_entry="Long", stop=longSL, limit=longTP)
     beEntry := close
-    beTP    := close + longRisk * rr
+    beTP    := longTP
     beArmed := useBE
+    beMoved := false
+    beStop  := na
+    beReCnt := 0
     beDir   := 1
 if shortEntry and canTrade and sizeOK and flat
     strategy.entry("Short", strategy.short, qty=qty)
-    strategy.exit("S-exit", from_entry="Short", stop=shortSL, limit=close - shortRisk * rr)
+    strategy.exit("S-exit", from_entry="Short", stop=shortSL, limit=shortTP)
     beEntry := close
-    beTP    := close - shortRisk * rr
+    beTP    := shortTP
     beArmed := useBE
+    beMoved := false
+    beStop  := na
+    beReCnt := 0
     beDir   := -1
+
 // +beTrig 動いたらSLを建値(+beOff)へ移動
 if useBE and beArmed and not flat
     if beDir == 1 and high >= beEntry + realBeTrig
-        strategy.exit("L-exit", from_entry="Long", stop=beEntry + realBeOff, limit=beTP)
+        beStop := beEntry + realBeOff
+        strategy.exit("L-exit", from_entry="Long", stop=beStop, limit=beTP)
         beArmed := false
+        beMoved := true
     else if beDir == -1 and low <= beEntry - realBeTrig
-        strategy.exit("S-exit", from_entry="Short", stop=beEntry - realBeOff, limit=beTP)
+        beStop := beEntry - realBeOff
+        strategy.exit("S-exit", from_entry="Short", stop=beStop, limit=beTP)
         beArmed := false
+        beMoved := true
+
+// 建値SLで決済された場合のみ 同方向に即再エントリー
+justClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+if useBEReentry and justClosed and beMoved and not na(beStop) and beReCnt < beReentryMax and canTrade
+    // 建値SLにタッチして閉じたか(TP決済は除外)
+    closedAtBE = beDir == 1 ? low <= beStop : high >= beStop
+    reRisk  = beDir == 1 ? longRisk : shortRisk
+    reTP    = beDir == 1 ? longTP   : shortTP
+    reSL    = beDir == 1 ? longSL   : shortSL
+    reLotsRaw = reRisk > 0 ? riskUSD / (reRisk * unitPerLot) : 0.0
+    reQty     = math.round(reLotsRaw) * unitPerLot
+    reRiskOK  = (not useStruct) or (reRisk > 0 and reRisk <= realMaxRisk)
+    if closedAtBE and reLotsRaw >= 1.0 and reQty > 0 and reRiskOK
+        if beDir == 1
+            strategy.entry("Long", strategy.long, qty=reQty)
+            strategy.exit("L-exit", from_entry="Long", stop=reSL, limit=reTP)
+        else
+            strategy.entry("Short", strategy.short, qty=reQty)
+            strategy.exit("S-exit", from_entry="Short", stop=reSL, limit=reTP)
+        beEntry := close
+        beTP    := reTP
+        beArmed := useBE
+        beMoved := false
+        beStop  := na
+        beReCnt += 1
 
 // ===================== 表示 =====================
 plot(useEmaSlope or useReaccel ? ema : na, "EMA", color=color.new(color.orange, 0))
