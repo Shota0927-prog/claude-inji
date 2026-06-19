@@ -7,7 +7,9 @@
 //  ・違い = 「レンジ内の反転売買」→「レンジ外(トレンド)での順張り」。
 //      レンジ端の定義 = ①〜⑤（固定ゾーン＋反発カウント／rangeValid）※絶対変更なし
 //      トレンド判定   = rangeValidではない + fastVolOk + レンジ外終値の連続維持（ADX不使用）
-//                       → trendRegime(1/-1) としてラッチ（押し目/戻りの最中も維持）
+//                       → trendRegime としてラッチ（押し目/戻りの最中も維持）
+//                         1=上昇 / -1=下降 / 0=なし / 2=上昇終了後の監視 / -2=下降終了後の監視
+//                         早期終了→監視→継続方向で復帰 or 反対方向で転換（終値2本確認）
 //      エントリー     = トレンド方向に一致する H&S が出たら順張りIN
 //                         上昇(regime=+1) → 逆三尊(inverse H&S, 安値圏) → BUY
 //                         下降(regime=-1) → 三尊  (H&S, 高値圏)         → SELL
@@ -76,6 +78,10 @@ trendBreakBars     = input.int(2,      "レンジ外終値の連続本数",    m
 trendMode          = input.string("BreakRun", "Trend Mode", options=["Candidate","BreakRun","BreakRun+EMA"], group=grpTrend)
 useTrendBodyFilter = input.bool(false, "トレンド足 実体フィルター",  group=grpTrend)
 trendBodyMult      = input.float(1.2,  "実体 > 平均実体(20) ×",     step=0.1, group=grpTrend)
+trendExitSwingLen     = input.int(10,  "トレンド解除用スイング本数", minval=2, group=grpTrend)
+useEma20TrendExit     = input.bool(true, "EMA20もトレンド解除に使う", group=grpTrend)
+trendReentryBars      = input.int(2,   "復帰/転換の連続終値本数",    minval=1, group=grpTrend)
+useEma20ReentryFilter = input.bool(true, "復帰/転換にEMA20方向を要求", group=grpTrend)
 
 // ===== ★Head & Shoulder（トレンド方向に一致するH&Sで順張り）=====
 grpHS = "3) Head & Shoulder (Trigger)"
@@ -282,19 +288,59 @@ trendDown = trendMode == "Candidate" ? trendDownCandidate :
             trendMode == "BreakRun"  ? trendDownBreakRun  :
             trendDownBreakRunEma
 
-// --- トレンド方向のラッチ（押し目/戻りの最中も方向を維持） ---
-var int trendRegime = 0      // 1=up, -1=down, 0=none
+// --- トレンド解除/復帰/転換の判定材料 ---
+// recentHighForExit/Low は「現在足を除く」直近スイング（[1]）
+recentHighForExit = ta.highest(high, trendExitSwingLen)[1]
+recentLowForExit  = ta.lowest(low,  trendExitSwingLen)[1]
+
+// trendRegime: 1=上昇 / -1=下降 / 0=なし / 2=上昇終了後の監視 / -2=下降終了後の監視
+var int trendRegime = 0
+
+// 早期トレンド終了（レンジ端まで戻るのを待たずに検知）
+exitUpTrend   = trendRegime == 1  and close < recentLowForExit  and (not useEma20TrendExit or close < ema20)
+exitDownTrend = trendRegime == -1 and close > recentHighForExit and (not useEma20TrendExit or close > ema20)
+
+// 監視状態からの復帰/転換用：直近 trendReentryBars 本連続の終値ブレイク
+int reBreakUpCount   = 0
+int reBreakDownCount = 0
+for i = 0 to trendReentryBars - 1
+    if close[i] > recentHighForExit[i]
+        reBreakUpCount += 1
+    if close[i] < recentLowForExit[i]
+        reBreakDownCount += 1
+reBreakUp   = reBreakUpCount   == trendReentryBars
+reBreakDown = reBreakDownCount == trendReentryBars
+
+// --- トレンド方向ラッチ + 監視状態の状態遷移 ---
 if barstate.isconfirmed
     if rangeValid
-        trendRegime := 0                    // レンジに戻ったら解除
-    else if trendUp
-        trendRegime := 1
-    else if trendDown
-        trendRegime := -1
-    if trendRegime == 1 and close < rangeLow
-        trendRegime := 0                    // 反対側へ終値抜け → 解除
-    if trendRegime == -1 and close > rangeHigh
-        trendRegime := 0
+        trendRegime := 0                                   // レンジ復帰 → 解除（最優先）
+    else if trendRegime == 1
+        // 上昇中：早期終了 or 反対側レンジ抜け → 上昇終了後の監視へ（exit を優先評価）
+        if exitUpTrend or close < rangeLow
+            trendRegime := 2
+    else if trendRegime == -1
+        // 下降中：早期終了 or 反対側レンジ抜け → 下降終了後の監視へ
+        if exitDownTrend or close > rangeHigh
+            trendRegime := -2
+    else if trendRegime == 2
+        // 上昇終了後の監視：反対(下降転換)を優先評価、続伸なら上昇復帰
+        if reBreakDown and fastVolOk and (not useEma20ReentryFilter or close < ema20)
+            trendRegime := -1
+        else if reBreakUp and fastVolOk
+            trendRegime := 1
+    else if trendRegime == -2
+        // 下降終了後の監視：反対(上昇転換)を優先評価、続落なら下降復帰
+        if reBreakUp and fastVolOk and (not useEma20ReentryFilter or close > ema20)
+            trendRegime := 1
+        else if reBreakDown and fastVolOk
+            trendRegime := -1
+    else
+        // ノートレンド(0) → 新規検出
+        if trendUp
+            trendRegime := 1
+        else if trendDown
+            trendRegime := -1
 
 // =============================================================================
 // 4) Head & Shoulder 検出（左肩/頭=Pivot確定, 右肩=左肩±許容への戻り）
@@ -694,6 +740,8 @@ plot(ema20,  "EMA20",  color=color.new(color.purple, 0), linewidth=1)
 bgcolor(showBgRange and isRange            ? color.new(color.yellow, 92) : na, title="Range BG")
 bgcolor(showBgRange and trendRegime == 1   ? color.new(color.green, 90)  : na, title="Trend Up BG")
 bgcolor(showBgRange and trendRegime == -1  ? color.new(color.red, 90)    : na, title="Trend Down BG")
+bgcolor(showBgRange and trendRegime == 2   ? color.new(color.green, 96)  : na, title="Trend Up Watch BG")
+bgcolor(showBgRange and trendRegime == -2  ? color.new(color.red, 96)    : na, title="Trend Down Watch BG")
 
 // 頭/左肩レベル
 plot(showPatternMarks ? sellHeadHigh : na,         "Head High",  color=color.new(color.red, 55),   style=plot.style_circles)
@@ -812,7 +860,9 @@ if showInfoTable and barstate.islast
     table.cell(infoTable, 0, 5, "Trend Cand.",     text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
     table.cell(infoTable, 1, 5, (trendCandidate?"TRUE":"FALSE"),      text_color=(trendCandidate?color.lime:color.gray), text_size=size.small)
     table.cell(infoTable, 0, 6, "Trend Regime",    text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
-    table.cell(infoTable, 1, 6, (trendRegime==1?"UP":trendRegime==-1?"DOWN":"-"), text_color=(trendRegime==1?color.lime:trendRegime==-1?color.red:color.gray), text_size=size.small)
+    regimeTxt = trendRegime==1?"UP":trendRegime==-1?"DOWN":trendRegime==2?"WATCH UP":trendRegime==-2?"WATCH DN":"-"
+    regimeCol = trendRegime==1?color.lime:trendRegime==-1?color.red:trendRegime==2?color.new(color.lime,40):trendRegime==-2?color.new(color.red,40):color.gray
+    table.cell(infoTable, 1, 6, regimeTxt, text_color=regimeCol, text_size=size.small)
     table.cell(infoTable, 0, 7, "Sell H&S Ready",  text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
     table.cell(infoTable, 1, 7, (sellHsOk?"TRUE":"FALSE"),            text_color=(sellHsOk?color.lime:color.gray), text_size=size.small)
     table.cell(infoTable, 0, 8, "Buy iH&S Ready",  text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
