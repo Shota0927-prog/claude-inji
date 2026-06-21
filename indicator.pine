@@ -1,68 +1,503 @@
-// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
-// © your_username
-
 //@version=5
-indicator(
-     title       = "My FX Indicator",
-     shorttitle  = "MyFX",
-     overlay     = true,       // true: ローソク足に重ねて表示 / false: 別パネルに表示
-     max_bars_back = 500
- )
+// =============================================================================
+// Gold Range FVG Absorption Reversion — Indicator (①〜⑤ Range)
+// -----------------------------------------------------------------------------
+//  ・レンジ端の定義 = ①〜⑤（固定ゾーン＋反発カウント／rangeValid）
+//  ・エントリーの引き金 = FVG Absorption（Sweepは使わない）
+//      SELL: レンジ上端付近で Bullish FVG が下方ブレイク（インバース）→ 陰線確定
+//      BUY : レンジ下端付近で Bearish FVG が上方ブレイク（インバース）→ 陽線確定
+//
+//  シグナル仕様：
+//   ・確定シグナル：足が確定したタイミングで1回だけ（アラート＋ラベル）
+//   ・仮シグナル  ：足が閉じる前に「足確定以外の条件」が揃ったら1回だけ（アラートのみ）
+//                   リセット条件＝確定が出た／違うFVGに切り替わった
+//   ・アラート/ラベルは「5分足のみ」かつ「ポジション保有中は出さない」（疑似ピラミッティング0）
+//   ・建値移動の時もアラート
+//
+//  ※ ストラテジー版の未使用フィルター（障害物/トレンド/ST/MAスナップ/上位足EMA配列/
+//     低ボラ禁止）は見やすさ優先で削除済み。
+// =============================================================================
+indicator("Gold Range FVG Absorption (①〜⑤ Range) [Indicator]",
+     overlay       = true,
+     max_bars_back = 500)
 
-// ============================================================
-// 入力パラメーター
-// ============================================================
-grp_ma = "移動平均線"
-ma_len  = input.int(20,  title = "MA 期間",  minval = 1, group = grp_ma)
-ma_type = input.string("EMA", title = "MA 種別",
-             options = ["SMA", "EMA", "WMA", "VWMA"], group = grp_ma)
+// ---- 5分足のみアラート/ラベルを出す ----
+is5m = timeframe.period == "5"
 
-grp_disp = "表示設定"
-show_ma   = input.bool(true, title = "MA を表示", group = grp_disp)
-ma_color  = input.color(color.new(color.blue, 0), title = "MA カラー", group = grp_disp)
+// =============================================================================
+// 1) Inputs
+// =============================================================================
+grpVol = "0) Volatility Base"
+atrLenBase = input.int(14, "基準ATR本数", minval=1, group=grpVol)
+atrTf      = input.timeframe("", "基準ATR時間足(空=チャート)", group=grpVol)
+baseAtr    = atrTf == "" ? ta.atr(atrLenBase)
+                         : request.security(syminfo.tickerid, atrTf, ta.atr(atrLenBase)[1], lookahead=barmerge.lookahead_off)
 
-// ============================================================
-// 計算ロジック
-// ============================================================
-float ma_value = switch ma_type
-    "SMA"  => ta.sma(close,  ma_len)
-    "EMA"  => ta.ema(close,  ma_len)
-    "WMA"  => ta.wma(close,  ma_len)
-    "VWMA" => ta.vwma(close, ma_len)
-    =>        ta.ema(close,  ma_len)
+// ===== ①〜⑤ レンジ定義の入力 =====
+grpRangeDef = "1) Range Definition (①〜⑤)"
+emaLen            = input.int(200, "① EMA Length",              minval=1, group=grpRangeDef)
+emaSlopeLookback  = input.int(20,  "① EMA Slope Lookback",      minval=1, group=grpRangeDef)
+emaSlopeThreshold = input.float(3.0,"① EMA Slope Threshold",    step=0.1, group=grpRangeDef)
+rangeLookback     = input.int(20,  "② Range Lookback(再アンカー)", minval=2, group=grpRangeDef)
+minRangeWidth     = input.float(10,"② Min Range Width",         step=0.5, group=grpRangeDef)
+maxRangeWidth     = input.float(80,"② Max Range Width",         step=0.5, group=grpRangeDef)
+touchToleranceATR = input.float(1.5,"③④ Touch Tolerance(×ATR)", step=0.1, group=grpRangeDef)
+minUpperReactions = input.int(2,   "③ Min Upper Reactions",     minval=1, group=grpRangeDef)
+minLowerReactions = input.int(2,   "④ Min Lower Reactions",     minval=1, group=grpRangeDef)
+rangeQualityMin   = input.float(3, "⑤ Range Width ÷ ATR Min",   step=0.5, group=grpRangeDef)
 
-// トレンド方向（MA が上向き = 上昇トレンド）
-bool uptrend   = ma_value > ma_value[1]
-bool downtrend = ma_value < ma_value[1]
+// ===== FVG Absorption =====
+grpFvg = "2) FVG Absorption"
+fvgMaxAge             = input.int(5,   "FVG有効期限 本数", minval=1, group=grpFvg)
+useFvgThicknessFilter = input.bool(true,"FVG厚みフィルター(薄いFVGを除外)", group=grpFvg)
+fvgMinThicknessATR    = input.float(0.0,"FVG最低厚み(×ATR)", minval=0.0, step=0.05, group=grpFvg)
 
-// ============================================================
-// プロット
-// ============================================================
-plot(
-     show_ma ? ma_value : na,
-     title     = "MA",
-     color     = uptrend ? color.lime : downtrend ? color.red : ma_color,
-     linewidth = 2
- )
+// ===== Win Zone / TP-SL / 資金管理 =====
+grpWin = "3) Win Zone / TP-SL"
+slFixed   = input.float(30.0, "SL ($/固定)", minval=0.1, step=0.1, group=grpWin)
+useAtrSL  = input.bool(true, "SLをATR可変にする", group=grpWin)
+atrSLMult = input.float(5.0, "SL用ATR係数", minval=0.1, step=0.1, group=grpWin)
+slDollars = useAtrSL ? baseAtr * atrSLMult : slFixed
+riskPctPerTrade = input.float(5.0, "Risk % per Trade", minval=0.1, step=0.1, group=grpWin)
+useRRTP   = input.bool(true,  "TPをRR比率で出す", group=grpWin)
+rrRatio   = input.float(1.0,  "RR (TP = SL × RR)", minval=0.1, step=0.1, group=grpWin)
+tpFixed   = input.float(10.0, "TP ($/固定:RR OFF時)", minval=0.1, step=0.1, group=grpWin)
+tpDollars = useRRTP ? slDollars * rrRatio : tpFixed
+winZoneMult = input.float(0.2, "Win Zone 余地(xRisk)", minval=0.0, step=0.1, group=grpWin)
+useBreakeven = input.bool(false, "建値移動を使う", group=grpWin)
+beTrigger    = input.float(0.7,  "建値移動の発動(xTP到達)", minval=0.1, maxval=1.0, step=0.05, group=grpWin)
+beOffset     = input.float(0.0,  "建値オフセット($) +で少し利益側", step=0.1, group=grpWin)
+useReentry = input.bool(false, "建値決済後に再エントリー", group=grpWin)
+maxReentry = input.int(1, "再エントリー最大回数", minval=1, group=grpWin)
+useRangeTP   = input.bool(true,  "TPをレンジ基準で置く", group=grpWin)
+tpRangePct   = input.float(50, "TP位置：レンジの何%先 (50=中央/100=反対側)", minval=1, maxval=100, step=5, group=grpWin)
+tpBufferMult = input.float(0.0,  "TP Buffer (×ATR) 手前で利確", minval=0.0, step=0.1, group=grpWin)
+minTpDist    = input.float(2.0,  "最小TP距離($) 安全弁", minval=0.1, step=0.1, group=grpWin)
 
-// 背景色でトレンドをハイライト
-bgcolor(
-     uptrend   ? color.new(color.green, 95) :
-     downtrend ? color.new(color.red,   95) : na,
-     title = "トレンド背景"
- )
+// ===== Session Filter (Asia/Tokyo time) =====
+grpSession = "4) Session Filter (Asia/Tokyo time)"
+useTokyoSession  = input.bool(true,  "Tokyo  10:00-16:00",     group=grpSession)
+useLondonSession = input.bool(true,  "London 16:00-21:00",     group=grpSession)
+useNYSession     = input.bool(false, "NY     21:00-03:00",     group=grpSession)
+manualNewsBlock  = input.bool(false, "Manual News Block (ON=no trade)", group=grpSession)
+avoidOpenMin    = input.bool(false, "セッション初動を回避", group=grpSession)
+blockLondonOpen = input.session("1600-1645", "London初動ブロック帯", group=grpSession)
+blockNYOpen     = input.session("2100-2145", "NY初動ブロック帯",     group=grpSession)
 
-// ============================================================
-// アラート
-// ============================================================
-alertcondition(
-     ta.crossover(close, ma_value),
-     title   = "価格が MA を上抜け",
-     message = "{{ticker}} : 価格が MA を上抜けました ({{close}})"
- )
+// ===== Display =====
+grpDisp = "5) Display"
+showRange       = input.bool(true,  "Show Range Lines",        group=grpDisp)
+showBgRange     = input.bool(true,  "Color Background on Range",group=grpDisp)
+showFvgMarks    = input.bool(true,  "Show FVG Marks",          group=grpDisp)
+showEntryLabels = input.bool(true,  "Show Entry/SL/TP Labels", group=grpDisp)
+showInfoTable   = input.bool(true,  "Show Range Info Table",   group=grpDisp)
 
-alertcondition(
-     ta.crossunder(close, ma_value),
-     title   = "価格が MA を下抜け",
-     message = "{{ticker}} : 価格が MA を下抜けました ({{close}})"
- )
+// =============================================================================
+// 2) ①〜⑤ Range Definition（固定ゾーン＋反発カウント）
+// =============================================================================
+ema200 = ta.ema(close, emaLen)
+hh  = ta.highest(high, rangeLookback)
+ll  = ta.lowest(low,  rangeLookback)
+tol = baseAtr * touchToleranceATR
+
+var float rangeHighFixed = na
+var float rangeLowFixed  = na
+var int   upperReactions = 0
+var int   lowerReactions = 0
+var bool  inUpperZone    = false
+var bool  inLowerZone    = false
+
+if barstate.isconfirmed
+    needInit  = na(rangeHighFixed) or na(rangeLowFixed)
+    brokeUp   = not needInit and close > rangeHighFixed + tol and close[1] > rangeHighFixed + tol
+    brokeDown = not needInit and close < rangeLowFixed  - tol and close[1] < rangeLowFixed  - tol
+    if needInit or brokeUp or brokeDown
+        rangeHighFixed := hh
+        rangeLowFixed  := ll
+        upperReactions := 0
+        lowerReactions := 0
+        inUpperZone    := false
+        inLowerZone    := false
+    else
+        if high >= rangeHighFixed - tol
+            inUpperZone := true
+        if inUpperZone and close < rangeHighFixed - tol
+            upperReactions += 1
+            inUpperZone    := false
+        if low <= rangeLowFixed + tol
+            inLowerZone := true
+        if inLowerZone and close > rangeLowFixed + tol
+            lowerReactions += 1
+            inLowerZone    := false
+
+// ①〜⑤ 各判定
+emaSlopeNorm     = math.abs((ema200 - ema200[emaSlopeLookback]) / baseAtr)
+emaSlopeOK       = emaSlopeNorm < emaSlopeThreshold
+rangeWidthVal    = rangeHighFixed - rangeLowFixed
+rangeWidthOK     = rangeWidthVal >= minRangeWidth and rangeWidthVal <= maxRangeWidth
+upperReactionsOK = upperReactions >= minUpperReactions
+lowerReactionsOK = lowerReactions >= minLowerReactions
+rangeQuality     = rangeWidthVal / baseAtr
+rangeQualityOK   = rangeQuality >= rangeQualityMin
+rangeValid       = emaSlopeOK and rangeWidthOK and upperReactionsOK and lowerReactionsOK and rangeQualityOK
+
+// ブリッジ
+rangeHigh  = rangeHighFixed
+rangeLow   = rangeLowFixed
+rangeWidth = rangeWidthVal
+rangeMid   = (rangeHighFixed + rangeLowFixed) / 2.0
+isRange    = rangeValid
+
+// =============================================================================
+// 3) FVG Detection & Absorption
+// =============================================================================
+nearHigh = high >= rangeHigh - tol
+nearLow  = low  <= rangeLow  + tol
+
+isBull = close > open
+isBear = close < open
+
+// FVG（3本パターン）発生
+bullFvgRaw = low  > high[2]     // Bullish FVG（窓開け上）
+bearFvgRaw = high < low[2]      // Bearish FVG（窓開け下）
+
+bullFvgLowRaw  = high[2]        // Bullish FVG 下限
+bullFvgHighRaw = low            // Bullish FVG 上限
+bearFvgLowRaw  = high           // Bearish FVG 下限
+bearFvgHighRaw = low[2]         // Bearish FVG 上限
+bullThick = bullFvgHighRaw - bullFvgLowRaw
+bearThick = bearFvgHighRaw - bearFvgLowRaw
+bullThickOk = not useFvgThicknessFilter or (bullThick >= baseAtr * fvgMinThicknessATR)
+bearThickOk = not useFvgThicknessFilter or (bearThick >= baseAtr * fvgMinThicknessATR)
+
+// アクティブFVGの状態（方向ごとに最新1つ）。id は「違うFVGに切替」検知用。
+var float fvgBullLow  = na
+var float fvgBullHigh = na
+var int   fvgBullAge  = 0
+var bool  fvgBullRet  = false
+var int   fvgBullId   = 0
+
+var float fvgBearLow  = na
+var float fvgBearHigh = na
+var int   fvgBearAge  = 0
+var bool  fvgBearRet  = false
+var int   fvgBearId   = 0
+
+bool buyTrigger  = false
+bool sellTrigger = false
+
+if barstate.isconfirmed
+    // ---- SELL：Bullish FVG の下方ブレイク（インバース） ----
+    if fvgBullAge > 0
+        if low <= fvgBullHigh
+            fvgBullRet := true
+        if fvgBullRet and close < fvgBullLow and isBear and nearHigh
+            sellTrigger := true
+            fvgBullAge := 0
+        else
+            fvgBullAge := fvgBullAge - 1
+
+    // ---- BUY：Bearish FVG の上方ブレイク（インバース） ----
+    if fvgBearAge > 0
+        if high >= fvgBearLow
+            fvgBearRet := true
+        if fvgBearRet and close > fvgBearHigh and isBull and nearLow
+            buyTrigger := true
+            fvgBearAge := 0
+        else
+            fvgBearAge := fvgBearAge - 1
+
+    // ---- 新規FVG登録（最後に：発生足での自己トリガーを防止） ----
+    if bullFvgRaw and bullThickOk
+        fvgBullLow  := bullFvgLowRaw
+        fvgBullHigh := bullFvgHighRaw
+        fvgBullAge  := fvgMaxAge
+        fvgBullRet  := false
+        fvgBullId   += 1
+    if bearFvgRaw and bearThickOk
+        fvgBearLow  := bearFvgLowRaw
+        fvgBearHigh := bearFvgHighRaw
+        fvgBearAge  := fvgMaxAge
+        fvgBearRet  := false
+        fvgBearId   += 1
+
+// ---- 仮シグナル用：足確定を待たない（ライブ）トリガー ----
+// FVG状態は確定足でしか更新されないため、形成中の足では直近確定値を使う。
+isBullLive   = close > open
+isBearLive   = close < open
+nearHighLive = high >= rangeHigh - tol
+nearLowLive  = low  <= rangeLow  + tol
+tentSellRaw  = fvgBullAge > 0 and (fvgBullRet or low  <= fvgBullHigh) and close < fvgBullLow  and isBearLive and nearHighLive
+tentBuyRaw   = fvgBearAge > 0 and (fvgBearRet or high >= fvgBearLow ) and close > fvgBearHigh and isBullLive and nearLowLive
+
+// =============================================================================
+// 4) Win Zone（実際に使うTP距離ベースで判定）
+// =============================================================================
+tpBufferDollars = baseAtr * tpBufferMult
+actualRisk      = slDollars
+
+tpRangeFrac     = tpRangePct / 100.0
+tpTargetSell    = rangeHigh - rangeWidth * tpRangeFrac
+tpTargetBuy     = rangeLow  + rangeWidth * tpRangeFrac
+sellTargetPrice = tpTargetSell + tpBufferDollars
+buyTargetPrice  = tpTargetBuy  - tpBufferDollars
+sellTargetDist  = useRangeTP ? (close - sellTargetPrice) : tpDollars
+buyTargetDist   = useRangeTP ? (buyTargetPrice - close)  : tpDollars
+
+winZoneSell = (sellTargetDist >= minTpDist) and (sellTargetDist >= actualRisk * winZoneMult)
+winZoneBuy  = (buyTargetDist  >= minTpDist) and (buyTargetDist  >= actualRisk * winZoneMult)
+
+sellTpValid = not useRangeTP or ((sellTargetPrice < close) and ((close - sellTargetPrice) >= minTpDist))
+buyTpValid  = not useRangeTP or ((buyTargetPrice  > close) and ((buyTargetPrice  - close) >= minTpDist))
+
+// 表示・通知に使う実TP
+sellTpShow = useRangeTP ? math.min(sellTargetPrice, close - minTpDist) : (close - tpDollars)
+buyTpShow  = useRangeTP ? math.max(buyTargetPrice,  close + minTpDist) : (close + tpDollars)
+
+// =============================================================================
+// 5) Session Filter (Asia/Tokyo time)
+// =============================================================================
+inTokyo  = not na(time(timeframe.period, "1000-1600", "Asia/Tokyo"))
+inLondon = not na(time(timeframe.period, "1600-2100", "Asia/Tokyo"))
+inNY     = not na(time(timeframe.period, "2100-0300", "Asia/Tokyo"))
+
+sessionOk =
+     (useTokyoSession  and inTokyo)  or
+     (useLondonSession and inLondon) or
+     (useNYSession     and inNY)
+noSessionSelected = not useTokyoSession and not useLondonSession and not useNYSession
+sessionFinal = noSessionSelected ? false : sessionOk
+
+newsOk = not manualNewsBlock
+inOpenBlock = avoidOpenMin and (
+     not na(time(timeframe.period, blockLondonOpen, "Asia/Tokyo")) or
+     not na(time(timeframe.period, blockNYOpen,     "Asia/Tokyo")))
+
+// 足確定以外の共通条件
+baseLive = isRange and sessionFinal and newsOk and not inOpenBlock
+
+// =============================================================================
+// 6) メッセージ生成
+// =============================================================================
+f_sigMsg(_tag, _dir, _e, _sl, _tp) =>
+    _w  = math.abs(_e - _sl)
+    _be = useBreakeven ? "建値移動=ON(" + str.tostring(beTrigger, "#.##") + "×TP到達)" : "建値移動=OFF"
+    _re = useReentry   ? "再エントリー=最大" + str.tostring(maxReentry) + "回"          : "再エントリー=OFF"
+    _tag + _dir +
+         " | E="    + str.tostring(_e,  "#.##") +
+         " SL="     + str.tostring(_sl, "#.##") +
+         " TP="     + str.tostring(_tp, "#.##") +
+         " 幅="     + str.tostring(_w,  "#.##") +
+         " " + _be +
+         " " + _re +
+         " リスク=" + str.tostring(riskPctPerTrade, "#.##") + "%"
+
+// =============================================================================
+// 7) ポジション状態マシン（指標版：疑似ピラミッティング0 / 建値移動 / 再エントリー）
+// =============================================================================
+var bool  inPos        = false
+var int   posDir       = 0        // 1 long / -1 short
+var float posEntry     = na
+var float posSL        = na
+var float posTP        = na
+var float posRisk      = na       // 当初リスク幅（建値移動後も保持）
+var bool  beDone       = false
+var int   reentryCount = 0
+var bool  armReentry   = false
+var bool  reIsLong     = false
+var float reRiskW      = na
+var float reTpW        = na
+
+// 仮シグナルの「FVGごとに1回」管理（id一致なら発火済み）
+var int tentSellFiredId = -1
+var int tentBuyFiredId  = -1
+
+// 発火フラグ（このバーの出力用）
+bool fireConfSell = false
+bool fireConfBuy  = false
+bool fireReentry  = false
+bool fireBeAlert  = false
+
+if barstate.isconfirmed
+    // (A) 前回の建値決済からの再エントリー（1本後）
+    if not inPos and armReentry and useReentry and reentryCount < maxReentry and reRiskW > 0
+        reentryCount += 1
+        inPos      := true
+        posDir     := reIsLong ? 1 : -1
+        posEntry   := close
+        posRisk    := reRiskW
+        posSL      := reIsLong ? close - reRiskW : close + reRiskW
+        posTP      := reIsLong ? close + reTpW   : close - reTpW
+        beDone     := false
+        armReentry := false
+        fireReentry := true
+
+    // (B) 保有ポジションの管理（建値移動 → 決済判定）
+    if inPos
+        tpDist = math.abs(posTP - posEntry)
+        // 建値移動
+        if useBreakeven and not beDone
+            if posDir == 1 and high >= posEntry + tpDist * beTrigger
+                beDone := true
+                posSL  := posEntry + beOffset
+                fireBeAlert := true
+            if posDir == -1 and low <= posEntry - tpDist * beTrigger
+                beDone := true
+                posSL  := posEntry - beOffset
+                fireBeAlert := true
+        // 決済判定（高安でSL/TP到達）
+        bool exitedBE = false
+        if posDir == 1
+            if low <= posSL
+                inPos    := false
+                exitedBE := beDone
+            else if high >= posTP
+                inPos := false
+        else if posDir == -1
+            if high >= posSL
+                inPos    := false
+                exitedBE := beDone
+            else if low <= posTP
+                inPos := false
+        // 建値決済なら再エントリーを予約
+        if not inPos and exitedBE and useReentry and reentryCount < maxReentry
+            armReentry := true
+            reIsLong   := posDir == 1
+            reRiskW    := posRisk
+            reTpW      := math.abs(posTP - posEntry)
+
+    // (C) 新規エントリー（フラット かつ 再エントリーしていない時のみ）
+    if not inPos and not fireReentry
+        if baseLive and sellTrigger and winZoneSell and sellTpValid
+            inPos        := true
+            posDir       := -1
+            posEntry     := close
+            posRisk      := slDollars
+            posSL        := close + slDollars
+            posTP        := sellTpShow
+            beDone       := false
+            reentryCount := 0
+            armReentry   := false
+            fireConfSell := true
+        else if baseLive and buyTrigger and winZoneBuy and buyTpValid
+            inPos        := true
+            posDir       := 1
+            posEntry     := close
+            posRisk      := slDollars
+            posSL        := close - slDollars
+            posTP        := buyTpShow
+            beDone       := false
+            reentryCount := 0
+            armReentry   := false
+            fireConfBuy  := true
+
+// =============================================================================
+// 8) 仮シグナル（足確定前・アラートのみ・FVGごとに1回・保有中は出さない）
+// =============================================================================
+fireTentSell = is5m and not inPos and baseLive and tentSellRaw and winZoneSell and sellTpValid and tentSellFiredId != fvgBullId
+fireTentBuy  = is5m and not inPos and baseLive and tentBuyRaw  and winZoneBuy  and buyTpValid  and tentBuyFiredId  != fvgBearId
+
+if fireTentSell
+    tentSellFiredId := fvgBullId
+    alert(f_sigMsg("仮", "SELL", close, close + slDollars, sellTpShow), alert.freq_once_per_bar)
+if fireTentBuy
+    tentBuyFiredId := fvgBearId
+    alert(f_sigMsg("仮", "BUY", close, close - slDollars, buyTpShow), alert.freq_once_per_bar)
+
+// =============================================================================
+// 9) 確定シグナル・建値移動・再エントリーのアラート＆ラベル（5分足のみ）
+// =============================================================================
+// 確定 SELL
+if is5m and fireConfSell
+    alert(f_sigMsg("確定", "SELL", posEntry, posSL, posTP), alert.freq_once_per_bar_close)
+    if showEntryLabels
+        label.new(bar_index, high,
+             text  = "SELL\nE="  + str.tostring(posEntry, "#.##") +
+                     "\nSL=" + str.tostring(posSL, "#.##") +
+                     "\nTP=" + str.tostring(posTP, "#.##"),
+             style = label.style_label_down,
+             color = color.new(color.red, 0),
+             textcolor = color.white,
+             size  = size.small)
+
+// 確定 BUY
+if is5m and fireConfBuy
+    alert(f_sigMsg("確定", "BUY", posEntry, posSL, posTP), alert.freq_once_per_bar_close)
+    if showEntryLabels
+        label.new(bar_index, low,
+             text  = "BUY\nE="  + str.tostring(posEntry, "#.##") +
+                     "\nSL=" + str.tostring(posSL, "#.##") +
+                     "\nTP=" + str.tostring(posTP, "#.##"),
+             style = label.style_label_up,
+             color = color.new(color.green, 0),
+             textcolor = color.white,
+             size  = size.small)
+
+// 再エントリー
+if is5m and fireReentry
+    alert("再エントリー(" + str.tostring(reentryCount) + "/" + str.tostring(maxReentry) + ") " +
+         (reIsLong ? "BUY" : "SELL") +
+         " | E="  + str.tostring(posEntry, "#.##") +
+         " SL=" + str.tostring(posSL, "#.##") +
+         " TP=" + str.tostring(posTP, "#.##"),
+         alert.freq_once_per_bar_close)
+    if showEntryLabels
+        label.new(bar_index, reIsLong ? low : high,
+             text  = (reIsLong ? "RE-BUY" : "RE-SELL") +
+                     "\nE="  + str.tostring(posEntry, "#.##") +
+                     "\nSL=" + str.tostring(posSL, "#.##") +
+                     "\nTP=" + str.tostring(posTP, "#.##"),
+             style = reIsLong ? label.style_label_up : label.style_label_down,
+             color = color.new(color.blue, 0),
+             textcolor = color.white,
+             size  = size.small)
+
+// 建値移動
+if is5m and fireBeAlert
+    alert("建値移動 | " + (posDir == 1 ? "BUY" : "SELL") +
+         " E="    + str.tostring(posEntry, "#.##") +
+         " 新SL=" + str.tostring(posSL, "#.##"),
+         alert.freq_once_per_bar_close)
+
+// =============================================================================
+// 10) Plot / Display
+// =============================================================================
+plot(showRange ? rangeHigh : na, "Range High", color=color.new(color.red,   0), linewidth=1)
+plot(showRange ? rangeLow  : na, "Range Low",  color=color.new(color.green, 0), linewidth=1)
+plot(showRange ? rangeMid  : na, "Range Mid",  color=color.new(color.gray,  0), style=plot.style_linebr)
+plot(ema200, "EMA200", color=color.new(color.blue, 0), linewidth=2)
+
+bgcolor(showBgRange and isRange ? color.new(color.yellow, 92) : na, title="Range BG")
+
+// FVG発生マーク
+plotshape(showFvgMarks and bearFvgRaw and bearThickOk, title="Bearish FVG",
+     style=shape.triangledown, location=location.abovebar, color=color.new(color.maroon, 0), size=size.tiny)
+plotshape(showFvgMarks and bullFvgRaw and bullThickOk, title="Bullish FVG",
+     style=shape.triangleup,   location=location.belowbar, color=color.new(color.teal,   0), size=size.tiny)
+// 反転待ち（FVG内に戻り、ブレイク確定待ち）
+plotshape(showFvgMarks and fvgBullAge > 0 and fvgBullRet and not sellTrigger, title="SELL 反転待ち",
+     style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+plotshape(showFvgMarks and fvgBearAge > 0 and fvgBearRet and not buyTrigger,  title="BUY 反転待ち",
+     style=shape.xcross, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny)
+
+// =============================================================================
+// 11) Range Info Table（①〜⑤ の状態を可視化）
+// =============================================================================
+var table infoTable = table.new(position.top_right, 2, 8, border_width=1, frame_width=1, frame_color=color.gray)
+if showInfoTable and barstate.islast
+    table.cell(infoTable, 0, 0, "Range High",      text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 0, str.tostring(rangeHighFixed, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 1, "Range Low",       text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 1, str.tostring(rangeLowFixed, "#.##"),  text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 2, "Range Width",     text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(rangeWidthVal, "#.##"),  text_color=(rangeWidthOK?color.lime:color.red), text_size=size.small)
+    table.cell(infoTable, 0, 3, "Width ÷ ATR",      text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(rangeQuality, "#.##"),   text_color=(rangeQualityOK?color.lime:color.red), text_size=size.small)
+    table.cell(infoTable, 0, 4, "Upper Reactions", text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 4, str.tostring(upperReactions),         text_color=(upperReactionsOK?color.lime:color.red), text_size=size.small)
+    table.cell(infoTable, 0, 5, "Lower Reactions", text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 5, str.tostring(lowerReactions),         text_color=(lowerReactionsOK?color.lime:color.red), text_size=size.small)
+    table.cell(infoTable, 0, 6, "EMA Slope OK",    text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 6, (emaSlopeOK?"TRUE":"FALSE"),          text_color=(emaSlopeOK?color.lime:color.red), text_size=size.small)
+    table.cell(infoTable, 0, 7, "Range Valid",     text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 7, (rangeValid?"TRUE":"FALSE"),          text_color=(rangeValid?color.lime:color.red), text_size=size.small)
