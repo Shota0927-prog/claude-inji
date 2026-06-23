@@ -1,0 +1,303 @@
+//@version=5
+// =============================================================================
+// XAUUSD Trend SELL  —  5分環境認識 × 1分エントリー (SELL ONLY)
+// -----------------------------------------------------------------------------
+//  思想： 5分 = 売る「場所」 / 1分 = 「タイミング」
+//      ① 上位足下降（1H close<EMA200 & EMA200下向き / 4H close<EMA200）
+//      ② 5分 SELL許可ゾーン（5分 close<EMA200 / EMA20<50<200 / EMA20or50タッチ後N本以内）
+//      ③ 1分 反転トリガー（1分 trend + タッチ/スイープ/FVG/陰線をスコア化）
+//  ・1分足チャート上で稼働。5分/上位足は request.security() で取得（非リペイント）。
+//  ・1分足だけでは絶対に入らない（必ず①②③の3段階）。
+//  ・SELL専用 / SL最大$12（超過は見送り、縮めない）/ 1日10回前後を狙う。
+// =============================================================================
+strategy("XAUUSD M5 Zone x M1 Trend SELL",
+     overlay                 = true,
+     pyramiding              = 0,
+     calc_on_order_fills     = false,
+     calc_on_every_tick      = false,
+     process_orders_on_close = true,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     initial_capital         = 1000,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 0.0,
+     max_labels_count        = 500)
+
+// =============================================================================
+// 1) Inputs
+// =============================================================================
+grpHtf = "1) 上位足下降確認"
+htf1Tf        = input.timeframe("60",  "上位足① (1時間)", group=grpHtf)
+htf2Tf        = input.timeframe("240", "上位足② (4時間)", group=grpHtf)
+ema1hSlopeLen = input.int(10, "1時間足EMA200 傾き判定 本数 (EMA200 < EMA200[N])", minval=1, group=grpHtf)
+
+grpM5 = "2) 5分 SELL許可ゾーン"
+m5TouchLookback = input.int(3, "5分EMA20/50タッチ後の有効本数", minval=1, group=grpM5)
+m5TouchAtrMult  = input.float(0.3, "5分EMA20/50タッチ許容ATR倍率", step=0.1, group=grpM5)
+
+grpM1 = "3) 1分 エントリートリガー"
+m1TouchAtrMult = input.float(0.3, "1分EMA20/50タッチ許容ATR倍率", step=0.1, group=grpM1)
+cUpWickRatioMin = input.float(0.40, "上ヒゲ比率 最低(0-1)", minval=0.0, maxval=1.0, step=0.05, group=grpM1)
+requiredScore   = input.float(2.0, "1分SELL必要スコア", step=0.5, group=grpM1)
+useM1RequireFvg = input.bool(false, "1分FVG吸収を必須にする", group=grpM1)
+
+grpFvg = "3F) 1分 Bullish FVG吸収"
+fvgMaxAge             = input.int(10, "FVG有効期限 本数", minval=1, group=grpFvg)
+useFvgThicknessFilter = input.bool(true, "FVG厚みフィルター(薄いFVGを除外)", group=grpFvg)
+fvgMinThicknessATR    = input.float(0.1, "FVG最低厚み(×ATR)", minval=0.0, step=0.05, group=grpFvg)
+
+grpRisk = "4) SL / TP / Risk"
+atr1mLen      = input.int(14, "1分ATR 期間", minval=1, group=grpRisk)
+slLookback    = input.int(10, "1分SL用高値本数", minval=1, group=grpRisk)
+maxRiskDollar = input.float(12.0, "最大SL幅($)", minval=0.1, step=0.5, group=grpRisk)
+rrRatio       = input.float(1.0, "RR (検証用 0.8 / 1.0 / 1.2)", step=0.1, group=grpRisk)
+minRiskGuard  = input.float(1.0, "最小リスク幅($)", minval=0.1, step=0.1, group=grpRisk)
+
+grpLimit = "5) エントリー制限"
+maxEntriesPerDay = input.int(10, "1日の最大エントリー数", minval=1, group=grpLimit)
+cooldownBars     = input.int(3, "エントリー後クールダウン本数", minval=0, group=grpLimit)
+
+grpSession = "6) Session Filter (Asia/Tokyo time)"
+useSessionFilter = input.bool(true, "セッションフィルターを使う", group=grpSession)
+useTokyoSession  = input.bool(true, "Tokyo  10:00-16:00", group=grpSession)
+useLondonSession = input.bool(true, "London 16:00-21:00", group=grpSession)
+useNYSession     = input.bool(true, "NY     21:00-03:00", group=grpSession)
+
+grpDisp = "7) Display"
+showEmas      = input.bool(true, "1分EMA(20/50/200)を表示", group=grpDisp)
+showBgZone    = input.bool(true, "5分SELL許可ゾーンの背景色", group=grpDisp)
+showLabels    = input.bool(true, "エントリーラベルを表示", group=grpDisp)
+showDebug     = input.bool(true, "デバッグテーブルを表示", group=grpDisp)
+
+// =============================================================================
+// 2) 基準ATR(1分チャート)
+// =============================================================================
+atr1m = ta.atr(atr1mLen)
+
+// =============================================================================
+// 3) ① 上位足下降確認（既存 htfBear を移植）非リペイント
+// =============================================================================
+close_1h       = request.security(syminfo.tickerid, htf1Tf, close[1],          lookahead=barmerge.lookahead_off)
+ema200_1h      = request.security(syminfo.tickerid, htf1Tf, ta.ema(close, 200)[1],  lookahead=barmerge.lookahead_off)
+ema200_1h_prev = request.security(syminfo.tickerid, htf1Tf, ta.ema(close, 200)[1 + ema1hSlopeLen], lookahead=barmerge.lookahead_off)
+close_4h       = request.security(syminfo.tickerid, htf2Tf, close[1],          lookahead=barmerge.lookahead_off)
+ema200_4h      = request.security(syminfo.tickerid, htf2Tf, ta.ema(close, 200)[1],  lookahead=barmerge.lookahead_off)
+
+htf1hBear = close_1h < ema200_1h and ema200_1h < ema200_1h_prev
+htf4hBear = close_4h < ema200_4h
+htfBear   = htf1hBear and htf4hBear
+
+// =============================================================================
+// 4) ② 5分 SELL許可ゾーン（request.security / 非リペイント=確定足[1]）
+//     5分 close<EMA200 / EMA20<EMA50<EMA200 / EMA20or50タッチ後 N本以内
+// =============================================================================
+f_m5zone() =>
+    _e20  = ta.ema(close, 20)
+    _e50  = ta.ema(close, 50)
+    _e200 = ta.ema(close, 200)
+    _atr  = ta.atr(14)
+    _t20  = high >= _e20 - _atr * m5TouchAtrMult and high <= _e20 + _atr * m5TouchAtrMult
+    _t50  = high >= _e50 - _atr * m5TouchAtrMult and high <= _e50 + _atr * m5TouchAtrMult
+    _touch = _t20 or _t50
+    var int _lastTouch = na
+    if _touch
+        _lastTouch := bar_index
+    _recent = not na(_lastTouch) and (bar_index - _lastTouch) <= m5TouchLookback
+    _stack  = _e20 < _e50 and _e50 < _e200
+    _below  = close < _e200
+    _zone   = _below and _stack and _recent
+    // 確定足の値を返す（非リペイント）
+    [_zone[1], _recent[1], _stack[1], _below[1]]
+
+[m5SellZone, m5TouchRecently, m5Stack, m5Below] = request.security(syminfo.tickerid, "5", f_m5zone(), lookahead=barmerge.lookahead_off)
+
+// =============================================================================
+// 5) ③ 1分 トレンド構造 + タッチ
+// =============================================================================
+ema20_1m  = ta.ema(close, 20)
+ema50_1m  = ta.ema(close, 50)
+ema200_1m = ta.ema(close, 200)
+
+m1Stack   = ema20_1m < ema50_1m and ema50_1m < ema200_1m
+m1Below   = close < ema200_1m
+m1TrendOk = m1Below and m1Stack
+
+m1Touch20 = high >= ema20_1m - atr1m * m1TouchAtrMult and high <= ema20_1m + atr1m * m1TouchAtrMult
+m1Touch50 = high >= ema50_1m - atr1m * m1TouchAtrMult and high <= ema50_1m + atr1m * m1TouchAtrMult
+
+// 確定足の強度
+body    = math.abs(close - open)
+avgBody = ta.sma(math.abs(close - open), 20)
+barRng  = math.max(high - low, syminfo.mintick)
+upWick  = high - math.max(open, close)
+isBear  = close < open
+strongBody = body >= avgBody              // 実体が平均実体20本以上
+upWick40   = (upWick / barRng) >= cUpWickRatioMin
+
+// スイープ加点：直近5本の高値を上抜けて陰線
+m1SweepHigh = high > ta.highest(high[1], 5) and close < open
+
+// =============================================================================
+// 6) 1分 Bullish FVG 吸収（加点 / useM1RequireFvg=ONで必須）
+// =============================================================================
+bullFvgRaw     = low  > high[2]
+fvgBullLowRaw  = high[2]
+fvgBullHighRaw = low
+bullThick      = fvgBullHighRaw - fvgBullLowRaw
+bullThickOk    = not useFvgThicknessFilter or (bullThick >= atr1m * fvgMinThicknessATR)
+
+var float fvgBullLow      = na
+var float fvgBullHigh     = na
+var int   fvgBullAge      = 0
+var bool  fvgBullRet      = false
+var float sellFvgHighTrig = na
+
+bool sellTrigger = false
+if barstate.isconfirmed
+    if fvgBullAge > 0
+        if low <= fvgBullHigh
+            fvgBullRet := true
+        if fvgBullRet and close < fvgBullLow and isBear
+            sellTrigger     := true
+            sellFvgHighTrig := fvgBullHigh
+            fvgBullAge      := 0
+        else
+            fvgBullAge := fvgBullAge - 1
+    if bullFvgRaw and bullThickOk
+        fvgBullLow  := fvgBullLowRaw
+        fvgBullHigh := fvgBullHighRaw
+        fvgBullAge  := fvgMaxAge
+        fvgBullRet  := false
+
+m1FvgOk = sellTrigger
+
+// =============================================================================
+// 7) スコア制
+//     EMA50タッチ +1 / EMA20タッチ +0.5 / スイープ +1 / FVG吸収 +1 / 強陰線 +1 / 上ヒゲ40% +1
+// =============================================================================
+score = 0.0
+score += m1Touch50   ? 1.0 : 0.0
+score += m1Touch20   ? 0.5 : 0.0
+score += m1SweepHigh ? 1.0 : 0.0
+score += m1FvgOk     ? 1.0 : 0.0
+score += strongBody  ? 1.0 : 0.0
+score += upWick40    ? 1.0 : 0.0
+
+// =============================================================================
+// 8) SL / TP / Risk（1分足基準）
+// =============================================================================
+sellSlRaw   = ta.highest(high, slLookback) + atr1m * 0.2
+sellSlRaw   := math.max(sellSlRaw, close + minRiskGuard)
+sellRisk    = sellSlRaw - close
+riskWithin12 = sellRisk <= maxRiskDollar
+sellSl      = sellSlRaw
+sellTp      = close - sellRisk * rrRatio
+
+// =============================================================================
+// 9) 制限 / セッション
+// =============================================================================
+var int lastEntryBar = na
+cooldownOk = na(lastEntryBar) or (bar_index - lastEntryBar) >= cooldownBars
+
+var int dailyEntryCount = 0
+if ta.change(time("D")) != 0
+    dailyEntryCount := 0
+dailyOk = dailyEntryCount < maxEntriesPerDay
+
+inTokyo  = not na(time(timeframe.period, "1000-1600", "Asia/Tokyo"))
+inLondon = not na(time(timeframe.period, "1600-2100", "Asia/Tokyo"))
+inNY     = not na(time(timeframe.period, "2100-0300", "Asia/Tokyo"))
+sessionOk = (useTokyoSession and inTokyo) or (useLondonSession and inLondon) or (useNYSession and inNY)
+sessionFinal = not useSessionFilter ? true : sessionOk
+
+// =============================================================================
+// 10) SELL 条件（必ず ①上位足 + ②5分ゾーン + ③1分トリガー の3段階）
+// =============================================================================
+m1SellTrigger = m5SellZone and htfBear and m1TrendOk and isBear and score >= requiredScore
+
+sellEntry =
+     barstate.isconfirmed and
+     m1SellTrigger and
+     (not useM1RequireFvg or m1FvgOk) and
+     riskWithin12 and
+     cooldownOk and
+     dailyOk and
+     sessionFinal and
+     sellRisk > 0 and
+     strategy.position_size == 0
+
+// =============================================================================
+// 11) Orders
+// =============================================================================
+if sellEntry
+    strategy.entry("SELL", strategy.short, qty=1)
+    strategy.exit("Exit SELL", from_entry="SELL", limit=sellTp, stop=sellSl)
+    lastEntryBar    := bar_index
+    dailyEntryCount := dailyEntryCount + 1
+
+// =============================================================================
+// 12) Display
+// =============================================================================
+plot(showEmas ? ema200_1m : na, "1m EMA200", color=color.new(color.fuchsia, 0), linewidth=2)
+plot(showEmas ? ema50_1m  : na, "1m EMA50",  color=color.new(color.aqua, 30))
+plot(showEmas ? ema20_1m  : na, "1m EMA20",  color=color.new(color.lime, 30))
+
+bgcolor(showBgZone and m5SellZone and htfBear ? color.new(color.red, 90) : na, title="M5 SELL Zone BG")
+
+if showLabels and sellEntry
+    label.new(bar_index, high,
+         text  = "SELL M1" +
+                 "\nScore=" + str.tostring(score, "#.#") +
+                 "\nFVG=" + (m1FvgOk ? "あり" : "なし") +
+                 "\nSweep=" + (m1SweepHigh ? "あり" : "なし") +
+                 "\nRisk=" + str.tostring(sellRisk, "#.##") +
+                 "\nSL=" + str.tostring(sellSl, "#.##") +
+                 "\nTP=" + str.tostring(sellTp, "#.##"),
+         style = label.style_label_down,
+         color = color.new(color.red, 0),
+         textcolor = color.white,
+         size  = size.small)
+
+// =============================================================================
+// 13) Alerts
+// =============================================================================
+alertcondition(sellEntry, title="M5 Zone + M1 Trend SELL", message="SELL | M5 Zone + M1 Trigger")
+
+if sellEntry
+    alert("Dir=SELL"
+         + " TF=M1"
+         + " Score=" + str.tostring(score, "#.#")
+         + " FVG="   + (m1FvgOk ? "1" : "0")
+         + " Sweep=" + (m1SweepHigh ? "1" : "0")
+         + " E="     + str.tostring(close, "#.##")
+         + " SL="    + str.tostring(sellSl, "#.##")
+         + " TP="    + str.tostring(sellTp, "#.##")
+         + " Risk="  + str.tostring(sellRisk, "#.##"),
+         alert.freq_once_per_bar_close)
+
+// =============================================================================
+// 14) Debug Table
+// =============================================================================
+f_tf(_t, _r, _name, _cond) =>
+    table.cell(_t, 0, _r, _name, text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
+    table.cell(_t, 1, _r, _cond ? "TRUE" : "FALSE", text_color=_cond ? color.lime : color.red, text_size=size.small)
+f_val(_t, _r, _name, _val) =>
+    table.cell(_t, 0, _r, _name, text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
+    table.cell(_t, 1, _r, _val, text_color=color.white, text_size=size.small)
+
+var table dbg = table.new(position.top_right, 2, 14, border_width=1, frame_width=1, frame_color=color.gray)
+if showDebug and barstate.islast
+    f_tf(dbg, 0,  "htfBear",         htfBear)
+    f_tf(dbg, 1,  "m5SellZone",      m5SellZone)
+    f_tf(dbg, 2,  "m5TouchRecently", m5TouchRecently)
+    f_tf(dbg, 3,  "m1TrendOk",       m1TrendOk)
+    f_tf(dbg, 4,  "m1Touch20",       m1Touch20)
+    f_tf(dbg, 5,  "m1Touch50",       m1Touch50)
+    f_tf(dbg, 6,  "m1SweepHigh",     m1SweepHigh)
+    f_tf(dbg, 7,  "m1FvgOk",         m1FvgOk)
+    f_val(dbg, 8, "score",           str.tostring(score, "#.#") + " / " + str.tostring(requiredScore, "#.#"))
+    f_tf(dbg, 9,  "riskWithin12",    riskWithin12)
+    f_tf(dbg, 10, "cooldownOk",      cooldownOk)
+    f_tf(dbg, 11, "sessionFinal",    sessionFinal)
+    f_val(dbg, 12, "dailyEntryCount", str.tostring(dailyEntryCount) + "/" + str.tostring(maxEntriesPerDay))
+    f_val(dbg, 13, "TF=1m",          timeframe.period == "1" ? "OK" : "NG(1mで稼働)")
