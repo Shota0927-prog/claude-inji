@@ -1,0 +1,283 @@
+//@version=5
+// =============================================================================
+// XAUUSD 15m EMA200 Pullback + 5m Bear FVG Absorption  (SELL ONLY / 順張り)
+// -----------------------------------------------------------------------------
+//  ・5分足チャート上で動かす前提（XAUUSD専用）。
+//  ・ロジック：
+//      ① 上位足下降確認（1時間/4時間の EMA200>600>1000>3000 並び & 終値が下）
+//      ② 15分 EMA200 付近まで戻る（戻り売りゾーン）
+//      ③ 5分 Bullish FVG の吸収（インバースFVG）で SELL
+//  ・FVG吸収ロジックは既存戦略の定義を流用：
+//      Bullish FVG 発生 → 価格がFVG内へ戻る → FVG下限を終値で下抜け＆陰線確定
+//  ・安値追いショートを避けるためのフィルターを追加：
+//      1) 15分EMA200から離れすぎでは売らない（notChasing）
+//      2) 直近安値までの余地（roomOk）
+//      3) エントリー後クールダウン（cooldownBars）
+//  ・BUYは後で追加予定。まずは SELL 専用。
+// =============================================================================
+strategy("XAUUSD 15m EMA200 Pullback FVG SELL",
+     overlay                 = true,
+     pyramiding              = 0,
+     calc_on_order_fills     = false,
+     calc_on_every_tick      = false,
+     process_orders_on_close = true,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     initial_capital         = 1000,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 0.0,
+     max_labels_count        = 500)
+
+// =============================================================================
+// 1) Inputs
+// =============================================================================
+grpHtf = "1) 上位足下降確認"
+htf1Tf = input.timeframe("60",  "上位足① (1時間)", group=grpHtf)
+htf2Tf = input.timeframe("240", "上位足② (4時間)", group=grpHtf)
+
+grpPb = "2) 15分EMA200 戻りゾーン"
+ema200_15m_len  = input.int(200, "15分EMA 期間", minval=1, group=grpPb)
+atr15Len        = input.int(14, "15分ATR 期間", minval=1, group=grpPb)
+pullbackAtrMult = input.float(0.5, "15分EMA200戻り許容 ATR倍率", step=0.1, group=grpPb)
+
+grpFvg = "3) 5分 Bear FVG吸収 (Trigger)"
+fvgMaxAge             = input.int(10, "FVG有効期限 本数", minval=1, group=grpFvg)
+useFvgThicknessFilter = input.bool(true, "FVG厚みフィルター(薄いFVGを除外)", group=grpFvg)
+fvgMinThicknessATR    = input.float(0.1, "FVG最低厚み(×ATR)", minval=0.0, step=0.05, group=grpFvg)
+useReversalCandleFilter = input.bool(false, "確定足に包み足/ピンバー強度を要求(OFF=単純な陰線)", group=grpFvg)
+pinWickRatio          = input.float(0.7, "ピンバーのヒゲ比率(0-1)", minval=0.1, maxval=1.0, step=0.05, group=grpFvg)
+bodyMult              = input.float(1.2, "包み足の実体強度 > 平均実体(20) ×", step=0.1, group=grpFvg)
+
+grpChase = "4) 安値追い禁止 / 余地"
+maxDistanceAtrMult = input.float(1.2, "15分EMA200からの最大乖離 ATR倍率", step=0.1, group=grpChase)
+recentLowLen       = input.int(30, "直近安値 参照本数", minval=2, group=grpChase)
+minRoomRR          = input.float(1.0, "直近安値まで最低余地 xRisk", step=0.1, group=grpChase)
+
+grpCooldown = "5) 連続エントリー制限"
+cooldownBars = input.int(5, "エントリー後クールダウン本数", minval=0, group=grpCooldown)
+
+grpRisk = "6) SL / TP / Risk"
+atrLen        = input.int(14, "基準ATR(5分) 期間", minval=1, group=grpRisk)
+slSwingLen    = input.int(10, "SL用 直近高値 本数", minval=1, group=grpRisk)
+rrRatio       = input.float(1.5, "RR", step=0.1, group=grpRisk)
+minRiskGuard  = input.float(1.0, "最小リスク幅($)", minval=0.1, step=0.1, group=grpRisk)
+useRiskSizing = input.bool(false, "Risk%でロット計算(OFF=固定1)", group=grpRisk)
+riskPctPerTrade = input.float(2.0, "Risk % per Trade", minval=0.1, step=0.1, group=grpRisk)
+
+grpSession = "7) Session Filter (Asia/Tokyo time)"
+useSessionFilter = input.bool(true, "セッションフィルターを使う", group=grpSession)
+useTokyoSession  = input.bool(true, "Tokyo  10:00-16:00", group=grpSession)
+useLondonSession = input.bool(true, "London 16:00-21:00", group=grpSession)
+useNYSession     = input.bool(true, "NY     21:00-03:00", group=grpSession)
+
+grpDisp = "8) Display"
+showEma15m    = input.bool(true, "15分EMA200を表示", group=grpDisp)
+showBgHtf     = input.bool(true, "上位足下降OKの背景色", group=grpDisp)
+showPbZone    = input.bool(true, "15分EMA200戻りゾーンを表示", group=grpDisp)
+showFvgMarks  = input.bool(true, "FVGマークを表示", group=grpDisp)
+showLabels    = input.bool(true, "Entry/SL/TP ラベルを表示", group=grpDisp)
+
+// =============================================================================
+// 2) 基準ATR(5分チャート)
+// =============================================================================
+atr = ta.atr(atrLen)
+
+// =============================================================================
+// 3) ① 上位足下降確認（1時間 / 4時間）
+//     EMA200 > 600 > 1000 > 3000 の並び & 終値が EMA200 の下
+//     非リペイント：確定足[1] + lookahead_off
+// =============================================================================
+close_1h    = request.security(syminfo.tickerid, htf1Tf, close[1],          lookahead=barmerge.lookahead_off)
+ema200_1h   = request.security(syminfo.tickerid, htf1Tf, ta.ema(close, 200)[1],  lookahead=barmerge.lookahead_off)
+ema600_1h   = request.security(syminfo.tickerid, htf1Tf, ta.ema(close, 600)[1],  lookahead=barmerge.lookahead_off)
+ema1000_1h  = request.security(syminfo.tickerid, htf1Tf, ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_off)
+ema3000_1h  = request.security(syminfo.tickerid, htf1Tf, ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_off)
+
+close_4h    = request.security(syminfo.tickerid, htf2Tf, close[1],          lookahead=barmerge.lookahead_off)
+ema200_4h   = request.security(syminfo.tickerid, htf2Tf, ta.ema(close, 200)[1],  lookahead=barmerge.lookahead_off)
+ema600_4h   = request.security(syminfo.tickerid, htf2Tf, ta.ema(close, 600)[1],  lookahead=barmerge.lookahead_off)
+ema1000_4h  = request.security(syminfo.tickerid, htf2Tf, ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_off)
+ema3000_4h  = request.security(syminfo.tickerid, htf2Tf, ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_off)
+
+htfBear =
+     close_1h < ema200_1h and
+     ema200_1h < ema600_1h and
+     ema600_1h < ema1000_1h and
+     ema1000_1h < ema3000_1h and
+     close_4h < ema200_4h and
+     ema200_4h < ema600_4h and
+     ema600_4h < ema1000_4h and
+     ema1000_4h < ema3000_4h
+
+// =============================================================================
+// 4) ② 15分 EMA200 戻りゾーン
+//     非リペイント：確定足[1] + lookahead_off
+// =============================================================================
+ema200_15m = request.security(syminfo.tickerid, "15", ta.ema(close, ema200_15m_len)[1], lookahead=barmerge.lookahead_off)
+atr_15m    = request.security(syminfo.tickerid, "15", ta.atr(atr15Len)[1],              lookahead=barmerge.lookahead_off)
+
+pullbackTo15mEma =
+     high >= ema200_15m - atr_15m * pullbackAtrMult and
+     high <= ema200_15m + atr_15m * pullbackAtrMult
+
+// =============================================================================
+// 5) ③ 5分 Bullish FVG の吸収（インバースFVG → SELL）
+//     既存コードの定義を流用：
+//        Bullish FVG（窓開け上）: low > high[2]
+//        下限 = high[2] / 上限 = low
+//     吸収トリガー：FVG内へ戻り(fvgBullRet) → 下限を終値ブレイク & 陰線確定
+// =============================================================================
+bullFvgRaw     = low  > high[2]
+fvgBullLowRaw  = high[2]
+fvgBullHighRaw = low
+bullThick      = fvgBullHighRaw - fvgBullLowRaw
+bullThickOk    = not useFvgThicknessFilter or (bullThick >= atr * fvgMinThicknessATR)
+
+// 確定足の強度（任意）：単純な陰線 or 包み足/ピンバー
+body       = math.abs(close - open)
+avgBody    = ta.sma(math.abs(close - open), 20)
+strongBody = body > avgBody * bodyMult
+bearEngulf = close < open and open >= close[1] and close <= open[1] and strongBody
+barRng     = math.max(high - low, syminfo.mintick)
+upWick     = high - math.max(open, close)
+bearPin    = (upWick / barRng) >= pinWickRatio
+sellConfirm = useReversalCandleFilter ? (bearEngulf or bearPin) : (close < open)
+
+// アクティブな Bullish FVG（最新1つを保持）
+var float fvgBullLow      = na
+var float fvgBullHigh     = na
+var int   fvgBullAge      = 0
+var bool  fvgBullRet      = false
+var float sellFvgHighTrig = na   // 吸収トリガー時のFVG上限（SL基準）
+
+bool sellTrigger = false
+
+if barstate.isconfirmed
+    // ---- SELL：Bullish FVG の下方ブレイク（吸収） ----
+    if fvgBullAge > 0
+        if low <= fvgBullHigh
+            fvgBullRet := true
+        if fvgBullRet and close < fvgBullLow and sellConfirm
+            sellTrigger     := true
+            sellFvgHighTrig := fvgBullHigh
+            fvgBullAge      := 0
+        else
+            fvgBullAge := fvgBullAge - 1
+
+    // ---- 新規FVG登録（最後に：発生足での自己トリガーを防止） ----
+    if bullFvgRaw and bullThickOk
+        fvgBullLow  := fvgBullLowRaw
+        fvgBullHigh := fvgBullHighRaw
+        fvgBullAge  := fvgMaxAge
+        fvgBullRet  := false
+
+sellFvgOk = sellTrigger
+
+// =============================================================================
+// 6) SL / TP / Risk
+//     SL = max(FVG上限, 直近高値) の少し上
+//     TP = Risk × RR
+// =============================================================================
+swingHighSL = ta.highest(high, slSwingLen)
+sellSl      = math.max(nz(sellFvgHighTrig, swingHighSL), swingHighSL) + atr * 0.2
+sellSl      := math.max(sellSl, close + minRiskGuard)
+sellRisk    = sellSl - close
+sellTp      = close - sellRisk * rrRatio
+
+riskUSD  = strategy.initial_capital * (riskPctPerTrade / 100.0)
+sellLots = useRiskSizing ? (sellRisk > 0 ? math.floor(riskUSD / sellRisk) : 0) : 1
+
+// =============================================================================
+// 7) 追加フィルター
+// =============================================================================
+// 1) 安値追い禁止：15分EMA200から離れすぎでは売らない
+notChasing = math.abs(close - ema200_15m) <= atr_15m * maxDistanceAtrMult
+
+// 2) 直近安値までの余地：TPまでに直近安値が近すぎる場合は入らない
+recentLow = ta.lowest(low, recentLowLen)
+roomToLow = close - recentLow
+roomOk    = roomToLow >= sellRisk * minRoomRR
+
+// 3) 連続エントリー制限：SELL後、最低 cooldownBars 本は次のSELL禁止
+var int lastEntryBar = na
+cooldownOk = na(lastEntryBar) or (bar_index - lastEntryBar) >= cooldownBars
+
+// =============================================================================
+// 8) Session Filter (Asia/Tokyo time)
+// =============================================================================
+inTokyo  = not na(time(timeframe.period, "1000-1600", "Asia/Tokyo"))
+inLondon = not na(time(timeframe.period, "1600-2100", "Asia/Tokyo"))
+inNY     = not na(time(timeframe.period, "2100-0300", "Asia/Tokyo"))
+sessionOk =
+     (useTokyoSession  and inTokyo)  or
+     (useLondonSession and inLondon) or
+     (useNYSession     and inNY)
+sessionFinal = not useSessionFilter ? true : sessionOk
+
+// =============================================================================
+// 9) 最終 SELL 条件
+// =============================================================================
+sellEntry =
+     barstate.isconfirmed and
+     htfBear and
+     pullbackTo15mEma and
+     sellFvgOk and
+     notChasing and
+     roomOk and
+     cooldownOk and
+     sessionFinal and
+     sellRisk > 0 and
+     sellLots >= 1 and
+     strategy.position_size == 0
+
+// =============================================================================
+// 10) Strategy Orders
+// =============================================================================
+if sellEntry
+    strategy.entry("SELL", strategy.short, qty=sellLots)
+    strategy.exit("Exit SELL", from_entry="SELL", limit=sellTp, stop=sellSl)
+    lastEntryBar := bar_index
+
+// =============================================================================
+// 11) Display
+// =============================================================================
+// 15分EMA200
+plot(showEma15m ? ema200_15m : na, "15m EMA200", color=color.new(color.orange, 0), linewidth=2)
+// 戻りゾーン（上下バンド）
+plot(showPbZone ? ema200_15m + atr_15m * pullbackAtrMult : na, "Pullback Zone High", color=color.new(color.blue, 60), style=plot.style_linebr)
+plot(showPbZone ? ema200_15m - atr_15m * pullbackAtrMult : na, "Pullback Zone Low",  color=color.new(color.blue, 60), style=plot.style_linebr)
+
+// 上位足下降OKの背景色
+bgcolor(showBgHtf and htfBear ? color.new(color.red, 90) : na, title="HTF Bear BG")
+
+// FVG発生マーク
+plotshape(showFvgMarks and bullFvgRaw and bullThickOk, title="Bullish FVG",
+     style=shape.triangleup, location=location.belowbar, color=color.new(color.teal, 0), size=size.tiny)
+// 吸収待ち（FVG内に戻り、ブレイク確定待ち）
+plotshape(showFvgMarks and fvgBullAge > 0 and fvgBullRet and not sellTrigger, title="SELL 吸収待ち",
+     style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+
+// FVG吸収 SELL ラベル + SL/TP
+if showLabels and sellEntry
+    label.new(bar_index, high,
+         text  = "SELL (FVG)\nE="  + str.tostring(close, "#.##") +
+                 "\nSL=" + str.tostring(sellSl, "#.##") +
+                 "\nTP=" + str.tostring(sellTp, "#.##"),
+         style = label.style_label_down,
+         color = color.new(color.red, 0),
+         textcolor = color.white,
+         size  = size.small)
+
+// =============================================================================
+// 12) Alerts
+// =============================================================================
+alertcondition(sellEntry, title="15m EMA200 Pullback FVG SELL",
+     message="SELL | 15m EMA200 Pullback + 5m FVG Absorption")
+
+if sellEntry
+    alert("Dir=SELL"
+         + " E="    + str.tostring(close, "#.##")
+         + " SL="   + str.tostring(sellSl, "#.##")
+         + " TP="   + str.tostring(sellTp, "#.##")
+         + " Risk=" + str.tostring(sellRisk, "#.##"),
+         alert.freq_once_per_bar_close)
