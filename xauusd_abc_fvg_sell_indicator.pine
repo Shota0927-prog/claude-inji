@@ -1,0 +1,398 @@
+//@version=5
+// =============================================================================
+// XAUUSD A/B/C Pullback + 5m FVG Absorption  —  SELL Signal Indicator
+// -----------------------------------------------------------------------------
+//  ・同名ストラテジーをインジケーター化したもの（5分足専用）。
+//  ・確定シグナル : 足確定で1回だけ（ラベル + アラート）
+//  ・仮シグナル   : 足確定前に「足確定以外の条件」が揃ったら1回だけ（アラートのみ）
+//                   リセット条件：確定が出た or 別のFVGに切り替わった
+//  ・pyramiding=0 を再現：仮想ポジション保有中は仮/確定シグナルを出さない
+//  ・建値移動(BE)・再エントリーも再現し、BE移動時にもアラート
+//  ・Size<1（ロット計算）ではエントリーしない（ストラテジーと同じ）
+//  ・アラート/ラベルは 5分足のみ
+// =============================================================================
+indicator("XAUUSD A/B/C FVG SELL (Indicator)", overlay=true, max_labels_count=500)
+
+// チャートが5分足かどうか（アラート/ラベルは5分のみ）
+is5m = timeframe.period == "5"
+
+// =============================================================================
+// 1) Inputs
+// =============================================================================
+grpMode = "0) Entry Mode / 階層"
+entryMode        = input.string("A+B+C", "エントリー階層", options=["C only","A only","A+B","A+B+C"], group=grpMode)
+useCRequireFvg   = input.bool(false, "CランクもFVG吸収を要求(OFF=FVGは加点扱い)", group=grpMode)
+maxEntriesPerDay = input.int(10, "1日の最大エントリー数", minval=1, group=grpMode)
+useTentative     = input.bool(true, "仮シグナル(アラートのみ)を使う", group=grpMode)
+
+grpHtf = "1) 上位足下降確認"
+htf1Tf = input.timeframe("60",  "上位足① (1時間)", group=grpHtf)
+htf2Tf = input.timeframe("240", "上位足② (4時間)", group=grpHtf)
+use1hStack     = input.bool(false, "1時間足: EMA600/1000/3000の並びも要求(ON/OFF)", group=grpHtf)
+ema1hSlopeLen  = input.int(10, "1時間足EMA200 傾き判定 本数 (EMA200 < EMA200[N])", minval=1, group=grpHtf)
+use4hFullStack = input.bool(false, "4時間足: EMA600/1000/3000 並びまで要求(OFF=close<EMA200のみ)", group=grpHtf)
+
+grpPb = "2A) Aランク: 15分EMA200 戻りゾーン"
+ema200_15m_len       = input.int(200, "15分EMA 期間", minval=1, group=grpPb)
+atr15Len             = input.int(14, "15分ATR 期間", minval=1, group=grpPb)
+pullbackAtrMult      = input.float(0.5, "15分EMA200戻り許容 ATR倍率", step=0.1, group=grpPb)
+pullbackLookbackBars = input.int(12, "15分EMA200タッチ後の有効本数", minval=1, group=grpPb)
+
+grpB = "2B) Bランク: 5分EMA200 戻りゾーン"
+ema200_5m_len      = input.int(200, "5分EMA200 期間", minval=1, group=grpB)
+pullback5mAtrMult  = input.float(0.5, "5分EMA200戻り許容 ATR倍率", step=0.1, group=grpB)
+pullback5mLookback = input.int(12, "5分EMA200タッチ後の有効本数", minval=1, group=grpB)
+
+grpC = "2C) Cランク: 5分EMA20/50 戻りゾーン (主軸)"
+ema20_5m_len    = input.int(20,  "5分EMA20 期間", minval=1, group=grpC)
+ema50_5m_len    = input.int(50,  "5分EMA50 期間", minval=1, group=grpC)
+cTouchAtrMult   = input.float(0.3, "EMA20/50戻り許容 ATR倍率", step=0.1, group=grpC)
+cLookback       = input.int(6, "EMA20/50タッチ後の有効本数", minval=1, group=grpC)
+cUpWickRatioMin = input.float(0.40, "C: 上ヒゲ比率 最低(0-1)", minval=0.0, maxval=1.0, step=0.05, group=grpC)
+
+grpFvg = "3) 5分 Bear FVG吸収 (Trigger)"
+fvgMaxAge               = input.int(10, "FVG有効期限 本数", minval=1, group=grpFvg)
+useFvgThicknessFilter   = input.bool(true, "FVG厚みフィルター(薄いFVGを除外)", group=grpFvg)
+fvgMinThicknessATR      = input.float(0.1, "FVG最低厚み(×ATR)", minval=0.0, step=0.05, group=grpFvg)
+useReversalCandleFilter = input.bool(false, "確定足に包み足/ピンバー強度を要求(OFF=単純な陰線)", group=grpFvg)
+pinWickRatio            = input.float(0.7, "ピンバーのヒゲ比率(0-1)", minval=0.1, maxval=1.0, step=0.05, group=grpFvg)
+bodyMult                = input.float(1.2, "包み足の実体強度 > 平均実体(20) ×", step=0.1, group=grpFvg)
+
+grpChase = "4) 安値追い禁止"
+maxDistanceAtrMult = input.float(2.0, "EMA200からの最大乖離 ATR倍率(A=15m/B=5m基準)", step=0.1, group=grpChase)
+
+grpCooldown = "5) 連続エントリー制限"
+cooldownBars = input.int(1, "エントリー後クールダウン本数", minval=0, group=grpCooldown)
+
+grpRisk = "6) SL / TP / Risk"
+atrLen          = input.int(14, "基準ATR(5分) 期間", minval=1, group=grpRisk)
+slSwingLen      = input.int(10, "SL用 直近高値 本数", minval=1, group=grpRisk)
+maxRiskDollar   = input.float(12.0, "最大SL幅($) これを超えるセットアップは見送り", minval=0.1, step=0.5, group=grpRisk)
+rrRatio         = input.float(1.0, "RR (検証用 0.8 / 1.0 / 1.2)", step=0.1, group=grpRisk)
+minRiskGuard    = input.float(1.0, "最小リスク幅($)", minval=0.1, step=0.1, group=grpRisk)
+initialCapital  = input.float(1000, "口座資金($) ロット計算用", minval=1, group=grpRisk)
+useRiskSizing   = input.bool(false, "Risk%でロット計算(OFF=固定1)", group=grpRisk)
+riskPctPerTrade = input.float(2.0, "Risk % per Trade", minval=0.1, step=0.1, group=grpRisk)
+
+grpBE = "6B) 建値移動 / 再エントリー"
+useBreakeven = input.bool(true,  "建値移動を使う", group=grpBE)
+beTrigger    = input.float(0.8,  "建値移動の発動(xTP到達)", minval=0.1, maxval=1.0, step=0.05, group=grpBE)
+beOffset     = input.float(0.0,  "建値オフセット($) +で少し利益側", step=0.1, group=grpBE)
+useReentry   = input.bool(false, "建値決済後に再エントリー", group=grpBE)
+maxReentry   = input.int(1, "再エントリー最大回数", minval=1, group=grpBE)
+
+grpSession = "7) Session Filter (Asia/Tokyo time)"
+useSessionFilter = input.bool(true, "セッションフィルターを使う", group=grpSession)
+useTokyoSession  = input.bool(true, "Tokyo  10:00-16:00", group=grpSession)
+useLondonSession = input.bool(true, "London 16:00-21:00", group=grpSession)
+useNYSession     = input.bool(true, "NY     21:00-03:00", group=grpSession)
+
+grpDisp = "8) Display"
+showEmas      = input.bool(true, "EMA(5m 20/50/200, 15m 200)を表示", group=grpDisp)
+showBgHtf     = input.bool(true, "上位足下降OKの背景色", group=grpDisp)
+showFvgMarks  = input.bool(true, "FVGマークを表示", group=grpDisp)
+showLabels    = input.bool(true, "Entry/SL/TP ラベルを表示", group=grpDisp)
+showPosLines  = input.bool(true, "保有中のSL/TPラインを表示", group=grpDisp)
+showInfoTable = input.bool(true, "情報パネルを表示", group=grpDisp)
+
+// =============================================================================
+// 2) 基準ATR(5分)
+// =============================================================================
+atr = ta.atr(atrLen)
+
+// =============================================================================
+// 3) ① 上位足下降確認（1時間 / 4時間）非リペイント
+// =============================================================================
+close_1h       = request.security(syminfo.tickerid, htf1Tf, close[1],          lookahead=barmerge.lookahead_off)
+ema200_1h      = request.security(syminfo.tickerid, htf1Tf, ta.ema(close, 200)[1],  lookahead=barmerge.lookahead_off)
+ema200_1h_prev = request.security(syminfo.tickerid, htf1Tf, ta.ema(close, 200)[1 + ema1hSlopeLen], lookahead=barmerge.lookahead_off)
+ema600_1h      = request.security(syminfo.tickerid, htf1Tf, ta.ema(close, 600)[1],  lookahead=barmerge.lookahead_off)
+ema1000_1h     = request.security(syminfo.tickerid, htf1Tf, ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_off)
+ema3000_1h     = request.security(syminfo.tickerid, htf1Tf, ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_off)
+
+close_4h   = request.security(syminfo.tickerid, htf2Tf, close[1],          lookahead=barmerge.lookahead_off)
+ema200_4h  = request.security(syminfo.tickerid, htf2Tf, ta.ema(close, 200)[1],  lookahead=barmerge.lookahead_off)
+ema600_4h  = request.security(syminfo.tickerid, htf2Tf, ta.ema(close, 600)[1],  lookahead=barmerge.lookahead_off)
+ema1000_4h = request.security(syminfo.tickerid, htf2Tf, ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_off)
+ema3000_4h = request.security(syminfo.tickerid, htf2Tf, ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_off)
+
+ema200_1h_slopeDown = ema200_1h < ema200_1h_prev
+htf1hStack = ema200_1h < ema600_1h and ema600_1h < ema1000_1h and ema1000_1h < ema3000_1h
+htf1hBear  = close_1h < ema200_1h and ema200_1h_slopeDown and (not use1hStack or htf1hStack)
+
+htf4hStack = ema200_4h < ema600_4h and ema600_4h < ema1000_4h and ema1000_4h < ema3000_4h
+htf4hBear  = close_4h < ema200_4h and (not use4hFullStack or htf4hStack)
+
+htfBear = htf1hBear and htf4hBear
+
+// =============================================================================
+// 4) ② 15分EMA200 戻り (Aランク) 非リペイント
+// =============================================================================
+ema200_15m = request.security(syminfo.tickerid, "15", ta.ema(close, ema200_15m_len)[1], lookahead=barmerge.lookahead_off)
+atr_15m    = request.security(syminfo.tickerid, "15", ta.atr(atr15Len)[1],              lookahead=barmerge.lookahead_off)
+
+pullbackTo15mEma = high >= ema200_15m - atr_15m * pullbackAtrMult and high <= ema200_15m + atr_15m * pullbackAtrMult
+var int lastPullbackBar = na
+if pullbackTo15mEma
+    lastPullbackBar := bar_index
+pullbackRecently = not na(lastPullbackBar) and bar_index - lastPullbackBar <= pullbackLookbackBars
+
+// =============================================================================
+// 4B/4C) 5分EMA200/20/50 戻り (B/Cランク)
+// =============================================================================
+ema200_5m = ta.ema(close, ema200_5m_len)
+ema20_5m  = ta.ema(close, ema20_5m_len)
+ema50_5m  = ta.ema(close, ema50_5m_len)
+
+touch5mEma200 = high >= ema200_5m - atr * pullback5mAtrMult and high <= ema200_5m + atr * pullback5mAtrMult
+var int last5mPullbackBar = na
+if touch5mEma200
+    last5mPullbackBar := bar_index
+pull5mRecently = not na(last5mPullbackBar) and bar_index - last5mPullbackBar <= pullback5mLookback
+
+touchEma20 = high >= ema20_5m - atr * cTouchAtrMult and high <= ema20_5m + atr * cTouchAtrMult
+touchEma50 = high >= ema50_5m - atr * cTouchAtrMult and high <= ema50_5m + atr * cTouchAtrMult
+cTouch = touchEma20 or touchEma50
+var int lastCTouchBar = na
+if cTouch
+    lastCTouchBar := bar_index
+cTouchRecently = not na(lastCTouchBar) and bar_index - lastCTouchBar <= cLookback
+
+// =============================================================================
+// 5) ③ 5分 Bullish FVG の吸収（インバースFVG → SELL）
+// =============================================================================
+bullFvgRaw     = low  > high[2]
+fvgBullLowRaw  = high[2]
+fvgBullHighRaw = low
+bullThick      = fvgBullHighRaw - fvgBullLowRaw
+bullThickOk    = not useFvgThicknessFilter or (bullThick >= atr * fvgMinThicknessATR)
+
+body       = math.abs(close - open)
+avgBody    = ta.sma(math.abs(close - open), 20)
+strongBody = body > avgBody * bodyMult
+bearEngulf = close < open and open >= close[1] and close <= open[1] and strongBody
+barRng     = math.max(high - low, syminfo.mintick)
+upWick     = high - math.max(open, close)
+bearPin    = (upWick / barRng) >= pinWickRatio
+sellConfirm = useReversalCandleFilter ? (bearEngulf or bearPin) : (close < open)
+
+var float fvgBullLow      = na
+var float fvgBullHigh     = na
+var int   fvgBullAge      = 0
+var bool  fvgBullRet      = false
+var float sellFvgHighTrig = na
+
+bool sellTrigger = false
+if barstate.isconfirmed
+    if fvgBullAge > 0
+        if low <= fvgBullHigh
+            fvgBullRet := true
+        if fvgBullRet and close < fvgBullLow and sellConfirm
+            sellTrigger     := true
+            sellFvgHighTrig := fvgBullHigh
+            fvgBullAge      := 0
+        else
+            fvgBullAge := fvgBullAge - 1
+    if bullFvgRaw and bullThickOk
+        fvgBullLow  := fvgBullLowRaw
+        fvgBullHigh := fvgBullHighRaw
+        fvgBullAge  := fvgMaxAge
+        fvgBullRet  := false
+
+// 確定FVG吸収（足確定時）と 仮FVG吸収（足確定前 / 当足のブレイクも評価）
+sellFvgOk = sellTrigger
+tentFvgOk = fvgBullAge > 0 and (fvgBullRet or low <= fvgBullHigh) and close < fvgBullLow and sellConfirm
+
+// =============================================================================
+// 6) SL / TP / Risk / Size
+// =============================================================================
+swingHighSL = ta.highest(high, slSwingLen)
+fvgHighForSl = sellFvgOk ? sellFvgHighTrig : (tentFvgOk ? fvgBullHigh : na)
+sellSlRaw   = math.max(math.max(nz(fvgHighForSl, swingHighSL), swingHighSL), high) + atr * 0.2
+sellSlRaw   := math.max(sellSlRaw, close + minRiskGuard)
+sellRiskRaw = sellSlRaw - close
+riskWithin12 = sellRiskRaw <= maxRiskDollar
+sellRisk = sellRiskRaw
+sellSl   = sellSlRaw
+sellTp   = close - sellRisk * rrRatio
+
+riskUSD  = initialCapital * (riskPctPerTrade / 100.0)
+sellLots = useRiskSizing ? (sellRisk > 0 ? math.floor(riskUSD / sellRisk) : 0) : 1
+sizeOk   = sellLots >= 1
+
+// =============================================================================
+// 7) フィルター / セッション / 日次カウント
+// =============================================================================
+notChasingA = math.abs(close - ema200_15m) <= atr_15m * maxDistanceAtrMult
+notChasingB = math.abs(close - ema200_5m)  <= atr     * maxDistanceAtrMult
+
+var int lastEntryBar = na
+cooldownOk = na(lastEntryBar) or (bar_index - lastEntryBar) >= cooldownBars
+
+var int dailyEntryCount = 0
+if ta.change(time("D")) != 0
+    dailyEntryCount := 0
+dailyOk = dailyEntryCount < maxEntriesPerDay
+
+inTokyo  = not na(time(timeframe.period, "1000-1600", "Asia/Tokyo"))
+inLondon = not na(time(timeframe.period, "1600-2100", "Asia/Tokyo"))
+inNY     = not na(time(timeframe.period, "2100-0300", "Asia/Tokyo"))
+sessionOk = (useTokyoSession and inTokyo) or (useLondonSession and inLondon) or (useNYSession and inNY)
+sessionFinal = not useSessionFilter ? true : sessionOk
+
+// =============================================================================
+// 8) A / B / C ランク判定（FVGフラグを差し替えて確定/仮の両方で使う）
+// =============================================================================
+isBear = close < open
+cStack = ema20_5m < ema50_5m and ema50_5m < ema200_5m
+cUpWickRatio = upWick / barRng
+cStrength = (cUpWickRatio >= cUpWickRatioMin) or (body >= avgBody)
+cConfirm  = isBear and cStrength
+
+aOn = entryMode == "A only" or entryMode == "A+B" or entryMode == "A+B+C"
+bOn = entryMode == "A+B"   or entryMode == "A+B+C"
+cOn = entryMode == "C only" or entryMode == "A+B+C"
+
+f_rank(_fvgOk) =>
+    _a = htfBear and pullbackRecently and _fvgOk and notChasingA
+    _b = htfBear and (close < ema200_15m) and pull5mRecently and _fvgOk and notChasingB
+    _c = htfBear and (close < ema200_5m) and cStack and cTouchRecently and cConfirm and (not useCRequireFvg or _fvgOk)
+    (aOn and _a) ? "A" : (bOn and _b) ? "B" : (cOn and _c) ? "C" : na
+
+confRank = f_rank(sellFvgOk)
+tentRank = f_rank(tentFvgOk)
+
+// 共通ゲート（足確定の有無は含めない）
+gateBase = is5m and riskWithin12 and cooldownOk and dailyOk and sessionFinal and sellRisk > 0 and sizeOk
+
+// =============================================================================
+// 9) 仮想ポジション管理（pyramiding=0 / 建値移動 / 再エントリー）
+// =============================================================================
+var bool   inPos        = false
+var float  pE           = na
+var float  pSL          = na
+var float  pTP          = na
+var float  pRisk        = na
+var string pRank        = na
+var bool   beDone       = false
+var int    reentryCount = 0
+
+// 共通メッセージ
+f_msg(_tag, _rank) =>
+    "SELL " + _tag + " Rank=" + _rank +
+     " E=" + str.tostring(close, "#.##") +
+     " SL=" + str.tostring(sellSl, "#.##") +
+     " TP=" + str.tostring(sellTp, "#.##") +
+     " Width=" + str.tostring(sellRisk, "#.##") +
+     " FVG=" + (sellFvgOk or tentFvgOk ? "1" : "0") +
+     " BE=" + str.tostring(beTrigger) + "xTP/" + str.tostring(beOffset) +
+     " Reentry=" + str.tostring(useReentry ? maxReentry : 0) +
+     " Risk=" + str.tostring(riskPctPerTrade) + "%"
+
+bool confFired = false
+
+// ---- 9-1) 保有中の建値移動 / 決済 / 再エントリー ----
+if inPos
+    tpDist = pE - pTP
+    // 建値移動（発動時アラート）
+    if useBreakeven and not beDone and low <= pE - tpDist * beTrigger
+        beDone := true
+        pSL := pE - beOffset
+        if is5m
+            alert("BE MOVE Rank=" + pRank + " newSL=" + str.tostring(pSL, "#.##") + " (建値移動)", alert.freq_once_per_bar)
+    // 決済判定（TP優先）
+    bool beExit = false
+    bool exited = false
+    if low <= pTP
+        exited := true
+    else if high >= pSL
+        exited := true
+        beExit := beDone
+    if exited
+        inPos := false
+        // 建値決済なら再エントリー（同方向・同リスク幅）
+        if useReentry and beExit and reentryCount < maxReentry and is5m
+            reentryCount := reentryCount + 1
+            pE   := close
+            pSL  := close + pRisk
+            pTP  := close - pRisk * rrRatio
+            beDone := false
+            inPos := true
+            lastEntryBar := bar_index
+            if showLabels
+                label.new(bar_index, high, text="RE-SELL " + pRank + " (" + str.tostring(reentryCount) + "/" + str.tostring(maxReentry) + ")" +
+                     "\nE=" + str.tostring(pE, "#.##") + "\nSL=" + str.tostring(pSL, "#.##") + "\nTP=" + str.tostring(pTP, "#.##"),
+                     style=label.style_label_down, color=color.new(color.orange, 0), textcolor=color.white, size=size.small)
+            alert("RE-ENTRY SELL Rank=" + pRank + " (" + str.tostring(reentryCount) + "/" + str.tostring(maxReentry) + ")" +
+                 " E=" + str.tostring(pE, "#.##") + " SL=" + str.tostring(pSL, "#.##") + " TP=" + str.tostring(pTP, "#.##"), alert.freq_once_per_bar)
+
+// ---- 9-2) 確定シグナル（足確定 / フラット時のみ / 1回）----
+if barstate.isconfirmed and not inPos and not na(confRank) and gateBase
+    inPos := true
+    pE    := close
+    pSL   := sellSl
+    pTP   := sellTp
+    pRisk := sellRisk
+    pRank := confRank
+    beDone := false
+    reentryCount := 0
+    lastEntryBar := bar_index
+    dailyEntryCount := dailyEntryCount + 1
+    confFired := true
+    if showLabels
+        label.new(bar_index, high, text="SELL " + confRank +
+             "\nE=" + str.tostring(pE, "#.##") + "\nSL=" + str.tostring(pSL, "#.##") + "\nTP=" + str.tostring(pTP, "#.##"),
+             style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+    alert(f_msg("CONF", confRank), alert.freq_once_per_bar_close)
+
+// ---- 9-3) 仮シグナル（足確定前 / アラートのみ / 1回 / 確定 or FVG切替でリセット）----
+fvgSwitched = ta.change(fvgBullLow) != 0 or ta.change(fvgBullHigh) != 0
+var bool tentLatch = false
+if confFired or fvgSwitched
+    tentLatch := false
+if useTentative and is5m and not barstate.isconfirmed and not inPos and not na(tentRank) and gateBase and not tentLatch
+    tentLatch := true
+    alert(f_msg("TENT", tentRank), alert.freq_once_per_bar)
+
+// =============================================================================
+// 10) Display
+// =============================================================================
+plot(showEmas ? ema200_15m : na, "15m EMA200", color=color.new(color.orange, 0), linewidth=2)
+plot(showEmas ? ema200_5m  : na, "5m EMA200",  color=color.new(color.fuchsia, 0), linewidth=1)
+plot(showEmas ? ema50_5m   : na, "5m EMA50",   color=color.new(color.aqua, 40))
+plot(showEmas ? ema20_5m   : na, "5m EMA20",   color=color.new(color.lime, 40))
+
+bgcolor(showBgHtf and htfBear ? color.new(color.red, 92) : na, title="HTF Bear BG")
+
+plotshape(showFvgMarks and bullFvgRaw and bullThickOk, title="Bullish FVG",
+     style=shape.triangleup, location=location.belowbar, color=color.new(color.teal, 0), size=size.tiny)
+plotshape(showFvgMarks and fvgBullAge > 0 and fvgBullRet and not sellTrigger, title="SELL 吸収待ち",
+     style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+
+// 保有中のSL/TPライン
+plot(showPosLines and inPos ? pE  : na, "Pos Entry", color=color.new(color.white, 0),  style=plot.style_linebr)
+plot(showPosLines and inPos ? pSL : na, "Pos SL",    color=color.new(color.red, 0),    style=plot.style_linebr)
+plot(showPosLines and inPos ? pTP : na, "Pos TP",    color=color.new(color.green, 0),  style=plot.style_linebr)
+
+// =============================================================================
+// 11) Info Panel
+// =============================================================================
+f_cell(_t, _r, _name, _val, _col) =>
+    table.cell(_t, 0, _r, _name, text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
+    table.cell(_t, 1, _r, _val, text_color=_col, text_size=size.small)
+
+var table info = table.new(position.top_right, 2, 12, border_width=1, frame_width=1, frame_color=color.gray)
+if showInfoTable and barstate.islast
+    sigNow = not na(confRank) ? confRank : not na(tentRank) ? tentRank : na
+    f_cell(info, 0, "Mode",        entryMode, color.white)
+    f_cell(info, 1, "TF=5m",       is5m ? "OK" : "NG(5mのみ)", is5m ? color.lime : color.red)
+    f_cell(info, 2, "htfBear",     htfBear ? "TRUE" : "FALSE", htfBear ? color.lime : color.red)
+    f_cell(info, 3, "Signal",      na(sigNow) ? "-" : sigNow + (not na(confRank) ? "(確定)" : "(仮)"), na(sigNow) ? color.gray : color.lime)
+    f_cell(info, 4, "In Position", inPos ? "YES " + pRank : "NO", inPos ? color.orange : color.gray)
+    f_cell(info, 5, "Entry",       inPos ? str.tostring(pE, "#.##") : str.tostring(close, "#.##"), color.white)
+    f_cell(info, 6, "SL",          inPos ? str.tostring(pSL, "#.##") : str.tostring(sellSl, "#.##"), color.white)
+    f_cell(info, 7, "TP",          inPos ? str.tostring(pTP, "#.##") : str.tostring(sellTp, "#.##"), color.white)
+    f_cell(info, 8, "Width(E-SL)", str.tostring(inPos ? pRisk : sellRisk, "#.##") + " / max " + str.tostring(maxRiskDollar), riskWithin12 ? color.lime : color.red)
+    f_cell(info, 9, "BE / Reentry", str.tostring(beTrigger) + "xTP  " + str.tostring(reentryCount) + "/" + str.tostring(useReentry ? maxReentry : 0), color.white)
+    f_cell(info, 10, "Risk%",      str.tostring(riskPctPerTrade) + "%  (Size " + str.tostring(sellLots) + ")", sizeOk ? color.white : color.red)
+    f_cell(info, 11, "Today",      str.tostring(dailyEntryCount) + "/" + str.tostring(maxEntriesPerDay), dailyOk ? color.white : color.red)
