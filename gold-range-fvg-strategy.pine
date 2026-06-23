@@ -1,0 +1,849 @@
+//@version=5
+// =============================================================================
+// Gold Range FVG Absorption Reversion Strategy  ×  ①〜⑤ Range Definition
+// -----------------------------------------------------------------------------
+//  ・レンジ端の定義 = ①〜⑤（固定ゾーン＋反発カウント／rangeValid）※変更なし
+//  ・エントリーの引き金 = FVG Absorption（Sweepは一切使わない）
+//      SELL: レンジ上端付近で Bearish FVG が吸収 → 陰線確定
+//      BUY : レンジ下端付近で Bullish FVG が吸収 → 陽線確定
+//  ・SL/TP・資金管理・WinZone・建値移動・再エントリー・MA調整・各フィルター・
+//    Range Info Table はコード②準拠で維持。
+//  ・下流コードは rangeHigh/rangeLow/rangeMid/rangeWidth/isRange の名前を維持。
+//
+//  ★拡張（2.5）: レンジ内戻り売り / レンジ拡張ゾーン / 上位足下降フィルター /
+//                反転ローソクトリガー。すべて input でON/OFFできる追加機能。
+//                既存ロジックは破壊せず、トグルOFF時は従来と完全同一挙動。
+// =============================================================================
+strategy("Gold Range FVG Absorption Reversion Strategy (①〜⑤ Range)",
+     overlay              = true,
+     pyramiding           = 0,
+     calc_on_order_fills  = false,
+     calc_on_every_tick   = false,
+     process_orders_on_close = true,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     initial_capital      = 1000,
+     commission_type      = strategy.commission.cash_per_contract,
+     commission_value     = 0.0)
+
+// =============================================================================
+// 1) Inputs
+// =============================================================================
+grpVol = "0) Volatility Base"
+atrLenBase = input.int(14, "基準ATR本数", minval=1, group=grpVol)
+atrTf      = input.timeframe("", "基準ATR時間足(空=チャート)", group=grpVol)
+baseAtr    = atrTf == "" ? ta.atr(atrLenBase)
+                         : request.security(syminfo.tickerid, atrTf, ta.atr(atrLenBase)[1], lookahead=barmerge.lookahead_off)
+useMinVol    = input.bool(false,  "低ボラ時はエントリー禁止", group=grpVol)
+minAtrDollar = input.float(1.5,  "最低ATR($) これ未満は入らない", minval=0.0, step=0.1, group=grpVol)
+volModeRel  = input.bool(false,  "低ボラ判定を相対(ATR平均比)にする", group=grpVol)
+volAvgLen   = input.int(480,    "ATR平均の本数(相対用)", minval=10, group=grpVol)
+volRatioMin = input.float(0.9,  "ATR ÷ ATR平均 の最低比", minval=0.1, step=0.05, group=grpVol)
+atrAvg      = ta.sma(baseAtr, volAvgLen)
+volOk = not useMinVol or (volModeRel ? (baseAtr >= atrAvg * volRatioMin) : (baseAtr >= minAtrDollar))
+
+// ===== ①〜⑤ レンジ定義の入力（変更なし） =====
+grpRangeDef = "1') Range Definition (①〜⑤)"
+emaLen            = input.int(200, "① EMA Length",              minval=1, group=grpRangeDef)
+emaSlopeLookback  = input.int(20,  "① EMA Slope Lookback",      minval=1, group=grpRangeDef)
+emaSlopeThreshold = input.float(3.0,"① EMA Slope Threshold",    step=0.1, group=grpRangeDef)
+rangeLookback     = input.int(20,  "② Range Lookback(再アンカー)", minval=2, group=grpRangeDef)
+minRangeWidth     = input.float(10,"② Min Range Width",         step=0.5, group=grpRangeDef)
+maxRangeWidth     = input.float(80,"② Max Range Width",         step=0.5, group=grpRangeDef)
+touchToleranceATR = input.float(1.5,"③④ Touch Tolerance(×ATR)", step=0.1, group=grpRangeDef)
+minUpperReactions = input.int(2,   "③ Min Upper Reactions",     minval=1, group=grpRangeDef)
+minLowerReactions = input.int(2,   "④ Min Lower Reactions",     minval=1, group=grpRangeDef)
+rangeQualityMin   = input.float(3, "⑤ Range Width ÷ ATR Min",   step=0.5, group=grpRangeDef)
+
+grpRange   = "1) Range Detection (補助)"
+adxLen            = input.int(14,   "ADX Length",                minval=2,  group=grpRange)
+maFastLen         = input.int(20,   "MA Fast Len",               minval=1,  group=grpRange)
+maMidLen          = input.int(50,   "MA Mid Len",                minval=1,  group=grpRange)
+maSlowLen         = input.int(100,  "MA Slow Len",               minval=1,  group=grpRange)
+
+// ===== ★FVG Absorption（Sweep系を撤去してこちらに置換） =====
+grpFvg = "2) FVG Absorption"
+fvgMaxAge             = input.int(5,   "FVG有効期限 本数", minval=1, group=grpFvg)
+useFvgThicknessFilter = input.bool(true,"FVG厚みフィルター(薄いFVGを除外)", group=grpFvg)
+fvgMinThicknessATR    = input.float(0.0,"FVG最低厚み(×ATR)", minval=0.0, step=0.05, group=grpFvg)
+
+// ===== ★2.5) Range Pullback / Extended Entry（追加機能・すべてOFFで従来挙動） =====
+grp25 = "2.5) Range Pullback / Extended Entry"
+useRangePullbackSellMode = input.bool(false, "レンジ内戻り売りモード（下降中の戻り売りを追加）", group=grp25)
+useExtendedRangeZone     = input.bool(false, "レンジ4分割の拡張ゾーンSELL/BUYを許可",          group=grp25)
+edgeZonePct              = input.float(0.25,  "レンジ内SELL/BUYゾーン比率",       step=0.05, minval=0.0, maxval=0.5, group=grp25)
+useHtfBearFilter         = input.bool(true,   "上位足下降フィルターを使う(htfBear)",            group=grp25)
+htfBearTf                = input.timeframe("60", "上位足下降判定 時間足",                        group=grp25)
+blockBuyWhenHtfBear      = input.bool(false,  "上位足下降中はBUY禁止",                          group=grp25)
+useCandleTrigger         = input.bool(false,  "FVG以外に反転ローソクも許可",                    group=grp25)
+candlePinWickMult        = input.float(2.0,   "ピンバー ヒゲ÷実体 倍率", step=0.1, minval=1.0,  group=grp25)
+
+grpObstacle = "3) Obstacle Filter"
+useObstacleFilter = input.bool(false,  "Use Obstacle Filter",      group=grpObstacle)
+swingLen          = input.int(10,     "Swing Pivot Lookback",     minval=2, group=grpObstacle)
+usePivotObstacle  = input.bool(false, "Use Swing Pivot as Obstacle", group=grpObstacle)
+useMaObstacle = input.bool(false, "MAも障害物に含める", group=grpObstacle)
+obstacleMaxDistMult = input.float(1.67, "Obstacle Max (xATR)", minval=0.1, step=0.1, group=grpObstacle)
+obstacleMaxDist = baseAtr * obstacleMaxDistMult
+
+grpWin     = "4) Win Zone / TP-SL"
+slFixed   = input.float(30.0, "SL ($/固定)", minval=0.1, step=0.1, group=grpWin)
+useAtrSL  = input.bool(true, "SLをATR可変にする", group=grpWin)
+atrSLMult = input.float(5.0, "SL用ATR係数", minval=0.1, step=0.1, group=grpWin)
+slDollars = useAtrSL ? baseAtr * atrSLMult : slFixed
+riskPctPerTrade   = input.float(5.0, "Risk % per Trade", minval=0.1, step=0.1, group=grpWin)
+useRRTP   = input.bool(true,  "TPをRR比率で出す", group=grpWin)
+rrRatio   = input.float(1.0,  "RR (TP = SL × RR)", minval=0.1, step=0.1, group=grpWin)
+tpFixed   = input.float(10.0, "TP ($/固定:RR OFF時)", minval=0.1, step=0.1, group=grpWin)
+tpDollars = useRRTP ? slDollars * rrRatio : tpFixed
+winZoneMult = input.float(0.2, "Win Zone 余地(xRisk)", minval=0.0, step=0.1, group=grpWin)
+
+useBreakeven = input.bool(false,  "建値移動を使う", group=grpWin)
+beTrigger    = input.float(0.7,  "建値移動の発動(xTP到達)", minval=0.1, maxval=1.0, step=0.05, group=grpWin)
+beOffset     = input.float(0.0,  "建値オフセット($) +で少し利益側", step=0.1, group=grpWin)
+
+useReentry = input.bool(false, "建値決済後に再エントリー", group=grpWin)
+maxReentry = input.int(1, "再エントリー最大回数", minval=1, group=grpWin)
+
+useMaSLTP  = input.bool(false,  "MAでSL/TP調整", group=grpWin)
+maNearPct  = input.float(0.30, "MA近接判定（リスク幅の割合）", minval=0.01, maxval=1.0, step=0.01, group=grpWin)
+maSlBuffer = input.float(5.0,  "MAスナップ余白：SL($)", minval=0.0, step=0.1, group=grpWin)
+maTpBuffer = input.float(1.0,  "MAスナップ余白：TP($)", minval=0.0, step=0.1, group=grpWin)
+minRiskGuard = input.float(3.0, "最小リスク幅($)", minval=0.1, step=0.1, group=grpWin)
+
+maSnapMaxMult   = input.float(1.2, "EMAスナップ許容（当初SLの何倍まで）", minval=1.0, step=0.1, group=grpWin)
+useMaTP         = input.bool(false, "MAでTP調整（±バンド）", group=grpWin)
+maTpSnapBandPct = input.float(30.0, "TPスナップ許容バンド(±%)", minval=0.0, step=1.0, group=grpWin)
+
+useRangeTP   = input.bool(true,  "TPをレンジ基準で置く", group=grpWin)
+tpRangePct   = input.float(50, "TP位置：レンジの何%先 (50=中央 / 100=反対側)", minval=1, maxval=100, step=5, group=grpWin)
+tpBufferMult = input.float(0.0,  "TP Buffer (×ATR) 手前で利確", minval=0.0, step=0.1, group=grpWin)
+minTpDist    = input.float(2.0,  "最小TP距離($) 安全弁", minval=0.1, step=0.1, group=grpWin)
+
+grpTrend   = "5) Trend Filter"
+useTrendBlock     = input.bool(false,  "Block Counter-Trend Entries", group=grpTrend)
+trendBlockMode    = input.string("AND", "ブロック条件", options=["OR","AND"], group=grpTrend)
+trendAdxMax       = input.float(28.0, "Trend Block ADX", minval=1.0, group=grpTrend)
+useStFilter = input.bool(false, "上位足スーパートレンドで順張りのみ", group=grpTrend)
+stTf        = input.timeframe("1440", "ST 時間足",     group=grpTrend)
+stFactor    = input.float(3.0, "ST Factor", step=0.1, group=grpTrend)
+stAtrLen    = input.int(10,  "ST ATR Length", minval=1, group=grpTrend)
+
+grpSession = "6) Session Filter (Asia/Tokyo time)"
+useTokyoSession   = input.bool(true,  "Tokyo  10:00-16:00",     group=grpSession)
+useLondonSession  = input.bool(true,  "London 16:00-21:00",     group=grpSession)
+useNYSession      = input.bool(false, "NY     21:00-03:00",     group=grpSession)
+manualNewsBlock   = input.bool(false, "Manual News Block (OFF=trade, ON=no trade)", group=grpSession)
+avoidOpenMin    = input.bool(false, "セッション初動を回避", group=grpSession)
+blockLondonOpen = input.session("1600-1645", "London初動ブロック帯", group=grpSession)
+blockNYOpen     = input.session("2100-2145", "NY初動ブロック帯",     group=grpSession)
+
+grpDisp    = "7) Display"
+showRange         = input.bool(true,  "Show Range Lines",       group=grpDisp)
+showBgRange       = input.bool(true,  "Color Background on Range",group=grpDisp)
+showFvgMarks      = input.bool(true,  "Show FVG Marks",         group=grpDisp)
+showEntryLabels   = input.bool(true,  "Show Entry/SL/TP Labels",group=grpDisp)
+showInfoTable     = input.bool(true,  "Show Range Info Table",  group=grpDisp)
+
+// =============================================================================
+// 2) Core Calculations
+// =============================================================================
+
+// --- MAs (compression / obstacle) -------------------------------------------
+maFast = ta.ema(close, maFastLen)
+maMid  = ta.ema(close, maMidLen)
+maSlow = ta.ema(close, maSlowLen)
+
+ema_1m_1000  = request.security(syminfo.tickerid, "1",   ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_1m_3000  = request.security(syminfo.tickerid, "1",   ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+ema_5m_1000  = request.security(syminfo.tickerid, "5",   ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_5m_3000  = request.security(syminfo.tickerid, "5",   ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+ema_15m_1000 = request.security(syminfo.tickerid, "15",  ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_15m_3000 = request.security(syminfo.tickerid, "15",  ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+ema_1h_1000  = request.security(syminfo.tickerid, "60",  ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_1h_3000  = request.security(syminfo.tickerid, "60",  ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+ema_4h_1000  = request.security(syminfo.tickerid, "240", ta.ema(close, 1000)[1], lookahead=barmerge.lookahead_on)
+ema_4h_3000  = request.security(syminfo.tickerid, "240", ta.ema(close, 3000)[1], lookahead=barmerge.lookahead_on)
+maArr = array.from(ema_1m_1000, ema_1m_3000, ema_5m_1000, ema_5m_3000, ema_15m_1000, ema_15m_3000, ema_1h_1000, ema_1h_3000, ema_4h_1000, ema_4h_3000)
+
+// --- ADX (manual, v5) → Trend Block 用に保持 --------------------------------
+upMove     = high - high[1]
+downMove   = low[1] - low
+plusDM     = (upMove > downMove and upMove > 0) ? upMove : 0.0
+minusDM    = (downMove > upMove and downMove > 0) ? downMove : 0.0
+trVal      = ta.tr(true)
+atrAdx     = ta.rma(trVal,   adxLen)
+plusDI     = 100.0 * ta.rma(plusDM,  adxLen) / (atrAdx == 0 ? 1.0 : atrAdx)
+minusDI    = 100.0 * ta.rma(minusDM, adxLen) / (atrAdx == 0 ? 1.0 : atrAdx)
+dx         = 100.0 * math.abs(plusDI - minusDI) / ((plusDI + minusDI) == 0 ? 1.0 : (plusDI + minusDI))
+adxVal     = ta.rma(dx, adxLen)
+
+// =============================================================================
+// 2') ①〜⑤ Range Definition（固定ゾーン＋反発カウント）  ※変更なし
+// =============================================================================
+ema200 = ta.ema(close, emaLen)
+hh  = ta.highest(high, rangeLookback)
+ll  = ta.lowest(low,  rangeLookback)
+tol = baseAtr * touchToleranceATR
+
+var float rangeHighFixed = na
+var float rangeLowFixed  = na
+var int   upperReactions = 0
+var int   lowerReactions = 0
+var bool  inUpperZone    = false
+var bool  inLowerZone    = false
+
+if barstate.isconfirmed
+    needInit  = na(rangeHighFixed) or na(rangeLowFixed)
+    brokeUp   = not needInit and close > rangeHighFixed + tol and close[1] > rangeHighFixed + tol
+    brokeDown = not needInit and close < rangeLowFixed  - tol and close[1] < rangeLowFixed  - tol
+    if needInit or brokeUp or brokeDown
+        rangeHighFixed := hh
+        rangeLowFixed  := ll
+        upperReactions := 0
+        lowerReactions := 0
+        inUpperZone    := false
+        inLowerZone    := false
+    else
+        if high >= rangeHighFixed - tol
+            inUpperZone := true
+        if inUpperZone and close < rangeHighFixed - tol
+            upperReactions += 1
+            inUpperZone    := false
+        if low <= rangeLowFixed + tol
+            inLowerZone := true
+        if inLowerZone and close > rangeLowFixed + tol
+            lowerReactions += 1
+            inLowerZone    := false
+
+// ①〜⑤ 各判定
+emaSlopeNorm     = math.abs((ema200 - ema200[emaSlopeLookback]) / baseAtr)
+emaSlopeOK       = emaSlopeNorm < emaSlopeThreshold
+rangeWidthVal    = rangeHighFixed - rangeLowFixed
+rangeWidthOK     = rangeWidthVal >= minRangeWidth and rangeWidthVal <= maxRangeWidth
+upperReactionsOK = upperReactions >= minUpperReactions
+lowerReactionsOK = lowerReactions >= minLowerReactions
+rangeQuality     = rangeWidthVal / baseAtr
+rangeQualityOK   = rangeQuality >= rangeQualityMin
+rangeValid       = emaSlopeOK and rangeWidthOK and upperReactionsOK and lowerReactionsOK and rangeQualityOK
+
+// ===== ブリッジ（下流コードは以下の名前を使うので維持） =====
+rangeHigh  = rangeHighFixed
+rangeLow   = rangeLowFixed
+rangeWidth = rangeWidthVal
+rangeMid   = (rangeHighFixed + rangeLowFixed) / 2.0
+isRange    = rangeValid
+
+// =============================================================================
+// 4) FVG Detection & Absorption（★Sweepを置換した新エントリー引き金）
+// =============================================================================
+// レンジ端付近（既存 tol を使用）
+nearHigh = high >= rangeHigh - tol
+nearLow  = low  <= rangeLow  + tol
+
+// 反転確認ローソク
+isBull = close > open
+isBear = close < open
+
+// ----- ★追加：レンジ4分割の拡張ゾーン（rangeMid 基準で上下に edgeZonePct 帯） -----
+//   sellZoneExtended : レンジ中央より上(=戻り売り候補ゾーン)
+//   buyZoneExtended  : レンジ中央より下(=押し目買い候補ゾーン)
+sellZoneExtended = close >= rangeMid + rangeWidth * edgeZonePct
+buyZoneExtended  = close <= rangeMid - rangeWidth * edgeZonePct
+
+// ----- ★追加：反転ローソク（包み足 / ピンバー）-----
+_cBody   = math.abs(close - open)
+_cRange  = high - low
+_cUpWick = high - math.max(close, open)
+_cDnWick = math.min(close, open) - low
+bearishEngulfing = close < open and close[1] > open[1] and open >= close[1] and close <= open[1]
+bullishEngulfing = close > open and close[1] < open[1] and open <= close[1] and close >= open[1]
+bearishPinbar    = _cUpWick >= _cBody * candlePinWickMult and _cUpWick >= _cRange * 0.5
+bullishPinbar    = _cDnWick >= _cBody * candlePinWickMult and _cDnWick >= _cRange * 0.5
+
+// --- FVG（3本パターン）発生 ---
+bullFvgRaw = low  > high[2]     // Bullish FVG（窓開け上）
+bearFvgRaw = high < low[2]      // Bearish FVG（窓開け下）
+
+// FVG境界（発生時点）と厚み
+bullFvgLowRaw  = high[2]        // Bullish FVG 下限
+bullFvgHighRaw = low            // Bullish FVG 上限
+bearFvgLowRaw  = high           // Bearish FVG 下限
+bearFvgHighRaw = low[2]         // Bearish FVG 上限
+bullThick = bullFvgHighRaw - bullFvgLowRaw
+bearThick = bearFvgHighRaw - bearFvgLowRaw
+bullThickOk = not useFvgThicknessFilter or (bullThick >= baseAtr * fvgMinThicknessATR)
+bearThickOk = not useFvgThicknessFilter or (bearThick >= baseAtr * fvgMinThicknessATR)
+
+// --- アクティブFVGの状態（方向ごとに最新1つを保持） ---
+//  SELL = Bullish FVG が下方ブレイク（インバース）
+//  BUY  = Bearish FVG が上方ブレイク（インバース）
+var float fvgBullLow  = na   // Bullish FVG 下限(=high[2])
+var float fvgBullHigh = na   // Bullish FVG 上限(=low)
+var int   fvgBullAge  = 0
+var bool  fvgBullRet  = false  // FVG内に戻ったか
+
+var float fvgBearLow  = na   // Bearish FVG 下限(=high)
+var float fvgBearHigh = na   // Bearish FVG 上限(=low[2])
+var int   fvgBearAge  = 0
+var bool  fvgBearRet  = false
+
+bool buyTrigger  = false
+bool sellTrigger = false
+// ★追加：拡張ゾーン（レンジ上半分/下半分）での FVG吸収トリガー
+bool sellTriggerExt = false
+bool buyTriggerExt  = false
+
+if barstate.isconfirmed
+    // ---- SELL：Bullish FVG の下方ブレイク（インバース） ----
+    if fvgBullAge > 0
+        // FVG内に戻った（安値が上限以下に入った）
+        if low <= fvgBullHigh
+            fvgBullRet := true
+        // 戻り後、終値がFVG下限を下抜け＆陰線確定でSELL吸収成立
+        if fvgBullRet and close < fvgBullLow and isBear and nearHigh
+            sellTrigger := true        // 既存：レンジ上端付近のみ（挙動不変）
+            fvgBullAge := 0
+        else if fvgBullRet and close < fvgBullLow and isBear and useRangePullbackSellMode and useExtendedRangeZone and sellZoneExtended
+            sellTriggerExt := true     // ★追加：レンジ上半分での戻り売り
+            fvgBullAge := 0
+        else
+            fvgBullAge := fvgBullAge - 1
+
+    // ---- BUY：Bearish FVG の上方ブレイク（インバース） ----
+    if fvgBearAge > 0
+        // FVG内に戻った（高値が下限以上に入った）
+        if high >= fvgBearLow
+            fvgBearRet := true
+        // 戻り後、終値がFVG上限を上抜け＆陽線確定でBUY吸収成立
+        if fvgBearRet and close > fvgBearHigh and isBull and nearLow
+            buyTrigger := true         // 既存：レンジ下端付近のみ（挙動不変）
+            fvgBearAge := 0
+        else if fvgBearRet and close > fvgBearHigh and isBull and useExtendedRangeZone and buyZoneExtended
+            buyTriggerExt := true      // ★追加：レンジ下半分での押し目買い
+            fvgBearAge := 0
+        else
+            fvgBearAge := fvgBearAge - 1
+
+    // ---- 新規FVG登録（最後に：発生足での自己トリガーを防止） ----
+    if bullFvgRaw and bullThickOk
+        fvgBullLow  := bullFvgLowRaw
+        fvgBullHigh := bullFvgHighRaw
+        fvgBullAge  := fvgMaxAge
+        fvgBullRet  := false
+    if bearFvgRaw and bearThickOk
+        fvgBearLow  := bearFvgLowRaw
+        fvgBearHigh := bearFvgHighRaw
+        fvgBearAge  := fvgMaxAge
+        fvgBearRet  := false
+
+// =============================================================================
+// 5) Obstacle Filter  ※変更なし
+// =============================================================================
+prevDayHigh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_off)
+prevDayLow  = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_off)
+
+newDay = ta.change(time("D")) != 0
+var float todayHighRun = na
+var float todayLowRun  = na
+if newDay
+    todayHighRun := high
+    todayLowRun  := low
+else
+    todayHighRun := math.max(nz(todayHighRun, high), high)
+    todayLowRun  := math.min(nz(todayLowRun,  low),  low)
+
+todayHigh = todayHighRun[7]
+todayLow  = todayLowRun[7]
+
+pivotHigh = ta.pivothigh(high, swingLen, swingLen)
+pivotLow  = ta.pivotlow(low,   swingLen, swingLen)
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+if not na(pivotHigh)
+    lastSwingHigh := pivotHigh
+if not na(pivotLow)
+    lastSwingLow  := pivotLow
+
+f_obstacleAbove(_priceRef) =>
+    bool found = false
+    if not na(prevDayHigh)   and prevDayHigh   > _priceRef and (prevDayHigh   - _priceRef) <= obstacleMaxDist
+        found := true
+    if not na(todayHigh)     and todayHigh     > _priceRef and (todayHigh     - _priceRef) <= obstacleMaxDist
+        found := true
+    if usePivotObstacle and not na(lastSwingHigh) and lastSwingHigh > _priceRef and (lastSwingHigh - _priceRef) <= obstacleMaxDist
+        found := true
+    if useMaObstacle
+        for _i = 0 to array.size(maArr) - 1
+            _m = array.get(maArr, _i)
+            if not na(_m) and _m > _priceRef and (_m - _priceRef) <= obstacleMaxDist
+                found := true
+    found
+
+f_obstacleBelow(_priceRef) =>
+    bool found = false
+    if not na(prevDayLow)   and prevDayLow   < _priceRef and (_priceRef - prevDayLow)   <= obstacleMaxDist
+        found := true
+    if not na(todayLow)     and todayLow     < _priceRef and (_priceRef - todayLow)     <= obstacleMaxDist
+        found := true
+    if usePivotObstacle and not na(lastSwingLow) and lastSwingLow < _priceRef and (_priceRef - lastSwingLow) <= obstacleMaxDist
+        found := true
+    if useMaObstacle
+        for _i = 0 to array.size(maArr) - 1
+            _m = array.get(maArr, _i)
+            if not na(_m) and _m < _priceRef and (_priceRef - _m) <= obstacleMaxDist
+                found := true
+    found
+
+obstacleOkSell = not useObstacleFilter or f_obstacleAbove(close)
+obstacleOkBuy  = not useObstacleFilter or f_obstacleBelow(close)
+
+f_nearestAboveDist(_p) =>
+    float d = na
+    if not na(prevDayHigh)   and prevDayHigh   > _p
+        d := na(d) ? prevDayHigh   - _p : math.min(d, prevDayHigh   - _p)
+    if not na(todayHigh)     and todayHigh     > _p
+        d := na(d) ? todayHigh     - _p : math.min(d, todayHigh     - _p)
+    if usePivotObstacle and not na(lastSwingHigh) and lastSwingHigh > _p
+        d := na(d) ? lastSwingHigh - _p : math.min(d, lastSwingHigh - _p)
+    d
+
+f_nearestBelowDist(_p) =>
+    float d = na
+    if not na(prevDayLow)   and prevDayLow   < _p
+        d := na(d) ? _p - prevDayLow   : math.min(d, _p - prevDayLow)
+    if not na(todayLow)     and todayLow     < _p
+        d := na(d) ? _p - todayLow     : math.min(d, _p - todayLow)
+    if usePivotObstacle and not na(lastSwingLow) and lastSwingLow < _p
+        d := na(d) ? _p - lastSwingLow : math.min(d, _p - lastSwingLow)
+    d
+
+// =============================================================================
+// 6) Win Zone（実際に使うTP距離ベースで判定）  ※変更なし
+// =============================================================================
+tpBufferDollars = baseAtr * tpBufferMult
+actualRisk      = slDollars     // SL調整前のリスク幅
+
+tpRangeFrac     = tpRangePct / 100.0
+tpTargetSell    = rangeHigh - rangeWidth * tpRangeFrac   // 50%→中央, 100%→下端(反対側)
+tpTargetBuy     = rangeLow  + rangeWidth * tpRangeFrac   // 50%→中央, 100%→上端(反対側)
+sellTargetPrice = tpTargetSell + tpBufferDollars         // 手前(エントリー側)に buffer 分ずらす
+buyTargetPrice  = tpTargetBuy  - tpBufferDollars
+sellTargetDist  = useRangeTP ? (close - sellTargetPrice) : tpDollars
+buyTargetDist   = useRangeTP ? (buyTargetPrice - close)  : tpDollars
+
+winZoneSell = (sellTargetDist >= minTpDist) and (sellTargetDist >= actualRisk * winZoneMult)
+winZoneBuy  = (buyTargetDist  >= minTpDist) and (buyTargetDist  >= actualRisk * winZoneMult)
+
+sellTpValid = not useRangeTP or ((sellTargetPrice < close) and ((close - sellTargetPrice) >= minTpDist))
+buyTpValid  = not useRangeTP or ((buyTargetPrice  > close) and ((buyTargetPrice  - close) >= minTpDist))
+
+// =============================================================================
+// 7) Trend Filter  ※変更なし
+// =============================================================================
+perfectUp   = maFast > maMid and maMid > maSlow
+perfectDown = maFast < maMid and maMid < maSlow
+
+f_stDir() =>
+    [_st, _dir] = ta.supertrend(stFactor, stAtrLen)
+    _dir
+stDir = request.security(syminfo.tickerid, stTf, f_stDir()[1], lookahead = barmerge.lookahead_off)
+stBullish = stDir < 0
+stBearish = stDir > 0
+
+stOkSell = not useStFilter or stBearish
+stOkBuy  = not useStFilter or stBullish
+
+trendBlockSell = useTrendBlock and (trendBlockMode == "OR" ? (perfectUp   or adxVal > trendAdxMax) : (perfectUp   and adxVal > trendAdxMax))
+trendBlockBuy  = useTrendBlock and (trendBlockMode == "OR" ? (perfectDown or adxVal > trendAdxMax) : (perfectDown and adxVal > trendAdxMax))
+
+// =============================================================================
+// 7.5) ★HTF Bear Bias（上位足下降目線の判定 / repaintしない設定）
+//   htfBear = チャート close<EMA200  or  上位足Supertrend bearish  or  上位足EMA200傾き下向き
+//   ※ 新規 security は lookahead_off + [1] のみ（lookahead_on は新規追加しない）
+// =============================================================================
+htfStDir     = request.security(syminfo.tickerid, htfBearTf, f_stDir()[1], lookahead = barmerge.lookahead_off)
+htfStBearish = htfStDir > 0
+htfEmaNow    = request.security(syminfo.tickerid, htfBearTf, ta.ema(close, emaLen)[1],                    lookahead = barmerge.lookahead_off)
+htfEmaPast   = request.security(syminfo.tickerid, htfBearTf, ta.ema(close, emaLen)[1 + emaSlopeLookback], lookahead = barmerge.lookahead_off)
+htfEmaDown   = not na(htfEmaPast) and htfEmaNow < htfEmaPast
+htfBear      = (close < ema200) or htfStBearish or htfEmaDown
+
+// =============================================================================
+// 8) Session Filter (Asia/Tokyo time)  ※変更なし
+// =============================================================================
+inTokyo  = not na(time(timeframe.period, "1000-1600", "Asia/Tokyo"))
+inLondon = not na(time(timeframe.period, "1600-2100", "Asia/Tokyo"))
+inNY     = not na(time(timeframe.period, "2100-0300", "Asia/Tokyo"))
+
+sessionOk =
+     (useTokyoSession  and inTokyo)  or
+     (useLondonSession and inLondon) or
+     (useNYSession     and inNY)
+
+noSessionSelected = not useTokyoSession and not useLondonSession and not useNYSession
+sessionFinal = noSessionSelected ? false : sessionOk
+
+newsOk = not manualNewsBlock
+
+inOpenBlock = avoidOpenMin and (
+     not na(time(timeframe.period, blockLondonOpen, "Asia/Tokyo")) or
+     not na(time(timeframe.period, blockNYOpen,     "Asia/Tokyo")))
+
+// =============================================================================
+// 9) Entry Conditions（引き金=FVG吸収トリガー / 構造は維持）
+// =============================================================================
+baseOk = barstate.isconfirmed and isRange and sessionFinal and newsOk and not inOpenBlock and volOk
+
+// ----- 既存コア条件（トグルOFFなら従来と完全同一） -----
+sellEntryCore = baseOk
+         and sellTrigger          // ← FVG吸収（Bearish, レンジ上端付近）
+         and obstacleOkSell
+         and winZoneSell
+         and not trendBlockSell
+         and stOkSell
+         and sellTpValid
+
+buyEntryCore  = baseOk
+         and buyTrigger           // ← FVG吸収（Bullish, レンジ下端付近）
+         and obstacleOkBuy
+         and winZoneBuy
+         and not trendBlockBuy
+         and stOkBuy
+         and buyTpValid
+
+// ----- ★追加：エントリー許容ゾーン（拡張ONなら端 or 中央寄りゾーン） -----
+sellZoneActive = useExtendedRangeZone ? (nearHigh or sellZoneExtended) : nearHigh
+buyZoneActive  = useExtendedRangeZone ? (nearLow  or buyZoneExtended)  : nearLow
+
+// ----- ★追加：反転ローソクトリガー（追加モードON時のみ・ゾーン内限定） -----
+sellCandleTrigger = useCandleTrigger and (bearishEngulfing or bearishPinbar) and sellZoneActive
+buyCandleTrigger  = useCandleTrigger and (bullishEngulfing or bullishPinbar) and buyZoneActive
+
+// ----- ★追加：レンジ内戻り売り SELL（上位足下降目線のとき条件を緩和） -----
+sellEntryPullback = baseOk
+         and useRangePullbackSellMode
+         and (sellTriggerExt or sellCandleTrigger)   // FVG吸収(拡張) or 反転ローソク
+         and (not useHtfBearFilter or htfBear)       // 上位足下降目線のときだけ許可
+         and obstacleOkSell
+         and winZoneSell
+         and not trendBlockSell
+         and stOkSell
+         and sellTpValid
+
+// ----- ★追加：レンジ拡張 BUY（中央寄り押し目買い） -----
+buyEntryExtended = baseOk
+         and (buyTriggerExt or buyCandleTrigger)     // FVG吸収(拡張) or 反転ローソク
+         and obstacleOkBuy
+         and winZoneBuy
+         and not trendBlockBuy
+         and stOkBuy
+         and buyTpValid
+
+// ----- ★追加：上位足下降中のBUY禁止（任意） -----
+buyBlockedByHtf = blockBuyWhenHtfBear and htfBear
+
+// ----- 最終エントリー（既存 or 追加） -----
+sellEntry = sellEntryCore or sellEntryPullback
+buyEntry  = (buyEntryCore or buyEntryExtended) and not buyBlockedByHtf
+
+// ----- トリガー種別（ラベル / アラート用） -----
+sellTrigType = sellEntryCore ? "FVG" : (sellTriggerExt ? "FVG-PB" : "Candle")
+buyTrigType  = buyEntryCore  ? "FVG" : (buyTriggerExt  ? "FVG-Ext" : "Candle")
+
+f_snap_sl_to_ema(_dir, _entry, _slRaw) =>
+    _sl = _slRaw
+    if useMaSLTP and array.size(maArr) > 0
+        _bestMA = float(na)
+        _bestD  = float(na)
+        for _i = 0 to array.size(maArr) - 1
+            _m = array.get(maArr, _i)
+            _valid = _dir == 1 ? _m < _entry : _m > _entry
+            if not na(_m) and _valid
+                _d = math.abs(_m - _slRaw)
+                if na(_bestD) or _d < _bestD
+                    _bestD  := _d
+                    _bestMA := _m
+        if not na(_bestMA)
+            _cand = _dir == 1 ? _bestMA - maSlBuffer : _bestMA + maSlBuffer
+            _cand := _dir == 1 ? math.min(_cand, _entry - minRiskGuard) : math.max(_cand, _entry + minRiskGuard)
+            _riskRaw  = math.abs(_entry - _slRaw)
+            _riskSnap = math.abs(_entry - _cand)
+            if _riskRaw > 0 and _riskSnap <= _riskRaw * maSnapMaxMult
+                _sl := _cand
+    _sl
+
+f_snap_tp_to_ema(_dir, _entry, _tpRR) =>
+    _tp = _tpRR
+    if useMaTP and array.size(maArr) > 0
+        _rewardRR = math.abs(_tpRR - _entry)
+        _bestMA = float(na)
+        _bestD  = float(na)
+        for _i = 0 to array.size(maArr) - 1
+            _m = array.get(maArr, _i)
+            _valid = _dir == 1 ? _m > _entry : _m < _entry
+            if not na(_m) and _valid
+                _d = math.abs(_m - _tpRR)
+                if na(_bestD) or _d < _bestD
+                    _bestD  := _d
+                    _bestMA := _m
+        if not na(_bestMA)
+            _cand = _dir == 1 ? _bestMA - maTpBuffer : _bestMA + maTpBuffer
+            _candReward = _dir == 1 ? _cand - _entry : _entry - _cand
+            _band = maTpSnapBandPct / 100.0
+            _loR  = _rewardRR * (1.0 - _band)
+            _hiR  = _rewardRR * (1.0 + _band)
+            if _candReward >= _loR and _candReward <= _hiR
+                _tp := _cand
+    _tp
+
+// =============================================================================
+// 10) Strategy Orders（Risk = riskPctPerTrade% per trade / 単利）  ※変更なし
+// =============================================================================
+var float posEntry = na
+var float posTP    = na
+var int   posDir   = 0
+var bool  beDone   = false
+var bool  reIsLong     = false
+var float reRiskW      = na
+var float reTpW        = na
+var int   reentryCount = 0
+var bool  armReentry   = false
+
+riskUSD  = strategy.initial_capital * (riskPctPerTrade / 100.0)
+qtyUnits = math.max(riskUSD / slDollars, 0.01)
+
+if sellEntry and strategy.position_size == 0
+    entryPrice = close
+    _slRaw = entryPrice + slDollars
+    _sl    = f_snap_sl_to_ema(-1, entryPrice, _slRaw)
+    _risk  = _sl - entryPrice
+    _tpDist = useRRTP ? _risk * rrRatio : tpFixed
+    _tp = useRangeTP ? math.min(sellTargetPrice, entryPrice - minTpDist) : f_snap_tp_to_ema(-1, entryPrice, entryPrice - _tpDist)
+    _qty = math.floor(riskUSD / math.max(_risk, 0.01))   // ★整数ロットに丸め
+    if _qty >= 1                                          // ★1未満は入らない
+        strategy.entry("SELL", strategy.short, qty = _qty)
+        strategy.exit("Exit SELL", from_entry="SELL", limit=_tp, stop=_sl)
+        posEntry := entryPrice
+        posTP    := _tp
+        posDir   := -1
+        beDone   := false
+        reIsLong := false
+        reRiskW  := _risk
+        reTpW    := math.abs(_tp - entryPrice)
+        reentryCount := 0
+
+if buyEntry and strategy.position_size == 0
+    entryPrice = close
+    _slRaw = entryPrice - slDollars
+    _sl    = f_snap_sl_to_ema(1, entryPrice, _slRaw)
+    _risk  = entryPrice - _sl
+    _tpDist = useRRTP ? _risk * rrRatio : tpFixed
+    _tp = useRangeTP ? math.max(buyTargetPrice, entryPrice + minTpDist) : f_snap_tp_to_ema(1, entryPrice, entryPrice + _tpDist)
+    _qty = math.floor(riskUSD / math.max(_risk, 0.01))   // ★整数ロットに丸め
+    if _qty >= 1                                          // ★1未満は入らない
+        strategy.entry("BUY", strategy.long, qty = _qty)
+        strategy.exit("Exit BUY", from_entry="BUY", limit=_tp, stop=_sl)
+        posEntry := entryPrice
+        posTP    := _tp
+        posDir   := 1
+        beDone   := false
+        reIsLong := true
+        reRiskW  := _risk
+        reTpW    := math.abs(_tp - entryPrice)
+        reentryCount := 0
+
+// =============================================================================
+// 11) Plot / Display（ラベルは実際のTPを表示）
+// =============================================================================
+sellTpShow = useRangeTP ? math.min(sellTargetPrice, close - minTpDist) : (close - tpDollars)
+buyTpShow  = useRangeTP ? math.max(buyTargetPrice, close + minTpDist) : (close + tpDollars)
+
+plot(showRange ? rangeHigh : na, "Range High",  color=color.new(color.red,   0), linewidth=1)
+plot(showRange ? rangeLow  : na, "Range Low",   color=color.new(color.green, 0), linewidth=1)
+plot(showRange ? rangeMid  : na, "Range Mid",   color=color.new(color.gray, 0),  style=plot.style_linebr)
+plot(ema200, "EMA200", color=color.new(color.blue, 0), linewidth=2)
+
+// ★追加：拡張ゾーン境界（4分割の SELL/BUY ライン）
+plot(showRange and useExtendedRangeZone ? rangeMid + rangeWidth * edgeZonePct : na, "SELL Ext Zone", color=color.new(color.maroon, 40), style=plot.style_linebr)
+plot(showRange and useExtendedRangeZone ? rangeMid - rangeWidth * edgeZonePct : na, "BUY Ext Zone",  color=color.new(color.teal,   40), style=plot.style_linebr)
+
+bgcolor(showBgRange and isRange ? color.new(color.yellow, 92) : na, title="Range BG")
+// ★追加：上位足下降目線の薄い背景（フィルター有効時のみ）
+bgcolor(useHtfBearFilter and htfBear ? color.new(color.red, 95) : na, title="HTF Bear BG")
+
+// FVG発生マーク
+plotshape(showFvgMarks and bearFvgRaw and bearThickOk, title="Bearish FVG",
+     style=shape.triangledown, location=location.abovebar, color=color.new(color.maroon, 0), size=size.tiny)
+plotshape(showFvgMarks and bullFvgRaw and bullThickOk, title="Bullish FVG",
+     style=shape.triangleup,   location=location.belowbar, color=color.new(color.teal,   0), size=size.tiny)
+// 反転待ち（FVG内に戻り、ブレイク確定待ち）
+plotshape(showFvgMarks and fvgBullAge > 0 and fvgBullRet and not sellTrigger, title="SELL 反転待ち",
+     style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+plotshape(showFvgMarks and fvgBearAge > 0 and fvgBearRet and not buyTrigger,  title="BUY 反転待ち",
+     style=shape.xcross, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny)
+// ★追加：反転ローソクマーク（追加モードON時のみ）
+plotshape(showFvgMarks and useCandleTrigger and (bearishEngulfing or bearishPinbar) and sellZoneActive, title="SELL Candle",
+     style=shape.diamond, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny)
+plotshape(showFvgMarks and useCandleTrigger and (bullishEngulfing or bullishPinbar) and buyZoneActive,  title="BUY Candle",
+     style=shape.diamond, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+
+if showEntryLabels and sellEntry
+    _sellTag = sellEntryCore ? "SELL" : (sellTriggerExt ? "SELL PB" : "SELL Candle")
+    label.new(bar_index, high,
+         text  = _sellTag + "\nE=" + str.tostring(close, "#.##") +
+                 "\nSL=" + str.tostring(close + slDollars, "#.##") +
+                 "\nTP=" + str.tostring(sellTpShow, "#.##"),
+         style = label.style_label_down,
+         color = color.new(sellEntryCore ? color.red : color.orange, 0),
+         textcolor = color.white,
+         size  = size.small)
+
+if showEntryLabels and buyEntry
+    _buyTag = buyEntryCore ? "BUY" : (buyTriggerExt ? "BUY Ext" : "BUY Candle")
+    label.new(bar_index, low,
+         text  = _buyTag + "\nE=" + str.tostring(close, "#.##") +
+                 "\nSL=" + str.tostring(close - slDollars, "#.##") +
+                 "\nTP=" + str.tostring(buyTpShow, "#.##"),
+         style = label.style_label_up,
+         color = color.new(buyEntryCore ? color.green : color.teal, 0),
+         textcolor = color.white,
+         size  = size.small)
+
+// --- 建値移動 (Breakeven) ---
+if useBreakeven and strategy.position_size != 0 and not beDone and posDir != 0
+    tpDist = math.abs(posTP - posEntry)
+    if posDir == 1 and high >= posEntry + tpDist * beTrigger
+        beDone := true
+        strategy.exit("Exit BUY", from_entry="BUY", limit=posTP, stop=posEntry + beOffset)
+    if posDir == -1 and low <= posEntry - tpDist * beTrigger
+        beDone := true
+        strategy.exit("Exit SELL", from_entry="SELL", limit=posTP, stop=posEntry - beOffset)
+
+// ===== 建値決済の検知 → 再エントリー =====
+if useReentry and beDone[1] and strategy.position_size == 0 and strategy.position_size[1] != 0 and reentryCount < maxReentry and not (sellEntry or buyEntry)
+    float _exitP  = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    float _entryP = strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    if not na(_exitP) and not na(_entryP) and math.abs(_exitP - _entryP) <= syminfo.mintick * 5
+        armReentry := true
+
+if armReentry and strategy.position_size == 0
+    float _e2  = close
+    float _sl2 = reIsLong ? _e2 - reRiskW : _e2 + reRiskW
+    float _tp2 = reIsLong ? _e2 + reTpW   : _e2 - reTpW
+    if reRiskW > 0
+        float _q2 = math.floor(riskUSD / math.max(reRiskW, 0.01))   // ★整数ロットに丸め
+        if _q2 >= 1                                                 // ★1未満は入らない
+            reentryCount += 1
+            if reIsLong
+                strategy.entry("BUY", strategy.long, qty=_q2)
+                strategy.exit("Exit BUY", from_entry="BUY", limit=_tp2, stop=_sl2)
+            else
+                strategy.entry("SELL", strategy.short, qty=_q2)
+                strategy.exit("Exit SELL", from_entry="SELL", limit=_tp2, stop=_sl2)
+            posEntry := _e2
+            posTP    := _tp2
+            posDir   := reIsLong ? 1 : -1
+            beDone   := false
+            alert("再エントリー(" + str.tostring(reentryCount) + "/" + str.tostring(maxReentry) + ") " + (reIsLong ? "BUY" : "SELL") + " | E=" + str.tostring(_e2, "#.##"), alert.freq_once_per_bar)
+    armReentry := false
+
+// =============================================================================
+// 12) Alerts（実際のTPを表示 / Risk幅・Range Width 付き）
+// =============================================================================
+obsDistSell = f_nearestAboveDist(close)
+obsDistBuy  = f_nearestBelowDist(close)
+
+// ----- 既存 alertcondition（維持） -----
+alertcondition(sellEntry, title="SELL FVG Absorption", message="SELL FVG | E={{close}} (①〜⑤ Range)")
+alertcondition(buyEntry,  title="BUY FVG Absorption",  message="BUY FVG | E={{close}} (①〜⑤ Range)")
+
+// ----- ★追加 alertcondition（拡張エントリー別） -----
+sellPbEvent     = sellEntry and not sellEntryCore and sellTriggerExt          // FVG吸収の戻り売り
+sellCandleEvent = sellEntry and not sellEntryCore and not sellTriggerExt      // 反転ローソクの戻り売り
+buyExtEvent     = buyEntry  and not buyEntryCore  and buyTriggerExt           // FVG吸収の拡張買い
+buyCandleEvent  = buyEntry  and not buyEntryCore  and not buyTriggerExt       // 反転ローソクの拡張買い
+
+alertcondition(sellPbEvent,     title="SELL Range Pullback",  message="SELL Range Pullback | E={{close}} (Range Upper-Half)")
+alertcondition(buyExtEvent,     title="BUY Range Extended",   message="BUY Range Extended | E={{close}} (Range Lower-Half)")
+alertcondition(sellCandleEvent, title="Candle Reversal SELL", message="Candle Reversal SELL | E={{close}}")
+alertcondition(buyCandleEvent,  title="Candle Reversal BUY",  message="Candle Reversal BUY | E={{close}}")
+
+// ----- 既存の動的アラート（コア=FVG吸収のみに限定して内容を正確化） -----
+if sellEntryCore
+    alert("SELL FVG Absorption | Dir=SELL"
+         + " E="    + str.tostring(close, "#.##")
+         + " SL="   + str.tostring(close + slDollars, "#.##")
+         + " TP="   + str.tostring(sellTpShow, "#.##")
+         + " Risk=" + str.tostring(slDollars, "#.##")
+         + " RW="   + str.tostring(rangeWidth, "#.##")
+         + " ADX="  + str.tostring(adxVal, "#.##")
+         + " ObsDist=" + (na(obsDistSell) ? "NA" : str.tostring(obsDistSell, "#.##")),
+         alert.freq_once_per_bar_close)
+
+if buyEntryCore
+    alert("BUY FVG Absorption | Dir=BUY"
+         + " E="    + str.tostring(close, "#.##")
+         + " SL="   + str.tostring(close - slDollars, "#.##")
+         + " TP="   + str.tostring(buyTpShow, "#.##")
+         + " Risk=" + str.tostring(slDollars, "#.##")
+         + " RW="   + str.tostring(rangeWidth, "#.##")
+         + " ADX="  + str.tostring(adxVal, "#.##")
+         + " ObsDist=" + (na(obsDistBuy) ? "NA" : str.tostring(obsDistBuy, "#.##")),
+         alert.freq_once_per_bar_close)
+
+// ----- ★追加の動的アラート（Entry/SL/TP/Range/htfBear/triggerType を含む） -----
+if sellPbEvent or sellCandleEvent
+    alert((sellTriggerExt ? "SELL Range Pullback" : "Candle Reversal SELL") + " | Dir=SELL"
+         + " Entry="     + str.tostring(close, "#.##")
+         + " SL="        + str.tostring(close + slDollars, "#.##")
+         + " TP="        + str.tostring(sellTpShow, "#.##")
+         + " RangeHigh=" + str.tostring(rangeHigh, "#.##")
+         + " RangeLow="  + str.tostring(rangeLow, "#.##")
+         + " RangeMid="  + str.tostring(rangeMid, "#.##")
+         + " htfBear="   + (htfBear ? "true" : "false")
+         + " triggerType=" + sellTrigType,
+         alert.freq_once_per_bar_close)
+
+if buyExtEvent or buyCandleEvent
+    alert((buyTriggerExt ? "BUY Range Extended" : "Candle Reversal BUY") + " | Dir=BUY"
+         + " Entry="     + str.tostring(close, "#.##")
+         + " SL="        + str.tostring(close - slDollars, "#.##")
+         + " TP="        + str.tostring(buyTpShow, "#.##")
+         + " RangeHigh=" + str.tostring(rangeHigh, "#.##")
+         + " RangeLow="  + str.tostring(rangeLow, "#.##")
+         + " RangeMid="  + str.tostring(rangeMid, "#.##")
+         + " htfBear="   + (htfBear ? "true" : "false")
+         + " triggerType=" + buyTrigType,
+         alert.freq_once_per_bar_close)
+
+// =============================================================================
+// 13) Range Info Table（①〜⑤ の状態を可視化）  ※既存維持 + 拡張状態を追記
+// =============================================================================
+var table infoTable = table.new(position.top_right, 2, 10, border_width = 1, frame_width = 1, frame_color = color.gray)
+if showInfoTable and barstate.islast
+    table.cell(infoTable, 0, 0, "Range High",      text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 0, str.tostring(rangeHighFixed, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 1, "Range Low",       text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 1, str.tostring(rangeLowFixed, "#.##"),  text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 2, "Range Width",     text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(rangeWidthVal, "#.##"),  text_color=(rangeWidthOK?color.lime:color.red), text_size=size.small)
+    table.cell(infoTable, 0, 3, "Width ÷ ATR",      text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(rangeQuality, "#.##"),   text_color=(rangeQualityOK?color.lime:color.red), text_size=size.small)
+    table.cell(infoTable, 0, 4, "Upper Reactions", text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 4, str.tostring(upperReactions),         text_color=(upperReactionsOK?color.lime:color.red), text_size=size.small)
+    table.cell(infoTable, 0, 5, "Lower Reactions", text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 5, str.tostring(lowerReactions),         text_color=(lowerReactionsOK?color.lime:color.red), text_size=size.small)
+    table.cell(infoTable, 0, 6, "EMA Slope OK",    text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 6, (emaSlopeOK?"TRUE":"FALSE"),          text_color=(emaSlopeOK?color.lime:color.red), text_size=size.small)
+    table.cell(infoTable, 0, 7, "Range Valid",     text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 7, (rangeValid?"TRUE":"FALSE"),          text_color=(rangeValid?color.lime:color.red), text_size=size.small)
+    // ★追加：上位足下降目線
+    table.cell(infoTable, 0, 8, "HTF Bear",        text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 8, (htfBear?"TRUE":"FALSE"),            text_color=(htfBear?color.red:color.lime), text_size=size.small)
+    // ★追加：拡張モードの状態
+    _modeTxt = (useRangePullbackSellMode?"PB ":"") + (useExtendedRangeZone?"EXT ":"") + (useCandleTrigger?"CDL":"")
+    table.cell(infoTable, 0, 9, "Add Modes",       text_color=color.white, bgcolor=color.new(color.gray,30), text_size=size.small)
+    table.cell(infoTable, 1, 9, (_modeTxt=="" ? "OFF" : _modeTxt),    text_color=(_modeTxt==""?color.gray:color.aqua), text_size=size.small)
+
+plot(baseAtr, "baseAtr", color=color.orange, display=display.data_window)
