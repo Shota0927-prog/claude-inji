@@ -183,18 +183,36 @@ f_inZone(bool valid, float sH, float sL) =>
     bool res = valid and not na(sH) and not na(sL) and (high >= zLow) and (low <= zHigh)
     res
 
+// 共通ヘルパー (旧ロジック互換): 終値が 38.2%〜61.8% に収まっているか。
+// PIVOT_CLASSIC 専用。バッファ無し・終値限定で旧挙動を完全再現する。
+f_inZoneClose(bool valid, float sH, float sL) =>
+    float wr   = sH - sL
+    float f382 = sL + wr * 0.382
+    float f618 = sL + wr * 0.618
+    bool res = valid and not na(sH) and not na(sL) and (close >= f382) and (close <= f618)
+    res
+
 // 共通ヘルパー: ある下降波 (swingHigh→swingLow) が「人間が見る下降推進波」かを評価。
+// 目的は Pivot を機械的に拾うことではなく、トレーダーが自然にフィボを引きたくなる
+// 「LH→LL の勢いのある下落」だけを採用すること。
 //   - swingHigh が先、swingLow が後 (順序)
 //   - swingHigh > swingLow
 //   - 波幅 >= ATR × minImpulseATR
-//   - swingLow が直近安値を更新 (LL) ※直前安値が取れる場合のみ判定
+//   - Lower High 形成: 戻り高値が前回高値より低い (LH) ※前回高値が取れる場合のみ判定
+//   - Lower Low  形成: swingLow が直近安値を更新 (LL) ※前回安値が取れる場合のみ判定
 //   - 下降波内の陰線比率 >= minBearBodyRatio
-//   - 下降推進中の最大戻し率 <= maxPullbackPctInImpulse
+//   - 下降推進中の最大戻し率 <= maxPullbackPctInImpulse (押し戻しが深すぎない)
 //   - useEMAImpulseFilter=true の場合、波の大部分 (>=60%) が EMA20 以下
-// 戻り値: [ok, reason]
-f_evalWave(float sH, float sL, int bH, int bL, float prevLow) =>
+//   - 下降中に EMA20 を「大きく(>1ATR)」上抜けていない (推進が崩れていない)
+// 戻り値: [ok, reason, bearRatio, pullPct, emaRatio, lhOK, llOK]
+f_evalWave(float sH, float sL, int bH, int bL, float prevLow, float prevHigh) =>
     bool ok = false
     string reason = "波なし"
+    float bearRatio = na
+    float pullPct   = na
+    float emaRatio  = na
+    bool  lhOK = false
+    bool  llOK = false
     if not na(sH) and not na(sL) and not na(bH) and not na(bL)
         int   agoH = bar_index - bH
         int   agoL = bar_index - bL
@@ -202,35 +220,44 @@ f_evalWave(float sH, float sL, int bH, int bL, float prevLow) =>
         bool orderOK = bH < bL
         bool priceOK = sH > sL
         bool rangeOK = wr >= atr * minImpulseATR
-        bool llOK    = na(prevLow) ? true : (sL < prevLow)
+        // LH / LL: 前回スイングが取れない場合は条件を課さない (true)
+        llOK := na(prevLow)  ? true : (sL < prevLow)
+        lhOK := na(prevHigh) ? true : (sH < prevHigh)
         bool freshOK = agoH <= waveLookback
-        int   total     = 0
-        int   bearCnt   = 0
-        int   emaBelow  = 0
-        float lowSoFar  = na
-        float maxBounce = 0.0
-        // 推進波の区間 (high バー → low バー) を走査して内部統計を取る。
+        int   total       = 0
+        int   bearCnt     = 0
+        int   emaBelow    = 0
+        float lowSoFar    = na
+        float maxBounce   = 0.0
+        float maxAboveEMA = 0.0
+        // 推進波の区間 (high バー → low バー) を古い高値から新しい安値へ走査して内部統計を取る。
+        // agoH (過去/大) → agoL (現在/小) なので必ず by -1 で下降方向に走査する。
         // 過去バー参照のため lookback を 300 本に制限 (max_bars_back 内に収める)。
         if agoH > agoL and agoL >= 0 and agoH <= 300 and agoH < bar_index
-            for k = agoH to agoL
+            for k = agoH to agoL by -1
                 total += 1
                 if close[k] < open[k]
                     bearCnt += 1
                 if close[k] < emaFast[k]
                     emaBelow += 1
+                else
+                    float ab = close[k] - emaFast[k]   // EMA20 上抜け幅
+                    if ab > maxAboveEMA
+                        maxAboveEMA := ab
                 lowSoFar := na(lowSoFar) ? low[k] : math.min(lowSoFar, low[k])
-                float b = high[k] - lowSoFar
+                float b = high[k] - lowSoFar           // ここまでの最安値からの戻り幅
                 if b > maxBounce
                     maxBounce := b
-        float bearRatio = total > 0 ? bearCnt  / total : 0.0
-        float emaRatio  = total > 0 ? emaBelow / total : 0.0
-        float pullPct   = (wr > 0 and total > 0) ? maxBounce / wr : 1.0
-        bool bodyOK = bearRatio >= minBearBodyRatio
-        bool pullOK = pullPct  <= maxPullbackPctInImpulse
-        bool emaOK  = not useEMAImpulseFilter or (emaRatio >= 0.6)
-        ok := orderOK and priceOK and rangeOK and llOK and freshOK and bodyOK and pullOK and emaOK
-        reason := not orderOK ? "順序NG" : not priceOK ? "H<=L" : not rangeOK ? "波幅不足" : not llOK ? "LL未更新" : not freshOK ? "波が古い" : total == 0 ? "区間なし" : not bodyOK ? "陰線比率不足" : not pullOK ? "戻し過大" : not emaOK ? "EMA上" : "OK"
-    [ok, reason]
+        bearRatio := total > 0 ? bearCnt  / total : 0.0
+        emaRatio  := total > 0 ? emaBelow / total : 0.0
+        pullPct   := (wr > 0 and total > 0) ? maxBounce / wr : 1.0
+        bool bodyOK     = bearRatio >= minBearBodyRatio
+        bool pullOK     = pullPct  <= maxPullbackPctInImpulse
+        bool emaOK      = not useEMAImpulseFilter or (emaRatio >= 0.6)
+        bool emaBreakOK = maxAboveEMA <= atr   // EMA20 を 1ATR 超えて上抜けていない
+        ok := orderOK and priceOK and rangeOK and lhOK and llOK and freshOK and bodyOK and pullOK and emaOK and emaBreakOK
+        reason := not orderOK ? "順序NG" : not priceOK ? "H<=L" : not rangeOK ? "波幅不足" : not lhOK ? "LH未形成" : not llOK ? "LL未更新" : not freshOK ? "波が古い" : total == 0 ? "区間なし" : not bodyOK ? "陰線比率不足" : not pullOK ? "戻し過大" : not emaOK ? "EMA上" : not emaBreakOK ? "EMA大上抜け" : "OK"
+    [ok, reason, bearRatio, pullPct, emaRatio, lhOK, llOK]
 
 // ---- (A) PIVOT_CLASSIC: 旧ロジック (固定 Pivot) ----
 ph = ta.pivothigh(high, swingLookback, swingLookback)
@@ -301,12 +328,14 @@ else
 int   nsw = array.size(swT)
 float rHigh = na
 float rLow  = na
-float rPrevLow = na
+float rPrevLow  = na
+float rPrevHigh = na
 int   rHbar = na
 int   rLbar = na
 float mHigh = na
 float mLow  = na
-float mPrevLow = na
+float mPrevLow  = na
+float mPrevHigh = na
 int   mHbar = na
 int   mLbar = na
 int   legc = 0
@@ -320,21 +349,25 @@ if nsw >= 2
             int   hib = array.get(swB, i + 1)
             // この下降レッグの直前の安値 (LL 判定用): i+2 が安値なら採用
             float pvl = (i + 2 <= nsw - 1 and array.get(swT, i + 2) == -1) ? array.get(swP, i + 2) : na
+            // この下降レッグの直前の高値 (LH 判定用): i+3 が高値なら採用
+            float pvh = (i + 3 <= nsw - 1 and array.get(swT, i + 3) == 1)  ? array.get(swP, i + 3) : na
             if legc == 1
                 rHigh := hi
                 rLow  := lo
                 rHbar := hib
                 rLbar := lob
-                rPrevLow := pvl
+                rPrevLow  := pvl
+                rPrevHigh := pvh
             else if legc == 2
                 mHigh := hi
                 mLow  := lo
                 mHbar := hib
                 mLbar := lob
-                mPrevLow := pvl
+                mPrevLow  := pvl
+                mPrevHigh := pvh
 
-[rOK, rReason] = f_evalWave(rHigh, rLow, rHbar, rLbar, rPrevLow)
-[mOK, mReason] = f_evalWave(mHigh, mLow, mHbar, mLbar, mPrevLow)
+[rOK, rReason, rBear, rPull, rEma, rLh, rLl] = f_evalWave(rHigh, rLow, rHbar, rLbar, rPrevLow, rPrevHigh)
+[mOK, mReason, mBear, mPull, mEma, mLh, mLl] = f_evalWave(mHigh, mLow, mHbar, mLbar, mPrevLow, mPrevHigh)
 
 // ---- (D) モードに応じて採用波を決定 ----
 float  selHigh   = na
@@ -345,8 +378,15 @@ bool   selValid  = false
 bool   inZone    = false
 string selType   = "NONE"
 string selReason = ""
+// デバッグ用に採用波の内部統計も保持する
+float  selBear   = na
+float  selPull   = na
+float  selEma    = na
+bool   selLh     = na
+bool   selLl     = na
 
 if fibMode == "PIVOT_CLASSIC"
+    // 旧ロジック完全互換: 検出は固定 Pivot、ゾーン判定は終値限定 (バッファ無し)。
     selValid  := validWavePivot
     selHigh   := lastPH
     selLow    := lastPL
@@ -354,7 +394,7 @@ if fibMode == "PIVOT_CLASSIC"
     selLbar   := lastPLbar
     selType   := "PIVOT"
     selReason := validWavePivot ? "OK" : "pivot波 無効"
-    inZone    := f_inZone(selValid, selHigh, selLow)
+    inZone    := f_inZoneClose(selValid, selHigh, selLow)
 else if fibMode == "IMPULSE_ZIGZAG"
     selValid  := rOK
     selHigh   := rHigh
@@ -363,9 +403,14 @@ else if fibMode == "IMPULSE_ZIGZAG"
     selLbar   := rLbar
     selType   := "IMPULSE"
     selReason := rReason
-    inZone    := f_inZone(selValid, selHigh, selLow)
+    selBear   := rBear
+    selPull   := rPull
+    selEma    := rEma
+    selLh     := rLh
+    selLl     := rLl
+    inZone    := f_inZone(selValid, selHigh, selLow)   // タッチ判定
 else
-    // MULTI_WAVE: recentWave 優先、なければ midWave。
+    // MULTI_WAVE: recentWave 優先、なければ midWave。判定はタッチ。
     bool izr = f_inZone(rOK, rHigh, rLow)
     bool izm = f_inZone(mOK, mHigh, mLow)
     if rOK and izr
@@ -376,6 +421,11 @@ else
         selLbar   := rLbar
         selType   := "RECENT"
         selReason := rReason
+        selBear   := rBear
+        selPull   := rPull
+        selEma    := rEma
+        selLh     := rLh
+        selLl     := rLl
         inZone    := true
     else if mOK and izm
         selValid  := mOK
@@ -385,6 +435,11 @@ else
         selLbar   := mLbar
         selType   := "MID"
         selReason := mReason
+        selBear   := mBear
+        selPull   := mPull
+        selEma    := mEma
+        selLh     := mLh
+        selLl     := mLl
         inZone    := true
     else
         // どちらのゾーンにも入っていない → 表示用に直近波を採用
@@ -395,6 +450,11 @@ else
         selLbar   := rLbar
         selType   := "RECENT"
         selReason := rOK ? "ゾーン外" : rReason
+        selBear   := rBear
+        selPull   := rPull
+        selEma    := rEma
+        selLh     := rLh
+        selLl     := rLl
         inZone    := false
 
 // ---- 下流互換のための共通変数 (旧コードがそのまま使える形を維持) ----
@@ -688,8 +748,19 @@ if showWaveDebug and barstate.islast
         else
             label.set_xy(fibLowLbl, selLbar, selLow)
             label.set_text(fibLowLbl, "Fib Low")
-    // validWave / 理由 / 採用タイプ
-    string dtxt = "type: " + selType + "\nvalid: " + (selValid ? "true" : "false") + "\nreason: " + selReason + "\ninZone: " + (inZone ? "true" : "false")
+    // 採用波の全統計を表示し「なぜ採用/不採用か」が一目で分かるようにする
+    float dbgRange = (not na(selHigh) and not na(selLow)) ? selHigh - selLow : na
+    float dbgAtrM  = (not na(dbgRange) and atr > 0) ? dbgRange / atr : na
+    string sHigh = na(selHigh) ? "-" : str.tostring(selHigh, "#.##")
+    string sLow  = na(selLow)  ? "-" : str.tostring(selLow,  "#.##")
+    string sAtrM = na(dbgAtrM) ? "-" : str.tostring(dbgAtrM, "#.##") + "x"
+    string sRng  = na(dbgRange)? "-" : str.tostring(dbgRange, "#.##")
+    string sBear = na(selBear) ? "-" : str.tostring(selBear * 100, "#") + "%"
+    string sPull = na(selPull) ? "-" : str.tostring(selPull * 100, "#") + "%"
+    string sEma  = na(selEma)  ? "-" : str.tostring(selEma  * 100, "#") + "%"
+    string sLh   = na(selLh)   ? "-" : (selLh ? "OK" : "NG")
+    string sLl   = na(selLl)   ? "-" : (selLl ? "OK" : "NG")
+    string dtxt = "mode: " + fibMode + "  type: " + selType + "\n採用High: " + sHigh + "\n採用Low : " + sLow + "\nATR倍率 : " + sAtrM + "\n波幅    : " + sRng + "\n陰線比率: " + sBear + "\n戻し率  : " + sPull + "\nEMA比率 : " + sEma + "\nLH判定  : " + sLh + "\nLL判定  : " + sLl + "\nvalid   : " + (selValid ? "true" : "false") + "\ninZone  : " + (inZone ? "true" : "false") + "\nreason  : " + selReason
     if na(dbgLbl)
         dbgLbl := label.new(bar_index, low, dtxt, style = label.style_label_up, color = color.new(color.gray, 20), textcolor = color.white, size = size.small)
     else
