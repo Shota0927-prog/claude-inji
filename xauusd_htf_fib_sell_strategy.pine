@@ -1,0 +1,712 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// XAUUSD HTF Downtrend Fib Pullback Sell Strategy
+// -----------------------------------------------
+// 上位足(4H/15M/5M)が下降目線のとき、下降推進波のフィボ 38.2%〜61.8% 戻し帯を
+// 「売りゾーン」として扱い、FVG / iFVG / レジサポ転換が重なり、かつ下位足で
+// 反転(失速)が確認できた場合にのみ戻り売り SELL を行う順張り戦略。
+//
+// 思想: 下落 → 戻り → 売りゾーン到達 → 下位足で反転確認 → SELL
+//        単なるフィボ到達だけでは入らない。
+//
+// ★ 改修ポイント ★
+//   フィボ検出を「人間が引きたくなる下降推進波」に近づけるため、フィボ検出モード
+//   (fibMode) を追加した。
+//     - PIVOT_CLASSIC : 旧ロジック (ta.pivothigh / ta.pivotlow の直近 Pivot)
+//     - IMPULSE_ZIGZAG: ATR ベース ZigZag による下降推進波 (LH→LL) を採用 (既定)
+//     - MULTI_WAVE    : 直近波(recentWave) と中期波(midWave) のどちらかに反応
+//   旧ロジックと新ロジックを input で切り替えて、エントリー回数 / PF / 勝率 / DD を
+//   比較できるようにしている。リペイント回避のため lookahead_off を維持し、ZigZag も
+//   確定済みスイングのみを使用する。
+
+//@version=5
+strategy(
+     title             = "XAUUSD HTF Downtrend Fib Pullback Sell Strategy",
+     shorttitle        = "XAU HTF Fib Sell",
+     overlay           = true,
+     pyramiding        = 0,
+     initial_capital   = 1250,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     calc_on_every_tick= false,
+     max_bars_back     = 500,
+     max_boxes_count   = 300,
+     max_lines_count   = 300,
+     max_labels_count  = 300
+ )
+
+// ============================================================
+// ★ INPUTS ★  （設定はすべてここに集約）
+// ============================================================
+
+// --- 1) 上位足 下降フィルター ---
+grpHTF = "1) 上位足 下降フィルター"
+useHTF4HFilter = input.bool(false, "4時間足フィルターを使う", group = grpHTF)
+useMTF15MFilter= input.bool(true, "15分足フィルターを使う",  group = grpHTF)
+useLTF5MFilter = input.bool(true, "5分足フィルターを使う",    group = grpHTF)
+emaFastLen     = input.int(20,  "EMA Fast 期間", minval = 1, group = grpHTF)
+emaSlowLen     = input.int(200, "EMA Slow 期間", minval = 1, group = grpHTF)
+tf4H           = input.timeframe("240", "4時間足 TF", group = grpHTF)
+tf15M          = input.timeframe("15",  "15分足 TF",  group = grpHTF)
+tf5M           = input.timeframe("5",   "5分足 TF",   group = grpHTF)
+
+// --- 共通 ---
+grpGen = "共通設定"
+atrLen = input.int(14, "ATR 期間", minval = 1, group = grpGen)
+
+// --- 資金管理 (ロット) ※ゴールド仕様 ---
+grpLot = "資金管理 (ロット)"
+useRiskSizing = input.bool(true, "リスク%でロット自動計算", group = grpLot)
+useCompound   = input.bool(false, "複利運用 (OFF=単利/初期資金固定)", group = grpLot)
+riskPercent   = input.float(5.0, "リスク % (資金に対する)", minval = 0.0, step = 0.1, group = grpLot)
+fixedLots     = input.float(1.0, "固定ロット (自動計算OFF時)", minval = 0.0, step = 1, group = grpLot)
+contractSize  = input.float(1, "1ロットの数量 oz (ゴールド標準=100)", minval = 1, step = 1, group = grpLot)
+
+// --- 2) 下降波 検出 ---
+grpWave = "2) 下降波 検出"
+// ★ フィボ検出モード (旧/新 切り替え)
+fibMode       = input.string("IMPULSE_ZIGZAG", "フィボ検出モード", options = ["PIVOT_CLASSIC", "IMPULSE_ZIGZAG", "MULTI_WAVE"], group = grpWave)
+// 旧ロジック (PIVOT_CLASSIC) 用
+swingLookback = input.int(5,   "スイング検出 左右本数", minval = 1, group = grpWave)
+waveLookback  = input.int(100, "波の有効本数 (古すぎる波は無視)", minval = 10, group = grpWave)
+minWaveATR    = input.float(3.0, "最低波幅 (ATR 倍) [PIVOT_CLASSIC]", minval = 0.0, step = 0.1, group = grpWave)
+// 新ロジック (IMPULSE_ZIGZAG / MULTI_WAVE) 用
+zigzagATRMult          = input.float(2.0, "ZigZag反転幅 ATR倍率", step = 0.1, group = grpWave)
+minImpulseATR          = input.float(3.0, "最低下降波幅 ATR倍率", step = 0.1, group = grpWave)
+maxPullbackPctInImpulse= input.float(0.45,"下降推進中の最大戻し率", step = 0.05, group = grpWave)
+minBearBodyRatio       = input.float(0.45,"下降波内の陰線比率",   step = 0.05, group = grpWave)
+useEMAImpulseFilter    = input.bool(true, "下降波中EMA20下推移を要求", group = grpWave)
+fibZoneBufferATR       = input.float(0.25,"フィボゾーン許容 ATR倍率", step = 0.05, group = grpWave)
+showWaveDebug          = input.bool(false,"波検出デバッグ表示", group = grpWave)
+
+// --- 4) FVG / iFVG ---
+grpFVG = "4) FVG / iFVG"
+fvgLookback     = input.int(50,   "FVG 保存本数", minval = 5, group = grpFVG)
+fvgToleranceATR = input.float(0.0, "FVG 許容 (ATR 倍)", minval = 0.0, step = 0.1, group = grpFVG)
+
+// --- 5) レジサポ転換 ---
+grpSR = "5) レジサポ転換"
+srLookback          = input.int(100, "サポレジ 探索本数", minval = 10, group = grpSR)
+srTouchToleranceATR = input.float(0.2, "タッチ許容 (ATR 倍)", minval = 0.0, step = 0.1, group = grpSR)
+minSRTouches        = input.int(2, "最低タッチ回数", minval = 1, group = grpSR)
+
+// --- 重合: 水平線 (POC/VPVR 代用) ---
+grpPOC = "重合: 水平線 (POC/VPVR 代用)"
+usePocLine = input.bool(false, "POC 水平線を使う", group = grpPOC)
+pocPrice   = input.float(4100.0, "POC 価格", group = grpPOC)
+
+// --- 重合判定 (個別ON/OFF + モード) ---
+grpConf = "重合判定"
+useFVGConfluence    = input.bool(false, "FVG 重合(吸収)を使う", group = grpConf)
+useSRFlipConfluence = input.bool(false,  "SRFlip 重合を使う",    group = grpConf)
+useEMAConfluence    = input.bool(false,  "EMA 重合を使う",       group = grpConf)
+usePOCConfluence    = input.bool(false, "POC 重合を使う",       group = grpConf)
+confluenceMode      = input.string("ANY", "重合判定モード", options = ["ANY", "ALL", "MIN_COUNT"], group = grpConf)
+minConfluenceCount  = input.int(1, "MIN_COUNT: 最低重合数", minval = 1, group = grpConf)
+
+// --- 6) エントリートリガー (下位足 反転確認) ---
+grpTrig = "6) エントリートリガー"
+useBearishEngulfing = input.bool(false,  "弱気包み足",         group = grpTrig)
+usePinbar           = input.bool(false, "上ヒゲピンバー",      group = grpTrig)
+useBOS              = input.bool(false, "直近安値更新 / BOS", group = grpTrig)
+useEMAReject        = input.bool(true, "EMA20 リジェクト",   group = grpTrig)
+useBearishFVGTrigger= input.bool(false,  "Bearish FVG 形成",   group = grpTrig)
+bosLookback         = input.int(10, "BOS 直近安値 本数", minval = 2, group = grpTrig)
+useLowerTFTrigger   = input.bool(true, "下位足(1分足)で反転確認", group = grpTrig)
+triggerTF           = input.timeframe("1", "反転確認 TF", group = grpTrig)
+
+// --- 7) 無効条件 ---
+grpInv = "7) 無効条件"
+useFib618Invalid = input.bool(true,  "fib618 上抜けで無効",   group = grpInv)
+useADXRangeFilter= input.bool(false, "ADX レンジフィルター",  group = grpInv)
+adxLen           = input.int(14, "ADX / DI 期間", minval = 1, group = grpInv)
+minADX           = input.float(18, "最低 ADX",     minval = 0, group = grpInv)
+
+// --- 8) SL / TP ---
+grpRisk = "8) SL / TP"
+slATRBuffer  = input.float(1.0, "SL バッファ (ATR 倍)", minval = 0.0, step = 0.1, group = grpRisk)
+riskReward   = input.float(1.0, "リスクリワード",        minval = 0.1, step = 0.1, group = grpRisk)
+useSwingLowTP= input.bool(true, "TP に直近安値を使う",   group = grpRisk)
+useFixedRRTP = input.bool(true, "TP に固定 RR を使う",   group = grpRisk)
+useBreakEven = input.bool(true, "建値移動を使う",        group = grpRisk)
+breakEvenAtR = input.float(1.0, "建値移動 発動 R",       minval = 0.1, step = 0.1, group = grpRisk)
+useTrailing  = input.bool(false,"トレーリングを使う",    group = grpRisk)
+trailATR     = input.float(1.5, "トレーリング距離 (ATR 倍)", minval = 0.1, step = 0.1, group = grpRisk)
+
+// --- 9) 可視化 ---
+grpViz = "9) 可視化"
+showFib  = input.bool(true, "フィボ / 波を表示", group = grpViz)
+showZone = input.bool(true, "売りゾーンを表示",   group = grpViz)
+showFVG  = input.bool(true, "FVG ゾーンを表示",   group = grpViz)
+showSLTP = input.bool(true, "SL / TP を表示",     group = grpViz)
+
+// ============================================================
+// 共通計算: ATR / EMA
+// ============================================================
+atr     = ta.atr(atrLen)
+emaFast = ta.ema(close, emaFastLen)   // 可視化 / EMA リジェクト / EMA 重合判定 / 推進波 EMA フィルター用
+emaSlow = ta.ema(close, emaSlowLen)
+
+// ============================================================
+// 1. 上位足 下降トレンド フィルター
+// ============================================================
+// 下降目線の判定: 価格 < EMA200, EMA20 < EMA200, EMA20 傾き下向き
+f_isDowntrend() =>
+    emaF = ta.ema(close, emaFastLen)
+    emaS = ta.ema(close, emaSlowLen)
+    (close < emaS) and (emaF < emaS) and (emaF < emaF[1])
+
+htf4hDown  = request.security(syminfo.tickerid, tf4H,  f_isDowntrend(), lookahead = barmerge.lookahead_off)
+mtf15mDown = request.security(syminfo.tickerid, tf15M, f_isDowntrend(), lookahead = barmerge.lookahead_off)
+ltf5mDown  = request.security(syminfo.tickerid, tf5M,  f_isDowntrend(), lookahead = barmerge.lookahead_off)
+
+// 5分足 EMA20 / 終値 (無効条件用)
+f_emaFast() => ta.ema(close, emaFastLen)
+f_closeTf5() => close
+htfEmaFast  = request.security(syminfo.tickerid, tf5M, f_emaFast(), lookahead = barmerge.lookahead_off)
+close5m     = request.security(syminfo.tickerid, tf5M, f_closeTf5(), lookahead = barmerge.lookahead_off)
+
+htfFilterOK = (not useHTF4HFilter or htf4hDown) and (not useMTF15MFilter or mtf15mDown) and (not useLTF5MFilter or ltf5mDown)
+
+// ============================================================
+// 2. 下降波の自動検出
+// ============================================================
+// 共通ヘルパー: フィボ売りゾーン (38.2%〜61.8% + ATR バッファ) への「タッチ」判定。
+// 終値限定ではなく高値/安値がゾーンに触れた場合も到達とみなす。
+f_inZone(bool valid, float sH, float sL) =>
+    float wr    = sH - sL
+    float f382  = sL + wr * 0.382
+    float f618  = sL + wr * 0.618
+    float zLow  = f382 - atr * fibZoneBufferATR
+    float zHigh = f618 + atr * fibZoneBufferATR
+    bool res = valid and not na(sH) and not na(sL) and (high >= zLow) and (low <= zHigh)
+    res
+
+// 共通ヘルパー: ある下降波 (swingHigh→swingLow) が「人間が見る下降推進波」かを評価。
+//   - swingHigh が先、swingLow が後 (順序)
+//   - swingHigh > swingLow
+//   - 波幅 >= ATR × minImpulseATR
+//   - swingLow が直近安値を更新 (LL) ※直前安値が取れる場合のみ判定
+//   - 下降波内の陰線比率 >= minBearBodyRatio
+//   - 下降推進中の最大戻し率 <= maxPullbackPctInImpulse
+//   - useEMAImpulseFilter=true の場合、波の大部分 (>=60%) が EMA20 以下
+// 戻り値: [ok, reason]
+f_evalWave(float sH, float sL, int bH, int bL, float prevLow) =>
+    bool ok = false
+    string reason = "波なし"
+    if not na(sH) and not na(sL) and not na(bH) and not na(bL)
+        int   agoH = bar_index - bH
+        int   agoL = bar_index - bL
+        float wr   = sH - sL
+        bool orderOK = bH < bL
+        bool priceOK = sH > sL
+        bool rangeOK = wr >= atr * minImpulseATR
+        bool llOK    = na(prevLow) ? true : (sL < prevLow)
+        bool freshOK = agoH <= waveLookback
+        int   total     = 0
+        int   bearCnt   = 0
+        int   emaBelow  = 0
+        float lowSoFar  = na
+        float maxBounce = 0.0
+        // 推進波の区間 (high バー → low バー) を走査して内部統計を取る。
+        // 過去バー参照のため lookback を 300 本に制限 (max_bars_back 内に収める)。
+        if agoH > agoL and agoL >= 0 and agoH <= 300 and agoH < bar_index
+            for k = agoH to agoL
+                total += 1
+                if close[k] < open[k]
+                    bearCnt += 1
+                if close[k] < emaFast[k]
+                    emaBelow += 1
+                lowSoFar := na(lowSoFar) ? low[k] : math.min(lowSoFar, low[k])
+                float b = high[k] - lowSoFar
+                if b > maxBounce
+                    maxBounce := b
+        float bearRatio = total > 0 ? bearCnt  / total : 0.0
+        float emaRatio  = total > 0 ? emaBelow / total : 0.0
+        float pullPct   = (wr > 0 and total > 0) ? maxBounce / wr : 1.0
+        bool bodyOK = bearRatio >= minBearBodyRatio
+        bool pullOK = pullPct  <= maxPullbackPctInImpulse
+        bool emaOK  = not useEMAImpulseFilter or (emaRatio >= 0.6)
+        ok := orderOK and priceOK and rangeOK and llOK and freshOK and bodyOK and pullOK and emaOK
+        reason := not orderOK ? "順序NG" : not priceOK ? "H<=L" : not rangeOK ? "波幅不足" : not llOK ? "LL未更新" : not freshOK ? "波が古い" : total == 0 ? "区間なし" : not bodyOK ? "陰線比率不足" : not pullOK ? "戻し過大" : not emaOK ? "EMA上" : "OK"
+    [ok, reason]
+
+// ---- (A) PIVOT_CLASSIC: 旧ロジック (固定 Pivot) ----
+ph = ta.pivothigh(high, swingLookback, swingLookback)
+pl = ta.pivotlow(low,  swingLookback, swingLookback)
+
+var float lastPH    = na
+var int   lastPHbar = na
+var float lastPL    = na
+var int   lastPLbar = na
+
+if not na(ph)
+    lastPH    := ph
+    lastPHbar := bar_index - swingLookback
+if not na(pl)
+    lastPL    := pl
+    lastPLbar := bar_index - swingLookback
+
+// 旧ロジックの下降波: スイング高値が先、その後に安値 / 波幅 ATR×X 以上 / 古すぎない
+validWavePivot = not na(lastPH) and not na(lastPL) and (lastPHbar < lastPLbar) and ((lastPH - lastPL) >= atr * minWaveATR) and ((bar_index - lastPHbar) <= waveLookback)
+
+// ---- (B) ATR ZigZag: 確定済みスイングのみを収集 (リペイント回避) ----
+// 価格が ATR × zigzagATRMult 以上 反転したらスイングを確定する。確定したスイングは
+// 過去バーに固定され、その後変化しない (未来足は使わない)。
+var array<float> swP = array.new_float()   // スイング価格 (index 0 = 最新)
+var array<int>   swB = array.new_int()     // スイング bar_index
+var array<int>   swT = array.new_int()     // 1 = high, -1 = low
+var int   zzDir   = 1                       // 1 = 高値追跡中, -1 = 安値追跡中
+var float zzExt   = na                      // 現在の暫定極値
+var int   zzExtBar= na
+
+f_pushSwing(float p, int b, int t) =>
+    array.unshift(swP, p)
+    array.unshift(swB, b)
+    array.unshift(swT, t)
+    if array.size(swP) > 30
+        array.pop(swP)
+        array.pop(swB)
+        array.pop(swT)
+
+zzTh = atr * zigzagATRMult
+if na(zzExt)
+    zzExt    := high
+    zzExtBar := bar_index
+    zzDir    := 1
+else
+    if zzDir == 1
+        if high >= zzExt
+            zzExt    := high
+            zzExtBar := bar_index
+        else if low <= zzExt - zzTh
+            f_pushSwing(zzExt, zzExtBar, 1)   // 高値スイング確定
+            zzDir    := -1
+            zzExt    := low
+            zzExtBar := bar_index
+    else
+        if low <= zzExt
+            zzExt    := low
+            zzExtBar := bar_index
+        else if high >= zzExt + zzTh
+            f_pushSwing(zzExt, zzExtBar, -1)  // 安値スイング確定
+            zzDir    := 1
+            zzExt    := high
+            zzExtBar := bar_index
+
+// ---- (C) 確定スイングから 下降波 (LH→LL) を抽出 ----
+// 交互に並ぶスイング列から「高値 → その後の安値」のペア = 下降レッグを取り出す。
+//   recentWave = 直近の下降レッグ / midWave = ひとつ前の下降レッグ
+int   nsw = array.size(swT)
+float rHigh = na
+float rLow  = na
+float rPrevLow = na
+int   rHbar = na
+int   rLbar = na
+float mHigh = na
+float mLow  = na
+float mPrevLow = na
+int   mHbar = na
+int   mLbar = na
+int   legc = 0
+if nsw >= 2
+    for i = 0 to nsw - 2
+        if array.get(swT, i) == -1 and array.get(swT, i + 1) == 1
+            legc += 1
+            float lo  = array.get(swP, i)
+            float hi  = array.get(swP, i + 1)
+            int   lob = array.get(swB, i)
+            int   hib = array.get(swB, i + 1)
+            // この下降レッグの直前の安値 (LL 判定用): i+2 が安値なら採用
+            float pvl = (i + 2 <= nsw - 1 and array.get(swT, i + 2) == -1) ? array.get(swP, i + 2) : na
+            if legc == 1
+                rHigh := hi
+                rLow  := lo
+                rHbar := hib
+                rLbar := lob
+                rPrevLow := pvl
+            else if legc == 2
+                mHigh := hi
+                mLow  := lo
+                mHbar := hib
+                mLbar := lob
+                mPrevLow := pvl
+
+[rOK, rReason] = f_evalWave(rHigh, rLow, rHbar, rLbar, rPrevLow)
+[mOK, mReason] = f_evalWave(mHigh, mLow, mHbar, mLbar, mPrevLow)
+
+// ---- (D) モードに応じて採用波を決定 ----
+float  selHigh   = na
+float  selLow    = na
+int    selHbar   = na
+int    selLbar   = na
+bool   selValid  = false
+bool   inZone    = false
+string selType   = "NONE"
+string selReason = ""
+
+if fibMode == "PIVOT_CLASSIC"
+    selValid  := validWavePivot
+    selHigh   := lastPH
+    selLow    := lastPL
+    selHbar   := lastPHbar
+    selLbar   := lastPLbar
+    selType   := "PIVOT"
+    selReason := validWavePivot ? "OK" : "pivot波 無効"
+    inZone    := f_inZone(selValid, selHigh, selLow)
+else if fibMode == "IMPULSE_ZIGZAG"
+    selValid  := rOK
+    selHigh   := rHigh
+    selLow    := rLow
+    selHbar   := rHbar
+    selLbar   := rLbar
+    selType   := "IMPULSE"
+    selReason := rReason
+    inZone    := f_inZone(selValid, selHigh, selLow)
+else
+    // MULTI_WAVE: recentWave 優先、なければ midWave。
+    bool izr = f_inZone(rOK, rHigh, rLow)
+    bool izm = f_inZone(mOK, mHigh, mLow)
+    if rOK and izr
+        selValid  := rOK
+        selHigh   := rHigh
+        selLow    := rLow
+        selHbar   := rHbar
+        selLbar   := rLbar
+        selType   := "RECENT"
+        selReason := rReason
+        inZone    := true
+    else if mOK and izm
+        selValid  := mOK
+        selHigh   := mHigh
+        selLow    := mLow
+        selHbar   := mHbar
+        selLbar   := mLbar
+        selType   := "MID"
+        selReason := mReason
+        inZone    := true
+    else
+        // どちらのゾーンにも入っていない → 表示用に直近波を採用
+        selValid  := rOK
+        selHigh   := rHigh
+        selLow    := rLow
+        selHbar   := rHbar
+        selLbar   := rLbar
+        selType   := "RECENT"
+        selReason := rOK ? "ゾーン外" : rReason
+        inZone    := false
+
+// ---- 下流互換のための共通変数 (旧コードがそのまま使える形を維持) ----
+validWave = selValid
+swingHigh = selHigh
+swingLow  = selLow
+waveRange = swingHigh - swingLow
+
+// SELL 用フィボ (安値起点で戻りを測る)
+fib382 = swingLow + waveRange * 0.382
+fib500 = swingLow + waveRange * 0.5
+fib618 = swingLow + waveRange * 0.618
+
+// ============================================================
+// 3. 売りゾーン (38.2% 〜 61.8%)  ※タッチ判定
+// ============================================================
+sellZoneLow  = fib382
+sellZoneHigh = fib618
+priceInSellZone = inZone   // f_inZone により高値/安値タッチで到達とみなす
+
+// ============================================================
+// 4. FVG / iFVG  （※ 接触ではなく「吸収」で判定）
+// ============================================================
+// Bearish FVG: 現在足の高値が 2本前の安値より下 (上方向に空いたギャップ)
+bearishFVG = high < low[2]
+// Bullish FVG: 現在足の安値が 2本前の高値より上 (下方向に空いたギャップ)
+bullishFVG = low > high[2]
+
+var array<float> fvgTop    = array.new_float()   // Bearish FVG ゾーン上限 = low[2]
+var array<float> fvgBot    = array.new_float()   // Bearish FVG ゾーン下限 = high
+var array<float> bullTop   = array.new_float()   // Bullish FVG ゾーン上限 = low[0]
+var array<float> bullBot   = array.new_float()   // Bullish FVG ゾーン下限 = high[2]
+var array<bool>  bullBroke = array.new_bool()    // 価格が下抜けて iFVG 化したか
+
+if bearishFVG and not na(low[2])
+    array.unshift(fvgTop, low[2])
+    array.unshift(fvgBot, high)
+    if array.size(fvgTop) > fvgLookback
+        array.pop(fvgTop)
+        array.pop(fvgBot)
+
+if bullishFVG and not na(high[2])
+    array.unshift(bullTop, low)
+    array.unshift(bullBot, high[2])
+    array.unshift(bullBroke, false)
+    if array.size(bullTop) > fvgLookback
+        array.pop(bullTop)
+        array.pop(bullBot)
+        array.pop(bullBroke)
+
+// FVG 吸収: 価格がゾーンへ上から入り、ゾーン下限「以下」で足が確定したら吸収とみなす。
+f_fvgAbsorbed(topArr, botArr) =>
+    bool absorbed = false
+    if array.size(botArr) > 0
+        for i = 0 to array.size(botArr) - 1
+            zBot = array.get(botArr, i) + atr * fvgToleranceATR
+            if (close < zBot) and (high >= zBot) and (open >= zBot or close[1] >= zBot)
+                absorbed := true
+    absorbed
+fvgAbsorbed = f_fvgAbsorbed(bullTop, bullBot)
+
+// iFVG (簡易): 過去 Bullish FVG を価格が下抜け → その後レジスタンスとして機能
+f_touchIFVG() =>
+    bool hit = false
+    if array.size(bullBot) > 0
+        for i = 0 to array.size(bullBot) - 1
+            b = array.get(bullBot, i)
+            t = array.get(bullTop, i)
+            broke = array.get(bullBroke, i)
+            if close < b - atr * fvgToleranceATR
+                array.set(bullBroke, i, true)
+            if broke and (high >= b - atr * fvgToleranceATR) and (high <= t + atr * fvgToleranceATR)
+                hit := true
+    hit
+ifvgTouch = f_touchIFVG()
+
+// ============================================================
+// 5. レジサポ転換 (Support → Resistance Flip)
+// ============================================================
+f_srFlip() =>
+    tol = atr * srTouchToleranceATR
+    int touches = 0
+    bool brokeBelow = false
+    lvl = close
+    if bar_index > srLookback
+        for i = 1 to srLookback
+            if not na(low[i]) and math.abs(low[i] - lvl) <= tol
+                touches := touches + 1
+            if not na(close[i]) and close[i] < lvl - tol
+                brokeBelow := true
+    (touches >= minSRTouches) and brokeBelow
+srFlip = f_srFlip()
+
+// EMA 重合 (売りゾーン付近に EMA200/EMA20 がある)
+emaConfluence = (math.abs(close - emaSlow) <= atr * 0.5) or (math.abs(close - emaFast) <= atr * 0.5)
+// POC 重合
+pocConfluence = usePocLine and (math.abs(close - pocPrice) <= atr * 0.5)
+
+// ============================================================
+// 重合判定 (ANY / ALL / MIN_COUNT)
+// ============================================================
+cFVG = useFVGConfluence    and (fvgAbsorbed or ifvgTouch)
+cSR  = useSRFlipConfluence and srFlip
+cEMA = useEMAConfluence    and emaConfluence
+cPOC = usePOCConfluence    and pocConfluence
+
+enabledCount   = (useFVGConfluence ? 1 : 0) + (useSRFlipConfluence ? 1 : 0) + (useEMAConfluence ? 1 : 0) + (usePOCConfluence ? 1 : 0)
+satisfiedCount = (cFVG ? 1 : 0) + (cSR ? 1 : 0) + (cEMA ? 1 : 0) + (cPOC ? 1 : 0)
+
+hasConfluence = switch confluenceMode
+    "ANY"       => enabledCount == 0 or satisfiedCount >= 1
+    "ALL"       => satisfiedCount >= enabledCount
+    "MIN_COUNT" => satisfiedCount >= minConfluenceCount
+    => true
+
+// ============================================================
+// 6. エントリートリガー (下位足 反転確認)
+// ============================================================
+// A. 弱気包み足
+bearishEngulfing = (close < open) and (close[1] > open[1]) and (close <= open[1]) and (open >= close[1])
+// B. 上ヒゲピンバー
+body      = math.abs(close - open)
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+pinbar    = (upperWick > body * 2) and (upperWick > lowerWick)
+// C. 直近安値更新 / BOS (下方向)
+bos = close < ta.lowest(low, bosLookback)[1]
+// D. EMA20 下抜けリジェクト
+emaReject = (high > emaFast) and (close < emaFast)
+// E. Bearish FVG 形成
+bearFVGtrig = bearishFVG
+
+// 現在足ベースの反転トリガー
+trigCurrent = (useBearishEngulfing and bearishEngulfing) or (usePinbar and pinbar) or (useBOS and bos) or (useEMAReject and emaReject) or (useBearishFVGTrigger and bearFVGtrig)
+
+// 同じ反転トリガーを triggerTF (1分足) で評価する関数
+f_lowerTrigger() =>
+    eF      = ta.ema(close, emaFastLen)
+    bodyL   = math.abs(close - open)
+    uw      = high - math.max(close, open)
+    lw      = math.min(close, open) - low
+    be      = (close < open) and (close[1] > open[1]) and (close <= open[1]) and (open >= close[1])
+    pb      = (uw > bodyL * 2) and (uw > lw)
+    bo      = close < ta.lowest(low, bosLookback)[1]
+    er      = (high > eF) and (close < eF)
+    bf      = high < low[2]
+    (useBearishEngulfing and be) or (usePinbar and pb) or (useBOS and bo) or (useEMAReject and er) or (useBearishFVGTrigger and bf)
+
+trigLowerTF = request.security(syminfo.tickerid, triggerTF, f_lowerTrigger(), lookahead = barmerge.lookahead_off)
+trigger     = useLowerTFTrigger ? trigLowerTF : trigCurrent
+
+// ============================================================
+// 7. 無効条件 (SELL 禁止)  ※終値ベース + ATR バッファ
+// ============================================================
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+
+invFib618    = useFib618Invalid and validWave and (close > fib618 + atr * fibZoneBufferATR)   // fib618 を終値で明確に上抜け
+inv5mAbove   = validWave and (close5m > sellZoneHigh + atr * fibZoneBufferATR)                // 5分足終値が売りゾーン上限+余白より上
+invEmaSettle = validWave and (close > htfEmaFast) and (close[1] > htfEmaFast)                 // 上位足 EMA20 上抜け定着
+invOrigin    = validWave and (close > swingHigh)                                              // 下降波の起点高値を上抜け
+invADXrange  = useADXRangeFilter and (adxVal < minADX)                                        // レンジ判定
+invalidated  = invFib618 or inv5mAbove or invEmaSettle or invOrigin or invADXrange
+
+// ============================================================
+// ロットサイズ (ゴールド仕様 / 小数切り捨て / 1未満は不可)
+// ============================================================
+capitalBase = useCompound ? strategy.equity : strategy.initial_capital
+projEntry = close
+projSL    = sellZoneHigh + atr * slATRBuffer
+projRisk  = projSL - projEntry
+riskAmt   = capitalBase * riskPercent / 100.0
+lotsRaw   = useRiskSizing ? (projRisk > 0 ? riskAmt / (projRisk * contractSize) : 0.0) : fixedLots
+lots      = math.floor(lotsRaw)
+qtyUnits  = lots * contractSize
+canSize   = lots >= 1
+
+// ============================================================
+// エントリー条件 統合
+// ============================================================
+sellSetup  = htfFilterOK and priceInSellZone and hasConfluence and not invalidated
+sellSignal = sellSetup and trigger and strategy.position_size == 0 and canSize
+
+// ============================================================
+// 8. SL / TP
+// ============================================================
+var float entryPrice = na
+var float slPrice    = na
+var float tpPrice    = na
+var float riskDist   = na
+
+if sellSignal
+    entryPrice := projEntry
+    slPrice    := projSL
+    riskDist   := projRisk
+    float tpFixed = entryPrice - riskDist * riskReward
+    float tpSwing = swingLow
+    tpPrice := useSwingLowTP and not na(tpSwing) and tpSwing < entryPrice ? tpSwing : (useFixedRRTP ? tpFixed : tpFixed)
+    strategy.entry("SELL", strategy.short, qty = qtyUnits)
+
+// 決済 (SL / TP)
+if strategy.position_size < 0 and not na(slPrice) and not na(tpPrice)
+    strategy.exit("EXIT", from_entry = "SELL", stop = slPrice, limit = tpPrice)
+
+// 建値移動: 含み益が breakEvenAtR×risk に達したら SL を建値へ
+var bool beDone = false
+if strategy.position_size < 0
+    if useBreakEven and not beDone and not na(riskDist)
+        if (entryPrice - low) >= riskDist * breakEvenAtR
+            slPrice := entryPrice
+            beDone  := true
+            strategy.exit("EXIT", from_entry = "SELL", stop = slPrice, limit = tpPrice)
+else
+    beDone := false
+
+// トレーリング (任意)
+if useTrailing and strategy.position_size < 0
+    strategy.exit("TRAIL", from_entry = "SELL", trail_points = trailATR * atr / syminfo.mintick, trail_offset = trailATR * atr / syminfo.mintick)
+
+// ============================================================
+// 9. 可視化
+// ============================================================
+plot(showFib and validWave ? swingHigh : na, "Swing High", color = color.new(color.red,   0), style = plot.style_linebr, linewidth = 2)
+plot(showFib and validWave ? swingLow  : na, "Swing Low",  color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+plot(showFib and validWave ? fib382    : na, "Fib 38.2%",  color = color.new(color.orange,0), style = plot.style_linebr)
+plot(showFib and validWave ? fib500    : na, "Fib 50.0%",  color = color.new(color.gray,  0), style = plot.style_linebr)
+plot(showFib and validWave ? fib618    : na, "Fib 61.8%",  color = color.new(color.purple,0), style = plot.style_linebr)
+
+plot(emaFast, "EMA Fast", color = color.new(color.blue,   30))
+plot(emaSlow, "EMA Slow", color = color.new(color.maroon, 30))
+plot(usePocLine ? pocPrice : na, "POC", color = color.new(color.teal, 0), style = plot.style_linebr)
+
+// 売りゾーン (赤ボックス)
+var box zoneBox = na
+if showZone and validWave
+    int leftX = na(selHbar) ? bar_index - 50 : selHbar
+    if na(zoneBox)
+        zoneBox := box.new(leftX, sellZoneHigh, bar_index + 5, sellZoneLow, border_color = color.new(color.red, 40), bgcolor = color.new(color.red, 85))
+    else
+        box.set_lefttop(zoneBox, leftX, sellZoneHigh)
+        box.set_rightbottom(zoneBox, bar_index + 5, sellZoneLow)
+
+// FVG ゾーン (直近のものを薄く表示)
+var box fvgBox = na
+if showFVG and array.size(fvgTop) > 0
+    t = array.get(fvgTop, 0)
+    b = array.get(fvgBot, 0)
+    if na(fvgBox)
+        fvgBox := box.new(bar_index - 1, t, bar_index + 1, b, border_color = color.new(color.fuchsia, 50), bgcolor = color.new(color.fuchsia, 90))
+    else
+        box.set_lefttop(fvgBox, bar_index - 1, t)
+        box.set_rightbottom(fvgBox, bar_index + 3, b)
+
+// SELL シグナル / ゾーン待機マーカー
+plotshape(sellSignal, title = "SELL", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0), text = "SELL", textcolor = color.white, size = size.small)
+plotshape(sellSetup and not sellSignal, title = "Zone Ready", style = shape.circle, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
+
+// SL / TP ライン (建玉中のみ)
+plot(showSLTP and strategy.position_size < 0 ? slPrice : na, "SL", color = color.new(color.red,   0), style = plot.style_linebr, linewidth = 2)
+plot(showSLTP and strategy.position_size < 0 ? tpPrice : na, "TP", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+
+// 無効化ラベル
+if invalidated and validWave and not invalidated[1]
+    label.new(bar_index, high, text = "無効化", style = label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.small)
+
+// ---- 採用モード / 波タイプ 表示 (常時) ----
+var label modeLbl = na
+if barstate.islast
+    string mtxt = "Mode: " + fibMode + "\nWave: " + selType + (selValid ? "  ✓" : "  ✗")
+    if na(modeLbl)
+        modeLbl := label.new(bar_index + 3, high, mtxt, style = label.style_label_left, color = color.new(color.blue, 20), textcolor = color.white, size = size.small)
+    else
+        label.set_xy(modeLbl, bar_index + 3, high)
+        label.set_text(modeLbl, mtxt)
+
+// ---- 波検出デバッグ (showWaveDebug=true のとき) ----
+var label fibHighLbl = na
+var label fibLowLbl  = na
+var label dbgLbl     = na
+if showWaveDebug and barstate.islast
+    // 採用 Swing High
+    if not na(selHbar) and not na(selHigh)
+        if na(fibHighLbl)
+            fibHighLbl := label.new(selHbar, selHigh, "Fib High", style = label.style_label_down, color = color.new(color.red, 20), textcolor = color.white, size = size.tiny)
+        else
+            label.set_xy(fibHighLbl, selHbar, selHigh)
+            label.set_text(fibHighLbl, "Fib High")
+    // 採用 Swing Low
+    if not na(selLbar) and not na(selLow)
+        if na(fibLowLbl)
+            fibLowLbl := label.new(selLbar, selLow, "Fib Low", style = label.style_label_up, color = color.new(color.green, 20), textcolor = color.white, size = size.tiny)
+        else
+            label.set_xy(fibLowLbl, selLbar, selLow)
+            label.set_text(fibLowLbl, "Fib Low")
+    // validWave / 理由 / 採用タイプ
+    string dtxt = "type: " + selType + "\nvalid: " + (selValid ? "true" : "false") + "\nreason: " + selReason + "\ninZone: " + (inZone ? "true" : "false")
+    if na(dbgLbl)
+        dbgLbl := label.new(bar_index, low, dtxt, style = label.style_label_up, color = color.new(color.gray, 20), textcolor = color.white, size = size.small)
+    else
+        label.set_xy(dbgLbl, bar_index, low)
+        label.set_text(dbgLbl, dtxt)
+
+// ============================================================
+// 10. アラート
+// ============================================================
+zoneArrival    = priceInSellZone and not priceInSellZone[1]
+reversalInZone = sellSetup and trigger
+tpHit          = strategy.position_size < 0 and not na(tpPrice) and low <= tpPrice
+slHit          = strategy.position_size < 0 and not na(slPrice) and high >= slPrice
+
+alertcondition(zoneArrival,    title = "1) 売りゾーン到達",       message = "XAUUSD: 価格が売りゾーンに到達しました")
+alertcondition(reversalInZone, title = "2) 売りゾーン内 反転確認", message = "XAUUSD: 売りゾーン内で反転確認 (トリガー発生)")
+alertcondition(sellSignal,     title = "3) SELL エントリー",      message = "XAUUSD: SELL エントリーシグナル")
+alertcondition(invFib618,      title = "4) fib618 上抜けで無効",  message = "XAUUSD: fib618 上抜けで売りセットアップ無効化")
+alertcondition(tpHit,          title = "5) TP 到達",             message = "XAUUSD: TP 到達")
+alertcondition(slHit,          title = "6) SL 到達",             message = "XAUUSD: SL 到達")
