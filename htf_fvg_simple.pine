@@ -41,6 +41,7 @@ tf1H     = input.timeframe("60",  "1時間足 TF", group = grpTF)
 grpParam = "しきい値"
 upperThreshold = input.float(0.8, "上限付近 しきい値", minval = 0.0, maxval = 1.0, step = 0.05, group = grpParam)
 lowerThreshold = input.float(0.2, "下限付近 しきい値", minval = 0.0, maxval = 1.0, step = 0.05, group = grpParam)
+htfFVGMaxCount = input.int(10, "未埋めFVG保持数", minval = 1, group = grpParam)
 
 // ============================================================
 //  表示
@@ -54,21 +55,82 @@ colLower  = input.color(color.new(color.green, 0), "下限付近 色", group = g
 colOff    = input.color(color.new(color.gray, 50), "OFF 色",     group = grpDisp)
 
 // ============================================================
-//  最新 FVG ゾーン取得 (request.security の中で各TFの文脈で評価)
-//   返り値: top, bottom (最新 FVG ゾーン / 無ければ na)
+//  未埋めFVG 取得 (request.security の中で各TFの文脈で評価)
+//   ・Bullish / Bearish FVG を配列で最大 htfFVGMaxCount 個保持。
+//   ・完全に埋められた FVG は filled=true にして判定対象から外す。
+//   ・未埋めFVGの中から アクティブFVG を選択
+//       優先1: 現在価格がFVG内 / 優先2: 現在価格に最も近い
+//   返り値: activeTop, activeBottom, 未埋めFVG数
 // ============================================================
-f_latestFVG() =>
-    var float top = na
-    var float bot = na
+f_unfilledFVG() =>
+    var array<float> topA    = array.new_float()
+    var array<float> botA    = array.new_float()
+    var array<int>   barA    = array.new_int()
+    var array<bool>  filledA = array.new_bool()
+    var array<int>   dirA    = array.new_int()   // 1=Bullish / -1=Bearish (埋め判定用)
+
+    // --- 新規FVG → 配列に追加 (直近 htfFVGMaxCount 個を保持) ---
     // Bullish FVG: low > high[2]  → top=low, bottom=high[2]
     if low > high[2]
-        top := low
-        bot := high[2]
+        array.push(topA, low)
+        array.push(botA, high[2])
+        array.push(barA, bar_index)
+        array.push(filledA, false)
+        array.push(dirA, 1)
+        if array.size(topA) > htfFVGMaxCount
+            array.shift(topA)
+            array.shift(botA)
+            array.shift(barA)
+            array.shift(filledA)
+            array.shift(dirA)
     // Bearish FVG: high < low[2]  → top=low[2], bottom=high
     if high < low[2]
-        top := low[2]
-        bot := high
-    [top, bot]
+        array.push(topA, low[2])
+        array.push(botA, high)
+        array.push(barA, bar_index)
+        array.push(filledA, false)
+        array.push(dirA, -1)
+        if array.size(topA) > htfFVGMaxCount
+            array.shift(topA)
+            array.shift(botA)
+            array.shift(barA)
+            array.shift(filledA)
+            array.shift(dirA)
+
+    int sz = array.size(topA)
+
+    // --- 完全埋め判定 (Bullish: close<bottom / Bearish: close>top) ---
+    if sz > 0
+        for i = 0 to sz - 1
+            if not array.get(filledA, i)
+                float t = array.get(topA, i)
+                float b = array.get(botA, i)
+                bool fill = array.get(dirA, i) == 1 ? close < b : close > t
+                if fill
+                    array.set(filledA, i, true)
+
+    // --- アクティブFVG選択 (1:内包優先 / 2:最も近い) + 未埋め数 ---
+    float bestTop    = na
+    float bestBot    = na
+    bool  bestInside = false
+    float bestDist   = na
+    int   cnt        = 0
+    if sz > 0
+        for i = 0 to sz - 1
+            if not array.get(filledA, i)
+                cnt += 1
+                float t = array.get(topA, i)
+                float b = array.get(botA, i)
+                bool  ins = close <= t and close >= b
+                float dist = ins ? 0.0 : (close > t ? close - t : b - close)
+                bool better = na(bestDist) ? true : (ins and not bestInside) ? true : (ins == bestInside and dist < bestDist)
+                if better
+                    bestTop := t
+                    bestBot := b
+                    bestInside := ins
+                    bestDist := dist
+
+    [bestTop, bestBot, cnt]
 
 // ============================================================
 //  FVG内 判定 (チャート側 / 現在価格 px に対して)
@@ -84,17 +146,32 @@ f_class(on, top, bot, px) =>
     [inside, zonePos, nearUpper, nearLower, allowShort, allowLong, on ? top : na, on ? bot : na]
 
 // ============================================================
-//  各時間足の最新FVGを取得 → FVG内判定
+//  各時間足の未埋めFVGを取得 → アクティブFVGでFVG内判定
 // ============================================================
-[wTopRaw, wBotRaw] = request.security(syminfo.tickerid, tfWeekly, f_latestFVG(), lookahead = barmerge.lookahead_off)
-[dTopRaw, dBotRaw] = request.security(syminfo.tickerid, tfDaily,  f_latestFVG(), lookahead = barmerge.lookahead_off)
-[f4TopRaw, f4BotRaw] = request.security(syminfo.tickerid, tf4H,    f_latestFVG(), lookahead = barmerge.lookahead_off)
-[f1TopRaw, f1BotRaw] = request.security(syminfo.tickerid, tf1H,    f_latestFVG(), lookahead = barmerge.lookahead_off)
+[wTopRaw, wBotRaw, wCntRaw] = request.security(syminfo.tickerid, tfWeekly, f_unfilledFVG(), lookahead = barmerge.lookahead_off)
+[dTopRaw, dBotRaw, dCntRaw] = request.security(syminfo.tickerid, tfDaily,  f_unfilledFVG(), lookahead = barmerge.lookahead_off)
+[f4TopRaw, f4BotRaw, f4CntRaw] = request.security(syminfo.tickerid, tf4H,   f_unfilledFVG(), lookahead = barmerge.lookahead_off)
+[f1TopRaw, f1BotRaw, f1CntRaw] = request.security(syminfo.tickerid, tf1H,   f_unfilledFVG(), lookahead = barmerge.lookahead_off)
 
 [weeklyInside, weeklyZonePosition, weeklyNearUpper, weeklyNearLower, weeklyAllowShort, weeklyAllowLong, weeklyTop, weeklyBottom] = f_class(useWeeklyFVG, wTopRaw, wBotRaw, close)
 [dailyInside, dailyZonePosition, dailyNearUpper, dailyNearLower, dailyAllowShort, dailyAllowLong, dailyTop, dailyBottom] = f_class(useDailyFVG, dTopRaw, dBotRaw, close)
 [h4Inside, h4ZonePosition, h4NearUpper, h4NearLower, h4AllowShort, h4AllowLong, h4Top, h4Bottom] = f_class(use4HFVG, f4TopRaw, f4BotRaw, close)
 [h1Inside, h1ZonePosition, h1NearUpper, h1NearLower, h1AllowShort, h1AllowLong, h1Top, h1Bottom] = f_class(use1HFVG, f1TopRaw, f1BotRaw, close)
+
+// アクティブFVG ゾーン (= f_class が返す masked top/bottom) と 未埋めFVG数
+float weeklyActiveTop = weeklyTop
+float weeklyActiveBottom = weeklyBottom
+float dailyActiveTop = dailyTop
+float dailyActiveBottom = dailyBottom
+float h4ActiveTop = h4Top
+float h4ActiveBottom = h4Bottom
+float h1ActiveTop = h1Top
+float h1ActiveBottom = h1Bottom
+
+int weeklyUnfilledCount = useWeeklyFVG ? wCntRaw : 0
+int dailyUnfilledCount  = useDailyFVG  ? dCntRaw : 0
+int h4UnfilledCount     = use4HFVG     ? f4CntRaw : 0
+int h1UnfilledCount     = use1HFVG     ? f1CntRaw : 0
 
 // ============================================================
 //  統合出力
@@ -152,6 +229,22 @@ plot(h1ZonePosition,     "h1ZonePosition",     display = display.data_window)
 plot(isRangeByHTFFVG    ? 1 : 0, "isRangeByHTFFVG",    display = display.data_window)
 plot(allowLongByHTFFVG  ? 1 : 0, "allowLongByHTFFVG",  display = display.data_window)
 plot(allowShortByHTFFVG ? 1 : 0, "allowShortByHTFFVG", display = display.data_window)
+
+// アクティブFVG ゾーン
+plot(weeklyActiveTop,    "weeklyActiveTop",    display = display.data_window)
+plot(weeklyActiveBottom, "weeklyActiveBottom", display = display.data_window)
+plot(dailyActiveTop,     "dailyActiveTop",     display = display.data_window)
+plot(dailyActiveBottom,  "dailyActiveBottom",  display = display.data_window)
+plot(h4ActiveTop,        "h4ActiveTop",        display = display.data_window)
+plot(h4ActiveBottom,     "h4ActiveBottom",     display = display.data_window)
+plot(h1ActiveTop,        "h1ActiveTop",        display = display.data_window)
+plot(h1ActiveBottom,     "h1ActiveBottom",     display = display.data_window)
+
+// 未埋めFVG数
+plot(weeklyUnfilledCount, "weeklyUnfilledCount", display = display.data_window)
+plot(dailyUnfilledCount,  "dailyUnfilledCount",  display = display.data_window)
+plot(h4UnfilledCount,     "h4UnfilledCount",     display = display.data_window)
+plot(h1UnfilledCount,     "h1UnfilledCount",     display = display.data_window)
 
 // ============================================================
 //  アラート
