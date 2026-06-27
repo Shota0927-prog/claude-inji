@@ -1,0 +1,301 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © your_username
+//
+// ============================================================
+//  HTF FVG 環境認識モジュール (Indicator版)
+// ============================================================
+//  ・週足 / 日足 / 4H / 1H の FVG を「環境認識」として返す。
+//  ・このモジュール単体ではエントリーしない (シグナルのみ)。
+//  ・後で フィボ / FVG反発 / FVG吸収 / EMA / 出来高 などの
+//    モジュールと AND 条件で接続する前提。
+//  ・各時間足は request.security() + lookahead_off で取得。
+//  ・関数化してあり、時間足を簡単に追加できる構造。
+// ============================================================
+
+//@version=5
+indicator(
+     title          = "HTF FVG Environment",
+     shorttitle     = "HTF-FVG",
+     overlay        = true,
+     max_bars_back  = 500
+ )
+
+// ============================================================
+//  対象時間足 ON/OFF
+// ============================================================
+grpTF = "対象時間足"
+useWeeklyFVG = input.bool(true,  "Weekly FVG を使う", group = grpTF)
+useDailyFVG  = input.bool(true,  "Daily FVG を使う",  group = grpTF)
+use4HFVG     = input.bool(true,  "4H FVG を使う",     group = grpTF)
+use1HFVG     = input.bool(true,  "1H FVG を使う",     group = grpTF)
+
+tfWeekly = input.timeframe("W",   "Weekly TF", group = grpTF)
+tfDaily  = input.timeframe("D",   "Daily TF",  group = grpTF)
+tf4H     = input.timeframe("240", "4H TF",     group = grpTF)
+tf1H     = input.timeframe("60",  "1H TF",     group = grpTF)
+
+// ============================================================
+//  モード ON/OFF
+// ============================================================
+grpMode = "モード"
+useRangeMode = input.bool(true, "レンジ(FVG内)モードを使う", group = grpMode)
+useBreakMode = input.bool(true, "ブレイクモードを使う",       group = grpMode)
+useNearMode  = input.bool(true, "近接モードを使う",           group = grpMode)
+
+// ============================================================
+//  パラメータ
+// ============================================================
+grpParam = "パラメータ"
+atrLen           = input.int(14,  "ATR期間",                minval = 1,   group = grpParam)
+upperThreshold   = input.float(0.8, "上限付近 しきい値",     minval = 0.0, maxval = 1.0, step = 0.05, group = grpParam)
+lowerThreshold   = input.float(0.2, "下限付近 しきい値",     minval = 0.0, maxval = 1.0, step = 0.05, group = grpParam)
+nearATR          = input.float(0.5, "近接判定 (ATR倍率)",    minval = 0.0, step = 0.05, group = grpParam)
+breakLookbackBars= input.int(20,  "ブレイク後 戻り許容(本)", minval = 1,   group = grpParam)
+
+// ============================================================
+//  厚みフィルター
+// ============================================================
+grpThick = "厚みフィルター"
+useHTFThicknessFilter = input.bool(true,  "厚みフィルターを使う", group = grpThick)
+useThicknessATR       = input.bool(true,  "ATR倍率で判定",        group = grpThick)
+useThicknessPct       = input.bool(false, "close比率で判定",      group = grpThick)
+fvgMinThicknessATR    = input.float(0.30,  "最低厚み (ATR倍率)",   minval = 0.0, step = 0.05,  group = grpThick)
+fvgMinThicknessPct    = input.float(0.0010,"最低厚み (close比率)", minval = 0.0, step = 0.0005, group = grpThick)
+
+// ============================================================
+//  表示
+// ============================================================
+grpDisp = "表示"
+showHTFTable = input.bool(true, "環境テーブルを表示", group = grpDisp)
+
+colInside   = input.color(color.new(color.blue,  0), "Inside 色",   group = grpDisp)
+colBreakUp  = input.color(color.new(color.green, 0), "BreakUp 色",  group = grpDisp)
+colBreakDn  = input.color(color.new(color.red,   0), "BreakDown 色",group = grpDisp)
+colOutside  = input.color(color.new(color.gray,  0), "Outside 色",  group = grpDisp)
+
+// ============================================================
+//  厚み条件 (HTF / Chart 共通で利用)
+// ============================================================
+f_thickOK(width, atrVal, px) =>
+    bool ok = true
+    if useHTFThicknessFilter
+        bool a = not useThicknessATR or (width >= atrVal * fvgMinThicknessATR)
+        bool p = not useThicknessPct or (px != 0 and (width / px) >= fvgMinThicknessPct)
+        ok := a and p
+    ok
+
+// ============================================================
+//  HTF 状態取得 (request.security の中で各時間足の文脈で評価される)
+//  返り値:
+//   bullTop, bullBot   : 最新 Bullish FVG ゾーン
+//   bearTop, bearBot   : 最新 Bearish FVG ゾーン
+//   bd, bu             : このHTF足で 下抜け/上抜け が起きたか (1/0)
+//   sinceBull,sinceBear: 最後のブレイクからの経過HTF本数
+//   atrVal             : HTF ATR
+// ============================================================
+f_htfState() =>
+    var float bullTop = na
+    var float bullBot = na
+    var float bearTop = na
+    var float bearBot = na
+    var int   bullBreakBar = na
+    var int   bearBreakBar = na
+
+    float atrVal = ta.atr(atrLen)
+
+    // --- 新規 FVG 検出 (現FVGモジュールと同じロジック) ---
+    // Bullish: low > high[2]
+    if low > high[2]
+        float w = low - high[2]
+        if w > 0 and f_thickOK(w, atrVal, close)
+            bullTop := low
+            bullBot := high[2]
+    // Bearish: high < low[2]
+    if high < low[2]
+        float w = low[2] - high
+        if w > 0 and f_thickOK(w, atrVal, close)
+            bearTop := low[2]
+            bearBot := high
+
+    // --- ブレイク検出 (HTF終値ベース) ---
+    bool bd = not na(bullBot) and close < bullBot   // Bullish FVG 下抜け
+    bool bu = not na(bearTop) and close > bearTop   // Bearish FVG 上抜け
+    if bd
+        bullBreakBar := bar_index
+    if bu
+        bearBreakBar := bar_index
+
+    int sinceBull = na(bullBreakBar) ? 1000000 : bar_index - bullBreakBar
+    int sinceBear = na(bearBreakBar) ? 1000000 : bar_index - bearBreakBar
+
+    [bullTop, bullBot, bearTop, bearBot, bd ? 1 : 0, bu ? 1 : 0, sinceBull, sinceBear, atrVal]
+
+// ============================================================
+//  環境分類 (チャート時間足で現在価格 px に対して判定)
+//  返り値 (14):
+//   mode, zonePos, isInside, isOutside,
+//   nearUpper, nearLower, rangeBuy, rangeSell,
+//   breakDown, breakUp, waitSell, waitBuy, nearBull, nearBear
+// ============================================================
+f_classify(on, bullTop, bullBot, bearTop, bearBot, bd, bu, sinceBull, sinceBear, htfATR, px) =>
+    // 在/不在
+    bool hasBull = not na(bullTop) and not na(bullBot)
+    bool hasBear = not na(bearTop) and not na(bearBot)
+    bool hasFVG  = hasBull or hasBear
+
+    // Inside 判定
+    bool insideBull = hasBull and px <= bullTop and px >= bullBot
+    bool insideBear = hasBear and px <= bearTop and px >= bearBot
+    bool isInside   = on and (insideBull or insideBear)
+
+    // アクティブゾーン (Inside のとき採用 / Bull 優先)
+    float aTop = insideBull ? bullTop : insideBear ? bearTop : na
+    float aBot = insideBull ? bullBot : insideBear ? bearBot : na
+
+    // zonePosition (0=下限, 0.5=中央, 1=上限)
+    float zonePos = (isInside and not na(aTop) and (aTop - aBot) > 0) ? (px - aBot) / (aTop - aBot) : na
+
+    // 上限/下限付近
+    bool nearUpper = isInside and not na(zonePos) and zonePos >= upperThreshold
+    bool nearLower = isInside and not na(zonePos) and zonePos <= lowerThreshold
+
+    // 環境許可 (エントリーではなく環境)
+    bool rangeSell = on and useRangeMode and nearUpper
+    bool rangeBuy  = on and useRangeMode and nearLower
+
+    // ブレイク
+    bool breakDown = on and useBreakMode and bd == 1
+    bool breakUp   = on and useBreakMode and bu == 1
+
+    // ブレイク後の戻り → iFVG候補
+    bool waitSell = on and useBreakMode and hasBull and sinceBull <= breakLookbackBars and px >= bullBot
+    bool waitBuy  = on and useBreakMode and hasBear and sinceBear <= breakLookbackBars and px <= bearTop
+
+    // Outside
+    bool isOutside = on and hasFVG and not isInside
+
+    // 近接 (Outside でも ATR以内なら近い)
+    float distBull = hasBull ? (px > bullTop ? px - bullTop : px < bullBot ? bullBot - px : 0.0) : na
+    float distBear = hasBear ? (px > bearTop ? px - bearTop : px < bearBot ? bearBot - px : 0.0) : na
+    bool nearBull = on and useNearMode and not insideBull and hasBull and not na(htfATR) and distBull <= htfATR * nearATR
+    bool nearBear = on and useNearMode and not insideBear and hasBear and not na(htfATR) and distBear <= htfATR * nearATR
+
+    // mode : 0なし / 1内 / 2上抜け / 3下抜け / 4外
+    int mode = not on ? 0 : breakDown ? 3 : breakUp ? 2 : isInside ? 1 : (hasFVG and isOutside ? 4 : 0)
+
+    [mode, zonePos, isInside, isOutside, nearUpper, nearLower, rangeBuy, rangeSell, breakDown, breakUp, waitSell, waitBuy, nearBull, nearBear]
+
+// ============================================================
+//  各時間足の HTF 状態を取得
+// ============================================================
+[wBullTop, wBullBot, wBearTop, wBearBot, wBD, wBU, wSinceBull, wSinceBear, wATR] = request.security(syminfo.tickerid, tfWeekly, f_htfState(), lookahead = barmerge.lookahead_off)
+[dBullTop, dBullBot, dBearTop, dBearBot, dBD, dBU, dSinceBull, dSinceBear, dATR] = request.security(syminfo.tickerid, tfDaily,  f_htfState(), lookahead = barmerge.lookahead_off)
+[h4BullTop, h4BullBot, h4BearTop, h4BearBot, h4BD, h4BU, h4SinceBull, h4SinceBear, h4ATR] = request.security(syminfo.tickerid, tf4H, f_htfState(), lookahead = barmerge.lookahead_off)
+[h1BullTop, h1BullBot, h1BearTop, h1BearBot, h1BD, h1BU, h1SinceBull, h1SinceBear, h1ATR] = request.security(syminfo.tickerid, tf1H, f_htfState(), lookahead = barmerge.lookahead_off)
+
+// ============================================================
+//  各時間足を分類
+// ============================================================
+[weeklyMode, weeklyZonePosition, wInside, wOutside, weeklyNearUpper, weeklyNearLower, weeklyRangeBuy, weeklyRangeSell, weeklyBreakDown, weeklyBreakUp, wWaitSell, wWaitBuy, weeklyNearBull, weeklyNearBear] = f_classify(useWeeklyFVG, wBullTop, wBullBot, wBearTop, wBearBot, wBD, wBU, wSinceBull, wSinceBear, wATR, close)
+[dailyMode, dailyZonePosition, dInside, dOutside, dailyNearUpper, dailyNearLower, dailyRangeBuy, dailyRangeSell, dailyBreakDown, dailyBreakUp, dWaitSell, dWaitBuy, dailyNearBull, dailyNearBear] = f_classify(useDailyFVG, dBullTop, dBullBot, dBearTop, dBearBot, dBD, dBU, dSinceBull, dSinceBear, dATR, close)
+[h4Mode, h4ZonePosition, h4Inside, h4Outside, h4NearUpper, h4NearLower, h4RangeBuy, h4RangeSell, h4BreakDown, h4BreakUp, h4WaitSell, h4WaitBuy, h4NearBull, h4NearBear] = f_classify(use4HFVG, h4BullTop, h4BullBot, h4BearTop, h4BearBot, h4BD, h4BU, h4SinceBull, h4SinceBear, h4ATR, close)
+[h1Mode, h1ZonePosition, h1Inside, h1Outside, h1NearUpper, h1NearLower, h1RangeBuy, h1RangeSell, h1BreakDown, h1BreakUp, h1WaitSell, h1WaitBuy, h1NearBull, h1NearBear] = f_classify(use1HFVG, h1BullTop, h1BullBot, h1BearTop, h1BearBot, h1BD, h1BU, h1SinceBull, h1SinceBear, h1ATR, close)
+
+// ============================================================
+//  コンフルエンス (週足+日足+4H が同一価格帯に重なる数)
+// ============================================================
+int fvgConfluenceCount = (useWeeklyFVG and wInside ? 1 : 0) + (useDailyFVG and dInside ? 1 : 0) + (use4HFVG and h4Inside ? 1 : 0)
+
+// ============================================================
+//  統合出力 (後でストラテジーが AND 条件で使う)
+// ============================================================
+bool allowLongByHTFFVG  = weeklyRangeBuy  or dailyRangeBuy  or h4RangeBuy  or h1RangeBuy
+bool allowShortByHTFFVG = weeklyRangeSell or dailyRangeSell or h4RangeSell or h1RangeSell
+bool isRangeByHTFFVG    = wInside or dInside or h4Inside or h1Inside
+bool waitingIFVG        = wWaitSell or wWaitBuy or dWaitSell or dWaitBuy or h4WaitSell or h4WaitBuy or h1WaitSell or h1WaitBuy
+
+// iFVG候補 (方向別 統合)
+bool waitingIFVGSell = wWaitSell or dWaitSell or h4WaitSell or h1WaitSell
+bool waitingIFVGBuy  = wWaitBuy  or dWaitBuy  or h4WaitBuy  or h1WaitBuy
+
+// ============================================================
+//  表示 : テーブル
+// ============================================================
+f_modeStr(m) =>
+    m == 1 ? "Inside" : m == 2 ? "BreakUp" : m == 3 ? "BreakDn" : m == 4 ? "Outside" : "-"
+
+f_modeCol(m) =>
+    m == 1 ? colInside : m == 2 ? colBreakUp : m == 3 ? colBreakDn : m == 4 ? colOutside : color.new(color.gray, 60)
+
+f_b(b) =>
+    b ? "✓" : "-"
+
+var table tbl = table.new(position.top_right, 8, 6, border_width = 1)
+
+f_tfRow(row, name, on, m, inside, outside, nearU, nearL, bUp, bDn) =>
+    color rc = on ? f_modeCol(m) : color.new(color.gray, 80)
+    table.cell(tbl, 0, row, name,                text_color = color.white, bgcolor = color.new(color.black, 50))
+    table.cell(tbl, 1, row, on ? f_modeStr(m) : "off", text_color = color.white, bgcolor = rc)
+    table.cell(tbl, 2, row, f_b(inside),  text_color = color.white)
+    table.cell(tbl, 3, row, f_b(outside), text_color = color.white)
+    table.cell(tbl, 4, row, f_b(nearU),   text_color = color.white)
+    table.cell(tbl, 5, row, f_b(nearL),   text_color = color.white)
+    table.cell(tbl, 6, row, f_b(bUp),     text_color = color.white)
+    table.cell(tbl, 7, row, f_b(bDn),     text_color = color.white)
+
+if showHTFTable and barstate.islast
+    table.cell(tbl, 0, 0, "TF",        text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(tbl, 1, 0, "Mode",      text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(tbl, 2, 0, "Inside",    text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(tbl, 3, 0, "Outside",   text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(tbl, 4, 0, "NearUp",    text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(tbl, 5, 0, "NearLow",   text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(tbl, 6, 0, "BreakUp",   text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(tbl, 7, 0, "BreakDn",   text_color = color.white, bgcolor = color.new(color.blue, 0))
+    f_tfRow(1, "Weekly", useWeeklyFVG, weeklyMode, wInside, wOutside, weeklyNearUpper, weeklyNearLower, weeklyBreakUp, weeklyBreakDown)
+    f_tfRow(2, "Daily",  useDailyFVG,  dailyMode,  dInside, dOutside, dailyNearUpper,  dailyNearLower,  dailyBreakUp,  dailyBreakDown)
+    f_tfRow(3, "4H",     use4HFVG,     h4Mode,     h4Inside,h4Outside,h4NearUpper,     h4NearLower,     h4BreakUp,     h4BreakDown)
+    f_tfRow(4, "1H",     use1HFVG,     h1Mode,     h1Inside,h1Outside,h1NearUpper,     h1NearLower,     h1BreakUp,     h1BreakDown)
+    table.cell(tbl, 0, 5, "Confluence", text_color = color.white, bgcolor = color.new(color.purple, 0))
+    table.cell(tbl, 1, 5, str.tostring(fvgConfluenceCount), text_color = color.white, bgcolor = color.new(color.purple, 0))
+    table.cell(tbl, 2, 5, "iFVG待ち",   text_color = color.white)
+    table.cell(tbl, 3, 5, f_b(waitingIFVG), text_color = color.white)
+    table.cell(tbl, 4, 5, "Long",  text_color = color.white)
+    table.cell(tbl, 5, 5, f_b(allowLongByHTFFVG),  text_color = color.white)
+    table.cell(tbl, 6, 5, "Short", text_color = color.white)
+    table.cell(tbl, 7, 5, f_b(allowShortByHTFFVG), text_color = color.white)
+
+// ============================================================
+//  プロット (接続用 : data_window に値を出す)
+// ============================================================
+plot(weeklyMode, "weeklyMode", display = display.data_window)
+plot(dailyMode,  "dailyMode",  display = display.data_window)
+plot(h4Mode,     "h4Mode",     display = display.data_window)
+plot(h1Mode,     "h1Mode",     display = display.data_window)
+
+plot(weeklyZonePosition, "weeklyZonePosition", display = display.data_window)
+plot(dailyZonePosition,  "dailyZonePosition",  display = display.data_window)
+plot(h4ZonePosition,     "h4ZonePosition",     display = display.data_window)
+plot(h1ZonePosition,     "h1ZonePosition",     display = display.data_window)
+
+plot(fvgConfluenceCount, "fvgConfluenceCount", display = display.data_window)
+plot(allowLongByHTFFVG  ? 1 : 0, "allowLongByHTFFVG",  display = display.data_window)
+plot(allowShortByHTFFVG ? 1 : 0, "allowShortByHTFFVG", display = display.data_window)
+plot(isRangeByHTFFVG    ? 1 : 0, "isRangeByHTFFVG",    display = display.data_window)
+plot(waitingIFVG        ? 1 : 0, "waitingIFVG",        display = display.data_window)
+
+// ============================================================
+//  アラート
+// ============================================================
+alertcondition(wInside,  "Weekly Inside", "{{ticker}} Weekly FVG内")
+alertcondition(dInside,  "Daily Inside",  "{{ticker}} Daily FVG内")
+alertcondition(h4Inside, "4H Inside",     "{{ticker}} 4H FVG内")
+alertcondition(h1Inside, "1H Inside",     "{{ticker}} 1H FVG内")
+
+alertcondition(weeklyBreakUp or weeklyBreakDown, "Weekly Break", "{{ticker}} Weekly FVG ブレイク")
+alertcondition(dailyBreakUp  or dailyBreakDown,  "Daily Break",  "{{ticker}} Daily FVG ブレイク")
+alertcondition(h4BreakUp     or h4BreakDown,     "4H Break",     "{{ticker}} 4H FVG ブレイク")
+alertcondition(h1BreakUp     or h1BreakDown,     "1H Break",     "{{ticker}} 1H FVG ブレイク")
+
+alertcondition(weeklyNearUpper or dailyNearUpper or h4NearUpper or h1NearUpper, "Near Upper", "{{ticker}} HTF FVG 上限付近")
+alertcondition(weeklyNearLower or dailyNearLower or h4NearLower or h1NearLower, "Near Lower", "{{ticker}} HTF FVG 下限付近")
