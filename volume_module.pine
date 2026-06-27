@@ -1,0 +1,397 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © your_username
+//
+// ============================================================
+//  出来高 / VPVR / POC 単体モジュール (Indicator版)
+// ============================================================
+//  ・出来高 / 疑似VPVR / POC 関連だけを独立モジュール化。
+//  ・後で 環境認識 / フィボ / FVG / EMA モジュールと接続する前提。
+//  ・strategy ではなく indicator。シグナル出力のみ。
+//  ・request.security / ADX は使わない。現在足ベース。
+//  検出パターン:
+//    A: POC貫通・アクセプタンス / B: POC反発
+//    C: 出来高急増ブレイク(+圧縮→爆発) / D: クライマックス反転
+//  共通: 出来高不足フィルター / 出来高SMA / 実体率 / 圧縮
+// ============================================================
+
+//@version=5
+indicator(
+     title          = "Volume / POC Module",
+     shorttitle     = "VOL-POC",
+     overlay        = true,
+     max_bars_back  = 1000,
+     max_boxes_count  = 50,
+     max_labels_count = 500
+ )
+
+// ============================================================
+//  ON/OFF
+// ============================================================
+grpMain = "モジュール"
+useVolumeModule = input.bool(true, "出来高モジュール全体を使う", group = grpMain)
+
+grpPat = "パターン ON/OFF"
+usePOCAcceptance = input.bool(true, "A: POC貫通・定着", group = grpPat)
+usePOCRebound    = input.bool(true, "B: POC反発",       group = grpPat)
+useVolumeBreakout= input.bool(true, "C: 出来高急増ブレイク", group = grpPat)
+useClimaxReversal= input.bool(true, "D: クライマックス反転", group = grpPat)
+
+grpFilt = "共通フィルター ON/OFF"
+useLowVolumeFilter = input.bool(true,  "出来高不足フィルター",   group = grpFilt)
+useVolumeSMAFilter = input.bool(false, "出来高SMAフィルター(>SMA)", group = grpFilt)
+useBodyFilter      = input.bool(false, "実体率フィルター",       group = grpFilt)
+useCompressionFilter = input.bool(false, "圧縮→爆発フィルター(C)", group = grpFilt)
+useFirstSignalOnly = input.bool(true,  "連続シグナル抑制(初回のみ)", group = grpFilt)
+
+// ============================================================
+//  VPVR / POC パラメータ
+// ============================================================
+grpVP = "VPVR / POC"
+vpLookback = input.int(120, "VP ルックバック(本)", minval = 10, group = grpVP)
+vpBins     = input.int(20,  "VP ビン数",           minval = 4,  maxval = 100, group = grpVP)
+pocZoneWidth = input.float(0.0, "POCゾーン幅(固定/価格)", minval = 0.0, step = 0.1, group = grpVP)
+useVolAdaptivePOCWidth = input.bool(true, "POCゾーン幅をATR連動にする", group = grpVP)
+atrLen        = input.int(14,  "ATR期間",          minval = 1,   group = grpVP)
+pocZoneATRMult= input.float(0.25, "POCゾーン幅 (ATR倍率)", minval = 0.0, step = 0.05, group = grpVP)
+
+// ============================================================
+//  A: POC アクセプタンス
+// ============================================================
+grpA = "A: POC アクセプタンス"
+crossLookback = input.int(10, "貫通前 参照本数", minval = 1, group = grpA)
+acceptBars    = input.int(2,  "定着本数",       minval = 1, group = grpA)
+useDirCandleForAcceptance = input.bool(false, "方向ローソク確認", group = grpA)
+useVolumeConfirmForAcceptance = input.bool(false, "出来高増加確認", group = grpA)
+
+// ============================================================
+//  B: POC 反発
+// ============================================================
+grpB = "B: POC 反発"
+pocReboundDepthMax = input.float(0.5, "許容 割込み深さ(ゾーン比)", minval = 0.0, step = 0.05, group = grpB)
+usePOCReboundCandleConfirm   = input.bool(true,  "反発: 方向ローソク", group = grpB)
+usePOCReboundWickConfirm     = input.bool(true,  "反発: ヒゲ確認",     group = grpB)
+usePOCReboundCloseEdgeConfirm= input.bool(true,  "反発: close寄り確認", group = grpB)
+
+// ============================================================
+//  C: 出来高急増ブレイク
+// ============================================================
+grpC = "C: 出来高ブレイク"
+breakoutLookback   = input.int(20, "ブレイク 参照本数", minval = 1, group = grpC)
+volumeSmaLen       = input.int(20, "出来高SMA期間",     minval = 1, group = grpC)
+volumeSpikeMult    = input.float(1.8, "出来高急増 倍率", minval = 0.0, step = 0.1, group = grpC)
+breakoutBodyRatioMin = input.float(0.5, "ブレイク 実体率最小", minval = 0.0, maxval = 1.0, step = 0.05, group = grpC)
+useATRExpansionFilter = input.bool(false, "ATR拡大フィルター", group = grpC)
+atrExpansionMult   = input.float(1.2, "ATR拡大 倍率", minval = 0.0, step = 0.05, group = grpC)
+
+grpComp = "圧縮→爆発"
+compressionLookback = input.int(10, "圧縮 参照本数", minval = 1, group = grpComp)
+compressionATRMult  = input.float(1.5, "圧縮 レンジ <= ATR×", minval = 0.0, step = 0.1, group = grpComp)
+
+// ============================================================
+//  D: クライマックス反転
+// ============================================================
+grpD = "D: クライマックス反転"
+climaxLookback = input.int(20, "クライマックス 参照本数", minval = 1, group = grpD)
+climaxVolumeMult = input.float(2.5, "クライマックス 出来高倍率", minval = 0.0, step = 0.1, group = grpD)
+climaxWickRatio  = input.float(0.5, "ヒゲ比率(ヒゲ/レンジ)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpD)
+climaxCloseEdgeRatio = input.float(0.35, "close端寄り比率", minval = 0.0, maxval = 1.0, step = 0.05, group = grpD)
+
+// ============================================================
+//  共通フィルター パラメータ
+// ============================================================
+grpCommon = "共通フィルター 値"
+lowVolumeMult = input.float(0.7, "出来高不足 倍率(volume<SMA×)", minval = 0.0, step = 0.05, group = grpCommon)
+bodyRatioMin  = input.float(0.3, "実体率 最小", minval = 0.0, maxval = 1.0, step = 0.05, group = grpCommon)
+
+// ============================================================
+//  表示
+// ============================================================
+grpDisp = "表示"
+showPOCZone        = input.bool(true, "POCゾーンを表示",     group = grpDisp)
+showVolumeLabels   = input.bool(true, "シグナルラベルを表示", group = grpDisp)
+showVolumeDebugTable = input.bool(true, "デバッグテーブルを表示", group = grpDisp)
+
+// ============================================================
+//  基礎計算
+// ============================================================
+float atr     = ta.atr(atrLen)
+float rng     = high - low
+float body    = math.abs(close - open)
+float upWick  = high - math.max(close, open)
+float dnWick  = math.min(close, open) - low
+float clPos   = rng > 0 ? (close - low) / rng : 0.5
+float bodyRatio = rng > 0 ? body / rng : 0.0
+
+float volumeSMA = ta.sma(volume, volumeSmaLen)
+float volumeRatio = (not na(volumeSMA) and volumeSMA > 0) ? volume / volumeSMA : na
+
+// ============================================================
+//  疑似 VPVR → POC 算出
+//   直近 vpLookback 本の高安レンジを vpBins 分割し、各足の volume を
+//   高安レンジに按分。最も出来高が多い価格帯の中心を POC とする。
+// ============================================================
+f_poc(lookback, bins) =>
+    float hi = ta.highest(high, lookback)
+    float lo = ta.lowest(low, lookback)
+    float rangeAll = hi - lo
+    float poc = close
+    if rangeAll > 0 and bins > 0 and bar_index >= lookback
+        array<float> bv = array.new_float(bins, 0.0)
+        float bs = rangeAll / bins
+        for k = 0 to lookback - 1
+            float ch = high[k]
+            float cl = low[k]
+            float cv = volume[k]
+            if not na(ch) and not na(cl) and not na(cv)
+                float crange = ch - cl
+                if crange <= 0
+                    int bidx = math.max(0, math.min(bins - 1, int((cl - lo) / bs)))
+                    array.set(bv, bidx, array.get(bv, bidx) + cv)
+                else
+                    for bi = 0 to bins - 1
+                        float binBot = lo + bi * bs
+                        float binTop = binBot + bs
+                        float ov = math.min(binTop, ch) - math.max(binBot, cl)
+                        if ov > 0
+                            array.set(bv, bi, array.get(bv, bi) + cv * ov / crange)
+        float best = -1.0
+        int   bestI = 0
+        for bi = 0 to bins - 1
+            float v = array.get(bv, bi)
+            if v > best
+                best := v
+                bestI := bi
+        poc := lo + (bestI + 0.5) * bs
+    poc
+
+float pocPrice = f_poc(vpLookback, vpBins)
+
+float pocWidth = useVolAdaptivePOCWidth ? atr * pocZoneATRMult : pocZoneWidth
+float pocUpper = pocPrice + pocWidth
+float pocLower = pocPrice - pocWidth
+bool  pocZoneActive = not na(pocPrice) and (pocUpper > pocLower)
+float pocZoneFull = pocUpper - pocLower
+
+// ============================================================
+//  共通フィルター
+// ============================================================
+// 出来高不足フィルター: volume < SMA×lowVolumeMult なら流動性NG
+bool volumeLiquidityOK = not useLowVolumeFilter or (not na(volumeSMA) and volume >= volumeSMA * lowVolumeMult)
+
+bool volSmaOK = not useVolumeSMAFilter or (not na(volumeSMA) and volume > volumeSMA)
+bool bodyOK   = not useBodyFilter or bodyRatio >= bodyRatioMin
+
+// 全シグナル共通ゲート
+bool filtersOK = useVolumeModule and volumeLiquidityOK and volSmaOK and bodyOK
+
+// ============================================================
+//  A: POC アクセプタンス
+// ============================================================
+bool cameFromBelow = ta.lowest(close, crossLookback) <= pocLower
+bool cameFromAbove = ta.highest(close, crossLookback) >= pocUpper
+
+bool accBuyConf  = (not useDirCandleForAcceptance or close > open) and (not useVolumeConfirmForAcceptance or (not na(volumeSMA) and volume > volumeSMA))
+bool accSellConf = (not useDirCandleForAcceptance or close < open) and (not useVolumeConfirmForAcceptance or (not na(volumeSMA) and volume > volumeSMA))
+
+bool accBuyCore  = pocZoneActive and cameFromBelow and ta.barssince(close <= pocUpper) >= acceptBars and accBuyConf
+bool accSellCore = pocZoneActive and cameFromAbove and ta.barssince(close >= pocLower) >= acceptBars and accSellConf
+
+bool accBuyEvt  = accBuyCore  and not accBuyCore[1]
+bool accSellEvt = accSellCore and not accSellCore[1]
+
+bool _accB = filtersOK and usePOCAcceptance and accBuyEvt
+bool _accS = filtersOK and usePOCAcceptance and accSellEvt
+bool volumeBuyAcceptanceSignal  = _accB and (not useFirstSignalOnly or not _accB[1])
+bool volumeSellAcceptanceSignal = _accS and (not useFirstSignalOnly or not _accS[1])
+bool isPOCAcceptance = volumeBuyAcceptanceSignal or volumeSellAcceptanceSignal
+int  pocAcceptanceDirection = volumeBuyAcceptanceSignal ? 1 : volumeSellAcceptanceSignal ? -1 : 0
+
+// ============================================================
+//  B: POC 反発
+// ============================================================
+// BUY: POCゾーンをサポートとして反発
+bool rbTouchBuy = low <= pocUpper
+float rbDepthBuy = (low < pocLower and pocZoneFull > 0) ? (pocLower - low) / pocZoneFull : 0.0
+bool rbConfBuy = (not usePOCReboundCandleConfirm or close > open) and (not usePOCReboundWickConfirm or dnWick >= body) and (not usePOCReboundCloseEdgeConfirm or clPos >= 0.5)
+bool rebBuyCore = pocZoneActive and rbTouchBuy and rbDepthBuy <= pocReboundDepthMax and close > pocLower and close <= pocUpper and rbConfBuy
+
+// SELL: POCゾーンをレジスタンスとして反落
+bool rbTouchSell = high >= pocLower
+float rbDepthSell = (high > pocUpper and pocZoneFull > 0) ? (high - pocUpper) / pocZoneFull : 0.0
+bool rbConfSell = (not usePOCReboundCandleConfirm or close < open) and (not usePOCReboundWickConfirm or upWick >= body) and (not usePOCReboundCloseEdgeConfirm or clPos <= 0.5)
+bool rebSellCore = pocZoneActive and rbTouchSell and rbDepthSell <= pocReboundDepthMax and close < pocUpper and close >= pocLower and rbConfSell
+
+bool _rebB = filtersOK and usePOCRebound and rebBuyCore
+bool _rebS = filtersOK and usePOCRebound and rebSellCore
+bool volumeBuyReboundSignal  = _rebB and (not useFirstSignalOnly or not _rebB[1])
+bool volumeSellReboundSignal = _rebS and (not useFirstSignalOnly or not _rebS[1])
+bool isPOCRebound = volumeBuyReboundSignal or volumeSellReboundSignal
+int  pocReboundDirection = volumeBuyReboundSignal ? 1 : volumeSellReboundSignal ? -1 : 0
+
+// ============================================================
+//  C: 出来高急増ブレイク (+ 圧縮→爆発)
+// ============================================================
+float rangeHigh = ta.highest(high, breakoutLookback)[1]
+float rangeLow  = ta.lowest(low,  breakoutLookback)[1]
+bool  volSpike  = not na(volumeSMA) and volume > volumeSMA * volumeSpikeMult
+bool  atrExpand = atr > nz(atr[breakoutLookback]) * atrExpansionMult
+bool  compressed = (ta.highest(high, compressionLookback) - ta.lowest(low, compressionLookback)) <= atr * compressionATRMult
+
+bool brkBuyCore  = not na(rangeHigh) and close > rangeHigh and volSpike and bodyRatio >= breakoutBodyRatioMin and (not useATRExpansionFilter or atrExpand) and (not useCompressionFilter or compressed[1])
+bool brkSellCore = not na(rangeLow)  and close < rangeLow  and volSpike and bodyRatio >= breakoutBodyRatioMin and (not useATRExpansionFilter or atrExpand) and (not useCompressionFilter or compressed[1])
+
+bool _brkB = filtersOK and useVolumeBreakout and brkBuyCore
+bool _brkS = filtersOK and useVolumeBreakout and brkSellCore
+bool volumeBuyBreakoutSignal  = _brkB and (not useFirstSignalOnly or not _brkB[1])
+bool volumeSellBreakoutSignal = _brkS and (not useFirstSignalOnly or not _brkS[1])
+bool isVolumeBreakout = volumeBuyBreakoutSignal or volumeSellBreakoutSignal
+int  volumeBreakoutDirection = volumeBuyBreakoutSignal ? 1 : volumeSellBreakoutSignal ? -1 : 0
+
+// ============================================================
+//  D: クライマックス出来高反転
+// ============================================================
+bool climaxVol = not na(volumeSMA) and volume > volumeSMA * climaxVolumeMult
+bool newLow  = low  <= ta.lowest(low,  climaxLookback)
+bool newHigh = high >= ta.highest(high, climaxLookback)
+
+bool climaxBuyCore  = climaxVol and rng > 0 and dnWick >= rng * climaxWickRatio and newLow  and clPos >= (1.0 - climaxCloseEdgeRatio)
+bool climaxSellCore = climaxVol and rng > 0 and upWick >= rng * climaxWickRatio and newHigh and clPos <= climaxCloseEdgeRatio
+
+bool _clmB = filtersOK and useClimaxReversal and climaxBuyCore
+bool _clmS = filtersOK and useClimaxReversal and climaxSellCore
+bool volumeBuyClimaxSignal  = _clmB and (not useFirstSignalOnly or not _clmB[1])
+bool volumeSellClimaxSignal = _clmS and (not useFirstSignalOnly or not _clmS[1])
+bool isClimaxReversal = volumeBuyClimaxSignal or volumeSellClimaxSignal
+int  climaxDirection = volumeBuyClimaxSignal ? 1 : volumeSellClimaxSignal ? -1 : 0
+
+// ============================================================
+//  シグナル優先順位 → 統合
+//   1. Climax(4) > 2. Acceptance(1) > 3. Breakout(3) > 4. Rebound(2)
+// ============================================================
+int volumeSignalType = (volumeBuyClimaxSignal or volumeSellClimaxSignal) ? 4 :
+                         (volumeBuyAcceptanceSignal or volumeSellAcceptanceSignal) ? 1 :
+                         (volumeBuyBreakoutSignal or volumeSellBreakoutSignal) ? 3 :
+                         (volumeBuyReboundSignal or volumeSellReboundSignal) ? 2 : 0
+
+int volumeDirection = volumeSignalType == 4 ? (volumeBuyClimaxSignal ? 1 : -1) :
+                       volumeSignalType == 1 ? (volumeBuyAcceptanceSignal ? 1 : -1) :
+                       volumeSignalType == 3 ? (volumeBuyBreakoutSignal ? 1 : -1) :
+                       volumeSignalType == 2 ? (volumeBuyReboundSignal ? 1 : -1) : 0
+
+bool volumeSignal = volumeSignalType != 0
+
+// 接続用
+bool allowEntryLongByVolume  = volumeSignal and volumeDirection == 1
+bool allowEntryShortByVolume = volumeSignal and volumeDirection == -1
+
+// ============================================================
+//  表示 : POC ゾーン
+// ============================================================
+plot(showPOCZone ? pocPrice : na, "POC", color = color.new(color.orange, 0), linewidth = 2)
+pPocU = plot(showPOCZone ? pocUpper : na, "POC Upper", color = color.new(color.orange, 60))
+pPocL = plot(showPOCZone ? pocLower : na, "POC Lower", color = color.new(color.orange, 60))
+fill(pPocU, pPocL, color = color.new(color.orange, 90), title = "POC Zone")
+
+var box pocBox = na
+if showPOCZone and pocZoneActive
+    if na(pocBox)
+        pocBox := box.new(bar_index - 1, pocUpper, bar_index, pocLower, border_color = color.new(color.orange, 40), bgcolor = color.new(color.orange, 85))
+    else
+        box.set_top(pocBox, pocUpper)
+        box.set_bottom(pocBox, pocLower)
+        box.set_right(pocBox, bar_index)
+        box.set_left(pocBox, math.max(0, bar_index - vpLookback))
+
+// ============================================================
+//  表示 : シグナルラベル
+// ============================================================
+f_mkLabel(isBuy, txt, col) =>
+    label.new(bar_index, isBuy ? low : high, txt, style = isBuy ? label.style_label_up : label.style_label_down, color = col, textcolor = color.white, yloc = isBuy ? yloc.belowbar : yloc.abovebar, size = size.small)
+
+if showVolumeLabels
+    if volumeBuyAcceptanceSignal
+        f_mkLabel(true,  "Accept↑", color.new(color.green, 0))
+    if volumeSellAcceptanceSignal
+        f_mkLabel(false, "Accept↓", color.new(color.red, 0))
+    if volumeBuyReboundSignal
+        f_mkLabel(true,  "Rebound↑", color.new(color.teal, 0))
+    if volumeSellReboundSignal
+        f_mkLabel(false, "Rebound↓", color.new(color.maroon, 0))
+    if volumeBuyBreakoutSignal
+        f_mkLabel(true,  "Break↑", color.new(color.lime, 0))
+    if volumeSellBreakoutSignal
+        f_mkLabel(false, "Break↓", color.new(color.fuchsia, 0))
+    if volumeBuyClimaxSignal
+        f_mkLabel(true,  "Climax↑", color.new(color.aqua, 0))
+    if volumeSellClimaxSignal
+        f_mkLabel(false, "Climax↓", color.new(color.orange, 0))
+
+// ============================================================
+//  表示 : デバッグテーブル
+// ============================================================
+var table dbg = table.new(position.top_right, 2, 6, border_width = 1)
+if showVolumeDebugTable and barstate.islast
+    string sType = volumeSignalType == 1 ? "Acceptance" : volumeSignalType == 2 ? "Rebound" : volumeSignalType == 3 ? "Breakout" : volumeSignalType == 4 ? "Climax" : "-"
+    string sDir  = volumeDirection == 1 ? "BUY" : volumeDirection == -1 ? "SELL" : "-"
+    table.cell(dbg, 0, 0, "Volume/POC", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(dbg, 1, 0, volumeSignal ? "SIGNAL" : "-", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(dbg, 0, 1, "POC",        text_color = color.white)
+    table.cell(dbg, 1, 1, na(pocPrice) ? "-" : str.tostring(pocPrice, format.mintick), text_color = color.white)
+    table.cell(dbg, 0, 2, "volRatio",   text_color = color.white)
+    table.cell(dbg, 1, 2, na(volumeRatio) ? "-" : str.tostring(volumeRatio, "#.##"), text_color = color.white)
+    table.cell(dbg, 0, 3, "liquidityOK",text_color = color.white)
+    table.cell(dbg, 1, 3, volumeLiquidityOK ? "true" : "false", text_color = volumeLiquidityOK ? color.lime : color.red)
+    table.cell(dbg, 0, 4, "signalType", text_color = color.white)
+    table.cell(dbg, 1, 4, sType,        text_color = color.white)
+    table.cell(dbg, 0, 5, "direction",  text_color = color.white)
+    table.cell(dbg, 1, 5, sDir,         text_color = color.white)
+
+// ============================================================
+//  プロット (接続用 : Data Window)
+// ============================================================
+plot(pocPrice,    "pocPrice",    display = display.data_window)
+plot(pocUpper,    "pocUpper",    display = display.data_window)
+plot(pocLower,    "pocLower",    display = display.data_window)
+plot(volumeSMA,   "volumeSMA",   display = display.data_window)
+plot(volumeRatio, "volumeRatio", display = display.data_window)
+plot(volumeLiquidityOK ? 1 : 0, "volumeLiquidityOK", display = display.data_window)
+plot(volumeSignalType, "volumeSignalType", display = display.data_window)
+plot(volumeDirection,  "volumeDirection",  display = display.data_window)
+plot(volumeSignal ? 1 : 0, "volumeSignal", display = display.data_window)
+plot(allowEntryLongByVolume  ? 1 : 0, "allowEntryLongByVolume",  display = display.data_window)
+plot(allowEntryShortByVolume ? 1 : 0, "allowEntryShortByVolume", display = display.data_window)
+
+plot(volumeBuyAcceptanceSignal  ? 1 : 0, "volumeBuyAcceptanceSignal",  display = display.data_window)
+plot(volumeSellAcceptanceSignal ? 1 : 0, "volumeSellAcceptanceSignal", display = display.data_window)
+plot(volumeBuyReboundSignal     ? 1 : 0, "volumeBuyReboundSignal",     display = display.data_window)
+plot(volumeSellReboundSignal    ? 1 : 0, "volumeSellReboundSignal",    display = display.data_window)
+plot(volumeBuyBreakoutSignal    ? 1 : 0, "volumeBuyBreakoutSignal",    display = display.data_window)
+plot(volumeSellBreakoutSignal   ? 1 : 0, "volumeSellBreakoutSignal",   display = display.data_window)
+plot(volumeBuyClimaxSignal      ? 1 : 0, "volumeBuyClimaxSignal",      display = display.data_window)
+plot(volumeSellClimaxSignal     ? 1 : 0, "volumeSellClimaxSignal",     display = display.data_window)
+
+// ============================================================
+//  シグナル形状 (チャート上)
+// ============================================================
+plotshape(volumeBuyAcceptanceSignal,  title = "BUY Accept",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0),   size = size.tiny)
+plotshape(volumeSellAcceptanceSignal, title = "SELL Accept", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),     size = size.tiny)
+plotshape(volumeBuyReboundSignal,     title = "BUY Rebound", style = shape.circle,       location = location.belowbar, color = color.new(color.teal, 0),    size = size.tiny)
+plotshape(volumeSellReboundSignal,    title = "SELL Rebound",style = shape.circle,       location = location.abovebar, color = color.new(color.maroon, 0),  size = size.tiny)
+plotshape(volumeBuyBreakoutSignal,    title = "BUY Break",   style = shape.diamond,      location = location.belowbar, color = color.new(color.lime, 0),    size = size.tiny)
+plotshape(volumeSellBreakoutSignal,   title = "SELL Break",  style = shape.diamond,      location = location.abovebar, color = color.new(color.fuchsia, 0), size = size.tiny)
+plotshape(volumeBuyClimaxSignal,      title = "BUY Climax",  style = shape.flag,         location = location.belowbar, color = color.new(color.aqua, 0),    size = size.tiny)
+plotshape(volumeSellClimaxSignal,     title = "SELL Climax", style = shape.flag,         location = location.abovebar, color = color.new(color.orange, 0),  size = size.tiny)
+
+// ============================================================
+//  アラート
+// ============================================================
+alertcondition(volumeBuyAcceptanceSignal,  "BUY POC Acceptance",  "{{ticker}} POCアクセプタンスBUY ({{close}})")
+alertcondition(volumeSellAcceptanceSignal, "SELL POC Acceptance", "{{ticker}} POCアクセプタンスSELL ({{close}})")
+alertcondition(volumeBuyReboundSignal,     "BUY POC Rebound",     "{{ticker}} POC反発BUY ({{close}})")
+alertcondition(volumeSellReboundSignal,    "SELL POC Rebound",    "{{ticker}} POC反発SELL ({{close}})")
+alertcondition(volumeBuyBreakoutSignal,    "BUY Volume Breakout", "{{ticker}} 出来高ブレイクBUY ({{close}})")
+alertcondition(volumeSellBreakoutSignal,   "SELL Volume Breakout","{{ticker}} 出来高ブレイクSELL ({{close}})")
+alertcondition(volumeBuyClimaxSignal,      "BUY Climax",          "{{ticker}} クライマックスBUY ({{close}})")
+alertcondition(volumeSellClimaxSignal,     "SELL Climax",         "{{ticker}} クライマックスSELL ({{close}})")
+alertcondition(allowEntryLongByVolume,     "Allow Long (Volume)", "{{ticker}} 出来高ロング許可 ({{close}})")
+alertcondition(allowEntryShortByVolume,    "Allow Short (Volume)","{{ticker}} 出来高ショート許可 ({{close}})")
