@@ -1,0 +1,343 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © your_username
+//
+// ============================================================
+//  DXY・金利 逆相関 単体モジュール (Indicator版)
+// ============================================================
+//  ・Gold と DXY / 米金利の逆相関を検知。
+//    通常の逆相関 / 相関の歪み / 逆相関復帰 / 方向不一致 をモジュール化。
+//  ・3段構成: ①DXY単体 ②金利単体 ③DXY+金利 合流
+//  ・後で 環境認識 / フィボ / FVG / 出来高 / EMA / 水平線 と AND 接続。
+//  ・strategy ではなく indicator。シグナル出力のみ。
+//  ・request.security は lookahead_off。ADX は使わない。
+// ============================================================
+
+//@version=5
+indicator(
+     title          = "Macro DXY/Yield Inverse",
+     shorttitle     = "MACRO",
+     overlay        = true,
+     max_bars_back  = 1000
+ )
+
+// ============================================================
+//  シンボル設定
+// ============================================================
+grpSym = "シンボル"
+goldSymbol  = input.symbol("TVC:GOLD",  "Gold",  group = grpSym)
+dxySymbol   = input.symbol("TVC:DXY",   "DXY",   group = grpSym)
+yieldSymbol = input.symbol("TVC:US10Y", "Yield (US10Y/US02Y)", group = grpSym)
+
+// ============================================================
+//  時間足 / 期間
+// ============================================================
+grpTF = "時間足 / 期間"
+macroTF        = input.timeframe("60", "マクロ時間足", group = grpTF)
+corrLen        = input.int(20, "相関計算期間",     minval = 2, group = grpTF)
+dirLookback    = input.int(10, "方向判定期間",     minval = 1, group = grpTF)
+recentLookback = input.int(3,  "直近方向確認期間", minval = 1, group = grpTF)
+
+// ============================================================
+//  ON/OFF
+// ============================================================
+grpSw = "ON/OFF"
+useMacroModule     = input.bool(true,  "マクロモジュール全体", group = grpSw)
+useDXYModule       = input.bool(true,  "DXYモジュール",        group = grpSw)
+useYieldModule     = input.bool(true,  "金利モジュール",       group = grpSw)
+useConfluenceModule= input.bool(true,  "合流モジュール",       group = grpSw)
+useDistortionFilter= input.bool(true,  "歪みフィルター",       group = grpSw)
+useReturnSignal    = input.bool(true,  "逆相関復帰シグナル",   group = grpSw)
+useLeadSignal      = input.bool(true,  "先行シグナル",         group = grpSw)
+useConflictFilter  = input.bool(true,  "方向不一致フィルター", group = grpSw)
+
+// ============================================================
+//  しきい値
+// ============================================================
+grpTh = "しきい値"
+inverseThreshold    = input.float(-0.3, "逆相関 しきい値 (corr<=)", minval = -1.0, maxval = 1.0, step = 0.05, group = grpTh)
+distortionThreshold = input.float(0.2,  "歪み しきい値 (corr>=)",   minval = -1.0, maxval = 1.0, step = 0.05, group = grpTh)
+corrWeakThreshold   = input.float(0.2,  "相関 弱すぎ しきい値 |corr|<", minval = 0.0, maxval = 1.0, step = 0.05, group = grpTh)
+
+// ============================================================
+//  先行シグナル しきい値 (% 変化)
+// ============================================================
+grpLead = "先行シグナル"
+dxyLeadMoveThreshold   = input.float(0.3, "DXY 先行 変化率(%)",  minval = 0.0, step = 0.05, group = grpLead)
+yieldLeadMoveThreshold = input.float(1.0, "金利 先行 変化率(%)", minval = 0.0, step = 0.05, group = grpLead)
+goldLagThreshold       = input.float(0.1, "Gold 未反応 変化率(%)", minval = 0.0, step = 0.05, group = grpLead)
+
+// ============================================================
+//  ボラフィルター
+// ============================================================
+grpVol = "ボラフィルター"
+useMacroVolFilter = input.bool(false, "ボラフィルターを使う", group = grpVol)
+atrLen          = input.int(14,  "Gold ATR期間",       minval = 1, group = grpVol)
+atrRankLookback = input.int(100, "ATR percentile 期間", minval = 1, group = grpVol)
+atrRankMin      = input.float(30, "ATR rank 最小(%)",   minval = 0.0, maxval = 100.0, step = 5, group = grpVol)
+
+// ============================================================
+//  表示
+// ============================================================
+grpDisp = "表示"
+showMacroBg         = input.bool(true, "歪み中 背景色",       group = grpDisp)
+showMacroLabels     = input.bool(true, "シグナルラベル",      group = grpDisp)
+showMacroDebugTable = input.bool(true, "デバッグテーブル",    group = grpDisp)
+
+// ============================================================
+//  データ取得 (request.security / lookahead_off)
+// ============================================================
+float goldC  = request.security(goldSymbol,  macroTF, close, lookahead = barmerge.lookahead_off)
+float dxyC   = request.security(dxySymbol,   macroTF, close, lookahead = barmerge.lookahead_off)
+float yieldC = request.security(yieldSymbol, macroTF, close, lookahead = barmerge.lookahead_off)
+float goldATR = request.security(goldSymbol, macroTF, ta.atr(atrLen), lookahead = barmerge.lookahead_off)
+
+// ============================================================
+//  共通計算
+// ============================================================
+f_chg(src, len) =>
+    (na(src[len]) or src[len] == 0) ? 0.0 : (src - src[len]) / src[len] * 100.0
+
+float dxyCorrelation   = ta.correlation(goldC, dxyC,   corrLen)
+float yieldCorrelation = ta.correlation(goldC, yieldC, corrLen)
+
+float dxyChange         = f_chg(dxyC, dirLookback)
+float goldChange        = f_chg(goldC, dirLookback)
+float yieldChange       = f_chg(yieldC, dirLookback)
+float dxyRecentChange   = f_chg(dxyC, recentLookback)
+float goldRecentChange  = f_chg(goldC, recentLookback)
+float yieldRecentChange = f_chg(yieldC, recentLookback)
+
+// 方向 (主)
+bool dxyUp   = dxyChange > 0
+bool dxyDown = dxyChange < 0
+bool yldUp   = yieldChange > 0
+bool yldDown = yieldChange < 0
+bool goldUp  = goldChange > 0
+bool goldDown= goldChange < 0
+// 方向 (直近)
+bool dxyRUp   = dxyRecentChange > 0
+bool dxyRDown = dxyRecentChange < 0
+bool yldRUp   = yieldRecentChange > 0
+bool yldRDown = yieldRecentChange < 0
+bool goldRUp  = goldRecentChange > 0
+bool goldRDown= goldRecentChange < 0
+
+bool dxyActive   = useMacroModule and useDXYModule
+bool yieldActive = useMacroModule and useYieldModule
+
+// ============================================================
+//  ① DXY 単体モジュール
+// ============================================================
+// 逆相関正常 / 歪み (方向ベース)
+bool dxyInverseOK_raw  = (dxyUp and goldDown) or (dxyDown and goldUp)
+bool dxyDistortion_raw = (dxyUp and goldUp)   or (dxyDown and goldDown)
+// 直近の逆相関
+bool dxyRecentInverse  = (dxyRUp and goldRDown) or (dxyRDown and goldRUp)
+// 逆相関復帰: 直前まで歪み → 現在 逆相関正常
+bool dxyReturnRaw = dxyRecentInverse and ta.barssince(dxyDistortion_raw) <= recentLookback
+bool dxyReturnSignal_raw = useReturnSignal and dxyReturnRaw and not dxyReturnRaw[1]
+int  dxyReturnDirection_raw = (dxyRDown and goldRUp) ? 1 : (dxyRUp and goldRDown) ? -1 : 0
+// Goldバイアス (DXY下落=ロング / 上昇=ショート)
+bool dxyGoldLongBias_raw  = dxyDown
+bool dxyGoldShortBias_raw = dxyUp
+
+// ON/OFF マスク
+bool dxyInverseOK     = dxyActive and dxyInverseOK_raw
+bool dxyDistortion    = dxyActive and dxyDistortion_raw
+bool dxyReturnSignal  = dxyActive and dxyReturnSignal_raw
+int  dxyReturnDirection = dxyActive ? dxyReturnDirection_raw : 0
+bool dxyGoldLongBias  = dxyActive and dxyGoldLongBias_raw
+bool dxyGoldShortBias = dxyActive and dxyGoldShortBias_raw
+int  dxyGoldDir = dxyGoldLongBias ? 1 : dxyGoldShortBias ? -1 : 0
+
+// ============================================================
+//  ② 金利 単体モジュール
+// ============================================================
+bool yieldInverseOK_raw  = (yldUp and goldDown) or (yldDown and goldUp)
+bool yieldDistortion_raw = (yldUp and goldUp)   or (yldDown and goldDown)
+bool yieldRecentInverse  = (yldRUp and goldRDown) or (yldRDown and goldRUp)
+bool yieldReturnRaw = yieldRecentInverse and ta.barssince(yieldDistortion_raw) <= recentLookback
+bool yieldReturnSignal_raw = useReturnSignal and yieldReturnRaw and not yieldReturnRaw[1]
+int  yieldReturnDirection_raw = (yldRDown and goldRUp) ? 1 : (yldRUp and goldRDown) ? -1 : 0
+bool yieldGoldLongBias_raw  = yldDown
+bool yieldGoldShortBias_raw = yldUp
+
+bool yieldInverseOK     = yieldActive and yieldInverseOK_raw
+bool yieldDistortion    = yieldActive and yieldDistortion_raw
+bool yieldReturnSignal  = yieldActive and yieldReturnSignal_raw
+int  yieldReturnDirection = yieldActive ? yieldReturnDirection_raw : 0
+bool yieldGoldLongBias  = yieldActive and yieldGoldLongBias_raw
+bool yieldGoldShortBias = yieldActive and yieldGoldShortBias_raw
+int  yieldGoldDir = yieldGoldLongBias ? 1 : yieldGoldShortBias ? -1 : 0
+
+// ============================================================
+//  ボラフィルター (Gold ATR percentile)
+// ============================================================
+float goldAtrRank = ta.percentrank(goldATR, atrRankLookback)
+bool  macroVolOK  = not useMacroVolFilter or (not na(goldAtrRank) and goldAtrRank >= atrRankMin)
+
+// ============================================================
+//  ③ 合流モジュール
+// ============================================================
+bool confActive = useMacroModule and useConfluenceModule
+
+// 方向一致 / 不一致
+bool sameDir = dxyGoldDir != 0 and dxyGoldDir == yieldGoldDir
+bool conflict = dxyGoldDir != 0 and yieldGoldDir != 0 and dxyGoldDir != yieldGoldDir
+bool macroConflict = confActive and useConflictFilter and conflict
+
+// 同時復帰
+bool bothReturn = dxyReturnSignal and yieldReturnSignal and dxyReturnDirection != 0 and dxyReturnDirection == yieldReturnDirection
+
+// ランク (0=なし/1=DXYのみ/2=金利のみ/3=同方向合流/4=同時復帰)
+int macroRank = not confActive ? 0 :
+                 bothReturn ? 4 :
+                 sameDir ? 3 :
+                 yieldReturnSignal ? 2 :
+                 dxyReturnSignal ? 1 : 0
+
+// 方向
+int macroDirection = not confActive ? 0 :
+                      bothReturn ? dxyReturnDirection :
+                      sameDir ? dxyGoldDir :
+                      yieldReturnSignal ? yieldReturnDirection :
+                      dxyReturnSignal ? dxyReturnDirection : 0
+
+// ============================================================
+//  先行シグナル (Lead)
+// ============================================================
+bool goldLag = math.abs(goldChange) <= goldLagThreshold
+bool dxyLeadMove   = math.abs(dxyChange)   >= dxyLeadMoveThreshold
+bool yieldLeadMove = math.abs(yieldChange) >= yieldLeadMoveThreshold
+
+bool macroLeadShort = useLeadSignal and confActive and goldLag and ((dxyActive and dxyUp and dxyLeadMove) or (yieldActive and yldUp and yieldLeadMove))
+bool macroLeadLong  = useLeadSignal and confActive and goldLag and ((dxyActive and dxyDown and dxyLeadMove) or (yieldActive and yldDown and yieldLeadMove))
+
+// ============================================================
+//  No Trade フィルター
+// ============================================================
+bool weakCorr = math.abs(dxyCorrelation) < corrWeakThreshold and math.abs(yieldCorrelation) < corrWeakThreshold
+bool distortionNow = (dxyActive and dxyDistortion) or (yieldActive and yieldDistortion)
+bool macroNoTrade = macroConflict or (useDistortionFilter and distortionNow) or weakCorr or (not macroVolOK)
+
+// ============================================================
+//  Signal Type (0=None/1=Inverse/2=Distortion/3=Return/4=Lead/5=Conflict)
+// ============================================================
+int macroSignalType = not useMacroModule ? 0 :
+                       macroConflict ? 5 :
+                       (dxyReturnSignal or yieldReturnSignal) ? 3 :
+                       (macroLeadLong or macroLeadShort) ? 4 :
+                       distortionNow ? 2 :
+                       (dxyInverseOK or yieldInverseOK) ? 1 : 0
+
+bool macroSignal = confActive and macroRank > 0 and macroDirection != 0
+
+// 接続用
+bool allowLongByMacro  = macroSignal and macroDirection == 1  and not macroNoTrade
+bool allowShortByMacro = macroSignal and macroDirection == -1 and not macroNoTrade
+
+// ============================================================
+//  表示 : 背景色 (歪み中)
+// ============================================================
+bgcolor(showMacroBg and distortionNow ? color.new(color.orange, 90) : na, title = "Distortion BG")
+bgcolor(showMacroBg and macroConflict ? color.new(color.red, 92) : na, title = "Conflict BG")
+
+// ============================================================
+//  表示 : ラベル
+// ============================================================
+f_mkLabel(isBuy, txt, col) =>
+    label.new(bar_index, isBuy ? low : high, txt, style = isBuy ? label.style_label_up : label.style_label_down, color = col, textcolor = color.white, yloc = isBuy ? yloc.belowbar : yloc.abovebar, size = size.small)
+
+if showMacroLabels
+    if dxyReturnSignal and dxyReturnDirection == 1
+        f_mkLabel(true,  "DXY Return BUY", color.new(color.green, 0))
+    if dxyReturnSignal and dxyReturnDirection == -1
+        f_mkLabel(false, "DXY Return SELL", color.new(color.red, 0))
+    if yieldReturnSignal and yieldReturnDirection == 1
+        f_mkLabel(true,  "Yield Return BUY", color.new(color.teal, 0))
+    if yieldReturnSignal and yieldReturnDirection == -1
+        f_mkLabel(false, "Yield Return SELL", color.new(color.maroon, 0))
+    if macroLeadLong
+        f_mkLabel(true,  "Lead↑ prep", color.new(color.aqua, 0))
+    if macroLeadShort
+        f_mkLabel(false, "Lead↓ prep", color.new(color.fuchsia, 0))
+    if macroConflict
+        f_mkLabel(false, "⚠ Conflict", color.new(color.gray, 0))
+
+// ============================================================
+//  表示 : デバッグテーブル
+// ============================================================
+f_dxyState() =>
+    dxyDistortion ? "Distort" : dxyInverseOK ? "Inverse" : "-"
+f_yieldState() =>
+    yieldDistortion ? "Distort" : yieldInverseOK ? "Inverse" : "-"
+f_typeStr(t) =>
+    t == 1 ? "Inverse" : t == 2 ? "Distortion" : t == 3 ? "Return" : t == 4 ? "Lead" : t == 5 ? "Conflict" : "-"
+
+var table dbg = table.new(position.top_right, 2, 8, border_width = 1)
+if showMacroDebugTable and barstate.islast
+    string sDir = macroDirection == 1 ? "BUY" : macroDirection == -1 ? "SELL" : "-"
+    table.cell(dbg, 0, 0, "Macro", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(dbg, 1, 0, macroSignal ? "SIGNAL" : (macroNoTrade ? "NoTrade" : "-"), text_color = color.white, bgcolor = macroNoTrade ? color.new(color.red, 30) : color.new(color.blue, 0))
+    table.cell(dbg, 0, 1, "DXY corr", text_color = color.white)
+    table.cell(dbg, 1, 1, na(dxyCorrelation) ? "-" : str.tostring(dxyCorrelation, "#.##"), text_color = color.white)
+    table.cell(dbg, 0, 2, "Yield corr", text_color = color.white)
+    table.cell(dbg, 1, 2, na(yieldCorrelation) ? "-" : str.tostring(yieldCorrelation, "#.##"), text_color = color.white)
+    table.cell(dbg, 0, 3, "DXY state", text_color = color.white)
+    table.cell(dbg, 1, 3, f_dxyState(), text_color = color.white)
+    table.cell(dbg, 0, 4, "Yield state", text_color = color.white)
+    table.cell(dbg, 1, 4, f_yieldState(), text_color = color.white)
+    table.cell(dbg, 0, 5, "Macro type", text_color = color.white)
+    table.cell(dbg, 1, 5, f_typeStr(macroSignalType), text_color = color.white)
+    table.cell(dbg, 0, 6, "Direction", text_color = color.white)
+    table.cell(dbg, 1, 6, sDir, text_color = color.white)
+    table.cell(dbg, 0, 7, "Rank / NoTrade", text_color = color.white)
+    table.cell(dbg, 1, 7, str.tostring(macroRank) + " / " + (macroNoTrade ? "Y" : "N"), text_color = color.white)
+
+// ============================================================
+//  プロット (接続用 : Data Window)
+// ============================================================
+plot(dxyCorrelation,   "dxyCorrelation",   display = display.data_window)
+plot(yieldCorrelation, "yieldCorrelation", display = display.data_window)
+plot(dxyInverseOK   ? 1 : 0, "dxyInverseOK",   display = display.data_window)
+plot(yieldInverseOK ? 1 : 0, "yieldInverseOK", display = display.data_window)
+plot(dxyDistortion   ? 1 : 0, "dxyDistortion",   display = display.data_window)
+plot(yieldDistortion ? 1 : 0, "yieldDistortion", display = display.data_window)
+plot(dxyReturnSignal   ? 1 : 0, "dxyReturnSignal",   display = display.data_window)
+plot(yieldReturnSignal ? 1 : 0, "yieldReturnSignal", display = display.data_window)
+plot(dxyReturnDirection,   "dxyReturnDirection",   display = display.data_window)
+plot(yieldReturnDirection, "yieldReturnDirection", display = display.data_window)
+plot(macroDirection,  "macroDirection",  display = display.data_window)
+plot(macroSignal ? 1 : 0, "macroSignal", display = display.data_window)
+plot(macroSignalType, "macroSignalType", display = display.data_window)
+plot(macroRank,       "macroRank",       display = display.data_window)
+plot(macroNoTrade ? 1 : 0, "macroNoTrade", display = display.data_window)
+plot(macroVolOK   ? 1 : 0, "macroVolOK",   display = display.data_window)
+plot(allowLongByMacro  ? 1 : 0, "allowLongByMacro",  display = display.data_window)
+plot(allowShortByMacro ? 1 : 0, "allowShortByMacro", display = display.data_window)
+plot(macroLeadLong  ? 1 : 0, "macroLeadLong",  display = display.data_window)
+plot(macroLeadShort ? 1 : 0, "macroLeadShort", display = display.data_window)
+plot(macroConflict  ? 1 : 0, "macroConflict",  display = display.data_window)
+plot(dxyChange,         "dxyChange",         display = display.data_window)
+plot(dxyRecentChange,   "dxyRecentChange",   display = display.data_window)
+plot(yieldChange,       "yieldChange",       display = display.data_window)
+plot(yieldRecentChange, "yieldRecentChange", display = display.data_window)
+
+// ============================================================
+//  シグナル形状
+// ============================================================
+plotshape(allowLongByMacro,  title = "Allow Long",  style = shape.triangleup,   location = location.bottom, color = color.new(color.green, 0), size = size.tiny)
+plotshape(allowShortByMacro, title = "Allow Short", style = shape.triangledown, location = location.top,    color = color.new(color.red, 0),   size = size.tiny)
+
+// ============================================================
+//  アラート
+// ============================================================
+alertcondition(dxyReturnSignal,   "DXY Return",   "{{ticker}} DXY 逆相関復帰")
+alertcondition(yieldReturnSignal, "Yield Return", "{{ticker}} 金利 逆相関復帰")
+alertcondition(macroSignal,       "Macro Signal", "{{ticker}} マクロ シグナル")
+alertcondition(allowLongByMacro,  "Allow Long Macro",  "{{ticker}} マクロ ロング許可")
+alertcondition(allowShortByMacro, "Allow Short Macro", "{{ticker}} マクロ ショート許可")
+alertcondition(macroNoTrade,      "Macro NoTrade", "{{ticker}} マクロ ノートレード")
+alertcondition(macroLeadLong,     "Macro Lead Long",  "{{ticker}} マクロ 先行ロング準備")
+alertcondition(macroLeadShort,    "Macro Lead Short", "{{ticker}} マクロ 先行ショート準備")
+alertcondition(macroConflict,     "Macro Conflict", "{{ticker}} マクロ 方向不一致")
