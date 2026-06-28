@@ -1,0 +1,520 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © your_username
+//
+// ============================================================
+//  Trendline / Channel 単体モジュール (Indicator版)
+// ============================================================
+//  ・Pivotベースでトレンドライン/チャネルを自動検知。
+//  ・後で EMA / Cloud / BB / Pivot / FVG / Fib / RSI / MACD /
+//    出来高 / レジサポ と AND 接続する前提。
+//  ・strategy ではなく indicator。シグナル出力のみ。
+//  ・strategy.entry/exit/closedtrades/opentrades は使わない。
+//  ・Pivotは確定後に使用 (未来参照なし)。再描画前提にしない。
+//  役割: 反発/ブレイク/リテスト/フェイク + チャネル各種 + 品質/Rank
+// ============================================================
+
+//@version=5
+indicator(
+     title          = "Trendline Channel Module",
+     shorttitle     = "TL-CH",
+     overlay        = true,
+     max_bars_back  = 1000,
+     max_lines_count = 500,
+     max_labels_count = 500
+ )
+
+// ============================================================
+//  入力 (グループ: Trendline Channel Module)
+// ============================================================
+grpTL = "Trendline Channel Module"
+
+useTrendlineModule  = input.bool(true, "Trendlineモジュールを使う", group = grpTL)
+showTrendlines      = input.bool(true, "Trendlineを表示",  group = grpTL)
+showChannelLines    = input.bool(true, "Channelを表示",    group = grpTL)
+showTrendLabels     = input.bool(true, "シグナルラベルを表示", group = grpTL)
+showTrendDebugTable = input.bool(true, "デバッグテーブルを表示", group = grpTL)
+
+pivotLen          = input.int(5, "Pivot Length", minval = 1, group = grpTL)
+useATRSwingFilter = input.bool(true, "ATR Swing Filterを使う", group = grpTL)
+minSwingATR       = input.float(0.8, "最低Swing幅 ATR倍率", step = 0.1, group = grpTL)
+
+trendTouchMode   = input.string("ATR", "接近判定", options = ["Dollar", "ATR"], group = grpTL)
+trendTouchDollar = input.float(3.0,  "接近幅($)",      step = 0.1,  group = grpTL)
+trendTouchATR    = input.float(0.25, "接近幅 ATR倍率", step = 0.05, group = grpTL)
+
+useTrendBounce    = input.bool(true, "A: Trendline反発",   group = grpTL)
+useTrendBreak     = input.bool(true, "B: Trendlineブレイク", group = grpTL)
+useTrendRetest    = input.bool(true, "C: Trendlineリテスト", group = grpTL)
+useTrendFakeBreak = input.bool(true, "D: Fake Break",       group = grpTL)
+
+useChannel             = input.bool(true, "E: Channelを使う",     group = grpTL)
+useChannelBounce       = input.bool(true, "F: Channel反発",       group = grpTL)
+useChannelBreak        = input.bool(true, "G: Channelブレイク",   group = grpTL)
+useChannelRetest       = input.bool(true, "H: Channelリテスト",   group = grpTL)
+useChannelPositionBias = input.bool(true, "I: Channel内位置Bias", group = grpTL)
+
+useTrendQualityFilter = input.bool(true, "J: Line Quality Filter", group = grpTL)
+minTrendlineQuality   = input.int(50, "最低Line Quality", minval = 0, maxval = 100, group = grpTL)
+useTrendNoTradeWeakLine = input.bool(false, "弱いラインはNoTrade", group = grpTL)
+
+trendRetestBars   = input.int(10, "Trendlineリテスト有効本数", minval = 1, group = grpTL)
+channelRetestBars = input.int(10, "Channelリテスト有効本数",   minval = 1, group = grpTL)
+
+maxLineAgeBars = input.int(300, "ライン有効期限 Bars", minval = 20, group = grpTL)
+minLineTouches = input.int(2, "最低Touch数", minval = 2, group = grpTL)
+minSlopeATR    = input.float(0.03, "最低Slope ATR倍率", step = 0.01, group = grpTL)
+maxSlopeATR    = input.float(1.5,  "最大Slope ATR倍率", step = 0.1,  group = grpTL)
+
+showOnlyBestLines = input.bool(true, "最良ラインのみ表示", group = grpTL)
+trendEntryMode    = input.string("Any", "エントリー結合", options = ["Any", "All"], group = grpTL)
+
+// ============================================================
+//  基礎
+// ============================================================
+float atr = ta.atr(14)
+float trendTouchRange = trendTouchMode == "ATR" ? atr * trendTouchATR : trendTouchDollar
+bool tAct = useTrendlineModule
+
+f_near(price, level, rng) =>
+    not na(level) and math.abs(price - level) <= rng
+
+f_lineValue(x1, y1, x2, y2, xNow) =>
+    float slope = (y2 - y1) / math.max(x2 - x1, 1)
+    y1 + slope * (xNow - x1)
+
+// 反転ローソク
+float tl_body   = math.abs(close - open)
+float tl_upWick = high - math.max(open, close)
+float tl_dnWick = math.min(open, close) - low
+bool tl_bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bool tl_bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+bool tl_pinLower = tl_dnWick >= tl_body and tl_dnWick >= tl_upWick
+bool tl_pinUpper = tl_upWick >= tl_body and tl_upWick >= tl_dnWick
+bool bullishReversal = tl_bullEngulf or tl_pinLower or close > open
+bool bearishReversal = tl_bearEngulf or tl_pinUpper or close < open
+
+// ============================================================
+//  Pivot検知 (確定Pivot / ATR Swing Filter)
+// ============================================================
+float ph = ta.pivothigh(high, pivotLen, pivotLen)
+float pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float highPivot1Price = na
+var int   highPivot1Bar   = na
+var float highPivot2Price = na
+var int   highPivot2Bar   = na
+var float lowPivot1Price = na
+var int   lowPivot1Bar   = na
+var float lowPivot2Price = na
+var int   lowPivot2Bar   = na
+
+bool newHighPivot = false
+bool newLowPivot  = false
+if not na(ph)
+    if na(highPivot1Price) or not useATRSwingFilter or math.abs(ph - highPivot1Price) >= atr * minSwingATR
+        highPivot2Price := highPivot1Price
+        highPivot2Bar   := highPivot1Bar
+        highPivot1Price := ph
+        highPivot1Bar   := bar_index - pivotLen
+        newHighPivot := true
+if not na(pl)
+    if na(lowPivot1Price) or not useATRSwingFilter or math.abs(pl - lowPivot1Price) >= atr * minSwingATR
+        lowPivot2Price := lowPivot1Price
+        lowPivot2Bar   := lowPivot1Bar
+        lowPivot1Price := pl
+        lowPivot1Bar   := bar_index - pivotLen
+        newLowPivot := true
+
+// ============================================================
+//  Trendline計算 (上昇=安値2点 / 下降=高値2点)
+// ============================================================
+bool upValid   = not na(lowPivot1Price) and not na(lowPivot2Price) and lowPivot1Bar != lowPivot2Bar
+bool downValid = not na(highPivot1Price) and not na(highPivot2Price) and highPivot1Bar != highPivot2Bar
+float upTrendlineValue   = upValid   ? f_lineValue(lowPivot2Bar, lowPivot2Price, lowPivot1Bar, lowPivot1Price, bar_index) : na
+float downTrendlineValue = downValid ? f_lineValue(highPivot2Bar, highPivot2Price, highPivot1Bar, highPivot1Price, bar_index) : na
+
+// ============================================================
+//  Channel計算 (平行offset)
+// ============================================================
+float upTLatHP = (upValid and not na(highPivot1Bar)) ? f_lineValue(lowPivot2Bar, lowPivot2Price, lowPivot1Bar, lowPivot1Price, highPivot1Bar) : na
+float upOffset = (not na(upTLatHP) and not na(highPivot1Price)) ? math.abs(highPivot1Price - upTLatHP) : na
+float upChannelLower = upTrendlineValue
+float upChannelUpper = (not na(upTrendlineValue) and not na(upOffset)) ? upTrendlineValue + upOffset : na
+float downTLatLP = (downValid and not na(lowPivot1Bar)) ? f_lineValue(highPivot2Bar, highPivot2Price, highPivot1Bar, highPivot1Price, lowPivot1Bar) : na
+float downOffset = (not na(downTLatLP) and not na(lowPivot1Price)) ? math.abs(lowPivot1Price - downTLatLP) : na
+float downChannelUpper = downTrendlineValue
+float downChannelLower = (not na(downTrendlineValue) and not na(downOffset)) ? downTrendlineValue - downOffset : na
+float upChannelWidth   = (not na(upChannelUpper) and not na(upChannelLower)) ? upChannelUpper - upChannelLower : na
+float downChannelWidth = (not na(downChannelUpper) and not na(downChannelLower)) ? downChannelUpper - downChannelLower : na
+
+// ============================================================
+//  接近判定
+// ============================================================
+bool nearUpTrendline   = f_near(low,  upTrendlineValue, trendTouchRange)
+bool nearDownTrendline = f_near(high, downTrendlineValue, trendTouchRange)
+bool nearUpChannelLower = f_near(low,  upChannelLower, trendTouchRange)
+bool nearUpChannelUpper = f_near(high, upChannelUpper, trendTouchRange)
+bool nearDownChannelUpper = f_near(high, downChannelUpper, trendTouchRange)
+bool nearDownChannelLower = f_near(low,  downChannelLower, trendTouchRange)
+
+// ============================================================
+//  Touch / Broken カウント (ライン更新でリセット)
+// ============================================================
+var int upTouchCount = 0
+var int upBrokenCount = 0
+var int downTouchCount = 0
+var int downBrokenCount = 0
+if newLowPivot
+    upTouchCount := 0
+    upBrokenCount := 0
+if newHighPivot
+    downTouchCount := 0
+    downBrokenCount := 0
+if nearUpTrendline and not nearUpTrendline[1]
+    upTouchCount := upTouchCount + 1
+if not na(upTrendlineValue) and not na(upTrendlineValue[1]) and close < upTrendlineValue and close[1] >= upTrendlineValue[1]
+    upBrokenCount := upBrokenCount + 1
+if nearDownTrendline and not nearDownTrendline[1]
+    downTouchCount := downTouchCount + 1
+if not na(downTrendlineValue) and not na(downTrendlineValue[1]) and close > downTrendlineValue and close[1] <= downTrendlineValue[1]
+    downBrokenCount := downBrokenCount + 1
+
+// ============================================================
+//  Line Quality 評価 (0-100)
+// ============================================================
+f_qualityScore(touch, ageBars, slopeAbsATR, broken) =>
+    int touchScore = touch >= 4 ? 40 : touch == 3 ? 30 : touch >= 2 ? 20 : 0
+    int ageScore = (ageBars >= 20 and ageBars <= 150) ? 20 : (ageBars >= 151 and ageBars <= 300) ? 10 : 0
+    int slopeScore = na(slopeAbsATR) ? 0 : (slopeAbsATR < minSlopeATR ? 5 : slopeAbsATR > maxSlopeATR ? 5 : 20)
+    int brokenScore = broken == 0 ? 20 : broken == 1 ? 10 : 0
+    math.min(100, touchScore + ageScore + slopeScore + brokenScore)
+
+int upAge   = upValid   ? bar_index - lowPivot2Bar  : na
+int downAge = downValid ? bar_index - highPivot2Bar : na
+float upSlopeAbsATR   = (upValid   and atr != 0) ? math.abs((lowPivot1Price - lowPivot2Price)   / math.max(lowPivot1Bar - lowPivot2Bar, 1))   / atr : na
+float downSlopeAbsATR = (downValid and atr != 0) ? math.abs((highPivot1Price - highPivot2Price) / math.max(highPivot1Bar - highPivot2Bar, 1)) / atr : na
+int upTrendlineQuality   = upValid   ? f_qualityScore(upTouchCount, upAge, upSlopeAbsATR, upBrokenCount) : 0
+int downTrendlineQuality = downValid ? f_qualityScore(downTouchCount, downAge, downSlopeAbsATR, downBrokenCount) : 0
+int trendlineQuality = math.max(upTrendlineQuality, downTrendlineQuality)
+bool trendQualityOk = not (tAct and useTrendQualityFilter) or trendlineQuality >= minTrendlineQuality
+bool tl_highQuality = trendlineQuality >= 80
+
+// ============================================================
+//  A: Trendline反発
+// ============================================================
+bool trendBuyBounceSignal  = tAct and useTrendBounce and nearUpTrendline   and bullishReversal and close > upTrendlineValue   and trendQualityOk
+bool trendSellBounceSignal = tAct and useTrendBounce and nearDownTrendline and bearishReversal and close < downTrendlineValue and trendQualityOk
+
+// ============================================================
+//  B: Trendlineブレイク (終値)
+// ============================================================
+bool trendBuyBreakSignal  = tAct and useTrendBreak and not na(downTrendlineValue) and not na(downTrendlineValue[1]) and close > downTrendlineValue and close[1] <= downTrendlineValue[1]
+bool trendSellBreakSignal = tAct and useTrendBreak and not na(upTrendlineValue) and not na(upTrendlineValue[1]) and close < upTrendlineValue and close[1] >= upTrendlineValue[1]
+
+// ============================================================
+//  C: Trendlineリテスト
+// ============================================================
+var int trendBreakUpBar   = na
+var int trendBreakDownBar = na
+if trendBuyBreakSignal
+    trendBreakUpBar := bar_index
+if trendSellBreakSignal
+    trendBreakDownBar := bar_index
+bool trendBuyRetestSignal  = tAct and useTrendRetest and not na(trendBreakUpBar)   and (bar_index - trendBreakUpBar)   <= trendRetestBars and not na(downTrendlineValue) and f_near(low, downTrendlineValue, trendTouchRange) and close > downTrendlineValue and bullishReversal
+bool trendSellRetestSignal = tAct and useTrendRetest and not na(trendBreakDownBar) and (bar_index - trendBreakDownBar) <= trendRetestBars and not na(upTrendlineValue)   and f_near(high, upTrendlineValue, trendTouchRange) and close < upTrendlineValue and bearishReversal
+
+// ============================================================
+//  D: Fake Break (流動性狩り)
+// ============================================================
+bool trendBuyFakeBreakSignal  = tAct and useTrendFakeBreak and not na(upTrendlineValue)   and low  < upTrendlineValue   and close > upTrendlineValue   and bullishReversal
+bool trendSellFakeBreakSignal = tAct and useTrendFakeBreak and not na(downTrendlineValue) and high > downTrendlineValue and close < downTrendlineValue and bearishReversal
+
+// ============================================================
+//  F: Channel反発
+// ============================================================
+bool channelBuyBounceSignal  = tAct and useChannel and useChannelBounce and (nearUpChannelLower or nearDownChannelLower) and bullishReversal
+bool channelSellBounceSignal = tAct and useChannel and useChannelBounce and (nearUpChannelUpper or nearDownChannelUpper) and bearishReversal
+
+// ============================================================
+//  G: Channelブレイク
+// ============================================================
+bool channelBuyBreakSignal  = tAct and useChannel and useChannelBreak and ((not na(upChannelUpper) and close > upChannelUpper) or (not na(downChannelUpper) and close > downChannelUpper))
+bool channelSellBreakSignal = tAct and useChannel and useChannelBreak and ((not na(upChannelLower) and close < upChannelLower) or (not na(downChannelLower) and close < downChannelLower))
+
+// ============================================================
+//  H: Channelリテスト
+// ============================================================
+var int chBreakUpBar = na
+var int chBreakDnBar = na
+if channelBuyBreakSignal
+    chBreakUpBar := bar_index
+if channelSellBreakSignal
+    chBreakDnBar := bar_index
+bool channelBuyRetestSignal  = tAct and useChannel and useChannelRetest and not na(chBreakUpBar) and (bar_index - chBreakUpBar) <= channelRetestBars and bullishReversal and ((not na(upChannelUpper) and f_near(low, upChannelUpper, trendTouchRange) and close > upChannelUpper) or (not na(downChannelUpper) and f_near(low, downChannelUpper, trendTouchRange) and close > downChannelUpper))
+bool channelSellRetestSignal = tAct and useChannel and useChannelRetest and not na(chBreakDnBar) and (bar_index - chBreakDnBar) <= channelRetestBars and bearishReversal and ((not na(upChannelLower) and f_near(high, upChannelLower, trendTouchRange) and close < upChannelLower) or (not na(downChannelLower) and f_near(high, downChannelLower, trendTouchRange) and close < downChannelLower))
+
+// ============================================================
+//  I: Channel内 Position Bias
+// ============================================================
+float channelPosition = (upValid and not na(upChannelWidth) and upChannelWidth > 0) ? (close - upChannelLower) / upChannelWidth * 100.0 : (downValid and not na(downChannelWidth) and downChannelWidth > 0) ? (close - downChannelLower) / downChannelWidth * 100.0 : na
+bool channelBiasLong     = tAct and useChannelPositionBias and not na(channelPosition) and channelPosition <= 33
+bool channelBiasShort    = tAct and useChannelPositionBias and not na(channelPosition) and channelPosition >= 67
+bool channelNoTradeMiddle= tAct and useChannelPositionBias and not na(channelPosition) and channelPosition > 33 and channelPosition < 67
+
+// ============================================================
+//  NoTrade
+// ============================================================
+bool trendNoTradeWeakLine = tAct and useTrendNoTradeWeakLine and trendlineQuality < minTrendlineQuality
+bool trendNoTrade      = trendNoTradeWeakLine
+bool trendNoTradeLong  = trendNoTradeWeakLine
+bool trendNoTradeShort = trendNoTradeWeakLine
+
+// ============================================================
+//  Bias 出力
+// ============================================================
+bool trendBiasLong = tAct and (channelBiasLong or trendBuyBounceSignal or trendBuyBreakSignal or trendBuyRetestSignal or trendBuyFakeBreakSignal or channelBuyBounceSignal or channelBuyBreakSignal or channelBuyRetestSignal) and not trendNoTradeLong
+bool trendBiasShort = tAct and (channelBiasShort or trendSellBounceSignal or trendSellBreakSignal or trendSellRetestSignal or trendSellFakeBreakSignal or channelSellBounceSignal or channelSellBreakSignal or channelSellRetestSignal) and not trendNoTradeShort
+
+// ============================================================
+//  Entry結合 (Any / All)
+// ============================================================
+int trendEnabledCount = (useTrendBounce ? 1 : 0) + (useTrendBreak ? 1 : 0) + (useTrendRetest ? 1 : 0) + (useTrendFakeBreak ? 1 : 0) + (useChannelBounce ? 1 : 0) + (useChannelBreak ? 1 : 0) + (useChannelRetest ? 1 : 0)
+int trendFiredBuy = (trendBuyBounceSignal ? 1 : 0) + (trendBuyBreakSignal ? 1 : 0) + (trendBuyRetestSignal ? 1 : 0) + (trendBuyFakeBreakSignal ? 1 : 0) + (channelBuyBounceSignal ? 1 : 0) + (channelBuyBreakSignal ? 1 : 0) + (channelBuyRetestSignal ? 1 : 0)
+int trendFiredSell = (trendSellBounceSignal ? 1 : 0) + (trendSellBreakSignal ? 1 : 0) + (trendSellRetestSignal ? 1 : 0) + (trendSellFakeBreakSignal ? 1 : 0) + (channelSellBounceSignal ? 1 : 0) + (channelSellBreakSignal ? 1 : 0) + (channelSellRetestSignal ? 1 : 0)
+bool trendEntryBuy  = tAct and trendEnabledCount > 0 and (trendEntryMode == "All" ? trendFiredBuy  == trendEnabledCount : trendFiredBuy  >= 1)
+bool trendEntrySell = tAct and trendEnabledCount > 0 and (trendEntryMode == "All" ? trendFiredSell == trendEnabledCount : trendFiredSell >= 1)
+
+// ============================================================
+//  最終出力
+// ============================================================
+bool allowLongByTrendline  = tAct and trendEntryBuy  and trendQualityOk and not trendNoTradeLong
+bool allowShortByTrendline = tAct and trendEntrySell and trendQualityOk and not trendNoTradeShort
+
+// ============================================================
+//  Signal Type / Direction / Rank
+//   優先: ChRetest>TLRetest>Fake>ChBreak>TLBreak>ChBounce>TLBounce>ChBias>Weak
+// ============================================================
+bool tl_anyChRetest = channelBuyRetestSignal or channelSellRetestSignal
+bool tl_anyTLRetest = trendBuyRetestSignal or trendSellRetestSignal
+bool tl_anyFake     = trendBuyFakeBreakSignal or trendSellFakeBreakSignal
+bool tl_anyChBreak  = channelBuyBreakSignal or channelSellBreakSignal
+bool tl_anyTLBreak  = trendBuyBreakSignal or trendSellBreakSignal
+bool tl_anyChBounce = channelBuyBounceSignal or channelSellBounceSignal
+bool tl_anyTLBounce = trendBuyBounceSignal or trendSellBounceSignal
+bool tl_anyChBias   = channelBiasLong or channelBiasShort
+
+int trendSignalType = not tAct ? 0 :
+                       tl_anyChRetest ? 7 :
+                       tl_anyTLRetest ? 3 :
+                       tl_anyFake ? 4 :
+                       tl_anyChBreak ? 6 :
+                       tl_anyTLBreak ? 2 :
+                       tl_anyChBounce ? 5 :
+                       tl_anyTLBounce ? 1 :
+                       tl_anyChBias ? 8 :
+                       trendNoTradeWeakLine ? 9 : 0
+
+int trendDirection = not tAct ? 0 :
+                      tl_anyChRetest ? (channelBuyRetestSignal ? 1 : -1) :
+                      tl_anyTLRetest ? (trendBuyRetestSignal ? 1 : -1) :
+                      tl_anyFake ? (trendBuyFakeBreakSignal ? 1 : -1) :
+                      tl_anyChBreak ? (channelBuyBreakSignal ? 1 : -1) :
+                      tl_anyTLBreak ? (trendBuyBreakSignal ? 1 : -1) :
+                      tl_anyChBounce ? (channelBuyBounceSignal ? 1 : -1) :
+                      tl_anyTLBounce ? (trendBuyBounceSignal ? 1 : -1) :
+                      tl_anyChBias ? (channelBiasLong ? 1 : -1) : 0
+
+int trendRank = not tAct ? 0 :
+                 (tl_anyChRetest and tl_highQuality) ? 10 :
+                 (tl_anyTLRetest and tl_highQuality) ? 9 :
+                 tl_highQuality ? 8 :
+                 tl_anyChRetest ? 7 :
+                 tl_anyChBounce ? 6 :
+                 tl_anyFake ? 5 :
+                 tl_anyTLRetest ? 4 :
+                 (tl_anyTLBreak or tl_anyChBreak) ? 3 :
+                 tl_anyTLBounce ? 2 :
+                 (tl_anyChBias or nearUpTrendline or nearDownTrendline) ? 1 : 0
+
+// ============================================================
+//  表示 : Trendline / Channel (line.new)
+// ============================================================
+bool tl_show = tAct and showTrendlines
+bool ch_show = tAct and showChannelLines
+bool showUp   = upValid   and (not showOnlyBestLines or upTrendlineQuality >= downTrendlineQuality)
+bool showDown = downValid and (not showOnlyBestLines or downTrendlineQuality > upTrendlineQuality)
+
+var line upLine = na
+var line downLine = na
+var line upChUpperLine = na
+var line downChLowerLine = na
+
+f_updateLine(ln, show, x1, y1, x2, y2, col) =>
+    line result = ln
+    if show and not na(y1) and not na(y2)
+        if na(result)
+            result := line.new(x1, y1, x2, y2, color = col, width = 1)
+        else
+            line.set_xy1(result, x1, y1)
+            line.set_xy2(result, x2, y2)
+            line.set_color(result, col)
+    else
+        if not na(result)
+            line.delete(result)
+            result := na
+    result
+
+// y1 はアンカーPivot価格 (直線なので履歴参照不要)
+int   upX1 = upValid ? lowPivot2Bar : bar_index
+int   downX1 = downValid ? highPivot2Bar : bar_index
+upLine   := f_updateLine(upLine,   tl_show and showUp,   upX1, upValid ? lowPivot2Price : na, bar_index, upTrendlineValue, color.new(color.green, 0))
+downLine := f_updateLine(downLine, tl_show and showDown, downX1, downValid ? highPivot2Price : na, bar_index, downTrendlineValue, color.new(color.red, 0))
+upChUpperLine   := f_updateLine(upChUpperLine,   ch_show and showUp,   upX1, (upValid and not na(upOffset)) ? lowPivot2Price + upOffset : na, bar_index, upChannelUpper, color.new(color.green, 50))
+downChLowerLine := f_updateLine(downChLowerLine, ch_show and showDown, downX1, (downValid and not na(downOffset)) ? highPivot2Price - downOffset : na, bar_index, downChannelLower, color.new(color.red, 50))
+
+// ============================================================
+//  表示 : ラベル
+// ============================================================
+f_mkLabel(isBuy, txt, col) =>
+    label.new(bar_index, isBuy ? low : high, txt, style = isBuy ? label.style_label_up : label.style_label_down, color = col, textcolor = color.white, yloc = isBuy ? yloc.belowbar : yloc.abovebar, size = size.small)
+
+if tAct and showTrendLabels
+    if trendBuyBounceSignal
+        f_mkLabel(true,  "TL Bounce↑", color.new(color.green, 0))
+    if trendSellBounceSignal
+        f_mkLabel(false, "TL Bounce↓", color.new(color.red, 0))
+    if trendBuyBreakSignal
+        f_mkLabel(true,  "TL Break↑", color.new(color.lime, 0))
+    if trendSellBreakSignal
+        f_mkLabel(false, "TL Break↓", color.new(color.maroon, 0))
+    if trendBuyRetestSignal
+        f_mkLabel(true,  "TL Retest↑", color.new(color.aqua, 0))
+    if trendSellRetestSignal
+        f_mkLabel(false, "TL Retest↓", color.new(color.orange, 0))
+    if trendBuyFakeBreakSignal
+        f_mkLabel(true,  "Fake↑", color.new(color.blue, 0))
+    if trendSellFakeBreakSignal
+        f_mkLabel(false, "Fake↓", color.new(color.purple, 0))
+    if channelBuyBounceSignal
+        f_mkLabel(true,  "CH Bounce↑", color.new(color.teal, 0))
+    if channelSellBounceSignal
+        f_mkLabel(false, "CH Bounce↓", color.new(color.fuchsia, 0))
+    if channelBuyBreakSignal
+        f_mkLabel(true,  "CH Break↑", color.new(color.green, 30))
+    if channelSellBreakSignal
+        f_mkLabel(false, "CH Break↓", color.new(color.red, 30))
+    if channelBuyRetestSignal
+        f_mkLabel(true,  "CH Retest↑", color.new(color.aqua, 30))
+    if channelSellRetestSignal
+        f_mkLabel(false, "CH Retest↓", color.new(color.orange, 30))
+
+// ============================================================
+//  表示 : デバッグテーブル
+// ============================================================
+f_typeStr(t) =>
+    t == 1 ? "TL Bounce" : t == 2 ? "TL Break" : t == 3 ? "TL Retest" : t == 4 ? "Fake" : t == 5 ? "CH Bounce" : t == 6 ? "CH Break" : t == 7 ? "CH Retest" : t == 8 ? "CH Bias" : t == 9 ? "WeakLine" : "-"
+f_stateStr() =>
+    upValid and downValid ? "Up+Down" : upValid ? "Up" : downValid ? "Down" : "-"
+
+var table dbg = table.new(position.top_right, 2, 12, border_width = 1)
+if tAct and showTrendDebugTable and barstate.islast
+    string sDir = trendDirection == 1 ? "BUY" : trendDirection == -1 ? "SELL" : "-"
+    table.cell(dbg, 0, 0, "Trendline", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(dbg, 1, 0, trendNoTrade ? "NoTrade" : (trendDirection != 0 ? "SIGNAL" : "-"), text_color = color.white, bgcolor = trendNoTrade ? color.new(color.red, 30) : color.new(color.blue, 0))
+    table.cell(dbg, 0, 1, "State", text_color = color.white)
+    table.cell(dbg, 1, 1, f_stateStr(), text_color = color.white)
+    table.cell(dbg, 0, 2, "Signal Type", text_color = color.white)
+    table.cell(dbg, 1, 2, f_typeStr(trendSignalType), text_color = color.white)
+    table.cell(dbg, 0, 3, "Direction", text_color = color.white)
+    table.cell(dbg, 1, 3, sDir, text_color = color.white)
+    table.cell(dbg, 0, 4, "Rank", text_color = color.white)
+    table.cell(dbg, 1, 4, str.tostring(trendRank), text_color = color.white)
+    table.cell(dbg, 0, 5, "UpTL Q", text_color = color.white)
+    table.cell(dbg, 1, 5, str.tostring(upTrendlineQuality), text_color = color.white)
+    table.cell(dbg, 0, 6, "DownTL Q", text_color = color.white)
+    table.cell(dbg, 1, 6, str.tostring(downTrendlineQuality), text_color = color.white)
+    table.cell(dbg, 0, 7, "Touch U/D", text_color = color.white)
+    table.cell(dbg, 1, 7, str.tostring(upTouchCount) + " / " + str.tostring(downTouchCount), text_color = color.white)
+    table.cell(dbg, 0, 8, "Broken U/D", text_color = color.white)
+    table.cell(dbg, 1, 8, str.tostring(upBrokenCount) + " / " + str.tostring(downBrokenCount), text_color = color.white)
+    table.cell(dbg, 0, 9, "Ch Position", text_color = color.white)
+    table.cell(dbg, 1, 9, na(channelPosition) ? "-" : str.tostring(channelPosition, "#.#"), text_color = color.white)
+    table.cell(dbg, 0, 10, "NoTrade / Bias L/S", text_color = color.white)
+    table.cell(dbg, 1, 10, (trendNoTrade ? "Y" : "N") + " | " + (trendBiasLong ? "L" : "-") + (trendBiasShort ? "S" : "-"), text_color = color.white)
+    table.cell(dbg, 0, 11, "Allow L/S", text_color = color.white)
+    table.cell(dbg, 1, 11, (allowLongByTrendline ? "Y" : "N") + " / " + (allowShortByTrendline ? "Y" : "N"), text_color = color.white)
+
+// ============================================================
+//  プロット (接続用 : Data Window)
+// ============================================================
+plot(upTrendlineValue,   "upTrendlineValue",   display = display.data_window)
+plot(downTrendlineValue, "downTrendlineValue", display = display.data_window)
+plot(upTrendlineQuality,   "upTrendlineQuality",   display = display.data_window)
+plot(downTrendlineQuality, "downTrendlineQuality", display = display.data_window)
+plot(trendlineQuality,     "trendlineQuality",     display = display.data_window)
+plot(nearUpTrendline   ? 1 : 0, "nearUpTrendline",   display = display.data_window)
+plot(nearDownTrendline ? 1 : 0, "nearDownTrendline", display = display.data_window)
+plot(trendBuyBounceSignal  ? 1 : 0, "trendBuyBounceSignal",  display = display.data_window)
+plot(trendSellBounceSignal ? 1 : 0, "trendSellBounceSignal", display = display.data_window)
+plot(trendBuyBreakSignal  ? 1 : 0, "trendBuyBreakSignal",  display = display.data_window)
+plot(trendSellBreakSignal ? 1 : 0, "trendSellBreakSignal", display = display.data_window)
+plot(trendBuyRetestSignal  ? 1 : 0, "trendBuyRetestSignal",  display = display.data_window)
+plot(trendSellRetestSignal ? 1 : 0, "trendSellRetestSignal", display = display.data_window)
+plot(trendBuyFakeBreakSignal  ? 1 : 0, "trendBuyFakeBreakSignal",  display = display.data_window)
+plot(trendSellFakeBreakSignal ? 1 : 0, "trendSellFakeBreakSignal", display = display.data_window)
+plot(channelBuyBounceSignal  ? 1 : 0, "channelBuyBounceSignal",  display = display.data_window)
+plot(channelSellBounceSignal ? 1 : 0, "channelSellBounceSignal", display = display.data_window)
+plot(channelBuyBreakSignal  ? 1 : 0, "channelBuyBreakSignal",  display = display.data_window)
+plot(channelSellBreakSignal ? 1 : 0, "channelSellBreakSignal", display = display.data_window)
+plot(channelBuyRetestSignal  ? 1 : 0, "channelBuyRetestSignal",  display = display.data_window)
+plot(channelSellRetestSignal ? 1 : 0, "channelSellRetestSignal", display = display.data_window)
+plot(channelPosition, "channelPosition", display = display.data_window)
+plot(channelBiasLong  ? 1 : 0, "channelBiasLong",  display = display.data_window)
+plot(channelBiasShort ? 1 : 0, "channelBiasShort", display = display.data_window)
+plot(trendSignalType, "trendSignalType", display = display.data_window)
+plot(trendDirection,  "trendDirection",  display = display.data_window)
+plot(trendRank,       "trendRank",       display = display.data_window)
+plot(trendBiasLong  ? 1 : 0, "trendBiasLong",  display = display.data_window)
+plot(trendBiasShort ? 1 : 0, "trendBiasShort", display = display.data_window)
+plot(trendNoTrade ? 1 : 0, "trendNoTrade", display = display.data_window)
+plot(allowLongByTrendline  ? 1 : 0, "allowLongByTrendline",  display = display.data_window)
+plot(allowShortByTrendline ? 1 : 0, "allowShortByTrendline", display = display.data_window)
+
+// ============================================================
+//  シグナル形状
+// ============================================================
+plotshape(trendBuyBounceSignal,  title = "TL BUY Bounce",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0),  size = size.tiny)
+plotshape(trendSellBounceSignal, title = "TL SELL Bounce", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),    size = size.tiny)
+plotshape(trendBuyBreakSignal,  title = "TL BUY Break",  style = shape.diamond, location = location.belowbar, color = color.new(color.lime, 0),    size = size.tiny)
+plotshape(trendSellBreakSignal, title = "TL SELL Break", style = shape.diamond, location = location.abovebar, color = color.new(color.maroon, 0), size = size.tiny)
+plotshape(trendBuyRetestSignal,  title = "TL BUY Retest",  style = shape.flag, location = location.belowbar, color = color.new(color.aqua, 0),   size = size.tiny)
+plotshape(trendSellRetestSignal, title = "TL SELL Retest", style = shape.flag, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
+plotshape(trendBuyFakeBreakSignal,  title = "TL BUY Fake",  style = shape.xcross, location = location.belowbar, color = color.new(color.blue, 0),   size = size.tiny)
+plotshape(trendSellFakeBreakSignal, title = "TL SELL Fake", style = shape.xcross, location = location.abovebar, color = color.new(color.purple, 0), size = size.tiny)
+plotshape(channelBuyBounceSignal,  title = "CH BUY Bounce",  style = shape.circle, location = location.belowbar, color = color.new(color.teal, 0),    size = size.tiny)
+plotshape(channelSellBounceSignal, title = "CH SELL Bounce", style = shape.circle, location = location.abovebar, color = color.new(color.fuchsia, 0), size = size.tiny)
+plotshape(channelBuyBreakSignal,  title = "CH BUY Break",  style = shape.arrowup,   location = location.bottom, color = color.new(color.green, 0), size = size.tiny)
+plotshape(channelSellBreakSignal, title = "CH SELL Break", style = shape.arrowdown, location = location.top,    color = color.new(color.red, 0),   size = size.tiny)
+plotshape(channelBuyRetestSignal,  title = "CH BUY Retest",  style = shape.square, location = location.belowbar, color = color.new(color.aqua, 30),   size = size.tiny)
+plotshape(channelSellRetestSignal, title = "CH SELL Retest", style = shape.square, location = location.abovebar, color = color.new(color.orange, 30), size = size.tiny)
+
+// ============================================================
+//  アラート
+// ============================================================
+alertcondition(trendBuyBounceSignal,  "TL BUY Bounce",  "{{ticker}} TL反発 BUY")
+alertcondition(trendSellBounceSignal, "TL SELL Bounce", "{{ticker}} TL反発 SELL")
+alertcondition(trendBuyBreakSignal,  "TL BUY Break",  "{{ticker}} TLブレイク BUY")
+alertcondition(trendSellBreakSignal, "TL SELL Break", "{{ticker}} TLブレイク SELL")
+alertcondition(trendBuyRetestSignal,  "TL BUY Retest",  "{{ticker}} TLリテスト BUY")
+alertcondition(trendSellRetestSignal, "TL SELL Retest", "{{ticker}} TLリテスト SELL")
+alertcondition(trendBuyFakeBreakSignal,  "TL BUY Fake Break",  "{{ticker}} TLフェイク BUY")
+alertcondition(trendSellFakeBreakSignal, "TL SELL Fake Break", "{{ticker}} TLフェイク SELL")
+alertcondition(channelBuyBounceSignal,  "Channel BUY Bounce",  "{{ticker}} CH反発 BUY")
+alertcondition(channelSellBounceSignal, "Channel SELL Bounce", "{{ticker}} CH反発 SELL")
+alertcondition(channelBuyBreakSignal,  "Channel BUY Break",  "{{ticker}} CHブレイク BUY")
+alertcondition(channelSellBreakSignal, "Channel SELL Break", "{{ticker}} CHブレイク SELL")
+alertcondition(channelBuyRetestSignal,  "Channel BUY Retest",  "{{ticker}} CHリテスト BUY")
+alertcondition(channelSellRetestSignal, "Channel SELL Retest", "{{ticker}} CHリテスト SELL")
+alertcondition(allowLongByTrendline,  "Allow Long Trendline",  "{{ticker}} TL ロング許可")
+alertcondition(allowShortByTrendline, "Allow Short Trendline", "{{ticker}} TL ショート許可")
+alertcondition(trendNoTrade, "Trendline NoTrade", "{{ticker}} TL ノートレード")
