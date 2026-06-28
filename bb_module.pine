@@ -1,0 +1,418 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © your_username
+//
+// ============================================================
+//  ボリンジャーバンド 単体モジュール (Indicator版)
+// ============================================================
+//  ・BB関連だけを独立モジュール化。
+//  ・後で Pivot / Cloud / FVG / Fib / EMA / RSI / MACD /
+//    ストキャス / 出来高 / レジサポ と AND 接続する前提。
+//  ・strategy ではなく indicator。シグナル出力のみ。
+//  ・strategy.entry/exit/closedtrades/opentrades は使わない。
+//  役割: A方向F B外側NoTrade C±2σ反発 D±3σ反発 E BandWalk
+//        F スクイーズ G エクスパンション H ミドル反発 I ミドルブレイク
+//        J %B K ZScore + Rank
+// ============================================================
+
+//@version=5
+indicator(
+     title          = "Bollinger Bands Module",
+     shorttitle     = "BB",
+     overlay        = true,
+     max_bars_back  = 1000,
+     max_labels_count = 500
+ )
+
+// ============================================================
+//  入力 (グループ: BB Module)
+// ============================================================
+grpBB = "BB Module"
+
+useBBModule      = input.bool(true, "BBモジュールを使う", group = grpBB)
+showBB           = input.bool(true, "ボリンジャーバンドを表示", group = grpBB)
+showBBLabels     = input.bool(true, "シグナルラベルを表示", group = grpBB)
+showBBDebugTable = input.bool(true, "デバッグテーブルを表示", group = grpBB)
+
+bbLen   = input.int(20, "BB Length", minval = 1, group = grpBB)
+bbMult1 = input.float(1.0, "BB 1σ", step = 0.1, group = grpBB)
+bbMult2 = input.float(2.0, "BB 2σ", step = 0.1, group = grpBB)
+bbMult3 = input.float(3.0, "BB 3σ", step = 0.1, group = grpBB)
+bbSource= input.source(close, "BB Source", group = grpBB)
+
+useBBDirectionFilter = input.bool(true,  "A: BB方向フィルター",   group = grpBB)
+useBBOutsideNoTrade  = input.bool(false, "B: 極端な外側NoTrade",  group = grpBB)
+useBBReversal2       = input.bool(true,  "C: ±2σ反発",           group = grpBB)
+useBBReversal3       = input.bool(false, "D: ±3σ反発",           group = grpBB)
+useBBBandWalk        = input.bool(true,  "E: Band Walk",          group = grpBB)
+useBBSqueeze         = input.bool(true,  "F: スクイーズ",         group = grpBB)
+useBBExpansion       = input.bool(true,  "G: エクスパンション",   group = grpBB)
+useBBMiddleBounce    = input.bool(true,  "H: ミドルライン反発",   group = grpBB)
+useBBMiddleBreak     = input.bool(true,  "I: ミドルラインブレイク", group = grpBB)
+useBBPercentB        = input.bool(true,  "J: %B判定",             group = grpBB)
+useBBZScore          = input.bool(true,  "K: ZScore判定",         group = grpBB)
+
+bbEntryMode = input.string("Any", "エントリー結合", options = ["Any", "All"], group = grpBB)
+
+bbTouchMode   = input.string("ATR", "接近判定", options = ["Dollar", "ATR"], group = grpBB)
+bbTouchDollar = input.float(2.0, "接近幅($)",      step = 0.1,  group = grpBB)
+bbTouchATR    = input.float(0.2, "接近幅 ATR倍率", step = 0.05, group = grpBB)
+
+bbSlopeLookback = input.int(5, "BBミドル傾き判定本数", minval = 1, group = grpBB)
+bbBandWalkBars  = input.int(3, "BandWalk判定本数",     minval = 1, group = grpBB)
+
+bbSqueezeLookback   = input.int(50, "スクイーズ判定Lookback", minval = 5, group = grpBB)
+bbSqueezePercentile = input.float(25.0, "スクイーズ閾値%ile", minval = 1, maxval = 100, step = 1, group = grpBB)
+
+bbExpansionLookback = input.int(5, "エクスパンション判定本数", minval = 1, group = grpBB)
+bbExpansionMinRatio = input.float(1.2, "エクスパンション倍率", step = 0.1, group = grpBB)
+
+bbPercentBLongMin  = input.float(0.5, "%B Long 最低値",  step = 0.05, group = grpBB)
+bbPercentBShortMax = input.float(0.5, "%B Short 最高値", step = 0.05, group = grpBB)
+bbZLongMin  = input.float(0.0, "ZScore Long 最低値",  step = 0.1, group = grpBB)
+bbZShortMax = input.float(0.0, "ZScore Short 最高値", step = 0.1, group = grpBB)
+bbExtremeZ  = input.float(3.0, "極端判定 ZScore", step = 0.1, group = grpBB)
+
+// ============================================================
+//  優先度1: BB計算
+// ============================================================
+float basis = ta.sma(bbSource, bbLen)
+float dev   = ta.stdev(bbSource, bbLen)
+
+float upper1 = basis + dev * bbMult1
+float lower1 = basis - dev * bbMult1
+float upper2 = basis + dev * bbMult2
+float lower2 = basis - dev * bbMult2
+float upper3 = basis + dev * bbMult3
+float lower3 = basis - dev * bbMult3
+
+float bandWidth    = upper2 - lower2
+float bandWidthPct = (not na(basis) and basis != 0) ? bandWidth / basis * 100.0 : na
+float percentB = (upper2 - lower2) != 0 ? (bbSource - lower2) / (upper2 - lower2) : na
+float zScore   = (not na(dev) and dev != 0) ? (bbSource - basis) / dev : na
+
+bool bAct = useBBModule
+
+// ============================================================
+//  優先度1: 基本判定
+// ============================================================
+bool bbAboveBasis = close > basis
+bool bbBelowBasis = close < basis
+float bbSlope = basis - basis[bbSlopeLookback]
+bool bbSlopeUp   = bbSlope > 0
+bool bbSlopeDown = bbSlope < 0
+bool bbAboveUpper2 = close > upper2
+bool bbBelowLower2 = close < lower2
+bool bbAboveUpper3 = close > upper3
+bool bbBelowLower3 = close < lower3
+bool bbInside2  = close <= upper2 and close >= lower2
+bool bbOutside2 = close > upper2 or close < lower2
+
+// ============================================================
+//  反転ローソク (共通)
+// ============================================================
+float bb_body   = math.abs(close - open)
+float bb_upWick = high - math.max(open, close)
+float bb_dnWick = math.min(open, close) - low
+bool bb_bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bool bb_bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+bool bb_pinLower = bb_dnWick >= bb_body and bb_dnWick >= bb_upWick
+bool bb_pinUpper = bb_upWick >= bb_body and bb_upWick >= bb_dnWick
+bool bb_bullishReversal = bb_bullEngulf or bb_pinLower or close > open
+bool bb_bearishReversal = bb_bearEngulf or bb_pinUpper or close < open
+
+float bb_touchRange = bbTouchMode == "ATR" ? ta.atr(14) * bbTouchATR : bbTouchDollar
+
+// ============================================================
+//  A: BB方向フィルター
+// ============================================================
+bool bbDirectionOkLong  = not (bAct and useBBDirectionFilter) or (bbAboveBasis and bbSlopeUp)
+bool bbDirectionOkShort = not (bAct and useBBDirectionFilter) or (bbBelowBasis and bbSlopeDown)
+
+// ============================================================
+//  B: 極端な外側NoTrade
+// ============================================================
+bool bbNoTradeLong  = bAct and useBBOutsideNoTrade and not na(zScore) and zScore >= bbExtremeZ
+bool bbNoTradeShort = bAct and useBBOutsideNoTrade and not na(zScore) and zScore <= -bbExtremeZ
+
+// ============================================================
+//  C: ±2σ反発
+// ============================================================
+bool bbBuyReversal2Signal  = bAct and useBBReversal2 and low  <= lower2 and bb_bullishReversal and close > lower2
+bool bbSellReversal2Signal = bAct and useBBReversal2 and high >= upper2 and bb_bearishReversal and close < upper2
+
+// ============================================================
+//  D: ±3σ反発
+// ============================================================
+bool bbBuyReversal3Signal  = bAct and useBBReversal3 and low  <= lower3 and bb_bullishReversal and close > lower3
+bool bbSellReversal3Signal = bAct and useBBReversal3 and high >= upper3 and bb_bearishReversal and close < upper3
+
+// ============================================================
+//  E: Band Walk
+// ============================================================
+bool bbBuyBandWalkSignal  = bAct and useBBBandWalk and ta.lowest(close, bbBandWalkBars)  > basis and close >= upper1
+bool bbSellBandWalkSignal = bAct and useBBBandWalk and ta.highest(close, bbBandWalkBars) < basis and close <= lower1
+bool bbBandWalkLong  = bbBuyBandWalkSignal
+bool bbBandWalkShort = bbSellBandWalkSignal
+
+// ============================================================
+//  F: スクイーズ
+// ============================================================
+float bbWidthLowest  = ta.lowest(bandWidth, bbSqueezeLookback)
+float bbWidthHighest = ta.highest(bandWidth, bbSqueezeLookback)
+float bbWidthRank = (bbWidthHighest - bbWidthLowest) != 0 ? (bandWidth - bbWidthLowest) / (bbWidthHighest - bbWidthLowest) * 100.0 : na
+bool bbSqueezeSignal = bAct and useBBSqueeze and not na(bbWidthRank) and bbWidthRank <= bbSqueezePercentile
+bool bbSqueezeNoTrade = bbSqueezeSignal
+
+// ============================================================
+//  G: エクスパンション
+// ============================================================
+bool bbExpansion = not na(bandWidth[bbExpansionLookback]) and bandWidth > bandWidth[bbExpansionLookback] * bbExpansionMinRatio
+bool bbBuyExpansionSignal  = bAct and useBBExpansion and bbExpansion and bbAboveBasis and bbSlopeUp
+bool bbSellExpansionSignal = bAct and useBBExpansion and bbExpansion and bbBelowBasis and bbSlopeDown
+
+// ============================================================
+//  H: ミドルライン反発
+// ============================================================
+bool bbBuyMiddleBounceSignal  = bAct and useBBMiddleBounce and bbSlopeUp   and low  <= basis + bb_touchRange and close > basis and bb_bullishReversal
+bool bbSellMiddleBounceSignal = bAct and useBBMiddleBounce and bbSlopeDown and high >= basis - bb_touchRange and close < basis and bb_bearishReversal
+
+// ============================================================
+//  I: ミドルラインブレイク
+// ============================================================
+bool bbBuyMiddleBreakSignal  = bAct and useBBMiddleBreak and ta.crossover(close, basis)
+bool bbSellMiddleBreakSignal = bAct and useBBMiddleBreak and ta.crossunder(close, basis)
+
+// ============================================================
+//  J: %B判定 / K: ZScore判定
+// ============================================================
+bool bbPercentBOkLong  = not (bAct and useBBPercentB) or (not na(percentB) and percentB >= bbPercentBLongMin)
+bool bbPercentBOkShort = not (bAct and useBBPercentB) or (not na(percentB) and percentB <= bbPercentBShortMax)
+bool bbZScoreOkLong  = not (bAct and useBBZScore) or (not na(zScore) and zScore >= bbZLongMin)
+bool bbZScoreOkShort = not (bAct and useBBZScore) or (not na(zScore) and zScore <= bbZShortMax)
+
+// ============================================================
+//  エントリー結合 (Any / All)
+//   対象: Reversal2/3 / BandWalk / Expansion / MiddleBounce / MiddleBreak
+// ============================================================
+int bbEnabledCount = (useBBReversal2 ? 1 : 0) + (useBBReversal3 ? 1 : 0) + (useBBBandWalk ? 1 : 0) + (useBBExpansion ? 1 : 0) + (useBBMiddleBounce ? 1 : 0) + (useBBMiddleBreak ? 1 : 0)
+int bbFiredBuy  = (bbBuyReversal2Signal ? 1 : 0) + (bbBuyReversal3Signal ? 1 : 0) + (bbBuyBandWalkSignal ? 1 : 0) + (bbBuyExpansionSignal ? 1 : 0) + (bbBuyMiddleBounceSignal ? 1 : 0) + (bbBuyMiddleBreakSignal ? 1 : 0)
+int bbFiredSell = (bbSellReversal2Signal ? 1 : 0) + (bbSellReversal3Signal ? 1 : 0) + (bbSellBandWalkSignal ? 1 : 0) + (bbSellExpansionSignal ? 1 : 0) + (bbSellMiddleBounceSignal ? 1 : 0) + (bbSellMiddleBreakSignal ? 1 : 0)
+bool bbEntryBuy  = bAct and bbEnabledCount > 0 and (bbEntryMode == "All" ? bbFiredBuy  == bbEnabledCount : bbFiredBuy  >= 1)
+bool bbEntrySell = bAct and bbEnabledCount > 0 and (bbEntryMode == "All" ? bbFiredSell == bbEnabledCount : bbFiredSell >= 1)
+
+// ============================================================
+//  Bias (方向フィルター用 / エントリー要求しない)
+// ============================================================
+bool bbBiasLong  = bAct and bbDirectionOkLong  and not bbNoTradeLong  and bbPercentBOkLong  and bbZScoreOkLong
+bool bbBiasShort = bAct and bbDirectionOkShort and not bbNoTradeShort and bbPercentBOkShort and bbZScoreOkShort
+
+// ============================================================
+//  最終出力
+// ============================================================
+bool allowLongByBB  = bAct and bbEntryBuy  and bbDirectionOkLong  and not bbNoTradeLong  and bbPercentBOkLong  and bbZScoreOkLong
+bool allowShortByBB = bAct and bbEntrySell and bbDirectionOkShort and not bbNoTradeShort and bbPercentBOkShort and bbZScoreOkShort
+bool bbNoTrade = bbNoTradeLong or bbNoTradeShort
+
+// ============================================================
+//  Signal Type / Direction / Rank
+//   type: 1Rev2 2Rev3 3BandWalk 4Squeeze 5Expansion 6MidBounce 7MidBreak
+//   優先: BandWalk>Expansion>MidBounce>Rev3>Rev2>MidBreak>Squeeze
+// ============================================================
+bool bb_anyWalk   = bbBuyBandWalkSignal or bbSellBandWalkSignal
+bool bb_anyExp    = bbBuyExpansionSignal or bbSellExpansionSignal
+bool bb_anyBounce = bbBuyMiddleBounceSignal or bbSellMiddleBounceSignal
+bool bb_anyRev3   = bbBuyReversal3Signal or bbSellReversal3Signal
+bool bb_anyRev2   = bbBuyReversal2Signal or bbSellReversal2Signal
+bool bb_anyBreak  = bbBuyMiddleBreakSignal or bbSellMiddleBreakSignal
+
+int bbSignalType = not bAct ? 0 :
+                    bb_anyWalk   ? 3 :
+                    bb_anyExp    ? 5 :
+                    bb_anyBounce ? 6 :
+                    bb_anyRev3   ? 2 :
+                    bb_anyRev2   ? 1 :
+                    bb_anyBreak  ? 7 :
+                    bbSqueezeSignal ? 4 : 0
+
+int bbDirection = not bAct ? 0 :
+                   bb_anyWalk   ? (bbBuyBandWalkSignal ? 1 : -1) :
+                   bb_anyExp    ? (bbBuyExpansionSignal ? 1 : -1) :
+                   bb_anyBounce ? (bbBuyMiddleBounceSignal ? 1 : -1) :
+                   bb_anyRev3   ? (bbBuyReversal3Signal ? 1 : -1) :
+                   bb_anyRev2   ? (bbBuyReversal2Signal ? 1 : -1) :
+                   bb_anyBreak  ? (bbBuyMiddleBreakSignal ? 1 : -1) : 0
+
+bool bb_basisAligned = (bbAboveBasis and bbSlopeUp) or (bbBelowBasis and bbSlopeDown)
+int bbRank = not bAct ? 0 :
+              (bb_anyWalk and bb_anyExp) ? 8 :
+              (bbSqueezeSignal and bb_anyExp) ? 7 :
+              bb_anyWalk   ? 6 :
+              bb_anyExp    ? 5 :
+              bb_anyBounce ? 4 :
+              bb_anyRev3   ? 3 :
+              bb_anyRev2   ? 2 :
+              bb_basisAligned ? 1 : 0
+
+// ============================================================
+//  表示 : ボリンジャーバンド
+// ============================================================
+bool bb_show = useBBModule and showBB
+pBasis = plot(bb_show ? basis : na, "basis", color = bb_show ? color.new(color.orange, 0) : na)
+pU2 = plot(bb_show ? upper2 : na, "upper2", color = bb_show ? color.new(color.red, 40) : na)
+pL2 = plot(bb_show ? lower2 : na, "lower2", color = bb_show ? color.new(color.blue, 40) : na)
+plot(bb_show ? upper1 : na, "upper1", color = bb_show ? color.new(color.red, 70) : na)
+plot(bb_show ? lower1 : na, "lower1", color = bb_show ? color.new(color.blue, 70) : na)
+plot(bb_show ? upper3 : na, "upper3", color = bb_show ? color.new(color.red, 20) : na)
+plot(bb_show ? lower3 : na, "lower3", color = bb_show ? color.new(color.blue, 20) : na)
+fill(pU2, pL2, color = bb_show ? color.new(color.gray, 92) : na, title = "BB Fill")
+
+// ============================================================
+//  表示 : ラベル
+// ============================================================
+f_mkLabel(isBuy, txt, col) =>
+    label.new(bar_index, isBuy ? low : high, txt, style = isBuy ? label.style_label_up : label.style_label_down, color = col, textcolor = color.white, yloc = isBuy ? yloc.belowbar : yloc.abovebar, size = size.small)
+
+if showBBLabels
+    if bbBuyReversal2Signal
+        f_mkLabel(true,  "BB Rev2↑", color.new(color.green, 0))
+    if bbSellReversal2Signal
+        f_mkLabel(false, "BB Rev2↓", color.new(color.red, 0))
+    if bbBuyReversal3Signal
+        f_mkLabel(true,  "BB Rev3↑", color.new(color.lime, 0))
+    if bbSellReversal3Signal
+        f_mkLabel(false, "BB Rev3↓", color.new(color.maroon, 0))
+    if bbBuyBandWalkSignal
+        f_mkLabel(true,  "BB Walk↑", color.new(color.teal, 0))
+    if bbSellBandWalkSignal
+        f_mkLabel(false, "BB Walk↓", color.new(color.fuchsia, 0))
+    if bbBuyExpansionSignal
+        f_mkLabel(true,  "BB Exp↑", color.new(color.aqua, 0))
+    if bbSellExpansionSignal
+        f_mkLabel(false, "BB Exp↓", color.new(color.orange, 0))
+    if bbBuyMiddleBounceSignal
+        f_mkLabel(true,  "BB MB↑", color.new(color.green, 0))
+    if bbSellMiddleBounceSignal
+        f_mkLabel(false, "BB MB↓", color.new(color.red, 0))
+    if bbBuyMiddleBreakSignal
+        f_mkLabel(true,  "BB Break↑", color.new(color.blue, 0))
+    if bbSellMiddleBreakSignal
+        f_mkLabel(false, "BB Break↓", color.new(color.purple, 0))
+    if bbSqueezeSignal
+        f_mkLabel(false, "BB Squeeze", color.new(color.gray, 0))
+
+// ============================================================
+//  表示 : デバッグテーブル
+// ============================================================
+f_typeStr(t) =>
+    t == 1 ? "Rev2" : t == 2 ? "Rev3" : t == 3 ? "BandWalk" : t == 4 ? "Squeeze" : t == 5 ? "Expansion" : t == 6 ? "MidBounce" : t == 7 ? "MidBreak" : "-"
+f_stateStr() =>
+    bbAboveUpper2 ? "AboveU2" : bbBelowLower2 ? "BelowL2" : bbAboveBasis ? "AboveMid" : bbBelowBasis ? "BelowMid" : "-"
+
+var table dbg = table.new(position.top_right, 2, 11, border_width = 1)
+if showBBDebugTable and barstate.islast
+    string sDir = bbDirection == 1 ? "BUY" : bbDirection == -1 ? "SELL" : "-"
+    table.cell(dbg, 0, 0, "BB", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(dbg, 1, 0, bbNoTrade ? "NoTrade" : (bbDirection != 0 ? "SIGNAL" : "-"), text_color = color.white, bgcolor = bbNoTrade ? color.new(color.red, 30) : color.new(color.blue, 0))
+    table.cell(dbg, 0, 1, "State", text_color = color.white)
+    table.cell(dbg, 1, 1, f_stateStr(), text_color = color.white)
+    table.cell(dbg, 0, 2, "Signal Type", text_color = color.white)
+    table.cell(dbg, 1, 2, f_typeStr(bbSignalType), text_color = color.white)
+    table.cell(dbg, 0, 3, "Direction", text_color = color.white)
+    table.cell(dbg, 1, 3, sDir, text_color = color.white)
+    table.cell(dbg, 0, 4, "Rank", text_color = color.white)
+    table.cell(dbg, 1, 4, str.tostring(bbRank), text_color = color.white)
+    table.cell(dbg, 0, 5, "BandWidth", text_color = color.white)
+    table.cell(dbg, 1, 5, na(bandWidth) ? "-" : str.tostring(bandWidth, "#.##"), text_color = color.white)
+    table.cell(dbg, 0, 6, "%B", text_color = color.white)
+    table.cell(dbg, 1, 6, na(percentB) ? "-" : str.tostring(percentB, "#.##"), text_color = color.white)
+    table.cell(dbg, 0, 7, "ZScore", text_color = color.white)
+    table.cell(dbg, 1, 7, na(zScore) ? "-" : str.tostring(zScore, "#.##"), text_color = color.white)
+    table.cell(dbg, 0, 8, "NoTrade", text_color = color.white)
+    table.cell(dbg, 1, 8, bbNoTrade ? "Y" : "N", text_color = bbNoTrade ? color.red : color.white)
+    table.cell(dbg, 0, 9, "Bias L/S", text_color = color.white)
+    table.cell(dbg, 1, 9, (bbBiasLong ? "Y" : "N") + " / " + (bbBiasShort ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 10, "Allow L/S", text_color = color.white)
+    table.cell(dbg, 1, 10, (allowLongByBB ? "Y" : "N") + " / " + (allowShortByBB ? "Y" : "N"), text_color = color.white)
+
+// ============================================================
+//  プロット (接続用 : Data Window)
+//   ※ basis/σバンドは上の可視plotで Data Window にも出る
+// ============================================================
+plot(bandWidth,    "bandWidth",    display = display.data_window)
+plot(bandWidthPct, "bandWidthPct", display = display.data_window)
+plot(percentB,     "percentB",     display = display.data_window)
+plot(zScore,       "zScore",       display = display.data_window)
+plot(bbAboveBasis ? 1 : 0, "bbAboveBasis", display = display.data_window)
+plot(bbBelowBasis ? 1 : 0, "bbBelowBasis", display = display.data_window)
+plot(bbSlopeUp   ? 1 : 0, "bbSlopeUp",   display = display.data_window)
+plot(bbSlopeDown ? 1 : 0, "bbSlopeDown", display = display.data_window)
+plot(bbAboveUpper2 ? 1 : 0, "bbAboveUpper2", display = display.data_window)
+plot(bbBelowLower2 ? 1 : 0, "bbBelowLower2", display = display.data_window)
+plot(bbAboveUpper3 ? 1 : 0, "bbAboveUpper3", display = display.data_window)
+plot(bbBelowLower3 ? 1 : 0, "bbBelowLower3", display = display.data_window)
+plot(bbInside2  ? 1 : 0, "bbInside2",  display = display.data_window)
+plot(bbOutside2 ? 1 : 0, "bbOutside2", display = display.data_window)
+plot(bbBuyReversal2Signal  ? 1 : 0, "bbBuyReversal2Signal",  display = display.data_window)
+plot(bbSellReversal2Signal ? 1 : 0, "bbSellReversal2Signal", display = display.data_window)
+plot(bbBuyReversal3Signal  ? 1 : 0, "bbBuyReversal3Signal",  display = display.data_window)
+plot(bbSellReversal3Signal ? 1 : 0, "bbSellReversal3Signal", display = display.data_window)
+plot(bbBuyBandWalkSignal  ? 1 : 0, "bbBuyBandWalkSignal",  display = display.data_window)
+plot(bbSellBandWalkSignal ? 1 : 0, "bbSellBandWalkSignal", display = display.data_window)
+plot(bbBuyExpansionSignal  ? 1 : 0, "bbBuyExpansionSignal",  display = display.data_window)
+plot(bbSellExpansionSignal ? 1 : 0, "bbSellExpansionSignal", display = display.data_window)
+plot(bbBuyMiddleBounceSignal  ? 1 : 0, "bbBuyMiddleBounceSignal",  display = display.data_window)
+plot(bbSellMiddleBounceSignal ? 1 : 0, "bbSellMiddleBounceSignal", display = display.data_window)
+plot(bbBuyMiddleBreakSignal  ? 1 : 0, "bbBuyMiddleBreakSignal",  display = display.data_window)
+plot(bbSellMiddleBreakSignal ? 1 : 0, "bbSellMiddleBreakSignal", display = display.data_window)
+plot(bbSqueezeSignal ? 1 : 0, "bbSqueezeSignal", display = display.data_window)
+plot(bbSignalType, "bbSignalType", display = display.data_window)
+plot(bbDirection,  "bbDirection",  display = display.data_window)
+plot(bbRank,       "bbRank",       display = display.data_window)
+plot(bbBiasLong  ? 1 : 0, "bbBiasLong",  display = display.data_window)
+plot(bbBiasShort ? 1 : 0, "bbBiasShort", display = display.data_window)
+plot(bbNoTrade      ? 1 : 0, "bbNoTrade",      display = display.data_window)
+plot(bbNoTradeLong  ? 1 : 0, "bbNoTradeLong",  display = display.data_window)
+plot(bbNoTradeShort ? 1 : 0, "bbNoTradeShort", display = display.data_window)
+plot(allowLongByBB  ? 1 : 0, "allowLongByBB",  display = display.data_window)
+plot(allowShortByBB ? 1 : 0, "allowShortByBB", display = display.data_window)
+plot(bbPercentBOkLong  ? 1 : 0, "bbPercentBOkLong",  display = display.data_window)
+plot(bbPercentBOkShort ? 1 : 0, "bbPercentBOkShort", display = display.data_window)
+plot(bbZScoreOkLong  ? 1 : 0, "bbZScoreOkLong",  display = display.data_window)
+plot(bbZScoreOkShort ? 1 : 0, "bbZScoreOkShort", display = display.data_window)
+
+// ============================================================
+//  シグナル形状
+// ============================================================
+plotshape(bbBuyReversal2Signal,  title = "BUY Rev2",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0),  size = size.tiny)
+plotshape(bbSellReversal2Signal, title = "SELL Rev2", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),    size = size.tiny)
+plotshape(bbBuyReversal3Signal,  title = "BUY Rev3",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime, 0),   size = size.small)
+plotshape(bbSellReversal3Signal, title = "SELL Rev3", style = shape.triangledown, location = location.abovebar, color = color.new(color.maroon, 0), size = size.small)
+plotshape(bbBuyBandWalkSignal,  title = "BUY Walk",  style = shape.flag, location = location.belowbar, color = color.new(color.teal, 0),    size = size.tiny)
+plotshape(bbSellBandWalkSignal, title = "SELL Walk", style = shape.flag, location = location.abovebar, color = color.new(color.fuchsia, 0), size = size.tiny)
+plotshape(bbBuyExpansionSignal,  title = "BUY Exp",  style = shape.arrowup,   location = location.belowbar, color = color.new(color.aqua, 0),   size = size.tiny)
+plotshape(bbSellExpansionSignal, title = "SELL Exp", style = shape.arrowdown, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
+plotshape(bbBuyMiddleBounceSignal,  title = "BUY MidBounce",  style = shape.circle, location = location.belowbar, color = color.new(color.green, 0), size = size.tiny)
+plotshape(bbSellMiddleBounceSignal, title = "SELL MidBounce", style = shape.circle, location = location.abovebar, color = color.new(color.red, 0),   size = size.tiny)
+plotshape(bbBuyMiddleBreakSignal,  title = "BUY MidBreak",  style = shape.diamond, location = location.belowbar, color = color.new(color.blue, 0),   size = size.tiny)
+plotshape(bbSellMiddleBreakSignal, title = "SELL MidBreak", style = shape.diamond, location = location.abovebar, color = color.new(color.purple, 0), size = size.tiny)
+plotshape(bbSqueezeSignal, title = "Squeeze", style = shape.xcross, location = location.bottom, color = color.new(color.gray, 0), size = size.tiny)
+
+// ============================================================
+//  アラート
+// ============================================================
+alertcondition(bbBuyReversal2Signal,  "BB BUY Rev2",  "{{ticker}} BB ±2σ反発 BUY")
+alertcondition(bbSellReversal2Signal, "BB SELL Rev2", "{{ticker}} BB ±2σ反発 SELL")
+alertcondition(bbBuyReversal3Signal,  "BB BUY Rev3",  "{{ticker}} BB ±3σ反発 BUY")
+alertcondition(bbSellReversal3Signal, "BB SELL Rev3", "{{ticker}} BB ±3σ反発 SELL")
+alertcondition(bbBuyBandWalkSignal,  "BB BUY Walk",  "{{ticker}} BB BandWalk BUY")
+alertcondition(bbSellBandWalkSignal, "BB SELL Walk", "{{ticker}} BB BandWalk SELL")
+alertcondition(bbBuyExpansionSignal,  "BB BUY Expansion",  "{{ticker}} BB エクスパンション BUY")
+alertcondition(bbSellExpansionSignal, "BB SELL Expansion", "{{ticker}} BB エクスパンション SELL")
+alertcondition(bbBuyMiddleBounceSignal,  "BB BUY MiddleBounce",  "{{ticker}} BB ミドル反発 BUY")
+alertcondition(bbSellMiddleBounceSignal, "BB SELL MiddleBounce", "{{ticker}} BB ミドル反発 SELL")
+alertcondition(bbBuyMiddleBreakSignal,  "BB BUY MiddleBreak",  "{{ticker}} BB ミドルブレイク BUY")
+alertcondition(bbSellMiddleBreakSignal, "BB SELL MiddleBreak", "{{ticker}} BB ミドルブレイク SELL")
+alertcondition(bbSqueezeSignal, "BB Squeeze", "{{ticker}} BB スクイーズ")
+alertcondition(allowLongByBB,  "Allow Long BB",  "{{ticker}} BB ロング許可")
+alertcondition(allowShortByBB, "Allow Short BB", "{{ticker}} BB ショート許可")
+alertcondition(bbNoTrade, "BB NoTrade", "{{ticker}} BB ノートレード")
