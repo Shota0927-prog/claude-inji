@@ -1,0 +1,323 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © your_username
+//
+// ============================================================
+//  Pivot 単体モジュール (Indicator版)
+// ============================================================
+//  ・Classic Pivot 関連だけを独立モジュール化。
+//  ・後で 環境認識 / フィボ / FVG / 出来高 / EMA / 水平線 /
+//    マクロ / Silver / ストキャス / RSI / MACD と AND 接続する前提。
+//  ・strategy ではなく indicator。シグナル出力のみ。
+//  ・strategy.entry / strategy.closedtrades / opentrades は使わない。
+//  ・request.security は lookahead_off (確定済み前足)。ADX は使わない。
+//  パターン: A:反発 B:スイープ反転 C:ブレイク→レジサポ転換
+//  フィルター: 障害物(Block) / 利幅(Room)
+// ============================================================
+
+//@version=5
+indicator(
+     title          = "Pivot Module",
+     shorttitle     = "PIVOT",
+     overlay        = true,
+     max_bars_back  = 1000,
+     max_labels_count = 500
+ )
+
+// ============================================================
+//  入力 (グループ: Pivot Module)
+// ============================================================
+grpPivot = "Pivot Module"
+
+usePivotModule  = input.bool(true,  "Pivotモジュールを使う", group = grpPivot)
+showPivotLines  = input.bool(true,  "Pivotラインを表示",     group = grpPivot)
+showPivotLabels = input.bool(true,  "シグナルラベルを表示",  group = grpPivot)
+showPivotDebugTable = input.bool(true, "デバッグテーブルを表示", group = grpPivot)
+pivotTf         = input.timeframe("D", "Pivot計算TF",        group = grpPivot)
+
+pivotTouchMode  = input.string("ATR", "Pivot接近判定", options = ["Dollar", "ATR"], group = grpPivot)
+pivotTouchDollar= input.float(3.0, "Pivot接近幅($)",      step = 0.1,  group = grpPivot)
+pivotTouchATR   = input.float(0.3, "Pivot接近幅 ATR倍率", step = 0.05, group = grpPivot)
+
+useBounceEntry      = input.bool(true, "A: Pivot反発",            group = grpPivot)
+useSweepEntry       = input.bool(true, "B: Pivotスイープ反転",    group = grpPivot)
+useBreakRetestEntry = input.bool(true, "C: Pivotブレイク→転換",   group = grpPivot)
+pivotEntryMode      = input.string("Any", "エントリー結合", options = ["Any", "All"], group = grpPivot)
+pivotRetestBars     = input.int(10, "Pivotリテスト有効本数", minval = 1, group = grpPivot)
+
+usepivotBlockFilter = input.bool(false, "障害物フィルター(近接Pivot禁止)", group = grpPivot)
+pivotBlockDollar    = input.float(5.0, "障害物 距離($)", step = 0.1, group = grpPivot)
+
+usePivotRoomFilter  = input.bool(false, "利幅フィルター", group = grpPivot)
+minPivotRoomDollar  = input.float(8.0, "最低Pivot利幅($)", step = 0.1, group = grpPivot)
+
+// ============================================================
+//  Pivot計算 (Classic / 関数化 / 確定済み前足)
+// ============================================================
+f_pivotClassic(tf) =>
+    [pH, pL, pC] = request.security(syminfo.tickerid, tf, [high[1], low[1], close[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+    float pp = (pH + pL + pC) / 3.0
+    float r1 = 2.0 * pp - pL
+    float s1 = 2.0 * pp - pH
+    float r2 = pp + (pH - pL)
+    float s2 = pp - (pH - pL)
+    float r3 = pH + 2.0 * (pp - pL)
+    float s3 = pL - 2.0 * (pH - pp)
+    [pp, r1, r2, r3, s1, s2, s3]
+
+[pivot_pp, pivot_r1, pivot_r2, pivot_r3, pivot_s1, pivot_s2, pivot_s3] = f_pivotClassic(pivotTf)
+
+bool pAct = usePivotModule
+
+// ============================================================
+//  接近判定
+// ============================================================
+float pivot_atr = ta.atr(14)
+float pivot_touchRange = pivotTouchMode == "ATR" ? pivot_atr * pivotTouchATR : pivotTouchDollar
+
+f_isNear(price, level, rng) =>
+    not na(level) and math.abs(price - level) <= rng
+
+bool pivot_nearUpper = f_isNear(close, pivot_r1, pivot_touchRange) or f_isNear(close, pivot_r2, pivot_touchRange) or f_isNear(close, pivot_r3, pivot_touchRange) or f_isNear(close, pivot_pp, pivot_touchRange)
+bool pivot_nearLower = f_isNear(close, pivot_s1, pivot_touchRange) or f_isNear(close, pivot_s2, pivot_touchRange) or f_isNear(close, pivot_s3, pivot_touchRange) or f_isNear(close, pivot_pp, pivot_touchRange)
+
+// ============================================================
+//  最寄り Pivot と距離 (Block/Room/TP候補 共用)
+// ============================================================
+pivot_levels = array.from(pivot_pp, pivot_r1, pivot_r2, pivot_r3, pivot_s1, pivot_s2, pivot_s3)
+float pivot_nearestUpper = na
+float pivot_nearestLower = na
+for pivot_i = 0 to array.size(pivot_levels) - 1
+    float lv = array.get(pivot_levels, pivot_i)
+    if not na(lv)
+        if lv > close
+            pivot_nearestUpper := na(pivot_nearestUpper) ? lv : math.min(pivot_nearestUpper, lv)
+        if lv < close
+            pivot_nearestLower := na(pivot_nearestLower) ? lv : math.max(pivot_nearestLower, lv)
+
+float pivot_nearestUpperDist = na(pivot_nearestUpper) ? na : pivot_nearestUpper - close
+float pivot_nearestLowerDist = na(pivot_nearestLower) ? na : close - pivot_nearestLower
+
+// ============================================================
+//  障害物 / 利幅フィルター
+// ============================================================
+bool pivotObstacleAbove = pAct and usepivotBlockFilter and not na(pivot_nearestUpperDist) and pivot_nearestUpperDist < pivotBlockDollar
+bool pivotObstacleBelow = pAct and usepivotBlockFilter and not na(pivot_nearestLowerDist) and pivot_nearestLowerDist < pivotBlockDollar
+
+bool pivotRoomOKLong  = not (pAct and usePivotRoomFilter) or na(pivot_nearestUpperDist) or pivot_nearestUpperDist >= minPivotRoomDollar
+bool pivotRoomOKShort = not (pAct and usePivotRoomFilter) or na(pivot_nearestLowerDist) or pivot_nearestLowerDist >= minPivotRoomDollar
+
+// ============================================================
+//  反転ローソク判定 (共通)
+// ============================================================
+float pivot_body   = math.abs(close - open)
+float pivot_upWick = high - math.max(open, close)
+float pivot_dnWick = math.min(open, close) - low
+bool pivot_bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bool pivot_bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+bool pivot_pinLower = pivot_dnWick >= pivot_body and pivot_dnWick >= pivot_upWick
+bool pivot_pinUpper = pivot_upWick >= pivot_body and pivot_upWick >= pivot_dnWick
+bool pivot_bullishReversal = pivot_bullEngulf or pivot_pinLower or close > open
+bool pivot_bearishReversal = pivot_bearEngulf or pivot_pinUpper or close < open
+
+// ============================================================
+//  A: Pivot反発
+// ============================================================
+bool pivotBuyBounceSignal  = pAct and useBounceEntry and pivot_nearLower and pivot_bullishReversal
+bool pivotSellBounceSignal = pAct and useBounceEntry and pivot_nearUpper and pivot_bearishReversal
+
+// ============================================================
+//  B: Pivotスイープ反転
+// ============================================================
+f_sweptUp(level) => not na(level) and high > level and close < level
+f_sweptDn(level) => not na(level) and low  < level and close > level
+bool pivot_upSwept = f_sweptUp(pivot_r1) or f_sweptUp(pivot_r2) or f_sweptUp(pivot_r3) or f_sweptUp(pivot_pp)
+bool pivot_dnSwept = f_sweptDn(pivot_s1) or f_sweptDn(pivot_s2) or f_sweptDn(pivot_s3) or f_sweptDn(pivot_pp)
+bool pivotSellSweepSignal = pAct and useSweepEntry and pivot_upSwept and pivot_upWick > pivot_body and close < open
+bool pivotBuySweepSignal  = pAct and useSweepEntry and pivot_dnSwept and pivot_dnWick > pivot_body and close > open
+
+// ============================================================
+//  C: Pivotブレイク → レジサポ転換 (簡易リテスト)
+// ============================================================
+var float pivot_breakUpLevel = na
+var int   pivot_breakUpBar   = na
+var float pivot_breakDnLevel = na
+var int   pivot_breakDnBar   = na
+
+if ta.crossover(close, pivot_r2)
+    pivot_breakUpLevel := pivot_r2
+    pivot_breakUpBar := bar_index
+else if ta.crossover(close, pivot_r1)
+    pivot_breakUpLevel := pivot_r1
+    pivot_breakUpBar := bar_index
+else if ta.crossover(close, pivot_pp)
+    pivot_breakUpLevel := pivot_pp
+    pivot_breakUpBar := bar_index
+if ta.crossunder(close, pivot_s2)
+    pivot_breakDnLevel := pivot_s2
+    pivot_breakDnBar := bar_index
+else if ta.crossunder(close, pivot_s1)
+    pivot_breakDnLevel := pivot_s1
+    pivot_breakDnBar := bar_index
+else if ta.crossunder(close, pivot_pp)
+    pivot_breakDnLevel := pivot_pp
+    pivot_breakDnBar := bar_index
+
+bool pivotBuyBreakRetestSignal  = pAct and useBreakRetestEntry and not na(pivot_breakUpLevel) and (bar_index - pivot_breakUpBar) <= pivotRetestBars and low <= pivot_breakUpLevel + pivot_touchRange and close > pivot_breakUpLevel and close > open
+bool pivotSellBreakRetestSignal = pAct and useBreakRetestEntry and not na(pivot_breakDnLevel) and (bar_index - pivot_breakDnBar) <= pivotRetestBars and high >= pivot_breakDnLevel - pivot_touchRange and close < pivot_breakDnLevel and close < open
+
+// ============================================================
+//  エントリー結合 (Any / All) → 方向別
+// ============================================================
+int pivot_enabledCount = (useBounceEntry ? 1 : 0) + (useSweepEntry ? 1 : 0) + (useBreakRetestEntry ? 1 : 0)
+int pivot_firedBuy  = (pivotBuyBounceSignal ? 1 : 0) + (pivotBuySweepSignal ? 1 : 0) + (pivotBuyBreakRetestSignal ? 1 : 0)
+int pivot_firedSell = (pivotSellBounceSignal ? 1 : 0) + (pivotSellSweepSignal ? 1 : 0) + (pivotSellBreakRetestSignal ? 1 : 0)
+bool pivotEntryBuy  = pAct and pivot_enabledCount > 0 and (pivotEntryMode == "All" ? pivot_firedBuy  == pivot_enabledCount : pivot_firedBuy  >= 1)
+bool pivotEntrySell = pAct and pivot_enabledCount > 0 and (pivotEntryMode == "All" ? pivot_firedSell == pivot_enabledCount : pivot_firedSell >= 1)
+
+// ============================================================
+//  Signal Type / Direction
+//   type: 0None /1Bounce /2Sweep /3BreakRetest (優先 Sweep>BreakRetest>Bounce)
+// ============================================================
+bool anyBounce = pivotBuyBounceSignal or pivotSellBounceSignal
+bool anySweep  = pivotBuySweepSignal or pivotSellSweepSignal
+bool anyBR     = pivotBuyBreakRetestSignal or pivotSellBreakRetestSignal
+
+int pivotSignalType = not pAct ? 0 :
+                       anySweep ? 2 :
+                       anyBR    ? 3 :
+                       anyBounce? 1 : 0
+
+int pivotDirection = not pAct ? 0 :
+                      anySweep ? (pivotBuySweepSignal ? 1 : -1) :
+                      anyBR    ? (pivotBuyBreakRetestSignal ? 1 : -1) :
+                      anyBounce? (pivotBuyBounceSignal ? 1 : -1) : 0
+
+// ============================================================
+//  Rank
+//   0None /1Bounce /2BreakRetest /3Sweep /4 Sweep+(Bounce/BreakRetest)合流
+// ============================================================
+int pivotRank = not pAct ? 0 :
+                 (anySweep and (anyBounce or anyBR)) ? 4 :
+                 anySweep ? 3 :
+                 anyBR ? 2 :
+                 anyBounce ? 1 : 0
+
+// ============================================================
+//  接続用出力
+// ============================================================
+bool pivotNoTrade = pAct and pivotObstacleAbove and pivotObstacleBelow   // 上下を近接Pivotに挟まれた状態
+bool allowLongByPivot  = pivotEntryBuy  and not pivotObstacleAbove and pivotRoomOKLong  and not pivotNoTrade
+bool allowShortByPivot = pivotEntrySell and not pivotObstacleBelow and pivotRoomOKShort and not pivotNoTrade
+
+// ============================================================
+//  表示 : Pivotライン
+// ============================================================
+plot(showPivotLines and pAct ? pivot_pp : na, "PP", color = color.new(color.gray, 0),  linewidth = 1, style = plot.style_linebr)
+plot(showPivotLines and pAct ? pivot_r1 : na, "R1", color = color.new(color.red, 30),   linewidth = 1, style = plot.style_linebr)
+plot(showPivotLines and pAct ? pivot_r2 : na, "R2", color = color.new(color.red, 50),   linewidth = 1, style = plot.style_linebr)
+plot(showPivotLines and pAct ? pivot_r3 : na, "R3", color = color.new(color.red, 70),   linewidth = 1, style = plot.style_linebr)
+plot(showPivotLines and pAct ? pivot_s1 : na, "S1", color = color.new(color.blue, 30),  linewidth = 1, style = plot.style_linebr)
+plot(showPivotLines and pAct ? pivot_s2 : na, "S2", color = color.new(color.blue, 50),  linewidth = 1, style = plot.style_linebr)
+plot(showPivotLines and pAct ? pivot_s3 : na, "S3", color = color.new(color.blue, 70),  linewidth = 1, style = plot.style_linebr)
+
+// ============================================================
+//  表示 : ラベル
+// ============================================================
+f_mkLabel(isBuy, txt, col) =>
+    label.new(bar_index, isBuy ? low : high, txt, style = isBuy ? label.style_label_up : label.style_label_down, color = col, textcolor = color.white, yloc = isBuy ? yloc.belowbar : yloc.abovebar, size = size.small)
+
+if showPivotLabels
+    if pivotBuyBounceSignal
+        f_mkLabel(true,  "Bounce↑", color.new(color.green, 0))
+    if pivotSellBounceSignal
+        f_mkLabel(false, "Bounce↓", color.new(color.red, 0))
+    if pivotBuySweepSignal
+        f_mkLabel(true,  "Sweep↑", color.new(color.aqua, 0))
+    if pivotSellSweepSignal
+        f_mkLabel(false, "Sweep↓", color.new(color.orange, 0))
+    if pivotBuyBreakRetestSignal
+        f_mkLabel(true,  "BRT↑", color.new(color.lime, 0))
+    if pivotSellBreakRetestSignal
+        f_mkLabel(false, "BRT↓", color.new(color.fuchsia, 0))
+
+// ============================================================
+//  表示 : デバッグテーブル
+// ============================================================
+f_typeStr(t) =>
+    t == 1 ? "Bounce" : t == 2 ? "Sweep" : t == 3 ? "BreakRT" : "-"
+
+var table dbg = table.new(position.top_right, 2, 8, border_width = 1)
+if showPivotDebugTable and barstate.islast
+    string sDir = pivotDirection == 1 ? "BUY" : pivotDirection == -1 ? "SELL" : "-"
+    table.cell(dbg, 0, 0, "Pivot", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(dbg, 1, 0, pivotNoTrade ? "NoTrade" : (pivotDirection != 0 ? "SIGNAL" : "-"), text_color = color.white, bgcolor = pivotNoTrade ? color.new(color.red, 30) : color.new(color.blue, 0))
+    table.cell(dbg, 0, 1, "PP", text_color = color.white)
+    table.cell(dbg, 1, 1, na(pivot_pp) ? "-" : str.tostring(pivot_pp, format.mintick), text_color = color.white)
+    table.cell(dbg, 0, 2, "Signal Type", text_color = color.white)
+    table.cell(dbg, 1, 2, f_typeStr(pivotSignalType), text_color = color.white)
+    table.cell(dbg, 0, 3, "Direction", text_color = color.white)
+    table.cell(dbg, 1, 3, sDir, text_color = color.white)
+    table.cell(dbg, 0, 4, "Rank", text_color = color.white)
+    table.cell(dbg, 1, 4, str.tostring(pivotRank), text_color = color.white)
+    table.cell(dbg, 0, 5, "Up/Low Dist", text_color = color.white)
+    table.cell(dbg, 1, 5, (na(pivot_nearestUpperDist) ? "-" : str.tostring(pivot_nearestUpperDist, "#.##")) + " / " + (na(pivot_nearestLowerDist) ? "-" : str.tostring(pivot_nearestLowerDist, "#.##")), text_color = color.white)
+    table.cell(dbg, 0, 6, "Obstacle A/B", text_color = color.white)
+    table.cell(dbg, 1, 6, (pivotObstacleAbove ? "Y" : "N") + " / " + (pivotObstacleBelow ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 7, "Room L/S", text_color = color.white)
+    table.cell(dbg, 1, 7, (pivotRoomOKLong ? "Y" : "N") + " / " + (pivotRoomOKShort ? "Y" : "N"), text_color = color.white)
+
+// ============================================================
+//  プロット (接続用 : Data Window)
+// ============================================================
+plot(pivot_pp, "pivot_pp", display = display.data_window)
+plot(pivot_r1, "pivot_r1", display = display.data_window)
+plot(pivot_r2, "pivot_r2", display = display.data_window)
+plot(pivot_r3, "pivot_r3", display = display.data_window)
+plot(pivot_s1, "pivot_s1", display = display.data_window)
+plot(pivot_s2, "pivot_s2", display = display.data_window)
+plot(pivot_s3, "pivot_s3", display = display.data_window)
+plot(pivot_nearestUpper, "pivot_nearestUpper", display = display.data_window)
+plot(pivot_nearestLower, "pivot_nearestLower", display = display.data_window)
+plot(pivot_nearestUpperDist, "pivot_nearestUpperDist", display = display.data_window)
+plot(pivot_nearestLowerDist, "pivot_nearestLowerDist", display = display.data_window)
+
+plot(pivotSignalType, "pivotSignalType", display = display.data_window)
+plot(pivotDirection,  "pivotDirection",  display = display.data_window)
+plot(pivotRank,       "pivotRank",       display = display.data_window)
+plot(allowLongByPivot  ? 1 : 0, "allowLongByPivot",  display = display.data_window)
+plot(allowShortByPivot ? 1 : 0, "allowShortByPivot", display = display.data_window)
+plot(pivotNoTrade ? 1 : 0, "pivotNoTrade", display = display.data_window)
+plot(pivotObstacleAbove ? 1 : 0, "pivotObstacleAbove", display = display.data_window)
+plot(pivotObstacleBelow ? 1 : 0, "pivotObstacleBelow", display = display.data_window)
+plot(pivotRoomOKLong  ? 1 : 0, "pivotRoomOKLong",  display = display.data_window)
+plot(pivotRoomOKShort ? 1 : 0, "pivotRoomOKShort", display = display.data_window)
+
+plot(pivotBuyBounceSignal  ? 1 : 0, "pivotBuyBounceSignal",  display = display.data_window)
+plot(pivotSellBounceSignal ? 1 : 0, "pivotSellBounceSignal", display = display.data_window)
+plot(pivotBuySweepSignal   ? 1 : 0, "pivotBuySweepSignal",   display = display.data_window)
+plot(pivotSellSweepSignal  ? 1 : 0, "pivotSellSweepSignal",  display = display.data_window)
+plot(pivotBuyBreakRetestSignal  ? 1 : 0, "pivotBuyBreakRetestSignal",  display = display.data_window)
+plot(pivotSellBreakRetestSignal ? 1 : 0, "pivotSellBreakRetestSignal", display = display.data_window)
+
+// ============================================================
+//  シグナル形状
+// ============================================================
+plotshape(pivotBuyBounceSignal,  title = "BUY Bounce",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0),   size = size.tiny)
+plotshape(pivotSellBounceSignal, title = "SELL Bounce", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),     size = size.tiny)
+plotshape(pivotBuySweepSignal,   title = "BUY Sweep",   style = shape.flag,         location = location.belowbar, color = color.new(color.aqua, 0),    size = size.tiny)
+plotshape(pivotSellSweepSignal,  title = "SELL Sweep",  style = shape.flag,         location = location.abovebar, color = color.new(color.orange, 0),  size = size.tiny)
+plotshape(pivotBuyBreakRetestSignal,  title = "BUY BRT",  style = shape.diamond,    location = location.belowbar, color = color.new(color.lime, 0),    size = size.tiny)
+plotshape(pivotSellBreakRetestSignal, title = "SELL BRT", style = shape.diamond,    location = location.abovebar, color = color.new(color.fuchsia, 0), size = size.tiny)
+
+// ============================================================
+//  アラート
+// ============================================================
+alertcondition(pivotBuyBounceSignal,  "Pivot BUY Bounce",  "{{ticker}} Pivot反発 BUY")
+alertcondition(pivotSellBounceSignal, "Pivot SELL Bounce", "{{ticker}} Pivot反発 SELL")
+alertcondition(pivotBuySweepSignal,   "Pivot BUY Sweep",   "{{ticker}} Pivotスイープ BUY")
+alertcondition(pivotSellSweepSignal,  "Pivot SELL Sweep",  "{{ticker}} Pivotスイープ SELL")
+alertcondition(pivotBuyBreakRetestSignal,  "Pivot BUY BRT",  "{{ticker}} Pivotブレイク転換 BUY")
+alertcondition(pivotSellBreakRetestSignal, "Pivot SELL BRT", "{{ticker}} Pivotブレイク転換 SELL")
+alertcondition(allowLongByPivot,  "Allow Long Pivot",  "{{ticker}} Pivot ロング許可")
+alertcondition(allowShortByPivot, "Allow Short Pivot", "{{ticker}} Pivot ショート許可")
+alertcondition(pivotNoTrade,      "Pivot NoTrade",     "{{ticker}} Pivot ノートレード")
