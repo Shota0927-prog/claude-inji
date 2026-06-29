@@ -65,6 +65,20 @@ partialTriggerMode = input.string("Accum15", "部分利確条件", options = ["A
 partialRR     = input.float(1.0,  "部分利確RR", minval = 0.1, step = 0.1, group = groupTradeMgmt)
 partialDollar = input.float(15.0, "部分利確幅($)", minval = 0.1, step = 0.1, group = groupTradeMgmt)
 
+// --- Fibonacci Expansion ---
+useFibExpansion = input.bool(true, "Fib Expansionを使う", group = groupTradeMgmt)
+fibSwingLen     = input.int(20, "Fib Expansion Swing Lookback", minval = 2, group = groupTradeMgmt)
+fibExpTPMode    = input.string("Off", "Fib Expansion TP調整", options = ["Off", "TP1_100", "TP2_127", "TP3_161", "TP4_200"], group = groupTradeMgmt)
+
+useFibPartialTP = input.bool(false, "Fib到達で部分利確", group = groupTradeMgmt)
+fibPartialLevel = input.string("127.2", "Fib部分利確Level", options = ["100", "127.2", "161.8", "200"], group = groupTradeMgmt)
+
+useFibRoomFilter = input.bool(false, "Fib伸びしろ不足でNoTrade", group = groupTradeMgmt)
+minFibRoomDollar = input.float(5.0, "最低Fib伸びしろ($)", minval = 0.1, step = 0.1, group = groupTradeMgmt)
+
+useFibOverExtensionFilter = input.bool(false, "Fib伸び切りで追いかけ禁止", group = groupTradeMgmt)
+fibOverExtensionLevel     = input.string("161.8", "伸び切り判定Level", options = ["127.2", "161.8", "200"], group = groupTradeMgmt)
+
 // ============================================================
 //  2. 接続用ブリッジ変数
 //  既存strategy側で以下を定義してから、このモジュールを貼り付けること
@@ -153,6 +167,60 @@ f_snap_tp_to_ema(_dir, _entry, _tpRaw) =>
     _tp
 
 // ============================================================
+//  5'. Fibonacci Expansion 計算 (直近高安ベース・簡易版)
+// ============================================================
+float fibSwingHigh = ta.highest(high, fibSwingLen)
+float fibSwingLow  = ta.lowest(low,  fibSwingLen)
+float fibRange     = fibSwingHigh - fibSwingLow
+
+// BUY Expansion (上方向)
+float fibExpBuy100 = fibSwingLow + fibRange * 1.0
+float fibExpBuy127 = fibSwingLow + fibRange * 1.272
+float fibExpBuy161 = fibSwingLow + fibRange * 1.618
+float fibExpBuy200 = fibSwingLow + fibRange * 2.0
+
+// SELL Expansion (下方向)
+float fibExpSell100 = fibSwingHigh - fibRange * 1.0
+float fibExpSell127 = fibSwingHigh - fibRange * 1.272
+float fibExpSell161 = fibSwingHigh - fibRange * 1.618
+float fibExpSell200 = fibSwingHigh - fibRange * 2.0
+
+// Fib TP 選択 (_dir: 1=BUY / -1=SELL)
+f_fib_tp(_dir) =>
+    float _tp = na
+    if _dir == 1
+        _tp := fibExpTPMode == "TP1_100" ? fibExpBuy100 :
+               fibExpTPMode == "TP2_127" ? fibExpBuy127 :
+               fibExpTPMode == "TP3_161" ? fibExpBuy161 :
+               fibExpTPMode == "TP4_200" ? fibExpBuy200 : na
+    if _dir == -1
+        _tp := fibExpTPMode == "TP1_100" ? fibExpSell100 :
+               fibExpTPMode == "TP2_127" ? fibExpSell127 :
+               fibExpTPMode == "TP3_161" ? fibExpSell161 :
+               fibExpTPMode == "TP4_200" ? fibExpSell200 : na
+    _tp
+
+// Fib 伸びしろ判定 (次ターゲット = 127.2)
+float fibNextTargetLong  = fibExpBuy127
+float fibNextTargetShort = fibExpSell127
+float fibRoomLong  = fibNextTargetLong - close
+float fibRoomShort = close - fibNextTargetShort
+bool fibRoomOkLong  = not useFibRoomFilter or not useFibExpansion or fibRoomLong  >= minFibRoomDollar
+bool fibRoomOkShort = not useFibRoomFilter or not useFibExpansion or fibRoomShort >= minFibRoomDollar
+
+// Fib 伸び切り判定
+bool fibOverLong =
+     fibOverExtensionLevel == "127.2" ? close >= fibExpBuy127 :
+     fibOverExtensionLevel == "161.8" ? close >= fibExpBuy161 :
+     close >= fibExpBuy200
+bool fibOverShort =
+     fibOverExtensionLevel == "127.2" ? close <= fibExpSell127 :
+     fibOverExtensionLevel == "161.8" ? close <= fibExpSell161 :
+     close <= fibExpSell200
+bool fibOverOkLong  = not useFibOverExtensionFilter or not useFibExpansion or not fibOverLong
+bool fibOverOkShort = not useFibOverExtensionFilter or not useFibExpansion or not fibOverShort
+
+// ============================================================
 //  6. 状態変数
 // ============================================================
 var map<string, float> tmTpMap = map.new<string, float>()
@@ -178,6 +246,7 @@ bool tmPartialEvent  = false
 bool tmBeEvent       = false
 bool tmBeClosedEvent = false
 bool tmReentryEvent  = false
+bool tmFibPartialEvent = false
 
 // ============================================================
 //  7. エントリー時の記録 (strategy.entry 直後に SL/TP スナップ + 状態保存)
@@ -185,10 +254,14 @@ bool tmReentryEvent  = false
 bool tmFlat = strategy.position_size == 0
 
 // ---- BUY ----
-if useTradeMgmtModule and tmEntryLong and tmFlat
+if useTradeMgmtModule and tmEntryLong and tmFlat and fibRoomOkLong and fibOverOkLong
     float _entry = close
     float _slRaw = _entry - tmRiskWidth
     float _tpRaw = _entry + tmRiskWidth * tmRR
+    // Fib Expansion TP を反映 (entry より上のときのみ採用)
+    float _fibTP = useFibExpansion and fibExpTPMode != "Off" ? f_fib_tp(1) : na
+    if not na(_fibTP) and _fibTP > _entry
+        _tpRaw := _fibTP
     float _slF = f_snap_sl_to_ema(1, _entry, _slRaw)
     float _tpF = f_snap_tp_to_ema(1, _entry, _tpRaw)
     // 既存 entryTag を使う場合は次行に差し替え:
@@ -210,10 +283,14 @@ if useTradeMgmtModule and tmEntryLong and tmFlat
     tmFinalTP      := _tpF
 
 // ---- SELL ----
-if useTradeMgmtModule and tmEntryShort and tmFlat
+if useTradeMgmtModule and tmEntryShort and tmFlat and fibRoomOkShort and fibOverOkShort
     float _entry = close
     float _slRaw = _entry + tmRiskWidth
     float _tpRaw = _entry - tmRiskWidth * tmRR
+    // Fib Expansion TP を反映 (entry より下のときのみ採用)
+    float _fibTP = useFibExpansion and fibExpTPMode != "Off" ? f_fib_tp(-1) : na
+    if not na(_fibTP) and _fibTP < _entry
+        _tpRaw := _fibTP
     float _slF = f_snap_sl_to_ema(-1, _entry, _slRaw)
     float _tpF = f_snap_tp_to_ema(-1, _entry, _tpRaw)
     // 既存 entryTag を使う場合は次行に差し替え:
@@ -238,16 +315,26 @@ if useTradeMgmtModule and tmEntryShort and tmFlat
 //  8. 部分利確 (1 トレード 1 回 / エントリー足では発動しない)
 // ============================================================
 bool tmAfterEntryBar = bar_index > nz(tmLastEntryBar, -1)
+
+// Fib 部分利確ターゲット価格 (方向別)
+float fibPartialTarget = tmReCurIsLong ?
+     (fibPartialLevel == "100" ? fibExpBuy100 : fibPartialLevel == "127.2" ? fibExpBuy127 : fibPartialLevel == "161.8" ? fibExpBuy161 : fibExpBuy200) :
+     (fibPartialLevel == "100" ? fibExpSell100 : fibPartialLevel == "127.2" ? fibExpSell127 : fibPartialLevel == "161.8" ? fibExpSell161 : fibExpSell200)
+bool fibPartialTrigger = useFibExpansion and useFibPartialTP and (tmReCurIsLong ? high >= fibPartialTarget : low <= fibPartialTarget)
+
 bool partialTrigger =
-     partialTriggerMode == "Accum15" ? newAccum15 :
-     partialTriggerMode == "RR"      ? (tmReCurIsLong ? high >= tmReEntryPx + tmReRiskW * partialRR : low <= tmReEntryPx - tmReRiskW * partialRR) :
-     (tmReCurIsLong ? high >= tmReEntryPx + partialDollar : low <= tmReEntryPx - partialDollar)
+     (partialTriggerMode == "Accum15" ? newAccum15 :
+      partialTriggerMode == "RR"      ? (tmReCurIsLong ? high >= tmReEntryPx + tmReRiskW * partialRR : low <= tmReEntryPx - tmReRiskW * partialRR) :
+      (tmReCurIsLong ? high >= tmReEntryPx + partialDollar : low <= tmReEntryPx - partialDollar))
+     or fibPartialTrigger
 
 if useTradeMgmtModule and usePartialTP and strategy.position_size != 0 and not tmPartialDone and not na(tmCurTag) and tmAfterEntryBar
     if partialTrigger
         strategy.close(tmCurTag, qty_percent = partialPct, comment = "PT")
         tmPartialDone := true
         tmPartialEvent := true
+        if fibPartialTrigger
+            tmFibPartialEvent := true
 
 // ============================================================
 //  9. 建値移動 (含み益が beTrigger に到達したら SL を建値へ / 1 回だけ)
@@ -287,6 +374,10 @@ if useTradeMgmtModule and tmArmReentry and strategy.position_size == 0
     float _e2   = close
     float _sl2r = tmReCurIsLong ? _e2 - tmReRiskW : _e2 + tmReRiskW
     float _tp2r = tmReCurIsLong ? _e2 + tmReRiskW * tmReRR : _e2 - tmReRiskW * tmReRR
+    // Fib Expansion TP を反映 (entry より有利方向のときのみ採用)
+    float _fibTP2 = useFibExpansion and fibExpTPMode != "Off" ? f_fib_tp(_dir) : na
+    if not na(_fibTP2) and ((tmReCurIsLong and _fibTP2 > _e2) or (not tmReCurIsLong and _fibTP2 < _e2))
+        _tp2r := _fibTP2
     float _sl2  = f_snap_sl_to_ema(_dir, _e2, _sl2r)
     float _tp2  = f_snap_tp_to_ema(_dir, _e2, _tp2r)
     string _tag = "RE_" + str.tostring(bar_index)
@@ -317,6 +408,26 @@ plot(tmBeMoved     ? 1 : 0, "tmBeMoved",      display = display.data_window)
 plot(tmArmReentry  ? 1 : 0, "tmArmReentry",   display = display.data_window)
 plot(tmReentryCount,        "tmReentryCount", display = display.data_window)
 
+// --- Fib Expansion 出力 ---
+plot(fibExpBuy100, "fibExpBuy100", display = display.data_window)
+plot(fibExpBuy127, "fibExpBuy127", display = display.data_window)
+plot(fibExpBuy161, "fibExpBuy161", display = display.data_window)
+plot(fibExpBuy200, "fibExpBuy200", display = display.data_window)
+plot(fibExpSell100, "fibExpSell100", display = display.data_window)
+plot(fibExpSell127, "fibExpSell127", display = display.data_window)
+plot(fibExpSell161, "fibExpSell161", display = display.data_window)
+plot(fibExpSell200, "fibExpSell200", display = display.data_window)
+plot(fibRoomLong,  "fibRoomLong",  display = display.data_window)
+plot(fibRoomShort, "fibRoomShort", display = display.data_window)
+plot(fibRoomOkLong  ? 1 : 0, "fibRoomOkLong",  display = display.data_window)
+plot(fibRoomOkShort ? 1 : 0, "fibRoomOkShort", display = display.data_window)
+plot(fibOverLong  ? 1 : 0, "fibOverLong",  display = display.data_window)
+plot(fibOverShort ? 1 : 0, "fibOverShort", display = display.data_window)
+plot(fibOverOkLong  ? 1 : 0, "fibOverOkLong",  display = display.data_window)
+plot(fibOverOkShort ? 1 : 0, "fibOverOkShort", display = display.data_window)
+plot(fibPartialTarget,        "fibPartialTarget",  display = display.data_window)
+plot(fibPartialTrigger ? 1 : 0, "fibPartialTrigger", display = display.data_window)
+
 // ============================================================
 //  13. Alert
 // ============================================================
@@ -324,3 +435,8 @@ alertcondition(tmPartialEvent,  "TradeMgmt Partial TP", "{{ticker}} 部分利確
 alertcondition(tmBeEvent,       "TradeMgmt BE Moved",   "{{ticker}} 建値移動")
 alertcondition(tmBeClosedEvent, "TradeMgmt BE Closed",  "{{ticker}} 建値決済")
 alertcondition(tmReentryEvent,  "TradeMgmt Reentry",    "{{ticker}} 再エントリー")
+alertcondition(tmFibPartialEvent, "TradeMgmt Fib Partial TP", "{{ticker}} Fib部分利確")
+alertcondition(useFibExpansion and useFibRoomFilter and not fibRoomOkLong,  "TradeMgmt Fib Room NG Long",  "{{ticker}} Fib伸びしろ不足(Long)")
+alertcondition(useFibExpansion and useFibRoomFilter and not fibRoomOkShort, "TradeMgmt Fib Room NG Short", "{{ticker}} Fib伸びしろ不足(Short)")
+alertcondition(useFibExpansion and fibOverLong,  "TradeMgmt Fib Over Long",  "{{ticker}} Fib伸び切り(Long)")
+alertcondition(useFibExpansion and fibOverShort, "TradeMgmt Fib Over Short", "{{ticker}} Fib伸び切り(Short)")
