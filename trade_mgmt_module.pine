@@ -1,0 +1,321 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// ============================================================
+//  Trade Management Module (Strategy 貼り付け用)
+// ============================================================
+//  既存 strategy に貼り付けて使う「決済管理モジュール」。
+//    1. 建値移動 (Breakeven)
+//    2. 建値決済後の再エントリー
+//    3. MA に沿った SL 調整 (損切り側 MA へスナップ)
+//    4. MA に沿った TP 調整 (利確側 MA へスナップ)
+//    5. 部分利確 (Accum15 / RR / Dollar)
+//
+//  ※ これは indicator ではなく strategy。strategy.entry/exit/close/
+//    closedtrades/opentrades を使用する。
+//  ※ Pine v5 制約: strategy.* は user-defined function 内から呼べないため、
+//    エントリー記録/BE/再エントリーは global スコープの if ブロックで実装。
+//  ※ 既存 tag と衝突しないよう tm_ / TM_ / RE_ prefix を使用。
+//
+//  ▼ 接続方法:
+//    下の「ユーザー接続部」のブリッジ変数を、既存戦略の値へ差し替える。
+//    tmEntryLong / tmEntryShort … エントリーシグナル (bool)
+//    tmRiskWidth … リスク幅($)   tmRR … リワード倍率   tmQty … 数量
+//    newAccum15  … 部分利確(Accum15)用シグナル
+//    maArr       … 既存の MA 配列があればそれを使用 (無ければ本モジュールが生成)
+// ============================================================
+
+//@version=5
+strategy(
+     title             = "Trade Management Module",
+     shorttitle        = "TRADE_MGMT",
+     overlay           = true,
+     pyramiding        = 0,
+     initial_capital   = 1000,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     calc_on_every_tick= false,
+     max_labels_count  = 500
+ )
+
+// ============================================================
+//  1. Input
+// ============================================================
+groupTradeMgmt = "Trade Management Module"
+
+useTradeMgmtModule = input.bool(true, "Trade Managementを使う", group = groupTradeMgmt)
+
+useBE     = input.bool(true, "建値移動ON", group = groupTradeMgmt)
+beTrigger = input.float(15.0, "建値移動 発動幅($)", minval = 0.1, step = 0.1, group = groupTradeMgmt)
+beOffset  = input.float(0.0, "建値オフセット($)", step = 0.1, group = groupTradeMgmt)
+
+useReentry = input.bool(true, "建値決済後に再エントリー", group = groupTradeMgmt)
+maxReentry = input.int(1, "再エントリー最大回数", minval = 1, group = groupTradeMgmt)
+
+useMaSLTP = input.bool(true,  "MAでSL/TP調整ON", group = groupTradeMgmt)
+useMaSL   = input.bool(true,  "MAでSL調整ON", group = groupTradeMgmt)
+useMaTP   = input.bool(false, "MAでTP調整ON", group = groupTradeMgmt)
+
+maSlBuffer      = input.float(3.0,  "MAスナップ余白 SL($)", minval = 0.0, step = 0.1, group = groupTradeMgmt)
+maTpBuffer      = input.float(1.0,  "MAスナップ余白 TP($)", minval = 0.0, step = 0.1, group = groupTradeMgmt)
+maSnapMaxMult   = input.float(1.5,  "SLスナップ許容倍率", minval = 1.0, step = 0.1, group = groupTradeMgmt)
+maTpSnapBandPct = input.float(10.0, "TPスナップ許容バンド(±%)", minval = 0.0, step = 1.0, group = groupTradeMgmt)
+
+usePartialTP = input.bool(true, "部分利確ON", group = groupTradeMgmt)
+partialPct   = input.float(70.0, "部分利確割合(%)", minval = 1, maxval = 100, group = groupTradeMgmt)
+
+partialTriggerMode = input.string("Accum15", "部分利確条件", options = ["Accum15", "RR", "Dollar"], group = groupTradeMgmt)
+partialRR     = input.float(1.0,  "部分利確RR", minval = 0.1, step = 0.1, group = groupTradeMgmt)
+partialDollar = input.float(15.0, "部分利確幅($)", minval = 0.1, step = 0.1, group = groupTradeMgmt)
+
+// ============================================================
+//  2. ユーザー接続部 (ブリッジ変数) ★既存戦略の値に差し替え★
+//     ↓ ここはデモ用の最小実装。実戦では自分の戦略のシグナルに置換する。
+// ============================================================
+emaFastDemo = ta.ema(close, 20)
+emaSlowDemo = ta.ema(close, 50)
+atrDemo     = ta.atr(14)
+
+bool  tmEntryLong  = ta.crossover(emaFastDemo, emaSlowDemo)   // ← 既存の entrySignalLong に差し替え
+bool  tmEntryShort = ta.crossunder(emaFastDemo, emaSlowDemo)  // ← 既存の entrySignalShort に差し替え
+float tmRiskWidth  = atrDemo * 2.0                            // ← 既存の riskWidth に差し替え
+float tmRR         = 2.0                                       // ← 既存の rrValue に差し替え
+float tmQty        = 1                                         // ← 既存の qty に差し替え
+bool  newAccum15   = false                                     // ← 既存の newAccum15 に差し替え (Accum15 部分利確用)
+
+// ============================================================
+//  3. MA 配列 (既存 maArr があれば不要 / 確定値・lookahead_off)
+// ============================================================
+ema_1m_1000  = request.security(syminfo.tickerid, "1",   ta.ema(close, 1000)[1], lookahead = barmerge.lookahead_off)
+ema_1m_3000  = request.security(syminfo.tickerid, "1",   ta.ema(close, 3000)[1], lookahead = barmerge.lookahead_off)
+ema_5m_1000  = request.security(syminfo.tickerid, "5",   ta.ema(close, 1000)[1], lookahead = barmerge.lookahead_off)
+ema_5m_3000  = request.security(syminfo.tickerid, "5",   ta.ema(close, 3000)[1], lookahead = barmerge.lookahead_off)
+ema_15m_1000 = request.security(syminfo.tickerid, "15",  ta.ema(close, 1000)[1], lookahead = barmerge.lookahead_off)
+ema_15m_3000 = request.security(syminfo.tickerid, "15",  ta.ema(close, 3000)[1], lookahead = barmerge.lookahead_off)
+ema_1h_1000  = request.security(syminfo.tickerid, "60",  ta.ema(close, 1000)[1], lookahead = barmerge.lookahead_off)
+ema_1h_3000  = request.security(syminfo.tickerid, "60",  ta.ema(close, 3000)[1], lookahead = barmerge.lookahead_off)
+ema_4h_1000  = request.security(syminfo.tickerid, "240", ta.ema(close, 1000)[1], lookahead = barmerge.lookahead_off)
+ema_4h_3000  = request.security(syminfo.tickerid, "240", ta.ema(close, 3000)[1], lookahead = barmerge.lookahead_off)
+maArr = array.from(ema_1m_1000, ema_1m_3000, ema_5m_1000, ema_5m_3000, ema_15m_1000, ema_15m_3000, ema_1h_1000, ema_1h_3000, ema_4h_1000, ema_4h_3000)
+
+// ============================================================
+//  4. MA SL スナップ関数 (損切り側 MA だけを見る)
+// ============================================================
+f_snap_sl_to_ema(_dir, _entry, _slRaw) =>
+    _sl = _slRaw
+    if useTradeMgmtModule and useMaSLTP and useMaSL and array.size(maArr) > 0
+        float _bestMA = na
+        float _bestD  = na
+        for i = 0 to array.size(maArr) - 1
+            _m = array.get(maArr, i)
+            // BUY は entry より下の MA / SELL は entry より上の MA
+            _valid = _dir == 1 ? _m < _entry : _m > _entry
+            if not na(_m) and _valid
+                _d = math.abs(_m - _slRaw)
+                if na(_bestD) or _d < _bestD
+                    _bestD  := _d
+                    _bestMA := _m
+        if not na(_bestMA)
+            _cand = _dir == 1 ? _bestMA - maSlBuffer : _bestMA + maSlBuffer
+            _riskRaw  = math.abs(_entry - _slRaw)
+            _riskSnap = math.abs(_entry - _cand)
+            if _riskRaw > 0 and _riskSnap <= _riskRaw * maSnapMaxMult
+                _sl := _cand
+    _sl
+
+// ============================================================
+//  5. MA TP スナップ関数 (利確側 MA だけを見る)
+// ============================================================
+f_snap_tp_to_ema(_dir, _entry, _tpRaw) =>
+    _tp = _tpRaw
+    if useTradeMgmtModule and useMaSLTP and useMaTP and array.size(maArr) > 0
+        _rewardRaw = math.abs(_tpRaw - _entry)
+        float _bestMA = na
+        float _bestD  = na
+        for i = 0 to array.size(maArr) - 1
+            _m = array.get(maArr, i)
+            // BUY は entry より上の MA / SELL は entry より下の MA
+            _valid = _dir == 1 ? _m > _entry : _m < _entry
+            if not na(_m) and _valid
+                _d = math.abs(_m - _tpRaw)
+                if na(_bestD) or _d < _bestD
+                    _bestD  := _d
+                    _bestMA := _m
+        if not na(_bestMA)
+            _cand = _dir == 1 ? _bestMA - maTpBuffer : _bestMA + maTpBuffer
+            _candReward = _dir == 1 ? _cand - _entry : _entry - _cand
+            _band = maTpSnapBandPct / 100.0
+            _loR  = _rewardRaw * (1.0 - _band)
+            _hiR  = _rewardRaw * (1.0 + _band)
+            if _candReward >= _loR and _candReward <= _hiR
+                _tp := _cand
+    _tp
+
+// ============================================================
+//  6. 状態変数
+// ============================================================
+var map<string, float> tmTpMap = map.new<string, float>()
+
+var string tmCurTag      = na
+var bool   tmPartialDone = false
+var bool   tmBeMoved     = false
+var bool   tmArmReentry  = false
+
+var bool   tmReCurIsLong = false
+var float  tmReEntryPx   = na
+var float  tmReRiskW     = na
+var float  tmReRR        = na
+var int    tmReentryCount = 0
+
+var int    tmLastEntryBar = na
+
+var float  tmFinalSL = na
+var float  tmFinalTP = na
+
+// バー内イベントフラグ (Alert 用)
+bool tmPartialEvent  = false
+bool tmBeEvent       = false
+bool tmBeClosedEvent = false
+bool tmReentryEvent  = false
+
+// ============================================================
+//  7. エントリー時の記録 (strategy.entry 直後に SL/TP スナップ + 状態保存)
+// ============================================================
+bool tmFlat = strategy.position_size == 0
+
+// ---- BUY ----
+if useTradeMgmtModule and tmEntryLong and tmFlat
+    float _entry = close
+    float _slRaw = _entry - tmRiskWidth
+    float _tpRaw = _entry + tmRiskWidth * tmRR
+    float _slF = f_snap_sl_to_ema(1, _entry, _slRaw)
+    float _tpF = f_snap_tp_to_ema(1, _entry, _tpRaw)
+    string _tag = "TM_" + str.tostring(bar_index)
+    strategy.entry(_tag, strategy.long, qty = tmQty)
+    strategy.exit(_tag + "_x", from_entry = _tag, stop = _slF, limit = _tpF)
+    map.put(tmTpMap, _tag, _tpF)
+    tmCurTag       := _tag
+    tmPartialDone  := false
+    tmReCurIsLong  := true
+    tmReEntryPx    := _entry
+    tmReRiskW      := math.abs(_entry - _slF)
+    tmReRR         := tmRR
+    tmBeMoved      := false
+    tmReentryCount := 0
+    tmLastEntryBar := bar_index
+    tmFinalSL      := _slF
+    tmFinalTP      := _tpF
+
+// ---- SELL ----
+if useTradeMgmtModule and tmEntryShort and tmFlat
+    float _entry = close
+    float _slRaw = _entry + tmRiskWidth
+    float _tpRaw = _entry - tmRiskWidth * tmRR
+    float _slF = f_snap_sl_to_ema(-1, _entry, _slRaw)
+    float _tpF = f_snap_tp_to_ema(-1, _entry, _tpRaw)
+    string _tag = "TM_" + str.tostring(bar_index)
+    strategy.entry(_tag, strategy.short, qty = tmQty)
+    strategy.exit(_tag + "_x", from_entry = _tag, stop = _slF, limit = _tpF)
+    map.put(tmTpMap, _tag, _tpF)
+    tmCurTag       := _tag
+    tmPartialDone  := false
+    tmReCurIsLong  := false
+    tmReEntryPx    := _entry
+    tmReRiskW      := math.abs(_entry - _slF)
+    tmReRR         := tmRR
+    tmBeMoved      := false
+    tmReentryCount := 0
+    tmLastEntryBar := bar_index
+    tmFinalSL      := _slF
+    tmFinalTP      := _tpF
+
+// ============================================================
+//  8. 部分利確 (1 トレード 1 回 / エントリー足では発動しない)
+// ============================================================
+bool tmAfterEntryBar = bar_index > nz(tmLastEntryBar, -1)
+bool partialTrigger =
+     partialTriggerMode == "Accum15" ? newAccum15 :
+     partialTriggerMode == "RR"      ? (tmReCurIsLong ? high >= tmReEntryPx + tmReRiskW * partialRR : low <= tmReEntryPx - tmReRiskW * partialRR) :
+     (tmReCurIsLong ? high >= tmReEntryPx + partialDollar : low <= tmReEntryPx - partialDollar)
+
+if useTradeMgmtModule and usePartialTP and strategy.position_size != 0 and not tmPartialDone and not na(tmCurTag) and tmAfterEntryBar
+    if partialTrigger
+        strategy.close(tmCurTag, qty_percent = partialPct, comment = "PT")
+        tmPartialDone := true
+        tmPartialEvent := true
+
+// ============================================================
+//  9. 建値移動 (含み益が beTrigger に到達したら SL を建値へ / 1 回だけ)
+// ============================================================
+if useTradeMgmtModule and useBE and not tmBeMoved and strategy.opentrades > 0
+    for i = 0 to strategy.opentrades - 1
+        _eid  = strategy.opentrades.entry_id(i)
+        _ep   = strategy.opentrades.entry_price(i)
+        _long = strategy.opentrades.size(i) > 0
+        float _tp = map.contains(tmTpMap, _eid) ? map.get(tmTpMap, _eid) : na
+        if _long and high >= _ep + beTrigger
+            strategy.exit(_eid + "_x", from_entry = _eid, stop = _ep + beOffset, limit = _tp)
+            tmBeMoved := true
+            tmBeEvent := true
+            tmFinalSL := _ep + beOffset
+        if not _long and low <= _ep - beTrigger
+            strategy.exit(_eid + "_x", from_entry = _eid, stop = _ep - beOffset, limit = _tp)
+            tmBeMoved := true
+            tmBeEvent := true
+            tmFinalSL := _ep - beOffset
+
+// ============================================================
+//  10. 建値決済検知 (BE 後にポジションが建値で閉じたか)
+// ============================================================
+if useTradeMgmtModule and useReentry and tmBeMoved and strategy.position_size == 0 and strategy.position_size[1] != 0 and tmReentryCount < maxReentry
+    float _exitP  = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    float _entryP = strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    if not na(_exitP) and not na(_entryP) and math.abs(_exitP - _entryP) <= syminfo.mintick * 5
+        tmArmReentry := true
+        tmBeClosedEvent := true
+
+// ============================================================
+//  11. 再エントリー実行 (MA SL/TP スナップを再適用)
+// ============================================================
+if useTradeMgmtModule and tmArmReentry and strategy.position_size == 0
+    int   _dir  = tmReCurIsLong ? 1 : -1
+    float _e2   = close
+    float _sl2r = tmReCurIsLong ? _e2 - tmReRiskW : _e2 + tmReRiskW
+    float _tp2r = tmReCurIsLong ? _e2 + tmReRiskW * tmReRR : _e2 - tmReRiskW * tmReRR
+    float _sl2  = f_snap_sl_to_ema(_dir, _e2, _sl2r)
+    float _tp2  = f_snap_tp_to_ema(_dir, _e2, _tp2r)
+    string _tag = "RE_" + str.tostring(bar_index)
+    strategy.entry(_tag, tmReCurIsLong ? strategy.long : strategy.short, qty = tmQty)
+    strategy.exit(_tag + "_x", from_entry = _tag, stop = _sl2, limit = _tp2)
+    map.put(tmTpMap, _tag, _tp2)
+    tmReentryCount := tmReentryCount + 1
+    tmReEntryPx    := _e2
+    tmReRiskW      := math.abs(_e2 - _sl2)
+    tmCurTag       := _tag
+    tmPartialDone  := false
+    tmBeMoved      := false
+    tmLastEntryBar := bar_index
+    tmFinalSL      := _sl2
+    tmFinalTP      := _tp2
+    tmReentryEvent := true
+    tmArmReentry   := false
+
+// ============================================================
+//  12. 出力 (Data Window)
+// ============================================================
+plot(tmFinalSL,  "tmFinalSL",  display = display.data_window)
+plot(tmFinalTP,  "tmFinalTP",  display = display.data_window)
+plot(tmReRiskW,  "tmReRiskW",  display = display.data_window)
+plot(tmReRR,     "tmReRR",     display = display.data_window)
+plot(tmPartialDone ? 1 : 0, "tmPartialDone",  display = display.data_window)
+plot(tmBeMoved     ? 1 : 0, "tmBeMoved",      display = display.data_window)
+plot(tmArmReentry  ? 1 : 0, "tmArmReentry",   display = display.data_window)
+plot(tmReentryCount,        "tmReentryCount", display = display.data_window)
+
+// ============================================================
+//  13. Alert
+// ============================================================
+alertcondition(tmPartialEvent,  "TradeMgmt Partial TP", "{{ticker}} 部分利確")
+alertcondition(tmBeEvent,       "TradeMgmt BE Moved",   "{{ticker}} 建値移動")
+alertcondition(tmBeClosedEvent, "TradeMgmt BE Closed",  "{{ticker}} 建値決済")
+alertcondition(tmReentryEvent,  "TradeMgmt Reentry",    "{{ticker}} 再エントリー")
