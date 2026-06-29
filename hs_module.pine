@@ -6,7 +6,7 @@
 // ============================================================
 //  参考コードの 三尊 / 逆三尊 ロジックを独立モジュール化。
 //  実装: 三尊 / 逆三尊 / 否定 / ネックラインブレイク / リテスト /
-//        右肩形成中・崩れ / Quality Score。
+//        右肩形成中・崩れ / Stage / Pattern Queue / Quality Score。
 //  2方式: Legacy(左肩戻り型) / Neckline(ブレイク→リテスト型)。
 //  ・strategy ではなく indicator。strategy.entry/exit 不使用。
 //  ・Pivot は確定後のみ (request.security lookahead_off / 未来参照なし)。
@@ -91,7 +91,7 @@ f_findBetween(_vals, _idxs, _lo, _hi) =>
     _res
 
 // ============================================================
-//  4. Pivot 配列 + パターン状態
+//  4. Pivot 配列
 // ============================================================
 var array<float> phVals = array.new_float()
 var array<int>   phIdx  = array.new_int()
@@ -100,6 +100,26 @@ var array<int>   plIdx  = array.new_int()
 var int htfCount     = 0
 var int lastPivotDir = 0
 
+// ============================================================
+//  9. Pattern Queue (完成パターンを最大5件 / Break・Retest 監視)
+// ============================================================
+var array<float> qSellNeck     = array.new_float()
+var array<float> qSellHead     = array.new_float()
+var array<float> qSellRS       = array.new_float()
+var array<float> qSellLS       = array.new_float()
+var array<int>   qSellCreated  = array.new_int()
+var array<int>   qSellBreakBar = array.new_int()
+var array<bool>  qSellBroke    = array.new_bool()
+
+var array<float> qBuyNeck     = array.new_float()
+var array<float> qBuyHead     = array.new_float()
+var array<float> qBuyRS       = array.new_float()
+var array<float> qBuyLS       = array.new_float()
+var array<int>   qBuyCreated  = array.new_int()
+var array<int>   qBuyBreakBar = array.new_int()
+var array<bool>  qBuyBroke    = array.new_bool()
+
+// 既存互換: 最新パターンのスカラ状態
 var float sellLeftShoulderHigh  = na
 var float sellHeadHigh          = na
 var float sellRightShoulderHigh = na
@@ -117,6 +137,24 @@ var bool  buyPatternFound     = false
 var bool  buyBreakDone        = false
 var bool  buyInvalidated      = false
 var int   buyBreakBar         = na
+
+// 1/2/3. 右肩形成中 / Stage 用ビルド状態
+var float bsSellHead = na
+var float bsSellLS   = na
+var int   sellStage  = 0
+var bool  sellRSBuilding = false
+var float bsBuyHead = na
+var float bsBuyLS   = na
+var int   buyStage  = 0
+var bool  buyRSBuilding = false
+
+// バー内イベントフラグ
+bool sellCompletedNow   = false
+bool buyCompletedNow    = false
+bool sellRSFailEventHTF = false
+bool buyRSFailEventHTF  = false
+bool sellQueueOverflow  = false
+bool buyQueueOverflow   = false
 
 // ============================================================
 //  6/7. パターン検出 (newHTF 時 / 同方向 Pivot は極値更新 / 最大10)
@@ -163,15 +201,28 @@ if newHTF
         float nl1 = f_findBetween(plVals, plIdx, lsNI, hdNI)
         float nl2 = f_findBetween(plVals, plIdx, hdNI, rsNI)
         bool promOk = not useHeadProm or (hdN - math.max(lsN, rsN)) > atrHS * headPromMult
-        bool okShapeS = hdN > lsN and hdN > rsN and (math.abs(lsN - rsN) / hdN <= shoulderTolerancePct) and promOk and not na(nl1) and not na(nl2)
-        if okShapeS
-            sellLeftShoulderHigh  := lsN
-            sellHeadHigh          := hdN
-            sellRightShoulderHigh := rsN
-            necklineSell          := (nl1 + nl2) / 2.0
-            sellPatternFound      := true
-            sellBreakDone         := false
-            sellInvalidated       := false
+        bool symOk  = math.abs(lsN - rsN) / hdN <= shoulderTolerancePct
+        bool headHi = hdN > lsN and hdN > rsN
+        if headHi and symOk and promOk and not na(nl1) and not na(nl2)
+            sellCompletedNow := true
+            array.push(qSellNeck, (nl1 + nl2) / 2.0)
+            array.push(qSellHead, hdN)
+            array.push(qSellRS, rsN)
+            array.push(qSellLS, lsN)
+            array.push(qSellCreated, bar_index)
+            array.push(qSellBreakBar, -1)
+            array.push(qSellBroke, false)
+            if array.size(qSellNeck) > 5
+                array.shift(qSellNeck)
+                array.shift(qSellHead)
+                array.shift(qSellRS)
+                array.shift(qSellLS)
+                array.shift(qSellCreated)
+                array.shift(qSellBreakBar)
+                array.shift(qSellBroke)
+                sellQueueOverflow := true
+        else if headHi and not symOk
+            sellRSFailEventHTF := true
 
     // --- 逆三尊 (直近3つの PL) ---
     int nL = array.size(plVals)
@@ -185,15 +236,278 @@ if newHTF
         float nh1 = f_findBetween(phVals, phIdx, lsbNI, hdbNI)
         float nh2 = f_findBetween(phVals, phIdx, hdbNI, rsbNI)
         bool promOkB = not useHeadProm or (math.min(lsbN, rsbN) - hdbN) > atrHS * headPromMult
-        bool okShapeB = hdbN < lsbN and hdbN < rsbN and (math.abs(lsbN - rsbN) / hdbN <= shoulderTolerancePct) and promOkB and not na(nh1) and not na(nh2)
-        if okShapeB
-            buyLeftShoulderLow  := lsbN
-            buyHeadLow          := hdbN
-            buyRightShoulderLow := rsbN
-            necklineBuy         := (nh1 + nh2) / 2.0
-            buyPatternFound     := true
-            buyBreakDone        := false
-            buyInvalidated      := false
+        bool symOkB  = math.abs(lsbN - rsbN) / hdbN <= shoulderTolerancePct
+        bool headLo  = hdbN < lsbN and hdbN < rsbN
+        if headLo and symOkB and promOkB and not na(nh1) and not na(nh2)
+            buyCompletedNow := true
+            array.push(qBuyNeck, (nh1 + nh2) / 2.0)
+            array.push(qBuyHead, hdbN)
+            array.push(qBuyRS, rsbN)
+            array.push(qBuyLS, lsbN)
+            array.push(qBuyCreated, bar_index)
+            array.push(qBuyBreakBar, -1)
+            array.push(qBuyBroke, false)
+            if array.size(qBuyNeck) > 5
+                array.shift(qBuyNeck)
+                array.shift(qBuyHead)
+                array.shift(qBuyRS)
+                array.shift(qBuyLS)
+                array.shift(qBuyCreated)
+                array.shift(qBuyBreakBar)
+                array.shift(qBuyBroke)
+                buyQueueOverflow := true
+        else if headLo and not symOkB
+            buyRSFailEventHTF := true
+
+    // --- Stage / 右肩形成中 (SELL) ---
+    int nHs = array.size(phVals)
+    float fHead = na
+    int   fHeadI = na
+    if nHs > 0
+        for i = 0 to nHs - 1
+            float v = array.get(phVals, i)
+            if na(fHead) or v > fHead
+                fHead := v
+                fHeadI := array.get(phIdx, i)
+    float fLS = na
+    if nHs > 0 and not na(fHeadI)
+        for i = 0 to nHs - 1
+            int idx = array.get(phIdx, i)
+            float v = array.get(phVals, i)
+            if idx < fHeadI and v < fHead
+                if na(fLS) or v > fLS
+                    fLS := v
+    if sellCompletedNow
+        sellStage := 4
+        sellRSBuilding := false
+        bsSellHead := na
+        bsSellLS := na
+    else if not na(fHead) and not na(fLS)
+        bsSellHead := fHead
+        bsSellLS := fLS
+        sellRSBuilding := true
+        sellStage := 3
+    else if not na(fHead)
+        bsSellHead := fHead
+        sellRSBuilding := false
+        sellStage := 2
+    else if nHs >= 1
+        sellRSBuilding := false
+        sellStage := 1
+    else
+        sellRSBuilding := false
+        sellStage := 0
+
+    // --- Stage / 右肩形成中 (BUY) ---
+    int nLs = array.size(plVals)
+    float fHeadB = na
+    int   fHeadBI = na
+    if nLs > 0
+        for i = 0 to nLs - 1
+            float v = array.get(plVals, i)
+            if na(fHeadB) or v < fHeadB
+                fHeadB := v
+                fHeadBI := array.get(plIdx, i)
+    float fLSB = na
+    if nLs > 0 and not na(fHeadBI)
+        for i = 0 to nLs - 1
+            int idx = array.get(plIdx, i)
+            float v = array.get(plVals, i)
+            if idx < fHeadBI and v > fHeadB
+                if na(fLSB) or v < fLSB
+                    fLSB := v
+    if buyCompletedNow
+        buyStage := 4
+        buyRSBuilding := false
+        bsBuyHead := na
+        bsBuyLS := na
+    else if not na(fHeadB) and not na(fLSB)
+        bsBuyHead := fHeadB
+        bsBuyLS := fLSB
+        buyRSBuilding := true
+        buyStage := 3
+    else if not na(fHeadB)
+        bsBuyHead := fHeadB
+        buyRSBuilding := false
+        buyStage := 2
+    else if nLs >= 1
+        buyRSBuilding := false
+        buyStage := 1
+    else
+        buyRSBuilding := false
+        buyStage := 0
+
+// ============================================================
+//  8/9. Queue: Break / Retest / 期限切れ
+// ============================================================
+bool sellBreakEvent  = false
+bool sellRetestEvent = false
+bool sellExpiredEvent = false
+if array.size(qSellNeck) > 0
+    int i = array.size(qSellNeck) - 1
+    while i >= 0
+        float nk = array.get(qSellNeck, i)
+        bool broke = array.get(qSellBroke, i)
+        int createdB = array.get(qSellCreated, i)
+        int brokeB = array.get(qSellBreakBar, i)
+        bool remove = false
+        if not broke
+            if not na(htfClose) and htfClose < nk
+                array.set(qSellBroke, i, true)
+                array.set(qSellBreakBar, i, bar_index)
+                sellBreakEvent := true
+            else if bar_index - createdB > setupValidBars
+                remove := true
+                sellExpiredEvent := true
+        else
+            if high >= nk - retestRange and close <= nk + retestRange
+                sellRetestEvent := true
+            if bar_index - brokeB > setupValidBars
+                remove := true
+        if remove
+            array.remove(qSellNeck, i)
+            array.remove(qSellHead, i)
+            array.remove(qSellRS, i)
+            array.remove(qSellLS, i)
+            array.remove(qSellCreated, i)
+            array.remove(qSellBreakBar, i)
+            array.remove(qSellBroke, i)
+        i := i - 1
+
+bool buyBreakEvent  = false
+bool buyRetestEvent = false
+bool buyExpiredEvent = false
+if array.size(qBuyNeck) > 0
+    int i = array.size(qBuyNeck) - 1
+    while i >= 0
+        float nk = array.get(qBuyNeck, i)
+        bool broke = array.get(qBuyBroke, i)
+        int createdB = array.get(qBuyCreated, i)
+        int brokeB = array.get(qBuyBreakBar, i)
+        bool remove = false
+        if not broke
+            if not na(htfClose) and htfClose > nk
+                array.set(qBuyBroke, i, true)
+                array.set(qBuyBreakBar, i, bar_index)
+                buyBreakEvent := true
+            else if bar_index - createdB > setupValidBars
+                remove := true
+                buyExpiredEvent := true
+        else
+            if low <= nk + retestRange and close >= nk - retestRange
+                buyRetestEvent := true
+            if bar_index - brokeB > setupValidBars
+                remove := true
+        if remove
+            array.remove(qBuyNeck, i)
+            array.remove(qBuyHead, i)
+            array.remove(qBuyRS, i)
+            array.remove(qBuyLS, i)
+            array.remove(qBuyCreated, i)
+            array.remove(qBuyBreakBar, i)
+            array.remove(qBuyBroke, i)
+        i := i - 1
+
+// ============================================================
+//  12. H&S 否定 (最新の未ブレイクパターンを消費 / 逆方向 Bias)
+// ============================================================
+bool hsSellInvalidation = false
+if useHSInvalidation and array.size(qSellNeck) > 0
+    int li = array.size(qSellNeck) - 1
+    if not array.get(qSellBroke, li)
+        float rs = array.get(qSellRS, li)
+        if not na(rs) and close > rs + atrHS * invalidationAtrMult
+            hsSellInvalidation := true
+            sellInvalidated := true
+            array.remove(qSellNeck, li)
+            array.remove(qSellHead, li)
+            array.remove(qSellRS, li)
+            array.remove(qSellLS, li)
+            array.remove(qSellCreated, li)
+            array.remove(qSellBreakBar, li)
+            array.remove(qSellBroke, li)
+
+bool hsBuyInvalidation = false
+if useHSInvalidation and array.size(qBuyNeck) > 0
+    int li = array.size(qBuyNeck) - 1
+    if not array.get(qBuyBroke, li)
+        float rs = array.get(qBuyRS, li)
+        if not na(rs) and close < rs - atrHS * invalidationAtrMult
+            hsBuyInvalidation := true
+            buyInvalidated := true
+            array.remove(qBuyNeck, li)
+            array.remove(qBuyHead, li)
+            array.remove(qBuyRS, li)
+            array.remove(qBuyLS, li)
+            array.remove(qBuyCreated, li)
+            array.remove(qBuyBreakBar, li)
+            array.remove(qBuyBroke, li)
+
+// ============================================================
+//  2. 右肩崩れ (頭更新 or 肩許容率超え) → ビルド state リセット
+// ============================================================
+bool sellPriceFail = sellRSBuilding and not na(bsSellHead) and high > bsSellHead + atrHS * invalidationAtrMult
+bool buyPriceFail  = buyRSBuilding and not na(bsBuyHead) and low < bsBuyHead - atrHS * invalidationAtrMult
+bool hsRightShoulderFailedSell = (sellPriceFail or sellRSFailEventHTF)
+bool hsRightShoulderFailedBuy  = (buyPriceFail or buyRSFailEventHTF)
+if hsRightShoulderFailedSell
+    sellRSBuilding := false
+    bsSellHead := na
+    bsSellLS := na
+    sellStage := 0
+if hsRightShoulderFailedBuy
+    buyRSBuilding := false
+    bsBuyHead := na
+    bsBuyLS := na
+    buyStage := 0
+
+bool hsRightShoulderBuildingSell = sellRSBuilding and not hsRightShoulderFailedSell
+bool hsRightShoulderBuildingBuy  = buyRSBuilding and not hsRightShoulderFailedBuy
+
+// ============================================================
+//  既存互換: 最新パターンのスカラ状態へ同期
+// ============================================================
+int nSellQ = array.size(qSellNeck)
+sellPatternFound := nSellQ > 0
+if nSellQ > 0
+    int li = nSellQ - 1
+    necklineSell          := array.get(qSellNeck, li)
+    sellHeadHigh          := array.get(qSellHead, li)
+    sellLeftShoulderHigh  := array.get(qSellLS, li)
+    sellRightShoulderHigh := array.get(qSellRS, li)
+    sellBreakDone         := array.get(qSellBroke, li)
+    int bb = array.get(qSellBreakBar, li)
+    sellBreakBar          := bb < 0 ? na : bb
+else
+    necklineSell          := na
+    sellHeadHigh          := na
+    sellLeftShoulderHigh  := na
+    sellRightShoulderHigh := na
+    sellBreakDone         := false
+
+int nBuyQ = array.size(qBuyNeck)
+buyPatternFound := nBuyQ > 0
+if nBuyQ > 0
+    int li = nBuyQ - 1
+    necklineBuy         := array.get(qBuyNeck, li)
+    buyHeadLow          := array.get(qBuyHead, li)
+    buyLeftShoulderLow  := array.get(qBuyLS, li)
+    buyRightShoulderLow := array.get(qBuyRS, li)
+    buyBreakDone        := array.get(qBuyBroke, li)
+    int bb = array.get(qBuyBreakBar, li)
+    buyBreakBar         := bb < 0 ? na : bb
+else
+    necklineBuy         := na
+    buyHeadLow          := na
+    buyLeftShoulderLow  := na
+    buyRightShoulderLow := na
+    buyBreakDone        := false
+
+// ブレイク/リテスト集約 (互換名)
+bool hsSellBreak  = sellBreakEvent
+bool hsBuyBreak   = buyBreakEvent
+bool hsSellRetest = sellRetestEvent
+bool hsBuyRetest  = buyRetestEvent
 
 // ============================================================
 //  10. 反転ローソク
@@ -217,46 +531,6 @@ bool sellCloseStrong = not useCloseStrong or close <= low + barRng * closeStrong
 bool buyCloseStrong  = not useCloseStrong or close >= high - barRng * closeStrongFrac
 
 // ============================================================
-//  12. H&S 否定 / 8. ネックラインブレイク (booleans → 状態更新)
-// ============================================================
-bool hsSellInvalidation = useHSInvalidation and sellPatternFound and not sellBreakDone and not na(sellRightShoulderHigh) and close > sellRightShoulderHigh + atrHS * invalidationAtrMult
-bool hsBuyInvalidation  = useHSInvalidation and buyPatternFound and not buyBreakDone and not na(buyRightShoulderLow) and close < buyRightShoulderLow - atrHS * invalidationAtrMult
-
-bool hsSellBreak = sellPatternFound and not sellBreakDone and not na(necklineSell) and not na(htfClose) and htfClose < necklineSell
-bool hsBuyBreak  = buyPatternFound and not buyBreakDone and not na(necklineBuy) and not na(htfClose) and htfClose > necklineBuy
-
-// 否定はパターンを消費 (逆方向 Bias)
-if hsSellInvalidation
-    sellInvalidated  := true
-    sellPatternFound := false
-if hsBuyInvalidation
-    buyInvalidated  := true
-    buyPatternFound := false
-
-if hsSellBreak and not hsSellInvalidation
-    sellBreakDone := true
-    sellBreakBar  := bar_index
-if hsBuyBreak and not hsBuyInvalidation
-    buyBreakDone := true
-    buyBreakBar  := bar_index
-
-// セットアップ有効期限切れ
-if sellPatternFound and sellBreakDone and not na(sellBreakBar) and (bar_index - sellBreakBar > setupValidBars)
-    sellPatternFound := false
-    sellBreakDone    := false
-if buyPatternFound and buyBreakDone and not na(buyBreakBar) and (bar_index - buyBreakBar > setupValidBars)
-    buyPatternFound := false
-    buyBreakDone    := false
-
-// ============================================================
-//  9. ネックラインリテスト
-// ============================================================
-bool sellSetupValid = sellPatternFound and sellBreakDone and not na(sellBreakBar) and (bar_index - sellBreakBar <= setupValidBars)
-bool buySetupValid  = buyPatternFound and buyBreakDone and not na(buyBreakBar) and (bar_index - buyBreakBar <= setupValidBars)
-bool hsSellRetest = sellSetupValid and not na(necklineSell) and high >= necklineSell - retestRange and close <= necklineSell + retestRange
-bool hsBuyRetest  = buySetupValid and not na(necklineBuy) and low <= necklineBuy + retestRange and close >= necklineBuy - retestRange
-
-// ============================================================
 //  11. Legacy 型 (左肩戻り型)
 // ============================================================
 float rsCandHigh = math.max(high, high[1])
@@ -271,13 +545,13 @@ bool hsSellLegacy = headOkSell and retSell and sellReversal and headPromOkSell
 bool hsBuyLegacy  = headOkBuy and retBuy and buyReversal and headPromOkBuy
 
 // ============================================================
-//  13. Quality Score
+//  13. Quality Score (肩対称性は線形補間)
 // ============================================================
-bool symOkSell = not na(sellHeadHigh) and not na(sellLeftShoulderHigh) and not na(sellRightShoulderHigh) and (math.abs(sellLeftShoulderHigh - sellRightShoulderHigh) / sellHeadHigh <= shoulderTolerancePct)
-bool symOkBuy  = not na(buyHeadLow) and not na(buyLeftShoulderLow) and not na(buyRightShoulderLow) and (math.abs(buyLeftShoulderLow - buyRightShoulderLow) / buyHeadLow <= shoulderTolerancePct)
+float sellSymPts = (na(sellHeadHigh) or na(sellLeftShoulderHigh) or na(sellRightShoulderHigh) or sellHeadHigh == 0 or shoulderTolerancePct == 0) ? 0.0 : math.max(0.0, 20.0 * (1.0 - (math.abs(sellLeftShoulderHigh - sellRightShoulderHigh) / sellHeadHigh) / shoulderTolerancePct))
+float buySymPts = (na(buyHeadLow) or na(buyLeftShoulderLow) or na(buyRightShoulderLow) or buyHeadLow == 0 or shoulderTolerancePct == 0) ? 0.0 : math.max(0.0, 20.0 * (1.0 - (math.abs(buyLeftShoulderLow - buyRightShoulderLow) / buyHeadLow) / shoulderTolerancePct))
 
-int hsSellQuality = math.min(100, (symOkSell ? 20 : 0) + (headPromOkSell and useHeadProm ? 20 : 0) + (not na(necklineSell) ? 20 : 0) + (sellBreakDone ? 15 : 0) + (hsSellRetest ? 15 : 0) + ((useHSReversalCandle and (bearEngulf or bearPin)) ? 10 : 0))
-int hsBuyQuality = math.min(100, (symOkBuy ? 20 : 0) + (headPromOkBuy and useHeadProm ? 20 : 0) + (not na(necklineBuy) ? 20 : 0) + (buyBreakDone ? 15 : 0) + (hsBuyRetest ? 15 : 0) + ((useHSReversalCandle and (bullEngulf or bullPin)) ? 10 : 0))
+int hsSellQuality = math.min(100, math.round(sellSymPts) + (headPromOkSell and useHeadProm ? 20 : 0) + (not na(necklineSell) ? 20 : 0) + (sellBreakDone ? 15 : 0) + (hsSellRetest ? 15 : 0) + ((useHSReversalCandle and (bearEngulf or bearPin)) ? 10 : 0))
+int hsBuyQuality = math.min(100, math.round(buySymPts) + (headPromOkBuy and useHeadProm ? 20 : 0) + (not na(necklineBuy) ? 20 : 0) + (buyBreakDone ? 15 : 0) + (hsBuyRetest ? 15 : 0) + ((useHSReversalCandle and (bullEngulf or bullPin)) ? 10 : 0))
 int hsQuality = math.max(hsSellQuality, hsBuyQuality)
 bool qualityOk = not useHSQualityFilter or hsQuality >= minHSQuality
 
@@ -318,9 +592,22 @@ bool allowShortByHS =
      hsEntryMode == "RetestOnly" ? hsSellRetestSignal :
      hsBiasShort
 
-bool hsNoTrade      = hAct and hsSellPattern and hsBuyPattern
+// 8. NoTrade 強化 + 理由
+bool rConflict  = hsSellPattern and hsBuyPattern
+bool rLowQual   = useHSQualityFilter and (hsSellPattern or hsBuyPattern) and not qualityOk
+bool rExpired   = sellExpiredEvent or buyExpiredEvent
+bool rFailedRS  = hsRightShoulderFailedSell or hsRightShoulderFailedBuy
+bool rInval     = hsSellInvalidation or hsBuyInvalidation
+
+int hsNoTradeReason = not hAct ? 0 : rConflict ? 1 : rLowQual ? 2 : rExpired ? 3 : rFailedRS ? 4 : rInval ? 5 : 0
+bool hsNoTrade      = hAct and (rConflict or rLowQual or rFailedRS)
 bool hsNoTradeLong  = hsNoTrade
 bool hsNoTradeShort = hsNoTrade
+
+// ============================================================
+//  3. Stage 集約
+// ============================================================
+int hsStage = math.max(sellStage, buyStage)
 
 // ============================================================
 //  18. Signal Type
@@ -340,7 +627,7 @@ int hsSignalType =
      hsBuyPattern ? 2 : 0
 
 // ============================================================
-//  19. Direction (三尊SELL/逆三尊否定→-1 / 逆三尊BUY/三尊否定→1)
+//  19. Direction
 // ============================================================
 int hsDirection = not hAct ? 0 : (hsBiasLong and not hsBiasShort) ? 1 : (hsBiasShort and not hsBiasLong) ? -1 : 0
 
@@ -366,82 +653,106 @@ int hsRank =
      (hsSellPattern or hsBuyPattern) ? 1 : 0
 
 // ============================================================
-//  21. 表示 : ネックライン
+//  7/21. 表示 : ネックライン (パターン保持中のみ)
 // ============================================================
-plot(showHSLines ? necklineSell : na, "necklineSell", color = color.new(color.red, 0),   style = plot.style_linebr)
-plot(showHSLines ? necklineBuy  : na, "necklineBuy",  color = color.new(color.green, 0), style = plot.style_linebr)
+plot(showHSLines and sellPatternFound ? necklineSell : na, "necklineSell", color = color.new(color.red, 0),   style = plot.style_linebr)
+plot(showHSLines and buyPatternFound  ? necklineBuy  : na, "necklineBuy",  color = color.new(color.green, 0), style = plot.style_linebr)
 
 // ============================================================
-//  21. 表示 : ラベル (状態変化時のみ)
+//  5/21. 表示 : ラベル (全て状態変化時のみ)
 // ============================================================
 if showHSLabels and hAct
     if hsSellPattern and not hsSellPattern[1]
         label.new(bar_index, high, "H&S", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 30), textcolor = color.white, size = size.small)
     if hsBuyPattern and not hsBuyPattern[1]
         label.new(bar_index, low, "iH&S", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.green, 30), textcolor = color.white, size = size.small)
-    if hsSellBreak
+    if hsSellBreak and not hsSellBreak[1]
         label.new(bar_index, high, "H&S Break", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.orange, 0), textcolor = color.white, size = size.small)
-    if hsBuyBreak
+    if hsBuyBreak and not hsBuyBreak[1]
         label.new(bar_index, low, "iH&S Break", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.orange, 0), textcolor = color.white, size = size.small)
-    if hsSellRetest
+    if hsSellRetest and not hsSellRetest[1]
         label.new(bar_index, high, "H&S Retest", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
-    if hsBuyRetest
+    if hsBuyRetest and not hsBuyRetest[1]
         label.new(bar_index, low, "iH&S Retest", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
-    if hsSellInvalidation
+    if hsSellInvalidation and not hsSellInvalidation[1]
         label.new(bar_index, low, "H&S Invalid", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
-    if hsBuyInvalidation
+    if hsBuyInvalidation and not hsBuyInvalidation[1]
         label.new(bar_index, high, "iH&S Invalid", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
+    if hsRightShoulderFailedSell and not hsRightShoulderFailedSell[1]
+        label.new(bar_index, high, "RS Fail", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.gray, 0), textcolor = color.white, size = size.small)
+    if hsRightShoulderFailedBuy and not hsRightShoulderFailedBuy[1]
+        label.new(bar_index, low, "RS Fail", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.gray, 0), textcolor = color.white, size = size.small)
 
 // ============================================================
 //  21. 表示 : Shape
 // ============================================================
-plotshape(showHSLabels and hAct and hsSellBreak, title = "H&S Break",   style = shape.xcross, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
-plotshape(showHSLabels and hAct and hsBuyBreak,  title = "iH&S Break",  style = shape.xcross, location = location.belowbar, color = color.new(color.orange, 0), size = size.tiny)
-plotshape(showHSLabels and hAct and hsSellRetest, title = "H&S Retest",  style = shape.circle, location = location.abovebar, color = color.new(color.red, 0),   size = size.tiny)
-plotshape(showHSLabels and hAct and hsBuyRetest,  title = "iH&S Retest", style = shape.circle, location = location.belowbar, color = color.new(color.green, 0), size = size.tiny)
+plotshape(showHSLabels and hAct and hsSellBreak and not hsSellBreak[1], title = "H&S Break",   style = shape.xcross, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
+plotshape(showHSLabels and hAct and hsBuyBreak and not hsBuyBreak[1],  title = "iH&S Break",  style = shape.xcross, location = location.belowbar, color = color.new(color.orange, 0), size = size.tiny)
+plotshape(showHSLabels and hAct and hsSellRetest and not hsSellRetest[1], title = "H&S Retest",  style = shape.circle, location = location.abovebar, color = color.new(color.red, 0),   size = size.tiny)
+plotshape(showHSLabels and hAct and hsBuyRetest and not hsBuyRetest[1],  title = "iH&S Retest", style = shape.circle, location = location.belowbar, color = color.new(color.green, 0), size = size.tiny)
 
 // ============================================================
 //  22. Debug Table
 // ============================================================
 f_typeStr(t) =>
     t == 1 ? "H&S Pat" : t == 2 ? "iH&S Pat" : t == 3 ? "H&S Break" : t == 4 ? "iH&S Break" : t == 5 ? "H&S Retest" : t == 6 ? "iH&S Retest" : t == 7 ? "H&S Inval" : t == 8 ? "iH&S Inval" : t == 9 ? "Legacy" : t == 10 ? "NoTrade" : "None"
+f_reasonStr(r) =>
+    r == 1 ? "Conflict" : r == 2 ? "Low Quality" : r == 3 ? "Expired" : r == 4 ? "Failed RS" : r == 5 ? "Invalidated" : "None"
 
-var table dbg = table.new(position.top_right, 2, 16, border_width = 1)
+var table dbg = table.new(position.top_right, 2, 18, border_width = 1)
 if showHSDebugTable and hAct and barstate.islast
     string sDir = hsDirection == 1 ? "BUY" : hsDirection == -1 ? "SELL" : "-"
     string sState = hsNoTrade ? "NoTrade" : hsBiasLong ? "BIAS L" : hsBiasShort ? "BIAS S" : "-"
+    int curAge = na
+    int curRemain = na
+    if array.size(qSellNeck) > 0
+        int li = array.size(qSellNeck) - 1
+        bool bk = array.get(qSellBroke, li)
+        int refBar = bk ? array.get(qSellBreakBar, li) : array.get(qSellCreated, li)
+        curAge := bar_index - array.get(qSellCreated, li)
+        curRemain := setupValidBars - (bar_index - refBar)
+    else if array.size(qBuyNeck) > 0
+        int li = array.size(qBuyNeck) - 1
+        bool bk = array.get(qBuyBroke, li)
+        int refBar = bk ? array.get(qBuyBreakBar, li) : array.get(qBuyCreated, li)
+        curAge := bar_index - array.get(qBuyCreated, li)
+        curRemain := setupValidBars - (bar_index - refBar)
     table.cell(dbg, 0, 0,  "HS State", text_color = color.white, bgcolor = color.new(color.blue, 0))
     table.cell(dbg, 1, 0,  sState, text_color = color.white, bgcolor = hsNoTrade ? color.new(color.red, 20) : color.new(color.blue, 0))
     table.cell(dbg, 0, 1,  "SignalType", text_color = color.white)
     table.cell(dbg, 1, 1,  f_typeStr(hsSignalType), text_color = color.white)
     table.cell(dbg, 0, 2,  "Direction", text_color = color.white)
     table.cell(dbg, 1, 2,  sDir, text_color = color.white)
-    table.cell(dbg, 0, 3,  "Rank", text_color = color.white)
-    table.cell(dbg, 1, 3,  str.tostring(hsRank), text_color = color.white)
-    table.cell(dbg, 0, 4,  "Quality", text_color = color.white)
-    table.cell(dbg, 1, 4,  str.tostring(hsQuality), text_color = color.white)
-    table.cell(dbg, 0, 5,  "Sell/Buy Qual", text_color = color.white)
-    table.cell(dbg, 1, 5,  str.tostring(hsSellQuality) + " / " + str.tostring(hsBuyQuality), text_color = color.white)
-    table.cell(dbg, 0, 6,  "Sell/Buy Pat", text_color = color.white)
-    table.cell(dbg, 1, 6,  (hsSellPattern ? "Y" : "N") + " / " + (hsBuyPattern ? "Y" : "N"), text_color = color.white)
-    table.cell(dbg, 0, 7,  "Sell/Buy Break", text_color = color.white)
-    table.cell(dbg, 1, 7,  (sellBreakDone ? "Y" : "N") + " / " + (buyBreakDone ? "Y" : "N"), text_color = color.white)
-    table.cell(dbg, 0, 8,  "Sell/Buy Retest", text_color = color.white)
-    table.cell(dbg, 1, 8,  (hsSellRetest ? "Y" : "N") + " / " + (hsBuyRetest ? "Y" : "N"), text_color = color.white)
-    table.cell(dbg, 0, 9,  "Sell/Buy Inval", text_color = color.white)
-    table.cell(dbg, 1, 9,  (sellInvalidated ? "Y" : "N") + " / " + (buyInvalidated ? "Y" : "N"), text_color = color.white)
-    table.cell(dbg, 0, 10, "Sell Neckline", text_color = color.white)
-    table.cell(dbg, 1, 10, na(necklineSell) ? "-" : str.tostring(necklineSell, format.mintick), text_color = color.white)
-    table.cell(dbg, 0, 11, "Buy Neckline", text_color = color.white)
-    table.cell(dbg, 1, 11, na(necklineBuy) ? "-" : str.tostring(necklineBuy, format.mintick), text_color = color.white)
-    table.cell(dbg, 0, 12, "HS Mode", text_color = color.white)
-    table.cell(dbg, 1, 12, hsMode, text_color = color.white)
-    table.cell(dbg, 0, 13, "Entry Mode", text_color = color.white)
-    table.cell(dbg, 1, 13, hsEntryMode, text_color = color.white)
-    table.cell(dbg, 0, 14, "Pivot H/L", text_color = color.white)
-    table.cell(dbg, 1, 14, str.tostring(array.size(phVals)) + " / " + str.tostring(array.size(plVals)), text_color = color.white)
-    table.cell(dbg, 0, 15, "Allow L/S", text_color = color.white)
-    table.cell(dbg, 1, 15, (allowLongByHS ? "L" : "-") + " / " + (allowShortByHS ? "S" : "-"), text_color = color.white)
+    table.cell(dbg, 0, 3,  "Rank / Quality", text_color = color.white)
+    table.cell(dbg, 1, 3,  str.tostring(hsRank) + " / " + str.tostring(hsQuality), text_color = color.white)
+    table.cell(dbg, 0, 4,  "Sell/Buy Qual", text_color = color.white)
+    table.cell(dbg, 1, 4,  str.tostring(hsSellQuality) + " / " + str.tostring(hsBuyQuality), text_color = color.white)
+    table.cell(dbg, 0, 5,  "Stage S/B", text_color = color.white)
+    table.cell(dbg, 1, 5,  str.tostring(sellStage) + " / " + str.tostring(buyStage), text_color = color.white)
+    table.cell(dbg, 0, 6,  "RS Building S/B", text_color = color.white)
+    table.cell(dbg, 1, 6,  (hsRightShoulderBuildingSell ? "Y" : "N") + " / " + (hsRightShoulderBuildingBuy ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 7,  "RS Failed S/B", text_color = color.white)
+    table.cell(dbg, 1, 7,  (hsRightShoulderFailedSell ? "Y" : "N") + " / " + (hsRightShoulderFailedBuy ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 8,  "Sell/Buy Pat", text_color = color.white)
+    table.cell(dbg, 1, 8,  (hsSellPattern ? "Y" : "N") + " / " + (hsBuyPattern ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 9,  "Sell/Buy Break", text_color = color.white)
+    table.cell(dbg, 1, 9,  (sellBreakDone ? "Y" : "N") + " / " + (buyBreakDone ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 10, "Sell/Buy Retest", text_color = color.white)
+    table.cell(dbg, 1, 10, (hsSellRetest ? "Y" : "N") + " / " + (hsBuyRetest ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 11, "Sell/Buy Inval", text_color = color.white)
+    table.cell(dbg, 1, 11, (sellInvalidated ? "Y" : "N") + " / " + (buyInvalidated ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 12, "NoTrade Reason", text_color = color.white)
+    table.cell(dbg, 1, 12, f_reasonStr(hsNoTradeReason), text_color = color.white)
+    table.cell(dbg, 0, 13, "Queue S/B", text_color = color.white)
+    table.cell(dbg, 1, 13, str.tostring(array.size(qSellNeck)) + " / " + str.tostring(array.size(qBuyNeck)), text_color = color.white)
+    table.cell(dbg, 0, 14, "Pattern Age", text_color = color.white)
+    table.cell(dbg, 1, 14, na(curAge) ? "-" : str.tostring(curAge), text_color = color.white)
+    table.cell(dbg, 0, 15, "Timeout Remain", text_color = color.white)
+    table.cell(dbg, 1, 15, na(curRemain) ? "-" : str.tostring(curRemain), text_color = color.white)
+    table.cell(dbg, 0, 16, "HS / Entry Mode", text_color = color.white)
+    table.cell(dbg, 1, 16, hsMode + " / " + hsEntryMode, text_color = color.white)
+    table.cell(dbg, 0, 17, "Allow L/S", text_color = color.white)
+    table.cell(dbg, 1, 17, (allowLongByHS ? "L" : "-") + " / " + (allowShortByHS ? "S" : "-"), text_color = color.white)
 
 // ============================================================
 //  23. Data Window 出力
@@ -453,6 +764,7 @@ plot(hsBiasShort ? 1 : 0, "hsBiasShort", display = display.data_window)
 plot(hsNoTrade      ? 1 : 0, "hsNoTrade",      display = display.data_window)
 plot(hsNoTradeLong  ? 1 : 0, "hsNoTradeLong",  display = display.data_window)
 plot(hsNoTradeShort ? 1 : 0, "hsNoTradeShort", display = display.data_window)
+plot(hsNoTradeReason, "hsNoTradeReason", display = display.data_window)
 plot(hsSignalType, "hsSignalType", display = display.data_window)
 plot(hsDirection,  "hsDirection",  display = display.data_window)
 plot(hsRank,       "hsRank",       display = display.data_window)
@@ -467,18 +779,33 @@ plot(hsSellRetest ? 1 : 0, "hsSellRetest", display = display.data_window)
 plot(hsBuyRetest  ? 1 : 0, "hsBuyRetest",  display = display.data_window)
 plot(hsSellInvalidation ? 1 : 0, "hsSellInvalidation", display = display.data_window)
 plot(hsBuyInvalidation  ? 1 : 0, "hsBuyInvalidation",  display = display.data_window)
+plot(hsRightShoulderBuildingSell ? 1 : 0, "hsRightShoulderBuildingSell", display = display.data_window)
+plot(hsRightShoulderBuildingBuy  ? 1 : 0, "hsRightShoulderBuildingBuy",  display = display.data_window)
+plot(hsRightShoulderFailedSell ? 1 : 0, "hsRightShoulderFailedSell", display = display.data_window)
+plot(hsRightShoulderFailedBuy  ? 1 : 0, "hsRightShoulderFailedBuy",  display = display.data_window)
+plot(hsStage, "hsStage", display = display.data_window)
+plot(sellStage, "sellStage", display = display.data_window)
+plot(buyStage,  "buyStage",  display = display.data_window)
+plot(necklineSell, "necklineSellVal", display = display.data_window)
+plot(necklineBuy,  "necklineBuyVal",  display = display.data_window)
 
 // ============================================================
 //  24. Alert
 // ============================================================
 alertcondition(hAct and hsSellPattern and not hsSellPattern[1], "HS Sell Pattern", "{{ticker}} 三尊 形成")
 alertcondition(hAct and hsBuyPattern and not hsBuyPattern[1],   "HS Buy Pattern",  "{{ticker}} 逆三尊 形成")
-alertcondition(hAct and hsSellBreak,  "HS Sell Break", "{{ticker}} 三尊 ネックラインブレイク")
-alertcondition(hAct and hsBuyBreak,   "HS Buy Break",  "{{ticker}} 逆三尊 ネックラインブレイク")
-alertcondition(hAct and hsSellRetest, "HS Sell Retest", "{{ticker}} 三尊 リテスト")
-alertcondition(hAct and hsBuyRetest,  "HS Buy Retest",  "{{ticker}} 逆三尊 リテスト")
+alertcondition(hAct and hsSellBreak and not hsSellBreak[1],  "HS Sell Break", "{{ticker}} 三尊 ネックラインブレイク")
+alertcondition(hAct and hsBuyBreak and not hsBuyBreak[1],    "HS Buy Break",  "{{ticker}} 逆三尊 ネックラインブレイク")
+alertcondition(hAct and hsSellRetest and not hsSellRetest[1], "HS Sell Retest", "{{ticker}} 三尊 リテスト")
+alertcondition(hAct and hsBuyRetest and not hsBuyRetest[1],   "HS Buy Retest",  "{{ticker}} 逆三尊 リテスト")
 alertcondition(hAct and hsSellInvalidation, "HS Sell Invalidation", "{{ticker}} 三尊 否定")
 alertcondition(hAct and hsBuyInvalidation,  "HS Buy Invalidation",  "{{ticker}} 逆三尊 否定")
+alertcondition(hAct and hsRightShoulderBuildingSell and not hsRightShoulderBuildingSell[1], "HS Right Shoulder Building",  "{{ticker}} 三尊 右肩形成中")
+alertcondition(hAct and hsRightShoulderBuildingBuy and not hsRightShoulderBuildingBuy[1],   "iHS Right Shoulder Building", "{{ticker}} 逆三尊 右肩形成中")
+alertcondition(hAct and hsRightShoulderFailedSell and not hsRightShoulderFailedSell[1], "HS Right Shoulder Failed",  "{{ticker}} 三尊 右肩崩れ")
+alertcondition(hAct and hsRightShoulderFailedBuy and not hsRightShoulderFailedBuy[1],   "iHS Right Shoulder Failed", "{{ticker}} 逆三尊 右肩崩れ")
+alertcondition(hAct and hsStage != hsStage[1], "HS Stage Changed", "{{ticker}} H&S Stage 変化")
+alertcondition(hAct and (sellQueueOverflow or buyQueueOverflow), "HS Queue Overflow", "{{ticker}} H&S Queue オーバーフロー")
 alertcondition(allowLongByHS,  "Allow Long HS",  "{{ticker}} H&S ロング許可")
 alertcondition(allowShortByHS, "Allow Short HS", "{{ticker}} H&S ショート許可")
 alertcondition(hsNoTrade, "HS NoTrade", "{{ticker}} H&S ノートレード")
