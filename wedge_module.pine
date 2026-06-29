@@ -1,0 +1,594 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// ============================================================
+//  Wedge (ベア/ブル ウェッジ) 単体モジュール (Indicator版)
+// ============================================================
+//  ・Bear Wedge = Rising Wedge (高安切り上げ＋収束 → 下限割れ SELL)
+//  ・Bull Wedge = Falling Wedge (高安切り下げ＋収束 → 上限抜け BUY)
+//  ・H&S / DT/DB モジュールと同思想:
+//      Pattern / Break / Retest / Invalidation / Building / Failed /
+//      Quality / Bias / Allow / NoTrade。
+//  ・strategy ではなく indicator。strategy.entry/exit 不使用。
+//  ・Pivot は確定後のみ (request.security lookahead_off / 未来参照なし)。
+//  ・useWedgeModule=false の時は allowLong/Short=true (AND 接続を邪魔しない)。
+//  ・変数名は wedge / bear / bull prefix (他モジュールと衝突回避)。
+// ============================================================
+
+//@version=5
+indicator(
+     title            = "Wedge Module",
+     shorttitle       = "WEDGE",
+     overlay          = true,
+     max_bars_back    = 1000,
+     max_labels_count = 500
+ )
+
+// ============================================================
+//  Input (グループ: Wedge Module)
+// ============================================================
+grpWedge = "Wedge Module"
+
+useWedgeModule = input.bool(true, "Wedgeモジュールを使う", group = grpWedge)
+
+showWedgeLines      = input.bool(true, "Wedgeラインを表示", group = grpWedge)
+showWedgeLabels     = input.bool(true, "Wedgeラベルを表示", group = grpWedge)
+showWedgeDebugTable = input.bool(true, "Debug Tableを表示", group = grpWedge)
+
+patternTf = input.timeframe("5", "Pattern TF", group = grpWedge)
+pivotLen  = input.int(5, "Pivot Length", minval = 1, group = grpWedge)
+
+minPivotTouches  = input.int(2, "最低Pivotタッチ数", minval = 2, maxval = 4, group = grpWedge)
+maxPivotLookback = input.int(10, "Pivot最大保持数", minval = 4, maxval = 20, group = grpWedge)
+
+contractionRatio = input.float(0.7, "収束率 WidthNow <= WidthStart ×", minval = 0.1, maxval = 1.0, step = 0.05, group = grpWedge)
+
+minWedgeBars = input.int(8, "Wedge最小形成本数", minval = 1, group = grpWedge)
+maxWedgeBars = input.int(80, "Wedge最大形成本数", minval = 5, group = grpWedge)
+
+minSlopeAtrMult = input.float(0.05, "最低傾き ATR倍率", step = 0.01, group = grpWedge)
+
+lineBreakAtrMult = input.float(0.1, "ラインブレイク ATR余白", step = 0.05, group = grpWedge)
+
+retestAtrLen  = input.int(14, "Retest ATR Length", minval = 1, group = grpWedge)
+retestAtrMult = input.float(0.5, "Retest ATR Mult", step = 0.1, group = grpWedge)
+
+setupValidBars = input.int(24, "セットアップ有効本数", minval = 1, group = grpWedge)
+
+useWedgeReversalCandle = input.bool(true, "反転ローソクを要求", group = grpWedge)
+useBodyFilter = input.bool(true, "包み足の実体強度を要求", group = grpWedge)
+bodyMult      = input.float(1.4, "実体 > 平均実体 ×", step = 0.1, group = grpWedge)
+pinWickRatio  = input.float(0.7, "ピンバーのヒゲ比率", minval = 0.1, maxval = 1.0, step = 0.05, group = grpWedge)
+
+useWedgeQualityFilter = input.bool(false, "Quality Filterを使う", group = grpWedge)
+minWedgeQuality       = input.int(50, "最低Wedge Quality", minval = 0, maxval = 100, group = grpWedge)
+
+useWedgeInvalidation = input.bool(true, "Wedge否定を使う", group = grpWedge)
+invalidationAtrMult  = input.float(0.2, "否定判定 ATR余白", step = 0.1, group = grpWedge)
+
+useVolatilityExpansion = input.bool(false, "ブレイク時ATR拡大を要求", group = grpWedge)
+atrExpandLen  = input.int(20, "ATR拡大比較本数", minval = 1, group = grpWedge)
+atrExpandMult = input.float(1.1, "ATR > 平均ATR ×", step = 0.05, group = grpWedge)
+
+wedgeEntryMode = input.string("Any", "Entry Mode", options = ["Any", "BreakOnly", "RetestOnly", "InvalidationOnly"], group = grpWedge)
+
+bool wAct = useWedgeModule
+
+// ============================================================
+//  共通計算
+// ============================================================
+float atrV = ta.atr(retestAtrLen)
+float retestRange = atrV * retestAtrMult
+float atrNow = ta.atr(retestAtrLen)
+float atrAvg = ta.sma(atrNow, atrExpandLen)
+bool atrExpansionOk = not useVolatilityExpansion or atrNow > atrAvg * atrExpandMult
+
+// ============================================================
+//  4. HTF Pivot 取得 (確定後のみ / lookahead_off)
+// ============================================================
+[htfPh, htfPl, htfClose, htfHigh, htfLow, htfTime] = request.security(syminfo.tickerid, patternTf, [ta.pivothigh(pivotLen, pivotLen), ta.pivotlow(pivotLen, pivotLen), close[1], high[1], low[1], time], lookahead = barmerge.lookahead_off)
+bool newHTF = na(htfTime[1]) ? false : htfTime != htfTime[1]
+
+// ============================================================
+//  6. ライン計算
+// ============================================================
+f_linePrice(_x1, _y1, _x2, _y2, _xNow) =>
+    float _res = na
+    if _x2 != _x1
+        float _slope = (_y2 - _y1) / (_x2 - _x1)
+        _res := _y1 + _slope * (_xNow - _x1)
+    _res
+
+f_slope(_x1, _y1, _x2, _y2) =>
+    _x2 != _x1 ? (_y2 - _y1) / (_x2 - _x1) : na
+
+// ============================================================
+//  5. Pivot 配列
+// ============================================================
+var array<float> phVals = array.new_float()
+var array<int>   phIdx  = array.new_int()
+var array<float> plVals = array.new_float()
+var array<int>   plIdx  = array.new_int()
+var int htfCount     = 0
+var int lastPivotDir = 0
+
+// ============================================================
+//  Wedge 幾何 (上限=直近2 PH / 下限=直近2 PL / 共通)
+// ============================================================
+var float upperLineNow = na
+var float lowerLineNow = na
+var float upperSlopeV  = na
+var float lowerSlopeV  = na
+var float widthStartV  = na
+var float widthNowV    = na
+var int   wedgeBarsV   = 0
+
+// パターン状態 (Bear=Rising / Bull=Falling)
+var bool  bearWedgeFound = false
+var bool  bearBreakDone  = false
+var bool  bearInvalidated = false
+var int   bearPatternBar = na
+var int   bearBreakBar   = na
+var bool  bearBuildingV  = false
+var bool  bullWedgeFound = false
+var bool  bullBreakDone  = false
+var bool  bullInvalidated = false
+var int   bullPatternBar = na
+var int   bullBreakBar   = na
+var bool  bullBuildingV  = false
+
+// バー内イベント
+bool bearFailHTF = false
+bool bullFailHTF = false
+bool bearExpiredEvent = false
+bool bullExpiredEvent = false
+
+// ============================================================
+//  5/7/8/9. Pivot push + Wedge 検出 (newHTF 時)
+// ============================================================
+if newHTF
+    htfCount := htfCount + 1
+    int _pIdx = htfCount - pivotLen
+    if not na(htfPh)
+        if lastPivotDir == 1 and array.size(phVals) > 0
+            int _li = array.size(phVals) - 1
+            if htfPh > array.get(phVals, _li)
+                array.set(phVals, _li, htfPh)
+                array.set(phIdx,  _li, _pIdx)
+        else
+            array.push(phVals, htfPh)
+            array.push(phIdx,  _pIdx)
+            lastPivotDir := 1
+            while array.size(phVals) > maxPivotLookback
+                array.shift(phVals)
+                array.shift(phIdx)
+    if not na(htfPl)
+        if lastPivotDir == -1 and array.size(plVals) > 0
+            int _li = array.size(plVals) - 1
+            if htfPl < array.get(plVals, _li)
+                array.set(plVals, _li, htfPl)
+                array.set(plIdx,  _li, _pIdx)
+        else
+            array.push(plVals, htfPl)
+            array.push(plIdx,  _pIdx)
+            lastPivotDir := -1
+            while array.size(plVals) > maxPivotLookback
+                array.shift(plVals)
+                array.shift(plIdx)
+
+    int nH = array.size(phVals)
+    int nL = array.size(plVals)
+    if nH >= 2 and nL >= 2
+        float h1v = array.get(phVals, nH - 2)
+        float h2v = array.get(phVals, nH - 1)
+        int   h1x = array.get(phIdx, nH - 2)
+        int   h2x = array.get(phIdx, nH - 1)
+        float l1v = array.get(plVals, nL - 2)
+        float l2v = array.get(plVals, nL - 1)
+        int   l1x = array.get(plIdx, nL - 2)
+        int   l2x = array.get(plIdx, nL - 1)
+        int xNow = htfCount
+        int startX = math.min(h1x, l1x)
+        upperSlopeV := f_slope(h1x, h1v, h2x, h2v)
+        lowerSlopeV := f_slope(l1x, l1v, l2x, l2v)
+        upperLineNow := f_linePrice(h1x, h1v, h2x, h2v, xNow)
+        lowerLineNow := f_linePrice(l1x, l1v, l2x, l2v, xNow)
+        float upStart = f_linePrice(h1x, h1v, h2x, h2v, startX)
+        float loStart = f_linePrice(l1x, l1v, l2x, l2v, startX)
+        widthNowV := upperLineNow - lowerLineNow
+        widthStartV := upStart - loStart
+        wedgeBarsV := xNow - startX
+
+        bool conv = not na(widthStartV) and widthStartV > 0 and widthNowV <= widthStartV * contractionRatio
+        bool convStart = not na(widthStartV) and widthNowV < widthStartV
+        bool barsOk = wedgeBarsV >= minWedgeBars and wedgeBarsV <= maxWedgeBars
+        bool slopeOkU = not na(upperSlopeV) and math.abs(upperSlopeV) * wedgeBarsV >= atrV * minSlopeAtrMult
+        bool slopeOkL = not na(lowerSlopeV) and math.abs(lowerSlopeV) * wedgeBarsV >= atrV * minSlopeAtrMult
+        bool risingShape  = upperSlopeV > 0 and lowerSlopeV > 0 and lowerSlopeV > upperSlopeV
+        bool fallingShape = upperSlopeV < 0 and lowerSlopeV < 0 and upperSlopeV < lowerSlopeV
+        bool bearOk = risingShape and conv and barsOk and slopeOkU and slopeOkL
+        bool bullOk = fallingShape and conv and barsOk and slopeOkU and slopeOkL
+
+        if bearOk
+            bearWedgeFound := true
+            bearBreakDone := false
+            bearInvalidated := false
+            bearPatternBar := bar_index
+            bearBuildingV := false
+            bullWedgeFound := false
+            bullBuildingV := false
+        else if bullOk
+            bullWedgeFound := true
+            bullBreakDone := false
+            bullInvalidated := false
+            bullPatternBar := bar_index
+            bullBuildingV := false
+            bearWedgeFound := false
+            bearBuildingV := false
+        else
+            if upperSlopeV > 0 and lowerSlopeV > 0 and convStart and not bearWedgeFound
+                bearBuildingV := true
+            else if bearBuildingV
+                if lowerSlopeV <= upperSlopeV or (not na(widthStartV) and widthNowV >= widthStartV) or wedgeBarsV > maxWedgeBars
+                    bearFailHTF := true
+            if upperSlopeV < 0 and lowerSlopeV < 0 and convStart and not bullWedgeFound
+                bullBuildingV := true
+            else if bullBuildingV
+                if upperSlopeV >= lowerSlopeV or (not na(widthStartV) and widthNowV >= widthStartV) or wedgeBarsV > maxWedgeBars
+                    bullFailHTF := true
+
+// ============================================================
+//  10. Wedge 崩れ
+// ============================================================
+bool bearPriceFail = bearBuildingV and not na(upperLineNow) and high > upperLineNow + atrV * invalidationAtrMult
+bool bullPriceFail = bullBuildingV and not na(lowerLineNow) and low < lowerLineNow - atrV * invalidationAtrMult
+bool bearWedgeFailed = wAct and (bearPriceFail or bearFailHTF)
+bool bullWedgeFailed = wAct and (bullPriceFail or bullFailHTF)
+if bearWedgeFailed
+    bearBuildingV := false
+if bullWedgeFailed
+    bullBuildingV := false
+
+bool bearWedgeBuilding = wAct and bearBuildingV and not bearWedgeFailed
+bool bullWedgeBuilding = wAct and bullBuildingV and not bullWedgeFailed
+
+// ============================================================
+//  13. 反転ローソク
+// ============================================================
+float body    = math.abs(close - open)
+float avgBody = ta.sma(math.abs(close - open), 20)
+bool strongBody = not useBodyFilter or body > avgBody * bodyMult
+
+bool bearEngulf = close < open and open >= close[1] and close <= open[1] and strongBody
+bool bullEngulf = close > open and open <= close[1] and close >= open[1] and strongBody
+float barRng = math.max(high - low, syminfo.mintick)
+float upWick = high - math.max(open, close)
+float dnWick = math.min(open, close) - low
+bool bearPin = upWick / barRng >= pinWickRatio
+bool bullPin = dnWick / barRng >= pinWickRatio
+
+bool bearWedgeReversal = not useWedgeReversalCandle or bearEngulf or bearPin
+bool bullWedgeReversal = not useWedgeReversalCandle or bullEngulf or bullPin
+
+// ============================================================
+//  14. Wedge 否定 / 11. ブレイク (状態更新)
+// ============================================================
+bool bearWedgeInvalidation = useWedgeInvalidation and bearWedgeFound and not bearBreakDone and not na(upperLineNow) and close > upperLineNow + atrV * invalidationAtrMult
+bool bullWedgeInvalidation = useWedgeInvalidation and bullWedgeFound and not bullBreakDone and not na(lowerLineNow) and close < lowerLineNow - atrV * invalidationAtrMult
+
+bool bearWedgeBreak = bearWedgeFound and not bearBreakDone and not na(lowerLineNow) and not na(htfClose) and htfClose < lowerLineNow - atrV * lineBreakAtrMult
+bool bullWedgeBreak = bullWedgeFound and not bullBreakDone and not na(upperLineNow) and not na(htfClose) and htfClose > upperLineNow + atrV * lineBreakAtrMult
+
+if bearWedgeInvalidation
+    bearInvalidated := true
+    bearWedgeFound := false
+if bullWedgeInvalidation
+    bullInvalidated := true
+    bullWedgeFound := false
+
+if bearWedgeBreak and not bearWedgeInvalidation
+    bearBreakDone := true
+    bearBreakBar  := bar_index
+if bullWedgeBreak and not bullWedgeInvalidation
+    bullBreakDone := true
+    bullBreakBar  := bar_index
+
+// セットアップ有効期限切れ
+if bearWedgeFound and bearBreakDone and not na(bearBreakBar) and (bar_index - bearBreakBar > setupValidBars)
+    bearWedgeFound := false
+    bearBreakDone  := false
+    bearExpiredEvent := true
+else if bearWedgeFound and not bearBreakDone and not na(bearPatternBar) and (bar_index - bearPatternBar > setupValidBars)
+    bearWedgeFound := false
+    bearExpiredEvent := true
+if bullWedgeFound and bullBreakDone and not na(bullBreakBar) and (bar_index - bullBreakBar > setupValidBars)
+    bullWedgeFound := false
+    bullBreakDone  := false
+    bullExpiredEvent := true
+else if bullWedgeFound and not bullBreakDone and not na(bullPatternBar) and (bar_index - bullPatternBar > setupValidBars)
+    bullWedgeFound := false
+    bullExpiredEvent := true
+
+// ============================================================
+//  12. Retest
+// ============================================================
+bool bearSetupValid = bearWedgeFound and bearBreakDone and not na(bearBreakBar) and (bar_index - bearBreakBar <= setupValidBars)
+bool bullSetupValid = bullWedgeFound and bullBreakDone and not na(bullBreakBar) and (bar_index - bullBreakBar <= setupValidBars)
+bool bearWedgeRetest = bearSetupValid and not na(lowerLineNow) and high >= lowerLineNow - retestRange and close <= lowerLineNow + retestRange
+bool bullWedgeRetest = bullSetupValid and not na(upperLineNow) and low <= upperLineNow + retestRange and close >= upperLineNow - retestRange
+
+// パターン出力
+bool bearWedgePattern = wAct and bearWedgeFound
+bool bullWedgePattern = wAct and bullWedgeFound
+
+// ============================================================
+//  16. Quality Score
+// ============================================================
+int bearTouchPts = (array.size(phVals) >= 2 ? 10 : 0) + (array.size(plVals) >= 2 ? 10 : 0)
+int bullTouchPts = bearTouchPts
+bool bearDirMatch = upperSlopeV > 0 and lowerSlopeV > 0 and lowerSlopeV > upperSlopeV
+bool bullDirMatch = upperSlopeV < 0 and lowerSlopeV < 0 and upperSlopeV < lowerSlopeV
+float wedgeRatio = (na(widthStartV) or widthStartV == 0) ? na : widthNowV / widthStartV
+float contractPts = na(wedgeRatio) ? 0.0 : (wedgeRatio <= contractionRatio ? 20.0 : wedgeRatio >= 1.0 ? 0.0 : 20.0 * (1.0 - wedgeRatio) / (1.0 - contractionRatio))
+
+int bearWedgeQuality = not bearWedgeFound ? 0 : math.min(100, bearTouchPts + (bearDirMatch ? 20 : 0) + math.round(contractPts) + (bearBreakDone ? 15 : 0) + (bearWedgeRetest ? 10 : 0) + ((useWedgeReversalCandle and (bearEngulf or bearPin)) ? 10 : 0) + ((useVolatilityExpansion and atrExpansionOk) ? 5 : 0))
+int bullWedgeQuality = not bullWedgeFound ? 0 : math.min(100, bullTouchPts + (bullDirMatch ? 20 : 0) + math.round(contractPts) + (bullBreakDone ? 15 : 0) + (bullWedgeRetest ? 10 : 0) + ((useWedgeReversalCandle and (bullEngulf or bullPin)) ? 10 : 0) + ((useVolatilityExpansion and atrExpansionOk) ? 5 : 0))
+int wedgeQuality = math.max(bearWedgeQuality, bullWedgeQuality)
+bool qualityOk = not useWedgeQualityFilter or wedgeQuality >= minWedgeQuality
+
+// ============================================================
+//  17. Signal 判定
+// ============================================================
+bool bearWedgeBreakSignal  = bearWedgeBreak and bearWedgeReversal and atrExpansionOk and qualityOk
+bool bearWedgeRetestSignal = bearWedgeRetest and bearWedgeReversal and qualityOk
+bool bullWedgeBreakSignal  = bullWedgeBreak and bullWedgeReversal and atrExpansionOk and qualityOk
+bool bullWedgeRetestSignal = bullWedgeRetest and bullWedgeReversal and qualityOk
+
+// 否定は逆方向 Bias
+bool bullByWedgeInvalidation = bearWedgeInvalidation
+bool bearByWedgeInvalidation = bullWedgeInvalidation
+
+// ============================================================
+//  18/19/20. Bias / Allow / NoTrade
+// ============================================================
+bool wedgeBiasShort = wAct and (bearWedgeBreakSignal or bearWedgeRetestSignal or bearByWedgeInvalidation)
+bool wedgeBiasLong  = wAct and (bullWedgeBreakSignal or bullWedgeRetestSignal or bullByWedgeInvalidation)
+
+bool allowLongByWedge =
+     not wAct ? true :
+     wedgeEntryMode == "InvalidationOnly" ? bullByWedgeInvalidation :
+     wedgeEntryMode == "BreakOnly" ? bullWedgeBreakSignal :
+     wedgeEntryMode == "RetestOnly" ? bullWedgeRetestSignal :
+     wedgeBiasLong
+bool allowShortByWedge =
+     not wAct ? true :
+     wedgeEntryMode == "InvalidationOnly" ? bearByWedgeInvalidation :
+     wedgeEntryMode == "BreakOnly" ? bearWedgeBreakSignal :
+     wedgeEntryMode == "RetestOnly" ? bearWedgeRetestSignal :
+     wedgeBiasShort
+
+bool rConflict = bearWedgePattern and bullWedgePattern
+bool rLowQual  = useWedgeQualityFilter and (bearWedgePattern or bullWedgePattern) and not qualityOk
+bool rExpired  = bearExpiredEvent or bullExpiredEvent
+bool rFailed   = bearWedgeFailed or bullWedgeFailed
+bool rInval    = bearWedgeInvalidation or bullWedgeInvalidation
+
+int wedgeNoTradeReason = not wAct ? 0 : rConflict ? 1 : rLowQual ? 2 : rExpired ? 3 : rFailed ? 4 : rInval ? 5 : 0
+bool wedgeNoTrade      = wAct and (rConflict or rLowQual or rExpired or rFailed or rInval)
+bool wedgeNoTradeLong  = wedgeNoTrade
+bool wedgeNoTradeShort = wedgeNoTrade
+
+// ============================================================
+//  21. Signal Type
+//  優先: NoTrade > Invalidation > Retest > Break > Pattern > Building
+// ============================================================
+int wedgeSignalType =
+     not wAct ? 0 :
+     wedgeNoTrade ? 11 :
+     bearWedgeInvalidation ? 7 :
+     bullWedgeInvalidation ? 8 :
+     bearWedgeRetest ? 5 :
+     bullWedgeRetest ? 6 :
+     bearWedgeBreak ? 3 :
+     bullWedgeBreak ? 4 :
+     bearWedgePattern ? 1 :
+     bullWedgePattern ? 2 :
+     bearWedgeBuilding ? 9 :
+     bullWedgeBuilding ? 10 : 0
+
+// ============================================================
+//  22. Direction
+// ============================================================
+int wedgeDirection = not wAct ? 0 : (wedgeBiasLong and not wedgeBiasShort) ? 1 : (wedgeBiasShort and not wedgeBiasLong) ? -1 : 0
+
+// ============================================================
+//  23. Rank (0〜10)
+// ============================================================
+bool anyRetest = bearWedgeRetest or bullWedgeRetest
+bool anyBreak  = bearWedgeBreak or bullWedgeBreak
+bool anyInval  = bearWedgeInvalidation or bullWedgeInvalidation
+bool anyRev    = bearWedgeReversal or bullWedgeReversal
+bool anyBuild  = bearWedgeBuilding or bullWedgeBuilding
+
+int wedgeRank =
+     not wAct ? 0 :
+     (anyRetest and wedgeQuality >= 80) ? 10 :
+     anyInval ? 9 :
+     wedgeQuality >= 80 ? 8 :
+     wedgeQuality >= 70 ? 7 :
+     (anyRetest and anyRev) ? 6 :
+     anyRetest ? 5 :
+     anyBreak ? 4 :
+     (qualityOk and wedgeQuality > 0) ? 3 :
+     (bearWedgePattern or bullWedgePattern) ? 2 :
+     anyBuild ? 1 : 0
+
+// ============================================================
+//  出力ライン / 幅
+// ============================================================
+bool wedgeActive = bearWedgeFound or bullWedgeFound or bearWedgeBuilding or bullWedgeBuilding
+float upperWedgeLine = wedgeActive ? upperLineNow : na
+float lowerWedgeLine = wedgeActive ? lowerLineNow : na
+float wedgeWidthStart = wedgeActive ? widthStartV : na
+float wedgeWidthNow   = wedgeActive ? widthNowV : na
+float wedgeContraction = (na(wedgeWidthStart) or wedgeWidthStart == 0) ? na : wedgeWidthNow / wedgeWidthStart
+
+// ============================================================
+//  24. 表示 : ライン (Pattern保持中 or Building中のみ)
+// ============================================================
+plot(showWedgeLines and wedgeActive ? upperWedgeLine : na, "upperWedgeLine", color = color.new(color.red, 0),   style = plot.style_linebr)
+plot(showWedgeLines and wedgeActive ? lowerWedgeLine : na, "lowerWedgeLine", color = color.new(color.green, 0), style = plot.style_linebr)
+
+// ============================================================
+//  24. 表示 : ラベル (状態変化時のみ)
+// ============================================================
+if showWedgeLabels and wAct
+    if bearWedgePattern and not bearWedgePattern[1]
+        label.new(bar_index, high, "Bear Wedge", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 30), textcolor = color.white, size = size.small)
+    if bullWedgePattern and not bullWedgePattern[1]
+        label.new(bar_index, low, "Bull Wedge", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.green, 30), textcolor = color.white, size = size.small)
+    if bearWedgeBreak and not bearWedgeBreak[1]
+        label.new(bar_index, high, "Bear Break", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.orange, 0), textcolor = color.white, size = size.small)
+    if bullWedgeBreak and not bullWedgeBreak[1]
+        label.new(bar_index, low, "Bull Break", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.orange, 0), textcolor = color.white, size = size.small)
+    if bearWedgeRetest and not bearWedgeRetest[1]
+        label.new(bar_index, high, "Bear Retest", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+    if bullWedgeRetest and not bullWedgeRetest[1]
+        label.new(bar_index, low, "Bull Retest", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+    if bearWedgeInvalidation and not bearWedgeInvalidation[1]
+        label.new(bar_index, low, "Bear Invalid", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
+    if bullWedgeInvalidation and not bullWedgeInvalidation[1]
+        label.new(bar_index, high, "Bull Invalid", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
+    if bearWedgeBuilding and not bearWedgeBuilding[1]
+        label.new(bar_index, high, "Bear Building", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.teal, 0), textcolor = color.white, size = size.tiny)
+    if bullWedgeBuilding and not bullWedgeBuilding[1]
+        label.new(bar_index, low, "Bull Building", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.teal, 0), textcolor = color.white, size = size.tiny)
+    if bearWedgeFailed and not bearWedgeFailed[1]
+        label.new(bar_index, high, "Bear Failed", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.gray, 0), textcolor = color.white, size = size.tiny)
+    if bullWedgeFailed and not bullWedgeFailed[1]
+        label.new(bar_index, low, "Bull Failed", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.gray, 0), textcolor = color.white, size = size.tiny)
+
+// ============================================================
+//  24. 表示 : Shape
+// ============================================================
+plotshape(showWedgeLabels and wAct and bearWedgeBreak and not bearWedgeBreak[1], title = "Bear Break", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),   size = size.tiny)
+plotshape(showWedgeLabels and wAct and bullWedgeBreak and not bullWedgeBreak[1], title = "Bull Break", style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0), size = size.tiny)
+
+// ============================================================
+//  25. Debug Table
+// ============================================================
+f_typeStr(t) =>
+    t == 1 ? "Bear Pattern" : t == 2 ? "Bull Pattern" : t == 3 ? "Bear Break" : t == 4 ? "Bull Break" : t == 5 ? "Bear Retest" : t == 6 ? "Bull Retest" : t == 7 ? "Bear Invalidation" : t == 8 ? "Bull Invalidation" : t == 9 ? "Bear Building" : t == 10 ? "Bull Building" : t == 11 ? "NoTrade" : "None"
+f_reasonStr(r) =>
+    r == 1 ? "Conflict" : r == 2 ? "Low Quality" : r == 3 ? "Expired" : r == 4 ? "Failed" : r == 5 ? "Invalidated" : "None"
+
+var table dbg = table.new(position.top_right, 2, 26, border_width = 1)
+if showWedgeDebugTable and wAct and barstate.islast
+    string sDir = wedgeDirection == 1 ? "BUY" : wedgeDirection == -1 ? "SELL" : "-"
+    string sState = wedgeNoTrade ? "NoTrade" : wedgeBiasLong ? "BIAS L" : wedgeBiasShort ? "BIAS S" : "-"
+    table.cell(dbg, 0, 0,  "Wedge State", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(dbg, 1, 0,  sState, text_color = color.white, bgcolor = wedgeNoTrade ? color.new(color.red, 20) : color.new(color.blue, 0))
+    table.cell(dbg, 0, 1,  "SignalType", text_color = color.white)
+    table.cell(dbg, 1, 1,  f_typeStr(wedgeSignalType), text_color = color.white)
+    table.cell(dbg, 0, 2,  "Direction", text_color = color.white)
+    table.cell(dbg, 1, 2,  sDir, text_color = color.white)
+    table.cell(dbg, 0, 3,  "Rank", text_color = color.white)
+    table.cell(dbg, 1, 3,  str.tostring(wedgeRank), text_color = color.white)
+    table.cell(dbg, 0, 4,  "Quality", text_color = color.white)
+    table.cell(dbg, 1, 4,  str.tostring(wedgeQuality), text_color = color.white)
+    table.cell(dbg, 0, 5,  "Bear/Bull Qual", text_color = color.white)
+    table.cell(dbg, 1, 5,  str.tostring(bearWedgeQuality) + " / " + str.tostring(bullWedgeQuality), text_color = color.white)
+    table.cell(dbg, 0, 6,  "Bear/Bull Pat", text_color = color.white)
+    table.cell(dbg, 1, 6,  (bearWedgePattern ? "Y" : "N") + " / " + (bullWedgePattern ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 7,  "Bear/Bull Break", text_color = color.white)
+    table.cell(dbg, 1, 7,  (bearBreakDone ? "Y" : "N") + " / " + (bullBreakDone ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 8,  "Bear/Bull Retest", text_color = color.white)
+    table.cell(dbg, 1, 8,  (bearWedgeRetest ? "Y" : "N") + " / " + (bullWedgeRetest ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 9,  "Bear/Bull Inval", text_color = color.white)
+    table.cell(dbg, 1, 9,  (bearInvalidated ? "Y" : "N") + " / " + (bullInvalidated ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 10, "Bear/Bull Build", text_color = color.white)
+    table.cell(dbg, 1, 10, (bearWedgeBuilding ? "Y" : "N") + " / " + (bullWedgeBuilding ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 11, "Bear/Bull Fail", text_color = color.white)
+    table.cell(dbg, 1, 11, (bearWedgeFailed ? "Y" : "N") + " / " + (bullWedgeFailed ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 12, "Upper Line", text_color = color.white)
+    table.cell(dbg, 1, 12, na(upperWedgeLine) ? "-" : str.tostring(upperWedgeLine, format.mintick), text_color = color.white)
+    table.cell(dbg, 0, 13, "Lower Line", text_color = color.white)
+    table.cell(dbg, 1, 13, na(lowerWedgeLine) ? "-" : str.tostring(lowerWedgeLine, format.mintick), text_color = color.white)
+    table.cell(dbg, 0, 14, "Width Start", text_color = color.white)
+    table.cell(dbg, 1, 14, na(wedgeWidthStart) ? "-" : str.tostring(wedgeWidthStart, format.mintick), text_color = color.white)
+    table.cell(dbg, 0, 15, "Width Now", text_color = color.white)
+    table.cell(dbg, 1, 15, na(wedgeWidthNow) ? "-" : str.tostring(wedgeWidthNow, format.mintick), text_color = color.white)
+    table.cell(dbg, 0, 16, "Contraction", text_color = color.white)
+    table.cell(dbg, 1, 16, na(wedgeContraction) ? "-" : str.tostring(wedgeContraction, "#.##"), text_color = color.white)
+    table.cell(dbg, 0, 17, "Wedge Bars", text_color = color.white)
+    table.cell(dbg, 1, 17, str.tostring(wedgeBarsV), text_color = color.white)
+    table.cell(dbg, 0, 18, "Upper Slope", text_color = color.white)
+    table.cell(dbg, 1, 18, na(upperSlopeV) ? "-" : str.tostring(upperSlopeV, "#.####"), text_color = color.white)
+    table.cell(dbg, 0, 19, "Lower Slope", text_color = color.white)
+    table.cell(dbg, 1, 19, na(lowerSlopeV) ? "-" : str.tostring(lowerSlopeV, "#.####"), text_color = color.white)
+    table.cell(dbg, 0, 20, "Pivot H/L", text_color = color.white)
+    table.cell(dbg, 1, 20, str.tostring(array.size(phVals)) + " / " + str.tostring(array.size(plVals)), text_color = color.white)
+    table.cell(dbg, 0, 21, "NoTrade Reason", text_color = color.white)
+    table.cell(dbg, 1, 21, f_reasonStr(wedgeNoTradeReason), text_color = color.white)
+    table.cell(dbg, 0, 22, "Entry Mode", text_color = color.white)
+    table.cell(dbg, 1, 22, wedgeEntryMode, text_color = color.white)
+    table.cell(dbg, 0, 23, "ATR Expand", text_color = color.white)
+    table.cell(dbg, 1, 23, useVolatilityExpansion ? (atrExpansionOk ? "OK" : "NG") : "OFF", text_color = color.white)
+    table.cell(dbg, 0, 24, "Allow L/S", text_color = color.white)
+    table.cell(dbg, 1, 24, (allowLongByWedge ? "L" : "-") + " / " + (allowShortByWedge ? "S" : "-"), text_color = color.white)
+    table.cell(dbg, 0, 25, "Wedge Module", text_color = color.white)
+    table.cell(dbg, 1, 25, useWedgeModule ? "ON" : "OFF", text_color = color.white)
+
+// ============================================================
+//  26. Data Window 出力
+// ============================================================
+plot(allowLongByWedge  ? 1 : 0, "allowLongByWedge",  display = display.data_window)
+plot(allowShortByWedge ? 1 : 0, "allowShortByWedge", display = display.data_window)
+plot(wedgeBiasLong  ? 1 : 0, "wedgeBiasLong",  display = display.data_window)
+plot(wedgeBiasShort ? 1 : 0, "wedgeBiasShort", display = display.data_window)
+plot(wedgeNoTrade      ? 1 : 0, "wedgeNoTrade",      display = display.data_window)
+plot(wedgeNoTradeLong  ? 1 : 0, "wedgeNoTradeLong",  display = display.data_window)
+plot(wedgeNoTradeShort ? 1 : 0, "wedgeNoTradeShort", display = display.data_window)
+plot(wedgeNoTradeReason, "wedgeNoTradeReason", display = display.data_window)
+plot(wedgeSignalType, "wedgeSignalType", display = display.data_window)
+plot(wedgeDirection,  "wedgeDirection",  display = display.data_window)
+plot(wedgeRank,       "wedgeRank",       display = display.data_window)
+plot(wedgeQuality,    "wedgeQuality",    display = display.data_window)
+plot(bearWedgeQuality, "bearWedgeQuality", display = display.data_window)
+plot(bullWedgeQuality, "bullWedgeQuality", display = display.data_window)
+plot(bearWedgePattern ? 1 : 0, "bearWedgePattern", display = display.data_window)
+plot(bullWedgePattern ? 1 : 0, "bullWedgePattern", display = display.data_window)
+plot(bearWedgeBreak ? 1 : 0, "bearWedgeBreak", display = display.data_window)
+plot(bullWedgeBreak ? 1 : 0, "bullWedgeBreak", display = display.data_window)
+plot(bearWedgeRetest ? 1 : 0, "bearWedgeRetest", display = display.data_window)
+plot(bullWedgeRetest ? 1 : 0, "bullWedgeRetest", display = display.data_window)
+plot(bearWedgeInvalidation ? 1 : 0, "bearWedgeInvalidation", display = display.data_window)
+plot(bullWedgeInvalidation ? 1 : 0, "bullWedgeInvalidation", display = display.data_window)
+plot(bearWedgeBuilding ? 1 : 0, "bearWedgeBuilding", display = display.data_window)
+plot(bullWedgeBuilding ? 1 : 0, "bullWedgeBuilding", display = display.data_window)
+plot(bearWedgeFailed ? 1 : 0, "bearWedgeFailed", display = display.data_window)
+plot(bullWedgeFailed ? 1 : 0, "bullWedgeFailed", display = display.data_window)
+plot(upperWedgeLine, "upperWedgeLine", display = display.data_window)
+plot(lowerWedgeLine, "lowerWedgeLine", display = display.data_window)
+plot(wedgeWidthStart, "wedgeWidthStart", display = display.data_window)
+plot(wedgeWidthNow,   "wedgeWidthNow",   display = display.data_window)
+plot(wedgeContraction, "wedgeContraction", display = display.data_window)
+
+// ============================================================
+//  27. Alert (状態変化時のみ)
+// ============================================================
+alertcondition(wAct and bearWedgePattern and not bearWedgePattern[1], "Bear Wedge Pattern", "{{ticker}} ベアウェッジ 形成")
+alertcondition(wAct and bullWedgePattern and not bullWedgePattern[1], "Bull Wedge Pattern", "{{ticker}} ブルウェッジ 形成")
+alertcondition(wAct and bearWedgeBreak and not bearWedgeBreak[1], "Bear Wedge Break", "{{ticker}} ベアウェッジ ブレイク")
+alertcondition(wAct and bullWedgeBreak and not bullWedgeBreak[1], "Bull Wedge Break", "{{ticker}} ブルウェッジ ブレイク")
+alertcondition(wAct and bearWedgeRetest and not bearWedgeRetest[1], "Bear Wedge Retest", "{{ticker}} ベアウェッジ リテスト")
+alertcondition(wAct and bullWedgeRetest and not bullWedgeRetest[1], "Bull Wedge Retest", "{{ticker}} ブルウェッジ リテスト")
+alertcondition(wAct and bearWedgeInvalidation and not bearWedgeInvalidation[1], "Bear Wedge Invalidation", "{{ticker}} ベアウェッジ 否定")
+alertcondition(wAct and bullWedgeInvalidation and not bullWedgeInvalidation[1], "Bull Wedge Invalidation", "{{ticker}} ブルウェッジ 否定")
+alertcondition(wAct and bearWedgeBuilding and not bearWedgeBuilding[1], "Bear Wedge Building", "{{ticker}} ベアウェッジ 形成中")
+alertcondition(wAct and bullWedgeBuilding and not bullWedgeBuilding[1], "Bull Wedge Building", "{{ticker}} ブルウェッジ 形成中")
+alertcondition(wAct and bearWedgeFailed and not bearWedgeFailed[1], "Bear Wedge Failed", "{{ticker}} ベアウェッジ 崩れ")
+alertcondition(wAct and bullWedgeFailed and not bullWedgeFailed[1], "Bull Wedge Failed", "{{ticker}} ブルウェッジ 崩れ")
+alertcondition(allowLongByWedge and not allowLongByWedge[1],   "Allow Long Wedge",  "{{ticker}} Wedge ロング許可")
+alertcondition(allowShortByWedge and not allowShortByWedge[1], "Allow Short Wedge", "{{ticker}} Wedge ショート許可")
+alertcondition(wedgeNoTrade and not wedgeNoTrade[1], "Wedge NoTrade", "{{ticker}} Wedge ノートレード")
