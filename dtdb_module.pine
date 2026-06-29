@@ -1,0 +1,585 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// ============================================================
+//  Double Top / Double Bottom 単体モジュール (Indicator版)
+// ============================================================
+//  参考コードの DT/DB ロジックを独立モジュール化。
+//  実装: ダブルトップ / ダブルボトム / 否定 / ネックラインブレイク /
+//        リテスト / 右山・右底形成中・崩れ / スイープ型 / Quality Score。
+//  ・strategy ではなく indicator。strategy.entry/exit 不使用。
+//  ・Pivot は確定後のみ (request.security lookahead_off / 未来参照なし)。
+//  ・useDTDBModule=false の時は allowLong/Short=true (AND 接続を邪魔しない)。
+//  ・変数名は dtdb / dt / db prefix (H&S モジュールと衝突回避)。
+// ============================================================
+
+//@version=5
+indicator(
+     title            = "Double Top / Bottom Module",
+     shorttitle       = "DTDB",
+     overlay          = true,
+     max_bars_back    = 1000,
+     max_labels_count = 500
+ )
+
+// ============================================================
+//  Input (グループ: Double Top / Bottom Module)
+// ============================================================
+grpDTDB = "Double Top / Bottom Module"
+
+useDTDBModule = input.bool(true, "DT/DBモジュールを使う", group = grpDTDB)
+
+showDTDBLines      = input.bool(true, "ネックラインを表示", group = grpDTDB)
+showDTDBLabels     = input.bool(true, "DT/DBラベルを表示", group = grpDTDB)
+showDTDBDebugTable = input.bool(true, "Debug Tableを表示", group = grpDTDB)
+
+patternTf = input.timeframe("5", "Pattern TF", group = grpDTDB)
+pivotLen  = input.int(5, "Pivot Length", minval = 1, group = grpDTDB)
+
+doubleTolerancePct = input.float(0.004, "2回目頂点/底値の許容率", step = 0.001, group = grpDTDB)
+
+useNeckDepth  = input.bool(true, "ネック深さを要求", group = grpDTDB)
+neckDepthMult = input.float(0.8, "ネック深さ >= ATR ×", step = 0.1, group = grpDTDB)
+
+useQuickRev  = input.bool(true, "2回目到達後N本以内の反転のみ", group = grpDTDB)
+quickRevBars = input.int(5, "反転までの最大本数", minval = 1, group = grpDTDB)
+
+retestAtrLen  = input.int(14, "Retest ATR Length", minval = 1, group = grpDTDB)
+retestAtrMult = input.float(0.5, "Retest ATR Mult", step = 0.1, group = grpDTDB)
+
+useDTDBReversalCandle = input.bool(true, "反転ローソクを要求", group = grpDTDB)
+useBodyFilter = input.bool(true, "包み足の実体強度を要求", group = grpDTDB)
+bodyMult      = input.float(1.6, "実体 > 平均実体 ×", step = 0.1, group = grpDTDB)
+pinWickRatio  = input.float(0.7, "ピンバーのヒゲ比率", minval = 0.1, maxval = 1.0, step = 0.05, group = grpDTDB)
+
+useDTDBQualityFilter = input.bool(false, "Quality Filterを使う", group = grpDTDB)
+minDTDBQuality       = input.int(50, "最低DT/DB Quality", minval = 0, maxval = 100, group = grpDTDB)
+
+useDTDBInvalidation = input.bool(true, "DT/DB否定を使う", group = grpDTDB)
+invalidationAtrMult = input.float(0.2, "否定判定 ATR余白", step = 0.1, group = grpDTDB)
+
+useSweepDTDB    = input.bool(true, "スイープ型DT/DBを使う", group = grpDTDB)
+sweepAtrMult    = input.float(0.3, "スイープ許容 ATR×", step = 0.1, group = grpDTDB)
+sweepReturnBars = input.int(3, "スイープ後に戻る最大本数", minval = 1, group = grpDTDB)
+
+setupValidBars = input.int(24, "セットアップ有効本数", minval = 1, group = grpDTDB)
+
+dtdbEntryMode = input.string("Any", "Entry Mode", options = ["Any", "BreakOnly", "RetestOnly", "InvalidationOnly", "SweepOnly"], group = grpDTDB)
+
+bool dAct = useDTDBModule
+
+// ============================================================
+//  共通計算
+// ============================================================
+float atrV = ta.atr(retestAtrLen)
+float retestRange = atrV * retestAtrMult
+
+// ============================================================
+//  3. HTF Pivot 取得 (確定後のみ / lookahead_off)
+// ============================================================
+[htfPh, htfPl, htfClose, htfHigh, htfLow, htfTime] = request.security(syminfo.tickerid, patternTf, [ta.pivothigh(pivotLen, pivotLen), ta.pivotlow(pivotLen, pivotLen), close[1], high[1], low[1], time], lookahead = barmerge.lookahead_off)
+bool newHTF = na(htfTime[1]) ? false : htfTime != htfTime[1]
+
+// ============================================================
+//  5. 補助関数: 2つの Pivot 間にある反対 Pivot を探す
+// ============================================================
+f_findBetween(_vals, _idxs, _lo, _hi) =>
+    float _res = na
+    if array.size(_vals) > 0
+        for i = 0 to array.size(_vals) - 1
+            int _id = array.get(_idxs, i)
+            if _id > _lo and _id < _hi
+                _res := array.get(_vals, i)
+    _res
+
+// ============================================================
+//  4. Pivot 配列
+// ============================================================
+var array<float> phVals = array.new_float()
+var array<int>   phIdx  = array.new_int()
+var array<float> plVals = array.new_float()
+var array<int>   plIdx  = array.new_int()
+var int htfCount     = 0
+var int lastPivotDir = 0
+
+// ============================================================
+//  パターン状態 (DT)
+// ============================================================
+var float dtFirstTop   = na
+var float dtSecondTop  = na
+var float necklineDT   = na
+var bool  dtPatternFound = false
+var bool  dtBreakDone    = false
+var bool  dtInvalidated  = false
+var bool  dtIsSweep      = false
+var int   dtPatternBar   = na
+var int   dtBreakBar     = na
+
+// パターン状態 (DB)
+var float dbFirstBottom  = na
+var float dbSecondBottom = na
+var float necklineDB     = na
+var bool  dbPatternFound = false
+var bool  dbBreakDone    = false
+var bool  dbInvalidated  = false
+var bool  dbIsSweep      = false
+var int   dbPatternBar   = na
+var int   dbBreakBar     = na
+
+// 右山 / 右底 形成ビルド状態
+var bool  dtRSBuilding = false
+var float dtBuildTop   = na
+var bool  dbRSBuilding = false
+var float dbBuildBot   = na
+
+// バー内イベント
+bool dtRSFailHTF   = false
+bool dbRSFailHTF   = false
+bool dtExpiredEvent = false
+bool dbExpiredEvent = false
+
+// ============================================================
+//  6/7/8/9. 検出 (newHTF 時)
+// ============================================================
+if newHTF
+    htfCount := htfCount + 1
+    int _pIdx = htfCount - pivotLen
+    if not na(htfPh)
+        if lastPivotDir == 1 and array.size(phVals) > 0
+            int _li = array.size(phVals) - 1
+            if htfPh > array.get(phVals, _li)
+                array.set(phVals, _li, htfPh)
+                array.set(phIdx,  _li, _pIdx)
+        else
+            array.push(phVals, htfPh)
+            array.push(phIdx,  _pIdx)
+            lastPivotDir := 1
+            while array.size(phVals) > 10
+                array.shift(phVals)
+                array.shift(phIdx)
+    if not na(htfPl)
+        if lastPivotDir == -1 and array.size(plVals) > 0
+            int _li = array.size(plVals) - 1
+            if htfPl < array.get(plVals, _li)
+                array.set(plVals, _li, htfPl)
+                array.set(plIdx,  _li, _pIdx)
+        else
+            array.push(plVals, htfPl)
+            array.push(plIdx,  _pIdx)
+            lastPivotDir := -1
+            while array.size(plVals) > 10
+                array.shift(plVals)
+                array.shift(plIdx)
+
+    // --- ダブルトップ (新しい PH が確定したとき / 直近2 PH) ---
+    int nH = array.size(phVals)
+    if not na(htfPh) and nH >= 2
+        float t1 = array.get(phVals, nH - 2)
+        float t2 = array.get(phVals, nH - 1)
+        int t1i = array.get(phIdx, nH - 2)
+        int t2i = array.get(phIdx, nH - 1)
+        float neck = f_findBetween(plVals, plIdx, t1i, t2i)
+        bool symOk   = math.abs(t1 - t2) / t1 <= doubleTolerancePct
+        bool depthOk = not useNeckDepth or (not na(neck) and (math.min(t1, t2) - neck) >= atrV * neckDepthMult)
+        bool sweepDT = useSweepDTDB and t2 > t1 and t2 <= t1 + atrV * sweepAtrMult and close < t1 and depthOk
+        if not na(neck) and (symOk and depthOk or sweepDT)
+            dtFirstTop     := t1
+            dtSecondTop    := t2
+            necklineDT     := neck
+            dtPatternFound := true
+            dtBreakDone    := false
+            dtInvalidated  := false
+            dtIsSweep      := sweepDT and not (symOk and depthOk)
+            dtPatternBar   := bar_index
+        else if not na(neck) and t2 > t1
+            dtRSFailHTF := true
+
+    // --- ダブルボトム (新しい PL が確定したとき / 直近2 PL) ---
+    int nL = array.size(plVals)
+    if not na(htfPl) and nL >= 2
+        float b1 = array.get(plVals, nL - 2)
+        float b2 = array.get(plVals, nL - 1)
+        int b1i = array.get(plIdx, nL - 2)
+        int b2i = array.get(plIdx, nL - 1)
+        float neckB = f_findBetween(phVals, phIdx, b1i, b2i)
+        bool symOkB   = math.abs(b1 - b2) / b1 <= doubleTolerancePct
+        bool depthOkB = not useNeckDepth or (not na(neckB) and (neckB - math.max(b1, b2)) >= atrV * neckDepthMult)
+        bool sweepDB  = useSweepDTDB and b2 < b1 and b2 >= b1 - atrV * sweepAtrMult and close > b1 and depthOkB
+        if not na(neckB) and (symOkB and depthOkB or sweepDB)
+            dbFirstBottom  := b1
+            dbSecondBottom := b2
+            necklineDB     := neckB
+            dbPatternFound := true
+            dbBreakDone    := false
+            dbInvalidated  := false
+            dbIsSweep      := sweepDB and not (symOkB and depthOkB)
+            dbPatternBar   := bar_index
+        else if not na(neckB) and b2 < b1
+            dbRSFailHTF := true
+
+    // --- 右山 / 右底 ビルド状態 ---
+    if not na(htfPh)
+        dtBuildTop := htfPh
+        dtRSBuilding := false
+    if not na(htfPl)
+        if not na(dtBuildTop)
+            dtRSBuilding := true
+    if not na(htfPl)
+        dbBuildBot := htfPl
+        dbRSBuilding := false
+    if not na(htfPh)
+        if not na(dbBuildBot)
+            dbRSBuilding := true
+
+// ============================================================
+//  10. 右山崩れ / 右底崩れ
+// ============================================================
+bool dtPriceFail = dtRSBuilding and not na(dtBuildTop) and high > dtBuildTop + atrV * invalidationAtrMult
+bool dbPriceFail = dbRSBuilding and not na(dbBuildBot) and low < dbBuildBot - atrV * invalidationAtrMult
+bool dtRightSideFailed = dtPriceFail or dtRSFailHTF
+bool dbRightSideFailed = dbPriceFail or dbRSFailHTF
+if dtRightSideFailed
+    dtRSBuilding := false
+    dtBuildTop := na
+if dbRightSideFailed
+    dbRSBuilding := false
+    dbBuildBot := na
+
+bool dtRightSideBuilding = dAct and dtRSBuilding and not dtRightSideFailed
+bool dbRightSideBuilding = dAct and dbRSBuilding and not dbRightSideFailed
+
+// ============================================================
+//  13. 反転ローソク
+// ============================================================
+float body    = math.abs(close - open)
+float avgBody = ta.sma(math.abs(close - open), 20)
+bool strongBody = not useBodyFilter or body > avgBody * bodyMult
+
+bool bearEngulf = close < open and open >= close[1] and close <= open[1] and strongBody
+bool bullEngulf = close > open and open <= close[1] and close >= open[1] and strongBody
+float barRng = math.max(high - low, syminfo.mintick)
+float upWick = high - math.max(open, close)
+float dnWick = math.min(open, close) - low
+bool bearPin = upWick / barRng >= pinWickRatio
+bool bullPin = dnWick / barRng >= pinWickRatio
+
+bool dtReversal = not useDTDBReversalCandle or bearEngulf or bearPin
+bool dbReversal = not useDTDBReversalCandle or bullEngulf or bullPin
+
+// ============================================================
+//  14. DT/DB 否定 / 11. ネックラインブレイク (状態更新)
+// ============================================================
+bool dtInvalidation = useDTDBInvalidation and dtPatternFound and not dtBreakDone and not na(dtFirstTop) and not na(dtSecondTop) and close > math.max(dtFirstTop, dtSecondTop) + atrV * invalidationAtrMult
+bool dbInvalidation = useDTDBInvalidation and dbPatternFound and not dbBreakDone and not na(dbFirstBottom) and not na(dbSecondBottom) and close < math.min(dbFirstBottom, dbSecondBottom) - atrV * invalidationAtrMult
+
+bool dtBreak = dtPatternFound and not dtBreakDone and not na(necklineDT) and not na(htfClose) and htfClose < necklineDT
+bool dbBreak = dbPatternFound and not dbBreakDone and not na(necklineDB) and not na(htfClose) and htfClose > necklineDB
+
+if dtInvalidation
+    dtInvalidated  := true
+    dtPatternFound := false
+if dbInvalidation
+    dbInvalidated  := true
+    dbPatternFound := false
+
+if dtBreak and not dtInvalidation
+    dtBreakDone := true
+    dtBreakBar  := bar_index
+if dbBreak and not dbInvalidation
+    dbBreakDone := true
+    dbBreakBar  := bar_index
+
+// セットアップ有効期限切れ
+if dtPatternFound and dtBreakDone and not na(dtBreakBar) and (bar_index - dtBreakBar > setupValidBars)
+    dtPatternFound := false
+    dtBreakDone    := false
+    dtExpiredEvent := true
+else if dtPatternFound and not dtBreakDone and not na(dtPatternBar) and (bar_index - dtPatternBar > setupValidBars)
+    dtPatternFound := false
+    dtExpiredEvent := true
+if dbPatternFound and dbBreakDone and not na(dbBreakBar) and (bar_index - dbBreakBar > setupValidBars)
+    dbPatternFound := false
+    dbBreakDone    := false
+    dbExpiredEvent := true
+else if dbPatternFound and not dbBreakDone and not na(dbPatternBar) and (bar_index - dbPatternBar > setupValidBars)
+    dbPatternFound := false
+    dbExpiredEvent := true
+
+// ============================================================
+//  12. ネックラインリテスト
+// ============================================================
+bool dtSetupValid = dtPatternFound and dtBreakDone and not na(dtBreakBar) and (bar_index - dtBreakBar <= setupValidBars)
+bool dbSetupValid = dbPatternFound and dbBreakDone and not na(dbBreakBar) and (bar_index - dbBreakBar <= setupValidBars)
+bool dtRetest = dtSetupValid and not na(necklineDT) and high >= necklineDT - retestRange and close <= necklineDT + retestRange
+bool dbRetest = dbSetupValid and not na(necklineDB) and low <= necklineDB + retestRange and close >= necklineDB - retestRange
+
+// ============================================================
+//  8. スイープ型 (Pattern 出力)
+// ============================================================
+bool dtSweepPattern = dAct and useSweepDTDB and dtPatternFound and dtIsSweep and not na(dtFirstTop) and close < dtFirstTop
+bool dbSweepPattern = dAct and useSweepDTDB and dbPatternFound and dbIsSweep and not na(dbFirstBottom) and close > dbFirstBottom
+
+// パターンフラグ出力
+bool dtPattern = dtPatternFound
+bool dbPattern = dbPatternFound
+
+// ============================================================
+//  15. Quality Score (対称性は線形補間)
+// ============================================================
+bool revSpeedOkDt = not na(dtPatternBar) and (bar_index - dtPatternBar) <= quickRevBars
+bool revSpeedOkDb = not na(dbPatternBar) and (bar_index - dbPatternBar) <= quickRevBars
+bool quickOkDt = not useQuickRev or revSpeedOkDt
+bool quickOkDb = not useQuickRev or revSpeedOkDb
+
+float dtSymPts = (na(dtFirstTop) or na(dtSecondTop) or dtFirstTop == 0 or doubleTolerancePct == 0) ? 0.0 : math.max(0.0, 20.0 * (1.0 - (math.abs(dtFirstTop - dtSecondTop) / dtFirstTop) / doubleTolerancePct))
+float dbSymPts = (na(dbFirstBottom) or na(dbSecondBottom) or dbFirstBottom == 0 or doubleTolerancePct == 0) ? 0.0 : math.max(0.0, 20.0 * (1.0 - (math.abs(dbFirstBottom - dbSecondBottom) / dbFirstBottom) / doubleTolerancePct))
+
+bool dtNeckDepthOk = not useNeckDepth or (not na(dtFirstTop) and not na(dtSecondTop) and not na(necklineDT) and (math.min(dtFirstTop, dtSecondTop) - necklineDT) >= atrV * neckDepthMult)
+bool dbNeckDepthOk = not useNeckDepth or (not na(dbFirstBottom) and not na(dbSecondBottom) and not na(necklineDB) and (necklineDB - math.max(dbFirstBottom, dbSecondBottom)) >= atrV * neckDepthMult)
+
+int dtQuality = not dtPatternFound ? 0 : math.min(100, math.round(dtSymPts) + (dtNeckDepthOk ? 20 : 0) + (revSpeedOkDt ? 15 : 0) + ((useDTDBReversalCandle and (bearEngulf or bearPin)) ? 15 : 0) + (dtBreakDone ? 15 : 0) + (dtRetest ? 10 : 0) + (dtIsSweep ? 5 : 0))
+int dbQuality = not dbPatternFound ? 0 : math.min(100, math.round(dbSymPts) + (dbNeckDepthOk ? 20 : 0) + (revSpeedOkDb ? 15 : 0) + ((useDTDBReversalCandle and (bullEngulf or bullPin)) ? 15 : 0) + (dbBreakDone ? 15 : 0) + (dbRetest ? 10 : 0) + (dbIsSweep ? 5 : 0))
+int dtdbQuality = math.max(dtQuality, dbQuality)
+bool qualityOk = not useDTDBQualityFilter or dtdbQuality >= minDTDBQuality
+
+// ============================================================
+//  16. Signal 判定
+// ============================================================
+bool dtBreakSignal  = dtBreak and dtReversal and qualityOk
+bool dtRetestSignal = dtRetest and dtReversal and qualityOk
+bool dtSweepSignal  = dtSweepPattern and dtReversal and qualityOk
+bool dbBreakSignal  = dbBreak and dbReversal and qualityOk
+bool dbRetestSignal = dbRetest and dbReversal and qualityOk
+bool dbSweepSignal  = dbSweepPattern and dbReversal and qualityOk
+
+// 否定は逆方向 Bias
+bool dbByInvalidation = dtInvalidation
+bool dtByInvalidation = dbInvalidation
+
+// ============================================================
+//  17/18/19. Bias / Allow / NoTrade
+// ============================================================
+bool dtdbBiasShort = dAct and (dtBreakSignal or dtRetestSignal or dtSweepSignal or dtByInvalidation)
+bool dtdbBiasLong  = dAct and (dbBreakSignal or dbRetestSignal or dbSweepSignal or dbByInvalidation)
+
+bool allowLongByDTDB =
+     not dAct ? true :
+     dtdbEntryMode == "InvalidationOnly" ? dbByInvalidation :
+     dtdbEntryMode == "BreakOnly" ? dbBreakSignal :
+     dtdbEntryMode == "RetestOnly" ? dbRetestSignal :
+     dtdbEntryMode == "SweepOnly" ? dbSweepSignal :
+     dtdbBiasLong
+bool allowShortByDTDB =
+     not dAct ? true :
+     dtdbEntryMode == "InvalidationOnly" ? dtByInvalidation :
+     dtdbEntryMode == "BreakOnly" ? dtBreakSignal :
+     dtdbEntryMode == "RetestOnly" ? dtRetestSignal :
+     dtdbEntryMode == "SweepOnly" ? dtSweepSignal :
+     dtdbBiasShort
+
+bool rConflict = dtPattern and dbPattern
+bool rLowQual  = useDTDBQualityFilter and (dtPattern or dbPattern) and not qualityOk
+bool rExpired  = dtExpiredEvent or dbExpiredEvent
+bool rFailedRS = dtRightSideFailed or dbRightSideFailed
+bool rInval    = dtInvalidation or dbInvalidation
+
+int dtdbNoTradeReason = not dAct ? 0 : rConflict ? 1 : rLowQual ? 2 : rExpired ? 3 : rFailedRS ? 4 : rInval ? 5 : 0
+bool dtdbNoTrade      = dAct and (rConflict or rLowQual or rExpired or rFailedRS or rInval)
+bool dtdbNoTradeLong  = dtdbNoTrade
+bool dtdbNoTradeShort = dtdbNoTrade
+
+// ============================================================
+//  20. Signal Type
+//  優先: NoTrade > Invalidation > Retest > Break > Sweep > Pattern
+// ============================================================
+int dtdbSignalType =
+     not dAct ? 0 :
+     dtdbNoTrade ? 11 :
+     dtInvalidation ? 7 :
+     dbInvalidation ? 8 :
+     dtRetest ? 5 :
+     dbRetest ? 6 :
+     dtBreak ? 3 :
+     dbBreak ? 4 :
+     dtSweepPattern ? 9 :
+     dbSweepPattern ? 10 :
+     dtPattern ? 1 :
+     dbPattern ? 2 : 0
+
+// ============================================================
+//  21. Direction
+// ============================================================
+int dtdbDirection = not dAct ? 0 : (dtdbBiasLong and not dtdbBiasShort) ? 1 : (dtdbBiasShort and not dtdbBiasLong) ? -1 : 0
+
+// ============================================================
+//  22. Rank (0〜10)
+// ============================================================
+bool anyRetest = dtRetest or dbRetest
+bool anyBreak  = dtBreak or dbBreak
+bool anyInval  = dtInvalidation or dbInvalidation
+bool anySweep  = dtSweepPattern or dbSweepPattern
+bool anyRev    = dtReversal or dbReversal
+
+int dtdbRank =
+     not dAct ? 0 :
+     (anySweep and anyRetest and dtdbQuality >= 80) ? 10 :
+     anyInval ? 9 :
+     dtdbQuality >= 80 ? 8 :
+     dtdbQuality >= 70 ? 7 :
+     anySweep ? 6 :
+     (anyRetest and anyRev) ? 5 :
+     anyRetest ? 4 :
+     anyBreak ? 3 :
+     (qualityOk and dtdbQuality > 0) ? 2 :
+     (dtPattern or dbPattern) ? 1 : 0
+
+// ============================================================
+//  23. 表示 : ネックライン (パターン保持中のみ)
+// ============================================================
+plot(showDTDBLines and dtPatternFound ? necklineDT : na, "necklineDT", color = color.new(color.red, 0),   style = plot.style_linebr)
+plot(showDTDBLines and dbPatternFound ? necklineDB : na, "necklineDB", color = color.new(color.green, 0), style = plot.style_linebr)
+
+// ============================================================
+//  23. 表示 : ラベル (状態変化時のみ)
+// ============================================================
+if showDTDBLabels and dAct
+    if dtPattern and not dtPattern[1]
+        label.new(bar_index, high, "Double Top", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 30), textcolor = color.white, size = size.small)
+    if dbPattern and not dbPattern[1]
+        label.new(bar_index, low, "Double Bottom", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.green, 30), textcolor = color.white, size = size.small)
+    if dtBreak and not dtBreak[1]
+        label.new(bar_index, high, "DT Break", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.orange, 0), textcolor = color.white, size = size.small)
+    if dbBreak and not dbBreak[1]
+        label.new(bar_index, low, "DB Break", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.orange, 0), textcolor = color.white, size = size.small)
+    if dtRetest and not dtRetest[1]
+        label.new(bar_index, high, "DT Retest", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+    if dbRetest and not dbRetest[1]
+        label.new(bar_index, low, "DB Retest", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+    if dtInvalidation and not dtInvalidation[1]
+        label.new(bar_index, low, "DT Invalid", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
+    if dbInvalidation and not dbInvalidation[1]
+        label.new(bar_index, high, "DB Invalid", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
+    if dtSweepPattern and not dtSweepPattern[1]
+        label.new(bar_index, high, "DT Sweep", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.purple, 0), textcolor = color.white, size = size.small)
+    if dbSweepPattern and not dbSweepPattern[1]
+        label.new(bar_index, low, "DB Sweep", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.purple, 0), textcolor = color.white, size = size.small)
+    if dtRightSideBuilding and not dtRightSideBuilding[1]
+        label.new(bar_index, high, "DT Right Build", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.teal, 0), textcolor = color.white, size = size.tiny)
+    if dbRightSideBuilding and not dbRightSideBuilding[1]
+        label.new(bar_index, low, "DB Right Build", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.teal, 0), textcolor = color.white, size = size.tiny)
+    if dtRightSideFailed and not dtRightSideFailed[1]
+        label.new(bar_index, high, "DT Right Fail", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.gray, 0), textcolor = color.white, size = size.tiny)
+    if dbRightSideFailed and not dbRightSideFailed[1]
+        label.new(bar_index, low, "DB Right Fail", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.gray, 0), textcolor = color.white, size = size.tiny)
+
+// ============================================================
+//  23. 表示 : Shape
+// ============================================================
+plotshape(showDTDBLabels and dAct and dtBreak and not dtBreak[1],  title = "DT Break",  style = shape.xcross,  location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
+plotshape(showDTDBLabels and dAct and dbBreak and not dbBreak[1],  title = "DB Break",  style = shape.xcross,  location = location.belowbar, color = color.new(color.orange, 0), size = size.tiny)
+plotshape(showDTDBLabels and dAct and dtRetest and not dtRetest[1], title = "DT Retest", style = shape.circle, location = location.abovebar, color = color.new(color.red, 0),    size = size.tiny)
+plotshape(showDTDBLabels and dAct and dbRetest and not dbRetest[1], title = "DB Retest", style = shape.circle, location = location.belowbar, color = color.new(color.green, 0),  size = size.tiny)
+
+// ============================================================
+//  24. Debug Table
+// ============================================================
+f_typeStr(t) =>
+    t == 1 ? "DT Pat" : t == 2 ? "DB Pat" : t == 3 ? "DT Break" : t == 4 ? "DB Break" : t == 5 ? "DT Retest" : t == 6 ? "DB Retest" : t == 7 ? "DT Inval" : t == 8 ? "DB Inval" : t == 9 ? "DT Sweep" : t == 10 ? "DB Sweep" : t == 11 ? "NoTrade" : "None"
+f_reasonStr(r) =>
+    r == 1 ? "Conflict" : r == 2 ? "Low Quality" : r == 3 ? "Expired" : r == 4 ? "Right Failed" : r == 5 ? "Invalidated" : "None"
+
+var table dbg = table.new(position.top_right, 2, 18, border_width = 1)
+if showDTDBDebugTable and dAct and barstate.islast
+    string sDir = dtdbDirection == 1 ? "BUY" : dtdbDirection == -1 ? "SELL" : "-"
+    string sState = dtdbNoTrade ? "NoTrade" : dtdbBiasLong ? "BIAS L" : dtdbBiasShort ? "BIAS S" : "-"
+    table.cell(dbg, 0, 0,  "DTDB State", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(dbg, 1, 0,  sState, text_color = color.white, bgcolor = dtdbNoTrade ? color.new(color.red, 20) : color.new(color.blue, 0))
+    table.cell(dbg, 0, 1,  "SignalType", text_color = color.white)
+    table.cell(dbg, 1, 1,  f_typeStr(dtdbSignalType), text_color = color.white)
+    table.cell(dbg, 0, 2,  "Direction", text_color = color.white)
+    table.cell(dbg, 1, 2,  sDir, text_color = color.white)
+    table.cell(dbg, 0, 3,  "Rank / Quality", text_color = color.white)
+    table.cell(dbg, 1, 3,  str.tostring(dtdbRank) + " / " + str.tostring(dtdbQuality), text_color = color.white)
+    table.cell(dbg, 0, 4,  "DT/DB Qual", text_color = color.white)
+    table.cell(dbg, 1, 4,  str.tostring(dtQuality) + " / " + str.tostring(dbQuality), text_color = color.white)
+    table.cell(dbg, 0, 5,  "DT/DB Pat", text_color = color.white)
+    table.cell(dbg, 1, 5,  (dtPattern ? "Y" : "N") + " / " + (dbPattern ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 6,  "DT/DB Break", text_color = color.white)
+    table.cell(dbg, 1, 6,  (dtBreakDone ? "Y" : "N") + " / " + (dbBreakDone ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 7,  "DT/DB Retest", text_color = color.white)
+    table.cell(dbg, 1, 7,  (dtRetest ? "Y" : "N") + " / " + (dbRetest ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 8,  "DT/DB Inval", text_color = color.white)
+    table.cell(dbg, 1, 8,  (dtInvalidated ? "Y" : "N") + " / " + (dbInvalidated ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 9,  "DT/DB Sweep", text_color = color.white)
+    table.cell(dbg, 1, 9,  (dtSweepPattern ? "Y" : "N") + " / " + (dbSweepPattern ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 10, "Right Build DT/DB", text_color = color.white)
+    table.cell(dbg, 1, 10, (dtRightSideBuilding ? "Y" : "N") + " / " + (dbRightSideBuilding ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 11, "Right Fail DT/DB", text_color = color.white)
+    table.cell(dbg, 1, 11, (dtRightSideFailed ? "Y" : "N") + " / " + (dbRightSideFailed ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 12, "NoTrade Reason", text_color = color.white)
+    table.cell(dbg, 1, 12, f_reasonStr(dtdbNoTradeReason), text_color = color.white)
+    table.cell(dbg, 0, 13, "DT Neckline", text_color = color.white)
+    table.cell(dbg, 1, 13, na(necklineDT) ? "-" : str.tostring(necklineDT, format.mintick), text_color = color.white)
+    table.cell(dbg, 0, 14, "DB Neckline", text_color = color.white)
+    table.cell(dbg, 1, 14, na(necklineDB) ? "-" : str.tostring(necklineDB, format.mintick), text_color = color.white)
+    table.cell(dbg, 0, 15, "Pivot H/L", text_color = color.white)
+    table.cell(dbg, 1, 15, str.tostring(array.size(phVals)) + " / " + str.tostring(array.size(plVals)), text_color = color.white)
+    table.cell(dbg, 0, 16, "Entry Mode", text_color = color.white)
+    table.cell(dbg, 1, 16, dtdbEntryMode, text_color = color.white)
+    table.cell(dbg, 0, 17, "Allow L/S", text_color = color.white)
+    table.cell(dbg, 1, 17, (allowLongByDTDB ? "L" : "-") + " / " + (allowShortByDTDB ? "S" : "-"), text_color = color.white)
+
+// ============================================================
+//  25. Data Window 出力
+// ============================================================
+plot(allowLongByDTDB  ? 1 : 0, "allowLongByDTDB",  display = display.data_window)
+plot(allowShortByDTDB ? 1 : 0, "allowShortByDTDB", display = display.data_window)
+plot(dtdbBiasLong  ? 1 : 0, "dtdbBiasLong",  display = display.data_window)
+plot(dtdbBiasShort ? 1 : 0, "dtdbBiasShort", display = display.data_window)
+plot(dtdbNoTrade      ? 1 : 0, "dtdbNoTrade",      display = display.data_window)
+plot(dtdbNoTradeLong  ? 1 : 0, "dtdbNoTradeLong",  display = display.data_window)
+plot(dtdbNoTradeShort ? 1 : 0, "dtdbNoTradeShort", display = display.data_window)
+plot(dtdbNoTradeReason, "dtdbNoTradeReason", display = display.data_window)
+plot(dtdbSignalType, "dtdbSignalType", display = display.data_window)
+plot(dtdbDirection,  "dtdbDirection",  display = display.data_window)
+plot(dtdbRank,       "dtdbRank",       display = display.data_window)
+plot(dtdbQuality,    "dtdbQuality",    display = display.data_window)
+plot(dtQuality, "dtQuality", display = display.data_window)
+plot(dbQuality, "dbQuality", display = display.data_window)
+plot(dtPattern ? 1 : 0, "dtPattern", display = display.data_window)
+plot(dbPattern ? 1 : 0, "dbPattern", display = display.data_window)
+plot(dtBreak ? 1 : 0, "dtBreak", display = display.data_window)
+plot(dbBreak ? 1 : 0, "dbBreak", display = display.data_window)
+plot(dtRetest ? 1 : 0, "dtRetest", display = display.data_window)
+plot(dbRetest ? 1 : 0, "dbRetest", display = display.data_window)
+plot(dtInvalidation ? 1 : 0, "dtInvalidation", display = display.data_window)
+plot(dbInvalidation ? 1 : 0, "dbInvalidation", display = display.data_window)
+plot(dtRightSideBuilding ? 1 : 0, "dtRightSideBuilding", display = display.data_window)
+plot(dbRightSideBuilding ? 1 : 0, "dbRightSideBuilding", display = display.data_window)
+plot(dtRightSideFailed ? 1 : 0, "dtRightSideFailed", display = display.data_window)
+plot(dbRightSideFailed ? 1 : 0, "dbRightSideFailed", display = display.data_window)
+plot(dtSweepPattern ? 1 : 0, "dtSweepPattern", display = display.data_window)
+plot(dbSweepPattern ? 1 : 0, "dbSweepPattern", display = display.data_window)
+plot(necklineDT, "necklineDTVal", display = display.data_window)
+plot(necklineDB, "necklineDBVal", display = display.data_window)
+
+// ============================================================
+//  26. Alert (全て状態変化時のみ)
+// ============================================================
+alertcondition(dAct and dtPattern and not dtPattern[1], "DT Pattern", "{{ticker}} ダブルトップ 形成")
+alertcondition(dAct and dbPattern and not dbPattern[1], "DB Pattern", "{{ticker}} ダブルボトム 形成")
+alertcondition(dAct and dtBreak and not dtBreak[1], "DT Break", "{{ticker}} DT ネックラインブレイク")
+alertcondition(dAct and dbBreak and not dbBreak[1], "DB Break", "{{ticker}} DB ネックラインブレイク")
+alertcondition(dAct and dtRetest and not dtRetest[1], "DT Retest", "{{ticker}} DT リテスト")
+alertcondition(dAct and dbRetest and not dbRetest[1], "DB Retest", "{{ticker}} DB リテスト")
+alertcondition(dAct and dtInvalidation and not dtInvalidation[1], "DT Invalidation", "{{ticker}} DT 否定")
+alertcondition(dAct and dbInvalidation and not dbInvalidation[1], "DB Invalidation", "{{ticker}} DB 否定")
+alertcondition(dAct and dtSweepPattern and not dtSweepPattern[1], "DT Sweep", "{{ticker}} DT スイープ")
+alertcondition(dAct and dbSweepPattern and not dbSweepPattern[1], "DB Sweep", "{{ticker}} DB スイープ")
+alertcondition(dAct and dtRightSideBuilding and not dtRightSideBuilding[1], "DT Right Side Building", "{{ticker}} DT 右山形成中")
+alertcondition(dAct and dbRightSideBuilding and not dbRightSideBuilding[1], "DB Right Side Building", "{{ticker}} DB 右底形成中")
+alertcondition(dAct and dtRightSideFailed and not dtRightSideFailed[1], "DT Right Side Failed", "{{ticker}} DT 右山崩れ")
+alertcondition(dAct and dbRightSideFailed and not dbRightSideFailed[1], "DB Right Side Failed", "{{ticker}} DB 右底崩れ")
+alertcondition(allowLongByDTDB and not allowLongByDTDB[1],   "Allow Long DTDB",  "{{ticker}} DT/DB ロング許可")
+alertcondition(allowShortByDTDB and not allowShortByDTDB[1], "Allow Short DTDB", "{{ticker}} DT/DB ショート許可")
+alertcondition(dtdbNoTrade and not dtdbNoTrade[1], "DTDB NoTrade", "{{ticker}} DT/DB ノートレード")
