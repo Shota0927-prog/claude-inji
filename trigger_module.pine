@@ -1,0 +1,391 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// ============================================================
+//  Entry Trigger 単体モジュール (Indicator版)
+// ============================================================
+//  ・既存ストラテジーのエントリートリガー部分を独立モジュール化。
+//  ・トリガー: 包み足 / ピンバー / BOS(直近高安更新) / EMAリジェクト /
+//             FVG形成 / 強ローソク / 下位足トリガー確認。
+//  ・strategy ではなく indicator。strategy.entry/exit/position_size 不使用。
+//  ・未来参照禁止。下位足は request.security(lookahead_off)。
+//  ・全機能 ON/OFF 可能。各変数を Data Window へ出力。
+//  ・他モジュールと AND 接続する前提:
+//      allowLongByTrigger / allowShortByTrigger / triggerBiasLong/Short 等を出力。
+// ============================================================
+
+//@version=5
+indicator(
+     title            = "Entry Trigger Module",
+     shorttitle       = "TRIG",
+     overlay          = true,
+     max_bars_back    = 500,
+     max_labels_count = 500,
+     max_lines_count  = 50
+ )
+
+// ============================================================
+//  Input (グループ: Entry Trigger Module)
+// ============================================================
+grpTrig = "Entry Trigger Module"
+
+useTriggerModule      = input.bool(true, "Triggerモジュールを使う",  group = grpTrig)
+showTriggerLabels     = input.bool(true, "Triggerラベルを表示",      group = grpTrig)
+showTriggerShapes     = input.bool(true, "Trigger Shapeを表示",      group = grpTrig)
+showTriggerDebugTable = input.bool(true, "Debug Tableを表示",        group = grpTrig)
+
+useEngulfingTrigger    = input.bool(true, "包み足",             group = grpTrig)
+usePinbarTrigger       = input.bool(true, "ピンバー",           group = grpTrig)
+useBOSTrigger          = input.bool(true, "BOS / 直近高安更新", group = grpTrig)
+useEMARejectTrigger    = input.bool(true, "EMAリジェクト",      group = grpTrig)
+useFVGTrigger          = input.bool(true, "FVG形成",            group = grpTrig)
+useStrongCandleTrigger = input.bool(true, "強ローソク",         group = grpTrig)
+
+triggerMode     = input.string("Any", "Trigger結合", options = ["Any", "All", "MinCount"], group = grpTrig)
+minTriggerCount = input.int(1, "最低Trigger数", minval = 1, group = grpTrig)
+
+useLowerTFTrigger = input.bool(true, "下位足Trigger確認", group = grpTrig)
+triggerTF         = input.timeframe("1", "下位足TF", group = grpTrig)
+
+emaLenTrigger = input.int(20, "EMA Length", minval = 1, group = grpTrig)
+bosLookback   = input.int(10, "BOS Lookback", minval = 2, group = grpTrig)
+
+pinWickBodyMult    = input.float(2.0, "Pinbar ヒゲ/実体倍率", step = 0.1, group = grpTrig)
+pinOppWickMaxRatio = input.float(1.0, "反対ヒゲ上限", step = 0.1, group = grpTrig)
+
+strongBodyRatio = input.float(0.6, "強ローソク 実体率", minval = 0.0, maxval = 1.0, step = 0.05, group = grpTrig)
+closeEdgeRatio  = input.float(0.7, "終値端寄せ", minval = 0.0, maxval = 1.0, step = 0.05, group = grpTrig)
+
+useTriggerCooldown  = input.bool(true, "Triggerクールダウン", group = grpTrig)
+triggerCooldownBars = input.int(3, "Cooldown Bars", minval = 1, group = grpTrig)
+
+useOppositeTriggerNoTrade = input.bool(false, "逆方向Trigger同時発生はNoTrade", group = grpTrig)
+
+bool tAct = useTriggerModule
+
+// ============================================================
+//  共通ヘルパー: SignalType / Score / 結合
+// ============================================================
+// SignalType 優先: MultiTrigger > BOS > Engulfing > Pinbar > EMAReject > FVG > StrongCandle
+f_typeOf(_cnt, _eng, _pin, _bos, _ema, _fvg, _strong) =>
+    _cnt >= 2 ? 7 : _bos ? 3 : _eng ? 1 : _pin ? 2 : _ema ? 4 : _fvg ? 5 : _strong ? 6 : 0
+
+f_scoreOf(_eng, _pin, _bos, _ema, _fvg, _strong) =>
+    (_eng ? 2 : 0) + (_pin ? 2 : 0) + (_bos ? 3 : 0) + (_ema ? 2 : 0) + (_fvg ? 2 : 0) + (_strong ? 2 : 0)
+
+f_combine(_cnt, _enabled) =>
+    triggerMode == "Any"  ? _cnt >= 1 :
+     triggerMode == "All" ? (_enabled > 0 and _cnt >= _enabled) :
+     _cnt >= minTriggerCount
+
+// ON になっているトリガー数 (結合判定用)
+int enabledTriggerCount = (useEngulfingTrigger ? 1 : 0) + (usePinbarTrigger ? 1 : 0) + (useBOSTrigger ? 1 : 0) + (useEMARejectTrigger ? 1 : 0) + (useFVGTrigger ? 1 : 0) + (useStrongCandleTrigger ? 1 : 0)
+
+// ============================================================
+//  Trigger 計算関数 (現在足 / 下位足 共用)
+//  return [bullCount, bearCount, bullType, bearType, bullScore, bearScore]
+// ============================================================
+f_triggerCalc() =>
+    float _body      = math.abs(close - open)
+    float _barRange  = high - low
+    float _upperWick = high - math.max(open, close)
+    float _lowerWick = math.min(open, close) - low
+    float _bodyRatio = _barRange > 0 ? _body / _barRange : 0.0
+    float _closePos  = _barRange > 0 ? (close - low) / _barRange : 0.0
+
+    // 包み足
+    bool _bullEng = useEngulfingTrigger and close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+    bool _bearEng = useEngulfingTrigger and close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+    // ピンバー
+    bool _bullPin = usePinbarTrigger and _lowerWick > _body * pinWickBodyMult and _lowerWick > _upperWick * pinOppWickMaxRatio and _closePos >= closeEdgeRatio
+    bool _bearPin = usePinbarTrigger and _upperWick > _body * pinWickBodyMult and _upperWick > _lowerWick * pinOppWickMaxRatio and _closePos <= 1.0 - closeEdgeRatio
+    // BOS
+    bool _bullBOS = useBOSTrigger and close > ta.highest(high, bosLookback)[1]
+    bool _bearBOS = useBOSTrigger and close < ta.lowest(low, bosLookback)[1]
+    // EMA Reject
+    float _ema = ta.ema(close, emaLenTrigger)
+    bool _bullEMA = useEMARejectTrigger and low <= _ema and close > _ema and close > open
+    bool _bearEMA = useEMARejectTrigger and high >= _ema and close < _ema and close < open
+    // FVG 形成
+    bool _bullFVG = useFVGTrigger and low > high[2]
+    bool _bearFVG = useFVGTrigger and high < low[2]
+    // 強ローソク
+    bool _bullStrong = useStrongCandleTrigger and close > open and _bodyRatio >= strongBodyRatio and _closePos >= closeEdgeRatio
+    bool _bearStrong = useStrongCandleTrigger and close < open and _bodyRatio >= strongBodyRatio and _closePos <= 1.0 - closeEdgeRatio
+
+    int _bullCount = (_bullEng ? 1 : 0) + (_bullPin ? 1 : 0) + (_bullBOS ? 1 : 0) + (_bullEMA ? 1 : 0) + (_bullFVG ? 1 : 0) + (_bullStrong ? 1 : 0)
+    int _bearCount = (_bearEng ? 1 : 0) + (_bearPin ? 1 : 0) + (_bearBOS ? 1 : 0) + (_bearEMA ? 1 : 0) + (_bearFVG ? 1 : 0) + (_bearStrong ? 1 : 0)
+
+    int _bullType = f_typeOf(_bullCount, _bullEng, _bullPin, _bullBOS, _bullEMA, _bullFVG, _bullStrong)
+    int _bearType = f_typeOf(_bearCount, _bearEng, _bearPin, _bearBOS, _bearEMA, _bearFVG, _bearStrong)
+
+    int _bullScore = f_scoreOf(_bullEng, _bullPin, _bullBOS, _bullEMA, _bullFVG, _bullStrong)
+    int _bearScore = f_scoreOf(_bearEng, _bearPin, _bearBOS, _bearEMA, _bearFVG, _bearStrong)
+
+    [_bullCount, _bearCount, _bullType, _bearType, _bullScore, _bearScore]
+
+// ============================================================
+//  3. 現在足のローソク基本計算 (個別出力/表示用)
+// ============================================================
+float body      = math.abs(close - open)
+float barRange  = high - low
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+float bodyRatio = barRange > 0 ? body / barRange : 0.0
+float closePos  = barRange > 0 ? (close - low) / barRange : 0.0
+
+bool bullCandle = close > open
+bool bearCandle = close < open
+
+// --- 4. 包み足 ---
+bool triggerBullEngulf = tAct and useEngulfingTrigger and close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bool triggerBearEngulf = tAct and useEngulfingTrigger and close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+
+// --- 5. Pinbar ---
+bool triggerBullPinbar = tAct and usePinbarTrigger and lowerWick > body * pinWickBodyMult and lowerWick > upperWick * pinOppWickMaxRatio and closePos >= closeEdgeRatio
+bool triggerBearPinbar = tAct and usePinbarTrigger and upperWick > body * pinWickBodyMult and upperWick > lowerWick * pinOppWickMaxRatio and closePos <= 1.0 - closeEdgeRatio
+
+// --- 6. BOS ---
+bool triggerBullBOS = tAct and useBOSTrigger and close > ta.highest(high, bosLookback)[1]
+bool triggerBearBOS = tAct and useBOSTrigger and close < ta.lowest(low, bosLookback)[1]
+
+// --- 7. EMA Reject ---
+float emaTrig = ta.ema(close, emaLenTrigger)
+bool triggerBullEMAReject = tAct and useEMARejectTrigger and low <= emaTrig and close > emaTrig and close > open
+bool triggerBearEMAReject = tAct and useEMARejectTrigger and high >= emaTrig and close < emaTrig and close < open
+
+// --- 8. FVG ---
+bool triggerBullFVG = tAct and useFVGTrigger and low > high[2]
+bool triggerBearFVG = tAct and useFVGTrigger and high < low[2]
+
+// --- 9. 強ローソク ---
+bool triggerBullStrongCandle = tAct and useStrongCandleTrigger and close > open and bodyRatio >= strongBodyRatio and closePos >= closeEdgeRatio
+bool triggerBearStrongCandle = tAct and useStrongCandleTrigger and close < open and bodyRatio >= strongBodyRatio and closePos <= 1.0 - closeEdgeRatio
+
+// ============================================================
+//  11. Trigger Count / Score (現在足)
+// ============================================================
+int bullTriggerCount = (triggerBullEngulf ? 1 : 0) + (triggerBullPinbar ? 1 : 0) + (triggerBullBOS ? 1 : 0) + (triggerBullEMAReject ? 1 : 0) + (triggerBullFVG ? 1 : 0) + (triggerBullStrongCandle ? 1 : 0)
+int bearTriggerCount = (triggerBearEngulf ? 1 : 0) + (triggerBearPinbar ? 1 : 0) + (triggerBearBOS ? 1 : 0) + (triggerBearEMAReject ? 1 : 0) + (triggerBearFVG ? 1 : 0) + (triggerBearStrongCandle ? 1 : 0)
+
+int triggerBullScore = f_scoreOf(triggerBullEngulf, triggerBullPinbar, triggerBullBOS, triggerBullEMAReject, triggerBullFVG, triggerBullStrongCandle)
+int triggerBearScore = f_scoreOf(triggerBearEngulf, triggerBearPinbar, triggerBearBOS, triggerBearEMAReject, triggerBearFVG, triggerBearStrongCandle)
+int triggerScore     = math.max(triggerBullScore, triggerBearScore)
+
+int triggerBullTypeCur = f_typeOf(bullTriggerCount, triggerBullEngulf, triggerBullPinbar, triggerBullBOS, triggerBullEMAReject, triggerBullFVG, triggerBullStrongCandle)
+int triggerBearTypeCur = f_typeOf(bearTriggerCount, triggerBearEngulf, triggerBearPinbar, triggerBearBOS, triggerBearEMAReject, triggerBearFVG, triggerBearStrongCandle)
+
+// ============================================================
+//  10. 下位足 Trigger (request.security / lookahead_off)
+// ============================================================
+[ltBullCount, ltBearCount, ltBullType, ltBearType, ltBullScore, ltBearScore] = request.security(syminfo.tickerid, triggerTF, f_triggerCalc(), lookahead = barmerge.lookahead_off)
+
+bool triggerBullLowerTF = tAct and useLowerTFTrigger and f_combine(ltBullCount, enabledTriggerCount)
+bool triggerBearLowerTF = tAct and useLowerTFTrigger and f_combine(ltBearCount, enabledTriggerCount)
+int  lowerTFBullScore   = ltBullScore
+int  lowerTFBearScore   = ltBearScore
+int  lowerTFSignalType  = ltBullScore >= ltBearScore ? ltBullType : ltBearType
+
+// 現在足結合
+bool triggerBullCurrent = tAct and f_combine(bullTriggerCount, enabledTriggerCount)
+bool triggerBearCurrent = tAct and f_combine(bearTriggerCount, enabledTriggerCount)
+
+// 現在足 / 下位足 は選択式
+bool finalBullTrigger = useLowerTFTrigger ? triggerBullLowerTF : triggerBullCurrent
+bool finalBearTrigger = useLowerTFTrigger ? triggerBearLowerTF : triggerBearCurrent
+
+// ============================================================
+//  12. Trigger 結合 (最終エントリー判定)
+// ============================================================
+bool triggerBullEntry = tAct and finalBullTrigger
+bool triggerBearEntry = tAct and finalBearTrigger
+
+// ============================================================
+//  13. 同時発生 NoTrade
+// ============================================================
+bool triggerNoTradeBoth = useOppositeTriggerNoTrade and triggerBullEntry and triggerBearEntry
+bool triggerNoTrade      = tAct and triggerNoTradeBoth
+bool triggerNoTradeLong  = triggerNoTrade
+bool triggerNoTradeShort = triggerNoTrade
+
+// ============================================================
+//  14. Cooldown
+// ============================================================
+var int lastTriggerBar = na
+bool triggerFiredNow   = triggerBullEntry or triggerBearEntry
+bool triggerCooldownOk = not useTriggerCooldown or na(lastTriggerBar) or (bar_index - lastTriggerBar) > triggerCooldownBars
+if triggerFiredNow and triggerCooldownOk
+    lastTriggerBar := bar_index
+
+// ============================================================
+//  15. 最終出力 (allow / bias)
+// ============================================================
+bool allowLongByTrigger  = tAct and triggerBullEntry and not triggerNoTrade and triggerCooldownOk
+bool allowShortByTrigger = tAct and triggerBearEntry and not triggerNoTrade and triggerCooldownOk
+
+bool triggerBiasLong  = tAct and triggerBullScore > triggerBearScore
+bool triggerBiasShort = tAct and triggerBearScore > triggerBullScore
+
+// ============================================================
+//  16. Signal Type / Direction
+// ============================================================
+int domType = triggerBullScore >= triggerBearScore ? triggerBullTypeCur : triggerBearTypeCur
+int triggerSignalType = not tAct ? 0 : (bullTriggerCount >= 2 or bearTriggerCount >= 2) ? 7 : domType
+
+int triggerDirection = not tAct ? 0 : (triggerBullEntry and triggerBearEntry) ? 0 : triggerBullEntry ? 1 : triggerBearEntry ? -1 : 0
+
+// ============================================================
+//  17. Rank (0〜8)
+// ============================================================
+bool hasBOS    = triggerBullBOS or triggerBearBOS
+bool isMulti   = bullTriggerCount >= 2 or bearTriggerCount >= 2
+bool isSingle  = bullTriggerCount >= 1 or bearTriggerCount >= 1
+bool lowerAgree = useLowerTFTrigger and ((triggerBullLowerTF and triggerBullCurrent) or (triggerBearLowerTF and triggerBearCurrent))
+
+int triggerRankRaw = not tAct ? 0 :
+                      (lowerAgree and isMulti) ? 8 :
+                      lowerAgree               ? 7 :
+                      (isMulti and hasBOS)     ? 6 :
+                      isMulti                  ? 5 :
+                      hasBOS                   ? 4 :
+                      triggerScore >= 4        ? 3 :
+                      triggerScore >= 2        ? 2 :
+                      isSingle                 ? 1 : 0
+int triggerRank = math.min(8, triggerRankRaw)
+
+// ============================================================
+//  18. 表示 : ラベル
+// ============================================================
+f_lblUp(txt, col) =>
+    label.new(bar_index, low, txt, style = label.style_label_up, yloc = yloc.belowbar, color = col, textcolor = color.white, size = size.small)
+f_lblDn(txt, col) =>
+    label.new(bar_index, high, txt, style = label.style_label_down, yloc = yloc.abovebar, color = col, textcolor = color.white, size = size.small)
+
+color colBuy  = color.new(color.green, 0)
+color colSell = color.new(color.red, 0)
+
+if showTriggerLabels and tAct
+    if triggerBullEngulf
+        f_lblUp("TRG Engulf↑", colBuy)
+    if triggerBearEngulf
+        f_lblDn("TRG Engulf↓", colSell)
+    if triggerBullPinbar
+        f_lblUp("TRG Pin↑", colBuy)
+    if triggerBearPinbar
+        f_lblDn("TRG Pin↓", colSell)
+    if triggerBullBOS
+        f_lblUp("TRG BOS↑", colBuy)
+    if triggerBearBOS
+        f_lblDn("TRG BOS↓", colSell)
+    if triggerBullEMAReject
+        f_lblUp("TRG EMA↑", colBuy)
+    if triggerBearEMAReject
+        f_lblDn("TRG EMA↓", colSell)
+    if triggerBullFVG
+        f_lblUp("TRG FVG↑", colBuy)
+    if triggerBearFVG
+        f_lblDn("TRG FVG↓", colSell)
+    if triggerBullStrongCandle
+        f_lblUp("TRG Strong↑", colBuy)
+    if triggerBearStrongCandle
+        f_lblDn("TRG Strong↓", colSell)
+
+// ============================================================
+//  18. 表示 : Debug Table
+// ============================================================
+f_typeStr(t) =>
+    t == 1 ? "Engulf" : t == 2 ? "Pinbar" : t == 3 ? "BOS" : t == 4 ? "EMAReject" : t == 5 ? "FVG" : t == 6 ? "Strong" : t == 7 ? "Multi" : "None"
+
+var table dbg = table.new(position.top_right, 2, 11, border_width = 1)
+if showTriggerDebugTable and tAct and barstate.islast
+    string sDir = triggerDirection == 1 ? "BUY" : triggerDirection == -1 ? "SELL" : "-"
+    string sState = allowLongByTrigger ? "LONG OK" : allowShortByTrigger ? "SHORT OK" : triggerNoTrade ? "NoTrade" : "-"
+    table.cell(dbg, 0, 0,  "Trigger", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(dbg, 1, 0,  sState, text_color = color.white, bgcolor = triggerNoTrade ? color.new(color.red, 20) : color.new(color.blue, 0))
+    table.cell(dbg, 0, 1,  "SignalType", text_color = color.white)
+    table.cell(dbg, 1, 1,  f_typeStr(triggerSignalType), text_color = color.white)
+    table.cell(dbg, 0, 2,  "Direction", text_color = color.white)
+    table.cell(dbg, 1, 2,  sDir, text_color = color.white)
+    table.cell(dbg, 0, 3,  "Rank", text_color = color.white)
+    table.cell(dbg, 1, 3,  str.tostring(triggerRank), text_color = color.white)
+    table.cell(dbg, 0, 4,  "Bull/Bear Cnt", text_color = color.white)
+    table.cell(dbg, 1, 4,  str.tostring(bullTriggerCount) + " / " + str.tostring(bearTriggerCount), text_color = color.white)
+    table.cell(dbg, 0, 5,  "Bull/Bear Score", text_color = color.white)
+    table.cell(dbg, 1, 5,  str.tostring(triggerBullScore) + " / " + str.tostring(triggerBearScore), text_color = color.white)
+    table.cell(dbg, 0, 6,  "LowerTF", text_color = color.white)
+    table.cell(dbg, 1, 6,  useLowerTFTrigger ? "ON" : "OFF", text_color = color.white)
+    table.cell(dbg, 0, 7,  "LowerTF B/S", text_color = color.white)
+    table.cell(dbg, 1, 7,  (triggerBullLowerTF ? "Y" : "N") + " / " + (triggerBearLowerTF ? "Y" : "N"), text_color = color.white)
+    table.cell(dbg, 0, 8,  "NoTrade", text_color = color.white)
+    table.cell(dbg, 1, 8,  triggerNoTrade ? "Y" : "N", text_color = color.white)
+    table.cell(dbg, 0, 9,  "Allow L/S", text_color = color.white)
+    table.cell(dbg, 1, 9,  (allowLongByTrigger ? "L" : "-") + " / " + (allowShortByTrigger ? "S" : "-"), text_color = color.white)
+    table.cell(dbg, 0, 10, "Cooldown", text_color = color.white)
+    table.cell(dbg, 1, 10, triggerCooldownOk ? "OK" : "WAIT", text_color = color.white)
+
+// ============================================================
+//  Shape (エントリー方向)
+// ============================================================
+plotshape(showTriggerShapes and allowLongByTrigger,  title = "Trigger Long",  style = shape.triangleup,   location = location.belowbar, color = colBuy,  size = size.small)
+plotshape(showTriggerShapes and allowShortByTrigger, title = "Trigger Short", style = shape.triangledown, location = location.abovebar, color = colSell, size = size.small)
+plotshape(showTriggerShapes and triggerNoTrade,      title = "Trigger NoTrade", style = shape.xcross,     location = location.abovebar, color = color.new(color.gray, 0), size = size.tiny)
+
+// ============================================================
+//  19. Data Window 出力
+// ============================================================
+plot(triggerBullEngulf       ? 1 : 0, "triggerBullEngulf",       display = display.data_window)
+plot(triggerBearEngulf       ? 1 : 0, "triggerBearEngulf",       display = display.data_window)
+plot(triggerBullPinbar       ? 1 : 0, "triggerBullPinbar",       display = display.data_window)
+plot(triggerBearPinbar       ? 1 : 0, "triggerBearPinbar",       display = display.data_window)
+plot(triggerBullBOS          ? 1 : 0, "triggerBullBOS",          display = display.data_window)
+plot(triggerBearBOS          ? 1 : 0, "triggerBearBOS",          display = display.data_window)
+plot(triggerBullEMAReject    ? 1 : 0, "triggerBullEMAReject",    display = display.data_window)
+plot(triggerBearEMAReject    ? 1 : 0, "triggerBearEMAReject",    display = display.data_window)
+plot(triggerBullFVG          ? 1 : 0, "triggerBullFVG",          display = display.data_window)
+plot(triggerBearFVG          ? 1 : 0, "triggerBearFVG",          display = display.data_window)
+plot(triggerBullStrongCandle ? 1 : 0, "triggerBullStrongCandle", display = display.data_window)
+plot(triggerBearStrongCandle ? 1 : 0, "triggerBearStrongCandle", display = display.data_window)
+
+plot(bullTriggerCount, "bullTriggerCount", display = display.data_window)
+plot(bearTriggerCount, "bearTriggerCount", display = display.data_window)
+plot(triggerBullScore, "triggerBullScore", display = display.data_window)
+plot(triggerBearScore, "triggerBearScore", display = display.data_window)
+plot(triggerScore,     "triggerScore",     display = display.data_window)
+
+plot(triggerSignalType, "triggerSignalType", display = display.data_window)
+plot(triggerDirection,  "triggerDirection",  display = display.data_window)
+plot(triggerRank,       "triggerRank",       display = display.data_window)
+
+plot(triggerBiasLong     ? 1 : 0, "triggerBiasLong",     display = display.data_window)
+plot(triggerBiasShort    ? 1 : 0, "triggerBiasShort",    display = display.data_window)
+plot(triggerNoTrade      ? 1 : 0, "triggerNoTrade",      display = display.data_window)
+plot(triggerNoTradeLong  ? 1 : 0, "triggerNoTradeLong",  display = display.data_window)
+plot(triggerNoTradeShort ? 1 : 0, "triggerNoTradeShort", display = display.data_window)
+plot(allowLongByTrigger  ? 1 : 0, "allowLongByTrigger",  display = display.data_window)
+plot(allowShortByTrigger ? 1 : 0, "allowShortByTrigger", display = display.data_window)
+
+plot(triggerBullLowerTF ? 1 : 0, "triggerBullLowerTF", display = display.data_window)
+plot(triggerBearLowerTF ? 1 : 0, "triggerBearLowerTF", display = display.data_window)
+plot(lowerTFBullScore,  "lowerTFBullScore",  display = display.data_window)
+plot(lowerTFBearScore,  "lowerTFBearScore",  display = display.data_window)
+plot(lowerTFSignalType, "lowerTFSignalType", display = display.data_window)
+
+// ============================================================
+//  20. Alert
+// ============================================================
+alertcondition(triggerBullEngulf,       "Trigger BUY Engulfing",  "{{ticker}} Trigger BUY 包み足")
+alertcondition(triggerBearEngulf,       "Trigger SELL Engulfing", "{{ticker}} Trigger SELL 包み足")
+alertcondition(triggerBullPinbar,       "Trigger BUY Pinbar",     "{{ticker}} Trigger BUY ピンバー")
+alertcondition(triggerBearPinbar,       "Trigger SELL Pinbar",    "{{ticker}} Trigger SELL ピンバー")
+alertcondition(triggerBullBOS,          "Trigger BUY BOS",        "{{ticker}} Trigger BUY BOS")
+alertcondition(triggerBearBOS,          "Trigger SELL BOS",       "{{ticker}} Trigger SELL BOS")
+alertcondition(triggerBullEMAReject,    "Trigger BUY EMA Reject", "{{ticker}} Trigger BUY EMAリジェクト")
+alertcondition(triggerBearEMAReject,    "Trigger SELL EMA Reject","{{ticker}} Trigger SELL EMAリジェクト")
+alertcondition(triggerBullFVG,          "Trigger BUY FVG",        "{{ticker}} Trigger BUY FVG")
+alertcondition(triggerBearFVG,          "Trigger SELL FVG",       "{{ticker}} Trigger SELL FVG")
+alertcondition(triggerBullStrongCandle, "Trigger BUY Strong Candle",  "{{ticker}} Trigger BUY 強ローソク")
+alertcondition(triggerBearStrongCandle, "Trigger SELL Strong Candle", "{{ticker}} Trigger SELL 強ローソク")
+
+alertcondition(allowLongByTrigger,  "Allow Long Trigger",  "{{ticker}} Trigger ロング許可")
+alertcondition(allowShortByTrigger, "Allow Short Trigger", "{{ticker}} Trigger ショート許可")
+alertcondition(triggerNoTrade,      "Trigger NoTrade",     "{{ticker}} Trigger ノートレード")
