@@ -1,0 +1,742 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// ============================================================
+//  Triangle 単体モジュール (Indicator版)
+// ============================================================
+//  3種を1モジュールで実装:
+//    ・Ascending  (上限水平 + 安値切上げ / 基本BUY継続, 上抜け失敗=Bull Trap)
+//    ・Descending (下限水平 + 高値切下げ / 基本SELL継続, 下抜け失敗=Bear Trap)
+//    ・Symmetrical(高安収束 / Pattern中はBias禁止=NoTrade, Break後のみBias)
+//  ・H&S / DT/DB / Wedge と同思想:
+//      Pattern / Break / Retest / FakeBreak / Invalidation / Building /
+//      Failed / Quality / Bias / Allow / NoTrade。
+//  ・strategy ではなく indicator。strategy.entry/exit 不使用。
+//  ・Pivot は確定後のみ (request.security lookahead_off / 未来参照なし)。
+//  ・useTriangleModule=false の時は allowLong/Short=true。
+//  ・変数名は triangle / asc / desc / sym prefix (他モジュールと衝突回避)。
+// ============================================================
+
+//@version=5
+indicator(
+     title            = "Triangle Module",
+     shorttitle       = "TRI",
+     overlay          = true,
+     max_bars_back    = 1000,
+     max_labels_count = 500
+ )
+
+// ============================================================
+//  Input (グループ: Triangle Module)
+// ============================================================
+grpTriangle = "Triangle Module"
+
+useTriangleModule = input.bool(true, "Triangleモジュールを使う", group = grpTriangle)
+
+showTriangleLines      = input.bool(true, "Triangleラインを表示", group = grpTriangle)
+showTriangleLabels     = input.bool(true, "Triangleラベルを表示", group = grpTriangle)
+showTriangleDebugTable = input.bool(true, "Debug Tableを表示", group = grpTriangle)
+
+patternTf = input.timeframe("5", "Pattern TF", group = grpTriangle)
+pivotLen  = input.int(5, "Pivot Length", minval = 1, group = grpTriangle)
+
+triangleTolerancePct = input.float(0.004, "水平ライン許容率", step = 0.001, group = grpTriangle)
+minTouches = input.int(2, "最低タッチ数", minval = 2, maxval = 4, group = grpTriangle)
+maxTouches = input.int(6, "最大タッチ数", minval = 2, maxval = 10, group = grpTriangle)
+
+contractionRatio = input.float(0.7, "収束率 WidthNow <= WidthStart ×", minval = 0.1, maxval = 1.0, step = 0.05, group = grpTriangle)
+
+minTriangleBars = input.int(8, "Triangle最小形成本数", minval = 1, group = grpTriangle)
+maxTriangleBars = input.int(80, "Triangle最大形成本数", minval = 5, group = grpTriangle)
+maxPivotLookback = input.int(10, "Pivot最大保持数", minval = 4, maxval = 20, group = grpTriangle)
+
+setupValidBars = input.int(24, "セットアップ有効本数", minval = 1, group = grpTriangle)
+
+retestAtrLen  = input.int(14, "Retest ATR Length", minval = 1, group = grpTriangle)
+retestAtrMult = input.float(0.5, "Retest ATR Mult", step = 0.1, group = grpTriangle)
+
+lineBreakAtrMult = input.float(0.1, "ラインブレイク ATR余白", step = 0.05, group = grpTriangle)
+fakeBreakBars    = input.int(3, "FakeBreak 戻り最大本数", minval = 1, group = grpTriangle)
+
+useTriangleReversalCandle = input.bool(true, "反転ローソクを要求", group = grpTriangle)
+useBodyFilter = input.bool(true, "包み足の実体強度を要求", group = grpTriangle)
+bodyMult      = input.float(1.4, "実体 > 平均実体 ×", step = 0.1, group = grpTriangle)
+pinWickRatio  = input.float(0.7, "ピンバーのヒゲ比率", minval = 0.1, maxval = 1.0, step = 0.05, group = grpTriangle)
+
+useTriangleQualityFilter = input.bool(false, "Quality Filterを使う", group = grpTriangle)
+minTriangleQuality       = input.int(50, "最低Triangle Quality", minval = 0, maxval = 100, group = grpTriangle)
+
+useTriangleInvalidation = input.bool(true, "Triangle否定を使う", group = grpTriangle)
+
+useATRExpansion = input.bool(false, "ブレイク時ATR拡大を要求", group = grpTriangle)
+atrExpandLen    = input.int(20, "ATR拡大比較本数", minval = 1, group = grpTriangle)
+atrExpandMult   = input.float(1.1, "ATR > 平均ATR ×", step = 0.05, group = grpTriangle)
+
+triangleEntryMode = input.string("Any", "Entry Mode", options = ["Any", "BreakOnly", "RetestOnly", "FakeBreakOnly", "InvalidationOnly"], group = grpTriangle)
+
+bool tAct = useTriangleModule
+
+// ============================================================
+//  共通計算
+// ============================================================
+float atrV = ta.atr(retestAtrLen)
+float retestRange = atrV * retestAtrMult
+float atrNow = ta.atr(retestAtrLen)
+float atrAvg = ta.sma(atrNow, atrExpandLen)
+bool atrExpansionOk = not useATRExpansion or atrNow > atrAvg * atrExpandMult
+
+// ============================================================
+//  HTF Pivot 取得 (確定後のみ / lookahead_off)
+// ============================================================
+[htfPh, htfPl, htfClose, htfHigh, htfLow, htfTime] = request.security(syminfo.tickerid, patternTf, [ta.pivothigh(pivotLen, pivotLen), ta.pivotlow(pivotLen, pivotLen), close[1], high[1], low[1], time], lookahead = barmerge.lookahead_off)
+bool newHTF = na(htfTime[1]) ? false : htfTime != htfTime[1]
+
+// ============================================================
+//  ライン計算
+// ============================================================
+f_linePrice(_x1, _y1, _x2, _y2, _xNow) =>
+    float _res = na
+    if _x2 != _x1
+        float _slope = (_y2 - _y1) / (_x2 - _x1)
+        _res := _y1 + _slope * (_xNow - _x1)
+    _res
+
+f_slope(_x1, _y1, _x2, _y2) =>
+    _x2 != _x1 ? (_y2 - _y1) / (_x2 - _x1) : na
+
+// ============================================================
+//  Pivot 配列
+// ============================================================
+var array<float> phVals = array.new_float()
+var array<int>   phIdx  = array.new_int()
+var array<float> plVals = array.new_float()
+var array<int>   plIdx  = array.new_int()
+var int htfCount     = 0
+var int lastPivotDir = 0
+
+// ============================================================
+//  Triangle 幾何 (上限=直近2 PH / 下限=直近2 PL / 共通)
+// ============================================================
+var float upperLineNow = na
+var float lowerLineNow = na
+var float upperSlopeV  = na
+var float lowerSlopeV  = na
+var float upperHorizPct = na
+var float lowerHorizPct = na
+var float widthStartV  = na
+var float widthNowV    = na
+var int   triBarsV     = 0
+
+// パターン状態 : Ascending
+var bool ascFound = false
+var bool ascBreakDone = false
+var int  ascBreakBar  = na
+var bool ascInvalidated = false
+var int  ascPatternBar  = na
+var bool ascBuildingV   = false
+var bool ascFakeArmed     = false
+var int  ascFakeBar       = na
+var bool ascFakeConfirmed = false
+
+// パターン状態 : Descending
+var bool descFound = false
+var bool descBreakDone = false
+var int  descBreakBar  = na
+var bool descInvalidated = false
+var int  descPatternBar  = na
+var bool descBuildingV   = false
+var bool descFakeArmed     = false
+var int  descFakeBar       = na
+var bool descFakeConfirmed = false
+
+// パターン状態 : Symmetrical
+var bool symFound = false
+var int  symBreakDir = 0     // 0 none / 1 up(long) / -1 down(short)
+var int  symBreakBar = na
+var bool symInvalidated = false
+var int  symPatternBar  = na
+var bool symBuildingV   = false
+
+// バー内イベント
+bool ascFailHTF  = false
+bool descFailHTF = false
+bool symFailHTF  = false
+bool ascExpiredEvent  = false
+bool descExpiredEvent = false
+bool symExpiredEvent  = false
+
+// ============================================================
+//  Pivot push + Triangle 検出 (newHTF 時)
+// ============================================================
+if newHTF
+    htfCount := htfCount + 1
+    int _pIdx = htfCount - pivotLen
+    if not na(htfPh)
+        if lastPivotDir == 1 and array.size(phVals) > 0
+            int _li = array.size(phVals) - 1
+            if htfPh > array.get(phVals, _li)
+                array.set(phVals, _li, htfPh)
+                array.set(phIdx,  _li, _pIdx)
+        else
+            array.push(phVals, htfPh)
+            array.push(phIdx,  _pIdx)
+            lastPivotDir := 1
+            while array.size(phVals) > maxPivotLookback
+                array.shift(phVals)
+                array.shift(phIdx)
+    if not na(htfPl)
+        if lastPivotDir == -1 and array.size(plVals) > 0
+            int _li = array.size(plVals) - 1
+            if htfPl < array.get(plVals, _li)
+                array.set(plVals, _li, htfPl)
+                array.set(plIdx,  _li, _pIdx)
+        else
+            array.push(plVals, htfPl)
+            array.push(plIdx,  _pIdx)
+            lastPivotDir := -1
+            while array.size(plVals) > maxPivotLookback
+                array.shift(plVals)
+                array.shift(plIdx)
+
+    int nH = array.size(phVals)
+    int nL = array.size(plVals)
+    if nH >= 2 and nL >= 2
+        float h1v = array.get(phVals, nH - 2)
+        float h2v = array.get(phVals, nH - 1)
+        int   h1x = array.get(phIdx, nH - 2)
+        int   h2x = array.get(phIdx, nH - 1)
+        float l1v = array.get(plVals, nL - 2)
+        float l2v = array.get(plVals, nL - 1)
+        int   l1x = array.get(plIdx, nL - 2)
+        int   l2x = array.get(plIdx, nL - 1)
+        int xNow = htfCount
+        int startX = math.min(h1x, l1x)
+        upperSlopeV := f_slope(h1x, h1v, h2x, h2v)
+        lowerSlopeV := f_slope(l1x, l1v, l2x, l2v)
+        upperLineNow := f_linePrice(h1x, h1v, h2x, h2v, xNow)
+        lowerLineNow := f_linePrice(l1x, l1v, l2x, l2v, xNow)
+        upperHorizPct := h1v != 0 ? math.abs(h1v - h2v) / h1v : na
+        lowerHorizPct := l1v != 0 ? math.abs(l1v - l2v) / l1v : na
+        float upStart = f_linePrice(h1x, h1v, h2x, h2v, startX)
+        float loStart = f_linePrice(l1x, l1v, l2x, l2v, startX)
+        widthNowV := upperLineNow - lowerLineNow
+        widthStartV := upStart - loStart
+        triBarsV := xNow - startX
+
+        bool conv = not na(widthStartV) and widthStartV > 0 and widthNowV <= widthStartV * contractionRatio
+        bool convStart = not na(widthStartV) and widthNowV < widthStartV
+        bool barsOk = triBarsV >= minTriangleBars and triBarsV <= maxTriangleBars
+        bool touchesOk = nH >= minTouches and nL >= minTouches
+        bool upperHorizontal = not na(upperHorizPct) and upperHorizPct <= triangleTolerancePct
+        bool lowerHorizontal = not na(lowerHorizPct) and lowerHorizPct <= triangleTolerancePct
+
+        bool ascShape  = upperHorizontal and lowerSlopeV > 0
+        bool descShape = lowerHorizontal and upperSlopeV < 0
+        bool symShape  = upperSlopeV < 0 and lowerSlopeV > 0 and not upperHorizontal and not lowerHorizontal
+        bool ascOk  = ascShape and conv and barsOk and touchesOk
+        bool descOk = descShape and conv and barsOk and touchesOk
+        bool symOk  = symShape and conv and barsOk and touchesOk
+
+        if ascOk and not ascFound
+            ascFound := true
+            ascBreakDone := false
+            ascInvalidated := false
+            ascPatternBar := bar_index
+            ascBuildingV := false
+            ascFakeArmed := false
+            ascFakeConfirmed := false
+            descFound := false
+            descBuildingV := false
+            symFound := false
+            symBuildingV := false
+        else if descOk and not descFound
+            descFound := true
+            descBreakDone := false
+            descInvalidated := false
+            descPatternBar := bar_index
+            descBuildingV := false
+            descFakeArmed := false
+            descFakeConfirmed := false
+            ascFound := false
+            ascBuildingV := false
+            symFound := false
+            symBuildingV := false
+        else if symOk and not symFound
+            symFound := true
+            symBreakDir := 0
+            symInvalidated := false
+            symPatternBar := bar_index
+            symBuildingV := false
+            ascFound := false
+            ascBuildingV := false
+            descFound := false
+            descBuildingV := false
+        else
+            if ascShape and convStart and not ascFound
+                ascBuildingV := true
+            else if ascBuildingV and (lowerSlopeV <= 0 or (not na(widthStartV) and widthNowV >= widthStartV) or triBarsV > maxTriangleBars)
+                ascFailHTF := true
+            if descShape and convStart and not descFound
+                descBuildingV := true
+            else if descBuildingV and (upperSlopeV >= 0 or (not na(widthStartV) and widthNowV >= widthStartV) or triBarsV > maxTriangleBars)
+                descFailHTF := true
+            if symShape and convStart and not symFound
+                symBuildingV := true
+            else if symBuildingV and ((upperSlopeV >= 0 or lowerSlopeV <= 0) or (not na(widthStartV) and widthNowV >= widthStartV) or triBarsV > maxTriangleBars)
+                symFailHTF := true
+
+// ============================================================
+//  反転ローソク
+// ============================================================
+float body    = math.abs(close - open)
+float avgBody = ta.sma(math.abs(close - open), 20)
+bool strongBody = not useBodyFilter or body > avgBody * bodyMult
+bool bearEngulf = close < open and open >= close[1] and close <= open[1] and strongBody
+bool bullEngulf = close > open and open <= close[1] and close >= open[1] and strongBody
+float barRng = math.max(high - low, syminfo.mintick)
+float upWick = high - math.max(open, close)
+float dnWick = math.min(open, close) - low
+bool bearPin = upWick / barRng >= pinWickRatio
+bool bullPin = dnWick / barRng >= pinWickRatio
+bool bullReversal = not useTriangleReversalCandle or bullEngulf or bullPin
+bool bearReversal = not useTriangleReversalCandle or bearEngulf or bearPin
+
+// ============================================================
+//  Break / Invalidation (状態更新)
+// ============================================================
+float brkMargin = atrV * lineBreakAtrMult
+bool ascendingBreak  = ascFound and not ascBreakDone and not na(upperLineNow) and not na(htfClose) and htfClose > upperLineNow + brkMargin
+bool descendingBreak = descFound and not descBreakDone and not na(lowerLineNow) and not na(htfClose) and htfClose < lowerLineNow - brkMargin
+bool ascendingInvalidation  = useTriangleInvalidation and ascFound and not ascBreakDone and not na(lowerLineNow) and close < lowerLineNow - brkMargin
+bool descendingInvalidation = useTriangleInvalidation and descFound and not descBreakDone and not na(upperLineNow) and close > upperLineNow + brkMargin
+
+if ascendingInvalidation
+    ascInvalidated := true
+    ascFound := false
+if descendingInvalidation
+    descInvalidated := true
+    descFound := false
+if ascendingBreak and not ascendingInvalidation
+    ascBreakDone := true
+    ascBreakBar  := bar_index
+if descendingBreak and not descendingInvalidation
+    descBreakDone := true
+    descBreakBar  := bar_index
+
+// Symmetrical Break (両方向 / Pattern中は方向未確定)
+bool symBreakLong  = false
+bool symBreakShort = false
+if symFound and symBreakDir == 0
+    if not na(upperLineNow) and not na(htfClose) and htfClose > upperLineNow + brkMargin
+        symBreakDir := 1
+        symBreakBar := bar_index
+        symBreakLong := true
+    else if not na(lowerLineNow) and not na(htfClose) and htfClose < lowerLineNow - brkMargin
+        symBreakDir := -1
+        symBreakBar := bar_index
+        symBreakShort := true
+
+// Symmetrical Invalidation (Break後に反対ライン突破)
+bool symInvalidation = false
+if symFound and symBreakDir == 1 and not na(lowerLineNow) and close < lowerLineNow - brkMargin
+    symInvalidation := true
+    symInvalidated := true
+    symFound := false
+if symFound and symBreakDir == -1 and not na(upperLineNow) and close > upperLineNow + brkMargin
+    symInvalidation := true
+    symInvalidated := true
+    symFound := false
+
+// 有効期限切れ
+if ascFound and ascBreakDone and not na(ascBreakBar) and (bar_index - ascBreakBar > setupValidBars)
+    ascFound := false
+    ascBreakDone := false
+    ascExpiredEvent := true
+else if ascFound and not ascBreakDone and not na(ascPatternBar) and (bar_index - ascPatternBar > setupValidBars)
+    ascFound := false
+    ascExpiredEvent := true
+if descFound and descBreakDone and not na(descBreakBar) and (bar_index - descBreakBar > setupValidBars)
+    descFound := false
+    descBreakDone := false
+    descExpiredEvent := true
+else if descFound and not descBreakDone and not na(descPatternBar) and (bar_index - descPatternBar > setupValidBars)
+    descFound := false
+    descExpiredEvent := true
+if symFound and symBreakDir != 0 and not na(symBreakBar) and (bar_index - symBreakBar > setupValidBars)
+    symFound := false
+    symExpiredEvent := true
+else if symFound and symBreakDir == 0 and not na(symPatternBar) and (bar_index - symPatternBar > setupValidBars)
+    symFound := false
+    symExpiredEvent := true
+
+// ============================================================
+//  FakeBreak (上抜け→戻る = Bull Trap / 下抜け→戻る = Bear Trap)
+// ============================================================
+if not na(upperLineNow) and (ascFound or ascBreakDone) and high > upperLineNow + brkMargin
+    ascFakeArmed := true
+    ascFakeBar := bar_index
+bool ascendingFakeBreak = tAct and ascFakeArmed and not na(upperLineNow) and close < upperLineNow and not na(ascFakeBar) and (bar_index - ascFakeBar) <= fakeBreakBars
+if ascendingFakeBreak
+    ascFakeArmed := false
+    ascFakeConfirmed := true
+else if ascFakeArmed and not na(ascFakeBar) and (bar_index - ascFakeBar) > fakeBreakBars
+    ascFakeArmed := false
+
+if not na(lowerLineNow) and (descFound or descBreakDone) and low < lowerLineNow - brkMargin
+    descFakeArmed := true
+    descFakeBar := bar_index
+bool descendingFakeBreak = tAct and descFakeArmed and not na(lowerLineNow) and close > lowerLineNow and not na(descFakeBar) and (bar_index - descFakeBar) <= fakeBreakBars
+if descendingFakeBreak
+    descFakeArmed := false
+    descFakeConfirmed := true
+else if descFakeArmed and not na(descFakeBar) and (bar_index - descFakeBar) > fakeBreakBars
+    descFakeArmed := false
+
+// ============================================================
+//  Failed
+// ============================================================
+bool ascendingFailed = tAct and ascFailHTF
+bool descendingFailed = tAct and descFailHTF
+bool symFailed = tAct and symFailHTF
+if ascendingFailed
+    ascBuildingV := false
+if descendingFailed
+    descBuildingV := false
+if symFailed
+    symBuildingV := false
+
+bool ascendingBuilding = tAct and ascBuildingV and not ascendingFailed
+bool descendingBuilding = tAct and descBuildingV and not descendingFailed
+bool symBuilding = tAct and symBuildingV and not symFailed
+
+// ============================================================
+//  Retest
+// ============================================================
+bool ascSetupValid = ascFound and ascBreakDone and not na(ascBreakBar) and (bar_index - ascBreakBar <= setupValidBars)
+bool descSetupValid = descFound and descBreakDone and not na(descBreakBar) and (bar_index - descBreakBar <= setupValidBars)
+bool ascendingRetest = ascSetupValid and not na(upperLineNow) and low <= upperLineNow + retestRange and close >= upperLineNow - retestRange
+bool descendingRetest = descSetupValid and not na(lowerLineNow) and high >= lowerLineNow - retestRange and close <= lowerLineNow + retestRange
+bool symSetupLong  = symFound and symBreakDir == 1 and not na(symBreakBar) and (bar_index - symBreakBar <= setupValidBars)
+bool symSetupShort = symFound and symBreakDir == -1 and not na(symBreakBar) and (bar_index - symBreakBar <= setupValidBars)
+bool symRetestLong  = symSetupLong and not na(upperLineNow) and low <= upperLineNow + retestRange and close >= upperLineNow - retestRange
+bool symRetestShort = symSetupShort and not na(lowerLineNow) and high >= lowerLineNow - retestRange and close <= lowerLineNow + retestRange
+
+// パターン出力
+bool ascendingPattern = tAct and ascFound
+bool descendingPattern = tAct and descFound
+bool symPattern = tAct and symFound
+
+// ============================================================
+//  Quality Score
+// ============================================================
+int touchPts = (array.size(phVals) >= minTouches ? 10 : 0) + (array.size(plVals) >= minTouches ? 10 : 0)
+float wedgeRatio = (na(widthStartV) or widthStartV == 0) ? na : widthNowV / widthStartV
+float contractPts = na(wedgeRatio) ? 0.0 : (wedgeRatio <= contractionRatio ? 20.0 : wedgeRatio >= 1.0 ? 0.0 : 20.0 * (1.0 - wedgeRatio) / (1.0 - contractionRatio))
+float ascLinePts  = (na(upperHorizPct) or triangleTolerancePct == 0) ? 0.0 : math.max(0.0, 20.0 * (1.0 - upperHorizPct / triangleTolerancePct))
+float descLinePts = (na(lowerHorizPct) or triangleTolerancePct == 0) ? 0.0 : math.max(0.0, 20.0 * (1.0 - lowerHorizPct / triangleTolerancePct))
+float symLinePts  = (na(upperSlopeV) or na(lowerSlopeV) or (math.abs(upperSlopeV) + math.abs(lowerSlopeV)) == 0) ? 0.0 : 20.0 * (1.0 - math.abs(math.abs(upperSlopeV) - math.abs(lowerSlopeV)) / (math.abs(upperSlopeV) + math.abs(lowerSlopeV)))
+
+int ascendingQuality = not ascFound ? 0 : math.min(100, math.round(ascLinePts) + touchPts + math.round(contractPts) + (ascBreakDone ? 15 : 0) + (ascendingRetest ? 10 : 0) + ((useTriangleReversalCandle and (bullEngulf or bullPin)) ? 10 : 0) + (atrExpansionOk ? 5 : 0))
+int descendingQuality = not descFound ? 0 : math.min(100, math.round(descLinePts) + touchPts + math.round(contractPts) + (descBreakDone ? 15 : 0) + (descendingRetest ? 10 : 0) + ((useTriangleReversalCandle and (bearEngulf or bearPin)) ? 10 : 0) + (atrExpansionOk ? 5 : 0))
+int symQuality = not symFound ? 0 : math.min(100, math.round(symLinePts) + touchPts + math.round(contractPts) + (symBreakDir != 0 ? 15 : 0) + ((symRetestLong or symRetestShort) ? 10 : 0) + ((useTriangleReversalCandle and (bullEngulf or bullPin or bearEngulf or bearPin)) ? 10 : 0) + (atrExpansionOk ? 5 : 0))
+int triangleQuality = math.max(math.max(ascendingQuality, descendingQuality), symQuality)
+bool qualityOk = not useTriangleQualityFilter or triangleQuality >= minTriangleQuality
+
+// ============================================================
+//  Signal 判定
+// ============================================================
+bool ascBreakSignal  = ascendingBreak and bullReversal and atrExpansionOk and qualityOk
+bool ascRetestSignal = ascendingRetest and bullReversal and qualityOk
+bool ascFakeSignal   = ascendingFakeBreak and bearReversal and qualityOk
+bool ascInvalSignal  = ascendingInvalidation
+bool descBreakSignal  = descendingBreak and bearReversal and atrExpansionOk and qualityOk
+bool descRetestSignal = descendingRetest and bearReversal and qualityOk
+bool descFakeSignal   = descendingFakeBreak and bullReversal and qualityOk
+bool descInvalSignal  = descendingInvalidation
+bool symBreakLongSignal   = symBreakLong and bullReversal and atrExpansionOk and qualityOk
+bool symBreakShortSignal  = symBreakShort and bearReversal and atrExpansionOk and qualityOk
+bool symRetestLongSignal  = symRetestLong and bullReversal and qualityOk
+bool symRetestShortSignal = symRetestShort and bearReversal and qualityOk
+
+// ============================================================
+//  Bias / Allow / NoTrade
+//  ※ Symmetrical は Pattern中(未Break)は Bias を出さない
+// ============================================================
+bool triangleBiasLong = tAct and (ascBreakSignal or ascRetestSignal or descFakeSignal or descInvalSignal or symBreakLongSignal or symRetestLongSignal)
+bool triangleBiasShort = tAct and (descBreakSignal or descRetestSignal or ascFakeSignal or ascInvalSignal or symBreakShortSignal or symRetestShortSignal)
+
+bool longBreakOnly = ascBreakSignal or symBreakLongSignal
+bool shortBreakOnly = descBreakSignal or symBreakShortSignal
+bool longRetestOnly = ascRetestSignal or symRetestLongSignal
+bool shortRetestOnly = descRetestSignal or symRetestShortSignal
+bool longFakeOnly = descFakeSignal
+bool shortFakeOnly = ascFakeSignal
+bool longInvalOnly = descInvalSignal
+bool shortInvalOnly = ascInvalSignal
+
+bool allowLongByTriangle =
+     not tAct ? true :
+     triangleEntryMode == "BreakOnly" ? longBreakOnly :
+     triangleEntryMode == "RetestOnly" ? longRetestOnly :
+     triangleEntryMode == "FakeBreakOnly" ? longFakeOnly :
+     triangleEntryMode == "InvalidationOnly" ? longInvalOnly :
+     triangleBiasLong
+bool allowShortByTriangle =
+     not tAct ? true :
+     triangleEntryMode == "BreakOnly" ? shortBreakOnly :
+     triangleEntryMode == "RetestOnly" ? shortRetestOnly :
+     triangleEntryMode == "FakeBreakOnly" ? shortFakeOnly :
+     triangleEntryMode == "InvalidationOnly" ? shortInvalOnly :
+     triangleBiasShort
+
+bool rConflict = ascendingPattern and descendingPattern
+bool rLowQual  = useTriangleQualityFilter and (ascendingPattern or descendingPattern or symPattern) and not qualityOk
+bool rExpired  = ascExpiredEvent or descExpiredEvent or symExpiredEvent
+bool rFailed   = ascendingFailed or descendingFailed or symFailed
+bool rSymWaiting = symFound and symBreakDir == 0
+
+int triangleNoTradeReason = not tAct ? 0 : rConflict ? 1 : rLowQual ? 2 : rExpired ? 3 : rFailed ? 4 : rSymWaiting ? 5 : 0
+bool triangleNoTrade      = tAct and (rConflict or rLowQual or rExpired or rFailed or rSymWaiting)
+bool triangleNoTradeLong  = triangleNoTrade
+bool triangleNoTradeShort = triangleNoTrade
+
+// ============================================================
+//  Signal Type (0〜18)
+// ============================================================
+int triangleSignalType =
+     not tAct ? 0 :
+     triangleNoTrade ? 18 :
+     ascendingInvalidation ? 14 :
+     descendingInvalidation ? 15 :
+     symInvalidation ? 16 :
+     ascendingFakeBreak ? 12 :
+     descendingFakeBreak ? 13 :
+     ascendingRetest ? 8 :
+     descendingRetest ? 9 :
+     symRetestLong ? 10 :
+     symRetestShort ? 11 :
+     ascendingBreak ? 4 :
+     descendingBreak ? 5 :
+     symBreakLong ? 6 :
+     symBreakShort ? 7 :
+     ascendingPattern ? 1 :
+     descendingPattern ? 2 :
+     symPattern ? 3 :
+     (ascendingBuilding or descendingBuilding or symBuilding) ? 17 : 0
+
+// ============================================================
+//  Direction
+// ============================================================
+int triangleDirection = not tAct ? 0 : (triangleBiasLong and not triangleBiasShort) ? 1 : (triangleBiasShort and not triangleBiasLong) ? -1 : 0
+
+// ============================================================
+//  Rank (0〜10)
+// ============================================================
+bool anyRetest = ascendingRetest or descendingRetest or symRetestLong or symRetestShort
+bool anyBreak  = ascendingBreak or descendingBreak or symBreakLong or symBreakShort
+bool anyFake   = ascendingFakeBreak or descendingFakeBreak
+bool anyInval  = ascendingInvalidation or descendingInvalidation or symInvalidation
+bool anyRev    = bullReversal or bearReversal
+bool anyPattern = ascendingPattern or descendingPattern or symPattern
+bool anyBuilding = ascendingBuilding or descendingBuilding or symBuilding
+
+int triangleRank =
+     not tAct ? 0 :
+     (anyRetest and triangleQuality >= 80) ? 10 :
+     anyInval ? 9 :
+     triangleQuality >= 80 ? 8 :
+     triangleQuality >= 70 ? 7 :
+     anyFake ? 6 :
+     anyRetest ? 5 :
+     anyBreak ? 4 :
+     (qualityOk and triangleQuality > 0) ? 3 :
+     anyPattern ? 2 :
+     anyBuilding ? 1 : 0
+
+// ============================================================
+//  出力ライン / 幅
+// ============================================================
+bool triangleActive = ascFound or descFound or symFound or ascBuildingV or descBuildingV or symBuildingV
+float upperTriangleLine = triangleActive ? upperLineNow : na
+float lowerTriangleLine = triangleActive ? lowerLineNow : na
+float triangleContraction = (na(widthStartV) or widthStartV == 0) ? na : widthNowV / widthStartV
+
+// ============================================================
+//  表示 : ライン (Pattern/Building中のみ)
+// ============================================================
+plot(showTriangleLines and triangleActive ? upperTriangleLine : na, "upperTriangleLine", color = color.new(color.red, 0),   style = plot.style_linebr)
+plot(showTriangleLines and triangleActive ? lowerTriangleLine : na, "lowerTriangleLine", color = color.new(color.green, 0), style = plot.style_linebr)
+
+// ============================================================
+//  表示 : ラベル (状態変化時のみ)
+// ============================================================
+f_lblDn(txt, col) =>
+    label.new(bar_index, high, txt, style = label.style_label_down, yloc = yloc.abovebar, color = col, textcolor = color.white, size = size.small)
+f_lblUp(txt, col) =>
+    label.new(bar_index, low, txt, style = label.style_label_up, yloc = yloc.belowbar, color = col, textcolor = color.white, size = size.small)
+
+if showTriangleLabels and tAct
+    if ascendingPattern and not ascendingPattern[1]
+        f_lblDn("Asc Tri", color.new(color.blue, 30))
+    if descendingPattern and not descendingPattern[1]
+        f_lblUp("Desc Tri", color.new(color.blue, 30))
+    if symPattern and not symPattern[1]
+        f_lblDn("Sym Tri", color.new(color.gray, 20))
+    if ascendingBreak and not ascendingBreak[1]
+        f_lblUp("Asc Break", color.new(color.green, 0))
+    if descendingBreak and not descendingBreak[1]
+        f_lblDn("Desc Break", color.new(color.red, 0))
+    if symBreakLong and not symBreakLong[1]
+        f_lblUp("Sym Break↑", color.new(color.green, 0))
+    if symBreakShort and not symBreakShort[1]
+        f_lblDn("Sym Break↓", color.new(color.red, 0))
+    if ascendingRetest and not ascendingRetest[1]
+        f_lblUp("Asc Retest", color.new(color.green, 20))
+    if descendingRetest and not descendingRetest[1]
+        f_lblDn("Desc Retest", color.new(color.red, 20))
+    if ascendingFakeBreak and not ascendingFakeBreak[1]
+        f_lblDn("Asc Fake", color.new(color.maroon, 0))
+    if descendingFakeBreak and not descendingFakeBreak[1]
+        f_lblUp("Desc Fake", color.new(color.maroon, 0))
+    if ascendingInvalidation and not ascendingInvalidation[1]
+        f_lblUp("Asc Invalid", color.new(color.purple, 0))
+    if descendingInvalidation and not descendingInvalidation[1]
+        f_lblDn("Desc Invalid", color.new(color.purple, 0))
+    if symInvalidation and not symInvalidation[1]
+        f_lblDn("Sym Invalid", color.new(color.purple, 0))
+    if ascendingBuilding and not ascendingBuilding[1]
+        f_lblDn("Asc Build", color.new(color.teal, 0))
+    if descendingBuilding and not descendingBuilding[1]
+        f_lblUp("Desc Build", color.new(color.teal, 0))
+    if symBuilding and not symBuilding[1]
+        f_lblDn("Sym Build", color.new(color.teal, 0))
+    if ascendingFailed and not ascendingFailed[1]
+        f_lblDn("Asc Failed", color.new(color.gray, 0))
+    if descendingFailed and not descendingFailed[1]
+        f_lblUp("Desc Failed", color.new(color.gray, 0))
+    if symFailed and not symFailed[1]
+        f_lblDn("Sym Failed", color.new(color.gray, 0))
+
+// ============================================================
+//  表示 : Shape
+// ============================================================
+plotshape(showTriangleLabels and tAct and ((ascendingBreak and not ascendingBreak[1]) or (symBreakLong and not symBreakLong[1])), title = "Break Long", style = shape.triangleup, location = location.belowbar, color = color.new(color.green, 0), size = size.tiny)
+plotshape(showTriangleLabels and tAct and ((descendingBreak and not descendingBreak[1]) or (symBreakShort and not symBreakShort[1])), title = "Break Short", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0), size = size.tiny)
+
+// ============================================================
+//  Debug Table
+// ============================================================
+f_typeStr(t) =>
+    t == 1 ? "Asc Pattern" : t == 2 ? "Desc Pattern" : t == 3 ? "Sym Pattern" : t == 4 ? "Asc Break" : t == 5 ? "Desc Break" : t == 6 ? "Sym Break L" : t == 7 ? "Sym Break S" : t == 8 ? "Asc Retest" : t == 9 ? "Desc Retest" : t == 10 ? "Sym Retest L" : t == 11 ? "Sym Retest S" : t == 12 ? "Asc Fake" : t == 13 ? "Desc Fake" : t == 14 ? "Asc Invalid" : t == 15 ? "Desc Invalid" : t == 16 ? "Sym Invalid" : t == 17 ? "Building" : t == 18 ? "NoTrade" : "None"
+f_reasonStr(r) =>
+    r == 1 ? "Conflict" : r == 2 ? "Low Quality" : r == 3 ? "Expired" : r == 4 ? "Failed" : r == 5 ? "Sym Waiting" : "None"
+
+var table dbg = table.new(position.top_right, 2, 19, border_width = 1)
+if showTriangleDebugTable and tAct and barstate.islast
+    string sDir = triangleDirection == 1 ? "BUY" : triangleDirection == -1 ? "SELL" : "-"
+    string sState = triangleNoTrade ? "NoTrade" : triangleBiasLong ? "BIAS L" : triangleBiasShort ? "BIAS S" : "-"
+    table.cell(dbg, 0, 0,  "Triangle State", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(dbg, 1, 0,  sState, text_color = color.white, bgcolor = triangleNoTrade ? color.new(color.red, 20) : color.new(color.blue, 0))
+    table.cell(dbg, 0, 1,  "SignalType", text_color = color.white)
+    table.cell(dbg, 1, 1,  f_typeStr(triangleSignalType), text_color = color.white)
+    table.cell(dbg, 0, 2,  "Direction", text_color = color.white)
+    table.cell(dbg, 1, 2,  sDir, text_color = color.white)
+    table.cell(dbg, 0, 3,  "Rank / Quality", text_color = color.white)
+    table.cell(dbg, 1, 3,  str.tostring(triangleRank) + " / " + str.tostring(triangleQuality), text_color = color.white)
+    table.cell(dbg, 0, 4,  "Asc/Desc/Sym Q", text_color = color.white)
+    table.cell(dbg, 1, 4,  str.tostring(ascendingQuality) + "/" + str.tostring(descendingQuality) + "/" + str.tostring(symQuality), text_color = color.white)
+    table.cell(dbg, 0, 5,  "Asc/Desc/Sym Pat", text_color = color.white)
+    table.cell(dbg, 1, 5,  (ascendingPattern ? "A" : "-") + (descendingPattern ? "D" : "-") + (symPattern ? "S" : "-"), text_color = color.white)
+    table.cell(dbg, 0, 6,  "Break A/D/S", text_color = color.white)
+    table.cell(dbg, 1, 6,  (ascBreakDone ? "A" : "-") + (descBreakDone ? "D" : "-") + (symBreakDir != 0 ? "S" : "-"), text_color = color.white)
+    table.cell(dbg, 0, 7,  "Retest", text_color = color.white)
+    table.cell(dbg, 1, 7,  (ascendingRetest ? "A" : "-") + (descendingRetest ? "D" : "-") + ((symRetestLong or symRetestShort) ? "S" : "-"), text_color = color.white)
+    table.cell(dbg, 0, 8,  "FakeBreak A/D", text_color = color.white)
+    table.cell(dbg, 1, 8,  (ascendingFakeBreak ? "A" : "-") + " / " + (descendingFakeBreak ? "D" : "-"), text_color = color.white)
+    table.cell(dbg, 0, 9,  "Invalid A/D/S", text_color = color.white)
+    table.cell(dbg, 1, 9,  (ascInvalidated ? "A" : "-") + (descInvalidated ? "D" : "-") + (symInvalidated ? "S" : "-"), text_color = color.white)
+    table.cell(dbg, 0, 10, "Building A/D/S", text_color = color.white)
+    table.cell(dbg, 1, 10, (ascendingBuilding ? "A" : "-") + (descendingBuilding ? "D" : "-") + (symBuilding ? "S" : "-"), text_color = color.white)
+    table.cell(dbg, 0, 11, "Failed A/D/S", text_color = color.white)
+    table.cell(dbg, 1, 11, (ascendingFailed ? "A" : "-") + (descendingFailed ? "D" : "-") + (symFailed ? "S" : "-"), text_color = color.white)
+    table.cell(dbg, 0, 12, "Upper Line", text_color = color.white)
+    table.cell(dbg, 1, 12, na(upperTriangleLine) ? "-" : str.tostring(upperTriangleLine, format.mintick), text_color = color.white)
+    table.cell(dbg, 0, 13, "Lower Line", text_color = color.white)
+    table.cell(dbg, 1, 13, na(lowerTriangleLine) ? "-" : str.tostring(lowerTriangleLine, format.mintick), text_color = color.white)
+    table.cell(dbg, 0, 14, "Contraction", text_color = color.white)
+    table.cell(dbg, 1, 14, na(triangleContraction) ? "-" : str.tostring(triangleContraction, "#.##"), text_color = color.white)
+    table.cell(dbg, 0, 15, "Tri Bars", text_color = color.white)
+    table.cell(dbg, 1, 15, str.tostring(triBarsV), text_color = color.white)
+    table.cell(dbg, 0, 16, "NoTrade Reason", text_color = color.white)
+    table.cell(dbg, 1, 16, f_reasonStr(triangleNoTradeReason), text_color = color.white)
+    table.cell(dbg, 0, 17, "Entry Mode", text_color = color.white)
+    table.cell(dbg, 1, 17, triangleEntryMode, text_color = color.white)
+    table.cell(dbg, 0, 18, "Allow L/S", text_color = color.white)
+    table.cell(dbg, 1, 18, (allowLongByTriangle ? "L" : "-") + " / " + (allowShortByTriangle ? "S" : "-"), text_color = color.white)
+
+// ============================================================
+//  Data Window 出力
+// ============================================================
+plot(allowLongByTriangle  ? 1 : 0, "allowLongByTriangle",  display = display.data_window)
+plot(allowShortByTriangle ? 1 : 0, "allowShortByTriangle", display = display.data_window)
+plot(triangleBiasLong  ? 1 : 0, "triangleBiasLong",  display = display.data_window)
+plot(triangleBiasShort ? 1 : 0, "triangleBiasShort", display = display.data_window)
+plot(triangleNoTrade      ? 1 : 0, "triangleNoTrade",      display = display.data_window)
+plot(triangleNoTradeLong  ? 1 : 0, "triangleNoTradeLong",  display = display.data_window)
+plot(triangleNoTradeShort ? 1 : 0, "triangleNoTradeShort", display = display.data_window)
+plot(triangleNoTradeReason, "triangleNoTradeReason", display = display.data_window)
+plot(triangleSignalType, "triangleSignalType", display = display.data_window)
+plot(triangleDirection,  "triangleDirection",  display = display.data_window)
+plot(triangleRank,       "triangleRank",       display = display.data_window)
+plot(triangleQuality,    "triangleQuality",    display = display.data_window)
+plot(ascendingQuality,  "ascendingQuality",  display = display.data_window)
+plot(descendingQuality, "descendingQuality", display = display.data_window)
+plot(symQuality,        "symQuality",        display = display.data_window)
+plot(ascendingPattern  ? 1 : 0, "ascendingPattern",  display = display.data_window)
+plot(descendingPattern ? 1 : 0, "descendingPattern", display = display.data_window)
+plot(symPattern        ? 1 : 0, "symPattern",        display = display.data_window)
+plot(ascendingBreak  ? 1 : 0, "ascendingBreak",  display = display.data_window)
+plot(descendingBreak ? 1 : 0, "descendingBreak", display = display.data_window)
+plot(symBreakLong    ? 1 : 0, "symBreakLong",    display = display.data_window)
+plot(symBreakShort   ? 1 : 0, "symBreakShort",   display = display.data_window)
+plot(ascendingRetest  ? 1 : 0, "ascendingRetest",  display = display.data_window)
+plot(descendingRetest ? 1 : 0, "descendingRetest", display = display.data_window)
+plot(symRetestLong    ? 1 : 0, "symRetestLong",    display = display.data_window)
+plot(symRetestShort   ? 1 : 0, "symRetestShort",   display = display.data_window)
+plot(ascendingFakeBreak  ? 1 : 0, "ascendingFakeBreak",  display = display.data_window)
+plot(descendingFakeBreak ? 1 : 0, "descendingFakeBreak", display = display.data_window)
+plot(ascendingInvalidation  ? 1 : 0, "ascendingInvalidation",  display = display.data_window)
+plot(descendingInvalidation ? 1 : 0, "descendingInvalidation", display = display.data_window)
+plot(symInvalidation        ? 1 : 0, "symInvalidation",        display = display.data_window)
+plot(ascendingBuilding  ? 1 : 0, "ascendingBuilding",  display = display.data_window)
+plot(descendingBuilding ? 1 : 0, "descendingBuilding", display = display.data_window)
+plot(symBuilding        ? 1 : 0, "symBuilding",        display = display.data_window)
+plot(ascendingFailed  ? 1 : 0, "ascendingFailed",  display = display.data_window)
+plot(descendingFailed ? 1 : 0, "descendingFailed", display = display.data_window)
+plot(symFailed        ? 1 : 0, "symFailed",        display = display.data_window)
+plot(upperTriangleLine, "upperTriangleLine", display = display.data_window)
+plot(lowerTriangleLine, "lowerTriangleLine", display = display.data_window)
+plot(triangleContraction, "triangleContraction", display = display.data_window)
+
+// ============================================================
+//  Alert (状態変化時のみ)
+// ============================================================
+alertcondition(tAct and ascendingPattern and not ascendingPattern[1], "Ascending Pattern", "{{ticker}} アセンディング 形成")
+alertcondition(tAct and descendingPattern and not descendingPattern[1], "Descending Pattern", "{{ticker}} ディセンディング 形成")
+alertcondition(tAct and symPattern and not symPattern[1], "Sym Pattern", "{{ticker}} シンメトリカル 形成")
+alertcondition(tAct and ascendingBreak and not ascendingBreak[1], "Ascending Break", "{{ticker}} アセンディング ブレイク")
+alertcondition(tAct and descendingBreak and not descendingBreak[1], "Descending Break", "{{ticker}} ディセンディング ブレイク")
+alertcondition(tAct and ((symBreakLong and not symBreakLong[1]) or (symBreakShort and not symBreakShort[1])), "Sym Break", "{{ticker}} シンメトリカル ブレイク")
+alertcondition(tAct and ascendingRetest and not ascendingRetest[1], "Ascending Retest", "{{ticker}} アセンディング リテスト")
+alertcondition(tAct and descendingRetest and not descendingRetest[1], "Descending Retest", "{{ticker}} ディセンディング リテスト")
+alertcondition(tAct and ((symRetestLong and not symRetestLong[1]) or (symRetestShort and not symRetestShort[1])), "Sym Retest", "{{ticker}} シンメトリカル リテスト")
+alertcondition(tAct and ascendingFakeBreak and not ascendingFakeBreak[1], "Ascending FakeBreak", "{{ticker}} アセンディング ダマシ")
+alertcondition(tAct and descendingFakeBreak and not descendingFakeBreak[1], "Descending FakeBreak", "{{ticker}} ディセンディング ダマシ")
+alertcondition(tAct and ascendingInvalidation and not ascendingInvalidation[1], "Ascending Invalidation", "{{ticker}} アセンディング 否定")
+alertcondition(tAct and descendingInvalidation and not descendingInvalidation[1], "Descending Invalidation", "{{ticker}} ディセンディング 否定")
+alertcondition(tAct and symInvalidation and not symInvalidation[1], "Sym Invalidation", "{{ticker}} シンメトリカル 否定")
+alertcondition(tAct and anyBuilding and not anyBuilding[1], "Building", "{{ticker}} Triangle 形成中")
+alertcondition(tAct and (ascendingFailed or descendingFailed or symFailed) and not (ascendingFailed[1] or descendingFailed[1] or symFailed[1]), "Failed", "{{ticker}} Triangle 崩れ")
+alertcondition(allowLongByTriangle and not allowLongByTriangle[1], "Allow Long Triangle", "{{ticker}} Triangle ロング許可")
+alertcondition(allowShortByTriangle and not allowShortByTriangle[1], "Allow Short Triangle", "{{ticker}} Triangle ショート許可")
+alertcondition(triangleNoTrade and not triangleNoTrade[1], "Triangle NoTrade", "{{ticker}} Triangle ノートレード")
