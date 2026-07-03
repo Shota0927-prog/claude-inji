@@ -5,11 +5,11 @@
 //  5分足 包み足ストラテジー (Engulfing Strategy)
 // ------------------------------------------------------------
 //  ・エントリー   : 包み足 (Bullish / Bearish Engulfing)
-//  ・ボラフィルタ : OFF / ATR / 固定値 の3モード
+//  ・ボラフィルタ : OFF / ATR(高速ボラフィルタ) / 固定値 の3モード
 //      - OFF の時は ATR 等の関数を一切呼ばず、負荷を軽くする
 //  ・環境フィルタ : 環境認識モジュール (4H/1H/15M/5M/1M) を統合
 //      - OFF の時は request.security を一切呼ばず、負荷を軽くする
-//  ・リスク   : 1トレードの損失を口座の 5% に固定 (position sizing)
+//  ・リスク   : 1トレードの損失を元金(単利) or 残高(複利) の X% に固定
 //  ・ロット   : 整数に切り捨て。1未満はエントリーしない。
 //
 //  ※ 5分足チャートに適用してください。
@@ -24,7 +24,8 @@ strategy(
      initial_capital   = 10000,
      default_qty_type  = strategy.fixed,
      default_qty_value = 1,
-     max_bars_back     = 500
+     dynamic_requests  = true,
+     max_bars_back     = 1000
  )
 
 // ============================================================
@@ -40,14 +41,35 @@ reqOppColor  = input.bool(true, "前足が反対色であることを要求", gr
 //  2. 入力 : ボラフィルタ
 // ------------------------------------------------------------
 //  OFF   … フィルタ無し (ATR 等の関数を呼ばない → 軽い)
-//  ATR   … ta.atr(atrLen) >= atrMin でボラを判定
+//  ATR   … 高速ボラフィルタモジュール一式で判定
 //  固定値 … 現在足のレンジ (high-low) >= fixedMin で判定
 // ============================================================
 grpVol   = "ボラフィルタ"
 volMode  = input.string("OFF", "ボラフィルタ", options = ["OFF", "ATR", "固定値"], group = grpVol)
-atrLen   = input.int(14,   "ATR本数",              minval = 1,   step = 1,   group = grpVol)
-atrMin   = input.float(1.5, "最低ATR (価格)",        minval = 0.0, step = 0.1, group = grpVol)
+
+// --- 固定値モード ---
 fixedMin = input.float(1.0, "最低レンジ (価格・固定値)", minval = 0.0, step = 0.1, group = grpVol)
+
+// --- ATRモード = 高速ボラフィルタ ---
+atrLenBase   = input.int(14, "基準ATR本数", minval = 1, group = grpVol)
+atrTf        = input.timeframe("", "基準ATR時間足(空=チャート)", group = grpVol)
+useMinVol    = input.bool(true,  "低ボラ時はエントリー禁止", group = grpVol)
+minAtrDollar = input.float(1.5,  "最低ATR($)", minval = 0.0, step = 0.1, group = grpVol)
+volModeRel   = input.bool(false, "低ボラ判定を相対ATRにする", group = grpVol)
+volAvgLen    = input.int(480,    "ATR平均本数", minval = 10, group = grpVol)
+volRatioMin  = input.float(0.9,  "ATR ÷ ATR平均 最低比", minval = 0.1, step = 0.05, group = grpVol)
+useFastVol   = input.bool(true,  "高速ボラフィルター", group = grpVol)
+fastAtrLen   = input.int(5,      "fastATR本数", minval = 1, group = grpVol)
+fastAtrMin   = input.float(2.2,  "fastATR最低($)", step = 0.1, group = grpVol)
+bodyAvgLen   = input.int(5,      "実体平均本数", minval = 1, group = grpVol)
+bodyAvgMin   = input.float(0.5,  "実体平均最低($)", step = 0.1, group = grpVol)
+useRangeRatioFilter = input.bool(true, "fastATR ÷ RangeWidth を使う", group = grpVol)
+rangeLookback       = input.int(20,    "RangeWidth参照本数", minval = 2, group = grpVol)
+atrRangeRatioMin    = input.float(0.06, "fastATR ÷ RangeWidth 最低比", step = 0.01, group = grpVol)
+useVolExpansion      = input.bool(true, "ボラ拡大判定を使う", group = grpVol)
+volExpansionLookback = input.int(3,     "ボラ拡大判定本数", minval = 1, group = grpVol)
+useVolCooldown  = input.bool(false, "低ボラ解除後の待機を使う", group = grpVol)
+volRecoveryBars = input.int(2,      "低ボラ解除後の待機本数", minval = 1, group = grpVol)
 
 // ============================================================
 //  3. 入力 : 環境フィルタ (環境認識モジュール)
@@ -55,8 +77,8 @@ fixedMin = input.float(1.0, "最低レンジ (価格・固定値)", minval = 0.0
 //  useEnvFilter = false の時は request.security を一切呼ばない。
 // ============================================================
 grpEnvMaster = "環境フィルタ"
-useEnvFilter = input.bool(false, "環境フィルタを使う (重い/OFF推奨で軽量)", group = grpEnvMaster)
-blockInRange = input.bool(false, "レンジ環境ではエントリーしない",         group = grpEnvMaster)
+useEnvFilter = input.bool(false, "環境フィルタを使う (重い/OFFで軽量)", group = grpEnvMaster)
+blockInRange = input.bool(false, "レンジ環境ではエントリーしない",       group = grpEnvMaster)
 
 // --- 時間足の ON/OFF と参照時間足 ---
 grpTF = "環境: 時間足 ON/OFF / 参照時間足"
@@ -145,9 +167,10 @@ colOff   = input.color(color.new(color.black, 0), "OFFカラー",   group = grpE
 //  4. 入力 : リスク / 決済
 // ============================================================
 grpRisk = "リスク / 決済"
-riskPct = input.float(5.0, "1トレード損失率 (%)",  minval = 0.1, step = 0.1, group = grpRisk)
-slBuf   = input.float(0.0, "SL バッファ (価格)",   minval = 0.0, step = 0.1, group = grpRisk)
-rrRatio = input.float(1.5, "リスクリワード比 (TP)", minval = 0.1, step = 0.1, group = grpRisk)
+riskPct     = input.float(5.0, "1トレード損失率 (%)",  minval = 0.1, step = 0.1, group = grpRisk)
+useCompound = input.bool(false, "複利 (残高ベース) ※OFF=元金単利", group = grpRisk)
+slBuf       = input.float(0.0, "SL バッファ (価格)",   minval = 0.0, step = 0.1, group = grpRisk)
+rrRatio     = input.float(1.5, "リスクリワード比 (TP)", minval = 0.1, step = 0.1, group = grpRisk)
 
 // ============================================================
 //  5. 包み足判定
@@ -168,16 +191,48 @@ bool bullEngulf = useLong  and curUp and (not reqOppColor or prevDn) and (strict
 bool bearEngulf = useShort and curDn and (not reqOppColor or prevUp) and (strictEngulf ? engulfBody : close <= prevBodyLo)
 
 // ============================================================
-//  6. ボラフィルタ判定
+//  6. ボラフィルタ判定 (高速ボラフィルタ統合)
 // ------------------------------------------------------------
 //  volMode は定数入力なので if 分岐は全バーで一貫。
-//  OFF のときは ta.atr 等を一切呼ばないため軽量。
+//  OFF のときは ta.atr / request.security を一切呼ばないため軽量。
 // ============================================================
 bool volOk = true
-if volMode == "ATR"
-    volOk := ta.atr(atrLen) >= atrMin
-else if volMode == "固定値"
+
+if volMode == "固定値"
     volOk := (high - low) >= fixedMin
+else if volMode == "ATR"
+    // 基本計算
+    float baseAtr = atrTf == "" ? ta.atr(atrLenBase) : request.security(syminfo.tickerid, atrTf, ta.atr(atrLenBase)[1], lookahead = barmerge.lookahead_off)
+    float atrAvg  = ta.sma(baseAtr, volAvgLen)
+    float fastAtr = ta.atr(fastAtrLen)
+    float bodyAvgFast = ta.sma(math.abs(close - open), bodyAvgLen)
+    float rangeWidthV = ta.highest(high, rangeLookback) - ta.lowest(low, rangeLookback)
+    float atrRangeRatio = rangeWidthV > 0 ? fastAtr / rangeWidthV : 0.0
+
+    // 低ボラ判定
+    bool volAbsOk  = baseAtr >= minAtrDollar
+    bool volRelOk  = atrAvg > 0 and baseAtr >= atrAvg * volRatioMin
+    bool volBaseOk = not useMinVol or (volModeRel ? volRelOk : volAbsOk)
+
+    // 高速ボラフィルター
+    bool fastAtrOk    = not useFastVol or fastAtr >= fastAtrMin
+    bool bodyAvgOk    = not useFastVol or bodyAvgFast >= bodyAvgMin
+    bool rangeRatioOk = not useFastVol or not useRangeRatioFilter or atrRangeRatio >= atrRangeRatioMin
+    bool fastVolOk    = not useFastVol or (fastAtrOk and bodyAvgOk and rangeRatioOk)
+
+    bool baseVolOk = volBaseOk and fastVolOk
+
+    // 低ボラ解除後の待機 (クールダウン)
+    bool volLowNow = not baseVolOk
+    var int volRecoveryStartBar = na
+    if volLowNow
+        volRecoveryStartBar := na
+    if not volLowNow and nz(volLowNow[1], false)
+        volRecoveryStartBar := bar_index
+    bool volRecoveryOk = not useVolCooldown or na(volRecoveryStartBar) or (bar_index - volRecoveryStartBar) >= volRecoveryBars
+
+    volOk := baseVolOk and volRecoveryOk
+// OFF のときは volOk = true のまま (関数呼び出しなし)
 
 // ============================================================
 //  7. 環境判定関数
@@ -336,8 +391,11 @@ float shortStop = patHigh + slBuf
 float shortRisk = shortStop - entryEst
 float shortTP   = entryEst - shortRisk * rrRatio
 
-// 損失許容額 = 口座残高 * リスク%
-float riskCapital = strategy.equity * riskPct / 100.0
+// 損失許容額 = 基準資金 * リスク%
+//   複利 OFF … 元金 (initial_capital) 基準 = 単利
+//   複利 ON  … 現在残高 (equity) 基準 = 複利
+float baseCapital = useCompound ? strategy.equity : strategy.initial_capital
+float riskCapital = baseCapital * riskPct / 100.0
 
 // リスク幅(価格)から整数ロットを算出 (1未満は 0 → エントリーしない)
 f_qty(float riskPerUnit) =>
