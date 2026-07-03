@@ -76,6 +76,10 @@ absorbCloseBufferATR = input.float(0.10, "吸収 終値バッファ(ATR倍率)",
 useAbsorbConfirmBars = input.bool(false, "吸収 連続終値確認を使う", group = grpFvg)
 absorbConfirmBars    = input.int(2, "吸収 連続終値本数", minval = 1, maxval = 5, group = grpFvg)
 
+// 吸収後の包み足エントリー期限
+useAbsorbEntryWindow = input.bool(true, "吸収後エントリー期限を使う", group = grpFvg)
+absorbEntryMaxBars   = input.int(10, "吸収後エントリー期限(本)", minval = 1, group = grpFvg)
+
 // FVG有効期間 (シグナルを出してよい年齢の範囲)
 useFVGActiveWindow = input.bool(false, "FVG有効期間を使う", group = grpFvg)
 fvgActiveMinAge    = input.int(1,  "FVG有効 最小年齢(本)", minval = 0, group = grpFvg)
@@ -276,7 +280,7 @@ f_nearestBelow(array<float> topArr, array<bool> deadArr, float price) =>
                     best := na(best) ? (price - t) : math.min(best, price - t)
     best
 
-f_fvgTrim(array<float> topA, array<float> botA, array<int> barA, array<bool> rebA, array<bool> absA, array<bool> deadA, array<box> boxA) =>
+f_fvgTrim(array<float> topA, array<float> botA, array<int> barA, array<bool> rebA, array<bool> absA, array<bool> deadA, array<box> boxA, array<bool> waitA, array<bool> entryA, array<int> absBarA) =>
     while array.size(topA) > maxFVGPerSide
         box b = array.shift(boxA)
         if not na(b)
@@ -287,6 +291,9 @@ f_fvgTrim(array<float> topA, array<float> botA, array<int> barA, array<bool> reb
         array.shift(rebA)
         array.shift(absA)
         array.shift(deadA)
+        array.shift(waitA)
+        array.shift(entryA)
+        array.shift(absBarA)
 
 // --- FVG 保存配列 ---
 var array<float> bullTopArr = array.new_float()
@@ -296,6 +303,9 @@ var array<bool>  bullRebUsed = array.new_bool()
 var array<bool>  bullAbsUsed = array.new_bool()
 var array<bool>  bullDeadArr = array.new_bool()
 var array<box>   bullBoxArr  = array.new_box()
+var array<bool>  bullAbsWaiting   = array.new_bool()   // 吸収済み・包み足待機中
+var array<bool>  bullAbsEntryUsed = array.new_bool()   // 吸収後の包み足エントリー使用済み
+var array<int>   bullAbsBar       = array.new_int()    // 吸収成立バー
 
 var array<float> bearTopArr = array.new_float()
 var array<float> bearBotArr = array.new_float()
@@ -304,6 +314,9 @@ var array<bool>  bearRebUsed = array.new_bool()
 var array<bool>  bearAbsUsed = array.new_bool()
 var array<bool>  bearDeadArr = array.new_bool()
 var array<box>   bearBoxArr  = array.new_box()
+var array<bool>  bearAbsWaiting   = array.new_bool()
+var array<bool>  bearAbsEntryUsed = array.new_bool()
+var array<int>   bearAbsBar       = array.new_int()
 
 // FVG シグナル (種類別)
 bool fvgReboundBuy  = false
@@ -312,6 +325,10 @@ bool fvgAbsorbBuy   = false
 bool fvgAbsorbSell  = false
 bool ifvgBuy        = false
 bool ifvgSell       = false
+
+// 吸収待機中フラグ (デバッグ用)
+bool bullAbsWaitingNow = false
+bool bearAbsWaitingNow = false
 
 if useFVG
     float fvgAtr = ta.atr(fvgAtrLen)
@@ -350,7 +367,7 @@ if useFVG
                         if not blocked
                             fvgReboundBuy := true
                             array.set(bullRebUsed, i, true)
-                // 吸収 SELL (下抜け) : 終値バッファ + 連続終値確認。吸収は1回まで。
+                // 吸収 SELL (下抜け) 成立 : シグナルは出さず「待機状態」にする。吸収は1回まで。
                 if useFVGAbsorptionFilter and not aUsed
                     float absorbSellLevel = bot - (useAbsorbCloseBuffer ? fvgAtr * absorbCloseBufferATR : 0.0)
                     bool absorbSellCloseOk = close < absorbSellLevel
@@ -359,15 +376,28 @@ if useFVG
                         for j = 0 to absorbConfirmBars - 1
                             absorbSellConfirmOk := absorbSellConfirmOk and close[j] < absorbSellLevel
                     if absorbSellCloseOk and absorbSellConfirmOk and rng > 0 and (bodyF / rng) >= absorbBodyMinRatio and clPos <= absorbCloseEdgeRatio
-                        fvgAbsorbSell := true
                         array.set(bullAbsUsed, i, true)
+                        array.set(bullAbsWaiting, i, true)
+                        array.set(bullAbsBar, i, bar_index)
                 // iFVG SELL (吸収済みをレジスタンス)
                 if useIFVGFilter and not dead and array.get(bullAbsUsed, i)
                     if high >= bot and close < open and close <= top
                         ifvgSell := true
                         array.set(bullDeadArr, i, true)
+            // 1b. 吸収待機中 → 最初の包み足(bearEngulf)でSELLシグナル。期限切れは待機解除。
+            if useFVGAbsorptionFilter and not dead and confBar and array.get(bullAbsWaiting, i) and not array.get(bullAbsEntryUsed, i)
+                int absBar = array.get(bullAbsBar, i)
+                bool absorbWindowOk = not useAbsorbEntryWindow or (not na(absBar) and bar_index - absBar <= absorbEntryMaxBars)
+                if not absorbWindowOk
+                    array.set(bullAbsWaiting, i, false)
+                else if bearEngulf and close <= top and bar_index - absBar >= 1
+                    fvgAbsorbSell := true
+                    array.set(bullAbsEntryUsed, i, true)
+                    array.set(bullAbsWaiting, i, false)
+            if array.get(bullAbsWaiting, i)
+                bullAbsWaitingNow := true
             // 2. 完全埋め (終値基準 close <= bot) なら dead 化。
-            //    ヒゲで埋めても終値で埋めるまでは生存。吸収済み(iFVG候補)は残す。
+            //    ヒゲで埋めても終値で埋めるまでは生存。吸収済み(iFVG候補/待機中)は残す。
             if not array.get(bullDeadArr, i) and not array.get(bullAbsUsed, i) and close <= bot
                 array.set(bullDeadArr, i, true)
 
@@ -401,7 +431,7 @@ if useFVG
                         if not blocked
                             fvgReboundSell := true
                             array.set(bearRebUsed, i, true)
-                // 吸収 BUY (上抜け) : 終値バッファ + 連続終値確認。吸収は1回まで。
+                // 吸収 BUY (上抜け) 成立 : シグナルは出さず「待機状態」にする。吸収は1回まで。
                 if useFVGAbsorptionFilter and not aUsed
                     float absorbBuyLevel = top + (useAbsorbCloseBuffer ? fvgAtr * absorbCloseBufferATR : 0.0)
                     bool absorbBuyCloseOk = close > absorbBuyLevel
@@ -410,15 +440,28 @@ if useFVG
                         for j = 0 to absorbConfirmBars - 1
                             absorbBuyConfirmOk := absorbBuyConfirmOk and close[j] > absorbBuyLevel
                     if absorbBuyCloseOk and absorbBuyConfirmOk and rng > 0 and (bodyF / rng) >= absorbBodyMinRatio and clPos >= (1.0 - absorbCloseEdgeRatio)
-                        fvgAbsorbBuy := true
                         array.set(bearAbsUsed, i, true)
+                        array.set(bearAbsWaiting, i, true)
+                        array.set(bearAbsBar, i, bar_index)
                 // iFVG BUY (吸収済みをサポート)
                 if useIFVGFilter and not dead and array.get(bearAbsUsed, i)
                     if low <= top and close > open and close >= bot
                         ifvgBuy := true
                         array.set(bearDeadArr, i, true)
+            // 1b. 吸収待機中 → 最初の包み足(bullEngulf)でBUYシグナル。期限切れは待機解除。
+            if useFVGAbsorptionFilter and not dead and confBar and array.get(bearAbsWaiting, i) and not array.get(bearAbsEntryUsed, i)
+                int absBar = array.get(bearAbsBar, i)
+                bool absorbWindowOk = not useAbsorbEntryWindow or (not na(absBar) and bar_index - absBar <= absorbEntryMaxBars)
+                if not absorbWindowOk
+                    array.set(bearAbsWaiting, i, false)
+                else if bullEngulf and close >= bot and bar_index - absBar >= 1
+                    fvgAbsorbBuy := true
+                    array.set(bearAbsEntryUsed, i, true)
+                    array.set(bearAbsWaiting, i, false)
+            if array.get(bearAbsWaiting, i)
+                bearAbsWaitingNow := true
             // 2. 完全埋め (終値基準 close >= top) なら dead 化。
-            //    ヒゲで埋めても終値で埋めるまでは生存。吸収済み(iFVG候補)は残す。
+            //    ヒゲで埋めても終値で埋めるまでは生存。吸収済み(iFVG候補/待機中)は残す。
             if not array.get(bearDeadArr, i) and not array.get(bearAbsUsed, i) and close >= top
                 array.set(bearDeadArr, i, true)
 
@@ -436,7 +479,10 @@ if useFVG
             array.push(bullAbsUsed, false)
             array.push(bullDeadArr, false)
             array.push(bullBoxArr, bx)
-            f_fvgTrim(bullTopArr, bullBotArr, bullBarArr, bullRebUsed, bullAbsUsed, bullDeadArr, bullBoxArr)
+            array.push(bullAbsWaiting, false)
+            array.push(bullAbsEntryUsed, false)
+            array.push(bullAbsBar, na)
+            f_fvgTrim(bullTopArr, bullBotArr, bullBarArr, bullRebUsed, bullAbsUsed, bullDeadArr, bullBoxArr, bullAbsWaiting, bullAbsEntryUsed, bullAbsBar)
     if useBearishFVG and high < low[2]
         float sTop = low[2]
         float sBot = high
@@ -450,7 +496,10 @@ if useFVG
             array.push(bearAbsUsed, false)
             array.push(bearDeadArr, false)
             array.push(bearBoxArr, bx)
-            f_fvgTrim(bearTopArr, bearBotArr, bearBarArr, bearRebUsed, bearAbsUsed, bearDeadArr, bearBoxArr)
+            array.push(bearAbsWaiting, false)
+            array.push(bearAbsEntryUsed, false)
+            array.push(bearAbsBar, na)
+            f_fvgTrim(bearTopArr, bearBotArr, bearBarArr, bearRebUsed, bearAbsUsed, bearDeadArr, bearBoxArr, bearAbsWaiting, bearAbsEntryUsed, bearAbsBar)
 
     // ---- box 右端更新 ----
     if showFVGBoxes
@@ -780,6 +829,10 @@ plot(shortFVGOk     ? 1 : 0, "shortFVGOk",     display = display.data_window)
 plot(useFVGActiveWindow ? 1 : 0, "useFVGActiveWindow", display = display.data_window)
 plot(reboundRecoverRatio,        "reboundRecoverRatio", display = display.data_window)
 plot(absorbCloseBufferATR,       "absorbCloseBufferATR", display = display.data_window)
+plot(bullAbsWaitingNow ? 1 : 0,  "bullAbsWaitingNow", display = display.data_window)
+plot(bearAbsWaitingNow ? 1 : 0,  "bearAbsWaitingNow", display = display.data_window)
+plot(useAbsorbEntryWindow ? 1 : 0, "useAbsorbEntryWindow", display = display.data_window)
+plot(absorbEntryMaxBars,           "absorbEntryMaxBars", display = display.data_window)
 plot(longQty,          "longQty",   display = display.data_window)
 plot(shortQty,         "shortQty",  display = display.data_window)
 plot(envEnabled,       "envEnabled", display = display.data_window)
