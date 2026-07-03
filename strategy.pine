@@ -38,6 +38,51 @@ strictEngulf = input.bool(true, "実体が前足を完全に包む",     group =
 reqOppColor  = input.bool(true, "前足が反対色であることを要求", group = grpEntry)
 
 // ============================================================
+//  1b. 入力 : 追加エントリートリガー
+// ------------------------------------------------------------
+//  包み足以外のトリガーを追加。各トリガーは個別に ON/OFF。
+//  OFF のトリガーは ta.* / request.security を一切呼ばないため軽い:
+//    BOS        … ta.highest / ta.lowest
+//    EMAリジェクト … ta.ema
+//    下位足確認   … request.security
+//  デフォルトは「包み足」のみ ON = 既存挙動と同じ。
+// ============================================================
+grpTrig = "追加エントリートリガー"
+useEngulfTrig       = input.bool(true,  "包み足 (既存ロジック使用)", group = grpTrig)
+usePinbarTrig       = input.bool(false, "ピンバー",              group = grpTrig)
+useBOSTrig          = input.bool(false, "BOS / 直近高安更新",     group = grpTrig)
+useEMARejectTrig    = input.bool(false, "EMAリジェクト",         group = grpTrig)
+useFVGTrig          = input.bool(false, "FVG形成",               group = grpTrig)
+useStrongCandleTrig = input.bool(false, "強ローソク",            group = grpTrig)
+
+// 複数トリガーの結合方法
+//   いずれか … どれか1つでも成立 (OR)
+//   すべて   … 有効な全トリガーが同一足で成立 (AND / 厳しい)
+//   最低数   … 成立数が minTrigCount 以上
+trigCombine  = input.string("いずれか", "トリガー結合", options = ["いずれか", "すべて", "最低数"], group = grpTrig)
+minTrigCount = input.int(1, "最低トリガー数 (最低数モード時)", minval = 1, group = grpTrig)
+
+// --- 下位足トリガー確認 (OFFで request.security を呼ばない) ---
+useLowerTFTrig = input.bool(false, "下位足トリガー確認 (重い/OFFで軽量)", group = grpTrig)
+lowerTF        = input.timeframe("1", "下位足TF", group = grpTrig)
+lowerTFMode    = input.string("現在足のみ", "現在足/下位足 結合", options = ["現在足のみ", "下位足のみ", "現在足AND下位足", "現在足OR下位足"], group = grpTrig)
+
+// --- トリガー個別パラメータ ---
+emaLenTrig         = input.int(20,   "EMA Length (EMAリジェクト用)", minval = 1, group = grpTrig)
+bosLookback        = input.int(10,   "BOS Lookback",               minval = 2, group = grpTrig)
+pinWickBodyMult    = input.float(2.0, "ピンバー ヒゲ/実体倍率",     step = 0.1, group = grpTrig)
+pinOppWickMaxRatio = input.float(1.0, "ピンバー 反対ヒゲ上限",      step = 0.1, group = grpTrig)
+strongBodyRatio    = input.float(0.6, "強ローソク 実体率", minval = 0.0, maxval = 1.0, step = 0.05, group = grpTrig)
+closeEdgeRatio     = input.float(0.7, "終値端寄せ率",     minval = 0.0, maxval = 1.0, step = 0.05, group = grpTrig)
+
+// --- クールダウン / 逆方向同時 ---
+useTrigCooldown        = input.bool(false, "トリガークールダウンを使う", group = grpTrig)
+trigCooldownBars       = input.int(3, "クールダウン本数", minval = 1, group = grpTrig)
+useOppositeTrigNoTrade = input.bool(false, "逆方向トリガー同時発生はNoTrade", group = grpTrig)
+
+showTrigTable = input.bool(true, "トリガー Debug テーブルを表示", group = grpTrig)
+
+// ============================================================
 //  2. 入力 : ボラフィルタ
 // ------------------------------------------------------------
 //  OFF   … フィルタ無し (ATR 等の関数を呼ばない → 軽い)
@@ -195,8 +240,171 @@ float prevBodyLo = math.min(open[1], close[1])
 
 bool engulfBody = curBodyHi >= prevBodyHi and curBodyLo <= prevBodyLo
 
-bool bullEngulf = useLong  and curUp and (not reqOppColor or prevDn) and (strictEngulf ? engulfBody : close >= prevBodyHi)
-bool bearEngulf = useShort and curDn and (not reqOppColor or prevUp) and (strictEngulf ? engulfBody : close <= prevBodyLo)
+// 包み足パターン (方向の有効化 useLong/useShort は section 10 の最終判定で適用)
+bool bullEngulf = curUp and (not reqOppColor or prevDn) and (strictEngulf ? engulfBody : close >= prevBodyHi)
+bool bearEngulf = curDn and (not reqOppColor or prevUp) and (strictEngulf ? engulfBody : close <= prevBodyLo)
+
+// ============================================================
+//  5b. 追加エントリートリガー計算
+// ------------------------------------------------------------
+//  各トリガーは ON のときだけ計算する。
+//  trigCombine / lowerTFMode は定数入力なので分岐は全バーで一貫し、
+//  未使用トリガーの ta.* / request.security は呼ばれない。
+//  最終的に entryLong / entryShort を出力し、section 10 で使う。
+// ============================================================
+
+// --- 結合関数 (現在足・下位足 共用) ---
+f_combineTrig(int _cnt, int _enabled) =>
+    trigCombine == "いずれか" ? _cnt >= 1 :
+     trigCombine == "すべて"  ? (_enabled > 0 and _cnt >= _enabled) :
+     _cnt >= minTrigCount
+
+// --- 下位足トリガー計算関数 (request.security から呼ばれる) ---
+//     戻り値 : [bullCount, bearCount]
+f_lowerTrig() =>
+    float _body   = math.abs(close - open)
+    float _range  = high - low
+    float _upWick = high - math.max(open, close)
+    float _loWick = math.min(open, close) - low
+    float _bodyR  = _range > 0 ? _body / _range : 0.0
+    float _closeP = _range > 0 ? (close - low) / _range : 0.0
+
+    // 包み足 (メインと同じ strict / 反対色 ルール)
+    bool _prevUp  = close[1] > open[1]
+    bool _prevDn  = close[1] < open[1]
+    bool _curUp   = close > open
+    bool _curDn   = close < open
+    float _prevBHi = math.max(open[1], close[1])
+    float _prevBLo = math.min(open[1], close[1])
+    bool _engBody  = math.max(open, close) >= _prevBHi and math.min(open, close) <= _prevBLo
+    bool _bE = useEngulfTrig and _curUp and (not reqOppColor or _prevDn) and (strictEngulf ? _engBody : close >= _prevBHi)
+    bool _sE = useEngulfTrig and _curDn and (not reqOppColor or _prevUp) and (strictEngulf ? _engBody : close <= _prevBLo)
+
+    // ピンバー
+    bool _bP = usePinbarTrig and _loWick > _body * pinWickBodyMult and _loWick > _upWick * pinOppWickMaxRatio and _closeP >= closeEdgeRatio
+    bool _sP = usePinbarTrig and _upWick > _body * pinWickBodyMult and _upWick > _loWick * pinOppWickMaxRatio and _closeP <= 1.0 - closeEdgeRatio
+
+    // BOS (ta.* は ON時のみ)
+    bool _bB = false
+    bool _sB = false
+    if useBOSTrig
+        _bB := close > ta.highest(high, bosLookback)[1]
+        _sB := close < ta.lowest(low, bosLookback)[1]
+
+    // EMAリジェクト (ta.ema は ON時のみ)
+    bool _bEma = false
+    bool _sEma = false
+    if useEMARejectTrig
+        float _ema = ta.ema(close, emaLenTrig)
+        _bEma := low <= _ema and close > _ema and close > open
+        _sEma := high >= _ema and close < _ema and close < open
+
+    // FVG形成
+    bool _bF = useFVGTrig and low > high[2]
+    bool _sF = useFVGTrig and high < low[2]
+
+    // 強ローソク
+    bool _bS = useStrongCandleTrig and close > open and _bodyR >= strongBodyRatio and _closeP >= closeEdgeRatio
+    bool _sS = useStrongCandleTrig and close < open and _bodyR >= strongBodyRatio and _closeP <= 1.0 - closeEdgeRatio
+
+    int _bull = (_bE ? 1 : 0) + (_bP ? 1 : 0) + (_bB ? 1 : 0) + (_bEma ? 1 : 0) + (_bF ? 1 : 0) + (_bS ? 1 : 0)
+    int _bear = (_sE ? 1 : 0) + (_sP ? 1 : 0) + (_sB ? 1 : 0) + (_sEma ? 1 : 0) + (_sF ? 1 : 0) + (_sS ? 1 : 0)
+    [_bull, _bear]
+
+// --- 現在足のローソク基本量 (軽量な算術のみ) ---
+float trBody      = math.abs(close - open)
+float trRange     = high - low
+float trUpWick    = high - math.max(open, close)
+float trLoWick    = math.min(open, close) - low
+float trBodyRatio = trRange > 0 ? trBody / trRange : 0.0
+float trClosePos  = trRange > 0 ? (close - low) / trRange : 0.0
+
+// 包み足 (既存 bullEngulf/bearEngulf を再利用)
+bool trigBullEngulf = useEngulfTrig and bullEngulf
+bool trigBearEngulf = useEngulfTrig and bearEngulf
+
+// ピンバー
+bool trigBullPin = false
+bool trigBearPin = false
+if usePinbarTrig
+    trigBullPin := trLoWick > trBody * pinWickBodyMult and trLoWick > trUpWick * pinOppWickMaxRatio and trClosePos >= closeEdgeRatio
+    trigBearPin := trUpWick > trBody * pinWickBodyMult and trUpWick > trLoWick * pinOppWickMaxRatio and trClosePos <= 1.0 - closeEdgeRatio
+
+// BOS (ta.highest / ta.lowest → ON時のみ)
+bool trigBullBOS = false
+bool trigBearBOS = false
+if useBOSTrig
+    trigBullBOS := close > ta.highest(high, bosLookback)[1]
+    trigBearBOS := close < ta.lowest(low, bosLookback)[1]
+
+// EMAリジェクト (ta.ema → ON時のみ)
+bool trigBullEMA = false
+bool trigBearEMA = false
+if useEMARejectTrig
+    float emaT = ta.ema(close, emaLenTrig)
+    trigBullEMA := low <= emaT and close > emaT and close > open
+    trigBearEMA := high >= emaT and close < emaT and close < open
+
+// FVG形成
+bool trigBullFVG = false
+bool trigBearFVG = false
+if useFVGTrig
+    trigBullFVG := low > high[2]
+    trigBearFVG := high < low[2]
+
+// 強ローソク
+bool trigBullStrong = false
+bool trigBearStrong = false
+if useStrongCandleTrig
+    trigBullStrong := close > open and trBodyRatio >= strongBodyRatio and trClosePos >= closeEdgeRatio
+    trigBearStrong := close < open and trBodyRatio >= strongBodyRatio and trClosePos <= 1.0 - closeEdgeRatio
+
+// 有効トリガー数 / bull・bear 成立数
+int enabledTrigCount = (useEngulfTrig ? 1 : 0) + (usePinbarTrig ? 1 : 0) + (useBOSTrig ? 1 : 0) + (useEMARejectTrig ? 1 : 0) + (useFVGTrig ? 1 : 0) + (useStrongCandleTrig ? 1 : 0)
+int bullTrigCount = (trigBullEngulf ? 1 : 0) + (trigBullPin ? 1 : 0) + (trigBullBOS ? 1 : 0) + (trigBullEMA ? 1 : 0) + (trigBullFVG ? 1 : 0) + (trigBullStrong ? 1 : 0)
+int bearTrigCount = (trigBearEngulf ? 1 : 0) + (trigBearPin ? 1 : 0) + (trigBearBOS ? 1 : 0) + (trigBearEMA ? 1 : 0) + (trigBearFVG ? 1 : 0) + (trigBearStrong ? 1 : 0)
+
+// 現在足の結合
+bool curBull = f_combineTrig(bullTrigCount, enabledTrigCount)
+bool curBear = f_combineTrig(bearTrigCount, enabledTrigCount)
+
+// 下位足トリガー (useLowerTFTrig=false のときは request.security を呼ばない)
+int ltBull = 0
+int ltBear = 0
+if useLowerTFTrig
+    [_lb, _ls] = request.security(syminfo.tickerid, lowerTF, f_lowerTrig(), lookahead = barmerge.lookahead_off)
+    ltBull := _lb
+    ltBear := _ls
+
+bool lowerBull = useLowerTFTrig and f_combineTrig(ltBull, enabledTrigCount)
+bool lowerBear = useLowerTFTrig and f_combineTrig(ltBear, enabledTrigCount)
+
+// 現在足 / 下位足 の結合
+bool rawBull =
+     not useLowerTFTrig or lowerTFMode == "現在足のみ"   ? curBull :
+     lowerTFMode == "下位足のみ"        ? lowerBull :
+     lowerTFMode == "現在足AND下位足"  ? (curBull and lowerBull) :
+     (curBull or lowerBull)
+
+bool rawBear =
+     not useLowerTFTrig or lowerTFMode == "現在足のみ"   ? curBear :
+     lowerTFMode == "下位足のみ"        ? lowerBear :
+     lowerTFMode == "現在足AND下位足"  ? (curBear and lowerBear) :
+     (curBear or lowerBear)
+
+// 逆方向同時発生の NoTrade
+bool trigBothFire = useOppositeTrigNoTrade and rawBull and rawBear
+
+// クールダウン (発火足からの経過本数)
+var int lastTrigBar = na
+bool trigFiredNow   = rawBull or rawBear
+bool trigCooldownOk = not useTrigCooldown or na(lastTrigBar) or (bar_index - lastTrigBar) > trigCooldownBars
+if trigFiredNow and trigCooldownOk
+    lastTrigBar := bar_index
+
+// トリガーモジュールの最終エントリー信号
+bool entryLong  = rawBull and not trigBothFire and trigCooldownOk
+bool entryShort = rawBear and not trigBothFire and trigCooldownOk
 
 // ============================================================
 //  6. ボラフィルタ判定
@@ -435,8 +643,8 @@ float shortQty = f_qty(shortRisk)
 // ============================================================
 //  10. 最終エントリー条件
 // ============================================================
-bool canLong  = bullEngulf and volOk and envLongOk  and longRisk  > 0 and longQty  >= 1
-bool canShort = bearEngulf and volOk and envShortOk and shortRisk > 0 and shortQty >= 1
+bool canLong  = useLong  and entryLong  and volOk and envLongOk  and longRisk  > 0 and longQty  >= 1
+bool canShort = useShort and entryShort and volOk and envShortOk and shortRisk > 0 and shortQty >= 1
 
 // ============================================================
 //  11. 発注
@@ -458,8 +666,8 @@ if isFlat and canShort
 // ============================================================
 //  12. 表示
 // ============================================================
-plotshape(canLong,  "包み足買い", style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0), size = size.small)
-plotshape(canShort, "包み足売り", style = shape.triangledown, location = location.abovebar, color = color.new(color.red,   0), size = size.small)
+plotshape(canLong,  "エントリー買い", style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0), size = size.small)
+plotshape(canShort, "エントリー売り", style = shape.triangledown, location = location.abovebar, color = color.new(color.red,   0), size = size.small)
 
 // Data Window 出力 (デバッグ用)
 plot(volOk    ? 1 : 0, "volOk",     display = display.data_window)
@@ -469,3 +677,48 @@ plot(envEnabled,       "envEnabled", display = display.data_window)
 plot(envMatched,       "envMatched", display = display.data_window)
 plot(envLongOk  ? 1 : 0, "envLongOk",  display = display.data_window)
 plot(envShortOk ? 1 : 0, "envShortOk", display = display.data_window)
+
+// --- 追加トリガー デバッグ出力 ---
+plot(trigBullEngulf ? 1 : 0, "trigBullEngulf", display = display.data_window)
+plot(trigBearEngulf ? 1 : 0, "trigBearEngulf", display = display.data_window)
+plot(trigBullPin    ? 1 : 0, "trigBullPin",    display = display.data_window)
+plot(trigBearPin    ? 1 : 0, "trigBearPin",    display = display.data_window)
+plot(trigBullBOS    ? 1 : 0, "trigBullBOS",    display = display.data_window)
+plot(trigBearBOS    ? 1 : 0, "trigBearBOS",    display = display.data_window)
+plot(trigBullEMA    ? 1 : 0, "trigBullEMA",    display = display.data_window)
+plot(trigBearEMA    ? 1 : 0, "trigBearEMA",    display = display.data_window)
+plot(trigBullFVG    ? 1 : 0, "trigBullFVG",    display = display.data_window)
+plot(trigBearFVG    ? 1 : 0, "trigBearFVG",    display = display.data_window)
+plot(trigBullStrong ? 1 : 0, "trigBullStrong", display = display.data_window)
+plot(trigBearStrong ? 1 : 0, "trigBearStrong", display = display.data_window)
+plot(bullTrigCount, "bullTrigCount", display = display.data_window)
+plot(bearTrigCount, "bearTrigCount", display = display.data_window)
+plot(ltBull,        "ltBull",        display = display.data_window)
+plot(ltBear,        "ltBear",        display = display.data_window)
+plot(entryLong  ? 1 : 0, "entryLong",  display = display.data_window)
+plot(entryShort ? 1 : 0, "entryShort", display = display.data_window)
+
+// --- トリガー デバッグテーブル (最終バーのみ描画・軽量) ---
+f_yn(bool b) => b ? "●" : "-"
+var table trigTable = table.new(position.bottom_right, 3, 9, border_width = 1)
+if showTrigTable and barstate.islast
+    table.cell(trigTable, 0, 0, "トリガー", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(trigTable, 1, 0, "買", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(trigTable, 2, 0, "売", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    trigNames = array.from("包み足", "ピンバー", "BOS", "EMAリジェクト", "FVG", "強ローソク")
+    trigEn    = array.from(useEngulfTrig, usePinbarTrig, useBOSTrig, useEMARejectTrig, useFVGTrig, useStrongCandleTrig)
+    trigBull  = array.from(trigBullEngulf, trigBullPin, trigBullBOS, trigBullEMA, trigBullFVG, trigBullStrong)
+    trigBear  = array.from(trigBearEngulf, trigBearPin, trigBearBOS, trigBearEMA, trigBearFVG, trigBearStrong)
+    for i = 0 to 5
+        row  = i + 1
+        en   = array.get(trigEn, i)
+        nmCol = en ? color.new(color.gray, 30) : color.new(color.gray, 70)
+        table.cell(trigTable, 0, row, array.get(trigNames, i), text_color = en ? color.white : color.new(color.white, 50), bgcolor = nmCol)
+        table.cell(trigTable, 1, row, en ? f_yn(array.get(trigBull, i)) : "OFF", text_color = color.white, bgcolor = en and array.get(trigBull, i) ? color.new(color.green, 0) : nmCol)
+        table.cell(trigTable, 2, row, en ? f_yn(array.get(trigBear, i)) : "OFF", text_color = color.white, bgcolor = en and array.get(trigBear, i) ? color.new(color.red, 0) : nmCol)
+    table.cell(trigTable, 0, 7, "成立数 買/売", text_color = color.white, bgcolor = color.new(color.gray, 30))
+    table.cell(trigTable, 1, 7, str.tostring(bullTrigCount), text_color = color.white)
+    table.cell(trigTable, 2, 7, str.tostring(bearTrigCount), text_color = color.white)
+    table.cell(trigTable, 0, 8, "エントリー", text_color = color.white, bgcolor = color.new(color.gray, 30))
+    table.cell(trigTable, 1, 8, canLong  ? "LONG" : "-", text_color = color.white, bgcolor = canLong  ? color.new(color.green, 0) : color.new(color.gray, 30))
+    table.cell(trigTable, 2, 8, canShort ? "SHORT" : "-", text_color = color.white, bgcolor = canShort ? color.new(color.red, 0) : color.new(color.gray, 30))
