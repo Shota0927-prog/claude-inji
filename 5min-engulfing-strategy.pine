@@ -40,6 +40,46 @@ strictEngulf = input.bool(true, "実体が前足を完全に包む",     group =
 reqOppColor  = input.bool(true, "前足が反対色であることを要求", group = grpEntry)
 
 // ============================================================
+//  1a. 入力 : エントリートリガー (追加条件・ON/OFF)
+// ------------------------------------------------------------
+//  包み足に加えて複数のトリガーを Any/All/MinCount で組み合わせる。
+//  各トリガーは ON/OFF 可能。OFF のものは ta 関数を呼ばず軽量。
+//  デフォルトは「包み足のみ ON」= 従来と同じ挙動。
+//  トリガー種類:
+//    包み足 / ピンバー / BOS(直近高安更新) / EMAリジェクト /
+//    FVG形成 / 強ローソク
+//  下位足確認 (useLowerTFTrigger) は OFF の時 request.security を呼ばない。
+// ============================================================
+grpTrig = "エントリートリガー (追加条件)"
+useEngulfingTrigger    = input.bool(true,  "包み足",             group = grpTrig)
+usePinbarTrigger       = input.bool(false, "ピンバー",           group = grpTrig)
+useBOSTrigger          = input.bool(false, "BOS / 直近高安更新", group = grpTrig)
+useEMARejectTrigger    = input.bool(false, "EMAリジェクト",      group = grpTrig)
+useFVGTriggerFormation = input.bool(false, "FVG形成",            group = grpTrig)
+useStrongCandleTrigger = input.bool(false, "強ローソク",         group = grpTrig)
+
+triggerMode     = input.string("Any", "トリガー結合", options = ["Any", "All", "MinCount"], group = grpTrig)
+minTriggerCount = input.int(1, "最低トリガー数 (MinCount時)", minval = 1, group = grpTrig)
+
+// 下位足トリガー確認 (OFF で request.security を呼ばない)
+useLowerTFTrigger = input.bool(false, "下位足トリガー確認 (重い)", group = grpTrig)
+triggerTF         = input.timeframe("1", "下位足TF", group = grpTrig)
+triggerTFMode     = input.string("CurrentOrLower", "現在足/下位足 結合", options = ["CurrentOnly", "LowerOnly", "CurrentAndLower", "CurrentOrLower"], group = grpTrig)
+
+// トリガー個別パラメータ
+emaLenTrigger      = input.int(20,  "EMA Length (EMAリジェクト)", minval = 1, group = grpTrig)
+bosLookback        = input.int(10,  "BOS Lookback", minval = 2, group = grpTrig)
+pinWickBodyMult    = input.float(2.0, "ピンバー ヒゲ/実体倍率", step = 0.1, group = grpTrig)
+pinOppWickMaxRatio = input.float(1.0, "ピンバー 反対ヒゲ上限", step = 0.1, group = grpTrig)
+strongBodyRatio    = input.float(0.6, "強ローソク 実体率", minval = 0.0, maxval = 1.0, step = 0.05, group = grpTrig)
+trigCloseEdgeRatio = input.float(0.7, "ピン/強 終値端寄せ比率", minval = 0.0, maxval = 1.0, step = 0.05, group = grpTrig)
+
+// トリガー クールダウン / 逆方向同時発生
+useTriggerCooldown        = input.bool(false, "トリガークールダウン", group = grpTrig)
+triggerCooldownBars       = input.int(3, "クールダウン本数", minval = 1, group = grpTrig)
+useOppositeTriggerNoTrade = input.bool(false, "逆方向トリガー同時発生はNoTrade", group = grpTrig)
+
+// ============================================================
 //  1b. 入力 : FVG 場所フィルター
 // ------------------------------------------------------------
 //  FVG はエントリートリガーではなく「場所条件」として使う。
@@ -533,6 +573,151 @@ bool shortFVGOk =
      (useIFVGFilter          and ifvgSell)
 
 // ============================================================
+//  5c. エントリートリガー統合 (包み足 + 追加条件)
+// ------------------------------------------------------------
+//  複数トリガーを Any/All/MinCount で結合し、最終シグナルを作る。
+//  ・包み足は既存の bullEngulf / bearEngulf を再利用 (FVG吸収と共有)。
+//  ・BOS / EMAリジェクトの ta.* は「ON の時だけ」呼ぶ (OFFで軽量)。
+//  ・下位足確認は useLowerTFTrigger が ON の時だけ request.security。
+//  ・出力: allowLongByTrigger / allowShortByTrigger
+// ============================================================
+
+// --- 結合判定ヘルパー ---
+//   Any     … 1つ以上一致
+//   All     … 有効な全トリガーが一致
+//   MinCount… minTriggerCount 以上一致
+f_combineTrig(int cnt, int enabled) =>
+    triggerMode == "Any"  ? cnt >= 1 :
+     triggerMode == "All" ? (enabled > 0 and cnt >= enabled) :
+     cnt >= minTriggerCount
+
+// --- 下位足トリガー計算関数 (request.security から呼ばれる) ---
+//   戻り値: [bullCount, bearCount]
+f_calcTriggers() =>
+    float _body      = math.abs(close - open)
+    float _range     = high - low
+    float _upWick    = high - math.max(open, close)
+    float _loWick    = math.min(open, close) - low
+    float _bodyRatio = _range > 0 ? _body / _range : 0.0
+    float _closePos  = _range > 0 ? (close - low) / _range : 0.0
+    bool  _pUp = close[1] > open[1]
+    bool  _pDn = close[1] < open[1]
+    float _cHi = math.max(open,    close)
+    float _cLo = math.min(open,    close)
+    float _pHi = math.max(open[1], close[1])
+    float _pLo = math.min(open[1], close[1])
+    bool  _engBody = _cHi >= _pHi and _cLo <= _pLo
+    // 包み足 (本体ストラテジーと同じ strict / 反対色ルール)
+    bool _bullEng = useEngulfingTrigger and close > open and (not reqOppColor or _pDn) and (strictEngulf ? _engBody : close >= _pHi)
+    bool _bearEng = useEngulfingTrigger and close < open and (not reqOppColor or _pUp) and (strictEngulf ? _engBody : close <= _pLo)
+    // ピンバー
+    bool _bullPin = usePinbarTrigger and _loWick > _body * pinWickBodyMult and _loWick > _upWick * pinOppWickMaxRatio and _closePos >= trigCloseEdgeRatio
+    bool _bearPin = usePinbarTrigger and _upWick > _body * pinWickBodyMult and _upWick > _loWick * pinOppWickMaxRatio and _closePos <= 1.0 - trigCloseEdgeRatio
+    // BOS
+    bool _bullBOS = useBOSTrigger and close > ta.highest(high, bosLookback)[1]
+    bool _bearBOS = useBOSTrigger and close < ta.lowest(low, bosLookback)[1]
+    // EMA リジェクト
+    float _ema = ta.ema(close, emaLenTrigger)
+    bool _bullEMA = useEMARejectTrigger and low <= _ema and close > _ema and close > open
+    bool _bearEMA = useEMARejectTrigger and high >= _ema and close < _ema and close < open
+    // FVG 形成
+    bool _bullFVG = useFVGTriggerFormation and low > high[2]
+    bool _bearFVG = useFVGTriggerFormation and high < low[2]
+    // 強ローソク
+    bool _bullStr = useStrongCandleTrigger and close > open and _bodyRatio >= strongBodyRatio and _closePos >= trigCloseEdgeRatio
+    bool _bearStr = useStrongCandleTrigger and close < open and _bodyRatio >= strongBodyRatio and _closePos <= 1.0 - trigCloseEdgeRatio
+    int _bullCnt = (_bullEng?1:0)+(_bullPin?1:0)+(_bullBOS?1:0)+(_bullEMA?1:0)+(_bullFVG?1:0)+(_bullStr?1:0)
+    int _bearCnt = (_bearEng?1:0)+(_bearPin?1:0)+(_bearBOS?1:0)+(_bearEMA?1:0)+(_bearFVG?1:0)+(_bearStr?1:0)
+    [_bullCnt, _bearCnt]
+
+// --- 有効(ON)トリガー数 ---
+int enabledTrigCount = (useEngulfingTrigger?1:0) + (usePinbarTrigger?1:0) + (useBOSTrigger?1:0) + (useEMARejectTrigger?1:0) + (useFVGTriggerFormation?1:0) + (useStrongCandleTrigger?1:0)
+
+// --- 現在足のローソク基本量 ---
+float trBody      = math.abs(close - open)
+float trRange     = high - low
+float trUpWick    = high - math.max(open, close)
+float trLoWick    = math.min(open, close) - low
+float trBodyRatio = trRange > 0 ? trBody / trRange : 0.0
+float trClosePos  = trRange > 0 ? (close - low) / trRange : 0.0
+
+// --- 各トリガー (現在足) ---
+// 包み足 (既存 bullEngulf / bearEngulf を再利用)
+bool trBullEng = useEngulfingTrigger and bullEngulf
+bool trBearEng = useEngulfingTrigger and bearEngulf
+
+// ピンバー (ta 不要)
+bool trBullPin = usePinbarTrigger and trLoWick > trBody * pinWickBodyMult and trLoWick > trUpWick * pinOppWickMaxRatio and trClosePos >= trigCloseEdgeRatio
+bool trBearPin = usePinbarTrigger and trUpWick > trBody * pinWickBodyMult and trUpWick > trLoWick * pinOppWickMaxRatio and trClosePos <= 1.0 - trigCloseEdgeRatio
+
+// BOS : ta.highest/lowest は ON の時だけ呼ぶ (OFFで軽量)
+float bosHigh = na
+float bosLow  = na
+if useBOSTrigger
+    bosHigh := ta.highest(high, bosLookback)[1]
+    bosLow  := ta.lowest(low,  bosLookback)[1]
+bool trBullBOS = useBOSTrigger and close > bosHigh
+bool trBearBOS = useBOSTrigger and close < bosLow
+
+// EMA リジェクト : ta.ema は ON の時だけ呼ぶ (OFFで軽量)
+float emaTrig = na
+if useEMARejectTrigger
+    emaTrig := ta.ema(close, emaLenTrigger)
+bool trBullEMA = useEMARejectTrigger and low <= emaTrig and close > emaTrig and close > open
+bool trBearEMA = useEMARejectTrigger and high >= emaTrig and close < emaTrig and close < open
+
+// FVG 形成 (ta 不要)
+bool trBullFVG = useFVGTriggerFormation and low > high[2]
+bool trBearFVG = useFVGTriggerFormation and high < low[2]
+
+// 強ローソク (ta 不要)
+bool trBullStr = useStrongCandleTrigger and close > open and trBodyRatio >= strongBodyRatio and trClosePos >= trigCloseEdgeRatio
+bool trBearStr = useStrongCandleTrigger and close < open and trBodyRatio >= strongBodyRatio and trClosePos <= 1.0 - trigCloseEdgeRatio
+
+int bullTrigCount = (trBullEng?1:0)+(trBullPin?1:0)+(trBullBOS?1:0)+(trBullEMA?1:0)+(trBullFVG?1:0)+(trBullStr?1:0)
+int bearTrigCount = (trBearEng?1:0)+(trBearPin?1:0)+(trBearBOS?1:0)+(trBearEMA?1:0)+(trBearFVG?1:0)+(trBearStr?1:0)
+
+bool trigBullCur = f_combineTrig(bullTrigCount, enabledTrigCount)
+bool trigBearCur = f_combineTrig(bearTrigCount, enabledTrigCount)
+
+// --- 下位足トリガー (OFF なら request.security を呼ばない) ---
+bool trigBullLower = false
+bool trigBearLower = false
+if useLowerTFTrigger
+    [ltBullCnt, ltBearCnt] = request.security(syminfo.tickerid, triggerTF, f_calcTriggers(), lookahead = barmerge.lookahead_off)
+    trigBullLower := f_combineTrig(ltBullCnt, enabledTrigCount)
+    trigBearLower := f_combineTrig(ltBearCnt, enabledTrigCount)
+
+// --- 現在足 / 下位足 の結合 ---
+bool finalBullTrig =
+     not useLowerTFTrigger or triggerTFMode == "CurrentOnly" ? trigBullCur :
+     triggerTFMode == "LowerOnly"       ? trigBullLower :
+     triggerTFMode == "CurrentAndLower" ? (trigBullCur and trigBullLower) :
+     triggerTFMode == "CurrentOrLower"  ? (trigBullCur or trigBullLower) :
+     trigBullCur
+
+bool finalBearTrig =
+     not useLowerTFTrigger or triggerTFMode == "CurrentOnly" ? trigBearCur :
+     triggerTFMode == "LowerOnly"       ? trigBearLower :
+     triggerTFMode == "CurrentAndLower" ? (trigBearCur and trigBearLower) :
+     triggerTFMode == "CurrentOrLower"  ? (trigBearCur or trigBearLower) :
+     trigBearCur
+
+// --- 逆方向同時発生 NoTrade ---
+bool trigNoTrade = useOppositeTriggerNoTrade and finalBullTrig and finalBearTrig
+
+// --- クールダウン (トリガー発火からの経過本数) ---
+var int lastTrigBar = na
+bool trigFiredNow   = finalBullTrig or finalBearTrig
+bool trigCooldownOk = not useTriggerCooldown or na(lastTrigBar) or (bar_index - lastTrigBar) > triggerCooldownBars
+if trigFiredNow and trigCooldownOk
+    lastTrigBar := bar_index
+
+// --- 最終トリガー許可 ---
+bool allowLongByTrigger  = finalBullTrig and not trigNoTrade and trigCooldownOk
+bool allowShortByTrigger = finalBearTrig and not trigNoTrade and trigCooldownOk
+
+// ============================================================
 //  6. ボラフィルタ判定
 // ------------------------------------------------------------
 //  通常ボラ (volMode) と 高速ボラ (fastVolMode) は独立して評価。
@@ -772,8 +957,8 @@ float shortQty = f_qty(shortRisk)
 //  トリガーは常に包み足。FVGは場所条件として AND する。
 //  環境 + FVG場所 + 包み足 + ボラ + リスク
 // ============================================================
-bool longSig  = bullEngulf
-bool shortSig = bearEngulf
+bool longSig  = allowLongByTrigger
+bool shortSig = allowShortByTrigger
 
 bool canLong =
      useLong and
@@ -839,3 +1024,26 @@ plot(envEnabled,       "envEnabled", display = display.data_window)
 plot(envMatched,       "envMatched", display = display.data_window)
 plot(envLongOk  ? 1 : 0, "envLongOk",  display = display.data_window)
 plot(envShortOk ? 1 : 0, "envShortOk", display = display.data_window)
+
+// --- エントリートリガー デバッグ ---
+plot(trBullEng ? 1 : 0, "trBullEng", display = display.data_window)
+plot(trBearEng ? 1 : 0, "trBearEng", display = display.data_window)
+plot(trBullPin ? 1 : 0, "trBullPin", display = display.data_window)
+plot(trBearPin ? 1 : 0, "trBearPin", display = display.data_window)
+plot(trBullBOS ? 1 : 0, "trBullBOS", display = display.data_window)
+plot(trBearBOS ? 1 : 0, "trBearBOS", display = display.data_window)
+plot(trBullEMA ? 1 : 0, "trBullEMA", display = display.data_window)
+plot(trBearEMA ? 1 : 0, "trBearEMA", display = display.data_window)
+plot(trBullFVG ? 1 : 0, "trBullFVG", display = display.data_window)
+plot(trBearFVG ? 1 : 0, "trBearFVG", display = display.data_window)
+plot(trBullStr ? 1 : 0, "trBullStr", display = display.data_window)
+plot(trBearStr ? 1 : 0, "trBearStr", display = display.data_window)
+plot(bullTrigCount, "bullTrigCount", display = display.data_window)
+plot(bearTrigCount, "bearTrigCount", display = display.data_window)
+plot(enabledTrigCount, "enabledTrigCount", display = display.data_window)
+plot(trigBullLower ? 1 : 0, "trigBullLower", display = display.data_window)
+plot(trigBearLower ? 1 : 0, "trigBearLower", display = display.data_window)
+plot(allowLongByTrigger  ? 1 : 0, "allowLongByTrigger",  display = display.data_window)
+plot(allowShortByTrigger ? 1 : 0, "allowShortByTrigger", display = display.data_window)
+plot(trigNoTrade ? 1 : 0, "trigNoTrade", display = display.data_window)
+plot(trigCooldownOk ? 1 : 0, "trigCooldownOk", display = display.data_window)
