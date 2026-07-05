@@ -228,8 +228,10 @@ function outputText_202607(text) {
   const sh = ss.getSheetByName(CAMPAIGN_CONFIG_202607.sheetName) || ss.getActiveSheet();
   sh.getRange(CAMPAIGN_CONFIG_202607.outputA1).setValue(text);
 }
+// スクリプトエディタ / 自動トリガーから実行するとダイアログの応答待ちで
+// ハングするため、alert ではなく実行ログに出力する
 function uiSafeAlert_202607(msg) {
-  try { SpreadsheetApp.getUi().alert(msg); } catch (_) {}
+  console.log(msg);
 }
 
 // 毎日23時の自動投稿トリガーを設定（この7月キャンペーン専用）
@@ -258,5 +260,5 @@ function stopDailyPosting_202607() {
       deleted++;
     }
   });
-  try { SpreadsheetApp.getUi().alert(`自動投稿のトリガーを ${deleted} 件削除しました。`); } catch (_) {}
+  uiSafeAlert_202607(`自動投稿のトリガーを ${deleted} 件削除しました。`);
 }
