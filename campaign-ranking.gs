@@ -1,4 +1,4 @@
-/*** Campaign Ranking One-Click (個人ランキング / チームランキング) ***/
+/*** Campaign Ranking One-Click (チーム対抗戦 🔵VS🔴 / 個人ランキング) ***/
 const CAMPAIGN_CONFIG = {
   sheetName: '7月営業(2026)',
   sourceSheets: ['7月営業(2026)'],
@@ -14,12 +14,10 @@ const CAMPAIGN_CONFIG = {
   excludeNames: ['あずな', '佐久間', 'kamiki', 'kazuki', 'ふうか', 'るる'],
   includeTNamesForTotal: ['あずな', 'kamiki', 'kazuki', 'ふうか'],
 
-  tOnlyNames: ['おぎ'], // ←この人はT(アポ取り)だけ加点する
-
-  // ✅ チーム分け（仮）：名前 → 所属チーム
+  // ✅ 2チームでのチーム対抗（青 VS 赤）。メンバーは仮設定
   teams: {
-    'Aチーム': ['きょうか', 'みく', 'しゅう', 'あいり'],
-    'Bチーム': ['うめ', 'ましー', 'おぎ', 'あやちゃん', 'はな'],
+    blue: { name: 'Aチーム', members: ['きょうか', 'みく', 'しゅう', 'あいり'] },
+    red:  { name: 'Bチーム', members: ['うめ', 'ましー', 'おぎ', 'あやちゃん', 'はな'] },
   },
 };
 
@@ -94,7 +92,6 @@ function runCampaignRanking() {
 
       const rankMultiplier = (rank === 'D') ? 0.5 : 1;
       const excluded = cfg.excludeNames.includes(name);
-      const tOnly = (cfg.tOnlyNames || []).includes(name);
 
       // --- T列（アポ取り） → ランク別ベース点 ---
       if (isValidDateInRange(row[COL.T - 1], start, end)) {
@@ -105,16 +102,12 @@ function runCampaignRanking() {
 
       // --- V列（日時） +2pt ---
       if (isValidDateInRange(row[COL.V - 1], start, end)) {
-        if (!excluded && !tOnly) {
-          addScore(scoreIndividual, name, 2 * rankMultiplier);
-        }
+        if (!excluded) addScore(scoreIndividual, name, 2 * rankMultiplier);
       }
 
       // --- Z列（日時） +3pt ---
       if (isValidDateInRange(row[COL.Z - 1], start, end)) {
-        if (!excluded && !tOnly) {
-          addScore(scoreIndividual, name, 3 * rankMultiplier);
-        }
+        if (!excluded) addScore(scoreIndividual, name, 3 * rankMultiplier);
       }
     }
   });
@@ -124,21 +117,22 @@ function runCampaignRanking() {
   // 個人ランキング
   const rankingIndividual = toRanking(scoreIndividual);
 
-  // チームランキング（個人スコアをチーム単位で合算）
+  // チーム対抗（青 VS 赤）：個人スコアをチーム単位で合算
   const nameToTeam = buildNameToTeam(cfg.teams);
-  const scoreTeam = new Map();
+  const blue = { name: cfg.teams.blue.name, pts: 0 };
+  const red  = { name: cfg.teams.red.name,  pts: 0 };
   scoreIndividual.forEach((pts, name) => {
-    const team = nameToTeam[name];
-    if (team) addScore(scoreTeam, team, pts);
+    const side = nameToTeam[name];
+    if (side === 'blue') blue.pts += pts;
+    else if (side === 'red') red.pts += pts;
   });
-  const rankingTeam = toRanking(scoreTeam);
 
   const header = `【${fmtDate(start)}〜${fmtDate(end)} キャンペーンランキング】`;
 
   const body = [
     header,
-    formatSection('個人ランキング', rankingIndividual, cfg.topN),
-    formatSection('チームランキング', rankingTeam, null), // チームは全件表示
+    formatVsBattle(blue, red),                          // ① チーム対抗戦
+    formatSection('個人ランキング', rankingIndividual, cfg.topN), // ② 個人ランキング
     '',
   ].join('\n');
 
@@ -154,14 +148,45 @@ function toRanking(map) {
     .sort((a, b) => b.pts - a.pts || a.name.localeCompare(b.name, 'ja'));
 }
 
-// 名前 -> チーム名 の逆引きテーブルを作る
+// 名前 -> 'blue' | 'red' の逆引きテーブル
 function buildNameToTeam(teams) {
   const table = {};
   if (!teams) return table;
-  Object.keys(teams).forEach(teamName => {
-    (teams[teamName] || []).forEach(name => { table[name] = teamName; });
+  ['blue', 'red'].forEach(side => {
+    ((teams[side] && teams[side].members) || []).forEach(name => { table[name] = side; });
   });
   return table;
+}
+
+// チーム対抗戦を 青🔵 VS 赤🔴 のゲージバーで整形
+function formatVsBattle(blue, red) {
+  const BAR = 20; // ゲージの長さ（マス数）
+  const total = blue.pts + red.pts;
+
+  let blueCount = (total === 0) ? BAR / 2 : Math.round(BAR * blue.pts / total);
+  blueCount = Math.max(0, Math.min(BAR, blueCount));
+  const redCount = BAR - blueCount;
+  const bar = '🟦'.repeat(blueCount) + '🟥'.repeat(redCount);
+
+  const bluePct = (total === 0) ? 50 : Math.round(100 * blue.pts / total);
+  const redPct = 100 - bluePct;
+
+  const diff = Math.abs(blue.pts - red.pts);
+  let verdict;
+  if (blue.pts > red.pts)      verdict = `🔵 ${blue.name} リード！（+${diff}pt）`;
+  else if (red.pts > blue.pts) verdict = `🔴 ${red.name} リード！（+${diff}pt）`;
+  else                         verdict = `🏳️ 引き分け！`;
+
+  return [
+    '',
+    '【⚔️ チーム対抗戦 ⚔️】',
+    `🔵 ${blue.name}　${blue.pts}pt　VS　${red.pts}pt　${red.name} 🔴`,
+    '',
+    bar,
+    `（🔵 ${bluePct}％ ／ ${redPct}％ 🔴）`,
+    '',
+    verdict,
+  ].join('\n');
 }
 
 // ランキング1セクションを整形。limit=null なら全件
