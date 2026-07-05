@@ -30,10 +30,11 @@ const CAMPAIGN_CONFIG = {
 // ⚠️ 列を1つずつ右にずらした（名前は G列 に変更、H列は未使用）
 const COL = {
   NAME: 7,   // G列（ポイントの名前）
-  T:    21,  // U列（アポ取り 日時）
-  V:    23,  // W列（日時） +2pt
-  Z:    27,  // AA列（日時） +3pt
   RANK: 15,  // O列（ランク）
+  T:    21,  // U列（アポ取り 日時）  → ランク基準点
+  V:    23,  // W列（アポ着座 日時）  +2pt
+  Z:    27,  // AA列（プレ着座 日時） +3pt
+  PAY:  33,  // AG列（入金 日時）     +4pt
 };
 
 function onOpen() {
@@ -96,24 +97,32 @@ function runCampaignRanking() {
 
       if (!name) continue;
 
-      const rankMultiplier = (rank === 'D') ? 0.5 : 1;
       const excluded = cfg.excludeNames.includes(name);
+      const hasPayment = isValidDateInRange(row[COL.PAY - 1], start, end);
 
-      // --- T列（アポ取り） → ランク別ベース点 ---
+      // D は着座系（アポ着座/プレ着座）を半減。ただし入金があれば通常ポイントに戻す
+      const seatMultiplier = (rank === 'D' && !hasPayment) ? 0.5 : 1;
+
+      // --- T列（アポ取り） → ランク基準点（S3 / A2 / B・C1 / D0.5） ---
       if (isValidDateInRange(row[COL.T - 1], start, end)) {
-        const pts = getTBasePoint(rank) * rankMultiplier;
+        const pts = getTBasePoint(rank);
         if (!excluded) addScore(scoreIndividual, name, pts);
         if (cfg.includeTNamesForTotal.includes(name)) extraTTotalFromExcluded += pts;
       }
 
-      // --- V列（日時） +2pt ---
+      // --- V列（アポ着座） +2pt ---
       if (isValidDateInRange(row[COL.V - 1], start, end)) {
-        if (!excluded) addScore(scoreIndividual, name, 2 * rankMultiplier);
+        if (!excluded) addScore(scoreIndividual, name, 2 * seatMultiplier);
       }
 
-      // --- Z列（日時） +3pt ---
+      // --- Z列（プレ着座） +3pt ---
       if (isValidDateInRange(row[COL.Z - 1], start, end)) {
-        if (!excluded) addScore(scoreIndividual, name, 3 * rankMultiplier);
+        if (!excluded) addScore(scoreIndividual, name, 3 * seatMultiplier);
+      }
+
+      // --- AG列（入金） +4pt ---
+      if (hasPayment) {
+        if (!excluded) addScore(scoreIndividual, name, 4);
       }
     }
   });
@@ -210,7 +219,8 @@ function formatSection(title, rankingArr, limit) {
 function getTBasePoint(rank) {
   if (rank === 'S') return 3;
   if (rank === 'A') return 2;
-  return 1;
+  if (rank === 'D') return 0.5;
+  return 1; // B・C・その他
 }
 function isValidDateInRange(value, start, end) {
   if (!(value instanceof Date)) return false;
