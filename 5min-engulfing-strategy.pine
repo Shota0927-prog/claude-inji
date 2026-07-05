@@ -306,6 +306,11 @@ macroCorrLen     = input.int(20,   "相関計算期間", minval = 2, group = grp
 macroDirLookback = input.int(10,   "方向判定期間", minval = 1, group = grpMacroTh)
 macroWeakCorr    = input.float(0.2, "相関 弱すぎ しきい値 |corr|<", minval = 0.0, maxval = 1.0, step = 0.05, group = grpMacroTh)
 
+grpMacroReturn = "Macro: 逆相関復帰"
+useMacroReturnEntry  = input.bool(true, "逆相関復帰をエントリー許可に使う", group = grpMacroReturn)
+macroReturnLookback  = input.int(3, "歪み→復帰 判定本数", minval = 1, group = grpMacroReturn)
+macroReturnStateBars = input.int(5, "復帰シグナル 有効本数", minval = 1, group = grpMacroReturn)
+
 // ============================================================
 //  3b. 入力 : Momentum モジュール (勢い・タイミング確認)
 // ------------------------------------------------------------
@@ -2095,12 +2100,15 @@ if useEnvFilter
             table.cell(envTable, 2, row, en ? f_trendTxt(det) : "-", text_color = color.white, bgcolor = detCol)
 
 // ============================================================
-//  8a. Macro (DXY/金利) 方向フィルター (Environment に接続)
+//  8a. Macro (DXY/金利) 逆相関復帰フィルター (Environment に接続)
 // ------------------------------------------------------------
-//  Gold と DXY / 米金利の逆相関から 方向バイアス と NoTrade を作る。
-//  ・DXY下落 / 金利低下 = Gold ロング寄り (逆相関)。
-//  ・方向フィルターなので、明確なバイアスがある時だけ逆方向を禁止する
-//    (中立=両方向許可)。WinZone/Trigger には一切混ぜない。
+//  Gold と DXY / 米金利の関係を「逆相関復帰」思想で使う:
+//    通常 : Gold と DXY/金利 は逆相関
+//    歪み : 同方向に動く → NoTrade (逆相関が崩れている)
+//    復帰 : 歪み → 逆相関へ戻る → 逆相関方向にエントリー許可
+//  ・復帰方向を macroReturnStateBars 本だけ状態保持して方向許可に使う。
+//  ・useMacroReturnEntry=false の時は従来のバイアス方向にフォールバック。
+//  ・Macro は Trigger ではなく Environment。WinZone/Trigger には混ぜない。
 //  ・useMacroModule=false の時は request.security を一切呼ばない。
 //  出力: allowLongByMacro / allowShortByMacro / macroNoTrade
 // ============================================================
@@ -2110,6 +2118,14 @@ f_macroChg(src, len) =>
 bool allowLongByMacro  = true
 bool allowShortByMacro = true
 bool macroNoTrade      = false
+// 逆相関復帰 (プロット/状態管理で参照するため module スコープで宣言)
+bool macroDistortion   = false
+bool dxyReturnSignal   = false
+bool yieldReturnSignal = false
+int  macroReturnDir    = 0
+var bool macroReturnLongState  = false
+var bool macroReturnShortState = false
+var int  macroReturnBar        = na
 
 if useMacroModule
     float _goldC  = request.security(macroGoldSymbol,  macroTF, close, lookahead = barmerge.lookahead_off)
@@ -2120,26 +2136,52 @@ if useMacroModule
     float _dxyChg   = f_macroChg(_dxyC,   macroDirLookback)
     float _yieldChg = f_macroChg(_yieldC, macroDirLookback)
     float _goldChg  = f_macroChg(_goldC,  macroDirLookback)
-    // 方向 (DXY下落/金利低下 = Gold ロング寄り = +1)
+    // 方向 (DXY下落/金利低下 = Gold ロング寄り = +1)。バイアス方式のフォールバック用。
     int _dxyDir   = _dxyChg   < 0 ? 1 : _dxyChg   > 0 ? -1 : 0
     int _yieldDir = _yieldChg < 0 ? 1 : _yieldChg > 0 ? -1 : 0
-    // 合成方向 : DXY と 金利 が一致した時のみ確定。不一致は中立(0)。
     int _biasDir = _dxyDir == _yieldDir ? _dxyDir : 0
-    // 方向フィルター : 明確なバイアスがある時だけ逆方向を禁止 (中立は両方許可)
-    allowLongByMacro  := _biasDir >= 0
-    allowShortByMacro := _biasDir <= 0
-    // NoTrade : 方向不一致 / 相関の歪み / 相関弱すぎ
-    bool _conflict = _dxyDir != 0 and _yieldDir != 0 and _dxyDir != _yieldDir
-    bool _dxyDistort   = (_dxyChg   > 0 and _goldChg > 0) or (_dxyChg   < 0 and _goldChg < 0)
-    bool _yieldDistort = (_yieldChg > 0 and _goldChg > 0) or (_yieldChg < 0 and _goldChg < 0)
-    bool _distortion = _dxyDistort or _yieldDistort
-    bool _weakCorr = (na(_dxyCorr) or math.abs(_dxyCorr) < macroWeakCorr) and (na(_yieldCorr) or math.abs(_yieldCorr) < macroWeakCorr)
-    macroNoTrade := useMacroNoTrade and (_conflict or _distortion or _weakCorr)
+    // --- 歪み判定 (Gold と DXY/金利 が同方向 = 逆相関が崩れている) ---
+    bool _dxyDistortion   = (_dxyChg   > 0 and _goldChg > 0) or (_dxyChg   < 0 and _goldChg < 0)
+    bool _yieldDistortion = (_yieldChg > 0 and _goldChg > 0) or (_yieldChg < 0 and _goldChg < 0)
+    macroDistortion := _dxyDistortion or _yieldDistortion
+    // --- 逆相関復帰判定 (歪み → 逆相関へ戻った瞬間) ---
+    bool _dxyInverseNow   = (_dxyChg   > 0 and _goldChg < 0) or (_dxyChg   < 0 and _goldChg > 0)
+    bool _yieldInverseNow = (_yieldChg > 0 and _goldChg < 0) or (_yieldChg < 0 and _goldChg > 0)
+    bool _wasDxyDistortion   = ta.barssince(_dxyDistortion)   <= macroReturnLookback
+    bool _wasYieldDistortion = ta.barssince(_yieldDistortion) <= macroReturnLookback
+    dxyReturnSignal   := _wasDxyDistortion   and _dxyInverseNow   and not _dxyInverseNow[1]
+    yieldReturnSignal := _wasYieldDistortion and _yieldInverseNow and not _yieldInverseNow[1]
+    // --- 復帰方向 (DXY下落&Gold上昇 = +1 / DXY上昇&Gold下落 = -1) ---
+    int _dxyReturnDir   = (_dxyChg   < 0 and _goldChg > 0) ? 1 : (_dxyChg   > 0 and _goldChg < 0) ? -1 : 0
+    int _yieldReturnDir = (_yieldChg < 0 and _goldChg > 0) ? 1 : (_yieldChg > 0 and _goldChg < 0) ? -1 : 0
+    // --- 復帰方向の合成 (両方一致→確定 / 片方→その方向) ---
+    macroReturnDir := dxyReturnSignal and yieldReturnSignal and _dxyReturnDir == _yieldReturnDir ? _dxyReturnDir : dxyReturnSignal ? _dxyReturnDir : yieldReturnSignal ? _yieldReturnDir : 0
+    // --- 復帰シグナル状態管理 (macroReturnStateBars 本だけ方向許可を保持) ---
+    if useMacroReturnEntry and macroReturnDir == 1
+        macroReturnLongState  := true
+        macroReturnShortState := false
+        macroReturnBar := bar_index
+    if useMacroReturnEntry and macroReturnDir == -1
+        macroReturnShortState := true
+        macroReturnLongState  := false
+        macroReturnBar := bar_index
+    if not na(macroReturnBar) and bar_index - macroReturnBar > macroReturnStateBars
+        macroReturnLongState  := false
+        macroReturnShortState := false
+    // --- NoTrade (歪み中は禁止。ただし復帰シグナルが出た足は解除) ---
+    bool _macroReturnNow = macroReturnDir != 0
+    macroNoTrade := useMacroNoTrade and macroDistortion and not _macroReturnNow
+    // --- allowLong / allowShort ---
+    //   復帰方式ON: 復帰状態のみ許可 / OFF: バイアス方向 (中立は両方許可)
+    allowLongByMacro  := not useMacroBias ? true : useMacroReturnEntry ? macroReturnLongState  : _biasDir >= 0
+    allowShortByMacro := not useMacroBias ? true : useMacroReturnEntry ? macroReturnShortState : _biasDir <= 0
 else
     // Macro OFF : 環境判定に一切影響させない (パススルー)
     allowLongByMacro  := true
     allowShortByMacro := true
     macroNoTrade      := false
+    macroReturnLongState  := false
+    macroReturnShortState := false
 
 // 環境フィルタ最終判定 (OFF なら常に許可)。ロング/ショート共通の環境テンプレート。
 //   既存環境条件 に Macro 方向バイアス と Macro NoTrade を AND 接続。
@@ -2556,18 +2598,22 @@ plot(envEnabled,       "envEnabled", display = display.data_window)
 plot(envMatched,       "envMatched", display = display.data_window)
 plot(envLongOk  ? 1 : 0, "envLongOk",  display = display.data_window)
 plot(envShortOk ? 1 : 0, "envShortOk", display = display.data_window)
-// Macro (DXY/金利) 方向フィルター
+// Macro (DXY/金利) 逆相関復帰フィルター
 plot(useMacroModule and allowLongByMacro  ? 1 : 0, "allowLongByMacro",  display = display.data_window)
 plot(useMacroModule and allowShortByMacro ? 1 : 0, "allowShortByMacro", display = display.data_window)
 plot(macroNoTrade ? 1 : 0, "macroNoTrade", display = display.data_window)
+plot(useMacroModule and macroDistortion       ? 1 : 0, "macroDistortion",       display = display.data_window)
+plot(useMacroModule and dxyReturnSignal       ? 1 : 0, "dxyReturnSignal",       display = display.data_window)
+plot(useMacroModule and yieldReturnSignal     ? 1 : 0, "yieldReturnSignal",     display = display.data_window)
+plot(useMacroModule ? macroReturnDir : 0,               "macroReturnDir",        display = display.data_window)
+plot(useMacroModule and macroReturnLongState  ? 1 : 0, "macroReturnLongState",  display = display.data_window)
+plot(useMacroModule and macroReturnShortState ? 1 : 0, "macroReturnShortState", display = display.data_window)
 
 // --- ② FVG (WinZone) : どこで狙うか (場所・状態保持) ---
 plot(fvgReboundBuy  ? 1 : 0, "fvgReboundBuy",  display = display.data_window)
 plot(fvgReboundSell ? 1 : 0, "fvgReboundSell", display = display.data_window)
 plot(fvgAbsorbBuy   ? 1 : 0, "fvgAbsorbBuy",   display = display.data_window)
 plot(fvgAbsorbSell  ? 1 : 0, "fvgAbsorbSell",  display = display.data_window)
-plot(ifvgBuy        ? 1 : 0, "ifvgBuy",        display = display.data_window)
-plot(ifvgSell       ? 1 : 0, "ifvgSell",       display = display.data_window)
 plot(longFVGStateOk  ? 1 : 0, "longFVGStateOk",  display = display.data_window)
 plot(shortFVGStateOk ? 1 : 0, "shortFVGStateOk", display = display.data_window)
 plot(longFVGOk      ? 1 : 0, "longFVGOk",      display = display.data_window)
@@ -2597,7 +2643,6 @@ plot(useAccumWZ and accumBreakShortOk ? 1 : 0, "accumBreakShortOk", display = di
 // --- ③ Momentum (ストキャス) : 勢いが反転したか (状態保持) ---
 plot(stochK, "stochK", display = display.data_window)
 plot(stochD, "stochD", display = display.data_window)
-plot(useStochTF ? 1 : 0, "useStochTF", display = display.data_window)
 plot(stochLongStateOk  ? 1 : 0, "stochLongStateOk",  display = display.data_window)
 plot(stochShortStateOk ? 1 : 0, "stochShortStateOk", display = display.data_window)
 plot(allowLongByMomentum  ? 1 : 0, "allowLongByMomentum",  display = display.data_window)
