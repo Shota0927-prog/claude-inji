@@ -11,7 +11,7 @@ const CAMPAIGN_CONFIG = {
   topN: 5,
   timezone: 'Asia/Tokyo',
 
-  excludeNames: ['あずな', '佐久間', 'kamiki', 'kazuki', 'ふうか', 'るる'],
+  excludeNames: ['あずな', 'kamiki', 'kazuki', 'ふうか', 'るる'],
   includeTNamesForTotal: ['あずな', 'kamiki', 'kazuki', 'ふうか'],
 
   // ✅ 2チームでのチーム対抗（青 VS 赤）
