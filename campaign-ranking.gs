@@ -1,5 +1,6 @@
-/*** Campaign Ranking One-Click (チーム対抗戦 🔵VS🔴 / 個人ランキング) ***/
-const CAMPAIGN_CONFIG = {
+/*** Campaign Ranking One-Click 2026/07 (チーム対抗戦 🔵VS🔴 / 個人ランキング) ***/
+/* ⚠️ 同一プロジェクト内の他ファイルと衝突しないよう、全識別子に _202607 を付与 */
+const CAMPAIGN_CONFIG_202607 = {
   sheetName: '7月営業(2026)',
   sourceSheets: ['7月営業(2026)'],
 
@@ -28,7 +29,7 @@ const CAMPAIGN_CONFIG = {
 };
 
 // ⚠️ 列を1つずつ右にずらした（名前は G列 に変更、H列は未使用）
-const COL = {
+const COL_202607 = {
   NAME: 7,   // G列（ポイントの名前）
   RANK: 15,  // O列（ランク）
   T:    21,  // U列（アポ取り 日時）  → ランク基準点
@@ -37,32 +38,8 @@ const COL = {
   PAY:  33,  // AG列（入金 日時）     +4pt
 };
 
-function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('Campaign')
-    .addItem('ランキング生成（期間内）', 'runCampaignRanking')
-    .addSeparator()
-    .addItem('毎日23時に自動投稿をセット', 'setupDaily23Trigger')
-    .addItem('自動投稿を停止', 'stopDailyPosting')
-    .addToUi();
-}
-
-function stopDailyPosting() {
-  const TARGET_HANDLERS = ['runCampaignRanking', 'setupDaily23Trigger'];
-  const triggers = ScriptApp.getProjectTriggers();
-  let deleted = 0;
-  triggers.forEach(t => {
-    const h = t.getHandlerFunction();
-    if (TARGET_HANDLERS.includes(h) || t.getEventType() === ScriptApp.EventType.CLOCK) {
-      ScriptApp.deleteTrigger(t);
-      deleted++;
-    }
-  });
-  try { SpreadsheetApp.getUi().alert(`自動投稿のトリガーを ${deleted} 件削除しました。`); } catch (_) {}
-}
-
-function runCampaignRanking() {
-  const cfg = CAMPAIGN_CONFIG;
+function runCampaignRanking_202607() {
+  const cfg = CAMPAIGN_CONFIG_202607;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const start = cfg.startDate;
   const end = cfg.endDate;
@@ -92,31 +69,31 @@ function runCampaignRanking() {
 
     for (let i = 0; i < values.length; i++) {
       const row = values[i];
-      const name = String(row[COL.NAME - 1] || '').trim();
-      const rank = String(row[COL.RANK - 1] || '').trim();
+      const name = String(row[COL_202607.NAME - 1] || '').trim();
+      const rank = String(row[COL_202607.RANK - 1] || '').trim();
 
       if (!name) continue;
 
       const excluded = cfg.excludeNames.includes(name);
-      const hasPayment = isValidDateInRange(row[COL.PAY - 1], start, end);
+      const hasPayment = isValidDateInRange_202607(row[COL_202607.PAY - 1], start, end);
 
       // D は着座系（アポ着座/プレ着座）を半減。ただし入金があれば通常ポイントに戻す
       const seatMultiplier = (rank === 'D' && !hasPayment) ? 0.5 : 1;
 
       // --- T列（アポ取り） → ランク基準点（S3 / A2 / B・C1 / D0.5） ---
-      if (isValidDateInRange(row[COL.T - 1], start, end)) {
-        const pts = getTBasePoint(rank);
+      if (isValidDateInRange_202607(row[COL_202607.T - 1], start, end)) {
+        const pts = getTBasePoint_202607(rank);
         if (!excluded) addScore(scoreIndividual, name, pts);
         if (cfg.includeTNamesForTotal.includes(name)) extraTTotalFromExcluded += pts;
       }
 
       // --- V列（アポ着座） +2pt ---
-      if (isValidDateInRange(row[COL.V - 1], start, end)) {
+      if (isValidDateInRange_202607(row[COL_202607.V - 1], start, end)) {
         if (!excluded) addScore(scoreIndividual, name, 2 * seatMultiplier);
       }
 
       // --- Z列（プレ着座） +3pt ---
-      if (isValidDateInRange(row[COL.Z - 1], start, end)) {
+      if (isValidDateInRange_202607(row[COL_202607.Z - 1], start, end)) {
         if (!excluded) addScore(scoreIndividual, name, 3 * seatMultiplier);
       }
 
@@ -127,13 +104,13 @@ function runCampaignRanking() {
     }
   });
 
-  if (!hasData) return uiSafeAlert('データがありません');
+  if (!hasData) return uiSafeAlert_202607('データがありません');
 
   // 個人ランキング
-  const rankingIndividual = toRanking(scoreIndividual);
+  const rankingIndividual = toRanking_202607(scoreIndividual);
 
   // チーム対抗（青 VS 赤）：個人スコアをチーム単位で合算
-  const nameToTeam = buildNameToTeam(cfg.teams);
+  const nameToTeam = buildNameToTeam_202607(cfg.teams);
   const blue = { name: cfg.teams.blue.name, pts: 0 };
   const red  = { name: cfg.teams.red.name,  pts: 0 };
   scoreIndividual.forEach((pts, name) => {
@@ -142,29 +119,29 @@ function runCampaignRanking() {
     else if (side === 'red') red.pts += pts;
   });
 
-  const header = `【${fmtDate(start)}〜${fmtDate(end)} キャンペーンランキング】`;
+  const header = `【${fmtDate_202607(start)}〜${fmtDate_202607(end)} キャンペーンランキング】`;
 
   const body = [
     header,
-    formatVsBattle(blue, red),                          // ① チーム対抗戦
-    formatSection('個人ランキング', rankingIndividual, cfg.topN), // ② 個人ランキング
+    formatVsBattle_202607(blue, red),                                  // ① チーム対抗戦
+    formatSection_202607('個人ランキング', rankingIndividual, cfg.topN), // ② 個人ランキング
     '',
   ].join('\n');
 
-  outputOrPost(body);
+  outputOrPost_202607(body);
 }
 
-/* === Utilities === */
+/* === Utilities（すべて _202607 サフィックス付き） === */
 
 // Map -> [{name, pts}] を pt 降順（同点は名前昇順）で
-function toRanking(map) {
+function toRanking_202607(map) {
   return Array.from(map.entries())
     .map(([name, pts]) => ({ name, pts }))
     .sort((a, b) => b.pts - a.pts || a.name.localeCompare(b.name, 'ja'));
 }
 
 // 名前 -> 'blue' | 'red' の逆引きテーブル
-function buildNameToTeam(teams) {
+function buildNameToTeam_202607(teams) {
   const table = {};
   if (!teams) return table;
   ['blue', 'red'].forEach(side => {
@@ -174,7 +151,7 @@ function buildNameToTeam(teams) {
 }
 
 // チーム対抗戦を 青🔵 VS 赤🔴 のゲージバーで整形
-function formatVsBattle(blue, red) {
+function formatVsBattle_202607(blue, red) {
   const BAR = 20; // ゲージの長さ（マス数）
   const total = blue.pts + red.pts;
 
@@ -205,7 +182,7 @@ function formatVsBattle(blue, red) {
 }
 
 // ランキング1セクションを整形。limit=null なら全件
-function formatSection(title, rankingArr, limit) {
+function formatSection_202607(title, rankingArr, limit) {
   if (!rankingArr.length) return ['', `【${title}】`, '該当データなし'].join('\n');
   const arr = (limit == null) ? rankingArr : rankingArr.slice(0, limit);
   const lines = arr.map((r, idx) => {
@@ -216,46 +193,48 @@ function formatSection(title, rankingArr, limit) {
   return ['', `【${title}】`, ...lines].join('\n');
 }
 
-function getTBasePoint(rank) {
+function getTBasePoint_202607(rank) {
   if (rank === 'S') return 3;
   if (rank === 'A') return 2;
   if (rank === 'D') return 0.5;
   return 1; // B・C・その他
 }
-function isValidDateInRange(value, start, end) {
+function isValidDateInRange_202607(value, start, end) {
   if (!(value instanceof Date)) return false;
   const t = value.getTime();
   return t >= start.getTime() && t <= end.getTime();
 }
-function fmtDate(d) {
-  return Utilities.formatDate(d, CAMPAIGN_CONFIG.timezone, 'M/d');
+function fmtDate_202607(d) {
+  return Utilities.formatDate(d, CAMPAIGN_CONFIG_202607.timezone, 'M/d');
 }
-function outputOrPost(text) {
-  if (CAMPAIGN_CONFIG.webhookUrl && CAMPAIGN_CONFIG.webhookUrl.startsWith('http')) {
-    try { postToDiscord(text); uiSafeAlert('Discordに投稿しました。'); }
-    catch (e) { uiSafeAlert('Discord投稿に失敗: ' + e); }
+function outputOrPost_202607(text) {
+  const cfg = CAMPAIGN_CONFIG_202607;
+  if (cfg.webhookUrl && cfg.webhookUrl.startsWith('http')) {
+    try { postToDiscord_202607(text); uiSafeAlert_202607('Discordに投稿しました。'); }
+    catch (e) { uiSafeAlert_202607('Discord投稿に失敗: ' + e); }
   } else {
-    outputText(text);
-    uiSafeAlert(`${CAMPAIGN_CONFIG.outputA1} に書き出しました。`);
+    outputText_202607(text);
+    uiSafeAlert_202607(`${cfg.outputA1} に書き出しました。`);
   }
 }
-function postToDiscord(text) {
+function postToDiscord_202607(text) {
   const payload = { content: text };
   const params = { method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true };
-  const res = UrlFetchApp.fetch(CAMPAIGN_CONFIG.webhookUrl, params);
+  const res = UrlFetchApp.fetch(CAMPAIGN_CONFIG_202607.webhookUrl, params);
   if (res.getResponseCode() >= 300) throw new Error(res.getContentText());
 }
-function outputText(text) {
+function outputText_202607(text) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sh = ss.getSheetByName(CAMPAIGN_CONFIG.sheetName) || ss.getActiveSheet();
-  sh.getRange(CAMPAIGN_CONFIG.outputA1).setValue(text);
+  const sh = ss.getSheetByName(CAMPAIGN_CONFIG_202607.sheetName) || ss.getActiveSheet();
+  sh.getRange(CAMPAIGN_CONFIG_202607.outputA1).setValue(text);
 }
-function uiSafeAlert(msg) {
+function uiSafeAlert_202607(msg) {
   try { SpreadsheetApp.getUi().alert(msg); } catch (_) {}
 }
 
-function setupDaily23Trigger() {
-  const handler = 'runCampaignRanking';
+// 毎日23時の自動投稿トリガーを設定（この7月キャンペーン専用）
+function setupDaily23Trigger_202607() {
+  const handler = 'runCampaignRanking_202607';
   ScriptApp.getProjectTriggers().forEach(t => {
     if (t.getHandlerFunction() === handler) ScriptApp.deleteTrigger(t);
   });
@@ -263,7 +242,21 @@ function setupDaily23Trigger() {
     .timeBased()
     .atHour(23)
     .everyDays(1)
-    .inTimezone(CAMPAIGN_CONFIG.timezone)
+    .inTimezone(CAMPAIGN_CONFIG_202607.timezone)
     .create();
-  uiSafeAlert('毎日23:00の自動投稿トリガーを設定しました。');
+  uiSafeAlert_202607('毎日23:00の自動投稿トリガーを設定しました。');
+}
+
+// この7月キャンペーンの自動投稿トリガーだけを停止
+function stopDailyPosting_202607() {
+  const handler = 'runCampaignRanking_202607';
+  const triggers = ScriptApp.getProjectTriggers();
+  let deleted = 0;
+  triggers.forEach(t => {
+    if (t.getHandlerFunction() === handler) {
+      ScriptApp.deleteTrigger(t);
+      deleted++;
+    }
+  });
+  try { SpreadsheetApp.getUi().alert(`自動投稿のトリガーを ${deleted} 件削除しました。`); } catch (_) {}
 }
