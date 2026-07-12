@@ -1,0 +1,3164 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// ============================================================
+//  5分足 包み足ストラテジー (Engulfing Strategy)
+// ------------------------------------------------------------
+//  ・エントリー   : 包み足 (Bullish / Bearish Engulfing)
+//  ・ボラフィルタ : OFF / ATR(高速ボラフィルタ) / 固定値 の3モード
+//      - OFF の時は ATR 等の関数を一切呼ばず、負荷を軽くする
+//  ・環境フィルタ : 環境認識モジュール (4H/1H/15M/5M/1M) を統合
+//      - OFF の時は request.security を一切呼ばず、負荷を軽くする
+//  ・リスク   : 1トレードの損失を元金(単利) or 残高(複利) の X% に固定
+//  ・ロット   : 整数に切り捨て。1未満はエントリーしない。
+//  ・ピラミッティング : 同方向へ最大3回まで追加エントリー可能 (下記 4a 参照)。
+//
+//  ※ 5分足チャートに適用してください。
+// ============================================================
+
+//@version=5
+strategy(
+     title             = "5min Engulfing Strategy",
+     shorttitle        = "ENG5",
+     overlay           = true,
+     pyramiding        = 3,
+     initial_capital   = 1000,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     dynamic_requests  = true,
+     max_bars_back     = 1000,
+     max_boxes_count   = 200,
+     max_labels_count  = 100
+ )
+
+// ============================================================
+//  1. 入力 : エントリー (トリガーは常に包み足)
+// ============================================================
+grpEntry = "エントリー"
+useLong      = input.bool(true, "ロングを有効",              group = grpEntry)
+useShort     = input.bool(false, "ショートを有効",            group = grpEntry)
+strictEngulf = input.bool(true, "実体が前足を完全に包む",     group = grpEntry)
+reqOppColor  = input.bool(true, "前足が反対色であることを要求", group = grpEntry)
+
+// ============================================================
+//  1a. 入力 : エントリートリガー (追加条件・ON/OFF)
+// ------------------------------------------------------------
+//  包み足に加えて複数のトリガーを Any/All/MinCount で組み合わせる。
+//  各トリガーは ON/OFF 可能。OFF のものは ta 関数を呼ばず軽量。
+//  デフォルトは「包み足のみ ON」= 従来と同じ挙動。
+//  トリガー種類:
+//    包み足 / ピンバー / BOS(直近高安更新) / EMAリジェクト /
+//    FVG形成 / 強ローソク
+//  下位足確認 (useLowerTFTrigger) は OFF の時 request.security を呼ばない。
+// ============================================================
+grpTrig = "エントリートリガー (追加条件)"
+useEngulfingTrigger    = input.bool(false, "包み足",             group = grpTrig)
+usePinbarTrigger       = input.bool(false, "ピンバー",           group = grpTrig)
+useBOSTrigger          = input.bool(false, "BOS / 直近高安更新", group = grpTrig)
+useEMARejectTrigger    = input.bool(true,  "EMAリジェクト",      group = grpTrig)
+useFVGTriggerFormation = input.bool(false, "FVG形成",            group = grpTrig)
+useStrongCandleTrigger = input.bool(true, "強ローソク",         group = grpTrig)
+
+triggerMode     = input.string("Any", "トリガー結合", options = ["Any", "All", "MinCount"], group = grpTrig)
+minTriggerCount = input.int(1, "最低トリガー数 (MinCount時)", minval = 1, group = grpTrig)
+
+// 下位足トリガー確認 (OFF で request.security を呼ばない)
+useLowerTFTrigger = input.bool(false, "下位足トリガー確認 (重い)", group = grpTrig)
+triggerTF         = input.timeframe("5", "下位足TF", group = grpTrig)
+triggerTFMode     = input.string("CurrentOnly", "現在足/下位足 結合", options = ["CurrentOnly", "LowerOnly", "CurrentAndLower", "CurrentOrLower"], group = grpTrig)
+
+// トリガー個別パラメータ
+emaLenTrigger      = input.int(20,  "EMA Length (EMAリジェクト)", minval = 1, group = grpTrig)
+// EMAリジェクト 傾きフィルター (ロングは上向き・ショートは下向きのみ許可。水平/逆向きは除外)
+useEMARejectSlopeFilter = input.bool(true, "EMAリジェクト 傾きフィルター", group = grpTrig)
+emaRejectSlopeLookback  = input.int(3, "EMAリジェクト 傾き判定本数", minval = 1, group = grpTrig)
+emaRejectSlopeMinATR    = input.float(0.05, "EMAリジェクト 最低傾き ATR倍率", minval = 0.0, step = 0.01, group = grpTrig)
+emaRejectSlopeAtrLen    = input.int(14, "EMAリジェクト 傾きATR期間", minval = 1, group = grpTrig)
+bosLookback        = input.int(10,  "BOS Lookback", minval = 2, group = grpTrig)
+pinWickBodyMult    = input.float(10.0, "ピンバー ヒゲ/実体倍率", step = 0.1, group = grpTrig)
+pinOppWickMaxRatio = input.float(1.0, "ピンバー 反対ヒゲ上限", step = 0.1, group = grpTrig)
+// ピンバー品質フィルター : 十字線/極小レンジ/ノイズを除外
+usePinBodyRatioFilter = input.bool(false, "ピンバー 実体率フィルター", group = grpTrig)
+pinMaxBodyRatio       = input.float(0.1, "ピンバー 最大実体率", minval = 0.05, maxval = 1.0, step = 0.05, group = grpTrig)
+usePinRangeFilter     = input.bool(true, "ピンバー 最低レンジフィルター", group = grpTrig)
+pinRangeAtrLen        = input.int(14, "ピンバー ATR期間", minval = 1, group = grpTrig)
+pinMinRangeATR        = input.float(0.10, "ピンバー 最低レンジ ATR倍率", step = 0.05, group = grpTrig)
+strongBodyRatio    = input.float(0.6, "強ローソク 実体率", minval = 0.0, maxval = 1.0, step = 0.05, group = grpTrig)
+trigCloseEdgeRatio = input.float(0.7, "ピン/強 終値端寄せ比率", minval = 0.0, maxval = 1.0, step = 0.05, group = grpTrig)
+// 包み足品質フィルター (弱い包み足を除外。トリガー側のみ適用・FVG吸収用 bullEngulf/bearEngulf は不変)
+useEngulfBodyRatioFilter   = input.bool(true, "包み足 包み込み率フィルター", group = grpTrig)
+engulfBodyRatioMin         = input.float(1.20, "包み足 最低包み込み率", minval = 1.0, step = 0.05, group = grpTrig)
+useEngulfBodyQualityFilter = input.bool(true, "包み足 実体率フィルター", group = grpTrig)
+engulfMinBodyRatio         = input.float(0.60, "包み足 最低実体率", minval = 0.0, maxval = 1.0, step = 0.05, group = grpTrig)
+useEngulfBodyAtrFilter     = input.bool(true, "包み足 最低実体ATRフィルター", group = grpTrig)
+engulfAtrLen               = input.int(14, "包み足 ATR期間", minval = 1, group = grpTrig)
+engulfMinBodyATR           = input.float(0.30, "包み足 最低実体 ATR倍率", minval = 0.0, step = 0.05, group = grpTrig)
+
+// トリガー クールダウン / 逆方向同時発生
+useTriggerCooldown        = input.bool(false, "トリガークールダウン", group = grpTrig)
+triggerCooldownBars       = input.int(3, "クールダウン本数", minval = 1, group = grpTrig)
+useOppositeTriggerNoTrade = input.bool(false, "逆方向トリガー同時発生はNoTrade", group = grpTrig)
+
+// ============================================================
+//  1b. 入力 : FVG 場所フィルター
+// ------------------------------------------------------------
+//  FVG はエントリートリガーではなく「場所条件」として使う。
+//  useFVGFilter = false のときは FVG 計算を動かさない (軽量)。
+//  (showFVGBoxes だけ ON の場合は表示のため計算する)
+// ============================================================
+grpFvg = "FVG 場所フィルター"
+useFVGFilter           = input.bool(true, "FVG場所フィルターを使う", group = grpFvg)
+useFVGReboundFilter    = input.bool(true,  "FVG反発を許可",          group = grpFvg)
+useFVGAbsorptionFilter = input.bool(true, "FVG吸収を許可",          group = grpFvg)
+useIFVGFilter          = input.bool(false, "iFVGを許可",             group = grpFvg)
+useBullishFVG    = input.bool(true,  "Bullish FVG (ロング側)",  group = grpFvg)
+useBearishFVG    = input.bool(true,  "Bearish FVG (ショート側)", group = grpFvg)
+useFVGConfirmBar = input.bool(true,  "確定足で判定",             group = grpFvg)
+useFVGThicknessFilter = input.bool(true,  "厚みフィルター(ATR)",     group = grpFvg)
+useFVGAgeFilter       = input.bool(true,  "年齢フィルター",          group = grpFvg)
+useFVGUsedFilter      = input.bool(true,  "使用済みフィルター (未使用/反発・吸収は常に各1回)", group = grpFvg)
+useOppositeFVGFilter  = input.bool(false, "逆側FVG近接フィルター",   group = grpFvg)
+fvgAtrLen        = input.int(14,  "FVG ATR期間",       minval = 1, group = grpFvg)
+fvgMaxAge        = input.int(100, "FVG最大年齢(本)",    minval = 1, group = grpFvg)
+maxFVGPerSide    = input.int(20,  "片側 最大FVG保持数", minval = 1, group = grpFvg)
+fvgMinThicknessATR = input.float(0.10, "最低厚み (ATR倍率)",       minval = 0.0, step = 0.05, group = grpFvg)
+oppositeFVGNearATR = input.float(0.50, "逆側FVG近接 (ATR倍率)",     minval = 0.0, step = 0.05, group = grpFvg)
+reboundDepthMax    = input.float(0.40, "反発 許容割込み深さ(幅比率)", minval = 0.0, step = 0.05, group = grpFvg)
+absorbBodyMinRatio = input.float(0.50, "吸収 実体最小比率",         minval = 0.0, maxval = 1.0, step = 0.05, group = grpFvg)
+absorbCloseEdgeRatio = input.float(0.7, "吸収 close端寄り比率",    minval = 0.0, maxval = 1.0, step = 0.05, group = grpFvg)
+
+// 反発の回復位置
+reboundRecoverRatio = input.float(0.30, "反発 回復位置(幅比率)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpFvg)
+
+// 吸収の定着条件
+useAbsorbCloseBuffer = input.bool(false, "吸収 終値バッファを使う", group = grpFvg)
+absorbCloseBufferATR = input.float(0.05, "吸収 終値バッファ(ATR倍率)", minval = 0.0, step = 0.05, group = grpFvg)
+useAbsorbConfirmBars = input.bool(false, "吸収 連続終値確認を使う", group = grpFvg)
+absorbConfirmBars    = input.int(2, "吸収 連続終値本数", minval = 1, maxval = 5, group = grpFvg)
+
+// 吸収後の包み足エントリー期限
+useAbsorbEntryWindow = input.bool(true, "吸収後エントリー期限を使う", group = grpFvg)
+absorbEntryMaxBars   = input.int(5, "吸収後エントリー期限(本)", minval = 1, group = grpFvg)
+
+// FVG有効期間 (シグナルを出してよい年齢の範囲)
+useFVGActiveWindow = input.bool(false, "FVG有効期間を使う", group = grpFvg)
+fvgActiveMinAge    = input.int(1,  "FVG有効 最小年齢(本)", minval = 0, group = grpFvg)
+fvgActiveMaxAge    = input.int(50, "FVG有効 最大年齢(本)", minval = 1, group = grpFvg)
+
+// FVG状態管理 (イベント発生後、一定本数だけ「FVG条件OK」を保持する)
+useFVGStateWindow       = input.bool(true, "FVG状態管理を使う", group = grpFvg)
+fvgStateMaxBars         = input.int(3, "FVG状態 有効本数", minval = 1, group = grpFvg)
+resetFVGStateAfterEntry = input.bool(true, "エントリー後FVG状態をリセット", group = grpFvg)
+
+showFVGBoxes     = input.bool(false, "FVG box を表示",          group = grpFvg)
+
+// ============================================================
+//  2. 入力 : ボラフィルタ
+// ------------------------------------------------------------
+//  OFF   … フィルタ無し (ATR 等の関数を呼ばない → 軽い)
+//  通常ボラ (volMode) と 高速ボラ (fastVolMode) は独立して ON/OFF 可能。
+//    volMode = OFF   … 通常ボラ無効 (base ATR/固定値の判定をしない)
+//    volMode = ATR   … base ATR で判定
+//    volMode = 固定値 … 現在足のレンジ (high-low) >= fixedMin で判定
+//    fastVolMode     … 高速ボラ (OFF/ATR/固定値)。volMode に関係なく併用可
+//  未使用の関数 (ta.atr 等) は呼ばれないため軽量。
+// ============================================================
+grpVol   = "ボラフィルタ"
+volMode  = input.string("OFF", "通常ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = grpVol)
+
+// --- 固定値モード (通常ボラ) ---
+fixedMin = input.float(1.0, "最低レンジ (価格・固定値)", minval = 0.0, step = 0.1, group = grpVol)
+
+// --- ATRモード (通常ボラ) ---
+atrLenBase   = input.int(14, "基準ATR本数", minval = 1, group = grpVol)
+atrTf        = input.timeframe("", "基準ATR時間足(空=チャート)", group = grpVol)
+useMinVol    = input.bool(true,  "低ボラ時はエントリー禁止", group = grpVol)
+minAtrDollar = input.float(1.5,  "最低ATR($)", minval = 0.0, step = 0.1, group = grpVol)
+volModeRel   = input.bool(false, "低ボラ判定を相対ATRにする", group = grpVol)
+volAvgLen    = input.int(480,    "ATR平均本数", minval = 10, group = grpVol)
+volRatioMin  = input.float(0.9,  "ATR ÷ ATR平均 最低比", minval = 0.1, step = 0.05, group = grpVol)
+// --- 高速ボラ (OFF/ATR/固定値) : 通常ボラとは独立 ---
+fastVolMode  = input.string("固定値", "高速ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = grpVol)
+fastAtrLen   = input.int(5,      "fastATR/値幅 参照本数", minval = 1, group = grpVol)
+fastAtrMin   = input.float(2.2,  "fastATR最低($) ※ATR時", step = 0.1, group = grpVol)
+fastFixedMin = input.float(3.0,  "直近値幅 最低($) ※固定値時", minval = 0.0, step = 0.1, group = grpVol)
+bodyAvgLen   = input.int(5,      "実体平均本数", minval = 1, group = grpVol)
+bodyAvgMin   = input.float(0.5,  "実体平均最低($)", step = 0.1, group = grpVol)
+useRangeRatioFilter = input.bool(true, "fastATR ÷ RangeWidth を使う ※ATR時", group = grpVol)
+rangeLookback       = input.int(20,    "RangeWidth参照本数", minval = 2, group = grpVol)
+atrRangeRatioMin    = input.float(0.06, "fastATR ÷ RangeWidth 最低比", step = 0.01, group = grpVol)
+useVolExpansion      = input.bool(false, "ボラ拡大判定を使う", group = grpVol)
+volExpansionLookback = input.int(3,     "ボラ拡大判定本数", minval = 1, group = grpVol)
+useVolCooldown  = input.bool(false, "低ボラ解除後の待機を使う", group = grpVol)
+volRecoveryBars = input.int(2,      "低ボラ解除後の待機本数", minval = 1, group = grpVol)
+
+// ============================================================
+//  3. 入力 : 環境フィルタ (環境認識モジュール)
+// ------------------------------------------------------------
+//  useEnvFilter = false の時は request.security を一切呼ばない。
+// ============================================================
+grpEnvMaster = "環境フィルタ"
+useEnvFilter = input.bool(true, "環境フィルタを使う (重い/OFFで軽量)", group = grpEnvMaster)
+
+// --- 時間足の 要求状態 (上昇/レンジ/下降/OFF) と参照時間足 ---
+//   各TFに「その足がこうであってほしい状態」を指定する。
+//   OFF のTFは判定に使わない。
+grpTF = "環境: 時間足 要求状態 / 参照時間足"
+reqTrend4H  = input.string("上昇", "4H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf4")
+tf4H        = input.timeframe("240", "TF",    group = grpTF, inline = "tf4")
+reqTrend1H  = input.string("上昇", "1H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf1")
+tf1H        = input.timeframe("60",  "TF",    group = grpTF, inline = "tf1")
+reqTrend15M = input.string("上昇", "15M 要求", options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf15")
+tf15M       = input.timeframe("15",  "TF",    group = grpTF, inline = "tf15")
+reqTrend5M  = input.string("OFF", "5M 要求",  options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf5")
+tf5M        = input.timeframe("5",   "TF",    group = grpTF, inline = "tf5")
+reqTrend1M  = input.string("OFF", "1M 要求",  options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf1m")
+tf1M        = input.timeframe("1",   "TF",    group = grpTF, inline = "tf1m")
+
+// --- 上昇条件 ON/OFF ---
+grpBull = "環境: 上昇条件 ON/OFF"
+useEma20Above50Up   = input.bool(true, "1. EMA20 > EMA50",       group = grpBull)
+useEma20SlopeUp     = input.bool(true, "2. EMA20 が上向き",       group = grpBull)
+useEma50SlopeUp     = input.bool(true, "3. EMA50 が上向き",       group = grpBull)
+useCloseAboveEma50  = input.bool(true, "4. close > EMA50",       group = grpBull)
+useCloseAboveEma200 = input.bool(true, "5. close > EMA200",      group = grpBull)
+useEmaDistanceWideU = input.bool(true, "6. EMA20/50 距離が広い",  group = grpBull)
+useEmaExpansionU    = input.bool(true, "7. EMA20/50 が拡散中",    group = grpBull)
+
+// --- 下降条件 ON/OFF ---
+grpBear = "環境: 下降条件 ON/OFF"
+useEma20Below50Dn   = input.bool(true, "1. EMA20 < EMA50",       group = grpBear)
+useEma20SlopeDown   = input.bool(true, "2. EMA20 が下向き",       group = grpBear)
+useEma50SlopeDown   = input.bool(true, "3. EMA50 が下向き",       group = grpBear)
+useCloseBelowEma50  = input.bool(true, "4. close < EMA50",       group = grpBear)
+useCloseBelowEma200 = input.bool(true, "5. close < EMA200",      group = grpBear)
+useEmaDistanceWideD = input.bool(true, "6. EMA20/50 距離が広い",  group = grpBear)
+useEmaExpansionD    = input.bool(true, "7. EMA20/50 が拡散中",    group = grpBear)
+
+// --- レンジ条件 ON/OFF ---
+grpRange = "環境: レンジ条件 ON/OFF"
+useEmaDistanceNarrow = input.bool(true, "1. EMA20/50 距離が近い",       group = grpRange)
+useEma20SlopeWeak    = input.bool(true, "2. EMA20 の傾きが弱い",         group = grpRange)
+useEma50SlopeWeak    = input.bool(true, "3. EMA50 の傾きが弱い",         group = grpRange)
+useEmaCompression    = input.bool(true, "4. EMA20/50 が収束中",          group = grpRange)
+useEma20CrossCount   = input.bool(true, "5. 価格が EMA20 を一定回数跨ぐ", group = grpRange)
+useEma50CrossCount   = input.bool(true, "6. 価格が EMA50 を一定回数跨ぐ", group = grpRange)
+useRangeWidthSmall   = input.bool(true, "7. 高値安値幅が小さい",         group = grpRange)
+
+// --- 調整パラメータ ---
+grpParam = "環境: 調整パラメータ"
+len20        = input.int(20,   "EMA20 length",  minval = 1, group = grpParam)
+len50        = input.int(50,   "EMA50 length",  minval = 1, group = grpParam)
+len200       = input.int(200,  "EMA200 length", minval = 1, group = grpParam)
+envAtrLen    = input.int(14,   "環境ATR length", minval = 1, group = grpParam)
+slopeBars    = input.int(3,    "EMA 傾き判定本数", minval = 1, group = grpParam)
+slopeMinMult = input.float(0.15, "EMA 傾きの最低値 ATR倍率",       minval = 0, step = 0.01, group = grpParam)
+distWideMult = input.float(0.50, "EMA20/50 距離 広い判定 ATR倍率", minval = 0, step = 0.01, group = grpParam)
+distNarrowMult = input.float(0.25, "EMA20/50 距離 近い判定 ATR倍率", minval = 0, step = 0.01, group = grpParam)
+convDivBars  = input.int(5,    "収束/拡散 判定本数",   minval = 1, group = grpParam)
+crossBars    = input.int(20,   "EMA跨ぎ回数 判定本数", minval = 1, group = grpParam)
+crossMinCount = input.int(3,   "EMA跨ぎ回数 最低回数", minval = 1, group = grpParam)
+rangeBars    = input.int(20,   "レンジ幅 判定本数",    minval = 1, group = grpParam)
+rangeMult    = input.float(1.5, "レンジ幅 ATR倍率",    minval = 0, step = 0.1, group = grpParam)
+
+// --- 判定ルール ---
+grpJudge = "環境: 判定ルール"
+tieAsRange          = input.bool(true, "同点時にレンジ扱いする",     group = grpJudge)
+insufficientAsRange = input.bool(true, "条件不足時にレンジ扱いする", group = grpJudge)
+minScore4H  = input.int(3, "4H 最低必要スコア",  minval = 1, group = grpJudge)
+minScore1H  = input.int(3, "1H 最低必要スコア",  minval = 1, group = grpJudge)
+minScore15M = input.int(3, "15M 最低必要スコア", minval = 1, group = grpJudge)
+minScore5M  = input.int(3, "5M 最低必要スコア",  minval = 1, group = grpJudge)
+minScore1M  = input.int(3, "1M 最低必要スコア",  minval = 1, group = grpJudge)
+
+// --- 環境フィルター接続 ---
+//   有効(OFF以外)なTFのうち、実際のトレンドが要求と一致した数で判定。
+grpLink = "環境: 判定"
+reqMatchCount = input.int(0, "必要一致TF数 (0=有効な全TFが一致)", minval = 0, group = grpLink)
+
+// --- 環境テーブル表示 ---
+grpEnvDisp = "環境: 表示"
+showEnvTable = input.bool(true, "環境テーブルを表示", group = grpEnvDisp)
+colUp    = input.color(color.new(color.green, 0), "上昇カラー",  group = grpEnvDisp)
+colDown  = input.color(color.new(color.red,   0), "下降カラー",  group = grpEnvDisp)
+colRange = input.color(color.new(color.gray,  0), "レンジカラー", group = grpEnvDisp)
+colOff   = input.color(color.new(color.black, 0), "OFFカラー",   group = grpEnvDisp)
+
+// ============================================================
+//  3b. 入力 : Momentum モジュール (勢い・タイミング確認)
+// ------------------------------------------------------------
+//  ※ これは「環境認識」ではない。トレンド判定には一切使わない。
+//     役割 = 勢い / 押し目・戻り / エントリータイミング / 逆張り禁止。
+//     設計順序 : 環境認識 → WinZone(FVG) → Momentum → Trigger → Entry
+//        FVG(場所) と Momentum(勢い) は状態保持。Trigger は最後の引き金。
+//     出力 : allowLongByMomentum / allowShortByMomentum (将来 RSI/MACD/CCI/ADX/ROC も統合)
+// ============================================================
+
+grpMomentum = "Momentum"
+useMomentumModule = input.bool(true, "Momentumモジュールを使う", group = grpMomentum)
+useStochMomentum  = input.bool(false, "ストキャス",              group = grpMomentum)
+momentumMode      = input.string("AND", "Momentum結合", options = ["AND", "OR"], group = grpMomentum)
+// ストキャス状態管理 (シグナル発生後、一定本数だけ Momentum OK を保持。FVG状態管理と同思想)
+useStochStateWindow       = input.bool(true, "ストキャス状態管理を使う", group = grpMomentum)
+stochStateMaxBars         = input.int(3, "ストキャス状態 有効本数", minval = 1, group = grpMomentum)
+resetStochStateAfterEntry = input.bool(true, "エントリー後ストキャス状態をリセット", group = grpMomentum)
+
+// --- ストキャス : ON/OFF (パターン) ---
+grpStochSw = "Momentum: ストキャス パターン"
+useExtremeReversal   = input.bool(false, "A: Extreme Reversal",   group = grpStochSw)
+useOBOSCross         = input.bool(false, "B: OB/OS Cross",        group = grpStochSw)
+useMiddleCross       = input.bool(false, "C: Middle Cross",       group = grpStochSw)
+useStickinessFilter  = input.bool(false, "D: Stickiness(禁止)",   group = grpStochSw)
+useRegularDivergence = input.bool(false, "E: Regular Divergence", group = grpStochSw)
+useHiddenDivergence  = input.bool(true, "F: Hidden Divergence",  group = grpStochSw)
+
+// --- ストキャス設定 ---
+grpStoch = "Momentum: ストキャス設定"
+kLen    = input.int(21, "%K 期間",      minval = 1, group = grpStoch)
+kSmooth = input.int(3,  "%K スムージング", minval = 1, group = grpStoch)
+dLen    = input.int(3,  "%D 期間",      minval = 1, group = grpStoch)
+// ストキャス参照時間足 (OFF=チャート足。ON時のみ request.security を呼ぶ)
+useStochTF = input.bool(false, "ストキャス参照TFを使う", group = grpStoch)
+stochTF    = input.timeframe("5", "ストキャス参照TF", group = grpStoch)
+extremeHigh = input.float(85, "Extreme High", group = grpStoch)
+extremeLow  = input.float(15, "Extreme Low",  group = grpStoch)
+obLevel     = input.float(80, "OB Level",     group = grpStoch)
+osLevel     = input.float(20, "OS Level",     group = grpStoch)
+middleLevel = input.float(50, "Middle Level", group = grpStoch)
+
+// --- A: Extreme Reversal ---
+grpStochA = "Momentum: A Extreme Reversal"
+useExtremeSlopeTurn    = input.bool(true, "傾き反転で確認", group = grpStochA)
+useExtremeKDCross      = input.bool(true, "K/Dクロスで確認", group = grpStochA)
+extremeLookback        = input.int(5, "Extreme 到達 参照本数", minval = 1, group = grpStochA)
+useExtremeOneShot      = input.bool(true, "Extreme 一回だけ発火", group = grpStochA)
+extremeResetLevelHigh  = input.float(80, "High リセットレベル", group = grpStochA)
+extremeResetLevelLow   = input.float(20, "Low リセットレベル",  group = grpStochA)
+useSlopeStrengthFilter = input.bool(false, "折り返し角度フィルター", group = grpStochA)
+stochSlopeMin          = input.float(2.0, "最小スロープ(|ΔK|)", minval = 0.0, step = 0.5, group = grpStochA)
+useExtremeRetraceFilter= input.bool(false, "戻り量フィルター", group = grpStochA)
+extremeRetraceMin      = input.float(5.0, "最小戻り量(ポイント)", minval = 0.0, step = 0.5, group = grpStochA)
+
+// --- D: Stickiness / Divergence / 共通フィルター ---
+grpStochD = "Momentum: D/Div/共通"
+stickBars           = input.int(5, "Stickiness 張り付き本数", minval = 1, group = grpStochD)
+divPivotLen         = input.int(5,  "Div Pivot 長さ",     minval = 1, group = grpStochD)
+divLookback         = input.int(50, "Div Pivot 間 最大本数", minval = 1, group = grpStochD)
+useKDirectionFilter = input.bool(false, "K傾きフィルター",   group = grpStochD)
+useKDRelationFilter = input.bool(false, "K/D位置フィルター", group = grpStochD)
+
+// ============================================================
+//  3c. 入力 : Momentum MACD モジュール
+// ------------------------------------------------------------
+//  MACD を「勢い / タイミング確認」の Momentum 指標として使う (ストキャスと並列)。
+//  WinZone でも Trigger でもない。出力 = allowLongByMACD / allowShortByMACD。
+//  useMACDModule=false の時は ta.macd / ta.atr / ta.sma / ta.pivot* /
+//  Divergence / Compression / 状態更新 を一切実行しない。
+//  さらに機能単位でも重い関数を呼ばない :
+//    Divergence OFF → ta.pivothigh/ta.pivotlow を呼ばない
+//    ATR正規化 OFF → ta.atr を呼ばない / 相対収束 OFF → ta.sma を呼ばない
+//  変数はすべて macd プレフィックスで既存コードとの衝突を回避。
+// ============================================================
+grpMomentumMACD = "Momentum: MACD"
+useMACDModule = input.bool(true, "MACDモジュールを使う", group = grpMomentumMACD)
+// MACD 状態管理 (シグナル後 macdStateMaxBars 本だけ Momentum OK を保持)
+useMACDStateWindow = input.bool(true, "MACD状態管理を使う", group = grpMomentumMACD)
+macdStateMaxBars   = input.int(3, "MACD状態 有効本数", minval = 1, group = grpMomentumMACD)
+resetMACDStateAfterEntry = input.bool(true, "エントリー後MACD状態をリセット", group = grpMomentumMACD)
+
+// --- MACD パターン ON/OFF ---
+grpMACDSw = "Momentum: MACD パターン"
+useMACDSignalCross          = input.bool(false,  "A: Signalクロス",         group = grpMACDSw)
+useMACDZeroFilter           = input.bool(false, "B: ゼロ上下(方向F)",       group = grpMACDSw)
+useMACDZeroCross            = input.bool(false, "C: ゼロクロス",            group = grpMACDSw)
+useMACDHistExpansion        = input.bool(true, "D: Hist拡大",             group = grpMACDSw)
+useMACDHistShrink           = input.bool(false, "E: Hist縮小(Exit警戒)",    group = grpMACDSw)
+useMACDRegularDivergence    = input.bool(false,  "F: Regular Divergence",   group = grpMACDSw)
+useMACDHiddenDivergence     = input.bool(false, "G: Hidden Divergence",    group = grpMACDSw)
+useMACDCompressionExpansion = input.bool(false, "H: 収束→拡散",            group = grpMACDSw)
+
+// --- MACD 設定 ---
+grpMACDSet = "Momentum: MACD 設定"
+macdFastLen   = input.int(8,  "Fast EMA",   minval = 1, group = grpMACDSet)
+macdSlowLen   = input.int(21, "Slow EMA",   minval = 1, group = grpMACDSet)
+macdSignalLen = input.int(5,  "Signal EMA", minval = 1, group = grpMACDSet)
+
+// --- D: Hist拡大 ---
+grpMACDD = "Momentum: MACD D Hist拡大"
+macdHistExpansionBars           = input.int(3, "拡大 連続本数", minval = 1, group = grpMACDD)
+useMACDHistExpansionConsecutive = input.bool(true, "連続拡大を要求", group = grpMACDD)
+useMACDHistSlopeStrength        = input.bool(false, "Histスロープ勢いを要求", group = grpMACDD)
+macdHistSlopeMin                = input.float(0.02, "最小Histスロープ", minval = 0.0, step = 0.01, group = grpMACDD)
+
+// --- H: 収束→拡散 ---
+grpMACDH = "Momentum: MACD H 収束→拡散"
+useMACDATRNormalizedThreshold   = input.bool(false, "収束しきい値をATR正規化", group = grpMACDH)
+macdAtrLen                      = input.int(14, "ATR期間", minval = 1, group = grpMACDH)
+macdCompressionThreshold        = input.float(0.05, "収束しきい値 |hist|", minval = 0.0, step = 0.01, group = grpMACDH)
+macdCompressionBars             = input.int(5, "収束 継続本数", minval = 1, group = grpMACDH)
+useMACDRelativeCompression      = input.bool(false, "相対収束を使う", group = grpMACDH)
+macdRelativeCompressionLookback = input.int(50, "相対収束 参照本数", minval = 1, group = grpMACDH)
+macdRelativeCompressionMult     = input.float(0.3, "相対収束 倍率(平均比)", minval = 0.0, step = 0.05, group = grpMACDH)
+
+// --- F/G: Divergence ---
+grpMACDDiv = "Momentum: MACD Divergence"
+macdDivPivotLen = input.int(4,  "Pivot 長さ",       minval = 1, group = grpMACDDiv)
+macdDivLookback = input.int(40, "Pivot 間 最大本数", minval = 1, group = grpMACDDiv)
+
+// --- 共通フィルター ---
+grpMACDFilt = "Momentum: MACD 共通フィルター"
+useMACDZeroDirectionFilter = input.bool(false, "ゼロ位置フィルター(line)", group = grpMACDFilt)
+useMACDHistDirectionFilter = input.bool(true, "Hist位置フィルター",       group = grpMACDFilt)
+useMACDSlopeFilter         = input.bool(false, "MACD傾きフィルター",       group = grpMACDFilt)
+useMACDZeroDistanceFilter  = input.bool(false, "ゼロ距離フィルター",       group = grpMACDFilt)
+macdZeroDistanceMin        = input.float(0.05, "ゼロから最小距離", minval = 0.0, step = 0.01, group = grpMACDFilt)
+
+// --- NoTrade (拡張用) ---
+grpMACDNT = "Momentum: MACD NoTrade"
+useMACDFlatNoTrade = input.bool(false, "横ばい(収束)時 NoTrade", group = grpMACDNT)
+
+// ============================================================
+//  4. 入力 : リスク / 決済
+// ============================================================
+grpRisk = "リスク / 決済"
+riskPct     = input.float(5.0, "1トレード損失率 (%)",  minval = 0.1, step = 0.1, group = grpRisk)
+useCompound = input.bool(false, "複利 (残高ベース) ※OFF=元金単利", group = grpRisk)
+slMode      = input.string("固定", "SL方式", options = ["パターン", "固定"], group = grpRisk)
+slBuf       = input.float(0.0, "SL バッファ (価格) ※パターン時", minval = 0.0, step = 0.1, group = grpRisk)
+slFixed     = input.float(10, "固定SL幅 (価格) ※固定時",         minval = 0.0, step = 0.1, group = grpRisk)
+rrRatio     = input.float(1.0, "リスクリワード比 (TP)", minval = 0.1, step = 0.1, group = grpRisk)
+
+// ============================================================
+//  4a. 入力 : ピラミッティング (同方向へ最大3回まで追加エントリー)
+// ------------------------------------------------------------
+//  ・usePyramiding = false のときは従来動作 (ノーポジ時のみ・最大1・ドテンなし)。
+//  ・strategy() の pyramiding には input を直接指定できないため 3 で固定し、
+//    実際の最大回数は発注条件側の maxPyramidEntries で制御する。
+//  ・ピラミッティング時のリスク :
+//      「各回そのまま」… 各エントリーで riskPct をそのまま使用 (合計最大 riskPct×回数)。
+//      「分割」        … riskPct / maxPyramidEntries を1回あたりに使用 (合計 ≒ riskPct)。
+//      デフォルトは安全性を優先して「分割」。
+// ============================================================
+grpPyramid = "ピラミッティング"
+usePyramiding       = input.bool(true, "ピラミッティングを使う", group = grpPyramid)
+maxPyramidEntries   = input.int(3, "最大エントリー回数", minval = 1, maxval = 3, group = grpPyramid)
+pyramidCooldownBars = input.int(1, "追加エントリー間隔（本）", minval = 1, group = grpPyramid)
+pyramidRiskMode     = input.string("分割", "ピラミッティング時のリスク", options = ["各回そのまま", "分割"], group = grpPyramid)
+
+// ============================================================
+//  4b. 入力 : 時間帯フィルタ (東京時間 JST 基準)
+// ------------------------------------------------------------
+//  シグナルを出す時間帯をセッション単位で制限する。
+//  東京時間 (Asia/Tokyo) で判定 :
+//    アジア 09:00-16:00 / EU 16:00-21:00 / NY 21:00-翌03:00
+//  ※ NY は日跨ぎ。03:00-09:00 はどのセッションにも属さず除外。
+// ============================================================
+grpSession = "時間帯フィルタ (東京時間)"
+useSessionFilter = input.bool(true, "時間帯フィルタを使う", group = grpSession)
+useAsiaSession   = input.bool(true, "アジア 09:00-16:00", group = grpSession)
+useEUSession     = input.bool(true, "EU 16:00-21:00",   group = grpSession)
+useNYSession     = input.bool(true, "NY 21:00-翌03:00", group = grpSession)
+
+// ============================================================
+//  4c. 入力 : WinZone モジュール (FVG / 出来高・POC を場所条件として並列化)
+// ------------------------------------------------------------
+//  環境認識 → WinZone(├FVG └出来高/POC) → Momentum → Trigger → Entry
+//  FVG と出来高を同じ「場所条件」階層で扱う。
+//    FVG_ONLY    … FVGのみ
+//    VOLUME_ONLY … 出来高/POCのみ
+//    OR          … どちらか
+//    AND          … 両方
+//  ※ 軽量化 : winZoneMode が対象を含まない側は計算を一切走らせない。
+// ============================================================
+grpWinZone = "WinZone: FVG / Volume / Fib / EMA / Line"
+useWinZoneModule = input.bool(true, "WinZoneモジュールを使う", group = grpWinZone)
+useFVGWinZone    = input.bool(false, "FVGをWinZoneに使う", group = grpWinZone)
+useVolumeWinZone = input.bool(false, "出来高/POCをWinZoneに使う", group = grpWinZone)
+useFibWinZone    = input.bool(false, "フィボをWinZoneに使う", group = grpWinZone)
+useEMAWinZone    = input.bool(false, "EMAをWinZoneに使う", group = grpWinZone)
+useLineWinZone   = input.bool(false, "水平線をWinZoneに使う", group = grpWinZone)
+winZoneMode      = input.string("AND", "WinZone結合", options = ["FVG_ONLY", "VOLUME_ONLY", "FIB_ONLY", "EMA_ONLY", "LINE_ONLY", "OR", "AND"], group = grpWinZone)
+
+// --- 出来高: パターン ON/OFF ---
+grpVolPat = "出来高: パターン ON/OFF"
+usePOCAcceptance  = input.bool(false, "A: POC貫通・定着",       group = grpVolPat)
+usePOCReject      = input.bool(false, "B: POCリジェクト(押し目/戻り)", group = grpVolPat)
+useVolumeBreakout = input.bool(true, "C: 出来高急増ブレイク",    group = grpVolPat)
+useClimaxReversal = input.bool(false, "D: クライマックス反転",    group = grpVolPat)
+
+// --- 出来高: 共通フィルター ON/OFF ---
+grpVolFilt = "出来高: 共通フィルター ON/OFF"
+useLowVolumeFilter   = input.bool(true,  "出来高不足フィルター",     group = grpVolFilt)
+useVolumeSMAFilter   = input.bool(false, "出来高SMAフィルター(>SMA)", group = grpVolFilt)
+useBodyFilter        = input.bool(false, "実体率フィルター",         group = grpVolFilt)
+useCompressionFilter = input.bool(false, "圧縮→爆発フィルター(C)",   group = grpVolFilt)
+useFirstSignalOnly   = input.bool(true,  "連続シグナル抑制(初回のみ)", group = grpVolFilt)
+
+// --- 出来高: VPVR / POC ---
+grpVP = "出来高: VPVR / POC"
+vpLookback = input.int(80, "VP ルックバック(本)", minval = 10, group = grpVP)
+vpBins     = input.int(20,  "VP ビン数",           minval = 4,  maxval = 100, group = grpVP)
+pocZoneWidth = input.float(0.0, "POCゾーン幅(固定/価格)", minval = 0.0, step = 0.1, group = grpVP)
+useVolAdaptivePOCWidth = input.bool(true, "POCゾーン幅をATR連動にする", group = grpVP)
+volAtrLen     = input.int(14,  "出来高ATR期間",          minval = 1,   group = grpVP)
+pocZoneATRMult= input.float(0.25, "POCゾーン幅 (ATR倍率)", minval = 0.0, step = 0.05, group = grpVP)
+
+// --- 出来高: A アクセプタンス ---
+grpVolA = "出来高: A アクセプタンス"
+crossLookback = input.int(10, "貫通前 参照本数", minval = 1, group = grpVolA)
+acceptBars    = input.int(2,  "定着本数",       minval = 1, group = grpVolA)
+useDirCandleForAcceptance     = input.bool(false, "方向ローソク確認", group = grpVolA)
+useVolumeConfirmForAcceptance = input.bool(false, "出来高増加確認",   group = grpVolA)
+
+// --- 出来高: B リジェクト ---
+grpVolB = "出来高: B リジェクト"
+pocRejectDepthMax = input.float(0.5, "許容 割込み深さ(ゾーン比)", minval = 0.0, step = 0.05, group = grpVolB)
+usePOCRejectCandleConfirm    = input.bool(true, "リジェクト: 方向ローソク",  group = grpVolB)
+usePOCRejectWickConfirm      = input.bool(true, "リジェクト: ヒゲ確認",      group = grpVolB)
+usePOCRejectCloseEdgeConfirm = input.bool(true, "リジェクト: close寄り確認", group = grpVolB)
+
+// --- 出来高: トレンドフィルター ---
+grpVolTrend = "出来高: トレンドフィルター"
+useTrendFilter  = input.bool(true, "トレンドフィルターを使う", group = grpVolTrend)
+allowTrendLong  = input.bool(true, "ロング許可",             group = grpVolTrend)
+allowTrendShort = input.bool(true, "ショート許可",           group = grpVolTrend)
+
+// --- 出来高: C ブレイク / 圧縮 ---
+grpVolC = "出来高: C ブレイク"
+breakoutLookback     = input.int(5, "ブレイク 参照本数", minval = 1, group = grpVolC)
+volumeSmaLen         = input.int(20, "出来高SMA期間",     minval = 1, group = grpVolC)
+volumeSpikeMult      = input.float(1.5, "出来高急増 倍率", minval = 0.0, step = 0.1, group = grpVolC)
+breakoutBodyRatioMin = input.float(0.3, "ブレイク 実体率最小", minval = 0.0, maxval = 1.0, step = 0.05, group = grpVolC)
+useATRExpansionFilter = input.bool(false, "ATR拡大フィルター", group = grpVolC)
+atrExpansionMult     = input.float(1.2, "ATR拡大 倍率", minval = 0.0, step = 0.05, group = grpVolC)
+compressionLookback  = input.int(10, "圧縮 参照本数", minval = 1, group = grpVolC)
+compressionATRMult   = input.float(1.5, "圧縮 レンジ <= ATR×", minval = 0.0, step = 0.1, group = grpVolC)
+
+// --- 出来高: D クライマックス ---
+grpVolD = "出来高: D クライマックス"
+climaxLookback   = input.int(20, "クライマックス 参照本数", minval = 1, group = grpVolD)
+climaxVolumeMult = input.float(2.5, "クライマックス 出来高倍率", minval = 0.0, step = 0.1, group = grpVolD)
+climaxWickRatio  = input.float(0.5, "ヒゲ比率(ヒゲ/レンジ)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpVolD)
+climaxCloseEdgeRatio = input.float(0.35, "close端寄り比率", minval = 0.0, maxval = 1.0, step = 0.05, group = grpVolD)
+
+// --- 出来高: 共通値 / 表示 ---
+grpVolCommon = "出来高: 共通値 / 表示"
+lowVolumeMult = input.float(0.7, "出来高不足 倍率(volume<SMA×)", minval = 0.0, step = 0.05, group = grpVolCommon)
+bodyRatioMin  = input.float(0.3, "実体率 最小", minval = 0.0, maxval = 1.0, step = 0.05, group = grpVolCommon)
+showPOCZone   = input.bool(true, "POCゾーンを表示", group = grpVolCommon)
+
+// --- 出来高: 状態管理 (FVGと同思想。イベント後 一定本数だけ場所条件OKを保持) ---
+grpVolState = "出来高: 状態管理"
+useVolumeStateWindow       = input.bool(true, "出来高状態管理を使う", group = grpVolState)
+volumeStateMaxBars         = input.int(10, "出来高状態 有効本数", minval = 1, group = grpVolState)
+resetVolumeStateAfterEntry = input.bool(true, "エントリー後出来高状態をリセット", group = grpVolState)
+
+// ============================================================
+//  4d. 入力 : フィボ WinZone (戻り売り/押し目買い・場所条件)
+// ------------------------------------------------------------
+//  トレンド波の戻り/押しを A/B/C ランクのフィボ帯で捉える場所条件。
+//  ※ useFibWZ=false の時は ta.pivot/atr/ema・波計算等を一切走らせない。
+// ============================================================
+grpFib = "フィボ: 波検出 / 設定"
+useFibSell = input.bool(true, "SELL(戻り売り)検出", group = grpFib)
+useFibBuy  = input.bool(true, "BUY(押し目買い)検出", group = grpFib)
+fibAtrLen        = input.int(14,  "Fib ATR期間", minval = 1, group = grpFib)
+fibEma20Len      = input.int(20,  "Fib EMA20期間 (反転確認用)", minval = 1, group = grpFib)
+swingLookback    = input.int(3,   "スイング検出 左右本数", minval = 1, group = grpFib)
+waveLookback     = input.int(100, "波の有効本数 (古い波は無視)", minval = 10, group = grpFib)
+minWaveATR       = input.float(2.0, "最低波幅 (ATR倍)", minval = 0.0, step = 0.1, group = grpFib)
+fibZoneBufferATR = input.float(0.3, "フィボゾーン許容 (ATR倍)", step = 0.05, group = grpFib)
+requireConfirmedBar = input.bool(true, "確定足でのみシグナル (リペイント回避)", group = grpFib)
+
+grpFibRank = "フィボ: ランク / レベル"
+useRankA = input.bool(false, "A ランク (深い)", group = grpFibRank)
+useRankB = input.bool(true, "B ランク (王道)", group = grpFibRank)
+useRankC = input.bool(true, "C ランク (浅い)", group = grpFibRank)
+fibAStart = input.float(0.618, "A 開始", step = 0.001, group = grpFibRank)
+fibAEnd   = input.float(0.786, "A 終了", step = 0.001, group = grpFibRank)
+fibBStart = input.float(0.500, "B 開始", step = 0.001, group = grpFibRank)
+fibBEnd   = input.float(0.618, "B 終了", step = 0.001, group = grpFibRank)
+fibCStart = input.float(0.382, "C 開始", step = 0.001, group = grpFibRank)
+fibCEnd   = input.float(0.500, "C 終了", step = 0.001, group = grpFibRank)
+
+grpFibConf = "フィボ: 反転確認"
+useRejectConfirm    = input.bool(false, "反転確認を必須にする", group = grpFibConf)
+useCandleConfirm    = input.bool(false, "陽線/陰線 確定",       group = grpFibConf)
+usePinbarConfirm    = input.bool(false, "ピンバー (上/下ヒゲ)", group = grpFibConf)
+useEngulfingConfirm = input.bool(false, "包み足 (engulfing)",   group = grpFibConf)
+useEma20Confirm     = input.bool(false, "close と EMA20 の関係", group = grpFibConf)
+useBreakPrevConfirm = input.bool(false, "直近足の高値/安値更新",  group = grpFibConf)
+pinbarWickRatio     = input.float(2.0, "pinbarWickRatio (ヒゲ/実体比)", minval = 0, step = 0.1, group = grpFibConf)
+engulfingBodyRatio  = input.float(1.0, "engulfingBodyRatio (実体比)",   minval = 0, step = 0.1, group = grpFibConf)
+
+grpFibInv = "フィボ: 無効条件"
+useDeepLimitInvalid = input.bool(true, "深限界 (A終了%) 突破で無効", group = grpFibInv)
+useOriginInvalid    = input.bool(true, "波の起点突破で無効",         group = grpFibInv)
+useEMASettleInvalid = input.bool(false, "EMA定着で無効",             group = grpFibInv)
+
+// --- フィボ: 状態管理 (FVG/出来高と同思想) ---
+grpFibState = "フィボ: 状態管理"
+useFibStateWindow       = input.bool(true, "フィボ状態管理を使う", group = grpFibState)
+fibStateMaxBars         = input.int(5, "フィボ状態 有効本数", minval = 1, group = grpFibState)
+resetFibStateAfterEntry = input.bool(true, "エントリー後フィボ状態をリセット", group = grpFibState)
+
+// ============================================================
+//  4g. 入力 : EMA WinZone (200/600/1000/2000/3000 を反応価格帯として)
+// ------------------------------------------------------------
+//  EMA は Bias(方向) ではなく Zone(反応する価格帯)。上だからロング等の
+//  方向制限はしない。各EMAごとに ON/OFF でき、ON のEMAだけ計算・判定する。
+//  FVG/Volume/Fib/Line と並列の WinZone。出力 emaLongWinZone / emaShortWinZone。
+//  ・useEMAWZ=false の時は EMA計算・ATR・cross・状態管理・描画 を一切走らせない。
+// ============================================================
+grpEMAWZ = "EMA WinZone"
+useEMAModule = input.bool(true, "EMAモジュールを使う (WinZone ON時のみ有効)", group = grpEMAWZ)
+emaLen1 = input.int(200,  "EMA200 Length",  minval = 1, group = grpEMAWZ)
+emaLen2 = input.int(600,  "EMA600 Length",  minval = 1, group = grpEMAWZ)
+emaLen3 = input.int(1000, "EMA1000 Length", minval = 1, group = grpEMAWZ)
+emaLen4 = input.int(2000, "EMA2000 Length", minval = 1, group = grpEMAWZ)
+emaLen5 = input.int(3000, "EMA3000 Length", minval = 1, group = grpEMAWZ)
+emaSource = input.source(close, "EMA Source", group = grpEMAWZ)
+// 各EMAを反発Zoneに使うか
+useEMA1Zone = input.bool(true, "EMA200をZoneに使う",  group = grpEMAWZ)
+useEMA2Zone = input.bool(true, "EMA600をZoneに使う",  group = grpEMAWZ)
+useEMA3Zone = input.bool(true, "EMA1000をZoneに使う", group = grpEMAWZ)
+useEMA4Zone = input.bool(true, "EMA2000をZoneに使う", group = grpEMAWZ)
+useEMA5Zone = input.bool(true, "EMA3000をZoneに使う", group = grpEMAWZ)
+// 各EMAのサポレジ転換を使うか
+useEMA1SRFlip = input.bool(false, "EMA200 SR転換",  group = grpEMAWZ)
+useEMA2SRFlip = input.bool(false, "EMA600 SR転換",  group = grpEMAWZ)
+useEMA3SRFlip = input.bool(false, "EMA1000 SR転換", group = grpEMAWZ)
+useEMA4SRFlip = input.bool(false, "EMA2000 SR転換", group = grpEMAWZ)
+useEMA5SRFlip = input.bool(false, "EMA3000 SR転換", group = grpEMAWZ)
+// シグナル種別 ON/OFF
+useEMABounce     = input.bool(true, "反発シグナルを使う",       group = grpEMAWZ)
+useEMASRFlipSig  = input.bool(true, "SR転換シグナルを使う (MTF未対応・初期OFF)", group = grpEMAWZ)
+useEMABandRetest = input.bool(false, "帯抜けリテストを使う",     group = grpEMAWZ)
+useEMAInsideNoTrade = input.bool(false, "ON EMA帯の中はNoTrade", group = grpEMAWZ)
+// 接近幅
+emaTouchMode   = input.string("ATR", "EMA接近判定", options = ["Dollar", "ATR"], group = grpEMAWZ)
+emaTouchDollar = input.float(3.0,  "EMA接近幅($)",      step = 0.1,  group = grpEMAWZ)
+emaTouchATRMult= input.float(0.25, "EMA接近幅 ATR倍率", step = 0.05, group = grpEMAWZ)
+emaAtrLen      = input.int(14, "EMA ATR期間", minval = 1, group = grpEMAWZ)
+emaSRFlipBars     = input.int(10, "SR転換 有効本数",    minval = 1, group = grpEMAWZ)
+emaBandRetestBars = input.int(10, "帯リテスト 有効本数", minval = 1, group = grpEMAWZ)
+showEMAMTFLabels  = input.bool(false, "EMA MTFラベルを表示", group = grpEMAWZ)
+
+// --- EMA WinZone: MTF (どの時間足のEMAを反応帯として見るか) ---
+//   OFF の時間足は request.security を呼ばない。各TFで ON のEMA種類だけ判定に使う。
+grpEMATF = "EMA WinZone: MTF"
+useEMA1M  = input.bool(true,  "1分EMAを使う",   group = grpEMATF)
+useEMA5M  = input.bool(true,  "5分EMAを使う",   group = grpEMATF)
+useEMA15M = input.bool(false,  "15分EMAを使う",  group = grpEMATF)
+useEMA1H  = input.bool(false,  "1時間EMAを使う", group = grpEMATF)
+useEMA4H  = input.bool(false,  "4時間EMAを使う", group = grpEMATF)
+tfEMA1M  = input.timeframe("1",   "1分TF",   group = grpEMATF)
+tfEMA5M  = input.timeframe("5",   "5分TF",   group = grpEMATF)
+tfEMA15M = input.timeframe("15",  "15分TF",  group = grpEMATF)
+tfEMA1H  = input.timeframe("60",  "1時間TF", group = grpEMATF)
+tfEMA4H  = input.timeframe("240", "4時間TF", group = grpEMATF)
+
+// --- EMA: 状態管理 (FVG/Volume/Fib/Line と同思想) ---
+grpEMAState = "EMA: 状態管理"
+useEMAStateWindow       = input.bool(true, "EMA状態管理を使う", group = grpEMAState)
+emaStateMaxBars         = input.int(5, "EMA状態 有効本数", minval = 1, group = grpEMAState)
+resetEMAStateAfterEntry = input.bool(true, "エントリー後EMA状態をリセット", group = grpEMAState)
+
+// ============================================================
+//  4h. 入力 : 水平線 WinZone (レジサポを反応する場所として)
+// ------------------------------------------------------------
+//  水平線は Bias ではなく Zone。上だからショート等の方向制限はしない。
+//  Pivot / 複数回反応 / 前日H・L / セッションH・L を統合ゾーン化し、
+//  反発 / レジサポ転換 / ブレイク / スイープ反転 を場所条件として使う。
+//  ・useLineWZ=false の時は ta.atr/pivot・配列・前日/セッション更新・
+//    ゾーン統合・各判定・状態管理・描画 を一切走らせない。
+// ============================================================
+grpLineSrc = "水平線: 検出ソース"
+useLineModule    = input.bool(true, "水平線モジュールを使う (WinZone ON時のみ有効)", group = grpLineSrc)
+usePivotLine     = input.bool(false, "Pivot High/Low", group = grpLineSrc)
+useReactionLine  = input.bool(false, "複数回反応価格帯", group = grpLineSrc)
+usePreviousDayHL = input.bool(true, "前日 高値/安値", group = grpLineSrc)
+useSessionHL     = input.bool(false, "セッション 高値/安値", group = grpLineSrc)
+
+// --- 水平線 MTF (1M/5M/15M/1H/4H の Pivot水平線を反応帯として) ---
+//   OFFの時間足は request.security を呼ばない。前日/セッションH・Lはチャート基準。
+grpLineTF = "水平線: MTF"
+useLine1M  = input.bool(false,  "1分水平線を使う",   group = grpLineTF)
+useLine5M  = input.bool(true,  "5分水平線を使う",   group = grpLineTF)
+useLine15M = input.bool(true,  "15分水平線を使う",  group = grpLineTF)
+useLine1H  = input.bool(true,  "1時間水平線を使う", group = grpLineTF)
+useLine4H  = input.bool(true,  "4時間水平線を使う", group = grpLineTF)
+tfLine1M  = input.timeframe("1",   "1分TF",   group = grpLineTF)
+tfLine5M  = input.timeframe("5",   "5分TF",   group = grpLineTF)
+tfLine15M = input.timeframe("15",  "15分TF",  group = grpLineTF)
+tfLine1H  = input.timeframe("60",  "1時間TF", group = grpLineTF)
+tfLine4H  = input.timeframe("240", "4時間TF", group = grpLineTF)
+
+grpLinePat = "水平線: パターン"
+useLineBounce = input.bool(true, "反発", group = grpLinePat)
+useLineFlip   = input.bool(false, "レジサポ転換", group = grpLinePat)
+useLineBreak  = input.bool(false, "ブレイク", group = grpLinePat)
+useLineSweep  = input.bool(false, "スイープ反転", group = grpLinePat)
+
+grpLineParam = "水平線: パラメータ"
+lineAtrLen   = input.int(14, "ATR期間", minval = 1, group = grpLineParam)
+lineMaxZones = input.int(20, "水平線 最大保持数", minval = 1, group = grpLineParam)
+linePivotLen = input.int(10, "Pivot Length", minval = 1, group = grpLineParam)
+reactionLookback     = input.int(300, "反応 参照本数", minval = 1, group = grpLineParam)
+reactionToleranceATR = input.float(0.3, "反応 許容幅 ATR倍率", step = 0.05, group = grpLineParam)
+reactionMinTouches   = input.int(2, "反応 最小タッチ数", minval = 2, group = grpLineParam)
+lineFlipLookback     = input.int(30, "転換 参照本数", minval = 1, group = grpLineParam)
+lineFlipConfirmBars  = input.int(2,  "転換 確定本数", minval = 0, group = grpLineParam)
+useLineBreakBodyFilter = input.bool(true, "ブレイク 実体フィルター", group = grpLineParam)
+lineBreakBodyRatio     = input.float(0.5, "ブレイク 実体率最小", minval = 0.0, maxval = 1.0, step = 0.05, group = grpLineParam)
+lineSweepToleranceATR  = input.float(0.2, "スイープ 最小貫通 ATR倍率", minval = 0.0, step = 0.05, group = grpLineParam)
+
+grpLineFilt = "水平線: 共通フィルター"
+useLineDirCandleFilter = input.bool(true,  "方向ローソク", group = grpLineFilt)
+useLineWickFilter      = input.bool(false, "ヒゲ確認",     group = grpLineFilt)
+useLineBodyFilter      = input.bool(false, "実体率",       group = grpLineFilt)
+useLineATRFilter       = input.bool(false, "ATR(値幅)",    group = grpLineFilt)
+lineBodyRatioMin       = input.float(0.3, "実体率 最小", minval = 0.0, maxval = 1.0, step = 0.05, group = grpLineFilt)
+lineAtrMinMult         = input.float(0.5, "最小値幅 ATR倍率", minval = 0.0, step = 0.05, group = grpLineFilt)
+
+grpLineZone = "水平線: ゾーン"
+useLineATRZone     = input.bool(true, "ゾーン幅をATR連動にする", group = grpLineZone)
+lineZoneATRMult    = input.float(0.25, "ゾーン幅 ATR倍率", step = 0.05, group = grpLineZone)
+lineZoneFixedWidth = input.float(0.0, "ゾーン幅 固定", step = 0.1, group = grpLineZone)
+useLineMergeZone   = input.bool(true, "近い水平線をゾーン統合する", group = grpLineZone)
+lineMergeToleranceATR = input.float(0.2, "統合許容幅 ATR倍率", step = 0.05, group = grpLineZone)
+
+grpLineSess = "水平線: セッション"
+lineSessTZ     = input.string("GMT", "セッション タイムゾーン", group = grpLineSess)
+lineAsiaSess   = input.session("0000-0800", "Asia",   group = grpLineSess)
+lineLondonSess = input.session("0700-1600", "London", group = grpLineSess)
+lineNySess     = input.session("1200-2100", "New York", group = grpLineSess)
+
+grpLineObs = "水平線: 障害物"
+useLineObstacleFilter = input.bool(false, "水平線障害物フィルターを使う", group = grpLineObs)
+lineObstacleATR       = input.float(0.5, "障害物 近接 ATR倍率", step = 0.05, group = grpLineObs)
+
+grpLineState = "水平線: 状態管理"
+useLineStateWindow       = input.bool(true, "水平線状態管理を使う", group = grpLineState)
+lineStateMaxBars         = input.int(3, "水平線状態 有効本数", minval = 1, group = grpLineState)
+resetLineStateAfterEntry = input.bool(true, "エントリー後水平線状態をリセット", group = grpLineState)
+
+grpLineDisp = "水平線: 表示"
+showLineZones  = input.bool(true, "水平線/ゾーンを表示", group = grpLineDisp)
+showLineLabels = input.bool(true, "シグナルラベルを表示", group = grpLineDisp)
+
+// ============================================================
+//  5. 包み足判定
+// ============================================================
+bool prevUp = close[1] > open[1]
+bool prevDn = close[1] < open[1]
+bool curUp  = close > open
+bool curDn  = close < open
+
+float curBodyHi  = math.max(open,    close)
+float curBodyLo  = math.min(open,    close)
+float prevBodyHi = math.max(open[1], close[1])
+float prevBodyLo = math.min(open[1], close[1])
+
+bool engulfBody = curBodyHi >= prevBodyHi and curBodyLo <= prevBodyLo
+
+bool bullEngulf = curUp and (not reqOppColor or prevDn) and (strictEngulf ? engulfBody : close >= prevBodyHi)
+bool bearEngulf = curDn and (not reqOppColor or prevUp) and (strictEngulf ? engulfBody : close <= prevBodyLo)
+
+// ============================================================
+//  5b. FVG 場所検知 (フィルター用)
+// ------------------------------------------------------------
+//  FVG はエントリートリガーではなく「場所条件」として使う。
+//  useFVGFilter を使う時、または box 表示時のみ配列・ループを動かす。
+// ============================================================
+// WinZone 階層でFVG/出来高を使うかどうか (対象外の側は計算を走らせない = 軽量)
+bool useFVGWZ  = useWinZoneModule and useFVGWinZone    and (winZoneMode == "FVG_ONLY"    or winZoneMode == "OR" or winZoneMode == "AND")
+bool useVolume = useWinZoneModule and useVolumeWinZone and (winZoneMode == "VOLUME_ONLY" or winZoneMode == "OR" or winZoneMode == "AND")
+bool useFibWZ  = useWinZoneModule and useFibWinZone    and (winZoneMode == "FIB_ONLY"    or winZoneMode == "OR" or winZoneMode == "AND")
+// 水平線 WinZone : マスター かつ 水平線ON かつ モジュールON かつ モード対象。OFFなら全処理を走らせない。
+bool useLineWZ = useWinZoneModule and useLineModule and useLineWinZone and (winZoneMode == "LINE_ONLY" or winZoneMode == "OR" or winZoneMode == "AND")
+// EMA WinZone : マスター かつ EMA ON かつ モジュール ON かつ モード対象。OFFなら EMA計算・ATR・cross・状態管理・描画 を一切走らせない。
+bool useEMAWZ = useWinZoneModule and useEMAWinZone and useEMAModule and (winZoneMode == "EMA_ONLY" or winZoneMode == "OR" or winZoneMode == "AND")
+// FVG 計算は WinZoneでFVGを使う時、または box 表示時のみ動かす
+bool useFVG = useFVGWZ or showFVGBoxes
+
+// --- FVGヘルパー ---
+f_fvgThick(float width, float atrVal) =>
+    not useFVGThicknessFilter or width >= atrVal * fvgMinThicknessATR
+
+f_nearestAbove(array<float> botArr, array<bool> deadArr, float price) =>
+    float best = na
+    if array.size(botArr) > 0
+        for i = 0 to array.size(botArr) - 1
+            if not array.get(deadArr, i)
+                float b = array.get(botArr, i)
+                if b > price
+                    best := na(best) ? (b - price) : math.min(best, b - price)
+    best
+
+f_nearestBelow(array<float> topArr, array<bool> deadArr, float price) =>
+    float best = na
+    if array.size(topArr) > 0
+        for i = 0 to array.size(topArr) - 1
+            if not array.get(deadArr, i)
+                float t = array.get(topArr, i)
+                if t < price
+                    best := na(best) ? (price - t) : math.min(best, price - t)
+    best
+
+f_fvgTrim(array<float> topA, array<float> botA, array<int> barA, array<bool> rebA, array<bool> absA, array<bool> deadA, array<box> boxA, array<bool> waitA, array<bool> entryA, array<int> absBarA) =>
+    while array.size(topA) > maxFVGPerSide
+        box b = array.shift(boxA)
+        if not na(b)
+            box.delete(b)
+        array.shift(topA)
+        array.shift(botA)
+        array.shift(barA)
+        array.shift(rebA)
+        array.shift(absA)
+        array.shift(deadA)
+        array.shift(waitA)
+        array.shift(entryA)
+        array.shift(absBarA)
+
+// --- FVG 保存配列 ---
+var array<float> bullTopArr = array.new_float()
+var array<float> bullBotArr = array.new_float()
+var array<int>   bullBarArr = array.new_int()
+var array<bool>  bullRebUsed = array.new_bool()
+var array<bool>  bullAbsUsed = array.new_bool()
+var array<bool>  bullDeadArr = array.new_bool()
+var array<box>   bullBoxArr  = array.new_box()
+var array<bool>  bullAbsWaiting   = array.new_bool()   // 吸収済み・包み足待機中
+var array<bool>  bullAbsEntryUsed = array.new_bool()   // 吸収後の包み足エントリー使用済み
+var array<int>   bullAbsBar       = array.new_int()    // 吸収成立バー
+
+var array<float> bearTopArr = array.new_float()
+var array<float> bearBotArr = array.new_float()
+var array<int>   bearBarArr = array.new_int()
+var array<bool>  bearRebUsed = array.new_bool()
+var array<bool>  bearAbsUsed = array.new_bool()
+var array<bool>  bearDeadArr = array.new_bool()
+var array<box>   bearBoxArr  = array.new_box()
+var array<bool>  bearAbsWaiting   = array.new_bool()
+var array<bool>  bearAbsEntryUsed = array.new_bool()
+var array<int>   bearAbsBar       = array.new_int()
+
+// FVG シグナル (種類別)
+bool fvgReboundBuy  = false
+bool fvgReboundSell = false
+bool fvgAbsorbBuy   = false
+bool fvgAbsorbSell  = false
+bool ifvgBuy        = false
+bool ifvgSell       = false
+
+// 吸収待機中フラグ (デバッグ用)
+bool bullAbsWaitingNow = false
+bool bearAbsWaitingNow = false
+
+if useFVG
+    float fvgAtr = ta.atr(fvgAtrLen)
+    float rng    = high - low
+    float bodyF  = math.abs(close - open)
+    float clPos  = rng > 0 ? (close - low) / rng : 0.5
+    bool confBar = not useFVGConfirmBar or barstate.isconfirmed
+
+    // ---- Bullish FVG 処理 (反発BUY / 吸収SELL / iFVG SELL) ----
+    if useBullishFVG and array.size(bullTopArr) > 0
+        for i = 0 to array.size(bullTopArr) - 1
+            float top = array.get(bullTopArr, i)
+            float bot = array.get(bullBotArr, i)
+            int  bbar = array.get(bullBarArr, i)
+            bool rUsed = array.get(bullRebUsed, i)
+            bool aUsed = array.get(bullAbsUsed, i)
+            bool dead  = array.get(bullDeadArr, i)
+            float width = top - bot
+            int age = bar_index - bbar
+            // 古すぎる FVG を dead 化 (既存)
+            if useFVGAgeFilter and not dead and age > fvgMaxAge
+                dead := true
+                array.set(bullDeadArr, i, true)
+            // シグナルを出してよい年齢範囲か
+            bool ageWindowOk = not useFVGActiveWindow or (age >= fvgActiveMinAge and age <= fvgActiveMaxAge)
+            // 1. 反発/吸収/iFVG 判定 (有効期間内のみ)
+            if not dead and confBar and ageWindowOk
+                // 反発 BUY (サポート) : 回復位置 close >= bot + width*reboundRecoverRatio。反発は1回まで。
+                if useFVGReboundFilter and not rUsed
+                    float depth = (low < bot and width > 0) ? (bot - low) / width : 0.0
+                    if low <= top and depth <= reboundDepthMax and close >= bot + width * reboundRecoverRatio and close > open
+                        bool blocked = false
+                        if useOppositeFVGFilter
+                            float d = f_nearestAbove(bearBotArr, bearDeadArr, close)
+                            blocked := not na(d) and d <= fvgAtr * oppositeFVGNearATR
+                        if not blocked
+                            fvgReboundBuy := true
+                            array.set(bullRebUsed, i, true)
+                // 吸収 SELL (下抜け) 成立 : シグナルは出さず「待機状態」にする。吸収は1回まで。
+                if useFVGAbsorptionFilter and not aUsed
+                    float absorbSellLevel = bot - (useAbsorbCloseBuffer ? fvgAtr * absorbCloseBufferATR : 0.0)
+                    bool absorbSellCloseOk = close < absorbSellLevel
+                    bool absorbSellConfirmOk = true
+                    if useAbsorbConfirmBars
+                        for j = 0 to absorbConfirmBars - 1
+                            absorbSellConfirmOk := absorbSellConfirmOk and close[j] < absorbSellLevel
+                    if absorbSellCloseOk and absorbSellConfirmOk and rng > 0 and (bodyF / rng) >= absorbBodyMinRatio and clPos <= absorbCloseEdgeRatio
+                        array.set(bullAbsUsed, i, true)
+                        array.set(bullAbsWaiting, i, true)
+                        array.set(bullAbsBar, i, bar_index)
+                // iFVG SELL (吸収済みをレジスタンス)
+                if useIFVGFilter and not dead and array.get(bullAbsUsed, i)
+                    if high >= bot and close < open and close <= top
+                        ifvgSell := true
+                        array.set(bullDeadArr, i, true)
+            // 1b. 吸収待機中 → 最初の包み足(bearEngulf)でSELLシグナル。期限切れは待機解除。
+            if useFVGAbsorptionFilter and not dead and confBar and array.get(bullAbsWaiting, i) and not array.get(bullAbsEntryUsed, i)
+                int absBar = array.get(bullAbsBar, i)
+                bool absorbWindowOk = not useAbsorbEntryWindow or (not na(absBar) and bar_index - absBar <= absorbEntryMaxBars)
+                if not absorbWindowOk
+                    array.set(bullAbsWaiting, i, false)
+                else if bearEngulf and close <= top and bar_index - absBar >= 1
+                    fvgAbsorbSell := true
+                    array.set(bullAbsEntryUsed, i, true)
+                    array.set(bullAbsWaiting, i, false)
+            if array.get(bullAbsWaiting, i)
+                bullAbsWaitingNow := true
+            // 2. 完全埋め (終値基準 close <= bot) なら dead 化。
+            //    ヒゲで埋めても終値で埋めるまでは生存。吸収済み(iFVG候補/待機中)は残す。
+            if not array.get(bullDeadArr, i) and not array.get(bullAbsUsed, i) and close <= bot
+                array.set(bullDeadArr, i, true)
+
+    // ---- Bearish FVG 処理 (反発SELL / 吸収BUY / iFVG BUY) ----
+    if useBearishFVG and array.size(bearTopArr) > 0
+        for i = 0 to array.size(bearTopArr) - 1
+            float top = array.get(bearTopArr, i)
+            float bot = array.get(bearBotArr, i)
+            int  bbar = array.get(bearBarArr, i)
+            bool rUsed = array.get(bearRebUsed, i)
+            bool aUsed = array.get(bearAbsUsed, i)
+            bool dead  = array.get(bearDeadArr, i)
+            float width = top - bot
+            int age = bar_index - bbar
+            // 古すぎる FVG を dead 化 (既存)
+            if useFVGAgeFilter and not dead and age > fvgMaxAge
+                dead := true
+                array.set(bearDeadArr, i, true)
+            // シグナルを出してよい年齢範囲か
+            bool ageWindowOk = not useFVGActiveWindow or (age >= fvgActiveMinAge and age <= fvgActiveMaxAge)
+            // 1. 反発/吸収/iFVG 判定 (有効期間内のみ)
+            if not dead and confBar and ageWindowOk
+                // 反発 SELL (レジスタンス) : 回復位置 close <= top - width*reboundRecoverRatio。反発は1回まで。
+                if useFVGReboundFilter and not rUsed
+                    float depth = (high > top and width > 0) ? (high - top) / width : 0.0
+                    if high >= bot and depth <= reboundDepthMax and close <= top - width * reboundRecoverRatio and close < open
+                        bool blocked = false
+                        if useOppositeFVGFilter
+                            float d = f_nearestBelow(bullTopArr, bullDeadArr, close)
+                            blocked := not na(d) and d <= fvgAtr * oppositeFVGNearATR
+                        if not blocked
+                            fvgReboundSell := true
+                            array.set(bearRebUsed, i, true)
+                // 吸収 BUY (上抜け) 成立 : シグナルは出さず「待機状態」にする。吸収は1回まで。
+                if useFVGAbsorptionFilter and not aUsed
+                    float absorbBuyLevel = top + (useAbsorbCloseBuffer ? fvgAtr * absorbCloseBufferATR : 0.0)
+                    bool absorbBuyCloseOk = close > absorbBuyLevel
+                    bool absorbBuyConfirmOk = true
+                    if useAbsorbConfirmBars
+                        for j = 0 to absorbConfirmBars - 1
+                            absorbBuyConfirmOk := absorbBuyConfirmOk and close[j] > absorbBuyLevel
+                    if absorbBuyCloseOk and absorbBuyConfirmOk and rng > 0 and (bodyF / rng) >= absorbBodyMinRatio and clPos >= (1.0 - absorbCloseEdgeRatio)
+                        array.set(bearAbsUsed, i, true)
+                        array.set(bearAbsWaiting, i, true)
+                        array.set(bearAbsBar, i, bar_index)
+                // iFVG BUY (吸収済みをサポート)
+                if useIFVGFilter and not dead and array.get(bearAbsUsed, i)
+                    if low <= top and close > open and close >= bot
+                        ifvgBuy := true
+                        array.set(bearDeadArr, i, true)
+            // 1b. 吸収待機中 → 最初の包み足(bullEngulf)でBUYシグナル。期限切れは待機解除。
+            if useFVGAbsorptionFilter and not dead and confBar and array.get(bearAbsWaiting, i) and not array.get(bearAbsEntryUsed, i)
+                int absBar = array.get(bearAbsBar, i)
+                bool absorbWindowOk = not useAbsorbEntryWindow or (not na(absBar) and bar_index - absBar <= absorbEntryMaxBars)
+                if not absorbWindowOk
+                    array.set(bearAbsWaiting, i, false)
+                else if bullEngulf and close >= bot and bar_index - absBar >= 1
+                    fvgAbsorbBuy := true
+                    array.set(bearAbsEntryUsed, i, true)
+                    array.set(bearAbsWaiting, i, false)
+            if array.get(bearAbsWaiting, i)
+                bearAbsWaitingNow := true
+            // 2. 完全埋め (終値基準 close >= top) なら dead 化。
+            //    ヒゲで埋めても終値で埋めるまでは生存。吸収済み(iFVG候補/待機中)は残す。
+            if not array.get(bearDeadArr, i) and not array.get(bearAbsUsed, i) and close >= top
+                array.set(bearDeadArr, i, true)
+
+    // ---- 新規 FVG 検出・保存 (判定後 → 生成足では発火しない) ----
+    if useBullishFVG and low > high[2]
+        float bTop = low
+        float bBot = high[2]
+        float w = bTop - bBot
+        if w > 0 and f_fvgThick(w, fvgAtr)
+            box bx = showFVGBoxes ? box.new(bar_index - 2, bTop, bar_index, bBot, border_color = color.new(color.teal, 50), bgcolor = color.new(color.teal, 80)) : na
+            array.push(bullTopArr, bTop)
+            array.push(bullBotArr, bBot)
+            array.push(bullBarArr, bar_index)
+            array.push(bullRebUsed, false)
+            array.push(bullAbsUsed, false)
+            array.push(bullDeadArr, false)
+            array.push(bullBoxArr, bx)
+            array.push(bullAbsWaiting, false)
+            array.push(bullAbsEntryUsed, false)
+            array.push(bullAbsBar, na)
+            f_fvgTrim(bullTopArr, bullBotArr, bullBarArr, bullRebUsed, bullAbsUsed, bullDeadArr, bullBoxArr, bullAbsWaiting, bullAbsEntryUsed, bullAbsBar)
+    if useBearishFVG and high < low[2]
+        float sTop = low[2]
+        float sBot = high
+        float w = sTop - sBot
+        if w > 0 and f_fvgThick(w, fvgAtr)
+            box bx = showFVGBoxes ? box.new(bar_index - 2, sTop, bar_index, sBot, border_color = color.new(color.red, 50), bgcolor = color.new(color.red, 80)) : na
+            array.push(bearTopArr, sTop)
+            array.push(bearBotArr, sBot)
+            array.push(bearBarArr, bar_index)
+            array.push(bearRebUsed, false)
+            array.push(bearAbsUsed, false)
+            array.push(bearDeadArr, false)
+            array.push(bearBoxArr, bx)
+            array.push(bearAbsWaiting, false)
+            array.push(bearAbsEntryUsed, false)
+            array.push(bearAbsBar, na)
+            f_fvgTrim(bearTopArr, bearBotArr, bearBarArr, bearRebUsed, bearAbsUsed, bearDeadArr, bearBoxArr, bearAbsWaiting, bearAbsEntryUsed, bearAbsBar)
+
+    // ---- box 右端更新 ----
+    if showFVGBoxes
+        if array.size(bullBoxArr) > 0
+            for i = 0 to array.size(bullBoxArr) - 1
+                box bx = array.get(bullBoxArr, i)
+                if not na(bx)
+                    box.set_right(bx, bar_index)
+        if array.size(bearBoxArr) > 0
+            for i = 0 to array.size(bearBoxArr) - 1
+                box bx = array.get(bearBoxArr, i)
+                if not na(bx)
+                    box.set_right(bx, bar_index)
+
+// --- 集約 (互換用) ---
+bool fvgBuy  = fvgReboundBuy  or fvgAbsorbBuy  or ifvgBuy
+bool fvgSell = fvgReboundSell or fvgAbsorbSell or ifvgSell
+
+// --- FVGイベントOK (そのバー限定) : 状態管理 OFF 時の従来判定に使う ---
+bool longFVGEventOk =
+     (useFVGReboundFilter    and fvgReboundBuy) or
+     (useFVGAbsorptionFilter and fvgAbsorbBuy) or
+     (useIFVGFilter          and ifvgBuy)
+
+bool shortFVGEventOk =
+     (useFVGReboundFilter    and fvgReboundSell) or
+     (useFVGAbsorptionFilter and fvgAbsorbSell) or
+     (useIFVGFilter          and ifvgSell)
+
+// --- FVG状態管理 : イベント発生後、一定本数だけ「FVG条件OK」を保持 ---
+//   反発・吸収・iFVG のいずれかが出たら状態ONにし、fvgStateMaxBars 本まで維持。
+//   その期間内に包み足が出ればエントリー可能になる (シグナルの単バー限定を緩和)。
+//   ※ 状態のセット/リセットのみ。FVG検出・反発・吸収・iFVG判定自体は不変。
+var bool   longFVGStateOk    = false
+var bool   shortFVGStateOk   = false
+var int    longFVGStateBar   = na
+var int    shortFVGStateBar  = na
+var string longFVGStateType  = ""
+var string shortFVGStateType = ""
+
+if useFVGStateWindow
+    // 1. イベント発生 → 状態ON
+    if longFVGEventOk
+        longFVGStateOk   := true
+        longFVGStateBar  := bar_index
+        longFVGStateType := fvgReboundBuy ? "rebound" : fvgAbsorbBuy ? "absorb" : "ifvg"
+    if shortFVGEventOk
+        shortFVGStateOk   := true
+        shortFVGStateBar  := bar_index
+        shortFVGStateType := fvgReboundSell ? "rebound" : fvgAbsorbSell ? "absorb" : "ifvg"
+    // 2. 有効期限切れ → 状態OFF
+    if longFVGStateOk and not na(longFVGStateBar) and (bar_index - longFVGStateBar > fvgStateMaxBars)
+        longFVGStateOk := false
+    if shortFVGStateOk and not na(shortFVGStateBar) and (bar_index - shortFVGStateBar > fvgStateMaxBars)
+        shortFVGStateOk := false
+
+// --- FVG 場所フィルター条件 ---
+//   useFVGFilter = false                          … 常に許可
+//   useFVGFilter = true  かつ useFVGStateWindow=false … 従来のイベント単バー判定
+//   useFVGFilter = true  かつ useFVGStateWindow=true  … 状態管理フラグを使う
+bool longFVGOk =
+     not useFVGFilter or
+     (useFVGStateWindow ? longFVGStateOk : longFVGEventOk)
+
+bool shortFVGOk =
+     not useFVGFilter or
+     (useFVGStateWindow ? shortFVGStateOk : shortFVGEventOk)
+
+// ============================================================
+//  5b-2. 出来高 / VPVR / POC モジュール (WinZone 場所条件)
+// ------------------------------------------------------------
+//  FVG と同じ「場所条件」階層。useVolume=false の時は f_poc / 配列 /
+//  ループ / ta系 / シグナル判定 を一切走らせない (軽量)。
+//  パターン: A:POC定着 / B:POCリジェクト / C:出来高ブレイク / D:クライマックス反転
+//  出力: longVolumeOk / shortVolumeOk (OFF時は false 固定)
+// ============================================================
+
+// 疑似 VPVR → POC 算出 (関数。呼ばれない時は実行されない = 軽量)
+f_poc(lookback, bins) =>
+    float hi = ta.highest(high, lookback)
+    float lo = ta.lowest(low, lookback)
+    float rangeAll = hi - lo
+    float poc = close
+    if rangeAll > 0 and bins > 0 and bar_index >= lookback
+        array<float> bv = array.new_float(bins, 0.0)
+        float bs = rangeAll / bins
+        for k = 0 to lookback - 1
+            float ch = high[k]
+            float cl = low[k]
+            float cv = volume[k]
+            if not na(ch) and not na(cl) and not na(cv)
+                float crange = ch - cl
+                if crange <= 0
+                    int bidx = math.max(0, math.min(bins - 1, int((cl - lo) / bs)))
+                    array.set(bv, bidx, array.get(bv, bidx) + cv)
+                else
+                    for bi = 0 to bins - 1
+                        float binBot = lo + bi * bs
+                        float binTop = binBot + bs
+                        float ov = math.min(binTop, ch) - math.max(binBot, cl)
+                        if ov > 0
+                            array.set(bv, bi, array.get(bv, bi) + cv * ov / crange)
+        float best = -1.0
+        int   bestI = 0
+        for bi = 0 to bins - 1
+            float v = array.get(bv, bi)
+            if v > best
+                best := v
+                bestI := bi
+        poc := lo + (bestI + 0.5) * bs
+    poc
+
+// 出力 (OFF時は false / na 固定)
+bool  longVolumeOk  = false
+bool  shortVolumeOk = false
+float vPocPrice   = na
+float vPocUpper   = na
+float vPocLower   = na
+int   volumeSignalType = 0
+int   volumeDirection  = 0
+
+if useVolume
+    float v_atr     = ta.atr(volAtrLen)
+    float v_rng     = high - low
+    float v_body    = math.abs(close - open)
+    float v_upWick  = high - math.max(close, open)
+    float v_dnWick  = math.min(close, open) - low
+    float v_clPos   = v_rng > 0 ? (close - low) / v_rng : 0.5
+    float v_bodyRatio = v_rng > 0 ? v_body / v_rng : 0.0
+    float v_volSMA  = ta.sma(volume, volumeSmaLen)
+    float poc = f_poc(vpLookback, vpBins)
+    float pw  = useVolAdaptivePOCWidth ? v_atr * pocZoneATRMult : pocZoneWidth
+    float pUp = poc + pw
+    float pLo = poc - pw
+    bool  pocActive = not na(poc) and (pUp > pLo)
+    float pocFull   = pUp - pLo
+
+    // 共通フィルター
+    bool liqOK = not useLowVolumeFilter or (not na(v_volSMA) and volume >= v_volSMA * lowVolumeMult)
+    bool smaOK = not useVolumeSMAFilter or (not na(v_volSMA) and volume > v_volSMA)
+    bool bOK   = not useBodyFilter or v_bodyRatio >= bodyRatioMin
+    bool fOK   = liqOK and smaOK and bOK
+
+    // A: POC アクセプタンス
+    bool cameBelow = ta.lowest(close, crossLookback) <= pLo
+    bool cameAbove = ta.highest(close, crossLookback) >= pUp
+    bool accBuyConf  = (not useDirCandleForAcceptance or close > open) and (not useVolumeConfirmForAcceptance or (not na(v_volSMA) and volume > v_volSMA))
+    bool accSellConf = (not useDirCandleForAcceptance or close < open) and (not useVolumeConfirmForAcceptance or (not na(v_volSMA) and volume > v_volSMA))
+    var int abovePocCnt = 0
+    var int belowPocCnt = 0
+    abovePocCnt := close > pUp ? abovePocCnt + 1 : 0
+    belowPocCnt := close < pLo ? belowPocCnt + 1 : 0
+    bool accBuyCore  = pocActive and cameBelow and abovePocCnt >= acceptBars and accBuyConf
+    bool accSellCore = pocActive and cameAbove and belowPocCnt >= acceptBars and accSellConf
+    bool accBuyEvt   = accBuyCore  and not accBuyCore[1]
+    bool accSellEvt  = accSellCore and not accSellCore[1]
+    bool _accB = fOK and usePOCAcceptance and accBuyEvt
+    bool _accS = fOK and usePOCAcceptance and accSellEvt
+    bool buyAccept  = _accB and (not useFirstSignalOnly or not _accB[1])
+    bool sellAccept = _accS and (not useFirstSignalOnly or not _accS[1])
+
+    // B: POC リジェクト (押し目/戻り)
+    bool trendL = not useTrendFilter or allowTrendLong
+    bool trendS = not useTrendFilter or allowTrendShort
+    bool rjTouchBuy = low <= pUp
+    float rjDepthBuy = (low < pLo and pocFull > 0) ? (pLo - low) / pocFull : 0.0
+    bool rjConfBuy = (not usePOCRejectCandleConfirm or close > open) and (not usePOCRejectWickConfirm or v_dnWick >= v_body) and (not usePOCRejectCloseEdgeConfirm or v_clPos >= 0.5)
+    bool rejBuyCore = pocActive and rjTouchBuy and rjDepthBuy <= pocRejectDepthMax and close > pLo and rjConfBuy
+    bool rjTouchSell = high >= pLo
+    float rjDepthSell = (high > pUp and pocFull > 0) ? (high - pUp) / pocFull : 0.0
+    bool rjConfSell = (not usePOCRejectCandleConfirm or close < open) and (not usePOCRejectWickConfirm or v_upWick >= v_body) and (not usePOCRejectCloseEdgeConfirm or v_clPos <= 0.5)
+    bool rejSellCore = pocActive and rjTouchSell and rjDepthSell <= pocRejectDepthMax and close < pUp and rjConfSell
+    bool _rejB = fOK and usePOCReject and trendL and rejBuyCore
+    bool _rejS = fOK and usePOCReject and trendS and rejSellCore
+    bool buyReject  = _rejB and (not useFirstSignalOnly or not _rejB[1])
+    bool sellReject = _rejS and (not useFirstSignalOnly or not _rejS[1])
+
+    // C: 出来高急増ブレイク (+圧縮→爆発)
+    float rHigh = ta.highest(high, breakoutLookback)[1]
+    float rLow  = ta.lowest(low,  breakoutLookback)[1]
+    bool  volSpike  = not na(v_volSMA) and volume > v_volSMA * volumeSpikeMult
+    bool  atrExpand = v_atr > nz(v_atr[breakoutLookback]) * atrExpansionMult
+    bool  compressed = (ta.highest(high, compressionLookback) - ta.lowest(low, compressionLookback)) <= v_atr * compressionATRMult
+    bool brkBuyCore  = not na(rHigh) and close > rHigh and volSpike and v_bodyRatio >= breakoutBodyRatioMin and (not useATRExpansionFilter or atrExpand) and (not useCompressionFilter or compressed[1])
+    bool brkSellCore = not na(rLow)  and close < rLow  and volSpike and v_bodyRatio >= breakoutBodyRatioMin and (not useATRExpansionFilter or atrExpand) and (not useCompressionFilter or compressed[1])
+    bool _brkB = fOK and useVolumeBreakout and brkBuyCore
+    bool _brkS = fOK and useVolumeBreakout and brkSellCore
+    bool buyBreak  = _brkB and (not useFirstSignalOnly or not _brkB[1])
+    bool sellBreak = _brkS and (not useFirstSignalOnly or not _brkS[1])
+
+    // D: クライマックス反転
+    bool climaxVol = not na(v_volSMA) and volume > v_volSMA * climaxVolumeMult
+    bool newLow  = low  <= ta.lowest(low,  climaxLookback)
+    bool newHigh = high >= ta.highest(high, climaxLookback)
+    bool climaxBuyCore  = climaxVol and v_rng > 0 and v_dnWick >= v_rng * climaxWickRatio and newLow  and v_clPos >= (1.0 - climaxCloseEdgeRatio)
+    bool climaxSellCore = climaxVol and v_rng > 0 and v_upWick >= v_rng * climaxWickRatio and newHigh and v_clPos <= climaxCloseEdgeRatio
+    bool _clmB = fOK and useClimaxReversal and climaxBuyCore
+    bool _clmS = fOK and useClimaxReversal and climaxSellCore
+    bool buyClimax  = _clmB and (not useFirstSignalOnly or not _clmB[1])
+    bool sellClimax = _clmS and (not useFirstSignalOnly or not _clmS[1])
+
+    // 統合 (優先: Climax(4) > Acceptance(1) > Breakout(3) > Reject(2))
+    int vType = (buyClimax or sellClimax) ? 4 : (buyAccept or sellAccept) ? 1 : (buyBreak or sellBreak) ? 3 : (buyReject or sellReject) ? 2 : 0
+    int vDir = vType == 4 ? (buyClimax ? 1 : -1) : vType == 1 ? (buyAccept ? 1 : -1) : vType == 3 ? (buyBreak ? 1 : -1) : vType == 2 ? (buyReject ? 1 : -1) : 0
+    bool vSig = vType != 0
+
+    longVolumeOk  := vSig and vDir == 1
+    shortVolumeOk := vSig and vDir == -1
+    vPocPrice := poc
+    vPocUpper := pUp
+    vPocLower := pLo
+    volumeSignalType := vType
+    volumeDirection  := vDir
+
+// --- 出来高 状態管理 : イベント発生後 volumeStateMaxBars 本だけ場所条件OKを保持 ---
+//   FVG状態管理と同思想。longVolumeOk/shortVolumeOk は「イベント発生バー」として残し、
+//   状態フラグで一定本数保持する。出来高イベント判定ロジック自体は不変。
+var bool longVolumeStateOk   = false
+var bool shortVolumeStateOk  = false
+var int  longVolumeStateBar  = na
+var int  shortVolumeStateBar = na
+var int  longVolumeStateType  = 0
+var int  shortVolumeStateType = 0
+
+if useVolumeStateWindow
+    if longVolumeOk
+        longVolumeStateOk   := true
+        longVolumeStateBar  := bar_index
+        longVolumeStateType := volumeSignalType
+    if shortVolumeOk
+        shortVolumeStateOk   := true
+        shortVolumeStateBar  := bar_index
+        shortVolumeStateType := volumeSignalType
+    if longVolumeStateOk and not na(longVolumeStateBar) and bar_index - longVolumeStateBar > volumeStateMaxBars
+        longVolumeStateOk := false
+    if shortVolumeStateOk and not na(shortVolumeStateBar) and bar_index - shortVolumeStateBar > volumeStateMaxBars
+        shortVolumeStateOk := false
+
+// 出来高 場所条件 (状態管理ON=状態フラグ / OFF=イベント単バー / 出来高未使用=false)
+bool longVolumeZoneOk =
+     not useVolume ? false :
+     useVolumeStateWindow ? longVolumeStateOk : longVolumeOk
+bool shortVolumeZoneOk =
+     not useVolume ? false :
+     useVolumeStateWindow ? shortVolumeStateOk : shortVolumeOk
+
+// ============================================================
+//  5b-2b. フィボ WinZone モジュール (戻り売り/押し目買い・場所条件)
+// ------------------------------------------------------------
+//  FVG/出来高と同じ場所条件階層。useFibWZ=false の時は ta.pivot/atr/ema・
+//  波計算・ランク・ゾーン・反転確認を一切走らせない (軽量)。
+//  出力: fibBuySignal / fibSellSignal → longFibOk / shortFibOk
+//        状態管理後 → longFibZoneOk / shortFibZoneOk
+// ============================================================
+
+// ランク判定関数 (pure。呼ばれない時は実行されない)
+f_fibRank(float pct) =>
+    int r = 0
+    if not na(pct)
+        if useRankA and pct >= fibAStart and pct <= fibAEnd
+            r := 3
+        else if useRankB and pct >= fibBStart and pct < fibBEnd
+            r := 2
+        else if useRankC and pct >= fibCStart and pct < fibCEnd
+            r := 1
+    r
+
+// 出力 (if外で初期化)
+bool fibBuySignal  = false
+bool fibSellSignal = false
+bool fibBuyZone    = false
+bool fibSellZone   = false
+int  fibDirection  = 0
+int  fibRank       = 0
+
+if useFibWZ
+    float _atr   = ta.atr(fibAtrLen)
+    float _ema20 = ta.ema(close, fibEma20Len)
+    float _ph = ta.pivothigh(high, swingLookback, swingLookback)
+    float _pl = ta.pivotlow(low,  swingLookback, swingLookback)
+    var float lastPH    = na
+    var int   lastPHbar = na
+    var float lastPL    = na
+    var int   lastPLbar = na
+    if not na(_ph)
+        lastPH := _ph
+        lastPHbar := bar_index - swingLookback
+    if not na(_pl)
+        lastPL := _pl
+        lastPLbar := bar_index - swingLookback
+    bool bothPivots = not na(lastPH) and not na(lastPL)
+    // 下降波(高→安=SELL用) / 上昇波(安→高=BUY用)
+    bool downWaveValid = bothPivots and (lastPHbar < lastPLbar) and ((lastPH - lastPL) >= _atr * minWaveATR) and ((bar_index - lastPHbar) <= waveLookback)
+    bool upWaveValid   = bothPivots and (lastPLbar < lastPHbar) and ((lastPH - lastPL) >= _atr * minWaveATR) and ((bar_index - lastPLbar) <= waveLookback)
+    float sSwingHigh = lastPH
+    float sSwingLow  = lastPL
+    float sRange = sSwingHigh - sSwingLow
+    float sRetracePct = downWaveValid and sRange > 0 ? math.max(0.0, math.min(1.0, (close - sSwingLow) / sRange)) : na
+    float bSwingHigh = lastPH
+    float bSwingLow  = lastPL
+    float bRange = bSwingHigh - bSwingLow
+    float bRetracePct = upWaveValid and bRange > 0 ? math.max(0.0, math.min(1.0, (bSwingHigh - close) / bRange)) : na
+    int sRank = f_fibRank(sRetracePct)
+    int bRank = f_fibRank(bRetracePct)
+    // ゾーン価格レベル
+    float sZoneLowPrice  = sSwingLow + fibCStart * sRange
+    float sZoneHighPrice = sSwingLow + fibAEnd   * sRange
+    float sDeepLimit     = sSwingLow + fibAEnd   * sRange
+    float bZoneHighPrice = bSwingHigh - fibCStart * bRange
+    float bZoneLowPrice  = bSwingHigh - fibAEnd   * bRange
+    float bDeepLimit     = bSwingHigh - fibAEnd   * bRange
+    float buf = _atr * fibZoneBufferATR
+    bool priceInSellZone = downWaveValid and sRank > 0 and (high >= sZoneLowPrice - buf) and (low <= sZoneHighPrice + buf)
+    bool priceInBuyZone  = upWaveValid   and bRank > 0 and (low <= bZoneHighPrice + buf) and (high >= bZoneLowPrice - buf)
+    // 反転確認
+    float _body     = math.abs(close - open)
+    float _bodyPrev = math.abs(close[1] - open[1])
+    float _upWick   = high - math.max(close, open)
+    float _loWick   = math.min(close, open) - low
+    bool _bearCandle   = close < open
+    bool _upPinbar     = _body > 0 and _upWick >= pinbarWickRatio * _body and _upWick > _loWick
+    bool _fibBearEngulf = close < open and close[1] > open[1] and close < open[1] and open > close[1] and _body >= engulfingBodyRatio * _bodyPrev
+    bool _breakPrevLow = low < low[1]
+    bool sellConfirm = (useCandleConfirm and _bearCandle) or (usePinbarConfirm and _upPinbar) or (useEngulfingConfirm and _fibBearEngulf) or (useEma20Confirm and close < _ema20) or (useBreakPrevConfirm and _breakPrevLow)
+    bool _bullCandle   = close > open
+    bool _dnPinbar     = _body > 0 and _loWick >= pinbarWickRatio * _body and _loWick > _upWick
+    bool _fibBullEngulf = close > open and close[1] < open[1] and close > open[1] and open < close[1] and _body >= engulfingBodyRatio * _bodyPrev
+    bool _breakPrevHigh = high > high[1]
+    bool buyConfirm = (useCandleConfirm and _bullCandle) or (usePinbarConfirm and _dnPinbar) or (useEngulfingConfirm and _fibBullEngulf) or (useEma20Confirm and close > _ema20) or (useBreakPrevConfirm and _breakPrevHigh)
+    // 無効条件
+    bool invSell = downWaveValid and ((useDeepLimitInvalid and close > sDeepLimit) or (useOriginInvalid and close > sSwingHigh) or (useEMASettleInvalid and close > _ema20 and close[1] > _ema20))
+    bool invBuy  = upWaveValid   and ((useDeepLimitInvalid and close < bDeepLimit) or (useOriginInvalid and close < bSwingLow)  or (useEMASettleInvalid and close < _ema20 and close[1] < _ema20))
+    bool confirmedOK = not requireConfirmedBar or barstate.isconfirmed
+    bool sellSetup = useFibSell and priceInSellZone and not invSell
+    bool buySetup  = useFibBuy  and priceInBuyZone  and not invBuy
+    bool _fibSellSig = sellSetup and (not useRejectConfirm or sellConfirm) and confirmedOK
+    bool _fibBuySig  = buySetup  and (not useRejectConfirm or buyConfirm)  and confirmedOK
+    // 出力へ反映
+    fibSellSignal := _fibSellSig
+    fibBuySignal  := _fibBuySig
+    fibSellZone   := sellSetup
+    fibBuyZone    := buySetup
+    fibDirection  := _fibBuySig ? 1 : _fibSellSig ? -1 : buySetup ? 1 : sellSetup ? -1 : 0
+    fibRank       := fibDirection == 1 ? bRank : fibDirection == -1 ? sRank : 0
+
+// 接続: BUYシグナル→longFibOk / SELLシグナル→shortFibOk (反転確認込み)
+bool longFibOk  = fibBuySignal
+bool shortFibOk = fibSellSignal
+
+// --- フィボ 状態管理 (FVG/出来高と同思想。イベント後 一定本数保持) ---
+var bool longFibStateOk   = false
+var bool shortFibStateOk  = false
+var int  longFibStateBar  = na
+var int  shortFibStateBar = na
+var int  longFibStateRank  = 0
+var int  shortFibStateRank = 0
+
+if useFibWZ and useFibStateWindow
+    if fibBuySignal
+        longFibStateOk   := true
+        longFibStateBar  := bar_index
+        longFibStateRank := fibRank
+    if fibSellSignal
+        shortFibStateOk   := true
+        shortFibStateBar  := bar_index
+        shortFibStateRank := fibRank
+    if longFibStateOk and not na(longFibStateBar) and bar_index - longFibStateBar > fibStateMaxBars
+        longFibStateOk := false
+    if shortFibStateOk and not na(shortFibStateBar) and bar_index - shortFibStateBar > fibStateMaxBars
+        shortFibStateOk := false
+
+// フィボ 場所条件 (状態管理ON=状態フラグ / OFF=シグナル単バー / 未使用=false)
+bool longFibZoneOk =
+     not useFibWZ ? false :
+     useFibStateWindow ? longFibStateOk : fibBuySignal
+bool shortFibZoneOk =
+     not useFibWZ ? false :
+     useFibStateWindow ? shortFibStateOk : fibSellSignal
+
+// ============================================================
+//  5b-2e. EMA WinZone モジュール (MTF: 1M/5M/15M/1H/4H を反応価格帯として)
+// ------------------------------------------------------------
+//  EMA は Bias ではなく Zone。上だからロング等の方向制限はしない。
+//  各時間足 ON/OFF・各EMA種類 ON/OFF。OFFの時間足は request.security を呼ばない。
+//  出力: emaLongWinZone / emaShortWinZone / emaNoTrade / emaSignalType / emaRank /
+//        emaHitTF (1/5/15/60/240) / emaHitMA (200/600/1000/2000/3000)
+//  ・useEMAWZ=false の時は EMA計算・ATR・security・状態管理 を一切実行しない。
+//  ※ security本数節約のため各TFで5EMA+ATRを1タプルで取得。EMA種類OFFは判定側で除外。
+// ============================================================
+
+// 1つの時間足の EMA(5本)+ATR を取得し、反発判定と帯レベルを返す (pure + levels配列に追記)。
+//   返り値: [bounceLong, bounceShort, hitMALong, hitMAShort]。OFFのTFは security を呼ばない。
+f_emaTFEval(bool _tfOn, string _tf, array<float> _levels) =>
+    float _e1 = na
+    float _e2 = na
+    float _e3 = na
+    float _e4 = na
+    float _e5 = na
+    float _atr = na
+    if _tfOn
+        [_v1, _v2, _v3, _v4, _v5, _v6] = request.security(syminfo.tickerid, _tf, [ta.ema(emaSource, emaLen1), ta.ema(emaSource, emaLen2), ta.ema(emaSource, emaLen3), ta.ema(emaSource, emaLen4), ta.ema(emaSource, emaLen5), ta.atr(emaAtrLen)], lookahead = barmerge.lookahead_off)
+        _e1 := _v1
+        _e2 := _v2
+        _e3 := _v3
+        _e4 := _v4
+        _e5 := _v5
+        _atr := _v6
+    float _touch = emaTouchMode == "ATR" ? _atr * emaTouchATRMult : emaTouchDollar
+    // BUY反発: low が EMA に触れ close が EMA上 / SELL反発: high が EMA に触れ close が EMA下
+    bool _bl1 = _tfOn and useEMA1Zone and not na(_e1) and low <= _e1 + _touch and close > _e1 and close > open
+    bool _bl2 = _tfOn and useEMA2Zone and not na(_e2) and low <= _e2 + _touch and close > _e2 and close > open
+    bool _bl3 = _tfOn and useEMA3Zone and not na(_e3) and low <= _e3 + _touch and close > _e3 and close > open
+    bool _bl4 = _tfOn and useEMA4Zone and not na(_e4) and low <= _e4 + _touch and close > _e4 and close > open
+    bool _bl5 = _tfOn and useEMA5Zone and not na(_e5) and low <= _e5 + _touch and close > _e5 and close > open
+    bool _bs1 = _tfOn and useEMA1Zone and not na(_e1) and high >= _e1 - _touch and close < _e1 and close < open
+    bool _bs2 = _tfOn and useEMA2Zone and not na(_e2) and high >= _e2 - _touch and close < _e2 and close < open
+    bool _bs3 = _tfOn and useEMA3Zone and not na(_e3) and high >= _e3 - _touch and close < _e3 and close < open
+    bool _bs4 = _tfOn and useEMA4Zone and not na(_e4) and high >= _e4 - _touch and close < _e4 and close < open
+    bool _bs5 = _tfOn and useEMA5Zone and not na(_e5) and high >= _e5 - _touch and close < _e5 and close < open
+    // 帯用: ON の EMA レベルを配列へ追記 (BandTop/Bottom を後で算出)
+    if _tfOn and useEMA1Zone and not na(_e1)
+        array.push(_levels, _e1)
+    if _tfOn and useEMA2Zone and not na(_e2)
+        array.push(_levels, _e2)
+    if _tfOn and useEMA3Zone and not na(_e3)
+        array.push(_levels, _e3)
+    if _tfOn and useEMA4Zone and not na(_e4)
+        array.push(_levels, _e4)
+    if _tfOn and useEMA5Zone and not na(_e5)
+        array.push(_levels, _e5)
+    bool _bLong  = _bl1 or _bl2 or _bl3 or _bl4 or _bl5
+    bool _bShort = _bs1 or _bs2 or _bs3 or _bs4 or _bs5
+    int _maL = _bl5 ? 3000 : _bl4 ? 2000 : _bl3 ? 1000 : _bl2 ? 600 : _bl1 ? 200 : 0
+    int _maS = _bs5 ? 3000 : _bs4 ? 2000 : _bs3 ? 1000 : _bs2 ? 600 : _bs1 ? 200 : 0
+    [_bLong, _bShort, _maL, _maS]
+
+// --- EMA WinZone 出力 (if外で初期化) ---
+bool emaLongEventOk  = false
+bool emaShortEventOk = false
+bool emaNoTrade      = false
+int  emaSignalType   = 0
+int  emaRank         = 0
+int  emaHitTF        = 0
+int  emaHitMA        = 0
+
+// 帯ブレイクの保持 (var)
+var int emaBandBreakUpBar = na
+var int emaBandBreakDnBar = na
+
+if useEMAWZ
+    array<float> _emaLevels = array.new_float()
+    [_bl1m,  _bs1m,  _maL1m,  _maS1m]  = f_emaTFEval(useEMA1M,  tfEMA1M,  _emaLevels)
+    [_bl5m,  _bs5m,  _maL5m,  _maS5m]  = f_emaTFEval(useEMA5M,  tfEMA5M,  _emaLevels)
+    [_bl15m, _bs15m, _maL15m, _maS15m] = f_emaTFEval(useEMA15M, tfEMA15M, _emaLevels)
+    [_bl1h,  _bs1h,  _maL1h,  _maS1h]  = f_emaTFEval(useEMA1H,  tfEMA1H,  _emaLevels)
+    [_bl4h,  _bs4h,  _maL4h,  _maS4h]  = f_emaTFEval(useEMA4H,  tfEMA4H,  _emaLevels)
+    // --- 反発 (どのTFでも反応すればOK) ---
+    bool emaBounceLong  = _bl1m or _bl5m or _bl15m or _bl1h or _bl4h
+    bool emaBounceShort = _bs1m or _bs5m or _bs15m or _bs1h or _bs4h
+    // どのTF/どのEMAで反応したか (長期TF優先)
+    int _hitTFL = _bl4h ? 240 : _bl1h ? 60 : _bl15m ? 15 : _bl5m ? 5 : _bl1m ? 1 : 0
+    int _hitMAL = _bl4h ? _maL4h : _bl1h ? _maL1h : _bl15m ? _maL15m : _bl5m ? _maL5m : _bl1m ? _maL1m : 0
+    int _hitTFS = _bs4h ? 240 : _bs1h ? 60 : _bs15m ? 15 : _bs5m ? 5 : _bs1m ? 1 : 0
+    int _hitMAS = _bs4h ? _maS4h : _bs1h ? _maS1h : _bs15m ? _maS15m : _bs5m ? _maS5m : _bs1m ? _maS1m : 0
+    // --- 帯 (全ON TF × 全ON EMA のレベルで BandTop / BandBottom) ---
+    //   空配列で array.max/min を呼ぶとエラーになるため if でガード。
+    float emaBandTop    = na
+    float emaBandBottom = na
+    if array.size(_emaLevels) > 0
+        emaBandTop    := array.max(_emaLevels)
+        emaBandBottom := array.min(_emaLevels)
+    bool emaBandValid  = not na(emaBandTop) and not na(emaBandBottom)
+    bool aboveEMABand  = emaBandValid and close > emaBandTop
+    bool belowEMABand  = emaBandValid and close < emaBandBottom
+    bool insideEMABand = emaBandValid and not aboveEMABand and not belowEMABand
+    // --- 帯抜けリテスト (チャート足の反応。接近幅はチャートATR) ---
+    float _chartAtr  = ta.atr(emaAtrLen)
+    float _bandTouch = emaTouchMode == "ATR" ? _chartAtr * emaTouchATRMult : emaTouchDollar
+    float _emaBody   = math.abs(close - open)
+    float _emaUpWick = high - math.max(open, close)
+    float _emaDnWick = math.min(open, close) - low
+    bool _emaBullRev = (close > open and close[1] < open[1] and close >= open[1] and open <= close[1]) or (_emaDnWick >= _emaBody and _emaDnWick >= _emaUpWick) or close > open
+    bool _emaBearRev = (close < open and close[1] > open[1] and close <= open[1] and open >= close[1]) or (_emaUpWick >= _emaBody and _emaUpWick >= _emaDnWick) or close < open
+    if aboveEMABand and not nz(aboveEMABand[1], false)
+        emaBandBreakUpBar := bar_index
+    if belowEMABand and not nz(belowEMABand[1], false)
+        emaBandBreakDnBar := bar_index
+    bool emaBandRetestLong  = useEMABandRetest and emaBandValid and not na(emaBandBreakUpBar) and (bar_index - emaBandBreakUpBar) <= emaBandRetestBars and low <= emaBandTop + _bandTouch and close > emaBandTop and _emaBullRev
+    bool emaBandRetestShort = useEMABandRetest and emaBandValid and not na(emaBandBreakDnBar) and (bar_index - emaBandBreakDnBar) <= emaBandRetestBars and high >= emaBandBottom - _bandTouch and close < emaBandBottom and _emaBearRev
+    // --- SR転換 (MTF未対応。初期は無効。useEMASRFlipSig 既定OFF) ---
+    bool emaSRFlipLong  = false
+    bool emaSRFlipShort = false
+    // --- WinZone イベント (Zone = 場所反応。方向はローソク反応から決まる) ---
+    bool _emaRawLong  = (useEMABounce and emaBounceLong)  or emaBandRetestLong  or emaSRFlipLong
+    bool _emaRawShort = (useEMABounce and emaBounceShort) or emaBandRetestShort or emaSRFlipShort
+    emaNoTrade := useEMAInsideNoTrade and insideEMABand
+    emaLongEventOk  := _emaRawLong  and not emaNoTrade
+    emaShortEventOk := _emaRawShort and not emaNoTrade
+    // どのTF/EMAで反応したか (BUY優先、無ければSELL。帯リテストは帯なので0)
+    emaHitTF := emaBounceLong ? _hitTFL : emaBounceShort ? _hitTFS : 0
+    emaHitMA := emaBounceLong ? _hitMAL : emaBounceShort ? _hitMAS : 0
+    // Signal Type (優先: 反発=1 > 帯リテスト=7)
+    emaSignalType := (emaBounceLong or emaBounceShort) ? 1 : (emaBandRetestLong or emaBandRetestShort) ? 7 : 0
+    // Rank (優先: 反発 > 帯リテスト > 帯外)
+    emaRank := (emaBounceLong or emaBounceShort) ? 3 : (emaBandRetestLong or emaBandRetestShort) ? 2 : (aboveEMABand or belowEMABand) ? 1 : 0
+    // --- ラベル (任意。useEMAWZ 内でのみ生成) ---
+    if showEMAMTFLabels and (emaBounceLong or emaBounceShort)
+        string _tfStr = emaHitTF == 240 ? "4H" : emaHitTF == 60 ? "1H" : emaHitTF == 15 ? "15M" : emaHitTF == 5 ? "5M" : emaHitTF == 1 ? "1M" : "?"
+        if emaBounceLong
+            label.new(bar_index, low, "EMA " + _tfStr + " " + str.tostring(emaHitMA) + " Bounce BUY", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.tiny)
+        else
+            label.new(bar_index, high, "EMA " + _tfStr + " " + str.tostring(emaHitMA) + " Bounce SELL", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.tiny)
+
+// --- EMA 状態管理 (FVG/Volume/Fib/Line と同思想) ---
+var bool emaLongState     = false
+var bool emaShortState    = false
+var int  emaLongStateBar  = na
+var int  emaShortStateBar = na
+
+if useEMAWZ and useEMAStateWindow
+    if emaLongEventOk
+        emaLongState    := true
+        emaLongStateBar := bar_index
+    if emaShortEventOk
+        emaShortState    := true
+        emaShortStateBar := bar_index
+    if emaLongState and not na(emaLongStateBar) and bar_index - emaLongStateBar > emaStateMaxBars
+        emaLongState := false
+    if emaShortState and not na(emaShortStateBar) and bar_index - emaShortStateBar > emaStateMaxBars
+        emaShortState := false
+
+// EMA WinZone 出力 (状態管理ON=状態フラグ / OFF=イベント単バー / 未使用=false)
+bool emaLongWinZone  = useEMAWZ ? (useEMAStateWindow ? emaLongState  : emaLongEventOk)  : false
+bool emaShortWinZone = useEMAWZ ? (useEMAStateWindow ? emaShortState : emaShortEventOk) : false
+
+// ============================================================
+//  5b-2f. 水平線 WinZone モジュール (レジサポを反応する場所として)
+// ------------------------------------------------------------
+//  Pivot / 複数回反応 / 前日H・L / セッションH・L を統合ゾーン化し、
+//  反発 / レジサポ転換 / ブレイク / スイープ反転 を場所条件(Zone)として使う。
+//  水平線は Bias ではなく Zone。反応したら WinZone。方向はローソク反応から。
+//  ・useLineWZ=false の時は ta.*・配列・前日/セッション更新・各判定・描画 を
+//    一切実行しない (全処理を if useLineWZ の中に閉じ込める)。
+// ============================================================
+
+// --- 統合水平線ゾーン配列 (var: 状態保持。操作は if useLineWZ 内のみ) ---
+var array<float> zPrice   = array.new_float()
+var array<int>   zTouch   = array.new_int()
+var array<int>   zCreated = array.new_int()
+var array<int>   zLast    = array.new_int()
+var array<bool>  zPivot   = array.new_bool()
+var array<bool>  zPrev    = array.new_bool()
+var array<bool>  zSess    = array.new_bool()
+var array<int>   zTF      = array.new_int()   // どの時間足由来か (1/5/15/60/240、0=前日/セッション)
+
+// 共通フィルター (ローソク品質)。呼ばれない時は実行されない。
+f_lineCommonOK(bool isBuy, float _atr) =>
+    float _rng  = high - low
+    float _body = math.abs(close - open)
+    float _upW  = high - math.max(close, open)
+    float _dnW  = math.min(close, open) - low
+    float _bRatio = _rng > 0 ? _body / _rng : 0.0
+    bool _ok = true
+    if useLineDirCandleFilter
+        _ok := _ok and (isBuy ? close > open : close < open)
+    if useLineWickFilter
+        _ok := _ok and (isBuy ? _dnW >= _body : _upW >= _body)
+    if useLineBodyFilter
+        _ok := _ok and _bRatio >= lineBodyRatioMin
+    if useLineATRFilter
+        _ok := _ok and _rng >= _atr * lineAtrMinMult
+    _ok
+
+// ゾーンへ追加/統合 (srcPivot/srcPrev/srcSess のいずれか1つを true で渡す。_tfCode=由来TF)
+f_lineAddZone(float p, bool srcPivot, bool srcPrev, bool srcSess, int _tfCode, float _mergeTol) =>
+    bool _found = false
+    if array.size(zPrice) > 0
+        for i = 0 to array.size(zPrice) - 1
+            if not _found and math.abs(array.get(zPrice, i) - p) <= _mergeTol
+                int _oldT = array.get(zTouch, i)
+                int _newT = _oldT + 1
+                array.set(zPrice, i, (array.get(zPrice, i) * _oldT + p) / _newT)
+                array.set(zTouch, i, _newT)
+                array.set(zLast,  i, bar_index)
+                array.set(zPivot, i, array.get(zPivot, i) or srcPivot)
+                array.set(zPrev,  i, array.get(zPrev,  i) or srcPrev)
+                array.set(zSess,  i, array.get(zSess,  i) or srcSess)
+                array.set(zTF,    i, math.max(array.get(zTF, i), _tfCode))   // 統合時は上位TFを採用
+                _found := true
+    if not _found
+        array.push(zPrice, p)
+        array.push(zTouch, 1)
+        array.push(zCreated, bar_index)
+        array.push(zLast, bar_index)
+        array.push(zPivot, srcPivot)
+        array.push(zPrev,  srcPrev)
+        array.push(zSess,  srcSess)
+        array.push(zTF,    _tfCode)
+        if array.size(zPrice) > lineMaxZones
+            array.shift(zPrice)
+            array.shift(zTouch)
+            array.shift(zCreated)
+            array.shift(zLast)
+            array.shift(zPivot)
+            array.shift(zPrev)
+            array.shift(zSess)
+            array.shift(zTF)
+
+// MTF Pivot 取得 → ゾーン追加 (ONのTFだけ request.security を呼ぶ)
+f_lineAddTFPivots(bool _tfOn, string _tf, int _tfCode, float _mergeTol) =>
+    if _tfOn
+        [_ph, _pl] = request.security(syminfo.tickerid, _tf, [ta.pivothigh(linePivotLen, linePivotLen), ta.pivotlow(linePivotLen, linePivotLen)], lookahead = barmerge.lookahead_off)
+        if not na(_ph) and (na(_ph[1]) or _ph != _ph[1])
+            f_lineAddZone(_ph, true, false, false, _tfCode, _mergeTol)
+        if not na(_pl) and (na(_pl[1]) or _pl != _pl[1])
+            f_lineAddZone(_pl, true, false, false, _tfCode, _mergeTol)
+
+// strength: 1=Pivotのみ / 2=複数反応 / 3=前日 / 4=セッション / 5=複数ソース重合
+f_lineZoneStrength(bool isPivot, bool isPrev, bool isSess, int touches) =>
+    int _srcCount = (isPivot ? 1 : 0) + (isPrev ? 1 : 0) + (isSess ? 1 : 0)
+    _srcCount >= 2 ? 5 : isSess ? 4 : isPrev ? 3 : (useReactionLine and touches >= reactionMinTouches) ? 2 : 1
+
+// セッション 高値/安値 追跡
+f_lineSession(string sessStr, float prevHi, float prevLo) =>
+    bool _inSess  = not na(time(timeframe.period, sessStr, lineSessTZ))
+    bool _started = _inSess and not _inSess[1]
+    bool _ended   = not _inSess and _inSess[1]
+    float _hi = prevHi
+    float _lo = prevLo
+    if _started
+        _hi := high
+        _lo := low
+    else if _inSess
+        _hi := na(prevHi) ? high : math.max(prevHi, high)
+        _lo := na(prevLo) ? low  : math.min(prevLo, low)
+    [_hi, _lo, _ended]
+
+// strength → 色 / 太さ
+f_lineStrengthColor(int s) =>
+    s >= 5 ? color.red : s == 4 ? color.orange : s == 3 ? color.yellow : s == 2 ? color.aqua : color.gray
+f_lineStrengthWidth(int s) =>
+    s >= 4 ? 3 : s >= 2 ? 2 : 1
+
+// --- 水平線 出力 (if外で初期化) ---
+bool  lineRawLong        = false
+bool  lineRawShort       = false
+float nearestSupport     = na
+float nearestResistance  = na
+int   lineSignalType     = 0
+int   lineStrength       = 0
+int   lineSource         = 0
+int   lineHitTF          = 0
+bool  lineNoTradeLong    = false
+bool  lineNoTradeShort   = false
+bool  lineNoTrade        = false
+
+// 前日 / セッション / Flip 状態 (var: バー跨ぎ保持。更新は if useLineWZ 内のみ)
+var float curDayHigh = na
+var float curDayLow  = na
+var float prevHigh   = na
+var float prevLow    = na
+var float asiaHigh   = na
+var float asiaLow    = na
+var float londonHigh = na
+var float londonLow  = na
+var float nyHigh     = na
+var float nyLow      = na
+var float flipResLevel = na
+var int   flipResBar   = na
+var float flipSupLevel = na
+var int   flipSupBar   = na
+// 表示オブジェクト
+var line supLine = na
+var line resLine = na
+var box  supBox  = na
+var box  resBox  = na
+
+if useLineWZ
+    float lineAtr = ta.atr(lineAtrLen)
+    float lineZoneW = useLineATRZone ? lineAtr * lineZoneATRMult : lineZoneFixedWidth
+    float _mergeTol = useLineMergeZone ? lineAtr * lineMergeToleranceATR : lineAtr * reactionToleranceATR
+    // ① MTF Pivot High/Low → ゾーン (ONのTFだけ request.security)
+    if usePivotLine or useReactionLine
+        f_lineAddTFPivots(useLine1M,  tfLine1M,  1,   _mergeTol)
+        f_lineAddTFPivots(useLine5M,  tfLine5M,  5,   _mergeTol)
+        f_lineAddTFPivots(useLine15M, tfLine15M, 15,  _mergeTol)
+        f_lineAddTFPivots(useLine1H,  tfLine1H,  60,  _mergeTol)
+        f_lineAddTFPivots(useLine4H,  tfLine4H,  240, _mergeTol)
+    // ③ 前日 高値/安値 (チャート基準。TFコード0)
+    bool _newDay = ta.change(time("D")) != 0
+    if _newDay
+        prevHigh := curDayHigh
+        prevLow  := curDayLow
+        curDayHigh := high
+        curDayLow  := low
+        if usePreviousDayHL and not na(prevHigh)
+            f_lineAddZone(prevHigh, false, true, false, 0, _mergeTol)
+        if usePreviousDayHL and not na(prevLow)
+            f_lineAddZone(prevLow, false, true, false, 0, _mergeTol)
+    else
+        curDayHigh := na(curDayHigh) ? high : math.max(curDayHigh, high)
+        curDayLow  := na(curDayLow)  ? low  : math.min(curDayLow, low)
+    // ④ セッション 高値/安値
+    [_aH, _aL, _aEnd] = f_lineSession(lineAsiaSess, asiaHigh, asiaLow)
+    asiaHigh := _aH
+    asiaLow  := _aL
+    [_lH, _lL, _lEnd] = f_lineSession(lineLondonSess, londonHigh, londonLow)
+    londonHigh := _lH
+    londonLow  := _lL
+    [_nH, _nL, _nEnd] = f_lineSession(lineNySess, nyHigh, nyLow)
+    nyHigh := _nH
+    nyLow  := _nL
+    if useSessionHL
+        if _aEnd and not na(asiaHigh)
+            f_lineAddZone(asiaHigh, false, false, true, 0, _mergeTol)
+        if _aEnd and not na(asiaLow)
+            f_lineAddZone(asiaLow, false, false, true, 0, _mergeTol)
+        if _lEnd and not na(londonHigh)
+            f_lineAddZone(londonHigh, false, false, true, 0, _mergeTol)
+        if _lEnd and not na(londonLow)
+            f_lineAddZone(londonLow, false, false, true, 0, _mergeTol)
+        if _nEnd and not na(nyHigh)
+            f_lineAddZone(nyHigh, false, false, true, 0, _mergeTol)
+        if _nEnd and not na(nyLow)
+            f_lineAddZone(nyLow, false, false, true, 0, _mergeTol)
+    // 最近接 Support(<=close) / Resistance(>=close)
+    int  _nsStrength = 0
+    int  _nrStrength = 0
+    int  _nsCreated = na
+    int  _nrCreated = na
+    int  _nsSource = 0
+    int  _nrSource = 0
+    int  _nsTF = 0
+    int  _nrTF = 0
+    if array.size(zPrice) > 0
+        for i = 0 to array.size(zPrice) - 1
+            if bar_index >= array.get(zCreated, i)
+                float _pr = array.get(zPrice, i)
+                int   _tc = array.get(zTouch, i)
+                bool  _ip = array.get(zPivot, i)
+                bool  _ipr= array.get(zPrev, i)
+                bool  _iss= array.get(zSess, i)
+                int   _st = f_lineZoneStrength(_ip, _ipr, _iss, _tc)
+                // ソース種別 (1=Pivot 2=Reaction 3=PrevDay 4=Session 5=Multiple)
+                int   _srcN = (_ip ? 1 : 0) + (_ipr ? 1 : 0) + (_iss ? 1 : 0)
+                int   _src = _srcN >= 2 ? 5 : _iss ? 4 : _ipr ? 3 : (useReactionLine and _tc >= reactionMinTouches) ? 2 : 1
+                if _pr <= close
+                    if na(nearestSupport) or _pr > nearestSupport
+                        nearestSupport := _pr
+                        _nsStrength := _st
+                        _nsCreated := array.get(zCreated, i)
+                        _nsSource := _src
+                        _nsTF := array.get(zTF, i)
+                if _pr >= close
+                    if na(nearestResistance) or _pr < nearestResistance
+                        nearestResistance := _pr
+                        _nrStrength := _st
+                        _nrCreated := array.get(zCreated, i)
+                        _nrSource := _src
+                        _nrTF := array.get(zTF, i)
+    float _supZoneTop = nearestSupport + lineZoneW
+    float _resZoneBot = nearestResistance - lineZoneW
+    bool _supUsable = not na(nearestSupport)    and not na(_nsCreated) and bar_index >= _nsCreated
+    bool _resUsable = not na(nearestResistance) and not na(_nrCreated) and bar_index >= _nrCreated
+    // A: 反発
+    bool _buyBounce  = useLineBounce and _supUsable and low  <= _supZoneTop and close > nearestSupport    and f_lineCommonOK(true, lineAtr)
+    bool _sellBounce = useLineBounce and _resUsable and high >= _resZoneBot and close < nearestResistance and f_lineCommonOK(false, lineAtr)
+    // B: レジサポ転換 (Flip)
+    if _resUsable and not na(nearestResistance[1]) and close > nearestResistance[1] and close[1] <= nearestResistance[1]
+        flipResLevel := nearestResistance[1]
+        flipResBar   := bar_index
+    if _supUsable and not na(nearestSupport[1]) and close < nearestSupport[1] and close[1] >= nearestSupport[1]
+        flipSupLevel := nearestSupport[1]
+        flipSupBar   := bar_index
+    bool _buyFlip  = useLineFlip and not na(flipResLevel) and (bar_index - flipResBar) >= lineFlipConfirmBars and (bar_index - flipResBar) <= lineFlipLookback and low <= flipResLevel + lineZoneW and close > flipResLevel and f_lineCommonOK(true, lineAtr)
+    bool _sellFlip = useLineFlip and not na(flipSupLevel) and (bar_index - flipSupBar) >= lineFlipConfirmBars and (bar_index - flipSupBar) <= lineFlipLookback and high >= flipSupLevel - lineZoneW and close < flipSupLevel and f_lineCommonOK(false, lineAtr)
+    if _buyFlip
+        flipResLevel := na
+    if _sellFlip
+        flipSupLevel := na
+    // C: ブレイク
+    bool _breakBodyOK = not useLineBreakBodyFilter or (high - low > 0 and math.abs(close - open) / (high - low) >= lineBreakBodyRatio)
+    bool _buyBreak  = useLineBreak and _resUsable and not na(nearestResistance[1]) and close > nearestResistance[1] and close[1] <= nearestResistance[1] and _breakBodyOK
+    bool _sellBreak = useLineBreak and _supUsable and not na(nearestSupport[1])    and close < nearestSupport[1]    and close[1] >= nearestSupport[1]    and _breakBodyOK
+    // D: スイープ反転
+    float _sweepTol = lineAtr * lineSweepToleranceATR
+    bool _buySweep  = useLineSweep and _supUsable and (nearestSupport - low)     >= _sweepTol and close > nearestSupport    and f_lineCommonOK(true, lineAtr)
+    bool _sellSweep = useLineSweep and _resUsable and (high - nearestResistance) >= _sweepTol and close < nearestResistance and f_lineCommonOK(false, lineAtr)
+    // 統合 (優先: Sweep > Break > Flip > Bounce)
+    lineSignalType := (_buySweep or _sellSweep) ? 4 : (_buyBreak or _sellBreak) ? 3 : (_buyFlip or _sellFlip) ? 2 : (_buyBounce or _sellBounce) ? 1 : 0
+    lineRawLong  := _buyBounce or _buyFlip or _buyBreak or _buySweep
+    lineRawShort := _sellBounce or _sellFlip or _sellBreak or _sellSweep
+    int _dir = (lineRawLong and not lineRawShort) ? 1 : (lineRawShort and not lineRawLong) ? -1 : 0
+    lineStrength := _dir == 1 ? _nsStrength : _dir == -1 ? _nrStrength : math.max(_nsStrength, _nrStrength)
+    // 反応した側のソース種別 / 由来TF (Long=Support側 / Short=Resistance側)
+    lineSource := _dir == 1 ? _nsSource : _dir == -1 ? _nrSource : math.max(_nsSource, _nrSource)
+    lineHitTF  := _dir == 1 ? _nsTF     : _dir == -1 ? _nrTF     : math.max(_nsTF, _nrTF)
+    // E: 障害物 (近すぎるレジサポで NoTrade)
+    bool _obsAbove = not na(nearestResistance) and (nearestResistance - close) <= lineAtr * lineObstacleATR
+    bool _obsBelow = not na(nearestSupport)    and (close - nearestSupport)    <= lineAtr * lineObstacleATR
+    lineNoTradeLong  := useLineObstacleFilter and _obsAbove
+    lineNoTradeShort := useLineObstacleFilter and _obsBelow
+    lineNoTrade      := lineNoTradeLong or lineNoTradeShort
+    // --- 表示 (useLineWZ 内でのみ line/box/label を生成) ---
+    if showLineZones and _supUsable
+        color _sc = f_lineStrengthColor(_nsStrength)
+        int   _sw = f_lineStrengthWidth(_nsStrength)
+        if na(supLine)
+            supLine := line.new(_nsCreated, nearestSupport, bar_index, nearestSupport, color = _sc, width = _sw)
+        else
+            line.set_xy1(supLine, _nsCreated, nearestSupport)
+            line.set_xy2(supLine, bar_index, nearestSupport)
+            line.set_color(supLine, _sc)
+            line.set_width(supLine, _sw)
+    if showLineZones and _resUsable
+        color _rc = f_lineStrengthColor(_nrStrength)
+        int   _rw = f_lineStrengthWidth(_nrStrength)
+        if na(resLine)
+            resLine := line.new(_nrCreated, nearestResistance, bar_index, nearestResistance, color = _rc, width = _rw)
+        else
+            line.set_xy1(resLine, _nrCreated, nearestResistance)
+            line.set_xy2(resLine, bar_index, nearestResistance)
+            line.set_color(resLine, _rc)
+            line.set_width(resLine, _rw)
+    if showLineLabels
+        if _buyBounce
+            label.new(bar_index, low, "Bounce↑", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.tiny)
+        if _sellBounce
+            label.new(bar_index, high, "Bounce↓", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.tiny)
+        if _buyFlip
+            label.new(bar_index, low, "Flip↑", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.teal, 0), textcolor = color.white, size = size.tiny)
+        if _sellFlip
+            label.new(bar_index, high, "Flip↓", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.maroon, 0), textcolor = color.white, size = size.tiny)
+        if _buyBreak
+            label.new(bar_index, low, "Break↑", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.lime, 0), textcolor = color.white, size = size.tiny)
+        if _sellBreak
+            label.new(bar_index, high, "Break↓", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.fuchsia, 0), textcolor = color.white, size = size.tiny)
+        if _buySweep
+            label.new(bar_index, low, "Sweep↑", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.aqua, 0), textcolor = color.white, size = size.tiny)
+        if _sellSweep
+            label.new(bar_index, high, "Sweep↓", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.orange, 0), textcolor = color.white, size = size.tiny)
+
+// --- 水平線 状態管理 (シグナル後 lineStateMaxBars 本だけ WinZone 維持) ---
+var int lineLongStateBar  = na
+var int lineShortStateBar = na
+if useLineWZ and useLineStateWindow
+    if lineRawLong
+        lineLongStateBar := bar_index
+    if lineRawShort
+        lineShortStateBar := bar_index
+bool lineLongState  = useLineStateWindow and not na(lineLongStateBar)  and (bar_index - lineLongStateBar)  <= lineStateMaxBars
+bool lineShortState = useLineStateWindow and not na(lineShortStateBar) and (bar_index - lineShortStateBar) <= lineStateMaxBars
+
+// 水平線 WinZone 出力 (状態管理ON=状態フラグ / OFF=イベント単バー / 未使用=false)
+bool lineLongWinZone  = useLineWZ ? (useLineStateWindow ? lineLongState  : lineRawLong)  : false
+bool lineShortWinZone = useLineWZ ? (useLineStateWindow ? lineShortState : lineRawShort) : false
+
+// ============================================================
+//  5b-3. WinZone 結合 (FVG / 出来高POC / フィボ / 水平線 を場所条件として統合)
+// ------------------------------------------------------------
+//  FVG_ONLY / VOLUME_ONLY / FIB_ONLY / LINE_ONLY / OR / AND で切り替え。
+//  useWinZoneModule=false なら常に許可 (場所条件を無効化)。
+//  OR : ONのWinZoneのどれかOKで true。AND : ONのWinZoneが全てOKで true。
+//       (OFFのWinZoneはAND条件に含めない = not useXxx or ... で通過)
+// ============================================================
+bool longWinZoneOk =
+     not useWinZoneModule ? true :
+     winZoneMode == "FVG_ONLY"    ? longFVGOk :
+     winZoneMode == "VOLUME_ONLY" ? longVolumeZoneOk :
+     winZoneMode == "FIB_ONLY"    ? longFibZoneOk :
+     winZoneMode == "EMA_ONLY"    ? emaLongWinZone :
+     winZoneMode == "LINE_ONLY"   ? lineLongWinZone :
+     winZoneMode == "OR"          ? ((useFVGWinZone and longFVGOk) or (useVolumeWinZone and longVolumeZoneOk) or (useFibWinZone and longFibZoneOk) or (useEMAWinZone and emaLongWinZone) or (useLineWinZone and lineLongWinZone)) :
+     winZoneMode == "AND"         ? ((not useFVGWinZone or longFVGOk) and (not useVolumeWinZone or longVolumeZoneOk) and (not useFibWinZone or longFibZoneOk) and (not useEMAWinZone or emaLongWinZone) and (not useLineWinZone or lineLongWinZone)) :
+     true
+
+bool shortWinZoneOk =
+     not useWinZoneModule ? true :
+     winZoneMode == "FVG_ONLY"    ? shortFVGOk :
+     winZoneMode == "VOLUME_ONLY" ? shortVolumeZoneOk :
+     winZoneMode == "FIB_ONLY"    ? shortFibZoneOk :
+     winZoneMode == "EMA_ONLY"    ? emaShortWinZone :
+     winZoneMode == "LINE_ONLY"   ? lineShortWinZone :
+     winZoneMode == "OR"          ? ((useFVGWinZone and shortFVGOk) or (useVolumeWinZone and shortVolumeZoneOk) or (useFibWinZone and shortFibZoneOk) or (useEMAWinZone and emaShortWinZone) or (useLineWinZone and lineShortWinZone)) :
+     winZoneMode == "AND"         ? ((not useFVGWinZone or shortFVGOk) and (not useVolumeWinZone or shortVolumeZoneOk) and (not useFibWinZone or shortFibZoneOk) and (not useEMAWinZone or emaShortWinZone) and (not useLineWinZone or lineShortWinZone)) :
+     true
+
+// ============================================================
+//  5c. エントリートリガー統合 (包み足 + 追加条件)
+// ------------------------------------------------------------
+//  複数トリガーを Any/All/MinCount で結合し、最終シグナルを作る。
+//  ・包み足は既存の bullEngulf / bearEngulf を再利用 (FVG吸収と共有)。
+//  ・BOS / EMAリジェクトの ta.* は「ON の時だけ」呼ぶ (OFFで軽量)。
+//  ・下位足確認は useLowerTFTrigger が ON の時だけ request.security。
+//  ・出力: allowLongByTrigger / allowShortByTrigger
+// ============================================================
+
+// --- 結合判定ヘルパー ---
+//   Any     … 1つ以上一致
+//   All     … 有効な全トリガーが一致
+//   MinCount… minTriggerCount 以上一致
+f_combineTrig(int cnt, int enabled) =>
+    triggerMode == "Any"  ? cnt >= 1 :
+     triggerMode == "All" ? (enabled > 0 and cnt >= enabled) :
+     cnt >= minTriggerCount
+
+// --- 下位足トリガー計算関数 (request.security から呼ばれる) ---
+//   戻り値: [bullCount, bearCount]
+f_calcTriggers() =>
+    float _body      = math.abs(close - open)
+    float _range     = high - low
+    float _upWick    = high - math.max(open, close)
+    float _loWick    = math.min(open, close) - low
+    float _bodyRatio = _range > 0 ? _body / _range : 0.0
+    float _closePos  = _range > 0 ? (close - low) / _range : 0.0
+    bool  _pUp = close[1] > open[1]
+    bool  _pDn = close[1] < open[1]
+    float _cHi = math.max(open,    close)
+    float _cLo = math.min(open,    close)
+    float _pHi = math.max(open[1], close[1])
+    float _pLo = math.min(open[1], close[1])
+    bool  _engBody = _cHi >= _pHi and _cLo <= _pLo
+    // 包み足 品質フィルター (現在足と同条件)
+    float _curBodySize  = math.abs(close - open)
+    float _prevBodySize = math.abs(close[1] - open[1])
+    float _curRangeSize = high - low
+    float _engulfAtr = ta.atr(engulfAtrLen)
+    bool _engulfRatioOk =
+         not useEngulfBodyRatioFilter or
+         (_prevBodySize > 0 and _curBodySize >= _prevBodySize * engulfBodyRatioMin)
+    bool _engulfBodyQualityOk =
+         not useEngulfBodyQualityFilter or
+         (_curRangeSize > 0 and _curBodySize / _curRangeSize >= engulfMinBodyRatio)
+    bool _engulfBodyAtrOk =
+         not useEngulfBodyAtrFilter or
+         _curBodySize >= _engulfAtr * engulfMinBodyATR
+    bool _engulfQualityOk =
+         _engulfRatioOk and
+         _engulfBodyQualityOk and
+         _engulfBodyAtrOk
+    // 包み足 (本体ストラテジーと同じ strict / 反対色ルール + 品質)
+    bool _bullEng = useEngulfingTrigger and close > open and (not reqOppColor or _pDn) and (strictEngulf ? _engBody : close >= _pHi) and _engulfQualityOk
+    bool _bearEng = useEngulfingTrigger and close < open and (not reqOppColor or _pUp) and (strictEngulf ? _engBody : close <= _pLo) and _engulfQualityOk
+    // ピンバー (実体率・最低レンジ フィルター込み)
+    float _pinAtr = ta.atr(pinRangeAtrLen)
+    bool _pinBodyRatioOk = not usePinBodyRatioFilter or _bodyRatio <= pinMaxBodyRatio
+    bool _pinRangeOk     = not usePinRangeFilter     or _range >= _pinAtr * pinMinRangeATR
+    bool _bullPin = usePinbarTrigger and _loWick > _body * pinWickBodyMult and _loWick > _upWick * pinOppWickMaxRatio and _closePos >= trigCloseEdgeRatio and _pinBodyRatioOk and _pinRangeOk
+    bool _bearPin = usePinbarTrigger and _upWick > _body * pinWickBodyMult and _upWick > _loWick * pinOppWickMaxRatio and _closePos <= 1.0 - trigCloseEdgeRatio and _pinBodyRatioOk and _pinRangeOk
+    // BOS
+    bool _bullBOS = useBOSTrigger and close > ta.highest(high, bosLookback)[1]
+    bool _bearBOS = useBOSTrigger and close < ta.lowest(low, bosLookback)[1]
+    // EMA リジェクト (傾きフィルター込み)
+    float _ema = ta.ema(close, emaLenTrigger)
+    float _emaSlope    = _ema - _ema[emaRejectSlopeLookback]
+    float _emaSlopeAtr = ta.atr(emaRejectSlopeAtrLen)
+    float _emaSlopeMin = _emaSlopeAtr * emaRejectSlopeMinATR
+    bool _bullEMASlopeOk = not useEMARejectSlopeFilter or _emaSlope >  _emaSlopeMin
+    bool _bearEMASlopeOk = not useEMARejectSlopeFilter or _emaSlope < -_emaSlopeMin
+    bool _bullEMA = useEMARejectTrigger and low <= _ema and close > _ema and close > open and _bullEMASlopeOk
+    bool _bearEMA = useEMARejectTrigger and high >= _ema and close < _ema and close < open and _bearEMASlopeOk
+    // FVG 形成
+    bool _bullFVG = useFVGTriggerFormation and low > high[2]
+    bool _bearFVG = useFVGTriggerFormation and high < low[2]
+    // 強ローソク
+    bool _bullStr = useStrongCandleTrigger and close > open and _bodyRatio >= strongBodyRatio and _closePos >= trigCloseEdgeRatio
+    bool _bearStr = useStrongCandleTrigger and close < open and _bodyRatio >= strongBodyRatio and _closePos <= 1.0 - trigCloseEdgeRatio
+    int _bullCnt = (_bullEng?1:0)+(_bullPin?1:0)+(_bullBOS?1:0)+(_bullEMA?1:0)+(_bullFVG?1:0)+(_bullStr?1:0)
+    int _bearCnt = (_bearEng?1:0)+(_bearPin?1:0)+(_bearBOS?1:0)+(_bearEMA?1:0)+(_bearFVG?1:0)+(_bearStr?1:0)
+    [_bullCnt, _bearCnt]
+
+// --- 有効(ON)トリガー数 ---
+int enabledTrigCount = (useEngulfingTrigger?1:0) + (usePinbarTrigger?1:0) + (useBOSTrigger?1:0) + (useEMARejectTrigger?1:0) + (useFVGTriggerFormation?1:0) + (useStrongCandleTrigger?1:0)
+
+// --- 現在足のローソク基本量 ---
+float trBody      = math.abs(close - open)
+float trRange     = high - low
+float trUpWick    = high - math.max(open, close)
+float trLoWick    = math.min(open, close) - low
+float trBodyRatio = trRange > 0 ? trBody / trRange : 0.0
+float trClosePos  = trRange > 0 ? (close - low) / trRange : 0.0
+
+// --- 各トリガー (現在足) ---
+// 包み足 : 既存 bullEngulf / bearEngulf に品質フィルターを AND (トリガー側のみ)
+//   ※ FVG吸収で使う bullEngulf / bearEngulf 自体は変更しない。
+//   品質 : 1.包み込み率 (実体が前足実体の何倍か) 2.実体率 3.最低実体ATR倍率。
+//   ta.atr は 包み足トリガーON かつ 実体ATRフィルターON の時だけ呼ぶ (OFFで軽量)。
+float curBodySize  = math.abs(close - open)
+float prevBodySize = math.abs(close[1] - open[1])
+float curRangeSize = high - low
+float engulfAtr = na
+if useEngulfingTrigger and useEngulfBodyAtrFilter
+    engulfAtr := ta.atr(engulfAtrLen)
+bool engulfRatioOk =
+     not useEngulfBodyRatioFilter or
+     (prevBodySize > 0 and curBodySize >= prevBodySize * engulfBodyRatioMin)
+bool engulfBodyQualityOk =
+     not useEngulfBodyQualityFilter or
+     (curRangeSize > 0 and curBodySize / curRangeSize >= engulfMinBodyRatio)
+bool engulfBodyAtrOk =
+     not useEngulfBodyAtrFilter or
+     curBodySize >= engulfAtr * engulfMinBodyATR
+bool engulfQualityOk =
+     engulfRatioOk and
+     engulfBodyQualityOk and
+     engulfBodyAtrOk
+bool trBullEng = useEngulfingTrigger and bullEngulf and engulfQualityOk
+bool trBearEng = useEngulfingTrigger and bearEngulf and engulfQualityOk
+
+// ピンバー : ヒゲ/実体・反対ヒゲ・終値位置 (既存) + 実体率・最低レンジ (品質)
+//   ta.atr は ピンバーON かつ レンジフィルターON の時だけ呼ぶ (OFFで軽量)
+float pinAtr = na
+if usePinbarTrigger and usePinRangeFilter
+    pinAtr := ta.atr(pinRangeAtrLen)
+bool pinBodyRatioOk = not usePinBodyRatioFilter or trBodyRatio <= pinMaxBodyRatio
+bool pinRangeOk     = not usePinRangeFilter     or trRange >= pinAtr * pinMinRangeATR
+bool trBullPin = usePinbarTrigger and trLoWick > trBody * pinWickBodyMult and trLoWick > trUpWick * pinOppWickMaxRatio and trClosePos >= trigCloseEdgeRatio and pinBodyRatioOk and pinRangeOk
+bool trBearPin = usePinbarTrigger and trUpWick > trBody * pinWickBodyMult and trUpWick > trLoWick * pinOppWickMaxRatio and trClosePos <= 1.0 - trigCloseEdgeRatio and pinBodyRatioOk and pinRangeOk
+
+// BOS : ta.highest/lowest は ON の時だけ呼ぶ (OFFで軽量)
+float bosHigh = na
+float bosLow  = na
+if useBOSTrigger
+    bosHigh := ta.highest(high, bosLookback)[1]
+    bosLow  := ta.lowest(low,  bosLookback)[1]
+bool trBullBOS = useBOSTrigger and close > bosHigh
+bool trBearBOS = useBOSTrigger and close < bosLow
+
+// EMA リジェクト : ta.ema / ta.atr は ON の時だけ呼ぶ (OFFで軽量)
+//   傾きフィルター : ロングは EMA が上向き・ショートは下向きの時のみ許可。
+//   水平/逆向き (|slope| <= slopeMin) は除外。slopeMin = ATR * 最低傾きATR倍率。
+float emaTrig     = na
+float emaSlope    = na
+float emaSlopeMin = na
+bool  emaRejectSlopeLongOk  = true
+bool  emaRejectSlopeShortOk = true
+if useEMARejectTrigger
+    emaTrig := ta.ema(close, emaLenTrigger)
+    emaSlope := emaTrig - emaTrig[emaRejectSlopeLookback]
+    float emaSlopeAtr = ta.atr(emaRejectSlopeAtrLen)
+    emaSlopeMin := emaSlopeAtr * emaRejectSlopeMinATR
+    emaRejectSlopeLongOk  := not useEMARejectSlopeFilter or emaSlope >  emaSlopeMin
+    emaRejectSlopeShortOk := not useEMARejectSlopeFilter or emaSlope < -emaSlopeMin
+bool trBullEMA =
+     useEMARejectTrigger and
+     low <= emaTrig and
+     close > emaTrig and
+     close > open and
+     emaRejectSlopeLongOk
+bool trBearEMA =
+     useEMARejectTrigger and
+     high >= emaTrig and
+     close < emaTrig and
+     close < open and
+     emaRejectSlopeShortOk
+
+// FVG 形成 (ta 不要)
+bool trBullFVG = useFVGTriggerFormation and low > high[2]
+bool trBearFVG = useFVGTriggerFormation and high < low[2]
+
+// 強ローソク (ta 不要)
+bool trBullStr = useStrongCandleTrigger and close > open and trBodyRatio >= strongBodyRatio and trClosePos >= trigCloseEdgeRatio
+bool trBearStr = useStrongCandleTrigger and close < open and trBodyRatio >= strongBodyRatio and trClosePos <= 1.0 - trigCloseEdgeRatio
+
+int bullTrigCount = (trBullEng?1:0)+(trBullPin?1:0)+(trBullBOS?1:0)+(trBullEMA?1:0)+(trBullFVG?1:0)+(trBullStr?1:0)
+int bearTrigCount = (trBearEng?1:0)+(trBearPin?1:0)+(trBearBOS?1:0)+(trBearEMA?1:0)+(trBearFVG?1:0)+(trBearStr?1:0)
+
+bool trigBullCur = f_combineTrig(bullTrigCount, enabledTrigCount)
+bool trigBearCur = f_combineTrig(bearTrigCount, enabledTrigCount)
+
+// --- 下位足トリガー (OFF なら request.security を呼ばない) ---
+bool trigBullLower = false
+bool trigBearLower = false
+if useLowerTFTrigger
+    [ltBullCnt, ltBearCnt] = request.security(syminfo.tickerid, triggerTF, f_calcTriggers(), lookahead = barmerge.lookahead_off)
+    trigBullLower := f_combineTrig(ltBullCnt, enabledTrigCount)
+    trigBearLower := f_combineTrig(ltBearCnt, enabledTrigCount)
+
+// --- 現在足 / 下位足 の結合 ---
+bool finalBullTrig =
+     not useLowerTFTrigger or triggerTFMode == "CurrentOnly" ? trigBullCur :
+     triggerTFMode == "LowerOnly"       ? trigBullLower :
+     triggerTFMode == "CurrentAndLower" ? (trigBullCur and trigBullLower) :
+     triggerTFMode == "CurrentOrLower"  ? (trigBullCur or trigBullLower) :
+     trigBullCur
+
+bool finalBearTrig =
+     not useLowerTFTrigger or triggerTFMode == "CurrentOnly" ? trigBearCur :
+     triggerTFMode == "LowerOnly"       ? trigBearLower :
+     triggerTFMode == "CurrentAndLower" ? (trigBearCur and trigBearLower) :
+     triggerTFMode == "CurrentOrLower"  ? (trigBearCur or trigBearLower) :
+     trigBearCur
+
+// --- 逆方向同時発生 NoTrade ---
+bool trigNoTrade = useOppositeTriggerNoTrade and finalBullTrig and finalBearTrig
+
+// --- クールダウン (トリガー発火からの経過本数) ---
+var int lastTrigBar = na
+bool trigFiredNow   = finalBullTrig or finalBearTrig
+bool trigCooldownOk = not useTriggerCooldown or na(lastTrigBar) or (bar_index - lastTrigBar) > triggerCooldownBars
+if trigFiredNow and trigCooldownOk
+    lastTrigBar := bar_index
+
+// --- 最終トリガー許可 ---
+bool allowLongByTrigger  = finalBullTrig and not trigNoTrade and trigCooldownOk
+bool allowShortByTrigger = finalBearTrig and not trigNoTrade and trigCooldownOk
+
+// ============================================================
+//  6. ボラフィルタ判定
+// ------------------------------------------------------------
+//  通常ボラ (volMode) と 高速ボラ (fastVolMode) は独立して評価。
+//  volMode / fastVolMode は定数入力なので分岐は全バーで一貫し、
+//  未使用側の関数 (ta.atr 等) は呼ばれないため軽量。
+// ============================================================
+
+// --- 通常ボラ (base) : volMode で選択 ---
+bool baseVolOk = true
+if volMode == "ATR"
+    float baseAtr = atrTf == "" ? ta.atr(atrLenBase) : request.security(syminfo.tickerid, atrTf, ta.atr(atrLenBase)[1], lookahead = barmerge.lookahead_off)
+    float atrAvg  = ta.sma(baseAtr, volAvgLen)
+    bool volAbsOk = baseAtr >= minAtrDollar
+    bool volRelOk = atrAvg > 0 and baseAtr >= atrAvg * volRatioMin
+    baseVolOk := not useMinVol or (volModeRel ? volRelOk : volAbsOk)
+else if volMode == "固定値"
+    baseVolOk := (high - low) >= fixedMin
+// volMode == OFF のときは baseVolOk = true (通常ボラ無効・関数呼び出しなし)
+
+// --- 高速ボラ (fast) : OFF/ATR/固定値。volMode に関係なく独立して使える ---
+bool fastVolPass = true
+if fastVolMode == "ATR"
+    float fastAtr = ta.atr(fastAtrLen)
+    float bodyAvgFast = ta.sma(math.abs(close - open), bodyAvgLen)
+    float rangeWidthV = ta.highest(high, rangeLookback) - ta.lowest(low, rangeLookback)
+    float atrRangeRatio = rangeWidthV > 0 ? fastAtr / rangeWidthV : 0.0
+    bool fastAtrOk    = fastAtr >= fastAtrMin
+    bool bodyAvgOk    = bodyAvgFast >= bodyAvgMin
+    bool rangeRatioOk = not useRangeRatioFilter or atrRangeRatio >= atrRangeRatioMin
+    fastVolPass := fastAtrOk and bodyAvgOk and rangeRatioOk
+else if fastVolMode == "固定値"
+    // ATRを使わず、直近 fastAtrLen 本の値幅を固定しきい値で判定
+    float fastRange = ta.highest(high, fastAtrLen) - ta.lowest(low, fastAtrLen)
+    float bodyAvgFast = ta.sma(math.abs(close - open), bodyAvgLen)
+    bool fastRangeOk = fastRange >= fastFixedMin
+    bool bodyAvgOk   = bodyAvgFast >= bodyAvgMin
+    fastVolPass := fastRangeOk and bodyAvgOk
+// fastVolMode == OFF のときは fastVolPass = true (関数呼び出しなし)
+
+// --- 合成 + 低ボラ解除後の待機 (クールダウン) ---
+bool volPassRaw = baseVolOk and fastVolPass
+bool volLowNow  = not volPassRaw
+var int volRecoveryStartBar = na
+if volLowNow
+    volRecoveryStartBar := na
+if not volLowNow and nz(volLowNow[1], false)
+    volRecoveryStartBar := bar_index
+bool volRecoveryOk = not useVolCooldown or na(volRecoveryStartBar) or (bar_index - volRecoveryStartBar) >= volRecoveryBars
+
+bool volOk = volPassRaw and volRecoveryOk
+
+// ============================================================
+//  7. 環境判定関数
+// ------------------------------------------------------------
+//  request.security から各時間足のコンテキストで呼ばれる。
+//  戻り値 : [trend, bullScore, bearScore, rangeScore]
+//           trend = 1=上昇 / 0=レンジ / -1=下降 / na=未判定
+// ============================================================
+f_envTrend(int minScore) =>
+    ema20  = ta.ema(close, len20)
+    ema50  = ta.ema(close, len50)
+    ema200 = ta.ema(close, len200)
+    atr    = ta.atr(envAtrLen)
+
+    dist     = math.abs(ema20 - ema50)
+    distPrev = dist[convDivBars]
+    slope20  = ema20 - ema20[slopeBars]
+    slope50  = ema50 - ema50[slopeBars]
+
+    cr20 = ta.crossover(close, ema20) or ta.crossunder(close, ema20)
+    cr50 = ta.crossover(close, ema50) or ta.crossunder(close, ema50)
+    cnt20 = math.sum(cr20 ? 1.0 : 0.0, crossBars)
+    cnt50 = math.sum(cr50 ? 1.0 : 0.0, crossBars)
+
+    rangeWidth = ta.highest(high, rangeBars) - ta.lowest(low, rangeBars)
+
+    // 上昇スコア
+    bullScore = 0
+    bullScore += useEma20Above50Up   and ema20 > ema50                     ? 1 : 0
+    bullScore += useEma20SlopeUp      and slope20 >=  atr * slopeMinMult    ? 1 : 0
+    bullScore += useEma50SlopeUp      and slope50 >=  atr * slopeMinMult    ? 1 : 0
+    bullScore += useCloseAboveEma50   and close > ema50                     ? 1 : 0
+    bullScore += useCloseAboveEma200  and close > ema200                    ? 1 : 0
+    bullScore += useEmaDistanceWideU  and ema20 > ema50 and dist >= atr * distWideMult ? 1 : 0
+    bullScore += useEmaExpansionU     and ema20 > ema50 and dist > distPrev            ? 1 : 0
+
+    // 下降スコア
+    bearScore = 0
+    bearScore += useEma20Below50Dn   and ema20 < ema50                     ? 1 : 0
+    bearScore += useEma20SlopeDown    and slope20 <= -atr * slopeMinMult    ? 1 : 0
+    bearScore += useEma50SlopeDown    and slope50 <= -atr * slopeMinMult    ? 1 : 0
+    bearScore += useCloseBelowEma50   and close < ema50                     ? 1 : 0
+    bearScore += useCloseBelowEma200  and close < ema200                    ? 1 : 0
+    bearScore += useEmaDistanceWideD  and ema20 < ema50 and dist >= atr * distWideMult ? 1 : 0
+    bearScore += useEmaExpansionD     and ema20 < ema50 and dist > distPrev            ? 1 : 0
+
+    // レンジスコア
+    rangeScore = 0
+    rangeScore += useEmaDistanceNarrow and dist <= atr * distNarrowMult              ? 1 : 0
+    rangeScore += useEma20SlopeWeak     and math.abs(slope20) <= atr * slopeMinMult  ? 1 : 0
+    rangeScore += useEma50SlopeWeak     and math.abs(slope50) <= atr * slopeMinMult  ? 1 : 0
+    rangeScore += useEmaCompression     and dist < distPrev                          ? 1 : 0
+    rangeScore += useEma20CrossCount    and cnt20 >= crossMinCount                    ? 1 : 0
+    rangeScore += useEma50CrossCount    and cnt50 >= crossMinCount                    ? 1 : 0
+    rangeScore += useRangeWidthSmall    and rangeWidth <= atr * rangeMult             ? 1 : 0
+
+    maxScore = math.max(bullScore, math.max(bearScore, rangeScore))
+    isBullTop  = bullScore == maxScore
+    isBearTop  = bearScore == maxScore
+    isRangeTop = rangeScore == maxScore
+    topCount   = (isBullTop ? 1 : 0) + (isBearTop ? 1 : 0) + (isRangeTop ? 1 : 0)
+    tie        = topCount > 1
+
+    int trend = na
+    if maxScore < minScore
+        trend := insufficientAsRange ? 0 : na
+    else if tie
+        trend := tieAsRange ? 0 : na
+    else if isBullTop
+        trend := 1
+    else if isBearTop
+        trend := -1
+    else
+        trend := 0
+    [trend, bullScore, bearScore, rangeScore]
+
+// 環境テーブル用ヘルパー
+// 要求文字列 → コード (1=上昇/0=レンジ/-1=下降/na=OFF)
+f_reqCode(string s) =>
+    s == "上昇" ? 1 : s == "レンジ" ? 0 : s == "下降" ? -1 : na
+
+// 実際のトレンド値 → 表示文字列
+f_trendTxt(float tr) =>
+    na(tr)   ? "未判定" :
+     tr == 1 ? "上昇" :
+     tr == -1 ? "下降" : "レンジ"
+
+// 要求文字列 → カラー
+f_reqCol(string s) =>
+    s == "上昇" ? colUp : s == "下降" ? colDown : s == "レンジ" ? colRange : colOff
+
+// ============================================================
+//  8. 環境フィルタ計算
+// ------------------------------------------------------------
+//  useEnvFilter は定数入力。OFF のときは if ブロックに入らず、
+//  request.security を一切呼ばないため軽い。
+// ============================================================
+bool allowByEnv  = true
+int  envEnabled = 0
+int  envMatched = 0
+
+var table envTable = table.new(position.top_right, 3, 6, border_width = 1)
+
+if useEnvFilter
+    [raw4H,  bull4H,  bear4H,  range4H ] = request.security(syminfo.tickerid, tf4H,  f_envTrend(minScore4H),  lookahead = barmerge.lookahead_off)
+    [raw1H,  bull1H,  bear1H,  range1H ] = request.security(syminfo.tickerid, tf1H,  f_envTrend(minScore1H),  lookahead = barmerge.lookahead_off)
+    [raw15M, bull15M, bear15M, range15M] = request.security(syminfo.tickerid, tf15M, f_envTrend(minScore15M), lookahead = barmerge.lookahead_off)
+    [raw5M,  bull5M,  bear5M,  range5M ] = request.security(syminfo.tickerid, tf5M,  f_envTrend(minScore5M),  lookahead = barmerge.lookahead_off)
+    [raw1M,  bull1M,  bear1M,  range1M ] = request.security(syminfo.tickerid, tf1M,  f_envTrend(minScore1M),  lookahead = barmerge.lookahead_off)
+
+    // 各TF : 有効か / 実際が要求と一致か
+    en4H  = reqTrend4H  != "OFF"
+    en1H  = reqTrend1H  != "OFF"
+    en15M = reqTrend15M != "OFF"
+    en5M  = reqTrend5M  != "OFF"
+    en1M  = reqTrend1M  != "OFF"
+
+    m4H  = en4H  and not na(raw4H)  and raw4H  == f_reqCode(reqTrend4H)
+    m1H  = en1H  and not na(raw1H)  and raw1H  == f_reqCode(reqTrend1H)
+    m15M = en15M and not na(raw15M) and raw15M == f_reqCode(reqTrend15M)
+    m5M  = en5M  and not na(raw5M)  and raw5M  == f_reqCode(reqTrend5M)
+    m1M  = en1M  and not na(raw1M)  and raw1M  == f_reqCode(reqTrend1M)
+
+    envEnabled := (en4H ? 1 : 0) + (en1H ? 1 : 0) + (en15M ? 1 : 0) + (en5M ? 1 : 0) + (en1M ? 1 : 0)
+    envMatched := (m4H ? 1 : 0) + (m1H ? 1 : 0) + (m15M ? 1 : 0) + (m5M ? 1 : 0) + (m1M ? 1 : 0)
+
+    // 必要一致数 (0=有効な全TF)。有効TFが無ければ制限なし。
+    int needMatch = reqMatchCount == 0 ? envEnabled : reqMatchCount
+    allowByEnv := envEnabled == 0 or envMatched >= needMatch
+
+    // 環境テーブル : TF | 要求 | 実際
+    if showEnvTable and barstate.islast
+        table.cell(envTable, 0, 0, "TF",   text_color = color.white, bgcolor = color.new(color.blue, 0))
+        table.cell(envTable, 1, 0, "要求", text_color = color.white, bgcolor = color.new(color.blue, 0))
+        table.cell(envTable, 2, 0, "実際", text_color = color.white, bgcolor = color.new(color.blue, 0))
+        labels = array.from("4H", "1H", "15M", "5M", "1M")
+        reqArr = array.from(reqTrend4H, reqTrend1H, reqTrend15M, reqTrend5M, reqTrend1M)
+        detArr = array.from(raw4H, raw1H, raw15M, raw5M, raw1M)
+        for i = 0 to 4
+            row  = i + 1
+            reqS = array.get(reqArr, i)
+            det  = array.get(detArr, i)
+            en   = reqS != "OFF"
+            matched = en and not na(det) and det == f_reqCode(reqS)
+            detCol  = not en ? colOff : matched ? color.new(color.green, 0) : color.new(color.red, 0)
+            table.cell(envTable, 0, row, array.get(labels, i), text_color = color.white, bgcolor = color.new(color.gray, 30))
+            table.cell(envTable, 1, row, reqS,               text_color = color.white, bgcolor = f_reqCol(reqS))
+            table.cell(envTable, 2, row, en ? f_trendTxt(det) : "-", text_color = color.white, bgcolor = detCol)
+
+// 環境フィルタ最終判定 (OFF なら常に許可)。ロング/ショート共通の環境テンプレート。
+bool envLongOk  = not useEnvFilter or allowByEnv
+bool envShortOk = not useEnvFilter or allowByEnv
+
+// ============================================================
+//  8b. Momentum モジュール (ストキャス) : 勢い・タイミング確認
+// ------------------------------------------------------------
+//  ※ 環境認識(トレンド判定)とは完全に独立。allowByEnv / envLongOk /
+//     envShortOk には絶対に混ぜない。
+//  設計順序上は FVG(場所) の次・Trigger(価格アクション) の前の
+//  「勢いが反転したか」の確認。状態保持し、その後 Trigger を待つ。
+//  役割: 勢い / 押し目・戻り / エントリータイミング / 逆張り禁止。
+//  出力: allowLongByStoch / allowShortByStoch / stochNoTrade
+//        → 上位の allowLongByMomentum / allowShortByMomentum に集約。
+//  ※ ストキャスの判定ロジックは単体モジュール版と同一。接続のみ追加。
+// ============================================================
+
+// ストキャス全体の有効フラグ (Momentumモジュール かつ ストキャスON)
+bool sAct = useMomentumModule and useStochMomentum
+
+// --- ストキャス計算 (関数化 → 参照TF切り替え可能) ---
+//   useStochTF=false … チャート足で計算 (従来挙動)
+//   useStochTF=true  … stochTF で計算 (request.security / lookahead_off で未来参照防止)
+f_stochCalc() =>
+    float _rawK = ta.stoch(close, high, low, kLen)
+    float _k = ta.sma(_rawK, kSmooth)
+    float _d = ta.sma(_k, dLen)
+    [_k, _d]
+
+// ※ 三項演算子 ?: はタプルを返せないため if/else で分岐 (request.security は useStochTF=true 時のみ)
+float stochK = na
+float stochD = na
+if useStochTF
+    [k1, d1] = request.security(syminfo.tickerid, stochTF, f_stochCalc(), lookahead = barmerge.lookahead_off)
+    stochK := k1
+    stochD := d1
+else
+    [k2, d2] = f_stochCalc()
+    stochK := k2
+    stochD := d2
+
+// 共通の傾き / クロス
+bool slopeUp     = stochK > stochK[1]
+bool slopeDown   = stochK < stochK[1]
+bool kdCrossUp   = ta.crossover(stochK, stochD)
+bool kdCrossDown = ta.crossunder(stochK, stochD)
+
+// 共通フィルター
+f_dirOK(bool isBuy) =>
+    bool d = not useKDirectionFilter or (isBuy ? slopeUp : slopeDown)
+    bool r = not useKDRelationFilter or (isBuy ? stochK > stochD : stochK < stochD)
+    d and r
+
+// --- A: Extreme Reversal (90/10 折り返し) ---
+bool turnDown = (useExtremeSlopeTurn and slopeDown) or (useExtremeKDCross and kdCrossDown)
+bool turnUp   = (useExtremeSlopeTurn and slopeUp)   or (useExtremeKDCross and kdCrossUp)
+
+float stochSlope = stochK - stochK[1]
+bool slopeStrengthOK_sell = not useSlopeStrengthFilter or stochSlope <= -stochSlopeMin
+bool slopeStrengthOK_buy  = not useSlopeStrengthFilter or stochSlope >=  stochSlopeMin
+
+var bool  wasExtremeHigh       = false
+var bool  wasExtremeLow        = false
+var bool  extremeHighTriggered = false
+var bool  extremeLowTriggered  = false
+var float lastExtremeHighValue = na
+var float lastExtremeLowValue  = na
+
+if stochK >= extremeHigh
+    wasExtremeHigh := true
+    lastExtremeHighValue := na(lastExtremeHighValue) ? stochK : math.max(lastExtremeHighValue, stochK)
+if stochK <= extremeLow
+    wasExtremeLow := true
+    lastExtremeLowValue := na(lastExtremeLowValue) ? stochK : math.min(lastExtremeLowValue, stochK)
+if stochK <= extremeResetLevelHigh
+    wasExtremeHigh := false
+    extremeHighTriggered := false
+    lastExtremeHighValue := na
+if stochK >= extremeResetLevelLow
+    wasExtremeLow := false
+    extremeLowTriggered := false
+    lastExtremeLowValue := na
+
+bool retraceOK_sell = not useExtremeRetraceFilter or (not na(lastExtremeHighValue) and (lastExtremeHighValue - stochK) >= extremeRetraceMin)
+bool retraceOK_buy  = not useExtremeRetraceFilter or (not na(lastExtremeLowValue)  and (stochK - lastExtremeLowValue)  >= extremeRetraceMin)
+
+bool exSell = sAct and useExtremeReversal and wasExtremeHigh and (not useExtremeOneShot or not extremeHighTriggered) and turnDown and slopeStrengthOK_sell and retraceOK_sell and f_dirOK(false)
+bool exBuy  = sAct and useExtremeReversal and wasExtremeLow  and (not useExtremeOneShot or not extremeLowTriggered)  and turnUp   and slopeStrengthOK_buy  and retraceOK_buy  and f_dirOK(true)
+
+if exSell
+    extremeHighTriggered := true
+if exBuy
+    extremeLowTriggered := true
+
+// --- B: OB/OS Cross (80/20 クロス) ---
+bool obSell = sAct and useOBOSCross and stochK > obLevel and kdCrossDown and f_dirOK(false)
+bool obBuy  = sAct and useOBOSCross and stochK < osLevel and kdCrossUp   and f_dirOK(true)
+
+// --- C: Middle Cross (50 抜け / 順張り勢い確認) ---
+bool midBuy  = sAct and useMiddleCross and ta.crossover(stochK, middleLevel)  and stochK > stochD and f_dirOK(true)
+bool midSell = sAct and useMiddleCross and ta.crossunder(stochK, middleLevel) and stochK < stochD and f_dirOK(false)
+
+// --- D: Trend Stickiness (張り付き → 逆張り禁止) ---
+var int bullStickCount = 0
+var int bearStickCount = 0
+bullStickCount := stochK >= obLevel ? bullStickCount + 1 : 0
+bearStickCount := stochK <= osLevel ? bearStickCount + 1 : 0
+bool stochBullSticky = sAct and useStickinessFilter and bullStickCount >= stickBars
+bool stochBearSticky = sAct and useStickinessFilter and bearStickCount >= stickBars
+bool stochNoSell = stochBullSticky   // 強い上昇中はSELL禁止
+bool stochNoBuy  = stochBearSticky   // 強い下降中はBUY禁止
+
+// --- E/F: Divergence (pivot ベース) ---
+float pricePH = ta.pivothigh(high, divPivotLen, divPivotLen)
+float pricePL = ta.pivotlow(low,  divPivotLen, divPivotLen)
+float stochAtPivot = stochK[divPivotLen]
+
+var float phPrev    = na
+var float phLast    = na
+var float shHPrev   = na
+var float shHLast   = na
+var int   phBarPrev = na
+var int   phBarLast = na
+var float plPrev    = na
+var float plLast    = na
+var float shLPrev   = na
+var float shLLast   = na
+var int   plBarPrev = na
+var int   plBarLast = na
+
+bool newPH = not na(pricePH)
+bool newPL = not na(pricePL)
+if newPH
+    phPrev := phLast
+    shHPrev := shHLast
+    phBarPrev := phBarLast
+    phLast := pricePH
+    shHLast := stochAtPivot
+    phBarLast := bar_index - divPivotLen
+if newPL
+    plPrev := plLast
+    shLPrev := shLLast
+    plBarPrev := plBarLast
+    plLast := pricePL
+    shLLast := stochAtPivot
+    plBarLast := bar_index - divPivotLen
+
+bool phInRange = not na(phPrev) and (phBarLast - phBarPrev) <= divLookback
+bool plInRange = not na(plPrev) and (plBarLast - plBarPrev) <= divLookback
+
+bool regSell = sAct and useRegularDivergence and newPH and phInRange and phLast > phPrev and shHLast < shHPrev
+bool regBuy  = sAct and useRegularDivergence and newPL and plInRange and plLast < plPrev and shLLast > shLPrev
+bool hidBuy  = sAct and useHiddenDivergence and newPL and plInRange and plLast > plPrev and shLLast < shLPrev
+bool hidSell = sAct and useHiddenDivergence and newPH and phInRange and phLast < phPrev and shHLast > shHPrev
+
+// --- Signal Direction (優先: Regular > Hidden > Extreme > OBOS > Middle) ---
+bool anyReg = regBuy or regSell
+bool anyHid = hidBuy or hidSell
+bool anyEx  = exBuy or exSell
+bool anyOB  = obBuy or obSell
+bool anyMid = midBuy or midSell
+
+int stochDirection = not sAct ? 0 :
+                      anyReg ? (regBuy ? 1 : -1) :
+                      anyHid ? (hidBuy ? 1 : -1) :
+                      anyEx  ? (exBuy ? 1 : -1) :
+                      anyOB  ? (obBuy ? 1 : -1) :
+                      anyMid ? (midBuy ? 1 : -1) : 0
+
+// Signal Type (1=Extreme/2=OBOS/3=Middle/4=RegDiv/5=HidDiv)
+int stochSignalType = not sAct ? 0 :
+                       anyReg ? 4 :
+                       anyHid ? 5 :
+                       anyEx  ? 1 :
+                       anyOB  ? 2 :
+                       anyMid ? 3 : 0
+
+// --- ストキャス イベント (そのバーで発生したシグナル) ---
+bool stochLongEvent  = sAct and stochDirection == 1  and not stochNoBuy
+bool stochShortEvent = sAct and stochDirection == -1 and not stochNoSell
+
+// --- ストキャス 状態管理 : イベント発生後 stochStateMaxBars 本 OK を保持 ---
+//   タイミングズレ (ストキャス→FVG→トリガー) で弾かれ回数が減るのを緩和。
+//   ※ A〜Fパターン判定は不変。イベントを状態化して allow を状態ベースにするだけ。
+var bool stochLongStateOk   = false
+var bool stochShortStateOk  = false
+var int  stochLongStateBar  = na
+var int  stochShortStateBar = na
+var int  stochLongStateType  = 0
+var int  stochShortStateType = 0
+
+if useStochStateWindow
+    if stochLongEvent
+        stochLongStateOk   := true
+        stochLongStateBar  := bar_index
+        stochLongStateType := stochSignalType
+    if stochShortEvent
+        stochShortStateOk   := true
+        stochShortStateBar  := bar_index
+        stochShortStateType := stochSignalType
+    if stochLongStateOk and not na(stochLongStateBar) and bar_index - stochLongStateBar > stochStateMaxBars
+        stochLongStateOk := false
+    if stochShortStateOk and not na(stochShortStateBar) and bar_index - stochShortStateBar > stochStateMaxBars
+        stochShortStateOk := false
+
+// --- ストキャス 接続用出力 (状態ベース) ---
+//   sAct=false … 通過 (Momentum側でOFF扱い)
+//   状態管理ON … 保持中フラグ かつ 逆張り禁止でない
+//   状態管理OFF … 従来のイベント単バー
+bool allowLongByStoch =
+     not sAct ? true :
+     useStochStateWindow ? (stochLongStateOk and not stochNoBuy) :
+     stochLongEvent
+bool allowShortByStoch =
+     not sAct ? true :
+     useStochStateWindow ? (stochShortStateOk and not stochNoSell) :
+     stochShortEvent
+bool stochNoTrade = sAct and (stochNoBuy or stochNoSell)
+
+// ============================================================
+//  8b-MACD. Momentum : MACD モジュール (勢い / タイミング確認)
+// ------------------------------------------------------------
+//  ストキャスと並列の Momentum 指標。WinZone/Trigger には混ぜない。
+//  A:Signalクロス B:ゼロ上下(方向F) C:ゼロクロス D:Hist拡大
+//  E:Hist縮小(Exit警戒) F:Regular Div G:Hidden Div H:収束→拡散
+//  useMACDModule=false の時は ta.macd / ta.atr / ta.sma / ta.pivot* /
+//  Divergence / Compression / 状態更新 を一切実行しない。
+//  機能単位でも : Divergence OFF→pivot無し / ATR正規化 OFF→ta.atr無し /
+//    相対収束 OFF→ta.sma無し。
+//  変数はすべて macd プレフィックスで既存グローバルとの衝突を回避。
+//  出力 : allowLongByMACD / allowShortByMACD / macdNoTrade / macdDirection /
+//         macdSignalType / macdRank / macdExitRank / macdExitDirection
+// ============================================================
+
+// --- ヘルパー (定義はグローバル。計算呼び出しは if 内のみ) ---
+f_macdDirOK(bool isBuy, float _line, float _hist, bool _zOKB, bool _zOKS) =>
+    bool z = not useMACDZeroDirectionFilter or ((isBuy ? _line > 0 : _line < 0) and (isBuy ? _zOKB : _zOKS))
+    bool h = not useMACDHistDirectionFilter or (isBuy ? _hist > 0 : _hist < 0)
+    bool s = not useMACDSlopeFilter or (isBuy ? _line > _line[1] : _line < _line[1])
+    z and h and s
+
+// --- 出力 (OFF安全デフォルト。素通し時はこの値のまま) ---
+int  macdSignalType = 0
+int  macdDirection  = 0
+int  macdRank       = 0
+int  macdExitRank   = 0
+int  macdExitDirection = 0
+bool macdNoTrade      = false
+bool macdNoTradeLong  = false
+bool macdNoTradeShort = false
+bool macdMomentumLong  = false
+bool macdMomentumShort = false
+
+if useMACDModule
+    [macdLine, macdSignal, macdHist] = ta.macd(close, macdFastLen, macdSlowLen, macdSignalLen)
+
+    // ② Histogram Slope Strength
+    float macdHistSlope = macdHist - macdHist[1]
+    bool macdHistSlopeBull = macdHistSlope >=  macdHistSlopeMin
+    bool macdHistSlopeBear = macdHistSlope <= -macdHistSlopeMin
+    bool macdHistSlopeOKBuy  = not useMACDHistSlopeStrength or macdHistSlopeBull
+    bool macdHistSlopeOKSell = not useMACDHistSlopeStrength or macdHistSlopeBear
+
+    // ③ Zero Distance
+    float macdZeroDistance = math.abs(macdLine)
+    bool macdZeroDistOKBuy  = not useMACDZeroDistanceFilter or (macdLine > 0 and macdZeroDistance >= macdZeroDistanceMin)
+    bool macdZeroDistOKSell = not useMACDZeroDistanceFilter or (macdLine < 0 and macdZeroDistance >= macdZeroDistanceMin)
+
+    // ① Relative Compression (相対収束 : ta.sma は相対収束ON時のみ)
+    float macdHistAbs    = math.abs(macdHist)
+    float macdHistAbsAvg = na
+    if useMACDRelativeCompression
+        macdHistAbsAvg := ta.sma(macdHistAbs, macdRelativeCompressionLookback)
+    bool macdRelComp = useMACDRelativeCompression and not na(macdHistAbsAvg) and macdHistAbs <= macdHistAbsAvg * macdRelativeCompressionMult
+
+    // ATR (収束しきい値のATR正規化ON時のみ ta.atr)
+    float macdAtr = na
+    if useMACDATRNormalizedThreshold
+        macdAtr := ta.atr(macdAtrLen)
+
+    // B: ゼロライン 上/下 (方向フィルター)
+    bool macdAboveZero = macdLine > 0
+    bool macdBelowZero = macdLine < 0
+    bool allowLongByMACDZero  = (not useMACDZeroFilter or macdAboveZero) and macdZeroDistOKBuy
+    bool allowShortByMACDZero = (not useMACDZeroFilter or macdBelowZero) and macdZeroDistOKSell
+
+    // A: MACD / Signal クロス
+    bool macdBuyCrossSignal  = useMACDSignalCross and ta.crossover(macdLine, macdSignal)  and f_macdDirOK(true,  macdLine, macdHist, macdZeroDistOKBuy, macdZeroDistOKSell)
+    bool macdSellCrossSignal = useMACDSignalCross and ta.crossunder(macdLine, macdSignal) and f_macdDirOK(false, macdLine, macdHist, macdZeroDistOKBuy, macdZeroDistOKSell)
+
+    // C: ゼロラインクロス
+    bool macdBuyZeroCrossSignal  = useMACDZeroCross and ta.crossover(macdLine, 0)  and f_macdDirOK(true,  macdLine, macdHist, macdZeroDistOKBuy, macdZeroDistOKSell)
+    bool macdSellZeroCrossSignal = useMACDZeroCross and ta.crossunder(macdLine, 0) and f_macdDirOK(false, macdLine, macdHist, macdZeroDistOKBuy, macdZeroDistOKSell)
+
+    // D: ヒストグラム拡大 (勢い確認)
+    bool macdHistExpandingBull = macdHist > 0 and macdHist > macdHist[1]
+    bool macdHistExpandingBear = macdHist < 0 and macdHist < macdHist[1]
+    var int macdBullExpCount = 0
+    var int macdBearExpCount = 0
+    macdBullExpCount := macdHistExpandingBull ? macdBullExpCount + 1 : 0
+    macdBearExpCount := macdHistExpandingBear ? macdBearExpCount + 1 : 0
+    bool macdHistBullOK = useMACDHistExpansionConsecutive ? macdBullExpCount >= macdHistExpansionBars : macdHistExpandingBull
+    bool macdHistBearOK = useMACDHistExpansionConsecutive ? macdBearExpCount >= macdHistExpansionBars : macdHistExpandingBear
+    bool macdBuyHistExpansionSignal  = useMACDHistExpansion and macdHistBullOK and macdHistSlopeOKBuy  and f_macdDirOK(true,  macdLine, macdHist, macdZeroDistOKBuy, macdZeroDistOKSell)
+    bool macdSellHistExpansionSignal = useMACDHistExpansion and macdHistBearOK and macdHistSlopeOKSell and f_macdDirOK(false, macdLine, macdHist, macdZeroDistOKBuy, macdZeroDistOKSell)
+
+    // E: ヒストグラム縮小 (Exit / 失速警戒)
+    bool macdLongWeakening  = macdHist > 0 and macdHist < macdHist[1]
+    bool macdShortWeakening = macdHist < 0 and macdHist > macdHist[1]
+    bool macdExitLongWarning  = useMACDHistShrink and macdLongWeakening
+    bool macdExitShortWarning = useMACDHistShrink and macdShortWeakening
+
+    // F/G: Divergence (pivot ベース / macdLine 値で判定 / Div ON時のみ pivot)
+    bool macdUseDiv = useMACDRegularDivergence or useMACDHiddenDivergence
+    bool macdRegSell = false
+    bool macdRegBuy  = false
+    bool macdHidBuy  = false
+    bool macdHidSell = false
+    if macdUseDiv
+        float macdPricePH = ta.pivothigh(high, macdDivPivotLen, macdDivPivotLen)
+        float macdPricePL = ta.pivotlow(low,  macdDivPivotLen, macdDivPivotLen)
+        float macdAtPivot = macdLine[macdDivPivotLen]
+        var float macdPhPrev = na
+        var float macdPhLast = na
+        var float macdMhPrev = na
+        var float macdMhLast = na
+        var int   macdPhBarPrev = na
+        var int   macdPhBarLast = na
+        var float macdPlPrev = na
+        var float macdPlLast = na
+        var float macdMlPrev = na
+        var float macdMlLast = na
+        var int   macdPlBarPrev = na
+        var int   macdPlBarLast = na
+        bool macdNewPH = not na(macdPricePH)
+        bool macdNewPL = not na(macdPricePL)
+        if macdNewPH
+            macdPhPrev := macdPhLast
+            macdMhPrev := macdMhLast
+            macdPhBarPrev := macdPhBarLast
+            macdPhLast := macdPricePH
+            macdMhLast := macdAtPivot
+            macdPhBarLast := bar_index - macdDivPivotLen
+        if macdNewPL
+            macdPlPrev := macdPlLast
+            macdMlPrev := macdMlLast
+            macdPlBarPrev := macdPlBarLast
+            macdPlLast := macdPricePL
+            macdMlLast := macdAtPivot
+            macdPlBarLast := bar_index - macdDivPivotLen
+        bool macdPhInRange = not na(macdPhPrev) and (macdPhBarLast - macdPhBarPrev) <= macdDivLookback
+        bool macdPlInRange = not na(macdPlPrev) and (macdPlBarLast - macdPlBarPrev) <= macdDivLookback
+        macdRegSell := useMACDRegularDivergence and macdNewPH and macdPhInRange and macdPhLast > macdPhPrev and macdMhLast < macdMhPrev
+        macdRegBuy  := useMACDRegularDivergence and macdNewPL and macdPlInRange and macdPlLast < macdPlPrev and macdMlLast > macdMlPrev
+        macdHidBuy  := useMACDHiddenDivergence and macdNewPL and macdPlInRange and macdPlLast > macdPlPrev and macdMlLast < macdMlPrev
+        macdHidSell := useMACDHiddenDivergence and macdNewPH and macdPhInRange and macdPhLast < macdPhPrev and macdMhLast > macdMhPrev
+    bool macdSellRegularDivSignal = macdRegSell
+    bool macdBuyRegularDivSignal  = macdRegBuy
+    bool macdBuyHiddenDivSignal   = macdHidBuy
+    bool macdSellHiddenDivSignal  = macdHidSell
+
+    // H: 収束 → 拡散 (レンジ後の初動)
+    float macdCompThresh = useMACDATRNormalizedThreshold ? macdAtr * macdCompressionThreshold : macdCompressionThreshold
+    bool macdCompressionCore = (math.abs(macdHist) <= macdCompThresh) or macdRelComp
+    var int macdCompCount = 0
+    macdCompCount := macdCompressionCore ? macdCompCount + 1 : 0
+    bool macdCompression = useMACDCompressionExpansion and macdCompCount >= macdCompressionBars
+    bool macdWasCompressed = macdCompression[1]
+    bool macdBuyExpansionFromCompression  = useMACDCompressionExpansion and macdWasCompressed and macdHist > 0 and macdHist > macdHist[1] and f_macdDirOK(true,  macdLine, macdHist, macdZeroDistOKBuy, macdZeroDistOKSell)
+    bool macdSellExpansionFromCompression = useMACDCompressionExpansion and macdWasCompressed and macdHist < 0 and macdHist < macdHist[1] and f_macdDirOK(false, macdLine, macdHist, macdZeroDistOKBuy, macdZeroDistOKSell)
+
+    // Signal Type / Direction (優先: RegDiv>HidDiv>CompExp>ZeroCross>SignalCross>HistExp)
+    bool macdAnyReg   = macdRegBuy or macdRegSell
+    bool macdAnyHid   = macdHidBuy or macdHidSell
+    bool macdAnyComp  = macdBuyExpansionFromCompression or macdSellExpansionFromCompression
+    bool macdAnyZeroX = macdBuyZeroCrossSignal or macdSellZeroCrossSignal
+    bool macdAnySigX  = macdBuyCrossSignal or macdSellCrossSignal
+    bool macdAnyHistX = macdBuyHistExpansionSignal or macdSellHistExpansionSignal
+    macdSignalType := macdAnyReg ? 4 : macdAnyHid ? 5 : macdAnyComp ? 6 : macdAnyZeroX ? 2 : macdAnySigX ? 1 : macdAnyHistX ? 3 : 0
+    macdDirection  := macdAnyReg ? (macdRegBuy ? 1 : -1) : macdAnyHid ? (macdHidBuy ? 1 : -1) : macdAnyComp ? (macdBuyExpansionFromCompression ? 1 : -1) : macdAnyZeroX ? (macdBuyZeroCrossSignal ? 1 : -1) : macdAnySigX ? (macdBuyCrossSignal ? 1 : -1) : macdAnyHistX ? (macdBuyHistExpansionSignal ? 1 : -1) : 0
+
+    // Rank (1 HistExp /2 SignalCross /3 ZeroCross・CompExp /4 Div /5 強合流)
+    bool macdAnyDiv = macdAnyReg or macdAnyHid
+    bool macdHistSlopeStrong = macdHistSlopeBull or macdHistSlopeBear
+    bool macdRank5 = (macdAnyComp and macdAnyZeroX) or (macdAnyDiv and macdAnyHistX) or (macdAnyComp and macdHistSlopeStrong)
+    macdRank := macdRank5 ? 5 : macdAnyDiv ? 4 : (macdAnyZeroX or macdAnyComp) ? 3 : macdAnySigX ? 2 : macdAnyHistX ? 1 : 0
+
+    // ④ Exit Rank (利確・撤退判断)
+    int macdLongExitRank  = not macdLongWeakening ? 0 : (macdSellRegularDivSignal and macdSellZeroCrossSignal) ? 5 : macdSellRegularDivSignal ? 4 : macdSellZeroCrossSignal ? 3 : macdSellCrossSignal ? 2 : 1
+    int macdShortExitRank = not macdShortWeakening ? 0 : (macdBuyRegularDivSignal and macdBuyZeroCrossSignal) ? 5 : macdBuyRegularDivSignal ? 4 : macdBuyZeroCrossSignal ? 3 : macdBuyCrossSignal ? 2 : 1
+    macdExitRank := math.max(macdLongExitRank, macdShortExitRank)
+    macdExitDirection := (macdLongExitRank >= macdShortExitRank and macdLongExitRank > 0) ? 1 : macdShortExitRank > 0 ? -1 : 0
+
+    // 接続用出力 (macdNoTrade は横ばい時のみ / 方向非依存 → 両方向へ)
+    macdNoTrade      := useMACDFlatNoTrade and macdCompression
+    macdNoTradeLong  := macdNoTrade
+    macdNoTradeShort := macdNoTrade
+    macdMomentumLong  := macdDirection == 1
+    macdMomentumShort := macdDirection == -1
+
+// --- MACD 状態管理 ---
+//  BUYシグナル(macdMomentumLong) → longMACDStateOk=true / macdStateMaxBars本で期限切れ
+//  ※ 更新は useMACDModule かつ useMACDStateWindow の時だけ。
+var bool longMACDStateOk  = false
+var bool shortMACDStateOk = false
+var int  longMACDStateBar  = na
+var int  shortMACDStateBar = na
+if useMACDModule and useMACDStateWindow
+    if macdMomentumLong
+        longMACDStateOk := true
+        longMACDStateBar := bar_index
+    if macdMomentumShort
+        shortMACDStateOk := true
+        shortMACDStateBar := bar_index
+    if longMACDStateOk and not na(longMACDStateBar) and bar_index - longMACDStateBar > macdStateMaxBars
+        longMACDStateOk := false
+    if shortMACDStateOk and not na(shortMACDStateBar) and bar_index - shortMACDStateBar > macdStateMaxBars
+        shortMACDStateOk := false
+
+// --- MACD 許可 ---
+//  OFF … 常に許可 / 状態管理OFF … シグナル単バー+NoTrade / 状態管理ON … 保持中+NoTrade
+bool allowLongByMACD  = not useMACDModule ? true : useMACDStateWindow ? (longMACDStateOk and not macdNoTradeLong) : (macdMomentumLong and not macdNoTradeLong)
+bool allowShortByMACD = not useMACDModule ? true : useMACDStateWindow ? (shortMACDStateOk and not macdNoTradeShort) : (macdMomentumShort and not macdNoTradeShort)
+
+// ============================================================
+//  8c. Momentum 集約 (ストキャス + MACD。将来 RSI/CCI/ADX/ROC も同じ構造で追加)
+// ------------------------------------------------------------
+//  各Momentum指標の long/short 許可を momentumMode(AND/OR)で結合。
+//  OFFの指標は AND=中立(通過) / OR=不参加。全部OFFなら常時許可。
+//  useMACDModule=false の時は allowLongByMACD=true / macdNoTrade=false のため
+//  既存(ストキャスのみ)の結果と一致する。
+// ============================================================
+bool stochMomentumEnabled = useStochMomentum
+bool macdMomentumEnabled  = useMACDModule
+
+// AND中立(通過) / OR不参加 のための通過フラグ
+bool momoLongStoch  = not useStochMomentum or allowLongByStoch
+bool momoShortStoch = not useStochMomentum or allowShortByStoch
+bool momoLongMACD   = not useMACDModule or allowLongByMACD
+bool momoShortMACD  = not useMACDModule or allowShortByMACD
+
+// 結合 : AND=有効な全指標一致 / OR=有効な指標のいずれか一致 (全OFFは通過)
+bool momoLongCombined = momentumMode == "AND" ? (momoLongStoch and momoLongMACD) : ((stochMomentumEnabled and allowLongByStoch) or (macdMomentumEnabled and allowLongByMACD) or (not stochMomentumEnabled and not macdMomentumEnabled))
+bool momoShortCombined = momentumMode == "AND" ? (momoShortStoch and momoShortMACD) : ((stochMomentumEnabled and allowShortByStoch) or (macdMomentumEnabled and allowShortByMACD) or (not stochMomentumEnabled and not macdMomentumEnabled))
+
+// Momentum NoTrade (方向別。ストキャス逆張り禁止 + MACD横ばい NoTrade を織り込む)
+bool momoNoTradeLong  = stochNoTrade or macdNoTradeLong
+bool momoNoTradeShort = stochNoTrade or macdNoTradeShort
+
+// 最終 Momentum 許可 (OFFなら常に許可。方向別 NoTrade 中はその方向のみ禁止)
+bool allowLongByMomentum  = not useMomentumModule or (momoLongCombined  and not momoNoTradeLong)
+bool allowShortByMomentum = not useMomentumModule or (momoShortCombined and not momoNoTradeShort)
+
+// ============================================================
+//  9. SL / TP / ロット計算
+// ============================================================
+float patLow  = math.min(low,  low[1])
+float patHigh = math.max(high, high[1])
+float entryEst = close
+
+// SL方式: パターン=包み足の高安ベース / 固定=一定の価格幅
+float longStop = slMode == "固定" ? entryEst - slFixed : patLow - slBuf
+float longRisk = entryEst - longStop
+float longTP   = entryEst + longRisk * rrRatio
+
+float shortStop = slMode == "固定" ? entryEst + slFixed : patHigh + slBuf
+float shortRisk = shortStop - entryEst
+float shortTP   = entryEst - shortRisk * rrRatio
+
+// 損失許容額 = 基準資金 * リスク%
+//   複利 OFF … 元金 (initial_capital) 基準 = 単利
+//   複利 ON  … 現在残高 (equity) 基準 = 複利
+//   ピラミッティング時のリスク (各追加エントリーもこの値で数量を再計算):
+//     「各回そのまま」… 各エントリーで riskPct をそのまま使用 (合計最大 riskPct×回数)
+//     「分割」        … riskPct / maxPyramidEntries を1回あたりに使用 (合計 ≒ riskPct)
+//   usePyramiding=false のときは effRiskPct = riskPct (従来と同じ)。
+float effRiskPct  = (usePyramiding and pyramidRiskMode == "分割") ? riskPct / maxPyramidEntries : riskPct
+float baseCapital = useCompound ? strategy.equity : strategy.initial_capital
+float riskCapital = baseCapital * effRiskPct / 100.0
+
+// リスク幅(価格)から整数ロットを算出 (1未満は 0 → エントリーしない)
+f_qty(float riskPerUnit) =>
+    float raw = riskPerUnit > 0 ? riskCapital / (riskPerUnit * syminfo.pointvalue) : 0.0
+    math.floor(raw)
+
+float longQty  = f_qty(longRisk)
+float shortQty = f_qty(shortRisk)
+
+// ============================================================
+//  10. 最終エントリー条件
+// ------------------------------------------------------------
+//  設計順序 : 環境認識 → WinZone(FVG/出来高) → Momentum(勢い) → Trigger(価格) → Entry
+//    ・envLongOk           = どちら向きに狙うか (環境認識)
+//    ・longWinZoneOk       = どこで狙うか (FVG / 出来高POC・場所条件)
+//    ・allowLongByMomentum = 勢いが反転したか (ストキャス・状態保持)
+//    ・allowLongByTrigger  = 価格が実際に反応したか (EMA/包み足/ピンバー・最後の引き金)
+//    ・volOk / risk / qty  = 執行フィルタ
+//  ※ AND条件なので数式結果は順序に依らないが、思想順に並べる。
+// ============================================================
+bool longSig  = allowLongByTrigger
+bool shortSig = allowShortByTrigger
+
+// --- 時間帯フィルタ (東京時間 JST) ---
+//   Asia 09:00-16:00 / EU 16:00-21:00 / NY 21:00-翌03:00 の中だけ許可。
+int  jstHour   = hour(time, "Asia/Tokyo")
+bool inAsia    = jstHour >= 9  and jstHour < 16
+bool inEU      = jstHour >= 16 and jstHour < 21
+bool inNY      = jstHour >= 21 or  jstHour < 3
+bool sessionOk =
+     not useSessionFilter or
+     (useAsiaSession and inAsia) or
+     (useEUSession   and inEU) or
+     (useNYSession   and inNY)
+
+bool canLong =
+     useLong and
+     sessionOk and
+     envLongOk and
+     longWinZoneOk and
+     allowLongByMomentum and
+     allowLongByTrigger and
+     volOk and
+     not lineNoTradeLong and
+     longRisk > 0 and
+     longQty >= 1
+
+bool canShort =
+     useShort and
+     sessionOk and
+     envShortOk and
+     shortWinZoneOk and
+     allowShortByMomentum and
+     allowShortByTrigger and
+     volOk and
+     not lineNoTradeShort and
+     shortRisk > 0 and
+     shortQty >= 1
+
+// ============================================================
+//  11. 発注 (ピラミッティング対応)
+// ------------------------------------------------------------
+//  ・初回エントリー          : ノーポジ時に従来どおり発注 (Long_1 / Short_1)。
+//  ・同方向への追加エントリー  : usePyramiding=true かつ 既に同方向を保有中で、
+//      現在の同方向エントリー数 < maxPyramidEntries、前回同方向エントリーから
+//      pyramidCooldownBars 本以上経過、その足で canLong/canShort が再成立、
+//      反対方向を保有していない、を全て満たすときだけ許可。
+//  ・最大保有回数            : maxPyramidEntries (strategy() 側の pyramiding は上限3で固定)。
+//  ・反対方向へのドテン禁止    : ロング保有中のショート/ショート保有中のロングは出さない。
+//  ・個別SL/TP              : 各エントリーの SL/TP をエントリー時点で固定保存し、
+//      後続シグナルの価格で上書きしない。各 strategy.exit は保存値で独立決済。
+//  ・usePyramiding=false     : 初回のみ・最大1・追加なし・ドテンなし (従来動作)。
+// ============================================================
+
+// --- ポジション状態 ---
+bool flatPosition  = strategy.position_size == 0
+bool longPosition  = strategy.position_size > 0
+bool shortPosition = strategy.position_size < 0
+
+// --- 各エントリー(スロット 1/2/3)専用の SL/TP と発注足 (Bar が na のスロットは空き) ---
+var float longStop1 = na
+var float longTP1   = na
+var float longStop2 = na
+var float longTP2   = na
+var float longStop3 = na
+var float longTP3   = na
+var int   longSlot1Bar = na
+var int   longSlot2Bar = na
+var int   longSlot3Bar = na
+
+var float shortStop1 = na
+var float shortTP1   = na
+var float shortStop2 = na
+var float shortTP2   = na
+var float shortStop3 = na
+var float shortTP3   = na
+var int   shortSlot1Bar = na
+var int   shortSlot2Bar = na
+var int   shortSlot3Bar = na
+
+// クールダウン用 : 前回同方向エントリー足
+var int lastLongEntryBar  = na
+var int lastShortEntryBar = na
+
+// --- 保有エントリーの走査 (entry_id が Long_/Short_ で始まるものを方向別に把握) ---
+//   総数ではなく ID で判定し、部分決済/個別決済後も実際の保有数とズレないようにする。
+bool longSlot1Open  = false
+bool longSlot2Open  = false
+bool longSlot3Open  = false
+bool shortSlot1Open = false
+bool shortSlot2Open = false
+bool shortSlot3Open = false
+int  longOpenCount  = 0
+int  shortOpenCount = 0
+if strategy.opentrades > 0
+    for i = 0 to strategy.opentrades - 1
+        string eid = strategy.opentrades.entry_id(i)
+        if str.startswith(eid, "Long_")
+            longOpenCount += 1
+            longSlot1Open := longSlot1Open or eid == "Long_1"
+            longSlot2Open := longSlot2Open or eid == "Long_2"
+            longSlot3Open := longSlot3Open or eid == "Long_3"
+        else if str.startswith(eid, "Short_")
+            shortOpenCount += 1
+            shortSlot1Open := shortSlot1Open or eid == "Short_1"
+            shortSlot2Open := shortSlot2Open or eid == "Short_2"
+            shortSlot3Open := shortSlot3Open or eid == "Short_3"
+
+// --- 個別決済されたスロットを解放 (走査で閉じ、かつ発注足より後なら空きに戻す) ---
+//   例: Long_2 が先に決済されたら Long_2 だけ空き、次の追加で Long_2 を再利用可能。
+if not na(longSlot1Bar) and not longSlot1Open and bar_index > longSlot1Bar
+    longStop1 := na
+    longTP1   := na
+    longSlot1Bar := na
+if not na(longSlot2Bar) and not longSlot2Open and bar_index > longSlot2Bar
+    longStop2 := na
+    longTP2   := na
+    longSlot2Bar := na
+if not na(longSlot3Bar) and not longSlot3Open and bar_index > longSlot3Bar
+    longStop3 := na
+    longTP3   := na
+    longSlot3Bar := na
+if not na(shortSlot1Bar) and not shortSlot1Open and bar_index > shortSlot1Bar
+    shortStop1 := na
+    shortTP1   := na
+    shortSlot1Bar := na
+if not na(shortSlot2Bar) and not shortSlot2Open and bar_index > shortSlot2Bar
+    shortStop2 := na
+    shortTP2   := na
+    shortSlot2Bar := na
+if not na(shortSlot3Bar) and not shortSlot3Open and bar_index > shortSlot3Bar
+    shortStop3 := na
+    shortTP3   := na
+    shortSlot3Bar := na
+
+// --- 空きスロット / 現在の同方向エントリー数 (発注済み+保有中を Bar で判定) ---
+int longFreeSlot  = na(longSlot1Bar)  ? 1 : na(longSlot2Bar)  ? 2 : na(longSlot3Bar)  ? 3 : 0
+int shortFreeSlot = na(shortSlot1Bar) ? 1 : na(shortSlot2Bar) ? 2 : na(shortSlot3Bar) ? 3 : 0
+int longActiveCount  = (na(longSlot1Bar)?0:1)  + (na(longSlot2Bar)?0:1)  + (na(longSlot3Bar)?0:1)
+int shortActiveCount = (na(shortSlot1Bar)?0:1) + (na(shortSlot2Bar)?0:1) + (na(shortSlot3Bar)?0:1)
+
+// --- 全ポジション決済後は管理変数を初期化 (クールダウン基準足のリセット) ---
+//   保存SL/TP・発注足・カウンター相当(longActiveCount)は上の解放処理でも 0 になる。
+if longActiveCount == 0
+    lastLongEntryBar := na
+if shortActiveCount == 0
+    lastShortEntryBar := na
+
+// --- クールダウン (同じローソク足での複数回エントリーも防止) ---
+bool cooldownLongOk  = na(lastLongEntryBar)  or (bar_index - lastLongEntryBar)  >= pyramidCooldownBars
+bool cooldownShortOk = na(lastShortEntryBar) or (bar_index - lastShortEntryBar) >= pyramidCooldownBars
+
+// --- 初回 / 追加 エントリー判定 ---
+//   初回 : ノーポジ時のみ (従来どおり)。
+//   追加 : usePyramiding かつ 同方向保有中 かつ 反対方向なし かつ 回数未満 かつ クールダウンOK かつ 空きあり。
+bool longFirstEntry = canLong and flatPosition
+bool longAddEntry   = usePyramiding and canLong and longPosition and not shortPosition and longActiveCount < maxPyramidEntries and cooldownLongOk
+bool doLongEntry    = (longFirstEntry or longAddEntry) and longFreeSlot != 0
+
+bool shortFirstEntry = canShort and flatPosition
+bool shortAddEntry   = usePyramiding and canShort and shortPosition and not longPosition and shortActiveCount < maxPyramidEntries and cooldownShortOk
+bool doShortEntry    = (shortFirstEntry or shortAddEntry) and shortFreeSlot != 0
+
+// --- エントリー成立フラグ (状態リセット判定用。追加エントリーも検知する) ---
+bool enteredLong  = false
+bool enteredShort = false
+
+// --- ロング発注 (初回=Long_1、追加=空きスロットへ) ---
+if doLongEntry
+    int    s   = longFreeSlot
+    string eid = "Long_" + str.tostring(s)
+    strategy.entry(eid, strategy.long, qty = longQty)
+    // 各エントリー時点の SL/TP をスロット専用変数へ固定保存 (後続シグナルで上書きしない)
+    if s == 1
+        longStop1 := longStop
+        longTP1   := longTP
+        longSlot1Bar := bar_index
+    else if s == 2
+        longStop2 := longStop
+        longTP2   := longTP
+        longSlot2Bar := bar_index
+    else
+        longStop3 := longStop
+        longTP3   := longTP
+        longSlot3Bar := bar_index
+    lastLongEntryBar := bar_index
+    enteredLong := true
+
+// --- ショート発注 (初回=Short_1、追加=空きスロットへ) ---
+if doShortEntry
+    int    s   = shortFreeSlot
+    string eid = "Short_" + str.tostring(s)
+    strategy.entry(eid, strategy.short, qty = shortQty)
+    if s == 1
+        shortStop1 := shortStop
+        shortTP1   := shortTP
+        shortSlot1Bar := bar_index
+    else if s == 2
+        shortStop2 := shortStop
+        shortTP2   := shortTP
+        shortSlot2Bar := bar_index
+    else
+        shortStop3 := shortStop
+        shortTP3   := shortTP
+        shortSlot3Bar := bar_index
+    lastShortEntryBar := bar_index
+    enteredShort := true
+
+// --- 各エントリーの個別決済 (保存した SL/TP で 1回目・2回目・3回目を独立決済) ---
+if not na(longSlot1Bar)
+    strategy.exit("Long Exit_1", from_entry = "Long_1", stop = longStop1, limit = longTP1)
+if not na(longSlot2Bar)
+    strategy.exit("Long Exit_2", from_entry = "Long_2", stop = longStop2, limit = longTP2)
+if not na(longSlot3Bar)
+    strategy.exit("Long Exit_3", from_entry = "Long_3", stop = longStop3, limit = longTP3)
+if not na(shortSlot1Bar)
+    strategy.exit("Short Exit_1", from_entry = "Short_1", stop = shortStop1, limit = shortTP1)
+if not na(shortSlot2Bar)
+    strategy.exit("Short Exit_2", from_entry = "Short_2", stop = shortStop2, limit = shortTP2)
+if not na(shortSlot3Bar)
+    strategy.exit("Short Exit_3", from_entry = "Short_3", stop = shortStop3, limit = shortTP3)
+
+// --- 状態管理: エントリー後リセット (成立足だけ・入った方向だけ / 追加エントリーも対象) ---
+if enteredLong
+    if resetFVGStateAfterEntry
+        longFVGStateOk := false
+    if resetVolumeStateAfterEntry
+        longVolumeStateOk := false
+    if resetFibStateAfterEntry
+        longFibStateOk := false
+    if resetStochStateAfterEntry
+        stochLongStateOk := false
+    if useMACDModule and resetMACDStateAfterEntry
+        longMACDStateOk := false
+
+if enteredShort
+    if resetFVGStateAfterEntry
+        shortFVGStateOk := false
+    if resetVolumeStateAfterEntry
+        shortVolumeStateOk := false
+    if resetFibStateAfterEntry
+        shortFibStateOk := false
+    if resetStochStateAfterEntry
+        stochShortStateOk := false
+    if useMACDModule and resetMACDStateAfterEntry
+        shortMACDStateOk := false
+
+// --- 状態管理: エントリー後リセット (EMA/水平線) ---
+//   ポジションサイズの増加では初回しか検知できないため、発注処理で立てた
+//   enteredLong / enteredShort を使って初回・追加の両方を検知する。
+bool didEnterLong  = enteredLong
+bool didEnterShort = enteredShort
+// EMA WinZone
+if useEMAWZ and resetEMAStateAfterEntry and didEnterLong
+    emaLongState     := false
+    emaLongStateBar  := na
+    emaLongWinZone   := false
+if useEMAWZ and resetEMAStateAfterEntry and didEnterShort
+    emaShortState    := false
+    emaShortStateBar := na
+    emaShortWinZone  := false
+// 水平線 WinZone
+if useLineWZ and resetLineStateAfterEntry and didEnterLong
+    lineLongStateBar := na
+if useLineWZ and resetLineStateAfterEntry and didEnterShort
+    lineShortStateBar := na
+
+// ============================================================
+//  12. 表示
+// ============================================================
+// Momentum: ストキャス参照TF 表示 (環境テーブルとは独立)
+var table stochTFtbl = table.new(position.bottom_right, 1, 1, border_width = 1)
+if barstate.islast and useMomentumModule and useStochMomentum
+    string stochTFtxt = useStochTF ? (stochTF == "" ? "chart" : stochTF) : "chart"
+    table.cell(stochTFtbl, 0, 0, "Stoch TF: " + stochTFtxt, text_color = color.white, bgcolor = color.new(color.purple, 0))
+
+// POC ゾーン表示 (出来高WinZone ON かつ 表示ON の時だけ描画)
+var box vPocBox = na
+if useVolume and showPOCZone and not na(vPocPrice)
+    if na(vPocBox)
+        vPocBox := box.new(bar_index - 1, vPocUpper, bar_index, vPocLower, border_color = color.new(color.orange, 40), bgcolor = color.new(color.orange, 85))
+    else
+        box.set_top(vPocBox, vPocUpper)
+        box.set_bottom(vPocBox, vPocLower)
+        box.set_right(vPocBox, bar_index)
+        box.set_left(vPocBox, math.max(0, bar_index - vpLookback))
+
+plotshape(canLong,  "買いエントリー", style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0), size = size.small)
+plotshape(canShort, "売りエントリー", style = shape.triangledown, location = location.abovebar, color = color.new(color.red,   0), size = size.small)
+
+// Data Window 出力 (デバッグ用) : Env → FVG → Momentum → Trigger → Entry の順
+
+// // --- ① 環境認識 (Env) : どちら向きに狙うか ---
+// plot(envEnabled,       "envEnabled", display = display.data_window)
+// plot(envMatched,       "envMatched", display = display.data_window)
+// plot(envLongOk  ? 1 : 0, "envLongOk",  display = display.data_window)
+// plot(envShortOk ? 1 : 0, "envShortOk", display = display.data_window)
+
+// // --- ② FVG (WinZone) : どこで狙うか (場所・状態保持) ---
+// plot(fvgReboundBuy  ? 1 : 0, "fvgReboundBuy",  display = display.data_window)
+// plot(fvgReboundSell ? 1 : 0, "fvgReboundSell", display = display.data_window)
+// plot(fvgAbsorbBuy   ? 1 : 0, "fvgAbsorbBuy",   display = display.data_window)
+// plot(fvgAbsorbSell  ? 1 : 0, "fvgAbsorbSell",  display = display.data_window)
+// plot(ifvgBuy        ? 1 : 0, "ifvgBuy",        display = display.data_window)
+// plot(ifvgSell       ? 1 : 0, "ifvgSell",       display = display.data_window)
+// plot(longFVGStateOk  ? 1 : 0, "longFVGStateOk",  display = display.data_window)
+// plot(shortFVGStateOk ? 1 : 0, "shortFVGStateOk", display = display.data_window)
+// plot(longFVGOk      ? 1 : 0, "longFVGOk",      display = display.data_window)
+// plot(shortFVGOk     ? 1 : 0, "shortFVGOk",     display = display.data_window)
+// plot(longWinZoneOk  ? 1 : 0, "longWinZoneOk",  display = display.data_window)
+// plot(shortWinZoneOk ? 1 : 0, "shortWinZoneOk", display = display.data_window)
+
+// // --- ③ Momentum : 勢いが反転したか (状態保持) ---
+// plot(stochK, "stochK", display = display.data_window)
+// plot(stochD, "stochD", display = display.data_window)
+// plot(allowLongByMomentum  ? 1 : 0, "allowLongByMomentum",  display = display.data_window)
+// plot(allowShortByMomentum ? 1 : 0, "allowShortByMomentum", display = display.data_window)
+
+// // --- ④ Trigger : 価格が実際に反応したか (最後の引き金) ---
+// plot(allowLongByTrigger  ? 1 : 0, "allowLongByTrigger",  display = display.data_window)
+// plot(allowShortByTrigger ? 1 : 0, "allowShortByTrigger", display = display.data_window)
+
+// // --- ⑤ Entry / 執行フィルタ (時間帯・ボラ・ロット・ピラミッティング) ---
+// plot(sessionOk ? 1 : 0, "sessionOk", display = display.data_window)
+// plot(volOk ? 1 : 0, "volOk", display = display.data_window)
+// plot(longQty,  "longQty",  display = display.data_window)
+// plot(shortQty, "shortQty", display = display.data_window)
+// plot(longActiveCount,  "longActiveCount",  display = display.data_window)
+// plot(shortActiveCount, "shortActiveCount", display = display.data_window)
+// plot(effRiskPct, "effRiskPct", display = display.data_window)
