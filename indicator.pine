@@ -2,17 +2,20 @@
 // © ka.mickey15
 //
 // ============================================================
-//  5分足 Cランク シグナルインジケーター (EMA＋MACD)
+//  5分足 マルチランク シグナルインジケーター
 // ------------------------------------------------------------
-//  ・元「5min Engulfing Strategy」から Cランク判定のみを抽出し、
-//    strategy() を indicator() へ変換した実運用シグナル版。
-//  ・Cランク = 環境認識(下降) + EMA WinZone(1分足EMA反発) +
-//    MACD Momentum(Hist拡大) + BOS + 高速ボラ + 時間帯 + Size。
-//    EMA・MACD・BOS は常時有効の必須条件 (OFF不可)。
-//  ・確定足では「エントリー予約」だけ行い、次足の頭で仮想ポジション開始。
-//    (元 strategy.entry の次足始値約定に合わせて保有/決済/抑制を一致させる)
-//  ・仮想ポジション保有中は新規シグナルを停止 (pyramiding=0 再現)。
-//  ・アラート/ラベルは 5分足チャートでのみ出力。
+//  【ロジックA】環境=下降／下降／下降
+//    ・Cランク(DDD-C) = 環境(下降DDD) + EMA WinZone(1M,ATR×0.25,状態5)
+//      + MACD(Hist拡大,状態3) + BOS(5) + 高速ボラ + 時間帯 + Size
+//  【ロジックB】環境=レンジ／下降／下降  (今回追加・DDDとは完全独立)
+//    ・共通 = 環境(レンジRDD) + long/short + 時間帯 + 高速ボラ
+//             + Trigger(BOS10 or EMAリジェクト) + SLリスク>0 + Size>=1
+//    ・Bランク(RDD-B) = 共通 + 出来高急増ブレイク + EMA反発(1M/5M,ATR×0.35,状態10)
+//                       + MACD(Signalクロス or Hist拡大,状態3)
+//    ・Cランク(RDD-C) = 共通 + 出来高急増ブレイク かつ not Bランク
+//  ・確定足は「エントリー予約」→次足頭で仮想ポジション開始 (元 strategy.entry 準拠)。
+//  ・仮想ポジション保有中/予約中は全ランク・全方向の新規を停止 (pyramiding=0 再現)。
+//  ・アラート/ラベルは 5分足チャートでのみ出力。上位ランク優先 (A>B>C)。
 // ============================================================
 
 //@version=5
@@ -21,8 +24,8 @@
 //  1. indicator 宣言
 // ============================================================
 indicator(
-     title         = "5min Cランク シグナル (EMA＋MACD)",
-     shorttitle    = "C-EMA+MACD",
+     title         = "5min マルチランク シグナル (DDD-C / RDD-B / RDD-C)",
+     shorttitle    = "5min SIG",
      overlay       = true,
      dynamic_requests = true,
      max_bars_back = 1000,
@@ -33,19 +36,14 @@ indicator(
 bool is5m = timeframe.in_seconds() == 300
 
 // ============================================================
-//  2. エントリー / 方向設定
-// ------------------------------------------------------------
-//  ロジックは残すが、ロングは元設定と同じく初期値 OFF。
+//  2. エントリー / 方向設定 (全ランク共通)
 // ============================================================
 grpEntry = "エントリー方向"
 useLong  = input.bool(false, "ロングを有効", group = grpEntry)
 useShort = input.bool(true,  "ショートを有効", group = grpEntry)
 
 // ============================================================
-//  3. リスク / SL / TP / 資金設定
-// ------------------------------------------------------------
-//  indicator では initial_capital / equity が使えないため、
-//  計算用資金を input で設定 (複利なし・入力資金固定)。
+//  3. リスク / SL / TP / 資金設定 (全ランク共通・数値同一)
 // ============================================================
 grpRisk = "リスク / 資金"
 calcCapital = input.float(1000, "計算用資金",              minval = 0.0, step = 100, group = grpRisk)
@@ -56,10 +54,7 @@ slFixed     = input.float(10,   "固定SL幅 (価格)",         minval = 0.0, st
 rrRatio     = input.float(1.0,  "リスクリワード比 (TP)",   minval = 0.1, step = 0.1, group = grpRisk)
 
 // ============================================================
-//  4. セッション設定 (時間帯フィルタ・東京時間 JST)
-// ------------------------------------------------------------
-//  Asia 09:00-16:00 / EU 16:00-21:00 / NY 21:00-翌03:00。
-//  03:00-09:00 はどのセッションにも属さず除外。
+//  4. セッション設定 (時間帯フィルタ・東京時間 JST・全ランク共通)
 // ============================================================
 grpSession = "時間帯フィルタ (東京時間)"
 useSessionFilter = input.bool(true, "時間帯フィルタを使う", group = grpSession)
@@ -68,22 +63,31 @@ useEUSession     = input.bool(true, "EU 16:00-21:00",   group = grpSession)
 useNYSession     = input.bool(true, "NY 21:00-翌03:00", group = grpSession)
 
 // ============================================================
-//  5. 環境認識 (4H/1H/15M のトレンド要求)
+//  5. 環境認識 (4H/1H/15M) : DDD と RDD を並列判定
 // ------------------------------------------------------------
-//  Cランクで使用する 4H/1H/15M のみを評価 (5M/1M は削除)。
-//  useEnvFilter=false の時は request.security を一切呼ばない。
-//  request.security は lookahead_off で未来参照しない。
+//  同一の 4H/1H/15M トレンド値(raw)から、要求状態違いで2環境を判定。
+//   envDDD = 4H下降 and 1H下降 and 15M下降
+//   envRDD = 4Hレンジ and 1H下降 and 15M下降
+//  4Hトレンド値は1つなので DDD と RDD は同一足で同時成立しない。
+//  useEnvFilter=false の時は request.security を一切呼ばない。lookahead_off。
 // ============================================================
 grpEnvMaster = "環境フィルタ"
 useEnvFilter = input.bool(true, "環境フィルタを使う", group = grpEnvMaster)
 
-grpTF = "環境: 時間足 要求状態 / 参照時間足"
+grpTF = "環境: 時間足 要求状態 / 参照時間足 (DDD)"
 reqTrend4H  = input.string("下降", "4H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf4")
 tf4H        = input.timeframe("240", "TF",     group = grpTF, inline = "tf4")
 reqTrend1H  = input.string("下降", "1H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf1")
 tf1H        = input.timeframe("60",  "TF",     group = grpTF, inline = "tf1")
 reqTrend15M = input.string("下降", "15M 要求", options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf15")
 tf15M       = input.timeframe("15",  "TF",     group = grpTF, inline = "tf15")
+
+// --- RDD 追加環境 (レンジ/下降/下降。DDDとは独立の要求設定) ---
+grpEnvRDD = "環境: RDD 追加 (レンジ/下降/下降)"
+reqTrend4H_RDD  = input.string("レンジ", "RDD 4H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], group = grpEnvRDD)
+reqTrend1H_RDD  = input.string("下降",  "RDD 1H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], group = grpEnvRDD)
+reqTrend15M_RDD = input.string("下降",  "RDD 15M 要求", options = ["OFF", "上昇", "レンジ", "下降"], group = grpEnvRDD)
+reqMatchCount_RDD = input.int(0, "RDD 必要一致TF数 (0=有効な全TF)", minval = 0, group = grpEnvRDD)
 
 grpBull = "環境: 上昇条件 ON/OFF"
 useEma20Above50Up   = input.bool(true, "1. EMA20 > EMA50",      group = grpBull)
@@ -134,7 +138,7 @@ minScore4H  = input.int(3, "4H 最低必要スコア",  minval = 1, group = grpJ
 minScore1H  = input.int(3, "1H 最低必要スコア",  minval = 1, group = grpJudge)
 minScore15M = input.int(3, "15M 最低必要スコア", minval = 1, group = grpJudge)
 
-grpLink = "環境: 判定"
+grpLink = "環境: 判定 (DDD)"
 reqMatchCount = input.int(0, "必要一致TF数 (0=有効な全TFが一致)", minval = 0, group = grpLink)
 
 // --- 環境判定関数 (各TFコンテキストで呼ばれる。戻り値: trend, bull, bear, range) ---
@@ -209,40 +213,49 @@ f_reqCode(string s) =>
     s == "上昇" ? 1 : s == "レンジ" ? 0 : s == "下降" ? -1 : na
 
 // --- 環境フィルタ計算 (useEnvFilter=false なら request.security を呼ばない) ---
-bool allowByEnv = true
+bool allowByEnv    = true    // DDD: 下降/下降/下降
+bool allowByEnvRDD = true    // RDD: レンジ/下降/下降
 if useEnvFilter
     [raw4H,  b4H,  be4H,  r4H ] = request.security(syminfo.tickerid, tf4H,  f_envTrend(minScore4H),  lookahead = barmerge.lookahead_off)
     [raw1H,  b1H,  be1H,  r1H ] = request.security(syminfo.tickerid, tf1H,  f_envTrend(minScore1H),  lookahead = barmerge.lookahead_off)
     [raw15M, b15M, be15M, r15M] = request.security(syminfo.tickerid, tf15M, f_envTrend(minScore15M), lookahead = barmerge.lookahead_off)
 
+    // --- DDD (下降/下降/下降) ---
     en4H  = reqTrend4H  != "OFF"
     en1H  = reqTrend1H  != "OFF"
     en15M = reqTrend15M != "OFF"
-
     m4H  = en4H  and not na(raw4H)  and raw4H  == f_reqCode(reqTrend4H)
     m1H  = en1H  and not na(raw1H)  and raw1H  == f_reqCode(reqTrend1H)
     m15M = en15M and not na(raw15M) and raw15M == f_reqCode(reqTrend15M)
-
     int envEnabled = (en4H ? 1 : 0) + (en1H ? 1 : 0) + (en15M ? 1 : 0)
     int envMatched = (m4H ? 1 : 0) + (m1H ? 1 : 0) + (m15M ? 1 : 0)
-
     int needMatch = reqMatchCount == 0 ? envEnabled : reqMatchCount
     allowByEnv := envEnabled == 0 or envMatched >= needMatch
 
+    // --- RDD (レンジ/下降/下降。同じ raw 値を別要求で判定) ---
+    enR4H  = reqTrend4H_RDD  != "OFF"
+    enR1H  = reqTrend1H_RDD  != "OFF"
+    enR15M = reqTrend15M_RDD != "OFF"
+    mR4H  = enR4H  and not na(raw4H)  and raw4H  == f_reqCode(reqTrend4H_RDD)
+    mR1H  = enR1H  and not na(raw1H)  and raw1H  == f_reqCode(reqTrend1H_RDD)
+    mR15M = enR15M and not na(raw15M) and raw15M == f_reqCode(reqTrend15M_RDD)
+    int envEnabledRDD = (enR4H ? 1 : 0) + (enR1H ? 1 : 0) + (enR15M ? 1 : 0)
+    int envMatchedRDD = (mR4H ? 1 : 0) + (mR1H ? 1 : 0) + (mR15M ? 1 : 0)
+    int needMatchRDD = reqMatchCount_RDD == 0 ? envEnabledRDD : reqMatchCount_RDD
+    allowByEnvRDD := envEnabledRDD == 0 or envMatchedRDD >= needMatchRDD
+
 // 環境フィルタ最終判定 (ロング/ショート共通の環境テンプレート)
-bool envLongOk  = not useEnvFilter or allowByEnv
+bool envLongOk  = not useEnvFilter or allowByEnv      // DDD
 bool envShortOk = not useEnvFilter or allowByEnv
+bool envLongRDD  = not useEnvFilter or allowByEnvRDD  // RDD
+bool envShortRDD = not useEnvFilter or allowByEnvRDD
 
 // ============================================================
-//  6. EMA WinZone (MTF EMA を反発する価格帯として使う場所条件)
+//  6. EMA WinZone [DDD-C 用] (1M・ATR×0.25・状態5)
 // ------------------------------------------------------------
-//  Cランク必須条件 (常時有効・OFF不可)。
-//  EMA は方向Bias ではなく Zone。各EMA/各TFで反発したら WinZone成立。
-//  Cランク初期設定: 1分足の EMA200/600/1000/2000/3000 反発を使用。
-//  接近幅は各TF ATR×0.25。イベント後 emaStateMaxBars 本だけ状態保持。
-//  OFF の時間足は request.security を呼ばない。
+//  DDD-C の必須条件。EMA は Zone。反発後 emaStateMaxBars 本だけ状態保持。
 // ============================================================
-grpEMAWZ = "EMA WinZone (必須)"
+grpEMAWZ = "EMA WinZone [DDD-C]"
 emaLen1 = input.int(200,  "EMA200 Length",  minval = 1, group = grpEMAWZ)
 emaLen2 = input.int(600,  "EMA600 Length",  minval = 1, group = grpEMAWZ)
 emaLen3 = input.int(1000, "EMA1000 Length", minval = 1, group = grpEMAWZ)
@@ -260,7 +273,7 @@ emaTouchDollar = input.float(3.0,  "EMA接近幅($)",      step = 0.1,  group = 
 emaTouchATRMult= input.float(0.25, "EMA接近幅 ATR倍率", step = 0.05, group = grpEMAWZ)
 emaAtrLen      = input.int(14, "EMA ATR期間", minval = 1, group = grpEMAWZ)
 
-grpEMATF = "EMA WinZone: MTF"
+grpEMATF = "EMA WinZone [DDD-C]: MTF"
 useEMA1M  = input.bool(true,  "1分EMAを使う",   group = grpEMATF)
 useEMA5M  = input.bool(false, "5分EMAを使う",   group = grpEMATF)
 useEMA15M = input.bool(false, "15分EMAを使う",  group = grpEMATF)
@@ -272,12 +285,12 @@ tfEMA15M = input.timeframe("15",  "15分TF",  group = grpEMATF)
 tfEMA1H  = input.timeframe("60",  "1時間TF", group = grpEMATF)
 tfEMA4H  = input.timeframe("240", "4時間TF", group = grpEMATF)
 
-grpEMAState = "EMA: 状態管理"
+grpEMAState = "EMA 状態管理 [DDD-C]"
 useEMAStateWindow       = input.bool(true, "EMA状態管理を使う", group = grpEMAState)
 emaStateMaxBars         = input.int(5, "EMA状態 有効本数", minval = 1, group = grpEMAState)
 resetEMAStateAfterEntry = input.bool(true, "エントリー後EMA状態をリセット", group = grpEMAState)
 
-// 1つのTFの EMA5本+ATR を取得し、反発(long/short)を返す。OFF の TF は security を呼ばない。
+// 1つのTFの EMA5本+ATR を取得し、反発(long/short)を返す [DDD-C版]。OFF の TF は security を呼ばない。
 f_emaTFEval(bool _tfOn, string _tf) =>
     float _e1 = na
     float _e2 = na
@@ -294,7 +307,6 @@ f_emaTFEval(bool _tfOn, string _tf) =>
         _e5 := _v5
         _atr := _v6
     float _touch = emaTouchMode == "ATR" ? _atr * emaTouchATRMult : emaTouchDollar
-    // BUY反発: low が EMA に触れ close が EMA上 / SELL反発: high が EMA に触れ close が EMA下
     bool _bl1 = _tfOn and useEMA1Zone and not na(_e1) and low <= _e1 + _touch and close > _e1 and close > open
     bool _bl2 = _tfOn and useEMA2Zone and not na(_e2) and low <= _e2 + _touch and close > _e2 and close > open
     bool _bl3 = _tfOn and useEMA3Zone and not na(_e3) and low <= _e3 + _touch and close > _e3 and close > open
@@ -309,7 +321,6 @@ f_emaTFEval(bool _tfOn, string _tf) =>
     bool _bShort = _bs1 or _bs2 or _bs3 or _bs4 or _bs5
     [_bLong, _bShort]
 
-// EMA WinZone 状態 (var: バー跨ぎ保持。エントリー後リセットは仮想ポジション側で実施)
 var bool emaLongState     = false
 var bool emaShortState    = false
 var int  emaLongStateBar  = na
@@ -336,20 +347,17 @@ if useEMAStateWindow
     if emaShortState and not na(emaShortStateBar) and bar_index - emaShortStateBar > emaStateMaxBars
         emaShortState := false
 
-// EMA WinZone 出力 (状態管理ON=状態フラグ / OFF=イベント単バー)。Cランク必須 → passthrough なし。
 bool emaLongWinZone  = useEMAStateWindow ? emaLongState  : emaLongEventOk
 bool emaShortWinZone = useEMAStateWindow ? emaShortState : emaShortEventOk
 bool longWinZoneOk  = emaLongWinZone
 bool shortWinZoneOk = emaShortWinZone
 
 // ============================================================
-//  7. MACD Momentum (勢い / タイミング確認)
+//  7. MACD Momentum [DDD-C 用] (Hist拡大のみ・状態3)
 // ------------------------------------------------------------
-//  Cランク必須条件 (常時有効・OFF不可)。
-//  Cランク初期設定: D「Hist拡大」(2本連続) + Hist位置フィルター。
-//  シグナル後 macdStateMaxBars 本だけ Momentum OK を保持。
+//  MACD値(8/21/5)は RDD と共有 (数値同一)。DDD-C は Hist拡大のみ。
 // ============================================================
-grpMACD = "Momentum: MACD (必須)"
+grpMACD = "Momentum: MACD [DDD-C]"
 useMACDStateWindow       = input.bool(true, "MACD状態管理を使う",   group = grpMACD)
 macdStateMaxBars         = input.int(3, "MACD状態 有効本数", minval = 1, group = grpMACD)
 resetMACDStateAfterEntry = input.bool(true, "エントリー後MACD状態をリセット", group = grpMACD)
@@ -360,17 +368,14 @@ macdFastLen   = input.int(8,  "Fast EMA",   minval = 1, group = grpMACD)
 macdSlowLen   = input.int(21, "Slow EMA",   minval = 1, group = grpMACD)
 macdSignalLen = input.int(5,  "Signal EMA", minval = 1, group = grpMACD)
 
-// MACD 状態 (var: バー跨ぎ保持)
 var bool longMACDStateOk   = false
 var bool shortMACDStateOk  = false
 var int  longMACDStateBar  = na
 var int  shortMACDStateBar = na
 
 [macdLine, macdSignal, macdHist] = ta.macd(close, macdFastLen, macdSlowLen, macdSignalLen)
-// Hist位置フィルター (BUY=hist>0 / SELL=hist<0)
 bool macdHistDirBuy  = not useMACDHistDirectionFilter or macdHist > 0
 bool macdHistDirSell = not useMACDHistDirectionFilter or macdHist < 0
-// D: Hist拡大 (連続本数)
 bool macdExpBull = macdHist > 0 and macdHist > macdHist[1]
 bool macdExpBear = macdHist < 0 and macdHist < macdHist[1]
 var int macdBullExpCount = 0
@@ -393,17 +398,13 @@ if useMACDStateWindow
     if shortMACDStateOk and not na(shortMACDStateBar) and bar_index - shortMACDStateBar > macdStateMaxBars
         shortMACDStateOk := false
 
-// Momentum 許可 (状態管理ON=保持中フラグ / OFF=シグナル単バー)。Cランク必須 → passthrough なし。
 bool allowLongByMACD  = useMACDStateWindow ? longMACDStateOk  : macdMomentumLong
 bool allowShortByMACD = useMACDStateWindow ? shortMACDStateOk : macdMomentumShort
 
 // ============================================================
-//  8. BOS Trigger (直近高安更新・最後の引き金)
-// ------------------------------------------------------------
-//  Cランク必須条件 (常時有効・OFF不可)。
-//  BUY: close > 直近 bosLookback 本の高値 / SELL: close < 直近安値。
+//  8. BOS Trigger [DDD-C 用] (BOS 5)
 // ============================================================
-grpTrig = "エントリートリガー (BOS・必須)"
+grpTrig = "エントリートリガー [DDD-C] (BOS)"
 bosLookback = input.int(5, "BOS Lookback", minval = 2, group = grpTrig)
 
 float bosHigh = ta.highest(high, bosLookback)[1]
@@ -412,10 +413,7 @@ bool allowLongByTrigger  = not na(bosHigh) and close > bosHigh
 bool allowShortByTrigger = not na(bosLow)  and close < bosLow
 
 // ============================================================
-//  9. ボラティリティフィルター (高速ボラ)
-// ------------------------------------------------------------
-//  Cランク初期設定: 固定値モード。
-//    固定値: 直近 fastAtrLen 本の値幅 >= fastFixedMin かつ 実体平均 >= bodyAvgMin
+//  9. ボラティリティフィルター (高速ボラ・全ランク共通・数値同一)
 // ============================================================
 grpVol = "高速ボラフィルタ"
 fastVolMode  = input.string("固定値", "高速ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = grpVol)
@@ -439,16 +437,226 @@ else if fastVolMode == "固定値"
     float fastRange = ta.highest(high, fastAtrLen) - ta.lowest(low, fastAtrLen)
     float bodyAvgFast = ta.sma(math.abs(close - open), bodyAvgLen)
     fastVolPass := fastRange >= fastFixedMin and bodyAvgFast >= bodyAvgMin
-// fastVolMode == OFF のときは fastVolPass = true
 bool volOk = fastVolPass
 
 // ============================================================
-//  10. Cランク条件 (Size判定を除く基本条件を統合)
+//  9R-1. RDD トリガー (BOS10 or EMAリジェクト・Any) [RDD-B/C 共通]
 // ------------------------------------------------------------
-//  設計順序: 環境認識 → WinZone(EMA) → Momentum(MACD) → Trigger(BOS) → 執行(時間帯/ボラ)
-//  EMA・MACD・BOS は常時必須。Size / SLリスクの判定は 11 で追加する。
+//  DDD の BOS(5) とは独立。BランクとCランクは同一の Trigger 結果を共有。
 // ============================================================
-// --- 時間帯フィルタ (東京時間 JST) ---
+grpTrigRDD = "RDD トリガー (BOS10 + EMAリジェクト)"
+bosLookbackRDD          = input.int(10, "RDD BOS Lookback", minval = 2, group = grpTrigRDD)
+emaLenTrigRDD           = input.int(20, "RDD EMAリジェクト EMA", minval = 1, group = grpTrigRDD)
+useEMARejectSlopeFilterRDD = input.bool(true, "RDD EMAリジェクト 傾きフィルター", group = grpTrigRDD)
+emaRejectSlopeLookbackRDD  = input.int(3, "RDD 傾き判定本数", minval = 1, group = grpTrigRDD)
+emaRejectSlopeMinATRRDD    = input.float(0.03, "RDD 最低傾き ATR倍率", minval = 0.0, step = 0.01, group = grpTrigRDD)
+emaRejectSlopeAtrLenRDD    = input.int(14, "RDD 傾きATR期間", minval = 1, group = grpTrigRDD)
+
+float bosHighRDD = ta.highest(high, bosLookbackRDD)[1]
+float bosLowRDD  = ta.lowest(low,  bosLookbackRDD)[1]
+bool trBullBOSRDD = not na(bosHighRDD) and close > bosHighRDD
+bool trBearBOSRDD = not na(bosLowRDD)  and close < bosLowRDD
+
+float emaTrigRDD    = ta.ema(close, emaLenTrigRDD)
+float emaSlopeRDD   = emaTrigRDD - emaTrigRDD[emaRejectSlopeLookbackRDD]
+float emaSlopeAtrRDD= ta.atr(emaRejectSlopeAtrLenRDD)
+float emaSlopeMinRDD= emaSlopeAtrRDD * emaRejectSlopeMinATRRDD
+bool slopeLongOkRDD  = not useEMARejectSlopeFilterRDD or emaSlopeRDD >  emaSlopeMinRDD
+bool slopeShortOkRDD = not useEMARejectSlopeFilterRDD or emaSlopeRDD < -emaSlopeMinRDD
+bool trBullEMARDD = low <= emaTrigRDD and close > emaTrigRDD and close > open and slopeLongOkRDD
+bool trBearEMARDD = high >= emaTrigRDD and close < emaTrigRDD and close < open and slopeShortOkRDD
+
+// Any 結合 (BOS or EMAリジェクト)
+bool triggerLongRDD  = trBullBOSRDD or trBullEMARDD
+bool triggerShortRDD = trBearBOSRDD or trBearEMARDD
+
+// ============================================================
+//  9R-2. RDD 出来高急増ブレイク [RDD-B/C 必須] (状態10)
+// ------------------------------------------------------------
+//  出来高パターンは「急増ブレイク」のみ (POC/アクセプタンス/リジェクト/
+//  クライマックスは今回不使用のため未実装)。共通フィルタ=出来高不足のみ。
+// ============================================================
+grpVolRDD = "RDD 出来高急増ブレイク (必須)"
+volBreakoutLookbackRDD = input.int(3, "ブレイク 参照本数", minval = 1, group = grpVolRDD)
+volSmaLenRDD           = input.int(20, "出来高SMA期間", minval = 1, group = grpVolRDD)
+volSpikeMultRDD        = input.float(1.3, "出来高急増 倍率", minval = 0.0, step = 0.1, group = grpVolRDD)
+volBreakoutBodyRatioMinRDD = input.float(0.3, "ブレイク 実体率最小", minval = 0.0, maxval = 1.0, step = 0.05, group = grpVolRDD)
+useLowVolumeFilterRDD  = input.bool(true, "出来高不足フィルター", group = grpVolRDD)
+lowVolumeMultRDD       = input.float(0.7, "出来高不足 倍率(volume>=SMA×)", minval = 0.0, step = 0.05, group = grpVolRDD)
+useFirstSignalOnlyRDD  = input.bool(true, "連続シグナル抑制(初回のみ)", group = grpVolRDD)
+useVolStateWindowRDD       = input.bool(true, "出来高状態管理を使う", group = grpVolRDD)
+volStateMaxBarsRDD         = input.int(10, "出来高状態 有効本数", minval = 1, group = grpVolRDD)
+resetVolStateAfterEntryRDD = input.bool(true, "エントリー後出来高状態をリセット", group = grpVolRDD)
+
+float v_volSMA_RDD  = ta.sma(volume, volSmaLenRDD)
+float v_rngRDD      = high - low
+float v_bodyRDD     = math.abs(close - open)
+float v_bodyRatioRDD= v_rngRDD > 0 ? v_bodyRDD / v_rngRDD : 0.0
+float rHighRDD = ta.highest(high, volBreakoutLookbackRDD)[1]
+float rLowRDD  = ta.lowest(low,  volBreakoutLookbackRDD)[1]
+bool volSpikeRDD = not na(v_volSMA_RDD) and volume > v_volSMA_RDD * volSpikeMultRDD
+bool volLiqOKRDD = not useLowVolumeFilterRDD or (not na(v_volSMA_RDD) and volume >= v_volSMA_RDD * lowVolumeMultRDD)
+bool brkBuyCoreRDD  = not na(rHighRDD) and close > rHighRDD and volSpikeRDD and v_bodyRatioRDD >= volBreakoutBodyRatioMinRDD
+bool brkSellCoreRDD = not na(rLowRDD)  and close < rLowRDD  and volSpikeRDD and v_bodyRatioRDD >= volBreakoutBodyRatioMinRDD
+bool _brkBRDD = volLiqOKRDD and brkBuyCoreRDD
+bool _brkSRDD = volLiqOKRDD and brkSellCoreRDD
+bool longVolumeEventRDD  = _brkBRDD and (not useFirstSignalOnlyRDD or not _brkBRDD[1])
+bool shortVolumeEventRDD = _brkSRDD and (not useFirstSignalOnlyRDD or not _brkSRDD[1])
+
+// 出来高 状態管理 (イベント後 volStateMaxBarsRDD 本 OK を保持)
+var bool longVolStateRDD  = false
+var bool shortVolStateRDD = false
+var int  longVolStateBarRDD  = na
+var int  shortVolStateBarRDD = na
+if useVolStateWindowRDD
+    if longVolumeEventRDD
+        longVolStateRDD    := true
+        longVolStateBarRDD := bar_index
+    if shortVolumeEventRDD
+        shortVolStateRDD    := true
+        shortVolStateBarRDD := bar_index
+    if longVolStateRDD and not na(longVolStateBarRDD) and bar_index - longVolStateBarRDD > volStateMaxBarsRDD
+        longVolStateRDD := false
+    if shortVolStateRDD and not na(shortVolStateBarRDD) and bar_index - shortVolStateBarRDD > volStateMaxBarsRDD
+        shortVolStateRDD := false
+
+bool longVolumeZoneRDD  = useVolStateWindowRDD ? longVolStateRDD  : longVolumeEventRDD
+bool shortVolumeZoneRDD = useVolStateWindowRDD ? shortVolStateRDD : shortVolumeEventRDD
+
+// ============================================================
+//  9R-3. RDD EMA WinZone [RDD-B 専用] (1M・5M・ATR×0.35・状態10)
+// ------------------------------------------------------------
+//  DDD-C の EMA WinZone とは独立 (接近幅・参照TF・状態本数が異なる)。
+//  EMA長・Source・Zone種別は数値同一のため共有。
+// ============================================================
+grpEMAWZRDD = "EMA WinZone [RDD-B]"
+emaTouchATRMultRDD = input.float(0.35, "RDD EMA接近幅 ATR倍率", step = 0.05, group = grpEMAWZRDD)
+emaAtrLenRDD       = input.int(14, "RDD EMA ATR期間", minval = 1, group = grpEMAWZRDD)
+useEMABounceRDD    = input.bool(true, "RDD 反発シグナルを使う", group = grpEMAWZRDD)
+useEMA1MRDD  = input.bool(true,  "RDD 1分EMAを使う",   group = grpEMAWZRDD)
+useEMA5MRDD  = input.bool(true,  "RDD 5分EMAを使う",   group = grpEMAWZRDD)
+useEMA15MRDD = input.bool(false, "RDD 15分EMAを使う",  group = grpEMAWZRDD)
+useEMA1HRDD  = input.bool(false, "RDD 1時間EMAを使う", group = grpEMAWZRDD)
+useEMA4HRDD  = input.bool(false, "RDD 4時間EMAを使う", group = grpEMAWZRDD)
+tfEMA1MRDD  = input.timeframe("1",   "RDD 1分TF",   group = grpEMAWZRDD)
+tfEMA5MRDD  = input.timeframe("5",   "RDD 5分TF",   group = grpEMAWZRDD)
+tfEMA15MRDD = input.timeframe("15",  "RDD 15分TF",  group = grpEMAWZRDD)
+tfEMA1HRDD  = input.timeframe("60",  "RDD 1時間TF", group = grpEMAWZRDD)
+tfEMA4HRDD  = input.timeframe("240", "RDD 4時間TF", group = grpEMAWZRDD)
+useEMAStateWindowRDD       = input.bool(true, "RDD EMA状態管理を使う", group = grpEMAWZRDD)
+emaStateMaxBarsRDD         = input.int(10, "RDD EMA状態 有効本数", minval = 1, group = grpEMAWZRDD)
+resetEMAStateAfterEntryRDD = input.bool(true, "RDD エントリー後EMA状態をリセット", group = grpEMAWZRDD)
+
+f_emaTFEvalRDD(bool _tfOn, string _tf) =>
+    float _e1 = na
+    float _e2 = na
+    float _e3 = na
+    float _e4 = na
+    float _e5 = na
+    float _atr = na
+    if _tfOn
+        [_v1, _v2, _v3, _v4, _v5, _v6] = request.security(syminfo.tickerid, _tf, [ta.ema(emaSource, emaLen1), ta.ema(emaSource, emaLen2), ta.ema(emaSource, emaLen3), ta.ema(emaSource, emaLen4), ta.ema(emaSource, emaLen5), ta.atr(emaAtrLenRDD)], lookahead = barmerge.lookahead_off)
+        _e1 := _v1
+        _e2 := _v2
+        _e3 := _v3
+        _e4 := _v4
+        _e5 := _v5
+        _atr := _v6
+    float _touch = emaTouchMode == "ATR" ? _atr * emaTouchATRMultRDD : emaTouchDollar
+    bool _bl1 = _tfOn and useEMA1Zone and not na(_e1) and low <= _e1 + _touch and close > _e1 and close > open
+    bool _bl2 = _tfOn and useEMA2Zone and not na(_e2) and low <= _e2 + _touch and close > _e2 and close > open
+    bool _bl3 = _tfOn and useEMA3Zone and not na(_e3) and low <= _e3 + _touch and close > _e3 and close > open
+    bool _bl4 = _tfOn and useEMA4Zone and not na(_e4) and low <= _e4 + _touch and close > _e4 and close > open
+    bool _bl5 = _tfOn and useEMA5Zone and not na(_e5) and low <= _e5 + _touch and close > _e5 and close > open
+    bool _bs1 = _tfOn and useEMA1Zone and not na(_e1) and high >= _e1 - _touch and close < _e1 and close < open
+    bool _bs2 = _tfOn and useEMA2Zone and not na(_e2) and high >= _e2 - _touch and close < _e2 and close < open
+    bool _bs3 = _tfOn and useEMA3Zone and not na(_e3) and high >= _e3 - _touch and close < _e3 and close < open
+    bool _bs4 = _tfOn and useEMA4Zone and not na(_e4) and high >= _e4 - _touch and close < _e4 and close < open
+    bool _bs5 = _tfOn and useEMA5Zone and not na(_e5) and high >= _e5 - _touch and close < _e5 and close < open
+    bool _bLong  = _bl1 or _bl2 or _bl3 or _bl4 or _bl5
+    bool _bShort = _bs1 or _bs2 or _bs3 or _bs4 or _bs5
+    [_bLong, _bShort]
+
+var bool emaLongStateRDD     = false
+var bool emaShortStateRDD    = false
+var int  emaLongStateBarRDD  = na
+var int  emaShortStateBarRDD = na
+
+[_bl1mR,  _bs1mR ] = f_emaTFEvalRDD(useEMA1MRDD,  tfEMA1MRDD)
+[_bl5mR,  _bs5mR ] = f_emaTFEvalRDD(useEMA5MRDD,  tfEMA5MRDD)
+[_bl15mR, _bs15mR] = f_emaTFEvalRDD(useEMA15MRDD, tfEMA15MRDD)
+[_bl1hR,  _bs1hR ] = f_emaTFEvalRDD(useEMA1HRDD,  tfEMA1HRDD)
+[_bl4hR,  _bs4hR ] = f_emaTFEvalRDD(useEMA4HRDD,  tfEMA4HRDD)
+bool emaBounceLongRDD  = _bl1mR or _bl5mR or _bl15mR or _bl1hR or _bl4hR
+bool emaBounceShortRDD = _bs1mR or _bs5mR or _bs15mR or _bs1hR or _bs4hR
+bool emaLongEventRDD  = useEMABounceRDD and emaBounceLongRDD
+bool emaShortEventRDD = useEMABounceRDD and emaBounceShortRDD
+if useEMAStateWindowRDD
+    if emaLongEventRDD
+        emaLongStateRDD    := true
+        emaLongStateBarRDD := bar_index
+    if emaShortEventRDD
+        emaShortStateRDD    := true
+        emaShortStateBarRDD := bar_index
+    if emaLongStateRDD and not na(emaLongStateBarRDD) and bar_index - emaLongStateBarRDD > emaStateMaxBarsRDD
+        emaLongStateRDD := false
+    if emaShortStateRDD and not na(emaShortStateBarRDD) and bar_index - emaShortStateBarRDD > emaStateMaxBarsRDD
+        emaShortStateRDD := false
+
+bool emaLongWinZoneRDD  = useEMAStateWindowRDD ? emaLongStateRDD  : emaLongEventRDD
+bool emaShortWinZoneRDD = useEMAStateWindowRDD ? emaShortStateRDD : emaShortEventRDD
+
+// ============================================================
+//  9R-4. RDD MACD [RDD-B 専用] (Signalクロス or Hist拡大・状態3)
+// ------------------------------------------------------------
+//  結合は OR (元 macdDirection の優先順位経由。ANDではない)。
+//  MACD値(8/21/5)・Hist拡大カウント・Hist位置フィルタは数値同一のため共有。
+//  DDD-C の MACD状態(状態3・Hist拡大のみ)とは別の状態変数で独立管理。
+// ============================================================
+grpMACDRDD = "MACD [RDD-B]"
+useMACDSignalCrossRDD    = input.bool(true, "A: Signalクロスを使う", group = grpMACDRDD)
+useMACDHistExpansionRDD  = input.bool(true, "D: Hist拡大を使う", group = grpMACDRDD)
+macdStateMaxBarsRDD      = input.int(3, "RDD MACD状態 有効本数", minval = 1, group = grpMACDRDD)
+resetMACDStateAfterEntryRDD = input.bool(true, "RDD エントリー後MACD状態をリセット", group = grpMACDRDD)
+
+// Signalクロス / Hist拡大 (Hist位置フィルタ込み。macdHistBullOK 等は DDDセクションで算出済・数値同一で共有)
+bool macdBuyCrossRDD  = useMACDSignalCrossRDD and ta.crossover(macdLine, macdSignal)  and macdHistDirBuy
+bool macdSellCrossRDD = useMACDSignalCrossRDD and ta.crossunder(macdLine, macdSignal) and macdHistDirSell
+bool macdBuyHistRDD   = useMACDHistExpansionRDD and macdHistBullOK and macdHistDirBuy
+bool macdSellHistRDD  = useMACDHistExpansionRDD and macdHistBearOK and macdHistDirSell
+bool macdAnySigXRDD  = macdBuyCrossRDD or macdSellCrossRDD
+bool macdAnyHistXRDD = macdBuyHistRDD or macdSellHistRDD
+// 方向 (優先: Signalクロス > Hist拡大)
+int macdDirRDD = macdAnySigXRDD ? (macdBuyCrossRDD ? 1 : -1) : macdAnyHistXRDD ? (macdBuyHistRDD ? 1 : -1) : 0
+bool macdMomentumLongRDD  = macdDirRDD == 1
+bool macdMomentumShortRDD = macdDirRDD == -1
+
+var bool longMACDStateRDD  = false
+var bool shortMACDStateRDD = false
+var int  longMACDStateBarRDD  = na
+var int  shortMACDStateBarRDD = na
+if macdMomentumLongRDD
+    longMACDStateRDD    := true
+    longMACDStateBarRDD := bar_index
+if macdMomentumShortRDD
+    shortMACDStateRDD    := true
+    shortMACDStateBarRDD := bar_index
+if longMACDStateRDD and not na(longMACDStateBarRDD) and bar_index - longMACDStateBarRDD > macdStateMaxBarsRDD
+    longMACDStateRDD := false
+if shortMACDStateRDD and not na(shortMACDStateBarRDD) and bar_index - shortMACDStateBarRDD > macdStateMaxBarsRDD
+    shortMACDStateRDD := false
+
+bool allowLongByMACDRDD  = longMACDStateRDD
+bool allowShortByMACDRDD = shortMACDStateRDD
+
+// ============================================================
+//  10. 各ランク条件 (Size判定を除く)
+// ------------------------------------------------------------
+//  DDD-C : 環境(下降) + EMA(DDD) + MACD(DDD) + BOS(5) + 執行
+//  RDD-B : 共通(レンジ環境+Trigger) + 出来高 + EMA(RDD) + MACD(RDD)
+//  RDD-C : 共通 + 出来高 かつ not RDD-B
+// ============================================================
+// --- 時間帯フィルタ (東京時間 JST・全ランク共通) ---
 int  jstHour   = hour(time, "Asia/Tokyo")
 bool inAsia    = jstHour >= 9  and jstHour < 16
 bool inEU      = jstHour >= 16 and jstHour < 21
@@ -459,31 +667,20 @@ bool sessionOk =
      (useEUSession   and inEU) or
      (useNYSession   and inNY)
 
-// Cランク基本条件 (方向別)。EMA(WinZone)・MACD・BOS は必須項目。
+// --- DDD-C 基本条件 (既存・変更なし) ---
 bool cRankLongBase =
-     useLong and
-     sessionOk and
-     envLongOk and
-     longWinZoneOk and
-     allowLongByMACD and
-     allowLongByTrigger and
-     volOk
-
+     useLong and sessionOk and envLongOk and longWinZoneOk and
+     allowLongByMACD and allowLongByTrigger and volOk
 bool cRankShortBase =
-     useShort and
-     sessionOk and
-     envShortOk and
-     shortWinZoneOk and
-     allowShortByMACD and
-     allowShortByTrigger and
-     volOk
+     useShort and sessionOk and envShortOk and shortWinZoneOk and
+     allowShortByMACD and allowShortByTrigger and volOk
+
+// --- RDD 共通条件 ---
+bool commonLongRDD  = useLong  and sessionOk and envLongRDD  and triggerLongRDD  and volOk
+bool commonShortRDD = useShort and sessionOk and envShortRDD and triggerShortRDD and volOk
 
 // ============================================================
-//  11. Size / SL / TP 計算
-// ------------------------------------------------------------
-//  SL方式/幅/RR/バッファは元ストラテジーと同一。
-//  Size = 計算用資金 × 損失率 ÷ (リスク幅 × pointvalue) を整数切り捨て。
-//  1未満はエントリー対象外 (仮/確定シグナル・仮想ポジションの元条件へ組込)。
+//  11. Size / SL / TP 計算 (全ランク共通・数値同一) + 各ランク最終条件
 // ============================================================
 float patLow  = math.min(low,  low[1])
 float patHigh = math.max(high, high[1])
@@ -506,53 +703,84 @@ f_qty(float riskPerUnit) =>
 float longQty  = f_qty(longRisk)
 float shortQty = f_qty(shortRisk)
 
-// Cランク最終条件 (SLリスク>0 と Size>=1 を組込)
-bool cRankLongFinal  = cRankLongBase  and longRisk  > 0 and longQty  >= 1
-bool cRankShortFinal = cRankShortBase and shortRisk > 0 and shortQty >= 1
+bool sizeLongOk  = longRisk  > 0 and longQty  >= 1
+bool sizeShortOk = shortRisk > 0 and shortQty >= 1
+
+// --- DDD-C 最終 ---
+bool cRankLongFinal  = cRankLongBase  and sizeLongOk
+bool cRankShortFinal = cRankShortBase and sizeShortOk
+
+// --- RDD B/C (Bは出来高+EMA+MACD、CはBを除外) ---
+bool bRankLongRDD  = commonLongRDD  and longVolumeZoneRDD  and emaLongWinZoneRDD  and allowLongByMACDRDD
+bool bRankShortRDD = commonShortRDD and shortVolumeZoneRDD and emaShortWinZoneRDD and allowShortByMACDRDD
+bool cRankLongRDD  = commonLongRDD  and longVolumeZoneRDD  and not bRankLongRDD
+bool cRankShortRDD = commonShortRDD and shortVolumeZoneRDD and not bRankShortRDD
+
+bool bRankLongFinalRDD  = bRankLongRDD  and sizeLongOk
+bool bRankShortFinalRDD = bRankShortRDD and sizeShortOk
+bool cRankLongFinalRDD  = cRankLongRDD  and sizeLongOk
+bool cRankShortFinalRDD = cRankShortRDD and sizeShortOk
 
 // ============================================================
-//  14-0. 仮想ポジション: 予約建玉の起動 (前足の確定で予約 → 今足の頭で開始)
+//  12-0. 仮想ポジション: 予約建玉の起動 (前足の確定で予約 → 今足の頭で開始)
 // ------------------------------------------------------------
-//  元 strategy.entry は次足始値で約定するため、確定足では予約だけ行い、
-//  次足の頭で仮想ポジションを開始する。SL/TP監視も建玉足(=次足)から。
+//  確定足では予約だけ行い、次足の頭で建玉開始。SL/TP監視も建玉足から。
 //  建玉成立足で EMA状態をリセット (元 didEnter* の約定足リセットに一致)。
+//  リセットするEMAは予約したロジック(DDD or RDD)に対応する側のみ。
 // ============================================================
-var int   posState = 0     // 0=ノーポジ / 1=ロング保有 / -1=ショート保有
-var float vEntry   = na
-var float vSL      = na
-var float vTP      = na
-var int   pendingEntryDir = 0   // 0=予約なし / 1=ロング予約 / -1=ショート予約
-var float resEntry = na
-var float resSL    = na
-var float resTP    = na
+var int    posState = 0     // 0=ノーポジ / 1=ロング保有 / -1=ショート保有
+var float  vEntry   = na
+var float  vSL      = na
+var float  vTP      = na
+var string vRank        = ""
+var string vLogic       = ""
+var string vEnvironment = ""
+// 予約内容 (確定足でセット → 次足で起動)
+var int    pendingEntryDir = 0   // 0=予約なし / 1=ロング予約 / -1=ショート予約
+var float  resEntry = na
+var float  resSL    = na
+var float  resTP    = na
+var string resRank        = ""
+var string resLogic       = ""
+var string resEnvironment = ""
+var bool   resIsRDD = false      // 予約が RDD(B/C) か DDD-C か (EMAリセット振り分け用)
 
-bool justActivated = false
 if is5m and pendingEntryDir != 0 and posState == 0
     posState := pendingEntryDir
     vEntry   := resEntry
     vSL      := resSL
     vTP      := resTP
-    if resetEMAStateAfterEntry
-        if pendingEntryDir == 1
-            emaLongState    := false
-            emaLongStateBar := na
-        else
-            emaShortState    := false
-            emaShortStateBar := na
+    vRank        := resRank
+    vLogic       := resLogic
+    vEnvironment := resEnvironment
+    // EMA状態リセット (建玉成立足・予約ロジック側のみ)
+    if resIsRDD
+        if resetEMAStateAfterEntryRDD
+            if pendingEntryDir == 1
+                emaLongStateRDD    := false
+                emaLongStateBarRDD := na
+            else
+                emaShortStateRDD    := false
+                emaShortStateBarRDD := na
+    else
+        if resetEMAStateAfterEntry
+            if pendingEntryDir == 1
+                emaLongState    := false
+                emaLongStateBar := na
+            else
+                emaShortState    := false
+                emaShortStateBar := na
     pendingEntryDir := 0
-    justActivated := true
 
 // ============================================================
-//  14a. 仮想ポジション: 建玉中の決済処理 (エントリー判定より前に評価)
+//  12a. 仮想ポジション: 建玉中の決済処理 (エントリー判定より前に評価)
 // ------------------------------------------------------------
 //  SL/TP は高値・安値の到達で判定。同足でSL/TP両到達はSL優先。
-//  Q3=① : 決済した足では新規を許可しない (次足以降のみ)。
-//  Q4=① : 過去足から通しで管理 (履歴から現在まで状態を引き継ぐ)。
+//  決済した足では新規を許可しない (次足以降)。過去足から通しで管理。
 // ============================================================
 bool exitedThisBar = false
 if is5m and posState != 0
     if posState == 1
-        // ロング保有: 安値がSL以下 → SL決済 / 高値がTP以上 → TP決済 (SL優先)
         if low <= vSL
             posState := 0
             exitedThisBar := true
@@ -560,7 +788,6 @@ if is5m and posState != 0
             posState := 0
             exitedThisBar := true
     else if posState == -1
-        // ショート保有: 高値がSL以上 → SL決済 / 安値がTP以下 → TP決済 (SL優先)
         if high >= vSL
             posState := 0
             exitedThisBar := true
@@ -569,118 +796,320 @@ if is5m and posState != 0
             exitedThisBar := true
 
 // 新規許可 = 5分足 かつ ノーポジ かつ 予約なし かつ 当該足で決済していない
+// (全ランク・全方向・仮/確定・ラベルを一括で停止する共通ゲート)
 bool entryAllowed = is5m and posState == 0 and pendingEntryDir == 0 and not exitedThisBar
+
+// ============================================================
+//  メッセージ生成ヘルパー (仮/確定アラート本文・確定ラベル)
+// ============================================================
+f_alertMsg(string kind, string dir, float e, float sl, float tp, string rank, string logic, string env, int sz) =>
+    "【" + kind + "】\n方向：" + dir + "\nエントリー：" + str.tostring(e, format.mintick) + "\nSL：" + str.tostring(sl, format.mintick) + "\nTP：" + str.tostring(tp, format.mintick) + "\nランク：" + rank + "\nロジック：" + logic + "\n環境：" + env + "\n時間足：5分\nSize：" + str.tostring(sz)
+
+f_labelTxt(string dir, float e, float sl, float tp, string rank, string logic, string env, int sz) =>
+    dir + "\nEntry：" + str.tostring(e, format.mintick) + "\nSL：" + str.tostring(sl, format.mintick) + "\nTP：" + str.tostring(tp, format.mintick) + "\nRank：" + rank + "\n" + logic + "\n" + env + "\nSize：" + str.tostring(sz)
+
+// ロジック別 表示文字列
+string LOGIC_DDDC = "EMA＋MACD"
+string LOGIC_RDDB = "出来高＋EMA＋MACD"
+string LOGIC_RDDC = "出来高"
+string ENV_DDD    = "下降／下降／下降"
+string ENV_RDD    = "レンジ／下降／下降"
 
 // ============================================================
 //  12. 仮シグナル管理 (リアルタイム・未確定通知)
 // ------------------------------------------------------------
-//  足確定前に「足確定以外の全条件」が初成立した瞬間、1回だけ alert()。
-//  通知済み状態と固定値は varip (リアルタイムのティック更新でロールバック
-//  しても通知済み状態が失われないようにする)。
-//  通知済み状態はロジック(C)・方向(Long/Short)ごとに分離。
-//  一度通知したら、その方向の確定シグナルが出るまで再通知しない(足跨ぎ維持)。
-//  ラベルは出さない。仮想ポジション保有中/予約中は出さない。
+//  通知済み状態・固定値は varip (ティック更新でロールバックさせない)。
+//  ランク(DDD-C / RDD-B / RDD-C)・方向 ごとに完全分離。
+//  昇格: cRankFinalRDD は not Bランクを含むため、Bが立つとC条件は自然に
+//        false化。C仮は varip で保持され、Bが立てばB仮を新規発火 (C仮維持)。
+//  確定シグナルが出るまで同ランク・同方向は再通知しない。ラベルは出さない。
+//  保有中/予約中(entryAllowed=false)は全て停止。
 // ============================================================
-varip bool  pendingLongC  = false   // Cランク・ロング仮通知済み
-varip bool  pendingShortC = false   // Cランク・ショート仮通知済み
-varip float pendEntryL = na
-varip float pendSLL    = na
-varip float pendTPL    = na
-varip int   pendSizeL  = na
-varip float pendEntryS = na
-varip float pendSLS    = na
-varip float pendTPS    = na
-varip int   pendSizeS  = na
+// --- DDD-C 仮通知済み + 固定値 ---
+varip bool  pendingLongC  = false
+varip bool  pendingShortC = false
+varip float pendEntryLC = na
+varip float pendSLLC    = na
+varip float pendTPLC    = na
+varip int   pendSizeLC  = na
+varip float pendEntrySC = na
+varip float pendSLSC    = na
+varip float pendTPSC    = na
+varip int   pendSizeSC  = na
+// --- RDD-B 仮通知済み + 固定値 ---
+varip bool  pendingLongBRDD  = false
+varip bool  pendingShortBRDD = false
+varip float pendEntryLB = na
+varip float pendSLLB    = na
+varip float pendTPLB    = na
+varip int   pendSizeLB  = na
+varip float pendEntrySB = na
+varip float pendSLSB    = na
+varip float pendTPSB    = na
+varip int   pendSizeSB  = na
+// --- RDD-C 仮通知済み + 固定値 ---
+varip bool  pendingLongCRDD  = false
+varip bool  pendingShortCRDD = false
+varip float pendEntryLCR = na
+varip float pendSLLCR    = na
+varip float pendTPLCR    = na
+varip int   pendSizeLCR  = na
+varip float pendEntrySCR = na
+varip float pendSLSCR    = na
+varip float pendTPSCR    = na
+varip int   pendSizeSCR  = na
 
-bool tentativeLong  = entryAllowed and useLong  and cRankLongFinal  and barstate.isrealtime and not barstate.isconfirmed and not pendingLongC
-bool tentativeShort = entryAllowed and useShort and cRankShortFinal and barstate.isrealtime and not barstate.isconfirmed and not pendingShortC
+bool rt = barstate.isrealtime and not barstate.isconfirmed
 
-if tentativeLong
+// DDD-C 仮
+bool tentLongC  = entryAllowed and useLong  and cRankLongFinal  and rt and not pendingLongC
+bool tentShortC = entryAllowed and useShort and cRankShortFinal and rt and not pendingShortC
+// RDD-B 仮
+bool tentLongB  = entryAllowed and useLong  and bRankLongFinalRDD  and rt and not pendingLongBRDD
+bool tentShortB = entryAllowed and useShort and bRankShortFinalRDD and rt and not pendingShortBRDD
+// RDD-C 仮
+bool tentLongCR  = entryAllowed and useLong  and cRankLongFinalRDD  and rt and not pendingLongCRDD
+bool tentShortCR = entryAllowed and useShort and cRankShortFinalRDD and rt and not pendingShortCRDD
+
+if tentLongC
     pendingLongC := true
-    pendEntryL := close
-    pendSLL    := longStop
-    pendTPL    := longTP
-    pendSizeL  := int(longQty)
-if tentativeShort
+    pendEntryLC := close
+    pendSLLC := longStop
+    pendTPLC := longTP
+    pendSizeLC := int(longQty)
+if tentShortC
     pendingShortC := true
-    pendEntryS := close
-    pendSLS    := shortStop
-    pendTPS    := shortTP
-    pendSizeS  := int(shortQty)
+    pendEntrySC := close
+    pendSLSC := shortStop
+    pendTPSC := shortTP
+    pendSizeSC := int(shortQty)
+if tentLongB
+    pendingLongBRDD := true
+    pendEntryLB := close
+    pendSLLB := longStop
+    pendTPLB := longTP
+    pendSizeLB := int(longQty)
+if tentShortB
+    pendingShortBRDD := true
+    pendEntrySB := close
+    pendSLSB := shortStop
+    pendTPSB := shortTP
+    pendSizeSB := int(shortQty)
+if tentLongCR
+    pendingLongCRDD := true
+    pendEntryLCR := close
+    pendSLLCR := longStop
+    pendTPLCR := longTP
+    pendSizeLCR := int(longQty)
+if tentShortCR
+    pendingShortCRDD := true
+    pendEntrySCR := close
+    pendSLSCR := shortStop
+    pendTPSCR := shortTP
+    pendSizeSCR := int(shortQty)
 
 // ============================================================
-//  13. 確定シグナル判定
+//  13. 確定シグナル判定 (足確定時)
 // ------------------------------------------------------------
-//  足確定(barstate.isconfirmed)時に全条件成立で1回だけ。
-//  仮シグナルが先に出ていることは不要 (取りこぼし防止)。
-//  重複防止は freq_once_per_bar_close に任せず、方向別に最後の確定 bar_index も管理。
-//  ロング/ショートは同一足で同時成立しない (BOS上抜け/下抜け排他・
-//  MACD Hist陽/陰排他)。よって優先順位ロジックは設けない。
+//  各ロジック・ランク・方向で最後の確定 bar_index を分離管理し重複防止。
+//  仮が先に出ていることは不要 (取りこぼし防止)。
 // ============================================================
-var int lastConfirmLongBarC  = na
-var int lastConfirmShortBarC = na
+var int lastConfirmLongC  = na   // DDD-C
+var int lastConfirmShortC = na
+var int lastConfirmLongBRDD  = na  // RDD-B
+var int lastConfirmShortBRDD = na
+var int lastConfirmLongCRDD  = na  // RDD-C
+var int lastConfirmShortCRDD = na
 
-bool confirmLong  = entryAllowed and useLong  and cRankLongFinal  and barstate.isconfirmed and bar_index != lastConfirmLongBarC
-bool confirmShort = entryAllowed and useShort and cRankShortFinal and barstate.isconfirmed and bar_index != lastConfirmShortBarC
+bool cf = barstate.isconfirmed
+// DDD-C
+bool confirmLongC  = entryAllowed and useLong  and cRankLongFinal  and cf and bar_index != nz(lastConfirmLongC, -1)
+bool confirmShortC = entryAllowed and useShort and cRankShortFinal and cf and bar_index != nz(lastConfirmShortC, -1)
+// RDD-B
+bool confirmLongB  = entryAllowed and useLong  and bRankLongFinalRDD  and cf and bar_index != nz(lastConfirmLongBRDD, -1)
+bool confirmShortB = entryAllowed and useShort and bRankShortFinalRDD and cf and bar_index != nz(lastConfirmShortBRDD, -1)
+// RDD-C
+bool confirmLongCR  = entryAllowed and useLong  and cRankLongFinalRDD  and cf and bar_index != nz(lastConfirmLongCRDD, -1)
+bool confirmShortCR = entryAllowed and useShort and cRankShortFinalRDD and cf and bar_index != nz(lastConfirmShortCRDD, -1)
 
 // ============================================================
-//  14b. 仮想ポジション: 確定で「エントリー予約」+ MACD状態リセット
+//  12b/14b. 仮想ポジション: 確定で「エントリー予約」(優先 A>B>C・1件のみ)
 // ------------------------------------------------------------
-//  確定シグナルで予約 (建玉は次足の頭)。仮シグナルだけでは予約しない。
-//  Entry/SL/TP は確定足で計算した値を固定 (次足始値へ変更しない)。
-//  MACD状態リセットはシグナル足で実施 (元 strategy.entry ブロックに一致)。
-//  (EMA状態リセットは建玉成立足=14-0 で実施)。
+//  DDDとRDDは環境が排他・長短はTrigger排他のため通常は1件のみ成立するが、
+//  状態ウィンドウの重なり等の保険として優先順位付きで1件だけ予約する。
+//  予約時: 出来高・MACD状態はシグナル足でリセット (元 entry ブロック準拠)。
+//          EMA状態は建玉成立足(12-0)でリセット。
+//  昇格/下位共有: 同方向のB仮・C仮を確定時に両方リセット。
 // ============================================================
-if confirmLong
+bool reservedThisBar = false
+bool firedLongB   = false
+bool firedShortB  = false
+bool firedLongCR  = false
+bool firedShortCR = false
+bool firedLongC   = false
+bool firedShortC  = false
+
+// --- Bランク (最優先) ---
+if confirmLongB and not reservedThisBar
     pendingEntryDir := 1
     resEntry := close
-    resSL    := longStop
-    resTP    := longTP
-    lastConfirmLongBarC := bar_index
+    resSL := longStop
+    resTP := longTP
+    resRank := "B"
+    resLogic := LOGIC_RDDB
+    resEnvironment := ENV_RDD
+    resIsRDD := true
+    lastConfirmLongBRDD := bar_index
+    pendingLongBRDD := false
+    pendingLongCRDD := false                       // 同方向Cの仮もリセット (昇格)
+    if resetVolStateAfterEntryRDD
+        longVolStateRDD := false
+    if resetMACDStateAfterEntryRDD
+        longMACDStateRDD := false
+    firedLongB := true
+    reservedThisBar := true
+if confirmShortB and not reservedThisBar
+    pendingEntryDir := -1
+    resEntry := close
+    resSL := shortStop
+    resTP := shortTP
+    resRank := "B"
+    resLogic := LOGIC_RDDB
+    resEnvironment := ENV_RDD
+    resIsRDD := true
+    lastConfirmShortBRDD := bar_index
+    pendingShortBRDD := false
+    pendingShortCRDD := false
+    if resetVolStateAfterEntryRDD
+        shortVolStateRDD := false
+    if resetMACDStateAfterEntryRDD
+        shortMACDStateRDD := false
+    firedShortB := true
+    reservedThisBar := true
+
+// --- Cランク RDD ---
+if confirmLongCR and not reservedThisBar
+    pendingEntryDir := 1
+    resEntry := close
+    resSL := longStop
+    resTP := longTP
+    resRank := "C"
+    resLogic := LOGIC_RDDC
+    resEnvironment := ENV_RDD
+    resIsRDD := true
+    lastConfirmLongCRDD := bar_index
+    pendingLongCRDD := false
+    pendingLongBRDD := false                        // 同方向Bの仮もリセット
+    if resetVolStateAfterEntryRDD
+        longVolStateRDD := false
+    if resetMACDStateAfterEntryRDD                  // 一律リセット (元コード準拠)
+        longMACDStateRDD := false
+    firedLongCR := true
+    reservedThisBar := true
+if confirmShortCR and not reservedThisBar
+    pendingEntryDir := -1
+    resEntry := close
+    resSL := shortStop
+    resTP := shortTP
+    resRank := "C"
+    resLogic := LOGIC_RDDC
+    resEnvironment := ENV_RDD
+    resIsRDD := true
+    lastConfirmShortCRDD := bar_index
+    pendingShortCRDD := false
+    pendingShortBRDD := false
+    if resetVolStateAfterEntryRDD
+        shortVolStateRDD := false
+    if resetMACDStateAfterEntryRDD
+        shortMACDStateRDD := false
+    firedShortCR := true
+    reservedThisBar := true
+
+// --- Cランク DDD (既存ロジック・変更なし) ---
+if confirmLongC and not reservedThisBar
+    pendingEntryDir := 1
+    resEntry := close
+    resSL := longStop
+    resTP := longTP
+    resRank := "C"
+    resLogic := LOGIC_DDDC
+    resEnvironment := ENV_DDD
+    resIsRDD := false
+    lastConfirmLongC := bar_index
     pendingLongC := false
     if resetMACDStateAfterEntry
         longMACDStateOk := false
-if confirmShort
+    firedLongC := true
+    reservedThisBar := true
+if confirmShortC and not reservedThisBar
     pendingEntryDir := -1
     resEntry := close
-    resSL    := shortStop
-    resTP    := shortTP
-    lastConfirmShortBarC := bar_index
+    resSL := shortStop
+    resTP := shortTP
+    resRank := "C"
+    resLogic := LOGIC_DDDC
+    resEnvironment := ENV_DDD
+    resIsRDD := false
+    lastConfirmShortC := bar_index
     pendingShortC := false
     if resetMACDStateAfterEntry
         shortMACDStateOk := false
+    firedShortC := true
+    reservedThisBar := true
 
 // ============================================================
 //  15. alert() (仮 = freq_once_per_bar / 確定 = freq_once_per_bar_close)
 // ------------------------------------------------------------
-//  alertcondition は使わず alert() のみ。
-//  frequency と 方向別状態変数の両方で重複を防止。
-//  すべて 5分足のみ。
+//  alertcondition は使わず alert() のみ。frequency と 状態変数の両方で重複防止。
+//  すべて 5分足のみ。確定は「実際に予約したシグナル」だけ通知。
 // ============================================================
-string _tfName = "5分"
+// --- 仮シグナル ---
+if is5m and tentLongC
+    alert(f_alertMsg("仮シグナル", "LONG", pendEntryLC, pendSLLC, pendTPLC, "C", LOGIC_DDDC, ENV_DDD, pendSizeLC), alert.freq_once_per_bar)
+if is5m and tentShortC
+    alert(f_alertMsg("仮シグナル", "SHORT", pendEntrySC, pendSLSC, pendTPSC, "C", LOGIC_DDDC, ENV_DDD, pendSizeSC), alert.freq_once_per_bar)
+if is5m and tentLongB
+    alert(f_alertMsg("仮シグナル", "LONG", pendEntryLB, pendSLLB, pendTPLB, "B", LOGIC_RDDB, ENV_RDD, pendSizeLB), alert.freq_once_per_bar)
+if is5m and tentShortB
+    alert(f_alertMsg("仮シグナル", "SHORT", pendEntrySB, pendSLSB, pendTPSB, "B", LOGIC_RDDB, ENV_RDD, pendSizeSB), alert.freq_once_per_bar)
+if is5m and tentLongCR
+    alert(f_alertMsg("仮シグナル", "LONG", pendEntryLCR, pendSLLCR, pendTPLCR, "C", LOGIC_RDDC, ENV_RDD, pendSizeLCR), alert.freq_once_per_bar)
+if is5m and tentShortCR
+    alert(f_alertMsg("仮シグナル", "SHORT", pendEntrySCR, pendSLSCR, pendTPSCR, "C", LOGIC_RDDC, ENV_RDD, pendSizeSCR), alert.freq_once_per_bar)
 
-// 仮シグナル alert (Size を含む)
-if is5m and tentativeLong
-    alert("【仮シグナル】\n方向：LONG\nエントリー：" + str.tostring(pendEntryL, format.mintick) + "\nSL：" + str.tostring(pendSLL, format.mintick) + "\nTP：" + str.tostring(pendTPL, format.mintick) + "\nランク：C\nロジック：EMA＋MACD\n時間足：" + _tfName + "\nSize：" + str.tostring(pendSizeL), alert.freq_once_per_bar)
-if is5m and tentativeShort
-    alert("【仮シグナル】\n方向：SHORT\nエントリー：" + str.tostring(pendEntryS, format.mintick) + "\nSL：" + str.tostring(pendSLS, format.mintick) + "\nTP：" + str.tostring(pendTPS, format.mintick) + "\nランク：C\nロジック：EMA＋MACD\n時間足：" + _tfName + "\nSize：" + str.tostring(pendSizeS), alert.freq_once_per_bar)
-
-// 確定シグナル alert
-if is5m and confirmLong
-    alert("【確定シグナル】\n方向：LONG\nエントリー：" + str.tostring(close, format.mintick) + "\nSL：" + str.tostring(longStop, format.mintick) + "\nTP：" + str.tostring(longTP, format.mintick) + "\nランク：C\nロジック：EMA＋MACD\n時間足：" + _tfName + "\nSize：" + str.tostring(int(longQty)), alert.freq_once_per_bar_close)
-if is5m and confirmShort
-    alert("【確定シグナル】\n方向：SHORT\nエントリー：" + str.tostring(close, format.mintick) + "\nSL：" + str.tostring(shortStop, format.mintick) + "\nTP：" + str.tostring(shortTP, format.mintick) + "\nランク：C\nロジック：EMA＋MACD\n時間足：" + _tfName + "\nSize：" + str.tostring(int(shortQty)), alert.freq_once_per_bar_close)
+// --- 確定シグナル (予約が実際に成立したものだけ) ---
+if is5m and firedLongB
+    alert(f_alertMsg("確定シグナル", "LONG", close, longStop, longTP, "B", LOGIC_RDDB, ENV_RDD, int(longQty)), alert.freq_once_per_bar_close)
+if is5m and firedShortB
+    alert(f_alertMsg("確定シグナル", "SHORT", close, shortStop, shortTP, "B", LOGIC_RDDB, ENV_RDD, int(shortQty)), alert.freq_once_per_bar_close)
+if is5m and firedLongCR
+    alert(f_alertMsg("確定シグナル", "LONG", close, longStop, longTP, "C", LOGIC_RDDC, ENV_RDD, int(longQty)), alert.freq_once_per_bar_close)
+if is5m and firedShortCR
+    alert(f_alertMsg("確定シグナル", "SHORT", close, shortStop, shortTP, "C", LOGIC_RDDC, ENV_RDD, int(shortQty)), alert.freq_once_per_bar_close)
+if is5m and firedLongC
+    alert(f_alertMsg("確定シグナル", "LONG", close, longStop, longTP, "C", LOGIC_DDDC, ENV_DDD, int(longQty)), alert.freq_once_per_bar_close)
+if is5m and firedShortC
+    alert(f_alertMsg("確定シグナル", "SHORT", close, shortStop, shortTP, "C", LOGIC_DDDC, ENV_DDD, int(shortQty)), alert.freq_once_per_bar_close)
 
 // ============================================================
 //  16. 確定ラベル (確定シグナルのみ・確定足で1回)
 // ------------------------------------------------------------
-//  ロングはローソク下側、ショートは上側に表示。
-//  Entry/SL/TP は確定足で計算した値 (次足始値へ変更しない)。
+//  色: DDD-C ロング=緑/ショート=赤 / RDD-B ロング=青/ショート=紫 /
+//      RDD-C ロング=青緑(teal)/ショート=橙(orange)。
+//  ロングはローソク下側、ショートは上側。
 // ============================================================
-if is5m and confirmLong
-    label.new(bar_index, low, "LONG\nEntry：" + str.tostring(close, format.mintick) + "\nSL：" + str.tostring(longStop, format.mintick) + "\nTP：" + str.tostring(longTP, format.mintick) + "\nRank：C\nEMA＋MACD\nSize：" + str.tostring(int(longQty)), style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.normal)
-if is5m and confirmShort
-    label.new(bar_index, high, "SHORT\nEntry：" + str.tostring(close, format.mintick) + "\nSL：" + str.tostring(shortStop, format.mintick) + "\nTP：" + str.tostring(shortTP, format.mintick) + "\nRank：C\nEMA＋MACD\nSize：" + str.tostring(int(shortQty)), style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.normal)
+if is5m and firedLongB
+    label.new(bar_index, low, f_labelTxt("LONG", close, longStop, longTP, "B", LOGIC_RDDB, ENV_RDD, int(longQty)), style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.blue, 0), textcolor = color.white, size = size.normal)
+if is5m and firedShortB
+    label.new(bar_index, high, f_labelTxt("SHORT", close, shortStop, shortTP, "B", LOGIC_RDDB, ENV_RDD, int(shortQty)), style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.purple, 0), textcolor = color.white, size = size.normal)
+if is5m and firedLongCR
+    label.new(bar_index, low, f_labelTxt("LONG", close, longStop, longTP, "C", LOGIC_RDDC, ENV_RDD, int(longQty)), style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.teal, 0), textcolor = color.white, size = size.normal)
+if is5m and firedShortCR
+    label.new(bar_index, high, f_labelTxt("SHORT", close, shortStop, shortTP, "C", LOGIC_RDDC, ENV_RDD, int(shortQty)), style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.orange, 0), textcolor = color.white, size = size.normal)
+if is5m and firedLongC
+    label.new(bar_index, low, f_labelTxt("LONG", close, longStop, longTP, "C", LOGIC_DDDC, ENV_DDD, int(longQty)), style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.normal)
+if is5m and firedShortC
+    label.new(bar_index, high, f_labelTxt("SHORT", close, shortStop, shortTP, "C", LOGIC_DDDC, ENV_DDD, int(shortQty)), style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.normal)
 
 // 5分足以外での警告表示 (1つだけ。5分足へ戻したら消す)
 var table warnTbl = table.new(position.middle_center, 1, 1, border_width = 1)
@@ -693,9 +1122,8 @@ if barstate.islast
 // ============================================================
 //  17. 将来のランク追加位置
 // ------------------------------------------------------------
-//  現在は Cランクのみ。A/Bランクを追加する場合は、それぞれ独立した
-//  条件・仮通知済み状態(pending***A / pending***B)・確定判定を作り、
-//  Cランクの状態変数に影響させないこと。
+//  現在は DDD-C / RDD-B / RDD-C。Aランクを追加する場合は、独立した
+//  条件・仮通知済み状態(pending***A)・確定判定・優先順位(A最優先)を作り、
+//  既存ランクの状態変数に影響させないこと。
 // ============================================================
 // TODO: Aランクロジックを将来追加
-// TODO: Bランクロジックを将来追加
