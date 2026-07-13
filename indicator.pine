@@ -165,6 +165,7 @@ volRecoveryBars = input.int(2,      "低ボラ解除後の待機本数", minval 
 // ============================================================
 grpRisk = "6. リスク / SL / TP"
 riskPct = input.float(5.0, "1トレード損失率 (%)",  minval = 0.1, step = 0.1, group = grpRisk)
+useCompound = input.bool(false, "複利 (仮想残高ベース) ※OFF=元金単利", group = grpRisk)
 slMode  = input.string("固定", "SL方式", options = ["パターン", "固定"], group = grpRisk)
 slBuf   = input.float(0.0, "SL バッファ (価格) ※パターン時", minval = 0.0, step = 0.1, group = grpRisk)
 slFixed = input.float(10, "固定SL幅 (価格) ※固定時",         minval = 0.0, step = 0.1, group = grpRisk)
@@ -2667,7 +2668,10 @@ if useEnvFilter and isFiveMinuteChart
     int needMatch = reqMatchCount == 0 ? envEnabled : reqMatchCount
     allowByEnv := envEnabled == 0 or envMatched >= needMatch
 
-bool envOk = not useEnvFilter or allowByEnv
+// 元コードでは envLongOk / envShortOk は共に allowByEnv (方向非依存) だった。
+// 方向別に意味を持たせず、元コードと同一結果になるよう双方 allowByEnv を使用する。
+bool envLongOk  = not useEnvFilter or allowByEnv
+bool envShortOk = not useEnvFilter or allowByEnv
 
 // ============================================================
 //  O. Structure — Elliott Wave Score モジュール
@@ -3096,7 +3100,8 @@ float shortStop = slMode == "固定" ? entryEst + slFixed : patHigh + slBuf
 float shortRisk = shortStop - entryEst
 float shortTP   = entryEst - shortRisk * rrRatio
 
-float baseCapital = initialCapital
+var float virtualEquity = initialCapital
+float baseCapital = useCompound ? virtualEquity : initialCapital
 float riskCapital = baseCapital * riskPct / 100.0
 
 f_qty(float riskPerUnit) =>
@@ -3122,8 +3127,8 @@ bool sessionOk =
 // ============================================================
 //  T. 全ランク共通ゲート (方向 / 時間帯 / 環境 / ボラ / トリガー / Size)
 // ============================================================
-bool commonLong  = useLong  and sessionOk and envOk and volOk and allowLongByTrigger  and longRisk  > 0 and longQty  >= 1
-bool commonShort = useShort and sessionOk and envOk and volOk and allowShortByTrigger and shortRisk > 0 and shortQty >= 1
+bool commonLong  = useLong  and sessionOk and envLongOk  and volOk and allowLongByTrigger  and longRisk  > 0 and longQty  >= 1
+bool commonShort = useShort and sessionOk and envShortOk and volOk and allowShortByTrigger and shortRisk > 0 and shortQty >= 1
 
 // ============================================================
 //  U. 各モジュールの成立状態 (状態管理済み・OFF時は false)
@@ -3291,6 +3296,10 @@ var float  virtualTP           = na
 var int    virtualRank         = 0
 var string virtualLogicNames   = ""
 var int    virtualEntryBar     = na
+var float  virtualQty          = na
+
+// 仮想残高 (複利時のSize基準)。確定損益で更新。
+// (virtualEquity 本体は R節で宣言済み)
 
 // ロジック別 仮シグナル送信済み (index はランクテーブルと共通)
 var array<bool> provSentLong  = array.new_bool(21, false)
@@ -3305,6 +3314,13 @@ if virtualInPosition and not na(virtualEntryBar) and bar_index > virtualEntryBar
     bool hitTP = virtualPositionSide == 1 ? high >= virtualTP : low <= virtualTP
     if hitSL or hitTP
         // 同一足でSL/TP両到達時は保守的にSL優先 (決済アラート/ラベルは無し)
+        // 仮想残高を実現損益で更新 (SL=実際のリスク額を減算 / TP=実際の利益額を加算)。
+        float _riskPerUnit   = math.abs(virtualEntryPrice - virtualSL)
+        float _profitPerUnit = math.abs(virtualTP - virtualEntryPrice)
+        if hitSL
+            virtualEquity := virtualEquity - virtualQty * _riskPerUnit   * syminfo.pointvalue
+        else
+            virtualEquity := virtualEquity + virtualQty * _profitPerUnit * syminfo.pointvalue
         virtualInPosition   := false
         virtualPositionSide := 0
         virtualEntryPrice   := na
@@ -3313,7 +3329,12 @@ if virtualInPosition and not na(virtualEntryBar) and bar_index > virtualEntryBar
         virtualRank         := 0
         virtualLogicNames   := ""
         virtualEntryBar     := na
+        virtualQty          := na
         justClosed          := true
+        // 仮想ポジション終了 → 全ロジックを新しいセットアップとして再アーム
+        for i = 0 to 20
+            array.set(provSentLong,  i, false)
+            array.set(provSentShort, i, false)
 
 // ============================================================
 //  AA. エントリー (確定シグナル / 仮シグナル)
@@ -3333,6 +3354,7 @@ if isFiveMinuteChart and not virtualInPosition and selDir != 0
         virtualRank         := selRank
         virtualLogicNames   := activeNames
         virtualEntryBar     := bar_index
+        virtualQty          := selDir == 1 ? longQty : shortQty
         alert(f_alertBody("【確定シグナル】", selDir == 1, selEntry, selSL, selTP, selRank, activeNames), alert.freq_once_per_bar_close)
         if showConfirmLabels
             string _lt = (selDir == 1 ? "BUY" : "SELL") + "\nEntry：" + f_price(selEntry) + "\nSL：" + f_price(selSL) + "\nTP：" + f_price(selTP) + "\nRank：" + f_rankStr(selRank) + "\nLogic：" + activeNames
@@ -3404,6 +3426,12 @@ if isFiveMinuteChart and not virtualInPosition and selDir != 0
                 wedgeShortStateBar := na
     else if barstate.isrealtime
         // ---- 仮シグナル (形成中の5分足) ----
+        // 重複防止は「ロジック別 送信済み配列」を主手段とする (alert.freq_all)。
+        // 送信した時点で該当ロジックを即 provSent=true にするため、
+        //   ・同じロジックは同一セットアップ中に1回だけ
+        //   ・別ロジックが後から成立すれば同じ足でも新規通知
+        //   ・後から上位ランクが成立すればそのランクで通知
+        //   ・var 配列は同一足のティック間で値を保持するためティック連打しない
         bool anyNew = false
         for i = 0 to 20
             bool act = selDir == 1 ? (array.get(useArr, i) and array.get(comboLongArr, i) and commonLong and array.get(rankArr, i) == selRank) : (array.get(useArr, i) and array.get(comboShortArr, i) and commonShort and array.get(rankArr, i) == selRank)
@@ -3412,27 +3440,26 @@ if isFiveMinuteChart and not virtualInPosition and selDir != 0
                 if not sent
                     anyNew := true
         if anyNew
-            alert(f_alertBody("【仮シグナル】", selDir == 1, selEntry, selSL, selTP, selRank, activeNames), alert.freq_once_per_bar)
+            alert(f_alertBody("【仮シグナル】", selDir == 1, selEntry, selSL, selTP, selRank, activeNames), alert.freq_all)
+            // 通知した時点で対象ランク・方向の成立ロジックを送信済みにする (足確定を待たない)
+            for i = 0 to 20
+                bool act2 = selDir == 1 ? (array.get(useArr, i) and array.get(comboLongArr, i) and commonLong and array.get(rankArr, i) == selRank) : (array.get(useArr, i) and array.get(comboShortArr, i) and commonShort and array.get(rankArr, i) == selRank)
+                if act2
+                    if selDir == 1
+                        array.set(provSentLong, i, true)
+                    else
+                        array.set(provSentShort, i, true)
 
 // ============================================================
-//  AB. 仮シグナル送信済みの確定コミット / 再アーム (足確定時)
+//  AB. 仮シグナル 再アーム 方針
 // ------------------------------------------------------------
-//  ・合成条件(estRaw = useArr and combo) が true → 送信済みへコミット
-//    (同じセットアップ中の再通知を防止)
-//  ・estRaw が false → 再アーム (新しいセットアップで再通知可能)
-//  ・仮想決済した足 (justClosed) は全ロジックを再アーム
-//  ・仮想ポジション保有中はコミットしない (保有中は仮通知しないため)
+//  ・仮通知した時点で provSent=true (上の仮シグナル処理内)。
+//  ・条件が一時的に false になっても、ノーポジション期間中は再通知しない
+//    (足確定時の estRaw ベース再アームは廃止)。
+//  ・仮想ポジションが SL/TP で終了した時点で全ロジックを再アーム (Z節 決済処理内)。
+//  ※ 確定シグナルが一度も出ずノーポジションが続く場合の再アーム条件は未実装
+//    (仕様確定待ち)。
 // ============================================================
-if isFiveMinuteChart and barstate.isconfirmed and not virtualInPosition
-    for i = 0 to 20
-        bool eRawL = array.get(useArr, i) and array.get(comboLongArr, i)
-        bool eRawS = array.get(useArr, i) and array.get(comboShortArr, i)
-        if justClosed
-            array.set(provSentLong,  i, false)
-            array.set(provSentShort, i, false)
-        else
-            array.set(provSentLong,  i, eRawL)
-            array.set(provSentShort, i, eRawS)
 
 // ============================================================
 //  AC. 出力 (データウィンドウ用・チャートには描画しない)
