@@ -1,68 +1,689 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
-// © your_username
+// © ka.mickey15
+//
+// ============================================================
+//  5分足 Cランク シグナルインジケーター (EMA＋MACD)
+// ------------------------------------------------------------
+//  ・元「5min Engulfing Strategy」から Cランク判定のみを抽出し、
+//    strategy() を indicator() へ変換した実運用シグナル版。
+//  ・Cランク = 環境認識(下降) + EMA WinZone(1分足EMA反発) +
+//    MACD Momentum(Hist拡大) + BOS + 高速ボラ + 時間帯 + Size。
+//  ・仮想ポジションを内部管理し、保有中は新規シグナルを停止 (pyramiding=0 再現)。
+//  ・アラート/ラベルは 5分足チャートでのみ出力。
+// ============================================================
 
 //@version=5
+
+// ============================================================
+//  1. indicator 宣言
+// ============================================================
 indicator(
-     title       = "My FX Indicator",
-     shorttitle  = "MyFX",
-     overlay     = true,       // true: ローソク足に重ねて表示 / false: 別パネルに表示
-     max_bars_back = 500
+     title         = "5min Cランク シグナル (EMA＋MACD)",
+     shorttitle    = "C-EMA+MACD",
+     overlay       = true,
+     dynamic_requests = true,
+     max_bars_back = 1000,
+     max_labels_count = 500
  )
 
-// ============================================================
-// 入力パラメーター
-// ============================================================
-grp_ma = "移動平均線"
-ma_len  = input.int(20,  title = "MA 期間",  minval = 1, group = grp_ma)
-ma_type = input.string("EMA", title = "MA 種別",
-             options = ["SMA", "EMA", "WMA", "VWMA"], group = grp_ma)
-
-grp_disp = "表示設定"
-show_ma   = input.bool(true, title = "MA を表示", group = grp_disp)
-ma_color  = input.color(color.new(color.blue, 0), title = "MA カラー", group = grp_disp)
+// 5分足判定 (文字列比較に頼らず秒数で安全に判定。5分 = 300秒)
+bool is5m = timeframe.in_seconds() == 300
 
 // ============================================================
-// 計算ロジック
+//  2. エントリー / 方向設定
+// ------------------------------------------------------------
+//  ロジックは残すが、ロングは元設定と同じく初期値 OFF。
 // ============================================================
-float ma_value = switch ma_type
-    "SMA"  => ta.sma(close,  ma_len)
-    "EMA"  => ta.ema(close,  ma_len)
-    "WMA"  => ta.wma(close,  ma_len)
-    "VWMA" => ta.vwma(close, ma_len)
-    =>        ta.ema(close,  ma_len)
-
-// トレンド方向（MA が上向き = 上昇トレンド）
-bool uptrend   = ma_value > ma_value[1]
-bool downtrend = ma_value < ma_value[1]
+grpEntry = "エントリー方向"
+useLong  = input.bool(false, "ロングを有効", group = grpEntry)
+useShort = input.bool(true,  "ショートを有効", group = grpEntry)
 
 // ============================================================
-// プロット
+//  3. リスク / SL / TP / 資金設定
+// ------------------------------------------------------------
+//  indicator では initial_capital / equity が使えないため、
+//  計算用資金を input で設定 (複利なし・入力資金固定)。
 // ============================================================
-plot(
-     show_ma ? ma_value : na,
-     title     = "MA",
-     color     = uptrend ? color.lime : downtrend ? color.red : ma_color,
-     linewidth = 2
- )
-
-// 背景色でトレンドをハイライト
-bgcolor(
-     uptrend   ? color.new(color.green, 95) :
-     downtrend ? color.new(color.red,   95) : na,
-     title = "トレンド背景"
- )
+grpRisk = "リスク / 資金"
+calcCapital = input.float(1000, "計算用資金",              minval = 0.0, step = 100, group = grpRisk)
+riskPct     = input.float(5.0,  "1トレード損失率 (%)",     minval = 0.1, step = 0.1, group = grpRisk)
+slMode      = input.string("固定", "SL方式", options = ["パターン", "固定"], group = grpRisk)
+slBuf       = input.float(0.0,  "パターンSLバッファ (価格)", minval = 0.0, step = 0.1, group = grpRisk)
+slFixed     = input.float(10,   "固定SL幅 (価格)",         minval = 0.0, step = 0.1, group = grpRisk)
+rrRatio     = input.float(1.0,  "リスクリワード比 (TP)",   minval = 0.1, step = 0.1, group = grpRisk)
 
 // ============================================================
-// アラート
+//  4. セッション設定 (時間帯フィルタ・東京時間 JST)
+// ------------------------------------------------------------
+//  Asia 09:00-16:00 / EU 16:00-21:00 / NY 21:00-翌03:00。
+//  03:00-09:00 はどのセッションにも属さず除外。
 // ============================================================
-alertcondition(
-     ta.crossover(close, ma_value),
-     title   = "価格が MA を上抜け",
-     message = "{{ticker}} : 価格が MA を上抜けました ({{close}})"
- )
+grpSession = "時間帯フィルタ (東京時間)"
+useSessionFilter = input.bool(true, "時間帯フィルタを使う", group = grpSession)
+useAsiaSession   = input.bool(true, "アジア 09:00-16:00", group = grpSession)
+useEUSession     = input.bool(true, "EU 16:00-21:00",   group = grpSession)
+useNYSession     = input.bool(true, "NY 21:00-翌03:00", group = grpSession)
 
-alertcondition(
-     ta.crossunder(close, ma_value),
-     title   = "価格が MA を下抜け",
-     message = "{{ticker}} : 価格が MA を下抜けました ({{close}})"
- )
+// ============================================================
+//  5. 環境認識 (4H/1H/15M/5M/1M のトレンド要求)
+// ------------------------------------------------------------
+//  各TFに要求状態を指定し、有効TFが要求と一致すれば許可。
+//  Cランク初期設定: 4H/1H/15M=下降、5M/1M=OFF。
+//  request.security は lookahead_off で未来参照しない。
+// ============================================================
+grpEnvMaster = "環境フィルタ"
+useEnvFilter = input.bool(true, "環境フィルタを使う", group = grpEnvMaster)
+
+grpTF = "環境: 時間足 要求状態 / 参照時間足"
+reqTrend4H  = input.string("下降", "4H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf4")
+tf4H        = input.timeframe("240", "TF",     group = grpTF, inline = "tf4")
+reqTrend1H  = input.string("下降", "1H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf1")
+tf1H        = input.timeframe("60",  "TF",     group = grpTF, inline = "tf1")
+reqTrend15M = input.string("下降", "15M 要求", options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf15")
+tf15M       = input.timeframe("15",  "TF",     group = grpTF, inline = "tf15")
+reqTrend5M  = input.string("OFF", "5M 要求",   options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf5")
+tf5M        = input.timeframe("5",   "TF",     group = grpTF, inline = "tf5")
+reqTrend1M  = input.string("OFF", "1M 要求",   options = ["OFF", "上昇", "レンジ", "下降"], group = grpTF, inline = "tf1m")
+tf1M        = input.timeframe("1",   "TF",     group = grpTF, inline = "tf1m")
+
+grpBull = "環境: 上昇条件 ON/OFF"
+useEma20Above50Up   = input.bool(true, "1. EMA20 > EMA50",      group = grpBull)
+useEma20SlopeUp     = input.bool(true, "2. EMA20 が上向き",      group = grpBull)
+useEma50SlopeUp     = input.bool(true, "3. EMA50 が上向き",      group = grpBull)
+useCloseAboveEma50  = input.bool(true, "4. close > EMA50",      group = grpBull)
+useCloseAboveEma200 = input.bool(true, "5. close > EMA200",     group = grpBull)
+useEmaDistanceWideU = input.bool(true, "6. EMA20/50 距離が広い", group = grpBull)
+useEmaExpansionU    = input.bool(true, "7. EMA20/50 が拡散中",   group = grpBull)
+
+grpBear = "環境: 下降条件 ON/OFF"
+useEma20Below50Dn   = input.bool(true, "1. EMA20 < EMA50",      group = grpBear)
+useEma20SlopeDown   = input.bool(true, "2. EMA20 が下向き",      group = grpBear)
+useEma50SlopeDown   = input.bool(true, "3. EMA50 が下向き",      group = grpBear)
+useCloseBelowEma50  = input.bool(true, "4. close < EMA50",      group = grpBear)
+useCloseBelowEma200 = input.bool(true, "5. close < EMA200",     group = grpBear)
+useEmaDistanceWideD = input.bool(true, "6. EMA20/50 距離が広い", group = grpBear)
+useEmaExpansionD    = input.bool(true, "7. EMA20/50 が拡散中",   group = grpBear)
+
+grpRange = "環境: レンジ条件 ON/OFF"
+useEmaDistanceNarrow = input.bool(true, "1. EMA20/50 距離が近い",      group = grpRange)
+useEma20SlopeWeak    = input.bool(true, "2. EMA20 の傾きが弱い",       group = grpRange)
+useEma50SlopeWeak    = input.bool(true, "3. EMA50 の傾きが弱い",       group = grpRange)
+useEmaCompression    = input.bool(true, "4. EMA20/50 が収束中",        group = grpRange)
+useEma20CrossCount   = input.bool(true, "5. 価格が EMA20 を一定回数跨ぐ", group = grpRange)
+useEma50CrossCount   = input.bool(true, "6. 価格が EMA50 を一定回数跨ぐ", group = grpRange)
+useRangeWidthSmall   = input.bool(true, "7. 高値安値幅が小さい",        group = grpRange)
+
+grpParam = "環境: 調整パラメータ"
+len20        = input.int(20,   "EMA20 length",  minval = 1, group = grpParam)
+len50        = input.int(50,   "EMA50 length",  minval = 1, group = grpParam)
+len200       = input.int(200,  "EMA200 length", minval = 1, group = grpParam)
+envAtrLen    = input.int(14,   "環境ATR length", minval = 1, group = grpParam)
+slopeBars    = input.int(3,    "EMA 傾き判定本数", minval = 1, group = grpParam)
+slopeMinMult = input.float(0.15, "EMA 傾きの最低値 ATR倍率",       minval = 0, step = 0.01, group = grpParam)
+distWideMult = input.float(0.50, "EMA20/50 距離 広い判定 ATR倍率", minval = 0, step = 0.01, group = grpParam)
+distNarrowMult = input.float(0.25, "EMA20/50 距離 近い判定 ATR倍率", minval = 0, step = 0.01, group = grpParam)
+convDivBars  = input.int(5,    "収束/拡散 判定本数",   minval = 1, group = grpParam)
+crossBars    = input.int(20,   "EMA跨ぎ回数 判定本数", minval = 1, group = grpParam)
+crossMinCount = input.int(3,   "EMA跨ぎ回数 最低回数", minval = 1, group = grpParam)
+rangeBars    = input.int(20,   "レンジ幅 判定本数",    minval = 1, group = grpParam)
+rangeMult    = input.float(1.5, "レンジ幅 ATR倍率",    minval = 0, step = 0.1, group = grpParam)
+
+grpJudge = "環境: 判定ルール"
+tieAsRange          = input.bool(true, "同点時にレンジ扱いする",     group = grpJudge)
+insufficientAsRange = input.bool(true, "条件不足時にレンジ扱いする", group = grpJudge)
+minScore4H  = input.int(3, "4H 最低必要スコア",  minval = 1, group = grpJudge)
+minScore1H  = input.int(3, "1H 最低必要スコア",  minval = 1, group = grpJudge)
+minScore15M = input.int(3, "15M 最低必要スコア", minval = 1, group = grpJudge)
+minScore5M  = input.int(3, "5M 最低必要スコア",  minval = 1, group = grpJudge)
+minScore1M  = input.int(3, "1M 最低必要スコア",  minval = 1, group = grpJudge)
+
+grpLink = "環境: 判定"
+reqMatchCount = input.int(0, "必要一致TF数 (0=有効な全TFが一致)", minval = 0, group = grpLink)
+
+// --- 環境判定関数 (各TFコンテキストで呼ばれる。戻り値: trend, bull, bear, range) ---
+//   trend = 1=上昇 / 0=レンジ / -1=下降 / na=未判定
+f_envTrend(int minScore) =>
+    ema20  = ta.ema(close, len20)
+    ema50  = ta.ema(close, len50)
+    ema200 = ta.ema(close, len200)
+    atr    = ta.atr(envAtrLen)
+
+    dist     = math.abs(ema20 - ema50)
+    distPrev = dist[convDivBars]
+    slope20  = ema20 - ema20[slopeBars]
+    slope50  = ema50 - ema50[slopeBars]
+
+    cr20 = ta.crossover(close, ema20) or ta.crossunder(close, ema20)
+    cr50 = ta.crossover(close, ema50) or ta.crossunder(close, ema50)
+    cnt20 = math.sum(cr20 ? 1.0 : 0.0, crossBars)
+    cnt50 = math.sum(cr50 ? 1.0 : 0.0, crossBars)
+
+    rangeWidth = ta.highest(high, rangeBars) - ta.lowest(low, rangeBars)
+
+    bullScore = 0
+    bullScore += useEma20Above50Up   and ema20 > ema50                     ? 1 : 0
+    bullScore += useEma20SlopeUp      and slope20 >=  atr * slopeMinMult    ? 1 : 0
+    bullScore += useEma50SlopeUp      and slope50 >=  atr * slopeMinMult    ? 1 : 0
+    bullScore += useCloseAboveEma50   and close > ema50                     ? 1 : 0
+    bullScore += useCloseAboveEma200  and close > ema200                    ? 1 : 0
+    bullScore += useEmaDistanceWideU  and ema20 > ema50 and dist >= atr * distWideMult ? 1 : 0
+    bullScore += useEmaExpansionU     and ema20 > ema50 and dist > distPrev            ? 1 : 0
+
+    bearScore = 0
+    bearScore += useEma20Below50Dn   and ema20 < ema50                     ? 1 : 0
+    bearScore += useEma20SlopeDown    and slope20 <= -atr * slopeMinMult    ? 1 : 0
+    bearScore += useEma50SlopeDown    and slope50 <= -atr * slopeMinMult    ? 1 : 0
+    bearScore += useCloseBelowEma50   and close < ema50                     ? 1 : 0
+    bearScore += useCloseBelowEma200  and close < ema200                    ? 1 : 0
+    bearScore += useEmaDistanceWideD  and ema20 < ema50 and dist >= atr * distWideMult ? 1 : 0
+    bearScore += useEmaExpansionD     and ema20 < ema50 and dist > distPrev            ? 1 : 0
+
+    rangeScore = 0
+    rangeScore += useEmaDistanceNarrow and dist <= atr * distNarrowMult              ? 1 : 0
+    rangeScore += useEma20SlopeWeak     and math.abs(slope20) <= atr * slopeMinMult  ? 1 : 0
+    rangeScore += useEma50SlopeWeak     and math.abs(slope50) <= atr * slopeMinMult  ? 1 : 0
+    rangeScore += useEmaCompression     and dist < distPrev                          ? 1 : 0
+    rangeScore += useEma20CrossCount    and cnt20 >= crossMinCount                    ? 1 : 0
+    rangeScore += useEma50CrossCount    and cnt50 >= crossMinCount                    ? 1 : 0
+    rangeScore += useRangeWidthSmall    and rangeWidth <= atr * rangeMult             ? 1 : 0
+
+    maxScore = math.max(bullScore, math.max(bearScore, rangeScore))
+    isBullTop  = bullScore == maxScore
+    isBearTop  = bearScore == maxScore
+    isRangeTop = rangeScore == maxScore
+    topCount   = (isBullTop ? 1 : 0) + (isBearTop ? 1 : 0) + (isRangeTop ? 1 : 0)
+    tie        = topCount > 1
+
+    int trend = na
+    if maxScore < minScore
+        trend := insufficientAsRange ? 0 : na
+    else if tie
+        trend := tieAsRange ? 0 : na
+    else if isBullTop
+        trend := 1
+    else if isBearTop
+        trend := -1
+    else
+        trend := 0
+    [trend, bullScore, bearScore, rangeScore]
+
+// 要求文字列 → コード (1=上昇/0=レンジ/-1=下降/na=OFF)
+f_reqCode(string s) =>
+    s == "上昇" ? 1 : s == "レンジ" ? 0 : s == "下降" ? -1 : na
+
+// --- 環境フィルタ計算 (OFF なら request.security を呼ばない) ---
+bool allowByEnv = true
+if useEnvFilter
+    [raw4H,  b4H,  be4H,  r4H ] = request.security(syminfo.tickerid, tf4H,  f_envTrend(minScore4H),  lookahead = barmerge.lookahead_off)
+    [raw1H,  b1H,  be1H,  r1H ] = request.security(syminfo.tickerid, tf1H,  f_envTrend(minScore1H),  lookahead = barmerge.lookahead_off)
+    [raw15M, b15M, be15M, r15M] = request.security(syminfo.tickerid, tf15M, f_envTrend(minScore15M), lookahead = barmerge.lookahead_off)
+    [raw5M,  b5M,  be5M,  r5M ] = request.security(syminfo.tickerid, tf5M,  f_envTrend(minScore5M),  lookahead = barmerge.lookahead_off)
+    [raw1M,  b1M,  be1M,  r1M ] = request.security(syminfo.tickerid, tf1M,  f_envTrend(minScore1M),  lookahead = barmerge.lookahead_off)
+
+    en4H  = reqTrend4H  != "OFF"
+    en1H  = reqTrend1H  != "OFF"
+    en15M = reqTrend15M != "OFF"
+    en5M  = reqTrend5M  != "OFF"
+    en1M  = reqTrend1M  != "OFF"
+
+    m4H  = en4H  and not na(raw4H)  and raw4H  == f_reqCode(reqTrend4H)
+    m1H  = en1H  and not na(raw1H)  and raw1H  == f_reqCode(reqTrend1H)
+    m15M = en15M and not na(raw15M) and raw15M == f_reqCode(reqTrend15M)
+    m5M  = en5M  and not na(raw5M)  and raw5M  == f_reqCode(reqTrend5M)
+    m1M  = en1M  and not na(raw1M)  and raw1M  == f_reqCode(reqTrend1M)
+
+    int envEnabled = (en4H ? 1 : 0) + (en1H ? 1 : 0) + (en15M ? 1 : 0) + (en5M ? 1 : 0) + (en1M ? 1 : 0)
+    int envMatched = (m4H ? 1 : 0) + (m1H ? 1 : 0) + (m15M ? 1 : 0) + (m5M ? 1 : 0) + (m1M ? 1 : 0)
+
+    int needMatch = reqMatchCount == 0 ? envEnabled : reqMatchCount
+    allowByEnv := envEnabled == 0 or envMatched >= needMatch
+
+// 環境フィルタ最終判定 (ロング/ショート共通の環境テンプレート)
+bool envLongOk  = not useEnvFilter or allowByEnv
+bool envShortOk = not useEnvFilter or allowByEnv
+
+// ============================================================
+//  6. EMA WinZone (MTF EMA を反発する価格帯として使う場所条件)
+// ------------------------------------------------------------
+//  EMA は方向Bias ではなく Zone。各EMA/各TFで反発したら WinZone成立。
+//  Cランク初期設定: 1分足の EMA200/600/1000/2000/3000 反発を使用。
+//  接近幅は各TF ATR×0.25。イベント後 emaStateMaxBars 本だけ状態保持。
+//  OFF の時間足は request.security を呼ばない。
+// ============================================================
+grpEMAWZ = "EMA WinZone"
+useEMAModule  = input.bool(true, "EMAモジュールを使う",        group = grpEMAWZ)
+useEMAWinZone = input.bool(true, "EMAをWinZoneに使う (Cランク必須条件)", group = grpEMAWZ)
+emaLen1 = input.int(200,  "EMA200 Length",  minval = 1, group = grpEMAWZ)
+emaLen2 = input.int(600,  "EMA600 Length",  minval = 1, group = grpEMAWZ)
+emaLen3 = input.int(1000, "EMA1000 Length", minval = 1, group = grpEMAWZ)
+emaLen4 = input.int(2000, "EMA2000 Length", minval = 1, group = grpEMAWZ)
+emaLen5 = input.int(3000, "EMA3000 Length", minval = 1, group = grpEMAWZ)
+emaSource = input.source(close, "EMA Source", group = grpEMAWZ)
+useEMA1Zone = input.bool(true, "EMA200をZoneに使う",  group = grpEMAWZ)
+useEMA2Zone = input.bool(true, "EMA600をZoneに使う",  group = grpEMAWZ)
+useEMA3Zone = input.bool(true, "EMA1000をZoneに使う", group = grpEMAWZ)
+useEMA4Zone = input.bool(true, "EMA2000をZoneに使う", group = grpEMAWZ)
+useEMA5Zone = input.bool(true, "EMA3000をZoneに使う", group = grpEMAWZ)
+useEMABounce   = input.bool(true, "反発シグナルを使う",  group = grpEMAWZ)
+emaTouchMode   = input.string("ATR", "EMA接近判定", options = ["Dollar", "ATR"], group = grpEMAWZ)
+emaTouchDollar = input.float(3.0,  "EMA接近幅($)",      step = 0.1,  group = grpEMAWZ)
+emaTouchATRMult= input.float(0.25, "EMA接近幅 ATR倍率", step = 0.05, group = grpEMAWZ)
+emaAtrLen      = input.int(14, "EMA ATR期間", minval = 1, group = grpEMAWZ)
+
+grpEMATF = "EMA WinZone: MTF"
+useEMA1M  = input.bool(true,  "1分EMAを使う",   group = grpEMATF)
+useEMA5M  = input.bool(false, "5分EMAを使う",   group = grpEMATF)
+useEMA15M = input.bool(false, "15分EMAを使う",  group = grpEMATF)
+useEMA1H  = input.bool(false, "1時間EMAを使う", group = grpEMATF)
+useEMA4H  = input.bool(false, "4時間EMAを使う", group = grpEMATF)
+tfEMA1M  = input.timeframe("1",   "1分TF",   group = grpEMATF)
+tfEMA5M  = input.timeframe("5",   "5分TF",   group = grpEMATF)
+tfEMA15M = input.timeframe("15",  "15分TF",  group = grpEMATF)
+tfEMA1H  = input.timeframe("60",  "1時間TF", group = grpEMATF)
+tfEMA4H  = input.timeframe("240", "4時間TF", group = grpEMATF)
+
+grpEMAState = "EMA: 状態管理"
+useEMAStateWindow       = input.bool(true, "EMA状態管理を使う", group = grpEMAState)
+emaStateMaxBars         = input.int(5, "EMA状態 有効本数", minval = 1, group = grpEMAState)
+resetEMAStateAfterEntry = input.bool(true, "エントリー後EMA状態をリセット", group = grpEMAState)
+
+bool useEMAWZ = useEMAWinZone and useEMAModule
+
+// 1つのTFの EMA5本+ATR を取得し、反発(long/short)を返す。OFF の TF は security を呼ばない。
+f_emaTFEval(bool _tfOn, string _tf) =>
+    float _e1 = na
+    float _e2 = na
+    float _e3 = na
+    float _e4 = na
+    float _e5 = na
+    float _atr = na
+    if _tfOn
+        [_v1, _v2, _v3, _v4, _v5, _v6] = request.security(syminfo.tickerid, _tf, [ta.ema(emaSource, emaLen1), ta.ema(emaSource, emaLen2), ta.ema(emaSource, emaLen3), ta.ema(emaSource, emaLen4), ta.ema(emaSource, emaLen5), ta.atr(emaAtrLen)], lookahead = barmerge.lookahead_off)
+        _e1 := _v1
+        _e2 := _v2
+        _e3 := _v3
+        _e4 := _v4
+        _e5 := _v5
+        _atr := _v6
+    float _touch = emaTouchMode == "ATR" ? _atr * emaTouchATRMult : emaTouchDollar
+    // BUY反発: low が EMA に触れ close が EMA上 / SELL反発: high が EMA に触れ close が EMA下
+    bool _bl1 = _tfOn and useEMA1Zone and not na(_e1) and low <= _e1 + _touch and close > _e1 and close > open
+    bool _bl2 = _tfOn and useEMA2Zone and not na(_e2) and low <= _e2 + _touch and close > _e2 and close > open
+    bool _bl3 = _tfOn and useEMA3Zone and not na(_e3) and low <= _e3 + _touch and close > _e3 and close > open
+    bool _bl4 = _tfOn and useEMA4Zone and not na(_e4) and low <= _e4 + _touch and close > _e4 and close > open
+    bool _bl5 = _tfOn and useEMA5Zone and not na(_e5) and low <= _e5 + _touch and close > _e5 and close > open
+    bool _bs1 = _tfOn and useEMA1Zone and not na(_e1) and high >= _e1 - _touch and close < _e1 and close < open
+    bool _bs2 = _tfOn and useEMA2Zone and not na(_e2) and high >= _e2 - _touch and close < _e2 and close < open
+    bool _bs3 = _tfOn and useEMA3Zone and not na(_e3) and high >= _e3 - _touch and close < _e3 and close < open
+    bool _bs4 = _tfOn and useEMA4Zone and not na(_e4) and high >= _e4 - _touch and close < _e4 and close < open
+    bool _bs5 = _tfOn and useEMA5Zone and not na(_e5) and high >= _e5 - _touch and close < _e5 and close < open
+    bool _bLong  = _bl1 or _bl2 or _bl3 or _bl4 or _bl5
+    bool _bShort = _bs1 or _bs2 or _bs3 or _bs4 or _bs5
+    [_bLong, _bShort]
+
+// EMA WinZone 状態 (var: バー跨ぎ保持。エントリー後リセットは仮想ポジション側で実施)
+var bool emaLongState     = false
+var bool emaShortState    = false
+var int  emaLongStateBar  = na
+var int  emaShortStateBar = na
+
+bool emaLongEventOk  = false
+bool emaShortEventOk = false
+if useEMAWZ
+    [_bl1m,  _bs1m ] = f_emaTFEval(useEMA1M,  tfEMA1M)
+    [_bl5m,  _bs5m ] = f_emaTFEval(useEMA5M,  tfEMA5M)
+    [_bl15m, _bs15m] = f_emaTFEval(useEMA15M, tfEMA15M)
+    [_bl1h,  _bs1h ] = f_emaTFEval(useEMA1H,  tfEMA1H)
+    [_bl4h,  _bs4h ] = f_emaTFEval(useEMA4H,  tfEMA4H)
+    bool bounceLong  = _bl1m or _bl5m or _bl15m or _bl1h or _bl4h
+    bool bounceShort = _bs1m or _bs5m or _bs15m or _bs1h or _bs4h
+    emaLongEventOk  := useEMABounce and bounceLong
+    emaShortEventOk := useEMABounce and bounceShort
+    if useEMAStateWindow
+        if emaLongEventOk
+            emaLongState    := true
+            emaLongStateBar := bar_index
+        if emaShortEventOk
+            emaShortState    := true
+            emaShortStateBar := bar_index
+        if emaLongState and not na(emaLongStateBar) and bar_index - emaLongStateBar > emaStateMaxBars
+            emaLongState := false
+        if emaShortState and not na(emaShortStateBar) and bar_index - emaShortStateBar > emaStateMaxBars
+            emaShortState := false
+
+bool emaLongWinZone  = useEMAWZ ? (useEMAStateWindow ? emaLongState  : emaLongEventOk)  : false
+bool emaShortWinZone = useEMAWZ ? (useEMAStateWindow ? emaShortState : emaShortEventOk) : false
+
+// WinZone 場所条件 (EMA WinZone のみ。OFF時は passthrough で許可)
+bool longWinZoneOk  = not useEMAWinZone or emaLongWinZone
+bool shortWinZoneOk = not useEMAWinZone or emaShortWinZone
+
+// ============================================================
+//  7. MACD Momentum (勢い / タイミング確認)
+// ------------------------------------------------------------
+//  Cランク初期設定: D「Hist拡大」(2本連続) + Hist位置フィルター。
+//  シグナル後 macdStateMaxBars 本だけ Momentum OK を保持。
+// ============================================================
+grpMACD = "Momentum: MACD"
+useMACDModule            = input.bool(true, "MACDモジュールを使う", group = grpMACD)
+useMACDStateWindow       = input.bool(true, "MACD状態管理を使う",   group = grpMACD)
+macdStateMaxBars         = input.int(3, "MACD状態 有効本数", minval = 1, group = grpMACD)
+resetMACDStateAfterEntry = input.bool(true, "エントリー後MACD状態をリセット", group = grpMACD)
+useMACDHistExpansion            = input.bool(true, "D: Hist拡大を使う", group = grpMACD)
+macdHistExpansionBars           = input.int(2, "拡大 連続本数", minval = 1, group = grpMACD)
+useMACDHistExpansionConsecutive = input.bool(true, "連続拡大を要求", group = grpMACD)
+useMACDHistDirectionFilter      = input.bool(true, "Hist位置フィルター", group = grpMACD)
+macdFastLen   = input.int(8,  "Fast EMA",   minval = 1, group = grpMACD)
+macdSlowLen   = input.int(21, "Slow EMA",   minval = 1, group = grpMACD)
+macdSignalLen = input.int(5,  "Signal EMA", minval = 1, group = grpMACD)
+
+// MACD 状態 (var: バー跨ぎ保持)
+var bool longMACDStateOk   = false
+var bool shortMACDStateOk  = false
+var int  longMACDStateBar  = na
+var int  shortMACDStateBar = na
+
+bool macdMomentumLong  = false
+bool macdMomentumShort = false
+if useMACDModule
+    [macdLine, macdSignal, macdHist] = ta.macd(close, macdFastLen, macdSlowLen, macdSignalLen)
+    // Hist位置フィルター (BUY=hist>0 / SELL=hist<0)
+    bool histDirBuy  = not useMACDHistDirectionFilter or macdHist > 0
+    bool histDirSell = not useMACDHistDirectionFilter or macdHist < 0
+    // D: Hist拡大 (連続本数)
+    bool expBull = macdHist > 0 and macdHist > macdHist[1]
+    bool expBear = macdHist < 0 and macdHist < macdHist[1]
+    var int macdBullExpCount = 0
+    var int macdBearExpCount = 0
+    macdBullExpCount := expBull ? macdBullExpCount + 1 : 0
+    macdBearExpCount := expBear ? macdBearExpCount + 1 : 0
+    bool histBullOK = useMACDHistExpansionConsecutive ? macdBullExpCount >= macdHistExpansionBars : expBull
+    bool histBearOK = useMACDHistExpansionConsecutive ? macdBearExpCount >= macdHistExpansionBars : expBear
+    macdMomentumLong  := useMACDHistExpansion and histBullOK and histDirBuy
+    macdMomentumShort := useMACDHistExpansion and histBearOK and histDirSell
+    if useMACDStateWindow
+        if macdMomentumLong
+            longMACDStateOk  := true
+            longMACDStateBar := bar_index
+        if macdMomentumShort
+            shortMACDStateOk  := true
+            shortMACDStateBar := bar_index
+        if longMACDStateOk and not na(longMACDStateBar) and bar_index - longMACDStateBar > macdStateMaxBars
+            longMACDStateOk := false
+        if shortMACDStateOk and not na(shortMACDStateBar) and bar_index - shortMACDStateBar > macdStateMaxBars
+            shortMACDStateOk := false
+
+// Momentum 許可 (OFF=常に許可 / 状態管理ON=保持中フラグ / OFF=シグナル単バー)
+bool allowLongByMACD  = not useMACDModule ? true : useMACDStateWindow ? longMACDStateOk  : macdMomentumLong
+bool allowShortByMACD = not useMACDModule ? true : useMACDStateWindow ? shortMACDStateOk : macdMomentumShort
+
+// ============================================================
+//  8. BOS Trigger (直近高安更新・最後の引き金)
+// ------------------------------------------------------------
+//  BUY: close > 直近 bosLookback 本の高値 / SELL: close < 直近安値。
+// ============================================================
+grpTrig = "エントリートリガー (BOS)"
+useBOSTrigger = input.bool(true, "BOS / 直近高安更新", group = grpTrig)
+bosLookback   = input.int(5, "BOS Lookback", minval = 2, group = grpTrig)
+
+float bosHigh = na
+float bosLow  = na
+if useBOSTrigger
+    bosHigh := ta.highest(high, bosLookback)[1]
+    bosLow  := ta.lowest(low,  bosLookback)[1]
+bool allowLongByTrigger  = useBOSTrigger and not na(bosHigh) and close > bosHigh
+bool allowShortByTrigger = useBOSTrigger and not na(bosLow)  and close < bosLow
+
+// ============================================================
+//  9. ボラティリティフィルター (高速ボラ)
+// ------------------------------------------------------------
+//  Cランク初期設定: 固定値モード。
+//    固定値: 直近 fastAtrLen 本の値幅 >= fastFixedMin かつ 実体平均 >= bodyAvgMin
+// ============================================================
+grpVol = "高速ボラフィルタ"
+fastVolMode  = input.string("固定値", "高速ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = grpVol)
+fastAtrLen   = input.int(5,     "fastATR/値幅 参照本数", minval = 1, group = grpVol)
+fastAtrMin   = input.float(2.2, "fastATR最低($) ※ATR時", step = 0.1, group = grpVol)
+fastFixedMin = input.float(3.0, "直近値幅 最低($) ※固定値時", minval = 0.0, step = 0.1, group = grpVol)
+bodyAvgLen   = input.int(5,     "実体平均本数", minval = 1, group = grpVol)
+bodyAvgMin   = input.float(0.5, "実体平均最低($)", step = 0.1, group = grpVol)
+useRangeRatioFilter = input.bool(true, "fastATR ÷ RangeWidth を使う ※ATR時", group = grpVol)
+rangeLookback       = input.int(20,    "RangeWidth参照本数", minval = 2, group = grpVol)
+atrRangeRatioMin    = input.float(0.06, "fastATR ÷ RangeWidth 最低比", step = 0.01, group = grpVol)
+
+bool fastVolPass = true
+if fastVolMode == "ATR"
+    float fastAtr = ta.atr(fastAtrLen)
+    float bodyAvgFast = ta.sma(math.abs(close - open), bodyAvgLen)
+    float rangeWidthV = ta.highest(high, rangeLookback) - ta.lowest(low, rangeLookback)
+    float atrRangeRatio = rangeWidthV > 0 ? fastAtr / rangeWidthV : 0.0
+    fastVolPass := fastAtr >= fastAtrMin and bodyAvgFast >= bodyAvgMin and (not useRangeRatioFilter or atrRangeRatio >= atrRangeRatioMin)
+else if fastVolMode == "固定値"
+    float fastRange = ta.highest(high, fastAtrLen) - ta.lowest(low, fastAtrLen)
+    float bodyAvgFast = ta.sma(math.abs(close - open), bodyAvgLen)
+    fastVolPass := fastRange >= fastFixedMin and bodyAvgFast >= bodyAvgMin
+// fastVolMode == OFF のときは fastVolPass = true
+bool volOk = fastVolPass
+
+// ============================================================
+//  10. Cランク条件 (Size判定を除く基本条件を統合)
+// ------------------------------------------------------------
+//  設計順序: 環境認識 → WinZone(EMA) → Momentum(MACD) → Trigger(BOS) → 執行(時間帯/ボラ)
+//  Size / SLリスクの判定は 11 で追加する。
+// ============================================================
+// --- 時間帯フィルタ (東京時間 JST) ---
+int  jstHour   = hour(time, "Asia/Tokyo")
+bool inAsia    = jstHour >= 9  and jstHour < 16
+bool inEU      = jstHour >= 16 and jstHour < 21
+bool inNY      = jstHour >= 21 or  jstHour < 3
+bool sessionOk =
+     not useSessionFilter or
+     (useAsiaSession and inAsia) or
+     (useEUSession   and inEU) or
+     (useNYSession   and inNY)
+
+// Cランク基本条件 (方向別)
+bool cRankLongBase =
+     useLong and
+     sessionOk and
+     envLongOk and
+     longWinZoneOk and
+     allowLongByMACD and
+     allowLongByTrigger and
+     volOk
+
+bool cRankShortBase =
+     useShort and
+     sessionOk and
+     envShortOk and
+     shortWinZoneOk and
+     allowShortByMACD and
+     allowShortByTrigger and
+     volOk
+
+// ============================================================
+//  11. Size / SL / TP 計算
+// ------------------------------------------------------------
+//  SL方式/幅/RR/バッファは元ストラテジーと同一。
+//  Size = 計算用資金 × 損失率 ÷ (リスク幅 × pointvalue) を整数切り捨て。
+//  1未満はエントリー対象外 (仮/確定シグナル・仮想ポジションの元条件へ組込)。
+// ============================================================
+float patLow  = math.min(low,  low[1])
+float patHigh = math.max(high, high[1])
+float entryEst = close
+
+float longStop = slMode == "固定" ? entryEst - slFixed : patLow - slBuf
+float longRisk = entryEst - longStop
+float longTP   = entryEst + longRisk * rrRatio
+
+float shortStop = slMode == "固定" ? entryEst + slFixed : patHigh + slBuf
+float shortRisk = shortStop - entryEst
+float shortTP   = entryEst - shortRisk * rrRatio
+
+float riskCapital = calcCapital * riskPct / 100.0
+
+f_qty(float riskPerUnit) =>
+    float raw = riskPerUnit > 0 ? riskCapital / (riskPerUnit * syminfo.pointvalue) : 0.0
+    math.floor(raw)
+
+float longQty  = f_qty(longRisk)
+float shortQty = f_qty(shortRisk)
+
+// Cランク最終条件 (SLリスク>0 と Size>=1 を組込)
+bool cRankLongFinal  = cRankLongBase  and longRisk  > 0 and longQty  >= 1
+bool cRankShortFinal = cRankShortBase and shortRisk > 0 and shortQty >= 1
+
+// ============================================================
+//  14a. 仮想ポジション: 建玉中の決済処理 (エントリー判定より前に評価)
+// ------------------------------------------------------------
+//  状態: 0=ノーポジ / 1=ロング保有 / -1=ショート保有。
+//  SL/TP は高値・安値の到達で判定。同足でSL/TP両到達はSL優先。
+//  Q3=① : 決済した足では新規を許可しない (次足以降のみ)。
+//  Q4=① : 過去足から通しで管理 (履歴から現在まで状態を引き継ぐ)。
+// ============================================================
+var int   posState = 0
+var float vEntry   = na
+var float vSL      = na
+var float vTP      = na
+
+bool exitedThisBar = false
+if is5m and posState != 0
+    if posState == 1
+        // ロング保有: 安値がSL以下 → SL決済 / 高値がTP以上 → TP決済 (SL優先)
+        if low <= vSL
+            posState := 0
+            exitedThisBar := true
+        else if high >= vTP
+            posState := 0
+            exitedThisBar := true
+    else if posState == -1
+        // ショート保有: 高値がSL以上 → SL決済 / 安値がTP以下 → TP決済 (SL優先)
+        if high >= vSL
+            posState := 0
+            exitedThisBar := true
+        else if low <= vTP
+            posState := 0
+            exitedThisBar := true
+
+// 新規許可 = 5分足 かつ ノーポジ かつ 当該足で決済していない
+bool entryAllowed = is5m and posState == 0 and not exitedThisBar
+
+// ============================================================
+//  12. 仮シグナル管理 (リアルタイム・未確定通知)
+// ------------------------------------------------------------
+//  足確定前に「足確定以外の全条件」が初成立した瞬間、1回だけ alert()。
+//  通知済み状態はロジック(C)・方向(Long/Short)ごとに分離。
+//  一度通知したら、その方向の確定シグナルが出るまで再通知しない(足跨ぎ維持)。
+//  ラベルは出さない。仮想ポジション保有中は出さない。
+// ============================================================
+// 仮通知済み状態 (将来のA/Bランク・逆方向に影響しないよう完全分離)
+var bool pendingLongC  = false   // Cランク・ロング仮通知済み
+var bool pendingShortC = false   // Cランク・ショート仮通知済み
+// 仮シグナルの固定価格 (初成立時の現在価格でエントリー/SL/TPを固定)
+var float pendEntryL = na
+var float pendSLL    = na
+var float pendTPL    = na
+var float pendEntryS = na
+var float pendSLS    = na
+var float pendTPS    = na
+
+bool tentativeLong  = entryAllowed and useLong  and cRankLongFinal  and barstate.isrealtime and not barstate.isconfirmed and not pendingLongC
+bool tentativeShort = entryAllowed and useShort and cRankShortFinal and barstate.isrealtime and not barstate.isconfirmed and not pendingShortC
+
+if tentativeLong
+    pendingLongC := true
+    pendEntryL := close
+    pendSLL    := longStop
+    pendTPL    := longTP
+if tentativeShort
+    pendingShortC := true
+    pendEntryS := close
+    pendSLS    := shortStop
+    pendTPS    := shortTP
+
+// ============================================================
+//  13. 確定シグナル判定
+// ------------------------------------------------------------
+//  足確定(barstate.isconfirmed)時に全条件成立で1回だけ。
+//  仮シグナルが先に出ていることは不要 (取りこぼし防止)。
+//  ロング/ショートは同一足で同時成立しない (BOS上抜け/下抜け排他・
+//  MACD Hist陽/陰排他)。よって優先順位ロジックは設けない。
+// ============================================================
+bool confirmLong  = entryAllowed and useLong  and cRankLongFinal  and barstate.isconfirmed
+bool confirmShort = entryAllowed and useShort and cRankShortFinal and barstate.isconfirmed
+
+// ============================================================
+//  14b. 仮想ポジション: 確定で建玉開始 + 状態リセット
+// ------------------------------------------------------------
+//  確定シグナルで建玉。仮シグナルだけでは建玉しない。
+//  建玉と同時に、その方向の仮通知済み状態・MACD/EMA状態をリセット
+//  (元ストラテジーの resetMACD/EMA StateAfterEntry を再現)。
+// ============================================================
+if confirmLong
+    posState := 1
+    vEntry   := close
+    vSL      := longStop
+    vTP      := longTP
+    pendingLongC := false
+    if resetMACDStateAfterEntry
+        longMACDStateOk := false
+    if useEMAWZ and resetEMAStateAfterEntry
+        emaLongState    := false
+        emaLongStateBar := na
+if confirmShort
+    posState := -1
+    vEntry   := close
+    vSL      := shortStop
+    vTP      := shortTP
+    pendingShortC := false
+    if resetMACDStateAfterEntry
+        shortMACDStateOk := false
+    if useEMAWZ and resetEMAStateAfterEntry
+        emaShortState    := false
+        emaShortStateBar := na
+
+// ============================================================
+//  15. alert() (仮 = freq_once_per_bar / 確定 = freq_once_per_bar_close)
+// ------------------------------------------------------------
+//  alertcondition は使わず alert() のみ。
+//  frequency と 方向別状態変数の両方で重複を防止。
+//  すべて 5分足のみ。
+// ============================================================
+string _tfName = "5分"
+
+// 仮シグナル alert
+if is5m and tentativeLong
+    alert("【仮シグナル】\n方向：LONG\nエントリー：" + str.tostring(pendEntryL, format.mintick) + "\nSL：" + str.tostring(pendSLL, format.mintick) + "\nTP：" + str.tostring(pendTPL, format.mintick) + "\nランク：C\nロジック：EMA＋MACD\n時間足：" + _tfName, alert.freq_once_per_bar)
+if is5m and tentativeShort
+    alert("【仮シグナル】\n方向：SHORT\nエントリー：" + str.tostring(pendEntryS, format.mintick) + "\nSL：" + str.tostring(pendSLS, format.mintick) + "\nTP：" + str.tostring(pendTPS, format.mintick) + "\nランク：C\nロジック：EMA＋MACD\n時間足：" + _tfName, alert.freq_once_per_bar)
+
+// 確定シグナル alert
+if is5m and confirmLong
+    alert("【確定シグナル】\n方向：LONG\nエントリー：" + str.tostring(close, format.mintick) + "\nSL：" + str.tostring(longStop, format.mintick) + "\nTP：" + str.tostring(longTP, format.mintick) + "\nランク：C\nロジック：EMA＋MACD\n時間足：" + _tfName + "\nSize：" + str.tostring(int(longQty)), alert.freq_once_per_bar_close)
+if is5m and confirmShort
+    alert("【確定シグナル】\n方向：SHORT\nエントリー：" + str.tostring(close, format.mintick) + "\nSL：" + str.tostring(shortStop, format.mintick) + "\nTP：" + str.tostring(shortTP, format.mintick) + "\nランク：C\nロジック：EMA＋MACD\n時間足：" + _tfName + "\nSize：" + str.tostring(int(shortQty)), alert.freq_once_per_bar_close)
+
+// ============================================================
+//  16. 確定ラベル (確定シグナルのみ・確定足で1回)
+// ------------------------------------------------------------
+//  ロングはローソク下側、ショートは上側に表示。
+// ============================================================
+if is5m and confirmLong
+    label.new(bar_index, low, "LONG\nEntry：" + str.tostring(close, format.mintick) + "\nSL：" + str.tostring(longStop, format.mintick) + "\nTP：" + str.tostring(longTP, format.mintick) + "\nRank：C\nEMA＋MACD\nSize：" + str.tostring(int(longQty)), style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.normal)
+if is5m and confirmShort
+    label.new(bar_index, high, "SHORT\nEntry：" + str.tostring(close, format.mintick) + "\nSL：" + str.tostring(shortStop, format.mintick) + "\nTP：" + str.tostring(shortTP, format.mintick) + "\nRank：C\nEMA＋MACD\nSize：" + str.tostring(int(shortQty)), style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.normal)
+
+// 5分足以外での警告表示 (1つだけ)
+var table warnTbl = table.new(position.middle_center, 1, 1, border_width = 1)
+if barstate.islast and not is5m
+    table.cell(warnTbl, 0, 0, "このインジケーターは5分足チャート専用です", text_color = color.white, bgcolor = color.new(color.red, 0))
+
+// ============================================================
+//  17. 将来のランク追加位置
+// ------------------------------------------------------------
+//  現在は Cランクのみ。A/Bランクを追加する場合は、それぞれ独立した
+//  条件・仮通知済み状態(pending***A / pending***B)・確定判定を作り、
+//  Cランクの状態変数に影響させないこと。
+// ============================================================
+// TODO: Aランクロジックを将来追加
+// TODO: Bランクロジックを将来追加
