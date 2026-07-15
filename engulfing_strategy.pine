@@ -697,6 +697,15 @@ lineFlipConfirmBars  = input.int(2,  "転換 確定本数", minval = 0, group = 
 useLineBreakBodyFilter = input.bool(true, "ブレイク 実体フィルター", group = grpLineParam)
 lineBreakBodyRatio     = input.float(0.5, "ブレイク 実体率最小", minval = 0.0, maxval = 1.0, step = 0.05, group = grpLineParam)
 lineSweepToleranceATR  = input.float(0.2, "スイープ 最小貫通 ATR倍率", minval = 0.0, step = 0.05, group = grpLineParam)
+// --- ブレイク改善: 最小バッファ ---
+lineBreakBufferMode   = input.string("ATR", "ブレイク 最小バッファ方式", options = ["Dollar", "ATR", "None"], group = grpLineParam)
+lineBreakBufferDollar = input.float(0.5,  "ブレイク バッファ(ドル/価格)", minval = 0.0, step = 0.1,  group = grpLineParam)
+lineBreakBufferATR    = input.float(0.10, "ブレイク バッファ ATR倍率",   minval = 0.0, step = 0.05, group = grpLineParam)
+// --- ブレイク改善: 確定方式 ---
+lineBreakConfirmMode  = input.string("CloseOnly", "ブレイク 確定方式", options = ["CloseOnly", "NextBar", "Consecutive"], group = grpLineParam)
+lineBreakConfirmBars  = input.int(2, "ブレイク 連続確定本数(Consecutive)", minval = 1, maxval = 10, group = grpLineParam)
+// --- ブレイク改善: セッション水平線 有効日数 ---
+lineSessionMaxDays    = input.int(2, "セッション水平線 有効日数(当日含む)", minval = 1, maxval = 10, group = grpLineParam)
 
 grpLineFilt = "水平線: 共通フィルター"
 useLineDirCandleFilter = input.bool(false,  "方向ローソク", group = grpLineFilt)
@@ -731,6 +740,8 @@ resetLineStateAfterEntry = input.bool(true, "エントリー後水平線状態�
 grpLineDisp = "水平線: 表示"
 showLineZones  = input.bool(true, "水平線/ゾーンを表示", group = grpLineDisp)
 showLineLabels = input.bool(true, "シグナルラベルを表示", group = grpLineDisp)
+showBrokenLineStyle   = input.bool(false, "ブレイク済み水平線を別スタイル表示", group = grpLineDisp)
+showPendingBreakDebug = input.bool(false, "ブレイク確定待ちデバッグ表示", group = grpLineDisp)
 
 // ============================================================
 //  5. 包み足判定
@@ -1565,6 +1576,8 @@ var array<bool>  zPivot   = array.new_bool()
 var array<bool>  zPrev    = array.new_bool()
 var array<bool>  zSess    = array.new_bool()
 var array<int>   zTF      = array.new_int()   // どの時間足由来か (1/5/15/60/240、0=前日/セッション)
+var array<bool>  zBreakUsed  = array.new_bool()  // ブレイク改善: この水平線が既にブレイク確定済みか (方向共通1回)
+var array<int>   zSessionDay = array.new_int()   // ブレイク改善: 生成日 (セッション水平線の有効日数判定用の連番)
 
 // 共通フィルター (ローソク品質)。呼ばれない時は実行されない。
 f_lineCommonOK(bool isBuy, float _atr) =>
@@ -1585,7 +1598,7 @@ f_lineCommonOK(bool isBuy, float _atr) =>
     _ok
 
 // ゾーンへ追加/統合 (srcPivot/srcPrev/srcSess のいずれか1つを true で渡す。_tfCode=由来TF)
-f_lineAddZone(float p, bool srcPivot, bool srcPrev, bool srcSess, int _tfCode, float _mergeTol) =>
+f_lineAddZone(float p, bool srcPivot, bool srcPrev, bool srcSess, int _tfCode, float _mergeTol, int _sessDay) =>
     bool _found = false
     if array.size(zPrice) > 0
         for i = 0 to array.size(zPrice) - 1
@@ -1599,6 +1612,8 @@ f_lineAddZone(float p, bool srcPivot, bool srcPrev, bool srcSess, int _tfCode, f
                 array.set(zPrev,  i, array.get(zPrev,  i) or srcPrev)
                 array.set(zSess,  i, array.get(zSess,  i) or srcSess)
                 array.set(zTF,    i, math.max(array.get(zTF, i), _tfCode))   // 統合時は上位TFを採用
+                // 統合時: 生成日は再タッチで更新 (セッション水平線を延命)。ブレイク済みフラグは維持。
+                array.set(zSessionDay, i, math.max(array.get(zSessionDay, i), _sessDay))
                 _found := true
     if not _found
         array.push(zPrice, p)
@@ -1609,6 +1624,8 @@ f_lineAddZone(float p, bool srcPivot, bool srcPrev, bool srcSess, int _tfCode, f
         array.push(zPrev,  srcPrev)
         array.push(zSess,  srcSess)
         array.push(zTF,    _tfCode)
+        array.push(zBreakUsed,  false)
+        array.push(zSessionDay, _sessDay)
         if array.size(zPrice) > lineMaxZones
             array.shift(zPrice)
             array.shift(zTouch)
@@ -1618,15 +1635,35 @@ f_lineAddZone(float p, bool srcPivot, bool srcPrev, bool srcSess, int _tfCode, f
             array.shift(zPrev)
             array.shift(zSess)
             array.shift(zTF)
+            array.shift(zBreakUsed)
+            array.shift(zSessionDay)
 
 // MTF Pivot 取得 → ゾーン追加 (ONのTFだけ request.security を呼ぶ)
-f_lineAddTFPivots(bool _tfOn, string _tf, int _tfCode, float _mergeTol) =>
+f_lineAddTFPivots(bool _tfOn, string _tf, int _tfCode, float _mergeTol, int _sessDay) =>
     if _tfOn
         [_ph, _pl] = request.security(syminfo.tickerid, _tf, [ta.pivothigh(linePivotLen, linePivotLen), ta.pivotlow(linePivotLen, linePivotLen)], lookahead = barmerge.lookahead_off)
         if not na(_ph) and (na(_ph[1]) or _ph != _ph[1])
-            f_lineAddZone(_ph, true, false, false, _tfCode, _mergeTol)
+            f_lineAddZone(_ph, true, false, false, _tfCode, _mergeTol, _sessDay)
         if not na(_pl) and (na(_pl[1]) or _pl != _pl[1])
-            f_lineAddZone(_pl, true, false, false, _tfCode, _mergeTol)
+            f_lineAddZone(_pl, true, false, false, _tfCode, _mergeTol, _sessDay)
+
+// ブレイク改善: ゾーンのソースがONか (ブレイク候補判定用)
+f_lineSourceOn(bool _ip, bool _ipr, bool _iss) =>
+    (_ip and (usePivotLine or useReactionLine)) or (_ipr and usePreviousDayHL) or (_iss and useSessionHL)
+
+// ブレイク改善: 上ブレイク確定時、pendUpLevel 以下で現在ブレイク状態の未使用ゾーンを全てブレイク済みに
+f_lineMarkBrokenUp(float _lvl, float _zw, float _buf) =>
+    if array.size(zBreakUsed) > 0
+        for i = 0 to array.size(zBreakUsed) - 1
+            if not array.get(zBreakUsed, i) and array.get(zPrice, i) <= _lvl and close > array.get(zPrice, i) + _zw + _buf
+                array.set(zBreakUsed, i, true)
+
+// ブレイク改善: 下ブレイク確定時、pendDnLevel 以上で現在ブレイク状態の未使用ゾーンを全てブレイク済みに
+f_lineMarkBrokenDn(float _lvl, float _zw, float _buf) =>
+    if array.size(zBreakUsed) > 0
+        for i = 0 to array.size(zBreakUsed) - 1
+            if not array.get(zBreakUsed, i) and array.get(zPrice, i) >= _lvl and close < array.get(zPrice, i) - _zw - _buf
+                array.set(zBreakUsed, i, true)
 
 // strength: 1=Pivotのみ / 2=複数反応 / 3=前日 / 4=セッション / 5=複数ソース重合
 f_lineZoneStrength(bool isPivot, bool isPrev, bool isSess, int touches) =>
@@ -1682,6 +1719,14 @@ var float flipResLevel = na
 var int   flipResBar   = na
 var float flipSupLevel = na
 var int   flipSupBar   = na
+// ブレイク改善: セッション水平線 有効日数用の連番 / ブレイク確定待ち状態
+var int   sessDayCounter = 0
+var bool  pendUpActive = false
+var int   pendUpCount  = 0
+var float pendUpLevel  = na
+var bool  pendDnActive = false
+var int   pendDnCount  = 0
+var float pendDnLevel  = na
 // 表示オブジェクト
 var line supLine = na
 var line resLine = na
@@ -1692,13 +1737,17 @@ if useLineWZ
     float lineAtr = ta.atr(lineAtrLen)
     float lineZoneW = useLineATRZone ? lineAtr * lineZoneATRMult : lineZoneFixedWidth
     float _mergeTol = useLineMergeZone ? lineAtr * lineMergeToleranceATR : lineAtr * reactionToleranceATR
+    // ブレイク改善: セッションTZ基準の暦日変化で連番を増やす (セッション水平線の有効日数判定用)
+    int _dayId = year(time, lineSessTZ) * 10000 + month(time, lineSessTZ) * 100 + dayofmonth(time, lineSessTZ)
+    if not na(_dayId[1]) and _dayId != _dayId[1]
+        sessDayCounter := sessDayCounter + 1
     // ① MTF Pivot High/Low → ゾーン (ONのTFだけ request.security)
     if usePivotLine or useReactionLine
-        f_lineAddTFPivots(useLine1M,  tfLine1M,  1,   _mergeTol)
-        f_lineAddTFPivots(useLine5M,  tfLine5M,  5,   _mergeTol)
-        f_lineAddTFPivots(useLine15M, tfLine15M, 15,  _mergeTol)
-        f_lineAddTFPivots(useLine1H,  tfLine1H,  60,  _mergeTol)
-        f_lineAddTFPivots(useLine4H,  tfLine4H,  240, _mergeTol)
+        f_lineAddTFPivots(useLine1M,  tfLine1M,  1,   _mergeTol, sessDayCounter)
+        f_lineAddTFPivots(useLine5M,  tfLine5M,  5,   _mergeTol, sessDayCounter)
+        f_lineAddTFPivots(useLine15M, tfLine15M, 15,  _mergeTol, sessDayCounter)
+        f_lineAddTFPivots(useLine1H,  tfLine1H,  60,  _mergeTol, sessDayCounter)
+        f_lineAddTFPivots(useLine4H,  tfLine4H,  240, _mergeTol, sessDayCounter)
     // ③ 前日 高値/安値 (チャート基準。TFコード0)
     bool _newDay = ta.change(time("D")) != 0
     if _newDay
@@ -1707,9 +1756,9 @@ if useLineWZ
         curDayHigh := high
         curDayLow  := low
         if usePreviousDayHL and not na(prevHigh)
-            f_lineAddZone(prevHigh, false, true, false, 0, _mergeTol)
+            f_lineAddZone(prevHigh, false, true, false, 0, _mergeTol, sessDayCounter)
         if usePreviousDayHL and not na(prevLow)
-            f_lineAddZone(prevLow, false, true, false, 0, _mergeTol)
+            f_lineAddZone(prevLow, false, true, false, 0, _mergeTol, sessDayCounter)
     else
         curDayHigh := na(curDayHigh) ? high : math.max(curDayHigh, high)
         curDayLow  := na(curDayLow)  ? low  : math.min(curDayLow, low)
@@ -1725,17 +1774,33 @@ if useLineWZ
     nyLow  := _nL
     if useSessionHL
         if _aEnd and not na(asiaHigh)
-            f_lineAddZone(asiaHigh, false, false, true, 0, _mergeTol)
+            f_lineAddZone(asiaHigh, false, false, true, 0, _mergeTol, sessDayCounter)
         if _aEnd and not na(asiaLow)
-            f_lineAddZone(asiaLow, false, false, true, 0, _mergeTol)
+            f_lineAddZone(asiaLow, false, false, true, 0, _mergeTol, sessDayCounter)
         if _lEnd and not na(londonHigh)
-            f_lineAddZone(londonHigh, false, false, true, 0, _mergeTol)
+            f_lineAddZone(londonHigh, false, false, true, 0, _mergeTol, sessDayCounter)
         if _lEnd and not na(londonLow)
-            f_lineAddZone(londonLow, false, false, true, 0, _mergeTol)
+            f_lineAddZone(londonLow, false, false, true, 0, _mergeTol, sessDayCounter)
         if _nEnd and not na(nyHigh)
-            f_lineAddZone(nyHigh, false, false, true, 0, _mergeTol)
+            f_lineAddZone(nyHigh, false, false, true, 0, _mergeTol, sessDayCounter)
         if _nEnd and not na(nyLow)
-            f_lineAddZone(nyLow, false, false, true, 0, _mergeTol)
+            f_lineAddZone(nyLow, false, false, true, 0, _mergeTol, sessDayCounter)
+    // ⑤ ブレイク改善: 純セッション水平線 (Pivot/PrevDay を持たない) は有効日数を超えたら削除
+    //    (Pivot/Reaction/PrevDay ソースには適用しない。全メタ配列を同一indexで remove)
+    if array.size(zPrice) > 0
+        for i = array.size(zPrice) - 1 to 0
+            bool _pureSess = array.get(zSess, i) and not array.get(zPivot, i) and not array.get(zPrev, i)
+            if _pureSess and array.get(zSessionDay, i) < sessDayCounter - (lineSessionMaxDays - 1)
+                array.remove(zPrice, i)
+                array.remove(zTouch, i)
+                array.remove(zCreated, i)
+                array.remove(zLast, i)
+                array.remove(zPivot, i)
+                array.remove(zPrev, i)
+                array.remove(zSess, i)
+                array.remove(zTF, i)
+                array.remove(zBreakUsed, i)
+                array.remove(zSessionDay, i)
     // 最近接 Support(<=close) / Resistance(>=close)
     int  _nsStrength = 0
     int  _nrStrength = 0
@@ -1791,10 +1856,80 @@ if useLineWZ
         flipResLevel := na
     if _sellFlip
         flipSupLevel := na
-    // C: ブレイク
+    // C: ブレイク (改善版)
+    //  ・水平線ごとに zBreakUsed で1回限り (方向共通)。確定時のみ true にする。
+    //  ・ゾーン外側エッジ + バッファ を終値が超えることを要求。
+    //  ・確定方式: CloseOnly(即時) / NextBar(翌足も外側) / Consecutive(N本連続外側)。
+    //  ・確定待ち中は基準レベルを固定 (途中でターゲットを切り替えない)。
+    //  ・1本で複数線を抜けたら全て zBreakUsed、シグナルは方向ごと1回だけ。
     bool _breakBodyOK = not useLineBreakBodyFilter or (high - low > 0 and math.abs(close - open) / (high - low) >= lineBreakBodyRatio)
-    bool _buyBreak  = useLineBreak and _resUsable and not na(nearestResistance[1]) and close > nearestResistance[1] and close[1] <= nearestResistance[1] and _breakBodyOK
-    bool _sellBreak = useLineBreak and _supUsable and not na(nearestSupport[1])    and close < nearestSupport[1]    and close[1] >= nearestSupport[1]    and _breakBodyOK
+    float _brkBuf = lineBreakBufferMode == "Dollar" ? lineBreakBufferDollar : lineBreakBufferMode == "ATR" ? lineAtr * lineBreakBufferATR : 0.0
+    int _confN = lineBreakConfirmMode == "CloseOnly" ? 1 : lineBreakConfirmMode == "NextBar" ? 2 : lineBreakConfirmBars
+    // 今バーで新規に上/下ブレイクした候補ゾーンの基準レベル (上=最上位 / 下=最下位)
+    float _upFreshLevel = na
+    float _dnFreshLevel = na
+    if useLineBreak and array.size(zPrice) > 0
+        for i = 0 to array.size(zPrice) - 1
+            if not array.get(zBreakUsed, i) and bar_index >= array.get(zCreated, i) and f_lineSourceOn(array.get(zPivot, i), array.get(zPrev, i), array.get(zSess, i))
+                float _zp  = array.get(zPrice, i)
+                float _zTp = _zp + lineZoneW
+                float _zBt = _zp - lineZoneW
+                if close > _zTp + _brkBuf and close[1] <= _zTp + _brkBuf
+                    _upFreshLevel := na(_upFreshLevel) ? _zp : math.max(_upFreshLevel, _zp)
+                if close < _zBt - _brkBuf and close[1] >= _zBt - _brkBuf
+                    _dnFreshLevel := na(_dnFreshLevel) ? _zp : math.min(_dnFreshLevel, _zp)
+    bool _buyBreak  = false
+    bool _sellBreak = false
+    // --- 上ブレイク 状態機械 ---
+    bool _upHandled = false
+    if useLineBreak and pendUpActive
+        _upHandled := true
+        if close > pendUpLevel + lineZoneW + _brkBuf
+            pendUpCount := pendUpCount + 1
+            if pendUpCount >= _confN
+                f_lineMarkBrokenUp(pendUpLevel, lineZoneW, _brkBuf)
+                _buyBreak := true
+                pendUpActive := false
+                pendUpCount  := 0
+                pendUpLevel  := na
+        else
+            pendUpActive := false
+            pendUpCount  := 0
+            pendUpLevel  := na
+    if useLineBreak and not pendUpActive and not _upHandled and not na(_upFreshLevel) and _breakBodyOK
+        pendUpLevel := _upFreshLevel
+        pendUpCount := 1
+        if _confN <= 1
+            f_lineMarkBrokenUp(pendUpLevel, lineZoneW, _brkBuf)
+            _buyBreak := true
+            pendUpLevel := na
+        else
+            pendUpActive := true
+    // --- 下ブレイク 状態機械 ---
+    bool _dnHandled = false
+    if useLineBreak and pendDnActive
+        _dnHandled := true
+        if close < pendDnLevel - lineZoneW - _brkBuf
+            pendDnCount := pendDnCount + 1
+            if pendDnCount >= _confN
+                f_lineMarkBrokenDn(pendDnLevel, lineZoneW, _brkBuf)
+                _sellBreak := true
+                pendDnActive := false
+                pendDnCount  := 0
+                pendDnLevel  := na
+        else
+            pendDnActive := false
+            pendDnCount  := 0
+            pendDnLevel  := na
+    if useLineBreak and not pendDnActive and not _dnHandled and not na(_dnFreshLevel) and _breakBodyOK
+        pendDnLevel := _dnFreshLevel
+        pendDnCount := 1
+        if _confN <= 1
+            f_lineMarkBrokenDn(pendDnLevel, lineZoneW, _brkBuf)
+            _sellBreak := true
+            pendDnLevel := na
+        else
+            pendDnActive := true
     // D: スイープ反転
     float _sweepTol = lineAtr * lineSweepToleranceATR
     bool _buySweep  = useLineSweep and _supUsable and (nearestSupport - low)     >= _sweepTol and close > nearestSupport    and f_lineCommonOK(true, lineAtr)
@@ -1852,6 +1987,22 @@ if useLineWZ
             label.new(bar_index, low, "Sweep↑", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.aqua, 0), textcolor = color.white, size = size.tiny)
         if _sellSweep
             label.new(bar_index, high, "Sweep↓", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.orange, 0), textcolor = color.white, size = size.tiny)
+    // ブレイク改善: ブレイク済み水平線を別スタイル表示 (Flip用に配列には残す)。確定バーに点線を描画。
+    if showBrokenLineStyle
+        if _buyBreak and not na(pendUpLevel[1])
+            line.new(bar_index - 1, pendUpLevel[1], bar_index, pendUpLevel[1], color = color.new(color.gray, 40), width = 1, style = line.style_dotted)
+        if _buyBreak and na(pendUpLevel[1]) and not na(_upFreshLevel)
+            line.new(bar_index - 1, _upFreshLevel, bar_index, _upFreshLevel, color = color.new(color.gray, 40), width = 1, style = line.style_dotted)
+        if _sellBreak and not na(pendDnLevel[1])
+            line.new(bar_index - 1, pendDnLevel[1], bar_index, pendDnLevel[1], color = color.new(color.gray, 40), width = 1, style = line.style_dotted)
+        if _sellBreak and na(pendDnLevel[1]) and not na(_dnFreshLevel)
+            line.new(bar_index - 1, _dnFreshLevel, bar_index, _dnFreshLevel, color = color.new(color.gray, 40), width = 1, style = line.style_dotted)
+    // ブレイク改善: 確定待ちデバッグ表示
+    if showPendingBreakDebug
+        if pendUpActive
+            label.new(bar_index, high, "Pend↑" + str.tostring(pendUpCount), style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.blue, 50), textcolor = color.white, size = size.tiny)
+        if pendDnActive
+            label.new(bar_index, low, "Pend↓" + str.tostring(pendDnCount), style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.blue, 50), textcolor = color.white, size = size.tiny)
 
 // --- 水平線 状態管理 (シグナル後 lineStateMaxBars 本だけ WinZone 維持) ---
 var int lineLongStateBar  = na
