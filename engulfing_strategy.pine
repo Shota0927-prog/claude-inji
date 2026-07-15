@@ -2798,9 +2798,243 @@ float longQty  = f_qty(longRisk)
 float shortQty = f_qty(shortRisk)
 
 // ============================================================
+//  9b. 日足レジームフィルター (Daily Regime Filter)
+// ------------------------------------------------------------
+//  日足レベルの相場を「方向(上昇/レンジ/下降) × ボラ(高/中/低)」の
+//  9パターンに分類し、選択した日足環境の日だけ既存ストラテジーを
+//  バックテストできるようにする独立モジュール。
+//    設計順序 : 日足レジーム → 既存の4H/1H/15M環境認識 → WinZone → Momentum → Trigger → Entry
+//  ・既存の 環境フィルタ(allowByEnv / envLongOk / envShortOk) には一切混ぜない。
+//    最終エントリー条件で dailyRegimeLongOk / dailyRegimeShortOk を独立 AND する。
+//  ・日足レジームには方向別の許可差を設けない (両出力とも同値)。
+//  ・未来参照防止 :
+//     「前日確定ベース」= 確定済み前日日足のみ参照 (正式バックテスト用)。
+//     「当日確定後分析」= 完成日足を表示・分析するだけで売買条件には接続しない。
+//                        (未来参照を避けるためエントリー制限には使用しない)
+//  ・useDailyRegimeFilter=false かつ 表示OFF のときは日足 request.security を
+//    呼ばず、重いパーセンタイル等も計算しない (軽量)。
+//  ・変数/関数は dailyRegime / dailyReg / dr プレフィックスで既存と衝突回避。
+// ============================================================
+grpDailyRegime = "日足レジーム"
+useDailyRegimeFilter = input.bool(false, "日足レジームフィルターを使う", group = grpDailyRegime)
+dailyRegimeMode = input.string("前日確定ベース", "日足レジーム判定モード", options = ["前日確定ベース", "当日確定後分析"], group = grpDailyRegime, tooltip = "前日確定ベース=正式バックテスト/実運用 (確定済み前日日足のみ参照・非リペイント)。当日確定後分析=未来参照を避けるためエントリー制限には使用しない (分類の表示・背景・集計専用)。")
+
+// 日足方向 / 日足ボラ の要求 (OFF=その軸は制限しない)
+reqDailyDirection  = input.string("OFF", "日足方向", options = ["OFF", "上昇", "レンジ", "下降"], group = grpDailyRegime)
+reqDailyVolatility = input.string("OFF", "日足ボラ", options = ["OFF", "高ボラ", "中ボラ", "低ボラ"], group = grpDailyRegime)
+
+// --- 日足ボラ分類方法 ---
+dailyVolatilityMethod = input.string("パーセンタイル", "日足ボラ分類方法", options = ["パーセンタイル", "ATR比率", "固定値"], group = grpDailyRegime)
+// A. パーセンタイル方式 (相対分布。判定対象日自身は分布に含めない)
+dailyVolLookback    = input.int(252, "日足ボラ分布 参照日数", minval = 30, group = grpDailyRegime)
+dailyLowPercentile  = input.float(33.0, "低ボラ上限パーセンタイル", minval = 1, maxval = 49, step = 1, group = grpDailyRegime)
+dailyHighPercentile = input.float(67.0, "高ボラ下限パーセンタイル", minval = 51, maxval = 99, step = 1, group = grpDailyRegime)
+// B. ATR比率方式 (日足値幅 ÷ 日足ATR)
+dailyAtrLen       = input.int(14, "日足ATR期間", minval = 1, group = grpDailyRegime)
+dailyLowAtrRatio  = input.float(0.80, "低ボラ上限 日足値幅÷ATR", minval = 0.1, step = 0.05, group = grpDailyRegime)
+dailyHighAtrRatio = input.float(1.20, "高ボラ下限 日足値幅÷ATR", minval = 0.1, step = 0.05, group = grpDailyRegime)
+// C. 固定値方式 (日足値幅 $ しきい値)
+dailyLowRangeMax  = input.float(8.5,  "低ボラ上限値幅($)", minval = 0, step = 0.1, group = grpDailyRegime)
+dailyHighRangeMin = input.float(16.5, "高ボラ下限値幅($)", minval = 0, step = 0.1, group = grpDailyRegime)
+
+// --- 日足方向分類 (陽陰だけでなく実体率・終値位置で判定) ---
+dailyDirectionBodyRatio = input.float(0.40, "日足方向 最低実体率", minval = 0, maxval = 1, step = 0.05, group = grpDailyRegime)
+dailyBullCloseLocation  = input.float(0.65, "日足上昇 終値位置下限", minval = 0, maxval = 1, step = 0.05, group = grpDailyRegime)
+dailyBearCloseLocation  = input.float(0.35, "日足下降 終値位置上限", minval = 0, maxval = 1, step = 0.05, group = grpDailyRegime)
+dailyInsufficientAsRange = input.bool(true, "日足データ不足時はレンジ扱い (false=データが揃うまで不一致)", group = grpDailyRegime)
+
+// --- 表示 ---
+showDailyRegimeTable      = input.bool(true,  "日足レジームテーブルを表示", group = grpDailyRegime)
+showDailyRegimeBackground = input.bool(false, "日足レジーム背景色を表示 (表示のみ・売買に影響しない)", group = grpDailyRegime)
+
+// --- 分類コード → 文字列 (1=上昇/高ボラ, 0=レンジ/中ボラ, -1=下降/低ボラ, na=判定不能) ---
+f_dailyDirectionText(int code) =>
+    code == 1 ? "上昇" : code == -1 ? "下降" : code == 0 ? "レンジ" : "-"
+f_dailyVolatilityText(int code) =>
+    code == 1 ? "高ボラ" : code == -1 ? "低ボラ" : code == 0 ? "中ボラ" : "-"
+
+// --- 日足方向コード (実体率 + 終値位置)。値幅0/na はデータ不足 → na ---
+f_drDirCode(float o, float h, float l, float c) =>
+    float _rng = h - l
+    int _code = na
+    if not na(o) and not na(h) and not na(l) and not na(c) and _rng > 0
+        float _body = math.abs(c - o)
+        float _bodyRatio = _body / _rng
+        float _closeLoc = (c - l) / _rng
+        bool _bull = c > o and _bodyRatio >= dailyDirectionBodyRatio and _closeLoc >= dailyBullCloseLocation
+        bool _bear = c < o and _bodyRatio >= dailyDirectionBodyRatio and _closeLoc <= dailyBearCloseLocation
+        // 上昇と下降は同時成立しない (終値位置しきい値が0.5前後で相互排他だが念のため優先順で確定)
+        _code := _bull and not _bear ? 1 : _bear and not _bull ? -1 : 0
+    _code
+
+// --- 日足ボラコード (方法別)。判定不能は na ---
+f_drVolCode(float rng, float atr, float loThr, float hiThr) =>
+    int _code = na
+    bool _valid = not na(rng) and rng > 0
+    if dailyVolatilityMethod == "パーセンタイル"
+        if _valid and not na(loThr) and not na(hiThr) and hiThr >= loThr
+            _code := rng >= hiThr ? 1 : rng <= loThr ? -1 : 0
+    else if dailyVolatilityMethod == "ATR比率"
+        if _valid and not na(atr) and atr > 0
+            float _ratio = rng / atr
+            float _lo = math.min(dailyLowAtrRatio, dailyHighAtrRatio)
+            float _hi = math.max(dailyLowAtrRatio, dailyHighAtrRatio)
+            _code := _ratio >= _hi ? 1 : _ratio <= _lo ? -1 : 0
+    else
+        // 固定値 (しきい値が逆転していても min/max で安全化)
+        if _valid
+            float _lo = math.min(dailyLowRangeMax, dailyHighRangeMin)
+            float _hi = math.max(dailyLowRangeMax, dailyHighRangeMin)
+            _code := rng >= _hi ? 1 : rng <= _lo ? -1 : 0
+    _code
+
+// --- 日足 OHLC / ATR / 値幅 / パーセンタイルしきい値 を 1回の security で取得 ---
+//   返り値 : 当日足(判定対象=当日)の8値 + 前日足(判定対象=前日)の8値。
+//   パーセンタイルしきい値は判定対象日自身を分布から除外するため [1] を掛ける。
+//     _loThrCur = percentile(rng, N)[1] … 当日を除いた過去N日分布の下限しきい値。
+//     前日判定用は同式の [1] (= percentile[2]) で前日自身を分布から除外。
+//   ※ security は lookahead_off。前日値は式側で [1] を掛けているので非リペイント。
+f_drDailyTuple() =>
+    float _o = open
+    float _h = high
+    float _l = low
+    float _c = close
+    float _a = ta.atr(dailyAtrLen)
+    float _r = _h - _l
+    float _loThr = na
+    float _hiThr = na
+    if dailyVolatilityMethod == "パーセンタイル"
+        _loThr := ta.percentile_linear_interpolation(_r, dailyVolLookback, dailyLowPercentile)[1]
+        _hiThr := ta.percentile_linear_interpolation(_r, dailyVolLookback, dailyHighPercentile)[1]
+    [_o, _h, _l, _c, _a, _r, _loThr, _hiThr, _o[1], _h[1], _l[1], _c[1], _a[1], _r[1], _loThr[1], _hiThr[1]]
+
+// --- 出力 (OFF/非アクティブ時の安全デフォルト) ---
+bool dailyRegimeLongOk  = true
+bool dailyRegimeShortOk = true
+bool dailyRegimeOk      = true
+// 表示・デバッグ用ホルダ
+int   drDirCodeAdj = na
+int   drVolCodeAdj = na
+float drRange   = na
+float drDailyATR = na
+float drRatio   = na
+float drLoThrDisp = na
+float drHiThrDisp = na
+bool  drMatch     = false
+bool  drInUse     = false
+
+// フィルター または 表示 のいずれかが有効なときだけ日足を計算する
+bool drActive = useDailyRegimeFilter or showDailyRegimeTable or showDailyRegimeBackground
+
+if drActive
+    [_o0, _h0, _l0, _c0, _a0, _r0, _loT0, _hiT0, _o1, _h1, _l1, _c1, _a1, _r1, _loT1, _hiT1] = request.security(syminfo.tickerid, "D", f_drDailyTuple(), lookahead = barmerge.lookahead_off)
+    // 判定対象日の選択 : 前日確定ベース=前日足 / 当日確定後分析=当日足
+    bool drUsePrev = dailyRegimeMode == "前日確定ベース"
+    float drO = drUsePrev ? _o1 : _o0
+    float drH = drUsePrev ? _h1 : _h0
+    float drL = drUsePrev ? _l1 : _l0
+    float drC = drUsePrev ? _c1 : _c0
+    drDailyATR := drUsePrev ? _a1 : _a0
+    drRange    := drUsePrev ? _r1 : _r0
+    float drLoThr = drUsePrev ? _loT1 : _loT0
+    float drHiThr = drUsePrev ? _hiT1 : _hiT0
+    drRatio := not na(drRange) and not na(drDailyATR) and drDailyATR > 0 ? drRange / drDailyATR : na
+
+    // 分類
+    int drDirCode = f_drDirCode(drO, drH, drL, drC)
+    int drVolCode = f_drVolCode(drRange, drDailyATR, drLoThr, drHiThr)
+    bool drDirInsufficient = na(drDirCode)
+    bool drVolInsufficient = na(drVolCode)
+    // データ不足時の扱い : レンジ扱い(方向=レンジ/ボラ=中) or na のまま
+    drDirCodeAdj := drDirInsufficient ? (dailyInsufficientAsRange ? 0 : na) : drDirCode
+    drVolCodeAdj := drVolInsufficient ? (dailyInsufficientAsRange ? 0 : na) : drVolCode
+
+    // 一致判定 (要求OFFの軸は常に一致)
+    string drDirText = f_dailyDirectionText(drDirCodeAdj)
+    string drVolText = f_dailyVolatilityText(drVolCodeAdj)
+    bool directionMatch  = reqDailyDirection  == "OFF" or drDirText == reqDailyDirection
+    bool volatilityMatch = reqDailyVolatility == "OFF" or drVolText == reqDailyVolatility
+    // データ不足を「レンジ扱いしない」設定のとき、要求している軸が不足なら不一致
+    bool drDirBlock = reqDailyDirection  != "OFF" and drDirInsufficient and not dailyInsufficientAsRange
+    bool drVolBlock = reqDailyVolatility != "OFF" and drVolInsufficient and not dailyInsufficientAsRange
+    dailyRegimeOk := not useDailyRegimeFilter or (directionMatch and volatilityMatch and not drDirBlock and not drVolBlock)
+    drMatch := directionMatch and volatilityMatch and not drDirBlock and not drVolBlock
+
+    // 表示用しきい値 (値幅ベースに換算)
+    if dailyVolatilityMethod == "パーセンタイル"
+        drLoThrDisp := drLoThr
+        drHiThrDisp := drHiThr
+    else if dailyVolatilityMethod == "ATR比率"
+        drLoThrDisp := not na(drDailyATR) ? math.min(dailyLowAtrRatio, dailyHighAtrRatio) * drDailyATR : na
+        drHiThrDisp := not na(drDailyATR) ? math.max(dailyLowAtrRatio, dailyHighAtrRatio) * drDailyATR : na
+    else
+        drLoThrDisp := math.min(dailyLowRangeMax, dailyHighRangeMin)
+        drHiThrDisp := math.max(dailyLowRangeMax, dailyHighRangeMin)
+
+// 最終出力 : 前日確定ベースのみ売買に接続。当日確定後分析は常に true (未来参照回避)。
+if dailyRegimeMode == "前日確定ベース"
+    dailyRegimeLongOk  := dailyRegimeOk
+    dailyRegimeShortOk := dailyRegimeOk
+// エントリー制限に実際に使われているか (当日確定後分析は接続しないので false)
+drInUse := useDailyRegimeFilter and dailyRegimeMode == "前日確定ベース"
+
+// --- 背景色 (表示のみ・売買条件には一切影響しない) ---
+//   方向 : 上昇=緑系 / レンジ=グレー系 / 下降=赤系。
+//   ボラ : 高=濃い / 中=中 / 低=薄い (透明度で表現)。
+color drBgColor = na
+if showDailyRegimeBackground and drActive
+    color _drBase = drDirCodeAdj == 1 ? color.green : drDirCodeAdj == -1 ? color.red : color.gray
+    int   _drTransp = drVolCodeAdj == 1 ? 80 : drVolCodeAdj == 0 ? 88 : drVolCodeAdj == -1 ? 94 : 92
+    drBgColor := color.new(_drBase, _drTransp)
+bgcolor(showDailyRegimeBackground ? drBgColor : na, title = "日足レジーム背景")
+
+// --- 日足レジームテーブル (既存の環境テーブル top_right と重ならない bottom_left) ---
+var table drTable = table.new(position.bottom_left, 2, 14, border_width = 1)
+if showDailyRegimeTable and drActive and barstate.islast
+    string _modeTxt   = dailyRegimeMode
+    string _targetTxt = dailyRegimeMode == "前日確定ベース" ? "前日 (確定)" : "当日 (確定後/未確定含む)"
+    string _reqVolTxt = reqDailyVolatility
+    string _actVolTxt = f_dailyVolatilityText(drVolCodeAdj)
+    string _reqDirTxt = reqDailyDirection
+    string _actDirTxt = f_dailyDirectionText(drDirCodeAdj)
+    string _comboTxt  = (na(drVolCodeAdj) or na(drDirCodeAdj)) ? "-" : _actVolTxt + "・" + _actDirTxt
+    color  _hdrCol = color.new(color.blue, 0)
+    color  _lblCol = color.new(color.gray, 30)
+    color  _matchCol = drMatch ? color.new(color.green, 0) : color.new(color.red, 0)
+    color  _useCol   = drInUse ? color.new(color.green, 0) : color.new(color.gray, 0)
+    table.cell(drTable, 0, 0,  "日足レジーム", text_color = color.white, bgcolor = _hdrCol)
+    table.cell(drTable, 1, 0,  _comboTxt,      text_color = color.white, bgcolor = _hdrCol)
+    table.cell(drTable, 0, 1,  "判定モード",   text_color = color.white, bgcolor = _lblCol)
+    table.cell(drTable, 1, 1,  _modeTxt,       text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 0, 2,  "判定対象日",   text_color = color.white, bgcolor = _lblCol)
+    table.cell(drTable, 1, 2,  _targetTxt,     text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 0, 3,  "要求ボラ",     text_color = color.white, bgcolor = _lblCol)
+    table.cell(drTable, 1, 3,  _reqVolTxt,     text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 0, 4,  "実際ボラ",     text_color = color.white, bgcolor = _lblCol)
+    table.cell(drTable, 1, 4,  _actVolTxt,     text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 0, 5,  "要求方向",     text_color = color.white, bgcolor = _lblCol)
+    table.cell(drTable, 1, 5,  _reqDirTxt,     text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 0, 6,  "実際方向",     text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 1, 6,  _actDirTxt,     text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 0, 7,  "9分類",        text_color = color.white, bgcolor = _lblCol)
+    table.cell(drTable, 1, 7,  _comboTxt,      text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 0, 8,  "日足値幅",     text_color = color.white, bgcolor = _lblCol)
+    table.cell(drTable, 1, 8,  na(drRange) ? "-" : str.tostring(drRange, "#.##"), text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 0, 9,  "日足ATR",      text_color = color.white, bgcolor = _lblCol)
+    table.cell(drTable, 1, 9,  na(drDailyATR) ? "-" : str.tostring(drDailyATR, "#.##"), text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 0, 10, "値幅÷ATR",    text_color = color.white, bgcolor = _lblCol)
+    table.cell(drTable, 1, 10, na(drRatio) ? "-" : str.tostring(drRatio, "#.##"), text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 0, 11, "低ボラしきい値", text_color = color.white, bgcolor = _lblCol)
+    table.cell(drTable, 1, 11, na(drLoThrDisp) ? "-" : str.tostring(drLoThrDisp, "#.##"), text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 0, 12, "高ボラしきい値", text_color = color.white, bgcolor = _lblCol)
+    table.cell(drTable, 1, 12, na(drHiThrDisp) ? "-" : str.tostring(drHiThrDisp, "#.##"), text_color = color.white, bgcolor = color.new(color.black, 20))
+    table.cell(drTable, 0, 13, "一致 / 使用中", text_color = color.white, bgcolor = _lblCol)
+    table.cell(drTable, 1, 13, (drMatch ? "一致" : "不一致") + " / " + (drInUse ? "使用中" : "非使用"), text_color = color.white, bgcolor = _matchCol)
+
+// ============================================================
 //  10. 最終エントリー条件
 // ------------------------------------------------------------
-//  設計順序 : 環境認識 → WinZone(FVG/出来高) → Momentum(勢い) → Trigger(価格) → Entry
+//  設計順序 : 日足レジーム → 環境認識 → WinZone(FVG/出来高) → Momentum(勢い) → Trigger(価格) → Entry
 //    ・envLongOk           = どちら向きに狙うか (環境認識)
 //    ・longWinZoneOk       = どこで狙うか (FVG / 出来高POC・場所条件)
 //    ・allowLongByMomentum = 勢いが反転したか (ストキャス・状態保持)
@@ -2825,6 +3059,7 @@ bool sessionOk =
 
 bool canLong =
      useLong and
+     dailyRegimeLongOk and
      sessionOk and
      envLongOk and
      longWinZoneOk and
@@ -2837,6 +3072,7 @@ bool canLong =
 
 bool canShort =
      useShort and
+     dailyRegimeShortOk and
      sessionOk and
      envShortOk and
      shortWinZoneOk and
