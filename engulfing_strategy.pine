@@ -628,6 +628,14 @@ emaAtrLen      = input.int(14, "EMA ATR期間", minval = 1, group = grpEMAWZ)
 emaSRFlipBars     = input.int(10, "SR転換 有効本数",    minval = 1, group = grpEMAWZ)
 emaBandRetestBars = input.int(10, "帯リテスト 有効本数", minval = 1, group = grpEMAWZ)
 showEMAMTFLabels  = input.bool(false, "EMA MTFラベルを表示", group = grpEMAWZ)
+// --- EMA反発 傾きフィルター (反発シグナルのみ。SR転換/帯リテスト/表示/状態管理/WinZone統合には非適用) ---
+//   傾き = 各参照TF上の (EMA値 - emaWZSlopeLookback本前のEMA値)。全EMA共通設定。
+//   ロング反発は上向き (slope >= min) / ショート反発は下向き (slope <= -min) のみ許可。
+//   OFF なら傾きに関係なく既存の反発判定をそのまま使う (挙動不変)。
+useEMABounceSlopeFilter = input.bool(false, "EMA反発 傾きフィルター", group = grpEMAWZ)
+emaWZSlopeLookback = input.int(3, "EMA反発 傾き判定本数", minval = 1, group = grpEMAWZ)
+emaWZSlopeMin      = input.float(0.1, "EMA反発 最低傾き（価格差）", minval = 0.0, step = 0.1, group = grpEMAWZ)
+showEMASlopeDebug  = input.bool(false, "EMA傾きデバッグ表示", group = grpEMAWZ)
 
 // --- EMA WinZone: MTF (どの時間足のEMAを反応帯として見るか) ---
 //   OFF の時間足は request.security を呼ばない。各TFで ON のEMA種類だけ判定に使う。
@@ -1412,8 +1420,26 @@ bool shortFibZoneOk =
 //  ※ security本数節約のため各TFで5EMA+ATRを1タプルで取得。EMA種類OFFは判定側で除外。
 // ============================================================
 
-// 1つの時間足の EMA(5本)+ATR を取得し、反発判定と帯レベルを返す (pure + levels配列に追記)。
-//   返り値: [bounceLong, bounceShort, hitMALong, hitMAShort]。OFFのTFは security を呼ばない。
+// 参照TF内で 5本のEMA + ATR + 5本の傾き(EMA - N本前EMA) を一括計算 (security 1回で取得)。
+//   傾きは各参照TF上の同一EMA系列の差分 = 「参照TF基準の N本前比較」。
+//   ※ 同じEMA系列から差分を取るため上位足EMA値が複数チャート足へ複製されても正しく評価される。
+f_emaTFBundle() =>
+    float _e1 = ta.ema(emaSource, emaLen1)
+    float _e2 = ta.ema(emaSource, emaLen2)
+    float _e3 = ta.ema(emaSource, emaLen3)
+    float _e4 = ta.ema(emaSource, emaLen4)
+    float _e5 = ta.ema(emaSource, emaLen5)
+    float _a  = ta.atr(emaAtrLen)
+    float _s1 = _e1 - _e1[emaWZSlopeLookback]
+    float _s2 = _e2 - _e2[emaWZSlopeLookback]
+    float _s3 = _e3 - _e3[emaWZSlopeLookback]
+    float _s4 = _e4 - _e4[emaWZSlopeLookback]
+    float _s5 = _e5 - _e5[emaWZSlopeLookback]
+    [_e1, _e2, _e3, _e4, _e5, _a, _s1, _s2, _s3, _s4, _s5]
+
+// 1つの時間足の EMA(5本)+ATR+傾き(5本) を取得し、反発判定と帯レベルを返す (pure + levels配列に追記)。
+//   返り値: [bounceLong, bounceShort, hitMALong, hitMAShort, slopeLongHit, slopeShortHit]。OFFのTFは security を呼ばない。
+//   傾きフィルター (useEMABounceSlopeFilter) は「反発シグナルのみ」に適用。SR転換/帯リテストは別処理で不変。
 f_emaTFEval(bool _tfOn, string _tf, array<float> _levels) =>
     float _e1 = na
     float _e2 = na
@@ -1421,26 +1447,48 @@ f_emaTFEval(bool _tfOn, string _tf, array<float> _levels) =>
     float _e4 = na
     float _e5 = na
     float _atr = na
+    float _s1 = na
+    float _s2 = na
+    float _s3 = na
+    float _s4 = na
+    float _s5 = na
     if _tfOn
-        [_v1, _v2, _v3, _v4, _v5, _v6] = request.security(syminfo.tickerid, _tf, [ta.ema(emaSource, emaLen1), ta.ema(emaSource, emaLen2), ta.ema(emaSource, emaLen3), ta.ema(emaSource, emaLen4), ta.ema(emaSource, emaLen5), ta.atr(emaAtrLen)], lookahead = barmerge.lookahead_off)
+        [_v1, _v2, _v3, _v4, _v5, _v6, _vs1, _vs2, _vs3, _vs4, _vs5] = request.security(syminfo.tickerid, _tf, f_emaTFBundle(), lookahead = barmerge.lookahead_off)
         _e1 := _v1
         _e2 := _v2
         _e3 := _v3
         _e4 := _v4
         _e5 := _v5
         _atr := _v6
+        _s1 := _vs1
+        _s2 := _vs2
+        _s3 := _vs3
+        _s4 := _vs4
+        _s5 := _vs5
     float _touch = emaTouchMode == "ATR" ? _atr * emaTouchATRMult : emaTouchDollar
-    // BUY反発: low が EMA に触れ close が EMA上 / SELL反発: high が EMA に触れ close が EMA下
-    bool _bl1 = _tfOn and useEMA1Zone and not na(_e1) and low <= _e1 + _touch and close > _e1 and close > open
-    bool _bl2 = _tfOn and useEMA2Zone and not na(_e2) and low <= _e2 + _touch and close > _e2 and close > open
-    bool _bl3 = _tfOn and useEMA3Zone and not na(_e3) and low <= _e3 + _touch and close > _e3 and close > open
-    bool _bl4 = _tfOn and useEMA4Zone and not na(_e4) and low <= _e4 + _touch and close > _e4 and close > open
-    bool _bl5 = _tfOn and useEMA5Zone and not na(_e5) and low <= _e5 + _touch and close > _e5 and close > open
-    bool _bs1 = _tfOn and useEMA1Zone and not na(_e1) and high >= _e1 - _touch and close < _e1 and close < open
-    bool _bs2 = _tfOn and useEMA2Zone and not na(_e2) and high >= _e2 - _touch and close < _e2 and close < open
-    bool _bs3 = _tfOn and useEMA3Zone and not na(_e3) and high >= _e3 - _touch and close < _e3 and close < open
-    bool _bs4 = _tfOn and useEMA4Zone and not na(_e4) and high >= _e4 - _touch and close < _e4 and close < open
-    bool _bs5 = _tfOn and useEMA5Zone and not na(_e5) and high >= _e5 - _touch and close < _e5 and close < open
+    // 傾きOK (反発のみ)。OFFなら常に true (挙動不変)。ON時は履歴不足(na)なら不許可。
+    //   ロング=上向き(slope>=min) / ショート=下向き(slope<=-min)。各EMA自身の傾きで判定。
+    bool _slL1 = not useEMABounceSlopeFilter or (not na(_s1) and _s1 >=  emaWZSlopeMin)
+    bool _slL2 = not useEMABounceSlopeFilter or (not na(_s2) and _s2 >=  emaWZSlopeMin)
+    bool _slL3 = not useEMABounceSlopeFilter or (not na(_s3) and _s3 >=  emaWZSlopeMin)
+    bool _slL4 = not useEMABounceSlopeFilter or (not na(_s4) and _s4 >=  emaWZSlopeMin)
+    bool _slL5 = not useEMABounceSlopeFilter or (not na(_s5) and _s5 >=  emaWZSlopeMin)
+    bool _slS1 = not useEMABounceSlopeFilter or (not na(_s1) and _s1 <= -emaWZSlopeMin)
+    bool _slS2 = not useEMABounceSlopeFilter or (not na(_s2) and _s2 <= -emaWZSlopeMin)
+    bool _slS3 = not useEMABounceSlopeFilter or (not na(_s3) and _s3 <= -emaWZSlopeMin)
+    bool _slS4 = not useEMABounceSlopeFilter or (not na(_s4) and _s4 <= -emaWZSlopeMin)
+    bool _slS5 = not useEMABounceSlopeFilter or (not na(_s5) and _s5 <= -emaWZSlopeMin)
+    // BUY反発: low が EMA に触れ close が EMA上 / SELL反発: high が EMA に触れ close が EMA下 (+ 傾きOK)
+    bool _bl1 = _tfOn and useEMA1Zone and not na(_e1) and low <= _e1 + _touch and close > _e1 and close > open and _slL1
+    bool _bl2 = _tfOn and useEMA2Zone and not na(_e2) and low <= _e2 + _touch and close > _e2 and close > open and _slL2
+    bool _bl3 = _tfOn and useEMA3Zone and not na(_e3) and low <= _e3 + _touch and close > _e3 and close > open and _slL3
+    bool _bl4 = _tfOn and useEMA4Zone and not na(_e4) and low <= _e4 + _touch and close > _e4 and close > open and _slL4
+    bool _bl5 = _tfOn and useEMA5Zone and not na(_e5) and low <= _e5 + _touch and close > _e5 and close > open and _slL5
+    bool _bs1 = _tfOn and useEMA1Zone and not na(_e1) and high >= _e1 - _touch and close < _e1 and close < open and _slS1
+    bool _bs2 = _tfOn and useEMA2Zone and not na(_e2) and high >= _e2 - _touch and close < _e2 and close < open and _slS2
+    bool _bs3 = _tfOn and useEMA3Zone and not na(_e3) and high >= _e3 - _touch and close < _e3 and close < open and _slS3
+    bool _bs4 = _tfOn and useEMA4Zone and not na(_e4) and high >= _e4 - _touch and close < _e4 and close < open and _slS4
+    bool _bs5 = _tfOn and useEMA5Zone and not na(_e5) and high >= _e5 - _touch and close < _e5 and close < open and _slS5
     // 帯用: ON の EMA レベルを配列へ追記 (BandTop/Bottom を後で算出)
     if _tfOn and useEMA1Zone and not na(_e1)
         array.push(_levels, _e1)
@@ -1456,7 +1504,10 @@ f_emaTFEval(bool _tfOn, string _tf, array<float> _levels) =>
     bool _bShort = _bs1 or _bs2 or _bs3 or _bs4 or _bs5
     int _maL = _bl5 ? 3000 : _bl4 ? 2000 : _bl3 ? 1000 : _bl2 ? 600 : _bl1 ? 200 : 0
     int _maS = _bs5 ? 3000 : _bs4 ? 2000 : _bs3 ? 1000 : _bs2 ? 600 : _bs1 ? 200 : 0
-    [_bLong, _bShort, _maL, _maS]
+    // 反応したEMA自身の傾き (デバッグ用)
+    float _sLHit = _bl5 ? _s5 : _bl4 ? _s4 : _bl3 ? _s3 : _bl2 ? _s2 : _bl1 ? _s1 : na
+    float _sSHit = _bs5 ? _s5 : _bs4 ? _s4 : _bs3 ? _s3 : _bs2 ? _s2 : _bs1 ? _s1 : na
+    [_bLong, _bShort, _maL, _maS, _sLHit, _sSHit]
 
 // --- EMA WinZone 出力 (if外で初期化) ---
 bool emaLongEventOk  = false
@@ -1473,11 +1524,11 @@ var int emaBandBreakDnBar = na
 
 if useEMAWZ
     array<float> _emaLevels = array.new_float()
-    [_bl1m,  _bs1m,  _maL1m,  _maS1m]  = f_emaTFEval(useEMA1M,  tfEMA1M,  _emaLevels)
-    [_bl5m,  _bs5m,  _maL5m,  _maS5m]  = f_emaTFEval(useEMA5M,  tfEMA5M,  _emaLevels)
-    [_bl15m, _bs15m, _maL15m, _maS15m] = f_emaTFEval(useEMA15M, tfEMA15M, _emaLevels)
-    [_bl1h,  _bs1h,  _maL1h,  _maS1h]  = f_emaTFEval(useEMA1H,  tfEMA1H,  _emaLevels)
-    [_bl4h,  _bs4h,  _maL4h,  _maS4h]  = f_emaTFEval(useEMA4H,  tfEMA4H,  _emaLevels)
+    [_bl1m,  _bs1m,  _maL1m,  _maS1m,  _sL1m,  _sS1m]  = f_emaTFEval(useEMA1M,  tfEMA1M,  _emaLevels)
+    [_bl5m,  _bs5m,  _maL5m,  _maS5m,  _sL5m,  _sS5m]  = f_emaTFEval(useEMA5M,  tfEMA5M,  _emaLevels)
+    [_bl15m, _bs15m, _maL15m, _maS15m, _sL15m, _sS15m] = f_emaTFEval(useEMA15M, tfEMA15M, _emaLevels)
+    [_bl1h,  _bs1h,  _maL1h,  _maS1h,  _sL1h,  _sS1h]  = f_emaTFEval(useEMA1H,  tfEMA1H,  _emaLevels)
+    [_bl4h,  _bs4h,  _maL4h,  _maS4h,  _sL4h,  _sS4h]  = f_emaTFEval(useEMA4H,  tfEMA4H,  _emaLevels)
     // --- 反発 (どのTFでも反応すればOK) ---
     bool emaBounceLong  = _bl1m or _bl5m or _bl15m or _bl1h or _bl4h
     bool emaBounceShort = _bs1m or _bs5m or _bs15m or _bs1h or _bs4h
@@ -1534,6 +1585,15 @@ if useEMAWZ
             label.new(bar_index, low, "EMA " + _tfStr + " " + str.tostring(emaHitMA) + " Bounce BUY", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.green, 0), textcolor = color.white, size = size.tiny)
         else
             label.new(bar_index, high, "EMA " + _tfStr + " " + str.tostring(emaHitMA) + " Bounce SELL", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.tiny)
+    // --- EMA傾きデバッグ (任意。反応したEMA自身の傾き値と方向を表示) ---
+    if showEMASlopeDebug and (emaBounceLong or emaBounceShort)
+        float _dbgSlopeL = _bl4h ? _sL4h : _bl1h ? _sL1h : _bl15m ? _sL15m : _bl5m ? _sL5m : _bl1m ? _sL1m : na
+        float _dbgSlopeS = _bs4h ? _sS4h : _bs1h ? _sS1h : _bs15m ? _sS15m : _bs5m ? _sS5m : _bs1m ? _sS1m : na
+        string _dbgTF = emaHitTF == 240 ? "4H" : emaHitTF == 60 ? "1H" : emaHitTF == 15 ? "15M" : emaHitTF == 5 ? "5M" : emaHitTF == 1 ? "1M" : "?"
+        if emaBounceLong
+            label.new(bar_index, low, "slope L " + _dbgTF + " EMA" + str.tostring(emaHitMA) + "=" + str.tostring(_dbgSlopeL, "#.###"), style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.blue, 30), textcolor = color.white, size = size.tiny)
+        else
+            label.new(bar_index, high, "slope S " + _dbgTF + " EMA" + str.tostring(emaHitMA) + "=" + str.tostring(_dbgSlopeS, "#.###"), style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.blue, 30), textcolor = color.white, size = size.tiny)
 
 // --- EMA 状態管理 (FVG/Volume/Fib/Line と同思想) ---
 var bool emaLongState     = false
