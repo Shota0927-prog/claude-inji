@@ -1578,6 +1578,18 @@ var array<bool>  zSess    = array.new_bool()
 var array<int>   zTF      = array.new_int()   // どの時間足由来か (1/5/15/60/240、0=前日/セッション)
 var array<bool>  zBreakUsed  = array.new_bool()  // ブレイク改善: この水平線が既にブレイク確定済みか (方向共通1回)
 var array<int>   zSessionDay = array.new_int()   // ブレイク改善: 生成日 (セッション水平線の有効日数判定用の連番)
+var array<int>   zId         = array.new_int()   // ブレイク改善: 水平線の固有ID (配列shift/removeでindexがずれても追跡可能)
+var int          nextZoneId  = 0                 // ブレイク改善: 次に払い出す固有ID
+var int          sessDayCounter = 0              // ブレイク改善: セッション水平線 有効日数用の連番
+// ブレイク改善: 確定待ち (pending) を方向別に固有IDで管理。
+//  index同士が対応: pendingUpZoneIds[k] のゾーンは pendingUpThresholds[k] を固定基準、
+//  pendingUpCounts[k] 本連続で外側に残れば確定。
+var array<int>   pendingUpZoneIds    = array.new_int()
+var array<float> pendingUpThresholds = array.new_float()
+var array<int>   pendingUpCounts     = array.new_int()
+var array<int>   pendingDnZoneIds    = array.new_int()
+var array<float> pendingDnThresholds = array.new_float()
+var array<int>   pendingDnCounts     = array.new_int()
 
 // 共通フィルター (ローソク品質)。呼ばれない時は実行されない。
 f_lineCommonOK(bool isBuy, float _atr) =>
@@ -1626,6 +1638,8 @@ f_lineAddZone(float p, bool srcPivot, bool srcPrev, bool srcSess, int _tfCode, f
         array.push(zTF,    _tfCode)
         array.push(zBreakUsed,  false)
         array.push(zSessionDay, _sessDay)
+        nextZoneId := nextZoneId + 1
+        array.push(zId, nextZoneId)   // 新規ゾーンにのみ固有IDを払い出す (統合時は既存IDを維持)
         if array.size(zPrice) > lineMaxZones
             array.shift(zPrice)
             array.shift(zTouch)
@@ -1637,6 +1651,7 @@ f_lineAddZone(float p, bool srcPivot, bool srcPrev, bool srcSess, int _tfCode, f
             array.shift(zTF)
             array.shift(zBreakUsed)
             array.shift(zSessionDay)
+            array.shift(zId)
 
 // MTF Pivot 取得 → ゾーン追加 (ONのTFだけ request.security を呼ぶ)
 f_lineAddTFPivots(bool _tfOn, string _tf, int _tfCode, float _mergeTol, int _sessDay) =>
@@ -1651,19 +1666,52 @@ f_lineAddTFPivots(bool _tfOn, string _tf, int _tfCode, float _mergeTol, int _ses
 f_lineSourceOn(bool _ip, bool _ipr, bool _iss) =>
     (_ip and (usePivotLine or useReactionLine)) or (_ipr and usePreviousDayHL) or (_iss and useSessionHL)
 
-// ブレイク改善: 上ブレイク確定時、pendUpLevel 以下で現在ブレイク状態の未使用ゾーンを全てブレイク済みに
-f_lineMarkBrokenUp(float _lvl, float _zw, float _buf) =>
-    if array.size(zBreakUsed) > 0
-        for i = 0 to array.size(zBreakUsed) - 1
-            if not array.get(zBreakUsed, i) and array.get(zPrice, i) <= _lvl and close > array.get(zPrice, i) + _zw + _buf
-                array.set(zBreakUsed, i, true)
+// ブレイク改善: 固有IDから現在の配列インデックスを検索 (なければ na)
+f_findZoneIndexById(int _id) =>
+    int _idx = na
+    if array.size(zId) > 0
+        for i = 0 to array.size(zId) - 1
+            if array.get(zId, i) == _id
+                _idx := i
+                break
+    _idx
 
-// ブレイク改善: 下ブレイク確定時、pendDnLevel 以上で現在ブレイク状態の未使用ゾーンを全てブレイク済みに
-f_lineMarkBrokenDn(float _lvl, float _zw, float _buf) =>
-    if array.size(zBreakUsed) > 0
-        for i = 0 to array.size(zBreakUsed) - 1
-            if not array.get(zBreakUsed, i) and array.get(zPrice, i) >= _lvl and close < array.get(zPrice, i) - _zw - _buf
-                array.set(zBreakUsed, i, true)
+// ブレイク改善: int配列に指定IDが含まれるか
+f_idInArray(array<int> _arr, int _id) =>
+    bool _f = false
+    if array.size(_arr) > 0
+        for i = 0 to array.size(_arr) - 1
+            if array.get(_arr, i) == _id
+                _f := true
+                break
+    _f
+
+// ブレイク改善: 指定IDのゾーンが今もブレイク確定に有効かを判定し、有効なら現在indexを返す
+//  (存在する / 未ブレイク / ソースON / セッション日数制限内)。無効なら na。
+f_lineBreakValidIdx(int _id) =>
+    int _idx = f_findZoneIndexById(_id)
+    int _res = na
+    if not na(_idx)
+        bool _iss = array.get(zSess, _idx)
+        bool _ipv = array.get(zPivot, _idx)
+        bool _ipr = array.get(zPrev, _idx)
+        bool _pureSess = _iss and not _ipv and not _ipr
+        bool _sessOK = not _pureSess or (array.get(zSessionDay, _idx) >= sessDayCounter - (lineSessionMaxDays - 1))
+        if not array.get(zBreakUsed, _idx) and f_lineSourceOn(_ipv, _ipr, _iss) and _sessOK
+            _res := _idx
+    _res
+
+// ブレイク改善: 方向別 pending を完全クリア (Break OFF / モジュールOFF 時)
+f_clearPendingUp() =>
+    if array.size(pendingUpZoneIds) > 0
+        array.clear(pendingUpZoneIds)
+        array.clear(pendingUpThresholds)
+        array.clear(pendingUpCounts)
+f_clearPendingDn() =>
+    if array.size(pendingDnZoneIds) > 0
+        array.clear(pendingDnZoneIds)
+        array.clear(pendingDnThresholds)
+        array.clear(pendingDnCounts)
 
 // strength: 1=Pivotのみ / 2=複数反応 / 3=前日 / 4=セッション / 5=複数ソース重合
 f_lineZoneStrength(bool isPivot, bool isPrev, bool isSess, int touches) =>
@@ -1719,14 +1767,6 @@ var float flipResLevel = na
 var int   flipResBar   = na
 var float flipSupLevel = na
 var int   flipSupBar   = na
-// ブレイク改善: セッション水平線 有効日数用の連番 / ブレイク確定待ち状態
-var int   sessDayCounter = 0
-var bool  pendUpActive = false
-var int   pendUpCount  = 0
-var float pendUpLevel  = na
-var bool  pendDnActive = false
-var int   pendDnCount  = 0
-var float pendDnLevel  = na
 // 表示オブジェクト
 var line supLine = na
 var line resLine = na
@@ -1801,6 +1841,7 @@ if useLineWZ
                 array.remove(zTF, i)
                 array.remove(zBreakUsed, i)
                 array.remove(zSessionDay, i)
+                array.remove(zId, i)
     // 最近接 Support(<=close) / Resistance(>=close)
     int  _nsStrength = 0
     int  _nrStrength = 0
@@ -1856,80 +1897,105 @@ if useLineWZ
         flipResLevel := na
     if _sellFlip
         flipSupLevel := na
-    // C: ブレイク (改善版)
+    // C: ブレイク (固有ID管理版)
     //  ・水平線ごとに zBreakUsed で1回限り (方向共通)。確定時のみ true にする。
-    //  ・ゾーン外側エッジ + バッファ を終値が超えることを要求。
-    //  ・確定方式: CloseOnly(即時) / NextBar(翌足も外側) / Consecutive(N本連続外側)。
-    //  ・確定待ち中は基準レベルを固定 (途中でターゲットを切り替えない)。
-    //  ・1本で複数線を抜けたら全て zBreakUsed、シグナルは方向ごと1回だけ。
+    //  ・今バーで実際に「内側→外側」へ跨いだラインだけを対象にする (価格が既に外側の線は巻き込まない)。
+    //  ・確定基準価格(threshold)は跨いだバーで固定 (ATR/ゾーン幅が変わっても再計算しない)。
+    //  ・確定方式: CloseOnly(即時) / NextBar(翌足も外側) / Consecutive(N本連続外側)。各IDごとにカウント管理。
+    //  ・1本で複数線を跨いだら全て pending に登録し、確定した線を zBreakUsed、シグナルは方向ごと1回。
     bool _breakBodyOK = not useLineBreakBodyFilter or (high - low > 0 and math.abs(close - open) / (high - low) >= lineBreakBodyRatio)
     float _brkBuf = lineBreakBufferMode == "Dollar" ? lineBreakBufferDollar : lineBreakBufferMode == "ATR" ? lineAtr * lineBreakBufferATR : 0.0
     int _confN = lineBreakConfirmMode == "CloseOnly" ? 1 : lineBreakConfirmMode == "NextBar" ? 2 : lineBreakConfirmBars
-    // 今バーで新規に上/下ブレイクした候補ゾーンの基準レベル (上=最上位 / 下=最下位)
-    float _upFreshLevel = na
-    float _dnFreshLevel = na
-    if useLineBreak and array.size(zPrice) > 0
-        for i = 0 to array.size(zPrice) - 1
-            if not array.get(zBreakUsed, i) and bar_index >= array.get(zCreated, i) and f_lineSourceOn(array.get(zPivot, i), array.get(zPrev, i), array.get(zSess, i))
-                float _zp  = array.get(zPrice, i)
-                float _zTp = _zp + lineZoneW
-                float _zBt = _zp - lineZoneW
-                if close > _zTp + _brkBuf and close[1] <= _zTp + _brkBuf
-                    _upFreshLevel := na(_upFreshLevel) ? _zp : math.max(_upFreshLevel, _zp)
-                if close < _zBt - _brkBuf and close[1] >= _zBt - _brkBuf
-                    _dnFreshLevel := na(_dnFreshLevel) ? _zp : math.min(_dnFreshLevel, _zp)
     bool _buyBreak  = false
     bool _sellBreak = false
-    // --- 上ブレイク 状態機械 ---
-    bool _upHandled = false
-    if useLineBreak and pendUpActive
-        _upHandled := true
-        if close > pendUpLevel + lineZoneW + _brkBuf
-            pendUpCount := pendUpCount + 1
-            if pendUpCount >= _confN
-                f_lineMarkBrokenUp(pendUpLevel, lineZoneW, _brkBuf)
-                _buyBreak := true
-                pendUpActive := false
-                pendUpCount  := 0
-                pendUpLevel  := na
-        else
-            pendUpActive := false
-            pendUpCount  := 0
-            pendUpLevel  := na
-    if useLineBreak and not pendUpActive and not _upHandled and not na(_upFreshLevel) and _breakBodyOK
-        pendUpLevel := _upFreshLevel
-        pendUpCount := 1
-        if _confN <= 1
-            f_lineMarkBrokenUp(pendUpLevel, lineZoneW, _brkBuf)
-            _buyBreak := true
-            pendUpLevel := na
-        else
-            pendUpActive := true
-    // --- 下ブレイク 状態機械 ---
-    bool _dnHandled = false
-    if useLineBreak and pendDnActive
-        _dnHandled := true
-        if close < pendDnLevel - lineZoneW - _brkBuf
-            pendDnCount := pendDnCount + 1
-            if pendDnCount >= _confN
-                f_lineMarkBrokenDn(pendDnLevel, lineZoneW, _brkBuf)
-                _sellBreak := true
-                pendDnActive := false
-                pendDnCount  := 0
-                pendDnLevel  := na
-        else
-            pendDnActive := false
-            pendDnCount  := 0
-            pendDnLevel  := na
-    if useLineBreak and not pendDnActive and not _dnHandled and not na(_dnFreshLevel) and _breakBodyOK
-        pendDnLevel := _dnFreshLevel
-        pendDnCount := 1
-        if _confN <= 1
-            f_lineMarkBrokenDn(pendDnLevel, lineZoneW, _brkBuf)
-            _sellBreak := true
-            pendDnLevel := na
-        else
-            pendDnActive := true
+    float _brokeUpLvl = na   // 表示用: 今バーに確定した上ブレイク線の価格
+    float _brokeDnLvl = na   // 表示用: 今バーに確定した下ブレイク線の価格
+    // --- (1) 既存 上pending を処理 (今バー追加分は後段で push するため二重処理しない) ---
+    if useLineBreak and array.size(pendingUpZoneIds) > 0
+        for k = array.size(pendingUpZoneIds) - 1 to 0
+            int   _pid = array.get(pendingUpZoneIds, k)
+            float _thr = array.get(pendingUpThresholds, k)
+            int   _cnt = array.get(pendingUpCounts, k)
+            int   _vidx = f_lineBreakValidIdx(_pid)   // 消滅/ブレイク済/ソースOFF/日数超過なら na
+            if na(_vidx)
+                array.remove(pendingUpZoneIds, k)
+                array.remove(pendingUpThresholds, k)
+                array.remove(pendingUpCounts, k)
+            else if close > _thr           // 固定基準の外側に定着
+                int _newCnt = _cnt + 1
+                if _newCnt >= _confN
+                    array.set(zBreakUsed, _vidx, true)
+                    _buyBreak := true
+                    _brokeUpLvl := array.get(zPrice, _vidx)
+                    array.remove(pendingUpZoneIds, k)
+                    array.remove(pendingUpThresholds, k)
+                    array.remove(pendingUpCounts, k)
+                else
+                    array.set(pendingUpCounts, k, _newCnt)
+            else                            // 内側へ戻った → このIDは破棄
+                array.remove(pendingUpZoneIds, k)
+                array.remove(pendingUpThresholds, k)
+                array.remove(pendingUpCounts, k)
+    // --- (2) 既存 下pending を処理 ---
+    if useLineBreak and array.size(pendingDnZoneIds) > 0
+        for k = array.size(pendingDnZoneIds) - 1 to 0
+            int   _pid = array.get(pendingDnZoneIds, k)
+            float _thr = array.get(pendingDnThresholds, k)
+            int   _cnt = array.get(pendingDnCounts, k)
+            int   _vidx = f_lineBreakValidIdx(_pid)
+            if na(_vidx)
+                array.remove(pendingDnZoneIds, k)
+                array.remove(pendingDnThresholds, k)
+                array.remove(pendingDnCounts, k)
+            else if close < _thr
+                int _newCnt = _cnt + 1
+                if _newCnt >= _confN
+                    array.set(zBreakUsed, _vidx, true)
+                    _sellBreak := true
+                    _brokeDnLvl := array.get(zPrice, _vidx)
+                    array.remove(pendingDnZoneIds, k)
+                    array.remove(pendingDnThresholds, k)
+                    array.remove(pendingDnCounts, k)
+                else
+                    array.set(pendingDnCounts, k, _newCnt)
+            else
+                array.remove(pendingDnZoneIds, k)
+                array.remove(pendingDnThresholds, k)
+                array.remove(pendingDnCounts, k)
+    // --- (3) 今バーで新規に跨いだラインを抽出 (内側→外側)。実体フィルターOKのバーのみ ---
+    if useLineBreak and _breakBodyOK and array.size(zPrice) > 0
+        for i = 0 to array.size(zPrice) - 1
+            if not array.get(zBreakUsed, i) and bar_index >= array.get(zCreated, i)
+                bool _ipv = array.get(zPivot, i)
+                bool _ipr = array.get(zPrev, i)
+                bool _iss = array.get(zSess, i)
+                bool _pureSess = _iss and not _ipv and not _ipr
+                bool _sessOK = not _pureSess or (array.get(zSessionDay, i) >= sessDayCounter - (lineSessionMaxDays - 1))
+                if f_lineSourceOn(_ipv, _ipr, _iss) and _sessOK
+                    int   _zid   = array.get(zId, i)
+                    float _zp    = array.get(zPrice, i)
+                    float _thrUp = _zp + lineZoneW + _brkBuf
+                    float _thrDn = _zp - lineZoneW - _brkBuf
+                    // 上抜け 新規クロス (前足は基準以下、今足は基準超え)
+                    if close[1] <= _thrUp and close > _thrUp and not f_idInArray(pendingUpZoneIds, _zid)
+                        if _confN <= 1
+                            array.set(zBreakUsed, i, true)
+                            _buyBreak := true
+                            _brokeUpLvl := _zp
+                        else
+                            array.push(pendingUpZoneIds, _zid)
+                            array.push(pendingUpThresholds, _thrUp)
+                            array.push(pendingUpCounts, 1)
+                    // 下抜け 新規クロス (前足は基準以上、今足は基準未満)
+                    if close[1] >= _thrDn and close < _thrDn and not f_idInArray(pendingDnZoneIds, _zid)
+                        if _confN <= 1
+                            array.set(zBreakUsed, i, true)
+                            _sellBreak := true
+                            _brokeDnLvl := _zp
+                        else
+                            array.push(pendingDnZoneIds, _zid)
+                            array.push(pendingDnThresholds, _thrDn)
+                            array.push(pendingDnCounts, 1)
     // D: スイープ反転
     float _sweepTol = lineAtr * lineSweepToleranceATR
     bool _buySweep  = useLineSweep and _supUsable and (nearestSupport - low)     >= _sweepTol and close > nearestSupport    and f_lineCommonOK(true, lineAtr)
@@ -1987,22 +2053,24 @@ if useLineWZ
             label.new(bar_index, low, "Sweep↑", style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.aqua, 0), textcolor = color.white, size = size.tiny)
         if _sellSweep
             label.new(bar_index, high, "Sweep↓", style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.orange, 0), textcolor = color.white, size = size.tiny)
-    // ブレイク改善: ブレイク済み水平線を別スタイル表示 (Flip用に配列には残す)。確定バーに点線を描画。
+    // ブレイク改善: ブレイク済み水平線を別スタイル表示 (Flip用に配列には残す)。確定した線価格に点線を描画。
     if showBrokenLineStyle
-        if _buyBreak and not na(pendUpLevel[1])
-            line.new(bar_index - 1, pendUpLevel[1], bar_index, pendUpLevel[1], color = color.new(color.gray, 40), width = 1, style = line.style_dotted)
-        if _buyBreak and na(pendUpLevel[1]) and not na(_upFreshLevel)
-            line.new(bar_index - 1, _upFreshLevel, bar_index, _upFreshLevel, color = color.new(color.gray, 40), width = 1, style = line.style_dotted)
-        if _sellBreak and not na(pendDnLevel[1])
-            line.new(bar_index - 1, pendDnLevel[1], bar_index, pendDnLevel[1], color = color.new(color.gray, 40), width = 1, style = line.style_dotted)
-        if _sellBreak and na(pendDnLevel[1]) and not na(_dnFreshLevel)
-            line.new(bar_index - 1, _dnFreshLevel, bar_index, _dnFreshLevel, color = color.new(color.gray, 40), width = 1, style = line.style_dotted)
-    // ブレイク改善: 確定待ちデバッグ表示
+        if _buyBreak and not na(_brokeUpLvl)
+            line.new(bar_index - 1, _brokeUpLvl, bar_index, _brokeUpLvl, color = color.new(color.gray, 40), width = 1, style = line.style_dotted)
+        if _sellBreak and not na(_brokeDnLvl)
+            line.new(bar_index - 1, _brokeDnLvl, bar_index, _brokeDnLvl, color = color.new(color.gray, 40), width = 1, style = line.style_dotted)
+    // ブレイク改善: 確定待ちデバッグ表示 (方向別 pending 件数)
     if showPendingBreakDebug
-        if pendUpActive
-            label.new(bar_index, high, "Pend↑" + str.tostring(pendUpCount), style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.blue, 50), textcolor = color.white, size = size.tiny)
-        if pendDnActive
-            label.new(bar_index, low, "Pend↓" + str.tostring(pendDnCount), style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.blue, 50), textcolor = color.white, size = size.tiny)
+        if array.size(pendingUpZoneIds) > 0
+            label.new(bar_index, high, "Pend↑" + str.tostring(array.size(pendingUpZoneIds)), style = label.style_label_down, yloc = yloc.abovebar, color = color.new(color.blue, 50), textcolor = color.white, size = size.tiny)
+        if array.size(pendingDnZoneIds) > 0
+            label.new(bar_index, low, "Pend↓" + str.tostring(array.size(pendingDnZoneIds)), style = label.style_label_up, yloc = yloc.belowbar, color = color.new(color.blue, 50), textcolor = color.white, size = size.tiny)
+
+// ブレイク改善: Break OFF / 水平線モジュール OFF 時は方向別 pending を完全クリア
+//  (古い仮ブレイクが再ON後に復活しないようにする。useLineWZ は Module/WinZone のON条件を内包)
+if not (useLineWZ and useLineBreak)
+    f_clearPendingUp()
+    f_clearPendingDn()
 
 // --- 水平線 状態管理 (シグナル後 lineStateMaxBars 本だけ WinZone 維持) ---
 var int lineLongStateBar  = na
