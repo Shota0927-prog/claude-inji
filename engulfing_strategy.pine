@@ -20,7 +20,7 @@ strategy(
      title             = "5min Engulfing Strategy",
      shorttitle        = "ENG5",
      overlay           = true,
-     pyramiding        = 0,
+     pyramiding        = 50,
      initial_capital   = 1000,
      default_qty_type  = strategy.fixed,
      default_qty_value = 1,
@@ -38,6 +38,10 @@ useLong      = input.bool(true, "ロングを有効",              group = grpEn
 useShort     = input.bool(true, "ショートを有効",            group = grpEntry)
 strictEngulf = input.bool(true, "実体が前足を完全に包む",     group = grpEntry)
 reqOppColor  = input.bool(true, "前足が反対色であることを要求", group = grpEntry)
+// ピラミッディング : 同方向へ同時に持てる建玉数の上限 (1=積み増しなし=従来動作)。
+//   ・2以上で押し目/戻りシグナル毎に買い増し・売り増し。反対方向保有中は入らない(ドテンしない)。
+//   ・各建玉は独立したSL/TPを持つ。実際の上限は strategy(pyramiding=50) 以下でこの値が制御。
+maxPyramiding = input.int(3, "最大同方向ポジション数 (ピラミッディング)", minval = 1, maxval = 50, group = grpEntry, tooltip = "同じ方向へ同時に持てる建玉数の上限。1=積み増しなし(従来動作)。2以上でピラミッディング。反対方向の保有中は新規を入れない(ドテンしない)。各建玉は独立SL/TP。")
 
 // ============================================================
 //  1a. 入力 : エントリートリガー (追加条件・ON/OFF)
@@ -3195,22 +3199,22 @@ bool canShort =
      shortQty >= 1
 
 // ============================================================
-//  11. 発注
+//  11. 発注 (ピラミッディング対応)
 // ------------------------------------------------------------
-//  ポジション保有中は新規シグナルを無視 (ドテンしない)。
-//  ノーポジ (position_size == 0) のときだけエントリーし、
-//  決済は SL / TP のみ。
+//  ・同方向へは strategy(pyramiding=) の上限まで積み増し可能 (ピラミッディング)。
+//    pyramiding=1 なら積み増しなし = 従来動作 (ノーポジ時のみ1回)。
+//  ・反対方向を保有中は新規を入れない (ドテンしない)。
+//  ・各建玉は固有IDを持ち、SL/TP を1本ずつ独立して管理する。
+//  ・同一バーでロング・ショートが両方成立したら、そのバーのローソク方向で
+//    1方向に確定し二重発注(ドテン)を防ぐ (陽線→ロング / 陰線→ショート)。
+//  ・積み増し上限は strategy() の pyramiding 入力が最終的に強制する
+//    (上限到達後の追加 strategy.entry は自動で拒否される)。
 // ============================================================
-bool isFlat = strategy.position_size == 0
+bool posLong  = strategy.position_size > 0
+bool posShort = strategy.position_size < 0
+bool posFlat  = strategy.position_size == 0
 
-// --- 同一バーでロング・ショートが両方成立した場合の 二重発注(ドテン)防止 ---
-//   isFlat はバー内で更新されないため、canLong と canShort が両方 true だと
-//   Long → Short の順で両方 strategy.entry が走り、即ドテン (建値決済=Breakeven)
-//   が大量発生する。方向トリガー等が無い構成では両者が常に一致するため、
-//   両成立を単純に NoTrade にすると「エントリーが一切出ない」状態になる。
-//   そこで両成立時は「そのバーのローソク方向」で1方向だけに確定し、
-//   二重発注(ドテン)のみを防ぐ (陽線→ロング / 陰線→ショート)。
-//   ※ 方向トリガーON時は両成立がほぼ起きないため従来挙動は不変。
+// 同一バー両成立は矛盾なので、そのバーのローソク方向で1方向に確定
 bool wantLong  = canLong
 bool wantShort = canShort
 if wantLong and wantShort
@@ -3219,9 +3223,21 @@ if wantLong and wantShort
     else
         wantLong := false
 
-if isFlat and wantLong
-    strategy.entry("Long", strategy.long, qty = longQty)
-    strategy.exit("Long Exit", from_entry = "Long", stop = longStop, limit = longTP)
+// 反対方向を保有中は追加しない (ドテン防止)。同方向 or ノーポジのみ追加可。
+//   同時に、現在の建玉数が maxPyramiding 未満のときだけ追加を許可する。
+//   ※ 反対方向は同時に持たない設計なので strategy.opentrades = 現在方向の建玉数。
+bool underPyrLimit = strategy.opentrades < maxPyramiding
+bool okAddLong  = (posFlat or posLong)  and underPyrLimit
+bool okAddShort = (posFlat or posShort) and underPyrLimit
+
+// 各エントリーへ固有IDを付与 → SL/TP を独立管理。積み増し上限は maxPyramiding が制御。
+var int pyrSeq = 0
+
+if okAddLong and wantLong
+    pyrSeq += 1
+    string _idL = "L" + str.tostring(pyrSeq)
+    strategy.entry(_idL, strategy.long, qty = longQty)
+    strategy.exit(_idL + "X", from_entry = _idL, stop = longStop, limit = longTP)
     // エントリー後、同じFVG状態で再入しないよう状態をリセット
     if resetFVGStateAfterEntry
         longFVGStateOk := false
@@ -3238,9 +3254,11 @@ if isFlat and wantLong
     if useMACDModule and resetMACDStateAfterEntry
         longMACDStateOk := false
 
-if isFlat and wantShort
-    strategy.entry("Short", strategy.short, qty = shortQty)
-    strategy.exit("Short Exit", from_entry = "Short", stop = shortStop, limit = shortTP)
+if okAddShort and wantShort
+    pyrSeq += 1
+    string _idS = "S" + str.tostring(pyrSeq)
+    strategy.entry(_idS, strategy.short, qty = shortQty)
+    strategy.exit(_idS + "X", from_entry = _idS, stop = shortStop, limit = shortTP)
     // エントリー後、同じFVG状態で再入しないよう状態をリセット
     if resetFVGStateAfterEntry
         shortFVGStateOk := false
