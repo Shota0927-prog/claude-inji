@@ -2821,7 +2821,7 @@ float shortQty = f_qty(shortRisk)
 // ============================================================
 grpDailyRegime = "日足レジーム"
 useDailyRegimeFilter = input.bool(false, "日足レジームフィルターを使う", group = grpDailyRegime)
-dailyRegimeMode = input.string("前日確定ベース", "日足レジーム判定モード", options = ["前日確定ベース", "当日確定後分析"], group = grpDailyRegime, tooltip = "前日確定ベース=正式バックテスト/実運用 (確定済み前日日足のみ参照・非リペイント)。当日確定後分析=未来参照を避けるためエントリー制限には使用しない (分類の表示・背景・集計専用)。")
+dailyRegimeMode = input.string("前日確定ベース", "日足レジーム判定モード", options = ["前日確定ベース", "当日進行中ベース", "当日確定後分析"], group = grpDailyRegime, tooltip = "前日確定ベース=確定済み前日日足で翌日を制限 (正式バックテスト/非リペイント)。当日進行中ベース=当日始値からその足までの累積値幅で分類し、その時点でエントリーを制限 (未来参照なし・非リペイント・エントリー接続)。当日確定後分析=完成日足の事後分類 (未来参照を避けるためエントリー制限には使用しない・表示/背景/集計専用)。")
 
 // 日足方向 / 日足ボラ の要求 (OFF=その軸は制限しない)
 reqDailyDirection  = input.string("OFF", "日足方向", options = ["OFF", "上昇", "レンジ", "下降"], group = grpDailyRegime)
@@ -2886,10 +2886,12 @@ f_drVolCode(float rng, float atr, float loThr, float hiThr) =>
             _code := _ratio >= _hi ? 1 : _ratio <= _lo ? -1 : 0
     else
         // 固定値 (しきい値が逆転していても min/max で安全化)
+        //   境界 : rng >= _hi → 高ボラ / rng < _lo → 低ボラ / それ以外 → 中ボラ。
+        //   (低は < なので 80.0 ちょうどは中ボラ・140.0 ちょうどは高ボラ)
         if _valid
             float _lo = math.min(dailyLowRangeMax, dailyHighRangeMin)
             float _hi = math.max(dailyLowRangeMax, dailyHighRangeMin)
-            _code := rng >= _hi ? 1 : rng <= _lo ? -1 : 0
+            _code := rng >= _hi ? 1 : rng < _lo ? -1 : 0
     _code
 
 // --- 日足 OHLC / ATR / 値幅 / パーセンタイルしきい値 を 1回の security で取得 ---
@@ -2932,14 +2934,45 @@ bool drActive = useDailyRegimeFilter or showDailyRegimeTable or showDailyRegimeB
 
 if drActive
     [_o0, _h0, _l0, _c0, _a0, _r0, _loT0, _hiT0, _o1, _h1, _l1, _c1, _a1, _r1, _loT1, _hiT1] = request.security(syminfo.tickerid, "D", f_drDailyTuple(), lookahead = barmerge.lookahead_off)
-    // 判定対象日の選択 : 前日確定ベース=前日足 / 当日確定後分析=当日足
-    bool drUsePrev = dailyRegimeMode == "前日確定ベース"
-    float drO = drUsePrev ? _o1 : _o0
-    float drH = drUsePrev ? _h1 : _h0
-    float drL = drUsePrev ? _l1 : _l0
-    float drC = drUsePrev ? _c1 : _c0
-    drDailyATR := drUsePrev ? _a1 : _a0
-    drRange    := drUsePrev ? _r1 : _r0
+
+    // --- 当日進行中 の累積 始値/高値/安値 (チャートTFで計算・非リペイント) ---
+    //   日付が変わったら当日高安をリセットし、以降は現在足まで累積更新する。
+    //   参照するのは「その足までに確定した高値/安値」だけ = 未来参照なし。
+    var float drCurDayOpen = na
+    var float drCurDayHigh = na
+    var float drCurDayLow  = na
+    bool drNewDay = ta.change(time("D")) != 0
+    if drNewDay or na(drCurDayHigh)
+        drCurDayOpen := open
+        drCurDayHigh := high
+        drCurDayLow  := low
+    else
+        drCurDayHigh := math.max(drCurDayHigh, high)
+        drCurDayLow  := math.min(drCurDayLow, low)
+    float drIntradayRange = drCurDayHigh - drCurDayLow
+
+    // 判定対象日の選択 :
+    //   前日確定ベース   = 確定済み前日足
+    //   当日進行中ベース = 当日始値〜現在足の累積 (ボラ=累積値幅 / ATR・percentile は確定済み過去)
+    //   当日確定後分析   = 当日(完成)足
+    bool drUsePrev  = dailyRegimeMode == "前日確定ベース"
+    bool drUseIntra = dailyRegimeMode == "当日進行中ベース"
+
+    // 方向用 OHLC (方向とボラで参照値を分離)
+    //   当日進行中は当日累積OHLC (始値=当日始値 / 高安=累積 / 終値=現在close)。未来参照なし。
+    float drO = drUsePrev ? _o1 : drUseIntra ? drCurDayOpen : _o0
+    float drH = drUsePrev ? _h1 : drUseIntra ? drCurDayHigh : _h0
+    float drL = drUsePrev ? _l1 : drUseIntra ? drCurDayLow  : _l0
+    float drC = drUsePrev ? _c1 : drUseIntra ? close        : _c0
+
+    // ボラ用 値幅 / ATR / パーセンタイルしきい値
+    //   当日進行中の値幅 = 当日累積値幅 (drIntradayRange)。
+    //   当日進行中のATR  = 確定済み前日日足ATR (_a1) を使い、当日未確定の日足ATRによる
+    //                      未来参照・リペイントを回避。
+    //   percentile しきい値 = 当日を分布から除外した当日slot (_loT0/_hiT0)。
+    //                        (これは前日確定日足時点の percentile なので当日進行中も非リペイント)
+    drRange    := drUsePrev ? _r1 : drUseIntra ? drIntradayRange : _r0
+    drDailyATR := drUsePrev ? _a1 : drUseIntra ? _a1 : _a0
     float drLoThr = drUsePrev ? _loT1 : _loT0
     float drHiThr = drUsePrev ? _hiT1 : _hiT0
     drRatio := not na(drRange) and not na(drDailyATR) and drDailyATR > 0 ? drRange / drDailyATR : na
@@ -2975,12 +3008,14 @@ if drActive
         drLoThrDisp := math.min(dailyLowRangeMax, dailyHighRangeMin)
         drHiThrDisp := math.max(dailyLowRangeMax, dailyHighRangeMin)
 
-// 最終出力 : 前日確定ベースのみ売買に接続。当日確定後分析は常に true (未来参照回避)。
-if dailyRegimeMode == "前日確定ベース"
+// 最終出力 : 前日確定ベース と 当日進行中ベース は売買に接続 (どちらも未来参照なし)。
+//   当日確定後分析は常に true = エントリー制限に接続しない (未来参照回避・表示専用)。
+bool drTradeConnected = dailyRegimeMode == "前日確定ベース" or dailyRegimeMode == "当日進行中ベース"
+if drTradeConnected
     dailyRegimeLongOk  := dailyRegimeOk
     dailyRegimeShortOk := dailyRegimeOk
 // エントリー制限に実際に使われているか (当日確定後分析は接続しないので false)
-drInUse := useDailyRegimeFilter and dailyRegimeMode == "前日確定ベース"
+drInUse := useDailyRegimeFilter and drTradeConnected
 
 // ============================================================
 //  9b-2. 日足ボラ状態 出力 (再利用用 : 将来のボラ別ロジック自動切替の土台)
@@ -3068,7 +3103,7 @@ bgcolor(showDailyRegimeBackground ? drBgColor : na, title = "日足レジーム�
 var table drTable = table.new(position.bottom_left, 2, 14, border_width = 1)
 if showDailyRegimeTable and drActive and barstate.islast
     string _modeTxt   = dailyRegimeMode
-    string _targetTxt = dailyRegimeMode == "前日確定ベース" ? "前日 (確定)" : "当日 (確定後/未確定含む)"
+    string _targetTxt = dailyRegimeMode == "前日確定ベース" ? "前日 (確定)" : dailyRegimeMode == "当日進行中ベース" ? "当日 (進行中・累積)" : "当日 (確定後)"
     string _reqVolTxt = reqDailyVolatility
     string _actVolTxt = f_dailyVolatilityText(drVolCodeAdj)
     string _reqDirTxt = reqDailyDirection
