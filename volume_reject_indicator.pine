@@ -2943,6 +2943,111 @@ float  fibCRR                   = 1.0          // フィボC リスクリワー�
 color COLOR_RANK_B = color.rgb(0, 100, 0)      // Bランク=深緑 (既存・不変)
 color COLOR_RANK_A = color.rgb(25, 70, 140)    // Aランク=濃紺 (深緑と明確に区別・派手すぎない)
 
+// --- 追加: セッション水平線反発 (内部判定=Bランク / 表示ランク=B・ショートのみ) ---
+//   相場環境=4Hレンジ/1H下降/15Mレンジ・日足方向OFF/日足ボラ低ボラ・時間帯=アジア+NY・
+//   WinZone=セッション高安の反発のみ・固定ゾーン0.1・状態3本・固定SL12/RR1.0。
+//   ※ グローバル水平線input(useLineWinZone/ソース/パターン/ゾーン/状態) には一切依存しない
+//     専用実効値。ユーザーが共通line設定を変えても本ロジックの判定は変わらない。
+string LOGIC_SLR_NAME    = "セッション水平線反発"
+string LOGIC_SLR_RANK    = "B"
+int    LOGIC_SLR_ID      = 3
+bool   useSLRLogic       = true          // セッション水平線反発ロジック有効
+float  slrSlFixed        = 12.0          // 固定SL($)
+float  slrRR             = 1.0           // リスクリワード
+float  slrZoneWidth      = 0.1           // 反発ゾーン幅 (固定・ATR連動しない)
+int    slrStateMaxBars   = 3             // 状態 有効本数
+string slrSessTZ         = "GMT"         // セッションTZ (固定)
+string slrAsiaSess       = "0000-0800"   // セッション定義 (877既定・GMT。固定)
+string slrLondonSess     = "0700-1600"
+string slrNySess         = "1200-2100"
+
+// ============================================================
+//  5b-2g. セッション水平線 反発 モジュール (第3ロジック専用・ショートのみ)
+// ------------------------------------------------------------
+//  既存の共通水平線モジュール(グローバルinput依存)とは独立した専用計算。
+//  ・ソース   : セッション高値/安値のみ (Pivot/複数回反応/前日高安は使わない)
+//  ・パターン : 反発のみ (レジサポ転換/ブレイク/スイープは使わない)
+//  ・ゾーン幅 : 固定0.1 (ATR連動しない) / 状態 : 3本 / 共通フィルターは全てOFF
+//  ・専用の小さなレベル配列のみ保持。共通の zPrice[] や line設定には触れない。
+// ============================================================
+// セッション高安トラッカー (var: バー跨ぎ保持) + レベル配列
+var float slrAsiaHi = na
+var float slrAsiaLo = na
+var float slrLdnHi  = na
+var float slrLdnLo  = na
+var float slrNyHi   = na
+var float slrNyLo   = na
+var array<float> slrLvl    = array.new_float()
+var array<int>   slrLvlBar = array.new_int()
+
+// セッション高安トラッカー (専用TZ slrSessTZ 使用 = グローバル lineSessTZ に非依存)
+f_slrSession(string sessStr, float prevHi, float prevLo) =>
+    bool _inSess  = not na(time(timeframe.period, sessStr, slrSessTZ))
+    bool _ended   = not _inSess and _inSess[1]
+    float _hi = prevHi
+    float _lo = prevLo
+    if _inSess and not _inSess[1]
+        _hi := high
+        _lo := low
+    else if _inSess
+        _hi := na(prevHi) ? high : math.max(prevHi, high)
+        _lo := na(prevLo) ? low  : math.min(prevLo, low)
+    [_hi, _lo, _ended]
+
+// レベル追加 (最大30保持で最古を捨てる)
+f_slrPush(float p) =>
+    if not na(p)
+        array.push(slrLvl, p)
+        array.push(slrLvlBar, bar_index)
+        if array.size(slrLvl) > 30
+            array.shift(slrLvl)
+            array.shift(slrLvlBar)
+
+bool  slrShortEvent = false
+float slrNearestRes = na
+if useSLRLogic
+    [_saH, _saL, _saEnd] = f_slrSession(slrAsiaSess, slrAsiaHi, slrAsiaLo)
+    slrAsiaHi := _saH
+    slrAsiaLo := _saL
+    [_slH, _slL, _slEnd] = f_slrSession(slrLondonSess, slrLdnHi, slrLdnLo)
+    slrLdnHi := _slH
+    slrLdnLo := _slL
+    [_snH, _snL, _snEnd] = f_slrSession(slrNySess, slrNyHi, slrNyLo)
+    slrNyHi := _snH
+    slrNyLo := _snL
+    // セッション終了時に そのセッションの高値/安値をレベルとして確定
+    if _saEnd
+        f_slrPush(slrAsiaHi)
+        f_slrPush(slrAsiaLo)
+    if _slEnd
+        f_slrPush(slrLdnHi)
+        f_slrPush(slrLdnLo)
+    if _snEnd
+        f_slrPush(slrNyHi)
+        f_slrPush(slrNyLo)
+    // 最近接レジスタンス (close 以上の最小レベル)
+    if array.size(slrLvl) > 0
+        for i = 0 to array.size(slrLvl) - 1
+            float _p = array.get(slrLvl, i)
+            if _p >= close and bar_index >= array.get(slrLvlBar, i)
+                if na(slrNearestRes) or _p < slrNearestRes
+                    slrNearestRes := _p
+    // 反発ショート : 高値がレジゾーンに触れ 終値がレジ未満 (方向ローソク/ヒゲ/実体/ATR/障害物は全てOFF)
+    bool  _resUse     = not na(slrNearestRes)
+    float _resZoneBot = slrNearestRes - slrZoneWidth
+    slrShortEvent := _resUse and high >= _resZoneBot and close < slrNearestRes
+
+// 状態管理 (反発イベント後 slrStateMaxBars 本だけ場所条件OKを保持)
+var bool slrShortState    = false
+var int  slrShortStateBar = na
+if useSLRLogic
+    if slrShortEvent
+        slrShortState    := true
+        slrShortStateBar := bar_index
+    if slrShortState and not na(slrShortStateBar) and bar_index - slrShortStateBar > slrStateMaxBars
+        slrShortState := false
+bool slrShortZoneOk = useSLRLogic and slrShortState
+
 // ============================================================
 //  【レイヤー3: ロジック別シグナル判定 (足確定を含まないロジック本体)】
 // ------------------------------------------------------------
@@ -3050,6 +3155,42 @@ bool fibCCanShort = fibCBaseShort and shortFibZoneOk
 //   波検出・フィボ範囲・無効条件・反転確認は確定と同一。barstate だけ要求しない。
 bool fibCCanLongRaw  = fibCBaseLong  and longFibZoneRawOk
 bool fibCCanShortRaw = fibCBaseShort and shortFibZoneRawOk
+
+// ------------------------------------------------------------
+//  セッション水平線反発 ロジック本体 (第3ロジック・ショートのみ・出来高/フィボと完全分離)
+// ------------------------------------------------------------
+//  ・時間帯   : アジア + NY (EU対象外。個別セッションinputに非依存の専用条件)
+//  ・環境     : 4Hレンジ / 1H下降 / 15Mレンジ (共通の検出結果 envRaw* を再利用し、
+//               本ロジック専用の要求で判定。グローバル reqTrend* には非依存)
+//  ・日足     : 日足方向OFF / 日足ボラ低ボラ (共通日足分類 drVolTextOut を再利用)
+//  ・場所条件 : セッション水平線 反発 (slrShortZoneOk。専用モジュール・状態3本)
+//  ・SL/TP    : 固定SL12 / RR1.0 (専用リスク幅で Size 算出)
+//  ・環境/Momentum/Trigger/ボラ の重い計算は共通結果を再利用 (トリガー/MomentumはOFFで素通り)
+// SLR 専用 時間帯 (アジア or NY。EUは対象外)
+bool slrSessionOk = not useSessionFilter or inAsia or inNY
+// SLR 専用 環境 (4Hレンジ=0 / 1H下降=-1 / 15Mレンジ=0)。共通検出 envRaw* を再利用・要求は専用固定。
+bool slrEnvShortOk = not useEnvFilter or (envRaw4H == 0 and envRaw1H == -1 and envRaw15M == 0)
+// SLR 専用 日足ボラ (低ボラのみ・方向OFF)。共通 drVolTextOut を再利用。
+bool slrDailyRegimeOk = not useDailyRegimeFilter or drVolTextOut == "低ボラ"
+// SLR 専用 SL / TP (固定SL12・RR1.0・ショートのみ)
+float slrShortStop = close + slrSlFixed
+float slrShortRisk = slrShortStop - close
+float slrShortTP   = close - slrShortRisk * slrRR
+float slrShortQty  = f_qty(slrShortRisk)
+// SLR エントリー条件本体 (ショートのみ・barstate 非含・他ロジックとは独立)
+bool slrCanShort =
+     useSLRLogic and
+     useShort and
+     slrDailyRegimeOk and
+     slrSessionOk and
+     allowByNewsTime and
+     slrEnvShortOk and
+     slrShortZoneOk and
+     allowShortByMomentum and
+     allowShortByTrigger and
+     volOk and
+     slrShortRisk > 0 and
+     slrShortQty >= 1
 
 // ============================================================
 //  出力ヘルパー (価格整形 / alert本文 / ラベル本文)
@@ -3198,6 +3339,23 @@ if not shortFibZoneRawOk
     fibCShortRealtimeProvSetupId  := na
     fibCShortCommittedProvSetupId := na
 
+// ====== セッション水平線反発: セットアップID / 発報済み管理 (ショートのみ・完全独立) ======
+//   セッション水平線反発状態 (slrShortZoneOk) の立ち上がりを新規セットアップとする。
+//   仮と確定は同じ反発機会の共通ID で紐づく。状態OFF(反発無効/期限切れ)でID失効。
+//   ショート専用のため long 系変数は持たない。
+bool slrWantShort = slrCanShort   // ショートのみ (long/short 競合なし)
+var int slrShortActiveSetupId = na
+if slrShortZoneOk and not slrShortZoneOk[1]
+    slrShortActiveSetupId := bar_index
+varip int slrShortRealtimeProvSetupId  = na
+var   int slrShortCommittedProvSetupId = na
+var int   slrShortConfFired            = na
+// セッション水平線反発 破綻 (状態OFF) → ID失効 + 仮抑止クリア
+if not slrShortZoneOk
+    slrShortActiveSetupId        := na
+    slrShortRealtimeProvSetupId  := na
+    slrShortCommittedProvSetupId := na
+
 // ============================================================
 //  【レイヤー6: 共通 ラベル / alert 出力】(優先: フィボC(表示A) > 出来高リジェクト(B))
 // ------------------------------------------------------------
@@ -3208,6 +3366,7 @@ if not shortFibZoneRawOk
 bool vpEnteredLong  = false
 bool vpEnteredShort = false
 bool vpEnterFibC    = false   // 今回の建玉がフィボCか (エントリー後リセットの切替に使用)
+bool vpEnterSLR     = false   // 今回の建玉がセッション水平線反発か (エントリー後リセットの切替に使用)
 bool claimedLong    = false   // 今バー ロング方向を上位ロジックが確保済みか
 bool claimedShort   = false   // 今バー ショート方向を上位ロジックが確保済みか
 int  firedLogicId   = 0       // デバッグ: 今バー 発報/エントリーしたロジック (0=なし)
@@ -3352,7 +3511,44 @@ if shortConf
     firedLogicId := LOGIC_VR_ID
     vpEnteredShort := true
 
-// --- 足確定時: 仮の realtime→committed コミット (両ロジック。足跨ぎ再発報防止) ---
+// ---------- 優先3: セッション水平線反発 (Bランク・ショートのみ) ----------
+//   上位(フィボC/出来高)が同方向を確保済み(claimedShort) / ポジション保有中 なら発報しない。
+bool slrShortReady = is5m and not posActive and slrWantShort and not claimedShort
+// 仮シグナル (足未確定 + 同一セットアップにつき1回。alert のみ)
+bool slrShortProv =
+     slrShortReady and not barstate.isconfirmed and not na(slrShortActiveSetupId) and
+     slrShortActiveSetupId != slrShortRealtimeProvSetupId and
+     slrShortActiveSetupId != slrShortCommittedProvSetupId
+if slrShortProv
+    alert(f_sigMsg("仮", "SHORT", close, slrShortStop, slrShortTP, slrShortQty, LOGIC_SLR_RANK, LOGIC_SLR_NAME, envDirText, drVolTextOut), alert.freq_once_per_bar)
+    slrShortRealtimeProvSetupId := slrShortActiveSetupId
+    claimedShort := true
+    firedLogicId := LOGIC_SLR_ID
+// 確定シグナル (足確定 + 同一セットアップにつき1回。alert + Bランク深緑ラベル + 仮想ポジション開始)
+bool slrShortConf = slrShortReady and barstate.isconfirmed and not na(slrShortActiveSetupId) and slrShortConfFired != slrShortActiveSetupId
+if slrShortConf
+    float _e = close
+    float _sl = slrShortStop
+    float _tp = slrShortTP
+    alert(f_sigMsg("確定", "SHORT", _e, _sl, _tp, slrShortQty, LOGIC_SLR_RANK, LOGIC_SLR_NAME, envDirText, drVolTextOut), alert.freq_once_per_bar)
+    label.new(bar_index, high, f_labelText("SHORT", _e, _sl, _tp, slrShortQty, LOGIC_SLR_RANK, LOGIC_SLR_NAME, envDirText, drVolTextOut), yloc = yloc.abovebar, style = label.style_label_down, color = COLOR_RANK_B, textcolor = color.white, size = size.small)
+    posActive := true
+    posDir := -1
+    posEntry := _e
+    posSL := _sl
+    posTP := _tp
+    posQty := slrShortQty
+    posLogic := LOGIC_SLR_ID
+    posEntryBar := bar_index
+    slrShortConfFired := slrShortActiveSetupId
+    slrShortRealtimeProvSetupId  := slrShortActiveSetupId
+    slrShortCommittedProvSetupId := slrShortActiveSetupId
+    claimedShort := true
+    firedLogicId := LOGIC_SLR_ID
+    vpEnteredShort := true
+    vpEnterSLR := true
+
+// --- 足確定時: 仮の realtime→committed コミット (3ロジック。足跨ぎ再発報防止) ---
 if barstate.isconfirmed
     if not na(longRealtimeProvSetupId)
         longCommittedProvSetupId := longRealtimeProvSetupId
@@ -3362,11 +3558,18 @@ if barstate.isconfirmed
         fibCLongCommittedProvSetupId := fibCLongRealtimeProvSetupId
     if not na(fibCShortRealtimeProvSetupId)
         fibCShortCommittedProvSetupId := fibCShortRealtimeProvSetupId
+    if not na(slrShortRealtimeProvSetupId)
+        slrShortCommittedProvSetupId := slrShortRealtimeProvSetupId
 
 // --- エントリー後 状態リセット ---
+//   セッション水平線反発で入った場合 : この水平線ロジックのショート状態だけをリセット
+//     (出来高/フィボ/FVG/EMA/ストキャス/MACD状態は触らない)。
 //   フィボCで入った場合 : フィボ側の状態だけをリセット (他モジュールは触らない)。
 //   出来高リジェクトで入った場合 : 従来通り (元ストラテジー思想を維持)。
-if vpEnterFibC
+if vpEnterSLR
+    slrShortState    := false
+    slrShortStateBar := na
+else if vpEnterFibC
     if vpEnteredLong and resetFibStateAfterEntry
         longFibStateOk    := false
         longFibStateRawOk := false
@@ -3415,11 +3618,13 @@ else
 string curLogicText =
      firedLogicId == LOGIC_FIB_C_ID ? "フィボC(A)" :
      firedLogicId == LOGIC_VR_ID    ? "出来高リジェクト(B)" :
+     firedLogicId == LOGIC_SLR_ID   ? "セッション水平線反発(B)" :
      posActive and posLogic == LOGIC_FIB_C_ID ? "フィボC(A) 保有" :
      posActive and posLogic == LOGIC_VR_ID    ? "出来高リジェクト(B) 保有" :
+     posActive and posLogic == LOGIC_SLR_ID   ? "セッション水平線反発(B) 保有" :
      "-"
 
-var table dbg = table.new(position.top_right, 2, 31, border_width = 1, frame_color = color.gray, frame_width = 1)
+var table dbg = table.new(position.top_right, 2, 35, border_width = 1, frame_color = color.gray, frame_width = 1)
 f_bMark(bool b) => b ? "○" : "×"
 f_drow(int r, string k, string v) =>
     table.cell(dbg, 0, r, k, text_size = size.tiny, text_color = color.white, text_halign = text.align_left, bgcolor = color.new(color.black, 20))
@@ -3457,6 +3662,10 @@ if barstate.islast
         f_drow(27, "フィボC longQty/shortQty", str.tostring(fibCLongQty, "#.##") + " / " + str.tostring(fibCShortQty, "#.##"))
         f_drow(28, "環境方向",             envDirText)
         f_drow(29, "日足ボラ",             drVolTextOut)
-        f_drow(30, "現在の成立ロジック",    curLogicText)
+        f_drow(30, "SLR 反発Short",        f_bMark(slrShortEvent))
+        f_drow(31, "SLR 状態Short",        f_bMark(slrShortZoneOk))
+        f_drow(32, "SLR canShort",         f_bMark(slrCanShort))
+        f_drow(33, "SLR 仮/確定発報済",     f_bMark(not na(slrShortRealtimeProvSetupId) or not na(slrShortCommittedProvSetupId)) + " / " + f_bMark(not na(slrShortConfFired)))
+        f_drow(34, "現在の成立ロジック",    curLogicText)
     else
-        table.clear(dbg, 0, 0, 1, 30)
+        table.clear(dbg, 0, 0, 1, 34)
