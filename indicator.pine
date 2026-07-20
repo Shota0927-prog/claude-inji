@@ -1571,6 +1571,9 @@ float  slrRR             = 1.0           // リスクリワード
 float  slrZoneWidth      = 0.1           // 反発ゾーン幅 (固定・ATR連動しない)
 int    slrStateMaxBars   = 3             // 状態 有効本数
 int    slrSessionMaxDays = 2             // セッション水平線 有効日数 (当日含む・元ストラテジー lineSessionMaxDays 準拠)
+int    slrMaxZones       = 20            // 最大保持数 (元ストラテジー lineMaxZones 初期値 準拠)
+int    slrMergeAtrLen    = 14            // 統合許容幅 算出用ATR期間 (元ストラテジー lineAtrLen 準拠)
+float  slrMergeToleranceATR = 0.3        // 統合許容幅 ATR倍率 (元ストラテジー reactionToleranceATR 初期値 準拠)
 string slrSessTZ         = "GMT"         // セッションTZ (固定)
 string slrAsiaSess       = "0000-0800"   // セッション定義 (877既定・GMT。固定)
 string slrLondonSess     = "0700-1600"
@@ -1627,10 +1630,12 @@ color COLOR_RANK_C = color.rgb(150, 90, 0)     // Cランク=琥珀/濃橙 (A濃
 // ============================================================
 //  5b-2g. セッション水平線 反発 モジュール (第3ロジック専用・ショートのみ)
 // ============================================================
-// セッション高安トラッカー (var) + レベル配列 (価格 / 作成バー / 作成日ID を同一indexで並列管理)
-var array<float> slrLvl    = array.new_float()
-var array<int>   slrLvlBar = array.new_int()
-var array<int>   slrLvlDay = array.new_int()   // 作成日ID (GMT暦日カウンター。有効日数判定用)
+// セッション高安トラッカー (var) + レベル配列 (価格 / 作成バー / 作成日ID / タッチ回数 を同一indexで並列管理)
+//   slrLvlTouch は元ストラテジー f_lineAddZone の zTouch 相当 (統合時の加重平均に必須)。
+var array<float> slrLvl      = array.new_float()
+var array<int>   slrLvlBar   = array.new_int()
+var array<int>   slrLvlDay   = array.new_int()   // 作成日ID (GMT暦日カウンター。有効日数判定用)
+var array<int>   slrLvlTouch = array.new_int()   // タッチ回数 (統合時の加重平均用。元 zTouch)
 
 // セッション高安トラッカー (専用TZ slrSessTZ 使用 = グローバル lineSessTZ に非依存)
 f_slrSession(string sessStr, float prevHi, float prevLo) =>
@@ -1646,21 +1651,40 @@ f_slrSession(string sessStr, float prevHi, float prevLo) =>
         _lo := na(prevLo) ? low  : math.min(prevLo, low)
     [_hi, _lo, _ended]
 
-// レベル追加 (作成日IDを保存。30本上限は安全上残すが、日数削除を f_calcSLR で先に適用する)
-f_slrPush(float p, int _dayId) =>
+// レベル追加/統合 (元ストラテジー f_lineAddZone と同一の統合方法を再現)。
+//   ・許容幅 _mergeTol 以内に既存水平線があれば統合 (先頭一致のみ)。
+//       価格 = (既存価格 * 旧タッチ回数 + p) / 新タッチ回数  … タッチ回数加重平均 (元 zPrice 更新式そのまま)
+//       タッチ回数 += 1 / 作成日ID = max(既存, 新)  … 再タッチで延命 (元 zSessionDay 更新式そのまま)
+//       ※ 作成バー(slrLvlBar) は統合時に更新しない (元 zCreated と同じく生成時のまま)。
+//   ・許容幅以内が無ければ新規追加。上限 slrMaxZones(20) 超過で最古shift。作成日IDを保存。
+f_slrPush(float p, int _dayId, float _mergeTol) =>
     if not na(p)
-        array.push(slrLvl, p)
-        array.push(slrLvlBar, bar_index)
-        array.push(slrLvlDay, _dayId)
-        if array.size(slrLvl) > 30
-            array.shift(slrLvl)
-            array.shift(slrLvlBar)
-            array.shift(slrLvlDay)
+        bool _found = false
+        if array.size(slrLvl) > 0
+            for i = 0 to array.size(slrLvl) - 1
+                if not _found and math.abs(array.get(slrLvl, i) - p) <= _mergeTol
+                    int _oldT = array.get(slrLvlTouch, i)
+                    int _newT = _oldT + 1
+                    array.set(slrLvl, i, (array.get(slrLvl, i) * _oldT + p) / _newT)
+                    array.set(slrLvlTouch, i, _newT)
+                    array.set(slrLvlDay, i, math.max(array.get(slrLvlDay, i), _dayId))
+                    _found := true
+        if not _found
+            array.push(slrLvl, p)
+            array.push(slrLvlBar, bar_index)
+            array.push(slrLvlDay, _dayId)
+            array.push(slrLvlTouch, 1)
+            if array.size(slrLvl) > slrMaxZones
+                array.shift(slrLvl)
+                array.shift(slrLvlBar)
+                array.shift(slrLvlDay)
+                array.shift(slrLvlTouch)
 
 // --- SLR 本体を関数化 (反発ショート判定は不変) ---
 //   セッション高安トラッカー var は関数ローカルへ。レベル配列 (slrLvl) はグローバル参照。外部参照する slrShortEvent を返す。
 //   _dayCounter = GMT暦日カウンター (関数外で算出して渡す。グローバルスカラーは関数内で書換え不可のため)。
-f_calcSLR(int _dayCounter) =>
+//   _mergeTol   = 統合許容幅 (ATR14 × 0.3。関数外で算出して渡す)。
+f_calcSLR(int _dayCounter, float _mergeTol) =>
     var float slrAsiaHi = na
     var float slrAsiaLo = na
     var float slrLdnHi  = na
@@ -1680,14 +1704,14 @@ f_calcSLR(int _dayCounter) =>
         slrNyHi := _snH
         slrNyLo := _snL
         if _saEnd
-            f_slrPush(slrAsiaHi, _dayCounter)
-            f_slrPush(slrAsiaLo, _dayCounter)
+            f_slrPush(slrAsiaHi, _dayCounter, _mergeTol)
+            f_slrPush(slrAsiaLo, _dayCounter, _mergeTol)
         if _slEnd
-            f_slrPush(slrLdnHi, _dayCounter)
-            f_slrPush(slrLdnLo, _dayCounter)
+            f_slrPush(slrLdnHi, _dayCounter, _mergeTol)
+            f_slrPush(slrLdnLo, _dayCounter, _mergeTol)
         if _snEnd
-            f_slrPush(slrNyHi, _dayCounter)
-            f_slrPush(slrNyLo, _dayCounter)
+            f_slrPush(slrNyHi, _dayCounter, _mergeTol)
+            f_slrPush(slrNyLo, _dayCounter, _mergeTol)
         // 有効日数を超えた古い水平線を削除 (作成日 < 現在日 - (maxDays-1))。判定より先に適用。
         //   元ストラテジーの純セッション水平線 有効日数(当日含む slrSessionMaxDays 日)管理に一致させる。
         if array.size(slrLvl) > 0
@@ -1696,6 +1720,7 @@ f_calcSLR(int _dayCounter) =>
                     array.remove(slrLvl, i)
                     array.remove(slrLvlBar, i)
                     array.remove(slrLvlDay, i)
+                    array.remove(slrLvlTouch, i)
         if array.size(slrLvl) > 0
             for i = 0 to array.size(slrLvl) - 1
                 float _p = array.get(slrLvl, i)
@@ -1713,7 +1738,10 @@ int _slrDayId = year(time, slrSessTZ) * 10000 + month(time, slrSessTZ) * 100 + d
 if not na(_slrDayId[1]) and _slrDayId != _slrDayId[1]
     slrSessDayCounter := slrSessDayCounter + 1
 
-bool slrShortEvent = f_calcSLR(slrSessDayCounter)
+// SLR専用 統合許容幅 = ATR14 × 0.3 (元ストラテジー useLineMergeZone=false 時の lineAtr * reactionToleranceATR 準拠)
+float slrMergeTol = ta.atr(slrMergeAtrLen) * slrMergeToleranceATR
+
+bool slrShortEvent = f_calcSLR(slrSessDayCounter, slrMergeTol)
 
 // 状態管理 (反発イベント後 slrStateMaxBars 本だけ場所条件OKを保持)
 var bool slrShortState    = false
