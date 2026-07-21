@@ -1,0 +1,715 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// ============================================================
+//  4H上昇 専用 統合インジケーター (4H Uptrend Integrated Indicator)
+// ------------------------------------------------------------
+//  「4Hが上昇している環境」の各パターンを 1つずつ logic として追加し、
+//  最終的に 4H上昇専用の統合インジケーターへまとめる。
+//
+//  ・4Hレンジ版 (indicator.pine) とは完全に別ファイル。相互参照しない。
+//  ・strategy() は使わない。実注文は出さない (indicator)。
+//    シグナル表示 (ラベル) と alert のみ。
+//  ・構造・変数管理・シグナル管理の思想は 4Hレンジ版に合わせる。
+//
+//  構成 (今後 logic02, logic03 … を追加できる設計):
+//    1. 共通入力        2. 共通計算        3. 環境認識        4. 日足レジーム
+//    5. ボラ判定        6. 時間帯・指標除外 7. WinZoneモジュール 8. モメンタムモジュール
+//    9. トリガーモジュール 10. ロジック別条件  11. ランク優先処理   12. 競合処理
+//    13. 仮シグナル      14. 確定シグナル     15. 仮想ポジション管理 16. 表示・アラート
+//
+//  === logic01 ===
+//    ・4H:上昇 / 1H:下降 / 15M:下降 / 5M・1M:環境判定に使用しない
+//    ・ランク: Bランク固定 (logic01Rank = "B")
+//    ・添付「5min Engulfing Strategy」の最終エントリー条件のみを移植:
+//        環境 = 4H上昇∧1H下降∧15M下降
+//        日足 = 高ボラ (当日進行中ベース・固定値法・当日累積値幅≥140)
+//        ボラ = 高速ボラ固定値 (直近5本値幅≥10 ∧ 実体平均5本≥0.5)
+//        モメンタム = MACD(8,21,5) ヒスト拡大D (hist>0/<0・3本連続・状態5本)
+//        WinZone/トリガー = 非使用 (元コードで全OFF・非接続)
+//        SL = 固定15 / RR = 1.0 (元設定を維持)
+//  ※ 5分足でのみ 仮/確定シグナル・ラベル・仮想ポジションを有効化。
+// ============================================================
+
+//@version=5
+indicator(
+     title             = "4H Uptrend Integrated Indicator",
+     shorttitle        = "4H-UP",
+     overlay           = true,
+     dynamic_requests  = true,
+     max_bars_back     = 1000,
+     max_labels_count  = 500
+ )
+
+// ============================================================
+//  1. 共通入力
+// ============================================================
+// --- 資金 / リスク (strategy.equity は使えないため input で受ける) ---
+grpCap = "資金 / リスク"
+indicatorCapital = input.float(1000, "計算用資金 (元金・単利)", minval = 0.0, step = 100, group = grpCap)
+riskPct          = input.float(5.0,  "1トレード損失率 (%)", minval = 0.1, step = 0.1, group = grpCap)
+
+// --- エントリー方向 ---
+grpEntry = "エントリー"
+useLong  = input.bool(true, "ロングを有効",   group = grpEntry)
+useShort = input.bool(true, "ショートを有効", group = grpEntry)
+
+// --- 時間帯フィルタ (東京時間 JST) ---
+grpSession = "時間帯フィルタ (東京時間)"
+useSessionFilter = input.bool(true, "時間帯フィルタを使う", group = grpSession)
+useAsiaSession   = input.bool(true, "アジア 09:00-16:00", group = grpSession)
+useEUSession     = input.bool(true, "EU 16:00-21:00",   group = grpSession)
+useNYSession     = input.bool(true, "NY 21:00-翌03:00", group = grpSession)
+
+// --- 指標時間フィルタ (Asia/Tokyo・新規のみ除外) ---
+grpNews = "指標時間フィルタ (Asia/Tokyo)"
+useNewsTimeFilter = input.bool(false, "重要指標時間を除外", group = grpNews)
+newsSession1 = input.session("2130-2230", "指標除外時間1", group = grpNews)
+newsSession2 = input.session("2330-0030", "指標除外時間2", group = grpNews)
+newsSession3 = input.session("0300-0400", "指標除外時間3", group = grpNews)
+
+// --- 仮想ポジション ---
+grpPos = "仮想ポジション"
+useVirtualPositionBlock = input.bool(true, "仮想ポジション保有中は新規シグナルを抑止", group = grpPos)
+
+// ============================================================
+//  3. 環境認識 (入力) — 4Hレンジ版と同一の環境認識ロジック
+// ------------------------------------------------------------
+//  EMA20/50/200・傾き・EMA間距離・収束/拡散・スコア・最低必要スコア・
+//  同点処理・条件不足処理・request.security の時間足・lookahead は
+//  添付ストラテジーから変更しない。
+// ============================================================
+grpTF = "環境: 参照時間足"
+tf4H  = input.timeframe("240", "4H TF",  group = grpTF)
+tf1H  = input.timeframe("60",  "1H TF",  group = grpTF)
+tf15M = input.timeframe("15",  "15M TF", group = grpTF)
+
+grpBull = "環境: 上昇条件 ON/OFF"
+useEma20Above50Up   = input.bool(true, "1. EMA20 > EMA50",       group = grpBull)
+useEma20SlopeUp     = input.bool(true, "2. EMA20 が上向き",       group = grpBull)
+useEma50SlopeUp     = input.bool(true, "3. EMA50 が上向き",       group = grpBull)
+useCloseAboveEma50  = input.bool(true, "4. close > EMA50",       group = grpBull)
+useCloseAboveEma200 = input.bool(true, "5. close > EMA200",      group = grpBull)
+useEmaDistanceWideU = input.bool(true, "6. EMA20/50 距離が広い",  group = grpBull)
+useEmaExpansionU    = input.bool(true, "7. EMA20/50 が拡散中",    group = grpBull)
+
+grpBear = "環境: 下降条件 ON/OFF"
+useEma20Below50Dn   = input.bool(true, "1. EMA20 < EMA50",       group = grpBear)
+useEma20SlopeDown   = input.bool(true, "2. EMA20 が下向き",       group = grpBear)
+useEma50SlopeDown   = input.bool(true, "3. EMA50 が下向き",       group = grpBear)
+useCloseBelowEma50  = input.bool(true, "4. close < EMA50",       group = grpBear)
+useCloseBelowEma200 = input.bool(true, "5. close < EMA200",      group = grpBear)
+useEmaDistanceWideD = input.bool(true, "6. EMA20/50 距離が広い",  group = grpBear)
+useEmaExpansionD    = input.bool(true, "7. EMA20/50 が拡散中",    group = grpBear)
+
+grpRange = "環境: レンジ条件 ON/OFF"
+useEmaDistanceNarrow = input.bool(true, "1. EMA20/50 距離が近い",       group = grpRange)
+useEma20SlopeWeak    = input.bool(true, "2. EMA20 の傾きが弱い",         group = grpRange)
+useEma50SlopeWeak    = input.bool(true, "3. EMA50 の傾きが弱い",         group = grpRange)
+useEmaCompression    = input.bool(true, "4. EMA20/50 が収束中",          group = grpRange)
+useEma20CrossCount   = input.bool(true, "5. 価格が EMA20 を一定回数跨ぐ", group = grpRange)
+useEma50CrossCount   = input.bool(true, "6. 価格が EMA50 を一定回数跨ぐ", group = grpRange)
+useRangeWidthSmall   = input.bool(true, "7. 高値安値幅が小さい",         group = grpRange)
+
+grpParam = "環境: 調整パラメータ"
+len20        = input.int(20,   "EMA20 length",  minval = 1, group = grpParam)
+len50        = input.int(50,   "EMA50 length",  minval = 1, group = grpParam)
+len200       = input.int(200,  "EMA200 length", minval = 1, group = grpParam)
+envAtrLen    = input.int(14,   "環境ATR length", minval = 1, group = grpParam)
+slopeBars    = input.int(3,    "EMA 傾き判定本数", minval = 1, group = grpParam)
+slopeMinMult = input.float(0.15, "EMA 傾きの最低値 ATR倍率",       minval = 0, step = 0.01, group = grpParam)
+distWideMult = input.float(0.50, "EMA20/50 距離 広い判定 ATR倍率", minval = 0, step = 0.01, group = grpParam)
+distNarrowMult = input.float(0.25, "EMA20/50 距離 近い判定 ATR倍率", minval = 0, step = 0.01, group = grpParam)
+convDivBars  = input.int(5,    "収束/拡散 判定本数",   minval = 1, group = grpParam)
+crossBars    = input.int(20,   "EMA跨ぎ回数 判定本数", minval = 1, group = grpParam)
+crossMinCount = input.int(3,   "EMA跨ぎ回数 最低回数", minval = 1, group = grpParam)
+rangeBars    = input.int(20,   "レンジ幅 判定本数",    minval = 1, group = grpParam)
+rangeMult    = input.float(1.5, "レンジ幅 ATR倍率",    minval = 0, step = 0.1, group = grpParam)
+
+grpJudge = "環境: 判定ルール"
+tieAsRange          = input.bool(true, "同点時にレンジ扱いする",     group = grpJudge)
+insufficientAsRange = input.bool(true, "条件不足時にレンジ扱いする", group = grpJudge)
+minScore4H  = input.int(3, "4H 最低必要スコア",  minval = 1, group = grpJudge)
+minScore1H  = input.int(3, "1H 最低必要スコア",  minval = 1, group = grpJudge)
+minScore15M = input.int(3, "15M 最低必要スコア", minval = 1, group = grpJudge)
+
+// ============================================================
+//  4. 日足レジーム (入力) — 分類のみ行い、各ロジックが要求レジームを判定
+// ============================================================
+grpDailyRegime = "日足レジーム"
+useDailyRegimeFilter = input.bool(true, "日足レジームフィルターを使う", group = grpDailyRegime)
+dailyRegimeMode = input.string("当日進行中ベース", "日足レジーム判定モード", options = ["前日確定ベース", "当日進行中ベース", "当日確定後分析"], group = grpDailyRegime, tooltip = "前日確定ベース=確定済み前日日足で翌日を制限 (非リペイント)。当日進行中ベース=当日始値からその足までの累積値幅で分類 (未来参照なし・非リペイント・エントリー接続)。当日確定後分析=完成日足の事後分類 (エントリー制限には使用しない・表示専用)。")
+dailyVolatilityMethod = input.string("固定値", "日足ボラ分類方法", options = ["パーセンタイル", "ATR比率", "固定値"], group = grpDailyRegime)
+dailyVolLookback    = input.int(252, "日足ボラ分布 参照日数", minval = 30, group = grpDailyRegime)
+dailyLowPercentile  = input.float(33.0, "低ボラ上限パーセンタイル", minval = 1, maxval = 49, step = 1, group = grpDailyRegime)
+dailyHighPercentile = input.float(67.0, "高ボラ下限パーセンタイル", minval = 51, maxval = 99, step = 1, group = grpDailyRegime)
+dailyAtrLen       = input.int(14, "日足ATR期間", minval = 1, group = grpDailyRegime)
+dailyLowAtrRatio  = input.float(0.80, "低ボラ上限 日足値幅÷ATR", minval = 0.1, step = 0.05, group = grpDailyRegime)
+dailyHighAtrRatio = input.float(1.20, "高ボラ下限 日足値幅÷ATR", minval = 0.1, step = 0.05, group = grpDailyRegime)
+dailyLowRangeMax  = input.float(80,  "低ボラ上限値幅($)", minval = 0, step = 0.1, group = grpDailyRegime)
+dailyHighRangeMin = input.float(140, "高ボラ下限値幅($)", minval = 0, step = 0.1, group = grpDailyRegime)
+dailyDirectionBodyRatio = input.float(0.40, "日足方向 最低実体率", minval = 0, maxval = 1, step = 0.05, group = grpDailyRegime)
+dailyBullCloseLocation  = input.float(0.65, "日足上昇 終値位置下限", minval = 0, maxval = 1, step = 0.05, group = grpDailyRegime)
+dailyBearCloseLocation  = input.float(0.35, "日足下降 終値位置上限", minval = 0, maxval = 1, step = 0.05, group = grpDailyRegime)
+dailyInsufficientAsRange = input.bool(true, "日足データ不足時はレンジ扱い", group = grpDailyRegime)
+
+// ============================================================
+//  5. ボラ判定 (入力) — 通常ボラ / 高速ボラ
+// ============================================================
+grpVol = "ボラフィルタ"
+volMode  = input.string("OFF", "通常ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = grpVol)
+fixedMin = input.float(1.0, "最低レンジ (価格・固定値)", minval = 0.0, step = 0.1, group = grpVol)
+atrLenBase   = input.int(14, "基準ATR本数", minval = 1, group = grpVol)
+atrTf        = input.timeframe("", "基準ATR時間足(空=チャート)", group = grpVol)
+useMinVol    = input.bool(true,  "低ボラ時はエントリー禁止", group = grpVol)
+minAtrDollar = input.float(1.5,  "最低ATR($)", minval = 0.0, step = 0.1, group = grpVol)
+volModeRel   = input.bool(false, "低ボラ判定を相対ATRにする", group = grpVol)
+volAvgLen    = input.int(480,    "ATR平均本数", minval = 10, group = grpVol)
+volRatioMin  = input.float(0.9,  "ATR ÷ ATR平均 最低比", minval = 0.1, step = 0.05, group = grpVol)
+fastVolMode  = input.string("固定値", "高速ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = grpVol)
+fastAtrLen   = input.int(5,      "fastATR/値幅 参照本数", minval = 1, group = grpVol)
+fastAtrMin   = input.float(2.2,  "fastATR最低($) ※ATR時", step = 0.1, group = grpVol)
+fastFixedMin = input.float(10.0, "直近値幅 最低($) ※固定値時", minval = 0.0, step = 0.1, group = grpVol)
+bodyAvgLen   = input.int(5,      "実体平均本数", minval = 1, group = grpVol)
+bodyAvgMin   = input.float(0.5,  "実体平均最低($)", step = 0.1, group = grpVol)
+useRangeRatioFilter = input.bool(true, "fastATR ÷ RangeWidth を使う ※ATR時", group = grpVol)
+rangeLookback       = input.int(20,    "RangeWidth参照本数", minval = 2, group = grpVol)
+atrRangeRatioMin    = input.float(0.06, "fastATR ÷ RangeWidth 最低比", step = 0.01, group = grpVol)
+useVolCooldown  = input.bool(false, "低ボラ解除後の待機を使う", group = grpVol)
+volRecoveryBars = input.int(2,      "低ボラ解除後の待機本数", minval = 1, group = grpVol)
+
+// ============================================================
+//  8. モメンタム (入力) — MACD (logic01 が使用する唯一の接続モメンタム)
+// ============================================================
+grpMACD = "Momentum: MACD"
+useMACDModule      = input.bool(true, "MACDモジュールを使う", group = grpMACD)
+macdFastLen        = input.int(8,  "Fast EMA",   minval = 1, group = grpMACD)
+macdSlowLen        = input.int(21, "Slow EMA",   minval = 1, group = grpMACD)
+macdSignalLen      = input.int(5,  "Signal EMA", minval = 1, group = grpMACD)
+useMACDHistDirectionFilter = input.bool(true, "Hist位置フィルター (hist>0/<0)", group = grpMACD)
+macdHistExpansionBars = input.int(3, "Hist拡大 連続本数", minval = 1, group = grpMACD)
+useMACDStateWindow = input.bool(true, "MACD状態管理を使う", group = grpMACD)
+macdStateMaxBars   = input.int(5, "MACD状態 有効本数", minval = 1, group = grpMACD)
+resetMACDStateAfterEntry = input.bool(true, "エントリー後MACD状態をリセット", group = grpMACD)
+
+// ============================================================
+//  2. 共通計算
+// ============================================================
+bool is5m = timeframe.isminutes and timeframe.multiplier == 5
+
+// 資金 → 損失許容額 → 整数ロット (1未満はエントリー不可)
+float riskCapital = indicatorCapital * riskPct / 100.0
+f_qty(float riskPerUnit) =>
+    float raw = riskPerUnit > 0 ? riskCapital / (riskPerUnit * syminfo.pointvalue) : 0.0
+    math.floor(raw)
+
+// 出力ヘルパー (4Hレンジ版と同一形式)
+f_fmtP(float p) => str.tostring(p, format.mintick)
+f_fmtSize(float s) => str.tostring(s, "#.##")
+f_rankText(string r) => r + "ランク"
+
+f_sigMsg(string state, string dir, string rankText, string logicName, float entry, float sl, float tp, float sz, string volT) =>
+    "【" + (state == "仮" ? "仮シグナル" : "確定シグナル") + "】\n" +
+     "状態: " + state + "\n" +
+     dir + "\n" +
+     f_rankText(rankText) + "\n" +
+     logicName + "\n" +
+     "Entry: " + f_fmtP(entry) + "\n" +
+     "SL: " + f_fmtP(sl) + "\n" +
+     "TP: " + f_fmtP(tp) + "\n" +
+     "Size: " + f_fmtSize(sz) + "\n" +
+     "日足ボラ: " + volT
+
+f_labelText(string dir, string rankText, string logicName, float entry, float sl, float tp, float sz, string volT) =>
+    "確定\n" + dir + "\n" +
+     f_rankText(rankText) + "\n" +
+     logicName + "\n" +
+     "Entry: " + f_fmtP(entry) + "\n" +
+     "SL: " + f_fmtP(sl) + "\n" +
+     "TP: " + f_fmtP(tp) + "\n" +
+     "Size: " + f_fmtSize(sz) + "\n" +
+     "日足ボラ: " + volT
+
+// ランク色 (A>B>C。将来のロジック追加を見越して3色用意)
+color COLOR_RANK_A = color.rgb(25, 70, 140)    // Aランク=濃紺
+color COLOR_RANK_B = color.rgb(0, 100, 0)      // Bランク=深緑 (4Hレンジ版と同一)
+color COLOR_RANK_C = color.rgb(150, 90, 0)     // Cランク=琥珀
+
+// ============================================================
+//  3. 環境認識 (計算) — f_envTrend は添付ストラテジーから不変
+// ============================================================
+f_envTrend(int minScore) =>
+    ema20  = ta.ema(close, len20)
+    ema50  = ta.ema(close, len50)
+    ema200 = ta.ema(close, len200)
+    atr    = ta.atr(envAtrLen)
+
+    dist     = math.abs(ema20 - ema50)
+    distPrev = dist[convDivBars]
+    slope20  = ema20 - ema20[slopeBars]
+    slope50  = ema50 - ema50[slopeBars]
+
+    cr20 = ta.crossover(close, ema20) or ta.crossunder(close, ema20)
+    cr50 = ta.crossover(close, ema50) or ta.crossunder(close, ema50)
+    cnt20 = math.sum(cr20 ? 1.0 : 0.0, crossBars)
+    cnt50 = math.sum(cr50 ? 1.0 : 0.0, crossBars)
+
+    rangeWidth = ta.highest(high, rangeBars) - ta.lowest(low, rangeBars)
+
+    bullScore = 0
+    bullScore += useEma20Above50Up   and ema20 > ema50                     ? 1 : 0
+    bullScore += useEma20SlopeUp      and slope20 >=  atr * slopeMinMult    ? 1 : 0
+    bullScore += useEma50SlopeUp      and slope50 >=  atr * slopeMinMult    ? 1 : 0
+    bullScore += useCloseAboveEma50   and close > ema50                     ? 1 : 0
+    bullScore += useCloseAboveEma200  and close > ema200                    ? 1 : 0
+    bullScore += useEmaDistanceWideU  and ema20 > ema50 and dist >= atr * distWideMult ? 1 : 0
+    bullScore += useEmaExpansionU     and ema20 > ema50 and dist > distPrev            ? 1 : 0
+
+    bearScore = 0
+    bearScore += useEma20Below50Dn   and ema20 < ema50                     ? 1 : 0
+    bearScore += useEma20SlopeDown    and slope20 <= -atr * slopeMinMult    ? 1 : 0
+    bearScore += useEma50SlopeDown    and slope50 <= -atr * slopeMinMult    ? 1 : 0
+    bearScore += useCloseBelowEma50   and close < ema50                     ? 1 : 0
+    bearScore += useCloseBelowEma200  and close < ema200                    ? 1 : 0
+    bearScore += useEmaDistanceWideD  and ema20 < ema50 and dist >= atr * distWideMult ? 1 : 0
+    bearScore += useEmaExpansionD     and ema20 < ema50 and dist > distPrev            ? 1 : 0
+
+    rangeScore = 0
+    rangeScore += useEmaDistanceNarrow and dist <= atr * distNarrowMult              ? 1 : 0
+    rangeScore += useEma20SlopeWeak     and math.abs(slope20) <= atr * slopeMinMult  ? 1 : 0
+    rangeScore += useEma50SlopeWeak     and math.abs(slope50) <= atr * slopeMinMult  ? 1 : 0
+    rangeScore += useEmaCompression     and dist < distPrev                          ? 1 : 0
+    rangeScore += useEma20CrossCount    and cnt20 >= crossMinCount                    ? 1 : 0
+    rangeScore += useEma50CrossCount    and cnt50 >= crossMinCount                    ? 1 : 0
+    rangeScore += useRangeWidthSmall    and rangeWidth <= atr * rangeMult             ? 1 : 0
+
+    maxScore = math.max(bullScore, math.max(bearScore, rangeScore))
+    isBullTop  = bullScore == maxScore
+    isBearTop  = bearScore == maxScore
+    isRangeTop = rangeScore == maxScore
+    topCount   = (isBullTop ? 1 : 0) + (isBearTop ? 1 : 0) + (isRangeTop ? 1 : 0)
+    tie        = topCount > 1
+
+    int trend = maxScore < minScore ? (insufficientAsRange ? 0 : na) :
+                 tie                 ? (tieAsRange ? 0 : na) :
+                 isBullTop           ? 1 :
+                 isBearTop           ? -1 :
+                 0
+    trend
+
+f_trendText(int c) => c == 1 ? "上昇" : c == 0 ? "レンジ" : c == -1 ? "下降" : "-"
+
+// 共有 環境トレンド (logic01 は 4H/1H/15M のみ使用。TF/lookahead は不変)
+int env4H  = request.security(syminfo.tickerid, tf4H,  f_envTrend(minScore4H),  lookahead = barmerge.lookahead_off)
+int env1H  = request.security(syminfo.tickerid, tf1H,  f_envTrend(minScore1H),  lookahead = barmerge.lookahead_off)
+int env15M = request.security(syminfo.tickerid, tf15M, f_envTrend(minScore15M), lookahead = barmerge.lookahead_off)
+
+// ============================================================
+//  4. 日足レジーム (計算) — 分類のみ (drVolTextOut / drDirTextOut を出力)
+// ============================================================
+f_dailyDirectionText(int code) => code == 1 ? "上昇" : code == -1 ? "下降" : code == 0 ? "レンジ" : "-"
+f_dailyVolatilityText(int code) => code == 1 ? "高ボラ" : code == -1 ? "低ボラ" : code == 0 ? "中ボラ" : "-"
+
+f_drDirCode(float o, float h, float l, float c) =>
+    float _rng = h - l
+    int _code = na
+    if not na(o) and not na(h) and not na(l) and not na(c) and _rng > 0
+        float _body = math.abs(c - o)
+        float _bodyRatio = _body / _rng
+        float _closeLoc = (c - l) / _rng
+        bool _bull = c > o and _bodyRatio >= dailyDirectionBodyRatio and _closeLoc >= dailyBullCloseLocation
+        bool _bear = c < o and _bodyRatio >= dailyDirectionBodyRatio and _closeLoc <= dailyBearCloseLocation
+        _code := _bull and not _bear ? 1 : _bear and not _bull ? -1 : 0
+    _code
+
+f_drVolCode(float rng, float atr, float loThr, float hiThr) =>
+    int _code = na
+    bool _valid = not na(rng) and rng > 0
+    if dailyVolatilityMethod == "パーセンタイル"
+        if _valid and not na(loThr) and not na(hiThr) and hiThr >= loThr
+            _code := rng >= hiThr ? 1 : rng <= loThr ? -1 : 0
+    else if dailyVolatilityMethod == "ATR比率"
+        if _valid and not na(atr) and atr > 0
+            float _ratio = rng / atr
+            float _lo = math.min(dailyLowAtrRatio, dailyHighAtrRatio)
+            float _hi = math.max(dailyLowAtrRatio, dailyHighAtrRatio)
+            _code := _ratio >= _hi ? 1 : _ratio <= _lo ? -1 : 0
+    else
+        if _valid
+            float _lo = math.min(dailyLowRangeMax, dailyHighRangeMin)
+            float _hi = math.max(dailyLowRangeMax, dailyHighRangeMin)
+            _code := rng >= _hi ? 1 : rng < _lo ? -1 : 0
+    _code
+
+f_drDailyTuple() =>
+    float _o = open
+    float _h = high
+    float _l = low
+    float _c = close
+    float _a = ta.atr(dailyAtrLen)
+    float _r = _h - _l
+    float _loThr = na
+    float _hiThr = na
+    if dailyVolatilityMethod == "パーセンタイル"
+        _loThr := ta.percentile_linear_interpolation(_r, dailyVolLookback, dailyLowPercentile)[1]
+        _hiThr := ta.percentile_linear_interpolation(_r, dailyVolLookback, dailyHighPercentile)[1]
+    [_o, _h, _l, _c, _a, _r, _loThr, _hiThr, _o[1], _h[1], _l[1], _c[1], _a[1], _r[1], _loThr[1], _hiThr[1]]
+
+// --- 日足レジーム本体 (方向/ボラ分類・モード・データ不足処理は添付ストラテジーと同一) ---
+f_calcDailyRegime() =>
+    int    drDirCodeAdj = na
+    int    drVolCodeAdj = na
+    string drDirTextOut = "-"
+    string drVolTextOut = "-"
+    if useDailyRegimeFilter
+        [_o0, _h0, _l0, _c0, _a0, _r0, _loT0, _hiT0, _o1, _h1, _l1, _c1, _a1, _r1, _loT1, _hiT1] = request.security(syminfo.tickerid, "D", f_drDailyTuple(), lookahead = barmerge.lookahead_off)
+
+        var float drCurDayOpen = na
+        var float drCurDayHigh = na
+        var float drCurDayLow  = na
+        bool drNewDay = ta.change(time("D")) != 0
+        bool drDayReset = drNewDay or na(drCurDayHigh)
+        drCurDayOpen := drDayReset ? open : drCurDayOpen
+        drCurDayHigh := drDayReset ? high : math.max(drCurDayHigh, high)
+        drCurDayLow  := drDayReset ? low  : math.min(drCurDayLow, low)
+        float drIntradayRange = drCurDayHigh - drCurDayLow
+
+        bool drUsePrev  = dailyRegimeMode == "前日確定ベース"
+        bool drUseIntra = dailyRegimeMode == "当日進行中ベース"
+
+        float drO = drUsePrev ? _o1 : drUseIntra ? drCurDayOpen : _o0
+        float drH = drUsePrev ? _h1 : drUseIntra ? drCurDayHigh : _h0
+        float drL = drUsePrev ? _l1 : drUseIntra ? drCurDayLow  : _l0
+        float drC = drUsePrev ? _c1 : drUseIntra ? close        : _c0
+
+        float drRange   = drUsePrev ? _r1 : drUseIntra ? drIntradayRange : _r0
+        float drDailyATR = drUsePrev ? _a1 : drUseIntra ? _a1 : _a0
+        float drLoThr = drUsePrev ? _loT1 : _loT0
+        float drHiThr = drUsePrev ? _hiT1 : _hiT0
+
+        int drDirCode = f_drDirCode(drO, drH, drL, drC)
+        int drVolCode = f_drVolCode(drRange, drDailyATR, drLoThr, drHiThr)
+        bool drDirInsufficient = na(drDirCode)
+        bool drVolInsufficient = na(drVolCode)
+        drDirCodeAdj := drDirInsufficient ? (dailyInsufficientAsRange ? 0 : na) : drDirCode
+        drVolCodeAdj := drVolInsufficient ? (dailyInsufficientAsRange ? 0 : na) : drVolCode
+        drDirTextOut := f_dailyDirectionText(drDirCodeAdj)
+        drVolTextOut := f_dailyVolatilityText(drVolCodeAdj)
+    [drDirTextOut, drVolTextOut]
+
+[drDirTextOut, drVolTextOut] = f_calcDailyRegime()
+
+// ============================================================
+//  5. ボラ判定 (計算) — 添付ストラテジーと同一
+// ============================================================
+f_calcVolatility() =>
+    bool baseVolOk = true
+    if volMode == "ATR"
+        float baseAtr = atrTf == "" ? ta.atr(atrLenBase) : request.security(syminfo.tickerid, atrTf, ta.atr(atrLenBase)[1], lookahead = barmerge.lookahead_off)
+        float atrAvg  = ta.sma(baseAtr, volAvgLen)
+        bool volAbsOk = baseAtr >= minAtrDollar
+        bool volRelOk = atrAvg > 0 and baseAtr >= atrAvg * volRatioMin
+        baseVolOk := not useMinVol or (volModeRel ? volRelOk : volAbsOk)
+    else if volMode == "固定値"
+        baseVolOk := (high - low) >= fixedMin
+
+    bool fastVolPass = true
+    if fastVolMode == "ATR"
+        float fastAtr = ta.atr(fastAtrLen)
+        float bodyAvgFast = ta.sma(math.abs(close - open), bodyAvgLen)
+        float rangeWidthV = ta.highest(high, rangeLookback) - ta.lowest(low, rangeLookback)
+        float atrRangeRatio = rangeWidthV > 0 ? fastAtr / rangeWidthV : 0.0
+        bool fastAtrOk    = fastAtr >= fastAtrMin
+        bool bodyAvgOk    = bodyAvgFast >= bodyAvgMin
+        bool rangeRatioOk = not useRangeRatioFilter or atrRangeRatio >= atrRangeRatioMin
+        fastVolPass := fastAtrOk and bodyAvgOk and rangeRatioOk
+    else if fastVolMode == "固定値"
+        float fastRange = ta.highest(high, fastAtrLen) - ta.lowest(low, fastAtrLen)
+        float bodyAvgFast = ta.sma(math.abs(close - open), bodyAvgLen)
+        bool fastRangeOk = fastRange >= fastFixedMin
+        bool bodyAvgOk   = bodyAvgFast >= bodyAvgMin
+        fastVolPass := fastRangeOk and bodyAvgOk
+
+    bool volPassRaw = baseVolOk and fastVolPass
+    bool volLowNow  = not volPassRaw
+    var int volRecoveryStartBar = na
+    if volLowNow
+        volRecoveryStartBar := na
+    if not volLowNow and nz(volLowNow[1], false)
+        volRecoveryStartBar := bar_index
+    bool volRecoveryOk = not useVolCooldown or na(volRecoveryStartBar) or (bar_index - volRecoveryStartBar) >= volRecoveryBars
+    volPassRaw and volRecoveryOk
+
+bool volOk = f_calcVolatility()
+
+// ============================================================
+//  6. 時間帯・指標除外 (計算)
+// ============================================================
+int  jstHour   = hour(time, "Asia/Tokyo")
+bool inAsia    = jstHour >= 9  and jstHour < 16
+bool inEU      = jstHour >= 16 and jstHour < 21
+bool inNY      = jstHour >= 21 or  jstHour < 3
+bool sessionOk =
+     not useSessionFilter or
+     (useAsiaSession and inAsia) or
+     (useEUSession   and inEU) or
+     (useNYSession   and inNY)
+
+bool inNewsSession1 = not na(time(timeframe.period, newsSession1, "Asia/Tokyo"))
+bool inNewsSession2 = not na(time(timeframe.period, newsSession2, "Asia/Tokyo"))
+bool inNewsSession3 = not na(time(timeframe.period, newsSession3, "Asia/Tokyo"))
+bool inNewsTime = inNewsSession1 or inNewsSession2 or inNewsSession3
+bool allowByNewsTime = not useNewsTimeFilter or not inNewsTime
+
+// ============================================================
+//  7. WinZoneモジュール (logic01 は非使用 = 常時許可)
+// ------------------------------------------------------------
+//  添付ストラテジーは WinZone を全てOFF (AND結合で常時true) のため、
+//  logic01 の場所条件は「なし」。将来ロジックが場所条件を使う場合は
+//  ここに FVG/出来高/フィボ/EMA/水平線 モジュールを追加する。
+// ============================================================
+bool longWinZoneOk  = true
+bool shortWinZoneOk = true
+
+// ============================================================
+//  8. モメンタムモジュール (計算) — MACD ヒスト拡大D (logic01 が使用)
+// ------------------------------------------------------------
+//  添付ストラテジーで接続されている唯一のモメンタム:
+//    MACD(8,21,5) の Hist拡大D。BUY = hist>0 かつ 3本連続で拡大、
+//    SELL = hist<0 かつ 3本連続で縮小 (Hist位置フィルターはこれと整合)。
+//  イベント後 macdStateMaxBars(5) 本だけ状態を保持。エントリー後リセット。
+// ============================================================
+f_calcMACDMomentum() =>
+    bool _long  = false
+    bool _short = false
+    if useMACDModule
+        [_line, _sig, _hist] = ta.macd(close, macdFastLen, macdSlowLen, macdSignalLen)
+        bool _bullExpand = _hist > 0 and _hist > _hist[1]
+        bool _bearExpand = _hist < 0 and _hist < _hist[1]
+        var int _bullCnt = 0
+        var int _bearCnt = 0
+        _bullCnt := _bullExpand ? _bullCnt + 1 : 0
+        _bearCnt := _bearExpand ? _bearCnt + 1 : 0
+        bool _bullOk = _bullCnt >= macdHistExpansionBars
+        bool _bearOk = _bearCnt >= macdHistExpansionBars
+        bool _dirBuy  = not useMACDHistDirectionFilter or _hist > 0
+        bool _dirSell = not useMACDHistDirectionFilter or _hist < 0
+        _long  := _bullOk and _dirBuy
+        _short := _bearOk and _dirSell
+    [_long, _short]
+
+[macdMomLongEvent, macdMomShortEvent] = f_calcMACDMomentum()
+
+var bool longMACDStateOk  = false
+var bool shortMACDStateOk = false
+var int  longMACDStateBar  = na
+var int  shortMACDStateBar = na
+if useMACDModule and useMACDStateWindow
+    longMACDStateBar  := macdMomLongEvent  ? bar_index : longMACDStateBar
+    shortMACDStateBar := macdMomShortEvent ? bar_index : shortMACDStateBar
+    longMACDStateOk   := (longMACDStateOk  or macdMomLongEvent)  and (na(longMACDStateBar)  or not (bar_index - longMACDStateBar  > macdStateMaxBars))
+    shortMACDStateOk  := (shortMACDStateOk or macdMomShortEvent) and (na(shortMACDStateBar) or not (bar_index - shortMACDStateBar > macdStateMaxBars))
+
+bool allowLongByMomentum  = not useMACDModule ? true : useMACDStateWindow ? longMACDStateOk  : macdMomLongEvent
+bool allowShortByMomentum = not useMACDModule ? true : useMACDStateWindow ? shortMACDStateOk : macdMomShortEvent
+
+// ============================================================
+//  9. トリガーモジュール (logic01 は非使用 = 常時許可)
+// ------------------------------------------------------------
+//  添付ストラテジーは全トリガーOFF (enabledTrigCount=0 → 常時true)。
+//  logic01 はトリガー条件を持たない。将来ロジックが価格アクショントリガー
+//  (包み足/ピンバー/BOS/EMAリジェクト等) を使う場合はここに追加する。
+// ============================================================
+bool allowLongByTrigger  = true
+bool allowShortByTrigger = true
+
+// ============================================================
+//  10. ロジック別条件 — logic01
+// ------------------------------------------------------------
+//  4H:上昇 / 1H:下降 / 15M:下降 / 5M・1M:環境判定に使用しない / ランク:B固定
+// ============================================================
+bool   logic01Enabled = true
+string logic01Rank    = "B"
+string logic01Name    = "4H上昇 / 1H下降 / 15M下降"
+
+// SL / RR (添付ストラテジーの設定を維持: 固定SL15 / RR1.0)
+float logic01SlFixed = 15.0
+float logic01RR      = 1.0
+
+// 環境条件 (ロング/ショート共有 = 元コードで envLongOk == envShortOk)
+bool logic01EnvLong  = not na(env4H) and not na(env1H) and not na(env15M) and env4H == 1 and env1H == -1 and env15M == -1
+bool logic01EnvShort = logic01EnvLong
+
+// 日足レジーム条件 (高ボラ要求。方向はOFF=制限なし)
+bool logic01DailyOk = not useDailyRegimeFilter or drVolTextOut == "高ボラ"
+
+// SL / TP / ロット
+float logic01LongStop  = close - logic01SlFixed
+float logic01LongRisk  = close - logic01LongStop
+float logic01LongTP    = close + logic01LongRisk * logic01RR
+float logic01ShortStop = close + logic01SlFixed
+float logic01ShortRisk = logic01ShortStop - close
+float logic01ShortTP   = close - logic01ShortRisk * logic01RR
+float logic01LongQty   = f_qty(logic01LongRisk)
+float logic01ShortQty  = f_qty(logic01ShortRisk)
+
+// セットアップ (場所条件+モメンタム+トリガー。logic01 は WinZone/トリガー非使用のため実質モメンタム)
+bool logic01SetupLong  = longWinZoneOk  and allowLongByMomentum  and allowLongByTrigger
+bool logic01SetupShort = shortWinZoneOk and allowShortByMomentum and allowShortByTrigger
+
+// 最終条件 (添付ストラテジー canLong / canShort を忠実に再現。WinZone/トリガーは常時true)
+bool logic01FinalLong =
+     logic01Enabled and
+     useLong and
+     logic01DailyOk and
+     sessionOk and
+     allowByNewsTime and
+     logic01EnvLong and
+     logic01SetupLong and
+     volOk and
+     logic01LongRisk > 0 and
+     logic01LongQty >= 1
+bool logic01FinalShort =
+     logic01Enabled and
+     useShort and
+     logic01DailyOk and
+     sessionOk and
+     allowByNewsTime and
+     logic01EnvShort and
+     logic01SetupShort and
+     volOk and
+     logic01ShortRisk > 0 and
+     logic01ShortQty >= 1
+
+// ============================================================
+//  11. ランク優先処理 (A > B > C)
+// ------------------------------------------------------------
+//  各ロジックから直接ラベル/alertを出さず、一度共通の採用シグナルへ集約する。
+//  同方向で複数ロジックが成立した場合は最上位ランクを採用し、同ランクは
+//  ロジック番号の若い順を優先する (4Hレンジ版の優先順位仕様に準拠)。
+//  ※ 今回は logic01 のみ。将来 logic02, logic03 … を候補配列に追加する。
+// ============================================================
+f_rankNum(string r) => r == "A" ? 3 : r == "B" ? 2 : r == "C" ? 1 : 0
+
+// --- ロング候補の集約 ---
+bool   selLong      = false
+string selLongRank  = ""
+string selLongName  = ""
+float  selLongStop  = na
+float  selLongTP    = na
+float  selLongQty   = na
+int    _selLongRankNum = 0
+// logic01
+if logic01FinalLong and f_rankNum(logic01Rank) > _selLongRankNum
+    selLong        := true
+    selLongRank    := logic01Rank
+    selLongName    := logic01Name
+    selLongStop    := logic01LongStop
+    selLongTP      := logic01LongTP
+    selLongQty     := logic01LongQty
+    _selLongRankNum := f_rankNum(logic01Rank)
+// (logic02 以降はここへ同形式で追加)
+
+// --- ショート候補の集約 ---
+bool   selShort      = false
+string selShortRank  = ""
+string selShortName  = ""
+float  selShortStop  = na
+float  selShortTP    = na
+float  selShortQty   = na
+int    _selShortRankNum = 0
+// logic01
+if logic01FinalShort and f_rankNum(logic01Rank) > _selShortRankNum
+    selShort        := true
+    selShortRank    := logic01Rank
+    selShortName    := logic01Name
+    selShortStop    := logic01ShortStop
+    selShortTP      := logic01ShortTP
+    selShortQty     := logic01ShortQty
+    _selShortRankNum := f_rankNum(logic01Rank)
+// (logic02 以降はここへ同形式で追加)
+
+// ============================================================
+//  12. 競合処理 — 同一足で BUY と SELL が両成立 → NoTrade
+// ============================================================
+bool selectedLong  = selLong
+bool selectedShort = selShort
+if selLong and selShort
+    selectedLong  := false
+    selectedShort := false
+
+// ============================================================
+//  15. 仮想ポジション管理 (実注文なし。連続シグナル抑止用)
+// ------------------------------------------------------------
+//  ・採用シグナル発生時に仮想ポジション開始 (固定SL・RRからTP)。
+//  ・BUY/SELL とも high/low で SL/TP 到達判定。同一足で両到達は SL 優先。
+//  ・保有中の新規抑止は useVirtualPositionBlock で ON/OFF。
+//  ・決済後は次のシグナルを許可。ピラミッディングなし (1ポジション)。
+//  ・将来ロジック別管理へ拡張可能 (posLogicName でどのロジックの建玉かを保持)。
+// ============================================================
+var bool   posActive   = false
+var int    posDir      = 0
+var float  posSL       = na
+var float  posTP       = na
+var int    posEntryBar = na
+var string posLogicName = ""
+
+// 決済監視 (シグナル判定より前。次バー以降・同一足SL/TP両到達はSL優先)
+if posActive and not na(posEntryBar) and bar_index > posEntryBar
+    if posDir == 1
+        if low <= posSL
+            posActive := false
+        else if high >= posTP
+            posActive := false
+    else if posDir == -1
+        if high >= posSL
+            posActive := false
+        else if low <= posTP
+            posActive := false
+
+// 新規受付可否 (抑止ON時は非保有のみ許可)
+bool canOpenNew = not useVirtualPositionBlock or not posActive
+
+// ============================================================
+//  13/14/16. 仮シグナル / 確定シグナル / 表示・アラート
+// ------------------------------------------------------------
+//  ・仮シグナル  : リアルタイム足の確定前。alert のみ (足内1回 = freq_once_per_bar)。
+//                  条件が消えれば確定シグナルは出ない (確定は足確定時に再評価)。
+//  ・確定シグナル: 足確定時に採用シグナルが成立していれば alert + ラベル (足1回)。
+//                  仮シグナルが出ていなくても、確定時に初成立なら許可。
+//  ・5分足でのみ有効。
+// ============================================================
+bool provLong  = is5m and not barstate.isconfirmed and canOpenNew and selectedLong
+bool provShort = is5m and not barstate.isconfirmed and canOpenNew and selectedShort
+if provLong
+    alert(f_sigMsg("仮", "BUY",  selLongRank,  selLongName,  close, selLongStop,  selLongTP,  selLongQty,  drVolTextOut), alert.freq_once_per_bar)
+if provShort
+    alert(f_sigMsg("仮", "SELL", selShortRank, selShortName, close, selShortStop, selShortTP, selShortQty, drVolTextOut), alert.freq_once_per_bar)
+
+bool confLong  = is5m and barstate.isconfirmed and canOpenNew and selectedLong
+bool confShort = is5m and barstate.isconfirmed and canOpenNew and selectedShort
+if confLong
+    float _e = close
+    alert(f_sigMsg("確定", "BUY", selLongRank, selLongName, _e, selLongStop, selLongTP, selLongQty, drVolTextOut), alert.freq_once_per_bar)
+    label.new(bar_index, low, f_labelText("BUY", selLongRank, selLongName, _e, selLongStop, selLongTP, selLongQty, drVolTextOut), yloc = yloc.belowbar, style = label.style_label_up, color = selLongRank == "A" ? COLOR_RANK_A : selLongRank == "C" ? COLOR_RANK_C : COLOR_RANK_B, textcolor = color.white, size = size.small)
+    posActive    := true
+    posDir       := 1
+    posSL        := selLongStop
+    posTP        := selLongTP
+    posEntryBar  := bar_index
+    posLogicName := selLongName
+    // エントリー後 状態リセット (元ストラテジーと同じ: MACD状態をリセット)
+    if useMACDModule and resetMACDStateAfterEntry
+        longMACDStateOk := false
+if confShort
+    float _e = close
+    alert(f_sigMsg("確定", "SELL", selShortRank, selShortName, _e, selShortStop, selShortTP, selShortQty, drVolTextOut), alert.freq_once_per_bar)
+    label.new(bar_index, high, f_labelText("SELL", selShortRank, selShortName, _e, selShortStop, selShortTP, selShortQty, drVolTextOut), yloc = yloc.abovebar, style = label.style_label_down, color = selShortRank == "A" ? COLOR_RANK_A : selShortRank == "C" ? COLOR_RANK_C : COLOR_RANK_B, textcolor = color.white, size = size.small)
+    posActive    := true
+    posDir       := -1
+    posSL        := selShortStop
+    posTP        := selShortTP
+    posEntryBar  := bar_index
+    posLogicName := selShortName
+    if useMACDModule and resetMACDStateAfterEntry
+        shortMACDStateOk := false
