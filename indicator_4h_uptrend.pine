@@ -3203,18 +3203,67 @@ bool canOpenNew = not useVirtualPositionBlock or not posActive
 // ============================================================
 //  13/14/16. 仮シグナル / 確定シグナル / 表示・アラート
 // ------------------------------------------------------------
-//  ・仮シグナル  : リアルタイム足の確定前。alert のみ (足内1回 = freq_once_per_bar)。
-//                  条件が消えれば確定シグナルは出ない (確定は足確定時に再評価)。
-//  ・確定シグナル: 足確定時に採用シグナルが成立していれば alert + ラベル (足1回)。
-//                  仮シグナルが出ていなくても、確定時に初成立なら許可。
-//  ・5分足でのみ有効。
+//  ・仮シグナル  : リアルタイム足の確定前。1セットアップにつき確定前1回だけ alert。
+//                  同一ロジック・同一方向で条件が継続 (次の5分足まで続く) しても再発火
+//                  しない。条件が完全に消えて再成立すると新セットアップとして再び1回。
+//                  ロング/ショートは別管理・別ロジックは別セットアップとして管理する。
+//  ・確定シグナル: 足確定時に採用シグナルが成立していれば alert + ラベル。
+//                  仮を発火済みでも確定は正常に出す (仮管理と確定管理は分離)。
+//                  同一ロジック・同一方向・同一 bar_index の二重確定のみ抑止 (下記配列)。
+//  ・5分足でのみ有効。競合処理後の selectedLong/selectedShort・selLongLogic/selShortLogic
+//    (最終選択結果) に対して適用する (各ロジックの生条件へは直接接続しない)。
 // ============================================================
-bool provLong  = is5m and not barstate.isconfirmed and canOpenNew and selectedLong
-bool provShort = is5m and not barstate.isconfirmed and canOpenNew and selectedShort
-if provLong
+
+// --- 仮シグナル セットアップ管理 (方向別・ロジック別。1セットアップ1回だけ発火) ---
+//   セットアップID = 新規選択 or 採用ロジック切替のたびに採番する連番。条件が継続する
+//   間は同じIDを維持し、方向が外れたら終了 (次の新規選択で新IDを採番)。
+//   ※ bar_index だけをIDにすると継続時に毎足別IDになり毎足発火するため連番で識別する。
+//   ※ 毎足無条件で発火履歴を na へ戻さない (戻すと継続中に何度も出るため)。
+var int longSetupSeq          = 0
+var int currentLongSetupId    = na
+var int activeLongSetupLogic  = na
+var int firedProvLongSetupId  = na
+var int shortSetupSeq         = 0
+var int currentShortSetupId   = na
+var int activeShortSetupLogic = na
+var int firedProvShortSetupId = na
+
+// ロング セットアップ: 新規選択 or ロジック切替で採番 / 非選択で終了
+bool longSetupStartNew = selectedLong and (na(currentLongSetupId) or activeLongSetupLogic != selLongLogic)
+if longSetupStartNew
+    longSetupSeq         += 1
+    currentLongSetupId   := longSetupSeq
+    activeLongSetupLogic := selLongLogic
+else if not selectedLong
+    currentLongSetupId   := na
+    activeLongSetupLogic := na
+
+// ショート セットアップ: 同上
+bool shortSetupStartNew = selectedShort and (na(currentShortSetupId) or activeShortSetupLogic != selShortLogic)
+if shortSetupStartNew
+    shortSetupSeq         += 1
+    currentShortSetupId   := shortSetupSeq
+    activeShortSetupLogic := selShortLogic
+else if not selectedShort
+    currentShortSetupId   := na
+    activeShortSetupLogic := na
+
+// 仮ロング: 未確定足・そのセットアップが未発火のときだけ 1 回 alert
+bool longProvEligible = is5m and canOpenNew and selectedLong and not na(currentLongSetupId) and (na(firedProvLongSetupId) or firedProvLongSetupId != currentLongSetupId)
+bool newProvLong = longProvEligible and not barstate.isconfirmed
+if newProvLong
     alert(f_sigMsg("仮", "BUY",  selLongRank,  selLongName,  close, selLongStop,  selLongTP,  selLongQty,  drVolTextOut), alert.freq_once_per_bar)
-if provShort
+// 発火済みIDを保存 (足確定時にもコミットされるよう、対象セットアップでは確定/未確定を問わず更新)
+if longProvEligible
+    firedProvLongSetupId := currentLongSetupId
+
+// 仮ショート: 同上
+bool shortProvEligible = is5m and canOpenNew and selectedShort and not na(currentShortSetupId) and (na(firedProvShortSetupId) or firedProvShortSetupId != currentShortSetupId)
+bool newProvShort = shortProvEligible and not barstate.isconfirmed
+if newProvShort
     alert(f_sigMsg("仮", "SELL", selShortRank, selShortName, close, selShortStop, selShortTP, selShortQty, drVolTextOut), alert.freq_once_per_bar)
+if shortProvEligible
+    firedProvShortSetupId := currentShortSetupId
 
 // 確定シグナル 重複防止 (ロジック別・方向別)
 //   同一ロジック・同一方向・同一 bar_index で確定ラベル/アラートが二重発火するのを防ぐ。
@@ -3223,11 +3272,18 @@ if provShort
 //   配列で最後に確定した bar_index を保持する (index 1..10 = logic01..logic10、0=未使用)。
 //   ※ ロング候補: 1/2/4/5/6/8/9/10 ・ ショート候補: 1/2/3/4/7/8。存在しない方向のスロットは
 //     参照されない (selLongLogic/selShortLogic がその番号にならないため)。
+//   ※ 配列初期値は na のため「na != bar_index」は true でなく na になる。初回確定が停止し
+//     配列も更新されず以後も確定が出なくなるバグを避けるため、na() を明示的に考慮する。
 var array<int> lastLongConfBarByLogic  = array.new_int(11, na)
 var array<int> lastShortConfBarByLogic = array.new_int(11, na)
 
-bool confLong  = is5m and barstate.isconfirmed and canOpenNew and selectedLong  and array.get(lastLongConfBarByLogic,  selLongLogic)  != bar_index
-bool confShort = is5m and barstate.isconfirmed and canOpenNew and selectedShort and array.get(lastShortConfBarByLogic, selShortLogic) != bar_index
+int  lastLongConfBar       = array.get(lastLongConfBarByLogic,  selLongLogic)
+int  lastShortConfBar      = array.get(lastShortConfBarByLogic, selShortLogic)
+bool longConfBarAvailable  = na(lastLongConfBar)  or lastLongConfBar  != bar_index
+bool shortConfBarAvailable = na(lastShortConfBar) or lastShortConfBar != bar_index
+
+bool confLong  = is5m and barstate.isconfirmed and canOpenNew and selectedLong  and longConfBarAvailable
+bool confShort = is5m and barstate.isconfirmed and canOpenNew and selectedShort and shortConfBarAvailable
 if confLong
     float _e = close
     alert(f_sigMsg("確定", "BUY", selLongRank, selLongName, _e, selLongStop, selLongTP, selLongQty, drVolTextOut), alert.freq_once_per_bar)
