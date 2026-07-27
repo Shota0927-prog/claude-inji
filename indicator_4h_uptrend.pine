@@ -764,10 +764,16 @@ f_envTrend(int minScore) =>
 
 f_trendText(int c) => c == 1 ? "上昇" : c == 0 ? "レンジ" : c == -1 ? "下降" : "-"
 
-// 共有 環境トレンド (logic01 は 4H/1H/15M のみ使用。TF/lookahead は不変)
-int env4H  = request.security(syminfo.tickerid, tf4H,  f_envTrend(minScore4H),  lookahead = barmerge.lookahead_off)
-int env1H  = request.security(syminfo.tickerid, tf1H,  f_envTrend(minScore1H),  lookahead = barmerge.lookahead_off)
-int env15M = request.security(syminfo.tickerid, tf15M, f_envTrend(minScore15M), lookahead = barmerge.lookahead_off)
+// 共有 環境トレンド (logic01〜logic10 が 4H/1H/15M を使用)
+//   4H・1H・15M環境判定は、リアルタイムと再読込後の不一致を防ぐため、直前に確定した
+//   上位足を使用する (関数戻り値 [1] + lookahead_on = 標準の非リペイント取得)。
+//   [1] で 1本前 (=確定済み) の上位足結果を参照し、lookahead_on と組み合わせても未来参照は
+//   発生しない (確定値のみを見るため)。
+//   そのため、未確定上位足を参照していた旧版 (lookahead_off・[1]なし) と比べて、
+//   環境切替およびシグナル発生タイミングが変わる可能性がある。
+int env4H  = request.security(syminfo.tickerid, tf4H,  f_envTrend(minScore4H)[1],  lookahead = barmerge.lookahead_on)
+int env1H  = request.security(syminfo.tickerid, tf1H,  f_envTrend(minScore1H)[1],  lookahead = barmerge.lookahead_on)
+int env15M = request.security(syminfo.tickerid, tf15M, f_envTrend(minScore15M)[1], lookahead = barmerge.lookahead_on)
 
 // ============================================================
 //  4. 日足レジーム (計算) — 分類のみ (drVolTextOut / drDirTextOut を出力)
@@ -887,7 +893,25 @@ bool drTradeConnected = dailyRegimeMode == "前日確定ベース" or dailyRegim
 f_calcVolatility() =>
     bool baseVolOk = true
     if volMode == "ATR"
-        float baseAtr = atrTf == "" ? ta.atr(atrLenBase) : request.security(syminfo.tickerid, atrTf, ta.atr(atrLenBase)[1], lookahead = barmerge.lookahead_off)
+        // ATR取得 (ATRフィルターのみ。他計算には影響しない):
+        //   ・atrTf == ""            → チャート足の ta.atr(atrLenBase) (従来どおり・遅れなし)
+        //   ・atrTf がチャート足より上位 → 直前に確定した上位足ATR ([1] + lookahead_on で
+        //                                未来参照なし・非リペイント)
+        //   ・atrTf がチャート足と同じ  → チャート足でそのまま計算 (不要な1本遅れを出さない)
+        //   ・atrTf がチャート足より下位 → 上位足用の [1]+lookahead_on は使わず lookahead_off で取得
+        //   大小判定は timeframe.in_seconds() で行う。
+        float baseAtr = na
+        if atrTf == ""
+            baseAtr := ta.atr(atrLenBase)
+        else
+            int _atrTfSec   = timeframe.in_seconds(atrTf)
+            int _chartTfSec = timeframe.in_seconds()
+            if _atrTfSec > _chartTfSec
+                baseAtr := request.security(syminfo.tickerid, atrTf, ta.atr(atrLenBase)[1], lookahead = barmerge.lookahead_on)
+            else if _atrTfSec == _chartTfSec
+                baseAtr := ta.atr(atrLenBase)
+            else
+                baseAtr := request.security(syminfo.tickerid, atrTf, ta.atr(atrLenBase), lookahead = barmerge.lookahead_off)
         float atrAvg  = ta.sma(baseAtr, volAvgLen)
         bool volAbsOk = baseAtr >= minAtrDollar
         bool volRelOk = atrAvg > 0 and baseAtr >= atrAvg * volRatioMin
@@ -3192,8 +3216,18 @@ if provLong
 if provShort
     alert(f_sigMsg("仮", "SELL", selShortRank, selShortName, close, selShortStop, selShortTP, selShortQty, drVolTextOut), alert.freq_once_per_bar)
 
-bool confLong  = is5m and barstate.isconfirmed and canOpenNew and selectedLong
-bool confShort = is5m and barstate.isconfirmed and canOpenNew and selectedShort
+// 確定シグナル 重複防止 (ロジック別・方向別)
+//   同一ロジック・同一方向・同一 bar_index で確定ラベル/アラートが二重発火するのを防ぐ。
+//   全ロジック共通の1変数で抑止すると、同じ足で別ロジックが成立した場合まで潰すため、
+//   採用ロジック番号 (selLongLogic / selShortLogic) をインデックスに、方向別の独立した
+//   配列で最後に確定した bar_index を保持する (index 1..10 = logic01..logic10、0=未使用)。
+//   ※ ロング候補: 1/2/4/5/6/8/9/10 ・ ショート候補: 1/2/3/4/7/8。存在しない方向のスロットは
+//     参照されない (selLongLogic/selShortLogic がその番号にならないため)。
+var array<int> lastLongConfBarByLogic  = array.new_int(11, na)
+var array<int> lastShortConfBarByLogic = array.new_int(11, na)
+
+bool confLong  = is5m and barstate.isconfirmed and canOpenNew and selectedLong  and array.get(lastLongConfBarByLogic,  selLongLogic)  != bar_index
+bool confShort = is5m and barstate.isconfirmed and canOpenNew and selectedShort and array.get(lastShortConfBarByLogic, selShortLogic) != bar_index
 if confLong
     float _e = close
     alert(f_sigMsg("確定", "BUY", selLongRank, selLongName, _e, selLongStop, selLongTP, selLongQty, drVolTextOut), alert.freq_once_per_bar)
@@ -3229,6 +3263,8 @@ if confLong
     if selLongLogic == 10 and useStochStateWindow and resetStochStateAfterEntry
         stochLongStateOk  := false
         stochLongStateBar := na
+    // 確定ラベル・アラート・状態処理が完了 → 採用ロジックのロング側 確定barを保存 (同一足の重複防止)
+    array.set(lastLongConfBarByLogic, selLongLogic, bar_index)
 if confShort
     float _e = close
     alert(f_sigMsg("確定", "SELL", selShortRank, selShortName, _e, selShortStop, selShortTP, selShortQty, drVolTextOut), alert.freq_once_per_bar)
@@ -3264,3 +3300,5 @@ if confShort
         shortFibStateBar := na
     if selShortLogic == 8 and useLineWZ and resetLineStateAfterEntry
         logic08SweepShortStateBar := na
+    // 確定ラベル・アラート・状態処理が完了 → 採用ロジックのショート側 確定barを保存 (同一足の重複防止)
+    array.set(lastShortConfBarByLogic, selShortLogic, bar_index)
