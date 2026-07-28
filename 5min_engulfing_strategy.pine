@@ -203,6 +203,27 @@ dailyBearCloseLocation  = input.float(0.35, "日足下降 終値位置上限")
 dailyInsufficientAsRange = input.bool(true, "日足データ不足時はレンジ扱い (false=データが揃うまで不一致)")
 
 // ============================================================
+//  3c. 入力 : Macro (DXY/金利) 方向フィルター
+// ------------------------------------------------------------
+//  Environment の「方向フィルター」。WinZone / Trigger ではない。
+//  Gold と DXY / 米金利の逆相関から 方向バイアス と NoTrade を作る。
+//  useMacroModule=false の時は request.security を一切呼ばない (軽量)。
+// ============================================================
+useMacroModule  = input.bool(false, "マクロモジュールを使う (重い/OFFで軽量)")
+useMacroBias    = input.bool(false, "マクロ方向バイアスを使う")
+useMacroNoTrade = input.bool(false, "マクロNoTradeを使う")
+macroGoldSymbol  = input.symbol("TVC:GOLD",  "Gold")
+macroDxySymbol   = input.symbol("TVC:DXY",   "DXY")
+macroYieldSymbol = input.symbol("TVC:US10Y", "Yield (US10Y)")
+macroTF          = input.timeframe("15",     "マクロ時間足")
+macroCorrLen     = input.int(20,   "相関計算期間", minval = 2)
+macroDirLookback = input.int(10,   "方向判定期間", minval = 1)
+macroWeakCorr    = input.float(0.2, "相関 弱すぎ しきい値 |corr|<", minval = 0.0, maxval = 1.0, step = 0.05)
+useMacroReturnEntry  = input.bool(false, "逆相関復帰をエントリー許可に使う")
+macroReturnLookback  = input.int(3, "歪み→復帰 判定本数", minval = 1)
+macroReturnStateBars = input.int(5, "復帰シグナル 有効本数", minval = 1)
+
+// ============================================================
 //  4. 入力 : リスク / 決済
 // ============================================================
 riskPct     = input.float(5.0, "1トレード損失率 (%)")
@@ -5057,8 +5078,96 @@ if useEnvFilter
     int needMatch = reqMatchCount == 0 ? envEnabled : reqMatchCount
     allowByEnv := envEnabled == 0 or envMatched >= needMatch
 
-bool envLongOk  = not useEnvFilter or allowByEnv
-bool envShortOk = not useEnvFilter or allowByEnv
+// ============================================================
+//  8a. Macro (DXY/金利) 逆相関復帰フィルター (Environment に接続)
+// ------------------------------------------------------------
+//  Gold と DXY / 米金利の関係を「逆相関復帰」思想で使う:
+//    通常 : Gold と DXY/金利 は逆相関
+//    歪み : 同方向に動く → NoTrade (逆相関が崩れている)
+//    復帰 : 歪み → 逆相関へ戻る → 逆相関方向にエントリー許可
+//  ・Macro は Trigger ではなく Environment。WinZone/Trigger には混ぜない。
+//  ・useMacroModule=false の時は request.security を一切呼ばない。
+//  出力: allowLongByMacro / allowShortByMacro / macroNoTrade
+// ============================================================
+f_macroChg(src, len) =>
+    (na(src[len]) or src[len] == 0) ? 0.0 : (src - src[len]) / src[len] * 100.0
+
+bool allowLongByMacro  = true
+bool allowShortByMacro = true
+bool macroNoTrade      = false
+bool macroDistortion   = false
+bool dxyReturnSignal   = false
+bool yieldReturnSignal = false
+int  macroReturnDir    = 0
+var bool macroReturnLongState  = false
+var bool macroReturnShortState = false
+var int  macroReturnBar        = na
+
+if useMacroModule
+    float _goldC  = request.security(macroGoldSymbol,  macroTF, close, lookahead = barmerge.lookahead_off)
+    float _dxyC   = request.security(macroDxySymbol,   macroTF, close, lookahead = barmerge.lookahead_off)
+    float _yieldC = request.security(macroYieldSymbol, macroTF, close, lookahead = barmerge.lookahead_off)
+    float _dxyCorr   = ta.correlation(_goldC, _dxyC,   macroCorrLen)
+    float _yieldCorr = ta.correlation(_goldC, _yieldC, macroCorrLen)
+    float _dxyChg   = f_macroChg(_dxyC,   macroDirLookback)
+    float _yieldChg = f_macroChg(_yieldC, macroDirLookback)
+    float _goldChg  = f_macroChg(_goldC,  macroDirLookback)
+    // 方向 (DXY下落/金利低下 = Gold ロング寄り = +1)。バイアス方式のフォールバック用。
+    int _dxyDir   = _dxyChg   < 0 ? 1 : _dxyChg   > 0 ? -1 : 0
+    int _yieldDir = _yieldChg < 0 ? 1 : _yieldChg > 0 ? -1 : 0
+    int _biasDir = _dxyDir == _yieldDir ? _dxyDir : 0
+    // --- 歪み判定 (Gold と DXY/金利 が同方向 = 逆相関が崩れている) ---
+    bool _dxyDistortion   = (_dxyChg   > 0 and _goldChg > 0) or (_dxyChg   < 0 and _goldChg < 0)
+    bool _yieldDistortion = (_yieldChg > 0 and _goldChg > 0) or (_yieldChg < 0 and _goldChg < 0)
+    macroDistortion := _dxyDistortion or _yieldDistortion
+    // --- 逆相関復帰判定 (歪み → 逆相関へ戻った瞬間) ---
+    bool _dxyInverseNow   = (_dxyChg   > 0 and _goldChg < 0) or (_dxyChg   < 0 and _goldChg > 0)
+    bool _yieldInverseNow = (_yieldChg > 0 and _goldChg < 0) or (_yieldChg < 0 and _goldChg > 0)
+    bool _wasDxyDistortion   = ta.barssince(_dxyDistortion)   <= macroReturnLookback
+    bool _wasYieldDistortion = ta.barssince(_yieldDistortion) <= macroReturnLookback
+    dxyReturnSignal   := _wasDxyDistortion   and _dxyInverseNow   and not _dxyInverseNow[1]
+    yieldReturnSignal := _wasYieldDistortion and _yieldInverseNow and not _yieldInverseNow[1]
+    // --- 復帰方向 (DXY下落&Gold上昇 = +1 / DXY上昇&Gold下落 = -1) ---
+    int _dxyReturnDir   = (_dxyChg   < 0 and _goldChg > 0) ? 1 : (_dxyChg   > 0 and _goldChg < 0) ? -1 : 0
+    int _yieldReturnDir = (_yieldChg < 0 and _goldChg > 0) ? 1 : (_yieldChg > 0 and _goldChg < 0) ? -1 : 0
+    // --- 復帰方向の合成 (両方一致→確定 / 片方→その方向) ---
+    macroReturnDir := dxyReturnSignal and yieldReturnSignal and _dxyReturnDir == _yieldReturnDir ? _dxyReturnDir : dxyReturnSignal ? _dxyReturnDir : yieldReturnSignal ? _yieldReturnDir : 0
+    // --- 復帰シグナル状態管理 (macroReturnStateBars 本だけ方向許可を保持) ---
+    if useMacroReturnEntry and macroReturnDir == 1
+        macroReturnLongState  := true
+        macroReturnShortState := false
+        macroReturnBar := bar_index
+    if useMacroReturnEntry and macroReturnDir == -1
+        macroReturnShortState := true
+        macroReturnLongState  := false
+        macroReturnBar := bar_index
+    if not na(macroReturnBar) and bar_index - macroReturnBar > macroReturnStateBars
+        macroReturnLongState  := false
+        macroReturnShortState := false
+    // --- NoTrade (歪み中は禁止。ただし復帰シグナルが出た足は解除) ---
+    bool _macroReturnNow = macroReturnDir != 0
+    macroNoTrade := useMacroNoTrade and macroDistortion and not _macroReturnNow
+    // --- allowLong / allowShort ---
+    //   復帰方式ON: 復帰状態のみ許可 / OFF: バイアス方向 (中立は両方許可)
+    allowLongByMacro  := not useMacroBias ? true : useMacroReturnEntry ? macroReturnLongState  : _biasDir >= 0
+    allowShortByMacro := not useMacroBias ? true : useMacroReturnEntry ? macroReturnShortState : _biasDir <= 0
+else
+    // Macro OFF : 環境判定に一切影響させない (パススルー)
+    allowLongByMacro  := true
+    allowShortByMacro := true
+    macroNoTrade      := false
+    macroReturnLongState  := false
+    macroReturnShortState := false
+
+// 環境フィルタ最終判定 : 既存環境条件 に Macro 方向バイアス と Macro NoTrade を AND 接続。
+bool envLongOk =
+     (not useEnvFilter or allowByEnv)
+     and (not useMacroModule or not useMacroBias or allowLongByMacro)
+     and (not useMacroModule or not useMacroNoTrade or not macroNoTrade)
+bool envShortOk =
+     (not useEnvFilter or allowByEnv)
+     and (not useMacroModule or not useMacroBias or allowShortByMacro)
+     and (not useMacroModule or not useMacroNoTrade or not macroNoTrade)
 
 // ============================================================
 //  8b. Momentum モジュール (ストキャス)
