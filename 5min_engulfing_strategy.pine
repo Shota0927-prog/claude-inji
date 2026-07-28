@@ -224,6 +224,41 @@ macroReturnLookback  = input.int(3, "歪み→復帰 判定本数", minval = 1)
 macroReturnStateBars = input.int(5, "復帰シグナル 有効本数", minval = 1)
 
 // ============================================================
+//  3d. 入力 : Intermarket (市場間分析) モジュール / Silver
+// ------------------------------------------------------------
+//  環境認識・WinZone・Momentum とは独立した「市場間」フィルター。
+//  Silver の 先行確認 / 方向一致 / 逆行警戒 / 乖離確認 を許可/NoTradeに使う。
+//  useIntermarketModule=false … 全処理停止 (security/ta を一切呼ばない)
+//  useSilverModule=false      … Silver の request.security すら呼ばない
+// ============================================================
+useIntermarketModule = input.bool(false, "Intermarketモジュールを使う (OFFで完全停止)")
+intermarketMode      = input.string("AND", "Intermarket結合 (将来 Silver/DXY/金利...)", options = ["AND", "OR"])
+useSilverModule      = input.bool(true,  "Silver を使う (OFFで security も呼ばない)")
+goldSymbol           = input.symbol("TVC:GOLD",   "Gold シンボル")
+silverSymbol         = input.symbol("TVC:SILVER", "Silver シンボル")
+silverTF             = input.timeframe("5", "Silver 時間足")
+silverLeadLookback   = input.int(4, "先行/方向 判定期間", minval = 1)
+silverRecentLookback = input.int(3,  "直近 確認期間",     minval = 1)
+useSilverLead        = input.bool(true, "A: Silver先行")
+useSilverConfirm     = input.bool(false, "B: Silver方向一致")
+useSilverConflict    = input.bool(false, "C: Silver逆行警戒")
+useSilverDivergence  = input.bool(false, "D: Gold/Silver乖離")
+useSilverRank        = input.bool(false, "E: Silver確認ランク")
+goldLongSetup        = input.bool(false, "Gold ロング条件 (接続用)")
+goldShortSetup       = input.bool(false, "Gold ショート条件 (接続用)")
+silverMinChange      = input.float(0.5, "Silver 最小変化率(%)", minval = 0.0, step = 0.05)
+silverLeadRatio      = input.float(2.0, "先行 比率 (silver/leadRatio)", minval = 0.1, step = 0.1)
+goldLagThreshold     = input.float(0.1, "Gold 未反応 変化率(%)", minval = 0.0, step = 0.05)
+silverDivThreshold   = input.float(0.8, "乖離 しきい値(%)",     minval = 0.0, step = 0.05)
+useSilverVolFilter    = input.bool(false, "ボラフィルターを使う")
+silverAtrLen          = input.int(14,  "Gold ATR期間",       minval = 1)
+silverAtrRankLookback = input.int(100, "ATR percentile 期間", minval = 1)
+silverAtrRankMin      = input.float(30, "ATR rank 最小(%)",   minval = 0.0, maxval = 100.0, step = 5)
+useSilverStateWindow       = input.bool(true, "Silver状態管理を使う")
+silverStateMaxBars         = input.int(3, "Silver状態 有効本数", minval = 1)
+resetSilverStateAfterEntry = input.bool(true, "エントリー後Silver状態をリセット")
+
+// ============================================================
 //  4. 入力 : リスク / 決済
 // ============================================================
 riskPct     = input.float(5.0, "1トレード損失率 (%)")
@@ -5170,6 +5205,127 @@ bool envShortOk =
      and (not useMacroModule or not useMacroNoTrade or not macroNoTrade)
 
 // ============================================================
+//  8a-2. Intermarket (市場間分析) モジュール / Silver
+// ------------------------------------------------------------
+//  環境認識(トレンド)・WinZone(場所)・Momentum(勢い) とは独立。
+//  Silver の 先行確認 / 方向一致 / 逆行警戒 / 乖離確認 を許可/NoTradeに使う。
+//  useIntermarketModule=false … 下の if に入らず全処理停止 (security/ta なし)
+//  useSilverModule=false      … Silver の request.security すら呼ばない
+//  出力: longIntermarketOk / shortIntermarketOk (OFF時は常に許可)
+//  ※ 表示コード(label/table/bgcolor)は本ファイルの方針に従い省略。
+// ============================================================
+// Silver 単体出力 (OFF時のデフォルト = 常に許可)
+bool  allowLongBySilver  = true
+bool  allowShortBySilver = true
+bool  silverNoTrade      = false
+int   silverDirection    = 0
+int   silverSignalType   = 0
+int   silverRank         = 0
+// Silver 生シグナル / 指標 (OFF時 false / na)
+bool  silverLeadLong      = false
+bool  silverLeadShort     = false
+bool  silverConfirmLong   = false
+bool  silverConfirmShort  = false
+bool  silverConflict      = false
+bool  silverDivergence    = false
+bool  silverLongEvent     = false
+bool  silverShortEvent    = false
+int   silverLeadDirection       = 0
+int   silverConflictDirection   = 0
+int   silverDivergenceDirection = 0
+float silverChange       = na
+float goldChange         = na
+float silverRecentChange = na
+float goldRecentChange   = na
+float goldAtrRank        = na
+// Silver 状態管理 (var。FVG・ストキャスと同思想)
+var bool longSilverStateOk  = false
+var bool shortSilverStateOk = false
+var int  longSilverStateBar  = na
+var int  shortSilverStateBar = na
+
+// 変化率ヘルパー
+f_imChg(src, len) =>
+    (na(src[len]) or src[len] == 0) ? 0.0 : (src - src[len]) / src[len] * 100.0
+
+// Silver 本体 : useIntermarketModule かつ useSilverModule の時だけ全処理
+if useIntermarketModule and useSilverModule
+    float goldC   = request.security(goldSymbol,   silverTF, close,               lookahead = barmerge.lookahead_off)
+    float silverC = request.security(silverSymbol, silverTF, close,               lookahead = barmerge.lookahead_off)
+    float goldATR = request.security(goldSymbol,   silverTF, ta.atr(silverAtrLen), lookahead = barmerge.lookahead_off)
+    // 変化率
+    silverChange       := f_imChg(silverC, silverLeadLookback)
+    goldChange         := f_imChg(goldC,   silverLeadLookback)
+    silverRecentChange := f_imChg(silverC, silverRecentLookback)
+    goldRecentChange   := f_imChg(goldC,   silverRecentLookback)
+    // A: Silver先行
+    bool goldLag = math.abs(goldChange) <= goldLagThreshold
+    silverLeadLong  := useSilverLead and (silverChange >=  silverMinChange) and (goldLag or goldChange < silverChange / silverLeadRatio)
+    silverLeadShort := useSilverLead and (silverChange <= -silverMinChange) and (goldLag or goldChange > silverChange / silverLeadRatio)
+    silverLeadDirection := silverLeadLong ? 1 : silverLeadShort ? -1 : 0
+    // B: Silver方向一致
+    silverConfirmLong  := useSilverConfirm and goldLongSetup  and silverChange > 0 and silverRecentChange > 0
+    silverConfirmShort := useSilverConfirm and goldShortSetup and silverChange < 0 and silverRecentChange < 0
+    // C: Silver逆行警戒
+    bool silverConflictLong  = goldLongSetup  and silverChange < 0
+    bool silverConflictShort = goldShortSetup and silverChange > 0
+    silverConflict := useSilverConflict and (silverConflictLong or silverConflictShort)
+    silverConflictDirection := silverConflictLong ? 1 : silverConflictShort ? -1 : 0
+    // D: Gold/Silver乖離
+    float divergenceAbs = math.abs(silverChange - goldChange)
+    silverDivergence := useSilverDivergence and divergenceAbs >= silverDivThreshold
+    silverDivergenceDirection := silverDivergence ? (silverChange > goldChange ? 1 : -1) : 0
+    // ボラフィルター (Gold ATR percentile)
+    goldAtrRank := ta.percentrank(goldATR, silverAtrRankLookback)
+    bool silverVolOK = not useSilverVolFilter or (not na(goldAtrRank) and goldAtrRank >= silverAtrRankMin)
+    // E: Silver確認ランク (0なし /1方向一致 /2先行 /3先行+一致 /4先行+一致+ボラOK)
+    bool hasLead    = silverLeadLong or silverLeadShort
+    bool hasConfirm = silverConfirmLong or silverConfirmShort
+    silverRank := useSilverRank ? (
+                   (hasLead and hasConfirm and silverVolOK) ? 4 :
+                   (hasLead and hasConfirm) ? 3 :
+                   hasLead ? 2 :
+                   hasConfirm ? 1 : 0) : 0
+    // Signal Type (0None/1Lead/2Confirm/3Conflict/4Divergence。優先: Conflict>Lead>Divergence>Confirm)
+    silverSignalType := silverConflict ? 3 : hasLead ? 1 : silverDivergence ? 4 : hasConfirm ? 2 : 0
+    // Direction (1=BUY / -1=SELL / 0=なし。採用順 Lead→Confirm→Divergence)
+    silverDirection := hasLead ? silverLeadDirection : hasConfirm ? (silverConfirmLong ? 1 : -1) : silverDivergence ? silverDivergenceDirection : 0
+    // NoTrade (逆行警戒)
+    silverNoTrade := silverConflict
+    // 生イベント (そのバーのシグナル。逆行時は不許可)
+    silverLongEvent  := not silverConflict and (silverLeadLong  or silverConfirmLong)
+    silverShortEvent := not silverConflict and (silverLeadShort or silverConfirmShort)
+    // 状態管理 : イベント発生後 silverStateMaxBars 本だけ OK を保持 (期限切れで false)
+    if useSilverStateWindow
+        if silverLongEvent
+            longSilverStateOk  := true
+            longSilverStateBar := bar_index
+        if silverShortEvent
+            shortSilverStateOk  := true
+            shortSilverStateBar := bar_index
+        if longSilverStateOk and not na(longSilverStateBar) and bar_index - longSilverStateBar > silverStateMaxBars
+            longSilverStateOk := false
+        if shortSilverStateOk and not na(shortSilverStateBar) and bar_index - shortSilverStateBar > silverStateMaxBars
+            shortSilverStateOk := false
+    // Silver 最終出力 (状態管理ON=状態ベース / OFF=イベント単バー)
+    allowLongBySilver  := useSilverStateWindow ? (longSilverStateOk  and not silverNoTrade) : silverLongEvent
+    allowShortBySilver := useSilverStateWindow ? (shortSilverStateOk and not silverNoTrade) : silverShortEvent
+
+// Intermarket 集約 (現状 Silver のみ。将来 DXY/US10Y/US2Y/SPX/NQ/VIX を AND/OR で追加)
+//   OFFの市場は「通過」。将来は imLongSilver and imLongDXY (AND) のように拡張。
+bool imLongSilver  = not useSilverModule or allowLongBySilver
+bool imShortSilver = not useSilverModule or allowShortBySilver
+bool allowLongByIntermarket  = intermarketMode == "AND" ? imLongSilver  : imLongSilver
+bool allowShortByIntermarket = intermarketMode == "AND" ? imShortSilver : imShortSilver
+bool intermarketNoTrade      = useIntermarketModule and useSilverModule and silverNoTrade
+int  intermarketDirection    = silverDirection
+int  intermarketSignalType   = silverSignalType
+int  intermarketRank         = silverRank
+// Intermarket 最終許可 (OFFなら常に許可。NoTrade中は禁止)
+bool longIntermarketOk  = not useIntermarketModule or (allowLongByIntermarket  and not intermarketNoTrade)
+bool shortIntermarketOk = not useIntermarketModule or (allowShortByIntermarket and not intermarketNoTrade)
+
+// ============================================================
 //  8b. Momentum モジュール (ストキャス)
 // ============================================================
 bool sAct = useMomentumModule and useStochMomentum
@@ -5676,6 +5832,7 @@ bool canLong =
      allowByNewsTime and
      envLongOk and
      longWinZoneOk and
+     longIntermarketOk and
      allowLongByMomentum and
      allowLongByTrigger and
      volOk and
@@ -5691,6 +5848,7 @@ bool canShort =
      allowByNewsTime and
      envShortOk and
      shortWinZoneOk and
+     shortIntermarketOk and
      allowShortByMomentum and
      allowShortByTrigger and
      volOk and
@@ -5827,3 +5985,8 @@ if useElliottWZ and resetElliottStateAfterEntry and didEnterShort
     shortElliottStateOk  := false
     shortElliottStateBar := na
     elliottShortWinZone  := false
+// Silver 状態リセット (エントリー後に同じ状態で再入しない)
+if useIntermarketModule and useSilverModule and resetSilverStateAfterEntry and didEnterLong
+    longSilverStateOk := false
+if useIntermarketModule and useSilverModule and resetSilverStateAfterEntry and didEnterShort
+    shortSilverStateOk := false
