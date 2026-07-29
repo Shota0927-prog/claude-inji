@@ -294,6 +294,52 @@ efvgShowDebug = input.bool(false, "デバッグ(スコア/状態)を表示", gro
 efvgShowZones = input.bool(false, "選択中FVGの上下限を表示", group = grpEFVG)
 
 // ============================================================
+//  4g. 入力 : EMA 環境認識モジュール (50 / 200 / 1000 EMA)
+// ------------------------------------------------------------
+//  日足/4H/1H/15M の EMA状態 (パーフェクトオーダー / GC・DC保持 + 傾き減点) を
+//  時間足の重みで加重合算し、EMAロング/ショート/イーブンを独立して返す。
+//  非リペイント: request.security + lookahead_on + 上位足内 確定1本前[1]。
+// ============================================================
+grpEEMA = "EMA 環境認識"
+useEEMAEnv = input.bool(false, "EMA環境認識をエントリーに使う (OFFで既存挙動を維持)", group = grpEEMA)
+emaFvgCombineMode = input.string("EMAAndFVG", "EMA/FVG 結合 (useEEMAEnv=ON時)", options = ["EMAOnly", "FVGOnly", "EMAAndFVG", "EMAOrFVG"], group = grpEEMA)
+// --- 対象時間足 (OFFにした足は request.security を呼ばない) ---
+useEEMADaily = input.bool(true, "日足EMAを使う", group = grpEEMA)
+useEEMA4H    = input.bool(true, "4時間足EMAを使う", group = grpEEMA)
+useEEMA1H    = input.bool(true, "1時間足EMAを使う", group = grpEEMA)
+useEEMA15M   = input.bool(true, "15分足EMAを使う", group = grpEEMA)
+eemaDailyTF = input.timeframe("D",   "日足TF", group = grpEEMA)
+eema4HTF    = input.timeframe("240", "4時間足TF", group = grpEEMA)
+eema1HTF    = input.timeframe("60",  "1時間足TF", group = grpEEMA)
+eema15MTF   = input.timeframe("15",  "15分足TF", group = grpEEMA)
+// --- 時間足の重み (小数可・float) ---
+eemaWeightD   = input.float(2.0, "重み 日足",  step = 0.1, group = grpEEMA)
+eemaWeight4H  = input.float(1.5, "重み 4H",   step = 0.1, group = grpEEMA)
+eemaWeight1H  = input.float(1.0, "重み 1H",   step = 0.1, group = grpEEMA)
+eemaWeight15M = input.float(0.5, "重み 15M",  step = 0.1, group = grpEEMA)
+// --- EMA長さ ---
+eemaLenFast = input.int(50,   "短期EMA", minval = 1, group = grpEEMA)
+eemaLenMid  = input.int(200,  "中期EMA", minval = 1, group = grpEEMA)
+eemaLenSlow = input.int(1000, "長期EMA", minval = 1, group = grpEEMA)
+// --- 点数 / 減点 ---
+eemaPOScore  = input.float(4.0, "パーフェクトオーダー 点数", step = 0.5, group = grpEEMA)
+eemaGCScore  = input.float(2.0, "GC/DC 点数", step = 0.5, group = grpEEMA)
+eemaSlopePen = input.float(1.0, "傾き消失の減点", step = 0.5, group = grpEEMA)
+// --- GC/DC 保持本数 (足ごと) ---
+eemaHoldDaily = input.int(3,  "日足 GC/DC保持本数",  minval = 1, group = grpEEMA)
+eemaHold4H    = input.int(6,  "4H GC/DC保持本数",   minval = 1, group = grpEEMA)
+eemaHold1H    = input.int(12, "1H GC/DC保持本数",   minval = 1, group = grpEEMA)
+eemaHold15M   = input.int(24, "15M GC/DC保持本数",  minval = 1, group = grpEEMA)
+// --- 傾き判定 ---
+eemaSlopeBars = input.int(3, "傾き判定本数", minval = 1, group = grpEEMA)
+eemaSlopeMin  = input.float(0.0, "傾きの最低値 (価格)", step = 0.1, minval = 0.0, group = grpEEMA)
+// --- 最終判定 ---
+eemaThreshold = input.float(6.0, "EMA合計スコア閾値 (±・ロング/ショート共通)", step = 0.5, group = grpEEMA)
+// --- 表示 ---
+eemaShowTable = input.bool(true,  "EMA環境テーブルを表示", group = grpEEMA)
+eemaShowDebug = input.bool(false, "EMAデバッグ表示", group = grpEEMA)
+
+// ============================================================
 //  5. 包み足判定
 // ============================================================
 bool prevUp = close[1] > open[1]
@@ -851,6 +897,133 @@ bool finalEnvShortOk =
      (efvgTrendOk or efvgBiasShort)
 
 // ============================================================
+//  8g. EMA 環境認識モジュール 本体 (50/200/1000 EMA)
+// ------------------------------------------------------------
+//  f_eemaState : 呼ばれた足(=上位足)コンテキストで EMA状態スコアを算出。
+//    優先順位 = 1.パーフェクトオーダー > 2.GC/DC保持 > 3.方向なし。
+//    PO成立中は GC/DC点を加算しない (同方向の二重評価を防止)。
+//    傾きは加点に使わず、方向性に対して 50/200EMA の傾きが消えた分だけ 0方向へ減点。
+//    1000EMA の傾きは評価しない。
+//  戻り値 [score(float), reason(int)]。
+//    reason: 2=上昇PO / 1=GC保持 / 0=方向なし / -1=DC保持 / -2=下降PO
+// ============================================================
+f_eemaState(int holdBars) =>
+    float _e50   = ta.ema(close, eemaLenFast)
+    float _e200  = ta.ema(close, eemaLenMid)
+    float _e1000 = ta.ema(close, eemaLenSlow)
+    // パーフェクトオーダー
+    bool _upPO = _e50 > _e200 and _e200 > _e1000
+    bool _dnPO = _e50 < _e200 and _e200 < _e1000
+    // GC/DC (50 vs 200 のみ) を保持
+    var int _gcBar = na
+    var int _dcBar = na
+    if ta.crossover(_e50, _e200)
+        _gcBar := bar_index
+    if ta.crossunder(_e50, _e200)
+        _dcBar := bar_index
+    bool _gcHeld = not na(_gcBar) and (bar_index - _gcBar) < holdBars
+    bool _dcHeld = not na(_dcBar) and (bar_index - _dcBar) < holdBars
+    bool _gcActive = _gcHeld and (na(_dcBar) or _gcBar >= _dcBar)
+    bool _dcActive = _dcHeld and (na(_gcBar) or _dcBar >  _gcBar)
+    // 傾き (50 / 200 のみ)
+    float _s50  = _e50  - _e50[eemaSlopeBars]
+    float _s200 = _e200 - _e200[eemaSlopeBars]
+    bool _up50  = _s50  >  eemaSlopeMin
+    bool _up200 = _s200 >  eemaSlopeMin
+    bool _dn50  = _s50  < -eemaSlopeMin
+    bool _dn200 = _s200 < -eemaSlopeMin
+    float _score = 0.0
+    int _reason = 0
+    if _upPO
+        _reason := 2
+        _score := eemaPOScore
+        if not _up50
+            _score -= eemaSlopePen
+        if not _up200
+            _score -= eemaSlopePen
+    else if _dnPO
+        _reason := -2
+        _score := -eemaPOScore
+        if not _dn50
+            _score += eemaSlopePen
+        if not _dn200
+            _score += eemaSlopePen
+    else if _gcActive
+        _reason := 1
+        _score := eemaGCScore
+        if not _up50
+            _score -= eemaSlopePen
+        if not _up200
+            _score -= eemaSlopePen
+    else if _dcActive
+        _reason := -1
+        _score := -eemaGCScore
+        if not _dn50
+            _score += eemaSlopePen
+        if not _dn200
+            _score += eemaSlopePen
+    [_score, _reason]
+
+// 確定済み1本前を上位足コンテキスト内で返す非リペイント補助。
+f_eemaConfirmed(int holdBars) =>
+    [_s, _r] = f_eemaState(holdBars)
+    [_s[1], _r[1]]
+
+f_eemaReasonText(int c) =>
+    c == 2 ? "Up PO" : c == 1 ? "GC Hold" : c == -1 ? "DC Hold" : c == -2 ? "Down PO" : "None"
+
+// --- 各足の確定EMA状態 (エントリー使用 or テーブル表示時のみ算出。OFF足は呼ばない) ---
+bool eemaCompute = useEEMAEnv or eemaShowTable
+float eemaDScore = 0.0
+int   eemaDReason = 0
+float eemaHScore = 0.0
+int   eemaHReason = 0
+float eemaOScore = 0.0
+int   eemaOReason = 0
+float eemaMScore = 0.0
+int   eemaMReason = 0
+if eemaCompute and useEEMADaily
+    [_s, _r] = request.security(syminfo.tickerid, eemaDailyTF, f_eemaConfirmed(eemaHoldDaily), lookahead = barmerge.lookahead_on)
+    eemaDScore := _s
+    eemaDReason := _r
+if eemaCompute and useEEMA4H
+    [_s, _r] = request.security(syminfo.tickerid, eema4HTF, f_eemaConfirmed(eemaHold4H), lookahead = barmerge.lookahead_on)
+    eemaHScore := _s
+    eemaHReason := _r
+if eemaCompute and useEEMA1H
+    [_s, _r] = request.security(syminfo.tickerid, eema1HTF, f_eemaConfirmed(eemaHold1H), lookahead = barmerge.lookahead_on)
+    eemaOScore := _s
+    eemaOReason := _r
+if eemaCompute and useEEMA15M
+    [_s, _r] = request.security(syminfo.tickerid, eema15MTF, f_eemaConfirmed(eemaHold15M), lookahead = barmerge.lookahead_on)
+    eemaMScore := _s
+    eemaMReason := _r
+
+// --- 加重合算 → 最終EMAバイアス ---
+float eemaDW = useEEMADaily ? eemaDScore * eemaWeightD   : 0.0
+float eemaHW = useEEMA4H    ? eemaHScore * eemaWeight4H  : 0.0
+float eemaOW = useEEMA1H    ? eemaOScore * eemaWeight1H  : 0.0
+float eemaMW = useEEMA15M   ? eemaMScore * eemaWeight15M : 0.0
+float eemaTotal = eemaDW + eemaHW + eemaOW + eemaMW
+bool eemaBiasLong  = eemaTotal >= eemaThreshold
+bool eemaBiasShort = eemaTotal <= -eemaThreshold
+int eemaFinalBias = eemaBiasLong and not eemaBiasShort ? 1 : eemaBiasShort and not eemaBiasLong ? -1 : 0
+
+// --- EMA / FVG 結合ゲート (useEEMAEnv=OFF の間は常に true = 既存挙動を変えない) ---
+bool eemaGateLong =
+     not useEEMAEnv ? true :
+     emaFvgCombineMode == "EMAOnly"   ? eemaBiasLong :
+     emaFvgCombineMode == "FVGOnly"   ? efvgBiasLong :
+     emaFvgCombineMode == "EMAAndFVG" ? (eemaBiasLong and efvgBiasLong) :
+     (eemaBiasLong or efvgBiasLong)
+bool eemaGateShort =
+     not useEEMAEnv ? true :
+     emaFvgCombineMode == "EMAOnly"   ? eemaBiasShort :
+     emaFvgCombineMode == "FVGOnly"   ? efvgBiasShort :
+     emaFvgCombineMode == "EMAAndFVG" ? (eemaBiasShort and efvgBiasShort) :
+     (eemaBiasShort or efvgBiasShort)
+
+// ============================================================
 //  9. SL / TP / ロット計算
 // ============================================================
 float patLow  = math.min(low,  low[1])
@@ -1296,6 +1469,7 @@ bool canLong =
      sessionOk and
      allowByNewsTime and
      finalEnvLongOk and
+     eemaGateLong and
      allowLongByTrigger and
      volOk and
      not blockedByAccum and
@@ -1310,6 +1484,7 @@ bool canShort =
      sessionOk and
      allowByNewsTime and
      finalEnvShortOk and
+     eemaGateShort and
      allowShortByTrigger and
      volOk and
      not blockedByAccum and
@@ -1414,3 +1589,47 @@ if efvgShowZones and barstate.islast
         f_efvgDrawZone(efvgHBB, color.new(color.aqua, 40))
         f_efvgDrawZone(efvgHRT, color.new(color.orange, 0))
         f_efvgDrawZone(efvgHRB, color.new(color.orange, 40))
+
+// ============================================================
+//  12b. EMA 環境認識 表示 (デバッグテーブル)
+// ============================================================
+var table eemaTbl = na
+if eemaShowTable
+    if na(eemaTbl)
+        eemaTbl := table.new(position.top_left, 5, 6, border_width = 1)
+    if barstate.islast
+        table.cell(eemaTbl, 0, 0, "TF",   text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(eemaTbl, 1, 0, "EMA",  text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(eemaTbl, 2, 0, "Score", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(eemaTbl, 3, 0, "重み",  text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(eemaTbl, 4, 0, "加重",  text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        // Daily
+        table.cell(eemaTbl, 0, 1, "D", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 1, 1, useEEMADaily ? f_eemaReasonText(eemaDReason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 2, 1, useEEMADaily ? str.tostring(eemaDScore, "#.##") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 3, 1, useEEMADaily ? str.tostring(eemaWeightD, "#.#") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 4, 1, useEEMADaily ? str.tostring(eemaDW, "#.##") : "-", text_color = color.white, text_size = size.small)
+        // 4H
+        table.cell(eemaTbl, 0, 2, "4H", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 1, 2, useEEMA4H ? f_eemaReasonText(eemaHReason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 2, 2, useEEMA4H ? str.tostring(eemaHScore, "#.##") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 3, 2, useEEMA4H ? str.tostring(eemaWeight4H, "#.#") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 4, 2, useEEMA4H ? str.tostring(eemaHW, "#.##") : "-", text_color = color.white, text_size = size.small)
+        // 1H
+        table.cell(eemaTbl, 0, 3, "1H", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 1, 3, useEEMA1H ? f_eemaReasonText(eemaOReason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 2, 3, useEEMA1H ? str.tostring(eemaOScore, "#.##") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 3, 3, useEEMA1H ? str.tostring(eemaWeight1H, "#.#") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 4, 3, useEEMA1H ? str.tostring(eemaOW, "#.##") : "-", text_color = color.white, text_size = size.small)
+        // 15M
+        table.cell(eemaTbl, 0, 4, "15M", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 1, 4, useEEMA15M ? f_eemaReasonText(eemaMReason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 2, 4, useEEMA15M ? str.tostring(eemaMScore, "#.##") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 3, 4, useEEMA15M ? str.tostring(eemaWeight15M, "#.#") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 4, 4, useEEMA15M ? str.tostring(eemaMW, "#.##") : "-", text_color = color.white, text_size = size.small)
+        // 合計 / 最終
+        table.cell(eemaTbl, 0, 5, "EMA BIAS", text_color = color.white, bgcolor = f_efvgBiasColor(eemaFinalBias), text_size = size.small)
+        table.cell(eemaTbl, 1, 5, f_efvgBiasText(eemaFinalBias), text_color = color.white, bgcolor = f_efvgBiasColor(eemaFinalBias), text_size = size.small)
+        table.cell(eemaTbl, 2, 5, eemaShowDebug ? ("Th:" + str.tostring(eemaThreshold, "#.#")) : "", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 3, 5, "合計", text_color = color.white, text_size = size.small)
+        table.cell(eemaTbl, 4, 5, str.tostring(eemaTotal, "#.##"), text_color = color.white, bgcolor = f_efvgBiasColor(eemaFinalBias), text_size = size.small)
