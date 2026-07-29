@@ -249,7 +249,7 @@ newsSession3 = input.session("0300-0400", "指標除外時間3")
 //  4f. 入力 : FVG 環境認識モジュール (日足 / 4H / 1H / 15M)
 // ------------------------------------------------------------
 //  上位足の「最新の有効な Bullish/Bearish FVG」を確定足のみで監視し、
-//  吸収 / 反発(案C:包み足・ピンバー) / iFVG から各足の優勢(1/0/-1)を判定。
+//  FVG吸収のみから各足の優勢(1/0/-1)を判定 (反発 / iFVG は不使用)。
 //  複数足を統合し、従来のトレンド環境認識(EMAスコア)と結合する。
 //  ※ 非リペイント: request.security + lookahead_on + 確定1本前[1] を使用。
 // ============================================================
@@ -270,13 +270,10 @@ efvgHoldDaily = input.int(3,  "日足 状態保持本数",  minval = 1, group = 
 efvgHold4H    = input.int(6,  "4H 状態保持本数",   minval = 1, group = grpEFVG)
 efvgHold1H    = input.int(12, "1H 状態保持本数",   minval = 1, group = grpEFVG)
 efvgHold15M   = input.int(24, "15M 状態保持本数",  minval = 1, group = grpEFVG)
-// --- FVG / 吸収 / 反発 / ピンバー パラメータ ---
+// --- FVG / 吸収 パラメータ ---
 efvgMinThick   = input.float(0.10, "FVG最小厚み (幅/ATR)", step = 0.05, group = grpEFVG)
 efvgAbsBodyMin = input.float(0.50, "吸収 実体最小比率", step = 0.05, group = grpEFVG)
 efvgAbsEdge    = input.float(0.60, "吸収 終値端寄せ比率", step = 0.05, group = grpEFVG)
-efvgPinMult    = input.float(2.0,  "ピンバー ヒゲ/実体倍率", step = 0.1, group = grpEFVG)
-efvgPinOpp     = input.float(2.0,  "ピンバー 反対ヒゲ上限", step = 0.1, group = grpEFVG)
-efvgPinEdge    = input.float(0.66, "ピンバー 終値端寄せ比率", step = 0.05, group = grpEFVG)
 // --- 複数足 統合方式 ---
 efvgIntegrationMode = input.string("WeightedScore", "統合方式", options = ["AllAgree", "MatchCount", "WeightedScore", "HTFPriority"], group = grpEFVG)
 efvgReqMatch  = input.int(3, "必要一致足数 (MatchCount時)", minval = 1, maxval = 4, group = grpEFVG)
@@ -649,127 +646,89 @@ if useEnvFilter
 //  8f. FVG 環境認識モジュール 本体
 // ------------------------------------------------------------
 //  f_efvgState : 呼ばれた足(=上位足)のコンテキストで、最新の有効な
-//    Bull/Bear FVG を1本ずつ保持し、吸収 / 反発 / iFVG から優勢を判定する。
-//    吸収の方向定義は既存エンジンと同一 (Bull FVG下抜け=ショート / Bear FVG上抜け=ロング)。
-//    反発は案C (包み足 or ピンバー + FVGから離れる終値)。
+//    Bull/Bear FVG を1本ずつ保持し、FVG吸収のみから優勢を判定する。
+//    (反発 / 包み足反発 / ピンバー反発 / iFVG / 逆リテストは一切使用しない)
+//    吸収の方向定義は既存エンジンと同一:
+//      ・Bearish FVG を終値で上抜け吸収 → Long優勢
+//      ・Bullish FVG を終値で下抜け吸収 → Short優勢
+//    各FVGにつき吸収は1回だけ。新FVG形成で吸収判定を再度可能にする。
 //  戻り値 [bias, reason, remain, bullTop, bullBot, bearTop, bearBot]。
 //    bias : 1=Long優勢 / 0=Even / -1=Short優勢
-//    reason:  1=Bull反発 2=Bear吸収 3=iFVG(Long) -1=Bear反発 -2=Bull吸収 -3=iFVG(Short) 0=なし
+//    reason: 2=Bear吸収(Long) / -2=Bull吸収(Short) / 0=吸収なし
 //    remain: 状態保持の残り本数
 // ============================================================
-f_efvgState(int holdBars, float minThickR, float absBodyMin, float absEdge, float pinMult, float pinOpp, float pinEdge) =>
+f_efvgState(int holdBars, float minThickR, float absBodyMin, float absEdge) =>
     float _ref = ta.atr(14)
-    var float _btop = na
-    var float _bbot = na
+    var float _btop = na          // Bullish FVG 上端 (= low)
+    var float _bbot = na          // Bullish FVG 下端 (= high[2])
     var int   _bbar = na
-    var bool  _bdead = false
-    var bool  _babs  = false
-    var bool  _brebU = false
-    var float _rtop = na
-    var float _rbot = na
+    var bool  _babs  = false       // Bullish FVG が吸収済み (重複防止)
+    var float _rtop = na          // Bearish FVG 上端 (= low[2])
+    var float _rbot = na          // Bearish FVG 下端 (= high)
     var int   _rbar = na
-    var bool  _rdead = false
-    var bool  _rabs  = false
-    var bool  _rrebU = false
+    var bool  _rabs  = false       // Bearish FVG が吸収済み (重複防止)
     var int   _bias   = 0
     var int   _reason = 0
     var int   _evbar  = na
     // --- ローソク指標 ---
     float _body = math.abs(close - open)
     float _rng  = high - low
-    float _upW  = high - math.max(open, close)
-    float _loW  = math.min(open, close) - low
-    float _cpos = _rng > 0 ? (close - low) / _rng : 0.5
-    bool _bullEng = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
-    bool _bearEng = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
-    bool _bullPin = _loW > _body * pinMult and _loW > _upW * pinOpp and _cpos >= pinEdge
-    bool _bearPin = _upW > _body * pinMult and _upW > _loW * pinOpp and _cpos <= 1.0 - pinEdge
-    // --- 1) FVG形成 (最新を1本だけ保持) ---
+    // --- FVG形成 (最新を1本だけ保持・吸収フラグをリセット) ---
     bool _newBull = _ref > 0 and low > high[2] and ((low - high[2]) / _ref) >= minThickR
     bool _newBear = _ref > 0 and high < low[2] and ((low[2] - high) / _ref) >= minThickR
     if _newBull
         _btop := low
         _bbot := high[2]
         _bbar := bar_index
-        _bdead := false
-        _babs  := false
-        _brebU := false
+        _babs := false
     if _newBear
         _rtop := low[2]
         _rbot := high
         _rbar := bar_index
-        _rdead := false
-        _rabs  := false
-        _rrebU := false
+        _rabs := false
     bool _bodyStrong  = _rng > 0 and (_body / _rng) >= absBodyMin
     bool _closeNearHi = _rng > 0 and (close - low) / _rng >= absEdge
     bool _closeNearLo = _rng > 0 and (high - close) / _rng >= absEdge
-    // --- 2) 吸収 (既存定義: Bull FVG下抜け=Short / Bear FVG上抜け=Long) ---
-    bool _absShort = not na(_btop) and not _bdead and not _babs and bar_index > _bbar and close < open and close < _bbot and _bodyStrong and _closeNearLo
-    bool _absLong  = not na(_rtop) and not _rdead and not _rabs and bar_index > _rbar and close > open and close > _rtop and _bodyStrong and _closeNearHi
-    // --- 3) 反発 (案C: 包み足/ピンバー + FVGから離れる終値) ---
-    bool _bullTouch = not na(_btop) and bar_index > _bbar and low <= _btop and high >= _bbot
-    bool _bearTouch = not na(_rtop) and bar_index > _rbar and high >= _rbot and low <= _rtop
-    bool _rebLong  = _bullTouch and not _bdead and not _babs and not _brebU and (_bullEng or _bullPin) and close > open and close > _bbot
-    bool _rebShort = _bearTouch and not _rdead and not _rabs and not _rrebU and (_bearEng or _bearPin) and close < open and close < _rtop
-    // --- 4) iFVG (吸収済みFVGの逆リテスト確認) ---
-    bool _ifvgShort = not na(_btop) and _babs and not _bdead and high >= _bbot and close < open and close <= _btop
-    bool _ifvgLong  = not na(_rtop) and _rabs and not _rdead and low <= _rtop and close > open and close >= _rbot
-    // --- イベント確定 (優先度: 吸収 > 反発 > iFVG) ---
-    bool _evLong  = false
-    bool _evShort = false
-    int  _evReason = 0
-    if _absLong
-        _evLong := true
-        _evReason := 2
+    // --- 吸収イベント (各FVG1回のみ) ---
+    //   Long : Bearish FVG を陽線・終値で上端上抜け・実体率・終値上寄せ
+    //   Short: Bullish FVG を陰線・終値で下端下抜け・実体率・終値下寄せ
+    bool _absLong  = not na(_rtop) and not _rabs and bar_index > _rbar and close > open and close > _rtop and _bodyStrong and _closeNearHi
+    bool _absShort = not na(_btop) and not _babs and bar_index > _bbar and close < open and close < _bbot and _bodyStrong and _closeNearLo
+    // --- イベント確定 ---
+    if _absLong and _absShort
+        // 同時吸収 → 方向を予想せず Even (保持もクリア)。両FVGは使用済みに。
+        _bias := 0
+        _reason := 0
+        _evbar := na
         _rabs := true
-    if _absShort
-        _evShort := true
-        _evReason := -2
         _babs := true
-    if not _absLong and not _absShort
-        if _rebLong
-            _evLong := true
-            _evReason := 1
-            _brebU := true
-        if _rebShort
-            _evShort := true
-            _evReason := -1
-            _rrebU := true
-    if not _evLong and not _evShort
-        if _ifvgLong
-            _evLong := true
-            _evReason := 3
-            _rdead := true
-        if _ifvgShort
-            _evShort := true
-            _evReason := -3
-            _bdead := true
-    if _evLong and not _evShort
+    else if _absLong
         _bias := 1
-        _reason := _evReason
+        _reason := 2
         _evbar := bar_index
-    else if _evShort and not _evLong
+        _rabs := true
+    else if _absShort
         _bias := -1
-        _reason := _evReason
+        _reason := -2
         _evbar := bar_index
-    // --- 状態保持 / 失効 ---
-    bool _active = not na(_evbar) and (bar_index - _evbar) <= holdBars
+        _babs := true
+    // --- 状態保持 / 失効 (イベント足を1本目として数える: bar_index - evbar < holdBars) ---
+    bool _active = not na(_evbar) and (bar_index - _evbar) < holdBars
     int _outBias   = _active ? _bias : 0
     int _outReason = _active ? _reason : 0
     int _outRemain = _active ? holdBars - (bar_index - _evbar) : 0
     [_outBias, _outReason, _outRemain, _btop, _bbot, _rtop, _rbot]
 
 // 確定済み1本前を上位足コンテキスト内で返す非リペイント補助。
-f_efvgConfirmed(int holdBars, float minThickR, float absBodyMin, float absEdge, float pinMult, float pinOpp, float pinEdge) =>
-    [_b, _r, _rem, _bt, _bb, _rt, _rb] = f_efvgState(holdBars, minThickR, absBodyMin, absEdge, pinMult, pinOpp, pinEdge)
+f_efvgConfirmed(int holdBars, float minThickR, float absBodyMin, float absEdge) =>
+    [_b, _r, _rem, _bt, _bb, _rt, _rb] = f_efvgState(holdBars, minThickR, absBodyMin, absEdge)
     [_b[1], _r[1], _rem[1], _bt[1], _bb[1], _rt[1], _rb[1]]
 
 // --- テキスト変換 ---
 f_efvgBiasText(int b) =>
     b == 1 ? "LONG" : b == -1 ? "SHORT" : "EVEN"
 f_efvgReasonText(int c) =>
-    c == 1 ? "Bull FVG Rebound" : c == 2 ? "Bear FVG Absorption" : c == 3 ? "iFVG Bullish" : c == -1 ? "Bear FVG Rebound" : c == -2 ? "Bull FVG Absorption" : c == -3 ? "iFVG Bearish" : "No Event"
+    c == 2 ? "Bear FVG Absorption" : c == -2 ? "Bull FVG Absorption" : "No Absorption"
 
 // --- 各足の確定FVG状態 (OFF足は request.security を呼ばない) ---
 int efvgDBias = 0
@@ -801,7 +760,7 @@ float efvgMBB = na
 float efvgMRT = na
 float efvgMRB = na
 if useEFVGEnv and useEFVGDaily
-    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvgDailyTF, f_efvgConfirmed(efvgHoldDaily, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, efvgPinMult, efvgPinOpp, efvgPinEdge), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvgDailyTF, f_efvgConfirmed(efvgHoldDaily, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
     efvgDBias := _b
     efvgDReason := _r
     efvgDRem := _rem
@@ -810,7 +769,7 @@ if useEFVGEnv and useEFVGDaily
     efvgDRT := _rt
     efvgDRB := _rb
 if useEFVGEnv and useEFVG4H
-    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvg4HTF, f_efvgConfirmed(efvgHold4H, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, efvgPinMult, efvgPinOpp, efvgPinEdge), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvg4HTF, f_efvgConfirmed(efvgHold4H, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
     efvgHBias := _b
     efvgHReason := _r
     efvgHRem := _rem
@@ -819,7 +778,7 @@ if useEFVGEnv and useEFVG4H
     efvgHRT := _rt
     efvgHRB := _rb
 if useEFVGEnv and useEFVG1H
-    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvg1HTF, f_efvgConfirmed(efvgHold1H, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, efvgPinMult, efvgPinOpp, efvgPinEdge), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvg1HTF, f_efvgConfirmed(efvgHold1H, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
     efvgOBias := _b
     efvgOReason := _r
     efvgORem := _rem
@@ -828,7 +787,7 @@ if useEFVGEnv and useEFVG1H
     efvgORT := _rt
     efvgORB := _rb
 if useEFVGEnv and useEFVG15M
-    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvg15MTF, f_efvgConfirmed(efvgHold15M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, efvgPinMult, efvgPinOpp, efvgPinEdge), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvg15MTF, f_efvgConfirmed(efvgHold15M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
     efvgMBias := _b
     efvgMReason := _r
     efvgMRem := _rem
