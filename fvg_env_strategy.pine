@@ -439,6 +439,30 @@ hsEnvShowLabels = input.bool(false, "採用パターンのラベルを表示 (LS
 hsEnvLabelTF    = input.string("15M", "ラベル表示TF", options = ["D", "4H", "1H", "15M"], group = grpHSEnv)
 
 // ============================================================
+//  4j. 入力 : Fib 環境認識モジュール (MTF・大きな波の押し/戻り評価)
+// ------------------------------------------------------------
+//  「現在の大きな波に対してどの程度 押し/戻し が入っているか」を評価する環境認識。
+//  日足/4H/1H/15M を各足の中で独立して計算 (request.security)。Bull/Bear/Neutral の
+//  1状態のみ保持し、小さな押し戻しで波を切り替えない。接頭辞 fibEnv。
+//  ※ 今回は出力のみ。既存 canLong/canShort・環境スコア・アラートには接続しない。
+//  非リペイント: request.security + lookahead_on + 上位足内 確定1本前[1]。
+// ============================================================
+grpFibEnv = "Fib 環境認識 (MTF)"
+useFibEnvEnv = input.bool(true, "Fib環境認識を使う (出力のみ)", group = grpFibEnv)
+useFibEnvD   = input.bool(true, "日足を使う", group = grpFibEnv)
+useFibEnvH4  = input.bool(true, "4Hを使う",  group = grpFibEnv)
+useFibEnvH1  = input.bool(true, "1Hを使う",  group = grpFibEnv)
+useFibEnvM15 = input.bool(true, "15Mを使う", group = grpFibEnv)
+fibEnvDailyTF = input.timeframe("D",   "日足TF", group = grpFibEnv)
+fibEnv4HTF    = input.timeframe("240", "4H TF",  group = grpFibEnv)
+fibEnv1HTF    = input.timeframe("60",  "1H TF",  group = grpFibEnv)
+fibEnv15MTF   = input.timeframe("15",  "15M TF", group = grpFibEnv)
+fibEnvAtrLen          = input.int(14, "Fib環境 ATR期間", minval = 1, group = grpFibEnv)
+fibEnvSwingLen        = input.int(3,  "Fib環境 スイング検出 左右本数", minval = 1, group = grpFibEnv)
+fibEnvMinSwingAtrMult = input.float(3.0, "Fib環境 最低波幅 (ATR倍)", minval = 0.1, step = 0.1, group = grpFibEnv)
+fibEnvShowTable = input.bool(true, "Fib環境テーブルを表示", group = grpFibEnv)
+
+// ============================================================
 //  5. 包み足判定
 // ============================================================
 bool prevUp = close[1] > open[1]
@@ -1636,6 +1660,150 @@ bool allowLongByHSEnv  = not hsEnvFilterActive or hsEnvBias == 1
 bool allowShortByHSEnv = not hsEnvFilterActive or hsEnvBias == -1
 
 // ============================================================
+//  8j. Fib 環境認識モジュール 本体 (MTF・大きな波の押し/戻り)
+// ------------------------------------------------------------
+//  f_fibEnvState : 呼ばれた足(=上位足)コンテキストで、その足のPivot/波/起点/終点を
+//    独立管理。Bull/Bear/Neutral の1状態のみ保持。起点固定・終点のみ更新。
+//    無効化は起点の終値突破 (ヒゲ突破は無効化しない)。波中の逆行=押し/戻し。
+//  戻り値 [direction, longScore, shortScore, retr, origin, extreme]。
+//  ※ 出力のみ。canLong/canShort・環境スコア・アラートには接続しない。
+// ============================================================
+// Fibリトレース位置 → スコア (境界は下側 >= 上側 < で重複なし)
+f_fibEnvScore(float r) =>
+    na(r) ? 0 :
+     r >= 0.786 ? 0 :
+     r >= 0.618 ? 2 :
+     r >= 0.500 ? 3 :
+     r >= 0.382 ? 2 :
+     r >= 0.236 ? 1 : 0
+
+f_fibEnvState(int atrLen, int swingLen, float minMult) =>
+    float _atr = ta.atr(atrLen)
+    float _ph  = ta.pivothigh(high, swingLen, swingLen)
+    float _pl  = ta.pivotlow(low,  swingLen, swingLen)
+    float _minSwing = _atr * minMult
+    var int   _state   = 0
+    var float _origin  = na
+    var float _extreme = na
+    var float _pendLow     = na
+    var int   _pendLowBar  = na
+    var float _pendHigh    = na
+    var int   _pendHighBar = na
+    // 有意Pivotを起点候補として更新
+    if not na(_pl)
+        _pendLow    := _pl
+        _pendLowBar := bar_index - swingLen
+    if not na(_ph)
+        _pendHigh    := _ph
+        _pendHighBar := bar_index - swingLen
+    int _prev = _state
+    // アクティブ波: 終点のみ更新 / 起点の終値突破で無効化
+    if _state == 1
+        if high > _extreme
+            _extreme := high
+        if close <= _origin
+            _state := 0
+            _origin := na
+            _extreme := na
+    else if _state == -1
+        if low < _extreme
+            _extreme := low
+        if close >= _origin
+            _state := 0
+            _origin := na
+            _extreme := na
+    // 新しい有意波の確定 (Neutralから来た足のみ = 無効化直後の同足では反対波を作らない)
+    if _prev == 0 and _state == 0
+        bool _bullOk = not na(_ph) and not na(_pendLow)  and _pendLowBar  < (bar_index - swingLen) and (_ph - _pendLow) >= _minSwing
+        bool _bearOk = not na(_pl) and not na(_pendHigh) and _pendHighBar < (bar_index - swingLen) and (_pendHigh - _pl) >= _minSwing
+        if _bullOk and (not _bearOk or (_ph - _pendLow) >= (_pendHigh - _pl))
+            _state   := 1
+            _origin  := _pendLow
+            _extreme := math.max(_ph, high)
+        else if _bearOk
+            _state   := -1
+            _origin  := _pendHigh
+            _extreme := math.min(_pl, low)
+    // リトレース率 (毎バー現在値・0〜1・最大値は保持しない)
+    float _retr = na
+    if _state == 1 and not na(_extreme) and not na(_origin) and (_extreme - _origin) > 0
+        _retr := math.max(0.0, math.min(1.0, (_extreme - close) / (_extreme - _origin)))
+    else if _state == -1 and not na(_extreme) and not na(_origin) and (_origin - _extreme) > 0
+        _retr := math.max(0.0, math.min(1.0, (close - _extreme) / (_origin - _extreme)))
+    int _scoreRaw = f_fibEnvScore(_retr)
+    int _long  = _state == 1  ? _scoreRaw : 0
+    int _short = _state == -1 ? _scoreRaw : 0
+    [_state, _long, _short, _retr, _origin, _extreme]
+
+// 確定済み1本前を上位足コンテキスト内で返す非リペイント補助 (lookahead_on + [1])。
+f_fibEnvConfirmed(int atrLen, int swingLen, float minMult) =>
+    [_d, _l, _s, _r, _o, _e] = f_fibEnvState(atrLen, swingLen, minMult)
+    [_d[1], _l[1], _s[1], _r[1], _o[1], _e[1]]
+
+f_fibEnvDirText(int d) =>
+    d == 1 ? "BULL" : d == -1 ? "BEAR" : "NEUTRAL"
+f_fibEnvDirColor(int d, bool on) =>
+    not on ? color.new(color.black, 0) : d == 1 ? color.new(color.green, 0) : d == -1 ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+// --- 各足の確定 Fib環境状態 (OFF足は request.security を呼ばない) ---
+int   fibEnvDirection_D   = 0
+int   fibEnvLongScore_D   = 0
+int   fibEnvShortScore_D  = 0
+float fibEnvRetr_D        = na
+float fibEnvOrigin_D      = na
+float fibEnvExtreme_D     = na
+int   fibEnvDirection_H4  = 0
+int   fibEnvLongScore_H4  = 0
+int   fibEnvShortScore_H4 = 0
+float fibEnvRetr_H4       = na
+float fibEnvOrigin_H4     = na
+float fibEnvExtreme_H4    = na
+int   fibEnvDirection_H1  = 0
+int   fibEnvLongScore_H1  = 0
+int   fibEnvShortScore_H1 = 0
+float fibEnvRetr_H1       = na
+float fibEnvOrigin_H1     = na
+float fibEnvExtreme_H1    = na
+int   fibEnvDirection_M15 = 0
+int   fibEnvLongScore_M15 = 0
+int   fibEnvShortScore_M15= 0
+float fibEnvRetr_M15      = na
+float fibEnvOrigin_M15    = na
+float fibEnvExtreme_M15   = na
+if useFibEnvEnv and useFibEnvD
+    [_d, _l, _s, _r, _o, _e] = request.security(syminfo.tickerid, fibEnvDailyTF, f_fibEnvConfirmed(fibEnvAtrLen, fibEnvSwingLen, fibEnvMinSwingAtrMult), lookahead = barmerge.lookahead_on)
+    fibEnvDirection_D := _d
+    fibEnvLongScore_D := _l
+    fibEnvShortScore_D := _s
+    fibEnvRetr_D := _r
+    fibEnvOrigin_D := _o
+    fibEnvExtreme_D := _e
+if useFibEnvEnv and useFibEnvH4
+    [_d, _l, _s, _r, _o, _e] = request.security(syminfo.tickerid, fibEnv4HTF, f_fibEnvConfirmed(fibEnvAtrLen, fibEnvSwingLen, fibEnvMinSwingAtrMult), lookahead = barmerge.lookahead_on)
+    fibEnvDirection_H4 := _d
+    fibEnvLongScore_H4 := _l
+    fibEnvShortScore_H4 := _s
+    fibEnvRetr_H4 := _r
+    fibEnvOrigin_H4 := _o
+    fibEnvExtreme_H4 := _e
+if useFibEnvEnv and useFibEnvH1
+    [_d, _l, _s, _r, _o, _e] = request.security(syminfo.tickerid, fibEnv1HTF, f_fibEnvConfirmed(fibEnvAtrLen, fibEnvSwingLen, fibEnvMinSwingAtrMult), lookahead = barmerge.lookahead_on)
+    fibEnvDirection_H1 := _d
+    fibEnvLongScore_H1 := _l
+    fibEnvShortScore_H1 := _s
+    fibEnvRetr_H1 := _r
+    fibEnvOrigin_H1 := _o
+    fibEnvExtreme_H1 := _e
+if useFibEnvEnv and useFibEnvM15
+    [_d, _l, _s, _r, _o, _e] = request.security(syminfo.tickerid, fibEnv15MTF, f_fibEnvConfirmed(fibEnvAtrLen, fibEnvSwingLen, fibEnvMinSwingAtrMult), lookahead = barmerge.lookahead_on)
+    fibEnvDirection_M15 := _d
+    fibEnvLongScore_M15 := _l
+    fibEnvShortScore_M15 := _s
+    fibEnvRetr_M15 := _r
+    fibEnvOrigin_M15 := _o
+    fibEnvExtreme_M15 := _e
+
+// ============================================================
 //  9. SL / TP / ロット計算
 // ============================================================
 float patLow  = math.min(low,  low[1])
@@ -2347,3 +2515,59 @@ if hsEnvShowLabels and barstate.islast
         array.push(hsEnvLbls, label.new(hsLblRsT, hsLblRsP, "RS", xloc = xloc.bar_time, style = label.style_label_up,   color = color.new(color.gray, 20),  textcolor = color.white, size = size.tiny))
         array.push(hsEnvLbls, label.new(hsLblN1T, hsLblN1P, "N1", xloc = xloc.bar_time, style = label.style_label_down, color = color.new(color.blue, 20),  textcolor = color.white, size = size.tiny))
         array.push(hsEnvLbls, label.new(hsLblN2T, hsLblN2P, "N2", xloc = xloc.bar_time, style = label.style_label_down, color = color.new(color.blue, 20),  textcolor = color.white, size = size.tiny))
+
+// ============================================================
+//  12e. Fib 環境認識 (MTF) 表示 (テーブル + Data Window)
+// ============================================================
+var table fibEnvTbl = na
+if fibEnvShowTable
+    if na(fibEnvTbl)
+        fibEnvTbl := table.new(position.middle_left, 5, 5, border_width = 1)
+    if barstate.islast
+        table.cell(fibEnvTbl, 0, 0, "FibEnv", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(fibEnvTbl, 1, 0, "方向",   text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(fibEnvTbl, 2, 0, "戻/押%", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(fibEnvTbl, 3, 0, "L",      text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(fibEnvTbl, 4, 0, "S",      text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        // Daily
+        table.cell(fibEnvTbl, 0, 1, "D", text_color = color.white, text_size = size.small)
+        table.cell(fibEnvTbl, 1, 1, useFibEnvD ? f_fibEnvDirText(fibEnvDirection_D) : "-", text_color = color.white, bgcolor = f_fibEnvDirColor(fibEnvDirection_D, useFibEnvD), text_size = size.small)
+        table.cell(fibEnvTbl, 2, 1, useFibEnvD and not na(fibEnvRetr_D) ? str.tostring(fibEnvRetr_D * 100.0, "#.#") : "-", text_color = color.white, text_size = size.small)
+        table.cell(fibEnvTbl, 3, 1, useFibEnvD ? str.tostring(fibEnvLongScore_D) : "-", text_color = color.white, text_size = size.small)
+        table.cell(fibEnvTbl, 4, 1, useFibEnvD ? str.tostring(fibEnvShortScore_D) : "-", text_color = color.white, text_size = size.small)
+        // 4H
+        table.cell(fibEnvTbl, 0, 2, "4H", text_color = color.white, text_size = size.small)
+        table.cell(fibEnvTbl, 1, 2, useFibEnvH4 ? f_fibEnvDirText(fibEnvDirection_H4) : "-", text_color = color.white, bgcolor = f_fibEnvDirColor(fibEnvDirection_H4, useFibEnvH4), text_size = size.small)
+        table.cell(fibEnvTbl, 2, 2, useFibEnvH4 and not na(fibEnvRetr_H4) ? str.tostring(fibEnvRetr_H4 * 100.0, "#.#") : "-", text_color = color.white, text_size = size.small)
+        table.cell(fibEnvTbl, 3, 2, useFibEnvH4 ? str.tostring(fibEnvLongScore_H4) : "-", text_color = color.white, text_size = size.small)
+        table.cell(fibEnvTbl, 4, 2, useFibEnvH4 ? str.tostring(fibEnvShortScore_H4) : "-", text_color = color.white, text_size = size.small)
+        // 1H
+        table.cell(fibEnvTbl, 0, 3, "1H", text_color = color.white, text_size = size.small)
+        table.cell(fibEnvTbl, 1, 3, useFibEnvH1 ? f_fibEnvDirText(fibEnvDirection_H1) : "-", text_color = color.white, bgcolor = f_fibEnvDirColor(fibEnvDirection_H1, useFibEnvH1), text_size = size.small)
+        table.cell(fibEnvTbl, 2, 3, useFibEnvH1 and not na(fibEnvRetr_H1) ? str.tostring(fibEnvRetr_H1 * 100.0, "#.#") : "-", text_color = color.white, text_size = size.small)
+        table.cell(fibEnvTbl, 3, 3, useFibEnvH1 ? str.tostring(fibEnvLongScore_H1) : "-", text_color = color.white, text_size = size.small)
+        table.cell(fibEnvTbl, 4, 3, useFibEnvH1 ? str.tostring(fibEnvShortScore_H1) : "-", text_color = color.white, text_size = size.small)
+        // 15M
+        table.cell(fibEnvTbl, 0, 4, "15M", text_color = color.white, text_size = size.small)
+        table.cell(fibEnvTbl, 1, 4, useFibEnvM15 ? f_fibEnvDirText(fibEnvDirection_M15) : "-", text_color = color.white, bgcolor = f_fibEnvDirColor(fibEnvDirection_M15, useFibEnvM15), text_size = size.small)
+        table.cell(fibEnvTbl, 2, 4, useFibEnvM15 and not na(fibEnvRetr_M15) ? str.tostring(fibEnvRetr_M15 * 100.0, "#.#") : "-", text_color = color.white, text_size = size.small)
+        table.cell(fibEnvTbl, 3, 4, useFibEnvM15 ? str.tostring(fibEnvLongScore_M15) : "-", text_color = color.white, text_size = size.small)
+        table.cell(fibEnvTbl, 4, 4, useFibEnvM15 ? str.tostring(fibEnvShortScore_M15) : "-", text_color = color.white, text_size = size.small)
+
+// Data Window : 各TFの Direction / Long / Short / Retr
+plot(fibEnvDirection_D,   "fibEnvDirection_D",   display = display.data_window)
+plot(fibEnvLongScore_D,   "fibEnvLongScore_D",   display = display.data_window)
+plot(fibEnvShortScore_D,  "fibEnvShortScore_D",  display = display.data_window)
+plot(fibEnvRetr_D,        "fibEnvRetr_D",        display = display.data_window)
+plot(fibEnvDirection_H4,  "fibEnvDirection_H4",  display = display.data_window)
+plot(fibEnvLongScore_H4,  "fibEnvLongScore_H4",  display = display.data_window)
+plot(fibEnvShortScore_H4, "fibEnvShortScore_H4", display = display.data_window)
+plot(fibEnvRetr_H4,       "fibEnvRetr_H4",       display = display.data_window)
+plot(fibEnvDirection_H1,  "fibEnvDirection_H1",  display = display.data_window)
+plot(fibEnvLongScore_H1,  "fibEnvLongScore_H1",  display = display.data_window)
+plot(fibEnvShortScore_H1, "fibEnvShortScore_H1", display = display.data_window)
+plot(fibEnvRetr_H1,       "fibEnvRetr_H1",       display = display.data_window)
+plot(fibEnvDirection_M15, "fibEnvDirection_M15", display = display.data_window)
+plot(fibEnvLongScore_M15, "fibEnvLongScore_M15", display = display.data_window)
+plot(fibEnvShortScore_M15,"fibEnvShortScore_M15",display = display.data_window)
+plot(fibEnvRetr_M15,      "fibEnvRetr_M15",      display = display.data_window)
