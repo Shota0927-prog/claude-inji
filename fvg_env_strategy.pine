@@ -386,6 +386,50 @@ eStochShowTable = input.bool(true,  "Stoch環境テーブルを表示", group = 
 eStochShowDebug = input.bool(false, "Stochデバッグ表示", group = grpEStoch)
 
 // ============================================================
+//  4i. 入力 : 三尊 / 逆三尊 環境認識モジュール (H&S WinZone とは別)
+// ------------------------------------------------------------
+//  三尊完成後のネックライン下抜け → 下降環境 / 逆三尊完成後の上抜け → 上昇環境。
+//  ネックラインブレイク後、一定期間だけ方向バイアス(hsEnvBias)を保持する。
+//  既存の H&S WinZone とは完全に独立 (接頭辞 hsEnv)。逆方向禁止フィルターとして接続。
+//  非リペイント: request.security + lookahead_off + 上位足内 確定1本前[1]。
+// ============================================================
+grpHSEnv = "環境: 三尊 / 逆三尊"
+useHSEnvEnv = input.bool(true, "三尊環境認識を使う", group = grpHSEnv)
+useHSEnvD   = input.bool(true, "日足を使う", group = grpHSEnv)
+useHSEnv4H  = input.bool(true, "4Hを使う",  group = grpHSEnv)
+useHSEnv1H  = input.bool(true, "1Hを使う",  group = grpHSEnv)
+useHSEnv15M = input.bool(true, "15Mを使う", group = grpHSEnv)
+hsEnvDailyTF = input.timeframe("D",   "日足TF", group = grpHSEnv)
+hsEnv4HTF    = input.timeframe("240", "4H TF",  group = grpHSEnv)
+hsEnv1HTF    = input.timeframe("60",  "1H TF",  group = grpHSEnv)
+hsEnv15MTF   = input.timeframe("15",  "15M TF", group = grpHSEnv)
+// --- 検知パラメータ ---
+hsEnvPivotLen       = input.int(5, "Pivot Length", minval = 1, group = grpHSEnv)
+hsEnvShoulderTol    = input.float(0.004, "肩の許容差", step = 0.001, group = grpHSEnv)
+hsEnvHeadPromMult   = input.float(1.0, "頭と肩の最低差 ATR倍率", step = 0.1, group = grpHSEnv)
+hsEnvBreakBufferATR = input.float(0.1, "ネックラインブレイクのATRバッファ", step = 0.05, group = grpHSEnv)
+useHSEnvBodyFilter  = input.bool(true, "ブレイク実体率フィルターを使う", group = grpHSEnv)
+hsEnvMinBodyRatio   = input.float(0.5, "最低ブレイク実体率", minval = 0.0, maxval = 1.0, step = 0.05, group = grpHSEnv)
+// --- 状態保持本数 (各足の足数) ---
+hsEnvHoldDaily = input.int(3,  "日足 状態保持本数",  minval = 1, group = grpHSEnv)
+hsEnvHold4H    = input.int(6,  "4H 状態保持本数",   minval = 1, group = grpHSEnv)
+hsEnvHold1H    = input.int(12, "1H 状態保持本数",   minval = 1, group = grpHSEnv)
+hsEnvHold15M   = input.int(24, "15M 状態保持本数",  minval = 1, group = grpHSEnv)
+// --- 統合方法 ---
+hsEnvCombineMode = input.string("WeightedScore", "三尊環境の結合方法", options = ["HigherTF", "WeightedScore"], group = grpHSEnv)
+hsEnvWeightD   = input.int(4, "重み 日足",  minval = 0, group = grpHSEnv)
+hsEnvWeight4H  = input.int(3, "重み 4H",   minval = 0, group = grpHSEnv)
+hsEnvWeight1H  = input.int(2, "重み 1H",   minval = 0, group = grpHSEnv)
+hsEnvWeight15M = input.int(1, "重み 15M",  minval = 0, group = grpHSEnv)
+hsEnvScoreThreshold = input.int(3, "WeightedScore 閾値 (±)", minval = 1, group = grpHSEnv)
+// --- エントリー接続 (逆方向禁止フィルター) ---
+useHSEnvBias         = input.bool(false, "三尊方向バイアスを使う (OFFで既存挙動を維持)", group = grpHSEnv)
+useHSEnvReverseBlock = input.bool(true,  "三尊の逆方向を禁止する", group = grpHSEnv)
+// --- 表示 ---
+hsEnvShowTable = input.bool(true,  "三尊環境テーブルを表示", group = grpHSEnv)
+hsEnvShowDebug = input.bool(false, "三尊環境デバッグ表示", group = grpHSEnv)
+
+// ============================================================
 //  5. 包み足判定
 // ============================================================
 bool prevUp = close[1] > open[1]
@@ -1174,6 +1218,116 @@ bool allEnvShortOk =
      stochShortOk
 
 // ============================================================
+//  8i. 三尊 / 逆三尊 環境認識モジュール 本体 (H&S WinZone とは別)
+// ------------------------------------------------------------
+//  f_hsEnvState : 呼ばれた足(=上位足)コンテキストで、直近3つの Pivot High/Low から
+//    三尊/逆三尊を簡易検出し、ネックライン ± ATRバッファ を終値ブレイクした時点で
+//    方向を確定 (三尊下抜け=-1 / 逆三尊上抜け=+1)。holdBars 本だけ保持し失効で0。
+//    同一パターンでは再更新しない (新Pivot形成で再アーム)。反対確定で即上書き。
+//  戻り値 int (1=上昇 / 0=中立 / -1=下降)。
+// ============================================================
+f_hsEnvState(int holdBars) =>
+    float _atr = ta.atr(14)
+    float _ph = ta.pivothigh(hsEnvPivotLen, hsEnvPivotLen)
+    float _pl = ta.pivotlow(hsEnvPivotLen, hsEnvPivotLen)
+    var float _ph1 = na
+    var float _ph2 = na
+    var float _ph3 = na
+    var float _pl1 = na
+    var float _pl2 = na
+    var float _pl3 = na
+    var bool  _topConsumed = false
+    var bool  _botConsumed = false
+    var float _neckTop = na
+    var float _neckBot = na
+    var bool  _topReady = false
+    var bool  _botReady = false
+    var int   _bias  = 0
+    var int   _evbar = na
+    if not na(_ph)
+        _ph3 := _ph2
+        _ph2 := _ph1
+        _ph1 := _ph
+        _topConsumed := false
+    if not na(_pl)
+        _pl3 := _pl2
+        _pl2 := _pl1
+        _pl1 := _pl
+        _botConsumed := false
+    // 三尊 (左肩=_ph3, 頭=_ph2, 右肩=_ph1)。ネックライン = 直近2つの Pivot Low の平均。
+    if not na(_ph1) and not na(_ph2) and not na(_ph3) and not na(_pl1) and not na(_pl2)
+        bool _headHi = _ph2 > _ph1 and _ph2 > _ph3
+        bool _symOk  = _ph2 != 0 and math.abs(_ph3 - _ph1) / _ph2 <= hsEnvShoulderTol
+        bool _promOk = (_ph2 - math.max(_ph1, _ph3)) >= _atr * hsEnvHeadPromMult
+        if _headHi and _symOk and _promOk
+            _neckTop := (_pl1 + _pl2) / 2.0
+            _topReady := true
+    // 逆三尊 (左肩=_pl3, 頭=_pl2, 右肩=_pl1)。ネックライン = 直近2つの Pivot High の平均。
+    if not na(_pl1) and not na(_pl2) and not na(_pl3) and not na(_ph1) and not na(_ph2)
+        bool _headLo  = _pl2 < _pl1 and _pl2 < _pl3
+        bool _symOkB  = _pl2 != 0 and math.abs(_pl3 - _pl1) / math.abs(_pl2) <= hsEnvShoulderTol
+        bool _promOkB = (math.min(_pl1, _pl3) - _pl2) >= _atr * hsEnvHeadPromMult
+        if _headLo and _symOkB and _promOkB
+            _neckBot := (_ph1 + _ph2) / 2.0
+            _botReady := true
+    // ネックラインブレイク確定 (実体率 + 方向ローソク)
+    float _bodyRatio = math.abs(close - open) / math.max(high - low, syminfo.mintick)
+    bool _bodyOk = not useHSEnvBodyFilter or _bodyRatio >= hsEnvMinBodyRatio
+    bool _sellConfirm = _topReady and not _topConsumed and not na(_neckTop) and close < _neckTop - _atr * hsEnvBreakBufferATR and close < open and _bodyOk
+    bool _buyConfirm  = _botReady and not _botConsumed and not na(_neckBot) and close > _neckBot + _atr * hsEnvBreakBufferATR and close > open and _bodyOk
+    if _sellConfirm and not _buyConfirm
+        _bias := -1
+        _evbar := bar_index
+        _topConsumed := true
+    else if _buyConfirm and not _sellConfirm
+        _bias := 1
+        _evbar := bar_index
+        _botConsumed := true
+    bool _active = not na(_evbar) and (bar_index - _evbar) < holdBars
+    int _out = _active ? _bias : 0
+    _out
+
+// 確定済み1本前を上位足コンテキスト内で返す非リペイント補助 (lookahead_off)。
+f_hsEnvConfirmed(int holdBars) =>
+    int _b = f_hsEnvState(holdBars)
+    _b[1]
+
+f_hsEnvText(int b) =>
+    b == 1 ? "逆三尊 / UP" : b == -1 ? "三尊 / DOWN" : "中立 / EVEN"
+f_hsEnvColor(int b, bool on) =>
+    not on ? color.new(color.black, 0) : b == 1 ? color.new(color.green, 0) : b == -1 ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+// --- 各足の確定 三尊環境状態 (使用 or 表示時のみ算出。OFF足は request.security を呼ばない) ---
+bool hsEnvCompute = useHSEnvEnv and (useHSEnvBias or hsEnvShowTable)
+int hsEnvD   = 0
+int hsEnv4H  = 0
+int hsEnv1H  = 0
+int hsEnv15M = 0
+if hsEnvCompute and useHSEnvD
+    hsEnvD := request.security(syminfo.tickerid, hsEnvDailyTF, f_hsEnvConfirmed(hsEnvHoldDaily), lookahead = barmerge.lookahead_off)
+if hsEnvCompute and useHSEnv4H
+    hsEnv4H := request.security(syminfo.tickerid, hsEnv4HTF, f_hsEnvConfirmed(hsEnvHold4H), lookahead = barmerge.lookahead_off)
+if hsEnvCompute and useHSEnv1H
+    hsEnv1H := request.security(syminfo.tickerid, hsEnv1HTF, f_hsEnvConfirmed(hsEnvHold1H), lookahead = barmerge.lookahead_off)
+if hsEnvCompute and useHSEnv15M
+    hsEnv15M := request.security(syminfo.tickerid, hsEnv15MTF, f_hsEnvConfirmed(hsEnvHold15M), lookahead = barmerge.lookahead_off)
+
+// --- 統合 (HigherTF: 上位足優先で最初の非ゼロ / WeightedScore: 重み合計を閾値判定) ---
+int hsEnvHigherTF =
+     (useHSEnvD   and hsEnvD   != 0) ? hsEnvD   :
+     (useHSEnv4H  and hsEnv4H  != 0) ? hsEnv4H  :
+     (useHSEnv1H  and hsEnv1H  != 0) ? hsEnv1H  :
+     (useHSEnv15M and hsEnv15M != 0) ? hsEnv15M : 0
+int hsEnvScore = (useHSEnvD ? hsEnvWeightD * hsEnvD : 0) + (useHSEnv4H ? hsEnvWeight4H * hsEnv4H : 0) + (useHSEnv1H ? hsEnvWeight1H * hsEnv1H : 0) + (useHSEnv15M ? hsEnvWeight15M * hsEnv15M : 0)
+int hsEnvWeighted = hsEnvScore >= hsEnvScoreThreshold ? 1 : hsEnvScore <= -hsEnvScoreThreshold ? -1 : 0
+int hsEnvBias = not useHSEnvEnv ? 0 : hsEnvCombineMode == "HigherTF" ? hsEnvHigherTF : hsEnvWeighted
+
+// --- 逆方向禁止フィルター (三尊が下方向→ロング禁止 / 逆三尊が上方向→ショート禁止) ---
+bool hsEnvFilterActive = useHSEnvEnv and useHSEnvBias and useHSEnvReverseBlock
+bool allowLongByHSEnv  = not hsEnvFilterActive or hsEnvBias != -1
+bool allowShortByHSEnv = not hsEnvFilterActive or hsEnvBias != 1
+
+// ============================================================
 //  9. SL / TP / ロット計算
 // ============================================================
 float patLow  = math.min(low,  low[1])
@@ -1619,6 +1773,7 @@ bool canLong =
      sessionOk and
      allowByNewsTime and
      allEnvLongOk and
+     allowLongByHSEnv and
      allowLongByTrigger and
      volOk and
      not blockedByAccum and
@@ -1633,6 +1788,7 @@ bool canShort =
      sessionOk and
      allowByNewsTime and
      allEnvShortOk and
+     allowShortByHSEnv and
      allowShortByTrigger and
      volOk and
      not blockedByAccum and
@@ -1825,3 +1981,34 @@ if eStochShowTable
         table.cell(eStochTbl, 2, 5, eStochShowDebug ? ("Th:" + str.tostring(eStochScoreThreshold, "#.#")) : "", text_color = color.white, text_size = size.small)
         table.cell(eStochTbl, 3, 5, "合計", text_color = color.white, text_size = size.small)
         table.cell(eStochTbl, 4, 5, str.tostring(eStochTotal, "#.##"), text_color = color.white, bgcolor = f_efvgBiasColor(eStochFinalBias), text_size = size.small)
+
+// ============================================================
+//  12d. 三尊 / 逆三尊 環境認識 表示 (デバッグテーブル + Data Window)
+// ============================================================
+var table hsEnvTbl = na
+if hsEnvShowTable
+    if na(hsEnvTbl)
+        hsEnvTbl := table.new(position.bottom_left, 2, 6, border_width = 1)
+    if barstate.islast
+        table.cell(hsEnvTbl, 0, 0, "H&S Env", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(hsEnvTbl, 1, 0, "状態",    text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(hsEnvTbl, 0, 1, "H&S D", text_color = color.white, text_size = size.small)
+        table.cell(hsEnvTbl, 1, 1, useHSEnvD ? f_hsEnvText(hsEnvD) : "OFF", text_color = color.white, bgcolor = f_hsEnvColor(hsEnvD, useHSEnvD), text_size = size.small)
+        table.cell(hsEnvTbl, 0, 2, "H&S 4H", text_color = color.white, text_size = size.small)
+        table.cell(hsEnvTbl, 1, 2, useHSEnv4H ? f_hsEnvText(hsEnv4H) : "OFF", text_color = color.white, bgcolor = f_hsEnvColor(hsEnv4H, useHSEnv4H), text_size = size.small)
+        table.cell(hsEnvTbl, 0, 3, "H&S 1H", text_color = color.white, text_size = size.small)
+        table.cell(hsEnvTbl, 1, 3, useHSEnv1H ? f_hsEnvText(hsEnv1H) : "OFF", text_color = color.white, bgcolor = f_hsEnvColor(hsEnv1H, useHSEnv1H), text_size = size.small)
+        table.cell(hsEnvTbl, 0, 4, "H&S 15M", text_color = color.white, text_size = size.small)
+        table.cell(hsEnvTbl, 1, 4, useHSEnv15M ? f_hsEnvText(hsEnv15M) : "OFF", text_color = color.white, bgcolor = f_hsEnvColor(hsEnv15M, useHSEnv15M), text_size = size.small)
+        table.cell(hsEnvTbl, 0, 5, "H&S TOTAL", text_color = color.white, text_size = size.small)
+        table.cell(hsEnvTbl, 1, 5, f_hsEnvText(hsEnvBias) + (hsEnvShowDebug ? (" (" + str.tostring(hsEnvScore) + ")") : ""), text_color = color.white, bgcolor = f_hsEnvColor(hsEnvBias, useHSEnvEnv), text_size = size.small)
+
+// Data Window (デバッグ) : 各時間足の状態 / WeightedScore / 統合バイアス
+plot(useHSEnvEnv ? hsEnvD   : na, "hsEnvD",    display = display.data_window)
+plot(useHSEnvEnv ? hsEnv4H  : na, "hsEnv4H",   display = display.data_window)
+plot(useHSEnvEnv ? hsEnv1H  : na, "hsEnv1H",   display = display.data_window)
+plot(useHSEnvEnv ? hsEnv15M : na, "hsEnv15M",  display = display.data_window)
+plot(useHSEnvEnv ? hsEnvScore : na, "hsEnvScore", display = display.data_window)
+plot(useHSEnvEnv ? hsEnvBias  : na, "hsEnvBias",  display = display.data_window)
+plot(allowLongByHSEnv  ? 1 : 0, "allowLongByHSEnv",  display = display.data_window)
+plot(allowShortByHSEnv ? 1 : 0, "allowShortByHSEnv", display = display.data_window)
