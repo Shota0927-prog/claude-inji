@@ -338,6 +338,51 @@ eemaShowTable = input.bool(true,  "EMA環境テーブルを表示", group = grpE
 eemaShowDebug = input.bool(false, "EMAデバッグ表示", group = grpEEMA)
 
 // ============================================================
+//  4h. 入力 : Stochastic 環境認識モジュール (折り返しのみ)
+// ------------------------------------------------------------
+//  EMA環境認識と同じ設計。ストキャスの「折り返し」だけを評価する。
+//    ・K が 10以下へ到達 → 上向き折り返し = +2 (Long)
+//    ・K が 90以上へ到達 → 下向き折り返し = +2 (Short)
+//  張り付き評価・マイナス点は無し。到達履歴は EMA と同じ状態管理で保持。
+//  非リペイント: request.security + lookahead_on + 上位足内 確定1本前[1]。
+// ============================================================
+grpEStoch = "Stochastic 環境認識"
+useEStochEnv = input.bool(false, "Stochastic環境認識をエントリーに使う (OFFで既存挙動を維持)", group = grpEStoch)
+// --- 対象時間足 (OFFにした足は request.security を呼ばない) ---
+useEStochDaily = input.bool(true, "日足Stochを使う", group = grpEStoch)
+useEStoch4H    = input.bool(true, "4時間足Stochを使う", group = grpEStoch)
+useEStoch1H    = input.bool(true, "1時間足Stochを使う", group = grpEStoch)
+useEStoch15M   = input.bool(true, "15分足Stochを使う", group = grpEStoch)
+eStochDailyTF = input.timeframe("D",   "日足TF", group = grpEStoch)
+eStoch4HTF    = input.timeframe("240", "4時間足TF", group = grpEStoch)
+eStoch1HTF    = input.timeframe("60",  "1時間足TF", group = grpEStoch)
+eStoch15MTF   = input.timeframe("15",  "15分足TF", group = grpEStoch)
+// --- 時間足の重み (小数可・float) ---
+eStochWeightD   = input.float(2.0, "重み 日足",  step = 0.1, group = grpEStoch)
+eStochWeight4H  = input.float(1.5, "重み 4H",   step = 0.1, group = grpEStoch)
+eStochWeight1H  = input.float(1.0, "重み 1H",   step = 0.1, group = grpEStoch)
+eStochWeight15M = input.float(0.5, "重み 15M",  step = 0.1, group = grpEStoch)
+// --- ストキャス設定 (%K Length / %K Smooth / %D Length) ---
+eStochKLen    = input.int(21, "%K Length",   minval = 1, group = grpEStoch)
+eStochKSmooth = input.int(3,  "%K Smooth",   minval = 1, group = grpEStoch)
+eStochDLen    = input.int(3,  "%D Length",   minval = 1, group = grpEStoch)
+// --- 折り返し判定 ---
+stochExtremeHigh = input.float(90, "Extreme High (到達ライン)", group = grpEStoch)
+stochExtremeLow  = input.float(10, "Extreme Low (到達ライン)",  group = grpEStoch)
+useEStochKDConfirm = input.bool(false, "折り返しに K/D 位置も要求 (Long:K>D / Short:K<D)", group = grpEStoch)
+eStochTurnScore    = input.float(2.0, "折り返し 点数", step = 0.5, group = grpEStoch)
+// --- 状態保持本数 (足ごと。到達→折り返し確定後この本数だけ優勢を保持) ---
+eStochHoldDaily = input.int(3,  "日足 状態保持本数",  minval = 1, group = grpEStoch)
+eStochHold4H    = input.int(6,  "4H 状態保持本数",   minval = 1, group = grpEStoch)
+eStochHold1H    = input.int(12, "1H 状態保持本数",   minval = 1, group = grpEStoch)
+eStochHold15M   = input.int(24, "15M 状態保持本数",  minval = 1, group = grpEStoch)
+// --- 最終判定 ---
+eStochScoreThreshold = input.float(6.0, "Stoch合計スコア閾値 (±・ロング/ショート共通)", step = 0.5, group = grpEStoch)
+// --- 表示 ---
+eStochShowTable = input.bool(true,  "Stoch環境テーブルを表示", group = grpEStoch)
+eStochShowDebug = input.bool(false, "Stochデバッグ表示", group = grpEStoch)
+
+// ============================================================
 //  5. 包み足判定
 // ============================================================
 bool prevUp = close[1] > open[1]
@@ -995,6 +1040,90 @@ bool eemaBiasShort = eemaTotal <= -eemaThreshold
 int eemaFinalBias = eemaBiasLong and not eemaBiasShort ? 1 : eemaBiasShort and not eemaBiasLong ? -1 : 0
 
 // ============================================================
+//  8g-2. Stochastic 環境認識モジュール 本体 (折り返しのみ)
+// ------------------------------------------------------------
+//  f_eStochState : 呼ばれた足(=上位足)コンテキストで %K/%D を算出し、
+//    「10以下へ到達→上向き折り返し=Long / 90以上へ到達→下向き折り返し=Short」
+//    のみをスコア化 (+eStochTurnScore)。張り付き・マイナス点は無し。
+//    到達フラグは折り返し確定で消費し、再到達で再アーム (毎バー再発火しない)。
+//  戻り値 [score(float), reason(int)]。 reason: 1=Long折返し / -1=Short折返し / 0=なし
+// ============================================================
+f_eStochState(int holdBars) =>
+    float _rawK = ta.stoch(close, high, low, eStochKLen)
+    float _k = ta.sma(_rawK, eStochKSmooth)
+    float _d = ta.sma(_k, eStochDLen)
+    var bool _lowArmed  = false
+    var bool _highArmed = false
+    var float _score  = 0.0
+    var int   _reason = 0
+    var int   _evbar  = na
+    if _k <= stochExtremeLow
+        _lowArmed := true
+    if _k >= stochExtremeHigh
+        _highArmed := true
+    bool _turnUp = _lowArmed  and _k > _k[1] and (not useEStochKDConfirm or _k > _d)
+    bool _turnDn = _highArmed and _k < _k[1] and (not useEStochKDConfirm or _k < _d)
+    if _turnUp and not _turnDn
+        _score := eStochTurnScore
+        _reason := 1
+        _evbar := bar_index
+        _lowArmed := false
+    else if _turnDn and not _turnUp
+        _score := eStochTurnScore
+        _reason := -1
+        _evbar := bar_index
+        _highArmed := false
+    bool _active = not na(_evbar) and (bar_index - _evbar) < holdBars
+    float _outScore  = _active ? (_reason == 1 ? _score : -_score) : 0.0
+    int   _outReason = _active ? _reason : 0
+    [_outScore, _outReason]
+
+// 確定済み1本前を上位足コンテキスト内で返す非リペイント補助。
+f_eStochConfirmed(int holdBars) =>
+    [_s, _r] = f_eStochState(holdBars)
+    [_s[1], _r[1]]
+
+f_eStochReasonText(int c) =>
+    c == 1 ? "Long Turn (OS)" : c == -1 ? "Short Turn (OB)" : "No Turn"
+
+// --- 各足の確定Stoch状態 (エントリー使用 or テーブル表示時のみ算出。OFF足は呼ばない) ---
+bool eStochCompute = useEStochEnv or eStochShowTable
+float eStochDScore = 0.0
+int   eStochDReason = 0
+float eStochHScore = 0.0
+int   eStochHReason = 0
+float eStochOScore = 0.0
+int   eStochOReason = 0
+float eStochMScore = 0.0
+int   eStochMReason = 0
+if eStochCompute and useEStochDaily
+    [_s, _r] = request.security(syminfo.tickerid, eStochDailyTF, f_eStochConfirmed(eStochHoldDaily), lookahead = barmerge.lookahead_on)
+    eStochDScore := _s
+    eStochDReason := _r
+if eStochCompute and useEStoch4H
+    [_s, _r] = request.security(syminfo.tickerid, eStoch4HTF, f_eStochConfirmed(eStochHold4H), lookahead = barmerge.lookahead_on)
+    eStochHScore := _s
+    eStochHReason := _r
+if eStochCompute and useEStoch1H
+    [_s, _r] = request.security(syminfo.tickerid, eStoch1HTF, f_eStochConfirmed(eStochHold1H), lookahead = barmerge.lookahead_on)
+    eStochOScore := _s
+    eStochOReason := _r
+if eStochCompute and useEStoch15M
+    [_s, _r] = request.security(syminfo.tickerid, eStoch15MTF, f_eStochConfirmed(eStochHold15M), lookahead = barmerge.lookahead_on)
+    eStochMScore := _s
+    eStochMReason := _r
+
+// --- 加重合算 → 最終Stochバイアス ---
+float eStochDW = useEStochDaily ? eStochDScore * eStochWeightD   : 0.0
+float eStochHW = useEStoch4H    ? eStochHScore * eStochWeight4H  : 0.0
+float eStochOW = useEStoch1H    ? eStochOScore * eStochWeight1H  : 0.0
+float eStochMW = useEStoch15M   ? eStochMScore * eStochWeight15M : 0.0
+float eStochTotal = eStochDW + eStochHW + eStochOW + eStochMW
+bool eStochBiasLong  = eStochTotal >= eStochScoreThreshold
+bool eStochBiasShort = eStochTotal <= -eStochScoreThreshold
+int eStochFinalBias = eStochBiasLong and not eStochBiasShort ? 1 : eStochBiasShort and not eStochBiasLong ? -1 : 0
+
+// ============================================================
 //  8h. 環境認識の結合 (モジュール別 ON/OFF 通過方式)
 // ------------------------------------------------------------
 //  各環境モジュールを個別の使用ON/OFFで管理し、ONのモジュールをすべて
@@ -1005,18 +1134,22 @@ int eemaFinalBias = eemaBiasLong and not eemaBiasShort ? 1 : eemaBiasShort and n
 bool trendLongOk = not useTrendEnv or allowByEnv
 bool fvgLongOk   = not useEFVGEnv  or efvgBiasLong
 bool emaLongOk   = not useEEMAEnv  or eemaBiasLong
+bool stochLongOk = not useEStochEnv or eStochBiasLong
 bool allEnvLongOk =
      trendLongOk and
      fvgLongOk and
-     emaLongOk
+     emaLongOk and
+     stochLongOk
 
 bool trendShortOk = not useTrendEnv or allowByEnv
 bool fvgShortOk   = not useEFVGEnv  or efvgBiasShort
 bool emaShortOk   = not useEEMAEnv  or eemaBiasShort
+bool stochShortOk = not useEStochEnv or eStochBiasShort
 bool allEnvShortOk =
      trendShortOk and
      fvgShortOk and
-     emaShortOk
+     emaShortOk and
+     stochShortOk
 
 // ============================================================
 //  9. SL / TP / ロット計算
@@ -1626,3 +1759,47 @@ if eemaShowTable
         table.cell(eemaTbl, 2, 5, eemaShowDebug ? ("Th:" + str.tostring(eemaThreshold, "#.#")) : "", text_color = color.white, text_size = size.small)
         table.cell(eemaTbl, 3, 5, "合計", text_color = color.white, text_size = size.small)
         table.cell(eemaTbl, 4, 5, str.tostring(eemaTotal, "#.##"), text_color = color.white, bgcolor = f_efvgBiasColor(eemaFinalBias), text_size = size.small)
+
+// ============================================================
+//  12c. Stochastic 環境認識 表示 (デバッグテーブル)
+// ============================================================
+var table eStochTbl = na
+if eStochShowTable
+    if na(eStochTbl)
+        eStochTbl := table.new(position.bottom_right, 5, 6, border_width = 1)
+    if barstate.islast
+        table.cell(eStochTbl, 0, 0, "TF",    text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(eStochTbl, 1, 0, "Stoch", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(eStochTbl, 2, 0, "Score", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(eStochTbl, 3, 0, "重み",  text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(eStochTbl, 4, 0, "加重",  text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        // Daily
+        table.cell(eStochTbl, 0, 1, "D", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 1, 1, useEStochDaily ? f_eStochReasonText(eStochDReason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 2, 1, useEStochDaily ? str.tostring(eStochDScore, "#.##") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 3, 1, useEStochDaily ? str.tostring(eStochWeightD, "#.#") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 4, 1, useEStochDaily ? str.tostring(eStochDW, "#.##") : "-", text_color = color.white, text_size = size.small)
+        // 4H
+        table.cell(eStochTbl, 0, 2, "4H", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 1, 2, useEStoch4H ? f_eStochReasonText(eStochHReason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 2, 2, useEStoch4H ? str.tostring(eStochHScore, "#.##") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 3, 2, useEStoch4H ? str.tostring(eStochWeight4H, "#.#") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 4, 2, useEStoch4H ? str.tostring(eStochHW, "#.##") : "-", text_color = color.white, text_size = size.small)
+        // 1H
+        table.cell(eStochTbl, 0, 3, "1H", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 1, 3, useEStoch1H ? f_eStochReasonText(eStochOReason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 2, 3, useEStoch1H ? str.tostring(eStochOScore, "#.##") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 3, 3, useEStoch1H ? str.tostring(eStochWeight1H, "#.#") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 4, 3, useEStoch1H ? str.tostring(eStochOW, "#.##") : "-", text_color = color.white, text_size = size.small)
+        // 15M
+        table.cell(eStochTbl, 0, 4, "15M", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 1, 4, useEStoch15M ? f_eStochReasonText(eStochMReason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 2, 4, useEStoch15M ? str.tostring(eStochMScore, "#.##") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 3, 4, useEStoch15M ? str.tostring(eStochWeight15M, "#.#") : "-", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 4, 4, useEStoch15M ? str.tostring(eStochMW, "#.##") : "-", text_color = color.white, text_size = size.small)
+        // 合計 / 最終
+        table.cell(eStochTbl, 0, 5, "STOCH BIAS", text_color = color.white, bgcolor = f_efvgBiasColor(eStochFinalBias), text_size = size.small)
+        table.cell(eStochTbl, 1, 5, f_efvgBiasText(eStochFinalBias), text_color = color.white, bgcolor = f_efvgBiasColor(eStochFinalBias), text_size = size.small)
+        table.cell(eStochTbl, 2, 5, eStochShowDebug ? ("Th:" + str.tostring(eStochScoreThreshold, "#.#")) : "", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 3, 5, "合計", text_color = color.white, text_size = size.small)
+        table.cell(eStochTbl, 4, 5, str.tostring(eStochTotal, "#.##"), text_color = color.white, bgcolor = f_efvgBiasColor(eStochFinalBias), text_size = size.small)
