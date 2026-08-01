@@ -26,7 +26,7 @@ strategy(
      max_bars_back     = 1000,
      max_boxes_count   = 200,
      max_labels_count  = 100,
-     max_lines_count   = 200
+     max_lines_count   = 500
  )
 
 // ============================================================
@@ -443,6 +443,11 @@ hsEnvShowNeckline     = input.bool(true,  "三尊ネックラインを表示", g
 hsEnvShowBreakLabel   = input.bool(true,  "三尊確定地点を表示", group = grpHSEnv)
 hsEnvPatternLineWidth = input.int(2, "パターンライン太さ", minval = 1, maxval = 4, group = grpHSEnv)
 hsEnvNeckLineWidth    = input.int(2, "ネックライン太さ", minval = 1, maxval = 4, group = grpHSEnv)
+// --- 過去履歴表示 (15M限定・表示専用。確定した過去パターンをチャートに残す) ---
+hsEnvShowHistory          = input.bool(true, "過去の三尊パターンを表示", group = grpHSEnv)
+hsEnvHistoryCount         = input.int(20, "過去パターン表示件数", minval = 1, maxval = 50, group = grpHSEnv)
+hsEnvShowCandidateHistory = input.bool(false, "未確定候補の履歴も表示", group = grpHSEnv)
+hsEnvHistoryLineTransp    = input.int(50, "過去確定ライン透明度", minval = 0, maxval = 90, group = grpHSEnv)
 
 // ============================================================
 //  4j. 入力 : Fib 環境認識モジュール (MTF・大きな波の押し/戻り評価)
@@ -1646,7 +1651,7 @@ f_hsEnvColor(int b, bool on) =>
 // --- 各足の確定 三尊環境状態 (使用 or 表示時のみ算出。OFF足は request.security を呼ばない) ---
 //   描画トグル (ライン/ネックライン/確定ラベル) も算出トリガーに含める。ただしこれらは
 //   すべて表示専用で、hsEnvBias→canLong/canShort へは接続しない (バックテスト不変)。
-bool hsEnvWantDraw = hsEnvShowLabels or hsEnvShowPatternLines or hsEnvShowNeckline or hsEnvShowBreakLabel
+bool hsEnvWantDraw = hsEnvShowLabels or hsEnvShowPatternLines or hsEnvShowNeckline or hsEnvShowBreakLabel or hsEnvShowHistory
 bool hsEnvCompute = useHSEnvEnv and (useHSEnvBias or hsEnvShowTable or hsEnvWantDraw)
 int hsEnvD   = 0
 int hsEnv4H  = 0
@@ -2927,6 +2932,113 @@ if barstate.islast
         if hsEnvShowBreakLabel and not na(hsCfBreakT) and not na(hsCfBreakP)
             string _hsBreakTxt = hsCfType == -1 ? "三尊確定" : "逆三尊確定"
             array.push(hsEnvBreakLabels, label.new(hsCfBreakT, hsCfBreakP, _hsBreakTxt, xloc = xloc.bar_time, style = hsCfType == -1 ? label.style_label_down : label.style_label_up, color = _confCol, textcolor = color.white, size = size.small))
+
+// --- 三尊 / 逆三尊 過去確定パターン履歴 (15M限定・表示専用) ---
+//   ・hsEnvShowHistory=ON かつ hsEnvLabelTF=="15M" かつ useHSEnv15M のときだけ有効。
+//   ・ネックラインブレイクで確定した瞬間に1回だけ履歴配列へ保存 (breakTime で重複防止)。
+//     holdBars 状態を毎バー保存しない = 同一パターンを複数の5分足バーで重複保存しない。
+//   ・過去パターンは色付き4本 (LS→N1→Head→N2→RS) + ネックライン(N1→N2・右延長なし) +
+//     小ラベル (三尊/逆三尊)。最新確定の右延長ネックラインは既存 hsCf* ブロックが担当。
+//   ・検知/スコア/ブレイク条件/holdBars/hsEnvBias/canLong/canShort には一切干渉しない。
+//   ・非リペイント : 保存する値は f_hsEnvConfirmed 由来 (lookahead_on + 確定1本前[1])。
+var array<int>   hsHistType  = array.new_int()
+var array<float> hsHistLsP   = array.new_float()
+var array<int>   hsHistLsT   = array.new_int()
+var array<float> hsHistN1P   = array.new_float()
+var array<int>   hsHistN1T   = array.new_int()
+var array<float> hsHistHdP   = array.new_float()
+var array<int>   hsHistHdT   = array.new_int()
+var array<float> hsHistN2P   = array.new_float()
+var array<int>   hsHistN2T   = array.new_int()
+var array<float> hsHistRsP   = array.new_float()
+var array<int>   hsHistRsT   = array.new_int()
+var array<float> hsHistBreakP = array.new_float()
+var array<int>   hsHistBreakT = array.new_int()
+var array<float> hsHistScore  = array.new_float()
+// 履歴描画用オブジェクト配列 (最新候補/最新確定の描画配列とは完全分離)
+var array<line>  hsEnvHistoryLines  = array.new_line()
+var array<label> hsEnvHistoryLabels = array.new_label()
+
+// --- 履歴保存 (毎バー・確定イベント発生時に1回だけ) ---
+bool hsHistActive = hsEnvShowHistory and hsEnvLabelTF == "15M" and useHSEnv15M
+var int hsLastStoredBreakT = na
+// breakTime が直近保存と異なる = 新しい確定イベント (na 比較は na() で明示処理)
+bool hsNewConfirmedPattern =
+     hsHistActive and
+     hsLblPatType != 0 and
+     not na(hsLblBreakT) and
+     not na(hsLblLsT) and not na(hsLblN1T) and not na(hsLblHdT) and not na(hsLblN2T) and not na(hsLblRsT) and
+     (na(hsLastStoredBreakT) or hsLblBreakT != hsLastStoredBreakT)
+if hsNewConfirmedPattern
+    array.push(hsHistType,  hsLblPatType)
+    array.push(hsHistLsP,   hsLblLsP)
+    array.push(hsHistLsT,   hsLblLsT)
+    array.push(hsHistN1P,   hsLblN1P)
+    array.push(hsHistN1T,   hsLblN1T)
+    array.push(hsHistHdP,   hsLblHdP)
+    array.push(hsHistHdT,   hsLblHdT)
+    array.push(hsHistN2P,   hsLblN2P)
+    array.push(hsHistN2T,   hsLblN2T)
+    array.push(hsHistRsP,   hsLblRsP)
+    array.push(hsHistRsT,   hsLblRsT)
+    array.push(hsHistBreakP, hsLblBreakP)
+    array.push(hsHistBreakT, hsLblBreakT)
+    array.push(hsHistScore,  hsDbgScore)
+    hsLastStoredBreakT := hsLblBreakT
+    // 件数上限を超えたら全配列の先頭を同時に削除 (サイズ整合を維持)
+    while array.size(hsHistType) > hsEnvHistoryCount
+        array.shift(hsHistType)
+        array.shift(hsHistLsP)
+        array.shift(hsHistLsT)
+        array.shift(hsHistN1P)
+        array.shift(hsHistN1T)
+        array.shift(hsHistHdP)
+        array.shift(hsHistHdT)
+        array.shift(hsHistN2P)
+        array.shift(hsHistN2T)
+        array.shift(hsHistRsP)
+        array.shift(hsHistRsT)
+        array.shift(hsHistBreakP)
+        array.shift(hsHistBreakT)
+        array.shift(hsHistScore)
+
+// --- 履歴描画 (barstate.islast で再描画。過去ネックラインは右延長しない) ---
+if barstate.islast
+    // 既存の履歴オブジェクトを削除
+    if array.size(hsEnvHistoryLines) > 0
+        for _i = 0 to array.size(hsEnvHistoryLines) - 1
+            line.delete(array.get(hsEnvHistoryLines, _i))
+        array.clear(hsEnvHistoryLines)
+    if array.size(hsEnvHistoryLabels) > 0
+        for _i = 0 to array.size(hsEnvHistoryLabels) - 1
+            label.delete(array.get(hsEnvHistoryLabels, _i))
+        array.clear(hsEnvHistoryLabels)
+    // 再描画 (古い順に走査)
+    if hsHistActive and array.size(hsHistType) > 0
+        for _i = 0 to array.size(hsHistType) - 1
+            int   _hTy  = array.get(hsHistType, _i)
+            color _hCol = _hTy == 1 ? color.new(color.green, hsEnvHistoryLineTransp) : color.new(color.red, hsEnvHistoryLineTransp)
+            float _hLsP = array.get(hsHistLsP, _i)
+            int   _hLsT = array.get(hsHistLsT, _i)
+            float _hN1P = array.get(hsHistN1P, _i)
+            int   _hN1T = array.get(hsHistN1T, _i)
+            float _hHdP = array.get(hsHistHdP, _i)
+            int   _hHdT = array.get(hsHistHdT, _i)
+            float _hN2P = array.get(hsHistN2P, _i)
+            int   _hN2T = array.get(hsHistN2T, _i)
+            float _hRsP = array.get(hsHistRsP, _i)
+            int   _hRsT = array.get(hsHistRsT, _i)
+            float _hBkP = array.get(hsHistBreakP, _i)
+            int   _hBkT = array.get(hsHistBreakT, _i)
+            // パターンライン LS → N1 → Head → N2 → RS (4本・線幅1)
+            array.push(hsEnvHistoryLines, line.new(_hLsT, _hLsP, _hN1T, _hN1P, xloc = xloc.bar_time, color = _hCol, width = 1))
+            array.push(hsEnvHistoryLines, line.new(_hN1T, _hN1P, _hHdT, _hHdP, xloc = xloc.bar_time, color = _hCol, width = 1))
+            array.push(hsEnvHistoryLines, line.new(_hHdT, _hHdP, _hN2T, _hN2P, xloc = xloc.bar_time, color = _hCol, width = 1))
+            array.push(hsEnvHistoryLines, line.new(_hN2T, _hN2P, _hRsT, _hRsP, xloc = xloc.bar_time, color = _hCol, width = 1))
+            // ネックライン N1 → N2 (右延長しない・青・透明度70)
+            array.push(hsEnvHistoryLines, line.new(_hN1T, _hN1P, _hN2T, _hN2P, xloc = xloc.bar_time, color = color.new(color.blue, 70), width = 1))
+            // ブレイク地点の小ラベル
+            array.push(hsEnvHistoryLabels, label.new(_hBkT, _hBkP, _hTy == -1 ? "三尊" : "逆三尊", xloc = xloc.bar_time, style = _hTy == -1 ? label.style_label_down : label.style_label_up, color = _hCol, textcolor = color.white, size = size.tiny))
 
 // ============================================================
 //  12e. Fib 環境認識 (MTF) 表示 (テーブル + Data Window)
