@@ -24,10 +24,14 @@ strategy(
      default_qty_type  = strategy.fixed,
      default_qty_value = 1,
      dynamic_requests  = true,
+     calc_on_every_tick = true,
      max_bars_back     = 1000,
      max_boxes_count   = 200,
      max_labels_count  = 100
  )
+// calc_on_every_tick = true : 5分足の確定を待たず、5分足形成途中でも新しい確定1分足が
+//   追加された時点でストラテジーを再計算し、下位足(1分足)トリガー条件を再評価する。
+//   ※ process_orders_on_close はあえて付けない (5分足終値までの発注遅延を避けるため)。
 
 // ============================================================
 //  1. 入力 : エントリー (トリガーは常に包み足)
@@ -52,9 +56,9 @@ triggerMode     = input.string("Any", "トリガー結合", options = ["Any", "A
 minTriggerCount = input.int(1, "最低トリガー数 (MinCount時)")
 
 // 下位足トリガー確認 (OFF で request.security を呼ばない)
-useLowerTFTrigger = input.bool(false, "下位足トリガー確認 (重い)")
-triggerTF         = input.timeframe("5", "下位足TF")
-triggerTFMode     = input.string("CurrentOnly", "現在足/下位足 結合", options = ["CurrentOnly", "LowerOnly", "CurrentAndLower", "CurrentOrLower"])
+useLowerTFTrigger = input.bool(true, "下位足トリガー確認 (重い)")
+triggerTF         = input.timeframe("1", "下位足TF")   // ※チャートTF(5分)より必ず下位のTFを指定 (request.security_lower_tf の制約)
+triggerTFMode     = input.string("LowerOnly", "現在足/下位足 結合", options = ["CurrentOnly", "LowerOnly", "CurrentAndLower", "CurrentOrLower"])
 
 // トリガー個別パラメータ
 emaLenTrigger      = input.int(20,  "EMA Length (EMAリジェクト)")
@@ -81,7 +85,8 @@ engulfAtrLen               = input.int(14, "包み足 ATR期間")
 engulfMinBodyATR           = input.float(0.30, "包み足 最低実体 ATR倍率")
 
 useTriggerCooldown        = input.bool(false, "トリガークールダウン")
-triggerCooldownBars       = input.int(3, "クールダウン本数")
+triggerCooldownBars       = input.int(3, "クールダウン本数 (旧・チャート足本数基準/未使用)")
+triggerCooldownMinutes    = input.int(3, "トリガークールダウン（分）")   // 下位足使用時は本数基準だと5倍になるため時刻(分)基準で管理
 useOppositeTriggerNoTrade = input.bool(false, "逆方向トリガー同時発生はNoTrade")
 
 // ============================================================
@@ -4723,12 +4728,51 @@ int bearTrigCount = (trBearEng?1:0)+(trBearPin?1:0)+(trBearBOS?1:0)+(trBearEMA?1
 bool trigBullCur = f_combineTrig(bullTrigCount, enabledTrigCount)
 bool trigBearCur = f_combineTrig(bearTrigCount, enabledTrigCount)
 
+// ============================================================
+//  下位足(1分足)トリガー取得 : request.security_lower_tf 版
+// ------------------------------------------------------------
+//  目的 : 5分足の内部にある1分足を「1本ずつ」確認し、確定した1分足で
+//         トリガーが成立した時点で判定できるようにする。
+//         (従来の request.security は5分足内部の途中1分足を取りこぼしていた)
+//  ・f_calcLowerTriggers() は f_calcTriggers() の結果 (各トリガー条件・Any/All/
+//    MinCount の意味は不変) に「確定フラグ」と「その1分足の時刻」を付けて返す。
+//  ・request.security_lower_tf は 5分足内部の各1分足の値を配列(タプル→配列群)で返す。
+//  ・確定済み(barstate.isconfirmed) かつ 未処理(time > lastProcessedLowerTime) の
+//    1分足だけを処理し、同じ1分足を二度使わない (varip で保持)。
+//  ・time は単調増加なので5分足切替時のカウンターリセットは不要 (キーが重複しない)。
+//
+//  リアルタイム : 5分足形成途中に確定した1分足を順次処理する。
+//  過去足       : request.security_lower_tf で5分足内部の1分足を確認するが、
+//                 ストラテジーの約定価格や処理タイミングには TradingView の
+//                 イントラバー・バックテスト仕様による制限があり、リアルタイムと
+//                 完全に同一にはならない (Bar Magnifier 有効時はより忠実に処理される)。
+// ============================================================
+f_calcLowerTriggers() =>
+    [_lbCnt, _lsCnt] = f_calcTriggers()
+    [_lbCnt, _lsCnt, barstate.isconfirmed, time]
+
+// 最後に処理した1分足の時刻 (varip: リアルタイムの同一足再計算でも巻き戻さない → 重複処理防止)
+varip int lastProcessedLowerTime = na
+
 bool trigBullLower = false
 bool trigBearLower = false
 if useLowerTFTrigger
-    [ltBullCnt, ltBearCnt] = request.security(syminfo.tickerid, triggerTF, f_calcTriggers(), lookahead = barmerge.lookahead_off)
-    trigBullLower := f_combineTrig(ltBullCnt, enabledTrigCount)
-    trigBearLower := f_combineTrig(ltBearCnt, enabledTrigCount)
+    [ltfBullArr, ltfBearArr, ltfConfArr, ltfTimeArr] = request.security_lower_tf(syminfo.tickerid, triggerTF, f_calcLowerTriggers())
+    int _ln = array.size(ltfTimeArr)
+    if _ln > 0
+        // 5分足内部の1分足を古い順に全確認。確定済み かつ 未処理の足だけ採用する。
+        for _i = 0 to _ln - 1
+            int  _lt   = array.get(ltfTimeArr, _i)
+            bool _lcnf = array.get(ltfConfArr, _i)
+            if _lcnf and (na(lastProcessedLowerTime) or _lt > lastProcessedLowerTime)
+                int _lbc = array.get(ltfBullArr, _i)
+                int _lsc = array.get(ltfBearArr, _i)
+                if f_combineTrig(_lbc, enabledTrigCount)
+                    trigBullLower := true
+                if f_combineTrig(_lsc, enabledTrigCount)
+                    trigBearLower := true
+                // 処理済みとして時刻を前進 → 同じ1分足トリガーを後から遡って再利用しない
+                lastProcessedLowerTime := _lt
 
 bool finalBullTrig =
      not useLowerTFTrigger or triggerTFMode == "CurrentOnly" ? trigBullCur :
@@ -4746,11 +4790,15 @@ bool finalBearTrig =
 
 bool trigNoTrade = useOppositeTriggerNoTrade and finalBullTrig and finalBearTrig
 
-var int lastTrigBar = na
+// トリガークールダウン : 下位足(1分足)使用時は「本数基準(bar_index)」だと5分足チャートで
+//   意図せず5倍(=5分足本数)になるため、時刻(分)基準で管理する。
+//   ※ これは「同じ1分足シグナルの重複防止(lastProcessedLowerTime)」とは別概念。
+//      重複防止 = 同一足を二度使わない / クールダウン = 発火間隔を任意の分数だけ空ける。
+varip int lastTrigTime = na
 bool trigFiredNow   = finalBullTrig or finalBearTrig
-bool trigCooldownOk = not useTriggerCooldown or na(lastTrigBar) or (bar_index - lastTrigBar) > triggerCooldownBars
+bool trigCooldownOk = not useTriggerCooldown or na(lastTrigTime) or (time - lastTrigTime) >= triggerCooldownMinutes * 60 * 1000
 if trigFiredNow and trigCooldownOk
-    lastTrigBar := bar_index
+    lastTrigTime := time
 
 bool allowLongByTrigger  = enabledTrigCount == 0 ? true : (finalBullTrig and not trigNoTrade and trigCooldownOk)
 bool allowShortByTrigger = enabledTrigCount == 0 ? true : (finalBearTrig and not trigNoTrade and trigCooldownOk)
