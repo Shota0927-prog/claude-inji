@@ -51,10 +51,11 @@ useStrongCandleTrigger = input.bool(false, "強ローソク")
 triggerMode     = input.string("Any", "トリガー結合", options = ["Any", "All", "MinCount"])
 minTriggerCount = input.int(1, "最低トリガー数 (MinCount時)")
 
-// 下位足トリガー確認 (OFF で request.security を呼ばない)
-useLowerTFTrigger = input.bool(false, "下位足トリガー確認 (重い)")
-triggerTF         = input.timeframe("5", "下位足TF")
-triggerTFMode     = input.string("CurrentOnly", "現在足/下位足 結合", options = ["CurrentOnly", "LowerOnly", "CurrentAndLower", "CurrentOrLower"])
+// 1分足トリガー確認 (request.security_lower_tf で現在の5分足内の確定1分足を配列取得)
+//   トリガー検知は 1分足 OHLC で行い、最終エントリーは 5分足確定時に判定する。
+//   現在足(5分足)との結合モード (triggerTFMode) は廃止。最終トリガーは 1分足のみで判断。
+useLowerTFTrigger = input.bool(true, "1分足トリガーを使う")
+triggerTF         = input.timeframe("1", "トリガー時間足")
 
 // トリガー個別パラメータ
 emaLenTrigger      = input.int(20,  "EMA Length (EMAリジェクト)")
@@ -82,7 +83,9 @@ engulfMinBodyATR           = input.float(0.30, "包み足 最低実体 ATR倍率
 
 useTriggerCooldown        = input.bool(false, "トリガークールダウン")
 triggerCooldownBars       = input.int(3, "クールダウン本数")
-useOppositeTriggerNoTrade = input.bool(false, "逆方向トリガー同時発生はNoTrade")
+// 既定 true : 同一5分足内で1分足のロング/ショートが両方成立したら NoTrade。
+//   false にすると両方成立時はローソク色で優先方向を決定 (発注部で解決)。
+useOppositeTriggerNoTrade = input.bool(true, "逆方向トリガー同時発生はNoTrade")
 
 // ============================================================
 //  2. 入力 : ボラフィルタ
@@ -319,6 +322,13 @@ f_combineTrig(int cnt, int enabled) =>
      triggerMode == "All" ? (enabled > 0 and cnt >= enabled) :
      cnt >= minTriggerCount
 
+// 有効化されたトリガー数 (Any/All/MinCount 判定で使用・全コンテキスト共通)。
+//   f_calcTriggers 内 (=1分足コンテキスト) からも参照するため関数より前で定義する。
+int enabledTrigCount = (useEngulfingTrigger?1:0) + (usePinbarTrigger?1:0) + (useBOSTrigger?1:0) + (useEMARejectTrigger?1:0) + (useFVGTriggerFormation?1:0) + (useStrongCandleTrigger?1:0)
+
+// 1分足コンテキストで全トリガーを判定し、その1分足単体で Any/All/MinCount を評価して
+//   [bullTrigger, bearTrigger] を返す。異なる1分足で発生した条件を合算しない。
+//   各トリガー条件・品質フィルターは既存ロジックと完全に同一 (変更なし)。
 f_calcTriggers() =>
     float _body      = math.abs(close - open)
     float _range     = high - low
@@ -373,9 +383,10 @@ f_calcTriggers() =>
     bool _bearStr = useStrongCandleTrigger and close < open and _bodyRatio >= strongBodyRatio and _closePos <= 1.0 - trigCloseEdgeRatio
     int _bullCnt = (_bullEng?1:0)+(_bullPin?1:0)+(_bullBOS?1:0)+(_bullEMA?1:0)+(_bullFVG?1:0)+(_bullStr?1:0)
     int _bearCnt = (_bearEng?1:0)+(_bearPin?1:0)+(_bearBOS?1:0)+(_bearEMA?1:0)+(_bearFVG?1:0)+(_bearStr?1:0)
-    [_bullCnt, _bearCnt]
-
-int enabledTrigCount = (useEngulfingTrigger?1:0) + (usePinbarTrigger?1:0) + (useBOSTrigger?1:0) + (useEMARejectTrigger?1:0) + (useFVGTriggerFormation?1:0) + (useStrongCandleTrigger?1:0)
+    // この1分足単体で Any/All/MinCount を評価 (1分足内で完結)
+    bool _bullTrigger = f_combineTrig(_bullCnt, enabledTrigCount)
+    bool _bearTrigger = f_combineTrig(_bearCnt, enabledTrigCount)
+    [_bullTrigger, _bearTrigger]
 
 float trBody      = math.abs(close - open)
 float trRange     = high - low
@@ -456,40 +467,52 @@ bool trBearStr = useStrongCandleTrigger and close < open and trBodyRatio >= stro
 int bullTrigCount = (trBullEng?1:0)+(trBullPin?1:0)+(trBullBOS?1:0)+(trBullEMA?1:0)+(trBullFVG?1:0)+(trBullStr?1:0)
 int bearTrigCount = (trBearEng?1:0)+(trBearPin?1:0)+(trBearBOS?1:0)+(trBearEMA?1:0)+(trBearFVG?1:0)+(trBearStr?1:0)
 
+// 現在足(5分足)での直接判定 (useLowerTFTrigger = false 時のフォールバックのみに使用)
 bool trigBullCur = f_combineTrig(bullTrigCount, enabledTrigCount)
 bool trigBearCur = f_combineTrig(bearTrigCount, enabledTrigCount)
 
-bool trigBullLower = false
-bool trigBearLower = false
+// --- 1分足トリガー集約 ---
+//   request.security_lower_tf で現在の5分足に含まれる確定済み1分足 (最大5本) の
+//   [bullTrigger, bearTrigger] を配列で取得。5本のうち1本でも成立していれば
+//   その方向を5分足の候補とする (途中の1分足トリガーを取りこぼさない)。
+//   Any/All/MinCount は各1分足内で f_calcTriggers が評価済み → 異なる足の条件は合算しない。
+//   ※ 形成途中の1分足は request.security_lower_tf の確定済み配列に含まれないため非リペイント。
+bool oneMinBullTriggered = false
+bool oneMinBearTriggered = false
 if useLowerTFTrigger
-    [ltBullCnt, ltBearCnt] = request.security(syminfo.tickerid, triggerTF, f_calcTriggers(), lookahead = barmerge.lookahead_off)
-    trigBullLower := f_combineTrig(ltBullCnt, enabledTrigCount)
-    trigBearLower := f_combineTrig(ltBearCnt, enabledTrigCount)
+    [bullTriggerArray, bearTriggerArray] = request.security_lower_tf(syminfo.tickerid, triggerTF, f_calcTriggers())
+    if array.size(bullTriggerArray) > 0
+        for i = 0 to array.size(bullTriggerArray) - 1
+            if array.get(bullTriggerArray, i)
+                oneMinBullTriggered := true
+    if array.size(bearTriggerArray) > 0
+        for i = 0 to array.size(bearTriggerArray) - 1
+            if array.get(bearTriggerArray, i)
+                oneMinBearTriggered := true
+else
+    // 1分足トリガー OFF → 現在足(5分足)で直接判定
+    oneMinBullTriggered := trigBullCur
+    oneMinBearTriggered := trigBearCur
 
-bool finalBullTrig =
-     not useLowerTFTrigger or triggerTFMode == "CurrentOnly" ? trigBullCur :
-     triggerTFMode == "LowerOnly"       ? trigBullLower :
-     triggerTFMode == "CurrentAndLower" ? (trigBullCur and trigBullLower) :
-     triggerTFMode == "CurrentOrLower"  ? (trigBullCur or trigBullLower) :
-     trigBullCur
+// 同一5分足内でロング/ショート両方の1分足トリガーが発生 → 方向を予想せず NoTrade。
+//   既定 (useOppositeTriggerNoTrade = true) では両方向発生時に NoTrade。
+//   OFF 時のみ両方向を許可し、発注部でローソク色により優先方向を決定する。
+bool lowerTFConflict = oneMinBullTriggered and oneMinBearTriggered
+bool trigNoTrade     = useOppositeTriggerNoTrade and lowerTFConflict
 
-bool finalBearTrig =
-     not useLowerTFTrigger or triggerTFMode == "CurrentOnly" ? trigBearCur :
-     triggerTFMode == "LowerOnly"       ? trigBearLower :
-     triggerTFMode == "CurrentAndLower" ? (trigBearCur and trigBearLower) :
-     triggerTFMode == "CurrentOrLower"  ? (trigBearCur or trigBearLower) :
-     trigBearCur
+bool finalBullTrig = oneMinBullTriggered and not trigNoTrade
+bool finalBearTrig = oneMinBearTriggered and not trigNoTrade
 
-bool trigNoTrade = useOppositeTriggerNoTrade and finalBullTrig and finalBearTrig
-
+// エントリークールダウンは5分足単位 (bar_index=5分足)。
+//   同一5分足で最大1回のエントリーは発注部の barstate.isconfirmed で担保する。
 var int lastTrigBar = na
 bool trigFiredNow   = finalBullTrig or finalBearTrig
 bool trigCooldownOk = not useTriggerCooldown or na(lastTrigBar) or (bar_index - lastTrigBar) > triggerCooldownBars
 if trigFiredNow and trigCooldownOk
     lastTrigBar := bar_index
 
-bool allowLongByTrigger  = enabledTrigCount == 0 ? true : (finalBullTrig and not trigNoTrade and trigCooldownOk)
-bool allowShortByTrigger = enabledTrigCount == 0 ? true : (finalBearTrig and not trigNoTrade and trigCooldownOk)
+bool allowLongByTrigger  = enabledTrigCount == 0 ? true : (finalBullTrig and trigCooldownOk)
+bool allowShortByTrigger = enabledTrigCount == 0 ? true : (finalBearTrig and trigCooldownOk)
 
 // ============================================================
 //  6. ボラフィルタ判定
@@ -1291,6 +1314,7 @@ bool accumShortDirectionOk =
 //  Accumulation NoTrade はそのまま維持。
 // ============================================================
 bool canLong =
+     barstate.isconfirmed and
      useLong and
      dailyRegimeLongOk and
      sessionOk and
@@ -1305,6 +1329,7 @@ bool canLong =
      longQty >= 1
 
 bool canShort =
+     barstate.isconfirmed and
      useShort and
      dailyRegimeShortOk and
      sessionOk and
