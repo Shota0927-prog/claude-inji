@@ -281,9 +281,11 @@ accumEnvDTrigTF   = input.timeframe("240", "日足Accum トリガー確認足", 
 accumEnvH4TrigTF  = input.timeframe("60",  "4H Accum トリガー確認足", group = grpAccum)
 accumEnvH1TrigTF  = input.timeframe("15",  "1H Accum トリガー確認足", group = grpAccum)
 accumEnvM15TrigTF = input.timeframe("5",   "15M Accum トリガー確認足", group = grpAccum)
-// --- 箱の最小幅・タッチ許容 ---
+// --- 箱の最小幅・タッチ許容・保持数 ---
 minAccumWidth       = input.float(30.0, "Accum箱 最小幅($) (これ以上=エントリー対象)", minval = 0.0, step = 0.5, group = grpAccum)
 accumTouchTolerance = input.float(3.0,  "境界タッチ許容($)", minval = 0.0, step = 0.1, group = grpAccum)
+// 上位足Accumエントリー用の確定箱保持数 (5分/15分NoTrade用 accumNTKeep とは分離)
+accumEnvKeep = input.int(3, "保持する上位足Accum数", minval = 1, maxval = 10, group = grpAccum)
 // --- 表示 / デバッグ ---
 accumEnvShowTable = input.bool(true,  "Accum環境テーブルを表示", group = grpAccum)
 accumEnvShowZones = input.bool(false, "選択中Accum箱の上下限を表示", group = grpAccum)
@@ -1111,154 +1113,347 @@ bool accumShortDirectionOk =
 // ============================================================
 //  10b-2. 上位足 Accumulation 場所条件エンジン (日足 / 4H / 1H / 15M)
 // ------------------------------------------------------------
-//  各上位足で Accum 箱 (f_accumNT15Confirmed) を確定足のみで取得し、実体基準
-//  (max/min(open,close)) の上下限を境界とする。境界タッチ + 確認足トリガーで
-//  反発 / ブレイクリテストのエントリー方向を出す。
-//    ・下限タッチ + ロングトリガー → ロング (通常反発)
-//    ・上限タッチ + ショートトリガー → ショート (通常反発)
-//    ・確定終値で箱上抜け → 以後は上限リテスト + ロングトリガー → ロング (抵抗→支持転換)
-//    ・確定終値で箱下抜け → 以後は下限リテスト + ショートトリガー → ショート (支持→抵抗転換)
-//    ・ブレイク後に確定終値が箱内へ戻れば通常反発ロジックへ復帰 (ブレイク失敗)。
-//    ・シグナルは「新しい確認足が確定した足」でのみ発火 → 同一確認足で複数回発火しない。
-//    ・優先度 D>4H>1H>15M。ただし価格が箱近傍(±tol)にある足のみ優先対象
-//      (遠い日足箱は下位足をブロックしない)。
-//  ※ 非リペイント: request.security(lookahead_on) + 関数内 [1] (f_..Confirmed)。
+//  各上位足で Accum を検出し、「Accum終了確定 (isAccum[1] and not isAccum)」した時点で
+//  固定箱として確定する。形成中の箱はエントリーに使わない (上下限が後から動くため)。
+//  確定箱は各TFごとに配列で accumEnvKeep 個まで保持し、上下限は以後一切変更しない。
+//    ・箱ごとに breakState (0/1/-1) を独立管理 (箱内復帰も該当箱のみ 0 に戻す)。
+//    ・境界タッチ + 確認足トリガーで 反発 / ブレイクリテスト方向を出す (ゾーン重複タッチ)。
+//    ・同一TFで複数箱が価格付近にある場合は「有効境界までの距離が最小 (同距離は新箱)」を1箱採用。
+//    ・優先度 D>4H>1H>15M。ただし価格付近に有効候補箱があるTFのみ優先対象。
+//    ・エントリー対象は箱確定後の「次の上位足以降」(確定検知に [1] + newBar を使用)。
+//  ※ 非リペイント: request.security(lookahead_on) + 関数内 [1]、確定足のみで確定判断。
 // ============================================================
-// _broke : 0=通常反発 / 1=上抜け後(上限リテストでロング) / -1=下抜け後(下限リテストでショート)
-f_accumEnvTF(float _bxHi, float _bxLo, int _bxSt, bool _tBull, bool _tBear, float _tClose, float _tHigh, float _tLow, bool _newTrig, float _minW, float _tol) =>
-    var int _broke  = 0
-    var int _idPrev = na
-    float _boxW  = not na(_bxHi) and not na(_bxLo) ? _bxHi - _bxLo : na
-    bool  _boxOk = not na(_boxW) and _boxW >= _minW
-    // 新しい箱に切り替わったらブレイク状態をリセット (箱識別子=箱の開始バー)
-    if not na(_bxSt) and (na(_idPrev) or _bxSt != _idPrev)
-        _broke  := 0
-        _idPrev := _bxSt
-    // (1) この確認足の「更新前」ブレイク状態を保存 → 反発/リテストは全てこの値で判定する。
-    //     こうすることでブレイクした確認足そのものでリテストシグナルを出さない
-    //     (ブレイク確定は下で行うが、シグナル判定には反映させない)。
-    int _brokeBefore = _broke
-    // ブレイク状態遷移 (新しい確認足が確定したときのみ・確定終値ベース。ヒゲ抜けは無視)
-    //   ・箱上抜け → _broke = 1 / 箱下抜け → _broke = -1
-    //   ・箱内へ戻る(ブレイク失敗) → _broke = 0 (この足は状態リセットのみ。シグナルは出さない)
-    if _newTrig and _boxOk
-        if _tClose > _bxHi
-            _broke := 1
-        else if _tClose < _bxLo
-            _broke := -1
-        else
-            _broke := 0
-    // (3) 境界タッチ判定 = ゾーン重複方式 (確認足の高安レンジが境界±tolゾーンと重なるか)。
-    //     境界を深くスイープして戻る Liquidity Sweep も接触扱い。完全に離れた足は非接触。
-    bool _lowerTouch = _boxOk and _tLow  <= _bxLo + _tol and _tHigh >= _bxLo - _tol
-    bool _upperTouch = _boxOk and _tHigh >= _bxHi - _tol and _tLow  <= _bxHi + _tol
-    // (1)(2) サブシグナル : 新しい確認足が確定したときのみ発火・状態は「更新前(_brokeBefore)」で判定。
-    //   ・通常反発  : 未ブレイク(_brokeBefore == 0) のときだけ
-    //   ・リテスト  : ブレイク確定後の別の確認足(_brokeBefore == ±1)で境界へ戻ったときだけ
-    //   → ブレイク足では _brokeBefore がまだ 0 なのでリテストは出ない。
-    //   → 箱内復帰足では _brokeBefore が ±1 なので通常反発は出ない(次足から_brokeBefore==0で許可)。
-    bool _lowerRev = _newTrig and _brokeBefore == 0  and _lowerTouch and _tBull   // 下限反発ロング
-    bool _upperRev = _newTrig and _brokeBefore == 0  and _upperTouch and _tBear   // 上限反発ショート
-    bool _upRetest = _newTrig and _brokeBefore == 1  and _upperTouch and _tBull   // 上抜け後リテストロング
-    bool _dnRetest = _newTrig and _brokeBefore == -1 and _lowerTouch and _tBear   // 下抜け後リテストショート
-    // この確認足で状態が遷移した (ブレイク足・箱内復帰足) 場合はシグナルを出さない。
-    //   ・ブレイク足    : _brokeBefore 0 → ±1  (この足はブレイク確定のみ)
-    //   ・箱内復帰足    : _brokeBefore ±1 → 0   (この足は状態リセットのみ)
-    //   → リテストは「ブレイクを維持したまま(_tClose が境界の外側)境界へ戻った別の足」でのみ成立。
-    //   → 反発は「箱内を維持したまま(_tClose が境界の内側)境界に触れた足」でのみ成立。
-    bool _transition = _broke != _brokeBefore
-    bool _long  = (_lowerRev or _upRetest) and not _transition
-    bool _short = (_upperRev or _dnRetest) and not _transition
-    // 価格の関連性 (チャート終値が箱±tol内 = 箱近傍/内部/リテスト範囲)。
-    //   シグナル発火足は接触済みなので無条件で関連ありとする (優先度解決で取りこぼさない)。
-    bool _relevant = _boxOk and (_long or _short or (close >= _bxLo - _tol and close <= _bxHi + _tol))
-    [_long, _short, _relevant, _broke, nz(_boxW, 0.0)]
+// 上位足Accum箱: 形成中の上下限拡張と「Accum終了確定」を検知 (確定足のみで判断)。
+//   返り値 [isAccum(形成中), formHi, formLo, ended, endHi, endLo, endStartTime, endEndTime]
+//   ended = 直前がAccumで当足が非Accum の確定足で true。確定箱の上下限/開始終了時刻は以後不変。
+f_accumEnvBox() =>
+    [_isA, _hi, _lo] = f_accumNTDetect()
+    var float _bxHi = na
+    var float _bxLo = na
+    var int   _bxStTime = na
+    var int   _bxEdTime = na
+    bool _start = _isA and not nz(_isA[1], false)
+    if _start
+        _bxHi := _hi
+        _bxLo := _lo
+        _bxStTime := time
+        _bxEdTime := time
+    if _isA
+        float _bt = math.max(open, close)
+        float _bb = math.min(open, close)
+        _bxHi := math.max(nz(_bxHi, _bt), _bt)
+        _bxLo := math.min(nz(_bxLo, _bb), _bb)
+        _bxEdTime := time
+    bool _ended = nz(_isA[1], false) and not _isA
+    float _endHi = _ended ? _bxHi : na
+    float _endLo = _ended ? _bxLo : na
+    int   _endSt = _ended ? _bxStTime : na
+    int   _endEd = _ended ? _bxEdTime : na
+    [_isA, _bxHi, _bxLo, _ended, _endHi, _endLo, _endSt, _endEd]
 
-// --- 各上位足の状態 (OFF足は request.security を呼ばない) ---
-bool  accumDLong  = false
+// 確定足1本前 (非リペイント)。lookahead_on と組み合わせて「直近確定した上位足」を参照する。
+f_accumEnvBoxConfirmed() =>
+    [_isA, _fHi, _fLo, _ended, _eHi, _eLo, _eSt, _eEd] = f_accumEnvBox()
+    [_isA[1], _fHi[1], _fLo[1], _ended[1], _eHi[1], _eLo[1], _eSt[1], _eEd[1]]
+
+// 確定箱配列を評価: ①各箱の breakState を独立更新 (確認足確定時) ②近傍の1箱を採用しシグナルを返す。
+//   返り値 [selLong, selShort, relevant, selIdx, selBroke, selHi, selLo, selDist, count]
+//   ・relevant  : 価格±tol内に有効(幅>=minW)な確定箱が1つでもあるか (優先度判定用)。
+//   ・採用      : 近傍候補のうち有効境界までの距離が最小の1箱 (同距離は新しい箱=後勝ち)。
+//                距離優先で1箱に確定 → その採用箱からのみシグナルを出す (重複シグナル防止)。
+//   ・シグナルは確認足確定 (_newTrig) のときのみ・遷移足 (ブレイク/箱内復帰) では出さない。
+f_accumEnvEval(array<float> _aHi, array<float> _aLo, array<int> _aSt, array<int> _aEd, array<int> _aBk, bool _tBull, bool _tBear, float _tClose, float _tHigh, float _tLow, bool _newTrig, float _minW, float _tol, float _px) =>
+    int   _n      = array.size(_aHi)
+    bool  _rel    = false
+    int   _selIdx = -1
+    float _selHi  = na
+    float _selLo  = na
+    int   _selBkBefore = 0
+    int   _selBkAfter  = 0
+    bool  _selLowerTouch = false
+    bool  _selUpperTouch = false
+    bool  _selTrans = false
+    float _selDist  = na
+    float _best     = na
+    if _n > 0
+        for i = 0 to _n - 1
+            float _hi = array.get(_aHi, i)
+            float _lo = array.get(_aLo, i)
+            int   _bkBefore = array.get(_aBk, i)
+            bool  _boxOk = not na(_hi) and not na(_lo) and (_hi - _lo) >= _minW
+            // 近傍候補 (価格が箱±tol内 = 近傍/内部/リテスト範囲)
+            bool _near = _boxOk and _px >= _lo - _tol and _px <= _hi + _tol
+            if _near
+                _rel := true
+            // ブレイク状態更新 (全箱それぞれ独立・確認足確定時・確定終値ベース)
+            int _bkAfter = _bkBefore
+            if _newTrig and _boxOk
+                _bkAfter := _tClose > _hi ? 1 : _tClose < _lo ? -1 : 0
+                array.set(_aBk, i, _bkAfter)
+            // 有効境界までの距離 (未ブレイク=近い方 / 上抜け=上限 / 下抜け=下限)
+            float _d = na
+            if _boxOk
+                _d := _bkBefore == 1 ? math.abs(_px - _hi) : _bkBefore == -1 ? math.abs(_px - _lo) : math.min(math.abs(_px - _lo), math.abs(_px - _hi))
+            // 最近接の候補箱を1つ採用 (同距離は新しい箱=後勝ち)。採用は距離優先 → 採用箱からのみシグナル。
+            if _near and not na(_d)
+                if na(_best) or _d <= _best
+                    _best   := _d
+                    _selIdx := i
+                    _selHi  := _hi
+                    _selLo  := _lo
+                    _selBkBefore := _bkBefore
+                    _selBkAfter  := _bkAfter
+                    _selDist := _d
+                    _selLowerTouch := _boxOk and _tLow  <= _lo + _tol and _tHigh >= _lo - _tol
+                    _selUpperTouch := _boxOk and _tHigh >= _hi - _tol and _tLow  <= _hi + _tol
+                    _selTrans := _bkAfter != _bkBefore
+    // 採用箱のみからシグナル生成 (更新前状態で判定・遷移足=ブレイク/箱内復帰足では出さない)
+    bool _lowerRev = _newTrig and _selIdx >= 0 and _selBkBefore == 0  and _selLowerTouch and _tBull
+    bool _upperRev = _newTrig and _selIdx >= 0 and _selBkBefore == 0  and _selUpperTouch and _tBear
+    bool _upRetest = _newTrig and _selIdx >= 0 and _selBkBefore == 1  and _selUpperTouch and _tBull
+    bool _dnRetest = _newTrig and _selIdx >= 0 and _selBkBefore == -1 and _selLowerTouch and _tBear
+    bool _selLong  = (_lowerRev or _upRetest) and not _selTrans
+    bool _selShort = (_upperRev or _dnRetest) and not _selTrans
+    [_selLong, _selShort, _rel, _selIdx, _selBkAfter, _selHi, _selLo, _selDist, _n]
+
+// --- 各TF 確定箱配列 (完全分離) ---
+var array<float> accEnvDHi = array.new_float()
+var array<float> accEnvDLo = array.new_float()
+var array<int>   accEnvDSt = array.new_int()
+var array<int>   accEnvDEd = array.new_int()
+var array<int>   accEnvDBk = array.new_int()
+var int accEnvDLastSt = na
+var array<float> accEnvHHi = array.new_float()
+var array<float> accEnvHLo = array.new_float()
+var array<int>   accEnvHSt = array.new_int()
+var array<int>   accEnvHEd = array.new_int()
+var array<int>   accEnvHBk = array.new_int()
+var int accEnvHLastSt = na
+var array<float> accEnvOHi = array.new_float()
+var array<float> accEnvOLo = array.new_float()
+var array<int>   accEnvOSt = array.new_int()
+var array<int>   accEnvOEd = array.new_int()
+var array<int>   accEnvOBk = array.new_int()
+var int accEnvOLastSt = na
+var array<float> accEnvMHi = array.new_float()
+var array<float> accEnvMLo = array.new_float()
+var array<int>   accEnvMSt = array.new_int()
+var array<int>   accEnvMEd = array.new_int()
+var array<int>   accEnvMBk = array.new_int()
+var int accEnvMLastSt = na
+
+// --- 各TF 出力 (採用箱の情報・表示/優先度用) ---
+bool  accumDLong = false
 bool  accumDShort = false
-bool  accumDRel   = false
+bool  accumDRel = false
 int   accumDBroke = 0
-float accumDHi    = na
-float accumDLo    = na
-bool  accumHLong  = false
+int   accumDSelIdx = -1
+int   accumDCount = 0
+float accumDHi = na
+float accumDLo = na
+float accumDDist = na
+int   accumDStTime = na
+int   accumDEdTime = na
+bool  accumDForming = false
+float accumDFormHi = na
+float accumDFormLo = na
+bool  accumHLong = false
 bool  accumHShort = false
-bool  accumHRel   = false
+bool  accumHRel = false
 int   accumHBroke = 0
-float accumHHi    = na
-float accumHLo    = na
-bool  accumOLong  = false
+int   accumHSelIdx = -1
+int   accumHCount = 0
+float accumHHi = na
+float accumHLo = na
+float accumHDist = na
+int   accumHStTime = na
+int   accumHEdTime = na
+bool  accumHForming = false
+float accumHFormHi = na
+float accumHFormLo = na
+bool  accumOLong = false
 bool  accumOShort = false
-bool  accumORel   = false
+bool  accumORel = false
 int   accumOBroke = 0
-float accumOHi    = na
-float accumOLo    = na
-bool  accumMLong  = false
+int   accumOSelIdx = -1
+int   accumOCount = 0
+float accumOHi = na
+float accumOLo = na
+float accumODist = na
+int   accumOStTime = na
+int   accumOEdTime = na
+bool  accumOForming = false
+float accumOFormHi = na
+float accumOFormLo = na
+bool  accumMLong = false
 bool  accumMShort = false
-bool  accumMRel   = false
+bool  accumMRel = false
 int   accumMBroke = 0
-float accumMHi    = na
-float accumMLo    = na
+int   accumMSelIdx = -1
+int   accumMCount = 0
+float accumMHi = na
+float accumMLo = na
+float accumMDist = na
+int   accumMStTime = na
+int   accumMEdTime = na
+bool  accumMForming = false
+float accumMFormHi = na
+float accumMFormLo = na
 
 // 日足
 if useAccumEnv and useAccumEnvD
-    [_bh, _bl, _bs] = request.security(syminfo.tickerid, accumEnvDTF, f_accumNT15Confirmed(), lookahead = barmerge.lookahead_on)
+    [_isA, _fHi, _fLo, _ended, _eHi, _eLo, _eSt, _eEd] = request.security(syminfo.tickerid, accumEnvDTF, f_accumEnvBoxConfirmed(), lookahead = barmerge.lookahead_on)
     [_tb, _ts, _tc, _th, _tl] = request.security(syminfo.tickerid, accumEnvDTrigTF, f_accumTrigConfirmed(), lookahead = barmerge.lookahead_on)
-    bool _newT = ta.change(time(accumEnvDTrigTF)) != 0
-    [_lg, _sh, _rl, _bk, _w] = f_accumEnvTF(_bh, _bl, _bs, _tb, _ts, _tc, _th, _tl, _newT, minAccumWidth, accumTouchTolerance)
+    bool _newBar  = ta.change(time(accumEnvDTF)) != 0
+    bool _newTrig = ta.change(time(accumEnvDTrigTF)) != 0
+    accumDForming := nz(_isA, false)
+    accumDFormHi := _fHi
+    accumDFormLo := _fLo
+    // 確定箱登録 (新しい上位足開始 + Accum終了確定 + 幅>=minW + 重複防止)
+    if _newBar and _ended and not na(_eHi) and (_eHi - _eLo) >= minAccumWidth and (na(accEnvDLastSt) or _eSt != accEnvDLastSt)
+        array.push(accEnvDHi, _eHi)
+        array.push(accEnvDLo, _eLo)
+        array.push(accEnvDSt, _eSt)
+        array.push(accEnvDEd, _eEd)
+        array.push(accEnvDBk, 0)
+        accEnvDLastSt := _eSt
+        while array.size(accEnvDHi) > accumEnvKeep
+            array.shift(accEnvDHi)
+            array.shift(accEnvDLo)
+            array.shift(accEnvDSt)
+            array.shift(accEnvDEd)
+            array.shift(accEnvDBk)
+    [_lg, _sh, _rl, _si, _bk, _shi, _slo, _sd, _cnt] = f_accumEnvEval(accEnvDHi, accEnvDLo, accEnvDSt, accEnvDEd, accEnvDBk, _tb, _ts, _tc, _th, _tl, _newTrig, minAccumWidth, accumTouchTolerance, close)
     accumDLong := _lg
     accumDShort := _sh
     accumDRel := _rl
+    accumDSelIdx := _si
     accumDBroke := _bk
-    accumDHi := _bh
-    accumDLo := _bl
+    accumDHi := _shi
+    accumDLo := _slo
+    accumDDist := _sd
+    accumDCount := _cnt
+    if _si >= 0
+        accumDStTime := array.get(accEnvDSt, _si)
+        accumDEdTime := array.get(accEnvDEd, _si)
+
 // 4時間足
 if useAccumEnv and useAccumEnvH4
-    [_bh, _bl, _bs] = request.security(syminfo.tickerid, accumEnvH4TF, f_accumNT15Confirmed(), lookahead = barmerge.lookahead_on)
+    [_isA, _fHi, _fLo, _ended, _eHi, _eLo, _eSt, _eEd] = request.security(syminfo.tickerid, accumEnvH4TF, f_accumEnvBoxConfirmed(), lookahead = barmerge.lookahead_on)
     [_tb, _ts, _tc, _th, _tl] = request.security(syminfo.tickerid, accumEnvH4TrigTF, f_accumTrigConfirmed(), lookahead = barmerge.lookahead_on)
-    bool _newT = ta.change(time(accumEnvH4TrigTF)) != 0
-    [_lg, _sh, _rl, _bk, _w] = f_accumEnvTF(_bh, _bl, _bs, _tb, _ts, _tc, _th, _tl, _newT, minAccumWidth, accumTouchTolerance)
+    bool _newBar  = ta.change(time(accumEnvH4TF)) != 0
+    bool _newTrig = ta.change(time(accumEnvH4TrigTF)) != 0
+    accumHForming := nz(_isA, false)
+    accumHFormHi := _fHi
+    accumHFormLo := _fLo
+    if _newBar and _ended and not na(_eHi) and (_eHi - _eLo) >= minAccumWidth and (na(accEnvHLastSt) or _eSt != accEnvHLastSt)
+        array.push(accEnvHHi, _eHi)
+        array.push(accEnvHLo, _eLo)
+        array.push(accEnvHSt, _eSt)
+        array.push(accEnvHEd, _eEd)
+        array.push(accEnvHBk, 0)
+        accEnvHLastSt := _eSt
+        while array.size(accEnvHHi) > accumEnvKeep
+            array.shift(accEnvHHi)
+            array.shift(accEnvHLo)
+            array.shift(accEnvHSt)
+            array.shift(accEnvHEd)
+            array.shift(accEnvHBk)
+    [_lg, _sh, _rl, _si, _bk, _shi, _slo, _sd, _cnt] = f_accumEnvEval(accEnvHHi, accEnvHLo, accEnvHSt, accEnvHEd, accEnvHBk, _tb, _ts, _tc, _th, _tl, _newTrig, minAccumWidth, accumTouchTolerance, close)
     accumHLong := _lg
     accumHShort := _sh
     accumHRel := _rl
+    accumHSelIdx := _si
     accumHBroke := _bk
-    accumHHi := _bh
-    accumHLo := _bl
+    accumHHi := _shi
+    accumHLo := _slo
+    accumHDist := _sd
+    accumHCount := _cnt
+    if _si >= 0
+        accumHStTime := array.get(accEnvHSt, _si)
+        accumHEdTime := array.get(accEnvHEd, _si)
+
 // 1時間足
 if useAccumEnv and useAccumEnvH1
-    [_bh, _bl, _bs] = request.security(syminfo.tickerid, accumEnvH1TF, f_accumNT15Confirmed(), lookahead = barmerge.lookahead_on)
+    [_isA, _fHi, _fLo, _ended, _eHi, _eLo, _eSt, _eEd] = request.security(syminfo.tickerid, accumEnvH1TF, f_accumEnvBoxConfirmed(), lookahead = barmerge.lookahead_on)
     [_tb, _ts, _tc, _th, _tl] = request.security(syminfo.tickerid, accumEnvH1TrigTF, f_accumTrigConfirmed(), lookahead = barmerge.lookahead_on)
-    bool _newT = ta.change(time(accumEnvH1TrigTF)) != 0
-    [_lg, _sh, _rl, _bk, _w] = f_accumEnvTF(_bh, _bl, _bs, _tb, _ts, _tc, _th, _tl, _newT, minAccumWidth, accumTouchTolerance)
+    bool _newBar  = ta.change(time(accumEnvH1TF)) != 0
+    bool _newTrig = ta.change(time(accumEnvH1TrigTF)) != 0
+    accumOForming := nz(_isA, false)
+    accumOFormHi := _fHi
+    accumOFormLo := _fLo
+    if _newBar and _ended and not na(_eHi) and (_eHi - _eLo) >= minAccumWidth and (na(accEnvOLastSt) or _eSt != accEnvOLastSt)
+        array.push(accEnvOHi, _eHi)
+        array.push(accEnvOLo, _eLo)
+        array.push(accEnvOSt, _eSt)
+        array.push(accEnvOEd, _eEd)
+        array.push(accEnvOBk, 0)
+        accEnvOLastSt := _eSt
+        while array.size(accEnvOHi) > accumEnvKeep
+            array.shift(accEnvOHi)
+            array.shift(accEnvOLo)
+            array.shift(accEnvOSt)
+            array.shift(accEnvOEd)
+            array.shift(accEnvOBk)
+    [_lg, _sh, _rl, _si, _bk, _shi, _slo, _sd, _cnt] = f_accumEnvEval(accEnvOHi, accEnvOLo, accEnvOSt, accEnvOEd, accEnvOBk, _tb, _ts, _tc, _th, _tl, _newTrig, minAccumWidth, accumTouchTolerance, close)
     accumOLong := _lg
     accumOShort := _sh
     accumORel := _rl
+    accumOSelIdx := _si
     accumOBroke := _bk
-    accumOHi := _bh
-    accumOLo := _bl
+    accumOHi := _shi
+    accumOLo := _slo
+    accumODist := _sd
+    accumOCount := _cnt
+    if _si >= 0
+        accumOStTime := array.get(accEnvOSt, _si)
+        accumOEdTime := array.get(accEnvOEd, _si)
+
 // 15分足
 if useAccumEnv and useAccumEnvM15
-    [_bh, _bl, _bs] = request.security(syminfo.tickerid, accumEnvM15TF, f_accumNT15Confirmed(), lookahead = barmerge.lookahead_on)
+    [_isA, _fHi, _fLo, _ended, _eHi, _eLo, _eSt, _eEd] = request.security(syminfo.tickerid, accumEnvM15TF, f_accumEnvBoxConfirmed(), lookahead = barmerge.lookahead_on)
     [_tb, _ts, _tc, _th, _tl] = request.security(syminfo.tickerid, accumEnvM15TrigTF, f_accumTrigConfirmed(), lookahead = barmerge.lookahead_on)
-    bool _newT = ta.change(time(accumEnvM15TrigTF)) != 0
-    [_lg, _sh, _rl, _bk, _w] = f_accumEnvTF(_bh, _bl, _bs, _tb, _ts, _tc, _th, _tl, _newT, minAccumWidth, accumTouchTolerance)
+    bool _newBar  = ta.change(time(accumEnvM15TF)) != 0
+    bool _newTrig = ta.change(time(accumEnvM15TrigTF)) != 0
+    accumMForming := nz(_isA, false)
+    accumMFormHi := _fHi
+    accumMFormLo := _fLo
+    if _newBar and _ended and not na(_eHi) and (_eHi - _eLo) >= minAccumWidth and (na(accEnvMLastSt) or _eSt != accEnvMLastSt)
+        array.push(accEnvMHi, _eHi)
+        array.push(accEnvMLo, _eLo)
+        array.push(accEnvMSt, _eSt)
+        array.push(accEnvMEd, _eEd)
+        array.push(accEnvMBk, 0)
+        accEnvMLastSt := _eSt
+        while array.size(accEnvMHi) > accumEnvKeep
+            array.shift(accEnvMHi)
+            array.shift(accEnvMLo)
+            array.shift(accEnvMSt)
+            array.shift(accEnvMEd)
+            array.shift(accEnvMBk)
+    [_lg, _sh, _rl, _si, _bk, _shi, _slo, _sd, _cnt] = f_accumEnvEval(accEnvMHi, accEnvMLo, accEnvMSt, accEnvMEd, accEnvMBk, _tb, _ts, _tc, _th, _tl, _newTrig, minAccumWidth, accumTouchTolerance, close)
     accumMLong := _lg
     accumMShort := _sh
     accumMRel := _rl
+    accumMSelIdx := _si
     accumMBroke := _bk
-    accumMHi := _bh
-    accumMLo := _bl
+    accumMHi := _shi
+    accumMLo := _slo
+    accumMDist := _sd
+    accumMCount := _cnt
+    if _si >= 0
+        accumMStTime := array.get(accEnvMSt, _si)
+        accumMEdTime := array.get(accEnvMEd, _si)
 
-// --- 優先度解決 (D>4H>1H>15M・価格が箱近傍の足のみ優先) ---
+// --- 優先度解決 (D>4H>1H>15M・価格付近に有効候補箱があるTFのみ優先) ---
 int accumPrioD = (useAccumEnv and useAccumEnvD   and accumDRel) ? 4 : 0
 int accumPrioH = (useAccumEnv and useAccumEnvH4  and accumHRel) ? 3 : 0
 int accumPrioO = (useAccumEnv and useAccumEnvH1  and accumORel) ? 2 : 0
 int accumPrioM = (useAccumEnv and useAccumEnvM15 and accumMRel) ? 1 : 0
 int accumPrio  = math.max(accumPrioD, math.max(accumPrioH, math.max(accumPrioO, accumPrioM)))
 
-// 優先度TFのシグナルを最終 Accum シグナルとして採用
-//   ※ 有効トリガー0本 (enabledTrigCount == 0) のときは Accum のエントリーを必ず false にする
-//     (方向転換トリガーが存在しないため場所条件だけで発注しない)。
+// 優先度TFの採用箱シグナルを最終 Accum シグナルとして採用
+//   ※ 有効トリガー0本 (enabledTrigCount == 0) のときは必ず false (場所条件だけで発注しない)。
 bool accumLongRaw  = accumPrio == 4 ? accumDLong  : accumPrio == 3 ? accumHLong  : accumPrio == 2 ? accumOLong  : accumPrio == 1 ? accumMLong  : false
 bool accumShortRaw = accumPrio == 4 ? accumDShort : accumPrio == 3 ? accumHShort : accumPrio == 2 ? accumOShort : accumPrio == 1 ? accumMShort : false
 bool accumLongSignal  = accumLongRaw  and enabledTrigCount > 0
@@ -1272,7 +1467,6 @@ bool accumLowerReversalLong    = accumLongSignal  and accumPrioBroke == 0
 bool accumUpperBreakRetestLong = accumLongSignal  and accumPrioBroke == 1
 bool accumUpperReversalShort   = accumShortSignal and accumPrioBroke == 0
 bool accumLowerBreakRetestShort = accumShortSignal and accumPrioBroke == -1
-
 // --- トレンド環境 allow (EMAスコア) ---
 bool accumTrendOk = not useEnvFilter or allowByEnv
 
@@ -1409,8 +1603,13 @@ if okAddShort and wantShort
         shortArmed := false
 
 
+
 // ============================================================
 //  12. Accum 環境認識 表示 (テーブル / デバッグ / ゾーン)
+// ------------------------------------------------------------
+//  ・確定Accum箱 : 実線 (エントリー対象はこれだけ)
+//  ・形成中Accum : 点線 + 薄色 (エントリーには使わない)
+//  ・デバッグテーブル : 確定箱数 / 採用箱番号 / 箱Lo-Hi / 距離 / 状態 / 形成中or確定 / 開始終了時刻 / Sig
 // ============================================================
 f_accumSigText(bool _lg, bool _sh) =>
     _lg and not _sh ? "LONG" : _sh and not _lg ? "SHORT" : "-"
@@ -1420,78 +1619,94 @@ f_accumBrokeText(int _bk) =>
     _bk == 1 ? "BreakUp" : _bk == -1 ? "BreakDn" : "Range"
 f_accumBoxText(float _hi, float _lo) =>
     na(_hi) or na(_lo) ? "-" : str.tostring(_lo, "#.#") + "-" + str.tostring(_hi, "#.#")
-f_accumWidthText(float _hi, float _lo) =>
-    na(_hi) or na(_lo) ? "-" : str.tostring(_hi - _lo, "#.#")
+f_accumDistText(float _d) =>
+    na(_d) ? "-" : str.tostring(_d, "#.#")
+f_accumSelText(int _idx, int _cnt) =>
+    _idx < 0 ? "-" : str.tostring(_idx + 1) + "/" + str.tostring(_cnt)
+f_accumFormText(bool _forming) =>
+    _forming ? "形成中" : "確定"
+f_accumTimeText(int _t) =>
+    na(_t) ? "-" : str.format_time(_t, "MM/dd HH:mm", "Asia/Tokyo")
+
+f_accumRow(table _t, int _row, string _lbl, bool _use, int _cnt, int _selIdx, float _hi, float _lo, float _dist, int _bk, bool _forming, int _stT, int _edT, bool _lg, bool _sh) =>
+    color _tc = color.white
+    table.cell(_t, 0, _row, _lbl, text_color = _tc, text_size = size.small)
+    table.cell(_t, 1, _row, _use ? str.tostring(_cnt) : "-", text_color = _tc, text_size = size.small)
+    table.cell(_t, 2, _row, _use ? f_accumSelText(_selIdx, _cnt) : "-", text_color = _tc, text_size = size.small)
+    table.cell(_t, 3, _row, _use ? f_accumBoxText(_hi, _lo) : "-", text_color = _tc, text_size = size.small)
+    table.cell(_t, 4, _row, _use ? f_accumDistText(_dist) : "-", text_color = _tc, text_size = size.small)
+    table.cell(_t, 5, _row, _use ? f_accumBrokeText(_bk) : "-", text_color = _tc, text_size = size.small)
+    table.cell(_t, 6, _row, _use ? f_accumFormText(_forming) : "-", text_color = _tc, text_size = size.small)
+    table.cell(_t, 7, _row, _use ? f_accumTimeText(_stT) : "-", text_color = _tc, text_size = size.small)
+    table.cell(_t, 8, _row, _use ? f_accumTimeText(_edT) : "-", text_color = _tc, text_size = size.small)
+    table.cell(_t, 9, _row, _use ? f_accumSigText(_lg, _sh) : "-", text_color = _tc, bgcolor = _use ? f_accumSigColor(_lg, _sh) : color.new(color.gray, 60), text_size = size.small)
 
 var table accTbl = na
 if accumEnvShowTable
     if na(accTbl)
-        accTbl := table.new(position.top_right, 6, 6, border_width = 1)
+        accTbl := table.new(position.top_right, 10, 6, border_width = 1)
     if barstate.islast
-        c_hdr = color.new(color.black, 0)
-        table.cell(accTbl, 0, 0, "TF",    text_color = color.white, bgcolor = c_hdr, text_size = size.small)
-        table.cell(accTbl, 1, 0, "箱(Lo-Hi)", text_color = color.white, bgcolor = c_hdr, text_size = size.small)
-        table.cell(accTbl, 2, 0, "幅",    text_color = color.white, bgcolor = c_hdr, text_size = size.small)
-        table.cell(accTbl, 3, 0, "状態",  text_color = color.white, bgcolor = c_hdr, text_size = size.small)
-        table.cell(accTbl, 4, 0, "関連",  text_color = color.white, bgcolor = c_hdr, text_size = size.small)
-        table.cell(accTbl, 5, 0, "Sig",   text_color = color.white, bgcolor = c_hdr, text_size = size.small)
-        // D
-        table.cell(accTbl, 0, 1, "D", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 1, 1, useAccumEnvD ? f_accumBoxText(accumDHi, accumDLo) : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 2, 1, useAccumEnvD ? f_accumWidthText(accumDHi, accumDLo) : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 3, 1, useAccumEnvD ? f_accumBrokeText(accumDBroke) : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 4, 1, useAccumEnvD ? (accumDRel ? "Y" : "n") : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 5, 1, useAccumEnvD ? f_accumSigText(accumDLong, accumDShort) : "-", text_color = color.white, bgcolor = useAccumEnvD ? f_accumSigColor(accumDLong, accumDShort) : color.new(color.gray, 60), text_size = size.small)
-        // 4H
-        table.cell(accTbl, 0, 2, "4H", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 1, 2, useAccumEnvH4 ? f_accumBoxText(accumHHi, accumHLo) : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 2, 2, useAccumEnvH4 ? f_accumWidthText(accumHHi, accumHLo) : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 3, 2, useAccumEnvH4 ? f_accumBrokeText(accumHBroke) : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 4, 2, useAccumEnvH4 ? (accumHRel ? "Y" : "n") : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 5, 2, useAccumEnvH4 ? f_accumSigText(accumHLong, accumHShort) : "-", text_color = color.white, bgcolor = useAccumEnvH4 ? f_accumSigColor(accumHLong, accumHShort) : color.new(color.gray, 60), text_size = size.small)
-        // 1H
-        table.cell(accTbl, 0, 3, "1H", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 1, 3, useAccumEnvH1 ? f_accumBoxText(accumOHi, accumOLo) : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 2, 3, useAccumEnvH1 ? f_accumWidthText(accumOHi, accumOLo) : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 3, 3, useAccumEnvH1 ? f_accumBrokeText(accumOBroke) : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 4, 3, useAccumEnvH1 ? (accumORel ? "Y" : "n") : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 5, 3, useAccumEnvH1 ? f_accumSigText(accumOLong, accumOShort) : "-", text_color = color.white, bgcolor = useAccumEnvH1 ? f_accumSigColor(accumOLong, accumOShort) : color.new(color.gray, 60), text_size = size.small)
-        // 15M
-        table.cell(accTbl, 0, 4, "15M", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 1, 4, useAccumEnvM15 ? f_accumBoxText(accumMHi, accumMLo) : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 2, 4, useAccumEnvM15 ? f_accumWidthText(accumMHi, accumMLo) : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 3, 4, useAccumEnvM15 ? f_accumBrokeText(accumMBroke) : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 4, 4, useAccumEnvM15 ? (accumMRel ? "Y" : "n") : "-", text_color = color.white, text_size = size.small)
-        table.cell(accTbl, 5, 4, useAccumEnvM15 ? f_accumSigText(accumMLong, accumMShort) : "-", text_color = color.white, bgcolor = useAccumEnvM15 ? f_accumSigColor(accumMLong, accumMShort) : color.new(color.gray, 60), text_size = size.small)
-        // FINAL
+        color _hc = color.new(color.black, 0)
+        table.cell(accTbl, 0, 0, "TF",     text_color = color.white, bgcolor = _hc, text_size = size.small)
+        table.cell(accTbl, 1, 0, "確定数", text_color = color.white, bgcolor = _hc, text_size = size.small)
+        table.cell(accTbl, 2, 0, "採用#",  text_color = color.white, bgcolor = _hc, text_size = size.small)
+        table.cell(accTbl, 3, 0, "箱Lo-Hi", text_color = color.white, bgcolor = _hc, text_size = size.small)
+        table.cell(accTbl, 4, 0, "距離",   text_color = color.white, bgcolor = _hc, text_size = size.small)
+        table.cell(accTbl, 5, 0, "状態",   text_color = color.white, bgcolor = _hc, text_size = size.small)
+        table.cell(accTbl, 6, 0, "形成",   text_color = color.white, bgcolor = _hc, text_size = size.small)
+        table.cell(accTbl, 7, 0, "開始",   text_color = color.white, bgcolor = _hc, text_size = size.small)
+        table.cell(accTbl, 8, 0, "終了",   text_color = color.white, bgcolor = _hc, text_size = size.small)
+        table.cell(accTbl, 9, 0, "Sig",    text_color = color.white, bgcolor = _hc, text_size = size.small)
+        f_accumRow(accTbl, 1, "D",   useAccumEnvD,   accumDCount, accumDSelIdx, accumDHi, accumDLo, accumDDist, accumDBroke, accumDForming, accumDStTime, accumDEdTime, accumDLong, accumDShort)
+        f_accumRow(accTbl, 2, "4H",  useAccumEnvH4,  accumHCount, accumHSelIdx, accumHHi, accumHLo, accumHDist, accumHBroke, accumHForming, accumHStTime, accumHEdTime, accumHLong, accumHShort)
+        f_accumRow(accTbl, 3, "1H",  useAccumEnvH1,  accumOCount, accumOSelIdx, accumOHi, accumOLo, accumODist, accumOBroke, accumOForming, accumOStTime, accumOEdTime, accumOLong, accumOShort)
+        f_accumRow(accTbl, 4, "15M", useAccumEnvM15, accumMCount, accumMSelIdx, accumMHi, accumMLo, accumMDist, accumMBroke, accumMForming, accumMStTime, accumMEdTime, accumMLong, accumMShort)
+        // FINAL (採用TF・最終シグナル・デバッグ)
         string _prioTxt = accumPrio == 4 ? "D" : accumPrio == 3 ? "4H" : accumPrio == 2 ? "1H" : accumPrio == 1 ? "15M" : "-"
         table.cell(accTbl, 0, 5, "採用", text_color = color.white, bgcolor = f_accumSigColor(accumLongSignal, accumShortSignal), text_size = size.small)
-        table.cell(accTbl, 1, 5, "優先:" + _prioTxt, text_color = color.white, text_size = size.small)
+        table.cell(accTbl, 1, 5, "TF:" + _prioTxt, text_color = color.white, text_size = size.small)
         table.cell(accTbl, 2, 5, accumEnvShowDebug ? accumEnvCombineMode : "", text_color = color.white, text_size = size.small)
         table.cell(accTbl, 3, 5, f_accumSigText(accumLongSignal, accumShortSignal), text_color = color.white, bgcolor = f_accumSigColor(accumLongSignal, accumShortSignal), text_size = size.small)
         table.cell(accTbl, 4, 5, accumEnvShowDebug ? ("Trd:" + (accumTrendOk ? "OK" : "NG")) : "", text_color = color.white, text_size = size.small)
         table.cell(accTbl, 5, 5, accumEnvShowDebug ? ("L:" + (finalEnvLongOk ? "1" : "0") + "/S:" + (finalEnvShortOk ? "1" : "0")) : "", text_color = color.white, text_size = size.small)
+        table.cell(accTbl, 6, 5, "", text_color = color.white, text_size = size.small)
+        table.cell(accTbl, 7, 5, "", text_color = color.white, text_size = size.small)
+        table.cell(accTbl, 8, 5, "", text_color = color.white, text_size = size.small)
+        table.cell(accTbl, 9, 5, "", text_color = color.white, text_size = size.small)
 
-// --- 各TF Accum箱の上下限ゾーン (デバッグ・最新バーで再描画) ---
+// --- ゾーン描画 (確定箱=実線 / 形成中=点線・薄色) ---
 var line[] accumZoneLines = array.new_line()
-f_accumDrawZone(float _p, color _c) =>
+f_accumDrawLine(float _p, color _c, string _style) =>
     if not na(_p)
-        line _ln = line.new(bar_index - 50, _p, bar_index, _p, color = _c, width = 1, extend = extend.right)
+        line _ln = line.new(bar_index - 50, _p, bar_index, _p, color = _c, width = 1, extend = extend.right, style = _style)
         array.push(accumZoneLines, _ln)
+f_accumDrawBoxes(array<float> _aHi, array<float> _aLo, color _c) =>
+    if array.size(_aHi) > 0
+        for i = 0 to array.size(_aHi) - 1
+            f_accumDrawLine(array.get(_aHi, i), _c, line.style_solid)
+            f_accumDrawLine(array.get(_aLo, i), _c, line.style_solid)
 if accumEnvShowZones and barstate.islast
     if array.size(accumZoneLines) > 0
         for _i = 0 to array.size(accumZoneLines) - 1
             line.delete(array.get(accumZoneLines, _i))
         array.clear(accumZoneLines)
     if useAccumEnvD
-        f_accumDrawZone(accumDHi, color.new(color.lime, 0))
-        f_accumDrawZone(accumDLo, color.new(color.lime, 40))
+        f_accumDrawBoxes(accEnvDHi, accEnvDLo, color.new(color.lime, 0))
+        if accumDForming
+            f_accumDrawLine(accumDFormHi, color.new(color.lime, 55), line.style_dotted)
+            f_accumDrawLine(accumDFormLo, color.new(color.lime, 55), line.style_dotted)
     if useAccumEnvH4
-        f_accumDrawZone(accumHHi, color.new(color.aqua, 0))
-        f_accumDrawZone(accumHLo, color.new(color.aqua, 40))
+        f_accumDrawBoxes(accEnvHHi, accEnvHLo, color.new(color.aqua, 0))
+        if accumHForming
+            f_accumDrawLine(accumHFormHi, color.new(color.aqua, 55), line.style_dotted)
+            f_accumDrawLine(accumHFormLo, color.new(color.aqua, 55), line.style_dotted)
     if useAccumEnvH1
-        f_accumDrawZone(accumOHi, color.new(color.orange, 0))
-        f_accumDrawZone(accumOLo, color.new(color.orange, 40))
+        f_accumDrawBoxes(accEnvOHi, accEnvOLo, color.new(color.orange, 0))
+        if accumOForming
+            f_accumDrawLine(accumOFormHi, color.new(color.orange, 55), line.style_dotted)
+            f_accumDrawLine(accumOFormLo, color.new(color.orange, 55), line.style_dotted)
     if useAccumEnvM15
-        f_accumDrawZone(accumMHi, color.new(color.fuchsia, 0))
-        f_accumDrawZone(accumMLo, color.new(color.fuchsia, 40))
+        f_accumDrawBoxes(accEnvMHi, accEnvMLo, color.new(color.fuchsia, 0))
+        if accumMForming
+            f_accumDrawLine(accumMFormHi, color.new(color.fuchsia, 55), line.style_dotted)
+            f_accumDrawLine(accumMFormLo, color.new(color.fuchsia, 55), line.style_dotted)
