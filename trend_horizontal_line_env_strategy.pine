@@ -942,6 +942,12 @@ f_lineEnvState(int holdBars, int tfCode) =>
     if useLineEnvReaction and array.size(_zP) > 0
         float _rTol = _atr * lineEnvReactionToleranceATR
         for _i = 0 to array.size(_zP) - 1
+            // 失効: 最終タッチから lookback 超過で反応履歴を全リセット (新タッチが無くても古いReactionは失効)。
+            int _lastR0 = array.get(_zRctLast, _i)
+            if not na(_lastR0) and (bar_index - _lastR0) > lineEnvReactionLookback
+                array.set(_zRct, _i, 0)
+                array.set(_zRctFirst, _i, na)
+                array.set(_zRctLast, _i, na)
             float _zp = array.get(_zP, _i)
             bool _touch = low <= _zp + _rTol and high >= _zp - _rTol
             if _touch
@@ -949,6 +955,7 @@ f_lineEnvState(int holdBars, int tfCode) =>
                 if na(_lastR) or _lastR != bar_index
                     int _cntR  = array.get(_zRct, _i)
                     int _firstR = array.get(_zRctFirst, _i)
+                    // 窓の先頭が lookback 外なら新起点で数え直す (クラスターの span を lookback 以内に保つ)。
                     if _cntR == 0 or na(_firstR) or (bar_index - _firstR) > lineEnvReactionLookback
                         array.set(_zRct, _i, 1)
                         array.set(_zRctFirst, _i, bar_index)
@@ -1056,9 +1063,11 @@ f_lineEnvState(int holdBars, int tfCode) =>
     int _shortType = _sellSweep ? 4 : _sellBreak ? 3 : _sellFlip ? 2 : _sellBounce ? 1 : 0
     bool _longEvent  = _longType  != 0
     bool _shortEvent = _shortType != 0
-    // 反応した側の強度 (Long=Support / Short=Resistance)
-    int _longStr  = _nSupStr
-    int _shortStr = _nResStr
+    // イベント種別に対応した方向別強度 (HigherStrength競合用)。
+    //   Long : Bounce/Sweep→Support / Break→突破Resistance(前バー) / Flip→旧Resistance候補。
+    //   Short: Bounce/Sweep→Resistance / Break→突破Support(前バー) / Flip→旧Support候補。
+    int _longStr  = _longType  == 3 ? _nResStr[1] : _longType  == 2 ? _flipResStr : _nSupStr
+    int _shortStr = _shortType == 3 ? _nSupStr[1] : _shortType == 2 ? _flipSupStr : _nResStr
     // --- 両方向同時成立の解決 ---
     bool _conflict = false
     int _dirNow = 0
@@ -1129,10 +1138,11 @@ f_lineEnvState(int holdBars, int tfCode) =>
     int _touchCnt = _hitTouch
     // --- スコア (BinaryBias / EventStrength) ---
     int _rawScore = lineEnvScoringMode == "BinaryBias" ? 1 : f_lineEnvScore(_signalType, _strength)
-    // --- 状態保持 / イベント再アーム (Long/Short × Bounce/Flip/Break/Sweep を個別管理) ---
-    //   同じイベントの連続バー再発火は禁止。発火で該当スロットを解除し、価格がゾーンから
-    //   lineEnvEventRearmATR 以上離れた / lineEnvEventRearmBars 本経過 で再アーム → 同じ水平線の
-    //   新しい反応で再発火可能。holdBars 切れだけでは (接触継続中は) 再アームしない。
+    // --- 状態保持 / イベント再アーム (direction × signalType × zoneId をキーに管理) ---
+    //   発火した (dir, type, zone) を「解除中キー」配列へ登録。同じキーが登録済みの間は再発火禁止。
+    //   別ゾーンの同種イベントは別キーなので独立発火可能。反対方向イベントも別キーで即時上書き可能。
+    //   再アーム = 元イベント条件が一度解除(false)された後 に、ゾーン離脱 (ATR) / 本数経過 を満たしたとき。
+    //   → 接触/反応継続中は再アームしない。holdBars 切れだけでも再アームしない。
     var int _evBar = na
     var int _evDir = 0
     var int _evScore = 0
@@ -1144,30 +1154,63 @@ f_lineEnvState(int holdBars, int tfCode) =>
     var int _evHitT = na
     var int _evTouch = 0
     var int _lastEventId = na
-    var array<bool>  _armArmed = array.new_bool(8, true)
-    var array<float> _armZoneP = array.new_float(8, na)
-    var array<int>   _armBar   = array.new_int(8, na)
-    bool _newEvent = (_longEvent or _shortEvent) and not _conflict and _dirNow != 0 and _signalType != 0
-    int _idx = _dirNow == 1 ? (_signalType - 1) : _dirNow == -1 ? (4 + _signalType - 1) : -1
-    // 再アームパス (解除中スロットのみ。O(8))
-    for _k = 0 to 7
-        if not array.get(_armArmed, _k)
-            float _azp = array.get(_armZoneP, _k)
-            int   _abr = array.get(_armBar, _k)
-            bool _leftZone = not na(_azp) and math.abs(close - _azp) >= _atr * lineEnvEventRearmATR
-            bool _barsOk   = not na(_abr) and (bar_index - _abr) >= lineEnvEventRearmBars
-            bool _rearm = lineEnvEventRearmMode == "LeaveZone" ? _leftZone : lineEnvEventRearmMode == "Bars" ? _barsOk : (_leftZone or _barsOk)
+    // 解除中イベントキー配列 (dir/type/zoneId/zonePrice/fireBar/conditionReleased)。最大保持数で古いキーを削除。
+    var array<int>   _dkDir  = array.new_int()
+    var array<int>   _dkType = array.new_int()
+    var array<int>   _dkZone = array.new_int()
+    var array<float> _dkZoneP = array.new_float()
+    var array<int>   _dkBar  = array.new_int()
+    var array<bool>  _dkRel  = array.new_bool()
+    int _maxKeys = 32
+    bool _wouldFire = (_longEvent or _shortEvent) and not _conflict and _dirNow != 0 and _signalType != 0 and not na(_hitZoneP)
+    int _zoneId = not na(_hitZoneP) ? int(math.round(_hitZoneP / syminfo.mintick)) : na
+    // 再アーム & 条件解除の更新 (解除中キーを後方から走査)
+    if array.size(_dkDir) > 0
+        int _j = array.size(_dkDir) - 1
+        while _j >= 0
+            int   _kd  = array.get(_dkDir, _j)
+            int   _kt  = array.get(_dkType, _j)
+            int   _kz  = array.get(_dkZone, _j)
+            float _kzp = array.get(_dkZoneP, _j)
+            int   _kb  = array.get(_dkBar, _j)
+            bool  _krel = array.get(_dkRel, _j)
+            // 同一キー (dir/type/zone) のイベント条件が このバーも継続しているか
+            bool _activeSame = _wouldFire and _dirNow == _kd and _signalType == _kt and not na(_zoneId) and _zoneId == _kz
+            if not _activeSame
+                _krel := true
+                array.set(_dkRel, _j, true)
+            bool _leftZone = not na(_kzp) and math.abs(close - _kzp) >= _atr * lineEnvEventRearmATR
+            bool _barsOk   = not na(_kb) and (bar_index - _kb) >= lineEnvEventRearmBars
+            bool _rearm = _krel and (lineEnvEventRearmMode == "LeaveZone" ? _leftZone : lineEnvEventRearmMode == "Bars" ? _barsOk : (_leftZone or _barsOk))
             if _rearm
-                array.set(_armArmed, _k, true)
-    // 発火 (該当スロットがアーム中の時だけ)。反対方向は別スロットのため即時上書き可能。
-    //   Pineは and の両辺を評価するため、負indexでの array.get を避けて安全indexで読む。
-    int _idxSafe = _idx >= 0 ? _idx : 0
-    bool _slotArmed = array.get(_armArmed, _idxSafe)
-    bool _fire = _newEvent and _idx >= 0 and _slotArmed
+                array.remove(_dkDir, _j)
+                array.remove(_dkType, _j)
+                array.remove(_dkZone, _j)
+                array.remove(_dkZoneP, _j)
+                array.remove(_dkBar, _j)
+                array.remove(_dkRel, _j)
+            _j := _j - 1
+    // 発火判定: 解除中キーに同一 (dir, type, zone) が無ければ発火
+    bool _keyDisarmed = false
+    if _wouldFire and array.size(_dkDir) > 0
+        for _j = 0 to array.size(_dkDir) - 1
+            if not _keyDisarmed and array.get(_dkDir, _j) == _dirNow and array.get(_dkType, _j) == _signalType and array.get(_dkZone, _j) == _zoneId
+                _keyDisarmed := true
+    bool _fire = _wouldFire and not _keyDisarmed
     if _fire
-        array.set(_armArmed, _idx, false)
-        array.set(_armZoneP, _idx, _hitZoneP)
-        array.set(_armBar, _idx, bar_index)
+        array.push(_dkDir, _dirNow)
+        array.push(_dkType, _signalType)
+        array.push(_dkZone, _zoneId)
+        array.push(_dkZoneP, _hitZoneP)
+        array.push(_dkBar, bar_index)
+        array.push(_dkRel, false)
+        while array.size(_dkDir) > _maxKeys
+            array.shift(_dkDir)
+            array.shift(_dkType)
+            array.shift(_dkZone)
+            array.shift(_dkZoneP)
+            array.shift(_dkBar)
+            array.shift(_dkRel)
         _evBar := bar_index
         _evDir := _dirNow
         _evScore := _rawScore
