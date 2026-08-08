@@ -284,6 +284,11 @@ accumEnvM15TrigTF = input.timeframe("5",   "15M Accum トリガー確認足", gr
 // --- 箱の最小幅・タッチ許容・保持数 ---
 minAccumWidth       = input.float(30.0, "Accum箱 最小幅($) (これ以上=エントリー対象)", minval = 0.0, step = 0.5, group = grpAccum)
 accumTouchTolerance = input.float(3.0,  "境界タッチ許容($)", minval = 0.0, step = 0.1, group = grpAccum)
+// --- タッチ状態 保持本数 (各Accumの「トリガー確認足」の本数。タッチ後この本数まで方向転換トリガーを待つ) ---
+accumTouchHoldD   = input.int(6, "日足Accum タッチ保持本数 (確認足)", minval = 1, group = grpAccum)
+accumTouchHoldH4  = input.int(6, "4H Accum タッチ保持本数 (確認足)", minval = 1, group = grpAccum)
+accumTouchHoldH1  = input.int(6, "1H Accum タッチ保持本数 (確認足)", minval = 1, group = grpAccum)
+accumTouchHoldM15 = input.int(6, "15M Accum タッチ保持本数 (確認足)", minval = 1, group = grpAccum)
 // 上位足Accumエントリー用の確定箱保持数 (5分/15分NoTrade用 accumNTKeep とは分離)
 accumEnvKeep = input.int(3, "保持する上位足Accum数", minval = 1, maxval = 10, group = grpAccum)
 // --- 表示 / デバッグ ---
@@ -1162,7 +1167,9 @@ f_accumEnvBoxConfirmed() =>
 //   ・採用      : 近傍候補のうち有効境界までの距離が最小の1箱 (同距離は新しい箱=後勝ち)。
 //                距離優先で1箱に確定 → その採用箱からのみシグナルを出す (重複シグナル防止)。
 //   ・シグナルは確認足確定 (_newTrig) のときのみ・遷移足 (ブレイク/箱内復帰) では出さない。
-f_accumEnvEval(array<float> _aHi, array<float> _aLo, array<int> _aSt, array<int> _aEd, array<int> _aBk, bool _tBull, bool _tBear, float _tClose, float _tHigh, float _tLow, bool _newTrig, float _minW, float _tol, float _px) =>
+//   ・タッチ(場所条件)→待機保持→保持期間中のトリガー成立でシグナル (タッチとトリガーは別足でよい)。
+//     _holdBars = タッチ後にトリガーを待つ「確認足」の本数。var 状態は呼び出し側(TF)ごとに独立。
+f_accumEnvEval(array<float> _aHi, array<float> _aLo, array<int> _aSt, array<int> _aEd, array<int> _aBk, bool _tBull, bool _tBear, float _tClose, float _tHigh, float _tLow, bool _newTrig, float _minW, float _tol, float _px, int _holdBars) =>
     int   _n      = array.size(_aHi)
     bool  _rel    = false
     int   _selIdx = -1
@@ -1207,13 +1214,78 @@ f_accumEnvEval(array<float> _aHi, array<float> _aLo, array<int> _aSt, array<int>
                     _selLowerTouch := _boxOk and _tLow  <= _lo + _tol and _tHigh >= _lo - _tol
                     _selUpperTouch := _boxOk and _tHigh >= _hi - _tol and _tLow  <= _hi + _tol
                     _selTrans := _bkAfter != _bkBefore
-    // 採用箱のみからシグナル生成 (更新前状態で判定・遷移足=ブレイク/箱内復帰足では出さない)
-    bool _lowerRev = _newTrig and _selIdx >= 0 and _selBkBefore == 0  and _selLowerTouch and _tBull
-    bool _upperRev = _newTrig and _selIdx >= 0 and _selBkBefore == 0  and _selUpperTouch and _tBear
-    bool _upRetest = _newTrig and _selIdx >= 0 and _selBkBefore == 1  and _selUpperTouch and _tBull
-    bool _dnRetest = _newTrig and _selIdx >= 0 and _selBkBefore == -1 and _selLowerTouch and _tBear
-    bool _selLong  = (_lowerRev or _upRetest) and not _selTrans
-    bool _selShort = (_upperRev or _dnRetest) and not _selTrans
+    // 採用箱の識別子 (開始time)。選択箱なしは na。→ 待機を「どの箱の境界か」で管理し別箱に持ち越さない。
+    int _selSt = _selIdx >= 0 ? array.get(_aSt, _selIdx) : na
+    // === タッチ検出 (場所条件・方向転換トリガーとは独立に成立) ===
+    //   Long場所 : 未ブレイク箱(0)の下限反発 / 上抜け箱(1)の上限リテスト。
+    //   Short場所: 未ブレイク箱(0)の上限反発 / 下抜け箱(-1)の下限リテスト。
+    //   遷移足(_selTrans=ブレイク/箱内復帰足)では新規タッチを開始しない (更新前 breakState で判定)。
+    bool _longTouch  = _selIdx >= 0 and not _selTrans and ((_selBkBefore == 0 and _selLowerTouch) or (_selBkBefore == 1  and _selUpperTouch))
+    bool _shortTouch = _selIdx >= 0 and not _selTrans and ((_selBkBefore == 0 and _selUpperTouch) or (_selBkBefore == -1 and _selLowerTouch))
+    bool _bothTouch  = _longTouch and _shortTouch   // 同足で両境界タッチ → 方向を予想せず待機を作らない
+    // === タッチ→待機→トリガー ステート管理 (確認足 _newTrig 単位・呼び出しTFごとに独立 var) ===
+    //   _waitDir : 1=ロング待機 / -1=ショート待機 / 0=待機なし
+    //   _waitBoxSt : 待機対象箱の識別子(開始time)  _waitBkAtTouch : タッチ時 breakState (変化で無効化)
+    //   _waitCount : タッチ後の確認足経過数 (_holdBars 超で失効)
+    var int _waitDir       = 0
+    var int _waitBoxSt     = na
+    var int _waitBkAtTouch = 0
+    var int _waitCount     = 0
+    bool _sigLong  = false
+    bool _sigShort = false
+    if _newTrig
+        // (1) 既存待機の無効化 : 採用箱が別箱/消失 / 同一箱で breakState 変化(遷移含む) / 保持期限超過
+        if _waitDir != 0
+            bool _boxGone   = na(_selSt) or _selSt != _waitBoxSt
+            bool _bkChanged = not na(_selSt) and _selSt == _waitBoxSt and (_selBkBefore != _waitBkAtTouch or _selTrans)
+            bool _expired   = _waitCount > _holdBars
+            if _boxGone or _bkChanged or _expired
+                _waitDir := 0
+                _waitBoxSt := na
+                _waitBkAtTouch := 0
+                _waitCount := 0
+        // (2) 保持期間中のトリガー成立 → シグナル + 待機解除 (同一タッチから複数回出さない)
+        if _waitDir == 1 and _tBull
+            _sigLong := true
+            _waitDir := 0
+            _waitBoxSt := na
+            _waitBkAtTouch := 0
+            _waitCount := 0
+        else if _waitDir == -1 and _tBear
+            _sigShort := true
+            _waitDir := 0
+            _waitBoxSt := na
+            _waitBkAtTouch := 0
+            _waitCount := 0
+        // (3) 新規タッチ検出 → 待機開始 (待機なしの時)。タッチ足でトリガーも成立なら即シグナル。
+        if _waitDir == 0 and _longTouch and not _bothTouch
+            _waitDir := 1
+            _waitBoxSt := _selSt
+            _waitBkAtTouch := _selBkBefore
+            _waitCount := 0
+            if _tBull
+                _sigLong := true
+                _waitDir := 0
+                _waitBoxSt := na
+                _waitBkAtTouch := 0
+                _waitCount := 0
+        else if _waitDir == 0 and _shortTouch and not _bothTouch
+            _waitDir := -1
+            _waitBoxSt := _selSt
+            _waitBkAtTouch := _selBkBefore
+            _waitCount := 0
+            if _tBear
+                _sigShort := true
+                _waitDir := 0
+                _waitBoxSt := na
+                _waitBkAtTouch := 0
+                _waitCount := 0
+        // (4) 待機継続 → 経過本数を加算 (次の確認足で保持期限を判定)
+        if _waitDir != 0
+            _waitCount += 1
+    // 採用箱のみからシグナル (タッチ足 or 保持期間中のトリガー足で発生・遷移足では待機を作らない)
+    bool _selLong  = _sigLong
+    bool _selShort = _sigShort
     [_selLong, _selShort, _rel, _selIdx, _selBkAfter, _selHi, _selLo, _selDist, _n]
 
 // --- 各TF 確定箱配列 (完全分離) ---
@@ -1323,7 +1395,7 @@ if useAccumEnv and useAccumEnvD
             array.shift(accEnvDSt)
             array.shift(accEnvDEd)
             array.shift(accEnvDBk)
-    [_lg, _sh, _rl, _si, _bk, _shi, _slo, _sd, _cnt] = f_accumEnvEval(accEnvDHi, accEnvDLo, accEnvDSt, accEnvDEd, accEnvDBk, _tb, _ts, _tc, _th, _tl, _newTrig, minAccumWidth, accumTouchTolerance, close)
+    [_lg, _sh, _rl, _si, _bk, _shi, _slo, _sd, _cnt] = f_accumEnvEval(accEnvDHi, accEnvDLo, accEnvDSt, accEnvDEd, accEnvDBk, _tb, _ts, _tc, _th, _tl, _newTrig, minAccumWidth, accumTouchTolerance, close, accumTouchHoldD)
     accumDLong := _lg
     accumDShort := _sh
     accumDRel := _rl
@@ -1359,7 +1431,7 @@ if useAccumEnv and useAccumEnvH4
             array.shift(accEnvHSt)
             array.shift(accEnvHEd)
             array.shift(accEnvHBk)
-    [_lg, _sh, _rl, _si, _bk, _shi, _slo, _sd, _cnt] = f_accumEnvEval(accEnvHHi, accEnvHLo, accEnvHSt, accEnvHEd, accEnvHBk, _tb, _ts, _tc, _th, _tl, _newTrig, minAccumWidth, accumTouchTolerance, close)
+    [_lg, _sh, _rl, _si, _bk, _shi, _slo, _sd, _cnt] = f_accumEnvEval(accEnvHHi, accEnvHLo, accEnvHSt, accEnvHEd, accEnvHBk, _tb, _ts, _tc, _th, _tl, _newTrig, minAccumWidth, accumTouchTolerance, close, accumTouchHoldH4)
     accumHLong := _lg
     accumHShort := _sh
     accumHRel := _rl
@@ -1395,7 +1467,7 @@ if useAccumEnv and useAccumEnvH1
             array.shift(accEnvOSt)
             array.shift(accEnvOEd)
             array.shift(accEnvOBk)
-    [_lg, _sh, _rl, _si, _bk, _shi, _slo, _sd, _cnt] = f_accumEnvEval(accEnvOHi, accEnvOLo, accEnvOSt, accEnvOEd, accEnvOBk, _tb, _ts, _tc, _th, _tl, _newTrig, minAccumWidth, accumTouchTolerance, close)
+    [_lg, _sh, _rl, _si, _bk, _shi, _slo, _sd, _cnt] = f_accumEnvEval(accEnvOHi, accEnvOLo, accEnvOSt, accEnvOEd, accEnvOBk, _tb, _ts, _tc, _th, _tl, _newTrig, minAccumWidth, accumTouchTolerance, close, accumTouchHoldH1)
     accumOLong := _lg
     accumOShort := _sh
     accumORel := _rl
@@ -1431,7 +1503,7 @@ if useAccumEnv and useAccumEnvM15
             array.shift(accEnvMSt)
             array.shift(accEnvMEd)
             array.shift(accEnvMBk)
-    [_lg, _sh, _rl, _si, _bk, _shi, _slo, _sd, _cnt] = f_accumEnvEval(accEnvMHi, accEnvMLo, accEnvMSt, accEnvMEd, accEnvMBk, _tb, _ts, _tc, _th, _tl, _newTrig, minAccumWidth, accumTouchTolerance, close)
+    [_lg, _sh, _rl, _si, _bk, _shi, _slo, _sd, _cnt] = f_accumEnvEval(accEnvMHi, accEnvMLo, accEnvMSt, accEnvMEd, accEnvMBk, _tb, _ts, _tc, _th, _tl, _newTrig, minAccumWidth, accumTouchTolerance, close, accumTouchHoldM15)
     accumMLong := _lg
     accumMShort := _sh
     accumMRel := _rl
