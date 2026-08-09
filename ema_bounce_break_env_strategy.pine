@@ -295,7 +295,6 @@ emaEnvHold1M = input.int(30, "1M EMA状態保持本数", minval = 1, group = grp
 emaEnvHold5M = input.int(24, "5M EMA状態保持本数", minval = 1, group = grpEMAEnv)
 // --- トレンド環境との結合 ---
 emaEnvTrendCombineMode = input.string("TrendAndEMA", "EMAトレンドとの結合", options = ["TrendOnly", "EMAOnly", "TrendAndEMA", "TrendOrEMA"], group = grpEMAEnv)
-useEMAEnvBias = input.bool(false, "EMA方向バイアスを使う (OFFで既存挙動を維持)", group = grpEMAEnv)
 // --- 表示 (表示専用・検知/判定に影響しない) ---
 emaEnvShowEMA    = input.bool(false, "EMAを表示", group = grpEMAEnv)
 emaEnvShowLabels = input.bool(false, "EMA反応ラベルを表示", group = grpEMAEnv)
@@ -712,7 +711,8 @@ f_emaEnvEvt(float _c1, float _c, float _o, float _h, float _l, float _emaNow, fl
 
 // 1分足 状態 (1分足コンテキスト・request.security_lower_tf から確定1分足ごとに評価)。
 //   4本の1M EMA をORし方向イベント → emaEnvHold1M 本(1分足)保持 → 現在biasを返す。
-//   戻り値 [bias, lastDir, lastEma, lastType] (last* は最後に発火したイベント詳細=表示専用)。
+//   戻り値 [bias, evtDir, evtEma, evtType]。evt* は「その確定1分足で新規発生した生イベント」
+//   (保持後の値ではない)。上位で各1分足の生イベントをORし新規Long/Shortを集約する。
 f_emaEnv1MState() =>
     float _atr  = ta.atr(emaEnvAtrLen)
     float _e200  = ta.ema(close, emaEnvLen200)
@@ -770,17 +770,11 @@ f_emaEnv1MState() =>
         _evbar := bar_index
     bool _active = not na(_evbar) and (bar_index - _evbar) < emaEnvHold1M
     int _outBias = _active ? _bias : 0
-    var int _lastDir  = 0
-    var int _lastEma  = 0
-    var int _lastType = 0
-    if _dir != 0
-        _lastDir  := _dir
-        _lastEma  := _ema
-        _lastType := _type
-    [_outBias, _lastDir, _lastEma, _lastType]
+    // evt* は当該確定1分足の「生イベント」(保持後の値ではない)。上位で新規Long/Short集約に使う。
+    [_outBias, _dir, _ema, _type]
 
 // --- 計算ゲート (使用 or 表示時のみ) ---
-bool emaEnvCompute = useEMAEnv and (useEMAEnvBias or emaEnvShowEMA or emaEnvShowLabels or emaEnvShowDebug)
+bool emaEnvCompute = useEMAEnv or emaEnvShowEMA or emaEnvShowLabels or emaEnvShowDebug
 bool emaEnv1MAny = useEMAEnv1M200 or useEMAEnv1M1000 or useEMAEnv1M2000 or useEMAEnv1M3000
 
 // === 5分足 EMA (チャート=5分足で直接算出。状態更新は確定足のみ=非リペイント) ===
@@ -844,51 +838,83 @@ int  ema5BiasOut  = ema5Active ? ema5Bias : 0
 int  ema5Remain   = ema5Active ? emaEnvHold5M - (bar_index - ema5EvBar) : 0
 
 // === 1分足 EMA (request.security_lower_tf で現在5分足内の確定1分足を取得=取りこぼさない/非リペイント) ===
-int ema1MBias    = 0
-int ema1MLastDir = 0
-int ema1MLastEma = 0
-int ema1MLastType = 0
+//   現在5分足内の各確定1分足の「生イベント」をOR → 新規Long/Short (ema1MNewL/ema1MNewS)。
+//   直近の生イベント詳細 (ema1MEvt*) は方向決定/表示用。保持bias (ema1MHeldBias) は失効判定にのみ使用。
+int  ema1MHeldBias = 0
+bool ema1MNewL     = false
+bool ema1MNewS     = false
+int  ema1MEvtDir   = 0
+int  ema1MEvtEma   = 0
+int  ema1MEvtType  = 0
 if emaEnvCompute and emaEnv1MAny
     [_ba, _da, _ea, _ka] = request.security_lower_tf(syminfo.tickerid, "1", f_emaEnv1MState())
+    int _n = array.size(_da)
     if array.size(_ba) > 0
-        ema1MBias    := array.get(_ba, array.size(_ba) - 1)
-    if array.size(_da) > 0
-        ema1MLastDir := array.get(_da, array.size(_da) - 1)
-    if array.size(_ea) > 0
-        ema1MLastEma := array.get(_ea, array.size(_ea) - 1)
-    if array.size(_ka) > 0
-        ema1MLastType := array.get(_ka, array.size(_ka) - 1)
+        ema1MHeldBias := array.get(_ba, array.size(_ba) - 1)
+    if _n > 0
+        for _i = 0 to _n - 1
+            int _dv = array.get(_da, _i)
+            if _dv == 1
+                ema1MNewL := true
+            if _dv == -1
+                ema1MNewS := true
+            if _dv != 0
+                ema1MEvtDir  := _dv
+                ema1MEvtEma  := array.get(_ea, _i)
+                ema1MEvtType := array.get(_ka, _i)
 
-// === 複数EMA/複数TF 統合 → EMA環境 Bias (点9/10/11) ===
-//   1M保持bias or 5M保持bias で Long/Short。両方成立 → Conflict(NoTrade)。
-bool emaEnvLongRaw  = (ema1MBias == 1)  or (ema5BiasOut == 1)
-bool emaEnvShortRaw = (ema1MBias == -1) or (ema5BiasOut == -1)
-bool emaEnvConflict = emaEnvLongRaw and emaEnvShortRaw
-bool emaEnvLongOk   = emaEnvLongRaw  and not emaEnvConflict
-bool emaEnvShortOk  = emaEnvShortRaw and not emaEnvConflict
-int  emaEnvBias = emaEnvLongOk ? 1 : emaEnvShortOk ? -1 : 0
-
-// --- 表示用: 直近の反応 (TF/EMA/種別/方向。判定に影響しない) ---
+// === 1M/5M 統合 EMA環境 状態機械 (点9/10/11) ===
+//   1M/5M を1つのEMA環境として管理する。管理する状態:
+//     現在Bias / 最後にBiasを更新したイベント (時刻・TF・EMA・種別=Bounce/Break・方向)。
+//   確定足ごとの遷移 (barstate.isconfirmed):
+//     ・新規Longイベント と 新規Shortイベント が同時発生 → Conflict(NoTrade)。方向は予測しない。
+//     ・新規Longのみ → Bias=Long へ即上書き。 新規Shortのみ → Bias=Short へ即上書き。
+//       (古い反対方向を保持中でも、新しい反対イベントで即上書きする)
+//     ・新規イベントなし → 現在Biasを保持。Biasを設定したTFの保持が切れたら解除。
+//   新規Long/Short = 5M当該確定足の生イベント or 現在5分足内の1M生イベント。
+bool emaEnvNewLong  = ema5L or ema1MNewL
+bool emaEnvNewShort = ema5S or ema1MNewS
+var int    emaEnvBias     = 0     // 現在Bias 1/-1/0
+var int    emaEnvSetTF    = 0     // Biasを設定したTF 5=5M / 1=1M / 0=なし
+var int    emaEnvLastBar  = na    // 最後にBiasを更新したイベント時刻
 var string emaEnvLastTF   = "-"
 var int    emaEnvLastEma  = 0
 var int    emaEnvLastType = 0
 var int    emaEnvLastDir  = 0
+bool emaEnvConflict = false
 if emaEnvCompute and barstate.isconfirmed
-    if ema5Dir != 0
-        emaEnvLastTF := "5M"
-        emaEnvLastEma := ema5Ema
-        emaEnvLastType := ema5Type
-        emaEnvLastDir := ema5Dir
-    else if ema1MLastDir != 0 and (emaEnvLastTF != "1M" or emaEnvLastEma != ema1MLastEma or emaEnvLastType != ema1MLastType or emaEnvLastDir != ema1MLastDir)
-        emaEnvLastTF := "1M"
-        emaEnvLastEma := ema1MLastEma
-        emaEnvLastType := ema1MLastType
-        emaEnvLastDir := ema1MLastDir
+    if emaEnvNewLong and emaEnvNewShort
+        // 同一確定足でLong/Shortが同時に新規発生 → どちらが新しいとも判断できない → Conflict。
+        emaEnvBias := 0
+        emaEnvSetTF := 0
+        emaEnvConflict := true
+    else if emaEnvNewLong
+        emaEnvBias := 1
+        emaEnvSetTF := ema5L ? 5 : 1
+        emaEnvLastBar := bar_index
+        emaEnvLastTF := ema5L ? "5M" : "1M"
+        emaEnvLastEma := ema5L ? ema5Ema : ema1MEvtEma
+        emaEnvLastType := ema5L ? ema5Type : ema1MEvtType
+        emaEnvLastDir := 1
+    else if emaEnvNewShort
+        emaEnvBias := -1
+        emaEnvSetTF := ema5S ? 5 : 1
+        emaEnvLastBar := bar_index
+        emaEnvLastTF := ema5S ? "5M" : "1M"
+        emaEnvLastEma := ema5S ? ema5Ema : ema1MEvtEma
+        emaEnvLastType := ema5S ? ema5Type : ema1MEvtType
+        emaEnvLastDir := -1
+    else
+        // 新規イベントなし → 保持。設定元TFの保持biasが現在Biasと一致しなくなったら (=保持期限切れ/反転) 解除。
+        bool _expired = emaEnvSetTF == 5 ? (ema5BiasOut != emaEnvBias) : emaEnvSetTF == 1 ? (ema1MHeldBias != emaEnvBias) : true
+        if _expired
+            emaEnvBias := 0
+            emaEnvSetTF := 0
 
 // === トレンド環境 (EMAスコア) と EMA反発/ブレイク環境 の結合 → finalEnvLongOk/finalEnvShortOk ===
-//   useEMAEnvBias=OFF or useEMAEnv=OFF → 完全素通し (既存=トレンドのみ)。
+//   useEMAEnv=OFF → 完全素通し (既存=トレンドのみ)。useEMAEnv=ON でEMA環境が結合に効く。
 //   TrendOnly / EMAOnly / TrendAndEMA / TrendOrEMA。
-bool emaEnvActive = useEMAEnv and useEMAEnvBias
+bool emaEnvActive = useEMAEnv
 bool emaLong  = emaEnvBias == 1
 bool emaShort = emaEnvBias == -1
 bool finalEnvLongOk =
@@ -1431,14 +1457,14 @@ plot(emaEnvShowEMA and useEMAEnv1M2000 ? request.security(syminfo.tickerid, "1",
 plot(emaEnvShowEMA and useEMAEnv1M3000 ? request.security(syminfo.tickerid, "1", ta.ema(close, emaEnvLen3000), lookahead = barmerge.lookahead_off) : na, "1M EMA3000", color = color.new(color.purple, 0),  display = display.all)
 
 // --- 反応ラベル (emaEnvShowLabels ON時のみ・確定足で描画) ---
-//   5M反応: 当該確定足で発生した5M EMAイベント。1M反応: 1M biasが変化した確定足。
+//   5M反応: 当該確定足で発生した5M EMAイベント。1M反応: 現在5分足内で発生した1M生イベント。
 if emaEnvShowLabels and emaEnvCompute and barstate.isconfirmed
     if ema5Dir != 0
         string _t5 = "5M E" + str.tostring(ema5Ema) + " " + f_emaEnvTypeTxt(ema5Type) + " " + f_emaEnvDirTxt(ema5Dir)
         label.new(bar_index, ema5Dir == 1 ? low : high, _t5, style = ema5Dir == 1 ? label.style_label_up : label.style_label_down, color = ema5Dir == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, yloc = ema5Dir == 1 ? yloc.belowbar : yloc.abovebar, size = size.small)
-    if ema1MLastDir != 0 and ema1MBias != ema1MBias[1] and ema1MBias != 0
-        string _t1 = "1M E" + str.tostring(ema1MLastEma) + " " + f_emaEnvTypeTxt(ema1MLastType) + " " + f_emaEnvDirTxt(ema1MLastDir)
-        label.new(bar_index, ema1MLastDir == 1 ? low : high, _t1, style = ema1MLastDir == 1 ? label.style_label_up : label.style_label_down, color = ema1MLastDir == 1 ? color.new(color.lime, 0) : color.new(color.maroon, 0), textcolor = color.white, yloc = ema1MLastDir == 1 ? yloc.belowbar : yloc.abovebar, size = size.small)
+    if ema1MEvtDir != 0
+        string _t1 = "1M E" + str.tostring(ema1MEvtEma) + " " + f_emaEnvTypeTxt(ema1MEvtType) + " " + f_emaEnvDirTxt(ema1MEvtDir)
+        label.new(bar_index, ema1MEvtDir == 1 ? low : high, _t1, style = ema1MEvtDir == 1 ? label.style_label_up : label.style_label_down, color = ema1MEvtDir == 1 ? color.new(color.lime, 0) : color.new(color.maroon, 0), textcolor = color.white, yloc = ema1MEvtDir == 1 ? yloc.belowbar : yloc.abovebar, size = size.small)
 
 // --- デバッグテーブル (emaEnvShowDebug ON時のみ) ---
 var table emaEnvTbl = na
@@ -1451,7 +1477,7 @@ if emaEnvShowDebug
         table.cell(emaEnvTbl, 0, 1, "Conflict", text_color = color.white, text_size = size.small)
         table.cell(emaEnvTbl, 1, 1, emaEnvConflict ? "YES" : "no", text_color = color.white, bgcolor = emaEnvConflict ? color.new(color.red, 20) : color.new(color.black, 0), text_size = size.small)
         table.cell(emaEnvTbl, 0, 2, "1M Bias", text_color = color.white, text_size = size.small)
-        table.cell(emaEnvTbl, 1, 2, f_emaEnvBiasTxt(ema1MBias), text_color = color.white, bgcolor = f_emaEnvBiasCol(ema1MBias), text_size = size.small)
+        table.cell(emaEnvTbl, 1, 2, f_emaEnvBiasTxt(ema1MHeldBias), text_color = color.white, bgcolor = f_emaEnvBiasCol(ema1MHeldBias), text_size = size.small)
         table.cell(emaEnvTbl, 0, 3, "5M Bias", text_color = color.white, text_size = size.small)
         table.cell(emaEnvTbl, 1, 3, f_emaEnvBiasTxt(ema5BiasOut), text_color = color.white, bgcolor = f_emaEnvBiasCol(ema5BiasOut), text_size = size.small)
         table.cell(emaEnvTbl, 0, 4, "5M Hold残", text_color = color.white, text_size = size.small)
