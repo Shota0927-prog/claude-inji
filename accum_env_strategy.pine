@@ -293,6 +293,12 @@ accumTouchHoldM15 = input.int(6, "15M Accum タッチ保持本数 (確認足)", 
 // --- Accumエントリー経路の個別ON/OFF (バックテストで反発/ブレイクリテストを別々に検証) ---
 useAccumRebound     = input.bool(true, "Accum境界反発を使う",         group = grpAccum)
 useAccumBreakRetest = input.bool(false, "Accumブレイクリテストを使う", group = grpAccum)
+// --- 境界タッチのみエントリー / SL後ドテン (トリガー不要のタッチ発注・§11b) ---
+//   useAccumTouchEntry : ON=方向転換トリガー不要で 下限タッチ→ロング / 上限タッチ→ショート。
+//   useAccumStopReverse: ON=境界タッチで入ったポジがSL決済されたときだけ逆方向へ1回だけドテン。
+//     (useAccumTouchEntry=OFF のときは useAccumStopReverse を ON にしてもドテンしない)
+useAccumTouchEntry  = input.bool(false, "Accum境界タッチのみでエントリー", group = grpAccum)
+useAccumStopReverse = input.bool(false, "Accum境界エントリーSL後にドテン", group = grpAccum)
 // 上位足Accumエントリー用の確定箱保持数 (5分/15分NoTrade用 accumNTKeep とは分離)
 accumEnvKeep = input.int(3, "保持する上位足Accum数", minval = 1, maxval = 10, group = grpAccum)
 // --- 表示 / デバッグ ---
@@ -1716,6 +1722,123 @@ if okAddShort and wantShort
     //   (Accum経路は確認足1本パルスなのでアーム解除不要)
     if trendArmShort
         shortArmed := false
+
+// ============================================================
+//  11b. Accum 境界タッチ エントリー + SL後ドテン (touch-only + stop-reverse)
+// ------------------------------------------------------------
+//  useAccumTouchEntry:
+//    ON  → 方向転換トリガー不要。優先度TFの採用箱の下限タッチ→ロング / 上限タッチ→ショート。
+//          境界タッチ判定は accumTouchTolerance (下限/上限 ± tol に足レンジが到達) を使用。
+//          同一接触につき1回のみ (価格が接触帯を離れて再接触したら再エントリー可)。
+//    OFF → 本ブロックは完全に不活性 (既存挙動と同一。トリガー版Accum反発は §10c のまま)。
+//  useAccumStopReverse (useAccumTouchEntry=ON のときのみ有効):
+//    境界タッチで入ったポジションが「SL決済されたときだけ」逆方向へ1回だけドテン。
+//    TP/その他決済ではドテンしない。ドテンにトリガーは不要 (SL成立がトリガー)。
+//    1回の初回タッチにつきドテンは最大1回 (初回→SL→ドテン→終了)。新しい接触で新セット。
+//  SL判定は strategy.closedtrades.exit_comment で厳密に行う (価格がstopを跨いだ等では判定しない):
+//    初回タッチ決済 : "ATSL"(損切) / "ATTP"(利確)   ドテン決済 : "ARSL" / "ARTP"。
+//  entry ID を分離 : 初回 = AT_L/AT_S、ドテン = AR_L/AR_S。§11 の通常発注 (L#/S#) とは独立。
+//  非リペイント : 判定/発注は確定足 (barstate.isconfirmed) のみ。優先度箱の上下限は非リペイント値。
+// ============================================================
+// 採用箱 (優先度TF) の境界タッチ候補 (下限=ロング / 上限=ショート)。accumPrio>0 のときのみ有効。
+bool atLowerTouch = useAccumTouchEntry and accumPrio > 0 and not na(accumPrioLo) and low  <= accumPrioLo + accumTouchTolerance and high >= accumPrioLo - accumTouchTolerance
+bool atUpperTouch = useAccumTouchEntry and accumPrio > 0 and not na(accumPrioHi) and high >= accumPrioHi - accumTouchTolerance and low  <= accumPrioHi + accumTouchTolerance
+// タッチモードが Accum経路として有効か (§10c canLong と同じ結合方針。TrendOnly では無効)。
+bool atModeActive = useAccumEnv and useAccumTouchEntry and accumEnvCombineMode != "TrendOnly"
+bool atTrendGate  = accumEnvCombineMode == "TrendAndAccum" ? accumTrendOk : true
+
+// --- 状態管理 ---
+//   atStage      : 0=アイドル / 1=初回タッチポジ保有 / 2=ドテンポジ保有
+//   atInitDir    : 初回タッチ方向 (1=下限ロング / -1=上限ショート)
+//   atLowerArmed/atUpperArmed : 同一接触の連続エントリー防止 (接触帯を離れると再アーム)
+//   atPrevClosed : 処理済み closedtrades 数 (新規決済の検出用)
+var int  atStage      = 0
+var int  atInitDir    = 0
+var bool atLowerArmed = true
+var bool atUpperArmed = true
+var int  atPrevClosed = 0
+
+if barstate.isconfirmed
+    // (a) 接触帯を離れたら再アーム (次の新規接触で再エントリー可能に)。
+    if not atLowerTouch
+        atLowerArmed := true
+    if not atUpperTouch
+        atUpperArmed := true
+    // (b) 新規決済の検出 (SL/TP を exit_comment で厳密判別。価格がstopを跨いだ判定はしない)。
+    //     §11 の通常発注 (L#/S#) は comment_loss/profit を持たないため一致せず無視される。
+    bool _initSL  = false   // 初回タッチポジが SL 決済
+    bool _initTP  = false   // 初回タッチポジが SL 以外 (TP等) で決済
+    bool _revDone = false   // ドテンポジが決済 (SL/TP 問わず終了)
+    if strategy.closedtrades > atPrevClosed
+        for _ci = atPrevClosed to strategy.closedtrades - 1
+            string _exc = strategy.closedtrades.exit_comment(_ci)
+            if _exc == "ATSL"
+                _initSL := true
+            else if _exc == "ATTP"
+                _initTP := true
+            else if _exc == "ARSL" or _exc == "ARTP"
+                _revDone := true
+        atPrevClosed := strategy.closedtrades
+    // (c) 状態遷移 + ドテン発注予約 (無限ドテン禁止 : ドテンは atStage==1→2 の1回のみ)。
+    bool _fireRevLong  = false   // ドテンロング (初回=上限ショートがSL)
+    bool _fireRevShort = false   // ドテンショート (初回=下限ロングがSL)
+    if atStage == 1
+        if _initSL
+            // 初回タッチがSL → useAccumStopReverse かつ 逆方向が useLong/useShort で許可ならドテン予約。
+            if useAccumStopReverse and atInitDir == 1 and useShort
+                _fireRevShort := true
+                atStage := 2
+            else if useAccumStopReverse and atInitDir == -1 and useLong
+                _fireRevLong := true
+                atStage := 2
+            else
+                atStage := 0
+                atInitDir := 0
+        else if _initTP
+            // TP/その他決済 → ドテンせず終了。
+            atStage := 0
+            atInitDir := 0
+    if atStage == 2 and _revDone
+        // ドテンポジ決済 → 終了 (2回目のドテンはしない=1段階のみ)。
+        atStage := 0
+        atInitDir := 0
+    // (d) 初回タッチ エントリー (アイドル・フラット・アーム済み・接触・結合/共通フィルタ通過時)。
+    //     §11 の通常発注が同足で入った場合は重複回避のため見送る (posFlat は足頭値のため)。
+    bool _initLong  = atModeActive and atTrendGate and commonLongOk  and posFlat and atStage == 0 and atLowerArmed and atLowerTouch and not (okAddLong and wantLong)
+    bool _initShort = atModeActive and atTrendGate and commonShortOk and posFlat and atStage == 0 and atUpperArmed and atUpperTouch and not (okAddShort and wantShort)
+    // 同足で両境界に同時接触 → ローソク色で方向を1つに解決 (方向は予想しない)。
+    if _initLong and _initShort
+        if close >= open
+            _initShort := false
+        else
+            _initLong := false
+    if _initLong
+        strategy.entry("AT_L", strategy.long, qty = longQty)
+        strategy.exit("AT_LX", from_entry = "AT_L", stop = longStop, limit = longTP, comment_loss = "ATSL", comment_profit = "ATTP")
+        atStage := 1
+        atInitDir := 1
+        atLowerArmed := false
+    if _initShort
+        strategy.entry("AT_S", strategy.short, qty = shortQty)
+        strategy.exit("AT_SX", from_entry = "AT_S", stop = shortStop, limit = shortTP, comment_loss = "ATSL", comment_profit = "ATTP")
+        atStage := 1
+        atInitDir := -1
+        atUpperArmed := false
+    // (e) SL後ドテン エントリー (トリガー不要・SL成立がトリガー。通常SL/TP/リスク/ロットを使用)。
+    if _fireRevShort
+        if shortRisk > 0 and shortQty >= 1
+            strategy.entry("AR_S", strategy.short, qty = shortQty)
+            strategy.exit("AR_SX", from_entry = "AR_S", stop = shortStop, limit = shortTP, comment_loss = "ARSL", comment_profit = "ARTP")
+        else
+            atStage := 0
+            atInitDir := 0
+    if _fireRevLong
+        if longRisk > 0 and longQty >= 1
+            strategy.entry("AR_L", strategy.long, qty = longQty)
+            strategy.exit("AR_LX", from_entry = "AR_L", stop = longStop, limit = longTP, comment_loss = "ARSL", comment_profit = "ARTP")
+        else
+            atStage := 0
+            atInitDir := 0
 
 
 
