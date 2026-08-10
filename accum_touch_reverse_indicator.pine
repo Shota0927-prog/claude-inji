@@ -460,6 +460,74 @@ f_accPick(array<float> aHi, array<float> aLo, float minW, float maxW, float tol)
     [_rel, _selHi, _selLo, _lower, _upper]
 
 // ============================================================
+//  12b. Accum ブレイク即エントリー 共通エンジン (元・最新Accumストラテジー A: ブレイク即エントリー)
+// ------------------------------------------------------------
+//  breakState(箱ごと・0/1/-1) を「5分足確定終値」で更新し、0→+1(上抜け)/0→-1(下抜け)の
+//  遷移が起きた確定足だけをブレイクイベントとする (ヒゲブレイクは扱わない=確定終値のみ)。
+//  ・確定終値で箱内へ戻れば breakState→0 にリセット (元ストラテジー同一)。再ブレイクは再度イベント。
+//  ・1ブレイクイベント=1回 (0→±1 の遷移足のみ true。以後 ±1 のままなので繰り返さない)。
+//  f_accBreakScan : 確定足で breakState を更新し、この足で発生した上/下ブレイク箱の上下限を返す。
+//    戻り [anyUp, upHi, upLo, anyDn, dnHi, dnLo] (幅フィルタは呼び出し側=ケースで適用)。
+//    ※ breakStateはstateful → 「1回だけ・全ケース共通」に更新するため各TF1回だけ呼ぶこと。
+f_accBreakScan(array<float> aHi, array<float> aLo, array<int> aBk) =>
+    bool  _anyUp = false
+    bool  _anyDn = false
+    float _upHi = na
+    float _upLo = na
+    float _dnHi = na
+    float _dnLo = na
+    if barstate.isconfirmed and array.size(aHi) > 0
+        for i = 0 to array.size(aHi) - 1
+            float _hi = array.get(aHi, i)
+            float _lo = array.get(aLo, i)
+            int   _bkB = array.get(aBk, i)
+            int   _bkA = close > _hi ? 1 : close < _lo ? -1 : 0   // 確定終値ベース (箱内復帰=0)
+            array.set(aBk, i, _bkA)
+            if _bkB == 0 and _bkA == 1
+                _anyUp := true
+                _upHi := _hi
+                _upLo := _lo
+            if _bkB == 0 and _bkA == -1
+                _anyDn := true
+                _dnHi := _hi
+                _dnLo := _lo
+    [_anyUp, _upHi, _upLo, _anyDn, _dnHi, _dnLo]
+
+// 形成中の「仮ブレイク予測」: breakState(前確定足の値)が0の箱に対し、現在closeが箱外なら候補。
+//   非破壊 (breakStateは更新しない)。仮シグナル用。戻り [predUp,upHi,upLo,predDn,dnHi,dnLo]。
+f_accBreakPeek(array<float> aHi, array<float> aLo, array<int> aBk) =>
+    bool  _u = false
+    bool  _d = false
+    float _uh = na
+    float _ul = na
+    float _dh = na
+    float _dl = na
+    if array.size(aHi) > 0
+        for i = 0 to array.size(aHi) - 1
+            if array.get(aBk, i) == 0
+                float _hi = array.get(aHi, i)
+                float _lo = array.get(aLo, i)
+                if close > _hi
+                    _u := true
+                    _uh := _hi
+                    _ul := _lo
+                if close < _lo
+                    _d := true
+                    _dh := _hi
+                    _dl := _lo
+    [_u, _uh, _ul, _d, _dh, _dl]
+
+// ブレイク結果を幅フィルタ + 上下同時=見送り で1方向に確定。戻り [qLong, qShort, hi, lo]。
+f_pickBreak(bool use, bool anyUp, float upHi, float upLo, bool anyDn, float dnHi, float dnLo, float minW, float maxW) =>
+    bool _qu = use and anyUp and (upHi - upLo) >= minW and (upHi - upLo) <= maxW
+    bool _qd = use and anyDn and (dnHi - dnLo) >= minW and (dnHi - dnLo) <= maxW
+    bool _ql = _qu and not _qd
+    bool _qs = _qd and not _qu
+    float _hi = _ql ? upHi : _qs ? dnHi : na
+    float _lo = _ql ? upLo : _qs ? dnLo : na
+    [_ql, _qs, _hi, _lo]
+
+// ============================================================
 //  13. Accum 検出 (元ストラテジー同一)
 // ============================================================
 f_accumNTDetect() =>
@@ -631,42 +699,54 @@ bool dailyDirGateOk = reqDailyDirection == "OFF" or drDirText == reqDailyDirecti
 
 // --- 16c. 上位足Accum 確定箱 (4TF・常に全計算・非リペイント・幅フィルタは採用時=ケース側) ---
 //   確定箱を登録 (新上位足開始 + Accum終了確定 + 幅>0 + 重複防止)。幅min/maxは f_accPick(ケース)で適用。
-f_accReg(array<float> aHi, array<float> aLo, array<int> aSt, bool newBar, bool ended, float eHi, float eLo, int eSt, int lastSt, int keep) =>
+//   aBk = 箱ごとの breakState 配列 (登録時 0・ブレイク即エントリー用)。
+f_accReg(array<float> aHi, array<float> aLo, array<int> aSt, array<int> aBk, bool newBar, bool ended, float eHi, float eLo, int eSt, int lastSt, int keep) =>
     int _last = lastSt
     if newBar and ended and not na(eHi) and (eHi - eLo) > 0 and (na(lastSt) or eSt != lastSt)
         array.push(aHi, eHi)
         array.push(aLo, eLo)
         array.push(aSt, eSt)
+        array.push(aBk, 0)
         _last := eSt
         while array.size(aHi) > keep
             array.shift(aHi)
             array.shift(aLo)
             array.shift(aSt)
+            array.shift(aBk)
     _last
 var array<float> accEnvDHi = array.new_float()
 var array<float> accEnvDLo = array.new_float()
 var array<int>   accEnvDSt = array.new_int()
+var array<int>   accEnvDBk = array.new_int()
 var int accEnvDLastSt = na
 var array<float> accEnvHHi = array.new_float()
 var array<float> accEnvHLo = array.new_float()
 var array<int>   accEnvHSt = array.new_int()
+var array<int>   accEnvHBk = array.new_int()
 var int accEnvHLastSt = na
 var array<float> accEnvOHi = array.new_float()
 var array<float> accEnvOLo = array.new_float()
 var array<int>   accEnvOSt = array.new_int()
+var array<int>   accEnvOBk = array.new_int()
 var int accEnvOLastSt = na
 var array<float> accEnvMHi = array.new_float()
 var array<float> accEnvMLo = array.new_float()
 var array<int>   accEnvMSt = array.new_int()
+var array<int>   accEnvMBk = array.new_int()
 var int accEnvMLastSt = na
 [_dIsA,_dEnded,_dEHi,_dELo,_dESt] = request.security(syminfo.tickerid, accumEnvDTF,   f_accBoxConfirmed(), lookahead = barmerge.lookahead_on)
 [_hIsA,_hEnded,_hEHi,_hELo,_hESt] = request.security(syminfo.tickerid, accumEnvH4TF,  f_accBoxConfirmed(), lookahead = barmerge.lookahead_on)
 [_oIsA,_oEnded,_oEHi,_oELo,_oESt] = request.security(syminfo.tickerid, accumEnvH1TF,  f_accBoxConfirmed(), lookahead = barmerge.lookahead_on)
 [_mIsA,_mEnded,_mEHi,_mELo,_mESt] = request.security(syminfo.tickerid, accumEnvM15TF, f_accBoxConfirmed(), lookahead = barmerge.lookahead_on)
-accEnvDLastSt := f_accReg(accEnvDHi, accEnvDLo, accEnvDSt, ta.change(time(accumEnvDTF))   != 0, _dEnded, _dEHi, _dELo, _dESt, accEnvDLastSt, accumEnvKeep)
-accEnvHLastSt := f_accReg(accEnvHHi, accEnvHLo, accEnvHSt, ta.change(time(accumEnvH4TF))  != 0, _hEnded, _hEHi, _hELo, _hESt, accEnvHLastSt, accumEnvKeep)
-accEnvOLastSt := f_accReg(accEnvOHi, accEnvOLo, accEnvOSt, ta.change(time(accumEnvH1TF))  != 0, _oEnded, _oEHi, _oELo, _oESt, accEnvOLastSt, accumEnvKeep)
-accEnvMLastSt := f_accReg(accEnvMHi, accEnvMLo, accEnvMSt, ta.change(time(accumEnvM15TF)) != 0, _mEnded, _mEHi, _mELo, _mESt, accEnvMLastSt, accumEnvKeep)
+accEnvDLastSt := f_accReg(accEnvDHi, accEnvDLo, accEnvDSt, accEnvDBk, ta.change(time(accumEnvDTF))   != 0, _dEnded, _dEHi, _dELo, _dESt, accEnvDLastSt, accumEnvKeep)
+accEnvHLastSt := f_accReg(accEnvHHi, accEnvHLo, accEnvHSt, accEnvHBk, ta.change(time(accumEnvH4TF))  != 0, _hEnded, _hEHi, _hELo, _hESt, accEnvHLastSt, accumEnvKeep)
+accEnvOLastSt := f_accReg(accEnvOHi, accEnvOLo, accEnvOSt, accEnvOBk, ta.change(time(accumEnvH1TF))  != 0, _oEnded, _oEHi, _oELo, _oESt, accEnvOLastSt, accumEnvKeep)
+accEnvMLastSt := f_accReg(accEnvMHi, accEnvMLo, accEnvMSt, accEnvMBk, ta.change(time(accumEnvM15TF)) != 0, _mEnded, _mEHi, _mELo, _mESt, accEnvMLastSt, accumEnvKeep)
+// --- ブレイク即エントリー用: 各TFの確定終値ブレイク (breakStateを1回だけ共通更新) ---
+[_dBrkU,_dBrkUHi,_dBrkULo,_dBrkD,_dBrkDHi,_dBrkDLo] = f_accBreakScan(accEnvDHi, accEnvDLo, accEnvDBk)
+[_hBrkU,_hBrkUHi,_hBrkULo,_hBrkD,_hBrkDHi,_hBrkDLo] = f_accBreakScan(accEnvHHi, accEnvHLo, accEnvHBk)
+[_oBrkU,_oBrkUHi,_oBrkULo,_oBrkD,_oBrkDHi,_oBrkDLo] = f_accBreakScan(accEnvOHi, accEnvOLo, accEnvOBk)
+[_mBrkU,_mBrkUHi,_mBrkULo,_mBrkD,_mBrkDHi,_mBrkDLo] = f_accBreakScan(accEnvMHi, accEnvMLo, accEnvMBk)
 
 // --- 16d. 1分足トリガー種類別集約 (security_lower_tf は1回だけ) ---
 [_aBEng,_aSEng,_aBPin,_aSPin,_aBBOS,_aSBOS,_aBEMA,_aSEMA,_aBFVG,_aSFVG,_aBStr,_aSStr] = request.security_lower_tf(syminfo.tickerid, triggerTF, f_calcTriggers())
@@ -892,6 +972,9 @@ type CaseCfg
     bool   tEMA
     bool   tFVG
     bool   tStr
+    // --- ブレイク経路 (既定OFF = 末尾に配置し既定値付き。Case1の27引数pushは不変のまま動作) ---
+    bool   useBreakEntry = false  // Accumブレイク即エントリー (5分足確定終値で箱抜け)
+    bool   useBreakCont  = false  // (予約) Accumブレイク後 継続方向トリガー
     // --- 実行時状態 (既定値付き = push行では指定不要・ケース増でも変数増なし) ---
     bool   armedLong  = true    // 再アーム状態 (トリガーOFF時のみ使用)
     bool   armedShort = true
@@ -1006,25 +1089,126 @@ f_evalCase(CaseCfg c) =>
         c.lowerArmed := true
     if not upperT
         c.upperArmed := true
-    // --- 初回タッチ候補 (下限→Long / 上限→Short・トリガー不要) ---
-    bool longWant  = c.useTouch and c.aLong  and envOk and rel and lowerT and c.lowerArmed and accumLongDirectionOk
-    bool shortWant = c.useTouch and c.aShort and envOk and rel and upperT and c.upperArmed and accumShortDirectionOk
-    if longWant and shortWant
+    // --- ブレイク即エントリー候補 (確定=確定終値ブレイク / 仮=形成中の予測。優先度 D>4H>1H>15M) ---
+    bool  brkL = false
+    bool  brkS = false
+    float brkHi = na
+    float brkLo = na
+    string brkTF = "-"
+    bool  tbkL = false
+    bool  tbkS = false
+    float tbkHi = na
+    float tbkLo = na
+    string tbkTF = "-"
+    if c.useBreakEntry
+        // 確定ブレイク (この確定足で 0→±1)
+        if c.accD and brkTF == "-"
+            [_ql,_qs,_h,_l] = f_pickBreak(true, _dBrkU,_dBrkUHi,_dBrkULo,_dBrkD,_dBrkDHi,_dBrkDLo, c.minW, c.maxW)
+            if _ql or _qs
+                brkL := _ql
+                brkS := _qs
+                brkHi := _h
+                brkLo := _l
+                brkTF := "D"
+        if c.accH4 and brkTF == "-"
+            [_ql,_qs,_h,_l] = f_pickBreak(true, _hBrkU,_hBrkUHi,_hBrkULo,_hBrkD,_hBrkDHi,_hBrkDLo, c.minW, c.maxW)
+            if _ql or _qs
+                brkL := _ql
+                brkS := _qs
+                brkHi := _h
+                brkLo := _l
+                brkTF := "4H"
+        if c.accH1 and brkTF == "-"
+            [_ql,_qs,_h,_l] = f_pickBreak(true, _oBrkU,_oBrkUHi,_oBrkULo,_oBrkD,_oBrkDHi,_oBrkDLo, c.minW, c.maxW)
+            if _ql or _qs
+                brkL := _ql
+                brkS := _qs
+                brkHi := _h
+                brkLo := _l
+                brkTF := "1H"
+        if c.accM15 and brkTF == "-"
+            [_ql,_qs,_h,_l] = f_pickBreak(true, _mBrkU,_mBrkUHi,_mBrkULo,_mBrkD,_mBrkDHi,_mBrkDLo, c.minW, c.maxW)
+            if _ql or _qs
+                brkL := _ql
+                brkS := _qs
+                brkHi := _h
+                brkLo := _l
+                brkTF := "15M"
+        // 仮ブレイク (形成中close予測・breakState前確定値0の箱)
+        if c.accD and tbkTF == "-"
+            [_pu,_puh,_pul,_pd,_pdh,_pdl] = f_accBreakPeek(accEnvDHi, accEnvDLo, accEnvDBk)
+            [_ql,_qs,_h,_l] = f_pickBreak(true, _pu,_puh,_pul,_pd,_pdh,_pdl, c.minW, c.maxW)
+            if _ql or _qs
+                tbkL := _ql
+                tbkS := _qs
+                tbkHi := _h
+                tbkLo := _l
+                tbkTF := "D"
+        if c.accH4 and tbkTF == "-"
+            [_pu,_puh,_pul,_pd,_pdh,_pdl] = f_accBreakPeek(accEnvHHi, accEnvHLo, accEnvHBk)
+            [_ql,_qs,_h,_l] = f_pickBreak(true, _pu,_puh,_pul,_pd,_pdh,_pdl, c.minW, c.maxW)
+            if _ql or _qs
+                tbkL := _ql
+                tbkS := _qs
+                tbkHi := _h
+                tbkLo := _l
+                tbkTF := "4H"
+        if c.accH1 and tbkTF == "-"
+            [_pu,_puh,_pul,_pd,_pdh,_pdl] = f_accBreakPeek(accEnvOHi, accEnvOLo, accEnvOBk)
+            [_ql,_qs,_h,_l] = f_pickBreak(true, _pu,_puh,_pul,_pd,_pdh,_pdl, c.minW, c.maxW)
+            if _ql or _qs
+                tbkL := _ql
+                tbkS := _qs
+                tbkHi := _h
+                tbkLo := _l
+                tbkTF := "1H"
+        if c.accM15 and tbkTF == "-"
+            [_pu,_puh,_pul,_pd,_pdh,_pdl] = f_accBreakPeek(accEnvMHi, accEnvMLo, accEnvMBk)
+            [_ql,_qs,_h,_l] = f_pickBreak(true, _pu,_puh,_pul,_pd,_pdh,_pdl, c.minW, c.maxW)
+            if _ql or _qs
+                tbkL := _ql
+                tbkS := _qs
+                tbkHi := _h
+                tbkLo := _l
+                tbkTF := "15M"
+    // --- 確定候補 (タッチ or 確定ブレイク) ---
+    bool cL = (c.useTouch and c.aLong  and envOk and rel and lowerT and c.lowerArmed and accumLongDirectionOk)  or (c.useBreakEntry and c.aLong  and envOk and brkL and accumLongDirectionOk)
+    bool cS = (c.useTouch and c.aShort and envOk and rel and upperT and c.upperArmed and accumShortDirectionOk) or (c.useBreakEntry and c.aShort and envOk and brkS and accumShortDirectionOk)
+    if cL and cS
         if close >= open
-            shortWant := false
+            cS := false
         else
-            longWant := false
-    int dir = longWant ? 1 : shortWant ? -1 : 0
+            cL := false
+    int cDir = cL ? 1 : cS ? -1 : 0
+    // --- 仮候補 (タッチ or 仮ブレイク) ---
+    bool tL = (c.useTouch and c.aLong  and envOk and rel and lowerT and c.lowerArmed and accumLongDirectionOk)  or (c.useBreakEntry and c.aLong  and envOk and tbkL and accumLongDirectionOk)
+    bool tS = (c.useTouch and c.aShort and envOk and rel and upperT and c.upperArmed and accumShortDirectionOk) or (c.useBreakEntry and c.aShort and envOk and tbkS and accumShortDirectionOk)
+    if tL and tS
+        if close >= open
+            tS := false
+        else
+            tL := false
+    int tDir = tL ? 1 : tS ? -1 : 0
+    // --- アクティブ候補 = 確定優先 (確定足でcDir / 形成足でtDir) ---
+    int aDir = cDir != 0 ? cDir : tDir
+    // ブレイク経路が採用されたか (採用箱・モード・タッチ表記の決定用)
+    bool _brkActive = c.useBreakEntry and (cDir != 0 ? (brkL or brkS) : (tbkL or tbkS))
+    float boxHi = _brkActive ? (cDir != 0 ? brkHi : tbkHi) : c.selHi
+    float boxLo = _brkActive ? (cDir != 0 ? brkLo : tbkLo) : c.selLo
+    string modeTxt  = _brkActive ? "Break Entry" : "Touch"
+    string touchTxt = _brkActive ? (aDir == 1 ? "Break↑" : "Break↓") : (aDir == 1 ? "Lower" : "Upper")
+    c.selMode := modeTxt
     // --- Entry / SL / TP / Size (SL/RRはケース値・元ストラテジー同一Size計算) ---
     float entry = close
-    float sl = dir == 1 ? entry - c.sl : dir == -1 ? entry + c.sl : na
-    float risk = dir == 1 ? entry - sl : dir == -1 ? sl - entry : na
-    float tp = dir == 1 ? entry + risk * c.rr : dir == -1 ? entry - risk * c.rr : na
+    float sl = aDir == 1 ? entry - c.sl : aDir == -1 ? entry + c.sl : na
+    float risk = c.sl
+    float tp = aDir == 1 ? entry + risk * c.rr : aDir == -1 ? entry - risk * c.rr : na
     float baseCap = useCompound ? virtualBalance : calcCapital
     float riskCap = baseCap * riskPct / 100.0
-    float size = (not na(risk) and risk > 0) ? math.floor(riskCap / (risk * syminfo.pointvalue)) : 0.0
-    bool valid = dir != 0 and not na(risk) and risk > 0 and size >= 1   // ★ Size<1 除外はここ
-    [valid, dir, entry, sl, tp, size, lowerT, upperT]
+    float size = risk > 0 ? math.floor(riskCap / (risk * syminfo.pointvalue)) : 0.0
+    bool validC = cDir != 0 and risk > 0 and size >= 1   // ★ Size<1 除外はここ (確定)
+    bool validT = tDir != 0 and risk > 0 and size >= 1   // 仮
+    [validC, validT, aDir, entry, sl, tp, size, boxHi, boxLo, touchTxt, modeTxt]
 
 // ============================================================
 //  19. 5分足限定フラグ
@@ -1044,6 +1228,9 @@ if barstate.isfirst
     //                 minW,maxW, useTouch,useStopRev,useReb,useBrk, aLong,aShort, sl,rr,
     //                 useTrig, tEng,tPin,tBOS,tEMA,tFVG,tStr
     array.push(CASES, CaseCfg.new(1, 3, 9, 9, 9, "OFF", false, true, false, false, 50.0, 300.0, true, true, false, false, true, true, 20.0, 3.0, false, false, false, false, false, false, false))
+    // ---- ケース2 : ⭐3 / 1H Accum / 幅50〜300 / ブレイク即エントリー(5分確定終値) / SL40 RR2 / Long+Short ----
+    //   末尾 useBreakEntry=true, useBreakCont=false を指定 (計29引数)。境界タッチ/ドテン/反発/リテストはOFF。
+    array.push(CASES, CaseCfg.new(2, 3, 9, 9, 9, "OFF", false, false, true, false, 50.0, 300.0, false, false, false, false, true, true, 40.0, 2.0, false, false, false, false, false, false, false, true, false))
 
 // ============================================================
 //  21. ケースごと独立処理 (決済+ドテン → 評価 → 仮/確定シグナル)
@@ -1060,15 +1247,15 @@ if barstate.isfirst
 if is5m
     for i = 0 to array.size(CASES) - 1
         CaseCfg c = array.get(CASES, i)
-        // --- 評価 (採用箱 selHi/selLo・再アームを毎足更新・保有中も呼ぶ) ---
-        [v, d, e, sl, tp, sz, lowerT, upperT] = f_evalCase(c)
-        string _touchTxt = d == 1 ? "Lower" : d == -1 ? "Upper" : "-"
+        // --- 評価 (採用箱・再アーム・breakStateは共通側で毎足更新済み) ---
+        //   vC=確定候補 / vT=仮候補 / d=アクティブ方向 / bHi,bLo=採用箱 / touchTxt / modeTxt(Touch or Break Entry)
+        [vC, vT, d, e, sl, tp, sz, bHi, bLo, touchTxt, modeTxt] = f_evalCase(c)
 
-        // --- 仮シグナル (初回タッチのみ・形成中・stage0/フラット・Caseごと方向別に1回) ---
-        if barstate.isrealtime and not barstate.isconfirmed and v and c.stage == 0 and not c.posActive
+        // --- 仮シグナル (形成中・stage0/フラット・Caseごと方向別に1回・タッチ/ブレイク予測) ---
+        if barstate.isrealtime and not barstate.isconfirmed and vT and c.stage == 0 and not c.posActive
             bool _tf = d == 1 ? c.tentLong : c.tentShort
             if not _tf
-                alert(f_msg("仮シグナル", c, d, e, sl, tp, sz, c.selHi, c.selLo, _touchTxt, "Initial"), alert.freq_all)
+                alert(f_msg("仮シグナル", c, d, e, sl, tp, sz, bHi, bLo, touchTxt, modeTxt), alert.freq_all)
                 if d == 1
                     c.tentLong := true
                 else
@@ -1126,10 +1313,10 @@ if is5m
                     // Size<1 → ドテンなし・セット終了
                     c.stage := 0
                     c.initDir := 0
-            // (c) 初回タッチ 確定エントリー (stage0・フラット・当該足未決済・ドテン未発火)
-            if v and c.stage == 0 and not c.posActive and not _justClosed and not _reverseFire
-                alert(f_msg("確定シグナル", c, d, e, sl, tp, sz, c.selHi, c.selLo, _touchTxt, "Initial"), alert.freq_all)
-                label.new(bar_index, d == 1 ? low : high, f_msg("確定", c, d, e, sl, tp, sz, c.selHi, c.selLo, _touchTxt, "Initial"), style = d == 1 ? label.style_label_up : label.style_label_down, color = d == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, size = size.small)
+            // (c) 初回 確定エントリー (stage0・フラット・当該足未決済・ドテン未発火。タッチ or ブレイク即)
+            if vC and c.stage == 0 and not c.posActive and not _justClosed and not _reverseFire
+                alert(f_msg("確定シグナル", c, d, e, sl, tp, sz, bHi, bLo, touchTxt, modeTxt), alert.freq_all)
+                label.new(bar_index, d == 1 ? low : high, f_msg("確定", c, d, e, sl, tp, sz, bHi, bLo, touchTxt, modeTxt), style = d == 1 ? label.style_label_up : label.style_label_down, color = d == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, size = size.small)
                 c.posActive := true
                 c.posDir    := d
                 c.posEntry  := e
