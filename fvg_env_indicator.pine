@@ -815,6 +815,16 @@ type CaseCfg
     bool   armedLong  = true    // 再アーム状態 (トリガーOFF時のみ使用)
     bool   armedShort = true
     int    lastTrigBar = na     // 直近トリガー成立5分足 (Trigger Cooldown用)
+    // --- 仮想ポジション状態 (Caseごとに独立・ピラミッティング0は同一Case内のみ) ---
+    bool   posActive = false
+    int    posDir    = 0
+    float  posEntry  = na
+    float  posSL     = na
+    float  posTP     = na
+    float  posSize   = na
+    // --- 仮シグナル発行済み状態 (Caseごと・方向別) ---
+    bool   tentLong  = false
+    bool   tentShort = false
 
 f_fvgTxt(CaseCfg c) =>
     string s = ""
@@ -927,98 +937,78 @@ if barstate.isfirst
     array.push(CASES, CaseCfg.new(4, 4, 1, 1, 0, "低ボラ", false, true,  false, false, false, false, 5, true,  false, slFixedG, 2.0, false, false, false, false, false, false, false))
 
 // ============================================================
-//  21. ケース選択 (環境一致した最初の有効ケースを採用・保有中は評価しない)
+//  21. ケースごと独立処理 (決済 → 状態更新 → シグナル発行)
+// ------------------------------------------------------------
+//  各Caseは posActive/posDir/posEntry/posSL/posTP/posSize と tentLong/tentShort を
+//  「Case自身のオブジェクト内」で独立管理する。
+//  ・ピラミッティング0 は「同一Case内のみ」: そのCaseが保有中はそのCaseの新規シグナルを
+//    出さない。別Caseは同時成立・同時保有・同時シグナルOK。
+//  ・全Caseを毎5分足処理する (先頭1件だけ採用する sigValid/sigCase 方式は廃止)。
+//  ・複利ONなら各Caseの決済で共通 virtualBalance に損益反映 (同足で複数決済も各々処理)。
+//  ・alert は alert.freq_all を使用 (同一足・同一実行で複数Caseを個別発火させるため。
+//    freq_once_per_bar はループ内で最初の1回しか鳴らないため不可)。
+//    重複防止は Caseごとの tentLong/tentShort と barstate.isconfirmed が担保する。
 // ============================================================
-var bool  vpActive = false
-var int   vpDir    = 0
-var float vpEntry  = na
-var float vpSL     = na
-var float vpTP     = na
-var float vpSize   = na
-var bool  tentFiredLong  = false
-var bool  tentFiredShort = false
-// ※ 仮シグナルのリセットは「対応する確定シグナル発行時」のみ (仕様どおり)。
-//    新しい5分足になっただけではリセットしない。
-
-// --- 21a. 仮想ポジション決済 (保有分・当該足の高安で判定) ---
-bool justClosed = false
-if is5m and vpActive
-    bool hitSL = vpDir == 1 ? low <= vpSL : high >= vpSL
-    bool hitTP = vpDir == 1 ? high >= vpTP : low <= vpTP
-    string ex = f_resolveExit(hitSL, hitTP)   // 同一足両到達は SL 優先 (共通処理)
-    if ex != ""
-        float xp = ex == "SL" ? vpSL : vpTP
-        if useCompound
-            virtualBalance += vpSize * (xp - vpEntry) * syminfo.pointvalue * vpDir
-        vpActive   := false
-        justClosed := true
-
-// --- 21b. ケース評価 ---
-//   f_evalCase は「毎5分足・全ケース」呼ぶ (保有中も) → 再アーム/Cooldown状態を常に最新化。
-//   シグナル採用 (sig*) はフラット時のみ・先頭有効ケースを1つだけ。
-bool  sigValid = false
-int   sigDir   = 0
-float sEntry   = na
-float sSL      = na
-float sTP      = na
-float sSize    = na
-bool  sigNoTrig = false
-CaseCfg sigCase = na
-bool canSelect = not vpActive and not justClosed
 if is5m
     for i = 0 to array.size(CASES) - 1
         CaseCfg c = array.get(CASES, i)
-        [v, d, e, sl, tp, sz, nt] = f_evalCase(c)   // ← 状態更新 (毎足・全ケース)
-        if v and canSelect and not sigValid
-            sigValid  := true
-            sigDir    := d
-            sEntry    := e
-            sSL       := sl
-            sTP       := tp
-            sSize     := sz
-            sigNoTrig := nt
-            sigCase   := c
+        // --- (a) 決済 (このCaseが保有中のみ・当該足の高安で判定) ---
+        bool justClosed = false
+        if c.posActive
+            bool hitSL = c.posDir == 1 ? low <= c.posSL : high >= c.posSL
+            bool hitTP = c.posDir == 1 ? high >= c.posTP : low <= c.posTP
+            string ex = f_resolveExit(hitSL, hitTP)   // 同一足両到達は SL 優先 (共通処理)
+            if ex != ""
+                float xp = ex == "SL" ? c.posSL : c.posTP
+                if useCompound
+                    virtualBalance += c.posSize * (xp - c.posEntry) * syminfo.pointvalue * c.posDir
+                c.posActive := false
+                justClosed  := true
+        // --- (b) 評価 (再アーム/Cooldown状態を毎足更新・保有中も呼ぶ) ---
+        [v, d, e, sl, tp, sz, nt] = f_evalCase(c)
+        // --- (c) シグナル発行 (このCaseがフラット かつ 当該足で決済していない時のみ) ---
+        if v and not c.posActive and not justClosed
+            // 仮シグナル : 形成中(未確定)に1回だけ alert() のみ (Caseごと・方向別)
+            bool tf = d == 1 ? c.tentLong : c.tentShort
+            if barstate.isrealtime and not barstate.isconfirmed and not tf
+                alert(f_msg("仮シグナル", c, d, e, sl, tp, sz), alert.freq_all)
+                if d == 1
+                    c.tentLong := true
+                else
+                    c.tentShort := true
+            // 確定シグナル : 5分足確定時に1回だけ alert() + label.new()
+            if barstate.isconfirmed
+                alert(f_msg("確定シグナル", c, d, e, sl, tp, sz), alert.freq_all)
+                label.new(bar_index, d == 1 ? low : high, f_msg("確定", c, d, e, sl, tp, sz), style = d == 1 ? label.style_label_up : label.style_label_down, color = d == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, size = size.small)
+                // このCaseの仮想ポジションON (確定と同時)
+                c.posActive := true
+                c.posDir    := d
+                c.posEntry  := e
+                c.posSL     := sl
+                c.posTP     := tp
+                c.posSize   := sz
+                // トリガーOFFケースは発注瞬間に disarm (主要条件が崩れるまで再エントリー禁止)
+                if nt
+                    if d == 1
+                        c.armedLong := false
+                    else
+                        c.armedShort := false
+                // 対応する方向の仮シグナルフラグをリセット (仕様どおり)
+                if d == 1
+                    c.tentLong := false
+                else
+                    c.tentShort := false
 
 // ============================================================
-//  22. シグナル発行 (仮 / 確定) + ラベル + 仮想ポジション建て
+//  22. 補助プロット (Caseごとに独立保有するため、保有中Case数のみ表示)
 // ------------------------------------------------------------
-//  5分足チャートのみ / 保有中は一切出さない (ピラミッティング0相当)。
+//  ※ 個別のEntry/SL/TPはCase数分あり単一plotで表せないため、Entry/SL/TP線は
+//    ラベル(確定時)で確認する。ここでは保有中Case数だけを別パネルに出す。
 // ============================================================
-if is5m and sigValid and not vpActive and not justClosed
-    // --- 仮シグナル : 形成中(リアルタイム未確定) に1回だけ alert() のみ ---
-    bool tfired = sigDir == 1 ? tentFiredLong : tentFiredShort
-    if barstate.isrealtime and not barstate.isconfirmed and not tfired
-        alert(f_msg("仮シグナル", sigCase, sigDir, sEntry, sSL, sTP, sSize), alert.freq_once_per_bar)
-        if sigDir == 1
-            tentFiredLong := true
-        else
-            tentFiredShort := true
-    // --- 確定シグナル : 5分足確定時に1回だけ alert() + label.new() ---
-    if barstate.isconfirmed
-        alert(f_msg("確定シグナル", sigCase, sigDir, sEntry, sSL, sTP, sSize), alert.freq_once_per_bar)
-        label.new(bar_index, sigDir == 1 ? low : high, f_msg("確定", sigCase, sigDir, sEntry, sSL, sTP, sSize), style = sigDir == 1 ? label.style_label_up : label.style_label_down, color = sigDir == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, size = size.small)
-        // 仮想ポジション建て (確定と同時に ON)
-        vpActive := true
-        vpDir    := sigDir
-        vpEntry  := sEntry
-        vpSL     := sSL
-        vpTP     := sTP
-        vpSize   := sSize
-        // トリガーOFFケースは発注した瞬間に disarm → 主要条件が一度崩れるまで再エントリー禁止。
-        if sigNoTrig
-            if sigDir == 1
-                sigCase.armedLong := false
-            else
-                sigCase.armedShort := false
-        // 確定が出たら「対応する方向の」仮シグナルフラグのみリセット (仕様どおり)
-        if sigDir == 1
-            tentFiredLong := false
-        else
-            tentFiredShort := false
-
-// ============================================================
-//  23. 補助プロット (仮想ポジションの Entry/SL/TP を可視化・任意)
-// ============================================================
-plot(vpActive ? vpEntry : na, "仮想Entry", color = color.new(color.yellow, 0), style = plot.style_linebr)
-plot(vpActive ? vpSL    : na, "仮想SL",    color = color.new(color.red, 0),    style = plot.style_linebr)
-plot(vpActive ? vpTP    : na, "仮想TP",    color = color.new(color.green, 0),  style = plot.style_linebr)
+int activeCaseCount = 0
+if is5m
+    for i = 0 to array.size(CASES) - 1
+        CaseCfg cc = array.get(CASES, i)
+        if cc.posActive
+            activeCaseCount += 1
+plot(activeCaseCount, "保有中Case数", color = color.new(color.teal, 0), display = display.data_window)
