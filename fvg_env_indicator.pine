@@ -43,6 +43,8 @@ triggerMode     = input.string("Any", "トリガー結合", options = ["Any", "A
 minTriggerCount = input.int(1, "最低トリガー数 (MinCount時)", group = gTrg)
 triggerTF       = input.timeframe("1", "トリガー時間足", group = gTrg)
 useOppositeTriggerNoTrade = input.bool(true, "逆方向トリガー同時発生はNoTrade", group = gTrg)
+useTriggerCooldown        = input.bool(false, "トリガークールダウン (トリガーON時)", group = gTrg)
+triggerCooldownBars       = input.int(3, "クールダウン本数", group = gTrg)
 reqOppColor  = input.bool(true, "前足が反対色であることを要求", group = gTrg)
 strictEngulf = input.bool(true, "実体が前足を完全に包む",       group = gTrg)
 emaLenTrigger      = input.int(20,  "EMA Length (EMAリジェクト)", group = gTrg)
@@ -808,6 +810,10 @@ type CaseCfg
     bool   tEMA
     bool   tFVG
     bool   tStr
+    // --- 実行時状態 (既定値付き = push行では指定不要・ケース増でも変数増なし) ---
+    bool   armedLong  = true    // 再アーム状態 (トリガーOFF時のみ使用)
+    bool   armedShort = true
+    int    lastTrigBar = na     // 直近トリガー成立5分足 (Trigger Cooldown用)
 
 f_fvgTxt(CaseCfg c) =>
     string s = ""
@@ -836,10 +842,12 @@ f_msg(string prefix, CaseCfg c, int dir, float e, float sl, float tp, float sz) 
 // ============================================================
 //  18. 共通エンジン : 1ケースを評価 (barstate.isconfirmed は含めない)
 // ------------------------------------------------------------
-//  戻り値 [valid, dir, entry, sl, tp, size]
+//  戻り値 [valid, dir, entry, sl, tp, size, noTrig]。
 //   valid = 「確定シグナル条件から barstate.isconfirmed を除いた全条件」
 //   → 確定 = valid AND barstate.isconfirmed / 仮 = valid AND 形成中。
-// ============================================================
+//  副作用: c.armedLong/armedShort (再アーム) と c.lastTrigBar (Cooldown) を毎足更新。
+//    → この関数は「保有中も含め毎5分足・全ケース」で呼ぶこと (状態を常に最新化)。
+//  実際のエントリー時の disarm (armed:=false) は発注部 (セクション22) で行う。
 f_evalCase(CaseCfg c) =>
     // --- 環境一致 (EMA方向 + 日足ボラ + 各種フィルタ) ---
     bool envOk = c.req4H == trend4H and c.req1H == trend1H and c.req15M == trend15M and (c.reqVol == "OFF" or c.reqVol == drVolText) and dailyDirGateOk and sessionOk and allowByNewsTime and volOk and not blockedByAccum and not blockedByAccumExitWait
@@ -849,17 +857,35 @@ f_evalCase(CaseCfg c) =>
     bool fvgShort = score <= -c.thr
     // --- 1分足トリガー (ケースが選んだ種類のみ結合) ---
     int te = (c.tEng?1:0)+(c.tPin?1:0)+(c.tBOS?1:0)+(c.tEMA?1:0)+(c.tFVG?1:0)+(c.tStr?1:0)
-    bool gate = c.useTrig and te > 0
+    bool gate = c.useTrig and te > 0                    // gate=false → noTriggerMode相当
+    bool noTrig = not gate
     int bc = (c.tEng and agBEng?1:0)+(c.tPin and agBPin?1:0)+(c.tBOS and agBBOS?1:0)+(c.tEMA and agBEMA?1:0)+(c.tFVG and agBFVG?1:0)+(c.tStr and agBStr?1:0)
     int sc = (c.tEng and agSEng?1:0)+(c.tPin and agSPin?1:0)+(c.tBOS and agSBOS?1:0)+(c.tEMA and agSEMA?1:0)+(c.tFVG and agSFVG?1:0)+(c.tStr and agSStr?1:0)
     bool bHit = f_combineTrig(bc, te)
     bool sHit = f_combineTrig(sc, te)
     bool conflict = gate and useOppositeTriggerNoTrade and bHit and sHit
-    bool bTrig = not gate or (bHit and not conflict)
-    bool sTrig = not gate or (sHit and not conflict)
+    bool bTrig = bHit and not conflict                  // finalBullTrig 相当 (トリガーON時)
+    bool sTrig = sHit and not conflict                  // finalBearTrig 相当 (トリガーON時)
+    // --- 主要条件 (再アーム/disarm の駆動条件・元 longMajorOk/shortMajorOk 相当) ---
+    //   ※ トリガー・Size・barstate は含めない (元ストラテジーと同一)。
+    bool majorLong  = envOk and fvgLong  and accumLongDirectionOk
+    bool majorShort = envOk and fvgShort and accumShortDirectionOk
+    // --- 再アーム (トリガーOFF時): 主要条件が不成立になったら次の1回を許可 ---
+    if not majorLong
+        c.armedLong := true
+    if not majorShort
+        c.armedShort := true
+    // --- Trigger Cooldown (トリガーON時): 元ストラテジーと同一・ケース毎に lastTrigBar 保持 ---
+    bool cdOk = not useTriggerCooldown or na(c.lastTrigBar) or (bar_index - c.lastTrigBar) > triggerCooldownBars
+    bool trigFiredNow = gate and (bTrig or sTrig)
+    if trigFiredNow and cdOk
+        c.lastTrigBar := bar_index
+    // --- 方向別ゲート (noTrig=再アーム / trig=最終トリガー+Cooldown) ---
+    bool longGate  = noTrig ? c.armedLong  : (bTrig and cdOk)
+    bool shortGate = noTrig ? c.armedShort : (sTrig and cdOk)
     // --- 方向決定 ---
-    bool longWant  = c.aLong  and envOk and fvgLong  and bTrig and accumLongDirectionOk
-    bool shortWant = c.aShort and envOk and fvgShort and sTrig and accumShortDirectionOk
+    bool longWant  = c.aLong  and majorLong  and longGate
+    bool shortWant = c.aShort and majorShort and shortGate
     if longWant and shortWant
         if close >= open
             shortWant := false
@@ -875,7 +901,7 @@ f_evalCase(CaseCfg c) =>
     float riskCap = baseCap * riskPct / 100.0
     float size = (not na(risk) and risk > 0) ? math.floor(riskCap / (risk * syminfo.pointvalue)) : 0.0
     bool valid = dir != 0 and not na(risk) and risk > 0 and size >= 1   // ★ Size<1 除外はここ
-    [valid, dir, entry, sl, tp, size]
+    [valid, dir, entry, sl, tp, size, noTrig]
 
 // ============================================================
 //  19. 5分足限定フラグ
@@ -906,11 +932,8 @@ var float vpTP     = na
 var float vpSize   = na
 var bool  tentFiredLong  = false
 var bool  tentFiredShort = false
-
-// 仮シグナルの重複防止フラグは「新しい5分足」でリセット (=リアルタイム中1回)。
-if barstate.isnew
-    tentFiredLong  := false
-    tentFiredShort := false
+// ※ 仮シグナルのリセットは「対応する確定シグナル発行時」のみ (仕様どおり)。
+//    新しい5分足になっただけではリセットしない。
 
 // --- 21a. 仮想ポジション決済 (保有分・当該足の高安で判定) ---
 bool justClosed = false
@@ -925,26 +948,31 @@ if is5m and vpActive
         vpActive   := false
         justClosed := true
 
-// --- 21b. ケース評価 (フラット時のみ・先頭有効ケースを採用) ---
+// --- 21b. ケース評価 ---
+//   f_evalCase は「毎5分足・全ケース」呼ぶ (保有中も) → 再アーム/Cooldown状態を常に最新化。
+//   シグナル採用 (sig*) はフラット時のみ・先頭有効ケースを1つだけ。
 bool  sigValid = false
 int   sigDir   = 0
 float sEntry   = na
 float sSL      = na
 float sTP      = na
 float sSize    = na
+bool  sigNoTrig = false
 CaseCfg sigCase = na
-if is5m and not vpActive and not justClosed
+bool canSelect = not vpActive and not justClosed
+if is5m
     for i = 0 to array.size(CASES) - 1
         CaseCfg c = array.get(CASES, i)
-        [v, d, e, sl, tp, sz] = f_evalCase(c)
-        if v and not sigValid
-            sigValid := true
-            sigDir   := d
-            sEntry   := e
-            sSL      := sl
-            sTP      := tp
-            sSize    := sz
-            sigCase  := c
+        [v, d, e, sl, tp, sz, nt] = f_evalCase(c)   // ← 状態更新 (毎足・全ケース)
+        if v and canSelect and not sigValid
+            sigValid  := true
+            sigDir    := d
+            sEntry    := e
+            sSL       := sl
+            sTP       := tp
+            sSize     := sz
+            sigNoTrig := nt
+            sigCase   := c
 
 // ============================================================
 //  22. シグナル発行 (仮 / 確定) + ラベル + 仮想ポジション建て
@@ -971,9 +999,17 @@ if is5m and sigValid and not vpActive and not justClosed
         vpSL     := sSL
         vpTP     := sTP
         vpSize   := sSize
-        // 確定が出たら仮シグナルフラグをリセット (仕様どおり)
-        tentFiredLong  := false
-        tentFiredShort := false
+        // トリガーOFFケースは発注した瞬間に disarm → 主要条件が一度崩れるまで再エントリー禁止。
+        if sigNoTrig
+            if sigDir == 1
+                sigCase.armedLong := false
+            else
+                sigCase.armedShort := false
+        // 確定が出たら「対応する方向の」仮シグナルフラグのみリセット (仕様どおり)
+        if sigDir == 1
+            tentFiredLong := false
+        else
+            tentFiredShort := false
 
 // ============================================================
 //  23. 補助プロット (仮想ポジションの Entry/SL/TP を可視化・任意)
