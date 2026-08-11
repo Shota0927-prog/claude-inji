@@ -986,9 +986,7 @@ type CaseCfg
     float  posSL     = na
     float  posTP     = na
     float  posSize   = na
-    // --- 仮シグナル発行済み状態 (Caseごと・方向別) ---
-    bool   tentLong  = false
-    bool   tentShort = false
+    // ※ 仮シグナル重複防止は varip 配列 (tentLongBars/tentShortBars) に一本化 (CaseCfgでは持たない)
     // --- Accum ドテン ステート ---
     int    stage      = 0       // 0=待機 / 1=初回タッチポジ / 2=ドテンポジ
     int    initDir    = 0       // 初回タッチ方向 (1=下限Long / -1=上限Short)
@@ -1233,33 +1231,52 @@ if barstate.isfirst
     array.push(CASES, CaseCfg.new(2, 3, 9, 9, 9, "OFF", false, false, true, false, 50.0, 300.0, false, false, false, false, true, true, 40.0, 2.0, false, false, false, false, false, false, false, true, false))
 
 // ============================================================
+//  20b. 仮シグナル intrabar 重複防止 (varip = リアルタイムtick間で rollback されない)
+// ------------------------------------------------------------
+//  「Case index × 方向 × 最後に仮通知した5分足 bar_index」を記録する。
+//  通常変数 (var / UDTフィールド) はリアルタイム足の各tick再計算で確定値へ rollback されるため、
+//  intrabarで立てたフラグが戻り同一足内で仮シグナルが再発火する。varip はtick間で保持されるため
+//  「同一Case・同一方向・同一5分足=最大1回」を担保できる。新しい足で bar_index が変わり自動再許可。
+//  配列は CASES と同じ index で管理し、ループ内で index i まで安全に拡張する (常にCASES数と一致)。
+// ============================================================
+varip array<int> tentLongBars  = array.new_int()
+varip array<int> tentShortBars = array.new_int()
+
+// ============================================================
 //  21. ケースごと独立処理 (決済+ドテン → 評価 → 仮/確定シグナル)
 // ------------------------------------------------------------
-//  Caseごとに独立: posActive/posDir/posEntry/posSL/posTP/posSize/tentLong/tentShort/
+//  Caseごとに独立: posActive/posDir/posEntry/posSL/posTP/posSize/
 //  stage(0/1/2)/initDir/lowerArmed/upperArmed。ピラミッティング0は同一Case内のみ。
+//  仮シグナル重複防止は varip 配列 tentLongBars/tentShortBars に一本化。
 //  ・決済・確定エントリー・ドテンは 5分足確定時 (barstate.isconfirmed) に処理 (非リペイント)。
 //    仮シグナルのみ形成中に発火。SL到達検知はその確定足で行い、ドテンEntryを確定する。
 //  ・stage 0=待機 / 1=初回タッチポジ / 2=ドテンポジ。
 //    stage1 が SL → 逆方向へ1回だけドテン(stage2)。TP/その他 → 終了。stage2 決済 → 終了(再ドテンしない)。
 //  ・同一足SL/TP両到達は f_resolveExit で SL 優先。複利ONは決済で virtualBalance 更新。
-//  ・alert は alert.freq_all (同一足で複数Caseを個別発火)。重複防止は tent フラグ / stage / isconfirmed。
+//  ・alert は alert.freq_all (同一足で複数Caseを個別発火)。仮シグナルの intrabar 重複防止は
+//    varip 配列 (tentLongBars/tentShortBars) が担保する (通常変数/UDTフィールドは rollback するため不可)。
 // ============================================================
 if is5m
     for i = 0 to array.size(CASES) - 1
         CaseCfg c = array.get(CASES, i)
+        // --- varip配列を index i まで安全に拡張 (CASES数と確実に一致・初期値 -1=未通知) ---
+        if array.size(tentLongBars) <= i
+            array.push(tentLongBars, -1)
+        if array.size(tentShortBars) <= i
+            array.push(tentShortBars, -1)
         // --- 評価 (採用箱・再アーム・breakStateは共通側で毎足更新済み) ---
         //   vC=確定候補 / vT=仮候補 / d=アクティブ方向 / bHi,bLo=採用箱 / touchTxt / modeTxt(Touch or Break Entry)
         [vC, vT, d, e, sl, tp, sz, bHi, bLo, touchTxt, modeTxt] = f_evalCase(c)
 
         // --- 仮シグナル (形成中・stage0/フラット・Caseごと方向別に1回・タッチ/ブレイク予測) ---
         if barstate.isrealtime and not barstate.isconfirmed and vT and c.stage == 0 and not c.posActive
-            bool _tf = d == 1 ? c.tentLong : c.tentShort
-            if not _tf
+            int _lastTentBar = d == 1 ? array.get(tentLongBars, i) : array.get(tentShortBars, i)
+            if _lastTentBar != bar_index
                 alert(f_msg("仮シグナル", c, d, e, sl, tp, sz, bHi, bLo, touchTxt, modeTxt), alert.freq_all)
                 if d == 1
-                    c.tentLong := true
+                    array.set(tentLongBars, i, bar_index)
                 else
-                    c.tentShort := true
+                    array.set(tentShortBars, i, bar_index)
 
         // --- 確定処理 (5分足確定時のみ: 決済 → ドテン → 初回エントリー) ---
         if barstate.isconfirmed
@@ -1330,11 +1347,6 @@ if is5m
                     c.lowerArmed := false
                 else
                     c.upperArmed := false
-                // 対応方向の仮フラグをリセット
-                if d == 1
-                    c.tentLong := false
-                else
-                    c.tentShort := false
 
 // ============================================================
 //  22. 補助プロット (Caseごとに独立保有するため、保有中Case数のみ表示)

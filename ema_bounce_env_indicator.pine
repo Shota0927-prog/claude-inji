@@ -889,9 +889,7 @@ type CaseCfg
     float  posSL     = na
     float  posTP     = na
     float  posSize   = na
-    // --- 仮シグナル発行済み状態 (Caseごと・方向別) ---
-    bool   tentLong  = false
-    bool   tentShort = false
+    // ※ 仮シグナル重複防止は varip 配列 (tentLongBars/tentShortBars) に一本化 (CaseCfgでは持たない)
 
 f_emaTxt(CaseCfg c) =>
     string _1 = (c.e1M200 ? "200/" : "") + (c.e1M1000 ? "1000/" : "") + (c.e1M2000 ? "2000/" : "") + (c.e1M3000 ? "3000/" : "")
@@ -1013,21 +1011,39 @@ if barstate.isfirst
     array.push(CASES, CaseCfg.new(1, 3, 1, 1, 1, "中ボラ", true, true, false, false, false, false, false, false, true, false, true, false, 10, 2.0, true, false, true, false, false, false, false))
 
 // ============================================================
+//  20b. 仮シグナル intrabar 重複防止 (varip = リアルタイムtick間で rollback されない)
+// ------------------------------------------------------------
+//  「Case index × 方向 × 最後に仮通知した5分足 bar_index」を記録する。
+//  通常変数 (var / UDTフィールド) はリアルタイム足の各tick再計算で確定値へ rollback されるため、
+//  intrabarで立てたフラグが戻り同一足内で仮シグナルが再発火する。varip はtick間で保持されるため
+//  「同一Case・同一方向・同一5分足=最大1回」を担保できる。新しい足で bar_index が変わり自動再許可。
+//  配列は CASES と同じ index で管理し、ループ内で index i まで安全に拡張する (常にCASES数と一致)。
+// ============================================================
+varip array<int> tentLongBars  = array.new_int()
+varip array<int> tentShortBars = array.new_int()
+
+// ============================================================
 //  21. ケースごと独立処理 (決済 → 状態更新 → シグナル発行)
 // ------------------------------------------------------------
-//  各Caseは posActive/posDir/posEntry/posSL/posTP/posSize と tentLong/tentShort を
-//  「Case自身のオブジェクト内」で独立管理する。
+//  各Caseは posActive/posDir/posEntry/posSL/posTP/posSize を「Case自身のオブジェクト内」で
+//  独立管理する (仮シグナル重複防止は varip 配列 tentLongBars/tentShortBars に一本化)。
 //  ・ピラミッティング0 は「同一Case内のみ」: そのCaseが保有中はそのCaseの新規シグナルを
 //    出さない。別Caseは同時成立・同時保有・同時シグナルOK。
 //  ・全Caseを毎5分足処理する (先頭1件だけ採用する sigValid/sigCase 方式は廃止)。
 //  ・複利ONなら各Caseの決済で共通 virtualBalance に損益反映 (同足で複数決済も各々処理)。
 //  ・alert は alert.freq_all を使用 (同一足・同一実行で複数Caseを個別発火させるため。
 //    freq_once_per_bar はループ内で最初の1回しか鳴らないため不可)。
-//    重複防止は Caseごとの tentLong/tentShort と barstate.isconfirmed が担保する。
+//    仮シグナルの intrabar 重複防止は varip 配列 (tentLongBars/tentShortBars) が担保する
+//    (通常変数/UDTフィールドはリアルタイムtickで rollback するため不可)。確定は barstate.isconfirmed。
 // ============================================================
 if is5m
     for i = 0 to array.size(CASES) - 1
         CaseCfg c = array.get(CASES, i)
+        // --- varip配列を index i まで安全に拡張 (CASES数と確実に一致・初期値 -1=未通知) ---
+        if array.size(tentLongBars) <= i
+            array.push(tentLongBars, -1)
+        if array.size(tentShortBars) <= i
+            array.push(tentShortBars, -1)
         // --- (a) 決済 (このCaseが保有中のみ・当該足の高安で判定) ---
         bool justClosed = false
         if c.posActive
@@ -1044,14 +1060,14 @@ if is5m
         [v, d, e, sl, tp, sz, nt] = f_evalCase(c)
         // --- (c) シグナル発行 (このCaseがフラット かつ 当該足で決済していない時のみ) ---
         if v and not c.posActive and not justClosed
-            // 仮シグナル : 形成中(未確定)に1回だけ alert() のみ (Caseごと・方向別)
-            bool tf = d == 1 ? c.tentLong : c.tentShort
-            if barstate.isrealtime and not barstate.isconfirmed and not tf
+            // 仮シグナル : 形成中(未確定)・同一Case×同一方向×同一5分足で最大1回 (varip で intrabar 保持)
+            int _lastTentBar = d == 1 ? array.get(tentLongBars, i) : array.get(tentShortBars, i)
+            if barstate.isrealtime and not barstate.isconfirmed and _lastTentBar != bar_index
                 alert(f_msg("仮シグナル", c, d, e, sl, tp, sz), alert.freq_all)
                 if d == 1
-                    c.tentLong := true
+                    array.set(tentLongBars, i, bar_index)
                 else
-                    c.tentShort := true
+                    array.set(tentShortBars, i, bar_index)
             // 確定シグナル : 5分足確定時に1回だけ alert() + label.new()
             if barstate.isconfirmed
                 alert(f_msg("確定シグナル", c, d, e, sl, tp, sz), alert.freq_all)
@@ -1069,11 +1085,6 @@ if is5m
                         c.armedLong := false
                     else
                         c.armedShort := false
-                // 対応する方向の仮シグナルフラグをリセット (仕様どおり)
-                if d == 1
-                    c.tentLong := false
-                else
-                    c.tentShort := false
 
 // ============================================================
 //  22. 補助プロット (Caseごとに独立保有するため、保有中Case数のみ表示)
