@@ -407,11 +407,13 @@ f_efvgState(int holdBars, float minThickR, float absBodyMin, float absEdge) =>
         _babs := true
     bool _active = not na(_evbar) and (bar_index - _evbar) < holdBars
     int _outBias = _active ? _bias : 0
-    _outBias
+    // eventId = 吸収イベント成立バー (_evbar)。新しい吸収成立時のみ更新され、hold中/減衰中は不変。
+    // これにより「hold保持中」と「新規吸収イベント」をエントリー側で区別できる (bias値・閾値・重みは不変)。
+    [_outBias, _evbar]
 
 f_efvgConfirmed(int holdBars, float minThickR, float absBodyMin, float absEdge) =>
-    int _b = f_efvgState(holdBars, minThickR, absBodyMin, absEdge)
-    _b[1]
+    [_b, _ev] = f_efvgState(holdBars, minThickR, absBodyMin, absEdge)
+    [_b[1], _ev[1]]
 
 // ============================================================
 //  13. Accum 検出 (元ストラテジー同一)
@@ -583,13 +585,15 @@ string drVolText = f_drVolText(drVolCodeAdj)
 // 日足方向は任意ゲート (既定OFF)。ボラはケースが drVolText と照合する。
 bool dailyDirGateOk = reqDailyDirection == "OFF" or drDirText == reqDailyDirection
 
-// --- 16c. FVG 6TF bias (常に全計算・ケースがスコア対象を選択) ---
-int efvgDBias = request.security(syminfo.tickerid, "D",   f_efvgConfirmed(efvgHoldDaily, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
-int efvgHBias = request.security(syminfo.tickerid, "240", f_efvgConfirmed(efvgHold4H,    efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
-int efvgOBias = request.security(syminfo.tickerid, "60",  f_efvgConfirmed(efvgHold1H,    efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
-int efvgMBias = request.security(syminfo.tickerid, "15",  f_efvgConfirmed(efvgHold15M,   efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
-int efvg5Bias = request.security(syminfo.tickerid, "5",   f_efvgConfirmed(efvgHold5M,    efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
-int efvg1Bias = request.security(syminfo.tickerid, "1",   f_efvgConfirmed(efvgHold1M,    efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
+// --- 16c. FVG 6TF bias + eventId (常に全計算・ケースがスコア対象を選択) ---
+//   bias(1/0/-1)=WeightedScore用 (従来どおり)。eventId=吸収イベント識別子 (signature用・新規追加)。
+//   ※ request.security の本数は増やさず、既存の1呼び出しで [bias, eventId] を同時取得する。
+[efvgDBias, efvgDEvent] = request.security(syminfo.tickerid, "D",   f_efvgConfirmed(efvgHoldDaily, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
+[efvgHBias, efvgHEvent] = request.security(syminfo.tickerid, "240", f_efvgConfirmed(efvgHold4H,    efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
+[efvgOBias, efvgOEvent] = request.security(syminfo.tickerid, "60",  f_efvgConfirmed(efvgHold1H,    efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
+[efvgMBias, efvgMEvent] = request.security(syminfo.tickerid, "15",  f_efvgConfirmed(efvgHold15M,   efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
+[efvg5Bias, efvg5Event] = request.security(syminfo.tickerid, "5",   f_efvgConfirmed(efvgHold5M,    efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
+[efvg1Bias, efvg1Event] = request.security(syminfo.tickerid, "1",   f_efvgConfirmed(efvgHold1M,    efvgMinThick, efvgAbsBodyMin, efvgAbsEdge), lookahead = barmerge.lookahead_on)
 
 // --- 16d. 1分足トリガー種類別集約 (security_lower_tf は1回だけ) ---
 [_aBEng,_aSEng,_aBPin,_aSPin,_aBBOS,_aSBOS,_aBEMA,_aSEMA,_aBFVG,_aSFVG,_aBStr,_aSStr] = request.security_lower_tf(syminfo.tickerid, triggerTF, f_calcTriggers())
@@ -822,7 +826,14 @@ type CaseCfg
     float  posSL     = na
     float  posTP     = na
     float  posSize   = na
-    // ※ 仮シグナル重複防止は varip 配列 (tentLongBars/tentShortBars) に一本化 (CaseCfgでは持たない)
+    // --- FVGイベント消費管理 (1 FVGイベント = 1エントリー採用・方向別) ---
+    //   確定エントリー時に「そのとき根拠となったFVG event signature」を保存する。
+    //   同じsignatureでは二度とエントリーしない (決済・再アームでは解除されない)。
+    //   新しい吸収eventIdが来て signature が変われば再び1回だけ許可される。
+    //   ※ 書き込みは barstate.isconfirmed の確定エントリー時のみ (= commit点) なので UDTフィールドで保持可。
+    string usedLongSig  = ""
+    string usedShortSig = ""
+    // ※ 仮シグナルの intrabar(tick)重複防止は varip 配列 (tentLongBars/tentShortBars) に一本化 (CaseCfgでは持たない)
 
 f_fvgTxt(CaseCfg c) =>
     string s = ""
@@ -833,6 +844,20 @@ f_fvgTxt(CaseCfg c) =>
     s := s + (c.f5  ? "5M "  : "")
     s := s + (c.f1m ? "1M "  : "")
     s == "" ? "-" : s
+
+// FVG event signature : このCaseが「今どのFVG吸収イベント群を根拠にしているか」を識別する文字列。
+//   ・スコア対象TF (c.fD..c.f1m) の eventId のみを連結する (対象外TFは含めない)。
+//   ・方向 (dir) も含める (Long/Short は別イベントとして扱う)。
+//   ・eventId は「新しい吸収成立時のみ」変化するので、単に fvgLong が継続しているだけでは
+//     signature は変わらない = 同一イベント扱い。新しい吸収で eventId が変われば signature が変わる。
+f_fvgSig(CaseCfg c, int dir) =>
+    "D" + str.tostring(dir) +
+     (c.fD  ? ":D"   + str.tostring(efvgDEvent) : "") +
+     (c.f4  ? ":H4"  + str.tostring(efvgHEvent) : "") +
+     (c.f1  ? ":H1"  + str.tostring(efvgOEvent) : "") +
+     (c.f15 ? ":M15" + str.tostring(efvgMEvent) : "") +
+     (c.f5  ? ":M5"  + str.tostring(efvg5Event) : "") +
+     (c.f1m ? ":M1"  + str.tostring(efvg1Event) : "")
 
 f_msg(string prefix, CaseCfg c, int dir, float e, float sl, float tp, float sz) =>
     "【" + prefix + "】\n" +
@@ -962,8 +987,12 @@ varip array<int> confirmedShortBars = array.new_int()
 //  ・複利ONなら各Caseの決済で共通 virtualBalance に損益反映 (同足で複数決済も各々処理)。
 //  ・alert は alert.freq_all を使用 (同一足・同一実行で複数Caseを個別発火させるため。
 //    freq_once_per_bar はループ内で最初の1回しか鳴らないため不可)。
-//    仮シグナルの intrabar 重複防止は varip 配列 (tentLongBars/tentShortBars) が担保する
-//    (通常変数/UDTフィールドはリアルタイムtickで rollback するため不可)。確定は barstate.isconfirmed。
+//  ・重複防止は役割ごとに完全分離する:
+//    (1) varip 配列 (tentLongBars/tentShortBars/confirmedLongBars/confirmedShortBars)
+//        = 「同一5分足 intrabar の tick 連打」防止のみ (Case index × 方向 × bar_index)。
+//    (2) usedLongSig/usedShortSig = 「1 FVGイベント = 1エントリー採用」= 同一FVG吸収イベントの再利用防止。
+//    (3) Trigger Cooldown (lastTrigBar) = BOS等トリガーの発火間隔制御。
+//        → (2)と(3)は独立。Cooldown OFF でも 1 FVGイベント = 1エントリー は必ず守られる。
 // ============================================================
 if is5m
     for i = 0 to array.size(CASES) - 1
@@ -993,17 +1022,27 @@ if is5m
         [v, d, e, sl, tp, sz, nt] = f_evalCase(c)
         // --- (c) シグナル発行 (このCaseがフラット かつ 当該足で決済していない時のみ) ---
         if v and not c.posActive and not justClosed
-            // 仮シグナル : 形成中(未確定)・同一Case×同一方向×同一5分足で最大1回 (varip で intrabar 保持)
+            // このCaseが今根拠にしているFVGイベントの signature (選択TFのeventId + 方向)
+            string _sig     = f_fvgSig(c, d)
+            string _usedSig = d == 1 ? c.usedLongSig : c.usedShortSig
+            // 1 FVGイベント = 1エントリー採用。同一signatureが使用済みなら仮/確定とも一切出さない。
+            //   ※ Trigger Cooldown / armed とは完全に独立。Cooldown OFF でも同一FVGでは再エントリーしない。
+            bool _fvgEventUnused = _sig != _usedSig
+            // 仮シグナル : 未使用FVGイベント かつ 形成中 かつ 同一5分足intrabar最大1回 (varip=tick重複防止のみ)。
+            //   仮ではFVGを消費しない (pending扱い)。確定前に条件消失すれば同一FVGで後続トリガーを再度待てる。
             int _lastTentBar = d == 1 ? array.get(tentLongBars, i) : array.get(tentShortBars, i)
-            if barstate.isrealtime and not barstate.isconfirmed and _lastTentBar != bar_index
+            if _fvgEventUnused and barstate.isrealtime and not barstate.isconfirmed and _lastTentBar != bar_index
                 alert(f_msg("仮シグナル", c, d, e, sl, tp, sz), alert.freq_all)
                 if d == 1
                     array.set(tentLongBars, i, bar_index)
                 else
                     array.set(tentShortBars, i, bar_index)
-            // 確定シグナル : 同一Case×同一方向×同一5分足で最大1回 (varip で intrabar 保持)
+            // 確定シグナル : 未使用FVGイベント かつ 確定足 かつ 同一5分足intrabar最大1回。
+            //   confirmedEntryEvent が true のときだけ「確定alert / label / posON / FVG消費」を単一イベントとして
+            //   一括実行する (両者は同一条件式なので alert だけ・label だけ が論理上発生しない)。
             int _lastConfirmedBar = d == 1 ? array.get(confirmedLongBars, i) : array.get(confirmedShortBars, i)
-            if barstate.isconfirmed and _lastConfirmedBar != bar_index
+            bool confirmedEntryEvent = _fvgEventUnused and barstate.isconfirmed and _lastConfirmedBar != bar_index
+            if confirmedEntryEvent
                 alert(f_msg("確定シグナル", c, d, e, sl, tp, sz), alert.freq_all)
                 label.new(bar_index, d == 1 ? low : high, f_msg("確定", c, d, e, sl, tp, sz), style = d == 1 ? label.style_label_up : label.style_label_down, color = d == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, size = size.small)
                 if d == 1
@@ -1017,6 +1056,11 @@ if is5m
                 c.posSL     := sl
                 c.posTP     := tp
                 c.posSize   := sz
+                // このFVGイベントを consumed に (同一signatureは決済後・env再一致後も二度と許可しない)
+                if d == 1
+                    c.usedLongSig := _sig
+                else
+                    c.usedShortSig := _sig
                 // トリガーOFFケースは発注瞬間に disarm (主要条件が崩れるまで再エントリー禁止)
                 if nt
                     if d == 1
