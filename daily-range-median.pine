@@ -1,0 +1,195 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © your_username
+//
+// 【目的】
+//   「前日までの直近 N 本の確定済み日足の High-Low の中央値」を
+//   サブウィンドウに描画し、過去チャート上での分布を検証するための
+//   分析専用インジケーター。
+//   エントリー / LONG-SHORT / FVG / EMA / Accum / トリガー等の
+//   売買ロジックは一切含まない（今回は分布確認のみ）。
+
+//@version=5
+indicator(
+     title         = "Daily Range Median (Volatility Regime)",
+     shorttitle    = "RangeMed",
+     overlay       = false,     // サブウィンドウ（別パネル）に表示
+     max_bars_back = 500
+ )
+
+// ============================================================
+// 入力パラメーター
+// ============================================================
+grp_calc = "中央値設定"
+// デフォルト 10 日。5 / 10 / 15 / 20 日などを比較検証できるよう変更可能。
+medianLength = input.int(10, title = "中央値期間（確定日足の本数 N）", minval = 3, group = grp_calc)
+
+grp_thr = "ボラ基準線"
+// 現在の分類基準（80 / 140 ドル）と比較するための水平線。変更可能。
+lowVolThreshold  = input.float(80.0,  title = "低ボラ基準（ドル）", minval = 0.0, group = grp_thr)
+highVolThreshold = input.float(140.0, title = "高ボラ基準（ドル）", minval = 0.0, group = grp_thr)
+
+grp_disp = "表示設定"
+// 前日の確定済み日足 Range も重ねて表示（デフォルト ON）。
+showPrevRange   = input.bool(true,  title = "前日の確定日足 Range を表示",   group = grp_disp)
+prevRangeAsHist = input.bool(false, title = "前日 Range をヒストグラム表示", group = grp_disp)
+showTable       = input.bool(true,  title = "右上に現在値テーブルを表示",     group = grp_disp)
+
+// ============================================================
+// 日足データの取得（★未来参照・リペイント防止★）
+// ============================================================
+// ■ なぜ現在の日足を含めないのか
+//   今日の値動き（形成中の日足 High-Low）で今日の判定値が動いてはいけない。
+//   その日の判定値は「昨日までの確定情報」だけで決まり、1 日固定であるべき。
+//   そのため (high - low) ではなく (high - low)[1]（＝1 本前の確定日足の値幅）を使う。
+//
+// ■ なぜ lookahead_on と [1] を組み合わせるのか（非リペイントの根拠）
+//   ・lookahead_on を「単体」で使うと、HTF バー確定前にその確定値を先読みする
+//     未来参照バグになる。
+//   ・しかし [1] で「常に 1 本前＝すでに確定したバー」を参照するため、
+//     未来情報は一切使われない。
+//   ・この「lookahead_on ＋ [1]」の組み合わせは、TradingView 公式（PineCoders）が
+//     推奨する非リペイント（no-repaint）イディオムそのもの。
+//   ・したがって 5 分足など日足以下のチャートで使っても、
+//     計算元は必ず「確定済み日足」であり、バックテストに未来情報は混入しない。
+//
+//   例）今日が 8/11 の場合、この値は 8/10（確定済み）の日足 High-Low を返す。
+//       今日 8/11 の値動きには一切依存しない。
+dailyRangePrev = request.security(
+     syminfo.tickerid, "D", (high - low)[1],
+     lookahead = barmerge.lookahead_on
+ )
+
+// ============================================================
+// 直近 N 本の確定日足 Range を収集して中央値を計算
+// ============================================================
+// ■ どの N 本を中央値計算に使っているか
+//   新しい日足が始まったタイミング（newDay）で、直前に確定した日足の Range
+//   （＝ dailyRangePrev）を配列へ 1 個だけ追加する。
+//   配列は常に「直近 N 本の確定日足 Range」だけを保持（古いものから捨てる）。
+//   → 今日が 8/11 なら、配列には 8/10, 8/9, ... と過去 N 本が入り、
+//     8/11（形成中）は決して入らない。
+//
+// ■ 中央値の計算方法
+//   配列をコピーして昇順ソートし、
+//     ・要素数が奇数 → 真ん中の 1 個
+//     ・要素数が偶数 → 中央 2 個の平均
+//   を中央値とする（外れ値に強い代表値）。
+//
+// ■ 1 日固定である理由
+//   配列の更新は「新しい日の最初のバー」でのみ行い、
+//   dailyRangePrev 自体も日中は一定なので、その日の中央値は日中変動しない。
+
+// 中央値本体（配列を壊さないようコピーしてから計算）
+f_median(array<float> a) =>
+    int sz = array.size(a)
+    float med = na
+    if sz > 0
+        arr = array.copy(a)
+        array.sort(arr, order.ascending)
+        if sz % 2 == 1
+            med := array.get(arr, sz / 2)                                  // 奇数：中央の値
+        else
+            med := (array.get(arr, sz / 2 - 1) + array.get(arr, sz / 2)) / 2.0  // 偶数：中央2つの平均
+    med
+
+// 直近 N 本の確定日足 Range を保持するローリング配列
+var array<float> rangeHist = array.new_float(0)
+
+// 新しい日足の開始判定（5 分足チャートでも日単位で true になる）
+bool newDay = timeframe.change("D")
+
+// その日の判定値（1 日固定）。新しい日にだけ更新する。
+var float medianRange = na
+
+if newDay and not na(dailyRangePrev)
+    array.push(rangeHist, dailyRangePrev)             // 直前に確定した日足 Range を追加
+    if array.size(rangeHist) > medianLength
+        array.shift(rangeHist)                        // 最古を捨てて直近 N 本に保つ
+    // N 本そろってから中央値を確定（それまでは na = データ蓄積中）
+    medianRange := array.size(rangeHist) == medianLength ? f_median(rangeHist) : na
+
+// ============================================================
+// ボラティリティ区分（前日までの中央値のみで判定）
+// ============================================================
+//   medianRange <  80          → 低ボラ（1）
+//   80 <= medianRange < 140    → 中ボラ（2）
+//   medianRange >= 140         → 高ボラ（3）
+int volCategory = na
+if not na(medianRange)
+    volCategory := medianRange < lowVolThreshold  ? 1 :
+                   medianRange < highVolThreshold ? 2 : 3
+
+// ============================================================
+// プロット
+// ============================================================
+// N 日 Range 中央値（メインライン）
+plot(
+     medianRange,
+     title     = "N日Range中央値",
+     color     = color.new(color.blue, 0),
+     linewidth = 2
+ )
+
+// 前日の確定日足 Range（ライン or ヒストグラムで比較表示）
+plot(
+     showPrevRange and not prevRangeAsHist ? dailyRangePrev : na,
+     title = "前日Range(ライン)",
+     color = color.new(color.gray, 0),
+     style = plot.style_stepline
+ )
+plot(
+     showPrevRange and prevRangeAsHist ? dailyRangePrev : na,
+     title = "前日Range(ヒスト)",
+     color = color.new(color.gray, 40),
+     style = plot.style_columns
+ )
+
+// 80 / 140 ドルの基準線（現行分類との比較用）
+hline(lowVolThreshold,  title = "低ボラ基準", color = color.new(color.green, 0), linestyle = hline.style_dashed)
+hline(highVolThreshold, title = "高ボラ基準", color = color.new(color.red,   0), linestyle = hline.style_dashed)
+
+// 背景色（中央値の現在区分。透明度高めでラインを妨げない）
+bgcolor(
+     na(volCategory)     ? na :
+     volCategory == 1    ? color.new(color.green,  88) :   // 低ボラ → 緑系
+     volCategory == 2    ? color.new(color.orange, 88) :   // 中ボラ → オレンジ系
+                           color.new(color.red,    88),    // 高ボラ → 赤系
+     title = "ボラ区分背景"
+ )
+
+// ============================================================
+// Data Window 用（TradingView の Data Window から数値確認）
+// ============================================================
+//   ・前日の Daily Range
+//   ・N 日 Daily Range 中央値
+//   ・ボラ区分（1 = 低ボラ / 2 = 中ボラ / 3 = 高ボラ）
+plot(dailyRangePrev, title = "前日Daily Range",       display = display.data_window)
+plot(medianRange,    title = "N日中央値",             display = display.data_window)
+plot(volCategory,    title = "ボラ区分(1低/2中/3高)", display = display.data_window)
+
+// ============================================================
+// 現在値テーブル（右上）
+// ============================================================
+string regimeText = na(volCategory) ? "データ蓄積中" :
+                    volCategory == 1 ? "低ボラ" :
+                    volCategory == 2 ? "中ボラ" : "高ボラ"
+color regimeColor = na(volCategory) ? color.gray :
+                    volCategory == 1 ? color.green :
+                    volCategory == 2 ? color.orange : color.red
+
+var table infoTable = table.new(position.top_right, 2, 4, border_width = 1)
+
+if showTable and barstate.islast
+    table.cell(infoTable, 0, 0, "期間",     text_color = color.white, bgcolor = color.new(color.gray, 20))
+    table.cell(infoTable, 1, 0, str.tostring(medianLength) + "日", text_color = color.white, bgcolor = color.new(color.gray, 20))
+
+    table.cell(infoTable, 0, 1, "中央値",   text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 1, 1, na(medianRange) ? "―" : str.tostring(medianRange, "#.0") + "ドル",
+                 text_color = color.white, bgcolor = color.new(color.gray, 40))
+
+    table.cell(infoTable, 0, 2, "判定",     text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 1, 2, regimeText, text_color = color.white, bgcolor = color.new(regimeColor, 20))
+
+    table.cell(infoTable, 0, 3, "前日Range", text_color = color.white, bgcolor = color.new(color.gray, 40))
+    table.cell(infoTable, 1, 3, na(dailyRangePrev) ? "―" : str.tostring(dailyRangePrev, "#.0") + "ドル",
+                 text_color = color.white, bgcolor = color.new(color.gray, 40))
