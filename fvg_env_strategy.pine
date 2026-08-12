@@ -1449,10 +1449,8 @@ var int pyrSeq = 0
 // --- 建値移動 状態 (Entry ID 単位。エントリー/元SL/TP計算には一切関与しない) ---
 //   beOrigTP     : 各Entry IDの発注時TP (建値移動でSL更新する際も TP は不変で再指定するため保持)。
 //   beActivated  : 各Entry IDが建値到達済みか (一度trueになったら二度と元SLへ戻さない一方向遷移)。
-//   beForceBE    : 「到達瞬間」で同一バー内に +幅到達→建値へ戻り を検知したID (以後 建値でのみ決済)。
 var map<string, float> beOrigTP    = map.new<string, float>()
 var map<string, bool>  beActivated = map.new<string, bool>()
-var map<string, bool>  beForceBE   = map.new<string, bool>()
 
 if okAddLong and wantLong
     pyrSeq += 1
@@ -1484,55 +1482,29 @@ if okAddShort and wantShort
 //  11b. 建値移動 (break-even) — 保有中ポジションの SL のみ更新
 // ------------------------------------------------------------
 //  ・useBreakEven=OFF → 本ブロックは何もしない (発注/SL/TP/結果は修正前と完全一致)。
-//  ・各 Entry ID (ピラミッディングの各ポジション) を個別に管理。建値到達で strategy.exit を
-//    「stop=実際のエントリー価格 / limit=元TP」に更新。一度到達したら beActivated を保持 (元SLへ戻さない)。
-//  ・建値SL決済は exit_comment="BE" (引き分け) / TP決済="TP" (勝ち) で判別。
+//  ・各 Entry ID (ピラミッディングの各ポジション) を個別に管理。
+//    建値到達 (Long: +breakEvenTrigger / Short: -breakEvenTrigger) を満たしたら、
+//    その Entry ID の strategy.exit を「stop=実際のエントリー価格 / limit=元TP」で更新。
+//    判定モード : "到達瞬間"=high/low基準 (TV標準約定に委譲) / "確定足"=確定足のclose基準。
+//    一度到達したら beActivated=true を保持し、以後ずっと建値SL (元SLへは戻さない)。
+//  ・建値SL決済は exit_comment="BE" (引き分け) / TP決済="TP" (勝ち) で判別可能にする。
 //    元SL(建値前)決済はコメントなし=通常の負け。TP/元SLの価格・計算は一切変更しない。
-//
-//  【"到達瞬間" モードの同一バー往復対応】
-//    strategy.exit の更新はそのバーの終値時点で行われ、実際に有効になるのは次バーから。
-//    そのため「同一5分足バー内で +幅到達 → エントリー価格へ戻り」が起きると、建値SLが間に合わず
-//    建値決済を取りこぼす (現状の不具合)。下位足は使わず TV標準OHLCの範囲で可能な限り正しく再現するため、
-//    確定足の高値/安値で "同一バー内に +幅到達(high/low) かつ 建値へ戻り(low/high)" を検知したら、
-//    そのIDを beForceBE=true に固定し、以後 TP を外して stop=エントリー価格のみで決済する。
-//    → 一度建値へ戻った (=本来なら建値で約定していた) トレードが、その後の上げでTP勝ちに化けるのを防ぎ、
-//      建値(±0)決済=引き分けとして確定させる。intrabar の到達順序はOHLCからは判別不能なため、
-//      建値決済側 (保守的=取りこぼさない) を採用する。"確定足" モードは終値1点判定のため対象外 (従来どおり)。
 // ============================================================
 if useBreakEven and strategy.opentrades > 0
     for _i = 0 to strategy.opentrades - 1
         string _eid = strategy.opentrades.entry_id(_i)
         if beOrigTP.contains(_eid)
             float _ep     = strategy.opentrades.entry_price(_i)
-            float _tp     = beOrigTP.get(_eid)
             bool  _isLong = strategy.opentrades.size(_i) > 0
             bool  _wasOn  = beActivated.contains(_eid) and beActivated.get(_eid)
-            bool  _forced = beForceBE.contains(_eid) and beForceBE.get(_eid)
-            if breakEvenTriggerMode == "確定足"
-                // 確定足モード : 終値基準 (従来どおり・変更なし)。
-                bool _reachC = _isLong ? (barstate.isconfirmed and close >= _ep + breakEvenTrigger) : (barstate.isconfirmed and close <= _ep - breakEvenTrigger)
-                if _wasOn or _reachC
-                    beActivated.put(_eid, true)
-                    strategy.exit(_eid + "X", from_entry = _eid, stop = _ep, limit = _tp, comment_loss = "BE", comment_profit = "TP")
+            bool  _reach  = false
+            if _isLong
+                _reach := breakEvenTriggerMode == "確定足" ? (barstate.isconfirmed and close >= _ep + breakEvenTrigger) : (high >= _ep + breakEvenTrigger)
             else
-                // 到達瞬間モード : high/low で判定。同一バー往復は建値決済に固定する。
-                bool _reach = _isLong ? (high >= _ep + breakEvenTrigger) : (low <= _ep - breakEvenTrigger)
-                bool _back  = _isLong ? (low <= _ep) : (high >= _ep)   // 建値(エントリー価格)へ戻ったか
-                if _forced
-                    // 同一バー往復を検知済み → TPを外し 建値(stop=エントリー価格)のみで決済 (引き分け固定)。
-                    strategy.exit(_eid + "X", from_entry = _eid, stop = _ep, comment_loss = "BE")
-                else if _wasOn
-                    // 前バーまでに建値到達済み → 建値SL + 元TP。
-                    strategy.exit(_eid + "X", from_entry = _eid, stop = _ep, limit = _tp, comment_loss = "BE", comment_profit = "TP")
-                else if _reach
-                    // 当バーで建値到達 → 建値到達を記録。
-                    beActivated.put(_eid, true)
-                    if _back
-                        // 当バー内で +幅到達 かつ 建値へ戻り (同一バー往復) → 以後 建値でのみ決済 (取りこぼし防止)。
-                        beForceBE.put(_eid, true)
-                        strategy.exit(_eid + "X", from_entry = _eid, stop = _ep, comment_loss = "BE")
-                    else
-                        strategy.exit(_eid + "X", from_entry = _eid, stop = _ep, limit = _tp, comment_loss = "BE", comment_profit = "TP")
+                _reach := breakEvenTriggerMode == "確定足" ? (barstate.isconfirmed and close <= _ep - breakEvenTrigger) : (low <= _ep - breakEvenTrigger)
+            if _wasOn or _reach
+                beActivated.put(_eid, true)
+                strategy.exit(_eid + "X", from_entry = _eid, stop = _ep, limit = beOrigTP.get(_eid), comment_loss = "BE", comment_profit = "TP")
 
 // ============================================================
 //  12. FVG 環境認識 表示 (テーブル / デバッグ / ゾーン)
