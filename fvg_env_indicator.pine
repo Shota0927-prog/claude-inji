@@ -975,6 +975,12 @@ varip array<int> tentShortBars = array.new_int()
 // 確定シグナルも同様に「Case index × 方向 × 5分足 bar_index」で最大1回に制限する
 varip array<int> confirmedLongBars  = array.new_int()
 varip array<int> confirmedShortBars = array.new_int()
+// 仮アラートは 1 FVG event signature につき最大1回 (5分足をまたいでも再通知しない)。
+//   ※ UDTフィールドだと「未確定足で書いた値」が確定足で rollback され複数足に持続しないため
+//     (仮アラートの書込みは未確定tick時なので commit されない)、varip 配列 (Case index × 方向) に
+//     signature を保持する (tick/足をまたいで不変)。確定使用済み usedLongSig/usedShortSig とは別管理。
+varip array<string> tentUsedLongSig  = array.new_string()
+varip array<string> tentUsedShortSig = array.new_string()
 
 // ============================================================
 //  21. ケースごと独立処理 (決済 → 状態更新 → シグナル発行)
@@ -990,9 +996,11 @@ varip array<int> confirmedShortBars = array.new_int()
 //  ・重複防止は役割ごとに完全分離する:
 //    (1) varip 配列 (tentLongBars/tentShortBars/confirmedLongBars/confirmedShortBars)
 //        = 「同一5分足 intrabar の tick 連打」防止のみ (Case index × 方向 × bar_index)。
-//    (2) usedLongSig/usedShortSig = 「1 FVGイベント = 1エントリー採用」= 同一FVG吸収イベントの再利用防止。
-//    (3) Trigger Cooldown (lastTrigBar) = BOS等トリガーの発火間隔制御。
-//        → (2)と(3)は独立。Cooldown OFF でも 1 FVGイベント = 1エントリー は必ず守られる。
+//    (2) tentUsedLongSig/tentUsedShortSig = 「1 FVG event signature = 仮アラート最大1回」
+//        = 同一FVGイベントで複数の5分足にまたがる仮アラート再通知の防止 (確定側では使わない)。
+//    (3) usedLongSig/usedShortSig = 「1 FVGイベント = 1確定エントリー採用」= 同一FVGの確定再利用防止。
+//    (4) Trigger Cooldown (lastTrigBar) = BOS等トリガーの発火間隔制御。
+//        → (2)(3)(4)は独立。Cooldown OFF でも 1 FVGイベント = 1確定エントリー は必ず守られる。
 // ============================================================
 if is5m
     for i = 0 to array.size(CASES) - 1
@@ -1006,6 +1014,10 @@ if is5m
             array.push(confirmedLongBars, -1)
         if array.size(confirmedShortBars) <= i
             array.push(confirmedShortBars, -1)
+        if array.size(tentUsedLongSig) <= i
+            array.push(tentUsedLongSig, "")
+        if array.size(tentUsedShortSig) <= i
+            array.push(tentUsedShortSig, "")
         // --- (a) 決済 (このCaseが保有中のみ・当該足の高安で判定) ---
         bool justClosed = false
         if c.posActive
@@ -1028,15 +1040,24 @@ if is5m
             // 1 FVGイベント = 1エントリー採用。同一signatureが使用済みなら仮/確定とも一切出さない。
             //   ※ Trigger Cooldown / armed とは完全に独立。Cooldown OFF でも同一FVGでは再エントリーしない。
             bool _fvgEventUnused = _sig != _usedSig
-            // 仮シグナル : 未使用FVGイベント かつ 形成中 かつ 同一5分足intrabar最大1回 (varip=tick重複防止のみ)。
-            //   仮ではFVGを消費しない (pending扱い)。確定前に条件消失すれば同一FVGで後続トリガーを再度待てる。
-            int _lastTentBar = d == 1 ? array.get(tentLongBars, i) : array.get(tentShortBars, i)
-            if _fvgEventUnused and barstate.isrealtime and not barstate.isconfirmed and _lastTentBar != bar_index
+            // 仮アラート : 「確定未使用FVG」かつ「同一FVG signatureで仮未通知」かつ「形成中」かつ「同一5分足tick未通知」。
+            //   ・_fvgEventUnused : 確定エントリー済みFVGでは仮も出さない (usedLongSig/usedShortSig)。
+            //   ・_fvgTentUnused  : 同一FVG signatureで既に仮を出していれば別の5分足でも再通知しない
+            //                       (tentUsedLongSig/tentUsedShortSig)。※確定側はこの条件を使わない。
+            //   ・_lastTentBar    : 同一5分足 intrabar の tick 連打防止 (varip / 従来どおり)。
+            //   仮ではFVGを消費しない (pending)。仮が失敗しても後続足の確定エントリーは禁止しない。
+            string _tentUsedSig   = d == 1 ? array.get(tentUsedLongSig, i) : array.get(tentUsedShortSig, i)
+            bool   _fvgTentUnused = _sig != _tentUsedSig
+            int    _lastTentBar   = d == 1 ? array.get(tentLongBars, i) : array.get(tentShortBars, i)
+            bool tentativeEntryEvent = _fvgEventUnused and _fvgTentUnused and barstate.isrealtime and not barstate.isconfirmed and _lastTentBar != bar_index
+            if tentativeEntryEvent
                 alert(f_msg("仮シグナル", c, d, e, sl, tp, sz), alert.freq_all)
                 if d == 1
-                    array.set(tentLongBars, i, bar_index)
+                    array.set(tentUsedLongSig,  i, _sig)       // このFVG signatureで仮通知済みに (足をまたいで再通知しない)
+                    array.set(tentLongBars,     i, bar_index)  // 同一5分足 intrabar の tick 連打防止
                 else
-                    array.set(tentShortBars, i, bar_index)
+                    array.set(tentUsedShortSig, i, _sig)
+                    array.set(tentShortBars,    i, bar_index)
             // 確定シグナル : 未使用FVGイベント かつ 確定足 かつ 同一5分足intrabar最大1回。
             //   confirmedEntryEvent が true のときだけ「確定alert / label / posON / FVG消費」を単一イベントとして
             //   一括実行する (両者は同一条件式なので alert だけ・label だけ が論理上発生しない)。
