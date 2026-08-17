@@ -1,6 +1,6 @@
 # POINT MASTER — 土台の使い方
 
-`point_master.pine` は、複数ロジック × 複数時間足のシグナルをポイント化して
+`POINT_MASTER_TEMPLATE.pine`（原本 / 編集禁止）は、複数ロジック × 複数時間足のシグナルをポイント化して
 `LONG SCORE` / `SHORT SCORE` / `NET SCORE` を算出する共通基盤です。
 実ロジック（FVG / EMA / TrendLine / DoubleTop 等）はまだ入っていません。
 
