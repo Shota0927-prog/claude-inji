@@ -1,0 +1,437 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © point_master
+
+//@version=5
+// =====================================================================================
+// POINT MASTER  ―  マルチロジック / マルチタイムフレーム スコアリング基盤
+// =====================================================================================
+// これは「土台」です。実ロジック（FVG / EMA / TrendLine / DoubleTop 等）はまだ入って
+// いません。後から §4「LOGIC SIGNAL INPUT AREA」へ 1 個ずつ接続していきます。
+//
+//   ポイント計算式 :  ロジックWeight × 時間足Weight
+//   集計           :  LONG SCORE / SHORT SCORE / NET SCORE ( = LONG - SHORT )
+//   状態管理       :  同一ロジック × 同一TF は NONE / LONG / SHORT の3状態のみ
+//                     （LONGとSHORTの同時保持は構造上できない）
+//
+// 【ロジックを1個追加する時に触る場所】
+//   §0 : N_LOGIC を +1
+//   §2 : 名称 / ロジックWeight の input ブロックを追加し、2つの array.from に足す
+//   §3 : 保持本数の input ブロックを追加し、HOLD_ALL に array.concat を1行追加
+//   §4 : LONG / SHORT の bool を書き、longs / shorts の array.from に足す
+//   → これだけ。集計・状態管理・表示は自動的に対応します。
+// =====================================================================================
+indicator(
+     title         = "POINT MASTER",
+     shorttitle    = "PM",
+     overlay       = true,
+     max_bars_back = 500
+ )
+
+// =====================================================================================
+// §0. 定数
+// =====================================================================================
+// ロジック本数。ロジックを1個追加したら必ずこの数字を +1 する。
+int N_LOGIC = 3
+// 対応時間足の本数（1M / 5M / 15M / 1H / 4H / 1D の6本。通常は変更不要）
+int N_TF = 6
+
+// 状態コード
+int ST_NONE  = 0
+int ST_LONG  = 1
+int ST_SHORT = -1
+
+// 両方向同時発生時の裁定コード
+int CONF_IGNORE = 0
+int CONF_LONG   = 1
+int CONF_SHORT  = 2
+
+// 1次元配列のインデックス変換： index = ロジック番号 * TF数 + TF番号
+f_idx(li, ti) => li * N_TF + ti
+
+// =====================================================================================
+// §1. 時間足設定（★TF Weight はここで変更）
+// =====================================================================================
+// 集計対象の時間足そのものも input なので「1M → 3M」のような差し替えも可能。
+grpTF = "① 時間足設定 (TF)"
+tfStr1 = input.timeframe("1",   "TF1 時間足", group = grpTF, inline = "tf1")
+tfW1   = input.float(1.0,       "Weight",     group = grpTF, inline = "tf1", step = 0.1, minval = 0)
+tfStr2 = input.timeframe("5",   "TF2 時間足", group = grpTF, inline = "tf2")
+tfW2   = input.float(1.2,       "Weight",     group = grpTF, inline = "tf2", step = 0.1, minval = 0)
+tfStr3 = input.timeframe("15",  "TF3 時間足", group = grpTF, inline = "tf3")
+tfW3   = input.float(1.5,       "Weight",     group = grpTF, inline = "tf3", step = 0.1, minval = 0)
+tfStr4 = input.timeframe("60",  "TF4 時間足", group = grpTF, inline = "tf4")
+tfW4   = input.float(2.0,       "Weight",     group = grpTF, inline = "tf4", step = 0.1, minval = 0)
+tfStr5 = input.timeframe("240", "TF5 時間足", group = grpTF, inline = "tf5")
+tfW5   = input.float(3.0,       "Weight",     group = grpTF, inline = "tf5", step = 0.1, minval = 0)
+tfStr6 = input.timeframe("D",   "TF6 時間足", group = grpTF, inline = "tf6")
+tfW6   = input.float(4.0,       "Weight",     group = grpTF, inline = "tf6", step = 0.1, minval = 0)
+
+// TFリスト（index 0..5 = 1M, 5M, 15M, 1H, 4H, 1D）
+TF_LIST   = array.from(tfStr1, tfStr2, tfStr3, tfStr4, tfStr5, tfStr6)
+TF_WEIGHT = array.from(tfW1,   tfW2,   tfW3,   tfW4,   tfW5,   tfW6)
+
+// =====================================================================================
+// §2. ロジック設定（★ロジック名 / ロジックWeight はここで変更）
+// =====================================================================================
+// ロジックを追加する時は、ここに1ブロック追加して LOGIC_NAME / LOGIC_WEIGHT に足す。
+// 名称は input なので、Logic01 を後から "FVG" に書き換えればテーブル表示も変わる。
+grpL1 = "② Logic01"
+l01Name = input.string("Logic01", "名称",           group = grpL1)
+l01W    = input.float(1.0,        "ロジックWeight", group = grpL1, step = 0.1, minval = 0)
+
+grpL2 = "② Logic02"
+l02Name = input.string("Logic02", "名称",           group = grpL2)
+l02W    = input.float(1.0,        "ロジックWeight", group = grpL2, step = 0.1, minval = 0)
+
+grpL3 = "② Logic03"
+l03Name = input.string("Logic03", "名称",           group = grpL3)
+l03W    = input.float(1.0,        "ロジックWeight", group = grpL3, step = 0.1, minval = 0)
+
+// ★ロジック追加時はここに grpL4 ブロックを追加し、下の2行に足す
+LOGIC_NAME   = array.from(l01Name, l02Name, l03Name)
+LOGIC_WEIGHT = array.from(l01W,    l02W,    l03W)
+
+// =====================================================================================
+// §3. 保持本数設定（★保持本数はここで変更 / ロジック × 時間足ごと）
+// =====================================================================================
+// 「そのTFの確定足で何本ぶんシグナルを保持するか」。
+// 例) Logic01 の 15M を 24 にすると、15M足24本のあいだポイントが加算され続ける。
+//     （チャート足の本数ではなく、必ずそのTF自身の本数で数えます）
+grpH1 = "③ Logic01 保持本数"
+h01a = input.int(6, "1M",  group = grpH1, minval = 1, inline = "h1a")
+h01b = input.int(6, "5M",  group = grpH1, minval = 1, inline = "h1a")
+h01c = input.int(6, "15M", group = grpH1, minval = 1, inline = "h1a")
+h01d = input.int(6, "1H",  group = grpH1, minval = 1, inline = "h1b")
+h01e = input.int(6, "4H",  group = grpH1, minval = 1, inline = "h1b")
+h01f = input.int(6, "1D",  group = grpH1, minval = 1, inline = "h1b")
+
+grpH2 = "③ Logic02 保持本数"
+h02a = input.int(6, "1M",  group = grpH2, minval = 1, inline = "h2a")
+h02b = input.int(6, "5M",  group = grpH2, minval = 1, inline = "h2a")
+h02c = input.int(6, "15M", group = grpH2, minval = 1, inline = "h2a")
+h02d = input.int(6, "1H",  group = grpH2, minval = 1, inline = "h2b")
+h02e = input.int(6, "4H",  group = grpH2, minval = 1, inline = "h2b")
+h02f = input.int(6, "1D",  group = grpH2, minval = 1, inline = "h2b")
+
+grpH3 = "③ Logic03 保持本数"
+h03a = input.int(6, "1M",  group = grpH3, minval = 1, inline = "h3a")
+h03b = input.int(6, "5M",  group = grpH3, minval = 1, inline = "h3a")
+h03c = input.int(6, "15M", group = grpH3, minval = 1, inline = "h3a")
+h03d = input.int(6, "1H",  group = grpH3, minval = 1, inline = "h3b")
+h03e = input.int(6, "4H",  group = grpH3, minval = 1, inline = "h3b")
+h03f = input.int(6, "1D",  group = grpH3, minval = 1, inline = "h3b")
+
+// ロジック別の保持本数リスト（TF順）
+HOLD01 = array.from(h01a, h01b, h01c, h01d, h01e, h01f)
+HOLD02 = array.from(h02a, h02b, h02c, h02d, h02e, h02f)
+HOLD03 = array.from(h03a, h03b, h03c, h03d, h03e, h03f)
+
+// 全ロジック分を1本の配列に連結（index = f_idx(logicIndex, tfIndex)）
+var HOLD_ALL = array.new_int(0)
+if array.size(HOLD_ALL) == 0
+    array.concat(HOLD_ALL, HOLD01)
+    array.concat(HOLD_ALL, HOLD02)
+    array.concat(HOLD_ALL, HOLD03)
+    // ★ロジック追加時はここに array.concat(HOLD_ALL, HOLD04) を1行追加
+
+// =====================================================================================
+// §4. LOGIC SIGNAL INPUT AREA  ―― ★後から各ロジックをここへ接続する
+// =====================================================================================
+// この関数は request.security() 経由で「各時間足のコンテキスト」で実行されます。
+// つまりここに書いた close / high / ta.ema() などは、自動的にその時間足の値になります。
+// MTF対応のために特別なことをする必要はありません。
+//
+//   Logic01 → 将来 FVG
+//   Logic02 → 将来 EMA
+//   Logic03 → 将来 TrendLine
+//
+// 戻り値は「LONGビットマスク」「SHORTビットマスク」の2値です。
+// 全ロジックを2つの数値へ圧縮して1回の request.security() で運ぶことで、
+// ロジックを20個に増やしても request 呼び出しは6回（TF数）のまま済みます。
+
+// 動作確認用のダミーシグナル（実ロジック接続後は OFF にする）
+grpDemo = "④ 動作確認 (ダミーシグナル)"
+useDemo = input.bool(false, "ダミーシグナルで動作確認する", group = grpDemo,
+     tooltip = "保持 / 切替 / 集計が正しく動くか確認するための擬似シグナルです。実ロジックではありません。")
+
+f_signalMasks() =>
+    // -------------------------------------------------------------------------------
+    // ▼▼▼ ここから：各ロジックの LONG / SHORT 判定を書く ▼▼▼
+    // -------------------------------------------------------------------------------
+    // Logic01（将来 FVG）
+    bool l01Long  = useDemo and bar_index % 37 == 0
+    bool l01Short = useDemo and bar_index % 53 == 0
+
+    // Logic02（将来 EMA）
+    bool l02Long  = useDemo and bar_index % 41 == 0
+    bool l02Short = useDemo and bar_index % 29 == 0
+
+    // Logic03（将来 TrendLine）
+    bool l03Long  = useDemo and bar_index % 61 == 0
+    bool l03Short = useDemo and bar_index % 23 == 0
+
+    // ★ロジック追加時はここに l04Long / l04Short を定義する
+    // -------------------------------------------------------------------------------
+    // ▲▲▲ ここまで ▲▲▲
+    // -------------------------------------------------------------------------------
+
+    // 並び順がロジック番号（0, 1, 2, ...）になります。N_LOGIC と個数を必ず一致させること。
+    longs  = array.from(l01Long,  l02Long,  l03Long)
+    shorts = array.from(l01Short, l02Short, l03Short)
+
+    float lm = 0.0
+    float sm = 0.0
+    for i = 0 to array.size(longs) - 1
+        float bit = math.pow(2, i)
+        lm += array.get(longs,  i) ? bit : 0.0
+        sm += array.get(shorts, i) ? bit : 0.0
+    [lm, sm]
+
+// ビットマスクから「ロジック番号 idx」のフラグを取り出す
+f_bitOn(mask, idx) =>
+    na(mask) ? false : math.floor(mask / math.pow(2, idx)) % 2 > 0.5
+
+// =====================================================================================
+// §5. MTF 取得（リペイント / 未来参照 対策）
+// =====================================================================================
+// ・lookahead は必ず barmerge.lookahead_off（未来参照の禁止）
+// ・さらに [1]（1本前）を参照して「確定足のみ」を扱う
+//   → 形成中の足を使わないので、リアルタイムでも再読込後でも値が変わりません
+// ・time[1] も一緒に取得し、「そのTFの新しい確定足が来た瞬間」を検出します
+//   （＝保持本数のカウントを、そのTFの足で1本ずつ進めるため）
+//
+// 【注意】チャートの時間足より小さいTFを集計する場合（例：日足チャートで1M）、
+//        request.security() はそのチャート足に含まれる最後の1M足しか返せません。
+//        正確に集計したい場合は、集計対象の最小TF以下のチャートで表示してください。
+f_htfPacket() =>
+    [lmRaw, smRaw] = f_signalMasks()
+    float lm = nz(lmRaw)
+    float sm = nz(smRaw)
+    int   tt = time
+    [lm[1], sm[1], tt[1]]
+
+// TFの数だけ明示的に展開（request.security() をループ内で呼ばないため）
+[lm1, sm1, tt1] = request.security(syminfo.tickerid, tfStr1, f_htfPacket(), lookahead = barmerge.lookahead_off)
+[lm2, sm2, tt2] = request.security(syminfo.tickerid, tfStr2, f_htfPacket(), lookahead = barmerge.lookahead_off)
+[lm3, sm3, tt3] = request.security(syminfo.tickerid, tfStr3, f_htfPacket(), lookahead = barmerge.lookahead_off)
+[lm4, sm4, tt4] = request.security(syminfo.tickerid, tfStr4, f_htfPacket(), lookahead = barmerge.lookahead_off)
+[lm5, sm5, tt5] = request.security(syminfo.tickerid, tfStr5, f_htfPacket(), lookahead = barmerge.lookahead_off)
+[lm6, sm6, tt6] = request.security(syminfo.tickerid, tfStr6, f_htfPacket(), lookahead = barmerge.lookahead_off)
+
+MASK_LONG  = array.from(nz(lm1), nz(lm2), nz(lm3), nz(lm4), nz(lm5), nz(lm6))
+MASK_SHORT = array.from(nz(sm1), nz(sm2), nz(sm3), nz(sm4), nz(sm5), nz(sm6))
+TF_TIME    = array.from(nz(tt1), nz(tt2), nz(tt3), nz(tt4), nz(tt5), nz(tt6))
+
+// =====================================================================================
+// §6. 状態管理エンジン（★LONG→SHORT 切替はここで処理）
+// =====================================================================================
+// 状態と残り保持本数は1次元配列で保持する（index = f_idx(logicIndex, tfIndex)）。
+// 「どのロジックが、どのTFで、LONG / SHORT / NONE か」が常に分かる形なので、
+// 将来のロジック詳細テーブル（§8下段）もこの配列を読むだけで作れます。
+var ST_STATE    = array.new_int(N_LOGIC * N_TF, ST_NONE)  // NONE / LONG / SHORT
+var ST_HOLD     = array.new_int(N_LOGIC * N_TF, 0)        // 残り保持本数
+var LAST_TFTIME = array.new_int(N_TF, 0)                  // TFごとの最終確定足の時刻
+
+grpRule = "⑤ 状態管理ルール"
+conflictStr = input.string("無視 (現状維持)", "同一ロジック・同一TFで両方向が同時発生した時",
+     options = ["無視 (現状維持)", "LONG優先", "SHORT優先"], group = grpRule)
+conflictMode = conflictStr == "LONG優先" ? CONF_LONG : conflictStr == "SHORT優先" ? CONF_SHORT : CONF_IGNORE
+
+// -------------------------------------------------------------------------------------
+// 状態遷移の中核。すべてのロジック・すべてのTFがこの1関数だけを通ります。
+// ロジックを何個増やしてもこの関数は変更不要です。
+//
+//   NONE       --LONG-->        LONG        保持本数をセット
+//   LONG       --LONG-->        LONG        ポイントは加算せず「保持期限だけリセット」
+//   LONG       --SHORT-->       SHORT       旧方向(LONG)を即解除して切替。保持は0から開始
+//   SHORT      --SHORT-->       SHORT       保持期限だけリセット
+//   SHORT      --LONG-->        LONG        旧方向(SHORT)を即解除して切替
+//   LONG/SHORT --シグナル無し--> 残り-1、0になったら NONE
+//
+// state は常に単一値なので、同一ロジック・同一TFで LONG と SHORT を同時に持つことは
+// 構造的に起こり得ません。ポイントの二重加算も起こりません。
+// -------------------------------------------------------------------------------------
+f_applySignal(stateArr, holdArr, k, sigLongRaw, sigShortRaw, holdBars, cMode) =>
+    int  st = array.get(stateArr, k)
+    int  hd = array.get(holdArr,  k)
+    bool sigLong  = sigLongRaw
+    bool sigShort = sigShortRaw
+
+    // 両方向が同時に来た場合の裁定（同時保持は禁止なので、寄せるか無視する）
+    if sigLong and sigShort
+        sigLong  := cMode == CONF_LONG
+        sigShort := cMode == CONF_SHORT
+
+    if sigLong
+        st := ST_LONG      // SHORT 保持中なら、ここで SHORT が即解除され LONG へ切替わる
+        hd := holdBars     // 同方向の再発生なら「期限リセット」だけになる
+    else if sigShort
+        st := ST_SHORT     // LONG 保持中なら、ここで LONG が即解除され SHORT へ切替わる
+        hd := holdBars
+    else if st != ST_NONE
+        // シグナル無し：そのTFの確定足が1本進むごとに保持本数を消化
+        hd := hd - 1
+        if hd <= 0
+            st := ST_NONE
+            hd := 0
+
+    array.set(stateArr, k, st)
+    array.set(holdArr,  k, hd)
+
+// -------------------------------------------------------------------------------------
+// 全TF × 全ロジックの状態更新
+// 更新は「そのTFの確定足が新しくなった瞬間」だけ実行する（チャート足ごとには進めない）
+// → 保持本数“6本”は、常にそのTF自身の6本を意味します
+// -------------------------------------------------------------------------------------
+for ti = 0 to N_TF - 1
+    int tNow = array.get(TF_TIME, ti)
+    if tNow > array.get(LAST_TFTIME, ti)
+        array.set(LAST_TFTIME, ti, tNow)
+        float lmask = array.get(MASK_LONG,  ti)
+        float smask = array.get(MASK_SHORT, ti)
+        for li = 0 to N_LOGIC - 1
+            int k = f_idx(li, ti)
+            f_applySignal(ST_STATE, ST_HOLD, k, f_bitOn(lmask, li), f_bitOn(smask, li), array.get(HOLD_ALL, k), conflictMode)
+
+// =====================================================================================
+// §7. ポイント集計
+// =====================================================================================
+// ポイント = ロジックWeight × 時間足Weight
+// LONG と SHORT は完全に独立集計（別ロジックであれば同時に立って構わない）
+TF_LONG  = array.new_float(N_TF, 0.0)
+TF_SHORT = array.new_float(N_TF, 0.0)
+
+float longScore  = 0.0
+float shortScore = 0.0
+
+for ti = 0 to N_TF - 1
+    float tw   = array.get(TF_WEIGHT, ti)
+    float sumL = 0.0
+    float sumS = 0.0
+    for li = 0 to N_LOGIC - 1
+        int   st = array.get(ST_STATE, f_idx(li, ti))
+        float pt = array.get(LOGIC_WEIGHT, li) * tw   // ← ロジックWeight × 時間足Weight
+        if st == ST_LONG
+            sumL += pt
+        else if st == ST_SHORT
+            sumS += pt
+    array.set(TF_LONG,  ti, sumL)
+    array.set(TF_SHORT, ti, sumS)
+    longScore  += sumL
+    shortScore += sumS
+
+float netScore = longScore - shortScore
+
+// 他スクリプトからの参照 / データウィンドウでの確認用
+plot(longScore,  "LONG SCORE",  display = display.data_window)
+plot(shortScore, "SHORT SCORE", display = display.data_window)
+plot(netScore,   "NET SCORE",   display = display.data_window)
+
+// =====================================================================================
+// §8. テーブル表示
+// =====================================================================================
+grpView = "⑥ 表示設定"
+showMain   = input.bool(true,  "スコアテーブルを表示 (右上)", group = grpView)
+showDetail = input.bool(false, "ロジック詳細テーブルを表示 (右下)", group = grpView,
+     tooltip = "どのロジックが、どのTFで LONG / SHORT を保持中かの一覧。括弧内は残り保持本数。")
+tblSize    = input.string(size.small, "文字サイズ",
+     options = [size.tiny, size.small, size.normal, size.large], group = grpView)
+decimals   = input.int(2, "小数点桁数", minval = 0, maxval = 3, group = grpView)
+
+colLong  = input.color(color.new(#26a69a, 0),  "LONG 色",  group = grpView, inline = "col")
+colShort = input.color(color.new(#ef5350, 0),  "SHORT 色", group = grpView, inline = "col")
+colBg    = input.color(color.new(#1e222d, 20), "背景色",   group = grpView)
+colTxt   = input.color(color.new(#d1d4dc, 0),  "文字色",   group = grpView)
+
+// 数値フォーマット（小数点桁数を input で切替）
+FMT = decimals == 0 ? "0" : decimals == 1 ? "0.0" : decimals == 2 ? "0.00" : "0.000"
+f_fmt(v) => str.tostring(v, FMT)
+f_fmtSigned(v) => (v > 0 ? "+" : v < 0 ? "-" : "") + str.tostring(math.abs(v), FMT)
+
+// 時間足コードを表示用ラベルへ（"60" → "1H" など）
+f_tfLabel(tf) =>
+    string s = str.upper(tf)
+    string r = switch s
+        "1"   => "1M"
+        "3"   => "3M"
+        "5"   => "5M"
+        "15"  => "15M"
+        "30"  => "30M"
+        "45"  => "45M"
+        "60"  => "1H"
+        "120" => "2H"
+        "180" => "3H"
+        "240" => "4H"
+        "360" => "6H"
+        "480" => "8H"
+        "720" => "12H"
+        "D"   => "1D"
+        "W"   => "1W"
+        "M"   => "1MO"
+        => s
+    r
+
+// ---- メインテーブル（右上）: TFごとの LONG / SHORT と TOTAL / NET --------------------
+var mainTbl = table.new(position.top_right, 3, N_TF + 3, border_width = 1)
+
+if showMain and barstate.islast
+    table.cell(mainTbl, 0, 0, "POINT MASTER", text_color = colTxt,   bgcolor = colBg, text_size = tblSize)
+    table.cell(mainTbl, 1, 0, "LONG",         text_color = colLong,  bgcolor = colBg, text_size = tblSize)
+    table.cell(mainTbl, 2, 0, "SHORT",        text_color = colShort, bgcolor = colBg, text_size = tblSize)
+
+    for ti = 0 to N_TF - 1
+        int   row = ti + 1
+        float lv  = array.get(TF_LONG,  ti)
+        float sv  = array.get(TF_SHORT, ti)
+        table.cell(mainTbl, 0, row, f_tfLabel(array.get(TF_LIST, ti)), text_color = colTxt, bgcolor = colBg, text_size = tblSize)
+        table.cell(mainTbl, 1, row, f_fmt(lv), text_color = lv > 0 ? colLong  : colTxt, bgcolor = colBg, text_size = tblSize)
+        table.cell(mainTbl, 2, row, f_fmt(sv), text_color = sv > 0 ? colShort : colTxt, bgcolor = colBg, text_size = tblSize)
+
+    int rTotal = N_TF + 1
+    table.cell(mainTbl, 0, rTotal, "TOTAL",           text_color = colTxt,   bgcolor = colBg, text_size = tblSize)
+    table.cell(mainTbl, 1, rTotal, f_fmt(longScore),  text_color = colLong,  bgcolor = colBg, text_size = tblSize)
+    table.cell(mainTbl, 2, rTotal, f_fmt(shortScore), text_color = colShort, bgcolor = colBg, text_size = tblSize)
+
+    int rNet = N_TF + 2
+    color netCol = netScore > 0 ? colLong : netScore < 0 ? colShort : colTxt
+    table.cell(mainTbl, 0, rNet, "NET", text_color = colTxt, bgcolor = colBg, text_size = tblSize)
+    table.cell(mainTbl, 1, rNet, f_fmtSigned(netScore), text_color = netCol, bgcolor = colBg, text_size = tblSize)
+    table.cell(mainTbl, 2, rNet, "",    text_color = colTxt, bgcolor = colBg, text_size = tblSize)
+
+// ---- 詳細テーブル（右下）: ロジック × TF の状態一覧 ---------------------------------
+// 内部状態（ST_STATE / ST_HOLD）をそのまま表示しているだけなので、
+// ロジックを増やせば行が自動的に増えます（コード変更不要）。
+var detailTbl = table.new(position.bottom_right, N_TF + 1, N_LOGIC + 1, border_width = 1)
+
+if showDetail and barstate.islast
+    table.cell(detailTbl, 0, 0, "LOGIC / TF", text_color = colTxt, bgcolor = colBg, text_size = tblSize)
+    for ti = 0 to N_TF - 1
+        table.cell(detailTbl, ti + 1, 0, f_tfLabel(array.get(TF_LIST, ti)), text_color = colTxt, bgcolor = colBg, text_size = tblSize)
+    for li = 0 to N_LOGIC - 1
+        table.cell(detailTbl, 0, li + 1, array.get(LOGIC_NAME, li), text_color = colTxt, bgcolor = colBg, text_size = tblSize)
+        for ti = 0 to N_TF - 1
+            int    st  = array.get(ST_STATE, f_idx(li, ti))
+            int    hd  = array.get(ST_HOLD,  f_idx(li, ti))
+            string txt = st == ST_LONG ? "L(" + str.tostring(hd) + ")" : st == ST_SHORT ? "S(" + str.tostring(hd) + ")" : "-"
+            color  c   = st == ST_LONG ? colLong : st == ST_SHORT ? colShort : colTxt
+            table.cell(detailTbl, ti + 1, li + 1, txt, text_color = c, bgcolor = colBg, text_size = tblSize)
+
+// =====================================================================================
+// §9. アラート土台
+// =====================================================================================
+// 実売買ロジック（エントリー / SL / TP）は未実装。スコアのしきい値だけ用意しています。
+// longScore / shortScore / netScore は §7 で確定済みの変数としてここから参照できます。
+grpAlert = "⑦ アラート"
+thLong  = input.float(5.0, "LONG SCORE >= ",  group = grpAlert, step = 0.1)
+thShort = input.float(5.0, "SHORT SCORE >= ", group = grpAlert, step = 0.1)
+thNet   = input.float(5.0, "|NET SCORE| >= ", group = grpAlert, step = 0.1)
+
+bool alertLongHit  = longScore  >= thLong
+bool alertShortHit = shortScore >= thShort
+bool alertNetUp    = netScore   >=  thNet
+bool alertNetDown  = netScore   <= -thNet
+
+alertcondition(alertLongHit,  "LONG SCORE 到達",  "POINT MASTER : LONG SCORE がしきい値に到達しました")
+alertcondition(alertShortHit, "SHORT SCORE 到達", "POINT MASTER : SHORT SCORE がしきい値に到達しました")
+alertcondition(alertNetUp,    "NET SCORE 上抜け", "POINT MASTER : NET SCORE が +しきい値に到達しました")
+alertcondition(alertNetDown,  "NET SCORE 下抜け", "POINT MASTER : NET SCORE が -しきい値に到達しました")
