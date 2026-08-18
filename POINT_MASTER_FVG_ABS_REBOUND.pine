@@ -28,6 +28,13 @@
 //   Logic26以降 = 未使用（下の4ステップで追加）
 // 共通基盤（MTF / 状態管理 / 保持 / Weight / 集計 / テーブル / アラート）は原本のままです。
 //
+// 【★5分足チャート専用】
+//   1M（TFスロット1）は request.security_lower_tf() で「その5分足に含まれる確定1分足すべて」を
+//   取得し、§6 で1本ずつ時系列順に状態管理エンジンへ流します（イベントの取りこぼしなし）。
+//   5M / 15M / 1H / 4H / 1D は従来どおり request.security() + [1] + lookahead_on です。
+//   最終的な LONG / SHORT / NET SCORE は5分足確定時点の全TF状態で決まります。
+//   5分足以外のチャートで使うと、画面左下に警告テーブルを表示します。
+//
 //   ポイント計算式 :  ロジックWeight × 時間足Weight
 //   集計           :  LONG SCORE / SHORT SCORE / NET SCORE ( = LONG - SHORT )
 //   状態管理       :  同一ロジック × 同一TF は NONE / LONG / SHORT の3状態のみ
@@ -44,7 +51,8 @@
 //
 // 【MTF計算エンジンは3分割】（§5・external elements 254個制限の回避）
 //   Engine A = Logic01〜12 / Engine B = Logic13〜18 / Engine C = Logic19〜25
-//   request.security() は 6TF × 3Engine = 18回。Engineが増えたら §5 に6行足すだけです。
+//   データ取得は 1M = request.security_lower_tf() × 3Engine（5分足内の全確定1分足を配列で取得）、
+//   5M〜1D = request.security() × 3Engine × 5TF = 15回。Engineが増えたら §5 に同じ形で足します。
 // =====================================================================================
 indicator(
      title         = "POINT MASTER FVG ABS REBOUND",
@@ -3293,11 +3301,13 @@ f_bitOn(mask, idx) =>
 //   Logic23 の時点で285になり上限を超えました（パラメータを配列へ束ねても、その配列を作る
 //   元 input まで依存関係として展開されるため、外部要素は減りません）。
 //   そこでロジックを Engine A / B / C の3グループへ分割し、TFごとに Engine ごとの
-//   request.security() を発行します（6TF × 3Engine = 18回）。
+//   request.security() を発行します（5M〜1D の5TF × 3Engine = 15回。1M は下の
+//   request.security_lower_tf() × 3Engine で、その5分足に含まれる確定1分足すべてを取得します）。
 //   1本あたりの外部要素は Engine A ≒60 / Engine B ≒165 / Engine C ≒70 程度になり、
 //   254 に対して十分な余裕ができます。将来 Engine D を足す場合も同じ形で増やせます。
 //   ★ [1] + lookahead_on の非リペイント方式は3Engineとも同一で、変更していません。
 //   ★ 確定足の時刻 tt は Engine A のパケットだけで取得します（同じTFなのでA/B/Cで同一）。
+// 上位足コンテキストで [1]（＝直近の確定足）を返すパケット（5M / 15M / 1H / 4H / 1D 用）
 f_htfPacketA() =>
     [lmRaw, smRaw] = f_signalMasksA()
     float lm = nz(lmRaw)
@@ -3318,22 +3328,52 @@ f_htfPacketC() =>
     float im = nz(imRaw)
     [lm[1], sm[1], im[1]]   // ★この [1] は必須（Fib解除マスクも同じ確定足の値）
 
+// -------------------------------------------------------------------------------------
+// 【1M（TFスロット1）だけ request.security_lower_tf() で全確定足を取得】
+// -------------------------------------------------------------------------------------
+// チャートは5分足前提です。5分足1本の中には1分足が5本あるため、通常の request.security()
+// では「そのチャート足に含まれる最後の1分足」しか返らず、途中の1分足イベントを取りこぼします。
+// そこで1Mだけ request.security_lower_tf() を使い、その5分足に含まれる確定1分足すべてを
+// 配列で受け取り、§6 で1本ずつ時系列順に状態管理エンジンへ流します。
+//   ・OR集約（5本のどれかでLONGが出たか）にはしません。順番・保持・反転をすべて保ちます。
+//   ・[1] は使いません。request.security_lower_tf() は確定済みの下位足だけを返すためです
+//     （形成中の1分足は配列に含まれません → 未来参照なし・非リペイント）。
+//   ・各1分足の time も同時に取得し、§6 で「同じ1分足を二度処理しない」判定に使います。
+f_ltfPacketA() =>
+    [lmRaw, smRaw] = f_signalMasksA()
+    [nz(lmRaw), nz(smRaw), time]
+
+f_ltfPacketB() =>
+    [lmRaw, smRaw] = f_signalMasksB()
+    [nz(lmRaw), nz(smRaw)]
+
+f_ltfPacketC() =>
+    [lmRaw, smRaw, imRaw] = f_signalMasksC()
+    [nz(lmRaw), nz(smRaw), nz(imRaw)]
+
+// チャートTFより上位のTFを request.security_lower_tf() へ渡すとエラーになるため、保険として
+// 「1M がチャートTF以下のときだけ tfStr1、そうでなければチャートTF自身」を要求します。
+// 5分足チャート（本来の使い方）では常に tfStr1（= 1M）がそのまま使われます。
+ltfStr1 = timeframe.in_seconds(tfStr1) <= timeframe.in_seconds() ? tfStr1 : timeframe.period
+
+[LTF_LM_A, LTF_SM_A, LTF_TIME] = request.security_lower_tf(syminfo.tickerid, ltfStr1, f_ltfPacketA())
+[LTF_LM_B, LTF_SM_B]           = request.security_lower_tf(syminfo.tickerid, ltfStr1, f_ltfPacketB())
+[LTF_LM_C, LTF_SM_C, LTF_IM_C] = request.security_lower_tf(syminfo.tickerid, ltfStr1, f_ltfPacketC())
+
 // TF × Engine の数だけ明示的に展開（request.security() をループ内で呼ばないため）
-[lmA1, smA1, tt1] = request.security(syminfo.tickerid, tfStr1, f_htfPacketA(), lookahead = barmerge.lookahead_on)
+// ※ TFスロット1（1M）は上の request.security_lower_tf() で取得するため、ここには含めません。
 [lmA2, smA2, tt2] = request.security(syminfo.tickerid, tfStr2, f_htfPacketA(), lookahead = barmerge.lookahead_on)
 [lmA3, smA3, tt3] = request.security(syminfo.tickerid, tfStr3, f_htfPacketA(), lookahead = barmerge.lookahead_on)
 [lmA4, smA4, tt4] = request.security(syminfo.tickerid, tfStr4, f_htfPacketA(), lookahead = barmerge.lookahead_on)
 [lmA5, smA5, tt5] = request.security(syminfo.tickerid, tfStr5, f_htfPacketA(), lookahead = barmerge.lookahead_on)
 [lmA6, smA6, tt6] = request.security(syminfo.tickerid, tfStr6, f_htfPacketA(), lookahead = barmerge.lookahead_on)
 
-[lmB1, smB1] = request.security(syminfo.tickerid, tfStr1, f_htfPacketB(), lookahead = barmerge.lookahead_on)
 [lmB2, smB2] = request.security(syminfo.tickerid, tfStr2, f_htfPacketB(), lookahead = barmerge.lookahead_on)
 [lmB3, smB3] = request.security(syminfo.tickerid, tfStr3, f_htfPacketB(), lookahead = barmerge.lookahead_on)
 [lmB4, smB4] = request.security(syminfo.tickerid, tfStr4, f_htfPacketB(), lookahead = barmerge.lookahead_on)
 [lmB5, smB5] = request.security(syminfo.tickerid, tfStr5, f_htfPacketB(), lookahead = barmerge.lookahead_on)
 [lmB6, smB6] = request.security(syminfo.tickerid, tfStr6, f_htfPacketB(), lookahead = barmerge.lookahead_on)
 
-[lmC1, smC1, imC1] = request.security(syminfo.tickerid, tfStr1, f_htfPacketC(), lookahead = barmerge.lookahead_on)
 [lmC2, smC2, imC2] = request.security(syminfo.tickerid, tfStr2, f_htfPacketC(), lookahead = barmerge.lookahead_on)
 [lmC3, smC3, imC3] = request.security(syminfo.tickerid, tfStr3, f_htfPacketC(), lookahead = barmerge.lookahead_on)
 [lmC4, smC4, imC4] = request.security(syminfo.tickerid, tfStr4, f_htfPacketC(), lookahead = barmerge.lookahead_on)
@@ -3341,14 +3381,15 @@ f_htfPacketC() =>
 [lmC6, smC6, imC6] = request.security(syminfo.tickerid, tfStr6, f_htfPacketC(), lookahead = barmerge.lookahead_on)
 
 // Engineごとのマスク（index = TFスロット）
-MASK_LONG_A  = array.from(nz(lmA1), nz(lmA2), nz(lmA3), nz(lmA4), nz(lmA5), nz(lmA6))
-MASK_SHORT_A = array.from(nz(smA1), nz(smA2), nz(smA3), nz(smA4), nz(smA5), nz(smA6))
-MASK_LONG_B  = array.from(nz(lmB1), nz(lmB2), nz(lmB3), nz(lmB4), nz(lmB5), nz(lmB6))
-MASK_SHORT_B = array.from(nz(smB1), nz(smB2), nz(smB3), nz(smB4), nz(smB5), nz(smB6))
-MASK_LONG_C  = array.from(nz(lmC1), nz(lmC2), nz(lmC3), nz(lmC4), nz(lmC5), nz(lmC6))
-MASK_SHORT_C = array.from(nz(smC1), nz(smC2), nz(smC3), nz(smC4), nz(smC5), nz(smC6))
-MASK_INV_C   = array.from(nz(imC1), nz(imC2), nz(imC3), nz(imC4), nz(imC5), nz(imC6))
-TF_TIME      = array.from(nz(tt1),  nz(tt2),  nz(tt3),  nz(tt4),  nz(tt5),  nz(tt6))
+// ※ index 0（1M）は request.security_lower_tf() の配列で処理するため、ここでは 0 のまま使いません。
+MASK_LONG_A  = array.from(0.0, nz(lmA2), nz(lmA3), nz(lmA4), nz(lmA5), nz(lmA6))
+MASK_SHORT_A = array.from(0.0, nz(smA2), nz(smA3), nz(smA4), nz(smA5), nz(smA6))
+MASK_LONG_B  = array.from(0.0, nz(lmB2), nz(lmB3), nz(lmB4), nz(lmB5), nz(lmB6))
+MASK_SHORT_B = array.from(0.0, nz(smB2), nz(smB3), nz(smB4), nz(smB5), nz(smB6))
+MASK_LONG_C  = array.from(0.0, nz(lmC2), nz(lmC3), nz(lmC4), nz(lmC5), nz(lmC6))
+MASK_SHORT_C = array.from(0.0, nz(smC2), nz(smC3), nz(smC4), nz(smC5), nz(smC6))
+MASK_INV_C   = array.from(0.0, nz(imC2), nz(imC3), nz(imC4), nz(imC5), nz(imC6))
+TF_TIME      = array.from(0,   nz(tt2),  nz(tt3),  nz(tt4),  nz(tt5),  nz(tt6))
 
 // =====================================================================================
 // §6. 状態管理エンジン（★LONG→SHORT 切替はここで処理）
@@ -3419,41 +3460,72 @@ f_applySignal(stateArr, holdArr, k, sigLongRaw, sigShortRaw, holdBars, cMode) =>
     array.set(holdArr,  k, hd)
 
 // -------------------------------------------------------------------------------------
-// 全TF × 全ロジックの状態更新
-// 更新は「そのTFの確定足が新しくなった瞬間」だけ実行する（チャート足ごとには進めない）
-// → 保持本数“6本”は、常にそのTF自身の6本を意味します
+// 1TFスロット分のマスクを全ロジックへ適用する（1回の呼び出し = そのTFの確定足1本ぶん）
 // -------------------------------------------------------------------------------------
-for ti = 0 to N_TF - 1
+// Engine内ビット位置 → 元のロジック番号 li への対応
+//   li 0〜11  = Engine A の bit 0〜11 （Logic01〜12）
+//   li 12〜17 = Engine B の bit 0〜5  （Logic13〜18）
+//   li 18〜24 = Engine C の bit 0〜6  （Logic19〜25）
+// 1M は request.security_lower_tf() で得た1分足1本ごとに、5M以上はそのTFの確定足ごとに
+// この関数を呼びます（呼ぶ回数だけ ST_HOLD が1本ぶん進みます）。
+f_applyTfMasks(ti, lmA, smA, lmB, smB, lmC, smC, imC) =>
+    for li = 0 to N_LOGIC - 1
+        int k = f_idx(li, ti)
+        bool sigLong  = li < ENG_A_N ? f_bitOn(lmA, li) : li < ENG_A_N + ENG_B_N ? f_bitOn(lmB, li - ENG_A_N) : f_bitOn(lmC, li - ENG_A_N - ENG_B_N)
+        bool sigShort = li < ENG_A_N ? f_bitOn(smA, li) : li < ENG_A_N + ENG_B_N ? f_bitOn(smB, li - ENG_A_N) : f_bitOn(smC, li - ENG_A_N - ENG_B_N)
+        if array.get(IS_STATE_LOGIC, li)
+            // 状態型ロジック（Logic24 Alice Band Bias）：保持本数を使わず現在状態をそのまま反映
+            array.set(ST_STATE, k, sigLong ? ST_LONG : sigShort ? ST_SHORT : ST_NONE)
+            array.set(ST_HOLD,  k, 0)
+        else
+            f_applySignal(ST_STATE, ST_HOLD, k, sigLong, sigShort, array.get(HOLD_ALL, k), conflictMode)
+        // Fibグループ専用の解除（深いFib到達 → 浅いFibロジックの保持を解除）。
+        // 解除マスクは Engine C だけが返し、その中でも Logic21〜23 のビットしか立たないため、
+        // Logic01〜20 には影響しません。1M では各1分足の時点で即解除されます。
+        if li >= ENG_A_N + ENG_B_N and f_bitOn(imC, li - ENG_A_N - ENG_B_N)
+            array.set(ST_STATE, k, ST_NONE)
+            array.set(ST_HOLD,  k, 0)
+    N_LOGIC
+
+// -------------------------------------------------------------------------------------
+// ① 1M（TFスロット0）: この5分足に含まれる確定1分足を「時系列順に1本ずつ」再生する
+// -------------------------------------------------------------------------------------
+// ・OR集約や「最後の1分足だけ」ではありません。1本目→5本目の順で状態を更新します。
+//   例) 10:01 LONG → 10:02 無し(保持-1) → 10:03 SHORTへ切替 → 10:04 保持-1 → 10:05 LONGへ切替
+// ・保持本数もこのループで1分足1本ずつ消化されるため、1M = 10本 は本当に1分足10本です。
+// ・LAST_TFTIME[0] に「最後に処理した1分足の時刻」を保存し、リアルタイムで同じ5分足が
+//   何度も再計算されても、同じ確定1分足を二度処理しません。
+// ・Alice Band（状態型）も各1分足ごとに更新されるため、5分足確定時点では
+//   「最後に確定した1分足のAlice状態」が ST_STATE に入ります。
+int _ltfN = array.size(LTF_TIME)
+if _ltfN > 0
+    int _nA = array.size(LTF_LM_A)
+    int _nB = array.size(LTF_LM_B)
+    int _nC = array.size(LTF_LM_C)
+    for _i = 0 to _ltfN - 1
+        int _t = array.get(LTF_TIME, _i)
+        if not na(_t) and _t > array.get(LAST_TFTIME, 0) and _i < _nA and _i < _nB and _i < _nC
+            array.set(LAST_TFTIME, 0, _t)
+            f_applyTfMasks(0,
+                 nz(array.get(LTF_LM_A, _i)), nz(array.get(LTF_SM_A, _i)),
+                 nz(array.get(LTF_LM_B, _i)), nz(array.get(LTF_SM_B, _i)),
+                 nz(array.get(LTF_LM_C, _i)), nz(array.get(LTF_SM_C, _i)),
+                 nz(array.get(LTF_IM_C, _i)))
+
+// -------------------------------------------------------------------------------------
+// ② 5M / 15M / 1H / 4H / 1D（TFスロット1〜5）: 従来どおり確定足が新しくなった瞬間だけ更新
+// -------------------------------------------------------------------------------------
+// 更新は「そのTFの確定足が新しくなった瞬間」だけ実行する（チャート足ごとには進めない）
+// → 保持本数“4本”は、常にそのTF自身の4本を意味します
+for ti = 1 to N_TF - 1
     int tNow = array.get(TF_TIME, ti)
     if tNow > array.get(LAST_TFTIME, ti)
         array.set(LAST_TFTIME, ti, tNow)
-        float lmA = array.get(MASK_LONG_A,  ti)
-        float smA = array.get(MASK_SHORT_A, ti)
-        float lmB = array.get(MASK_LONG_B,  ti)
-        float smB = array.get(MASK_SHORT_B, ti)
-        float lmC = array.get(MASK_LONG_C,  ti)
-        float smC = array.get(MASK_SHORT_C, ti)
-        float imC = array.get(MASK_INV_C,   ti)
-        for li = 0 to N_LOGIC - 1
-            int k = f_idx(li, ti)
-            // Engine内ビット位置 → 元のロジック番号 li への対応
-            //   li 0〜11  = Engine A の bit 0〜11 （Logic01〜12）
-            //   li 12〜17 = Engine B の bit 0〜5  （Logic13〜18）
-            //   li 18〜24 = Engine C の bit 0〜6  （Logic19〜25）
-            bool sigLong  = li < ENG_A_N ? f_bitOn(lmA, li) : li < ENG_A_N + ENG_B_N ? f_bitOn(lmB, li - ENG_A_N) : f_bitOn(lmC, li - ENG_A_N - ENG_B_N)
-            bool sigShort = li < ENG_A_N ? f_bitOn(smA, li) : li < ENG_A_N + ENG_B_N ? f_bitOn(smB, li - ENG_A_N) : f_bitOn(smC, li - ENG_A_N - ENG_B_N)
-            if array.get(IS_STATE_LOGIC, li)
-                // 状態型ロジック（Logic24 Alice Band Bias）：保持本数を使わず現在状態をそのまま反映
-                array.set(ST_STATE, k, sigLong ? ST_LONG : sigShort ? ST_SHORT : ST_NONE)
-                array.set(ST_HOLD,  k, 0)
-            else
-                f_applySignal(ST_STATE, ST_HOLD, k, sigLong, sigShort, array.get(HOLD_ALL, k), conflictMode)
-            // Fibグループ専用の解除（深いFib到達 → 浅いFibロジックの保持を解除）。
-            // 解除マスクは Engine C だけが返し、その中でも Logic21〜23 のビットしか立たないため、
-            // Logic01〜20 には影響しません。
-            if li >= ENG_A_N + ENG_B_N and f_bitOn(imC, li - ENG_A_N - ENG_B_N)
-                array.set(ST_STATE, k, ST_NONE)
-                array.set(ST_HOLD,  k, 0)
+        f_applyTfMasks(ti,
+             array.get(MASK_LONG_A,  ti), array.get(MASK_SHORT_A, ti),
+             array.get(MASK_LONG_B,  ti), array.get(MASK_SHORT_B, ti),
+             array.get(MASK_LONG_C,  ti), array.get(MASK_SHORT_C, ti),
+             array.get(MASK_INV_C,   ti))
 
 // =====================================================================================
 // §7. ポイント集計
@@ -3591,6 +3663,18 @@ if showDetail and barstate.islast
                          st == ST_SHORT ? "S" + f_fmt(pt) + " " + hold : "-"
             color  c   = st == ST_LONG ? colLong : st == ST_SHORT ? colShort : colTxt
             table.cell(detailTbl, ti + 1, li + 1, txt, text_color = c, bgcolor = colBg, text_size = tblSize)
+
+// ---- 5分足チャート専用の警告（左下） ---------------------------------------------
+// 1M は request.security_lower_tf() で「チャート足に含まれる確定1分足」を取得する方式なので、
+// このバージョンは5分足チャート専用です。別のTFで開いた場合は結果が想定と変わるため警告します
+// （runtime.error で止めず、警告表示だけにしています）。
+bool isChart5M = timeframe.in_seconds() == timeframe.in_seconds("5")
+var warnTbl = table.new(position.bottom_left, 1, 2, border_width = 1)
+if not isChart5M and barstate.islast
+    table.cell(warnTbl, 0, 0, "⚠ POINT MASTER は5分足チャート専用です",
+         text_color = color.new(#ffffff, 0), bgcolor = color.new(#b71c1c, 0), text_size = tblSize)
+    table.cell(warnTbl, 0, 1, "現在: " + timeframe.period + " → 5分足へ切り替えてください",
+         text_color = colTxt, bgcolor = colBg, text_size = tblSize)
 
 // =====================================================================================
 // §9. アラート土台
