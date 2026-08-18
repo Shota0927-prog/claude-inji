@@ -1,0 +1,226 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © point_master
+
+//@version=5
+// =====================================================================================
+// POINT MASTER 90% Strategy  ―  LONG90 / SHORT90 シグナル単体の勝率検証用ストラテジー
+// =====================================================================================
+// POINT MASTER 本体（POINT_MASTER_FVG_ABS_REBOUND.pine）と
+// POINT MASTER Confidence Signal（POINT_MASTER_CONFIDENCE_SIGNAL.pine）とは
+// 完全に別のファイルです。どちらも変更していません。
+//
+// 本体が plot している「NET SCORE」だけを input.source() で受け取り、
+// Confidence Signal と同じ7段階判定（70% / 80% / 90%）を行い、
+//   ・新しく LONG 90% に到達した確定足 → LONG エントリー
+//   ・新しく SHORT 90% に到達した確定足 → SHORT エントリー
+// だけを検証します（70% / 80% / 格下げはエントリーに使いません）。
+//
+// 【使い方】
+//   1. チャートへ POINT MASTER 本体を追加する（NET SCORE が plot されています）
+//   2. チャートへ このストラテジーを追加する
+//   3. 設定 → 「POINT MASTER NET SCORE」で
+//      "POINT MASTER FVG ABS REBOUND : NET SCORE" を選択して接続する
+//   4. Strategy Tester で 総トレード数 / 勝率 / Profit Factor / 最大DD を確認する
+//
+// 【検証条件】
+//   エントリー : 90%到達が確定した足の終値（process_orders_on_close = true）
+//   SL         : 固定ドル幅（既定 10.0）
+//   TP         : SL幅 × RR（既定 RR = 2.0 → 20.0）
+//   決済       : SL または TP のみ（90%消失 / 70%未満 / 反対シグナル では決済しない）
+//   ポジション : 常に1つだけ（保有中の新規90%は同方向・反対方向とも無視・ドテンなし）
+//   数量       : 固定1
+//   手数料 / スリッページ : 0（Properties タブから変更できます）
+//
+// 【非リペイント】判定は確定足の NET SCORE のみ（barstate.isconfirmed）。
+//   形成中に一時的に NET が閾値を超えただけではエントリーしません。
+// =====================================================================================
+strategy(
+     title                   = "POINT MASTER 90% Strategy",
+     shorttitle              = "PM-90",
+     overlay                 = true,
+     pyramiding              = 0,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 0,
+     slippage                = 0,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false,
+     max_labels_count        = 500
+ )
+
+// =====================================================================================
+// §0. 入力
+// =====================================================================================
+grpSrc = "① 接続元"
+netSource = input.source(close, "POINT MASTER NET SCORE", group = grpSrc,
+     tooltip = "POINT MASTER 本体の NET SCORE を選択してください（NET SCORE = LONG SCORE - SHORT SCORE）。")
+useConfirmedOnly = input.bool(true, "確定足だけで判定する (非リペイント)", group = grpSrc)
+
+grpTh = "② 信頼度しきい値 (NET SCORE)"
+th70 = input.float(5.0,  "70% Threshold", group = grpTh, step = 0.1, minval = 0)
+th80 = input.float(7.0,  "80% Threshold", group = grpTh, step = 0.1, minval = 0)
+th90 = input.float(10.0, "90% Threshold", group = grpTh, step = 0.1, minval = 0)
+// ★ th70 < th80 < th90 を前提に判定します。
+
+grpDir = "③ 検証する方向"
+useLong  = input.bool(true, "LONG 90% を検証",  group = grpDir)
+useShort = input.bool(true, "SHORT 90% を検証", group = grpDir)
+
+grpRisk = "④ SL / TP"
+slFixed = input.float(10.0, "固定SL幅 ($)", group = grpRisk, step = 0.5, minval = 0.1)
+rrRatio = input.float(2.0,  "RR (TP = SL幅 × RR)", group = grpRisk, step = 0.1, minval = 0.1)
+
+grpView = "⑤ 表示"
+showTable  = input.bool(true, "勝率テーブルを表示", group = grpView)
+showLabels = input.bool(true, "エントリーラベルを表示", group = grpView)
+tblSize    = input.string(size.small, "文字サイズ",
+     options = [size.tiny, size.small, size.normal, size.large], group = grpView)
+colLongC  = input.color(color.new(#1b5e20, 0), "LONG 色",  group = grpView)
+colShortC = input.color(color.new(#b71c1c, 0), "SHORT 色", group = grpView)
+colTblBg  = input.color(color.new(#1e222d, 20), "背景色",  group = grpView)
+colTblTxt = input.color(color.new(#d1d4dc, 0),  "文字色",  group = grpView)
+
+// =====================================================================================
+// §1. 信頼度レベル判定（Confidence Signal と同一）
+// =====================================================================================
+//   +3 = LONG 90% / +2 = LONG 80% / +1 = LONG 70%
+//    0 = 70%未満（中立）
+//   -1 = SHORT 70% / -2 = SHORT 80% / -3 = SHORT 90%
+//
+//   NET >= +th90            → +3        NET <= -th90            → -3
+//   +th80 <= NET < +th90    → +2        -th90 <  NET <= -th80   → -2
+//   +th70 <= NET < +th80    → +1        -th80 <  NET <= -th70   → -1
+//   -th70 <  NET <  +th70   →  0（LONG / SHORT 完全対称）
+f_level(_net) =>
+    int _l = 0
+    if na(_net)
+        _l := 0
+    else if _net >= th90
+        _l := 3
+    else if _net >= th80
+        _l := 2
+    else if _net >= th70
+        _l := 1
+    else if _net <= -th90
+        _l := -3
+    else if _net <= -th80
+        _l := -2
+    else if _net <= -th70
+        _l := -1
+    _l
+
+// =====================================================================================
+// §2. 状態の更新（確定足ベース）
+// =====================================================================================
+int rawLevel = f_level(netSource)
+var int curLevel  = 0
+var int prevLevel = 0
+bool evalNow = not useConfirmedOnly or barstate.isconfirmed
+bool changed = false
+if evalNow
+    prevLevel := curLevel
+    curLevel  := rawLevel
+    changed   := curLevel != prevLevel
+
+// =====================================================================================
+// §3. 90%シグナル
+// =====================================================================================
+// 「新しく90%へ到達した確定足」だけ true。
+//   ・LONG80 → LONG90 / LONG70 → LONG90 / 中立 → LONG90 のいずれも対象
+//   ・SHORT90 → LONG90 の直接反転も LONG90 の新規シグナルとして扱う
+//   ・LONG90 → LONG80 → LONG90 と戻った場合も、再到達なので新しいシグナルになる
+//   ・同じ90%が続いている間は true になりません
+bool long90Signal  = changed and curLevel ==  3 and curLevel > prevLevel
+bool short90Signal = changed and curLevel == -3 and curLevel < prevLevel
+
+// =====================================================================================
+// §4. SL / TP（シグナル足の終値基準・固定SL + RR）
+// =====================================================================================
+float entryEst  = close
+float longStop  = entryEst - slFixed
+float longRisk  = entryEst - longStop            // = slFixed
+float longTP    = entryEst + longRisk * rrRatio
+float shortStop = entryEst + slFixed
+float shortRisk = shortStop - entryEst           // = slFixed
+float shortTP   = entryEst - shortRisk * rrRatio
+
+// =====================================================================================
+// §5. 発注（1シグナル = 1トレード / ドテンなし / 途中決済なし）
+// =====================================================================================
+// ポジションが無い時だけ新規エントリーします。保有中の新規90%は
+// 同方向・反対方向ともすべて無視し、SL または TP に到達するまで保有し続けます。
+bool flat = strategy.position_size == 0
+
+bool goLong  = long90Signal  and useLong  and flat and evalNow
+bool goShort = short90Signal and useShort and flat and evalNow
+
+if goLong
+    strategy.entry("L90", strategy.long, qty = 1)
+    strategy.exit("L90X", from_entry = "L90", stop = longStop, limit = longTP)
+
+if goShort
+    strategy.entry("S90", strategy.short, qty = 1)
+    strategy.exit("S90X", from_entry = "S90", stop = shortStop, limit = shortTP)
+
+// エントリー地点のラベル（表示用のみ・成績には影響しません）
+if showLabels and goLong
+    label.new(bar_index, na, "LONG 90%", yloc = yloc.belowbar, style = label.style_label_up,
+         color = colLongC, textcolor = color.white, size = size.small)
+if showLabels and goShort
+    label.new(bar_index, na, "SHORT 90%", yloc = yloc.abovebar, style = label.style_label_down,
+         color = colShortC, textcolor = color.white, size = size.small)
+
+// =====================================================================================
+// §6. データウィンドウ出力
+// =====================================================================================
+plot(netSource, "NET SCORE",  display = display.data_window)
+plot(curLevel,  "LEVEL CODE", display = display.data_window)
+
+// =====================================================================================
+// §7. 勝率テーブル（TradingView の決済済みトレードをそのまま集計）
+// =====================================================================================
+// strategy.closedtrades.* を読んでいるだけなので、Strategy Tester の結果とズレません。
+// 勝ち = 利益 > 0 / 負け = 利益 <= 0（引き分け 0 は負け側に含めています）。
+f_rate(_w, _t) =>
+    _t > 0 ? str.tostring(_w * 100.0 / _t, "0.0") + "%" : "-"
+
+var table statTbl = table.new(position.top_right, 4, 4, border_width = 1)
+if showTable and barstate.islast
+    int _lTrades = 0
+    int _lWins   = 0
+    int _sTrades = 0
+    int _sWins   = 0
+    if strategy.closedtrades > 0
+        for _i = 0 to strategy.closedtrades - 1
+            bool _isLong = strategy.closedtrades.size(_i) > 0
+            bool _isWin  = strategy.closedtrades.profit(_i) > 0
+            if _isLong
+                _lTrades += 1
+                _lWins   += _isWin ? 1 : 0
+            else
+                _sTrades += 1
+                _sWins   += _isWin ? 1 : 0
+    int _tTrades = _lTrades + _sTrades
+    int _tWins   = _lWins + _sWins
+
+    table.cell(statTbl, 0, 0, "PM 90%", text_color = colTblTxt,  bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 1, 0, "Trades", text_color = colTblTxt,  bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 2, 0, "Wins",   text_color = colTblTxt,  bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 3, 0, "WinRate", text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
+
+    table.cell(statTbl, 0, 1, "LONG", text_color = colLongC, bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 1, 1, str.tostring(_lTrades), text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 2, 1, str.tostring(_lWins),   text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 3, 1, f_rate(_lWins, _lTrades), text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
+
+    table.cell(statTbl, 0, 2, "SHORT", text_color = colShortC, bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 1, 2, str.tostring(_sTrades), text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 2, 2, str.tostring(_sWins),   text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 3, 2, f_rate(_sWins, _sTrades), text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
+
+    table.cell(statTbl, 0, 3, "TOTAL", text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 1, 3, str.tostring(_tTrades), text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 2, 3, str.tostring(_tWins),   text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 3, 3, f_rate(_tWins, _tTrades), text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
