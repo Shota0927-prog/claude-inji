@@ -245,7 +245,9 @@ rrRatio     = input.float(2.0, "リスクリワード比 (TP)")
 //  他市場 (Silver / DXY / 米金利) との関係からバイアス化する。
 //    各市場 × 各TF の状態 → スコア化 → TF重み × 市場重み → 合計 → Gold Long/Short Bias。
 //  ・Silver は Gold と同方向 (Lead / Confirm / Conflict / Divergence)。
-//  ・DXY / Yield は Gold と逆相関 (Direction / InverseCorrelation / Distortion / Return)。
+//  ・DXY / Yield / Oil は Gold と逆相関 (Direction / InverseCorrelation / Distortion / Return)。
+//    Distortion→Return は「正常逆相関 → 歪み → どちら側が歪んだか判定 → 逆相関へ復帰」
+//    という遷移を状態機械で検出し、復帰方向 (Original / Opposite) を別イベントとして扱う。
 //  ・市場個別ON/OFF。OFF市場はスコア0・request.security を呼ばない。全部OFFで完全素通し。
 //  ・状態保持: イベント発生後 各参照TFの本数だけ保持。反対イベントで即時切替。
 //    同方向条件が続くだけでは Hold開始バーを更新しない (毎バー再発火しない)。
@@ -301,6 +303,10 @@ imRecentLookback = input.int(3,  "直近確認 参照本数", minval = 1, group 
 imCorrLen        = input.int(20, "相関計算 期間",     minval = 2, group = grpIm)
 imCorrThreshold  = input.float(0.2, "逆相関しきい値 (|corr|>=)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpIm)
 imReturnLookback = input.int(3,  "歪み→復帰 判定本数", minval = 1, group = grpIm)
+imStructureLookback = input.int(5, "Intermarket 構造判定本数", minval = 1, group = grpIm)
+imDistortionRequireCorr = input.bool(true, "Distortion に直前の逆相関成立(corr)を要求", group = grpIm)
+useDistortionMinMove    = input.bool(true, "Distortion 最小変化率フィルターを使う", group = grpIm)
+goldDistortionMinChange = input.float(0.10, "Distortion Gold 最小変化率(%)", minval = 0.0, step = 0.05, group = grpIm)
 // --- Silver パターン (個別ON/OFF) ---
 useSilverLead          = input.bool(true,  "Silver A: Lead (先行)",       group = grpIm)
 useSilverConfirm       = input.bool(true,  "Silver B: Confirm (方向一致)", group = grpIm)
@@ -317,18 +323,21 @@ useDxyInverseCorrelation = input.bool(false, "DXY 逆相関フィルター",    
 useDxyDistortionNoTrade = input.bool(false, "DXY 歪み NoTrade",              group = grpIm)
 useDxyReturn           = input.bool(false, "DXY 逆相関復帰イベント",          group = grpIm)
 dxyMinChange = input.float(0.1, "DXY 最小変化率(%)", minval = 0.0, step = 0.05, group = grpIm)
+dxyDistortionMinChange = input.float(0.05, "Distortion DXY 最小変化率(%)", minval = 0.0, step = 0.05, group = grpIm)
 // --- Yield パターン (個別ON/OFF・DXYのデータは使わずYield単独) ---
 useYieldDirection        = input.bool(true,  "Yield 方向 (低下→Gold Long)",   group = grpIm)
 useYieldInverseCorrelation = input.bool(false, "Yield 逆相関フィルター",         group = grpIm)
 useYieldDistortionNoTrade = input.bool(false, "Yield 歪み NoTrade",           group = grpIm)
 useYieldReturn           = input.bool(false, "Yield 逆相関復帰イベント",        group = grpIm)
 yieldMinChange = input.float(0.1, "Yield 最小変化率(%)", minval = 0.0, step = 0.05, group = grpIm)
+yieldDistortionMinChange = input.float(0.05, "Distortion Yield 最小変化率(%)", minval = 0.0, step = 0.05, group = grpIm)
 // --- Oil パターン (個別ON/OFF・Goldと逆相関。DXY/Yieldと同構造) ---
 useOilDirection        = input.bool(true,  "Oil 方向 (下落→Gold Long)",     group = grpIm)
 useOilInverseCorrelation = input.bool(false, "Oil 逆相関フィルター",           group = grpIm)
 useOilDistortionNoTrade = input.bool(false, "Oil 歪み NoTrade",             group = grpIm)
 useOilReturn           = input.bool(false, "Oil 逆相関復帰イベント",          group = grpIm)
 oilMinChange = input.float(0.1, "Oil 最小変化率(%)", minval = 0.0, step = 0.05, group = grpIm)
+oilDistortionMinChange = input.float(0.05, "Distortion Oil 最小変化率(%)", minval = 0.0, step = 0.05, group = grpIm)
 // --- 状態保持本数 (足ごと。各参照TF自身の本数) ---
 imHoldDaily = input.int(3,  "日足 状態保持本数",  minval = 1, group = grpIm)
 imHold4H    = input.int(6,  "4H 状態保持本数",   minval = 1, group = grpIm)
@@ -343,6 +352,8 @@ intermarketNoTradeMode = input.string("ANY", "NoTrade結合", options = ["ANY", 
 // --- 表示 ---
 imShowTable = input.bool(true,  "Intermarketテーブルを表示", group = grpIm)
 imShowDebug = input.bool(false, "各市場×TFの詳細を表示", group = grpIm)
+imShowReturnTable   = input.bool(true, "Distortion/Return 詳細テーブルを表示", group = grpIm)
+imReturnTableMarket = input.string("DXY", "詳細テーブル 対象市場", options = ["DXY", "Yield", "Oil"], group = grpIm)
 
 
 
@@ -741,11 +752,19 @@ if useTrendEnv
 //  var (TF足カウンタ / 状態 / 歪み履歴) は各 (市場×TF) 呼び出しごとに独立。
 // ============================================================
 
-// 確定TF足の [変化率%, 直近変化率%, 終値] を返す (TFコンテキスト内で確定1本前[1])。
-f_imDataConfirmed(int len, int recentLen) =>
+// 確定TF足の [変化率%, 直近変化率%, 終値, 上昇構造維持, 下降構造維持] を返す。
+//   ・すべて TFコンテキスト内で確定1本前[1] に固定 (lookahead_on と組み合わせて非リペイント)。
+//   ・上昇構造維持 = 現在の終値が「直近 structLen 本の安値」を割っていない。
+//   ・下降構造維持 = 現在の終値が「直近 structLen 本の高値」を超えていない。
+//     直近 structLen 本は ta.lowest/ta.highest(...)[1] で当該足自身を除外して評価する。
+f_imDataConfirmed(int len, int recentLen, int structLen) =>
     float _chg    = (na(close[len])       or close[len] == 0)       ? 0.0 : (close - close[len])       / close[len]       * 100.0
     float _recent = (na(close[recentLen]) or close[recentLen] == 0) ? 0.0 : (close - close[recentLen]) / close[recentLen] * 100.0
-    [_chg[1], _recent[1], close[1]]
+    float _loN = ta.lowest(low,   structLen)[1]
+    float _hiN = ta.highest(high, structLen)[1]
+    bool  _structUp = not na(_loN) and close >= _loN
+    bool  _structDn = not na(_hiN) and close <= _hiN
+    [_chg[1], _recent[1], close[1], _structUp[1], _structDn[1]]
 
 // MTF相関: 各参照TFの確定足を「そのTF自身のバー単位」でバッファ蓄積し相関を計算する。
 //   ・チャート(5分足)へ展開後の series に ta.correlation(..., len) すると len が
@@ -825,52 +844,145 @@ f_silverState(bool active, bool newBar, int holdBars, float gChg, float sChg, fl
     int _outR = _act ? _reason : 0
     [_out, _outR, active and _conflict]
 
-// DXY / Yield 状態 (Goldと逆相関: Direction / InverseCorrelation / Distortion / Return)。
-//   Distortion = Goldと市場が同方向 (逆相関が崩れている) → NoTrade。
-//   Return = 歪み後に逆相関へ戻る「最初の足」だけイベント発火 (毎バー再発火しない)。
-//   戻り値 [score, reason(1/-1/0), noTrade]
-f_macroState(bool active, bool newBar, int holdBars, float gChg, float mChg, float corr, bool useDir, bool useCorr, bool useDistNT, bool useRet, float corrThresh, float dirMinChg, int retLookback, float eventPoint) =>
-    var int  _tfBar = 0
-    var int  _reason = 0
-    var int  _evBar = na
-    var bool _noTrade = false
-    var int  _lastDistortBar = na
-    var bool _inverseNowPrev = false
-    var int  _prevRawEvent = 0
+// DXY / Yield / Oil 状態 (Goldと逆相関)。
+//   Direction / InverseCorrelation は従来どおり。Distortion → Return を状態機械で管理する。
+//     Normal     : 通常 (逆相関 or 中立)
+//     Distortion : 「直前まで正常な逆相関」→「Goldと市場が同方向」へ崩れた状態 (NoTrade対象)
+//     Return     : Distortion から逆相関へ復帰した最初の確定TF足 (この1本だけイベント発火)
+//     Expired    : Distortion のまま retLookback 本を超過 (Returnイベントは出さない)
+//   Distortion 開始条件 (すべて必須):
+//     ・1本前の確定TF足が方向として逆相関 (Gold↑/市場↓ または Gold↓/市場↑)
+//     ・1本前の corr <= -corrThresh   (imDistortionRequireCorr = false で省略可)
+//     ・当該足で Goldと市場が同方向
+//     ・|Gold変化率| >= gMinMove かつ |市場変化率| >= mMinMove (useDistortionMinMove = true 時)
+//   Return方向は「実際に復帰した逆相関の向き」= Goldの向き。
+//     Gold↑ / 市場↓ → Long Return   /   Gold↓ / 市場↑ → Short Return
+//   Return種別は Distortion直前のGold方向との一致で分類。
+//     一致 → Original Return (元のGold方向へ復帰)
+//     不一致 → Opposite Return (Gold側が崩れて反対方向へ正常化)
+//   主導判定 (leader):
+//     Distortion開始時   … 直前方向を維持した側 (Gold維持=Gold主導 / 市場維持=市場主導)
+//     Distortion継続中   … Goldが「直前方向 + 構造維持」なら Gold主導、崩れたら 市場主導
+//   戻り値 [score, reason(1/-1/0), noTrade, state(0=Normal/1=Distortion/2=Return/3=Expired),
+//           preGoldDir(1/-1/0), returnType(0=なし/1=Original/2=Opposite), returnDir(1/-1/0),
+//           leader(1=Gold/-1=市場/0=不明)]
+f_macroState(bool active, bool newBar, int holdBars, float gChg, float mChg, float corr, bool gStructUp, bool gStructDn, bool mStructUp, bool mStructDn, bool useDir, bool useCorr, bool useDistNT, bool useRet, float corrThresh, float dirMinChg, int retLookback, float eventPoint, float gMinMove, float mMinMove) =>
+    var int   _tfBar        = 0
+    var int   _reason       = 0
+    var int   _evBar        = na
+    var bool  _noTrade      = false
+    var int   _prevRawEvent = 0
+    // --- Distortion / Return 状態機械 ---
+    var int   _state      = 0
+    var bool  _expired    = false
+    var bool  _returnBar  = false
+    var int   _distortBar = na
+    var int   _returnType = 0
+    var int   _returnDir  = 0
+    var int   _leader     = 0
+    // --- Distortion 直前 (= 最後に正常逆相関だった確定TF足) の保存値 ---
+    var int   _preGoldDir      = 0
+    var int   _preMktDir       = 0
+    var float _preGoldChg      = 0.0
+    var float _preMktChg       = 0.0
+    var bool  _preGoldLed      = false
+    var bool  _preMktLed       = false
+    var bool  _preGoldStructUp = false
+    var bool  _preGoldStructDn = false
+    var bool  _preMktStructUp  = false
+    var bool  _preMktStructDn  = false
+    // --- 1本前の確定TF足スナップショット ---
+    var int   _prevGoldDir = 0
+    var int   _prevMktDir  = 0
+    var float _prevGoldChg = 0.0
+    var float _prevMktChg  = 0.0
+    var bool  _prevInverse = false
+    var bool  _prevCorrInv = false
     if active and newBar
         _tfBar += 1
+        _returnBar := false
+        int  _gDir       = gChg > 0 ? 1 : gChg < 0 ? -1 : 0
+        int  _mDir       = mChg > 0 ? 1 : mChg < 0 ? -1 : 0
+        bool _inverseNow = (_gDir == 1 and _mDir == -1) or (_gDir == -1 and _mDir == 1)
+        bool _sameNow    = (_gDir == 1 and _mDir == 1) or (_gDir == -1 and _mDir == -1)
+        bool _corrInvNow = not na(corr) and corr <= -corrThresh
+        bool _moveOk     = not useDistortionMinMove or (math.abs(gChg) >= gMinMove and math.abs(mChg) >= mMinMove)
+        // 「直前まで正常な逆相関だったか」= 方向の逆相関 (+ 任意で corr 条件)
+        bool _prevWasInverse = _prevInverse and (not imDistortionRequireCorr or _prevCorrInv)
+        int  _retDir  = 0
+        int  _retType = 0
+        // --- Distortion 継続中 : 主導判定の更新 / 復帰 / 期限切れ ---
+        if _state == 1
+            bool _withinWindow = not na(_distortBar) and (_tfBar - _distortBar) <= retLookback
+            bool _goldHold = _preGoldDir == 1 ? (_gDir == 1 and gStructUp) : _preGoldDir == -1 ? (_gDir == -1 and gStructDn) : false
+            _leader := _goldHold ? 1 : -1
+            if _withinWindow and _inverseNow
+                // 逆相関へ復帰 → Return (この確定TF足1本だけ)
+                _retDir     := _gDir
+                _retType    := _retDir == _preGoldDir ? 1 : 2
+                _returnDir  := _retDir
+                _returnType := _retType
+                _returnBar  := true
+                _expired    := false
+                _state      := 0
+            else if not _withinWindow
+                // 期限切れ → Returnにしない
+                _state   := 0
+                _expired := true
+        // --- Normal → Distortion 開始判定 ---
+        if _state == 0 and not _returnBar and _sameNow and _prevWasInverse and _moveOk
+            _state           := 1
+            _expired         := false
+            _distortBar      := _tfBar
+            _preGoldDir      := _prevGoldDir
+            _preMktDir       := _prevMktDir
+            _preGoldChg      := _prevGoldChg
+            _preMktChg       := _prevMktChg
+            _preGoldStructUp := gStructUp
+            _preGoldStructDn := gStructDn
+            _preMktStructUp  := mStructUp
+            _preMktStructDn  := mStructDn
+            bool _goldHeld = _gDir == _prevGoldDir
+            bool _mktHeld  = _mDir == _prevMktDir
+            _preGoldLed := _goldHeld and not _mktHeld
+            _preMktLed  := _mktHeld  and not _goldHeld
+            _leader     := _preGoldLed ? 1 : _preMktLed ? -1 : 0
+            _returnType := 0
+            _returnDir  := 0
+        // --- イベント統合 (Direction と Return は完全独立) ---
+        //   useDir = false のとき Direction は一切イベントを出さない。
+        //   Return は useRet のみで制御し、Distortion → 復帰を経由した足だけ発火する。
         int _dirEvent = 0
         if useDir
             _dirEvent := mChg <= -dirMinChg ? 1 : mChg >= dirMinChg ? -1 : 0
-        bool _corrOK = not useCorr or (not na(corr) and corr <= -corrThresh)
-        bool _distortion = (mChg > 0 and gChg > 0) or (mChg < 0 and gChg < 0)
-        bool _inverseNow = (mChg > 0 and gChg < 0) or (mChg < 0 and gChg > 0)
-        if _distortion
-            _lastDistortBar := _tfBar
-        bool _wasDistort = not na(_lastDistortBar) and (_tfBar - _lastDistortBar) <= retLookback
-        int _retDir = 0
-        if useRet and _wasDistort and _inverseNow and not _inverseNowPrev
-            _retDir := (mChg < 0 and gChg > 0) ? 1 : (mChg > 0 and gChg < 0) ? -1 : 0
-        int _event = _retDir != 0 ? _retDir : (_corrOK ? _dirEvent : 0)
-        // 新規方向イベントは「生条件の立ち上がり」でのみ発火 (保持Bias _reason とは別管理)。
-        //   前TF足の生方向 _prevRawEvent と比較し、0/反対 → 当該方向 に変化した足だけ Hold開始。
-        //   ・同方向継続 (_event == _prevRawEvent) → 再発火しない (Hold延長なし)。
-        //   ・Hold期限切れでも生条件が継続中なら再発火しない (_reason ではなく生条件で判定)。
-        //   ・生条件が一度 0 になり後日再成立 (0→当該方向) すれば再発火。
-        //   ・反対方向 (Long⇔Short) は即時切替。Return も復帰した最初の足でここを通り切替。
-        if _event == 1 and _prevRawEvent != 1
+        bool _corrOK   = not useCorr or _corrInvNow
+        int  _retEvent = (useRet and _returnBar) ? _retDir : 0
+        int  _event    = _retEvent != 0 ? _retEvent : (useDir and _corrOK ? _dirEvent : 0)
+        // Return は必ず Hold を張り直す (Distortion→Return サイクルごとに1回)。
+        // Direction は従来どおり「生条件の立ち上がり」でのみ発火 (同方向継続では再発火しない)。
+        if _retEvent != 0
+            _reason := _retEvent
+            _evBar  := _tfBar
+        else if _event == 1 and _prevRawEvent != 1
             _reason := 1
-            _evBar := _tfBar
+            _evBar  := _tfBar
         else if _event == -1 and _prevRawEvent != -1
             _reason := -1
-            _evBar := _tfBar
+            _evBar  := _tfBar
         _prevRawEvent := _event
-        _noTrade := useDistNT and _distortion and _retDir == 0
-        _inverseNowPrev := _inverseNow
-    bool _act = _reason != 0 and not na(_evBar) and (_tfBar - _evBar) < holdBars
-    float _out = _act ? (_reason == 1 ? eventPoint : -eventPoint) : 0.0
-    int _outR = _act ? _reason : 0
-    [_out, _outR, active and _noTrade]
+        // Distortion中は NoTrade。Return が成立した復帰足では解除される (_state が 0 に戻るため)。
+        _noTrade := useDistNT and _state == 1
+        _prevGoldDir := _gDir
+        _prevMktDir  := _mDir
+        _prevGoldChg := gChg
+        _prevMktChg  := mChg
+        _prevInverse := _inverseNow
+        _prevCorrInv := _corrInvNow
+    bool  _act       = _reason != 0 and not na(_evBar) and (_tfBar - _evBar) < holdBars
+    float _out       = _act ? (_reason == 1 ? eventPoint : -eventPoint) : 0.0
+    int   _outR      = _act ? _reason : 0
+    int   _stateCode = _returnBar ? 2 : _state == 1 ? 1 : _expired ? 3 : 0
+    [_out, _outR, active and _noTrade, _stateCode, _preGoldDir, _returnType, _returnDir, _leader]
 
 f_imReasonText(int c) =>
     c == 1 ? "Long" : c == -1 ? "Short" : "-"
@@ -890,27 +1002,43 @@ float yChgD = 0.0
 float yCloseD = na
 float oChgD = 0.0
 float oCloseD = na
+bool gStructUpD = false
+bool gStructDnD = false
+bool xStructUpD = false
+bool xStructDnD = false
+bool yStructUpD = false
+bool yStructDnD = false
+bool oStructUpD = false
+bool oStructDnD = false
 if imActive and useIntermarketD
-    [_gc, _gr, _gp] = request.security(goldSymbol, imDailyTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+    [_gc, _gr, _gp, _gsu, _gsd] = request.security(goldSymbol, imDailyTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
     gChgD := _gc
     gCloseD := _gp
+    gStructUpD := _gsu
+    gStructDnD := _gsd
     if useSilverEnv
-        [_sc, _sr, _sp] = request.security(silverSymbol, imDailyTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_sc, _sr, _sp, _ssu, _ssd] = request.security(silverSymbol, imDailyTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         sChgD := _sc
         sRecentD := _sr
         sCloseD := _sp
     if useDxyEnv
-        [_xc, _xr, _xp] = request.security(dxySymbol, imDailyTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_xc, _xr, _xp, _xsu, _xsd] = request.security(dxySymbol, imDailyTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         xChgD := _xc
         xCloseD := _xp
+        xStructUpD := _xsu
+        xStructDnD := _xsd
     if useYieldEnv
-        [_yc, _yr, _yp] = request.security(yieldSymbol, imDailyTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_yc, _yr, _yp, _ysu, _ysd] = request.security(yieldSymbol, imDailyTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         yChgD := _yc
         yCloseD := _yp
+        yStructUpD := _ysu
+        yStructDnD := _ysd
     if useOilEnv
-        [_oc, _or, _op] = request.security(oilSymbol, imDailyTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_oc, _or, _op, _osu, _osd] = request.security(oilSymbol, imDailyTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         oChgD := _oc
         oCloseD := _op
+        oStructUpD := _osu
+        oStructDnD := _osd
 bool newBarD = ta.change(time(imDailyTF)) != 0
 var array<float> gxBufD = array.new_float()
 var array<float> xBufD  = array.new_float()
@@ -925,9 +1053,9 @@ float corrXD = (imActive and useIntermarketD and useDxyEnv)   ? f_corrCalc(gxBuf
 float corrYD = (imActive and useIntermarketD and useYieldEnv) ? f_corrCalc(gyBufD, yBufD, imCorrLen) : na
 float corrOD = (imActive and useIntermarketD and useOilEnv)   ? f_corrCalc(goBufD, oBufD, imCorrLen) : na
 [sScoreD, sReasonD, sNTD] = f_silverState(imActive and useSilverEnv and useIntermarketD, newBarD, imHoldDaily, gChgD, sChgD, sRecentD, silverEventPoint)
-[xScoreD, xReasonD, xNTD] = f_macroState(imActive and useDxyEnv and useIntermarketD, newBarD, imHoldDaily, gChgD, xChgD, corrXD, useDxyDirection, useDxyInverseCorrelation, useDxyDistortionNoTrade, useDxyReturn, imCorrThreshold, dxyMinChange, imReturnLookback, dxyEventPoint)
-[yScoreD, yReasonD, yNTD] = f_macroState(imActive and useYieldEnv and useIntermarketD, newBarD, imHoldDaily, gChgD, yChgD, corrYD, useYieldDirection, useYieldInverseCorrelation, useYieldDistortionNoTrade, useYieldReturn, imCorrThreshold, yieldMinChange, imReturnLookback, yieldEventPoint)
-[oScoreD, oReasonD, oNTD] = f_macroState(imActive and useOilEnv and useIntermarketD, newBarD, imHoldDaily, gChgD, oChgD, corrOD, useOilDirection, useOilInverseCorrelation, useOilDistortionNoTrade, useOilReturn, imCorrThreshold, oilMinChange, imReturnLookback, oilEventPoint)
+[xScoreD, xReasonD, xNTD, xStateD, xPreDirD, xRetTypeD, xRetDirD, xLeaderD] = f_macroState(imActive and useDxyEnv and useIntermarketD, newBarD, imHoldDaily, gChgD, xChgD, corrXD, gStructUpD, gStructDnD, xStructUpD, xStructDnD, useDxyDirection, useDxyInverseCorrelation, useDxyDistortionNoTrade, useDxyReturn, imCorrThreshold, dxyMinChange, imReturnLookback, dxyEventPoint, goldDistortionMinChange, dxyDistortionMinChange)
+[yScoreD, yReasonD, yNTD, yStateD, yPreDirD, yRetTypeD, yRetDirD, yLeaderD] = f_macroState(imActive and useYieldEnv and useIntermarketD, newBarD, imHoldDaily, gChgD, yChgD, corrYD, gStructUpD, gStructDnD, yStructUpD, yStructDnD, useYieldDirection, useYieldInverseCorrelation, useYieldDistortionNoTrade, useYieldReturn, imCorrThreshold, yieldMinChange, imReturnLookback, yieldEventPoint, goldDistortionMinChange, yieldDistortionMinChange)
+[oScoreD, oReasonD, oNTD, oStateD, oPreDirD, oRetTypeD, oRetDirD, oLeaderD] = f_macroState(imActive and useOilEnv and useIntermarketD, newBarD, imHoldDaily, gChgD, oChgD, corrOD, gStructUpD, gStructDnD, oStructUpD, oStructDnD, useOilDirection, useOilInverseCorrelation, useOilDistortionNoTrade, useOilReturn, imCorrThreshold, oilMinChange, imReturnLookback, oilEventPoint, goldDistortionMinChange, oilDistortionMinChange)
 float sWD = (useSilverEnv and useIntermarketD) ? sScoreD * imWeightD : 0.0
 float xWD = (useDxyEnv and useIntermarketD)    ? xScoreD * imWeightD : 0.0
 float yWD = (useYieldEnv and useIntermarketD)  ? yScoreD * imWeightD : 0.0
@@ -944,27 +1072,43 @@ float yChg4H = 0.0
 float yClose4H = na
 float oChg4H = 0.0
 float oClose4H = na
+bool gStructUp4H = false
+bool gStructDn4H = false
+bool xStructUp4H = false
+bool xStructDn4H = false
+bool yStructUp4H = false
+bool yStructDn4H = false
+bool oStructUp4H = false
+bool oStructDn4H = false
 if imActive and useIntermarket4H
-    [_gc, _gr, _gp] = request.security(goldSymbol, im4HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+    [_gc, _gr, _gp, _gsu, _gsd] = request.security(goldSymbol, im4HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
     gChg4H := _gc
     gClose4H := _gp
+    gStructUp4H := _gsu
+    gStructDn4H := _gsd
     if useSilverEnv
-        [_sc, _sr, _sp] = request.security(silverSymbol, im4HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_sc, _sr, _sp, _ssu, _ssd] = request.security(silverSymbol, im4HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         sChg4H := _sc
         sRecent4H := _sr
         sClose4H := _sp
     if useDxyEnv
-        [_xc, _xr, _xp] = request.security(dxySymbol, im4HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_xc, _xr, _xp, _xsu, _xsd] = request.security(dxySymbol, im4HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         xChg4H := _xc
         xClose4H := _xp
+        xStructUp4H := _xsu
+        xStructDn4H := _xsd
     if useYieldEnv
-        [_yc, _yr, _yp] = request.security(yieldSymbol, im4HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_yc, _yr, _yp, _ysu, _ysd] = request.security(yieldSymbol, im4HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         yChg4H := _yc
         yClose4H := _yp
+        yStructUp4H := _ysu
+        yStructDn4H := _ysd
     if useOilEnv
-        [_oc, _or, _op] = request.security(oilSymbol, im4HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_oc, _or, _op, _osu, _osd] = request.security(oilSymbol, im4HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         oChg4H := _oc
         oClose4H := _op
+        oStructUp4H := _osu
+        oStructDn4H := _osd
 bool newBar4H = ta.change(time(im4HTF)) != 0
 var array<float> gxBuf4H = array.new_float()
 var array<float> xBuf4H  = array.new_float()
@@ -979,9 +1123,9 @@ float corrX4H = (imActive and useIntermarket4H and useDxyEnv)   ? f_corrCalc(gxB
 float corrY4H = (imActive and useIntermarket4H and useYieldEnv) ? f_corrCalc(gyBuf4H, yBuf4H, imCorrLen) : na
 float corrO4H = (imActive and useIntermarket4H and useOilEnv)   ? f_corrCalc(goBuf4H, oBuf4H, imCorrLen) : na
 [sScore4H, sReason4H, sNT4H] = f_silverState(imActive and useSilverEnv and useIntermarket4H, newBar4H, imHold4H, gChg4H, sChg4H, sRecent4H, silverEventPoint)
-[xScore4H, xReason4H, xNT4H] = f_macroState(imActive and useDxyEnv and useIntermarket4H, newBar4H, imHold4H, gChg4H, xChg4H, corrX4H, useDxyDirection, useDxyInverseCorrelation, useDxyDistortionNoTrade, useDxyReturn, imCorrThreshold, dxyMinChange, imReturnLookback, dxyEventPoint)
-[yScore4H, yReason4H, yNT4H] = f_macroState(imActive and useYieldEnv and useIntermarket4H, newBar4H, imHold4H, gChg4H, yChg4H, corrY4H, useYieldDirection, useYieldInverseCorrelation, useYieldDistortionNoTrade, useYieldReturn, imCorrThreshold, yieldMinChange, imReturnLookback, yieldEventPoint)
-[oScore4H, oReason4H, oNT4H] = f_macroState(imActive and useOilEnv and useIntermarket4H, newBar4H, imHold4H, gChg4H, oChg4H, corrO4H, useOilDirection, useOilInverseCorrelation, useOilDistortionNoTrade, useOilReturn, imCorrThreshold, oilMinChange, imReturnLookback, oilEventPoint)
+[xScore4H, xReason4H, xNT4H, xState4H, xPreDir4H, xRetType4H, xRetDir4H, xLeader4H] = f_macroState(imActive and useDxyEnv and useIntermarket4H, newBar4H, imHold4H, gChg4H, xChg4H, corrX4H, gStructUp4H, gStructDn4H, xStructUp4H, xStructDn4H, useDxyDirection, useDxyInverseCorrelation, useDxyDistortionNoTrade, useDxyReturn, imCorrThreshold, dxyMinChange, imReturnLookback, dxyEventPoint, goldDistortionMinChange, dxyDistortionMinChange)
+[yScore4H, yReason4H, yNT4H, yState4H, yPreDir4H, yRetType4H, yRetDir4H, yLeader4H] = f_macroState(imActive and useYieldEnv and useIntermarket4H, newBar4H, imHold4H, gChg4H, yChg4H, corrY4H, gStructUp4H, gStructDn4H, yStructUp4H, yStructDn4H, useYieldDirection, useYieldInverseCorrelation, useYieldDistortionNoTrade, useYieldReturn, imCorrThreshold, yieldMinChange, imReturnLookback, yieldEventPoint, goldDistortionMinChange, yieldDistortionMinChange)
+[oScore4H, oReason4H, oNT4H, oState4H, oPreDir4H, oRetType4H, oRetDir4H, oLeader4H] = f_macroState(imActive and useOilEnv and useIntermarket4H, newBar4H, imHold4H, gChg4H, oChg4H, corrO4H, gStructUp4H, gStructDn4H, oStructUp4H, oStructDn4H, useOilDirection, useOilInverseCorrelation, useOilDistortionNoTrade, useOilReturn, imCorrThreshold, oilMinChange, imReturnLookback, oilEventPoint, goldDistortionMinChange, oilDistortionMinChange)
 float sW4H = (useSilverEnv and useIntermarket4H) ? sScore4H * imWeight4H : 0.0
 float xW4H = (useDxyEnv and useIntermarket4H)    ? xScore4H * imWeight4H : 0.0
 float yW4H = (useYieldEnv and useIntermarket4H)  ? yScore4H * imWeight4H : 0.0
@@ -998,27 +1142,43 @@ float yChg1H = 0.0
 float yClose1H = na
 float oChg1H = 0.0
 float oClose1H = na
+bool gStructUp1H = false
+bool gStructDn1H = false
+bool xStructUp1H = false
+bool xStructDn1H = false
+bool yStructUp1H = false
+bool yStructDn1H = false
+bool oStructUp1H = false
+bool oStructDn1H = false
 if imActive and useIntermarket1H
-    [_gc, _gr, _gp] = request.security(goldSymbol, im1HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+    [_gc, _gr, _gp, _gsu, _gsd] = request.security(goldSymbol, im1HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
     gChg1H := _gc
     gClose1H := _gp
+    gStructUp1H := _gsu
+    gStructDn1H := _gsd
     if useSilverEnv
-        [_sc, _sr, _sp] = request.security(silverSymbol, im1HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_sc, _sr, _sp, _ssu, _ssd] = request.security(silverSymbol, im1HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         sChg1H := _sc
         sRecent1H := _sr
         sClose1H := _sp
     if useDxyEnv
-        [_xc, _xr, _xp] = request.security(dxySymbol, im1HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_xc, _xr, _xp, _xsu, _xsd] = request.security(dxySymbol, im1HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         xChg1H := _xc
         xClose1H := _xp
+        xStructUp1H := _xsu
+        xStructDn1H := _xsd
     if useYieldEnv
-        [_yc, _yr, _yp] = request.security(yieldSymbol, im1HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_yc, _yr, _yp, _ysu, _ysd] = request.security(yieldSymbol, im1HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         yChg1H := _yc
         yClose1H := _yp
+        yStructUp1H := _ysu
+        yStructDn1H := _ysd
     if useOilEnv
-        [_oc, _or, _op] = request.security(oilSymbol, im1HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_oc, _or, _op, _osu, _osd] = request.security(oilSymbol, im1HTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         oChg1H := _oc
         oClose1H := _op
+        oStructUp1H := _osu
+        oStructDn1H := _osd
 bool newBar1H = ta.change(time(im1HTF)) != 0
 var array<float> gxBuf1H = array.new_float()
 var array<float> xBuf1H  = array.new_float()
@@ -1033,9 +1193,9 @@ float corrX1H = (imActive and useIntermarket1H and useDxyEnv)   ? f_corrCalc(gxB
 float corrY1H = (imActive and useIntermarket1H and useYieldEnv) ? f_corrCalc(gyBuf1H, yBuf1H, imCorrLen) : na
 float corrO1H = (imActive and useIntermarket1H and useOilEnv)   ? f_corrCalc(goBuf1H, oBuf1H, imCorrLen) : na
 [sScore1H, sReason1H, sNT1H] = f_silverState(imActive and useSilverEnv and useIntermarket1H, newBar1H, imHold1H, gChg1H, sChg1H, sRecent1H, silverEventPoint)
-[xScore1H, xReason1H, xNT1H] = f_macroState(imActive and useDxyEnv and useIntermarket1H, newBar1H, imHold1H, gChg1H, xChg1H, corrX1H, useDxyDirection, useDxyInverseCorrelation, useDxyDistortionNoTrade, useDxyReturn, imCorrThreshold, dxyMinChange, imReturnLookback, dxyEventPoint)
-[yScore1H, yReason1H, yNT1H] = f_macroState(imActive and useYieldEnv and useIntermarket1H, newBar1H, imHold1H, gChg1H, yChg1H, corrY1H, useYieldDirection, useYieldInverseCorrelation, useYieldDistortionNoTrade, useYieldReturn, imCorrThreshold, yieldMinChange, imReturnLookback, yieldEventPoint)
-[oScore1H, oReason1H, oNT1H] = f_macroState(imActive and useOilEnv and useIntermarket1H, newBar1H, imHold1H, gChg1H, oChg1H, corrO1H, useOilDirection, useOilInverseCorrelation, useOilDistortionNoTrade, useOilReturn, imCorrThreshold, oilMinChange, imReturnLookback, oilEventPoint)
+[xScore1H, xReason1H, xNT1H, xState1H, xPreDir1H, xRetType1H, xRetDir1H, xLeader1H] = f_macroState(imActive and useDxyEnv and useIntermarket1H, newBar1H, imHold1H, gChg1H, xChg1H, corrX1H, gStructUp1H, gStructDn1H, xStructUp1H, xStructDn1H, useDxyDirection, useDxyInverseCorrelation, useDxyDistortionNoTrade, useDxyReturn, imCorrThreshold, dxyMinChange, imReturnLookback, dxyEventPoint, goldDistortionMinChange, dxyDistortionMinChange)
+[yScore1H, yReason1H, yNT1H, yState1H, yPreDir1H, yRetType1H, yRetDir1H, yLeader1H] = f_macroState(imActive and useYieldEnv and useIntermarket1H, newBar1H, imHold1H, gChg1H, yChg1H, corrY1H, gStructUp1H, gStructDn1H, yStructUp1H, yStructDn1H, useYieldDirection, useYieldInverseCorrelation, useYieldDistortionNoTrade, useYieldReturn, imCorrThreshold, yieldMinChange, imReturnLookback, yieldEventPoint, goldDistortionMinChange, yieldDistortionMinChange)
+[oScore1H, oReason1H, oNT1H, oState1H, oPreDir1H, oRetType1H, oRetDir1H, oLeader1H] = f_macroState(imActive and useOilEnv and useIntermarket1H, newBar1H, imHold1H, gChg1H, oChg1H, corrO1H, gStructUp1H, gStructDn1H, oStructUp1H, oStructDn1H, useOilDirection, useOilInverseCorrelation, useOilDistortionNoTrade, useOilReturn, imCorrThreshold, oilMinChange, imReturnLookback, oilEventPoint, goldDistortionMinChange, oilDistortionMinChange)
 float sW1H = (useSilverEnv and useIntermarket1H) ? sScore1H * imWeight1H : 0.0
 float xW1H = (useDxyEnv and useIntermarket1H)    ? xScore1H * imWeight1H : 0.0
 float yW1H = (useYieldEnv and useIntermarket1H)  ? yScore1H * imWeight1H : 0.0
@@ -1052,27 +1212,43 @@ float yChg15M = 0.0
 float yClose15M = na
 float oChg15M = 0.0
 float oClose15M = na
+bool gStructUp15M = false
+bool gStructDn15M = false
+bool xStructUp15M = false
+bool xStructDn15M = false
+bool yStructUp15M = false
+bool yStructDn15M = false
+bool oStructUp15M = false
+bool oStructDn15M = false
 if imActive and useIntermarket15M
-    [_gc, _gr, _gp] = request.security(goldSymbol, im15MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+    [_gc, _gr, _gp, _gsu, _gsd] = request.security(goldSymbol, im15MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
     gChg15M := _gc
     gClose15M := _gp
+    gStructUp15M := _gsu
+    gStructDn15M := _gsd
     if useSilverEnv
-        [_sc, _sr, _sp] = request.security(silverSymbol, im15MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_sc, _sr, _sp, _ssu, _ssd] = request.security(silverSymbol, im15MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         sChg15M := _sc
         sRecent15M := _sr
         sClose15M := _sp
     if useDxyEnv
-        [_xc, _xr, _xp] = request.security(dxySymbol, im15MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_xc, _xr, _xp, _xsu, _xsd] = request.security(dxySymbol, im15MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         xChg15M := _xc
         xClose15M := _xp
+        xStructUp15M := _xsu
+        xStructDn15M := _xsd
     if useYieldEnv
-        [_yc, _yr, _yp] = request.security(yieldSymbol, im15MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_yc, _yr, _yp, _ysu, _ysd] = request.security(yieldSymbol, im15MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         yChg15M := _yc
         yClose15M := _yp
+        yStructUp15M := _ysu
+        yStructDn15M := _ysd
     if useOilEnv
-        [_oc, _or, _op] = request.security(oilSymbol, im15MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_oc, _or, _op, _osu, _osd] = request.security(oilSymbol, im15MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         oChg15M := _oc
         oClose15M := _op
+        oStructUp15M := _osu
+        oStructDn15M := _osd
 bool newBar15M = ta.change(time(im15MTF)) != 0
 var array<float> gxBuf15M = array.new_float()
 var array<float> xBuf15M  = array.new_float()
@@ -1087,9 +1263,9 @@ float corrX15M = (imActive and useIntermarket15M and useDxyEnv)   ? f_corrCalc(g
 float corrY15M = (imActive and useIntermarket15M and useYieldEnv) ? f_corrCalc(gyBuf15M, yBuf15M, imCorrLen) : na
 float corrO15M = (imActive and useIntermarket15M and useOilEnv)   ? f_corrCalc(goBuf15M, oBuf15M, imCorrLen) : na
 [sScore15M, sReason15M, sNT15M] = f_silverState(imActive and useSilverEnv and useIntermarket15M, newBar15M, imHold15M, gChg15M, sChg15M, sRecent15M, silverEventPoint)
-[xScore15M, xReason15M, xNT15M] = f_macroState(imActive and useDxyEnv and useIntermarket15M, newBar15M, imHold15M, gChg15M, xChg15M, corrX15M, useDxyDirection, useDxyInverseCorrelation, useDxyDistortionNoTrade, useDxyReturn, imCorrThreshold, dxyMinChange, imReturnLookback, dxyEventPoint)
-[yScore15M, yReason15M, yNT15M] = f_macroState(imActive and useYieldEnv and useIntermarket15M, newBar15M, imHold15M, gChg15M, yChg15M, corrY15M, useYieldDirection, useYieldInverseCorrelation, useYieldDistortionNoTrade, useYieldReturn, imCorrThreshold, yieldMinChange, imReturnLookback, yieldEventPoint)
-[oScore15M, oReason15M, oNT15M] = f_macroState(imActive and useOilEnv and useIntermarket15M, newBar15M, imHold15M, gChg15M, oChg15M, corrO15M, useOilDirection, useOilInverseCorrelation, useOilDistortionNoTrade, useOilReturn, imCorrThreshold, oilMinChange, imReturnLookback, oilEventPoint)
+[xScore15M, xReason15M, xNT15M, xState15M, xPreDir15M, xRetType15M, xRetDir15M, xLeader15M] = f_macroState(imActive and useDxyEnv and useIntermarket15M, newBar15M, imHold15M, gChg15M, xChg15M, corrX15M, gStructUp15M, gStructDn15M, xStructUp15M, xStructDn15M, useDxyDirection, useDxyInverseCorrelation, useDxyDistortionNoTrade, useDxyReturn, imCorrThreshold, dxyMinChange, imReturnLookback, dxyEventPoint, goldDistortionMinChange, dxyDistortionMinChange)
+[yScore15M, yReason15M, yNT15M, yState15M, yPreDir15M, yRetType15M, yRetDir15M, yLeader15M] = f_macroState(imActive and useYieldEnv and useIntermarket15M, newBar15M, imHold15M, gChg15M, yChg15M, corrY15M, gStructUp15M, gStructDn15M, yStructUp15M, yStructDn15M, useYieldDirection, useYieldInverseCorrelation, useYieldDistortionNoTrade, useYieldReturn, imCorrThreshold, yieldMinChange, imReturnLookback, yieldEventPoint, goldDistortionMinChange, yieldDistortionMinChange)
+[oScore15M, oReason15M, oNT15M, oState15M, oPreDir15M, oRetType15M, oRetDir15M, oLeader15M] = f_macroState(imActive and useOilEnv and useIntermarket15M, newBar15M, imHold15M, gChg15M, oChg15M, corrO15M, gStructUp15M, gStructDn15M, oStructUp15M, oStructDn15M, useOilDirection, useOilInverseCorrelation, useOilDistortionNoTrade, useOilReturn, imCorrThreshold, oilMinChange, imReturnLookback, oilEventPoint, goldDistortionMinChange, oilDistortionMinChange)
 float sW15M = (useSilverEnv and useIntermarket15M) ? sScore15M * imWeight15M : 0.0
 float xW15M = (useDxyEnv and useIntermarket15M)    ? xScore15M * imWeight15M : 0.0
 float yW15M = (useYieldEnv and useIntermarket15M)  ? yScore15M * imWeight15M : 0.0
@@ -1106,27 +1282,43 @@ float yChg5M = 0.0
 float yClose5M = na
 float oChg5M = 0.0
 float oClose5M = na
+bool gStructUp5M = false
+bool gStructDn5M = false
+bool xStructUp5M = false
+bool xStructDn5M = false
+bool yStructUp5M = false
+bool yStructDn5M = false
+bool oStructUp5M = false
+bool oStructDn5M = false
 if imActive and useIntermarket5M
-    [_gc, _gr, _gp] = request.security(goldSymbol, im5MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+    [_gc, _gr, _gp, _gsu, _gsd] = request.security(goldSymbol, im5MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
     gChg5M := _gc
     gClose5M := _gp
+    gStructUp5M := _gsu
+    gStructDn5M := _gsd
     if useSilverEnv
-        [_sc, _sr, _sp] = request.security(silverSymbol, im5MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_sc, _sr, _sp, _ssu, _ssd] = request.security(silverSymbol, im5MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         sChg5M := _sc
         sRecent5M := _sr
         sClose5M := _sp
     if useDxyEnv
-        [_xc, _xr, _xp] = request.security(dxySymbol, im5MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_xc, _xr, _xp, _xsu, _xsd] = request.security(dxySymbol, im5MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         xChg5M := _xc
         xClose5M := _xp
+        xStructUp5M := _xsu
+        xStructDn5M := _xsd
     if useYieldEnv
-        [_yc, _yr, _yp] = request.security(yieldSymbol, im5MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_yc, _yr, _yp, _ysu, _ysd] = request.security(yieldSymbol, im5MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         yChg5M := _yc
         yClose5M := _yp
+        yStructUp5M := _ysu
+        yStructDn5M := _ysd
     if useOilEnv
-        [_oc, _or, _op] = request.security(oilSymbol, im5MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_oc, _or, _op, _osu, _osd] = request.security(oilSymbol, im5MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         oChg5M := _oc
         oClose5M := _op
+        oStructUp5M := _osu
+        oStructDn5M := _osd
 bool newBar5M = ta.change(time(im5MTF)) != 0
 var array<float> gxBuf5M = array.new_float()
 var array<float> xBuf5M  = array.new_float()
@@ -1141,9 +1333,9 @@ float corrX5M = (imActive and useIntermarket5M and useDxyEnv)   ? f_corrCalc(gxB
 float corrY5M = (imActive and useIntermarket5M and useYieldEnv) ? f_corrCalc(gyBuf5M, yBuf5M, imCorrLen) : na
 float corrO5M = (imActive and useIntermarket5M and useOilEnv)   ? f_corrCalc(goBuf5M, oBuf5M, imCorrLen) : na
 [sScore5M, sReason5M, sNT5M] = f_silverState(imActive and useSilverEnv and useIntermarket5M, newBar5M, imHold5M, gChg5M, sChg5M, sRecent5M, silverEventPoint)
-[xScore5M, xReason5M, xNT5M] = f_macroState(imActive and useDxyEnv and useIntermarket5M, newBar5M, imHold5M, gChg5M, xChg5M, corrX5M, useDxyDirection, useDxyInverseCorrelation, useDxyDistortionNoTrade, useDxyReturn, imCorrThreshold, dxyMinChange, imReturnLookback, dxyEventPoint)
-[yScore5M, yReason5M, yNT5M] = f_macroState(imActive and useYieldEnv and useIntermarket5M, newBar5M, imHold5M, gChg5M, yChg5M, corrY5M, useYieldDirection, useYieldInverseCorrelation, useYieldDistortionNoTrade, useYieldReturn, imCorrThreshold, yieldMinChange, imReturnLookback, yieldEventPoint)
-[oScore5M, oReason5M, oNT5M] = f_macroState(imActive and useOilEnv and useIntermarket5M, newBar5M, imHold5M, gChg5M, oChg5M, corrO5M, useOilDirection, useOilInverseCorrelation, useOilDistortionNoTrade, useOilReturn, imCorrThreshold, oilMinChange, imReturnLookback, oilEventPoint)
+[xScore5M, xReason5M, xNT5M, xState5M, xPreDir5M, xRetType5M, xRetDir5M, xLeader5M] = f_macroState(imActive and useDxyEnv and useIntermarket5M, newBar5M, imHold5M, gChg5M, xChg5M, corrX5M, gStructUp5M, gStructDn5M, xStructUp5M, xStructDn5M, useDxyDirection, useDxyInverseCorrelation, useDxyDistortionNoTrade, useDxyReturn, imCorrThreshold, dxyMinChange, imReturnLookback, dxyEventPoint, goldDistortionMinChange, dxyDistortionMinChange)
+[yScore5M, yReason5M, yNT5M, yState5M, yPreDir5M, yRetType5M, yRetDir5M, yLeader5M] = f_macroState(imActive and useYieldEnv and useIntermarket5M, newBar5M, imHold5M, gChg5M, yChg5M, corrY5M, gStructUp5M, gStructDn5M, yStructUp5M, yStructDn5M, useYieldDirection, useYieldInverseCorrelation, useYieldDistortionNoTrade, useYieldReturn, imCorrThreshold, yieldMinChange, imReturnLookback, yieldEventPoint, goldDistortionMinChange, yieldDistortionMinChange)
+[oScore5M, oReason5M, oNT5M, oState5M, oPreDir5M, oRetType5M, oRetDir5M, oLeader5M] = f_macroState(imActive and useOilEnv and useIntermarket5M, newBar5M, imHold5M, gChg5M, oChg5M, corrO5M, gStructUp5M, gStructDn5M, oStructUp5M, oStructDn5M, useOilDirection, useOilInverseCorrelation, useOilDistortionNoTrade, useOilReturn, imCorrThreshold, oilMinChange, imReturnLookback, oilEventPoint, goldDistortionMinChange, oilDistortionMinChange)
 float sW5M = (useSilverEnv and useIntermarket5M) ? sScore5M * imWeight5M : 0.0
 float xW5M = (useDxyEnv and useIntermarket5M)    ? xScore5M * imWeight5M : 0.0
 float yW5M = (useYieldEnv and useIntermarket5M)  ? yScore5M * imWeight5M : 0.0
@@ -1160,27 +1352,43 @@ float yChg1M = 0.0
 float yClose1M = na
 float oChg1M = 0.0
 float oClose1M = na
+bool gStructUp1M = false
+bool gStructDn1M = false
+bool xStructUp1M = false
+bool xStructDn1M = false
+bool yStructUp1M = false
+bool yStructDn1M = false
+bool oStructUp1M = false
+bool oStructDn1M = false
 if imActive and useIntermarket1M
-    [_gc, _gr, _gp] = request.security(goldSymbol, im1MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+    [_gc, _gr, _gp, _gsu, _gsd] = request.security(goldSymbol, im1MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
     gChg1M := _gc
     gClose1M := _gp
+    gStructUp1M := _gsu
+    gStructDn1M := _gsd
     if useSilverEnv
-        [_sc, _sr, _sp] = request.security(silverSymbol, im1MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_sc, _sr, _sp, _ssu, _ssd] = request.security(silverSymbol, im1MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         sChg1M := _sc
         sRecent1M := _sr
         sClose1M := _sp
     if useDxyEnv
-        [_xc, _xr, _xp] = request.security(dxySymbol, im1MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_xc, _xr, _xp, _xsu, _xsd] = request.security(dxySymbol, im1MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         xChg1M := _xc
         xClose1M := _xp
+        xStructUp1M := _xsu
+        xStructDn1M := _xsd
     if useYieldEnv
-        [_yc, _yr, _yp] = request.security(yieldSymbol, im1MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_yc, _yr, _yp, _ysu, _ysd] = request.security(yieldSymbol, im1MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         yChg1M := _yc
         yClose1M := _yp
+        yStructUp1M := _ysu
+        yStructDn1M := _ysd
     if useOilEnv
-        [_oc, _or, _op] = request.security(oilSymbol, im1MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback), lookahead = barmerge.lookahead_on)
+        [_oc, _or, _op, _osu, _osd] = request.security(oilSymbol, im1MTF, f_imDataConfirmed(imChangeLookback, imRecentLookback, imStructureLookback), lookahead = barmerge.lookahead_on)
         oChg1M := _oc
         oClose1M := _op
+        oStructUp1M := _osu
+        oStructDn1M := _osd
 bool newBar1M = ta.change(time(im1MTF)) != 0
 var array<float> gxBuf1M = array.new_float()
 var array<float> xBuf1M  = array.new_float()
@@ -1195,9 +1403,9 @@ float corrX1M = (imActive and useIntermarket1M and useDxyEnv)   ? f_corrCalc(gxB
 float corrY1M = (imActive and useIntermarket1M and useYieldEnv) ? f_corrCalc(gyBuf1M, yBuf1M, imCorrLen) : na
 float corrO1M = (imActive and useIntermarket1M and useOilEnv)   ? f_corrCalc(goBuf1M, oBuf1M, imCorrLen) : na
 [sScore1M, sReason1M, sNT1M] = f_silverState(imActive and useSilverEnv and useIntermarket1M, newBar1M, imHold1M, gChg1M, sChg1M, sRecent1M, silverEventPoint)
-[xScore1M, xReason1M, xNT1M] = f_macroState(imActive and useDxyEnv and useIntermarket1M, newBar1M, imHold1M, gChg1M, xChg1M, corrX1M, useDxyDirection, useDxyInverseCorrelation, useDxyDistortionNoTrade, useDxyReturn, imCorrThreshold, dxyMinChange, imReturnLookback, dxyEventPoint)
-[yScore1M, yReason1M, yNT1M] = f_macroState(imActive and useYieldEnv and useIntermarket1M, newBar1M, imHold1M, gChg1M, yChg1M, corrY1M, useYieldDirection, useYieldInverseCorrelation, useYieldDistortionNoTrade, useYieldReturn, imCorrThreshold, yieldMinChange, imReturnLookback, yieldEventPoint)
-[oScore1M, oReason1M, oNT1M] = f_macroState(imActive and useOilEnv and useIntermarket1M, newBar1M, imHold1M, gChg1M, oChg1M, corrO1M, useOilDirection, useOilInverseCorrelation, useOilDistortionNoTrade, useOilReturn, imCorrThreshold, oilMinChange, imReturnLookback, oilEventPoint)
+[xScore1M, xReason1M, xNT1M, xState1M, xPreDir1M, xRetType1M, xRetDir1M, xLeader1M] = f_macroState(imActive and useDxyEnv and useIntermarket1M, newBar1M, imHold1M, gChg1M, xChg1M, corrX1M, gStructUp1M, gStructDn1M, xStructUp1M, xStructDn1M, useDxyDirection, useDxyInverseCorrelation, useDxyDistortionNoTrade, useDxyReturn, imCorrThreshold, dxyMinChange, imReturnLookback, dxyEventPoint, goldDistortionMinChange, dxyDistortionMinChange)
+[yScore1M, yReason1M, yNT1M, yState1M, yPreDir1M, yRetType1M, yRetDir1M, yLeader1M] = f_macroState(imActive and useYieldEnv and useIntermarket1M, newBar1M, imHold1M, gChg1M, yChg1M, corrY1M, gStructUp1M, gStructDn1M, yStructUp1M, yStructDn1M, useYieldDirection, useYieldInverseCorrelation, useYieldDistortionNoTrade, useYieldReturn, imCorrThreshold, yieldMinChange, imReturnLookback, yieldEventPoint, goldDistortionMinChange, yieldDistortionMinChange)
+[oScore1M, oReason1M, oNT1M, oState1M, oPreDir1M, oRetType1M, oRetDir1M, oLeader1M] = f_macroState(imActive and useOilEnv and useIntermarket1M, newBar1M, imHold1M, gChg1M, oChg1M, corrO1M, gStructUp1M, gStructDn1M, oStructUp1M, oStructDn1M, useOilDirection, useOilInverseCorrelation, useOilDistortionNoTrade, useOilReturn, imCorrThreshold, oilMinChange, imReturnLookback, oilEventPoint, goldDistortionMinChange, oilDistortionMinChange)
 float sW1M = (useSilverEnv and useIntermarket1M) ? sScore1M * imWeight1M : 0.0
 float xW1M = (useDxyEnv and useIntermarket1M)    ? xScore1M * imWeight1M : 0.0
 float yW1M = (useYieldEnv and useIntermarket1M)  ? yScore1M * imWeight1M : 0.0
@@ -1897,3 +2105,95 @@ if imShowTable and imShowDebug
         table.cell(imDbg, 2, 6, (useDxyEnv and useIntermarket1M)    ? f_imReasonText(xReason1M) + " " + str.tostring(xW1M, "#.#") : "-", text_color = color.white, text_size = size.tiny)
         table.cell(imDbg, 3, 6, (useYieldEnv and useIntermarket1M)  ? f_imReasonText(yReason1M) + " " + str.tostring(yW1M, "#.#") : "-", text_color = color.white, text_size = size.tiny)
         table.cell(imDbg, 4, 6, (useOilEnv and useIntermarket1M)    ? f_imReasonText(oReason1M) + " " + str.tostring(oW1M, "#.#") : "-", text_color = color.white, text_size = size.tiny)
+
+// ============================================================
+//  12d. Intermarket Distortion → Return 詳細テーブル
+// ------------------------------------------------------------
+//  DXY / Yield / Oil のいずれか1市場について、各参照TFの
+//    Corr   : 現在の相関係数 (参照TF確定足 imCorrLen 本)
+//    State  : Normal / Distortion / Return / Expired (Distortion期限切れ)
+//    PreDir : Distortion直前のGold方向
+//    Return : Original Long / Original Short / Opposite Long / Opposite Short
+//    Leader : Gold主導 / 市場主導
+//  を表示する。イベント発火の有無 (useXxxReturn) に関わらず状態機械は動作するため、
+//  Return を OFF にしたままサイクルの検証だけを行うこともできる。
+// ============================================================
+f_imStateText(int c) =>
+    c == 1 ? "Distortion" : c == 2 ? "Return" : c == 3 ? "Expired" : "Normal"
+f_imStateColor(int c) =>
+    c == 1 ? color.new(color.orange, 20) : c == 2 ? color.new(color.blue, 20) : c == 3 ? color.new(color.gray, 40) : color.new(color.black, 0)
+f_imPreDirText(int d) =>
+    d == 1 ? "Gold Long" : d == -1 ? "Gold Short" : "-"
+f_imReturnTypeText(int t, int d) =>
+    t == 0 or d == 0 ? "-" : (t == 1 ? "Original " : "Opposite ") + (d == 1 ? "Long" : "Short")
+f_imLeaderText(int l, string mkt) =>
+    l == 1 ? "Gold" : l == -1 ? mkt : "-"
+
+f_rtCell(table t, int col, int row, string txt, color bg) =>
+    table.cell(t, col, row, txt, text_color = color.white, bgcolor = bg, text_size = size.tiny)
+
+f_rtRow(table t, int row, string tfName, bool on, float corrV, int st, int preDir, int rt, int rd, int ld, string mkt) =>
+    f_rtCell(t, 0, row, tfName, color.new(color.black, 0))
+    f_rtCell(t, 1, row, on and not na(corrV) ? str.tostring(corrV, "#.##") : "-", color.new(color.black, 0))
+    f_rtCell(t, 2, row, on ? f_imStateText(st) : "OFF", on ? f_imStateColor(st) : color.new(color.black, 0))
+    f_rtCell(t, 3, row, on ? f_imPreDirText(preDir) : "-", color.new(color.black, 0))
+    f_rtCell(t, 4, row, on ? f_imReturnTypeText(rt, rd) : "-", color.new(color.black, 0))
+    f_rtCell(t, 5, row, on ? f_imLeaderText(ld, mkt) : "-", color.new(color.black, 0))
+
+bool imRtIsDxy   = imReturnTableMarket == "DXY"
+bool imRtIsYield = imReturnTableMarket == "Yield"
+bool imRtOnMkt   = imActive and (imRtIsDxy ? useDxyEnv : imRtIsYield ? useYieldEnv : useOilEnv)
+float rtCorrD    = imRtIsDxy ? corrXD : imRtIsYield ? corrYD : corrOD
+int   rtStateD   = imRtIsDxy ? xStateD : imRtIsYield ? yStateD : oStateD
+int   rtPreDirD  = imRtIsDxy ? xPreDirD : imRtIsYield ? yPreDirD : oPreDirD
+int   rtRetTypeD = imRtIsDxy ? xRetTypeD : imRtIsYield ? yRetTypeD : oRetTypeD
+int   rtRetDirD  = imRtIsDxy ? xRetDirD : imRtIsYield ? yRetDirD : oRetDirD
+int   rtLeaderD  = imRtIsDxy ? xLeaderD : imRtIsYield ? yLeaderD : oLeaderD
+float rtCorr4H    = imRtIsDxy ? corrX4H : imRtIsYield ? corrY4H : corrO4H
+int   rtState4H   = imRtIsDxy ? xState4H : imRtIsYield ? yState4H : oState4H
+int   rtPreDir4H  = imRtIsDxy ? xPreDir4H : imRtIsYield ? yPreDir4H : oPreDir4H
+int   rtRetType4H = imRtIsDxy ? xRetType4H : imRtIsYield ? yRetType4H : oRetType4H
+int   rtRetDir4H  = imRtIsDxy ? xRetDir4H : imRtIsYield ? yRetDir4H : oRetDir4H
+int   rtLeader4H  = imRtIsDxy ? xLeader4H : imRtIsYield ? yLeader4H : oLeader4H
+float rtCorr1H    = imRtIsDxy ? corrX1H : imRtIsYield ? corrY1H : corrO1H
+int   rtState1H   = imRtIsDxy ? xState1H : imRtIsYield ? yState1H : oState1H
+int   rtPreDir1H  = imRtIsDxy ? xPreDir1H : imRtIsYield ? yPreDir1H : oPreDir1H
+int   rtRetType1H = imRtIsDxy ? xRetType1H : imRtIsYield ? yRetType1H : oRetType1H
+int   rtRetDir1H  = imRtIsDxy ? xRetDir1H : imRtIsYield ? yRetDir1H : oRetDir1H
+int   rtLeader1H  = imRtIsDxy ? xLeader1H : imRtIsYield ? yLeader1H : oLeader1H
+float rtCorr15M    = imRtIsDxy ? corrX15M : imRtIsYield ? corrY15M : corrO15M
+int   rtState15M   = imRtIsDxy ? xState15M : imRtIsYield ? yState15M : oState15M
+int   rtPreDir15M  = imRtIsDxy ? xPreDir15M : imRtIsYield ? yPreDir15M : oPreDir15M
+int   rtRetType15M = imRtIsDxy ? xRetType15M : imRtIsYield ? yRetType15M : oRetType15M
+int   rtRetDir15M  = imRtIsDxy ? xRetDir15M : imRtIsYield ? yRetDir15M : oRetDir15M
+int   rtLeader15M  = imRtIsDxy ? xLeader15M : imRtIsYield ? yLeader15M : oLeader15M
+float rtCorr5M    = imRtIsDxy ? corrX5M : imRtIsYield ? corrY5M : corrO5M
+int   rtState5M   = imRtIsDxy ? xState5M : imRtIsYield ? yState5M : oState5M
+int   rtPreDir5M  = imRtIsDxy ? xPreDir5M : imRtIsYield ? yPreDir5M : oPreDir5M
+int   rtRetType5M = imRtIsDxy ? xRetType5M : imRtIsYield ? yRetType5M : oRetType5M
+int   rtRetDir5M  = imRtIsDxy ? xRetDir5M : imRtIsYield ? yRetDir5M : oRetDir5M
+int   rtLeader5M  = imRtIsDxy ? xLeader5M : imRtIsYield ? yLeader5M : oLeader5M
+float rtCorr1M    = imRtIsDxy ? corrX1M : imRtIsYield ? corrY1M : corrO1M
+int   rtState1M   = imRtIsDxy ? xState1M : imRtIsYield ? yState1M : oState1M
+int   rtPreDir1M  = imRtIsDxy ? xPreDir1M : imRtIsYield ? yPreDir1M : oPreDir1M
+int   rtRetType1M = imRtIsDxy ? xRetType1M : imRtIsYield ? yRetType1M : oRetType1M
+int   rtRetDir1M  = imRtIsDxy ? xRetDir1M : imRtIsYield ? yRetDir1M : oRetDir1M
+int   rtLeader1M  = imRtIsDxy ? xLeader1M : imRtIsYield ? yLeader1M : oLeader1M
+
+var table imRtTbl = na
+if imShowReturnTable
+    if na(imRtTbl)
+        imRtTbl := table.new(position.top_right, 6, 7, border_width = 1)
+    if barstate.islast
+        f_rtCell(imRtTbl, 0, 0, imReturnTableMarket, color.new(color.gray, 30))
+        f_rtCell(imRtTbl, 1, 0, "Corr",   color.new(color.gray, 30))
+        f_rtCell(imRtTbl, 2, 0, "State",  color.new(color.gray, 30))
+        f_rtCell(imRtTbl, 3, 0, "PreDir", color.new(color.gray, 30))
+        f_rtCell(imRtTbl, 4, 0, "Return", color.new(color.gray, 30))
+        f_rtCell(imRtTbl, 5, 0, "Leader", color.new(color.gray, 30))
+        f_rtRow(imRtTbl, 1, "D", imRtOnMkt and useIntermarketD, rtCorrD, rtStateD, rtPreDirD, rtRetTypeD, rtRetDirD, rtLeaderD, imReturnTableMarket)
+        f_rtRow(imRtTbl, 2, "4H", imRtOnMkt and useIntermarket4H, rtCorr4H, rtState4H, rtPreDir4H, rtRetType4H, rtRetDir4H, rtLeader4H, imReturnTableMarket)
+        f_rtRow(imRtTbl, 3, "1H", imRtOnMkt and useIntermarket1H, rtCorr1H, rtState1H, rtPreDir1H, rtRetType1H, rtRetDir1H, rtLeader1H, imReturnTableMarket)
+        f_rtRow(imRtTbl, 4, "15M", imRtOnMkt and useIntermarket15M, rtCorr15M, rtState15M, rtPreDir15M, rtRetType15M, rtRetDir15M, rtLeader15M, imReturnTableMarket)
+        f_rtRow(imRtTbl, 5, "5M", imRtOnMkt and useIntermarket5M, rtCorr5M, rtState5M, rtPreDir5M, rtRetType5M, rtRetDir5M, rtLeader5M, imReturnTableMarket)
+        f_rtRow(imRtTbl, 6, "1M", imRtOnMkt and useIntermarket1M, rtCorr1M, rtState1M, rtPreDir1M, rtRetType1M, rtRetDir1M, rtLeader1M, imReturnTableMarket)
