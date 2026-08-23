@@ -872,7 +872,7 @@ f_trigTxt(CaseCfg c) =>
         s := s == "" ? "なし" : s
     s
 
-f_msg(string prefix, CaseCfg c, int dir, float e, float sl, float tp, float sz) =>
+f_msg(string prefix, CaseCfg c, int dir, float e, float sl, float tp, float sz, bool dual) =>
     "【" + prefix + "】\n" +
      (dir == 1 ? "LONG" : "SHORT") +
      "\nEntry: " + str.tostring(e, format.mintick) +
@@ -880,10 +880,11 @@ f_msg(string prefix, CaseCfg c, int dir, float e, float sl, float tp, float sz) 
      "\nTP: "    + str.tostring(tp, format.mintick) +
      "\nSize: "  + str.tostring(sz) +
      "\nRank: ⭐️" + str.tostring(c.rank) +
-     "\nFVG Rebound: " + f_fvgTxt(c) +
+     "\nFVG Rebound: " + (dual ? "5M+15M FVG反発 同時成立" : f_fvgTxt(c)) +
      "\nEnv: "   + f_dirTxt(c.req4H) + "/" + f_dirTxt(c.req1H) + "/" + f_dirTxt(c.req15M) +
      "\nVol: "   + str.tostring(c.volMin) + "〜" + str.tostring(c.volMax) +
      "\nTrigger: " + f_trigTxt(c) +
+     "\n重複統合: " + (dual ? "YES" : "NO") +
      "\nCase: "  + str.tostring(c.id)
 
 // ============================================================
@@ -1026,6 +1027,21 @@ varip array<string> usedShortSigs     = array.new_string()
 //    (4) Trigger Cooldown (lastTrigBar) = BOS等トリガーの発火間隔制御。
 //        → (2)(3)(4)は独立。Cooldown OFF でも 1 FVGイベント = 1確定エントリー は必ず守られる。
 // ============================================================
+// --- 5M/15M FVG反発グループ 同方向1ポジション制御 (Case単位 posActive とは別ゲート) ---
+//   対象 = c.f5 or c.f15 のFVG反発Case。同方向 (LONG/SHORT別) で「グループ全体に保有中が
+//   1つでもあれば、後続の同方向確定エントリーを禁止」する。ループ開始時点 (=前足までの保有) の
+//   posActive で初期化し、ループ内で「新規確定エントリー→占有ON」「決済→占有OFF」を反映する。
+//   → 5M単独/15M単独は各1エントリー。5M+15M同方向同時は先頭Caseのみ確定。LONG/SHORTは独立。
+bool grpLongHeld  = false
+bool grpShortHeld = false
+if is5m
+    for gi = 0 to array.size(CASES) - 1
+        CaseCfg gc = array.get(CASES, gi)
+        if (gc.f5 or gc.f15) and gc.posActive
+            if gc.posDir == 1
+                grpLongHeld := true
+            else if gc.posDir == -1
+                grpShortHeld := true
 if is5m
     for i = 0 to array.size(CASES) - 1
         CaseCfg c = array.get(CASES, i)
@@ -1069,10 +1085,22 @@ if is5m
                     virtualBalance += c.posSize * (xp - c.posEntry) * syminfo.pointvalue * c.posDir
                 c.posActive := false
                 justClosed  := true
+                // グループ占有解除 : 5M/15M FVG反発Caseが決済(TP/SL/BE)されたら同方向の占有をOFF
+                //   → 決済後は同グループの同方向エントリーを再度許可 (仕様どおり)。
+                if c.f5 or c.f15
+                    if c.posDir == 1
+                        grpLongHeld := false
+                    else if c.posDir == -1
+                        grpShortHeld := false
         // --- (b) 評価 (再アーム/Cooldown状態を毎足更新・保有中も呼ぶ) ---
         [v, d, e, sl, tp, sz, nt] = f_evalCase(c)
         // --- (c) シグナル発行 (このCaseがフラット かつ 当該足で決済していない時のみ) ---
         if v and not c.posActive and not justClosed
+            // --- 5M+15M 同時成立判定 (表示用) : 同方向で 5M・15M 両方のFVG反発biasが成立しているか。
+            //   確定エントリーを出す前に判定する (後続Caseを見て判断しない)。単独成立=false。
+            bool dualRebound = (c.f5 or c.f15) and efvg5Bias == d and efvgMBias == d
+            // --- 5M/15M FVG反発グループ 同方向占有 (このCaseがグループ対象かつ同方向が既に保有中か) ---
+            bool grpBusy = (c.f5 or c.f15) and (d == 1 ? grpLongHeld : grpShortHeld)
             // このCaseが今根拠にしているFVGイベントの signature (選択TFのeventId + 方向)
             string _sig     = f_fvgSig(c, d)
             // 判定は必ず varip 配列を参照する (CaseCfg の通常フィールドは使わない = rollback 回避)
@@ -1091,7 +1119,7 @@ if is5m
             int    _lastTentBar   = d == 1 ? array.get(tentLongBars, i) : array.get(tentShortBars, i)
             bool tentativeEntryEvent = _fvgEventUnused and _fvgTentUnused and barstate.isrealtime and not barstate.isconfirmed and _lastTentBar != bar_index
             if tentativeEntryEvent
-                alert(f_msg("仮シグナル", c, d, e, sl, tp, sz), alert.freq_all)
+                alert(f_msg("仮シグナル", c, d, e, sl, tp, sz, dualRebound), alert.freq_all)
                 if d == 1
                     array.set(tentUsedLongSigs,  i, _sig)      // このFVG signatureで仮通知済みに (足をまたいで再通知しない)
                     array.set(tentLongBars,      i, bar_index) // 同一5分足 intrabar の tick 連打防止
@@ -1102,10 +1130,12 @@ if is5m
             //   confirmedEntryEvent が true のときだけ「確定alert / label / posON / FVG消費」を単一イベントとして
             //   一括実行する (両者は同一条件式なので alert だけ・label だけ が論理上発生しない)。
             int _lastConfirmedBar = d == 1 ? array.get(confirmedLongBars, i) : array.get(confirmedShortBars, i)
-            bool confirmedEntryEvent = _fvgEventUnused and barstate.isconfirmed and _lastConfirmedBar != bar_index
+            // 確定エントリーは「1 FVGイベント制御 + intrabar重複防止」に加え、5M/15M FVG反発グループの
+            //   同方向占有中 (grpBusy) なら禁止 → 5M+15M同方向同時成立は先頭Caseのみ確定 (2重リスク防止)。
+            bool confirmedEntryEvent = _fvgEventUnused and barstate.isconfirmed and _lastConfirmedBar != bar_index and not grpBusy
             if confirmedEntryEvent
-                alert(f_msg("確定シグナル", c, d, e, sl, tp, sz), alert.freq_all)
-                label.new(bar_index, d == 1 ? low : high, f_msg("確定", c, d, e, sl, tp, sz), style = d == 1 ? label.style_label_up : label.style_label_down, color = d == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, size = size.small)
+                alert(f_msg("確定シグナル", c, d, e, sl, tp, sz, dualRebound), alert.freq_all)
+                label.new(bar_index, d == 1 ? low : high, f_msg("確定", c, d, e, sl, tp, sz, dualRebound), style = d == 1 ? label.style_label_up : label.style_label_down, color = d == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, size = size.small)
                 if d == 1
                     array.set(confirmedLongBars, i, bar_index)
                 else
@@ -1117,6 +1147,12 @@ if is5m
                 c.posSL     := sl
                 c.posTP     := tp
                 c.posSize   := sz
+                // グループ占有ON : 5M/15M FVG反発Caseが確定したら同方向を占有 (同足の後続Caseを禁止)
+                if c.f5 or c.f15
+                    if d == 1
+                        grpLongHeld := true
+                    else
+                        grpShortHeld := true
                 // このFVGイベントを consumed に (同一signatureは決済後・env再一致後も二度と許可しない・varip保持)
                 if d == 1
                     array.set(usedLongSigs,  i, _sig)
