@@ -954,6 +954,49 @@ f_evalCase(CaseCfg c) =>
     bool valid = dir != 0 and not na(risk) and risk > 0 and size >= 1   // ★ Size<1 除外はここ
     [valid, dir, entry, sl, tp, size, noTrig]
 
+// --- 副作用なしの評価 (5M+15M 同時成立の事前判定専用) ---
+//   f_evalCase と同一ロジックで「そのCaseが当該5分足で成立するエントリー候補方向 (1/-1/0)」だけを返す。
+//   ※ 再アーム(armed:=)・Cooldown(lastTrigBar:=) の書き込みは一切行わない (発注ループの本評価と二重に
+//     状態を書き換えない = Trigger Cooldown 等を壊さない)。書き込みを除いても valid/dir の結果は
+//     f_evalCase と一致する (再アームは major不成立時のみ=その時 dir=0 / Cooldown書込は cdOk 計算後)。
+f_evalCaseDir(CaseCfg c) =>
+    bool volRangeOk = not useDailyVolFilter or (not na(dailyVolMedian) and dailyVolMedian >= c.volMin and dailyVolMedian < c.volMax)
+    bool envOk = c.req4H == trend4H and c.req1H == trend1H and c.req15M == trend15M and volRangeOk and dailyDirGateOk and sessionOk and allowByNewsTime and volOk and not blockedByAccum and not blockedByAccumExitWait
+    int score = (c.fD ? efvgWeightD * efvgDBias : 0) + (c.f4 ? efvgWeight4H * efvgHBias : 0) + (c.f1 ? efvgWeight1H * efvgOBias : 0) + (c.f15 ? efvgWeight15M * efvgMBias : 0) + (c.f5 ? efvgWeight5M * efvg5Bias : 0) + (c.f1m ? efvgWeight1M * efvg1Bias : 0)
+    bool fvgLong  = score >=  c.thr
+    bool fvgShort = score <= -c.thr
+    int te = (c.tEng?1:0)+(c.tPin?1:0)+(c.tBOS?1:0)+(c.tEMA?1:0)+(c.tFVG?1:0)+(c.tStr?1:0)
+    bool gate = c.useTrig and te > 0
+    bool noTrig = not gate
+    int bc = (c.tEng and agBEng?1:0)+(c.tPin and agBPin?1:0)+(c.tBOS and agBBOS?1:0)+(c.tEMA and agBEMA?1:0)+(c.tFVG and agBFVG?1:0)+(c.tStr and agBStr?1:0)
+    int sc = (c.tEng and agSEng?1:0)+(c.tPin and agSPin?1:0)+(c.tBOS and agSBOS?1:0)+(c.tEMA and agSEMA?1:0)+(c.tFVG and agSFVG?1:0)+(c.tStr and agSStr?1:0)
+    bool bHit = f_combineTrig(bc, te)
+    bool sHit = f_combineTrig(sc, te)
+    bool conflict = gate and useOppositeTriggerNoTrade and bHit and sHit
+    bool bTrig = bHit and not conflict
+    bool sTrig = sHit and not conflict
+    bool majorLong  = envOk and fvgLong  and accumLongDirectionOk
+    bool majorShort = envOk and fvgShort and accumShortDirectionOk
+    bool cdOk = not useTriggerCooldown or na(c.lastTrigBar) or (bar_index - c.lastTrigBar) > triggerCooldownBars
+    bool longGate  = noTrig ? c.armedLong  : (bTrig and cdOk)
+    bool shortGate = noTrig ? c.armedShort : (sTrig and cdOk)
+    bool longWant  = c.aLong  and majorLong  and longGate
+    bool shortWant = c.aShort and majorShort and shortGate
+    if longWant and shortWant
+        if close >= open
+            shortWant := false
+        else
+            longWant := false
+    int dir = longWant ? 1 : shortWant ? -1 : 0
+    float entry = close
+    float sl = dir == 1 ? entry - c.sl : dir == -1 ? entry + c.sl : na
+    float risk = dir == 1 ? entry - sl : dir == -1 ? sl - entry : na
+    float baseCap = useCompound ? virtualBalance : calcCapital
+    float riskCap = baseCap * riskPct / 100.0
+    float size = (not na(risk) and risk > 0) ? math.floor(riskCap / (risk * syminfo.pointvalue)) : 0.0
+    bool valid = dir != 0 and not na(risk) and risk > 0 and size >= 1
+    valid ? dir : 0
+
 // ============================================================
 //  19. 5分足限定フラグ
 // ============================================================
@@ -1034,6 +1077,13 @@ varip array<string> usedShortSigs     = array.new_string()
 //   → 5M単独/15M単独は各1エントリー。5M+15M同方向同時は先頭Caseのみ確定。LONG/SHORTは独立。
 bool grpLongHeld  = false
 bool grpShortHeld = false
+// --- 5M+15M 同時成立 事前判定用フラグ (当該5分足で実際にエントリー条件が成立したCaseの有無) ---
+//   held(保持中)のbiasだけでは同時成立にしない。f_evalCaseDir で「そのCaseが当該足で成立する
+//   エントリー候補方向」を副作用なしで求め、5M Case / 15M Case それぞれの LONG/SHORT 成立有無を集約。
+bool g5Long   = false
+bool g15Long  = false
+bool g5Short  = false
+bool g15Short = false
 if is5m
     for gi = 0 to array.size(CASES) - 1
         CaseCfg gc = array.get(CASES, gi)
@@ -1042,6 +1092,14 @@ if is5m
                 grpLongHeld := true
             else if gc.posDir == -1
                 grpShortHeld := true
+        // 当該5分足のエントリー候補方向 (副作用なし) を集約 → 5M+15M 同時成立の表示判定に使用
+        int gcd = f_evalCaseDir(gc)
+        if gc.f5
+            g5Long  := g5Long  or gcd == 1
+            g5Short := g5Short or gcd == -1
+        if gc.f15
+            g15Long  := g15Long  or gcd == 1
+            g15Short := g15Short or gcd == -1
 if is5m
     for i = 0 to array.size(CASES) - 1
         CaseCfg c = array.get(CASES, i)
@@ -1096,9 +1154,10 @@ if is5m
         [v, d, e, sl, tp, sz, nt] = f_evalCase(c)
         // --- (c) シグナル発行 (このCaseがフラット かつ 当該足で決済していない時のみ) ---
         if v and not c.posActive and not justClosed
-            // --- 5M+15M 同時成立判定 (表示用) : 同方向で 5M・15M 両方のFVG反発biasが成立しているか。
+            // --- 5M+15M 同時成立判定 (表示用) : 当該5分足で 5M Case と 15M Case の「エントリー条件」が
+            //   同方向で実際に成立したか (held bias だけでは同時成立にしない)。事前集約した4フラグを使用。
             //   確定エントリーを出す前に判定する (後続Caseを見て判断しない)。単独成立=false。
-            bool dualRebound = (c.f5 or c.f15) and efvg5Bias == d and efvgMBias == d
+            bool dualRebound = (c.f5 or c.f15) and (d == 1 ? (g5Long and g15Long) : (g5Short and g15Short))
             // --- 5M/15M FVG反発グループ 同方向占有 (このCaseがグループ対象かつ同方向が既に保有中か) ---
             bool grpBusy = (c.f5 or c.f15) and (d == 1 ? grpLongHeld : grpShortHeld)
             // このCaseが今根拠にしているFVGイベントの signature (選択TFのeventId + 方向)
