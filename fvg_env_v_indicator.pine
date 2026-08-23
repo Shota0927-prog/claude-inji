@@ -828,7 +828,7 @@ f_fvgSig(CaseCfg c, int dir) =>
      (c.f5  ? ":M5"  + str.tostring(efvg5Event) : "") +
      (c.f1m ? ":M1"  + str.tostring(efvg1Event) : "")
 
-f_msg(string prefix, CaseCfg c, int dir, float e, float sl, float tp, float sz) =>
+f_msg(string prefix, CaseCfg c, int dir, float e, float sl, float tp, float sz, string fvgTxt, bool dual) =>
     "【" + prefix + "】\n" +
      (dir == 1 ? "LONG" : "SHORT") +
      "\nEntry: " + str.tostring(e, format.mintick) +
@@ -836,10 +836,11 @@ f_msg(string prefix, CaseCfg c, int dir, float e, float sl, float tp, float sz) 
      "\nTP: "    + str.tostring(tp, format.mintick) +
      "\nSize: "  + str.tostring(sz) +
      "\nRank: ⭐️" + str.tostring(c.rank) +
-     "\nFVG: "   + f_fvgTxt(c) +
+     "\nFVG Absorption: " + fvgTxt +
      "\nThreshold: " + str.tostring(c.thr) +
      "\nEnv: "   + f_dirTxt(c.req4H) + "/" + f_dirTxt(c.req1H) + "/" + f_dirTxt(c.req15M) +
      "\nVol: "   + str.tostring(c.volMin) + "〜" + str.tostring(c.volMax) +
+     "\n重複統合: " + (dual ? "YES" : "NO") +
      "\nCase: "  + str.tostring(c.id)
 
 // ============================================================
@@ -908,6 +909,66 @@ f_evalCase(CaseCfg c) =>
     float size = (not na(risk) and risk > 0) ? math.floor(riskCap / (risk * syminfo.pointvalue)) : 0.0
     bool valid = dir != 0 and not na(risk) and risk > 0 and size >= 1   // ★ Size<1 除外はここ
     [valid, dir, entry, sl, tp, size, noTrig]
+
+// --- 副作用なしの評価 (複数TF 同時成立の事前判定専用) ---
+//   f_evalCase と同一ロジックで「そのCaseが当該5分足で成立するエントリー候補方向 (1/-1/0)」だけを返す。
+//   ※ 再アーム(armed:=)・Cooldown(lastTrigBar:=) の書き込みは一切行わない (発注ループの本評価と二重に
+//     状態を書き換えない = Trigger Cooldown 等を壊さない)。書き込みを除いても valid/dir の結果は
+//     f_evalCase と一致する (再アームは major不成立時のみ=その時 dir=0 / Cooldown書込は cdOk 計算後)。
+f_evalCaseDir(CaseCfg c) =>
+    bool volRangeOk = not useDailyVolFilter or (not na(dailyVolMedian) and dailyVolMedian >= c.volMin and dailyVolMedian < c.volMax)
+    bool envOk = c.req4H == trend4H and c.req1H == trend1H and c.req15M == trend15M and volRangeOk and dailyDirGateOk and sessionOk and allowByNewsTime and volOk and not blockedByAccum and not blockedByAccumExitWait
+    int score = (c.fD ? efvgWeightD * efvgDBias : 0) + (c.f4 ? efvgWeight4H * efvgHBias : 0) + (c.f1 ? efvgWeight1H * efvgOBias : 0) + (c.f15 ? efvgWeight15M * efvgMBias : 0) + (c.f5 ? efvgWeight5M * efvg5Bias : 0) + (c.f1m ? efvgWeight1M * efvg1Bias : 0)
+    bool fvgLong  = score >=  c.thr
+    bool fvgShort = score <= -c.thr
+    int te = (c.tEng?1:0)+(c.tPin?1:0)+(c.tBOS?1:0)+(c.tEMA?1:0)+(c.tFVG?1:0)+(c.tStr?1:0)
+    bool gate = c.useTrig and te > 0
+    bool noTrig = not gate
+    int bc = (c.tEng and agBEng?1:0)+(c.tPin and agBPin?1:0)+(c.tBOS and agBBOS?1:0)+(c.tEMA and agBEMA?1:0)+(c.tFVG and agBFVG?1:0)+(c.tStr and agBStr?1:0)
+    int sc = (c.tEng and agSEng?1:0)+(c.tPin and agSPin?1:0)+(c.tBOS and agSBOS?1:0)+(c.tEMA and agSEMA?1:0)+(c.tFVG and agSFVG?1:0)+(c.tStr and agSStr?1:0)
+    bool bHit = f_combineTrig(bc, te)
+    bool sHit = f_combineTrig(sc, te)
+    bool conflict = gate and useOppositeTriggerNoTrade and bHit and sHit
+    bool bTrig = bHit and not conflict
+    bool sTrig = sHit and not conflict
+    bool majorLong  = envOk and fvgLong  and accumLongDirectionOk
+    bool majorShort = envOk and fvgShort and accumShortDirectionOk
+    bool cdOk = not useTriggerCooldown or na(c.lastTrigBar) or (bar_index - c.lastTrigBar) > triggerCooldownBars
+    bool longGate  = noTrig ? c.armedLong  : (bTrig and cdOk)
+    bool shortGate = noTrig ? c.armedShort : (sTrig and cdOk)
+    bool longWant  = c.aLong  and majorLong  and longGate
+    bool shortWant = c.aShort and majorShort and shortGate
+    if longWant and shortWant
+        if close >= open
+            shortWant := false
+        else
+            longWant := false
+    int dir = longWant ? 1 : shortWant ? -1 : 0
+    float entry = close
+    float sl = dir == 1 ? entry - c.sl : dir == -1 ? entry + c.sl : na
+    float risk = dir == 1 ? entry - sl : dir == -1 ? sl - entry : na
+    float baseCap = useCompound ? virtualBalance : calcCapital
+    float riskCap = baseCap * riskPct / 100.0
+    float size = (not na(risk) and risk > 0) ? math.floor(riskCap / (risk * syminfo.pointvalue)) : 0.0
+    bool valid = dir != 0 and not na(risk) and risk > 0 and size >= 1
+    valid ? dir : 0
+
+// 同時成立TFの表示文字列を昇順 (1M→5M→15M→1H→4H→D) で連結する。
+f_comboTxt(bool b1m, bool b5, bool b15, bool b1h, bool b4h, bool bD) =>
+    string s = ""
+    if b1m
+        s := s == "" ? "1M" : s + "+1M"
+    if b5
+        s := s == "" ? "5M" : s + "+5M"
+    if b15
+        s := s == "" ? "15M" : s + "+15M"
+    if b1h
+        s := s == "" ? "1H" : s + "+1H"
+    if b4h
+        s := s == "" ? "4H" : s + "+4H"
+    if bD
+        s := s == "" ? "D" : s + "+D"
+    s
 
 // ============================================================
 //  19. 5分足限定フラグ
@@ -988,6 +1049,60 @@ varip array<string> usedShortSigs     = array.new_string()
 //    (4) Trigger Cooldown (lastTrigBar) = BOS等トリガーの発火間隔制御。
 //        → (2)(3)(4)は独立。Cooldown OFF でも 1 FVGイベント = 1確定エントリー は必ず守られる。
 // ============================================================
+// --- FVG吸収 全TFグループ 同方向1ポジション制御 (Case単位 posActive とは別ゲート) ---
+//   対象 = FVG吸収TF (D/4H/1H/15M/5M/1M いずれか) を使う全Case = 1グループ。
+//   同方向 (LONG/SHORT別) で「グループ全体に保有中が1つでもあれば、別TFのFVG吸収Caseが成立しても
+//   追加確定エントリーを禁止」する。ループ開始時点 (=前足までの保有) の posActive で初期化し、
+//   ループ内で「新規確定エントリー→占有ON」「決済(TP/SL/BE)→占有OFF」を反映する。
+//   → 同一5分足で複数TF同方向成立時は CASES 先頭Caseのみ確定。LONG/SHORTは独立管理。
+bool grpLongHeld  = false
+bool grpShortHeld = false
+// 各TF×方向の「当該5分足で実際にエントリー条件が成立したか」(held bias ではなく副作用なし実評価) を集約。
+bool gDLong=false
+bool g4Long=false
+bool g1Long=false
+bool g15Long=false
+bool g5Long=false
+bool g1mLong=false
+bool gDShort=false
+bool g4Short=false
+bool g1Short=false
+bool g15Short=false
+bool g5Short=false
+bool g1mShort=false
+if is5m
+    for gi = 0 to array.size(CASES) - 1
+        CaseCfg gc = array.get(CASES, gi)
+        bool _isGrp = gc.fD or gc.f4 or gc.f1 or gc.f15 or gc.f5 or gc.f1m
+        if _isGrp and gc.posActive
+            if gc.posDir == 1
+                grpLongHeld := true
+            else if gc.posDir == -1
+                grpShortHeld := true
+        int gcd = f_evalCaseDir(gc)   // 副作用なし: 当該足のエントリー候補方向 (1/-1/0)
+        if gc.fD
+            gDLong  := gDLong  or gcd == 1
+            gDShort := gDShort or gcd == -1
+        if gc.f4
+            g4Long  := g4Long  or gcd == 1
+            g4Short := g4Short or gcd == -1
+        if gc.f1
+            g1Long  := g1Long  or gcd == 1
+            g1Short := g1Short or gcd == -1
+        if gc.f15
+            g15Long  := g15Long  or gcd == 1
+            g15Short := g15Short or gcd == -1
+        if gc.f5
+            g5Long  := g5Long  or gcd == 1
+            g5Short := g5Short or gcd == -1
+        if gc.f1m
+            g1mLong  := g1mLong  or gcd == 1
+            g1mShort := g1mShort or gcd == -1
+// 同時成立TF文字列 + 本数 (LONG/SHORT別)。2TF以上 = 同時成立。
+string comboLongTxt  = f_comboTxt(g1mLong, g5Long, g15Long, g1Long, g4Long, gDLong)
+string comboShortTxt = f_comboTxt(g1mShort, g5Short, g15Short, g1Short, g4Short, gDShort)
+int comboLongCnt  = (g1mLong?1:0)+(g5Long?1:0)+(g15Long?1:0)+(g1Long?1:0)+(g4Long?1:0)+(gDLong?1:0)
+int comboShortCnt = (g1mShort?1:0)+(g5Short?1:0)+(g15Short?1:0)+(g1Short?1:0)+(g4Short?1:0)+(gDShort?1:0)
 if is5m
     for i = 0 to array.size(CASES) - 1
         CaseCfg c = array.get(CASES, i)
@@ -1020,10 +1135,25 @@ if is5m
                     virtualBalance += c.posSize * (xp - c.posEntry) * syminfo.pointvalue * c.posDir
                 c.posActive := false
                 justClosed  := true
+                // グループ占有解除 : FVG吸収Caseが決済(TP/SL/BE)されたら同方向の占有をOFF
+                //   → 決済後は同グループの同方向エントリーを再度許可 (仕様どおり)。
+                if c.fD or c.f4 or c.f1 or c.f15 or c.f5 or c.f1m
+                    if c.posDir == 1
+                        grpLongHeld := false
+                    else if c.posDir == -1
+                        grpShortHeld := false
         // --- (b) 評価 (再アーム/Cooldown状態を毎足更新・保有中も呼ぶ) ---
         [v, d, e, sl, tp, sz, nt] = f_evalCase(c)
         // --- (c) シグナル発行 (このCaseがフラット かつ 当該足で決済していない時のみ) ---
         if v and not c.posActive and not justClosed
+            // --- 複数TF 同時成立判定 (表示用) : 当該5分足で同方向のFVG吸収エントリー条件が
+            //   2TF以上で成立したか (held bias ではなく事前集約した実成立フラグを使用)。
+            bool _isGrp = c.fD or c.f4 or c.f1 or c.f15 or c.f5 or c.f1m
+            int  comboCnt = d == 1 ? comboLongCnt : comboShortCnt
+            bool dual = _isGrp and comboCnt >= 2
+            string fvgTxtLine = dual ? ((d == 1 ? comboLongTxt : comboShortTxt) + " 同時成立") : f_fvgTxt(c)
+            // --- FVG吸収グループ 同方向占有 (このCaseがグループ対象かつ同方向が既に保有中か) ---
+            bool grpBusy = _isGrp and (d == 1 ? grpLongHeld : grpShortHeld)
             // このCaseが今根拠にしているFVGイベントの signature (選択TFのeventId + 方向)
             string _sig     = f_fvgSig(c, d)
             // 判定は必ず varip 配列を参照する (CaseCfg の通常フィールドは使わない = rollback 回避)
@@ -1042,7 +1172,7 @@ if is5m
             int    _lastTentBar   = d == 1 ? array.get(tentLongBars, i) : array.get(tentShortBars, i)
             bool tentativeEntryEvent = _fvgEventUnused and _fvgTentUnused and barstate.isrealtime and not barstate.isconfirmed and _lastTentBar != bar_index
             if tentativeEntryEvent
-                alert(f_msg("仮シグナル", c, d, e, sl, tp, sz), alert.freq_all)
+                alert(f_msg("仮シグナル", c, d, e, sl, tp, sz, fvgTxtLine, dual), alert.freq_all)
                 if d == 1
                     array.set(tentUsedLongSigs,  i, _sig)      // このFVG signatureで仮通知済みに (足をまたいで再通知しない)
                     array.set(tentLongBars,      i, bar_index) // 同一5分足 intrabar の tick 連打防止
@@ -1053,10 +1183,12 @@ if is5m
             //   confirmedEntryEvent が true のときだけ「確定alert / label / posON / FVG消費」を単一イベントとして
             //   一括実行する (両者は同一条件式なので alert だけ・label だけ が論理上発生しない)。
             int _lastConfirmedBar = d == 1 ? array.get(confirmedLongBars, i) : array.get(confirmedShortBars, i)
-            bool confirmedEntryEvent = _fvgEventUnused and barstate.isconfirmed and _lastConfirmedBar != bar_index
+            // 確定エントリーは「1 FVGイベント制御 + intrabar重複防止」に加え、FVG吸収グループの
+            //   同方向占有中 (grpBusy) なら禁止 → 同一5分足で複数TF同方向成立は先頭Caseのみ確定 (多重リスク防止)。
+            bool confirmedEntryEvent = _fvgEventUnused and barstate.isconfirmed and _lastConfirmedBar != bar_index and not grpBusy
             if confirmedEntryEvent
-                alert(f_msg("確定シグナル", c, d, e, sl, tp, sz), alert.freq_all)
-                label.new(bar_index, d == 1 ? low : high, f_msg("確定", c, d, e, sl, tp, sz), style = d == 1 ? label.style_label_up : label.style_label_down, color = d == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, size = size.small)
+                alert(f_msg("確定シグナル", c, d, e, sl, tp, sz, fvgTxtLine, dual), alert.freq_all)
+                label.new(bar_index, d == 1 ? low : high, f_msg("確定", c, d, e, sl, tp, sz, fvgTxtLine, dual), style = d == 1 ? label.style_label_up : label.style_label_down, color = d == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, size = size.small)
                 if d == 1
                     array.set(confirmedLongBars, i, bar_index)
                 else
@@ -1068,6 +1200,12 @@ if is5m
                 c.posSL     := sl
                 c.posTP     := tp
                 c.posSize   := sz
+                // グループ占有ON : FVG吸収Caseが確定したら同方向を占有 (同足の後続Case・別TFを禁止)
+                if _isGrp
+                    if d == 1
+                        grpLongHeld := true
+                    else
+                        grpShortHeld := true
                 // このFVGイベントを consumed に (同一signatureは決済後・env再一致後も二度と許可しない・varip保持)
                 if d == 1
                     array.set(usedLongSigs,  i, _sig)
