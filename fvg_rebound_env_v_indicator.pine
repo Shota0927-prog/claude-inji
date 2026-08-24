@@ -1049,6 +1049,12 @@ varip array<string> tentUsedLongSigs  = array.new_string()
 varip array<string> tentUsedShortSigs = array.new_string()
 varip array<string> usedLongSigs      = array.new_string()
 varip array<string> usedShortSigs     = array.new_string()
+// --- 環境変化 例外用 : 直近に確定エントリーを許可した 4H/1H/15M EMA環境 signature (方向別) ---
+//   同方向グループ保有中(grpBusy)でも、現在の環境signatureが前回エントリー時と異なれば
+//   「新環境につき1回だけ」追加確定エントリーを許可する。消費は確定エントリー成立時のみ (仮では消費しない)。
+//   varip = tick/足をまたいで不変 (書込みは確定エントリー時=commit点)。
+varip string lastLongEntryEnvSig  = ""
+varip string lastShortEntryEnvSig = ""
 
 // ============================================================
 //  21. ケースごと独立処理 (決済 → 状態更新 → シグナル発行)
@@ -1070,11 +1076,15 @@ varip array<string> usedShortSigs     = array.new_string()
 //    (4) Trigger Cooldown (lastTrigBar) = BOS等トリガーの発火間隔制御。
 //        → (2)(3)(4)は独立。Cooldown OFF でも 1 FVGイベント = 1確定エントリー は必ず守られる。
 // ============================================================
-// --- 5M/15M FVG反発グループ 同方向1ポジション制御 (Case単位 posActive とは別ゲート) ---
+// 現在の 4H/1H/15M EMA環境 signature (環境変化の例外判定に使用)
+string curEnvSig = str.tostring(trend4H) + ":" + str.tostring(trend1H) + ":" + str.tostring(trend15M)
+// --- 5M/15M FVG反発グループ 同方向ポジション制御 (Case単位 posActive とは別ゲート) ---
 //   対象 = c.f5 or c.f15 のFVG反発Case。同方向 (LONG/SHORT別) で「グループ全体に保有中が
-//   1つでもあれば、後続の同方向確定エントリーを禁止」する。ループ開始時点 (=前足までの保有) の
-//   posActive で初期化し、ループ内で「新規確定エントリー→占有ON」「決済→占有OFF」を反映する。
-//   → 5M単独/15M単独は各1エントリー。5M+15M同方向同時は先頭Caseのみ確定。LONG/SHORTは独立。
+//   1つでもあれば新規確定エントリーを原則禁止」する。ただし 4H/1H/15M 環境が前回エントリー時から
+//   変化した場合のみ「新環境につき1回だけ」例外的に追加を許可する (envChangedEntryAllowed)。
+//   占有状態 grpLongHeld/grpShortHeld は「CASES全体の posActive を再走査」して求める (ループ開始時点の
+//   全保有 + 同足の新規確定を反映)。1ポジ決済で false にはしない (他の同方向ポジが残る可能性があるため)。
+//   → 5M単独/15M単独は各1。5M+15M同方向同時は先頭Caseのみ。環境変化時のみ保有中でも1回追加。LONG/SHORT独立。
 bool grpLongHeld  = false
 bool grpShortHeld = false
 // --- 5M+15M 同時成立 事前判定用フラグ (当該5分足で実際にエントリー条件が成立したCaseの有無) ---
@@ -1143,13 +1153,8 @@ if is5m
                     virtualBalance += c.posSize * (xp - c.posEntry) * syminfo.pointvalue * c.posDir
                 c.posActive := false
                 justClosed  := true
-                // グループ占有解除 : 5M/15M FVG反発Caseが決済(TP/SL/BE)されたら同方向の占有をOFF
-                //   → 決済後は同グループの同方向エントリーを再度許可 (仕様どおり)。
-                if c.f5 or c.f15
-                    if c.posDir == 1
-                        grpLongHeld := false
-                    else if c.posDir == -1
-                        grpShortHeld := false
+                // ※ グループ占有はここでは false にしない (同方向に別ポジが残る可能性があるため)。
+                //   占有解除は次足のループ開始時 再走査 (posActive) で自動反映される。
         // --- (b) 評価 (再アーム/Cooldown状態を毎足更新・保有中も呼ぶ) ---
         [v, d, e, sl, tp, sz, nt] = f_evalCase(c)
         // --- (c) シグナル発行 (このCaseがフラット かつ 当該足で決済していない時のみ) ---
@@ -1160,6 +1165,11 @@ if is5m
             bool dualRebound = (c.f5 or c.f15) and (d == 1 ? (g5Long and g15Long) : (g5Short and g15Short))
             // --- 5M/15M FVG反発グループ 同方向占有 (このCaseがグループ対象かつ同方向が既に保有中か) ---
             bool grpBusy = (c.f5 or c.f15) and (d == 1 ? grpLongHeld : grpShortHeld)
+            // --- 環境変化 例外 : 同方向保有中(grpBusy)でも 4H/1H/15M 環境が前回エントリー時から
+            //   変化していれば「新環境につき1回だけ」許可。消費(=lastEntryEnvSig更新)は確定エントリー成立時のみ。
+            string _lastEntryEnvSig = d == 1 ? lastLongEntryEnvSig : lastShortEntryEnvSig
+            bool envChangedEntryAllowed = curEnvSig != _lastEntryEnvSig
+            bool groupEntryAllowed = not grpBusy or envChangedEntryAllowed
             // このCaseが今根拠にしているFVGイベントの signature (選択TFのeventId + 方向)
             string _sig     = f_fvgSig(c, d)
             // 判定は必ず varip 配列を参照する (CaseCfg の通常フィールドは使わない = rollback 回避)
@@ -1176,7 +1186,7 @@ if is5m
             string _tentUsedSig   = d == 1 ? array.get(tentUsedLongSigs, i) : array.get(tentUsedShortSigs, i)
             bool   _fvgTentUnused = _sig != _tentUsedSig
             int    _lastTentBar   = d == 1 ? array.get(tentLongBars, i) : array.get(tentShortBars, i)
-            bool tentativeEntryEvent = _fvgEventUnused and _fvgTentUnused and not grpBusy and barstate.isrealtime and not barstate.isconfirmed and _lastTentBar != bar_index
+            bool tentativeEntryEvent = _fvgEventUnused and _fvgTentUnused and groupEntryAllowed and barstate.isrealtime and not barstate.isconfirmed and _lastTentBar != bar_index
             if tentativeEntryEvent
                 alert(f_msg("仮シグナル", c, d, e, sl, tp, sz, dualRebound), alert.freq_all)
                 if d == 1
@@ -1189,9 +1199,9 @@ if is5m
             //   confirmedEntryEvent が true のときだけ「確定alert / label / posON / FVG消費」を単一イベントとして
             //   一括実行する (両者は同一条件式なので alert だけ・label だけ が論理上発生しない)。
             int _lastConfirmedBar = d == 1 ? array.get(confirmedLongBars, i) : array.get(confirmedShortBars, i)
-            // 確定エントリーは「1 FVGイベント制御 + intrabar重複防止」に加え、5M/15M FVG反発グループの
-            //   同方向占有中 (grpBusy) なら禁止 → 5M+15M同方向同時成立は先頭Caseのみ確定 (2重リスク防止)。
-            bool confirmedEntryEvent = _fvgEventUnused and barstate.isconfirmed and _lastConfirmedBar != bar_index and not grpBusy
+            // 確定エントリーは「1 FVGイベント制御 + intrabar重複防止」に加え、グループ同方向占有中は禁止。
+            //   ただし groupEntryAllowed (= not grpBusy or 環境変化) の例外で「新環境につき1回だけ」許可。
+            bool confirmedEntryEvent = _fvgEventUnused and barstate.isconfirmed and _lastConfirmedBar != bar_index and groupEntryAllowed
             if confirmedEntryEvent
                 alert(f_msg("確定シグナル", c, d, e, sl, tp, sz, dualRebound), alert.freq_all)
                 label.new(bar_index, d == 1 ? low : high, f_msg("確定", c, d, e, sl, tp, sz, dualRebound), style = d == 1 ? label.style_label_up : label.style_label_down, color = d == 1 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, size = size.small)
@@ -1207,11 +1217,15 @@ if is5m
                 c.posTP     := tp
                 c.posSize   := sz
                 // グループ占有ON : 5M/15M FVG反発Caseが確定したら同方向を占有 (同足の後続Caseを禁止)
+                //   併せて環境変化 例外を消費 : この方向の lastEntryEnvSig を現在の環境signatureへ更新
+                //   → 同一環境が続く間は追加不可。次に環境が変わったときだけ再び1回許可される。
                 if c.f5 or c.f15
                     if d == 1
                         grpLongHeld := true
+                        lastLongEntryEnvSig := curEnvSig
                     else
                         grpShortHeld := true
+                        lastShortEntryEnvSig := curEnvSig
                 // このFVGイベントを consumed に (同一signatureは決済後・env再一致後も二度と許可しない・varip保持)
                 if d == 1
                     array.set(usedLongSigs,  i, _sig)
