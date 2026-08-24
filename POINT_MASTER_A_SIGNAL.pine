@@ -16,6 +16,9 @@
 //   ・5分足の確定足のみで判定（非リペイント）
 //   ・条件が「新しく成立した瞬間」だけ1回発火（成立が続いている間は再発火しません）
 //   ・LONG A 継続中に一気に SHORT A 条件まで反転した場合は、その足で SHORT A を新規発火
+//   ・シグナル発生後は「保有中」となり、保存した SL / TP に到達するまで
+//     同方向・反対方向とも新しいシグナルを出しません（ドテン禁止・同時保有は常に1つ）
+//     決済後は、A条件が一度崩れてから改めて成立した時だけ次のシグナルになります
 //   ・方向一致率フィルターは使いません（今回のAランク条件では不要）
 //
 // 【推奨リスク（シグナル条件ではありません・表示用）】
@@ -120,9 +123,10 @@ if evalNow
     longActive  := _lc
     shortActive := _sc
 
-// 実際に表示・通知するシグナル（5分足チャート かつ 方向ON のときだけ）
-bool longASignal  = longSignal  and useLong  and is5m
-bool shortASignal = shortSignal and useShort and is5m
+// ここで得られる longSignal / shortSignal は「A条件が新しく成立した確定足」を表す raw 値です。
+// 実際に表示・通知するシグナル（longASignal / shortASignal）は、保有中フィルターを通した後の
+// §4b で決まります。longActive / shortActive は保有中かどうかに関係なく進み続けるため、
+// 保有中ずっと成立していた条件が決済直後に後追い発火することはありません。
 
 // =====================================================================================
 // §4. 推奨SL / TP（シグナル足の終値基準）
@@ -133,6 +137,61 @@ float longStop  = entryEst - slFixed
 float longTP    = entryEst + slFixed * rrRatio
 float shortStop = entryEst + slFixed
 float shortTP   = entryEst - slFixed * rrRatio
+
+// =====================================================================================
+// §4b. 保有中フィルター（1ポジションのみ / ドテン禁止 / 重複シグナル抑止）
+// =====================================================================================
+// ・LONG A または SHORT A が発生したら「保有中」にし、Entry / SL / TP を保存します。
+// ・保有中は同方向・反対方向とも一切シグナルを出しません（ラベルもアラートも出ません）。
+// ・解除は保存した SL / TP への到達だけです（high / low で判定）。
+//     LONG  : low  <= SL → SL決済 / high >= TP → TP決済
+//     SHORT : high >= SL → SL決済 / low  <= TP → TP決済
+//   同じ足で SL と TP の両方に触れた場合は、どちらが先か分からないため保守的に SL 優先。
+// ・決済後は、A条件が一度非成立になってから改めて false → true になった新規成立だけが
+//   次のシグナルになります（保有中ずっと成立していた条件の後追い発火はしません）。
+// ★ 処理順は「① 決済判定 → ② 新規シグナル判定」です。エントリー足では ① の時点で
+//   まだ保有していないため、その足の high / low で即決済されることはありません。
+var bool  inPosition    = false
+var int   positionDir   = 0        // 1 = LONG保有 / -1 = SHORT保有 / 0 = ノーポジ
+var float positionEntry = na
+var float positionSL    = na
+var float positionTP    = na
+
+// ① 決済判定（保有中のみ・SL優先）
+bool exitSL = false
+bool exitTP = false
+if inPosition
+    if positionDir == 1
+        if low <= positionSL
+            exitSL := true
+        else if high >= positionTP
+            exitTP := true
+    else if positionDir == -1
+        if high >= positionSL
+            exitSL := true
+        else if low <= positionTP
+            exitTP := true
+    if exitSL or exitTP
+        inPosition  := false
+        positionDir := 0
+
+// ② 実際に表示・通知するシグナル（5分足チャート / 方向ON / ノーポジ の時だけ）
+bool longASignal  = longSignal  and useLong  and is5m and not inPosition
+bool shortASignal = shortSignal and useShort and is5m and not inPosition
+
+// ③ 採用したシグナルで保有状態へ（Entry / SL / TP を保存。以降は SL / TP まで固定）
+if longASignal
+    inPosition    := true
+    positionDir   := 1
+    positionEntry := entryEst
+    positionSL    := longStop
+    positionTP    := longTP
+if shortASignal
+    inPosition    := true
+    positionDir   := -1
+    positionEntry := entryEst
+    positionSL    := shortStop
+    positionTP    := shortTP
 
 // =====================================================================================
 // §5. ラベル
@@ -190,7 +249,7 @@ if shortASignal
 string statusTxt = longCondRaw ? "LONG A" : shortCondRaw ? "SHORT A" : "WAIT"
 color  statusCol = longCondRaw ? colLongC : shortCondRaw ? colShortC : colTblTxt
 
-var table statTbl = table.new(position.top_right, 2, 5, border_width = 1)
+var table statTbl = table.new(position.top_right, 2, 6, border_width = 1)
 if showTable and barstate.islast
     table.cell(statTbl, 0, 0, "POINT MASTER A", text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
     table.cell(statTbl, 1, 0, is5m ? "5M" : timeframe.period,
@@ -206,6 +265,12 @@ if showTable and barstate.islast
          bgcolor = colTblBg, text_size = tblSize)
     table.cell(statTbl, 0, 4, "STATUS", text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
     table.cell(statTbl, 1, 4, statusTxt, text_color = statusCol, bgcolor = colTblBg, text_size = tblSize)
+    // 保有中は新規シグナルを出さないため、現在の保有状態も表示します
+    table.cell(statTbl, 0, 5, "POSITION", text_color = colTblTxt, bgcolor = colTblBg, text_size = tblSize)
+    table.cell(statTbl, 1, 5, not inPosition ? "FLAT" :
+         (positionDir == 1 ? "LONG " : "SHORT ") + "SL " + str.tostring(positionSL, "0.00") + " / TP " + str.tostring(positionTP, "0.00"),
+         text_color = not inPosition ? colTblTxt : positionDir == 1 ? colLongC : colShortC,
+         bgcolor = colTblBg, text_size = tblSize)
 
 // ---- 5分足以外の警告（左下） ------------------------------------------------------
 var warnTbl = table.new(position.bottom_left, 1, 2, border_width = 1)
