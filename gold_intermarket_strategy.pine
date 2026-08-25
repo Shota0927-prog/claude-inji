@@ -37,7 +37,7 @@ usePinbarTrigger       = input.bool(false, "ピンバー")
 useBOSTrigger          = input.bool(false, "BOS / 直近高安更新")
 useEMARejectTrigger    = input.bool(false,  "EMAリジェクト")
 useFVGTriggerFormation = input.bool(false, "FVG形成")
-useStrongCandleTrigger = input.bool(true, "強ローソク")
+useStrongCandleTrigger = input.bool(false, "強ローソク")
 
 triggerMode     = input.string("Any", "トリガー結合", options = ["Any", "All", "MinCount"])
 minTriggerCount = input.int(1, "最低トリガー数 (MinCount時)")
@@ -258,8 +258,8 @@ rrRatio     = input.float(2.0, "リスクリワード比 (TP)")
 // ============================================================
 grpIm = "Intermarket 環境認識"
 // --- 市場 個別ON/OFF (全部OFFで完全素通し) ---
-useSilverEnv = input.bool(false, "Silver を使う", group = grpIm)
-useDxyEnv    = input.bool(true,  "DXY を使う",    group = grpIm)
+useSilverEnv = input.bool(true,  "Silver を使う", group = grpIm)
+useDxyEnv    = input.bool(false, "DXY を使う",    group = grpIm)
 useYieldEnv  = input.bool(false, "Yield を使う",  group = grpIm)
 useOilEnv    = input.bool(false, "Oil を使う",    group = grpIm)
 // --- シンボル ---
@@ -309,8 +309,8 @@ imDistortionRequireCorr = input.bool(true, "Distortion に直前の相関成立(
 useDistortionMinMove    = input.bool(true, "主市場の最低変化率フィルターを使う", group = grpIm)
 goldResponseMinChange   = input.float(0.05, "Gold 最低反応変化率(%)", minval = 0.0, step = 0.01, group = grpIm)
 // --- Silver パターン (個別ON/OFF) ---
-useSilverLead          = input.bool(true,  "Silver A: Lead (先行)",       group = grpIm)
-useSilverConfirm       = input.bool(true,  "Silver B: Confirm (方向一致)", group = grpIm)
+useSilverLead          = input.bool(false, "Silver A: Lead (先行)",       group = grpIm)
+useSilverConfirm       = input.bool(false, "Silver B: Confirm (方向一致)", group = grpIm)
 useSilverConflict      = input.bool(false, "Silver C: Conflict (逆行)",    group = grpIm)
 useSilverConflictNoTrade = input.bool(false, "Silver Conflict を NoTrade にする", group = grpIm)
 useSilverDivergence    = input.bool(false, "Silver D: Divergence (乖離)",  group = grpIm)
@@ -318,6 +318,15 @@ silverMinChange   = input.float(0.5, "Silver 最小変化率(%)",   minval = 0.0
 silverLeadRatio   = input.float(2.0, "Silver 先行比率 (silver/ratio)", minval = 0.1, step = 0.1, group = grpIm)
 goldLagThreshold  = input.float(0.1, "Gold 未反応 変化率(%)",  minval = 0.0, step = 0.05, group = grpIm)
 silverDivThreshold= input.float(0.8, "Silver 乖離しきい値(%)", minval = 0.0, step = 0.05, group = grpIm)
+// --- Silver Lead → Gold Follow (Silver先行 → Gold遅れ → Goldが追随開始した最初の足) ---
+//   既存 Lead / Confirm / Divergence / Conflict / Distortion→Return とは独立した追加イベント。
+//   Lead の判定式そのものは変更せず、その後の Gold 追随開始だけを新しいイベントにする。
+useSilverLeadFollow = input.bool(true, "Silver Lead → Gold Follow", group = grpIm)
+silverLeadFollowGoldMinChange = input.float(0.03, "Silver Lead Follow: Gold 最低追随変化率(%)", minval = 0.0, step = 0.01, group = grpIm)
+silverLeadFollowLookback = input.int(3, "Silver Lead Follow: Lead後の追随待ち本数", minval = 1, group = grpIm)
+useSilverLeadFollowCancelOnSilverReverse = input.bool(true, "Silver Lead Follow: Silver反転で待機解除", group = grpIm)
+//   Lead成立足でGoldがすでに追随済みだった場合の扱い (既定 = その足では出さず次の確定TF足から判定)。
+useSilverLeadFollowAllowSameBar = input.bool(false, "Silver Lead Follow: Lead成立足でのFollowを許可", group = grpIm)
 // Silver Distortion → Return (Silverを主・Goldを従とした正相関の崩れと復帰)
 useSilverCorrFilter       = input.bool(false, "Silver 正相関フィルター",        group = grpIm)
 useSilverDistortionNoTrade = input.bool(false, "Silver 歪み NoTrade",          group = grpIm)
@@ -832,8 +841,10 @@ f_corrCalc(array<float> ga, array<float> ma, int len) =>
         _corr := _den > 0 ? _cov / _den : na
     _corr
 
-// Silver 状態 (Goldと同方向: Lead / Confirm / Divergence をスコア化、Conflict は NoTrade)。
+// Silver 状態 (Goldと同方向: LeadFollow / Lead / Confirm / Divergence をスコア化、Conflict は NoTrade)。
 //   反対イベントで即時切替。同条件継続では Hold開始バー(_evBar)を更新しない。
+//   Silver Lead → Gold Follow の待機状態 (_leadPending / _leadDir / _leadStartTfBar) は
+//   var のためTFごとの呼び出しインスタンス単位で保持され、TF間で混ざらない。
 //   戻り値 [score, reason(1/-1/0), noTrade]
 f_silverState(bool active, bool newBar, int holdBars, float gChg, float sChg, float sRecent, float eventPoint) =>
     var int  _tfBar  = 0
@@ -841,11 +852,23 @@ f_silverState(bool active, bool newBar, int holdBars, float gChg, float sChg, fl
     var int  _evBar  = na
     var bool _conflict = false
     var int  _prevRawEvent = 0
+    // --- Silver Lead → Gold Follow 用の待機状態 (このTF呼び出し専用) ---
+    var bool _leadPending    = false   // Lead発生後、Gold追随待ちか
+    var int  _leadDir        = 0       // 1 = LONG待ち / -1 = SHORT待ち
+    var int  _leadStartTfBar = na      // Lead起点のTF足番号
+    var int  _prevLeadRaw    = 0       // Lead生条件の立ち上がり検知用
+    var bool _prevFollowRaw  = false   // Follow生条件の立ち上がり検知用
     if active and newBar
         _tfBar += 1
         bool _goldLag  = math.abs(gChg) <= goldLagThreshold
-        bool _leadLong  = useSilverLead and sChg >=  silverMinChange and (_goldLag or gChg < sChg / silverLeadRatio)
-        bool _leadShort = useSilverLead and sChg <= -silverMinChange and (_goldLag or gChg > sChg / silverLeadRatio)
+        // Lead「検出」と Lead「イベント出力」を分離する。
+        //   useSilverLead = false でも useSilverLeadFollow = true なら内部でLeadを検出する。
+        //   判定式そのものは既存と同一 (useSilverLead = true のとき _leadLong/_leadShort は修正前と完全一致)。
+        bool _detectLead   = useSilverLead or useSilverLeadFollow
+        bool _leadRawLong  = _detectLead and sChg >=  silverMinChange and (_goldLag or gChg < sChg / silverLeadRatio)
+        bool _leadRawShort = _detectLead and sChg <= -silverMinChange and (_goldLag or gChg > sChg / silverLeadRatio)
+        bool _leadLong  = useSilverLead and _leadRawLong
+        bool _leadShort = useSilverLead and _leadRawShort
         bool _confLong  = useSilverConfirm and sChg > 0 and sRecent > 0 and gChg > 0
         bool _confShort = useSilverConfirm and sChg < 0 and sRecent < 0 and gChg < 0
         float _divAbs = math.abs(sChg - gChg)
@@ -855,8 +878,42 @@ f_silverState(bool active, bool newBar, int holdBars, float gChg, float sChg, fl
         bool _conflictShort = gChg < 0 and sChg > 0
         bool _conf = useSilverConflict and (_conflictLong or _conflictShort) and _divAbs >= silverDivThreshold
         _conflict := useSilverConflictNoTrade and _conf
-        // 優先 Lead > Confirm > Divergence。Conflict(NoTrade)成立時は方向を出さない。
-        int _event = (_leadLong or _leadShort) ? (_leadLong ? 1 : -1) : (_confLong or _confShort) ? (_confLong ? 1 : -1) : _div ? _divDir : 0
+        // ============================================================
+        //  Silver Lead → Gold Follow 状態機械 (この確定TF足でのみ進行)
+        // ------------------------------------------------------------
+        //  ① Lead生条件の立ち上がりで待機開始
+        //     0→Lead / 反対Lead→Lead の最初の足だけを起点にする (同方向継続では起点を更新しない)。
+        //     反対Leadが来た場合は古い待機を破棄して新しい方向へ即切替 (下の代入がそのまま上書き)。
+        int _leadRawDir = _leadRawLong ? 1 : _leadRawShort ? -1 : 0
+        if _leadRawDir != 0 and _leadRawDir != _prevLeadRaw
+            _leadPending    := true
+            _leadDir        := _leadRawDir
+            _leadStartTfBar := _tfBar
+            _prevFollowRaw  := false
+        //  ② 期限切れ : Lead起点から silverLeadFollowLookback 本を超えたら待機解除
+        if _leadPending and (_tfBar - _leadStartTfBar) > silverLeadFollowLookback
+            _leadPending := false
+            _leadDir     := 0
+        //  ③ Silver自体の反転で待機解除 (input で ON/OFF)
+        bool _silverReverse = useSilverLeadFollowCancelOnSilverReverse and ((_leadDir == 1 and sChg < 0) or (_leadDir == -1 and sChg > 0))
+        if _leadPending and _silverReverse
+            _leadPending := false
+            _leadDir     := 0
+        //  ④ Gold追随の生条件。方向は保存済み _leadDir を使い、Silverの現在方向から再判定しない。
+        bool _sameBarOk    = useSilverLeadFollowAllowSameBar or (not na(_leadStartTfBar) and _tfBar > _leadStartTfBar)
+        bool _followGoldOk = (_leadDir == 1 and gChg >= silverLeadFollowGoldMinChange) or (_leadDir == -1 and gChg <= -silverLeadFollowGoldMinChange)
+        bool _followRaw    = _leadPending and _sameBarOk and _followGoldOk
+        //  ⑤ 「追随開始」の立ち上がり (不成立→成立) だけを発火。発火後は待機解除して1回だけにする。
+        bool _followFire = _followRaw and not _prevFollowRaw
+        int  _followEv   = _followFire ? _leadDir : 0
+        _prevFollowRaw := _followRaw
+        if _followFire
+            _leadPending := false
+            _leadDir     := 0
+        _prevLeadRaw := _leadRawDir
+        // 優先 LeadFollow > Lead > Confirm > Divergence。Conflict(NoTrade)成立時は方向を出さない。
+        //   useSilverLeadFollow = false のとき _followEv は無視され、式は修正前と完全一致。
+        int _event = (useSilverLeadFollow and _followEv != 0) ? _followEv : (_leadLong or _leadShort) ? (_leadLong ? 1 : -1) : (_confLong or _confShort) ? (_confLong ? 1 : -1) : _div ? _divDir : 0
         if _conflict
             _event := 0
         // 新規方向イベントは「生条件の立ち上がり」でのみ発火 (保持Bias _reason とは別管理)。
