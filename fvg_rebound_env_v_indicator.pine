@@ -189,6 +189,13 @@ gFVG = "FVG環境認識 (反発)"
 efvgMinThick        = input.float(0.0,  "FVG最小厚み (幅/ATR)", step = 0.05, group = gFVG)
 reboundDepthMax     = input.float(0.70, "反発 最大侵入率 (FVG内部・幅比率)", minval = 0.0, step = 0.05, group = gFVG)
 reboundRecoverRatio = input.float(0.10, "反発 回復位置 (FVG幅比率)", minval = 0.0, maxval = 1.0, step = 0.05, group = gFVG)
+// --- 5M FVG反発 BOS構造フィルター (5M専用・参考ストラテジー最新仕様) ---
+//   5Mコンテキスト内で独立したBOS状態 (0=Neutral/+1=Bull/-1=Bear) をラッチ保持し、
+//   5M FVG反発を同一TF(5M)のBOS方向でゲートする。+1中はSHORT反発禁止 / -1中はLONG反発禁止。
+//   BOS判定は確定足終値ベース。禁止中でも反発条件を満たしたFVGは消費 (後で逆BOSでも復活しない)。
+//   ※ 5M以外 (D/4H/1H/15M/1M) には適用しない (関数引数 useBos=false で呼ぶ)。
+useFvgBosFilter = input.bool(true, "5M FVG反発にBOS方向フィルターを使う", group = gFVG)
+fvgBosLookback  = input.int(5, "5M BOS Lookback", minval = 2, group = gFVG)
 efvgHoldDaily = input.int(3,  "日足 状態保持本数",  minval = 1, group = gFVG)
 efvgHold4H    = input.int(6,  "4H 状態保持本数",   minval = 1, group = gFVG)
 efvgHold1H    = input.int(12, "1H 状態保持本数",   minval = 1, group = gFVG)
@@ -385,7 +392,7 @@ f_calcTriggers() =>
 //  eventId = 反発イベント成立バー (_evbar)。新しい反発成立時のみ更新 (hold中/失効後も不変)。
 //  → 「同一Case×同一方向×同一反発イベント」で確定エントリーを重複させない signature に使用。
 // ============================================================
-f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverRatio) =>
+f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverRatio, bool useBos, int bosLen) =>
     float _ref = ta.atr(14)
     var float _btop = na          // Bullish FVG 上端 (= low)
     var float _bbot = na          // Bullish FVG 下端 (= high[2])
@@ -399,6 +406,15 @@ f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverR
     var bool  _rDead = false       // Bearish FVG が完全否定 → 以後反発不可
     var int   _bias   = 0
     var int   _evbar  = na
+    // --- BOS構造状態 (このTFコンテキスト内で保持: 0=Neutral / +1=Bull / -1=Bear・ラッチ式) ---
+    //   確定足終値ベース。useBos=false のTF (5M以外) では下の許可判定が常に true になり従来と同一。
+    var int   _bosState = 0
+    bool _fbBull = close > ta.highest(high, bosLen)[1]
+    bool _fbBear = close < ta.lowest(low,  bosLen)[1]
+    if _fbBull
+        _bosState := 1
+    if _fbBear
+        _bosState := -1
     // --- FVG形成 (最新を1本だけ保持・反発/否定フラグをリセット) ---
     bool _newBull = _ref > 0 and low > high[2] and ((low - high[2]) / _ref) >= minThickR
     bool _newBear = _ref > 0 and high < low[2] and ((low[2] - high) / _ref) >= minThickR
@@ -427,27 +443,35 @@ f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverR
     float _rPen = (not na(_rWidth) and _rWidth > 0) ? (high - _rbot) / _rWidth : na
     bool _rebLong  = not na(_btop) and not _bReb and not _bDead and bar_index > _bbar and not na(_bWidth) and _bWidth > 0 and low <= _btop and _bPen <= depthMax and close >= _bbot + _bWidth * recoverRatio and close > open
     bool _rebShort = not na(_rtop) and not _rReb and not _rDead and bar_index > _rbar and not na(_rWidth) and _rWidth > 0 and high >= _rbot and _rPen <= depthMax and close <= _rtop - _rWidth * recoverRatio and close < open
+    // --- BOS方向ゲート (useBos=false なら常に許可 = 従来と完全同一) ---
+    //   LONG反発 (Bullish FVG) は BOS状態 -1 (Bear) のとき禁止 / SHORT反発 (Bearish FVG) は +1 (Bull) のとき禁止。
+    bool _longAllowed  = not useBos or _bosState != -1
+    bool _shortAllowed = not useBos or _bosState !=  1
     // --- イベント確定 ---
+    //   ※ 反発条件成立時はFVGを必ず消費 (_bReb/_rReb := true)。BOS禁止で bias/evbar を出さない場合でも
+    //     消費するため、後から逆BOSが出ても同じ古いFVGからシグナルは復活しない (参考ストラテジー同一)。
     if _rebLong and _rebShort
         _bias := 0
         _evbar := na
         _bReb := true
         _rReb := true
     else if _rebLong
-        _bias := 1
-        _evbar := bar_index
         _bReb := true
+        if _longAllowed
+            _bias := 1
+            _evbar := bar_index
     else if _rebShort
-        _bias := -1
-        _evbar := bar_index
         _rReb := true
+        if _shortAllowed
+            _bias := -1
+            _evbar := bar_index
     bool _active = not na(_evbar) and (bar_index - _evbar) < holdBars
     int _outBias = _active ? _bias : 0
     // eventId = 反発イベント成立バー。hold中/失効後は不変・新しい反発でのみ更新。
     [_outBias, _evbar]
 
-f_efvgConfirmed(int holdBars, float minThickR, float depthMax, float recoverRatio) =>
-    [_b, _ev] = f_efvgReboundState(holdBars, minThickR, depthMax, recoverRatio)
+f_efvgConfirmed(int holdBars, float minThickR, float depthMax, float recoverRatio, bool useBos, int bosLen) =>
+    [_b, _ev] = f_efvgReboundState(holdBars, minThickR, depthMax, recoverRatio, useBos, bosLen)
     [_b[1], _ev[1]]
 
 // ============================================================
@@ -590,12 +614,13 @@ bool dailyDirGateOk = reqDailyDirection == "OFF" or drDirText == reqDailyDirecti
 // --- 16c. FVG 6TF ★反発★ bias + eventId (常に全計算・ケースがTFを選択) ---
 //   bias(1/0/-1)=反発優勢 (Bull FVG反発=Long / Bear FVG反発=Short)。eventId=反発イベント識別子。
 //   ※ request.security の本数は増やさず、既存の1呼び出しで [bias, eventId] を同時取得する。
-[efvgDBias, efvgDEvent] = request.security(syminfo.tickerid, "D",   f_efvgConfirmed(efvgHoldDaily, efvgMinThick, reboundDepthMax, reboundRecoverRatio), lookahead = barmerge.lookahead_on)
-[efvgHBias, efvgHEvent] = request.security(syminfo.tickerid, "240", f_efvgConfirmed(efvgHold4H,    efvgMinThick, reboundDepthMax, reboundRecoverRatio), lookahead = barmerge.lookahead_on)
-[efvgOBias, efvgOEvent] = request.security(syminfo.tickerid, "60",  f_efvgConfirmed(efvgHold1H,    efvgMinThick, reboundDepthMax, reboundRecoverRatio), lookahead = barmerge.lookahead_on)
-[efvgMBias, efvgMEvent] = request.security(syminfo.tickerid, "15",  f_efvgConfirmed(efvgHold15M,   efvgMinThick, reboundDepthMax, reboundRecoverRatio), lookahead = barmerge.lookahead_on)
-[efvg5Bias, efvg5Event] = request.security(syminfo.tickerid, "5",   f_efvgConfirmed(efvgHold5M,    efvgMinThick, reboundDepthMax, reboundRecoverRatio), lookahead = barmerge.lookahead_on)
-[efvg1Bias, efvg1Event] = request.security(syminfo.tickerid, "1",   f_efvgConfirmed(efvgHold1M,    efvgMinThick, reboundDepthMax, reboundRecoverRatio), lookahead = barmerge.lookahead_on)
+//   ※ BOS方向フィルターは 5M のみ有効 (useFvgBosFilter を渡す)。他TFは false で従来挙動を維持。
+[efvgDBias, efvgDEvent] = request.security(syminfo.tickerid, "D",   f_efvgConfirmed(efvgHoldDaily, efvgMinThick, reboundDepthMax, reboundRecoverRatio, false,           fvgBosLookback), lookahead = barmerge.lookahead_on)
+[efvgHBias, efvgHEvent] = request.security(syminfo.tickerid, "240", f_efvgConfirmed(efvgHold4H,    efvgMinThick, reboundDepthMax, reboundRecoverRatio, false,           fvgBosLookback), lookahead = barmerge.lookahead_on)
+[efvgOBias, efvgOEvent] = request.security(syminfo.tickerid, "60",  f_efvgConfirmed(efvgHold1H,    efvgMinThick, reboundDepthMax, reboundRecoverRatio, false,           fvgBosLookback), lookahead = barmerge.lookahead_on)
+[efvgMBias, efvgMEvent] = request.security(syminfo.tickerid, "15",  f_efvgConfirmed(efvgHold15M,   efvgMinThick, reboundDepthMax, reboundRecoverRatio, false,           fvgBosLookback), lookahead = barmerge.lookahead_on)
+[efvg5Bias, efvg5Event] = request.security(syminfo.tickerid, "5",   f_efvgConfirmed(efvgHold5M,    efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+[efvg1Bias, efvg1Event] = request.security(syminfo.tickerid, "1",   f_efvgConfirmed(efvgHold1M,    efvgMinThick, reboundDepthMax, reboundRecoverRatio, false,           fvgBosLookback), lookahead = barmerge.lookahead_on)
 
 // --- 16d. 1分足トリガー種類別集約 (security_lower_tf は1回だけ) ---
 [_aBEng,_aSEng,_aBPin,_aSPin,_aBBOS,_aSBOS,_aBEMA,_aSEMA,_aBFVG,_aSFVG,_aBStr,_aSStr] = request.security_lower_tf(syminfo.tickerid, triggerTF, f_calcTriggers())
@@ -1016,12 +1041,12 @@ if barstate.isfirst
     //   ※ FVG は「反発」環境認識TF (画像の○)。1分足トリガー: tStr=強ローソク (request.security_lower_tf)。
     //   ※ 各CASEは反発TFを1つだけ使用 → thr は選択TFの重み (5M=2 / 15M=3) に合わせ、
     //     その対象TFの反発Biasが方向一致すればFVG条件成立となる (画像の「閾値2」は不使用)。
-    // ---- CASE1 : 上昇/上昇/上昇 / 5M FVG反発 / ボラ0〜100 / LONG / SL10 / RR3 / 1分 強ローソク ----
-    array.push(CASES, CaseCfg.new(1, 5, 1, 1, 1, 0.0, 100.0, false, false, false, false, true,  false, 2, true, false, 10, 3.0, true,  false, false, false, false, false, true))
+    // ---- CASE1 : 上昇/上昇/上昇 / 5M FVG反発 / ボラ0〜100 / LONG / SL10 / RR3 / 1分 強ローソク / ⭐3 ----
+    array.push(CASES, CaseCfg.new(1, 3, 1, 1, 1, 0.0, 100.0, false, false, false, false, true,  false, 2, true, false, 10, 3.0, true,  false, false, false, false, false, true))
     // ---- CASE2 : 上昇/上昇/上昇 / 15M FVG反発 / ボラ0〜100 / LONG / SL10 / RR5 / 1分トリガーなし ----
     array.push(CASES, CaseCfg.new(2, 5, 1, 1, 1, 0.0, 100.0, false, false, false, true,  false, false, 3, true, false, 10, 5.0, false, false, false, false, false, false, false))
-    // ---- CASE3 : 上昇/上昇/レンジ / 5M FVG反発 / ボラ0〜100 / LONG / SL15 / RR4 / 1分トリガーなし ----
-    array.push(CASES, CaseCfg.new(3, 4, 1, 1, 0, 0.0, 100.0, false, false, false, false, true,  false, 2, true, false, 15, 4.0, false, false, false, false, false, false, false))
+    // ---- CASE3 : 上昇/上昇/レンジ / 5M FVG反発 / ボラ0〜100 / LONG / SL15 / RR4 / 1分トリガーなし / ⭐3 ----
+    array.push(CASES, CaseCfg.new(3, 3, 1, 1, 0, 0.0, 100.0, false, false, false, false, true,  false, 2, true, false, 15, 4.0, false, false, false, false, false, false, false))
     // ---- CASE4 : 上昇/上昇/レンジ / 15M FVG反発 / ボラ0〜100 / LONG / SL15 / RR3 / 1分トリガーなし ----
     array.push(CASES, CaseCfg.new(4, 4, 1, 1, 0, 0.0, 100.0, false, false, false, true,  false, false, 3, true, false, 15, 3.0, false, false, false, false, false, false, false))
 
