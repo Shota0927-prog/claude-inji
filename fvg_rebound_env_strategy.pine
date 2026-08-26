@@ -320,6 +320,24 @@ efvgShowDebug = input.bool(false, "デバッグ(スコア/状態)を表示", gro
 efvgShowZones = input.bool(false, "選択中FVGの上下限を表示", group = grpEFVG)
 
 // ============================================================
+//  4g. 入力 : FVG構造管理 BOS (時間足ごとのBOS方向でFVG反発を許可/禁止)
+// ------------------------------------------------------------
+//  ・各FVG対象TF (D/4H/1H/15M/5M/1M) に独立したBOS状態 (0/+1/-1) を持たせ、
+//    「そのTFのFVG反発」を「同一TFのBOS方向」でゲートする (1対1対応)。
+//    +1 (直近Bullish BOS) : LONG反発のみ許可 / -1 (直近Bearish BOS) : SHORT反発のみ許可 /
+//    0 (初期) : 両方許可 (従来どおり)。下位足BOSで上位足FVGを禁止しない。
+//  ・BOSは確定足の終値ベース (close > highest(high, len)[1] / close < lowest(low, len)[1])。
+//    既存の1分足エントリートリガー用 BOS (bosLookback) とは完全に分離。
+//  ・禁止中に反発条件まで満たしたFVGは その時点で消費 (reboundUsed相当) し、
+//    後から逆BOSが出ても復活させない。
+//  ・useFvgBosFilter=false で従来と完全に同一の挙動へ戻る。
+// ============================================================
+gBosStructure   = "FVG構造管理 BOS"
+useFvgBosFilter = input.bool(true, "FVG反発にBOS方向フィルターを使う", group = gBosStructure)
+fvgBosLookback  = input.int(10, "BOS Lookback", minval = 2, group = gBosStructure)
+showFvgBosDebug = input.bool(false, "FVG構造BOS デバッグ表示", group = gBosStructure)
+
+// ============================================================
 //  5. 包み足判定
 // ============================================================
 bool prevUp = close[1] > open[1]
@@ -706,7 +724,7 @@ if useEnvFilter
 //    reason: 1=Bullish FVG反発(Long) / -1=Bearish FVG反発(Short) / 0=反発なし
 //    remain: 状態保持の残り本数
 // ============================================================
-f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverRatio) =>
+f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverRatio, bool useBos, int bosLen) =>
     float _ref = ta.atr(14)
     var float _btop = na          // Bullish FVG 上端 (= low)
     var float _bbot = na          // Bullish FVG 下端 (= high[2])
@@ -721,6 +739,15 @@ f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverR
     var int   _bias   = 0
     var int   _reason = 0
     var int   _evbar  = na
+    // --- FVG構造管理 BOS状態 (このTFコンテキスト内で保持: 0=Neutral / +1=Bull / -1=Bear) ---
+    //   確定足終値ベース。既存トリガー用BOS (bosLookback) とは完全分離。ラッチ式で保持。
+    var int   _bosState = 0
+    bool _fbBull = close > ta.highest(high, bosLen)[1]
+    bool _fbBear = close < ta.lowest(low,  bosLen)[1]
+    if _fbBull
+        _bosState := 1
+    if _fbBear
+        _bosState := -1
     // --- FVG形成 (最新を1本だけ保持・反発フラグをリセット) ---
     bool _newBull = _ref > 0 and low > high[2] and ((low - high[2]) / _ref) >= minThickR
     bool _newBear = _ref > 0 and high < low[2] and ((low[2] - high) / _ref) >= minThickR
@@ -757,7 +784,15 @@ f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverR
     float _rPen = (not na(_rWidth) and _rWidth > 0) ? (high - _rbot) / _rWidth : na
     bool _rebLong  = not na(_btop) and not _bReb and not _bDead and bar_index > _bbar and not na(_bWidth) and _bWidth > 0 and low <= _btop and _bPen <= depthMax and close >= _bbot + _bWidth * recoverRatio and close > open
     bool _rebShort = not na(_rtop) and not _rReb and not _rDead and bar_index > _rbar and not na(_rWidth) and _rWidth > 0 and high >= _rbot and _rPen <= depthMax and close <= _rtop - _rWidth * recoverRatio and close < open
+    // --- BOS方向ゲート (同一TFのBOS状態でこのTFのFVG反発を許可/禁止) ---
+    //   useBos=false なら常に許可 → 従来と完全に同一の挙動。
+    //   LONG反発 (Bullish FVG) は BOS状態が -1 (Bearish) のとき禁止。
+    //   SHORT反発 (Bearish FVG) は BOS状態が +1 (Bullish) のとき禁止。
+    bool _longAllowed  = not useBos or _bosState != -1
+    bool _shortAllowed = not useBos or _bosState !=  1
     // --- イベント確定 ---
+    //   ※ 反発条件 (_rebLong/_rebShort) 自体は不変。禁止中に反発条件を満たしたFVGは
+    //     シグナルを出さずに「消費 (_bReb/_rReb := true)」して無効化し、後から逆BOSでも復活させない。
     if _rebLong and _rebShort
         // 同時反発 → 方向を予想せず Even (保持もクリア)。両FVGは使用済みに。
         _bias := 0
@@ -766,26 +801,30 @@ f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverR
         _bReb := true
         _rReb := true
     else if _rebLong
-        _bias := 1
-        _reason := 1
-        _evbar := bar_index
+        // Bullish FVG反発条件成立 → FVGは必ず消費 (禁止中でも reboundUsed 相当で無効化)
         _bReb := true
+        if _longAllowed
+            _bias := 1
+            _reason := 1
+            _evbar := bar_index
     else if _rebShort
-        _bias := -1
-        _reason := -1
-        _evbar := bar_index
+        // Bearish FVG反発条件成立 → FVGは必ず消費 (禁止中でも reboundUsed 相当で無効化)
         _rReb := true
+        if _shortAllowed
+            _bias := -1
+            _reason := -1
+            _evbar := bar_index
     // --- 状態保持 / 失効 (イベント足を1本目として数える: bar_index - evbar < holdBars) ---
     bool _active = not na(_evbar) and (bar_index - _evbar) < holdBars
     int _outBias   = _active ? _bias : 0
     int _outReason = _active ? _reason : 0
     int _outRemain = _active ? holdBars - (bar_index - _evbar) : 0
-    [_outBias, _outReason, _outRemain, _btop, _bbot, _rtop, _rbot]
+    [_outBias, _outReason, _outRemain, _btop, _bbot, _rtop, _rbot, _bosState]
 
 // 確定済み1本前を上位足コンテキスト内で返す非リペイント補助。
-f_efvgReboundConfirmed(int holdBars, float minThickR, float depthMax, float recoverRatio) =>
-    [_b, _r, _rem, _bt, _bb, _rt, _rb] = f_efvgReboundState(holdBars, minThickR, depthMax, recoverRatio)
-    [_b[1], _r[1], _rem[1], _bt[1], _bb[1], _rt[1], _rb[1]]
+f_efvgReboundConfirmed(int holdBars, float minThickR, float depthMax, float recoverRatio, bool useBos, int bosLen) =>
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = f_efvgReboundState(holdBars, minThickR, depthMax, recoverRatio, useBos, bosLen)
+    [_b[1], _r[1], _rem[1], _bt[1], _bb[1], _rt[1], _rb[1], _bos[1]]
 
 // --- テキスト変換 ---
 f_efvgBiasText(int b) =>
@@ -836,8 +875,15 @@ float efvg1BT = na
 float efvg1BB = na
 float efvg1RT = na
 float efvg1RB = na
+// --- 各TFの FVG構造管理 BOS状態 (0/+1/-1・デバッグ表示用) ---
+int efvgDBos = 0
+int efvgHBos = 0
+int efvgOBos = 0
+int efvgMBos = 0
+int efvg5Bos = 0
+int efvg1Bos = 0
 if useEFVGEnv and useEFVGDaily
-    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvgDailyTF, f_efvgReboundConfirmed(efvgHoldDaily, efvgMinThick, reboundDepthMax, reboundRecoverRatio), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvgDailyTF, f_efvgReboundConfirmed(efvgHoldDaily, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
     efvgDBias := _b
     efvgDReason := _r
     efvgDRem := _rem
@@ -845,8 +891,9 @@ if useEFVGEnv and useEFVGDaily
     efvgDBB := _bb
     efvgDRT := _rt
     efvgDRB := _rb
+    efvgDBos := _bos
 if useEFVGEnv and useEFVG4H
-    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvg4HTF, f_efvgReboundConfirmed(efvgHold4H, efvgMinThick, reboundDepthMax, reboundRecoverRatio), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg4HTF, f_efvgReboundConfirmed(efvgHold4H, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
     efvgHBias := _b
     efvgHReason := _r
     efvgHRem := _rem
@@ -854,8 +901,9 @@ if useEFVGEnv and useEFVG4H
     efvgHBB := _bb
     efvgHRT := _rt
     efvgHRB := _rb
+    efvgHBos := _bos
 if useEFVGEnv and useEFVG1H
-    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvg1HTF, f_efvgReboundConfirmed(efvgHold1H, efvgMinThick, reboundDepthMax, reboundRecoverRatio), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg1HTF, f_efvgReboundConfirmed(efvgHold1H, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
     efvgOBias := _b
     efvgOReason := _r
     efvgORem := _rem
@@ -863,8 +911,9 @@ if useEFVGEnv and useEFVG1H
     efvgOBB := _bb
     efvgORT := _rt
     efvgORB := _rb
+    efvgOBos := _bos
 if useEFVGEnv and useEFVG15M
-    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvg15MTF, f_efvgReboundConfirmed(efvgHold15M, efvgMinThick, reboundDepthMax, reboundRecoverRatio), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg15MTF, f_efvgReboundConfirmed(efvgHold15M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
     efvgMBias := _b
     efvgMReason := _r
     efvgMRem := _rem
@@ -872,10 +921,11 @@ if useEFVGEnv and useEFVG15M
     efvgMBB := _bb
     efvgMRT := _rt
     efvgMRB := _rb
+    efvgMBos := _bos
 // 5M : チャートと同じ5分足。確定済み1本前 (f_efvgReboundConfirmed の [1]) を参照 → 形成途中の
 //   現在足では状態が変化しない。既存の上位足と同一の非リペイント取得パターン。
 if useEFVGEnv and useEFVG5M
-    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvg5MTF, f_efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg5MTF, f_efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
     efvg5Bias := _b
     efvg5Reason := _r
     efvg5Rem := _rem
@@ -883,11 +933,12 @@ if useEFVGEnv and useEFVG5M
     efvg5BB := _bb
     efvg5RT := _rt
     efvg5RB := _rb
+    efvg5Bos := _bos
 // 1M : FVG形成/反発の状態を1分足コンテキストで継続管理 (f_efvgReboundState を request.security 内で
 //   毎1分足評価)。f_efvgReboundConfirmed の [1] + lookahead_on で「直近確定した1分足」の状態を取得し、
 //   形成途中の1分足は使用しない。5分足エントリートリガーの security_lower_tf 集約とは別系統。
 if useEFVGEnv and useEFVG1M
-    [_b, _r, _rem, _bt, _bb, _rt, _rb] = request.security(syminfo.tickerid, efvg1MTF, f_efvgReboundConfirmed(efvgHold1M, efvgMinThick, reboundDepthMax, reboundRecoverRatio), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg1MTF, f_efvgReboundConfirmed(efvgHold1M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
     efvg1Bias := _b
     efvg1Reason := _r
     efvg1Rem := _rem
@@ -895,6 +946,7 @@ if useEFVGEnv and useEFVG1M
     efvg1BB := _bb
     efvg1RT := _rt
     efvg1RB := _rb
+    efvg1Bos := _bos
 
 // --- 複数足 統合 (AllAgree / MatchCount / WeightedScore / HTFPriority) ---
 int efvgEnabledCount = (useEFVGDaily ? 1 : 0) + (useEFVG4H ? 1 : 0) + (useEFVG1H ? 1 : 0) + (useEFVG15M ? 1 : 0) + (useEFVG5M ? 1 : 0) + (useEFVG1M ? 1 : 0)
@@ -1548,6 +1600,30 @@ if showDailyVolDebug and useDailyRegimeFilter
         table.cell(dailyVolTbl, 1, 1, (na(drMedianRange) ? "-" : str.tostring(drMedianRange, "#.#")) + "$", text_color = color.white, text_size = size.small)
         table.cell(dailyVolTbl, 0, 2, "判定", text_color = color.white, text_size = size.small)
         table.cell(dailyVolTbl, 1, 2, f_dailyVolatilityText(drVolCodeAdj), text_color = color.white, bgcolor = f_efvgBiasColor(nz(drVolCodeAdj, 0)), text_size = size.small)
+
+// --- FVG構造管理 BOS デバッグ表示 (各TFのBOS状態・任意ON/OFF・既定OFF) ---
+f_fvgBosText(int s) =>
+    s == 1 ? "Bull" : s == -1 ? "Bear" : "Neutral"
+var table fvgBosTbl = na
+if showFvgBosDebug and useEFVGEnv
+    if na(fvgBosTbl)
+        fvgBosTbl := table.new(position.bottom_right, 2, 7, border_width = 1)
+    if barstate.islast
+        color _hb = color.new(color.black, 0)
+        table.cell(fvgBosTbl, 0, 0, "FVG構造BOS", text_color = color.white, bgcolor = _hb, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 0, useFvgBosFilter ? "ON" : "OFF", text_color = color.white, bgcolor = _hb, text_size = size.small)
+        table.cell(fvgBosTbl, 0, 1, "D",   text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 1, useEFVGDaily ? f_fvgBosText(efvgDBos) : "-", text_color = color.white, bgcolor = useEFVGDaily ? f_efvgBiasColor(efvgDBos) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(fvgBosTbl, 0, 2, "4H",  text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 2, useEFVG4H ? f_fvgBosText(efvgHBos) : "-", text_color = color.white, bgcolor = useEFVG4H ? f_efvgBiasColor(efvgHBos) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(fvgBosTbl, 0, 3, "1H",  text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 3, useEFVG1H ? f_fvgBosText(efvgOBos) : "-", text_color = color.white, bgcolor = useEFVG1H ? f_efvgBiasColor(efvgOBos) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(fvgBosTbl, 0, 4, "15M", text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 4, useEFVG15M ? f_fvgBosText(efvgMBos) : "-", text_color = color.white, bgcolor = useEFVG15M ? f_efvgBiasColor(efvgMBos) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(fvgBosTbl, 0, 5, "5M",  text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 5, useEFVG5M ? f_fvgBosText(efvg5Bos) : "-", text_color = color.white, bgcolor = useEFVG5M ? f_efvgBiasColor(efvg5Bos) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(fvgBosTbl, 0, 6, "1M",  text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 6, useEFVG1M ? f_fvgBosText(efvg1Bos) : "-", text_color = color.white, bgcolor = useEFVG1M ? f_efvgBiasColor(efvg1Bos) : color.new(color.gray, 60), text_size = size.small)
 
 // --- 選択中FVGの上下限ゾーン (デバッグ・最新バーで更新) ---
 var line[] efvgZoneLines = array.new_line()
