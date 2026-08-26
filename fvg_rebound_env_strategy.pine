@@ -912,22 +912,69 @@ if useEFVGEnv and useEFVG1H
     efvgORT := _rt
     efvgORB := _rb
     efvgOBos := _bos
-// 5M : チャートと同じ5分足。確定済み1本前 (f_efvgReboundConfirmed の [1]) を参照 → 形成途中の
-//   現在足では状態が変化しない。既存の上位足と同一の非リペイント取得パターン。
-//   ★ 5M BOS状態 (efvg5Bos) は「5M FVG自身のゲート」と「15M FVGのゲート」の両方で共有するため、
-//     5M FVG を使わない設定でも 15M が5M BOSを必要とするなら、この1回の request.security で取得する
-//     (5M BOSロジックを二重計算しない)。5M FVG の bias/zone は useEFVG5M の時のみ統合に使用される。
+// 1M : FVG形成/反発の状態を1分足コンテキストで継続管理 (f_efvgReboundState を request.security 内で
+//   毎1分足評価)。f_efvgReboundConfirmed の [1] + lookahead_on で「直近確定した1分足」の状態を取得し、
+//   形成途中の1分足は使用しない。5分足エントリートリガーの security_lower_tf 集約とは別系統。
+//   ★ 1M BOS状態 (efvg1Bos) は「1M FVG自身のゲート」と「5M FVGのゲート」の両方で共有するため、
+//     1M FVG を使わない設定でも 5M が1M BOSを必要とするなら、この1回の request.security で取得する
+//     (1M BOSロジックを二重計算しない)。1M FVG の bias/zone は useEFVG1M の時のみ統合に使用される。
+//   ※ 1M FVG 自身のゲートは従来どおり 1M BOS (useBos=useFvgBosFilter) で不変。
+bool need1MState = useEFVGEnv and (useEFVG1M or (useEFVG5M and useFvgBosFilter))
+if need1MState
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg1MTF, f_efvgReboundConfirmed(efvgHold1M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvg1Bias := _b
+    efvg1Reason := _r
+    efvg1Rem := _rem
+    efvg1BT := _bt
+    efvg1BB := _bb
+    efvg1RT := _rt
+    efvg1RB := _rb
+    efvg1Bos := _bos
+
+// 5M : FVG は5Mのまま (形成 / ゾーン / 完全否定 / 侵入率 / 反発判定 / 保持本数 / event / 1反発 すべて5M)。
+//   ★ 反発ゲートだけ 5M BOS ではなく【1M BOS (efvg1Bos)】を参照する (このTFだけの特別対応)。
+//   実装 : 5M関数は useBos=false で呼ぶ → 内部ゲートせず raw な5M反発bias を返す。反発条件を満たした
+//     5M FVGは (許可/禁止に関わらず) 関数内部で必ず消費 (_bReb/_rReb := true) される。→ チャート側で
+//     「反発イベント発生時に1回だけ」1M BOSでゲートし、許可後も1M BOSを常時監視して逆転時に即失効。
+//     一度失効した古いbiasは新規5M反発イベントまで復活しない。
+//   ★ 同時に raw 5M BOS状態 (efvg5Bos) を返し、15M FVG ゲート用に共有する (5M BOSを二重計算しない)。
+//     5M FVG を使わなくても 15M が5M BOSを必要とするなら need5MState で取得する。
 bool need5MState = useEFVGEnv and (useEFVG5M or (useEFVG15M and useFvgBosFilter))
+var int m5GateBias   = 0   // 1M BOSでゲート後の5M bias (ラッチ)
+var int m5PrevReason = 0   // 直近の raw reason (新規イベント検出用)
+var int m5PrevRem    = 0   // 直近の raw remain (保持リセット=新規イベント検出用)
 if need5MState
-    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg5MTF, f_efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
-    efvg5Bias := _b
-    efvg5Reason := _r
-    efvg5Rem := _rem
+    // useBos=false : 5M内部ゲートを無効化 (ゲートは1M BOSでチャート側が行う)。消費は内部で常に発生。
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg5MTF, f_efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, false, fvgBosLookback), lookahead = barmerge.lookahead_on)
     efvg5BT := _bt
     efvg5BB := _bb
     efvg5RT := _rt
     efvg5RB := _rb
-    efvg5Bos := _bos
+    efvg5Bos := _bos   // raw 5M BOS (15M FVG ゲート用に共有・5M FVG自身のゲートには未使用)
+    // --- 新規反発イベント (raw) 検出 → その時点の 1M BOS で1回だけゲートしラッチ ---
+    //   非リペイント : _b/_r/_rem は確定5M・efvg1Bos は確定1M (共に確定1本前) を参照。
+    bool _m5NewEvent = _r != 0 and (_r != m5PrevReason or _rem > m5PrevRem)
+    if _m5NewEvent
+        bool _allowL = not useFvgBosFilter or efvg1Bos != -1  // 1M BOSが-1(Bear)ならLONG禁止
+        bool _allowS = not useFvgBosFilter or efvg1Bos !=  1  // 1M BOSが+1(Bull)ならSHORT禁止
+        m5GateBias := _r == 1 ? (_allowL ? 1 : 0) : _r == -1 ? (_allowS ? -1 : 0) : 0
+    // raw bias が失効 (_b==0) したらラッチ解除 (失効条件A: 5M保持期間終了)
+    if _b == 0
+        m5GateBias := 0
+    // --- 常時失効 (失効条件B: 1M BOSが逆方向へ転換) ---
+    //   許可済み5M biasを毎バー efvg1Bos と照合し、逆転した瞬間に即0へ。useFvgBosFilter=OFF時は無効。
+    //   ※ 復活は「新規5M反発イベント」のみ (上の _m5NewEvent) → 一度失効した古いbiasは復活しない。
+    if useFvgBosFilter
+        if m5GateBias == 1 and efvg1Bos == -1
+            m5GateBias := 0
+        if m5GateBias == -1 and efvg1Bos == 1
+            m5GateBias := 0
+    m5PrevReason := _r
+    m5PrevRem := _rem
+    // ゲート後の値を統合へ渡す (禁止中/失効は EVEN・useEFVG5M時のみ実際に使用)。ゾーンは表示用に raw を保持。
+    efvg5Bias := m5GateBias
+    efvg5Reason := m5GateBias != 0 ? _r : 0
+    efvg5Rem := m5GateBias != 0 ? _rem : 0
 
 // 15M : FVG は15Mのまま (形成 / ゾーン / 完全否定 / 侵入率 / 反発判定 / 保持本数 / event / 1反発 すべて15M)。
 //   ★ 反発ゲートだけ 15M BOS ではなく【5M BOS (efvg5Bos)】を参照する (このTFだけの特別対応)。
@@ -971,19 +1018,6 @@ if useEFVGEnv and useEFVG15M
     efvgMBias := m15GateBias
     efvgMReason := m15GateBias != 0 ? _r : 0
     efvgMRem := m15GateBias != 0 ? _rem : 0
-// 1M : FVG形成/反発の状態を1分足コンテキストで継続管理 (f_efvgReboundState を request.security 内で
-//   毎1分足評価)。f_efvgReboundConfirmed の [1] + lookahead_on で「直近確定した1分足」の状態を取得し、
-//   形成途中の1分足は使用しない。5分足エントリートリガーの security_lower_tf 集約とは別系統。
-if useEFVGEnv and useEFVG1M
-    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg1MTF, f_efvgReboundConfirmed(efvgHold1M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
-    efvg1Bias := _b
-    efvg1Reason := _r
-    efvg1Rem := _rem
-    efvg1BT := _bt
-    efvg1BB := _bb
-    efvg1RT := _rt
-    efvg1RB := _rb
-    efvg1Bos := _bos
 
 // --- 複数足 統合 (AllAgree / MatchCount / WeightedScore / HTFPriority) ---
 int efvgEnabledCount = (useEFVGDaily ? 1 : 0) + (useEFVG4H ? 1 : 0) + (useEFVG1H ? 1 : 0) + (useEFVG15M ? 1 : 0) + (useEFVG5M ? 1 : 0) + (useEFVG1M ? 1 : 0)
@@ -1658,8 +1692,9 @@ if showFvgBosDebug and useEFVGEnv
         // ★ 15M FVG は 5M BOS を参照してゲートする → 参照元 (5M BOS) を表示。
         table.cell(fvgBosTbl, 0, 4, "15M→5M", text_color = color.white, text_size = size.small)
         table.cell(fvgBosTbl, 1, 4, useEFVG15M ? (useFvgBosFilter ? f_fvgBosText(efvg5Bos) : "OFF") : "-", text_color = color.white, bgcolor = (useEFVG15M and useFvgBosFilter) ? f_efvgBiasColor(efvg5Bos) : color.new(color.gray, 60), text_size = size.small)
-        table.cell(fvgBosTbl, 0, 5, "5M",  text_color = color.white, text_size = size.small)
-        table.cell(fvgBosTbl, 1, 5, useEFVG5M ? f_fvgBosText(efvg5Bos) : "-", text_color = color.white, bgcolor = useEFVG5M ? f_efvgBiasColor(efvg5Bos) : color.new(color.gray, 60), text_size = size.small)
+        // ★ 5M FVG は 1M BOS を参照してゲートする → 参照元 (1M BOS) を表示。
+        table.cell(fvgBosTbl, 0, 5, "5M→1M", text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 5, useEFVG5M ? (useFvgBosFilter ? f_fvgBosText(efvg1Bos) : "OFF") : "-", text_color = color.white, bgcolor = (useEFVG5M and useFvgBosFilter) ? f_efvgBiasColor(efvg1Bos) : color.new(color.gray, 60), text_size = size.small)
         table.cell(fvgBosTbl, 0, 6, "1M",  text_color = color.white, text_size = size.small)
         table.cell(fvgBosTbl, 1, 6, useEFVG1M ? f_fvgBosText(efvg1Bos) : "-", text_color = color.white, bgcolor = useEFVG1M ? f_efvgBiasColor(efvg1Bos) : color.new(color.gray, 60), text_size = size.small)
 
