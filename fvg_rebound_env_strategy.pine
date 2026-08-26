@@ -326,16 +326,22 @@ efvgShowZones = input.bool(false, "選択中FVGの上下限を表示", group = g
 //    「そのTFのFVG反発」を「同一TFのBOS方向」でゲートする (1対1対応)。
 //    +1 (直近Bullish BOS) : LONG反発のみ許可 / -1 (直近Bearish BOS) : SHORT反発のみ許可 /
 //    0 (初期) : 両方許可 (従来どおり)。下位足BOSで上位足FVGを禁止しない。
-//  ・BOSは確定足の終値ベース (close > highest(high, len)[1] / close < lowest(low, len)[1])。
-//    既存の1分足エントリートリガー用 BOS (bosLookback) とは完全に分離。
+//  ・BOSは【確定 Swing High / Swing Low (戻り高値 / 押し安値) の終値ブレイク】で判定。
+//    Bullish BOS : close > 直近確定Swing High → State +1
+//    Bearish BOS : close < 直近確定Swing Low  → State -1
+//    Swing は ta.pivothigh / ta.pivotlow (右 swRight 本確定後) で検出 → 未来参照なし。
+//    同一Swing Level では BOS成立は1回だけ (新Swing確定で監視を再開)。
+//    既存の1分足エントリートリガー用 BOS とは完全に分離。
 //  ・禁止中に反発条件まで満たしたFVGは その時点で消費 (reboundUsed相当) し、
 //    後から逆BOSが出ても復活させない。
 //  ・useFvgBosFilter=false で従来と完全に同一の挙動へ戻る。
 // ============================================================
-gBosStructure   = "FVG構造管理 BOS"
-useFvgBosFilter = input.bool(true, "FVG反発にBOS方向フィルターを使う", group = gBosStructure)
-fvgBosLookback  = input.int(10, "BOS Lookback", minval = 2, group = gBosStructure)
-showFvgBosDebug = input.bool(false, "FVG構造BOS デバッグ表示", group = gBosStructure)
+gBosStructure    = "FVG構造管理 BOS"
+useFvgBosFilter  = input.bool(true, "FVG反発にBOS方向フィルターを使う", group = gBosStructure)
+fvgBosSwingLeft  = input.int(3, "Swing Left",  minval = 1, group = gBosStructure)
+fvgBosSwingRight = input.int(3, "Swing Right", minval = 1, group = gBosStructure)
+showFvgBosDebug  = input.bool(false, "FVG構造BOS デバッグ表示", group = gBosStructure)
+showFvgBosSwings = input.bool(false, "確定Swing High/Low をチャート表示 (5M)", group = gBosStructure)
 
 // ============================================================
 //  5. 包み足判定
@@ -724,7 +730,7 @@ if useEnvFilter
 //    reason: 1=Bullish FVG反発(Long) / -1=Bearish FVG反発(Short) / 0=反発なし
 //    remain: 状態保持の残り本数
 // ============================================================
-f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverRatio, bool useBos, int bosLen) =>
+f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverRatio, bool useBos, int swLeft, int swRight) =>
     float _ref = ta.atr(14)
     var float _btop = na          // Bullish FVG 上端 (= low)
     var float _bbot = na          // Bullish FVG 下端 (= high[2])
@@ -740,14 +746,35 @@ f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverR
     var int   _reason = 0
     var int   _evbar  = na
     // --- FVG構造管理 BOS状態 (このTFコンテキスト内で保持: 0=Neutral / +1=Bull / -1=Bear) ---
-    //   確定足終値ベース。既存トリガー用BOS (bosLookback) とは完全分離。ラッチ式で保持。
-    var int   _bosState = 0
-    bool _fbBull = close > ta.highest(high, bosLen)[1]
-    bool _fbBear = close < ta.lowest(low,  bosLen)[1]
+    //   確定 Swing High / Swing Low (戻り高値 / 押し安値) の終値ブレイクで判定。ラッチ式で保持。
+    //   既存トリガー用BOSとは完全分離。
+    var int   _bosState   = 0
+    var float _swHigh     = na     // 直近確定 Swing High (構造レベル)
+    var float _swLow      = na     // 直近確定 Swing Low  (構造レベル)
+    var bool  _swHighUsed = false  // この Swing High で既にBOS成立済み (多重BOS防止)
+    var bool  _swLowUsed  = false  // この Swing Low  で既にBOS成立済み (多重BOS防止)
+    // (A) BOS評価 : 「このバー開始時点で既に確定している」直近Swingへの終値ブレイクのみ判定。
+    //     このバーで新たに確定するSwing (下の (B)) は使わない → 同バー先取り/リペイント防止。
+    //     ヒゲ抜けはBOSにしない (close ブレイクのみ)。同一Swingでの成立は1回だけ。
+    bool _fbBull = not na(_swHigh) and not _swHighUsed and close > _swHigh
+    bool _fbBear = not na(_swLow)  and not _swLowUsed  and close < _swLow
     if _fbBull
-        _bosState := 1
+        _bosState   := 1
+        _swHighUsed := true
     if _fbBear
-        _bosState := -1
+        _bosState   := -1
+        _swLowUsed  := true
+    // (B) このバーで新たに確定した Swing を構造レベルとして更新 ((A)の後 → 同バー先取り防止)。
+    //     ta.pivothigh/low は右 swRight 本が確定した時点で値を返す (未来参照なし・非リペイント)。
+    //     新Swing確定で used をリセットし、新しい構造レベルとして監視を再開する。
+    float _ph = ta.pivothigh(high, swLeft, swRight)
+    float _pl = ta.pivotlow(low,  swLeft, swRight)
+    if not na(_ph)
+        _swHigh     := _ph
+        _swHighUsed := false
+    if not na(_pl)
+        _swLow      := _pl
+        _swLowUsed  := false
     // --- FVG形成 (最新を1本だけ保持・反発フラグをリセット) ---
     bool _newBull = _ref > 0 and low > high[2] and ((low - high[2]) / _ref) >= minThickR
     bool _newBear = _ref > 0 and high < low[2] and ((low[2] - high) / _ref) >= minThickR
@@ -819,12 +846,12 @@ f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverR
     int _outBias   = _active ? _bias : 0
     int _outReason = _active ? _reason : 0
     int _outRemain = _active ? holdBars - (bar_index - _evbar) : 0
-    [_outBias, _outReason, _outRemain, _btop, _bbot, _rtop, _rbot, _bosState]
+    [_outBias, _outReason, _outRemain, _btop, _bbot, _rtop, _rbot, _bosState, _swHigh, _swLow]
 
 // 確定済み1本前を上位足コンテキスト内で返す非リペイント補助。
-f_efvgReboundConfirmed(int holdBars, float minThickR, float depthMax, float recoverRatio, bool useBos, int bosLen) =>
-    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = f_efvgReboundState(holdBars, minThickR, depthMax, recoverRatio, useBos, bosLen)
-    [_b[1], _r[1], _rem[1], _bt[1], _bb[1], _rt[1], _rb[1], _bos[1]]
+f_efvgReboundConfirmed(int holdBars, float minThickR, float depthMax, float recoverRatio, bool useBos, int swLeft, int swRight) =>
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos, _swh, _swl] = f_efvgReboundState(holdBars, minThickR, depthMax, recoverRatio, useBos, swLeft, swRight)
+    [_b[1], _r[1], _rem[1], _bt[1], _bb[1], _rt[1], _rb[1], _bos[1], _swh[1], _swl[1]]
 
 // --- テキスト変換 ---
 f_efvgBiasText(int b) =>
@@ -882,8 +909,11 @@ int efvgOBos = 0
 int efvgMBos = 0
 int efvg5Bos = 0
 int efvg1Bos = 0
+// --- 5M の確定 Swing High / Low (デバッグ表示用) ---
+float efvg5SwH = na
+float efvg5SwL = na
 if useEFVGEnv and useEFVGDaily
-    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvgDailyTF, f_efvgReboundConfirmed(efvgHoldDaily, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos, _swh, _swl] = request.security(syminfo.tickerid, efvgDailyTF, f_efvgReboundConfirmed(efvgHoldDaily, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosSwingLeft, fvgBosSwingRight), lookahead = barmerge.lookahead_on)
     efvgDBias := _b
     efvgDReason := _r
     efvgDRem := _rem
@@ -893,7 +923,7 @@ if useEFVGEnv and useEFVGDaily
     efvgDRB := _rb
     efvgDBos := _bos
 if useEFVGEnv and useEFVG4H
-    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg4HTF, f_efvgReboundConfirmed(efvgHold4H, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos, _swh, _swl] = request.security(syminfo.tickerid, efvg4HTF, f_efvgReboundConfirmed(efvgHold4H, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosSwingLeft, fvgBosSwingRight), lookahead = barmerge.lookahead_on)
     efvgHBias := _b
     efvgHReason := _r
     efvgHRem := _rem
@@ -903,7 +933,7 @@ if useEFVGEnv and useEFVG4H
     efvgHRB := _rb
     efvgHBos := _bos
 if useEFVGEnv and useEFVG1H
-    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg1HTF, f_efvgReboundConfirmed(efvgHold1H, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos, _swh, _swl] = request.security(syminfo.tickerid, efvg1HTF, f_efvgReboundConfirmed(efvgHold1H, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosSwingLeft, fvgBosSwingRight), lookahead = barmerge.lookahead_on)
     efvgOBias := _b
     efvgOReason := _r
     efvgORem := _rem
@@ -913,7 +943,7 @@ if useEFVGEnv and useEFVG1H
     efvgORB := _rb
     efvgOBos := _bos
 if useEFVGEnv and useEFVG15M
-    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg15MTF, f_efvgReboundConfirmed(efvgHold15M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos, _swh, _swl] = request.security(syminfo.tickerid, efvg15MTF, f_efvgReboundConfirmed(efvgHold15M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosSwingLeft, fvgBosSwingRight), lookahead = barmerge.lookahead_on)
     efvgMBias := _b
     efvgMReason := _r
     efvgMRem := _rem
@@ -925,7 +955,7 @@ if useEFVGEnv and useEFVG15M
 // 5M : チャートと同じ5分足。確定済み1本前 (f_efvgReboundConfirmed の [1]) を参照 → 形成途中の
 //   現在足では状態が変化しない。既存の上位足と同一の非リペイント取得パターン。
 if useEFVGEnv and useEFVG5M
-    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg5MTF, f_efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos, _swh, _swl] = request.security(syminfo.tickerid, efvg5MTF, f_efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosSwingLeft, fvgBosSwingRight), lookahead = barmerge.lookahead_on)
     efvg5Bias := _b
     efvg5Reason := _r
     efvg5Rem := _rem
@@ -934,11 +964,13 @@ if useEFVGEnv and useEFVG5M
     efvg5RT := _rt
     efvg5RB := _rb
     efvg5Bos := _bos
+    efvg5SwH := _swh
+    efvg5SwL := _swl
 // 1M : FVG形成/反発の状態を1分足コンテキストで継続管理 (f_efvgReboundState を request.security 内で
 //   毎1分足評価)。f_efvgReboundConfirmed の [1] + lookahead_on で「直近確定した1分足」の状態を取得し、
 //   形成途中の1分足は使用しない。5分足エントリートリガーの security_lower_tf 集約とは別系統。
 if useEFVGEnv and useEFVG1M
-    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos] = request.security(syminfo.tickerid, efvg1MTF, f_efvgReboundConfirmed(efvgHold1M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    [_b, _r, _rem, _bt, _bb, _rt, _rb, _bos, _swh, _swl] = request.security(syminfo.tickerid, efvg1MTF, f_efvgReboundConfirmed(efvgHold1M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosSwingLeft, fvgBosSwingRight), lookahead = barmerge.lookahead_on)
     efvg1Bias := _b
     efvg1Reason := _r
     efvg1Rem := _rem
@@ -1607,7 +1639,7 @@ f_fvgBosText(int s) =>
 var table fvgBosTbl = na
 if showFvgBosDebug and useEFVGEnv
     if na(fvgBosTbl)
-        fvgBosTbl := table.new(position.bottom_right, 2, 7, border_width = 1)
+        fvgBosTbl := table.new(position.bottom_right, 2, 9, border_width = 1)
     if barstate.islast
         color _hb = color.new(color.black, 0)
         table.cell(fvgBosTbl, 0, 0, "FVG構造BOS", text_color = color.white, bgcolor = _hb, text_size = size.small)
@@ -1624,6 +1656,19 @@ if showFvgBosDebug and useEFVGEnv
         table.cell(fvgBosTbl, 1, 5, useEFVG5M ? f_fvgBosText(efvg5Bos) : "-", text_color = color.white, bgcolor = useEFVG5M ? f_efvgBiasColor(efvg5Bos) : color.new(color.gray, 60), text_size = size.small)
         table.cell(fvgBosTbl, 0, 6, "1M",  text_color = color.white, text_size = size.small)
         table.cell(fvgBosTbl, 1, 6, useEFVG1M ? f_fvgBosText(efvg1Bos) : "-", text_color = color.white, bgcolor = useEFVG1M ? f_efvgBiasColor(efvg1Bos) : color.new(color.gray, 60), text_size = size.small)
+        // 5M の直近確定 Swing High / Low の価格 (別インジ / 目視突合用)
+        table.cell(fvgBosTbl, 0, 7, "5M SwH", text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 7, na(efvg5SwH) ? "-" : str.tostring(efvg5SwH, "#.##"), text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 0, 8, "5M SwL", text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 8, na(efvg5SwL) ? "-" : str.tostring(efvg5SwL, "#.##"), text_color = color.white, text_size = size.small)
+
+// --- 確定 Swing High / Low のチャートマーク (任意ON/OFF・既定OFF・チャート足=5M想定) ---
+//   ta.pivothigh/low は右 fvgBosSwingRight 本確定後に値を返す (未来参照なし)。offset で
+//   実際のSwing発生バーへマークを配置する。表示専用でシグナル/BOS判定には一切影響しない。
+float _chartPH = ta.pivothigh(high, fvgBosSwingLeft, fvgBosSwingRight)
+float _chartPL = ta.pivotlow(low,  fvgBosSwingLeft, fvgBosSwingRight)
+plotshape(showFvgBosSwings and not na(_chartPH), title = "Swing High", style = shape.triangledown, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny, offset = -fvgBosSwingRight)
+plotshape(showFvgBosSwings and not na(_chartPL), title = "Swing Low",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.aqua, 0),   size = size.tiny, offset = -fvgBosSwingRight)
 
 // --- 選択中FVGの上下限ゾーン (デバッグ・最新バーで更新) ---
 var line[] efvgZoneLines = array.new_line()
