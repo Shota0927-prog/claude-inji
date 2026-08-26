@@ -320,6 +320,16 @@ efvgShowDebug = input.bool(false, "デバッグ(スコア/状態)を表示", gro
 efvgShowZones = input.bool(false, "選択中FVGの上下限を表示", group = grpEFVG)
 
 // ============================================================
+//  4h. 入力 : 5M FVG反発 → 1M 同方向BOS 順序確認
+// ------------------------------------------------------------
+//  5M FVG反発が成立した後に、その方向の 1M BOS が「反発より後」に新規成立したときだけ
+//  エントリーを許可する順序制御。1M BOS → 5M FVG反発 の逆順は無効。
+//  BOSは既存の bosLookback を使用 (close > highest(high, bosLookback)[1] 等)。
+// ============================================================
+grp5mBosOrder      = "5M FVG → 1M BOS 順序確認"
+use5mFvg1mBosOrder = input.bool(true, "5M FVG反発後に1M同方向BOSを確認してエントリー", group = grp5mBosOrder)
+
+// ============================================================
 //  5. 包み足判定
 // ============================================================
 bool prevUp = close[1] > open[1]
@@ -410,6 +420,15 @@ f_calcTriggers() =>
     bool _bullTrigger = f_combineTrig(_bullCnt, enabledTrigCount)
     bool _bearTrigger = f_combineTrig(_bearCnt, enabledTrigCount)
     [_bullTrigger, _bearTrigger]
+
+// 1分足コンテキストで BOS方向 + その1分足の成立時刻を返す (5M FVG反発→1M BOS 順序確認用)。
+//   BOSは既存トリガーと同一定義 (close > highest[1] / close < lowest[1])・bosLookback 共通。
+//   既存の f_calcTriggers / トリガー系には一切影響しない (別系統の lower_tf 取得)。
+f_bos1m() =>
+    bool _bull = close > ta.highest(high, bosLookback)[1]
+    bool _bear = close < ta.lowest(low,  bosLookback)[1]
+    int  _dir  = _bull ? 1 : _bear ? -1 : 0
+    [_dir, time]
 
 float trBody      = math.abs(close - open)
 float trRange     = high - low
@@ -946,6 +965,58 @@ bool finalEnvShortOk =
      (efvgTrendOk or efvgBiasShort)
 
 // ============================================================
+//  8g. 5M FVG反発 → 1M 同方向BOS 順序確認
+// ------------------------------------------------------------
+//  「5M FVG反発が成立 → その後に新しい同方向1M BOSが成立」の順序でのみエントリーを許可する。
+//   ・5M FVG反発ロジック自体 (f_efvgReboundState) は不変。5M BOS事前フィルターは追加しない。
+//   ・新規5M FVG反発イベントの成立時刻を保存 (efvg5Reason=1:Long / -1:Short・efvg5Rem リセットで新規)。
+//   ・1M BOS の bool だけでなく「成立した1分足の time」も取得し、反発時刻より後のBOSのみ確認とする。
+//     反発前に出た古い1M BOSは使用しない。1反発イベントにつき最初の同方向BOSのみ有効。
+//   ・そのイベントでエントリーしたら消費 → 同一反発イベント中は再エントリー不可 (新反発で再アーム)。
+//   ・反発の5分足とBOSの5分足が別でも有効 (var状態を跨いで判定)。非リペイント: 確定済み下位足のみ参照。
+// ============================================================
+var int  reb5LongRebTime   = na    // 直近Long(Bullish)反発イベントの成立時刻
+var int  reb5ShortRebTime  = na    // 直近Short(Bearish)反発イベントの成立時刻
+var bool reb5LongBosOk     = false // 反発後に同方向1M BOSを確認済み (未消費なら有効)
+var bool reb5ShortBosOk    = false
+var bool reb5LongConsumed  = false // このLong反発イベントで既にエントリー済み
+var bool reb5ShortConsumed = false
+var int  reb5PrevReason    = 0     // 新規イベント検出用 (直近 efvg5Reason)
+var int  reb5PrevRem       = 0     // 新規イベント検出用 (直近 efvg5Rem)
+
+if use5mFvg1mBosOrder and useEFVGEnv and useEFVG5M
+    // (1) 新規5M FVG反発イベント検出 → 反発時刻を保存し、確認/消費を再アーム。
+    //     反発は確定1本前の5M足で成立するため time[1] を反発時刻とする。
+    bool _newLong  = efvg5Reason == 1  and (efvg5Reason != reb5PrevReason or efvg5Rem > reb5PrevRem)
+    bool _newShort = efvg5Reason == -1 and (efvg5Reason != reb5PrevReason or efvg5Rem > reb5PrevRem)
+    if _newLong
+        reb5LongRebTime  := time[1]
+        reb5LongBosOk    := false
+        reb5LongConsumed := false
+    if _newShort
+        reb5ShortRebTime  := time[1]
+        reb5ShortBosOk    := false
+        reb5ShortConsumed := false
+    reb5PrevReason := efvg5Reason
+    reb5PrevRem    := efvg5Rem
+    // (2) この5M足に含まれる確定1分足の [BOS方向, 成立時刻] を取得 (未来参照なし・非リペイント)。
+    [_bos1mDir, _bos1mTime] = request.security_lower_tf(syminfo.tickerid, triggerTF, f_bos1m())
+    int _bn = array.size(_bos1mDir)
+    if _bn > 0
+        for _bi = 0 to _bn - 1
+            int _d = array.get(_bos1mDir, _bi)
+            int _t = array.get(_bos1mTime, _bi)
+            // (3) 反発より後の同方向1M BOS のみ確認 (未消費・未確認の間だけ・最初の1回で確定)。
+            if not reb5LongConsumed and not reb5LongBosOk and not na(reb5LongRebTime) and _d == 1 and _t > reb5LongRebTime
+                reb5LongBosOk := true
+            if not reb5ShortConsumed and not reb5ShortBosOk and not na(reb5ShortRebTime) and _d == -1 and _t > reb5ShortRebTime
+                reb5ShortBosOk := true
+
+// 順序確認ゲート (本機能ON かつ 5M FVG使用時のみ有効。OFF/5M未使用なら常に許可 = 従来挙動)。
+bool fvgOrderLongOk  = not (use5mFvg1mBosOrder and useEFVGEnv and useEFVG5M) or reb5LongBosOk
+bool fvgOrderShortOk = not (use5mFvg1mBosOrder and useEFVGEnv and useEFVG5M) or reb5ShortBosOk
+
+// ============================================================
 //  9. SL / TP / ロット計算
 // ============================================================
 float patLow  = math.min(low,  low[1])
@@ -1425,8 +1496,9 @@ bool triggerLongSignal  = not noTriggerMode and baseLongCondition  and finalBull
 bool triggerShortSignal = not noTriggerMode and baseShortCondition and finalBearTrig and trigCooldownOk
 
 // --- 最終エントリー可否 (モードで分岐) ---
-bool canLong  = noTriggerMode ? noTriggerLongSignal  : triggerLongSignal
-bool canShort = noTriggerMode ? noTriggerShortSignal : triggerShortSignal
+// 5M FVG反発 → 1M 同方向BOS の順序確認を AND (本機能OFF/5M未使用時は常に true)。
+bool canLong  = (noTriggerMode ? noTriggerLongSignal  : triggerLongSignal)  and fvgOrderLongOk
+bool canShort = (noTriggerMode ? noTriggerShortSignal : triggerShortSignal) and fvgOrderShortOk
 
 // ============================================================
 //  11. 発注 (ピラミッディング対応)
@@ -1467,6 +1539,10 @@ if okAddLong and wantLong
     // トリガーOFF時: 発注した瞬間に解除 → 主要条件が崩れるまで再エントリーしない
     if noTriggerMode
         longArmed := false
+    // 5M FVG反発→1M BOS: このLong反発イベントを消費 → 同一反発イベント中は再エントリー不可
+    if use5mFvg1mBosOrder and useEFVGEnv and useEFVG5M
+        reb5LongConsumed := true
+        reb5LongBosOk    := false
 
 if okAddShort and wantShort
     pyrSeq += 1
@@ -1480,6 +1556,10 @@ if okAddShort and wantShort
     // トリガーOFF時: 発注した瞬間に解除 → 主要条件が崩れるまで再エントリーしない
     if noTriggerMode
         shortArmed := false
+    // 5M FVG反発→1M BOS: このShort反発イベントを消費 → 同一反発イベント中は再エントリー不可
+    if use5mFvg1mBosOrder and useEFVGEnv and useEFVG5M
+        reb5ShortConsumed := true
+        reb5ShortBosOk    := false
 
 // ============================================================
 //  12. FVG 環境認識 表示 (テーブル / デバッグ / ゾーン)
