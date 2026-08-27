@@ -1,0 +1,1288 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  Support / Resistance Zone Engine  (Ver.1 - Zone Map only, no Entry logic)
+// ============================================================================
+//  目的:
+//    「どこで支えられやすいか / どこが抵抗になりやすいか / そのZoneがどれくらい
+//      強いか / 上下にどれだけPrice Spaceがあるか」を構造化して検出する。
+//    Entryシグナルは出さない。将来のEntry ModuleがLive Zone Mapを参照して
+//    Structural SL / TP / RR / Obstacle Count / PASS-FAIL を取得する。
+//
+//  セクション構成:
+//     1. Inputs
+//     2. Constants & User Defined Types
+//     3. Utility Functions
+//     4. MA Source Module
+//     5. Horizontal Source Module          (5M / 15M / 1H Swing Pivot)
+//     6. Day High / Low Module             (Asia/Tokyo 基準)
+//     7. Accumulation Module               (1H / 4H / D)  ← 差し替え可能
+//     8. Raw Zone Generation
+//     9. Cluster Engine
+//    10. Strength Score Engine
+//    11. Zone State Engine
+//    12. Break / Flip Engine
+//    13. Live Zone Map
+//    14. Structural SL / TP Utility Functions  (Entry Module 接続点)
+//    15. Display
+//    16. Debug Table
+//
+//  既知の制約 (Pine Script仕様上のもの / 仕様は変更していない):
+//   L1. request.security でチャート足より下位の足を参照すると、TradingViewは
+//       その足の「最後のintrabar値」しか返さず精度が落ちる。1分足2000/3000MA
+//       および5M Break判定を仕様どおり機能させるため、本インジケーターは
+//       1分足チャートでの使用を前提とする。上位足で使うとDebug Tableに警告が出る。
+//   L2. ta.sma(close, 3000) は1分足で3000本の履歴を要求する。履歴が足りない
+//       銘柄/プランでは MA Zone は na となりZone生成から除外される。
+//   L3. Pineには連想配列が無いため、毎バー作り直されるCluster Zoneと永続的な
+//       Break/Flip状態の紐付けは「価格帯の近さ (clusterDist以内)」で行っている。
+//   L4. box / label は最大500個。描画は現在価格に近い maxZonesDraw 本のみ、
+//       最新バー上に描画する (Live Zone Mapの可視化であり履歴描画ではない)。
+// ============================================================================
+
+//@version=5
+indicator(
+     title            = "Support / Resistance Zone Engine",
+     shorttitle       = "SR Zone Engine",
+     overlay          = true,
+     max_boxes_count  = 500,
+     max_labels_count = 500,
+     max_lines_count  = 500
+ )
+
+// ============================================================================
+// 1. INPUTS
+// ============================================================================
+
+// ---- 1.1 Zone Geometry -----------------------------------------------------
+var string G_ZONE = "01 · Zone Geometry"
+zoneHalfWidth = input.float(10.0, "Zone Half Width ($)", minval = 0.1, step = 0.5, group = G_ZONE,
+     tooltip = "Zone = 中心価格 ± この値。Strengthによって幅は変えない。")
+
+// ---- 1.2 MA Source ---------------------------------------------------------
+var string G_MA = "02 · MA Source"
+maTf        = input.timeframe("1",  "MA Timeframe",           group = G_MA)
+maType      = input.string("SMA",   "MA Type", options = ["SMA", "EMA"], group = G_MA)
+ma1Len      = input.int(2000,       "MA #1 Length", minval = 1, maxval = 4999, group = G_MA)
+ma2Len      = input.int(3000,       "MA #2 Length", minval = 1, maxval = 4999, group = G_MA)
+scoreMa1    = input.float(2.0,      "Base Score · MA #1", step = 0.5, group = G_MA)
+scoreMa2    = input.float(2.0,      "Base Score · MA #2", step = 0.5, group = G_MA)
+useMaSource = input.bool(true,      "Enable MA Source",   group = G_MA)
+
+// ---- 1.3 MA Slope ----------------------------------------------------------
+var string G_SLOPE = "03 · MA Slope"
+slopeLookback   = input.int(60,   "Slope Lookback (MA TF bars)", minval = 1, group = G_SLOPE)
+slopeThrMod     = input.float(1.0, "Slope Threshold · Moderate ($/lookback)", step = 0.1, group = G_SLOPE)
+slopeThrStrong  = input.float(3.0, "Slope Threshold · Strong ($/lookback)",   step = 0.1, group = G_SLOPE)
+slopeBonusFlat  = input.float(0.0, "Slope Bonus · Flat",     step = 0.5, group = G_SLOPE)
+slopeBonusMod   = input.float(1.0, "Slope Bonus · Moderate", step = 0.5, group = G_SLOPE)
+slopeBonusStr   = input.float(2.0, "Slope Bonus · Strong",   step = 0.5, group = G_SLOPE)
+slopeBonusMode  = input.string("Sum (per MA)", "Slope Bonus Aggregation in Cluster",
+     options = ["Sum (per MA)", "Max"], group = G_SLOPE,
+     tooltip = "同一Cluster内に2000MAと3000MAが両方入った場合、Slope Bonusを合算するか最大値のみ採用するか。")
+maClusterDist   = input.float(20.0, "MA Cluster Distance ($)", step = 1.0, group = G_SLOPE)
+maClusterBonusV = input.float(1.0, "MA Cluster Bonus",              step = 0.5, group = G_SLOPE)
+maClusterDirBns = input.float(1.0, "MA Cluster Bonus · Same Slope", step = 0.5, group = G_SLOPE)
+
+// ---- 1.4 Horizontal Source -------------------------------------------------
+var string G_HZ = "04 · Horizontal Source (Swing)"
+useHzSource = input.bool(true,      "Enable Horizontal Source", group = G_HZ)
+hzTf1       = input.timeframe("5",  "Horizontal TF #1", group = G_HZ)
+hzTf2       = input.timeframe("15", "Horizontal TF #2", group = G_HZ)
+hzTf3       = input.timeframe("60", "Horizontal TF #3", group = G_HZ)
+pivLen1     = input.int(10, "Swing Pivot Length · TF #1", minval = 1, group = G_HZ)
+pivLen2     = input.int(8,  "Swing Pivot Length · TF #2", minval = 1, group = G_HZ)
+pivLen3     = input.int(6,  "Swing Pivot Length · TF #3", minval = 1, group = G_HZ)
+scoreHz1    = input.float(1.0, "Base Score · TF #1 Swing", step = 0.5, group = G_HZ)
+scoreHz2    = input.float(2.0, "Base Score · TF #2 Swing", step = 0.5, group = G_HZ)
+scoreHz3    = input.float(3.0, "Base Score · TF #3 Swing", step = 0.5, group = G_HZ)
+
+// ---- 1.5 Horizontal Reaction ----------------------------------------------
+var string G_REACT = "05 · Horizontal Reaction"
+reactionDist    = input.float(10.0, "Reaction Distance ($)", step = 0.5, group = G_REACT,
+     tooltip = "Zoneに接触したあと、来た方向へこの距離以上戻ればReaction 1回。")
+reactionBonus1  = input.float(1.0, "Reaction Bonus · 1 time",  step = 0.5, group = G_REACT)
+reactionBonus2  = input.float(2.0, "Reaction Bonus · 2+ times", step = 0.5, group = G_REACT)
+reactionCap     = input.float(2.0, "Reaction Bonus Cap",        step = 0.5, group = G_REACT)
+reactionAllSrc  = input.bool(false, "Track Reaction on Accum / DayHL too", group = G_REACT,
+     tooltip = "仕様どおりの既定は OFF (水平線のみ)。ONにすると静的Zone全般でReactionを数える。")
+
+// ---- 1.6 Day High / Low ----------------------------------------------------
+var string G_DHL = "06 · Day High / Low"
+useDayHL        = input.bool(true, "Enable Day High / Low Source", group = G_DHL)
+dayTz           = input.string("Asia/Tokyo", "Day Session Timezone", group = G_DHL)
+scoreDayHL      = input.float(3.0, "Base Score · Day High / Low", step = 0.5, group = G_DHL)
+carryPrevDayHL  = input.bool(false, "Carry Previous Day H/L as Horizontal Zone", group = G_DHL,
+     tooltip = "日付変更時に旧Day High / Low をHorizontal Zoneとして保持する。")
+scorePrevDayHL  = input.float(2.0, "Base Score · Carried Prev Day H/L", step = 0.5, group = G_DHL)
+lifePrevDayHL   = input.float(5.0, "Lifetime · Carried Prev Day H/L (days)", step = 1.0, group = G_DHL)
+
+// ---- 1.7 Accumulation ------------------------------------------------------
+var string G_ACC = "07 · Accumulation"
+useAccSource = input.bool(true,       "Enable Accumulation Source", group = G_ACC)
+accTf1       = input.timeframe("60",  "Accum TF #1", group = G_ACC)
+accTf2       = input.timeframe("240", "Accum TF #2", group = G_ACC)
+accTf3       = input.timeframe("D",   "Accum TF #3", group = G_ACC)
+accLen1      = input.int(20, "Accum Lookback · TF #1 (bars)", minval = 3, group = G_ACC)
+accLen2      = input.int(20, "Accum Lookback · TF #2 (bars)", minval = 3, group = G_ACC)
+accLen3      = input.int(15, "Accum Lookback · TF #3 (bars)", minval = 3, group = G_ACC)
+accMult      = input.float(1.2, "Accum Max Range / ATR", step = 0.1, minval = 0.1, group = G_ACC,
+     tooltip = "レンジ幅(highest-lowest) <= ATR * この値 ならAccumulationと判定。")
+scoreAcc1    = input.float(3.0, "Base Score · TF #1 Accum", step = 0.5, group = G_ACC)
+scoreAcc2    = input.float(4.0, "Base Score · TF #2 Accum", step = 0.5, group = G_ACC)
+scoreAcc3    = input.float(5.0, "Base Score · TF #3 Accum", step = 0.5, group = G_ACC)
+lifeAcc      = input.float(30.0, "Lifetime · Accum Zone (days)", step = 1.0, group = G_ACC)
+
+// ---- 1.8 Cluster -----------------------------------------------------------
+var string G_CLU = "08 · Cluster"
+clusterDist = input.float(20.0, "Cluster Distance ($)", step = 1.0, group = G_CLU,
+     tooltip = "Raw Zone中心同士がこの距離以内ならCluster候補。統合後も全Sourceが最終Centerからこの距離以内であることを検証する。")
+
+// ---- 1.9 Strength Score ----------------------------------------------------
+var string G_SCORE = "09 · Strength Score"
+thrMedium   = input.float(4.0,  "Threshold · Medium",      step = 0.5, group = G_SCORE)
+thrStrong   = input.float(7.0,  "Threshold · Strong",      step = 0.5, group = G_SCORE)
+thrVStrong  = input.float(10.0, "Threshold · Very Strong", step = 0.5, group = G_SCORE)
+confBonus2  = input.float(1.0, "Confluence Bonus · 2 categories",  step = 0.5, group = G_SCORE)
+confBonus3  = input.float(2.0, "Confluence Bonus · 3 categories",  step = 0.5, group = G_SCORE)
+confBonus4  = input.float(3.0, "Confluence Bonus · 4+ categories", step = 0.5, group = G_SCORE)
+flipBonusV  = input.float(2.0, "Flip Bonus", step = 0.5, group = G_SCORE)
+
+// ---- 1.10 Break / Flip -----------------------------------------------------
+var string G_BF = "10 · Break / Flip"
+breakTf         = input.timeframe("5", "Break Evaluation Timeframe", group = G_BF,
+     tooltip = "Breakはヒゲではなくこの時間足の確定終値で判定する。")
+breakBuffer     = input.float(5.0,  "Break Buffer ($)",         step = 0.5, group = G_BF)
+flipConfirmDist = input.float(10.0, "Flip Confirm Distance ($)", step = 0.5, group = G_BF)
+resetOnReclaim  = input.bool(true,  "Reset Broken on Reclaim", group = G_BF,
+     tooltip = "Break後、Flip未成立のまま元の側へ明確に戻った場合はBreakを無効化してStateを再判定する。")
+trackStaleBars  = input.int(500, "Zone State Retention (bars without match)", minval = 10, group = G_BF)
+
+// ---- 1.11 Zone Lifetime ----------------------------------------------------
+var string G_LIFE = "11 · Zone Lifetime"
+lifeHz1         = input.float(2.0,  "Lifetime · TF #1 Horizontal (days)",  step = 0.5, group = G_LIFE)
+lifeHz2         = input.float(5.0,  "Lifetime · TF #2 Horizontal (days)",  step = 0.5, group = G_LIFE)
+lifeHz3         = input.float(14.0, "Lifetime · TF #3 Horizontal (days)",  step = 0.5, group = G_LIFE)
+lifeExtendOn    = input.bool(true,  "Extend Lifetime on Reaction / Flip", group = G_LIFE)
+lifeExtendRatio = input.float(0.5,  "Lifetime Extension Ratio", step = 0.1, minval = 0.0, group = G_LIFE)
+maxPersistZones = input.int(200, "Max Persistent Raw Zones", minval = 20, maxval = 800, group = G_LIFE)
+
+// ---- 1.12 Structural SL / TP ----------------------------------------------
+var string G_SLTP = "12 · Structural SL / TP (Entry Module API)"
+slBuffer      = input.float(5.0,  "SL Buffer ($)", step = 0.5, group = G_SLTP)
+tpBuffer      = input.float(5.0,  "TP Buffer ($)", step = 0.5, group = G_SLTP)
+maxSlDist     = input.float(30.0, "Max SL Distance ($)", step = 1.0, group = G_SLTP)
+minStructRR   = input.float(1.0,  "Minimum Structural RR", step = 0.1, group = G_SLTP)
+slMinScore    = input.float(4.0,  "SL Zone · Min Score", step = 0.5, group = G_SLTP)
+slMinStrStr   = input.string("Medium", "SL Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+tpMinScore    = input.float(7.0,  "TP Zone · Min Score", step = 0.5, group = G_SLTP)
+tpMinStrStr   = input.string("Strong", "TP Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+obsMinStrStr  = input.string("Medium", "Obstacle · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+slExclBroken  = input.bool(false, "SL Zone · Exclude Broken", group = G_SLTP)
+tpExclBroken  = input.bool(false, "TP Zone · Exclude Broken", group = G_SLTP)
+
+// ---- 1.13 Display ----------------------------------------------------------
+var string G_DISP = "13 · Display"
+showZones      = input.bool(true,  "Show Zones (box)",        group = G_DISP)
+showMaLines    = input.bool(true,  "Plot MA Source Lines",    group = G_DISP)
+showLabels     = input.bool(true,  "Show Zone Labels",        group = G_DISP)
+showDetailLbl  = input.bool(false, "Detailed Labels (sources)", group = G_DISP)
+maxZonesDraw   = input.int(30, "Max Zones Drawn", minval = 1, maxval = 120, group = G_DISP)
+zoneLeftBars   = input.int(150, "Zone Box · Left Extension (bars)",  minval = 1, group = G_DISP)
+zoneRightBars  = input.int(30,  "Zone Box · Right Extension (bars)", minval = 1, group = G_DISP)
+colSupport     = input.color(color.new(#26A69A, 0), "Color · Support",    group = G_DISP)
+colResistance  = input.color(color.new(#EF5350, 0), "Color · Resistance", group = G_DISP)
+colActive      = input.color(color.new(#FFB300, 0), "Color · Active",     group = G_DISP)
+colBroken      = input.color(color.new(#78909C, 0), "Color · Broken",     group = G_DISP)
+trWeak         = input.int(90, "Transparency · Weak",        minval = 0, maxval = 100, group = G_DISP)
+trMedium       = input.int(80, "Transparency · Medium",      minval = 0, maxval = 100, group = G_DISP)
+trStrong       = input.int(68, "Transparency · Strong",      minval = 0, maxval = 100, group = G_DISP)
+trVStrong      = input.int(55, "Transparency · Very Strong", minval = 0, maxval = 100, group = G_DISP)
+
+// ---- 1.14 Debug ------------------------------------------------------------
+var string G_DBG = "14 · Debug"
+showDebugTable = input.bool(true, "Show Debug Table", group = G_DBG)
+dbgPosStr      = input.string("Top Right", "Debug Table Position",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group = G_DBG)
+dbgNearestN    = input.int(3, "Nearest Zones per Side", minval = 1, maxval = 5, group = G_DBG)
+dbgTextSize    = input.string("Small", "Debug Table Text Size", options = ["Tiny", "Small", "Normal"], group = G_DBG)
+showPlanPrev   = input.bool(false, "Show Structural Plan Preview", group = G_DBG,
+     tooltip = "Entryロジックは未実装。ここではEntry Priceを手入力してSL/TP/RR/Obstacle/PASS-FAILの動作確認だけを行う。")
+prevEntryDir   = input.string("Long", "Preview Direction", options = ["Long", "Short"], group = G_DBG)
+prevEntryPrice = input.float(0.0, "Preview Entry Price (0 = current close)", step = 0.1, group = G_DBG)
+
+// ============================================================================
+// 2. CONSTANTS & USER DEFINED TYPES
+// ============================================================================
+
+// Zone State
+int ST_ACTIVE  = 0
+int ST_SUPPORT = 1
+int ST_RESIST  = 2
+int ST_BROKEN  = 3
+
+// Strength tier
+int SR_WEAK    = 1
+int SR_MEDIUM  = 2
+int SR_STRONG  = 3
+int SR_VSTRONG = 4
+
+// Source Category (§14) — Confluence判定はこの文字列だけを見る。
+// 新Sourceを足すときは既存カテゴリーに割り当てるか、ここへ1つ追加するだけでよい。
+string CAT_MA   = "MA"
+string CAT_HZ   = "Horizontal"
+string CAT_DHL  = "DayHL"
+string CAT_ACC  = "Accum"
+
+int MS_PER_DAY = 86400000
+
+// ---------------------------------------------------------------------------
+// 2.1 RawZone : 個々のSourceが生成する単位Zone (§10)
+// ---------------------------------------------------------------------------
+type RawZone
+    string srcId        = ""        // "MA1" / "SWING" / "DAY_HIGH" / "ACC_HI" ...
+    string srcCat       = ""        // CAT_MA / CAT_HZ / CAT_DHL / CAT_ACC
+    string srcTf        = ""        // Source Timeframe
+    string srcLabel     = ""        // 表示用ラベル ("2000MA↑", "1H Accum Low" ...)
+    float  center       = 0.0
+    float  top          = 0.0
+    float  bottom       = 0.0
+    float  baseScore    = 0.0
+    int    slopeState   = 0         // 0 Flat / 1 Moderate / 2 Strong
+    int    slopeDir     = 0         // -1 down / 0 flat / +1 up
+    float  slopeBonus   = 0.0
+    float  maClusterBonus = 0.0
+    int    reactionCnt  = 0
+    float  reactionBonus = 0.0
+    bool   flipped      = false     // 直近マッチしたZone Trackのflip状態
+    float  flipBonus    = 0.0
+    int    entrySide    = 0         // Reaction計測用: +1 上から進入 / -1 下から進入
+    int    createdBar   = 0
+    int    createdTime  = 0
+    int    expireTime   = 0         // 0 = 無期限
+    int    lifeMs       = 0
+    bool   dynamic      = false     // true = 毎バー再計算 (MA / Day H-L)
+
+// ---------------------------------------------------------------------------
+// 2.2 Zone : Cluster統合後の最終Zone。Live Zone Mapの構成要素 (§23)
+// ---------------------------------------------------------------------------
+type Zone
+    float  center       = 0.0
+    float  top          = 0.0
+    float  bottom       = 0.0
+    float  score        = 0.0
+    float  baseSum      = 0.0
+    float  slopeBonus   = 0.0
+    float  maBonus      = 0.0
+    float  reactionBonus = 0.0
+    float  flipBonus    = 0.0
+    float  confBonus    = 0.0
+    int    strength     = 1
+    int    state        = 0
+    bool   flipped      = false
+    int    flipDir      = 0
+    int    catCount     = 0
+    int    memberCount  = 0
+    string sources      = ""
+    int    trackId      = -1
+
+// ---------------------------------------------------------------------------
+// 2.3 ZoneTrack : Zone State / Break / Flip の永続ステート (§17-§20)
+//     Cluster Zoneは毎バー作り直されるため、状態は価格帯で紐付けて保持する。
+// ---------------------------------------------------------------------------
+type ZoneTrack
+    int   id          = 0
+    float center      = 0.0
+    float top         = 0.0
+    float bottom      = 0.0
+    int   state       = 0
+    int   breakDir    = 0     // +1 Up Break済 / -1 Down Break済 / 0 なし
+    int   breakBar    = 0
+    bool  retested    = false
+    bool  flipped     = false
+    int   flipDir     = 0     // +1 Resistance→Support / -1 Support→Resistance
+    int   lastSeenBar = 0
+    bool  matched     = false
+
+// ---------------------------------------------------------------------------
+// 2.4 TradePlan : Entry Moduleへ返す構造 (§24-§29)
+// ---------------------------------------------------------------------------
+type TradePlan
+    bool   valid        = false
+    string status       = "FAIL"
+    string reason       = "NO_ENTRY"
+    int    dir          = 0        // +1 Long / -1 Short
+    float  entry        = 0.0
+    float  sl           = 0.0
+    float  tp           = 0.0
+    float  risk         = 0.0
+    float  reward       = 0.0
+    float  rr           = 0.0
+    int    obstacles    = 0
+    float  slZoneCenter = 0.0
+    float  slZoneScore  = 0.0
+    float  tpZoneCenter = 0.0
+    float  tpZoneScore  = 0.0
+
+// ============================================================================
+// 3. UTILITY FUNCTIONS
+// ============================================================================
+
+// Score → Strength Tier (§16)
+f_strengthOf(float score) =>
+    score >= thrVStrong ? SR_VSTRONG : score >= thrStrong ? SR_STRONG : score >= thrMedium ? SR_MEDIUM : SR_WEAK
+
+f_strengthName(int s) =>
+    s == SR_VSTRONG ? "VERY STRONG" : s == SR_STRONG ? "STRONG" : s == SR_MEDIUM ? "MEDIUM" : "WEAK"
+
+f_strengthIdx(string s) =>
+    s == "Very Strong" ? SR_VSTRONG : s == "Strong" ? SR_STRONG : s == "Medium" ? SR_MEDIUM : SR_WEAK
+
+f_stateName(int st) =>
+    st == ST_SUPPORT ? "SUP" : st == ST_RESIST ? "RES" : st == ST_ACTIVE ? "ACT" : "BRK"
+
+f_stateFull(int st) =>
+    st == ST_SUPPORT ? "Support" : st == ST_RESIST ? "Resistance" : st == ST_ACTIVE ? "Active" : "Broken"
+
+f_num(float v, string fmt) =>
+    na(v) ? "-" : str.tostring(v, fmt)
+
+f_arrow(int dir) =>
+    dir > 0 ? "↑" : dir < 0 ? "↓" : "→"
+
+// Slope 3段階判定 (§4)
+f_slopeState(float delta) =>
+    float a = math.abs(nz(delta))
+    a >= slopeThrStrong ? 2 : a >= slopeThrMod ? 1 : 0
+
+f_slopeDir(float delta) =>
+    nz(delta) > 0 ? 1 : nz(delta) < 0 ? -1 : 0
+
+f_slopeBonusValue(int st) =>
+    st == 2 ? slopeBonusStr : st == 1 ? slopeBonusMod : slopeBonusFlat
+
+// Reaction回数 → Bonus (§7)
+f_reactionBonus(int cnt) =>
+    math.min(cnt <= 0 ? 0.0 : cnt == 1 ? reactionBonus1 : reactionBonus2, reactionCap)
+
+// Confluence Bonus (§15)
+f_confluenceBonus(int catCount) =>
+    catCount >= 4 ? confBonus4 : catCount == 3 ? confBonus3 : catCount == 2 ? confBonus2 : 0.0
+
+f_days2ms(float d) =>
+    int(d * MS_PER_DAY)
+
+// ============================================================================
+// 4. MA SOURCE MODULE  (§3 / §4 / §5 / §22)
+// ============================================================================
+// 1分足 2000MA / 3000MA。動的Sourceなので毎バー再計算される。
+
+f_ma(float src, simple int len) =>
+    maType == "EMA" ? ta.ema(src, len) : ta.sma(src, len)
+
+f_maPack() =>
+    float m1 = f_ma(close, ma1Len)
+    float m2 = f_ma(close, ma2Len)
+    float d1 = m1 - m1[slopeLookback]
+    float d2 = m2 - m2[slopeLookback]
+    [m1, d1, m2, d2]
+
+[ma1Val, ma1Delta, ma2Val, ma2Delta] = request.security(syminfo.tickerid, maTf, f_maPack(),
+     lookahead = barmerge.lookahead_off)
+
+int   ma1Dir   = f_slopeDir(ma1Delta)
+int   ma2Dir   = f_slopeDir(ma2Delta)
+int   ma1State = f_slopeState(ma1Delta)
+int   ma2State = f_slopeState(ma2Delta)
+
+// Slope Bonusは「MAの向き」と「そのZoneが機能する向き」が一致した時だけ (§4)
+f_maSlopeBonus(float maVal, int dir, int st) =>
+    bool aligned = (dir > 0 and close > maVal) or (dir < 0 and close < maVal)
+    aligned ? f_slopeBonusValue(st) : 0.0
+
+float ma1SlopeBonus = na(ma1Val) ? 0.0 : f_maSlopeBonus(ma1Val, ma1Dir, ma1State)
+float ma2SlopeBonus = na(ma2Val) ? 0.0 : f_maSlopeBonus(ma2Val, ma2Dir, ma2State)
+
+// MA Cluster Bonus (§5)
+float maClusterBonus = 0.0
+if not na(ma1Val) and not na(ma2Val) and math.abs(ma1Val - ma2Val) <= maClusterDist
+    maClusterBonus := maClusterBonusV
+    if ma1Dir != 0 and ma1Dir == ma2Dir
+        maClusterBonus += maClusterDirBns
+
+// ============================================================================
+// 5. HORIZONTAL SOURCE MODULE  (§6)
+// ============================================================================
+// Swing High / Low。ta.pivothigh/pivotlow は右側 len 本が確定して初めて値が出る
+// ため、未確定Pivotは構造的に使用されない (= リペイントしない)。
+
+f_pivotPack(simple int len) =>
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low,  len, len)
+    int   pt = na(ph) ? int(na) : time
+    int   lt = na(pl) ? int(na) : time
+    [ph, pt, pl, lt]
+
+[ph1, ph1T, pl1, pl1T] = request.security(syminfo.tickerid, hzTf1, f_pivotPack(pivLen1), lookahead = barmerge.lookahead_off)
+[ph2, ph2T, pl2, pl2T] = request.security(syminfo.tickerid, hzTf2, f_pivotPack(pivLen2), lookahead = barmerge.lookahead_off)
+[ph3, ph3T, pl3, pl3T] = request.security(syminfo.tickerid, hzTf3, f_pivotPack(pivLen3), lookahead = barmerge.lookahead_off)
+
+// 「新しいPivot / Accumが確定した瞬間」だけ true になる立ち上がりエッジは
+// §8.0 でグローバル系列として計算する (関数引数の履歴参照を避けるため)。
+
+// ============================================================================
+// 6. DAY HIGH / LOW MODULE  (§8)
+// ============================================================================
+// Asia/Tokyo (input) 基準の暦日で当日高値・安値を保持する。
+// 日付変更でリセット。旧値はオプションでHorizontal Zoneへ引き継げる。
+
+int  _dayNo  = dayofmonth(time, dayTz)
+bool isNewDay = na(_dayNo[1]) or _dayNo != _dayNo[1]
+
+var float dayHigh     = na
+var float dayLow      = na
+var float prevDayHigh = na
+var float prevDayLow  = na
+
+if isNewDay
+    prevDayHigh := dayHigh
+    prevDayLow  := dayLow
+    dayHigh     := high
+    dayLow      := low
+else
+    dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+    dayLow  := na(dayLow)  ? low  : math.min(dayLow,  low)
+
+// ============================================================================
+// 7. ACCUMULATION MODULE  (§9)  ← このブロックだけ差し替えれば判定を交換できる
+// ============================================================================
+// 判定ロジック本体。戻り値は [BoxTop, BoxBottom, 新規確定フラグ]。
+// 現行実装: 直近 len 本のレンジ幅が ATR(len) * accMult 以下ならAccumulation。
+
+f_accumDetect(simple int len, float mult) =>
+    float hh   = ta.highest(high, len)
+    float ll   = ta.lowest(low,  len)
+    float atrv = ta.atr(len)
+    bool  isAcc = not na(atrv) and atrv > 0 and (hh - ll) <= atrv * mult
+    [hh, ll, isAcc]
+
+// 上位足の「確定済みバー」だけを見るため、出力を 1 本ずらして返す。
+f_accumPack(simple int len, float mult) =>
+    [hh, ll, isAcc] = f_accumDetect(len, mult)
+    bool newAcc = isAcc and not isAcc[1]
+    int  stamp  = newAcc[1] ? time[1] : int(na)
+    [hh[1], ll[1], stamp]
+
+[acc1Hi, acc1Lo, acc1T] = request.security(syminfo.tickerid, accTf1, f_accumPack(accLen1, accMult), lookahead = barmerge.lookahead_off)
+[acc2Hi, acc2Lo, acc2T] = request.security(syminfo.tickerid, accTf2, f_accumPack(accLen2, accMult), lookahead = barmerge.lookahead_off)
+[acc3Hi, acc3Lo, acc3T] = request.security(syminfo.tickerid, accTf3, f_accumPack(accLen3, accMult), lookahead = barmerge.lookahead_off)
+
+// ============================================================================
+// 7.5 BREAK TIMEFRAME FEED  (§18)
+// ============================================================================
+// Break判定は breakTf の「確定終値」のみ。ヒゲでは判定しない。
+
+[brCloseRaw, brHighRaw, brLowRaw] = request.security(syminfo.tickerid, breakTf, [close, high, low],
+     lookahead = barmerge.lookahead_off)
+
+bool  brBarClosed = bar_index > 0 and not na(time(breakTf)) and nz(ta.change(time(breakTf)), 0) != 0
+float brClose = brBarClosed ? brCloseRaw[1] : na
+float brHigh  = brBarClosed ? brHighRaw[1]  : na
+float brLow   = brBarClosed ? brLowRaw[1]   : na
+bool  brEval  = brBarClosed and not na(brClose)
+
+// ============================================================================
+// 8. RAW ZONE GENERATION  (§10 / §21 / §36)
+// ============================================================================
+// 静的Source (Swing / Accum / 引き継いだPrev Day H-L) は gPersist に蓄積し、
+// 寿命が来たら破棄する。動的Source (MA / 当日High-Low) は毎バー作り直す。
+//
+// ★ 新Sourceを追加する場合はここに f_registerStatic() / f_makeRaw() を1行
+//    足すだけでよい。Cluster / Score / State 以降は一切変更不要。
+
+var array<RawZone> gPersist = array.new<RawZone>()
+
+f_makeRaw(string id, string cat, string tf, string lbl, float c, float bs, bool dyn) =>
+    RawZone.new(srcId = id, srcCat = cat, srcTf = tf, srcLabel = lbl,
+         center = c, top = c + zoneHalfWidth, bottom = c - zoneHalfWidth,
+         baseScore = bs, createdBar = bar_index, createdTime = time, dynamic = dyn)
+
+// 静的Zoneの登録 (同一TF・同一価格帯の重複は寿命リフレッシュのみ)
+f_registerStatic(bool trig, float price, string id, string cat, string tf, string lbl, float bs, float lifeDays) =>
+    if trig and not na(price)
+        int life = f_days2ms(lifeDays)
+        bool dup = false
+        if array.size(gPersist) > 0
+            for i = 0 to array.size(gPersist) - 1
+                RawZone z = array.get(gPersist, i)
+                if z.srcId == id and z.srcTf == tf and math.abs(z.center - price) <= zoneHalfWidth
+                    dup := true
+                    if life > 0
+                        z.expireTime := time + life
+                    break
+        if not dup
+            RawZone nz = f_makeRaw(id, cat, tf, lbl, price, bs, false)
+            nz.lifeMs     := life
+            nz.expireTime := life > 0 ? time + life : 0
+            array.push(gPersist, nz)
+
+// ---- 8.0 新規確定の立ち上がりエッジ (全バーで無条件に評価する) -------------
+bool nPh1 = not na(ph1T)  and (na(ph1T[1])  or ph1T  != ph1T[1])
+bool nPl1 = not na(pl1T)  and (na(pl1T[1])  or pl1T  != pl1T[1])
+bool nPh2 = not na(ph2T)  and (na(ph2T[1])  or ph2T  != ph2T[1])
+bool nPl2 = not na(pl2T)  and (na(pl2T[1])  or pl2T  != pl2T[1])
+bool nPh3 = not na(ph3T)  and (na(ph3T[1])  or ph3T  != ph3T[1])
+bool nPl3 = not na(pl3T)  and (na(pl3T[1])  or pl3T  != pl3T[1])
+bool nAc1 = not na(acc1T) and (na(acc1T[1]) or acc1T != acc1T[1])
+bool nAc2 = not na(acc2T) and (na(acc2T[1]) or acc2T != acc2T[1])
+bool nAc3 = not na(acc3T) and (na(acc3T[1]) or acc3T != acc3T[1])
+
+// ---- 8.1 Swing High / Low 登録 --------------------------------------------
+f_registerStatic(useHzSource and nPh1, ph1, "SWING_H", CAT_HZ, hzTf1, hzTf1 + " Swing High", scoreHz1, lifeHz1)
+f_registerStatic(useHzSource and nPl1, pl1, "SWING_L", CAT_HZ, hzTf1, hzTf1 + " Swing Low",  scoreHz1, lifeHz1)
+f_registerStatic(useHzSource and nPh2, ph2, "SWING_H", CAT_HZ, hzTf2, hzTf2 + " Swing High", scoreHz2, lifeHz2)
+f_registerStatic(useHzSource and nPl2, pl2, "SWING_L", CAT_HZ, hzTf2, hzTf2 + " Swing Low",  scoreHz2, lifeHz2)
+f_registerStatic(useHzSource and nPh3, ph3, "SWING_H", CAT_HZ, hzTf3, hzTf3 + " Swing High", scoreHz3, lifeHz3)
+f_registerStatic(useHzSource and nPl3, pl3, "SWING_L", CAT_HZ, hzTf3, hzTf3 + " Swing Low",  scoreHz3, lifeHz3)
+
+// ---- 8.2 Accumulation Box 上限 / 下限 登録 (Box全体はZone化しない §9) ------
+f_registerStatic(useAccSource and nAc1, acc1Hi, "ACC_HI", CAT_ACC, accTf1, accTf1 + " Accum High", scoreAcc1, lifeAcc)
+f_registerStatic(useAccSource and nAc1, acc1Lo, "ACC_LO", CAT_ACC, accTf1, accTf1 + " Accum Low",  scoreAcc1, lifeAcc)
+f_registerStatic(useAccSource and nAc2, acc2Hi, "ACC_HI", CAT_ACC, accTf2, accTf2 + " Accum High", scoreAcc2, lifeAcc)
+f_registerStatic(useAccSource and nAc2, acc2Lo, "ACC_LO", CAT_ACC, accTf2, accTf2 + " Accum Low",  scoreAcc2, lifeAcc)
+f_registerStatic(useAccSource and nAc3, acc3Hi, "ACC_HI", CAT_ACC, accTf3, accTf3 + " Accum High", scoreAcc3, lifeAcc)
+f_registerStatic(useAccSource and nAc3, acc3Lo, "ACC_LO", CAT_ACC, accTf3, accTf3 + " Accum Low",  scoreAcc3, lifeAcc)
+
+// ---- 8.3 旧Day High / Low の Horizontal 化 (§8 後半) -----------------------
+f_registerStatic(useDayHL and carryPrevDayHL and isNewDay, prevDayHigh, "PDH", CAT_HZ, "PD", "Prev Day High", scorePrevDayHL, lifePrevDayHL)
+f_registerStatic(useDayHL and carryPrevDayHL and isNewDay, prevDayLow,  "PDL", CAT_HZ, "PD", "Prev Day Low",  scorePrevDayHL, lifePrevDayHL)
+
+// ---- 8.4 Horizontal Reaction 計測 (§7) ------------------------------------
+// 「タッチだけ」ではReactionにしない。Zoneへ接触 → 進入してきた側へ
+// reactionDist 以上離れた場合のみ +1。反対側へ抜けた場合はノーカウント。
+f_updateReactions() =>
+    if array.size(gPersist) > 0
+        for i = 0 to array.size(gPersist) - 1
+            RawZone z = array.get(gPersist, i)
+            bool target = z.srcCat == CAT_HZ or (reactionAllSrc and (z.srcCat == CAT_ACC or z.srcCat == CAT_DHL))
+            if target
+                bool touching = low <= z.top and high >= z.bottom
+                if touching and z.entrySide == 0
+                    z.entrySide := close[1] > z.top ? 1 : close[1] < z.bottom ? -1 : 0
+                if z.entrySide == 1
+                    if high >= z.top + reactionDist
+                        z.reactionCnt := z.reactionCnt + 1
+                        z.entrySide   := 0
+                        if lifeExtendOn and z.expireTime > 0
+                            z.expireTime := z.expireTime + int(z.lifeMs * lifeExtendRatio)
+                    else if close <= z.bottom - reactionDist
+                        z.entrySide := 0
+                else if z.entrySide == -1
+                    if low <= z.bottom - reactionDist
+                        z.reactionCnt := z.reactionCnt + 1
+                        z.entrySide   := 0
+                        if lifeExtendOn and z.expireTime > 0
+                            z.expireTime := z.expireTime + int(z.lifeMs * lifeExtendRatio)
+                    else if close >= z.top + reactionDist
+                        z.entrySide := 0
+                z.reactionBonus := f_reactionBonus(z.reactionCnt)
+f_updateReactions()
+
+// ---- 8.5 寿命切れ / 上限超過の破棄 (§21) ----------------------------------
+f_prunePersist() =>
+    if array.size(gPersist) > 0
+        for i = array.size(gPersist) - 1 to 0
+            if i < array.size(gPersist)
+                RawZone z = array.get(gPersist, i)
+                if z.expireTime > 0 and time > z.expireTime
+                    array.remove(gPersist, i)
+    while array.size(gPersist) > maxPersistZones
+        array.shift(gPersist)
+f_prunePersist()
+
+// ---- 8.6 このバーで評価するRaw Zone一式を組み立てる ------------------------
+array<RawZone> gRaw = array.new<RawZone>()
+
+if array.size(gPersist) > 0
+    for i = 0 to array.size(gPersist) - 1
+        array.push(gRaw, array.get(gPersist, i))
+
+// 動的Source: MA (§22 Live Zone Mapでは常時再計算)
+if useMaSource and not na(ma1Val)
+    RawZone rMa1 = f_makeRaw("MA1", CAT_MA, maTf, str.tostring(ma1Len) + "MA" + f_arrow(ma1Dir), ma1Val, scoreMa1, true)
+    rMa1.slopeState     := ma1State
+    rMa1.slopeDir       := ma1Dir
+    rMa1.slopeBonus     := ma1SlopeBonus
+    rMa1.maClusterBonus := maClusterBonus
+    array.push(gRaw, rMa1)
+
+if useMaSource and not na(ma2Val)
+    RawZone rMa2 = f_makeRaw("MA2", CAT_MA, maTf, str.tostring(ma2Len) + "MA" + f_arrow(ma2Dir), ma2Val, scoreMa2, true)
+    rMa2.slopeState     := ma2State
+    rMa2.slopeDir       := ma2Dir
+    rMa2.slopeBonus     := ma2SlopeBonus
+    rMa2.maClusterBonus := maClusterBonus
+    array.push(gRaw, rMa2)
+
+// 動的Source: 当日High / Low
+if useDayHL and not na(dayHigh)
+    array.push(gRaw, f_makeRaw("DAY_HIGH", CAT_DHL, "D", "Day High", dayHigh, scoreDayHL, true))
+if useDayHL and not na(dayLow)
+    array.push(gRaw, f_makeRaw("DAY_LOW", CAT_DHL, "D", "Day Low", dayLow, scoreDayHL, true))
+
+// ============================================================================
+// 9. CLUSTER ENGINE  (§11 / §12 / §13)
+// ============================================================================
+// - Raw Zone中心が clusterDist 以内なら同一Cluster候補
+// - Cluster中心は Base Score 加重平均
+// - 追加のたびに「全構成Sourceが最終Centerから clusterDist 以内か」を再検証し、
+//   外れるならClusterを切る (連鎖統合の防止 §13)
+
+f_weightOf(RawZone z) =>
+    math.max(z.baseScore, 0.01)
+
+// Cluster確定 → Zone生成 + Score算出 (Flip Bonusは Zone State Engine で加算)
+f_finalizeCluster(array<RawZone> members) =>
+    float tw      = 0.0
+    float ts      = 0.0
+    float baseSum = 0.0
+    float slopeB  = 0.0
+    float maB     = 0.0
+    float reactB  = 0.0
+    bool  hasMA   = false
+    bool  hasHZ   = false
+    bool  hasDHL  = false
+    bool  hasACC  = false
+    string srcStr = ""
+    int n = array.size(members)
+    for j = 0 to n - 1
+        RawZone m = array.get(members, j)
+        float w = f_weightOf(m)
+        tw      += w
+        ts      += m.center * w
+        baseSum += m.baseScore
+        slopeB  := slopeBonusMode == "Max" ? math.max(slopeB, m.slopeBonus) : slopeB + m.slopeBonus
+        maB     := math.max(maB, m.maClusterBonus)      // MA Cluster Bonusは二重計上しない
+        reactB  := math.max(reactB, m.reactionBonus)    // Reaction Bonusはcap付き最大値
+        srcStr  := srcStr + (j > 0 ? " / " : "") + m.srcLabel
+        hasMA   := hasMA  or m.srcCat == CAT_MA
+        hasHZ   := hasHZ  or m.srcCat == CAT_HZ
+        hasDHL  := hasDHL or m.srcCat == CAT_DHL
+        hasACC  := hasACC or m.srcCat == CAT_ACC
+    float ctr = tw > 0 ? ts / tw : na
+    int   cat = (hasMA ? 1 : 0) + (hasHZ ? 1 : 0) + (hasDHL ? 1 : 0) + (hasACC ? 1 : 0)
+    reactB := math.min(reactB, reactionCap)
+    float confB = f_confluenceBonus(cat)
+    Zone.new(
+         center = ctr, top = ctr + zoneHalfWidth, bottom = ctr - zoneHalfWidth,
+         score = baseSum + slopeB + maB + reactB + confB,
+         baseSum = baseSum, slopeBonus = slopeB, maBonus = maB,
+         reactionBonus = reactB, flipBonus = 0.0, confBonus = confB,
+         strength = SR_WEAK, state = ST_ACTIVE, flipped = false, flipDir = 0,
+         catCount = cat, memberCount = n, sources = srcStr, trackId = -1)
+
+f_buildClusters(array<RawZone> src) =>
+    array<Zone> out = array.new<Zone>()
+    int n = array.size(src)
+    if n > 0
+        array<float> centers = array.new_float()
+        for i = 0 to n - 1
+            array.push(centers, array.get(src, i).center)
+        array<int> ord = array.sort_indices(centers, order.ascending)
+
+        array<RawZone> cur = array.new<RawZone>()
+        for k = 0 to n - 1
+            RawZone z = array.get(src, array.get(ord, k))
+            if array.size(cur) == 0
+                array.push(cur, z)
+            else
+                // 加重平均の暫定中心を計算
+                float tw = 0.0
+                float ts = 0.0
+                for j = 0 to array.size(cur) - 1
+                    RawZone m = array.get(cur, j)
+                    float w = f_weightOf(m)
+                    tw += w
+                    ts += m.center * w
+                float wz = f_weightOf(z)
+                float newCenter = (ts + z.center * wz) / (tw + wz)
+
+                // §13: 追加後の中心から全メンバーが clusterDist 以内であること
+                bool ok = math.abs(z.center - newCenter) <= clusterDist
+                if ok
+                    for j = 0 to array.size(cur) - 1
+                        if math.abs(array.get(cur, j).center - newCenter) > clusterDist
+                            ok := false
+                            break
+                if ok
+                    array.push(cur, z)
+                else
+                    array.push(out, f_finalizeCluster(cur))
+                    cur := array.new<RawZone>()
+                    array.push(cur, z)
+        if array.size(cur) > 0
+            array.push(out, f_finalizeCluster(cur))
+    out
+
+array<Zone> gZones = f_buildClusters(gRaw)
+
+// ============================================================================
+// 10. STRENGTH SCORE ENGINE  (§14 / §15 / §16)
+// ============================================================================
+// Base Score合計 + MA Slope Bonus + MA Cluster Bonus + Reaction Bonus
+//   + Flip Bonus + Confluence Bonus   ← Flip Bonusのみ §12 の後で加算する。
+// ここでは Flip 以外を確定させ、Strength Tier を暫定計算しておく。
+
+f_applyStrength(Zone z) =>
+    z.score    := z.baseSum + z.slopeBonus + z.maBonus + z.reactionBonus + z.flipBonus + z.confBonus
+    z.strength := f_strengthOf(z.score)
+
+if array.size(gZones) > 0
+    for i = 0 to array.size(gZones) - 1
+        f_applyStrength(array.get(gZones, i))
+
+// ============================================================================
+// 11. ZONE STATE ENGINE  (§17 / §22)
+// ============================================================================
+// Cluster Zoneは毎バー作り直されるため、State / Break / Flip は
+// ZoneTrack (永続オブジェクト) 側で保持し、価格帯の近さで毎バー紐付ける。
+// これにより MA Zone が動いても、また Cluster が分離・再結合しても
+// Break / Flip の履歴が失われない。
+
+var array<ZoneTrack> gTracks   = array.new<ZoneTrack>()
+var int              gTrackSeq = 0
+
+f_findTrack(float center) =>
+    int best = -1
+    float bestD = 1e20
+    if array.size(gTracks) > 0
+        for i = 0 to array.size(gTracks) - 1
+            ZoneTrack t = array.get(gTracks, i)
+            if not t.matched
+                float d = math.abs(t.center - center)
+                if d <= clusterDist and d < bestD
+                    bestD := d
+                    best  := i
+    best
+
+f_naturalState(float top, float bottom) =>
+    close > top ? ST_SUPPORT : close < bottom ? ST_RESIST : ST_ACTIVE
+
+// ============================================================================
+// 12. BREAK / FLIP ENGINE  (§18 / §19 / §20)
+// ============================================================================
+// Break判定は breakTf の確定終値のみ (ヒゲ不可)。
+//   Resistance : 5M Close > Top    + breakBuffer  → Up Break   → Broken
+//   Support    : 5M Close < Bottom - breakBuffer  → Down Break → Broken
+// Break直後は反転させない (§19)。Flipは次の4段階すべてを満たして初めて成立。
+//   1) 確定終値でBreak  2) 旧ZoneへRetest  3) 再度明確に抜け返さない
+//   4) Zoneから flipConfirmDist 以上離れる
+// 戻り値: 0 なし / +1 UpBreak / -1 DownBreak / +2 Support Flip / -2 Resistance Flip
+f_updateTrack(ZoneTrack t, bool evalBar, float bc, float bh, float bl) =>
+    int ev = 0
+
+    // Broken以外は現在価格との位置関係でStateを毎バー更新する
+    if t.state != ST_BROKEN
+        t.state := f_naturalState(t.top, t.bottom)
+
+    if evalBar
+        if t.state == ST_RESIST and bc > t.top + breakBuffer
+            t.state    := ST_BROKEN
+            t.breakDir := 1
+            t.breakBar := bar_index
+            t.retested := false
+            t.flipped  := false      // 再Breakで過去のFlipは無効化 (Flip Bonusも消える)
+            t.flipDir  := 0
+            ev := 1
+        else if t.state == ST_SUPPORT and bc < t.bottom - breakBuffer
+            t.state    := ST_BROKEN
+            t.breakDir := -1
+            t.breakBar := bar_index
+            t.retested := false
+            t.flipped  := false      // 再Breakで過去のFlipは無効化 (Flip Bonusも消える)
+            t.flipDir  := 0
+            ev := -1
+        else if t.state == ST_BROKEN and t.breakDir == 1
+            // Resistance → Support Flip の進行管理
+            if bc < t.bottom - breakBuffer
+                // Breakが否定された
+                t.breakDir := 0
+                t.retested := false
+                t.state    := resetOnReclaim ? f_naturalState(t.top, t.bottom) : ST_BROKEN
+            else if not t.retested
+                if bl <= t.top and bh >= t.bottom
+                    t.retested := true
+            else if bc >= t.top + flipConfirmDist
+                t.flipped  := true
+                t.flipDir  := 1
+                t.state    := ST_SUPPORT
+                t.breakDir := 0
+                t.retested := false
+                ev := 2
+        else if t.state == ST_BROKEN and t.breakDir == -1
+            // Support → Resistance Flip の進行管理
+            if bc > t.top + breakBuffer
+                t.breakDir := 0
+                t.retested := false
+                t.state    := resetOnReclaim ? f_naturalState(t.top, t.bottom) : ST_BROKEN
+            else if not t.retested
+                if bh >= t.bottom and bl <= t.top
+                    t.retested := true
+            else if bc <= t.bottom - flipConfirmDist
+                t.flipped  := true
+                t.flipDir  := -1
+                t.state    := ST_RESIST
+                t.breakDir := 0
+                t.retested := false
+                ev := -2
+    ev
+
+// ---- 12.1 Track と Cluster Zone の紐付け + 状態更新 ------------------------
+bool evUpBreak   = false
+bool evDownBreak = false
+bool evFlipSup   = false
+bool evFlipRes   = false
+
+if array.size(gTracks) > 0
+    for i = 0 to array.size(gTracks) - 1
+        ZoneTrack tt = array.get(gTracks, i)
+        tt.matched := false
+
+if array.size(gZones) > 0
+    for i = 0 to array.size(gZones) - 1
+        Zone z = array.get(gZones, i)
+        int ti = f_findTrack(z.center)
+        ZoneTrack t = na
+        if ti >= 0
+            t := array.get(gTracks, ti)
+        else
+            gTrackSeq += 1
+            t := ZoneTrack.new(id = gTrackSeq, center = z.center, top = z.top, bottom = z.bottom,
+                 state = f_naturalState(z.top, z.bottom), lastSeenBar = bar_index)
+            array.push(gTracks, t)
+        t.matched     := true
+        t.center      := z.center
+        t.top         := z.top
+        t.bottom      := z.bottom
+        t.lastSeenBar := bar_index
+
+        int ev = f_updateTrack(t, brEval, brClose, brHigh, brLow)
+        evUpBreak   := evUpBreak   or ev == 1
+        evDownBreak := evDownBreak or ev == -1
+        evFlipSup   := evFlipSup   or ev == 2
+        evFlipRes   := evFlipRes   or ev == -2
+
+        // Flip Bonus を Score に反映 (§20) してから Strength を確定
+        z.state     := t.state
+        z.flipped   := t.flipped
+        z.flipDir   := t.flipDir
+        z.flipBonus := t.flipped ? flipBonusV : 0.0
+        z.trackId   := t.id
+        f_applyStrength(z)
+
+// ---- 12.2 長期間マッチしないTrackを破棄 ------------------------------------
+if array.size(gTracks) > 0
+    for i = array.size(gTracks) - 1 to 0
+        if i < array.size(gTracks)
+            ZoneTrack t = array.get(gTracks, i)
+            if bar_index - t.lastSeenBar > trackStaleBars
+                array.remove(gTracks, i)
+
+// ============================================================================
+// 13. LIVE ZONE MAP  (§23)
+// ============================================================================
+// 将来のEntry Moduleが参照する唯一の中心データ。
+// Entry側でZoneを再計算してはならず、必ずこのMapを読むこと。
+
+var array<Zone> gLiveMap = array.new<Zone>()
+array.clear(gLiveMap)
+if array.size(gZones) > 0
+    for i = 0 to array.size(gZones) - 1
+        array.push(gLiveMap, array.get(gZones, i))
+
+// Live Zone Map への公開アクセサ (Entry Module 用)
+f_zoneCount() => array.size(gLiveMap)
+f_zoneAt(int i) => array.get(gLiveMap, i)
+
+// ============================================================================
+// 14. STRUCTURAL SL / TP UTILITY FUNCTIONS   ★ Entry Module 接続点 ★
+//     (§24 / §25 / §26 / §27 / §28 / §29)
+// ============================================================================
+// 将来 Entry Module 側は
+//     bool longSignal / bool shortSignal / float entryPrice
+// を作り、下記の関数へ entryPrice を渡すだけでよい。
+// Zone検出ロジックには一切触れない (疎結合)。
+
+int SL_MIN_STR  = f_strengthIdx(slMinStrStr)
+int TP_MIN_STR  = f_strengthIdx(tpMinStrStr)
+int OBS_MIN_STR = f_strengthIdx(obsMinStrStr)
+
+// ---- 14.1 Structural SL (§25) ---------------------------------------------
+// Long : Entryより完全に下 (zoneTop < Entry) で Medium以上 / Score>=4 の
+//        最も近いZone → SL = Zone Bottom - slBuffer
+// 戻り値: [slPrice, zoneIndex]  (該当なしは [na, -1])
+f_getLongStructuralSL(float entryPrice) =>
+    float sl = na
+    int   idx = -1
+    float bestD = 1e20
+    if array.size(gLiveMap) > 0
+        for i = 0 to array.size(gLiveMap) - 1
+            Zone z = array.get(gLiveMap, i)
+            bool okState = not (slExclBroken and z.state == ST_BROKEN)
+            if z.top < entryPrice and z.strength >= SL_MIN_STR and z.score >= slMinScore and okState
+                float d = entryPrice - z.top
+                if d < bestD
+                    bestD := d
+                    sl    := z.bottom - slBuffer
+                    idx   := i
+    [sl, idx]
+
+// Short : Entryより完全に上 (zoneBottom > Entry) → SL = Zone Top + slBuffer
+f_getShortStructuralSL(float entryPrice) =>
+    float sl = na
+    int   idx = -1
+    float bestD = 1e20
+    if array.size(gLiveMap) > 0
+        for i = 0 to array.size(gLiveMap) - 1
+            Zone z = array.get(gLiveMap, i)
+            bool okState = not (slExclBroken and z.state == ST_BROKEN)
+            if z.bottom > entryPrice and z.strength >= SL_MIN_STR and z.score >= slMinScore and okState
+                float d = z.bottom - entryPrice
+                if d < bestD
+                    bestD := d
+                    sl    := z.top + slBuffer
+                    idx   := i
+    [sl, idx]
+
+// ---- 14.2 Structural TP (§26) ---------------------------------------------
+// Long : Entryより上の Resistance Zone のうち Strong以上 / Score>=7 の最初のもの
+//        → TP = Resistance Bottom - tpBuffer
+f_getLongStructuralTP(float entryPrice) =>
+    float tp = na
+    int   idx = -1
+    float bestD = 1e20
+    if array.size(gLiveMap) > 0
+        for i = 0 to array.size(gLiveMap) - 1
+            Zone z = array.get(gLiveMap, i)
+            bool okState = not (tpExclBroken and z.state == ST_BROKEN)
+            if z.bottom > entryPrice and z.strength >= TP_MIN_STR and z.score >= tpMinScore and okState
+                float d = z.bottom - entryPrice
+                if d < bestD
+                    bestD := d
+                    tp    := z.bottom - tpBuffer
+                    idx   := i
+    [tp, idx]
+
+// Short : Entryより下の Support Zone → TP = Support Top + tpBuffer
+f_getShortStructuralTP(float entryPrice) =>
+    float tp = na
+    int   idx = -1
+    float bestD = 1e20
+    if array.size(gLiveMap) > 0
+        for i = 0 to array.size(gLiveMap) - 1
+            Zone z = array.get(gLiveMap, i)
+            bool okState = not (tpExclBroken and z.state == ST_BROKEN)
+            if z.top < entryPrice and z.strength >= TP_MIN_STR and z.score >= tpMinScore and okState
+                float d = entryPrice - z.top
+                if d < bestD
+                    bestD := d
+                    tp    := z.top + tpBuffer
+                    idx   := i
+    [tp, idx]
+
+// ---- 14.3 Structural RR (§28) ---------------------------------------------
+// 戻り値: [riskDistance, rewardDistance, structuralRR]
+f_getStructuralRR(float entryPrice, float sl, float tp) =>
+    float risk   = na(sl) or na(entryPrice) ? na : math.abs(entryPrice - sl)
+    float reward = na(tp) or na(entryPrice) ? na : math.abs(tp - entryPrice)
+    float rr     = na(risk) or na(reward) or risk <= 0 ? na : reward / risk
+    [risk, reward, rr]
+
+// ---- 14.4 Obstacle Count (§27) --------------------------------------------
+// Entry ～ Main TP の間にある Medium以上のZoneを数える。Main TP Zone自身は除外。
+// TP は Zone境界から tpBuffer だけ内側にあるため、その境界を上限として数えれば
+// Main TP Zone は自動的に除外される。
+f_getObstacleCount(float entryPrice, float tpPrice, int direction) =>
+    int cnt = 0
+    if not na(entryPrice) and not na(tpPrice) and array.size(gLiveMap) > 0
+        float boundary = direction > 0 ? tpPrice + tpBuffer : tpPrice - tpBuffer
+        for i = 0 to array.size(gLiveMap) - 1
+            Zone z = array.get(gLiveMap, i)
+            if z.strength >= OBS_MIN_STR
+                bool inWay = direction > 0 ? (z.bottom > entryPrice and z.top < boundary)
+                                           : (z.top < entryPrice and z.bottom > boundary)
+                if inWay
+                    cnt += 1
+    cnt
+
+// ---- 14.5 PASS / FAIL (§29) -----------------------------------------------
+// FAIL条件: NO_SL_ZONE / NO_TP_ZONE / SL_TOO_FAR / LOW_STRUCTURAL_RR
+// Ver.1 では Entry Signal が無いため実際の表示は行わない。関数だけ用意する。
+f_buildTradePlan(int direction, float entryPrice) =>
+    // タプル分解はネストしたifブロック内では行わず、関数本体の先頭で確定させる。
+    [lSl, lSi] = f_getLongStructuralSL(entryPrice)
+    [lTp, lTi] = f_getLongStructuralTP(entryPrice)
+    [sSl, sSi] = f_getShortStructuralSL(entryPrice)
+    [sTp, sTi] = f_getShortStructuralTP(entryPrice)
+
+    float sl = direction > 0 ? lSl : direction < 0 ? sSl : na
+    int   si = direction > 0 ? lSi : direction < 0 ? sSi : -1
+    float tp = direction > 0 ? lTp : direction < 0 ? sTp : na
+    int   ti = direction > 0 ? lTi : direction < 0 ? sTi : -1
+
+    [risk, reward, rr] = f_getStructuralRR(entryPrice, sl, tp)
+
+    TradePlan p = TradePlan.new(dir = direction, entry = entryPrice)
+    p.sl        := sl
+    p.tp        := tp
+    p.risk      := risk
+    p.reward    := reward
+    p.rr        := rr
+    p.obstacles := na(tp) ? 0 : f_getObstacleCount(entryPrice, tp, direction)
+    if si >= 0
+        Zone zs = array.get(gLiveMap, si)
+        p.slZoneCenter := zs.center
+        p.slZoneScore  := zs.score
+    if ti >= 0
+        Zone zt = array.get(gLiveMap, ti)
+        p.tpZoneCenter := zt.center
+        p.tpZoneScore  := zt.score
+
+    if direction == 0
+        p.status := "FAIL"
+        p.reason := "NO_ENTRY"
+    else if si < 0
+        p.status := "FAIL"
+        p.reason := "NO_SL_ZONE"
+    else if ti < 0
+        p.status := "FAIL"
+        p.reason := "NO_TP_ZONE"
+    else if risk > maxSlDist
+        p.status := "FAIL"
+        p.reason := "SL_TOO_FAR"
+    else if na(rr) or rr < minStructRR
+        p.status := "FAIL"
+        p.reason := "LOW_STRUCTURAL_RR"
+    else
+        p.valid  := true
+        p.status := "PASS"
+        p.reason := "OK"
+    p
+
+// --- 将来の Entry Module はここに接続する -----------------------------------
+//     bool  longSignal  = <your entry logic>
+//     bool  shortSignal = <your entry logic>
+//     float entryPrice  = close
+//     if longSignal
+//         TradePlan plan = f_buildTradePlan(1, entryPrice)
+//         if plan.valid
+//             // plan.sl / plan.tp / plan.rr / plan.obstacles を使う
+// ---------------------------------------------------------------------------
+
+// ============================================================================
+// 15. DISPLAY  (§30 / §31)
+// ============================================================================
+// Zoneは line ではなく box で描画する。
+//   色      : State (Support / Resistance / Active / Broken)
+//   透明度  : Strength (Weak / Medium / Strong / Very Strong)
+//   枠線幅  : Strength、Broken は破線
+
+var array<box>   gBoxes  = array.new<box>()
+var array<label> gLabels = array.new<label>()
+
+f_clearDrawings() =>
+    while array.size(gBoxes) > 0
+        box.delete(array.pop(gBoxes))
+    while array.size(gLabels) > 0
+        label.delete(array.pop(gLabels))
+
+f_zoneColor(int st) =>
+    st == ST_SUPPORT ? colSupport : st == ST_RESIST ? colResistance : st == ST_ACTIVE ? colActive : colBroken
+
+f_zoneTransp(int strength) =>
+    strength == SR_VSTRONG ? trVStrong : strength == SR_STRONG ? trStrong : strength == SR_MEDIUM ? trMedium : trWeak
+
+// 現在価格に近い順のZone index配列
+f_drawOrder(int maxN) =>
+    array<int> out = array.new_int()
+    int n = array.size(gLiveMap)
+    if n > 0
+        array<float> d = array.new_float()
+        for i = 0 to n - 1
+            array.push(d, math.abs(array.get(gLiveMap, i).center - close))
+        array<int> ord = array.sort_indices(d, order.ascending)
+        int lim = int(math.min(n, maxN))
+        for k = 0 to lim - 1
+            array.push(out, array.get(ord, k))
+    out
+
+// Support / Resistance 側それぞれで、現在価格に近い順のZone index配列
+f_nearestIdx(bool wantSupport, int maxN) =>
+    array<int>   pick = array.new_int()
+    array<float> dist = array.new_float()
+    int n = array.size(gLiveMap)
+    if n > 0
+        for i = 0 to n - 1
+            Zone z = array.get(gLiveMap, i)
+            bool ok = wantSupport ? z.top < close : z.bottom > close
+            if ok
+                array.push(pick, i)
+                array.push(dist, wantSupport ? close - z.top : z.bottom - close)
+    array<int> out = array.new_int()
+    if array.size(dist) > 0
+        array<int> ord = array.sort_indices(dist, order.ascending)
+        int lim = int(math.min(array.size(ord), maxN))
+        for k = 0 to lim - 1
+            array.push(out, array.get(pick, array.get(ord, k)))
+    out
+
+if barstate.islast
+    f_clearDrawings()
+    if showZones and array.size(gLiveMap) > 0
+        array<int> ord = f_drawOrder(maxZonesDraw)
+        if array.size(ord) > 0
+            for k = 0 to array.size(ord) - 1
+                Zone  z  = array.get(gLiveMap, array.get(ord, k))
+                color bc = f_zoneColor(z.state)
+                int   tr = f_zoneTransp(z.strength)
+                box b = box.new(
+                     left         = bar_index - zoneLeftBars,
+                     top          = z.top,
+                     right        = bar_index + zoneRightBars,
+                     bottom       = z.bottom,
+                     bgcolor      = color.new(bc, tr),
+                     border_color = color.new(bc, math.max(tr - 30, 0)),
+                     border_width = z.strength >= SR_STRONG ? 2 : 1,
+                     border_style = z.state == ST_BROKEN ? line.style_dashed : line.style_solid,
+                     xloc         = xloc.bar_index)
+                array.push(gBoxes, b)
+
+                if showLabels
+                    string txt = f_stateName(z.state) + " | " + f_num(z.score, "#.#") + " | " + f_strengthName(z.strength)
+                    if z.flipped
+                        txt := txt + " | FLIP"
+                    if showDetailLbl
+                        txt := txt + "\n" + z.sources
+                    label lb = label.new(
+                         x         = bar_index + zoneRightBars,
+                         y         = z.top,
+                         text      = txt,
+                         xloc      = xloc.bar_index,
+                         style     = label.style_label_left,
+                         color     = color.new(bc, 20),
+                         textcolor = color.white,
+                         size      = size.small)
+                    array.push(gLabels, lb)
+
+// ---- 15.1 MA Source の可視化 (Ver.1 の精度検証用) --------------------------
+plot(showMaLines and useMaSource ? ma1Val : na, "MA #1", color = color.new(color.aqua, 25), linewidth = 1)
+plot(showMaLines and useMaSource ? ma2Val : na, "MA #2", color = color.new(color.fuchsia, 25), linewidth = 1)
+
+// ---- 15.2 Alerts ----------------------------------------------------------
+alertcondition(evUpBreak,   "Zone Up Break",      "SR Zone Engine: Resistance Zone を上方Break")
+alertcondition(evDownBreak, "Zone Down Break",    "SR Zone Engine: Support Zone を下方Break")
+alertcondition(evFlipSup,   "Flip to Support",    "SR Zone Engine: Resistance → Support Flip 成立")
+alertcondition(evFlipRes,   "Flip to Resistance", "SR Zone Engine: Support → Resistance Flip 成立")
+
+// ============================================================================
+// 16. DEBUG TABLE  (§32)
+// ============================================================================
+
+f_tablePos(string s) =>
+    s == "Top Left"      ? position.top_left :
+     s == "Bottom Right" ? position.bottom_right :
+     s == "Bottom Left"  ? position.bottom_left :
+     s == "Middle Right" ? position.middle_right : position.top_right
+
+f_textSize(string s) =>
+    s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
+
+var table dbg = table.new(f_tablePos(dbgPosStr), 7, dbgNearestN * 2 + 8,
+     border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 40))
+
+f_cell(int col, int row, string txt, color txtCol, color bgCol) =>
+    table.cell(dbg, col, row, txt, text_color = txtCol, bgcolor = bgCol,
+         text_size = f_textSize(dbgTextSize), text_halign = text.align_left)
+
+f_zoneRow(int row, string tag, int zi, color tagCol) =>
+    Zone z = array.get(gLiveMap, zi)
+    float d = z.center - close
+    f_cell(0, row, tag,                                   tagCol,      color.new(tagCol, 88))
+    f_cell(1, row, f_num(z.center, "#.##"),               color.white, color.new(tagCol, 92))
+    f_cell(2, row, f_num(z.score, "#.#"),                 color.white, color.new(tagCol, 92))
+    f_cell(3, row, f_strengthName(z.strength),            color.white, color.new(tagCol, 92))
+    f_cell(4, row, f_stateFull(z.state) + (z.flipped ? " (Flip)" : ""), color.white, color.new(tagCol, 92))
+    f_cell(5, row, f_num(math.abs(d), "#.#"),             color.white, color.new(tagCol, 92))
+    f_cell(6, row, z.sources,                             color.white, color.new(tagCol, 92))
+
+if barstate.islast and showDebugTable
+    table.clear(dbg, 0, 0, 6, dbgNearestN * 2 + 7)
+    color hdr = color.new(color.gray, 70)
+    f_cell(0, 0, "Zone",     color.white, hdr)
+    f_cell(1, 0, "Center",   color.white, hdr)
+    f_cell(2, 0, "Score",    color.white, hdr)
+    f_cell(3, 0, "Strength", color.white, hdr)
+    f_cell(4, 0, "State",    color.white, hdr)
+    f_cell(5, 0, "Distance", color.white, hdr)
+    f_cell(6, 0, "Sources",  color.white, hdr)
+
+    array<int> resIdx = f_nearestIdx(false, dbgNearestN)
+    array<int> supIdx = f_nearestIdx(true,  dbgNearestN)
+
+    // Resistance は遠い順に並べて上から表示 (チャートの上下と一致させる)
+    int row = 1
+    if array.size(resIdx) > 0
+        for k = array.size(resIdx) - 1 to 0
+            f_zoneRow(row, "RES " + str.tostring(k + 1), array.get(resIdx, k), colResistance)
+            row += 1
+    if array.size(resIdx) < dbgNearestN
+        for k = array.size(resIdx) to dbgNearestN - 1
+            f_cell(0, row, "RES -", color.gray, color.new(color.gray, 90))
+            row += 1
+
+    f_cell(0, row, "PRICE", color.black, color.new(color.yellow, 20))
+    f_cell(1, row, f_num(close, "#.##"), color.black, color.new(color.yellow, 40))
+    f_cell(2, row, "Zones: " + str.tostring(array.size(gLiveMap)), color.black, color.new(color.yellow, 60))
+    f_cell(3, row, "Raw: " + str.tostring(array.size(gRaw)),       color.black, color.new(color.yellow, 60))
+    f_cell(4, row, "MA1 " + f_arrow(ma1Dir) + " MA2 " + f_arrow(ma2Dir), color.black, color.new(color.yellow, 60))
+    f_cell(5, row, "MAcl +" + f_num(maClusterBonus, "#.#"),        color.black, color.new(color.yellow, 60))
+    f_cell(6, row, "Day H/L " + f_num(dayHigh, "#.#") + " / " + f_num(dayLow, "#.#"), color.black, color.new(color.yellow, 60))
+    row += 1
+
+    if array.size(supIdx) > 0
+        for k = 0 to array.size(supIdx) - 1
+            f_zoneRow(row, "SUP " + str.tostring(k + 1), array.get(supIdx, k), colSupport)
+            row += 1
+    if array.size(supIdx) < dbgNearestN
+        for k = array.size(supIdx) to dbgNearestN - 1
+            f_cell(0, row, "SUP -", color.gray, color.new(color.gray, 90))
+            row += 1
+
+    // ---- Structural Plan Preview (Entry未実装のため手動Entry Priceで検証用) --
+    if showPlanPrev
+        int   pdir  = prevEntryDir == "Long" ? 1 : -1
+        float pent  = prevEntryPrice > 0 ? prevEntryPrice : close
+        TradePlan pl = f_buildTradePlan(pdir, pent)
+        color pc = pl.valid ? color.new(color.teal, 70) : color.new(color.maroon, 70)
+        f_cell(0, row, "PLAN", color.white, pc)
+        f_cell(1, row, (pdir > 0 ? "LONG @" : "SHORT @") + f_num(pent, "#.##"), color.white, pc)
+        f_cell(2, row, "SL " + f_num(pl.sl, "#.##"),   color.white, pc)
+        f_cell(3, row, "TP " + f_num(pl.tp, "#.##"),   color.white, pc)
+        f_cell(4, row, "RR " + f_num(pl.rr, "#.##"),   color.white, pc)
+        f_cell(5, row, "Obst " + str.tostring(pl.obstacles), color.white, pc)
+        f_cell(6, row, pl.status + " · " + pl.reason,  color.white, pc)
+        row += 1
+
+    // ---- 環境警告 -----------------------------------------------------------
+    string warn = ""
+    if timeframe.in_seconds() > timeframe.in_seconds(maTf)
+        warn := warn + "Chart TF > MA TF (下位足参照は精度低下). "
+    if timeframe.in_seconds() > timeframe.in_seconds(breakTf)
+        warn := warn + "Chart TF > Break TF. "
+    if timeframe.in_seconds() > timeframe.in_seconds(hzTf1)
+        warn := warn + "Chart TF > Horizontal TF#1. "
+    if warn != ""
+        f_cell(0, row, "WARN", color.white, color.new(color.orange, 40))
+        f_cell(1, row, warn, color.white, color.new(color.orange, 60))
+        table.merge_cells(dbg, 1, row, 6, row)
