@@ -268,6 +268,7 @@ int MS_PER_DAY = 86400000
 // ---------------------------------------------------------------------------
 type RawZone
     int    uid          = 0         // Source インスタンス識別子 (ZoneTrack継承判定に使用)
+    int    instId       = 0         // Sourceインスタンスの同一性キー (Accum検出ID / 日付など)
     string srcId        = ""        // "MA1" / "SWING" / "DAY_HIGH" / "ACC_HI" ...
     string srcCat       = ""        // CAT_MA / CAT_HZ / CAT_DHL / CAT_ACC
     string srcTf        = ""        // Source Timeframe
@@ -494,10 +495,13 @@ else
 //     D  Accum Upper / D  Accum Lower
 // の6値だけである。したがってこのModuleの対外契約は次の1点しかない。
 //
-//     f_accumPack(...) => [accumUpper, accumLower, updateStamp]
+//     f_accumPack(...) => [accumUpper, accumLower, accumInstId]
 //         accumUpper  : Accum Box の上限価格 (na = Accum無し)
 //         accumLower  : Accum Box の下限価格 (na = Accum無し)
-//         updateStamp : 内容が更新された時刻 (na = 更新なし / 重複登録防止キー)
+//         accumInstId : Accum検出ID。同一Accumインスタンスが継続している間は不変で、
+//                       新しいAccumが発生したときだけ値が変わること。
+//                       Zone Engine はこのIDで「同一Accumの範囲更新」と
+//                       「新規Accum」を区別する (価格距離では判定しない)。
 //
 // この3値さえ返せば、Raw Zone化から下流 (Cluster / Score / State / Break /
 // Flip / Structural SL-TP) は一切変更せずに判定ロジックを差し替えられる。
@@ -608,25 +612,33 @@ f_accumDetectProvisional(simple int len, float mult) =>
     [hh, ll, isAcc]
 
 // ---------------------------------------------------------------------------
-// アダプタ: 選択されたModuleの結果を共通契約 [upper, lower, stamp] に変換する。
+// アダプタ: 選択されたModuleの結果を共通契約 [upper, lower, instId] に変換する。
 // Zone Engine 側はこの3値しか見ない。
+// 検出IDは「Accumが継続している間は不変 / 新規Accumで変化」であることが必須。
+//   (A) ported      : f_accumBoxState() の _sid をそのまま使う (新規Accum開始時のtime)
+//   (B) provisional : 一過性フラグしか持たないため、ここでAccum継続中は保持し、
+//                     Accum終了で na に戻す形へ変換する
 // ---------------------------------------------------------------------------
 f_accumPack(simple int provLen, float provMult) =>
     // (A) ported: barstate.isconfirmed 内でのみ更新されるので既に確定値
     [pSid, pTop, pBot] = f_accumBoxState()
     // (B) provisional: 上位足の確定バーのみ見るため 1 本ずらす
     [qHi, qLo, qIsAcc] = f_accumDetectProvisional(provLen, provMult)
-    bool qNew   = qIsAcc and not qIsAcc[1]
-    int  qStamp = qNew[1] ? time[1] : int(na)
+    bool qNew = qIsAcc and not qIsAcc[1]
+    var int qSid = na
+    if not nz(qIsAcc[1], false)
+        qSid := int(na)                 // Accum終了 → インスタンス終了
+    if nz(qNew[1], false)
+        qSid := time[1]                 // 新規Accum開始 → 新インスタンスID
 
-    float upper = usePortedAccum ? pTop : qHi[1]
-    float lower = usePortedAccum ? pBot : qLo[1]
-    int   stamp = usePortedAccum ? pSid : qStamp
-    [upper, lower, stamp]
+    float upper  = usePortedAccum ? pTop : qHi[1]
+    float lower  = usePortedAccum ? pBot : qLo[1]
+    int   instId = usePortedAccum ? pSid : qSid
+    [upper, lower, instId]
 
-[acc1Hi, acc1Lo, acc1T] = request.security(syminfo.tickerid, accTf1, f_accumPack(accLen1, accMult), lookahead = barmerge.lookahead_off)
-[acc2Hi, acc2Lo, acc2T] = request.security(syminfo.tickerid, accTf2, f_accumPack(accLen2, accMult), lookahead = barmerge.lookahead_off)
-[acc3Hi, acc3Lo, acc3T] = request.security(syminfo.tickerid, accTf3, f_accumPack(accLen3, accMult), lookahead = barmerge.lookahead_off)
+[acc1Hi, acc1Lo, acc1Id] = request.security(syminfo.tickerid, accTf1, f_accumPack(accLen1, accMult), lookahead = barmerge.lookahead_off)
+[acc2Hi, acc2Lo, acc2Id] = request.security(syminfo.tickerid, accTf2, f_accumPack(accLen2, accMult), lookahead = barmerge.lookahead_off)
+[acc3Hi, acc3Lo, acc3Id] = request.security(syminfo.tickerid, accTf3, f_accumPack(accLen3, accMult), lookahead = barmerge.lookahead_off)
 
 // ============================================================================
 // 7.5 BREAK TIMEFRAME FEED  (§18)
@@ -654,19 +666,29 @@ bool  brEval  = brBarClosed and not na(brClose)
 var array<RawZone> gPersist = array.new<RawZone>()
 
 // Source インスタンス識別子 (uid)。ZoneTrackの誤継承防止に使う (§6)。
-//   静的Source : 登録順に 1, 2, 3, ... (同じ実体である限り不変)
-//   動的Source : 固定の負値。MAや当日H/Lは価格が動いても同一Sourceであり続ける。
+//   MA #1 / MA #2 : 固定の負値。価格が動いても常に同一Sourceであり続ける。
+//   Day High/Low  : 日付ごとに新規発行。前日と翌日は別Sourceとして扱う。
+//   Swing / Accum / Prev Day : 実体ごとに 1, 2, 3, ... を発行 (Accumは検出ID単位)。
 // 関数からグローバルスカラーは書き換えられないため、カウンターは配列で保持する。
 var array<int> gUidSeq = array.new_int(1, 0)
-int UID_MA1      = -1
-int UID_MA2      = -2
-int UID_DAY_HIGH = -3
-int UID_DAY_LOW  = -4
+int UID_MA1 = -1
+int UID_MA2 = -2
 
 f_nextUid() =>
     int u = array.get(gUidSeq, 0) + 1
     array.set(gUidSeq, 0, u)
     u
+
+// Day High / Low は日付が変われば「別Source」である。
+// 日付変更時に新しいUIDを発行し、前日のBreak / Flip状態を翌日へ継承させない。
+// 同一日の中では Day High / Low が更新されても同じUIDを維持するため、
+// 当日中の高値・安値切り上げにはZoneTrackが追従する。
+// (MA1 / MA2 は固定UIDのまま = 常に同一Source)
+var int gDayHighUid = 0
+var int gDayLowUid  = 0
+if isNewDay or gDayHighUid == 0
+    gDayHighUid := f_nextUid()
+    gDayLowUid  := f_nextUid()
 
 f_makeRaw(int uid, string id, string cat, string tf, string lbl, float c, float bs, bool dyn) =>
     RawZone.new(uid = uid, srcId = id, srcCat = cat, srcTf = tf, srcLabel = lbl,
@@ -699,18 +721,44 @@ bool nPh2 = not na(ph2T)  and (na(ph2T[1])  or ph2T  != ph2T[1])
 bool nPl2 = not na(pl2T)  and (na(pl2T[1])  or pl2T  != pl2T[1])
 bool nPh3 = not na(ph3T)  and (na(ph3T[1])  or ph3T  != ph3T[1])
 bool nPl3 = not na(pl3T)  and (na(pl3T[1])  or pl3T  != pl3T[1])
-// Accumは「新規検出 (stamp変化)」だけでなく「Box上限/下限の更新」でも登録し直す。
-// 同一TF・±zoneHalfWidth 以内の既存Zoneは f_registerStatic 側で寿命更新のみとなり、
-// 重複登録されない。
-bool nAc1 = (not na(acc1T)  and (na(acc1T[1])  or acc1T  != acc1T[1]))
+// Accumは「新規検出 (検出IDの変化)」だけでなく「Box上限/下限の更新」でも評価する。
+// 同一検出IDなら f_registerAccumZone 側で既存Raw Zoneの位置更新に回るため、
+// 継続中のAccumが複数Zoneに分裂することはない。
+bool nAc1 = (not na(acc1Id) and (na(acc1Id[1]) or acc1Id != acc1Id[1]))
           or (not na(acc1Hi) and (na(acc1Hi[1]) or acc1Hi != acc1Hi[1]))
           or (not na(acc1Lo) and (na(acc1Lo[1]) or acc1Lo != acc1Lo[1]))
-bool nAc2 = (not na(acc2T)  and (na(acc2T[1])  or acc2T  != acc2T[1]))
+bool nAc2 = (not na(acc2Id) and (na(acc2Id[1]) or acc2Id != acc2Id[1]))
           or (not na(acc2Hi) and (na(acc2Hi[1]) or acc2Hi != acc2Hi[1]))
           or (not na(acc2Lo) and (na(acc2Lo[1]) or acc2Lo != acc2Lo[1]))
-bool nAc3 = (not na(acc3T)  and (na(acc3T[1])  or acc3T  != acc3T[1]))
+bool nAc3 = (not na(acc3Id) and (na(acc3Id[1]) or acc3Id != acc3Id[1]))
           or (not na(acc3Hi) and (na(acc3Hi[1]) or acc3Hi != acc3Hi[1]))
           or (not na(acc3Lo) and (na(acc3Lo[1]) or acc3Lo != acc3Lo[1]))
+
+// Accum専用の登録/更新。同一Accumインスタンス (検出ID一致) であれば新規追加せず、
+// UIDを維持したまま center / top / bottom を最新の Accum Upper / Lower へ追従させる。
+// 新しいAccumが発生したとき (検出IDが変化したとき) だけ新UIDのRaw Zoneを発行する。
+// 同一性の判定に価格距離は一切使わないため、過去Accumと現在Accumが混ざらない。
+f_registerAccumZone(bool trig, float price, int instId, string id, string tf, string lbl, float bs, float lifeDays) =>
+    if trig and not na(price) and not na(instId)
+        int life = f_days2ms(lifeDays)
+        bool found = false
+        if array.size(gPersist) > 0
+            for i = 0 to array.size(gPersist) - 1
+                RawZone z = array.get(gPersist, i)
+                if z.srcCat == CAT_ACC and z.srcId == id and z.srcTf == tf and z.instId == instId
+                    found    := true
+                    z.center := price
+                    z.top    := price + zoneHalfWidth
+                    z.bottom := price - zoneHalfWidth
+                    if life > 0
+                        z.expireTime := time + life
+                    break
+        if not found
+            RawZone nz = f_makeRaw(f_nextUid(), id, CAT_ACC, tf, lbl, price, bs, false)
+            nz.instId     := instId
+            nz.lifeMs     := life
+            nz.expireTime := life > 0 ? time + life : 0
+            array.push(gPersist, nz)
 
 // ---- 8.1 Swing High / Low 登録 --------------------------------------------
 f_registerStatic(useHzSource and nPh1, ph1, "SWING_H", CAT_HZ, hzTf1, hzTf1 + " Swing High", scoreHz1, lifeHz1)
@@ -721,12 +769,12 @@ f_registerStatic(useHzSource and nPh3, ph3, "SWING_H", CAT_HZ, hzTf3, hzTf3 + " 
 f_registerStatic(useHzSource and nPl3, pl3, "SWING_L", CAT_HZ, hzTf3, hzTf3 + " Swing Low",  scoreHz3, lifeHz3)
 
 // ---- 8.2 Accumulation Box 上限 / 下限 登録 (Box全体はZone化しない §9) ------
-f_registerStatic(useAccSource and nAc1, acc1Hi, "ACC_HI", CAT_ACC, accTf1, accTf1 + " Accum High", scoreAcc1, lifeAcc)
-f_registerStatic(useAccSource and nAc1, acc1Lo, "ACC_LO", CAT_ACC, accTf1, accTf1 + " Accum Low",  scoreAcc1, lifeAcc)
-f_registerStatic(useAccSource and nAc2, acc2Hi, "ACC_HI", CAT_ACC, accTf2, accTf2 + " Accum High", scoreAcc2, lifeAcc)
-f_registerStatic(useAccSource and nAc2, acc2Lo, "ACC_LO", CAT_ACC, accTf2, accTf2 + " Accum Low",  scoreAcc2, lifeAcc)
-f_registerStatic(useAccSource and nAc3, acc3Hi, "ACC_HI", CAT_ACC, accTf3, accTf3 + " Accum High", scoreAcc3, lifeAcc)
-f_registerStatic(useAccSource and nAc3, acc3Lo, "ACC_LO", CAT_ACC, accTf3, accTf3 + " Accum Low",  scoreAcc3, lifeAcc)
+f_registerAccumZone(useAccSource and nAc1, acc1Hi, acc1Id, "ACC_HI", accTf1, accTf1 + " Accum High", scoreAcc1, lifeAcc)
+f_registerAccumZone(useAccSource and nAc1, acc1Lo, acc1Id, "ACC_LO", accTf1, accTf1 + " Accum Low",  scoreAcc1, lifeAcc)
+f_registerAccumZone(useAccSource and nAc2, acc2Hi, acc2Id, "ACC_HI", accTf2, accTf2 + " Accum High", scoreAcc2, lifeAcc)
+f_registerAccumZone(useAccSource and nAc2, acc2Lo, acc2Id, "ACC_LO", accTf2, accTf2 + " Accum Low",  scoreAcc2, lifeAcc)
+f_registerAccumZone(useAccSource and nAc3, acc3Hi, acc3Id, "ACC_HI", accTf3, accTf3 + " Accum High", scoreAcc3, lifeAcc)
+f_registerAccumZone(useAccSource and nAc3, acc3Lo, acc3Id, "ACC_LO", accTf3, accTf3 + " Accum Low",  scoreAcc3, lifeAcc)
 
 // ---- 8.3 旧Day High / Low の Horizontal 化 (§8 後半) -----------------------
 f_registerStatic(useDayHL and carryPrevDayHL and isNewDay, prevDayHigh, "PDH", CAT_HZ, "PD", "Prev Day High", scorePrevDayHL, lifePrevDayHL)
@@ -801,9 +849,9 @@ if useMaSource and not na(ma2Val)
 
 // 動的Source: 当日High / Low
 if useDayHL and not na(dayHigh)
-    array.push(gRaw, f_makeRaw(UID_DAY_HIGH, "DAY_HIGH", CAT_DHL, "D", "Day High", dayHigh, scoreDayHL, true))
+    array.push(gRaw, f_makeRaw(gDayHighUid, "DAY_HIGH", CAT_DHL, "D", "Day High", dayHigh, scoreDayHL, true))
 if useDayHL and not na(dayLow)
-    array.push(gRaw, f_makeRaw(UID_DAY_LOW, "DAY_LOW", CAT_DHL, "D", "Day Low", dayLow, scoreDayHL, true))
+    array.push(gRaw, f_makeRaw(gDayLowUid, "DAY_LOW", CAT_DHL, "D", "Day Low", dayLow, scoreDayHL, true))
 
 // ============================================================================
 // 9. CLUSTER ENGINE  (§11 / §12 / §13)
