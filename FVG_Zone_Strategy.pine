@@ -1,0 +1,3085 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  FVG + Support/Resistance Zone Engine Strategy
+//  (Structural SL / TP · Multi Entry Logic 対応 共通Trade Engine)
+// ============================================================================
+//  設計思想:
+//    ・Zone Engine      … 「どこが支えられ / 抵抗になり / どれだけ強いか」を検出する共通基盤。
+//                          Entry Logicの存在を知らない。
+//    ・Entry Logic      … 「エントリー条件が成立した」ことだけを返す。
+//                          SL/TP計算・発注・勝敗管理を一切持たない。
+//    ・Trade Engine     … Entry Price / Direction を受け取り、
+//                          Zone EngineへStructural SL / TPを問い合わせ、
+//                          RR判定 → Qty計算 → 発注 → SL/TP固定 まで一括で行う共通層。
+//
+//  セクション構成 (Entry Moduleを追加する場合は 06〜07 だけ触ればよい):
+//    01. Common Inputs
+//    02. Zone Engine Inputs
+//    03. Zone Engine
+//    04. TradePlan / Structural SLTP
+//    05. Common Trade Engine
+//    06. Entry Module - FVG
+//    07. Future Entry Modules
+//    08. Order Execution
+//    09. Display / Debug
+//
+//  前提:
+//    ・チャート時間足 = 5分足。Entry判定は5分足確定時に行う。
+//    ・Zone Engine内の 2000MA / 3000MA は 1分足コンテキストで直接計算し、
+//      その結果を5分足側へ取得する (5分足closeからは計算しない)。
+//
+//  既知の制約 (Pine Script仕様上のもの):
+//   L1. request.security で下位足 (1分足) を参照した場合、TradingViewは
+//       「そのチャート足に含まれる最後の確定intrabar値」を返す。
+//       本Strategyはこれを仕様として利用する
+//       (= 5分足の判定時点で利用可能な最新の1分足MA値)。
+//   L2. SMA 3000 は1分足で3000本の履歴を要求する。履歴が足りない場合 MA Zone は na となり
+//       Zone生成から除外される (既定は EMA)。
+//   L3. Pineには連想配列が無いため、毎バー作り直されるCluster Zoneと永続的な
+//       Break/Flip状態の紐付けは「価格帯の近さ + Source構成の連続性」で行っている。
+//   L4. box / label は最大500個。描画は現在価格に近い maxZonesDraw 本のみ。
+//   L5. TradingView Strategyは「単一ネットポジション」しか持てない。したがって
+//       反対方向Logicの同時保有は構造上できない。既定では反対方向シグナルを
+//       スキップし、各Logicのトレードが互いを打ち消さないようにしている
+//       (allowOppositeEntry = true で従来どおりネット決済を許可)。
+// ============================================================================
+
+//@version=5
+strategy(
+     title             = "FVG + Zone Engine Strategy",
+     shorttitle        = "FVG-ZONE",
+     overlay           = true,
+     pyramiding        = 100,
+     initial_capital   = 1000,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     dynamic_requests  = true,
+     max_boxes_count   = 500,
+     max_labels_count  = 500,
+     max_lines_count   = 200
+ )
+
+// ============================================================================
+// 01. COMMON INPUTS
+// ----------------------------------------------------------------------------
+//  全Entry Logicが共有する設定。Logic固有の設定は Section 06〜07 に置く。
+// ============================================================================
+
+// ---- 1.1 Position Size / Risk ---------------------------------------------
+var string G_RISK = "01 · Common · Risk"
+riskPct     = input.float(5.0, "1トレード損失率 (%)", step = 0.1, group = G_RISK,
+     tooltip = "Risk Amount ÷ Structural SL距離 でQtyを計算する。")
+useCompound = input.bool(false, "複利 (残高ベース) ※OFF=元金単利", group = G_RISK)
+
+// ---- 1.2 Trade Engine ------------------------------------------------------
+var string G_TE = "01 · Common · Trade Engine"
+fallbackRR         = input.float(2.0, "Fallback RR (Structural TPが無い場合のみ使用)", step = 0.1, minval = 0.1, group = G_TE,
+     tooltip = "有効なTP Zoneが見つからない場合のみ、Structural SL距離 × この値でTPを作る。")
+maxOpenPerLogic    = input.int(1, "Logicごとの最大同時保有トレード数", minval = 1, maxval = 50, group = G_TE,
+     tooltip = "同一logicIdのポジションをいくつまで同時に持てるか。Logic間は互いに影響しない。")
+allowOppositeEntry = input.bool(false, "反対方向Logicの同時Entryを許可", group = G_TE,
+     tooltip = "TradingView Strategyは単一ネットポジションのため、反対方向Entryは既存Tradeを\n" +
+               "打ち消してしまう。既定 (false) では反対方向シグナルをスキップし、\n" +
+               "各Logicのトレード結果が汚染されないようにする。")
+
+// ---- 1.3 Break Even (共通Trade Engine側で Entry ID 単位に管理) --------------
+var string G_BE = "01 · Common · Break Even"
+useBreakEven         = input.bool(false, "建値移動を使う", group = G_BE,
+     tooltip = "既定OFF。OFF時はStructural SL / TPの結果をそのまま検証できる。")
+breakEvenTrigger     = input.float(10.0, "建値移動開始幅 ($)", step = 0.1, group = G_BE)
+breakEvenTriggerMode = input.string("到達瞬間", "建値移動判定", options = ["到達瞬間", "確定足"], group = G_BE)
+
+// ---- 1.4 Session / News Filter (共通・どのLogicからも参照可) ---------------
+var string G_SESS = "01 · Common · Session / News"
+useSessionFilter = input.bool(true, "時間帯フィルタを使う", group = G_SESS)
+useAsiaSession   = input.bool(true, "アジア 09:00-16:00", group = G_SESS)
+useEUSession     = input.bool(true, "EU 16:00-21:00", group = G_SESS)
+useNYSession     = input.bool(true, "NY 21:00-翌03:00", group = G_SESS)
+useNewsTimeFilter = input.bool(false, "重要指標時間を除外", group = G_SESS)
+newsSession1 = input.session("2130-2230", "指標除外時間1", group = G_SESS)
+newsSession2 = input.session("2330-0030", "指標除外時間2", group = G_SESS)
+newsSession3 = input.session("0300-0400", "指標除外時間3", group = G_SESS)
+
+// ---- 1.5 Common Debug ------------------------------------------------------
+var string G_DBGC = "01 · Common · Debug"
+showEntryLabel = input.bool(true,  "Entry Debug Label を表示", group = G_DBGC,
+     tooltip = "Logic / Direction / Entry / SL / TP / RR / TP Type を発注時に表示する。")
+showTradeDebug = input.bool(true,  "Trade Debug 行 (最新TradePlan) を表示", group = G_DBGC)
+
+// ---- 1.6 Common Filter Calculation ----------------------------------------
+int  jstHour   = hour(time, "Asia/Tokyo")
+bool inAsia    = jstHour >= 9  and jstHour < 16
+bool inEU      = jstHour >= 16 and jstHour < 21
+bool inNY      = jstHour >= 21 or  jstHour < 3
+bool sessionOk =
+     not useSessionFilter or
+     (useAsiaSession and inAsia) or
+     (useEUSession   and inEU) or
+     (useNYSession   and inNY)
+
+bool inNewsSession1 = not na(time(timeframe.period, newsSession1, "Asia/Tokyo"))
+bool inNewsSession2 = not na(time(timeframe.period, newsSession2, "Asia/Tokyo"))
+bool inNewsSession3 = not na(time(timeframe.period, newsSession3, "Asia/Tokyo"))
+bool inNewsTime = inNewsSession1 or inNewsSession2 or inNewsSession3
+bool allowByNewsTime = not useNewsTimeFilter or not inNewsTime
+
+// ============================================================================
+// 02. ZONE ENGINE INPUTS
+// ----------------------------------------------------------------------------
+//  Support / Resistance Zone Engine の設定。Entry Logicからは触らない。
+// ============================================================================
+
+// ---- 2.1 Zone Geometry -----------------------------------------------------
+var string G_ZONE = "02 · Zone Geometry"
+zoneHalfWidth = input.float(5.0, "Zone Half Width ($)", minval = 0.1, step = 0.5, group = G_ZONE,
+     tooltip = "Zone = 中心価格 ± この値。Strengthによって幅は変えない。")
+
+// ---- 2.2 MA Source (1分足コンテキストで直接計算) ---------------------------
+var string G_MA = "02 · MA Source"
+maTf        = input.timeframe("1",  "MA Timeframe",           group = G_MA,
+     tooltip = "既定 1分足。1分足コンテキスト内でMAを計算し、その結果を5分足へ取得する。")
+maType      = input.string("EMA",   "MA Type", options = ["SMA", "EMA"], group = G_MA)
+ma1Len      = input.int(2000,       "MA #1 Length", minval = 1, maxval = 4999, group = G_MA)
+ma2Len      = input.int(3000,       "MA #2 Length", minval = 1, maxval = 4999, group = G_MA)
+scoreMa1    = input.float(2.0,      "Base Score · MA #1", step = 0.5, group = G_MA)
+scoreMa2    = input.float(2.0,      "Base Score · MA #2", step = 0.5, group = G_MA)
+useMaSource = input.bool(true,      "Enable MA Source",   group = G_MA)
+
+// ---- 2.3 MA Slope ----------------------------------------------------------
+var string G_SLOPE = "02 · MA Slope"
+slopeLookback   = input.int(60,   "Slope Lookback (MA TF bars)", minval = 1, group = G_SLOPE)
+slopeThrMod     = input.float(1.0, "Slope Threshold · Moderate ($/lookback)", step = 0.1, group = G_SLOPE)
+slopeThrStrong  = input.float(3.0, "Slope Threshold · Strong ($/lookback)",   step = 0.1, group = G_SLOPE)
+slopeBonusFlat  = input.float(0.0, "Slope Bonus · Flat",     step = 0.5, group = G_SLOPE)
+slopeBonusMod   = input.float(1.0, "Slope Bonus · Moderate", step = 0.5, group = G_SLOPE)
+slopeBonusStr   = input.float(2.0, "Slope Bonus · Strong",   step = 0.5, group = G_SLOPE)
+slopeBonusMode  = input.string("Sum (per MA)", "Slope Bonus Aggregation in Cluster",
+     options = ["Sum (per MA)", "Max"], group = G_SLOPE,
+     tooltip = "同一Cluster内に2000MAと3000MAが両方入った場合、Slope Bonusを合算するか最大値のみ採用するか。")
+maClusterDist   = input.float(20.0, "MA Cluster Distance ($)", step = 1.0, group = G_SLOPE)
+maClusterBonusV = input.float(1.0, "MA Cluster Bonus",              step = 0.5, group = G_SLOPE)
+maClusterDirBns = input.float(1.0, "MA Cluster Bonus · Same Slope", step = 0.5, group = G_SLOPE)
+
+// ---- 2.4 Horizontal Source -------------------------------------------------
+var string G_HZ = "02 · Horizontal Source (Swing)"
+useHzSource = input.bool(true,      "Enable Horizontal Source", group = G_HZ)
+hzTf1       = input.timeframe("5",  "Horizontal TF #1", group = G_HZ)
+hzTf2       = input.timeframe("15", "Horizontal TF #2", group = G_HZ)
+hzTf3       = input.timeframe("60", "Horizontal TF #3", group = G_HZ)
+pivLen1     = input.int(10, "Swing Pivot Length · TF #1", minval = 1, group = G_HZ)
+pivLen2     = input.int(8,  "Swing Pivot Length · TF #2", minval = 1, group = G_HZ)
+pivLen3     = input.int(6,  "Swing Pivot Length · TF #3", minval = 1, group = G_HZ)
+// Swingの役割は「価格帯の発見 + Horizontal Zoneの生成」まで。
+// 同一価格帯に何本Swingが出ても Base Score は増えない (同一TFにつき1回だけ加点)。
+// 「その価格帯が実際に何回機能したか」は Reaction Bonus 側で評価する。
+scoreHz1    = input.float(1.0, "Base Score · TF #1 Swing", step = 0.5, group = G_HZ)
+scoreHz2    = input.float(2.0, "Base Score · TF #2 Swing", step = 0.5, group = G_HZ)
+scoreHz3    = input.float(3.0, "Base Score · TF #3 Swing", step = 0.5, group = G_HZ)
+
+// ---- 2.5 Horizontal Reaction ----------------------------------------------
+var string G_REACT = "02 · Horizontal Reaction"
+reactionDist    = input.float(20.0, "Reaction Distance ($)", step = 0.5, group = G_REACT,
+     tooltip = "Zoneに接触したあと、来た方向へこの距離以上戻ればReaction 1回。")
+reactionBonus1  = input.float(1.0, "Reaction Bonus · 1 time",   step = 0.5, group = G_REACT)
+reactionBonus2  = input.float(2.0, "Reaction Bonus · 2 times",  step = 0.5, group = G_REACT)
+reactionBonus3  = input.float(3.0, "Reaction Bonus · 3+ times", step = 0.5, group = G_REACT)
+reactionRearmDist = input.float(10.0, "Reaction Re-arm Distance ($)", step = 0.5, group = G_REACT,
+     tooltip = "Reaction成立後は受付をロックする。ローソク全体がZoneからこの距離以上離れて\n" +
+               "「一度明確にZoneを離れた」と確認できたときだけ、次のReaction受付を再開する。")
+reactionAllSrc  = input.bool(false, "Track Reaction on Accum / DayHL too", group = G_REACT,
+     tooltip = "既定は OFF (水平線のみ)。ONにすると静的Zone全般でReactionを数える。")
+
+// ---- 2.6 Day High / Low ----------------------------------------------------
+var string G_DHL = "02 · Day High / Low"
+useDayHL        = input.bool(true, "Enable Day High / Low Source", group = G_DHL)
+dayTz           = input.string("Asia/Tokyo", "Day Session Timezone", group = G_DHL)
+dayResetHour    = input.int(5, "Day Reset Hour (取引日の開始時刻)", minval = 0, maxval = 23, group = G_DHL,
+     tooltip = "既定 5 = 日本時間 05:00 ～ 翌 04:59 を1取引日として扱う。0 にすると暦日基準に戻る。")
+scoreDayHL      = input.float(3.0, "Base Score · Day High / Low", step = 0.5, group = G_DHL)
+carryPrevDayHL  = input.bool(false, "Carry Previous Day H/L as Horizontal Zone", group = G_DHL)
+scorePrevDayHL  = input.float(2.0, "Base Score · Carried Prev Day H/L", step = 0.5, group = G_DHL)
+lifePrevDayHL   = input.float(5.0, "Lifetime · Carried Prev Day H/L (days)", step = 1.0, group = G_DHL)
+
+// ---- 2.7 Accumulation ------------------------------------------------------
+var string G_ACC = "02 · Accumulation"
+useAccSource = input.bool(true,       "Enable Accumulation Source", group = G_ACC)
+accumModule  = input.string("Accum Box (ported)", "Accum Detection Module",
+     options = ["Accum Box (ported)", "Provisional ATR (暫定)"], group = G_ACC,
+     tooltip = "Accum Box (ported) = 実運用のAccum判定ロジック。\nProvisional ATR = 暫定簡易判定 (本番用ではない)。")
+accTf1       = input.timeframe("60",  "Accum TF #1", group = G_ACC)
+accTf2       = input.timeframe("240", "Accum TF #2", group = G_ACC)
+accTf3       = input.timeframe("D",   "Accum TF #3", group = G_ACC)
+scoreAcc1    = input.float(3.0, "Base Score · TF #1 Accum", step = 0.5, group = G_ACC)
+scoreAcc2    = input.float(4.0, "Base Score · TF #2 Accum", step = 0.5, group = G_ACC)
+scoreAcc3    = input.float(5.0, "Base Score · TF #3 Accum", step = 0.5, group = G_ACC)
+accKeep1     = input.int(3, "Keep Count · TF #1 Accum (instances)", minval = 1, group = G_ACC,
+     tooltip = "最新N個のAccumインスタンスを保持する。High / Low のペアで1個と数える。")
+accKeep2     = input.int(2, "Keep Count · TF #2 Accum (instances)", minval = 1, group = G_ACC)
+accKeep3     = input.int(1, "Keep Count · TF #3 Accum (instances)", minval = 1, group = G_ACC)
+
+// ---- 2.7a Accum Box (ported) パラメータ ------------------------------------
+var string G_ACCP = "02a · Accum Box (ported) Parameters"
+accumRangeLen        = input.int(10,   "Accum判定レンジ本数",     minval = 6,  group = G_ACCP)
+accumBaseLen         = input.int(20,   "基準平均本数",            minval = 10, group = G_ACCP)
+accumAtrLen          = input.int(14,   "ATR本数",                minval = 1,  group = G_ACCP)
+accumMinUpperCloses  = input.int(4,    "上半分の最低終値本数",     minval = 1,  group = G_ACCP)
+accumMinLowerCloses  = input.int(4,    "下半分の最低終値本数",     minval = 1,  group = G_ACCP)
+accumMaxSameColorRun = input.int(4,    "同色連続の上限",          minval = 1,  group = G_ACCP)
+accumAtrMult         = input.float(2.5,  "Accum レンジ幅 / ATR 上限",    minval = 0.5,  step = 0.1,  group = G_ACCP)
+accumBarRatioMax     = input.float(0.70, "Accum 平均値幅/基準平均 上限", minval = 0.1,  step = 0.01, group = G_ACCP)
+accumDriftMax        = input.float(0.30, "Accum ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = G_ACCP)
+
+// ---- 2.7b Provisional ATR (暫定) パラメータ --------------------------------
+var string G_ACCQ = "02b · Provisional ATR Accum (暫定・本番未使用)"
+accLen1      = input.int(20, "[暫定] Accum Lookback · TF #1 (bars)", minval = 3, group = G_ACCQ)
+accLen2      = input.int(20, "[暫定] Accum Lookback · TF #2 (bars)", minval = 3, group = G_ACCQ)
+accLen3      = input.int(15, "[暫定] Accum Lookback · TF #3 (bars)", minval = 3, group = G_ACCQ)
+accMult      = input.float(1.2, "[暫定] Accum Max Range / ATR", step = 0.1, minval = 0.1, group = G_ACCQ)
+
+// ---- 2.8 Cluster -----------------------------------------------------------
+var string G_CLU = "02 · Cluster"
+clusterDist = input.float(20.0, "Cluster Distance ($)", step = 1.0, group = G_CLU,
+     tooltip = "Raw Zone中心同士がこの距離以内ならCluster候補。統合後も全Sourceが最終Centerからこの距離以内であることを検証する。")
+
+// ---- 2.9 Strength Score ----------------------------------------------------
+var string G_SCORE = "02 · Strength Score"
+thrMedium   = input.float(5.0,  "Medium Score Threshold",      step = 0.5, group = G_SCORE)
+thrStrong   = input.float(10.0, "Strong Score Threshold",      step = 0.5, group = G_SCORE)
+thrVStrong  = input.float(15.0, "Very Strong Score Threshold", step = 0.5, group = G_SCORE)
+confBonus2  = input.float(1.0, "Confluence Bonus · 2 categories",  step = 0.5, group = G_SCORE)
+confBonus3  = input.float(2.0, "Confluence Bonus · 3 categories",  step = 0.5, group = G_SCORE)
+confBonus4  = input.float(3.0, "Confluence Bonus · 4+ categories", step = 0.5, group = G_SCORE)
+flipBonusV  = input.float(2.0, "Flip Bonus", step = 0.5, group = G_SCORE)
+
+// ---- 2.9a Very Strong · Higher Timeframe Structure -------------------------
+var string G_HTF = "02a · Very Strong · Higher TF Structure"
+requireHtfForVStrong = input.bool(true, "Require Higher TF Structure for Very Strong", group = G_HTF)
+htfSwing1H  = input.bool(true,  "Count 1H Swing (TF #3) as Higher TF",   group = G_HTF)
+htfAccum1H  = input.bool(true,  "Count 1H Accum (TF #1) as Higher TF",   group = G_HTF)
+htfAccum4H  = input.bool(true,  "Count 4H Accum (TF #2) as Higher TF",   group = G_HTF)
+htfAccumD   = input.bool(true,  "Count Daily Accum (TF #3) as Higher TF", group = G_HTF)
+htfSwing15M = input.bool(false, "Count 15M Swing (TF #2) as Higher TF",  group = G_HTF)
+htfMa1      = input.bool(false, "Count MA #1 (2000) as Higher TF",       group = G_HTF)
+htfMa2      = input.bool(false, "Count MA #2 (3000) as Higher TF",       group = G_HTF)
+htfDayHL    = input.bool(false, "Count Day High / Low as Higher TF",     group = G_HTF)
+
+// ---- 2.10 Break / Flip -----------------------------------------------------
+var string G_BF = "02 · Break / Flip"
+breakTf         = input.timeframe("5", "Break Evaluation Timeframe", group = G_BF,
+     tooltip = "Breakはヒゲではなくこの時間足の確定終値で判定する。")
+breakBuffer     = input.float(5.0,  "Break Buffer ($)",         step = 0.5, group = G_BF)
+flipConfirmDist = input.float(10.0, "Flip Confirm Distance ($)", step = 0.5, group = G_BF)
+resetOnReclaim  = input.bool(true,  "Reset Broken on Reclaim", group = G_BF)
+trackStaleBars  = input.int(500, "Zone State Retention (bars without match)", minval = 10, group = G_BF)
+trackContinuity = input.float(0.5, "Zone Track · Min Source Continuity", minval = 0.01, maxval = 1.0, step = 0.05, group = G_BF,
+     tooltip = "ZoneTrackを継承する条件。Center距離が近いだけでは継承せず、Source構成の重なり率が\nこの値以上であることを要求する。1.0 = Source構成完全一致のみ継承。")
+
+// ---- 2.11 Zone Lifetime ----------------------------------------------------
+var string G_LIFE = "02 · Zone Lifetime"
+lifeHz1         = input.float(5.0,  "Lifetime · TF #1 Horizontal (days)",  step = 0.5, group = G_LIFE)
+lifeHz2         = input.float(10.0, "Lifetime · TF #2 Horizontal (days)",  step = 0.5, group = G_LIFE)
+lifeHz3         = input.float(30.0, "Lifetime · TF #3 Horizontal (days)",  step = 0.5, group = G_LIFE)
+lifeExtendOn    = input.bool(true,  "Extend Lifetime on Reaction / Flip", group = G_LIFE)
+lifeExtendRatio = input.float(0.5,  "Lifetime Extension Ratio", step = 0.1, minval = 0.0, group = G_LIFE)
+maxPersistZones = input.int(200, "Max Persistent Raw Zones", minval = 20, maxval = 800, group = G_LIFE)
+
+// ---- 2.12 Structural SL / TP (Trade Engine 接続点) -------------------------
+var string G_SLTP = "02 · Structural SL / TP"
+slBuffer      = input.float(5.0,  "SL Buffer ($)", step = 0.5, group = G_SLTP)
+tpBuffer      = input.float(5.0,  "TP Buffer ($)", step = 0.5, group = G_SLTP)
+maxSlDist     = input.float(30.0, "Max SL Distance ($)", step = 1.0, group = G_SLTP)
+minStructRR   = input.float(1.0,  "Minimum Structural RR", step = 0.1, group = G_SLTP,
+     tooltip = "Structural TPが存在する場合、この値未満のRRならエントリー禁止 (固定RR TPへ逃げない)。")
+slMinScore    = input.float(4.0,  "SL Zone · Min Score", step = 0.5, group = G_SLTP)
+slMinStrStr   = input.string("Medium", "SL Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+tpMinScore    = input.float(7.0,  "TP Zone · Min Score", step = 0.5, group = G_SLTP)
+tpMinStrStr   = input.string("Strong", "TP Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+obsMinStrStr  = input.string("Medium", "Obstacle · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+
+// ---- 2.13 Zone Display -----------------------------------------------------
+var string G_DISP = "02 · Zone Display"
+showZones      = input.bool(true,  "Show Zones (box)",        group = G_DISP)
+showMaLines    = input.bool(true,  "Plot MA Source Lines",    group = G_DISP)
+showLabels     = input.bool(true,  "Show Zone Labels",        group = G_DISP)
+showDetailLbl  = input.bool(false, "Detailed Labels (sources)", group = G_DISP)
+maxZonesDraw   = input.int(30, "Max Zones Drawn", minval = 1, maxval = 120, group = G_DISP)
+zoneLeftBars   = input.int(150, "Zone Box · Left Extension (bars)",  minval = 1, group = G_DISP)
+zoneRightBars  = input.int(30,  "Zone Box · Right Extension (bars)", minval = 1, group = G_DISP)
+colSupport     = input.color(color.new(#26A69A, 0), "Color · Support",    group = G_DISP)
+colResistance  = input.color(color.new(#EF5350, 0), "Color · Resistance", group = G_DISP)
+colActive      = input.color(color.new(#FFB300, 0), "Color · Active",     group = G_DISP)
+colBroken      = input.color(color.new(#78909C, 0), "Color · Broken",     group = G_DISP)
+trWeak         = input.int(90, "Transparency · Weak",        minval = 0, maxval = 100, group = G_DISP)
+trMedium       = input.int(80, "Transparency · Medium",      minval = 0, maxval = 100, group = G_DISP)
+trStrong       = input.int(68, "Transparency · Strong",      minval = 0, maxval = 100, group = G_DISP)
+trVStrong      = input.int(55, "Transparency · Very Strong", minval = 0, maxval = 100, group = G_DISP)
+
+// ---- 2.14 Zone Debug -------------------------------------------------------
+var string G_DBG = "02 · Zone Debug"
+showDebugTable = input.bool(true, "Show Zone Debug Table", group = G_DBG)
+dbgPosStr      = input.string("Top Right", "Debug Table Position",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group = G_DBG)
+dbgNearestN    = input.int(3, "Nearest Zones per Side", minval = 1, maxval = 5, group = G_DBG)
+dbgTextSize    = input.string("Small", "Debug Table Text Size", options = ["Tiny", "Small", "Normal"], group = G_DBG)
+
+// ============================================================================
+// 03. ZONE ENGINE
+// ----------------------------------------------------------------------------
+//  Support / Resistance Zone Engine 本体。
+//  MA2000/3000 · MA slope · Swing · Reaction · Day High/Low · Accumulation ·
+//  Accum Keep Count · Cluster · Strength Score · Very Strong条件 · Zone State ·
+//  Break · Retest · Flip · ZoneTrack continuity · Live Zone Map
+//  → ロジックは Zone Engine 単体版から変更していない。
+//  Entry Logicはこのセクションを一切参照しない (Section 04 の関数経由でのみ使う)。
+// ============================================================================
+
+// ---- 3.1 Constants ---------------------------------------------------------
+int ST_ACTIVE  = 0
+int ST_SUPPORT = 1
+int ST_RESIST  = 2
+int ST_BROKEN  = 3
+
+int SR_WEAK    = 1
+int SR_MEDIUM  = 2
+int SR_STRONG  = 3
+int SR_VSTRONG = 4
+
+string CAT_MA   = "MA"
+string CAT_HZ   = "Horizontal"
+string CAT_DHL  = "DayHL"
+string CAT_ACC  = "Accum"
+
+int MS_PER_DAY = 86400000
+
+// ---- 3.2 User Defined Types ------------------------------------------------
+// RawZone : 個々のSourceが生成する単位Zone
+type RawZone
+    int    uid          = 0
+    int    instId       = 0
+    string srcId        = ""
+    string srcCat       = ""
+    string srcTf        = ""
+    string srcLabel     = ""
+    float  center       = 0.0
+    float  top          = 0.0
+    float  bottom       = 0.0
+    float  baseScore    = 0.0
+    int    slopeState   = 0
+    int    slopeDir     = 0
+    float  slopeBonus   = 0.0
+    float  maClusterBonus = 0.0
+    int    reactionCnt  = 0
+    float  reactionBonus = 0.0
+    bool   flipped      = false
+    float  flipBonus    = 0.0
+    int    entrySide    = 0
+    bool   reactionArmed = true
+    int    createdBar   = 0
+    int    createdTime  = 0
+    int    expireTime   = 0
+    int    lifeMs       = 0
+    bool   dynamic      = false
+
+// Zone : Cluster統合後の最終Zone。Live Zone Mapの構成要素
+type Zone
+    float  center       = 0.0
+    float  top          = 0.0
+    float  bottom       = 0.0
+    float  score        = 0.0
+    float  baseSum      = 0.0
+    float  slopeBonus   = 0.0
+    float  maBonus      = 0.0
+    float  reactionBonus = 0.0
+    float  flipBonus    = 0.0
+    float  confBonus    = 0.0
+    int    strength     = 1
+    int    state        = 0
+    bool   flipped      = false
+    int    flipDir      = 0
+    int    catCount     = 0
+    int    memberCount  = 0
+    string sources      = ""
+    int    trackId      = -1
+    array<int> memberUids
+    string sourceSig    = ""
+    int    reactionCnt  = 0
+    bool   hasHtf       = false
+    string htfSources   = ""
+
+// ZoneTrack : Zone State / Break / Flip の永続ステート
+type ZoneTrack
+    int   id          = 0
+    float center      = 0.0
+    float top         = 0.0
+    float bottom      = 0.0
+    int   state       = 0
+    int   lastRole    = 0
+    int   breakDir    = 0
+    int   breakBar    = 0
+    bool  retested    = false
+    bool  flipped     = false
+    int   flipDir     = 0
+    int   lastSeenBar = 0
+    bool  matched     = false
+    array<int> memberUids
+    string sourceSig  = ""
+
+// ---- 3.3 Utility Functions -------------------------------------------------
+f_tfName(string tf) =>
+    tf == "1"    ? "1M"  : tf == "3"   ? "3M"  : tf == "5"   ? "5M"  :
+     tf == "15"  ? "15M" : tf == "30"  ? "30M" : tf == "45"  ? "45M" :
+     tf == "60"  ? "1H"  : tf == "120" ? "2H"  : tf == "180" ? "3H"  :
+     tf == "240" ? "4H"  : tf == "360" ? "6H"  : tf == "720" ? "12H" : tf
+
+f_strengthOf(float score, bool hasHtf) =>
+    int t = score < thrMedium ? SR_WEAK : score < thrStrong ? SR_MEDIUM : score < thrVStrong ? SR_STRONG : SR_VSTRONG
+    if t == SR_VSTRONG and requireHtfForVStrong and not hasHtf
+        t := SR_STRONG
+    t
+
+f_strengthName(int s) =>
+    s == SR_VSTRONG ? "VERY STRONG" : s == SR_STRONG ? "STRONG" : s == SR_MEDIUM ? "MEDIUM" : "WEAK"
+
+f_strengthIdx(string s) =>
+    s == "Very Strong" ? SR_VSTRONG : s == "Strong" ? SR_STRONG : s == "Medium" ? SR_MEDIUM : SR_WEAK
+
+f_stateName(int st) =>
+    st == ST_SUPPORT ? "SUP" : st == ST_RESIST ? "RES" : st == ST_ACTIVE ? "ACT" : "BRK"
+
+f_stateFull(int st) =>
+    st == ST_SUPPORT ? "Support" : st == ST_RESIST ? "Resistance" : st == ST_ACTIVE ? "Active" : "Broken"
+
+f_num(float v, string fmt) =>
+    na(v) ? "-" : str.tostring(v, fmt)
+
+f_arrow(int dir) =>
+    dir > 0 ? "↑" : dir < 0 ? "↓" : "→"
+
+f_slopeState(float delta) =>
+    float a = math.abs(nz(delta))
+    a >= slopeThrStrong ? 2 : a >= slopeThrMod ? 1 : 0
+
+f_slopeDir(float delta) =>
+    nz(delta) > 0 ? 1 : nz(delta) < 0 ? -1 : 0
+
+f_slopeBonusValue(int st) =>
+    st == 2 ? slopeBonusStr : st == 1 ? slopeBonusMod : slopeBonusFlat
+
+f_reactionBonus(int cnt) =>
+    cnt <= 0 ? 0.0 : cnt == 1 ? reactionBonus1 : cnt == 2 ? reactionBonus2 : reactionBonus3
+
+f_confluenceBonus(int catCount) =>
+    catCount >= 4 ? confBonus4 : catCount == 3 ? confBonus3 : catCount == 2 ? confBonus2 : 0.0
+
+f_days2ms(float d) =>
+    int(d * MS_PER_DAY)
+
+// ---- 3.4 MA Source Module --------------------------------------------------
+// ★ 1分足 2000MA / 3000MA。
+//   f_maPack() は request.security によって「maTf (=1分足) のコンテキスト内」で
+//   評価されるため、EMA/SMA は 1分足 close 系列から直接計算される。
+//   5分足 close から 2000MA / 3000MA を計算しているのではない。
+//   5分足側では「その5分足時点で利用可能な最新の1分足MA値」を受け取る。
+f_ma(float src, simple int len) =>
+    maType == "EMA" ? ta.ema(src, len) : ta.sma(src, len)
+
+f_maPack() =>
+    float m1 = f_ma(close, ma1Len)          // ← close は1分足のclose
+    float m2 = f_ma(close, ma2Len)
+    float d1 = m1 - m1[slopeLookback]       // ← slopeも1分足ベース
+    float d2 = m2 - m2[slopeLookback]
+    [m1, d1, m2, d2]
+
+[ma1Val, ma1Delta, ma2Val, ma2Delta] = request.security(syminfo.tickerid, maTf, f_maPack(),
+     lookahead = barmerge.lookahead_off)
+
+int   ma1Dir   = f_slopeDir(ma1Delta)
+int   ma2Dir   = f_slopeDir(ma2Delta)
+int   ma1State = f_slopeState(ma1Delta)
+int   ma2State = f_slopeState(ma2Delta)
+
+f_maSlopeBonus(float maVal, int dir, int st) =>
+    bool aligned = (dir > 0 and close > maVal) or (dir < 0 and close < maVal)
+    aligned ? f_slopeBonusValue(st) : 0.0
+
+float ma1SlopeBonus = na(ma1Val) ? 0.0 : f_maSlopeBonus(ma1Val, ma1Dir, ma1State)
+float ma2SlopeBonus = na(ma2Val) ? 0.0 : f_maSlopeBonus(ma2Val, ma2Dir, ma2State)
+
+float maClusterBonus = 0.0
+if not na(ma1Val) and not na(ma2Val) and math.abs(ma1Val - ma2Val) <= maClusterDist
+    maClusterBonus := maClusterBonusV
+    if ma1Dir != 0 and ma1Dir == ma2Dir
+        maClusterBonus += maClusterDirBns
+
+// ---- 3.5 Horizontal Source Module (Swing Pivot) ---------------------------
+f_pivotPack(simple int len) =>
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low,  len, len)
+    int   pt = na(ph) ? int(na) : time
+    int   lt = na(pl) ? int(na) : time
+    [ph, pt, pl, lt]
+
+[ph1, ph1T, pl1, pl1T] = request.security(syminfo.tickerid, hzTf1, f_pivotPack(pivLen1), lookahead = barmerge.lookahead_off)
+[ph2, ph2T, pl2, pl2T] = request.security(syminfo.tickerid, hzTf2, f_pivotPack(pivLen2), lookahead = barmerge.lookahead_off)
+[ph3, ph3T, pl3, pl3T] = request.security(syminfo.tickerid, hzTf3, f_pivotPack(pivLen3), lookahead = barmerge.lookahead_off)
+
+// ---- 3.6 Day High / Low Module --------------------------------------------
+int _locY = year(time, dayTz)
+int _locM = month(time, dayTz)
+int _locD = dayofmonth(time, dayTz)
+int _locH = hour(time, dayTz)
+int _calDayNo   = int(timestamp(dayTz, _locY, _locM, _locD, 0, 0) / MS_PER_DAY)
+int tradingDayId = _locH < dayResetHour ? _calDayNo - 1 : _calDayNo
+bool isNewDay = na(tradingDayId[1]) or tradingDayId != tradingDayId[1]
+
+var float dayHigh     = na
+var float dayLow      = na
+var float prevDayHigh = na
+var float prevDayLow  = na
+
+if isNewDay
+    prevDayHigh := dayHigh
+    prevDayLow  := dayLow
+    dayHigh     := high
+    dayLow      := low
+else
+    dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+    dayLow  := na(dayLow)  ? low  : math.min(dayLow,  low)
+
+// ---- 3.7 Accumulation Module (差し替え可能) -------------------------------
+//  対外契約: f_accumPack(...) => [accumUpper, accumLower, accumInstId]
+bool usePortedAccum = accumModule == "Accum Box (ported)"
+
+f_accumBoxCore(_atrMult, _barRatioMax, _driftMax) =>
+    _atr = ta.atr(accumAtrLen)
+
+    _bodyTop   = math.max(open, close)
+    _bodyBot   = math.min(open, close)
+    _rangeHigh = ta.highest(_bodyTop, accumRangeLen)
+    _rangeLow  = ta.lowest(_bodyBot, accumRangeLen)
+    _rangeNow  = _rangeHigh - _rangeLow
+    _rangeMid  = (_rangeHigh + _rangeLow) * 0.5
+
+    _upperCloses = 0
+    _lowerCloses = 0
+    _bullRun = 0
+    _bearRun = 0
+    _maxBullRun = 0
+    _maxBearRun = 0
+
+    for i = 0 to accumRangeLen - 1
+        _upperCloses += close[i] > _rangeMid ? 1 : 0
+        _lowerCloses += close[i] < _rangeMid ? 1 : 0
+        _isBull = close[i] > open[i]
+        _isBear = close[i] < open[i]
+
+        if _isBull
+            _bullRun += 1
+            _bearRun := 0
+        else if _isBear
+            _bearRun += 1
+            _bullRun := 0
+        else
+            _bullRun := 0
+            _bearRun := 0
+
+        _maxBullRun := math.max(_maxBullRun, _bullRun)
+        _maxBearRun := math.max(_maxBearRun, _bearRun)
+
+    _startMid = (open[accumRangeLen - 1] + close[accumRangeLen - 1]) * 0.5
+    _endMid   = (open + close) * 0.5
+    _drift    = math.abs(_endMid - _startMid)
+
+    _condAtr = _atr > 0 and _rangeNow <= _atr * _atrMult
+
+    _bodyTopNow = math.max(open, close)
+    _bodyBotNow = math.min(open, close)
+    _rangeShort = ta.highest(_bodyTopNow, accumRangeLen) - ta.lowest(_bodyBotNow, accumRangeLen)
+    _rangeBase  = ta.highest(_bodyTopNow, accumBaseLen)  - ta.lowest(_bodyBotNow, accumBaseLen)
+
+    _condBar      = _rangeBase > 0 and _rangeShort <= _rangeBase * _barRatioMax
+    _condBalance  = _upperCloses >= accumMinUpperCloses and _lowerCloses >= accumMinLowerCloses
+    _condDrift    = _rangeNow > 0 and (_drift / _rangeNow) <= _driftMax
+    _condColorRun = _maxBullRun <= accumMaxSameColorRun and _maxBearRun <= accumMaxSameColorRun
+
+    _condAtr and _condBar and _condBalance and _condDrift and _condColorRun
+
+f_accumBoxState() =>
+    _isAccum   = f_accumBoxCore(accumAtrMult, accumBarRatioMax, accumDriftMax)
+    _accumHigh = ta.highest(math.max(open, close), accumRangeLen)
+    _accumLow  = ta.lowest(math.min(open, close), accumRangeLen)
+    _isStart   = _isAccum and not nz(_isAccum[1], false)
+
+    var float _top = na
+    var float _bot = na
+    var int   _sid = na
+
+    if barstate.isconfirmed
+        if _isStart
+            _top := _accumHigh
+            _bot := _accumLow
+            _sid := time
+        if _isAccum
+            _bt = math.max(open, close)
+            _bb = math.min(open, close)
+            _top := math.max(nz(_top, _bt), _bt)
+            _bot := math.min(nz(_bot, _bb), _bb)
+
+    [_sid, _top, _bot]
+
+f_accumDetectProvisional(simple int len, float mult) =>
+    float hh   = ta.highest(high, len)
+    float ll   = ta.lowest(low,  len)
+    float atrv = ta.atr(len)
+    bool  isAcc = not na(atrv) and atrv > 0 and (hh - ll) <= atrv * mult
+    [hh, ll, isAcc]
+
+f_accumPack(simple int provLen, float provMult) =>
+    [pSid, pTop, pBot] = f_accumBoxState()
+    [qHi, qLo, qIsAcc] = f_accumDetectProvisional(provLen, provMult)
+    bool qNew = qIsAcc and not qIsAcc[1]
+    var int qSid = na
+    if not nz(qIsAcc[1], false)
+        qSid := int(na)
+    if nz(qNew[1], false)
+        qSid := time[1]
+
+    float upper  = usePortedAccum ? pTop : qHi[1]
+    float lower  = usePortedAccum ? pBot : qLo[1]
+    int   instId = usePortedAccum ? pSid : qSid
+    [upper, lower, instId]
+
+[acc1Hi, acc1Lo, acc1Id] = request.security(syminfo.tickerid, accTf1, f_accumPack(accLen1, accMult), lookahead = barmerge.lookahead_off)
+[acc2Hi, acc2Lo, acc2Id] = request.security(syminfo.tickerid, accTf2, f_accumPack(accLen2, accMult), lookahead = barmerge.lookahead_off)
+[acc3Hi, acc3Lo, acc3Id] = request.security(syminfo.tickerid, accTf3, f_accumPack(accLen3, accMult), lookahead = barmerge.lookahead_off)
+
+// ---- 3.8 Break Timeframe Feed ---------------------------------------------
+[brCloseRaw, brHighRaw, brLowRaw] = request.security(syminfo.tickerid, breakTf, [close, high, low],
+     lookahead = barmerge.lookahead_off)
+
+bool  brBarClosed = bar_index > 0 and not na(time(breakTf)) and nz(ta.change(time(breakTf)), 0) != 0
+float brClose = brBarClosed ? brCloseRaw[1] : na
+float brHigh  = brBarClosed ? brHighRaw[1]  : na
+float brLow   = brBarClosed ? brLowRaw[1]   : na
+bool  brEval  = brBarClosed and not na(brClose)
+
+// ---- 3.9 Raw Zone Generation ----------------------------------------------
+var array<RawZone> gPersist = array.new<RawZone>()
+var array<int> gUidSeq = array.new_int(1, 0)
+int UID_MA1 = -1
+int UID_MA2 = -2
+
+f_nextUid() =>
+    int u = array.get(gUidSeq, 0) + 1
+    array.set(gUidSeq, 0, u)
+    u
+
+var int gDayHighUid = 0
+var int gDayLowUid  = 0
+if isNewDay or gDayHighUid == 0
+    gDayHighUid := f_nextUid()
+    gDayLowUid  := f_nextUid()
+
+f_makeRaw(int uid, string id, string cat, string tf, string lbl, float c, float bs, bool dyn) =>
+    RawZone.new(uid = uid, srcId = id, srcCat = cat, srcTf = tf, srcLabel = lbl,
+         center = c, top = c + zoneHalfWidth, bottom = c - zoneHalfWidth,
+         baseScore = bs, createdBar = bar_index, createdTime = time, dynamic = dyn)
+
+f_registerStatic(bool trig, float price, string id, string cat, string tf, string lbl, float bs, float lifeDays) =>
+    if trig and not na(price)
+        int life = f_days2ms(lifeDays)
+        bool dup = false
+        if array.size(gPersist) > 0
+            for i = 0 to array.size(gPersist) - 1
+                RawZone z = array.get(gPersist, i)
+                if z.srcId == id and z.srcTf == tf and math.abs(z.center - price) <= zoneHalfWidth
+                    dup := true
+                    if life > 0
+                        z.expireTime := time + life
+                    break
+        if not dup
+            RawZone rz = f_makeRaw(f_nextUid(), id, cat, tf, lbl, price, bs, false)
+            rz.lifeMs     := life
+            rz.expireTime := life > 0 ? time + life : 0
+            array.push(gPersist, rz)
+
+bool nPh1 = not na(ph1T)  and (na(ph1T[1])  or ph1T  != ph1T[1])
+bool nPl1 = not na(pl1T)  and (na(pl1T[1])  or pl1T  != pl1T[1])
+bool nPh2 = not na(ph2T)  and (na(ph2T[1])  or ph2T  != ph2T[1])
+bool nPl2 = not na(pl2T)  and (na(pl2T[1])  or pl2T  != pl2T[1])
+bool nPh3 = not na(ph3T)  and (na(ph3T[1])  or ph3T  != ph3T[1])
+bool nPl3 = not na(pl3T)  and (na(pl3T[1])  or pl3T  != pl3T[1])
+
+bool nAc1 = (not na(acc1Id) and (na(acc1Id[1]) or acc1Id != acc1Id[1]))
+          or (not na(acc1Hi) and (na(acc1Hi[1]) or acc1Hi != acc1Hi[1]))
+          or (not na(acc1Lo) and (na(acc1Lo[1]) or acc1Lo != acc1Lo[1]))
+bool nAc2 = (not na(acc2Id) and (na(acc2Id[1]) or acc2Id != acc2Id[1]))
+          or (not na(acc2Hi) and (na(acc2Hi[1]) or acc2Hi != acc2Hi[1]))
+          or (not na(acc2Lo) and (na(acc2Lo[1]) or acc2Lo != acc2Lo[1]))
+bool nAc3 = (not na(acc3Id) and (na(acc3Id[1]) or acc3Id != acc3Id[1]))
+          or (not na(acc3Hi) and (na(acc3Hi[1]) or acc3Hi != acc3Hi[1]))
+          or (not na(acc3Lo) and (na(acc3Lo[1]) or acc3Lo != acc3Lo[1]))
+
+f_registerAccumZone(bool trig, float price, int instId, string id, string tf, string lbl, float bs) =>
+    if trig and not na(price) and not na(instId)
+        bool found = false
+        if array.size(gPersist) > 0
+            for i = 0 to array.size(gPersist) - 1
+                RawZone z = array.get(gPersist, i)
+                if z.srcCat == CAT_ACC and z.srcId == id and z.srcTf == tf and z.instId == instId
+                    found    := true
+                    z.center := price
+                    z.top    := price + zoneHalfWidth
+                    z.bottom := price - zoneHalfWidth
+                    break
+        if not found
+            RawZone rz = f_makeRaw(f_nextUid(), id, CAT_ACC, tf, lbl, price, bs, false)
+            rz.instId     := instId
+            rz.lifeMs     := 0
+            rz.expireTime := 0
+            array.push(gPersist, rz)
+
+f_pruneAccumGenerations(string tf, int keepCount) =>
+    if keepCount >= 1
+        array<int> ids = array.new_int()
+        if array.size(gPersist) > 0
+            for i = 0 to array.size(gPersist) - 1
+                RawZone z = array.get(gPersist, i)
+                if z.srcCat == CAT_ACC and z.srcTf == tf and not array.includes(ids, z.instId)
+                    array.push(ids, z.instId)
+        while array.size(ids) > keepCount
+            int oldest = array.get(ids, 0)
+            int oi = 0
+            if array.size(ids) > 1
+                for k = 1 to array.size(ids) - 1
+                    if array.get(ids, k) < oldest
+                        oldest := array.get(ids, k)
+                        oi     := k
+            array.remove(ids, oi)
+            if array.size(gPersist) > 0
+                for i = array.size(gPersist) - 1 to 0
+                    if i < array.size(gPersist)
+                        RawZone z = array.get(gPersist, i)
+                        if z.srcCat == CAT_ACC and z.srcTf == tf and z.instId == oldest
+                            array.remove(gPersist, i)
+
+f_registerStatic(useHzSource and nPh1, ph1, "SWING_H", CAT_HZ, hzTf1, hzTf1 + " Swing High", scoreHz1, lifeHz1)
+f_registerStatic(useHzSource and nPl1, pl1, "SWING_L", CAT_HZ, hzTf1, hzTf1 + " Swing Low",  scoreHz1, lifeHz1)
+f_registerStatic(useHzSource and nPh2, ph2, "SWING_H", CAT_HZ, hzTf2, hzTf2 + " Swing High", scoreHz2, lifeHz2)
+f_registerStatic(useHzSource and nPl2, pl2, "SWING_L", CAT_HZ, hzTf2, hzTf2 + " Swing Low",  scoreHz2, lifeHz2)
+f_registerStatic(useHzSource and nPh3, ph3, "SWING_H", CAT_HZ, hzTf3, hzTf3 + " Swing High", scoreHz3, lifeHz3)
+f_registerStatic(useHzSource and nPl3, pl3, "SWING_L", CAT_HZ, hzTf3, hzTf3 + " Swing Low",  scoreHz3, lifeHz3)
+
+f_registerAccumZone(useAccSource and nAc1, acc1Hi, acc1Id, "ACC_HI", accTf1, accTf1 + " Accum High", scoreAcc1)
+f_registerAccumZone(useAccSource and nAc1, acc1Lo, acc1Id, "ACC_LO", accTf1, accTf1 + " Accum Low",  scoreAcc1)
+f_registerAccumZone(useAccSource and nAc2, acc2Hi, acc2Id, "ACC_HI", accTf2, accTf2 + " Accum High", scoreAcc2)
+f_registerAccumZone(useAccSource and nAc2, acc2Lo, acc2Id, "ACC_LO", accTf2, accTf2 + " Accum Low",  scoreAcc2)
+f_registerAccumZone(useAccSource and nAc3, acc3Hi, acc3Id, "ACC_HI", accTf3, accTf3 + " Accum High", scoreAcc3)
+f_registerAccumZone(useAccSource and nAc3, acc3Lo, acc3Id, "ACC_LO", accTf3, accTf3 + " Accum Low",  scoreAcc3)
+
+f_pruneAccumGenerations(accTf1, accKeep1)
+f_pruneAccumGenerations(accTf2, accKeep2)
+f_pruneAccumGenerations(accTf3, accKeep3)
+
+f_registerStatic(useDayHL and carryPrevDayHL and isNewDay, prevDayHigh, "PDH", CAT_HZ, "PD", "Prev Day High", scorePrevDayHL, lifePrevDayHL)
+f_registerStatic(useDayHL and carryPrevDayHL and isNewDay, prevDayLow,  "PDL", CAT_HZ, "PD", "Prev Day Low",  scorePrevDayHL, lifePrevDayHL)
+
+// ---- 3.10 Horizontal Reaction 計測 ----------------------------------------
+f_updateReactions() =>
+    if array.size(gPersist) > 0
+        for i = 0 to array.size(gPersist) - 1
+            RawZone z = array.get(gPersist, i)
+            bool target = z.srcCat == CAT_HZ or (reactionAllSrc and (z.srcCat == CAT_ACC or z.srcCat == CAT_DHL))
+            if target
+                bool touching = low <= z.top and high >= z.bottom
+
+                if not z.reactionArmed
+                    bool awayUp   = low  >= z.top    + reactionRearmDist
+                    bool awayDown = high <= z.bottom - reactionRearmDist
+                    if awayUp or awayDown
+                        z.reactionArmed := true
+
+                if touching and z.entrySide == 0 and z.reactionArmed
+                    z.entrySide := close[1] > z.top ? 1 : close[1] < z.bottom ? -1 : 0
+
+                if z.entrySide == 1
+                    if high >= z.top + reactionDist
+                        z.reactionCnt   := z.reactionCnt + 1
+                        z.entrySide     := 0
+                        z.reactionArmed := false
+                        if lifeExtendOn and z.expireTime > 0
+                            z.expireTime := z.expireTime + int(z.lifeMs * lifeExtendRatio)
+                    else if close <= z.bottom - reactionDist
+                        z.entrySide     := 0
+                        z.reactionArmed := false
+                else if z.entrySide == -1
+                    if low <= z.bottom - reactionDist
+                        z.reactionCnt   := z.reactionCnt + 1
+                        z.entrySide     := 0
+                        z.reactionArmed := false
+                        if lifeExtendOn and z.expireTime > 0
+                            z.expireTime := z.expireTime + int(z.lifeMs * lifeExtendRatio)
+                    else if close >= z.top + reactionDist
+                        z.entrySide     := 0
+                        z.reactionArmed := false
+                z.reactionBonus := f_reactionBonus(z.reactionCnt)
+f_updateReactions()
+
+// ---- 3.11 寿命切れ / 上限超過の破棄 ---------------------------------------
+f_prunePersist() =>
+    if array.size(gPersist) > 0
+        for i = array.size(gPersist) - 1 to 0
+            if i < array.size(gPersist)
+                RawZone z = array.get(gPersist, i)
+                if z.expireTime > 0 and time > z.expireTime
+                    array.remove(gPersist, i)
+    while array.size(gPersist) > maxPersistZones
+        RawZone z0 = array.get(gPersist, 0)
+        if z0.srcCat == CAT_ACC
+            string tf0 = z0.srcTf
+            int    id0 = z0.instId
+            for i = array.size(gPersist) - 1 to 0
+                if i < array.size(gPersist)
+                    RawZone z = array.get(gPersist, i)
+                    if z.srcCat == CAT_ACC and z.srcTf == tf0 and z.instId == id0
+                        array.remove(gPersist, i)
+        else
+            array.shift(gPersist)
+f_prunePersist()
+
+// ---- 3.12 このバーで評価するRaw Zone一式 ----------------------------------
+array<RawZone> gRaw = array.new<RawZone>()
+
+if array.size(gPersist) > 0
+    for i = 0 to array.size(gPersist) - 1
+        array.push(gRaw, array.get(gPersist, i))
+
+if useMaSource and not na(ma1Val)
+    RawZone rMa1 = f_makeRaw(UID_MA1, "MA1", CAT_MA, maTf, str.tostring(ma1Len) + "MA" + f_arrow(ma1Dir), ma1Val, scoreMa1, true)
+    rMa1.slopeState     := ma1State
+    rMa1.slopeDir       := ma1Dir
+    rMa1.slopeBonus     := ma1SlopeBonus
+    rMa1.maClusterBonus := maClusterBonus
+    array.push(gRaw, rMa1)
+
+if useMaSource and not na(ma2Val)
+    RawZone rMa2 = f_makeRaw(UID_MA2, "MA2", CAT_MA, maTf, str.tostring(ma2Len) + "MA" + f_arrow(ma2Dir), ma2Val, scoreMa2, true)
+    rMa2.slopeState     := ma2State
+    rMa2.slopeDir       := ma2Dir
+    rMa2.slopeBonus     := ma2SlopeBonus
+    rMa2.maClusterBonus := maClusterBonus
+    array.push(gRaw, rMa2)
+
+if useDayHL and not na(dayHigh)
+    array.push(gRaw, f_makeRaw(gDayHighUid, "DAY_HIGH", CAT_DHL, "D", "Day High", dayHigh, scoreDayHL, true))
+if useDayHL and not na(dayLow)
+    array.push(gRaw, f_makeRaw(gDayLowUid, "DAY_LOW", CAT_DHL, "D", "Day Low", dayLow, scoreDayHL, true))
+
+// ---- 3.13 Cluster Engine ---------------------------------------------------
+f_weightOf(RawZone z) =>
+    math.max(z.baseScore, 0.01)
+
+f_finalizeCluster(array<RawZone> members) =>
+    float tw      = 0.0
+    float ts      = 0.0
+    float baseSum = 0.0
+    float slopeB  = 0.0
+    float maB     = 0.0
+    float reactB  = 0.0
+    bool  hasMA   = false
+    bool  hasHZ   = false
+    bool  hasDHL  = false
+    bool  hasACC  = false
+
+    bool swHit1 = false
+    bool swHit2 = false
+    bool swHit3 = false
+    int  reactCnt = 0
+    bool accHi1 = false
+    bool accLo1 = false
+    bool accHi2 = false
+    bool accLo2 = false
+    bool accHi3 = false
+    bool accLo3 = false
+    bool htfSw1h = false
+    bool htfAc1  = false
+    bool htfAc2  = false
+    bool htfAc3  = false
+    bool htfSw15 = false
+    bool htfM1   = false
+    bool htfM2   = false
+    bool htfDay  = false
+
+    string srcStr = ""
+    string sigStr = ""
+    array<int>    uids   = array.new_int()
+    array<string> grpKey = array.new_string()
+    array<int>    grpCnt = array.new_int()
+
+    int n = array.size(members)
+    for j = 0 to n - 1
+        RawZone m = array.get(members, j)
+
+        float w = f_weightOf(m)
+        tw += w
+        ts += m.center * w
+
+        bool isSwing = m.srcCat == CAT_HZ and (m.srcId == "SWING_H" or m.srcId == "SWING_L")
+        bool isAccHi = m.srcId == "ACC_HI"
+        if isSwing
+            if m.srcTf == hzTf1
+                if not swHit1
+                    swHit1  := true
+                    baseSum += scoreHz1
+            else if m.srcTf == hzTf2
+                if not swHit2
+                    swHit2  := true
+                    baseSum += scoreHz2
+            else if m.srcTf == hzTf3
+                if not swHit3
+                    swHit3  := true
+                    baseSum += scoreHz3
+            else
+                baseSum += m.baseScore
+        else if m.srcCat == CAT_ACC
+            if m.srcTf == accTf1
+                if isAccHi and not accHi1
+                    accHi1  := true
+                    baseSum += m.baseScore
+                else if not isAccHi and not accLo1
+                    accLo1  := true
+                    baseSum += m.baseScore
+            else if m.srcTf == accTf2
+                if isAccHi and not accHi2
+                    accHi2  := true
+                    baseSum += m.baseScore
+                else if not isAccHi and not accLo2
+                    accLo2  := true
+                    baseSum += m.baseScore
+            else if m.srcTf == accTf3
+                if isAccHi and not accHi3
+                    accHi3  := true
+                    baseSum += m.baseScore
+                else if not isAccHi and not accLo3
+                    accLo3  := true
+                    baseSum += m.baseScore
+            else
+                baseSum += m.baseScore
+        else
+            baseSum += m.baseScore
+
+        slopeB  := slopeBonusMode == "Max" ? math.max(slopeB, m.slopeBonus) : slopeB + m.slopeBonus
+        maB     := math.max(maB, m.maClusterBonus)
+        reactB   := math.max(reactB, m.reactionBonus)
+        reactCnt := math.max(reactCnt, m.reactionCnt)
+
+        if isSwing and m.srcTf == hzTf3 and htfSwing1H
+            htfSw1h := true
+        if isSwing and m.srcTf == hzTf2 and htfSwing15M
+            htfSw15 := true
+        if m.srcCat == CAT_ACC and m.srcTf == accTf1 and htfAccum1H
+            htfAc1 := true
+        if m.srcCat == CAT_ACC and m.srcTf == accTf2 and htfAccum4H
+            htfAc2 := true
+        if m.srcCat == CAT_ACC and m.srcTf == accTf3 and htfAccumD
+            htfAc3 := true
+        if m.srcId == "MA1" and htfMa1
+            htfM1 := true
+        if m.srcId == "MA2" and htfMa2
+            htfM2 := true
+        if m.srcCat == CAT_DHL and htfDayHL
+            htfDay := true
+
+        sigStr  := sigStr + (j > 0 ? "+" : "") + m.srcId + "@" + m.srcTf + "#" + str.tostring(m.uid)
+        array.push(uids, m.uid)
+        hasMA   := hasMA  or m.srcCat == CAT_MA
+        hasHZ   := hasHZ  or m.srcCat == CAT_HZ
+        hasDHL  := hasDHL or m.srcCat == CAT_DHL
+        hasACC  := hasACC or m.srcCat == CAT_ACC
+
+        string gk = m.srcLabel
+        if isSwing
+            gk := m.srcTf + " Swing"
+        else if m.srcCat == CAT_ACC
+            gk := m.srcTf + " Accum " + (isAccHi ? "High" : "Low")
+        int gi = array.indexof(grpKey, gk)
+        if gi >= 0
+            array.set(grpCnt, gi, array.get(grpCnt, gi) + 1)
+        else
+            array.push(grpKey, gk)
+            array.push(grpCnt, 1)
+
+    string htfStr = ""
+    if htfSw1h
+        htfStr := htfStr + (htfStr == "" ? "" : " / ") + f_tfName(hzTf3) + " Swing"
+    if htfAc1
+        htfStr := htfStr + (htfStr == "" ? "" : " / ") + f_tfName(accTf1) + " Accum"
+    if htfAc2
+        htfStr := htfStr + (htfStr == "" ? "" : " / ") + f_tfName(accTf2) + " Accum"
+    if htfAc3
+        htfStr := htfStr + (htfStr == "" ? "" : " / ") + f_tfName(accTf3) + " Accum"
+    if htfSw15
+        htfStr := htfStr + (htfStr == "" ? "" : " / ") + f_tfName(hzTf2) + " Swing"
+    if htfM1
+        htfStr := htfStr + (htfStr == "" ? "" : " / ") + str.tostring(ma1Len) + "MA"
+    if htfM2
+        htfStr := htfStr + (htfStr == "" ? "" : " / ") + str.tostring(ma2Len) + "MA"
+    if htfDay
+        htfStr := htfStr + (htfStr == "" ? "" : " / ") + "Day H/L"
+    bool hasHtfStruct = htfStr != ""
+
+    if array.size(grpKey) > 0
+        for k = 0 to array.size(grpKey) - 1
+            int c = array.get(grpCnt, k)
+            srcStr := srcStr + (k > 0 ? " / " : "") + array.get(grpKey, k) + (c > 1 ? " x" + str.tostring(c) : "")
+
+    float ctr = tw > 0 ? ts / tw : na
+    int   cat = (hasMA ? 1 : 0) + (hasHZ ? 1 : 0) + (hasDHL ? 1 : 0) + (hasACC ? 1 : 0)
+    float confB = f_confluenceBonus(cat)
+    Zone.new(
+         center = ctr, top = ctr + zoneHalfWidth, bottom = ctr - zoneHalfWidth,
+         score = baseSum + slopeB + maB + reactB + confB,
+         baseSum = baseSum, slopeBonus = slopeB, maBonus = maB,
+         reactionBonus = reactB, flipBonus = 0.0, confBonus = confB,
+         strength = SR_WEAK, state = ST_ACTIVE, flipped = false, flipDir = 0,
+         catCount = cat, memberCount = n, sources = srcStr, trackId = -1,
+         memberUids = uids, sourceSig = sigStr, reactionCnt = reactCnt,
+         hasHtf = hasHtfStruct, htfSources = htfStr)
+
+f_buildClusters(array<RawZone> src) =>
+    array<Zone> out = array.new<Zone>()
+    int n = array.size(src)
+    if n > 0
+        array<float> centers = array.new_float()
+        for i = 0 to n - 1
+            array.push(centers, array.get(src, i).center)
+        array<int> ord = array.sort_indices(centers, order.ascending)
+
+        array<RawZone> cur = array.new<RawZone>()
+        for k = 0 to n - 1
+            RawZone z = array.get(src, array.get(ord, k))
+            if array.size(cur) == 0
+                array.push(cur, z)
+            else
+                float tw = 0.0
+                float ts = 0.0
+                for j = 0 to array.size(cur) - 1
+                    RawZone m = array.get(cur, j)
+                    float w = f_weightOf(m)
+                    tw += w
+                    ts += m.center * w
+                float wz = f_weightOf(z)
+                float newCenter = (ts + z.center * wz) / (tw + wz)
+
+                bool ok = math.abs(z.center - newCenter) <= clusterDist
+                if ok
+                    for j = 0 to array.size(cur) - 1
+                        if math.abs(array.get(cur, j).center - newCenter) > clusterDist
+                            ok := false
+                            break
+                if ok
+                    array.push(cur, z)
+                else
+                    array.push(out, f_finalizeCluster(cur))
+                    cur := array.new<RawZone>()
+                    array.push(cur, z)
+        if array.size(cur) > 0
+            array.push(out, f_finalizeCluster(cur))
+    out
+
+array<Zone> gZones = f_buildClusters(gRaw)
+
+// ---- 3.14 Strength Score Engine -------------------------------------------
+f_applyStrength(Zone z) =>
+    z.score    := z.baseSum + z.slopeBonus + z.maBonus + z.reactionBonus + z.flipBonus + z.confBonus
+    z.strength := f_strengthOf(z.score, z.hasHtf)
+
+if array.size(gZones) > 0
+    for i = 0 to array.size(gZones) - 1
+        f_applyStrength(array.get(gZones, i))
+
+// ---- 3.15 Zone State Engine (ZoneTrack) -----------------------------------
+var array<ZoneTrack> gTracks   = array.new<ZoneTrack>()
+var int              gTrackSeq = 0
+
+f_uidOverlap(array<int> a, array<int> b) =>
+    int c = 0
+    if not na(a) and not na(b) and array.size(a) > 0 and array.size(b) > 0
+        for i = 0 to array.size(a) - 1
+            if array.includes(b, array.get(a, i))
+                c += 1
+    c
+
+f_trackContinuous(ZoneTrack t, Zone z) =>
+    int ov = f_uidOverlap(z.memberUids, t.memberUids)
+    int sz = na(z.memberUids) ? 0 : array.size(z.memberUids)
+    int st = na(t.memberUids) ? 0 : array.size(t.memberUids)
+    int mx = math.max(sz, st)
+    ov >= 1 and mx > 0 and (float(ov) / float(mx)) >= trackContinuity
+
+f_findTrack(Zone z) =>
+    int best = -1
+    float bestD = 1e20
+    if array.size(gTracks) > 0
+        for i = 0 to array.size(gTracks) - 1
+            ZoneTrack t = array.get(gTracks, i)
+            if not t.matched
+                float d = math.abs(t.center - z.center)
+                if d <= clusterDist and d < bestD and f_trackContinuous(t, z)
+                    bestD := d
+                    best  := i
+    best
+
+f_naturalState(float top, float bottom) =>
+    close > top ? ST_SUPPORT : close < bottom ? ST_RESIST : ST_ACTIVE
+
+// ---- 3.16 Break / Flip Engine ---------------------------------------------
+f_updateTrack(ZoneTrack t, bool evalBar, float bc, float bh, float bl) =>
+    int ev = 0
+
+    int  prevState = t.state
+    bool handled   = false
+
+    int evalState = prevState == ST_ACTIVE ? (t.lastRole > 0 ? ST_SUPPORT : t.lastRole < 0 ? ST_RESIST : ST_ACTIVE) : prevState
+
+    if evalBar
+        if evalState == ST_RESIST and bc > t.top + breakBuffer
+            t.state    := ST_BROKEN
+            t.breakDir := 1
+            t.breakBar := bar_index
+            t.retested := false
+            t.flipped  := false
+            t.flipDir  := 0
+            handled    := true
+            ev := 1
+        else if evalState == ST_SUPPORT and bc < t.bottom - breakBuffer
+            t.state    := ST_BROKEN
+            t.breakDir := -1
+            t.breakBar := bar_index
+            t.retested := false
+            t.flipped  := false
+            t.flipDir  := 0
+            handled    := true
+            ev := -1
+        else if prevState == ST_BROKEN and t.breakDir == 1
+            handled := true
+            if bc < t.bottom - breakBuffer
+                t.breakDir := 0
+                t.retested := false
+                if resetOnReclaim
+                    t.state := f_naturalState(t.top, t.bottom)
+            else if not t.retested
+                if bl <= t.top and bh >= t.bottom
+                    t.retested := true
+            else if bc >= t.top + flipConfirmDist
+                t.flipped  := true
+                t.flipDir  := 1
+                t.state    := ST_SUPPORT
+                t.breakDir := 0
+                t.retested := false
+                ev := 2
+        else if prevState == ST_BROKEN and t.breakDir == -1
+            handled := true
+            if bc > t.top + breakBuffer
+                t.breakDir := 0
+                t.retested := false
+                if resetOnReclaim
+                    t.state := f_naturalState(t.top, t.bottom)
+            else if not t.retested
+                if bh >= t.bottom and bl <= t.top
+                    t.retested := true
+            else if bc <= t.bottom - flipConfirmDist
+                t.flipped  := true
+                t.flipDir  := -1
+                t.state    := ST_RESIST
+                t.breakDir := 0
+                t.retested := false
+                ev := -2
+
+    if not handled and t.state != ST_BROKEN
+        t.state := f_naturalState(t.top, t.bottom)
+
+    if t.state == ST_SUPPORT
+        t.lastRole := 1
+    else if t.state == ST_RESIST
+        t.lastRole := -1
+    ev
+
+bool evUpBreak   = false
+bool evDownBreak = false
+bool evFlipSup   = false
+bool evFlipRes   = false
+
+if array.size(gTracks) > 0
+    for i = 0 to array.size(gTracks) - 1
+        ZoneTrack tt = array.get(gTracks, i)
+        tt.matched := false
+
+if array.size(gZones) > 0
+    for i = 0 to array.size(gZones) - 1
+        Zone z = array.get(gZones, i)
+        int ti = f_findTrack(z)
+        ZoneTrack t = na
+        if ti >= 0
+            t := array.get(gTracks, ti)
+        else
+            gTrackSeq += 1
+            t := ZoneTrack.new(id = gTrackSeq, center = z.center, top = z.top, bottom = z.bottom,
+                 state = f_naturalState(z.top, z.bottom), lastSeenBar = bar_index,
+                 memberUids = array.copy(z.memberUids), sourceSig = z.sourceSig)
+            array.push(gTracks, t)
+        t.matched     := true
+        t.center      := z.center
+        t.top         := z.top
+        t.bottom      := z.bottom
+        t.lastSeenBar := bar_index
+        t.memberUids  := array.copy(z.memberUids)
+        t.sourceSig   := z.sourceSig
+
+        int ev = f_updateTrack(t, brEval, brClose, brHigh, brLow)
+        evUpBreak   := evUpBreak   or ev == 1
+        evDownBreak := evDownBreak or ev == -1
+        evFlipSup   := evFlipSup   or ev == 2
+        evFlipRes   := evFlipRes   or ev == -2
+
+        z.state     := t.state
+        z.flipped   := t.flipped
+        z.flipDir   := t.flipDir
+        z.flipBonus := t.flipped ? flipBonusV : 0.0
+        z.trackId   := t.id
+        f_applyStrength(z)
+
+if array.size(gTracks) > 0
+    for i = array.size(gTracks) - 1 to 0
+        if i < array.size(gTracks)
+            ZoneTrack t = array.get(gTracks, i)
+            if bar_index - t.lastSeenBar > trackStaleBars
+                array.remove(gTracks, i)
+
+// ---- 3.17 Live Zone Map ----------------------------------------------------
+// Entry Logic / Trade Engine が参照する唯一の中心データ。
+var array<Zone> gLiveMap = array.new<Zone>()
+array.clear(gLiveMap)
+if array.size(gZones) > 0
+    for i = 0 to array.size(gZones) - 1
+        array.push(gLiveMap, array.get(gZones, i))
+
+f_zoneCount() => array.size(gLiveMap)
+f_zoneAt(int i) => array.get(gLiveMap, i)
+
+// ============================================================================
+// 04. TRADEPLAN / STRUCTURAL SL-TP
+// ----------------------------------------------------------------------------
+//  Entry Logic からは f_buildTradePlan(direction, entryPrice) だけを呼ぶ。
+//  Entry Logic は Zone がどう作られたかを知らなくてよい。
+//
+//  優先順位:
+//    Structural SL 必須 (無ければ NO TRADE。固定SL / パターンSL / ATR SL へは
+//                        フォールバックしない)
+//    Structural TP あり → そのTPを必ず使う → RR不足なら NO TRADE
+//    Structural TP なし → Structural SL基準の Fallback RR TP
+// ============================================================================
+
+// ---- 4.1 TradePlan Type ----------------------------------------------------
+type TradePlan
+    bool   valid         = false
+    string status        = "FAIL"
+    string reason        = "NO_ENTRY"
+    string logicId       = ""
+    int    dir           = 0        // +1 Long / -1 Short
+    float  entry         = 0.0
+    float  sl            = 0.0
+    float  tp            = 0.0
+    float  risk          = 0.0
+    float  reward        = 0.0
+    float  rr            = 0.0
+    int    obstacles     = 0
+    float  slZoneCenter  = 0.0
+    float  slZoneScore   = 0.0
+    float  tpZoneCenter  = 0.0
+    float  tpZoneScore   = 0.0
+    bool   usedFallbackTP = false
+    string tpType        = "-"      // "STRUCTURAL" / "FALLBACK_RR"
+
+int SL_MIN_STR  = f_strengthIdx(slMinStrStr)
+int TP_MIN_STR  = f_strengthIdx(tpMinStrStr)
+int OBS_MIN_STR = f_strengthIdx(obsMinStrStr)
+
+// ---- 4.2 Structural SL -----------------------------------------------------
+// Long : zoneTop < entryPrice / state == ST_SUPPORT / Strength>=指定 / Score>=指定
+//        の最も近いZone → SL = Zone Bottom - slBuffer
+//        (例: center 4580 / half 5 → 下端 4575 / buffer 5 → SL 4570)
+// ★ ST_ACTIVE と ST_BROKEN は常にStructural SL候補から除外する。
+f_getLongStructuralSL(float entryPrice) =>
+    float sl = na
+    int   idx = -1
+    float bestD = 1e20
+    if array.size(gLiveMap) > 0
+        for i = 0 to array.size(gLiveMap) - 1
+            Zone z = array.get(gLiveMap, i)
+            bool okState = z.state == ST_SUPPORT
+            if z.top < entryPrice and z.strength >= SL_MIN_STR and z.score >= slMinScore and okState
+                float d = entryPrice - z.top
+                if d < bestD
+                    bestD := d
+                    sl    := z.bottom - slBuffer
+                    idx   := i
+    [sl, idx]
+
+// Short : zoneBottom > entryPrice / state == ST_RESIST → SL = Zone Top + slBuffer
+f_getShortStructuralSL(float entryPrice) =>
+    float sl = na
+    int   idx = -1
+    float bestD = 1e20
+    if array.size(gLiveMap) > 0
+        for i = 0 to array.size(gLiveMap) - 1
+            Zone z = array.get(gLiveMap, i)
+            bool okState = z.state == ST_RESIST
+            if z.bottom > entryPrice and z.strength >= SL_MIN_STR and z.score >= slMinScore and okState
+                float d = z.bottom - entryPrice
+                if d < bestD
+                    bestD := d
+                    sl    := z.top + slBuffer
+                    idx   := i
+    [sl, idx]
+
+// ---- 4.3 Structural TP -----------------------------------------------------
+// Long : Entryより上の ST_RESIST Zone のうち最も近いもの → TP = Zone Bottom - tpBuffer
+f_getLongStructuralTP(float entryPrice) =>
+    float tp = na
+    int   idx = -1
+    float bestD = 1e20
+    if array.size(gLiveMap) > 0
+        for i = 0 to array.size(gLiveMap) - 1
+            Zone z = array.get(gLiveMap, i)
+            bool okState = z.state == ST_RESIST
+            if z.bottom > entryPrice and z.strength >= TP_MIN_STR and z.score >= tpMinScore and okState
+                float d = z.bottom - entryPrice
+                if d < bestD
+                    bestD := d
+                    tp    := z.bottom - tpBuffer
+                    idx   := i
+    [tp, idx]
+
+// Short : Entryより下の ST_SUPPORT Zone → TP = Zone Top + tpBuffer
+f_getShortStructuralTP(float entryPrice) =>
+    float tp = na
+    int   idx = -1
+    float bestD = 1e20
+    if array.size(gLiveMap) > 0
+        for i = 0 to array.size(gLiveMap) - 1
+            Zone z = array.get(gLiveMap, i)
+            bool okState = z.state == ST_SUPPORT
+            if z.top < entryPrice and z.strength >= TP_MIN_STR and z.score >= tpMinScore and okState
+                float d = entryPrice - z.top
+                if d < bestD
+                    bestD := d
+                    tp    := z.top + tpBuffer
+                    idx   := i
+    [tp, idx]
+
+// ---- 4.4 Obstacle Count ----------------------------------------------------
+f_getObstacleCount(float entryPrice, float tpPrice, int direction) =>
+    int cnt = 0
+    if not na(entryPrice) and not na(tpPrice) and array.size(gLiveMap) > 0
+        float boundary = direction > 0 ? tpPrice + tpBuffer : tpPrice - tpBuffer
+        for i = 0 to array.size(gLiveMap) - 1
+            Zone z = array.get(gLiveMap, i)
+            bool okState = direction > 0 ? z.state == ST_RESIST : z.state == ST_SUPPORT
+            if z.strength >= OBS_MIN_STR and okState
+                bool inWay = direction > 0 ? (z.bottom > entryPrice and z.top < boundary)
+                                           : (z.top < entryPrice and z.bottom > boundary)
+                if inWay
+                    cnt += 1
+    cnt
+
+// ---- 4.5 Trade Plan Builder (Entry Module 共通API) ------------------------
+//  戻り値 TradePlan:
+//    valid = true  → 発注してよい
+//    valid = false → reason に理由:
+//        NO_ENTRY / NO_SL_ZONE / INVALID_SL / SL_TOO_FAR /
+//        TP_WRONG_SIDE / LOW_STRUCTURAL_RR
+f_buildTradePlan(int direction, float entryPrice) =>
+    [lSl, lSi] = f_getLongStructuralSL(entryPrice)
+    [lTp, lTi] = f_getLongStructuralTP(entryPrice)
+    [sSl, sSi] = f_getShortStructuralSL(entryPrice)
+    [sTp, sTi] = f_getShortStructuralTP(entryPrice)
+
+    float sl  = direction > 0 ? lSl : direction < 0 ? sSl : na
+    int   si  = direction > 0 ? lSi : direction < 0 ? sSi : -1
+    float tpZ = direction > 0 ? lTp : direction < 0 ? sTp : na
+    int   ti  = direction > 0 ? lTi : direction < 0 ? sTi : -1
+
+    float risk = na(sl) or na(entryPrice) ? na : math.abs(entryPrice - sl)
+
+    TradePlan p = TradePlan.new(dir = direction, entry = entryPrice)
+    p.sl   := sl
+    p.risk := risk
+    if si >= 0
+        Zone zs = array.get(gLiveMap, si)
+        p.slZoneCenter := zs.center
+        p.slZoneScore  := zs.score
+    if ti >= 0
+        Zone zt = array.get(gLiveMap, ti)
+        p.tpZoneCenter := zt.center
+        p.tpZoneScore  := zt.score
+
+    if direction == 0
+        p.status := "FAIL"
+        p.reason := "NO_ENTRY"
+    else if si < 0 or na(sl)
+        // ★ Structural SL必須。固定SL / パターンSL / ATR SL へのフォールバックは無い。
+        p.status := "FAIL"
+        p.reason := "NO_SL_ZONE"
+    else if na(risk) or risk <= 0
+        p.status := "FAIL"
+        p.reason := "INVALID_SL"
+    else if risk > maxSlDist
+        p.status := "FAIL"
+        p.reason := "SL_TOO_FAR"
+    else if ti >= 0
+        // ---- Structural TP が存在する場合 : 必ずこのTPを使う ----
+        //      RRが足りなくても「遠い固定RR TP」へ逃げてはいけない → NO TRADE。
+        p.tp             := tpZ
+        p.reward         := math.abs(tpZ - entryPrice)
+        p.rr             := risk > 0 ? p.reward / risk : na
+        p.usedFallbackTP := false
+        p.tpType         := "STRUCTURAL"
+        p.obstacles      := f_getObstacleCount(entryPrice, tpZ, direction)
+        if p.reward <= 0
+            p.status := "FAIL"
+            p.reason := "TP_WRONG_SIDE"
+        else if na(p.rr) or p.rr < minStructRR
+            p.status := "FAIL"
+            p.reason := "LOW_STRUCTURAL_RR"
+        else
+            p.valid  := true
+            p.status := "PASS"
+            p.reason := "OK_STRUCTURAL_TP"
+    else
+        // ---- Structural TP が無い場合のみ : Structural SL基準の固定RR TP ----
+        float ftp = entryPrice + direction * risk * fallbackRR
+        p.tp             := ftp
+        p.reward         := math.abs(ftp - entryPrice)
+        p.rr             := fallbackRR
+        p.usedFallbackTP := true
+        p.tpType         := "FALLBACK_RR"
+        p.obstacles      := f_getObstacleCount(entryPrice, ftp, direction)
+        p.valid  := true
+        p.status := "PASS"
+        p.reason := "OK_FALLBACK_TP"
+    p
+
+// ============================================================================
+// 05. COMMON TRADE ENGINE
+// ----------------------------------------------------------------------------
+//  Entry ID生成 / Qty計算 / 発注 / SL-TP固定 / Break Even を一括で持つ共通層。
+//  Entry Module 側には strategy.entry / strategy.exit / SL計算 / TP計算 /
+//  勝敗管理を一切書かない。
+//
+//  Entry ID 書式 : <LOGIC_ID>_L_<seq> / <LOGIC_ID>_S_<seq>
+//     例 : FVG_L_1 / FVG_S_2 / EMA_L_3 / HORIZONTAL_S_4
+//  → List of Trades からどのLogicのトレードか判別できる。
+// ============================================================================
+
+// ---- 5.1 State -------------------------------------------------------------
+// Entry ID 連番 (関数内から書き換えるため配列で保持)
+var array<int> gSeq = array.new_int(1, 0)
+// Entry IDごとの固定TP (Break Even で SL のみ更新する際にTPを不変で再指定するため)
+var map<string, float> gTradeTP = map.new<string, float>()
+// Entry IDごとの建値到達フラグ (一度trueになったら元SLへ戻さない一方向遷移)
+var map<string, bool>  gTradeBE = map.new<string, bool>()
+// 直近TradePlanのDebug文字列 (Display / Debug セクションで表示)
+var array<string> gLastPlan = array.new_string(2, "-")
+
+// ---- 5.2 Position Size (Structural SL距離ベース) --------------------------
+//  Risk Amount ÷ Structural SL距離 でQtyを計算する。Long / Short 共通。
+f_riskCapital() =>
+    (useCompound ? strategy.equity : strategy.initial_capital) * riskPct / 100.0
+
+f_qty(float riskPerUnit) =>
+    float raw = riskPerUnit > 0 ? f_riskCapital() / (riskPerUnit * syminfo.pointvalue) : 0.0
+    math.floor(raw)
+
+// ---- 5.3 Logic別 保有数カウント -------------------------------------------
+//  Entry ID の接頭辞で数える → Logic間は互いに干渉しない。
+f_openCountForLogic(string logicId) =>
+    int c = 0
+    if strategy.opentrades > 0
+        for i = 0 to strategy.opentrades - 1
+            string oid = strategy.opentrades.entry_id(i)
+            // "<LOGIC>_L_" / "<LOGIC>_S_" で厳密に判定する (別Logicの前方一致を拾わない)
+            if str.startswith(oid, logicId + "_L_") or str.startswith(oid, logicId + "_S_")
+                c += 1
+    c
+
+// ---- 5.4 Debug 記録 --------------------------------------------------------
+f_planText(string logicId, TradePlan p) =>
+    logicId + " " + (p.dir > 0 ? "LONG" : p.dir < 0 ? "SHORT" : "-") +
+     " | E " + f_num(p.entry, "#.##") +
+     " | SL " + f_num(p.sl, "#.##") +
+     " | TP " + f_num(p.tp, "#.##") +
+     " | RR " + f_num(p.rr, "#.##") +
+     " | " + p.tpType +
+     " | Obst " + str.tostring(p.obstacles)
+
+f_recordPlan(string logicId, TradePlan p, string extra) =>
+    array.set(gLastPlan, 0, f_planText(logicId, p))
+    array.set(gLastPlan, 1, p.status + " · " + p.reason + (extra == "" ? "" : " · " + extra))
+    true
+
+// ---- 5.5 発注 (共通) -------------------------------------------------------
+//  ★ ここが唯一 strategy.entry / strategy.exit を呼ぶ場所。
+//    Entry時点の Structural SL / TP (または Fallback TP) を strategy.exit へ
+//    渡して固定する。以後Zoneが動いても、そのトレードのSL/TPは変更しない。
+f_executeTrade(string logicId, int dir, float entryPrice, TradePlan p) =>
+    string eid  = ""
+    bool   done = false
+    if dir != 0
+        if not p.valid
+            // Structural SL無し / RR不足 など → 発注しない (理由はDebugへ)
+            f_recordPlan(logicId, p, "")
+            done := true
+        else
+            float qty = f_qty(p.risk)
+            // 反対方向Entryの扱い (TV単一ネットポジション制約)
+            bool oppositeConflict = not allowOppositeEntry and
+                 ((dir > 0 and strategy.position_size < 0) or (dir < 0 and strategy.position_size > 0))
+            bool logicFull = f_openCountForLogic(logicId) >= maxOpenPerLogic
+            if logicFull
+                f_recordPlan(logicId, p, "SKIP_LOGIC_LIMIT")
+                done := true
+            else if oppositeConflict
+                f_recordPlan(logicId, p, "SKIP_OPPOSITE_POSITION")
+                done := true
+            else if qty < 1
+                f_recordPlan(logicId, p, "SKIP_NO_QTY")
+                done := true
+            else
+                int n = array.get(gSeq, 0) + 1
+                array.set(gSeq, 0, n)
+                eid := logicId + (dir > 0 ? "_L_" : "_S_") + str.tostring(n)
+                strategy.entry(eid, dir > 0 ? strategy.long : strategy.short, qty = qty)
+                // ★ Entry時点の SL / TP をここで固定する。以後Zoneが変化しても更新しない。
+                strategy.exit(eid + "X", from_entry = eid, stop = p.sl, limit = p.tp,
+                     comment_profit = "TP", comment_loss = "SL")
+                // Break Even ON時のみ Entry ID → 固定TP を保持する (OFF時はmapを育てない)
+                if useBreakEven
+                    gTradeTP.put(eid, p.tp)
+                    gTradeBE.put(eid, false)
+                f_recordPlan(logicId, p, eid)
+                if showEntryLabel
+                    // Logic / Direction / Entry / SL / TP / RR / TP Type
+                    string ltxt = eid + "\n" + (dir > 0 ? "LONG" : "SHORT")
+                    ltxt := ltxt + "\nE  " + f_num(p.entry, "#.##")
+                    ltxt := ltxt + "\nSL " + f_num(p.sl, "#.##")
+                    ltxt := ltxt + "\nTP " + f_num(p.tp, "#.##")
+                    ltxt := ltxt + "\nRR " + f_num(p.rr, "#.##")
+                    ltxt := ltxt + "\n" + p.tpType
+                    label.new(bar_index, dir > 0 ? low : high, text = ltxt,
+                         style = dir > 0 ? label.style_label_up : label.style_label_down,
+                         color = dir > 0 ? color.new(color.teal, 20) : color.new(color.maroon, 20),
+                         textcolor = color.white, size = size.small)
+                done := true
+    done ? eid : ""
+
+// ---- 5.6 Entry Signal → 発注 の共通パイプライン ---------------------------
+//  Entry Module は「logicId / direction / entrySignal / entryPrice」だけを渡す。
+//  Structural SL取得 → Structural TP取得 → RR確認 → PASSなら発注 は全てここ。
+f_submitSignal(string logicId, bool signal, int dir, float entryPrice) =>
+    string eid = ""
+    if signal
+        TradePlan p = f_buildTradePlan(dir, entryPrice)
+        p.logicId := logicId
+        eid := f_executeTrade(logicId, dir, entryPrice, p)
+    eid
+
+// ---- 5.7 Break Even (Entry ID 単位) ---------------------------------------
+//  useBreakEven=OFF → 何もしない (Structural SL/TPの結果をそのまま検証できる)。
+//  ON → 各Entry IDが建値幅に到達したら、そのEntry IDのSLのみエントリー価格へ。
+//       TPは Entry時点で固定した値 (gTradeTP) をそのまま再指定する。
+f_updateBreakEven() =>
+    if useBreakEven and strategy.opentrades > 0
+        for i = 0 to strategy.opentrades - 1
+            string eid = strategy.opentrades.entry_id(i)
+            if gTradeTP.contains(eid)
+                float ep     = strategy.opentrades.entry_price(i)
+                bool  isLong = strategy.opentrades.size(i) > 0
+                bool  wasOn  = gTradeBE.contains(eid) and gTradeBE.get(eid)
+                bool  reach  = false
+                if isLong
+                    reach := breakEvenTriggerMode == "確定足" ? (barstate.isconfirmed and close >= ep + breakEvenTrigger) : (high >= ep + breakEvenTrigger)
+                else
+                    reach := breakEvenTriggerMode == "確定足" ? (barstate.isconfirmed and close <= ep - breakEvenTrigger) : (low <= ep - breakEvenTrigger)
+                if wasOn or reach
+                    gTradeBE.put(eid, true)
+                    strategy.exit(eid + "X", from_entry = eid, stop = ep, limit = gTradeTP.get(eid),
+                         comment_loss = "BE", comment_profit = "TP")
+
+// ============================================================================
+// 06. ENTRY MODULE - FVG  (logicId = "FVG")
+// ----------------------------------------------------------------------------
+//  FVG Rebound Env Strategy の Entry Logic をそのまま移植したモジュール。
+//    ・環境認識 (EMAトレンド) / FVG反発判定 / BOS / Trigger /
+//      Volatility Filter / Session Filter / News Filter / Accum NoTrade /
+//      Armed管理 / Trigger Cooldown  … すべて変更していない。
+//    ・SL/TP計算・発注・勝敗管理は一切持たない。
+//  このモジュールの出力は次の3つだけ:
+//      LOGIC_FVG (logicId) / fvgLongSignal / fvgShortSignal / fvgEntryPrice
+// ============================================================================
+
+string LOGIC_FVG = "FVG"
+
+// ---- 6.1 Inputs : エントリー / トリガー -----------------------------------
+var string GF_ENT = "06 · FVG · Entry"
+useLong      = input.bool(true,  "ロングを有効", group = GF_ENT)
+useShort     = input.bool(false, "ショートを有効", group = GF_ENT)
+strictEngulf = input.bool(true,  "実体が前足を完全に包む", group = GF_ENT)
+reqOppColor  = input.bool(true,  "前足が反対色であることを要求", group = GF_ENT)
+
+var string GF_TRG = "06 · FVG · Trigger"
+useEngulfingTrigger    = input.bool(false, "包み足", group = GF_TRG)
+usePinbarTrigger       = input.bool(false, "ピンバー", group = GF_TRG)
+useBOSTrigger          = input.bool(false, "BOS / 直近高安更新", group = GF_TRG)
+useEMARejectTrigger    = input.bool(false, "EMAリジェクト", group = GF_TRG)
+useFVGTriggerFormation = input.bool(false, "FVG形成", group = GF_TRG)
+useStrongCandleTrigger = input.bool(false, "強ローソク", group = GF_TRG)
+
+triggerMode     = input.string("Any", "トリガー結合", options = ["Any", "All", "MinCount"], group = GF_TRG)
+minTriggerCount = input.int(1, "最低トリガー数 (MinCount時)", group = GF_TRG)
+
+useLowerTFTrigger = input.bool(true, "1分足トリガーを使う", group = GF_TRG)
+triggerTF         = input.timeframe("1", "トリガー時間足", group = GF_TRG)
+
+emaLenTrigger      = input.int(20,  "EMA Length (EMAリジェクト)", group = GF_TRG)
+useEMARejectSlopeFilter = input.bool(false, "EMAリジェクト 傾きフィルター", group = GF_TRG)
+emaRejectSlopeLookback  = input.int(3, "EMAリジェクト 傾き判定本数", group = GF_TRG)
+emaRejectSlopeMinATR    = input.float(0.12, "EMAリジェクト 最低傾き ATR倍率", group = GF_TRG)
+emaRejectSlopeAtrLen    = input.int(14, "EMAリジェクト 傾きATR期間", group = GF_TRG)
+bosLookback        = input.int(10,  "BOS Lookback", group = GF_TRG)
+pinWickBodyMult    = input.float(3.0, "ピンバー ヒゲ/実体倍率", group = GF_TRG)
+pinOppWickMaxRatio = input.float(2.0, "ピンバー 反対ヒゲ上限", group = GF_TRG)
+usePinBodyRatioFilter = input.bool(false, "ピンバー 実体率フィルター", group = GF_TRG)
+pinMaxBodyRatio       = input.float(0.1, "ピンバー 最大実体率", group = GF_TRG)
+usePinRangeFilter     = input.bool(false, "ピンバー 最低レンジフィルター", group = GF_TRG)
+pinRangeAtrLen        = input.int(14, "ピンバー ATR期間", group = GF_TRG)
+pinMinRangeATR        = input.float(0.10, "ピンバー 最低レンジ ATR倍率", group = GF_TRG)
+strongBodyRatio    = input.float(0.6, "強ローソク 実体率", group = GF_TRG)
+trigCloseEdgeRatio = input.float(0.7, "ピン/強 終値端寄せ比率", group = GF_TRG)
+useEngulfBodyRatioFilter   = input.bool(true, "包み足 包み込み率フィルター", group = GF_TRG)
+engulfBodyRatioMin         = input.float(1.20, "包み足 最低包み込み率", group = GF_TRG)
+useEngulfBodyQualityFilter = input.bool(true, "包み足 実体率フィルター", group = GF_TRG)
+engulfMinBodyRatio         = input.float(0.60, "包み足 最低実体率", group = GF_TRG)
+useEngulfBodyAtrFilter     = input.bool(true, "包み足 最低実体ATRフィルター", group = GF_TRG)
+engulfAtrLen               = input.int(14, "包み足 ATR期間", group = GF_TRG)
+engulfMinBodyATR           = input.float(0.30, "包み足 最低実体 ATR倍率", group = GF_TRG)
+
+useTriggerCooldown        = input.bool(false, "トリガークールダウン", group = GF_TRG)
+triggerCooldownBars       = input.int(3, "クールダウン本数", group = GF_TRG)
+useOppositeTriggerNoTrade = input.bool(true, "逆方向トリガー同時発生はNoTrade", group = GF_TRG)
+
+// ---- 6.2 Inputs : ボラフィルタ --------------------------------------------
+var string GF_VOL = "06 · FVG · Volatility"
+volMode  = input.string("OFF", "通常ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = GF_VOL)
+fixedMin = input.float(1.0, "最低レンジ (価格・固定値)", group = GF_VOL)
+atrLenBase   = input.int(14, "基準ATR本数", group = GF_VOL)
+atrTf        = input.timeframe("", "基準ATR時間足(空=チャート)", group = GF_VOL)
+useMinVol    = input.bool(true,  "低ボラ時はエントリー禁止", group = GF_VOL)
+minAtrDollar = input.float(1.5,  "最低ATR($)", group = GF_VOL)
+volModeRel   = input.bool(false, "低ボラ判定を相対ATRにする", group = GF_VOL)
+volAvgLen    = input.int(480,    "ATR平均本数", group = GF_VOL)
+volRatioMin  = input.float(0.9,  "ATR ÷ ATR平均 最低比", group = GF_VOL)
+fastVolMode  = input.string("固定値", "高速ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = GF_VOL)
+fastAtrLen   = input.int(5,      "fastATR/値幅 参照本数", group = GF_VOL)
+fastAtrMin   = input.float(2.2,  "fastATR最低($) ※ATR時", group = GF_VOL)
+fastFixedMin = input.float(10.0, "直近値幅 最低($) ※固定値時", group = GF_VOL)
+bodyAvgLen   = input.int(5,      "実体平均本数", group = GF_VOL)
+bodyAvgMin   = input.float(0.5,  "実体平均最低($)", group = GF_VOL)
+useRangeRatioFilter = input.bool(true, "fastATR ÷ RangeWidth を使う ※ATR時", group = GF_VOL)
+rangeLookback       = input.int(20,    "RangeWidth参照本数", group = GF_VOL)
+atrRangeRatioMin    = input.float(0.06, "fastATR ÷ RangeWidth 最低比", group = GF_VOL)
+useVolCooldown  = input.bool(false, "低ボラ解除後の待機を使う", group = GF_VOL)
+volRecoveryBars = input.int(2,      "低ボラ解除後の待機本数", group = GF_VOL)
+
+// ---- 6.3 Inputs : 環境フィルタ (EMAトレンド) ------------------------------
+var string GF_ENV = "06 · FVG · Trend Env"
+useEnvFilter = input.bool(true, "環境フィルタを使う (重い/OFFで軽量)", group = GF_ENV)
+reqTrend4H  = input.string("上昇", "4H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf4", group = GF_ENV)
+tf4H        = input.timeframe("240", "TF", inline = "tf4", group = GF_ENV)
+reqTrend1H  = input.string("上昇", "1H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf1", group = GF_ENV)
+tf1H        = input.timeframe("60",  "TF", inline = "tf1", group = GF_ENV)
+reqTrend15M = input.string("上昇", "15M 要求", options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf15", group = GF_ENV)
+tf15M       = input.timeframe("15",  "TF", inline = "tf15", group = GF_ENV)
+reqTrend5M  = input.string("OFF", "5M 要求",  options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf5", group = GF_ENV)
+tf5M        = input.timeframe("5",   "TF", inline = "tf5", group = GF_ENV)
+reqTrend1M  = input.string("OFF", "1M 要求",  options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf1m", group = GF_ENV)
+tf1M        = input.timeframe("1",   "TF", inline = "tf1m", group = GF_ENV)
+
+useEma20Above50Up   = input.bool(true, "1. EMA20 > EMA50", group = GF_ENV)
+useEma20SlopeUp     = input.bool(true, "2. EMA20 が上向き", group = GF_ENV)
+useEma50SlopeUp     = input.bool(true, "3. EMA50 が上向き", group = GF_ENV)
+useCloseAboveEma50  = input.bool(true, "4. close > EMA50", group = GF_ENV)
+useCloseAboveEma200 = input.bool(true, "5. close > EMA200", group = GF_ENV)
+useEmaDistanceWideU = input.bool(true, "6. EMA20/50 距離が広い", group = GF_ENV)
+useEmaExpansionU    = input.bool(true, "7. EMA20/50 が拡散中", group = GF_ENV)
+
+useEma20Below50Dn   = input.bool(true, "1. EMA20 < EMA50", group = GF_ENV)
+useEma20SlopeDown   = input.bool(true, "2. EMA20 が下向き", group = GF_ENV)
+useEma50SlopeDown   = input.bool(true, "3. EMA50 が下向き", group = GF_ENV)
+useCloseBelowEma50  = input.bool(true, "4. close < EMA50", group = GF_ENV)
+useCloseBelowEma200 = input.bool(true, "5. close < EMA200", group = GF_ENV)
+useEmaDistanceWideD = input.bool(true, "6. EMA20/50 距離が広い", group = GF_ENV)
+useEmaExpansionD    = input.bool(true, "7. EMA20/50 が拡散中", group = GF_ENV)
+
+useEmaDistanceNarrow = input.bool(true, "1. EMA20/50 距離が近い", group = GF_ENV)
+useEma20SlopeWeak    = input.bool(true, "2. EMA20 の傾きが弱い", group = GF_ENV)
+useEma50SlopeWeak    = input.bool(true, "3. EMA50 の傾きが弱い", group = GF_ENV)
+useEmaCompression    = input.bool(true, "4. EMA20/50 が収束中", group = GF_ENV)
+useEma20CrossCount   = input.bool(true, "5. 価格が EMA20 を一定回数跨ぐ", group = GF_ENV)
+useEma50CrossCount   = input.bool(true, "6. 価格が EMA50 を一定回数跨ぐ", group = GF_ENV)
+useRangeWidthSmall   = input.bool(true, "7. 高値安値幅が小さい", group = GF_ENV)
+
+len20        = input.int(20,   "EMA20 length", group = GF_ENV)
+len50        = input.int(50,   "EMA50 length", group = GF_ENV)
+len200       = input.int(200,  "EMA200 length", group = GF_ENV)
+envAtrLen    = input.int(14,   "環境ATR length", group = GF_ENV)
+slopeBars    = input.int(3,    "EMA 傾き判定本数", group = GF_ENV)
+slopeMinMult = input.float(0.15, "EMA 傾きの最低値 ATR倍率", group = GF_ENV)
+distWideMult = input.float(0.50, "EMA20/50 距離 広い判定 ATR倍率", group = GF_ENV)
+distNarrowMult = input.float(0.25, "EMA20/50 距離 近い判定 ATR倍率", group = GF_ENV)
+convDivBars  = input.int(5,    "収束/拡散 判定本数", group = GF_ENV)
+crossBars    = input.int(20,   "EMA跨ぎ回数 判定本数", group = GF_ENV)
+crossMinCount = input.int(3,   "EMA跨ぎ回数 最低回数", group = GF_ENV)
+rangeBars    = input.int(20,   "レンジ幅 判定本数", group = GF_ENV)
+rangeMult    = input.float(1.5, "レンジ幅 ATR倍率", group = GF_ENV)
+
+tieAsRange          = input.bool(true, "同点時にレンジ扱いする", group = GF_ENV)
+insufficientAsRange = input.bool(true, "条件不足時にレンジ扱いする", group = GF_ENV)
+minScore4H  = input.int(3, "4H 最低必要スコア", group = GF_ENV)
+minScore1H  = input.int(3, "1H 最低必要スコア", group = GF_ENV)
+minScore15M = input.int(3, "15M 最低必要スコア", group = GF_ENV)
+minScore5M  = input.int(3, "5M 最低必要スコア", group = GF_ENV)
+minScore1M  = input.int(3, "1M 最低必要スコア", group = GF_ENV)
+reqMatchCount = input.int(0, "必要一致TF数 (0=有効な全TFが一致)", group = GF_ENV)
+
+// ---- 6.4 Inputs : 日足レジーム --------------------------------------------
+var string GF_DR = "06 · FVG · Daily Regime"
+useDailyRegimeFilter = input.bool(true, "日足レジームフィルターを使う", group = GF_DR)
+dailyRegimeMode = input.string("当日進行中ベース", "日足レジーム判定モード", options = ["前日確定ベース", "当日進行中ベース", "当日確定後分析"], group = GF_DR)
+reqDailyDirection  = input.string("OFF", "日足方向", options = ["OFF", "上昇", "レンジ", "下降"], group = GF_DR)
+reqDailyVolatility = input.string("低ボラ", "日足ボラ", options = ["OFF", "高ボラ", "中ボラ", "低ボラ"], group = GF_DR)
+dailyVolMedianLength  = input.int(10, "日足ボラ中央値期間", minval = 3, group = GF_DR)
+dailyLowVolThreshold  = input.float(100.0, "低ボラ上限", group = GF_DR)
+dailyHighVolThreshold = input.float(100.0, "高ボラ下限", group = GF_DR)
+dailyDirectionBodyRatio = input.float(0.40, "日足方向 最低実体率", group = GF_DR)
+dailyBullCloseLocation  = input.float(0.65, "日足上昇 終値位置下限", group = GF_DR)
+dailyBearCloseLocation  = input.float(0.35, "日足下降 終値位置上限", group = GF_DR)
+dailyInsufficientAsRange = input.bool(true, "日足データ不足時はレンジ扱い", group = GF_DR)
+showDailyVolDebug = input.bool(true, "日足ボラ中央値デバッグ表示", group = GF_DR)
+
+// ---- 6.5 Inputs : Accumulation NoTrade ------------------------------------
+var string GF_ACC = "06 · FVG · Accumulation NoTrade"
+useAccumNoTrade = input.bool(true, "Accumulation NoTradeフィルターを使う", group = GF_ACC)
+useAccumNT5M    = input.bool(true, "5分足Accumを使う",  group = GF_ACC)
+useAccumNT15M   = input.bool(true, "15分足Accumを使う", group = GF_ACC)
+accumNTKeep     = input.int(1, "保持するAccum数", minval = 1, maxval = 10, group = GF_ACC)
+accumNT15Tf     = input.timeframe("15", "15分足TF", group = GF_ACC)
+accumNTRangeLen        = input.int(10,   "Accum判定レンジ本数",  minval = 6,  group = GF_ACC)
+accumNTBaseLen         = input.int(20,   "基準平均本数",         minval = 10, group = GF_ACC)
+accumNTAtrLen          = input.int(14,   "ATR本数",             minval = 1,  group = GF_ACC)
+accumNTMinUpperCloses  = input.int(4,    "上半分の最低終値本数",  minval = 1,  group = GF_ACC)
+accumNTMinLowerCloses  = input.int(4,    "下半分の最低終値本数",  minval = 1,  group = GF_ACC)
+accumNTMaxSameColorRun = input.int(4,    "同色連続の上限",       minval = 1,  group = GF_ACC)
+accumNTAtrMult         = input.float(2.5,  "Accum レンジ幅 / ATR 上限",    minval = 0.5,  step = 0.1,  group = GF_ACC)
+accumNTBarRatioMax     = input.float(0.70, "Accum 平均値幅/基準平均 上限", minval = 0.1,  step = 0.01, group = GF_ACC)
+accumNTDriftMax        = input.float(0.30, "Accum ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = GF_ACC)
+useAccumExitConfirm  = input.bool(false, "Accum離脱後の確認を使う", group = GF_ACC)
+accumExitConfirmBars = input.int(2, "Accum離脱後の待機本数", minval = 1, maxval = 20, group = GF_ACC)
+useAccumBreakDirection  = input.bool(true, "Accum離脱方向フィルターを使う", group = GF_ACC)
+accumBreakDirectionBars = input.int(10, "Accum離脱方向の有効本数", minval = 1, maxval = 100, group = GF_ACC)
+
+// ---- 6.6 Inputs : FVG 環境認識 --------------------------------------------
+var string GF_EFVG = "06 · FVG · FVG Env"
+useEFVGEnv = input.bool(true, "FVG環境認識を使う (重い/OFFで軽量)", group = GF_EFVG)
+efvgCombineMode = input.string("TrendAndFVG", "トレンド環境との結合", options = ["TrendOnly", "FVGOnly", "TrendAndFVG", "TrendOrFVG"], group = GF_EFVG)
+useEFVGDaily = input.bool(false, "日足FVGを使う", group = GF_EFVG)
+useEFVG4H    = input.bool(false, "4時間足FVGを使う", group = GF_EFVG)
+useEFVG1H    = input.bool(false, "1時間足FVGを使う", group = GF_EFVG)
+useEFVG15M   = input.bool(false, "15分足FVGを使う", group = GF_EFVG)
+useEFVG5M    = input.bool(true,  "5分足FVGを使う", group = GF_EFVG)
+useEFVG1M    = input.bool(false, "1分足FVGを使う", group = GF_EFVG)
+efvgDailyTF = input.timeframe("D",   "日足TF", group = GF_EFVG)
+efvg4HTF    = input.timeframe("240", "4時間足TF", group = GF_EFVG)
+efvg1HTF    = input.timeframe("60",  "1時間足TF", group = GF_EFVG)
+efvg15MTF   = input.timeframe("15",  "15分足TF", group = GF_EFVG)
+efvg5MTF    = input.timeframe("5",   "5分足TF", group = GF_EFVG)
+efvg1MTF    = input.timeframe("1",   "1分足TF", group = GF_EFVG)
+efvgHoldDaily = input.int(3,  "日足 状態保持本数",  minval = 1, group = GF_EFVG)
+efvgHold4H    = input.int(6,  "4H 状態保持本数",   minval = 1, group = GF_EFVG)
+efvgHold1H    = input.int(12, "1H 状態保持本数",   minval = 1, group = GF_EFVG)
+efvgHold15M   = input.int(24, "15M 状態保持本数",  minval = 1, group = GF_EFVG)
+efvgHold5M    = input.int(30, "5M 状態保持本数",   minval = 1, group = GF_EFVG)
+efvgHold1M    = input.int(40, "1M 状態保持本数",   minval = 1, group = GF_EFVG)
+efvgMinThick        = input.float(0.0,  "FVG最小厚み (幅/ATR)", step = 0.05, group = GF_EFVG)
+reboundDepthMax     = input.float(0.70, "反発 最大侵入率 (FVG内部・幅比率)", minval = 0.0, step = 0.05, group = GF_EFVG)
+reboundRecoverRatio = input.float(0.10, "反発 回復位置 (FVG幅比率)", minval = 0.0, maxval = 1.0, step = 0.05, group = GF_EFVG)
+efvgIntegrationMode = input.string("WeightedScore", "統合方式", options = ["AllAgree", "MatchCount", "WeightedScore", "HTFPriority"], group = GF_EFVG)
+efvgReqMatch  = input.int(3, "必要一致足数 (MatchCount時)", minval = 1, maxval = 6, group = GF_EFVG)
+efvgWeightD   = input.int(6, "重み 日足",  minval = 0, group = GF_EFVG)
+efvgWeight4H  = input.int(5, "重み 4H",   minval = 0, group = GF_EFVG)
+efvgWeight1H  = input.int(4, "重み 1H",   minval = 0, group = GF_EFVG)
+efvgWeight15M = input.int(3, "重み 15M",  minval = 0, group = GF_EFVG)
+efvgWeight5M  = input.int(2, "重み 5M",   minval = 0, group = GF_EFVG)
+efvgWeight1M  = input.int(1, "重み 1M",   minval = 0, group = GF_EFVG)
+efvgScoreThresh = input.int(1, "スコア閾値 (±・WeightedScore時)", minval = 1, group = GF_EFVG)
+efvgMode4Allow  = input.bool(false, "HTF優先時 下位逆行でもエントリー許可", group = GF_EFVG)
+efvgShowTable = input.bool(true,  "FVG環境テーブルを表示", group = GF_EFVG)
+efvgShowDebug = input.bool(false, "デバッグ(スコア/状態)を表示", group = GF_EFVG)
+
+var string GF_BOS = "06 · FVG · 構造管理 BOS"
+useFvgBosFilter = input.bool(true, "FVG反発にBOS方向フィルターを使う", group = GF_BOS)
+fvgBosLookback  = input.int(5, "BOS Lookback", minval = 2, group = GF_BOS)
+showFvgBosDebug = input.bool(false, "FVG構造BOS デバッグ表示", group = GF_BOS)
+
+// ---- 6.7 包み足判定 --------------------------------------------------------
+bool prevUp = close[1] > open[1]
+bool prevDn = close[1] < open[1]
+bool curUp  = close > open
+bool curDn  = close < open
+
+float curBodyHi  = math.max(open,    close)
+float curBodyLo  = math.min(open,    close)
+float prevBodyHi = math.max(open[1], close[1])
+float prevBodyLo = math.min(open[1], close[1])
+
+bool engulfBody = curBodyHi >= prevBodyHi and curBodyLo <= prevBodyLo
+
+bool bullEngulf = curUp and (not reqOppColor or prevDn) and (strictEngulf ? engulfBody : close >= prevBodyHi)
+bool bearEngulf = curDn and (not reqOppColor or prevUp) and (strictEngulf ? engulfBody : close <= prevBodyLo)
+
+// ---- 6.8 エントリートリガー統合 -------------------------------------------
+f_combineTrig(int cnt, int enabled) =>
+    triggerMode == "Any"  ? cnt >= 1 :
+     triggerMode == "All" ? (enabled > 0 and cnt >= enabled) :
+     cnt >= minTriggerCount
+
+int enabledTrigCount = (useEngulfingTrigger?1:0) + (usePinbarTrigger?1:0) + (useBOSTrigger?1:0) + (useEMARejectTrigger?1:0) + (useFVGTriggerFormation?1:0) + (useStrongCandleTrigger?1:0)
+
+f_calcTriggers() =>
+    float _body      = math.abs(close - open)
+    float _range     = high - low
+    float _upWick    = high - math.max(open, close)
+    float _loWick    = math.min(open, close) - low
+    float _bodyRatio = _range > 0 ? _body / _range : 0.0
+    float _closePos  = _range > 0 ? (close - low) / _range : 0.0
+    bool  _pUp = close[1] > open[1]
+    bool  _pDn = close[1] < open[1]
+    float _cHi = math.max(open,    close)
+    float _cLo = math.min(open,    close)
+    float _pHi = math.max(open[1], close[1])
+    float _pLo = math.min(open[1], close[1])
+    bool  _engBody = _cHi >= _pHi and _cLo <= _pLo
+    float _curBodySize  = math.abs(close - open)
+    float _prevBodySize = math.abs(close[1] - open[1])
+    float _curRangeSize = high - low
+    float _engulfAtr = ta.atr(engulfAtrLen)
+    bool _engulfRatioOk =
+         not useEngulfBodyRatioFilter or
+         (_prevBodySize > 0 and _curBodySize >= _prevBodySize * engulfBodyRatioMin)
+    bool _engulfBodyQualityOk =
+         not useEngulfBodyQualityFilter or
+         (_curRangeSize > 0 and _curBodySize / _curRangeSize >= engulfMinBodyRatio)
+    bool _engulfBodyAtrOk =
+         not useEngulfBodyAtrFilter or
+         _curBodySize >= _engulfAtr * engulfMinBodyATR
+    bool _engulfQualityOk =
+         _engulfRatioOk and
+         _engulfBodyQualityOk and
+         _engulfBodyAtrOk
+    bool _bullEng = useEngulfingTrigger and close > open and (not reqOppColor or _pDn) and (strictEngulf ? _engBody : close >= _pHi) and _engulfQualityOk
+    bool _bearEng = useEngulfingTrigger and close < open and (not reqOppColor or _pUp) and (strictEngulf ? _engBody : close <= _pLo) and _engulfQualityOk
+    float _pinAtr = ta.atr(pinRangeAtrLen)
+    bool _pinBodyRatioOk = not usePinBodyRatioFilter or _bodyRatio <= pinMaxBodyRatio
+    bool _pinRangeOk     = not usePinRangeFilter     or _range >= _pinAtr * pinMinRangeATR
+    bool _bullPin = usePinbarTrigger and _loWick > _body * pinWickBodyMult and _loWick > _upWick * pinOppWickMaxRatio and _closePos >= trigCloseEdgeRatio and _pinBodyRatioOk and _pinRangeOk
+    bool _bearPin = usePinbarTrigger and _upWick > _body * pinWickBodyMult and _upWick > _loWick * pinOppWickMaxRatio and _closePos <= 1.0 - trigCloseEdgeRatio and _pinBodyRatioOk and _pinRangeOk
+    bool _bullBOS = useBOSTrigger and close > ta.highest(high, bosLookback)[1]
+    bool _bearBOS = useBOSTrigger and close < ta.lowest(low, bosLookback)[1]
+    float _ema = ta.ema(close, emaLenTrigger)
+    float _emaSlope    = _ema - _ema[emaRejectSlopeLookback]
+    float _emaSlopeAtr = ta.atr(emaRejectSlopeAtrLen)
+    float _emaSlopeMin = _emaSlopeAtr * emaRejectSlopeMinATR
+    bool _bullEMASlopeOk = not useEMARejectSlopeFilter or _emaSlope >  _emaSlopeMin
+    bool _bearEMASlopeOk = not useEMARejectSlopeFilter or _emaSlope < -_emaSlopeMin
+    bool _bullEMA = useEMARejectTrigger and low <= _ema and close > _ema and close > open and _bullEMASlopeOk
+    bool _bearEMA = useEMARejectTrigger and high >= _ema and close < _ema and close < open and _bearEMASlopeOk
+    bool _bullFVG = useFVGTriggerFormation and low > high[2]
+    bool _bearFVG = useFVGTriggerFormation and high < low[2]
+    bool _bullStr = useStrongCandleTrigger and close > open and _bodyRatio >= strongBodyRatio and _closePos >= trigCloseEdgeRatio
+    bool _bearStr = useStrongCandleTrigger and close < open and _bodyRatio >= strongBodyRatio and _closePos <= 1.0 - trigCloseEdgeRatio
+    int _bullCnt = (_bullEng?1:0)+(_bullPin?1:0)+(_bullBOS?1:0)+(_bullEMA?1:0)+(_bullFVG?1:0)+(_bullStr?1:0)
+    int _bearCnt = (_bearEng?1:0)+(_bearPin?1:0)+(_bearBOS?1:0)+(_bearEMA?1:0)+(_bearFVG?1:0)+(_bearStr?1:0)
+    bool _bullTrigger = f_combineTrig(_bullCnt, enabledTrigCount)
+    bool _bearTrigger = f_combineTrig(_bearCnt, enabledTrigCount)
+    [_bullTrigger, _bearTrigger]
+
+float trBody      = math.abs(close - open)
+float trRange     = high - low
+float trUpWick    = high - math.max(open, close)
+float trLoWick    = math.min(open, close) - low
+float trBodyRatio = trRange > 0 ? trBody / trRange : 0.0
+float trClosePos  = trRange > 0 ? (close - low) / trRange : 0.0
+
+float curBodySize  = math.abs(close - open)
+float prevBodySize = math.abs(close[1] - open[1])
+float curRangeSize = high - low
+float engulfAtr = na
+if useEngulfingTrigger and useEngulfBodyAtrFilter
+    engulfAtr := ta.atr(engulfAtrLen)
+bool engulfRatioOk =
+     not useEngulfBodyRatioFilter or
+     (prevBodySize > 0 and curBodySize >= prevBodySize * engulfBodyRatioMin)
+bool engulfBodyQualityOk =
+     not useEngulfBodyQualityFilter or
+     (curRangeSize > 0 and curBodySize / curRangeSize >= engulfMinBodyRatio)
+bool engulfBodyAtrOk =
+     not useEngulfBodyAtrFilter or
+     curBodySize >= engulfAtr * engulfMinBodyATR
+bool engulfQualityOk =
+     engulfRatioOk and
+     engulfBodyQualityOk and
+     engulfBodyAtrOk
+bool trBullEng = useEngulfingTrigger and bullEngulf and engulfQualityOk
+bool trBearEng = useEngulfingTrigger and bearEngulf and engulfQualityOk
+
+float pinAtr = na
+if usePinbarTrigger and usePinRangeFilter
+    pinAtr := ta.atr(pinRangeAtrLen)
+bool pinBodyRatioOk = not usePinBodyRatioFilter or trBodyRatio <= pinMaxBodyRatio
+bool pinRangeOk     = not usePinRangeFilter     or trRange >= pinAtr * pinMinRangeATR
+bool trBullPin = usePinbarTrigger and trLoWick > trBody * pinWickBodyMult and trLoWick > trUpWick * pinOppWickMaxRatio and trClosePos >= trigCloseEdgeRatio and pinBodyRatioOk and pinRangeOk
+bool trBearPin = usePinbarTrigger and trUpWick > trBody * pinWickBodyMult and trUpWick > trLoWick * pinOppWickMaxRatio and trClosePos <= 1.0 - trigCloseEdgeRatio and pinBodyRatioOk and pinRangeOk
+
+float bosHigh = na
+float bosLow  = na
+if useBOSTrigger
+    bosHigh := ta.highest(high, bosLookback)[1]
+    bosLow  := ta.lowest(low,  bosLookback)[1]
+bool trBullBOS = useBOSTrigger and close > bosHigh
+bool trBearBOS = useBOSTrigger and close < bosLow
+
+float emaTrig     = na
+float emaSlope    = na
+float emaSlopeMin = na
+bool  emaRejectSlopeLongOk  = true
+bool  emaRejectSlopeShortOk = true
+if useEMARejectTrigger
+    emaTrig := ta.ema(close, emaLenTrigger)
+    emaSlope := emaTrig - emaTrig[emaRejectSlopeLookback]
+    float emaSlopeAtr = ta.atr(emaRejectSlopeAtrLen)
+    emaSlopeMin := emaSlopeAtr * emaRejectSlopeMinATR
+    emaRejectSlopeLongOk  := not useEMARejectSlopeFilter or emaSlope >  emaSlopeMin
+    emaRejectSlopeShortOk := not useEMARejectSlopeFilter or emaSlope < -emaSlopeMin
+bool trBullEMA =
+     useEMARejectTrigger and
+     low <= emaTrig and
+     close > emaTrig and
+     close > open and
+     emaRejectSlopeLongOk
+bool trBearEMA =
+     useEMARejectTrigger and
+     high >= emaTrig and
+     close < emaTrig and
+     close < open and
+     emaRejectSlopeShortOk
+
+bool trBullFVG = useFVGTriggerFormation and low > high[2]
+bool trBearFVG = useFVGTriggerFormation and high < low[2]
+
+bool trBullStr = useStrongCandleTrigger and close > open and trBodyRatio >= strongBodyRatio and trClosePos >= trigCloseEdgeRatio
+bool trBearStr = useStrongCandleTrigger and close < open and trBodyRatio >= strongBodyRatio and trClosePos <= 1.0 - trigCloseEdgeRatio
+
+int bullTrigCount = (trBullEng?1:0)+(trBullPin?1:0)+(trBullBOS?1:0)+(trBullEMA?1:0)+(trBullFVG?1:0)+(trBullStr?1:0)
+int bearTrigCount = (trBearEng?1:0)+(trBearPin?1:0)+(trBearBOS?1:0)+(trBearEMA?1:0)+(trBearFVG?1:0)+(trBearStr?1:0)
+
+bool trigBullCur = f_combineTrig(bullTrigCount, enabledTrigCount)
+bool trigBearCur = f_combineTrig(bearTrigCount, enabledTrigCount)
+
+bool oneMinBullTriggered = false
+bool oneMinBearTriggered = false
+if useLowerTFTrigger
+    [bullTriggerArray, bearTriggerArray] = request.security_lower_tf(syminfo.tickerid, triggerTF, f_calcTriggers())
+    if array.size(bullTriggerArray) > 0
+        for i = 0 to array.size(bullTriggerArray) - 1
+            if array.get(bullTriggerArray, i)
+                oneMinBullTriggered := true
+    if array.size(bearTriggerArray) > 0
+        for i = 0 to array.size(bearTriggerArray) - 1
+            if array.get(bearTriggerArray, i)
+                oneMinBearTriggered := true
+else
+    oneMinBullTriggered := trigBullCur
+    oneMinBearTriggered := trigBearCur
+
+bool lowerTFConflict = oneMinBullTriggered and oneMinBearTriggered
+bool trigNoTrade     = useOppositeTriggerNoTrade and lowerTFConflict
+
+bool finalBullTrig = oneMinBullTriggered and not trigNoTrade
+bool finalBearTrig = oneMinBearTriggered and not trigNoTrade
+
+var int lastTrigBar = na
+bool trigFiredNow   = finalBullTrig or finalBearTrig
+bool trigCooldownOk = not useTriggerCooldown or na(lastTrigBar) or (bar_index - lastTrigBar) > triggerCooldownBars
+if trigFiredNow and trigCooldownOk
+    lastTrigBar := bar_index
+
+// ---- 6.9 ボラフィルタ判定 --------------------------------------------------
+bool baseVolOk = true
+if volMode == "ATR"
+    float baseAtr = atrTf == "" ? ta.atr(atrLenBase) : request.security(syminfo.tickerid, atrTf, ta.atr(atrLenBase)[1], lookahead = barmerge.lookahead_off)
+    float atrAvg  = ta.sma(baseAtr, volAvgLen)
+    bool volAbsOk = baseAtr >= minAtrDollar
+    bool volRelOk = atrAvg > 0 and baseAtr >= atrAvg * volRatioMin
+    baseVolOk := not useMinVol or (volModeRel ? volRelOk : volAbsOk)
+else if volMode == "固定値"
+    baseVolOk := (high - low) >= fixedMin
+
+bool fastVolPass = true
+if fastVolMode == "ATR"
+    float fastAtr = ta.atr(fastAtrLen)
+    float bodyAvgFast = ta.sma(math.abs(close - open), bodyAvgLen)
+    float rangeWidthV = ta.highest(high, rangeLookback) - ta.lowest(low, rangeLookback)
+    float atrRangeRatio = rangeWidthV > 0 ? fastAtr / rangeWidthV : 0.0
+    bool fastAtrOk    = fastAtr >= fastAtrMin
+    bool bodyAvgOk    = bodyAvgFast >= bodyAvgMin
+    bool rangeRatioOk = not useRangeRatioFilter or atrRangeRatio >= atrRangeRatioMin
+    fastVolPass := fastAtrOk and bodyAvgOk and rangeRatioOk
+else if fastVolMode == "固定値"
+    float fastRange = ta.highest(high, fastAtrLen) - ta.lowest(low, fastAtrLen)
+    float bodyAvgFast = ta.sma(math.abs(close - open), bodyAvgLen)
+    bool fastRangeOk = fastRange >= fastFixedMin
+    bool bodyAvgOk   = bodyAvgFast >= bodyAvgMin
+    fastVolPass := fastRangeOk and bodyAvgOk
+
+bool volPassRaw = baseVolOk and fastVolPass
+bool volLowNow  = not volPassRaw
+var int volRecoveryStartBar = na
+if volLowNow
+    volRecoveryStartBar := na
+if not volLowNow and nz(volLowNow[1], false)
+    volRecoveryStartBar := bar_index
+bool volRecoveryOk = not useVolCooldown or na(volRecoveryStartBar) or (bar_index - volRecoveryStartBar) >= volRecoveryBars
+
+bool volOk = volPassRaw and volRecoveryOk
+
+// ---- 6.10 環境(トレンド)判定 ----------------------------------------------
+f_envTrend(int minScore) =>
+    ema20  = ta.ema(close, len20)
+    ema50  = ta.ema(close, len50)
+    ema200 = ta.ema(close, len200)
+    atr    = ta.atr(envAtrLen)
+
+    dist     = math.abs(ema20 - ema50)
+    distPrev = dist[convDivBars]
+    slope20  = ema20 - ema20[slopeBars]
+    slope50  = ema50 - ema50[slopeBars]
+
+    cr20 = ta.crossover(close, ema20) or ta.crossunder(close, ema20)
+    cr50 = ta.crossover(close, ema50) or ta.crossunder(close, ema50)
+    cnt20 = math.sum(cr20 ? 1.0 : 0.0, crossBars)
+    cnt50 = math.sum(cr50 ? 1.0 : 0.0, crossBars)
+
+    rangeWidth = ta.highest(high, rangeBars) - ta.lowest(low, rangeBars)
+
+    bullScore = 0
+    bullScore += useEma20Above50Up   and ema20 > ema50                     ? 1 : 0
+    bullScore += useEma20SlopeUp      and slope20 >=  atr * slopeMinMult    ? 1 : 0
+    bullScore += useEma50SlopeUp      and slope50 >=  atr * slopeMinMult    ? 1 : 0
+    bullScore += useCloseAboveEma50   and close > ema50                     ? 1 : 0
+    bullScore += useCloseAboveEma200  and close > ema200                    ? 1 : 0
+    bullScore += useEmaDistanceWideU  and ema20 > ema50 and dist >= atr * distWideMult ? 1 : 0
+    bullScore += useEmaExpansionU     and ema20 > ema50 and dist > distPrev            ? 1 : 0
+
+    bearScore = 0
+    bearScore += useEma20Below50Dn   and ema20 < ema50                     ? 1 : 0
+    bearScore += useEma20SlopeDown    and slope20 <= -atr * slopeMinMult    ? 1 : 0
+    bearScore += useEma50SlopeDown    and slope50 <= -atr * slopeMinMult    ? 1 : 0
+    bearScore += useCloseBelowEma50   and close < ema50                     ? 1 : 0
+    bearScore += useCloseBelowEma200  and close < ema200                    ? 1 : 0
+    bearScore += useEmaDistanceWideD  and ema20 < ema50 and dist >= atr * distWideMult ? 1 : 0
+    bearScore += useEmaExpansionD     and ema20 < ema50 and dist > distPrev            ? 1 : 0
+
+    rangeScore = 0
+    rangeScore += useEmaDistanceNarrow and dist <= atr * distNarrowMult              ? 1 : 0
+    rangeScore += useEma20SlopeWeak     and math.abs(slope20) <= atr * slopeMinMult  ? 1 : 0
+    rangeScore += useEma50SlopeWeak     and math.abs(slope50) <= atr * slopeMinMult  ? 1 : 0
+    rangeScore += useEmaCompression     and dist < distPrev                          ? 1 : 0
+    rangeScore += useEma20CrossCount    and cnt20 >= crossMinCount                    ? 1 : 0
+    rangeScore += useEma50CrossCount    and cnt50 >= crossMinCount                    ? 1 : 0
+    rangeScore += useRangeWidthSmall    and rangeWidth <= atr * rangeMult             ? 1 : 0
+
+    maxScore = math.max(bullScore, math.max(bearScore, rangeScore))
+    isBullTop  = bullScore == maxScore
+    isBearTop  = bearScore == maxScore
+    isRangeTop = rangeScore == maxScore
+    topCount   = (isBullTop ? 1 : 0) + (isBearTop ? 1 : 0) + (isRangeTop ? 1 : 0)
+    tie        = topCount > 1
+
+    int trend = na
+    if maxScore < minScore
+        trend := insufficientAsRange ? 0 : na
+    else if tie
+        trend := tieAsRange ? 0 : na
+    else if isBullTop
+        trend := 1
+    else if isBearTop
+        trend := -1
+    else
+        trend := 0
+    trend
+
+f_reqCode(string s) =>
+    s == "上昇" ? 1 : s == "レンジ" ? 0 : s == "下降" ? -1 : na
+
+f_envTrendConfirmed(int minScore) =>
+    int _t = f_envTrend(minScore)
+    _t[1]
+
+bool allowByEnv  = true
+int  envEnabled = 0
+int  envMatched = 0
+
+if useEnvFilter
+    raw4H  = request.security(syminfo.tickerid, tf4H,  f_envTrendConfirmed(minScore4H),  lookahead = barmerge.lookahead_on)
+    raw1H  = request.security(syminfo.tickerid, tf1H,  f_envTrendConfirmed(minScore1H),  lookahead = barmerge.lookahead_on)
+    raw15M = request.security(syminfo.tickerid, tf15M, f_envTrendConfirmed(minScore15M), lookahead = barmerge.lookahead_on)
+    raw5M  = request.security(syminfo.tickerid, tf5M,  f_envTrend(minScore5M),  lookahead = barmerge.lookahead_off)
+    raw1M  = request.security(syminfo.tickerid, tf1M,  f_envTrend(minScore1M),  lookahead = barmerge.lookahead_off)
+
+    en4H  = reqTrend4H  != "OFF"
+    en1H  = reqTrend1H  != "OFF"
+    en15M = reqTrend15M != "OFF"
+    en5M  = reqTrend5M  != "OFF"
+    en1M  = reqTrend1M  != "OFF"
+
+    m4H  = en4H  and not na(raw4H)  and raw4H  == f_reqCode(reqTrend4H)
+    m1H  = en1H  and not na(raw1H)  and raw1H  == f_reqCode(reqTrend1H)
+    m15M = en15M and not na(raw15M) and raw15M == f_reqCode(reqTrend15M)
+    m5M  = en5M  and not na(raw5M)  and raw5M  == f_reqCode(reqTrend5M)
+    m1M  = en1M  and not na(raw1M)  and raw1M  == f_reqCode(reqTrend1M)
+
+    envEnabled := (en4H ? 1 : 0) + (en1H ? 1 : 0) + (en15M ? 1 : 0) + (en5M ? 1 : 0) + (en1M ? 1 : 0)
+    envMatched := (m4H ? 1 : 0) + (m1H ? 1 : 0) + (m15M ? 1 : 0) + (m5M ? 1 : 0) + (m1M ? 1 : 0)
+
+    int needMatch = reqMatchCount == 0 ? envEnabled : reqMatchCount
+    allowByEnv := envEnabled == 0 or envMatched >= needMatch
+
+// ---- 6.11 FVG 環境認識 本体 -----------------------------------------------
+//  戻り値 [bias, reason, remain, bosState]
+//    bias : 1=Long優勢 / 0=Even / -1=Short優勢
+f_efvgReboundState(int holdBars, float minThickR, float depthMax, float recoverRatio, bool useBos, int bosLen) =>
+    float _ref = ta.atr(14)
+    var float _btop = na
+    var float _bbot = na
+    var int   _bbar = na
+    var bool  _bReb  = false
+    var bool  _bDead = false
+    var float _rtop = na
+    var float _rbot = na
+    var int   _rbar = na
+    var bool  _rReb  = false
+    var bool  _rDead = false
+    var int   _bias   = 0
+    var int   _reason = 0
+    var int   _evbar  = na
+    var int   _bosState = 0
+    bool _fbBull = close > ta.highest(high, bosLen)[1]
+    bool _fbBear = close < ta.lowest(low,  bosLen)[1]
+    if _fbBull
+        _bosState := 1
+    if _fbBear
+        _bosState := -1
+    bool _newBull = _ref > 0 and low > high[2] and ((low - high[2]) / _ref) >= minThickR
+    bool _newBear = _ref > 0 and high < low[2] and ((low[2] - high) / _ref) >= minThickR
+    if _newBull
+        _btop := low
+        _bbot := high[2]
+        _bbar := bar_index
+        _bReb := false
+        _bDead := false
+    if _newBear
+        _rtop := low[2]
+        _rbot := high
+        _rbar := bar_index
+        _rReb := false
+        _rDead := false
+    if not na(_bbot) and close <= _bbot
+        _bDead := true
+    if not na(_rtop) and close >= _rtop
+        _rDead := true
+    float _bWidth = (not na(_btop) and not na(_bbot)) ? _btop - _bbot : na
+    float _rWidth = (not na(_rtop) and not na(_rbot)) ? _rtop - _rbot : na
+    float _bPen = (not na(_bWidth) and _bWidth > 0) ? (_btop - low) / _bWidth : na
+    float _rPen = (not na(_rWidth) and _rWidth > 0) ? (high - _rbot) / _rWidth : na
+    bool _rebLong  = not na(_btop) and not _bReb and not _bDead and bar_index > _bbar and not na(_bWidth) and _bWidth > 0 and low <= _btop and _bPen <= depthMax and close >= _bbot + _bWidth * recoverRatio and close > open
+    bool _rebShort = not na(_rtop) and not _rReb and not _rDead and bar_index > _rbar and not na(_rWidth) and _rWidth > 0 and high >= _rbot and _rPen <= depthMax and close <= _rtop - _rWidth * recoverRatio and close < open
+    bool _longAllowed  = not useBos or _bosState != -1
+    bool _shortAllowed = not useBos or _bosState !=  1
+    if _rebLong and _rebShort
+        _bias := 0
+        _reason := 0
+        _evbar := na
+        _bReb := true
+        _rReb := true
+    else if _rebLong
+        _bReb := true
+        if _longAllowed
+            _bias := 1
+            _reason := 1
+            _evbar := bar_index
+    else if _rebShort
+        _rReb := true
+        if _shortAllowed
+            _bias := -1
+            _reason := -1
+            _evbar := bar_index
+    bool _active = not na(_evbar) and (bar_index - _evbar) < holdBars
+    int _outBias   = _active ? _bias : 0
+    int _outReason = _active ? _reason : 0
+    int _outRemain = _active ? holdBars - (bar_index - _evbar) : 0
+    [_outBias, _outReason, _outRemain, _bosState]
+
+f_efvgReboundConfirmed(int holdBars, float minThickR, float depthMax, float recoverRatio, bool useBos, int bosLen) =>
+    [_b, _r, _rem, _bos] = f_efvgReboundState(holdBars, minThickR, depthMax, recoverRatio, useBos, bosLen)
+    [_b[1], _r[1], _rem[1], _bos[1]]
+
+f_efvgBiasText(int b) =>
+    b == 1 ? "LONG" : b == -1 ? "SHORT" : "EVEN"
+f_efvgReasonText(int c) =>
+    c == 1 ? "Bullish FVG Rebound" : c == -1 ? "Bearish FVG Rebound" : "No Rebound"
+
+int efvgDBias = 0
+int efvgDReason = 0
+int efvgDRem = 0
+int efvgHBias = 0
+int efvgHReason = 0
+int efvgHRem = 0
+int efvgOBias = 0
+int efvgOReason = 0
+int efvgORem = 0
+int efvgMBias = 0
+int efvgMReason = 0
+int efvgMRem = 0
+int efvg5Bias = 0
+int efvg5Reason = 0
+int efvg5Rem = 0
+int efvg1Bias = 0
+int efvg1Reason = 0
+int efvg1Rem = 0
+int efvgDBos = 0
+int efvgHBos = 0
+int efvgOBos = 0
+int efvgMBos = 0
+int efvg5Bos = 0
+int efvg1Bos = 0
+
+if useEFVGEnv and useEFVGDaily
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvgDailyTF, f_efvgReboundConfirmed(efvgHoldDaily, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvgDBias := _b
+    efvgDReason := _r
+    efvgDRem := _rem
+    efvgDBos := _bos
+if useEFVGEnv and useEFVG4H
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg4HTF, f_efvgReboundConfirmed(efvgHold4H, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvgHBias := _b
+    efvgHReason := _r
+    efvgHRem := _rem
+    efvgHBos := _bos
+if useEFVGEnv and useEFVG1H
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg1HTF, f_efvgReboundConfirmed(efvgHold1H, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvgOBias := _b
+    efvgOReason := _r
+    efvgORem := _rem
+    efvgOBos := _bos
+
+// 5M : 15M FVG のゲートにも 5M BOS を使うため、必要なら1回だけ取得する。
+bool need5MState = useEFVGEnv and (useEFVG5M or (useEFVG15M and useFvgBosFilter))
+if need5MState
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg5MTF, f_efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvg5Bias := _b
+    efvg5Reason := _r
+    efvg5Rem := _rem
+    efvg5Bos := _bos
+
+// 15M : FVG判定は15Mのまま。反発ゲートだけ 5M BOS を参照する (このTFだけの特別対応)。
+var int m15GateBias   = 0
+var int m15PrevReason = 0
+var int m15PrevRem    = 0
+if useEFVGEnv and useEFVG15M
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg15MTF, f_efvgReboundConfirmed(efvgHold15M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, false, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvgMBos := _bos
+    bool _m15NewEvent = _r != 0 and (_r != m15PrevReason or _rem > m15PrevRem)
+    if _m15NewEvent
+        bool _allowL = not useFvgBosFilter or efvg5Bos != -1
+        bool _allowS = not useFvgBosFilter or efvg5Bos !=  1
+        m15GateBias := _r == 1 ? (_allowL ? 1 : 0) : _r == -1 ? (_allowS ? -1 : 0) : 0
+    if _b == 0
+        m15GateBias := 0
+    if useFvgBosFilter
+        if m15GateBias == 1 and efvg5Bos == -1
+            m15GateBias := 0
+        if m15GateBias == -1 and efvg5Bos == 1
+            m15GateBias := 0
+    m15PrevReason := _r
+    m15PrevRem := _rem
+    efvgMBias := m15GateBias
+    efvgMReason := m15GateBias != 0 ? _r : 0
+    efvgMRem := m15GateBias != 0 ? _rem : 0
+
+if useEFVGEnv and useEFVG1M
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg1MTF, f_efvgReboundConfirmed(efvgHold1M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvg1Bias := _b
+    efvg1Reason := _r
+    efvg1Rem := _rem
+    efvg1Bos := _bos
+
+int efvgEnabledCount = (useEFVGDaily ? 1 : 0) + (useEFVG4H ? 1 : 0) + (useEFVG1H ? 1 : 0) + (useEFVG15M ? 1 : 0) + (useEFVG5M ? 1 : 0) + (useEFVG1M ? 1 : 0)
+bool efvgAllLong  = efvgEnabledCount > 0 and (not useEFVGDaily or efvgDBias == 1) and (not useEFVG4H or efvgHBias == 1) and (not useEFVG1H or efvgOBias == 1) and (not useEFVG15M or efvgMBias == 1) and (not useEFVG5M or efvg5Bias == 1) and (not useEFVG1M or efvg1Bias == 1)
+bool efvgAllShort = efvgEnabledCount > 0 and (not useEFVGDaily or efvgDBias == -1) and (not useEFVG4H or efvgHBias == -1) and (not useEFVG1H or efvgOBias == -1) and (not useEFVG15M or efvgMBias == -1) and (not useEFVG5M or efvg5Bias == -1) and (not useEFVG1M or efvg1Bias == -1)
+int efvgLongCnt  = (useEFVGDaily and efvgDBias == 1 ? 1 : 0) + (useEFVG4H and efvgHBias == 1 ? 1 : 0) + (useEFVG1H and efvgOBias == 1 ? 1 : 0) + (useEFVG15M and efvgMBias == 1 ? 1 : 0) + (useEFVG5M and efvg5Bias == 1 ? 1 : 0) + (useEFVG1M and efvg1Bias == 1 ? 1 : 0)
+int efvgShortCnt = (useEFVGDaily and efvgDBias == -1 ? 1 : 0) + (useEFVG4H and efvgHBias == -1 ? 1 : 0) + (useEFVG1H and efvgOBias == -1 ? 1 : 0) + (useEFVG15M and efvgMBias == -1 ? 1 : 0) + (useEFVG5M and efvg5Bias == -1 ? 1 : 0) + (useEFVG1M and efvg1Bias == -1 ? 1 : 0)
+bool efvgCntLong  = efvgLongCnt  >= efvgReqMatch
+bool efvgCntShort = efvgShortCnt >= efvgReqMatch
+int efvgScore = (useEFVGDaily ? efvgWeightD * efvgDBias : 0) + (useEFVG4H ? efvgWeight4H * efvgHBias : 0) + (useEFVG1H ? efvgWeight1H * efvgOBias : 0) + (useEFVG15M ? efvgWeight15M * efvgMBias : 0) + (useEFVG5M ? efvgWeight5M * efvg5Bias : 0) + (useEFVG1M ? efvgWeight1M * efvg1Bias : 0)
+bool efvgScoreLong  = efvgScore >= efvgScoreThresh
+bool efvgScoreShort = efvgScore <= -efvgScoreThresh
+int efvgHtfScore = (useEFVGDaily ? efvgWeightD * efvgDBias : 0) + (useEFVG4H ? efvgWeight4H * efvgHBias : 0)
+int efvgHtfDir = efvgHtfScore > 0 ? 1 : efvgHtfScore < 0 ? -1 : 0
+bool efvgLoConflictLong  = (useEFVG1H and efvgOBias == -1) or (useEFVG15M and efvgMBias == -1) or (useEFVG5M and efvg5Bias == -1) or (useEFVG1M and efvg1Bias == -1)
+bool efvgLoConflictShort = (useEFVG1H and efvgOBias == 1) or (useEFVG15M and efvgMBias == 1) or (useEFVG5M and efvg5Bias == 1) or (useEFVG1M and efvg1Bias == 1)
+bool efvgHtfLong  = efvgHtfDir == 1 and (efvgMode4Allow or not efvgLoConflictLong)
+bool efvgHtfShort = efvgHtfDir == -1 and (efvgMode4Allow or not efvgLoConflictShort)
+bool efvgBiasLong =
+     efvgIntegrationMode == "AllAgree"     ? efvgAllLong :
+     efvgIntegrationMode == "MatchCount"   ? efvgCntLong :
+     efvgIntegrationMode == "WeightedScore" ? efvgScoreLong :
+     efvgHtfLong
+bool efvgBiasShort =
+     efvgIntegrationMode == "AllAgree"     ? efvgAllShort :
+     efvgIntegrationMode == "MatchCount"   ? efvgCntShort :
+     efvgIntegrationMode == "WeightedScore" ? efvgScoreShort :
+     efvgHtfShort
+int efvgFinalBias = efvgBiasLong and not efvgBiasShort ? 1 : efvgBiasShort and not efvgBiasLong ? -1 : 0
+
+bool efvgTrendOk = not useEnvFilter or allowByEnv
+bool finalEnvLongOk =
+     not useEFVGEnv ? efvgTrendOk :
+     efvgCombineMode == "TrendOnly"   ? efvgTrendOk :
+     efvgCombineMode == "FVGOnly"     ? efvgBiasLong :
+     efvgCombineMode == "TrendAndFVG" ? (efvgTrendOk and efvgBiasLong) :
+     (efvgTrendOk or efvgBiasLong)
+bool finalEnvShortOk =
+     not useEFVGEnv ? efvgTrendOk :
+     efvgCombineMode == "TrendOnly"   ? efvgTrendOk :
+     efvgCombineMode == "FVGOnly"     ? efvgBiasShort :
+     efvgCombineMode == "TrendAndFVG" ? (efvgTrendOk and efvgBiasShort) :
+     (efvgTrendOk or efvgBiasShort)
+
+// ---- 6.12 日足レジームフィルター ------------------------------------------
+f_dailyDirectionText(int code) =>
+    code == 1 ? "上昇" : code == -1 ? "下降" : code == 0 ? "レンジ" : "-"
+f_dailyVolatilityText(int code) =>
+    code == 1 ? "高ボラ" : code == -1 ? "低ボラ" : code == 0 ? "中ボラ" : "-"
+
+f_drDirCode(float o, float h, float l, float c) =>
+    float _rng = h - l
+    int _code = na
+    if not na(o) and not na(h) and not na(l) and not na(c) and _rng > 0
+        float _body = math.abs(c - o)
+        float _bodyRatio = _body / _rng
+        float _closeLoc = (c - l) / _rng
+        bool _bull = c > o and _bodyRatio >= dailyDirectionBodyRatio and _closeLoc >= dailyBullCloseLocation
+        bool _bear = c < o and _bodyRatio >= dailyDirectionBodyRatio and _closeLoc <= dailyBearCloseLocation
+        _code := _bull and not _bear ? 1 : _bear and not _bull ? -1 : 0
+    _code
+
+f_drDailyTuple() =>
+    [open, high, low, close, open[1], high[1], low[1], close[1]]
+
+bool dailyRegimeLongOk  = true
+bool dailyRegimeShortOk = true
+bool dailyRegimeOk      = true
+int   drDirCodeAdj = na
+int   drVolCodeAdj = na
+float drMedianRange = na
+
+bool drActive = useDailyRegimeFilter
+
+if drActive
+    [_o0, _h0, _l0, _c0, _o1, _h1, _l1, _c1] = request.security(syminfo.tickerid, "D", f_drDailyTuple(), lookahead = barmerge.lookahead_off)
+
+    drMedianRange := request.security(syminfo.tickerid, "D", ta.median(high - low, dailyVolMedianLength)[1], lookahead = barmerge.lookahead_on)
+
+    var float drCurDayOpen = na
+    var float drCurDayHigh = na
+    var float drCurDayLow  = na
+    bool drNewDay = ta.change(time("D")) != 0
+    if drNewDay or na(drCurDayHigh)
+        drCurDayOpen := open
+        drCurDayHigh := high
+        drCurDayLow  := low
+    else
+        drCurDayHigh := math.max(drCurDayHigh, high)
+        drCurDayLow  := math.min(drCurDayLow, low)
+
+    bool drUsePrev  = dailyRegimeMode == "前日確定ベース"
+    bool drUseIntra = dailyRegimeMode == "当日進行中ベース"
+
+    float drO = drUsePrev ? _o1 : drUseIntra ? drCurDayOpen : _o0
+    float drH = drUsePrev ? _h1 : drUseIntra ? drCurDayHigh : _h0
+    float drL = drUsePrev ? _l1 : drUseIntra ? drCurDayLow  : _l0
+    float drC = drUsePrev ? _c1 : drUseIntra ? close        : _c0
+
+    int drDirCode = f_drDirCode(drO, drH, drL, drC)
+    bool drDirInsufficient = na(drDirCode)
+    drDirCodeAdj := drDirInsufficient ? (dailyInsufficientAsRange ? 0 : na) : drDirCode
+
+    int drVolCode = na
+    if not na(drMedianRange)
+        drVolCode := drMedianRange >= dailyHighVolThreshold ? 1 : drMedianRange < dailyLowVolThreshold ? -1 : 0
+    bool drVolInsufficient = na(drVolCode)
+    drVolCodeAdj := drVolInsufficient ? (dailyInsufficientAsRange ? 0 : na) : drVolCode
+
+    string drDirText = f_dailyDirectionText(drDirCodeAdj)
+    string drVolText = f_dailyVolatilityText(drVolCodeAdj)
+    bool directionMatch  = reqDailyDirection  == "OFF" or drDirText == reqDailyDirection
+    bool volatilityMatch = reqDailyVolatility == "OFF" or drVolText == reqDailyVolatility
+    bool drDirBlock = reqDailyDirection  != "OFF" and drDirInsufficient and not dailyInsufficientAsRange
+    bool drVolBlock = reqDailyVolatility != "OFF" and drVolInsufficient and not dailyInsufficientAsRange
+    dailyRegimeOk := not useDailyRegimeFilter or (directionMatch and volatilityMatch and not drDirBlock and not drVolBlock)
+
+bool drTradeConnected = dailyRegimeMode == "前日確定ベース" or dailyRegimeMode == "当日進行中ベース"
+if drTradeConnected
+    dailyRegimeLongOk  := dailyRegimeOk
+    dailyRegimeShortOk := dailyRegimeOk
+
+// ---- 6.13 Accumulation NoTrade フィルター ---------------------------------
+f_accumNTDetect() =>
+    _atr       = ta.atr(accumNTAtrLen)
+    _bodyTop   = math.max(open, close)
+    _bodyBot   = math.min(open, close)
+    _rangeHigh = ta.highest(_bodyTop, accumNTRangeLen)
+    _rangeLow  = ta.lowest(_bodyBot, accumNTRangeLen)
+    _rangeNow  = _rangeHigh - _rangeLow
+    _rangeMid  = (_rangeHigh + _rangeLow) * 0.5
+    int _upperCloses = 0
+    int _lowerCloses = 0
+    int _bullRun = 0
+    int _bearRun = 0
+    int _maxBullRun = 0
+    int _maxBearRun = 0
+    for i = 0 to accumNTRangeLen - 1
+        _upperCloses += close[i] > _rangeMid ? 1 : 0
+        _lowerCloses += close[i] < _rangeMid ? 1 : 0
+        bool _isBull = close[i] > open[i]
+        bool _isBear = close[i] < open[i]
+        if _isBull
+            _bullRun += 1
+            _bearRun := 0
+        else if _isBear
+            _bearRun += 1
+            _bullRun := 0
+        else
+            _bullRun := 0
+            _bearRun := 0
+        _maxBullRun := math.max(_maxBullRun, _bullRun)
+        _maxBearRun := math.max(_maxBearRun, _bearRun)
+    _startMid = (open[accumNTRangeLen - 1] + close[accumNTRangeLen - 1]) * 0.5
+    _endMid   = (open + close) * 0.5
+    _drift    = math.abs(_endMid - _startMid)
+    _condAtr    = _atr > 0 and _rangeNow <= _atr * accumNTAtrMult
+    _rangeShort = ta.highest(_bodyTop, accumNTRangeLen) - ta.lowest(_bodyBot, accumNTRangeLen)
+    _rangeBase  = ta.highest(_bodyTop, accumNTBaseLen)  - ta.lowest(_bodyBot, accumNTBaseLen)
+    _condBar      = _rangeBase > 0 and _rangeShort <= _rangeBase * accumNTBarRatioMax
+    _condBalance  = _upperCloses >= accumNTMinUpperCloses and _lowerCloses >= accumNTMinLowerCloses
+    _condDrift    = _rangeNow > 0 and (_drift / _rangeNow) <= accumNTDriftMax
+    _condColorRun = _maxBullRun <= accumNTMaxSameColorRun and _maxBearRun <= accumNTMaxSameColorRun
+    bool _isAccum = _condAtr and _condBar and _condBalance and _condDrift and _condColorRun
+    float _hi = ta.highest(math.max(open, close), accumNTRangeLen)
+    float _lo = ta.lowest(math.min(open, close),  accumNTRangeLen)
+    [_isAccum, _hi, _lo]
+
+f_accumNT15() =>
+    [_isA, _hi, _lo] = f_accumNTDetect()
+    var float _bxHi = na
+    var float _bxLo = na
+    var int   _bxSt = na
+    bool _start = _isA and not nz(_isA[1], false)
+    if _start
+        _bxHi := _hi
+        _bxLo := _lo
+        _bxSt := bar_index
+    if _isA
+        float _bt = math.max(open, close)
+        float _bb = math.min(open, close)
+        _bxHi := math.max(nz(_bxHi, _bt), _bt)
+        _bxLo := math.min(nz(_bxLo, _bb), _bb)
+    [_isA, _bxHi, _bxLo, _bxSt]
+
+f_accumNT15Confirmed() =>
+    [_isA, _bxHi, _bxLo, _bxSt] = f_accumNT15()
+    [_bxHi[1], _bxLo[1], _bxSt[1]]
+
+var array<float> accNT5Hi  = array.new_float()
+var array<float> accNT5Lo  = array.new_float()
+var array<int>   accNT5St  = array.new_int()
+var array<float> accNT15Hi = array.new_float()
+var array<float> accNT15Lo = array.new_float()
+var array<int>   accNT15St = array.new_int()
+var float accNT5BoxHi = na
+var float accNT5BoxLo = na
+var int   accNT5BoxSt = na
+var bool  accNT5Prev  = false
+var int   accNT15LastSt = na
+
+bool insideAccum5M  = false
+bool insideAccum15M = false
+
+if useAccumNoTrade and useAccumNT5M
+    [isA5, hi5, lo5] = f_accumNTDetect()
+    bool start5 = isA5 and not accNT5Prev
+    accNT5Prev := isA5
+    if start5
+        accNT5BoxHi := hi5
+        accNT5BoxLo := lo5
+        accNT5BoxSt := bar_index
+        array.push(accNT5Hi, accNT5BoxHi)
+        array.push(accNT5Lo, accNT5BoxLo)
+        array.push(accNT5St, accNT5BoxSt)
+        while array.size(accNT5St) > accumNTKeep
+            array.shift(accNT5Hi)
+            array.shift(accNT5Lo)
+            array.shift(accNT5St)
+    if isA5
+        float _bt = math.max(open, close)
+        float _bb = math.min(open, close)
+        accNT5BoxHi := math.max(nz(accNT5BoxHi, _bt), _bt)
+        accNT5BoxLo := math.min(nz(accNT5BoxLo, _bb), _bb)
+        if array.size(accNT5St) > 0
+            array.set(accNT5Hi, array.size(accNT5Hi) - 1, accNT5BoxHi)
+            array.set(accNT5Lo, array.size(accNT5Lo) - 1, accNT5BoxLo)
+    if array.size(accNT5St) > 0
+        for i = 0 to array.size(accNT5St) - 1
+            if close >= array.get(accNT5Lo, i) and close <= array.get(accNT5Hi, i)
+                insideAccum5M := true
+
+if useAccumNoTrade and useAccumNT15M
+    [bxHi15, bxLo15, bxSt15] = request.security(syminfo.tickerid, accumNT15Tf, f_accumNT15Confirmed(), lookahead = barmerge.lookahead_on)
+    bool new15Bar = ta.change(time(accumNT15Tf)) != 0
+    if new15Bar
+        if not na(bxSt15) and bxSt15 != accNT15LastSt
+            array.push(accNT15Hi, bxHi15)
+            array.push(accNT15Lo, bxLo15)
+            array.push(accNT15St, bxSt15)
+            accNT15LastSt := bxSt15
+            while array.size(accNT15St) > accumNTKeep
+                array.shift(accNT15Hi)
+                array.shift(accNT15Lo)
+                array.shift(accNT15St)
+        else if array.size(accNT15St) > 0 and not na(bxSt15) and bxSt15 == accNT15LastSt
+            array.set(accNT15Hi, array.size(accNT15Hi) - 1, bxHi15)
+            array.set(accNT15Lo, array.size(accNT15Lo) - 1, bxLo15)
+    if array.size(accNT15St) > 0
+        for i = 0 to array.size(accNT15St) - 1
+            if close >= array.get(accNT15Lo, i) and close <= array.get(accNT15Hi, i)
+                insideAccum15M := true
+
+bool blockedByAccum = useAccumNoTrade and ((useAccumNT5M and insideAccum5M) or (useAccumNT15M and insideAccum15M))
+
+var bool waitingAccumExitConfirm  = false
+var int  accumOutsideConfirmCount = 0
+
+bool exitedAccumThisBar =
+     useAccumNoTrade and
+     nz(blockedByAccum[1], false) and
+     not blockedByAccum
+
+if not useAccumNoTrade or not useAccumExitConfirm
+    waitingAccumExitConfirm  := false
+    accumOutsideConfirmCount := 0
+else
+    if blockedByAccum
+        waitingAccumExitConfirm  := false
+        accumOutsideConfirmCount := 0
+    else if exitedAccumThisBar
+        waitingAccumExitConfirm  := true
+        accumOutsideConfirmCount := 0
+    else if waitingAccumExitConfirm
+        accumOutsideConfirmCount += 1
+    if waitingAccumExitConfirm and accumOutsideConfirmCount >= accumExitConfirmBars
+        waitingAccumExitConfirm := false
+
+bool blockedByAccumExitWait =
+     useAccumNoTrade and
+     useAccumExitConfirm and
+     waitingAccumExitConfirm
+
+var int  accumBreakDirection         = 0
+var int  accumBreakDirectionStartBar = na
+var bool accumBreakDirectionActive   = false
+
+if not useAccumNoTrade or not useAccumBreakDirection
+    accumBreakDirection         := 0
+    accumBreakDirectionStartBar := na
+    accumBreakDirectionActive   := false
+else
+    if blockedByAccum
+        accumBreakDirection         := 0
+        accumBreakDirectionStartBar := na
+        accumBreakDirectionActive   := false
+    else if exitedAccumThisBar
+        bool brokeUp   = false
+        bool brokeDown = false
+        if useAccumNT5M and array.size(accNT5St) > 0
+            for i = 0 to array.size(accNT5St) - 1
+                float _bh = array.get(accNT5Hi, i)
+                float _bl = array.get(accNT5Lo, i)
+                bool _wasInside = close[1] >= _bl and close[1] <= _bh
+                if _wasInside and close > _bh
+                    brokeUp := true
+                if _wasInside and close < _bl
+                    brokeDown := true
+        if useAccumNT15M and array.size(accNT15St) > 0
+            for i = 0 to array.size(accNT15St) - 1
+                float _bh = array.get(accNT15Hi, i)
+                float _bl = array.get(accNT15Lo, i)
+                bool _wasInside = close[1] >= _bl and close[1] <= _bh
+                if _wasInside and close > _bh
+                    brokeUp := true
+                if _wasInside and close < _bl
+                    brokeDown := true
+        if brokeUp and not brokeDown
+            accumBreakDirection         := 1
+            accumBreakDirectionStartBar := bar_index
+            accumBreakDirectionActive   := true
+        else if brokeDown and not brokeUp
+            accumBreakDirection         := -1
+            accumBreakDirectionStartBar := bar_index
+            accumBreakDirectionActive   := true
+        else
+            accumBreakDirection         := 0
+            accumBreakDirectionStartBar := na
+            accumBreakDirectionActive   := false
+    if accumBreakDirectionActive and not na(accumBreakDirectionStartBar) and (bar_index - accumBreakDirectionStartBar > accumBreakDirectionBars)
+        accumBreakDirection         := 0
+        accumBreakDirectionStartBar := na
+        accumBreakDirectionActive   := false
+
+bool accumLongDirectionOk =
+     not useAccumNoTrade or
+     not useAccumBreakDirection or
+     not accumBreakDirectionActive or
+     accumBreakDirection == 1
+bool accumShortDirectionOk =
+     not useAccumNoTrade or
+     not useAccumBreakDirection or
+     not accumBreakDirectionActive or
+     accumBreakDirection == -1
+
+// ---- 6.14 FVG Entry Signal (このモジュールの唯一の出力) -------------------
+//  ★ SL / TP / Qty / 発注はここでは一切扱わない。
+//    「エントリー条件が成立した」という情報だけを Section 08 へ渡す。
+bool longMajorOk =
+     dailyRegimeLongOk and
+     sessionOk and
+     allowByNewsTime and
+     finalEnvLongOk and
+     volOk and
+     not blockedByAccum and
+     not blockedByAccumExitWait and
+     accumLongDirectionOk
+bool shortMajorOk =
+     dailyRegimeShortOk and
+     sessionOk and
+     allowByNewsTime and
+     finalEnvShortOk and
+     volOk and
+     not blockedByAccum and
+     not blockedByAccumExitWait and
+     accumShortDirectionOk
+
+bool baseLongCondition  = barstate.isconfirmed and useLong  and longMajorOk
+bool baseShortCondition = barstate.isconfirmed and useShort and shortMajorOk
+
+bool noTriggerMode = enabledTrigCount == 0
+
+// Armed管理 (トリガーOFF時: 主要条件の立ち上がりで1回だけ)
+var bool longArmed  = true
+var bool shortArmed = true
+if not longMajorOk
+    longArmed := true
+if not shortMajorOk
+    shortArmed := true
+
+bool noTriggerLongSignal  = noTriggerMode and baseLongCondition  and longArmed
+bool noTriggerShortSignal = noTriggerMode and baseShortCondition and shortArmed
+
+bool triggerLongSignal  = not noTriggerMode and baseLongCondition  and finalBullTrig and trigCooldownOk
+bool triggerShortSignal = not noTriggerMode and baseShortCondition and finalBearTrig and trigCooldownOk
+
+bool fvgLongRaw  = noTriggerMode ? noTriggerLongSignal  : triggerLongSignal
+bool fvgShortRaw = noTriggerMode ? noTriggerShortSignal : triggerShortSignal
+
+// 同一機会でロング/ショートが同時成立した場合はローソク色で優先方向を決定 (従来どおり)
+bool fvgLongSignal  = fvgLongRaw
+bool fvgShortSignal = fvgShortRaw
+if fvgLongSignal and fvgShortSignal
+    if close >= open
+        fvgShortSignal := false
+    else
+        fvgLongSignal := false
+
+float fvgEntryPrice = close
+
+// ============================================================================
+// 07. FUTURE ENTRY MODULES
+// ----------------------------------------------------------------------------
+//  新しいEntry Logicを追加するときに触るのはこのセクション (と Section 08 の1行) だけ。
+//  Zone Engine / Structural SL / TP / Trade Engine は一切変更不要。
+//
+//  追加手順は3つだけ:
+//    ① input を書く            (この下に 5〜20行)
+//    ② Entry Signal を判定する (この下に 5〜40行)
+//    ③ logicId を指定して Section 08 で f_submitSignal() へ渡す (1〜2行)
+//
+//  ---- テンプレート (EMA Reject の例) ----------------------------------------
+//  string LOGIC_EMA = "EMA_REJECT"
+//  var string GE = "07 · EMA Reject"
+//  useEmaLogic   = input.bool(false, "EMA Reject Logic を使う", group = GE)
+//  emaRejLen     = input.int(20, "EMA Length", group = GE)
+//  //  ② Entry Signal (SL/TP/発注は書かない)
+//  float _emaRej = ta.ema(close, emaRejLen)
+//  bool emaLongSignal  = useEmaLogic and barstate.isconfirmed and sessionOk and
+//                        low <= _emaRej and close > _emaRej and close > open
+//  bool emaShortSignal = useEmaLogic and barstate.isconfirmed and sessionOk and
+//                        high >= _emaRej and close < _emaRej and close < open
+//  float emaEntryPrice = close
+//  //  ③ Section 08 へ:
+//  //     f_submitSignal(LOGIC_EMA, emaLongSignal,  1, emaEntryPrice)
+//  //     f_submitSignal(LOGIC_EMA, emaShortSignal, -1, emaEntryPrice)
+//  ---------------------------------------------------------------------------
+//  ・logicId は Entry ID の接頭辞になる (EMA_REJECT_L_7 など) ので、
+//    List of Trades からどのLogicのトレードか判別できる。
+//  ・maxOpenPerLogic は logicId 単位で独立に効くため、
+//    他Logicが保有中でも新Logicはエントリーできる。
+//  ・各Logicが独自の再アーム条件 (Armed / Cooldown) を持ちたい場合は、
+//    そのLogicのSignal判定内で完結させること (Trade Engineは関与しない)。
+// ============================================================================
+
+// ============================================================================
+// 08. ORDER EXECUTION
+// ----------------------------------------------------------------------------
+//  各Entry Module の Signal を共通Trade Engineへ渡すだけ。
+//  ここには SL / TP / RR / Qty の計算を一切書かない。
+//
+//  同じ5分足で複数Logicが成立しても、それぞれ独立したEntry IDで発注されるため
+//  完全に別トレードとして扱われる (勝敗も別)。
+// ============================================================================
+
+// ---- 8.1 FVG Logic ---------------------------------------------------------
+string fvgEidLong  = f_submitSignal(LOGIC_FVG, fvgLongSignal,   1, fvgEntryPrice)
+string fvgEidShort = f_submitSignal(LOGIC_FVG, fvgShortSignal, -1, fvgEntryPrice)
+
+// FVG Logic 固有の再アーム解除 (トリガーOFFモード時のみ・実際に発注できた時だけ)
+if noTriggerMode and fvgEidLong != ""
+    longArmed := false
+if noTriggerMode and fvgEidShort != ""
+    shortArmed := false
+
+// ---- 8.2 Future Logic (追加例) ---------------------------------------------
+//  f_submitSignal(LOGIC_EMA, emaLongSignal,  1, emaEntryPrice)
+//  f_submitSignal(LOGIC_EMA, emaShortSignal, -1, emaEntryPrice)
+
+// ---- 8.3 Break Even 更新 (共通・Entry ID単位) ------------------------------
+f_updateBreakEven()
+
+// ============================================================================
+// 09. DISPLAY / DEBUG
+// ----------------------------------------------------------------------------
+//  表示は全てON/OFF可能。ロジックには一切影響しない。
+// ============================================================================
+
+// ---- 9.1 Zone 描画 ---------------------------------------------------------
+var array<box>   gBoxes  = array.new<box>()
+var array<label> gLabels = array.new<label>()
+
+f_clearDrawings() =>
+    while array.size(gBoxes) > 0
+        box.delete(array.pop(gBoxes))
+    while array.size(gLabels) > 0
+        label.delete(array.pop(gLabels))
+
+f_zoneColor(int st) =>
+    st == ST_SUPPORT ? colSupport : st == ST_RESIST ? colResistance : st == ST_ACTIVE ? colActive : colBroken
+
+f_zoneTransp(int strength) =>
+    strength == SR_VSTRONG ? trVStrong : strength == SR_STRONG ? trStrong : strength == SR_MEDIUM ? trMedium : trWeak
+
+f_drawOrder(int maxN) =>
+    array<int> out = array.new_int()
+    int n = array.size(gLiveMap)
+    if n > 0
+        array<float> d = array.new_float()
+        for i = 0 to n - 1
+            array.push(d, math.abs(array.get(gLiveMap, i).center - close))
+        array<int> ord = array.sort_indices(d, order.ascending)
+        int lim = int(math.min(n, maxN))
+        for k = 0 to lim - 1
+            array.push(out, array.get(ord, k))
+    out
+
+f_nearestIdx(bool wantSupport, int maxN) =>
+    array<int>   pick = array.new_int()
+    array<float> dist = array.new_float()
+    int n = array.size(gLiveMap)
+    if n > 0
+        for i = 0 to n - 1
+            Zone z = array.get(gLiveMap, i)
+            bool ok = wantSupport ? z.top < close : z.bottom > close
+            if ok
+                array.push(pick, i)
+                array.push(dist, wantSupport ? close - z.top : z.bottom - close)
+    array<int> out = array.new_int()
+    if array.size(dist) > 0
+        array<int> ord = array.sort_indices(dist, order.ascending)
+        int lim = int(math.min(array.size(ord), maxN))
+        for k = 0 to lim - 1
+            array.push(out, array.get(pick, array.get(ord, k)))
+    out
+
+if barstate.islast
+    f_clearDrawings()
+    if showZones and array.size(gLiveMap) > 0
+        array<int> ord = f_drawOrder(maxZonesDraw)
+        if array.size(ord) > 0
+            for k = 0 to array.size(ord) - 1
+                Zone  z  = array.get(gLiveMap, array.get(ord, k))
+                color bc = f_zoneColor(z.state)
+                int   tr = f_zoneTransp(z.strength)
+                box b = box.new(
+                     left         = bar_index - zoneLeftBars,
+                     top          = z.top,
+                     right        = bar_index + zoneRightBars,
+                     bottom       = z.bottom,
+                     bgcolor      = color.new(bc, tr),
+                     border_color = color.new(bc, math.max(tr - 30, 0)),
+                     border_width = z.strength >= SR_STRONG ? 2 : 1,
+                     border_style = z.state == ST_BROKEN ? line.style_dashed : line.style_solid,
+                     xloc         = xloc.bar_index)
+                array.push(gBoxes, b)
+
+                if showLabels
+                    string txt = f_stateName(z.state) + " | " + f_num(z.score, "#.#") + " | " + f_strengthName(z.strength)
+                    txt := txt + " | HTF: " + (z.hasHtf ? z.htfSources : "NO")
+                    txt := txt + " | React " + str.tostring(z.reactionCnt)
+                    if z.flipped
+                        txt := txt + " | FLIP"
+                    if showDetailLbl
+                        txt := txt + "\n" + z.sources
+                    label lb = label.new(
+                         x         = bar_index + zoneRightBars,
+                         y         = z.top,
+                         text      = txt,
+                         xloc      = xloc.bar_index,
+                         style     = label.style_label_left,
+                         color     = color.new(bc, 20),
+                         textcolor = color.white,
+                         size      = size.small)
+                    array.push(gLabels, lb)
+
+// ---- 9.2 MA Source の可視化 -----------------------------------------------
+plot(showMaLines and useMaSource ? ma1Val : na, "MA #1 (1M)", color = color.new(color.aqua, 25), linewidth = 1)
+plot(showMaLines and useMaSource ? ma2Val : na, "MA #2 (1M)", color = color.new(color.fuchsia, 25), linewidth = 1)
+
+// ---- 9.3 Zone Debug Table --------------------------------------------------
+f_tablePos(string s) =>
+    s == "Top Left"      ? position.top_left :
+     s == "Bottom Right" ? position.bottom_right :
+     s == "Bottom Left"  ? position.bottom_left :
+     s == "Middle Right" ? position.middle_right : position.top_right
+
+f_textSize(string s) =>
+    s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
+
+var table dbg = table.new(f_tablePos(dbgPosStr), 7, dbgNearestN * 2 + 9,
+     border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 40))
+
+f_cell(int col, int row, string txt, color txtCol, color bgCol) =>
+    table.cell(dbg, col, row, txt, text_color = txtCol, bgcolor = bgCol,
+         text_size = f_textSize(dbgTextSize), text_halign = text.align_left)
+
+f_zoneRow(int row, string tag, int zi, color tagCol) =>
+    Zone z = array.get(gLiveMap, zi)
+    float d = z.center - close
+    f_cell(0, row, tag,                                   tagCol,      color.new(tagCol, 88))
+    f_cell(1, row, f_num(z.center, "#.##"),               color.white, color.new(tagCol, 92))
+    f_cell(2, row, f_num(z.score, "#.#") + " · R" + str.tostring(z.reactionCnt), color.white, color.new(tagCol, 92))
+    f_cell(3, row, f_strengthName(z.strength) + " · HTF " + (z.hasHtf ? z.htfSources : "NO"), color.white, color.new(tagCol, 92))
+    f_cell(4, row, f_stateFull(z.state) + (z.flipped ? " (Flip)" : ""), color.white, color.new(tagCol, 92))
+    f_cell(5, row, f_num(math.abs(d), "#.#"),             color.white, color.new(tagCol, 92))
+    f_cell(6, row, z.sources,                             color.white, color.new(tagCol, 92))
+
+if barstate.islast and showDebugTable
+    table.clear(dbg, 0, 0, 6, dbgNearestN * 2 + 8)
+    color hdr = color.new(color.gray, 70)
+    f_cell(0, 0, "Zone",     color.white, hdr)
+    f_cell(1, 0, "Center",   color.white, hdr)
+    f_cell(2, 0, "Score",    color.white, hdr)
+    f_cell(3, 0, "Strength", color.white, hdr)
+    f_cell(4, 0, "State",    color.white, hdr)
+    f_cell(5, 0, "Distance", color.white, hdr)
+    f_cell(6, 0, "Sources",  color.white, hdr)
+
+    array<int> resIdx = f_nearestIdx(false, dbgNearestN)
+    array<int> supIdx = f_nearestIdx(true,  dbgNearestN)
+
+    int row = 1
+    if array.size(resIdx) > 0
+        for k = array.size(resIdx) - 1 to 0
+            f_zoneRow(row, "RES " + str.tostring(k + 1), array.get(resIdx, k), colResistance)
+            row += 1
+    if array.size(resIdx) < dbgNearestN
+        for k = array.size(resIdx) to dbgNearestN - 1
+            f_cell(0, row, "RES -", color.gray, color.new(color.gray, 90))
+            row += 1
+
+    f_cell(0, row, "PRICE", color.black, color.new(color.yellow, 20))
+    f_cell(1, row, f_num(close, "#.##"), color.black, color.new(color.yellow, 40))
+    f_cell(2, row, "Zones: " + str.tostring(array.size(gLiveMap)), color.black, color.new(color.yellow, 60))
+    f_cell(3, row, "Raw: " + str.tostring(array.size(gRaw)),       color.black, color.new(color.yellow, 60))
+    f_cell(4, row, "MA1 " + f_arrow(ma1Dir) + " MA2 " + f_arrow(ma2Dir), color.black, color.new(color.yellow, 60))
+    f_cell(5, row, "MAcl +" + f_num(maClusterBonus, "#.#"),        color.black, color.new(color.yellow, 60))
+    f_cell(6, row, "Day H/L " + f_num(dayHigh, "#.#") + " / " + f_num(dayLow, "#.#"), color.black, color.new(color.yellow, 60))
+    row += 1
+
+    if array.size(supIdx) > 0
+        for k = 0 to array.size(supIdx) - 1
+            f_zoneRow(row, "SUP " + str.tostring(k + 1), array.get(supIdx, k), colSupport)
+            row += 1
+    if array.size(supIdx) < dbgNearestN
+        for k = array.size(supIdx) to dbgNearestN - 1
+            f_cell(0, row, "SUP -", color.gray, color.new(color.gray, 90))
+            row += 1
+
+    // ---- 直近TradePlan (Logic / Dir / Entry / SL / TP / RR / TP Type) -----
+    if showTradeDebug
+        color pc = color.new(color.blue, 70)
+        f_cell(0, row, "PLAN", color.white, pc)
+        f_cell(1, row, array.get(gLastPlan, 0), color.white, pc)
+        for c = 2 to 6
+            f_cell(c, row, "", color.white, pc)
+        table.merge_cells(dbg, 1, row, 6, row)
+        row += 1
+        f_cell(0, row, "STATUS", color.white, pc)
+        f_cell(1, row, array.get(gLastPlan, 1) + "  |  Open " + str.tostring(strategy.opentrades), color.white, pc)
+        for c = 2 to 6
+            f_cell(c, row, "", color.white, pc)
+        table.merge_cells(dbg, 1, row, 6, row)
+        row += 1
+
+    // ---- 環境警告 ---------------------------------------------------------
+    string warn = ""
+    if timeframe.in_seconds() < timeframe.in_seconds(breakTf)
+        warn := warn + "Chart TF < Break TF. "
+    if timeframe.in_seconds() < timeframe.in_seconds(hzTf1)
+        warn := warn + "Chart TF < Horizontal TF#1. "
+    if timeframe.in_seconds() != timeframe.in_seconds("5")
+        warn := warn + "本Strategyは5分足チャート前提。"
+    if warn != ""
+        f_cell(0, row, "WARN", color.white, color.new(color.orange, 40))
+        f_cell(1, row, warn, color.white, color.new(color.orange, 60))
+        for c = 2 to 6
+            f_cell(c, row, "", color.white, color.new(color.orange, 60))
+        table.merge_cells(dbg, 1, row, 6, row)
+
+// ---- 9.4 FVG 環境認識 テーブル --------------------------------------------
+f_efvgBiasColor(int b) =>
+    b == 1 ? color.new(color.green, 0) : b == -1 ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+var table efvgTbl = na
+if efvgShowTable
+    if na(efvgTbl)
+        efvgTbl := table.new(position.middle_left, 4, 8, border_width = 1)
+    if barstate.islast
+        table.cell(efvgTbl, 0, 0, "TF",   text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(efvgTbl, 1, 0, "FVG",  text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(efvgTbl, 2, 0, "理由", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(efvgTbl, 3, 0, "残",   text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(efvgTbl, 0, 1, "D", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 1, 1, useEFVGDaily ? f_efvgBiasText(efvgDBias) : "-", text_color = color.white, bgcolor = useEFVGDaily ? f_efvgBiasColor(efvgDBias) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(efvgTbl, 2, 1, useEFVGDaily ? f_efvgReasonText(efvgDReason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 3, 1, useEFVGDaily ? str.tostring(efvgDRem) : "-", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 0, 2, "4H", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 1, 2, useEFVG4H ? f_efvgBiasText(efvgHBias) : "-", text_color = color.white, bgcolor = useEFVG4H ? f_efvgBiasColor(efvgHBias) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(efvgTbl, 2, 2, useEFVG4H ? f_efvgReasonText(efvgHReason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 3, 2, useEFVG4H ? str.tostring(efvgHRem) : "-", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 0, 3, "1H", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 1, 3, useEFVG1H ? f_efvgBiasText(efvgOBias) : "-", text_color = color.white, bgcolor = useEFVG1H ? f_efvgBiasColor(efvgOBias) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(efvgTbl, 2, 3, useEFVG1H ? f_efvgReasonText(efvgOReason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 3, 3, useEFVG1H ? str.tostring(efvgORem) : "-", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 0, 4, "15M", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 1, 4, useEFVG15M ? f_efvgBiasText(efvgMBias) : "-", text_color = color.white, bgcolor = useEFVG15M ? f_efvgBiasColor(efvgMBias) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(efvgTbl, 2, 4, useEFVG15M ? f_efvgReasonText(efvgMReason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 3, 4, useEFVG15M ? str.tostring(efvgMRem) : "-", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 0, 5, "5M", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 1, 5, useEFVG5M ? f_efvgBiasText(efvg5Bias) : "-", text_color = color.white, bgcolor = useEFVG5M ? f_efvgBiasColor(efvg5Bias) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(efvgTbl, 2, 5, useEFVG5M ? f_efvgReasonText(efvg5Reason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 3, 5, useEFVG5M ? str.tostring(efvg5Rem) : "-", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 0, 6, "1M", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 1, 6, useEFVG1M ? f_efvgBiasText(efvg1Bias) : "-", text_color = color.white, bgcolor = useEFVG1M ? f_efvgBiasColor(efvg1Bias) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(efvgTbl, 2, 6, useEFVG1M ? f_efvgReasonText(efvg1Reason) : "-", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 3, 6, useEFVG1M ? str.tostring(efvg1Rem) : "-", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 0, 7, "FINAL FVG BIAS: " + f_efvgBiasText(efvgFinalBias), text_color = color.white, bgcolor = f_efvgBiasColor(efvgFinalBias), text_size = size.small)
+        table.cell(efvgTbl, 1, 7, efvgShowDebug ? ("Score:" + str.tostring(efvgScore)) : "", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 2, 7, efvgShowDebug ? (efvgCombineMode + "/" + efvgIntegrationMode) : "", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 3, 7, efvgShowDebug ? ("Trend:" + (efvgTrendOk ? "OK" : "NG")) : "", text_color = color.white, text_size = size.small)
+
+// ---- 9.5 日足ボラ中央値 デバッグ ------------------------------------------
+var table dailyVolTbl = na
+if showDailyVolDebug and useDailyRegimeFilter
+    if na(dailyVolTbl)
+        dailyVolTbl := table.new(position.top_left, 2, 3, border_width = 1)
+    if barstate.islast
+        color _hb = color.new(color.black, 0)
+        table.cell(dailyVolTbl, 0, 0, "日足ボラ (中央値" + str.tostring(dailyVolMedianLength) + "本)", text_color = color.white, bgcolor = _hb, text_size = size.small)
+        table.cell(dailyVolTbl, 1, 0, "", text_color = color.white, bgcolor = _hb, text_size = size.small)
+        table.cell(dailyVolTbl, 0, 1, "中央値", text_color = color.white, text_size = size.small)
+        table.cell(dailyVolTbl, 1, 1, (na(drMedianRange) ? "-" : str.tostring(drMedianRange, "#.#")) + "$", text_color = color.white, text_size = size.small)
+        table.cell(dailyVolTbl, 0, 2, "判定", text_color = color.white, text_size = size.small)
+        table.cell(dailyVolTbl, 1, 2, f_dailyVolatilityText(drVolCodeAdj), text_color = color.white, bgcolor = f_efvgBiasColor(nz(drVolCodeAdj, 0)), text_size = size.small)
+
+// ---- 9.6 FVG構造管理 BOS デバッグ -----------------------------------------
+f_fvgBosText(int s) =>
+    s == 1 ? "Bull" : s == -1 ? "Bear" : "Neutral"
+var table fvgBosTbl = na
+if showFvgBosDebug and useEFVGEnv
+    if na(fvgBosTbl)
+        fvgBosTbl := table.new(position.bottom_right, 2, 7, border_width = 1)
+    if barstate.islast
+        color _hb = color.new(color.black, 0)
+        table.cell(fvgBosTbl, 0, 0, "FVG構造BOS", text_color = color.white, bgcolor = _hb, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 0, useFvgBosFilter ? "ON" : "OFF", text_color = color.white, bgcolor = _hb, text_size = size.small)
+        table.cell(fvgBosTbl, 0, 1, "D",   text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 1, useEFVGDaily ? f_fvgBosText(efvgDBos) : "-", text_color = color.white, bgcolor = useEFVGDaily ? f_efvgBiasColor(efvgDBos) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(fvgBosTbl, 0, 2, "4H",  text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 2, useEFVG4H ? f_fvgBosText(efvgHBos) : "-", text_color = color.white, bgcolor = useEFVG4H ? f_efvgBiasColor(efvgHBos) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(fvgBosTbl, 0, 3, "1H",  text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 3, useEFVG1H ? f_fvgBosText(efvgOBos) : "-", text_color = color.white, bgcolor = useEFVG1H ? f_efvgBiasColor(efvgOBos) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(fvgBosTbl, 0, 4, "15M→5M", text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 4, useEFVG15M ? (useFvgBosFilter ? f_fvgBosText(efvg5Bos) : "OFF") : "-", text_color = color.white, bgcolor = (useEFVG15M and useFvgBosFilter) ? f_efvgBiasColor(efvg5Bos) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(fvgBosTbl, 0, 5, "5M",  text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 5, useEFVG5M ? f_fvgBosText(efvg5Bos) : "-", text_color = color.white, bgcolor = useEFVG5M ? f_efvgBiasColor(efvg5Bos) : color.new(color.gray, 60), text_size = size.small)
+        table.cell(fvgBosTbl, 0, 6, "1M",  text_color = color.white, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 6, useEFVG1M ? f_fvgBosText(efvg1Bos) : "-", text_color = color.white, bgcolor = useEFVG1M ? f_efvgBiasColor(efvg1Bos) : color.new(color.gray, 60), text_size = size.small)
