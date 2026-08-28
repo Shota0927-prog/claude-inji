@@ -411,12 +411,39 @@ int zoneCountNow = zn.update(eng, cfg, feed)
 // ============================================================================
 // 03. RISK / QTY
 // ----------------------------------------------------------------------------
-//  Qty は必ず Structural SL距離 から計算する。Long / Short 共通。
-//     Risk Amount ÷ Structural SL距離 ÷ pointvalue → qtyStep 単位に切り下げ
-//  目標: SL到達時の想定損失額 ≒ Risk Capital
+//  Qty は必ず Structural SL距離 から計算する。Long / Short 共通。構造は不変:
+//     Risk Capital ÷ Structural SL距離 ÷ syminfo.pointvalue → qtyStep単位に切り下げ
+//
+//  ★★ 単位についての重要な注意 ★★
+//   TradingView の qty は「銘柄の取引単位」であって、FXブローカーの "lot" ではない。
+//   両者が一致する保証はないので、qtyStep = 0.01 を 0.01 lot と読み替えてはいけない。
+//
+//   TradingView の損益計算式:
+//       損益 = (決済価格 - Entry価格) × qty × syminfo.pointvalue
+//   したがって SL到達時の想定損失は
+//       Expected SL Loss = SL距離 × qty × syminfo.pointvalue
+//   であり、qty を上式で決めれば Expected SL Loss ≒ Risk Capital になる。
+//   これは pointvalue が幾つであっても成り立つ (式に pointvalue が入っているため)。
+//
+//   XAUUSD (CFD/FX系) では通常 syminfo.pointvalue = 1 で、qty の単位は「1オンス」。
+//   一般的なFXの 1 lot = 100オンス なので qty 1.00 ≒ 0.01 lot 相当になる。
+//   一方 GC等の先物では pointvalue = 100 のことがあり、その場合 qty の意味が変わる。
+//   → 実際の値は Debug の "QTY" 行 (PV = syminfo.pointvalue) で必ず確認すること。
+//     qtyStep も銘柄に合わせて調整する (pointvalueが大きい銘柄では 0.01 刻みは粗い)。
+//
+//  ★ 想定損失と実損失がズレる要因 (コード側では解消できないもの) ★
+//   ・Qtyは「シグナル足のclose (= plan.entry)」を基準に計算するが、成行の約定は
+//     次足始値。窓を開けると実際のSL距離が変わるため損失もズレる。
+//   ・qtyStep への切り下げ分だけ、実損失は Risk Capital をわずかに下回る。
+//   ・手数料 / スリッページ / SL突破は Risk Capital に含まれていない。
+//   ・account_currency と銘柄の通貨が異なる場合、TradingViewが換算するためズレる。
+//   → Debug の "QTY" 行に、直近SL決済の実損益 (LastSL) も表示して突合できるようにした。
 // ============================================================================
+f_baseCapital() =>
+    useCompound ? strategy.equity : strategy.initial_capital
+
 f_riskCapital() =>
-    (useCompound ? strategy.equity : strategy.initial_capital) * riskPct / 100.0
+    f_baseCapital() * riskPct / 100.0
 
 f_qty(float riskPerUnit) =>
     float raw = riskPerUnit > 0 ? f_riskCapital() / (riskPerUnit * syminfo.pointvalue) : 0.0
@@ -424,6 +451,10 @@ f_qty(float riskPerUnit) =>
     // 浮動小数の誤差で 0.30000000000004 のような値にならないよう丸めておく。
     float q = qtyStep > 0 ? math.floor(raw / qtyStep) * qtyStep : raw
     math.round(q, 8)
+
+// SL到達時の想定損失額 (TradingViewの損益式と同じ形)
+f_expectedLoss(float qty, float slDist) =>
+    nz(qty) * nz(slDist) * syminfo.pointvalue
 
 // ============================================================================
 // 04. COMMON TRADE ENGINE
@@ -442,7 +473,7 @@ f_qty(float riskPerUnit) =>
 var array<int> gSeq = array.new_int(1, 0)
 var map<string, float> gTradeTP = map.new<string, float>()
 var map<string, bool>  gTradeBE = map.new<string, bool>()
-var array<string> gLastPlan = array.new_string(2, "-")
+var array<string> gLastPlan = array.new_string(3, "-")
 
 f_openCountForLogic(string logicId) =>
     int c = 0
@@ -463,9 +494,25 @@ f_planText(string logicId, zn.TradePlan p) =>
      " | " + p.tpType +
      " | Obst " + str.tostring(p.obstacles)
 
+// Qty検証用のテキスト (Risk Capital / SL Distance / Calculated Qty / Expected SL Loss)
+f_qtyText(zn.TradePlan p) =>
+    float rc = f_riskCapital()
+    float q  = f_qty(p.risk)
+    float el = f_expectedLoss(q, p.risk)
+    float bc = f_baseCapital()
+    "RiskCap " + f_num(rc, "#.##") + " (" + f_num(riskPct, "#.##") + "%)" +
+     " | SLdist " + f_num(p.risk, "#.##") +
+     " | Qty " + f_num(q, "#.####") +
+     " | ExpLoss " + f_num(el, "#.##") +
+     " (" + f_num(bc > 0 ? el / bc * 100.0 : na, "#.###") + "% of capital)" +
+     " | PV " + str.tostring(syminfo.pointvalue) + " " + syminfo.currency +
+     " / Acct " + strategy.account_currency +
+     (syminfo.currency != strategy.account_currency ? " ※通貨換算あり(損失額がズレる)" : "")
+
 f_recordPlan(string logicId, zn.TradePlan p, string extra) =>
     array.set(gLastPlan, 0, f_planText(logicId, p))
     array.set(gLastPlan, 1, p.status + " · " + p.reason + (extra == "" ? "" : " · " + extra))
+    array.set(gLastPlan, 2, f_qtyText(p))
     true
 
 // ★ ここが唯一 strategy.entry / strategy.exit を呼ぶ場所。
@@ -511,7 +558,8 @@ f_executeTrade(string logicId, int dir, float entryPrice, zn.TradePlan p) =>
                     ltxt := ltxt + "\nSL " + f_num(p.sl, "#.##")
                     ltxt := ltxt + "\nTP " + f_num(p.tp, "#.##")
                     ltxt := ltxt + "\nRR " + f_num(p.rr, "#.##")
-                    ltxt := ltxt + "\nQty " + str.tostring(qty)
+                    ltxt := ltxt + "\nQty " + f_num(qty, "#.####")
+                    ltxt := ltxt + "\nLoss~ " + f_num(f_expectedLoss(qty, p.risk), "#.##")
                     ltxt := ltxt + "\n" + p.tpType
                     label.new(bar_index, dir > 0 ? low : high, text = ltxt,
                          style = dir > 0 ? label.style_label_up : label.style_label_down,
@@ -1723,6 +1771,41 @@ if noTriggerMode and fvgEidShort != ""
 //  Entry ID 単位で管理。既定OFF。
 //  ONの場合も TP は Entry時点で固定した値 (gTradeTP) をそのまま再指定する。
 // ============================================================================
+
+// ---- 8.1 決済済みTradeのクリーンアップ ------------------------------------
+//  gTradeTP / gTradeBE に終了済みTradeのEntry IDが永久に残らないようにする。
+//  毎バー全closedtradesを走査せず、lastClosedCount からの差分 (このバーで新しく
+//  終了したTradeだけ) を処理する。長期バックテスト・多数Logicでも負荷が増えない。
+//  ※ BE OFF時はMapが空なので remove は走らない (LastSL集計だけ行う)。
+var int   gLastClosedCount = 0
+var float gLastSlLoss      = na   // 直近のSL決済の実損益 (Qty検証用)
+var float gLastSlQty       = na
+
+f_isOpenEntry(string eid) =>
+    bool found = false
+    if strategy.opentrades > 0
+        for j = 0 to strategy.opentrades - 1
+            if strategy.opentrades.entry_id(j) == eid
+                found := true
+                break
+    found
+
+if strategy.closedtrades > gLastClosedCount
+    for i = gLastClosedCount to strategy.closedtrades - 1
+        string ceid = strategy.closedtrades.entry_id(i)
+        // Qty検証用: 直近のSL決済の実損益を控えておく
+        if strategy.closedtrades.exit_comment(i) == "SL"
+            gLastSlLoss := strategy.closedtrades.profit(i)
+            gLastSlQty  := strategy.closedtrades.size(i)
+        // Map掃除 (部分決済で同一Entry IDがまだ建っている場合は残す)
+        if useBreakEven and not f_isOpenEntry(ceid)
+            if gTradeTP.contains(ceid)
+                gTradeTP.remove(ceid)
+            if gTradeBE.contains(ceid)
+                gTradeBE.remove(ceid)
+    gLastClosedCount := strategy.closedtrades
+
+// ---- 8.2 建値移動 ----------------------------------------------------------
 if useBreakEven and strategy.opentrades > 0
     for i = 0 to strategy.opentrades - 1
         string eid = strategy.opentrades.entry_id(i)
@@ -1889,9 +1972,22 @@ if barstate.islast and showDebugTable
         table.merge_cells(dbg, 1, row, 6, row)
         row += 1
         f_cell(0, row, "STATUS", color.white, pc)
-        f_cell(1, row, array.get(gLastPlan, 1) + "  |  Open " + str.tostring(strategy.opentrades), color.white, pc)
+        f_cell(1, row, array.get(gLastPlan, 1) + "  |  Open " + str.tostring(strategy.opentrades) +
+             "  |  Map " + str.tostring(gTradeTP.size()) + "/" + str.tostring(gTradeBE.size()) +
+             "  |  Closed " + str.tostring(strategy.closedtrades), color.white, pc)
         for c = 2 to 6
             f_cell(c, row, "", color.white, pc)
+        table.merge_cells(dbg, 1, row, 6, row)
+        row += 1
+        // Qty検証行: Risk Capital / SL Distance / Calculated Qty / Expected SL Loss
+        //   LastSL = 実際にSLで決済された直近トレードの損益。ExpLoss と突き合わせる。
+        color qc = color.new(color.purple, 70)
+        f_cell(0, row, "QTY", color.white, qc)
+        f_cell(1, row, array.get(gLastPlan, 2) +
+             "  ||  LastSL P/L " + f_num(gLastSlLoss, "#.##") + " (qty " + f_num(gLastSlQty, "#.####") + ")",
+             color.white, qc)
+        for c = 2 to 6
+            f_cell(c, row, "", color.white, qc)
         table.merge_cells(dbg, 1, row, 6, row)
         row += 1
 
