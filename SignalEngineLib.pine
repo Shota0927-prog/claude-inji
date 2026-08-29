@@ -15,13 +15,15 @@
 //
 //  セクション構成:
 //    01. Types            (FvgCfg / FvgFeed / FvgEngine / FvgSignal /
-//                          Fvg15Engine / Fvg15Signal)
+//                          Fvg15Engine / Fvg15Signal /
+//                          FvgAbsEngine / FvgAbsSignal)
 //    02. Factories
 //    03. FVG · 外部足コンテキストで評価する計算式 (Mainがrequest.securityで包む)
 //    04. FVG · チャート足コンテキストの内部ヘルパー
 //    05. FVG · updateFvg  (本体)             ← 既存5M FVG Logic
 //    06. FVG15 · updateFvg15 (15M FVG反発 → 5M BOS 順序確認)
-//    07. Future Logics    (EMA / MACD / Stoch / BB / Intermarket ...)
+//    07. FVGABS · updateFvgAbs (FVG吸収 → BOS / Abs5・Abs15 / Longのみ)
+//    08. Future Logics    (EMA / MACD / Stoch / BB / Intermarket ...)
 //
 //  ★ Logic は Engine / Cfg / Feed のインスタンスごとに完全独立 ★
 //    FVG15 Logic は「環境認識・Filter の計算」だけ updateFvg() を再利用し、
@@ -317,6 +319,10 @@ export type FvgSignal
     bool  volOk             = false
     bool  blockedByAccum    = false
     bool  blockedByExitWait = false
+    // ★ 追加: Accum離脱方向Filterの結果。計算式は既存のまま、値を外へ出すだけ。
+    //   FVG吸収系列がこの結果を再利用し、Accum判定を二重に計算しないようにする。
+    bool  accumLongDirOk    = true
+    bool  accumShortDirOk   = true
     bool  trigBull          = false
     bool  trigBear          = false
     bool  trigNoTrade       = false
@@ -359,6 +365,35 @@ export type Fvg15Signal
     bool  bosOkShort  = false
     int   rebReason   = 0
 
+// ---- FvgAbsEngine : FVG吸収系列 (Abs5 / Abs15) の永続状態 -----------------
+//  ★ 反発系列 (FvgEngine / Fvg15Engine) とは別インスタンス。
+//    armed / consumed / eventId / BOS待機 を反発側と一切共有しない。
+//    「FVG反発Event ≠ FVG吸収Event」なので、反発でEntryしても吸収は消費されない。
+//  各TFが持つのは4つだけ:
+//    evXId       … 最後に認識した吸収eventId (吸収成立バー)
+//    evXTime     … その eventId をチャート(5分足)上で最初に認識したバーの time
+//                  → 「これ以降のBOS」だけを有効にするための基準。同一バーも有効。
+//    evXConsumed … 実際にEntryできた eventId (Mainが consumeFvgAbs で通知)
+//    bosXTime    … 直近 Bullish BOS の成立時刻 (BOS待機状態はこの時刻比較で表現)
+export type FvgAbsEngine
+    int ev5Id       = na
+    int ev5Time     = na
+    int ev5Consumed = na
+    int bos1mTime   = na
+    int ev15Id       = na
+    int ev15Time     = na
+    int ev15Consumed = na
+    int bos5mTime    = na
+
+// ---- FvgAbsSignal : updateFvgAbs の戻り値 (Longのみ) ----------------------
+export type FvgAbsSignal
+    bool  long5      = false
+    bool  long15     = false
+    float entryPrice = na
+    // 以下は Debug 表示用
+    bool  bos5Ok     = false
+    bool  bos15Ok    = false
+
 // ============================================================================
 // 02. FACTORIES
 // ============================================================================
@@ -378,6 +413,11 @@ export newFvgEngine() =>
 // @returns   Fvg15Engine
 export newFvg15Engine() =>
     Fvg15Engine.new()
+
+// @function  FVG吸収系列 (Abs5 / Abs15) の永続状態を作る。Main Strategyで var 宣言すること。
+// @returns   FvgAbsEngine
+export newFvgAbsEngine() =>
+    FvgAbsEngine.new()
 
 // ============================================================================
 // 03. FVG · 外部足コンテキストで評価する計算式
@@ -619,6 +659,86 @@ export efvgRebound15Pack(int holdBars, float minThickR, float depthMax, float re
      bool useBos, simple int bosLen) =>
     [_b, _r, _rem, _bos] = efvgReboundState(holdBars, minThickR, depthMax, recoverRatio, useBos, bosLen)
     [_b[1], _r[1], _rem[1], _bos[1], time[1]]
+
+// @function  FVG吸収の状態を返す (追加元 FVG Env Signal V の f_efvgState と同一定義)。
+//   反発 (efvgReboundState) とは別物。反対方向FVGを終値で完全に抜けたイベントを検出する。
+//     Long吸収  : Bearish FVG (top=low[2]) を close が上抜け → Bearish FVGを上方向へ吸収
+//     Short吸収 : Bullish FVG (bot=high[2]) を close が下抜け
+//   品質条件は追加元と同一 (吸収方向と同じローソク色 / 最低実体率 / 終値端寄せ)。
+//   同一FVGにつき吸収は1回だけ (_rabs / _babs)。新しいFVG形成でリセットされる。
+// @param holdBars   吸収bias の保持本数
+// @param minThickR  FVG最小厚み (幅 / ATR14)
+// @param absBodyMin 吸収 実体最小比率
+// @param absEdge    吸収 終値端寄せ比率
+// @param useColor   吸収方向と同じローソク色を要求するか
+// @param useBody    最低実体率を要求するか
+// @param useEdge    終値端寄せを要求するか
+// @returns  [bias, eventId]  bias: 1=Long吸収保持中 / -1=Short / 0=なし
+//           eventId: 吸収成立バー。新しい吸収成立時のみ変化し、hold中は不変
+//           → 「hold保持中」と「新規吸収イベント」を呼び出し側が区別できる。
+export efvgAbsState(int holdBars, float minThickR, float absBodyMin, float absEdge,
+     bool useColor, bool useBody, bool useEdge) =>
+    float _ref = ta.atr(14)
+    var float _btop = na
+    var float _bbot = na
+    var int   _bbar = na
+    var bool  _babs = false
+    var float _rtop = na
+    var float _rbot = na
+    var int   _rbar = na
+    var bool  _rabs = false
+    var int   _bias  = 0
+    var int   _evbar = na
+    float _body = math.abs(close - open)
+    float _rng  = high - low
+    bool _newBull = _ref > 0 and low > high[2] and ((low - high[2]) / _ref) >= minThickR
+    bool _newBear = _ref > 0 and high < low[2] and ((low[2] - high) / _ref) >= minThickR
+    if _newBull
+        _btop := low
+        _bbot := high[2]
+        _bbar := bar_index
+        _babs := false
+    if _newBear
+        _rtop := low[2]
+        _rbot := high
+        _rbar := bar_index
+        _rabs := false
+    bool _bodyStrong  = _rng > 0 and (_body / _rng) >= absBodyMin
+    bool _closeNearHi = _rng > 0 and (close - low) / _rng >= absEdge
+    bool _closeNearLo = _rng > 0 and (high - close) / _rng >= absEdge
+    bool _absLong  = not na(_rtop) and not _rabs and bar_index > _rbar and close > _rtop and (not useColor or close > open) and (not useBody or _bodyStrong) and (not useEdge or _closeNearHi)
+    bool _absShort = not na(_btop) and not _babs and bar_index > _bbar and close < _bbot and (not useColor or close < open) and (not useBody or _bodyStrong) and (not useEdge or _closeNearLo)
+    if _absLong and _absShort
+        _bias  := 0
+        _evbar := na
+        _rabs  := true
+        _babs  := true
+    else if _absLong
+        _bias  := 1
+        _evbar := bar_index
+        _rabs  := true
+    else if _absShort
+        _bias  := -1
+        _evbar := bar_index
+        _babs  := true
+    bool _active = not na(_evbar) and (bar_index - _evbar) < holdBars
+    int _outBias = _active ? _bias : 0
+    [_outBias, _evbar]
+
+// @function  efvgAbsState の確定済み1本前を返す非リペイント版。
+//   Main が request.security(..., lookahead_on) で包む。
+export efvgAbsConfirmed(int holdBars, float minThickR, float absBodyMin, float absEdge,
+     bool useColor, bool useBody, bool useEdge) =>
+    [_b, _ev] = efvgAbsState(holdBars, minThickR, absBodyMin, absEdge, useColor, useBody, useEdge)
+    [_b[1], _ev[1]]
+
+// @function  下位足コンテキストでの Bullish BOS 判定。
+//   Main が request.security_lower_tf(..., 1分足) で包み、その5分足に含まれる
+//   確定1分足ぶんの配列として受け取る。定義は既存BOSと同一 (close > highest[1])。
+// @param lookback  BOS Lookback
+// @returns  bool
+export bosBullLowerTf(simple int lookback) =>
+    close > ta.highest(high, lookback)[1]
 
 export efvgBiasText(int b) =>
     b == 1 ? "LONG" : b == -1 ? "SHORT" : "EVEN"
@@ -1276,6 +1396,8 @@ export updateFvg(FvgEngine e, FvgCfg c, FvgTrigCfg tc, FvgAccCfg ac, FvgFeed f,
          volOk             = volOk,
          blockedByAccum    = blockedByAccum,
          blockedByExitWait = blockedByAccumExitWait,
+         accumLongDirOk    = accumLongDirectionOk,
+         accumShortDirOk   = accumShortDirectionOk,
          trigBull          = finalBullTrig,
          trigBear          = finalBearTrig,
          trigNoTrade       = trigNoTrade,
@@ -1379,7 +1501,101 @@ export consumeFvg15(Fvg15Engine e, int dir) =>
     true
 
 // ============================================================================
-// 07. FUTURE LOGICS
+// 07. FVGABS · updateFvgAbs (FVG吸収 → BOS 順序確認 / Longのみ)
+// ----------------------------------------------------------------------------
+//  FVG吸収系列は反発系列とは完全に別の系列。
+//    Abs5  : 5M Bearish FVG を上方向へ吸収 → 1M Bullish BOS(10)  → Long
+//    Abs15 : 15M Bearish FVG を上方向へ吸収 → 5M Bullish BOS(3)  → Long
+//
+//  この関数がやるのは「吸収イベント管理 + BOS順序管理 + consumed管理」だけ。
+//    ・環境認識 / Session / News / ボラ / Accum は Main が envLongOk にまとめて渡す
+//      (Main は既存 updateFvg の出力 volOk / blockedByAccum / accumLongDirOk を
+//       再利用するので、これらの重い判定を吸収系列用に再計算しない)。
+//    ・SL / TP / RR / Qty / BE は一切扱わない (Main の共通Trade Engineの担当)。
+//    ・Shortは実装しない。enableShort がONでも吸収系列からShortは出ない。
+//
+//  ★ 状態は反発系列 (FvgEngine / Fvg15Engine) と共有しない。
+//    反発でEntryしても吸収イベントは消費されない。
+// ============================================================================
+
+// @function  FVG吸収系列を1バー分評価する。
+// @param e             FvgAbsEngine (Mainで var 宣言した永続状態)
+// @param envLongOk     環境条件がすべて成立しているか (Mainが既存出力から合成)
+// @param entryPrice    Entry価格 (通常 close)
+// @param abs5Bias      5M 吸収bias  ( 1=Long吸収 保持中)
+// @param abs5Event     5M 吸収eventId
+// @param abs15Bias     15M 吸収bias
+// @param abs15Event    15M 吸収eventId
+// @param bos1mBull     この5分足に含まれる確定1分足の Bullish BOS(10) 配列
+// @param use5          Abs5 Logic を使うか
+// @param use15         Abs15 Logic を使うか
+// @param bos5Lookback  5M BOS Lookback (Abs15用)
+// @returns  FvgAbsSignal
+export updateFvgAbs(FvgAbsEngine e, bool envLongOk, float entryPrice,
+     int abs5Bias, int abs5Event, int abs15Bias, int abs15Event,
+     array<bool> bos1mBull, bool use5, bool use15, simple int bos5Lookback) =>
+    // ---- (1) 新規吸収イベント検出 -----------------------------------------
+    //   eventId (吸収成立バー) が変わったときだけ「新しいイベント」。
+    //   hold保持中は eventId が変わらないので、何度も新規イベントにはならない。
+    //   evXTime = その eventId をチャート(5分足)上で最初に認識したバーの time。
+    if not na(abs5Event) and (na(e.ev5Id) or abs5Event != e.ev5Id)
+        e.ev5Id   := abs5Event
+        e.ev5Time := time
+    if not na(abs15Event) and (na(e.ev15Id) or abs15Event != e.ev15Id)
+        e.ev15Id   := abs15Event
+        e.ev15Time := time
+
+    // ---- (2) Bullish BOS の成立時刻を記録 ----------------------------------
+    //   1M BOS : この5分足に含まれる確定1分足のどれかで成立していれば
+    //     「この5分足で成立」とみなす (1分単位の厳密順序は要求しない仕様)。
+    bool bos1mNow = false
+    if array.size(bos1mBull) > 0
+        for i = 0 to array.size(bos1mBull) - 1
+            if array.get(bos1mBull, i)
+                bos1mNow := true
+    if bos1mNow
+        e.bos1mTime := time
+    //   5M BOS : チャート足。ta.* は毎バー評価してから確定足だけで記録する
+    //     (条件分岐の中で ta.* を呼ばない)。
+    float bos5Hi = ta.highest(high, bos5Lookback)[1]
+    if barstate.isconfirmed and close > bos5Hi
+        e.bos5mTime := time
+
+    // ---- (3) 順序判定 ------------------------------------------------------
+    //   「吸収イベントを認識したバー以降 (同一バーを含む)」のBOSだけ有効。
+    //   吸収より前に出ていた古いBOSは time が小さいため自動的に除外される。
+    bool bos5Ok  = not na(e.bos1mTime) and not na(e.ev5Time)  and e.bos1mTime >= e.ev5Time
+    bool bos15Ok = not na(e.bos5mTime) and not na(e.ev15Time) and e.bos5mTime >= e.ev15Time
+
+    // ---- (4) Long Signal (Longのみ) ---------------------------------------
+    //   abs*Bias == 1 : Bearish FVG を上方向へ吸収したイベントが保持中。
+    //   consumed : 実際にEntryできた eventId だけを Main が consumeFvgAbs で通知する。
+    //     → Signalを返しただけでは消費しない。Zone Plan FAIL なら次のチャンスを待てる。
+    bool unused5  = na(e.ev5Consumed)  or e.ev5Consumed  != e.ev5Id
+    bool unused15 = na(e.ev15Consumed) or e.ev15Consumed != e.ev15Id
+    bool l5 = use5 and envLongOk and barstate.isconfirmed and abs5Bias == 1 and
+     not na(e.ev5Id) and unused5 and bos5Ok
+    bool l15 = use15 and envLongOk and barstate.isconfirmed and abs15Bias == 1 and
+     not na(e.ev15Id) and unused15 and bos15Ok
+
+    FvgAbsSignal.new(long5 = l5, long15 = l15, entryPrice = entryPrice,
+         bos5Ok = bos5Ok, bos15Ok = bos15Ok)
+
+// @function  吸収イベントを「消費済み」にする。
+//   Main が「実際に発注できた (Entry IDが空でない)」ときだけ呼ぶこと。
+//   Signalが出ただけ / Zone TradePlan FAIL では呼んではいけない。
+// @param e      FvgAbsEngine
+// @param which  5 = Abs5 / 15 = Abs15
+// @returns      常に true
+export consumeFvgAbs(FvgAbsEngine e, int which) =>
+    if which == 5
+        e.ev5Consumed := e.ev5Id
+    else if which == 15
+        e.ev15Consumed := e.ev15Id
+    true
+
+// ============================================================================
+// 08. FUTURE LOGICS
 // ----------------------------------------------------------------------------
 //  新しいEntry Logicはここへ同じ形で追加する。Logicごとに
 //    <Name>Cfg / <Name>Feed / <Name>Engine / update<Name>()
