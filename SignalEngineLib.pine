@@ -14,12 +14,19 @@
 //  役割は「エントリー条件が成立したか」まで。
 //
 //  セクション構成:
-//    01. Types            (FvgCfg / FvgFeed / FvgEngine / FvgSignal)
+//    01. Types            (FvgCfg / FvgFeed / FvgEngine / FvgSignal /
+//                          Fvg15Engine / Fvg15Signal)
 //    02. Factories
 //    03. FVG · 外部足コンテキストで評価する計算式 (Mainがrequest.securityで包む)
 //    04. FVG · チャート足コンテキストの内部ヘルパー
-//    05. FVG · updateFvg  (本体)
-//    06. Future Logics    (EMA / MACD / Stoch / BB / Intermarket ...)
+//    05. FVG · updateFvg  (本体)             ← 既存5M FVG Logic
+//    06. FVG15 · updateFvg15 (15M FVG反発 → 5M BOS 順序確認)
+//    07. Future Logics    (EMA / MACD / Stoch / BB / Intermarket ...)
+//
+//  ★ Logic は Engine / Cfg / Feed のインスタンスごとに完全独立 ★
+//    FVG15 Logic は「環境認識・Filter の計算」だけ updateFvg() を再利用し、
+//    Engine (Armed / Cooldown / Accum / Daily) は別インスタンスを使う。
+//    Armed / Consumed / BOS待ち などの Logic固有state は一切共有しない。
 //
 // ----------------------------------------------------------------------------
 //  ★ Pine Library の制約と対応 (ZoneEngine と同じ) ★
@@ -324,6 +331,34 @@ export type FvgSignal
     int   drDirCode         = na
     int   drVolCode         = na
 
+// ---- Fvg15Engine : 15M FVG反発 → 5M BOS Logic 固有の永続状態 --------------
+//  ★ 既存 FvgEngine とは別インスタンス。Armed / Cooldown / Accum 等の状態は
+//    一切共有しない (共有するのは Main が計算した Feed の「計算結果」だけ)。
+//  ここが持つのは「順序確認」に必要な状態のみ:
+//    ・直近15M FVG反発イベントの反発足 開始時刻 (方向別)
+//    ・そのイベントを既にEntryで消費したか (方向別)
+//    ・新規イベント検出用の直近 reason / remain
+//    ・方向別の直近5M BOS 成立時刻
+export type Fvg15Engine
+    int  longRebTime   = na
+    int  shortRebTime  = na
+    bool longConsumed  = false
+    bool shortConsumed = false
+    int  prevReason    = 0
+    int  prevRem       = 0
+    int  last5mBullT   = na
+    int  last5mBearT   = na
+
+// ---- Fvg15Signal : updateFvg15 の戻り値 -----------------------------------
+export type Fvg15Signal
+    bool  longSignal  = false
+    bool  shortSignal = false
+    float entryPrice  = na
+    // 以下は Debug 表示用
+    bool  bosOkLong   = false
+    bool  bosOkShort  = false
+    int   rebReason   = 0
+
 // ============================================================================
 // 02. FACTORIES
 // ============================================================================
@@ -338,6 +373,11 @@ export newFvgCfg() =>
 export newFvgEngine() =>
     FvgEngine.new(a5Hi = array.new_float(), a5Lo = array.new_float(), a5St = array.new_int(),
          a15Hi = array.new_float(), a15Lo = array.new_float(), a15St = array.new_int())
+
+// @function  15M FVG → 5M BOS Logic の永続状態を作る。Main Strategyで var 宣言すること。
+// @returns   Fvg15Engine
+export newFvg15Engine() =>
+    Fvg15Engine.new()
 
 // ============================================================================
 // 03. FVG · 外部足コンテキストで評価する計算式
@@ -568,6 +608,17 @@ export efvgReboundConfirmed(int holdBars, float minThickR, float depthMax, float
      bool useBos, simple int bosLen) =>
     [_b, _r, _rem, _bos] = efvgReboundState(holdBars, minThickR, depthMax, recoverRatio, useBos, bosLen)
     [_b[1], _r[1], _rem[1], _bos[1]]
+
+// @function  efvgReboundConfirmed と同じ4値に「その確定足の開始時刻」を足して返す。
+//   15M FVG反発 → 5M BOS の順序確認は「反発が起きた15M足の開始時刻」を基準にするため、
+//   反発状態と時刻を1回の request.security でまとめて取得できるようにしたもの。
+//   先頭4要素は efvgReboundConfirmed と完全に同一の式なので、既存Logicが
+//   この関数から4値を受け取っても取得値は変わらない (同一TFでの重複requestを避ける)。
+// @returns   [bias, reason, remain, bosState, barOpenTime]
+export efvgRebound15Pack(int holdBars, float minThickR, float depthMax, float recoverRatio,
+     bool useBos, simple int bosLen) =>
+    [_b, _r, _rem, _bos] = efvgReboundState(holdBars, minThickR, depthMax, recoverRatio, useBos, bosLen)
+    [_b[1], _r[1], _rem[1], _bos[1], time[1]]
 
 export efvgBiasText(int b) =>
     b == 1 ? "LONG" : b == -1 ? "SHORT" : "EVEN"
@@ -1240,7 +1291,95 @@ export updateFvg(FvgEngine e, FvgCfg c, FvgTrigCfg tc, FvgAccCfg ac, FvgFeed f,
          drVolCode         = drVolCodeAdj)
 
 // ============================================================================
-// 06. FUTURE LOGICS
+// 06. FVG15 · updateFvg15 (15M FVG反発 → 5M BOS 順序確認)
+// ----------------------------------------------------------------------------
+//  この関数がやるのは「順序確認」だけ。
+//    ・環境認識 / Session / News / ボラ / Accum / Daily Regime / Armed は
+//      updateFvg() が計算した結果を baseLong / baseShort として受け取る。
+//      → 共通計算を二重実装しない。
+//    ・SL / TP / RR / Qty / 発注 は一切扱わない (Main の共通Trade Engineの担当)。
+//
+//  順序 (追加元 Strategy の「15M FVG → 下位足BOS 順序確認」と同じ意味):
+//    15M FVG反発が確定
+//      → その反発15M足の開始時刻を記録
+//      → 「その時刻以降」に成立した同方向5M BOSだけを有効とする
+//         (反発より前に出ていた古いBOSは使わない)
+//      → 1つの反発イベントにつきEntryは1回だけ (consumed)
+//      → 新しい反発イベントが来たら再びEntry可能 (再アーム)
+//
+//  ★ consumed は「実際に発注できたときだけ」Main が consume15() で立てる。
+//    Signalが出ただけ / TradePlan FAIL では消費しない。
+//  ★ 5M BOS はチャート足(5分足)で判定するため request.security は使わない。
+// ============================================================================
+
+// @function  15M FVG反発 → 5M BOS の順序ゲートを1バー分評価する。
+// @param e               Fvg15Engine (Mainで var 宣言した永続状態)
+// @param baseLong        updateFvg() が出した Long Signal (環境/フィルタ適用済み)
+// @param baseShort       updateFvg() が出した Short Signal
+// @param entryPrice      Entry価格 (updateFvg() の entryPrice をそのまま)
+// @param rawReason       15M FVG反発の reason ( 1=Long反発 / -1=Short反発 / 0=なし)
+// @param rawRem          15M FVG反発の remain (新規イベント検出に使う)
+// @param rebBarOpenTime  反発が確定した15M足の開始時刻
+// @param useOrder        順序確認を使うか (falseなら従来どおりゲートなし)
+// @param bos5Lookback    5M BOS Lookback (15M用・既存 bosLookback とは別)
+// @returns  Fvg15Signal
+export updateFvg15(Fvg15Engine e, bool baseLong, bool baseShort, float entryPrice,
+     int rawReason, int rawRem, int rebBarOpenTime, bool useOrder, simple int bos5Lookback) =>
+    // ---- (1) 新規15M FVG反発イベント検出 -----------------------------------
+    //   reason が変わった / remain が増えた = 新しい反発イベント。
+    //   反発足の開始時刻を記録し、そのイベントの消費フラグを再アームする。
+    bool newLong  = rawReason == 1  and (rawReason != e.prevReason or rawRem > e.prevRem)
+    bool newShort = rawReason == -1 and (rawReason != e.prevReason or rawRem > e.prevRem)
+    if newLong
+        e.longRebTime  := rebBarOpenTime
+        e.longConsumed := false
+    if newShort
+        e.shortRebTime  := rebBarOpenTime
+        e.shortConsumed := false
+    e.prevReason := rawReason
+    e.prevRem    := rawRem
+
+    // ---- (2) 5M BOS の方向別 最新成立時刻 ----------------------------------
+    //   ta.highest / ta.lowest は毎バー評価してから確定足だけで記録する
+    //   (条件分岐の中で ta.* を呼ばない)。判定式は追加元と同一。
+    float bos5Hi = ta.highest(high, bos5Lookback)[1]
+    float bos5Lo = ta.lowest(low,  bos5Lookback)[1]
+    if barstate.isconfirmed
+        if close > bos5Hi
+            e.last5mBullT := time
+        if close < bos5Lo
+            e.last5mBearT := time
+
+    // ---- (3) 順序判定 : 反発足の開始以降に成立した同方向5M BOSのみ有効 -----
+    bool bosOkLong  = not na(e.last5mBullT) and not na(e.longRebTime)  and e.last5mBullT >= e.longRebTime
+    bool bosOkShort = not na(e.last5mBearT) and not na(e.shortRebTime) and e.last5mBearT >= e.shortRebTime
+
+    bool gateLong  = not useOrder or (bosOkLong  and not e.longConsumed)
+    bool gateShort = not useOrder or (bosOkShort and not e.shortConsumed)
+
+    Fvg15Signal.new(
+         longSignal  = baseLong  and gateLong,
+         shortSignal = baseShort and gateShort,
+         entryPrice  = entryPrice,
+         bosOkLong   = bosOkLong,
+         bosOkShort  = bosOkShort,
+         rebReason   = rawReason)
+
+// @function  15M FVG反発イベントを「消費済み」にする。
+//   Main が「実際に発注できた (Entry IDが空でない)」ときだけ呼ぶこと。
+//   Signalが出ただけ / TradePlan FAIL で呼んではいけない。
+// @param e    Fvg15Engine
+// @param dir  1 = Long / -1 = Short
+// @returns    常に true (呼び出しを式として書けるようにするため)
+export consumeFvg15(Fvg15Engine e, int dir) =>
+    if dir > 0
+        e.longConsumed := true
+    else if dir < 0
+        e.shortConsumed := true
+    true
+
+// ============================================================================
+// 07. FUTURE LOGICS
 // ----------------------------------------------------------------------------
 //  新しいEntry Logicはここへ同じ形で追加する。Logicごとに
 //    <Name>Cfg / <Name>Feed / <Name>Engine / update<Name>()
