@@ -576,6 +576,13 @@ zoneBosTf        = input.timeframe("5", "Zone BOS Timeframe", group = GF_ZBOS,
 zoneBosLookback  = input.int(10, "Zone BOS Lookback", minval = 1, group = GF_ZBOS,
      tooltip = "BOSの定義は既存と同一 (close > ta.highest(high, n)[1] / close < ta.lowest(low, n)[1])。\n" +
      "Lookback値だけ Zone BOS 単独で変更できる。")
+//  ZONEBOS専用 日足ボラ設定。判定方式・境界条件は既存Daily Regimeのボラ判定と同一で、
+//  参照する「設定値」だけをZONEBOS専用にする。日足データ (drMedianRange) は
+//  Section 03 で取得済みのものを共有し、request は増やさない。
+zoneBosReqDailyVolatility    = input.string("中ボラ", "Zone BOS · 日足ボラ", options = ["OFF", "高ボラ", "中ボラ", "低ボラ"], group = GF_ZBOS,
+     tooltip = "FVG側の「日足ボラ」とは完全に独立。どちらを変えても他方に影響しない。")
+zoneBosDailyLowVolThreshold  = input.float(0.0,  "Zone BOS · 低ボラ上限", group = GF_ZBOS)
+zoneBosDailyHighVolThreshold = input.float(80.0, "Zone BOS · 高ボラ下限", group = GF_ZBOS)
 zoneBosMinMoveAway = input.float(5.0, "Zone BOS · 最低離脱距離 ($)", minval = 0.0, step = 0.5, group = GF_ZBOS,
      tooltip = "Zoneタッチ後、この距離ぶんZoneから離れてからでないとBOSを有効にしない。\n" +
      "  Long  : close >= タッチしたSupport Zoneの上端 + この距離\n" +
@@ -617,6 +624,8 @@ fvg15BreakEvenTrigger = input.float(10.0, "FVG15 建値移動開始幅 ($)", ste
 absBreakEvenTrigger  = input.float(10.0, "FVG吸収 建値移動開始幅 ($)", step = 0.1, group = G_BE,
      tooltip = "FVG吸収系列 (FVGABS5 / FVGABS15) だけこの幅を使う。\n" +
      "建値移動の判定方式 / SLを建値へ動かす処理 / TP再指定は共通のまま。")
+zoneBosBreakEvenTrigger = input.float(10.0, "ZONEBOS 建値移動開始幅 ($)", step = 0.1, group = G_BE,
+     tooltip = "Zone Touch → BOS Logic (ZONEBOS) だけこの幅を使う。")
 breakEvenTriggerMode = input.string("到達瞬間", "建値移動判定", options = ["到達瞬間", "確定足"], group = G_BE)
 
 // ============================================================================
@@ -1115,7 +1124,11 @@ int env1M  = na
 //    吸収系列がONなら取得する。取得しても updateFvg 側は c.useEnvFilter の中でしか
 //    参照しないので、既存反発Logicの判定は一切変わらない。
 bool absAnyOn = useFvgAbs5Logic or useFvgAbs15Logic
-if useEnvFilter or absAnyOn
+//  ★ ZONEBOS も 4H/1H/15M の環境判定結果 (env4H / env1H / env15M) を
+//    専用のOR条件で使うため、useEnvFilter が OFF でも取得する。
+//    取得しても updateFvg 側は c.useEnvFilter の中でしか参照しないので、
+//    既存FVG系Logicの判定は一切変わらない。
+if useEnvFilter or absAnyOn or useZoneBosLogic
     env4H  := request.security(syminfo.tickerid, tf4H,  sg.envTrendConfirmed(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore4H),  lookahead = barmerge.lookahead_on)
     env1H  := request.security(syminfo.tickerid, tf1H,  sg.envTrendConfirmed(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore1H),  lookahead = barmerge.lookahead_on)
     env15M := request.security(syminfo.tickerid, tf15M, sg.envTrendConfirmed(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore15M), lookahead = barmerge.lookahead_on)
@@ -1305,7 +1318,9 @@ if useDailyRegimeFilter
 //  ★ 日足ボラ中央値は吸収系列の環境条件でも使うため、日足レジームフィルタが OFF でも
 //    吸収系列がONなら取得する。同一 (TF, 式) を重複requestしないよう1本に統合。
 //    updateFvg 側は c.useDailyRegimeFilter の中でしか参照しないので既存判定は不変。
-if useDailyRegimeFilter or absAnyOn
+//  ★ ZONEBOS も日足ボラ中央値を使う (閾値だけ専用) ので、日足レジームフィルタが
+//    OFF でも ZONEBOS がONなら取得する。同一 (TF, 式) を1本に統合したまま。
+if useDailyRegimeFilter or absAnyOn or useZoneBosLogic
     drMedianRange := request.security(syminfo.tickerid, "D", sg.dailyRangeMedian(dailyVolMedianLength), lookahead = barmerge.lookahead_on)
 
 // Accumulation NoTrade (15分足の確定Accum箱)
@@ -1694,28 +1709,57 @@ bool zoneBosGroupOpen = false
 if useZoneBosLogic
     zoneBosGroupOpen := f_openCountZoneBosGroup() > 0
 
-//  ---- 共通Environment Filter -------------------------------------------
-//  ★ ZONEBOS専用のフィルターは1つも作らない。既存FVG側で計算済みの結果を
-//    そのまま再利用する (request も再計算も増やさない)。
+//  ---- Environment Filter ------------------------------------------------
+//  共通で再利用するもの (計算も request も増やさない):
 //      Session / News        : Section 03 の共通フィルタ
-//      EMA環境認識 4H/1H/15M : fvgSig.trendOk
-//        → useEnvFilter / reqTrend4H / reqTrend1H / reqTrend15M / reqTrend5M /
-//          reqTrend1M / reqMatchCount の既存設定にそのまま従う。
-//          ZONEBOSに方向をハードコードしていないので、上昇/レンジ/OFF の
-//          どの組み合わせに変えてもそのまま反映される。
 //      通常ボラ              : fvgSig.volOk
-//      日足ボラ / Daily Regime: fvgSig.drLongOk / fvgSig.drShortOk
 //      Accum NoTrade         : fvgSig.blockedByAccum
 //      Accum離脱待機         : fvgSig.blockedByExitWait
 //      Accum離脱方向         : fvgSig.accumLongDirOk / fvgSig.accumShortDirOk
+//  ZONEBOS専用にするもの:
+//      上位足方向 : 4H/1H/15M の OR 条件 (下記 zoneBosTrendLongOk/ShortOk)
+//      日足ボラ   : ZONEBOS専用の要求区分と閾値 (下記 zoneBosDailyVolOk)
+//  ★ fvgSig.trendOk / fvgSig.drLongOk / fvgSig.drShortOk は ZONEBOS では使わない。
+
+//  ---- ZONEBOS専用 上位足方向 (AND ではなく OR) --------------------------
+//  4H / 1H / 15M のうち「1つ以上」が該当方向なら方向条件OK。
+//  上昇/レンジ/下降 の判定式は作らず、Section 03 で取得済みの
+//  env4H / env1H / env15M ( 1=上昇 / 0=レンジ / -1=下降 ) をそのまま使う。
+//  → FVG側の reqTrend4H / reqTrend1H / reqTrend15M / reqMatchCount /
+//    useEnvFilter を変えても、この OR 条件は影響を受けない。
+bool zoneBosTrendLongOk =
+     nz(env4H, 0) == 1 or nz(env1H, 0) == 1 or nz(env15M, 0) == 1
+bool zoneBosTrendShortOk =
+     nz(env4H, 0) == -1 or nz(env1H, 0) == -1 or nz(env15M, 0) == -1
+
+//  ---- ZONEBOS専用 日足ボラ ----------------------------------------------
+//  日足データ (drMedianRange = 前日までの確定Daily Range中央値) は
+//  Section 03 で取得済みのものを共有し、ZONEBOS専用の request は追加しない。
+//  分類・境界条件は既存 Daily Regime のボラ判定と完全に同一で、
+//  参照する閾値と要求区分だけ ZONEBOS専用のものに差し替えている:
+//      中央値 >= 高ボラ下限            → 高ボラ ( 1)
+//      中央値 <  低ボラ上限            → 低ボラ (-1)
+//      それ以外                        → 中ボラ ( 0)
+//  データ不足 (na) の扱いは共通の dailyInsufficientAsRange に従う。
+//  Long / Short 共通の判定 (日足「方向」ゲートは ZONEBOS では使わない)。
+int zbDrVolCode = na
+if not na(drMedianRange)
+    zbDrVolCode := drMedianRange >= zoneBosDailyHighVolThreshold ? 1 : drMedianRange < zoneBosDailyLowVolThreshold ? -1 : 0
+bool zbDrVolInsufficient = na(zbDrVolCode)
+int zbDrVolCodeAdj = zbDrVolInsufficient ? (dailyInsufficientAsRange ? 0 : na) : zbDrVolCode
+string zbDrVolText = sg.dailyVolatilityText(zbDrVolCodeAdj)
+bool zbVolatilityMatch = zoneBosReqDailyVolatility == "OFF" or zbDrVolText == zoneBosReqDailyVolatility
+bool zbDrVolBlock = zoneBosReqDailyVolatility != "OFF" and zbDrVolInsufficient and not dailyInsufficientAsRange
+bool zoneBosDailyVolOk = zbVolatilityMatch and not zbDrVolBlock
+
 bool zoneBosEnvLongOk =
      sessionOk and allowByNewsTime and
-     fvgSig.trendOk and fvgSig.volOk and fvgSig.drLongOk and
+     zoneBosTrendLongOk and fvgSig.volOk and zoneBosDailyVolOk and
      not fvgSig.blockedByAccum and not fvgSig.blockedByExitWait and
      fvgSig.accumLongDirOk
 bool zoneBosEnvShortOk =
      sessionOk and allowByNewsTime and
-     fvgSig.trendOk and fvgSig.volOk and fvgSig.drShortOk and
+     zoneBosTrendShortOk and fvgSig.volOk and zoneBosDailyVolOk and
      not fvgSig.blockedByAccum and not fvgSig.blockedByExitWait and
      fvgSig.accumShortDirOk
 
@@ -1877,15 +1921,19 @@ if useBreakEven and strategy.opentrades > 0
             //  Entry ID の接頭辞を完全一致で判定して幅を選ぶ。
             //    FVG15_L_ / FVG15_S_          → fvg15BreakEvenTrigger
             //    FVGABS5_L_ / FVGABS15_L_     → absBreakEvenTrigger
+            //    ZONEBOS_L_ / ZONEBOS_S_      → zoneBosBreakEvenTrigger
             //    それ以外 (FVG_L_ / FVG_S_ / 将来のLogic) → breakEvenTrigger
             //  ("FVG15_L_" が "FVG_L_" に一致することはないので取り違えは起きない。)
-            //  判定方式 / SLを建値へ動かす処理 / TP再指定は不変。
+            //  判定方式 / SLを建値へ動かす処理 / TP再指定 / Map管理は不変。
             bool isFvg15Trade = str.startswith(eid, LOGIC_FVG15 + "_L_") or
                  str.startswith(eid, LOGIC_FVG15 + "_S_")
             bool isAbsTrade = str.startswith(eid, LOGIC_FVG_ABS5 + "_L_") or
                  str.startswith(eid, LOGIC_FVG_ABS15 + "_L_")
+            bool isZoneBosTrade = str.startswith(eid, LOGIC_ZONE_BOS + "_L_") or
+                 str.startswith(eid, LOGIC_ZONE_BOS + "_S_")
             float beTrigger = isFvg15Trade ? fvg15BreakEvenTrigger :
-                 isAbsTrade ? absBreakEvenTrigger : breakEvenTrigger
+                 isAbsTrade ? absBreakEvenTrigger :
+                 isZoneBosTrade ? zoneBosBreakEvenTrigger : breakEvenTrigger
             if isLong
                 reach := breakEvenTriggerMode == "確定足" ? (barstate.isconfirmed and close >= ep + beTrigger) : (high >= ep + beTrigger)
             else
