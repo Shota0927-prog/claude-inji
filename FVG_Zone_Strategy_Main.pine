@@ -28,6 +28,7 @@
 //    07. ORDER EXECUTION
 //    08. BREAK EVEN
 //    09. DISPLAY / DEBUG
+//    10. ALERTS                (alert() を呼ぶだけ。ロジックには影響しない)
 //
 //  新しいEntry Logicを追加するときに触るのは:
 //    01-1 (Use xxx)  /  01-3 (Logicのinput)  /  03 (必要ならFeed)  /
@@ -39,6 +40,14 @@
 // ============================================================================
 
 //@version=5
+//  ★ calc_on_every_tick = true は 仮アラート (Section 10) に必須。
+//    Strategy は既定では確定足でしか再計算しないため、false だと
+//    形成中バーで alert() を呼ぶ機会そのものが無い。
+//    ・Entry条件は全て barstate.isconfirmed を含むので、発注バーは変わらない。
+//    ・ヒストリカルの計算・バックテスト結果は変わらない。
+//    ・フォワード実行時のみ、Break Even 「リアルタイム」モードが足の途中で
+//      作動するようになる (確定足モードなら影響なし)。
+//    仮アラートが不要なら、この1行を false に戻せば完全に元の挙動になる。
 strategy(
      title             = "FVG + Zone Engine Strategy",
      shorttitle        = "FVG-ZONE",
@@ -48,6 +57,7 @@ strategy(
      default_qty_type  = strategy.fixed,
      default_qty_value = 1,
      dynamic_requests  = true,
+     calc_on_every_tick = true,
      max_boxes_count   = 500,
      max_labels_count  = 500,
      max_lines_count   = 200
@@ -613,6 +623,16 @@ maxOpenPerLogic    = input.int(1, "Logicごとの最大同時保有トレード�
 allowOppositeEntry = input.bool(false, "反対方向Logicの同時Entryを許可", group = G_TE,
      tooltip = "TradingView Strategyは単一ネットポジションのため、反対方向Entryは既存Tradeを\n" +
                "打ち消してしまう。既定 (false) では反対方向シグナルをSKIPする。")
+
+// ---- 1.x Alerts ------------------------------------------------------------
+//  ★ アラート専用。Entry判定には一切使わない。
+var string G_ALERT = "05 · Alerts"
+useProvisionalAlert = input.bool(false, "仮アラートを出す (形成中バー)", group = G_ALERT,
+     tooltip = "確定アラートの条件から「確定足であること」だけを外した判定。\n" +
+     "同一バー・同一Logic・同一方向につき最大1回。\n" +
+     "TradePlan FAIL / Qty不足 / Group制御で弾かれる状態では出さない。")
+useConfirmedAlert   = input.bool(true,  "確定アラートを出す (実Entry成立時)", group = G_ALERT,
+     tooltip = "f_submitSignal() が Entry ID を返した = 実際に strategy.entry した時だけ発火。")
 
 var string G_BE = "04 · Trade Engine · Break Even"
 useBreakEven         = input.bool(true, "建値移動を使う", group = G_BE,
@@ -2177,3 +2197,184 @@ if showFvgBosDebug and useEFVGEnv
         f_bosRow(fvgBosTbl, 4, "15M→5M", useEFVG15M and useFvgBosFilter, efvg5Bos)
         f_bosRow(fvgBosTbl, 5, "5M",  useEFVG5M,    efvg5Bos)
         f_bosRow(fvgBosTbl, 6, "1M",  useEFVG1M,    efvg1Bos)
+
+// ============================================================================
+// 10. ALERTS
+// ----------------------------------------------------------------------------
+//  ★ このセクションは alert() を呼ぶだけ。既存ロジックには一切影響しない ★
+//    ・strategy.entry / strategy.exit を呼ばない
+//    ・Engine state (armed / consumed / eventId / waiting) を書き換えない
+//    ・f_submitSignal() を追加実行しない (実発注につながるため)
+//    ・zn.buildPlan() は読み取り専用なので、判定用に呼んでも副作用が無い
+//
+//  ① 確定アラート
+//     Section 07 が返した Entry ID が空でない = 実際に strategy.entry した時だけ。
+//     Signal成立 / Direction / TradePlan / Structural SL / TP / Minimum RR /
+//     TP Mode / Qty / ポジション制御 を全て通過した場合だけ発火する。
+//
+//  ② 仮アラート
+//     確定アラートの条件から「確定足であること」だけを外したもの。
+//     形成中バーで、その値のまま確定すればEntryできる状態になった瞬間に出す。
+//     同一バー・同一Logic・同一方向につき最大1回 (varip でtick間保持)。
+// ============================================================================
+
+// ---- 10.1 副作用なしの Entry 可否判定 --------------------------------------
+//  f_executeTrade() の判定部分だけを、状態を書き換えずに再現したもの。
+//  Entry ID の採番も発注も記録も行わない。純粋に「入れるか」だけを返す。
+f_canEnter(string logicId, int dir, float entryPrice) =>
+    bool ok = false
+    bool dirOk = (dir > 0 and enableLong) or (dir < 0 and enableShort)
+    if dir != 0 and dirOk
+        zn.TradePlan p = zn.buildPlan(zoneEng, zoneCfg, dir, entryPrice)
+        // TP Mode フィルター (f_submitSignal と同一)
+        bool planOk = p.valid
+        if tpMode == "STRUCTURAL_ONLY" and p.tpType == "FALLBACK_RR"
+            planOk := false
+        else if tpMode == "FALLBACK_ONLY" and p.tpType == "STRUCTURAL"
+            planOk := false
+        if planOk
+            float qty = f_qty(p.risk)
+            bool oppositeConflict = not allowOppositeEntry and
+                 ((dir > 0 and strategy.position_size < 0) or (dir < 0 and strategy.position_size > 0))
+            bool logicFull = f_openCountForLogic(logicId) >= maxOpenPerLogic
+            ok := not logicFull and not oppositeConflict and qty >= qtyMin and qty > 0
+    ok
+
+// ---- 10.2 アラート本文 -----------------------------------------------------
+f_alertMsg(string kind, string logicId, int dir) =>
+    kind + " | " + logicId + " | " + (dir > 0 ? "LONG" : "SHORT") +
+     " | " + syminfo.ticker + " | Price=" + f_num(close, "#.##")
+
+// ---- 10.3 確定アラート -----------------------------------------------------
+//  Entry ID が返った = 実Entry成立。実Entry 1回につき 1回だけ発火する。
+f_confirmedAlert(string eid, string logicId, int dir) =>
+    if useConfirmedAlert and eid != ""
+        alert(f_alertMsg("CONFIRMED", logicId, dir), alert.freq_all)
+    true
+
+f_confirmedAlert(fvg15EidLong,  LOGIC_FVG15,     1)
+f_confirmedAlert(fvg15EidShort, LOGIC_FVG15,    -1)
+f_confirmedAlert(fvgEidLong,    LOGIC_FVG,       1)
+f_confirmedAlert(fvgEidShort,   LOGIC_FVG,      -1)
+f_confirmedAlert(abs15Eid,      LOGIC_FVG_ABS15, 1)
+f_confirmedAlert(abs5Eid,       LOGIC_FVG_ABS5,  1)
+f_confirmedAlert(zbEidLong,     LOGIC_ZONE_BOS,  1)
+f_confirmedAlert(zbEidShort,    LOGIC_ZONE_BOS, -1)
+
+// ---- 10.4 仮アラート -------------------------------------------------------
+//  重複防止は varip で行う。通常の var はリアルタイム足の各tick再計算で
+//  巻き戻るため、intrabar で立てたフラグが戻って同一足で再発火してしまう。
+//  slot = Logic index * 2 + (dir > 0 ? 0 : 1)  … 5 Logic × 2方向 = 10
+varip array<int> gProvBar = array.new_int(10, -1)
+
+f_provSlot(string logicId, int dir) =>
+    int li = logicId == LOGIC_FVG ? 0 : logicId == LOGIC_FVG15 ? 1 :
+         logicId == LOGIC_FVG_ABS5 ? 2 : logicId == LOGIC_FVG_ABS15 ? 3 :
+         logicId == LOGIC_ZONE_BOS ? 4 : -1
+    li < 0 ? -1 : li * 2 + (dir > 0 ? 0 : 1)
+
+//  raw = 「確定足であること」以外のSignal条件が成立しているか。
+//  そのうえで Group Gate と f_canEnter() (TradePlan / Qty / ポジション制御) を通す。
+//  ① 「今この瞬間に確定したらEntryできるか」だけを返す (発火はしない)。
+//    useProvisionalAlert / raw / gateOk が揃ったときにしか f_canEnter() を
+//    呼ばないので、OFF時は zn.buildPlan() の追加呼び出しも発生しない。
+f_provWouldEnter(string logicId, int dir, bool raw, bool gateOk) =>
+    bool r = false
+    if useProvisionalAlert and raw and gateOk and not barstate.isconfirmed
+        r := f_canEnter(logicId, dir, close)
+    r
+
+//  ② 実際の発火。同一バー・同一Logic・同一方向につき最大1回。
+f_provFire(string logicId, int dir, bool would) =>
+    if would
+        int slot = f_provSlot(logicId, dir)
+        if slot >= 0 and array.get(gProvBar, slot) != bar_index
+            array.set(gProvBar, slot, bar_index)
+            alert(f_alertMsg("PROVISIONAL", logicId, dir), alert.freq_all)
+    true
+
+//  ---- 各Logicの「確定足条件を外した」raw 判定 -----------------------------
+//  SignalEngine が公開しているフィールドと Engine state だけで組み立てる。
+//  ロジックの計算式は作り直さない (公開値の組み合わせのみ)。
+//  ※ トリガーON時の Trigger Cooldown は SignalEngine が公開していないため
+//    仮アラートには反映されない (制約として報告済み)。
+bool provFvgLongRaw   = useFvgLogic and enableLong  and fvgSig.longMajorOk  and
+     (fvgSig.noTriggerMode ? fvgEng.longArmed  : fvgSig.trigBull)
+bool provFvgShortRaw  = useFvgLogic and enableShort and fvgSig.shortMajorOk and
+     (fvgSig.noTriggerMode ? fvgEng.shortArmed : fvgSig.trigBear)
+if provFvgLongRaw and provFvgShortRaw
+    if close >= open
+        provFvgShortRaw := false
+    else
+        provFvgLongRaw := false
+
+bool fvg15GateL = not use15mFvgBosOrder or (fvg15Sig.bosOkLong  and not fvg15Ord.longConsumed)
+bool fvg15GateS = not use15mFvgBosOrder or (fvg15Sig.bosOkShort and not fvg15Ord.shortConsumed)
+bool provFvg15LongRaw  = useFvg15Logic and enableLong  and fvg15Base.longMajorOk  and
+     (fvg15Base.noTriggerMode ? fvg15Eng.longArmed  : fvg15Base.trigBull) and fvg15GateL
+bool provFvg15ShortRaw = useFvg15Logic and enableShort and fvg15Base.shortMajorOk and
+     (fvg15Base.noTriggerMode ? fvg15Eng.shortArmed : fvg15Base.trigBear) and fvg15GateS
+if provFvg15LongRaw and provFvg15ShortRaw
+    if close >= open
+        provFvg15ShortRaw := false
+    else
+        provFvg15LongRaw := false
+
+bool absUnused5  = na(fvgAbsEng.ev5Consumed)  or fvgAbsEng.ev5Consumed  != fvgAbsEng.ev5Id
+bool absUnused15 = na(fvgAbsEng.ev15Consumed) or fvgAbsEng.ev15Consumed != fvgAbsEng.ev15Id
+//  ※ Abs15 の 5M BOS は SignalEngine 側で barstate.isconfirmed のときだけ
+//    記録される (e.bos5mTime)。そのため「形成中の5M足の中で成立したBOS」は
+//    仮アラートに乗らず、Abs15 の仮アラートは 5M BOS が1本前までに成立済みの
+//    ケースだけ出る。Abs5 (1M BOS) は下位足の確定足で見るためこの制約は無い。
+bool provAbs5Raw  = useFvgAbs5Logic  and absEnvLongOk and absBias5  == 1 and
+     not na(fvgAbsEng.ev5Id)  and absUnused5  and absSig.bos5Ok
+bool provAbs15Raw = useFvgAbs15Logic and absEnvLongOk and absBias15 == 1 and
+     not na(fvgAbsEng.ev15Id) and absUnused15 and absSig.bos15Ok
+
+bool provZbLongRaw  = false
+bool provZbShortRaw = false
+if useZoneBosLogic
+    provZbLongRaw  := enableLong  and sg.zoneBosEnvLong(zoneBosCfg, zoneBosFeed)  and
+         not zoneBosGroupOpen and zoneBosEng.longWaiting  and zoneBosEng.longMovedAway  and zbBullBos
+    provZbShortRaw := enableShort and sg.zoneBosEnvShort(zoneBosCfg, zoneBosFeed) and
+         not zoneBosGroupOpen and zoneBosEng.shortWaiting and zoneBosEng.shortMovedAway and zbBearBos
+    if provZbLongRaw and provZbShortRaw
+        if close >= open
+            provZbShortRaw := false
+        else
+            provZbLongRaw := false
+
+//  ---- Group Gate / 優先順位は Section 07 と同じ順序で再現する -------------
+//   Section 07 の順序:
+//     7.1 FVG15 Long → FVG15 Short (Long が発注できたら Short は出さない)
+//     7.2 FVG   Long / Short  (FVG15 が実発注できたバーはSKIP)
+//     7.3 ABS15 → ABS5        (ABS15 が実発注できたら ABS5 はSKIP)
+//     7.4 ZONEBOS Long → Short (Long が発注できたら Short は出さない)
+//   形成中バーでは Entry ID がまだ無いので、Section 07 の「Entry ID が空でない」
+//   の代わりに「その方向が f_canEnter() を通っているか」を使う。
+bool provWFvg15L = f_provWouldEnter(LOGIC_FVG15, 1, provFvg15LongRaw, not fvgGroupBlocked)
+bool provWFvg15S = f_provWouldEnter(LOGIC_FVG15, -1, provFvg15ShortRaw,
+     not fvgGroupBlocked and not provWFvg15L)
+bool provFvg15Entered = provWFvg15L or provWFvg15S
+
+bool provWFvgL = f_provWouldEnter(LOGIC_FVG, 1, provFvgLongRaw,
+     not fvgGroupBlocked and not provFvg15Entered)
+bool provWFvgS = f_provWouldEnter(LOGIC_FVG, -1, provFvgShortRaw,
+     not fvgGroupBlocked and not provFvg15Entered)
+
+bool provWAbs15 = f_provWouldEnter(LOGIC_FVG_ABS15, 1, provAbs15Raw, not fvgAbsGroupBlocked)
+bool provWAbs5  = f_provWouldEnter(LOGIC_FVG_ABS5, 1, provAbs5Raw,
+     not fvgAbsGroupBlocked and not provWAbs15)
+
+bool provWZbL = f_provWouldEnter(LOGIC_ZONE_BOS, 1, provZbLongRaw, not zoneBosGroupOpen)
+bool provWZbS = f_provWouldEnter(LOGIC_ZONE_BOS, -1, provZbShortRaw,
+     not zoneBosGroupOpen and not provWZbL)
+
+f_provFire(LOGIC_FVG15,     1, provWFvg15L)
+f_provFire(LOGIC_FVG15,    -1, provWFvg15S)
+f_provFire(LOGIC_FVG,       1, provWFvgL)
+f_provFire(LOGIC_FVG,      -1, provWFvgS)
+f_provFire(LOGIC_FVG_ABS15, 1, provWAbs15)
+f_provFire(LOGIC_FVG_ABS5,  1, provWAbs5)
+f_provFire(LOGIC_ZONE_BOS,  1, provWZbL)
+f_provFire(LOGIC_ZONE_BOS, -1, provWZbS)
