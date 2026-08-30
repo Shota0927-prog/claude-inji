@@ -16,14 +16,16 @@
 //  セクション構成:
 //    01. Types            (FvgCfg / FvgFeed / FvgEngine / FvgSignal /
 //                          Fvg15Engine / Fvg15Signal /
-//                          FvgAbsEngine / FvgAbsSignal)
+//                          FvgAbsEngine / FvgAbsSignal /
+//                          ZoneBosEngine / ZoneBosSignal)
 //    02. Factories
 //    03. FVG · 外部足コンテキストで評価する計算式 (Mainがrequest.securityで包む)
 //    04. FVG · チャート足コンテキストの内部ヘルパー
 //    05. FVG · updateFvg  (本体)             ← 既存5M FVG Logic
 //    06. FVG15 · updateFvg15 (15M FVG反発 → 5M BOS 順序確認)
 //    07. FVGABS · updateFvgAbs (FVG吸収 → BOS / Abs5・Abs15 / Longのみ)
-//    08. Future Logics    (EMA / MACD / Stoch / BB / Intermarket ...)
+//    08. ZONEBOS · updateZoneBos (Zone Touch → BOS)
+//    09. Future Logics    (EMA / MACD / Stoch / BB / Intermarket ...)
 //
 //  ★ Logic は Engine / Cfg / Feed のインスタンスごとに完全独立 ★
 //    FVG15 Logic は「環境認識・Filter の計算」だけ updateFvg() を再利用し、
@@ -394,6 +396,34 @@ export type FvgAbsSignal
     bool  bos5Ok     = false
     bool  bos15Ok    = false
 
+// ---- ZoneBosEngine : Zone Touch → BOS Logic の永続状態 --------------------
+//  ★ FVG系列 (FvgEngine / Fvg15Engine / FvgAbsEngine) とは完全に別インスタンス。
+//    armed / consumed / eventId / BOS待機 を FVG側と一切共有しない。
+//  Long / Short それぞれ独立して保持する:
+//    xxxWaiting   … Zoneタッチ済みでBOS待機中か
+//    xxxTouchBar  … タッチしたときの「BOS対象時間足のバーカウンタ」
+//                   → 待機期限は BOS対象TFのバー数で数える (チャート足ではない)
+//    xxxTouchTime … タッチしたチャート足の time (Debug用)
+//    xxxZoneId    … タッチしたZoneの識別子 (ZoneEngineの trackId)
+export type ZoneBosEngine
+    bool longWaiting    = false
+    int  longTouchBar   = na
+    int  longTouchTime  = na
+    int  longZoneId     = na
+    bool shortWaiting   = false
+    int  shortTouchBar  = na
+    int  shortTouchTime = na
+    int  shortZoneId    = na
+
+// ---- ZoneBosSignal : updateZoneBos の戻り値 -------------------------------
+export type ZoneBosSignal
+    bool  longSignal  = false
+    bool  shortSignal = false
+    float entryPrice  = na
+    // 以下は Debug 表示用
+    bool  longWaiting  = false
+    bool  shortWaiting = false
+
 // ============================================================================
 // 02. FACTORIES
 // ============================================================================
@@ -418,6 +448,11 @@ export newFvg15Engine() =>
 // @returns   FvgAbsEngine
 export newFvgAbsEngine() =>
     FvgAbsEngine.new()
+
+// @function  Zone Touch → BOS Logic の永続状態を作る。Main Strategyで var 宣言すること。
+// @returns   ZoneBosEngine
+export newZoneBosEngine() =>
+    ZoneBosEngine.new()
 
 // ============================================================================
 // 03. FVG · 外部足コンテキストで評価する計算式
@@ -751,6 +786,18 @@ export efvgAbsConfirmed(int holdBars, float minThickR, float absBodyMin, float a
 // @returns  bool
 export bosBullLowerTf(simple int lookback) =>
     close > ta.highest(high, lookback)[1]
+
+// @function  Bullish / Bearish BOS をまとめて返す。
+//   計算式は既存BOS (calcTriggers の trBullBOS / trBearBOS、bosBullLowerTf) と完全に同一。
+//     Bullish : close > ta.highest(high, lookback)[1]
+//     Bearish : close < ta.lowest(low,  lookback)[1]
+//   Main が request.security(..., <BOS対象TF>) で包む。Zone BOS Logic 用。
+// @param lookback  BOS Lookback
+// @returns  [bullBos, bearBos]
+export bosPack(simple int lookback) =>
+    bool _bull = close > ta.highest(high, lookback)[1]
+    bool _bear = close < ta.lowest(low,  lookback)[1]
+    [_bull, _bear]
 
 export efvgBiasText(int b) =>
     b == 1 ? "LONG" : b == -1 ? "SHORT" : "EVEN"
@@ -1616,7 +1663,98 @@ export consumeFvgAbs(FvgAbsEngine e, int which) =>
     true
 
 // ============================================================================
-// 08. FUTURE LOGICS
+// 08. ZONEBOS · updateZoneBos (Zone Touch → BOS)
+// ----------------------------------------------------------------------------
+//  FVG系列とは完全に独立したEntry Logic。
+//    Long  : 対象Strength以上の Support Zone にタッチ → BOS対象TFで Bullish BOS
+//    Short : 対象Strength以上の Resistance Zone にタッチ → BOS対象TFで Bearish BOS
+//
+//  この関数がやるのは「タッチイベント管理 + BOS待機期限 + Signal生成」だけ。
+//    ・Zoneの検索とタッチ判定は Main が ZoneEngine を使って行い、結果だけを渡す
+//      (SignalEngine から ZoneEngine を import して密結合させない)。
+//    ・BOSの計算式は既存と同一 (bosPack)。Main が request.security で包んで渡す。
+//    ・SL / TP / RR / Qty / BE は一切扱わない (Main の共通Trade Engineの担当)。
+//
+//  ★ 状態は FVG系列と共有しない。FVG側でEntryしてもZoneタッチイベントは消えない。
+// ============================================================================
+
+// @function  Zone Touch → BOS Logic を1バー分評価する。
+// @param e             ZoneBosEngine (Mainで var 宣言した永続状態)
+// @param allowLong     Long発注が許可されているか (Logic ON/OFF × enableLong)
+// @param allowShort    Short発注が許可されているか
+// @param touchSupport  このバーで対象Strength以上の Support Zone にタッチしたか
+// @param supZoneId     そのZoneの識別子 (ZoneEngineの trackId)
+// @param touchResist   このバーで対象Strength以上の Resistance Zone にタッチしたか
+// @param resZoneId     そのZoneの識別子
+// @param bullBos       BOS対象TFの Bullish BOS
+// @param bearBos       BOS対象TFの Bearish BOS
+// @param bosBarCount   BOS対象TFのバーカウンタ (新しい対象TF足ごとに +1)
+// @param waitBars      BOS待機本数 (BOS対象TFのバー数)
+// @param groupOpen     Zone BOS系列でポジション保有中か
+// @param entryPrice    Entry価格 (BOS確認後なので close)
+// @returns  ZoneBosSignal
+export updateZoneBos(ZoneBosEngine e, bool allowLong, bool allowShort,
+     bool touchSupport, int supZoneId, bool touchResist, int resZoneId,
+     bool bullBos, bool bearBos, int bosBarCount, int waitBars, bool groupOpen,
+     float entryPrice) =>
+    // ---- (0) 保有中は待機イベントを持たない --------------------------------
+    //   これにより「決済後に古いZoneタッチ/BOS待機stateを持ち越して即再Entry」
+    //   が構造的に起きない。決済後は新しいZoneタッチから待機をやり直す。
+    //   ※「一度Zoneから完全に離脱しないと再アーム不可」という条件は付けない。
+    if groupOpen
+        e.longWaiting  := false
+        e.shortWaiting := false
+
+    // ---- (1) Zoneタッチ → BOS待機開始 --------------------------------------
+    //   タッチしている間は毎バー更新されるので、期限は「最後にタッチした足」起点。
+    if touchSupport and not groupOpen
+        e.longWaiting   := true
+        e.longTouchBar  := bosBarCount
+        e.longTouchTime := time
+        e.longZoneId    := supZoneId
+    if touchResist and not groupOpen
+        e.shortWaiting   := true
+        e.shortTouchBar  := bosBarCount
+        e.shortTouchTime := time
+        e.shortZoneId    := resZoneId
+
+    // ---- (2) 待機期限切れ --------------------------------------------------
+    //   タッチした対象TF足を 0本目として、waitBars 本後までを有効とする
+    //   (同一足 = 経過0本 も有効)。期限を過ぎたイベントからは二度とEntryしない。
+    if e.longWaiting and (na(e.longTouchBar) or bosBarCount - e.longTouchBar > waitBars)
+        e.longWaiting := false
+    if e.shortWaiting and (na(e.shortTouchBar) or bosBarCount - e.shortTouchBar > waitBars)
+        e.shortWaiting := false
+
+    // ---- (3) Signal --------------------------------------------------------
+    //   タッチと同じ足でBOSが成立した場合も有効 (経過0本なので上の期限判定を通る)。
+    bool l = allowLong  and not groupOpen and barstate.isconfirmed and e.longWaiting  and bullBos
+    bool s = allowShort and not groupOpen and barstate.isconfirmed and e.shortWaiting and bearBos
+    //   同一足でLong/Short両方成立したらローソク色で優先方向を決める (既存Logicと同じ扱い)
+    if l and s
+        if close >= open
+            s := false
+        else
+            l := false
+
+    ZoneBosSignal.new(longSignal = l, shortSignal = s, entryPrice = entryPrice,
+         longWaiting = e.longWaiting, shortWaiting = e.shortWaiting)
+
+// @function  Zoneタッチイベントを「消費済み」にする。
+//   Main が「実際に発注できた (Entry IDが空でない)」ときだけ呼ぶこと。
+//   Signalが出ただけ / Zone TradePlan FAIL では呼んではいけない。
+// @param e    ZoneBosEngine
+// @param dir  1 = Long / -1 = Short
+// @returns    常に true
+export consumeZoneBos(ZoneBosEngine e, int dir) =>
+    if dir > 0
+        e.longWaiting := false
+    else if dir < 0
+        e.shortWaiting := false
+    true
+
+// ============================================================================
+// 09. FUTURE LOGICS
 // ----------------------------------------------------------------------------
 //  新しいEntry Logicはここへ同じ形で追加する。Logicごとに
 //    <Name>Cfg / <Name>Feed / <Name>Engine / update<Name>()
