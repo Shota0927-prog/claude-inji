@@ -1,0 +1,2417 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  FVG + Zone Engine Signals  (Indicator Main)
+//  ※ "FVG + Zone Engine Strategy" を唯一の正本として 1対1変換したもの
+// ============================================================================
+//  この Indicator は Strategy の Section 01〜09 をそのまま移植している。
+//  Strategy から意図的に変更したのは次の3点だけ (詳細は末尾 Section 10 参照):
+//     1. strategy()  → indicator()
+//     2. strategy.*  → Virtual Trade State (Section 05V)
+//     3. Strategy Tester 専用表示 → Entry Signal / 一致確認Debug 表示
+//  Entry判定ロジック (Section 01/02/03/04/06/07/08) は Strategy と同一。
+//
+//  セクション構成 (Strategy と同じ番号):
+//    01. ALL INPUTS
+//    02. ENGINE INITIALIZATION
+//    03. EXTERNAL DATA FEED
+//    04. RISK / QTY
+//    05V VIRTUAL TRADE STATE   ← Strategy の 05 COMMON TRADE ENGINE に対応
+//    06. SIGNAL ENGINE CALLS
+//    07. ORDER EXECUTION
+//    08. BREAK EVEN
+//    09. DISPLAY / DEBUG
+//    10. 差分メモ
+//
+//  前提: チャート時間足 = 5分足。
+//        Zone Engine の 2000MA / 3000MA は 1分足コンテキストで直接計算する。
+// ============================================================================
+
+//@version=5
+indicator(
+     title             = "FVG + Zone Engine Signals",
+     shorttitle        = "FVG-ZONE-SIG",
+     overlay           = true,
+     dynamic_requests  = true,
+     max_boxes_count   = 500,
+     max_labels_count  = 500,
+     max_lines_count   = 200
+ )
+
+// ★★★ Library import ★★★  Strategy と完全に同じバージョンを使う。
+import sekine3310/ZoneEngine/3   as zn
+import sekine3310/SignalEngine/8 as sg
+
+// Library内の定数と同じ値 (定数exportはPineのバージョン依存機能のため再宣言する)
+int ST_ACTIVE  = 0
+int ST_SUPPORT = 1
+int ST_RESIST  = 2
+int ST_BROKEN  = 3
+int SR_WEAK    = 1
+int SR_MEDIUM  = 2
+int SR_STRONG  = 3
+int SR_VSTRONG = 4
+
+// Logic ID (Entry ID の接頭辞になる)
+string LOGIC_FVG   = "FVG"
+string LOGIC_FVG15 = "FVG15"
+// FVG吸収系列 (反発系列とは別Group)
+string LOGIC_FVG_ABS5  = "FVGABS5"
+string LOGIC_FVG_ABS15 = "FVGABS15"
+// Zone Touch → BOS 系列 (FVG系列とは完全に別Group)
+string LOGIC_ZONE_BOS = "ZONEBOS"
+
+// 表示用の小さなヘルパー
+f_num(float v, string fmt) =>
+    na(v) ? "-" : str.tostring(v, fmt)
+f_arrow(int dir) =>
+    dir > 0 ? "↑" : dir < 0 ? "↓" : "→"
+// 下位足の確定バー配列に true が1つでもあるか (request.security_lower_tf の集約用)
+f_anyTrue(array<bool> a) =>
+    bool r = false
+    if array.size(a) > 0
+        for i = 0 to array.size(a) - 1
+            if array.get(a, i)
+                r := true
+    r
+
+// ============================================================================
+// 01. ALL INPUTS
+// ----------------------------------------------------------------------------
+//  Strategy Section 01 の input を、名前 / default / options / minval / maxval /
+//  step / timeframe / tooltip すべてそのまま移植している。
+//  Indicator用に追加したのは
+//     ・indInitialCapital (Strategy の initial_capital = 1000 に対応。★1箇所)
+//     ・Section 01-6 の表示専用input
+//  の2つだけで、判定に使うinputは1つも追加・削除・変更していない。
+// ============================================================================
+
+// ============================================================================
+// 01-1. COMMON INPUTS
+// ============================================================================
+// ---- 1.1 Direction (全Logic共通) ------------------------------------------
+var string G_DIR = "01 · Common · Direction"
+enableLong  = input.bool(true,  "Enable Long  (全LogicのLongを許可)",  group = G_DIR)
+enableShort = input.bool(false, "Enable Short (全LogicのShortを許可)", group = G_DIR)
+
+// ---- 1.2 Logic ON / OFF ----------------------------------------------------
+var string G_LOGIC = "01 · Common · Entry Logic ON/OFF"
+useFvgLogic = input.bool(true, "Use FVG", group = G_LOGIC,
+     tooltip = "既存の 5M FVG Logic (LOGIC_FVG)。15M Logicとは完全に独立。")
+useFvg15Logic = input.bool(true, "Use 15M FVG → 5M BOS", group = G_LOGIC,
+     tooltip = "15M FVG反発 → その反発15M足の開始以降の5M BOS で入る別Logic (LOGIC_FVG15)。\n" +
+     "OFFにすると既存5M FVG単体の成績になる (修正前と完全一致)。")
+useFvgAbs5Logic = input.bool(true, "Use 5M FVG Absorption → 1M BOS", group = G_LOGIC,
+     tooltip = "5M Bearish FVG を上方向へ吸収 → 1M Bullish BOS(10) でLong (LOGIC_FVGABS5)。Longのみ。")
+useFvgAbs15Logic = input.bool(true, "Use 15M FVG Absorption → 5M BOS", group = G_LOGIC,
+     tooltip = "15M Bearish FVG を上方向へ吸収 → 5M Bullish BOS(3) でLong (LOGIC_FVGABS15)。Longのみ。")
+useZoneBosLogic = input.bool(true, "Use Zone Touch → BOS", group = G_LOGIC,
+     tooltip = "対象Strength以上の Support Zone タッチ → Bullish BOS で Long、\n" +
+     "Resistance Zone タッチ → Bearish BOS で Short (LOGIC_ZONEBOS)。\n" +
+     "FVG系列とは完全に独立したGroupで、同時保有できる。")
+
+// ---- 1.6 Session / News Filter (共通・どのLogicからも参照可) ---------------
+var string G_SESS = "01 · Common · Session / News"
+useSessionFilter = input.bool(true, "時間帯フィルタを使う", group = G_SESS)
+useAsiaSession   = input.bool(true, "アジア 09:00-16:00", group = G_SESS)
+useEUSession     = input.bool(true, "EU 16:00-21:00", group = G_SESS)
+useNYSession     = input.bool(true, "NY 21:00-翌03:00", group = G_SESS)
+useNewsTimeFilter = input.bool(false, "重要指標時間を除外", group = G_SESS)
+newsSession1 = input.session("2130-2230", "指標除外時間1", group = G_SESS)
+newsSession2 = input.session("2330-0030", "指標除外時間2", group = G_SESS)
+newsSession3 = input.session("0300-0400", "指標除外時間3", group = G_SESS)
+
+// ============================================================================
+// 01-2. ZONE ENGINE INPUTS
+// ============================================================================
+// ---- 2.1 Zone Geometry -----------------------------------------------------
+var string G_ZONE = "02 · Zone Geometry"
+zoneHalfWidth = input.float(5.0, "Zone Half Width ($)", minval = 0.1, step = 0.5, group = G_ZONE,
+     tooltip = "Zone = 中心価格 ± この値。Strengthによって幅は変えない。")
+
+// ---- 2.2 MA Source (1分足コンテキストで直接計算) ---------------------------
+var string G_MA = "02 · MA Source"
+maTf = input.timeframe("1", "MA Timeframe", group = G_MA,
+     tooltip = "既定 1分足。1分足コンテキスト内でMAを計算し、その結果を5分足へ取得する。")
+maType = input.string("EMA", "MA Type", options = ["SMA", "EMA"], group = G_MA)
+useMaSource = input.bool(true, "Enable MA Source", group = G_MA)
+ma1Len = input.int(2000, "MA #1 Length", minval = 1, maxval = 4999, group = G_MA)
+ma2Len = input.int(3000, "MA #2 Length", minval = 1, maxval = 4999, group = G_MA)
+slopeLookback = input.int(60, "Slope Lookback (MA TF bars)", minval = 1, group = G_MA)
+scoreMa1 = input.float(2.0, "Base Score · MA #1", step = 0.5, group = G_MA)
+scoreMa2 = input.float(2.0, "Base Score · MA #2", step = 0.5, group = G_MA)
+
+// ---- 2.3 MA Slope ----------------------------------------------------------
+var string G_SLOPE = "02 · MA Slope"
+slopeThrMod = input.float(1.0, "Slope Threshold · Moderate ($/lookback)", step = 0.1, group = G_SLOPE)
+slopeThrStrong = input.float(3.0, "Slope Threshold · Strong ($/lookback)",   step = 0.1, group = G_SLOPE)
+slopeBonusFlat = input.float(0.0, "Slope Bonus · Flat",     step = 0.5, group = G_SLOPE)
+slopeBonusMod = input.float(1.0, "Slope Bonus · Moderate", step = 0.5, group = G_SLOPE)
+slopeBonusStr = input.float(2.0, "Slope Bonus · Strong",   step = 0.5, group = G_SLOPE)
+slopeBonusMode = input.string("Sum (per MA)", "Slope Bonus Aggregation in Cluster",
+     options = ["Sum (per MA)", "Max"], group = G_SLOPE,
+     tooltip = "同一Cluster内に2000MAと3000MAが両方入った場合、Slope Bonusを合算するか最大値のみ採用するか。")
+maClusterDist = input.float(20.0, "MA Cluster Distance ($)", step = 1.0, group = G_SLOPE)
+maClusterBonus = input.float(1.0, "MA Cluster Bonus",              step = 0.5, group = G_SLOPE)
+maClusterDirBonus = input.float(1.0, "MA Cluster Bonus · Same Slope", step = 0.5, group = G_SLOPE)
+
+// ---- 2.4 Horizontal Source -------------------------------------------------
+var string G_HZ = "02 · Horizontal Source (Swing)"
+useHzSource = input.bool(true, "Enable Horizontal Source", group = G_HZ)
+hzTf1 = input.timeframe("5",  "Horizontal TF #1", group = G_HZ)
+hzTf2 = input.timeframe("15", "Horizontal TF #2", group = G_HZ)
+hzTf3 = input.timeframe("60", "Horizontal TF #3", group = G_HZ)
+pivLen1 = input.int(10, "Swing Pivot Length · TF #1", minval = 1, group = G_HZ)
+pivLen2 = input.int(8,  "Swing Pivot Length · TF #2", minval = 1, group = G_HZ)
+pivLen3 = input.int(6,  "Swing Pivot Length · TF #3", minval = 1, group = G_HZ)
+scoreHz1 = input.float(1.0, "Base Score · TF #1 Swing", step = 0.5, group = G_HZ)
+scoreHz2 = input.float(2.0, "Base Score · TF #2 Swing", step = 0.5, group = G_HZ)
+scoreHz3 = input.float(3.0, "Base Score · TF #3 Swing", step = 0.5, group = G_HZ)
+
+// ---- 2.5 Horizontal Reaction ----------------------------------------------
+var string G_REACT = "02 · Horizontal Reaction"
+reactionDist = input.float(20.0, "Reaction Distance ($)", step = 0.5, group = G_REACT,
+     tooltip = "Zoneに接触したあと、来た方向へこの距離以上戻ればReaction 1回。")
+reactionBonus1 = input.float(1.0, "Reaction Bonus · 1 time",   step = 0.5, group = G_REACT)
+reactionBonus2 = input.float(2.0, "Reaction Bonus · 2 times",  step = 0.5, group = G_REACT)
+reactionBonus3 = input.float(3.0, "Reaction Bonus · 3+ times", step = 0.5, group = G_REACT)
+reactionRearmDist = input.float(10.0, "Reaction Re-arm Distance ($)", step = 0.5, group = G_REACT)
+reactionAllSrc = input.bool(false, "Track Reaction on Accum / DayHL too", group = G_REACT)
+
+// ---- 2.6 Day High / Low ----------------------------------------------------
+var string G_DHL = "02 · Day High / Low"
+useDayHL = input.bool(true, "Enable Day High / Low Source", group = G_DHL)
+dayTz        = input.string("Asia/Tokyo", "Day Session Timezone", group = G_DHL)
+dayResetHour = input.int(5, "Day Reset Hour (取引日の開始時刻)", minval = 0, maxval = 23, group = G_DHL,
+     tooltip = "既定 5 = 日本時間 05:00 ～ 翌 04:59 を1取引日として扱う。0 にすると暦日基準。")
+scoreDayHL = input.float(3.0, "Base Score · Day High / Low", step = 0.5, group = G_DHL)
+carryPrevDayHL = input.bool(false, "Carry Previous Day H/L as Horizontal Zone", group = G_DHL)
+scorePrevDayHL = input.float(2.0, "Base Score · Carried Prev Day H/L", step = 0.5, group = G_DHL)
+lifePrevDayHL = input.float(5.0, "Lifetime · Carried Prev Day H/L (days)", step = 1.0, group = G_DHL)
+
+// ---- 2.7 Accumulation ------------------------------------------------------
+var string G_ACC = "02 · Accumulation"
+useAccSource = input.bool(true, "Enable Accumulation Source", group = G_ACC)
+accumModule = input.string("Accum Box (ported)", "Accum Detection Module",
+     options = ["Accum Box (ported)", "Provisional ATR (暫定)"], group = G_ACC)
+accTf1 = input.timeframe("60",  "Accum TF #1", group = G_ACC)
+accTf2 = input.timeframe("240", "Accum TF #2", group = G_ACC)
+accTf3 = input.timeframe("D",   "Accum TF #3", group = G_ACC)
+scoreAcc1 = input.float(3.0, "Base Score · TF #1 Accum", step = 0.5, group = G_ACC)
+scoreAcc2 = input.float(4.0, "Base Score · TF #2 Accum", step = 0.5, group = G_ACC)
+scoreAcc3 = input.float(5.0, "Base Score · TF #3 Accum", step = 0.5, group = G_ACC)
+accKeep1 = input.int(3, "Keep Count · TF #1 Accum (instances)", minval = 1, group = G_ACC)
+accKeep2 = input.int(2, "Keep Count · TF #2 Accum (instances)", minval = 1, group = G_ACC)
+accKeep3 = input.int(1, "Keep Count · TF #3 Accum (instances)", minval = 1, group = G_ACC)
+
+var string G_ACCP = "02a · Accum Box (ported) Parameters"
+accumRangeLen        = input.int(10,   "Accum判定レンジ本数",  minval = 6,  group = G_ACCP)
+accumBaseLen         = input.int(20,   "基準平均本数",         minval = 10, group = G_ACCP)
+accumAtrLen          = input.int(14,   "ATR本数",             minval = 1,  group = G_ACCP)
+accumMinUpperCloses  = input.int(4,    "上半分の最低終値本数",  minval = 1,  group = G_ACCP)
+accumMinLowerCloses  = input.int(4,    "下半分の最低終値本数",  minval = 1,  group = G_ACCP)
+accumMaxSameColorRun = input.int(4,    "同色連続の上限",       minval = 1,  group = G_ACCP)
+accumAtrMult         = input.float(2.5,  "Accum レンジ幅 / ATR 上限",    minval = 0.5,  step = 0.1,  group = G_ACCP)
+accumBarRatioMax     = input.float(0.70, "Accum 平均値幅/基準平均 上限", minval = 0.1,  step = 0.01, group = G_ACCP)
+accumDriftMax        = input.float(0.30, "Accum ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = G_ACCP)
+
+var string G_ACCQ = "02b · Provisional ATR Accum (暫定・本番未使用)"
+accLen1 = input.int(20, "[暫定] Accum Lookback · TF #1 (bars)", minval = 3, group = G_ACCQ)
+accLen2 = input.int(20, "[暫定] Accum Lookback · TF #2 (bars)", minval = 3, group = G_ACCQ)
+accLen3 = input.int(15, "[暫定] Accum Lookback · TF #3 (bars)", minval = 3, group = G_ACCQ)
+accMult = input.float(1.2, "[暫定] Accum Max Range / ATR", step = 0.1, minval = 0.1, group = G_ACCQ)
+
+// ---- 2.8 Cluster / Score / HTF --------------------------------------------
+var string G_CLU = "02 · Cluster"
+clusterDist = input.float(20.0, "Cluster Distance ($)", step = 1.0, group = G_CLU)
+
+var string G_SCORE = "02 · Strength Score"
+thrMedium = input.float(5.0,  "Medium Score Threshold",      step = 0.5, group = G_SCORE)
+thrStrong = input.float(10.0, "Strong Score Threshold",      step = 0.5, group = G_SCORE)
+thrVStrong = input.float(15.0, "Very Strong Score Threshold", step = 0.5, group = G_SCORE)
+confBonus2 = input.float(1.0, "Confluence Bonus · 2 categories",  step = 0.5, group = G_SCORE)
+confBonus3 = input.float(2.0, "Confluence Bonus · 3 categories",  step = 0.5, group = G_SCORE)
+confBonus4 = input.float(3.0, "Confluence Bonus · 4+ categories", step = 0.5, group = G_SCORE)
+flipBonus = input.float(2.0, "Flip Bonus", step = 0.5, group = G_SCORE)
+
+var string G_HTF = "02a · Very Strong · Higher TF Structure"
+requireHtfForVStrong = input.bool(true, "Require Higher TF Structure for Very Strong", group = G_HTF)
+htfSwing1H = input.bool(true,  "Count 1H Swing (TF #3) as Higher TF",    group = G_HTF)
+htfAccum1H = input.bool(true,  "Count 1H Accum (TF #1) as Higher TF",    group = G_HTF)
+htfAccum4H = input.bool(true,  "Count 4H Accum (TF #2) as Higher TF",    group = G_HTF)
+htfAccumD = input.bool(true,  "Count Daily Accum (TF #3) as Higher TF", group = G_HTF)
+htfSwing15M = input.bool(false, "Count 15M Swing (TF #2) as Higher TF",   group = G_HTF)
+htfMa1 = input.bool(false, "Count MA #1 (2000) as Higher TF",        group = G_HTF)
+htfMa2 = input.bool(false, "Count MA #2 (3000) as Higher TF",        group = G_HTF)
+htfDayHL = input.bool(false, "Count Day High / Low as Higher TF",      group = G_HTF)
+
+// ---- 2.9 Break / Flip / Lifetime ------------------------------------------
+var string G_BF = "02 · Break / Flip"
+breakTf = input.timeframe("5", "Break Evaluation Timeframe", group = G_BF,
+     tooltip = "Breakはヒゲではなくこの時間足の確定終値で判定する。")
+breakBuffer = input.float(5.0,  "Break Buffer ($)",         step = 0.5, group = G_BF)
+flipConfirmDist = input.float(10.0, "Flip Confirm Distance ($)", step = 0.5, group = G_BF)
+resetOnReclaim = input.bool(true,  "Reset Broken on Reclaim", group = G_BF)
+trackStaleBars = input.int(500, "Zone State Retention (bars without match)", minval = 10, group = G_BF)
+trackContinuity = input.float(0.5, "Zone Track · Min Source Continuity", minval = 0.01, maxval = 1.0, step = 0.05, group = G_BF)
+
+var string G_LIFE = "02 · Zone Lifetime"
+lifeHz1 = input.float(5.0,  "Lifetime · TF #1 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeHz2 = input.float(10.0, "Lifetime · TF #2 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeHz3 = input.float(30.0, "Lifetime · TF #3 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeExtendOn = input.bool(true,  "Extend Lifetime on Reaction / Flip", group = G_LIFE)
+lifeExtendRatio = input.float(0.5,  "Lifetime Extension Ratio", step = 0.1, minval = 0.0, group = G_LIFE)
+maxPersistZones = input.int(200, "Max Persistent Raw Zones", minval = 20, maxval = 800, group = G_LIFE)
+
+// ---- 2.10 Structural SL / TP ----------------------------------------------
+var string G_SLTP = "02 · Structural SL / TP"
+slBuffer = input.float(5.0,  "SL Buffer ($)", step = 0.5, group = G_SLTP)
+tpBuffer = input.float(0.0,  "TP Buffer ($)", step = 0.5, group = G_SLTP)
+maxSlDist = input.float(30.0, "Max SL Distance ($)", step = 1.0, group = G_SLTP)
+minStructRR = input.float(1,  "Minimum Structural RR", step = 0.1, group = G_SLTP,
+     tooltip = "Structural TPが存在する場合、この値未満のRRならエントリー禁止 (固定RR TPへ逃げない)。")
+tpMode = input.string("BOTH", "TP Mode", options = ["BOTH", "STRUCTURAL_ONLY", "FALLBACK_ONLY"], group = G_SLTP,
+     tooltip = "Structural TP と Fallback RR TP の成績を切り分けて検証するための採用フィルター。\n" +
+     "BOTH            : 現行動作。Structural TPがあればそれを使い、無ければFallback RR TP。\n" +
+     "STRUCTURAL_ONLY : Structural TPが存在するトレードのみ発注。無い場合はFallbackを作らずNoTrade。\n" +
+     "FALLBACK_ONLY   : Structural TPが存在しなかったシグナルのみFallback RR TPで発注。\n" +
+     "                  (Structural TPを無視してRR TPへ差し替えるのではなく、そのシグナル自体を除外する)\n" +
+     "SL判定 (Active Zone / SL Zone / SL距離) は3モードとも完全共通。")
+slMinScore = input.float(4.0,  "SL Zone · Min Score", step = 0.5, group = G_SLTP)
+slMinStrStr  = input.string("Medium", "SL Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+tpMinScore = input.float(7.0,  "TP Zone · Min Score", step = 0.5, group = G_SLTP)
+tpMinStrStr  = input.string("Strong", "TP Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+obsMinStrStr = input.string("Medium", "Obstacle · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+activeNoTradeMinStrStr = input.string("Medium", "Active Zone NoTrade · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP,
+     tooltip = "Entry価格がこのStrength以上の ACTIVE Zone (現在価格がZone内部) の中に\n" +
+               "ある場合は NO TRADE にする。Structural SL / TP が存在しても、\n" +
+               "Fallback RR TP も使わずエントリーを見送る。Long / Short 共通。")
+fallbackRR = input.float(2.0, "Fallback RR (Structural TPが無い場合のみ使用)", step = 0.1, minval = 0.1, group = G_SLTP,
+     tooltip = "有効なTP Zoneが見つからない場合のみ、Structural SL距離 × この値でTPを作る。")
+
+// ============================================================================
+// 01-3. SIGNAL ENGINE INPUTS  (FVG Logic)
+// ----------------------------------------------------------------------------
+//  変数名 / 初期値 / options / minval / maxval / step / tooltip は
+//  Strategy から一切変更していない。
+// ============================================================================
+
+// ---- 5.1 Inputs : エントリー / トリガー -----------------------------------
+var string GF_ENT = "03 · FVG · Entry"
+strictEngulf = input.bool(true,  "実体が前足を完全に包む", group = GF_ENT)
+reqOppColor  = input.bool(true,  "前足が反対色であることを要求", group = GF_ENT)
+
+var string GF_TRG = "03 · FVG · Trigger"
+useEngulfingTrigger    = input.bool(false, "包み足", group = GF_TRG)
+usePinbarTrigger       = input.bool(false, "ピンバー", group = GF_TRG)
+useBOSTrigger          = input.bool(false, "BOS / 直近高安更新", group = GF_TRG)
+useEMARejectTrigger    = input.bool(false, "EMAリジェクト", group = GF_TRG)
+useFVGTriggerFormation = input.bool(false, "FVG形成", group = GF_TRG)
+useStrongCandleTrigger = input.bool(false, "強ローソク", group = GF_TRG)
+
+triggerMode     = input.string("Any", "トリガー結合", options = ["Any", "All", "MinCount"], group = GF_TRG)
+minTriggerCount = input.int(1, "最低トリガー数 (MinCount時)", group = GF_TRG)
+
+useLowerTFTrigger = input.bool(true, "1分足トリガーを使う", group = GF_TRG)
+triggerTF         = input.timeframe("1", "トリガー時間足", group = GF_TRG)
+
+emaLenTrigger      = input.int(20,  "EMA Length (EMAリジェクト)", group = GF_TRG)
+useEMARejectSlopeFilter = input.bool(false, "EMAリジェクト 傾きフィルター", group = GF_TRG)
+emaRejectSlopeLookback  = input.int(3, "EMAリジェクト 傾き判定本数", group = GF_TRG)
+emaRejectSlopeMinATR    = input.float(0.12, "EMAリジェクト 最低傾き ATR倍率", group = GF_TRG)
+emaRejectSlopeAtrLen    = input.int(14, "EMAリジェクト 傾きATR期間", group = GF_TRG)
+bosLookback        = input.int(10,  "BOS Lookback", group = GF_TRG)
+pinWickBodyMult    = input.float(3.0, "ピンバー ヒゲ/実体倍率", group = GF_TRG)
+pinOppWickMaxRatio = input.float(2.0, "ピンバー 反対ヒゲ上限", group = GF_TRG)
+usePinBodyRatioFilter = input.bool(false, "ピンバー 実体率フィルター", group = GF_TRG)
+pinMaxBodyRatio       = input.float(0.1, "ピンバー 最大実体率", group = GF_TRG)
+usePinRangeFilter     = input.bool(false, "ピンバー 最低レンジフィルター", group = GF_TRG)
+pinRangeAtrLen        = input.int(14, "ピンバー ATR期間", group = GF_TRG)
+pinMinRangeATR        = input.float(0.10, "ピンバー 最低レンジ ATR倍率", group = GF_TRG)
+strongBodyRatio    = input.float(0.6, "強ローソク 実体率", group = GF_TRG)
+trigCloseEdgeRatio = input.float(0.7, "ピン/強 終値端寄せ比率", group = GF_TRG)
+useEngulfBodyRatioFilter   = input.bool(true, "包み足 包み込み率フィルター", group = GF_TRG)
+engulfBodyRatioMin         = input.float(1.20, "包み足 最低包み込み率", group = GF_TRG)
+useEngulfBodyQualityFilter = input.bool(true, "包み足 実体率フィルター", group = GF_TRG)
+engulfMinBodyRatio         = input.float(0.60, "包み足 最低実体率", group = GF_TRG)
+useEngulfBodyAtrFilter     = input.bool(true, "包み足 最低実体ATRフィルター", group = GF_TRG)
+engulfAtrLen               = input.int(14, "包み足 ATR期間", group = GF_TRG)
+engulfMinBodyATR           = input.float(0.30, "包み足 最低実体 ATR倍率", group = GF_TRG)
+
+useTriggerCooldown        = input.bool(false, "トリガークールダウン", group = GF_TRG)
+triggerCooldownBars       = input.int(3, "クールダウン本数", group = GF_TRG)
+useOppositeTriggerNoTrade = input.bool(true, "逆方向トリガー同時発生はNoTrade", group = GF_TRG)
+
+// ---- 5.2 Inputs : ボラフィルタ --------------------------------------------
+var string GF_VOL = "03 · FVG · Volatility"
+volMode  = input.string("OFF", "通常ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = GF_VOL)
+fixedMin = input.float(1.0, "最低レンジ (価格・固定値)", group = GF_VOL)
+atrLenBase   = input.int(14, "基準ATR本数", group = GF_VOL)
+atrTf        = input.timeframe("", "基準ATR時間足(空=チャート)", group = GF_VOL)
+useMinVol    = input.bool(true,  "低ボラ時はエントリー禁止", group = GF_VOL)
+minAtrDollar = input.float(1.5,  "最低ATR($)", group = GF_VOL)
+volModeRel   = input.bool(false, "低ボラ判定を相対ATRにする", group = GF_VOL)
+volAvgLen    = input.int(480,    "ATR平均本数", group = GF_VOL)
+volRatioMin  = input.float(0.9,  "ATR ÷ ATR平均 最低比", group = GF_VOL)
+fastVolMode  = input.string("固定値", "高速ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = GF_VOL)
+fastAtrLen   = input.int(5,      "fastATR/値幅 参照本数", group = GF_VOL)
+fastAtrMin   = input.float(2.2,  "fastATR最低($) ※ATR時", group = GF_VOL)
+fastFixedMin = input.float(10.0, "直近値幅 最低($) ※固定値時", group = GF_VOL)
+bodyAvgLen   = input.int(5,      "実体平均本数", group = GF_VOL)
+bodyAvgMin   = input.float(0.5,  "実体平均最低($)", group = GF_VOL)
+useRangeRatioFilter = input.bool(true, "fastATR ÷ RangeWidth を使う ※ATR時", group = GF_VOL)
+rangeLookback       = input.int(20,    "RangeWidth参照本数", group = GF_VOL)
+atrRangeRatioMin    = input.float(0.06, "fastATR ÷ RangeWidth 最低比", group = GF_VOL)
+useVolCooldown  = input.bool(false, "低ボラ解除後の待機を使う", group = GF_VOL)
+volRecoveryBars = input.int(2,      "低ボラ解除後の待機本数", group = GF_VOL)
+
+// ---- 5.3 Inputs : 環境フィルタ (EMAトレンド) ------------------------------
+var string GF_ENV = "03 · FVG · Trend Env"
+useEnvFilter = input.bool(true, "環境フィルタを使う (重い/OFFで軽量)", group = GF_ENV)
+reqTrend4H  = input.string("上昇", "4H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf4", group = GF_ENV)
+tf4H        = input.timeframe("240", "TF", inline = "tf4", group = GF_ENV)
+reqTrend1H  = input.string("上昇", "1H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf1", group = GF_ENV)
+tf1H        = input.timeframe("60",  "TF", inline = "tf1", group = GF_ENV)
+reqTrend15M = input.string("上昇", "15M 要求", options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf15", group = GF_ENV)
+tf15M       = input.timeframe("15",  "TF", inline = "tf15", group = GF_ENV)
+reqTrend5M  = input.string("OFF", "5M 要求",  options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf5", group = GF_ENV)
+tf5M        = input.timeframe("5",   "TF", inline = "tf5", group = GF_ENV)
+reqTrend1M  = input.string("OFF", "1M 要求",  options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf1m", group = GF_ENV)
+tf1M        = input.timeframe("1",   "TF", inline = "tf1m", group = GF_ENV)
+
+useEma20Above50Up   = input.bool(true, "1. EMA20 > EMA50", group = GF_ENV)
+useEma20SlopeUp     = input.bool(true, "2. EMA20 が上向き", group = GF_ENV)
+useEma50SlopeUp     = input.bool(true, "3. EMA50 が上向き", group = GF_ENV)
+useCloseAboveEma50  = input.bool(true, "4. close > EMA50", group = GF_ENV)
+useCloseAboveEma200 = input.bool(true, "5. close > EMA200", group = GF_ENV)
+useEmaDistanceWideU = input.bool(true, "6. EMA20/50 距離が広い", group = GF_ENV)
+useEmaExpansionU    = input.bool(true, "7. EMA20/50 が拡散中", group = GF_ENV)
+
+useEma20Below50Dn   = input.bool(true, "1. EMA20 < EMA50", group = GF_ENV)
+useEma20SlopeDown   = input.bool(true, "2. EMA20 が下向き", group = GF_ENV)
+useEma50SlopeDown   = input.bool(true, "3. EMA50 が下向き", group = GF_ENV)
+useCloseBelowEma50  = input.bool(true, "4. close < EMA50", group = GF_ENV)
+useCloseBelowEma200 = input.bool(true, "5. close < EMA200", group = GF_ENV)
+useEmaDistanceWideD = input.bool(true, "6. EMA20/50 距離が広い", group = GF_ENV)
+useEmaExpansionD    = input.bool(true, "7. EMA20/50 が拡散中", group = GF_ENV)
+
+useEmaDistanceNarrow = input.bool(true, "1. EMA20/50 距離が近い", group = GF_ENV)
+useEma20SlopeWeak    = input.bool(true, "2. EMA20 の傾きが弱い", group = GF_ENV)
+useEma50SlopeWeak    = input.bool(true, "3. EMA50 の傾きが弱い", group = GF_ENV)
+useEmaCompression    = input.bool(true, "4. EMA20/50 が収束中", group = GF_ENV)
+useEma20CrossCount   = input.bool(true, "5. 価格が EMA20 を一定回数跨ぐ", group = GF_ENV)
+useEma50CrossCount   = input.bool(true, "6. 価格が EMA50 を一定回数跨ぐ", group = GF_ENV)
+useRangeWidthSmall   = input.bool(true, "7. 高値安値幅が小さい", group = GF_ENV)
+
+len20        = input.int(20,   "EMA20 length", group = GF_ENV)
+len50        = input.int(50,   "EMA50 length", group = GF_ENV)
+len200       = input.int(200,  "EMA200 length", group = GF_ENV)
+envAtrLen    = input.int(14,   "環境ATR length", group = GF_ENV)
+slopeBars    = input.int(3,    "EMA 傾き判定本数", group = GF_ENV)
+slopeMinMult = input.float(0.15, "EMA 傾きの最低値 ATR倍率", group = GF_ENV)
+distWideMult = input.float(0.50, "EMA20/50 距離 広い判定 ATR倍率", group = GF_ENV)
+distNarrowMult = input.float(0.25, "EMA20/50 距離 近い判定 ATR倍率", group = GF_ENV)
+convDivBars  = input.int(5,    "収束/拡散 判定本数", group = GF_ENV)
+crossBars    = input.int(20,   "EMA跨ぎ回数 判定本数", group = GF_ENV)
+crossMinCount = input.int(3,   "EMA跨ぎ回数 最低回数", group = GF_ENV)
+rangeBars    = input.int(20,   "レンジ幅 判定本数", group = GF_ENV)
+rangeMult    = input.float(1.5, "レンジ幅 ATR倍率", group = GF_ENV)
+
+tieAsRange          = input.bool(true, "同点時にレンジ扱いする", group = GF_ENV)
+insufficientAsRange = input.bool(true, "条件不足時にレンジ扱いする", group = GF_ENV)
+minScore4H  = input.int(3, "4H 最低必要スコア", group = GF_ENV)
+minScore1H  = input.int(3, "1H 最低必要スコア", group = GF_ENV)
+minScore15M = input.int(3, "15M 最低必要スコア", group = GF_ENV)
+minScore5M  = input.int(3, "5M 最低必要スコア", group = GF_ENV)
+minScore1M  = input.int(3, "1M 最低必要スコア", group = GF_ENV)
+reqMatchCount = input.int(0, "必要一致TF数 (0=有効な全TFが一致)", group = GF_ENV)
+
+// ---- 5.4 Inputs : 日足レジーム --------------------------------------------
+var string GF_DR = "03 · FVG · Daily Regime"
+useDailyRegimeFilter = input.bool(true, "日足レジームフィルターを使う", group = GF_DR)
+dailyRegimeMode = input.string("当日進行中ベース", "日足レジーム判定モード", options = ["前日確定ベース", "当日進行中ベース", "当日確定後分析"], group = GF_DR)
+reqDailyDirection  = input.string("OFF", "日足方向", options = ["OFF", "上昇", "レンジ", "下降"], group = GF_DR)
+reqDailyVolatility = input.string("低ボラ", "日足ボラ", options = ["OFF", "高ボラ", "中ボラ", "低ボラ"], group = GF_DR)
+dailyVolMedianLength  = input.int(10, "日足ボラ中央値期間", minval = 3, group = GF_DR)
+dailyLowVolThreshold  = input.float(100.0, "低ボラ上限", group = GF_DR)
+dailyHighVolThreshold = input.float(100.0, "高ボラ下限", group = GF_DR)
+dailyDirectionBodyRatio = input.float(0.40, "日足方向 最低実体率", group = GF_DR)
+dailyBullCloseLocation  = input.float(0.65, "日足上昇 終値位置下限", group = GF_DR)
+dailyBearCloseLocation  = input.float(0.35, "日足下降 終値位置上限", group = GF_DR)
+dailyInsufficientAsRange = input.bool(true, "日足データ不足時はレンジ扱い", group = GF_DR)
+
+// ---- 5.5 Inputs : Accumulation NoTrade ------------------------------------
+var string GF_ACC = "03 · FVG · Accumulation NoTrade"
+useAccumNoTrade = input.bool(true, "Accumulation NoTradeフィルターを使う", group = GF_ACC)
+useAccumNT5M    = input.bool(true, "5分足Accumを使う",  group = GF_ACC)
+useAccumNT15M   = input.bool(true, "15分足Accumを使う", group = GF_ACC)
+accumNTKeep     = input.int(1, "保持するAccum数", minval = 1, maxval = 10, group = GF_ACC)
+accumNT15Tf     = input.timeframe("15", "15分足TF", group = GF_ACC)
+accumNTRangeLen        = input.int(10,   "Accum判定レンジ本数",  minval = 6,  group = GF_ACC)
+accumNTBaseLen         = input.int(20,   "基準平均本数",         minval = 10, group = GF_ACC)
+accumNTAtrLen          = input.int(14,   "ATR本数",             minval = 1,  group = GF_ACC)
+accumNTMinUpperCloses  = input.int(4,    "上半分の最低終値本数",  minval = 1,  group = GF_ACC)
+accumNTMinLowerCloses  = input.int(4,    "下半分の最低終値本数",  minval = 1,  group = GF_ACC)
+accumNTMaxSameColorRun = input.int(4,    "同色連続の上限",       minval = 1,  group = GF_ACC)
+accumNTAtrMult         = input.float(2.5,  "Accum レンジ幅 / ATR 上限",    minval = 0.5,  step = 0.1,  group = GF_ACC)
+accumNTBarRatioMax     = input.float(0.70, "Accum 平均値幅/基準平均 上限", minval = 0.1,  step = 0.01, group = GF_ACC)
+accumNTDriftMax        = input.float(0.30, "Accum ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = GF_ACC)
+useAccumExitConfirm  = input.bool(false, "Accum離脱後の確認を使う", group = GF_ACC)
+accumExitConfirmBars = input.int(2, "Accum離脱後の待機本数", minval = 1, maxval = 20, group = GF_ACC)
+useAccumBreakDirection  = input.bool(true, "Accum離脱方向フィルターを使う", group = GF_ACC)
+accumBreakDirectionBars = input.int(10, "Accum離脱方向の有効本数", minval = 1, maxval = 100, group = GF_ACC)
+
+// ---- 5.6 Inputs : FVG 環境認識 --------------------------------------------
+var string GF_EFVG = "03 · FVG · FVG Env"
+useEFVGEnv = input.bool(true, "FVG環境認識を使う (重い/OFFで軽量)", group = GF_EFVG)
+efvgCombineMode = input.string("TrendAndFVG", "トレンド環境との結合", options = ["TrendOnly", "FVGOnly", "TrendAndFVG", "TrendOrFVG"], group = GF_EFVG)
+useEFVGDaily = input.bool(false, "日足FVGを使う", group = GF_EFVG)
+useEFVG4H    = input.bool(false, "4時間足FVGを使う", group = GF_EFVG)
+useEFVG1H    = input.bool(false, "1時間足FVGを使う", group = GF_EFVG)
+useEFVG15M   = input.bool(false, "15分足FVGを使う", group = GF_EFVG)
+useEFVG5M    = input.bool(true,  "5分足FVGを使う", group = GF_EFVG)
+useEFVG1M    = input.bool(false, "1分足FVGを使う", group = GF_EFVG)
+efvgDailyTF = input.timeframe("D",   "日足TF", group = GF_EFVG)
+efvg4HTF    = input.timeframe("240", "4時間足TF", group = GF_EFVG)
+efvg1HTF    = input.timeframe("60",  "1時間足TF", group = GF_EFVG)
+efvg15MTF   = input.timeframe("15",  "15分足TF", group = GF_EFVG)
+efvg5MTF    = input.timeframe("5",   "5分足TF", group = GF_EFVG)
+efvg1MTF    = input.timeframe("1",   "1分足TF", group = GF_EFVG)
+efvgHoldDaily = input.int(3,  "日足 状態保持本数",  minval = 1, group = GF_EFVG)
+efvgHold4H    = input.int(6,  "4H 状態保持本数",   minval = 1, group = GF_EFVG)
+efvgHold1H    = input.int(12, "1H 状態保持本数",   minval = 1, group = GF_EFVG)
+efvgHold15M   = input.int(24, "15M 状態保持本数",  minval = 1, group = GF_EFVG)
+efvgHold5M    = input.int(30, "5M 状態保持本数",   minval = 1, group = GF_EFVG)
+efvgHold1M    = input.int(40, "1M 状態保持本数",   minval = 1, group = GF_EFVG)
+efvgMinThick        = input.float(0.0,  "FVG最小厚み (幅/ATR)", step = 0.05, group = GF_EFVG)
+reboundDepthMax     = input.float(0.90, "反発 最大侵入率 (FVG内部・幅比率)", minval = 0.0, step = 0.05, group = GF_EFVG)
+reboundRecoverRatio = input.float(0.10, "反発 回復位置 (FVG幅比率)", minval = 0.0, maxval = 1.0, step = 0.05, group = GF_EFVG)
+efvgIntegrationMode = input.string("WeightedScore", "統合方式", options = ["AllAgree", "MatchCount", "WeightedScore", "HTFPriority"], group = GF_EFVG)
+efvgReqMatch  = input.int(3, "必要一致足数 (MatchCount時)", minval = 1, maxval = 6, group = GF_EFVG)
+efvgWeightD   = input.int(6, "重み 日足",  minval = 0, group = GF_EFVG)
+efvgWeight4H  = input.int(5, "重み 4H",   minval = 0, group = GF_EFVG)
+efvgWeight1H  = input.int(4, "重み 1H",   minval = 0, group = GF_EFVG)
+efvgWeight15M = input.int(3, "重み 15M",  minval = 0, group = GF_EFVG)
+efvgWeight5M  = input.int(2, "重み 5M",   minval = 0, group = GF_EFVG)
+efvgWeight1M  = input.int(1, "重み 1M",   minval = 0, group = GF_EFVG)
+efvgScoreThresh = input.int(1, "スコア閾値 (±・WeightedScore時)", minval = 1, group = GF_EFVG)
+efvgMode4Allow  = input.bool(false, "HTF優先時 下位逆行でもエントリー許可", group = GF_EFVG)
+
+var string GF_BOS = "03 · FVG · 構造管理 BOS"
+useFvgBosFilter = input.bool(true, "FVG反発にBOS方向フィルターを使う", group = GF_BOS)
+fvgBosLookback  = input.int(5, "BOS Lookback", minval = 2, group = GF_BOS)
+
+// ---- 3.x FVG15 Logic (15M FVG反発 → 5M BOS 順序確認) -----------------------
+var string GF_F15 = "03 · FVG15 · 15M FVG → 5M BOS"
+use15mFvgBosOrder  = input.bool(true, "15M FVG反発後の5M BOSを確認する", group = GF_F15,
+     tooltip = "ON: 反発した15M足の開始以降に成立した同方向5M BOSだけを有効とする\n" +
+     "     (反発より前に出ていた古いBOSは使わない)。1反発イベントにつきEntryは1回。\n" +
+     "OFF: 順序確認なし。15M FVG環境が成立していれば入る。")
+bos15mTo5mLookback = input.int(3, "5M BOS Lookback (FVG15専用)", minval = 1, group = GF_F15,
+     tooltip = "既存FVG Logicの BOS Lookback とは完全に別。")
+fvg15Hold = input.int(18, "FVG15 状態保持本数", minval = 1, group = GF_F15,
+     tooltip = "FVG15 Logic が使う15M反発biasの保持本数。\n" +
+     "既存5M FVG Logic の FVG環境認識 (15分足FVGを使う) と FVGABS15 は\n" +
+     "従来どおり「15M 状態保持本数」(efvgHold15M) を使う。")
+
+// ---- 3.y FVG吸収系列 (FVGABS5 / FVGABS15) ----------------------------------
+var string GF_ABS = "03 · FVGABS · FVG吸収 → BOS (Longのみ)"
+useAbsCandleColor = input.bool(true, "吸収: 方向と同じローソク色を要求", group = GF_ABS)
+useAbsBodyFilter  = input.bool(true, "吸収: 最低実体率を要求", group = GF_ABS)
+useAbsEdgeFilter  = input.bool(true, "吸収: 終値端寄せを要求", group = GF_ABS)
+efvgAbsBodyMin    = input.float(0.50, "吸収 実体最小比率", step = 0.05, group = GF_ABS)
+efvgAbsEdge       = input.float(0.60, "吸収 終値端寄せ比率", step = 0.05, group = GF_ABS)
+absHold5M         = input.int(24, "FVGABS5 状態保持本数", minval = 1, group = GF_ABS,
+     tooltip = "5M吸収bias の保持本数。反発系列の「5M 状態保持本数」(efvgHold5M) とは別。\n" +
+     "15M吸収は既存の efvgHold15M を共有する。")
+absBos1mLookback  = input.int(10, "1M BOS Lookback (FVGABS5用)", minval = 1, group = GF_ABS)
+absBos5mLookback  = input.int(3,  "5M BOS Lookback (FVGABS15用)", minval = 1, group = GF_ABS)
+absVolMin = input.float(0.0,   "日足ボラ中央値 下限 ($ · 以上)", group = GF_ABS,
+     tooltip = "吸収系列の環境条件。前日までの直近N本の確定Daily Range中央値で判定する\n" +
+     "(既存の日足レジーム計算をそのまま再利用。request は増やしていない)。")
+absVolMax = input.float(100.0, "日足ボラ中央値 上限 ($ · 未満)", group = GF_ABS)
+
+// ---- 3.z Zone Touch → BOS Logic (ZONEBOS) ----------------------------------
+var string GF_ZBOS = "03 · ZONEBOS · Zone Touch → BOS"
+zoneBosMinStrStr = input.string("Strong", "Zone BOS · 対象 最低Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = GF_ZBOS,
+     tooltip = "このStrength以上のZoneへのタッチだけをEntry対象にする。\n" +
+     "Long は Support Zone、Short は Resistance Zone のタッチのみ有効。")
+zoneBosTf        = input.timeframe("1", "Zone BOS Timeframe", group = GF_ZBOS,
+     tooltip = "BOSを判定する時間足。既存FVGの triggerTF 等とは共有しない専用設定。")
+zoneBosLookback  = input.int(10, "Zone BOS Lookback", minval = 1, group = GF_ZBOS,
+     tooltip = "BOSの定義は既存と同一 (close > ta.highest(high, n)[1] / close < ta.lowest(low, n)[1])。\n" +
+     "Lookback値だけ Zone BOS 単独で変更できる。")
+zoneBosReqDailyVolatility    = input.string("中ボラ", "Zone BOS · 日足ボラ", options = ["OFF", "高ボラ", "中ボラ", "低ボラ"], group = GF_ZBOS,
+     tooltip = "FVG側の「日足ボラ」とは完全に独立。どちらを変えても他方に影響しない。")
+zoneBosDailyLowVolThreshold  = input.float(0.0,  "Zone BOS · 低ボラ上限", group = GF_ZBOS)
+zoneBosDailyHighVolThreshold = input.float(80.0, "Zone BOS · 高ボラ下限", group = GF_ZBOS)
+zoneBosMinMoveAway = input.float(0.0, "Zone BOS · 最低離脱距離 ($)", minval = 0.0, step = 0.5, group = GF_ZBOS,
+     tooltip = "Zoneタッチ後、この距離ぶんZoneから離れてからでないとBOSを有効にしない。\n" +
+     "  Long  : close >= タッチしたSupport Zoneの上端 + この距離\n" +
+     "  Short : close <= タッチしたResistance Zoneの下端 - この距離\n" +
+     "基準はタッチ価格ではなくZoneの境界。判定は終値のみ (ヒゲだけでは成立しない)。\n" +
+     "0 にすると条件OFF = 従来の Touch → BOS → Entry と同じ挙動。")
+zoneBosWaitBars  = input.int(30, "Zone BOS · BOS待機本数", minval = 0, group = GF_ZBOS,
+     tooltip = "Zoneタッチした「BOS対象時間足の足」を0本目として、この本数後まで有効。\n" +
+     "同一足でのタッチ+BOS (経過0本) も有効。既定の 1M × 30本 なら約30分の待機期間。\n" +
+     "BOS時間足を変えると、待機期限もその時間足基準の本数になる (5M × 30本 なら約150分)。")
+
+// ============================================================================
+// 01-4. TRADE ENGINE INPUTS
+// ============================================================================
+var string G_RISK = "04 · Trade Engine · Risk"
+//  ★ Indicator専用の追加input (1つだけ) ★
+//    Strategy の strategy(initial_capital = 1000) に対応する。
+//    Indicator は strategy.initial_capital / strategy.equity を読めないため、
+//    同じ数値をここから与える。必ず Strategy の initial_capital と一致させること。
+//    ここがズレると Qty が変わり、Qty不足によるEntry可否が Strategy とズレる。
+indInitialCapital = input.float(1000, "初期資金 (Strategyの initial_capital と一致させる)", minval = 0.01, group = G_RISK,
+     tooltip = "Strategy側 strategy(initial_capital = 1000) と同じ値にする。\n" +
+     "useCompound = false のときは f_qty が完全一致する。")
+riskPct     = input.float(5.0, "1トレード損失率 (%)", step = 0.1, group = G_RISK,
+     tooltip = "Risk Amount ÷ Structural SL距離 でQtyを計算する。")
+useCompound = input.bool(false, "複利 (残高ベース) ※OFF=元金単利", group = G_RISK)
+qtyStep     = input.float(1, "Qty 刻み (最小ロット単位)", minval = 0.00000001, step = 0.01, group = G_RISK,
+     tooltip = "XAUUSD等の小数ロットを潰さないための刻み。\n" +
+               "0.01 → 0.01単位で発注 / 1 → 整数ロットのみ。\n" +
+               "Qty = floor(RiskAmount ÷ SL距離 ÷ step) × step")
+qtyMin      = input.float(0.01, "Qty 最小値 (これ未満はエントリーしない)", minval = 0.0, step = 0.01, group = G_RISK)
+
+var string G_TE = "04 · Trade Engine · Order"
+maxOpenPerLogic    = input.int(1, "Logicごとの最大同時保有トレード数", minval = 1, maxval = 50, group = G_TE,
+     tooltip = "同一logicIdのポジションをいくつまで同時に持てるか。Logic間は互いに影響しない。")
+allowOppositeEntry = input.bool(false, "反対方向Logicの同時Entryを許可", group = G_TE,
+     tooltip = "TradingView Strategyは単一ネットポジションのため、反対方向Entryは既存Tradeを\n" +
+               "打ち消してしまう。既定 (false) では反対方向シグナルをSKIPする。")
+
+var string G_BE = "04 · Trade Engine · Break Even"
+useBreakEven         = input.bool(true, "建値移動を使う", group = G_BE,
+     tooltip = "既定OFF。OFF時はStructural SL / TPの結果をそのまま検証できる。")
+breakEvenTrigger     = input.float(15.0, "建値移動開始幅 ($)", step = 0.1, group = G_BE,
+     tooltip = "既存5M FVG反発 (FVG) およびその他Logic 用。FVG15 / FVG吸収は下の専用設定を使う。")
+fvg15BreakEvenTrigger = input.float(10.0, "FVG15 建値移動開始幅 ($)", step = 0.1, group = G_BE,
+     tooltip = "15M FVG反発 Logic (FVG15) だけこの幅を使う。")
+absBreakEvenTrigger  = input.float(10.0, "FVG吸収 建値移動開始幅 ($)", step = 0.1, group = G_BE,
+     tooltip = "FVG吸収系列 (FVGABS5 / FVGABS15) だけこの幅を使う。\n" +
+     "建値移動の判定方式 / SLを建値へ動かす処理 / TP再指定は共通のまま。")
+zoneBosBreakEvenTrigger = input.float(10.0, "ZONEBOS 建値移動開始幅 ($)", step = 0.1, group = G_BE,
+     tooltip = "Zone Touch → BOS Logic (ZONEBOS) だけこの幅を使う。")
+breakEvenTriggerMode = input.string("到達瞬間", "建値移動判定", options = ["到達瞬間", "確定足"], group = G_BE)
+
+// ============================================================================
+// 01-5. DISPLAY / DEBUG INPUTS  (Strategy と同一)
+// ============================================================================
+var string G_DBGC = "05 · Debug · Trade"
+showEntryLabel = input.bool(true, "Entry Debug Label を表示", group = G_DBGC)
+showTradeDebug = input.bool(true, "Trade Debug 行 (最新TradePlan) を表示", group = G_DBGC)
+// ---- 2.11 Zone Display -----------------------------------------------------
+var string G_DISP = "05 · Display · Zone"
+showZones     = input.bool(true,  "Show Zones (box)",          group = G_DISP)
+showMaLines   = input.bool(true,  "Plot MA Source Lines",      group = G_DISP)
+showLabels    = input.bool(true,  "Show Zone Labels",          group = G_DISP)
+showDetailLbl = input.bool(false, "Detailed Labels (sources)", group = G_DISP)
+maxZonesDraw  = input.int(30, "Max Zones Drawn", minval = 1, maxval = 120, group = G_DISP)
+zoneLeftBars  = input.int(150, "Zone Box · Left Extension (bars)",  minval = 1, group = G_DISP)
+zoneRightBars = input.int(30,  "Zone Box · Right Extension (bars)", minval = 1, group = G_DISP)
+colSupport    = input.color(color.new(#26A69A, 0), "Color · Support",    group = G_DISP)
+colResistance = input.color(color.new(#EF5350, 0), "Color · Resistance", group = G_DISP)
+colActive     = input.color(color.new(#FFB300, 0), "Color · Active",     group = G_DISP)
+colBroken     = input.color(color.new(#78909C, 0), "Color · Broken",     group = G_DISP)
+trWeak        = input.int(90, "Transparency · Weak",        minval = 0, maxval = 100, group = G_DISP)
+trMedium      = input.int(80, "Transparency · Medium",      minval = 0, maxval = 100, group = G_DISP)
+trStrong      = input.int(68, "Transparency · Strong",      minval = 0, maxval = 100, group = G_DISP)
+trVStrong     = input.int(55, "Transparency · Very Strong", minval = 0, maxval = 100, group = G_DISP)
+
+var string G_DBG = "05 · Debug · Zone"
+showDebugTable = input.bool(true, "Show Zone Debug Table", group = G_DBG)
+dbgPosStr      = input.string("Top Right", "Debug Table Position",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group = G_DBG)
+dbgNearestN    = input.int(3, "Nearest Zones per Side", minval = 1, maxval = 5, group = G_DBG)
+dbgTextSize    = input.string("Small", "Debug Table Text Size", options = ["Tiny", "Small", "Normal"], group = G_DBG)
+showDailyVolDebug = input.bool(true, "日足ボラ中央値デバッグ表示", group = GF_DR)
+efvgShowTable = input.bool(true,  "FVG環境テーブルを表示", group = GF_EFVG)
+efvgShowDebug = input.bool(false, "デバッグ(スコア/状態)を表示", group = GF_EFVG)
+showFvgBosDebug = input.bool(false, "FVG構造BOS デバッグ表示", group = GF_BOS)
+
+// ============================================================================
+// 01-6. INDICATOR 専用 表示 INPUTS  (判定には一切influenceしない)
+// ----------------------------------------------------------------------------
+//  ここにあるのは全て「表示のON/OFFと見た目」だけ。Entry判定に使うinputは無い。
+// ============================================================================
+var string G_SIG = "06 · Signal 表示"
+showEntrySignal = input.bool(true,  "ENTRY SIGNAL を表示 (発注バー · Strategy比較用)", group = G_SIG,
+     tooltip = "Strategy が strategy.entry() を呼んだバーに表示する。\n" +
+     "Strategy の List of Trades と 1対1 で突き合わせるのはこちら。")
+showEntryShape  = input.bool(true,  "ENTRY 三角マーカーを表示", group = G_SIG)
+showFillMarker  = input.bool(false, "FILL マーカーを表示 (次バー始値の約定位置)", group = G_SIG,
+     tooltip = "発注バーではなく「約定バー」に小さな × を出す。\n" +
+     "ENTRY SIGNAL とは別物なので混同しないこと。Alert は発火しない。")
+sigLabelSize    = input.string("小", "ラベルサイズ", options = ["小", "普通", "大"], group = G_SIG)
+sigOffsetAtrLen = input.int(14, "ラベル間隔 ATR期間", minval = 1, group = G_SIG)
+sigOffsetMult   = input.float(0.8, "ラベル間隔 (ATR倍率)", step = 0.1, group = G_SIG)
+sigShowEid      = input.bool(true,  "ラベルに Entry ID を表示",   group = G_SIG)
+sigShowPlan     = input.bool(true,  "ラベルに Plan Entry を表示", group = G_SIG)
+sigShowSlTp     = input.bool(true,  "ラベルに SL / TP を表示",    group = G_SIG)
+sigShowRr       = input.bool(true,  "ラベルに RR を表示",         group = G_SIG)
+sigShowQty      = input.bool(true,  "ラベルに Qty を表示",        group = G_SIG)
+
+var string G_MATCH = "07 · Debug · Strategy一致確認"
+showMatchTable  = input.bool(true, "RAW / GATE / PLAN / ENTRY カウンタを表示", group = G_MATCH)
+matchPosStr     = input.string("Bottom Left", "カウンタ表示位置",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Center"], group = G_MATCH)
+showEntryLog    = input.bool(true, "Entry ID ログを表示", group = G_MATCH)
+entryLogPosStr  = input.string("Middle Center", "Entry ID ログ表示位置",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Center"], group = G_MATCH)
+entryLogRows    = input.int(50, "Entry ID ログ 表示件数", minval = 5, maxval = 50, group = G_MATCH)
+entryLogTz      = input.string("Asia/Tokyo", "Entry ID ログ タイムゾーン", group = G_MATCH,
+     tooltip = "Strategy の List of Trades と突き合わせやすいタイムゾーンにする。")
+matchTextSize   = input.string("Tiny", "一致確認テーブル 文字サイズ", options = ["Tiny", "Small", "Normal"], group = G_MATCH)
+
+// ============================================================================
+// 02. ENGINE INITIALIZATION
+// ----------------------------------------------------------------------------
+//  ★ Strategy Section 02 をそのままコピー。Engineの生成方法・代入値・代入順序・
+//    共有/分離の構成を1行も変えていない。
+// ============================================================================
+
+// ---- 2.1 Engines -----------------------------------------------------------
+var zn.ZoneEngine zoneEng = zn.newEngine()
+var sg.FvgEngine  fvgEng  = sg.newFvgEngine()
+// FVG15 Logic 用。Engineは既存 fvgEng とは別インスタンスなので、
+// Armed / Cooldown / Accum / Daily の状態は既存5M Logicと一切混ざらない。
+var sg.FvgEngine   fvg15Eng = sg.newFvgEngine()
+var sg.Fvg15Engine fvg15Ord = sg.newFvg15Engine()
+// FVG吸収系列 用。反発系列 (fvgEng / fvg15Eng / fvg15Ord) とstateを共有しない。
+var sg.FvgAbsEngine fvgAbsEng = sg.newFvgAbsEngine()
+// Zone Touch → BOS 用。FVG系列のEngineとstateを共有しない。
+var sg.ZoneBosEngine zoneBosEng = sg.newZoneBosEngine()
+
+// ---- 2.2 Zone Engine Config -----------------------------------------------
+zn.ZoneCfg zoneCfg = zn.newCfg()
+zoneCfg.zoneHalfWidth        := zoneHalfWidth
+zoneCfg.useMaSource          := useMaSource
+zoneCfg.maTfName             := maTf
+zoneCfg.ma1Len               := ma1Len
+zoneCfg.ma2Len               := ma2Len
+zoneCfg.scoreMa1             := scoreMa1
+zoneCfg.scoreMa2             := scoreMa2
+zoneCfg.slopeThrMod          := slopeThrMod
+zoneCfg.slopeThrStrong       := slopeThrStrong
+zoneCfg.slopeBonusFlat       := slopeBonusFlat
+zoneCfg.slopeBonusMod        := slopeBonusMod
+zoneCfg.slopeBonusStr        := slopeBonusStr
+zoneCfg.slopeBonusMax        := slopeBonusMode == "Max"
+zoneCfg.maClusterDist        := maClusterDist
+zoneCfg.maClusterBonus       := maClusterBonus
+zoneCfg.maClusterDirBonus    := maClusterDirBonus
+zoneCfg.useHzSource          := useHzSource
+zoneCfg.hzTf1                := hzTf1
+zoneCfg.hzTf2                := hzTf2
+zoneCfg.hzTf3                := hzTf3
+zoneCfg.scoreHz1             := scoreHz1
+zoneCfg.scoreHz2             := scoreHz2
+zoneCfg.scoreHz3             := scoreHz3
+zoneCfg.reactionDist         := reactionDist
+zoneCfg.reactionBonus1       := reactionBonus1
+zoneCfg.reactionBonus2       := reactionBonus2
+zoneCfg.reactionBonus3       := reactionBonus3
+zoneCfg.reactionRearmDist    := reactionRearmDist
+zoneCfg.reactionAllSrc       := reactionAllSrc
+zoneCfg.useDayHL             := useDayHL
+zoneCfg.scoreDayHL           := scoreDayHL
+zoneCfg.carryPrevDayHL       := carryPrevDayHL
+zoneCfg.scorePrevDayHL       := scorePrevDayHL
+zoneCfg.lifePrevDayHL        := lifePrevDayHL
+zoneCfg.useAccSource         := useAccSource
+zoneCfg.accTf1               := accTf1
+zoneCfg.accTf2               := accTf2
+zoneCfg.accTf3               := accTf3
+zoneCfg.scoreAcc1            := scoreAcc1
+zoneCfg.scoreAcc2            := scoreAcc2
+zoneCfg.scoreAcc3            := scoreAcc3
+zoneCfg.accKeep1             := accKeep1
+zoneCfg.accKeep2             := accKeep2
+zoneCfg.accKeep3             := accKeep3
+zoneCfg.clusterDist          := clusterDist
+zoneCfg.thrMedium            := thrMedium
+zoneCfg.thrStrong            := thrStrong
+zoneCfg.thrVStrong           := thrVStrong
+zoneCfg.confBonus2           := confBonus2
+zoneCfg.confBonus3           := confBonus3
+zoneCfg.confBonus4           := confBonus4
+zoneCfg.flipBonus            := flipBonus
+zoneCfg.requireHtfForVStrong := requireHtfForVStrong
+zoneCfg.htfSwing1H           := htfSwing1H
+zoneCfg.htfAccum1H           := htfAccum1H
+zoneCfg.htfAccum4H           := htfAccum4H
+zoneCfg.htfAccumD            := htfAccumD
+zoneCfg.htfSwing15M          := htfSwing15M
+zoneCfg.htfMa1               := htfMa1
+zoneCfg.htfMa2               := htfMa2
+zoneCfg.htfDayHL             := htfDayHL
+zoneCfg.breakBuffer          := breakBuffer
+zoneCfg.flipConfirmDist      := flipConfirmDist
+zoneCfg.resetOnReclaim       := resetOnReclaim
+zoneCfg.trackStaleBars       := trackStaleBars
+zoneCfg.trackContinuity      := trackContinuity
+zoneCfg.lifeHz1              := lifeHz1
+zoneCfg.lifeHz2              := lifeHz2
+zoneCfg.lifeHz3              := lifeHz3
+zoneCfg.lifeExtendOn         := lifeExtendOn
+zoneCfg.lifeExtendRatio      := lifeExtendRatio
+zoneCfg.maxPersistZones      := maxPersistZones
+zoneCfg.slBuffer             := slBuffer
+zoneCfg.tpBuffer             := tpBuffer
+zoneCfg.maxSlDist            := maxSlDist
+zoneCfg.minStructRR          := minStructRR
+zoneCfg.slMinScore           := slMinScore
+zoneCfg.slMinStrength        := zn.strengthIdx(slMinStrStr)
+zoneCfg.tpMinScore           := tpMinScore
+zoneCfg.tpMinStrength        := zn.strengthIdx(tpMinStrStr)
+zoneCfg.obsMinStrength       := zn.strengthIdx(obsMinStrStr)
+zoneCfg.activeNoTradeMinStrength := zn.strengthIdx(activeNoTradeMinStrStr)
+zoneCfg.fallbackRR           := fallbackRR
+
+// ---- 2.3 Signal Engine Config (FVG) ---------------------------------------
+//  ★ Strategy と同じく Config を「どのコンテキストで評価されるか」で4つに分ける。
+//    security 式あたりの external elements 上限 (254) を超えないための分割で、
+//    分割のしかたも Strategy と完全に同一。
+
+// calcTriggers (1分足) が参照する設定
+sg.FvgTrigCfg fvgTrigCfg = sg.FvgTrigCfg.new(
+     strictEngulf = strictEngulf,
+     reqOppColor = reqOppColor,
+     useEngulfingTrigger = useEngulfingTrigger,
+     usePinbarTrigger = usePinbarTrigger,
+     useBOSTrigger = useBOSTrigger,
+     useEMARejectTrigger = useEMARejectTrigger,
+     useFVGTriggerFormation = useFVGTriggerFormation,
+     useStrongCandleTrigger = useStrongCandleTrigger,
+     triggerMode = triggerMode,
+     minTriggerCount = minTriggerCount,
+     useEMARejectSlopeFilter = useEMARejectSlopeFilter,
+     emaRejectSlopeMinATR = emaRejectSlopeMinATR,
+     pinWickBodyMult = pinWickBodyMult,
+     pinOppWickMaxRatio = pinOppWickMaxRatio,
+     usePinBodyRatioFilter = usePinBodyRatioFilter,
+     pinMaxBodyRatio = pinMaxBodyRatio,
+     usePinRangeFilter = usePinRangeFilter,
+     pinMinRangeATR = pinMinRangeATR,
+     strongBodyRatio = strongBodyRatio,
+     trigCloseEdgeRatio = trigCloseEdgeRatio,
+     useEngulfBodyRatioFilter = useEngulfBodyRatioFilter,
+     engulfBodyRatioMin = engulfBodyRatioMin,
+     useEngulfBodyQualityFilter = useEngulfBodyQualityFilter,
+     engulfMinBodyRatio = engulfMinBodyRatio,
+     useEngulfBodyAtrFilter = useEngulfBodyAtrFilter,
+     engulfMinBodyATR = engulfMinBodyATR)
+
+// envTrend (各TF) が参照する設定
+sg.FvgEnvCfg fvgEnvCfg = sg.FvgEnvCfg.new(
+     useEma20Above50Up = useEma20Above50Up,
+     useEma20SlopeUp = useEma20SlopeUp,
+     useEma50SlopeUp = useEma50SlopeUp,
+     useCloseAboveEma50 = useCloseAboveEma50,
+     useCloseAboveEma200 = useCloseAboveEma200,
+     useEmaDistanceWideU = useEmaDistanceWideU,
+     useEmaExpansionU = useEmaExpansionU,
+     useEma20Below50Dn = useEma20Below50Dn,
+     useEma20SlopeDown = useEma20SlopeDown,
+     useEma50SlopeDown = useEma50SlopeDown,
+     useCloseBelowEma50 = useCloseBelowEma50,
+     useCloseBelowEma200 = useCloseBelowEma200,
+     useEmaDistanceWideD = useEmaDistanceWideD,
+     useEmaExpansionD = useEmaExpansionD,
+     useEmaDistanceNarrow = useEmaDistanceNarrow,
+     useEma20SlopeWeak = useEma20SlopeWeak,
+     useEma50SlopeWeak = useEma50SlopeWeak,
+     useEmaCompression = useEmaCompression,
+     useEma20CrossCount = useEma20CrossCount,
+     useEma50CrossCount = useEma50CrossCount,
+     useRangeWidthSmall = useRangeWidthSmall,
+     slopeMinMult = slopeMinMult,
+     distWideMult = distWideMult,
+     distNarrowMult = distNarrowMult,
+     crossMinCount = crossMinCount,
+     rangeMult = rangeMult,
+     tieAsRange = tieAsRange,
+     insufficientAsRange = insufficientAsRange)
+
+// accumNTDetect (15分足) が参照する設定
+sg.FvgAccCfg fvgAccCfg = sg.FvgAccCfg.new(
+     accumNTMinUpperCloses = accumNTMinUpperCloses,
+     accumNTMinLowerCloses = accumNTMinLowerCloses,
+     accumNTMaxSameColorRun = accumNTMaxSameColorRun,
+     accumNTAtrMult = accumNTAtrMult,
+     accumNTBarRatioMax = accumNTBarRatioMax,
+     accumNTDriftMax = accumNTDriftMax)
+
+// updateFvg (チャート足) でのみ使う残りの設定
+sg.FvgCfg fvgCfg = sg.newFvgCfg()
+fvgCfg.useLowerTFTrigger          := useLowerTFTrigger
+fvgCfg.useTriggerCooldown         := useTriggerCooldown
+fvgCfg.triggerCooldownBars        := triggerCooldownBars
+fvgCfg.useOppositeTriggerNoTrade  := useOppositeTriggerNoTrade
+fvgCfg.volMode                    := volMode
+fvgCfg.fixedMin                   := fixedMin
+fvgCfg.useMinVol                  := useMinVol
+fvgCfg.minAtrDollar               := minAtrDollar
+fvgCfg.volModeRel                 := volModeRel
+fvgCfg.volRatioMin                := volRatioMin
+fvgCfg.fastVolMode                := fastVolMode
+fvgCfg.fastAtrMin                 := fastAtrMin
+fvgCfg.fastFixedMin               := fastFixedMin
+fvgCfg.bodyAvgMin                 := bodyAvgMin
+fvgCfg.useRangeRatioFilter        := useRangeRatioFilter
+fvgCfg.atrRangeRatioMin           := atrRangeRatioMin
+fvgCfg.useVolCooldown             := useVolCooldown
+fvgCfg.volRecoveryBars            := volRecoveryBars
+fvgCfg.useEnvFilter               := useEnvFilter
+fvgCfg.reqTrend4H                 := reqTrend4H
+fvgCfg.reqTrend1H                 := reqTrend1H
+fvgCfg.reqTrend15M                := reqTrend15M
+fvgCfg.reqTrend5M                 := reqTrend5M
+fvgCfg.reqTrend1M                 := reqTrend1M
+fvgCfg.minScore4H                 := minScore4H
+fvgCfg.minScore1H                 := minScore1H
+fvgCfg.minScore15M                := minScore15M
+fvgCfg.minScore5M                 := minScore5M
+fvgCfg.minScore1M                 := minScore1M
+fvgCfg.reqMatchCount              := reqMatchCount
+fvgCfg.useDailyRegimeFilter       := useDailyRegimeFilter
+fvgCfg.dailyRegimeMode            := dailyRegimeMode
+fvgCfg.reqDailyDirection          := reqDailyDirection
+fvgCfg.reqDailyVolatility         := reqDailyVolatility
+fvgCfg.dailyLowVolThreshold       := dailyLowVolThreshold
+fvgCfg.dailyHighVolThreshold      := dailyHighVolThreshold
+fvgCfg.dailyDirectionBodyRatio    := dailyDirectionBodyRatio
+fvgCfg.dailyBullCloseLocation     := dailyBullCloseLocation
+fvgCfg.dailyBearCloseLocation     := dailyBearCloseLocation
+fvgCfg.dailyInsufficientAsRange   := dailyInsufficientAsRange
+fvgCfg.useAccumNoTrade            := useAccumNoTrade
+fvgCfg.useAccumNT5M               := useAccumNT5M
+fvgCfg.useAccumNT15M              := useAccumNT15M
+fvgCfg.accumNTKeep                := accumNTKeep
+fvgCfg.useAccumExitConfirm        := useAccumExitConfirm
+fvgCfg.accumExitConfirmBars       := accumExitConfirmBars
+fvgCfg.useAccumBreakDirection     := useAccumBreakDirection
+fvgCfg.accumBreakDirectionBars    := accumBreakDirectionBars
+fvgCfg.useEFVGEnv                 := useEFVGEnv
+fvgCfg.efvgCombineMode            := efvgCombineMode
+fvgCfg.useEFVGDaily               := useEFVGDaily
+fvgCfg.useEFVG4H                  := useEFVG4H
+fvgCfg.useEFVG1H                  := useEFVG1H
+fvgCfg.useEFVG15M                 := useEFVG15M
+fvgCfg.useEFVG5M                  := useEFVG5M
+fvgCfg.useEFVG1M                  := useEFVG1M
+fvgCfg.efvgIntegrationMode        := efvgIntegrationMode
+fvgCfg.efvgReqMatch               := efvgReqMatch
+fvgCfg.efvgWeightD                := efvgWeightD
+fvgCfg.efvgWeight4H               := efvgWeight4H
+fvgCfg.efvgWeight1H               := efvgWeight1H
+fvgCfg.efvgWeight15M              := efvgWeight15M
+fvgCfg.efvgWeight5M               := efvgWeight5M
+fvgCfg.efvgWeight1M               := efvgWeight1M
+fvgCfg.efvgScoreThresh            := efvgScoreThresh
+fvgCfg.efvgMode4Allow             := efvgMode4Allow
+fvgCfg.useFvgBosFilter            := useFvgBosFilter
+
+// ---- 2.4 Signal Engine Config (FVG15 Logic) --------------------------------
+//  ★ 既存 fvgCfg は一切書き換えない。copy() して FVG環境認識のTFだけ差し替える。
+//  ★ useFvgBosFilter は false にして、既存 updateFvg 内の 15M BOSラッチを
+//    素通し (= 生の15M反発bias) にする。順序確認は updateFvg15 が別に行う。
+sg.FvgCfg fvg15Cfg = fvgCfg.copy()
+fvg15Cfg.useEFVGEnv      := true
+fvg15Cfg.useEFVGDaily    := false
+fvg15Cfg.useEFVG4H       := false
+fvg15Cfg.useEFVG1H       := false
+fvg15Cfg.useEFVG15M      := true
+fvg15Cfg.useEFVG5M       := false
+fvg15Cfg.useEFVG1M       := false
+fvg15Cfg.useFvgBosFilter := false
+
+// ============================================================================
+// 03. EXTERNAL DATA FEED
+// ----------------------------------------------------------------------------
+//  ★ Strategy Section 03 をそのままコピー。request.security /
+//    request.security_lower_tf / lookahead / timeframe / 確定足処理 /
+//    取得条件の if を1つも変えていない (まとめ・削減も一切していない)。
+// ============================================================================
+
+// ---- 3.1 共通フィルタ (Global Filter) -------------------------------------
+int  jstHour   = hour(time, "Asia/Tokyo")
+bool inAsia    = jstHour >= 9  and jstHour < 16
+bool inEU      = jstHour >= 16 and jstHour < 21
+bool inNY      = jstHour >= 21 or  jstHour < 3
+bool sessionOk =
+     not useSessionFilter or
+     (useAsiaSession and inAsia) or
+     (useEUSession   and inEU) or
+     (useNYSession   and inNY)
+
+bool inNewsSession1 = not na(time(timeframe.period, newsSession1, "Asia/Tokyo"))
+bool inNewsSession2 = not na(time(timeframe.period, newsSession2, "Asia/Tokyo"))
+bool inNewsSession3 = not na(time(timeframe.period, newsSession3, "Asia/Tokyo"))
+bool inNewsTime = inNewsSession1 or inNewsSession2 or inNewsSession3
+bool allowByNewsTime = not useNewsTimeFilter or not inNewsTime
+
+// ---- 3.2 Zone Engine Feed --------------------------------------------------
+float ma1Val   = na
+float ma1Delta = na
+float ma2Val   = na
+float ma2Delta = na
+if useMaSource
+    [_m1, _m1d, _m2, _m2d] = request.security(syminfo.tickerid, maTf,
+         zn.maPack(maType, ma1Len, ma2Len, slopeLookback), lookahead = barmerge.lookahead_off)
+    ma1Val   := _m1
+    ma1Delta := _m1d
+    ma2Val   := _m2
+    ma2Delta := _m2d
+
+float ph1 = na
+int   ph1T = na
+float pl1 = na
+int   pl1T = na
+float ph2 = na
+int   ph2T = na
+float pl2 = na
+int   pl2T = na
+float ph3 = na
+int   ph3T = na
+float pl3 = na
+int   pl3T = na
+if useHzSource
+    [_h1, _h1t, _l1, _l1t] = request.security(syminfo.tickerid, hzTf1, zn.pivotPack(pivLen1), lookahead = barmerge.lookahead_off)
+    [_h2, _h2t, _l2, _l2t] = request.security(syminfo.tickerid, hzTf2, zn.pivotPack(pivLen2), lookahead = barmerge.lookahead_off)
+    [_h3, _h3t, _l3, _l3t] = request.security(syminfo.tickerid, hzTf3, zn.pivotPack(pivLen3), lookahead = barmerge.lookahead_off)
+    ph1 := _h1
+    ph1T := _h1t
+    pl1 := _l1
+    pl1T := _l1t
+    ph2 := _h2
+    ph2T := _h2t
+    pl2 := _l2
+    pl2T := _l2t
+    ph3 := _h3
+    ph3T := _h3t
+    pl3 := _l3
+    pl3T := _l3t
+
+bool usePortedAccum = accumModule == "Accum Box (ported)"
+float acc1Hi = na
+float acc1Lo = na
+int   acc1Id = na
+float acc2Hi = na
+float acc2Lo = na
+int   acc2Id = na
+float acc3Hi = na
+float acc3Lo = na
+int   acc3Id = na
+if useAccSource
+    [_a1h, _a1l, _a1i] = request.security(syminfo.tickerid, accTf1,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen1, accMult), lookahead = barmerge.lookahead_off)
+    [_a2h, _a2l, _a2i] = request.security(syminfo.tickerid, accTf2,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen2, accMult), lookahead = barmerge.lookahead_off)
+    [_a3h, _a3l, _a3i] = request.security(syminfo.tickerid, accTf3,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen3, accMult), lookahead = barmerge.lookahead_off)
+    acc1Hi := _a1h
+    acc1Lo := _a1l
+    acc1Id := _a1i
+    acc2Hi := _a2h
+    acc2Lo := _a2l
+    acc2Id := _a2i
+    acc3Hi := _a3h
+    acc3Lo := _a3l
+    acc3Id := _a3i
+
+// Break判定は breakTf の「確定終値」のみ (ヒゲでは判定しない)
+[brCloseRaw, brHighRaw, brLowRaw] = request.security(syminfo.tickerid, breakTf, [close, high, low],
+     lookahead = barmerge.lookahead_off)
+bool  brBarClosed = bar_index > 0 and not na(time(breakTf)) and nz(ta.change(time(breakTf)), 0) != 0
+float brClose = brBarClosed ? brCloseRaw[1] : na
+float brHigh  = brBarClosed ? brHighRaw[1]  : na
+float brLow   = brBarClosed ? brLowRaw[1]   : na
+bool  brEval  = brBarClosed and not na(brClose)
+
+// 取引日ID (timestamp/hour の timezone は series 不可なので Main で計算する)
+int _locY = year(time, dayTz)
+int _locM = month(time, dayTz)
+int _locD = dayofmonth(time, dayTz)
+int _locH = hour(time, dayTz)
+int _calDayNo    = int(timestamp(dayTz, _locY, _locM, _locD, 0, 0) / 86400000)
+int tradingDayId = _locH < dayResetHour ? _calDayNo - 1 : _calDayNo
+
+zn.ZoneFeed zoneFeed = zn.ZoneFeed.new(
+     ma1 = ma1Val, ma1d = ma1Delta, ma2 = ma2Val, ma2d = ma2Delta,
+     ph1 = ph1, ph1t = ph1T, pl1 = pl1, pl1t = pl1T,
+     ph2 = ph2, ph2t = ph2T, pl2 = pl2, pl2t = pl2T,
+     ph3 = ph3, ph3t = ph3T, pl3 = pl3, pl3t = pl3T,
+     acc1Hi = acc1Hi, acc1Lo = acc1Lo, acc1Id = acc1Id,
+     acc2Hi = acc2Hi, acc2Lo = acc2Lo, acc2Id = acc2Id,
+     acc3Hi = acc3Hi, acc3Lo = acc3Lo, acc3Id = acc3Id,
+     dayId = tradingDayId,
+     brClose = brClose, brHigh = brHigh, brLow = brLow, brEval = brEval)
+
+int zoneCountNow = zn.update(zoneEng, zoneCfg, zoneFeed)
+
+// ---- 3.3 Signal Engine Feed (FVG) -----------------------------------------
+int fvgEnabledTrigCount = (useEngulfingTrigger?1:0) + (usePinbarTrigger?1:0) + (useBOSTrigger?1:0) + (useEMARejectTrigger?1:0) + (useFVGTriggerFormation?1:0) + (useStrongCandleTrigger?1:0)
+array<bool> fvgBullTrig = array.new_bool()
+array<bool> fvgBearTrig = array.new_bool()
+if useLowerTFTrigger and fvgEnabledTrigCount > 0
+    [_bull, _bear] = request.security_lower_tf(syminfo.tickerid, triggerTF,
+         sg.calcTriggers(fvgTrigCfg, engulfAtrLen, pinRangeAtrLen, bosLookback,
+         emaLenTrigger, emaRejectSlopeLookback, emaRejectSlopeAtrLen))
+    fvgBullTrig := _bull
+    fvgBearTrig := _bear
+
+// ボラフィルタ用 基準ATR (Strategyと同じく volMode == "ATR" のときだけ)
+float fvgBaseAtr = na
+if volMode == "ATR"
+    fvgBaseAtr := atrTf == "" ? ta.atr(atrLenBase) : request.security(syminfo.tickerid, atrTf, ta.atr(atrLenBase)[1], lookahead = barmerge.lookahead_off)
+
+// 環境認識 (EMAトレンド)
+int env4H  = na
+int env1H  = na
+int env15M = na
+int env5M  = na
+int env1M  = na
+bool absAnyOn = useFvgAbs5Logic or useFvgAbs15Logic
+if useEnvFilter or absAnyOn or useZoneBosLogic
+    env4H  := request.security(syminfo.tickerid, tf4H,  sg.envTrendConfirmed(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore4H),  lookahead = barmerge.lookahead_on)
+    env1H  := request.security(syminfo.tickerid, tf1H,  sg.envTrendConfirmed(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore1H),  lookahead = barmerge.lookahead_on)
+    env15M := request.security(syminfo.tickerid, tf15M, sg.envTrendConfirmed(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore15M), lookahead = barmerge.lookahead_on)
+    env5M  := request.security(syminfo.tickerid, tf5M,  sg.envTrend(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore5M),  lookahead = barmerge.lookahead_off)
+    env1M  := request.security(syminfo.tickerid, tf1M,  sg.envTrend(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore1M),  lookahead = barmerge.lookahead_off)
+
+// FVG環境認識 (各TFの反発状態)
+int efvgDBias = 0
+int efvgDReason = 0
+int efvgDRem = 0
+int efvgDBos = 0
+int efvgHBias = 0
+int efvgHReason = 0
+int efvgHRem = 0
+int efvgHBos = 0
+int efvgOBias = 0
+int efvgOReason = 0
+int efvgORem = 0
+int efvgOBos = 0
+int efvg5Bias = 0
+int efvg5Reason = 0
+int efvg5Rem = 0
+int efvg5Bos = 0
+int efvg1Bias = 0
+int efvg1Reason = 0
+int efvg1Rem = 0
+int efvg1Bos = 0
+int efvgMRawBias = 0
+int efvgMRawReason = 0
+int efvgMRawRem = 0
+int efvgMRawBos = 0
+
+if useEFVGEnv and useEFVGDaily
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvgDailyTF, sg.efvgReboundConfirmed(efvgHoldDaily, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvgDBias := _b
+    efvgDReason := _r
+    efvgDRem := _rem
+    efvgDBos := _bos
+if useEFVGEnv and useEFVG4H
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg4HTF, sg.efvgReboundConfirmed(efvgHold4H, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvgHBias := _b
+    efvgHReason := _r
+    efvgHRem := _rem
+    efvgHBos := _bos
+if useEFVGEnv and useEFVG1H
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg1HTF, sg.efvgReboundConfirmed(efvgHold1H, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvgOBias := _b
+    efvgOReason := _r
+    efvgORem := _rem
+    efvgOBos := _bos
+
+// 5M : 15M FVG のゲートにも 5M BOS を使うため、必要なら1回だけ取得する。
+bool need5MState = useEFVGEnv and (useEFVG5M or (useEFVG15M and useFvgBosFilter))
+if need5MState
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg5MTF, sg.efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvg5Bias := _b
+    efvg5Reason := _r
+    efvg5Rem := _rem
+    efvg5Bos := _bos
+
+// 15M (既存5M FVG Logic の FVG環境認識用) : BOSゲート無し (useBos=false) の生の値
+if useEFVGEnv and useEFVG15M
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg15MTF, sg.efvgReboundConfirmed(efvgHold15M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, false, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvgMRawBias := _b
+    efvgMRawReason := _r
+    efvgMRawRem := _rem
+    efvgMRawBos := _bos
+
+// 15M (FVG15 Logic 専用) : 保持本数だけ fvg15Hold に差し替えた別系統。
+int fvg15RawBias   = 0
+int fvg15RawReason = 0
+int fvg15RawRem    = 0
+int fvg15RawBos    = 0
+int fvg15RawTime   = na
+if useFvg15Logic
+    [_b, _r, _rem, _bos, _t] = request.security(syminfo.tickerid, efvg15MTF, sg.efvgRebound15Pack(fvg15Hold, efvgMinThick, reboundDepthMax, reboundRecoverRatio, false, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    fvg15RawBias   := _b
+    fvg15RawReason := _r
+    fvg15RawRem    := _rem
+    fvg15RawBos    := _bos
+    fvg15RawTime   := _t
+
+if useEFVGEnv and useEFVG1M
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg1MTF, sg.efvgReboundConfirmed(efvgHold1M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvg1Bias := _b
+    efvg1Reason := _r
+    efvg1Rem := _rem
+    efvg1Bos := _bos
+
+// ---- FVG吸収 (反発とは別の式なので既存requestは再利用できない) --------------
+int absBias5      = 0
+int absEvent5     = na
+int absEventTime5 = na
+int absBias15      = 0
+int absEvent15     = na
+int absEventTime15 = na
+if useFvgAbs5Logic
+    [_ab, _ae, _at] = request.security(syminfo.tickerid, efvg5MTF, sg.efvgAbsConfirmed(absHold5M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, useAbsCandleColor, useAbsBodyFilter, useAbsEdgeFilter), lookahead = barmerge.lookahead_on)
+    absBias5      := _ab
+    absEvent5     := _ae
+    absEventTime5 := _at
+if useFvgAbs15Logic
+    [_ab, _ae, _at] = request.security(syminfo.tickerid, efvg15MTF, sg.efvgAbsConfirmed(efvgHold15M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, useAbsCandleColor, useAbsBodyFilter, useAbsEdgeFilter), lookahead = barmerge.lookahead_on)
+    absBias15      := _ab
+    absEvent15     := _ae
+    absEventTime15 := _at
+
+// 1M Bullish BOS(10) : FVGABS5 用。
+array<bool> absBos1m = array.new_bool()
+if useFvgAbs5Logic
+    absBos1m := request.security_lower_tf(syminfo.tickerid, triggerTF, sg.bosBullLowerTf(absBos1mLookback))
+
+// ---- Zone BOS 用 BOS (専用TF / 専用Lookback・計算式は既存と同一) ------------
+bool zbBullBos = false
+bool zbBearBos = false
+bool zbLowerTf = timeframe.in_seconds(zoneBosTf) < timeframe.in_seconds()
+array<bool> zbBullArr = array.new_bool()
+array<bool> zbBearArr = array.new_bool()
+if useZoneBosLogic
+    if zbLowerTf
+        [_lb, _ls] = request.security_lower_tf(syminfo.tickerid, zoneBosTf, sg.bosPack(zoneBosLookback))
+        zbBullArr := _lb
+        zbBearArr := _ls
+        zbBullBos := f_anyTrue(zbBullArr)
+        zbBearBos := f_anyTrue(zbBearArr)
+    else
+        [_zbb, _zbs] = request.security(syminfo.tickerid, zoneBosTf, sg.bosPack(zoneBosLookback), lookahead = barmerge.lookahead_off)
+        zbBullBos := _zbb
+        zbBearBos := _zbs
+
+// BOS対象時間足のバーカウンタ。
+var int zoneBosBarCount = 0
+if useZoneBosLogic
+    if zbLowerTf
+        zoneBosBarCount += array.size(zbBullArr)
+    else if nz(ta.change(time(zoneBosTf)), 0) != 0
+        zoneBosBarCount += 1
+
+// 日足レジーム
+float drO0 = na
+float drH0 = na
+float drL0 = na
+float drC0 = na
+float drO1 = na
+float drH1 = na
+float drL1 = na
+float drC1 = na
+float drMedianRange = na
+bool  drNewDay = ta.change(time("D")) != 0
+if useDailyRegimeFilter
+    [_o0, _h0, _l0, _c0, _o1, _h1, _l1, _c1] = request.security(syminfo.tickerid, "D", sg.drDailyTuple(), lookahead = barmerge.lookahead_off)
+    drO0 := _o0
+    drH0 := _h0
+    drL0 := _l0
+    drC0 := _c0
+    drO1 := _o1
+    drH1 := _h1
+    drL1 := _l1
+    drC1 := _c1
+if useDailyRegimeFilter or absAnyOn or useZoneBosLogic
+    drMedianRange := request.security(syminfo.tickerid, "D", sg.dailyRangeMedian(dailyVolMedianLength), lookahead = barmerge.lookahead_on)
+
+// Accumulation NoTrade (15分足の確定Accum箱)
+float acc15Hi = na
+float acc15Lo = na
+int   acc15St = na
+bool  accNew15Bar = false
+if useAccumNoTrade and useAccumNT15M
+    [_h15, _l15, _s15] = request.security(syminfo.tickerid, accumNT15Tf, sg.accumNT15Confirmed(fvgAccCfg, accumNTRangeLen, accumNTBaseLen, accumNTAtrLen), lookahead = barmerge.lookahead_on)
+    acc15Hi := _h15
+    acc15Lo := _l15
+    acc15St := _s15
+    accNew15Bar := ta.change(time(accumNT15Tf)) != 0
+
+sg.FvgFeed fvgFeed = sg.FvgFeed.new(
+     allowLong = useFvgLogic and enableLong, allowShort = useFvgLogic and enableShort,
+     sessionOk = sessionOk, newsOk = allowByNewsTime,
+     bullTrig = fvgBullTrig, bearTrig = fvgBearTrig,
+     baseAtr = fvgBaseAtr,
+     env4H = env4H, env1H = env1H, env15M = env15M, env5M = env5M, env1M = env1M,
+     dBias = efvgDBias, dReason = efvgDReason, dRem = efvgDRem, dBos = efvgDBos,
+     hBias = efvgHBias, hReason = efvgHReason, hRem = efvgHRem, hBos = efvgHBos,
+     oBias = efvgOBias, oReason = efvgOReason, oRem = efvgORem, oBos = efvgOBos,
+     b5Bias = efvg5Bias, b5Reason = efvg5Reason, b5Rem = efvg5Rem, b5Bos = efvg5Bos,
+     b1Bias = efvg1Bias, b1Reason = efvg1Reason, b1Rem = efvg1Rem, b1Bos = efvg1Bos,
+     mRawBias = efvgMRawBias, mRawReason = efvgMRawReason, mRawRem = efvgMRawRem, mRawBos = efvgMRawBos,
+     drO0 = drO0, drH0 = drH0, drL0 = drL0, drC0 = drC0,
+     drO1 = drO1, drH1 = drH1, drL1 = drL1, drC1 = drC1,
+     drMedianRange = drMedianRange, drNewDay = drNewDay,
+     acc15Hi = acc15Hi, acc15Lo = acc15Lo, acc15St = acc15St, new15Bar = accNew15Bar)
+
+// FVG15 Logic 用 Feed。
+sg.FvgFeed fvg15Feed = fvgFeed.copy()
+fvg15Feed.allowLong  := useFvg15Logic and enableLong
+fvg15Feed.allowShort := useFvg15Logic and enableShort
+fvg15Feed.mRawBias   := fvg15RawBias
+fvg15Feed.mRawReason := fvg15RawReason
+fvg15Feed.mRawRem    := fvg15RawRem
+fvg15Feed.mRawBos    := fvg15RawBos
+
+// ============================================================================
+// 05V-A. VIRTUAL TRADE STATE  (Strategy の strategy.* API の代替)
+// ----------------------------------------------------------------------------
+//  Strategy固有API → Indicator代替 の対応:
+//    strategy.entry(eid, ...)          → VTrade.pending = true で積む
+//                                        (成行なので約定は次バー始値)
+//    strategy.exit(stop=, limit=)      → VTrade.sl / VTrade.tp
+//                                        (発注バーの次バーから有効 = 約定バー自身も対象)
+//    strategy.opentrades               → f_openCount*() … active のみ数える
+//    strategy.opentrades.entry_id(i)   → VTrade.eid
+//    strategy.opentrades.entry_price(i)→ VTrade.entryPrice (実約定 = 次バー始値)
+//    strategy.opentrades.size(i) > 0   → VTrade.dir > 0
+//    strategy.position_size            → f_virtPositionSize()
+//    strategy.closedtrades             → gClosedCnt
+//    strategy.equity                   → f_virtEquity()
+//    strategy.initial_capital          → indInitialCapital (input)
+//
+//  ★★ pending を保有数に数えない理由 (最重要) ★★
+//    Pine では strategy.entry() を呼んでも、その同一バーの実行内では
+//    strategy.opentrades / strategy.position_size は増えない
+//    (Broker Emulator が次バー始値で約定させて初めてカウントされる)。
+//    Strategy Section 07 もこれを前提に組まれている:
+//      ・fvgGroupBlocked は 7.1 の前に1回だけ評価され、7.2 で再評価されない
+//      ・FVG と FVG15 は別logicIdなので f_openCountForLogic では止まらない
+//      → 同一バーで FVG15 が入った後に FVG を止めているのは
+//        「not fvg15Entered」だけ。opentrades が即時更新される前提なら
+//        このフラグは不要になる。同じことが abs15Entered / zbEidLong == ""
+//        にも当てはまる。
+//    したがって f_openCount*() / f_virtPositionSize() は必ず
+//    「active (= 約定済み) のみ」を数える。pending を数えると Strategy とズレる。
+// ============================================================================
+
+// ---- 5V.1 仮想Trade --------------------------------------------------------
+type VTrade
+    string eid        = ""
+    string logicId    = ""
+    int    dir        = 0
+    float  qty        = 0.0
+    bool   pending    = false   // 発注済み・未約定 (次バー始値で約定)
+    bool   active     = false   // 約定済み・保有中
+    int    orderBar   = na      // strategy.entry を呼んだバー
+    int    orderTime  = na
+    int    fillBar    = na      // 約定バー
+    int    fillTime   = na
+    float  planEntry  = na      // シグナル足の close (= TradePlan.entry / Qty算出基準)
+    float  entryPrice = na      // 実約定価格 (次バー始値) = strategy.opentrades.entry_price()
+    float  sl         = na      // 現在のSL (BE発動後は entryPrice)
+    float  tp         = na
+    float  originalSl = na      // Entry時点のSL (BEで書き換わらない記録用)
+    bool   beOn       = false
+    int    exitBar    = na
+
+var array<VTrade> gTrades = array.new<VTrade>()
+var array<int>    gSeq       = array.new_int(1, 0)      // Strategy の gSeq と同じ
+var array<float>  gRealized  = array.new_float(1, 0.0)  // 確定損益 (strategy.netprofit 相当)
+var array<int>    gClosedCnt = array.new_int(1, 0)      // strategy.closedtrades 相当
+var array<float>  gLastSl    = array.new_float(2, na)   // [0]=直近SL決済損益 [1]=そのqty
+var array<string> gLastPlan  = array.new_string(3, "-") // Strategy の gLastPlan と同じ
+
+// 表示用フラグ (判定には一切使わない)
+var array<int>  gSigSlot   = array.new_int(1, 0)
+var array<bool> gEntryFlag = array.new_bool(2, false)   // [0]=Long発注 [1]=Short発注
+var array<bool> gFillFlag  = array.new_bool(2, false)   // [0]=Long約定 [1]=Short約定
+
+// 一致確認カウンタ (ご指示20)。slot: 0=FVG L 1=FVG S 2=FVG15 L 3=FVG15 S
+//                                4=FVGABS5 L 5=FVGABS15 L 6=ZONEBOS L 7=ZONEBOS S
+var array<int> gCntRaw   = array.new_int(8, 0)
+var array<int> gCntGate  = array.new_int(8, 0)
+var array<int> gCntPlan  = array.new_int(8, 0)
+var array<int> gCntEntry = array.new_int(8, 0)
+
+// Entry ID ログ (ご指示21)
+var array<string> gLogEid       = array.new_string()
+var array<string> gLogLogic     = array.new_string()
+var array<int>    gLogDir       = array.new_int()
+var array<int>    gLogOrderTime = array.new_int()
+var array<int>    gLogOrderBar  = array.new_int()
+var array<int>    gLogFillTime  = array.new_int()
+var array<float>  gLogFillPx    = array.new_float()
+int LOG_CAP = 50
+
+// ---- 5V.2 保有数カウント (strategy.opentrades 相当) ------------------------
+//  ★ 判定式は Strategy の f_openCount*() と1文字も変えていない。
+//    strategy.opentrades.entry_id(i) → t.eid に置き換えただけ。
+//    t.active のみ対象 (pending は数えない)。
+f_openCountForLogic(string logicId) =>
+    int c = 0
+    if array.size(gTrades) > 0
+        for i = 0 to array.size(gTrades) - 1
+            VTrade t = array.get(gTrades, i)
+            string oid = t.eid
+            if t.active and (str.startswith(oid, logicId + "_L_") or str.startswith(oid, logicId + "_S_"))
+                c += 1
+    c
+
+f_openCountFvgGroup() =>
+    int c = 0
+    if array.size(gTrades) > 0
+        for i = 0 to array.size(gTrades) - 1
+            VTrade t = array.get(gTrades, i)
+            string oid = t.eid
+            bool isGrp = str.startswith(oid, LOGIC_FVG + "_L_") or str.startswith(oid, LOGIC_FVG + "_S_")
+            isGrp := isGrp or str.startswith(oid, LOGIC_FVG15 + "_L_") or str.startswith(oid, LOGIC_FVG15 + "_S_")
+            if t.active and isGrp
+                c += 1
+    c
+
+f_openCountFvgAbsGroup() =>
+    int c = 0
+    if array.size(gTrades) > 0
+        for i = 0 to array.size(gTrades) - 1
+            VTrade t = array.get(gTrades, i)
+            string oid = t.eid
+            bool isGrp = str.startswith(oid, LOGIC_FVG_ABS5 + "_L_") or str.startswith(oid, LOGIC_FVG_ABS5 + "_S_")
+            isGrp := isGrp or str.startswith(oid, LOGIC_FVG_ABS15 + "_L_") or str.startswith(oid, LOGIC_FVG_ABS15 + "_S_")
+            if t.active and isGrp
+                c += 1
+    c
+
+f_openCountZoneBosGroup() =>
+    int c = 0
+    if array.size(gTrades) > 0
+        for i = 0 to array.size(gTrades) - 1
+            VTrade t = array.get(gTrades, i)
+            string oid = t.eid
+            if t.active and (str.startswith(oid, LOGIC_ZONE_BOS + "_L_") or str.startswith(oid, LOGIC_ZONE_BOS + "_S_"))
+                c += 1
+    c
+
+// strategy.opentrades 相当 (Debug表示用)
+f_virtOpenCount() =>
+    int c = 0
+    if array.size(gTrades) > 0
+        for i = 0 to array.size(gTrades) - 1
+            if array.get(gTrades, i).active
+                c += 1
+    c
+
+// strategy.position_size 相当 (符号だけ見るので合計で足りる)
+f_virtPositionSize() =>
+    float s = 0.0
+    if array.size(gTrades) > 0
+        for i = 0 to array.size(gTrades) - 1
+            VTrade t = array.get(gTrades, i)
+            if t.active
+                s += t.qty * t.dir
+    s
+
+// strategy.openprofit 相当 (現在のcloseベースの含み損益)
+f_virtOpenProfit() =>
+    float s = 0.0
+    if array.size(gTrades) > 0
+        for i = 0 to array.size(gTrades) - 1
+            VTrade t = array.get(gTrades, i)
+            if t.active
+                s += (close - t.entryPrice) * t.qty * t.dir * syminfo.pointvalue
+    s
+
+// strategy.equity 相当
+//   Pine の定義: strategy.equity = initial_capital + netprofit + openprofit
+//   netprofit  → gRealized  (仮想ブローカーが確定させた損益)
+//   openprofit → f_virtOpenProfit() (現バーcloseでの含み損益)
+//  ★ 再現不能な差分 (ここだけコメントで明示):
+//    ・手数料 / スリッページ … Strategy側で未設定 (=0) なので現状は差が出ない。
+//      Strategy Properties で commission / slippage を設定した場合のみズレる。
+//    ・syminfo.currency != account_currency の通貨換算
+//      … Indicator から strategy.account_currency を読めないため再現不能。
+//      同一通貨なら差は出ない。
+//    useCompound = false (既定) の場合はこの関数自体が使われないため、
+//    Strategy と完全一致する。
+f_virtEquity() =>
+    indInitialCapital + array.get(gRealized, 0) + f_virtOpenProfit()
+
+// ============================================================================
+// 04. RISK / QTY
+// ----------------------------------------------------------------------------
+//  ★ Strategy Section 04 と同一。置き換えたのは f_baseCapital の中身だけ:
+//      strategy.equity          → f_virtEquity()
+//      strategy.initial_capital → indInitialCapital (input)
+//    f_riskCapital / f_qty / f_expectedLoss は1文字も変えていない。
+// ============================================================================
+f_baseCapital() =>
+    useCompound ? f_virtEquity() : indInitialCapital
+
+f_riskCapital() =>
+    f_baseCapital() * riskPct / 100.0
+
+f_qty(float riskPerUnit) =>
+    float raw = riskPerUnit > 0 ? f_riskCapital() / (riskPerUnit * syminfo.pointvalue) : 0.0
+    // qtyStep 単位へ切り下げ (0.01 等の小数ロットを潰さない)。
+    float q = qtyStep > 0 ? math.floor(raw / qtyStep) * qtyStep : raw
+    math.round(q, 8)
+
+// SL到達時の想定損失額 (TradingViewの損益式と同じ形)
+f_expectedLoss(float qty, float slDist) =>
+    nz(qty) * nz(slDist) * syminfo.pointvalue
+
+// ============================================================================
+// 05V-B. VIRTUAL BROKER / ENTRY PIPELINE
+// ----------------------------------------------------------------------------
+//  Strategy Section 05 (COMMON TRADE ENGINE) に対応する。
+//  f_planText / f_qtyText / f_recordPlan / f_executeTrade / f_submitSignal は
+//  Strategy と同じ名前・同じ判定順序で、strategy.* の呼び出しだけを
+//  仮想Trade操作へ置き換えている。
+// ============================================================================
+
+float sigAtr = ta.atr(sigOffsetAtrLen)   // ラベル間隔用 (毎バー評価)
+
+f_sigSize(string s) =>
+    s == "大" ? size.normal : s == "普通" ? size.small : size.tiny
+
+// ---- 5V.3 Entry ID ログ記録 (表示専用) -------------------------------------
+f_logEntry(VTrade t) =>
+    array.push(gLogEid,       t.eid)
+    array.push(gLogLogic,     t.logicId)
+    array.push(gLogDir,       t.dir)
+    array.push(gLogOrderTime, t.orderTime)
+    array.push(gLogOrderBar,  t.orderBar)
+    array.push(gLogFillTime,  t.fillTime)
+    array.push(gLogFillPx,    t.entryPrice)
+    while array.size(gLogEid) > LOG_CAP
+        array.shift(gLogEid)
+        array.shift(gLogLogic)
+        array.shift(gLogDir)
+        array.shift(gLogOrderTime)
+        array.shift(gLogOrderBar)
+        array.shift(gLogFillTime)
+        array.shift(gLogFillPx)
+    true
+
+// ---- 5V.4 FILL マーカー (表示専用・Alertは発火しない) ----------------------
+//  ★ ENTRY SIGNAL とは別物。Strategy比較に使うのは ENTRY SIGNAL のほう。
+f_emitFill(VTrade t) =>
+    array.set(gFillFlag, t.dir > 0 ? 0 : 1, true)
+    if showFillMarker
+        int slot = array.get(gSigSlot, 0)
+        array.set(gSigSlot, 0, slot + 1)
+        float off = nz(sigAtr, 0.0) * sigOffsetMult * (slot + 1)
+        label.new(bar_index, t.dir > 0 ? low - off : high + off,
+             text = "fill " + f_num(t.entryPrice, "#.##"),
+             style = label.style_label_center,
+             color = color.new(color.gray, 55),
+             textcolor = color.white, size = size.tiny)
+    true
+
+// ---- 5V.5 仮想ブローカー ---------------------------------------------------
+//  Strategy では、スクリプトがバーN終値で走る前に Broker Emulator が
+//    (a) 前バーで出した成行注文を open[N] で約定
+//    (b) バーN の値動きで SL / TP を判定
+//  を済ませている。Section 06 / 07 が参照する保有状態はその結果。
+//  → Indicator でも Section 06 の前にこの処理を行う (ご指示14)。
+//  SL は「前バー終了時点の値」で判定する (BE更新は Section 08 = バー終値後)。
+//
+//  ★ 同一バーで SL / TP 両方へ到達した場合の順序 ★
+//    TradingView Broker Emulator の Default Historical Fill 仕様に合わせる。
+//    バー内の価格経路は「始値が高値と安値のどちらに近いか」で決まる:
+//      |high - open| < |open - low|  → open → high → low  → close
+//      それ以外                       → open → low  → high → close
+//    経路上で先に触れたほうが約定する。したがって:
+//      Long  (SL下 / TP上) : open→high→low → TP先 / open→low→high → SL先
+//      Short (SL上 / TP下) : open→high→low → SL先 / open→low→high → TP先
+//    ★ gap: 始値の時点ですでに水準を超えていた注文はその始値で約定する
+//      (Stopは不利側、Limitは有利側)。経路判定より優先する。
+//
+//  ★★ 再現不能な差分 (ここだけコメントで明示) ★★
+//    上記は Strategy 側で Bar Magnifier / High historical detail を
+//    使っていない前提。これらを有効にすると Broker Emulator は下位足の実データで
+//    バー内順序を決めるため、この OHLC ベースでは完全再現できない。
+//    影響を受けるのは「同一バーで SL と TP の両方へ到達したトレード」だけ。
+//    Indicator から Strategy のこの設定は読めないため検知もできない。
+f_virtBroker() =>
+    // このバーの表示フラグを初期化 (Section 07 の ENTRY はこの後で立つ)
+    array.set(gSigSlot,   0, 0)
+    array.set(gEntryFlag, 0, false)
+    array.set(gEntryFlag, 1, false)
+    array.set(gFillFlag,  0, false)
+    array.set(gFillFlag,  1, false)
+
+    if array.size(gTrades) > 0
+        for i = 0 to array.size(gTrades) - 1
+            VTrade t = array.get(gTrades, i)
+            // (a) 前バーの発注をこのバーの始値で約定
+            if t.pending
+                t.pending    := false
+                t.active     := true
+                t.entryPrice := open
+                t.fillBar    := bar_index
+                t.fillTime   := time
+                f_logEntry(t)
+                f_emitFill(t)
+            // (b) 約定済みTradeの SL / TP 判定 (約定したバー自身も対象)
+            if t.active
+                bool hitSL = t.dir > 0 ? low  <= t.sl : high >= t.sl
+                bool hitTP = t.dir > 0 ? high >= t.tp : low  <= t.tp
+                if hitSL or hitTP
+                    bool gapSL = t.dir > 0 ? open <= t.sl : open >= t.sl
+                    bool gapTP = t.dir > 0 ? open >= t.tp : open <= t.tp
+                    bool openNearHigh = math.abs(high - open) < math.abs(open - low)
+                    bool slFirst = false
+                    if gapSL and gapTP
+                        // 通常のSL/TP設定では起きない。念のため不利側を採用。
+                        slFirst := true
+                    else if gapSL
+                        slFirst := true
+                    else if gapTP
+                        slFirst := false
+                    else if hitSL and hitTP
+                        slFirst := t.dir > 0 ? not openNearHigh : openNearHigh
+                    else
+                        slFirst := hitSL
+                    float xp  = slFirst ? (gapSL ? open : t.sl) : (gapTP ? open : t.tp)
+                    float pnl = (xp - t.entryPrice) * t.qty * t.dir * syminfo.pointvalue
+                    array.set(gRealized, 0, array.get(gRealized, 0) + pnl)
+                    // Strategy の exit_comment == "SL" と同じ条件
+                    //   (BE適用後の決済は comment_loss = "BE" になるので対象外)
+                    if slFirst and not t.beOn
+                        array.set(gLastSl, 0, pnl)
+                        array.set(gLastSl, 1, t.qty)
+                    t.active  := false
+                    t.exitBar := bar_index
+                    array.set(gClosedCnt, 0, array.get(gClosedCnt, 0) + 1)
+
+    // 決済済みTradeを配列から除去 (保有数カウントは active しか見ないので挙動不変)
+    if array.size(gTrades) > 0
+        for i = array.size(gTrades) - 1 to 0
+            if i < array.size(gTrades)
+                VTrade tt = array.get(gTrades, i)
+                if not tt.active and not tt.pending
+                    array.remove(gTrades, i)
+    true
+
+// ---- 5V.6 Plan Debug (Strategy と同一・判定には影響しない) ------------------
+f_planText(string logicId, zn.TradePlan p) =>
+    logicId + " " + (p.dir > 0 ? "LONG" : p.dir < 0 ? "SHORT" : "-") +
+     " | E " + f_num(p.entry, "#.##") +
+     " | SL " + f_num(p.sl, "#.##") +
+     " | TP " + f_num(p.tp, "#.##") +
+     " | RR " + f_num(p.rr, "#.##") +
+     " | " + p.tpType +
+     " | Obst " + str.tostring(p.obstacles)
+
+// Strategy の f_qtyText と同一。strategy.account_currency だけ取得できないため
+// その表示部分のみ差し替えている (表示専用・判定には一切影響しない)。
+f_qtyText(zn.TradePlan p) =>
+    float rc = f_riskCapital()
+    float q  = f_qty(p.risk)
+    float el = f_expectedLoss(q, p.risk)
+    float bc = f_baseCapital()
+    "RiskCap " + f_num(rc, "#.##") + " (" + f_num(riskPct, "#.##") + "%)" +
+     " | SLdist " + f_num(p.risk, "#.##") +
+     " | Qty " + f_num(q, "#.####") +
+     " | ExpLoss " + f_num(el, "#.##") +
+     " (" + f_num(bc > 0 ? el / bc * 100.0 : na, "#.###") + "% of capital)" +
+     " | PV " + str.tostring(syminfo.pointvalue) + " " + syminfo.currency +
+     " / Acct (Indicatorでは取得不可)"
+
+f_recordPlan(string logicId, zn.TradePlan p, string extra) =>
+    array.set(gLastPlan, 0, f_planText(logicId, p))
+    array.set(gLastPlan, 1, p.status + " · " + p.reason + (extra == "" ? "" : " · " + extra))
+    array.set(gLastPlan, 2, f_qtyText(p))
+    true
+
+// ---- 5V.7 一致確認カウンタ用 slot (Debug専用) -----------------------------
+f_slot(string logicId, int dir) =>
+    int s = -1
+    if logicId == LOGIC_FVG
+        s := dir > 0 ? 0 : 1
+    else if logicId == LOGIC_FVG15
+        s := dir > 0 ? 2 : 3
+    else if logicId == LOGIC_FVG_ABS5
+        s := 4
+    else if logicId == LOGIC_FVG_ABS15
+        s := 5
+    else if logicId == LOGIC_ZONE_BOS
+        s := dir > 0 ? 6 : 7
+    s
+
+// ---- 5V.8 ENTRY SIGNAL 表示 + Alert (ご指示18・19) -------------------------
+//  ★ Label と Alert はこの1関数の中だけで出す。条件は共通の entered ただ1つ。
+//    別実装は存在しない = LabelとAlertの条件が食い違うことは構造的に起きない。
+//  ★ 呼ばれるのは f_submitSignal の中で Entry ID が発行された直後だけなので、
+//    RAW Signal だけ / TradePlan FAIL / Qty不足 の場所には絶対に出ない。
+//  ★ Fill Entry (実約定価格) は発注バーの時点ではまだ存在しないため、
+//    ここではなく FILL マーカー側で表示する。
+f_emitEntry(string logicId, int dir, string eid, zn.TradePlan p, float qty) =>
+    bool entered = eid != ""
+    if entered
+        array.set(gEntryFlag, dir > 0 ? 0 : 1, true)
+        string head = logicId + (dir > 0 ? " LONG" : " SHORT")
+        string txt  = head
+        if sigShowEid
+            txt := txt + "\n" + eid
+        if sigShowPlan
+            txt := txt + "\nPlanE " + f_num(p.entry, "#.##")
+        if sigShowSlTp
+            txt := txt + "\nSL " + f_num(p.sl, "#.##") + "  TP " + f_num(p.tp, "#.##")
+        if sigShowRr
+            txt := txt + "\nRR " + f_num(p.rr, "#.##") + "  " + p.tpType
+        if sigShowQty
+            txt := txt + "\nQty " + f_num(qty, "#.####")
+        if showEntrySignal
+            int slot = array.get(gSigSlot, 0)
+            array.set(gSigSlot, 0, slot + 1)
+            float off = nz(sigAtr, 0.0) * sigOffsetMult * (slot + 1)
+            label.new(bar_index, dir > 0 ? low - off : high + off, text = txt,
+                 style = dir > 0 ? label.style_label_up : label.style_label_down,
+                 color = dir > 0 ? color.new(color.teal, 15) : color.new(color.maroon, 15),
+                 textcolor = color.white, size = f_sigSize(sigLabelSize))
+        alert(head + " | " + eid +
+             " | PlanE " + f_num(p.entry, "#.##") +
+             " | SL " + f_num(p.sl, "#.##") +
+             " | TP " + f_num(p.tp, "#.##") +
+             " | RR " + f_num(p.rr, "#.##") +
+             " | Qty " + f_num(qty, "#.####") +
+             " | " + syminfo.ticker + " " + timeframe.period, alert.freq_once_per_bar)
+    entered
+
+// ---- 5V.9 f_executeTrade (Strategy と同一の判定順序) -----------------------
+//  判定順序: p.valid → qty算出 → logicFull → oppositeConflict → qty下限 → Entry
+//  ★ Strategy から変更したのは strategy.entry / strategy.exit / Mapへの登録を
+//    仮想Trade の push に置き換えた点だけ。条件式も順序も1つも変えていない。
+f_executeTrade(string logicId, int dir, float entryPrice, zn.TradePlan p) =>
+    string eid  = ""
+    bool   done = false
+    if dir != 0
+        if not p.valid
+            f_recordPlan(logicId, p, "")
+            done := true
+        else
+            float qty = f_qty(p.risk)
+            bool oppositeConflict = not allowOppositeEntry and
+                 ((dir > 0 and f_virtPositionSize() < 0) or (dir < 0 and f_virtPositionSize() > 0))
+            bool logicFull = f_openCountForLogic(logicId) >= maxOpenPerLogic
+            if logicFull
+                f_recordPlan(logicId, p, "SKIP_LOGIC_LIMIT")
+                done := true
+            else if oppositeConflict
+                f_recordPlan(logicId, p, "SKIP_OPPOSITE_POSITION")
+                done := true
+            else if qty < qtyMin or qty <= 0
+                f_recordPlan(logicId, p, "SKIP_NO_QTY")
+                done := true
+            else
+                int n = array.get(gSeq, 0) + 1
+                array.set(gSeq, 0, n)
+                eid := logicId + (dir > 0 ? "_L_" : "_S_") + str.tostring(n)
+                // ★ strategy.entry + strategy.exit 相当。
+                //   成行なので約定は次バー始値 → pending で積む。
+                //   SL / TP は Entry時点の値で固定する (以後Zoneが動いても変更しない)。
+                array.push(gTrades, VTrade.new(eid = eid, logicId = logicId, dir = dir,
+                     qty = qty, pending = true, active = false,
+                     orderBar = bar_index, orderTime = time,
+                     planEntry = p.entry, sl = p.sl, tp = p.tp, originalSl = p.sl,
+                     beOn = false))
+                f_recordPlan(logicId, p, eid)
+                if showEntryLabel
+                    string ltxt = eid + "\n" + (dir > 0 ? "LONG" : "SHORT")
+                    ltxt := ltxt + "\nE  " + f_num(p.entry, "#.##")
+                    ltxt := ltxt + "\nSL " + f_num(p.sl, "#.##")
+                    ltxt := ltxt + "\nTP " + f_num(p.tp, "#.##")
+                    ltxt := ltxt + "\nRR " + f_num(p.rr, "#.##")
+                    ltxt := ltxt + "\nQty " + f_num(qty, "#.####")
+                    ltxt := ltxt + "\nLoss~ " + f_num(f_expectedLoss(qty, p.risk), "#.##")
+                    ltxt := ltxt + "\n" + p.tpType
+                    label.new(bar_index, dir > 0 ? low : high, text = ltxt,
+                         style = dir > 0 ? label.style_label_up : label.style_label_down,
+                         color = dir > 0 ? color.new(color.teal, 20) : color.new(color.maroon, 20),
+                         textcolor = color.white, size = size.small)
+                done := true
+    done ? eid : ""
+
+// ---- 5V.10 f_submitSignal (Strategy と同一) --------------------------------
+//  ★ 追加したのは「★DEBUG」と書いたカウンタ加算と ENTRY SIGNAL 発火だけで、
+//    条件式・順序・TP Mode フィルターは Strategy と1文字も変えていない。
+f_submitSignal(string logicId, bool signal, int dir, float entryPrice) =>
+    string eid = ""
+    bool dirOk = (dir > 0 and enableLong) or (dir < 0 and enableShort)
+    int slot = f_slot(logicId, dir)                                   // ★DEBUG
+    if signal and slot >= 0                                           // ★DEBUG GATE
+        array.set(gCntGate, slot, array.get(gCntGate, slot) + 1)      // ★DEBUG
+    if signal and dirOk
+        zn.TradePlan p = zn.buildPlan(zoneEng, zoneCfg, dir, entryPrice)
+        p.logicId := logicId
+        if p.valid and slot >= 0                                      // ★DEBUG PLAN
+            array.set(gCntPlan, slot, array.get(gCntPlan, slot) + 1)  // ★DEBUG
+        // ---- TP Mode フィルター (Strategy と完全に同一) --------------------
+        if tpMode == "STRUCTURAL_ONLY" and p.tpType == "FALLBACK_RR"
+            p.valid  := false
+            p.status := "FAIL"
+            p.reason := "NO_STRUCTURAL_TP"
+        else if tpMode == "FALLBACK_ONLY" and p.tpType == "STRUCTURAL"
+            p.valid  := false
+            p.status := "FAIL"
+            p.reason := "STRUCTURAL_TP_EXISTS"
+        eid := f_executeTrade(logicId, dir, entryPrice, p)
+        // ---- ENTRY SIGNAL / Alert (ご指示18・19) --------------------------
+        //  entered = eid != "" を f_emitEntry の中で1回だけ評価し、
+        //  Label と Alert の両方をその1条件で出す。
+        f_emitEntry(logicId, dir, eid, p, f_qty(p.risk))
+        if eid != "" and slot >= 0                                     // ★DEBUG ENTRY
+            array.set(gCntEntry, slot, array.get(gCntEntry, slot) + 1) // ★DEBUG
+    eid
+
+// ★ Section 06 / 07 が保有状態を見る前に、このバーの約定 / 決済を済ませる (ご指示14)
+f_virtBroker()
+
+// ============================================================================
+// 06. SIGNAL ENGINE CALLS
+// ----------------------------------------------------------------------------
+//  ★ Strategy Section 06 をそのままコピー。呼び出し順序 (updateFvg →
+//    updateFvg15 → updateFvgAbs → updateZoneBos) も全argumentも同一。
+//    SignalEngine の結果 (fvgSig / fvg15Sig / absSig / zbSig) は
+//    Indicator側で一切加工しない。
+// ============================================================================
+// ---- 6.1 FVG Logic (既存5M) ------------------------------------------------
+sg.FvgSignal fvgSig = sg.updateFvg(fvgEng, fvgCfg, fvgTrigCfg, fvgAccCfg, fvgFeed,
+     engulfAtrLen, pinRangeAtrLen, bosLookback,
+     emaLenTrigger, emaRejectSlopeLookback, emaRejectSlopeAtrLen,
+     volAvgLen, fastAtrLen, bodyAvgLen, rangeLookback,
+     accumNTRangeLen, accumNTBaseLen, accumNTAtrLen)
+
+// ---- 6.2 FVG15 Logic (15M FVG反発 → 5M BOS) --------------------------------
+sg.FvgSignal   fvg15Base = sg.FvgSignal.new()
+sg.Fvg15Signal fvg15Sig  = sg.Fvg15Signal.new()
+if useFvg15Logic
+    fvg15Base := sg.updateFvg(fvg15Eng, fvg15Cfg, fvgTrigCfg, fvgAccCfg, fvg15Feed,
+         engulfAtrLen, pinRangeAtrLen, bosLookback,
+         emaLenTrigger, emaRejectSlopeLookback, emaRejectSlopeAtrLen,
+         volAvgLen, fastAtrLen, bodyAvgLen, rangeLookback,
+         accumNTRangeLen, accumNTBaseLen, accumNTAtrLen)
+    fvg15Sig  := sg.updateFvg15(fvg15Ord,
+         fvg15Base.longSignal, fvg15Base.shortSignal, fvg15Base.entryPrice,
+         fvg15RawReason, fvg15RawRem, fvg15RawTime,
+         use15mFvgBosOrder, bos15mTo5mLookback)
+
+// ---- 6.3 FVGABS Logic (FVG吸収 → BOS / Longのみ) ---------------------------
+bool absEnvLongOk = sg.fvgAbsEnvLong(enableLong and absAnyOn, sessionOk, allowByNewsTime,
+     env4H, env1H, env15M,
+     drMedianRange, absVolMin, absVolMax,
+     fvgSig.volOk, fvgSig.blockedByAccum, fvgSig.blockedByExitWait, fvgSig.accumLongDirOk)
+
+sg.FvgAbsSignal absSig = sg.FvgAbsSignal.new()
+if absAnyOn
+    absSig := sg.updateFvgAbs(fvgAbsEng, absEnvLongOk, close,
+         absBias5, absEvent5, absEventTime5,
+         absBias15, absEvent15, absEventTime15,
+         absBos1m, useFvgAbs5Logic, useFvgAbs15Logic, absBos5mLookback)
+
+// ---- 6.4 ZONEBOS Logic (Zone Touch → BOS) ----------------------------------
+int zoneBosMinStrength = zn.strengthIdx(zoneBosMinStrStr)
+bool  zbTouchSup   = false
+int   zbSupZoneId  = na
+float zbSupZoneTop = na
+bool  zbTouchRes      = false
+int   zbResZoneId     = na
+float zbResZoneBottom = na
+if useZoneBosLogic
+    int zbZoneN = zn.zoneCount(zoneEng)
+    if zbZoneN > 0
+        for zbI = 0 to zbZoneN - 1
+            zn.Zone zbZ = zn.zoneAt(zoneEng, zbI)
+            bool zbHit = zbZ.strength >= zoneBosMinStrength and low <= zbZ.top and high >= zbZ.bottom
+            if zbHit and zbZ.state == ST_SUPPORT and not zbTouchSup
+                zbTouchSup   := true
+                zbSupZoneId  := zbZ.trackId
+                zbSupZoneTop := zbZ.top
+            if zbHit and zbZ.state == ST_RESIST and not zbTouchRes
+                zbTouchRes      := true
+                zbResZoneId     := zbZ.trackId
+                zbResZoneBottom := zbZ.bottom
+
+//  ★ strategy.opentrades → 仮想Trade の active カウント。
+//    Section 06 のこの時点は「仮想ブローカー実行後・Entry発注前」なので、
+//    Strategy がバーN終値で見る strategy.opentrades と同じ値になる。
+bool zoneBosGroupOpen = false
+if useZoneBosLogic
+    zoneBosGroupOpen := f_openCountZoneBosGroup() > 0
+
+sg.ZoneBosCfg zoneBosCfg = sg.newZoneBosCfg()
+zoneBosCfg.enableLong          := enableLong
+zoneBosCfg.enableShort         := enableShort
+zoneBosCfg.reqDailyVol         := zoneBosReqDailyVolatility
+zoneBosCfg.dailyLowVol         := zoneBosDailyLowVolThreshold
+zoneBosCfg.dailyHighVol        := zoneBosDailyHighVolThreshold
+zoneBosCfg.insufficientAsRange := dailyInsufficientAsRange
+zoneBosCfg.waitBars            := zoneBosWaitBars
+zoneBosCfg.minMoveAway         := zoneBosMinMoveAway
+
+sg.ZoneBosFeed zoneBosFeed = sg.ZoneBosFeed.new(
+     sessionOk = sessionOk, newsOk = allowByNewsTime,
+     volOk = fvgSig.volOk,
+     blockedByAccum = fvgSig.blockedByAccum, blockedByExitWait = fvgSig.blockedByExitWait,
+     accumLongDirOk = fvgSig.accumLongDirOk, accumShortDirOk = fvgSig.accumShortDirOk,
+     env4H = env4H, env1H = env1H, env15M = env15M,
+     drMedianRange = drMedianRange,
+     touchSupport = zbTouchSup, supZoneId = zbSupZoneId, supZoneTop = zbSupZoneTop,
+     touchResist = zbTouchRes, resZoneId = zbResZoneId, resZoneBottom = zbResZoneBottom,
+     bullBos = zbBullBos, bearBos = zbBearBos, bosBarCount = zoneBosBarCount,
+     groupOpen = zoneBosGroupOpen)
+
+sg.ZoneBosSignal zbSig = sg.ZoneBosSignal.new()
+if useZoneBosLogic
+    zbSig := sg.updateZoneBos(zoneBosEng, zoneBosCfg, zoneBosFeed, close)
+
+// ---- 6.5 RAW Signal カウント (ご指示20・Indicator専用のDebug) --------------
+//  ★ SignalEngine が直接返した値だけを数える。
+//    Group Gate / priority を適用したあとの値は絶対にRAWとして数えない。
+if fvgSig.longSignal
+    array.set(gCntRaw, 0, array.get(gCntRaw, 0) + 1)
+if fvgSig.shortSignal
+    array.set(gCntRaw, 1, array.get(gCntRaw, 1) + 1)
+if fvg15Sig.longSignal
+    array.set(gCntRaw, 2, array.get(gCntRaw, 2) + 1)
+if fvg15Sig.shortSignal
+    array.set(gCntRaw, 3, array.get(gCntRaw, 3) + 1)
+if absSig.long5
+    array.set(gCntRaw, 4, array.get(gCntRaw, 4) + 1)
+if absSig.long15
+    array.set(gCntRaw, 5, array.get(gCntRaw, 5) + 1)
+if zbSig.longSignal
+    array.set(gCntRaw, 6, array.get(gCntRaw, 6) + 1)
+if zbSig.shortSignal
+    array.set(gCntRaw, 7, array.get(gCntRaw, 7) + 1)
+
+// ============================================================================
+// 07. ORDER EXECUTION
+// ----------------------------------------------------------------------------
+//  ★ Strategy Section 07 をそのままコピー。
+//    判定順序 (FVG15 L → FVG15 S → FVG L → FVG S → ABS15 → ABS5 →
+//    ZONEBOS L → ZONEBOS S)、Group制御、consume / Armed解除のタイミングを
+//    1つも変えていない。
+// ============================================================================
+
+// ---- 7.0 FVG / FVG15 共通ポジション制御 -----------------------------------
+//  ★ Strategy と同じく 7.1 の前に1回だけ評価し、7.2 では再評価しない。
+bool fvgGroupBlocked = false
+if useFvg15Logic
+    fvgGroupBlocked := f_openCountFvgGroup() > 0
+
+// ---- 7.1 FVG15 Logic (同一バーでは既存5Mより優先) --------------------------
+string fvg15EidLong  = f_submitSignal(LOGIC_FVG15, fvg15Sig.longSignal  and not fvgGroupBlocked,  1, fvg15Sig.entryPrice)
+string fvg15EidShort = f_submitSignal(LOGIC_FVG15, fvg15Sig.shortSignal and not fvgGroupBlocked and fvg15EidLong == "", -1, fvg15Sig.entryPrice)
+bool fvg15Entered = fvg15EidLong != "" or fvg15EidShort != ""
+
+// 15M反発イベントの消費 / 再アーム解除は「実際に発注できた時だけ」。
+if fvg15EidLong != ""
+    sg.consumeFvg15(fvg15Ord, 1)
+    if fvg15Base.noTriggerMode
+        fvg15Eng.longArmed := false
+if fvg15EidShort != ""
+    sg.consumeFvg15(fvg15Ord, -1)
+    if fvg15Base.noTriggerMode
+        fvg15Eng.shortArmed := false
+
+// ---- 7.2 FVG Logic (既存5M) -----------------------------------------------
+string fvgEidLong  = f_submitSignal(LOGIC_FVG, fvgSig.longSignal  and not fvgGroupBlocked and not fvg15Entered,  1, fvgSig.entryPrice)
+string fvgEidShort = f_submitSignal(LOGIC_FVG, fvgSig.shortSignal and not fvgGroupBlocked and not fvg15Entered, -1, fvgSig.entryPrice)
+
+// FVG Logic 固有の再アーム解除 (トリガーOFFモード時のみ・実際に発注できた時だけ)
+if fvgSig.noTriggerMode and fvgEidLong != ""
+    fvgEng.longArmed := false
+if fvgSig.noTriggerMode and fvgEidShort != ""
+    fvgEng.shortArmed := false
+
+// ---- 7.3 FVGABS Logic (吸収系列) -------------------------------------------
+bool fvgAbsGroupBlocked = false
+if absAnyOn
+    fvgAbsGroupBlocked := f_openCountFvgAbsGroup() > 0
+
+string abs15Eid = f_submitSignal(LOGIC_FVG_ABS15, absSig.long15 and not fvgAbsGroupBlocked, 1, absSig.entryPrice)
+bool abs15Entered = abs15Eid != ""
+string abs5Eid = f_submitSignal(LOGIC_FVG_ABS5, absSig.long5 and not fvgAbsGroupBlocked and not abs15Entered, 1, absSig.entryPrice)
+
+//  吸収イベントの消費は「実際に発注できた時だけ」。
+if abs15Eid != ""
+    sg.consumeFvgAbs(fvgAbsEng, 15)
+if abs5Eid != ""
+    sg.consumeFvgAbs(fvgAbsEng, 5)
+
+// ---- 7.4 ZONEBOS Logic (Zone Touch → BOS) ----------------------------------
+string zbEidLong  = f_submitSignal(LOGIC_ZONE_BOS, zbSig.longSignal  and not zoneBosGroupOpen,  1, zbSig.entryPrice)
+string zbEidShort = f_submitSignal(LOGIC_ZONE_BOS, zbSig.shortSignal and not zoneBosGroupOpen and zbEidLong == "", -1, zbSig.entryPrice)
+
+//  Zoneタッチイベントの消費は「実際に発注できた時だけ」。
+if zbEidLong != ""
+    sg.consumeZoneBos(zoneBosEng, 1)
+if zbEidShort != ""
+    sg.consumeZoneBos(zoneBosEng, -1)
+
+// ============================================================================
+// 08. BREAK EVEN
+// ----------------------------------------------------------------------------
+//  ★ Strategy Section 08-2 をそのままコピー。
+//    Logic別のBE Trigger選択・判定方式・条件式は1つも変えていない。
+//    strategy.opentrades ループ → active な仮想Trade のループ
+//    strategy.opentrades.entry_price(i) → t.entryPrice (実約定 = 次バー始値)
+//    strategy.exit(stop = ep, limit = gTradeTP.get(eid)) → t.sl := ep
+//      (t.tp は Entry時に固定した値のまま = gTradeTP と同じ)
+//  ★ Strategy では Section 08 がバー終値で走り、変更後のSLは次バーから有効。
+//    Indicator も仮想ブローカーが次バー先頭で走るので順序が一致する。
+//  ★ Strategy 8.1 (gTradeTP / gTradeBE の Map掃除) は、状態を VTrade 自身が
+//    持つため不要。LastSL の集計だけ仮想ブローカーの決済処理へ移してある。
+//  ★ pending (このバーに発注しただけ) は strategy.opentrades に入らないので
+//    BEの対象にもならない。t.active のみを対象にすることで一致する。
+// ============================================================================
+if useBreakEven and array.size(gTrades) > 0
+    for i = 0 to array.size(gTrades) - 1
+        VTrade t = array.get(gTrades, i)
+        if t.active
+            string eid   = t.eid
+            float  ep    = t.entryPrice
+            bool   isLong = t.dir > 0
+            bool   wasOn = t.beOn
+            bool   reach = false
+            // ---- 建値移動開始幅の切り替え (Logicごと・Strategy と同一) -----
+            bool isFvg15Trade = str.startswith(eid, LOGIC_FVG15 + "_L_") or
+                 str.startswith(eid, LOGIC_FVG15 + "_S_")
+            bool isAbsTrade = str.startswith(eid, LOGIC_FVG_ABS5 + "_L_") or
+                 str.startswith(eid, LOGIC_FVG_ABS15 + "_L_")
+            bool isZoneBosTrade = str.startswith(eid, LOGIC_ZONE_BOS + "_L_") or
+                 str.startswith(eid, LOGIC_ZONE_BOS + "_S_")
+            float beTrigger = isFvg15Trade ? fvg15BreakEvenTrigger :
+                 isAbsTrade ? absBreakEvenTrigger :
+                 isZoneBosTrade ? zoneBosBreakEvenTrigger : breakEvenTrigger
+            if isLong
+                reach := breakEvenTriggerMode == "確定足" ? (barstate.isconfirmed and close >= ep + beTrigger) : (high >= ep + beTrigger)
+            else
+                reach := breakEvenTriggerMode == "確定足" ? (barstate.isconfirmed and close <= ep - beTrigger) : (low <= ep - beTrigger)
+            if wasOn or reach
+                t.beOn := true
+                t.sl   := ep
+
+// ============================================================================
+// 09. DISPLAY / DEBUG
+// ----------------------------------------------------------------------------
+//  ★ このセクションは完全に表示専用。Section 05V〜08 (仮想ブローカー / Signal /
+//    発注 / consume / BE) の後に置いてあり、ここから engine / cfg / feed /
+//    仮想Trade を書き換えない。Zone描画が使う zn.zoneCount / zn.drawOrder /
+//    zn.zoneAt はいずれも読み取り専用なので、描画を足しても Entry判定は変わらない。
+// ============================================================================
+// ---- 9.1 Zone 描画 (Strategy Section 9.1 と同一) ---------------------------
+var array<box>   gBoxes  = array.new<box>()
+var array<label> gLabels = array.new<label>()
+
+f_clearDrawings() =>
+    while array.size(gBoxes) > 0
+        box.delete(array.pop(gBoxes))
+    while array.size(gLabels) > 0
+        label.delete(array.pop(gLabels))
+    true
+
+f_zoneColor(int st) =>
+    st == ST_SUPPORT ? colSupport : st == ST_RESIST ? colResistance : st == ST_ACTIVE ? colActive : colBroken
+
+f_zoneTransp(int strength) =>
+    strength == SR_VSTRONG ? trVStrong : strength == SR_STRONG ? trStrong : strength == SR_MEDIUM ? trMedium : trWeak
+
+if barstate.islast
+    f_clearDrawings()
+    if showZones and zn.zoneCount(zoneEng) > 0
+        array<int> ord = zn.drawOrder(zoneEng, maxZonesDraw)
+        if array.size(ord) > 0
+            for k = 0 to array.size(ord) - 1
+                zn.Zone z = zn.zoneAt(zoneEng, array.get(ord, k))
+                color bc = f_zoneColor(z.state)
+                int   tr = f_zoneTransp(z.strength)
+                box b = box.new(
+                     left         = bar_index - zoneLeftBars,
+                     top          = z.top,
+                     right        = bar_index + zoneRightBars,
+                     bottom       = z.bottom,
+                     bgcolor      = color.new(bc, tr),
+                     border_color = color.new(bc, math.max(tr - 30, 0)),
+                     border_width = z.strength >= SR_STRONG ? 2 : 1,
+                     border_style = z.state == ST_BROKEN ? line.style_dashed : line.style_solid,
+                     xloc         = xloc.bar_index)
+                array.push(gBoxes, b)
+
+                if showLabels
+                    string txt = zn.stateName(z.state) + " | " + f_num(z.score, "#.#") + " | " + zn.strengthName(z.strength)
+                    txt := txt + " | HTF: " + (z.hasHtf ? z.htfSources : "NO")
+                    txt := txt + " | React " + str.tostring(z.reactionCnt)
+                    if z.flipped
+                        txt := txt + " | FLIP"
+                    if showDetailLbl
+                        txt := txt + "\n" + z.sources
+                    label lb = label.new(
+                         x         = bar_index + zoneRightBars,
+                         y         = z.top,
+                         text      = txt,
+                         xloc      = xloc.bar_index,
+                         style     = label.style_label_left,
+                         color     = color.new(bc, 20),
+                         textcolor = color.white,
+                         size      = size.small)
+                    array.push(gLabels, lb)
+
+// ---- 9.2 MA Source の可視化 (Strategy Section 9.2 と同一) ------------------
+plot(showMaLines and useMaSource ? ma1Val : na, "MA #1 (1M)", color = color.new(color.aqua, 25), linewidth = 1)
+plot(showMaLines and useMaSource ? ma2Val : na, "MA #2 (1M)", color = color.new(color.fuchsia, 25), linewidth = 1)
+
+// ---- 9.3 Zone Debug Table (Strategy Section 9.3 と同一) --------------------
+f_tablePos(string s) =>
+    s == "Top Left"       ? position.top_left :
+     s == "Bottom Right"  ? position.bottom_right :
+     s == "Bottom Left"   ? position.bottom_left :
+     s == "Middle Right"  ? position.middle_right :
+     s == "Middle Center" ? position.middle_center : position.top_right
+
+f_textSize(string s) =>
+    s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
+
+// BE適用中の仮想Trade数 (Strategy の gTradeBE.size() 相当の表示)
+f_virtBeCount() =>
+    int c = 0
+    if array.size(gTrades) > 0
+        for i = 0 to array.size(gTrades) - 1
+            VTrade t = array.get(gTrades, i)
+            if t.active and t.beOn
+                c += 1
+    c
+
+var table dbg = table.new(f_tablePos(dbgPosStr), 7, dbgNearestN * 2 + 9,
+     border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 40))
+
+f_cell(int col, int row, string txt, color txtCol, color bgCol) =>
+    table.cell(dbg, col, row, txt, text_color = txtCol, bgcolor = bgCol,
+         text_size = f_textSize(dbgTextSize), text_halign = text.align_left)
+
+f_zoneRow(int row, string tag, int zi, color tagCol) =>
+    zn.Zone z = zn.zoneAt(zoneEng, zi)
+    float d = z.center - close
+    f_cell(0, row, tag,                                   tagCol,      color.new(tagCol, 88))
+    f_cell(1, row, f_num(z.center, "#.##"),               color.white, color.new(tagCol, 92))
+    f_cell(2, row, f_num(z.score, "#.#") + " · R" + str.tostring(z.reactionCnt), color.white, color.new(tagCol, 92))
+    f_cell(3, row, zn.strengthName(z.strength) + " · HTF " + (z.hasHtf ? z.htfSources : "NO"), color.white, color.new(tagCol, 92))
+    f_cell(4, row, zn.stateFull(z.state) + (z.flipped ? " (Flip)" : ""), color.white, color.new(tagCol, 92))
+    f_cell(5, row, f_num(math.abs(d), "#.#"),             color.white, color.new(tagCol, 92))
+    f_cell(6, row, z.sources,                             color.white, color.new(tagCol, 92))
+
+if barstate.islast and showDebugTable
+    table.clear(dbg, 0, 0, 6, dbgNearestN * 2 + 8)
+    color hdr = color.new(color.gray, 70)
+    f_cell(0, 0, "Zone",     color.white, hdr)
+    f_cell(1, 0, "Center",   color.white, hdr)
+    f_cell(2, 0, "Score",    color.white, hdr)
+    f_cell(3, 0, "Strength", color.white, hdr)
+    f_cell(4, 0, "State",    color.white, hdr)
+    f_cell(5, 0, "Distance", color.white, hdr)
+    f_cell(6, 0, "Sources",  color.white, hdr)
+
+    array<int> resIdx = zn.nearestIdx(zoneEng, false, dbgNearestN)
+    array<int> supIdx = zn.nearestIdx(zoneEng, true,  dbgNearestN)
+
+    int row = 1
+    if array.size(resIdx) > 0
+        for k = array.size(resIdx) - 1 to 0
+            f_zoneRow(row, "RES " + str.tostring(k + 1), array.get(resIdx, k), colResistance)
+            row += 1
+    if array.size(resIdx) < dbgNearestN
+        for k = array.size(resIdx) to dbgNearestN - 1
+            f_cell(0, row, "RES -", color.gray, color.new(color.gray, 90))
+            row += 1
+
+    f_cell(0, row, "PRICE", color.black, color.new(color.yellow, 20))
+    f_cell(1, row, f_num(close, "#.##"), color.black, color.new(color.yellow, 40))
+    f_cell(2, row, "Zones: " + str.tostring(zoneCountNow), color.black, color.new(color.yellow, 60))
+    f_cell(3, row, "Raw: " + str.tostring(zoneEng.rawCount),   color.black, color.new(color.yellow, 60))
+    f_cell(4, row, "MA1 " + f_arrow(zoneEng.ma1Dir) + " MA2 " + f_arrow(zoneEng.ma2Dir), color.black, color.new(color.yellow, 60))
+    f_cell(5, row, "MAcl +" + f_num(zoneEng.maClusterBonus, "#.#"), color.black, color.new(color.yellow, 60))
+    f_cell(6, row, "Day H/L " + f_num(zoneEng.dayHigh, "#.#") + " / " + f_num(zoneEng.dayLow, "#.#"), color.black, color.new(color.yellow, 60))
+    row += 1
+
+    if array.size(supIdx) > 0
+        for k = 0 to array.size(supIdx) - 1
+            f_zoneRow(row, "SUP " + str.tostring(k + 1), array.get(supIdx, k), colSupport)
+            row += 1
+    if array.size(supIdx) < dbgNearestN
+        for k = array.size(supIdx) to dbgNearestN - 1
+            f_cell(0, row, "SUP -", color.gray, color.new(color.gray, 90))
+            row += 1
+
+    // ---- 直近TradePlan (Strategy と同一) ---------------------------------
+    if showTradeDebug
+        color pc = color.new(color.blue, 70)
+        f_cell(0, row, "PLAN", color.white, pc)
+        f_cell(1, row, array.get(gLastPlan, 0) + "  |  TP MODE: " + tpMode, color.white, pc)
+        for c = 2 to 6
+            f_cell(c, row, "", color.white, pc)
+        table.merge_cells(dbg, 1, row, 6, row)
+        row += 1
+        f_cell(0, row, "STATUS", color.white, pc)
+        string sigTxt = "  |  SIG FVG " + (fvgSig.longSignal ? "L" : fvgSig.shortSignal ? "S" : "-")
+        sigTxt := sigTxt + " / FVG15 " + (fvg15Sig.longSignal ? "L" : fvg15Sig.shortSignal ? "S" : "-")
+        sigTxt := sigTxt + " (bos " + (fvg15Sig.bosOkLong ? "L" : "-") + (fvg15Sig.bosOkShort ? "S" : "-") + ")"
+        sigTxt := sigTxt + " / ABS5 " + (absSig.long5 ? "L" : "-") + " ABS15 " + (absSig.long15 ? "L" : "-")
+        sigTxt := sigTxt + " (bos " + (absSig.bos5Ok ? "5" : "-") + (absSig.bos15Ok ? "15" : "-") + ")"
+        sigTxt := sigTxt + " / ZBOS " + (zbSig.longSignal ? "L" : zbSig.shortSignal ? "S" : "-")
+        sigTxt := sigTxt + " (wait " + (zbSig.longWaiting ? "L" : "-") + (zbSig.shortWaiting ? "S" : "-") +
+             " away " + (zbSig.longMovedAway ? "L" : "-") + (zbSig.shortMovedAway ? "S" : "-") + ")"
+        f_cell(1, row, array.get(gLastPlan, 1) + "  |  Open " + str.tostring(f_virtOpenCount()) +
+             "  |  BE " + str.tostring(f_virtBeCount()) + "/" + str.tostring(f_virtOpenCount()) +
+             "  |  Closed " + str.tostring(array.get(gClosedCnt, 0)) + sigTxt, color.white, pc)
+        for c = 2 to 6
+            f_cell(c, row, "", color.white, pc)
+        table.merge_cells(dbg, 1, row, 6, row)
+        row += 1
+        color qc = color.new(color.purple, 70)
+        f_cell(0, row, "QTY", color.white, qc)
+        f_cell(1, row, array.get(gLastPlan, 2) +
+             "  ||  LastSL P/L " + f_num(array.get(gLastSl, 0), "#.##") + " (qty " + f_num(array.get(gLastSl, 1), "#.####") + ")",
+             color.white, qc)
+        for c = 2 to 6
+            f_cell(c, row, "", color.white, qc)
+        table.merge_cells(dbg, 1, row, 6, row)
+        row += 1
+
+    // ---- 環境警告 (Strategy と同一) ---------------------------------------
+    string warn = ""
+    if timeframe.in_seconds() < timeframe.in_seconds(breakTf)
+        warn := warn + "Chart TF < Break TF. "
+    if timeframe.in_seconds() < timeframe.in_seconds(hzTf1)
+        warn := warn + "Chart TF < Horizontal TF#1. "
+    if timeframe.in_seconds() != timeframe.in_seconds("5")
+        warn := warn + "本Indicatorは5分足チャート前提。"
+    if warn != ""
+        f_cell(0, row, "WARN", color.white, color.new(color.orange, 40))
+        f_cell(1, row, warn, color.white, color.new(color.orange, 60))
+        for c = 2 to 6
+            f_cell(c, row, "", color.white, color.new(color.orange, 60))
+        table.merge_cells(dbg, 1, row, 6, row)
+
+// ---- 9.4 FVG 環境認識 テーブル (Strategy Section 9.4 と同一) ---------------
+f_efvgBiasColor(int b) =>
+    b == 1 ? color.new(color.green, 0) : b == -1 ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+f_efvgRow(table t, int row, string tf, bool on, int bias, int reason, int rem) =>
+    table.cell(t, 0, row, tf, text_color = color.white, text_size = size.small)
+    table.cell(t, 1, row, on ? sg.efvgBiasText(bias) : "-", text_color = color.white,
+         bgcolor = on ? f_efvgBiasColor(bias) : color.new(color.gray, 60), text_size = size.small)
+    table.cell(t, 2, row, on ? sg.efvgReasonText(reason) : "-", text_color = color.white, text_size = size.small)
+    table.cell(t, 3, row, on ? str.tostring(rem) : "-", text_color = color.white, text_size = size.small)
+
+var table efvgTbl = na
+if efvgShowTable
+    if na(efvgTbl)
+        efvgTbl := table.new(position.middle_left, 4, 8, border_width = 1)
+    if barstate.islast
+        color _hb = color.new(color.black, 0)
+        table.cell(efvgTbl, 0, 0, "TF",   text_color = color.white, bgcolor = _hb, text_size = size.small)
+        table.cell(efvgTbl, 1, 0, "FVG",  text_color = color.white, bgcolor = _hb, text_size = size.small)
+        table.cell(efvgTbl, 2, 0, "理由", text_color = color.white, bgcolor = _hb, text_size = size.small)
+        table.cell(efvgTbl, 3, 0, "残",   text_color = color.white, bgcolor = _hb, text_size = size.small)
+        f_efvgRow(efvgTbl, 1, "D",   useEFVGDaily, efvgDBias, efvgDReason, efvgDRem)
+        f_efvgRow(efvgTbl, 2, "4H",  useEFVG4H,    efvgHBias, efvgHReason, efvgHRem)
+        f_efvgRow(efvgTbl, 3, "1H",  useEFVG1H,    efvgOBias, efvgOReason, efvgORem)
+        f_efvgRow(efvgTbl, 4, "15M", useEFVG15M,   fvgSig.mBias, fvgSig.mReason, fvgSig.mRem)
+        f_efvgRow(efvgTbl, 5, "5M",  useEFVG5M,    efvg5Bias, efvg5Reason, efvg5Rem)
+        f_efvgRow(efvgTbl, 6, "1M",  useEFVG1M,    efvg1Bias, efvg1Reason, efvg1Rem)
+        table.cell(efvgTbl, 0, 7, "FINAL FVG BIAS: " + sg.efvgBiasText(fvgSig.efvgFinalBias),
+             text_color = color.white, bgcolor = f_efvgBiasColor(fvgSig.efvgFinalBias), text_size = size.small)
+        table.cell(efvgTbl, 1, 7, efvgShowDebug ? ("Score:" + str.tostring(fvgSig.efvgScore)) : "", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 2, 7, efvgShowDebug ? (efvgCombineMode + "/" + efvgIntegrationMode) : "", text_color = color.white, text_size = size.small)
+        table.cell(efvgTbl, 3, 7, efvgShowDebug ? ("Trend:" + (fvgSig.trendOk ? "OK" : "NG")) : "", text_color = color.white, text_size = size.small)
+
+// ---- 9.5 日足ボラ中央値 デバッグ (Strategy Section 9.5 と同一) -------------
+var table dailyVolTbl = na
+if showDailyVolDebug and useDailyRegimeFilter
+    if na(dailyVolTbl)
+        dailyVolTbl := table.new(position.top_left, 2, 3, border_width = 1)
+    if barstate.islast
+        color _hb = color.new(color.black, 0)
+        table.cell(dailyVolTbl, 0, 0, "日足ボラ (中央値" + str.tostring(dailyVolMedianLength) + "本)", text_color = color.white, bgcolor = _hb, text_size = size.small)
+        table.cell(dailyVolTbl, 1, 0, "", text_color = color.white, bgcolor = _hb, text_size = size.small)
+        table.cell(dailyVolTbl, 0, 1, "中央値", text_color = color.white, text_size = size.small)
+        table.cell(dailyVolTbl, 1, 1, (na(drMedianRange) ? "-" : str.tostring(drMedianRange, "#.#")) + "$", text_color = color.white, text_size = size.small)
+        table.cell(dailyVolTbl, 0, 2, "判定", text_color = color.white, text_size = size.small)
+        table.cell(dailyVolTbl, 1, 2, sg.dailyVolatilityText(fvgSig.drVolCode), text_color = color.white,
+             bgcolor = f_efvgBiasColor(nz(fvgSig.drVolCode, 0)), text_size = size.small)
+
+// ---- 9.6 FVG構造管理 BOS デバッグ (Strategy Section 9.6 と同一) ------------
+f_fvgBosText(int s) =>
+    s == 1 ? "Bull" : s == -1 ? "Bear" : "Neutral"
+
+f_bosRow(table t, int row, string tf, bool on, int bos) =>
+    table.cell(t, 0, row, tf, text_color = color.white, text_size = size.small)
+    table.cell(t, 1, row, on ? f_fvgBosText(bos) : "-", text_color = color.white,
+         bgcolor = on ? f_efvgBiasColor(bos) : color.new(color.gray, 60), text_size = size.small)
+
+var table fvgBosTbl = na
+if showFvgBosDebug and useEFVGEnv
+    if na(fvgBosTbl)
+        fvgBosTbl := table.new(position.bottom_right, 2, 7, border_width = 1)
+    if barstate.islast
+        color _hb = color.new(color.black, 0)
+        table.cell(fvgBosTbl, 0, 0, "FVG構造BOS", text_color = color.white, bgcolor = _hb, text_size = size.small)
+        table.cell(fvgBosTbl, 1, 0, useFvgBosFilter ? "ON" : "OFF", text_color = color.white, bgcolor = _hb, text_size = size.small)
+        f_bosRow(fvgBosTbl, 1, "D",   useEFVGDaily, efvgDBos)
+        f_bosRow(fvgBosTbl, 2, "4H",  useEFVG4H,    efvgHBos)
+        f_bosRow(fvgBosTbl, 3, "1H",  useEFVG1H,    efvgOBos)
+        f_bosRow(fvgBosTbl, 4, "15M→5M", useEFVG15M and useFvgBosFilter, efvg5Bos)
+        f_bosRow(fvgBosTbl, 5, "5M",  useEFVG5M,    efvg5Bos)
+        f_bosRow(fvgBosTbl, 6, "1M",  useEFVG1M,    efvg1Bos)
+
+// ============================================================================
+// 09V. INDICATOR 専用 表示 (Strategy Tester の代替)
+// ============================================================================
+// ---- 9V.1 ENTRY / FILL マーカー -------------------------------------------
+//  ENTRY = Strategy が strategy.entry() を呼んだ発注バー (1対1比較用)
+//  FILL  = 次バー始値で約定した位置 (参考表示)
+bool anyLongEntry   = array.get(gEntryFlag, 0)
+bool anyShortEntry  = array.get(gEntryFlag, 1)
+bool anyLongFilled  = array.get(gFillFlag, 0)
+bool anyShortFilled = array.get(gFillFlag, 1)
+
+plotshape(showEntryShape and anyLongEntry,   title = "ENTRY LONG",  style = shape.triangleup,
+     location = location.belowbar, color = color.new(color.teal, 0),   size = size.tiny)
+plotshape(showEntryShape and anyShortEntry,  title = "ENTRY SHORT", style = shape.triangledown,
+     location = location.abovebar, color = color.new(color.maroon, 0), size = size.tiny)
+plotshape(showFillMarker and anyLongFilled,  title = "FILL LONG",   style = shape.xcross,
+     location = location.belowbar, color = color.new(color.gray, 0),   size = size.tiny)
+plotshape(showFillMarker and anyShortFilled, title = "FILL SHORT",  style = shape.xcross,
+     location = location.abovebar, color = color.new(color.gray, 0),   size = size.tiny)
+
+// ---- 9V.2 一致確認 Debug テーブル (ご指示20) -------------------------------
+//  RAW   = SignalEngine が直接返した Signal 数
+//  GATE  = Group / priority を通過して f_submitSignal へ進んだ数
+//  PLAN  = zn.buildPlan が valid だった数 (TP Mode フィルター適用前)
+//  ENTRY = 最終的に Entry ID が発行された数
+//  → Strategy の List of Trades 件数と一致するのは ENTRY 列の合計。
+var table matchTbl = na
+if showMatchTable
+    if na(matchTbl)
+        matchTbl := table.new(f_tablePos(matchPosStr), 5, 10, border_width = 1,
+             frame_width = 1, frame_color = color.new(color.gray, 40))
+    if barstate.islast
+        color _mh = color.new(color.black, 10)
+        table.cell(matchTbl, 0, 0, "Logic", text_color = color.white, bgcolor = _mh, text_size = f_textSize(matchTextSize))
+        table.cell(matchTbl, 1, 0, "RAW",   text_color = color.white, bgcolor = _mh, text_size = f_textSize(matchTextSize))
+        table.cell(matchTbl, 2, 0, "GATE",  text_color = color.white, bgcolor = _mh, text_size = f_textSize(matchTextSize))
+        table.cell(matchTbl, 3, 0, "PLAN",  text_color = color.white, bgcolor = _mh, text_size = f_textSize(matchTextSize))
+        table.cell(matchTbl, 4, 0, "ENTRY", text_color = color.white, bgcolor = _mh, text_size = f_textSize(matchTextSize))
+        int totRaw = 0
+        int totGate = 0
+        int totPlan = 0
+        int totEntry = 0
+        for s = 0 to 7
+            string nm = s == 0 ? "FVG L" : s == 1 ? "FVG S" : s == 2 ? "FVG15 L" : s == 3 ? "FVG15 S" :
+                 s == 4 ? "FVGABS5 L" : s == 5 ? "FVGABS15 L" : s == 6 ? "ZONEBOS L" : "ZONEBOS S"
+            color rc = color.new(s < 2 ? color.blue : s < 4 ? color.teal : s < 6 ? color.purple : color.orange, 85)
+            table.cell(matchTbl, 0, s + 1, nm, text_color = color.white, bgcolor = rc, text_size = f_textSize(matchTextSize), text_halign = text.align_left)
+            table.cell(matchTbl, 1, s + 1, str.tostring(array.get(gCntRaw,   s)), text_color = color.white, bgcolor = rc, text_size = f_textSize(matchTextSize))
+            table.cell(matchTbl, 2, s + 1, str.tostring(array.get(gCntGate,  s)), text_color = color.white, bgcolor = rc, text_size = f_textSize(matchTextSize))
+            table.cell(matchTbl, 3, s + 1, str.tostring(array.get(gCntPlan,  s)), text_color = color.white, bgcolor = rc, text_size = f_textSize(matchTextSize))
+            table.cell(matchTbl, 4, s + 1, str.tostring(array.get(gCntEntry, s)), text_color = color.white, bgcolor = rc, text_size = f_textSize(matchTextSize))
+            totRaw   += array.get(gCntRaw,   s)
+            totGate  += array.get(gCntGate,  s)
+            totPlan  += array.get(gCntPlan,  s)
+            totEntry += array.get(gCntEntry, s)
+        color tc = color.new(color.yellow, 25)
+        table.cell(matchTbl, 0, 9, "TOTAL", text_color = color.black, bgcolor = tc, text_size = f_textSize(matchTextSize), text_halign = text.align_left)
+        table.cell(matchTbl, 1, 9, str.tostring(totRaw),   text_color = color.black, bgcolor = tc, text_size = f_textSize(matchTextSize))
+        table.cell(matchTbl, 2, 9, str.tostring(totGate),  text_color = color.black, bgcolor = tc, text_size = f_textSize(matchTextSize))
+        table.cell(matchTbl, 3, 9, str.tostring(totPlan),  text_color = color.black, bgcolor = tc, text_size = f_textSize(matchTextSize))
+        table.cell(matchTbl, 4, 9, str.tostring(totEntry), text_color = color.black, bgcolor = tc, text_size = f_textSize(matchTextSize))
+
+// ---- 9V.3 Entry ID ログ (ご指示21) -----------------------------------------
+//  Strategy の List of Trades / Entry Debug Label と1件ずつ突き合わせる用。
+//  新しいものが上。「発注」= strategy.entry を呼んだバー、「約定」= 次バー始値。
+f_logTime(int t) =>
+    na(t) ? "-" : str.format_time(t, "yyyy-MM-dd HH:mm", entryLogTz)
+
+var table logTbl = na
+if showEntryLog
+    if na(logTbl)
+        logTbl := table.new(f_tablePos(entryLogPosStr), 7, entryLogRows + 1, border_width = 1,
+             frame_width = 1, frame_color = color.new(color.gray, 40))
+    if barstate.islast
+        table.clear(logTbl, 0, 0, 6, entryLogRows)
+        color _lh = color.new(color.black, 10)
+        table.cell(logTbl, 0, 0, "Entry ID",  text_color = color.white, bgcolor = _lh, text_size = f_textSize(matchTextSize))
+        table.cell(logTbl, 1, 0, "Logic",     text_color = color.white, bgcolor = _lh, text_size = f_textSize(matchTextSize))
+        table.cell(logTbl, 2, 0, "Dir",       text_color = color.white, bgcolor = _lh, text_size = f_textSize(matchTextSize))
+        table.cell(logTbl, 3, 0, "発注日時",   text_color = color.white, bgcolor = _lh, text_size = f_textSize(matchTextSize))
+        table.cell(logTbl, 4, 0, "発注bar",    text_color = color.white, bgcolor = _lh, text_size = f_textSize(matchTextSize))
+        table.cell(logTbl, 5, 0, "約定日時",   text_color = color.white, bgcolor = _lh, text_size = f_textSize(matchTextSize))
+        table.cell(logTbl, 6, 0, "Fill価格",   text_color = color.white, bgcolor = _lh, text_size = f_textSize(matchTextSize))
+        int nLog = array.size(gLogEid)
+        if nLog > 0
+            int shown = int(math.min(nLog, entryLogRows))
+            for k = 0 to shown - 1
+                int    idx = nLog - 1 - k          // 新しいものから
+                int    dr  = array.get(gLogDir, idx)
+                color  rc  = color.new(dr > 0 ? color.teal : color.maroon, 82)
+                table.cell(logTbl, 0, k + 1, array.get(gLogEid, idx),   text_color = color.white, bgcolor = rc, text_size = f_textSize(matchTextSize), text_halign = text.align_left)
+                table.cell(logTbl, 1, k + 1, array.get(gLogLogic, idx), text_color = color.white, bgcolor = rc, text_size = f_textSize(matchTextSize), text_halign = text.align_left)
+                table.cell(logTbl, 2, k + 1, dr > 0 ? "LONG" : "SHORT", text_color = color.white, bgcolor = rc, text_size = f_textSize(matchTextSize))
+                table.cell(logTbl, 3, k + 1, f_logTime(array.get(gLogOrderTime, idx)), text_color = color.white, bgcolor = rc, text_size = f_textSize(matchTextSize))
+                table.cell(logTbl, 4, k + 1, str.tostring(array.get(gLogOrderBar, idx)), text_color = color.white, bgcolor = rc, text_size = f_textSize(matchTextSize))
+                table.cell(logTbl, 5, k + 1, f_logTime(array.get(gLogFillTime, idx)),  text_color = color.white, bgcolor = rc, text_size = f_textSize(matchTextSize))
+                table.cell(logTbl, 6, k + 1, f_num(array.get(gLogFillPx, idx), "#.##"), text_color = color.white, bgcolor = rc, text_size = f_textSize(matchTextSize))
+
+// ============================================================================
+// 10. Strategy から意図的に変更した箇所 (これ以外の Entry ロジック変更は無い)
+// ----------------------------------------------------------------------------
+//  1. strategy() → indicator()
+//       pyramiding / initial_capital / default_qty_type / default_qty_value は
+//       indicator() に存在しないため削除。initial_capital の値は
+//       input indInitialCapital (既定 1000) として Section 01-4 に移した。
+//
+//  2. strategy.* API → Virtual Trade State (Section 05V)
+//       strategy.entry / strategy.exit          → VTrade (pending → active)
+//       strategy.opentrades / entry_id / size   → f_openCount*() / VTrade.eid / dir
+//       strategy.opentrades.entry_price         → VTrade.entryPrice
+//       strategy.position_size                  → f_virtPositionSize()
+//       strategy.closedtrades / exit_comment    → gClosedCnt / 仮想Broker の決済処理
+//       strategy.equity / initial_capital       → f_virtEquity() / indInitialCapital
+//       Broker Emulator の約定・SL/TP判定        → f_virtBroker()
+//       Strategy 8.1 の Map掃除 (gTradeTP / gTradeBE / f_isOpenEntry) は
+//       状態を VTrade 自身が持つため不要になり削除。
+//       strategy.account_currency は Indicator から読めないため
+//       f_qtyText の該当表示だけ差し替え (表示専用)。
+//
+//  3. Strategy Tester 専用表示 → Indicator用 Signal / Debug 表示
+//       ENTRY SIGNAL ラベル + Alert (Section 05V.8 · 発注バーに表示)
+//       FILL マーカー (Section 05V.4 · 約定バー。Alertは発火しない)
+//       RAW / GATE / PLAN / ENTRY カウンタ (Section 09V.2)
+//       Entry ID ログテーブル (Section 09V.3)
+//       Section 01-6 の表示専用input
+//
+//  ※ Entry判定に関わる input / 条件式 / 判定順序 / consumeタイミング /
+//    Armed解除 / Group制御 / TradePlan / Qty計算 は1つも変更していない。
+// ============================================================================
