@@ -17,7 +17,8 @@
 //    01. Types            (FvgCfg / FvgFeed / FvgEngine / FvgSignal /
 //                          Fvg15Engine / Fvg15Signal /
 //                          FvgAbsEngine / FvgAbsSignal /
-//                          ZoneBosEngine / ZoneBosSignal)
+//                          ZoneBosEngine / ZoneBosSignal /
+//                          ZoneBosCfg / ZoneBosFeed)
 //    02. Factories
 //    03. FVG · 外部足コンテキストで評価する計算式 (Mainがrequest.securityで包む)
 //    04. FVG · チャート足コンテキストの内部ヘルパー
@@ -400,6 +401,57 @@ export type FvgAbsSignal
     bool  bos5Ok     = false
     bool  bos15Ok    = false
 
+// ---- ZoneBosCfg : Zone Touch → BOS Logic の設定 (input は Main 側で定義) --
+//  ZONEBOS専用の設定値だけを持つ。共通フィルタの設定は持たない
+//  (共通フィルタは「結果」を ZoneBosFeed で受け取る)。
+export type ZoneBosCfg
+    // Logic ON/OFF × 方向許可 (Mainの enableLong / enableShort)
+    bool   enableLong          = true
+    bool   enableShort         = true
+    // ZONEBOS専用 日足ボラ
+    string reqDailyVol         = "OFF"
+    float  dailyLowVol         = 0.0
+    float  dailyHighVol        = 0.0
+    bool   insufficientAsRange = true
+    // BOS待機 / 最低離脱距離
+    int    waitBars            = 6
+    float  minMoveAway         = 0.0
+
+// ---- ZoneBosFeed : Main が用意して渡す外部データ / 共通フィルタ結果 -------
+//  ★ ここに入るのは「すでに計算済みの結果」だけ。
+//    request.security も ZoneEngine の走査も Main の担当で、
+//    SignalEngine から ZoneEngine を import しない構造を保つ。
+export type ZoneBosFeed
+    // 共通フィルタ結果 (FVG側と同じ計算結果をそのまま再利用する)
+    bool  sessionOk         = true
+    bool  newsOk            = true
+    bool  volOk             = false
+    bool  blockedByAccum    = false
+    bool  blockedByExitWait = false
+    bool  accumLongDirOk    = true
+    bool  accumShortDirOk   = true
+    // 環境認識 (各TFの確定トレンド  1=上昇 / 0=レンジ / -1=下降)
+    int   env4H             = na
+    int   env1H             = na
+    int   env15M            = na
+    // 日足ボラ中央値 (前日までの確定Daily Range中央値)
+    float drMedianRange     = na
+    // Zoneタッチ (Main が ZoneEngine を走査して求めた結果)
+    bool  touchSupport      = false
+    int   supZoneId         = na
+    float supZoneTop        = na
+    bool  touchResist       = false
+    int   resZoneId         = na
+    float resZoneBottom     = na
+    // BOS (Main が request.security / request.security_lower_tf で取得)
+    bool  bullBos           = false
+    bool  bearBos           = false
+    int   bosBarCount       = 0
+    // ★ Strategy固有の状態。保有中は待機イベントを持たないための入力で、
+    //   「保有しているか」の判定自体は Main (Strategy) の担当。
+    //   Indicator から使うときは常に false を渡せばよい。
+    bool  groupOpen         = false
+
 // ---- ZoneBosEngine : Zone Touch → BOS Logic の永続状態 --------------------
 //  ★ FVG系列 (FvgEngine / Fvg15Engine / FvgAbsEngine) とは完全に別インスタンス。
 //    armed / consumed / eventId / BOS待機 を FVG側と一切共有しない。
@@ -467,6 +519,11 @@ export newFvgAbsEngine() =>
 // @returns   ZoneBosEngine
 export newZoneBosEngine() =>
     ZoneBosEngine.new()
+
+// @function  Zone Touch → BOS Logic の既定Cfgを作る。Main側でフィールドを上書きする。
+// @returns   ZoneBosCfg
+export newZoneBosCfg() =>
+    ZoneBosCfg.new()
 
 // ============================================================================
 // 03. FVG · 外部足コンテキストで評価する計算式
@@ -1665,6 +1722,37 @@ export updateFvgAbs(FvgAbsEngine e, bool envLongOk, float entryPrice,
     FvgAbsSignal.new(long5 = l5, long15 = l15, entryPrice = entryPrice,
          bos5Ok = bos5Ok, bos15Ok = bos15Ok)
 
+// @function  FVG吸収系列の環境条件を判定する (Longのみ)。
+//   Main に散っていた合成をここへ集約したもので、条件・順序は従来と同一。
+//   共通フィルタは「結果」を受け取るだけ (再計算も request も増やさない)。
+//     EMA環境  : 4H / 1H / 15M が3つとも上昇 (吸収系列の固定条件)
+//     日足ボラ : 中央値が [volMin, volMax) の範囲内
+//     その他   : Session / News / 通常ボラ / Accum 各種
+// @param allowLong          Long発注が許可されているか (Logic ON/OFF × enableLong)
+// @param sessionOk          時間帯フィルタ
+// @param newsOk             指標時間フィルタ
+// @param env4H              4H 環境判定 ( 1=上昇 / 0=レンジ / -1=下降)
+// @param env1H              1H 環境判定
+// @param env15M             15M 環境判定
+// @param drMedianRange      日足Range中央値
+// @param volMin             日足ボラ 下限 (以上)
+// @param volMax             日足ボラ 上限 (未満)
+// @param volOk              通常ボラフィルタの結果
+// @param blockedByAccum     Accumulation NoTrade
+// @param blockedByExitWait  Accum離脱待機
+// @param accumLongDirOk     Accum離脱方向 (Long)
+// @returns  bool
+export fvgAbsEnvLong(bool allowLong, bool sessionOk, bool newsOk,
+     int env4H, int env1H, int env15M,
+     float drMedianRange, float volMin, float volMax,
+     bool volOk, bool blockedByAccum, bool blockedByExitWait, bool accumLongDirOk) =>
+    bool _dailyVolOk = not na(drMedianRange) and drMedianRange >= volMin and drMedianRange < volMax
+    allowLong and
+     nz(env4H, 0) == 1 and nz(env1H, 0) == 1 and nz(env15M, 0) == 1 and
+     _dailyVolOk and sessionOk and newsOk and
+     volOk and not blockedByAccum and not blockedByExitWait and
+     accumLongDirOk
+
 // @function  吸収イベントを「消費済み」にする。
 //   Main が「実際に発注できた (Entry IDが空でない)」ときだけ呼ぶこと。
 //   Signalが出ただけ / Zone TradePlan FAIL では呼んではいけない。
@@ -1696,72 +1784,118 @@ export consumeFvgAbs(FvgAbsEngine e, int which) =>
 //  ★ 状態は FVG系列と共有しない。FVG側でEntryしてもZoneタッチイベントは消えない。
 // ============================================================================
 
+// @function  ZONEBOS 上位足方向 (Long)。4H / 1H / 15M のうち1つ以上が上昇ならOK。
+//   AND ではなく OR。判定式は作らず、Main が取得済みの環境判定コードを使う。
+// @param f  ZoneBosFeed
+// @returns  bool
+export zoneBosTrendLong(ZoneBosFeed f) =>
+    nz(f.env4H, 0) == 1 or nz(f.env1H, 0) == 1 or nz(f.env15M, 0) == 1
+
+// @function  ZONEBOS 上位足方向 (Short)。4H / 1H / 15M のうち1つ以上が下降ならOK。
+// @param f  ZoneBosFeed
+// @returns  bool
+export zoneBosTrendShort(ZoneBosFeed f) =>
+    nz(f.env4H, 0) == -1 or nz(f.env1H, 0) == -1 or nz(f.env15M, 0) == -1
+
+// @function  ZONEBOS 日足ボラ判定 (Long / Short 共通)。
+//   分類・境界条件は既存 Daily Regime のボラ判定と完全に同一で、
+//   参照する閾値と要求区分だけ ZONEBOS専用のもの:
+//     中央値 >= 高ボラ下限 → 高ボラ ( 1)
+//     中央値 <  低ボラ上限 → 低ボラ (-1)
+//     それ以外             → 中ボラ ( 0)
+//   データ不足 (na) の扱いは c.insufficientAsRange に従う。
+//   日足「方向」ゲートは ZONEBOS では使わない。
+// @param c  ZoneBosCfg
+// @param f  ZoneBosFeed
+// @returns  bool
+export zoneBosDailyVolOk(ZoneBosCfg c, ZoneBosFeed f) =>
+    int _code = na
+    if not na(f.drMedianRange)
+        _code := f.drMedianRange >= c.dailyHighVol ? 1 : f.drMedianRange < c.dailyLowVol ? -1 : 0
+    bool _insufficient = na(_code)
+    int _codeAdj = _insufficient ? (c.insufficientAsRange ? 0 : na) : _code
+    string _text = dailyVolatilityText(_codeAdj)
+    bool _match = c.reqDailyVol == "OFF" or _text == c.reqDailyVol
+    bool _block = c.reqDailyVol != "OFF" and _insufficient and not c.insufficientAsRange
+    _match and not _block
+
+// @function  ZONEBOS 環境条件 (Long)。
+//   共通で再利用するもの : Session / News / 通常ボラ / Accum NoTrade /
+//                          Accum離脱待機 / Accum離脱方向
+//   ZONEBOS専用          : 上位足方向 OR条件 / 日足ボラ
+// @param c  ZoneBosCfg
+// @param f  ZoneBosFeed
+// @returns  bool
+export zoneBosEnvLong(ZoneBosCfg c, ZoneBosFeed f) =>
+    f.sessionOk and f.newsOk and
+     zoneBosTrendLong(f) and f.volOk and zoneBosDailyVolOk(c, f) and
+     not f.blockedByAccum and not f.blockedByExitWait and
+     f.accumLongDirOk
+
+// @function  ZONEBOS 環境条件 (Short)。
+// @param c  ZoneBosCfg
+// @param f  ZoneBosFeed
+// @returns  bool
+export zoneBosEnvShort(ZoneBosCfg c, ZoneBosFeed f) =>
+    f.sessionOk and f.newsOk and
+     zoneBosTrendShort(f) and f.volOk and zoneBosDailyVolOk(c, f) and
+     not f.blockedByAccum and not f.blockedByExitWait and
+     f.accumShortDirOk
+
 // @function  Zone Touch → BOS Logic を1バー分評価する。
-// @param e             ZoneBosEngine (Mainで var 宣言した永続状態)
-// @param allowLong     Long発注が許可されているか。Main が
-//                      「enableLong × 共通Environment (Long側)」を畳み込んで渡す。
-//                      → BOS成立時点でEnvironmentがNGならEntryしない。
-// @param allowShort    同上 (Short側)
-// @param touchSupport  このバーで対象Strength以上の Support Zone にタッチしたか。
-//                      Main が「共通Environment (Long側) OK」も畳み込んで渡すので、
-//                      Environment NG中のタッチでは待機を開始しない
-//                      (= 後からOKになっても古いタッチを流用できない)。
-// @param supZoneId     そのZoneの識別子 (ZoneEngineの trackId)
-// @param supZoneTop    そのSupport Zoneの上端 (離脱距離の基準)
-// @param touchResist   このバーで対象Strength以上の Resistance Zone にタッチしたか
-//                      (Short側Environmentを畳み込み済み)
-// @param resZoneId     そのZoneの識別子
-// @param resZoneBottom そのResistance Zoneの下端 (離脱距離の基準)
-// @param bullBos       BOS対象TFの Bullish BOS
-// @param bearBos       BOS対象TFの Bearish BOS
-// @param bosBarCount   BOS対象TFのバーカウンタ (対象TFの足が1本進むごとに +1)。
-//                      チャート足より下位のTFを指定した場合も、Mainが下位足の
-//                      確定本数で数えるので waitBars は常に「対象TFの本数」。
-// @param waitBars      BOS待機本数 (BOS対象TFのバー数)。起点は常にZoneタッチ時点で、
-//                      離脱成立では期限をリセットしない。
-// @param minMoveAway   Zoneからの最低離脱距離 ($)。0 なら条件OFF。
-// @param groupOpen     Zone BOS系列でポジション保有中か
-// @param entryPrice    Entry価格 (BOS確認後なので close)
+//   環境判定 (zoneBosEnvLong / zoneBosEnvShort) もこの中で行う。
+//   Environmentは「Zoneタッチ時」と「BOS成立時」の両方で要求する:
+//     ・タッチ登録に畳み込む → NG中はBOS待機を開始しない
+//       (後からOKになっても、NG中に発生したタッチを流用してEntryできない)
+//     ・Signal生成に畳み込む → BOS成立時にNGならEntryしない
+// @param e           ZoneBosEngine (Mainで var 宣言した永続状態)
+// @param c           ZoneBosCfg
+// @param f           ZoneBosFeed
+// @param entryPrice  Entry価格 (BOS確認後なので close)
 // @returns  ZoneBosSignal
-export updateZoneBos(ZoneBosEngine e, bool allowLong, bool allowShort,
-     bool touchSupport, int supZoneId, float supZoneTop,
-     bool touchResist, int resZoneId, float resZoneBottom,
-     bool bullBos, bool bearBos, int bosBarCount, int waitBars, bool groupOpen,
-     float minMoveAway, float entryPrice) =>
-    // ---- (0) 保有中は待機イベントを持たない --------------------------------
+export updateZoneBos(ZoneBosEngine e, ZoneBosCfg c, ZoneBosFeed f, float entryPrice) =>
+    // ---- (0) 環境判定 ------------------------------------------------------
+    bool envLong  = zoneBosEnvLong(c, f)
+    bool envShort = zoneBosEnvShort(c, f)
+    bool allowLong    = c.enableLong  and envLong
+    bool allowShort   = c.enableShort and envShort
+    bool touchSupport = f.touchSupport and envLong
+    bool touchResist  = f.touchResist  and envShort
+
+    // ---- (1) 保有中は待機イベントを持たない --------------------------------
     //   これにより「決済後に古いZoneタッチ/BOS待機stateを持ち越して即再Entry」
     //   が構造的に起きない。決済後は新しいZoneタッチから待機をやり直す。
     //   ※「一度Zoneから完全に離脱しないと再アーム不可」という条件は付けない。
-    if groupOpen
+    if f.groupOpen
         e.longWaiting    := false
         e.shortWaiting   := false
         e.longMovedAway  := false
         e.shortMovedAway := false
 
-    // ---- (1) Zoneタッチ → BOS待機開始 --------------------------------------
+    // ---- (2) Zoneタッチ → BOS待機開始 --------------------------------------
     //   ★ 既にその方向が待機中なら、Zone内に価格が居続けても TouchBar を更新しない。
     //     更新してしまうと待機期限が毎バー延長され、いつまでも失効しなくなる。
     //     期限は必ず「最初のZoneタッチ」を起点に数える。
     //     BOS成立 / 期限切れ / ポジション保有によるクリアで待機が解除された後は、
     //     次の新しいタッチから再び待機を開始できる (同じZoneでも可)。
-    if touchSupport and not groupOpen and not e.longWaiting
+    if touchSupport and not f.groupOpen and not e.longWaiting
         e.longWaiting    := true
-        e.longTouchBar   := bosBarCount
+        e.longTouchBar   := f.bosBarCount
         e.longTouchTime  := time
-        e.longZoneId     := supZoneId
-        e.longZoneTop    := supZoneTop
+        e.longZoneId     := f.supZoneId
+        e.longZoneTop    := f.supZoneTop
         e.longMovedAway  := false
-    if touchResist and not groupOpen and not e.shortWaiting
+    if touchResist and not f.groupOpen and not e.shortWaiting
         e.shortWaiting    := true
-        e.shortTouchBar   := bosBarCount
+        e.shortTouchBar   := f.bosBarCount
         e.shortTouchTime  := time
-        e.shortZoneId     := resZoneId
-        e.shortZoneBottom := resZoneBottom
+        e.shortZoneId     := f.resZoneId
+        e.shortZoneBottom := f.resZoneBottom
         e.shortMovedAway  := false
 
-    // ---- (1b) Zoneからの最低離脱距離 --------------------------------------
+    // ---- (3) Zoneからの最低離脱距離 ----------------------------------------
     //   基準は「タッチした価格」ではなく「タッチしたZoneの境界」:
-    //     Long  : close >= longZoneTop    + minMoveAway
+    //     Long  : close >= longZoneTop     + minMoveAway
     //     Short : close <= shortZoneBottom - minMoveAway
     //   ★ 必ず close で判定する。high / low が離れただけでは成立させない
     //     (ヒゲだけ伸びてZoneへ戻されたケースを除外するため)。
@@ -1769,31 +1903,32 @@ export updateZoneBos(ZoneBosEngine e, bool allowLong, bool allowShort,
     //   一度成立したらそのタッチイベントの間はラッチする。
     //   新しいタッチで待機を張り直すときに false へ戻る (上のブロック)。
     if e.longWaiting
-        if minMoveAway <= 0
+        if c.minMoveAway <= 0
             e.longMovedAway := true
-        else if not na(e.longZoneTop) and close >= e.longZoneTop + minMoveAway
+        else if not na(e.longZoneTop) and close >= e.longZoneTop + c.minMoveAway
             e.longMovedAway := true
     if e.shortWaiting
-        if minMoveAway <= 0
+        if c.minMoveAway <= 0
             e.shortMovedAway := true
-        else if not na(e.shortZoneBottom) and close <= e.shortZoneBottom - minMoveAway
+        else if not na(e.shortZoneBottom) and close <= e.shortZoneBottom - c.minMoveAway
             e.shortMovedAway := true
 
-    // ---- (2) 待機期限切れ --------------------------------------------------
+    // ---- (4) 待機期限切れ --------------------------------------------------
     //   タッチした対象TF足を 0本目として、waitBars 本後までを有効とする
     //   (同一足 = 経過0本 も有効)。期限を過ぎたイベントからは二度とEntryしない。
-    if e.longWaiting and (na(e.longTouchBar) or bosBarCount - e.longTouchBar > waitBars)
+    //   起点は常にZoneタッチ時点で、離脱成立では期限をリセットしない。
+    if e.longWaiting and (na(e.longTouchBar) or f.bosBarCount - e.longTouchBar > c.waitBars)
         e.longWaiting := false
-    if e.shortWaiting and (na(e.shortTouchBar) or bosBarCount - e.shortTouchBar > waitBars)
+    if e.shortWaiting and (na(e.shortTouchBar) or f.bosBarCount - e.shortTouchBar > c.waitBars)
         e.shortWaiting := false
 
-    // ---- (3) Signal --------------------------------------------------------
+    // ---- (5) Signal --------------------------------------------------------
     //   タッチと同じ足でBOSが成立した場合も有効 (経過0本なので上の期限判定を通る)。
     //   ★ BOSは「離脱成立後」だけ有効。BOSの成立自体を保存していないので、
     //     離脱前に出たBOSを後から流用することは構造的に起こらない。
     //     同一足で Touch + 離脱 + BOS が揃った場合は上の順序で評価されるため有効。
-    bool l = allowLong  and not groupOpen and barstate.isconfirmed and e.longWaiting  and e.longMovedAway  and bullBos
-    bool s = allowShort and not groupOpen and barstate.isconfirmed and e.shortWaiting and e.shortMovedAway and bearBos
+    bool l = allowLong  and not f.groupOpen and barstate.isconfirmed and e.longWaiting  and e.longMovedAway  and f.bullBos
+    bool s = allowShort and not f.groupOpen and barstate.isconfirmed and e.shortWaiting and e.shortMovedAway and f.bearBos
     //   同一足でLong/Short両方成立したらローソク色で優先方向を決める (既存Logicと同じ扱い)
     if l and s
         if close >= open
