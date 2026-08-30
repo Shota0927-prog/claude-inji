@@ -1510,39 +1510,107 @@ f_virtPositionSize() =>
                 s += t.qty * t.dir
     s
 
-// ---- 5.3 仮想ブローカー (このバーの約定処理) ------------------------------
+// ---- 5.3 シグナル表示設定 (Indicator専用) --------------------------------
+//  ★ 表示は「発注バー」ではなく「Strategyなら実際に約定したバー」で出すため、
+//    仮想ブローカーの中から呼べるようここで定義する。
+var string G_SIG = "09 · Signal 表示"
+showSignalLabel = input.bool(true,  "シグナルラベルを表示",   group = G_SIG)
+showSignalShape = input.bool(true,  "シグナル三角を表示",     group = G_SIG)
+sigLabelSize    = input.string("小", "ラベルサイズ", options = ["小", "普通", "大"], group = G_SIG)
+sigOffsetAtrLen = input.int(14, "ラベル間隔 ATR期間", minval = 1, group = G_SIG)
+sigOffsetMult   = input.float(0.8, "ラベル間隔 (ATR倍率)", step = 0.1, group = G_SIG)
+
+float sigAtr = ta.atr(sigOffsetAtrLen)
+
+f_sigSize(string s) =>
+    s == "大" ? size.normal : s == "普通" ? size.small : size.tiny
+
+//  このバーで何個目の約定かを数えてラベルのY位置をずらす (判定はずらさない)。
+var array<int>  gSigSlot  = array.new_int(1, 0)
+//  plotshape 用のフラグ [0]=Long約定あり / [1]=Short約定あり
+var array<bool> gFillFlag = array.new_bool(2, false)
+
+// @function  仮想Tradeが約定した (= Strategyなら実際にEntryした) ことを表示する。
+//   Entry価格は シグナル足の close ではなく 仮想実約定価格 t.entry を使う。
+f_emitFill(VTrade t) =>
+    int slot = array.get(gSigSlot, 0)
+    array.set(gSigSlot, 0, slot + 1)
+    array.set(gFillFlag, t.dir > 0 ? 0 : 1, true)
+    string txt = t.logicId + (t.dir > 0 ? " LONG" : " SHORT")
+    if showSignalLabel
+        float off = nz(sigAtr, 0.0) * sigOffsetMult * (slot + 1)
+        label.new(bar_index, t.dir > 0 ? low - off : high + off, text = txt,
+             style = t.dir > 0 ? label.style_label_up : label.style_label_down,
+             color = t.dir > 0 ? color.new(color.teal, 15) : color.new(color.maroon, 15),
+             textcolor = color.white, size = f_sigSize(sigLabelSize))
+    alert(txt + " | " + t.eid +
+         " | Entry " + f_num(t.entry, "#.##") +
+         " | SL " + f_num(t.sl, "#.##") +
+         " | TP " + f_num(t.tp, "#.##") +
+         " | " + syminfo.ticker + " " + timeframe.period, alert.freq_all)
+    true
+
+// ---- 5.4 仮想ブローカー (このバーの約定処理) ------------------------------
 //  Strategy では、スクリプトがバーN終値で走る前にブローカーが
 //    ・前バーで出した成行注文を open[N] で約定
 //    ・バーN の値動きで SL / TP を判定
 //  を済ませている。Section 06 / 07 が参照する保有状態はその結果。
 //  → Indicator でも Section 06 の前にこの処理を行う。
 //  SL は「前バー終了時点の値」で判定する (BE更新は Section 08 = バー終値後)。
+//
+//  ★ SL / TP が同一バーで両方に到達した場合の順序 ★
+//    TradingView Broker Emulator が想定するバー内の価格経路に合わせる。
+//      陽線 (close >= open) : open → low  → high → close
+//      陰線 (close <  open) : open → high → low  → close
+//    経路上で先に触れた方が約定する。したがって:
+//      Long  (SL下 / TP上) : 陽線 → SL先 / 陰線 → TP先
+//      Short (SL上 / TP下) : 陽線 → TP先 / 陰線 → SL先
+//    ★ ギャップ: バーの始値の時点ですでに水準を超えていた注文は、その始値で
+//      約定する (Stopは不利側、Limitは有利側に滑る)。経路判定より優先する。
 f_virtBroker() =>
+    array.set(gSigSlot, 0, 0)
+    array.set(gFillFlag, 0, false)
+    array.set(gFillFlag, 1, false)
     if array.size(gTrades) > 0
         for i = 0 to array.size(gTrades) - 1
             VTrade t = array.get(gTrades, i)
-            // (a) 前バーの発注をこのバーの始値で約定
+            // (a) 前バーの発注をこのバーの始値で約定 → ここで初めて表示する
             if t.pending
                 t.pending  := false
                 t.active   := true
                 t.entry    := open
                 t.entryBar := bar_index
+                f_emitFill(t)
             // (b) 約定済みTradeの SL / TP 判定 (約定したバー自身も対象)
             if t.active
-                bool hitSL = t.dir > 0 ? low <= t.sl : high >= t.sl
-                bool hitTP = t.dir > 0 ? high >= t.tp : low <= t.tp
+                bool hitSL = t.dir > 0 ? low  <= t.sl : high >= t.sl
+                bool hitTP = t.dir > 0 ? high >= t.tp : low  <= t.tp
                 if hitSL or hitTP
-                    // ★ 同一バーで両方に到達した場合は SL 優先。
-                    //   TradingView Broker Emulator も、バー内の値動き順が
-                    //   分からない場合は不利側 (SL) を先に約定させる。
-                    float xp = hitSL ? t.sl : t.tp
+                    // 始値の時点でどちらかを超えていたか (ギャップ)
+                    bool gapSL = t.dir > 0 ? open <= t.sl : open >= t.sl
+                    bool gapTP = t.dir > 0 ? open >= t.tp : open <= t.tp
+                    bool upBar = close >= open
+                    bool slFirst = false
+                    if gapSL and not gapTP
+                        slFirst := true
+                    else if gapTP and not gapSL
+                        slFirst := false
+                    else if gapSL and gapTP
+                        // 通常のSL/TP設定では起きない。念のため不利側を採用。
+                        slFirst := true
+                    else if hitSL and hitTP
+                        // 経路上どちらに先に触れるか
+                        slFirst := t.dir > 0 ? upBar : not upBar
+                    else
+                        slFirst := hitSL
+                    float xp = slFirst ? (gapSL ? open : t.sl) : (gapTP ? open : t.tp)
                     array.set(gVirtRealized, 0,
                          array.get(gVirtRealized, 0) + (xp - t.entry) * t.qty * t.dir * syminfo.pointvalue)
                     t.active  := false
                     t.exitBar := bar_index
     true
 
-// ---- 5.4 Plan Debug (表示のみ・判定には影響しない) ------------------------
+// ---- 5.5 Plan Debug (表示のみ・判定には影響しない) ------------------------
 f_planText(string logicId, zn.TradePlan p) =>
     logicId + " " + (p.dir > 0 ? "LONG" : p.dir < 0 ? "SHORT" : "-") +
      " | E " + f_num(p.entry, "#.##") +
@@ -1556,7 +1624,7 @@ f_recordPlan(string logicId, zn.TradePlan p, string extra) =>
     array.set(gLastPlan, 1, p.status + " · " + p.reason + (extra == "" ? "" : " · " + extra))
     true
 
-// ---- 5.5 仮想Entry (Strategy の f_executeTrade と同じ判定) ----------------
+// ---- 5.6 仮想Entry (Strategy の f_executeTrade と同じ判定) ----------------
 //  ★ 判定順序・条件は Strategy と完全に同一 ★
 //     p.valid → Qty → Logic上限 → 反対方向 → Qty下限 → Entry
 //  違うのは strategy.entry / strategy.exit を呼ばず仮想Tradeを積む点だけ。
@@ -1594,7 +1662,7 @@ f_executeTrade(string logicId, int dir, float entryPrice, zn.TradePlan p) =>
                 done := true
     done ? eid : ""
 
-// ---- 5.6 Signal → Entry (Strategy の f_submitSignal と完全に同じ) ---------
+// ---- 5.7 Signal → Entry (Strategy の f_submitSignal と完全に同じ) ---------
 f_submitSignal(string logicId, bool signal, int dir, float entryPrice) =>
     string eid = ""
     bool dirOk = (dir > 0 and enableLong) or (dir < 0 and enableShort)
@@ -1890,65 +1958,22 @@ if useBreakEven and array.size(gTrades) > 0
                 t.sl   := ep
 
 // ============================================================================
-// 09. SIGNAL DISPLAY / ALERT
+// 09. SIGNAL DISPLAY  (Shape / Debug)
 // ----------------------------------------------------------------------------
-//  ★ 表示するのは「Strategy なら実際に strategy.entry が成功した場所」だけ。
-//    SignalEngine の生シグナル (fvgSig.longSignal 等) では表示しない。
-//    Section 07 の f_submitSignal が Entry ID を返した = 仮想Entry成功。
-//  3Group は独立しているので、同じバーで最大3つ同時に表示される。
-//  重ならないよう表示位置だけ縦にずらす (判定タイミングはずらさない)。
+//  ★ ラベルと Alert は Section 05 の仮想ブローカーが「約定したバー」で出す。
+//    Strategy の成行は次バー始値で約定するため、発注バーではなく約定バーが
+//    Strategy の実Entry位置と一致する。Entry価格も仮想実約定価格 t.entry。
+//  ★ ここでは plotshape 用にフラグを読むだけ。判定は一切しない。
+//    Logic の consume と 優先順位 (FVG15→FVG / ABS15→ABS5) は従来どおり
+//    Section 07 の「発注成功時」に行われる (ロジック挙動は変更なし)。
+//  3Group は独立しているので、同じバーで最大3つ約定して3つ表示される。
 // ============================================================================
-var string G_SIG = "09 · Signal 表示"
-showSignalLabel = input.bool(true,  "シグナルラベルを表示",   group = G_SIG)
-showSignalShape = input.bool(true,  "シグナル三角を表示",     group = G_SIG)
-sigLabelSize    = input.string("小", "ラベルサイズ", options = ["小", "普通", "大"], group = G_SIG)
-sigOffsetAtrLen = input.int(14, "ラベル間隔 ATR期間", minval = 1, group = G_SIG)
-sigOffsetMult   = input.float(0.8, "ラベル間隔 (ATR倍率)", step = 0.1, group = G_SIG)
+bool anyLongFilled  = array.get(gFillFlag, 0)
+bool anyShortFilled = array.get(gFillFlag, 1)
 
-float sigAtr = ta.atr(sigOffsetAtrLen)
-
-f_sigSize(string s) =>
-    s == "大" ? size.normal : s == "普通" ? size.small : size.tiny
-
-//  このバーで何個目のシグナルかを数えて、ラベルのY位置をずらす。
-var array<int> gSigSlot = array.new_int(1, 0)
-if barstate.isnew
-    array.set(gSigSlot, 0, 0)
-
-f_emitSignal(string eid, string logicId, int dir) =>
-    if eid != ""
-        int slot = array.get(gSigSlot, 0)
-        array.set(gSigSlot, 0, slot + 1)
-        string txt = logicId + (dir > 0 ? " LONG" : " SHORT")
-        if showSignalLabel
-            float off = nz(sigAtr, 0.0) * sigOffsetMult * (slot + 1)
-            label.new(bar_index, dir > 0 ? low - off : high + off, text = txt,
-                 style = dir > 0 ? label.style_label_up : label.style_label_down,
-                 color = dir > 0 ? color.new(color.teal, 15) : color.new(color.maroon, 15),
-                 textcolor = color.white, size = f_sigSize(sigLabelSize))
-        alert(txt + " | " + eid +
-             " | Entry " + f_num(close, "#.##") +
-             " | " + syminfo.ticker + " " + timeframe.period, alert.freq_all)
-    eid != ""
-
-//  ---- 9.1 仮想Entry成功のみをシグナル化 ----------------------------------
-//   Section 07 が返した Entry ID をそのまま使う。
-//   FVG15 → FVG、ABS15 → ABS5 の優先順位も Section 07 の結果に含まれている。
-bool sigFvg15L = f_emitSignal(fvg15EidLong,  LOGIC_FVG15,     1)
-bool sigFvg15S = f_emitSignal(fvg15EidShort, LOGIC_FVG15,    -1)
-bool sigFvgL   = f_emitSignal(fvgEidLong,    LOGIC_FVG,       1)
-bool sigFvgS   = f_emitSignal(fvgEidShort,   LOGIC_FVG,      -1)
-bool sigAbs15  = f_emitSignal(abs15Eid,      LOGIC_FVG_ABS15, 1)
-bool sigAbs5   = f_emitSignal(abs5Eid,       LOGIC_FVG_ABS5,  1)
-bool sigZbL    = f_emitSignal(zbEidLong,     LOGIC_ZONE_BOS,  1)
-bool sigZbS    = f_emitSignal(zbEidShort,    LOGIC_ZONE_BOS, -1)
-
-bool anyLongSignal  = sigFvg15L or sigFvgL or sigAbs15 or sigAbs5 or sigZbL
-bool anyShortSignal = sigFvg15S or sigFvgS or sigZbS
-
-plotshape(showSignalShape and anyLongSignal,  title = "LONG Signal",  style = shape.triangleup,
+plotshape(showSignalShape and anyLongFilled,  title = "LONG Entry",  style = shape.triangleup,
      location = location.belowbar, color = color.new(color.teal, 0),   size = size.tiny)
-plotshape(showSignalShape and anyShortSignal, title = "SHORT Signal", style = shape.triangledown,
+plotshape(showSignalShape and anyShortFilled, title = "SHORT Entry", style = shape.triangledown,
      location = location.abovebar, color = color.new(color.maroon, 0), size = size.tiny)
 
 //  ---- 9.2 Plan Debug (Strategyと突き合わせる用・判定には影響しない) -------
