@@ -2075,6 +2075,518 @@ export consumeZoneBos(ZoneBosEngine e, int dir) =>
     true
 
 // ============================================================================
+// 08B. ZONE 4-Logic · Rebound / FakeBreak / Break Retest / Break
+// ----------------------------------------------------------------------------
+//  ZoneEngine が作った既存Zoneを「イベント」として追跡し、4つの独立Logicへ
+//  振り分ける。Zone生成 / Score / Strength / SL / TP のルールは一切変更しない。
+//
+//  ★ Zoneの検索・Strengthフィルタ・Support/Resistance判定は Main が
+//    ZoneEngine を使って行い、結果 (Zone配列のスナップショット) だけを渡す。
+//    SignalEngine から ZoneEngine を import して密結合させない構造を維持する。
+//
+//  ---- イベントの向き (side) ------------------------------------------------
+//    side = +1 : Support Zone に「上から」接近した          (close[1] > zone.top)
+//    side = -1 : Resistance Zone に「下から」接近した       (close[1] < zone.bottom)
+//    どちらでもない (Zone内から始まった等) はイベントを作らない。
+//    → 「下からSupportを貫通して上昇」は Rebound Long にならない。
+//    → 「上からResistanceを貫通して下降」は Rebound Short にならない。
+//    イベントは開始時の zoneId / top / bottom / side を凍結して保持するので、
+//    その後 Zone State が Support → Broken → Resistance と変化しても、
+//    参照対象が別Zoneへ入れ替わることはない。
+//
+//  ---- Break の定義 ---------------------------------------------------------
+//    ヒゲではなく終値で、Zone境界 + Buffer を明確に抜けた場合のみ成立。
+//      side = +1 (Support) : close < bottom - breakBuffer  → Downside Break
+//      side = -1 (Resist)  : close > top    + breakBuffer  → Upside Break
+//    ヒゲだけの一時的な抜けでは Rebound候補を失効させない。
+//
+//  ---- 状態遷移 -------------------------------------------------------------
+//    phase 0 : 接近 → Rebound候補 (Break候補も兼ねる)
+//        ・BOS成立 → Rebound Signal
+//        ・Break確定 → Break Signal + phase 1 (Rebound候補は即キャンセル)
+//        ・waitBars 経過 → 破棄
+//    phase 1 : Break後
+//        ・fakeMaxBars 以内に元Zoneを完全Reclaim + BOS → FakeBreak Signal
+//        ・再武装距離以上 離れた → phase 2 (古いFakeBreak候補は破棄)
+//        ・max(fakeMaxBars, waitBars) 経過 → 破棄
+//    phase 2 : Retest再武装済み
+//        ・Zoneへ戻る → 戻り確認
+//        ・戻った後の BOS → Break Retest Signal
+//        ・waitBars 経過 → 破棄
+//    ★ Break直後のZone再接触では Retest を出さない (必ず phase 2 を経由する)。
+//
+//  ---- 1イベント1エントリー --------------------------------------------------
+//    Signalを返しただけでは消費しない。Main が「実際に発注できた」ときだけ
+//    consumeZoneEvt() を呼び、そのイベントの該当Logicを消費済みにする。
+//      Rebound / Retest 成立 → そのイベントは終了 (alive = false)
+//      FakeBreak 成立        → 同じBreakイベントの未成立Retest候補もキャンセル
+//      Break 成立            → イベントは生かしたまま (Fake / Retest を続けて管理)
+// ============================================================================
+
+// ---- 8B-1 Types ------------------------------------------------------------
+
+// @type  1ロジック・1方向ぶんの上位足環境許可設定。
+//   各時間足につき 上昇 / レンジ / 下降 を個別ON/OFF。
+//   同一時間足内は OR。3状態とも OFF のその時間足は判定対象外。
+//   時間足同士の結合は useAnd で AND / OR を切り替える。
+//   4H / 1H / 15M が全て無効なら「環境フィルターなし = true」。
+export type ZoneTfEnvCfg
+    bool up4H   = false
+    bool rg4H   = false
+    bool dn4H   = false
+    bool up1H   = false
+    bool rg1H   = false
+    bool dn1H   = false
+    bool up15M  = false
+    bool rg15M  = false
+    bool dn15M  = false
+    bool useAnd = false
+
+// @type  4ロジック × Long/Short = 8個の環境設定をまとめて渡すための入れ物。
+export type ZoneEnvSet
+    ZoneTfEnvCfg rbLong
+    ZoneTfEnvCfg rbShort
+    ZoneTfEnvCfg fkLong
+    ZoneTfEnvCfg fkShort
+    ZoneTfEnvCfg rtLong
+    ZoneTfEnvCfg rtShort
+    ZoneTfEnvCfg bkLong
+    ZoneTfEnvCfg bkShort
+
+// @type  Zone 4Logic 共通設定。
+export type ZoneCommonCfg
+    bool   enableLong  = true
+    bool   enableShort = true
+    bool   useRebound  = true
+    bool   useFake     = false
+    bool   useRetest   = false
+    bool   useBreak    = false
+    string reqDailyVol = "OFF"
+    float  dailyLowVol  = 0.0
+    float  dailyHighVol = 80.0
+    bool   insufficientAsRange = true
+    float  breakBuffer     = 3.0
+    int    fakeMaxBars     = 10
+    float  retestMinDist   = 10.0
+    float  retestWidthMult = 0.5
+    int    waitBars        = 30
+    float  minMoveAway     = 0.0
+
+// @type  共通フィルタの「結果」だけを受け取る (再計算も request も増やさない)。
+export type ZoneEnvFeed
+    bool  sessionOk = false
+    bool  newsOk    = false
+    bool  volOk     = false
+    bool  blockedByAccum    = false
+    bool  blockedByExitWait = false
+    bool  accumLongDirOk  = true
+    bool  accumShortDirOk = true
+    int   env4H  = 0
+    int   env1H  = 0
+    int   env15M = 0
+    float drMedianRange = na
+
+// @type  追跡中のZoneイベント1件。開始時のZone情報を凍結して保持する。
+export type ZoneEvt
+    int   zoneId    = na
+    float top       = na
+    float bottom    = na
+    int   side      = 0
+    int   startBar  = na
+    int   phase     = 0
+    int   breakBar  = na
+    int   rearmBar  = na
+    int   returnBar = na
+    bool  movedAway   = false
+    bool  reclaimed   = false
+    bool  returned    = false
+    bool  fakeAlive   = false
+    bool  reboundDone = false
+    bool  breakDone   = false
+    bool  fakeDone    = false
+    bool  retestDone  = false
+    bool  envLongAtStart  = false
+    bool  envShortAtStart = false
+    bool  alive       = true
+
+// @type  Zone 4Logic の永続状態。Main Strategyで var 宣言すること。
+//   sigXxx は「このバーのSignalを出したイベントの index」。
+//   consumeZoneEvt() がこの index を使って該当イベントだけを消費する。
+export type ZoneEvtEngine
+    array<ZoneEvt> evts
+    int sigRebound = -1
+    int sigFake    = -1
+    int sigRetest  = -1
+    int sigBreak   = -1
+
+// @type  Zone 4Logic の出力。Logicごと・方向ごとに完全独立。
+export type ZoneLogicSignal
+    bool  reboundLong  = false
+    bool  reboundShort = false
+    bool  fakeLong     = false
+    bool  fakeShort    = false
+    bool  retestLong   = false
+    bool  retestShort  = false
+    bool  breakLong    = false
+    bool  breakShort   = false
+    float entryPrice   = na
+    // 仮アラート用 Preview (確定足条件だけを外したもの)
+    bool  pvReboundLong  = false
+    bool  pvReboundShort = false
+    bool  pvFakeLong     = false
+    bool  pvFakeShort    = false
+    bool  pvRetestLong   = false
+    bool  pvRetestShort  = false
+    bool  pvBreakLong    = false
+    bool  pvBreakShort   = false
+    // Debug 表示用
+    int   evtCount   = 0
+    int   candTouch  = 0
+    int   candFake   = 0
+    int   candRetest = 0
+
+// ---- 8B-2 Factories --------------------------------------------------------
+
+// @function  ZoneTfEnvCfg を作る (全OFF = その方向は環境フィルターなし)。
+// @returns   ZoneTfEnvCfg
+export newZoneTfEnvCfg() =>
+    ZoneTfEnvCfg.new()
+
+// @function  4ロジック × Long/Short の環境設定入れ物を作る。
+// @returns   ZoneEnvSet
+export newZoneEnvSet() =>
+    ZoneEnvSet.new(
+         rbLong = ZoneTfEnvCfg.new(), rbShort = ZoneTfEnvCfg.new(),
+         fkLong = ZoneTfEnvCfg.new(), fkShort = ZoneTfEnvCfg.new(),
+         rtLong = ZoneTfEnvCfg.new(), rtShort = ZoneTfEnvCfg.new(),
+         bkLong = ZoneTfEnvCfg.new(), bkShort = ZoneTfEnvCfg.new())
+
+// @function  Zone 4Logic 共通設定の既定値を作る。Main側でフィールドを上書きする。
+// @returns   ZoneCommonCfg
+export newZoneCommonCfg() =>
+    ZoneCommonCfg.new()
+
+// @function  Zone 4Logic の永続状態を作る。Main Strategyで var 宣言すること。
+// @returns   ZoneEvtEngine
+export newZoneEvtEngine() =>
+    ZoneEvtEngine.new(evts = array.new<ZoneEvt>())
+
+// ---- 8B-3 環境判定 ---------------------------------------------------------
+
+// @function  1ロジック・1方向ぶんの上位足環境条件を判定する。
+//   同一時間足内は OR (上昇ON + レンジON なら どちらでも通る)。
+//   3状態とも OFF の時間足は判定対象外。
+//   時間足同士は useAnd = true で AND / false で OR。
+//   4H / 1H / 15M が全て無効なら true (環境フィルターなし)。
+// @param c      ZoneTfEnvCfg
+// @param env4H  4H 環境判定 ( 1=上昇 / 0=レンジ / -1=下降)
+// @param env1H  1H 環境判定
+// @param env15M 15M 環境判定
+// @returns  bool
+export zoneTfEnvOk(ZoneTfEnvCfg c, int env4H, int env1H, int env15M) =>
+    bool en4  = c.up4H  or c.rg4H  or c.dn4H
+    bool en1  = c.up1H  or c.rg1H  or c.dn1H
+    bool en15 = c.up15M or c.rg15M or c.dn15M
+    int  v4  = nz(env4H,  0)
+    int  v1  = nz(env1H,  0)
+    int  v15 = nz(env15M, 0)
+    bool ok4  = (c.up4H  and v4  ==  1) or (c.rg4H  and v4  == 0) or (c.dn4H  and v4  == -1)
+    bool ok1  = (c.up1H  and v1  ==  1) or (c.rg1H  and v1  == 0) or (c.dn1H  and v1  == -1)
+    bool ok15 = (c.up15M and v15 ==  1) or (c.rg15M and v15 == 0) or (c.dn15M and v15 == -1)
+    bool r = true
+    if en4 or en1 or en15
+        if c.useAnd
+            r := (not en4 or ok4) and (not en1 or ok1) and (not en15 or ok15)
+        else
+            r := (en4 and ok4) or (en1 and ok1) or (en15 and ok15)
+    r
+
+// @function  Zone 4Logic 共通の日足ボラ判定。
+//   分類・境界条件は既存 Daily Regime のボラ判定と完全に同一で、
+//   参照する閾値と要求区分だけ Zone系専用のもの。
+// @param c  ZoneCommonCfg
+// @param f  ZoneEnvFeed
+// @returns  bool
+export zoneDailyVolOk(ZoneCommonCfg c, ZoneEnvFeed f) =>
+    int _code = na
+    if not na(f.drMedianRange)
+        _code := f.drMedianRange >= c.dailyHighVol ? 1 : f.drMedianRange < c.dailyLowVol ? -1 : 0
+    bool _insufficient = na(_code)
+    int _codeAdj = _insufficient ? (c.insufficientAsRange ? 0 : na) : _code
+    string _text = dailyVolatilityText(_codeAdj)
+    bool _match = c.reqDailyVol == "OFF" or _text == c.reqDailyVol
+    bool _block = c.reqDailyVol != "OFF" and _insufficient and not c.insufficientAsRange
+    _match and not _block
+
+// @function  Zone 4Logic 共通の基礎環境 (方向に依存しない部分)。
+//   Session / News / 通常ボラ / 日足ボラ / Accum NoTrade / Accum離脱待機。
+// @param c  ZoneCommonCfg
+// @param f  ZoneEnvFeed
+// @returns  bool
+export zoneBaseEnvOk(ZoneCommonCfg c, ZoneEnvFeed f) =>
+    f.sessionOk and f.newsOk and f.volOk and zoneDailyVolOk(c, f) and
+     not f.blockedByAccum and not f.blockedByExitWait
+
+// @function  Zone 1ロジックぶんの Long 環境条件。
+// @param c  ZoneCommonCfg
+// @param f  ZoneEnvFeed
+// @param t  そのロジックのLong側 ZoneTfEnvCfg
+// @returns  bool
+export zoneEnvLong(ZoneCommonCfg c, ZoneEnvFeed f, ZoneTfEnvCfg t) =>
+    zoneBaseEnvOk(c, f) and f.accumLongDirOk and zoneTfEnvOk(t, f.env4H, f.env1H, f.env15M)
+
+// @function  Zone 1ロジックぶんの Short 環境条件。
+// @param c  ZoneCommonCfg
+// @param f  ZoneEnvFeed
+// @param t  そのロジックのShort側 ZoneTfEnvCfg
+// @returns  bool
+export zoneEnvShort(ZoneCommonCfg c, ZoneEnvFeed f, ZoneTfEnvCfg t) =>
+    zoneBaseEnvOk(c, f) and f.accumShortDirOk and zoneTfEnvOk(t, f.env4H, f.env1H, f.env15M)
+
+// ---- 8B-4 メイン更新 -------------------------------------------------------
+
+// @function  Zone 4Logic (Rebound / FakeBreak / Break Retest / Break) を
+//   1バー分評価する。Zoneイベントの状態遷移もこの中で完結する。
+//   ★ 実Entryは全て barstate.isconfirmed 付き。Preview は同じ式から
+//     barstate.isconfirmed だけを外したもの (仮アラート専用・副作用なし)。
+// @param e            ZoneEvtEngine (Mainで var 宣言した永続状態)
+// @param c            ZoneCommonCfg
+// @param f            ZoneEnvFeed
+// @param v            ZoneEnvSet (4ロジック × Long/Short の環境設定)
+// @param zId          このバーのZoneスナップショット : trackId
+// @param zSide        同 : 1 = Support / -1 = Resistance
+// @param zTop         同 : Zone上端
+// @param zBot         同 : Zone下端
+// @param bullBos      判定時間足の Bullish BOS
+// @param bearBos      判定時間足の Bearish BOS
+// @param barCount     判定時間足のバーカウンタ (待機本数の基準)
+// @param entryPrice   Entry価格 (close)
+// @param openRebound  ZONEREBOUND を既に保有中か
+// @param openFake     ZONEFAKE   を既に保有中か
+// @param openRetest   ZONERETEST を既に保有中か
+// @param openBreak    ZONEBREAK  を既に保有中か
+// @returns  ZoneLogicSignal
+export updateZoneEvents(ZoneEvtEngine e, ZoneCommonCfg c, ZoneEnvFeed f, ZoneEnvSet v,
+     array<int> zId, array<int> zSide, array<float> zTop, array<float> zBot,
+     bool bullBos, bool bearBos, int barCount, float entryPrice,
+     bool openRebound, bool openFake, bool openRetest, bool openBreak) =>
+    // ---- (0) 環境判定 (ロジック別・方向別に完全独立) ------------------------
+    bool envRbL = zoneEnvLong(c, f, v.rbLong)
+    bool envRbS = zoneEnvShort(c, f, v.rbShort)
+    bool envFkL = zoneEnvLong(c, f, v.fkLong)
+    bool envFkS = zoneEnvShort(c, f, v.fkShort)
+    bool envRtL = zoneEnvLong(c, f, v.rtLong)
+    bool envRtS = zoneEnvShort(c, f, v.rtShort)
+    bool envBkL = zoneEnvLong(c, f, v.bkLong)
+    bool envBkS = zoneEnvShort(c, f, v.bkShort)
+
+    bool aRbL = c.useRebound and c.enableLong  and envRbL and not openRebound
+    bool aRbS = c.useRebound and c.enableShort and envRbS and not openRebound
+    bool aFkL = c.useFake    and c.enableLong  and envFkL and not openFake
+    bool aFkS = c.useFake    and c.enableShort and envFkS and not openFake
+    bool aRtL = c.useRetest  and c.enableLong  and envRtL and not openRetest
+    bool aRtS = c.useRetest  and c.enableShort and envRtS and not openRetest
+    bool aBkL = c.useBreak   and c.enableLong  and envBkL and not openBreak
+    bool aBkS = c.useBreak   and c.enableShort and envBkS and not openBreak
+
+    // ---- (1) 前バーで死んだイベントを掃除する ------------------------------
+    //   ★ 掃除は「次の呼び出しの先頭」で行う。update の末尾で消すと sigXxx の
+    //     index がズレて、Main の consumeZoneEvt() が別イベントを消費してしまう。
+    if array.size(e.evts) > 0
+        for i = array.size(e.evts) - 1 to 0
+            ZoneEvt d = array.get(e.evts, i)
+            if not d.alive
+                array.remove(e.evts, i)
+    //   追跡上限 (古いものから捨てる)。Zone数は有限なので通常は到達しない。
+    while array.size(e.evts) > 60
+        array.remove(e.evts, 0)
+
+    // ---- (2) 新規イベント登録 (接近方向つき) -------------------------------
+    //   「どちら側からZoneへ入ってきたか」を必ず記録する。
+    //     close[1] > zone.top    → 上から接近 → Support のみ有効 (side = +1)
+    //     close[1] < zone.bottom → 下から接近 → Resistance のみ有効 (side = -1)
+    //   同一Zone・同一sideのイベントが生きている間は二重登録しない。
+    if array.size(zId) > 0
+        for i = 0 to array.size(zId) - 1
+            int   zi = array.get(zId,   i)
+            int   zs = array.get(zSide, i)
+            float zt = array.get(zTop,  i)
+            float zb = array.get(zBot,  i)
+            bool  hit = low <= zt and high >= zb
+            int   sd = 0
+            if close[1] > zt
+                sd := 1
+            else if close[1] < zb
+                sd := -1
+            if hit and sd != 0 and sd == zs
+                bool exists = false
+                if array.size(e.evts) > 0
+                    for j = 0 to array.size(e.evts) - 1
+                        ZoneEvt q0 = array.get(e.evts, j)
+                        if q0.alive and q0.zoneId == zi and q0.side == sd
+                            exists := true
+                if not exists
+                    array.push(e.evts, ZoneEvt.new(zoneId = zi, top = zt, bottom = zb,
+                         side = sd, startBar = barCount, phase = 0,
+                         envLongAtStart = envRbL, envShortAtStart = envRbS))
+
+    // ---- (3) 状態遷移 + Signal 収集 ----------------------------------------
+    bool rbL = false
+    bool rbS = false
+    bool fkL = false
+    bool fkS = false
+    bool rtL = false
+    bool rtS = false
+    bool bkL = false
+    bool bkS = false
+    int  iRb = -1
+    int  iFk = -1
+    int  iRt = -1
+    int  iBk = -1
+    int  nTouch  = 0
+    int  nFake   = 0
+    int  nRetest = 0
+
+    if array.size(e.evts) > 0
+        for i = 0 to array.size(e.evts) - 1
+            ZoneEvt q = array.get(e.evts, i)
+            if q.alive
+                float w  = q.top - q.bottom
+                float rd = math.max(c.retestMinDist, w * c.retestWidthMult)
+                if q.phase == 0
+                    nTouch += 1
+                    // Break確定 (終値 + Buffer。ヒゲだけでは成立しない)
+                    bool brk = q.side > 0 ? close < q.bottom - c.breakBuffer : close > q.top + c.breakBuffer
+                    if brk
+                        // 未確定Rebound候補はここでキャンセル (phase遷移)
+                        q.phase     := 1
+                        q.breakBar  := barCount
+                        q.fakeAlive := true
+                        q.reclaimed := false
+                        q.returned  := false
+                        if not q.breakDone and iBk < 0
+                            // Support下抜け → Short / Resistance上抜け → Long
+                            if q.side > 0 and aBkS
+                                bkS := true
+                                iBk := i
+                            else if q.side < 0 and aBkL
+                                bkL := true
+                                iBk := i
+                    else
+                        // Rebound用 最低離脱距離 (終値のみ / 0 = OFF)
+                        if c.minMoveAway <= 0
+                            q.movedAway := true
+                        else if q.side > 0 and close >= q.top + c.minMoveAway
+                            q.movedAway := true
+                        else if q.side < 0 and close <= q.bottom - c.minMoveAway
+                            q.movedAway := true
+                        if barCount - q.startBar > c.waitBars
+                            q.alive := false
+                        if q.alive and not q.reboundDone and q.movedAway and iRb < 0
+                            if q.side > 0 and bullBos and q.envLongAtStart and aRbL
+                                rbL := true
+                                iRb := i
+                            else if q.side < 0 and bearBos and q.envShortAtStart and aRbS
+                                rbS := true
+                                iRb := i
+                else if q.phase == 1
+                    int el = barCount - q.breakBar
+                    if el > c.fakeMaxBars
+                        q.fakeAlive := false
+                    // FakeBreak : 元Zoneを完全にReclaim (Zone内へ戻っただけでは不成立)
+                    if q.fakeAlive
+                        nFake += 1
+                        if q.side > 0 and close > q.top
+                            q.reclaimed := true
+                        if q.side < 0 and close < q.bottom
+                            q.reclaimed := true
+                        if not q.fakeDone and q.reclaimed and iFk < 0
+                            if q.side > 0 and bullBos and aFkL
+                                fkL := true
+                                iFk := i
+                            else if q.side < 0 and bearBos and aFkS
+                                fkS := true
+                                iFk := i
+                    // Break Retest : まずZoneから十分離れて再武装する
+                    bool far = q.side > 0 ? close <= q.bottom - rd : close >= q.top + rd
+                    if far
+                        q.phase     := 2
+                        q.rearmBar  := barCount
+                        q.fakeAlive := false
+                        q.reclaimed := false
+                        q.returned  := false
+                    else if el > math.max(c.fakeMaxBars, c.waitBars)
+                        q.alive := false
+                else
+                    nRetest += 1
+                    // 再武装後にZoneへ戻ってきた (Break直後の再接触はここへ来ない)
+                    if not q.returned and low <= q.top and high >= q.bottom
+                        q.returned  := true
+                        q.returnBar := barCount
+                    if not q.returned and barCount - q.rearmBar > c.waitBars
+                        q.alive := false
+                    if q.returned and barCount - q.returnBar > c.waitBars
+                        q.alive := false
+                    if q.alive and q.returned and not q.retestDone and iRt < 0
+                        // Support下抜け後の戻り → Resistanceとして反発 → Short
+                        // Resistance上抜け後の戻り → Supportとして反発 → Long
+                        if q.side > 0 and bearBos and aRtS
+                            rtS := true
+                            iRt := i
+                        else if q.side < 0 and bullBos and aRtL
+                            rtL := true
+                            iRt := i
+
+    e.sigRebound := iRb
+    e.sigFake    := iFk
+    e.sigRetest  := iRt
+    e.sigBreak   := iBk
+
+    // ---- (4) 出力 ----------------------------------------------------------
+    //   実Entryは確定足のみ。Preview は同じ式から確定足条件だけを外したもの。
+    bool cf = barstate.isconfirmed
+    ZoneLogicSignal.new(
+         reboundLong  = rbL and cf, reboundShort = rbS and cf,
+         fakeLong     = fkL and cf, fakeShort    = fkS and cf,
+         retestLong   = rtL and cf, retestShort  = rtS and cf,
+         breakLong    = bkL and cf, breakShort   = bkS and cf,
+         entryPrice   = entryPrice,
+         pvReboundLong = rbL, pvReboundShort = rbS,
+         pvFakeLong    = fkL, pvFakeShort    = fkS,
+         pvRetestLong  = rtL, pvRetestShort  = rtS,
+         pvBreakLong   = bkL, pvBreakShort   = bkS,
+         evtCount = array.size(e.evts),
+         candTouch = nTouch, candFake = nFake, candRetest = nRetest)
+
+// @function  Zoneイベントを「消費済み」にする。
+//   Main が「実際に発注できた (Entry IDが空でない)」ときだけ呼ぶこと。
+//   Signalが出ただけ / TradePlan FAIL では呼んではいけない。
+//     kind 0 = Rebound   : そのイベントは終了
+//     kind 1 = FakeBreak : そのイベントは終了 (未成立Retest候補も同時にキャンセル)
+//     kind 2 = Retest    : そのイベントは終了
+//     kind 3 = Break     : イベントは生かしたまま (Fake / Retest を続けて管理)
+// @param e     ZoneEvtEngine
+// @param kind  0 = Rebound / 1 = FakeBreak / 2 = Break Retest / 3 = Break
+// @returns     常に true
+export consumeZoneEvt(ZoneEvtEngine e, int kind) =>
+    int idx = kind == 0 ? e.sigRebound : kind == 1 ? e.sigFake : kind == 2 ? e.sigRetest : e.sigBreak
+    if not na(idx) and idx >= 0 and idx < array.size(e.evts)
+        ZoneEvt q = array.get(e.evts, idx)
+        if kind == 0
+            q.reboundDone := true
+            q.alive       := false
+        else if kind == 1
+            q.fakeDone   := true
+            q.retestDone := true
+            q.alive      := false
+        else if kind == 2
+            q.retestDone := true
+            q.alive      := false
+        else
+            q.breakDone := true
+    true
+
+// ============================================================================
 // 09. FUTURE LOGICS
 // ----------------------------------------------------------------------------
 //  新しいEntry Logicはここへ同じ形で追加する。Logicごとに
