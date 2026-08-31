@@ -864,7 +864,8 @@ allowOppositeEntry = input.bool(false, "反対方向Logicの同時Entryを許可
 var string G_ALERT = "05 · Alerts"
 useProvisionalAlert = input.bool(true, "仮アラートを出す (形成中バー・Shortのみ)", group = G_ALERT,
      tooltip = "確定アラートの条件から「確定足であること」だけを外した判定。\n" +
-     "同じシグナル機会につき最大1回 (確定するか、条件が消滅するまで再送しない)。\n" +
+     "同一Logicにつき、そのバーで最大1回。形成中に条件が一度消えて再成立しても再送しない。\n" +
+     "再アームは確定シグナル成立時、または次のバーへ移行したときだけ。\n" +
      "TradePlan FAIL / Qty不足 / Group制御で弾かれる状態では出さない。\n" +
      "ラベルは出さず alert() のみ。")
 useConfirmedAlert   = input.bool(true,  "確定アラートを出す (実Entry成立時・Shortのみ)", group = G_ALERT,
@@ -2558,7 +2559,7 @@ if showFvgBosDebug and useEFVGEnv
 //    ・Engine state (armed / consumed / eventId / phase / roleCycle) を書き換えない
 //    ・f_submitSignal() を追加実行しない (実発注につながるため)
 //    ・zn.buildPlan() は読み取り専用なので、表示用に呼んでも副作用が無い
-//    ・アラート管理用の state (gPvSent) は Entry Logic の state と完全に別物
+//    ・アラート管理用の state (gPvBar) は Entry Logic の state と完全に別物
 //
 //  ① 確定シグナル (アラート + ラベル)
 //     Section 07 が返した Short の Entry ID が空でない = 実際に strategy.entry
@@ -2581,9 +2582,10 @@ if showFvgBosDebug and useEFVGEnv
 //     Minimum RR / TP Mode / Qty / Position制御) は確定と完全に同じものを通す。
 //
 //  ③ 仮 → 確定の管理 (Logicごとに独立)
-//     Preview成立 → 仮alert 1回 → 同じ機会では追加なし
+//     Preview成立 → 仮alert 1回 → 同じバーでは追加なし
 //       → 確定成立 → 確定alert + label → 仮通知状態をリセット
-//       → 条件が消滅 (Preview が false に戻る) → 次の新規機会に備えて再アーム
+//     ★ 再アームは「確定シグナル成立時」または「次のバーへ移行したとき」だけ。
+//       形成中に Preview条件が一度 false へ戻って再成立しても、同じバーでは再送しない。
 //     ★ フラグは varip で持つ。通常の var はリアルタイム足の各tick再計算で
 //       足の開始時点へ巻き戻るため、途中tickで立てた「送信済み」が毎tick戻り、
 //       同じ機会で何度も仮アラートが飛んでしまう。
@@ -2631,7 +2633,14 @@ f_logicName(string logicId) =>
 // ---- 10.3 仮アラート 管理フラグ (Logicごとに独立) --------------------------
 //  slot : FVG=0 / FVG15=1 / FVGABS5=2 / FVGABS15=3 /
 //         ZONEREBOUND=4 / ZONEFAKE=5 / ZONERETEST=6 / ZONEBREAK=7
-varip array<bool> gPvSent = array.new_bool(8, false)
+//  ★ 「送信済みか」ではなく「どのバーで送信したか」を持つ。
+//    同一チャートバー内では、Preview条件が一度 false へ戻ってから再成立しても
+//    再アームしない = そのバーでは最大1回。
+//    再アームされるのは次の2つだけ:
+//      ・確定シグナルが成立した (f_shortConfirmed が -1 へ戻す)
+//      ・次のバーへ移行した (bar_index が変わる = 完全に新しいシグナル機会)
+//    -1 = 未送信。
+varip array<int> gPvBar = array.new_int(8, -1)
 
 f_pvSlot(string logicId) =>
     logicId == LOGIC_FVG        ? 0 :
@@ -2680,25 +2689,26 @@ f_shortConfirmed(string eid, string logicId, float entryPrice) =>
         // 確定したらこのLogicの仮通知状態をリセット (次の機会に備える)
         int s = f_pvSlot(logicId)
         if s >= 0
-            array.set(gPvSent, s, false)
+            array.set(gPvBar, s, -1)
     true
 
 // ---- 10.5 仮Short : アラートのみ (ラベルなし) ------------------------------
-//  raw   : Preview Short (確定足条件だけを外したSignal) が成立しているか
-//  would : その上で Group制御 / 優先順位 / TradePlan / Qty / Position制御 を
-//          通過して「今確定すればEntryできる」状態か
-f_shortProvisional(string logicId, bool raw, bool would) =>
+//  would : Preview Short (確定足条件だけを外したSignal) が成立し、その上で
+//          Group制御 / 優先順位 / TradePlan / Qty / Position制御 を通過して
+//          「今確定すればEntryできる」状態か。
+//          ※ would は f_provWouldEnter() が raw を含めて判定した結果なので、
+//            ここで raw を別に受け取る必要はない。
+//  ★ 同一Logicにつき、そのバーで最大1回。
+//    Preview条件が形成中に一度消えて再成立しても、同じバーでは再送しない。
+//    再アームは「確定シグナル成立時」または「次のバーへ移行したとき」だけ。
+f_shortProvisional(string logicId, bool would) =>
     int s = f_pvSlot(logicId)
-    if s >= 0
-        if not raw
-            // 機会が消滅した → 次の新規機会に備えて再アーム
-            array.set(gPvSent, s, false)
-        else if would and not array.get(gPvSent, s)
-            array.set(gPvSent, s, true)
-            alert("【仮 SHORT】" +
-                 "\nLogic: " + f_logicName(logicId) +
-                 "\n" + syminfo.ticker +
-                 "\nE: " + f_num(close, "#.##"), alert.freq_all)
+    if s >= 0 and would and array.get(gPvBar, s) != bar_index
+        array.set(gPvBar, s, bar_index)
+        alert("【仮 SHORT】" +
+             "\nLogic: " + f_logicName(logicId) +
+             "\n" + syminfo.ticker +
+             "\nE: " + f_num(close, "#.##"), alert.freq_all)
     true
 
 // ---- 10.6 Preview Short (確定足条件だけを外したSignal) ---------------------
@@ -2796,11 +2806,11 @@ f_shortConfirmed(zfkEidShort,   LOGIC_ZONE_FK,   zlSig.entryPrice)
 f_shortConfirmed(zrtEidShort,   LOGIC_ZONE_RT,   zlSig.entryPrice)
 f_shortConfirmed(zbkEidShort,   LOGIC_ZONE_BK,   zlSig.entryPrice)
 
-f_shortProvisional(LOGIC_FVG15,     provFvg15ShortRaw, provWFvg15S)
-f_shortProvisional(LOGIC_FVG,       provFvgShortRaw,   provWFvgS)
-f_shortProvisional(LOGIC_FVG_ABS15, provAbs15ShortRaw, provWAbs15S)
-f_shortProvisional(LOGIC_FVG_ABS5,  provAbs5ShortRaw,  provWAbs5S)
-f_shortProvisional(LOGIC_ZONE_RB,   provZrbShortRaw,   provWZrbS)
-f_shortProvisional(LOGIC_ZONE_FK,   provZfkShortRaw,   provWZfkS)
-f_shortProvisional(LOGIC_ZONE_RT,   provZrtShortRaw,   provWZrtS)
-f_shortProvisional(LOGIC_ZONE_BK,   provZbkShortRaw,   provWZbkS)
+f_shortProvisional(LOGIC_FVG15,     provWFvg15S)
+f_shortProvisional(LOGIC_FVG,       provWFvgS)
+f_shortProvisional(LOGIC_FVG_ABS15, provWAbs15S)
+f_shortProvisional(LOGIC_FVG_ABS5,  provWAbs5S)
+f_shortProvisional(LOGIC_ZONE_RB,   provWZrbS)
+f_shortProvisional(LOGIC_ZONE_FK,   provWZfkS)
+f_shortProvisional(LOGIC_ZONE_RT,   provWZrtS)
+f_shortProvisional(LOGIC_ZONE_BK,   provWZbkS)
