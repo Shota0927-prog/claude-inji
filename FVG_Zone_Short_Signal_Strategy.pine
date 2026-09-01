@@ -876,8 +876,8 @@ allowOppositeEntry = input.bool(false, "反対方向Logicの同時Entryを許可
 var string G_ALERT = "05 · Alerts"
 useProvisionalAlert = input.bool(true, "仮アラートを出す (形成中バー・Shortのみ)", group = G_ALERT,
      tooltip = "確定アラートの条件から「確定足であること」だけを外した判定。\n" +
-     "同一Logicにつき、そのバーで最大1回。形成中に条件が一度消えて再成立しても再送しない。\n" +
-     "再アームは確定シグナル成立時、または次のバーへ移行したときだけ。\n" +
+     "同一Logicにつき、確定シグナル成立まで最大1回。条件が一度消えて再成立しても再送しない。\n" +
+     "再アームは確定シグナル成立時のみ。バーが変わっても再送しない。\n" +
      "TradePlan FAIL / Qty不足 / Group制御で弾かれる状態では出さない。\n" +
      "ラベルは出さず alert() のみ。")
 useConfirmedAlert   = input.bool(true,  "確定アラートを出す (実Entry成立時・Shortのみ)", group = G_ALERT,
@@ -2582,7 +2582,7 @@ if showFvgBosDebug and useEFVGEnv
 //    ・Engine state (armed / consumed / eventId / phase / roleCycle) を書き換えない
 //    ・f_submitSignal() を追加実行しない (実発注につながるため)
 //    ・zn.buildPlan() は読み取り専用なので、表示用に呼んでも副作用が無い
-//    ・アラート管理用の state (gPvBar) は Entry Logic の state と完全に別物
+//    ・アラート管理用の state (gPvSent) は Entry Logic の state と完全に別物
 //
 //  ① 確定シグナル (アラート + ラベル)
 //     Section 07 が返した Short の Entry ID が空でない = 実際に strategy.entry
@@ -2605,10 +2605,10 @@ if showFvgBosDebug and useEFVGEnv
 //     Minimum RR / TP Mode / Qty / Position制御) は確定と完全に同じものを通す。
 //
 //  ③ 仮 → 確定の管理 (Logicごとに独立)
-//     Preview成立 → 仮alert 1回 → 同じバーでは追加なし
+//     Preview成立 → 仮alert 1回 → 何バー経過しても追加の仮なし
 //       → 確定成立 → 確定alert + label → 仮通知状態をリセット
-//     ★ 再アームは「確定シグナル成立時」または「次のバーへ移行したとき」だけ。
-//       形成中に Preview条件が一度 false へ戻って再成立しても、同じバーでは再送しない。
+//     ★ 再アームは「確定シグナル成立時」だけ。バーが変わっても再アームしない。
+//       Preview条件が一度 false へ戻って再成立しても、確定が出るまで再送しない。
 //     ★ フラグは varip で持つ。通常の var はリアルタイム足の各tick再計算で
 //       足の開始時点へ巻き戻るため、途中tickで立てた「送信済み」が毎tick戻り、
 //       同じ機会で何度も仮アラートが飛んでしまう。
@@ -2656,14 +2656,14 @@ f_logicName(string logicId) =>
 // ---- 10.3 仮アラート 管理フラグ (Logicごとに独立) --------------------------
 //  slot : FVG=0 / FVG15=1 / FVGABS5=2 / FVGABS15=3 /
 //         ZONEREBOUND=4 / ZONEFAKE=5 / ZONERETEST=6 / ZONEBREAK=7
-//  ★ 「送信済みか」ではなく「どのバーで送信したか」を持つ。
-//    同一チャートバー内では、Preview条件が一度 false へ戻ってから再成立しても
-//    再アームしない = そのバーでは最大1回。
-//    再アームされるのは次の2つだけ:
-//      ・確定シグナルが成立した (f_shortConfirmed が -1 へ戻す)
-//      ・次のバーへ移行した (bar_index が変わる = 完全に新しいシグナル機会)
-//    -1 = 未送信。
-varip array<int> gPvBar = array.new_int(8, -1)
+//  ★ Logicごとに「仮アラート送信済みか」の bool だけを持つ。bar_index は使わない。
+//    同一Logicにつき、確定シグナルが成立するまで仮アラートは最大1回。
+//    ・次のバーへ移行しても false へは戻さない。
+//    ・Preview条件が一度 false へ戻ってから再成立しても再送しない。
+//    再アームされるのは1つだけ:
+//      ・確定シグナルが成立した (f_shortConfirmed が false へ戻す)
+//    false = 未送信。
+varip array<bool> gPvSent = array.new_bool(8, false)
 
 f_pvSlot(string logicId) =>
     logicId == LOGIC_FVG        ? 0 :
@@ -2710,9 +2710,10 @@ f_shortConfirmed(string eid, string logicId, float entryPrice) =>
                  textcolor = color.white,
                  size      = size.small)
         // 確定したらこのLogicの仮通知状態をリセット (次の機会に備える)
+        // ★ これが唯一の仮アラート再アーム条件。
         int s = f_pvSlot(logicId)
         if s >= 0
-            array.set(gPvBar, s, -1)
+            array.set(gPvSent, s, false)
     true
 
 // ---- 10.5 仮Short : アラートのみ (ラベルなし) ------------------------------
@@ -2721,13 +2722,13 @@ f_shortConfirmed(string eid, string logicId, float entryPrice) =>
 //          「今確定すればEntryできる」状態か。
 //          ※ would は f_provWouldEnter() が raw を含めて判定した結果なので、
 //            ここで raw を別に受け取る必要はない。
-//  ★ 同一Logicにつき、そのバーで最大1回。
-//    Preview条件が形成中に一度消えて再成立しても、同じバーでは再送しない。
-//    再アームは「確定シグナル成立時」または「次のバーへ移行したとき」だけ。
+//  ★ 同一Logicにつき、確定シグナル成立まで最大1回。
+//    Preview条件が一度消えて再成立しても、バーが変わっても再送しない。
+//    再アームは「確定シグナル成立時」だけ (f_shortConfirmed が false へ戻す)。
 f_shortProvisional(string logicId, bool would) =>
     int s = f_pvSlot(logicId)
-    if s >= 0 and would and array.get(gPvBar, s) != bar_index
-        array.set(gPvBar, s, bar_index)
+    if s >= 0 and would and not array.get(gPvSent, s)
+        array.set(gPvSent, s, true)
         alert("【仮 SHORT】" +
              "\nLogic: " + f_logicName(logicId) +
              "\n" + syminfo.ticker +
@@ -2817,9 +2818,11 @@ bool provWZbkL = f_provWouldEnter(LOGIC_ZONE_BK, 1, provZbkLongRaw, true)
 bool provWZbkS = f_provWouldEnter(LOGIC_ZONE_BK, -1, provZbkShortRaw, not provWZbkL)
 
 // ---- 10.8 発火 (Short のみ) ------------------------------------------------
-//  ★ 確定を先に処理する。同一バーで仮 → 確定と進んだ場合でも、
-//    確定側が仮通知状態をリセットしてから仮側の再アーム判定が走るため、
-//    「確定と同じ機会に対する2回目の仮アラート」は出ない。
+//  ★ 確定を先に処理する。確定側が gPvSent を false へ戻す = 再アームなので、
+//    「次のシグナル機会」の仮アラートは同じスクリプト実行内でも取りこぼさない。
+//    確定と同じ機会に対する2回目の仮アラートは出ない。実発注が成立した時点で
+//    Section 07 が event を consume し (armed解除)、position制御 / maxOpenPerLogic
+//    も効くため、そのLogicの would が同じ機会のまま true へ戻ることはない。
 f_shortConfirmed(fvg15EidShort, LOGIC_FVG15,     fvg15Sig.entryPrice)
 f_shortConfirmed(fvgEidShort,   LOGIC_FVG,       fvgSig.entryPrice)
 f_shortConfirmed(abs15EidShort, LOGIC_FVG_ABS15, absSig.entryPrice)
