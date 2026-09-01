@@ -93,7 +93,7 @@ strategy(
 //  ★ SignalEngine は FVGABS 追加で更新されている。再Publishした実際のバージョン番号に
 //    合わせること (下は「SignalEngine をまだ /2 から再公開していない」前提で /3)。
 import sekine3310/ZoneEngine/3   as zn
-import sekine3310/SignalEngine/11 as sg
+import sekine3310/SignalEngine/12 as sg
 
 // Library内の定数と同じ値 (定数exportはPineのバージョン依存機能のため再宣言する)
 int ST_ACTIVE  = 0
@@ -655,8 +655,18 @@ absVolMax = input.float(100.0, "日足ボラ中央値 上限 ($ · 未満)", gro
 var string GZ_COM = "03 · Zone · 共通設定"
 zoneBosMinStrStr = input.string("Strong", "Zone · 対象 最低Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = GZ_COM,
      tooltip = "このStrength以上のZoneだけをイベント追跡の対象にする (4Logic共通)。")
-zoneBosTf        = input.timeframe("1", "Zone · 判定時間足 (BOS / 本数カウント)", group = GZ_COM,
-     tooltip = "BOSを判定する時間足。待機本数・fakeBreakMaxBars もこの時間足の本数で数える。\n" +
+zoneBosTf        = input.timeframe("1", "Zone · 判定時間足 (価格判定 / BOS / 本数)", group = GZ_COM,
+     tooltip = "Zone 4Logic の基準時間足。価格判定も本数カウントもすべてこの足で行う:\n" +
+     "  ・Break成立 (終値 + Buffer)\n" +
+     "  ・FakeBreak の完全Reclaim\n" +
+     "  ・Retest 再武装距離の到達\n" +
+     "  ・Retest で Zone へ戻った判定 (高値 / 安値)\n" +
+     "  ・Zone への接近方向 (1本前の終値)\n" +
+     "  ・Rebound の離脱距離 (終値)\n" +
+     "  ・BOS\n" +
+     "  ・待機本数 / fakeBreakMaxBars\n" +
+     "例) 1M判定でBreak → fakeBreakMaxBars = 10 は1分足10本。\n" +
+     "    5M判定なら5分足10本 / 15M判定なら15分足10本。チャート足では数えない。\n" +
      "既存FVGの triggerTF 等とは共有しない Zone系専用設定。")
 zoneBosLookback  = input.int(10, "Zone · BOS Lookback", minval = 1, group = GZ_COM,
      tooltip = "BOSの定義は既存と同一 (close > ta.highest(high, n)[1] / close < ta.lowest(low, n)[1])。")
@@ -668,7 +678,7 @@ zoneBosReqDailyVolatility    = input.string("中ボラ", "Zone · 日足ボラ",
 zoneBosDailyLowVolThreshold  = input.float(0.0,  "Zone · 低ボラ上限", group = GZ_COM)
 zoneBosDailyHighVolThreshold = input.float(80.0, "Zone · 高ボラ下限", group = GZ_COM)
 zoneBosWaitBars  = input.int(30, "Zone · 待機本数 (判定時間足)", minval = 0, group = GZ_COM,
-     tooltip = "判定時間足の本数で数える待機期限。次の3箇所で使う:\n" +
+     tooltip = "判定時間足の本数で数える待機期限 (価格判定と同じ足)。次の3箇所で使う:\n" +
      "  ・Rebound : Zone接近から BOS までの有効期限\n" +
      "  ・Retest  : Break後の再武装待ちの期限 / 戻ってから BOS までの期限\n" +
      "既定の 1M × 30本 なら約30分。判定時間足を変えるとその時間足基準になる。")
@@ -681,7 +691,9 @@ zoneBreakBuffer = input.float(3.0, "Break Buffer ($)", minval = 0.0, step = 0.5,
      "ヒゲだけの抜けでは Break にならず、Rebound候補も失効しない。")
 fakeBreakMaxBars = input.int(10, "FakeBreak 有効本数 (判定時間足)", minval = 1, group = GZ_BRK,
      tooltip = "Break成立から、元Zoneを完全Reclaimして BOS が出るまでの猶予本数。\n" +
-     "基準は Zone判定時間足。1M判定なら10分 / 5M判定なら50分 / 15M判定なら150分。\n" +
+     "★ 基準は「Breakが成立した判定時間足」そのもの。Break判定に使うOHLCと\n" +
+     "  同じ足で数えるので、価格判定と本数カウントのTFが混在することはない。\n" +
+     "1M判定でBreakなら1分足10本 / 5M判定なら5分足10本 / 15M判定なら15分足10本。\n" +
      "この本数を超えたら FakeBreak候補は破棄する。")
 retestMinDistance = input.float(10.0, "Retest 再武装 最低距離 ($)", minval = 0.0, step = 0.5, group = GZ_BRK,
      tooltip = "Break後、Retestを待つ前に Zone からこれ以上離れる必要がある (終値基準)。")
@@ -1527,45 +1539,58 @@ if useFvgAbs5Logic
     absBos1m  := _a1b
     absBos1mS := _a1s
 
-// ---- Zone BOS 用 BOS (専用TF / 専用Lookback・計算式は既存と同一) ------------
-//  ★ BOS対象TFがチャート足より下位 (5分足チャートで 1M 等) のときは
-//    request.security_lower_tf を使う。request.security では5分足内部で発生した
-//    下位足BOSを取りこぼすため。FVGABS5 の1M BOS取得と同じ方式。
-//    「その5分足に含まれる確定下位足で1回でも成立していれば true」とする
-//    (同一5分足内の厳密な時系列順序は要求しない仕様)。
-//  ★ チャート足以上のTFは従来どおり request.security + lookahead_off。
-//    未来のデータは入らず、BOS対象TF = チャート足なら直接計算と完全に同じ値。
-//  ★ BOSの計算式 (sg.bosPack) はどちらの経路でも完全に同一。
-bool zbBullBos = false
-bool zbBearBos = false
+// ---- Zone 4Logic 判定時間足データ (OHLC + BOS) -----------------------------
+//  ★ Zone 4Logic は「価格判定」も「本数カウント」も判定時間足で完全に統一する。
+//    そのため BOS だけでなく close / high / low も同じ1回の request で取得し、
+//    Break / 完全Reclaim / 再武装距離 / Zoneへの戻り / 接近方向 / 離脱距離 /
+//    fakeBreakMaxBars / waitBars をすべてこの足の確定値で評価する。
+//    → 「Breakは5M終値なのに期限だけ1Mで10本」のような混在は起きない。
+//  ★ 判定TFがチャート足より下位 (5分足チャートで 1M 等) のときは
+//    request.security_lower_tf を使い、そのチャート足に含まれる確定下位足を
+//    古い順の配列として受け取る。SignalEngine はその1本ずつを1ステップとして
+//    イベントを進めるので、1本の5分足の中で Break → Reclaim → BOS が起きても
+//    1分足単位の順序と本数で正しく処理される
+//    (「5分足の中に1回でもBOSがあれば true」という集約はしない)。
+//  ★ 判定TF = チャート足 のときは、チャートの各足を1ステップとして毎バー1本渡す
+//    (二重処理はしない)。
+//  ★ 判定TFがチャート足より上位のときは request.security + lookahead_off で、
+//    その上位足が新しく確定したバーだけ1本渡す
+//    (同じ上位足を5分足ごとに何度もカウントしない)。
+//  ★ BOSの計算式 (sg.zoneTfPack 内) は従来の sg.bosPack と完全に同一:
+//      Bullish : close > ta.highest(high, zoneBosLookback)[1]
+//      Bearish : close < ta.lowest(low,  zoneBosLookback)[1]
+//    どちらの経路でも request の本数は従来と同じ1本のまま。
 bool zbLowerTf = timeframe.in_seconds(zoneBosTf) < timeframe.in_seconds()
+bool zbSameTf  = timeframe.in_seconds(zoneBosTf) == timeframe.in_seconds()
 //  na配列を array.size() に渡すと RE10052 になるため、必ず空配列で初期化する。
-array<bool> zbBullArr = array.new_bool()
-array<bool> zbBearArr = array.new_bool()
+array<float> zbTfC    = array.new_float()
+array<float> zbTfH    = array.new_float()
+array<float> zbTfL    = array.new_float()
+array<bool>  zbBullArr = array.new_bool()
+array<bool>  zbBearArr = array.new_bool()
 if useZoneAny
     if zbLowerTf
-        [_lb, _ls] = request.security_lower_tf(syminfo.tickerid, zoneBosTf, sg.bosPack(zoneBosLookback))
+        [_zc, _zh, _zl, _lb, _ls] = request.security_lower_tf(syminfo.tickerid, zoneBosTf, sg.zoneTfPack(zoneBosLookback))
+        zbTfC     := _zc
+        zbTfH     := _zh
+        zbTfL     := _zl
         zbBullArr := _lb
         zbBearArr := _ls
-        zbBullBos := f_anyTrue(zbBullArr)
-        zbBearBos := f_anyTrue(zbBearArr)
     else
-        [_zbb, _zbs] = request.security(syminfo.tickerid, zoneBosTf, sg.bosPack(zoneBosLookback), lookahead = barmerge.lookahead_off)
-        zbBullBos := _zbb
-        zbBearBos := _zbs
+        [_zc2, _zh2, _zl2, _zbb, _zbs] = request.security(syminfo.tickerid, zoneBosTf, sg.zoneTfPack(zoneBosLookback), lookahead = barmerge.lookahead_off)
+        //  判定TF = チャート足 → 毎バー1本 (直接計算と完全に同じ値)。
+        //  上位足 → その足が切り替わったバーで、直前に確定した1本だけを渡す。
+        bool _zNewBar = zbSameTf or nz(ta.change(time(zoneBosTf)), 0) != 0
+        if _zNewBar
+            array.push(zbTfC,     _zc2)
+            array.push(zbTfH,     _zh2)
+            array.push(zbTfL,     _zl2)
+            array.push(zbBullArr, _zbb)
+            array.push(zbBearArr, _zbs)
 
-// BOS対象時間足のバーカウンタ。待機期限はチャート足ではなくこの本数で数える。
-//  ・下位足の場合 : この5分足に含まれる確定下位足の本数ぶん進める。
-//    5分足チャートで1Mなら1バーあたり約5本進むので、waitBars = 6 は約6分になる。
-//    (ta.change(time("1")) は5分足では1バーに1回しか変化せず正しく数えられない。)
-//  ・チャート足以上の場合 : 対象TFの足が変わったときに1本進める。
-//    → 5M/6本 = 約30分、15M/6本 = 約90分。
-var int zoneBosBarCount = 0
-if useZoneAny
-    if zbLowerTf
-        zoneBosBarCount += array.size(zbBullArr)
-    else if nz(ta.change(time(zoneBosTf)), 0) != 0
-        zoneBosBarCount += 1
+//  判定時間足の秒数。イベント作成時に基準TFとして焼き込む
+//  (そのイベントが終了するまで基準TFを変えないための識別子)。
+int zoneJudgeTfSec = timeframe.in_seconds(zoneBosTf)
 
 // 日足レジーム
 float drO0 = na
@@ -2076,7 +2101,8 @@ sg.ZoneLogicSignal zlSig = sg.ZoneLogicSignal.new()
 if useZoneAny
     zlSig := sg.updateZoneEvents(zoneEvtEng, zoneCmnCfg, zoneEnvFeed, zoneEnvSet,
          zSnapId, zSnapSide, zSnapTop, zSnapBot,
-         zbBullBos, zbBearBos, zoneBosBarCount, close,
+         zbTfC, zbTfH, zbTfL, zbBullArr, zbBearArr,
+         zoneJudgeTfSec, close,
          zrbOpen, zfkOpen, zrtOpen, zbkOpen)
 
 // ============================================================================
