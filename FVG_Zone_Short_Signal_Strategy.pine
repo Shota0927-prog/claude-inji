@@ -126,6 +126,40 @@ f_num(float v, string fmt) =>
     na(v) ? "-" : str.tostring(v, fmt)
 f_arrow(int dir) =>
     dir > 0 ? "↑" : dir < 0 ? "↓" : "→"
+// Logic ID → 人間が読める名前。
+//  ★ 表示・通知専用。Entry判定・Group制御・Entry ID の生成には一切使わない
+//    (Entry ID は従来どおり内部IDの LOGIC_* をそのまま接頭辞に使う)。
+f_logicName(string logicId) =>
+    logicId == LOGIC_FVG        ? "5分FVG反発" :
+     logicId == LOGIC_FVG15     ? "15分FVG反発 → 5分BOS" :
+     logicId == LOGIC_FVG_ABS5  ? "5分FVG吸収 → 1分BOS" :
+     logicId == LOGIC_FVG_ABS15 ? "15分FVG吸収 → 5分BOS" :
+     logicId == LOGIC_ZONE_RB   ? "Zone Rebound" :
+     logicId == LOGIC_ZONE_FK   ? "Zone FakeBreak" :
+     logicId == LOGIC_ZONE_RT   ? "Zone Break Retest" :
+     logicId == LOGIC_ZONE_BK   ? "Zone Break" : logicId
+// Entry ID の接頭辞から Logic ID を復元する。表示・通知専用。
+//  Entry ID は "<LOGIC_ID>_L_<seq>" / "<LOGIC_ID>_S_<seq>" なので、必ず
+//  完全な接頭辞で判定する ("FVG15_L_" が "FVG_L_" に一致することはない)。
+f_logicIdFromEid(string eid) =>
+    string r = ""
+    if str.startswith(eid, LOGIC_FVG15 + "_L_") or str.startswith(eid, LOGIC_FVG15 + "_S_")
+        r := LOGIC_FVG15
+    else if str.startswith(eid, LOGIC_FVG_ABS15 + "_L_") or str.startswith(eid, LOGIC_FVG_ABS15 + "_S_")
+        r := LOGIC_FVG_ABS15
+    else if str.startswith(eid, LOGIC_FVG_ABS5 + "_L_") or str.startswith(eid, LOGIC_FVG_ABS5 + "_S_")
+        r := LOGIC_FVG_ABS5
+    else if str.startswith(eid, LOGIC_FVG + "_L_") or str.startswith(eid, LOGIC_FVG + "_S_")
+        r := LOGIC_FVG
+    else if str.startswith(eid, LOGIC_ZONE_RB + "_L_") or str.startswith(eid, LOGIC_ZONE_RB + "_S_")
+        r := LOGIC_ZONE_RB
+    else if str.startswith(eid, LOGIC_ZONE_FK + "_L_") or str.startswith(eid, LOGIC_ZONE_FK + "_S_")
+        r := LOGIC_ZONE_FK
+    else if str.startswith(eid, LOGIC_ZONE_RT + "_L_") or str.startswith(eid, LOGIC_ZONE_RT + "_S_")
+        r := LOGIC_ZONE_RT
+    else if str.startswith(eid, LOGIC_ZONE_BK + "_L_") or str.startswith(eid, LOGIC_ZONE_BK + "_S_")
+        r := LOGIC_ZONE_BK
+    r
 // 下位足の確定バー配列に true が1つでもあるか (request.security_lower_tf の集約用)
 f_anyTrue(array<bool> a) =>
     bool r = false
@@ -889,6 +923,18 @@ maxOpenPerLogic    = input.int(1, "Logicごとの最大同時保有トレード�
 allowOppositeEntry = input.bool(false, "反対方向Logicの同時Entryを許可", group = G_TE,
      tooltip = "TradingView Strategyは単一ネットポジションのため、反対方向Entryは既存Tradeを\n" +
                "打ち消してしまう。既定 (false) では反対方向シグナルをSKIPする。")
+//  ---- TP管理方式 (FIXED = 従来どおり固定 / DYNAMIC = 近づける方向のみ可変) ----
+tpManagementMode = input.string("FIXED", "TP管理", options = ["FIXED", "DYNAMIC"], group = G_TE,
+     tooltip = "FIXED   : 現状と完全に同じ。Entry時に決定した TP を最後まで固定する。\n" +
+     "          保有中に新しいStrong Zoneが出ても、Zoneが昇格・降格・消滅してもTPは動かない。\n" +
+     "DYNAMIC : 保有中に現在TPより手前へ新しい有効な Strong以上のTP Zone が出現した\n" +
+     "          場合のみ、TPをそのZoneまで近づける。TPを遠ざける変更は行わない。\n" +
+     "          一度近づけたTPは、そのZoneが消滅・弱化しても元に戻さない (不可逆)。\n" +
+     "★ Entry条件 / Structural SL / Risk / Qty / Break Even / Entry時TP算出は\n" +
+     "  どちらのモードでも一切変わらない。FIXED のバックテスト結果は追加前と完全一致する。")
+useDynamicTpAlert = input.bool(true, "Dynamic TP 変更時にアラートを出す", group = G_TE,
+     tooltip = "TP管理 = DYNAMIC のときだけ有効。実際にTP価格が変わったときに1回だけ通知する。\n" +
+     "同じTPへの更新では通知しない。")
 
 // ---- 1.x Alerts ------------------------------------------------------------
 //  ★ アラート専用。Entry判定には一切使わない。
@@ -1765,7 +1811,14 @@ f_expectedLoss(float qty, float slDist) =>
 // ============================================================================
 
 var array<int> gSeq = array.new_int(1, 0)
+//  gTradeTP : 各 Entry ID の「現在有効なTP」。Entry時は p.tp、Dynamic TP更新後は
+//             更新後の値が入る。Break Even の TP再指定もこの値を使うため、
+//             BE発動後も必ず Dynamic TP 適用後の最新TPが使われる。
 var map<string, float> gTradeTP = map.new<string, float>()
+//  gTradeSL : 各 Entry ID の Entry時 Structural SL。Dynamic TP で strategy.exit を
+//             再発行するときに「BE未発動ならこのSL」を復元するために保持する。
+//             SL自体は一切可変化しない (BE発動時のみ既存仕様どおりEntry価格へ)。
+var map<string, float> gTradeSL = map.new<string, float>()
 var map<string, bool>  gTradeBE = map.new<string, bool>()
 var array<string> gLastPlan = array.new_string(3, "-")
 
@@ -1877,8 +1930,12 @@ f_executeTrade(string logicId, int dir, float entryPrice, zn.TradePlan p) =>
                 // ★ Entry時点の SL / TP をここで固定する。以後Zoneが変化しても更新しない。
                 strategy.exit(eid + "X", from_entry = eid, stop = p.sl, limit = p.tp,
                      comment_profit = "TP", comment_loss = "SL")
+                //  ★ TP / SL の控えは Break Even とは独立に必ず登録する。
+                //    Dynamic TP は BE OFF でも動く必要があるため。
+                //    (Map へ入れるだけで、FIXED では誰も読まない = 発注は不変)
+                gTradeTP.put(eid, p.tp)
+                gTradeSL.put(eid, p.sl)
                 if useBreakEven
-                    gTradeTP.put(eid, p.tp)
                     gTradeBE.put(eid, false)
                 f_recordPlan(logicId, p, eid)
                 if showEntryLabel
@@ -2350,9 +2407,13 @@ if strategy.closedtrades > gLastClosedCount
             gLastSlLoss := strategy.closedtrades.profit(i)
             gLastSlQty  := strategy.closedtrades.size(i)
         // Map掃除 (部分決済で同一Entry IDがまだ建っている場合は残す)
-        if useBreakEven and not f_isOpenEntry(ceid)
+        //  ★ gTradeTP / gTradeSL は Dynamic TP が BE OFF でも使うため、
+        //    掃除を useBreakEven に依存させない。gTradeBE だけ存在確認で削除する。
+        if not f_isOpenEntry(ceid)
             if gTradeTP.contains(ceid)
                 gTradeTP.remove(ceid)
+            if gTradeSL.contains(ceid)
+                gTradeSL.remove(ceid)
             if gTradeBE.contains(ceid)
                 gTradeBE.remove(ceid)
     gLastClosedCount := strategy.closedtrades
@@ -2400,6 +2461,70 @@ if useBreakEven and strategy.opentrades > 0
                 gTradeBE.put(eid, true)
                 strategy.exit(eid + "X", from_entry = eid, stop = ep, limit = gTradeTP.get(eid),
                      comment_loss = "BE", comment_profit = "TP")
+
+// ---- 8.3 Dynamic TP --------------------------------------------------------
+//  ★ TP管理 = "DYNAMIC" のときだけ動く。"FIXED" ではこのブロックへ一切入らない
+//    (strategy.exit も呼ばれないので、発注・約定・バックテスト結果は追加前と一致)。
+//
+//  仕様 : 「保有中に、現在TPより手前に新しい有効な Strong以上のTP Zone が出現した
+//         場合のみ、TPをそのZoneへ近づける」。TPを遠ざける変更は絶対に行わない。
+//    Long  : newTP < 現在TP のときだけ更新 (かつ newTP > Entry価格)
+//    Short : newTP > 現在TP のときだけ更新 (かつ newTP < Entry価格)
+//
+//  ★ TP候補の探索は ZoneEngine の既存 Structural TP 選択関数をそのまま使う。
+//    zn.getLongStructuralTP()  : ST_RESIST のみ / z.bottom > entry /
+//                                strength >= tpMinStrength / score >= tpMinScore
+//                                → TP = z.bottom - tpBuffer  (最も手前のZone)
+//    zn.getShortStructuralTP() : ST_SUPPORT のみ / z.top < entry / 同上
+//                                → TP = z.top + tpBuffer     (最も手前のZone)
+//    → Entry時 Structural TP と 適格条件も価格定義も完全に同一。独自定義はしない。
+//    → どちらも読み取り専用 (ZoneEngine の状態を書き換えない)。
+//  ★ zn.buildPlan() は使わない。Active Zone NoTrade / SL Zone / Max SL Distance /
+//    Minimum RR / Fallback TP といった Entry可否の再判定を保有中に行わないため。
+//  ★ Entry時TPが STRUCTURAL / FALLBACK_RR のどちらでも対象。
+//  ★ 現在TPの元Zoneが消滅・弱化・Breakしても、探索結果が今のTPより遠ければ
+//    更新条件を満たさないので、TPはそのまま維持される (自動的に不可逆)。
+//  ★ 更新は 5分足の確定時 (barstate.isconfirmed) のみ。calc_on_every_tick による
+//    形成途中の一時的なZone変化ではTPを動かさない。
+//  ★ SLは一切可変化しない。BE未発動なら Entry時 Structural SL (gTradeSL)、
+//    BE発動済みなら Entry価格 をそのまま再指定する。
+//    → Dynamic TP 更新で BE済みTradeのSLが元のStructural SLへ戻る事故は起きない。
+//  Debug用 : [Entry ID, 変更前TP, 変更後TP]
+var array<string> gDynTpLast = array.new_string(3, "-")
+if tpManagementMode == "DYNAMIC" and barstate.isconfirmed and strategy.opentrades > 0
+    for i = 0 to strategy.opentrades - 1
+        string deid = strategy.opentrades.entry_id(i)
+        if gTradeTP.contains(deid) and gTradeSL.contains(deid)
+            float dEp     = strategy.opentrades.entry_price(i)
+            bool  dIsLong = strategy.opentrades.size(i) > 0
+            float dCurTp  = gTradeTP.get(deid)
+            float dCand   = na
+            if dIsLong
+                [_dtL, _diL] = zn.getLongStructuralTP(zoneEng, zoneCfg, dEp)
+                dCand := _dtL
+            else
+                [_dtS, _diS] = zn.getShortStructuralTP(zoneEng, zoneCfg, dEp)
+                dCand := _dtS
+            //  近づける方向のみ。かつ Entry価格の利益側にあること。
+            bool dCloser = not na(dCand) and not na(dCurTp) and
+                 (dIsLong ? (dCand < dCurTp and dCand > dEp) : (dCand > dCurTp and dCand < dEp))
+            if dCloser
+                bool  dBeOn  = gTradeBE.contains(deid) and gTradeBE.get(deid)
+                float dStop  = dBeOn ? dEp : gTradeSL.get(deid)
+                gTradeTP.put(deid, dCand)
+                strategy.exit(deid + "X", from_entry = deid, stop = dStop, limit = dCand,
+                     comment_loss = dBeOn ? "BE" : "SL", comment_profit = "TP")
+                array.set(gDynTpLast, 0, deid)
+                array.set(gDynTpLast, 1, f_num(dCurTp, "#.##"))
+                array.set(gDynTpLast, 2, f_num(dCand,  "#.##"))
+                if useDynamicTpAlert
+                    alert("【TP変更 " + (dIsLong ? "LONG" : "SHORT") + "】" +
+                         "\nLogic: " + f_logicName(f_logicIdFromEid(deid)) +
+                         "\n" + syminfo.ticker +
+                         "\nID: " + deid +
+                         "\nOld TP: " + f_num(dCurTp, "#.##") +
+                         "\nNew TP: " + f_num(dCand,  "#.##") +
+                         "\nReason: NEW STRONG ZONE", alert.freq_all)
 
 // ============================================================================
 // 09. DISPLAY / DEBUG
@@ -2541,7 +2666,11 @@ if barstate.islast and showDebugTable
     if showTradeDebug
         color pc = color.new(color.blue, 70)
         f_cell(0, row, "PLAN", color.white, pc)
-        f_cell(1, row, array.get(gLastPlan, 0) + "  |  TP MODE: " + tpMode, color.white, pc)
+        string dynTxt = array.get(gDynTpLast, 0) == "-" ? "" :
+             ("  |  DynamicTP " + array.get(gDynTpLast, 0) +
+              " Old " + array.get(gDynTpLast, 1) + " → New " + array.get(gDynTpLast, 2))
+        f_cell(1, row, array.get(gLastPlan, 0) + "  |  TP MODE: " + tpMode +
+             "  |  TP管理: " + tpManagementMode + dynTxt, color.white, pc)
         for c = 2 to 6
             f_cell(c, row, "", color.white, pc)
         table.merge_cells(dbg, 1, row, 6, row)
@@ -2738,17 +2867,6 @@ f_canEnter(string logicId, int dir, float entryPrice) =>
             bool logicFull = f_openCountForLogic(logicId) >= maxOpenPerLogic
             ok := not logicFull and not oppositeConflict and qty >= qtyMin and qty > 0
     ok
-
-// ---- 10.2 Logic 表示名 -----------------------------------------------------
-f_logicName(string logicId) =>
-    logicId == LOGIC_FVG        ? "5分FVG反発" :
-     logicId == LOGIC_FVG15     ? "15分FVG反発 → 5分BOS" :
-     logicId == LOGIC_FVG_ABS5  ? "5分FVG吸収 → 1分BOS" :
-     logicId == LOGIC_FVG_ABS15 ? "15分FVG吸収 → 5分BOS" :
-     logicId == LOGIC_ZONE_RB   ? "Zone Rebound" :
-     logicId == LOGIC_ZONE_FK   ? "Zone FakeBreak" :
-     logicId == LOGIC_ZONE_RT   ? "Zone Break Retest" :
-     logicId == LOGIC_ZONE_BK   ? "Zone Break" : logicId
 
 // ---- 10.3 仮アラート 管理フラグ (Logicごとに独立) --------------------------
 //  slot : FVG=0 / FVG15=1 / FVGABS5=2 / FVGABS15=3 /
