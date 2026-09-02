@@ -2202,12 +2202,22 @@ export consumeZoneBos(ZoneBosEngine e, int dir) =>
 //        → Aを上へ完全Reclaim → ZoneEngine上で再びSupport (世代 +1)
 //        → 一度離れる → 上から再接近 → Rebound候補#2 (#1とは別イベント)
 //
-//  ---- 基準時間足 -----------------------------------------------------------
-//    Zone 4Logic は「価格判定」と「本数カウント」を 判定時間足 (Zone · 判定時間足)
-//    で完全に統一する。Break / 完全Reclaim / 再武装距離 / Zoneへの戻り / 接近方向 /
-//    fakeBreakMaxBars / waitBars のすべてが同じ足の確定値で評価される。
-//    チャート足の本数では数えない。イベントには作成時の判定TF秒数 (tfSec) を
-//    焼き込み、そのイベントが終了するまで基準TFを変えない。
+//  ---- 基準時間足 (2層構造) -------------------------------------------------
+//    ★ Break だけが「Break判定TF」(既定 5M)、それ以外は全て「精密判定TF」(既定 1M)。
+//      Break判定TF : Zoneを本当に抜けたかの確定だけに使う。必ず確定終値。
+//      精密判定TF : Break後の Rearm / Touch / Rejection / Reclaim / BOS と、
+//                   Rebound の接近 / 接触 / 離脱 / BOS。本数カウントも全てこの足。
+//
+//      Rebound      接近・接触・離脱・BOS         : 精密TF (1M)   Trigger: 1M
+//      Break        Break                          : Break TF (5M) Trigger: 5M Break確定
+//      FakeBreak    Break → Reclaim → BOS         : 5M → 1M       Trigger: 1M
+//      BreakRetest  Break → Rearm → Touch →
+//                   Rejection → BOS               : 5M → 1M       Trigger: 1M
+//
+//    startBar / breakBar / rearmBar / touchBar / reclaimBar / rejectBar と
+//    fakeBreakMaxBars / waitBars は全て精密TFの本数で数える。イベントには作成時の
+//    精密TF秒数 (tfSec) と Break時の Break TF秒数 (brkTfSec) を焼き込み、
+//    そのイベントが終了するまで基準TFを変えない。
 //
 //  ---- 環境条件のタイミング --------------------------------------------------
 //    4Logicとも、環境条件は「シグナル成立の瞬間」だけで判定する。
@@ -2216,25 +2226,39 @@ export consumeZoneBos(ZoneBosEngine e, int dir) =>
 //      逆に開始時OKでも、成立時NGならEntryしない。
 //
 //  ---- Break の定義 ---------------------------------------------------------
-//    ヒゲではなく終値で、Zone境界 + Buffer を明確に抜けた場合のみ成立。
-//      side = +1 (Support) : close < bottom - breakBuffer  → Downside Break
-//      side = -1 (Resist)  : close > top    + breakBuffer  → Upside Break
-//    ヒゲだけの一時的な抜けでは Rebound候補を失効させない。
+//    ★ Break は必ず「Break判定TF (既定 5M) の確定終値」だけで判定する。
+//      side = +1 (Support) : brkClose < bottom - breakBuffer  → Downside Break
+//      side = -1 (Resist)  : brkClose > top    + breakBuffer  → Upside Break
+//    精密TF (1M) のヒゲ抜けでも 1M終値抜けでも Break にはならない。
+//    → Break / FakeBreak / Break Retest は 5M Break が確定するまで絶対に始まらない。
+//
+//    ★ Rebound候補のキャンセルだけは従来どおり精密TF終値の抜けで行う。
+//      Rebound の挙動 (成立条件 / 回数 / 期限) を Break側の変更で動かさないため、
+//      「1M終値でZone + Buffer を抜けたら Rebound候補は失効」という既存判定を
+//      rbCancelled フラグとして そのまま残してある。Rebound の出力は
+//      この改修前と完全に一致する。
 //
 //  ---- 状態遷移 -------------------------------------------------------------
-//    phase 0 : 接近 → Rebound候補 (Break候補も兼ねる)
-//        ・BOS成立 → Rebound Signal
-//        ・Break確定 → Break Signal + phase 1 (Rebound候補は即キャンセル)
+//    phase 0 : 接近 → Rebound候補 / Break待ち
+//        ・[1M] 離脱後の BOS → Rebound Signal (rbCancelled でないときだけ)
+//        ・[1M] Zone + Buffer を終値で抜けた → rbCancelled = true (Reboundのみ失効)
+//        ・[5M] Break確定 → Break Signal + phase 1
+//               zoneId / top / bottom / breakDir / breakTime を凍結
 //        ・waitBars 経過 → 破棄
-//    phase 1 : Break後
-//        ・fakeMaxBars 以内に元Zoneを完全Reclaim + BOS → FakeBreak Signal
-//        ・再武装距離以上 離れた → phase 2 (古いFakeBreak候補は破棄)
+//    phase 1 : 5M Break後 (FakeBreak監視 + Retest再武装待ち)
+//        ・[1M] fakeMaxBars 以内に元Zoneを完全Reclaim → reclaimed / reclaimBar
+//        ・[1M] reclaimBar 以降の新規BOS → FakeBreak Signal
+//        ・[1M] 再武装距離以上 離れた → phase 2 (FakeBreak候補は破棄)
 //        ・max(fakeMaxBars, waitBars) 経過 → 破棄
 //    phase 2 : Retest再武装済み
-//        ・Zoneへ戻る → 戻り確認
-//        ・戻った後の BOS → Break Retest Signal
+//        ・[1M] Zoneへ接触           → touched / touchBar
+//        ・[1M] 接触後、終値がBreak方向側へ戻って確定 → rejected / rejectBar
+//        ・[1M] rejectBar 以降の新規BOS → Break Retest Signal
+//        ・[1M] 逆方向へ完全Reclaim  → イベント失効 (Retest無効)
 //        ・waitBars 経過 → 破棄
 //    ★ Break直後のZone再接触では Retest を出さない (必ず phase 2 を経由する)。
+//    ★ Touch (接触) と Rejection (反発確認) は別ステート。接触しただけでは
+//      Retest候補は完成しない。Rejection より前に出ていた BOS は使わない。
 //
 //  ---- 1イベント1エントリー --------------------------------------------------
 //    Signalを返しただけでは消費しない。Main が「実際に発注できた」ときだけ
@@ -2321,20 +2345,36 @@ export type ZoneEvt
     int   side      = 0
     int   startBar  = na
     int   phase     = 0
+    //  ---- Break時点で凍結する情報 (Retest / FakeBreak が終わるまで不変) ----
+    //    zoneId / top / bottom はイベント作成時から凍結済み。
+    //    breakDir  :  1 = 上抜けBreak (Resistance) / -1 = 下抜けBreak (Support)
+    //    breakTime : Break が確定した Break判定TF足の time (チャート足の time)
     int   breakBar  = na
+    int   breakDir  = 0
+    int   breakTime = na
     int   rearmBar  = na
-    int   returnBar = na
+    int   touchBar  = na
+    int   reclaimBar = na
+    int   rejectBar  = na
+    int   rejectTime = na
     bool  movedAway   = false
     bool  reclaimed   = false
-    bool  returned    = false
+    bool  touched     = false
+    bool  rejected    = false
     bool  fakeAlive   = false
+    //  ★ Rebound候補が精密TFのBreakでキャンセルされたか。
+    //    Rebound の挙動を改修前と完全一致させるためだけに存在する。
+    //    Break / FakeBreak / Retest の phase 遷移には使わない。
+    bool  rbCancelled = false
     bool  reboundDone = false
     bool  breakDone   = false
     bool  fakeDone    = false
     bool  retestDone  = false
-    //  ★ このイベントの基準時間足 (秒)。作成時に判定時間足を焼き込み、
-    //    イベントが終了するまで変更しない。価格判定も本数カウントもこのTF。
+    //  ★ このイベントの精密判定時間足 (秒)。作成時に焼き込み、イベントが
+    //    終了するまで変更しない。Break以外の価格判定と本数カウントは全てこのTF。
     int   tfSec       = 0
+    //  ★ Break を判定した時間足 (秒)。Break成立時に焼き込む。
+    int   brkTfSec    = 0
     bool  alive       = true
 
 // @type  Zone 4Logic の永続状態。Main Strategyで var 宣言すること。
@@ -2342,10 +2382,10 @@ export type ZoneEvt
 //   consumeZoneEvt() がこの index を使って該当イベントだけを消費する。
 export type ZoneEvtEngine
     array<ZoneEvt> evts
-    //  判定時間足の確定足カウンタ。startBar / breakBar / rearmBar / returnBar と
-    //  fakeMaxBars / waitBars はすべてこの本数で数える (価格判定と同じTF)。
+    //  精密判定時間足の確定足カウンタ。startBar / breakBar / rearmBar / touchBar /
+    //  reclaimBar / rejectBar と fakeMaxBars / waitBars はすべてこの本数で数える。
     int barNo = 0
-    //  1本前の判定時間足の終値。Zoneへの接近方向 (上から / 下から) の判定に使う。
+    //  1本前の精密判定時間足の終値。Zoneへの接近方向 (上から / 下から) の判定に使う。
     float prevClose = na
     int sigRebound = -1
     int sigFake    = -1
@@ -2495,19 +2535,26 @@ export zoneEnvShort(ZoneCommonCfg c, ZoneEnvFeed f, ZoneTfEnvCfg t) =>
 // ---- 8B-4 メイン更新 -------------------------------------------------------
 
 // @function  Zone 4Logic (Rebound / FakeBreak / Break Retest / Break) を評価する。
-//   ★ 価格判定も本数カウントも「判定時間足 (Zone · 判定時間足)」で完全に統一する。
-//     Main から渡される tfClose / tfHigh / tfLow / tfBull / tfBear は、そのチャート足
-//     に含まれる判定時間足の確定足を古い順に並べた配列。この関数はその1本ずつを
-//     1ステップとしてイベントを進める。
-//       ・Break成立           : その足の終値
-//       ・FakeBreak 完全Reclaim: その足の終値
-//       ・Retest 再武装距離    : その足の終値
-//       ・Retest Zoneへの戻り  : その足の高値 / 安値
-//       ・Zoneへの接近方向     : 1本前の判定TF足の終値 (e.prevClose)
-//       ・fakeMaxBars / waitBars : 判定TF足の本数 (e.barNo)
-//     → 「Breakは5M終値なのに期限だけ1Mで10本」のような混在は構造的に起きない。
-//     例) 判定TF = 1M なら fakeBreakMaxBars = 10 は1分足10本
-//         判定TF = 5M なら5分足10本 / 判定TF = 15M なら15分足10本
+//   ★ 時間足の役割を2層に分ける ★
+//     ・Break判定TF (既定 5M) … Zoneを本当にBreakしたかの確定だけ。必ず確定終値。
+//     ・精密判定TF  (既定 1M) … Break後の Rearm / Touch / Rejection / Reclaim /
+//                               BOS と、Rebound の接近 / 接触 / 離脱 / BOS。
+//                               本数カウント (fakeMaxBars / waitBars) も全てこの足。
+//   ★ 精密TFの引き渡し
+//     tfClose / tfHigh / tfLow / tfBull / tfBear は、そのチャート足に含まれる
+//     精密判定TFの確定足を古い順に並べた配列。この関数はその1本ずつを1ステップとして
+//     イベントを進める。「5分足の中に1回でもBOSがあれば true」という集約はしない。
+//   ★ 5M Breakの引き渡し
+//     brkClose = Break判定TFの確定終値 / brkValid = このチャート足でその確定足が
+//     新しく1本ぶん確定したか。Break は精密TFの全ステップを処理し終えた後に
+//     1回だけ適用する。Break判定TF = チャート足 のときは brkClose が
+//     そのチャート足自身の確定終値になるため、「1M sub-bar を全部進める →
+//     その5M足の終値でBreak確定」という実際の時間順序と完全に一致する。
+//     (Break判定TF は チャート足以上であること。下位足は想定しない。)
+//   ★ Rebound は改修前と完全に同一 ★
+//     Rebound候補のキャンセルだけは従来どおり精密TF終値の抜けで行い (rbCancelled)、
+//     成立条件 / 離脱距離 / 待機本数 / 1イベント1回 も一切変えていない。
+//     Break側を5Mへ移したことによる Rebound の出力変化は無い。
 //   ★ 環境条件は「シグナル成立時のみ」判定する。Zone接触時 / イベント作成時 /
 //     Break発生時に環境状態を固定・保存しない。
 //   ★ 実Entryは全て barstate.isconfirmed 付き。Preview は同じ式から
@@ -2520,12 +2567,15 @@ export zoneEnvShort(ZoneCommonCfg c, ZoneEnvFeed f, ZoneTfEnvCfg t) =>
 // @param zSide        同 : 1 = Support / -1 = Resistance
 // @param zTop         同 : Zone上端
 // @param zBot         同 : Zone下端
-// @param tfClose      判定時間足の確定足 終値 (古い順)
+// @param tfClose      精密判定TFの確定足 終値 (古い順)
 // @param tfHigh       同 : 高値
 // @param tfLow        同 : 安値
 // @param tfBull       同 : Bullish BOS
 // @param tfBear       同 : Bearish BOS
-// @param judgeTfSec   判定時間足の秒数 (イベントに基準TFとして焼き込む)
+// @param judgeTfSec   精密判定TFの秒数 (イベントに基準TFとして焼き込む)
+// @param brkClose     Break判定TFの確定終値 (Break判定に使う唯一の価格)
+// @param brkValid     このチャート足で Break判定TF足が新しく確定したか
+// @param brkTfSec     Break判定TFの秒数 (Break成立時にイベントへ焼き込む)
 // @param entryPrice   Entry価格 (チャート足の close)
 // @param openRebound  ZONEREBOUND を既に保有中か
 // @param openFake     ZONEFAKE   を既に保有中か
@@ -2536,7 +2586,7 @@ export updateZoneEvents(ZoneEvtEngine e, ZoneCommonCfg c, ZoneEnvFeed f, ZoneEnv
      array<int> zId, array<int> zSide, array<float> zTop, array<float> zBot,
      array<float> tfClose, array<float> tfHigh, array<float> tfLow,
      array<bool> tfBull, array<bool> tfBear,
-     int judgeTfSec, float entryPrice,
+     int judgeTfSec, float brkClose, bool brkValid, int brkTfSec, float entryPrice,
      bool openRebound, bool openFake, bool openRetest, bool openBreak) =>
     // ---- (0) 環境判定 (ロジック別・方向別に完全独立) ------------------------
     //   ★ ここで求めた許可フラグは「シグナル成立の瞬間」にだけ使う。
@@ -2621,7 +2671,7 @@ export updateZoneEvents(ZoneEvtEngine e, ZoneCommonCfg c, ZoneEnvFeed f, ZoneEnv
                 array.remove(e.roleSeen,    i)
                 array.remove(e.roleSeenBar, i)
 
-    // ---- (2) 判定時間足の確定足を1本ずつ進める -----------------------------
+    // ---- (2) 精密判定TFの確定足を1本ずつ進める -----------------------------
     bool rbL = false
     bool rbS = false
     bool fkL = false
@@ -2649,7 +2699,7 @@ export updateZoneEvents(ZoneEvtEngine e, ZoneCommonCfg c, ZoneEnvFeed f, ZoneEnv
             e.barNo += 1
 
             // ---- (2a) 新規イベント登録 (接近方向つき + Roleサイクル) --------
-            //   「どちら側からZoneへ入ってきたか」を必ず記録する。判定は判定TF足:
+            //   「どちら側からZoneへ入ってきたか」を必ず記録する。判定は精密TF足:
             //     前足終値 > zone.top    → 上から接近 → Support のみ有効 (side = +1)
             //     前足終値 < zone.bottom → 下から接近 → Resistance のみ有効 (side = -1)
             //   ★ 二重登録の防止は zoneId + side + roleCycle の3点で判定する。
@@ -2686,7 +2736,7 @@ export updateZoneEvents(ZoneEvtEngine e, ZoneCommonCfg c, ZoneEnvFeed f, ZoneEnv
                                  top = zt, bottom = zb, side = sd,
                                  startBar = e.barNo, phase = 0, tfSec = judgeTfSec))
 
-            // ---- (2b) 状態遷移 + Signal 収集 -------------------------------
+            // ---- (2b) 状態遷移 + Signal 収集 (精密TF) ----------------------
             if array.size(e.evts) > 0
                 for i = 0 to array.size(e.evts) - 1
                     ZoneEvt q = array.get(e.evts, i)
@@ -2695,24 +2745,13 @@ export updateZoneEvents(ZoneEvtEngine e, ZoneCommonCfg c, ZoneEnvFeed f, ZoneEnv
                         float rd = math.max(c.retestMinDist, w * c.retestWidthMult)
                         if q.phase == 0
                             nTouch += 1
-                            // Break確定 (判定TF足の終値 + Buffer。ヒゲでは成立しない)
-                            bool brk = q.side > 0 ? tc < q.bottom - c.breakBuffer : tc > q.top + c.breakBuffer
-                            if brk
-                                // 未確定Rebound候補はここでキャンセル (phase遷移)
-                                q.phase     := 1
-                                q.breakBar  := e.barNo
-                                q.fakeAlive := true
-                                q.reclaimed := false
-                                q.returned  := false
-                                if not q.breakDone and iBk < 0
-                                    // Support下抜け → Short / Resistance上抜け → Long
-                                    if q.side > 0 and aBkS
-                                        bkS := true
-                                        iBk := i
-                                    else if q.side < 0 and aBkL
-                                        bkL := true
-                                        iBk := i
-                            else
+                            //  ★ ここでは Break を成立させない (Break は 5M のみ)。
+                            //    精密TFの抜けは Rebound候補のキャンセルにだけ使う。
+                            //    条件式は改修前の Break判定とまったく同じもの。
+                            bool brk1m = q.side > 0 ? tc < q.bottom - c.breakBuffer : tc > q.top + c.breakBuffer
+                            if brk1m
+                                q.rbCancelled := true
+                            if not q.rbCancelled
                                 // Rebound用 最低離脱距離 (終値のみ / 0 = OFF)
                                 if c.minMoveAway <= 0
                                     q.movedAway := true
@@ -2720,64 +2759,127 @@ export updateZoneEvents(ZoneEvtEngine e, ZoneCommonCfg c, ZoneEnvFeed f, ZoneEnv
                                     q.movedAway := true
                                 else if q.side < 0 and tc <= q.bottom - c.minMoveAway
                                     q.movedAway := true
-                                if e.barNo - q.startBar > c.waitBars
-                                    q.alive := false
-                                if q.alive and not q.reboundDone and q.movedAway and iRb < 0
-                                    if q.side > 0 and tb and aRbL
-                                        rbL := true
-                                        iRb := i
-                                    else if q.side < 0 and ts and aRbS
-                                        rbS := true
-                                        iRb := i
+                            //  待機本数の期限は改修前と同じ精密TF本数で数える。
+                            //  (Rebound は rbCancelled で既に失効しているため、
+                            //   ここで期限切れにしても Rebound の出力は変わらない。)
+                            if e.barNo - q.startBar > c.waitBars
+                                q.alive := false
+                            if q.alive and not q.rbCancelled and not q.reboundDone and q.movedAway and iRb < 0
+                                if q.side > 0 and tb and aRbL
+                                    rbL := true
+                                    iRb := i
+                                else if q.side < 0 and ts and aRbS
+                                    rbS := true
+                                    iRb := i
                         else if q.phase == 1
                             int el = e.barNo - q.breakBar
                             if el > c.fakeMaxBars
                                 q.fakeAlive := false
                             // FakeBreak : 元Zoneを完全にReclaim (Zone内へ戻っただけでは不成立)
+                            //   ★ Reclaim成立バーを記録し、それ以降の新規BOSだけを使う。
+                            //     Reclaim前に出ていた古いBOSは絶対に流用しない。
                             if q.fakeAlive
                                 nFake += 1
-                                if q.side > 0 and tc > q.top
-                                    q.reclaimed := true
-                                if q.side < 0 and tc < q.bottom
-                                    q.reclaimed := true
-                                if not q.fakeDone and q.reclaimed and iFk < 0
+                                if not q.reclaimed
+                                    if q.side > 0 and tc > q.top
+                                        q.reclaimed  := true
+                                        q.reclaimBar := e.barNo
+                                    else if q.side < 0 and tc < q.bottom
+                                        q.reclaimed  := true
+                                        q.reclaimBar := e.barNo
+                                if not q.fakeDone and q.reclaimed and not na(q.reclaimBar) and e.barNo >= q.reclaimBar and iFk < 0
                                     if q.side > 0 and tb and aFkL
                                         fkL := true
                                         iFk := i
                                     else if q.side < 0 and ts and aFkS
                                         fkS := true
                                         iFk := i
-                            // Break Retest : まずZoneから十分離れて再武装する
+                            // Break Retest : まずZoneから十分離れて再武装する (精密TF終値)
                             bool far = q.side > 0 ? tc <= q.bottom - rd : tc >= q.top + rd
                             if far
-                                q.phase     := 2
-                                q.rearmBar  := e.barNo
-                                q.fakeAlive := false
-                                q.reclaimed := false
-                                q.returned  := false
+                                q.phase      := 2
+                                q.rearmBar   := e.barNo
+                                q.fakeAlive  := false
+                                q.reclaimed  := false
+                                q.reclaimBar := na
+                                q.touched    := false
+                                q.rejected   := false
                             else if el > math.max(c.fakeMaxBars, c.waitBars)
                                 q.alive := false
                         else
                             nRetest += 1
-                            // 再武装後にZoneへ戻ってきた (Break直後の再接触はここへ来ない)
-                            if not q.returned and tl <= q.top and th >= q.bottom
-                                q.returned  := true
-                                q.returnBar := e.barNo
-                            if not q.returned and e.barNo - q.rearmBar > c.waitBars
+                            //  ---- (i) Retest失効 : 元Zoneを逆方向へ完全Reclaim ----
+                            //    Support下抜け後のRetest中に 1M終値が Zone Top より上で
+                            //    確定したら、その Break イベントごと失効させる。
+                            //    以後 Bearish BOS が出ても古いBreakでShortしない。
+                            bool invalid = q.side > 0 ? tc > q.top : tc < q.bottom
+                            if invalid
                                 q.alive := false
-                            if q.returned and e.barNo - q.returnBar > c.waitBars
-                                q.alive := false
-                            if q.alive and q.returned and not q.retestDone and iRt < 0
-                                // Support下抜け後の戻り → Resistanceとして反発 → Short
-                                // Resistance上抜け後の戻り → Supportとして反発 → Long
-                                if q.side > 0 and ts and aRtS
-                                    rtS := true
-                                    iRt := i
-                                else if q.side < 0 and tb and aRtL
-                                    rtL := true
-                                    iRt := i
+                            else
+                                //  ---- (ii) Touch : Zoneへの接触 (接触だけでは未完成) ----
+                                if not q.touched and tl <= q.top and th >= q.bottom
+                                    q.touched  := true
+                                    q.touchBar := e.barNo
+                                //  ---- (iii) Rejection : 接触後、終値がBreak方向側で確定 ----
+                                //    side +1 (Support下抜け) : tc < bottom → Bearish rejection
+                                //    side -1 (Resist上抜け)  : tc > top    → Bullish rejection
+                                if q.touched and not q.rejected
+                                    bool rej = q.side > 0 ? tc < q.bottom : tc > q.top
+                                    if rej
+                                        q.rejected   := true
+                                        q.rejectBar  := e.barNo
+                                        q.rejectTime := time
+                                //  ---- 期限 ----
+                                if not q.touched and e.barNo - q.rearmBar > c.waitBars
+                                    q.alive := false
+                                if q.touched and e.barNo - q.touchBar > c.waitBars
+                                    q.alive := false
+                                //  ---- (iv) Rejection 以降の新規BOSだけ有効 ----
+                                if q.alive and q.rejected and not na(q.rejectBar) and e.barNo >= q.rejectBar and not q.retestDone and iRt < 0
+                                    if q.side > 0 and ts and aRtS
+                                        rtS := true
+                                        iRt := i
+                                    else if q.side < 0 and tb and aRtL
+                                        rtL := true
+                                        iRt := i
 
             e.prevClose := tc
+
+    // ---- (2c) Break判定 (Break判定TFの確定終値のみ) ------------------------
+    //   ★ 精密TFの全ステップを処理し終えてから、そのチャート足で確定した
+    //     Break判定TF足の終値で1回だけ判定する。
+    //     Break判定TF = チャート足 (既定 5M/5M) なら brkClose はそのチャート足
+    //     自身の確定終値なので、「1M sub-bar を全部進める → 5M終値でBreak確定」
+    //     という実際の時間順序と完全に一致する。
+    //   ★ ヒゲでは絶対に成立しない (high / low は一切見ない)。
+    //   ★ Break成立時に zoneId / top / bottom / breakDir / breakTime を凍結する。
+    //     以後 Fake / Retest が終わるまで参照先Zoneを変えない。
+    if brkValid and not na(brkClose) and array.size(e.evts) > 0
+        for i = 0 to array.size(e.evts) - 1
+            ZoneEvt qb = array.get(e.evts, i)
+            if qb.alive and qb.phase == 0
+                bool brk5m = qb.side > 0 ? brkClose < qb.bottom - c.breakBuffer : brkClose > qb.top + c.breakBuffer
+                if brk5m
+                    qb.phase      := 1
+                    qb.breakBar   := e.barNo
+                    qb.breakDir   := -qb.side
+                    qb.breakTime  := time
+                    qb.brkTfSec   := brkTfSec
+                    qb.fakeAlive  := true
+                    qb.reclaimed  := false
+                    qb.reclaimBar := na
+                    qb.touched    := false
+                    qb.rejected   := false
+                    qb.rejectBar  := na
+                    //  Zone Break 単体は、この 5M Break が確定した瞬間にSignalを出す。
+                    if not qb.breakDone and iBk < 0
+                        // Support下抜け → Short / Resistance上抜け → Long
+                        if qb.side > 0 and aBkS
+                            bkS := true
+                            iBk := i
+                        else if qb.side < 0 and aBkL
+                            bkL := true
+                            iBk := i
 
     e.sigRebound := iRb
     e.sigFake    := iFk
