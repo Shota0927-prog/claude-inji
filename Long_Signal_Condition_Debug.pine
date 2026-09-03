@@ -1,0 +1,2295 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  Long Signal Condition Debug
+//  FVG反発 / FVG吸収 / ZONE反発 の Long条件が「今どこまで成立しているか」を
+//  リアルタイムで確認するためのデバッグ専用インジケーター。
+// ----------------------------------------------------------------------------
+//  ★ このスクリプトは表示専用 ★
+//    ・strategy() ではなく indicator()。注文・ポジション管理・決済は存在しない。
+//    ・alert() を一切呼ばない (アラートも発火しない)。
+//    ・既存Strategy (FVG + Zone Engine Strategy / Short Signal Strategy) の
+//      Entry / 決済 / アラート / バックテスト結果には一切影響しない。
+//      別スクリプトなので状態も共有しない。
+//
+//  ★ 判定は「既存ロジックと同一」であることを最優先にしている ★
+//    ・Section 01 (input) / 02 (Engine初期化) / 03 (外部データFeed) /
+//      04 (SignalEngine呼び出し) は FVG + Zone Engine Strategy から
+//      そのまま持ってきたもの。input名・初期値・Cfg代入・request・
+//      Engine更新の順序まで同一。
+//    ・条件の判定式は SignalEngine / ZoneEngine の export 関数と、
+//      それらが返す Signal / Event の値だけを読む。
+//      「それっぽい再現」を新規に書き起こしてはいない。
+//    ・通常ボラ / 高速ボラだけは SignalEngine が中間結果 (baseVolOk /
+//      fastVolPass) を返さないため、updateFvg() 内の式を1行ずつ写した
+//      ミラーで「現在値」を表示している (式・パラメータとも完全同一)。
+//    ・SignalEngine が内部にしか持っておらず取得できない値は、推測で似た
+//      ロジックを作らず「要SignalEngine Debug出力」と明示している。
+//      該当は次の4つ:
+//        ・FVG侵入率            (efvgReboundState 内部の侵入率)
+//        ・FVG回復位置          (同 回復率)
+//        ・Accum 5M / 15M の内訳 (blockedByAccum は合成結果のみ)
+//        ・Accum 離脱方向の向き  (accumLongDirOk は許可/不許可のみ)
+//        ・BOS成立からの経過本数 (BOSは成立/不成立のみ)
+//
+//  ★ 今回は Long 側のみ。Short は対象外。
+//  前提: チャート時間足 = 5分足 (既存Strategyと同じ)。
+// ============================================================================
+
+//@version=5
+indicator(
+     title             = "Long Signal Condition Debug",
+     shorttitle        = "LONG COND DEBUG",
+     overlay           = true,
+     dynamic_requests  = true,
+     max_boxes_count   = 500,
+     max_labels_count  = 500,
+     max_lines_count   = 200
+ )
+
+// ★★★ Library import ★★★
+//  "shota0927-prog" は、Libraryを公開した自分のTradingViewユーザー名に置き換えること。
+//  末尾の数字は Library のバージョン。Libraryを再公開するたびに増やす。
+//  ★ SignalEngine は FVGABS 追加で更新されている。再Publishした実際のバージョン番号に
+//    合わせること (下は「SignalEngine をまだ /2 から再公開していない」前提で /3)。
+import sekine3310/ZoneEngine/3   as zn
+import sekine3310/SignalEngine/13 as sg
+
+// Library内の定数と同じ値 (定数exportはPineのバージョン依存機能のため再宣言する)
+int ST_ACTIVE  = 0
+int ST_SUPPORT = 1
+int ST_RESIST  = 2
+int ST_BROKEN  = 3
+int SR_WEAK    = 1
+int SR_MEDIUM  = 2
+int SR_STRONG  = 3
+int SR_VSTRONG = 4
+
+// ============================================================================
+//  Gold Only ゲート
+// ----------------------------------------------------------------------------
+//  このStrategyはXAUUSD (GOLD) 専用。ブローカーによって XAUUSD / GOLD /
+//  XAUUSD.P など表記が違うため、完全一致ではなく syminfo.ticker に
+//  "XAU" または "GOLD" を含むかで判定する。
+//  ★ isGold は syminfo.ticker から決まるチャート単位の定数。
+//    XAUUSD 上では常に true なので、後述の全ゲート (isGold and <既存条件>) は
+//    恒等式になり、Entry / Zone / アラート / 表示は修正前と完全に一致する。
+//  ★ Gold以外では「発注」「アラート」「チャート描画」の3系統だけを止める。
+//    Entry条件・FVG判定・Zone判定・BOS・Accum・Session・News・Daily Regime・
+//    SL/TP・TradePlan・RR・Break Even・Group制御 の式は1つも変更していない。
+bool isGold = str.contains(str.upper(syminfo.ticker), "XAU") or
+     str.contains(str.upper(syminfo.ticker), "GOLD")
+
+// Logic ID (Entry ID の接頭辞になる)
+string LOGIC_FVG   = "FVG"
+string LOGIC_FVG15 = "FVG15"
+// FVG吸収系列 (反発系列とは別Group)
+string LOGIC_FVG_ABS5  = "FVGABS5"
+string LOGIC_FVG_ABS15 = "FVGABS15"
+// Zone 4系列 (FVG系列とは完全に別Group / 4つとも互いに独立)
+//   ZONEREBOUND : Zoneへ接近 → 反発 → BOS
+//   ZONEFAKE    : Zone Break → 短時間で完全Reclaim → BOS
+//   ZONERETEST  : Zone Break → 十分離れて再武装 → 戻り → 反発 → BOS
+//   ZONEBREAK   : Zoneの確定Break そのもの (BOS不要)
+string LOGIC_ZONE_RB = "ZONEREBOUND"
+string LOGIC_ZONE_FK = "ZONEFAKE"
+string LOGIC_ZONE_RT = "ZONERETEST"
+string LOGIC_ZONE_BK = "ZONEBREAK"
+
+// 表示用の小さなヘルパー
+f_num(float v, string fmt) =>
+    na(v) ? "-" : str.tostring(v, fmt)
+f_arrow(int dir) =>
+    dir > 0 ? "↑" : dir < 0 ? "↓" : "→"
+// Logic ID → 人間が読める名前。
+//  ★ 表示・通知専用。Entry判定・Group制御・Entry ID の生成には一切使わない
+//    (Entry ID は従来どおり内部IDの LOGIC_* をそのまま接頭辞に使う)。
+f_logicName(string logicId) =>
+    logicId == LOGIC_FVG        ? "5分FVG反発" :
+     logicId == LOGIC_FVG15     ? "15分FVG反発 → 5分BOS" :
+     logicId == LOGIC_FVG_ABS5  ? "5分FVG吸収 → 1分BOS" :
+     logicId == LOGIC_FVG_ABS15 ? "15分FVG吸収 → 5分BOS" :
+     logicId == LOGIC_ZONE_RB   ? "Zone反発" :
+     logicId == LOGIC_ZONE_FK   ? "Zone FakeBreak" :
+     logicId == LOGIC_ZONE_RT   ? "Zone Break Retest" :
+     logicId == LOGIC_ZONE_BK   ? "Zone Break" : logicId
+// Entry ID の接頭辞から Logic ID を復元する。表示・通知専用。
+//  Entry ID は "<LOGIC_ID>_L_<seq>" / "<LOGIC_ID>_S_<seq>" なので、必ず
+//  完全な接頭辞で判定する ("FVG15_L_" が "FVG_L_" に一致することはない)。
+f_logicIdFromEid(string eid) =>
+    string r = ""
+    if str.startswith(eid, LOGIC_FVG15 + "_L_") or str.startswith(eid, LOGIC_FVG15 + "_S_")
+        r := LOGIC_FVG15
+    else if str.startswith(eid, LOGIC_FVG_ABS15 + "_L_") or str.startswith(eid, LOGIC_FVG_ABS15 + "_S_")
+        r := LOGIC_FVG_ABS15
+    else if str.startswith(eid, LOGIC_FVG_ABS5 + "_L_") or str.startswith(eid, LOGIC_FVG_ABS5 + "_S_")
+        r := LOGIC_FVG_ABS5
+    else if str.startswith(eid, LOGIC_FVG + "_L_") or str.startswith(eid, LOGIC_FVG + "_S_")
+        r := LOGIC_FVG
+    else if str.startswith(eid, LOGIC_ZONE_RB + "_L_") or str.startswith(eid, LOGIC_ZONE_RB + "_S_")
+        r := LOGIC_ZONE_RB
+    else if str.startswith(eid, LOGIC_ZONE_FK + "_L_") or str.startswith(eid, LOGIC_ZONE_FK + "_S_")
+        r := LOGIC_ZONE_FK
+    else if str.startswith(eid, LOGIC_ZONE_RT + "_L_") or str.startswith(eid, LOGIC_ZONE_RT + "_S_")
+        r := LOGIC_ZONE_RT
+    else if str.startswith(eid, LOGIC_ZONE_BK + "_L_") or str.startswith(eid, LOGIC_ZONE_BK + "_S_")
+        r := LOGIC_ZONE_BK
+    r
+// 下位足の確定バー配列に true が1つでもあるか (request.security_lower_tf の集約用)
+f_anyTrue(array<bool> a) =>
+    bool r = false
+    if array.size(a) > 0
+        for i = 0 to array.size(a) - 1
+            if array.get(a, i)
+                r := true
+    r
+
+// ============================================================================
+// 01. ALL INPUTS
+// ----------------------------------------------------------------------------
+//  input.* はこのセクションにのみ置く。Engineへの代入は Section 02 で行う。
+// ============================================================================
+
+// ============================================================================
+// 01-1. COMMON INPUTS
+// ============================================================================
+// ---- 1.1 Direction (全Logic共通) ------------------------------------------
+//  推奨検証手順:  Longのみ / Shortのみ を別々に実行する。
+//  TradingView Strategy は単一ネットポジションのため、Long/Short同時ONは
+//  完全なヘッジ検証にはならない。
+var string G_DIR = "01 · Common · Direction"
+enableLong  = input.bool(true,  "Enable Long  (全LogicのLongを許可)",  group = G_DIR)
+enableShort = input.bool(false, "Enable Short (全LogicのShortを許可)", group = G_DIR)
+
+// ---- 1.2 Logic ON / OFF ----------------------------------------------------
+//  Logic単体成績を見たいときは、対象LogicだけONにして Strategy Tester を読む。
+//  全部ONにすれば全Logic合算成績になる。
+var string G_LOGIC = "01 · Common · Entry Logic ON/OFF"
+useFvgLogic = input.bool(true, "Use FVG", group = G_LOGIC,
+     tooltip = "既存の 5M FVG Logic (LOGIC_FVG)。15M Logicとは完全に独立。")
+useFvg15Logic = input.bool(true, "Use 15M FVG → 5M BOS", group = G_LOGIC,
+     tooltip = "15M FVG反発 → その反発15M足の開始以降の5M BOS で入る別Logic (LOGIC_FVG15)。\n" +
+     "OFFにすると既存5M FVG単体の成績になる (修正前と完全一致)。")
+useFvgAbs5Logic = input.bool(true, "Use 5M FVG Absorption → 1M BOS", group = G_LOGIC,
+     tooltip = "Long  : 5M Bearish FVG を上方向へ吸収 → 1M Bullish BOS でLong。\n" +
+     "Short : 5M Bullish FVG を下方向へ吸収 → 1M Bearish BOS でShort。\n" +
+     "Long / Short は完全対称 (吸収判定・品質条件・Hold・BOS Lookback は共通設定)。\n" +
+     "共通の Enable Long / Enable Short を必ず通る。(LOGIC_FVGABS5)")
+useFvgAbs15Logic = input.bool(true, "Use 15M FVG Absorption → 5M BOS", group = G_LOGIC,
+     tooltip = "Long  : 15M Bearish FVG を上方向へ吸収 → 5M Bullish BOS でLong。\n" +
+     "Short : 15M Bullish FVG を下方向へ吸収 → 5M Bearish BOS でShort。\n" +
+     "Long / Short は完全対称 (吸収判定・品質条件・Hold・BOS Lookback は共通設定)。\n" +
+     "共通の Enable Long / Enable Short を必ず通る。(LOGIC_FVGABS15)")
+//  ---- Zone 4系列 (それぞれ完全独立。個別ON/OFF・個別集計) ----------------
+useZoneRebound = input.bool(true, "Use Zone Rebound", group = G_LOGIC,
+     tooltip = "Support Zone へ「上から」接近 → 反発 → Bullish BOS で Long。\n" +
+     "Resistance Zone へ「下から」接近 → 反発 → Bearish BOS で Short。\n" +
+     "旧 ZONEBOS の置き換え。接近方向を判定するので、下からSupportを貫通して\n" +
+     "上昇するようなケースは Rebound Long にならない。(LOGIC_ZONEREBOUND)")
+useZoneFake    = input.bool(false, "Use Zone FakeBreak", group = G_LOGIC,
+     tooltip = "Zone Break確定後、fakeBreakMaxBars 以内に元Zoneを完全Reclaim して\n" +
+     "BOSが出たら逆方向へ入る (LOGIC_ZONEFAKE)。Zone内へ戻っただけでは成立しない。")
+useZoneRetest  = input.bool(false, "Use Zone Break Retest", group = G_LOGIC,
+     tooltip = "Zone Break確定 → 再武装距離以上 離れる → Zoneへ戻る → 反発 → BOS\n" +
+     "でBreak方向へ入る (LOGIC_ZONERETEST)。Break直後の再接触では発火しない。")
+useZoneBreak   = input.bool(false, "Use Zone Break", group = G_LOGIC,
+     tooltip = "Zone境界 + Buffer を終値で明確に抜けた瞬間そのものでEntry (LOGIC_ZONEBREAK)。\n" +
+     "BOSは要求しない (Zone Break単体の優位性を検証するため)。1 Breakにつき1回。")
+//  Zone系のうち1つでもONなら、Zone用の外部データ取得とイベント管理を行う。
+bool useZoneAny = useZoneRebound or useZoneFake or useZoneRetest or useZoneBreak
+// 新Logicを足したらここに1行追加する:
+// useEmaLogic = input.bool(false, "Use EMA Reject", group = G_LOGIC)
+
+// ---- 1.6 Session / News Filter (共通・どのLogicからも参照可) ---------------
+var string G_SESS = "01 · Common · Session / News"
+useSessionFilter = input.bool(true, "時間帯フィルタを使う", group = G_SESS)
+useAsiaSession   = input.bool(true, "アジア 09:00-16:00", group = G_SESS)
+useEUSession     = input.bool(true, "EU 16:00-21:00", group = G_SESS)
+useNYSession     = input.bool(true, "NY 21:00-翌03:00", group = G_SESS)
+useNewsTimeFilter = input.bool(false, "重要指標時間を除外", group = G_SESS)
+newsSession1 = input.session("2130-2230", "指標除外時間1", group = G_SESS)
+newsSession2 = input.session("2330-0030", "指標除外時間2", group = G_SESS)
+newsSession3 = input.session("0300-0400", "指標除外時間3", group = G_SESS)
+
+// ============================================================================
+// 01-2. ZONE ENGINE INPUTS
+// ============================================================================
+// ---- 2.1 Zone Geometry -----------------------------------------------------
+var string G_ZONE = "02 · Zone Geometry"
+zoneHalfWidth = input.float(5.0, "Zone Half Width ($)", minval = 0.1, step = 0.5, group = G_ZONE,
+     tooltip = "Zone = 中心価格 ± この値。Strengthによって幅は変えない。")
+
+// ---- 2.2 MA Source (1分足コンテキストで直接計算) ---------------------------
+var string G_MA = "02 · MA Source"
+maTf = input.timeframe("1", "MA Timeframe", group = G_MA,
+     tooltip = "既定 1分足。1分足コンテキスト内でMAを計算し、その結果を5分足へ取得する。")
+maType = input.string("EMA", "MA Type", options = ["SMA", "EMA"], group = G_MA)
+useMaSource = input.bool(true, "Enable MA Source", group = G_MA)
+// ★ ma1Len / ma2Len / 各TF は request.security・zn.maPack へ渡すため
+//   「input変数のまま (simple修飾)」保持する。UDTのフィールド読み出しは series 扱いになり、
+//   request.security の timeframe や ta.ema の length には使えないため。
+ma1Len = input.int(2000, "MA #1 Length", minval = 1, maxval = 4999, group = G_MA)
+ma2Len = input.int(3000, "MA #2 Length", minval = 1, maxval = 4999, group = G_MA)
+slopeLookback = input.int(60, "Slope Lookback (MA TF bars)", minval = 1, group = G_MA)
+scoreMa1 = input.float(2.0, "Base Score · MA #1", step = 0.5, group = G_MA)
+scoreMa2 = input.float(2.0, "Base Score · MA #2", step = 0.5, group = G_MA)
+
+// ---- 2.3 MA Slope ----------------------------------------------------------
+var string G_SLOPE = "02 · MA Slope"
+slopeThrMod = input.float(1.0, "Slope Threshold · Moderate ($/lookback)", step = 0.1, group = G_SLOPE)
+slopeThrStrong = input.float(3.0, "Slope Threshold · Strong ($/lookback)",   step = 0.1, group = G_SLOPE)
+slopeBonusFlat = input.float(0.0, "Slope Bonus · Flat",     step = 0.5, group = G_SLOPE)
+slopeBonusMod = input.float(1.0, "Slope Bonus · Moderate", step = 0.5, group = G_SLOPE)
+slopeBonusStr = input.float(2.0, "Slope Bonus · Strong",   step = 0.5, group = G_SLOPE)
+slopeBonusMode = input.string("Sum (per MA)", "Slope Bonus Aggregation in Cluster",
+     options = ["Sum (per MA)", "Max"], group = G_SLOPE,
+     tooltip = "同一Cluster内に2000MAと3000MAが両方入った場合、Slope Bonusを合算するか最大値のみ採用するか。")
+maClusterDist = input.float(20.0, "MA Cluster Distance ($)", step = 1.0, group = G_SLOPE)
+maClusterBonus = input.float(1.0, "MA Cluster Bonus",              step = 0.5, group = G_SLOPE)
+maClusterDirBonus = input.float(1.0, "MA Cluster Bonus · Same Slope", step = 0.5, group = G_SLOPE)
+
+// ---- 2.4 Horizontal Source -------------------------------------------------
+var string G_HZ = "02 · Horizontal Source (Swing)"
+useHzSource = input.bool(true, "Enable Horizontal Source", group = G_HZ)
+hzTf1 = input.timeframe("5",  "Horizontal TF #1", group = G_HZ)
+hzTf2 = input.timeframe("15", "Horizontal TF #2", group = G_HZ)
+hzTf3 = input.timeframe("60", "Horizontal TF #3", group = G_HZ)
+pivLen1 = input.int(10, "Swing Pivot Length · TF #1", minval = 1, group = G_HZ)
+pivLen2 = input.int(8,  "Swing Pivot Length · TF #2", minval = 1, group = G_HZ)
+pivLen3 = input.int(6,  "Swing Pivot Length · TF #3", minval = 1, group = G_HZ)
+scoreHz1 = input.float(1.0, "Base Score · TF #1 Swing", step = 0.5, group = G_HZ)
+scoreHz2 = input.float(2.0, "Base Score · TF #2 Swing", step = 0.5, group = G_HZ)
+scoreHz3 = input.float(3.0, "Base Score · TF #3 Swing", step = 0.5, group = G_HZ)
+
+// ---- 2.5 Horizontal Reaction ----------------------------------------------
+var string G_REACT = "02 · Horizontal Reaction"
+reactionDist = input.float(20.0, "Reaction Distance ($)", step = 0.5, group = G_REACT,
+     tooltip = "Zoneに接触したあと、来た方向へこの距離以上戻ればReaction 1回。")
+reactionBonus1 = input.float(1.0, "Reaction Bonus · 1 time",   step = 0.5, group = G_REACT)
+reactionBonus2 = input.float(2.0, "Reaction Bonus · 2 times",  step = 0.5, group = G_REACT)
+reactionBonus3 = input.float(3.0, "Reaction Bonus · 3+ times", step = 0.5, group = G_REACT)
+reactionRearmDist = input.float(10.0, "Reaction Re-arm Distance ($)", step = 0.5, group = G_REACT)
+reactionAllSrc = input.bool(false, "Track Reaction on Accum / DayHL too", group = G_REACT)
+
+// ---- 2.6 Day High / Low ----------------------------------------------------
+var string G_DHL = "02 · Day High / Low"
+useDayHL = input.bool(true, "Enable Day High / Low Source", group = G_DHL)
+dayTz        = input.string("Asia/Tokyo", "Day Session Timezone", group = G_DHL)
+dayResetHour = input.int(5, "Day Reset Hour (取引日の開始時刻)", minval = 0, maxval = 23, group = G_DHL,
+     tooltip = "既定 5 = 日本時間 05:00 ～ 翌 04:59 を1取引日として扱う。0 にすると暦日基準。")
+scoreDayHL = input.float(3.0, "Base Score · Day High / Low", step = 0.5, group = G_DHL)
+carryPrevDayHL = input.bool(false, "Carry Previous Day H/L as Horizontal Zone", group = G_DHL)
+scorePrevDayHL = input.float(2.0, "Base Score · Carried Prev Day H/L", step = 0.5, group = G_DHL)
+lifePrevDayHL = input.float(5.0, "Lifetime · Carried Prev Day H/L (days)", step = 1.0, group = G_DHL)
+
+// ---- 2.7 Accumulation ------------------------------------------------------
+var string G_ACC = "02 · Accumulation"
+useAccSource = input.bool(true, "Enable Accumulation Source", group = G_ACC)
+accumModule = input.string("Accum Box (ported)", "Accum Detection Module",
+     options = ["Accum Box (ported)", "Provisional ATR (暫定)"], group = G_ACC)
+accTf1 = input.timeframe("60",  "Accum TF #1", group = G_ACC)
+accTf2 = input.timeframe("240", "Accum TF #2", group = G_ACC)
+accTf3 = input.timeframe("D",   "Accum TF #3", group = G_ACC)
+scoreAcc1 = input.float(3.0, "Base Score · TF #1 Accum", step = 0.5, group = G_ACC)
+scoreAcc2 = input.float(4.0, "Base Score · TF #2 Accum", step = 0.5, group = G_ACC)
+scoreAcc3 = input.float(5.0, "Base Score · TF #3 Accum", step = 0.5, group = G_ACC)
+accKeep1 = input.int(3, "Keep Count · TF #1 Accum (instances)", minval = 1, group = G_ACC)
+accKeep2 = input.int(2, "Keep Count · TF #2 Accum (instances)", minval = 1, group = G_ACC)
+accKeep3 = input.int(1, "Keep Count · TF #3 Accum (instances)", minval = 1, group = G_ACC)
+
+var string G_ACCP = "02a · Accum Box (ported) Parameters"
+accumRangeLen        = input.int(10,   "Accum判定レンジ本数",  minval = 6,  group = G_ACCP)
+accumBaseLen         = input.int(20,   "基準平均本数",         minval = 10, group = G_ACCP)
+accumAtrLen          = input.int(14,   "ATR本数",             minval = 1,  group = G_ACCP)
+accumMinUpperCloses  = input.int(4,    "上半分の最低終値本数",  minval = 1,  group = G_ACCP)
+accumMinLowerCloses  = input.int(4,    "下半分の最低終値本数",  minval = 1,  group = G_ACCP)
+accumMaxSameColorRun = input.int(4,    "同色連続の上限",       minval = 1,  group = G_ACCP)
+accumAtrMult         = input.float(2.5,  "Accum レンジ幅 / ATR 上限",    minval = 0.5,  step = 0.1,  group = G_ACCP)
+accumBarRatioMax     = input.float(0.70, "Accum 平均値幅/基準平均 上限", minval = 0.1,  step = 0.01, group = G_ACCP)
+accumDriftMax        = input.float(0.30, "Accum ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = G_ACCP)
+
+var string G_ACCQ = "02b · Provisional ATR Accum (暫定・本番未使用)"
+accLen1 = input.int(20, "[暫定] Accum Lookback · TF #1 (bars)", minval = 3, group = G_ACCQ)
+accLen2 = input.int(20, "[暫定] Accum Lookback · TF #2 (bars)", minval = 3, group = G_ACCQ)
+accLen3 = input.int(15, "[暫定] Accum Lookback · TF #3 (bars)", minval = 3, group = G_ACCQ)
+accMult = input.float(1.2, "[暫定] Accum Max Range / ATR", step = 0.1, minval = 0.1, group = G_ACCQ)
+
+// ---- 2.8 Cluster / Score / HTF --------------------------------------------
+var string G_CLU = "02 · Cluster"
+clusterDist = input.float(20.0, "Cluster Distance ($)", step = 1.0, group = G_CLU)
+
+var string G_SCORE = "02 · Strength Score"
+thrMedium = input.float(5.0,  "Medium Score Threshold",      step = 0.5, group = G_SCORE)
+thrStrong = input.float(10.0, "Strong Score Threshold",      step = 0.5, group = G_SCORE)
+thrVStrong = input.float(15.0, "Very Strong Score Threshold", step = 0.5, group = G_SCORE)
+confBonus2 = input.float(1.0, "Confluence Bonus · 2 categories",  step = 0.5, group = G_SCORE)
+confBonus3 = input.float(2.0, "Confluence Bonus · 3 categories",  step = 0.5, group = G_SCORE)
+confBonus4 = input.float(3.0, "Confluence Bonus · 4+ categories", step = 0.5, group = G_SCORE)
+flipBonus = input.float(2.0, "Flip Bonus", step = 0.5, group = G_SCORE)
+
+var string G_HTF = "02a · Very Strong · Higher TF Structure"
+requireHtfForVStrong = input.bool(true, "Require Higher TF Structure for Very Strong", group = G_HTF)
+htfSwing1H = input.bool(true,  "Count 1H Swing (TF #3) as Higher TF",    group = G_HTF)
+htfAccum1H = input.bool(true,  "Count 1H Accum (TF #1) as Higher TF",    group = G_HTF)
+htfAccum4H = input.bool(true,  "Count 4H Accum (TF #2) as Higher TF",    group = G_HTF)
+htfAccumD = input.bool(true,  "Count Daily Accum (TF #3) as Higher TF", group = G_HTF)
+htfSwing15M = input.bool(false, "Count 15M Swing (TF #2) as Higher TF",   group = G_HTF)
+htfMa1 = input.bool(false, "Count MA #1 (2000) as Higher TF",        group = G_HTF)
+htfMa2 = input.bool(false, "Count MA #2 (3000) as Higher TF",        group = G_HTF)
+htfDayHL = input.bool(false, "Count Day High / Low as Higher TF",      group = G_HTF)
+
+// ---- 2.9 Break / Flip / Lifetime ------------------------------------------
+var string G_BF = "02 · Break / Flip"
+breakTf = input.timeframe("5", "Break Evaluation Timeframe", group = G_BF,
+     tooltip = "Breakはヒゲではなくこの時間足の確定終値で判定する。")
+breakBuffer = input.float(5.0,  "Break Buffer ($)",         step = 0.5, group = G_BF)
+flipConfirmDist = input.float(10.0, "Flip Confirm Distance ($)", step = 0.5, group = G_BF)
+resetOnReclaim = input.bool(true,  "Reset Broken on Reclaim", group = G_BF)
+trackStaleBars = input.int(500, "Zone State Retention (bars without match)", minval = 10, group = G_BF)
+trackContinuity = input.float(0.5, "Zone Track · Min Source Continuity", minval = 0.01, maxval = 1.0, step = 0.05, group = G_BF)
+
+var string G_LIFE = "02 · Zone Lifetime"
+lifeHz1 = input.float(5.0,  "Lifetime · TF #1 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeHz2 = input.float(10.0, "Lifetime · TF #2 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeHz3 = input.float(30.0, "Lifetime · TF #3 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeExtendOn = input.bool(true,  "Extend Lifetime on Reaction / Flip", group = G_LIFE)
+lifeExtendRatio = input.float(0.5,  "Lifetime Extension Ratio", step = 0.1, minval = 0.0, group = G_LIFE)
+maxPersistZones = input.int(200, "Max Persistent Raw Zones", minval = 20, maxval = 800, group = G_LIFE)
+
+// ---- 2.10 Structural SL / TP ----------------------------------------------
+var string G_SLTP = "02 · Structural SL / TP"
+slBuffer = input.float(5.0,  "SL Buffer ($)", step = 0.5, group = G_SLTP)
+tpBuffer = input.float(0.0,  "TP Buffer ($)", step = 0.5, group = G_SLTP)
+maxSlDist = input.float(30.0, "Max SL Distance ($)", step = 1.0, group = G_SLTP)
+minStructRR = input.float(1,  "Minimum Structural RR", step = 0.1, group = G_SLTP,
+     tooltip = "Structural TPが存在する場合、この値未満のRRならエントリー禁止 (固定RR TPへ逃げない)。")
+tpMode = input.string("BOTH", "TP Mode", options = ["BOTH", "STRUCTURAL_ONLY", "FALLBACK_ONLY"], group = G_SLTP,
+     tooltip = "Structural TP と Fallback RR TP の成績を切り分けて検証するための採用フィルター。\n" +
+     "BOTH            : 現行動作。Structural TPがあればそれを使い、無ければFallback RR TP。\n" +
+     "STRUCTURAL_ONLY : Structural TPが存在するトレードのみ発注。無い場合はFallbackを作らずNoTrade。\n" +
+     "FALLBACK_ONLY   : Structural TPが存在しなかったシグナルのみFallback RR TPで発注。\n" +
+     "                  (Structural TPを無視してRR TPへ差し替えるのではなく、そのシグナル自体を除外する)\n" +
+     "SL判定 (Active Zone / SL Zone / SL距離) は3モードとも完全共通。")
+slMinScore = input.float(4.0,  "SL Zone · Min Score", step = 0.5, group = G_SLTP)
+slMinStrStr  = input.string("Medium", "SL Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+tpMinScore = input.float(7.0,  "TP Zone · Min Score", step = 0.5, group = G_SLTP)
+tpMinStrStr  = input.string("Strong", "TP Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+obsMinStrStr = input.string("Medium", "Obstacle · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+activeNoTradeMinStrStr = input.string("Medium", "Active Zone NoTrade · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP,
+     tooltip = "Entry価格がこのStrength以上の ACTIVE Zone (現在価格がZone内部) の中に\n" +
+               "ある場合は NO TRADE にする。Structural SL / TP が存在しても、\n" +
+               "Fallback RR TP も使わずエントリーを見送る。Long / Short 共通。")
+fallbackRR = input.float(2.0, "Fallback RR (Structural TPが無い場合のみ使用)", step = 0.1, minval = 0.1, group = G_SLTP,
+     tooltip = "有効なTP Zoneが見つからない場合のみ、Structural SL距離 × この値でTPを作る。")
+
+// ============================================================================
+// 01-3. SIGNAL ENGINE INPUTS  (FVG Logic)
+// ----------------------------------------------------------------------------
+//  変数名 / 初期値 / options / minval / maxval / step / tooltip は
+//  分割前から一切変更していない (配置を移動しただけ)。
+// ============================================================================
+
+// ---- 5.1 Inputs : エントリー / トリガー -----------------------------------
+var string GF_ENT = "03 · FVG · Entry"
+// ※ 方向のON/OFFは Section 01 の共通 enableLong / enableShort、
+//    Logic自体のON/OFFは Section 01 の useFvgLogic を使う (旧 useLong / useShort は廃止)。
+strictEngulf = input.bool(true,  "実体が前足を完全に包む", group = GF_ENT)
+reqOppColor  = input.bool(true,  "前足が反対色であることを要求", group = GF_ENT)
+
+var string GF_TRG = "03 · FVG · Trigger"
+useEngulfingTrigger    = input.bool(false, "包み足", group = GF_TRG)
+usePinbarTrigger       = input.bool(false, "ピンバー", group = GF_TRG)
+useBOSTrigger          = input.bool(false, "BOS / 直近高安更新", group = GF_TRG)
+useEMARejectTrigger    = input.bool(false, "EMAリジェクト", group = GF_TRG)
+useFVGTriggerFormation = input.bool(false, "FVG形成", group = GF_TRG)
+useStrongCandleTrigger = input.bool(false, "強ローソク", group = GF_TRG)
+
+triggerMode     = input.string("Any", "トリガー結合", options = ["Any", "All", "MinCount"], group = GF_TRG)
+minTriggerCount = input.int(1, "最低トリガー数 (MinCount時)", group = GF_TRG)
+
+useLowerTFTrigger = input.bool(true, "1分足トリガーを使う", group = GF_TRG)
+triggerTF         = input.timeframe("1", "トリガー時間足", group = GF_TRG)
+
+emaLenTrigger      = input.int(20,  "EMA Length (EMAリジェクト)", group = GF_TRG)
+useEMARejectSlopeFilter = input.bool(false, "EMAリジェクト 傾きフィルター", group = GF_TRG)
+emaRejectSlopeLookback  = input.int(3, "EMAリジェクト 傾き判定本数", group = GF_TRG)
+emaRejectSlopeMinATR    = input.float(0.12, "EMAリジェクト 最低傾き ATR倍率", group = GF_TRG)
+emaRejectSlopeAtrLen    = input.int(14, "EMAリジェクト 傾きATR期間", group = GF_TRG)
+bosLookback        = input.int(10,  "BOS Lookback", group = GF_TRG)
+pinWickBodyMult    = input.float(3.0, "ピンバー ヒゲ/実体倍率", group = GF_TRG)
+pinOppWickMaxRatio = input.float(2.0, "ピンバー 反対ヒゲ上限", group = GF_TRG)
+usePinBodyRatioFilter = input.bool(false, "ピンバー 実体率フィルター", group = GF_TRG)
+pinMaxBodyRatio       = input.float(0.1, "ピンバー 最大実体率", group = GF_TRG)
+usePinRangeFilter     = input.bool(false, "ピンバー 最低レンジフィルター", group = GF_TRG)
+pinRangeAtrLen        = input.int(14, "ピンバー ATR期間", group = GF_TRG)
+pinMinRangeATR        = input.float(0.10, "ピンバー 最低レンジ ATR倍率", group = GF_TRG)
+strongBodyRatio    = input.float(0.6, "強ローソク 実体率", group = GF_TRG)
+trigCloseEdgeRatio = input.float(0.7, "ピン/強 終値端寄せ比率", group = GF_TRG)
+useEngulfBodyRatioFilter   = input.bool(true, "包み足 包み込み率フィルター", group = GF_TRG)
+engulfBodyRatioMin         = input.float(1.20, "包み足 最低包み込み率", group = GF_TRG)
+useEngulfBodyQualityFilter = input.bool(true, "包み足 実体率フィルター", group = GF_TRG)
+engulfMinBodyRatio         = input.float(0.60, "包み足 最低実体率", group = GF_TRG)
+useEngulfBodyAtrFilter     = input.bool(true, "包み足 最低実体ATRフィルター", group = GF_TRG)
+engulfAtrLen               = input.int(14, "包み足 ATR期間", group = GF_TRG)
+engulfMinBodyATR           = input.float(0.30, "包み足 最低実体 ATR倍率", group = GF_TRG)
+
+useTriggerCooldown        = input.bool(false, "トリガークールダウン", group = GF_TRG)
+triggerCooldownBars       = input.int(3, "クールダウン本数", group = GF_TRG)
+useOppositeTriggerNoTrade = input.bool(true, "逆方向トリガー同時発生はNoTrade", group = GF_TRG)
+
+// ---- 5.2 Inputs : ボラフィルタ --------------------------------------------
+var string GF_VOL = "03 · FVG · Volatility"
+volMode  = input.string("OFF", "通常ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = GF_VOL)
+fixedMin = input.float(1.0, "最低レンジ (価格・固定値)", group = GF_VOL)
+atrLenBase   = input.int(14, "基準ATR本数", group = GF_VOL)
+atrTf        = input.timeframe("", "基準ATR時間足(空=チャート)", group = GF_VOL)
+useMinVol    = input.bool(true,  "低ボラ時はエントリー禁止", group = GF_VOL)
+minAtrDollar = input.float(1.5,  "最低ATR($)", group = GF_VOL)
+volModeRel   = input.bool(false, "低ボラ判定を相対ATRにする", group = GF_VOL)
+volAvgLen    = input.int(480,    "ATR平均本数", group = GF_VOL)
+volRatioMin  = input.float(0.9,  "ATR ÷ ATR平均 最低比", group = GF_VOL)
+fastVolMode  = input.string("固定値", "高速ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = GF_VOL,
+     tooltip = "FVG系列 (FVG / FVG15 / FVGABS5 / FVGABS15) 専用の高速ボラ設定。\n" +
+     "Zone 4Logic は「03 · Zone · 共通設定」の zoneFastVolMode を参照するため、\n" +
+     "ここを変えても Zone側には影響しない。")
+fastAtrLen   = input.int(5,      "fastATR/値幅 参照本数", group = GF_VOL)
+fastAtrMin   = input.float(2.2,  "fastATR最低($) ※ATR時", group = GF_VOL)
+fastFixedMin = input.float(10.0, "直近値幅 最低($) ※固定値時", group = GF_VOL)
+bodyAvgLen   = input.int(5,      "実体平均本数", group = GF_VOL)
+bodyAvgMin   = input.float(0.5,  "実体平均最低($)", group = GF_VOL)
+useRangeRatioFilter = input.bool(true, "fastATR ÷ RangeWidth を使う ※ATR時", group = GF_VOL)
+rangeLookback       = input.int(20,    "RangeWidth参照本数", group = GF_VOL)
+atrRangeRatioMin    = input.float(0.06, "fastATR ÷ RangeWidth 最低比", group = GF_VOL)
+useVolCooldown  = input.bool(false, "低ボラ解除後の待機を使う", group = GF_VOL)
+volRecoveryBars = input.int(2,      "低ボラ解除後の待機本数", group = GF_VOL)
+
+// ---- 5.3 Inputs : 環境フィルタ (EMAトレンド) ------------------------------
+//  ★ この Trend Env は FVG / FVG15 / FVGABS5 / FVGABS15 で共通。
+//    判定は updateFvg() が1度だけ行い、その結果 (FvgSignal.trendOk) を
+//    吸収系列も共有する → 判定の二重実装なし・input重複なし・request追加なし。
+//  ★ reqTrend は Long / Short 共通の「要求する相場環境」。
+//    方向による自動反転は行わない (Short だから下降へ読み替える処理は無い)。
+var string GF_ENV = "03 · FVG · Trend Env"
+useEnvFilter = input.bool(true, "環境フィルタを使う (重い/OFFで軽量)", group = GF_ENV,
+     tooltip = "FVG / FVG15 / FVGABS5 / FVGABS15 に共通で効く。\n" +
+     "OFF にすると 4本すべてで EMA環境フィルターが完全に無効になる。")
+reqTrend4H  = input.string("上昇", "4H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf4", group = GF_ENV)
+tf4H        = input.timeframe("240", "TF", inline = "tf4", group = GF_ENV)
+reqTrend1H  = input.string("上昇", "1H 要求",  options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf1", group = GF_ENV)
+tf1H        = input.timeframe("60",  "TF", inline = "tf1", group = GF_ENV)
+reqTrend15M = input.string("上昇", "15M 要求", options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf15", group = GF_ENV)
+tf15M       = input.timeframe("15",  "TF", inline = "tf15", group = GF_ENV)
+reqTrend5M  = input.string("OFF", "5M 要求",  options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf5", group = GF_ENV)
+tf5M        = input.timeframe("5",   "TF", inline = "tf5", group = GF_ENV)
+reqTrend1M  = input.string("OFF", "1M 要求",  options = ["OFF", "上昇", "レンジ", "下降"], inline = "tf1m", group = GF_ENV)
+tf1M        = input.timeframe("1",   "TF", inline = "tf1m", group = GF_ENV)
+
+useEma20Above50Up   = input.bool(true, "1. EMA20 > EMA50", group = GF_ENV)
+useEma20SlopeUp     = input.bool(true, "2. EMA20 が上向き", group = GF_ENV)
+useEma50SlopeUp     = input.bool(true, "3. EMA50 が上向き", group = GF_ENV)
+useCloseAboveEma50  = input.bool(true, "4. close > EMA50", group = GF_ENV)
+useCloseAboveEma200 = input.bool(true, "5. close > EMA200", group = GF_ENV)
+useEmaDistanceWideU = input.bool(true, "6. EMA20/50 距離が広い", group = GF_ENV)
+useEmaExpansionU    = input.bool(true, "7. EMA20/50 が拡散中", group = GF_ENV)
+
+useEma20Below50Dn   = input.bool(true, "1. EMA20 < EMA50", group = GF_ENV)
+useEma20SlopeDown   = input.bool(true, "2. EMA20 が下向き", group = GF_ENV)
+useEma50SlopeDown   = input.bool(true, "3. EMA50 が下向き", group = GF_ENV)
+useCloseBelowEma50  = input.bool(true, "4. close < EMA50", group = GF_ENV)
+useCloseBelowEma200 = input.bool(true, "5. close < EMA200", group = GF_ENV)
+useEmaDistanceWideD = input.bool(true, "6. EMA20/50 距離が広い", group = GF_ENV)
+useEmaExpansionD    = input.bool(true, "7. EMA20/50 が拡散中", group = GF_ENV)
+
+useEmaDistanceNarrow = input.bool(true, "1. EMA20/50 距離が近い", group = GF_ENV)
+useEma20SlopeWeak    = input.bool(true, "2. EMA20 の傾きが弱い", group = GF_ENV)
+useEma50SlopeWeak    = input.bool(true, "3. EMA50 の傾きが弱い", group = GF_ENV)
+useEmaCompression    = input.bool(true, "4. EMA20/50 が収束中", group = GF_ENV)
+useEma20CrossCount   = input.bool(true, "5. 価格が EMA20 を一定回数跨ぐ", group = GF_ENV)
+useEma50CrossCount   = input.bool(true, "6. 価格が EMA50 を一定回数跨ぐ", group = GF_ENV)
+useRangeWidthSmall   = input.bool(true, "7. 高値安値幅が小さい", group = GF_ENV)
+
+len20        = input.int(20,   "EMA20 length", group = GF_ENV)
+len50        = input.int(50,   "EMA50 length", group = GF_ENV)
+len200       = input.int(200,  "EMA200 length", group = GF_ENV)
+envAtrLen    = input.int(14,   "環境ATR length", group = GF_ENV)
+slopeBars    = input.int(3,    "EMA 傾き判定本数", group = GF_ENV)
+slopeMinMult = input.float(0.15, "EMA 傾きの最低値 ATR倍率", group = GF_ENV)
+distWideMult = input.float(0.50, "EMA20/50 距離 広い判定 ATR倍率", group = GF_ENV)
+distNarrowMult = input.float(0.25, "EMA20/50 距離 近い判定 ATR倍率", group = GF_ENV)
+convDivBars  = input.int(5,    "収束/拡散 判定本数", group = GF_ENV)
+crossBars    = input.int(20,   "EMA跨ぎ回数 判定本数", group = GF_ENV)
+crossMinCount = input.int(3,   "EMA跨ぎ回数 最低回数", group = GF_ENV)
+rangeBars    = input.int(20,   "レンジ幅 判定本数", group = GF_ENV)
+rangeMult    = input.float(1.5, "レンジ幅 ATR倍率", group = GF_ENV)
+
+tieAsRange          = input.bool(true, "同点時にレンジ扱いする", group = GF_ENV)
+insufficientAsRange = input.bool(true, "条件不足時にレンジ扱いする", group = GF_ENV)
+minScore4H  = input.int(3, "4H 最低必要スコア", group = GF_ENV)
+minScore1H  = input.int(3, "1H 最低必要スコア", group = GF_ENV)
+minScore15M = input.int(3, "15M 最低必要スコア", group = GF_ENV)
+minScore5M  = input.int(3, "5M 最低必要スコア", group = GF_ENV)
+minScore1M  = input.int(3, "1M 最低必要スコア", group = GF_ENV)
+reqMatchCount = input.int(0, "必要一致TF数 (0=有効な全TFが一致)", group = GF_ENV)
+
+// ---- 5.4 Inputs : 日足レジーム --------------------------------------------
+var string GF_DR = "03 · FVG · Daily Regime"
+useDailyRegimeFilter = input.bool(true, "日足レジームフィルターを使う", group = GF_DR)
+dailyRegimeMode = input.string("当日進行中ベース", "日足レジーム判定モード", options = ["前日確定ベース", "当日進行中ベース", "当日確定後分析"], group = GF_DR)
+reqDailyDirection  = input.string("OFF", "日足方向", options = ["OFF", "上昇", "レンジ", "下降"], group = GF_DR)
+reqDailyVolatility = input.string("低ボラ", "日足ボラ", options = ["OFF", "高ボラ", "中ボラ", "低ボラ"], group = GF_DR)
+dailyVolMedianLength  = input.int(10, "日足ボラ中央値期間", minval = 3, group = GF_DR)
+dailyLowVolThreshold  = input.float(100.0, "低ボラ上限", group = GF_DR)
+dailyHighVolThreshold = input.float(100.0, "高ボラ下限", group = GF_DR)
+dailyDirectionBodyRatio = input.float(0.40, "日足方向 最低実体率", group = GF_DR)
+dailyBullCloseLocation  = input.float(0.65, "日足上昇 終値位置下限", group = GF_DR)
+dailyBearCloseLocation  = input.float(0.35, "日足下降 終値位置上限", group = GF_DR)
+dailyInsufficientAsRange = input.bool(true, "日足データ不足時はレンジ扱い", group = GF_DR)
+
+// ---- 5.5 Inputs : Accumulation NoTrade ------------------------------------
+var string GF_ACC = "03 · FVG · Accumulation NoTrade"
+useAccumNoTrade = input.bool(true, "Accumulation NoTradeフィルターを使う", group = GF_ACC)
+useAccumNT5M    = input.bool(true, "5分足Accumを使う",  group = GF_ACC)
+useAccumNT15M   = input.bool(true, "15分足Accumを使う", group = GF_ACC)
+accumNTKeep     = input.int(1, "保持するAccum数", minval = 1, maxval = 10, group = GF_ACC)
+accumNT15Tf     = input.timeframe("15", "15分足TF", group = GF_ACC)
+accumNTRangeLen        = input.int(10,   "Accum判定レンジ本数",  minval = 6,  group = GF_ACC)
+accumNTBaseLen         = input.int(20,   "基準平均本数",         minval = 10, group = GF_ACC)
+accumNTAtrLen          = input.int(14,   "ATR本数",             minval = 1,  group = GF_ACC)
+accumNTMinUpperCloses  = input.int(4,    "上半分の最低終値本数",  minval = 1,  group = GF_ACC)
+accumNTMinLowerCloses  = input.int(4,    "下半分の最低終値本数",  minval = 1,  group = GF_ACC)
+accumNTMaxSameColorRun = input.int(4,    "同色連続の上限",       minval = 1,  group = GF_ACC)
+accumNTAtrMult         = input.float(2.5,  "Accum レンジ幅 / ATR 上限",    minval = 0.5,  step = 0.1,  group = GF_ACC)
+accumNTBarRatioMax     = input.float(0.70, "Accum 平均値幅/基準平均 上限", minval = 0.1,  step = 0.01, group = GF_ACC)
+accumNTDriftMax        = input.float(0.30, "Accum ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = GF_ACC)
+useAccumExitConfirm  = input.bool(false, "Accum離脱後の確認を使う", group = GF_ACC)
+accumExitConfirmBars = input.int(2, "Accum離脱後の待機本数", minval = 1, maxval = 20, group = GF_ACC)
+useAccumBreakDirection  = input.bool(true, "Accum離脱方向フィルターを使う", group = GF_ACC)
+accumBreakDirectionBars = input.int(10, "Accum離脱方向の有効本数", minval = 1, maxval = 100, group = GF_ACC)
+
+// ---- 5.6 Inputs : FVG 環境認識 --------------------------------------------
+var string GF_EFVG = "03 · FVG · FVG Env"
+useEFVGEnv = input.bool(true, "FVG環境認識を使う (重い/OFFで軽量)", group = GF_EFVG)
+efvgCombineMode = input.string("TrendAndFVG", "トレンド環境との結合", options = ["TrendOnly", "FVGOnly", "TrendAndFVG", "TrendOrFVG"], group = GF_EFVG)
+useEFVGDaily = input.bool(false, "日足FVGを使う", group = GF_EFVG)
+useEFVG4H    = input.bool(false, "4時間足FVGを使う", group = GF_EFVG)
+useEFVG1H    = input.bool(false, "1時間足FVGを使う", group = GF_EFVG)
+useEFVG15M   = input.bool(false, "15分足FVGを使う", group = GF_EFVG)
+useEFVG5M    = input.bool(true,  "5分足FVGを使う", group = GF_EFVG)
+useEFVG1M    = input.bool(false, "1分足FVGを使う", group = GF_EFVG)
+efvgDailyTF = input.timeframe("D",   "日足TF", group = GF_EFVG)
+efvg4HTF    = input.timeframe("240", "4時間足TF", group = GF_EFVG)
+efvg1HTF    = input.timeframe("60",  "1時間足TF", group = GF_EFVG)
+efvg15MTF   = input.timeframe("15",  "15分足TF", group = GF_EFVG)
+efvg5MTF    = input.timeframe("5",   "5分足TF", group = GF_EFVG)
+efvg1MTF    = input.timeframe("1",   "1分足TF", group = GF_EFVG)
+efvgHoldDaily = input.int(3,  "日足 状態保持本数",  minval = 1, group = GF_EFVG)
+efvgHold4H    = input.int(6,  "4H 状態保持本数",   minval = 1, group = GF_EFVG)
+efvgHold1H    = input.int(12, "1H 状態保持本数",   minval = 1, group = GF_EFVG)
+efvgHold15M   = input.int(24, "15M 状態保持本数",  minval = 1, group = GF_EFVG)
+efvgHold5M    = input.int(30, "5M 状態保持本数",   minval = 1, group = GF_EFVG)
+efvgHold1M    = input.int(40, "1M 状態保持本数",   minval = 1, group = GF_EFVG)
+efvgMinThick        = input.float(0.0,  "FVG最小厚み (幅/ATR)", step = 0.05, group = GF_EFVG)
+reboundDepthMax     = input.float(0.90, "反発 最大侵入率 (FVG内部・幅比率)", minval = 0.0, step = 0.05, group = GF_EFVG)
+reboundRecoverRatio = input.float(0.10, "反発 回復位置 (FVG幅比率)", minval = 0.0, maxval = 1.0, step = 0.05, group = GF_EFVG)
+efvgIntegrationMode = input.string("WeightedScore", "統合方式", options = ["AllAgree", "MatchCount", "WeightedScore", "HTFPriority"], group = GF_EFVG)
+efvgReqMatch  = input.int(3, "必要一致足数 (MatchCount時)", minval = 1, maxval = 6, group = GF_EFVG)
+efvgWeightD   = input.int(6, "重み 日足",  minval = 0, group = GF_EFVG)
+efvgWeight4H  = input.int(5, "重み 4H",   minval = 0, group = GF_EFVG)
+efvgWeight1H  = input.int(4, "重み 1H",   minval = 0, group = GF_EFVG)
+efvgWeight15M = input.int(3, "重み 15M",  minval = 0, group = GF_EFVG)
+efvgWeight5M  = input.int(2, "重み 5M",   minval = 0, group = GF_EFVG)
+efvgWeight1M  = input.int(1, "重み 1M",   minval = 0, group = GF_EFVG)
+efvgScoreThresh = input.int(1, "スコア閾値 (±・WeightedScore時)", minval = 1, group = GF_EFVG)
+efvgMode4Allow  = input.bool(false, "HTF優先時 下位逆行でもエントリー許可", group = GF_EFVG)
+
+var string GF_BOS = "03 · FVG · 構造管理 BOS"
+useFvgBosFilter = input.bool(true, "FVG反発にBOS方向フィルターを使う", group = GF_BOS)
+fvgBosLookback  = input.int(5, "BOS Lookback", minval = 2, group = GF_BOS)
+
+// ---- 3.x FVG15 Logic (15M FVG反発 → 5M BOS 順序確認) -----------------------
+//  この Logic 専用の設定はこの2つだけ。環境認識 / Session / News / ボラ /
+//  Accum / Daily Regime / EMAトレンド は上の共通設定をそのまま共有する。
+//  15M FVG の反発判定パラメータ (efvgMinThick / reboundDepthMax /
+//  reboundRecoverRatio / efvgHold15M / efvg15MTF) も共通のものを使う。
+var string GF_F15 = "03 · FVG15 · 15M FVG → 5M BOS"
+use15mFvgBosOrder  = input.bool(true, "15M FVG反発後の5M BOSを確認する", group = GF_F15,
+     tooltip = "ON: 反発した15M足の開始以降に成立した同方向5M BOSだけを有効とする\n" +
+     "     (反発より前に出ていた古いBOSは使わない)。1反発イベントにつきEntryは1回。\n" +
+     "OFF: 順序確認なし。15M FVG環境が成立していれば入る。")
+bos15mTo5mLookback = input.int(3, "5M BOS Lookback (FVG15専用)", minval = 1, group = GF_F15,
+     tooltip = "既存FVG Logicの BOS Lookback とは完全に別。")
+fvg15Hold = input.int(18, "FVG15 状態保持本数", minval = 1, group = GF_F15,
+     tooltip = "FVG15 Logic が使う15M反発biasの保持本数。\n" +
+     "既存5M FVG Logic の FVG環境認識 (15分足FVGを使う) と FVGABS15 は\n" +
+     "従来どおり「15M 状態保持本数」(efvgHold15M) を使う。")
+
+// ---- 3.y FVG吸収系列 (FVGABS5 / FVGABS15) ----------------------------------
+//  反発系列とは別系列。吸収の定義・品質条件は追加元 FVG Env Signal V と同一。
+//  FVG最小厚み (efvgMinThick) と 状態保持本数 (efvgHold5M / efvgHold15M) は
+//  上の共通設定をそのまま共有する (重複inputを作らない)。
+//  ★ 以下の設定は Long / Short 共通。Short専用の設定は作らない。
+//      Long  : Bearish FVG を上方向へ吸収 (陽線 / 実体率 / 終値High寄せ)
+//              → Bullish BOS
+//      Short : Bullish FVG を下方向へ吸収 (陰線 / 実体率 / 終値Low寄せ)
+//              → Bearish BOS
+var string GF_ABS = "03 · FVGABS · FVG吸収 → BOS (Long / Short 対称)"
+useAbsCandleColor = input.bool(true, "吸収: 方向と同じローソク色を要求", group = GF_ABS)
+useAbsBodyFilter  = input.bool(true, "吸収: 最低実体率を要求", group = GF_ABS)
+useAbsEdgeFilter  = input.bool(true, "吸収: 終値端寄せを要求", group = GF_ABS)
+efvgAbsBodyMin    = input.float(0.50, "吸収 実体最小比率", step = 0.05, group = GF_ABS)
+efvgAbsEdge       = input.float(0.60, "吸収 終値端寄せ比率", step = 0.05, group = GF_ABS)
+absHold5M         = input.int(24, "FVGABS5 状態保持本数", minval = 1, group = GF_ABS,
+     tooltip = "5M吸収bias の保持本数。反発系列の「5M 状態保持本数」(efvgHold5M) とは別。\n" +
+     "15M吸収は既存の efvgHold15M を共有する。どちらも Long / Short 共通。")
+absBos1mLookback  = input.int(10, "1M BOS Lookback (FVGABS5用)", minval = 1, group = GF_ABS,
+     tooltip = "Long は Bullish BOS、Short は Bearish BOS に同じ Lookback を使う。")
+absBos5mLookback  = input.int(3,  "5M BOS Lookback (FVGABS15用)", minval = 1, group = GF_ABS,
+     tooltip = "Long は Bullish BOS、Short は Bearish BOS に同じ Lookback を使う。")
+absVolMin = input.float(0.0,   "日足ボラ中央値 下限 ($ · 以上)", group = GF_ABS,
+     tooltip = "吸収系列の環境条件。前日までの直近N本の確定Daily Range中央値で判定する\n" +
+     "(既存の日足レジーム計算をそのまま再利用。request は増やしていない)。\n" +
+     "Long / Short 共通 (方向に依存しない条件)。")
+absVolMax = input.float(100.0, "日足ボラ中央値 上限 ($ · 未満)", group = GF_ABS)
+
+// ---- 3.z Zone 4-Logic (Rebound / FakeBreak / Break Retest / Break) ----------
+//  ZoneEngine が生成した既存Zoneをそのまま使う。新しいZone判定は作らない。
+//  Zone生成 / Score / Strength / Structural SL / TP のルールは一切変更しない。
+//  ここで管理するのは「Entry側のZoneイベント」だけ。
+var string GZ_COM = "03 · Zone · 共通設定"
+zoneBosMinStrStr = input.string("Medium", "Zone · 対象 最低Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = GZ_COM,
+     tooltip = "このStrength以上のZoneだけをイベント追跡の対象にする (4Logic共通)。")
+zoneBreakTf      = input.timeframe("5", "Zone · Break判定時間足 (Breakのみ)", group = GZ_COM,
+     tooltip = "★ Zoneを「本当にBreakしたか」の確定だけに使う時間足 (既定 5M)。\n" +
+     "  ・Short : 確定5M close < Zone下端 - Break Buffer\n" +
+     "  ・Long  : 確定5M close > Zone上端 + Break Buffer\n" +
+     "ヒゲ抜けも、精密判定時間足 (下の設定) の終値抜けも Break にはならない。\n" +
+     "Zone Break / Break Retest / FakeBreak は、この5M Breakが確定するまで始まらない。\n" +
+     "★ このStrategyはチャート足 = 5分足前提なので、Break判定時間足は\n" +
+     "  チャート足と同じかそれ以上にすること (下位足は想定していない)。")
+zoneBosTf        = input.timeframe("1", "Zone · 精密判定時間足 (Break以外の全て)", group = GZ_COM,
+     tooltip = "Break以外のZone 4Logic判定をすべてこの足で行う (既定 1M)。\n" +
+     "  ・Rebound の接近方向 / 接触 / 離脱 / BOS\n" +
+     "  ・Break Retest の再武装距離 / Zone接触 / 反発確認 (Rejection) / BOS\n" +
+     "  ・FakeBreak の完全Reclaim / BOS\n" +
+     "  ・待機本数 / fakeBreakMaxBars の本数カウント\n" +
+     "★ Break だけは上の「Break判定時間足」で判定する。ここでの終値抜けは\n" +
+     "  Rebound候補のキャンセルにしか使わない (Rebound の挙動は従来どおり)。\n" +
+     "  ・BOS\n" +
+     "  ・待機本数 / fakeBreakMaxBars\n" +
+     "例) 1M判定でBreak → fakeBreakMaxBars = 10 は1分足10本。\n" +
+     "    5M判定なら5分足10本 / 15M判定なら15分足10本。チャート足では数えない。\n" +
+     "既存FVGの triggerTF 等とは共有しない Zone系専用設定。")
+zoneBosLookback = input.int(3, "Zone · BOS Lookback", minval = 1, group = GZ_COM,
+     tooltip = "BOSの定義は既存と同一 (close > ta.highest(high, n)[1] / close < ta.lowest(low, n)[1])。")
+//  Zone系専用 日足ボラ設定。判定方式・境界条件は既存Daily Regimeのボラ判定と同一で、
+//  参照する「設定値」だけをZone系専用にする。日足データ (drMedianRange) は
+//  Section 03 で取得済みのものを共有し、request は増やさない。
+zoneBosReqDailyVolatility    = input.string("中ボラ", "Zone · 日足ボラ", options = ["OFF", "高ボラ", "中ボラ", "低ボラ"], group = GZ_COM,
+     tooltip = "FVG側の「日足ボラ」とは完全に独立。どちらを変えても他方に影響しない。")
+zoneBosDailyLowVolThreshold  = input.float(0.0,  "Zone · 低ボラ上限", group = GZ_COM)
+zoneBosDailyHighVolThreshold = input.float(80.0, "Zone · 高ボラ下限", group = GZ_COM)
+//  Zone系専用 高速ボラ設定。判定式・パラメータ (fastAtrLen / fastAtrMin /
+//  fastFixedMin / bodyAvgLen / bodyAvgMin / useRangeRatioFilter / rangeLookback /
+//  atrRangeRatioMin) は FVG系列と共有し、「モード」だけをZone系専用にする。
+zoneFastVolMode = input.string("OFF", "Zone · 高速ボラ (OFF/ATR/固定値)", options = ["OFF", "ATR", "固定値"], group = GZ_COM,
+     tooltip = "FVG系列の「高速ボラ」とは完全に独立。どちらを変えても他方に影響しない。\n" +
+     "OFF のときは高速ボラ条件で Zone 4Logic のEntryを弾かない。\n" +
+     "対象: Zone Rebound / Zone FakeBreak / Zone Break Retest / Zone Break。")
+zoneBosWaitBars  = input.int(30, "Zone · 待機本数 (精密判定時間足)", minval = 0, group = GZ_COM,
+     tooltip = "精密判定時間足 (既定 1M) の本数で数える待機期限。次の3箇所で使う:\n" +
+     "  ・Rebound : Zone接近から BOS までの有効期限\n" +
+     "  ・Break   : Zone接近から 5M Break確定 までの有効期限\n" +
+     "  ・Retest  : Break後の再武装待ちの期限 / Zone接触してから BOS までの期限\n" +
+     "既定の 1M × 30本 なら約30分。精密判定時間足を変えるとその時間足基準になる。")
+
+var string GZ_BRK = "03 · Zone · Break / FakeBreak / Retest 共通パラメータ"
+zoneBreakBuffer = input.float(3.0, "Break Buffer ($)", minval = 0.0, step = 0.5, group = GZ_BRK,
+     tooltip = "Zone境界を「明確に」抜けたと見なす追加距離。判定は必ず終値:\n" +
+     "  Support   : close < zone.bottom - Buffer  → Downside Break\n" +
+     "  Resistance: close > zone.top    + Buffer  → Upside Break\n" +
+     "ヒゲだけの抜けでは Break にならず、Rebound候補も失効しない。")
+fakeBreakMaxBars = input.int(10, "FakeBreak 有効本数 (精密判定時間足)", minval = 1, group = GZ_BRK,
+     tooltip = "確定5M Break成立から、元Zoneを完全Reclaimして BOS が出るまでの猶予本数。\n" +
+     "★ 起点は「Break判定時間足 (既定 5M) の確定Break」。\n" +
+     "  数えるのは「精密判定時間足 (既定 1M)」の本数。\n" +
+     "  既定 5M Break → 1分足10本 なら、Break確定から10分以内のReclaimまで有効。\n" +
+     "この本数を超えたら FakeBreak候補は破棄する (Retest候補はそのまま生存)。")
+retestMinDistance = input.float(10.0, "Retest 再武装 最低距離 ($)", minval = 0.0, step = 0.5, group = GZ_BRK,
+     tooltip = "Break後、Retestを待つ前に Zone からこれ以上離れる必要がある (終値基準)。")
+retestZoneWidthMultiplier = input.float(0.5, "Retest 再武装 Zone幅倍率", minval = 0.0, step = 0.1, group = GZ_BRK,
+     tooltip = "再武装距離 = max(最低距離, Zone幅 × この倍率)。\n" +
+     "Break直後にZone付近をウロウロしているだけのケースを Retest にしないための条件。")
+zoneBosMinMoveAway = input.float(0.0, "Rebound 最低離脱距離 ($)", minval = 0.0, step = 0.5, group = GZ_BRK,
+     tooltip = "Rebound専用。Zone接近後、この距離ぶんZoneから離れてからでないとBOSを有効にしない。\n" +
+     "  Long  : close >= Support Zoneの上端 + この距離\n" +
+     "  Short : close <= Resistance Zoneの下端 - この距離\n" +
+     "基準は接近価格ではなくZoneの境界。判定は終値のみ。0 で条件OFF。")
+
+
+var string GZ_RBL = "03 · Zone Rebound - Long Environment"
+//  Zone Rebound · Long 環境認識 (4H / 1H / 15M をそれぞれ 上昇 / レンジ / 下降 で許可)
+zrbL4Up = input.bool(true,   "4H    上昇", group = GZ_RBL, inline = "zrbL4")
+zrbL4Rg = input.bool(true, "レンジ",   group = GZ_RBL, inline = "zrbL4")
+zrbL4Dn = input.bool(true, "下降",     group = GZ_RBL, inline = "zrbL4")
+zrbL1Up = input.bool(true,   "1H    上昇", group = GZ_RBL, inline = "zrbL1")
+zrbL1Rg = input.bool(true, "レンジ",   group = GZ_RBL, inline = "zrbL1")
+zrbL1Dn = input.bool(false, "下降",     group = GZ_RBL, inline = "zrbL1")
+zrbLmUp = input.bool(true,   "15M  上昇", group = GZ_RBL, inline = "zrbLm")
+zrbLmRg = input.bool(false, "レンジ",   group = GZ_RBL, inline = "zrbLm")
+zrbLmDn = input.bool(true, "下降",     group = GZ_RBL, inline = "zrbLm")
+zrbLAnd = input.bool(false, "有効な時間足を AND で結合 (OFF = OR)", group = GZ_RBL,
+     tooltip = "有効 = その時間足で 上昇/レンジ/下降 のどれか1つ以上がONの時間足。\n" +
+     "AND : 有効な時間足が全て一致したときだけ許可。\n" +
+     "OR  : 有効な時間足のうち1つでも一致すれば許可。\n" +
+     "同じ時間足で複数状態をONにした場合は、その時間足内では常に OR。\n" +
+     "3状態とも OFF の時間足は判定対象外。4H/1H/15M が全てOFFなら環境フィルターなし。")
+
+var string GZ_RBS = "03 · Zone Rebound - Short Environment"
+//  Zone Rebound · Short 環境認識 (4H / 1H / 15M をそれぞれ 上昇 / レンジ / 下降 で許可)
+zrbS4Up = input.bool(false,   "4H    上昇", group = GZ_RBS, inline = "zrbS4")
+zrbS4Rg = input.bool(false, "レンジ",   group = GZ_RBS, inline = "zrbS4")
+zrbS4Dn = input.bool(true, "下降",     group = GZ_RBS, inline = "zrbS4")
+zrbS1Up = input.bool(false,   "1H    上昇", group = GZ_RBS, inline = "zrbS1")
+zrbS1Rg = input.bool(false, "レンジ",   group = GZ_RBS, inline = "zrbS1")
+zrbS1Dn = input.bool(true, "下降",     group = GZ_RBS, inline = "zrbS1")
+zrbSmUp = input.bool(false,   "15M  上昇", group = GZ_RBS, inline = "zrbSm")
+zrbSmRg = input.bool(false, "レンジ",   group = GZ_RBS, inline = "zrbSm")
+zrbSmDn = input.bool(true, "下降",     group = GZ_RBS, inline = "zrbSm")
+zrbSAnd = input.bool(false, "有効な時間足を AND で結合 (OFF = OR)", group = GZ_RBS,
+     tooltip = "有効 = その時間足で 上昇/レンジ/下降 のどれか1つ以上がONの時間足。\n" +
+     "AND : 有効な時間足が全て一致したときだけ許可。\n" +
+     "OR  : 有効な時間足のうち1つでも一致すれば許可。\n" +
+     "同じ時間足で複数状態をONにした場合は、その時間足内では常に OR。\n" +
+     "3状態とも OFF の時間足は判定対象外。4H/1H/15M が全てOFFなら環境フィルターなし。")
+
+var string GZ_FKL = "03 · Zone FakeBreak - Long Environment"
+//  Zone FakeBreak · Long 環境認識 (4H / 1H / 15M をそれぞれ 上昇 / レンジ / 下降 で許可)
+zfkL4Up = input.bool(true,   "4H    上昇", group = GZ_FKL, inline = "zfkL4")
+zfkL4Rg = input.bool(false, "レンジ",   group = GZ_FKL, inline = "zfkL4")
+zfkL4Dn = input.bool(false, "下降",     group = GZ_FKL, inline = "zfkL4")
+zfkL1Up = input.bool(true,   "1H    上昇", group = GZ_FKL, inline = "zfkL1")
+zfkL1Rg = input.bool(false, "レンジ",   group = GZ_FKL, inline = "zfkL1")
+zfkL1Dn = input.bool(false, "下降",     group = GZ_FKL, inline = "zfkL1")
+zfkLmUp = input.bool(true,   "15M  上昇", group = GZ_FKL, inline = "zfkLm")
+zfkLmRg = input.bool(false, "レンジ",   group = GZ_FKL, inline = "zfkLm")
+zfkLmDn = input.bool(false, "下降",     group = GZ_FKL, inline = "zfkLm")
+zfkLAnd = input.bool(false, "有効な時間足を AND で結合 (OFF = OR)", group = GZ_FKL,
+     tooltip = "有効 = その時間足で 上昇/レンジ/下降 のどれか1つ以上がONの時間足。\n" +
+     "AND : 有効な時間足が全て一致したときだけ許可。\n" +
+     "OR  : 有効な時間足のうち1つでも一致すれば許可。\n" +
+     "同じ時間足で複数状態をONにした場合は、その時間足内では常に OR。\n" +
+     "3状態とも OFF の時間足は判定対象外。4H/1H/15M が全てOFFなら環境フィルターなし。")
+
+var string GZ_FKS = "03 · Zone FakeBreak - Short Environment"
+//  Zone FakeBreak · Short 環境認識 (4H / 1H / 15M をそれぞれ 上昇 / レンジ / 下降 で許可)
+zfkS4Up = input.bool(false,   "4H    上昇", group = GZ_FKS, inline = "zfkS4")
+zfkS4Rg = input.bool(false, "レンジ",   group = GZ_FKS, inline = "zfkS4")
+zfkS4Dn = input.bool(true, "下降",     group = GZ_FKS, inline = "zfkS4")
+zfkS1Up = input.bool(false,   "1H    上昇", group = GZ_FKS, inline = "zfkS1")
+zfkS1Rg = input.bool(false, "レンジ",   group = GZ_FKS, inline = "zfkS1")
+zfkS1Dn = input.bool(true, "下降",     group = GZ_FKS, inline = "zfkS1")
+zfkSmUp = input.bool(false,   "15M  上昇", group = GZ_FKS, inline = "zfkSm")
+zfkSmRg = input.bool(false, "レンジ",   group = GZ_FKS, inline = "zfkSm")
+zfkSmDn = input.bool(true, "下降",     group = GZ_FKS, inline = "zfkSm")
+zfkSAnd = input.bool(false, "有効な時間足を AND で結合 (OFF = OR)", group = GZ_FKS,
+     tooltip = "有効 = その時間足で 上昇/レンジ/下降 のどれか1つ以上がONの時間足。\n" +
+     "AND : 有効な時間足が全て一致したときだけ許可。\n" +
+     "OR  : 有効な時間足のうち1つでも一致すれば許可。\n" +
+     "同じ時間足で複数状態をONにした場合は、その時間足内では常に OR。\n" +
+     "3状態とも OFF の時間足は判定対象外。4H/1H/15M が全てOFFなら環境フィルターなし。")
+
+var string GZ_RTL = "03 · Zone Break Retest - Long Environment"
+//  Zone Break Retest · Long 環境認識 (4H / 1H / 15M をそれぞれ 上昇 / レンジ / 下降 で許可)
+zrtL4Up = input.bool(true,   "4H    上昇", group = GZ_RTL, inline = "zrtL4")
+zrtL4Rg = input.bool(false, "レンジ",   group = GZ_RTL, inline = "zrtL4")
+zrtL4Dn = input.bool(false, "下降",     group = GZ_RTL, inline = "zrtL4")
+zrtL1Up = input.bool(true,   "1H    上昇", group = GZ_RTL, inline = "zrtL1")
+zrtL1Rg = input.bool(false, "レンジ",   group = GZ_RTL, inline = "zrtL1")
+zrtL1Dn = input.bool(false, "下降",     group = GZ_RTL, inline = "zrtL1")
+zrtLmUp = input.bool(true,   "15M  上昇", group = GZ_RTL, inline = "zrtLm")
+zrtLmRg = input.bool(false, "レンジ",   group = GZ_RTL, inline = "zrtLm")
+zrtLmDn = input.bool(false, "下降",     group = GZ_RTL, inline = "zrtLm")
+zrtLAnd = input.bool(false, "有効な時間足を AND で結合 (OFF = OR)", group = GZ_RTL,
+     tooltip = "有効 = その時間足で 上昇/レンジ/下降 のどれか1つ以上がONの時間足。\n" +
+     "AND : 有効な時間足が全て一致したときだけ許可。\n" +
+     "OR  : 有効な時間足のうち1つでも一致すれば許可。\n" +
+     "同じ時間足で複数状態をONにした場合は、その時間足内では常に OR。\n" +
+     "3状態とも OFF の時間足は判定対象外。4H/1H/15M が全てOFFなら環境フィルターなし。")
+
+var string GZ_RTS = "03 · Zone Break Retest - Short Environment"
+//  Zone Break Retest · Short 環境認識 (4H / 1H / 15M をそれぞれ 上昇 / レンジ / 下降 で許可)
+zrtS4Up = input.bool(false,   "4H    上昇", group = GZ_RTS, inline = "zrtS4")
+zrtS4Rg = input.bool(false, "レンジ",   group = GZ_RTS, inline = "zrtS4")
+zrtS4Dn = input.bool(true, "下降",     group = GZ_RTS, inline = "zrtS4")
+zrtS1Up = input.bool(false,   "1H    上昇", group = GZ_RTS, inline = "zrtS1")
+zrtS1Rg = input.bool(false, "レンジ",   group = GZ_RTS, inline = "zrtS1")
+zrtS1Dn = input.bool(true, "下降",     group = GZ_RTS, inline = "zrtS1")
+zrtSmUp = input.bool(false,   "15M  上昇", group = GZ_RTS, inline = "zrtSm")
+zrtSmRg = input.bool(false, "レンジ",   group = GZ_RTS, inline = "zrtSm")
+zrtSmDn = input.bool(true, "下降",     group = GZ_RTS, inline = "zrtSm")
+zrtSAnd = input.bool(false, "有効な時間足を AND で結合 (OFF = OR)", group = GZ_RTS,
+     tooltip = "有効 = その時間足で 上昇/レンジ/下降 のどれか1つ以上がONの時間足。\n" +
+     "AND : 有効な時間足が全て一致したときだけ許可。\n" +
+     "OR  : 有効な時間足のうち1つでも一致すれば許可。\n" +
+     "同じ時間足で複数状態をONにした場合は、その時間足内では常に OR。\n" +
+     "3状態とも OFF の時間足は判定対象外。4H/1H/15M が全てOFFなら環境フィルターなし。")
+
+var string GZ_BKL = "03 · Zone Break - Long Environment"
+//  Zone Break · Long 環境認識 (4H / 1H / 15M をそれぞれ 上昇 / レンジ / 下降 で許可)
+zbkL4Up = input.bool(true,   "4H    上昇", group = GZ_BKL, inline = "zbkL4")
+zbkL4Rg = input.bool(false, "レンジ",   group = GZ_BKL, inline = "zbkL4")
+zbkL4Dn = input.bool(false, "下降",     group = GZ_BKL, inline = "zbkL4")
+zbkL1Up = input.bool(true,   "1H    上昇", group = GZ_BKL, inline = "zbkL1")
+zbkL1Rg = input.bool(false, "レンジ",   group = GZ_BKL, inline = "zbkL1")
+zbkL1Dn = input.bool(false, "下降",     group = GZ_BKL, inline = "zbkL1")
+zbkLmUp = input.bool(true,   "15M  上昇", group = GZ_BKL, inline = "zbkLm")
+zbkLmRg = input.bool(false, "レンジ",   group = GZ_BKL, inline = "zbkLm")
+zbkLmDn = input.bool(false, "下降",     group = GZ_BKL, inline = "zbkLm")
+zbkLAnd = input.bool(false, "有効な時間足を AND で結合 (OFF = OR)", group = GZ_BKL,
+     tooltip = "有効 = その時間足で 上昇/レンジ/下降 のどれか1つ以上がONの時間足。\n" +
+     "AND : 有効な時間足が全て一致したときだけ許可。\n" +
+     "OR  : 有効な時間足のうち1つでも一致すれば許可。\n" +
+     "同じ時間足で複数状態をONにした場合は、その時間足内では常に OR。\n" +
+     "3状態とも OFF の時間足は判定対象外。4H/1H/15M が全てOFFなら環境フィルターなし。")
+
+var string GZ_BKS = "03 · Zone Break - Short Environment"
+//  Zone Break · Short 環境認識 (4H / 1H / 15M をそれぞれ 上昇 / レンジ / 下降 で許可)
+zbkS4Up = input.bool(false,   "4H    上昇", group = GZ_BKS, inline = "zbkS4")
+zbkS4Rg = input.bool(false, "レンジ",   group = GZ_BKS, inline = "zbkS4")
+zbkS4Dn = input.bool(true, "下降",     group = GZ_BKS, inline = "zbkS4")
+zbkS1Up = input.bool(false,   "1H    上昇", group = GZ_BKS, inline = "zbkS1")
+zbkS1Rg = input.bool(false, "レンジ",   group = GZ_BKS, inline = "zbkS1")
+zbkS1Dn = input.bool(true, "下降",     group = GZ_BKS, inline = "zbkS1")
+zbkSmUp = input.bool(false,   "15M  上昇", group = GZ_BKS, inline = "zbkSm")
+zbkSmRg = input.bool(false, "レンジ",   group = GZ_BKS, inline = "zbkSm")
+zbkSmDn = input.bool(true, "下降",     group = GZ_BKS, inline = "zbkSm")
+zbkSAnd = input.bool(false, "有効な時間足を AND で結合 (OFF = OR)", group = GZ_BKS,
+     tooltip = "有効 = その時間足で 上昇/レンジ/下降 のどれか1つ以上がONの時間足。\n" +
+     "AND : 有効な時間足が全て一致したときだけ許可。\n" +
+     "OR  : 有効な時間足のうち1つでも一致すれば許可。\n" +
+     "同じ時間足で複数状態をONにした場合は、その時間足内では常に OR。\n" +
+     "3状態とも OFF の時間足は判定対象外。4H/1H/15M が全てOFFなら環境フィルターなし。")
+
+// ============================================================================
+// 01-5. DISPLAY / DEBUG INPUTS
+// ============================================================================
+var string G_DBGC = "05 · Debug · Trade"
+showEntryLabel = input.bool(true, "Entry Debug Label を表示", group = G_DBGC)
+showTradeDebug = input.bool(true, "Trade Debug 行 (最新TradePlan) を表示", group = G_DBGC)
+// ---- 2.11 Zone Display -----------------------------------------------------
+var string G_DISP = "05 · Display · Zone"
+showZones     = input.bool(true,  "Show Zones (box)",          group = G_DISP)
+showMaLines   = input.bool(true,  "Plot MA Source Lines",      group = G_DISP)
+showLabels    = input.bool(true,  "Show Zone Labels",          group = G_DISP)
+showDetailLbl = input.bool(false, "Detailed Labels (sources)", group = G_DISP)
+maxZonesDraw  = input.int(30, "Max Zones Drawn", minval = 1, maxval = 120, group = G_DISP)
+zoneLeftBars  = input.int(150, "Zone Box · Left Extension (bars)",  minval = 1, group = G_DISP)
+zoneRightBars = input.int(30,  "Zone Box · Right Extension (bars)", minval = 1, group = G_DISP)
+colSupport    = input.color(color.new(#26A69A, 0), "Color · Support",    group = G_DISP)
+colResistance = input.color(color.new(#EF5350, 0), "Color · Resistance", group = G_DISP)
+colActive     = input.color(color.new(#FFB300, 0), "Color · Active",     group = G_DISP)
+colBroken     = input.color(color.new(#78909C, 0), "Color · Broken",     group = G_DISP)
+trWeak        = input.int(90, "Transparency · Weak",        minval = 0, maxval = 100, group = G_DISP)
+trMedium      = input.int(80, "Transparency · Medium",      minval = 0, maxval = 100, group = G_DISP)
+trStrong      = input.int(68, "Transparency · Strong",      minval = 0, maxval = 100, group = G_DISP)
+trVStrong     = input.int(55, "Transparency · Very Strong", minval = 0, maxval = 100, group = G_DISP)
+
+var string G_DBG = "05 · Debug · Zone"
+showDebugTable = input.bool(true, "Show Zone Debug Table", group = G_DBG)
+dbgPosStr      = input.string("Top Right", "Debug Table Position",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group = G_DBG)
+dbgNearestN    = input.int(3, "Nearest Zones per Side", minval = 1, maxval = 5, group = G_DBG)
+dbgTextSize    = input.string("Small", "Debug Table Text Size", options = ["Tiny", "Small", "Normal"], group = G_DBG)
+showDailyVolDebug = input.bool(true, "日足ボラ中央値デバッグ表示", group = GF_DR)
+efvgShowTable = input.bool(true,  "FVG環境テーブルを表示", group = GF_EFVG)
+efvgShowDebug = input.bool(false, "デバッグ(スコア/状態)を表示", group = GF_EFVG)
+showFvgBosDebug = input.bool(false, "FVG構造BOS デバッグ表示", group = GF_BOS)
+// ============================================================================
+// 02. ENGINE INITIALIZATION
+// ----------------------------------------------------------------------------
+//  Engine (永続状態) を var で1つずつ持ち、Config に Section 01 の input を詰める。
+//  Library 側は input を持てないため、UI定義 (01) と Config代入 (02) を分離している。
+//  Logicを増やす場合は、そのLogicの Engine と Cfg をここに1組追加する
+//  (Cooldown / Armed 等の状態は Engine ごとに完全独立)。
+// ============================================================================
+
+// ---- 2.1 Engines -----------------------------------------------------------
+var zn.ZoneEngine zoneEng = zn.newEngine()
+var sg.FvgEngine  fvgEng  = sg.newFvgEngine()
+// FVG15 Logic 用。Engineは既存 fvgEng とは別インスタンスなので、
+// Armed / Cooldown / Accum / Daily の状態は既存5M Logicと一切混ざらない。
+var sg.FvgEngine   fvg15Eng = sg.newFvgEngine()
+var sg.Fvg15Engine fvg15Ord = sg.newFvg15Engine()
+// FVG吸収系列 用。反発系列 (fvgEng / fvg15Eng / fvg15Ord) とstateを共有しない。
+var sg.FvgAbsEngine fvgAbsEng = sg.newFvgAbsEngine()
+// Zone 4系列 用。FVG系列のEngineとstateを共有しない。
+//  4Logicは同じZoneイベント列を共有するが、消費フラグ (reboundDone / breakDone /
+//  fakeDone / retestDone) はイベント内でLogicごとに独立している。
+var sg.ZoneEvtEngine zoneEvtEng = sg.newZoneEvtEngine()
+
+// ---- 2.2 Zone Engine Config -----------------------------------------------
+zn.ZoneCfg zoneCfg = zn.newCfg()
+zoneCfg.zoneHalfWidth        := zoneHalfWidth
+zoneCfg.useMaSource          := useMaSource
+zoneCfg.maTfName             := maTf
+zoneCfg.ma1Len               := ma1Len
+zoneCfg.ma2Len               := ma2Len
+zoneCfg.scoreMa1             := scoreMa1
+zoneCfg.scoreMa2             := scoreMa2
+zoneCfg.slopeThrMod          := slopeThrMod
+zoneCfg.slopeThrStrong       := slopeThrStrong
+zoneCfg.slopeBonusFlat       := slopeBonusFlat
+zoneCfg.slopeBonusMod        := slopeBonusMod
+zoneCfg.slopeBonusStr        := slopeBonusStr
+zoneCfg.slopeBonusMax        := slopeBonusMode == "Max"
+zoneCfg.maClusterDist        := maClusterDist
+zoneCfg.maClusterBonus       := maClusterBonus
+zoneCfg.maClusterDirBonus    := maClusterDirBonus
+zoneCfg.useHzSource          := useHzSource
+zoneCfg.hzTf1                := hzTf1
+zoneCfg.hzTf2                := hzTf2
+zoneCfg.hzTf3                := hzTf3
+zoneCfg.scoreHz1             := scoreHz1
+zoneCfg.scoreHz2             := scoreHz2
+zoneCfg.scoreHz3             := scoreHz3
+zoneCfg.reactionDist         := reactionDist
+zoneCfg.reactionBonus1       := reactionBonus1
+zoneCfg.reactionBonus2       := reactionBonus2
+zoneCfg.reactionBonus3       := reactionBonus3
+zoneCfg.reactionRearmDist    := reactionRearmDist
+zoneCfg.reactionAllSrc       := reactionAllSrc
+zoneCfg.useDayHL             := useDayHL
+zoneCfg.scoreDayHL           := scoreDayHL
+zoneCfg.carryPrevDayHL       := carryPrevDayHL
+zoneCfg.scorePrevDayHL       := scorePrevDayHL
+zoneCfg.lifePrevDayHL        := lifePrevDayHL
+zoneCfg.useAccSource         := useAccSource
+zoneCfg.accTf1               := accTf1
+zoneCfg.accTf2               := accTf2
+zoneCfg.accTf3               := accTf3
+zoneCfg.scoreAcc1            := scoreAcc1
+zoneCfg.scoreAcc2            := scoreAcc2
+zoneCfg.scoreAcc3            := scoreAcc3
+zoneCfg.accKeep1             := accKeep1
+zoneCfg.accKeep2             := accKeep2
+zoneCfg.accKeep3             := accKeep3
+zoneCfg.clusterDist          := clusterDist
+zoneCfg.thrMedium            := thrMedium
+zoneCfg.thrStrong            := thrStrong
+zoneCfg.thrVStrong           := thrVStrong
+zoneCfg.confBonus2           := confBonus2
+zoneCfg.confBonus3           := confBonus3
+zoneCfg.confBonus4           := confBonus4
+zoneCfg.flipBonus            := flipBonus
+zoneCfg.requireHtfForVStrong := requireHtfForVStrong
+zoneCfg.htfSwing1H           := htfSwing1H
+zoneCfg.htfAccum1H           := htfAccum1H
+zoneCfg.htfAccum4H           := htfAccum4H
+zoneCfg.htfAccumD            := htfAccumD
+zoneCfg.htfSwing15M          := htfSwing15M
+zoneCfg.htfMa1               := htfMa1
+zoneCfg.htfMa2               := htfMa2
+zoneCfg.htfDayHL             := htfDayHL
+zoneCfg.breakBuffer          := breakBuffer
+zoneCfg.flipConfirmDist      := flipConfirmDist
+zoneCfg.resetOnReclaim       := resetOnReclaim
+zoneCfg.trackStaleBars       := trackStaleBars
+zoneCfg.trackContinuity      := trackContinuity
+zoneCfg.lifeHz1              := lifeHz1
+zoneCfg.lifeHz2              := lifeHz2
+zoneCfg.lifeHz3              := lifeHz3
+zoneCfg.lifeExtendOn         := lifeExtendOn
+zoneCfg.lifeExtendRatio      := lifeExtendRatio
+zoneCfg.maxPersistZones      := maxPersistZones
+zoneCfg.slBuffer             := slBuffer
+zoneCfg.tpBuffer             := tpBuffer
+zoneCfg.maxSlDist            := maxSlDist
+zoneCfg.minStructRR          := minStructRR
+zoneCfg.slMinScore           := slMinScore
+zoneCfg.slMinStrength        := zn.strengthIdx(slMinStrStr)
+zoneCfg.tpMinScore           := tpMinScore
+zoneCfg.tpMinStrength        := zn.strengthIdx(tpMinStrStr)
+zoneCfg.obsMinStrength       := zn.strengthIdx(obsMinStrStr)
+zoneCfg.activeNoTradeMinStrength := zn.strengthIdx(activeNoTradeMinStrStr)
+zoneCfg.fallbackRR           := fallbackRR
+// ---- 2.3 Signal Engine Config (FVG) ---------------------------------------
+//  ★ Config を「どのコンテキストで評価されるか」で4つに分けている ★
+//    Pine の external elements 上限は 1つの request.security 式あたり 254 個。
+//    security 式へ渡したUDTは、その構築に使った input 全てが外部要素として
+//    数えられるため、127フィールドの単一Cfgを渡すと超過する
+//    (127 input + 127 代入 + 期間引数 ≒ 257 → コンパイルエラー)。
+//    そこで security で評価される関数が実際に参照する設定だけを小さなUDTへ分けた。
+//      FvgTrigCfg (26) … calcTriggers  → 1分足コンテキスト
+//      FvgEnvCfg  (28) … envTrend      → 各TFコンテキスト
+//      FvgAccCfg  ( 6) … accumNTDetect → 15分足コンテキスト
+//      FvgCfg     (67) … updateFvg のみ (チャート足) = 上限と無関係
+//    小さい3つは .new() の名前付き引数で一気に構築する
+//    (中間代入を作らないぶん依存チェーンが短くなる)。
+//    ※ Logicを追加するときも同じ方針にすること。security へ渡すUDTは
+//      「そのsecurity関数が実際に読むフィールドだけ」に限定する。
+
+// calcTriggers (1分足) が参照する設定
+sg.FvgTrigCfg fvgTrigCfg = sg.FvgTrigCfg.new(
+     strictEngulf = strictEngulf,
+     reqOppColor = reqOppColor,
+     useEngulfingTrigger = useEngulfingTrigger,
+     usePinbarTrigger = usePinbarTrigger,
+     useBOSTrigger = useBOSTrigger,
+     useEMARejectTrigger = useEMARejectTrigger,
+     useFVGTriggerFormation = useFVGTriggerFormation,
+     useStrongCandleTrigger = useStrongCandleTrigger,
+     triggerMode = triggerMode,
+     minTriggerCount = minTriggerCount,
+     useEMARejectSlopeFilter = useEMARejectSlopeFilter,
+     emaRejectSlopeMinATR = emaRejectSlopeMinATR,
+     pinWickBodyMult = pinWickBodyMult,
+     pinOppWickMaxRatio = pinOppWickMaxRatio,
+     usePinBodyRatioFilter = usePinBodyRatioFilter,
+     pinMaxBodyRatio = pinMaxBodyRatio,
+     usePinRangeFilter = usePinRangeFilter,
+     pinMinRangeATR = pinMinRangeATR,
+     strongBodyRatio = strongBodyRatio,
+     trigCloseEdgeRatio = trigCloseEdgeRatio,
+     useEngulfBodyRatioFilter = useEngulfBodyRatioFilter,
+     engulfBodyRatioMin = engulfBodyRatioMin,
+     useEngulfBodyQualityFilter = useEngulfBodyQualityFilter,
+     engulfMinBodyRatio = engulfMinBodyRatio,
+     useEngulfBodyAtrFilter = useEngulfBodyAtrFilter,
+     engulfMinBodyATR = engulfMinBodyATR)
+
+// envTrend (各TF) が参照する設定
+sg.FvgEnvCfg fvgEnvCfg = sg.FvgEnvCfg.new(
+     useEma20Above50Up = useEma20Above50Up,
+     useEma20SlopeUp = useEma20SlopeUp,
+     useEma50SlopeUp = useEma50SlopeUp,
+     useCloseAboveEma50 = useCloseAboveEma50,
+     useCloseAboveEma200 = useCloseAboveEma200,
+     useEmaDistanceWideU = useEmaDistanceWideU,
+     useEmaExpansionU = useEmaExpansionU,
+     useEma20Below50Dn = useEma20Below50Dn,
+     useEma20SlopeDown = useEma20SlopeDown,
+     useEma50SlopeDown = useEma50SlopeDown,
+     useCloseBelowEma50 = useCloseBelowEma50,
+     useCloseBelowEma200 = useCloseBelowEma200,
+     useEmaDistanceWideD = useEmaDistanceWideD,
+     useEmaExpansionD = useEmaExpansionD,
+     useEmaDistanceNarrow = useEmaDistanceNarrow,
+     useEma20SlopeWeak = useEma20SlopeWeak,
+     useEma50SlopeWeak = useEma50SlopeWeak,
+     useEmaCompression = useEmaCompression,
+     useEma20CrossCount = useEma20CrossCount,
+     useEma50CrossCount = useEma50CrossCount,
+     useRangeWidthSmall = useRangeWidthSmall,
+     slopeMinMult = slopeMinMult,
+     distWideMult = distWideMult,
+     distNarrowMult = distNarrowMult,
+     crossMinCount = crossMinCount,
+     rangeMult = rangeMult,
+     tieAsRange = tieAsRange,
+     insufficientAsRange = insufficientAsRange)
+
+// accumNTDetect (15分足) が参照する設定
+sg.FvgAccCfg fvgAccCfg = sg.FvgAccCfg.new(
+     accumNTMinUpperCloses = accumNTMinUpperCloses,
+     accumNTMinLowerCloses = accumNTMinLowerCloses,
+     accumNTMaxSameColorRun = accumNTMaxSameColorRun,
+     accumNTAtrMult = accumNTAtrMult,
+     accumNTBarRatioMax = accumNTBarRatioMax,
+     accumNTDriftMax = accumNTDriftMax)
+
+// updateFvg (チャート足) でのみ使う残りの設定
+sg.FvgCfg fvgCfg = sg.newFvgCfg()
+fvgCfg.useLowerTFTrigger          := useLowerTFTrigger
+fvgCfg.useTriggerCooldown         := useTriggerCooldown
+fvgCfg.triggerCooldownBars        := triggerCooldownBars
+fvgCfg.useOppositeTriggerNoTrade  := useOppositeTriggerNoTrade
+fvgCfg.volMode                    := volMode
+fvgCfg.fixedMin                   := fixedMin
+fvgCfg.useMinVol                  := useMinVol
+fvgCfg.minAtrDollar               := minAtrDollar
+fvgCfg.volModeRel                 := volModeRel
+fvgCfg.volRatioMin                := volRatioMin
+fvgCfg.fastVolMode                := fastVolMode
+fvgCfg.fastAtrMin                 := fastAtrMin
+fvgCfg.fastFixedMin               := fastFixedMin
+fvgCfg.bodyAvgMin                 := bodyAvgMin
+fvgCfg.useRangeRatioFilter        := useRangeRatioFilter
+fvgCfg.atrRangeRatioMin           := atrRangeRatioMin
+fvgCfg.useVolCooldown             := useVolCooldown
+fvgCfg.volRecoveryBars            := volRecoveryBars
+fvgCfg.useEnvFilter               := useEnvFilter
+fvgCfg.reqTrend4H                 := reqTrend4H
+fvgCfg.reqTrend1H                 := reqTrend1H
+fvgCfg.reqTrend15M                := reqTrend15M
+fvgCfg.reqTrend5M                 := reqTrend5M
+fvgCfg.reqTrend1M                 := reqTrend1M
+fvgCfg.minScore4H                 := minScore4H
+fvgCfg.minScore1H                 := minScore1H
+fvgCfg.minScore15M                := minScore15M
+fvgCfg.minScore5M                 := minScore5M
+fvgCfg.minScore1M                 := minScore1M
+fvgCfg.reqMatchCount              := reqMatchCount
+fvgCfg.useDailyRegimeFilter       := useDailyRegimeFilter
+fvgCfg.dailyRegimeMode            := dailyRegimeMode
+fvgCfg.reqDailyDirection          := reqDailyDirection
+fvgCfg.reqDailyVolatility         := reqDailyVolatility
+fvgCfg.dailyLowVolThreshold       := dailyLowVolThreshold
+fvgCfg.dailyHighVolThreshold      := dailyHighVolThreshold
+fvgCfg.dailyDirectionBodyRatio    := dailyDirectionBodyRatio
+fvgCfg.dailyBullCloseLocation     := dailyBullCloseLocation
+fvgCfg.dailyBearCloseLocation     := dailyBearCloseLocation
+fvgCfg.dailyInsufficientAsRange   := dailyInsufficientAsRange
+fvgCfg.useAccumNoTrade            := useAccumNoTrade
+fvgCfg.useAccumNT5M               := useAccumNT5M
+fvgCfg.useAccumNT15M              := useAccumNT15M
+fvgCfg.accumNTKeep                := accumNTKeep
+fvgCfg.useAccumExitConfirm        := useAccumExitConfirm
+fvgCfg.accumExitConfirmBars       := accumExitConfirmBars
+fvgCfg.useAccumBreakDirection     := useAccumBreakDirection
+fvgCfg.accumBreakDirectionBars    := accumBreakDirectionBars
+fvgCfg.useEFVGEnv                 := useEFVGEnv
+fvgCfg.efvgCombineMode            := efvgCombineMode
+fvgCfg.useEFVGDaily               := useEFVGDaily
+fvgCfg.useEFVG4H                  := useEFVG4H
+fvgCfg.useEFVG1H                  := useEFVG1H
+fvgCfg.useEFVG15M                 := useEFVG15M
+fvgCfg.useEFVG5M                  := useEFVG5M
+fvgCfg.useEFVG1M                  := useEFVG1M
+fvgCfg.efvgIntegrationMode        := efvgIntegrationMode
+fvgCfg.efvgReqMatch               := efvgReqMatch
+fvgCfg.efvgWeightD                := efvgWeightD
+fvgCfg.efvgWeight4H               := efvgWeight4H
+fvgCfg.efvgWeight1H               := efvgWeight1H
+fvgCfg.efvgWeight15M              := efvgWeight15M
+fvgCfg.efvgWeight5M               := efvgWeight5M
+fvgCfg.efvgWeight1M               := efvgWeight1M
+fvgCfg.efvgScoreThresh            := efvgScoreThresh
+fvgCfg.efvgMode4Allow             := efvgMode4Allow
+fvgCfg.useFvgBosFilter            := useFvgBosFilter
+
+// ---- 2.4 Signal Engine Config (FVG15 Logic) --------------------------------
+//  ★ 既存 fvgCfg は一切書き換えない。copy() して FVG環境認識のTFだけ差し替える。
+//    追加元 Strategy の現在ONの設定 (15M FVG のみ ON / 他のTFは OFF) を再現する。
+//    Session / News / ボラ / Accum / Daily Regime / EMAトレンド環境 /
+//    統合方式 (WeightedScore) / 結合 (TrendAndFVG) は共通設定をそのまま継承。
+//  ★ useFvgBosFilter は false にして、既存 updateFvg 内の 15M BOSラッチを
+//    素通し (= 生の15M反発bias) にする。順序確認は updateFvg15 が別に行う。
+sg.FvgCfg fvg15Cfg = fvgCfg.copy()
+fvg15Cfg.useEFVGEnv      := true
+fvg15Cfg.useEFVGDaily    := false
+fvg15Cfg.useEFVG4H       := false
+fvg15Cfg.useEFVG1H       := false
+fvg15Cfg.useEFVG15M      := true
+fvg15Cfg.useEFVG5M       := false
+fvg15Cfg.useEFVG1M       := false
+fvg15Cfg.useFvgBosFilter := false
+
+// ============================================================================
+// 03. EXTERNAL DATA FEED
+// ----------------------------------------------------------------------------
+//  Library は request.*() を呼べないため、外部足の取得はすべてここで行う。
+//  取得した値は ZoneFeed / FvgFeed に詰めて各Engineへ渡す。
+//
+//  ★ request.* の本数 (分割前と同数。Library化で重複は増えていない) ★
+//    Zone   : MA×1 / Swing×3 / Accum×3 / Break×1                  = 8
+//    Signal : 1分足Trigger×1 / baseATR×1 / 環境×5 / FVG環境×最大6 /
+//             日足×2 / Accum15M×1                                  = 最大16
+//    合計 最大24。各呼び出しは (TF, 式) の組が全て異なるため共有できるものは無い。
+//    Logicを増やす場合も、同じ (TF, 式) が既にあれば必ず再利用すること。
+// ============================================================================
+
+// ---- 3.1 共通フィルタ (Global Filter) -------------------------------------
+//  Session / News は Main で判定し、必要とする Logic にだけ Feed で渡す。
+//  「共通で計算する」だけであり、全Logicに自動適用はしない
+//  (Logic Local Filter として使うかどうかは各Logicの自由)。
+int  jstHour   = hour(time, "Asia/Tokyo")
+bool inAsia    = jstHour >= 9  and jstHour < 16
+bool inEU      = jstHour >= 16 and jstHour < 21
+bool inNY      = jstHour >= 21 or  jstHour < 3
+bool sessionOk =
+     not useSessionFilter or
+     (useAsiaSession and inAsia) or
+     (useEUSession   and inEU) or
+     (useNYSession   and inNY)
+
+bool inNewsSession1 = not na(time(timeframe.period, newsSession1, "Asia/Tokyo"))
+bool inNewsSession2 = not na(time(timeframe.period, newsSession2, "Asia/Tokyo"))
+bool inNewsSession3 = not na(time(timeframe.period, newsSession3, "Asia/Tokyo"))
+bool inNewsTime = inNewsSession1 or inNewsSession2 or inNewsSession3
+bool allowByNewsTime = not useNewsTimeFilter or not inNewsTime
+
+// ---- 3.2 Zone Engine Feed --------------------------------------------------
+// ★ MA2000 / MA3000 : zn.maPack() を 1分足コンテキストで評価させる。
+//   maPack() の中身は ta.ema(close, 2000) 等であり、この close は1分足のclose。
+//   → 5分足closeからの再計算ではない。
+//  ★ Source が OFF のときは取得自体を行わない (結果不変・下の理由による) ★
+//    Library 側は MA / Swing / Accum のどれも
+//      「c.useXxxSource が true」かつ「値が na でない」
+//    ときにしか Zone を登録しない。OFF のとき取得値は元々一切使われていないため、
+//    na を渡すのと実測値を渡すのは Zone 時系列に対して完全に等価。
+//    エッジ検出 (nPh1 / nAc1 等) も not na(...) を要求するので false のまま。
+float ma1Val   = na
+float ma1Delta = na
+float ma2Val   = na
+float ma2Delta = na
+if useMaSource
+    [_m1, _m1d, _m2, _m2d] = request.security(syminfo.tickerid, maTf,
+         zn.maPack(maType, ma1Len, ma2Len, slopeLookback), lookahead = barmerge.lookahead_off)
+    ma1Val   := _m1
+    ma1Delta := _m1d
+    ma2Val   := _m2
+    ma2Delta := _m2d
+
+float ph1 = na
+int   ph1T = na
+float pl1 = na
+int   pl1T = na
+float ph2 = na
+int   ph2T = na
+float pl2 = na
+int   pl2T = na
+float ph3 = na
+int   ph3T = na
+float pl3 = na
+int   pl3T = na
+if useHzSource
+    [_h1, _h1t, _l1, _l1t] = request.security(syminfo.tickerid, hzTf1, zn.pivotPack(pivLen1), lookahead = barmerge.lookahead_off)
+    [_h2, _h2t, _l2, _l2t] = request.security(syminfo.tickerid, hzTf2, zn.pivotPack(pivLen2), lookahead = barmerge.lookahead_off)
+    [_h3, _h3t, _l3, _l3t] = request.security(syminfo.tickerid, hzTf3, zn.pivotPack(pivLen3), lookahead = barmerge.lookahead_off)
+    ph1 := _h1
+    ph1T := _h1t
+    pl1 := _l1
+    pl1T := _l1t
+    ph2 := _h2
+    ph2T := _h2t
+    pl2 := _l2
+    pl2T := _l2t
+    ph3 := _h3
+    ph3T := _h3t
+    pl3 := _l3
+    pl3T := _l3t
+
+bool usePortedAccum = accumModule == "Accum Box (ported)"
+float acc1Hi = na
+float acc1Lo = na
+int   acc1Id = na
+float acc2Hi = na
+float acc2Lo = na
+int   acc2Id = na
+float acc3Hi = na
+float acc3Lo = na
+int   acc3Id = na
+if useAccSource
+    [_a1h, _a1l, _a1i] = request.security(syminfo.tickerid, accTf1,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen1, accMult), lookahead = barmerge.lookahead_off)
+    [_a2h, _a2l, _a2i] = request.security(syminfo.tickerid, accTf2,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen2, accMult), lookahead = barmerge.lookahead_off)
+    [_a3h, _a3l, _a3i] = request.security(syminfo.tickerid, accTf3,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen3, accMult), lookahead = barmerge.lookahead_off)
+    acc1Hi := _a1h
+    acc1Lo := _a1l
+    acc1Id := _a1i
+    acc2Hi := _a2h
+    acc2Lo := _a2l
+    acc2Id := _a2i
+    acc3Hi := _a3h
+    acc3Lo := _a3l
+    acc3Id := _a3i
+
+// Break判定は breakTf の「確定終値」のみ (ヒゲでは判定しない)
+[brCloseRaw, brHighRaw, brLowRaw] = request.security(syminfo.tickerid, breakTf, [close, high, low],
+     lookahead = barmerge.lookahead_off)
+bool  brBarClosed = bar_index > 0 and not na(time(breakTf)) and nz(ta.change(time(breakTf)), 0) != 0
+float brClose = brBarClosed ? brCloseRaw[1] : na
+float brHigh  = brBarClosed ? brHighRaw[1]  : na
+float brLow   = brBarClosed ? brLowRaw[1]   : na
+bool  brEval  = brBarClosed and not na(brClose)
+
+// 取引日ID (timestamp/hour の timezone は series 不可なので Main で計算する)
+int _locY = year(time, dayTz)
+int _locM = month(time, dayTz)
+int _locD = dayofmonth(time, dayTz)
+int _locH = hour(time, dayTz)
+int _calDayNo    = int(timestamp(dayTz, _locY, _locM, _locD, 0, 0) / 86400000)
+int tradingDayId = _locH < dayResetHour ? _calDayNo - 1 : _calDayNo
+
+zn.ZoneFeed zoneFeed = zn.ZoneFeed.new(
+     ma1 = ma1Val, ma1d = ma1Delta, ma2 = ma2Val, ma2d = ma2Delta,
+     ph1 = ph1, ph1t = ph1T, pl1 = pl1, pl1t = pl1T,
+     ph2 = ph2, ph2t = ph2T, pl2 = pl2, pl2t = pl2T,
+     ph3 = ph3, ph3t = ph3T, pl3 = pl3, pl3t = pl3T,
+     acc1Hi = acc1Hi, acc1Lo = acc1Lo, acc1Id = acc1Id,
+     acc2Hi = acc2Hi, acc2Lo = acc2Lo, acc2Id = acc2Id,
+     acc3Hi = acc3Hi, acc3Lo = acc3Lo, acc3Id = acc3Id,
+     dayId = tradingDayId,
+     brClose = brClose, brHigh = brHigh, brLow = brLow, brEval = brEval)
+
+int zoneCountNow = zn.update(zoneEng, zoneCfg, zoneFeed)
+
+// ---- 3.3 Signal Engine Feed (FVG) -----------------------------------------
+//  取得条件 (どのTFを取るか) は分割前と同一の if 条件を維持している。
+
+// 1分足トリガー
+//  ★ 有効なトリガーが1つも無いとき (enabledTrigCount == 0) は取得しない ★
+//    そのとき SignalEngine は noTriggerMode に入り、finalBullTrig / finalBearTrig を
+//    参照しない (triggerLongSignal / triggerShortSignal が not noTriggerMode で
+//    無効化されるため)。取得を省いても Signal は完全に同じ。
+//    calcTriggers は ta.atr×3 / ta.highest / ta.lowest / ta.ema を評価するので、
+//    1分足5本ぶん × 全バー の計算が丸ごと不要になる。
+int fvgEnabledTrigCount = (useEngulfingTrigger?1:0) + (usePinbarTrigger?1:0) + (useBOSTrigger?1:0) + (useEMARejectTrigger?1:0) + (useFVGTriggerFormation?1:0) + (useStrongCandleTrigger?1:0)
+//    ※ 取得しない場合でも na 配列を渡すと updateFvg 内の array.size() が
+//      RE10052 (Cannot call array methods when ID of array is 'na') になるため、
+//      必ず「空配列」で初期化して渡す。空配列なら array.size() == 0 で
+//      ループに入らず、oneMinBullTriggered / oneMinBearTriggered は false のまま。
+array<bool> fvgBullTrig = array.new_bool()
+array<bool> fvgBearTrig = array.new_bool()
+if useLowerTFTrigger and fvgEnabledTrigCount > 0
+    [_bull, _bear] = request.security_lower_tf(syminfo.tickerid, triggerTF,
+         sg.calcTriggers(fvgTrigCfg, engulfAtrLen, pinRangeAtrLen, bosLookback,
+         emaLenTrigger, emaRejectSlopeLookback, emaRejectSlopeAtrLen))
+    fvgBullTrig := _bull
+    fvgBearTrig := _bear
+
+// ボラフィルタ用 基準ATR (分割前と同じく volMode == "ATR" のときだけ)
+float fvgBaseAtr = na
+if volMode == "ATR"
+    fvgBaseAtr := atrTf == "" ? ta.atr(atrLenBase) : request.security(syminfo.tickerid, atrTf, ta.atr(atrLenBase)[1], lookahead = barmerge.lookahead_off)
+
+// 環境認識 (EMAトレンド)
+int env4H  = na
+int env1H  = na
+int env15M = na
+int env5M  = na
+int env1M  = na
+//  ★ 吸収系列は既存 Trend Env の判定結果 (fvgSig.trendOk) を共有するようになったため、
+//    吸収系列のためだけに env4H/1H/15M を取得する必要は無くなった
+//    (useEnvFilter = OFF なら trendOk は常に true = 環境フィルター無効)。
+bool absAnyOn = useFvgAbs5Logic or useFvgAbs15Logic
+//  ★ Zone 4系列 も 4H/1H/15M の環境判定結果 (env4H / env1H / env15M) を
+//    ロジック別・方向別の許可設定で使うため、useEnvFilter が OFF でも取得する。
+//    取得しても updateFvg 側は c.useEnvFilter の中でしか参照しないので、
+//    既存FVG系Logicの判定は一切変わらない。
+if useEnvFilter or useZoneAny
+    env4H  := request.security(syminfo.tickerid, tf4H,  sg.envTrendConfirmed(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore4H),  lookahead = barmerge.lookahead_on)
+    env1H  := request.security(syminfo.tickerid, tf1H,  sg.envTrendConfirmed(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore1H),  lookahead = barmerge.lookahead_on)
+    env15M := request.security(syminfo.tickerid, tf15M, sg.envTrendConfirmed(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore15M), lookahead = barmerge.lookahead_on)
+    env5M  := request.security(syminfo.tickerid, tf5M,  sg.envTrend(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore5M),  lookahead = barmerge.lookahead_off)
+    env1M  := request.security(syminfo.tickerid, tf1M,  sg.envTrend(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore1M),  lookahead = barmerge.lookahead_off)
+
+// FVG環境認識 (各TFの反発状態)
+int efvgDBias = 0
+int efvgDReason = 0
+int efvgDRem = 0
+int efvgDBos = 0
+int efvgHBias = 0
+int efvgHReason = 0
+int efvgHRem = 0
+int efvgHBos = 0
+int efvgOBias = 0
+int efvgOReason = 0
+int efvgORem = 0
+int efvgOBos = 0
+int efvg5Bias = 0
+int efvg5Reason = 0
+int efvg5Rem = 0
+int efvg5Bos = 0
+int efvg1Bias = 0
+int efvg1Reason = 0
+int efvg1Rem = 0
+int efvg1Bos = 0
+int efvgMRawBias = 0
+int efvgMRawReason = 0
+int efvgMRawRem = 0
+int efvgMRawBos = 0
+
+if useEFVGEnv and useEFVGDaily
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvgDailyTF, sg.efvgReboundConfirmed(efvgHoldDaily, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvgDBias := _b
+    efvgDReason := _r
+    efvgDRem := _rem
+    efvgDBos := _bos
+if useEFVGEnv and useEFVG4H
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg4HTF, sg.efvgReboundConfirmed(efvgHold4H, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvgHBias := _b
+    efvgHReason := _r
+    efvgHRem := _rem
+    efvgHBos := _bos
+if useEFVGEnv and useEFVG1H
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg1HTF, sg.efvgReboundConfirmed(efvgHold1H, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvgOBias := _b
+    efvgOReason := _r
+    efvgORem := _rem
+    efvgOBos := _bos
+
+// 5M : 15M FVG のゲートにも 5M BOS を使うため、必要なら1回だけ取得する。
+bool need5MState = useEFVGEnv and (useEFVG5M or (useEFVG15M and useFvgBosFilter))
+if need5MState
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg5MTF, sg.efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvg5Bias := _b
+    efvg5Reason := _r
+    efvg5Rem := _rem
+    efvg5Bos := _bos
+
+// 15M (既存5M FVG Logic の FVG環境認識用) : BOSゲート無し (useBos=false) の生の値を
+//   取得し、5M BOSでのゲートは SignalEngine 内 (updateFvg) が行う。
+//   ★ 保持本数は従来どおり efvgHold15M。FVG15 Logic 用とは分離したので、
+//     FVG15 の保持本数を変えてもここは一切影響を受けない。
+if useEFVGEnv and useEFVG15M
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg15MTF, sg.efvgReboundConfirmed(efvgHold15M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, false, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvgMRawBias := _b
+    efvgMRawReason := _r
+    efvgMRawRem := _rem
+    efvgMRawBos := _bos
+
+// 15M (FVG15 Logic 専用) : 保持本数だけ fvg15Hold に差し替えた別系統。
+//   efvgRebound15Pack は上の4値 + 反発足の開始時刻 を返す (順序確認に使う)。
+//   ★ 保持本数が違う = 別の計算なので、上のrequestとは共有できない。
+//     ただし useEFVG15M = false (既定) のときは上は発行されないため、
+//     15分足へのrequestは結局この1本だけになる。
+int fvg15RawBias   = 0
+int fvg15RawReason = 0
+int fvg15RawRem    = 0
+int fvg15RawBos    = 0
+int fvg15RawTime   = na
+if useFvg15Logic
+    [_b, _r, _rem, _bos, _t] = request.security(syminfo.tickerid, efvg15MTF, sg.efvgRebound15Pack(fvg15Hold, efvgMinThick, reboundDepthMax, reboundRecoverRatio, false, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    fvg15RawBias   := _b
+    fvg15RawReason := _r
+    fvg15RawRem    := _rem
+    fvg15RawBos    := _bos
+    fvg15RawTime   := _t
+
+if useEFVGEnv and useEFVG1M
+    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg1MTF, sg.efvgReboundConfirmed(efvgHold1M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)
+    efvg1Bias := _b
+    efvg1Reason := _r
+    efvg1Rem := _rem
+    efvg1Bos := _bos
+
+// ---- FVG吸収 (反発とは別の式なので既存requestは再利用できない) --------------
+//  Logic が OFF のときは取得しない = 追加前と request 本数も計算量も同じ。
+//  ★ 3値目 absEventTime は「実際に吸収が成立した足の time」。
+//    Main が event を認識するのは confirmed ([1]) のぶんだけ後のバーになるので、
+//    認識時刻ではなくこの成立時刻をBOS順序判定の基準にする。
+int absBias5      = 0
+int absEvent5     = na
+int absEventTime5 = na
+int absBias15      = 0
+int absEvent15     = na
+int absEventTime15 = na
+if useFvgAbs5Logic
+    [_ab, _ae, _at] = request.security(syminfo.tickerid, efvg5MTF, sg.efvgAbsConfirmed(absHold5M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, useAbsCandleColor, useAbsBodyFilter, useAbsEdgeFilter), lookahead = barmerge.lookahead_on)
+    absBias5      := _ab
+    absEvent5     := _ae
+    absEventTime5 := _at
+if useFvgAbs15Logic
+    [_ab, _ae, _at] = request.security(syminfo.tickerid, efvg15MTF, sg.efvgAbsConfirmed(efvgHold15M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, useAbsCandleColor, useAbsBodyFilter, useAbsEdgeFilter), lookahead = barmerge.lookahead_on)
+    absBias15      := _ab
+    absEvent15     := _ae
+    absEventTime15 := _at
+
+// 1M BOS : FVGABS5 用。既存の1分足トリガー取得とは式が違うため共有できない。
+//  ★ Bullish (Long用) と Bearish (Short用) を1回の request で同時に取る。
+//    sg.bosPack() は Zone BOS と同じ式で、Bullish 側の計算は従来の
+//    sg.bosBullLowerTf() と完全に同一 (close > ta.highest(high, n)[1])。
+//    → request.security_lower_tf の呼び出し数は増えない。
+//  ★ na配列を渡すと updateFvgAbs 内の array.size() が RE10052 になるため、
+//    取得しない場合も必ず「空配列」で初期化する。
+array<bool> absBos1m  = array.new_bool()
+array<bool> absBos1mS = array.new_bool()
+if useFvgAbs5Logic
+    [_a1b, _a1s] = request.security_lower_tf(syminfo.tickerid, triggerTF, sg.bosPack(absBos1mLookback))
+    absBos1m  := _a1b
+    absBos1mS := _a1s
+
+// ---- Zone 4Logic 精密判定時間足データ (OHLC + BOS) -------------------------
+//  ★ Break だけが Break判定TF (既定 5M・すぐ下で取得)、それ以外はすべて
+//    この精密判定TF (既定 1M) で評価する。
+//    そのため BOS だけでなく close / high / low も同じ1回の request で取得し、
+//    Rebound の接近 / 接触 / 離脱 / BOS、Retest の再武装距離 / Zone接触 /
+//    反発確認 (Rejection) / BOS、FakeBreak の完全Reclaim / BOS、
+//    fakeBreakMaxBars / waitBars の本数カウントをすべてこの足の確定値で行う。
+//    → 「1Mヒゲ抜けでBreakしてしまう」ことは構造的に起きない
+//      (Break はこの配列を一切参照しない)。
+//  ★ 判定TFがチャート足より下位 (5分足チャートで 1M 等) のときは
+//    request.security_lower_tf を使い、そのチャート足に含まれる確定下位足を
+//    古い順の配列として受け取る。SignalEngine はその1本ずつを1ステップとして
+//    イベントを進める。
+//  ★ チャート足以上のTFは request.security + lookahead_off。未来のデータは入らない。
+//    判定TF = チャート足なら毎バー1本、上位足なら足が変わったときに1本だけ渡す。
+//  ★ BOSの計算式 (sg.zoneTfPack 内) は従来の sg.bosPack と完全に同一。
+//    どちらの経路でも request の本数は従来と同じ1本のまま。
+bool zbLowerTf = timeframe.in_seconds(zoneBosTf) < timeframe.in_seconds()
+bool zbSameTf  = timeframe.in_seconds(zoneBosTf) == timeframe.in_seconds()
+//  na配列を array.size() に渡すと RE10052 になるため、必ず空配列で初期化する。
+array<float> zbTfC    = array.new_float()
+array<float> zbTfH    = array.new_float()
+array<float> zbTfL    = array.new_float()
+array<bool>  zbBullArr = array.new_bool()
+array<bool>  zbBearArr = array.new_bool()
+if useZoneAny
+    if zbLowerTf
+        [_zc, _zh, _zl, _lb, _ls] = request.security_lower_tf(syminfo.tickerid, zoneBosTf, sg.zoneTfPack(zoneBosLookback))
+        zbTfC     := _zc
+        zbTfH     := _zh
+        zbTfL     := _zl
+        zbBullArr := _lb
+        zbBearArr := _ls
+    else
+        [_zc2, _zh2, _zl2, _zbb, _zbs] = request.security(syminfo.tickerid, zoneBosTf, sg.zoneTfPack(zoneBosLookback), lookahead = barmerge.lookahead_off)
+        //  判定TF = チャート足 → 毎バー1本 (直接計算と完全に同じ値)。
+        //  上位足 → その足が切り替わったバーで、直前に確定した1本だけを渡す。
+        bool _zNewBar = zbSameTf or nz(ta.change(time(zoneBosTf)), 0) != 0
+        if _zNewBar
+            array.push(zbTfC,     _zc2)
+            array.push(zbTfH,     _zh2)
+            array.push(zbTfL,     _zl2)
+            array.push(zbBullArr, _zbb)
+            array.push(zbBearArr, _zbs)
+
+//  精密判定時間足の秒数。イベント作成時に基準TFとして焼き込む。
+int zoneJudgeTfSec = timeframe.in_seconds(zoneBosTf)
+
+// ---- Zone Break判定時間足の確定終値 (Breakだけに使う) ----------------------
+//  ★ Break は必ず「Break判定TF (既定 5M) の確定終値」で判定する。high / low は
+//    一切見ないので、1Mヒゲ抜けでも1M終値抜けでも Break にはならない。
+//  ★ Break判定TF = チャート足 (既定 5M / 5M) のときは、そのチャート足自身の
+//    確定終値がそのまま Break判定価格になる。request は1本も増えない。
+//    SignalEngine 側は「そのチャート足に含まれる1M sub-bar を全部進めてから、
+//    最後に この5M終値で Break を確定する」順序で処理するので、実際の時間順序
+//    (1分足5本 → その5分足の確定終値) と完全に一致する。
+//  ★ Break判定TF > チャート足 のときだけ request.security を1本使い、その上位足が
+//    新しく確定したバーで1回だけ Break判定を行う (lookahead_off なので先読み無し)。
+float zbBrkClose = na
+bool  zbBrkValid = false
+if useZoneAny
+    if timeframe.in_seconds(zoneBreakTf) <= timeframe.in_seconds()
+        zbBrkClose := close
+        zbBrkValid := true
+    else
+        float _zbc = request.security(syminfo.tickerid, zoneBreakTf, close, lookahead = barmerge.lookahead_off)
+        zbBrkClose := _zbc
+        zbBrkValid := nz(ta.change(time(zoneBreakTf)), 0) != 0
+int zoneBreakTfSec = timeframe.in_seconds(zoneBreakTf)
+
+// 日足レジーム
+float drO0 = na
+float drH0 = na
+float drL0 = na
+float drC0 = na
+float drO1 = na
+float drH1 = na
+float drL1 = na
+float drC1 = na
+float drMedianRange = na
+bool  drNewDay = ta.change(time("D")) != 0
+if useDailyRegimeFilter
+    [_o0, _h0, _l0, _c0, _o1, _h1, _l1, _c1] = request.security(syminfo.tickerid, "D", sg.drDailyTuple(), lookahead = barmerge.lookahead_off)
+    drO0 := _o0
+    drH0 := _h0
+    drL0 := _l0
+    drC0 := _c0
+    drO1 := _o1
+    drH1 := _h1
+    drL1 := _l1
+    drC1 := _c1
+//  ★ 日足ボラ中央値は吸収系列の環境条件でも使うため、日足レジームフィルタが OFF でも
+//    吸収系列がONなら取得する。同一 (TF, 式) を重複requestしないよう1本に統合。
+//    updateFvg 側は c.useDailyRegimeFilter の中でしか参照しないので既存判定は不変。
+//  ★ Zone 4系列 も日足ボラ中央値を使う (閾値だけ専用) ので、日足レジームフィルタが
+//    OFF でも Zone系がONなら取得する。同一 (TF, 式) を1本に統合したまま。
+if useDailyRegimeFilter or absAnyOn or useZoneAny
+    drMedianRange := request.security(syminfo.tickerid, "D", sg.dailyRangeMedian(dailyVolMedianLength), lookahead = barmerge.lookahead_on)
+
+// Accumulation NoTrade (15分足の確定Accum箱)
+float acc15Hi = na
+float acc15Lo = na
+int   acc15St = na
+bool  accNew15Bar = false
+if useAccumNoTrade and useAccumNT15M
+    [_h15, _l15, _s15] = request.security(syminfo.tickerid, accumNT15Tf, sg.accumNT15Confirmed(fvgAccCfg, accumNTRangeLen, accumNTBaseLen, accumNTAtrLen), lookahead = barmerge.lookahead_on)
+    acc15Hi := _h15
+    acc15Lo := _l15
+    acc15St := _s15
+    accNew15Bar := ta.change(time(accumNT15Tf)) != 0
+
+sg.FvgFeed fvgFeed = sg.FvgFeed.new(
+     allowLong = useFvgLogic and enableLong, allowShort = useFvgLogic and enableShort,
+     sessionOk = sessionOk, newsOk = allowByNewsTime,
+     bullTrig = fvgBullTrig, bearTrig = fvgBearTrig,
+     baseAtr = fvgBaseAtr,
+     env4H = env4H, env1H = env1H, env15M = env15M, env5M = env5M, env1M = env1M,
+     dBias = efvgDBias, dReason = efvgDReason, dRem = efvgDRem, dBos = efvgDBos,
+     hBias = efvgHBias, hReason = efvgHReason, hRem = efvgHRem, hBos = efvgHBos,
+     oBias = efvgOBias, oReason = efvgOReason, oRem = efvgORem, oBos = efvgOBos,
+     b5Bias = efvg5Bias, b5Reason = efvg5Reason, b5Rem = efvg5Rem, b5Bos = efvg5Bos,
+     b1Bias = efvg1Bias, b1Reason = efvg1Reason, b1Rem = efvg1Rem, b1Bos = efvg1Bos,
+     mRawBias = efvgMRawBias, mRawReason = efvgMRawReason, mRawRem = efvgMRawRem, mRawBos = efvgMRawBos,
+     drO0 = drO0, drH0 = drH0, drL0 = drL0, drC0 = drC0,
+     drO1 = drO1, drH1 = drH1, drL1 = drL1, drC1 = drC1,
+     drMedianRange = drMedianRange, drNewDay = drNewDay,
+     acc15Hi = acc15Hi, acc15Lo = acc15Lo, acc15St = acc15St, new15Bar = accNew15Bar)
+
+// FVG15 Logic 用 Feed。中身は上の fvgFeed と同じ「計算結果」をそのまま共有し、
+// Logic ON/OFF を表す allowLong / allowShort だけ差し替える。
+// → request.security は1本も増えない。共有するのは計算結果だけで、
+//   Armed / Consumed 等の Logic固有state は Engine 側で完全に分離している。
+sg.FvgFeed fvg15Feed = fvgFeed.copy()
+fvg15Feed.allowLong  := useFvg15Logic and enableLong
+fvg15Feed.allowShort := useFvg15Logic and enableShort
+// 15M反発の生の状態だけ、FVG15専用 (保持本数 fvg15Hold) の値に差し替える。
+// 既存 fvgFeed 側は efvgHold15M ベースのまま = 既存5M Logic は影響を受けない。
+fvg15Feed.mRawBias   := fvg15RawBias
+fvg15Feed.mRawReason := fvg15RawReason
+fvg15Feed.mRawRem    := fvg15RawRem
+fvg15Feed.mRawBos    := fvg15RawBos
+
+// ============================================================================
+// 04. SIGNAL ENGINE CALLS
+// ----------------------------------------------------------------------------
+//  各 Entry Logic の計算は SignalEngine Library が行う。
+//  Main は Cfg / Feed を渡して Signal を受け取るだけで、内部の判定は知らない。
+//
+//  期間系 (simple int) を明示的に渡すのは、UDTフィールドが series 修飾になり
+//  ta.atr(length) 等へ渡せないため。値は Section 01 の input のまま渡している。
+//
+//  Logicを追加する場合はここに1行追加する:
+//     sg.EmaSignal emaSig = sg.updateEma(emaEng, emaCfg, emaFeed, emaLen)
+// ============================================================================
+// ---- 6.1 FVG Logic (既存5M・変更なし) --------------------------------------
+sg.FvgSignal fvgSig = sg.updateFvg(fvgEng, fvgCfg, fvgTrigCfg, fvgAccCfg, fvgFeed,
+     engulfAtrLen, pinRangeAtrLen, bosLookback,
+     emaLenTrigger, emaRejectSlopeLookback, emaRejectSlopeAtrLen,
+     volAvgLen, fastAtrLen, bodyAvgLen, rangeLookback,
+     accumNTRangeLen, accumNTBaseLen, accumNTAtrLen)
+
+// ---- 6.2 FVG15 Logic (15M FVG反発 → 5M BOS) --------------------------------
+//  (a) 環境認識 / Session / News / ボラ / Accum / Daily Regime / Armed は
+//      既存と同じ updateFvg() を使って計算する。ただし Engine も Cfg も Feed も
+//      別インスタンスなので、既存5M Logicの状態とは一切混ざらない。
+//      fvg15Cfg は FVG環境認識のTFだけ 15M に差し替えてある (5M FVGはOFF)。
+//      → 共通計算を二重に書かず、追加元の「現在ONのFilter」をそのまま再現できる。
+//  (b) その上に「15M FVG反発 → その反発足の開始以降の5M BOS」という順序ゲートを
+//      updateFvg15() でかける。ここだけが FVG15 固有のロジック。
+//  ★ useFvg15Logic = OFF のときは計算そのものを行わない ★
+//    useFvg15Logic は input なので全バーで同じ値 = 分岐は常に成立/常に不成立。
+//    「あるバーだけ評価されない」ことは起こらないため、内部の ta.* / var の
+//    履歴がズレることはない (既存コードの useEngulfingTrigger 等と同じ形)。
+//    OFF時は updateFvg の2回目 (ta.*14回 / forループ7本 / 配列操作46回) が
+//    まるごと不要になり、既存5M単体のチャート更新時間は追加前と同じになる。
+//    Signal既定値は longSignal=false / shortSignal=false なので発注もしない。
+sg.FvgSignal   fvg15Base = sg.FvgSignal.new()
+sg.Fvg15Signal fvg15Sig  = sg.Fvg15Signal.new()
+if useFvg15Logic
+    fvg15Base := sg.updateFvg(fvg15Eng, fvg15Cfg, fvgTrigCfg, fvgAccCfg, fvg15Feed,
+         engulfAtrLen, pinRangeAtrLen, bosLookback,
+         emaLenTrigger, emaRejectSlopeLookback, emaRejectSlopeAtrLen,
+         volAvgLen, fastAtrLen, bodyAvgLen, rangeLookback,
+         accumNTRangeLen, accumNTBaseLen, accumNTAtrLen)
+    fvg15Sig  := sg.updateFvg15(fvg15Ord,
+         fvg15Base.longSignal, fvg15Base.shortSignal, fvg15Base.entryPrice,
+         fvg15RawReason, fvg15RawRem, fvg15RawTime,
+         use15mFvgBosOrder, bos15mTo5mLookback)
+
+// ---- 6.3 FVGABS Logic (FVG吸収 → BOS / Long・Short 対称) -------------------
+//  ★ 環境条件は「既存 updateFvg (6.1) が計算済みの結果」を再利用して合成する。
+//    吸収系列のために updateFvg を追加で呼ばない = 計算量を増やさない。
+//      ・上位足環境         : ★ fvgSig.trendOk
+//        = 既存「03 · FVG · Trend Env」(useEnvFilter / reqTrend4H / 1H / 15M /
+//          5M / 1M / 必要一致TF数) の判定結果そのもの。
+//          updateFvg() が1度だけ計算した値を FVG / FVG15 / FVGABS5 / FVGABS15 で
+//          共有する → 判定の二重実装なし・input重複なし・request追加なし。
+//          5M / 1M も含めて5時間足すべてが選択対象になる。
+//          useEnvFilter = false なら trendOk は常に true = 環境フィルター無効。
+//      ・日足ボラ中央値     : Section 03 で取得済みの drMedianRange (request増なし)
+//      ・Session / News     : Section 03 の共通フィルタ
+//      ・ボラ / Accum       : fvgSig.volOk / blockedByAccum / blockedByExitWait /
+//                            accumLongDirOk / accumShortDirOk
+//                            (updateFvg の出力をそのまま利用)
+//  ★ 日足「方向」ゲートは追加しない (仕様どおりボラ範囲のみ)。
+//  ★ Long / Short は完全対称。方向設定 (Enable Long / Enable Short) を必ず通す。
+//      Long  : Bearish FVG を上方向へ吸収 → Bullish BOS
+//      Short : Bullish FVG を下方向へ吸収 → Bearish BOS
+//    吸収判定・品質条件・Hold・BOS Lookback・日足ボラ範囲は Long / Short 共通設定。
+//  ★ 上位足環境 (reqTrend) は Long / Short 共通の「要求する相場環境」。
+//    方向による自動反転は行わない。reqTrend1H = "レンジ" なら Long も Short も
+//    1H レンジを要求する (Short だから下降へ読み替える、という処理は入れない)。
+//  ★ 環境条件の「判定」は SignalEngine (sg.fvgAbsEnvLong / sg.fvgAbsEnvShort) が
+//    持つ。Main は input と取得済みデータを渡すだけ。Long側の条件・順序は従来と同一。
+bool absEnvLongOk = sg.fvgAbsEnvLong(enableLong and absAnyOn, fvgSig.trendOk, sessionOk, allowByNewsTime,
+     drMedianRange, absVolMin, absVolMax,
+     fvgSig.volOk, fvgSig.blockedByAccum, fvgSig.blockedByExitWait, fvgSig.accumLongDirOk)
+bool absEnvShortOk = sg.fvgAbsEnvShort(enableShort and absAnyOn, fvgSig.trendOk, sessionOk, allowByNewsTime,
+     drMedianRange, absVolMin, absVolMax,
+     fvgSig.volOk, fvgSig.blockedByAccum, fvgSig.blockedByExitWait, fvgSig.accumShortDirOk)
+
+//  Logic が両方OFFのときは吸収系列の計算そのものを行わない (input なので分岐は一定)。
+sg.FvgAbsSignal absSig = sg.FvgAbsSignal.new()
+if absAnyOn
+    absSig := sg.updateFvgAbs(fvgAbsEng, absEnvLongOk, absEnvShortOk, close,
+         absBias5, absEvent5, absEventTime5,
+         absBias15, absEvent15, absEventTime15,
+         absBos1m, absBos1mS, useFvgAbs5Logic, useFvgAbs15Logic, absBos5mLookback)
+
+// ---- 6.4 Zone 4-Logic (Rebound / FakeBreak / Break Retest / Break) ---------
+//  ★ Zoneの検索・Strengthフィルタ・Support/Resistance判定は「ZoneEngine を
+//    import している Main」で行い、結果 (スナップショット) だけを SignalEngine へ渡す。
+//    SignalEngine から ZoneEngine を import して密結合させない構造を維持する。
+//  ★ ZoneEngine の Zone生成 / Score / Strength / State のルールは変更しない。
+//  ★ 接近方向 (上から / 下から) の判定・状態遷移・4Logicへの振り分けは
+//    SignalEngine (sg.updateZoneEvents) が持つ。Main は input と結果を渡すだけ。
+int zoneMinStrength = zn.strengthIdx(zoneBosMinStrStr)
+array<int>   zSnapId   = array.new_int()
+array<int>   zSnapSide = array.new_int()
+array<float> zSnapTop  = array.new_float()
+array<float> zSnapBot  = array.new_float()
+if useZoneAny
+    int zSnapN = zn.zoneCount(zoneEng)
+    if zSnapN > 0
+        for zsI = 0 to zSnapN - 1
+            zn.Zone zsZ = zn.zoneAt(zoneEng, zsI)
+            //  対象Strength以上の Support / Resistance Zone だけを渡す。
+            //  ここでは重なりもnearest制限もせず、Live Zoneを全部渡す。
+            //  どのZoneでイベントを開始したかは SignalEngine が trackId で追跡する。
+            if zsZ.strength >= zoneMinStrength and (zsZ.state == ST_SUPPORT or zsZ.state == ST_RESIST)
+                array.push(zSnapId,   zsZ.trackId)
+                array.push(zSnapSide, zsZ.state == ST_SUPPORT ? 1 : -1)
+                array.push(zSnapTop,  zsZ.top)
+                array.push(zSnapBot,  zsZ.bottom)
+
+//  各Zone Logicの保有状況。4Logicそれぞれが独立したGroup (各最大1ポジション)。
+//  FVG系列の保有状況とは無関係。
+//  ★ このスクリプトは indicator なのでポジションを持たない。
+//    Strategy 側の「保有中はそのLogicのSignalを出さない」ゲートは、条件の
+//    現在状態を確認するというDebugの目的上むしろ邪魔になるため、常に
+//    「未保有」として渡す。ここ以外の判定は Strategy と完全に同一。
+bool zrbOpen = false
+bool zfkOpen = false
+bool zrtOpen = false
+bool zbkOpen = false
+
+//  ---- 共通Cfg -----------------------------------------------------------
+sg.ZoneCommonCfg zoneCmnCfg = sg.newZoneCommonCfg()
+zoneCmnCfg.enableLong          := enableLong
+zoneCmnCfg.enableShort         := enableShort
+zoneCmnCfg.useRebound          := useZoneRebound
+zoneCmnCfg.useFake             := useZoneFake
+zoneCmnCfg.useRetest           := useZoneRetest
+zoneCmnCfg.useBreak            := useZoneBreak
+zoneCmnCfg.reqDailyVol         := zoneBosReqDailyVolatility
+zoneCmnCfg.dailyLowVol         := zoneBosDailyLowVolThreshold
+zoneCmnCfg.dailyHighVol        := zoneBosDailyHighVolThreshold
+zoneCmnCfg.insufficientAsRange := dailyInsufficientAsRange
+zoneCmnCfg.breakBuffer         := zoneBreakBuffer
+zoneCmnCfg.fakeMaxBars         := fakeBreakMaxBars
+zoneCmnCfg.retestMinDist       := retestMinDistance
+zoneCmnCfg.retestWidthMult     := retestZoneWidthMultiplier
+zoneCmnCfg.waitBars            := zoneBosWaitBars
+zoneCmnCfg.minMoveAway         := zoneBosMinMoveAway
+
+//  ---- Zone系専用 高速ボラ (FVG系列の fastVolMode とは完全に独立) ----------
+//    ★ 分離したのは「モード」だけ。判定式と各パラメータ
+//      (fastAtrLen / fastAtrMin / fastFixedMin / bodyAvgLen / bodyAvgMin /
+//       useRangeRatioFilter / rangeLookback / atrRangeRatioMin) は FVG系列と
+//      同じものを共有する。
+//    ★ 通常ボラ (volMode / useMinVol / minAtrDollar / volModeRel / volRatioMin /
+//      fixedMin) と 低ボラ解除待機 (useVolCooldown / volRecoveryBars) の判定式も
+//      SignalEngine の updateFvg 内と1行ずつ同一。したがって
+//      zoneFastVolMode == fastVolMode のときは zoneVolOk == fvgSig.volOk になる。
+//    ★ zoneFastVolMode == "OFF" なら zoneFastVolPass は常に true。
+//      高速ボラ条件で Zone 4Logic のEntryが弾かれることはない。
+//    ★ request は1つも増やさない (基準ATRは Section 03 の fvgBaseAtr を共有)。
+bool zoneBaseVolOk = true
+if volMode == "ATR"
+    float zAtrAvg   = ta.sma(fvgBaseAtr, volAvgLen)
+    bool  zVolAbsOk = fvgBaseAtr >= minAtrDollar
+    bool  zVolRelOk = zAtrAvg > 0 and fvgBaseAtr >= zAtrAvg * volRatioMin
+    zoneBaseVolOk := not useMinVol or (volModeRel ? zVolRelOk : zVolAbsOk)
+else if volMode == "固定値"
+    zoneBaseVolOk := (high - low) >= fixedMin
+
+bool zoneFastVolPass = true
+if zoneFastVolMode == "ATR"
+    float zFastAtr       = ta.atr(fastAtrLen)
+    float zBodyAvgFast   = ta.sma(math.abs(close - open), bodyAvgLen)
+    float zRangeWidthV   = ta.highest(high, rangeLookback) - ta.lowest(low, rangeLookback)
+    float zAtrRangeRatio = zRangeWidthV > 0 ? zFastAtr / zRangeWidthV : 0.0
+    bool  zFastAtrOk     = zFastAtr >= fastAtrMin
+    bool  zBodyAvgOk     = zBodyAvgFast >= bodyAvgMin
+    bool  zRangeRatioOk  = not useRangeRatioFilter or zAtrRangeRatio >= atrRangeRatioMin
+    zoneFastVolPass := zFastAtrOk and zBodyAvgOk and zRangeRatioOk
+else if zoneFastVolMode == "固定値"
+    float zFastRange     = ta.highest(high, fastAtrLen) - ta.lowest(low, fastAtrLen)
+    float zBodyAvgFast   = ta.sma(math.abs(close - open), bodyAvgLen)
+    bool  zFastRangeOk   = zFastRange >= fastFixedMin
+    bool  zBodyAvgOk     = zBodyAvgFast >= bodyAvgMin
+    zoneFastVolPass := zFastRangeOk and zBodyAvgOk
+
+//    低ボラ解除後の待機も Zone系専用に持つ (FVG系列の state とは別物)。
+//    useVolCooldown = false のときは常に true なので既存挙動と変わらない。
+var int  zoneVolRecoveryStartBar = na
+var bool zonePrevVolLow          = false
+bool zoneVolPassRaw = zoneBaseVolOk and zoneFastVolPass
+bool zoneVolLowNow  = not zoneVolPassRaw
+if zoneVolLowNow
+    zoneVolRecoveryStartBar := na
+if not zoneVolLowNow and zonePrevVolLow
+    zoneVolRecoveryStartBar := bar_index
+bool zoneVolRecoveryOk = not useVolCooldown or na(zoneVolRecoveryStartBar) or (bar_index - zoneVolRecoveryStartBar) >= volRecoveryBars
+bool zoneVolOk = zoneVolPassRaw and zoneVolRecoveryOk
+zonePrevVolLow := zoneVolLowNow
+
+//  ---- 共通フィルタの「結果」だけを渡す (再計算も request も増やさない) ----
+//    Session / News        : Section 03 の共通フィルタ
+//    通常ボラ + 高速ボラ   : zoneVolOk (Zone系専用。FVG系列の fvgSig.volOk とは
+//                            高速ボラのモードだけが独立している)
+//    Accum NoTrade / 離脱待機 / 離脱方向 : fvgSig.* の出力
+//    環境認識 4H/1H/15M    : Section 03 で取得済みの env4H / env1H / env15M
+//    日足ボラ中央値        : Section 03 で取得済みの drMedianRange
+sg.ZoneEnvFeed zoneEnvFeed = sg.ZoneEnvFeed.new(
+     sessionOk = sessionOk, newsOk = allowByNewsTime,
+     volOk = zoneVolOk,
+     blockedByAccum = fvgSig.blockedByAccum, blockedByExitWait = fvgSig.blockedByExitWait,
+     accumLongDirOk = fvgSig.accumLongDirOk, accumShortDirOk = fvgSig.accumShortDirOk,
+     env4H = env4H, env1H = env1H, env15M = env15M,
+     drMedianRange = drMedianRange)
+
+//  ---- ロジック別・方向別の上位足環境設定 (8個・完全独立) ------------------
+sg.ZoneTfEnvCfg zcRbL = sg.ZoneTfEnvCfg.new(
+     up4H  = zrbL4Up, rg4H  = zrbL4Rg, dn4H  = zrbL4Dn,
+     up1H  = zrbL1Up, rg1H  = zrbL1Rg, dn1H  = zrbL1Dn,
+     up15M = zrbLmUp, rg15M = zrbLmRg, dn15M = zrbLmDn,
+     useAnd = zrbLAnd)
+sg.ZoneTfEnvCfg zcRbS = sg.ZoneTfEnvCfg.new(
+     up4H  = zrbS4Up, rg4H  = zrbS4Rg, dn4H  = zrbS4Dn,
+     up1H  = zrbS1Up, rg1H  = zrbS1Rg, dn1H  = zrbS1Dn,
+     up15M = zrbSmUp, rg15M = zrbSmRg, dn15M = zrbSmDn,
+     useAnd = zrbSAnd)
+sg.ZoneTfEnvCfg zcFkL = sg.ZoneTfEnvCfg.new(
+     up4H  = zfkL4Up, rg4H  = zfkL4Rg, dn4H  = zfkL4Dn,
+     up1H  = zfkL1Up, rg1H  = zfkL1Rg, dn1H  = zfkL1Dn,
+     up15M = zfkLmUp, rg15M = zfkLmRg, dn15M = zfkLmDn,
+     useAnd = zfkLAnd)
+sg.ZoneTfEnvCfg zcFkS = sg.ZoneTfEnvCfg.new(
+     up4H  = zfkS4Up, rg4H  = zfkS4Rg, dn4H  = zfkS4Dn,
+     up1H  = zfkS1Up, rg1H  = zfkS1Rg, dn1H  = zfkS1Dn,
+     up15M = zfkSmUp, rg15M = zfkSmRg, dn15M = zfkSmDn,
+     useAnd = zfkSAnd)
+sg.ZoneTfEnvCfg zcRtL = sg.ZoneTfEnvCfg.new(
+     up4H  = zrtL4Up, rg4H  = zrtL4Rg, dn4H  = zrtL4Dn,
+     up1H  = zrtL1Up, rg1H  = zrtL1Rg, dn1H  = zrtL1Dn,
+     up15M = zrtLmUp, rg15M = zrtLmRg, dn15M = zrtLmDn,
+     useAnd = zrtLAnd)
+sg.ZoneTfEnvCfg zcRtS = sg.ZoneTfEnvCfg.new(
+     up4H  = zrtS4Up, rg4H  = zrtS4Rg, dn4H  = zrtS4Dn,
+     up1H  = zrtS1Up, rg1H  = zrtS1Rg, dn1H  = zrtS1Dn,
+     up15M = zrtSmUp, rg15M = zrtSmRg, dn15M = zrtSmDn,
+     useAnd = zrtSAnd)
+sg.ZoneTfEnvCfg zcBkL = sg.ZoneTfEnvCfg.new(
+     up4H  = zbkL4Up, rg4H  = zbkL4Rg, dn4H  = zbkL4Dn,
+     up1H  = zbkL1Up, rg1H  = zbkL1Rg, dn1H  = zbkL1Dn,
+     up15M = zbkLmUp, rg15M = zbkLmRg, dn15M = zbkLmDn,
+     useAnd = zbkLAnd)
+sg.ZoneTfEnvCfg zcBkS = sg.ZoneTfEnvCfg.new(
+     up4H  = zbkS4Up, rg4H  = zbkS4Rg, dn4H  = zbkS4Dn,
+     up1H  = zbkS1Up, rg1H  = zbkS1Rg, dn1H  = zbkS1Dn,
+     up15M = zbkSmUp, rg15M = zbkSmRg, dn15M = zbkSmDn,
+     useAnd = zbkSAnd)
+
+sg.ZoneEnvSet zoneEnvSet = sg.ZoneEnvSet.new(
+     rbLong = zcRbL, rbShort = zcRbS,
+     fkLong = zcFkL, fkShort = zcFkS,
+     rtLong = zcRtL, rtShort = zcRtS,
+     bkLong = zcBkL, bkShort = zcBkS)
+
+sg.ZoneLogicSignal zlSig = sg.ZoneLogicSignal.new()
+if useZoneAny
+    zlSig := sg.updateZoneEvents(zoneEvtEng, zoneCmnCfg, zoneEnvFeed, zoneEnvSet,
+         zSnapId, zSnapSide, zSnapTop, zSnapBot,
+         zbTfC, zbTfH, zbTfL, zbBullArr, zbBearArr,
+         zoneJudgeTfSec, zbBrkClose, zbBrkValid, zoneBreakTfSec, close,
+         zrbOpen, zfkOpen, zrtOpen, zbkOpen)
+
+// ============================================================================
+// 05. LONG SIGNAL CONDITION DEBUG TABLE
+// ----------------------------------------------------------------------------
+//  ★ 表示専用。ここで新しい判定式は1つも作らない ★
+//    ・SignalEngine / ZoneEngine が返した値 (FvgSignal / FvgAbsSignal /
+//      ZoneLogicSignal / ZoneEvt / Zone) と、export された判定関数
+//      (sg.zoneTfEnvOk / sg.zoneDailyVolOk / sg.dailyVolatilityText /
+//       zn.strengthName 等) だけを読む。
+//    ・通常ボラ / 高速ボラだけは SignalEngine が中間結果を返さないため、
+//      updateFvg() 内の式を1行ずつ写したミラーで「現在値」を出す
+//      (式もパラメータも完全同一。Zone側の zoneBaseVolOk / zoneFastVolPass は
+//       Section 04 で計算済みのものをそのまま使う)。
+//    ・取得できない内部状態は推測せず「要SignalEngine Debug出力」と明示する。
+// ============================================================================
+
+var string G_LCD = "00 · Long Signal Condition Debug"
+showLongCondDebug = input.bool(false, "Long Signal Condition Debugを表示", group = G_LCD,
+     tooltip = "OFF のときはテーブルを一切生成しない (完全非表示)。\n" +
+     "このインジケーターは表示専用で、注文・ポジション・アラートは行わない。")
+lcdPosStr = input.string("Middle Right", "表示位置",
+     options = ["Top Right", "Middle Right", "Bottom Right"], group = G_LCD)
+lcdTextSizeStr = input.string("Tiny", "文字サイズ", options = ["Tiny", "Small", "Normal"], group = G_LCD)
+
+f_lcdPos(string s) =>
+    s == "Top Right" ? position.top_right : s == "Bottom Right" ? position.bottom_right : position.middle_right
+f_lcdSize(string s) =>
+    s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
+//  ✅ / ❌ / - (判定対象外)
+f_ox(bool v) =>
+    v ? "✅" : "❌"
+f_envArrow(int v) =>
+    v == 1 ? "↑" : v == -1 ? "↓" : "→"
+f_bosTxt(int v) =>
+    v == 1 ? "Bullish BOS成立" : v == -1 ? "Bearish BOSのみ" : "未成立"
+
+// ---- 5.1 共通条件の現在値 --------------------------------------------------
+//  上位足方向 (FVG / FVGABS 共通の Trend Env)。判定結果は fvgSig.trendOk。
+string lcdEnvTxt = "4H" + f_envArrow(nz(env4H, 0)) + " / 1H" + f_envArrow(nz(env1H, 0)) +
+     " / 15M" + f_envArrow(nz(env15M, 0)) + " / 5M" + f_envArrow(nz(env5M, 0)) +
+     " / 1M" + f_envArrow(nz(env1M, 0))
+string lcdEnvReq = "要求 4H:" + reqTrend4H + " 1H:" + reqTrend1H + " 15M:" + reqTrend15M +
+     " 5M:" + reqTrend5M + " 1M:" + reqTrend1M
+
+//  日足レジーム (方向 + ボラ)。判定結果は fvgSig.drLongOk。
+string lcdDrTxt = (na(drMedianRange) ? "-" : str.tostring(drMedianRange, "#.#")) + "$ / " +
+     sg.dailyVolatilityText(fvgSig.drVolCode) + " / 要求" + reqDailyVolatility
+
+//  通常ボラ : updateFvg 内の baseVolOk と同じ式 (Section 04 の zoneBaseVolOk)。
+string lcdBaseVolTxt = volMode == "OFF" ? "OFF" :
+     volMode == "固定値" ? ("レンジ " + f_num(high - low, "#.##") + "$ / 最低" + f_num(fixedMin, "#.##") + "$") :
+     volModeRel ? ("ATR " + f_num(fvgBaseAtr, "#.##") + "$ / 平均比 最低" + f_num(volRatioMin, "#.##")) :
+     ("ATR " + f_num(fvgBaseAtr, "#.##") + "$ / 最低" + f_num(minAtrDollar, "#.##") + "$")
+
+//  高速ボラ (FVG系列) : updateFvg 内の fastVolPass と1行ずつ同じ式のミラー。
+//   Zone系列は Section 04 の zoneFastVolPass (zoneFastVolMode 参照) を使う。
+bool  lcdFastPass = true
+float lcdFastVal  = na
+float lcdFastNeed = na
+if fastVolMode == "ATR"
+    float lfAtr   = ta.atr(fastAtrLen)
+    float lfBody  = ta.sma(math.abs(close - open), bodyAvgLen)
+    float lfRw    = ta.highest(high, rangeLookback) - ta.lowest(low, rangeLookback)
+    float lfRatio = lfRw > 0 ? lfAtr / lfRw : 0.0
+    bool  lfAtrOk   = lfAtr >= fastAtrMin
+    bool  lfBodyOk  = lfBody >= bodyAvgMin
+    bool  lfRatioOk = not useRangeRatioFilter or lfRatio >= atrRangeRatioMin
+    lcdFastPass := lfAtrOk and lfBodyOk and lfRatioOk
+    lcdFastVal  := lfAtr
+    lcdFastNeed := fastAtrMin
+else if fastVolMode == "固定値"
+    float lfRange = ta.highest(high, fastAtrLen) - ta.lowest(low, fastAtrLen)
+    float lfBody  = ta.sma(math.abs(close - open), bodyAvgLen)
+    bool  lfRangeOk = lfRange >= fastFixedMin
+    bool  lfBodyOk  = lfBody >= bodyAvgMin
+    lcdFastPass := lfRangeOk and lfBodyOk
+    lcdFastVal  := lfRange
+    lcdFastNeed := fastFixedMin
+string lcdFastTxt = fastVolMode == "OFF" ? "OFF" :
+     (f_num(lcdFastVal, "#.##") + "$ / " + fastVolMode + " " + f_num(lcdFastNeed, "#.##") + "$" +
+      " · 実体平均 " + f_num(ta.sma(math.abs(close - open), bodyAvgLen), "#.##") + "$ / 最低" + f_num(bodyAvgMin, "#.##") + "$")
+
+//  Accum : blockedByAccum / blockedByExitWait は合成結果のみ公開されている。
+//   5M / 15M どちらのAccum箱に入っているかの内訳は SignalEngine 内部にしか無い。
+string lcdAccTxt = not useAccumNoTrade ? "OFF" :
+     ((fvgSig.blockedByAccum ? "Accum内 (NoTrade)" : "Accum外") +
+      (fvgSig.blockedByExitWait ? " / 離脱待機中" : "") +
+      " ※5M/15Mの内訳は要SignalEngine Debug出力")
+bool lcdAccOk = not fvgSig.blockedByAccum and not fvgSig.blockedByExitWait
+
+//  Accum離脱方向 : 許可/不許可だけが公開されている。向き (上抜け/下抜け) は内部値。
+string lcdAccDirTxt = not useAccumBreakDirection ? "OFF" :
+     ((fvgSig.accumLongDirOk ? "Long許可" : "Long不許可") + " ※向き(上抜け/下抜け)は要SignalEngine Debug出力")
+
+// ---- 5.2 FVG反発 (Long) の各条件 -------------------------------------------
+//  ① FVG侵入率 / ② FVG回復位置 は efvgReboundState() の内部値で、
+//    export される [bias, reason, rem, bos] には含まれていない。
+//    推測で似た計算を作らず、取得が必要であることを明示する。
+string lcdFvgPenTxt = "要SignalEngine Debug出力 (efvgReboundState 内部の侵入率)" +
+     " · 上限 " + f_num(reboundDepthMax * 100, "#") + "%"
+string lcdFvgRecTxt = "要SignalEngine Debug出力 (efvgReboundState 内部の回復率)" +
+     " · 必要 " + f_num(reboundRecoverRatio * 100, "#") + "%以上"
+
+//  ③ FVG状態保持 : rem (残り本数) は公開されているので 経過 = hold - rem で出せる。
+string lcdHoldTxt = ""
+bool   lcdHoldOk  = false
+if useEFVGEnv
+    if useEFVGDaily
+        lcdHoldTxt := lcdHoldTxt + "D " + sg.efvgBiasText(efvgDBias) + " " + str.tostring(efvgHoldDaily - efvgDRem) + "/" + str.tostring(efvgHoldDaily) + "本  "
+        lcdHoldOk := lcdHoldOk or (efvgDBias == 1 and efvgDRem > 0)
+    if useEFVG4H
+        lcdHoldTxt := lcdHoldTxt + "4H " + sg.efvgBiasText(efvgHBias) + " " + str.tostring(efvgHold4H - efvgHRem) + "/" + str.tostring(efvgHold4H) + "本  "
+        lcdHoldOk := lcdHoldOk or (efvgHBias == 1 and efvgHRem > 0)
+    if useEFVG1H
+        lcdHoldTxt := lcdHoldTxt + "1H " + sg.efvgBiasText(efvgOBias) + " " + str.tostring(efvgHold1H - efvgORem) + "/" + str.tostring(efvgHold1H) + "本  "
+        lcdHoldOk := lcdHoldOk or (efvgOBias == 1 and efvgORem > 0)
+    if useEFVG15M
+        lcdHoldTxt := lcdHoldTxt + "15M " + sg.efvgBiasText(fvgSig.mBias) + " " + str.tostring(efvgHold15M - fvgSig.mRem) + "/" + str.tostring(efvgHold15M) + "本  "
+        lcdHoldOk := lcdHoldOk or (fvgSig.mBias == 1 and fvgSig.mRem > 0)
+    if useEFVG5M
+        lcdHoldTxt := lcdHoldTxt + "5M " + sg.efvgBiasText(efvg5Bias) + " " + str.tostring(efvgHold5M - efvg5Rem) + "/" + str.tostring(efvgHold5M) + "本  "
+        lcdHoldOk := lcdHoldOk or (efvg5Bias == 1 and efvg5Rem > 0)
+    if useEFVG1M
+        lcdHoldTxt := lcdHoldTxt + "1M " + sg.efvgBiasText(efvg1Bias) + " " + str.tostring(efvgHold1M - efvg1Rem) + "/" + str.tostring(efvgHold1M) + "本  "
+        lcdHoldOk := lcdHoldOk or (efvg1Bias == 1 and efvg1Rem > 0)
+if lcdHoldTxt == ""
+    lcdHoldTxt := "OFF"
+
+//  ⑩ BOS方向 : 各TFのBOSコードは公開されている。経過本数は内部値のため非公開。
+string lcdFvgBosTxt = not useFvgBosFilter ? "OFF (BOSフィルター未使用)" :
+     ("5M " + f_bosTxt(efvg5Bos) + " / 15M " + f_bosTxt(efvgMRawBos) +
+      " ※BOSからの経過本数は要SignalEngine Debug出力")
+
+// ---- 5.3 FVG吸収 (Long) の各条件 -------------------------------------------
+//  ① 吸収 : absBias 1 = Long方向 (Bearish FVG を上方向へ吸収)
+string lcdAbsTxt = ""
+bool   lcdAbsOk  = false
+if useFvgAbs5Logic
+    lcdAbsTxt := "5M " + (absBias5 == 1 ? "Bearish FVG 上方向吸収済み" : absBias5 == -1 ? "下方向吸収 (Short側)" : "吸収未成立")
+    lcdAbsOk  := lcdAbsOk or absBias5 == 1
+if useFvgAbs15Logic
+    lcdAbsTxt := lcdAbsTxt + (lcdAbsTxt == "" ? "" : " / ") + "15M " +
+         (absBias15 == 1 ? "Bearish FVG 上方向吸収済み" : absBias15 == -1 ? "下方向吸収 (Short側)" : "吸収未成立")
+    lcdAbsOk  := lcdAbsOk or absBias15 == 1
+if lcdAbsTxt == ""
+    lcdAbsTxt := "OFF"
+
+//  ② 吸収状態保持 : 吸収成立足の時刻 (absEventTime) が公開されているので、
+//    そこからの経過本数を その時間足の秒数で割って出す。
+int lcdAbsEl5  = na
+int lcdAbsEl15 = na
+if not na(absEventTime5)
+    lcdAbsEl5  := int(math.floor((time - absEventTime5)  / (timeframe.in_seconds(efvg5MTF)  * 1000)))
+if not na(absEventTime15)
+    lcdAbsEl15 := int(math.floor((time - absEventTime15) / (timeframe.in_seconds(efvg15MTF) * 1000)))
+string lcdAbsHoldTxt = ""
+bool   lcdAbsHoldOk  = false
+if useFvgAbs5Logic
+    lcdAbsHoldTxt := "5M " + (na(lcdAbsEl5) ? "-" : str.tostring(lcdAbsEl5)) + "本経過 / " + str.tostring(absHold5M) + "本以内"
+    lcdAbsHoldOk  := lcdAbsHoldOk or (not na(lcdAbsEl5) and lcdAbsEl5 <= absHold5M)
+if useFvgAbs15Logic
+    lcdAbsHoldTxt := lcdAbsHoldTxt + (lcdAbsHoldTxt == "" ? "" : " / ") + "15M " +
+         (na(lcdAbsEl15) ? "-" : str.tostring(lcdAbsEl15)) + "本経過 / " + str.tostring(efvgHold15M) + "本以内"
+    lcdAbsHoldOk  := lcdAbsHoldOk or (not na(lcdAbsEl15) and lcdAbsEl15 <= efvgHold15M)
+if lcdAbsHoldTxt == ""
+    lcdAbsHoldTxt := "OFF"
+
+//  ④ 日足ボラ (吸収系列専用の範囲条件)。fvgAbsEnvLong 内の _dailyVolOk と同じ式。
+bool   lcdAbsVolOk  = not na(drMedianRange) and drMedianRange >= absVolMin and drMedianRange < absVolMax
+string lcdAbsVolTxt = (na(drMedianRange) ? "-" : str.tostring(drMedianRange, "#.#")) + "$ / 範囲 " +
+     f_num(absVolMin, "#.#") + "$以上 " + f_num(absVolMax, "#.#") + "$未満"
+
+//  ⑨ BOS : ABS5 = 1M Bullish BOS / ABS15 = 5M Bullish BOS (Long側)
+string lcdAbsBosTxt = ""
+bool   lcdAbsBosOk  = false
+if useFvgAbs5Logic
+    lcdAbsBosTxt := "ABS5 (1M) " + (absSig.bos5Ok ? "Bullish BOS成立" : "未成立")
+    lcdAbsBosOk  := lcdAbsBosOk or absSig.bos5Ok
+if useFvgAbs15Logic
+    lcdAbsBosTxt := lcdAbsBosTxt + (lcdAbsBosTxt == "" ? "" : " / ") + "ABS15 (5M) " +
+         (absSig.bos15Ok ? "Bullish BOS成立" : "未成立")
+    lcdAbsBosOk  := lcdAbsBosOk or absSig.bos15Ok
+if lcdAbsBosTxt == ""
+    lcdAbsBosTxt := "OFF"
+else
+    lcdAbsBosTxt := lcdAbsBosTxt + " ※経過本数は要SignalEngine Debug出力"
+
+// ---- 5.4 ZONE反発 (Long) の各条件 ------------------------------------------
+//  Zone側は ZoneEvt (export type) のフィールドをそのまま読めるので、
+//  Strategy が実際に使っているイベント状態を推測なしで表示できる。
+//   Long Rebound = Support Zone (side = +1) へ「上から」接近したイベント。
+int lcdZi = -1
+if array.size(zoneEvtEng.evts) > 0
+    for i = 0 to array.size(zoneEvtEng.evts) - 1
+        sg.ZoneEvt qz = array.get(zoneEvtEng.evts, i)
+        if lcdZi < 0 and qz.alive and qz.side == 1
+            lcdZi := i
+
+//  ① 有効Zone : ZoneEngine の Live Zone から、対象Strength以上で
+//    現在価格より下にある最も近い Support Zone を探す (Long Rebound の対象)。
+int   lcdZoneIdx = -1
+float lcdZoneD   = 1e20
+if zn.zoneCount(zoneEng) > 0
+    for i = 0 to zn.zoneCount(zoneEng) - 1
+        zn.Zone lz = zn.zoneAt(zoneEng, i)
+        if lz.state == ST_SUPPORT and lz.strength >= zoneMinStrength and lz.top <= close
+            float lzD = close - lz.top
+            if lzD < lcdZoneD
+                lcdZoneD   := lzD
+                lcdZoneIdx := i
+string lcdZoneTxt = "対象Support Zoneなし (Strength " + zoneBosMinStrStr + "以上)"
+if lcdZoneIdx >= 0
+    zn.Zone lz2 = zn.zoneAt(zoneEng, lcdZoneIdx)
+    lcdZoneTxt := "Support / " + zn.strengthName(lz2.strength) + " / " +
+         f_num(lz2.bottom, "#.##") + "-" + f_num(lz2.top, "#.##") +
+         " / Score " + f_num(lz2.score, "#.#")
+
+// ② 接触 / ③ 反発 / ④ 離脱距離 / ⑥ BOS期限 / ⑦ Break はイベントから読む。
+string lcdZTouchTxt = "未接触 (上側からSupportへ接近したイベントなし)"
+string lcdZRebTxt   = "-"
+string lcdZAwayTxt  = zoneBosMinMoveAway <= 0 ? "OFF" : "-"
+string lcdZWaitTxt  = "-"
+string lcdZBrkTxt   = "-"
+bool   lcdZTouchOk  = false
+bool   lcdZRebOk    = false
+bool   lcdZAwayOk   = zoneBosMinMoveAway <= 0
+bool   lcdZWaitOk   = false
+bool   lcdZBrkOk    = false
+if lcdZi >= 0
+    sg.ZoneEvt qz2 = array.get(zoneEvtEng.evts, lcdZi)
+    float lcdZAway = close - qz2.top
+    lcdZTouchTxt := "上側からSupport接触済み (" + f_num(qz2.bottom, "#.##") + "-" + f_num(qz2.top, "#.##") + ")"
+    lcdZTouchOk  := true
+    lcdZRebTxt   := (lcdZAway >= 0 ? "上方向 +" : "Zone内/下方向 ") + f_num(lcdZAway, "#.##") + "$"
+    lcdZRebOk    := lcdZAway > 0
+    lcdZAwayTxt  := zoneBosMinMoveAway <= 0 ? "OFF" :
+         (f_num(lcdZAway, "#.##") + "$ / 必要" + f_num(zoneBosMinMoveAway, "#.##") + "$")
+    lcdZAwayOk   := qz2.movedAway
+    lcdZWaitTxt  := str.tostring(zoneEvtEng.barNo - qz2.startBar) + "本経過 / " +
+         str.tostring(zoneBosWaitBars) + "本以内 (精密判定時間足)"
+    lcdZWaitOk   := (zoneEvtEng.barNo - qz2.startBar) <= zoneBosWaitBars
+    lcdZBrkTxt   := qz2.phase >= 1 ? ("Support下抜けBreak済み (" + zoneBreakTf + "終値)") :
+         qz2.rbCancelled ? ("精密TF終値抜けでRebound候補失効 (" + zoneBosTf + ")") : "未Break"
+    lcdZBrkOk    := qz2.phase == 0 and not qz2.rbCancelled
+
+// ⑤ BOS : 精密判定時間足の Bullish BOS (Strategy が updateZoneEvents へ渡すのと同じ配列)
+bool   lcdZBosNow = f_anyTrue(zbBullArr)
+string lcdZBosTxt = (lcdZBosNow ? "Bullish BOS成立" : "未成立") + " (" + zoneBosTf + ") / このバーの精密TF足数 " +
+     str.tostring(array.size(zbBullArr))
+
+// ⑧⑨⑩ Zone側の環境 / 日足ボラ / 通常ボラ (Zone専用設定)
+bool   lcdZEnvOk  = sg.zoneTfEnvOk(zcRbL, nz(env4H, 0), nz(env1H, 0), nz(env15M, 0))
+bool   lcdZDrOk   = sg.zoneDailyVolOk(zoneCmnCfg, zoneEnvFeed)
+string lcdZDrTxt  = (na(drMedianRange) ? "-" : str.tostring(drMedianRange, "#.#")) + "$ / 要求" + zoneBosReqDailyVolatility +
+     " (低ボラ上限" + f_num(zoneBosDailyLowVolThreshold, "#.#") + "$ / 高ボラ下限" + f_num(zoneBosDailyHighVolThreshold, "#.#") + "$)"
+string lcdZVolTxt = "通常ボラ " + (zoneBaseVolOk ? "OK" : "NG") + " / 高速ボラ " +
+     (zoneFastVolMode == "OFF" ? "OFF" : (zoneFastVolPass ? "OK" : "NG")) + " (Zone専用: " + zoneFastVolMode + ")"
+
+// ---- 5.5 テーブル描画 ------------------------------------------------------
+var table lcdTbl = na
+if showLongCondDebug and na(lcdTbl)
+    lcdTbl := table.new(f_lcdPos(lcdPosStr), 3, 40, border_width = 1,
+         frame_width = 1, frame_color = color.new(color.gray, 40))
+
+f_lcdCell(int row, string name, string val, string ok, color bg) =>
+    table.cell(lcdTbl, 0, row, name, text_color = color.white, bgcolor = bg,
+         text_size = f_lcdSize(lcdTextSizeStr), text_halign = text.align_left)
+    table.cell(lcdTbl, 1, row, val, text_color = color.white, bgcolor = bg,
+         text_size = f_lcdSize(lcdTextSizeStr), text_halign = text.align_left)
+    table.cell(lcdTbl, 2, row, ok, text_color = color.white, bgcolor = bg,
+         text_size = f_lcdSize(lcdTextSizeStr), text_halign = text.align_center)
+    true
+
+if showLongCondDebug and barstate.islast and not na(lcdTbl)
+    table.clear(lcdTbl, 0, 0, 2, 39)
+    color cHdr = color.new(color.gray, 60)
+    color cGrp = color.new(color.blue, 55)
+    color cRow = color.new(color.black, 70)
+    color cSum = color.new(color.teal, 55)
+    int r = 0
+    f_lcdCell(r, "条件", "現在の状態 / 現在値", "判定", cHdr)
+    r += 1
+
+    // ---- FVG反発 (Long) : 10項目 ----
+    f_lcdCell(r, "■ FVG反発 (Long)", useFvgLogic ? "Logic ON" : "Logic OFF", useFvgLogic ? "" : "-", cGrp)
+    r += 1
+    f_lcdCell(r, "① FVG侵入率",      lcdFvgPenTxt, "-", cRow)
+    r += 1
+    f_lcdCell(r, "② FVG回復位置",    lcdFvgRecTxt, "-", cRow)
+    r += 1
+    f_lcdCell(r, "③ FVG状態保持",    lcdHoldTxt, lcdHoldTxt == "OFF" ? "-" : f_ox(lcdHoldOk), cRow)
+    r += 1
+    f_lcdCell(r, "④ 上位足方向",      lcdEnvTxt + "  |  " + lcdEnvReq, useEnvFilter ? f_ox(fvgSig.trendOk) : "-", cRow)
+    r += 1
+    f_lcdCell(r, "⑤ 日足ボラ",        useDailyRegimeFilter ? lcdDrTxt : "OFF", useDailyRegimeFilter ? f_ox(fvgSig.drLongOk) : "-", cRow)
+    r += 1
+    f_lcdCell(r, "⑥ 通常ボラ",        lcdBaseVolTxt, volMode == "OFF" ? "-" : f_ox(zoneBaseVolOk), cRow)
+    r += 1
+    f_lcdCell(r, "⑦ 高速ボラ",        lcdFastTxt, fastVolMode == "OFF" ? "-" : f_ox(lcdFastPass), cRow)
+    r += 1
+    f_lcdCell(r, "⑧ Accum状態",       lcdAccTxt, useAccumNoTrade ? f_ox(lcdAccOk) : "-", cRow)
+    r += 1
+    f_lcdCell(r, "⑨ Accum離脱方向",   lcdAccDirTxt, useAccumBreakDirection ? f_ox(fvgSig.accumLongDirOk) : "-", cRow)
+    r += 1
+    f_lcdCell(r, "⑩ BOS方向",         lcdFvgBosTxt, useFvgBosFilter ? f_ox(efvg5Bos == 1) : "-", cRow)
+    r += 1
+    f_lcdCell(r, "  → FVG反発 Long Signal",
+         "確定: " + (fvgSig.longSignal ? "成立" : "未成立") + "  /  形成中Preview: " + (fvgSig.previewLong ? "成立" : "未成立"),
+         useFvgLogic ? f_ox(fvgSig.previewLong) : "-", cSum)
+    r += 1
+
+    // ---- FVG吸収 (Long) : 9項目 ----
+    f_lcdCell(r, "■ FVG吸収 (Long)", (useFvgAbs5Logic or useFvgAbs15Logic) ? "Logic ON" : "Logic OFF",
+         (useFvgAbs5Logic or useFvgAbs15Logic) ? "" : "-", cGrp)
+    r += 1
+    f_lcdCell(r, "① FVG吸収",         lcdAbsTxt, lcdAbsTxt == "OFF" ? "-" : f_ox(lcdAbsOk), cRow)
+    r += 1
+    f_lcdCell(r, "② 吸収状態保持",     lcdAbsHoldTxt, lcdAbsHoldTxt == "OFF" ? "-" : f_ox(lcdAbsHoldOk), cRow)
+    r += 1
+    f_lcdCell(r, "③ 上位足方向",       lcdEnvTxt + "  |  " + lcdEnvReq, useEnvFilter ? f_ox(fvgSig.trendOk) : "-", cRow)
+    r += 1
+    f_lcdCell(r, "④ 日足ボラ (吸収用)", lcdAbsVolTxt, f_ox(lcdAbsVolOk), cRow)
+    r += 1
+    f_lcdCell(r, "⑤ 通常ボラ",         lcdBaseVolTxt, volMode == "OFF" ? "-" : f_ox(zoneBaseVolOk), cRow)
+    r += 1
+    f_lcdCell(r, "⑥ 高速ボラ",         lcdFastTxt, fastVolMode == "OFF" ? "-" : f_ox(lcdFastPass), cRow)
+    r += 1
+    f_lcdCell(r, "⑦ Accum状態",        lcdAccTxt, useAccumNoTrade ? f_ox(lcdAccOk) : "-", cRow)
+    r += 1
+    f_lcdCell(r, "⑧ Accum離脱方向",    lcdAccDirTxt, useAccumBreakDirection ? f_ox(fvgSig.accumLongDirOk) : "-", cRow)
+    r += 1
+    f_lcdCell(r, "⑨ BOS方向",          lcdAbsBosTxt, lcdAbsBosTxt == "OFF" ? "-" : f_ox(lcdAbsBosOk), cRow)
+    r += 1
+    f_lcdCell(r, "  → FVG吸収 Long Signal",
+         "ABS5 確定" + (absSig.long5 ? "成立" : "未成立") + " / Preview" + (absSig.previewLong5 ? "成立" : "未成立") +
+         "  |  ABS15 確定" + (absSig.long15 ? "成立" : "未成立") + " / Preview" + (absSig.previewLong15 ? "成立" : "未成立"),
+         (useFvgAbs5Logic or useFvgAbs15Logic) ? f_ox(absSig.previewLong5 or absSig.previewLong15) : "-", cSum)
+    r += 1
+
+    // ---- ZONE反発 (Long) : 12項目 ----
+    f_lcdCell(r, "■ ZONE反発 (Long)", useZoneRebound ? "Logic ON" : "Logic OFF", useZoneRebound ? "" : "-", cGrp)
+    r += 1
+    f_lcdCell(r, "① 有効Zone",         lcdZoneTxt, f_ox(lcdZoneIdx >= 0), cRow)
+    r += 1
+    f_lcdCell(r, "② Zone接触",         lcdZTouchTxt, f_ox(lcdZTouchOk), cRow)
+    r += 1
+    f_lcdCell(r, "③ Zone反発",         lcdZRebTxt, lcdZi < 0 ? "-" : f_ox(lcdZRebOk), cRow)
+    r += 1
+    f_lcdCell(r, "④ 最低離脱距離",      lcdZAwayTxt, zoneBosMinMoveAway <= 0 ? "-" : (lcdZi < 0 ? "-" : f_ox(lcdZAwayOk)), cRow)
+    r += 1
+    f_lcdCell(r, "⑤ BOS",              lcdZBosTxt, f_ox(lcdZBosNow), cRow)
+    r += 1
+    f_lcdCell(r, "⑥ BOS期限",          lcdZWaitTxt, lcdZi < 0 ? "-" : f_ox(lcdZWaitOk), cRow)
+    r += 1
+    f_lcdCell(r, "⑦ Zone Break",       lcdZBrkTxt, lcdZi < 0 ? "-" : f_ox(lcdZBrkOk), cRow)
+    r += 1
+    f_lcdCell(r, "⑧ 上位足方向 (Zone)", lcdEnvTxt + "  |  Zone Rebound Long 設定に対する判定", f_ox(lcdZEnvOk), cRow)
+    r += 1
+    f_lcdCell(r, "⑨ 日足ボラ (Zone用)", lcdZDrTxt, f_ox(lcdZDrOk), cRow)
+    r += 1
+    f_lcdCell(r, "⑩ 通常ボラ (Zone用)", lcdZVolTxt, f_ox(zoneVolOk), cRow)
+    r += 1
+    f_lcdCell(r, "⑪ Accum状態",         lcdAccTxt, useAccumNoTrade ? f_ox(lcdAccOk) : "-", cRow)
+    r += 1
+    f_lcdCell(r, "⑫ Accum離脱方向",     lcdAccDirTxt, useAccumBreakDirection ? f_ox(fvgSig.accumLongDirOk) : "-", cRow)
+    r += 1
+    f_lcdCell(r, "  → Zone Rebound Long Signal",
+         "確定: " + (zlSig.reboundLong ? "成立" : "未成立") + "  /  形成中Preview: " + (zlSig.pvReboundLong ? "成立" : "未成立") +
+         "  |  追跡中イベント " + str.tostring(zlSig.evtCount) + "件",
+         useZoneRebound ? f_ox(zlSig.pvReboundLong) : "-", cSum)
+    r += 1
+
+    f_lcdCell(r, "※ 未公開の内部値",
+         "FVG侵入率 / FVG回復位置 / Accum 5M・15M内訳 / Accum離脱の向き / BOSからの経過本数 は SignalEngine 内部にのみ存在する。" +
+         "推測で再現せず、取得するには SignalEngine 側へ Debug用の出力を追加する必要あり。",
+         "-", cHdr)
+
+// ---- 5.6 出力 (indicator の必須要件を満たすためのダミー) -------------------
+//  値は常に na なのでチャートには何も描画されない。
+plot(na, title = "Long Cond Debug (non-plotting)", display = display.none)
