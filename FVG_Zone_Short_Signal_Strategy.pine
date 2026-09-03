@@ -1822,6 +1822,31 @@ var map<string, float> gTradeSL = map.new<string, float>()
 var map<string, bool>  gTradeBE = map.new<string, bool>()
 var array<string> gLastPlan = array.new_string(3, "-")
 
+// ---- 仮アラート 送信済み管理 (Logicごとに独立) -----------------------------
+//  slot : FVG=0 / FVG15=1 / FVGABS5=2 / FVGABS15=3 /
+//         ZONEREBOUND=4 / ZONEFAKE=5 / ZONERETEST=6 / ZONEBREAK=7
+//  ★ 「送信済みか」の bool だけを持つ。bar_index は一切使わない。
+//    同一Logicにつき、確定シグナルが成立するまで仮アラートは最大1回。
+//      ・次のバーへ移行しても false へは戻さない
+//      ・Preview条件が一度 false へ戻ってから再成立しても戻さない
+//      ・時間経過でも戻さない
+//    再アーム条件はただ1つ、「そのLogicの実Entryが成立したとき」。
+//    その再アームは f_executeTrade() の実Entry成立ブランチで行う。
+//  ★ varip はここだけ。リアルタイム専用の重複防止フラグであり、Entry判定・
+//    Engine state・バックテスト結果には一切関与しない。
+//  ★ Section 05 (実Entry) から参照するため、宣言をここへ置いている。
+varip array<bool> gPvSent = array.new_bool(8, false)
+
+f_pvSlot(string logicId) =>
+    logicId == LOGIC_FVG        ? 0 :
+     logicId == LOGIC_FVG15     ? 1 :
+     logicId == LOGIC_FVG_ABS5  ? 2 :
+     logicId == LOGIC_FVG_ABS15 ? 3 :
+     logicId == LOGIC_ZONE_RB   ? 4 :
+     logicId == LOGIC_ZONE_FK   ? 5 :
+     logicId == LOGIC_ZONE_RT   ? 6 :
+     logicId == LOGIC_ZONE_BK   ? 7 : -1
+
 f_openCountForLogic(string logicId) =>
     int c = 0
     if strategy.opentrades > 0
@@ -1938,6 +1963,51 @@ f_executeTrade(string logicId, int dir, float entryPrice, zn.TradePlan p) =>
                 if useBreakEven
                     gTradeBE.put(eid, false)
                 f_recordPlan(logicId, p, eid)
+                // ============================================================
+                // ★ 確定アラート + 確定シグナルラベル ★
+                //   strategy.entry / strategy.exit と同じ実Entry成立ブランチ。
+                //   実Entry成立 = strategy.entry() = ラベル = 確定Alert を
+                //   1イベントにするため、ここで直接 alert() / label.new() を呼ぶ。
+                //   Section 10 など後段から確定アラートを出す経路は持たない
+                //   (二重発火を構造的に不可能にする)。
+                //   E / SL / TP / RR は strategy.exit へ渡した p の値そのもの。
+                //   zn.buildPlan() を呼び直さないので、表示値と実注文は必ず一致する。
+                //   Bar / Time は非リペイント検証用の識別情報 (項目13)。
+                // ============================================================
+                float cfDist = math.abs(p.sl - p.entry)
+                if useConfirmedAlert
+                    alert("【確定 " + (dir > 0 ? "LONG" : "SHORT") + "】" +
+                         "\nLogic: " + f_logicName(logicId) +
+                         "\n" + syminfo.ticker +
+                         "\nE: "  + f_num(p.entry, "#.##") +
+                         "\nSL: " + f_num(p.sl,    "#.##") +
+                         "\nTP: " + f_num(p.tp,    "#.##") +
+                         "\nE-SL距離: " + f_num(cfDist, "#.##") +
+                         "\nRR: " + f_num(p.rr,    "#.##") +
+                         "\nID: " + eid +
+                         "\nBar: " + str.tostring(bar_index) +
+                         " / time " + str.tostring(time) +
+                         " / close " + str.tostring(time_close), alert.freq_once_per_bar)
+                if showShortSignalLabel
+                    label.new(bar_index, dir > 0 ? low : high,
+                         text = (dir > 0 ? "LONG" : "SHORT") +
+                         "\nE: "  + f_num(p.entry, "#.##") +
+                         "\nSL: " + f_num(p.sl,    "#.##") +
+                         "\nTP: " + f_num(p.tp,    "#.##") +
+                         "\nE-SL距離: " + f_num(cfDist, "#.##") +
+                         "\nRR: " + f_num(p.rr,    "#.##") +
+                         "\nLogic: " + f_logicName(logicId) +
+                         (showTradeDebug ? ("\n" + eid + " · Bar " + str.tostring(bar_index) +
+                          " / t " + str.tostring(time) + " / tc " + str.tostring(time_close)) : ""),
+                         style     = dir > 0 ? label.style_label_up : label.style_label_down,
+                         color     = dir > 0 ? color.new(color.teal, 15) : color.new(color.maroon, 15),
+                         textcolor = color.white,
+                         size      = size.small)
+                // ★ このLogicの仮アラートだけを再アームする。
+                //   これが唯一の再アーム条件 (バー更新 / Preview false / 時間経過では戻さない)。
+                int pslot = f_pvSlot(logicId)
+                if pslot >= 0
+                    array.set(gPvSent, pslot, false)
                 if showEntryLabel
                     string ltxt = eid + "\n" + (dir > 0 ? "LONG" : "SHORT")
                     ltxt := ltxt + "\nE  " + f_num(p.entry, "#.##")
@@ -2877,70 +2947,7 @@ f_canEnter(string logicId, int dir, float entryPrice) =>
             ok := not logicFull and not oppositeConflict and qty >= qtyMin and qty > 0
     ok
 
-// ---- 10.3 仮アラート 管理フラグ (Logicごとに独立) --------------------------
-//  slot : FVG=0 / FVG15=1 / FVGABS5=2 / FVGABS15=3 /
-//         ZONEREBOUND=4 / ZONEFAKE=5 / ZONERETEST=6 / ZONEBREAK=7
-//  ★ Logicごとに「仮アラート送信済みか」の bool だけを持つ。bar_index は使わない。
-//    同一Logicにつき、確定シグナルが成立するまで仮アラートは最大1回。
-//    ・次のバーへ移行しても false へは戻さない。
-//    ・Preview条件が一度 false へ戻ってから再成立しても再送しない。
-//    再アームされるのは1つだけ:
-//      ・確定シグナルが成立した (f_shortConfirmed が false へ戻す)
-//    false = 未送信。
-varip array<bool> gPvSent = array.new_bool(8, false)
-
-f_pvSlot(string logicId) =>
-    logicId == LOGIC_FVG        ? 0 :
-     logicId == LOGIC_FVG15     ? 1 :
-     logicId == LOGIC_FVG_ABS5  ? 2 :
-     logicId == LOGIC_FVG_ABS15 ? 3 :
-     logicId == LOGIC_ZONE_RB   ? 4 :
-     logicId == LOGIC_ZONE_FK   ? 5 :
-     logicId == LOGIC_ZONE_RT   ? 6 :
-     logicId == LOGIC_ZONE_BK   ? 7 : -1
-
-// ---- 10.4 確定Short : アラート + ラベル ------------------------------------
-//  ★ 表示する数値は「実際に strategy.exit へ渡された TradePlan」と同じ値。
-//    f_executeTrade() が内部で使ったのと同じ引数 (dir = -1, 同じ entryPrice) で
-//    zn.buildPlan() を呼び直している。buildPlan は読み取り専用かつ決定的なので、
-//    同じバー・同じ引数なら必ず同じ p.entry / p.sl / p.tp / p.rr が返る。
-//    RR は独自計算せず p.rr をそのまま使う (Structural TP / Fallback RR TP の
-//    既存判定とのズレを防ぐため)。
-//  ★ E-SL距離 は Short なので SL - E だが、表示は正の距離にするため
-//    math.abs(SL - E) を使う。
-f_shortConfirmed(string eid, string logicId, float entryPrice) =>
-    if eid != ""
-        zn.TradePlan p = zn.buildPlan(zoneEng, zoneCfg, -1, entryPrice)
-        float dist = math.abs(p.sl - p.entry)
-        string body = "Logic: " + f_logicName(logicId) +
-             "\nE: "  + f_num(p.entry, "#.##") +
-             "\nSL: " + f_num(p.sl,    "#.##") +
-             "\nTP: " + f_num(p.tp,    "#.##") +
-             "\nE-SL距離: " + f_num(dist,  "#.##") +
-             "\nRR: " + f_num(p.rr,    "#.##")
-        if useConfirmedAlert
-            alert("【確定 SHORT】\n" + body, alert.freq_all)
-        if showShortSignalLabel
-            label.new(bar_index, high,
-                 text = "SHORT" +
-                 "\nE: "  + f_num(p.entry, "#.##") +
-                 "\nSL: " + f_num(p.sl,    "#.##") +
-                 "\nTP: " + f_num(p.tp,    "#.##") +
-                 "\nE-SL距離: " + f_num(dist, "#.##") +
-                 "\nRR: " + f_num(p.rr,    "#.##") +
-                 "\nLogic: " + f_logicName(logicId),
-                 style     = label.style_label_down,
-                 color     = color.new(color.maroon, 15),
-                 textcolor = color.white,
-                 size      = size.small)
-        // 確定したらこのLogicの仮通知状態をリセット (次の機会に備える)
-        // ★ これが唯一の仮アラート再アーム条件。
-        int s = f_pvSlot(logicId)
-        if s >= 0
-            array.set(gPvSent, s, false)
-    true
-
-// ---- 10.5 仮Short : アラートのみ (ラベルなし) ------------------------------
+// ---- 10.3 仮Short : アラートのみ (ラベルなし) ------------------------------
 //  would : Preview Short (確定足条件だけを外したSignal) が成立し、その上で
 //          Group制御 / 優先順位 / TradePlan / Qty / Position制御 を通過して
 //          「今確定すればEntryできる」状態か。
@@ -2948,7 +2955,7 @@ f_shortConfirmed(string eid, string logicId, float entryPrice) =>
 //            ここで raw を別に受け取る必要はない。
 //  ★ 同一Logicにつき、確定シグナル成立まで最大1回。
 //    Preview条件が一度消えて再成立しても、バーが変わっても再送しない。
-//    再アームは「確定シグナル成立時」だけ (f_shortConfirmed が false へ戻す)。
+//    再アームは「実Entry成立時」だけ (Section 05 の f_executeTrade が false へ戻す)。
 f_shortProvisional(string logicId, bool would) =>
     int s = f_pvSlot(logicId)
     if s >= 0 and would and not array.get(gPvSent, s)
@@ -2959,7 +2966,7 @@ f_shortProvisional(string logicId, bool would) =>
              "\nE: " + f_num(close, "#.##"), alert.freq_all)
     true
 
-// ---- 10.6 Preview Short (確定足条件だけを外したSignal) ---------------------
+// ---- 10.4 Preview Short (確定足条件だけを外したSignal) ---------------------
 //  ★ ここでは条件を1つも組み直さない。全て SignalEngine が確定Signalと
 //    同じ式・同じ順序で計算した Preview 出力をそのまま受け取る。
 //    → 確定Entry条件を変更したら Preview も同じ場所で必ず追従するため、
@@ -2990,7 +2997,7 @@ bool provZrtShortRaw = zlSig.pvRetestShort
 bool provZbkLongRaw  = zlSig.pvBreakLong
 bool provZbkShortRaw = zlSig.pvBreakShort
 
-// ---- 10.7 「今確定すればEntryできるか」判定 --------------------------------
+// ---- 10.5 「今確定すればEntryできるか」判定 --------------------------------
 //  useProvisionalAlert / raw / gateOk が揃ったときにしか f_canEnter() を
 //  呼ばないので、OFF時は zn.buildPlan() の追加呼び出しも発生しない。
 f_provWouldEnter(string logicId, int dir, bool raw, bool gateOk) =>
@@ -3041,21 +3048,15 @@ bool provWZrtS = f_provWouldEnter(LOGIC_ZONE_RT, -1, provZrtShortRaw, not provWZ
 bool provWZbkL = f_provWouldEnter(LOGIC_ZONE_BK, 1, provZbkLongRaw, true)
 bool provWZbkS = f_provWouldEnter(LOGIC_ZONE_BK, -1, provZbkShortRaw, not provWZbkL)
 
-// ---- 10.8 発火 (Short のみ) ------------------------------------------------
-//  ★ 確定を先に処理する。確定側が gPvSent を false へ戻す = 再アームなので、
-//    「次のシグナル機会」の仮アラートは同じスクリプト実行内でも取りこぼさない。
-//    確定と同じ機会に対する2回目の仮アラートは出ない。実発注が成立した時点で
-//    Section 07 が event を consume し (armed解除)、position制御 / maxOpenPerLogic
-//    も効くため、そのLogicの would が同じ機会のまま true へ戻ることはない。
-f_shortConfirmed(fvg15EidShort, LOGIC_FVG15,     fvg15Sig.entryPrice)
-f_shortConfirmed(fvgEidShort,   LOGIC_FVG,       fvgSig.entryPrice)
-f_shortConfirmed(abs15EidShort, LOGIC_FVG_ABS15, absSig.entryPrice)
-f_shortConfirmed(abs5EidShort,  LOGIC_FVG_ABS5,  absSig.entryPrice)
-f_shortConfirmed(zrbEidShort,   LOGIC_ZONE_RB,   zlSig.entryPrice)
-f_shortConfirmed(zfkEidShort,   LOGIC_ZONE_FK,   zlSig.entryPrice)
-f_shortConfirmed(zrtEidShort,   LOGIC_ZONE_RT,   zlSig.entryPrice)
-f_shortConfirmed(zbkEidShort,   LOGIC_ZONE_BK,   zlSig.entryPrice)
-
+// ---- 10.6 発火 (仮アラートのみ) ------------------------------------------------
+//  ★ 確定アラート / 確定ラベル / 仮アラートの再アームは、すべて Section 05 の
+//    f_executeTrade() 内 (strategy.entry と同じ実Entry成立ブランチ) で済んでいる。
+//    ここは仮アラートを出すだけ。Section 07 の実Entryは既に処理済みなので、
+//    実Entryが成立したLogicの gPvSent は この時点で既に false へ戻っている。
+//    それでも「確定と同じ機会に対する2回目の仮アラート」は出ない。実発注が
+//    成立した時点で Section 07 が event を consume し (armed解除)、position制御 /
+//    maxOpenPerLogic も効くため、そのLogicの would が同じ機会のまま true へ
+//    戻ることはない。
 f_shortProvisional(LOGIC_FVG15,     provWFvg15S)
 f_shortProvisional(LOGIC_FVG,       provWFvgS)
 f_shortProvisional(LOGIC_FVG_ABS15, provWAbs15S)
