@@ -190,6 +190,15 @@ export type FvgCfg
     int    accumExitConfirmBars      = 2
     bool   useAccumBreakDirection    = true
     int    accumBreakDirectionBars   = 10
+    //  ★ Accum内 Zone位置例外 (既定 false = 従来動作と完全一致)
+    //    true のとき「現在価格がAccum内」でも、そのAccum箱と Zone中央値 の
+    //    位置関係が条件を満たしていれば、その方向のAccum NoTradeだけを解除する。
+    //      Long  : AccumLow  >= 有効Support Zone の中央値
+    //      Short : AccumHigh <= 有効Resistance Zone の中央値
+    //    Zone の探索は Main が行い、その結果 (中央値) だけを FvgFeed で受け取る。
+    //    ★ 解除するのは Accum NoTrade だけ。Entry条件を1つも増減させない。
+    //    ★ Accum離脱後確認 / 離脱方向フィルター / 保持数 / 5M・15M判定 は不変。
+    bool   useAccumZoneException     = false
     bool   useEFVGEnv                = true
     string efvgCombineMode           = "TrendAndFVG"
     bool   useEFVGDaily              = false
@@ -273,6 +282,16 @@ export type FvgFeed
     float acc15Lo = na
     int   acc15St = na
     bool  new15Bar = false
+    // Accum内 Zone位置例外 (c.useAccumZoneException = true のときだけ使う)
+    //  accZnSupCtr : 有効Support Zone のうち「中央値が最も低い」ものの中央値
+    //  accZnResCtr : 有効Resistance Zone のうち「中央値が最も高い」ものの中央値
+    //  ★ 判定式は AccumLow >= 中央値 / AccumHigh <= 中央値 の単調条件なので、
+    //    「Accumの下側にある最も近いSupport」が条件を満たすことと
+    //    「中央値が最も低いSupportが条件を満たすこと」は完全に等価。
+    //    そのため Main は 1回のZone走査でこの2値を求めるだけでよい。
+    //  ★ どちらも na のときは例外なし = 従来どおり NoTrade。
+    float accZnSupCtr = na
+    float accZnResCtr = na
 
 // ---- FvgEngine : FVG Logic の永続状態 (Logicごとに独立) -------------------
 export type FvgEngine
@@ -321,6 +340,11 @@ export type FvgSignal
     bool  trendOk           = false
     bool  volOk             = false
     bool  blockedByAccum    = false
+    // ★ 追加: Accum NoTrade を方向別に分けたもの。
+    //   useAccumZoneException = false のときは blockedByAccum と常に同値。
+    //   true のときだけ、Zone位置例外が成立した方向が false になる。
+    bool  blockedByAccumLong  = false
+    bool  blockedByAccumShort = false
     bool  blockedByExitWait = false
     // ★ 追加: Accum離脱方向Filterの結果。計算式は既存のまま、値を外へ出すだけ。
     //   FVG吸収系列がこの結果を再利用し、Accum判定を二重に計算しないようにする。
@@ -1497,9 +1521,19 @@ export updateFvg(FvgEngine e, FvgCfg c, FvgTrigCfg tc, FvgAccCfg ac, FvgFeed f,
         dailyRegimeShortOk := dailyRegimeOk
 
 
-    // ---- Accumulation NoTrade (変更なし) -----------------------------------
+    // ---- Accumulation NoTrade ----------------------------------------------
+    //  ★ insideAccum5M / insideAccum15M / blockedByAccum の式は従来のまま。
+    //    離脱後確認 / 離脱方向フィルター / 保持数 / 5M・15M判定は一切変更しない。
+    //  ★ 追加したのは「方向別のブロック判定」だけ:
+    //    blkAcc*Long / blkAcc*Short は insideAccum* と同じ箱ループの中で求める
+    //    (走査回数は増えない)。c.useAccumZoneException = false なら
+    //    blkAcc*Long / blkAcc*Short は insideAccum* と常に同値になる。
     bool insideAccum5M  = false
     bool insideAccum15M = false
+    bool blkAcc5Long   = false
+    bool blkAcc5Short  = false
+    bool blkAcc15Long  = false
+    bool blkAcc15Short = false
 
     if c.useAccumNoTrade and c.useAccumNT5M
         [isA5, hi5, lo5] = f_accumNTDetect(ac, accumNTRangeLen, accumNTBaseLen, accumNTAtrLen)
@@ -1526,8 +1560,16 @@ export updateFvg(FvgEngine e, FvgCfg c, FvgTrigCfg tc, FvgAccCfg ac, FvgFeed f,
                 array.set(e.a5Lo, array.size(e.a5Lo) - 1, e.a5BoxLo)
         if array.size(e.a5St) > 0
             for i = 0 to array.size(e.a5St) - 1
-                if close >= array.get(e.a5Lo, i) and close <= array.get(e.a5Hi, i)
+                float _aLo = array.get(e.a5Lo, i)
+                float _aHi = array.get(e.a5Hi, i)
+                if close >= _aLo and close <= _aHi
                     insideAccum5M := true
+                    // その箱について Long / Short の Zone位置例外を判定する。
+                    // 例外が成立しない箱の中にいる限り、その方向はブロックのまま。
+                    if not (c.useAccumZoneException and not na(f.accZnSupCtr) and _aLo >= f.accZnSupCtr)
+                        blkAcc5Long := true
+                    if not (c.useAccumZoneException and not na(f.accZnResCtr) and _aHi <= f.accZnResCtr)
+                        blkAcc5Short := true
 
     if c.useAccumNoTrade and c.useAccumNT15M
         // 確定15分足のAccum箱と「新しい15分足が始まったか」は Main が Feed へ入れる
@@ -1546,10 +1588,23 @@ export updateFvg(FvgEngine e, FvgCfg c, FvgTrigCfg tc, FvgAccCfg ac, FvgFeed f,
                 array.set(e.a15Lo, array.size(e.a15Lo) - 1, f.acc15Lo)
         if array.size(e.a15St) > 0
             for i = 0 to array.size(e.a15St) - 1
-                if close >= array.get(e.a15Lo, i) and close <= array.get(e.a15Hi, i)
+                float _aLo15 = array.get(e.a15Lo, i)
+                float _aHi15 = array.get(e.a15Hi, i)
+                if close >= _aLo15 and close <= _aHi15
                     insideAccum15M := true
+                    if not (c.useAccumZoneException and not na(f.accZnSupCtr) and _aLo15 >= f.accZnSupCtr)
+                        blkAcc15Long := true
+                    if not (c.useAccumZoneException and not na(f.accZnResCtr) and _aHi15 <= f.accZnResCtr)
+                        blkAcc15Short := true
 
     bool blockedByAccum = c.useAccumNoTrade and ((c.useAccumNT5M and insideAccum5M) or (c.useAccumNT15M and insideAccum15M))
+    //  ★ 方向別。式の形は blockedByAccum と完全に同じで、inside* を
+    //    「例外が成立しなかった箱の中にいるか」に置き換えただけ。
+    //    useAccumZoneException = false なら 3つとも同値になる。
+    //  ★ blockedByAccum 自体は従来のまま使う。離脱後確認 / 離脱方向 /
+    //    e.prevBlockedByAccum は方向別の値を一切参照しない。
+    bool blockedByAccumLong  = c.useAccumNoTrade and ((c.useAccumNT5M and blkAcc5Long)  or (c.useAccumNT15M and blkAcc15Long))
+    bool blockedByAccumShort = c.useAccumNoTrade and ((c.useAccumNT5M and blkAcc5Short) or (c.useAccumNT15M and blkAcc15Short))
 
 
     bool exitedAccumThisBar =
@@ -1644,7 +1699,7 @@ export updateFvg(FvgEngine e, FvgCfg c, FvgTrigCfg tc, FvgAccCfg ac, FvgFeed f,
          f.newsOk and
          finalEnvLongOk and
          volOk and
-         not blockedByAccum and
+         not blockedByAccumLong and
          not blockedByAccumExitWait and
          accumLongDirectionOk
     bool shortMajorOk =
@@ -1653,7 +1708,7 @@ export updateFvg(FvgEngine e, FvgCfg c, FvgTrigCfg tc, FvgAccCfg ac, FvgFeed f,
          f.newsOk and
          finalEnvShortOk and
          volOk and
-         not blockedByAccum and
+         not blockedByAccumShort and
          not blockedByAccumExitWait and
          accumShortDirectionOk
 
@@ -1722,6 +1777,8 @@ export updateFvg(FvgEngine e, FvgCfg c, FvgTrigCfg tc, FvgAccCfg ac, FvgFeed f,
          trendOk           = efvgTrendOk,
          volOk             = volOk,
          blockedByAccum    = blockedByAccum,
+         blockedByAccumLong  = blockedByAccumLong,
+         blockedByAccumShort = blockedByAccumShort,
          blockedByExitWait = blockedByAccumExitWait,
          accumLongDirOk    = accumLongDirectionOk,
          accumShortDirOk   = accumShortDirectionOk,
@@ -2469,6 +2526,9 @@ export type ZoneEnvFeed
     bool  newsOk    = false
     bool  volOk     = false
     bool  blockedByAccum    = false
+    // 方向別 Accum NoTrade (FvgSignal.blockedByAccumLong / Short をそのまま渡す)
+    bool  blockedByAccumLong  = false
+    bool  blockedByAccumShort = false
     bool  blockedByExitWait = false
     bool  accumLongDirOk  = true
     bool  accumShortDirOk = true
@@ -2715,13 +2775,17 @@ export zoneDailyVolOk(ZoneCommonCfg c, ZoneEnvFeed f) =>
     _match and not _block
 
 // @function  Zone 4Logic 共通の基礎環境 (方向に依存しない部分)。
-//   Session / News / 通常ボラ / 日足ボラ / Accum NoTrade / Accum離脱待機。
+//   Session / News / 通常ボラ / 日足ボラ / Accum離脱待機。
+//   ★ Accum NoTrade は方向別 (blockedByAccumLong / blockedByAccumShort) になったため
+//     zoneEnvLong / zoneEnvShort 側へ移した。判定式そのものは変わっていない:
+//     useAccumZoneException = false なら方向別の値は blockedByAccum と同値なので、
+//     zoneEnvLong / zoneEnvShort の結果は修正前と完全に一致する。
 // @param c  ZoneCommonCfg
 // @param f  ZoneEnvFeed
 // @returns  bool
 export zoneBaseEnvOk(ZoneCommonCfg c, ZoneEnvFeed f) =>
     f.sessionOk and f.newsOk and f.volOk and zoneDailyVolOk(c, f) and
-     not f.blockedByAccum and not f.blockedByExitWait
+     not f.blockedByExitWait
 
 // @function  Zone 1ロジックぶんの Long 環境条件。
 // @param c  ZoneCommonCfg
@@ -2729,7 +2793,7 @@ export zoneBaseEnvOk(ZoneCommonCfg c, ZoneEnvFeed f) =>
 // @param t  そのロジックのLong側 ZoneTfEnvCfg
 // @returns  bool
 export zoneEnvLong(ZoneCommonCfg c, ZoneEnvFeed f, ZoneTfEnvCfg t) =>
-    zoneBaseEnvOk(c, f) and f.accumLongDirOk and zoneTfEnvOk(t, f.env4H, f.env1H, f.env15M)
+    zoneBaseEnvOk(c, f) and not f.blockedByAccumLong and f.accumLongDirOk and zoneTfEnvOk(t, f.env4H, f.env1H, f.env15M)
 
 // @function  Zone 1ロジックぶんの Short 環境条件。
 // @param c  ZoneCommonCfg
@@ -2737,7 +2801,7 @@ export zoneEnvLong(ZoneCommonCfg c, ZoneEnvFeed f, ZoneTfEnvCfg t) =>
 // @param t  そのロジックのShort側 ZoneTfEnvCfg
 // @returns  bool
 export zoneEnvShort(ZoneCommonCfg c, ZoneEnvFeed f, ZoneTfEnvCfg t) =>
-    zoneBaseEnvOk(c, f) and f.accumShortDirOk and zoneTfEnvOk(t, f.env4H, f.env1H, f.env15M)
+    zoneBaseEnvOk(c, f) and not f.blockedByAccumShort and f.accumShortDirOk and zoneTfEnvOk(t, f.env4H, f.env1H, f.env15M)
 
 // ---- 8B-4 メイン更新 -------------------------------------------------------
 
