@@ -2580,6 +2580,21 @@ export type ZoneCommonCfg
     //    ★ 接触 / 接近方向 / BOS / 待機期限 / Break による候補失効など、Rebound の
     //      その他の状態遷移は一切変更しない。変えるのは最低回復位置だけ。
     float  reboundRecoveryRatio = 1.0
+    //  ★ Zone Break (LOGIC_ZONEBREAK) 専用の上書き設定 ★
+    //    Rebound / FakeBreak / Break Retest が参照する共通設定
+    //    (waitBars / reqDailyVol / dailyLowVol / dailyHighVol) は一切変更せず、
+    //    Zone Break の Entry判定だけ別の値で評価できるようにするためのもの。
+    //    既定値は共通側と同じなので、Main が設定しなければ従来と完全に一致する。
+    //      breakWaitBars     : Zone接近から 5M Break確定 までの有効期限 (精密TF本数)
+    //      breakReqDailyVol  : Zone Break 用の日足ボラ要求区分
+    //      breakDailyLowVol  : Zone Break 用の低ボラ上限
+    //      breakDailyHighVol : Zone Break 用の高ボラ下限
+    //    ★ ZoneEngine の Break判定 / Zone State管理そのものは分離していない。
+    //      分離したのは「ZONEBREAK の Entry判定に使う設定」だけ。
+    int    breakWaitBars     = 30
+    string breakReqDailyVol  = "OFF"
+    float  breakDailyLowVol  = 0.0
+    float  breakDailyHighVol = 80.0
 
 // @type  共通フィルタの「結果」だけを受け取る (再計算も request も増やさない)。
 export type ZoneEnvFeed
@@ -2637,6 +2652,11 @@ export type ZoneEvt
     //  ★ Rebound候補が精密TFのBreakでキャンセルされたか。
     //    Rebound の挙動を改修前と完全一致させるためだけに存在する。
     //    Break / FakeBreak / Retest の phase 遷移には使わない。
+    //  ★ 共通 waitBars を超えてから先も Zone Break のためだけに生かしている
+    //    イベント。Rebound / FakeBreak / Break Retest からは完全に不可視で、
+    //    Break が成立した時点で即座に alive = false にする。
+    //    breakWaitBars <= waitBars のとき (既定) は永久に false のまま。
+    bool  bkOnly      = false
     bool  rbCancelled = false
     bool  reboundDone = false
     bool  breakDone   = false
@@ -2861,6 +2881,49 @@ export zoneBaseEnvOk(ZoneCommonCfg c, ZoneEnvFeed f) =>
     f.sessionOk and f.newsOk and f.volOk and zoneDailyVolOk(c, f) and
      not f.blockedByExitWait
 
+// @function  Zone Break 専用の日足ボラ判定。zoneDailyVolOk と式は完全に同一で、
+//   参照する閾値と要求区分だけ Zone Break 専用フィールドにしたもの。
+//   breakReqDailyVol / breakDailyLowVol / breakDailyHighVol を共通側と同じ値に
+//   しておけば zoneDailyVolOk と完全に同じ結果になる。
+// @param c  ZoneCommonCfg
+// @param f  ZoneEnvFeed
+// @returns  bool
+export zoneDailyVolOkBreak(ZoneCommonCfg c, ZoneEnvFeed f) =>
+    int _code = na
+    if not na(f.drMedianRange)
+        _code := f.drMedianRange >= c.breakDailyHighVol ? 1 : f.drMedianRange < c.breakDailyLowVol ? -1 : 0
+    bool _insufficient = na(_code)
+    int _codeAdj = _insufficient ? (c.insufficientAsRange ? 0 : na) : _code
+    string _text = dailyVolatilityText(_codeAdj)
+    bool _match = c.breakReqDailyVol == "OFF" or _text == c.breakReqDailyVol
+    bool _block = c.breakReqDailyVol != "OFF" and _insufficient and not c.insufficientAsRange
+    _match and not _block
+
+// @function  Zone Break 専用の基礎環境。zoneBaseEnvOk と同じ式で、
+//   日足ボラだけ Zone Break 専用の判定を使う。
+// @param c  ZoneCommonCfg
+// @param f  ZoneEnvFeed
+// @returns  bool
+export zoneBaseEnvOkBreak(ZoneCommonCfg c, ZoneEnvFeed f) =>
+    f.sessionOk and f.newsOk and f.volOk and zoneDailyVolOkBreak(c, f) and
+     not f.blockedByExitWait
+
+// @function  Zone Break 専用の Long 環境条件。zoneEnvLong と同じ式。
+// @param c  ZoneCommonCfg
+// @param f  ZoneEnvFeed
+// @param t  Zone Break Long の ZoneTfEnvCfg
+// @returns  bool
+export zoneEnvLongBreak(ZoneCommonCfg c, ZoneEnvFeed f, ZoneTfEnvCfg t) =>
+    zoneBaseEnvOkBreak(c, f) and not f.blockedByAccumLong and f.accumLongDirOk and zoneTfEnvOk(t, f.env4H, f.env1H, f.env15M)
+
+// @function  Zone Break 専用の Short 環境条件。zoneEnvShort と同じ式。
+// @param c  ZoneCommonCfg
+// @param f  ZoneEnvFeed
+// @param t  Zone Break Short の ZoneTfEnvCfg
+// @returns  bool
+export zoneEnvShortBreak(ZoneCommonCfg c, ZoneEnvFeed f, ZoneTfEnvCfg t) =>
+    zoneBaseEnvOkBreak(c, f) and not f.blockedByAccumShort and f.accumShortDirOk and zoneTfEnvOk(t, f.env4H, f.env1H, f.env15M)
+
 // @function  Zone 1ロジックぶんの Long 環境条件。
 // @param c  ZoneCommonCfg
 // @param f  ZoneEnvFeed
@@ -2952,8 +3015,9 @@ export updateZoneEvents(ZoneEvtEngine e, ZoneCommonCfg c, ZoneEnvFeed f, ZoneEnv
     bool envFkS = zoneEnvShort(c, f, v.fkShort)
     bool envRtL = zoneEnvLong(c, f, v.rtLong)
     bool envRtS = zoneEnvShort(c, f, v.rtShort)
-    bool envBkL = zoneEnvLong(c, f, v.bkLong)
-    bool envBkS = zoneEnvShort(c, f, v.bkShort)
+    //  ★ Zone Break だけは専用の日足ボラ設定で判定する (他3Logicは共通設定のまま)。
+    bool envBkL = zoneEnvLongBreak(c, f, v.bkLong)
+    bool envBkS = zoneEnvShortBreak(c, f, v.bkShort)
 
     bool aRbL = c.useRebound and c.enableLong  and envRbL and not openRebound
     bool aRbS = c.useRebound and c.enableShort and envRbS and not openRebound
@@ -2973,6 +3037,20 @@ export updateZoneEvents(ZoneEvtEngine e, ZoneCommonCfg c, ZoneEnvFeed f, ZoneEnv
             if not d.alive
                 array.remove(e.evts, i)
     //   追跡上限 (古いものから捨てる)。Zone数は有限なので通常は到達しない。
+    //   ★ Zone Break のためだけに延命している bkOnly イベントを先に捨てる。
+    //     これにより、breakWaitBars を長くしても Rebound / FakeBreak /
+    //     Break Retest の生存イベントが押し出されることはない。
+    //     bkOnly が1件も無いとき (既定 breakWaitBars <= waitBars) は
+    //     下の従来どおりの FIFO だけが働くので、挙動は修正前と完全に一致する。
+    if array.size(e.evts) > 60
+        int _cut = array.size(e.evts) - 60
+        int _bi  = 0
+        while _cut > 0 and _bi < array.size(e.evts)
+            if array.get(e.evts, _bi).bkOnly
+                array.remove(e.evts, _bi)
+                _cut -= 1
+            else
+                _bi += 1
     while array.size(e.evts) > 60
         array.remove(e.evts, 0)
 
@@ -3177,9 +3255,19 @@ export updateZoneEvents(ZoneEvtEngine e, ZoneCommonCfg c, ZoneEnvFeed f, ZoneEnv
                             //  待機本数の期限は改修前と同じ精密TF本数で数える。
                             //  (Rebound は rbCancelled で既に失効しているため、
                             //   ここで期限切れにしても Rebound の出力は変わらない。)
-                            if e.barNo - q.startBar > c.waitBars
+                            //  ★ 共通 waitBars を超えたイベントは bkOnly にする。
+                            //    bkOnly は Rebound / FakeBreak / Break Retest からは
+                            //    完全に不可視で、Zone Break の判定にしか使わない。
+                            //    イベント自体は breakWaitBars まで生かす。
+                            //    breakWaitBars <= waitBars (既定) のときは
+                            //    max() が waitBars になるので、bkOnly が立った次の行で
+                            //    必ず alive = false になり、修正前と完全に同じ挙動になる。
+                            int _el0 = e.barNo - q.startBar
+                            if _el0 > c.waitBars
+                                q.bkOnly := true
+                            if _el0 > math.max(c.waitBars, c.breakWaitBars)
                                 q.alive := false
-                            if q.alive and not q.rbCancelled and not q.reboundDone and q.movedAway and iRb < 0
+                            if q.alive and not q.bkOnly and not q.rbCancelled and not q.reboundDone and q.movedAway and iRb < 0
                                 if q.side > 0 and tb and aRbL
                                     rbL := true
                                     iRb := i
@@ -3294,26 +3382,45 @@ export updateZoneEvents(ZoneEvtEngine e, ZoneCommonCfg c, ZoneEnvFeed f, ZoneEnv
             if qb.alive and qb.phase == 0
                 bool brk5m = qb.side > 0 ? brkClose < qb.bottom - c.breakBuffer : brkClose > qb.top + c.breakBuffer
                 if brk5m
-                    qb.phase      := 1
-                    qb.breakBar   := e.barNo
-                    qb.breakDir   := -qb.side
-                    qb.breakTime  := time
-                    qb.brkTfSec   := brkTfSec
-                    qb.fakeAlive  := true
-                    qb.reclaimed  := false
-                    qb.reclaimBar := na
-                    qb.touched    := false
-                    qb.rejected   := false
-                    qb.rejectBar  := na
-                    //  Zone Break 単体は、この 5M Break が確定した瞬間にSignalを出す。
-                    if not qb.breakDone and iBk < 0
-                        // Support下抜け → Short / Resistance上抜け → Long
-                        if qb.side > 0 and aBkS
-                            bkS := true
-                            iBk := i
-                        else if qb.side < 0 and aBkL
-                            bkL := true
-                            iBk := i
+                    //  Zone Break の有効期限は専用の breakWaitBars で数える。
+                    //  breakWaitBars = waitBars (既定) のとき、alive なイベントは
+                    //  必ず _elB <= waitBars なので _bkSigOk は常に true になり、
+                    //  修正前と完全に同じ判定になる。
+                    int  _elB    = e.barNo - qb.startBar
+                    bool _bkSigOk = _elB <= c.breakWaitBars
+                    if qb.bkOnly
+                        //  共通 waitBars を超えてから Break したイベント。
+                        //  Zone Break のSignalだけ出し、phase 1 へは進めない。
+                        //  → FakeBreak / Break Retest の候補には一切ならない。
+                        if _bkSigOk and not qb.breakDone and iBk < 0
+                            if qb.side > 0 and aBkS
+                                bkS := true
+                                iBk := i
+                            else if qb.side < 0 and aBkL
+                                bkL := true
+                                iBk := i
+                        qb.alive := false
+                    else
+                        qb.phase      := 1
+                        qb.breakBar   := e.barNo
+                        qb.breakDir   := -qb.side
+                        qb.breakTime  := time
+                        qb.brkTfSec   := brkTfSec
+                        qb.fakeAlive  := true
+                        qb.reclaimed  := false
+                        qb.reclaimBar := na
+                        qb.touched    := false
+                        qb.rejected   := false
+                        qb.rejectBar  := na
+                        //  Zone Break 単体は、この 5M Break が確定した瞬間にSignalを出す。
+                        if _bkSigOk and not qb.breakDone and iBk < 0
+                            // Support下抜け → Short / Resistance上抜け → Long
+                            if qb.side > 0 and aBkS
+                                bkS := true
+                                iBk := i
+                            else if qb.side < 0 and aBkL
+                                bkL := true
+                                iBk := i
 
     e.sigRebound := iRb
     e.sigFake    := iFk
