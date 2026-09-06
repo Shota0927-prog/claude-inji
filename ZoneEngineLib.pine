@@ -324,6 +324,9 @@ export type ZoneTrack
     float evalRef      = na       // 評価基準価格 (Support = Zone上限 / Resist = Zone下限)
     float evalBest     = na       // 期間中の最大有利方向移動
     bool  evalIsFirst  = true     // その評価が初回タッチぶんか (初回は減点しない)
+    //  直前の確定Break判定足の終値。lastRole = 0 の新しいZoneで接近方向を
+    //  判定するためだけに使う。ADAPTIVE でしか更新しない。
+    float prevBrClose  = na
 
 // ---- ZoneFeed : Main Strategy が request.security で取得した外部入力 ------
 //  ※ Library は request.*() を呼べないため、上位足/下位足の値はここで受け取る。
@@ -483,6 +486,38 @@ f_reactionBonus(int cnt, ZoneCfg c) =>
 f_confluenceBonus(int catCount, ZoneCfg c) =>
     catCount >= 4 ? c.confBonus4 : catCount == 3 ? c.confBonus3 : catCount == 2 ? c.confBonus2 : 0.0
 
+// ---- ADAPTIVE : 設定値の内部クランプ --------------------------------------
+//  ★ input そのものは削除も固定もしない。ここで「内部計算に使う値」だけを
+//    矛盾しない範囲へ丸める。すべて ADAPTIVE 経路からしか呼ばれないため、
+//    LEGACY の計算には一切関与しない。
+//      ・幅 / 距離 / 減点 / 閾値 は負数にしない
+//      ・Maximum Width < Minimum Width にならない
+//      ・Medium Density Span < Tight Density Span にならない
+//      ・Strong Move Threshold < Weak Move Threshold にならない
+//      ・評価本数は 1 本以上
+f_adpMinW(ZoneCfg c) =>
+    math.max(0.0, c.adaptiveMinWidth)
+f_adpPad(ZoneCfg c) =>
+    math.max(0.0, c.adaptiveEdgePad)
+f_adpMaxW(ZoneCfg c) =>
+    math.max(f_adpMinW(c), math.max(0.0, c.adaptiveMaxWidth))
+f_adpTightSpan(ZoneCfg c) =>
+    math.max(0.0, c.densityTightSpan)
+f_adpMedSpan(ZoneCfg c) =>
+    math.max(f_adpTightSpan(c), math.max(0.0, c.densityMediumSpan))
+f_adpRearm(ZoneCfg c) =>
+    math.max(0.0, c.retouchRearmDist)
+f_adpWeakThr(ZoneCfg c) =>
+    math.max(0.0, c.weakMoveThr)
+f_adpStrongThr(ZoneCfg c) =>
+    math.max(f_adpWeakThr(c), math.max(0.0, c.strongMoveThr))
+f_adpEvalBars(ZoneCfg c) =>
+    math.max(1, c.weakEvalBars)
+f_adpPenPer(ZoneCfg c) =>
+    math.max(0.0, c.weakPenaltyPer)
+f_adpPenMax(ZoneCfg c) =>
+    math.max(0.0, c.weakPenaltyMax)
+
 // ADAPTIVE : 根拠の密集度による加点。
 //   判定幅は外側余白を含まない rootSpan。独立根拠 (Source Group) が2つ未満なら0点。
 //   grpN   : 重複を除いた独立根拠数
@@ -490,9 +525,9 @@ f_confluenceBonus(int catCount, ZoneCfg c) =>
 f_densityBonus(int grpN, float span, ZoneCfg c) =>
     float b = 0.0
     if grpN >= 2 and not na(span)
-        if span <= c.densityTightSpan
+        if span <= f_adpTightSpan(c)
             b := c.densityTightBonus
-        else if span <= c.densityMediumSpan
+        else if span <= f_adpMedSpan(c)
             b := c.densityMediumBonus
     b
 
@@ -858,6 +893,12 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
     array<int>    uids   = array.new_int()
     array<string> grpKey = array.new_string()
     array<int>    grpCnt = array.new_int()
+    //  ★ 密集度 (Density) 用の独立根拠キー。表示用の grpKey とは別に持つ。
+    //    grpKey は Zone.sources の文字列生成に使われており、LEGACY の
+    //    ラベル / Debug Table 表示に直結するため一切変更しない。
+    //    こちらは Accum に instId を含めるので、同一TFでも世代 (instance) が
+    //    違えば別の独立根拠として数えられる。ADAPTIVE でしか作らない。
+    array<string> denKey = array.new_string()
 
     int n = array.size(members)
     for j = 0 to n - 1
@@ -954,6 +995,20 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
             array.push(grpKey, gk)
             array.push(grpCnt, 1)
 
+        //  ---- 密集度用の独立根拠キー (ADAPTIVE のみ) ----------------------
+        //    MA1 / MA2 / 各TF Swing / Day High / Day Low /
+        //    Prev Day High / Prev Day Low  … 既存どおり srcLabel ベース
+        //    Accum … srcTf + instId + High/Low で1根拠 (世代ごとに独立)
+        //    同じTF・同じ instId・同じ High/Low の重複登録は1根拠のまま。
+        if c.adaptiveMode
+            string dk = m.srcLabel
+            if isSwing
+                dk := m.srcTf + " Swing"
+            else if m.srcCat == CAT_ACC
+                dk := m.srcTf + "#" + str.tostring(m.instId) + " Accum " + (isAccHi ? "High" : "Low")
+            if array.indexof(denKey, dk) < 0
+                array.push(denKey, dk)
+
     string htfStr = ""
     if htfSw1h
         htfStr := htfStr + (htfStr == "" ? "" : " / ") + f_tfName(c.hzTf3) + " Swing"
@@ -997,7 +1052,8 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
             rMin := na(rMin) ? mc : math.min(rMin, mc)
             rMax := na(rMax) ? mc : math.max(rMax, mc)
     float rSpan = na(rMin) or na(rMax) ? na : rMax - rMin
-    int   grpN  = array.size(grpKey)
+    //  ★ 独立根拠数は密集度専用の denKey から数える (LEGACY では 0 のまま)。
+    int   grpN  = c.adaptiveMode ? array.size(denKey) : array.size(grpKey)
     float densB = c.adaptiveMode ? f_densityBonus(grpN, rSpan, c) : 0.0
 
     // ---- Zone上下限 ---------------------------------------------------------
@@ -1007,11 +1063,11 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
     float zTop = ctr + c.zoneHalfWidth
     float zBot = ctr - c.zoneHalfWidth
     if c.adaptiveMode and not na(rMin) and not na(rMax)
-        zBot := rMin - c.adaptiveEdgePad
-        zTop := rMax + c.adaptiveEdgePad
+        zBot := rMin - f_adpPad(c)
+        zTop := rMax + f_adpPad(c)
         float w0 = zTop - zBot
-        if w0 < c.adaptiveMinWidth
-            float grow = (c.adaptiveMinWidth - w0) / 2.0
+        if w0 < f_adpMinW(c)
+            float grow = (f_adpMinW(c) - w0) / 2.0
             zBot := zBot - grow
             zTop := zTop + grow
 
@@ -1076,8 +1132,8 @@ f_buildClusters(array<RawZone> src, ZoneCfg c) =>
                         curMin := math.min(curMin, cj)
                         curMax := math.max(curMax, cj)
                     float newSpan  = curMax - curMin
-                    float newWidth = math.max(c.adaptiveMinWidth, newSpan + c.adaptiveEdgePad * 2.0)
-                    if newWidth > c.adaptiveMaxWidth
+                    float newWidth = math.max(f_adpMinW(c), newSpan + f_adpPad(c) * 2.0)
+                    if newWidth > f_adpMaxW(c)
                         ok := false
                 if ok
                     array.push(cur, z)
@@ -1233,11 +1289,11 @@ f_updateTrack(ZoneTrack t, ZoneCfg c, bool evalBar, float bc, float bh, float bl
 //   その間     : 中立 → 加点も減点もしない
 f_finishReaction(ZoneTrack t, ZoneCfg c) =>
     float mv = nz(t.evalBest, 0.0)
-    if mv >= c.strongMoveThr
+    if mv >= f_adpStrongThr(c)
         t.strongCount := t.strongCount + 1
-    else if not t.evalIsFirst and mv < c.weakMoveThr
+    else if not t.evalIsFirst and mv < f_adpWeakThr(c)
         t.weakCount   := t.weakCount + 1
-        t.weakPenalty := math.min(t.weakPenalty + c.weakPenaltyPer, c.weakPenaltyMax)
+        t.weakPenalty := math.min(t.weakPenalty + f_adpPenPer(c), f_adpPenMax(c))
     t.evalActive := false
     t.evalRemain := 0
     t.evalBest   := na
@@ -1278,22 +1334,40 @@ f_updateTrackReaction(ZoneTrack t, ZoneCfg c, int ev, bool evalBar, float bc, fl
         //    ★ Strong は閾値へ到達した時点で確定してよい。
         //    ★ 判定期間が終わったあとに Strong へ到達しても遡って変更しない
         //      (評価が既に確定しているので、そもそも計測していない)。
-        if t.evalActive and (ev == 1 or ev == -1 or t.evalRemain <= 0 or nz(t.evalBest, 0.0) >= c.strongMoveThr)
+        if t.evalActive and (ev == 1 or ev == -1 or t.evalRemain <= 0 or nz(t.evalBest, 0.0) >= f_adpStrongThr(c))
             f_finishReaction(t, c)
         //  ---- (c) 接触 / 再武装 ---------------------------------------------
-        //    Support / Resistance のときだけ数える (ACTIVE / BROKEN では数えない)。
-        int role = t.state == ST_SUPPORT ? 1 : t.state == ST_RESIST ? -1 : 0
-        if role == 0
-            t.inZone := false
-        else
-            bool touching = bl <= t.top and bh >= t.bottom
+        //    ★ 接触の価格条件は確定Break判定足 (既定5M) の高値・安値で判定する。
+        //        bl <= Zone上限 かつ bh >= Zone下限  → Zone接触
+        //    ★ ACTIVE は「価格がZone内へ入った結果」なので、接触から除外しない。
+        //      ACTIVE のときは直前までの役割 (lastRole) で方向を決める。
+        //      lastRole = 0 の新しいZoneでは、直前の確定足終値から接近方向を判定:
+        //        直前終値 > Zone上限 → Support方向 / < Zone下限 → Resistance方向
+        //        どちらでもない (直前終値もZone内) 場合は方向を確定できないので
+        //        無理に Long / Short へ分類せず、方向が確定してから追跡を始める。
+        //    ★ BROKEN は旧Support / Resistance としては無効なので数えない。
+        int role = 0
+        if t.state == ST_SUPPORT
+            role := 1
+        else if t.state == ST_RESIST
+            role := -1
+        else if t.state == ST_ACTIVE
+            role := t.lastRole
+            if role == 0 and not na(t.prevBrClose)
+                if t.prevBrClose > t.top
+                    role := 1
+                else if t.prevBrClose < t.bottom
+                    role := -1
+
+        bool touching = bl <= t.top and bh >= t.bottom
+        if role != 0
             //  再武装 : Support なら Zone上限から上へ、Resistance なら Zone下限から
             //  下へ Re-arm Distance 以上離れた確定終値。
-            bool away = role > 0 ? bc >= t.top + c.retouchRearmDist : bc <= t.bottom - c.retouchRearmDist
+            bool away = role > 0 ? bc >= t.top + f_adpRearm(c) : bc <= t.bottom - f_adpRearm(c)
             if away
                 t.rearmed := true
             //  独立したタッチ = 「再武装済み」かつ「前の確定足ではZone外」
-            //  → Zone内でローソクが何本続いても1回しか数えない。
+            //  → Zone内で確定足が何本滞在しても1回しか数えない。
             if touching and not t.inZone and t.rearmed
                 t.touchCount := t.touchCount + 1
                 t.rearmed    := false
@@ -1304,13 +1378,28 @@ f_updateTrackReaction(ZoneTrack t, ZoneCfg c, int ev, bool evalBar, float bc, fl
                 //  前回タッチを確定してから新しいタッチを開始する。
                 if t.evalActive
                     f_finishReaction(t, c)
+                //  ★ タッチ足は「確定終値までの回復量」だけを初期反発量にする。
+                //    タッチ前につけた高値 / 安値を反発として誤加算しないため、
+                //    タッチ足の bh / bl は初期値に使わない。
+                //      Support    : max(0, brClose - Zone上限)
+                //      Resistance : max(0, Zone下限 - brClose)
+                //  ★ 評価基準 (evalRef) はタッチ時点の Zone上限 / 下限で固定する。
+                //    評価期間中にZone範囲が動いても基準は変えない。
                 t.evalActive  := true
-                t.evalRemain  := c.weakEvalBars - 1
+                t.evalRemain  := f_adpEvalBars(c) - 1
                 t.evalRole    := role
                 t.evalRef     := role > 0 ? t.top : t.bottom
-                t.evalBest    := role > 0 ? bh - t.top : t.bottom - bl
+                t.evalBest    := role > 0 ? math.max(0.0, bc - t.top) : math.max(0.0, t.bottom - bc)
                 t.evalIsFirst := isFirst
-            t.inZone := touching
+                //  weakEvalBars = 1 のときはタッチ足の回復量だけでその場で確定する
+                //  (次の足まで評価を延ばさない)。Strong 到達済みならここで確定してよい。
+                if f_adpEvalBars(c) <= 1 or nz(t.evalBest, 0.0) >= f_adpStrongThr(c)
+                    f_finishReaction(t, c)
+        //  ★ inZone は State に関係なく、実際の接触状態で毎回更新する。
+        //    「State が ACTIVE になった」ことだけを理由に false へ戻さない。
+        t.inZone := touching
+        //  次バーで lastRole = 0 の接近方向判定に使うため、確定足終値を控える。
+        t.prevBrClose := bc
     true
 
 // ============================================================================
