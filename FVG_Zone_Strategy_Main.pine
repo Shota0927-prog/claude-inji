@@ -2112,6 +2112,55 @@ f_openCountFvgAbsGroup() =>
 //    TPd = Structural TP Zone Depth (設定した比率)
 //    TPb = 比率から算出したTP基準価格。ここから tpBuffer を引いた (Long) /
 //          足した (Short) ものが実際の TP になる。
+//  ★ Logic の星評価 (表示・通知専用) ★
+//    判定・発注・建値移動には一切使わない。未設定のLogic
+//    (ZONEFAKE / ZONERETEST) は "" を返し、表示側で行ごと省略する。
+f_logicRatingText(string logicId) =>
+    logicId == LOGIC_ZONE_RB   ? "⭐️5" :
+     logicId == LOGIC_ZONE_BK   ? "⭐️4" :
+     logicId == LOGIC_FVG_ABS5  ? "⭐️4" :
+     logicId == LOGIC_FVG_ABS15 ? "⭐️4" :
+     logicId == LOGIC_FVG       ? "⭐️3" :
+     logicId == LOGIC_FVG15     ? "⭐️3" : ""
+
+//  ★ そのLogic・その方向に「実際に適用される」建値移動開始幅 ★
+//    Section 8.2 の建値移動処理もこの関数を参照する (分岐の二重定義をしない)。
+//    → 設定画面で幅を変えても、表示と実処理が必ず同じ値になる。
+//    振り分けは修正前の三項式と1対1で同じ (Logic IDは相互排他なので順序も等価):
+//      FVG15                          → fvg15BreakEvenTrigger
+//      FVGABS5 / FVGABS15             → absBreakEvenTrigger
+//      ZONEBREAK かつ Long かつ互換ON → breakLongBreakEvenTrigger
+//      ZONEREBOUND / ZONEFAKE / ZONERETEST / ZONEBREAK → zoneBreakEvenTrigger
+//      それ以外 (FVG / 未知のID)      → breakEvenTrigger
+f_breakEvenTriggerFor(string logicId, int dir) =>
+    float r = breakEvenTrigger
+    if logicId == LOGIC_FVG15
+        r := fvg15BreakEvenTrigger
+    else if logicId == LOGIC_FVG_ABS5 or logicId == LOGIC_FVG_ABS15
+        r := absBreakEvenTrigger
+    else if logicId == LOGIC_ZONE_BK and dir > 0 and breakLongRefCompat
+        r := breakLongBreakEvenTrigger
+    else if logicId == LOGIC_ZONE_RB or logicId == LOGIC_ZONE_FK or
+         logicId == LOGIC_ZONE_RT or logicId == LOGIC_ZONE_BK
+        r := zoneBreakEvenTrigger
+    r
+
+//  ★ 建値移動の表示テキスト。建値移動OFFなら "OFF"。
+f_breakEvenDisplayText(string logicId, int dir) =>
+    useBreakEven ? "+" + f_num(f_breakEvenTriggerFor(logicId, dir), "#.##") + "ドル" : "OFF"
+
+//  ★ LONG のラベル / アラートへ足す「評価」「建値移動」の行 (表示専用)。
+//    SHORT (dir < 0) では必ず "" を返すので、SHORT の文面は一切変わらない。
+//    星評価が未設定のLogicでは「評価:」行そのものを出さない。
+f_ratingBeLines(string logicId, int dir, string sep) =>
+    string t = ""
+    if dir > 0
+        string rate = f_logicRatingText(logicId)
+        if rate != ""
+            t := t + sep + "評価: " + rate
+        t := t + sep + "建値移動: " + f_breakEvenDisplayText(logicId, dir)
+    t
+
 //  ★ Logic / 方向ごとの Structural TP Zone Depth ★
 //    Zone Break の Long だけ互換モードで別のDepthを使う。
 //    それ以外は必ず共通の structuralTpDepthRatio を返すので、他Logicは不変。
@@ -2216,6 +2265,7 @@ f_executeTrade(string logicId, int dir, float entryPrice, zn.TradePlan p) =>
                 if useConfirmedAlert
                     alert("【確定 " + (dir > 0 ? "LONG" : "SHORT") + "】" +
                          "\nLogic: " + f_logicName(logicId) +
+                         f_ratingBeLines(logicId, dir, "\n") +
                          "\n" + syminfo.ticker +
                          "\nE: "    + f_num(p.entry, "#.##") +
                          "\nSL: "   + f_num(p.sl,    "#.##") +
@@ -2243,6 +2293,8 @@ f_executeTrade(string logicId, int dir, float entryPrice, zn.TradePlan p) =>
                     ltxt := ltxt + "\nE-SL  " + f_num(math.abs(p.entry - p.sl), "#.##")
                     ltxt := ltxt + "\nRR    " + f_num(p.rr, "#.##")
                     ltxt := ltxt + "\nLogic " + f_logicName(logicId)
+                    //  ★ LONG だけ 星評価 / 実適用の建値移動幅 を足す (表示のみ)。
+                    ltxt := ltxt + f_ratingBeLines(logicId, dir, "\n")
                     //  ★ LONG は上の7行だけ。SHORT は従来どおり追加情報を付ける。
                     //    ここは表示文字列を組み立てているだけで、Entry ID の採番も
                     //    Qty / Risk の計算も既に済んでいる (値を読むだけ)。
@@ -2768,35 +2820,18 @@ if useBreakEven and strategy.opentrades > 0
             bool  wasOn  = gTradeBE.contains(eid) and gTradeBE.get(eid)
             bool  reach  = false
             // ---- 建値移動開始幅の切り替え (Logicごと) ----------------------
-            //  Entry ID の接頭辞を完全一致で判定して幅を選ぶ。
-            //    FVG15_L_ / FVG15_S_          → fvg15BreakEvenTrigger
-            //    FVGABS5_L_ / _S_ / FVGABS15_L_ / _S_  → absBreakEvenTrigger
-            //    ZONEREBOUND_ / ZONEFAKE_ / ZONERETEST_ / ZONEBREAK_
-            //                                 → zoneBreakEvenTrigger
-            //    それ以外 (FVG_L_ / FVG_S_ / 将来のLogic) → breakEvenTrigger
+            //  ★ 分岐は f_breakEvenTriggerFor() 1箇所だけに集約した。
+            //    ラベル / 仮アラート / 確定アラートの表示も同じ関数を読むので、
+            //    設定を変えても実処理と表示が必ず同期する。
+            //  Entry ID は "<LOGIC_ID>_L_<seq>" / "_S_<seq>" なので、Logic ID は
+            //  従来と同じ「完全な接頭辞での判定」(f_logicIdFromEid) で復元する。
             //  ("FVG15_L_" が "FVG_L_" に一致することはないので取り違えは起きない。)
+            //  未知のEntry IDは logicId = "" / dir = -1 となり、修正前と同じく
+            //  既定の breakEvenTrigger へ落ちる。
             //  判定方式 / SLを建値へ動かす処理 / TP再指定 / Map管理は不変。
-            bool isFvg15Trade = str.startswith(eid, LOGIC_FVG15 + "_L_") or
-                 str.startswith(eid, LOGIC_FVG15 + "_S_")
-            bool isAbsTrade = str.startswith(eid, LOGIC_FVG_ABS5 + "_L_") or
-                 str.startswith(eid, LOGIC_FVG_ABS5 + "_S_") or
-                 str.startswith(eid, LOGIC_FVG_ABS15 + "_L_") or
-                 str.startswith(eid, LOGIC_FVG_ABS15 + "_S_")
-            bool isZoneTrade = str.startswith(eid, LOGIC_ZONE_RB + "_L_") or
-                 str.startswith(eid, LOGIC_ZONE_RB + "_S_") or
-                 str.startswith(eid, LOGIC_ZONE_FK + "_L_") or
-                 str.startswith(eid, LOGIC_ZONE_FK + "_S_") or
-                 str.startswith(eid, LOGIC_ZONE_RT + "_L_") or
-                 str.startswith(eid, LOGIC_ZONE_RT + "_S_") or
-                 str.startswith(eid, LOGIC_ZONE_BK + "_L_") or
-                 str.startswith(eid, LOGIC_ZONE_BK + "_S_")
-            //  ★ Zone Break Long 互換モード : "ZONEBREAK_L_" 完全一致のときだけ
-            //    Long専用の幅を使う。"ZONEBREAK_S_" も他Logicも影響を受けない。
-            bool isBkLongTrade = breakLongRefCompat and str.startswith(eid, LOGIC_ZONE_BK + "_L_")
-            float beTrigger = isBkLongTrade ? breakLongBreakEvenTrigger :
-                 isFvg15Trade ? fvg15BreakEvenTrigger :
-                 isAbsTrade ? absBreakEvenTrigger :
-                 isZoneTrade ? zoneBreakEvenTrigger : breakEvenTrigger
+            string beLogic = f_logicIdFromEid(eid)
+            int    beDir   = str.startswith(eid, beLogic + "_L_") ? 1 : -1
+            float  beTrigger = f_breakEvenTriggerFor(beLogic, beDir)
             if isLong
                 reach := breakEvenTriggerMode == "確定足" ? (barstate.isconfirmed and close >= ep + beTrigger) : (high >= ep + beTrigger)
             else
@@ -3284,6 +3319,7 @@ f_canEnter(string logicId, int dir, float entryPrice) =>
 f_provAlertMsg(string logicId, int dir) =>
     "【仮 " + (dir > 0 ? "LONG" : "SHORT") + "】" +
      "\nLogic: " + f_logicName(logicId) +
+     f_ratingBeLines(logicId, dir, "\n") +
      "\n" + syminfo.ticker +
      "\nE: " + f_num(close, "#.##")
 
