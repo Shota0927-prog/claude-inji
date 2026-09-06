@@ -183,6 +183,32 @@ export type ZoneCfg
     //    ★ TP候補Zoneの選定条件 (State / Strength / Score / Entryより利益側 /
     //      最も手前) は一切変更しない。置く位置だけを変える。
     float  structuralTpDepthRatio = 0.0
+    // ========================================================================
+    //  ADAPTIVE Zone定義 (既定 false = LEGACY = 現行動作と完全一致)
+    // ------------------------------------------------------------------------
+    //  ★ adaptiveMode = false のときは、以下のフィールドは1つも参照されない。
+    //    Zone範囲 / Score / Strength / State / Break / Flip / 反応履歴は
+    //    すべて従来の処理をそのまま通る (新しい式で再現しているのではなく、
+    //    従来の処理を残したまま分岐しているだけ)。
+    // ========================================================================
+    bool   adaptiveMode        = false
+    //  (2) 根拠分布を反映したZone範囲
+    float  adaptiveMinWidth    = 10.0   // Zone最小幅 ($)
+    float  adaptiveEdgePad     = 2.5    // rootMin / rootMax の外側余白 ($)
+    float  adaptiveMaxWidth    = 20.0   // Zone最大幅 ($) : 超える Cluster は分割
+    //  (3) 根拠の密集度 (Density Bonus)。判定幅は外側余白を含まない rootSpan。
+    float  densityTightSpan    = 5.0
+    float  densityMediumSpan   = 10.0
+    float  densityTightBonus   = 1.0
+    float  densityMediumBonus  = 0.5
+    //  (5) 再タッチの再武装距離 ($)
+    float  retouchRearmDist    = 10.0
+    //  (6) 弱い反発の判定
+    int    weakEvalBars        = 6      // 判定本数 (確定Break判定足 = 既定5M)
+    float  weakMoveThr         = 10.0   // これ未満 = 弱い反発
+    float  strongMoveThr       = 20.0   // これ以上 = 強い反発
+    float  weakPenaltyPer      = 1.0    // 弱反発1回あたりの減点
+    float  weakPenaltyMax      = 3.0    // 減点の上限
     float  maxSlDist          = 30.0
     float  minStructRR        = 1.0
     float  slMinScore         = 4.0
@@ -247,6 +273,22 @@ export type Zone
     int    reactionCnt   = 0
     bool   hasHtf        = false
     string htfSources    = ""
+    // ---- ADAPTIVE 追加フィールド (LEGACY では既定値のまま使われない) ------
+    //  ★ 既存フィールドは1つも意味を変えていない。すべて純粋な追加。
+    float  rootMin       = na     // Cluster内RawZone.center の最小値
+    float  rootMax       = na     // Cluster内RawZone.center の最大値
+    float  rootSpan      = na     // rootMax - rootMin (外側余白を含まない)
+    int    groupCount    = 0      // 重複を除いた独立根拠 (Source Group) 数
+    float  densityBonus  = 0.0    // 密集度加点
+    float  structScore   = 0.0    // 構造点 = baseSum + slope + maBonus + conf + density
+    float  weakPenalty   = 0.0    // 弱反発による減点 (0以上・上限あり)
+    int    touchCount    = 0
+    int    retouchCount  = 0
+    int    strongCount   = 0
+    int    weakCount     = 0
+    int    roleCycle     = 0
+    int    reactState    = 0      // 0 = 待機 / 1 = 再武装待ち / 2 = 反発評価中
+    int    reactRemain   = 0      // 反発評価の残り本数
 
 // ---- ZoneTrack : Zone State / Break / Flip の永続ステート -----------------
 export type ZoneTrack
@@ -265,6 +307,23 @@ export type ZoneTrack
     bool  matched     = false
     array<int> memberUids
     string sourceSig  = ""
+    // ---- ADAPTIVE 反応履歴 (統合後の最終Zone / ZoneTrack 単位で管理) ------
+    //  ★ LEGACY では一切更新されない (f_updateTrackReaction を呼ばないため)。
+    //  ★ Break / Reclaim では保持し、Flip確定時だけ roleCycle を進めてリセットする。
+    int   roleCycle    = 0
+    int   touchCount   = 0
+    int   retouchCount = 0
+    int   strongCount  = 0
+    int   weakCount    = 0
+    float weakPenalty  = 0.0
+    bool  inZone       = false    // 直前の確定足でZone内にいたか
+    bool  rearmed      = true     // 再武装済み (次の接触を独立タッチとして数える)
+    bool  evalActive   = false    // 反発評価中
+    int   evalRemain   = 0        // 反発評価の残り本数
+    int   evalRole     = 0        // 評価開始時の役割 (+1 Support / -1 Resistance)
+    float evalRef      = na       // 評価基準価格 (Support = Zone上限 / Resist = Zone下限)
+    float evalBest     = na       // 期間中の最大有利方向移動
+    bool  evalIsFirst  = true     // その評価が初回タッチぶんか (初回は減点しない)
 
 // ---- ZoneFeed : Main Strategy が request.security で取得した外部入力 ------
 //  ※ Library は request.*() を呼べないため、上位足/下位足の値はここで受け取る。
@@ -423,6 +482,19 @@ f_reactionBonus(int cnt, ZoneCfg c) =>
 
 f_confluenceBonus(int catCount, ZoneCfg c) =>
     catCount >= 4 ? c.confBonus4 : catCount == 3 ? c.confBonus3 : catCount == 2 ? c.confBonus2 : 0.0
+
+// ADAPTIVE : 根拠の密集度による加点。
+//   判定幅は外側余白を含まない rootSpan。独立根拠 (Source Group) が2つ未満なら0点。
+//   grpN   : 重複を除いた独立根拠数
+//   span   : rootMax - rootMin
+f_densityBonus(int grpN, float span, ZoneCfg c) =>
+    float b = 0.0
+    if grpN >= 2 and not na(span)
+        if span <= c.densityTightSpan
+            b := c.densityTightBonus
+        else if span <= c.densityMediumSpan
+            b := c.densityMediumBonus
+    b
 
 f_days2ms(float d) =>
     int(d * MS_PER_DAY)
@@ -909,15 +981,52 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
     float ctr = tw > 0 ? ts / tw : na
     int   cat = (hasMA ? 1 : 0) + (hasHZ ? 1 : 0) + (hasDHL ? 1 : 0) + (hasACC ? 1 : 0)
     float confB = f_confluenceBonus(cat, c)
+
+    // ---- ADAPTIVE : 根拠分布 (rootMin / rootMax / rootSpan) と 密集度 -------
+    //   ★ rootMin / rootMax / rootSpan / groupCount / densityBonus は
+    //     LEGACY でも計算して Zone へ持たせる (表示・検証用)。
+    //     LEGACY では top / bottom / score のどれにも使わないので結果は不変。
+    //   ★ 独立根拠数は memberCount ではなく、上で作った Source Group
+    //     (grpKey : MA1 / MA2 / 各TF Swing / Day High / Day Low /
+    //      各TF Accum High・Low) の数を使う。同じ根拠の重複登録では増えない。
+    float rMin = na
+    float rMax = na
+    for j = 0 to n - 1
+        float mc = array.get(members, j).center
+        if not na(mc)
+            rMin := na(rMin) ? mc : math.min(rMin, mc)
+            rMax := na(rMax) ? mc : math.max(rMax, mc)
+    float rSpan = na(rMin) or na(rMax) ? na : rMax - rMin
+    int   grpN  = array.size(grpKey)
+    float densB = c.adaptiveMode ? f_densityBonus(grpN, rSpan, c) : 0.0
+
+    // ---- Zone上下限 ---------------------------------------------------------
+    //   LEGACY  : 従来どおり center ± zoneHalfWidth (この式は一切変更していない)
+    //   ADAPTIVE: rootMin - 余白 〜 rootMax + 余白。最小幅未満なら上下へ均等拡張。
+    //             (最大幅は f_buildClusters 側で Cluster分割によって守る)
+    float zTop = ctr + c.zoneHalfWidth
+    float zBot = ctr - c.zoneHalfWidth
+    if c.adaptiveMode and not na(rMin) and not na(rMax)
+        zBot := rMin - c.adaptiveEdgePad
+        zTop := rMax + c.adaptiveEdgePad
+        float w0 = zTop - zBot
+        if w0 < c.adaptiveMinWidth
+            float grow = (c.adaptiveMinWidth - w0) / 2.0
+            zBot := zBot - grow
+            zTop := zTop + grow
+
+    float structS = baseSum + slopeB + maB + confB + densB
     Zone.new(
-         center = ctr, top = ctr + c.zoneHalfWidth, bottom = ctr - c.zoneHalfWidth,
+         center = ctr, top = zTop, bottom = zBot,
          score = baseSum + slopeB + maB + reactB + confB,
          baseSum = baseSum, slopeBonus = slopeB, maBonus = maB,
          reactionBonus = reactB, flipBonus = 0.0, confBonus = confB,
          strength = SR_WEAK, state = ST_ACTIVE, flipped = false, flipDir = 0,
          catCount = cat, memberCount = n, sources = srcStr, trackId = -1,
          memberUids = uids, sourceSig = "", reactionCnt = reactCnt,
-         hasHtf = hasHtfStruct, htfSources = htfStr)
+         hasHtf = hasHtfStruct, htfSources = htfStr,
+         rootMin = rMin, rootMax = rMax, rootSpan = rSpan,
+         groupCount = grpN, densityBonus = densB, structScore = structS)
 
 f_buildClusters(array<RawZone> src, ZoneCfg c) =>
     array<Zone> out = array.new<Zone>()
@@ -950,6 +1059,26 @@ f_buildClusters(array<RawZone> src, ZoneCfg c) =>
                         if math.abs(array.get(cur, j).center - newCenter) > c.clusterDist
                             ok := false
                             break
+                //  ★ ADAPTIVE : 既存の clusterDist 条件はそのまま残したうえで、
+                //    「追加後のZone幅が Adaptive Zone Maximum Width 以内」という
+                //    条件を追加する。満たさない場合はここで Cluster を閉じ、
+                //    z から新しい Cluster を始める = そのClusterが複数Zoneへ分割される。
+                //    上下限を切って根拠をZone外へ追い出すことはしない。
+                //  ★ src は center 昇順で走査しているので、cur の最小centerは
+                //    先頭要素、追加後の最大centerは z.center になる。
+                if ok and c.adaptiveMode
+                    //  ★ Pine の for は開始 > 終了だと降順ループになるため、
+                    //    要素1件のときに範囲外アクセスしないよう必ず 0 から回す。
+                    float curMin = z.center
+                    float curMax = z.center
+                    for j = 0 to array.size(cur) - 1
+                        float cj = array.get(cur, j).center
+                        curMin := math.min(curMin, cj)
+                        curMax := math.max(curMax, cj)
+                    float newSpan  = curMax - curMin
+                    float newWidth = math.max(c.adaptiveMinWidth, newSpan + c.adaptiveEdgePad * 2.0)
+                    if newWidth > c.adaptiveMaxWidth
+                        ok := false
                 if ok
                     array.push(cur, z)
                 else
@@ -961,7 +1090,18 @@ f_buildClusters(array<RawZone> src, ZoneCfg c) =>
     out
 
 f_applyStrength(Zone z, ZoneCfg c) =>
-    z.score    := z.baseSum + z.slopeBonus + z.maBonus + z.reactionBonus + z.flipBonus + z.confBonus
+    //  LEGACY  : 従来の式をそのまま (1文字も変えていない)。
+    //  ADAPTIVE: 構造点 / 反応点 / Flip に分けて合成し、下限を0点にする。
+    //      構造点 = Base Score + Slope Bonus + MA Cluster Bonus
+    //               + Confluence Bonus + Density Bonus
+    //      Current Score = 構造点 + Reaction Bonus - Weak Reaction Penalty
+    //                      + Flip Bonus   (最低0)
+    //    Strength は Current Score から求める。
+    if c.adaptiveMode
+        z.structScore := z.baseSum + z.slopeBonus + z.maBonus + z.confBonus + z.densityBonus
+        z.score       := math.max(0.0, z.structScore + z.reactionBonus - z.weakPenalty + z.flipBonus)
+    else
+        z.score := z.baseSum + z.slopeBonus + z.maBonus + z.reactionBonus + z.flipBonus + z.confBonus
     z.strength := f_strengthOf(z.score, z.hasHtf, c)
     z.strength
 
@@ -1079,6 +1219,99 @@ f_updateTrack(ZoneTrack t, ZoneCfg c, bool evalBar, float bc, float bh, float bl
     else if t.state == ST_RESIST
         t.lastRole := -1
     ev
+
+// ---- 05b. ADAPTIVE 反応履歴 (タッチ / 再タッチ / 弱反発) -------------------
+//  ★ adaptiveMode = false のときは呼ばれない。LEGACY の RawZone Reaction 処理
+//    (f_updateReactions) は削除せずそのまま残してある。
+//  ★ 判定はすべて「Break判定足 (既定 5M) の確定終値 / 高値 / 安値」で行う。
+//    形成中の値動きでは1つも状態が動かないため、確定済みの Score や反応履歴が
+//    足の途中で書き換わることはない。
+
+// 進行中の反発評価を、その時点までの最大有利方向移動で確定する。
+//   20ドル以上 : 強い反発 → 既存Reaction Bonus の回数へ加算
+//   10ドル未満 : 弱い反発 → 減点 (初回タッチぶんは減点しない)
+//   その間     : 中立 → 加点も減点もしない
+f_finishReaction(ZoneTrack t, ZoneCfg c) =>
+    float mv = nz(t.evalBest, 0.0)
+    if mv >= c.strongMoveThr
+        t.strongCount := t.strongCount + 1
+    else if not t.evalIsFirst and mv < c.weakMoveThr
+        t.weakCount   := t.weakCount + 1
+        t.weakPenalty := math.min(t.weakPenalty + c.weakPenaltyPer, c.weakPenaltyMax)
+    t.evalActive := false
+    t.evalRemain := 0
+    t.evalBest   := na
+    t.evalRef    := na
+    t.evalRole   := 0
+    true
+
+// タッチ / 再武装 / 反発評価 / Flipリセットを1確定足ぶん進める。
+//   ev : f_updateTrack の戻り値 (0 なし / ±1 Break / +2 Support Flip / -2 Resist Flip)
+f_updateTrackReaction(ZoneTrack t, ZoneCfg c, int ev, bool evalBar, float bc, float bh, float bl) =>
+    if ev == 2 or ev == -2
+        //  ---- Flip確定 : 新しい役割サイクル。反応履歴だけを全リセットする ----
+        //    構造点 (Base / Slope / MA Cluster / Confluence / Density) は
+        //    その時点の構成根拠から毎バー再計算されるので、ここでは触らない。
+        //    既存 Flip Bonus は f_applyStrength でそのまま加算される。
+        t.roleCycle    := t.roleCycle + 1
+        t.touchCount   := 0
+        t.retouchCount := 0
+        t.strongCount  := 0
+        t.weakCount    := 0
+        t.weakPenalty  := 0.0
+        t.inZone       := false
+        t.rearmed      := true
+        t.evalActive   := false
+        t.evalRemain   := 0
+        t.evalRole     := 0
+        t.evalRef      := na
+        t.evalBest     := na
+        t.evalIsFirst  := true
+    else if evalBar
+        //  ---- (a) 進行中の評価を更新 ----------------------------------------
+        if t.evalActive
+            float mv = t.evalRole > 0 ? bh - t.evalRef : t.evalRef - bl
+            t.evalBest   := na(t.evalBest) ? mv : math.max(t.evalBest, mv)
+            t.evalRemain := t.evalRemain - 1
+        //  ---- (b) 期限切れ / Strong到達 / Break成立 で確定 -------------------
+        //    ★ Break が先に成立した場合も、その時点までの最大有利方向移動で確定する。
+        //    ★ Strong は閾値へ到達した時点で確定してよい。
+        //    ★ 判定期間が終わったあとに Strong へ到達しても遡って変更しない
+        //      (評価が既に確定しているので、そもそも計測していない)。
+        if t.evalActive and (ev == 1 or ev == -1 or t.evalRemain <= 0 or nz(t.evalBest, 0.0) >= c.strongMoveThr)
+            f_finishReaction(t, c)
+        //  ---- (c) 接触 / 再武装 ---------------------------------------------
+        //    Support / Resistance のときだけ数える (ACTIVE / BROKEN では数えない)。
+        int role = t.state == ST_SUPPORT ? 1 : t.state == ST_RESIST ? -1 : 0
+        if role == 0
+            t.inZone := false
+        else
+            bool touching = bl <= t.top and bh >= t.bottom
+            //  再武装 : Support なら Zone上限から上へ、Resistance なら Zone下限から
+            //  下へ Re-arm Distance 以上離れた確定終値。
+            bool away = role > 0 ? bc >= t.top + c.retouchRearmDist : bc <= t.bottom - c.retouchRearmDist
+            if away
+                t.rearmed := true
+            //  独立したタッチ = 「再武装済み」かつ「前の確定足ではZone外」
+            //  → Zone内でローソクが何本続いても1回しか数えない。
+            if touching and not t.inZone and t.rearmed
+                t.touchCount := t.touchCount + 1
+                t.rearmed    := false
+                bool isFirst = t.touchCount <= 1
+                if not isFirst
+                    t.retouchCount := t.retouchCount + 1
+                //  判定期間中に次の独立した再タッチが来たら、その時点までの値で
+                //  前回タッチを確定してから新しいタッチを開始する。
+                if t.evalActive
+                    f_finishReaction(t, c)
+                t.evalActive  := true
+                t.evalRemain  := c.weakEvalBars - 1
+                t.evalRole    := role
+                t.evalRef     := role > 0 ? t.top : t.bottom
+                t.evalBest    := role > 0 ? bh - t.top : t.bottom - bl
+                t.evalIsFirst := isFirst
+            t.inZone := touching
+    true
 
 // ============================================================================
 // 06. LIVE ZONE MAP
@@ -1250,11 +1483,30 @@ export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
             e.evFlipSup   := e.evFlipSup   or ev == 2
             e.evFlipRes   := e.evFlipRes   or ev == -2
 
+            //  ★ ADAPTIVE : タッチ / 再タッチ / 弱反発 / Flipリセットを更新する。
+            //    LEGACY では呼ばないので ZoneTrack の反応履歴は一切動かない。
+            //    Break / Reclaim では履歴を保持し、Flip確定時だけリセットされる。
+            if c.adaptiveMode
+                f_updateTrackReaction(t, c, ev, f.brEval, f.brClose, f.brHigh, f.brLow)
+
             z.state     := t.state
             z.flipped   := t.flipped
             z.flipDir   := t.flipDir
             z.flipBonus := t.flipped ? c.flipBonus : 0.0
             z.trackId   := t.id
+            //  ★ ADAPTIVE : 反応点は統合後の最終Zone / ZoneTrack 単位の履歴から作る。
+            //    LEGACY の RawZone 由来 reactionBonus / reactionCnt は上書きしない。
+            if c.adaptiveMode
+                z.reactionCnt   := t.strongCount
+                z.reactionBonus := f_reactionBonus(t.strongCount, c)
+                z.weakPenalty   := t.weakPenalty
+                z.touchCount    := t.touchCount
+                z.retouchCount  := t.retouchCount
+                z.strongCount   := t.strongCount
+                z.weakCount     := t.weakCount
+                z.roleCycle     := t.roleCycle
+                z.reactState    := t.evalActive ? 2 : (t.rearmed ? 0 : 1)
+                z.reactRemain   := t.evalActive ? t.evalRemain : 0
             f_applyStrength(z, c)
 
     // ---- 6.11 長期間マッチしないTrackを破棄 -------------------------------
