@@ -1,0 +1,1144 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  IntermarketEntryEngine  —  Intermarket Entry Candidate Library
+// ============================================================================
+//  役割 : Intermarket市場 (今回は DXY のみ) の状態計算と Entry Candidate の生成。
+//
+//  ★ このLibraryが「やらないこと」 ★
+//    strategy.entry / strategy.exit / Qty計算 / SL・TP計算 / 建値移動 /
+//    ポジション管理 / 共通Trade Engineの再実装 / Zone生成 / FVG再計算。
+//    注文とポジション管理は Main の共通Trade Engine がそのまま担当する。
+//
+//  ★ 既存Libraryとの関係 ★
+//    SignalEngine / ZoneEngine を import せず、それらのUDTにも依存しない。
+//    型・関数・状態はすべてこのLibrary専用。
+//
+//  ★ request.*() は持たない ★
+//    Library は request.*() を呼べないため、外部データ取得は Main 側で行い、
+//    プリミティブ値と本Library専用型だけを受け取る。
+//    request の「式」として使う関数 (dxyDataPack / dxyTriggerPack /
+//    dxyAccum15Pack / dxyDailyPack) だけを export し、呼び出しは Main が行う。
+//
+//  ★ 移植元 ★
+//    "Gold Intermarket Environment Strategy" の DXY 経路。
+//    canLong / canShort から、移植元固有の SL・Qty 判定
+//    (longRisk > 0 / longQty >= 1) だけを外したものを Candidate とする。
+//    条件式・評価順序・状態遷移は移植元のソースをそのまま移している。
+// ============================================================================
+
+//@version=5
+library("IntermarketEntryEngine", overlay = true)
+
+// ============================================================================
+// 01. TYPES
+// ============================================================================
+
+// @type  日足レジーム用パック。request.security が返す16値を1オブジェクトにまとめる。
+//   ★ tuple ではなく UDT にしているのは、request.*() が返す tuple 要素の合計 127
+//     という上限を圧迫しないため。値の式・[1]位置は移植元 f_drDailyTuple と同一。
+//   ★ 取得しない設定では Main が na を渡す。Engine 側は na安全に読むので、
+//     移植元で「tuple要素が na」になる場合と同じ値になる。
+export type DxyDaily
+    float o0   = na
+    float h0   = na
+    float l0   = na
+    float c0   = na
+    float a0   = na
+    float r0   = na
+    float loT0 = na
+    float hiT0 = na
+    float o1   = na
+    float h1   = na
+    float l1   = na
+    float c1   = na
+    float a1   = na
+    float r1   = na
+    float loT1 = na
+    float hiT1 = na
+
+// @type  DXY Entry Candidate の全設定。既定値は移植元の input 既定値と同一。
+export type DxyCfg
+    bool   useDxy                 = true
+    bool   useLong                = true
+    bool   useShort               = true
+    bool   useDxyDirection        = false
+    bool   useDxyInverseCorr      = false
+    bool   useDxyDistNoTrade      = false
+    bool   useDxyReturn           = true
+    bool   useDxyRetNeutral       = false
+    bool   useDxyRetSameDir       = true
+    bool   useDxyRetOriginal      = true
+    bool   useDxyRetOpposite      = false
+    float  dxyMinChange           = 0.1
+    float  dxyDistMinChange       = 0.05
+    float  dxyWeight              = 1.0
+    float  dxyEventPoint          = 2.0
+    float  tfWeight15M            = 0.5
+    int    hold15M                = 24
+    float  corrThreshold          = 0.2
+    int    corrLen                = 20
+    int    returnLookback         = 3
+    bool   distRequireCorr        = true
+    bool   useDistMinMove         = true
+    float  goldRespMinChange      = 0.05
+    float  scoreThreshold         = 1.0
+    bool   useEngulfingTrigger    = false
+    bool   usePinbarTrigger       = false
+    bool   useBOSTrigger          = false
+    bool   useEMARejectTrigger    = false
+    bool   useFVGTrigger          = false
+    bool   useStrongCandleTrigger = true
+    string triggerMode            = "Any"
+    int    minTriggerCount        = 1
+    bool   useLowerTFTrigger      = true
+    bool   strictEngulf           = true
+    bool   reqOppColor            = true
+    bool   useEMARejectSlope      = false
+    float  emaRejectSlopeMinATR   = 0.12
+    float  pinWickBodyMult        = 3.0
+    float  pinOppWickMaxRatio     = 2.0
+    bool   usePinBodyRatioFilter  = false
+    float  pinMaxBodyRatio        = 0.1
+    bool   usePinRangeFilter      = false
+    float  pinMinRangeATR         = 0.10
+    float  strongBodyRatio        = 0.6
+    float  trigCloseEdgeRatio     = 0.7
+    bool   useEngulfBodyRatioFilter   = true
+    float  engulfBodyRatioMin         = 1.20
+    bool   useEngulfBodyQualityFilter = true
+    float  engulfMinBodyRatio         = 0.60
+    bool   useEngulfBodyAtrFilter     = true
+    float  engulfMinBodyATR           = 0.30
+    bool   useTriggerCooldown     = false
+    int    triggerCooldownBars    = 3
+    bool   useOppTrigNoTrade      = true
+    string volMode                = "OFF"
+    float  fixedMin               = 1.0
+    bool   useMinVol              = true
+    float  minAtrDollar           = 1.5
+    bool   volModeRel             = false
+    float  volRatioMin            = 0.9
+    string fastVolMode            = "固定値"
+    float  fastAtrMin             = 2.2
+    float  fastFixedMin           = 10.0
+    float  bodyAvgMin             = 0.5
+    bool   useRangeRatioFilter    = true
+    float  atrRangeRatioMin       = 0.06
+    bool   useVolCooldown         = false
+    int    volRecoveryBars        = 2
+    bool   useDailyRegime         = true
+    string dailyRegimeMode        = "当日進行中ベース"
+    string reqDailyDirection      = "OFF"
+    string reqDailyVolatility     = "OFF"
+    string dailyVolMethod         = "固定値"
+    float  dailyLowAtrRatio       = 0.80
+    float  dailyHighAtrRatio      = 1.20
+    float  dailyLowRangeMax       = 80
+    float  dailyHighRangeMin      = 140
+    bool   useHighVol140to170     = true
+    bool   useHighVol170to200     = true
+    bool   useHighVol200Plus      = true
+    float  highVolLevel1          = 140.0
+    float  highVolLevel2          = 170.0
+    float  extremeVolLevel        = 200.0
+    float  dailyDirBodyRatio      = 0.40
+    float  dailyBullCloseLoc      = 0.65
+    float  dailyBearCloseLoc      = 0.35
+    bool   dailyInsufficientAsRange = true
+    bool   useAccumNoTrade        = true
+    bool   useAccumNT5M           = true
+    bool   useAccumNT15M          = true
+    int    accumKeep              = 1
+    int    accumMinUpperCloses    = 4
+    int    accumMinLowerCloses    = 4
+    int    accumMaxSameColorRun   = 4
+    float  accumAtrMult           = 2.5
+    float  accumBarRatioMax       = 0.70
+    float  accumDriftMax          = 0.30
+    bool   useAccumExitConfirm    = false
+    int    accumExitConfirmBars   = 2
+    bool   useAccumBreakDirection = true
+    int    accumBreakDirectionBars = 10
+    bool   useSessionFilter       = true
+    bool   useAsiaSession         = true
+    bool   useEUSession           = true
+    bool   useNYSession           = true
+    bool   useNewsTimeFilter      = false
+
+// @type  Main が毎バー渡す入力。すべてプリミティブ値と本Library専用型。
+export type DxyFeed
+    bool  confirmed    = false
+    float goldChg      = na
+    float goldClose    = na
+    bool  goldStructUp = false
+    bool  goldStructDn = false
+    float dxyChg       = na
+    float dxyClose     = na
+    bool  dxyStructUp  = false
+    bool  dxyStructDn  = false
+    bool  new15Bar     = false
+    array<bool> bullTrigArr
+    array<bool> bearTrigArr
+    bool  trigBullCur  = false
+    bool  trigBearCur  = false
+    float acc15Hi      = na
+    float acc15Lo      = na
+    int   acc15St      = na
+    bool  accNew15Bar  = false
+    DxyDaily daily     = na
+    bool  newDay       = false
+    float baseAtr      = na
+    bool  inNewsTime   = false
+
+// @type  DXY Entry Candidate の状態 (var 相当)。すべてこのLibrary専用。
+export type DxyEngine
+    array<float> corrG
+    array<float> corrM
+    int   tfBar = 0
+    int   reason = 0
+    int   evBar = na
+    bool  mNoTrade = false
+    int   prevRawEvent = 0
+    int   state = 0
+    int   distKind = 0
+    int   distKindStart = 0
+    bool  expired = false
+    bool  returnBar = false
+    int   distortBar = na
+    int   returnType = 0
+    int   returnDir = 0
+    int   leader = 0
+    int   mDirOut = 0
+    int   gRespOut = 0
+    int   preGoldDir = 0
+    int   preMktDir = 0
+    float preGoldChg = 0.0
+    float preMktChg = 0.0
+    bool  preGoldStructUp = false
+    bool  preGoldStructDn = false
+    bool  preMktStructUp = false
+    bool  preMktStructDn = false
+    int   prevGoldDir = 0
+    int   prevMktDir = 0
+    float prevGoldChg = 0.0
+    float prevMktChg = 0.0
+    bool  prevRelNormal = false
+    bool  prevCorrOk = false
+    bool  prevGoldStructUp = false
+    bool  prevGoldStructDn = false
+    bool  prevMktStructUp = false
+    bool  prevMktStructDn = false
+    int   volRecoveryStartBar = na
+    bool  prevVolLow = false
+    float curDayOpen = na
+    float curDayHigh = na
+    float curDayLow  = na
+    array<float> acc5Hi
+    array<float> acc5Lo
+    array<int>   acc5St
+    float acc5BoxHi = na
+    float acc5BoxLo = na
+    int   acc5BoxSt = na
+    bool  acc5Prev = false
+    array<float> acc15Hi
+    array<float> acc15Lo
+    array<int>   acc15St
+    int   acc15LastSt = na
+    bool  prevBlockedByAccum = false
+    bool  waitingExitConfirm = false
+    int   outsideConfirmCount = 0
+    int   breakDirection = 0
+    int   breakDirStartBar = na
+    bool  breakDirActive = false
+    int   lastTrigBar = na
+    bool  longArmed = true
+    bool  shortArmed = true
+
+// @type  DXY Entry Candidate の出力。
+//   candLong / candShort が移植元の canLong / canShort 相当。
+export type DxySignal
+    bool  candLong  = false
+    bool  candShort = false
+    bool  dataValid = false
+    int   dxyBias   = 0
+    float dxyScore  = 0.0
+    bool  dxyNoTrade = false
+    bool  trigBull  = false
+    bool  trigBear  = false
+    bool  trigNoTrade = false
+    bool  trigCooldownOk = true
+    bool  volOk     = false
+    bool  dailyRegimeOk = true
+    bool  blockedByAccum = false
+    bool  blockedByExitWait = false
+    bool  accumLongDirOk = true
+    bool  accumShortDirOk = true
+    bool  sessionOk = true
+    bool  newsOk    = true
+    bool  longMajorOk = false
+    bool  shortMajorOk = false
+    bool  noTriggerMode = false
+    int   distState = 0
+    int   returnType = 0
+    int   returnDir = 0
+
+// ============================================================================
+// 02. CONSTRUCTORS
+// ============================================================================
+
+// @function  既定値 (= 移植元の input 既定値) の Cfg を作る。
+// @returns   DxyCfg
+export newDxyCfg() =>
+    DxyCfg.new()
+
+// @function  DXY Entry Candidate 用の状態を新規作成する。
+// @returns   DxyEngine
+export newDxyEngine() =>
+    DxyEngine.new(
+         corrG   = array.new_float(), corrM   = array.new_float(),
+         acc5Hi  = array.new_float(), acc5Lo  = array.new_float(), acc5St  = array.new_int(),
+         acc15Hi = array.new_float(), acc15Lo = array.new_float(), acc15St = array.new_int())
+
+// ============================================================================
+// 03. REQUEST EXPRESSION FUNCTIONS  (Main が request.*() の式として渡す)
+// ============================================================================
+
+// @function     確定TF足の [変化率%, 直近変化率%, 終値, 上昇構造維持, 下降構造維持]。
+//   移植元 f_imDataConfirmed と同一。すべて TFコンテキスト内の確定1本前 [1] に固定し、
+//   lookahead_on と組み合わせて非リペイントにする。
+// @param len       方向判定 参照本数
+// @param recentLen 直近確認 参照本数
+// @param structLen 構造判定本数
+// @returns         [chg, recent, close, structUp, structDn]
+export dxyDataPack(simple int len, simple int recentLen, simple int structLen) =>
+    float _chg    = (na(close[len])       or close[len] == 0)       ? 0.0 : (close - close[len])       / close[len]       * 100.0
+    float _recent = (na(close[recentLen]) or close[recentLen] == 0) ? 0.0 : (close - close[recentLen]) / close[recentLen] * 100.0
+    float _loN = ta.lowest(low,   structLen)[1]
+    float _hiN = ta.highest(high, structLen)[1]
+    bool  _structUp = not na(_loN) and close >= _loN
+    bool  _structDn = not na(_hiN) and close <= _hiN
+    [_chg[1], _recent[1], close[1], _structUp[1], _structDn[1]]
+
+f_enabledTrigCount(DxyCfg c) =>
+    (c.useEngulfingTrigger?1:0) + (c.usePinbarTrigger?1:0) + (c.useBOSTrigger?1:0) + (c.useEMARejectTrigger?1:0) + (c.useFVGTrigger?1:0) + (c.useStrongCandleTrigger?1:0)
+
+f_combineTrig(DxyCfg c, int cnt, int enabled) =>
+    c.triggerMode == "Any"  ? cnt >= 1 :
+     c.triggerMode == "All" ? (enabled > 0 and cnt >= enabled) :
+     cnt >= c.minTriggerCount
+
+// 移植元 f_calcTriggers と同一。呼び出したコンテキスト (1分足 / チャート足) で
+//   全トリガーを判定し、その足単体で Any/All/MinCount を評価する。
+f_calcTrig(DxyCfg c, simple int engulfAtrLen, simple int pinAtrLen, simple int bosLen,
+     simple int emaLen, simple int emaSlopeLb, simple int emaSlopeAtrLen) =>
+    float _body      = math.abs(close - open)
+    float _range     = high - low
+    float _upWick    = high - math.max(open, close)
+    float _loWick    = math.min(open, close) - low
+    float _bodyRatio = _range > 0 ? _body / _range : 0.0
+    float _closePos  = _range > 0 ? (close - low) / _range : 0.0
+    bool  _pUp = close[1] > open[1]
+    bool  _pDn = close[1] < open[1]
+    float _cHi = math.max(open,    close)
+    float _cLo = math.min(open,    close)
+    float _pHi = math.max(open[1], close[1])
+    float _pLo = math.min(open[1], close[1])
+    bool  _engBody = _cHi >= _pHi and _cLo <= _pLo
+    float _curBodySize  = math.abs(close - open)
+    float _prevBodySize = math.abs(close[1] - open[1])
+    float _curRangeSize = high - low
+    float _engulfAtr = ta.atr(engulfAtrLen)
+    bool _engulfRatioOk =
+         not c.useEngulfBodyRatioFilter or
+         (_prevBodySize > 0 and _curBodySize >= _prevBodySize * c.engulfBodyRatioMin)
+    bool _engulfBodyQualityOk =
+         not c.useEngulfBodyQualityFilter or
+         (_curRangeSize > 0 and _curBodySize / _curRangeSize >= c.engulfMinBodyRatio)
+    bool _engulfBodyAtrOk =
+         not c.useEngulfBodyAtrFilter or
+         _curBodySize >= _engulfAtr * c.engulfMinBodyATR
+    bool _engulfQualityOk =
+         _engulfRatioOk and
+         _engulfBodyQualityOk and
+         _engulfBodyAtrOk
+    bool _bullEng = c.useEngulfingTrigger and close > open and (not c.reqOppColor or _pDn) and (c.strictEngulf ? _engBody : close >= _pHi) and _engulfQualityOk
+    bool _bearEng = c.useEngulfingTrigger and close < open and (not c.reqOppColor or _pUp) and (c.strictEngulf ? _engBody : close <= _pLo) and _engulfQualityOk
+    float _pinAtr = ta.atr(pinAtrLen)
+    bool _pinBodyRatioOk = not c.usePinBodyRatioFilter or _bodyRatio <= c.pinMaxBodyRatio
+    bool _pinRangeOk     = not c.usePinRangeFilter     or _range >= _pinAtr * c.pinMinRangeATR
+    bool _bullPin = c.usePinbarTrigger and _loWick > _body * c.pinWickBodyMult and _loWick > _upWick * c.pinOppWickMaxRatio and _closePos >= c.trigCloseEdgeRatio and _pinBodyRatioOk and _pinRangeOk
+    bool _bearPin = c.usePinbarTrigger and _upWick > _body * c.pinWickBodyMult and _upWick > _loWick * c.pinOppWickMaxRatio and _closePos <= 1.0 - c.trigCloseEdgeRatio and _pinBodyRatioOk and _pinRangeOk
+    bool _bullBOS = c.useBOSTrigger and close > ta.highest(high, bosLen)[1]
+    bool _bearBOS = c.useBOSTrigger and close < ta.lowest(low, bosLen)[1]
+    float _ema = ta.ema(close, emaLen)
+    float _emaSlope    = _ema - _ema[emaSlopeLb]
+    float _emaSlopeAtr = ta.atr(emaSlopeAtrLen)
+    float _emaSlopeMin = _emaSlopeAtr * c.emaRejectSlopeMinATR
+    bool _bullEMASlopeOk = not c.useEMARejectSlope or _emaSlope >  _emaSlopeMin
+    bool _bearEMASlopeOk = not c.useEMARejectSlope or _emaSlope < -_emaSlopeMin
+    bool _bullEMA = c.useEMARejectTrigger and low <= _ema and close > _ema and close > open and _bullEMASlopeOk
+    bool _bearEMA = c.useEMARejectTrigger and high >= _ema and close < _ema and close < open and _bearEMASlopeOk
+    bool _bullFVG = c.useFVGTrigger and low > high[2]
+    bool _bearFVG = c.useFVGTrigger and high < low[2]
+    bool _bullStr = c.useStrongCandleTrigger and close > open and _bodyRatio >= c.strongBodyRatio and _closePos >= c.trigCloseEdgeRatio
+    bool _bearStr = c.useStrongCandleTrigger and close < open and _bodyRatio >= c.strongBodyRatio and _closePos <= 1.0 - c.trigCloseEdgeRatio
+    int _bullCnt = (_bullEng?1:0)+(_bullPin?1:0)+(_bullBOS?1:0)+(_bullEMA?1:0)+(_bullFVG?1:0)+(_bullStr?1:0)
+    int _bearCnt = (_bearEng?1:0)+(_bearPin?1:0)+(_bearBOS?1:0)+(_bearEMA?1:0)+(_bearFVG?1:0)+(_bearStr?1:0)
+    int _enabled = f_enabledTrigCount(c)
+    [f_combineTrig(c, _bullCnt, _enabled), f_combineTrig(c, _bearCnt, _enabled)]
+
+// @function  1分足コンテキストで評価するトリガー。移植元 f_calcTriggers と同一。
+//   request.security_lower_tf(syminfo.tickerid, "1", dxyTriggerPack(...)) で呼ぶ。
+// @param c               DxyCfg
+// @param engulfAtrLen    包み足 ATR期間
+// @param pinAtrLen       ピンバー ATR期間
+// @param bosLen          BOS Lookback
+// @param emaLen          EMA Length (EMAリジェクト)
+// @param emaSlopeLb      EMAリジェクト 傾き判定本数
+// @param emaSlopeAtrLen  EMAリジェクト 傾きATR期間
+// @returns               [bullTrigger, bearTrigger]
+export dxyTriggerPack(DxyCfg c, simple int engulfAtrLen, simple int pinAtrLen, simple int bosLen,
+     simple int emaLen, simple int emaSlopeLb, simple int emaSlopeAtrLen) =>
+    f_calcTrig(c, engulfAtrLen, pinAtrLen, bosLen, emaLen, emaSlopeLb, emaSlopeAtrLen)
+
+// 移植元 f_accumNTDetect と同一。呼び出したコンテキストの足で Accum を検出する。
+f_accumDetect(DxyCfg c, simple int rangeLen, simple int baseLen, simple int atrLen) =>
+    _atr       = ta.atr(atrLen)
+    _bodyTop   = math.max(open, close)
+    _bodyBot   = math.min(open, close)
+    _rangeHigh = ta.highest(_bodyTop, rangeLen)
+    _rangeLow  = ta.lowest(_bodyBot, rangeLen)
+    _rangeNow  = _rangeHigh - _rangeLow
+    _rangeMid  = (_rangeHigh + _rangeLow) * 0.5
+    int _upperCloses = 0
+    int _lowerCloses = 0
+    int _bullRun = 0
+    int _bearRun = 0
+    int _maxBullRun = 0
+    int _maxBearRun = 0
+    for i = 0 to rangeLen - 1
+        _upperCloses += close[i] > _rangeMid ? 1 : 0
+        _lowerCloses += close[i] < _rangeMid ? 1 : 0
+        bool _isBull = close[i] > open[i]
+        bool _isBear = close[i] < open[i]
+        if _isBull
+            _bullRun += 1
+            _bearRun := 0
+        else if _isBear
+            _bearRun += 1
+            _bullRun := 0
+        else
+            _bullRun := 0
+            _bearRun := 0
+        _maxBullRun := math.max(_maxBullRun, _bullRun)
+        _maxBearRun := math.max(_maxBearRun, _bearRun)
+    _startMid = (open[rangeLen - 1] + close[rangeLen - 1]) * 0.5
+    _endMid   = (open + close) * 0.5
+    _drift    = math.abs(_endMid - _startMid)
+    _condAtr    = _atr > 0 and _rangeNow <= _atr * c.accumAtrMult
+    _rangeShort = ta.highest(_bodyTop, rangeLen) - ta.lowest(_bodyBot, rangeLen)
+    _rangeBase  = ta.highest(_bodyTop, baseLen)  - ta.lowest(_bodyBot, baseLen)
+    _condBar      = _rangeBase > 0 and _rangeShort <= _rangeBase * c.accumBarRatioMax
+    _condBalance  = _upperCloses >= c.accumMinUpperCloses and _lowerCloses >= c.accumMinLowerCloses
+    _condDrift    = _rangeNow > 0 and (_drift / _rangeNow) <= c.accumDriftMax
+    _condColorRun = _maxBullRun <= c.accumMaxSameColorRun and _maxBearRun <= c.accumMaxSameColorRun
+    bool _isAccum = _condAtr and _condBar and _condBalance and _condDrift and _condColorRun
+    float _hi = ta.highest(math.max(open, close), rangeLen)
+    float _lo = ta.lowest(math.min(open, close),  rangeLen)
+    [_isAccum, _hi, _lo]
+
+// @function  15分足コンテキストで確定済み1本前の Accum箱を返す。
+//   移植元 f_accumNT15 + f_accumNT15Confirmed と同一。
+//   request.security(syminfo.tickerid, "15", dxyAccum15Pack(...), lookahead_on) で呼ぶ。
+// @param c         DxyCfg
+// @param rangeLen  Accum判定レンジ本数
+// @param baseLen   基準平均本数
+// @param atrLen    ATR本数
+// @returns         [boxHigh, boxLow, boxStartBar]
+export dxyAccum15Pack(DxyCfg c, simple int rangeLen, simple int baseLen, simple int atrLen) =>
+    [_isA, _hi, _lo] = f_accumDetect(c, rangeLen, baseLen, atrLen)
+    var float _bxHi = na
+    var float _bxLo = na
+    var int   _bxSt = na
+    bool _start = _isA and not nz(_isA[1], false)
+    if _start
+        _bxHi := _hi
+        _bxLo := _lo
+        _bxSt := bar_index
+    if _isA
+        float _bt = math.max(open, close)
+        float _bb = math.min(open, close)
+        _bxHi := math.max(nz(_bxHi, _bt), _bt)
+        _bxLo := math.min(nz(_bxLo, _bb), _bb)
+    [_bxHi[1], _bxLo[1], _bxSt[1]]
+
+// @function  日足レジーム用データ。移植元 f_drDailyTuple と同じ値を UDT で返す。
+//   request.security(syminfo.tickerid, "D", dxyDailyPack(...), lookahead_off) で呼ぶ。
+// @param volMethod    日足ボラ分類方法
+// @param atrLen       日足ATR期間
+// @param volLookback  日足ボラ分布 参照日数
+// @param loPct        低ボラ上限パーセンタイル
+// @param hiPct        高ボラ下限パーセンタイル
+// @returns            DxyDaily
+export dxyDailyPack(simple string volMethod, simple int atrLen, simple int volLookback,
+     simple float loPct, simple float hiPct) =>
+    float _a = ta.atr(atrLen)
+    float _r = high - low
+    float _loThr = na
+    float _hiThr = na
+    if volMethod == "パーセンタイル"
+        _loThr := ta.percentile_linear_interpolation(_r, volLookback, loPct)[1]
+        _hiThr := ta.percentile_linear_interpolation(_r, volLookback, hiPct)[1]
+    DxyDaily.new(
+         o0 = open, h0 = high, l0 = low, c0 = close, a0 = _a, r0 = _r, loT0 = _loThr, hiT0 = _hiThr,
+         o1 = open[1], h1 = high[1], l1 = low[1], c1 = close[1], a1 = _a[1], r1 = _r[1],
+         loT1 = _loThr[1], hiT1 = _hiThr[1])
+
+// ============================================================================
+// 04. INTERNAL STATE HELPERS  (すべて移植元の該当処理をそのまま移植)
+// ============================================================================
+
+// 移植元 f_corrPush2 と同一。参照TFの新しい確定足でだけ Gold/市場の確定終値を対で積む。
+f_corrPush(array<float> ga, array<float> ma, bool doPush, float g, float m, int len) =>
+    if doPush and not na(g) and not na(m)
+        array.push(ga, g)
+        array.push(ma, m)
+        while array.size(ga) > len
+            array.shift(ga)
+            array.shift(ma)
+
+// 移植元 f_corrCalc と同一。バッファ (= 参照TF確定足 len 本) 上の Pearson 相関。
+f_corrCalc(array<float> ga, array<float> ma, int len) =>
+    int _n = array.size(ga)
+    float _corr = na
+    if _n >= len
+        float _mg = array.avg(ga)
+        float _mm = array.avg(ma)
+        float _cov = 0.0
+        float _vg  = 0.0
+        float _vm  = 0.0
+        for i = 0 to _n - 1
+            float _dg = array.get(ga, i) - _mg
+            float _dm = array.get(ma, i) - _mm
+            _cov += _dg * _dm
+            _vg  += _dg * _dg
+            _vm  += _dm * _dm
+        float _den = math.sqrt(_vg * _vm)
+        _corr := _den > 0 ? _cov / _den : na
+    _corr
+
+// 移植元 f_macroState の DXY 呼び出し (inverseMkt = true) をそのまま移植したもの。
+//   ・var で持っていた状態は すべて DxyEngine のフィールドへ移しただけで、
+//     判定式・評価順序・遷移条件・Hold の数え方は一切変更していない。
+//   ・移植元で市場別の引数だった値は DxyCfg の DXY 用フィールドから読む。
+// @returns [score, reason, noTrade, stateCode, returnType, returnDir]
+f_macro(DxyCfg c, DxyEngine e, bool active, bool newBar, float gChg, float mChg, float corr,
+     bool gStructUp, bool gStructDn, bool mStructUp, bool mStructDn) =>
+    if active and newBar
+        e.tfBar += 1
+        e.returnBar := false
+        // ① 主 = 市場。最低変化率以上動いた足だけ関係を分類する。
+        float _mThr = c.useDistMinMove ? c.dxyDistMinChange : 0.0
+        int   _mDir = (mChg > 0 and math.abs(mChg) >= _mThr) ? 1 : (mChg < 0 and math.abs(mChg) >= _mThr) ? -1 : 0
+        // ② 従 = Gold。goldRespMinChange 未満は Neutral (無反応)。
+        int   _gResp = gChg >= c.goldRespMinChange ? 1 : gChg <= -c.goldRespMinChange ? -1 : 0
+        e.mDirOut  := _mDir
+        e.gRespOut := _gResp
+        // 相関は補助条件。DXY は逆相関市場なので corr <= -th。
+        bool _corrOkNow = not na(corr) and corr <= -c.corrThreshold
+        // ③ 関係分類 (inverseMkt = true → 期待方向は -_mDir)
+        int _expected = -_mDir
+        int _rel      = _mDir == 0 ? 0 : _gResp == _expected ? 1 : _gResp == 0 ? 2 : 3
+        int _retDir   = 0
+        int _retType  = 0
+        int _retKind  = 0
+        // --- Distortion の期限切れ判定 (主市場が動いていない足でも必ず進める) ---
+        if e.state == 1 and (na(e.distortBar) or (e.tfBar - e.distortBar) > c.returnLookback)
+            e.state         := 0
+            e.distKind      := 0
+            e.distKindStart := 0
+            e.expired       := true
+        if _rel != 0
+            // --- Distortion 継続中 : 主導判定 / 復帰 ---
+            if e.state == 1
+                bool _goldHold = e.preGoldDir == 1 ? (_gResp == 1 and gStructUp) : e.preGoldDir == -1 ? (_gResp == -1 and gStructDn) : false
+                bool _mktHold  = e.preMktDir  == 1 ? (_mDir  == 1 and mStructUp) : e.preMktDir  == -1 ? (_mDir  == -1 and mStructDn) : false
+                if _goldHold and not _mktHold
+                    e.leader := 1
+                else if _mktHold and not _goldHold
+                    e.leader := -1
+                else
+                    e.leader := 0
+                if _rel == 1
+                    // 正常な関係へ復帰 → Return (この確定TF足1本だけ)
+                    _retDir     := _gResp
+                    _retType    := _retDir == e.preGoldDir ? 1 : 2
+                    e.returnDir  := _retDir
+                    e.returnType := _retType
+                    _retKind     := e.distKindStart
+                    e.returnBar  := true
+                    e.expired    := false
+                    e.state      := 0
+                    e.distKind   := 0
+                    e.distKindStart := 0
+                else
+                    // Distortion 継続 (Neutral ⇔ Opposite の種別だけ更新)
+                    e.distKind := _rel == 2 ? 1 : 2
+            // --- Normal → Distortion 開始判定 ---
+            if e.state == 0 and not e.returnBar and _rel != 1 and e.prevRelNormal and (not c.distRequireCorr or e.prevCorrOk)
+                e.state           := 1
+                e.distKind        := _rel == 2 ? 1 : 2
+                e.distKindStart   := _rel == 2 ? 1 : 2
+                e.expired         := false
+                e.distortBar      := e.tfBar
+                e.preGoldDir      := e.prevGoldDir
+                e.preMktDir       := e.prevMktDir
+                e.preGoldChg      := e.prevGoldChg
+                e.preMktChg       := e.prevMktChg
+                e.preGoldStructUp := e.prevGoldStructUp
+                e.preGoldStructDn := e.prevGoldStructDn
+                e.preMktStructUp  := e.prevMktStructUp
+                e.preMktStructDn  := e.prevMktStructDn
+                bool _goldHeld = e.prevGoldDir == 1 ? (_gResp == 1 and gStructUp) : e.prevGoldDir == -1 ? (_gResp == -1 and gStructDn) : false
+                bool _mktHeld  = e.prevMktDir  == 1 ? (_mDir  == 1 and mStructUp) : e.prevMktDir  == -1 ? (_mDir  == -1 and mStructDn) : false
+                if _goldHeld and not _mktHeld
+                    e.leader := 1
+                else if _mktHeld and not _goldHeld
+                    e.leader := -1
+                else
+                    e.leader := 0
+                e.returnType := 0
+                e.returnDir  := 0
+            // --- スナップショット更新 (分類できた足だけ) ---
+            e.prevGoldDir      := _gResp
+            e.prevMktDir       := _mDir
+            e.prevGoldChg      := gChg
+            e.prevMktChg       := mChg
+            e.prevRelNormal    := _rel == 1
+            e.prevCorrOk       := _corrOkNow
+            e.prevGoldStructUp := gStructUp
+            e.prevGoldStructDn := gStructDn
+            e.prevMktStructUp  := mStructUp
+            e.prevMktStructDn  := mStructDn
+        // --- イベント統合 (Direction と Return は完全独立) ---
+        int _dirEvent = 0
+        if c.useDxyDirection
+            _dirEvent := mChg <= -c.dxyMinChange ? 1 : mChg >= c.dxyMinChange ? -1 : 0
+        bool _corrOK = not c.useDxyInverseCorr or _corrOkNow
+        bool _retKindOk = _retKind == 1 ? c.useDxyRetNeutral  : _retKind == 2 ? c.useDxyRetSameDir  : false
+        bool _retTypeOk = _retType == 1 ? c.useDxyRetOriginal : _retType == 2 ? c.useDxyRetOpposite : false
+        int  _retEvent = (c.useDxyReturn and e.returnBar and _retKindOk and _retTypeOk) ? _retDir : 0
+        int  _event    = _retEvent != 0 ? _retEvent : (c.useDxyDirection and _corrOK ? _dirEvent : 0)
+        // Return は必ず Hold を張り直す。Direction は生条件の立ち上がりでのみ発火。
+        if _retEvent != 0
+            e.reason := _retEvent
+            e.evBar  := e.tfBar
+        else if _event == 1 and e.prevRawEvent != 1
+            e.reason := 1
+            e.evBar  := e.tfBar
+        else if _event == -1 and e.prevRawEvent != -1
+            e.reason := -1
+            e.evBar  := e.tfBar
+        e.prevRawEvent := _event
+        // Distortion中は NoTrade。Return 成立足では解除される (state が 0 に戻るため)。
+        e.mNoTrade := c.useDxyDistNoTrade and e.state == 1
+    bool  _act       = e.reason != 0 and not na(e.evBar) and (e.tfBar - e.evBar) < c.hold15M
+    float _out       = _act ? (e.reason == 1 ? c.dxyEventPoint : -c.dxyEventPoint) : 0.0
+    int   _outR      = _act ? e.reason : 0
+    int   _stateCode = e.returnBar ? 3 : e.state == 1 ? (e.distKind == 1 ? 1 : 2) : e.expired ? 4 : 0
+    [_out, _outR, active and e.mNoTrade, _stateCode, e.returnType, e.returnDir]
+
+// 移植元 f_drDirCode と同一。
+f_drDirCode(DxyCfg c, float o, float h, float l, float cl) =>
+    float _rng = h - l
+    int _code = na
+    if not na(o) and not na(h) and not na(l) and not na(cl) and _rng > 0
+        float _body = math.abs(cl - o)
+        float _bodyRatio = _body / _rng
+        float _closeLoc = (cl - l) / _rng
+        bool _bull = cl > o and _bodyRatio >= c.dailyDirBodyRatio and _closeLoc >= c.dailyBullCloseLoc
+        bool _bear = cl < o and _bodyRatio >= c.dailyDirBodyRatio and _closeLoc <= c.dailyBearCloseLoc
+        _code := _bull and not _bear ? 1 : _bear and not _bull ? -1 : 0
+    _code
+
+// 移植元 f_drVolCode と同一。
+f_drVolCode(DxyCfg c, float rng, float atr, float loThr, float hiThr) =>
+    int _code = na
+    bool _valid = not na(rng) and rng > 0
+    if c.dailyVolMethod == "パーセンタイル"
+        if _valid and not na(loThr) and not na(hiThr) and hiThr >= loThr
+            _code := rng >= hiThr ? 1 : rng <= loThr ? -1 : 0
+    else if c.dailyVolMethod == "ATR比率"
+        if _valid and not na(atr) and atr > 0
+            float _ratio = rng / atr
+            float _lo = math.min(c.dailyLowAtrRatio, c.dailyHighAtrRatio)
+            float _hi = math.max(c.dailyLowAtrRatio, c.dailyHighAtrRatio)
+            _code := _ratio >= _hi ? 1 : _ratio <= _lo ? -1 : 0
+    else
+        if _valid
+            float _lo = math.min(c.dailyLowRangeMax, c.dailyHighRangeMin)
+            float _hi = math.max(c.dailyLowRangeMax, c.dailyHighRangeMin)
+            _code := rng >= _hi ? 1 : rng < _lo ? -1 : 0
+    _code
+
+// 移植元 f_dailyDirectionText / f_dailyVolatilityText と同一。
+f_drDirText(int code) =>
+    code == 1 ? "上昇" : code == -1 ? "下降" : code == 0 ? "レンジ" : "-"
+f_drVolText(int code) =>
+    code == 1 ? "高ボラ" : code == -1 ? "低ボラ" : code == 0 ? "中ボラ" : "-"
+
+// ============================================================================
+// 05. UPDATE  (毎バー1回・移植元の評価順序をそのまま再現)
+// ============================================================================
+
+// @function  DXY Entry Candidate を1バー分計算する。
+//   移植元 "Gold Intermarket Environment Strategy" の
+//     5.トリガー集約 → 6.ボラフィルタ → 8g-2.Intermarket → 9b.日足レジーム →
+//     10.時間帯/指標 → 10b.Accumulation → 10c.最終エントリー条件
+//   をこの順で実行し、canLong / canShort 相当を candLong / candShort として返す。
+//
+//   ★ 移植元との相違点 (すべて利用者指示による) ★
+//     ・longRisk > 0 / longQty >= 1 (および Short 同等) は Candidate から外す。
+//       SL・TP・Qty・保有制御は Main の共通Trade Engine が担当するため。
+//     ・Trend環境は未実装 (trendOk = true 固定)。
+//     ・armed の解除は「実注文が通ったとき」ではなく Candidate 成立時に行う。
+//     ・DXYデータが na の間は Candidate を出さない (状態更新は止めない)。
+//
+// @param c              DxyCfg
+// @param e              DxyEngine (状態。呼び出し側が var で保持する)
+// @param f              DxyFeed (Main が request 等で用意した当バーの入力)
+// @param volAvgLen      ATR平均本数
+// @param fastAtrLen     fastATR/値幅 参照本数
+// @param bodyAvgLen     実体平均本数
+// @param rangeLbV       RangeWidth参照本数
+// @param accumRangeLen  Accum判定レンジ本数
+// @param accumBaseLen   Accum基準平均本数
+// @param accumAtrLen    Accum ATR本数
+// @returns              DxySignal
+export updateDxy(DxyCfg c, DxyEngine e, DxyFeed f,
+     simple int volAvgLen, simple int fastAtrLen, simple int bodyAvgLen, simple int rangeLbV,
+     simple int accumRangeLen, simple int accumBaseLen, simple int accumAtrLen) =>
+    bool _active = c.useDxy
+
+    // ---- ta.* は毎バー無条件に評価する ----
+    //   移植元では定数inputの if 内で呼ばれており、分岐は常に成立/常に不成立のいずれか。
+    //   ここでは Cfg が series のため無条件評価にしているが、採用される値は同一。
+    float _atrAvg      = ta.sma(f.baseAtr, volAvgLen)
+    float _fastAtr     = ta.atr(fastAtrLen)
+    float _bodyAvgFast = ta.sma(math.abs(close - open), bodyAvgLen)
+    float _rangeWidthV = ta.highest(high, rangeLbV) - ta.lowest(low, rangeLbV)
+    float _fastRange   = ta.highest(high, fastAtrLen) - ta.lowest(low, fastAtrLen)
+    [_isA5, _hi5, _lo5] = f_accumDetect(c, accumRangeLen, accumBaseLen, accumAtrLen)
+
+    // ============================================================
+    //  5. 1分足トリガー集約 (移植元 5. と同一)
+    // ============================================================
+    bool _oneMinBull = false
+    bool _oneMinBear = false
+    if c.useLowerTFTrigger
+        if not na(f.bullTrigArr) and array.size(f.bullTrigArr) > 0
+            for i = 0 to array.size(f.bullTrigArr) - 1
+                if array.get(f.bullTrigArr, i)
+                    _oneMinBull := true
+        if not na(f.bearTrigArr) and array.size(f.bearTrigArr) > 0
+            for i = 0 to array.size(f.bearTrigArr) - 1
+                if array.get(f.bearTrigArr, i)
+                    _oneMinBear := true
+    else
+        _oneMinBull := f.trigBullCur
+        _oneMinBear := f.trigBearCur
+    bool _lowerTFConflict = _oneMinBull and _oneMinBear
+    bool _trigNoTrade     = c.useOppTrigNoTrade and _lowerTFConflict
+    bool _finalBullTrig   = _oneMinBull and not _trigNoTrade
+    bool _finalBearTrig   = _oneMinBear and not _trigNoTrade
+    bool _trigFiredNow    = _finalBullTrig or _finalBearTrig
+    bool _trigCooldownOk  = not c.useTriggerCooldown or na(e.lastTrigBar) or (bar_index - e.lastTrigBar) > c.triggerCooldownBars
+    if _trigFiredNow and _trigCooldownOk
+        e.lastTrigBar := bar_index
+
+    // ============================================================
+    //  6. ボラフィルタ判定 (移植元 6. と同一)
+    // ============================================================
+    bool _baseVolOk = true
+    if c.volMode == "ATR"
+        bool _volAbsOk = f.baseAtr >= c.minAtrDollar
+        bool _volRelOk = _atrAvg > 0 and f.baseAtr >= _atrAvg * c.volRatioMin
+        _baseVolOk := not c.useMinVol or (c.volModeRel ? _volRelOk : _volAbsOk)
+    else if c.volMode == "固定値"
+        _baseVolOk := (high - low) >= c.fixedMin
+    bool _fastVolPass = true
+    if c.fastVolMode == "ATR"
+        float _atrRangeRatio = _rangeWidthV > 0 ? _fastAtr / _rangeWidthV : 0.0
+        bool _fastAtrOk    = _fastAtr >= c.fastAtrMin
+        bool _bodyAvgOkA   = _bodyAvgFast >= c.bodyAvgMin
+        bool _rangeRatioOk = not c.useRangeRatioFilter or _atrRangeRatio >= c.atrRangeRatioMin
+        _fastVolPass := _fastAtrOk and _bodyAvgOkA and _rangeRatioOk
+    else if c.fastVolMode == "固定値"
+        bool _fastRangeOk = _fastRange >= c.fastFixedMin
+        bool _bodyAvgOkB  = _bodyAvgFast >= c.bodyAvgMin
+        _fastVolPass := _fastRangeOk and _bodyAvgOkB
+    bool _volPassRaw = _baseVolOk and _fastVolPass
+    bool _volLowNow  = not _volPassRaw
+    if _volLowNow
+        e.volRecoveryStartBar := na
+    if not _volLowNow and e.prevVolLow
+        e.volRecoveryStartBar := bar_index
+    e.prevVolLow := _volLowNow
+    bool _volRecoveryOk = not c.useVolCooldown or na(e.volRecoveryStartBar) or (bar_index - e.volRecoveryStartBar) >= c.volRecoveryBars
+    bool _volOk = _volPassRaw and _volRecoveryOk
+
+    // ============================================================
+    //  8g-2. Intermarket 環境認識 (DXY × 15M のみ)
+    // ============================================================
+    f_corrPush(e.corrG, e.corrM, _active and f.new15Bar, f.goldClose, f.dxyClose, c.corrLen)
+    float _corr = _active ? f_corrCalc(e.corrG, e.corrM, c.corrLen) : na
+    [_xScore, _xReason, _xNT, _xState, _xRetType, _xRetDir] =
+     f_macro(c, e, _active, f.new15Bar, f.goldChg, f.dxyChg, _corr,
+     f.goldStructUp, f.goldStructDn, f.dxyStructUp, f.dxyStructDn)
+    float _xW15M    = _active ? _xScore * c.tfWeight15M : 0.0
+    float _dxyTotal = _active ? c.dxyWeight * _xW15M : 0.0
+    bool  _dxyNT    = _active and _xNT
+    int   _dxyBias  = not _active ? 0 : _dxyTotal >= c.scoreThreshold ? 1 : _dxyTotal <= -c.scoreThreshold ? -1 : 0
+    // 有効市場が DXY のみのため、移植元の WeightedScore / AND / OR は
+    // いずれも「DXY単体のBias」と同値になる。ここでは DXY単体Bias を使う。
+    bool _imBiasLong  = _dxyBias == 1
+    bool _imBiasShort = _dxyBias == -1
+    bool _imNoTrade   = _active and _dxyNT
+    bool _imLongOk    = not _active or (_imBiasLong  and not _imNoTrade)
+    bool _imShortOk   = not _active or (_imBiasShort and not _imNoTrade)
+    bool _trendOk       = true
+    bool _allEnvLongOk  = _trendOk and _imLongOk
+    bool _allEnvShortOk = _trendOk and _imShortOk
+
+    // ============================================================
+    //  9b. 日足レジームフィルター (移植元 9b. と同一)
+    // ============================================================
+    bool _dailyRegimeOk = true
+    if c.useDailyRegime
+        float _o0 = na
+        float _h0 = na
+        float _l0 = na
+        float _c0 = na
+        float _a0 = na
+        float _r0 = na
+        float _loT0 = na
+        float _hiT0 = na
+        float _o1 = na
+        float _h1 = na
+        float _l1 = na
+        float _c1 = na
+        float _a1 = na
+        float _r1 = na
+        float _loT1 = na
+        float _hiT1 = na
+        if not na(f.daily)
+            _o0 := f.daily.o0
+            _h0 := f.daily.h0
+            _l0 := f.daily.l0
+            _c0 := f.daily.c0
+            _a0 := f.daily.a0
+            _r0 := f.daily.r0
+            _loT0 := f.daily.loT0
+            _hiT0 := f.daily.hiT0
+            _o1 := f.daily.o1
+            _h1 := f.daily.h1
+            _l1 := f.daily.l1
+            _c1 := f.daily.c1
+            _a1 := f.daily.a1
+            _r1 := f.daily.r1
+            _loT1 := f.daily.loT1
+            _hiT1 := f.daily.hiT1
+        if f.newDay or na(e.curDayHigh)
+            e.curDayOpen := open
+            e.curDayHigh := high
+            e.curDayLow  := low
+        else
+            e.curDayHigh := math.max(e.curDayHigh, high)
+            e.curDayLow  := math.min(e.curDayLow, low)
+        float _drIntradayRange = e.curDayHigh - e.curDayLow
+        bool _drUsePrev  = c.dailyRegimeMode == "前日確定ベース"
+        bool _drUseIntra = c.dailyRegimeMode == "当日進行中ベース"
+        float _drO = _drUsePrev ? _o1 : _drUseIntra ? e.curDayOpen : _o0
+        float _drH = _drUsePrev ? _h1 : _drUseIntra ? e.curDayHigh : _h0
+        float _drL = _drUsePrev ? _l1 : _drUseIntra ? e.curDayLow  : _l0
+        float _drC = _drUsePrev ? _c1 : _drUseIntra ? close        : _c0
+        float _drRange    = _drUsePrev ? _r1 : _drUseIntra ? _drIntradayRange : _r0
+        float _drDailyATR = _drUsePrev ? _a1 : _drUseIntra ? _a1 : _a0
+        float _drLoThr = _drUsePrev ? _loT1 : _loT0
+        float _drHiThr = _drUsePrev ? _hiT1 : _hiT0
+        int _drDirCode = f_drDirCode(c, _drO, _drH, _drL, _drC)
+        int _drVolCode = f_drVolCode(c, _drRange, _drDailyATR, _drLoThr, _drHiThr)
+        bool _drDirInsufficient = na(_drDirCode)
+        bool _drVolInsufficient = na(_drVolCode)
+        int _drDirCodeAdj = _drDirInsufficient ? (c.dailyInsufficientAsRange ? 0 : na) : _drDirCode
+        int _drVolCodeAdj = _drVolInsufficient ? (c.dailyInsufficientAsRange ? 0 : na) : _drVolCode
+        string _drDirText = f_drDirText(_drDirCodeAdj)
+        string _drVolText = f_drVolText(_drVolCodeAdj)
+        bool _directionMatch  = c.reqDailyDirection  == "OFF" or _drDirText == c.reqDailyDirection
+        bool _volatilityMatch = c.reqDailyVolatility == "OFF" or _drVolText == c.reqDailyVolatility
+        bool _drDirBlock = c.reqDailyDirection  != "OFF" and _drDirInsufficient and not c.dailyInsufficientAsRange
+        bool _drVolBlock = c.reqDailyVolatility != "OFF" and _drVolInsufficient and not c.dailyInsufficientAsRange
+        bool _highVol140to170 = _drRange >= c.highVolLevel1 and _drRange < c.highVolLevel2
+        bool _highVol170to200 = _drRange >= c.highVolLevel2 and _drRange < c.extremeVolLevel
+        bool _highVol200Plus  = _drRange >= c.extremeVolLevel
+        bool _allowHighVol =
+             (c.useHighVol140to170 and _highVol140to170) or
+             (c.useHighVol170to200 and _highVol170to200) or
+             (c.useHighVol200Plus  and _highVol200Plus)
+        bool _drIsHighVol   = not na(_drVolCodeAdj) and _drVolCodeAdj == 1
+        bool _highVolBandOk = not _drIsHighVol or _allowHighVol
+        _dailyRegimeOk := not c.useDailyRegime or (_directionMatch and _volatilityMatch and not _drDirBlock and not _drVolBlock and _highVolBandOk)
+    bool _drTradeConnected = c.dailyRegimeMode == "前日確定ベース" or c.dailyRegimeMode == "当日進行中ベース"
+    bool _dailyRegimeLongOk  = _drTradeConnected ? _dailyRegimeOk : true
+    bool _dailyRegimeShortOk = _drTradeConnected ? _dailyRegimeOk : true
+
+    // ============================================================
+    //  10. 時間帯 / 指標時間フィルタ (移植元 10. と同一)
+    // ============================================================
+    int  _jstHour = hour(time, "Asia/Tokyo")
+    bool _inAsia  = _jstHour >= 9  and _jstHour < 16
+    bool _inEU    = _jstHour >= 16 and _jstHour < 21
+    bool _inNY    = _jstHour >= 21 or  _jstHour < 3
+    bool _sessionOk =
+         not c.useSessionFilter or
+         (c.useAsiaSession and _inAsia) or
+         (c.useEUSession   and _inEU) or
+         (c.useNYSession   and _inNY)
+    bool _allowByNewsTime = not c.useNewsTimeFilter or not f.inNewsTime
+
+    // ============================================================
+    //  10b. Accumulation NoTrade フィルター (移植元 10b. と同一)
+    // ============================================================
+    bool _insideAccum5M  = false
+    bool _insideAccum15M = false
+    if c.useAccumNoTrade and c.useAccumNT5M
+        bool _start5 = _isA5 and not e.acc5Prev
+        e.acc5Prev := _isA5
+        if _start5
+            e.acc5BoxHi := _hi5
+            e.acc5BoxLo := _lo5
+            e.acc5BoxSt := bar_index
+            array.push(e.acc5Hi, e.acc5BoxHi)
+            array.push(e.acc5Lo, e.acc5BoxLo)
+            array.push(e.acc5St, e.acc5BoxSt)
+            while array.size(e.acc5St) > c.accumKeep
+                array.shift(e.acc5Hi)
+                array.shift(e.acc5Lo)
+                array.shift(e.acc5St)
+        if _isA5
+            float _bt = math.max(open, close)
+            float _bb = math.min(open, close)
+            e.acc5BoxHi := math.max(nz(e.acc5BoxHi, _bt), _bt)
+            e.acc5BoxLo := math.min(nz(e.acc5BoxLo, _bb), _bb)
+            if array.size(e.acc5St) > 0
+                array.set(e.acc5Hi, array.size(e.acc5Hi) - 1, e.acc5BoxHi)
+                array.set(e.acc5Lo, array.size(e.acc5Lo) - 1, e.acc5BoxLo)
+        if array.size(e.acc5St) > 0
+            for i = 0 to array.size(e.acc5St) - 1
+                if close >= array.get(e.acc5Lo, i) and close <= array.get(e.acc5Hi, i)
+                    _insideAccum5M := true
+    if c.useAccumNoTrade and c.useAccumNT15M
+        if f.accNew15Bar
+            if not na(f.acc15St) and f.acc15St != e.acc15LastSt
+                array.push(e.acc15Hi, f.acc15Hi)
+                array.push(e.acc15Lo, f.acc15Lo)
+                array.push(e.acc15St, f.acc15St)
+                e.acc15LastSt := f.acc15St
+                while array.size(e.acc15St) > c.accumKeep
+                    array.shift(e.acc15Hi)
+                    array.shift(e.acc15Lo)
+                    array.shift(e.acc15St)
+            else if array.size(e.acc15St) > 0 and not na(f.acc15St) and f.acc15St == e.acc15LastSt
+                array.set(e.acc15Hi, array.size(e.acc15Hi) - 1, f.acc15Hi)
+                array.set(e.acc15Lo, array.size(e.acc15Lo) - 1, f.acc15Lo)
+        if array.size(e.acc15St) > 0
+            for i = 0 to array.size(e.acc15St) - 1
+                if close >= array.get(e.acc15Lo, i) and close <= array.get(e.acc15Hi, i)
+                    _insideAccum15M := true
+    bool _blockedByAccum = c.useAccumNoTrade and ((c.useAccumNT5M and _insideAccum5M) or (c.useAccumNT15M and _insideAccum15M))
+    bool _exitedAccumThisBar = c.useAccumNoTrade and e.prevBlockedByAccum and not _blockedByAccum
+    if not c.useAccumNoTrade or not c.useAccumExitConfirm
+        e.waitingExitConfirm  := false
+        e.outsideConfirmCount := 0
+    else
+        if _blockedByAccum
+            e.waitingExitConfirm  := false
+            e.outsideConfirmCount := 0
+        else if _exitedAccumThisBar
+            e.waitingExitConfirm  := true
+            e.outsideConfirmCount := 0
+        else if e.waitingExitConfirm
+            e.outsideConfirmCount += 1
+        if e.waitingExitConfirm and e.outsideConfirmCount >= c.accumExitConfirmBars
+            e.waitingExitConfirm := false
+    bool _blockedByAccumExitWait = c.useAccumNoTrade and c.useAccumExitConfirm and e.waitingExitConfirm
+    if not c.useAccumNoTrade or not c.useAccumBreakDirection
+        e.breakDirection   := 0
+        e.breakDirStartBar := na
+        e.breakDirActive   := false
+    else
+        if _blockedByAccum
+            e.breakDirection   := 0
+            e.breakDirStartBar := na
+            e.breakDirActive   := false
+        else if _exitedAccumThisBar
+            bool _brokeUp   = false
+            bool _brokeDown = false
+            if c.useAccumNT5M and array.size(e.acc5St) > 0
+                for i = 0 to array.size(e.acc5St) - 1
+                    float _bh = array.get(e.acc5Hi, i)
+                    float _bl = array.get(e.acc5Lo, i)
+                    bool _wasInside = close[1] >= _bl and close[1] <= _bh
+                    if _wasInside and close > _bh
+                        _brokeUp := true
+                    if _wasInside and close < _bl
+                        _brokeDown := true
+            if c.useAccumNT15M and array.size(e.acc15St) > 0
+                for i = 0 to array.size(e.acc15St) - 1
+                    float _bh = array.get(e.acc15Hi, i)
+                    float _bl = array.get(e.acc15Lo, i)
+                    bool _wasInside = close[1] >= _bl and close[1] <= _bh
+                    if _wasInside and close > _bh
+                        _brokeUp := true
+                    if _wasInside and close < _bl
+                        _brokeDown := true
+            if _brokeUp and not _brokeDown
+                e.breakDirection   := 1
+                e.breakDirStartBar := bar_index
+                e.breakDirActive   := true
+            else if _brokeDown and not _brokeUp
+                e.breakDirection   := -1
+                e.breakDirStartBar := bar_index
+                e.breakDirActive   := true
+            else
+                e.breakDirection   := 0
+                e.breakDirStartBar := na
+                e.breakDirActive   := false
+        if e.breakDirActive and not na(e.breakDirStartBar) and (bar_index - e.breakDirStartBar > c.accumBreakDirectionBars)
+            e.breakDirection   := 0
+            e.breakDirStartBar := na
+            e.breakDirActive   := false
+    e.prevBlockedByAccum := _blockedByAccum
+    bool _accumLongDirOk =
+         not c.useAccumNoTrade or
+         not c.useAccumBreakDirection or
+         not e.breakDirActive or
+         e.breakDirection == 1
+    bool _accumShortDirOk =
+         not c.useAccumNoTrade or
+         not c.useAccumBreakDirection or
+         not e.breakDirActive or
+         e.breakDirection == -1
+
+    // ============================================================
+    //  10c. 最終エントリー条件 (移植元 10c. と同一)
+    //    ただし longRisk / longQty 条件は Candidate から外す (利用者指示)。
+    // ============================================================
+    bool _longMajorOk =
+         _dailyRegimeLongOk and
+         _sessionOk and
+         _allowByNewsTime and
+         _allEnvLongOk and
+         _volOk and
+         not _blockedByAccum and
+         not _blockedByAccumExitWait and
+         _accumLongDirOk
+    bool _shortMajorOk =
+         _dailyRegimeShortOk and
+         _sessionOk and
+         _allowByNewsTime and
+         _allEnvShortOk and
+         _volOk and
+         not _blockedByAccum and
+         not _blockedByAccumExitWait and
+         _accumShortDirOk
+    bool _dataValid = _active and not na(f.goldClose) and not na(f.dxyClose)
+    bool _baseLongCondition  = f.confirmed and c.useLong  and _longMajorOk
+    bool _baseShortCondition = f.confirmed and c.useShort and _shortMajorOk
+    bool _noTriggerMode = f_enabledTrigCount(c) == 0
+    if not _longMajorOk
+        e.longArmed := true
+    if not _shortMajorOk
+        e.shortArmed := true
+    bool _noTrigLongSig  = _noTriggerMode and _baseLongCondition  and e.longArmed
+    bool _noTrigShortSig = _noTriggerMode and _baseShortCondition and e.shortArmed
+    bool _trigLongSig    = not _noTriggerMode and _baseLongCondition  and _finalBullTrig and _trigCooldownOk
+    bool _trigShortSig   = not _noTriggerMode and _baseShortCondition and _finalBearTrig and _trigCooldownOk
+    bool _candLong  = _active and _dataValid and (_noTriggerMode ? _noTrigLongSig  : _trigLongSig)
+    bool _candShort = _active and _dataValid and (_noTriggerMode ? _noTrigShortSig : _trigShortSig)
+    // armed の解除は Candidate 成立時に行う (実注文の可否には依存しない)。
+    if _noTriggerMode and _candLong
+        e.longArmed := false
+    if _noTriggerMode and _candShort
+        e.shortArmed := false
+
+    DxySignal.new(
+         candLong = _candLong, candShort = _candShort, dataValid = _dataValid,
+         dxyBias = _dxyBias, dxyScore = _dxyTotal, dxyNoTrade = _dxyNT,
+         trigBull = _finalBullTrig, trigBear = _finalBearTrig,
+         trigNoTrade = _trigNoTrade, trigCooldownOk = _trigCooldownOk,
+         volOk = _volOk, dailyRegimeOk = _dailyRegimeOk,
+         blockedByAccum = _blockedByAccum, blockedByExitWait = _blockedByAccumExitWait,
+         accumLongDirOk = _accumLongDirOk, accumShortDirOk = _accumShortDirOk,
+         sessionOk = _sessionOk, newsOk = _allowByNewsTime,
+         longMajorOk = _longMajorOk, shortMajorOk = _shortMajorOk,
+         noTriggerMode = _noTriggerMode,
+         distState = _xState, returnType = _xRetType, returnDir = _xRetDir)
+
+// ============================================================================
+// 06. DEBUG TABLE  (Main のトークンを増やさないため描画も Library 側に置く)
+// ============================================================================
+
+f_b(bool v) =>
+    v ? "1" : "0"
+f_f(float v) =>
+    na(v) ? "-" : str.tostring(v, "#.##")
+
+// @function  DXY の 3段階 Debug テーブルを描画する。表示専用。
+//   判定・発注・状態には一切関与しない (呼ばなくても Candidate は変わらない)。
+// @param show    表示するか (false なら table を作らない)
+// @param s       DxySignal
+// @param on      DXY エントリーロジックが ON か
+// @param candL   段階1 Candidate Long 累計
+// @param candS   段階1 Candidate Short 累計
+// @param st2L    段階2 eligibility Long (当バー)
+// @param st2S    段階2 eligibility Short (当バー)
+// @param entL    段階3 実発注 Long 累計
+// @param entS    段階3 実発注 Short 累計
+// @param recent  直近 Candidate のテキスト
+// @returns       true
+export dxyDebugTable(bool show, DxySignal s, bool on, int candL, int candS,
+     bool st2L, bool st2S, int entL, int entS, string recent) =>
+    var table _t = na
+    if show
+        if na(_t)
+            _t := table.new(position.bottom_left, 2, 9, border_width = 1)
+        if barstate.islast
+            table.cell(_t, 0, 0, "DXY", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+            table.cell(_t, 1, 0, on ? "ON" : "OFF", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+            table.cell(_t, 0, 1, "Bias / Score", text_size = size.tiny)
+            table.cell(_t, 1, 1, str.tostring(s.dxyBias) + " / " + f_f(s.dxyScore), text_size = size.tiny)
+            table.cell(_t, 0, 2, "NT / Dist / Ret", text_size = size.tiny)
+            table.cell(_t, 1, 2, f_b(s.dxyNoTrade) + " / " + str.tostring(s.distState) + " / " +
+                 str.tostring(s.returnType) + ":" + str.tostring(s.returnDir), text_size = size.tiny)
+            table.cell(_t, 0, 3, "Trig B/S/NT/CD", text_size = size.tiny)
+            table.cell(_t, 1, 3, f_b(s.trigBull) + "/" + f_b(s.trigBear) + "/" +
+                 f_b(s.trigNoTrade) + "/" + f_b(s.trigCooldownOk), text_size = size.tiny)
+            table.cell(_t, 0, 4, "vol/daily/sess/news", text_size = size.tiny)
+            table.cell(_t, 1, 4, f_b(s.volOk) + "/" + f_b(s.dailyRegimeOk) + "/" +
+                 f_b(s.sessionOk) + "/" + f_b(s.newsOk), text_size = size.tiny)
+            table.cell(_t, 0, 5, "accum blk/wait/L/S", text_size = size.tiny)
+            table.cell(_t, 1, 5, f_b(s.blockedByAccum) + "/" + f_b(s.blockedByExitWait) + "/" +
+                 f_b(s.accumLongDirOk) + "/" + f_b(s.accumShortDirOk), text_size = size.tiny)
+            table.cell(_t, 0, 6, "major L/S · noTrig", text_size = size.tiny)
+            table.cell(_t, 1, 6, f_b(s.longMajorOk) + "/" + f_b(s.shortMajorOk) + " · " +
+                 f_b(s.noTriggerMode), text_size = size.tiny)
+            table.cell(_t, 0, 7, "S1 cand · S2 elig", text_size = size.tiny)
+            table.cell(_t, 1, 7, str.tostring(candL) + "/" + str.tostring(candS) + " · " +
+                 f_b(st2L) + "/" + f_b(st2S), text_size = size.tiny)
+            table.cell(_t, 0, 8, "S3 entry · recent", text_size = size.tiny)
+            table.cell(_t, 1, 8, str.tostring(entL) + "/" + str.tostring(entS) + "\n" +
+                 (recent == "" ? "-" : recent), text_size = size.tiny)
+    true
