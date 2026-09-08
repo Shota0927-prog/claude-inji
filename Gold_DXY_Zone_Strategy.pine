@@ -10,7 +10,11 @@
 //    DXY単体のエントリー判定 (canLong / canShort) を完全に維持したまま、
 //    SL・TP方式を ORIGINAL / ZONE の2種類から切り替えられるようにする。
 //      ORIGINAL … 移植元の固定SL / 固定RR / 発注方式をそのまま使う
+//                 TP管理 (FIXED / DYNAMIC) を一切参照しない
 //      ZONE     … ZoneEngine の Structural SL / Structural TP を使う
+//                 TP管理 = FIXED  : Entry時TPを最後まで固定
+//                 TP管理 = DYNAMIC: 保有中、現在TPより手前へ新しい適格 TP Zone が
+//                                   出たときだけTPを近づける (遠ざけない・不可逆)
 //
 //  ★ 移植元から削除したもの (DXY・15M のみを有効にした移植元と結果が変わらない範囲) ★
 //    ・Silver / Yield / Oil の全処理と入力
@@ -473,9 +477,25 @@ var string G_ZORD = "01 · ZONEモード 発注設定"
 zoneTpMode = input.string("BOTH", "ZONE TP採用モード", options = ["BOTH", "STRUCTURAL_ONLY", "FALLBACK_ONLY"], group = G_ZORD,
      tooltip = "BOTH            : Structural TP があればそれを使い、無ければ ZoneCfg の Fallback RR TP を使う。\n" +
      "STRUCTURAL_ONLY : Structural TP が無い Candidate は発注しない (NO_TP_ZONE)。\n" +
-     "FALLBACK_ONLY   : Structural TP が存在する Candidate は発注しない。")
+     "FALLBACK_ONLY   : Structural TP が存在する Candidate は発注しない。\n" +
+     "★ これは Entry時の採用フィルターのみ。保有中の Dynamic TP には関与しない\n" +
+     "  (Fallback TP で Entry したトレードも Dynamic TP の対象になる)。")
 zoneQtyMin = input.float(1.0, "ZONE 最小Qty", minval = 0.0, step = 0.1, group = G_ZORD,
      tooltip = "Structural SL距離から計算した Qty がこの値未満なら発注しない (NO_QTY)。")
+//  ---- TP管理方式 (FIXED = Entry時TPを固定 / DYNAMIC = 近づける方向のみ可変) ----
+//    ★ ZONE モード専用。ORIGINAL モードはこの input を一切参照しない。
+tpManagementMode = input.string("DYNAMIC", "TP管理", options = ["FIXED", "DYNAMIC"], group = G_ZORD,
+     tooltip = "FIXED   : Entry時に決定した TP を最後まで固定する。\n" +
+     "          保有中に新しいStrong Zoneが出ても、Zoneが昇格・降格・消滅してもTPは動かない。\n" +
+     "DYNAMIC : 保有中に現在TPより手前へ新しい有効な Strong以上のTP Zone が出現した\n" +
+     "          場合のみ、TPをそのZoneまで近づける。TPを遠ざける変更は行わない。\n" +
+     "          一度近づけたTPは、そのZoneが消滅・弱化・Breakしても元に戻さない (不可逆)。\n" +
+     "★ Candidate条件 / Structural SL / Risk / Qty / 建値移動 / Entry時TP算出は\n" +
+     "  どちらでも一切変わらない。FIXED の結果は Dynamic TP 追加前と完全一致する。\n" +
+     "★ ORIGINAL モードではこの設定を完全に無視する。")
+useDynamicTpAlert = input.bool(true, "Dynamic TP 変更時にアラートを出す", group = G_ZORD,
+     tooltip = "TP管理 = DYNAMIC のときだけ有効。実際にTP価格が変わったときに1回だけ通知する。\n" +
+     "同じTPへの更新では通知しない。")
 
 var string G_BE = "01 · 建値移動"
 useBreakEven = input.bool(false, "建値移動を使う", group = G_BE,
@@ -1822,8 +1842,15 @@ bool okAddShort = (posFlat or posShort) and underPyrLimit
 var int pyrSeq = 0
 
 // --- 建値移動 / 表示用の控え (Entry ID 単位) ---
+//  gTradeTP : 各 Entry ID の現在TP (Dynamic TP はここを書き換える)
+//  gTradeEP : 各 Entry ID の Entry時基準価格 (= TradePlan の entry / 建値移動のstop)
+//  gTradeSL : 各 Entry ID の Entry時 Structural SL。Dynamic TP で strategy.exit を
+//             再発行するとき、建値移動前の stop をここから復元する
+//             (BE OFF でも Dynamic TP が動くため、建値移動の設定に依存させない)。
+//  gTradeBE : 建値移動が発動済みか
 var map<string, float> gTradeTP = map.new<string, float>()
 var map<string, float> gTradeEP = map.new<string, float>()
+var map<string, float> gTradeSL = map.new<string, float>()
 var map<string, bool>  gTradeBE = map.new<string, bool>()
 
 // --- Zone Reject 理由コード ---
@@ -1923,6 +1950,14 @@ else
     //    消費するので、主要条件が継続していても同じ Candidate が次の足で
     //    再発生しない。トリガーが1つ以上ONの通常モードでは armed に触れない。
     //  ★ ORIGINAL の固定SL / 固定RR は実注文の SL / TP に一切使わない。
+    //  ★ Entry時TP : zn.buildPlan() が返した TP をここで確定させ、strategy.exit へ
+    //    渡すと同時に gTradeTP へ控える。TP Depth は ZoneCfg の
+    //    structuralTpDepthRatio (Zone入力) がそのまま使われる。
+    //    TP管理 = FIXED  … 以後この TP は動かない (12c. へ入らない)。
+    //    TP管理 = DYNAMIC… 12c. が「現在TPより手前」の条件を満たしたときだけ
+    //                      gTradeTP を書き換えて strategy.exit を再発行する。
+    //    Entry時 Structural SL は gTradeSL へ控え、Dynamic TP の再発行時に
+    //    建値移動前の stop として復元する。
     if wantLong or wantShort
         int   _dir  = wantLong ? 1 : -1
         float _ep   = close
@@ -1992,28 +2027,56 @@ else
                 dbgEntryS += 1
             gTradeTP.put(_idZ, _p.tp)
             gTradeEP.put(_idZ, _ep)
+            //  ★ strategy.exit へ実際に渡した Structural SL をそのまま控える。
+            //    Dynamic TP の再発行時、建値移動前はこの値を stop に使う。
+            gTradeSL.put(_idZ, _p.sl)
             gTradeBE.put(_idZ, false)
             f_dxyEntryReport(_idZ, _dir, _ep, _p.sl, _p.tp, _p.rr, _qty, zoneBreakEvenTrigger, time)
 
 
 // ============================================================
-//  12. 建値移動 (Entry ID 単位・モード別の幅)
+//  12. 決済済みTradeのクリーンアップ
 // ------------------------------------------------------------
-//  ★ 幅は現在のモードのものだけを使う。モード切替時に他方の幅は参照しない。
-//  ★ 状態は Entry ID 単位。決済済みIDは即座に削除するので他トレードへ引き継がない。
-//  ★ 既定 OFF。ORIGINAL回帰テストは必ず OFF で行うこと (移植元に建値移動は無い)。
+//  ★ gTradeTP / gTradeEP / gTradeSL / gTradeBE に終了済みTradeの Entry ID が
+//    永久に残らないようにする。毎バー全closedtradesを走査せず、
+//    gLastClosed からの差分 (このバーで新しく終了したTradeだけ) を処理する。
+//  ★ 部分決済などで同じ Entry ID がまだ Open のときは削除しない。
+//  ★ 掃除は useBreakEven に依存させない。Dynamic TP は建値移動 OFF でも
+//    gTradeTP / gTradeSL / gTradeEP を読むため。
 // ============================================================
+f_isOpenEntry(string eid) =>
+    bool found = false
+    if strategy.opentrades > 0
+        for j = 0 to strategy.opentrades - 1
+            if strategy.opentrades.entry_id(j) == eid
+                found := true
+                break
+    found
+
 var int gLastClosed = 0
 if strategy.closedtrades > gLastClosed
     for i = gLastClosed to strategy.closedtrades - 1
         string _cid = strategy.closedtrades.entry_id(i)
-        if gTradeTP.contains(_cid)
-            gTradeTP.remove(_cid)
-        if gTradeEP.contains(_cid)
-            gTradeEP.remove(_cid)
-        if gTradeBE.contains(_cid)
-            gTradeBE.remove(_cid)
+        if not f_isOpenEntry(_cid)
+            if gTradeTP.contains(_cid)
+                gTradeTP.remove(_cid)
+            if gTradeEP.contains(_cid)
+                gTradeEP.remove(_cid)
+            if gTradeSL.contains(_cid)
+                gTradeSL.remove(_cid)
+            if gTradeBE.contains(_cid)
+                gTradeBE.remove(_cid)
     gLastClosed := strategy.closedtrades
+
+// ============================================================
+//  12b. 建値移動 (Entry ID 単位・モード別の幅)
+// ------------------------------------------------------------
+//  ★ 幅は現在のモードのものだけを使う。モード切替時に他方の幅は参照しない。
+//  ★ 状態は Entry ID 単位。決済済みIDは 12. で削除するので引き継がない。
+//  ★ 既定 OFF。ORIGINAL回帰テストは必ず OFF で行うこと (移植元に建値移動は無い)。
+//  ★ TP は gTradeTP の現在値をそのまま再指定する。Dynamic TP で TP が
+//    近づけられていた場合も、その値をそのまま使う (元TPへ戻さない)。
+// ============================================================
 
 float beTriggerNow = tradePlanMode == "ORIGINAL" ? originalBreakEvenTrigger : zoneBreakEvenTrigger
 if useBreakEven and strategy.opentrades > 0
@@ -2032,6 +2095,81 @@ if useBreakEven and strategy.opentrades > 0
             if _wasOn or _reach
                 gTradeBE.put(_eid, true)
                 strategy.exit(_eid + "X", from_entry = _eid, stop = _bep, limit = _btp)
+
+// ============================================================
+//  12c. Dynamic TP (ZONEモード + TP管理 = DYNAMIC のときだけ動く)
+// ------------------------------------------------------------
+//  ★ 実行条件 : tradePlanMode == "ZONE" かつ tpManagementMode == "DYNAMIC" かつ
+//    barstate.isconfirmed かつ strategy.opentrades > 0。
+//    ORIGINAL では tpManagementMode を一切参照しないのでこのブロックへ入らない。
+//    ZONE + FIXED でもこのブロックへ入らない (strategy.exit も呼ばれないので
+//    発注・約定・バックテスト結果は Dynamic TP 追加前と完全一致する)。
+//
+//  仕様 : 「保有中に、現在TPより手前に新しい有効な Strong以上のTP Zone が出現した
+//         場合のみ、TPをそのZoneへ近づける」。TPを遠ざける変更は絶対に行わない。
+//    Long  : newTP < 現在TP のときだけ更新 (かつ newTP > Entry基準価格 / newTP > close)
+//    Short : newTP > 現在TP のときだけ更新 (かつ newTP < Entry基準価格 / newTP < close)
+//
+//  ★ TP候補の探索は ZoneEngine の既存 Structural TP 選択関数だけを読み取り専用で使う。
+//    zn.getLongStructuralTpAt()  : ST_RESIST のみ / z.bottom > entry /
+//                                  strength >= tpMinStrength / score >= tpMinScore
+//    zn.getShortStructuralTpAt() : ST_SUPPORT のみ / z.top < entry / 同上
+//    → Entry時 Structural TP と適格条件も価格定義も完全に同一。独自定義はしない。
+//  ★ TP Depth は Entry時と同じ structuralTpDepthRatio を渡す (ZoneCfg も同じ値)。
+//  ★ zn.buildPlan() は呼ばない。Active Zone NoTrade / SL Zone の再選定 /
+//    Max SL Distance / Minimum Structural RR / Fallback TP / Qty /
+//    Position Limit / Opposite Position は Entry時だけの条件であり、
+//    保有中に再判定しない。
+//  ★ Entry時TPが STRUCTURAL / FALLBACK_RR のどちらでも対象。Fallback TP で
+//    Entry したあとに手前の適格 Structural TP Zone が出れば、そのZoneへ近づける。
+//  ★ 現在TPの元Zoneが消滅・弱化・Breakしても、探索結果が今のTPより遠ければ
+//    更新条件を満たさないのでTPはそのまま維持される (自動的に不可逆)。
+//  ★ 更新は 5分足の確定時のみ。形成途中の一時的なZone変化ではTPを動かさない。
+//  ★ SLは一切可変化しない。建値移動前は Entry時 Structural SL (gTradeSL)、
+//    建値移動後は 12b. と同じ Entry基準価格 (gTradeEP) をそのまま再指定する。
+//    → Dynamic TP 更新で建値移動済みのSLが元のStructural SLへ戻る事故は起きない。
+//  Debug用 : [Entry ID, 変更前TP, 変更後TP]
+// ============================================================
+var array<string> gDynTpLast = array.new_string(3, "-")
+var int dbgDynTpCount = 0
+if tradePlanMode == "ZONE" and tpManagementMode == "DYNAMIC" and barstate.isconfirmed and strategy.opentrades > 0
+    for i = 0 to strategy.opentrades - 1
+        string _deid = strategy.opentrades.entry_id(i)
+        if gTradeTP.contains(_deid) and gTradeSL.contains(_deid) and gTradeEP.contains(_deid)
+            float _dEp    = gTradeEP.get(_deid)
+            bool  _dLong  = strategy.opentrades.size(i) > 0
+            float _dCurTp = gTradeTP.get(_deid)
+            float _dCand  = na
+            if _dLong
+                [_dtL, _diL] = zn.getLongStructuralTpAt(zoneEng, zoneCfg, _dEp, structuralTpDepthRatio)
+                _dCand := _dtL
+            else
+                [_dtS, _diS] = zn.getShortStructuralTpAt(zoneEng, zoneCfg, _dEp, structuralTpDepthRatio)
+                _dCand := _dtS
+            //  近づける方向のみ。かつ Entry基準価格の利益側にあること。
+            //  ★ さらに「更新時点の現在価格より進行方向側」であることも必須にする。
+            //    価格が既に通過したZoneが後からStrongへ昇格しても、その通過済みZoneへ
+            //    TPを戻してしまわないため (Long なら _dCand > close / Short なら _dCand < close)。
+            bool _dCloser = not na(_dCand) and not na(_dCurTp) and
+                 (_dLong ? (_dCand > close and _dCand < _dCurTp and _dCand > _dEp) : (_dCand < close and _dCand > _dCurTp and _dCand < _dEp))
+            if _dCloser
+                bool  _dBeOn = gTradeBE.contains(_deid) and gTradeBE.get(_deid)
+                float _dStop = _dBeOn ? _dEp : gTradeSL.get(_deid)
+                gTradeTP.put(_deid, _dCand)
+                strategy.exit(_deid + "X", from_entry = _deid, stop = _dStop, limit = _dCand)
+                dbgDynTpCount += 1
+                array.set(gDynTpLast, 0, _deid)
+                array.set(gDynTpLast, 1, f_dxyNum(_dCurTp, "#.##"))
+                array.set(gDynTpLast, 2, f_dxyNum(_dCand,  "#.##"))
+                if useDynamicTpAlert
+                    alert("【TP変更 " + (_dLong ? "LONG" : "SHORT") + "】" +
+                         "\nLogic: DXY" +
+                         "\nMode: " + tradePlanMode +
+                         "\n" + syminfo.ticker +
+                         "\nID: " + _deid +
+                         "\nOld TP: " + f_dxyNum(_dCurTp, "#.##") +
+                         "\nNew TP: " + f_dxyNum(_dCand,  "#.##") +
+                         "\nReason: NEW STRONG ZONE", alert.freq_all)
 
 // ============================================================
 //  13. 3段階 Debug (Candidate / Zone Plan / 実Entry)
@@ -2079,7 +2217,7 @@ plot(dbgRejTotal, "Zone Reject Cum",        display = display.data_window)
 var table dxyTbl = na
 if showDxyDebug
     if na(dxyTbl)
-        dxyTbl := table.new(position.bottom_right, 2, 17, border_width = 1)
+        dxyTbl := table.new(position.bottom_right, 2, 20, border_width = 1)
     if barstate.islast
         table.cell(dxyTbl, 0, 0, "DXY / " + tradePlanMode, text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
         table.cell(dxyTbl, 1, 0, useDxyEnv ? "ON" : "OFF", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
@@ -2115,3 +2253,9 @@ if showDxyDebug
         table.cell(dxyTbl, 1, 15, dbgLastCand == "" ? "-" : dbgLastCand, text_size = size.tiny)
         table.cell(dxyTbl, 0, 16, "直近 Zone Reject", text_size = size.tiny)
         table.cell(dxyTbl, 1, 16, dbgLastRej == "" ? "-" : dbgLastRej, text_size = size.tiny)
+        table.cell(dxyTbl, 0, 17, "TP管理", text_size = size.tiny)
+        table.cell(dxyTbl, 1, 17, tradePlanMode == "ZONE" ? tpManagementMode : "(ORIGINALは不使用)", text_size = size.tiny)
+        table.cell(dxyTbl, 0, 18, "Dynamic TP 変更累計", text_size = size.tiny)
+        table.cell(dxyTbl, 1, 18, str.tostring(dbgDynTpCount), text_size = size.tiny)
+        table.cell(dxyTbl, 0, 19, "直近 TP変更 ID / 旧 / 新", text_size = size.tiny)
+        table.cell(dxyTbl, 1, 19, array.get(gDynTpLast, 0) + " / " + array.get(gDynTpLast, 1) + " / " + array.get(gDynTpLast, 2), text_size = size.tiny)
