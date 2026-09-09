@@ -464,14 +464,33 @@ fallbackRR = input.float(2.0, "Fallback RR (Structural TPが無い場合のみ�
 // 01-3. SL・TPモード / ZONE用 発注設定 / 建値移動 / Debug (本ファイルの新規入力)
 // ============================================================================
 var string G_MODE = "01 · SL・TPモード"
+//  ★ 既存の保存済み設定を壊さないため、Strict モードの設定値は "ZONE" のまま残す。
+//    表示上の名称は ZONE_STRICT (f_modeName() が変換する)。
+//    分岐は "ZONE_STRICT" も受け付けるので、将来 options を改名しても動く。
 tradePlanMode = input.string(
      "ORIGINAL",
      "DXY SL・TPモード",
-     options = ["ORIGINAL", "ZONE"],
+     options = ["ORIGINAL", "ZONE", "ZONE_SLTP_ONLY"],
      group = G_MODE,
-     tooltip = "ORIGINAL : 移植元の固定SL / 固定RR / 発注方式をそのまま使う。\n" +
-     "ZONE     : ZoneEngine の Structural SL / Structural TP を使う。\n" +
-     "DXY の Candidate 条件は両モードで完全に共通。Candidate 成立後だけ分岐する。")
+     tooltip = "ORIGINAL       : 移植元の固定SL / 固定RR / 発注方式をそのまま使う。\n" +
+     "                 Zone は注文判定に一切使わない。\n" +
+     "ZONE           : (= ZONE_STRICT) zn.buildPlan() を使う厳格モード。\n" +
+     "                 Active Zone NoTrade / Max SL Distance / Minimum Structural RR /\n" +
+     "                 TP採用モード / Qty / Position Limit / Opposite Position を\n" +
+     "                 すべて発注条件として判定する。\n" +
+     "ZONE_SLTP_ONLY : DXY Candidate がエントリー方向とタイミングを決め、\n" +
+     "                 Zone は SL・TP 価格の算出だけに使う。\n" +
+     "                 INSIDE_ACTIVE_ZONE / SL_TOO_FAR / LOW_RR では発注を拒否せず、\n" +
+     "                 Debug 上の Warning として計測するだけ。\n" +
+     "DXY の Candidate 条件は3モードで完全に共通。Candidate 成立後だけ分岐する。")
+
+//  ---- モード判定ヘルパー (表示と分岐で同じ定義を使う) ----
+bool isModeOriginal   = tradePlanMode == "ORIGINAL"
+bool isModeZoneStrict = tradePlanMode == "ZONE" or tradePlanMode == "ZONE_STRICT"
+bool isModeZoneSltp   = tradePlanMode == "ZONE_SLTP_ONLY"
+bool isZoneMode       = isModeZoneStrict or isModeZoneSltp
+f_modeName() =>
+    isModeOriginal ? "ORIGINAL" : isModeZoneStrict ? "ZONE_STRICT" : "ZONE_SLTP_ONLY"
 
 var string G_ZORD = "01 · ZONEモード 発注設定"
 zoneTpMode = input.string("BOTH", "ZONE TP採用モード", options = ["BOTH", "STRUCTURAL_ONLY", "FALLBACK_ONLY"], group = G_ZORD,
@@ -1878,10 +1897,16 @@ f_zoneReasonCode(string r) =>
 f_dxyNum(float v, string fmt) =>
     na(v) ? "-" : str.tostring(v, fmt)
 
+//  ★ ZONE_SLTP_ONLY で発注したときだけ、該当する Warning をラベル / アラートへ
+//    足すための文字列。ORIGINAL / ZONE_STRICT では常に "" のまま (行が増えない)。
+//    Warning は発注拒否ではない。複数該当する場合はすべて連結する。
+string gEntryWarn = ""
+
 f_dxyEntryReport(string eid, int dir, float ep, float sl, float tp, float rr, float qty, float beW, int candTime) =>
     string _body =
      "\nLogic: DXY" +
-     "\nMode: " + tradePlanMode +
+     "\nMode: " + f_modeName() +
+     gEntryWarn +
      "\n" + (dir > 0 ? "LONG" : "SHORT") +
      "\n" + syminfo.ticker +
      "\nEntry: " + f_dxyNum(ep, "#.##") +
@@ -1911,6 +1936,14 @@ var int dbgPlanOkS  = 0
 var int dbgRejTotal = 0
 var array<int> dbgRej = array.new_int(11, 0)
 var string dbgLastRej = ""
+//  ---- ZONE_SLTP_ONLY 専用の集計 ----
+//    Hard Reject = 実際に発注を見送った件数 (Warning は含めない)。
+var int dbgHardRejTotal   = 0
+var int dbgWarnSlFar      = 0
+var int dbgWarnLowRR      = 0
+var int dbgWarnActive     = 0
+var string dbgLastWarn    = ""
+var string dbgLastHardRej = ""
 bool zonePlanValidLong  = false
 bool zonePlanValidShort = false
 
@@ -1941,8 +1974,8 @@ if tradePlanMode == "ORIGINAL"
         gTradeEP.put(_idS, entryEst)
         gTradeBE.put(_idS, false)
         f_dxyEntryReport(_idS, -1, entryEst, shortStop, shortTP, rrRatio, shortQty, originalBreakEvenTrigger, time)
-else
-    // ---- Zone Plan による注文 ----
+else if isModeZoneStrict
+    // ---- Zone Plan による注文 (ZONE_STRICT) ----
     //  ★ Candidate 成立バーで Zone Plan が組めるときだけ発注する。
     //    Zone が後から出るのを待って遅れてエントリーする処理は持たない。
     //    Plan 無効で発注しなかった Candidate は別バーで自動再試行しない
@@ -2037,6 +2070,145 @@ else
             gTradeSL.put(_idZ, _p.sl)
             gTradeBE.put(_idZ, false)
             f_dxyEntryReport(_idZ, _dir, _ep, _p.sl, _p.tp, _p.rr, _qty, zoneBreakEvenTrigger, time)
+else
+    // ---- ZONE_SLTP_ONLY : DXY がエントリーを決め、Zone は SL・TP 価格だけ決める ----
+    //  ★ zn.buildPlan() は使わない。ZoneEngine の SL / TP 取得関数だけを
+    //    読み取り専用で使い、ZoneEngine の状態は一切書き換えない。
+    //  ★ 発注拒否に使わない条件 (Debug 上の Warning としてのみ計測):
+    //      INSIDE_ACTIVE_ZONE / SL_TOO_FAR / LOW_RR
+    //  ★ 発注拒否に使う条件 (Hard Reject。安全上・注文成立に必要な機械的条件):
+    //      NO_SL_ZONE / INVALID_SL / NO_TP_ZONE / INVALID_TP /
+    //      NO_QTY / POSITION_LIMIT / OPPOSITE_POSITION
+    //  ★ Candidate 消費・再アーム / Long・Short の使用設定 / 保留キューを持たない点は
+    //    ZONE_STRICT と完全に同じ。
+    if wantLong or wantShort
+        int   _dir2 = wantLong ? 1 : -1
+        float _ep2  = close
+        //  ★ Candidate を評価した時点で該当方向を消費する (noTriggerMode のときだけ)。
+        //    Hard Reject / Warning / 発注成立のいずれでも必ず解除する。
+        if noTriggerMode
+            if _dir2 > 0
+                longArmed := false
+            else
+                shortArmed := false
+        int    _rej2   = 0
+        string _warn2  = ""
+        // ① Structural SL (ZoneEngine の既存条件をそのまま使う)
+        float _sl2 = na
+        int   _si2 = -1
+        if _dir2 > 0
+            [_sLo, _siLo] = zn.getLongStructuralSL(zoneEng, zoneCfg, _ep2)
+            _sl2 := _sLo
+            _si2 := _siLo
+        else
+            [_sSo, _siSo] = zn.getShortStructuralSL(zoneEng, zoneCfg, _ep2)
+            _sl2 := _sSo
+            _si2 := _siSo
+        if _si2 < 0 or na(_sl2)
+            _rej2 := 1
+        // ② SL が Entry の正しい側にあるか (安全上の Hard Reject)
+        float _risk2 = na
+        if _rej2 == 0
+            bool _slOk2 = _dir2 > 0 ? _sl2 < _ep2 : _sl2 > _ep2
+            _risk2 := math.abs(_ep2 - _sl2)
+            if not _slOk2 or na(_risk2) or _risk2 <= 0
+                _rej2 := 3
+        // ③ Max SL Distance は Warning のみ (発注は許可する)
+        if _rej2 == 0 and _risk2 > maxSlDist
+            _warn2 := _warn2 + "\nWarning: SL_TOO_FAR (" + f_dxyNum(_risk2, "#.##") + " > " + f_dxyNum(maxSlDist, "#.##") + ")"
+            dbgWarnSlFar += 1
+        // ④ Structural TP (無ければ zoneTpMode に従って Fallback TP)
+        float  _tp2     = na
+        int    _ti2     = -1
+        string _tpType2 = "-"
+        if _rej2 == 0
+            if _dir2 > 0
+                [_tLo, _tiLo] = zn.getLongStructuralTpAt(zoneEng, zoneCfg, _ep2, structuralTpDepthRatio)
+                _tp2 := _tLo
+                _ti2 := _tiLo
+            else
+                [_tSo, _tiSo] = zn.getShortStructuralTpAt(zoneEng, zoneCfg, _ep2, structuralTpDepthRatio)
+                _tp2 := _tSo
+                _ti2 := _tiSo
+            if _ti2 >= 0 and not na(_tp2)
+                //  Structural TP が存在する
+                if zoneTpMode == "FALLBACK_ONLY"
+                    _rej2 := 2
+                else
+                    _tpType2 := "STRUCTURAL"
+            else
+                //  Structural TP が無い
+                if zoneTpMode == "STRUCTURAL_ONLY"
+                    _rej2 := 2
+                else
+                    _tp2     := _ep2 + _dir2 * _risk2 * fallbackRR
+                    _tpType2 := "FALLBACK_RR"
+        // ⑤ TP が Entry の正しい側にあるか (安全上の Hard Reject)
+        float _rr2 = na
+        if _rej2 == 0
+            bool _tpOk2 = _dir2 > 0 ? (not na(_tp2) and _tp2 > _ep2) : (not na(_tp2) and _tp2 < _ep2)
+            if not _tpOk2
+                _rej2 := 4
+            else
+                _rr2 := math.abs(_tp2 - _ep2) / _risk2
+        // ⑥ Minimum Structural RR は Warning のみ (発注は許可する)
+        //    Structural TP のときだけ判定する (ZONE_STRICT が RR を見るのも同じ場面)。
+        if _rej2 == 0 and _tpType2 == "STRUCTURAL" and not na(_rr2) and _rr2 < minStructRR
+            _warn2 := _warn2 + "\nWarning: LOW_RR (" + f_dxyNum(_rr2, "#.##") + " < " + f_dxyNum(minStructRR, "#.##") + ")"
+            dbgWarnLowRR += 1
+        // ⑦ Active Zone NoTrade は Warning のみ (発注は許可する)
+        if _rej2 == 0 and zn.isInsideActiveZone(zoneEng, zoneCfg, _ep2)
+            _warn2 := _warn2 + "\nWarning: INSIDE_ACTIVE_ZONE"
+            dbgWarnActive += 1
+        // ⑧ Qty は実際の Structural SL距離から計算する (固定SLは使わない)
+        float _qty2 = 0.0
+        if _rej2 == 0
+            _qty2 := f_qty(_risk2)
+            if _qty2 < zoneQtyMin or _qty2 <= 0
+                _rej2 := 7
+        // ⑨ 保有制御 (ZONE_STRICT と同じ機械的条件)
+        if _rej2 == 0
+            bool _opp2 = (_dir2 > 0 and posShort) or (_dir2 < 0 and posLong)
+            if _opp2
+                _rej2 := 9
+            else if not underPyrLimit
+                _rej2 := 8
+        // Stage 2 : SL・TP Plan が組めた件数 (保有制御より前の段階で数える)
+        bool _planOk2 = _rej2 == 0 or _rej2 == 8 or _rej2 == 9
+        if _planOk2
+            if _dir2 > 0
+                zonePlanValidLong := true
+                dbgPlanOkL += 1
+            else
+                zonePlanValidShort := true
+                dbgPlanOkS += 1
+        if _warn2 != ""
+            dbgLastWarn := str.format_time(time, "MM-dd HH:mm", "Asia/Tokyo") + " " +
+                 (_dir2 > 0 ? "L" : "S") + str.replace_all(_warn2, "\nWarning: ", " ")
+        if _rej2 != 0
+            //  ★ Warning は Zone Reject 合計へ加算しない。Hard Reject だけを数える。
+            dbgHardRejTotal += 1
+            array.set(dbgRej, _rej2, array.get(dbgRej, _rej2) + 1)
+            dbgLastHardRej := str.format_time(time, "MM-dd HH:mm", "Asia/Tokyo") + " " +
+                 (_dir2 > 0 ? "L " : "S ") + f_zoneRejectName(_rej2)
+        else
+            pyrSeq += 1
+            string _idZ2 = (_dir2 > 0 ? "L" : "S") + str.tostring(pyrSeq)
+            strategy.entry(_idZ2, _dir2 > 0 ? strategy.long : strategy.short, qty = _qty2)
+            strategy.exit(_idZ2 + "X", from_entry = _idZ2, stop = _sl2, limit = _tp2)
+            if _dir2 > 0
+                dbgEntryL += 1
+            else
+                dbgEntryS += 1
+            gTradeTP.put(_idZ2, _tp2)
+            gTradeEP.put(_idZ2, _ep2)
+            //  ★ strategy.exit へ実際に渡した Structural SL をそのまま控える。
+            //    Dynamic TP の再発行時、建値移動前はこの値を stop に使う。
+            gTradeSL.put(_idZ2, _sl2)
+            gTradeBE.put(_idZ2, false)
+            //  ★ 該当した Warning だけをラベル / アラートへ足す (発注拒否ではない)。
+            gEntryWarn := _warn2
+            f_dxyEntryReport(_idZ2, _dir2, _ep2, _sl2, _tp2, _rr2, _qty2, zoneBreakEvenTrigger, time)
 
 
 // ============================================================
@@ -2078,7 +2250,7 @@ if strategy.closedtrades > gLastClosed
 // ------------------------------------------------------------
 //  ★ 幅は現在のモードのものだけを使う。モード切替時に他方の幅は参照しない。
 //  ★ Entry価格の基準 : ORIGINAL は gTradeEP (Candidate成立時のEntry基準価格)、
-//    ZONE は strategy.opentrades.entry_price(i) (実約定価格)。
+//    ZONE_STRICT / ZONE_SLTP_ONLY は strategy.opentrades.entry_price(i) (実約定価格)。
 //  ★ 状態は Entry ID 単位。決済済みIDは 12. で削除するので引き継がない。
 //  ★ 既定 OFF。ORIGINAL回帰テストは必ず OFF で行うこと (移植元に建値移動は無い)。
 //  ★ TP は gTradeTP の現在値をそのまま再指定する。Dynamic TP で TP が
@@ -2093,9 +2265,9 @@ if useBreakEven and strategy.opentrades > 0
             //  ★ Entry価格の基準をモード別に分ける。
             //    ORIGINAL : 従来どおり gTradeEP (Candidate成立時のEntry基準価格)。
             //               既存挙動を変えないため実約定価格へは切り替えない。
-            //    ZONE     : TradingView の実約定価格。
+            //    ZONE_STRICT / ZONE_SLTP_ONLY : TradingView の実約定価格。
             //               到達判定と strategy.exit の stop の両方をこの値に統一する。
-            float _bep   = tradePlanMode == "ZONE" ?
+            float _bep   = isZoneMode ?
                  strategy.opentrades.entry_price(i) :
                  gTradeEP.get(_eid)
             float _btp   = gTradeTP.get(_eid)
@@ -2111,12 +2283,13 @@ if useBreakEven and strategy.opentrades > 0
                 strategy.exit(_eid + "X", from_entry = _eid, stop = _bep, limit = _btp)
 
 // ============================================================
-//  12c. Dynamic TP (ZONEモード + TP管理 = DYNAMIC のときだけ動く)
+//  12c. Dynamic TP (ZONE系モード + TP管理 = DYNAMIC のときだけ動く)
 // ------------------------------------------------------------
-//  ★ 実行条件 : tradePlanMode == "ZONE" かつ tpManagementMode == "DYNAMIC" かつ
-//    barstate.isconfirmed かつ strategy.opentrades > 0。
+//  ★ 実行条件 : isZoneMode (ZONE_STRICT または ZONE_SLTP_ONLY) かつ
+//    tpManagementMode == "DYNAMIC" かつ barstate.isconfirmed かつ
+//    strategy.opentrades > 0。
 //    ORIGINAL では tpManagementMode を一切参照しないのでこのブロックへ入らない。
-//    ZONE + FIXED でもこのブロックへ入らない (strategy.exit も呼ばれないので
+//    ZONE系 + FIXED でもこのブロックへ入らない (strategy.exit も呼ばれないので
 //    発注・約定・バックテスト結果は Dynamic TP 追加前と完全一致する)。
 //
 //  仕様 : 「保有中に、現在TPより手前に新しい有効な Strong以上のTP Zone が出現した
@@ -2148,7 +2321,7 @@ if useBreakEven and strategy.opentrades > 0
 // ============================================================
 var array<string> gDynTpLast = array.new_string(3, "-")
 var int dbgDynTpCount = 0
-if tradePlanMode == "ZONE" and tpManagementMode == "DYNAMIC" and barstate.isconfirmed and strategy.opentrades > 0
+if isZoneMode and tpManagementMode == "DYNAMIC" and barstate.isconfirmed and strategy.opentrades > 0
     for i = 0 to strategy.opentrades - 1
         string _deid = strategy.opentrades.entry_id(i)
         if gTradeTP.contains(_deid) and gTradeSL.contains(_deid) and gTradeEP.contains(_deid)
@@ -2199,7 +2372,7 @@ if tradePlanMode == "ZONE" and tpManagementMode == "DYNAMIC" and barstate.isconf
 //    ORIGINAL の発注可否には一切使わない (下の参考計算はモード分岐の後ろにある)。
 // ============================================================
 // Stage 2 参考値 (ORIGINAL モードで Debug ON のときだけ評価する)
-if tradePlanMode == "ORIGINAL" and showDxyDebug and (wantLong or wantShort)
+if isModeOriginal and showDxyDebug and (wantLong or wantShort)
     int _rdir = wantLong ? 1 : -1
     zn.TradePlan _rp = zn.buildPlan(zoneEng, zoneCfg, _rdir, close)
     if _rp.valid
@@ -2235,9 +2408,9 @@ plot(dbgRejTotal, "Zone Reject Cum",        display = display.data_window)
 var table dxyTbl = na
 if showDxyDebug
     if na(dxyTbl)
-        dxyTbl := table.new(position.bottom_right, 2, 20, border_width = 1)
+        dxyTbl := table.new(position.bottom_right, 2, 24, border_width = 1)
     if barstate.islast
-        table.cell(dxyTbl, 0, 0, "DXY / " + tradePlanMode, text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(dxyTbl, 0, 0, "DXY / " + f_modeName(), text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
         table.cell(dxyTbl, 1, 0, useDxyEnv ? "ON" : "OFF", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
         table.cell(dxyTbl, 0, 1, "Bias / Score", text_size = size.tiny)
         table.cell(dxyTbl, 1, 1, str.tostring(dxyBias) + " / " + f_dxyNum(dxyTotalScore, "#.##"), text_size = size.tiny)
@@ -2253,7 +2426,7 @@ if showDxyDebug
         table.cell(dxyTbl, 1, 6, str.tostring(dbgPlanOkL) + " / " + str.tostring(dbgPlanOkS), text_size = size.tiny)
         table.cell(dxyTbl, 0, 7, "S3 Entry L/S", text_size = size.tiny)
         table.cell(dxyTbl, 1, 7, str.tostring(dbgEntryL) + " / " + str.tostring(dbgEntryS), text_size = size.tiny)
-        table.cell(dxyTbl, 0, 8, "Zone Reject 合計", text_size = size.tiny)
+        table.cell(dxyTbl, 0, 8, "STRICT Reject 合計", text_size = size.tiny)
         table.cell(dxyTbl, 1, 8, str.tostring(dbgRejTotal), text_size = size.tiny)
         table.cell(dxyTbl, 0, 9,  "NO_SL_ZONE / NO_TP_ZONE", text_size = size.tiny)
         table.cell(dxyTbl, 1, 9,  str.tostring(array.get(dbgRej, 1)) + " / " + str.tostring(array.get(dbgRej, 2)), text_size = size.tiny)
@@ -2277,3 +2450,11 @@ if showDxyDebug
         table.cell(dxyTbl, 1, 18, str.tostring(dbgDynTpCount), text_size = size.tiny)
         table.cell(dxyTbl, 0, 19, "直近 TP変更 ID / 旧 / 新", text_size = size.tiny)
         table.cell(dxyTbl, 1, 19, array.get(gDynTpLast, 0) + " / " + array.get(gDynTpLast, 1) + " / " + array.get(gDynTpLast, 2), text_size = size.tiny)
+        table.cell(dxyTbl, 0, 20, "SLTP_ONLY Hard Reject 合計", text_size = size.tiny)
+        table.cell(dxyTbl, 1, 20, str.tostring(dbgHardRejTotal), text_size = size.tiny)
+        table.cell(dxyTbl, 0, 21, "WARN SLfar / LowRR / Active", text_size = size.tiny)
+        table.cell(dxyTbl, 1, 21, str.tostring(dbgWarnSlFar) + " / " + str.tostring(dbgWarnLowRR) + " / " + str.tostring(dbgWarnActive), text_size = size.tiny)
+        table.cell(dxyTbl, 0, 22, "直近 Warning", text_size = size.tiny)
+        table.cell(dxyTbl, 1, 22, dbgLastWarn == "" ? "-" : dbgLastWarn, text_size = size.tiny)
+        table.cell(dxyTbl, 0, 23, "直近 Hard Reject", text_size = size.tiny)
+        table.cell(dxyTbl, 1, 23, dbgLastHardRej == "" ? "-" : dbgLastHardRej, text_size = size.tiny)
