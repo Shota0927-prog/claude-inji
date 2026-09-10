@@ -1,0 +1,529 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// SAT PANEL Approximation - 表示専用インジケーター（XAUUSD 5分足を主対象）
+//
+// ============================================================================
+// 【概要】
+//   「SAT's PANEL」の見た目を、公開情報のみで近似再現する表示専用スクリプト。
+//   元インジケーターの計算式は非公開のため、STB / BAND LINE は
+//   Supertrend 型（ATR バンド）で近似している。
+//
+//   実装済み:
+//     1. 長期移動平均線（既定 EMA200・方向で色替え）
+//     2. STB ライン（Supertrend 近似 + フィルター強度による転換遅延）
+//     3. SAT's BAND LINE1（ATR 倍率違い）
+//     4. SAT's BAND LINE2（ATR 倍率違い）
+//     5. STB 確定転換時の「濃い縦背景」（継続本数指定）
+//     6. STB / LINE1 / LINE2 が揃った時の「薄いパーフェクトオーダー背景」
+//     7. MTF（マルチタイムフレーム）方向スコアとデバッグテーブル
+//
+//   未実装（初期版では意図的に除外）:
+//     - 中央の EMA リボン状の雲
+//     - エントリー / TP / SL / バックテスト / アラート
+//
+// 【リペイントについて】
+//   - request.security() は必ず lookahead = barmerge.lookahead_off。
+//   - 「確定足のみで判定」を ON にすると、方向判定にひとつ前の確定足の
+//     生方向を使うため、形成中バーの値動きで方向が揺れない（1本分の遅延あり）。
+//   - ライン自体の値（Supertrend 値）は形成中バーでは動くが、
+//     確定済みバーの履歴は書き換わらない（＝過去のリペイントは発生しない）。
+// ============================================================================
+
+//@version=6
+indicator(
+     title         = "SAT PANEL Approximation",
+     shorttitle    = "SAT PANEL Approx",
+     overlay       = true,
+     max_bars_back = 1000
+ )
+
+// ============================================================================
+// 設定グループ定義
+// ============================================================================
+// input() の group 引数は const string が必要なため、var を付けずに宣言する
+G_TF    = "01｜時間軸設定"
+G_STB   = "02｜STB設定"
+G_L1    = "03｜SAT's BAND LINE1"
+G_L2    = "04｜SAT's BAND LINE2"
+G_MA    = "05｜移動平均線"
+G_FLIP  = "06｜転換背景"
+G_PO    = "07｜パーフェクトオーダー背景"
+G_DEBUG = "08｜デバッグ"
+
+// 方向が未確定（0）のときに使う中立色（グレー）
+C_FLAT_DEF = color.rgb(149, 152, 161)
+
+// ============================================================================
+// 01｜時間軸設定
+// ============================================================================
+// 各時間軸の STB 方向を集計し、MTF 方向スコアを作る。
+// ※ 注意（初期版の仕様）：
+//   チャート時間足が 15分 / 1時間 などと同じ場合、同じ方向が二重に集計される。
+//   初期版では二重集計を許容している（例：15分足チャートで「現在足」と「15分足」
+//   の両方が ON だと 15分足の方向が 2票としてカウントされる）。
+//   厳密に排除したい場合は、各 TF の ON/OFF を手動で切り替えて調整すること。
+useTfChart = input.bool(true,  "現在のチャート時間足を使う", group = G_TF)
+useTf15    = input.bool(true,  "15分足を使う",               group = G_TF)
+useTf60    = input.bool(true,  "1時間足を使う",              group = G_TF)
+useTf240   = input.bool(true,  "4時間足を使う",              group = G_TF)
+useTfD     = input.bool(true,  "日足を使う",                 group = G_TF)
+useTfW     = input.bool(true,  "週足を使う",                 group = G_TF)
+
+tf15  = input.timeframe("15",  "15分足の時間足指定",  group = G_TF)
+tf60  = input.timeframe("60",  "1時間足の時間足指定", group = G_TF)
+tf240 = input.timeframe("240", "4時間足の時間足指定", group = G_TF)
+tfD   = input.timeframe("D",   "日足の時間足指定",    group = G_TF)
+tfW   = input.timeframe("W",   "週足の時間足指定",    group = G_TF)
+
+mtfMode = input.string("指定数以上一致", "MTF一致条件",
+     options = ["全時間足一致", "過半数一致", "指定数以上一致"], group = G_TF,
+     tooltip = "背景判定に使う MTF 一致条件。全時間足一致は条件が厳しくシグナルが激減する。")
+mtfMinAgree = input.int(3, "指定数以上一致：必要本数", minval = 1, maxval = 6, group = G_TF)
+
+// ============================================================================
+// 02｜STB設定
+// ============================================================================
+showStb     = input.bool(true, "STBラインを表示", group = G_STB)
+stbSrcType  = input.string("hl2", "STB ソース", options = ["hl2", "close", "open", "hlc3", "ohlc4", "hlcc4"], group = G_STB)
+stbAtrLen   = input.int(10,  "STB ATR期間", minval = 1, maxval = 200, group = G_STB)
+stbFactor   = input.float(2.0, "STB ATR倍率", minval = 0.1, maxval = 20.0, step = 0.1, group = G_STB)
+stbFilter   = input.int(2,   "STB フィルター強度（連続確定本数）", minval = 1, maxval = 10, group = G_STB,
+     tooltip = "反対方向の生シグナルが指定本数だけ連続で確定したら STB 方向を転換する。それまでは直前の方向を維持。")
+stbWidth    = input.int(2,   "STB 線幅", minval = 1, maxval = 5, group = G_STB)
+stbUpCol    = input.color(color.rgb(38, 198, 218), "STB 上昇色", group = G_STB)
+stbDnCol    = input.color(color.rgb(255, 82, 82),  "STB 下降色", group = G_STB)
+useConfirmed = input.bool(true, "確定足のみで判定（リペイント防止）", group = G_STB,
+     tooltip = "ON：ひとつ前の確定足の生方向を使って方向判定を行う（1本分遅れるが形成中バーで揺れない）。")
+
+// ============================================================================
+// 03｜SAT's BAND LINE1
+// ============================================================================
+showL1     = input.bool(true, "BAND LINE1 を表示", group = G_L1)
+l1SrcType  = input.string("hl2", "LINE1 ソース", options = ["hl2", "close", "open", "hlc3", "ohlc4", "hlcc4"], group = G_L1)
+l1AtrLen   = input.int(10,  "LINE1 ATR期間", minval = 1, maxval = 200, group = G_L1)
+l1Factor   = input.float(2.5, "LINE1 ATR倍率", minval = 0.1, maxval = 20.0, step = 0.1, group = G_L1)
+l1Width    = input.int(2,   "LINE1 線幅", minval = 1, maxval = 5, group = G_L1)
+l1UpCol    = input.color(color.rgb(38, 198, 218), "LINE1 上昇色", group = G_L1)
+l1DnCol    = input.color(color.rgb(255, 82, 82),  "LINE1 下降色", group = G_L1)
+
+// ============================================================================
+// 04｜SAT's BAND LINE2
+// ============================================================================
+showL2     = input.bool(true, "BAND LINE2 を表示", group = G_L2)
+l2SrcType  = input.string("hl2", "LINE2 ソース", options = ["hl2", "close", "open", "hlc3", "ohlc4", "hlcc4"], group = G_L2)
+l2AtrLen   = input.int(10,  "LINE2 ATR期間", minval = 1, maxval = 200, group = G_L2)
+l2Factor   = input.float(4.0, "LINE2 ATR倍率", minval = 0.1, maxval = 20.0, step = 0.1, group = G_L2)
+l2Width    = input.int(2,   "LINE2 線幅", minval = 1, maxval = 5, group = G_L2)
+l2UpCol    = input.color(color.rgb(38, 198, 218), "LINE2 上昇色", group = G_L2)
+l2DnCol    = input.color(color.rgb(255, 82, 82),  "LINE2 下降色", group = G_L2)
+
+// ============================================================================
+// 05｜移動平均線
+// ============================================================================
+showMa    = input.bool(true, "移動平均線を表示", group = G_MA)
+maType    = input.string("EMA", "MA 種別", options = ["EMA", "SMA", "RMA", "WMA"], group = G_MA)
+maLen     = input.int(200, "MA 期間", minval = 1, maxval = 1000, group = G_MA)
+maSrcType = input.string("close", "MA ソース", options = ["hl2", "close", "open", "hlc3", "ohlc4", "hlcc4"], group = G_MA)
+maWidth   = input.int(2, "MA 線幅", minval = 1, maxval = 5, group = G_MA)
+maUpCol   = input.color(color.rgb(38, 198, 218), "MA 上昇色", group = G_MA)
+maDnCol   = input.color(color.rgb(255, 82, 82),  "MA 下降色", group = G_MA)
+maFlatCol = input.color(color.rgb(149, 152, 161), "MA 中立色", group = G_MA)
+
+// ============================================================================
+// 06｜転換背景（濃い縦背景）
+// ============================================================================
+showFlipBg  = input.bool(true, "濃い転換背景を表示", group = G_FLIP)
+flipHold    = input.int(3, "転換背景の継続本数", minval = 1, maxval = 30, group = G_FLIP,
+     tooltip = "STB の確定転換バーを含めて、この本数ぶん背景を表示する。5分足で 3 なら 15 分間。")
+flipBuyCol  = input.color(color.rgb(38, 198, 218), "Buy転換 背景色",  group = G_FLIP)
+flipSellCol = input.color(color.rgb(255, 82, 82),  "Sell転換 背景色", group = G_FLIP)
+flipTransp  = input.int(75, "転換背景の透明度", minval = 0, maxval = 100, group = G_FLIP)
+
+// ============================================================================
+// 07｜パーフェクトオーダー背景（薄い背景）
+// ============================================================================
+showPoBg   = input.bool(true, "薄いパーフェクトオーダー背景を表示", group = G_PO)
+poUseEma   = input.bool(false, "EMAフィルターを使う", group = G_PO,
+     tooltip = "ON：Buy は終値が MA より上、Sell は終値が MA より下であることを条件に加える。")
+poUseMtf   = input.bool(false, "MTFフィルターを使う", group = G_PO,
+     tooltip = "ON：01｜時間軸設定 で選んだ MTF 一致条件が Buy/Sell であることを条件に加える。")
+poBuyCol   = input.color(color.rgb(38, 198, 218), "Buy PO 背景色",  group = G_PO)
+poSellCol  = input.color(color.rgb(255, 82, 82),  "Sell PO 背景色", group = G_PO)
+poTransp   = input.int(90, "PO背景の透明度", minval = 0, maxval = 100, group = G_PO)
+
+// ============================================================================
+// 08｜デバッグ
+// ============================================================================
+showDebug   = input.bool(false, "デバッグテーブルを表示", group = G_DEBUG)
+debugTxtSize = input.string("tiny", "テーブル文字サイズ", options = ["tiny", "small", "normal"], group = G_DEBUG)
+
+// ============================================================================
+// 共通関数
+// ============================================================================
+
+// ソース文字列から価格系列を取得する
+f_src(simple string t) =>
+    switch t
+        "close" => close
+        "open"  => open
+        "hl2"   => hl2
+        "hlc3"  => hlc3
+        "ohlc4" => ohlc4
+        "hlcc4" => hlcc4
+        =>         hl2
+
+// 移動平均の種別切り替え
+f_ma(simple string t, float src, simple int len) =>
+    switch t
+        "EMA" => ta.ema(src, len)
+        "SMA" => ta.sma(src, len)
+        "RMA" => ta.rma(src, len)
+        "WMA" => ta.wma(src, len)
+        =>       ta.ema(src, len)
+
+// ----------------------------------------------------------------------------
+// Supertrend 型ライン（STB / BAND LINE の共通計算）
+//   戻り値: [ライン値, 生方向]
+//   生方向は  +1 = 上昇（ラインは下側バンド） / -1 = 下降（ラインは上側バンド）
+//   ※ 組み込み ta.supertrend() は -1 が上昇・+1 が下降で紛らわしいため、
+//     ここでは自前実装して +1=上昇 に統一している（方向値の解釈ミス対策）。
+//   ※ ソースを input で切り替えたいので、組み込み関数（hl2 固定）は使わない。
+// ----------------------------------------------------------------------------
+f_supertrend(float src, simple int atrLen, float factor) =>
+    float atrVal     = ta.atr(atrLen)
+    float upperBand  = src + factor * atrVal
+    float lowerBand  = src - factor * atrVal
+    float prevUpper  = nz(upperBand[1])
+    float prevLower  = nz(lowerBand[1])
+    // バンドは「トレンド方向に切り上がる／切り下がる」ように片方向に固定する
+    lowerBand := lowerBand > prevLower or close[1] < prevLower ? lowerBand : prevLower
+    upperBand := upperBand < prevUpper or close[1] > prevUpper ? upperBand : prevUpper
+    int   dirRaw = na
+    float stLine = na
+    float prevSt = stLine[1]   // 直前バーのライン値（history 参照）
+    if na(atrVal[1])
+        dirRaw := -1           // 計算開始直後は下降から開始（na 初期化の型エラー回避）
+    else if prevSt == prevUpper
+        dirRaw := close > upperBand ?  1 : -1
+    else
+        dirRaw := close < lowerBand ? -1 :  1
+    stLine := dirRaw == 1 ? lowerBand : upperBand
+    [stLine, dirRaw]
+
+// ----------------------------------------------------------------------------
+// フィルター強度つき方向確定ロジック
+//   反対方向の生シグナルが strength 本連続で確定したときだけ方向を転換する。
+//   それまでは直前の方向を維持する。
+//   var を使っているため、形成中バーでは毎ティック直前確定値から再計算され、
+//   同一バーで何度も転換が積み重なることはない。
+// ----------------------------------------------------------------------------
+f_filterDir(int rawDir, simple int strength) =>
+    var int dirState = 0
+    var int oppCount = 0
+    int r = nz(rawDir, 0)
+    if r != 0
+        if dirState == 0
+            // 初期化：最初に得られた生方向をそのまま採用
+            dirState := r
+            oppCount := 0
+        else if r != dirState
+            oppCount := oppCount + 1
+            if oppCount >= strength
+                dirState := r
+                oppCount := 0
+        else
+            oppCount := 0
+    dirState
+
+// ----------------------------------------------------------------------------
+// STB 方向（フィルター適用後）をひとまとめに計算する関数
+//   request.security() からも呼べるように、戻り値は int 単体にしている
+//   （タプルを security に渡すときの取り扱いミスを避けるため）。
+// ----------------------------------------------------------------------------
+f_stbDir(simple string srcType, simple int atrLen, float factor, simple int strength, simple bool confirmOnly) =>
+    float s = f_src(srcType)
+    [_st, rawDirTuple] = f_supertrend(s, atrLen, factor)
+    // タプル分解した変数へ直接 history 参照をかけないよう、通常変数へコピーする
+    int rawDir = rawDirTuple
+    // 確定足のみで判定する場合は、ひとつ前の確定バーの生方向を入力にする
+    int inDir = confirmOnly ? nz(rawDir[1], 0) : nz(rawDir, 0)
+    f_filterDir(inDir, strength)
+
+// 方向 → 表示文字列
+f_dirStr(int d) =>
+    d ==  1 ? "▲ UP" : d == -1 ? "▼ DOWN" : "－"
+
+// 方向 → 表示色
+f_dirCol(int d, color upC, color dnC, color flatC) =>
+    d ==  1 ? upC : d == -1 ? dnC : flatC
+
+// ============================================================================
+// 計算：チャート時間足の 3 ライン
+// ============================================================================
+float stbSrc = f_src(stbSrcType)
+float l1Src  = f_src(l1SrcType)
+float l2Src  = f_src(l2SrcType)
+
+[stbLine, stbRawDir] = f_supertrend(stbSrc, stbAtrLen, stbFactor)
+[l1Line,  l1RawDir]  = f_supertrend(l1Src,  l1AtrLen,  l1Factor)
+[l2Line,  l2RawDir]  = f_supertrend(l2Src,  l2AtrLen,  l2Factor)
+
+// タプル分解した変数へ直接 history 参照をかけないよう、通常変数へコピーする
+int stbRaw = stbRawDir
+int l1Raw  = l1RawDir
+int l2Raw  = l2RawDir
+
+// STB の方向判定に使う入力（確定足オプション適用）
+//   ON のときはひとつ前の確定バーの生方向を入力にするため、
+//   形成中バーの値動きで STB 方向（＝転換背景）が揺れない。
+int stbDirIn = useConfirmed ? nz(stbRaw[1], 0) : nz(stbRaw, 0)
+
+// STB はフィルター強度を適用した確定方向を使う
+//   （ライン値は生の Supertrend 値なので、フィルター中は線色と線の位置が
+//     一時的にずれる。これはフィルター強度の仕様どおりの挙動。）
+int stbDir = f_filterDir(stbDirIn, stbFilter)
+
+// BAND LINE はフィルターなし。
+//   線の値と線の色が必ず一致するよう、確定足シフトは掛けずに生方向を使う。
+//   （形成中バーで色が変わることはあるが、確定済みバーの履歴は書き換わらない）
+int l1Dir = nz(l1Raw, 0)
+int l2Dir = nz(l2Raw, 0)
+
+// ============================================================================
+// 計算：移動平均線
+// ============================================================================
+float maSrc = f_src(maSrcType)
+float maVal = f_ma(maType, maSrc, maLen)
+int   maDir = maVal > maVal[1] ? 1 : maVal < maVal[1] ? -1 : 0
+
+// ============================================================================
+// 計算：MTF（マルチタイムフレーム）STB 方向
+//   すべて lookahead_off。確定足オプションは f_stbDir 内部で処理済み。
+//   ※ request.security() はグローバルスコープで無条件に呼び、
+//     ON/OFF は集計側で判定する（条件分岐内呼び出しによる不整合を避けるため）。
+// ============================================================================
+int dirChart = stbDir   // 現在のチャート時間足はローカル計算をそのまま使う
+
+int dir15 = nz(request.security(syminfo.tickerid, tf15,
+     f_stbDir(stbSrcType, stbAtrLen, stbFactor, stbFilter, useConfirmed),
+     lookahead = barmerge.lookahead_off), 0)
+
+int dir60 = nz(request.security(syminfo.tickerid, tf60,
+     f_stbDir(stbSrcType, stbAtrLen, stbFactor, stbFilter, useConfirmed),
+     lookahead = barmerge.lookahead_off), 0)
+
+int dir240 = nz(request.security(syminfo.tickerid, tf240,
+     f_stbDir(stbSrcType, stbAtrLen, stbFactor, stbFilter, useConfirmed),
+     lookahead = barmerge.lookahead_off), 0)
+
+int dirD = nz(request.security(syminfo.tickerid, tfD,
+     f_stbDir(stbSrcType, stbAtrLen, stbFactor, stbFilter, useConfirmed),
+     lookahead = barmerge.lookahead_off), 0)
+
+int dirW = nz(request.security(syminfo.tickerid, tfW,
+     f_stbDir(stbSrcType, stbAtrLen, stbFactor, stbFilter, useConfirmed),
+     lookahead = barmerge.lookahead_off), 0)
+
+// --- 集計（OFF の時間足は集計対象外） ---
+int buyCount  = 0
+int sellCount = 0
+int tfTotal   = 0
+
+if useTfChart
+    tfTotal := tfTotal + 1
+    if dirChart == 1
+        buyCount := buyCount + 1
+    else if dirChart == -1
+        sellCount := sellCount + 1
+
+if useTf15
+    tfTotal := tfTotal + 1
+    if dir15 == 1
+        buyCount := buyCount + 1
+    else if dir15 == -1
+        sellCount := sellCount + 1
+
+if useTf60
+    tfTotal := tfTotal + 1
+    if dir60 == 1
+        buyCount := buyCount + 1
+    else if dir60 == -1
+        sellCount := sellCount + 1
+
+if useTf240
+    tfTotal := tfTotal + 1
+    if dir240 == 1
+        buyCount := buyCount + 1
+    else if dir240 == -1
+        sellCount := sellCount + 1
+
+if useTfD
+    tfTotal := tfTotal + 1
+    if dirD == 1
+        buyCount := buyCount + 1
+    else if dirD == -1
+        sellCount := sellCount + 1
+
+if useTfW
+    tfTotal := tfTotal + 1
+    if dirW == 1
+        buyCount := buyCount + 1
+    else if dirW == -1
+        sellCount := sellCount + 1
+
+// MTF 方向スコア（+ が Buy 寄り、- が Sell 寄り）
+int mtfScore = buyCount - sellCount
+
+// 説明用の総合判定（一致条件の設定とは無関係に、状況を言葉で表す）
+string mtfDesc = tfTotal == 0 ? "TF未選択" :
+     buyCount  == tfTotal      ? "強いBuy"   :
+     sellCount == tfTotal      ? "強いSell"  :
+     buyCount * 2  > tfTotal   ? "Buy優勢"   :
+     sellCount * 2 > tfTotal   ? "Sell優勢"  : "Neutral"
+
+// 背景判定に使う MTF シグナル（選択した一致条件で決定）
+int mtfSignal = 0
+if tfTotal > 0
+    if mtfMode == "全時間足一致"
+        mtfSignal := buyCount == tfTotal ? 1 : sellCount == tfTotal ? -1 : 0
+    else if mtfMode == "過半数一致"
+        mtfSignal := buyCount * 2 > tfTotal ? 1 : sellCount * 2 > tfTotal ? -1 : 0
+    else
+        // 指定数以上一致：両方が条件を満たした場合は多い方を採用、同数なら Neutral
+        bool bOk = buyCount  >= mtfMinAgree
+        bool sOk = sellCount >= mtfMinAgree
+        mtfSignal := bOk and (not sOk or buyCount > sellCount) ?  1 :
+                     sOk and (not bOk or sellCount > buyCount) ? -1 : 0
+
+// ============================================================================
+// 判定：STB 確定転換（濃い縦背景用）
+//   フィルター強度の条件を満たして stbDir が反転したバーだけ発火する。
+//   同方向が継続しているだけでは発火しない。
+// ============================================================================
+bool stbFlipUp   = stbDir ==  1 and stbDir[1] == -1
+bool stbFlipDown = stbDir == -1 and stbDir[1] ==  1
+
+// 転換後の継続本数をカウンタで管理する。
+// var のロールバックにより、形成中バーでの多重発火は起こらない。
+var int flipRemain = 0
+var int flipDir    = 0
+if stbFlipUp
+    flipDir    := 1
+    flipRemain := flipHold
+else if stbFlipDown
+    flipDir    := -1
+    flipRemain := flipHold
+else if flipRemain > 0
+    flipRemain := flipRemain - 1
+
+bool flipActive = flipRemain > 0
+
+// ============================================================================
+// 判定：パーフェクトオーダー（薄い背景用）
+// ============================================================================
+bool poBuyBase  = stbDir ==  1 and l1Dir ==  1 and l2Dir ==  1
+bool poSellBase = stbDir == -1 and l1Dir == -1 and l2Dir == -1
+
+// EMA フィルター（任意）
+bool emaOkBuy  = not poUseEma or close > maVal
+bool emaOkSell = not poUseEma or close < maVal
+
+// MTF フィルター（任意）
+bool mtfOkBuy  = not poUseMtf or mtfSignal ==  1
+bool mtfOkSell = not poUseMtf or mtfSignal == -1
+
+bool poBuy  = poBuyBase  and emaOkBuy  and mtfOkBuy
+bool poSell = poSellBase and emaOkSell and mtfOkSell
+
+// ============================================================================
+// 描画：ライン
+//   plot() はグローバルスコープでのみ呼ぶ（ローカルスコープ禁止）。
+//   STB ラインの色はフィルター適用後の確定方向を使う。
+// ============================================================================
+plot(showL2 ? l2Line : na, title = "SAT's BAND LINE2",
+     color = l2Dir == 1 ? l2UpCol : l2Dir == -1 ? l2DnCol : C_FLAT_DEF,
+     linewidth = l2Width)
+
+plot(showL1 ? l1Line : na, title = "SAT's BAND LINE1",
+     color = l1Dir == 1 ? l1UpCol : l1Dir == -1 ? l1DnCol : C_FLAT_DEF,
+     linewidth = l1Width)
+
+plot(showStb ? stbLine : na, title = "STB Line",
+     color = stbDir == 1 ? stbUpCol : stbDir == -1 ? stbDnCol : C_FLAT_DEF,
+     linewidth = stbWidth)
+
+plot(showMa ? maVal : na, title = "MA (EMA200)",
+     color = maDir == 1 ? maUpCol : maDir == -1 ? maDnCol : maFlatCol,
+     linewidth = maWidth)
+
+// ============================================================================
+// 描画：背景
+//   濃い転換背景と薄い PO 背景が重なる場合は、濃い転換背景を優先する。
+//   bgcolor() の多重呼び出しによる意図しない上書きを避けるため、
+//   最終的な背景色を 1 つの変数にまとめてから 1 回だけ描画する。
+// ============================================================================
+color bgFinal = na
+if showFlipBg and flipActive
+    bgFinal := flipDir == 1 ? color.new(flipBuyCol, flipTransp) : color.new(flipSellCol, flipTransp)
+else if showPoBg and (poBuy or poSell)
+    bgFinal := poBuy ? color.new(poBuyCol, poTransp) : color.new(poSellCol, poTransp)
+
+bgcolor(bgFinal, title = "SAT PANEL 背景")
+
+// ============================================================================
+// デバッグテーブル（初期値 OFF・ラベルは出さない）
+// ============================================================================
+var table dbgTable = table.new(position.top_right, 2, 12,
+     border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50))
+
+// PO の現在判定を文字列化
+string poStr = poBuy ? "Buy PO" : poSell ? "Sell PO" : "なし"
+
+if showDebug and barstate.islast
+    string ts = debugTxtSize
+    color  bgH = color.new(color.gray, 70)
+    color  bgC = color.new(color.black, 60)
+
+    table.cell(dbgTable, 0, 0, "SAT PANEL DEBUG", text_color = color.white, bgcolor = bgH, text_size = ts)
+    table.cell(dbgTable, 1, 0, timeframe.period,  text_color = color.white, bgcolor = bgH, text_size = ts)
+
+    table.cell(dbgTable, 0, 1, "STB方向",   text_color = color.white, bgcolor = bgC, text_size = ts)
+    table.cell(dbgTable, 1, 1, f_dirStr(stbDir), text_color = f_dirCol(stbDir, stbUpCol, stbDnCol, C_FLAT_DEF), bgcolor = bgC, text_size = ts)
+
+    table.cell(dbgTable, 0, 2, "LINE1方向", text_color = color.white, bgcolor = bgC, text_size = ts)
+    table.cell(dbgTable, 1, 2, f_dirStr(l1Dir), text_color = f_dirCol(l1Dir, l1UpCol, l1DnCol, C_FLAT_DEF), bgcolor = bgC, text_size = ts)
+
+    table.cell(dbgTable, 0, 3, "LINE2方向", text_color = color.white, bgcolor = bgC, text_size = ts)
+    table.cell(dbgTable, 1, 3, f_dirStr(l2Dir), text_color = f_dirCol(l2Dir, l2UpCol, l2DnCol, C_FLAT_DEF), bgcolor = bgC, text_size = ts)
+
+    table.cell(dbgTable, 0, 4, "MA方向",    text_color = color.white, bgcolor = bgC, text_size = ts)
+    table.cell(dbgTable, 1, 4, f_dirStr(maDir), text_color = f_dirCol(maDir, maUpCol, maDnCol, maFlatCol), bgcolor = bgC, text_size = ts)
+
+    table.cell(dbgTable, 0, 5, "現在足STB", text_color = color.white, bgcolor = bgC, text_size = ts)
+    table.cell(dbgTable, 1, 5, useTfChart ? f_dirStr(dirChart) : "OFF",
+         text_color = useTfChart ? f_dirCol(dirChart, stbUpCol, stbDnCol, C_FLAT_DEF) : C_FLAT_DEF, bgcolor = bgC, text_size = ts)
+
+    table.cell(dbgTable, 0, 6, "15分STB",   text_color = color.white, bgcolor = bgC, text_size = ts)
+    table.cell(dbgTable, 1, 6, useTf15 ? f_dirStr(dir15) : "OFF",
+         text_color = useTf15 ? f_dirCol(dir15, stbUpCol, stbDnCol, C_FLAT_DEF) : C_FLAT_DEF, bgcolor = bgC, text_size = ts)
+
+    table.cell(dbgTable, 0, 7, "1時間STB",  text_color = color.white, bgcolor = bgC, text_size = ts)
+    table.cell(dbgTable, 1, 7, useTf60 ? f_dirStr(dir60) : "OFF",
+         text_color = useTf60 ? f_dirCol(dir60, stbUpCol, stbDnCol, C_FLAT_DEF) : C_FLAT_DEF, bgcolor = bgC, text_size = ts)
+
+    table.cell(dbgTable, 0, 8, "4時間STB",  text_color = color.white, bgcolor = bgC, text_size = ts)
+    table.cell(dbgTable, 1, 8, useTf240 ? f_dirStr(dir240) : "OFF",
+         text_color = useTf240 ? f_dirCol(dir240, stbUpCol, stbDnCol, C_FLAT_DEF) : C_FLAT_DEF, bgcolor = bgC, text_size = ts)
+
+    table.cell(dbgTable, 0, 9, "日足/週足STB", text_color = color.white, bgcolor = bgC, text_size = ts)
+    table.cell(dbgTable, 1, 9,
+         (useTfD ? f_dirStr(dirD) : "OFF") + " / " + (useTfW ? f_dirStr(dirW) : "OFF"),
+         text_color = color.white, bgcolor = bgC, text_size = ts)
+
+    table.cell(dbgTable, 0, 10, "Buy/Sell一致数", text_color = color.white, bgcolor = bgC, text_size = ts)
+    table.cell(dbgTable, 1, 10, str.tostring(buyCount) + " / " + str.tostring(sellCount) +
+         "  (計" + str.tostring(tfTotal) + " スコア" + str.tostring(mtfScore) + ")",
+         text_color = color.white, bgcolor = bgC, text_size = ts)
+
+    table.cell(dbgTable, 0, 11, "MTF判定 / PO", text_color = color.white, bgcolor = bgC, text_size = ts)
+    table.cell(dbgTable, 1, 11, mtfDesc + " [" + (mtfSignal == 1 ? "Buy" : mtfSignal == -1 ? "Sell" : "-") + "] / " + poStr,
+         text_color = mtfSignal == 1 ? stbUpCol : mtfSignal == -1 ? stbDnCol : color.white, bgcolor = bgC, text_size = ts)
