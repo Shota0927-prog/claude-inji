@@ -271,8 +271,20 @@ bgTransp   = input.int(85, "背景の透明度", minval = 0, maxval = 100, group
 // ※ 表示の切り替えは plot() へ渡す系列と bgcolor の色だけを変えるものであり、
 //   内部の計算や方向状態（var dirState など）には一切影響しない。
 viewMode = input.string("通常表示", "比較表示モード",
-     options = ["通常表示", "STBだけ", "LINE1だけ", "LINE2だけ", "LINE1 上下バンド比較", "LINE2 上下バンド比較"], group = G_VIEW,
-     tooltip = "単独表示：対象以外のライン・移動平均線・背景を非表示にする。\n上下バンド比較：対象ラインの上下バンドを方向に関係なく両方表示する。平滑化前は薄い線、平滑化後は濃い線。背景・STB・EMA200 は非表示。\nいずれのモードでも内部計算と方向状態は変わらない。")
+     options = ["通常表示", "STBだけ", "LINE1だけ", "LINE2だけ", "LINE1 上下バンド比較", "LINE2 上下バンド比較", "LINE2 中心線・固定ATR比較"], group = G_VIEW,
+     tooltip = "単独表示：対象以外のライン・移動平均線・背景を非表示にする。\n上下バンド比較：対象ラインの上下バンドを方向に関係なく両方表示する。平滑化前は薄い線、平滑化後は濃い線。背景・STB・EMA200 は非表示。\nLINE2 中心線・固定ATR比較：中心線 basis（黄）／通常 ATR の下側バンド（青）／固定 ATR の下側バンド（白）を並べ、中心線の下降と ATR 幅の拡大の影響を分けて確認する。\nいずれのモードでも内部計算と方向状態は変わらない。")
+
+// ATR を固定し始める日時。
+// 【タイムゾーンについて】
+//   ・比較には bar の time（UNIX ミリ秒・UTC 基準）をそのまま使う。
+//   ・既定値は timestamp("UTC", ...) で UTC を明示している。
+//   ・TradingView の設定画面に出る日時ピッカーが何のタイムゾーンで表示・入力
+//     されるかは環境（チャートのタイムゾーン設定）に依存するため、ここでは
+//     断定しない。実際にどのバーで固定されたかは、データウィンドウの
+//     「DW: LINE2 固定ATR取得バー時刻(UNIX ms)」と、デバッグテーブルの
+//     「固定ATR」行に出る UTC 表記の時刻で必ず確認すること。
+freezeTime = input.time(timestamp("UTC", 2026, 1, 1, 0, 0), "ATR固定開始日時", group = G_VIEW,
+     tooltip = "「LINE2 中心線・固定ATR比較」で ATR を固定し始める日時。急落が始まる足を指定する想定。\n指定時刻以降で最初のバーの『1本前の ATR』を固定値として使う（固定開始バー自身の ATR は使わない）。\n以降その値は更新しない。\n\nタイムゾーン：内部比較は UNIX ミリ秒（UTC 基準）で行う。既定値は UTC で指定している。設定画面のピッカーの表示タイムゾーンは環境依存なので、実際に固定されたバーはデータウィンドウの『DW: LINE2 固定ATR取得バー時刻(UNIX ms)』とデバッグテーブルの UTC 表記で確認すること。")
 
 showFlipMarker = input.bool(false, "転換確認マーカーを表示", group = G_VIEW,
      tooltip = "ON のとき、LINE1 / LINE2 の確定方向が反転したバーに小さなマーカーを表示する。初期化（方向 0 から最初の方向が決まった時点）は転換として扱わない。\nLINE1：三角／LINE2：ひし形。上昇転換は足の下、下降転換は足の上。")
@@ -700,6 +712,87 @@ if l2Method == M_BREAK
     l2DiagSwLo  := l2BreakSwLo
 
 // ============================================================================
+// 計算：LINE2 中心線・固定ATR比較（表示モードに関係なく毎バー計算する）
+//
+//   目的：LINE2 の急落後の沈み込みについて、
+//         「中心線 basis が下がった影響」と「ATR 幅が広がった影響」を分けて見る。
+//
+//   ・basis は固定しない（毎バー更新する）
+//   ・固定するのは ATR だけ
+//   ・rawNormal = basis - 現在ATR   × 表示倍率
+//   ・rawFixed  = basis - 固定ATR   × 表示倍率
+//   ・転換倍率や方向状態はこの比較に一切使わない
+//
+//   固定値の取り方：
+//     指定時刻以降で最初のバーにおける「1 本前の ATR」を採用する。
+//     固定開始バー自身の ATR は使わない。以降は更新しない。
+//     未来の値は参照しない（[1] は必ず過去側）。
+//     直前の ATR が na（履歴不足）の場合は固定値を na のままにし、失敗を記録する。
+// ============================================================================
+// タプル分解した変数へ直接 history 参照をかけないよう、通常変数へコピーする
+float l2AtrNow   = l2BreakAtr
+float l2BasisNow = l2BreakBasis
+
+var float l2FrozenAtr     = na
+var int   l2FrozenBarTime = na
+var bool  l2FreezeDone    = false
+var bool  l2FreezeFailed  = false
+
+if not l2FreezeDone and time >= freezeTime
+    l2FreezeDone    := true
+    l2FrozenBarTime := time
+    float prevAtr = l2AtrNow[1]
+    if na(prevAtr)
+        // 指定時刻より前の履歴が読み込まれておらず、直前バーの ATR を取れない
+        l2FreezeFailed := true
+    else
+        l2FrozenAtr := prevAtr
+
+// 生の比較バンド（表示倍率は LINE2 の表示ATR倍率をそのまま使う）
+//   rawNormal は f_emaAtrBreakout() が返す下側生バンドと同一の式なので、
+//   値がずれないよう l2RawLo をそのまま使う。
+float cmpRawNormal = l2RawLo
+float cmpRawFixed  = na
+if not na(l2FrozenAtr)
+    cmpRawFixed := l2BasisNow - l2FrozenAtr * l2DpMult
+
+// --- 平滑化（表示モードの ON/OFF に関係なく毎バー計算する） ---
+// 中心線の平滑化。ta.ema() は条件分岐の外で毎バー呼ぶ。
+float cmpBasisSmooth = ta.ema(l2BasisNow, l2SmoothLen)
+// 通常側の平滑化は f_emaAtrBreakout() 内で計算済みの下側平滑化バンドを使う。
+float cmpNormalSmooth = l2SmLo
+
+// 固定側の平滑化：
+//   固定開始の前バーまでは通常側の EMA と同じ値を保持しておき、
+//   固定開始バーから rawFixed を入力として同じ係数で更新する。
+//   こうすると固定開始前の平滑化履歴が揃い、
+//   開始後は「ATR を固定した影響」だけが差として出る。
+float cmpAlpha = 2.0 / (l2SmoothLen + 1)
+var float cmpFixedSmooth = na
+if l2FreezeDone
+    if na(cmpFixedSmooth)
+        cmpFixedSmooth := cmpRawFixed
+    else
+        cmpFixedSmooth := cmpAlpha * cmpRawFixed + (1 - cmpAlpha) * cmpFixedSmooth
+else
+    cmpFixedSmooth := cmpNormalSmooth
+
+// --- 表示に使う値を選ぶ（平滑化 ON/OFF で条件を揃える） ---
+float l2CmpBasisPlot  = l2BasisNow
+float l2CmpNormalPlot = cmpRawNormal
+if l2Smooth
+    l2CmpBasisPlot  := cmpBasisSmooth
+    l2CmpNormalPlot := cmpNormalSmooth
+
+// 固定側は固定開始バーより前は表示しない
+float l2CmpFixedPlot = na
+if l2FreezeDone
+    if l2Smooth
+        l2CmpFixedPlot := cmpFixedSmooth
+    else
+        l2CmpFixedPlot := cmpRawFixed
+
+// ============================================================================
 // 計算：移動平均線
 // ============================================================================
 float maSrc = f_src(maSrcType)
@@ -927,7 +1020,11 @@ bool isSolo  = soloStb or soloL1 or soloL2
 //   この比較モードでは背景を出さない。
 bool cmpL1 = viewMode == "LINE1 上下バンド比較"
 bool cmpL2 = viewMode == "LINE2 上下バンド比較"
-bool isCmp = cmpL1 or cmpL2
+// LINE2 中心線・固定ATR比較モード
+bool cmpL2Fix = viewMode == "LINE2 中心線・固定ATR比較"
+// 比較線が有効なのは EMA ATR Breakout Band を選んでいるときだけ
+bool cmpL2FixOk = cmpL2Fix and l2Method == M_BREAK
+bool isCmp = cmpL1 or cmpL2 or cmpL2Fix
 
 bool visStb = showStb
 bool visL1  = showL1
@@ -972,6 +1069,16 @@ else if cmpL2 and l2Method == M_BREAK
     cmpUpCol := l2DnCol
     cmpLoCol := l2UpCol
 
+// LINE2 中心線・固定ATR比較で描画する 3 本。
+// 対象モードでない、または方式が Breakout でない場合は na にして何も出さない。
+float fixBasisPlot  = na
+float fixNormalPlot = na
+float fixFixedPlot  = na
+if cmpL2FixOk
+    fixBasisPlot  := l2CmpBasisPlot
+    fixNormalPlot := l2CmpNormalPlot
+    fixFixedPlot  := l2CmpFixedPlot
+
 // ============================================================================
 // 描画：ライン
 //   plot() はグローバルスコープでのみ呼ぶ（ローカルスコープ禁止）。
@@ -1008,6 +1115,20 @@ plot(cmpSmUp,  title = "比較: 上バンド（平滑化後）",
      color = color.new(cmpUpCol, 0), linewidth = 2)
 plot(cmpSmLo,  title = "比較: 下バンド（平滑化後）",
      color = color.new(cmpLoCol, 0), linewidth = 2)
+
+// ============================================================================
+// 描画：LINE2 中心線・固定ATR比較（対象モードのときだけ値が入る）
+//   ① 中心線 basis            … 黄
+//   ② 通常 ATR の下側バンド   … 青
+//   ③ 固定 ATR の下側バンド   … 白
+//   平滑化 ON/OFF は 3 本とも同じ条件で揃えてある。
+// ============================================================================
+plot(fixBasisPlot,  title = "比較: LINE2 中心線 basis",
+     color = color.yellow, linewidth = 2)
+plot(fixNormalPlot, title = "比較: LINE2 通常ATR 下側バンド",
+     color = color.blue, linewidth = 2)
+plot(fixFixedPlot,  title = "比較: LINE2 固定ATR 下側バンド",
+     color = color.white, linewidth = 2)
 
 // ============================================================================
 // 描画：転換確認マーカー（初期値 OFF）
@@ -1054,6 +1175,16 @@ plot(l2DiagAtr,        title = "DW: LINE2 ATR値",         display = display.dat
 plot(l2DiagSwUp,       title = "DW: LINE2 転換判定上限",  display = display.data_window)
 plot(l2DiagSwLo,       title = "DW: LINE2 転換判定下限",  display = display.data_window)
 
+// --- LINE2 中心線・固定ATR比較の診断値 ---
+//   固定ATR取得バー時刻は UNIX ミリ秒（UTC 基準）。
+//   読みやすい UTC 表記はデバッグテーブルの「固定ATR」行に出る。
+plot(l2AtrNow,             title = "DW: LINE2 現在ATR",                    display = display.data_window)
+plot(l2FrozenAtr,          title = "DW: LINE2 固定ATR",                    display = display.data_window)
+plot(l2CmpBasisPlot,       title = "DW: LINE2 中心線 比較表示値",          display = display.data_window)
+plot(l2CmpNormalPlot,      title = "DW: LINE2 通常ATR下側 比較表示値",     display = display.data_window)
+plot(l2CmpFixedPlot,       title = "DW: LINE2 固定ATR下側 比較表示値",     display = display.data_window)
+plot(l2FrozenBarTime * 1.0, title = "DW: LINE2 固定ATR取得バー時刻(UNIX ms)", display = display.data_window)
+
 // ============================================================================
 // 描画：背景
 //   bgcolor() の多重呼び出しによる意図しない上書きを避けるため、
@@ -1075,9 +1206,35 @@ if visBg
 bgcolor(bgFinal, title = "SAT PANEL 背景")
 
 // ============================================================================
+// 比較モードの案内メッセージ
+//   ラベルは最終バーに最大 1 個だけ。条件が解消したら削除する。
+//     ・LINE2 の計算方式が EMA ATR Breakout Band でない → 切替案内
+//     ・指定時刻より前の履歴が足りず固定 ATR を取得できなかった → その旨
+// ============================================================================
+var label cmpMsgLbl = na
+
+if barstate.islast
+    string cmpMsg = ""
+    if cmpL2Fix and l2Method != M_BREAK
+        cmpMsg := "LINE2 の計算方式を「" + M_BREAK + "」に切り替えてください（現在：" + l2Method + "）"
+    else if cmpL2Fix and l2FreezeFailed
+        cmpMsg := "指定時刻前の履歴が不足（固定開始バーの 1 本前の ATR を取得できませんでした）"
+    if cmpMsg == ""
+        if not na(cmpMsgLbl)
+            label.delete(cmpMsgLbl)
+            cmpMsgLbl := na
+    else
+        if na(cmpMsgLbl)
+            cmpMsgLbl := label.new(bar_index, high, cmpMsg, style = label.style_label_down,
+                 color = color.new(color.orange, 20), textcolor = color.black, size = size.small)
+        else
+            label.set_xy(cmpMsgLbl, bar_index, high)
+            label.set_text(cmpMsgLbl, cmpMsg)
+
+// ============================================================================
 // デバッグテーブル（初期値 OFF・ラベルは出さない）
 // ============================================================================
-var table dbgTable = table.new(position.top_right, 2, 27,
+var table dbgTable = table.new(position.top_right, 2, 28,
      border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50))
 
 // 現在の背景判定を文字列化
@@ -1095,6 +1252,13 @@ else if orderBackground
 
 // 3 本を高い順に並べた実測の並び
 string rankStr = f_rankStr(stbDisplayLine, l1DisplayLine, l2DisplayLine)
+
+// 固定 ATR の状態（値と、実際に固定されたバーの時刻を UTC 表記で出す）
+string frozenStr = "未固定（指定時刻に未到達）"
+if l2FreezeFailed
+    frozenStr := "指定時刻前の履歴が不足"
+else if not na(l2FrozenAtr)
+    frozenStr := f_priceStr(l2FrozenAtr) + " @ " + str.format_time(l2FrozenBarTime, "yyyy-MM-dd HH:mm", "UTC") + " UTC"
 
 // 選択した並びの成立状況（比較用。反転は導出しない）
 string orderStr = bgOrderMode + "  " + (orderMatch ? "○ 成立" : "✕")
@@ -1225,3 +1389,6 @@ if showDebug and barstate.islast
          "L1 " + (l1Smooth ? "ON(" + str.tostring(l1SmoothLen) + ")" : "OFF") +
          " / L2 " + (l2Smooth ? "ON(" + str.tostring(l2SmoothLen) + ")" : "OFF"),
          text_color = color.white, bgcolor = bgC, text_size = ts)
+
+    table.cell(dbgTable, 0, 27, "固定ATR", text_color = color.white, bgcolor = bgC, text_size = ts)
+    table.cell(dbgTable, 1, 27, frozenStr, text_color = color.white, bgcolor = bgC, text_size = ts)
