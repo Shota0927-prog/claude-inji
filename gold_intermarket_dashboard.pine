@@ -228,25 +228,31 @@ f_dirCode(int score) =>
     score >= dirUpThreshold ? 1 : score <= dirDnThreshold ? -1 : 0
 
 // 相関分類コード
-//   1 = OK        期待どおりの相関が成立
+//   0 = DATA不足  相関計算に必要な本数がまだない (データ取得不可を含む)
+//   4 = STALE     過去の相関値はあるが、対象市場の最新確定足が Gold と同期していない
+//                 (休場 / データ停止 / 配信遅延 → 古い情報で投票させない)
+//   3 = UNSTABLE  短期・中期相関が弱い、または短期と中期が不一致
 //   2 = BREAK     期待と反対の相関
-//   3 = UNSTABLE  相関が弱い、または短期と中期が不一致
-//   0 = DATA不足  必要本数不足 / データ取得不可
+//   1 = OK        期待する相関が成立し、最新足も同期している
+//   判定順序は上記のとおり。本数不足 → 同期切れ → 相関の中身、の順に切り分ける。
 //   expectPositive = true  → Silver (Goldと正相関を期待)
 //   expectPositive = false → DXY / Yield / Oil (Goldと逆相関を期待)
 //   Oil も「常に逆相関」と決めつけず、実測相関が逆相関のときだけ OK になる。
-f_relationCode(float cShort, float cMid, bool expectPositive, float th) =>
+f_relationCode(float cShort, float cMid, bool expectPositive, float th, bool current) =>
     int _rel = 0
-    if not na(cShort) and not na(cMid)
-        if expectPositive
-            _rel := (cShort >= th and cMid >= th) ? 1 : (cShort <= -th and cMid <= -th) ? 2 : 3
-        else
-            _rel := (cShort <= -th and cMid <= -th) ? 1 : (cShort >= th and cMid >= th) ? 2 : 3
+    if na(cShort) or na(cMid)
+        _rel := 0
+    else if not current
+        _rel := 4
+    else if expectPositive
+        _rel := (cShort >= th and cMid >= th) ? 1 : (cShort <= -th and cMid <= -th) ? 2 : 3
+    else
+        _rel := (cShort <= -th and cMid <= -th) ? 1 : (cShort >= th and cMid >= th) ? 2 : 3
     _rel
 
 // Gold への影響コード
 //    1 = Gold LONG要因 / -1 = Gold SHORT要因 / 0 = 中立 (相関OKだが方向レンジ)
-//    9 = OFF (相関 BREAK / UNSTABLE / DATA不足 → 投票から除外)
+//    9 = OFF (相関 BREAK / UNSTABLE / DATA不足 / STALE → 投票から除外)
 //   逆相関市場 : 上昇 → Gold SHORT / 下降 → Gold LONG
 //   正相関市場 : 上昇 → Gold LONG  / 下降 → Gold SHORT
 f_impactCode(int rel, int dir, bool expectPositive) =>
@@ -289,7 +295,7 @@ f_corrText(float c) =>
     na(c) ? "-" : (c >= 0 ? "+" : "") + str.tostring(c, "0.00")
 
 f_relationText(int rel) =>
-    rel == 1 ? "OK" : rel == 2 ? "BREAK" : rel == 3 ? "UNSTABLE" : "DATA不足"
+    rel == 1 ? "OK" : rel == 2 ? "BREAK" : rel == 3 ? "UNSTABLE" : rel == 4 ? "STALE" : "DATA不足"
 
 f_impactText(int imp) =>
     imp == 1 ? "LONG" : imp == -1 ? "SHORT" : imp == 0 ? "NEUTRAL" : "OFF"
@@ -307,6 +313,7 @@ colOk       = color.rgb(0, 130, 90)     // 相関成立
 colStrongL  = color.rgb(0, 230, 80)     // 明るい緑
 colStrongS  = color.rgb(255, 70, 70)    // 明るい赤
 colConflict = color.orange
+colStale    = color.rgb(90, 105, 125)   // 同期切れ (グレー系・投票対象外)
 colHeader   = color.rgb(25, 25, 25)
 colBase     = color.rgb(40, 40, 40)
 
@@ -315,7 +322,11 @@ f_impactColor(int imp, int transp) =>
     imp == 1 ? color.new(colLong, transp) : imp == -1 ? color.new(colShort, transp) : color.new(colNeutral, transp)
 
 f_relationColor(int rel, int transp) =>
-    rel == 1 ? color.new(colOk, transp) : rel == 2 ? color.new(colBreak, transp) : rel == 3 ? color.new(colUnstable, transp) : color.new(colNeutral, transp)
+    rel == 1 ? color.new(colOk, transp) :
+     rel == 2 ? color.new(colBreak, transp) :
+     rel == 3 ? color.new(colUnstable, transp) :
+     rel == 4 ? color.new(colStale, transp) :
+     color.new(colNeutral, transp)
 
 f_judgeColor(int j, int transp) =>
     j == 1 ? color.new(colStrongL, transp) :
@@ -448,8 +459,20 @@ float slvCorrS = useSilver ? f_pearson(gArrSlv, mArrSlv, corrShortLen) : na
 float slvCorrM = useSilver ? f_pearson(gArrSlv, mArrSlv, corrMidLen)   : na
 
 // ============================================================
-//  14. 方向 / 相関分類 / Gold影響
+//  14. 現在データ同期判定 / 方向 / 相関分類 / Gold影響
 // ============================================================
+// 現在データ同期判定 :
+//   Gold と対象市場の「最新確定相関足時刻」が一致しているかを見る。
+//   休場 / データ配信停止 / 上場廃止などで対象市場の足が止まると、
+//   request.security は最後の足を返し続けるため時刻が Gold より古くなる。
+//   一致していない市場は、過去に計算された相関係数や方向スコアが
+//   残っていても「現在の情報ではない」ものとして扱い、
+//   Gold の LONG・SHORT どちらの投票にも参加させない (STALE → 除外数へ計上)。
+bool dxyCurrent = useDxy    and not na(gTime) and not na(dxyTime) and gTime == dxyTime
+bool yldCurrent = useYield  and not na(gTime) and not na(yldTime) and gTime == yldTime
+bool oilCurrent = useOil    and not na(gTime) and not na(oilTime) and gTime == oilTime
+bool slvCurrent = useSilver and not na(gTime) and not na(slvTime) and gTime == slvTime
+
 // データ取得成否 (シンボル取得失敗・データ不足なら方向を使わない)
 bool dxyDataOk = useDxy    and not na(dxyD1H) and not na(dxyD15M) and not na(dxyD5M)
 bool yldDataOk = useYield  and not na(yldD1H) and not na(yldD15M) and not na(yldD5M)
@@ -467,16 +490,20 @@ int oilDir = oilDataOk ? f_dirCode(oilScore) : 0
 int slvDir = slvDataOk ? f_dirCode(slvScore) : 0
 
 // 期待相関 : DXY / Yield / Oil = 逆相関 (false) / Silver = 正相関 (true)
-int dxyRel = useDxy    ? f_relationCode(dxyCorrS, dxyCorrM, false, corrThreshold) : 0
-int yldRel = useYield  ? f_relationCode(yldCorrS, yldCorrM, false, corrThreshold) : 0
-int oilRel = useOil    ? f_relationCode(oilCorrS, oilCorrM, false, corrThreshold) : 0
-int slvRel = useSilver ? f_relationCode(slvCorrS, slvCorrM, true,  corrThreshold) : 0
+int dxyRel = useDxy    ? f_relationCode(dxyCorrS, dxyCorrM, false, corrThreshold, dxyCurrent) : 0
+int yldRel = useYield  ? f_relationCode(yldCorrS, yldCorrM, false, corrThreshold, yldCurrent) : 0
+int oilRel = useOil    ? f_relationCode(oilCorrS, oilCorrM, false, corrThreshold, oilCurrent) : 0
+int slvRel = useSilver ? f_relationCode(slvCorrS, slvCorrM, true,  corrThreshold, slvCurrent) : 0
 
-// 方向データが取れていない市場は相関がOKでも投票させない
-int dxyImp = (useDxy    and dxyDataOk) ? f_impactCode(dxyRel, dxyDir, false) : 9
-int yldImp = (useYield  and yldDataOk) ? f_impactCode(yldRel, yldDir, false) : 9
-int oilImp = (useOil    and oilDataOk) ? f_impactCode(oilRel, oilDir, false) : 9
-int slvImp = (useSilver and slvDataOk) ? f_impactCode(slvRel, slvDir, true)  : 9
+// 投票させない条件 :
+//   ・方向データが取れていない (シンボル取得失敗など)          → dataOk = false
+//   ・対象市場の最新確定足が Gold と同期していない (STALE)     → current = false
+//     → 相関係数だけでなく方向スコアも古い情報なので投票させない。
+//   ・相関が OK でない (BREAK / UNSTABLE / DATA不足)           → f_impactCode 内で 9
+int dxyImp = (useDxy    and dxyDataOk and dxyCurrent) ? f_impactCode(dxyRel, dxyDir, false) : 9
+int yldImp = (useYield  and yldDataOk and yldCurrent) ? f_impactCode(yldRel, yldDir, false) : 9
+int oilImp = (useOil    and oilDataOk and oilCurrent) ? f_impactCode(oilRel, oilDir, false) : 9
+int slvImp = (useSilver and slvDataOk and slvCurrent) ? f_impactCode(slvRel, slvDir, true)  : 9
 
 // ============================================================
 //  15. 集計 / 総合判定
@@ -500,7 +527,7 @@ int neutralCount =
      ((useOil    and oilImp == 0) ? 1 : 0) +
      ((useSilver and slvImp == 0) ? 1 : 0)
 
-// 相関不成立 (BREAK / UNSTABLE / DATA不足) による除外
+// 相関不成立 (BREAK / UNSTABLE / DATA不足) および STALE / データ欠損による除外
 int excludedCount =
      ((useDxy    and dxyImp == 9) ? 1 : 0) +
      ((useYield  and yldImp == 9) ? 1 : 0) +
@@ -526,7 +553,7 @@ f_drawRow(table t, int row, string name, bool on, bool dataOk, int dir, int scor
     table.cell(t, 3, row, on ? f_corrText(cs) : "-",                 text_color = color.white, bgcolor = _base, text_size = sz)
     table.cell(t, 4, row, on ? f_corrText(cm) : "-",                 text_color = color.white, bgcolor = _base, text_size = sz)
     table.cell(t, 5, row, on ? f_relationText(rel) : "-",            text_color = on ? f_relationTextColor(rel) : color.white, bgcolor = _relC, text_size = sz)
-    table.cell(t, 6, row, on ? f_impactText(imp) : "-",              text_color = color.white, bgcolor = _impC, text_size = sz)
+    table.cell(t, 6, row, on ? (rel == 4 ? "STALE" : f_impactText(imp)) : "-", text_color = color.white, bgcolor = on and rel == 4 ? color.new(colStale, transp) : _impC, text_size = sz)
 
 if barstate.islast
     string _sz  = f_textSize(tableSizeStr)
