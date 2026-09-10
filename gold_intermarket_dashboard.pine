@@ -1,0 +1,576 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// ============================================================
+//  Gold Intermarket Dashboard  (表示専用インジケーター)
+// ------------------------------------------------------------
+//  目的 :
+//    DXY / 米国10年債利回り / Oil / Silver の「方向」と、Gold との
+//    「現在の相関関係」をリアルタイムに確認し、Gold のロング・ショート
+//    どちらに強気になれる状態かをテーブル表示する。
+//
+//  本インジケーターは完全な表示専用。以下は一切実装していない :
+//    strategy.entry / strategy.exit / 注文処理 / バックテスト /
+//    ZONE / FVG / 包み足 / ピンバー / BOS /
+//    Accumulation / Distortion / Return / 状態保持 /
+//    市場別のエントリースコア / 既存ストラテジーとの結合
+//
+//  設計方針 :
+//    ① 方向判定  : 1H / 15M / 5M の EMA20 位置 + 傾きで 上昇/下降/レンジ を分類し
+//                   TF重み付き合計スコアから市場方向を決定。
+//    ② 相関計算  : 価格そのものではなく「確定 15分足の対数騰落率」同士の
+//                   Pearson 相関。新しい確定15分足が発生したチャート足でのみ
+//                   Gold と対象市場の騰落率をペアで配列へ push する。
+//                   → チャート足へ展開された同じ値が複数回入って相関が歪むことはない。
+//                   → 短期相関 / 中期相関は「同一の騰落率配列」の末尾 N 本から計算するため
+//                      2つの期間で常に同じデータ系列を共有する。
+//    ③ 相関成立時のみ、その市場の方向を Gold 方向の投票に使う。
+//       期待相関が崩れている (BREAK) / 弱い・不一致 (UNSTABLE) / 本数不足 (DATA不足)
+//       の市場は LONG・SHORT どちらの投票にも含めない。
+//    ④ 非リペイント : 既定は「確定足のみ」。request.security は
+//       lookahead_on + TFコンテキスト内 確定1本前 [1] の組み合わせで
+//       未来参照なし・過去結果が変化しない。
+//       相関用の騰落率は仕様どおり常に「確定15分足」のみを使用する
+//       (未確定の騰落率を配列へ push すると配列が恒久的に汚染されるため)。
+//       リアルタイム更新モード (既定 OFF) は方向判定のみを未確定足ベースへ切り替える。
+//       確定足モードとリアルタイムモードの方向判定計算は混在しない (lookahead ごと切替)。
+//
+//  ※ Gold チャート (例 : TVC:GOLD / OANDA:XAUUSD) に適用してください。
+// ============================================================
+
+//@version=5
+indicator(
+     title            = "Gold Intermarket Dashboard",
+     shorttitle       = "GOLD IMD",
+     overlay          = true,
+     dynamic_requests = true,
+     max_bars_back    = 500
+ )
+
+// ============================================================
+//  1. 入力 : シンボル
+// ============================================================
+grpSym = "シンボル"
+goldSymbol   = input.symbol("TVC:GOLD",   "Gold シンボル",            group = grpSym)
+dxySymbol    = input.symbol("TVC:DXY",    "DXY シンボル",             group = grpSym)
+yieldSymbol  = input.symbol("TVC:US10Y",  "Yield シンボル (米10年債)", group = grpSym)
+oilSymbol    = input.symbol("TVC:USOIL",  "Oil シンボル (WTI)",       group = grpSym)
+silverSymbol = input.symbol("TVC:SILVER", "Silver シンボル",          group = grpSym)
+
+// ============================================================
+//  2. 入力 : 市場別 ON/OFF
+// ------------------------------------------------------------
+//  OFF の市場は request.security を呼ばず、相関・方向・投票の対象外。
+//  全市場 OFF でもエラーにならない (security を1本も呼ばない)。
+// ============================================================
+grpUse = "市場 ON/OFF"
+useDxy    = input.bool(true, "DXY を使う",    group = grpUse)
+useYield  = input.bool(true, "Yield を使う",  group = grpUse)
+useOil    = input.bool(true, "Oil を使う",    group = grpUse)
+useSilver = input.bool(true, "Silver を使う", group = grpUse)
+
+// ============================================================
+//  3. 入力 : 方向判定 (EMA20 の位置と傾き)
+// ============================================================
+grpDir = "方向判定"
+tf1H  = input.timeframe("60", "1H 時間足",  group = grpDir)
+tf15M = input.timeframe("15", "15M 時間足", group = grpDir)
+tf5M  = input.timeframe("5",  "5M 時間足",  group = grpDir)
+
+emaLen        = input.int(20, "EMA 期間",         minval = 1, group = grpDir)
+emaSlopeLen   = input.int(3,  "EMA 傾き参照本数", minval = 1, group = grpDir)
+
+weight1H  = input.int(2, "時間足の重み 1H",  minval = 0, group = grpDir)
+weight15M = input.int(2, "時間足の重み 15M", minval = 0, group = grpDir)
+weight5M  = input.int(1, "時間足の重み 5M",  minval = 0, group = grpDir)
+
+dirUpThreshold = input.int(3,  "方向スコア 上昇しきい値 (以上)", group = grpDir)
+dirDnThreshold = input.int(-3, "方向スコア 下降しきい値 (以下)", group = grpDir)
+
+// ============================================================
+//  4. 入力 : 相関 (確定15分足の対数騰落率ベース)
+// ============================================================
+grpCorr = "相関"
+corrTF        = input.timeframe("15", "相関ベース時間足", group = grpCorr)
+corrShortLen  = input.int(20,   "短期相関 本数", minval = 2, group = grpCorr)
+corrMidLen    = input.int(48,   "中期相関 本数", minval = 2, group = grpCorr)
+corrThreshold = input.float(0.30, "相関しきい値 (|corr|)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpCorr)
+
+// ============================================================
+//  5. 入力 : リアルタイム / 非リペイント
+// ============================================================
+grpRT = "リアルタイム / 非リペイント"
+rtMode = input.bool(false, "リアルタイム更新モード (未確定足を含むため表示が変化します・既定OFF)", group = grpRT)
+
+// 方向判定用 lookahead。
+//   確定足モード     : lookahead_on  + TFコンテキスト内 確定1本前[1]  → 非リペイント
+//   リアルタイムモード: lookahead_off + 未確定足そのまま              → 表示は変化する
+//   ※ 2モードの計算は混在しない (lookahead ごと切り替わる)。
+lookaheadDir = rtMode ? barmerge.lookahead_off : barmerge.lookahead_on
+
+// ============================================================
+//  6. 入力 : 表示
+// ============================================================
+grpDisp = "表示"
+tablePosStr  = input.string("右上", "テーブル位置", options = ["右上", "左上", "右下", "左下", "中央上", "中央下"], group = grpDisp)
+tableSizeStr = input.string("small", "文字サイズ", options = ["tiny", "small", "normal", "large"], group = grpDisp)
+tableTransp  = input.int(15, "背景透明度 (0=不透明 / 100=透明)", minval = 0, maxval = 100, group = grpDisp)
+
+// ============================================================
+//  7. 補助関数 : 表示系マッピング
+// ============================================================
+f_tablePos(string s) =>
+    s == "右上"   ? position.top_right    :
+     s == "左上"   ? position.top_left     :
+     s == "右下"   ? position.bottom_right :
+     s == "左下"   ? position.bottom_left  :
+     s == "中央上" ? position.top_center   :
+     position.bottom_center
+
+f_textSize(string s) =>
+    s == "tiny" ? size.tiny : s == "small" ? size.small : s == "normal" ? size.normal : size.large
+
+// ============================================================
+//  8. request.security 用 関数 (参照TFコンテキスト内で評価)
+// ============================================================
+
+// 方向判定 : EMA20 の位置と傾き。
+//   上昇 : 終値 > EMA20 かつ EMA20 > EMA20[傾き参照本数]
+//   下降 : 終値 < EMA20 かつ EMA20 < EMA20[傾き参照本数]
+//   それ以外はレンジ (0)。
+//   rt = false のとき、参照TFコンテキスト内で確定1本前 [1] に固定する。
+//   これを lookahead_on と組み合わせることで未来参照なし・非リペイントになる。
+f_dirState(int len, int slopeLen, bool rt) =>
+    float _ema = ta.ema(close, len)
+    bool  _up  = close > _ema and _ema > _ema[slopeLen]
+    bool  _dn  = close < _ema and _ema < _ema[slopeLen]
+    int   _d   = _up ? 1 : _dn ? -1 : 0
+    rt ? _d : _d[1]
+
+// 相関用データ : 確定した参照TF足の「対数騰落率」と、その足の時刻。
+//   価格の終値ではなく騰落率を返す (相関は騰落率同士で計算する)。
+//   時刻は Gold と対象市場の同期チェック (同じ値の重複 push 防止) に使う。
+//   常に確定1本前 [1] を返し、呼び出し側は lookahead_on 固定で使用する。
+f_corrData() =>
+    float _r = (na(close) or na(close[1]) or close <= 0 or close[1] <= 0) ? na : math.log(close / close[1])
+    [_r[1], time[1]]
+
+// ============================================================
+//  9. 補助関数 : 相関計算 (騰落率配列ベース)
+// ============================================================
+
+// 新しい確定参照TF足が発生したチャート足でのみ、Gold と対象市場の
+// 騰落率を「同期して」配列へ追加する。
+//   ・doPush (= 新しい確定足) 以外では一切 push しない
+//     → チャート足へ展開された同じ値が複数回入って相関が歪むことはない。
+//   ・Gold と対象市場の両方の値が取得できた場合だけ追加する。
+//   ・両者の参照TF足の時刻が前回 push 時から進んでいる場合だけ追加する
+//     → 片側が休場などで新しい足を持たないとき、同じ騰落率を重複投入しない。
+//   ・配列の最大サイズは相関期間 (短期・中期の大きい方) と同じ。
+//     短期相関と中期相関はこの同一配列の末尾 N 本から計算する
+//     → 2つの期間で常に同じ騰落率データを共有する。
+//   var はこの関数呼び出し (市場ペア) ごとに独立したインスタンスになる。
+f_pushReturns(array<float> ga, array<float> ma, bool doPush, float gv, float mv, int gt, int mt, int maxLen) =>
+    var int _lastG = na
+    var int _lastM = na
+    bool _valid = doPush and not na(gv) and not na(mv) and not na(gt) and not na(mt)
+    bool _fresh = (na(_lastG) or gt != _lastG) and (na(_lastM) or mt != _lastM)
+    if _valid and _fresh
+        array.push(ga, gv)
+        array.push(ma, mv)
+        _lastG := gt
+        _lastM := mt
+        while array.size(ga) > maxLen
+            array.shift(ga)
+            array.shift(ma)
+
+// 騰落率配列の末尾 len 本で Pearson 相関係数を計算する。
+//   必要本数が揃っていない間は na (= DATA不足) を返す。
+f_pearson(array<float> ga, array<float> ma, int len) =>
+    int   _n = array.size(ga)
+    float _r = na
+    if _n >= len and len >= 2
+        float _sg = 0.0
+        float _sm = 0.0
+        for i = _n - len to _n - 1
+            _sg += array.get(ga, i)
+            _sm += array.get(ma, i)
+        float _mg = _sg / len
+        float _mm = _sm / len
+        float _cov = 0.0
+        float _vg  = 0.0
+        float _vm  = 0.0
+        for i = _n - len to _n - 1
+            float _dg = array.get(ga, i) - _mg
+            float _dm = array.get(ma, i) - _mm
+            _cov += _dg * _dm
+            _vg  += _dg * _dg
+            _vm  += _dm * _dm
+        float _den = math.sqrt(_vg * _vm)
+        _r := _den > 0 ? _cov / _den : na
+    _r
+
+// ============================================================
+//  10. 補助関数 : 分類 / 投票
+// ============================================================
+
+// 方向スコア → 方向コード (1 = 上昇 / -1 = 下降 / 0 = レンジ)
+f_dirCode(int score) =>
+    score >= dirUpThreshold ? 1 : score <= dirDnThreshold ? -1 : 0
+
+// 相関分類コード
+//   1 = OK        期待どおりの相関が成立
+//   2 = BREAK     期待と反対の相関
+//   3 = UNSTABLE  相関が弱い、または短期と中期が不一致
+//   0 = DATA不足  必要本数不足 / データ取得不可
+//   expectPositive = true  → Silver (Goldと正相関を期待)
+//   expectPositive = false → DXY / Yield / Oil (Goldと逆相関を期待)
+//   Oil も「常に逆相関」と決めつけず、実測相関が逆相関のときだけ OK になる。
+f_relationCode(float cShort, float cMid, bool expectPositive, float th) =>
+    int _rel = 0
+    if not na(cShort) and not na(cMid)
+        if expectPositive
+            _rel := (cShort >= th and cMid >= th) ? 1 : (cShort <= -th and cMid <= -th) ? 2 : 3
+        else
+            _rel := (cShort <= -th and cMid <= -th) ? 1 : (cShort >= th and cMid >= th) ? 2 : 3
+    _rel
+
+// Gold への影響コード
+//    1 = Gold LONG要因 / -1 = Gold SHORT要因 / 0 = 中立 (相関OKだが方向レンジ)
+//    9 = OFF (相関 BREAK / UNSTABLE / DATA不足 → 投票から除外)
+//   逆相関市場 : 上昇 → Gold SHORT / 下降 → Gold LONG
+//   正相関市場 : 上昇 → Gold LONG  / 下降 → Gold SHORT
+f_impactCode(int rel, int dir, bool expectPositive) =>
+    int _imp = 9
+    if rel == 1
+        _imp := dir == 0 ? 0 : (expectPositive ? dir : -dir)
+    _imp
+
+// 総合判定コード
+//   1 = STRONG LONG / 2 = STRONG SHORT / 3 = LONG優勢 / 4 = SHORT優勢
+//   5 = CONFLICT    / 6 = NEUTRAL
+f_judgeCode(int lv, int sv, int ev) =>
+    int _j = 6
+    if ev < 2
+        _j := 6
+    else if ev >= 3 and lv >= 3 and sv == 0
+        _j := 1
+    else if ev >= 3 and sv >= 3 and lv == 0
+        _j := 2
+    else if lv >= 2 and (lv - sv) >= 2
+        _j := 3
+    else if sv >= 2 and (sv - lv) >= 2
+        _j := 4
+    else if lv > 0 and sv > 0 and math.abs(lv - sv) < 2
+        _j := 5
+    else
+        _j := 6
+    _j
+
+// ============================================================
+//  11. 補助関数 : テキスト / 色
+// ============================================================
+f_dirText(int dir, bool ok) =>
+    not ok ? "N/A" : dir == 1 ? "↑ UP" : dir == -1 ? "↓ DOWN" : "→ RANGE"
+
+f_scoreText(int score, bool ok) =>
+    not ok ? "-" : (score > 0 ? "+" : "") + str.tostring(score)
+
+f_corrText(float c) =>
+    na(c) ? "-" : (c >= 0 ? "+" : "") + str.tostring(c, "0.00")
+
+f_relationText(int rel) =>
+    rel == 1 ? "OK" : rel == 2 ? "BREAK" : rel == 3 ? "UNSTABLE" : "DATA不足"
+
+f_impactText(int imp) =>
+    imp == 1 ? "LONG" : imp == -1 ? "SHORT" : imp == 0 ? "NEUTRAL" : "OFF"
+
+f_judgeText(int j) =>
+    j == 1 ? "STRONG LONG" : j == 2 ? "STRONG SHORT" : j == 3 ? "LONG優勢" : j == 4 ? "SHORT優勢" : j == 5 ? "CONFLICT" : "NEUTRAL"
+
+// 色定義
+colLong     = color.green
+colShort    = color.red
+colNeutral  = color.gray
+colUnstable = color.rgb(235, 180, 0)    // 黄色〜オレンジ
+colBreak    = color.rgb(190, 80, 0)     // 濃いオレンジ
+colOk       = color.rgb(0, 130, 90)     // 相関成立
+colStrongL  = color.rgb(0, 230, 80)     // 明るい緑
+colStrongS  = color.rgb(255, 70, 70)    // 明るい赤
+colConflict = color.orange
+colHeader   = color.rgb(25, 25, 25)
+colBase     = color.rgb(40, 40, 40)
+
+// Gold への影響 → 背景色 (LONG要因=緑 / SHORT要因=赤 / 中立・OFF=グレー)
+f_impactColor(int imp, int transp) =>
+    imp == 1 ? color.new(colLong, transp) : imp == -1 ? color.new(colShort, transp) : color.new(colNeutral, transp)
+
+f_relationColor(int rel, int transp) =>
+    rel == 1 ? color.new(colOk, transp) : rel == 2 ? color.new(colBreak, transp) : rel == 3 ? color.new(colUnstable, transp) : color.new(colNeutral, transp)
+
+f_judgeColor(int j, int transp) =>
+    j == 1 ? color.new(colStrongL, transp) :
+     j == 2 ? color.new(colStrongS, transp) :
+     j == 3 ? color.new(colLong, transp) :
+     j == 4 ? color.new(colShort, transp) :
+     j == 5 ? color.new(colConflict, transp) :
+     color.new(colNeutral, transp)
+
+// 明るい背景では黒文字にして可読性を確保する
+f_relationTextColor(int rel) =>
+    rel == 3 ? color.black : color.white
+
+f_judgeTextColor(int j) =>
+    (j == 1 or j == 5) ? color.black : color.white
+
+// ============================================================
+//  12. データ取得
+// ------------------------------------------------------------
+//  ・OFF の市場は request.security を一切呼ばない。
+//  ・全市場 OFF なら Gold の相関用取得も呼ばない。
+//  ・ignore_invalid_symbol = true : シンボル取得失敗でもエラーにせず na。
+//  ・方向 : 3TF × 有効市場数
+//    相関 : Gold 1本 + 有効市場数 (常に確定足 lookahead_on)
+//    → 最大 1 + 4 × 4 = 17本。不要な request.security は呼ばない。
+// ============================================================
+bool anyMarketOn = useDxy or useYield or useOil or useSilver
+int  corrMaxLen  = math.max(corrShortLen, corrMidLen)
+
+// --- Gold : 相関用 確定騰落率 (全ペア共通・1本のみ) ---
+float gRet  = na
+int   gTime = na
+if anyMarketOn
+    [_gr, _gt] = request.security(goldSymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    gRet  := _gr
+    gTime := _gt
+
+// --- DXY ---
+int   dxyD1H  = na
+int   dxyD15M = na
+int   dxyD5M  = na
+float dxyRet  = na
+int   dxyTime = na
+if useDxy
+    dxyD1H  := request.security(dxySymbol, tf1H,  f_dirState(emaLen, emaSlopeLen, rtMode), lookahead = lookaheadDir, ignore_invalid_symbol = true)
+    dxyD15M := request.security(dxySymbol, tf15M, f_dirState(emaLen, emaSlopeLen, rtMode), lookahead = lookaheadDir, ignore_invalid_symbol = true)
+    dxyD5M  := request.security(dxySymbol, tf5M,  f_dirState(emaLen, emaSlopeLen, rtMode), lookahead = lookaheadDir, ignore_invalid_symbol = true)
+    [_dr, _dt] = request.security(dxySymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    dxyRet  := _dr
+    dxyTime := _dt
+
+// --- Yield ---
+int   yldD1H  = na
+int   yldD15M = na
+int   yldD5M  = na
+float yldRet  = na
+int   yldTime = na
+if useYield
+    yldD1H  := request.security(yieldSymbol, tf1H,  f_dirState(emaLen, emaSlopeLen, rtMode), lookahead = lookaheadDir, ignore_invalid_symbol = true)
+    yldD15M := request.security(yieldSymbol, tf15M, f_dirState(emaLen, emaSlopeLen, rtMode), lookahead = lookaheadDir, ignore_invalid_symbol = true)
+    yldD5M  := request.security(yieldSymbol, tf5M,  f_dirState(emaLen, emaSlopeLen, rtMode), lookahead = lookaheadDir, ignore_invalid_symbol = true)
+    [_yr, _yt] = request.security(yieldSymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    yldRet  := _yr
+    yldTime := _yt
+
+// --- Oil ---
+int   oilD1H  = na
+int   oilD15M = na
+int   oilD5M  = na
+float oilRet  = na
+int   oilTime = na
+if useOil
+    oilD1H  := request.security(oilSymbol, tf1H,  f_dirState(emaLen, emaSlopeLen, rtMode), lookahead = lookaheadDir, ignore_invalid_symbol = true)
+    oilD15M := request.security(oilSymbol, tf15M, f_dirState(emaLen, emaSlopeLen, rtMode), lookahead = lookaheadDir, ignore_invalid_symbol = true)
+    oilD5M  := request.security(oilSymbol, tf5M,  f_dirState(emaLen, emaSlopeLen, rtMode), lookahead = lookaheadDir, ignore_invalid_symbol = true)
+    [_or_, _ot] = request.security(oilSymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    oilRet  := _or_
+    oilTime := _ot
+
+// --- Silver ---
+int   slvD1H  = na
+int   slvD15M = na
+int   slvD5M  = na
+float slvRet  = na
+int   slvTime = na
+if useSilver
+    slvD1H  := request.security(silverSymbol, tf1H,  f_dirState(emaLen, emaSlopeLen, rtMode), lookahead = lookaheadDir, ignore_invalid_symbol = true)
+    slvD15M := request.security(silverSymbol, tf15M, f_dirState(emaLen, emaSlopeLen, rtMode), lookahead = lookaheadDir, ignore_invalid_symbol = true)
+    slvD5M  := request.security(silverSymbol, tf5M,  f_dirState(emaLen, emaSlopeLen, rtMode), lookahead = lookaheadDir, ignore_invalid_symbol = true)
+    [_sr, _st] = request.security(silverSymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    slvRet  := _sr
+    slvTime := _st
+
+// ============================================================
+//  13. 相関計算
+// ------------------------------------------------------------
+//  新しい確定相関TF足が発生したチャート足でのみ push する。
+//  Gold 側の配列は市場ごとに独立させ、常に「同じ確定足のペア」で揃える。
+// ============================================================
+bool newCorrBar = ta.change(time(corrTF)) != 0
+
+var array<float> gArrDxy = array.new_float()
+var array<float> mArrDxy = array.new_float()
+var array<float> gArrYld = array.new_float()
+var array<float> mArrYld = array.new_float()
+var array<float> gArrOil = array.new_float()
+var array<float> mArrOil = array.new_float()
+var array<float> gArrSlv = array.new_float()
+var array<float> mArrSlv = array.new_float()
+
+f_pushReturns(gArrDxy, mArrDxy, useDxy    and newCorrBar, gRet, dxyRet, gTime, dxyTime, corrMaxLen)
+f_pushReturns(gArrYld, mArrYld, useYield  and newCorrBar, gRet, yldRet, gTime, yldTime, corrMaxLen)
+f_pushReturns(gArrOil, mArrOil, useOil    and newCorrBar, gRet, oilRet, gTime, oilTime, corrMaxLen)
+f_pushReturns(gArrSlv, mArrSlv, useSilver and newCorrBar, gRet, slvRet, gTime, slvTime, corrMaxLen)
+
+float dxyCorrS = useDxy    ? f_pearson(gArrDxy, mArrDxy, corrShortLen) : na
+float dxyCorrM = useDxy    ? f_pearson(gArrDxy, mArrDxy, corrMidLen)   : na
+float yldCorrS = useYield  ? f_pearson(gArrYld, mArrYld, corrShortLen) : na
+float yldCorrM = useYield  ? f_pearson(gArrYld, mArrYld, corrMidLen)   : na
+float oilCorrS = useOil    ? f_pearson(gArrOil, mArrOil, corrShortLen) : na
+float oilCorrM = useOil    ? f_pearson(gArrOil, mArrOil, corrMidLen)   : na
+float slvCorrS = useSilver ? f_pearson(gArrSlv, mArrSlv, corrShortLen) : na
+float slvCorrM = useSilver ? f_pearson(gArrSlv, mArrSlv, corrMidLen)   : na
+
+// ============================================================
+//  14. 方向 / 相関分類 / Gold影響
+// ============================================================
+// データ取得成否 (シンボル取得失敗・データ不足なら方向を使わない)
+bool dxyDataOk = useDxy    and not na(dxyD1H) and not na(dxyD15M) and not na(dxyD5M)
+bool yldDataOk = useYield  and not na(yldD1H) and not na(yldD15M) and not na(yldD5M)
+bool oilDataOk = useOil    and not na(oilD1H) and not na(oilD15M) and not na(oilD5M)
+bool slvDataOk = useSilver and not na(slvD1H) and not na(slvD15M) and not na(slvD5M)
+
+int dxyScore = dxyDataOk ? nz(dxyD1H) * weight1H + nz(dxyD15M) * weight15M + nz(dxyD5M) * weight5M : 0
+int yldScore = yldDataOk ? nz(yldD1H) * weight1H + nz(yldD15M) * weight15M + nz(yldD5M) * weight5M : 0
+int oilScore = oilDataOk ? nz(oilD1H) * weight1H + nz(oilD15M) * weight15M + nz(oilD5M) * weight5M : 0
+int slvScore = slvDataOk ? nz(slvD1H) * weight1H + nz(slvD15M) * weight15M + nz(slvD5M) * weight5M : 0
+
+int dxyDir = dxyDataOk ? f_dirCode(dxyScore) : 0
+int yldDir = yldDataOk ? f_dirCode(yldScore) : 0
+int oilDir = oilDataOk ? f_dirCode(oilScore) : 0
+int slvDir = slvDataOk ? f_dirCode(slvScore) : 0
+
+// 期待相関 : DXY / Yield / Oil = 逆相関 (false) / Silver = 正相関 (true)
+int dxyRel = useDxy    ? f_relationCode(dxyCorrS, dxyCorrM, false, corrThreshold) : 0
+int yldRel = useYield  ? f_relationCode(yldCorrS, yldCorrM, false, corrThreshold) : 0
+int oilRel = useOil    ? f_relationCode(oilCorrS, oilCorrM, false, corrThreshold) : 0
+int slvRel = useSilver ? f_relationCode(slvCorrS, slvCorrM, true,  corrThreshold) : 0
+
+// 方向データが取れていない市場は相関がOKでも投票させない
+int dxyImp = (useDxy    and dxyDataOk) ? f_impactCode(dxyRel, dxyDir, false) : 9
+int yldImp = (useYield  and yldDataOk) ? f_impactCode(yldRel, yldDir, false) : 9
+int oilImp = (useOil    and oilDataOk) ? f_impactCode(oilRel, oilDir, false) : 9
+int slvImp = (useSilver and slvDataOk) ? f_impactCode(slvRel, slvDir, true)  : 9
+
+// ============================================================
+//  15. 集計 / 総合判定
+// ============================================================
+int longVotes =
+     ((useDxy    and dxyImp ==  1) ? 1 : 0) +
+     ((useYield  and yldImp ==  1) ? 1 : 0) +
+     ((useOil    and oilImp ==  1) ? 1 : 0) +
+     ((useSilver and slvImp ==  1) ? 1 : 0)
+
+int shortVotes =
+     ((useDxy    and dxyImp == -1) ? 1 : 0) +
+     ((useYield  and yldImp == -1) ? 1 : 0) +
+     ((useOil    and oilImp == -1) ? 1 : 0) +
+     ((useSilver and slvImp == -1) ? 1 : 0)
+
+// 相関は有効だが市場方向がレンジ (中立)
+int neutralCount =
+     ((useDxy    and dxyImp == 0) ? 1 : 0) +
+     ((useYield  and yldImp == 0) ? 1 : 0) +
+     ((useOil    and oilImp == 0) ? 1 : 0) +
+     ((useSilver and slvImp == 0) ? 1 : 0)
+
+// 相関不成立 (BREAK / UNSTABLE / DATA不足) による除外
+int excludedCount =
+     ((useDxy    and dxyImp == 9) ? 1 : 0) +
+     ((useYield  and yldImp == 9) ? 1 : 0) +
+     ((useOil    and oilImp == 9) ? 1 : 0) +
+     ((useSilver and slvImp == 9) ? 1 : 0)
+
+int effectiveVotes = longVotes + shortVotes
+int judgeCode      = f_judgeCode(longVotes, shortVotes, effectiveVotes)
+
+// ============================================================
+//  16. テーブル表示
+// ============================================================
+var table dashTbl = table.new(f_tablePos(tablePosStr), 7, 7, border_width = 1)
+
+// 1市場ぶんの行を描画する
+f_drawRow(table t, int row, string name, bool on, bool dataOk, int dir, int score, float cs, float cm, int rel, int imp, string sz, int transp) =>
+    color _base = color.new(colBase, transp)
+    color _impC = on ? f_impactColor(imp, transp) : color.new(colNeutral, transp)
+    color _relC = on ? f_relationColor(rel, transp) : color.new(colNeutral, transp)
+    table.cell(t, 0, row, name, text_color = color.white, bgcolor = _base, text_size = sz)
+    table.cell(t, 1, row, on ? f_dirText(dir, dataOk) : "OFF",       text_color = color.white, bgcolor = _impC, text_size = sz)
+    table.cell(t, 2, row, on ? f_scoreText(score, dataOk) : "-",     text_color = color.white, bgcolor = _impC, text_size = sz)
+    table.cell(t, 3, row, on ? f_corrText(cs) : "-",                 text_color = color.white, bgcolor = _base, text_size = sz)
+    table.cell(t, 4, row, on ? f_corrText(cm) : "-",                 text_color = color.white, bgcolor = _base, text_size = sz)
+    table.cell(t, 5, row, on ? f_relationText(rel) : "-",            text_color = on ? f_relationTextColor(rel) : color.white, bgcolor = _relC, text_size = sz)
+    table.cell(t, 6, row, on ? f_impactText(imp) : "-",              text_color = color.white, bgcolor = _impC, text_size = sz)
+
+if barstate.islast
+    string _sz  = f_textSize(tableSizeStr)
+    color  _hdr = color.new(colHeader, tableTransp)
+    color  _base = color.new(colBase, tableTransp)
+
+    // ヘッダー
+    table.cell(dashTbl, 0, 0, "Market",       text_color = color.white, bgcolor = _hdr, text_size = _sz)
+    table.cell(dashTbl, 1, 0, "Direction",    text_color = color.white, bgcolor = _hdr, text_size = _sz)
+    table.cell(dashTbl, 2, 0, "Score",        text_color = color.white, bgcolor = _hdr, text_size = _sz)
+    table.cell(dashTbl, 3, 0, "Short Corr",   text_color = color.white, bgcolor = _hdr, text_size = _sz)
+    table.cell(dashTbl, 4, 0, "Mid Corr",     text_color = color.white, bgcolor = _hdr, text_size = _sz)
+    table.cell(dashTbl, 5, 0, "Relation",     text_color = color.white, bgcolor = _hdr, text_size = _sz)
+    table.cell(dashTbl, 6, 0, "Gold Impact",  text_color = color.white, bgcolor = _hdr, text_size = _sz)
+
+    // 各市場
+    f_drawRow(dashTbl, 1, "DXY",    useDxy,    dxyDataOk, dxyDir, dxyScore, dxyCorrS, dxyCorrM, dxyRel, dxyImp, _sz, tableTransp)
+    f_drawRow(dashTbl, 2, "Yield",  useYield,  yldDataOk, yldDir, yldScore, yldCorrS, yldCorrM, yldRel, yldImp, _sz, tableTransp)
+    f_drawRow(dashTbl, 3, "Oil",    useOil,    oilDataOk, oilDir, oilScore, oilCorrS, oilCorrM, oilRel, oilImp, _sz, tableTransp)
+    f_drawRow(dashTbl, 4, "Silver", useSilver, slvDataOk, slvDir, slvScore, slvCorrS, slvCorrM, slvRel, slvImp, _sz, tableTransp)
+
+    // 集計行
+    table.cell(dashTbl, 0, 5, "LONG票",      text_color = color.white, bgcolor = _base, text_size = _sz)
+    table.cell(dashTbl, 1, 5, str.tostring(longVotes),  text_color = color.white, bgcolor = color.new(colLong, tableTransp), text_size = _sz)
+    table.cell(dashTbl, 2, 5, "SHORT票",     text_color = color.white, bgcolor = _base, text_size = _sz)
+    table.cell(dashTbl, 3, 5, str.tostring(shortVotes), text_color = color.white, bgcolor = color.new(colShort, tableTransp), text_size = _sz)
+    table.cell(dashTbl, 4, 5, "有効方向票",  text_color = color.white, bgcolor = _base, text_size = _sz)
+    table.cell(dashTbl, 5, 5, str.tostring(effectiveVotes), text_color = color.white, bgcolor = _base, text_size = _sz)
+    table.cell(dashTbl, 6, 5, "中立 " + str.tostring(neutralCount) + " / 除外 " + str.tostring(excludedCount), text_color = color.white, bgcolor = color.new(colNeutral, tableTransp), text_size = _sz)
+
+    // 最終判定行
+    color _jc = f_judgeColor(judgeCode, tableTransp)
+    table.cell(dashTbl, 0, 6, "最終判定", text_color = color.white, bgcolor = _base, text_size = _sz)
+    table.cell(dashTbl, 1, 6, f_judgeText(judgeCode), text_color = f_judgeTextColor(judgeCode), bgcolor = _jc, text_size = _sz)
+    table.cell(dashTbl, 2, 6, "", text_color = color.white, bgcolor = _jc, text_size = _sz)
+    table.cell(dashTbl, 3, 6, "", text_color = color.white, bgcolor = _jc, text_size = _sz)
+    table.cell(dashTbl, 4, 6, "", text_color = color.white, bgcolor = _jc, text_size = _sz)
+    table.cell(dashTbl, 5, 6, "", text_color = color.white, bgcolor = _jc, text_size = _sz)
+    table.cell(dashTbl, 6, 6, rtMode ? "RT (未確定足)" : "確定足", text_color = f_judgeTextColor(judgeCode), bgcolor = _jc, text_size = _sz)
+
+// ============================================================
+//  17. アラート
+// ------------------------------------------------------------
+//  総合判定が「その状態へ新しく切り替わった最初の1回」だけ発生する。
+//  同じ状態が継続している間は再発火しない (prevJudge を確定足で更新)。
+// ============================================================
+var int prevJudge = 0
+bool judgeChanged = judgeCode != prevJudge
+
+bool alertStrongLong  = judgeChanged and judgeCode == 1
+bool alertStrongShort = judgeChanged and judgeCode == 2
+bool alertLongBias    = judgeChanged and judgeCode == 3
+bool alertShortBias   = judgeChanged and judgeCode == 4
+bool alertConflict    = judgeChanged and judgeCode == 5
+
+if barstate.isconfirmed
+    prevJudge := judgeCode
+
+alertcondition(alertStrongLong,  title = "STRONG LONG へ切替",  message = "{{ticker}} : Gold Intermarket 判定が STRONG LONG へ切り替わりました")
+alertcondition(alertStrongShort, title = "STRONG SHORT へ切替", message = "{{ticker}} : Gold Intermarket 判定が STRONG SHORT へ切り替わりました")
+alertcondition(alertLongBias,    title = "LONG優勢 へ切替",     message = "{{ticker}} : Gold Intermarket 判定が LONG優勢 へ切り替わりました")
+alertcondition(alertShortBias,   title = "SHORT優勢 へ切替",    message = "{{ticker}} : Gold Intermarket 判定が SHORT優勢 へ切り替わりました")
+alertcondition(alertConflict,    title = "CONFLICT へ切替",     message = "{{ticker}} : Gold Intermarket 判定が CONFLICT へ切り替わりました")
