@@ -1,0 +1,1402 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  SAT MTF Background Strategy  (15s / 30s / 1m)
+// ============================================================================
+//  ベース : SAT PANEL Approximation        … STB / LINE1 / LINE2 / 背景判定
+//  Zone   : FVG + Zone Engine Strategy     … ZoneEngine / TradePlan / Risk / Qty
+//
+//  ★ チャート時間足は 15秒足 前提 ★
+//
+//  Entry の中心は「15s / 30s / 1m SAT Background State Machine」。
+//  SignalEngine は使わない (SAT背景 State Machine が Entry Signal そのもの)。
+//
+//  構成:
+//    01. ALL INPUTS
+//         01-1 SAT PANEL (正式ロジック)
+//         01-2 MTF / Entry
+//         01-3 SL/TP Mode  (ZONE / FIXED)
+//         01-4 Zone Engine (ZONE モード用)
+//         01-5 Trade Engine (Risk / Qty / Order)
+//         01-6 Display / Debug
+//    02. SAT PANEL 計算関数 (チャート足と HTF で完全に同一の関数を使う)
+//    03. SAT 背景 : 15s / 30s / 1m
+//    04. ENTRY STATE MACHINE (LONG / SHORT 独立)
+//    05. ZONE ENGINE (ZONE モードのみ)
+//    06. RISK / QTY
+//    07. TRADE ENGINE (SL/TP 決定 → Qty → strategy.entry → strategy.exit)
+//    08. ORDER EXECUTION + State Reset
+//    09. DISPLAY / DEBUG
+//
+// ----------------------------------------------------------------------------
+//  ■ SAT PANEL 側について (元ファイルを正として扱っている範囲)
+//
+//   本 Strategy が使うのは元ファイルの「正式ライン」だけである。
+//   計算式は元ファイルからそのまま持ち込んでおり、置き換えていない。
+//
+//     STB    … 正式 STB = Donchian (表示期間 / 転換期間を分離)
+//              ・表示バンド : ta.highest(high, 表示期間) / ta.lowest(low, 表示期間)
+//              ・転換判定   : 当該足を含める前のレンジ [1] を high / low のヒゲで突破
+//              ・上抜けを先に判定し、下抜けは else if。同一バーで両方なら上抜け優先
+//              ・ATR / EMA / 平滑化 / Supertrend / 確認本数は一切かけない
+//     LINE1  … EMA ATR Breakout Band の表示バンド
+//              ＋ 価格State方式「専用転換Band＋確認」(元ファイルの標準初期値)
+//     LINE2  … EMA ATR Breakout Band の表示バンド (ST表示候補 相当の値)
+//              ＋ 価格State方式「Supertrend非対称＋高ボラ補正」(元ファイルの標準初期値)
+//              ＋ 色判定方式「終値 vs 最終LINE2」→ これが正式 LINE2 方向
+//     背景   … 「価格が3本すべてを突破」
+//              青 : 判定ソース > STB表示値 / LINE1表示値 / LINE2表示値 の3本すべて
+//              赤 : 判定ソース < 上記3本すべて
+//              フラット : どちらでもない / いずれかが na
+//
+//   ■ 元ファイルから持ち込んでいないもの (Entry結果に影響しないため)
+//     ・比較表示モード (上下バンド比較 / 固定ATR比較 / STB構造比較 など)
+//     ・CSV検証プリセット切替 UI と、その対象になっていた旧候補系列
+//     ・旧 Supertrend STB / ATR Trailing / EMA+ATR Band などの「他方式」
+//     ・15m / 1H / 4H / D / W の MTF 参考表示 (request.security を 5 本消費するため)
+//     ・接近挙動マーカー / 転換確認マーカー などの診断描画
+//     いずれも元ファイルでも正式ラインの計算には使われていない比較・診断用機能で、
+//     STB / LINE1 / LINE2 / 背景 の計算式そのものには一切手を入れていない。
+//     正式ラインのパラメータは元ファイルの標準初期値をそのまま input として残してある。
+//
+// ----------------------------------------------------------------------------
+//  ■ リペイント防止
+//   ・Entry Signal は必ず「確定した15秒足」で決定する (barstate.isconfirmed)。
+//   ・30秒 / 1分の背景は request.security(..., lookahead_off) の内部で [1] を掛け、
+//     「最後に確定した HTF バー」の値だけを使う。形成中 HTF は絶対に使わない。
+//   ・lookahead_on は使用しない。未来参照なし。
+//   ・過去バーの Entry 位置が後から変わる実装は入れていない。
+//
+//  ■ 30秒 / 1分の SAT 計算について (重要)
+//   15秒足で計算したラインを流用していない。f_satPanel() を
+//   request.security() の「中」で評価しているため、STB / LINE1 / LINE2 /
+//   背景のすべてが、その時間足自身の OHLC から独立に再計算される。
+//   30秒・1分はラインを描画しないので、必要な「背景 State」だけを
+//   それぞれ 1 回の request.security() で取得している (SAT 側の追加 request は 2 本のみ)。
+// ============================================================================
+
+//@version=5
+strategy(
+     title             = "SAT MTF Background Strategy (15s/30s/1m)",
+     shorttitle        = "SAT-MTF",
+     overlay           = true,
+     pyramiding        = 100,
+     initial_capital   = 1000,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     dynamic_requests  = true,
+     max_boxes_count   = 500,
+     max_labels_count  = 500,
+     max_lines_count   = 200
+ )
+
+// ★★★ Library import ★★★
+//  ZONE モードで使う。ZoneEngine の Zone 生成ロジックは変更しない。
+import sekine3310/ZoneEngine/9 as zn
+
+// Library 内の定数と同じ値 (定数 export は Pine のバージョン依存機能のため再宣言する)
+int ST_ACTIVE  = 0
+int ST_SUPPORT = 1
+int ST_RESIST  = 2
+int ST_BROKEN  = 3
+int SR_WEAK    = 1
+int SR_MEDIUM  = 2
+int SR_STRONG  = 3
+int SR_VSTRONG = 4
+
+// 背景 State
+int BG_BLUE = 1
+int BG_FLAT = 0
+int BG_RED  = -1
+
+// Entry State Machine
+//   LONG  : 0 WAIT_INITIAL / 1 ARMED(青を見た) / 2 SAW_FLAT / 3 SAW_RED
+//   SHORT : 0 WAIT_INITIAL / 1 ARMED(赤を見た) / 2 SAW_FLAT / 3 SAW_BLUE
+int ST_WAIT  = 0
+int ST_ARMED = 1
+int ST_FLAT  = 2
+int ST_OPP   = 3
+
+string LOGIC_ID = "SAT"
+
+// ============================================================================
+// 01. ALL INPUTS
+// ============================================================================
+
+// ---- 01-1 SAT PANEL : STB (正式 = Donchian) -------------------------------
+var string G_STB = "01 · SAT · STB (Donchian)"
+stbDcDisplayLen = input.int(10, "STB Donchian 表示期間", minval = 1, maxval = 500, group = G_STB,
+     tooltip = "表示するバンドの本数。UP は この期間の安値 (ta.lowest)、DOWN は この期間の高値 (ta.highest) を表示価格にする。\n方向転換の判定には使わない。")
+stbDcStateLen   = input.int(20, "STB Donchian 転換期間", minval = 1, maxval = 500, group = G_STB,
+     tooltip = "方向転換の判定に使う本数。表示期間とは独立。\n当該足を含める前のレンジ ta.highest(high, 転換期間)[1] / ta.lowest(low, 転換期間)[1] を基準にする。\n判定は high / low のヒゲで行い、close は使わない。")
+
+// ---- 01-1 SAT PANEL : LINE1 -----------------------------------------------
+var string G_L1 = "01 · SAT · LINE1"
+l1SrcType   = input.string("close", "LINE1 ソース", options = ["hl2", "close", "open", "hlc3", "ohlc4", "hlcc4"], group = G_L1)
+l1EmaLen    = input.int(1,   "LINE1 EMA期間",  minval = 1, maxval = 500, group = G_L1)
+l1AtrLen    = input.int(58,  "LINE1 ATR期間",  minval = 1, maxval = 500, group = G_L1)
+l1DpMult    = input.float(3.0, "LINE1 表示ATR倍率", minval = 0.1, maxval = 20.0, step = 0.1, group = G_L1)
+l1Smooth    = input.bool(true, "LINE1 表示バンド平滑化", group = G_L1)
+l1SmoothLen = input.int(24,  "LINE1 平滑化期間", minval = 1, maxval = 200, group = G_L1)
+
+var string G_L1S = "01 · SAT · LINE1 専用転換Band (価格State)"
+l1StateSrcType     = input.string("close", "LINE1 専用転換ソース", options = ["close", "hl2", "open", "hlc3", "ohlc4", "hlcc4"], group = G_L1S)
+l1StateUpEmaLen    = input.int(55,  "DOWN→UP 転換EMA期間", minval = 1, maxval = 500, group = G_L1S)
+l1StateUpAtrLen    = input.int(10,  "DOWN→UP 転換ATR期間", minval = 1, maxval = 500, group = G_L1S)
+l1StateUpMult      = input.float(4.0,  "DOWN→UP 転換ATR倍率", minval = 0.1, maxval = 20.0, step = 0.01, group = G_L1S)
+l1StateUpSmooth    = input.bool(true,  "DOWN→UP 転換Band平滑化", group = G_L1S)
+l1StateUpSmoothLen = input.int(30,  "DOWN→UP 転換平滑化期間", minval = 1, maxval = 200, group = G_L1S)
+l1StateUpConfirm   = input.int(3,   "DOWN→UP 確認本数", minval = 1, maxval = 10, group = G_L1S)
+l1StateDnEmaLen    = input.int(34,  "UP→DOWN 転換EMA期間", minval = 1, maxval = 500, group = G_L1S)
+l1StateDnAtrLen    = input.int(58,  "UP→DOWN 転換ATR期間", minval = 1, maxval = 500, group = G_L1S)
+l1StateDnMult      = input.float(3.75, "UP→DOWN 転換ATR倍率", minval = 0.1, maxval = 20.0, step = 0.01, group = G_L1S)
+l1StateDnSmooth    = input.bool(true,  "UP→DOWN 転換Band平滑化", group = G_L1S)
+l1StateDnSmoothLen = input.int(20,  "UP→DOWN 転換平滑化期間", minval = 1, maxval = 200, group = G_L1S)
+l1StateDnConfirm   = input.int(4,   "UP→DOWN 確認本数", minval = 1, maxval = 10, group = G_L1S)
+
+// ---- 01-1 SAT PANEL : LINE2 -----------------------------------------------
+//  元ファイルの標準初期値 = CSV検証プリセット「ST表示候補」相当:
+//    close → EMA2 → ATR30 → ATR を EMA40 で平滑化 → ×1.675 → 上下バンドを EMA9 で平滑化
+var string G_L2 = "01 · SAT · LINE2"
+l2SrcType      = input.string("close", "LINE2 ソース", options = ["hl2", "close", "open", "hlc3", "ohlc4", "hlcc4"], group = G_L2)
+l2EmaLen       = input.int(2,   "LINE2 EMA期間", minval = 1, maxval = 500, group = G_L2)
+l2AtrLen       = input.int(30,  "LINE2 ATR期間", minval = 1, maxval = 500, group = G_L2)
+l2DpMult       = input.float(1.675, "LINE2 表示ATR倍率", minval = 0.1, maxval = 20.0, step = 0.001, group = G_L2)
+l2AtrSmooth    = input.bool(true, "LINE2 表示用ATR平滑化", group = G_L2)
+l2AtrSmoothLen = input.int(40,  "LINE2 表示用ATR平滑化期間", minval = 1, maxval = 200, group = G_L2)
+l2Smooth       = input.bool(true, "LINE2 表示バンド平滑化", group = G_L2)
+l2SmoothLen    = input.int(9,   "LINE2 平滑化期間", minval = 1, maxval = 200, group = G_L2)
+
+var string G_L2S = "01 · SAT · LINE2 非対称ST (価格State)"
+l2PsAsymSrcType = input.string("close", "非対称ST ソース", options = ["close", "hl2", "open", "hlc3", "ohlc4", "hlcc4"], group = G_L2S)
+l2PsAsymAtrLen  = input.int(43,   "非対称ST ATR期間", minval = 1, maxval = 500, group = G_L2S)
+l2PsAsymUpFac   = input.float(4.83, "非対称ST 上昇Factor (DOWN→UP)", minval = 0.1, maxval = 20.0, step = 0.01, group = G_L2S)
+l2PsAsymDnFac   = input.float(4.71, "非対称ST 下降Factor (通常)",    minval = 0.1, maxval = 20.0, step = 0.01, group = G_L2S)
+l2PsAsymDnFacHV = input.float(4.49, "非対称ST 下降Factor (高ボラ)",  minval = 0.1, maxval = 20.0, step = 0.01, group = G_L2S)
+l2PsAsymVolTh   = input.float(0.0018, "非対称ST 高ボラしきい値 (ATR/close)", minval = 0.0, maxval = 1.0, step = 0.0001, group = G_L2S)
+l2PsAsymFilter  = input.int(2,    "非対称ST 確認本数", minval = 1, maxval = 10, group = G_L2S)
+
+// ---- 01-1 SAT PANEL : 背景 / EMA ------------------------------------------
+var string G_BG = "01 · SAT · 背景"
+bgSrcMode = input.string("close", "背景判定ソース",
+     options = ["close", "high/low", "ローソク足全体"], group = G_BG,
+     tooltip = "「価格が3本すべてを突破」方式の判定ソース。\nclose (既定) : 終値が 3 本すべてより上／下\nhigh/low : 高値が 3 本すべてより上 (青) ／ 安値が 3 本すべてより下 (赤)\nローソク足全体 : 安値が 3 本すべてより上 (青) ／ 高値が 3 本すべてより下 (赤)\n★ 15s / 30s / 1m すべて同じ設定で判定する。")
+useConfirmed = input.bool(true, "確定足のみで判定 (リペイント防止)", group = G_BG,
+     tooltip = "ON : 15秒足が確定したタイミングでのみ方向 State を更新する。\n30秒 / 1分は常に確定 HTF バーのみを参照する (この設定に関係なく固定)。")
+bgBuyCol  = input.color(color.rgb(38, 198, 218), "青 (Buy) 背景色",  group = G_BG)
+bgSellCol = input.color(color.rgb(255, 82, 82),  "赤 (Sell) 背景色", group = G_BG)
+bgTransp  = input.int(85, "背景の透明度", minval = 0, maxval = 100, group = G_BG)
+
+var string G_MA = "01 · SAT · 移動平均線"
+showMa    = input.bool(true, "移動平均線を表示", group = G_MA)
+maType    = input.string("EMA", "MA 種別", options = ["EMA", "SMA", "RMA", "WMA"], group = G_MA)
+maLen     = input.int(200, "MA 期間", minval = 1, maxval = 1000, group = G_MA)
+maSrcType = input.string("close", "MA ソース", options = ["hl2", "close", "open", "hlc3", "ohlc4", "hlcc4"], group = G_MA)
+maWidth   = input.int(2, "MA 線幅", minval = 1, maxval = 5, group = G_MA)
+maUpCol   = input.color(color.rgb(38, 198, 218),  "MA 上昇色", group = G_MA)
+maDnCol   = input.color(color.rgb(255, 82, 82),   "MA 下降色", group = G_MA)
+maFlatCol = input.color(color.rgb(149, 152, 161), "MA 中立色", group = G_MA)
+
+var string G_LINEDISP = "01 · SAT · ライン表示"
+showStb = input.bool(true, "STB ラインを表示", group = G_LINEDISP)
+showL1  = input.bool(true, "LINE1 を表示",     group = G_LINEDISP)
+showL2  = input.bool(true, "LINE2 を表示",     group = G_LINEDISP)
+stbWidth = input.int(2, "STB 線幅",   minval = 1, maxval = 5, group = G_LINEDISP)
+l1Width  = input.int(2, "LINE1 線幅", minval = 1, maxval = 5, group = G_LINEDISP)
+l2Width  = input.int(2, "LINE2 線幅", minval = 1, maxval = 5, group = G_LINEDISP)
+satUpCol = input.color(color.rgb(38, 198, 218), "上昇色 (共通)", group = G_LINEDISP)
+satDnCol = input.color(color.rgb(255, 82, 82),  "下降色 (共通)", group = G_LINEDISP)
+
+// ---- 01-2 MTF / Entry ------------------------------------------------------
+var string G_MTF = "02 · MTF · 時間足"
+satTf30 = input.timeframe("30S", "30秒足 の時間足指定", group = G_MTF,
+     tooltip = "この時間足のコンテキスト内で STB / LINE1 / LINE2 / 背景 をすべて再計算する。\n15秒足のラインを流用しない。")
+satTf1m = input.timeframe("1",   "1分足 の時間足指定",  group = G_MTF,
+     tooltip = "この時間足のコンテキスト内で STB / LINE1 / LINE2 / 背景 をすべて再計算する。")
+
+var string G_DIR = "02 · MTF · Direction"
+enableLong  = input.bool(true, "Enable Long",  group = G_DIR)
+enableShort = input.bool(true, "Enable Short", group = G_DIR)
+
+// ---- 01-3 SL / TP ----------------------------------------------------------
+var string G_SLTPM = "03 · SLTP Mode"
+sltpMode = input.string("FIXED", "SLTP Mode", options = ["ZONE", "FIXED"], group = G_SLTPM,
+     tooltip = "Entry ロジックはこの設定で一切変わらない。同じ SAT Entry Signal を使い、SL/TP の決め方だけを切り替える。\nZONE  : ZoneEngine の Structural SL / TP (TradePlan)\nFIXED : 固定ドル幅")
+fixedSlDollar = input.float(15.0, "Fixed SL ($)", minval = 0.01, step = 0.1, group = G_SLTPM)
+fixedTpDollar = input.float(20.0, "Fixed TP ($)", minval = 0.01, step = 0.1, group = G_SLTPM)
+
+bool useZoneSltp = sltpMode == "ZONE"
+
+// ---- 01-4 Zone Engine ------------------------------------------------------
+//  ZONE モードのときだけ使う。Zone 生成ロジックは ZoneEngine のまま変更しない。
+var string G_ZONE = "04 · Zone Geometry"
+zoneHalfWidth = input.float(5.0, "Zone Half Width ($)", minval = 0.1, step = 0.5, group = G_ZONE)
+
+var string G_ZMA = "04 · Zone · MA Source"
+maTf = input.timeframe("1", "MA Timeframe", group = G_ZMA)
+zMaType = input.string("EMA", "MA Type", options = ["SMA", "EMA"], group = G_ZMA)
+useMaSource = input.bool(true, "Enable MA Source", group = G_ZMA)
+ma1Len = input.int(2000, "MA #1 Length", minval = 1, maxval = 4999, group = G_ZMA)
+ma2Len = input.int(3000, "MA #2 Length", minval = 1, maxval = 4999, group = G_ZMA)
+slopeLookback = input.int(60, "Slope Lookback (MA TF bars)", minval = 1, group = G_ZMA)
+scoreMa1 = input.float(2.0, "Base Score · MA #1", step = 0.5, group = G_ZMA)
+scoreMa2 = input.float(2.0, "Base Score · MA #2", step = 0.5, group = G_ZMA)
+
+var string G_ZSLOPE = "04 · Zone · MA Slope"
+slopeThrMod       = input.float(1.0, "Slope Threshold · Moderate ($/lookback)", step = 0.1, group = G_ZSLOPE)
+slopeThrStrong    = input.float(3.0, "Slope Threshold · Strong ($/lookback)",   step = 0.1, group = G_ZSLOPE)
+slopeBonusFlat    = input.float(0.0, "Slope Bonus · Flat",     step = 0.5, group = G_ZSLOPE)
+slopeBonusMod     = input.float(1.0, "Slope Bonus · Moderate", step = 0.5, group = G_ZSLOPE)
+slopeBonusStr     = input.float(2.0, "Slope Bonus · Strong",   step = 0.5, group = G_ZSLOPE)
+slopeBonusMode    = input.string("Sum (per MA)", "Slope Bonus Aggregation in Cluster", options = ["Sum (per MA)", "Max"], group = G_ZSLOPE)
+maClusterDist     = input.float(20.0, "MA Cluster Distance ($)", step = 1.0, group = G_ZSLOPE)
+maClusterBonus    = input.float(1.0,  "MA Cluster Bonus",        step = 0.5, group = G_ZSLOPE)
+maClusterDirBonus = input.float(1.0,  "MA Cluster Bonus · Same Slope", step = 0.5, group = G_ZSLOPE)
+
+var string G_ZHZ = "04 · Zone · Horizontal Source (Swing)"
+useHzSource = input.bool(true, "Enable Horizontal Source", group = G_ZHZ)
+hzTf1 = input.timeframe("5",  "Horizontal TF #1", group = G_ZHZ)
+hzTf2 = input.timeframe("15", "Horizontal TF #2", group = G_ZHZ)
+hzTf3 = input.timeframe("60", "Horizontal TF #3", group = G_ZHZ)
+pivLen1 = input.int(10, "Swing Pivot Length · TF #1", minval = 1, group = G_ZHZ)
+pivLen2 = input.int(8,  "Swing Pivot Length · TF #2", minval = 1, group = G_ZHZ)
+pivLen3 = input.int(6,  "Swing Pivot Length · TF #3", minval = 1, group = G_ZHZ)
+scoreHz1 = input.float(1.0, "Base Score · TF #1 Swing", step = 0.5, group = G_ZHZ)
+scoreHz2 = input.float(2.0, "Base Score · TF #2 Swing", step = 0.5, group = G_ZHZ)
+scoreHz3 = input.float(3.0, "Base Score · TF #3 Swing", step = 0.5, group = G_ZHZ)
+
+var string G_ZREACT = "04 · Zone · Horizontal Reaction"
+reactionDist      = input.float(20.0, "Reaction Distance ($)", step = 0.5, group = G_ZREACT)
+reactionBonus1    = input.float(1.0,  "Reaction Bonus · 1 time",   step = 0.5, group = G_ZREACT)
+reactionBonus2    = input.float(2.0,  "Reaction Bonus · 2 times",  step = 0.5, group = G_ZREACT)
+reactionBonus3    = input.float(3.0,  "Reaction Bonus · 3+ times", step = 0.5, group = G_ZREACT)
+reactionRearmDist = input.float(10.0, "Reaction Re-arm Distance ($)", step = 0.5, group = G_ZREACT)
+reactionAllSrc    = input.bool(false, "Track Reaction on Accum / DayHL too", group = G_ZREACT)
+
+var string G_ZDHL = "04 · Zone · Day High / Low"
+useDayHL = input.bool(true, "Enable Day High / Low Source", group = G_ZDHL)
+dayTz        = input.string("Asia/Tokyo", "Day Session Timezone", group = G_ZDHL)
+dayResetHour = input.int(5, "Day Reset Hour", minval = 0, maxval = 23, group = G_ZDHL)
+scoreDayHL     = input.float(3.0, "Base Score · Day High / Low", step = 0.5, group = G_ZDHL)
+carryPrevDayHL = input.bool(false, "Carry Previous Day H/L as Horizontal Zone", group = G_ZDHL)
+scorePrevDayHL = input.float(2.0, "Base Score · Carried Prev Day H/L", step = 0.5, group = G_ZDHL)
+lifePrevDayHL  = input.float(5.0, "Lifetime · Carried Prev Day H/L (days)", step = 1.0, group = G_ZDHL)
+
+var string G_ZACC = "04 · Zone · Accumulation"
+useAccSource = input.bool(true, "Enable Accumulation Source", group = G_ZACC)
+accumModule  = input.string("Accum Box (ported)", "Accum Detection Module", options = ["Accum Box (ported)", "Provisional ATR (暫定)"], group = G_ZACC)
+accTf1 = input.timeframe("60",  "Accum TF #1", group = G_ZACC)
+accTf2 = input.timeframe("240", "Accum TF #2", group = G_ZACC)
+accTf3 = input.timeframe("D",   "Accum TF #3", group = G_ZACC)
+scoreAcc1 = input.float(3.0, "Base Score · TF #1 Accum", step = 0.5, group = G_ZACC)
+scoreAcc2 = input.float(4.0, "Base Score · TF #2 Accum", step = 0.5, group = G_ZACC)
+scoreAcc3 = input.float(5.0, "Base Score · TF #3 Accum", step = 0.5, group = G_ZACC)
+accKeep1 = input.int(3, "Keep Count · TF #1 Accum", minval = 1, group = G_ZACC)
+accKeep2 = input.int(2, "Keep Count · TF #2 Accum", minval = 1, group = G_ZACC)
+accKeep3 = input.int(1, "Keep Count · TF #3 Accum", minval = 1, group = G_ZACC)
+
+var string G_ZACCP = "04a · Zone · Accum Box Parameters"
+accumRangeLen        = input.int(10,  "Accum判定レンジ本数", minval = 6,  group = G_ZACCP)
+accumBaseLen         = input.int(20,  "基準平均本数",        minval = 10, group = G_ZACCP)
+accumAtrLen          = input.int(14,  "ATR本数",            minval = 1,  group = G_ZACCP)
+accumMinUpperCloses  = input.int(4,   "上半分の最低終値本数", minval = 1,  group = G_ZACCP)
+accumMinLowerCloses  = input.int(4,   "下半分の最低終値本数", minval = 1,  group = G_ZACCP)
+accumMaxSameColorRun = input.int(4,   "同色連続の上限",      minval = 1,  group = G_ZACCP)
+accumAtrMult         = input.float(2.5,  "Accum レンジ幅 / ATR 上限",    minval = 0.5,  step = 0.1,  group = G_ZACCP)
+accumBarRatioMax     = input.float(0.70, "Accum 平均値幅/基準平均 上限", minval = 0.1,  step = 0.01, group = G_ZACCP)
+accumDriftMax        = input.float(0.30, "Accum ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = G_ZACCP)
+
+var string G_ZACCQ = "04b · Zone · Provisional ATR Accum (暫定)"
+accLen1 = input.int(20, "[暫定] Accum Lookback · TF #1", minval = 3, group = G_ZACCQ)
+accLen2 = input.int(20, "[暫定] Accum Lookback · TF #2", minval = 3, group = G_ZACCQ)
+accLen3 = input.int(15, "[暫定] Accum Lookback · TF #3", minval = 3, group = G_ZACCQ)
+accMult = input.float(1.2, "[暫定] Accum Max Range / ATR", step = 0.1, minval = 0.1, group = G_ZACCQ)
+
+var string G_ZCLU = "04 · Zone · Cluster / Score"
+clusterDist = input.float(20.0, "Cluster Distance ($)", step = 1.0, group = G_ZCLU)
+thrMedium   = input.float(5.0,  "Medium Score Threshold",      step = 0.5, group = G_ZCLU)
+thrStrong   = input.float(10.0, "Strong Score Threshold",      step = 0.5, group = G_ZCLU)
+thrVStrong  = input.float(15.0, "Very Strong Score Threshold", step = 0.5, group = G_ZCLU)
+confBonus2  = input.float(1.0, "Confluence Bonus · 2 categories",  step = 0.5, group = G_ZCLU)
+confBonus3  = input.float(2.0, "Confluence Bonus · 3 categories",  step = 0.5, group = G_ZCLU)
+confBonus4  = input.float(3.0, "Confluence Bonus · 4+ categories", step = 0.5, group = G_ZCLU)
+flipBonus   = input.float(2.0, "Flip Bonus", step = 0.5, group = G_ZCLU)
+
+var string G_ZHTF = "04a · Zone · Very Strong · Higher TF Structure"
+requireHtfForVStrong = input.bool(true, "Require Higher TF Structure for Very Strong", group = G_ZHTF)
+htfSwing1H  = input.bool(true,  "Count 1H Swing (TF #3) as Higher TF",    group = G_ZHTF)
+htfAccum1H  = input.bool(true,  "Count 1H Accum (TF #1) as Higher TF",    group = G_ZHTF)
+htfAccum4H  = input.bool(true,  "Count 4H Accum (TF #2) as Higher TF",    group = G_ZHTF)
+htfAccumD   = input.bool(true,  "Count Daily Accum (TF #3) as Higher TF", group = G_ZHTF)
+htfSwing15M = input.bool(false, "Count 15M Swing (TF #2) as Higher TF",   group = G_ZHTF)
+htfMa1      = input.bool(false, "Count MA #1 (2000) as Higher TF",        group = G_ZHTF)
+htfMa2      = input.bool(false, "Count MA #2 (3000) as Higher TF",        group = G_ZHTF)
+htfDayHL    = input.bool(false, "Count Day High / Low as Higher TF",      group = G_ZHTF)
+
+var string G_ZBF = "04 · Zone · Break / Flip"
+breakTf         = input.timeframe("5", "Break Evaluation Timeframe", group = G_ZBF,
+     tooltip = "Break はヒゲではなくこの時間足の確定終値で判定する。")
+breakBuffer     = input.float(5.0,  "Break Buffer ($)",          step = 0.5, group = G_ZBF)
+flipConfirmDist = input.float(10.0, "Flip Confirm Distance ($)", step = 0.5, group = G_ZBF)
+resetOnReclaim  = input.bool(true,  "Reset Broken on Reclaim", group = G_ZBF)
+trackStaleBars  = input.int(500, "Zone State Retention (bars without match)", minval = 10, group = G_ZBF)
+trackContinuity = input.float(0.5, "Zone Track · Min Source Continuity", minval = 0.01, maxval = 1.0, step = 0.05, group = G_ZBF)
+
+var string G_ZLIFE = "04 · Zone · Lifetime"
+lifeHz1         = input.float(5.0,  "Lifetime · TF #1 Horizontal (days)", step = 0.5, group = G_ZLIFE)
+lifeHz2         = input.float(10.0, "Lifetime · TF #2 Horizontal (days)", step = 0.5, group = G_ZLIFE)
+lifeHz3         = input.float(30.0, "Lifetime · TF #3 Horizontal (days)", step = 0.5, group = G_ZLIFE)
+lifeExtendOn    = input.bool(true,  "Extend Lifetime on Reaction / Flip", group = G_ZLIFE)
+lifeExtendRatio = input.float(0.5,  "Lifetime Extension Ratio", step = 0.1, minval = 0.0, group = G_ZLIFE)
+maxPersistZones = input.int(200, "Max Persistent Raw Zones", minval = 20, maxval = 800, group = G_ZLIFE)
+
+var string G_ZSLTP = "04 · Zone · Structural SL / TP"
+slBuffer    = input.float(5.0,  "SL Buffer ($)", step = 0.5, group = G_ZSLTP)
+tpBuffer    = input.float(0.0,  "TP Buffer ($)", step = 0.5, group = G_ZSLTP)
+maxSlDist   = input.float(30.0, "Maximum SL Distance ($)", step = 1.0, group = G_ZSLTP)
+minStructRR = input.float(1.0,  "Minimum Structural RR", step = 0.1, group = G_ZSLTP,
+     tooltip = "Structural TP が存在する場合、この値未満の RR ならエントリー禁止 (固定RR TPへ逃げない)。")
+tpMode = input.string("BOTH", "TP Mode", options = ["BOTH", "STRUCTURAL_ONLY", "FALLBACK_ONLY"], group = G_ZSLTP,
+     tooltip = "BOTH            : Structural TP があればそれを使い、無ければ Fallback RR TP。\nSTRUCTURAL_ONLY : Structural TP が存在するトレードのみ発注。\nFALLBACK_ONLY   : Structural TP が存在しなかったシグナルのみ Fallback RR TP で発注。")
+slMinScore   = input.float(4.0, "SL Zone Min Score", step = 0.5, group = G_ZSLTP)
+slMinStrStr  = input.string("Medium", "SL Zone Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_ZSLTP)
+tpMinScore   = input.float(7.0, "TP Zone Min Score", step = 0.5, group = G_ZSLTP)
+tpMinStrStr  = input.string("Strong", "TP Zone Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_ZSLTP)
+obsMinStrStr = input.string("Medium", "Obstacle Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_ZSLTP)
+activeNoTradeMinStrStr = input.string("Medium", "Active Zone NoTrade · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_ZSLTP)
+structuralTpDepthRatio = input.float(0.25, "Structural TP Zone Depth", minval = 0.0, maxval = 1.0, step = 0.25, group = G_ZSLTP,
+     tooltip = "Structural TP を TP Zone 内のどの位置に置くかを Zone 幅比率で指定する。Long / Short は完全対称。\n  Long  (Resistance Zone) : 0.00 = Zone下端 / 0.50 = 中央 / 1.00 = Zone上端\n  Short (Support Zone)    : 0.00 = Zone上端 / 0.50 = 中央 / 1.00 = Zone下端")
+fallbackRR = input.float(2.0, "Fallback RR", step = 0.1, minval = 0.1, group = G_ZSLTP,
+     tooltip = "有効な TP Zone が見つからない場合のみ、Structural SL 距離 × この値で TP を作る。")
+
+// ---- 01-5 Trade Engine -----------------------------------------------------
+var string G_RISK = "05 · Trade Engine · Risk"
+riskPct     = input.float(1.0, "1トレード損失率 (%)", step = 0.1, minval = 0.0, group = G_RISK,
+     tooltip = "Risk Capital ÷ SL距離 で Qty を計算する。\nZONE  : Structural SL までの距離を Risk として使用\nFIXED : Fixed SL の距離を Risk として使用")
+useCompound = input.bool(false, "複利 (残高ベース) ※OFF=元金単利", group = G_RISK)
+qtyStep     = input.float(0.01, "Qty 刻み (最小ロット単位)", minval = 0.00000001, step = 0.01, group = G_RISK)
+qtyMin      = input.float(0.01, "Qty 最小値 (これ未満はエントリーしない)", minval = 0.0, step = 0.01, group = G_RISK)
+
+var string G_TE = "05 · Trade Engine · Order"
+maxOpenTrades      = input.int(1, "最大同時保有トレード数", minval = 1, maxval = 50, group = G_TE)
+allowOppositeEntry = input.bool(false, "反対方向の同時Entryを許可", group = G_TE,
+     tooltip = "TradingView Strategy は単一ネットポジションのため、反対方向 Entry は既存 Trade を打ち消す。既定 (false) では SKIP する。")
+
+// ---- 01-6 Display / Debug --------------------------------------------------
+var string G_DBG = "06 · Display / Debug"
+showEntryLabel = input.bool(true,  "Entry Label を表示", group = G_DBG)
+showDebugTable = input.bool(true,  "Debug Table を表示", group = G_DBG)
+dbgTextSize    = input.string("tiny", "Debug Table 文字サイズ", options = ["tiny", "small", "normal"], group = G_DBG)
+showZones      = input.bool(false, "Zone Box を表示 (ZONEモードのみ)", group = G_DBG)
+maxZonesDraw   = input.int(30, "Max Zones Drawn", minval = 1, maxval = 120, group = G_DBG)
+zoneLeftBars   = input.int(150, "Zone Box · Left Extension (bars)",  minval = 1, group = G_DBG)
+zoneRightBars  = input.int(30,  "Zone Box · Right Extension (bars)", minval = 1, group = G_DBG)
+colSupport     = input.color(color.new(#26A69A, 0), "Color · Support",    group = G_DBG)
+colResistance  = input.color(color.new(#EF5350, 0), "Color · Resistance", group = G_DBG)
+colActive      = input.color(color.new(#FFB300, 0), "Color · Active",     group = G_DBG)
+colBroken      = input.color(color.new(#78909C, 0), "Color · Broken",     group = G_DBG)
+
+// ============================================================================
+// 02. SAT PANEL 計算関数
+// ----------------------------------------------------------------------------
+//  ★ ここに書かれた計算式は SAT PANEL Approximation の正式ラインそのもの。
+//  ★ この関数を チャート足 (15s) と request.security() の中 (30s / 1m) の
+//    両方から呼ぶため、3つの時間足で判定式が食い違うことが構造的に起きない。
+//  ★ 関数内の var は呼び出し箇所ごとに独立した State を持つ。
+//    15s / 30s / 1m の State が混ざることはない。
+// ============================================================================
+
+// ソース文字列から価格系列を取得する
+f_src(simple string t) =>
+    switch t
+        "close" => close
+        "open"  => open
+        "hl2"   => hl2
+        "hlc3"  => hlc3
+        "ohlc4" => ohlc4
+        "hlcc4" => hlcc4
+        =>         hl2
+
+// 移動平均の種別切り替え
+f_ma(simple string t, float src, simple int len) =>
+    switch t
+        "EMA" => ta.ema(src, len)
+        "SMA" => ta.sma(src, len)
+        "RMA" => ta.rma(src, len)
+        "WMA" => ta.wma(src, len)
+        =>       ta.ema(src, len)
+
+// ----------------------------------------------------------------------------
+// [SAT] 非対称 Supertrend (LINE2 価格State用) ※元ファイルの f_supertrendAsym と同一
+//
+//   stateVolRatio = ta.atr(atrLen) / close
+//   downFactor    = stateVolRatio >= volThreshold ? 高ボラ倍率 : 通常倍率
+//   upperBand     = src + atrVal * upFactor      ← DOWN → UP の判定に使う
+//   lowerBand     = src - atrVal * downFactor    ← UP → DOWN の判定に使う
+//
+//   戻り値: 生方向 (+1 = 上昇 / -1 = 下降)
+//   ※ この Supertrend のライン価格は LINE2 として表示しない。使うのは方向だけ。
+// ----------------------------------------------------------------------------
+f_supertrendAsymDir(float src, simple int atrLen, simple float upFactor, simple float dnFactorNormal, simple float dnFactorHighVol, simple float volThreshold) =>
+    float atrVal   = ta.atr(atrLen)
+    float volRatio = close == 0 ? float(na) : atrVal / close
+    float dnFactor = nz(volRatio, 0.0) >= volThreshold ? dnFactorHighVol : dnFactorNormal
+    float upperBand = src + atrVal * upFactor
+    float lowerBand = src - atrVal * dnFactor
+    float prevUpper = nz(upperBand[1])
+    float prevLower = nz(lowerBand[1])
+    // トレーリング処理は元ファイルの f_supertrend() と完全に同じ式
+    lowerBand := lowerBand > prevLower or close[1] < prevLower ? lowerBand : prevLower
+    upperBand := upperBand < prevUpper or close[1] > prevUpper ? upperBand : prevUpper
+    int   dirRaw = na
+    float stLine = na
+    float prevSt = stLine[1]
+    if na(atrVal[1])
+        dirRaw := -1
+    else if prevSt == prevUpper
+        dirRaw := close > upperBand ?  1 : -1
+    else
+        dirRaw := close < lowerBand ? -1 :  1
+    stLine := dirRaw == 1 ? lowerBand : upperBand
+    dirRaw
+
+// ----------------------------------------------------------------------------
+// [SAT] フィルター強度つき方向確定 ※元ファイルの f_filterDir と同一
+//   反対方向の生シグナルが strength 本連続したときだけ方向を転換する。
+// ----------------------------------------------------------------------------
+f_filterDir(int rawDir, simple int strength, bool allowUpdate) =>
+    var int dirState = 0
+    var int oppCount = 0
+    int r = nz(rawDir, 0)
+    if allowUpdate and r != 0
+        if dirState == 0
+            dirState := r
+            oppCount := 0
+        else if r != dirState
+            oppCount := oppCount + 1
+            if oppCount >= strength
+                dirState := r
+                oppCount := 0
+        else
+            oppCount := 0
+    dirState
+
+// ----------------------------------------------------------------------------
+// [SAT] LINE1 専用転換バンド突破＋確認本数による価格 State
+//       ※元ファイルの f_l1SeparateState と同一
+//
+//     State  0 : 初期化。stateMid = (upBand + dnBand) / 2 と終値を比較して即決する。
+//                確認本数は要求しない。
+//     State -1 : close > upBand のバーを数える。upConfirm 本連続で +1 へ。
+//     State +1 : close < dnBand のバーを数える。dnConfirm 本連続で -1 へ。
+//     条件が 1 本でも崩れたバーで、その方向のカウントは 0 に戻る。
+// ----------------------------------------------------------------------------
+f_l1SeparateState(float upBand, float dnBand, simple int upConfirm, simple int dnConfirm, bool allowUpdate) =>
+    var int dirState = 0
+    var int upCount  = 0
+    var int dnCount  = 0
+    bool valid = not na(upBand) and not na(dnBand)
+    if allowUpdate and valid
+        if dirState == 0
+            float stateMid = (upBand + dnBand) / 2
+            if close > stateMid
+                dirState := 1
+            else if close < stateMid
+                dirState := -1
+            upCount := 0
+            dnCount := 0
+        else if dirState == -1
+            if close > upBand
+                upCount := upCount + 1
+                if upCount >= upConfirm
+                    dirState := 1
+                    upCount  := 0
+                    dnCount  := 0
+            else
+                upCount := 0
+        else
+            if close < dnBand
+                dnCount := dnCount + 1
+                if dnCount >= dnConfirm
+                    dirState := -1
+                    upCount  := 0
+                    dnCount  := 0
+            else
+                dnCount := 0
+    dirState
+
+// ----------------------------------------------------------------------------
+// [SAT] SAT PANEL 本体 : STB / LINE1 / LINE2 / 背景 を丸ごと計算する
+//
+//   戻り値 : [背景State, STB表示価格, STB方向, LINE1表示価格, LINE1方向,
+//             LINE2表示価格, LINE2方向]
+//     背景State : 1 = 青 / -1 = 赤 / 0 = フラット
+//
+//   ★ この関数は自分が評価されているコンテキストの OHLC しか見ない。
+//     request.security(tf, f_satPanel(...)) と書けば、その tf の
+//     OHLC から STB / LINE1 / LINE2 / 背景 がすべて再計算される。
+//   ★ ta.*() と var はすべて条件分岐の外・無条件に評価している
+//     (実行されないバーがあると履歴がずれるため)。
+// ----------------------------------------------------------------------------
+f_satPanel(simple int dcDisp, simple int dcState,
+     simple string l1Src, simple int l1Ema, simple int l1Atr, simple float l1Dp, simple bool l1Sm, simple int l1SmLen,
+     simple string l1StSrc,
+     simple int l1UpEma, simple int l1UpAtr, simple float l1UpMul, simple bool l1UpSm, simple int l1UpSmLen, simple int l1UpCfm,
+     simple int l1DnEma, simple int l1DnAtr, simple float l1DnMul, simple bool l1DnSm, simple int l1DnSmLen, simple int l1DnCfm,
+     simple string l2Src, simple int l2Ema, simple int l2Atr, simple float l2Dp,
+     simple bool l2AtrSm, simple int l2AtrSmLen, simple bool l2Sm, simple int l2SmLen,
+     simple string l2AsymSrc, simple int l2AsymAtr, simple float l2AsymUp, simple float l2AsymDn, simple float l2AsymDnHv, simple float l2AsymTh, simple int l2AsymFil,
+     simple string bgSrc, bool allowUpdate) =>
+    // ========================================================================
+    // STB (正式 = Donchian / 表示期間と転換期間を分離)
+    // ========================================================================
+    //  表示用のバンド (表示期間ぶんの高値・安値)
+    float dcUpper = ta.highest(high, dcDisp)
+    float dcLower = ta.lowest(low,  dcDisp)
+    //  転換判定用のレンジ。当該足を含める前の転換期間ぶんのレンジを見る。
+    //  ※ [1] は転換を 1 本遅らせるためではない。
+    float dcStUpPrev = ta.highest(high, dcState)[1]
+    float dcStLoPrev = ta.lowest(low,  dcState)[1]
+    //  毎バー必ず次の順で判定する。
+    //    1. 上抜け (high > 前レンジ高値) を先に判定 → UP(+1)
+    //    2. 上抜けしていなければ下抜け (low < 前レンジ安値) を判定 → DOWN(-1)
+    //    3. どちらも成立しなければ直前の State を維持する
+    //  同一バーで上下両方を突破した場合は else if の構造により上抜けが優先される。
+    var int stbDir = 0
+    if allowUpdate and not na(dcStUpPrev) and not na(dcStLoPrev)
+        if high > dcStUpPrev
+            stbDir := 1
+        else if low < dcStLoPrev
+            stbDir := -1
+    //  表示価格。UP は表示期間の安値、DOWN は表示期間の高値。追加の平滑化はしない。
+    float stbLine = na
+    if stbDir == 1
+        stbLine := dcLower
+    else if stbDir == -1
+        stbLine := dcUpper
+
+    // ========================================================================
+    // LINE1 : EMA ATR Breakout Band の表示バンド
+    // ========================================================================
+    //  ① basis = ta.ema(source, emaLength)  /  atrValue = ta.atr(atrLength)
+    //  ② rawUpper = basis + atrValue * displayMultiplier
+    //     rawLower = basis - atrValue * displayMultiplier
+    //     ※ LINE1 は表示用 ATR の平滑化を使わない (元ファイルでも OFF 固定)
+    //  ③ 上下それぞれ独立に EMA をかけた平滑化バンド
+    //  ④ 方向で上下を切り替えたあとの線には EMA をかけない
+    float l1SrcV  = f_src(l1Src)
+    float l1Basis = ta.ema(l1SrcV, l1Ema)
+    float l1AtrV  = ta.atr(l1Atr)
+    float l1RawUp = l1Basis + l1AtrV * l1Dp
+    float l1RawLo = l1Basis - l1AtrV * l1Dp
+    float l1SmUp  = ta.ema(l1RawUp, l1SmLen)
+    float l1SmLo  = ta.ema(l1RawLo, l1SmLen)
+    float l1DispUp = l1Sm ? l1SmUp : l1RawUp
+    float l1DispLo = l1Sm ? l1SmLo : l1RawLo
+
+    // LINE1 転換判定専用バンド (表示バンドとは完全に独立)
+    //  ソースだけ共通で、EMA期間 / ATR期間 / 倍率 / 平滑化 / 確認本数は
+    //  DOWN→UP 用と UP→DOWN 用で完全に別々。
+    //  ※ 判定にしか使わない。LINE1 の表示価格には一切使わない。
+    float l1StSrcV     = f_src(l1StSrc)
+    float l1StUpBasis  = ta.ema(l1StSrcV, l1UpEma)
+    float l1StUpAtrV   = ta.atr(l1UpAtr)
+    float l1StUpRaw    = l1StUpBasis + l1StUpAtrV * l1UpMul
+    float l1StUpSmV    = ta.ema(l1StUpRaw, l1UpSmLen)
+    float l1StUpBand   = l1UpSm ? l1StUpSmV : l1StUpRaw
+    float l1StDnBasis  = ta.ema(l1StSrcV, l1DnEma)
+    float l1StDnAtrV   = ta.atr(l1DnAtr)
+    float l1StDnRaw    = l1StDnBasis - l1StDnAtrV * l1DnMul
+    float l1StDnSmV    = ta.ema(l1StDnRaw, l1DnSmLen)
+    float l1StDnBand   = l1DnSm ? l1StDnSmV : l1StDnRaw
+
+    int l1Dir = f_l1SeparateState(l1StUpBand, l1StDnBand, l1UpCfm, l1DnCfm, allowUpdate)
+
+    //  専用転換バンドで方向だけを決める。表示価格は表示バンドのまま。
+    float l1Line = na
+    if l1Dir == 1
+        l1Line := l1DispLo
+    else if l1Dir == -1
+        l1Line := l1DispUp
+
+    // ========================================================================
+    // LINE2 : EMA ATR Breakout Band の表示バンド (表示用 ATR の平滑化あり)
+    // ========================================================================
+    //  ① baseAtr = ta.atr(atrLength)
+    //  ② slowAtr = ta.ema(baseAtr, atrSmoothLen)  / useAtrSmooth なら dispAtr = slowAtr
+    //  ③ rawUpper / rawLower = basis ± dispAtr * displayMultiplier
+    //  ④ 上下それぞれ独立に EMA をかけた平滑化バンド
+    float l2SrcV    = f_src(l2Src)
+    float l2Basis   = ta.ema(l2SrcV, l2Ema)
+    float l2AtrV    = ta.atr(l2Atr)
+    float l2SlowAtr = ta.ema(l2AtrV, l2AtrSmLen)
+    float l2DispAtr = l2AtrSm ? l2SlowAtr : l2AtrV
+    float l2RawUp   = l2Basis + l2DispAtr * l2Dp
+    float l2RawLo   = l2Basis - l2DispAtr * l2Dp
+    float l2SmUpV   = ta.ema(l2RawUp, l2SmLen)
+    float l2SmLoV   = ta.ema(l2RawLo, l2SmLen)
+    float l2DispUp  = l2Sm ? l2SmUpV : l2RawUp
+    float l2DispLo  = l2Sm ? l2SmLoV : l2RawLo
+
+    // LINE2 価格State : 非対称 Supertrend の方向だけを使う。ライン価格は使わない。
+    float l2AsymSrcV = f_src(l2AsymSrc)
+    int   l2AsymRaw  = nz(f_supertrendAsymDir(l2AsymSrcV, l2AsymAtr, l2AsymUp, l2AsymDn, l2AsymDnHv, l2AsymTh), 0)
+    int   l2PriceDir = f_filterDir(l2AsymRaw, l2AsymFil, allowUpdate)
+
+    float l2Line = na
+    if l2PriceDir == 1
+        l2Line := l2DispLo
+    else if l2PriceDir == -1
+        l2Line := l2DispUp
+
+    // LINE2 色 State (= 正式 LINE2 方向)
+    //   チャートに実際に表示されている LINE2 の価格と終値を比べて色を決める。
+    //     close > 表示中のLINE2 → 青 / close < 表示中のLINE2 → 赤 / 同値 → 直前を維持
+    //   ここで決まった方向が正式 LINE2 方向になる。
+    var int l2ColorState = 0
+    if allowUpdate and not na(l2Line)
+        if close > l2Line
+            l2ColorState := 1
+        else if close < l2Line
+            l2ColorState := -1
+    int l2Dir = l2ColorState
+
+    // ========================================================================
+    // 背景 : 価格が3本すべてを突破
+    // ========================================================================
+    //  青 : 判定ソース > STB表示値 / LINE1表示値 / LINE2表示値 のすべて
+    //  赤 : 判定ソース < 上記3本すべて
+    //  フラット : 上記どちらでもない / いずれかのライン値が na
+    //  EMA200 と MTF は条件に含めない。保持本数の処理もしない。
+    float hi3 = math.max(stbLine, math.max(l1Line, l2Line))
+    float lo3 = math.min(stbLine, math.min(l1Line, l2Line))
+    float buySrc  = bgSrc == "close" ? close : bgSrc == "high/low" ? high : low
+    float sellSrc = bgSrc == "close" ? close : bgSrc == "high/low" ? low  : high
+    bool pBuy  = not na(hi3) and buySrc  > hi3
+    bool pSell = not na(lo3) and sellSrc < lo3
+    //  high/low モードでは巨大な包み足で両方成立しうるため、青を優先する
+    //  (元ファイルの bgcolor 評価順と同じ)。
+    int bgState = 0
+    if pBuy
+        bgState := 1
+    else if pSell
+        bgState := -1
+
+    [bgState, stbLine, stbDir, l1Line, l1Dir, l2Line, l2Dir]
+
+// ----------------------------------------------------------------------------
+// [SAT] 上位足用ラッパー : 「最後に確定した HTF バー」の背景 State だけを返す
+//
+//   request.security(..., lookahead_off) だけでは、リアルタイム進行中の
+//   未確定な上位足の値は変動する。lookahead_off が保証するのは
+//   「未来の値が過去に漏れないこと」だけで、「現在の上位足の値が動かないこと」ではない。
+//   そのため式に [1] を掛け、ひとつ前の "閉じた" 上位足の値を参照する。
+//   [1] は security 内部 (上位足の時系列) で適用するため、
+//   未来の値が過去バーへ漏れることはない。
+//
+//   ※ HTF コンテキストでは barstate.isconfirmed を使わない (allowUpdate = true)。
+//     security 内では HTF バーごとに 1 回評価されるため、[1] で確定足になる。
+// ----------------------------------------------------------------------------
+f_satBgHtf(simple int dcDisp, simple int dcState,
+     simple string l1Src, simple int l1Ema, simple int l1Atr, simple float l1Dp, simple bool l1Sm, simple int l1SmLen,
+     simple string l1StSrc,
+     simple int l1UpEma, simple int l1UpAtr, simple float l1UpMul, simple bool l1UpSm, simple int l1UpSmLen, simple int l1UpCfm,
+     simple int l1DnEma, simple int l1DnAtr, simple float l1DnMul, simple bool l1DnSm, simple int l1DnSmLen, simple int l1DnCfm,
+     simple string l2Src, simple int l2Ema, simple int l2Atr, simple float l2Dp,
+     simple bool l2AtrSm, simple int l2AtrSmLen, simple bool l2Sm, simple int l2SmLen,
+     simple string l2AsymSrc, simple int l2AsymAtr, simple float l2AsymUp, simple float l2AsymDn, simple float l2AsymDnHv, simple float l2AsymTh, simple int l2AsymFil,
+     simple string bgSrc) =>
+    [bgRaw, _s1, _s2, _s3, _s4, _s5, _s6] = f_satPanel(dcDisp, dcState,
+         l1Src, l1Ema, l1Atr, l1Dp, l1Sm, l1SmLen,
+         l1StSrc,
+         l1UpEma, l1UpAtr, l1UpMul, l1UpSm, l1UpSmLen, l1UpCfm,
+         l1DnEma, l1DnAtr, l1DnMul, l1DnSm, l1DnSmLen, l1DnCfm,
+         l2Src, l2Ema, l2Atr, l2Dp, l2AtrSm, l2AtrSmLen, l2Sm, l2SmLen,
+         l2AsymSrc, l2AsymAtr, l2AsymUp, l2AsymDn, l2AsymDnHv, l2AsymTh, l2AsymFil,
+         bgSrc, true)
+    // タプル分解した変数へ直接 history 参照をかけないよう、通常変数へコピーする
+    int bgv = bgRaw
+    bgv[1]
+
+// 表示用の小さなヘルパー
+f_num(float v, string fmt) =>
+    na(v) ? "-" : str.tostring(v, fmt)
+f_bgStr(int b) =>
+    b == 1 ? "青 (BLUE)" : b == -1 ? "赤 (RED)" : "フラット (FLAT)"
+f_bgCol(int b) =>
+    b == 1 ? bgBuyCol : b == -1 ? bgSellCol : color.rgb(149, 152, 161)
+f_longStateStr(int s) =>
+    s == ST_WAIT ? "WAIT_INITIAL" : s == ST_ARMED ? "ARMED (青)" : s == ST_FLAT ? "SAW_FLAT" : "SAW_RED"
+f_shortStateStr(int s) =>
+    s == ST_WAIT ? "WAIT_INITIAL" : s == ST_ARMED ? "ARMED (赤)" : s == ST_FLAT ? "SAW_FLAT" : "SAW_BLUE"
+
+// ============================================================================
+// 03. SAT 背景 : 15s (チャート足) / 30s / 1m
+// ============================================================================
+//  15秒足 : useConfirmed = ON なら確定足でのみ State を更新する。
+//  ※ 過去足へずらす方式 (rawDir[1]) は使わない。余分な 1 本の遅延が出るため。
+bool allowStateUpdate = useConfirmed ? barstate.isconfirmed : true
+
+[bg15, satStbLine, satStbDir, satL1Line, satL1Dir, satL2Line, satL2Dir] = f_satPanel(stbDcDisplayLen, stbDcStateLen,
+     l1SrcType, l1EmaLen, l1AtrLen, l1DpMult, l1Smooth, l1SmoothLen,
+     l1StateSrcType,
+     l1StateUpEmaLen, l1StateUpAtrLen, l1StateUpMult, l1StateUpSmooth, l1StateUpSmoothLen, l1StateUpConfirm,
+     l1StateDnEmaLen, l1StateDnAtrLen, l1StateDnMult, l1StateDnSmooth, l1StateDnSmoothLen, l1StateDnConfirm,
+     l2SrcType, l2EmaLen, l2AtrLen, l2DpMult, l2AtrSmooth, l2AtrSmoothLen, l2Smooth, l2SmoothLen,
+     l2PsAsymSrcType, l2PsAsymAtrLen, l2PsAsymUpFac, l2PsAsymDnFac, l2PsAsymDnFacHV, l2PsAsymVolTh, l2PsAsymFilter,
+     bgSrcMode, allowStateUpdate)
+
+// ---- 30秒 / 1分 : それぞれ独立した時間足コンテキストで SAT を丸ごと再計算 ----
+//  ★ 15秒足で計算したラインを流用していない。
+//  ★ 必要なのは背景 State だけなので、1 時間足につき request.security() は 1 本。
+//  ★ lookahead_off。security 内部で [1] を掛け、最後に確定した HTF バーだけを見る。
+int bg30 = nz(request.security(syminfo.tickerid, satTf30,
+     f_satBgHtf(stbDcDisplayLen, stbDcStateLen,
+         l1SrcType, l1EmaLen, l1AtrLen, l1DpMult, l1Smooth, l1SmoothLen,
+         l1StateSrcType,
+         l1StateUpEmaLen, l1StateUpAtrLen, l1StateUpMult, l1StateUpSmooth, l1StateUpSmoothLen, l1StateUpConfirm,
+         l1StateDnEmaLen, l1StateDnAtrLen, l1StateDnMult, l1StateDnSmooth, l1StateDnSmoothLen, l1StateDnConfirm,
+         l2SrcType, l2EmaLen, l2AtrLen, l2DpMult, l2AtrSmooth, l2AtrSmoothLen, l2Smooth, l2SmoothLen,
+         l2PsAsymSrcType, l2PsAsymAtrLen, l2PsAsymUpFac, l2PsAsymDnFac, l2PsAsymDnFacHV, l2PsAsymVolTh, l2PsAsymFilter,
+         bgSrcMode),
+     lookahead = barmerge.lookahead_off), 0)
+
+int bg1m = nz(request.security(syminfo.tickerid, satTf1m,
+     f_satBgHtf(stbDcDisplayLen, stbDcStateLen,
+         l1SrcType, l1EmaLen, l1AtrLen, l1DpMult, l1Smooth, l1SmoothLen,
+         l1StateSrcType,
+         l1StateUpEmaLen, l1StateUpAtrLen, l1StateUpMult, l1StateUpSmooth, l1StateUpSmoothLen, l1StateUpConfirm,
+         l1StateDnEmaLen, l1StateDnAtrLen, l1StateDnMult, l1StateDnSmooth, l1StateDnSmoothLen, l1StateDnConfirm,
+         l2SrcType, l2EmaLen, l2AtrLen, l2DpMult, l2AtrSmooth, l2AtrSmoothLen, l2Smooth, l2SmoothLen,
+         l2PsAsymSrcType, l2PsAsymAtrLen, l2PsAsymUpFac, l2PsAsymDnFac, l2PsAsymDnFacHV, l2PsAsymVolTh, l2PsAsymFilter,
+         bgSrcMode),
+     lookahead = barmerge.lookahead_off), 0)
+
+// 移動平均線 (表示のみ・背景判定には使わない)
+float maSrc = f_src(maSrcType)
+float maVal = f_ma(maType, maSrc, maLen)
+int   maDir = maVal > maVal[1] ? 1 : maVal < maVal[1] ? -1 : 0
+
+// ============================================================================
+// 04. ENTRY STATE MACHINE
+// ----------------------------------------------------------------------------
+//  ★ background[2] / background[1] / background だけの判定はしていない。
+//    フラット・赤・青が複数本連続しても成立するよう、明示的な State Machine にしてある。
+//  ★ LONG と SHORT は完全に別の State を持つ。互いに干渉しない。
+//  ★ 判定は確定した15秒足でのみ進める (barstate.isconfirmed)。
+//
+//  LONG
+//    WAIT_INITIAL : 15s青 + 30s青 + 1m青 が同時成立 → ARMED
+//                   (この時点では Entry しない。あくまで LONG 待機開始)
+//    ARMED        : 青が続く限り ARMED / フラット → SAW_FLAT / 赤 → SAW_RED
+//    SAW_FLAT     : フラットが続く限り SAW_FLAT
+//                   青 → 【Pattern A Entry】
+//                   赤 → SAW_RED
+//    SAW_RED      : 赤が続く限り SAW_RED
+//                   フラット → 【Pattern B Entry】
+//                   青 → ARMED
+//    ※ 待機開始後は 30秒足の色を一切問わない (初期成立条件でのみ 30s青 を使う)。
+//    ※ 1分足は Entry 成立まで「青を維持」が必須。確定1分背景が青でなくなった
+//      時点で LONG 待機状態・15秒パターン進行状態をすべてリセットする。
+//
+//  SHORT は完全対称 (青と赤を入れ替えるだけ)。
+//
+//  Entry 後の再アーム (§10)
+//    1 回 Entry が成立したら、その方向の待機状態を完全リセット (WAIT_INITIAL) する。
+//    次の Entry には再度 15s+30s+1m の初期成立を要求する。
+//    ※ パターンは完成したが実際には発注できなかった場合
+//      (ZONE の TradePlan FAIL / Qty 不足 / ポジション制御による SKIP) は
+//      待機イベントを消費しない。State は「その足で観測した色」に応じた
+//      自然な次状態 (Pattern A なら ARMED / Pattern B なら SAW_FLAT) のまま残り、
+//      確定1分背景が青 (SHORT は赤) を維持している限り次のチャンスを待てる。
+// ============================================================================
+var int longState  = ST_WAIT
+var int shortState = ST_WAIT
+
+bool barConfirmed = barstate.isconfirmed
+
+int  lsNext     = longState
+bool longSigA   = false
+bool longSigB   = false
+int  ssNext     = shortState
+bool shortSigA  = false
+bool shortSigB  = false
+
+if barConfirmed
+    // ---- LONG ----------------------------------------------------------
+    //  1) 1分足ガード : 待機中に確定1分背景が青でなくなったら全リセット
+    if lsNext != ST_WAIT and bg1m != BG_BLUE
+        lsNext := ST_WAIT
+    //  2) State 遷移
+    if lsNext == ST_WAIT
+        //  初期成立。この青は Pattern の最初の「青」として数える。
+        if bg15 == BG_BLUE and bg30 == BG_BLUE and bg1m == BG_BLUE
+            lsNext := ST_ARMED
+    else if lsNext == ST_ARMED
+        if bg15 == BG_FLAT
+            lsNext := ST_FLAT
+        else if bg15 == BG_RED
+            lsNext := ST_OPP
+    else if lsNext == ST_FLAT
+        if bg15 == BG_BLUE
+            //  青 → フラット(複数本可) → 青
+            longSigA := true
+            lsNext   := ST_ARMED
+        else if bg15 == BG_RED
+            lsNext := ST_OPP
+    else
+        if bg15 == BG_FLAT
+            //  青 → 赤(複数本可) → フラット
+            longSigB := true
+            lsNext   := ST_FLAT
+        else if bg15 == BG_BLUE
+            lsNext := ST_ARMED
+
+    // ---- SHORT (LONG の完全対称) ---------------------------------------
+    if ssNext != ST_WAIT and bg1m != BG_RED
+        ssNext := ST_WAIT
+    if ssNext == ST_WAIT
+        if bg15 == BG_RED and bg30 == BG_RED and bg1m == BG_RED
+            ssNext := ST_ARMED
+    else if ssNext == ST_ARMED
+        if bg15 == BG_FLAT
+            ssNext := ST_FLAT
+        else if bg15 == BG_BLUE
+            ssNext := ST_OPP
+    else if ssNext == ST_FLAT
+        if bg15 == BG_RED
+            //  赤 → フラット(複数本可) → 赤
+            shortSigA := true
+            ssNext    := ST_ARMED
+        else if bg15 == BG_BLUE
+            ssNext := ST_OPP
+    else
+        if bg15 == BG_FLAT
+            //  赤 → 青(複数本可) → フラット
+            shortSigB := true
+            ssNext    := ST_FLAT
+        else if bg15 == BG_RED
+            ssNext := ST_ARMED
+
+//  Entry Signal。方向の ON/OFF は Trade Engine 側でも必ず通す。
+bool longSignal  = longSigA  or longSigB
+bool shortSignal = shortSigA or shortSigB
+
+// ============================================================================
+// 05. ZONE ENGINE  (ZONE モードのみ)
+// ----------------------------------------------------------------------------
+//  ZoneEngine の Zone 生成 / Score / Strength / Break / Flip / Structural SL・TP は
+//  一切変更していない。参考 Strategy の Config 代入と Feed をそのまま流用する。
+//  ★ FIXED モードでは request.security を 1 本も発行しない (計算負荷ゼロ)。
+//    sltpMode は input なので、この分岐は全バーで同じ = ta 状態がずれることはない。
+// ============================================================================
+var zn.ZoneEngine zoneEng = zn.newEngine()
+
+zn.ZoneCfg zoneCfg = zn.newCfg()
+zoneCfg.zoneHalfWidth        := zoneHalfWidth
+zoneCfg.useMaSource          := useMaSource
+zoneCfg.maTfName             := maTf
+zoneCfg.ma1Len               := ma1Len
+zoneCfg.ma2Len               := ma2Len
+zoneCfg.scoreMa1             := scoreMa1
+zoneCfg.scoreMa2             := scoreMa2
+zoneCfg.slopeThrMod          := slopeThrMod
+zoneCfg.slopeThrStrong       := slopeThrStrong
+zoneCfg.slopeBonusFlat       := slopeBonusFlat
+zoneCfg.slopeBonusMod        := slopeBonusMod
+zoneCfg.slopeBonusStr        := slopeBonusStr
+zoneCfg.slopeBonusMax        := slopeBonusMode == "Max"
+zoneCfg.maClusterDist        := maClusterDist
+zoneCfg.maClusterBonus       := maClusterBonus
+zoneCfg.maClusterDirBonus    := maClusterDirBonus
+zoneCfg.useHzSource          := useHzSource
+zoneCfg.hzTf1                := hzTf1
+zoneCfg.hzTf2                := hzTf2
+zoneCfg.hzTf3                := hzTf3
+zoneCfg.scoreHz1             := scoreHz1
+zoneCfg.scoreHz2             := scoreHz2
+zoneCfg.scoreHz3             := scoreHz3
+zoneCfg.reactionDist         := reactionDist
+zoneCfg.reactionBonus1       := reactionBonus1
+zoneCfg.reactionBonus2       := reactionBonus2
+zoneCfg.reactionBonus3       := reactionBonus3
+zoneCfg.reactionRearmDist    := reactionRearmDist
+zoneCfg.reactionAllSrc       := reactionAllSrc
+zoneCfg.useDayHL             := useDayHL
+zoneCfg.scoreDayHL           := scoreDayHL
+zoneCfg.carryPrevDayHL       := carryPrevDayHL
+zoneCfg.scorePrevDayHL       := scorePrevDayHL
+zoneCfg.lifePrevDayHL        := lifePrevDayHL
+zoneCfg.useAccSource         := useAccSource
+zoneCfg.accTf1               := accTf1
+zoneCfg.accTf2               := accTf2
+zoneCfg.accTf3               := accTf3
+zoneCfg.scoreAcc1            := scoreAcc1
+zoneCfg.scoreAcc2            := scoreAcc2
+zoneCfg.scoreAcc3            := scoreAcc3
+zoneCfg.accKeep1             := accKeep1
+zoneCfg.accKeep2             := accKeep2
+zoneCfg.accKeep3             := accKeep3
+zoneCfg.clusterDist          := clusterDist
+zoneCfg.thrMedium            := thrMedium
+zoneCfg.thrStrong            := thrStrong
+zoneCfg.thrVStrong           := thrVStrong
+zoneCfg.confBonus2           := confBonus2
+zoneCfg.confBonus3           := confBonus3
+zoneCfg.confBonus4           := confBonus4
+zoneCfg.flipBonus            := flipBonus
+zoneCfg.requireHtfForVStrong := requireHtfForVStrong
+zoneCfg.htfSwing1H           := htfSwing1H
+zoneCfg.htfAccum1H           := htfAccum1H
+zoneCfg.htfAccum4H           := htfAccum4H
+zoneCfg.htfAccumD            := htfAccumD
+zoneCfg.htfSwing15M          := htfSwing15M
+zoneCfg.htfMa1               := htfMa1
+zoneCfg.htfMa2               := htfMa2
+zoneCfg.htfDayHL             := htfDayHL
+zoneCfg.breakBuffer          := breakBuffer
+zoneCfg.flipConfirmDist      := flipConfirmDist
+zoneCfg.resetOnReclaim       := resetOnReclaim
+zoneCfg.trackStaleBars       := trackStaleBars
+zoneCfg.trackContinuity      := trackContinuity
+zoneCfg.lifeHz1              := lifeHz1
+zoneCfg.lifeHz2              := lifeHz2
+zoneCfg.lifeHz3              := lifeHz3
+zoneCfg.lifeExtendOn         := lifeExtendOn
+zoneCfg.lifeExtendRatio      := lifeExtendRatio
+zoneCfg.maxPersistZones      := maxPersistZones
+zoneCfg.slBuffer             := slBuffer
+zoneCfg.tpBuffer             := tpBuffer
+zoneCfg.maxSlDist            := maxSlDist
+zoneCfg.minStructRR          := minStructRR
+zoneCfg.slMinScore           := slMinScore
+zoneCfg.slMinStrength        := zn.strengthIdx(slMinStrStr)
+zoneCfg.tpMinScore           := tpMinScore
+zoneCfg.tpMinStrength        := zn.strengthIdx(tpMinStrStr)
+zoneCfg.obsMinStrength       := zn.strengthIdx(obsMinStrStr)
+zoneCfg.activeNoTradeMinStrength := zn.strengthIdx(activeNoTradeMinStrStr)
+zoneCfg.structuralTpDepthRatio   := structuralTpDepthRatio
+zoneCfg.fallbackRR           := fallbackRR
+
+// ---- Zone Feed (外部足の取得はすべてここ) ---------------------------------
+float ma1Val   = na
+float ma1Delta = na
+float ma2Val   = na
+float ma2Delta = na
+if useZoneSltp and useMaSource
+    [_m1, _m1d, _m2, _m2d] = request.security(syminfo.tickerid, maTf,
+         zn.maPack(zMaType, ma1Len, ma2Len, slopeLookback), lookahead = barmerge.lookahead_off)
+    ma1Val   := _m1
+    ma1Delta := _m1d
+    ma2Val   := _m2
+    ma2Delta := _m2d
+
+float ph1 = na
+int   ph1T = na
+float pl1 = na
+int   pl1T = na
+float ph2 = na
+int   ph2T = na
+float pl2 = na
+int   pl2T = na
+float ph3 = na
+int   ph3T = na
+float pl3 = na
+int   pl3T = na
+if useZoneSltp and useHzSource
+    [_h1, _h1t, _l1, _l1t] = request.security(syminfo.tickerid, hzTf1, zn.pivotPack(pivLen1), lookahead = barmerge.lookahead_off)
+    [_h2, _h2t, _l2, _l2t] = request.security(syminfo.tickerid, hzTf2, zn.pivotPack(pivLen2), lookahead = barmerge.lookahead_off)
+    [_h3, _h3t, _l3, _l3t] = request.security(syminfo.tickerid, hzTf3, zn.pivotPack(pivLen3), lookahead = barmerge.lookahead_off)
+    ph1  := _h1
+    ph1T := _h1t
+    pl1  := _l1
+    pl1T := _l1t
+    ph2  := _h2
+    ph2T := _h2t
+    pl2  := _l2
+    pl2T := _l2t
+    ph3  := _h3
+    ph3T := _h3t
+    pl3  := _l3
+    pl3T := _l3t
+
+bool usePortedAccum = accumModule == "Accum Box (ported)"
+float acc1Hi = na
+float acc1Lo = na
+int   acc1Id = na
+float acc2Hi = na
+float acc2Lo = na
+int   acc2Id = na
+float acc3Hi = na
+float acc3Lo = na
+int   acc3Id = na
+if useZoneSltp and useAccSource
+    [_a1h, _a1l, _a1i] = request.security(syminfo.tickerid, accTf1,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen1, accMult), lookahead = barmerge.lookahead_off)
+    [_a2h, _a2l, _a2i] = request.security(syminfo.tickerid, accTf2,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen2, accMult), lookahead = barmerge.lookahead_off)
+    [_a3h, _a3l, _a3i] = request.security(syminfo.tickerid, accTf3,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen3, accMult), lookahead = barmerge.lookahead_off)
+    acc1Hi := _a1h
+    acc1Lo := _a1l
+    acc1Id := _a1i
+    acc2Hi := _a2h
+    acc2Lo := _a2l
+    acc2Id := _a2i
+    acc3Hi := _a3h
+    acc3Lo := _a3l
+    acc3Id := _a3i
+
+// Break 判定は breakTf の「確定終値」のみ (ヒゲでは判定しない)
+float brClose = na
+float brHigh  = na
+float brLow   = na
+bool  brEval  = false
+if useZoneSltp
+    [brCloseRaw, brHighRaw, brLowRaw] = request.security(syminfo.tickerid, breakTf, [close, high, low],
+         lookahead = barmerge.lookahead_off)
+    bool brBarClosed = bar_index > 0 and not na(time(breakTf)) and nz(ta.change(time(breakTf)), 0) != 0
+    brClose := brBarClosed ? brCloseRaw[1] : na
+    brHigh  := brBarClosed ? brHighRaw[1]  : na
+    brLow   := brBarClosed ? brLowRaw[1]   : na
+    brEval  := brBarClosed and not na(brClose)
+
+// 取引日ID (timestamp / hour の timezone は series 不可なのでここで計算する)
+int _locY = year(time, dayTz)
+int _locM = month(time, dayTz)
+int _locD = dayofmonth(time, dayTz)
+int _locH = hour(time, dayTz)
+int _calDayNo    = int(timestamp(dayTz, _locY, _locM, _locD, 0, 0) / 86400000)
+int tradingDayId = _locH < dayResetHour ? _calDayNo - 1 : _calDayNo
+
+zn.ZoneFeed zoneFeed = zn.ZoneFeed.new(
+     ma1 = ma1Val, ma1d = ma1Delta, ma2 = ma2Val, ma2d = ma2Delta,
+     ph1 = ph1, ph1t = ph1T, pl1 = pl1, pl1t = pl1T,
+     ph2 = ph2, ph2t = ph2T, pl2 = pl2, pl2t = pl2T,
+     ph3 = ph3, ph3t = ph3T, pl3 = pl3, pl3t = pl3T,
+     acc1Hi = acc1Hi, acc1Lo = acc1Lo, acc1Id = acc1Id,
+     acc2Hi = acc2Hi, acc2Lo = acc2Lo, acc2Id = acc2Id,
+     acc3Hi = acc3Hi, acc3Lo = acc3Lo, acc3Id = acc3Id,
+     dayId = tradingDayId,
+     brClose = brClose, brHigh = brHigh, brLow = brLow, brEval = brEval)
+
+int zoneCountNow = 0
+if useZoneSltp
+    zoneCountNow := zn.update(zoneEng, zoneCfg, zoneFeed)
+
+// ============================================================================
+// 06. RISK / QTY
+// ----------------------------------------------------------------------------
+//  Qty は必ず SL 距離から計算する。Long / Short 共通。
+//     Risk Capital ÷ SL距離 ÷ syminfo.pointvalue → qtyStep 単位に切り下げ
+//  ZONE  : Structural SL までの距離 (TradePlan.risk)
+//  FIXED : Fixed SL の距離
+// ============================================================================
+f_baseCapital() =>
+    useCompound ? strategy.equity : strategy.initial_capital
+
+f_riskCapital() =>
+    f_baseCapital() * riskPct / 100.0
+
+f_qty(float riskPerUnit) =>
+    float raw = riskPerUnit > 0 ? f_riskCapital() / (riskPerUnit * syminfo.pointvalue) : 0.0
+    float q = qtyStep > 0 ? math.floor(raw / qtyStep) * qtyStep : raw
+    math.round(q, 8)
+
+f_expectedLoss(float qty, float slDist) =>
+    nz(qty) * nz(slDist) * syminfo.pointvalue
+
+// ============================================================================
+// 07. TRADE ENGINE
+// ----------------------------------------------------------------------------
+//  SAT Entry Signal → Trade Plan 生成 → SL/TP 決定 → Qty → strategy.entry
+//  → strategy.exit の順で処理する唯一の場所。
+//  ★ Entry ロジック自体は SLTP Mode によって変化しない。
+//    ZONE でも FIXED でも同じ SAT Entry Signal を使い、SL/TP の決め方だけ切り替える。
+// ============================================================================
+var array<int>   gSeq      = array.new_int(1, 0)
+var array<string> gLastPlan = array.new_string(3, "-")
+
+// SL/TP をまとめて返す内部プラン
+//   戻り値 : [valid, sl, tp, rr, risk(SL距離), status, reason, tpType]
+f_buildPlan(int dir, float entryPrice) =>
+    bool   pValid  = false
+    float  pSl     = na
+    float  pTp     = na
+    float  pRr     = na
+    float  pRisk   = na
+    string pStatus = "FAIL"
+    string pReason = "-"
+    string pTpType = "-"
+    if useZoneSltp
+        //  ZONE : ZoneEngine の TradePlan をそのまま使う (Zone 生成ロジックは不変)。
+        //  TP Depth は Plan 生成の引数で渡す (共通 zoneCfg は書き換えない)。
+        zn.TradePlan p = zn.buildPlanWithTpDepth(zoneEng, zoneCfg, dir, entryPrice, structuralTpDepthRatio)
+        pValid  := p.valid
+        pSl     := p.sl
+        pTp     := p.tp
+        pRr     := p.rr
+        pRisk   := p.risk
+        pStatus := p.status
+        pReason := p.reason
+        pTpType := p.tpType
+        // ---- TP Mode フィルター (Structural / Fallback の成績切り分け用) ----
+        //  PASS → FAIL の一方向のみ。FAIL → PASS への昇格は行わない。
+        if tpMode == "STRUCTURAL_ONLY" and pTpType == "FALLBACK_RR"
+            pValid  := false
+            pStatus := "FAIL"
+            pReason := "NO_STRUCTURAL_TP"
+        else if tpMode == "FALLBACK_ONLY" and pTpType == "STRUCTURAL"
+            pValid  := false
+            pStatus := "FAIL"
+            pReason := "STRUCTURAL_TP_EXISTS"
+    else
+        //  FIXED : Long / Short 完全対称
+        //    LONG  : SL = Entry - Fixed SL / TP = Entry + Fixed TP
+        //    SHORT : SL = Entry + Fixed SL / TP = Entry - Fixed TP
+        if dir > 0
+            pSl := entryPrice - fixedSlDollar
+            pTp := entryPrice + fixedTpDollar
+        else
+            pSl := entryPrice + fixedSlDollar
+            pTp := entryPrice - fixedTpDollar
+        pRisk   := fixedSlDollar
+        pRr     := fixedSlDollar > 0 ? fixedTpDollar / fixedSlDollar : na
+        pTpType := "FIXED"
+        if fixedSlDollar > 0 and fixedTpDollar > 0
+            pValid  := true
+            pStatus := "PASS"
+            pReason := "FIXED_SLTP"
+        else
+            pReason := "INVALID_FIXED_SLTP"
+    [pValid, pSl, pTp, pRr, pRisk, pStatus, pReason, pTpType]
+
+f_recordPlan(int dir, float entryP, float sl, float tp, float rr, float risk, string tpType, string status, string reason, string extra) =>
+    array.set(gLastPlan, 0,
+         LOGIC_ID + " " + (dir > 0 ? "LONG" : "SHORT") +
+         " | Mode " + sltpMode +
+         " | E " + f_num(entryP, "#.##") +
+         " | SL " + f_num(sl, "#.##") +
+         " | TP " + f_num(tp, "#.##") +
+         " | RR " + f_num(rr, "#.##") +
+         " | " + tpType)
+    array.set(gLastPlan, 1, status + " · " + reason + (extra == "" ? "" : " · " + extra))
+    float q  = f_qty(risk)
+    float el = f_expectedLoss(q, risk)
+    float bc = f_baseCapital()
+    array.set(gLastPlan, 2,
+         "RiskCap " + f_num(f_riskCapital(), "#.##") + " (" + f_num(riskPct, "#.##") + "%)" +
+         " | SLdist " + f_num(risk, "#.##") +
+         " | Qty " + f_num(q, "#.####") +
+         " | ExpLoss " + f_num(el, "#.##") +
+         " (" + f_num(bc > 0 ? el / bc * 100.0 : na, "#.###") + "%)" +
+         " | PV " + str.tostring(syminfo.pointvalue) + " " + syminfo.currency)
+    true
+
+// ★ ここが唯一 strategy.entry / strategy.exit を呼ぶ場所。
+//   Entry 時点の SL / TP を strategy.exit へ渡して固定する。
+//   戻り値 : 実際に発注できたら Entry ID、できなければ ""
+f_submitSignal(bool signal, int dir, float entryPrice, string patternName) =>
+    string eid = ""
+    bool dirOk = (dir > 0 and enableLong) or (dir < 0 and enableShort)
+    if signal and dirOk and dir != 0
+        [pValid, pSl, pTp, pRr, pRisk, pStatus, pReason, pTpType] = f_buildPlan(dir, entryPrice)
+        if not pValid
+            f_recordPlan(dir, entryPrice, pSl, pTp, pRr, pRisk, pTpType, pStatus, pReason, patternName)
+        else
+            float qty = f_qty(pRisk)
+            bool oppositeConflict = not allowOppositeEntry and
+                 ((dir > 0 and strategy.position_size < 0) or (dir < 0 and strategy.position_size > 0))
+            bool tradesFull = strategy.opentrades >= maxOpenTrades
+            if tradesFull
+                f_recordPlan(dir, entryPrice, pSl, pTp, pRr, pRisk, pTpType, "FAIL", "SKIP_MAX_OPEN", patternName)
+            else if oppositeConflict
+                f_recordPlan(dir, entryPrice, pSl, pTp, pRr, pRisk, pTpType, "FAIL", "SKIP_OPPOSITE_POSITION", patternName)
+            else if qty < qtyMin or qty <= 0
+                f_recordPlan(dir, entryPrice, pSl, pTp, pRr, pRisk, pTpType, "FAIL", "SKIP_NO_QTY", patternName)
+            else
+                int n = array.get(gSeq, 0) + 1
+                array.set(gSeq, 0, n)
+                eid := LOGIC_ID + (dir > 0 ? "_L_" : "_S_") + str.tostring(n)
+                strategy.entry(eid, dir > 0 ? strategy.long : strategy.short, qty = qty)
+                //  Entry 時点の SL / TP をここで固定する。以後 Zone が変化しても更新しない。
+                strategy.exit(eid + "X", from_entry = eid, stop = pSl, limit = pTp,
+                     comment_profit = "TP", comment_loss = "SL")
+                f_recordPlan(dir, entryPrice, pSl, pTp, pRr, pRisk, pTpType, pStatus, pReason, eid + " · " + patternName)
+                if showEntryLabel
+                    string ltxt = (dir > 0 ? "LONG" : "SHORT") + "  " + patternName
+                    ltxt := ltxt + "\nEntry " + f_num(entryPrice, "#.##")
+                    ltxt := ltxt + "\nSL    " + f_num(pSl, "#.##")
+                    ltxt := ltxt + "\nTP    " + f_num(pTp, "#.##")
+                    ltxt := ltxt + "\nRR    " + f_num(pRr, "#.##")
+                    ltxt := ltxt + "\nMode  " + sltpMode + " (" + pTpType + ")"
+                    ltxt := ltxt + "\nQty   " + f_num(qty, "#.####")
+                    label.new(bar_index, dir > 0 ? low : high, text = ltxt,
+                         style = dir > 0 ? label.style_label_up : label.style_label_down,
+                         color = dir > 0 ? color.new(bgBuyCol, 20) : color.new(bgSellCol, 20),
+                         textcolor = color.white,
+                         size = size.small)
+    eid
+
+// ============================================================================
+// 08. ORDER EXECUTION + State Reset
+// ----------------------------------------------------------------------------
+//  ★ 同一バーで Pattern A と Pattern B が同時に成立することはない
+//    (A は SAW_FLAT からの青、B は SAW_RED からのフラットで、State が排他のため)。
+//  ★ LONG を先に処理する。Long が発注できた場合、反対方向の Short は
+//    allowOppositeEntry = false なら f_submitSignal 内で自動的に SKIP される。
+// ============================================================================
+string longEid  = f_submitSignal(longSignal,  1, close, longSigA  ? "Pattern A" : "Pattern B")
+string shortEid = f_submitSignal(shortSignal, -1, close, shortSigA ? "Pattern A" : "Pattern B")
+
+//  Entry 後の再アーム : 実際に発注できたときだけ待機状態を完全リセットする。
+//  発注できなかった場合 (TradePlan FAIL / Qty 不足 / ポジション制御) は
+//  待機イベントを消費せず、lsNext / ssNext の自然な次状態のまま継続する。
+if longEid != ""
+    lsNext := ST_WAIT
+if shortEid != ""
+    ssNext := ST_WAIT
+
+longState  := lsNext
+shortState := ssNext
+
+// ============================================================================
+// 09. DISPLAY / DEBUG
+// ============================================================================
+// ---- 9.1 SAT ライン / 背景 -------------------------------------------------
+plot(showL2 and not na(satL2Line) ? satL2Line : na, title = "SAT's BAND LINE2",
+     color = satL2Dir == 1 ? satUpCol : satL2Dir == -1 ? satDnCol : color.rgb(149, 152, 161),
+     linewidth = l2Width)
+plot(showL1 and not na(satL1Line) ? satL1Line : na, title = "SAT's BAND LINE1",
+     color = satL1Dir == 1 ? satUpCol : satL1Dir == -1 ? satDnCol : color.rgb(149, 152, 161),
+     linewidth = l1Width)
+plot(showStb and not na(satStbLine) ? satStbLine : na, title = "STB Line",
+     color = satStbDir == 1 ? satUpCol : satStbDir == -1 ? satDnCol : color.rgb(149, 152, 161),
+     linewidth = stbWidth)
+plot(showMa ? maVal : na, title = "MA",
+     color = maDir == 1 ? maUpCol : maDir == -1 ? maDnCol : maFlatCol,
+     linewidth = maWidth)
+
+color bgFinal = na
+if bg15 == BG_BLUE
+    bgFinal := color.new(bgBuyCol, bgTransp)
+else if bg15 == BG_RED
+    bgFinal := color.new(bgSellCol, bgTransp)
+bgcolor(bgFinal, title = "SAT 15s 背景")
+
+// ---- 9.2 Data Window (デバッグ用の数値) -----------------------------------
+//  背景 State : 1 = 青 / -1 = 赤 / 0 = フラット
+//  待機状態   : 0 = WAIT_INITIAL / 1 = ARMED / 2 = SAW_FLAT / 3 = SAW_RED(青)
+plot(bg15 * 1.0,  title = "DW: 15s 背景State",        display = display.data_window)
+plot(bg30 * 1.0,  title = "DW: 30s 確定背景State",     display = display.data_window)
+plot(bg1m * 1.0,  title = "DW: 1m 確定背景State",      display = display.data_window)
+plot(longState  * 1.0, title = "DW: LONG Pattern State",  display = display.data_window)
+plot(shortState * 1.0, title = "DW: SHORT Pattern State", display = display.data_window)
+plot(longState  != ST_WAIT ? 1.0 : 0.0, title = "DW: LONG 待機状態",  display = display.data_window)
+plot(shortState != ST_WAIT ? 1.0 : 0.0, title = "DW: SHORT 待機状態", display = display.data_window)
+plot(satStbLine,      title = "DW: STB 表示価格",   display = display.data_window)
+plot(satStbDir * 1.0, title = "DW: STB 方向",       display = display.data_window)
+plot(satL1Line,       title = "DW: LINE1 表示価格", display = display.data_window)
+plot(satL1Dir * 1.0,  title = "DW: LINE1 方向",     display = display.data_window)
+plot(satL2Line,       title = "DW: LINE2 表示価格", display = display.data_window)
+plot(satL2Dir * 1.0,  title = "DW: LINE2 方向",     display = display.data_window)
+
+// ---- 9.3 Zone Box (ZONE モードのみ・既定 OFF) -----------------------------
+var array<box> gBoxes = array.new<box>()
+
+f_zoneColor(int st) =>
+    st == ST_SUPPORT ? colSupport : st == ST_RESIST ? colResistance : st == ST_ACTIVE ? colActive : colBroken
+
+f_zoneTransp(int strength) =>
+    strength == SR_VSTRONG ? 55 : strength == SR_STRONG ? 68 : strength == SR_MEDIUM ? 80 : 90
+
+if barstate.islast
+    while array.size(gBoxes) > 0
+        box.delete(array.pop(gBoxes))
+    if useZoneSltp and showZones and zn.zoneCount(zoneEng) > 0
+        array<int> ord = zn.drawOrder(zoneEng, maxZonesDraw)
+        if array.size(ord) > 0
+            for k = 0 to array.size(ord) - 1
+                zn.Zone z = zn.zoneAt(zoneEng, array.get(ord, k))
+                color bc = f_zoneColor(z.state)
+                int   tr = f_zoneTransp(z.strength)
+                box b = box.new(
+                     left         = bar_index - zoneLeftBars,
+                     top          = z.top,
+                     right        = bar_index + zoneRightBars,
+                     bottom       = z.bottom,
+                     bgcolor      = color.new(bc, tr),
+                     border_color = color.new(bc, math.max(tr - 30, 0)),
+                     border_width = z.strength >= SR_STRONG ? 2 : 1,
+                     border_style = z.state == ST_BROKEN ? line.style_dashed : line.style_solid,
+                     xloc         = xloc.bar_index)
+                array.push(gBoxes, b)
+
+// ---- 9.4 Debug Table -------------------------------------------------------
+f_textSize(string s) =>
+    s == "tiny" ? size.tiny : s == "normal" ? size.normal : size.small
+
+var table dbgTable = table.new(position.top_right, 2, 14,
+     border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50))
+
+if showDebugTable and barstate.islast
+    color bgH = color.new(color.gray,  70)
+    color bgS = color.new(color.blue,  75)
+    color bgC = color.new(color.black, 60)
+    string ts0 = dbgTextSize
+
+    table.cell(dbgTable, 0, 0, "SAT MTF DEBUG", text_color = color.white, bgcolor = bgH, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 0, timeframe.period + "  /  " + sltpMode, text_color = color.white, bgcolor = bgH, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 1, "15s 背景", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 1, f_bgStr(bg15), text_color = f_bgCol(bg15), bgcolor = bgS, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 2, "30s 確定背景", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 2, f_bgStr(bg30) + "  [" + satTf30 + "]", text_color = f_bgCol(bg30), bgcolor = bgS, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 3, "1m 確定背景", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 3, f_bgStr(bg1m) + "  [" + satTf1m + "]", text_color = f_bgCol(bg1m), bgcolor = bgS, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 4, "LONG 待機状態", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 4, longState != ST_WAIT ? "ON" : "OFF",
+         text_color = longState != ST_WAIT ? bgBuyCol : color.rgb(149, 152, 161), bgcolor = bgC, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 5, "LONG Pattern State", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 5, f_longStateStr(longState), text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 6, "SHORT 待機状態", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 6, shortState != ST_WAIT ? "ON" : "OFF",
+         text_color = shortState != ST_WAIT ? bgSellCol : color.rgb(149, 152, 161), bgcolor = bgC, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 7, "SHORT Pattern State", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 7, f_shortStateStr(shortState), text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 8, "STB", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 8, f_num(satStbLine, format.mintick) + "  (Donchian 表示" + str.tostring(stbDcDisplayLen) + " / 転換" + str.tostring(stbDcStateLen) + ")",
+         text_color = satStbDir == 1 ? satUpCol : satStbDir == -1 ? satDnCol : color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 9, "LINE1", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 9, f_num(satL1Line, format.mintick) + "  (専用転換Band＋確認)",
+         text_color = satL1Dir == 1 ? satUpCol : satL1Dir == -1 ? satDnCol : color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 10, "LINE2", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 10, f_num(satL2Line, format.mintick) + "  (非対称ST / 終値 vs 最終LINE2)",
+         text_color = satL2Dir == 1 ? satUpCol : satL2Dir == -1 ? satDnCol : color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 11, "PLAN", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 11, array.get(gLastPlan, 0), text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 12, "STATUS", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 12, array.get(gLastPlan, 1) + "  |  Open " + str.tostring(strategy.opentrades) +
+         "  |  Closed " + str.tostring(strategy.closedtrades) +
+         (useZoneSltp ? "  |  Zones " + str.tostring(zoneCountNow) : ""),
+         text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 13, "QTY", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 13, array.get(gLastPlan, 2) +
+         (timeframe.in_seconds() != 15 ? "   ※本Strategyは15秒足チャート前提" : ""),
+         text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
