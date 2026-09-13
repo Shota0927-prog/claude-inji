@@ -11,6 +11,8 @@
 //
 //  ★★ 時間軸の分離 ★★
 //    SAT Entry Logic      … 15秒足 (30秒 / 1分 の確定背景を参照)
+//    Entry Filter ①       … 1分足の色遷移 State Machine (1分足1本につき1回更新)
+//    Entry Filter ②       … 5分足 SAT 背景 (確定足のみ / ZoneEngine Base TF とは別)
 //    Zone Engine          … Base TF 5分 (ZoneEngine v10 / チャート足から独立)
 //    TradePlan entryPrice … SAT Pattern 成立時の 15秒 close
 //
@@ -25,14 +27,16 @@
 //  構成:
 //    01. ALL INPUTS
 //         01-1 SAT PANEL (正式ロジック)
-//         01-2 MTF / Entry
+//         01-2 MTF / Entry / Entry Filter Mode
 //         01-3 SL/TP Mode  (ZONE / FIXED)
 //         01-4 Zone Engine (ZONE モード用)
 //         01-5 Trade Engine (Risk / Qty / Order)
 //         01-6 Display / Debug
 //    02. SAT PANEL 計算関数 (チャート足と HTF で完全に同一の関数を使う)
-//    03. SAT 背景 : 15s / 30s / 1m
+//    03. SAT 背景 : 15s / 30s / 1m / 5m
+//    03b. ENTRY FILTER ① : 1分足 色遷移 State Machine
 //    04. ENTRY STATE MACHINE (LONG / SHORT 独立)
+//    04b. ENTRY FILTER 合成 (① / ② / ①+②)
 //    05. ZONE ENGINE (ZONE モードのみ)
 //    06. RISK / QTY
 //    07. TRADE ENGINE (SL/TP 決定 → Qty → strategy.entry → strategy.exit)
@@ -231,6 +235,29 @@ satTf30 = input.timeframe("30S", "30秒足 の時間足指定", group = G_MTF,
      tooltip = "この時間足のコンテキスト内で STB / LINE1 / LINE2 / 背景 をすべて再計算する。\n15秒足のラインを流用しない。")
 satTf1m = input.timeframe("1",   "1分足 の時間足指定",  group = G_MTF,
      tooltip = "この時間足のコンテキスト内で STB / LINE1 / LINE2 / 背景 をすべて再計算する。")
+satTf5m = input.timeframe("5",   "5分足 の時間足指定 (Entry Filter ②)",  group = G_MTF,
+     tooltip = "Entry Filter ② で使う SAT 背景の時間足。\n" +
+     "★ ZoneEngine の Base TF とは別概念。こちらは SAT PANEL の\n" +
+     "  STB / LINE1 / LINE2 / 背景 を5分足コンテキストで正式に再計算したもの。\n" +
+     "15秒足の SAT ラインは流用しない。")
+
+// ---- Entry Filter (既存 Entry State Machine には手を入れない追加条件) -------
+var string G_FLT = "02 · Entry Filter"
+FM_1M   = "① 1m Transition"
+FM_5M   = "② 5m Background"
+FM_BOTH = "① + ②"
+entryFilterMode = input.string(FM_1M, "Entry Filter Mode",
+     options = ["① 1m Transition", "② 5m Background", "① + ②"], group = G_FLT,
+     tooltip = "既存の 15秒 Pattern A / B State Machine は一切変更しない。\n" +
+     "baseSignal が完成したあとに、この追加フィルターで通す / 落とすだけ。\n\n" +
+     "① 1m Transition : 現在の1分Regimeが「反対色から始まったか」を見る\n" +
+     "   LONG  … 1分 赤 → (フラット0本以上) → 青 で始まった青Regimeの間だけ許可\n" +
+     "   SHORT … 1分 青 → (フラット0本以上) → 赤 で始まった赤Regimeの間だけ許可\n\n" +
+     "② 5m Background : baseSignal 完成時点の「直近確定5分SAT背景」を見る\n" +
+     "   LONG … 青 / SHORT … 赤\n" +
+     "   ★ 5分が青になるまで待つ方式ではない。Signal 完成のその瞬間に判定し、\n" +
+     "     そこで不成立ならそのSignalは捨てる (あとから復活させない)。\n\n" +
+     "① + ② : 両方必須 (AND)。OR ではない。")
 
 var string G_DIR = "02 · MTF · Direction"
 enableLong  = input.bool(true, "Enable Long",  group = G_DIR)
@@ -769,6 +796,11 @@ f_longStateStr(int s) =>
     s == ST_WAIT ? "WAIT_INITIAL" : s == ST_ARMED ? "ARMED (青)" : s == ST_FLAT ? "SAW_FLAT" : "SAW_RED"
 f_shortStateStr(int s) =>
     s == ST_WAIT ? "WAIT_INITIAL" : s == ST_ARMED ? "ARMED (赤)" : s == ST_FLAT ? "SAW_FLAT" : "SAW_BLUE"
+//  1分 色遷移 State の表示名。isLong = true なら LONG 視点 (反対色 = 赤)。
+f_trStateStr(int s, bool isLong) =>
+    string opp = isLong ? "RED"  : "BLUE"
+    string val = isLong ? "BLUE" : "RED"
+    s == 0 ? "WAIT_" + opp : s == 1 ? "SAW_" + opp : s == 2 ? opp + "_THEN_FLAT" : "VALID_" + val
 
 // ============================================================================
 // 03. SAT 背景 : 15s (チャート足) / 30s / 1m
@@ -812,10 +844,103 @@ int bg1m = nz(request.security(syminfo.tickerid, satTf1m,
          bgSrcMode),
      lookahead = barmerge.lookahead_on), 0)
 
+// ---- Entry Filter ② 用 : 5分足 SAT 背景 ------------------------------------
+//  ★ ZoneEngine の Base TF とは別概念。SAT PANEL の STB / LINE1 / LINE2 / 背景 を
+//    5分足自身の OHLC から正式に再計算したもの。15秒足のラインは流用していない。
+//  ★ 30秒 / 1分と完全に同じ方式 : security 内部で [1] + lookahead_on。
+//    形成中の5分足は使わない。参照するのは常に「最後に確定した5分足」。
+int bg5m = nz(request.security(syminfo.tickerid, satTf5m,
+     f_satBgHtf(stbDcDisplayLen, stbDcStateLen,
+         l1SrcType, l1EmaLen, l1AtrLen, l1DpMult, l1Smooth, l1SmoothLen,
+         l1StateSrcType,
+         l1StateUpEmaLen, l1StateUpAtrLen, l1StateUpMult, l1StateUpSmooth, l1StateUpSmoothLen, l1StateUpConfirm,
+         l1StateDnEmaLen, l1StateDnAtrLen, l1StateDnMult, l1StateDnSmooth, l1StateDnSmoothLen, l1StateDnConfirm,
+         l2SrcType, l2EmaLen, l2AtrLen, l2DpMult, l2AtrSmooth, l2AtrSmoothLen, l2Smooth, l2SmoothLen,
+         l2PsAsymSrcType, l2PsAsymAtrLen, l2PsAsymUpFac, l2PsAsymDnFac, l2PsAsymDnFacHV, l2PsAsymVolTh, l2PsAsymFilter,
+         bgSrcMode),
+     lookahead = barmerge.lookahead_on), 0)
+
 // 移動平均線 (表示のみ・背景判定には使わない)
 float maSrc = f_src(maSrcType)
 float maVal = f_ma(maType, maSrc, maLen)
 int   maDir = maVal > maVal[1] ? 1 : maVal < maVal[1] ? -1 : 0
+
+// ============================================================================
+// 03b. ENTRY FILTER ① : 1分足 色遷移 State Machine
+// ----------------------------------------------------------------------------
+//  「現在の1分Regimeが、反対色から始まったRegimeか」を判定する。
+//
+//   LONG 有効パターン   1分 赤 → 青
+//                       1分 赤 → フラット(1本以上) → 青
+//   SHORT 有効パターン  1分 青 → 赤
+//                       1分 青 → フラット(1本以上) → 赤
+//   フラットは複数本連続してもよい。
+//
+//  ★ 有効期間 : その色を維持している間だけ。
+//    LONG は1分背景が青でなくなった時点 (フラット / 赤) で無効化する。
+//    「過去に一度 赤→青 になったから永久に有効」ではない。
+//
+//  ★ 更新タイミング (重要) ★
+//    bg1m は15秒チャート上では同じ確定1分背景が複数の15秒バーにわたって保持される。
+//    そのため15秒足ごとに遷移判定をしてはいけない (同じ1分背景を4回処理してしまう)。
+//    time(satTf1m) が切り替わった最初の15秒足 = 新しい確定1分足が bg1m へ
+//    反映されたタイミングでだけ State を更新する。1分足1本につき必ず1回。
+//    (bg1m は security 内部で [1] + lookahead_on を掛けているため、
+//     この瞬間にちょうど「いま閉じた1分足」の背景へ切り替わる)
+// ============================================================================
+int TR_WAIT_OPP = 0   // LONG: WAIT_RED      / SHORT: WAIT_BLUE
+int TR_SAW_OPP  = 1   // LONG: SAW_RED       / SHORT: SAW_BLUE
+int TR_OPP_FLAT = 2   // LONG: RED_THEN_FLAT / SHORT: BLUE_THEN_FLAT
+int TR_VALID    = 3   // LONG: VALID_BLUE    / SHORT: VALID_RED
+
+//  1分足が1本確定して bg1m が切り替わったバーで true。
+//  time() は request.security ではないので毎バー無条件に評価してよい。
+int  tf1mChange     = nz(ta.change(time(satTf1m)), 0)
+bool newConfirmed1m = bar_index > 0 and tf1mChange != 0
+
+// ----------------------------------------------------------------------------
+//  LONG / SHORT で同じ関数を使う (呼び出し箇所ごとに var State は独立する)。
+//    LONG  : oppColor = 赤   / validColor = 青
+//    SHORT : oppColor = 青   / validColor = 赤
+//  これにより SHORT が LONG の完全対称であることがコード上で保証される。
+//
+//    WAIT_OPP  : 反対色を見たら SAW_OPP / それ以外は維持
+//                (反対色を経ていない有効色はここでは valid にしない)
+//    SAW_OPP   : 反対色なら維持 / フラットなら OPP_FLAT / 有効色なら VALID
+//    OPP_FLAT  : フラットなら維持 / 有効色なら VALID / 反対色なら SAW_OPP
+//    VALID     : 有効色なら維持 / フラットなら WAIT_OPP (無効化) / 反対色なら SAW_OPP
+//
+//  ※ VALID からフラットへ抜けたら WAIT_OPP へ戻す。
+//    そうしないと 青 → フラット → 青 が valid になってしまい、
+//    「反対色から始まった Regime か」という条件が崩れるため。
+// ----------------------------------------------------------------------------
+f_1mTransition(int bg, int oppColor, int validColor, bool doUpdate) =>
+    var int st = 0
+    if doUpdate
+        if st == TR_WAIT_OPP
+            if bg == oppColor
+                st := TR_SAW_OPP
+        else if st == TR_SAW_OPP
+            if bg == validColor
+                st := TR_VALID
+            else if bg == BG_FLAT
+                st := TR_OPP_FLAT
+        else if st == TR_OPP_FLAT
+            if bg == validColor
+                st := TR_VALID
+            else if bg == oppColor
+                st := TR_SAW_OPP
+        else
+            if bg == oppColor
+                st := TR_SAW_OPP
+            else if bg == BG_FLAT
+                st := TR_WAIT_OPP
+    st
+
+int  long1mTrState  = f_1mTransition(bg1m, BG_RED,  BG_BLUE, newConfirmed1m)
+int  short1mTrState = f_1mTransition(bg1m, BG_BLUE, BG_RED,  newConfirmed1m)
+bool long1mTransitionValid  = long1mTrState  == TR_VALID
+bool short1mTransitionValid = short1mTrState == TR_VALID
 
 // ============================================================================
 // 04. ENTRY STATE MACHINE
@@ -918,9 +1043,47 @@ if barConfirmed
         else if bg15 == BG_RED
             ssNext := ST_ARMED
 
-//  Entry Signal。方向の ON/OFF は Trade Engine 側でも必ず通す。
-bool longSignal  = longSigA  or longSigB
-bool shortSignal = shortSigA or shortSigB
+//  既存の15秒 Pattern A / B が完成したことを示す素の Signal。
+//  ★ 以下のフィルターはこの Signal を「通す / 落とす」だけで、
+//    Pattern A / B の State Machine (lsNext / ssNext) には一切影響しない。
+bool baseLongSignal  = longSigA  or longSigB
+bool baseShortSignal = shortSigA or shortSigB
+
+// ============================================================================
+// 04b. ENTRY FILTER 合成
+// ----------------------------------------------------------------------------
+//  ① 1m Transition : 現在の1分Regimeが反対色から始まったか (03b の State Machine)
+//  ② 5m Background : baseSignal 完成「その瞬間」の直近確定5分SAT背景
+//
+//  ★ ② は「5分が青になるまで待つ」方式ではない。
+//    baseSignal が完成した15秒足の確定時点で直近確定5分背景を見て、
+//    そこで不成立ならその Signal は捨てる。あとから5分が青になっても
+//    過去の Signal を復活させて Entry することはしない
+//    (baseLongSignal はそのバーだけ true になる瞬間値なので、構造的に起きない)。
+//
+//  ★ ① + ② は AND。OR ではない。
+//  ★ ①②とも Mode に関係なく常に計算する (Debug 比較のため)。
+//    Entry 可否に使うのは Mode で選ばれたものだけ。
+// ============================================================================
+bool f1LongPass  = long1mTransitionValid
+bool f1ShortPass = short1mTransitionValid
+bool f2LongPass  = bg5m == BG_BLUE
+bool f2ShortPass = bg5m == BG_RED
+
+bool filterLongPass  = false
+bool filterShortPass = false
+if entryFilterMode == FM_1M
+    filterLongPass  := f1LongPass
+    filterShortPass := f1ShortPass
+else if entryFilterMode == FM_5M
+    filterLongPass  := f2LongPass
+    filterShortPass := f2ShortPass
+else
+    filterLongPass  := f1LongPass  and f2LongPass
+    filterShortPass := f1ShortPass and f2ShortPass
+
+bool longSignal  = baseLongSignal  and filterLongPass
+bool shortSignal = baseShortSignal and filterShortPass
 
 // ============================================================================
 // 05. ZONE ENGINE  (ZONE モードのみ / Base TF = 5分)
@@ -1374,6 +1537,7 @@ f_submitSignal(bool signal, int dir, float entryPrice, string patternName) =>
                     ltxt := ltxt + "\nTP    " + f_num(pTp, "#.##")
                     ltxt := ltxt + "\nRR    " + f_num(pRr, "#.##")
                     ltxt := ltxt + "\nMode  " + sltpMode + " (" + pTpType + ")"
+                    ltxt := ltxt + "\nFilter " + entryFilterMode
                     ltxt := ltxt + "\nQty   " + f_num(qty, "#.####")
                     label.new(bar_index, dir > 0 ? low : high, text = ltxt,
                          style = dir > 0 ? label.style_label_up : label.style_label_down,
@@ -1389,6 +1553,14 @@ f_submitSignal(bool signal, int dir, float entryPrice, string patternName) =>
 //    (A は SAW_FLAT からの青、B は SAW_RED からのフラットで、State が排他のため)。
 //  ★ LONG を先に処理する。Long が発注できた場合、反対方向の Short は
 //    allowOppositeEntry = false なら f_submitSignal 内で自動的に SKIP される。
+//
+//  ★ Entry Filter で落ちた場合の State 遷移 (重要) ★
+//    longSignal / shortSignal は「baseSignal AND フィルター」なので、
+//    フィルター不成立なら f_submitSignal は何もせず eid = "" を返す。
+//    下の再アームは eid != "" のときだけ走るため、15秒 State Machine は
+//    そのバーで本来遷移するはずの自然な次状態 (lsNext / ssNext) のまま残る。
+//    Pattern A 完成 → フィルター NG → Entry なし → State は ARMED のまま、
+//    という既存の遷移がそのまま維持される。WAIT_INITIAL へ強制リセットはしない。
 // ============================================================================
 string longEid  = f_submitSignal(longSignal,  1, close, longSigA  ? "Pattern A" : "Pattern B")
 string shortEid = f_submitSignal(shortSignal, -1, close, shortSigA ? "Pattern A" : "Pattern B")
@@ -1403,6 +1575,23 @@ if shortEid != ""
 
 longState  := lsNext
 shortState := ssNext
+
+//  Pattern A / B 別の Entry 回数 (表示専用。Entry 判定には一切使わない)。
+//  Filter Mode を切り替えたときに A / B のどちらが削られたかを比較するため。
+var int cntLongA  = 0
+var int cntLongB  = 0
+var int cntShortA = 0
+var int cntShortB = 0
+if longEid != ""
+    if longSigA
+        cntLongA := cntLongA + 1
+    else
+        cntLongB := cntLongB + 1
+if shortEid != ""
+    if shortSigA
+        cntShortA := cntShortA + 1
+    else
+        cntShortB := cntShortB + 1
 
 // ============================================================================
 // 09. DISPLAY / DEBUG
@@ -1434,6 +1623,26 @@ bgcolor(bgFinal, title = "SAT 15s 背景")
 plot(bg15 * 1.0,  title = "DW: 15s 背景State",        display = display.data_window)
 plot(bg30 * 1.0,  title = "DW: 30s 確定背景State",     display = display.data_window)
 plot(bg1m * 1.0,  title = "DW: 1m 確定背景State",      display = display.data_window)
+plot(bg5m * 1.0,  title = "DW: 5m 確定背景State",      display = display.data_window)
+//  Entry Filter ① : 1分 色遷移 State
+//    0 = WAIT_OPP / 1 = SAW_OPP / 2 = OPP_THEN_FLAT / 3 = VALID
+plot(long1mTrState  * 1.0, title = "DW: 1m Transition LONG State",  display = display.data_window)
+plot(short1mTrState * 1.0, title = "DW: 1m Transition SHORT State", display = display.data_window)
+plot(long1mTransitionValid  ? 1.0 : 0.0, title = "DW: 1m Transition LONG Valid",  display = display.data_window)
+plot(short1mTransitionValid ? 1.0 : 0.0, title = "DW: 1m Transition SHORT Valid", display = display.data_window)
+//  各フィルターの通過可否 (Mode に関係なく常に計算している)
+plot(f1LongPass  ? 1.0 : 0.0, title = "DW: ① LONG Pass",  display = display.data_window)
+plot(f1ShortPass ? 1.0 : 0.0, title = "DW: ① SHORT Pass", display = display.data_window)
+plot(f2LongPass  ? 1.0 : 0.0, title = "DW: ② LONG Pass",  display = display.data_window)
+plot(f2ShortPass ? 1.0 : 0.0, title = "DW: ② SHORT Pass", display = display.data_window)
+//  Entry Filter Mode : 1 = ① / 2 = ② / 3 = ①+②
+plot(entryFilterMode == FM_1M ? 1.0 : entryFilterMode == FM_5M ? 2.0 : 3.0,
+     title = "DW: Entry Filter Mode", display = display.data_window)
+//  素の Signal (フィルター適用前) と 最終 Signal (適用後)
+plot(baseLongSignal  ? 1.0 : 0.0, title = "DW: base LONG Signal",  display = display.data_window)
+plot(baseShortSignal ? 1.0 : 0.0, title = "DW: base SHORT Signal", display = display.data_window)
+plot(longSignal  ? 1.0 : 0.0, title = "DW: final LONG Signal",  display = display.data_window)
+plot(shortSignal ? 1.0 : 0.0, title = "DW: final SHORT Signal", display = display.data_window)
 plot(longState  * 1.0, title = "DW: LONG Pattern State",  display = display.data_window)
 plot(shortState * 1.0, title = "DW: SHORT Pattern State", display = display.data_window)
 plot(longState  != ST_WAIT ? 1.0 : 0.0, title = "DW: LONG 待機状態",  display = display.data_window)
@@ -1480,13 +1689,14 @@ if barstate.islast
 f_textSize(string s) =>
     s == "tiny" ? size.tiny : s == "normal" ? size.normal : size.small
 
-var table dbgTable = table.new(position.top_right, 2, 15,
+var table dbgTable = table.new(position.top_right, 2, 18,
      border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50))
 
 if showDebugTable and barstate.islast
     color bgH = color.new(color.gray,  70)
     color bgS = color.new(color.blue,  75)
     color bgC = color.new(color.black, 60)
+    color bgF = color.new(color.purple, 70)
     string ts0 = dbgTextSize
 
     table.cell(dbgTable, 0, 0, "SAT MTF DEBUG", text_color = color.white, bgcolor = bgH, text_size = f_textSize(ts0))
@@ -1501,45 +1711,66 @@ if showDebugTable and barstate.islast
     table.cell(dbgTable, 0, 3, "1m 確定背景", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
     table.cell(dbgTable, 1, 3, f_bgStr(bg1m) + "  [" + satTf1m + "]", text_color = f_bgCol(bg1m), bgcolor = bgS, text_size = f_textSize(ts0))
 
-    table.cell(dbgTable, 0, 4, "LONG 待機状態", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
-    table.cell(dbgTable, 1, 4, longState != ST_WAIT ? "ON" : "OFF",
+    table.cell(dbgTable, 0, 4, "5m 確定背景", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 4, f_bgStr(bg5m) + "  [" + satTf5m + "]  ※Entry Filter ② 用 (ZoneEngine Base TF とは別)",
+         text_color = f_bgCol(bg5m), bgcolor = bgS, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 5, "Entry Filter", text_color = color.white, bgcolor = bgF, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 5, entryFilterMode +
+         "   ①L " + (f1LongPass ? "PASS" : "-") + " / ①S " + (f1ShortPass ? "PASS" : "-") +
+         "   ②L " + (f2LongPass ? "PASS" : "-") + " / ②S " + (f2ShortPass ? "PASS" : "-") +
+         "   → 適用 L " + (filterLongPass ? "PASS" : "BLOCK") +
+         " / S " + (filterShortPass ? "PASS" : "BLOCK"),
+         text_color = color.white, bgcolor = bgF, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 6, "1m Transition", text_color = color.white, bgcolor = bgF, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 6,
+         "LONG "  + f_trStateStr(long1mTrState,  true)  + " → " + (long1mTransitionValid  ? "VALID" : "invalid") +
+         "   |   SHORT " + f_trStateStr(short1mTrState, false) + " → " + (short1mTransitionValid ? "VALID" : "invalid"),
+         text_color = long1mTransitionValid ? bgBuyCol : short1mTransitionValid ? bgSellCol : color.white,
+         bgcolor = bgF, text_size = f_textSize(ts0))
+
+    table.cell(dbgTable, 0, 7, "LONG 待機状態", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 7, longState != ST_WAIT ? "ON" : "OFF",
          text_color = longState != ST_WAIT ? bgBuyCol : color.rgb(149, 152, 161), bgcolor = bgC, text_size = f_textSize(ts0))
 
-    table.cell(dbgTable, 0, 5, "LONG Pattern State", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
-    table.cell(dbgTable, 1, 5, f_longStateStr(longState), text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 0, 8, "LONG Pattern State", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 8, f_longStateStr(longState), text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
 
-    table.cell(dbgTable, 0, 6, "SHORT 待機状態", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
-    table.cell(dbgTable, 1, 6, shortState != ST_WAIT ? "ON" : "OFF",
+    table.cell(dbgTable, 0, 9, "SHORT 待機状態", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 9, shortState != ST_WAIT ? "ON" : "OFF",
          text_color = shortState != ST_WAIT ? bgSellCol : color.rgb(149, 152, 161), bgcolor = bgC, text_size = f_textSize(ts0))
 
-    table.cell(dbgTable, 0, 7, "SHORT Pattern State", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
-    table.cell(dbgTable, 1, 7, f_shortStateStr(shortState), text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 0, 10, "SHORT Pattern State", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 10, f_shortStateStr(shortState), text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
 
-    table.cell(dbgTable, 0, 8, "STB", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
-    table.cell(dbgTable, 1, 8, f_num(satStbLine, format.mintick) + "  (Donchian 表示" + str.tostring(stbDcDisplayLen) + " / 転換" + str.tostring(stbDcStateLen) + ")",
+    table.cell(dbgTable, 0, 11, "STB", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 11, f_num(satStbLine, format.mintick) + "  (Donchian 表示" + str.tostring(stbDcDisplayLen) + " / 転換" + str.tostring(stbDcStateLen) + ")",
          text_color = satStbDir == 1 ? satUpCol : satStbDir == -1 ? satDnCol : color.white, bgcolor = bgC, text_size = f_textSize(ts0))
 
-    table.cell(dbgTable, 0, 9, "LINE1", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
-    table.cell(dbgTable, 1, 9, f_num(satL1Line, format.mintick) + "  (専用転換Band＋確認)",
+    table.cell(dbgTable, 0, 12, "LINE1", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 12, f_num(satL1Line, format.mintick) + "  (専用転換Band＋確認)",
          text_color = satL1Dir == 1 ? satUpCol : satL1Dir == -1 ? satDnCol : color.white, bgcolor = bgC, text_size = f_textSize(ts0))
 
-    table.cell(dbgTable, 0, 10, "LINE2", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
-    table.cell(dbgTable, 1, 10, f_num(satL2Line, format.mintick) + "  (非対称ST / 終値 vs 最終LINE2)",
+    table.cell(dbgTable, 0, 13, "LINE2", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 13, f_num(satL2Line, format.mintick) + "  (非対称ST / 終値 vs 最終LINE2)",
          text_color = satL2Dir == 1 ? satUpCol : satL2Dir == -1 ? satDnCol : color.white, bgcolor = bgC, text_size = f_textSize(ts0))
 
-    table.cell(dbgTable, 0, 11, "PLAN", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
-    table.cell(dbgTable, 1, 11, array.get(gLastPlan, 0), text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 0, 14, "PLAN", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 14, array.get(gLastPlan, 0), text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
 
-    table.cell(dbgTable, 0, 12, "STATUS", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
-    table.cell(dbgTable, 1, 12, array.get(gLastPlan, 1) + "  |  Open " + str.tostring(strategy.opentrades) +
+    table.cell(dbgTable, 0, 15, "STATUS", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 15, array.get(gLastPlan, 1) + "  |  Open " + str.tostring(strategy.opentrades) +
          "  |  Closed " + str.tostring(strategy.closedtrades) +
+         "  |  Entry L A" + str.tostring(cntLongA) + "/B" + str.tostring(cntLongB) +
+         " S A" + str.tostring(cntShortA) + "/B" + str.tostring(cntShortB) +
          (useZoneSltp ? "  |  Zones " + str.tostring(zoneCountNow) +
               "  |  ZoneUpd " + str.tostring(zoneUpdateCnt) +
               "  |  BaseSeq " + str.tostring(zoneBaseSeq) : ""),
          text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
 
-    table.cell(dbgTable, 0, 13, "Zone Base TF", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
-    table.cell(dbgTable, 1, 13,
+    table.cell(dbgTable, 0, 16, "Zone Base TF", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 16,
          not useZoneSltp ? "FIXED モードのため Zone 未使用" :
          zoneBaseTf + "  確定足 O " + f_num(bOpen, "#.##") +
          " / H " + f_num(bHigh, "#.##") + " / L " + f_num(bLow, "#.##") +
@@ -1550,7 +1781,7 @@ if showDebugTable and barstate.islast
          (newBaseBar ? "   ← このバーで Zone 更新" : ""),
          text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
 
-    table.cell(dbgTable, 0, 14, "QTY", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
-    table.cell(dbgTable, 1, 14, array.get(gLastPlan, 2) +
+    table.cell(dbgTable, 0, 17, "QTY", text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 17, array.get(gLastPlan, 2) +
          (timeframe.in_seconds() != 15 ? "   ※本Strategyは15秒足チャート前提" : ""),
          text_color = color.white, bgcolor = bgC, text_size = f_textSize(ts0))
