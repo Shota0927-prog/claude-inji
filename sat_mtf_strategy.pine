@@ -12,7 +12,8 @@
 //  ★★ 時間軸の分離 ★★
 //    SAT Entry Logic      … 15秒足 (30秒 / 1分 の確定背景を参照)
 //    Entry Filter ①       … 1分足の色遷移 State Machine (1分足1本につき1回更新)
-//    Entry Filter ②       … 5分足 SAT 背景 (確定足のみ / ZoneEngine Base TF とは別)
+//    Entry Filter ②       … baseSignal 後に待機し、確定5分 SAT 背景が目的色へ
+//                            切り替わった時点で Entry (ZoneEngine Base TF とは別)
 //    Zone Engine          … Base TF 5分 (ZoneEngine v10 / チャート足から独立)
 //    TradePlan entryPrice … SAT Pattern 成立時の 15秒 close
 //
@@ -198,6 +199,8 @@ satTf1m = input.timeframe("1",   "1分足 の時間足指定",  group = G_MTF,
      tooltip = "この時間足のコンテキスト内で STB / LINE1 / LINE2 / 背景 をすべて再計算する。")
 satTf5m = input.timeframe("5",   "5分足 の時間足指定 (Entry Filter ②)",  group = G_MTF,
      tooltip = "Entry Filter ② で使う SAT 背景の時間足。\n" +
+     "baseSignal 成立後に待機へ入り、この時間足の確定背景が目的色へ\n" +
+     "切り替わった最初の15秒確定足で Entry する。\n" +
      "★ ZoneEngine の Base TF とは別概念。こちらは SAT BAND Reconstruction の\n" +
      "  LINE1 / LINE2 / STB / 背景 を5分足コンテキストで再計算したもの。\n" +
      "15秒足の SAT ラインは流用しない。")
@@ -214,11 +217,16 @@ entryFilterMode = input.string(FM_1M, "Entry Filter Mode",
      "① 1m Transition : 現在の1分Regimeが「反対色から始まったか」を見る\n" +
      "   LONG  … 1分 赤 → (フラット0本以上) → 青 で始まった青Regimeの間だけ許可\n" +
      "   SHORT … 1分 青 → (フラット0本以上) → 赤 で始まった赤Regimeの間だけ許可\n\n" +
-     "② 5m Background : baseSignal 完成時点の「直近確定5分SAT背景」を見る\n" +
-     "   LONG … 青 / SHORT … 赤\n" +
-     "   ★ 5分が青になるまで待つ方式ではない。Signal 完成のその瞬間に判定し、\n" +
-     "     そこで不成立ならそのSignalは捨てる (あとから復活させない)。\n\n" +
-     "① + ② : 両方必須 (AND)。OR ではない。")
+     "② 5m Background : baseSignal 完成後に待機し、確定5分SAT背景が目的色へ\n" +
+     "   切り替わった最初の15秒確定足で Entry する (待機方式)\n" +
+     "   ★ baseSignal 成立時点ですでに5分が目的色でも、その場では Entry しない。\n" +
+     "     非目的色 → 目的色 の切り替わりが Signal 発生後に起きることを要求する。\n" +
+     "   ★ 待機中は確定1分背景が目的色 (LONG 青 / SHORT 赤) を維持することが必須。\n" +
+     "     フラットまたは反対色になった時点でその Signal を破棄する。\n" +
+     "     あとから1分が戻っても古い Signal は復活しない (新しい baseSignal が必要)。\n" +
+     "   ★ 1方向につき待機は最大1つ。待機中の新しい Pattern A / B は重複登録しない。\n\n" +
+     "① + ② : baseSignal 成立時点で①を満たしていることを待機開始の条件にし、\n" +
+     "   そのあと②の5分待機へ進む。OR ではない。")
 
 var string G_DIR = "02 · MTF · Direction"
 enableLong  = input.bool(true, "Enable Long",  group = G_DIR)
@@ -861,37 +869,88 @@ bool baseShortSignal = shortSigA or shortSigB
 // 04b. ENTRY FILTER 合成
 // ----------------------------------------------------------------------------
 //  ① 1m Transition : 現在の1分Regimeが反対色から始まったか (03b の State Machine)
-//  ② 5m Background : baseSignal 完成「その瞬間」の直近確定5分SAT背景
+//  ② 5m Background : baseSignal 完成後に「待機」へ入り、その後 確定5分SAT背景が
+//                    目的色へ切り替わった最初の15秒確定足で Entry する
 //
-//  ★ ② は「5分が青になるまで待つ」方式ではない。
-//    baseSignal が完成した15秒足の確定時点で直近確定5分背景を見て、
-//    そこで不成立ならその Signal は捨てる。あとから5分が青になっても
-//    過去の Signal を復活させて Entry することはしない
-//    (baseLongSignal はそのバーだけ true になる瞬間値なので、構造的に起きない)。
+//  ★ ② は待機方式 ★
+//    1) baseSignal 成立 → その場では Entry せず pending = true にする
+//       (その時点ですでに5分が目的色でも Entry しない)
+//    2) 待機中は確定1分背景が目的色を維持していることが必須
+//       FLAT または反対色になった時点で pending = false にして Signal を破棄する。
+//       あとから1分が戻っても古い Signal は復活させない (新しい baseSignal が必要)
+//    3) 待機中に「確定5分背景が目的色へ切り替わった」新しい確定5分更新が来たら Entry
+//       単に bg5m == 目的色 では発火しない。非目的色 → 目的色 の遷移が必要。
 //
-//  ★ ① + ② は AND。OR ではない。
-//  ★ ①②とも Mode に関係なく常に計算する (Debug 比較のため)。
-//    Entry 可否に使うのは Mode で選ばれたものだけ。
+//  ★ 1方向につき pending は最大 1 つ。
+//    待機中に新しい Pattern A / B が出ても重複登録しない (その Signal は捨てる)。
+//    pending が解除されるのは「Entry 成立」か「1分条件が崩れた」ときだけ。
+//
+//  ★ ①のみモードは従来どおり即 Entry (待機しない)。
+//  ★ ①+② は baseSignal 成立時点で①を満たしていることを待機開始の条件にし、
+//    そのあと②の5分待機へ進む。待機中に1分が FLAT / 反対色になれば
+//    ①の valid も自動的に外れるので、pending 解除と同時に Signal は破棄される。
 // ============================================================================
 bool f1LongPass  = long1mTransitionValid
 bool f1ShortPass = short1mTransitionValid
-bool f2LongPass  = bg5m == BG_BLUE
-bool f2ShortPass = bg5m == BG_RED
 
-bool filterLongPass  = false
-bool filterShortPass = false
-if entryFilterMode == FM_1M
-    filterLongPass  := f1LongPass
-    filterShortPass := f1ShortPass
-else if entryFilterMode == FM_5M
-    filterLongPass  := f2LongPass
-    filterShortPass := f2ShortPass
-else
-    filterLongPass  := f1LongPass  and f2LongPass
-    filterShortPass := f1ShortPass and f2ShortPass
+// ---- 確定5分背景が「目的色へ切り替わった」イベント --------------------------
+//  bg5m は security 内部で [1] + lookahead_on を掛けているため、
+//  time(satTf5m) が切り替わった最初の15秒足でちょうど「いま閉じた5分足」の
+//  背景へ更新される。そのタイミングだけを見て遷移を判定する。
+//  5分足1本につき必ず1回。形成中5分足は使わない。
+int  tf5mChange     = nz(ta.change(time(satTf5m)), 0)
+bool newConfirmed5m = bar_index > 0 and tf5mChange != 0
 
-bool longSignal  = baseLongSignal  and filterLongPass
-bool shortSignal = baseShortSignal and filterShortPass
+var int bg5mPrevConfirmed = 0
+bool bg5mTurnedBlue = false
+bool bg5mTurnedRed  = false
+if newConfirmed5m
+    bg5mTurnedBlue := bg5m == BG_BLUE and bg5mPrevConfirmed != BG_BLUE
+    bg5mTurnedRed  := bg5m == BG_RED  and bg5mPrevConfirmed != BG_RED
+    bg5mPrevConfirmed := bg5m
+
+// ---- ② 待機 State -----------------------------------------------------------
+var bool long5mPending  = false
+var bool short5mPending = false
+
+bool use5mPending = entryFilterMode == FM_5M or entryFilterMode == FM_BOTH
+
+//  Debug 用の「②発火条件が成立したか」。Entry 判定にもそのまま使う。
+bool f2LongPass  = false
+bool f2ShortPass = false
+
+bool longSignal  = false
+bool shortSignal = false
+
+if barConfirmed
+    if use5mPending
+        //  1) 待機キャンセル : 確定1分背景が目的色でなくなったら Signal を破棄
+        if long5mPending and bg1m != BG_BLUE
+            long5mPending := false
+        if short5mPending and bg1m != BG_RED
+            short5mPending := false
+        //  2) 発火 : 待機中に確定5分背景が目的色へ切り替わった最初の15秒確定足
+        //     ★ 3) の待機開始より先に評価する。こうすることで「baseSignal と
+        //       5分の切り替わりが同じ15秒足で起きた」ケースでも即 Entry にならず、
+        //       必ず「Signal 発生後の切り替わり」だけが発火条件になる。
+        if long5mPending and bg5mTurnedBlue
+            f2LongPass := true
+            longSignal := true
+        if short5mPending and bg5mTurnedRed
+            f2ShortPass := true
+            shortSignal := true
+        //  3) 待機開始 : 1方向につき最大1つ。すでに待機中なら重複登録しない。
+        //     ①+② では待機開始の時点で①を満たしていることを要求する。
+        bool armLong  = baseLongSignal  and (entryFilterMode == FM_BOTH ? f1LongPass  : true)
+        bool armShort = baseShortSignal and (entryFilterMode == FM_BOTH ? f1ShortPass : true)
+        if not long5mPending and armLong
+            long5mPending := true
+        if not short5mPending and armShort
+            short5mPending := true
+    else
+        //  ①のみ : 従来どおり baseSignal AND ① で即 Entry
+        longSignal  := baseLongSignal  and f1LongPass
+        shortSignal := baseShortSignal and f1ShortPass
 
 // ============================================================================
 // 05. ZONE ENGINE  (ZONE モードのみ / Base TF = 5分)
@@ -1376,10 +1435,16 @@ string shortEid = f_submitSignal(shortSignal, -1, close, shortSigA ? "Pattern A"
 //  Entry 後の再アーム : 実際に発注できたときだけ待機状態を完全リセットする。
 //  発注できなかった場合 (TradePlan FAIL / Qty 不足 / ポジション制御) は
 //  待機イベントを消費せず、lsNext / ssNext の自然な次状態のまま継続する。
+//  ★ Entry Filter ② の pending も「Entry 成立」でのみ解除する。
+//    発注できなかった場合は pending を残し、次に確定5分背景が目的色へ
+//    切り替わったタイミングで再度発火できるようにする
+//    (1分条件が崩れればそこで破棄される)。
 if longEid != ""
     lsNext := ST_WAIT
+    long5mPending := false
 if shortEid != ""
     ssNext := ST_WAIT
+    short5mPending := false
 
 longState  := lsNext
 shortState := ssNext
@@ -1441,8 +1506,13 @@ plot(short1mTransitionValid ? 1.0 : 0.0, title = "DW: 1m Transition SHORT Valid"
 //  各フィルターの通過可否 (Mode に関係なく常に計算している)
 plot(f1LongPass  ? 1.0 : 0.0, title = "DW: ① LONG Pass",  display = display.data_window)
 plot(f1ShortPass ? 1.0 : 0.0, title = "DW: ① SHORT Pass", display = display.data_window)
-plot(f2LongPass  ? 1.0 : 0.0, title = "DW: ② LONG Pass",  display = display.data_window)
-plot(f2ShortPass ? 1.0 : 0.0, title = "DW: ② SHORT Pass", display = display.data_window)
+plot(f2LongPass  ? 1.0 : 0.0, title = "DW: ② LONG Pass (発火)",  display = display.data_window)
+plot(f2ShortPass ? 1.0 : 0.0, title = "DW: ② SHORT Pass (発火)", display = display.data_window)
+//  ② の待機状態と、確定5分背景が目的色へ切り替わったイベント
+plot(long5mPending  ? 1.0 : 0.0, title = "DW: ② LONG Pending",  display = display.data_window)
+plot(short5mPending ? 1.0 : 0.0, title = "DW: ② SHORT Pending", display = display.data_window)
+plot(bg5mTurnedBlue ? 1.0 : 0.0, title = "DW: 5m turned BLUE",  display = display.data_window)
+plot(bg5mTurnedRed  ? 1.0 : 0.0, title = "DW: 5m turned RED",   display = display.data_window)
 //  Entry Filter Mode : 1 = ① / 2 = ② / 3 = ①+②
 plot(entryFilterMode == FM_1M ? 1.0 : entryFilterMode == FM_5M ? 2.0 : 3.0,
      title = "DW: Entry Filter Mode", display = display.data_window)
@@ -1535,10 +1605,11 @@ if showDebugTable and barstate.islast
 
     table.cell(dbgTable, 0, 5, "Entry Filter", text_color = color.white, bgcolor = bgF, text_size = f_textSize(ts0))
     table.cell(dbgTable, 1, 5, entryFilterMode +
-         "   ①L " + (f1LongPass ? "PASS" : "-") + " / ①S " + (f1ShortPass ? "PASS" : "-") +
-         "   ②L " + (f2LongPass ? "PASS" : "-") + " / ②S " + (f2ShortPass ? "PASS" : "-") +
-         "   → 適用 L " + (filterLongPass ? "PASS" : "BLOCK") +
-         " / S " + (filterShortPass ? "PASS" : "BLOCK"),
+         "   ①L " + (f1LongPass ? "VALID" : "-") + " / ①S " + (f1ShortPass ? "VALID" : "-") +
+         "   ② pending L " + (long5mPending ? "WAIT" : "-") +
+         " / S " + (short5mPending ? "WAIT" : "-") +
+         "   5m turn " + (bg5mTurnedBlue ? "→BLUE" : bg5mTurnedRed ? "→RED" : "-") +
+         "   発火 L " + (f2LongPass ? "FIRE" : "-") + " / S " + (f2ShortPass ? "FIRE" : "-"),
          text_color = color.white, bgcolor = bgF, text_size = f_textSize(ts0))
 
     table.cell(dbgTable, 0, 6, "1m Transition", text_color = color.white, bgcolor = bgF, text_size = f_textSize(ts0))
