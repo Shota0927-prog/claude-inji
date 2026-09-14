@@ -533,8 +533,11 @@ int zoneCountNow = zn.update(zoneEng, zoneCfg, zoneFeed)
 //    定義: バーのレンジが Zone と重なったら Touch。一度 Re-arm Distance 以上
 //    離れてから再接触した場合のみ次の Touch として数える。
 //    同じ接近中に Zone 内で複数バー推移しても加算されない。
-//  ★ vzTouchCnt の宣言だけ、Section 09 (描画) より前で必要になるためここに置く。
-//    更新は従来どおり Section 10.6.1 だけで行う。
+//  ★ TouchCount は vzTouchCnt 1本だけで管理する (二重管理しない)。
+//    宣言はここ (Section 09 の描画より前で必要なため)、更新は Section 10.6.1 のみ。
+//    10.6.1 は useValidation ではなく barstate.isconfirmed だけでゲートしているので、
+//    Enable Validation Logger = OFF でも Touch回数は進み、Touch降格も機能する。
+//    Validation Logger 側の CSVイベントも同じ vzTouchCnt を参照する。
 var map<int, int> vzTouchCnt = map.new<int, int>()
 
 var string G_EFF = "08b · Effective Strength (Touch消耗)"
@@ -667,9 +670,14 @@ plot(isGold and showMaLines and useMaSource ? ma2Val : na, "MA #2 (1M)", color =
 // ---- 10.1 検証用 Inputs ----------------------------------------------------
 var string G_VAL = "10 · Zone Validation (検証専用)"
 useValidation = input.bool(true, "Enable Validation Logger", group = G_VAL,
-     tooltip = "OFFにすると検証処理を完全に停止する。ZoneEngine側の結果はON/OFFで変化しない。")
+     tooltip = "CSVイベント生成 / MFE追跡 / Queue出力 だけを ON/OFF する。\n" +
+     "Zone登録簿 / Touch判定 / Re-arm / TouchCount加算 は常時動作するため、\n" +
+     "OFF にしても Effective Strength の Touch降格は有効なまま。\n" +
+     "ZoneEngine側の結果は ON/OFF で変化しない。")
 touchRearmDist = input.float(10.0, "Touch Re-arm Distance ($)", minval = 0.0, step = 0.5, group = G_VAL,
-     tooltip = "Zoneから終値がこの距離以上離れて初めて再Touchを計上する。ZoneEngineのReaction判定とは無関係。")
+     tooltip = "Zoneから終値がこの距離以上離れて初めて再Touchを計上する。ZoneEngineのReaction判定とは無関係。\n" +
+     "★ この TouchCount は Effective Strength の降格判定にも使われるため、\n" +
+     "  useValidation = false でも有効。")
 evalBars = input.int(48, "Evaluation Bars", minval = 1, maxval = 500, group = G_VAL,
      tooltip = "Touch後に追跡するバー数。5分足で48 = 4時間。")
 vSplitStrong = input.float(12.5, "Split · Strong L/H (score)", step = 0.5, group = G_VAL)
@@ -957,9 +965,17 @@ float ev_effectiveStrength = na
 //    リアルタイムバーの再実行で Touch が二重計上されるのを防ぐ。
 //    var の map / array はティック毎ロールバックされないため、確定バーだけで
 //    状態を進める。
-if useValidation and barstate.isconfirmed
-    //  10.6.1 Zone全件走査: 登録簿更新 + Touch検出 + LiveIndex構築
+//  ★★★ useValidation からの独立:
+//    10.6.1 (Zone登録簿 / Touch判定 / Re-arm / TouchCount加算 / 誕生時Snapshot) と
+//    10.6.3 (登録簿の間引き) は Effective Strength が依存する Zone評価機能なので、
+//    useValidation の ON/OFF に関係なく常時動作させる。
+//    useValidation が制御するのは CSVイベント生成 / MFE追跡 / Queue出力だけ。
+//    → useValidation = false でも Touch 1〜2回 = Raw / 3回以上 = 1段降格 は動く。
+//    TouchCount は vzTouchCnt 1本だけで管理し、二重管理しない。
+if barstate.isconfirmed
+    //  10.6.1 Zone全件走査: 登録簿更新 + Touch検出 + LiveIndex構築  ★常時動作★
     //    ・走査は1バー1回だけ。過去バーの再走査は行わない。
+    //    ・useValidation には依存しない (Effective Strength が使う Zone評価機能)。
     //    ・Event生成 / TouchCount は direction が確定できた接触のみ
     //      (SUPPORT / RESIST、および直前方向を引き継げる ACTIVE)。
     //      BROKEN と 方向不明ACTIVE では新規Eventを作らない。
@@ -1028,49 +1044,53 @@ if useValidation and barstate.isconfirmed
                         map.put(vzArmed, _id, 0)
                         int _tc = map.get(vzTouchCnt, _id) + 1
                         map.put(vzTouchCnt, _id, _tc)
-                        if array.size(vActive) < maxActiveEvents
-                            //  ★ refPrice = 反発の起点となる Zone境界価格。
-                            //    direction = 1  → z.top    (境界から上へどれだけ伸びたか)
-                            //    direction = -1 → z.bottom (境界から下へどれだけ伸びたか)
-                            //    Touch足の終値を基準にすると、その足で大きく反発して
-                            //    Zoneから離れて引けた場合に反発幅を過小評価するため、
-                            //    終値基準にはしない。
-                            float _ref = _dir == 1 ? _z.top : _z.bottom
-                            VEvent _ne = VEvent.new()
-                            _ne.zoneId      := _id
-                            _ne.touchTimeMs := time
-                            _ne.touchBar    := bar_index
-                            _ne.direction   := _dir
-                            _ne.zTop        := _z.top
-                            _ne.zBot        := _z.bottom
-                            _ne.zCtr        := (_z.top + _z.bottom) / 2
-                            _ne.score       := _z.score
-                            _ne.oStr        := _z.strength
-                            //  Effective は「今回の Touch を数えた後」の回数で判定する。
-                            //  → 3回目の Touch から降格が反映される。
-                            _ne.eStr        := f_effStrength(_z.strength, _id)
-                            _ne.vStr        := f_valStrength(_z.strength, _z.score)
-                            _ne.hasHtf      := _z.hasHtf ? 1 : 0
-                            _ne.reactionCnt := _z.reactionCnt
-                            _ne.touchCnt    := _tc
-                            _ne.ageBars     := bar_index - map.get(vzBornBar, _id)
-                            _ne.ageMin      := int((time - map.get(vzBornMs, _id)) / 60000)
-                            _ne.flipped     := _z.flipped ? 1 : 0
-                            _ne.srcMask     := f_valSrcMask(_z.sources)
-                            _ne.htfMask     := f_valHtfMask(_z.htfSources)
-                            _ne.refPrice    := _ref
-                            //  ★ 誕生時Snapshot をそのまま転記 (ここでも再計算しない)
-                            _ne.bScore      := map.get(vzBirthScore, _id)
-                            _ne.bStr        := map.get(vzBirthStr, _id)
-                            _ne.bVStr       := map.get(vzBirthVStr, _id)
-                            _ne.bHasHtf     := map.get(vzBirthHasHtf, _id)
-                            _ne.bSrcMask    := map.get(vzBirthSrcMask, _id)
-                            _ne.bHtfMask    := map.get(vzBirthHtfMask, _id)
-                            _ne.bTop        := map.get(vzBirthTop, _id)
-                            _ne.bBot        := map.get(vzBirthBot, _id)
-                            array.push(vActive, _ne)
-                        else
-                            vDropped += 1
+                        if useValidation
+                            //  ★ Event生成だけ useValidation で切る。
+                            //    TouchCount の加算 (直上) はここより前で完了しているため、
+                            //    useValidation = false でも Touch 回数は正しく進む。
+                            if array.size(vActive) < maxActiveEvents
+                                //  ★ refPrice = 反発の起点となる Zone境界価格。
+                                //    direction = 1  → z.top    (境界から上へどれだけ伸びたか)
+                                //    direction = -1 → z.bottom (境界から下へどれだけ伸びたか)
+                                //    Touch足の終値を基準にすると、その足で大きく反発して
+                                //    Zoneから離れて引けた場合に反発幅を過小評価するため、
+                                //    終値基準にはしない。
+                                float _ref = _dir == 1 ? _z.top : _z.bottom
+                                VEvent _ne = VEvent.new()
+                                _ne.zoneId      := _id
+                                _ne.touchTimeMs := time
+                                _ne.touchBar    := bar_index
+                                _ne.direction   := _dir
+                                _ne.zTop        := _z.top
+                                _ne.zBot        := _z.bottom
+                                _ne.zCtr        := (_z.top + _z.bottom) / 2
+                                _ne.score       := _z.score
+                                _ne.oStr        := _z.strength
+                                //  Effective は「今回の Touch を数えた後」の回数で判定する。
+                                //  → 3回目の Touch から降格が反映される。
+                                _ne.eStr        := f_effStrength(_z.strength, _id)
+                                _ne.vStr        := f_valStrength(_z.strength, _z.score)
+                                _ne.hasHtf      := _z.hasHtf ? 1 : 0
+                                _ne.reactionCnt := _z.reactionCnt
+                                _ne.touchCnt    := _tc
+                                _ne.ageBars     := bar_index - map.get(vzBornBar, _id)
+                                _ne.ageMin      := int((time - map.get(vzBornMs, _id)) / 60000)
+                                _ne.flipped     := _z.flipped ? 1 : 0
+                                _ne.srcMask     := f_valSrcMask(_z.sources)
+                                _ne.htfMask     := f_valHtfMask(_z.htfSources)
+                                _ne.refPrice    := _ref
+                                //  ★ 誕生時Snapshot をそのまま転記 (ここでも再計算しない)
+                                _ne.bScore      := map.get(vzBirthScore, _id)
+                                _ne.bStr        := map.get(vzBirthStr, _id)
+                                _ne.bVStr       := map.get(vzBirthVStr, _id)
+                                _ne.bHasHtf     := map.get(vzBirthHasHtf, _id)
+                                _ne.bSrcMask    := map.get(vzBirthSrcMask, _id)
+                                _ne.bHtfMask    := map.get(vzBirthHtfMask, _id)
+                                _ne.bTop        := map.get(vzBirthTop, _id)
+                                _ne.bBot        := map.get(vzBirthBot, _id)
+                                array.push(vActive, _ne)
+                            else
+                                vDropped += 1
                     else if _armed == 1 and _z.state == ST_ACTIVE
                         //  方向不明 (lastDir == 0) の ACTIVE への接触。
                         //   ・Support / Resistance を推測しないため Event は作らない
@@ -1088,79 +1108,8 @@ if useValidation and barstate.isconfirmed
                         map.put(vzArmed, _id, 1)
                         map.put(vzUnkSeen, _id, 0)
 
-    //  10.6.2 追跡中イベントの更新 (Touchしたバー自身はスキップ)
-    //    ・同一Zoneの同時追跡を許可する (Zone毎1件に制限しない)。
-    //    ・全体件数は maxActiveEvents で上限を掛けてタイムアウトを防ぐ。
-    int _ai = 0
-    while _ai < array.size(vActive)
-        VEvent _e = array.get(vActive, _ai)
-        bool _fin = false
-        if _e.touchBar != bar_index
-            _e.elapsed := _e.elapsed + 1
-
-            //  MFE: Touch時点の Zone境界価格 (refPrice) を基準にした最大有利変動。
-            //    SUPPORT なら refPrice = zTop からの上方向、
-            //    RESIST  なら refPrice = zBot からの下方向。
-            //  maxPenetration: Touch時点のZone形状に対する最大貫入量。
-            //  ★ Touch足そのものは OHLC の順序が判別できないため、
-            //    _e.touchBar != bar_index のゲートにより MFE / HIT 判定から
-            //    除外している (評価は次のバーから開始)。
-            if _e.direction == 1
-                float _fav = high - _e.refPrice
-                if _fav > _e.mfe
-                    _e.mfe := _fav
-                float _pen = _e.zTop - low
-                if _pen > _e.maxPen
-                    _e.maxPen := _pen
-            else if _e.direction == -1
-                float _favS = _e.refPrice - low
-                if _favS > _e.mfe
-                    _e.mfe := _favS
-                float _penS = high - _e.zBot
-                if _penS > _e.maxPen
-                    _e.maxPen := _penS
-
-            //  到達判定 (direction が未定義の ACTIVE / BROKEN では計上しない)
-            if _e.direction == 1 or _e.direction == -1
-                if _e.hit1 == 0 and _e.mfe >= vHitLv1
-                    _e.hit1 := 1
-                    _e.barsTo1 := _e.elapsed
-                if _e.hit2 == 0 and _e.mfe >= vHitLv2
-                    _e.hit2 := 1
-                    _e.barsTo2 := _e.elapsed
-                if _e.hit3 == 0 and _e.mfe >= vHitLv3
-                    _e.hit3 := 1
-                    _e.barsTo3 := _e.elapsed
-
-            //  Break / Reclaim は ZoneEngine の state だけから取得する。
-            //  独自の Break Buffer は一切使わない。
-            if map.contains(vLiveIdx, _e.zoneId)
-                zn.Zone _cz = zn.zoneAt(zoneEng, map.get(vLiveIdx, _e.zoneId))
-                if _e.broken == 0
-                    if _cz.state == ST_BROKEN
-                        _e.broken := 1
-                        _e.barsToBreak := _e.elapsed
-                else if _e.reclaimed == 0
-                    if _cz.state == ST_SUPPORT or _cz.state == ST_RESIST
-                        _e.reclaimed := 1
-                        _e.barsToReclaim := _e.elapsed
-            else
-                //  Zone が消滅 (Lifetime / stale) した場合も窓の終わりまで
-                //  価格側の追跡は続け、trackingLost = 1 を立てる。
-                _e.trackLost := 1
-
-            if _e.elapsed >= evalBars
-                _fin := true
-        if _fin
-            array.remove(vActive, _ai)
-            if array.size(vQueue) < maxQueue
-                array.push(vQueue, _e)
-            else
-                vDropped += 1
-        else
-            _ai += 1
-
-    //  10.6.3 登録簿の間引き (上限超過時のみ / 古いIDから)
+    //  10.6.3 登録簿の間引き (上限超過時のみ / 古いIDから)  ★常時動作★
+    //    ・10.6.1 が常に登録簿を伸ばすため、間引きも useValidation に依存させない。
     if map.size(vzLastSeen) > maxTrackedZones
         array<int> _ks = map.keys(vzLastSeen)
         if array.size(_ks) > 0
@@ -1183,55 +1132,130 @@ if useValidation and barstate.isconfirmed
                     map.remove(vzBirthTop, _k)
                     map.remove(vzBirthBot, _k)
 
-    //  10.6.4 Queue から1バー1件だけ出力
-    if array.size(vQueue) > 0
-        VEvent _o = array.shift(vQueue)
-        ev_zoneId             := _o.zoneId
-        ev_touchTime          := math.floor(_o.touchTimeMs / 1000.0)
-        ev_direction          := _o.direction
-        ev_zoneTop            := _o.zTop
-        ev_zoneBottom         := _o.zBot
-        ev_zoneCenter         := _o.zCtr
-        ev_score              := _o.score
-        ev_originalStrength   := _o.oStr
-        ev_validationStrength := _o.vStr
-        ev_hasHtf             := _o.hasHtf
-        ev_reactionCnt        := _o.reactionCnt
-        ev_touchCnt           := _o.touchCnt
-        ev_zoneAgeBars        := _o.ageBars
-        ev_zoneAgeMin         := _o.ageMin
-        ev_flipped            := _o.flipped
-        ev_sourceMask         := _o.srcMask
-        ev_htfMask            := _o.htfMask
-        ev_refPrice           := _o.refPrice
-        ev_mfe                := _o.mfe
-        ev_maxPenetration     := _o.maxPen
-        ev_hit10              := _o.hit1
-        ev_hit20              := _o.hit2
-        ev_hit30              := _o.hit3
-        ev_barsTo10           := _o.barsTo1
-        ev_barsTo20           := _o.barsTo2
-        ev_barsTo30           := _o.barsTo3
-        ev_broken             := _o.broken
-        ev_barsToBreak        := _o.barsToBreak
-        ev_reclaimed          := _o.reclaimed
-        ev_barsToReclaim      := _o.barsToReclaim
-        ev_trackingLost       := _o.trackLost
-        ev_birthScore              := _o.bScore
-        ev_birthStrength           := _o.bStr
-        ev_birthValidationStrength := _o.bVStr
-        ev_birthHasHtf             := _o.bHasHtf
-        ev_birthSourceMask         := _o.bSrcMask
-        ev_birthHtfMask            := _o.bHtfMask
-        ev_birthTop                := _o.bTop
-        ev_birthBottom             := _o.bBot
-        ev_birthWidth              := _o.bTop - _o.bBot
-        ev_scoreGrowth             := _o.score - _o.bScore
-        ev_baseStrength            := f_valBase(_o.bScore)
-        ev_durability              := f_valDurability(_o.touchCnt)
-        //  Birth時点でHTFが無く、Touch時点でHTFが付いていれば 1
-        ev_addedHtf                := _o.bHasHtf == 0 and _o.hasHtf == 1 ? 1 : 0
-        ev_effectiveStrength       := _o.eStr
+    //  ★ ここから下は CSV検証専用 (useValidation で ON/OFF)。
+    //    Touch判定 / TouchCount / 登録簿は上で完了済みなので影響を受けない。
+    if useValidation
+        //  10.6.2 追跡中イベントの更新 (Touchしたバー自身はスキップ)
+        //    ・同一Zoneの同時追跡を許可する (Zone毎1件に制限しない)。
+        //    ・全体件数は maxActiveEvents で上限を掛けてタイムアウトを防ぐ。
+        int _ai = 0
+        while _ai < array.size(vActive)
+            VEvent _e = array.get(vActive, _ai)
+            bool _fin = false
+            if _e.touchBar != bar_index
+                _e.elapsed := _e.elapsed + 1
+
+                //  MFE: Touch時点の Zone境界価格 (refPrice) を基準にした最大有利変動。
+                //    SUPPORT なら refPrice = zTop からの上方向、
+                //    RESIST  なら refPrice = zBot からの下方向。
+                //  maxPenetration: Touch時点のZone形状に対する最大貫入量。
+                //  ★ Touch足そのものは OHLC の順序が判別できないため、
+                //    _e.touchBar != bar_index のゲートにより MFE / HIT 判定から
+                //    除外している (評価は次のバーから開始)。
+                if _e.direction == 1
+                    float _fav = high - _e.refPrice
+                    if _fav > _e.mfe
+                        _e.mfe := _fav
+                    float _pen = _e.zTop - low
+                    if _pen > _e.maxPen
+                        _e.maxPen := _pen
+                else if _e.direction == -1
+                    float _favS = _e.refPrice - low
+                    if _favS > _e.mfe
+                        _e.mfe := _favS
+                    float _penS = high - _e.zBot
+                    if _penS > _e.maxPen
+                        _e.maxPen := _penS
+
+                //  到達判定 (direction が未定義の ACTIVE / BROKEN では計上しない)
+                if _e.direction == 1 or _e.direction == -1
+                    if _e.hit1 == 0 and _e.mfe >= vHitLv1
+                        _e.hit1 := 1
+                        _e.barsTo1 := _e.elapsed
+                    if _e.hit2 == 0 and _e.mfe >= vHitLv2
+                        _e.hit2 := 1
+                        _e.barsTo2 := _e.elapsed
+                    if _e.hit3 == 0 and _e.mfe >= vHitLv3
+                        _e.hit3 := 1
+                        _e.barsTo3 := _e.elapsed
+
+                //  Break / Reclaim は ZoneEngine の state だけから取得する。
+                //  独自の Break Buffer は一切使わない。
+                if map.contains(vLiveIdx, _e.zoneId)
+                    zn.Zone _cz = zn.zoneAt(zoneEng, map.get(vLiveIdx, _e.zoneId))
+                    if _e.broken == 0
+                        if _cz.state == ST_BROKEN
+                            _e.broken := 1
+                            _e.barsToBreak := _e.elapsed
+                    else if _e.reclaimed == 0
+                        if _cz.state == ST_SUPPORT or _cz.state == ST_RESIST
+                            _e.reclaimed := 1
+                            _e.barsToReclaim := _e.elapsed
+                else
+                    //  Zone が消滅 (Lifetime / stale) した場合も窓の終わりまで
+                    //  価格側の追跡は続け、trackingLost = 1 を立てる。
+                    _e.trackLost := 1
+
+                if _e.elapsed >= evalBars
+                    _fin := true
+            if _fin
+                array.remove(vActive, _ai)
+                if array.size(vQueue) < maxQueue
+                    array.push(vQueue, _e)
+                else
+                    vDropped += 1
+            else
+                _ai += 1
+
+        //  10.6.4 Queue から1バー1件だけ出力
+        if array.size(vQueue) > 0
+            VEvent _o = array.shift(vQueue)
+            ev_zoneId             := _o.zoneId
+            ev_touchTime          := math.floor(_o.touchTimeMs / 1000.0)
+            ev_direction          := _o.direction
+            ev_zoneTop            := _o.zTop
+            ev_zoneBottom         := _o.zBot
+            ev_zoneCenter         := _o.zCtr
+            ev_score              := _o.score
+            ev_originalStrength   := _o.oStr
+            ev_validationStrength := _o.vStr
+            ev_hasHtf             := _o.hasHtf
+            ev_reactionCnt        := _o.reactionCnt
+            ev_touchCnt           := _o.touchCnt
+            ev_zoneAgeBars        := _o.ageBars
+            ev_zoneAgeMin         := _o.ageMin
+            ev_flipped            := _o.flipped
+            ev_sourceMask         := _o.srcMask
+            ev_htfMask            := _o.htfMask
+            ev_refPrice           := _o.refPrice
+            ev_mfe                := _o.mfe
+            ev_maxPenetration     := _o.maxPen
+            ev_hit10              := _o.hit1
+            ev_hit20              := _o.hit2
+            ev_hit30              := _o.hit3
+            ev_barsTo10           := _o.barsTo1
+            ev_barsTo20           := _o.barsTo2
+            ev_barsTo30           := _o.barsTo3
+            ev_broken             := _o.broken
+            ev_barsToBreak        := _o.barsToBreak
+            ev_reclaimed          := _o.reclaimed
+            ev_barsToReclaim      := _o.barsToReclaim
+            ev_trackingLost       := _o.trackLost
+            ev_birthScore              := _o.bScore
+            ev_birthStrength           := _o.bStr
+            ev_birthValidationStrength := _o.bVStr
+            ev_birthHasHtf             := _o.bHasHtf
+            ev_birthSourceMask         := _o.bSrcMask
+            ev_birthHtfMask            := _o.bHtfMask
+            ev_birthTop                := _o.bTop
+            ev_birthBottom             := _o.bBot
+            ev_birthWidth              := _o.bTop - _o.bBot
+            ev_scoreGrowth             := _o.score - _o.bScore
+            ev_baseStrength            := f_valBase(_o.bScore)
+            ev_durability              := f_valDurability(_o.touchCnt)
+            //  Birth時点でHTFが無く、Touch時点でHTFが付いていれば 1
+            ev_addedHtf                := _o.bHasHtf == 0 and _o.hasHtf == 1 ? 1 : 0
+            ev_effectiveStrength       := _o.eStr
 
 // ---- 10.7 CSV出力列 (display.data_window) ----------------------------------
 //  ★ チャートには一切描画しない (display.data_window のみ)。
