@@ -81,6 +81,15 @@ int SR_MEDIUM  = 2
 int SR_STRONG  = 3
 int SR_VSTRONG = 4
 
+// ---- Zone Distance Research : Bucket Code ----------------------------------
+//  0 = Zoneなし / 1 = Zone内 / 2 = $0〜2.5 / 3 = $2.5〜5 / 4 = $5〜7.5 / 5 = $7.5〜10
+int ZB_NONE    = 0
+int ZB_INSIDE  = 1
+int ZB_0_2_5   = 2
+int ZB_2_5_5   = 3
+int ZB_5_7_5   = 4
+int ZB_7_5_10  = 5
+
 // ---- 背景 State -------------------------------------------------------------
 int BG_BLUE = 1
 int BG_FLAT = 0
@@ -322,8 +331,50 @@ colResistance  = input.color(color.new(#EF5350, 0), "Color · Resistance", group
 colActive      = input.color(color.new(#FFB300, 0), "Color · Active",     group = G_ZDRAW)
 colBroken      = input.color(color.new(#78909C, 0), "Color · Broken",     group = G_ZDRAW)
 
-//  Zone 側の計算を回すかどうか。Filter も表示も OFF なら request を 1 本も出さない。
-bool useZoneFeatures = useZoneObstacleFilter or showZones
+// ---- 01-4d Zone Distance Research ------------------------------------------
+//  ★ これは Filter ではなく Research ★
+//    Pattern Signal の条件は一切変えない。Signal 成立時点で「固定 TP までの
+//    進行方向にある最寄り Zone までの距離」で 6 グループに分類し、
+//    選んだ Bucket だけを Entry させて各グループ単独の成績を比較する。
+//
+//  ★ 対象外 Bucket でも Setup は消費する (ST_WAIT へ戻す) ★
+//    どの Bucket を選んでも Pattern Signal の母集団自体は変わらない。
+//    Reset は Section 07 の longActionable / shortActionable を使う。
+//
+//  ★ Zone Obstacle Filter とは完全に独立 ★
+//    Research を ON にしても Obstacle Filter は自動 ON にならない。
+//    強度の input も別に持つ (zoneResearchMinStrength)。
+var string G_ZRES = "04 · Zone Distance Research"
+useZoneDistanceResearch = input.bool(false, "Zone Distance Research を使う", group = G_ZRES,
+     tooltip = "OFF (既定) なら Bucket 判定は Entry に一切関与しない。\n" +
+     "ON のとき、選んだ Bucket の Signal だけを Entry する。\n" +
+     "対象外 Bucket の Signal も Setup は消費する (再 ARM が必要になる) ので、\n" +
+     "どの Bucket を選んでも Pattern Signal の母集団は同じまま。")
+
+ZONE_BUCKET_ALL    = "ALL"
+ZONE_BUCKET_NONE   = "1 · Zoneなし"
+ZONE_BUCKET_INSIDE = "2 · Zone内"
+ZONE_BUCKET_0_2_5  = "3 · $0〜2.5"
+ZONE_BUCKET_2_5_5  = "4 · $2.5〜5"
+ZONE_BUCKET_5_7_5  = "5 · $5〜7.5"
+ZONE_BUCKET_7_5_10 = "6 · $7.5〜10"
+zoneResearchBucket = input.string(ZONE_BUCKET_ALL, "Research Bucket",
+     options = ["ALL", "1 · Zoneなし", "2 · Zone内", "3 · $0〜2.5",
+     "4 · $2.5〜5", "5 · $5〜7.5", "6 · $7.5〜10"], group = G_ZRES,
+     tooltip = "ALL なら全 Bucket を Entry する (母集団そのもの)。\n" +
+     "個別 Bucket を選ぶとその Bucket の Signal だけを Entry する。\n\n" +
+     "距離は Entry 価格から対象 Zone の Entry 側の端まで。\n" +
+     "  LONG  … Resistance の下端 (bottom)\n" +
+     "  SHORT … Support   の上端 (top)\n" +
+     "Entry が対象 Zone の内部なら距離 0 で「Zone内」を最優先。\n" +
+     "固定 TP より先にしか Zone がない場合は「Zoneなし」。")
+zoneResearchMinStrStr = input.string("Medium", "Research Min Strength",
+     options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_ZRES,
+     tooltip = "この強度以上の Zone だけを Research の対象にする。\n" +
+     "Zone Obstacle Filter の Obstacle Min Strength とは independent。")
+
+//  Zone 側の計算を回すかどうか。すべて OFF なら request を 1 本も出さない。
+bool useZoneFeatures = useZoneObstacleFilter or useZoneDistanceResearch or showZones
 
 // ---- 01-5 Risk -------------------------------------------------------------
 var string G_RISK = "05 · Risk"
@@ -1056,6 +1107,120 @@ bool longZonePass  = not useZoneObstacleFilter or not longBlocked
 bool shortZonePass = not useZoneObstacleFilter or not shortBlocked
 
 // ============================================================================
+// 05d. ZONE DISTANCE RESEARCH
+// ----------------------------------------------------------------------------
+//  ★ Filter ではなく Research ★
+//    Pattern Signal の条件は一切変えない。Signal 成立時点で「固定 TP までの
+//    進行方向にある最寄り Zone までの距離」だけを見て 6 グループへ分類する。
+//
+//  ★ 対象 Zone ★
+//    LONG  … state == ST_RESIST  (Resistance)
+//    SHORT … state == ST_SUPPORT (Support)
+//    ST_ACTIVE / ST_BROKEN は対象外。
+//    強度は zoneResearchMinStrength 以上のものだけ。
+//    ★ Zone Obstacle Filter の zoneObstacleMinStrength とは別 input ★
+//
+//  ★ 距離 ★
+//    Entry 価格から対象 Zone の「Entry 側の端」までの距離。
+//      LONG  … Resistance の下端 (bottom) − entryPrice
+//      SHORT … entryPrice − Support の上端 (top)
+//    Zone 中心は使わない。
+//
+//  ★ Zone内を最優先 ★
+//    対象 Zone のうち 1 つでも bottom <= entryPrice <= top なら、
+//    他にどんな距離の Zone があっても Bucket = Zone内 / 距離 0 とする。
+//    これにより Zone内 は距離 Bucket と絶対に重複しない。
+//
+//  ★ 固定 TP より先の Zone は無視 ★
+//    「TP までの障害物」を見る研究なので distance <= tpDistance のものだけを
+//    最寄り候補にする。TP より先にしか Zone がなければ Bucket = Zoneなし。
+//
+//  ★ Bucket (優先順) ★
+//    1 Zone内     : distance == 0
+//    2 $0〜2.5    : 0 < distance <= 2.5
+//    3 $2.5〜5    : 2.5 < distance <= 5.0
+//    4 $5〜7.5    : 5.0 < distance <= 7.5
+//    5 $7.5〜10   : 7.5 < distance <= tpDistance
+//    0 Zoneなし   : Zone内でもなく、tpDistance 以内に対象 Zone がない
+//    各 Signal は必ず 1 つの Bucket だけに所属する。
+//
+//  戻り値 : [bucket, nearestDistance, nearestEdge, nearestStrength,
+//            nearestTop, nearestBottom]
+// ============================================================================
+int zoneResearchMinStrength = zn.strengthIdx(zoneResearchMinStrStr)
+
+f_zoneDistanceBucket(int dir, float entryPrice, float tpDistance) =>
+    int   bucket     = ZB_NONE
+    float distance   = na
+    float edge       = na
+    int   strength   = na
+    float zoneTop    = na
+    float zoneBottom = na
+    bool  inside     = false
+    int   n = zn.zoneCount(zoneEng)
+    if n > 0 and not na(entryPrice) and not na(tpDistance)
+        for i = 0 to n - 1
+            zn.Zone z = zn.zoneAt(zoneEng, i)
+            bool targetState = dir > 0 ? z.state == ST_RESIST : z.state == ST_SUPPORT
+            if targetState and z.strength >= zoneResearchMinStrength and
+                 not na(z.top) and not na(z.bottom)
+                if entryPrice >= z.bottom and entryPrice <= z.top
+                    //  Zone内 は最優先。最初に見つかったものを採用する。
+                    if not inside
+                        inside     := true
+                        distance   := 0.0
+                        edge       := entryPrice
+                        strength   := z.strength
+                        zoneTop    := z.top
+                        zoneBottom := z.bottom
+                else if not inside
+                    //  Entry 側の端 : LONG は下端 / SHORT は上端
+                    float e = dir > 0 ? z.bottom : z.top
+                    //  進行方向にあり、かつ固定 TP 以内のものだけ
+                    float d = dir > 0 ? e - entryPrice : entryPrice - e
+                    if d > 0 and d <= tpDistance
+                        if na(distance) or d < distance
+                            distance   := d
+                            edge       := e
+                            strength   := z.strength
+                            zoneTop    := z.top
+                            zoneBottom := z.bottom
+    //  Bucket 判定
+    if inside
+        bucket := ZB_INSIDE
+    else if na(distance)
+        bucket := ZB_NONE
+    else if distance <= 2.5
+        bucket := ZB_0_2_5
+    else if distance <= 5.0
+        bucket := ZB_2_5_5
+    else if distance <= 7.5
+        bucket := ZB_5_7_5
+    else
+        bucket := ZB_7_5_10
+    [bucket, distance, edge, strength, zoneTop, zoneBottom]
+
+[longBucket,  longResDist,  longResEdge,  longResStr,  longResTop,  longResBottom]  =
+     f_zoneDistanceBucket(1,  close, fixedTpDollar)
+[shortBucket, shortResDist, shortResEdge, shortResStr, shortResTop, shortResBottom] =
+     f_zoneDistanceBucket(-1, close, fixedTpDollar)
+
+//  選択中の Bucket Code (ALL のときは -1 で「全通過」を表す)
+int selectedBucket = zoneResearchBucket == ZONE_BUCKET_NONE   ? ZB_NONE   :
+     zoneResearchBucket == ZONE_BUCKET_INSIDE ? ZB_INSIDE  :
+     zoneResearchBucket == ZONE_BUCKET_0_2_5  ? ZB_0_2_5   :
+     zoneResearchBucket == ZONE_BUCKET_2_5_5  ? ZB_2_5_5   :
+     zoneResearchBucket == ZONE_BUCKET_5_7_5  ? ZB_5_7_5   :
+     zoneResearchBucket == ZONE_BUCKET_7_5_10 ? ZB_7_5_10  : -1
+
+//  ★ Research OFF / ALL なら常に PASS ★
+//    OFF のときの Strategy Tester 結果は Research 追加前と完全に一致する。
+bool longBucketPass  = not useZoneDistanceResearch or zoneResearchBucket == ZONE_BUCKET_ALL or
+     longBucket == selectedBucket
+bool shortBucketPass = not useZoneDistanceResearch or zoneResearchBucket == ZONE_BUCKET_ALL or
+     shortBucket == selectedBucket
+
+// ============================================================================
 // 06. RISK / QTY
 // ----------------------------------------------------------------------------
 //  Qty は必ず SL 距離から計算する。Long / Short 共通。
@@ -1106,8 +1271,8 @@ bool qtyOk    = tradeQty >= qtyMin and tradeQty > 0
 bool longActionable  = longSignal  and enableLong  and flat and qtyOk
 bool shortActionable = shortSignal and enableShort and flat and qtyOk
 
-bool canLong  = longActionable  and longZonePass
-bool canShort = shortActionable and shortZonePass
+bool canLong  = longActionable  and longBucketPass  and longZonePass
+bool canShort = shortActionable and shortBucketPass and shortZonePass
 
 if canLong
     string eid = longEntryPattern == 1 ? "L-A" : "L-B"
@@ -1143,8 +1308,13 @@ if canShort
 //    State Machine が返した自然な次 State のまま継続する。
 //    今回追加した Reset は「Zone Obstacle Filter が最終的に BLOCK した場合」だけ。
 //
-//  ★ Zone Filter OFF のときは longZonePass が常に true なので
-//    longActionable == canLong となり、Reset 条件は Filter 追加前と完全に同じ。
+//  ★ Zone Distance Research で対象外 Bucket だった場合も同じ扱い ★
+//    longActionable が true なら Entry の有無に関係なく ST_WAIT へ戻す。
+//    これで「どの Bucket を選んでも Pattern Signal の母集団は同じ」になる。
+//
+//  ★ Zone Filter / Research が OFF のときは longZonePass / longBucketPass が
+//    常に true なので longActionable == canLong となり、Reset 条件は
+//    これらを追加する前と完全に同じ。
 if longActionable
     lsNext := ST_WAIT
 if shortActionable
@@ -1155,7 +1325,26 @@ shortState := ssNext
 
 // ============================================================================
 // 08. DISPLAY / DEBUG
+// ----------------------------------------------------------------------------
+//  ★ ここから下は表示専用。Entry 判定には一切関与しない。
 // ============================================================================
+//  直近の Signal バーの Bucket / 距離を Debug Table 用に保持する。
+var int   lastLongBucket  = na
+var float lastLongDist    = na
+var int   lastShortBucket = na
+var float lastShortDist   = na
+if longActionable
+    lastLongBucket := longBucket
+    lastLongDist   := longResDist
+if shortActionable
+    lastShortBucket := shortBucket
+    lastShortDist   := shortResDist
+
+f_bucketStr(int b) =>
+    na(b) ? "-" : b == ZB_NONE ? "Zoneなし" : b == ZB_INSIDE ? "Zone内" :
+     b == ZB_0_2_5 ? "$0〜2.5" : b == ZB_2_5_5 ? "$2.5〜5" :
+     b == ZB_5_7_5 ? "$5〜7.5" : "$7.5〜10"
+
 color bgFinal = not showBg ? na :
      bg15 == BG_BLUE ? color.new(bgBuyCol, bgTransp) :
      bg15 == BG_RED  ? color.new(bgSellCol, bgTransp) : na
@@ -1191,9 +1380,26 @@ plot(longObsEdge,   title = "DW: LONG Nearest Obstacle Edge",  display = display
 plot(shortObsEdge,  title = "DW: SHORT Nearest Obstacle Edge", display = display.data_window)
 plot(longObsStr,    title = "DW: LONG Obstacle Strength",  display = display.data_window)
 plot(shortObsStr,   title = "DW: SHORT Obstacle Strength", display = display.data_window)
+//  ---- Zone Distance Research (既存項目はそのまま。以下を追加) --------------
+//  ★ Bucket / Distance は Signal が成立したバーだけ値を出す (それ以外は na) ★
+//    Entry 判定に使うのは Signal バーの Bucket だけなので、CSV でもその足だけ
+//    見れば十分。Bucket は 0=Zoneなし / 1=Zone内 / 2=$0〜2.5 / 3=$2.5〜5 /
+//    4=$5〜7.5 / 5=$7.5〜10。
+plot(useZoneDistanceResearch ? 1.0 : 0.0, title = "DW: Zone Research Enabled", display = display.data_window)
+//  Bucket Mode : -1 = ALL / 0〜5 = 個別 Bucket
+plot(zoneResearchBucket == ZONE_BUCKET_ALL ? -1.0 : selectedBucket,
+     title = "DW: Zone Research Bucket Mode", display = display.data_window)
+plot(longActionable  ? longBucket  : na, title = "DW: LONG Zone Bucket",  display = display.data_window)
+plot(shortActionable ? shortBucket : na, title = "DW: SHORT Zone Bucket", display = display.data_window)
+plot(longActionable  ? longResDist  : na, title = "DW: LONG Zone Distance",  display = display.data_window)
+plot(shortActionable ? shortResDist : na, title = "DW: SHORT Zone Distance", display = display.data_window)
+plot(longActionable  ? longResEdge  : na, title = "DW: LONG Zone Edge",  display = display.data_window)
+plot(shortActionable ? shortResEdge : na, title = "DW: SHORT Zone Edge", display = display.data_window)
+plot(longActionable  ? longResStr  : na, title = "DW: LONG Zone Strength",  display = display.data_window)
+plot(shortActionable ? shortResStr : na, title = "DW: SHORT Zone Strength", display = display.data_window)
 
 // ---- Debug Table (小さめ) ---------------------------------------------------
-var table dbgTable = table.new(position.top_right, 2, 9,
+var table dbgTable = table.new(position.top_right, 2, 11,
      border_width = 1, frame_width = 1, frame_color = color.gray)
 
 if showDebug and barstate.islast
@@ -1234,6 +1440,23 @@ if showDebug and barstate.islast
          " (" + (na(longObsDist)  ? "-" : str.tostring(longObsDist,  format.mintick)) + ")" +
          "   SHORT " + (shortBlocked ? "BLOCK" : "PASS") +
          " (" + (na(shortObsDist) ? "-" : str.tostring(shortObsDist, format.mintick)) + ")",
+         text_color = color.white, bgcolor = bgC, text_size = size.small)
+
+    //  ---- Zone Distance Research (表示専用) ----------------------------------
+    //  直近の Signal バーの Bucket / Distance を保持して表示する。
+    table.cell(dbgTable, 0, 9, "Zone Research", text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 9,
+         (useZoneDistanceResearch ? "ON" : "OFF") +
+         "  Bucket " + zoneResearchBucket +
+         "  (最低強度 " + zoneResearchMinStrStr + ")",
+         text_color = color.white, bgcolor = bgC, text_size = size.small)
+
+    table.cell(dbgTable, 0, 10, "直近 Bucket", text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 10,
+         "LONG "  + f_bucketStr(lastLongBucket)  +
+         " (" + (na(lastLongDist)  ? "-" : str.tostring(lastLongDist,  format.mintick)) + ")" +
+         "   SHORT " + f_bucketStr(lastShortBucket) +
+         " (" + (na(lastShortDist) ? "-" : str.tostring(lastShortDist, format.mintick)) + ")",
          text_color = color.white, bgcolor = bgC, text_size = size.small)
 
 // ---- Zone Box 描画 (検証用。Entry 判定には一切関与しない) -------------------
