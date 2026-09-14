@@ -154,6 +154,11 @@ int ST_WAIT  = 0
 int ST_ARMED = 1
 int ST_FLAT  = 2
 int ST_OPP   = 3
+//  ★ CANDIDATE_2 専用 : 「反対色を経由したあとのフラット」を表す State。
+//    ST_FLAT は「青 → フラット」など通常の遷移でも使うため、両者を区別しないと
+//    青 → 赤 → フラット → 青 を正確に判定できない。
+//    CURRENT / CANDIDATE_1 ではこの State へ遷移しない。
+int ST_B_CONFIRM = 4
 
 string LOGIC_ID = "SAT"
 
@@ -204,6 +209,33 @@ satTf5m = input.timeframe("5",   "5分足 の時間足指定 (Entry Filter ②)"
      "★ ZoneEngine の Base TF とは別概念。こちらは SAT BAND Reconstruction の\n" +
      "  LINE1 / LINE2 / STB / 背景 を5分足コンテキストで再計算したもの。\n" +
      "15秒足の SAT ラインは流用しない。")
+
+// ---- Base Signal Mode (baseSignal の生成部分だけを切り替える) --------------
+//  ★ 切り替わるのは Section 04 の 15秒 State Machine だけ ★
+//    その後の Entry Filter ① / ② / ③ / HTF SAT Filter / ZoneEngine /
+//    SLTP / Risk / Qty / Order は一切変わらない。処理順も従来どおり:
+//      Base Signal Mode → baseLongSignal / baseShortSignal
+//      → Entry Filter Mode → HTF Filter → Trade Engine
+//  ★ CURRENT は既存コードをそのまま (インデントを変えただけで) 使うため、
+//    CURRENT を選んでいる限り Entry 位置・回数・Strategy Tester 結果は
+//    この機能の追加前と完全に一致する。
+var string G_BASE = "02 · Base Signal"
+BASE_CURRENT = "CURRENT"
+BASE_C1      = "CANDIDATE_1"
+BASE_C2      = "CANDIDATE_2"
+baseSignalMode = input.string(BASE_CURRENT, "Base Signal Mode",
+     options = ["CURRENT", "CANDIDATE_1", "CANDIDATE_2"], group = G_BASE,
+     tooltip = "CURRENT : 現行ロジックそのまま\n" +
+     "  ARM = 15s + 30s + 1m の同方向一致 / ARM 後も確定1分背景の維持が必須\n" +
+     "  Pattern A (青→フラット→青) と Pattern B (青→赤→フラット) の両方が Signal\n\n" +
+     "CANDIDATE_1 : 15s + 30s で ARM / 1m 維持なし / Pattern B のみ\n" +
+     "  1分背景を ARM 条件にも維持条件にも使わない。\n" +
+     "  15秒 State 遷移は CURRENT と同じで、Pattern A は Signal にしない。\n\n" +
+     "CANDIDATE_2 : 現行 ARM / 1m 維持なし / Pattern B を目的色復帰まで待つ\n" +
+     "  ARM は CURRENT と同じ (15s + 30s + 1m)。ARM 後は1分でリセットしない。\n" +
+     "  LONG  青 → 赤(複数本可) → フラット(複数本可) → 青  で Signal\n" +
+     "  SHORT 赤 → 青(複数本可) → フラット(複数本可) → 赤  で Signal\n" +
+     "  Pattern A は Signal にしない。")
 
 // ---- Entry Filter (既存 Entry State Machine には手を入れない追加条件) -------
 var string G_FLT = "02 · Entry Filter"
@@ -711,9 +743,11 @@ f_bgStr(int b) =>
 f_bgCol(int b) =>
     b == 1 ? bgBuyCol : b == -1 ? bgSellCol : color.rgb(149, 152, 161)
 f_longStateStr(int s) =>
-    s == ST_WAIT ? "WAIT_INITIAL" : s == ST_ARMED ? "ARMED (青)" : s == ST_FLAT ? "SAW_FLAT" : "SAW_RED"
+    s == ST_WAIT ? "WAIT_INITIAL" : s == ST_ARMED ? "ARMED (青)" : s == ST_FLAT ? "SAW_FLAT" :
+     s == ST_OPP ? "SAW_RED" : "B_CONFIRM_FLAT"
 f_shortStateStr(int s) =>
-    s == ST_WAIT ? "WAIT_INITIAL" : s == ST_ARMED ? "ARMED (赤)" : s == ST_FLAT ? "SAW_FLAT" : "SAW_BLUE"
+    s == ST_WAIT ? "WAIT_INITIAL" : s == ST_ARMED ? "ARMED (赤)" : s == ST_FLAT ? "SAW_FLAT" :
+     s == ST_OPP ? "SAW_BLUE" : "B_CONFIRM_FLAT"
 //  HTF SAT Filter : 条件が有効か (OFF 以外か)
 f_htfAct(string c) =>
     c == "OFF" ? 0 : 1
@@ -942,60 +976,184 @@ bool shortSigA  = false
 bool shortSigB  = false
 
 if barConfirmed
-    // ---- LONG ----------------------------------------------------------
-    //  1) 1分足ガード : 待機中に確定1分背景が青でなくなったら全リセット
-    if lsNext != ST_WAIT and bg1m != BG_BLUE
-        lsNext := ST_WAIT
-    //  2) State 遷移
-    if lsNext == ST_WAIT
-        //  初期成立。この青は Pattern の最初の「青」として数える。
-        if bg15 == BG_BLUE and bg30 == BG_BLUE and bg1m == BG_BLUE
-            lsNext := ST_ARMED
-    else if lsNext == ST_ARMED
-        if bg15 == BG_FLAT
-            lsNext := ST_FLAT
-        else if bg15 == BG_RED
-            lsNext := ST_OPP
-    else if lsNext == ST_FLAT
-        if bg15 == BG_BLUE
-            //  青 → フラット(複数本可) → 青
-            longSigA := true
-            lsNext   := ST_ARMED
-        else if bg15 == BG_RED
-            lsNext := ST_OPP
-    else
-        if bg15 == BG_FLAT
-            //  青 → 赤(複数本可) → フラット
-            longSigB := true
-            lsNext   := ST_FLAT
-        else if bg15 == BG_BLUE
-            lsNext := ST_ARMED
+    if baseSignalMode == BASE_CURRENT
+        // ---- LONG ----------------------------------------------------------
+        //  1) 1分足ガード : 待機中に確定1分背景が青でなくなったら全リセット
+        if lsNext != ST_WAIT and bg1m != BG_BLUE
+            lsNext := ST_WAIT
+        //  2) State 遷移
+        if lsNext == ST_WAIT
+            //  初期成立。この青は Pattern の最初の「青」として数える。
+            if bg15 == BG_BLUE and bg30 == BG_BLUE and bg1m == BG_BLUE
+                lsNext := ST_ARMED
+        else if lsNext == ST_ARMED
+            if bg15 == BG_FLAT
+                lsNext := ST_FLAT
+            else if bg15 == BG_RED
+                lsNext := ST_OPP
+        else if lsNext == ST_FLAT
+            if bg15 == BG_BLUE
+                //  青 → フラット(複数本可) → 青
+                longSigA := true
+                lsNext   := ST_ARMED
+            else if bg15 == BG_RED
+                lsNext := ST_OPP
+        else
+            if bg15 == BG_FLAT
+                //  青 → 赤(複数本可) → フラット
+                longSigB := true
+                lsNext   := ST_FLAT
+            else if bg15 == BG_BLUE
+                lsNext := ST_ARMED
 
-    // ---- SHORT (LONG の完全対称) ---------------------------------------
-    if ssNext != ST_WAIT and bg1m != BG_RED
-        ssNext := ST_WAIT
-    if ssNext == ST_WAIT
-        if bg15 == BG_RED and bg30 == BG_RED and bg1m == BG_RED
-            ssNext := ST_ARMED
-    else if ssNext == ST_ARMED
-        if bg15 == BG_FLAT
-            ssNext := ST_FLAT
-        else if bg15 == BG_BLUE
-            ssNext := ST_OPP
-    else if ssNext == ST_FLAT
-        if bg15 == BG_RED
-            //  赤 → フラット(複数本可) → 赤
-            shortSigA := true
-            ssNext    := ST_ARMED
-        else if bg15 == BG_BLUE
-            ssNext := ST_OPP
+        // ---- SHORT (LONG の完全対称) ---------------------------------------
+        if ssNext != ST_WAIT and bg1m != BG_RED
+            ssNext := ST_WAIT
+        if ssNext == ST_WAIT
+            if bg15 == BG_RED and bg30 == BG_RED and bg1m == BG_RED
+                ssNext := ST_ARMED
+        else if ssNext == ST_ARMED
+            if bg15 == BG_FLAT
+                ssNext := ST_FLAT
+            else if bg15 == BG_BLUE
+                ssNext := ST_OPP
+        else if ssNext == ST_FLAT
+            if bg15 == BG_RED
+                //  赤 → フラット(複数本可) → 赤
+                shortSigA := true
+                ssNext    := ST_ARMED
+            else if bg15 == BG_BLUE
+                ssNext := ST_OPP
+        else
+            if bg15 == BG_FLAT
+                //  赤 → 青(複数本可) → フラット
+                shortSigB := true
+                ssNext    := ST_FLAT
+            else if bg15 == BG_RED
+                ssNext := ST_ARMED
+
+    else if baseSignalMode == BASE_C1
+        // ---- CANDIDATE_1 -----------------------------------------------
+        //  CURRENT の15秒 State 遷移をそのまま使い、次の 3 点だけを変える。
+        //    ・ARM 条件から 1分背景を外す (15s + 30s の同方向一致だけ)
+        //    ・ARM 後の1分ガードを実行しない (色が崩れてもリセットしない)
+        //    ・Pattern A は Signal にしない (State 遷移だけ行う)
+        //  追加の条件は入れていない。
+        // ---- LONG ------------------------------------------------------
+        if lsNext == ST_WAIT
+            if bg15 == BG_BLUE and bg30 == BG_BLUE
+                lsNext := ST_ARMED
+        else if lsNext == ST_ARMED
+            if bg15 == BG_FLAT
+                lsNext := ST_FLAT
+            else if bg15 == BG_RED
+                lsNext := ST_OPP
+        else if lsNext == ST_FLAT
+            if bg15 == BG_BLUE
+                //  青 → フラット → 青 : State は ARMED へ戻すが Signal にはしない
+                lsNext := ST_ARMED
+            else if bg15 == BG_RED
+                lsNext := ST_OPP
+        else
+            if bg15 == BG_FLAT
+                //  青 → 赤(複数本可) → フラット  ← Pattern B のみ Signal
+                longSigB := true
+                lsNext   := ST_FLAT
+            else if bg15 == BG_BLUE
+                lsNext := ST_ARMED
+
+        // ---- SHORT (LONG の完全対称) -----------------------------------
+        if ssNext == ST_WAIT
+            if bg15 == BG_RED and bg30 == BG_RED
+                ssNext := ST_ARMED
+        else if ssNext == ST_ARMED
+            if bg15 == BG_FLAT
+                ssNext := ST_FLAT
+            else if bg15 == BG_BLUE
+                ssNext := ST_OPP
+        else if ssNext == ST_FLAT
+            if bg15 == BG_RED
+                ssNext := ST_ARMED
+            else if bg15 == BG_BLUE
+                ssNext := ST_OPP
+        else
+            if bg15 == BG_FLAT
+                //  赤 → 青(複数本可) → フラット  ← Pattern B のみ Signal
+                shortSigB := true
+                ssNext    := ST_FLAT
+            else if bg15 == BG_RED
+                ssNext := ST_ARMED
+
     else
-        if bg15 == BG_FLAT
-            //  赤 → 青(複数本可) → フラット
-            shortSigB := true
-            ssNext    := ST_FLAT
-        else if bg15 == BG_RED
-            ssNext := ST_ARMED
+        // ---- CANDIDATE_2 -----------------------------------------------
+        //  初期 ARM は CURRENT と同じ (15s + 30s + 1m の同方向一致)。
+        //  ただし ARM 後の1分ガードは実行しない (色が崩れてもリセットしない)。
+        //  Pattern A は Signal にしない。
+        //  Pattern B は「反対色を経由したあとのフラット」で即 Entry せず、
+        //  目的色へ復帰するまで待つ:
+        //    LONG  青 → 赤(複数本可) → フラット(複数本可) → 青   で Signal
+        //    SHORT 赤 → 青(複数本可) → フラット(複数本可) → 赤   で Signal
+        //  ★ ST_FLAT と ST_B_CONFIRM は別 State。
+        //    ST_FLAT は「青 → フラット」など通常の遷移でも使うため、
+        //    「反対色を経由したあとのフラット」を区別しないと
+        //    青 → 赤 → フラット → 青 を正確に判定できない。
+        // ---- LONG ------------------------------------------------------
+        if lsNext == ST_WAIT
+            if bg15 == BG_BLUE and bg30 == BG_BLUE and bg1m == BG_BLUE
+                lsNext := ST_ARMED
+        else if lsNext == ST_ARMED
+            if bg15 == BG_FLAT
+                lsNext := ST_FLAT
+            else if bg15 == BG_RED
+                lsNext := ST_OPP
+        else if lsNext == ST_FLAT
+            if bg15 == BG_BLUE
+                //  青 → フラット → 青 : Signal にはしない
+                lsNext := ST_ARMED
+            else if bg15 == BG_RED
+                lsNext := ST_OPP
+        else if lsNext == ST_OPP
+            if bg15 == BG_FLAT
+                //  赤 → フラット : ここではまだ Entry しない。復帰待ちへ。
+                lsNext := ST_B_CONFIRM
+            else if bg15 == BG_BLUE
+                lsNext := ST_ARMED
+        else
+            //  ST_B_CONFIRM : フラットが続く限り維持
+            if bg15 == BG_BLUE
+                //  青 → 赤 → フラット → 青  ← ここで Pattern B Signal
+                longSigB := true
+                lsNext   := ST_ARMED
+            else if bg15 == BG_RED
+                lsNext := ST_OPP
+
+        // ---- SHORT (LONG の完全対称) -----------------------------------
+        if ssNext == ST_WAIT
+            if bg15 == BG_RED and bg30 == BG_RED and bg1m == BG_RED
+                ssNext := ST_ARMED
+        else if ssNext == ST_ARMED
+            if bg15 == BG_FLAT
+                ssNext := ST_FLAT
+            else if bg15 == BG_BLUE
+                ssNext := ST_OPP
+        else if ssNext == ST_FLAT
+            if bg15 == BG_RED
+                ssNext := ST_ARMED
+            else if bg15 == BG_BLUE
+                ssNext := ST_OPP
+        else if ssNext == ST_OPP
+            if bg15 == BG_FLAT
+                ssNext := ST_B_CONFIRM
+            else if bg15 == BG_RED
+                ssNext := ST_ARMED
+        else
+            //  ST_B_CONFIRM : フラットが続く限り維持
+            if bg15 == BG_RED
+                //  赤 → 青 → フラット → 赤  ← ここで Pattern B Signal
+                shortSigB := true
+                ssNext    := ST_ARMED
+            else if bg15 == BG_BLUE
+                ssNext := ST_OPP
 
 //  既存の15秒 Pattern A / B が完成したことを示す素の Signal。
 //  ★ 以下のフィルターはこの Signal を「通す / 落とす」だけで、
@@ -1743,6 +1901,10 @@ plot(bg5mTurnedRed  ? 1.0 : 0.0, title = "DW: 5m turned RED",   display = displa
 plot(entryFilterMode == FM_1M ? 1.0 : entryFilterMode == FM_5M ? 2.0 : entryFilterMode == FM_BOTH ? 3.0 : 4.0,
      title = "DW: Entry Filter Mode", display = display.data_window)
 //  素の Signal (フィルター適用前) と 最終 Signal (適用後)
+//  Base Signal Mode : 0 = CURRENT / 1 = CANDIDATE_1 / 2 = CANDIDATE_2
+plot(baseSignalMode == BASE_CURRENT ? 0.0 : baseSignalMode == BASE_C1 ? 1.0 :
+     baseSignalMode == BASE_C2 ? 2.0 : -1.0,
+     title = "DW: Base Signal Mode", display = display.data_window)
 //  Pattern A / B を個別に出す (Python で Base Signal から再探索するため)。
 //  ★ State Machine の出力を読むだけ。Pattern 判定そのものには一切関与しない。
 plot(longSigA  ? 1.0 : 0.0, title = "DW: LONG Pattern A Signal",  display = display.data_window)
@@ -1816,7 +1978,8 @@ if showDebugTable and barstate.islast
     string ts0 = dbgTextSize
 
     table.cell(dbgTable, 0, 0, "SAT MTF DEBUG", text_color = color.white, bgcolor = bgH, text_size = f_textSize(ts0))
-    table.cell(dbgTable, 1, 0, timeframe.period + "  /  " + sltpMode, text_color = color.white, bgcolor = bgH, text_size = f_textSize(ts0))
+    table.cell(dbgTable, 1, 0, timeframe.period + "  /  " + sltpMode +
+         "  /  Base " + baseSignalMode, text_color = color.white, bgcolor = bgH, text_size = f_textSize(ts0))
 
     table.cell(dbgTable, 0, 1, "15s 背景", text_color = color.white, bgcolor = bgS, text_size = f_textSize(ts0))
     table.cell(dbgTable, 1, 1, f_bgStr(bg15) +
