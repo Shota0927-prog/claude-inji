@@ -1,0 +1,557 @@
+// ============================================================================
+//  SAT Original Base Research Strategy
+// ----------------------------------------------------------------------------
+//  既存 SAT MTF Strategy に最初から存在していた CURRENT Base Signal を、
+//  余計な Filter / Zone を一切入れずに完全再現して再検証するためのファイル。
+//
+//  sat_mtf_strategy.pine / sat_base_v2_research.pine とは完全に独立した
+//  別ファイルで、あちらのロジックは一切変更していない。
+//
+//  ■ 目的
+//    ・CURRENT 全体
+//    ・Pattern A 単独
+//    ・Pattern B 単独
+//    ・LONG / SHORT
+//    を 365 日で分解し、「元ロジックのどこに Edge があるのか」を確認する。
+//
+//  ■ CURRENT ロジック (LONG。SHORT は色を反転した完全対称)
+//    初期 ARM : 15s BLUE かつ 30s BLUE かつ 1m BLUE
+//               ★ 30s は初期 ARM にだけ使う。ARM 後の維持条件ではない。
+//    1m Guard : ST_WAIT 以外のとき確定1分背景が BLUE でなくなったら即 ST_WAIT
+//    Pattern A: BLUE → FLAT (1本以上) → BLUE   ← BLUE へ復帰した足で Signal
+//    Pattern B: BLUE → RED  (1本以上) → FLAT   ← 最初の FLAT で Signal
+//               ★ Pattern B は FLAT 到達時点で Signal。BLUE 復帰までは待たない。
+//
+//  ■ このファイルに入れていないもの (意図的)
+//    5m SAT / CANDIDATE_1 ～ 17 / SAT Base v2 の 3 仮説 / ZoneEngine /
+//    Zone SLTP / Entry Filter ① / Entry Filter ② / HTF Filter / MA Filter /
+//    Session Filter / Volatility Filter / DXY / Yield / Oil / Silver /
+//    スコアリング / 追加 Confirm / Freshness / Setup Event / 新しい Entry 条件
+//
+//  ■ 構成
+//    01. INPUTS
+//    02. SAT BAND Reconstruction 計算関数
+//    03. SAT 背景 : 15s / 30s / 1m
+//    04. ORIGINAL CURRENT STATE MACHINE
+//    05. PATTERN MODE → 最終 Signal
+//    06. RISK / QTY
+//    07. ORDER + Entry 成功時 Reset
+//    08. DISPLAY / DEBUG
+//
+//  ■ リペイント防止
+//   ・Entry State の更新は必ず確定した15秒足で行う (barstate.isconfirmed)。
+//   ・30秒 / 1分の背景は request.security(..., lookahead_on) の内部で
+//     式に [1] を掛け、「最後に確定した HTF バー」の値だけを使う。
+//     形成中の HTF バーは絶対に使わない。
+//     ★ lookahead_on は必ず [1] とセットで使う。単独では絶対に使わない。
+//       [1] が「ひとつ前の閉じた HTF バー」を指すため、lookahead_on が
+//       前借りするのはその確定済みバーの値だけで、未来の情報は入らない。
+//       lookahead_off + [1] は HTF バー切り替わり直後にもう 1 本ぶん古い値を
+//       返しうるので、ヒストリカルとリアルタイムで判定がずれる。
+//   ・過去バーの Entry 位置が後から変わる実装は入れていない。
+// ============================================================================
+
+//@version=5
+strategy(
+     title             = "SAT Original Base Research Strategy",
+     shorttitle        = "SAT-Orig-Base",
+     overlay           = true,
+     pyramiding        = 1,
+     initial_capital   = 1000,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     process_orders_on_close = true,
+     max_labels_count  = 500
+ )
+
+// ---- 背景 State -------------------------------------------------------------
+int BG_BLUE = 1
+int BG_FLAT = 0
+int BG_RED  = -1
+
+// ---- Entry State Machine (元 CURRENT と同じ 4 State) ------------------------
+//   LONG  : 0 WAIT / 1 ARMED(青基準) / 2 SAW_FLAT / 3 SAW_RED
+//   SHORT : 0 WAIT / 1 ARMED(赤基準) / 2 SAW_FLAT / 3 SAW_BLUE
+int ST_WAIT  = 0
+int ST_ARMED = 1
+int ST_FLAT  = 2
+int ST_OPP   = 3
+
+// ============================================================================
+// 01. INPUTS
+// ============================================================================
+
+// ---- 01-1 Pattern Mode -----------------------------------------------------
+var string G_PAT = "01 · Pattern Mode"
+MODE_ALL = "ORIGINAL · A + B"
+MODE_A   = "PATTERN_A_ONLY"
+MODE_B   = "PATTERN_B_ONLY"
+patternMode = input.string(MODE_ALL, "Pattern Mode",
+     options = ["ORIGINAL · A + B", "PATTERN_A_ONLY", "PATTERN_B_ONLY"], group = G_PAT,
+     tooltip = "★ Pattern Mode で変わるのは「どの Signal を Order へ渡すか」だけ ★\n" +
+     "  State Machine そのものは 3 Mode でまったく同じように進む。\n" +
+     "  例えば PATTERN_B_ONLY でも Pattern A 相当の FLAT → BLUE の State 遷移は\n" +
+     "  通常どおり処理する。ただし A Signal を Order には渡さない。\n\n" +
+     "ORIGINAL · A + B : 元 CURRENT そのまま (A も B も Entry)\n" +
+     "PATTERN_A_ONLY   : Pattern A (BLUE → FLAT → BLUE) だけ Entry\n" +
+     "PATTERN_B_ONLY   : Pattern B (BLUE → RED → FLAT) だけ Entry")
+
+// ---- 01-2 MTF --------------------------------------------------------------
+var string G_MTF = "02 · MTF · 時間足"
+satTf30 = input.timeframe("30S", "30秒足 の時間足指定", group = G_MTF,
+     tooltip = "この時間足のコンテキスト内で STB / LINE1 / LINE2 / 背景 をすべて再計算する。\n15秒足のラインを流用しない。")
+satTf1m = input.timeframe("1",   "1分足 の時間足指定",  group = G_MTF)
+
+// ---- 01-3 方向 -------------------------------------------------------------
+var string G_DIR = "03 · 方向"
+enableLong  = input.bool(true, "Enable Long",  group = G_DIR)
+enableShort = input.bool(true, "Enable Short", group = G_DIR)
+
+// ---- 01-4 SL / TP (固定のみ) -----------------------------------------------
+var string G_SLTP = "04 · SL / TP (固定のみ)"
+fixedSlDollar = input.float(5.0,  "Fixed SL ($)", minval = 0.01, step = 0.1, group = G_SLTP)
+fixedTpDollar = input.float(10.0, "Fixed TP ($)", minval = 0.01, step = 0.1, group = G_SLTP)
+
+// ---- 01-5 Risk -------------------------------------------------------------
+var string G_RISK = "05 · Risk"
+riskPct     = input.float(1.0, "1トレード損失率 (%)", step = 0.1, minval = 0.0, group = G_RISK)
+useCompound = input.bool(false, "複利 (残高ベース) ※OFF=元金単利", group = G_RISK)
+qtyStep     = input.float(0.01, "Qty 刻み (最小ロット単位)", minval = 0.00000001, step = 0.01, group = G_RISK)
+qtyMin      = input.float(0.01, "Qty 最小値 (これ未満はエントリーしない)", minval = 0.0, step = 0.01, group = G_RISK)
+
+// ---- 01-6 表示 -------------------------------------------------------------
+var string G_DISP = "06 · 表示"
+showBg    = input.bool(true, "SAT 15s 背景を表示", group = G_DISP)
+bgBuyCol  = input.color(#068C8C, "青 (Bull) 背景色", group = G_DISP)
+bgSellCol = input.color(#F54230, "赤 (Bear) 背景色", group = G_DISP)
+bgTransp  = input.int(66, "背景の透明度", minval = 0, maxval = 100, group = G_DISP)
+showDebug = input.bool(true, "Debug Table を表示", group = G_DISP)
+
+// ============================================================================
+// 02. SAT BAND Reconstruction 計算関数
+// ----------------------------------------------------------------------------
+//  ★ 計算式は既存最新版 (sat_mtf_strategy.pine) と完全一致 ★
+//    見た目を合わせるための補正・追加平滑化・Confirm などは一切入れていない。
+//
+//    共通   … basis  = ta.vwma(hlc3, 5)
+//             common = basis * 0.5
+//             atr50  = ta.atr(50)[1]
+//             src      = close[1] * 0.5
+//             trigLow  = low[1]   * 0.5
+//             trigHigh = high[1]  * 0.5
+//
+//    LINE1  … k = 5.0 の Anchor State 機械   line1 = common + anchor1
+//    LINE2  … k = 2.5 の Anchor State 機械   line2 = common + anchor2
+//             (構造は LINE1 と同一。違うのは倍率だけ。anchor / dir は完全に別変数)
+//
+//    STB    … 表示     : ta.highest(high, 10) / ta.lowest(low, 10)
+//             方向判定 : ta.highest(high, 20)[1] / ta.lowest(low, 20)[1]
+//             毎バー high breakout を先に判定し、下抜けは else if。
+//             同一バーで上下両方を突破した場合は Bull(+1) 優先。
+//
+//    背景   … 各ラインの dir は使わず、close と 3 本の位置関係だけで決める。
+//             青 (+1) : close > LINE1 かつ close > LINE2 かつ close > STB
+//             赤 (-1) : close < LINE1 かつ close < LINE2 かつ close < STB
+//             フラット (0) : それ以外
+//
+//  ■ 計算パラメータは固定値 (input 化していない)
+//    VWMA 5 / common 倍率 0.5 / ATR 50 / LINE1 k = 5.0 / LINE2 k = 2.5 /
+//    STB 表示 10 本 / STB 転換 20 本
+// ============================================================================
+f_satRebuild() =>
+    // ---- 共通 Basis (SMA でも EMA でもなく VWMA) --------------------------
+    float basis  = ta.vwma(hlc3, 5)
+    float common = basis * 0.5
+
+    // ---- ATR (ta.atr なので内部は RMA。現在足ではなく 1 本前の値) ---------
+    float atr50 = ta.atr(50)[1]
+
+    // ---- Anchor 共通 source と State 反転判定用の値 -----------------------
+    //  いずれも 1 本前の足から作る。現在足は使わない。
+    float src      = close[1] * 0.5
+    float trigLow  = low[1]   * 0.5
+    float trigHigh = high[1]  * 0.5
+
+    bool ready = not na(atr50) and not na(src) and not na(trigLow) and not na(trigHigh)
+
+    // ---- LINE1 (k = 5.0) --------------------------------------------------
+    //  ※ 同一バー内で更新済みの anchor / dir を条件判定へ再利用しないよう、
+    //    判定前に prevAnchor1 / prevDir1 へ退避してから State を更新する。
+    float k1 = 5.0
+    var float anchor1 = na
+    var int   dir1    = 1
+    float prevAnchor1 = anchor1
+    int   prevDir1    = dir1
+    if ready
+        if na(prevAnchor1)
+            // 初期化：Bull から開始する
+            anchor1 := src - k1 * atr50
+            dir1    := 1
+        else if prevDir1 == 1
+            if trigLow < prevAnchor1
+                // Bull → Bear
+                dir1    := -1
+                anchor1 := src + k1 * atr50
+            else
+                dir1    := 1
+                anchor1 := math.max(prevAnchor1, src - k1 * atr50)
+        else
+            if trigHigh > prevAnchor1
+                // Bear → Bull
+                dir1    := 1
+                anchor1 := src - k1 * atr50
+            else
+                dir1    := -1
+                anchor1 := math.min(prevAnchor1, src + k1 * atr50)
+    float line1 = common + anchor1
+
+    // ---- LINE2 (k = 2.5) --------------------------------------------------
+    //  LINE1 と構造は完全に同じ。違うのは倍率だけ。
+    //  状態変数は LINE1 とは独立しており、互いを参照しない。
+    float k2 = 2.5
+    var float anchor2 = na
+    var int   dir2    = 1
+    float prevAnchor2 = anchor2
+    int   prevDir2    = dir2
+    if ready
+        if na(prevAnchor2)
+            // 初期化：Bull から開始する
+            anchor2 := src - k2 * atr50
+            dir2    := 1
+        else if prevDir2 == 1
+            if trigLow < prevAnchor2
+                // Bull → Bear
+                dir2    := -1
+                anchor2 := src + k2 * atr50
+            else
+                dir2    := 1
+                anchor2 := math.max(prevAnchor2, src - k2 * atr50)
+        else
+            if trigHigh > prevAnchor2
+                // Bear → Bull
+                dir2    := 1
+                anchor2 := src - k2 * atr50
+            else
+                dir2    := -1
+                anchor2 := math.min(prevAnchor2, src + k2 * atr50)
+    float line2 = common + anchor2
+
+    // ---- STB (Donchian 構造) ----------------------------------------------
+    //  LINE1 / LINE2 の State とは完全に独立。互いを参照しない。
+    //  ATR / EMA / Supertrend は一切使わない。
+    //    表示用     : ta.highest(high, 10) / ta.lowest(low, 10)
+    //    方向判定用 : ta.highest(high, 20)[1] / ta.lowest(low, 20)[1]
+    //  方向転換は毎バー high breakout を先に判定する。同じ足で上下両方を
+    //  突破した場合も else if の構造により Bull(+1) が優先される。
+    //  どちらも突破していなければ直前の State を維持する。
+    float stbUpper = ta.highest(high, 10)
+    float stbLower = ta.lowest(low, 10)
+    float prev20High = ta.highest(high, 20)[1]
+    float prev20Low  = ta.lowest(low, 20)[1]
+    var int stbDir = 1
+    if not na(prev20High) and not na(prev20Low)
+        if high > prev20High
+            stbDir := 1
+        else if low < prev20Low
+            stbDir := -1
+    // UP は下側 (lower10)、DOWN は上側 (upper10) を表示価格にする
+    float stb = stbDir == 1 ? stbLower : stbUpper
+
+    // ---- Background State --------------------------------------------------
+    //  各ラインの dir ではなく、現在の close と LINE1 / LINE2 / STB の
+    //  位置関係だけで決める。判定ソースは close 固定。
+    bool allAbove = close > line1 and close > line2 and close > stb
+    bool allBelow = close < line1 and close < line2 and close < stb
+    int bgState = 0
+    if allAbove
+        bgState := 1
+    else if allBelow
+        bgState := -1
+
+    [bgState, line1, dir1, line2, dir2, stb, stbDir, basis, common, atr50, anchor1, anchor2]
+
+// ----------------------------------------------------------------------------
+// [SAT] 上位足用ラッパー : 「最後に確定した HTF バー」の背景 State だけを返す
+//
+//   ★ 内部の [1] と 外側の bgv[1] は目的が違う。どちらも必要 ★
+//     内部 [1] (atr50 = ta.atr(50)[1] / src = close[1] * 0.5 など)
+//         … Reconstruction の計算式そのもの。SAT の定義の一部。
+//     外側 bgv[1]
+//         … 「最後に確定した HTF バー」の背景を取り出すためのもの。
+//           request.security の中 (HTF の時系列) で適用するので、
+//           返るのは必ず確定済み HTF バーの値になる。
+//
+//   ★ 呼び出し側は barmerge.lookahead_on と組み合わせる (この [1] とセット) ★
+//     lookahead_on 単独は未来参照になるので絶対に使わない。
+// ----------------------------------------------------------------------------
+f_satBgHtf() =>
+    [bgRaw, _r1, _r2, _r3, _r4, _r5, _r6, _r7, _r8, _r9, _r10, _r11] = f_satRebuild()
+    // タプル分解した変数へ直接 history 参照をかけないよう、通常変数へコピーする
+    int bgv = bgRaw
+    bgv[1]
+
+// ---- 表示用ヘルパー ---------------------------------------------------------
+f_bgStr(int b) =>
+    b == BG_BLUE ? "青 (BLUE)" : b == BG_RED ? "赤 (RED)" : "フラット (FLAT)"
+f_bgCol(int b) =>
+    b == BG_BLUE ? bgBuyCol : b == BG_RED ? bgSellCol : color.rgb(149, 152, 161)
+f_longStateStr(int s) =>
+    s == ST_WAIT ? "WAIT_INITIAL" : s == ST_ARMED ? "ARMED (青)" :
+     s == ST_FLAT ? "SAW_FLAT" : "SAW_RED"
+f_shortStateStr(int s) =>
+    s == ST_WAIT ? "WAIT_INITIAL" : s == ST_ARMED ? "ARMED (赤)" :
+     s == ST_FLAT ? "SAW_FLAT" : "SAW_BLUE"
+
+// ============================================================================
+// 03. SAT 背景 : 15s (チャート足) / 30s / 1m
+// ----------------------------------------------------------------------------
+//  すべて同一の f_satRebuild() を使う。時間足ごとに別の近似式は書かない。
+//  ★ 15秒で計算したラインは流用していない。request.security() の中で
+//    f_satRebuild() そのものを評価しているため、VWMA / ATR / Anchor State /
+//    STB State はすべてその時間足自身の OHLC から作られる。
+//  ★ 関数内の var (anchor1 / anchor2 / dir1 / dir2 / stbDir) は呼び出し箇所ごとに
+//    独立するので、15秒 / 30秒 / 1分の State が混ざることはない。
+//  ★ 5分は今回取得しない (元 CURRENT が使っていないため)。
+// ============================================================================
+[bg15, satL1Line, satL1Dir, satL2Line, satL2Dir, satStbLine, satStbDir,
+     satBasis, satCommon, satAtr50, satAnchor1, satAnchor2] = f_satRebuild()
+
+int bg30 = nz(request.security(syminfo.tickerid, satTf30, f_satBgHtf(),
+     lookahead = barmerge.lookahead_on), 0)
+
+int bg1m = nz(request.security(syminfo.tickerid, satTf1m, f_satBgHtf(),
+     lookahead = barmerge.lookahead_on), 0)
+
+// ============================================================================
+// 04. ORIGINAL CURRENT STATE MACHINE
+// ----------------------------------------------------------------------------
+//  ★ 下の if barConfirmed の中身は、元 sat_mtf_strategy.pine の
+//    CURRENT ブロックをそのまま移したもの。1 行も変更していない。
+//
+//  ★ background[2] / background[1] / background だけの判定はしていない。
+//    フラット・赤・青が複数本連続しても成立するよう、明示的な State Machine。
+//  ★ LONG と SHORT は完全に別の State を持つ。互いに干渉しない。
+//  ★ 判定は確定した15秒足でのみ進める (barstate.isconfirmed)。
+//
+//  LONG
+//    WAIT_INITIAL : 15s青 + 30s青 + 1m青 が同時成立 → ARMED
+//                   (この時点では Entry しない。あくまで LONG 待機開始)
+//    ARMED        : 青が続く限り ARMED / フラット → SAW_FLAT / 赤 → SAW_RED
+//    SAW_FLAT     : フラットが続く限り SAW_FLAT
+//                   青 → 【Pattern A Signal】→ ARMED
+//                   赤 → SAW_RED
+//    SAW_RED      : 赤が続く限り SAW_RED
+//                   フラット → 【Pattern B Signal】→ SAW_FLAT
+//                   青 → Signal なしで ARMED
+//    ※ 待機開始後は 30秒足の色を一切問わない (初期成立条件でのみ 30s青 を使う)。
+//    ※ 1分足は Signal 成立まで「青を維持」が必須。確定1分背景が青でなくなった
+//      時点で LONG 待機状態・15秒パターン進行状態をすべてリセットする。
+//
+//  SHORT は完全対称 (青と赤を入れ替えるだけ)。
+// ============================================================================
+var int longState  = ST_WAIT
+var int shortState = ST_WAIT
+
+bool barConfirmed = barstate.isconfirmed
+
+int  lsNext     = longState
+bool longSigA   = false
+bool longSigB   = false
+int  ssNext     = shortState
+bool shortSigA  = false
+bool shortSigB  = false
+
+if barConfirmed
+    // ---- LONG ----------------------------------------------------------
+    //  1) 1分足ガード : 待機中に確定1分背景が青でなくなったら全リセット
+    if lsNext != ST_WAIT and bg1m != BG_BLUE
+        lsNext := ST_WAIT
+    //  2) State 遷移
+    if lsNext == ST_WAIT
+        //  初期成立。この青は Pattern の最初の「青」として数える。
+        if bg15 == BG_BLUE and bg30 == BG_BLUE and bg1m == BG_BLUE
+            lsNext := ST_ARMED
+    else if lsNext == ST_ARMED
+        if bg15 == BG_FLAT
+            lsNext := ST_FLAT
+        else if bg15 == BG_RED
+            lsNext := ST_OPP
+    else if lsNext == ST_FLAT
+        if bg15 == BG_BLUE
+            //  青 → フラット(複数本可) → 青
+            longSigA := true
+            lsNext   := ST_ARMED
+        else if bg15 == BG_RED
+            lsNext := ST_OPP
+    else
+        if bg15 == BG_FLAT
+            //  青 → 赤(複数本可) → フラット
+            longSigB := true
+            lsNext   := ST_FLAT
+        else if bg15 == BG_BLUE
+            lsNext := ST_ARMED
+
+    // ---- SHORT (LONG の完全対称) ---------------------------------------
+    if ssNext != ST_WAIT and bg1m != BG_RED
+        ssNext := ST_WAIT
+    if ssNext == ST_WAIT
+        if bg15 == BG_RED and bg30 == BG_RED and bg1m == BG_RED
+            ssNext := ST_ARMED
+    else if ssNext == ST_ARMED
+        if bg15 == BG_FLAT
+            ssNext := ST_FLAT
+        else if bg15 == BG_BLUE
+            ssNext := ST_OPP
+    else if ssNext == ST_FLAT
+        if bg15 == BG_RED
+            //  赤 → フラット(複数本可) → 赤
+            shortSigA := true
+            ssNext    := ST_ARMED
+        else if bg15 == BG_BLUE
+            ssNext := ST_OPP
+    else
+        if bg15 == BG_FLAT
+            //  赤 → 青(複数本可) → フラット
+            shortSigB := true
+            ssNext    := ST_FLAT
+        else if bg15 == BG_RED
+            ssNext := ST_ARMED
+
+// ============================================================================
+// 05. PATTERN MODE → 最終 Signal
+// ----------------------------------------------------------------------------
+//  ★ Pattern Mode が変えるのは「どの Signal を Order へ渡すか」だけ ★
+//    上の State Machine は 3 Mode でまったく同じように進む。
+//    PATTERN_B_ONLY でも Pattern A 相当の FLAT → BLUE の State 遷移
+//    (longSigA が立って lsNext が ST_ARMED へ戻る) は通常どおり処理する。
+//    ただし longSignal には乗せないので Order も Entry Reset も起きない。
+//    これで「Pattern A を禁止した状態で Pattern B だけを運用した場合」の
+//    実際の Strategy 結果が測れる。
+// ============================================================================
+bool longSignal  = patternMode == MODE_A ? longSigA  :
+     patternMode == MODE_B ? longSigB  : (longSigA  or longSigB)
+bool shortSignal = patternMode == MODE_A ? shortSigA :
+     patternMode == MODE_B ? shortSigB : (shortSigA or shortSigB)
+
+//  Entry ID を分けるための Pattern 種別 (0 = なし / 1 = A / 2 = B)
+//  Mode ALL で同一バーに A と B が同時成立することは State Machine 上ない
+//  (A は ST_FLAT からの青、B は ST_OPP からのフラットで State が排他のため)。
+int longEntryPattern  = longSignal  ? (longSigA  ? 1 : 2) : 0
+int shortEntryPattern = shortSignal ? (shortSigA ? 1 : 2) : 0
+
+// ============================================================================
+// 06. RISK / QTY
+// ----------------------------------------------------------------------------
+//  Qty は必ず SL 距離から計算する。Long / Short 共通。
+//    Risk Capital ÷ SL距離 ÷ syminfo.pointvalue → qtyStep 単位に切り下げ
+// ============================================================================
+f_baseCapital() =>
+    useCompound ? strategy.equity : strategy.initial_capital
+
+f_riskCapital() =>
+    f_baseCapital() * riskPct / 100.0
+
+f_qty(float riskPerUnit) =>
+    float raw = riskPerUnit > 0 ? f_riskCapital() / (riskPerUnit * syminfo.pointvalue) : 0.0
+    float q = qtyStep > 0 ? math.floor(raw / qtyStep) * qtyStep : raw
+    math.round(q, 8)
+
+float tradeQty = f_qty(fixedSlDollar)
+
+// ============================================================================
+// 07. ORDER + Entry 成功時 Reset
+// ----------------------------------------------------------------------------
+//  ・最大同時保有 1 (ポジションを持っている間は新規 Entry しない)
+//  ・SL / TP は固定。Entry 時の close から $ 距離で決める
+//  ・Entry ID は Pattern 別 : L-A / L-B / S-A / S-B
+//    SL / TP も from_entry で対応させる
+//
+//  ★ Entry 成功時の Reset は元 CURRENT と同じ挙動 ★
+//    実際に Entry 注文を出せたときだけ、その方向の State を ST_WAIT へ戻す。
+//    Base Signal が出ただけでは強制リセットしない。ポジション保有中 /
+//    Qty 不足などで Entry できなかった場合は、State Machine の自然な次 State
+//    (Pattern A なら ARMED / Pattern B なら SAW_FLAT) のまま継続する。
+//    ★ Pattern Mode で除外された Signal でも Entry Reset は起きない。
+//      longSignal / shortSignal に乗っていないため canLong / canShort が
+//      false になり、下の Reset 条件を通らない。
+// ============================================================================
+bool flat     = strategy.position_size == 0
+bool qtyOk    = tradeQty >= qtyMin and tradeQty > 0
+bool canLong  = longSignal  and enableLong  and flat and qtyOk
+bool canShort = shortSignal and enableShort and flat and qtyOk
+
+if canLong
+    string eid = longEntryPattern == 1 ? "L-A" : "L-B"
+    strategy.entry(eid, strategy.long, qty = tradeQty)
+    strategy.exit(eid + "-X", from_entry = eid,
+         stop = close - fixedSlDollar, limit = close + fixedTpDollar)
+
+if canShort
+    string eid = shortEntryPattern == 1 ? "S-A" : "S-B"
+    strategy.entry(eid, strategy.short, qty = tradeQty)
+    strategy.exit(eid + "-X", from_entry = eid,
+         stop = close + fixedSlDollar, limit = close - fixedTpDollar)
+
+//  Entry が成立した方向だけ待機状態を完全リセットする。
+//  次の Entry には再度 15s + 30s + 1m の初期成立を要求する。
+if canLong
+    lsNext := ST_WAIT
+if canShort
+    ssNext := ST_WAIT
+
+longState  := lsNext
+shortState := ssNext
+
+// ============================================================================
+// 08. DISPLAY / DEBUG
+// ============================================================================
+color bgFinal = not showBg ? na :
+     bg15 == BG_BLUE ? color.new(bgBuyCol, bgTransp) :
+     bg15 == BG_RED  ? color.new(bgSellCol, bgTransp) : na
+bgcolor(bgFinal, title = "SAT 15s 背景")
+
+// ---- Data Window ------------------------------------------------------------
+//  Pattern Mode : 0 = ALL / 1 = A_ONLY / 2 = B_ONLY
+plot(patternMode == MODE_ALL ? 0.0 : patternMode == MODE_A ? 1.0 : 2.0,
+     title = "DW: Pattern Mode", display = display.data_window)
+plot(bg15 * 1.0, title = "DW: 15s BG", display = display.data_window)
+plot(bg30 * 1.0, title = "DW: 30s BG", display = display.data_window)
+plot(bg1m * 1.0, title = "DW: 1m BG",  display = display.data_window)
+plot(longState  * 1.0, title = "DW: LONG State",  display = display.data_window)
+plot(shortState * 1.0, title = "DW: SHORT State", display = display.data_window)
+//  Pattern 別の素の Signal (Pattern Mode に関係なく常に出る)
+plot(longSigA  ? 1.0 : 0.0, title = "DW: LONG Pattern A Signal",  display = display.data_window)
+plot(longSigB  ? 1.0 : 0.0, title = "DW: LONG Pattern B Signal",  display = display.data_window)
+plot(shortSigA ? 1.0 : 0.0, title = "DW: SHORT Pattern A Signal", display = display.data_window)
+plot(shortSigB ? 1.0 : 0.0, title = "DW: SHORT Pattern B Signal", display = display.data_window)
+//  Pattern Mode 適用後の最終 Signal
+plot(longSignal  ? 1.0 : 0.0, title = "DW: Final LONG Signal",  display = display.data_window)
+plot(shortSignal ? 1.0 : 0.0, title = "DW: Final SHORT Signal", display = display.data_window)
+
+// ---- Debug Table (小さめ) ---------------------------------------------------
+var table dbgTable = table.new(position.top_right, 2, 7,
+     border_width = 1, frame_width = 1, frame_color = color.gray)
+
+if showDebug and barstate.islast
+    color bgH = color.new(color.black, 10)
+    color bgC = color.new(color.black, 30)
+    table.cell(dbgTable, 0, 0, "SAT Original Base", text_color = color.white, bgcolor = bgH, text_size = size.small)
+    table.cell(dbgTable, 1, 0, patternMode,         text_color = color.white, bgcolor = bgH, text_size = size.small)
+
+    table.cell(dbgTable, 0, 1, "15s BG", text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 1, f_bgStr(bg15), text_color = f_bgCol(bg15), bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 0, 2, "30s BG", text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 2, f_bgStr(bg30) + "  ※初期ARMのみ", text_color = f_bgCol(bg30), bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 0, 3, "1m BG",  text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 3, f_bgStr(bg1m) + "  ※維持必須", text_color = f_bgCol(bg1m), bgcolor = bgC, text_size = size.small)
+
+    table.cell(dbgTable, 0, 4, "LONG State",  text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 4, f_longStateStr(longState),  text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 0, 5, "SHORT State", text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 5, f_shortStateStr(shortState), text_color = color.white, bgcolor = bgC, text_size = size.small)
+
+    table.cell(dbgTable, 0, 6, "Signal A / B", text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 6,
+         "LONG "  + (longSigA  ? "A" : "-") + (longSigB  ? "B" : "-") +
+         "   SHORT " + (shortSigA ? "A" : "-") + (shortSigB ? "B" : "-"),
+         text_color = color.white, bgcolor = bgC, text_size = size.small)
