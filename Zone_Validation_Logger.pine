@@ -774,12 +774,27 @@ var map<int, int> vzTouchCnt = map.new<int, int>()
 var map<int, int> vzArmed    = map.new<int, int>()
 var map<int, int> vzLastSeen = map.new<int, int>()
 
+//  ★ Zoneごとの「直前の方向性State」。
+//    ST_SUPPORT を観測したら 1 / ST_RESIST を観測したら -1 を保存し、
+//    ST_ACTIVE / ST_BROKEN では上書きしない (直前方向を保持する)。
+//    0 = 方向不明 (一度も SUPPORT / RESIST を観測していない)。
+//    ZoneEngine 側の state 判定には一切影響しない検証専用の記憶。
+var map<int, int> vzLastDir = map.new<int, int>()
+
+//  ★ 「方向不明の ACTIVE Zone への接触」を1接近につき1回だけ数えるためのフラグ。
+//    再arm (Re-arm Distance 到達) でクリアする。
+var map<int, int> vzUnkSeen = map.new<int, int>()
+
 //  ★ 毎バー作り直す「trackId → 現在のZone配列index」。var + clear で再利用する。
 var map<int, int> vLiveIdx = map.new<int, int>()
 
 var array<VEvent> vActive = array.new<VEvent>()
 var array<VEvent> vQueue  = array.new<VEvent>()
 var int vDropped = 0
+
+//  ★ 診断用: 方向不明 (lastDir == 0) の ACTIVE Zone への接触の累積件数。
+//    Event は生成していない = 取りこぼしの目安。
+var int vUnknownActive = 0
 
 // ---- 10.5 出力スロット (plot用グローバル) ---------------------------------
 float ev_zoneId            = na
@@ -822,7 +837,9 @@ float ev_trackingLost      = na
 if useValidation and barstate.isconfirmed
     //  10.6.1 Zone全件走査: 登録簿更新 + Touch検出 + LiveIndex構築
     //    ・走査は1バー1回だけ。過去バーの再走査は行わない。
-    //    ・Event生成 / TouchCount は ST_SUPPORT / ST_RESIST のZoneのみ。
+    //    ・Event生成 / TouchCount は direction が確定できた接触のみ
+    //      (SUPPORT / RESIST、および直前方向を引き継げる ACTIVE)。
+    //      BROKEN と 方向不明ACTIVE では新規Eventを作らない。
     map.clear(vLiveIdx)
     int _zc = zn.zoneCount(zoneEng)
     if _zc > 0
@@ -836,7 +853,17 @@ if useValidation and barstate.isconfirmed
                     map.put(vzBornMs, _id, time)
                     map.put(vzTouchCnt, _id, 0)
                     map.put(vzArmed, _id, 1)
+                    //  初検出時点で既に ACTIVE の場合は方向不明 (0) から始める。
+                    map.put(vzLastDir, _id, 0)
+                    map.put(vzUnkSeen, _id, 0)
                 map.put(vzLastSeen, _id, bar_index)
+
+                //  ★ 直前方向Stateの更新 (観測のみ / ZoneEngine へは書き戻さない)
+                //    ST_ACTIVE / ST_BROKEN では上書きせず、直前方向を保持する。
+                if _z.state == ST_SUPPORT
+                    map.put(vzLastDir, _id, 1)
+                else if _z.state == ST_RESIST
+                    map.put(vzLastDir, _id, -1)
 
                 //  Touch定義: そのバーのレンジが Zone [bottom, top] と重なること。
                 //    ZoneEngine の Reaction 判定とは独立した検証専用カウンタ。
@@ -844,32 +871,37 @@ if useValidation and barstate.isconfirmed
                 bool _inZone = low <= _z.top and high >= _z.bottom
                 float _dist = close < _z.bottom ? _z.bottom - close : close > _z.top ? close - _z.top : 0.0
                 int _armed = map.get(vzArmed, _id)
-                //  ★ Event生成 / TouchCount の対象は ST_SUPPORT / ST_RESIST だけ。
-                //    ST_ACTIVE / ST_BROKEN への接触では
-                //     ・新規Eventを作らない
-                //     ・TouchCountも加算しない
-                //     ・armed も落とさない (価格がZoneに留まったまま
-                //       SUPPORT / RESIST に確定した場合、その接触を取り逃さない)
-                //    → Break後の状態変化は、既に追跡中のEvent側 (10.6.2) で
-                //      従来どおり監視する。
-                bool _srState = _z.state == ST_SUPPORT or _z.state == ST_RESIST
+                //  ★ Touch時の direction 判定
+                //    ① 現在 ST_SUPPORT           → 1
+                //    ② 現在 ST_RESIST            → -1
+                //    ③ 現在 ST_ACTIVE            → vzLastDir (直前方向を引き継ぐ)
+                //    ④ 現在 ST_BROKEN            → 0 (新規Eventを作らない)
+                //    ③で vzLastDir == 0 (方向不明) の場合も 0 となり、
+                //    Support / Resistance を推測せず Event生成を見送る。
+                //
+                //    価格がZoneへ侵入した瞬間に ZoneEngine 側が ST_ACTIVE へ
+                //    変化するケースでも、直前の SUPPORT / RESIST を引き継いで
+                //    Touch を取得できる。
+                int _lastDir = map.get(vzLastDir, _id)
+                int _dir = _z.state == ST_SUPPORT ? 1 : _z.state == ST_RESIST ? -1 :
+                 _z.state == ST_ACTIVE ? _lastDir : 0
                 if _inZone
-                    if _armed == 1 and _srState
+                    if _armed == 1 and _dir != 0
+                        //  ★ 方向が確定できた接触は ACTIVE でも正式なTouchとして扱い、
+                        //    ここで armed を落とす。
+                        //    → 「ACTIVEでEvent生成 → 次バーSUPPORTへ戻る → まだZone内」
+                        //      でも同じTouchを二重計上しない。
                         map.put(vzArmed, _id, 0)
                         int _tc = map.get(vzTouchCnt, _id) + 1
                         map.put(vzTouchCnt, _id, _tc)
                         if array.size(vActive) < maxActiveEvents
-                            //  direction: 1=SUPPORT(上が有利) / -1=RESIST(下が有利)
-                            //    (0=ACTIVE / -2=BROKEN は上の _srState ゲートにより
-                            //     新規Eventでは発生しない)
-                            int _dir = _z.state == ST_SUPPORT ? 1 : -1
                             //  ★ refPrice = 反発の起点となる Zone境界価格。
-                            //    SUPPORT → z.top  (上side の境界から上へどれだけ伸びたか)
-                            //    RESIST  → z.bottom (下side の境界から下へどれだけ伸びたか)
+                            //    direction = 1  → z.top    (境界から上へどれだけ伸びたか)
+                            //    direction = -1 → z.bottom (境界から下へどれだけ伸びたか)
                             //    Touch足の終値を基準にすると、その足で大きく反発して
                             //    Zoneから離れて引けた場合に反発幅を過小評価するため、
                             //    終値基準にはしない。
-                            float _ref = _z.state == ST_SUPPORT ? _z.top : _z.bottom
+                            float _ref = _dir == 1 ? _z.top : _z.bottom
                             VEvent _ne = VEvent.new()
                             _ne.zoneId      := _id
                             _ne.touchTimeMs := time
@@ -893,9 +925,22 @@ if useValidation and barstate.isconfirmed
                             array.push(vActive, _ne)
                         else
                             vDropped += 1
+                    else if _armed == 1 and _z.state == ST_ACTIVE
+                        //  方向不明 (lastDir == 0) の ACTIVE への接触。
+                        //   ・Support / Resistance を推測しないため Event は作らない
+                        //   ・TouchCount も加算しない
+                        //   ・armed も落とさない
+                        //     (同じ接近中に SUPPORT / RESIST へ確定したら拾えるように)
+                        //   ・診断用に1接近あたり1回だけカウントする
+                        if map.get(vzUnkSeen, _id) == 0
+                            map.put(vzUnkSeen, _id, 1)
+                            vUnknownActive += 1
                 else
+                    //  ★ 再arm は「終値が Zone から Re-arm Distance 以上離れたこと」のみ。
+                    //    ACTIVE → SUPPORT などの state 変化だけでは再arm しない。
                     if _dist >= touchRearmDist
                         map.put(vzArmed, _id, 1)
+                        map.put(vzUnkSeen, _id, 0)
 
     //  10.6.2 追跡中イベントの更新 (Touchしたバー自身はスキップ)
     //    ・同一Zoneの同時追跡を許可する (Zone毎1件に制限しない)。
@@ -981,6 +1026,8 @@ if useValidation and barstate.isconfirmed
                     map.remove(vzBornMs, _k)
                     map.remove(vzTouchCnt, _k)
                     map.remove(vzArmed, _k)
+                    map.remove(vzLastDir, _k)
+                    map.remove(vzUnkSeen, _k)
 
     //  10.6.4 Queue から1バー1件だけ出力
     if array.size(vQueue) > 0
@@ -1056,6 +1103,8 @@ plot(ev_trackingLost,       "EV_trackingLost",       display = display.data_wind
 float ev_queueLen     = useValidation ? array.size(vQueue)  : na
 float ev_activeEvents = useValidation ? array.size(vActive) : na
 float ev_dropped      = useValidation ? vDropped            : na
+float ev_unknownAct   = useValidation ? vUnknownActive      : na
 plot(ev_queueLen,     "EV_queueLen",     display = display.data_window)
 plot(ev_activeEvents, "EV_activeEvents", display = display.data_window)
 plot(ev_dropped,      "EV_dropped",      display = display.data_window)
+plot(ev_unknownAct,   "EV_unknownActiveTouches", display = display.data_window)
