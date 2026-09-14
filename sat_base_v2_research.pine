@@ -93,9 +93,11 @@ baseMode = input.string(MODE_TREND, "Base Mode",
      tooltip = "3 Mode とも 15秒 Trigger は完全に同じ。違うのは Setup の作り方だけ。\n" +
      "  15秒 Trigger (LONG) : 15s RED (複数本可) → 最初の FLAT で Signal\n" +
      "  15秒 Trigger (SHORT): 15s BLUE (複数本可) → 最初の FLAT で Signal\n\n" +
-     "TREND_CONTINUATION : 5m が目的色を維持している中で、\n" +
-     "  1m が一度目的色から離れてから目的色へ復帰した瞬間を Setup とする。\n" +
-     "  5m と 1m が目的色なだけでは ARM しない (1m の押しと戻りの履歴が必須)。\n\n" +
+     "TREND_CONTINUATION : 5m Regime が継続している最中の 1m 押し → 戻り。\n" +
+     "  LONG なら 5m BLUE を一度も失わないまま\n" +
+     "  1m BLUE → 1m 非BLUE (押し) → 1m BLUE 復帰 が起きた瞬間だけ Setup。\n" +
+     "  5m と 1m が目的色なだけでは ARM しない (1m の押しと戻りの履歴が必須)。\n" +
+     "  押しの途中で 5m が崩れたらその履歴は破棄され、Setup にならない。\n\n" +
      "NEW_TREND : 確定5m背景が FLAT → 目的色 へ転換したときだけ Setup 開始。\n" +
      "  その後「次に確定する1m足 1 本だけ」を確認し、目的色なら ARM。\n" +
      "  目的色でなければ Setup 失敗 (無期限には待たない)。\n\n" +
@@ -366,39 +368,64 @@ if newConfirmed5m
     bg5mPrevReady     := true
 
 // ---- 1m Pullback → Recovery イベント (TREND_CONTINUATION 用) ----------------
-//  LONG  : 1m が一度 BLUE から離れた履歴を持ち、その後 BLUE へ復帰した瞬間
-//  SHORT : 1m が一度 RED  から離れた履歴を持ち、その後 RED  へ復帰した瞬間
+//  LONG  : 5m BLUE Regime が継続している最中に
+//            1m BLUE  →  1m 非BLUE (押し)  →  1m BLUE 復帰
+//          が起きた瞬間
+//  SHORT : 5m RED Regime 内で 1m RED → 非RED → RED 復帰 (完全対称)
 //
-//  ★ 「離れた履歴」が必須 ★
-//    ただ 1m が目的色であるだけでは Event にしない。押しのない BLUE 継続中に
-//    何度も ARM してしまうのを防ぐため、目的色を一度外れたことを var で覚える。
+//  ★ Pullback の開始から Recovery まで 5m Regime を一度も失ってはいけない ★
+//    1m だけを追跡すると、押しの途中で 5m が FLAT / 反対色へ崩れ、あとから
+//    5m が目的色へ戻ったところで 1m が復帰した場合まで Event になってしまう。
+//    それは「既存トレンド中の押し目」ではなく別の現象なので、
+//    5m が目的色でなくなった時点で履歴を完全リセットする。
+//
+//  ★ 一度その 5m Regime 内で 1m Target を確認してから離れた場合だけ Pullback ★
+//    履歴開始直後 (または 5m Regime が変わった直後) に 1m がたまたま非 Target
+//    だっただけでは leftTarget を立てない。seenTarget を先に要求することで、
+//    「Target を見てから離れた」ものだけを押しとして扱う。
 //
 //  ★ LONG / SHORT は同じ関数を使う (呼び出し箇所ごとに var は独立する) ★
 //    targetColor を入れ替えるだけなので、完全対称であることがコード上保証される。
 //
-//    State  false : 目的色から離れた履歴なし (復帰しても Event にしない)
-//           true  : 目的色から離れた履歴あり (次に目的色へ戻ったら Event)
+//    seenTarget : この 5m Regime 内で 1m Target を一度確認済みか
+//    leftTarget : その後 1m が Target から離れたか
 //
-//  ★ 履歴開始直後の 1 本目は初期化だけに使い、Event を発生させない。
-f_1mPullbackRecovery(int bg, int targetColor, bool doUpdate) =>
+//  ★ 更新タイミング ★
+//    1m 側の State (seenTarget / leftTarget) を進めるのは確定1分更新のときだけ。
+//    15秒足ごとには更新しない。
+//    5m Regime 崩れによるリセットは確定5m更新と確定1分更新の両方で判定する。
+//    bg5m が値を変えられるのは確定5m更新のときだけなので確定5m更新だけでも
+//    十分だが、両方で見ておけば取りこぼしが構造的に起きない。
+f_trendPullbackRecovery(int bgHtf, int bg1, int targetColor,
+     bool doUpdate5m, bool doUpdate1m) =>
+    var bool seenTarget = false
     var bool leftTarget = false
-    var bool ready      = false
     bool ev = false
-    if doUpdate
-        if not ready
-            // 初期化 : 1 本目は現在色を記録するだけ
-            leftTarget := bg != targetColor
-            ready      := true
-        else if bg == targetColor
-            if leftTarget
-                ev := true
+    //  1) 5m Regime が目的色でなくなったら履歴を完全リセット
+    if doUpdate5m or doUpdate1m
+        if bgHtf != targetColor
+            seenTarget := false
             leftTarget := false
-        else
+    //  2) ～ 4) 1m 側は確定1分更新のときだけ進める (5m が目的色のときのみ)
+    if doUpdate1m and bgHtf == targetColor
+        if not seenTarget
+            //  2) この Regime 内でまだ 1m Target を見ていない
+            //     Target を見たら seenTarget。非 Target はここでは押しにしない。
+            if bg1 == targetColor
+                seenTarget := true
+        else if bg1 != targetColor
+            //  3) Target を見たあとに離れた → 押し
             leftTarget := true
+        else if leftTarget
+            //  4) 押しのあとの Target 復帰 → Setup Event
+            ev := true
+            leftTarget := false
     ev
 
-bool ev1mRecoverBlue = f_1mPullbackRecovery(bg1m, BG_BLUE, newConfirmed1m)
-bool ev1mRecoverRed  = f_1mPullbackRecovery(bg1m, BG_RED,  newConfirmed1m)
+bool evTrendLongRecovery  = f_trendPullbackRecovery(bg5m, bg1m, BG_BLUE,
+     newConfirmed5m, newConfirmed1m)
+bool evTrendShortRecovery = f_trendPullbackRecovery(bg5m, bg1m, BG_RED,
+     newConfirmed5m, newConfirmed1m)
 
 // ============================================================================
 // 05. BASE STATE MACHINE (3 Mode 共通の枠組み)
@@ -486,21 +513,23 @@ bool shortSignal = false
 if barConfirmed
     if baseMode == MODE_TREND
         // ---- ① TREND_CONTINUATION --------------------------------------
-        //  Setup Event : 5m が目的色を維持している中で、1m が一度目的色から
+        //  Setup Event : 5m Regime が継続している最中に、1m が一度目的色から
         //                離れてから目的色へ復帰した確定1分更新。
         //                ★ 5m と 1m が目的色なだけでは ARM しない。
         //                  1m の「押し → 戻り」の履歴が必須。
+        //                ★ 押しの開始から復帰まで 5m Regime を一度も
+        //                  失っていないことが必須 (崩れたら履歴は破棄)。
         //  1m 確認     : Setup Event 自体が 1m の確認を兼ねているので使わない。
         //                Event バーでは Trigger 判定をしないので (処理順 4 が
         //                2 より後)、15s Trigger は次の確定15秒足から。
         //  Setup 維持  : 5m と 1m の両方が目的色。どちらか崩れたら Setup 終了。
         [tLSt, tLSig] = f_baseStep(lsNext,
-             bg5m == BG_BLUE and ev1mRecoverBlue, bg5m == BG_BLUE and bg1m == BG_BLUE,
+             bg5m == BG_BLUE and evTrendLongRecovery, bg5m == BG_BLUE and bg1m == BG_BLUE,
              false, false, false, true, bg15, BG_RED)
         lsNext     := tLSt
         longSignal := tLSig
         [tSSt, tSSig] = f_baseStep(ssNext,
-             bg5m == BG_RED and ev1mRecoverRed, bg5m == BG_RED and bg1m == BG_RED,
+             bg5m == BG_RED and evTrendShortRecovery, bg5m == BG_RED and bg1m == BG_RED,
              false, false, false, true, bg15, BG_BLUE)
         ssNext      := tSSt
         shortSignal := tSSig
@@ -619,8 +648,10 @@ plot(ev5mRedToBlue  ? 1.0 : 0.0, title = "DW: 5m RED→BLUE",  display = display
 plot(ev5mBlueToRed  ? 1.0 : 0.0, title = "DW: 5m BLUE→RED",  display = display.data_window)
 //  1m 確認イベント
 plot(newConfirmed1m  ? 1.0 : 0.0, title = "DW: New Confirmed 1m",   display = display.data_window)
-plot(ev1mRecoverBlue ? 1.0 : 0.0, title = "DW: 1m Recover BLUE",    display = display.data_window)
-plot(ev1mRecoverRed  ? 1.0 : 0.0, title = "DW: 1m Recover RED",     display = display.data_window)
+//  ★ 列名・列数・並びは従来どおり。中身が「5m Regime 維持中の 1m 押し → 戻り」
+//    になっただけで、CSV のスキーマは変えていない。
+plot(evTrendLongRecovery  ? 1.0 : 0.0, title = "DW: 1m Recover BLUE",    display = display.data_window)
+plot(evTrendShortRecovery ? 1.0 : 0.0, title = "DW: 1m Recover RED",     display = display.data_window)
 
 // ---- Debug Table (小さめ) ---------------------------------------------------
 var table dbgTable = table.new(position.top_right, 2, 8,
@@ -654,5 +685,5 @@ if showDebug and barstate.islast
          "5m " + (ev5mFlatToBlue ? "FLAT→BLUE" : ev5mFlatToRed ? "FLAT→RED" :
               ev5mRedToBlue ? "RED→BLUE" : ev5mBlueToRed ? "BLUE→RED" : "-") +
          "  /  1m " + (newConfirmed1m ? "確定" : "-") +
-         (ev1mRecoverBlue ? " 復帰BLUE" : ev1mRecoverRed ? " 復帰RED" : ""),
+         (evTrendLongRecovery ? " 復帰BLUE" : evTrendShortRecovery ? " 復帰RED" : ""),
          text_color = color.white, bgcolor = bgC, text_size = size.small)
