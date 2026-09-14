@@ -159,6 +159,11 @@ int ST_OPP   = 3
 //    青 → 赤 → フラット → 青 を正確に判定できない。
 //    CURRENT / CANDIDATE_1 ではこの State へ遷移しない。
 int ST_B_CONFIRM = 4
+//  ★ CANDIDATE_3 ～ CANDIDATE_7 専用 : 上位足 Setup イベントは発生したが、
+//    中間時間足の確認待ちであることを表す State。
+//    C6 (1m Turn → 30s Confirm) と C7 (5m Turn → 1m Confirm) だけが使う。
+//    CURRENT / CANDIDATE_1 / CANDIDATE_2 ではこの State へ遷移しない。
+int ST_SETUP_CONFIRM = 5
 
 string LOGIC_ID = "SAT"
 
@@ -223,8 +228,18 @@ var string G_BASE = "02 · Base Signal"
 BASE_CURRENT = "CURRENT"
 BASE_C1      = "CANDIDATE_1"
 BASE_C2      = "CANDIDATE_2"
+BASE_C3      = "CANDIDATE_3 · 5m Turn → 15s"
+BASE_C4      = "CANDIDATE_4 · 1m Turn → 15s"
+BASE_C5      = "CANDIDATE_5 · 5m Regime + 1m Turn → 15s"
+BASE_C6      = "CANDIDATE_6 · 1m Turn → 30s Confirm → 15s"
+BASE_C7      = "CANDIDATE_7 · 5m Turn → 1m Confirm → 15s"
 baseSignalMode = input.string(BASE_CURRENT, "Base Signal Mode",
-     options = ["CURRENT", "CANDIDATE_1", "CANDIDATE_2"], group = G_BASE,
+     options = ["CURRENT", "CANDIDATE_1", "CANDIDATE_2",
+     "CANDIDATE_3 · 5m Turn → 15s",
+     "CANDIDATE_4 · 1m Turn → 15s",
+     "CANDIDATE_5 · 5m Regime + 1m Turn → 15s",
+     "CANDIDATE_6 · 1m Turn → 30s Confirm → 15s",
+     "CANDIDATE_7 · 5m Turn → 1m Confirm → 15s"], group = G_BASE,
      tooltip = "CURRENT : 現行ロジックそのまま\n" +
      "  ARM = 15s + 30s + 1m の同方向一致 / ARM 後も確定1分背景の維持が必須\n" +
      "  Pattern A (青→フラット→青) と Pattern B (青→赤→フラット) の両方が Signal\n\n" +
@@ -235,7 +250,18 @@ baseSignalMode = input.string(BASE_CURRENT, "Base Signal Mode",
      "  ARM は CURRENT と同じ (15s + 30s + 1m)。ARM 後は1分でリセットしない。\n" +
      "  LONG  青 → 赤(複数本可) → フラット(複数本可) → 青  で Signal\n" +
      "  SHORT 赤 → 青(複数本可) → フラット(複数本可) → 赤  で Signal\n" +
-     "  Pattern A は Signal にしない。")
+     "  Pattern A は Signal にしない。\n\n" +
+     "━━ CANDIDATE_3 ～ 7 : 上位足 Setup → 15秒押し戻し Trigger ━━\n" +
+     "  15秒 Trigger は 5 つとも共通。Setup 成立後の最初の押しだけを見る。\n" +
+     "    LONG  15s RED (複数本可) → FLAT で Signal\n" +
+     "    SHORT 15s BLUE (複数本可) → FLAT で Signal\n" +
+     "    Opposite から FLAT を通らず目的色へ直接戻ったら Signal なしで終了。\n" +
+     "    Signal を出した時点でその Setup は消費される (発注可否に関係ない)。\n\n" +
+     "  CANDIDATE_3 : 確定5分背景が新しく目的色へ転換 → Setup\n" +
+     "  CANDIDATE_4 : 確定1分背景が新しく目的色へ転換 → Setup\n" +
+     "  CANDIDATE_5 : 5m が目的色の中で 1m が新しく転換 → Setup\n" +
+     "  CANDIDATE_6 : 1m 転換 → その後の確定30秒で同方向確認 → Setup\n" +
+     "  CANDIDATE_7 : 5m 転換 → その後の確定1分で同方向確認 → Setup")
 
 // ---- Entry Filter (既存 Entry State Machine には手を入れない追加条件) -------
 var string G_FLT = "02 · Entry Filter"
@@ -744,10 +770,10 @@ f_bgCol(int b) =>
     b == 1 ? bgBuyCol : b == -1 ? bgSellCol : color.rgb(149, 152, 161)
 f_longStateStr(int s) =>
     s == ST_WAIT ? "WAIT_INITIAL" : s == ST_ARMED ? "ARMED (青)" : s == ST_FLAT ? "SAW_FLAT" :
-     s == ST_OPP ? "SAW_RED" : "B_CONFIRM_FLAT"
+     s == ST_OPP ? "SAW_RED" : s == ST_B_CONFIRM ? "B_CONFIRM_FLAT" : "WAIT_MID_CONFIRM"
 f_shortStateStr(int s) =>
     s == ST_WAIT ? "WAIT_INITIAL" : s == ST_ARMED ? "ARMED (赤)" : s == ST_FLAT ? "SAW_FLAT" :
-     s == ST_OPP ? "SAW_BLUE" : "B_CONFIRM_FLAT"
+     s == ST_OPP ? "SAW_BLUE" : s == ST_B_CONFIRM ? "B_CONFIRM_FLAT" : "WAIT_MID_CONFIRM"
 //  HTF SAT Filter : 条件が有効か (OFF 以外か)
 f_htfAct(string c) =>
     c == "OFF" ? 0 : 1
@@ -931,6 +957,138 @@ bool long1mTransitionValid  = long1mTrState  == TR_VALID and long1mValidBars  >=
 bool short1mTransitionValid = short1mTrState == TR_VALID and short1mValidBars >= 1 and short1mValidBars <= transitionValidBars
 
 // ============================================================================
+// 03c. CANDIDATE_3 ～ CANDIDATE_7 用 : 上位足 Setup イベント検出
+// ----------------------------------------------------------------------------
+//  ★ ここで作る値を参照するのは Section 04 の CANDIDATE_3 ～ CANDIDATE_7 だけ。
+//    CURRENT / CANDIDATE_1 / CANDIDATE_2 の判定には一切関与しない。
+//  ★ 5分転換イベント (newConfirmed5m / bg5mTurnedBlue / bg5mTurnedRed) は
+//    もともと 04b (Entry Filter ②) の中にあったものを、Section 04 から参照できる
+//    ように「位置だけ」この上へ移したもの。計算式・初期化ガードは変えていない。
+//    Entry Filter ② は引き続き同じ値をそのまま使う。
+// ============================================================================
+
+// ---- 確定5分背景が「目的色へ切り替わった」イベント --------------------------
+//  bg5m は security 内部で [1] + lookahead_on を掛けているため、
+//  time(satTf5m) が切り替わった最初の15秒足でちょうど「いま閉じた5分足」の
+//  背景へ更新される。そのタイミングだけを見て遷移を判定する。
+//  5分足1本につき必ず1回。形成中5分足は使わない。
+int  tf5mChange     = nz(ta.change(time(satTf5m)), 0)
+bool newConfirmed5m = bar_index > 0 and tf5mChange != 0
+
+//  ★ 最初の確定5分更新は「初期化だけ」に使い、転換イベントを発生させない ★
+//    bg5mPrevConfirmed の初期値 0 (FLAT) をそのまま前回値として扱うと、
+//    履歴開始後に最初に得られた確定5分背景が BLUE / RED だった場合に
+//    0 → BLUE / RED を色転換と誤認してしまう。
+//    そのため bg5mPrevReady が立つまでは前回値を記録するだけにする。
+//    2 回目以降の確定5分更新から「前回非BLUE → 今回BLUE」
+//    「前回非RED → 今回RED」を転換イベントとして判定する。
+var int  bg5mPrevConfirmed = 0
+var bool bg5mPrevReady     = false
+bool bg5mTurnedBlue = false
+bool bg5mTurnedRed  = false
+if newConfirmed5m
+    if bg5mPrevReady
+        bg5mTurnedBlue := bg5m == BG_BLUE and bg5mPrevConfirmed != BG_BLUE
+        bg5mTurnedRed  := bg5m == BG_RED  and bg5mPrevConfirmed != BG_RED
+    bg5mPrevConfirmed := bg5m
+    bg5mPrevReady     := true
+
+// ---- 確定1分背景が「目的色へ切り替わった」イベント --------------------------
+//  ★ bg1m は15秒チャート上で同じ値が4本続くため、bg1m != bg1m[1] のような
+//    単純比較では判定できない。newConfirmed1m (= time(satTf1m) が切り替わった
+//    最初の15秒足) のときだけ「ひとつ前の確定1分背景」と比較する。
+//    これで1分足1本につき必ず1回だけ転換判定が走る。
+//  ★ 最初の確定1分更新は「初期化だけ」に使い、転換イベントを発生させない。
+//    prevConfirmedBg1m が na の間は記録するだけにする (5分側と同じ考え方)。
+//  ★ 形成中の1分足は使わない。bg1m は security 内部で [1] + lookahead_on を
+//    掛けているため、常に「最後に確定した1分足」の背景である。
+var int prevConfirmedBg1m = na
+
+bool bg1mTurnedBlue = false
+bool bg1mTurnedRed  = false
+if newConfirmed1m
+    bg1mTurnedBlue := not na(prevConfirmedBg1m) and prevConfirmedBg1m != BG_BLUE and bg1m == BG_BLUE
+    bg1mTurnedRed  := not na(prevConfirmedBg1m) and prevConfirmedBg1m != BG_RED  and bg1m == BG_RED
+    prevConfirmedBg1m := bg1m
+
+// ---- 確定30秒足の更新イベント (CANDIDATE_6 の中間確認に使う) ----------------
+//  形成中の30秒足は使わない。bg30 は security 内部で [1] + lookahead_on なので、
+//  この更新タイミングでちょうど「いま閉じた30秒足」の背景へ切り替わる。
+int  tf30Change      = nz(ta.change(time(satTf30)), 0)
+bool newConfirmed30s = bar_index > 0 and tf30Change != 0
+
+// ----------------------------------------------------------------------------
+//  C3 ～ C7 共通の Setup → 15秒 Trigger State Machine
+//
+//  ★ 15秒 Trigger は 5 候補すべて同一。違うのは「Setup をどう始めるか」だけ。
+//    今回は Trigger の違いを比較しないので、FLAT → 目的色の復帰待ちや
+//    Pattern A / ローソク足 / EMA / Zone / ATR などは一切入れていない。
+//
+//  State の意味 (C3 ～ C7)
+//    ST_WAIT          : 新しい Setup Event を待っている
+//    ST_SETUP_CONFIRM : 中間時間足の確認待ち (C6 / C7 だけが使う)
+//    ST_ARMED         : Setup 成立済み。15秒の最初の Opposite を待っている
+//    ST_OPP           : 15秒 Opposite を確認済み。FLAT への回復を待っている
+//    ※ ST_FLAT / ST_B_CONFIRM は C3 ～ C7 では使わない。
+//
+//  1バーの処理順 (この順序が時間順序の保証そのもの)
+//    1) Setup キャンセル判定
+//    2) 15秒 Trigger 判定
+//    3) 中間時間足の確認 (ST_SETUP_CONFIRM → ST_ARMED)
+//    4) 新しい Setup Event (ST_WAIT → ST_SETUP_CONFIRM / ST_ARMED)
+//
+//    3) が 2) より後なので「確認が成立したバー」では Trigger 判定を始めない。
+//    4) が 3) より後なので「Setup Event のバー」では確認判定も Trigger 判定も
+//    始めない。どちらも必ず「次の確定15秒足」からになる。
+//
+//  Trigger (LONG の場合。SHORT は oppColor を BG_BLUE にするだけの完全対称)
+//    ST_ARMED : bg15 == RED       → ST_OPP
+//               それ以外           → ST_ARMED 維持
+//    ST_OPP   : bg15 == RED       → ST_OPP 維持 (RED は何本続いてもよい)
+//               bg15 == FLAT      → Signal を出して ST_WAIT (Setup を消費)
+//               bg15 == BLUE      → Signal なしで ST_WAIT (FLAT を通らなかった)
+//
+//  ★ Signal を出したらその場で ST_WAIT に戻す。実際に発注できたかどうかは見ない。
+//    Entry Filter で落ちても / ポジション保有中でも / Qty 不足でも、
+//    同じ Setup から 2 回目の Trigger は出さない。
+//    新しい Setup Event が来るまで再 ARM しない (Fresh Setup 厳守)。
+//
+//  ★ LONG / SHORT で同じ関数を使うことで、条件・State 遷移・キャンセル条件が
+//    完全対称であることをコード上で保証する。
+//  ★ 関数内に var / ta.* を持たないので、呼び出し位置による履歴のズレは起きない。
+// ----------------------------------------------------------------------------
+f_setupTrigger(int stIn, bool setupEvent, bool setupAlive, bool useConfirm,
+     bool confirmEvent, bool confirmAlive, int bgTrig, int oppColor) =>
+    int  st  = stIn
+    bool sig = false
+    //  1) Setup キャンセル
+    if st == ST_SETUP_CONFIRM
+        if not confirmAlive
+            st := ST_WAIT
+    else if st != ST_WAIT
+        if not setupAlive
+            st := ST_WAIT
+    //  2) 15秒 Trigger
+    if st == ST_ARMED
+        if bgTrig == oppColor
+            st := ST_OPP
+    else if st == ST_OPP
+        if bgTrig == BG_FLAT
+            //  Opposite → FLAT : Signal を出して Setup を消費する
+            sig := true
+            st  := ST_WAIT
+        else if bgTrig != oppColor
+            //  FLAT を通らず目的色へ直接戻った → Signal なしで Setup 終了
+            st := ST_WAIT
+    //  3) 中間時間足の確認
+    if st == ST_SETUP_CONFIRM and confirmEvent
+        st := ST_ARMED
+    //  4) 新しい Setup Event
+    if st == ST_WAIT and setupEvent
+        st := useConfirm ? ST_SETUP_CONFIRM : ST_ARMED
+    [st, sig]
+
+// ============================================================================
 // 04. ENTRY STATE MACHINE
 // ----------------------------------------------------------------------------
 //  ★ background[2] / background[1] / background だけの判定はしていない。
@@ -1084,7 +1242,7 @@ if barConfirmed
             else if bg15 == BG_RED
                 ssNext := ST_ARMED
 
-    else
+    else if baseSignalMode == BASE_C2
         // ---- CANDIDATE_2 -----------------------------------------------
         //  初期 ARM は CURRENT と同じ (15s + 30s + 1m の同方向一致)。
         //  ただし ARM 後の1分ガードは実行しない (色が崩れてもリセットしない)。
@@ -1155,6 +1313,95 @@ if barConfirmed
             else if bg15 == BG_BLUE
                 ssNext := ST_OPP
 
+    else if baseSignalMode == BASE_C3
+        // ---- CANDIDATE_3 · 5m Turn → 15s First Pullback --------------------
+        //  Setup 開始 : 確定5分背景が新しく目的色へ転換した確定15秒足 (ARM だけ)
+        //  Setup 維持 : bg5m が目的色であること。崩れたら即キャンセル
+        //  Trigger    : Setup 成立後の最初の 15s Opposite → FLAT
+        // ---- LONG ------------------------------------------------------
+        [c3LSt, c3LSig] = f_setupTrigger(lsNext, bg5mTurnedBlue, bg5m == BG_BLUE,
+             false, false, true, bg15, BG_RED)
+        lsNext    := c3LSt
+        longSigB  := c3LSig
+        // ---- SHORT (LONG の完全対称 : 青と赤を入れ替えるだけ) -----------
+        [c3SSt, c3SSig] = f_setupTrigger(ssNext, bg5mTurnedRed, bg5m == BG_RED,
+             false, false, true, bg15, BG_BLUE)
+        ssNext    := c3SSt
+        shortSigB := c3SSig
+
+    else if baseSignalMode == BASE_C4
+        // ---- CANDIDATE_4 · 1m Turn → 15s First Pullback --------------------
+        //  Setup 開始 : 確定1分背景が新しく目的色へ転換した確定15秒足 (ARM だけ)
+        //  Setup 維持 : bg1m が目的色であること。FLAT / 反対色でキャンセル
+        //  Trigger    : Setup 成立後の最初の 15s Opposite → FLAT
+        // ---- LONG ------------------------------------------------------
+        [c4LSt, c4LSig] = f_setupTrigger(lsNext, bg1mTurnedBlue, bg1m == BG_BLUE,
+             false, false, true, bg15, BG_RED)
+        lsNext    := c4LSt
+        longSigB  := c4LSig
+        // ---- SHORT (LONG の完全対称 : 青と赤を入れ替えるだけ) -----------
+        [c4SSt, c4SSig] = f_setupTrigger(ssNext, bg1mTurnedRed, bg1m == BG_RED,
+             false, false, true, bg15, BG_BLUE)
+        ssNext    := c4SSt
+        shortSigB := c4SSig
+
+    else if baseSignalMode == BASE_C5
+        // ---- CANDIDATE_5 · 5m Regime + 1m Turn → 15s First Pullback --------
+        //  Setup 開始 : bg5m が目的色 (方向フィルター) である中で、
+        //               確定1分背景が新しく目的色へ転換した確定15秒足 (ARM だけ)
+        //               ★ 5m が目的色なだけでは ARM しない。1m の新しい転換が必須
+        //  Setup 維持 : bg5m と bg1m の両方が目的色。どちらか崩れたらキャンセル
+        //  Trigger    : Setup 成立後の最初の 15s Opposite → FLAT
+        // ---- LONG ------------------------------------------------------
+        [c5LSt, c5LSig] = f_setupTrigger(lsNext, bg5m == BG_BLUE and bg1mTurnedBlue, bg5m == BG_BLUE and bg1m == BG_BLUE,
+             false, false, true, bg15, BG_RED)
+        lsNext    := c5LSt
+        longSigB  := c5LSig
+        // ---- SHORT (LONG の完全対称 : 青と赤を入れ替えるだけ) -----------
+        [c5SSt, c5SSig] = f_setupTrigger(ssNext, bg5m == BG_RED and bg1mTurnedRed, bg5m == BG_RED and bg1m == BG_RED,
+             false, false, true, bg15, BG_BLUE)
+        ssNext    := c5SSt
+        shortSigB := c5SSig
+
+    else if baseSignalMode == BASE_C6
+        // ---- CANDIDATE_6 · 1m Turn → 30s Confirm → 15s First Pullback ------
+        //  Setup 開始 : 確定1分背景が新しく目的色へ転換 → ST_SETUP_CONFIRM
+        //  確認待ち中 : bg1m が目的色を維持していること (崩れたらキャンセル)
+        //               その後の「確定30秒更新かつ bg30 が目的色」で ST_ARMED
+        //               ★ 確認が成立したバーでは Trigger 判定を始めない
+        //  Setup 維持 : bg1m と bg30 の両方が目的色。どちらか崩れたらキャンセル
+        //  Trigger    : Setup 成立後の最初の 15s Opposite → FLAT
+        // ---- LONG ------------------------------------------------------
+        [c6LSt, c6LSig] = f_setupTrigger(lsNext, bg1mTurnedBlue, bg1m == BG_BLUE and bg30 == BG_BLUE,
+             true, newConfirmed30s and bg30 == BG_BLUE, bg1m == BG_BLUE, bg15, BG_RED)
+        lsNext    := c6LSt
+        longSigB  := c6LSig
+        // ---- SHORT (LONG の完全対称 : 青と赤を入れ替えるだけ) -----------
+        [c6SSt, c6SSig] = f_setupTrigger(ssNext, bg1mTurnedRed, bg1m == BG_RED and bg30 == BG_RED,
+             true, newConfirmed30s and bg30 == BG_RED, bg1m == BG_RED, bg15, BG_BLUE)
+        ssNext    := c6SSt
+        shortSigB := c6SSig
+
+    else if baseSignalMode == BASE_C7
+        // ---- CANDIDATE_7 · 5m Turn → 1m Confirm → 15s First Pullback -------
+        //  Setup 開始 : 確定5分背景が新しく目的色へ転換 → ST_SETUP_CONFIRM
+        //  確認待ち中 : bg5m が目的色を維持していること (崩れたらキャンセル)
+        //               その後の「確定1分更新かつ bg1m が目的色」で ST_ARMED
+        //               ★ 5m 転換イベントと同じバーでは 1m 確認まで進めない
+        //               ★ 確認が成立したバーでは Trigger 判定を始めない
+        //  Setup 維持 : bg5m と bg1m の両方が目的色。どちらか崩れたらキャンセル
+        //  Trigger    : Setup 成立後の最初の 15s Opposite → FLAT
+        // ---- LONG ------------------------------------------------------
+        [c7LSt, c7LSig] = f_setupTrigger(lsNext, bg5mTurnedBlue, bg5m == BG_BLUE and bg1m == BG_BLUE,
+             true, newConfirmed1m and bg1m == BG_BLUE, bg5m == BG_BLUE, bg15, BG_RED)
+        lsNext    := c7LSt
+        longSigB  := c7LSig
+        // ---- SHORT (LONG の完全対称 : 青と赤を入れ替えるだけ) -----------
+        [c7SSt, c7SSig] = f_setupTrigger(ssNext, bg5mTurnedRed, bg5m == BG_RED and bg1m == BG_RED,
+             true, newConfirmed1m and bg1m == BG_RED, bg5m == BG_RED, bg15, BG_BLUE)
+        ssNext    := c7SSt
+        shortSigB := c7SSig
+
 //  既存の15秒 Pattern A / B が完成したことを示す素の Signal。
 //  ★ 以下のフィルターはこの Signal を「通す / 落とす」だけで、
 //    Pattern A / B の State Machine (lsNext / ssNext) には一切影響しない。
@@ -1189,31 +1436,10 @@ bool baseShortSignal = shortSigA or shortSigB
 bool f1LongPass  = long1mTransitionValid
 bool f1ShortPass = short1mTransitionValid
 
-// ---- 確定5分背景が「目的色へ切り替わった」イベント --------------------------
-//  bg5m は security 内部で [1] + lookahead_on を掛けているため、
-//  time(satTf5m) が切り替わった最初の15秒足でちょうど「いま閉じた5分足」の
-//  背景へ更新される。そのタイミングだけを見て遷移を判定する。
-//  5分足1本につき必ず1回。形成中5分足は使わない。
-int  tf5mChange     = nz(ta.change(time(satTf5m)), 0)
-bool newConfirmed5m = bar_index > 0 and tf5mChange != 0
-
-//  ★ 最初の確定5分更新は「初期化だけ」に使い、転換イベントを発生させない ★
-//    bg5mPrevConfirmed の初期値 0 (FLAT) をそのまま前回値として扱うと、
-//    履歴開始後に最初に得られた確定5分背景が BLUE / RED だった場合に
-//    0 → BLUE / RED を色転換と誤認してしまう。
-//    そのため bg5mPrevReady が立つまでは前回値を記録するだけにする。
-//    2 回目以降の確定5分更新から「前回非BLUE → 今回BLUE」
-//    「前回非RED → 今回RED」を転換イベントとして判定する。
-var int  bg5mPrevConfirmed = 0
-var bool bg5mPrevReady     = false
-bool bg5mTurnedBlue = false
-bool bg5mTurnedRed  = false
-if newConfirmed5m
-    if bg5mPrevReady
-        bg5mTurnedBlue := bg5m == BG_BLUE and bg5mPrevConfirmed != BG_BLUE
-        bg5mTurnedRed  := bg5m == BG_RED  and bg5mPrevConfirmed != BG_RED
-    bg5mPrevConfirmed := bg5m
-    bg5mPrevReady     := true
+//  ★ 確定5分背景の転換イベント (newConfirmed5m / bg5mTurnedBlue / bg5mTurnedRed) は
+//    Section 03c で計算している。Section 04 の CANDIDATE_3 / CANDIDATE_7 からも
+//    参照するため、計算式はそのままに位置だけを 04b の手前へ移した。
+//    ここでの使い方は従来と一切変わらない。
 
 // ---- ② 待機 State -----------------------------------------------------------
 var bool long5mPending  = false
@@ -1901,10 +2127,19 @@ plot(bg5mTurnedRed  ? 1.0 : 0.0, title = "DW: 5m turned RED",   display = displa
 plot(entryFilterMode == FM_1M ? 1.0 : entryFilterMode == FM_5M ? 2.0 : entryFilterMode == FM_BOTH ? 3.0 : 4.0,
      title = "DW: Entry Filter Mode", display = display.data_window)
 //  素の Signal (フィルター適用前) と 最終 Signal (適用後)
-//  Base Signal Mode : 0 = CURRENT / 1 = CANDIDATE_1 / 2 = CANDIDATE_2
+//  Base Signal Mode
+//    0 = CURRENT / 1 = CANDIDATE_1 / 2 = CANDIDATE_2 / 3 = CANDIDATE_3 /
+//    4 = CANDIDATE_4 / 5 = CANDIDATE_5 / 6 = CANDIDATE_6 / 7 = CANDIDATE_7
 plot(baseSignalMode == BASE_CURRENT ? 0.0 : baseSignalMode == BASE_C1 ? 1.0 :
-     baseSignalMode == BASE_C2 ? 2.0 : -1.0,
+     baseSignalMode == BASE_C2 ? 2.0 : baseSignalMode == BASE_C3 ? 3.0 :
+     baseSignalMode == BASE_C4 ? 4.0 : baseSignalMode == BASE_C5 ? 5.0 :
+     baseSignalMode == BASE_C6 ? 6.0 : baseSignalMode == BASE_C7 ? 7.0 : -1.0,
      title = "DW: Base Signal Mode", display = display.data_window)
+//  CANDIDATE_3 ～ CANDIDATE_7 の Setup Event 研究用
+//  (5m turned BLUE / RED は上の ② 用のものをそのまま流用する)
+plot(bg1mTurnedBlue  ? 1.0 : 0.0, title = "DW: 1m turned BLUE",   display = display.data_window)
+plot(bg1mTurnedRed   ? 1.0 : 0.0, title = "DW: 1m turned RED",    display = display.data_window)
+plot(newConfirmed30s ? 1.0 : 0.0, title = "DW: New Confirmed 30s", display = display.data_window)
 //  Pattern A / B を個別に出す (Python で Base Signal から再探索するため)。
 //  ★ State Machine の出力を読むだけ。Pattern 判定そのものには一切関与しない。
 plot(longSigA  ? 1.0 : 0.0, title = "DW: LONG Pattern A Signal",  display = display.data_window)
