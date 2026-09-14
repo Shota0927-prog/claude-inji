@@ -1,0 +1,658 @@
+// ============================================================================
+//  SAT Base v2 Research Strategy
+// ----------------------------------------------------------------------------
+//  Base Signal の検証を最初からやり直すための最小構成 Strategy。
+//  既存の sat_mtf_strategy.pine (CANDIDATE_1 ～ CANDIDATE_17) とは
+//  完全に独立した別ファイルで、あちらのロジックは一切持ち込んでいない。
+//
+//  ■ 目的
+//    細かい候補最適化をやめ、市場構造として意味の異なる 3 仮説だけを
+//    365 日以上で横並び比較する。
+//
+//      ① TREND_CONTINUATION  既存5mトレンド中の押し目 / 戻り
+//      ② NEW_TREND           5m FLAT から新しい方向が発生した初動
+//      ③ FULL_REVERSAL       5m が完全に反対方向へ転換した反転初動
+//
+//    3 つとも「環境 / Setup → 1m 確認 → 15s Entry Trigger」という
+//    時間軸分離を使い、15秒 Trigger は 3 Mode で完全に同一。
+//    違うのは「どういう環境で Setup を開始するか」だけ。
+//
+//  ■ このファイルに入れていないもの (意図的)
+//    CANDIDATE_1 ～ 17 / ZoneEngine / Zone SLTP / Entry Filter ① /
+//    Entry Filter ② / HTF Filter / DXY / Yield / Oil / Silver /
+//    MA Filter / 時間帯 Filter / Research Export / 追加スコアリング /
+//    Pattern A / Shallow Trigger / Direct Recovery / 2回目 Entry /
+//    ATR Filter / Volatility Filter / Session Filter / 複雑な最適化 Parameter
+//
+//    見たいのは「Entry そのものに優位性があるか」だけ。
+//
+//  ■ 構成
+//    01. INPUTS
+//    02. SAT BAND Reconstruction 計算関数
+//    03. SAT 背景 : 15s / 30s / 1m / 5m
+//    04. 5m 転換イベント / 1m イベント
+//    05. BASE STATE MACHINE (3 Mode)
+//    06. RISK / QTY
+//    07. ORDER
+//    08. DISPLAY / DEBUG
+//
+//  ■ リペイント防止
+//   ・Entry Signal は必ず確定した15秒足で決定する (barstate.isconfirmed)。
+//   ・30秒 / 1分 / 5分の背景は request.security(..., lookahead_on) の内部で
+//     式に [1] を掛け、「最後に確定した HTF バー」の値だけを使う。
+//     形成中の HTF バーは絶対に使わない。
+//     ★ lookahead_on は必ず [1] とセットで使う。単独では絶対に使わない。
+//       [1] が「ひとつ前の閉じた HTF バー」を指すため、lookahead_on が
+//       前借りするのはその確定済みバーの値だけで、未来の情報は入らない。
+//       lookahead_off + [1] は HTF バー切り替わり直後にもう 1 本ぶん古い値を
+//       返しうるので、ヒストリカルとリアルタイムで判定がずれる。
+//   ・上位足イベントの判定は「その時間足が 1 本確定したタイミング」だけで行う。
+//     bg1m != bg1m[1] のような15秒足上の単純比較は使っていない。
+//   ・過去バーの Entry 位置が後から変わる実装は入れていない。
+// ============================================================================
+
+//@version=5
+strategy(
+     title             = "SAT Base v2 Research Strategy",
+     shorttitle        = "SAT-Base-v2",
+     overlay           = true,
+     pyramiding        = 1,
+     initial_capital   = 1000,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     process_orders_on_close = true,
+     max_labels_count  = 500
+ )
+
+// ---- 背景 State -------------------------------------------------------------
+int BG_BLUE = 1
+int BG_FLAT = 0
+int BG_RED  = -1
+
+// ---- Base State Machine -----------------------------------------------------
+//  ST_WAIT         : 新しい Setup 待ち
+//  ST_WAIT_CONFIRM : 上位足 Setup 発生後、1m 確認待ち
+//  ST_ARMED        : Setup Ready。最初の15s Deep Pullback 待ち
+//  ST_OPPOSITE     : 15s が反対色まで押した。FLAT 回復待ち
+int ST_WAIT         = 0
+int ST_WAIT_CONFIRM = 1
+int ST_ARMED        = 2
+int ST_OPPOSITE     = 3
+
+// ============================================================================
+// 01. INPUTS
+// ============================================================================
+
+// ---- 01-1 Base Mode --------------------------------------------------------
+var string G_MODE = "01 · Base Mode"
+MODE_TREND    = "TREND_CONTINUATION"
+MODE_NEW      = "NEW_TREND"
+MODE_REVERSAL = "FULL_REVERSAL"
+baseMode = input.string(MODE_TREND, "Base Mode",
+     options = ["TREND_CONTINUATION", "NEW_TREND", "FULL_REVERSAL"], group = G_MODE,
+     tooltip = "3 Mode とも 15秒 Trigger は完全に同じ。違うのは Setup の作り方だけ。\n" +
+     "  15秒 Trigger (LONG) : 15s RED (複数本可) → 最初の FLAT で Signal\n" +
+     "  15秒 Trigger (SHORT): 15s BLUE (複数本可) → 最初の FLAT で Signal\n\n" +
+     "TREND_CONTINUATION : 5m が目的色を維持している中で、\n" +
+     "  1m が一度目的色から離れてから目的色へ復帰した瞬間を Setup とする。\n" +
+     "  5m と 1m が目的色なだけでは ARM しない (1m の押しと戻りの履歴が必須)。\n\n" +
+     "NEW_TREND : 確定5m背景が FLAT → 目的色 へ転換したときだけ Setup 開始。\n" +
+     "  その後「次に確定する1m足 1 本だけ」を確認し、目的色なら ARM。\n" +
+     "  目的色でなければ Setup 失敗 (無期限には待たない)。\n\n" +
+     "FULL_REVERSAL : 確定5m背景が 反対色 → 目的色 へ転換したときだけ Setup 開始。\n" +
+     "  以降は NEW_TREND と同じ (次の確定1m 1 本だけ確認)。")
+
+// ---- 01-2 MTF --------------------------------------------------------------
+var string G_MTF = "02 · MTF"
+satTf30 = input.timeframe("30S", "30秒足", group = G_MTF,
+     tooltip = "この時間足のコンテキスト内で STB / LINE1 / LINE2 / 背景 をすべて再計算する。\n15秒足のラインを流用しない。")
+satTf1m = input.timeframe("1",   "1分足",  group = G_MTF)
+satTf5m = input.timeframe("5",   "5分足",  group = G_MTF)
+
+// ---- 01-3 方向 -------------------------------------------------------------
+var string G_DIR = "03 · 方向"
+enableLong  = input.bool(true, "Enable Long",  group = G_DIR)
+enableShort = input.bool(true, "Enable Short", group = G_DIR)
+
+// ---- 01-4 SL / TP (固定のみ) -----------------------------------------------
+var string G_SLTP = "04 · SL / TP (固定のみ)"
+fixedSlDollar = input.float(5.0,  "Fixed SL ($)", minval = 0.01, step = 0.1, group = G_SLTP)
+fixedTpDollar = input.float(10.0, "Fixed TP ($)", minval = 0.01, step = 0.1, group = G_SLTP)
+
+// ---- 01-5 Risk -------------------------------------------------------------
+var string G_RISK = "05 · Risk"
+riskPct     = input.float(1.0, "1トレード損失率 (%)", step = 0.1, minval = 0.0, group = G_RISK)
+useCompound = input.bool(false, "複利 (残高ベース) ※OFF=元金単利", group = G_RISK)
+qtyStep     = input.float(0.01, "Qty 刻み (最小ロット単位)", minval = 0.00000001, step = 0.01, group = G_RISK)
+qtyMin      = input.float(0.01, "Qty 最小値 (これ未満はエントリーしない)", minval = 0.0, step = 0.01, group = G_RISK)
+
+// ---- 01-6 表示 -------------------------------------------------------------
+var string G_DISP = "06 · 表示"
+showBg    = input.bool(true, "SAT 15s 背景を表示", group = G_DISP)
+bgBuyCol  = input.color(#068C8C, "青 (Bull) 背景色", group = G_DISP)
+bgSellCol = input.color(#F54230, "赤 (Bear) 背景色", group = G_DISP)
+bgTransp  = input.int(66, "背景の透明度", minval = 0, maxval = 100, group = G_DISP)
+showDebug = input.bool(true, "Debug Table を表示", group = G_DISP)
+
+// ============================================================================
+// 02. SAT BAND Reconstruction 計算関数
+// ----------------------------------------------------------------------------
+//  ★ 計算式は既存最新版 (sat_mtf_strategy.pine) と完全一致 ★
+//    見た目を合わせるための補正・追加平滑化・Confirm などは一切入れていない。
+//
+//    共通   … basis  = ta.vwma(hlc3, 5)
+//             common = basis * 0.5
+//             atr50  = ta.atr(50)[1]
+//             src      = close[1] * 0.5
+//             trigLow  = low[1]   * 0.5
+//             trigHigh = high[1]  * 0.5
+//
+//    LINE1  … k = 5.0 の Anchor State 機械   line1 = common + anchor1
+//    LINE2  … k = 2.5 の Anchor State 機械   line2 = common + anchor2
+//             (構造は LINE1 と同一。違うのは倍率だけ。anchor / dir は完全に別変数)
+//
+//    STB    … 表示     : ta.highest(high, 10) / ta.lowest(low, 10)
+//             方向判定 : ta.highest(high, 20)[1] / ta.lowest(low, 20)[1]
+//             毎バー high breakout を先に判定し、下抜けは else if。
+//             同一バーで上下両方を突破した場合は Bull(+1) 優先。
+//
+//    背景   … 各ラインの dir は使わず、close と 3 本の位置関係だけで決める。
+//             青 (+1) : close > LINE1 かつ close > LINE2 かつ close > STB
+//             赤 (-1) : close < LINE1 かつ close < LINE2 かつ close < STB
+//             フラット (0) : それ以外
+//
+//  ■ 計算パラメータは固定値 (input 化していない)
+//    VWMA 5 / common 倍率 0.5 / ATR 50 / LINE1 k = 5.0 / LINE2 k = 2.5 /
+//    STB 表示 10 本 / STB 転換 20 本
+// ============================================================================
+f_satRebuild() =>
+    // ---- 共通 Basis (SMA でも EMA でもなく VWMA) --------------------------
+    float basis  = ta.vwma(hlc3, 5)
+    float common = basis * 0.5
+
+    // ---- ATR (ta.atr なので内部は RMA。現在足ではなく 1 本前の値) ---------
+    float atr50 = ta.atr(50)[1]
+
+    // ---- Anchor 共通 source と State 反転判定用の値 -----------------------
+    //  いずれも 1 本前の足から作る。現在足は使わない。
+    float src      = close[1] * 0.5
+    float trigLow  = low[1]   * 0.5
+    float trigHigh = high[1]  * 0.5
+
+    bool ready = not na(atr50) and not na(src) and not na(trigLow) and not na(trigHigh)
+
+    // ---- LINE1 (k = 5.0) --------------------------------------------------
+    //  ※ 同一バー内で更新済みの anchor / dir を条件判定へ再利用しないよう、
+    //    判定前に prevAnchor1 / prevDir1 へ退避してから State を更新する。
+    float k1 = 5.0
+    var float anchor1 = na
+    var int   dir1    = 1
+    float prevAnchor1 = anchor1
+    int   prevDir1    = dir1
+    if ready
+        if na(prevAnchor1)
+            // 初期化：Bull から開始する
+            anchor1 := src - k1 * atr50
+            dir1    := 1
+        else if prevDir1 == 1
+            if trigLow < prevAnchor1
+                // Bull → Bear
+                dir1    := -1
+                anchor1 := src + k1 * atr50
+            else
+                dir1    := 1
+                anchor1 := math.max(prevAnchor1, src - k1 * atr50)
+        else
+            if trigHigh > prevAnchor1
+                // Bear → Bull
+                dir1    := 1
+                anchor1 := src - k1 * atr50
+            else
+                dir1    := -1
+                anchor1 := math.min(prevAnchor1, src + k1 * atr50)
+    float line1 = common + anchor1
+
+    // ---- LINE2 (k = 2.5) --------------------------------------------------
+    //  LINE1 と構造は完全に同じ。違うのは倍率だけ。
+    //  状態変数は LINE1 とは独立しており、互いを参照しない。
+    float k2 = 2.5
+    var float anchor2 = na
+    var int   dir2    = 1
+    float prevAnchor2 = anchor2
+    int   prevDir2    = dir2
+    if ready
+        if na(prevAnchor2)
+            // 初期化：Bull から開始する
+            anchor2 := src - k2 * atr50
+            dir2    := 1
+        else if prevDir2 == 1
+            if trigLow < prevAnchor2
+                // Bull → Bear
+                dir2    := -1
+                anchor2 := src + k2 * atr50
+            else
+                dir2    := 1
+                anchor2 := math.max(prevAnchor2, src - k2 * atr50)
+        else
+            if trigHigh > prevAnchor2
+                // Bear → Bull
+                dir2    := 1
+                anchor2 := src - k2 * atr50
+            else
+                dir2    := -1
+                anchor2 := math.min(prevAnchor2, src + k2 * atr50)
+    float line2 = common + anchor2
+
+    // ---- STB (Donchian 構造) ----------------------------------------------
+    //  LINE1 / LINE2 の State とは完全に独立。互いを参照しない。
+    //  ATR / EMA / Supertrend は一切使わない。
+    //    表示用     : ta.highest(high, 10) / ta.lowest(low, 10)
+    //    方向判定用 : ta.highest(high, 20)[1] / ta.lowest(low, 20)[1]
+    //  方向転換は毎バー high breakout を先に判定する。同じ足で上下両方を
+    //  突破した場合も else if の構造により Bull(+1) が優先される。
+    //  どちらも突破していなければ直前の State を維持する。
+    float stbUpper = ta.highest(high, 10)
+    float stbLower = ta.lowest(low, 10)
+    float prev20High = ta.highest(high, 20)[1]
+    float prev20Low  = ta.lowest(low, 20)[1]
+    var int stbDir = 1
+    if not na(prev20High) and not na(prev20Low)
+        if high > prev20High
+            stbDir := 1
+        else if low < prev20Low
+            stbDir := -1
+    // UP は下側 (lower10)、DOWN は上側 (upper10) を表示価格にする
+    float stb = stbDir == 1 ? stbLower : stbUpper
+
+    // ---- Background State --------------------------------------------------
+    //  各ラインの dir ではなく、現在の close と LINE1 / LINE2 / STB の
+    //  位置関係だけで決める。判定ソースは close 固定。
+    bool allAbove = close > line1 and close > line2 and close > stb
+    bool allBelow = close < line1 and close < line2 and close < stb
+    int bgState = 0
+    if allAbove
+        bgState := 1
+    else if allBelow
+        bgState := -1
+
+    [bgState, line1, dir1, line2, dir2, stb, stbDir, basis, common, atr50, anchor1, anchor2]
+
+// ----------------------------------------------------------------------------
+// [SAT] 上位足用ラッパー : 「最後に確定した HTF バー」の背景 State だけを返す
+//
+//   ★ 内部の [1] と 外側の bgv[1] は目的が違う。どちらも必要 ★
+//     内部 [1] (atr50 = ta.atr(50)[1] / src = close[1] * 0.5 など)
+//         … Reconstruction の計算式そのもの。SAT の定義の一部。
+//     外側 bgv[1]
+//         … 「最後に確定した HTF バー」の背景を取り出すためのもの。
+//           request.security の中 (HTF の時系列) で適用するので、
+//           返るのは必ず確定済み HTF バーの値になる。
+//
+//   ★ 呼び出し側は barmerge.lookahead_on と組み合わせる (この [1] とセット) ★
+//     lookahead_on 単独は未来参照になるので絶対に使わない。
+// ----------------------------------------------------------------------------
+f_satBgHtf() =>
+    [bgRaw, _r1, _r2, _r3, _r4, _r5, _r6, _r7, _r8, _r9, _r10, _r11] = f_satRebuild()
+    // タプル分解した変数へ直接 history 参照をかけないよう、通常変数へコピーする
+    int bgv = bgRaw
+    bgv[1]
+
+// ---- 表示用ヘルパー ---------------------------------------------------------
+f_bgStr(int b) =>
+    b == BG_BLUE ? "青 (BLUE)" : b == BG_RED ? "赤 (RED)" : "フラット (FLAT)"
+f_bgCol(int b) =>
+    b == BG_BLUE ? bgBuyCol : b == BG_RED ? bgSellCol : color.rgb(149, 152, 161)
+f_stateStr(int s) =>
+    s == ST_WAIT ? "WAIT" : s == ST_WAIT_CONFIRM ? "WAIT_CONFIRM" :
+     s == ST_ARMED ? "ARMED" : "OPPOSITE"
+
+// ============================================================================
+// 03. SAT 背景 : 15s (チャート足) / 30s / 1m / 5m
+// ----------------------------------------------------------------------------
+//  すべて同一の f_satRebuild() を使う。時間足ごとに別の近似式は書かない。
+//  ★ 15秒で計算したラインは流用していない。request.security() の中で
+//    f_satRebuild() そのものを評価しているため、VWMA / ATR / Anchor State /
+//    STB State はすべてその時間足自身の OHLC から作られる。
+//  ★ 関数内の var (anchor1 / anchor2 / dir1 / dir2 / stbDir) は呼び出し箇所ごとに
+//    独立するので、15秒 / 30秒 / 1分 / 5分の State が混ざることはない。
+// ============================================================================
+[bg15, satL1Line, satL1Dir, satL2Line, satL2Dir, satStbLine, satStbDir,
+     satBasis, satCommon, satAtr50, satAnchor1, satAnchor2] = f_satRebuild()
+
+int bg30 = nz(request.security(syminfo.tickerid, satTf30, f_satBgHtf(),
+     lookahead = barmerge.lookahead_on), 0)
+
+int bg1m = nz(request.security(syminfo.tickerid, satTf1m, f_satBgHtf(),
+     lookahead = barmerge.lookahead_on), 0)
+
+int bg5m = nz(request.security(syminfo.tickerid, satTf5m, f_satBgHtf(),
+     lookahead = barmerge.lookahead_on), 0)
+
+// ============================================================================
+// 04. 5m 転換イベント / 1m イベント
+// ----------------------------------------------------------------------------
+//  ★ どちらも「その時間足が 1 本確定したタイミング」だけで判定する ★
+//    bg1m / bg5m は15秒チャート上で同じ値が何本も続くため、
+//    bg1m != bg1m[1] のような単純比較では判定できない。
+//    time(tf) が切り替わった最初の15秒足 (= newConfirmed1m / 5m) のときだけ、
+//    var に保存しておいた「ひとつ前の確定背景」と比較する。
+//    これで HTF 1 本につき必ず 1 回だけイベント判定が走る。
+// ============================================================================
+int  tf1mChange     = nz(ta.change(time(satTf1m)), 0)
+bool newConfirmed1m = bar_index > 0 and tf1mChange != 0
+
+int  tf5mChange     = nz(ta.change(time(satTf5m)), 0)
+bool newConfirmed5m = bar_index > 0 and tf5mChange != 0
+
+// ---- 5m 転換イベント --------------------------------------------------------
+//  ★ 最初の確定5m更新は「初期化だけ」に使い、転換イベントを発生させない ★
+//    prev の初期値 0 (FLAT) をそのまま前回値として扱うと、履歴開始後に
+//    最初に得られた確定5分背景が BLUE / RED だった場合に
+//    「FLAT → BLUE」を本物の転換と誤認してしまう。
+//    そのため bg5mPrevReady が立つまでは前回値を記録するだけにする。
+var int  bg5mPrevConfirmed = 0
+var bool bg5mPrevReady     = false
+bool ev5mFlatToBlue = false
+bool ev5mFlatToRed  = false
+bool ev5mRedToBlue  = false
+bool ev5mBlueToRed  = false
+if newConfirmed5m
+    if bg5mPrevReady
+        ev5mFlatToBlue := bg5m == BG_BLUE and bg5mPrevConfirmed == BG_FLAT
+        ev5mFlatToRed  := bg5m == BG_RED  and bg5mPrevConfirmed == BG_FLAT
+        ev5mRedToBlue  := bg5m == BG_BLUE and bg5mPrevConfirmed == BG_RED
+        ev5mBlueToRed  := bg5m == BG_RED  and bg5mPrevConfirmed == BG_BLUE
+    bg5mPrevConfirmed := bg5m
+    bg5mPrevReady     := true
+
+// ---- 1m Pullback → Recovery イベント (TREND_CONTINUATION 用) ----------------
+//  LONG  : 1m が一度 BLUE から離れた履歴を持ち、その後 BLUE へ復帰した瞬間
+//  SHORT : 1m が一度 RED  から離れた履歴を持ち、その後 RED  へ復帰した瞬間
+//
+//  ★ 「離れた履歴」が必須 ★
+//    ただ 1m が目的色であるだけでは Event にしない。押しのない BLUE 継続中に
+//    何度も ARM してしまうのを防ぐため、目的色を一度外れたことを var で覚える。
+//
+//  ★ LONG / SHORT は同じ関数を使う (呼び出し箇所ごとに var は独立する) ★
+//    targetColor を入れ替えるだけなので、完全対称であることがコード上保証される。
+//
+//    State  false : 目的色から離れた履歴なし (復帰しても Event にしない)
+//           true  : 目的色から離れた履歴あり (次に目的色へ戻ったら Event)
+//
+//  ★ 履歴開始直後の 1 本目は初期化だけに使い、Event を発生させない。
+f_1mPullbackRecovery(int bg, int targetColor, bool doUpdate) =>
+    var bool leftTarget = false
+    var bool ready      = false
+    bool ev = false
+    if doUpdate
+        if not ready
+            // 初期化 : 1 本目は現在色を記録するだけ
+            leftTarget := bg != targetColor
+            ready      := true
+        else if bg == targetColor
+            if leftTarget
+                ev := true
+            leftTarget := false
+        else
+            leftTarget := true
+    ev
+
+bool ev1mRecoverBlue = f_1mPullbackRecovery(bg1m, BG_BLUE, newConfirmed1m)
+bool ev1mRecoverRed  = f_1mPullbackRecovery(bg1m, BG_RED,  newConfirmed1m)
+
+// ============================================================================
+// 05. BASE STATE MACHINE (3 Mode 共通の枠組み)
+// ----------------------------------------------------------------------------
+//  ★ 15秒 Trigger は 3 Mode で完全に同一 ★
+//    LONG  : ST_ARMED → 15s RED (複数本可) → 最初の FLAT で Signal
+//    SHORT : ST_ARMED → 15s BLUE (複数本可) → 最初の FLAT で Signal
+//    取らないもの : FLAT → 目的色 / 反対色 → 目的色 の直戻り
+//
+//  ★ 1 バーの処理順 (この順序が時間軸分離の保証そのもの) ★
+//    1) 既存 Setup の無効化判定
+//    2) 既に ARM 済みの Setup の 15s Trigger 判定
+//    3) 既に WAIT_CONFIRM 中の 1m Confirm 判定
+//    4) 新しい Setup Event 判定
+//
+//    3) が 2) より後なので「1m Confirm が成立したバー」では Trigger を始めない。
+//    4) が 3) より後なので「新 Setup Event のバー」では Confirm も Trigger も
+//    始めない。どちらも必ず「次の確定15秒足」からになる。
+//
+//  ★ 1 Setup につき Signal は最大 1 回 ★
+//    Signal を出したらその場で ST_WAIT へ戻して Setup を消費する。
+//    実際に注文できたかどうかは見ない (TradePlan 失敗 / ポジション保有 /
+//    Qty 不足でも同じ Setup から再 Signal は出さない)。
+//
+//  ★ Mode ごとの違いは引数だけ ★
+//    setupEvent   : Setup を開始するイベント
+//    useConfirm   : 1m 確認ステップを使うか
+//                   TREND_CONTINUATION は Setup Event 自体が 1m の確認を
+//                   兼ねているので使わず、直接 ST_ARMED へ入る。
+//    confirmBar   : 1m 確認を評価してよいタイミング (確定1分更新)
+//    confirmOk    : その確定1分が目的色か
+//    confirmAlive : 確認待ち中に維持すべき条件
+//    setupAlive   : ARM 以降に維持すべき条件
+//
+//  ★ LONG / SHORT は同じ関数を呼ぶ ★
+//    targetColor / oppColor を入れ替えるだけなので、条件・State 遷移・
+//    キャンセル条件が完全対称であることがコード上保証される。
+//    関数内に var / ta.* を持たないので呼び出し位置による履歴のズレも起きない。
+//
+//  戻り値 : [次の State, Signal か]
+// ============================================================================
+f_baseStep(int stIn, bool setupEvent, bool setupAlive, bool useConfirm,
+     bool confirmBar, bool confirmOk, bool confirmAlive, int bgTrig, int oppColor) =>
+    int  st  = stIn
+    bool sig = false
+    //  1) 既存 Setup の無効化判定
+    if st == ST_WAIT_CONFIRM
+        if not confirmAlive
+            st := ST_WAIT
+    else if st != ST_WAIT
+        if not setupAlive
+            st := ST_WAIT
+    //  2) 15s Trigger 判定 (ARM 済みの Setup だけ)
+    if st == ST_ARMED
+        if bgTrig == oppColor
+            st := ST_OPPOSITE
+    else if st == ST_OPPOSITE
+        if bgTrig == BG_FLAT
+            //  反対色まで押してから中立へ回復した最初のタイミング
+            sig := true
+            st  := ST_WAIT
+        else if bgTrig != oppColor
+            //  FLAT を通らず目的色へ直接戻った → Signal なしで Setup 終了
+            st := ST_WAIT
+    //  3) 1m Confirm 判定 (WAIT_CONFIRM 中の Setup だけ)
+    //     確定1分を 1 本だけ見る。目的色なら ARM、そうでなければ Setup 失敗。
+    //     無期限には待たない。
+    if st == ST_WAIT_CONFIRM and confirmBar
+        st := confirmOk ? ST_ARMED : ST_WAIT
+    //  4) 新しい Setup Event 判定
+    if st == ST_WAIT and setupEvent
+        st := useConfirm ? ST_WAIT_CONFIRM : ST_ARMED
+    [st, sig]
+
+var int longState  = ST_WAIT
+var int shortState = ST_WAIT
+
+bool barConfirmed = barstate.isconfirmed
+
+int  lsNext     = longState
+int  ssNext     = shortState
+bool longSignal  = false
+bool shortSignal = false
+
+if barConfirmed
+    if baseMode == MODE_TREND
+        // ---- ① TREND_CONTINUATION --------------------------------------
+        //  Setup Event : 5m が目的色を維持している中で、1m が一度目的色から
+        //                離れてから目的色へ復帰した確定1分更新。
+        //                ★ 5m と 1m が目的色なだけでは ARM しない。
+        //                  1m の「押し → 戻り」の履歴が必須。
+        //  1m 確認     : Setup Event 自体が 1m の確認を兼ねているので使わない。
+        //                Event バーでは Trigger 判定をしないので (処理順 4 が
+        //                2 より後)、15s Trigger は次の確定15秒足から。
+        //  Setup 維持  : 5m と 1m の両方が目的色。どちらか崩れたら Setup 終了。
+        [tLSt, tLSig] = f_baseStep(lsNext,
+             bg5m == BG_BLUE and ev1mRecoverBlue, bg5m == BG_BLUE and bg1m == BG_BLUE,
+             false, false, false, true, bg15, BG_RED)
+        lsNext     := tLSt
+        longSignal := tLSig
+        [tSSt, tSSig] = f_baseStep(ssNext,
+             bg5m == BG_RED and ev1mRecoverRed, bg5m == BG_RED and bg1m == BG_RED,
+             false, false, false, true, bg15, BG_BLUE)
+        ssNext      := tSSt
+        shortSignal := tSSig
+
+    else if baseMode == MODE_NEW
+        // ---- ② NEW_TREND -----------------------------------------------
+        //  Setup Event : 確定5m背景が FLAT → 目的色 へ転換したときだけ。
+        //                反対色 → 目的色 は対象外。
+        //  確認待ち中  : 5m が目的色を維持していること (崩れたら Setup 終了)。
+        //                その後「次に確定する1m足 1 本だけ」を確認し、
+        //                目的色なら ARM、そうでなければ Setup 失敗。
+        //                ★ 5m 転換バーと 1m 確認を同一15秒バーで成立させない
+        //                  (処理順 3 が 4 より先)。
+        //                ★ 確認が成立したバーでは Trigger 判定を始めない
+        //                  (処理順 2 が 3 より先)。
+        //  Setup 維持  : 5m と 1m の両方が目的色。
+        [nLSt, nLSig] = f_baseStep(lsNext,
+             ev5mFlatToBlue, bg5m == BG_BLUE and bg1m == BG_BLUE,
+             true, newConfirmed1m, bg1m == BG_BLUE, bg5m == BG_BLUE, bg15, BG_RED)
+        lsNext     := nLSt
+        longSignal := nLSig
+        [nSSt, nSSig] = f_baseStep(ssNext,
+             ev5mFlatToRed, bg5m == BG_RED and bg1m == BG_RED,
+             true, newConfirmed1m, bg1m == BG_RED, bg5m == BG_RED, bg15, BG_BLUE)
+        ssNext      := nSSt
+        shortSignal := nSSig
+
+    else
+        // ---- ③ FULL_REVERSAL -------------------------------------------
+        //  Setup Event : 確定5m背景が 反対色 → 目的色 へ転換したときだけ。
+        //                FLAT → 目的色 は対象外。
+        //  以降は NEW_TREND と完全に同じ (次の確定1m 1 本だけ確認)。
+        [rLSt, rLSig] = f_baseStep(lsNext,
+             ev5mRedToBlue, bg5m == BG_BLUE and bg1m == BG_BLUE,
+             true, newConfirmed1m, bg1m == BG_BLUE, bg5m == BG_BLUE, bg15, BG_RED)
+        lsNext     := rLSt
+        longSignal := rLSig
+        [rSSt, rSSig] = f_baseStep(ssNext,
+             ev5mBlueToRed, bg5m == BG_RED and bg1m == BG_RED,
+             true, newConfirmed1m, bg1m == BG_RED, bg5m == BG_RED, bg15, BG_BLUE)
+        ssNext      := rSSt
+        shortSignal := rSSig
+
+//  ★ Setup は Signal を出した時点で消費済み (f_baseStep が ST_WAIT を返す) ★
+//    下の発注結果によって State を書き換える処理は入れていない。
+//    Base Signal の質だけを見るため、Order Engine とは完全に独立させている。
+longState  := lsNext
+shortState := ssNext
+
+// ============================================================================
+// 06. RISK / QTY
+// ----------------------------------------------------------------------------
+//  Qty は必ず SL 距離から計算する。Long / Short 共通。
+//    Risk Capital ÷ SL距離 ÷ syminfo.pointvalue → qtyStep 単位に切り下げ
+// ============================================================================
+f_baseCapital() =>
+    useCompound ? strategy.equity : strategy.initial_capital
+
+f_riskCapital() =>
+    f_baseCapital() * riskPct / 100.0
+
+f_qty(float riskPerUnit) =>
+    float raw = riskPerUnit > 0 ? f_riskCapital() / (riskPerUnit * syminfo.pointvalue) : 0.0
+    float q = qtyStep > 0 ? math.floor(raw / qtyStep) * qtyStep : raw
+    math.round(q, 8)
+
+float tradeQty = f_qty(fixedSlDollar)
+
+// ============================================================================
+// 07. ORDER
+// ----------------------------------------------------------------------------
+//  ・最大同時保有 1 (ポジションを持っている間は新規 Entry しない)
+//  ・反対方向の同時保有はしない
+//  ・SL / TP は固定。Entry 時の close から $ 距離で決める
+//  ・process_orders_on_close = true なので Signal バーの終値で約定する
+// ============================================================================
+bool flat      = strategy.position_size == 0
+bool qtyOk     = tradeQty >= qtyMin and tradeQty > 0
+bool canLong   = longSignal  and enableLong  and flat and qtyOk
+bool canShort  = shortSignal and enableShort and flat and qtyOk
+
+if canLong
+    strategy.entry("L", strategy.long, qty = tradeQty)
+    strategy.exit("L-X", from_entry = "L",
+         stop = close - fixedSlDollar, limit = close + fixedTpDollar)
+
+if canShort
+    strategy.entry("S", strategy.short, qty = tradeQty)
+    strategy.exit("S-X", from_entry = "S",
+         stop = close + fixedSlDollar, limit = close - fixedTpDollar)
+
+// ============================================================================
+// 08. DISPLAY / DEBUG
+// ============================================================================
+color bgFinal = not showBg ? na :
+     bg15 == BG_BLUE ? color.new(bgBuyCol, bgTransp) :
+     bg15 == BG_RED  ? color.new(bgSellCol, bgTransp) : na
+bgcolor(bgFinal, title = "SAT 15s 背景")
+
+// ---- Data Window (CSV 比較用の最低限) ---------------------------------------
+//  Base Mode : 0 = TREND_CONTINUATION / 1 = NEW_TREND / 2 = FULL_REVERSAL
+plot(baseMode == MODE_TREND ? 0.0 : baseMode == MODE_NEW ? 1.0 : 2.0,
+     title = "DW: Base Mode", display = display.data_window)
+plot(bg15 * 1.0, title = "DW: 15s BG", display = display.data_window)
+plot(bg30 * 1.0, title = "DW: 30s BG", display = display.data_window)
+plot(bg1m * 1.0, title = "DW: 1m BG",  display = display.data_window)
+plot(bg5m * 1.0, title = "DW: 5m BG",  display = display.data_window)
+plot(longState  * 1.0, title = "DW: LONG State",  display = display.data_window)
+plot(shortState * 1.0, title = "DW: SHORT State", display = display.data_window)
+plot(longSignal  ? 1.0 : 0.0, title = "DW: LONG Base Signal",  display = display.data_window)
+plot(shortSignal ? 1.0 : 0.0, title = "DW: SHORT Base Signal", display = display.data_window)
+//  5m 転換イベント (4 種類を個別に出す)
+plot(ev5mFlatToBlue ? 1.0 : 0.0, title = "DW: 5m FLAT→BLUE", display = display.data_window)
+plot(ev5mFlatToRed  ? 1.0 : 0.0, title = "DW: 5m FLAT→RED",  display = display.data_window)
+plot(ev5mRedToBlue  ? 1.0 : 0.0, title = "DW: 5m RED→BLUE",  display = display.data_window)
+plot(ev5mBlueToRed  ? 1.0 : 0.0, title = "DW: 5m BLUE→RED",  display = display.data_window)
+//  1m 確認イベント
+plot(newConfirmed1m  ? 1.0 : 0.0, title = "DW: New Confirmed 1m",   display = display.data_window)
+plot(ev1mRecoverBlue ? 1.0 : 0.0, title = "DW: 1m Recover BLUE",    display = display.data_window)
+plot(ev1mRecoverRed  ? 1.0 : 0.0, title = "DW: 1m Recover RED",     display = display.data_window)
+
+// ---- Debug Table (小さめ) ---------------------------------------------------
+var table dbgTable = table.new(position.top_right, 2, 8,
+     border_width = 1, frame_width = 1, frame_color = color.gray)
+
+if showDebug and barstate.islast
+    color bgH = color.new(color.black, 10)
+    color bgC = color.new(color.black, 30)
+    table.cell(dbgTable, 0, 0, "SAT Base v2", text_color = color.white, bgcolor = bgH, text_size = size.small)
+    table.cell(dbgTable, 1, 0, baseMode,      text_color = color.white, bgcolor = bgH, text_size = size.small)
+
+    table.cell(dbgTable, 0, 1, "15s BG", text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 1, f_bgStr(bg15), text_color = f_bgCol(bg15), bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 0, 2, "30s BG", text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 2, f_bgStr(bg30), text_color = f_bgCol(bg30), bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 0, 3, "1m BG",  text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 3, f_bgStr(bg1m), text_color = f_bgCol(bg1m), bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 0, 4, "5m BG",  text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 4, f_bgStr(bg5m), text_color = f_bgCol(bg5m), bgcolor = bgC, text_size = size.small)
+
+    table.cell(dbgTable, 0, 5, "State L / S", text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 5, f_stateStr(longState) + " / " + f_stateStr(shortState),
+         text_color = color.white, bgcolor = bgC, text_size = size.small)
+
+    table.cell(dbgTable, 0, 6, "Base Signal", text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 6, "L " + (longSignal ? "SIGNAL" : "-") + " / S " + (shortSignal ? "SIGNAL" : "-"),
+         text_color = color.white, bgcolor = bgC, text_size = size.small)
+
+    table.cell(dbgTable, 0, 7, "Event", text_color = color.white, bgcolor = bgC, text_size = size.small)
+    table.cell(dbgTable, 1, 7,
+         "5m " + (ev5mFlatToBlue ? "FLAT→BLUE" : ev5mFlatToRed ? "FLAT→RED" :
+              ev5mRedToBlue ? "RED→BLUE" : ev5mBlueToRed ? "BLUE→RED" : "-") +
+         "  /  1m " + (newConfirmed1m ? "確定" : "-") +
+         (ev1mRecoverBlue ? " 復帰BLUE" : ev1mRecoverRed ? " 復帰RED" : ""),
+         text_color = color.white, bgcolor = bgC, text_size = size.small)
