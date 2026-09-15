@@ -91,7 +91,9 @@ export type ZoneLevelCfg
     //  検索対象に含める state
     bool  includeActive   = true   // ACTIVE の Zone も支持・抵抗として扱う
     bool  includeBroken   = false  // BROKEN の Zone も支持・抵抗として扱う
-    bool  requireDirState = false  // true: 抵抗検索は RESIST、支持検索は SUPPORT のみ
+    bool  requireDirState = true   // true: 抵抗検索は RESIST、支持検索は SUPPORT のみ
+                                   //       (既定 true。ACTIVE Zone は最寄り検索の候補に
+                                   //        含めず、zoneAtPrice() 側で使う)
     //  登録簿
     int   maxTracked      = 400    // trackId 登録簿の上限 (超過時に古いものから破棄)
     int   staleBars       = 500    // この本数観測されなかった trackId を破棄対象にする
@@ -120,6 +122,7 @@ export type ZoneLevel
     int    addedSourceMask = 0
     //  実戦用
     int    touchCount      = 0
+    int    lastDir         = 0      // 直前に観測した SUPPORT / RESIST 方向 (Touch判定用)
     int    zoneLevel       = 0
     string zoneLevelName   = "-"
     int    ageBars         = 0
@@ -153,6 +156,7 @@ export type ZoneLevelEngine
     map<int, int>       tkAddedSrc
     map<int, int>       tkTouchCnt
     map<int, int>       tkArmed
+    map<int, int>       tkLastDir
     map<int, int>       tkLastSeen
     int                 lastAdvBar = -1
     bool                advance    = false
@@ -241,7 +245,7 @@ f_toResult(ZoneLevel z, float dist) =>
 //                        cfg.touchRearmDist := 10.0
 //                      既定値: birthScoreHigh = 10.0 / touchMidMin = 2 / touchWeakMin = 3 /
 //                      touchRearmDist = 10.0 / includeActive = true / includeBroken = false /
-//                      requireDirState = false / maxTracked = 400 / staleBars = 500 /
+//                      requireDirState = true / maxTracked = 400 / staleBars = 500 /
 //                      trackAddedSrc = true / srcMaskBits = 16
 // @returns             ZoneLevelCfg
 export newCfg() =>
@@ -261,6 +265,7 @@ export newEngine() =>
      tkAddedSrc   = map.new<int, int>(),
      tkTouchCnt   = map.new<int, int>(),
      tkArmed      = map.new<int, int>(),
+     tkLastDir    = map.new<int, int>(),
      tkLastSeen   = map.new<int, int>())
 
 // ============================================================================
@@ -294,6 +299,8 @@ export beginBar(ZoneLevelEngine e, bool advanceState) =>
 // @param flipped       ZoneEngine の flipped
 // @param sourceMask    Source のビットマスク。使わない場合は 0 を渡す。
 // @returns             ZoneLevel (trackId < 0 のときは zoneLevel = 0 の空レコード)
+//                      TouchCount は Zone Validation Logger と同じ仕様:
+//                      Zone と重なり / armed / direction != 0 の3条件を満たしたときだけ加算。
 export feedZone(ZoneLevelEngine e, ZoneLevelCfg c, int trackId, float top, float bottom,
      int state, float rawScore, int rawStrength, bool flipped, int sourceMask) =>
     ZoneLevel zl = ZoneLevel.new()
@@ -311,6 +318,7 @@ export feedZone(ZoneLevelEngine e, ZoneLevelCfg c, int trackId, float top, float
             map.put(e.tkAddedSrc,   trackId, 0)
             map.put(e.tkTouchCnt,   trackId, 0)
             map.put(e.tkArmed,      trackId, 1)
+            map.put(e.tkLastDir,    trackId, 0)
         map.put(e.tkLastSeen, trackId, bar_index)
 
         if e.advance
@@ -326,14 +334,33 @@ export feedZone(ZoneLevelEngine e, ZoneLevelCfg c, int trackId, float top, float
                          f_maskOr(map.get(e.tkAddedSrc, trackId), _new, c.srcMaskBits))
                     map.put(e.tkSeenSrc, trackId, f_maskOr(_seen, sourceMask, c.srcMaskBits))
 
-            //  ---- TouchCount ----
-            //    バーのレンジが Zone と重なったら Touch。
+            //  ---- 直前方向 State (Touch判定用) ----
+            //    SUPPORT / RESIST を観測したときだけ更新する。
+            //    ACTIVE / BROKEN では上書きせず、直前方向を保持する。
+            if state == ZS_SUPPORT
+                map.put(e.tkLastDir, trackId, DIR_SUPPORT)
+            else if state == ZS_RESIST
+                map.put(e.tkLastDir, trackId, DIR_RESIST)
+
+            //  ---- TouchCount (Zone Validation Logger と完全に同じ仕様) ----
+            //    Touch の direction:
+            //      SUPPORT → +1 / RESIST → -1 / ACTIVE → tkLastDir を引き継ぐ /
+            //      BROKEN  → 0
+            //    加算するのは「Zone と重なっている」「armed == 1」「direction != 0」
+            //    の3つを全て満たしたときだけ。
+            //      ACTIVE + 過去方向あり → Touch対象
+            //      ACTIVE + 過去方向なし → Touch対象外 (armed も消費しない。
+            //                              同じ接近中に方向確定したら拾えるようにする)
+            //      BROKEN                → Touch対象外
             //    同じ接近中に Zone 内で何本推移しても 1 回だけ (armed を消費する)。
             //    終値が Zone から touchRearmDist 以上離れて初めて再び armed になる。
+            int _ldir = map.get(e.tkLastDir, trackId)
+            int _tdir = state == ZS_SUPPORT ? DIR_SUPPORT : state == ZS_RESIST ? DIR_RESIST :
+             state == ZS_ACTIVE ? _ldir : 0
             bool _inZone = low <= top and high >= bottom
             float _dist = close < bottom ? bottom - close : close > top ? close - top : 0.0
             if _inZone
-                if map.get(e.tkArmed, trackId) == 1
+                if map.get(e.tkArmed, trackId) == 1 and _tdir != 0
                     map.put(e.tkArmed, trackId, 0)
                     map.put(e.tkTouchCnt, trackId, map.get(e.tkTouchCnt, trackId) + 1)
             else
@@ -359,6 +386,7 @@ export feedZone(ZoneLevelEngine e, ZoneLevelCfg c, int trackId, float top, float
         zl.birthSourceMask := map.get(e.tkBirthSrc, trackId)
         zl.addedSourceMask := map.get(e.tkAddedSrc, trackId)
         zl.touchCount      := _tc
+        zl.lastDir         := map.get(e.tkLastDir, trackId)
         zl.zoneLevel       := _lv
         zl.zoneLevelName   := f_levelName(_lv)
         zl.ageBars         := bar_index - map.get(e.tkBirthBar, trackId)
@@ -388,6 +416,7 @@ export endBar(ZoneLevelEngine e, ZoneLevelCfg c) =>
                     map.remove(e.tkAddedSrc,   _k)
                     map.remove(e.tkTouchCnt,   _k)
                     map.remove(e.tkArmed,      _k)
+                    map.remove(e.tkLastDir,    _k)
                     removed += 1
     removed
 
@@ -465,10 +494,16 @@ export levelFrom(float birthScore, int touchCount, ZoneLevelCfg c) =>
 //    Short: TP  = nearestSupport()    / SL = nearestResistance()
 //  ★ distance は「価格から Zone の手前側の端までの距離」。
 //    抵抗 = bottom - price / 支持 = price - top。Zone 内部にいる場合は 0。
+//  ★ requireDirState は既定 true。
+//    nearestResistance() は RESIST、nearestSupport() は SUPPORT の Zone だけを
+//    候補にする。ACTIVE Zone は最寄り検索の候補に含めない。
+//    ACTIVE Zone は zoneAtPrice() の「現在価格が Zone 内部か」判定で使う
+//    (includeActive は既定 true のまま)。
 //  ★ SL Buffer の付与や TP の最終決定はこのライブラリでは行わない。
 // ============================================================================
 
 // @function            price より上にある、minLevel 以上の最寄り抵抗 Zone を返す。
+//                      requireDirState = true (既定) なら RESIST の Zone のみが候補。
 // @param e             ZoneLevelEngine
 // @param c             ZoneLevelCfg
 // @param price         基準価格 (Entry Price など)
@@ -491,6 +526,7 @@ export nearestResistance(ZoneLevelEngine e, ZoneLevelCfg c, float price, int min
     r
 
 // @function            price より下にある、minLevel 以上の最寄り支持 Zone を返す。
+//                      requireDirState = true (既定) なら SUPPORT の Zone のみが候補。
 // @param e             ZoneLevelEngine
 // @param c             ZoneLevelCfg
 // @param price         基準価格 (Entry Price など)
