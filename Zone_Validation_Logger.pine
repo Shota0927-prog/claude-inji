@@ -774,6 +774,35 @@ f_valBase(float bs) =>
 f_valBaseName(int b) =>
     b == 3 ? "BASE3" : b == 2 ? "BASE2" : b == 1 ? "BASE1" : "BASE?"
 
+//  ★ ビット演算ヘルパー
+//    Pine Script v5 には &  |  ~ などのビット演算子が無いため、
+//    「bit値で割って 2 で割った余り」で 1bit ずつ判定する。
+//    sourceMask は bit0(1) 〜 bit9(512) の 10bit。
+int VAL_SRC_BITS = 10
+
+f_bitOn(int m, int b) =>
+    na(m) or b <= 0 ? false : int(m / b) % 2 == 1
+
+//  cur に有り prev に無いビットだけを取り出す (= 新しく追加された Source)
+f_maskAdded(int cur, int prev) =>
+    int r = 0
+    int b = 1
+    for _bi = 0 to VAL_SRC_BITS - 1
+        if f_bitOn(cur, b) and not f_bitOn(prev, b)
+            r += b
+        b := b * 2
+    r
+
+//  2つの mask の論理和 (累積用)
+f_maskOr(int m1, int m2) =>
+    int r = 0
+    int b = 1
+    for _bi = 0 to VAL_SRC_BITS - 1
+        if f_bitOn(m1, b) or f_bitOn(m2, b)
+            r += b
+        b := b * 2
+    r
+
 //  ★ sourceMask ビット割当 (Zone.sources / 生TF表記)
 //    bit0(1)   = MA #1        (str.tostring(ma1Len) + "MA")
 //    bit1(2)   = MA #2        (str.tostring(ma2Len) + "MA")
@@ -869,6 +898,16 @@ type VEvent
     int   bHtfMask      = 0
     float bTop          = na
     float bBot          = na
+    int   hasAdd        = 0
+    int   firstAddMs    = 0
+    int   firstAddMask  = 0
+    int   addedMask     = 0
+    int   barsSinceAdd  = 0
+    int   minSinceAdd   = 0
+    float addScoreBef   = na
+    float addScoreAft   = na
+    int   addStrBef     = 0
+    int   addStrAft     = 0
     float mfe           = 0.0
     float maxPen        = 0.0
     int   hit1          = 0
@@ -917,6 +956,25 @@ var map<int, int>   vzBirthSrcMask = map.new<int, int>()
 var map<int, int>   vzBirthHtfMask = map.new<int, int>()
 var map<int, float> vzBirthTop     = map.new<int, float>()
 var map<int, float> vzBirthBot     = map.new<int, float>()
+
+//  ★ Zone誕生「後」の Source 追加履歴 (観測のみ)
+//    ・vzPrevSrcMask / vzPrevScore / vzPrevStr は「前バーで最後に観測した値」。
+//      誕生バーでは誕生時の値を入れるので、誕生時 Source は追加扱いにならない。
+//    ・vzAddedSrcMask は誕生後に一度でも新規追加された bit の累積。
+//      Source が後から消えても履歴は消さない。
+//    ・vzFirstAdd* / vzAddScore* / vzAddStr* は最初の追加を検出した瞬間だけ
+//      書き込み、以降は上書きしない (vzFirstAddBar < 0 が「未追加」の印)。
+var map<int, int>   vzPrevSrcMask  = map.new<int, int>()
+var map<int, float> vzPrevScore    = map.new<int, float>()
+var map<int, int>   vzPrevStr      = map.new<int, int>()
+var map<int, int>   vzAddedSrcMask = map.new<int, int>()
+var map<int, int>   vzFirstAddBar  = map.new<int, int>()
+var map<int, int>   vzFirstAddMs   = map.new<int, int>()
+var map<int, int>   vzFirstAddMask = map.new<int, int>()
+var map<int, float> vzAddScoreBef  = map.new<int, float>()
+var map<int, float> vzAddScoreAft  = map.new<int, float>()
+var map<int, int>   vzAddStrBef    = map.new<int, int>()
+var map<int, int>   vzAddStrAft    = map.new<int, int>()
 
 //  ★ 毎バー作り直す「trackId → 現在のZone配列index」。var + clear で再利用する。
 var map<int, int> vLiveIdx = map.new<int, int>()
@@ -979,6 +1037,19 @@ float ev_addedHtf          = na
 //  ★ 旧仕様との比較用に列だけ残している。Touch 回数で Strength を変更しないため、
 //    常に EV_originalStrength (Raw Strength) と同値になる。
 float ev_effectiveStrength = na
+//  ★ Zone誕生「後」の Source 追加ログ (Birth Snapshot 系とは別列)
+//    hasAdd = 0 の行では時刻 / mask / bars / score / strength は na になる。
+float ev_hasAddedSource          = na
+float ev_sourceAddPhase          = na
+float ev_firstAddedSourceTime    = na
+float ev_firstAddedSourceMask    = na
+float ev_addedSourceMask         = na
+float ev_barsSinceFirstSourceAdd = na
+float ev_minutesSinceFirstSourceAdd = na
+float ev_scoreBeforeFirstAdd     = na
+float ev_scoreAfterFirstAdd      = na
+float ev_strengthBeforeFirstAdd  = na
+float ev_strengthAfterFirstAdd   = na
 
 // ---- 10.6 本体 (確定バーのみ) ----------------------------------------------
 //  ★ barstate.isconfirmed ゲート:
@@ -1027,7 +1098,49 @@ if barstate.isconfirmed
                     map.put(vzBirthHtfMask, _id, f_valHtfMask(_z.htfSources))
                     map.put(vzBirthTop,     _id, _z.top)
                     map.put(vzBirthBot,     _id, _z.bottom)
+                    //  ★ Source追加追跡の初期値。
+                    //    prev に誕生時の値を入れることで、誕生時 Source は
+                    //    「後から追加」に含まれない。
+                    map.put(vzPrevSrcMask,  _id, f_valSrcMask(_z.sources))
+                    map.put(vzPrevScore,    _id, _z.score)
+                    map.put(vzPrevStr,      _id, _z.strength)
+                    map.put(vzAddedSrcMask, _id, 0)
+                    map.put(vzFirstAddBar,  _id, -1)
+                    map.put(vzFirstAddMs,   _id, 0)
+                    map.put(vzFirstAddMask, _id, 0)
+                    map.put(vzAddScoreBef,  _id, na)
+                    map.put(vzAddScoreAft,  _id, na)
+                    map.put(vzAddStrBef,    _id, 0)
+                    map.put(vzAddStrAft,    _id, 0)
                 map.put(vzLastSeen, _id, bar_index)
+
+                //  ★ Source追加の検出 (観測のみ / ZoneEngine へは書き戻さない)
+                //    「前バーで観測した mask に無く、今バーの mask に有る bit」だけを
+                //    追加とみなす。
+                //     ・Source が消えただけでは追加扱いにならない
+                //     ・同じ Source が継続しているだけでは再追加されない
+                //     ・同一バーで複数追加された場合は全 bit が入る
+                //     ・Sources 文字列の順序変化は mask に影響しない
+                //    ※ 一度消えた Source が再び現れた場合は「新規追加」として
+                //      計上される (前バー比較という定義そのままの挙動)。
+                int _curSrc  = f_valSrcMask(_z.sources)
+                int _newBits = f_maskAdded(_curSrc, map.get(vzPrevSrcMask, _id))
+                if _newBits != 0
+                    map.put(vzAddedSrcMask, _id, f_maskOr(map.get(vzAddedSrcMask, _id), _newBits))
+                    //  最初の追加だけ固定保存する (以降は上書きしない)
+                    if map.get(vzFirstAddBar, _id) < 0
+                        map.put(vzFirstAddBar,  _id, bar_index)
+                        map.put(vzFirstAddMs,   _id, time)
+                        map.put(vzFirstAddMask, _id, _newBits)
+                        //  Before = 前バーで最後に観測した値 / After = 検出バーの値
+                        map.put(vzAddScoreBef,  _id, map.get(vzPrevScore, _id))
+                        map.put(vzAddScoreAft,  _id, _z.score)
+                        map.put(vzAddStrBef,    _id, map.get(vzPrevStr, _id))
+                        map.put(vzAddStrAft,    _id, _z.strength)
+                //  次バー比較用に「前バー観測値」を更新する
+                map.put(vzPrevSrcMask, _id, _curSrc)
+                map.put(vzPrevScore,   _id, _z.score)
+                map.put(vzPrevStr,     _id, _z.strength)
 
                 //  ★ 直前方向Stateの更新 (観測のみ / ZoneEngine へは書き戻さない)
                 //    ST_ACTIVE / ST_BROKEN では上書きせず、直前方向を保持する。
@@ -1109,6 +1222,19 @@ if barstate.isconfirmed
                                 _ne.bHtfMask    := map.get(vzBirthHtfMask, _id)
                                 _ne.bTop        := map.get(vzBirthTop, _id)
                                 _ne.bBot        := map.get(vzBirthBot, _id)
+                                //  ★ Source追加履歴の転記 (ここでも再計算しない)
+                                //    Touch 時点で最初の追加が済んでいれば hasAdd = 1。
+                                int _fab = map.get(vzFirstAddBar, _id)
+                                _ne.hasAdd       := _fab >= 0 ? 1 : 0
+                                _ne.firstAddMs   := map.get(vzFirstAddMs, _id)
+                                _ne.firstAddMask := map.get(vzFirstAddMask, _id)
+                                _ne.addedMask    := map.get(vzAddedSrcMask, _id)
+                                _ne.barsSinceAdd := _fab >= 0 ? bar_index - _fab : 0
+                                _ne.minSinceAdd  := _fab >= 0 ? int((time - map.get(vzFirstAddMs, _id)) / 60000) : 0
+                                _ne.addScoreBef  := map.get(vzAddScoreBef, _id)
+                                _ne.addScoreAft  := map.get(vzAddScoreAft, _id)
+                                _ne.addStrBef    := map.get(vzAddStrBef, _id)
+                                _ne.addStrAft    := map.get(vzAddStrAft, _id)
                                 array.push(vActive, _ne)
                             else
                                 vDropped += 1
@@ -1152,6 +1278,17 @@ if barstate.isconfirmed
                     map.remove(vzBirthHtfMask, _k)
                     map.remove(vzBirthTop, _k)
                     map.remove(vzBirthBot, _k)
+                    map.remove(vzPrevSrcMask, _k)
+                    map.remove(vzPrevScore, _k)
+                    map.remove(vzPrevStr, _k)
+                    map.remove(vzAddedSrcMask, _k)
+                    map.remove(vzFirstAddBar, _k)
+                    map.remove(vzFirstAddMs, _k)
+                    map.remove(vzFirstAddMask, _k)
+                    map.remove(vzAddScoreBef, _k)
+                    map.remove(vzAddScoreAft, _k)
+                    map.remove(vzAddStrBef, _k)
+                    map.remove(vzAddStrAft, _k)
 
     //  ★ ここから下は CSV検証専用 (useValidation で ON/OFF)。
     //    Touch判定 / TouchCount / 登録簿は上で完了済みなので影響を受けない。
@@ -1277,6 +1414,19 @@ if barstate.isconfirmed
             //  Birth時点でHTFが無く、Touch時点でHTFが付いていれば 1
             ev_addedHtf                := _o.bHasHtf == 0 and _o.hasHtf == 1 ? 1 : 0
             ev_effectiveStrength       := _o.eStr
+            //  ★ Source追加ログ。EV_sourceAddPhase は Touch 時点の判定で
+            //    0 = 最初の Source 追加より前 (または一度も追加なし) / 1 = 追加後。
+            ev_hasAddedSource          := _o.hasAdd
+            ev_sourceAddPhase          := _o.hasAdd
+            ev_addedSourceMask         := _o.addedMask
+            ev_firstAddedSourceTime    := _o.hasAdd == 1 ? math.floor(_o.firstAddMs / 1000.0) : na
+            ev_firstAddedSourceMask    := _o.hasAdd == 1 ? _o.firstAddMask : na
+            ev_barsSinceFirstSourceAdd := _o.hasAdd == 1 ? _o.barsSinceAdd : na
+            ev_minutesSinceFirstSourceAdd := _o.hasAdd == 1 ? _o.minSinceAdd : na
+            ev_scoreBeforeFirstAdd     := _o.addScoreBef
+            ev_scoreAfterFirstAdd      := _o.addScoreAft
+            ev_strengthBeforeFirstAdd  := _o.hasAdd == 1 ? _o.addStrBef : na
+            ev_strengthAfterFirstAdd   := _o.hasAdd == 1 ? _o.addStrAft : na
 
 // ---- 10.7 CSV出力列 (display.data_window) ----------------------------------
 //  ★ チャートには一切描画しない (display.data_window のみ)。
@@ -1327,6 +1477,17 @@ plot(ev_baseStrength,            "EV_baseStrength",            display = display
 plot(ev_durability,              "EV_durability",              display = display.data_window)
 plot(ev_addedHtf,                "EV_addedHtf",                display = display.data_window)
 plot(ev_effectiveStrength,       "EV_effectiveStrength",       display = display.data_window)
+plot(ev_hasAddedSource,          "EV_hasAddedSource",          display = display.data_window)
+plot(ev_sourceAddPhase,          "EV_sourceAddPhase",          display = display.data_window)
+plot(ev_firstAddedSourceTime,    "EV_firstAddedSourceTime",    display = display.data_window)
+plot(ev_firstAddedSourceMask,    "EV_firstAddedSourceMask",    display = display.data_window)
+plot(ev_addedSourceMask,         "EV_addedSourceMask",         display = display.data_window)
+plot(ev_barsSinceFirstSourceAdd, "EV_barsSinceFirstSourceAdd", display = display.data_window)
+plot(ev_minutesSinceFirstSourceAdd, "EV_minutesSinceFirstSourceAdd", display = display.data_window)
+plot(ev_scoreBeforeFirstAdd,     "EV_scoreBeforeFirstAdd",     display = display.data_window)
+plot(ev_scoreAfterFirstAdd,      "EV_scoreAfterFirstAdd",      display = display.data_window)
+plot(ev_strengthBeforeFirstAdd,  "EV_strengthBeforeFirstAdd",  display = display.data_window)
+plot(ev_strengthAfterFirstAdd,   "EV_strengthAfterFirstAdd",   display = display.data_window)
 //  ★ 診断用 (検証処理そのものの健全性確認)
 float ev_queueLen     = useValidation ? array.size(vQueue)  : na
 float ev_activeEvents = useValidation ? array.size(vActive) : na
