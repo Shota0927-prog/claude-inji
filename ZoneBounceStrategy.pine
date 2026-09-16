@@ -1,0 +1,1326 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  Zone Level Display  ―  実戦用 Zone Level 表示専用 Indicator
+//  ★ ZoneEngine v11 + ZoneLevelEngine v2 対応版 ★
+// ----------------------------------------------------------------------------
+//  ■ 今回の変更点 (ロジックは変更していない)
+//    1) import を ZoneEngine/11 + ZoneLevelEngine/2 へ更新
+//       v11 : trackId 継続判定の分母を「旧 Zone の Source 数」へ変更したもの。
+//             Source が後から追加されただけでは新 ID にならない。
+//             Zone 生成 / Cluster / Break / Flip / Lifetime / Score /
+//             Raw Strength / Source Weight / trackStaleBars は v10 から無変更。
+//    2) zl.beginBar() / zl.endBar() は v2 に存在しないため
+//       zl.beginBaseBar() / zl.endBaseBar() へ変更
+//    3) Base TF = チャート時間足 (5分足) なので、Base TF の足情報として
+//       bar_index / time / high / low / close をそのまま渡す
+//    4) barstate.isconfirmed のときだけ beginBaseBar → feedZone → endBaseBar を
+//       1 回だけ実行する。未確定足では TouchCount / 登録簿を進めない。
+//
+//    ★ ZoneLevelEngine v2 の Level ロジック / Touch 仕様は変更していない ★
+//      Level 判定は birthScore + touchCount のみ。
+//      Touch は SUPPORT / RESIST / ACTIVE(lastDir 継承) が対象、
+//      ACTIVE(lastDir なし) と BROKEN は対象外。armed 方式 / Re-arm 10 ドル。
+//
+// ----------------------------------------------------------------------------
+//  ★ 役割分担
+//      ZoneEngine       … Zone生成 / 位置 / State / trackId / Score / Strength
+//      ZoneLevelEngine  … BirthScore + TouchCount から実戦用 Zone Level を算出
+//      ZoneLevelDisplay … その結果を描画するだけ
+//    このファイルでは Zone生成 / Score計算 / Level計算 / TouchCount計算 を
+//    一切再実装しない。
+//
+//  ★ 表示する Level は ZoneLevelEngine の zoneLevel / zoneLevelName
+//    ZoneEngine の Raw Strength (Weak / Medium / Strong / Very Strong) は
+//    Box の濃さ / 線の太さ / 表示可否 / Level名 のいずれにも使わない。
+//    Raw Score / Raw Strength は詳細ラベルの参考情報としてだけ表示する。
+//    → 「Level: Strong / Raw: Very Strong」は正常な状態。
+//
+//  ★ Display 側で Level を再計算しない
+//    birthScore >= 10 ? ... / touchCount >= 3 ? ... のような判定は
+//    このファイルには存在しない。Level ルールを変えるときは
+//    ZoneLevelEngine だけを変更すれば、全 Strategy と本 Display に反映される。
+//    → チャートで見えている Level と、今後 TP / SL / Entry で使う Level が
+//      必ず一致する。
+//
+//  ★ Zone Engine 部分 (Section 01 / 02 / 03 / zn.update) は
+//    Zone Validation Logger から1行も書き換えずに移植している。
+//    Zone生成条件は変更していない。ZoneEngine Library も変更していない。
+//    Reaction Score Bonus は検証仕様と同じく既定 OFF
+//    (ZoneCfg へ reactionBonus1/2/3 = 0.0 を渡す)。Reaction 検出自体は残す。
+//
+//  ★ このファイルが持たないもの
+//    Entry / Signal / Strategy / 発注 / TP / SL / RR / NoTrade条件 /
+//    Obstacle判定 / アラート は一切無い。完全に表示専用。
+//
+//  ★ Gold 専用表示
+//    XAUUSD / GOLD 系チャートでのみ描画する。Gold判定は「描画ゲート」だけに使い、
+//    ZoneEngine / ZoneLevelEngine の計算条件には一切入れない。
+//
+//  前提: チャート時間足 = 5分足 / 銘柄 = XAUUSD 系。
+//        ★ Base TF もこのチャート時間足 (5分) と同一 ★
+// ============================================================================
+//@version=5
+strategy(
+     title             = "Zone Bounce Strategy (XAUUSD 5m)",
+     shorttitle        = "ZONE BOUNCE",
+     overlay           = true,
+     dynamic_requests  = true,
+     //  ★ 同時保有は最大 1 ポジション ★
+     pyramiding        = 0,
+     initial_capital   = 100000,
+     //  ★ Qty は常に 1 固定 ★
+     //    CSV 側の集計が「1トレードあたりの値幅」ベースなので、
+     //    Profit Factor が CSV とそのまま比較できるようにする。
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     //  ★ 手数料 / スリッページは 0 のまま (CSV 集計と揃えるため) ★
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.0,
+     slippage          = 0,
+     //  ★ Bar Magnifier を明示的に OFF ★
+     //    CSV は 5分足の high / low だけで判定しているので、
+     //    約定判定も 5分足レベルに固定して再現性を確保する。
+     use_bar_magnifier = false,
+     max_boxes_count   = 500,
+     max_labels_count  = 500,
+     max_lines_count   = 200
+ )
+
+// ★★★ Library import ★★★
+//  ZoneEngine      … Zone生成 / 位置 / State / trackId / Score / Strength
+//  ZoneLevelEngine … BirthScore + TouchCount から実戦用 Zone Level を算出
+//  このファイルは「描画」だけを担当し、Zone生成 / Score / Level / TouchCount の
+//  計算は一切再実装しない。SignalEngine は使わない。
+//
+//  ※ publish 後のバージョン番号が下記と違う場合は、この 2 行を実際の番号へ
+//    書き換えること。
+import sekine3310/ZoneEngine/11 as zn
+import sekine3310/ZoneLevelEngine/2 as zl
+
+// Library内の定数と同じ値 (定数exportはPineのバージョン依存機能のため再宣言する)
+int ST_ACTIVE  = 0
+int ST_SUPPORT = 1
+int ST_RESIST  = 2
+int ST_BROKEN  = 3
+int SR_WEAK    = 1
+int SR_MEDIUM  = 2
+int SR_STRONG  = 3
+int SR_VSTRONG = 4
+
+// ---- Gold Only (表示ゲート) ------------------------------------------------
+//  ★ このIndicatorは XAUUSD / GOLD 系チャート専用。
+//    Gold以外の銘柄では Zone Box / Strength Label / 詳細 Zone Label /
+//    MA Source Lines を一切描画しない。
+//  ★ 完全一致判定にしない理由:
+//    ブローカーによって XAUUSD / XAUUSD.P / GOLD / GOLDUSD など表記が異なるため、
+//    syminfo.ticker に "XAU" または "GOLD" を含んでいればGoldとして扱う。
+//  ★ Gold判定は「表示ゲート」にだけ使う。
+//    request.security() / ZoneFeed / zn.update() / ZoneCfg / Zone生成 / Score /
+//    Strength / Cluster / Reaction / Break / Flip / Lifetime には一切入れない。
+//    → Gold上での Zone位置 / Zone数 / Score / Strength / State は
+//      この修正の前後で完全に一致する。
+bool isGold = str.contains(str.upper(syminfo.ticker), "XAU") or
+     str.contains(str.upper(syminfo.ticker), "GOLD")
+
+// 表示用の小さなヘルパー (Zone Label のスコア表示に使う)
+f_num(float v, string fmt) =>
+    na(v) ? "-" : str.tostring(v, fmt)
+
+// ============================================================================
+// 01. ZONE ENGINE INPUTS
+// ----------------------------------------------------------------------------
+//  ★ 元 Strategy の「01-2. ZONE ENGINE INPUTS」をそのまま移植。
+//    変数名 / 初期値 / options / minval / maxval / step / tooltip は一切変更していない。
+// ============================================================================
+// ---- 2.1 Zone Geometry -----------------------------------------------------
+var string G_ZONE = "02 · Zone Geometry"
+zoneHalfWidth = input.float(5.0, "Zone Half Width ($)", minval = 0.1, step = 0.5, group = G_ZONE,
+     tooltip = "Zone = 中心価格 ± この値。Strengthによって幅は変えない。")
+
+// ---- 2.2 MA Source (1分足コンテキストで直接計算) ---------------------------
+var string G_MA = "02 · MA Source"
+maTf = input.timeframe("1", "MA Timeframe", group = G_MA,
+     tooltip = "既定 1分足。1分足コンテキスト内でMAを計算し、その結果を5分足へ取得する。")
+maType = input.string("EMA", "MA Type", options = ["SMA", "EMA"], group = G_MA)
+useMaSource = input.bool(true, "Enable MA Source", group = G_MA)
+// ★ ma1Len / ma2Len / 各TF は request.security・zn.maPack へ渡すため
+//   「input変数のまま (simple修飾)」保持する。UDTのフィールド読み出しは series 扱いになり、
+//   request.security の timeframe や ta.ema の length には使えないため。
+ma1Len = input.int(2000, "MA #1 Length", minval = 1, maxval = 4999, group = G_MA)
+ma2Len = input.int(3000, "MA #2 Length", minval = 1, maxval = 4999, group = G_MA)
+slopeLookback = input.int(60, "Slope Lookback (MA TF bars)", minval = 1, group = G_MA)
+scoreMa1 = input.float(2.0, "Base Score · MA #1", step = 0.5, group = G_MA)
+scoreMa2 = input.float(2.0, "Base Score · MA #2", step = 0.5, group = G_MA)
+
+// ---- 2.3 MA Slope ----------------------------------------------------------
+var string G_SLOPE = "02 · MA Slope"
+slopeThrMod = input.float(1.0, "Slope Threshold · Moderate ($/lookback)", step = 0.1, group = G_SLOPE)
+slopeThrStrong = input.float(3.0, "Slope Threshold · Strong ($/lookback)",   step = 0.1, group = G_SLOPE)
+slopeBonusFlat = input.float(0.0, "Slope Bonus · Flat",     step = 0.5, group = G_SLOPE)
+slopeBonusMod = input.float(1.0, "Slope Bonus · Moderate", step = 0.5, group = G_SLOPE)
+slopeBonusStr = input.float(2.0, "Slope Bonus · Strong",   step = 0.5, group = G_SLOPE)
+slopeBonusMode = input.string("Sum (per MA)", "Slope Bonus Aggregation in Cluster",
+     options = ["Sum (per MA)", "Max"], group = G_SLOPE,
+     tooltip = "同一Cluster内に2000MAと3000MAが両方入った場合、Slope Bonusを合算するか最大値のみ採用するか。")
+maClusterDist = input.float(20.0, "MA Cluster Distance ($)", step = 1.0, group = G_SLOPE)
+maClusterBonus = input.float(1.0, "MA Cluster Bonus",              step = 0.5, group = G_SLOPE)
+maClusterDirBonus = input.float(1.0, "MA Cluster Bonus · Same Slope", step = 0.5, group = G_SLOPE)
+
+// ---- 2.4 Horizontal Source -------------------------------------------------
+var string G_HZ = "02 · Horizontal Source (Swing)"
+useHzSource = input.bool(true, "Enable Horizontal Source", group = G_HZ)
+hzTf1 = input.timeframe("5",  "Horizontal TF #1", group = G_HZ)
+hzTf2 = input.timeframe("15", "Horizontal TF #2", group = G_HZ)
+hzTf3 = input.timeframe("60", "Horizontal TF #3", group = G_HZ)
+pivLen1 = input.int(10, "Swing Pivot Length · TF #1", minval = 1, group = G_HZ)
+pivLen2 = input.int(8,  "Swing Pivot Length · TF #2", minval = 1, group = G_HZ)
+pivLen3 = input.int(6,  "Swing Pivot Length · TF #3", minval = 1, group = G_HZ)
+scoreHz1 = input.float(1.0, "Base Score · TF #1 Swing", step = 0.5, group = G_HZ)
+scoreHz2 = input.float(2.0, "Base Score · TF #2 Swing", step = 0.5, group = G_HZ)
+scoreHz3 = input.float(3.0, "Base Score · TF #3 Swing", step = 0.5, group = G_HZ)
+
+// ---- 2.5 Horizontal Reaction ----------------------------------------------
+var string G_REACT = "02 · Horizontal Reaction"
+reactionDist = input.float(20.0, "Reaction Distance ($)", step = 0.5, group = G_REACT,
+     tooltip = "Zoneに接触したあと、来た方向へこの距離以上戻ればReaction 1回。")
+reactionBonus1 = input.float(1.0, "Reaction Bonus · 1 time",   step = 0.5, group = G_REACT)
+reactionBonus2 = input.float(2.0, "Reaction Bonus · 2 times",  step = 0.5, group = G_REACT)
+reactionBonus3 = input.float(3.0, "Reaction Bonus · 3+ times", step = 0.5, group = G_REACT)
+//  ★ Reaction回数によるScore加点の ON/OFF (既定 OFF = 新仕様)。
+//    OFF のとき ZoneCfg へ 0.0 を渡すため、Reaction が何回起きても Score は動かない。
+//    Reaction検出 / reactionCnt / Re-arm / 表示 / デバッグはそのまま残る
+//    (ZoneEngine 側で reactionBonus が使われているのは Score の合計式だけ)。
+//    上の reactionBonus1/2/3 は設定崩れを避けるため input として残す。
+useReactionScoreBonus = input.bool(false, "Use Reaction Score Bonus (旧仕様)", group = G_REACT,
+     tooltip = "ON にすると従来どおり Reaction 回数に応じて Score を加点する。\n" +
+     "既定 OFF: 「過去に何度も反発した = さらに強い」という評価を行わない。")
+reactionRearmDist = input.float(10.0, "Reaction Re-arm Distance ($)", step = 0.5, group = G_REACT)
+reactionAllSrc = input.bool(false, "Track Reaction on Accum / DayHL too", group = G_REACT)
+
+// ---- 2.6 Day High / Low ----------------------------------------------------
+var string G_DHL = "02 · Day High / Low"
+useDayHL = input.bool(true, "Enable Day High / Low Source", group = G_DHL)
+dayTz        = input.string("Asia/Tokyo", "Day Session Timezone", group = G_DHL)
+dayResetHour = input.int(5, "Day Reset Hour (取引日の開始時刻)", minval = 0, maxval = 23, group = G_DHL,
+     tooltip = "既定 5 = 日本時間 05:00 ～ 翌 04:59 を1取引日として扱う。0 にすると暦日基準。")
+scoreDayHL = input.float(3.0, "Base Score · Day High / Low", step = 0.5, group = G_DHL)
+carryPrevDayHL = input.bool(false, "Carry Previous Day H/L as Horizontal Zone", group = G_DHL)
+scorePrevDayHL = input.float(2.0, "Base Score · Carried Prev Day H/L", step = 0.5, group = G_DHL)
+lifePrevDayHL = input.float(5.0, "Lifetime · Carried Prev Day H/L (days)", step = 1.0, group = G_DHL)
+
+// ---- 2.7 Accumulation ------------------------------------------------------
+var string G_ACC = "02 · Accumulation"
+useAccSource = input.bool(true, "Enable Accumulation Source", group = G_ACC)
+accumModule = input.string("Accum Box (ported)", "Accum Detection Module",
+     options = ["Accum Box (ported)", "Provisional ATR (暫定)"], group = G_ACC)
+accTf1 = input.timeframe("60",  "Accum TF #1", group = G_ACC)
+accTf2 = input.timeframe("240", "Accum TF #2", group = G_ACC)
+accTf3 = input.timeframe("D",   "Accum TF #3", group = G_ACC)
+scoreAcc1 = input.float(3.0, "Base Score · TF #1 Accum", step = 0.5, group = G_ACC)
+scoreAcc2 = input.float(4.0, "Base Score · TF #2 Accum", step = 0.5, group = G_ACC)
+scoreAcc3 = input.float(5.0, "Base Score · TF #3 Accum", step = 0.5, group = G_ACC)
+accKeep1 = input.int(3, "Keep Count · TF #1 Accum (instances)", minval = 1, group = G_ACC)
+accKeep2 = input.int(2, "Keep Count · TF #2 Accum (instances)", minval = 1, group = G_ACC)
+accKeep3 = input.int(1, "Keep Count · TF #3 Accum (instances)", minval = 1, group = G_ACC)
+
+var string G_ACCP = "02a · Accum Box (ported) Parameters"
+accumRangeLen        = input.int(10,   "Accum判定レンジ本数",  minval = 6,  group = G_ACCP)
+accumBaseLen         = input.int(20,   "基準平均本数",         minval = 10, group = G_ACCP)
+accumAtrLen          = input.int(14,   "ATR本数",             minval = 1,  group = G_ACCP)
+accumMinUpperCloses  = input.int(4,    "上半分の最低終値本数",  minval = 1,  group = G_ACCP)
+accumMinLowerCloses  = input.int(4,    "下半分の最低終値本数",  minval = 1,  group = G_ACCP)
+accumMaxSameColorRun = input.int(4,    "同色連続の上限",       minval = 1,  group = G_ACCP)
+accumAtrMult         = input.float(2.5,  "Accum レンジ幅 / ATR 上限",    minval = 0.5,  step = 0.1,  group = G_ACCP)
+accumBarRatioMax     = input.float(0.70, "Accum 平均値幅/基準平均 上限", minval = 0.1,  step = 0.01, group = G_ACCP)
+accumDriftMax        = input.float(0.30, "Accum ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = G_ACCP)
+
+var string G_ACCQ = "02b · Provisional ATR Accum (暫定・本番未使用)"
+accLen1 = input.int(20, "[暫定] Accum Lookback · TF #1 (bars)", minval = 3, group = G_ACCQ)
+accLen2 = input.int(20, "[暫定] Accum Lookback · TF #2 (bars)", minval = 3, group = G_ACCQ)
+accLen3 = input.int(15, "[暫定] Accum Lookback · TF #3 (bars)", minval = 3, group = G_ACCQ)
+accMult = input.float(1.2, "[暫定] Accum Max Range / ATR", step = 0.1, minval = 0.1, group = G_ACCQ)
+
+// ---- 2.8 Cluster / Score / HTF --------------------------------------------
+var string G_CLU = "02 · Cluster"
+clusterDist = input.float(20.0, "Cluster Distance ($)", step = 1.0, group = G_CLU)
+
+var string G_SCORE = "02 · Strength Score"
+thrMedium = input.float(5.0,  "Medium Score Threshold",      step = 0.5, group = G_SCORE)
+thrStrong = input.float(10.0, "Strong Score Threshold",      step = 0.5, group = G_SCORE)
+thrVStrong = input.float(15.0, "Very Strong Score Threshold", step = 0.5, group = G_SCORE)
+confBonus2 = input.float(1.0, "Confluence Bonus · 2 categories",  step = 0.5, group = G_SCORE)
+confBonus3 = input.float(2.0, "Confluence Bonus · 3 categories",  step = 0.5, group = G_SCORE)
+confBonus4 = input.float(3.0, "Confluence Bonus · 4+ categories", step = 0.5, group = G_SCORE)
+flipBonus = input.float(2.0, "Flip Bonus", step = 0.5, group = G_SCORE)
+
+var string G_HTF = "02a · Very Strong · Higher TF Structure"
+requireHtfForVStrong = input.bool(true, "Require Higher TF Structure for Very Strong", group = G_HTF)
+htfSwing1H = input.bool(true,  "Count 1H Swing (TF #3) as Higher TF",    group = G_HTF)
+htfAccum1H = input.bool(true,  "Count 1H Accum (TF #1) as Higher TF",    group = G_HTF)
+htfAccum4H = input.bool(true,  "Count 4H Accum (TF #2) as Higher TF",    group = G_HTF)
+htfAccumD = input.bool(true,  "Count Daily Accum (TF #3) as Higher TF", group = G_HTF)
+htfSwing15M = input.bool(false, "Count 15M Swing (TF #2) as Higher TF",   group = G_HTF)
+htfMa1 = input.bool(false, "Count MA #1 (2000) as Higher TF",        group = G_HTF)
+htfMa2 = input.bool(false, "Count MA #2 (3000) as Higher TF",        group = G_HTF)
+htfDayHL = input.bool(false, "Count Day High / Low as Higher TF",      group = G_HTF)
+
+// ---- 2.9 Break / Flip / Lifetime ------------------------------------------
+var string G_BF = "02 · Break / Flip"
+breakTf = input.timeframe("5", "Break Evaluation Timeframe", group = G_BF,
+     tooltip = "Breakはヒゲではなくこの時間足の確定終値で判定する。")
+breakBuffer = input.float(5.0,  "Break Buffer ($)",         step = 0.5, group = G_BF)
+flipConfirmDist = input.float(10.0, "Flip Confirm Distance ($)", step = 0.5, group = G_BF)
+resetOnReclaim = input.bool(true,  "Reset Broken on Reclaim", group = G_BF)
+trackStaleBars = input.int(500, "Zone State Retention (bars without match)", minval = 10, group = G_BF)
+trackContinuity = input.float(0.5, "Zone Track · Min Source Continuity", minval = 0.01, maxval = 1.0, step = 0.05, group = G_BF)
+
+var string G_LIFE = "02 · Zone Lifetime"
+lifeHz1 = input.float(5.0,  "Lifetime · TF #1 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeHz2 = input.float(10.0, "Lifetime · TF #2 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeHz3 = input.float(30.0, "Lifetime · TF #3 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeExtendOn = input.bool(true,  "Extend Lifetime on Reaction / Flip", group = G_LIFE)
+lifeExtendRatio = input.float(0.5,  "Lifetime Extension Ratio", step = 0.1, minval = 0.0, group = G_LIFE)
+maxPersistZones = input.int(200, "Max Persistent Raw Zones", minval = 20, maxval = 800, group = G_LIFE)
+
+// ---- 2.10 Structural SL / TP ----------------------------------------------
+var string G_SLTP = "02 · Structural SL / TP"
+slBuffer = input.float(5.0,  "SL Buffer ($)", step = 0.5, group = G_SLTP)
+tpBuffer = input.float(0.0,  "TP Buffer ($)", step = 0.5, group = G_SLTP)
+maxSlDist = input.float(30.0, "Max SL Distance ($)", step = 1.0, group = G_SLTP)
+minStructRR = input.float(1,  "Minimum Structural RR", step = 0.1, group = G_SLTP,
+     tooltip = "Structural TPが存在する場合、この値未満のRRならエントリー禁止 (固定RR TPへ逃げない)。")
+tpMode = input.string("BOTH", "TP Mode", options = ["BOTH", "STRUCTURAL_ONLY", "FALLBACK_ONLY"], group = G_SLTP,
+     tooltip = "Structural TP と Fallback RR TP の成績を切り分けて検証するための採用フィルター。\n" +
+     "BOTH            : 現行動作。Structural TPがあればそれを使い、無ければFallback RR TP。\n" +
+     "STRUCTURAL_ONLY : Structural TPが存在するトレードのみ発注。無い場合はFallbackを作らずNoTrade。\n" +
+     "FALLBACK_ONLY   : Structural TPが存在しなかったシグナルのみFallback RR TPで発注。\n" +
+     "                  (Structural TPを無視してRR TPへ差し替えるのではなく、そのシグナル自体を除外する)\n" +
+     "SL判定 (Active Zone / SL Zone / SL距離) は3モードとも完全共通。")
+slMinScore = input.float(4.0,  "SL Zone · Min Score", step = 0.5, group = G_SLTP)
+slMinStrStr  = input.string("Medium", "SL Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+tpMinScore = input.float(7.0,  "TP Zone · Min Score", step = 0.5, group = G_SLTP)
+tpMinStrStr  = input.string("Strong", "TP Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+obsMinStrStr = input.string("Medium", "Obstacle · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+activeNoTradeMinStrStr = input.string("Medium", "Active Zone NoTrade · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP,
+     tooltip = "Entry価格がこのStrength以上の ACTIVE Zone (現在価格がZone内部) の中に\n" +
+               "ある場合は NO TRADE にする。Structural SL / TP が存在しても、\n" +
+               "Fallback RR TP も使わずエントリーを見送る。Long / Short 共通。")
+fallbackRR = input.float(2.0, "Fallback RR (Structural TPが無い場合のみ使用)", step = 0.1, minval = 0.1, group = G_SLTP,
+     tooltip = "有効なTP Zoneが見つからない場合のみ、Structural SL距離 × この値でTPを作る。")
+
+// ============================================================================
+// 01D. DISPLAY INPUTS (Zone Level 表示専用)
+// ----------------------------------------------------------------------------
+//  ★ 透明度 / 表示可否 / 線の太さ はすべて ZoneLevelEngine の zoneLevel 基準。
+//    ZoneEngine の Raw Strength は使わない。
+// ============================================================================
+var string G_DISP = "05 · Display · Zone Level"
+showZones        = input.bool(true,  "Show Zones (box)",              group = G_DISP)
+showLevelLabels  = input.bool(true,  "Show Level Labels",             group = G_DISP)
+showDetailLabels = input.bool(false, "Show Detail Labels",            group = G_DISP,
+     tooltip = "BirthScore / Raw Score / Raw Strength / trackId をラベルへ追加する。\n" +
+     "これらは参考情報で、Level 判定には一切使われていない。")
+maxZonesDraw     = input.int(30, "Max Zones Drawn", minval = 1, maxval = 120, group = G_DISP,
+     tooltip = "Level の高い Zone から順に描画し、この本数で打ち切る。")
+zoneLeftBars     = input.int(150, "Left Extension (bars)",  minval = 1, group = G_DISP)
+zoneRightBars    = input.int(30,  "Right Extension (bars)", minval = 1, group = G_DISP)
+
+// ---- Level フィルター -------------------------------------------------------
+var string G_FILT = "05a · Display · Level Filter"
+minDisplayLevelStr = input.string("Medium", "Minimum Display Level",
+     options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_FILT,
+     tooltip = "この Level 未満の Zone を描画しない。個別の Show ON/OFF と AND で効く。")
+showWeak       = input.bool(false, "Show Weak",        group = G_FILT)
+showMedium     = input.bool(true,  "Show Medium",      group = G_FILT)
+showStrong     = input.bool(true,  "Show Strong",      group = G_FILT)
+showVeryStrong = input.bool(true,  "Show Very Strong", group = G_FILT)
+
+// ---- State フィルター -------------------------------------------------------
+var string G_STATE = "05b · Display · State Filter"
+showActive = input.bool(true,  "Show Active", group = G_STATE,
+     tooltip = "ACTIVE Zone も表示する。Level は ZoneLevelEngine の値をそのまま使い、\n" +
+     "色だけ ACTIVE 用になる。ACTIVE だからといって Level は変えない。")
+showBroken = input.bool(false, "Show Broken", group = G_STATE,
+     tooltip = "BROKEN Zone を表示する。既定 OFF。\n" +
+     "BROKEN だからといって TouchCount や Level を表示側で変えることはしない。")
+
+// ---- 色 / 透明度 / 線 -------------------------------------------------------
+var string G_COL = "05c · Display · Color"
+colSupport    = input.color(color.new(#2962FF, 0), "Color · Support",    group = G_COL)
+colResistance = input.color(color.new(#EF5350, 0), "Color · Resistance", group = G_COL)
+colActive     = input.color(color.new(#FFB300, 0), "Color · Active",     group = G_COL)
+colBroken     = input.color(color.new(#78909C, 0), "Color · Broken",     group = G_COL)
+trVStrong = input.int(50, "Transparency · Very Strong", minval = 0, maxval = 100, group = G_COL)
+trStrong  = input.int(65, "Transparency · Strong",      minval = 0, maxval = 100, group = G_COL)
+trMedium  = input.int(80, "Transparency · Medium",      minval = 0, maxval = 100, group = G_COL)
+trWeak    = input.int(90, "Transparency · Weak",        minval = 0, maxval = 100, group = G_COL)
+
+// ============================================================================
+// 02. ENGINE INITIALIZATION
+// ----------------------------------------------------------------------------
+//  Zone Engine のみ。SignalEngine 系の Engine は持たない。
+// ============================================================================
+
+// ---- 2.1 Engine ------------------------------------------------------------
+var zn.ZoneEngine zoneEng = zn.newEngine()
+
+// ---- 2.2 Zone Engine Config (元 Strategy の 2.2 をそのまま移植) ------------
+zn.ZoneCfg zoneCfg = zn.newCfg()
+zoneCfg.zoneHalfWidth        := zoneHalfWidth
+zoneCfg.useMaSource          := useMaSource
+zoneCfg.maTfName             := maTf
+zoneCfg.ma1Len               := ma1Len
+zoneCfg.ma2Len               := ma2Len
+zoneCfg.scoreMa1             := scoreMa1
+zoneCfg.scoreMa2             := scoreMa2
+zoneCfg.slopeThrMod          := slopeThrMod
+zoneCfg.slopeThrStrong       := slopeThrStrong
+zoneCfg.slopeBonusFlat       := slopeBonusFlat
+zoneCfg.slopeBonusMod        := slopeBonusMod
+zoneCfg.slopeBonusStr        := slopeBonusStr
+zoneCfg.slopeBonusMax        := slopeBonusMode == "Max"
+zoneCfg.maClusterDist        := maClusterDist
+zoneCfg.maClusterBonus       := maClusterBonus
+zoneCfg.maClusterDirBonus    := maClusterDirBonus
+zoneCfg.useHzSource          := useHzSource
+zoneCfg.hzTf1                := hzTf1
+zoneCfg.hzTf2                := hzTf2
+zoneCfg.hzTf3                := hzTf3
+zoneCfg.scoreHz1             := scoreHz1
+zoneCfg.scoreHz2             := scoreHz2
+zoneCfg.scoreHz3             := scoreHz3
+zoneCfg.reactionDist         := reactionDist
+//  ★ useReactionScoreBonus == false のとき 0.0 を渡し、Score加点だけを無効化する。
+//    ZoneEngineLib は未変更 (f_reactionBonus が 0.0 を返すだけ)。
+zoneCfg.reactionBonus1       := useReactionScoreBonus ? reactionBonus1 : 0.0
+zoneCfg.reactionBonus2       := useReactionScoreBonus ? reactionBonus2 : 0.0
+zoneCfg.reactionBonus3       := useReactionScoreBonus ? reactionBonus3 : 0.0
+zoneCfg.reactionRearmDist    := reactionRearmDist
+zoneCfg.reactionAllSrc       := reactionAllSrc
+zoneCfg.useDayHL             := useDayHL
+zoneCfg.scoreDayHL           := scoreDayHL
+zoneCfg.carryPrevDayHL       := carryPrevDayHL
+zoneCfg.scorePrevDayHL       := scorePrevDayHL
+zoneCfg.lifePrevDayHL        := lifePrevDayHL
+zoneCfg.useAccSource         := useAccSource
+zoneCfg.accTf1               := accTf1
+zoneCfg.accTf2               := accTf2
+zoneCfg.accTf3               := accTf3
+zoneCfg.scoreAcc1            := scoreAcc1
+zoneCfg.scoreAcc2            := scoreAcc2
+zoneCfg.scoreAcc3            := scoreAcc3
+zoneCfg.accKeep1             := accKeep1
+zoneCfg.accKeep2             := accKeep2
+zoneCfg.accKeep3             := accKeep3
+zoneCfg.clusterDist          := clusterDist
+zoneCfg.thrMedium            := thrMedium
+zoneCfg.thrStrong            := thrStrong
+zoneCfg.thrVStrong           := thrVStrong
+zoneCfg.confBonus2           := confBonus2
+zoneCfg.confBonus3           := confBonus3
+zoneCfg.confBonus4           := confBonus4
+zoneCfg.flipBonus            := flipBonus
+zoneCfg.requireHtfForVStrong := requireHtfForVStrong
+zoneCfg.htfSwing1H           := htfSwing1H
+zoneCfg.htfAccum1H           := htfAccum1H
+zoneCfg.htfAccum4H           := htfAccum4H
+zoneCfg.htfAccumD            := htfAccumD
+zoneCfg.htfSwing15M          := htfSwing15M
+zoneCfg.htfMa1               := htfMa1
+zoneCfg.htfMa2               := htfMa2
+zoneCfg.htfDayHL             := htfDayHL
+zoneCfg.breakBuffer          := breakBuffer
+zoneCfg.flipConfirmDist      := flipConfirmDist
+zoneCfg.resetOnReclaim       := resetOnReclaim
+zoneCfg.trackStaleBars       := trackStaleBars
+zoneCfg.trackContinuity      := trackContinuity
+zoneCfg.lifeHz1              := lifeHz1
+zoneCfg.lifeHz2              := lifeHz2
+zoneCfg.lifeHz3              := lifeHz3
+zoneCfg.lifeExtendOn         := lifeExtendOn
+zoneCfg.lifeExtendRatio      := lifeExtendRatio
+zoneCfg.maxPersistZones      := maxPersistZones
+zoneCfg.slBuffer             := slBuffer
+zoneCfg.tpBuffer             := tpBuffer
+zoneCfg.maxSlDist            := maxSlDist
+zoneCfg.minStructRR          := minStructRR
+zoneCfg.slMinScore           := slMinScore
+zoneCfg.slMinStrength        := zn.strengthIdx(slMinStrStr)
+zoneCfg.tpMinScore           := tpMinScore
+zoneCfg.tpMinStrength        := zn.strengthIdx(tpMinStrStr)
+zoneCfg.obsMinStrength       := zn.strengthIdx(obsMinStrStr)
+zoneCfg.activeNoTradeMinStrength := zn.strengthIdx(activeNoTradeMinStrStr)
+zoneCfg.fallbackRR           := fallbackRR
+
+// ============================================================================
+// 03. EXTERNAL DATA FEED
+// ----------------------------------------------------------------------------
+//  Library は request.*() を呼べないため、外部足の取得はすべてここで行う。
+//  ★ 元 Strategy の「03.2 Zone Engine Feed」をそのまま移植 ★
+//    request.security の TF / 式 / lookahead / 取得条件 (if useXxxSource) も
+//    1行も変更していない。したがって Zone 時系列は Strategy と完全一致する。
+//
+//  ★ request.* の本数
+//    MA×1 / Swing×3 / Accum×3 / Break×1 = 8 (Strategy の Zone分と同数)
+// ============================================================================
+
+// ---- 3.2 Zone Engine Feed --------------------------------------------------
+// ★ MA2000 / MA3000 : zn.maPack() を 1分足コンテキストで評価させる。
+//   maPack() の中身は ta.ema(close, 2000) 等であり、この close は1分足のclose。
+//   → 5分足closeからの再計算ではない。
+//  ★ Source が OFF のときは取得自体を行わない (結果不変・下の理由による) ★
+//    Library 側は MA / Swing / Accum のどれも
+//      「c.useXxxSource が true」かつ「値が na でない」
+//    ときにしか Zone を登録しない。OFF のとき取得値は元々一切使われていないため、
+//    na を渡すのと実測値を渡すのは Zone 時系列に対して完全に等価。
+//    エッジ検出 (nPh1 / nAc1 等) も not na(...) を要求するので false のまま。
+float ma1Val   = na
+float ma1Delta = na
+float ma2Val   = na
+float ma2Delta = na
+if useMaSource
+    [_m1, _m1d, _m2, _m2d] = request.security(syminfo.tickerid, maTf,
+         zn.maPack(maType, ma1Len, ma2Len, slopeLookback), lookahead = barmerge.lookahead_off)
+    ma1Val   := _m1
+    ma1Delta := _m1d
+    ma2Val   := _m2
+    ma2Delta := _m2d
+
+float ph1 = na
+int   ph1T = na
+float pl1 = na
+int   pl1T = na
+float ph2 = na
+int   ph2T = na
+float pl2 = na
+int   pl2T = na
+float ph3 = na
+int   ph3T = na
+float pl3 = na
+int   pl3T = na
+if useHzSource
+    [_h1, _h1t, _l1, _l1t] = request.security(syminfo.tickerid, hzTf1, zn.pivotPack(pivLen1), lookahead = barmerge.lookahead_off)
+    [_h2, _h2t, _l2, _l2t] = request.security(syminfo.tickerid, hzTf2, zn.pivotPack(pivLen2), lookahead = barmerge.lookahead_off)
+    [_h3, _h3t, _l3, _l3t] = request.security(syminfo.tickerid, hzTf3, zn.pivotPack(pivLen3), lookahead = barmerge.lookahead_off)
+    ph1 := _h1
+    ph1T := _h1t
+    pl1 := _l1
+    pl1T := _l1t
+    ph2 := _h2
+    ph2T := _h2t
+    pl2 := _l2
+    pl2T := _l2t
+    ph3 := _h3
+    ph3T := _h3t
+    pl3 := _l3
+    pl3T := _l3t
+
+bool usePortedAccum = accumModule == "Accum Box (ported)"
+float acc1Hi = na
+float acc1Lo = na
+int   acc1Id = na
+float acc2Hi = na
+float acc2Lo = na
+int   acc2Id = na
+float acc3Hi = na
+float acc3Lo = na
+int   acc3Id = na
+if useAccSource
+    [_a1h, _a1l, _a1i] = request.security(syminfo.tickerid, accTf1,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen1, accMult), lookahead = barmerge.lookahead_off)
+    [_a2h, _a2l, _a2i] = request.security(syminfo.tickerid, accTf2,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen2, accMult), lookahead = barmerge.lookahead_off)
+    [_a3h, _a3l, _a3i] = request.security(syminfo.tickerid, accTf3,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen3, accMult), lookahead = barmerge.lookahead_off)
+    acc1Hi := _a1h
+    acc1Lo := _a1l
+    acc1Id := _a1i
+    acc2Hi := _a2h
+    acc2Lo := _a2l
+    acc2Id := _a2i
+    acc3Hi := _a3h
+    acc3Lo := _a3l
+    acc3Id := _a3i
+
+// Break判定は breakTf の「確定終値」のみ (ヒゲでは判定しない)
+[brCloseRaw, brHighRaw, brLowRaw] = request.security(syminfo.tickerid, breakTf, [close, high, low],
+     lookahead = barmerge.lookahead_off)
+bool  brBarClosed = bar_index > 0 and not na(time(breakTf)) and nz(ta.change(time(breakTf)), 0) != 0
+float brClose = brBarClosed ? brCloseRaw[1] : na
+float brHigh  = brBarClosed ? brHighRaw[1]  : na
+float brLow   = brBarClosed ? brLowRaw[1]   : na
+bool  brEval  = brBarClosed and not na(brClose)
+
+// 取引日ID (timestamp/hour の timezone は series 不可なので Main で計算する)
+int _locY = year(time, dayTz)
+int _locM = month(time, dayTz)
+int _locD = dayofmonth(time, dayTz)
+int _locH = hour(time, dayTz)
+int _calDayNo    = int(timestamp(dayTz, _locY, _locM, _locD, 0, 0) / 86400000)
+int tradingDayId = _locH < dayResetHour ? _calDayNo - 1 : _calDayNo
+
+zn.ZoneFeed zoneFeed = zn.ZoneFeed.new(
+     ma1 = ma1Val, ma1d = ma1Delta, ma2 = ma2Val, ma2d = ma2Delta,
+     ph1 = ph1, ph1t = ph1T, pl1 = pl1, pl1t = pl1T,
+     ph2 = ph2, ph2t = ph2T, pl2 = pl2, pl2t = pl2T,
+     ph3 = ph3, ph3t = ph3T, pl3 = pl3, pl3t = pl3T,
+     acc1Hi = acc1Hi, acc1Lo = acc1Lo, acc1Id = acc1Id,
+     acc2Hi = acc2Hi, acc2Lo = acc2Lo, acc2Id = acc2Id,
+     acc3Hi = acc3Hi, acc3Lo = acc3Lo, acc3Id = acc3Id,
+     dayId = tradingDayId,
+     brClose = brClose, brHigh = brHigh, brLow = brLow, brEval = brEval,
+     baseOpen = open, baseHigh = high, baseLow = low, baseClose = close,
+     basePrevClose = close[1], baseTime = time, baseBarSeq = bar_index)
+
+//  ★ CSV を出力した Zone Validation Logger と同じゲートにしてある ★
+//    Logger 側は zn.update() を barstate.isconfirmed で 1 本 1 回に制限している。
+//    ヒストリカルバーでは isconfirmed が常に true なので、バックテスト結果は
+//    Display 版 (毎バー呼び出し) と完全に同一。リアルタイム足でだけ、
+//    ティック毎に Break / Flip / trackId が動くのを防ぐ。
+//  ★ Zone 生成ロジックそのものは一切変更していない ★
+var int zoneCountNow = 0
+if barstate.isconfirmed
+    zoneCountNow := zn.update(zoneEng, zoneCfg, zoneFeed)
+
+// ============================================================================
+// 04. SOURCE MASK (ZoneLevelEngine へ渡す参考情報)
+// ----------------------------------------------------------------------------
+//  ★ Zone Validation Logger の f_valHasSrc() / f_valSrcMask() を
+//    ビット割当ごと逐語で移植している。独自の割当には変更していない。
+//  ★ ZoneLevelEngine 側の addedSourceMask (誕生後に追加された Source) 用。
+//    表示 Level には一切影響しない。
+// ============================================================================
+//  ★ Zone.sources / Zone.htfSources は " / " 区切りの文字列。
+//    "5 Swing" が "15 Swing" に部分一致してしまうのを避けるため、
+//    先頭一致 または " / " + key での一致だけを採用する。
+f_valHasSrc(string s, string key) =>
+    na(s) or s == "" ? false : (str.startswith(s, key) or str.contains(s, " / " + key))
+
+//  ★ sourceMask ビット割当 (Zone.sources / 生TF表記)
+//    bit0(1)   = MA #1        (str.tostring(ma1Len) + "MA")
+//    bit1(2)   = MA #2        (str.tostring(ma2Len) + "MA")
+//    bit2(4)   = Swing TF#1   (hzTf1 + " Swing")
+//    bit3(8)   = Swing TF#2   (hzTf2 + " Swing")
+//    bit4(16)  = Swing TF#3   (hzTf3 + " Swing")
+//    bit5(32)  = Day High / Day Low
+//    bit6(64)  = Prev Day High / Prev Day Low
+//    bit7(128) = Accum TF#1   (accTf1 + " Accum")
+//    bit8(256) = Accum TF#2   (accTf2 + " Accum")
+//    bit9(512) = Accum TF#3   (accTf3 + " Accum")
+f_valSrcMask(string s) =>
+    int m = 0
+    if f_valHasSrc(s, str.tostring(ma1Len) + "MA")
+        m += 1
+    if f_valHasSrc(s, str.tostring(ma2Len) + "MA")
+        m += 2
+    if f_valHasSrc(s, hzTf1 + " Swing")
+        m += 4
+    if f_valHasSrc(s, hzTf2 + " Swing")
+        m += 8
+    if f_valHasSrc(s, hzTf3 + " Swing")
+        m += 16
+    if f_valHasSrc(s, "Day High") or f_valHasSrc(s, "Day Low")
+        m += 32
+    if f_valHasSrc(s, "Prev Day High") or f_valHasSrc(s, "Prev Day Low")
+        m += 64
+    if f_valHasSrc(s, accTf1 + " Accum")
+        m += 128
+    if f_valHasSrc(s, accTf2 + " Accum")
+        m += 256
+    if f_valHasSrc(s, accTf3 + " Accum")
+        m += 512
+    m
+// ============================================================================
+// 05. ZONE LEVEL ENGINE の更新 (確定足 1 本につき 1 回)
+// ----------------------------------------------------------------------------
+//  ★ ZoneLevelEngine v2 対応 ★
+//    v1 の beginBar() / endBar() は v2 に存在しない。
+//    v2 は Touch / Birth / Age に使う足情報を外から受け取る設計なので、
+//    beginBaseBar() / endBaseBar() へ置き換える。
+//
+//  ★ Base TF = チャート時間足 (5分) ★
+//    この Indicator は XAUUSD 5分足で使うため、Base TF もそのまま 5分。
+//    したがって Base TF の足情報はチャートの built-in をそのまま渡せる。
+//      baseBarSeq = bar_index / baseTime = time
+//      baseHigh   = high      / baseLow  = low  / baseClose = close
+//
+//  ★ barstate.isconfirmed のときだけ 1 回だけ実行する ★
+//    未確定足では TouchCount / 登録簿を一切進めない。
+//    リアルタイム足はティックごとに再実行されるため、ここを通すと
+//    同じ足で Touch が何度も加算されてしまう。
+//    さらに v2 側にも「同じ baseBarSeq では 2 回以上進めない」ガードがあるので、
+//    二重加算は二重に防がれている。
+//
+//  ★ スナップショット (lvlEng.zones) は beginBaseBar() でしか作り直さない ★
+//    未確定足では前回の確定足のスナップショットがそのまま残る。
+//    描画セクションはそれを読むので、リアルタイム足でも直近の確定 5分足の
+//    Zone Level が表示される (TouchCount が未確定足で動くことはない)。
+//
+//  ★ ZoneLevelCfg は zl.newCfg() の既定値をそのまま使う。
+//    表示側で閾値を上書きすると「チャートで見えている Level」と
+//    「Strategy が使う Level」がズレるため、あえて input を設けていない。
+//    Level ルールを変えるときは ZoneLevelEngine 側だけを変更する。
+//
+//  ★ Gold判定はここに入れない。計算は全銘柄で同じように走らせ、
+//    描画だけ Gold に限定する。
+// ============================================================================
+var zl.ZoneLevelCfg    lvlCfg = zl.newCfg()
+var zl.ZoneLevelEngine lvlEng = zl.newEngine()
+
+//  診断用カウンタ (Level 判定には使わない)
+var int lvlUpdateCnt = 0
+
+if barstate.isconfirmed
+    zl.beginBaseBar(lvlEng, bar_index, time, high, low, close)
+    int _zcFeed = zn.zoneCount(zoneEng)
+    if _zcFeed > 0
+        for _fi = 0 to _zcFeed - 1
+            zn.Zone _fz = zn.zoneAt(zoneEng, _fi)
+            zl.feedZone(lvlEng, lvlCfg, _fz.trackId, _fz.top, _fz.bottom,
+                 _fz.state, _fz.score, _fz.strength, _fz.flipped, f_valSrcMask(_fz.sources))
+    zl.endBaseBar(lvlEng, lvlCfg)
+    lvlUpdateCnt := lvlUpdateCnt + 1
+
+// ============================================================================
+// 06. DISPLAY
+// ----------------------------------------------------------------------------
+//  ★ 描画に使う Level は ZoneLevel.zoneLevel / zoneLevelName のみ。
+//    透明度 / 線の太さ / 表示可否 も Level 基準で、Raw Strength は使わない。
+//  ★ barstate.islast で既存の box / label を全消し → 直近の確定足で作った
+//    Snapshot から再描画する。毎バー増え続けることはない。
+//  ★ Touch 0 の Zone も除外しない。ZoneLevelEngine の仕様どおり
+//    BirthScore >= 10 なら Very Strong、< 10 なら Strong として表示される。
+// ============================================================================
+var array<box>   gLevelBoxes  = array.new<box>()
+var array<label> gLevelLabels = array.new<label>()
+
+f_lvlClear() =>
+    while array.size(gLevelBoxes) > 0
+        box.delete(array.pop(gLevelBoxes))
+    while array.size(gLevelLabels) > 0
+        label.delete(array.pop(gLevelLabels))
+    true
+
+//  ★ Level 定数は ZoneLevelEngine から取得する (Display 側で数値を決めない)。
+int LVL_W  = zl.levelWeak()
+int LVL_M  = zl.levelMedium()
+int LVL_S  = zl.levelStrong()
+int LVL_VS = zl.levelVeryStrong()
+
+//  Minimum Display Level の文字列 → Level コード (フィルター用。Level 判定ではない)
+f_minLevel(string s) =>
+    s == "Very Strong" ? LVL_VS : s == "Strong" ? LVL_S : s == "Medium" ? LVL_M : LVL_W
+
+//  State → 色 (色だけ State 依存。Level には影響しない)
+f_stateColor(int st) =>
+    st == ST_SUPPORT ? colSupport : st == ST_RESIST ? colResistance :
+     st == ST_ACTIVE ? colActive : colBroken
+
+//  Level → 透明度 / 線の太さ
+f_lvlTransp(int lvl) =>
+    lvl == LVL_VS ? trVStrong : lvl == LVL_S ? trStrong : lvl == LVL_M ? trMedium : trWeak
+
+f_lvlWidth(int lvl) =>
+    lvl == LVL_VS ? 3 : lvl == LVL_S ? 2 : 1
+
+//  Level / State の個別 ON/OFF
+f_lvlShown(int lvl) =>
+    lvl == LVL_VS ? showVeryStrong : lvl == LVL_S ? showStrong :
+     lvl == LVL_M ? showMedium : lvl == LVL_W ? showWeak : false
+
+f_stateShown(int st) =>
+    st == ST_ACTIVE ? showActive : st == ST_BROKEN ? showBroken : true
+
+//  ★ Gold以外では box.new / label.new を1つも実行しない。
+if isGold and barstate.islast
+    bool _cleared = f_lvlClear()
+    if showZones
+        int _n = zl.zoneCount(lvlEng)
+        if _n > 0
+            int _minLv  = f_minLevel(minDisplayLevelStr)
+            int _drawn  = 0
+            //  Level の高いものから順に描き、Max Zones Drawn で打ち切る。
+            for _lv = LVL_VS to LVL_W
+                for _i = 0 to _n - 1
+                    if _drawn < maxZonesDraw
+                        zl.ZoneLevel _z = zl.zoneAt(lvlEng, _i)
+                        bool _ok = _z.trackId >= 0 and _z.zoneLevel == _lv and
+                         _z.zoneLevel >= _minLv and f_lvlShown(_z.zoneLevel) and
+                         f_stateShown(_z.state)
+                        if _ok
+                            color _bc = f_stateColor(_z.state)
+                            int   _tr = f_lvlTransp(_z.zoneLevel)
+                            box _b = box.new(
+                                 left         = bar_index - zoneLeftBars,
+                                 top          = _z.top,
+                                 right        = bar_index + zoneRightBars,
+                                 bottom       = _z.bottom,
+                                 bgcolor      = color.new(_bc, _tr),
+                                 border_color = color.new(_bc, math.max(_tr - 30, 0)),
+                                 border_width = f_lvlWidth(_z.zoneLevel),
+                                 border_style = _z.state == ST_ACTIVE ? line.style_dashed : line.style_solid,
+                                 xloc         = xloc.bar_index)
+                            array.push(gLevelBoxes, _b)
+                            _drawn += 1
+
+                            //  ラベル: Level名 + TouchCount (詳細 ON で参考情報を追加)
+                            //   ・Level名は ZoneLevel.zoneLevelName をそのまま使う。
+                            //   ・Raw Score / Raw Strength は参考情報としてだけ出す。
+                            if showLevelLabels
+                                string _txt = _z.zoneLevelName + "\nT" + str.tostring(_z.touchCount)
+                                if showDetailLabels
+                                    _txt := _txt + "\nBirth " + f_num(_z.birthScore, "#.#")
+                                    _txt := _txt + "\nRaw " + f_num(_z.rawScore, "#.#") +
+                                     " / " + zn.strengthName(_z.rawStrength)
+                                    _txt := _txt + "\nID " + str.tostring(_z.trackId)
+                                label _l = label.new(
+                                     x         = bar_index + zoneRightBars,
+                                     y         = (_z.top + _z.bottom) / 2,
+                                     text      = _txt,
+                                     xloc      = xloc.bar_index,
+                                     style     = label.style_label_left,
+                                     color     = color.new(_bc, math.max(_tr - 20, 0)),
+                                     textcolor = color.white,
+                                     size      = size.small)
+                                array.push(gLevelLabels, _l)
+
+// ============================================================================
+// 07. TOUCH REGISTRY  (Zone Validation Logger の Touch 判定を逐語移植)
+// ----------------------------------------------------------------------------
+//  ★★★ ここは CSV を出力した Zone Validation Logger の
+//    「10.6.1 Zone全件走査: 登録簿更新 + Touch検出」と同じ条件式・同じ順序 ★★★
+//
+//  ★ なぜ ZoneLevelEngine の touchCount を使わないのか ★
+//    CSV の EV_touchCnt は ZoneLevelEngine の touchCount ではなく、
+//    Logger 独自の vzTouchCnt (このセクションの zbTouchCnt) の値。
+//    両者は別実装なので値がズレることがあり、そのズレを測るために
+//    Logger には EV_levelSync という列がある。
+//    CSV の集計 (400 / 123 / 87 / 55 trades) は EV_touchCnt 基準なので、
+//    Strategy 側も同じカウンタを再現しないと本数が合わない。
+//    → zoneLevel も Debug で併記して、両者の対応を確認できるようにする。
+//
+//  ★ 観測専用 ★
+//    zoneEng / zoneCfg / zoneFeed / lvlEng へは一切書き戻さない。
+//    使うのは zn.zoneCount() / zn.zoneAt() (どちらも参照系) だけ。
+//    → Zone の生成 / Cluster / Break / Flip / Lifetime / Score / Strength /
+//      Source / trackId は、この Strategy を載せても 1 つも変わらない。
+//
+//  ★ ポジションを持っていても Touch 判定は止めない ★
+//    保有中でも touchCnt / armed / lastDir は通常どおり更新し続ける。
+//    新規エントリーを見送るのは Section 08 の Strategy 側だけ。
+// ============================================================================
+var string G_TOUCH = "20 · Touch 判定 (CSV再現用)"
+touchRearmDist = input.float(10.0, "Touch Re-arm Distance ($)", minval = 0.0, step = 0.5,
+     group = G_TOUCH,
+     tooltip = "終値が Zone からこの距離以上離れたら、その Zone を再び Touch 可能にする。\n" +
+     "★ CSV を出力した Validation Logger の既定値 (10.0) と必ず揃えること。\n" +
+     "ここを変えると Touch 回数が変わり、CSV と本数が合わなくなる。")
+
+maxTrackedZones = input.int(400, "Max Tracked Zones", minval = 50, maxval = 2000, group = G_TOUCH,
+     tooltip = "登録簿の上限。超えたら古い trackId から間引く (Logger と同じ)。")
+trackStaleBars  = input.int(500, "Track Stale Bars", minval = 50, maxval = 5000, group = G_TOUCH,
+     tooltip = "この本数見かけなかった trackId を間引き対象にする (Logger と同じ)。")
+
+//  trackId ごとの登録簿 (Logger の vz* と 1:1 対応)
+var map<int, int> zbBornBar  = map.new<int, int>()   // vzBornBar
+var map<int, int> zbLastSeen = map.new<int, int>()   // vzLastSeen
+var map<int, int> zbTouchCnt = map.new<int, int>()   // vzTouchCnt  ← CSV の EV_touchCnt
+var map<int, int> zbArmed    = map.new<int, int>()   // vzArmed
+var map<int, int> zbLastDir  = map.new<int, int>()   // vzLastDir
+
+//  このバーで Touch が成立した Zone (Debug / 集計用。Entry 判定には使わない)
+var int zbTouchEvents = 0
+
+f_zbTouchCnt(int tid) =>
+    tid >= 0 and map.contains(zbTouchCnt, tid) ? map.get(zbTouchCnt, tid) : 0
+
+f_zbArmed(int tid) =>
+    tid >= 0 and map.contains(zbArmed, tid) ? map.get(zbArmed, tid) : 0
+
+//  ★ Touch 時の direction 判定 (Logger と同じ 4 分岐) ★
+//      ① ST_SUPPORT → 1
+//      ② ST_RESIST  → -1
+//      ③ ST_ACTIVE  → 直前方向 (lastDir) を引き継ぐ。0 なら判定不能
+//      ④ ST_BROKEN  → 0 (Event を作らない)
+f_zbDir(int st, int lastDir) =>
+    st == ST_SUPPORT ? 1 : st == ST_RESIST ? -1 : st == ST_ACTIVE ? lastDir : 0
+
+if barstate.isconfirmed
+    int _zc = zn.zoneCount(zoneEng)
+    if _zc > 0
+        for _i = 0 to _zc - 1
+            zn.Zone _z = zn.zoneAt(zoneEng, _i)
+            int _id = _z.trackId
+            if _id >= 0
+                if not map.contains(zbBornBar, _id)
+                    map.put(zbBornBar,  _id, bar_index)
+                    map.put(zbTouchCnt, _id, 0)
+                    map.put(zbArmed,    _id, 1)
+                    //  初検出時点で既に ACTIVE の場合は方向不明 (0) から始める
+                    map.put(zbLastDir,  _id, 0)
+                map.put(zbLastSeen, _id, bar_index)
+
+                //  直前方向の更新 (ACTIVE / BROKEN では上書きせず保持)
+                if _z.state == ST_SUPPORT
+                    map.put(zbLastDir, _id, 1)
+                else if _z.state == ST_RESIST
+                    map.put(zbLastDir, _id, -1)
+
+                //  Touch 定義 : そのバーのレンジが Zone [bottom, top] と重なること
+                bool  _inZone = low <= _z.top and high >= _z.bottom
+                float _dist   = close < _z.bottom ? _z.bottom - close :
+                     close > _z.top ? close - _z.top : 0.0
+                int _armed   = map.get(zbArmed, _id)
+                int _lastDir = map.get(zbLastDir, _id)
+                int _dir     = f_zbDir(_z.state, _lastDir)
+
+                if _inZone
+                    if _armed == 1 and _dir != 0
+                        //  方向が確定できた接触は ACTIVE でも正式な Touch として扱い、
+                        //  ここで armed を落とす (同じ接近での二重計上を防ぐ)
+                        map.put(zbArmed, _id, 0)
+                        map.put(zbTouchCnt, _id, map.get(zbTouchCnt, _id) + 1)
+                        zbTouchEvents := zbTouchEvents + 1
+                    //  方向不明 ACTIVE への接触は armed を落とさない
+                    //  (同じ接近中に SUPPORT / RESIST へ確定したら拾えるように)
+                else
+                    //  ★ 再 arm は「終値が Zone から Re-arm Distance 以上離れたこと」のみ ★
+                    //    ACTIVE → SUPPORT などの state 変化だけでは再 arm しない
+                    if _dist >= touchRearmDist
+                        map.put(zbArmed, _id, 1)
+
+    //  登録簿の間引き (上限超過時のみ / 古い trackId から)
+    if map.size(zbLastSeen) > maxTrackedZones
+        array<int> _ks = map.keys(zbLastSeen)
+        if array.size(_ks) > 0
+            for _ki = 0 to array.size(_ks) - 1
+                int _k = array.get(_ks, _ki)
+                if bar_index - map.get(zbLastSeen, _k) > trackStaleBars
+                    map.remove(zbLastSeen, _k)
+                    map.remove(zbBornBar,  _k)
+                    map.remove(zbTouchCnt, _k)
+                    map.remove(zbArmed,    _k)
+                    map.remove(zbLastDir,  _k)
+
+// ============================================================================
+// 08. ZONE BOUNCE STRATEGY
+// ----------------------------------------------------------------------------
+//  ★ エントリー基準価格 ★
+//    Long  (Support Zone へ上から到達) : zoneTop    = CSV の EV_refPrice
+//    Short (Resist  Zone へ下から到達) : zoneBottom = CSV の EV_refPrice
+//
+//  ★ なぜ成行ではなく limit なのか ★
+//    Touch は「その5分足のレンジが Zone と重なった」時点で成立するが、
+//    価格が zoneTop に触れたのはバーの途中。終値で成行を出すと
+//    CSV の EV_refPrice と約定価格がズレる。
+//    そこで 1 本前の確定足の終値時点で limit を置いておき、
+//    次の足で価格が届いた瞬間に zoneTop / zoneBottom で約定させる。
+//
+//  ★ Touch 条件との同値性 ★
+//    Support Zone に上から近づく場合、Logger の Touch 条件
+//      low <= top  and  high >= bottom
+//    のうち high >= bottom は自明に成立するので、実質 low <= top。
+//    zoneTop の buy limit が約定する条件と完全に一致する。
+//    Resist Zone も同様に high >= bottom ⟺ zoneBottom の sell limit 約定。
+//    → 約定したバー = Logger が Touch を検出するバー。
+//
+//  ★ Zone は毎足作り直されるので limit も毎足置き直す ★
+//    同じ Entry ID で strategy.entry を呼ぶと待機注文が置き換わる。
+//    Zone が消えた / 条件を満たさなくなったら strategy.cancel で取り消す。
+//
+//  ★ 待機注文は常に 1 本だけ ★
+//    Long / Short 両方を同時に置くと、大きな1本の足で両方約定して
+//    ドテンする危険がある。終値から最も近い候補 1 本だけを置く。
+//    (価格が先に到達するのは最も近い水準なので、時系列的にも自然)
+//
+//  ★ 未来情報は一切使わない ★
+//    判定に使うのは「1本前までに確定した Zone 情報」と「現在の終値」だけ。
+//    MFE / maxPenetration / hit10 / hit20 / hit30 / barsTo* / broken /
+//    reclaimed / trackingLost のような Touch 後に確定する値は使わない。
+//    request.security の lookahead も Zone Engine 既存分以外は追加していない。
+// ============================================================================
+var string G_STRAT = "21 · Zone Bounce Strategy"
+
+enableStrategy = input.bool(true, "Enable Strategy", group = G_STRAT)
+
+//  ---- Entry Mode (タッチ回数フィルター) ----
+//    CSV を SL15 / TP20 で検証した結果:
+//      ALL        400 trades / 191 WIN / 209 LOSS / 勝率 47.75% / PF 1.22
+//      FIRST_3    123 trades /  74 WIN /  49 LOSS / 勝率 60.16% / PF 2.01
+//      FIRST_2     87 trades /  57 WIN /  30 LOSS / 勝率 65.52% / PF 2.53
+//      FIRST_ONLY  55 trades /  39 WIN /  16 LOSS / 勝率 70.91% / PF 3.25
+entryMode = input.string("FIRST_2", "Entry Mode",
+     options = ["ALL", "FIRST_3", "FIRST_2", "FIRST_ONLY"], group = G_STRAT,
+     tooltip = "そのエントリーが、その Zone にとって何回目の Touch になるかで絞る。\n" +
+     "ALL        : 全タッチ\n" +
+     "FIRST_3    : touchCnt <= 3\n" +
+     "FIRST_2    : touchCnt <= 2  (既定)\n" +
+     "FIRST_ONLY : touchCnt == 1\n" +
+     "★ 判定に使うのは Validation Logger と同じ touchCnt。\n" +
+     "  CSV 全 564 イベントでは zoneLevel >= 2 と touchCnt <= 2 が完全一致していた。")
+
+slDollar = input.float(15.0, "SL ($)", minval = 0.1, step = 0.5, group = G_STRAT,
+     tooltip = "XAUUSD 価格そのものの値幅。tick 数や % ではない。")
+tpDollar = input.float(20.0, "TP ($)", minval = 0.1, step = 0.5, group = G_STRAT,
+     tooltip = "XAUUSD 価格そのものの値幅。tick 数や % ではない。")
+
+allowLong  = input.bool(true, "Long (Support Zone) 有効",    group = G_STRAT)
+allowShort = input.bool(true, "Short (Resist Zone) 有効",    group = G_STRAT)
+
+//  ---- 何回目の Touch になるかで通すかどうか ----
+f_entryModeOk(int nextTouchNo) =>
+    entryMode == "ALL"        ? true :
+     entryMode == "FIRST_3"   ? nextTouchNo <= 3 :
+     entryMode == "FIRST_2"   ? nextTouchNo <= 2 :
+     entryMode == "FIRST_ONLY"? nextTouchNo == 1 : false
+
+// ---- 8.1 待機注文の候補選定 -------------------------------------------------
+//  ★ 候補条件 ★
+//    ・trackId が有効
+//    ・armed == 1            (Logger が次の Touch を数える状態)
+//    ・direction が確定できる (BROKEN / 方向不明 ACTIVE は除外)
+//    ・次の Touch 回数が Entry Mode を通る
+//    ・終値が Zone の外側にある
+//        Long  : close > zone.top     (buy limit を終値より下に置けること)
+//        Short : close < zone.bottom  (sell limit を終値より上に置けること)
+//      armed な Zone は必ずこの条件を満たす。終値が Zone の内側にあるなら
+//      その足で既にレンジが重なっており、Touch は済んで armed が落ちている。
+string ENTRY_L = "ZB_LONG"
+string ENTRY_S = "ZB_SHORT"
+
+int   cndDir   = 0      // 1 = Long / -1 = Short / 0 = 候補なし
+int   cndId    = -1
+float cndPrice = na     // Long なら zoneTop / Short なら zoneBottom
+float cndTop   = na
+float cndBot   = na
+float cndDist  = na
+int   cndTouch = 0      // 現在の touchCnt (エントリーすれば +1 回目になる)
+int   cndLevel = 0
+float cndScore = na
+int   cndStr   = 0
+
+if enableStrategy and barstate.isconfirmed
+    int _zc = zn.zoneCount(zoneEng)
+    if _zc > 0
+        for _i = 0 to _zc - 1
+            zn.Zone _z = zn.zoneAt(zoneEng, _i)
+            int _id = _z.trackId
+            if _id >= 0 and f_zbArmed(_id) == 1 and not na(_z.top) and not na(_z.bottom)
+                int _tc   = f_zbTouchCnt(_id)
+                int _dir  = f_zbDir(_z.state, map.contains(zbLastDir, _id) ? map.get(zbLastDir, _id) : 0)
+                bool _ok  = f_entryModeOk(_tc + 1)
+                if _ok and _dir == 1 and allowLong and close > _z.top
+                    float _d = close - _z.top
+                    if na(cndDist) or _d < cndDist
+                        cndDist  := _d
+                        cndDir   := 1
+                        cndId    := _id
+                        cndPrice := _z.top
+                        cndTop   := _z.top
+                        cndBot   := _z.bottom
+                        cndTouch := _tc
+                        cndScore := _z.score
+                        cndStr   := _z.strength
+                else if _ok and _dir == -1 and allowShort and close < _z.bottom
+                    float _d = _z.bottom - close
+                    if na(cndDist) or _d < cndDist
+                        cndDist  := _d
+                        cndDir   := -1
+                        cndId    := _id
+                        cndPrice := _z.bottom
+                        cndTop   := _z.top
+                        cndBot   := _z.bottom
+                        cndTouch := _tc
+                        cndScore := _z.score
+                        cndStr   := _z.strength
+
+//  候補 Zone の Level (Entry 判定には使わない。Debug で touchCnt と対応を見るため)
+if cndId >= 0
+    zl.ZoneLevel _cl = zl.zoneByTrackId(lvlEng, cndId)
+    cndLevel := _cl.trackId >= 0 ? _cl.zoneLevel : 0
+
+// ---- 8.2 待機注文の発注 / 取消 ---------------------------------------------
+//  ★ フラットのときだけ待機注文を置く ★
+//    ポジション保有中は両方取り消す。別 Zone / 同じ Zone へタッチしても
+//    新規エントリーしない。Touch 登録簿 (Section 07) は止めない。
+bool isFlat = strategy.position_size == 0
+
+if enableStrategy and barstate.isconfirmed
+    if isFlat and cndDir == 1 and not na(cndPrice)
+        strategy.cancel(ENTRY_S)
+        strategy.entry(ENTRY_L, strategy.long, limit = cndPrice)
+    else if isFlat and cndDir == -1 and not na(cndPrice)
+        strategy.cancel(ENTRY_L)
+        strategy.entry(ENTRY_S, strategy.short, limit = cndPrice)
+    else
+        strategy.cancel(ENTRY_L)
+        strategy.cancel(ENTRY_S)
+
+// ---- 8.3 待機注文の紐付け (約定したときにどの Zone だったかを残す) ---------
+//  ★ 注文を出した足の候補情報を 1 本分だけ保持しておく ★
+//    約定は次の足なので、約定を検出したときに参照する。
+var int   pendDir   = 0
+var int   pendId    = -1
+var float pendPrice = na
+var float pendTop   = na
+var float pendBot   = na
+var int   pendTouch = 0
+var int   pendLevel = 0
+var float pendScore = na
+var int   pendStr   = 0
+
+if enableStrategy and barstate.isconfirmed and isFlat
+    pendDir   := cndDir
+    pendId    := cndId
+    pendPrice := cndPrice
+    pendTop   := cndTop
+    pendBot   := cndBot
+    pendTouch := cndTouch
+    pendLevel := cndLevel
+    pendScore := cndScore
+    pendStr   := cndStr
+
+// ---- 8.4 エグジット (SL / TP 固定幅) ---------------------------------------
+//  ★ Touch 足自身は評価対象外 ★
+//    strategy.exit はポジションを持っている足の終値で置くので、有効になるのは
+//    次の足から。CSV 側も「Touch 足は評価対象外、次のバーから Evaluation」
+//    という定義なので位相が一致する。
+//  ★ SL / TP は実際の約定価格 (strategy.position_avg_price) から測る ★
+//    ギャップで limit より有利に約定した場合もその価格基準になる。
+float posEntry = strategy.position_avg_price
+float exitSl = strategy.position_size > 0 ? posEntry - slDollar :
+     strategy.position_size < 0 ? posEntry + slDollar : na
+float exitTp = strategy.position_size > 0 ? posEntry + tpDollar :
+     strategy.position_size < 0 ? posEntry - tpDollar : na
+
+if enableStrategy and strategy.position_size != 0 and not na(posEntry)
+    strategy.exit("ZB_X", stop = exitSl, limit = exitTp)
+
+// ============================================================================
+// 09. VIRTUAL BACKTEST  (SL 優先 / CSV 集計と同じルール)
+// ----------------------------------------------------------------------------
+//  ★ なぜ Strategy Tester と別に集計するのか ★
+//    同じ 5分足の中で TP と SL の両方に到達した場合、TradingView の
+//    Broker Emulator はバー内の価格経路を知らないため、TP を先に約定させる
+//    ことがある。CSV 側は保守的に「SL 優先 = LOSS」で集計している。
+//    そこでこのセクションで、同じエントリーをバー単位で追跡し直し、
+//    必ず SL 優先で WIN / LOSS を数える。
+//      Long  : low  <= SL なら (high >= TP でも) LOSS
+//      Short : high >= SL なら (low  <= TP でも) LOSS
+//    ★ 推奨条件 FIRST_2 では CSV 上この同時到達ケースは 0 件だったため、
+//      FIRST_2 の再現結果には基本的に影響しない (ALL では 2 件存在)。
+//
+//  ★ エントリーは実際の約定を採用する ★
+//    仮想側で約定判定をやり直すと Strategy Tester とズレるため、
+//    エントリー価格 / 時刻は strategy 側の実約定をそのまま使い、
+//    決済判定だけ SL 優先でやり直す。
+//    通常のバーでは実約定と仮想の決済バーは一致するので、
+//    両者がズレるのは「同一足で TP / SL 同時到達」の 1 ケースだけ。
+//
+//  ★ Touch 足自身は評価対象外 ★
+//    bar_index > vEntryBar のバーから判定を始める。CSV と同じ位相。
+// ============================================================================
+var string G_DBG = "22 · Debug / Virtual Backtest"
+debugMode = input.bool(false, "Debug Mode (ラベル表示)", group = G_DBG,
+     tooltip = "エントリー / 決済ラベルを描く。トレードが多いと重くなるので既定 OFF。")
+showStatTable = input.bool(true, "Virtual Backtest 集計テーブル", group = G_DBG)
+
+var bool  vOpen     = false
+var int   vDir      = 0
+var float vEntry    = na
+var float vSl       = na
+var float vTp       = na
+var int   vEntryBar = 0
+var int   vEntryMs  = 0
+var int   vZoneId   = -1
+var int   vTouchNo  = 0
+var int   vLevel    = 0
+var float vScore    = na
+var int   vStr      = 0
+var float vTop      = na
+var float vBot      = na
+
+var int   vTrades    = 0
+var int   vWin       = 0
+var int   vLoss      = 0
+var float vGrossWin  = 0.0
+var float vGrossLoss = 0.0
+var int   vLongCnt   = 0
+var int   vShortCnt  = 0
+var int   vBothHit   = 0     // 同一足で TP / SL 同時到達 (SL 優先で LOSS にした件数)
+
+if barstate.isconfirmed
+    // ---- 9.1 仮想ポジションの決済判定 (SL 優先) ----------------------------
+    if vOpen and bar_index > vEntryBar
+        bool _hitSl = vDir > 0 ? low  <= vSl : high >= vSl
+        bool _hitTp = vDir > 0 ? high >= vTp : low  <= vTp
+        if _hitSl or _hitTp
+            if _hitSl and _hitTp
+                vBothHit := vBothHit + 1
+            //  ★ 同時到達は必ず SL 優先 ★
+            bool  _isWin = _hitSl ? false : true
+            float _exit  = _hitSl ? vSl : vTp
+            float _pnl   = vDir > 0 ? _exit - vEntry : vEntry - _exit
+            vTrades := vTrades + 1
+            if _isWin
+                vWin      := vWin + 1
+                vGrossWin := vGrossWin + math.abs(_pnl)
+            else
+                vLoss      := vLoss + 1
+                vGrossLoss := vGrossLoss + math.abs(_pnl)
+            if debugMode
+                label.new(
+                     x         = bar_index,
+                     y         = vDir > 0 ? high : low,
+                     text      = (_isWin ? "WIN" : "LOSS") +
+                          (_hitSl and _hitTp ? " (TP/SL同時→SL優先)" : "") +
+                          "\nEntry " + f_num(vEntry, "#.##") +
+                          "\nExit  " + f_num(_exit, "#.##") +
+                          "\nSL " + f_num(vSl, "#.##") + " / TP " + f_num(vTp, "#.##") +
+                          "\n保有 " + str.tostring(bar_index - vEntryBar) + " bars",
+                     xloc      = xloc.bar_index,
+                     style     = vDir > 0 ? label.style_label_down : label.style_label_up,
+                     color     = color.new(_isWin ? color.teal : color.maroon, 15),
+                     textcolor = color.white,
+                     size      = size.small)
+            vOpen := false
+
+    // ---- 9.2 実約定の検出 → 仮想ポジションを開く ---------------------------
+    //    strategy.position_size は足の終値時点の値。前足が 0 で今足が 0 でなければ
+    //    この足で待機注文が約定したということ。
+    if not vOpen and strategy.position_size != 0 and nz(strategy.position_size[1], 0) == 0
+        vOpen     := true
+        vDir      := strategy.position_size > 0 ? 1 : -1
+        vEntry    := strategy.position_avg_price
+        vSl       := vDir > 0 ? vEntry - slDollar : vEntry + slDollar
+        vTp       := vDir > 0 ? vEntry + tpDollar : vEntry - tpDollar
+        vEntryBar := bar_index
+        vEntryMs  := time
+        //  この約定を出した待機注文の候補情報 (前足で保存したもの)
+        vZoneId   := pendId
+        vTouchNo  := pendTouch + 1
+        vLevel    := pendLevel
+        vScore    := pendScore
+        vStr      := pendStr
+        vTop      := pendTop
+        vBot      := pendBot
+        if vDir > 0
+            vLongCnt := vLongCnt + 1
+        else
+            vShortCnt := vShortCnt + 1
+        if debugMode
+            label.new(
+                 x         = bar_index,
+                 y         = vDir > 0 ? low : high,
+                 text      = (vDir > 0 ? "LONG" : "SHORT") +
+                      "  Zone #" + str.tostring(vZoneId) +
+                      "\nEntry " + f_num(vEntry, "#.##") +
+                      "  (ref " + f_num(vDir > 0 ? vTop : vBot, "#.##") + ")" +
+                      "\ntouchCnt " + str.tostring(vTouchNo) +
+                      " / zoneLevel " + zl.levelName(vLevel) + " (" + str.tostring(vLevel) + ")" +
+                      "\nScore " + f_num(vScore, "#.##") +
+                      " / Strength " + zn.strengthName(vStr) +
+                      "\nTop " + f_num(vTop, "#.##") + " / Bottom " + f_num(vBot, "#.##") +
+                      "\n" + str.format_time(vEntryMs, "yyyy-MM-dd HH:mm", "UTC") + " UTC",
+                 xloc      = xloc.bar_index,
+                 style     = vDir > 0 ? label.style_label_up : label.style_label_down,
+                 color     = color.new(vDir > 0 ? color.blue : color.red, 20),
+                 textcolor = color.white,
+                 size      = size.small)
+
+    // ---- 9.3 実ポジションが閉じたのに仮想が開いたままなら同期を取り直す ----
+    //    Broker Emulator と仮想判定がズレた場合の保険。通常は発生しない。
+    if vOpen and strategy.position_size == 0 and bar_index > vEntryBar
+        float _pnl = vDir > 0 ? close - vEntry : vEntry - close
+        vTrades := vTrades + 1
+        if _pnl > 0
+            vWin      := vWin + 1
+            vGrossWin := vGrossWin + _pnl
+        else
+            vLoss      := vLoss + 1
+            vGrossLoss := vGrossLoss + math.abs(_pnl)
+        vOpen := false
+
+// ============================================================================
+// 10. STAT TABLE  (CSV 基準値との比較)
+// ============================================================================
+f_pf() =>
+    vGrossLoss > 0 ? vGrossWin / vGrossLoss : na
+
+f_wr() =>
+    vTrades > 0 ? vWin * 100.0 / vTrades : na
+
+//  Entry Mode ごとの CSV 基準値 (SL15 / TP20 / 時系列再計算)
+f_csvRef() =>
+    entryMode == "ALL"        ? "400 trades / 191 W / 209 L / 47.75% / PF 1.22" :
+     entryMode == "FIRST_3"   ? "123 trades /  74 W /  49 L / 60.16% / PF 2.01" :
+     entryMode == "FIRST_2"   ? " 87 trades /  57 W /  30 L / 65.52% / PF 2.53" :
+     entryMode == "FIRST_ONLY"? " 55 trades /  39 W /  16 L / 70.91% / PF 3.25" : "-"
+
+var table zbTable = table.new(position.top_right, 2, 9,
+     border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50))
+
+if showStatTable and barstate.islast
+    color _bh = color.new(color.gray,  70)
+    color _bs = color.new(color.blue,  75)
+    color _bc = color.new(color.black, 60)
+
+    table.cell(zbTable, 0, 0, "ZONE BOUNCE", text_color = color.white, bgcolor = _bh, text_size = size.small)
+    table.cell(zbTable, 1, 0, "XAUUSD 5m  |  SL " + f_num(slDollar, "#.#") +
+         " / TP " + f_num(tpDollar, "#.#") + "  |  " + entryMode,
+         text_color = color.white, bgcolor = _bh, text_size = size.small)
+
+    table.cell(zbTable, 0, 1, "Virtual (SL優先)", text_color = color.white, bgcolor = _bs, text_size = size.small)
+    table.cell(zbTable, 1, 1, str.tostring(vTrades) + " trades  |  " +
+         str.tostring(vWin) + " WIN / " + str.tostring(vLoss) + " LOSS  |  " +
+         f_num(f_wr(), "#.##") + "%  |  PF " + f_num(f_pf(), "#.##"),
+         text_color = color.white, bgcolor = _bs, text_size = size.small)
+
+    table.cell(zbTable, 0, 2, "CSV 基準値", text_color = color.white, bgcolor = _bc, text_size = size.small)
+    table.cell(zbTable, 1, 2, f_csvRef(), text_color = color.white, bgcolor = _bc, text_size = size.small)
+
+    table.cell(zbTable, 0, 3, "Strategy Tester", text_color = color.white, bgcolor = _bs, text_size = size.small)
+    table.cell(zbTable, 1, 3, str.tostring(strategy.closedtrades) + " closed  |  " +
+         str.tostring(strategy.wintrades) + " WIN / " + str.tostring(strategy.losstrades) + " LOSS  |  " +
+         "PF " + f_num(strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na, "#.##") +
+         (vBothHit > 0 ? "   ← TP/SL同時到達 " + str.tostring(vBothHit) + " 件あり (Virtual と差が出る)" : ""),
+         text_color = color.white, bgcolor = _bs, text_size = size.small)
+
+    table.cell(zbTable, 0, 4, "方向内訳", text_color = color.white, bgcolor = _bc, text_size = size.small)
+    table.cell(zbTable, 1, 4, "LONG " + str.tostring(vLongCnt) + " / SHORT " + str.tostring(vShortCnt) +
+         "   |   TP/SL同時到達 " + str.tostring(vBothHit) + " 件 (SL優先で LOSS)",
+         text_color = color.white, bgcolor = _bc, text_size = size.small)
+
+    table.cell(zbTable, 0, 5, "Touch イベント", text_color = color.white, bgcolor = _bs, text_size = size.small)
+    table.cell(zbTable, 1, 5, "全 Zone の Touch 検出 " + str.tostring(zbTouchEvents) + " 件" +
+         "   |   Re-arm " + f_num(touchRearmDist, "#.#") + "$" +
+         "   |   登録簿 " + str.tostring(map.size(zbLastSeen)) + " trackId",
+         text_color = color.white, bgcolor = _bs, text_size = size.small)
+
+    table.cell(zbTable, 0, 6, "現在の候補", text_color = color.white, bgcolor = _bc, text_size = size.small)
+    table.cell(zbTable, 1, 6, cndDir == 0 ? "なし" :
+         (cndDir > 0 ? "LONG " : "SHORT ") + "Zone #" + str.tostring(cndId) +
+         "  |  limit " + f_num(cndPrice, "#.##") +
+         "  |  次は " + str.tostring(cndTouch + 1) + " 回目" +
+         "  |  zoneLevel " + zl.levelName(cndLevel) +
+         "  |  距離 " + f_num(cndDist, "#.##") + "$",
+         text_color = color.white, bgcolor = _bc, text_size = size.small)
+
+    table.cell(zbTable, 0, 7, "保有中", text_color = color.white, bgcolor = _bs, text_size = size.small)
+    table.cell(zbTable, 1, 7, not vOpen ? "フラット" :
+         (vDir > 0 ? "LONG " : "SHORT ") + "Zone #" + str.tostring(vZoneId) +
+         "  |  Entry " + f_num(vEntry, "#.##") +
+         "  |  SL " + f_num(vSl, "#.##") + " / TP " + f_num(vTp, "#.##") +
+         "  |  touchCnt " + str.tostring(vTouchNo) +
+         "  |  zoneLevel " + zl.levelName(vLevel) +
+         "  |  " + str.tostring(bar_index - vEntryBar) + " bars",
+         text_color = color.white, bgcolor = _bs, text_size = size.small)
+
+    table.cell(zbTable, 0, 8, "注意", text_color = color.white, bgcolor = _bc, text_size = size.small)
+    table.cell(zbTable, 1, 8, "Virtual が CSV 基準値。Strategy Tester はバー内経路の扱いが違うため TP/SL 同時到達時のみズレる。",
+         text_color = color.white, bgcolor = _bc, text_size = size.small)
