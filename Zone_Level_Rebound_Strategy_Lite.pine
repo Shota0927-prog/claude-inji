@@ -21,6 +21,15 @@
 //    ZoneEngine の Raw Strength / Raw Score は Entry条件・SL・TP に一切使わない。
 //    ラベルに出している Raw Score / BirthScore は表示・検証用のみ。
 //
+//  ■ Entry Mode (03 · Entry · Zone Rebound)
+//    RECOVERY_CLOSE … 従来ロジック。Zoneタッチ → Recovery確認 → 確定足closeで成行。
+//    EDGE_LIMIT     … タッチ前に Zone手前端 (Long = zone.top / Short = zone.bottom)
+//                     へ Limit注文を置き、その後 価格が実際に到達したら約定。
+//    ★ EDGE_LIMIT は疑似約定ではない。タッチを確認してから過去のZone端価格で
+//      約定したことにする処理は持たない (lookahead も使わない)。
+//    ★ RECOVERY_CLOSE のときの Entry / SL / TP / Qty は EDGE_LIMIT 追加前と
+//      完全に一致する。
+//
 //  ■ TP Mode
 //    BOTH / STRUCTURAL_ONLY / FALLBACK_ONLY … Structural TP を使う従来の3モード
 //    FIXED_RR   … Structural Zone を無視し TP = SL距離 × Fixed RR
@@ -299,6 +308,17 @@ minEntryLevelStr = input.string("Strong", "Minimum Entry Level",
      options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_ENT,
      tooltip = "ZoneLevelEngine の zoneLevel がこの Level 以上の Zone だけを\n" +
      "Entry対象にする。ZoneEngine の Raw Strength / Raw Score は使わない。")
+entryMode = input.string("RECOVERY_CLOSE", "Entry Mode",
+     options = ["RECOVERY_CLOSE", "EDGE_LIMIT"], group = G_ENT,
+     tooltip = "RECOVERY_CLOSE : 現行ロジック。Zoneタッチ → Recovery確認 →\n" +
+     "                 その確定足の close で成行Entry。\n" +
+     "EDGE_LIMIT     : タッチする前に Zone手前端へ Limit注文を置いておき、\n" +
+     "                 実際に価格がそこへ到達したら約定させる。\n" +
+     "                 Long = zone.top / Short = zone.bottom。\n" +
+     "★ EDGE_LIMIT は「タッチ後に Zone端で入ったことにする」疑似約定ではない。\n" +
+     "  必ずタッチ前の確定足で発注し、その後の価格到達で約定する。\n" +
+     "★ 下の Minimum Entry Level / Entry Level Timing / Rebound Recovery Ratio は\n" +
+     "  RECOVERY_CLOSE 専用。EDGE_LIMIT は Edge Limit 用の設定を使う。")
 entryLevelMode = input.string("PRE_TOUCH", "Entry Level Timing",
      options = ["PRE_TOUCH", "POST_TOUCH"], group = G_ENT,
      tooltip = "PRE_TOUCH  : 今回の反発足がZoneへ接触する直前の確定足時点Levelで判定。\n" +
@@ -314,6 +334,22 @@ reboundRecoveryRatio = input.float(1.00, "Rebound Recovery Ratio (Zone比率)",
      "                   0.00 = Zone下端 / 0.50 = 中央 / 1.00 = Zone上端\n" +
      "  Short (RESIST) : Recovery = zoneTop    - (zoneTop - zoneBottom) * ratio\n" +
      "                   0.00 = Zone上端 / 0.50 = 中央 / 1.00 = Zone下端")
+
+//  ---- EDGE_LIMIT 専用 (RECOVERY_CLOSE では一切参照されない) ----------------
+edgeLevelStr = input.string("Strong", "Edge Limit Level",
+     options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_ENT,
+     tooltip = "EDGE_LIMIT で注文を置く対象にする Zone Level。\n" +
+     "★ 判定に使うのは「注文を置く時点で分かっている現在の zoneLevel」だけ。\n" +
+     "  タッチ後の Level を先読みして使うことはしない。")
+edgeLevelMatch = input.string("MINIMUM", "Edge Limit Level Match",
+     options = ["EXACT", "MINIMUM"], group = G_ENT,
+     tooltip = "EXACT   : その Level ちょうどだけ (zoneLevel == 選択Level)。\n" +
+     "MINIMUM : その Level 以上 (zoneLevel >= 選択Level)。")
+edgeTouchMode = input.string("T1_ONLY", "Edge Limit Touch",
+     options = ["T1_ONLY", "ALL"], group = G_ENT,
+     tooltip = "T1_ONLY : 注文を置く時点で touchCount == 0 の Zone だけ\n" +
+     "          (= 次のタッチが T1 になる Zone)。\n" +
+     "ALL     : TouchCount に関係なく対象。")
 
 // ---- 3.2 SL ----------------------------------------------------------------
 var string G_SL = "03 · SL"
@@ -817,6 +853,7 @@ int minEntryLevel   = f_levelIdx(minEntryLevelStr)
 int minTpLevel      = f_levelIdx(minTpLevelStr)
 int minDisplayLevel = f_levelIdx(minDisplayLevelStr)
 int loggerLevel     = f_levelIdx(loggerLevelStr)
+int edgeLevel       = f_levelIdx(edgeLevelStr)
 
 // ============================================================================
 // 06. ENTRY / SL / TP HELPERS
@@ -932,27 +969,115 @@ f_qty(float slDist) =>
     float q   = qtyStep > 0 ? math.floor(raw / qtyStep) * qtyStep : raw
     math.round(q, 8)
 
+// ---- 6.4 Trade 構築 (SL / TP / RR / Qty) -----------------------------------
+//  ★ RECOVERY_CLOSE / EDGE_LIMIT の両方から呼ぶ共通処理 ★
+//    entryPx が基準価格 (RECOVERY_CLOSE = 確定足の close /
+//    EDGE_LIMIT = Limit注文価格 = Zone手前端)。
+//    ★ EDGE_LIMIT では「注文価格」と「SL / TP / RR / Qty の計算基準価格」が
+//      必ずこの同じ Limit価格になる。
+//    ★ 中身は従来 Section 7.2 - 7.5 の判定順序・条件をそのまま関数化しただけで、
+//      式は1つも変えていない (RECOVERY_CLOSE の結果は修正前と完全一致)。
+//  戻り値: [ok, sl, tp, rr, qty, slDist]
+f_buildTrade(int dir, float entryPx, float zTop, float zBot) =>
+    //  SL は Entry対象になった Zone 自身
+    float sl     = dir > 0 ? zBot - slBuffer : zTop + slBuffer
+    float slDist = math.abs(entryPx - sl)
+    bool  ok     = (dir > 0 ? sl < entryPx : sl > entryPx) and slDist > 0 and slDist <= maxSlDist
+    float tp = na
+    float rr = na
+    if ok and tpMode == "FIXED_RR"
+        //  Structural Zone を完全に無視 (TP Zone探索を行わない)
+        tp := dir > 0 ? entryPx + slDist * fixedRR : entryPx - slDist * fixedRR
+        rr := fixedRR
+    else if ok and tpMode == "FIXED_MOVE"
+        //  実際の Entry価格から固定ドル幅 (同じく TP Zone探索を行わない)
+        tp := dir > 0 ? entryPx + fixedMove : entryPx - fixedMove
+        rr := fixedMove / slDist
+    else if ok
+        float stTp = f_findStructuralTp(dir, entryPx, minTpLevel, tpDepthRatio, tpBuffer)
+        if not na(stTp)
+            rr := (dir > 0 ? stTp - entryPx : entryPx - stTp) / slDist
+            if tpMode == "FALLBACK_ONLY"
+                //  Structural TP が存在するシグナル自体を除外する
+                ok := false
+            else if rr < minRR
+                //  Structural TP があるのに Minimum RR 未満 → NoTrade
+                ok := false
+            else
+                tp := stTp
+        else
+            if tpMode == "STRUCTURAL_ONLY"
+                ok := false
+            else
+                tp := dir > 0 ? entryPx + slDist * fallbackRR : entryPx - slDist * fallbackRR
+                rr := fallbackRR
+    float qty = 0.0
+    if ok and not na(tp)
+        qty := f_qty(slDist)
+    bool fin = ok and not na(tp) and qty >= qtyMin and qty > 0
+    [fin, sl, tp, rr, qty, slDist]
+
+// ---- 6.5 EDGE_LIMIT の候補Zone探索 -----------------------------------------
+//  Long  : 現在価格より下にある SUPPORT のうち、zone.top が現在価格に最も近いもの
+//          (条件 : state == SUPPORT / close > zone.top = 上から接近している)
+//  Short : 現在価格より上にある RESIST のうち、zone.bottom が最も近いもの
+//          (条件 : state == RESIST / close < zone.bottom = 下から接近している)
+//  ★ Level は「今この時点で分かっている zoneLevel」だけを使う (タッチ前 Level)。
+//    POST_TOUCH Level を未来予測して使うことはしない。
+//  ★ T1_ONLY は「注文を置く時点で touchCount == 0」= 次のタッチが T1 になる Zone。
+//  ★ すでに Entry済みの trackId + touchCount は候補にしない (注文も置かない)。
+//  戻り値: スナップショット内の index (見つからなければ -1)
+f_findEdgeZone(int dir) =>
+    int   bestIdx  = -1
+    float bestEdge = na
+    int   n = zl.zoneCount(lvlEng)
+    if n > 0
+        for i = 0 to n - 1
+            zl.ZoneLevel z = zl.zoneAt(lvlEng, i)
+            if z.trackId >= 0
+                bool lvOk  = edgeLevelMatch == "EXACT" ? z.zoneLevel == edgeLevel : z.zoneLevel >= edgeLevel
+                bool tcOk  = edgeTouchMode == "ALL" or z.touchCount == 0
+                bool dupOk = not (gEnteredTouch.contains(z.trackId) and z.touchCount <= gEnteredTouch.get(z.trackId))
+                if lvOk and tcOk and dupOk
+                    if dir > 0
+                        if z.state == ST_SUPPORT and close > z.top and (na(bestEdge) or z.top > bestEdge)
+                            bestEdge := z.top
+                            bestIdx  := i
+                    else
+                        if z.state == ST_RESIST and close < z.bottom and (na(bestEdge) or z.bottom < bestEdge)
+                            bestEdge := z.bottom
+                            bestIdx  := i
+    bestIdx
+
 // ============================================================================
 // 07. ENTRY EXECUTION
 // ----------------------------------------------------------------------------
-//  ★ 重複Entry防止 ★
+//  ★ Entry Mode は2つ。同時には片方しか動かない ★
+//    7.1 RECOVERY_CLOSE : 従来どおり Zoneタッチ → Recovery確認 → 確定足closeで成行
+//    7.2 EDGE_LIMIT     : タッチ前に Zone手前端へ Limit注文を置き、価格到達で約定
+//    entryMode == "RECOVERY_CLOSE" のときの挙動は EDGE_LIMIT 追加前と完全一致する。
+//
+//  ★ 重複Entry防止 (両Mode共通) ★
 //    (1) 最大同時保有は Strategy全体で 1 ポジション。
-//        strategy.position_size == 0 のときだけ新規Entryを許可する。
+//        ポジションが無いときだけ新規Entry / 新規Limit注文を許可する。
 //    (2) 同じ Zone の同じ Touch で複数回入らない。
-//        Entry時に trackId → そのときの touchCount を map へ記録し、
-//        同じ trackId で touchCount が増えるまで再Entryを禁止する。
-//        新しい TouchCount になれば再度Entry可能。
+//        Entry時に trackId → そのときの touchCount を map へ記録する。
+//        ★ 記録する touchCount は Mode の評価タイミングに合わせる ★
+//          RECOVERY_CLOSE : タッチが反映された後の touchCount
+//                           (Entry判定がタッチ後の snapshot で行われるため)
+//          EDGE_LIMIT     : 注文を置いた時点の touchCount
+//                           (候補判定がタッチ前に行われるため)
+//        どちらも「1 Touch につき 1 Entry」になる。
 //    ★ 巨大なイベントEngineは作らない。map 1本と数個の var だけ。
-//      map が増えるのは「実際にEntryしたZone」の数だけなので軽い。
 // ============================================================================
 var map<int, int> gEnteredTouch = map.new<int, int>()   // trackId → 最後にEntryしたtouchCount
-var int    gSeq  = 0                                    // Entry ID 連番
+var int    gSeq  = 0                                    // Entry ID 連番 (RECOVERY_CLOSE用)
 var string gEid  = na                                   // 現在保有中の Entry ID
 var float  gTP   = na                                   // Entry時に確定したTP (最後まで維持)
 var bool   gBeOn = false                                // 建値移動 済みフラグ
 
-if barstate.isconfirmed and strategy.position_size == 0 and strategy.opentrades == 0
-    // ---- 7.1 Signal ------------------------------------------------------
+// ---- 7.1 RECOVERY_CLOSE (従来ロジック · 変更なし) ---------------------------
+if entryMode == "RECOVERY_CLOSE" and barstate.isconfirmed and strategy.position_size == 0 and strategy.opentrades == 0
     //  Long を先に見て、成立していなければ Short を見る
     //  (同一バーで両方成立することは通常起きないが、起きた場合は Long 優先)。
     int _dir = 0
@@ -970,68 +1095,13 @@ if barstate.isconfirmed and strategy.position_size == 0 and strategy.opentrades 
 
     if _dir != 0
         zl.ZoneLevel _z = zl.zoneAt(lvlEng, _idx)
-
-        // ---- 7.2 SL (Entry対象になった Zone 自身) -------------------------
-        float _entry  = close
-        float _sl     = _dir > 0 ? _z.bottom - slBuffer : _z.top + slBuffer
-        float _slDist = math.abs(_entry - _sl)
-        bool  _slSideOk = _dir > 0 ? _sl < _entry : _sl > _entry
-
-        // ---- 7.3 同一 trackId + touchCount の重複Entry防止 ----------------
+        //  同一 trackId + touchCount の重複Entry防止
         bool _dup = gEnteredTouch.contains(_z.trackId) and _z.touchCount <= gEnteredTouch.get(_z.trackId)
-
-        bool _ok = _slSideOk and _slDist > 0 and _slDist <= maxSlDist and not _dup
-
-        // ---- 7.4 TP (FIXED_RR / FIXED_MOVE は固定 · それ以外は Structural) --
-        float _tp = na
-        float _rr = na
-        if _ok and tpMode == "FIXED_RR"
-            //  ★ FIXED_RR : Structural Zone を完全に無視する ★
-            //    Zone の有無・距離・Level に関わらず TP = SL距離 × Fixed RR。
-            //    f_findStructuralTp() を呼ばないので TP探索用の Zoneループも
-            //    走らない (軽量性のため、これが FIXED_RR の要件)。
-            //    Minimum TP Level / TP Depth / TP Buffer / Minimum RR /
-            //    Fallback RR はどれも参照しない。
-            _tp := _dir > 0 ? _entry + _slDist * fixedRR : _entry - _slDist * fixedRR
-            _rr := fixedRR
-        else if _ok and tpMode == "FIXED_MOVE"
-            //  ★ FIXED_MOVE : 実際のEntry価格から固定ドル幅 ★
-            //    Structural Zone の有無・距離・Level を完全に無視する。
-            //    f_findStructuralTp() を呼ばないので TP探索用の Zoneループも
-            //    走らない。Minimum TP Level / TP Depth / TP Buffer /
-            //    Minimum RR / Fallback RR / Fixed RR はどれも参照しない。
-            //    RR は「結果として何倍になったか」の表示用に算出するだけで、
-            //    Entry可否の判定には使わない (Minimum RR は効かない)。
-            _tp := _dir > 0 ? _entry + fixedMove : _entry - fixedMove
-            _rr := fixedMove / _slDist
-        else if _ok
-            //  ↓ ここから下は従来の Structural TP 処理。FIXED_RR 追加でも
-            //    BOTH / STRUCTURAL_ONLY / FALLBACK_ONLY の挙動は変えていない。
-            float _stTp = f_findStructuralTp(_dir, _entry, minTpLevel, tpDepthRatio, tpBuffer)
-            if not na(_stTp)
-                _rr := (_dir > 0 ? _stTp - _entry : _entry - _stTp) / _slDist
-                if tpMode == "FALLBACK_ONLY"
-                    //  Structural TP が存在するシグナル自体を除外する
-                    //  (Structural TP を無視して RR TP へ差し替えるのではない)。
-                    _ok := false
-                else if _rr < minRR
-                    //  ★ Structural TP があるのに Minimum RR 未満 → NoTrade。
-                    //    Fallback TP へは逃げない。
-                    _ok := false
-                else
-                    _tp := _stTp
-            else
-                if tpMode == "STRUCTURAL_ONLY"
-                    _ok := false
-                else
-                    //  Structural TP が無い場合のみ SL距離 × Fallback RR で作る。
-                    _tp := _dir > 0 ? _entry + _slDist * fallbackRR : _entry - _slDist * fallbackRR
-                    _rr := fallbackRR
-
-        // ---- 7.5 Qty / 発注 ------------------------------------------------
-        if _ok and not na(_tp)
-            float _qty = f_qty(_slDist)
-            if _qty >= qtyMin and _qty > 0
+        if not _dup
+            //  SL / TP / RR / Qty (基準価格は確定足の close)
+            float _entry = close
+            [_ok, _sl, _tp, _rr, _qty, _slDist] = f_buildTrade(_dir, _entry, _z.top, _z.bottom)
+            if _ok
                 gSeq := gSeq + 1
                 string _eid = LOGIC_ZONE_RB + (_dir > 0 ? "_L_" : "_S_") + str.tostring(gSeq)
                 strategy.entry(_eid, _dir > 0 ? strategy.long : strategy.short, qty = _qty)
@@ -1075,6 +1145,178 @@ if barstate.isconfirmed and strategy.position_size == 0 and strategy.opentrades 
                          color     = _dir > 0 ? color.new(color.teal, 20) : color.new(color.maroon, 20),
                          textcolor = color.white,
                          size      = size.small)
+
+// ---- 7.2 EDGE_LIMIT (Zone手前端への事前Limit注文) ---------------------------
+//  ★ 疑似約定にしないための作り ★
+//    ・注文はタッチ前の確定足で strategy.entry(..., limit = Zone手前端) として出す。
+//    ・約定するのは、その後のバーで実際に価格がその指値へ到達したときだけ。
+//    ・「タッチを確認してから過去の Zone端価格で約定したことにする」処理は無い。
+//    ・lookahead / request.security_lower_tf / SignalEngine は使わない。
+//
+//  ★ 注文IDは Long / Short それぞれ固定 ★
+//    同じIDで strategy.entry を出し直すと未約定Limitの価格 / Qty が更新される。
+//    候補が消えた場合は strategy.cancel() で取り消す (古い指値を残さない)。
+//
+//  ★ Long / Short の両方に候補があれば両方置く ★
+//    ただし OCA (oca_type = strategy.oca.cancel) で結び、片方が約定したら
+//    もう片方は自動でキャンセルされる (同一バー内の両建て事故を防ぐ)。
+//
+//  ★ SL / TP は発注と同時に strategy.exit で予約する ★
+//    from_entry の指値が約定するまで待機し、約定した瞬間から有効になる。
+//    → 約定バーの途中で SL / TP に届いた場合もその足で処理される。
+string EDGE_ID_L = LOGIC_ZONE_RB + "_L"
+string EDGE_ID_S = LOGIC_ZONE_RB + "_S"
+//  未約定Limitの控え (約定を検知したときに Entry済み記録 / BE用TPへ使う)
+var bool   gPendLOn  = false
+var int    gPendLTid = -1
+var int    gPendLTc  = -1
+var float  gPendLTp  = na
+var float  gPendLSl  = na
+var string gPendLTxt = ""
+var bool   gPendSOn  = false
+var int    gPendSTid = -1
+var int    gPendSTc  = -1
+var float  gPendSTp  = na
+var float  gPendSSl  = na
+var string gPendSTxt = ""
+//  約定検知用 (opentrades + closedtrades が増えた = どれかの注文が約定した)
+var int    gLastTradeCnt = 0
+
+if entryMode == "EDGE_LIMIT" and barstate.isconfirmed
+    // ---- 7.2a 約定検知 → Entry済み記録 / ラベル ---------------------------
+    //  ★ 注文を置いただけでは Entry済みにしない。未約定キャンセルも記録しない。
+    //    実際に約定した Zone の trackId + touchCount だけを記録する。
+    int _tradeCnt = strategy.opentrades + strategy.closedtrades
+    if _tradeCnt > gLastTradeCnt
+        //  約定した向き (まだ保有中ならそれ、同じ足で決済済みなら最後のClosed)
+        bool _fLong = strategy.opentrades > 0 ? strategy.opentrades.size(0) > 0 :
+             strategy.closedtrades.size(strategy.closedtrades - 1) > 0
+        if _fLong and gPendLOn
+            gEnteredTouch.put(gPendLTid, gPendLTc)
+            gEid  := EDGE_ID_L
+            gTP   := gPendLTp
+            gBeOn := false
+            //  ★ 保険 : 発注と同時に予約した SL / TP をここでも出し直す ★
+            //    同じIDなので上書きされるだけ。約定が確定したこの時点で
+            //    必ず SL / TP が有効になっていることを保証する。
+            if strategy.opentrades > 0
+                strategy.exit(EDGE_ID_L + "X", from_entry = EDGE_ID_L,
+                     stop = gPendLSl, limit = gPendLTp,
+                     comment_loss = "SL", comment_profit = "TP")
+            if showEntryLabel and gPendLTxt != ""
+                label.new(bar_index, low, text = gPendLTxt, style = label.style_label_up,
+                     color = color.new(color.teal, 20), textcolor = color.white, size = size.small)
+        else if not _fLong and gPendSOn
+            gEnteredTouch.put(gPendSTid, gPendSTc)
+            gEid  := EDGE_ID_S
+            gTP   := gPendSTp
+            gBeOn := false
+            //  ★ 保険 (Long側と同じ。同じIDなので上書きされるだけ)
+            if strategy.opentrades > 0
+                strategy.exit(EDGE_ID_S + "X", from_entry = EDGE_ID_S,
+                     stop = gPendSSl, limit = gPendSTp,
+                     comment_loss = "SL", comment_profit = "TP")
+            if showEntryLabel and gPendSTxt != ""
+                label.new(bar_index, high, text = gPendSTxt, style = label.style_label_down,
+                     color = color.new(color.maroon, 20), textcolor = color.white, size = size.small)
+        //  約定した側の控えは用済み。反対側は OCA で取り消されている。
+        gPendLOn := false
+        gPendSOn := false
+    gLastTradeCnt := _tradeCnt
+
+    // ---- 7.2b 未約定Limitの再評価 (毎確定足) ------------------------------
+    bool _flat = strategy.position_size == 0 and strategy.opentrades == 0
+    if not _flat
+        //  保有中は新規Limitを置かない。残っている未約定Limitは取り消す。
+        if gPendLOn
+            strategy.cancel(EDGE_ID_L)
+            strategy.cancel(EDGE_ID_L + "X")
+            gPendLOn := false
+        if gPendSOn
+            strategy.cancel(EDGE_ID_S)
+            strategy.cancel(EDGE_ID_S + "X")
+            gPendSOn := false
+    else
+        //  ---- Long 側 ----
+        //  候補Zoneが消えた / Level・State・Touch条件から外れた / 別Zoneの方が
+        //  近くなった場合は、下の f_findEdgeZone() の結果が変わるだけで済む。
+        //  同じIDで出し直せば未約定Limitは新しい価格へ更新され、候補が無ければ
+        //  取り消される。
+        bool _lPlaced = false
+        if enableLong
+            int _eiL = f_findEdgeZone(1)
+            if _eiL >= 0
+                zl.ZoneLevel _ezL = zl.zoneAt(lvlEng, _eiL)
+                float _limL = _ezL.top
+                [_okL, _slL, _tpL, _rrL, _qtyL, _sdL] = f_buildTrade(1, _limL, _ezL.top, _ezL.bottom)
+                if _okL
+                    strategy.entry(EDGE_ID_L, strategy.long, qty = _qtyL, limit = _limL,
+                         oca_name = "ZRB_EDGE", oca_type = strategy.oca.cancel)
+                    strategy.exit(EDGE_ID_L + "X", from_entry = EDGE_ID_L, stop = _slL, limit = _tpL,
+                         comment_loss = "SL", comment_profit = "TP")
+                    gPendLOn  := true
+                    gPendLTid := _ezL.trackId
+                    gPendLTc  := _ezL.touchCount
+                    gPendLTp  := _tpL
+                    gPendLSl  := _slL
+                    _lPlaced  := true
+                    if showEntryLabel
+                        //  ラベル文面は発注時に作り、実際に約定したときだけ表示する。
+                        string _tl = "LONG (EDGE LIMIT)"
+                        _tl := _tl + "\nEntry      " + f_num(_limL, "#.##")
+                        _tl := _tl + "\nSL         " + f_num(_slL, "#.##") + "  (" + f_num(_sdL, "#.##") + ")"
+                        _tl := _tl + "\nTP         " + f_num(_tpL, "#.##")
+                        _tl := _tl + "\nRR         " + f_num(_rrL, "#.##")
+                        _tl := _tl + "\nTP Mode    " + tpMode
+                        _tl := _tl + "\nLevel      " + _ezL.zoneLevelName + " (発注時)"
+                        _tl := _tl + "\nTouch      " + str.tostring(_ezL.touchCount) + " (発注時)"
+                        _tl := _tl + "\nBirth      " + f_num(_ezL.birthScore, "#.#") + "  (参考)"
+                        _tl := _tl + "\nRaw        " + f_num(_ezL.rawScore, "#.#") +
+                             " / " + zn.strengthName(_ezL.rawStrength) + "  (参考)"
+                        _tl := _tl + "\nID         " + str.tostring(_ezL.trackId)
+                        gPendLTxt := _tl
+        if not _lPlaced and gPendLOn
+            strategy.cancel(EDGE_ID_L)
+            strategy.cancel(EDGE_ID_L + "X")
+            gPendLOn := false
+
+        //  ---- Short 側 (完全対称) ----
+        bool _sPlaced = false
+        if enableShort
+            int _eiS = f_findEdgeZone(-1)
+            if _eiS >= 0
+                zl.ZoneLevel _ezS = zl.zoneAt(lvlEng, _eiS)
+                float _limS = _ezS.bottom
+                [_okS, _slS, _tpS, _rrS, _qtyS, _sdS] = f_buildTrade(-1, _limS, _ezS.top, _ezS.bottom)
+                if _okS
+                    strategy.entry(EDGE_ID_S, strategy.short, qty = _qtyS, limit = _limS,
+                         oca_name = "ZRB_EDGE", oca_type = strategy.oca.cancel)
+                    strategy.exit(EDGE_ID_S + "X", from_entry = EDGE_ID_S, stop = _slS, limit = _tpS,
+                         comment_loss = "SL", comment_profit = "TP")
+                    gPendSOn  := true
+                    gPendSTid := _ezS.trackId
+                    gPendSTc  := _ezS.touchCount
+                    gPendSTp  := _tpS
+                    gPendSSl  := _slS
+                    _sPlaced  := true
+                    if showEntryLabel
+                        string _ts = "SHORT (EDGE LIMIT)"
+                        _ts := _ts + "\nEntry      " + f_num(_limS, "#.##")
+                        _ts := _ts + "\nSL         " + f_num(_slS, "#.##") + "  (" + f_num(_sdS, "#.##") + ")"
+                        _ts := _ts + "\nTP         " + f_num(_tpS, "#.##")
+                        _ts := _ts + "\nRR         " + f_num(_rrS, "#.##")
+                        _ts := _ts + "\nTP Mode    " + tpMode
+                        _ts := _ts + "\nLevel      " + _ezS.zoneLevelName + " (発注時)"
+                        _ts := _ts + "\nTouch      " + str.tostring(_ezS.touchCount) + " (発注時)"
+                        _ts := _ts + "\nBirth      " + f_num(_ezS.birthScore, "#.#") + "  (参考)"
+                        _ts := _ts + "\nRaw        " + f_num(_ezS.rawScore, "#.#") +
+                             " / " + zn.strengthName(_ezS.rawStrength) + "  (参考)"
+                        _ts := _ts + "\nID         " + str.tostring(_ezS.trackId)
+                        gPendSTxt := _ts
+        if not _sPlaced and gPendSOn
+            strategy.cancel(EDGE_ID_S)
+            strategy.cancel(EDGE_ID_S + "X")
+            gPendSOn := false
 
 // ============================================================================
 // 08. BREAK EVEN
