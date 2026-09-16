@@ -790,29 +790,43 @@ if isGold and barstate.islast
                                 array.push(gLevelLabels, _l)
 
 // ============================================================================
-// 07. TOUCH REGISTRY  (Zone Validation Logger の Touch 判定を逐語移植)
+// 07. TOUCH REGISTRY + CSV VIRTUAL BACKTEST
 // ----------------------------------------------------------------------------
-//  ★★★ ここは CSV を出力した Zone Validation Logger の
-//    「10.6.1 Zone全件走査: 登録簿更新 + Touch検出」と同じ条件式・同じ順序 ★★★
+//  ★★★ ここが CSV 再現の本体 ★★★
+//    このセクションは strategy.entry / strategy.exit を一切使わない。
+//    strategy.position_size / strategy.position_avg_price も参照しない。
+//    正式な Touch Event だけで Entry / Exit を組み立てるので、
+//    Broker Emulator の約定挙動 (ギャップ / バー内経路 / 注文の置き方) から
+//    完全に独立している。
+//      → CSV の 87 trades / 57 WIN / 30 LOSS を突き合わせるのはこちら。
+//    実際に発注する Executable Strategy は Section 08 に分けてある。
 //
-//  ★ なぜ ZoneLevelEngine の touchCount を使わないのか ★
+//  ★ Touch 判定は Zone Validation Logger の「10.6.1」を逐語移植 ★
 //    CSV の EV_touchCnt は ZoneLevelEngine の touchCount ではなく、
-//    Logger 独自の vzTouchCnt (このセクションの zbTouchCnt) の値。
+//    Logger 独自の vzTouchCnt (ここの zbTouchCnt) の値。
 //    両者は別実装なので値がズレることがあり、そのズレを測るために
 //    Logger には EV_levelSync という列がある。
 //    CSV の集計 (400 / 123 / 87 / 55 trades) は EV_touchCnt 基準なので、
-//    Strategy 側も同じカウンタを再現しないと本数が合わない。
-//    → zoneLevel も Debug で併記して、両者の対応を確認できるようにする。
+//    ここも同じカウンタを再現しないと本数が合わない。
+//
+//  ★ 接近方向は条件にしない ★
+//    Logger の direction は「価格がどちら側から来たか」ではなく
+//      SUPPORT → Long / RESIST → Short / ACTIVE → 直前方向 (lastDir)
+//    だけで決まる。特に ACTIVE 継承により
+//      「価格が Zone より下にあるのに LONG Touch」
+//      「価格が Zone より上にあるのに SHORT Touch」
+//    が CSV には実在する。close > top のような接近方向条件を入れると
+//    それらのイベントを落としてしまうので、ここでは絶対に使わない。
 //
 //  ★ 観測専用 ★
 //    zoneEng / zoneCfg / zoneFeed / lvlEng へは一切書き戻さない。
-//    使うのは zn.zoneCount() / zn.zoneAt() (どちらも参照系) だけ。
+//    使うのは zn.zoneCount() / zn.zoneAt() / zl.zoneByTrackId() だけ (全て参照系)。
 //    → Zone の生成 / Cluster / Break / Flip / Lifetime / Score / Strength /
 //      Source / trackId は、この Strategy を載せても 1 つも変わらない。
 //
-//  ★ ポジションを持っていても Touch 判定は止めない ★
-//    保有中でも touchCnt / armed / lastDir は通常どおり更新し続ける。
-//    新規エントリーを見送るのは Section 08 の Strategy 側だけ。
+//  ★ 保有中も Touch Registry は止めない ★
+//    Virtual Position を持っている間も touchCnt / armed / lastDir は
+//    通常どおり更新する。止めるのは「新しい Virtual Entry を作ること」だけ。
 // ============================================================================
 var string G_TOUCH = "20 · Touch 判定 (CSV再現用)"
 touchRearmDist = input.float(10.0, "Touch Re-arm Distance ($)", minval = 0.0, step = 0.5,
@@ -822,10 +836,44 @@ touchRearmDist = input.float(10.0, "Touch Re-arm Distance ($)", minval = 0.0, st
      "ここを変えると Touch 回数が変わり、CSV と本数が合わなくなる。")
 
 maxTrackedZones = input.int(400, "Max Tracked Zones", minval = 50, maxval = 2000, group = G_TOUCH,
-     tooltip = "登録簿の上限。超えたら古い trackId から間引く (Logger と同じ)。")
-trackStaleBars  = input.int(500, "Track Stale Bars", minval = 50, maxval = 5000, group = G_TOUCH,
-     tooltip = "この本数見かけなかった trackId を間引き対象にする (Logger と同じ)。")
+     tooltip = "Touch 登録簿の上限。超えたら古い trackId から間引く (Logger と同じ)。")
 
+//  ★ 変数名は ZoneEngine Inputs の trackStaleBars と必ず分けること ★
+//    trackStaleBars は zoneCfg.trackStaleBars へ渡す ZoneEngine 側の設定。
+//    こちらは Touch 登録簿の間引き専用で、用途がまったく別。
+//    同名にすると Pine が二重宣言エラーを出す。
+touchTrackStaleBars = input.int(500, "Touch Registry · Stale Bars", minval = 50, maxval = 5000,
+     group = G_TOUCH,
+     tooltip = "Touch 登録簿で、この本数見かけなかった trackId を間引き対象にする。\n" +
+     "ZoneEngine の Zone State Retention (trackStaleBars) とは別物。")
+
+var string G_CSV = "21 · CSV Virtual Backtest"
+
+//  ---- Entry Mode (タッチ回数フィルター) ----
+//    CSV を SL15 / TP20 で検証した結果 (時系列再計算):
+//      ALL        400 trades / 191 WIN / 209 LOSS / 勝率 47.75% / PF 1.22
+//      FIRST_3    123 trades /  74 WIN /  49 LOSS / 勝率 60.16% / PF 2.01
+//      FIRST_2     87 trades /  57 WIN /  30 LOSS / 勝率 65.52% / PF 2.53
+//      FIRST_ONLY  55 trades /  39 WIN /  16 LOSS / 勝率 70.91% / PF 3.25
+entryMode = input.string("FIRST_2", "Entry Mode",
+     options = ["ALL", "FIRST_3", "FIRST_2", "FIRST_ONLY"], group = G_CSV,
+     tooltip = "Touch が成立した後の touchCnt で絞る。\n" +
+     "ALL / FIRST_3 (<=3) / FIRST_2 (<=2, 既定) / FIRST_ONLY (==1)\n" +
+     "★ CSV 全 564 イベントでは zoneLevel >= 2 と touchCnt <= 2 が完全一致していた。")
+
+slDollar = input.float(15.0, "SL ($)", minval = 0.1, step = 0.5, group = G_CSV,
+     tooltip = "XAUUSD 価格そのものの値幅。tick 数や % ではない。")
+tpDollar = input.float(20.0, "TP ($)", minval = 0.1, step = 0.5, group = G_CSV,
+     tooltip = "XAUUSD 価格そのものの値幅。tick 数や % ではない。")
+
+allowLong  = input.bool(true, "Long (SUPPORT Zone) 有効", group = G_CSV)
+allowShort = input.bool(true, "Short (RESIST Zone) 有効", group = G_CSV)
+
+var string G_DBG = "23 · Debug"
+debugMode = input.bool(false, "Debug Mode (CSV Virtual のラベル表示)", group = G_DBG,
+     tooltip = "CSV Virtual の Entry / Exit ラベルを描く。トレードが多いと重いので既定 OFF。")
+
+// ---- 7.0 登録簿 / Virtual 状態 ---------------------------------------------
 //  trackId ごとの登録簿 (Logger の vz* と 1:1 対応)
 var map<int, int> zbBornBar  = map.new<int, int>()   // vzBornBar
 var map<int, int> zbLastSeen = map.new<int, int>()   // vzLastSeen
@@ -833,14 +881,46 @@ var map<int, int> zbTouchCnt = map.new<int, int>()   // vzTouchCnt  ← CSV の 
 var map<int, int> zbArmed    = map.new<int, int>()   // vzArmed
 var map<int, int> zbLastDir  = map.new<int, int>()   // vzLastDir
 
-//  このバーで Touch が成立した Zone (Debug / 集計用。Entry 判定には使わない)
+//  全 Zone の Touch 検出件数 (CSV のイベント総数 564 と突き合わせる用)
 var int zbTouchEvents = 0
+//  Entry Mode を通った Touch 件数 (保有中で見送った分も含む)
+var int zbModeOkEvents = 0
+//  保有中だったため Entry にならなかった Touch 件数
+var int zbSkipHolding = 0
+
+//  ---- CSV Virtual Position ----
+var bool  vOpen     = false
+var int   vDir      = 0
+var float vEntry    = na      // = _z.top (Long) / _z.bottom (Short) = EV_refPrice
+var float vSl       = na
+var float vTp       = na
+var int   vEntryBar = 0
+var int   vEntryMs  = 0
+var int   vZoneId   = -1
+var int   vTouchNo  = 0
+var int   vLevel    = 0
+var float vScore    = na
+var int   vStr      = 0
+var float vTop      = na
+var float vBot      = na
+
+var int   vTrades    = 0
+var int   vWin       = 0
+var int   vLoss      = 0
+var float vGrossWin  = 0.0
+var float vGrossLoss = 0.0
+var int   vLongCnt   = 0
+var int   vShortCnt  = 0
+var int   vBothHit   = 0      // 同一足で TP / SL 同時到達 (SL 優先で LOSS にした件数)
 
 f_zbTouchCnt(int tid) =>
     tid >= 0 and map.contains(zbTouchCnt, tid) ? map.get(zbTouchCnt, tid) : 0
 
 f_zbArmed(int tid) =>
     tid >= 0 and map.contains(zbArmed, tid) ? map.get(zbArmed, tid) : 0
+
+f_zbLastDir(int tid) =>
+    tid >= 0 and map.contains(zbLastDir, tid) ? map.get(zbLastDir, tid) : 0
 
 //  ★ Touch 時の direction 判定 (Logger と同じ 4 分岐) ★
 //      ① ST_SUPPORT → 1
@@ -850,7 +930,55 @@ f_zbArmed(int tid) =>
 f_zbDir(int st, int lastDir) =>
     st == ST_SUPPORT ? 1 : st == ST_RESIST ? -1 : st == ST_ACTIVE ? lastDir : 0
 
+//  ★ Touch が成立した「後」の touchCnt で判定する ★
+f_entryModeOk(int touchNo) =>
+    entryMode == "ALL"         ? true :
+     entryMode == "FIRST_3"    ? touchNo <= 3 :
+     entryMode == "FIRST_2"    ? touchNo <= 2 :
+     entryMode == "FIRST_ONLY" ? touchNo == 1 : false
+
 if barstate.isconfirmed
+    // ---- 7.1 CSV Virtual の決済判定 (SL 優先) ------------------------------
+    //    ★ Touch 足自身では判定しない ★
+    //      bar_index > vEntryBar のバーから始める。CSV と同じ位相。
+    //    ★ 同一足で TP / SL 両方に到達したら必ず SL 優先 = LOSS ★
+    //      Long  : low  <= SL なら (high >= TP でも) LOSS
+    //      Short : high >= SL なら (low  <= TP でも) LOSS
+    if vOpen and bar_index > vEntryBar
+        bool _hitSl = vDir > 0 ? low  <= vSl : high >= vSl
+        bool _hitTp = vDir > 0 ? high >= vTp : low  <= vTp
+        if _hitSl or _hitTp
+            if _hitSl and _hitTp
+                vBothHit := vBothHit + 1
+            bool  _isWin = not _hitSl
+            float _exit  = _hitSl ? vSl : vTp
+            float _pnl   = vDir > 0 ? _exit - vEntry : vEntry - _exit
+            vTrades := vTrades + 1
+            if _isWin
+                vWin      := vWin + 1
+                vGrossWin := vGrossWin + math.abs(_pnl)
+            else
+                vLoss      := vLoss + 1
+                vGrossLoss := vGrossLoss + math.abs(_pnl)
+            if debugMode
+                label.new(
+                     x         = bar_index,
+                     y         = vDir > 0 ? high : low,
+                     text      = (_isWin ? "WIN" : "LOSS") +
+                          (_hitSl and _hitTp ? "  (TP/SL同時→SL優先)" : "") +
+                          "\nEntry " + f_num(vEntry, "#.##") +
+                          "\nExit  " + f_num(_exit, "#.##") +
+                          "\nSL " + f_num(vSl, "#.##") + " / TP " + f_num(vTp, "#.##") +
+                          "\n保有 " + str.tostring(bar_index - vEntryBar) + " bars",
+                     xloc      = xloc.bar_index,
+                     style     = vDir > 0 ? label.style_label_down : label.style_label_up,
+                     color     = color.new(_isWin ? color.teal : color.maroon, 15),
+                     textcolor = color.white,
+                     size      = size.small)
+            vOpen := false
+
+    // ---- 7.2 Zone 全件走査: 登録簿更新 + Touch 検出 + Virtual Entry ---------
+    //    ★ 条件式・順序は Zone Validation Logger の 10.6.1 と同じ ★
     int _zc = zn.zoneCount(zoneEng)
     if _zc > 0
         for _i = 0 to _zc - 1
@@ -881,11 +1009,70 @@ if barstate.isconfirmed
 
                 if _inZone
                     if _armed == 1 and _dir != 0
-                        //  方向が確定できた接触は ACTIVE でも正式な Touch として扱い、
-                        //  ここで armed を落とす (同じ接近での二重計上を防ぐ)
+                        //  ★ 正式な Touch 成立 ★
+                        //    方向が確定できた接触は ACTIVE でも正式な Touch として扱い、
+                        //    ここで armed を落とす (同じ接近での二重計上を防ぐ)。
+                        //    ★ Virtual Position を持っていても必ず実行する ★
                         map.put(zbArmed, _id, 0)
-                        map.put(zbTouchCnt, _id, map.get(zbTouchCnt, _id) + 1)
+                        int _touchNo = map.get(zbTouchCnt, _id) + 1
+                        map.put(zbTouchCnt, _id, _touchNo)
                         zbTouchEvents := zbTouchEvents + 1
+
+                        //  ---- Touch Event の内容 ----
+                        //    CSV の 1 行に相当する。EV_refPrice の定義と同じく
+                        //    Long は Zone Top / Short は Zone Bottom。
+                        float _ref = _dir > 0 ? _z.top : _z.bottom
+                        bool  _dirOk = (_dir > 0 and allowLong) or (_dir < 0 and allowShort)
+                        bool  _modeOk = f_entryModeOk(_touchNo)
+                        if _modeOk and _dirOk
+                            zbModeOkEvents := zbModeOkEvents + 1
+                            if vOpen
+                                //  保有中の Touch では新しい Entry を作らない。
+                                //  登録簿 (touchCnt / armed / lastDir) は上で更新済み。
+                                zbSkipHolding := zbSkipHolding + 1
+                            else
+                                //  ---- CSV Virtual Entry ----
+                                //    entryPrice は必ず Zone の端。
+                                //    strategy.position_avg_price は使わない。
+                                zl.ZoneLevel _zl = zl.zoneByTrackId(lvlEng, _id)
+                                vOpen     := true
+                                vDir      := _dir
+                                vEntry    := _ref
+                                vSl       := _dir > 0 ? _ref - slDollar : _ref + slDollar
+                                vTp       := _dir > 0 ? _ref + tpDollar : _ref - tpDollar
+                                vEntryBar := bar_index
+                                vEntryMs  := time
+                                vZoneId   := _id
+                                vTouchNo  := _touchNo
+                                vLevel    := _zl.trackId >= 0 ? _zl.zoneLevel : 0
+                                vScore    := _z.score
+                                vStr      := _z.strength
+                                vTop      := _z.top
+                                vBot      := _z.bottom
+                                if _dir > 0
+                                    vLongCnt := vLongCnt + 1
+                                else
+                                    vShortCnt := vShortCnt + 1
+                                if debugMode
+                                    label.new(
+                                         x         = bar_index,
+                                         y         = _dir > 0 ? low : high,
+                                         text      = (_dir > 0 ? "LONG" : "SHORT") +
+                                              "  Zone #" + str.tostring(_id) +
+                                              "\nEntry " + f_num(_ref, "#.##") + "  (EV_refPrice)" +
+                                              "\ntouchCnt " + str.tostring(_touchNo) +
+                                              " / zoneLevel " + zl.levelName(vLevel) +
+                                              " (" + str.tostring(vLevel) + ")" +
+                                              "\nScore " + f_num(_z.score, "#.##") +
+                                              " / Strength " + zn.strengthName(_z.strength) +
+                                              "\nTop " + f_num(_z.top, "#.##") +
+                                              " / Bottom " + f_num(_z.bottom, "#.##") +
+                                              "\n" + str.format_time(time, "yyyy-MM-dd HH:mm", "UTC") + " UTC",
+                                         xloc      = xloc.bar_index,
+                                         style     = _dir > 0 ? label.style_label_up : label.style_label_down,
+                                         color     = color.new(_dir > 0 ? color.blue : color.red, 20),
+                                         textcolor = color.white,
+                                         size      = size.small)
                     //  方向不明 ACTIVE への接触は armed を落とさない
                     //  (同じ接近中に SUPPORT / RESIST へ確定したら拾えるように)
                 else
@@ -894,13 +1081,13 @@ if barstate.isconfirmed
                     if _dist >= touchRearmDist
                         map.put(zbArmed, _id, 1)
 
-    //  登録簿の間引き (上限超過時のみ / 古い trackId から)
+    // ---- 7.3 登録簿の間引き (上限超過時のみ / 古い trackId から) ------------
     if map.size(zbLastSeen) > maxTrackedZones
         array<int> _ks = map.keys(zbLastSeen)
         if array.size(_ks) > 0
             for _ki = 0 to array.size(_ks) - 1
                 int _k = array.get(_ks, _ki)
-                if bar_index - map.get(zbLastSeen, _k) > trackStaleBars
+                if bar_index - map.get(zbLastSeen, _k) > touchTrackStaleBars
                     map.remove(zbLastSeen, _k)
                     map.remove(zbBornBar,  _k)
                     map.remove(zbTouchCnt, _k)
@@ -908,101 +1095,54 @@ if barstate.isconfirmed
                     map.remove(zbLastDir,  _k)
 
 // ============================================================================
-// 08. ZONE BOUNCE STRATEGY
+// 08. EXECUTABLE STRATEGY  (実際に発注する側 / CSV Virtual とは別物)
 // ----------------------------------------------------------------------------
-//  ★ エントリー基準価格 ★
-//    Long  (Support Zone へ上から到達) : zoneTop    = CSV の EV_refPrice
-//    Short (Resist  Zone へ下から到達) : zoneBottom = CSV の EV_refPrice
+//  ★ Section 07 の CSV Virtual とは完全に独立した層 ★
+//    CSV Virtual は注文を置かず Touch Event だけで組み立てる。
+//    こちらは Broker Emulator に実際の注文を出す。
+//    前バーの終値時点で待機注文を置く必要があるため、両者は完全一致しない。
+//    それは仕様であって不具合ではない。
+//      CSV の 87 trades / 57 WIN / 30 LOSS を突き合わせるのは CSV Virtual。
+//      Strategy Tester の結果ではない。
 //
-//  ★ なぜ成行ではなく limit なのか ★
-//    Touch は「その5分足のレンジが Zone と重なった」時点で成立するが、
-//    価格が zoneTop に触れたのはバーの途中。終値で成行を出すと
-//    CSV の EV_refPrice と約定価格がズレる。
-//    そこで 1 本前の確定足の終値時点で limit を置いておき、
-//    次の足で価格が届いた瞬間に zoneTop / zoneBottom で約定させる。
-//
-//  ★ Touch 条件との同値性 ★
-//    Support Zone に上から近づく場合、Logger の Touch 条件
-//      low <= top  and  high >= bottom
-//    のうち high >= bottom は自明に成立するので、実質 low <= top。
-//    zoneTop の buy limit が約定する条件と完全に一致する。
-//    Resist Zone も同様に high >= bottom ⟺ zoneBottom の sell limit 約定。
-//    → 約定したバー = Logger が Touch を検出するバー。
-//
-//  ★ Zone は毎足作り直されるので limit も毎足置き直す ★
-//    同じ Entry ID で strategy.entry を呼ぶと待機注文が置き換わる。
-//    Zone が消えた / 条件を満たさなくなったら strategy.cancel で取り消す。
+//  ★ 注文種別を価格の位置で切り替える ★
+//    Logger の Touch は「Zone のレンジに触れたこと」なので、Zone の端へは
+//    上からも下からも到達しうる。片側だけ limit を置くと片方向を取り逃がす。
+//      Long  / refPrice = zoneTop
+//          現在価格 > zoneTop → Buy Limit  (上から下りてきて Zone Top に触れる)
+//          現在価格 < zoneTop → Buy Stop   (下から上がってきて Zone Top に触れる)
+//      Short / refPrice = zoneBottom
+//          現在価格 < zoneBottom → Sell Limit (下から上がってきて Bottom に触れる)
+//          現在価格 > zoneBottom → Sell Stop  (上から下りてきて Bottom に触れる)
+//    ★ 接近方向を条件にはしない ★
+//      どちら側にいても候補にする。方向は Section 07 と同じ
+//      SUPPORT / RESIST / ACTIVE 継承だけで決める。
 //
 //  ★ 待機注文は常に 1 本だけ ★
-//    Long / Short 両方を同時に置くと、大きな1本の足で両方約定して
-//    ドテンする危険がある。終値から最も近い候補 1 本だけを置く。
-//    (価格が先に到達するのは最も近い水準なので、時系列的にも自然)
+//    Long / Short を同時に置くと、大きな 1 本の足で両方約定してドテンする。
+//    refPrice が現在の終値に最も近い候補 1 本だけを置く。
 //
 //  ★ 未来情報は一切使わない ★
-//    判定に使うのは「1本前までに確定した Zone 情報」と「現在の終値」だけ。
+//    判定に使うのは「確定した Zone 情報」と「現在の終値」だけ。
 //    MFE / maxPenetration / hit10 / hit20 / hit30 / barsTo* / broken /
 //    reclaimed / trackingLost のような Touch 後に確定する値は使わない。
-//    request.security の lookahead も Zone Engine 既存分以外は追加していない。
 // ============================================================================
-var string G_STRAT = "21 · Zone Bounce Strategy"
+var string G_EXEC = "22 · Executable Strategy (実発注)"
+enableStrategy = input.bool(true, "Enable Executable Strategy", group = G_EXEC,
+     tooltip = "OFF にすると発注しない。CSV Virtual の集計は OFF でも動く。")
 
-enableStrategy = input.bool(true, "Enable Strategy", group = G_STRAT)
-
-//  ---- Entry Mode (タッチ回数フィルター) ----
-//    CSV を SL15 / TP20 で検証した結果:
-//      ALL        400 trades / 191 WIN / 209 LOSS / 勝率 47.75% / PF 1.22
-//      FIRST_3    123 trades /  74 WIN /  49 LOSS / 勝率 60.16% / PF 2.01
-//      FIRST_2     87 trades /  57 WIN /  30 LOSS / 勝率 65.52% / PF 2.53
-//      FIRST_ONLY  55 trades /  39 WIN /  16 LOSS / 勝率 70.91% / PF 3.25
-entryMode = input.string("FIRST_2", "Entry Mode",
-     options = ["ALL", "FIRST_3", "FIRST_2", "FIRST_ONLY"], group = G_STRAT,
-     tooltip = "そのエントリーが、その Zone にとって何回目の Touch になるかで絞る。\n" +
-     "ALL        : 全タッチ\n" +
-     "FIRST_3    : touchCnt <= 3\n" +
-     "FIRST_2    : touchCnt <= 2  (既定)\n" +
-     "FIRST_ONLY : touchCnt == 1\n" +
-     "★ 判定に使うのは Validation Logger と同じ touchCnt。\n" +
-     "  CSV 全 564 イベントでは zoneLevel >= 2 と touchCnt <= 2 が完全一致していた。")
-
-slDollar = input.float(15.0, "SL ($)", minval = 0.1, step = 0.5, group = G_STRAT,
-     tooltip = "XAUUSD 価格そのものの値幅。tick 数や % ではない。")
-tpDollar = input.float(20.0, "TP ($)", minval = 0.1, step = 0.5, group = G_STRAT,
-     tooltip = "XAUUSD 価格そのものの値幅。tick 数や % ではない。")
-
-allowLong  = input.bool(true, "Long (Support Zone) 有効",    group = G_STRAT)
-allowShort = input.bool(true, "Short (Resist Zone) 有効",    group = G_STRAT)
-
-//  ---- 何回目の Touch になるかで通すかどうか ----
-f_entryModeOk(int nextTouchNo) =>
-    entryMode == "ALL"        ? true :
-     entryMode == "FIRST_3"   ? nextTouchNo <= 3 :
-     entryMode == "FIRST_2"   ? nextTouchNo <= 2 :
-     entryMode == "FIRST_ONLY"? nextTouchNo == 1 : false
-
-// ---- 8.1 待機注文の候補選定 -------------------------------------------------
-//  ★ 候補条件 ★
-//    ・trackId が有効
-//    ・armed == 1            (Logger が次の Touch を数える状態)
-//    ・direction が確定できる (BROKEN / 方向不明 ACTIVE は除外)
-//    ・次の Touch 回数が Entry Mode を通る
-//    ・終値が Zone の外側にある
-//        Long  : close > zone.top     (buy limit を終値より下に置けること)
-//        Short : close < zone.bottom  (sell limit を終値より上に置けること)
-//      armed な Zone は必ずこの条件を満たす。終値が Zone の内側にあるなら
-//      その足で既にレンジが重なっており、Touch は済んで armed が落ちている。
 string ENTRY_L = "ZB_LONG"
 string ENTRY_S = "ZB_SHORT"
 
-int   cndDir   = 0      // 1 = Long / -1 = Short / 0 = 候補なし
-int   cndId    = -1
-float cndPrice = na     // Long なら zoneTop / Short なら zoneBottom
-float cndTop   = na
-float cndBot   = na
-float cndDist  = na
-int   cndTouch = 0      // 現在の touchCnt (エントリーすれば +1 回目になる)
-int   cndLevel = 0
-float cndScore = na
-int   cndStr   = 0
+// ---- 8.1 待機注文の候補選定 -------------------------------------------------
+//  候補条件 : trackId が有効 / armed == 1 / direction が確定できる /
+//             Touch が成立したら Entry Mode を通る (touchCnt + 1 で判定)
+int   exDir   = 0        // 1 = Long / -1 = Short / 0 = 候補なし
+int   exId    = -1
+float exRef   = na       // Long なら zoneTop / Short なら zoneBottom
+float exDist  = na
+int   exTouch = 0        // 現在の touchCnt (Touch すれば +1 回目になる)
+bool  exIsStop = false   // true = Stop 注文 / false = Limit 注文
 
 if enableStrategy and barstate.isconfirmed
     int _zc = zn.zoneCount(zoneEng)
@@ -1011,316 +1151,153 @@ if enableStrategy and barstate.isconfirmed
             zn.Zone _z = zn.zoneAt(zoneEng, _i)
             int _id = _z.trackId
             if _id >= 0 and f_zbArmed(_id) == 1 and not na(_z.top) and not na(_z.bottom)
-                int _tc   = f_zbTouchCnt(_id)
-                int _dir  = f_zbDir(_z.state, map.contains(zbLastDir, _id) ? map.get(zbLastDir, _id) : 0)
-                bool _ok  = f_entryModeOk(_tc + 1)
-                if _ok and _dir == 1 and allowLong and close > _z.top
-                    float _d = close - _z.top
-                    if na(cndDist) or _d < cndDist
-                        cndDist  := _d
-                        cndDir   := 1
-                        cndId    := _id
-                        cndPrice := _z.top
-                        cndTop   := _z.top
-                        cndBot   := _z.bottom
-                        cndTouch := _tc
-                        cndScore := _z.score
-                        cndStr   := _z.strength
-                else if _ok and _dir == -1 and allowShort and close < _z.bottom
-                    float _d = _z.bottom - close
-                    if na(cndDist) or _d < cndDist
-                        cndDist  := _d
-                        cndDir   := -1
-                        cndId    := _id
-                        cndPrice := _z.bottom
-                        cndTop   := _z.top
-                        cndBot   := _z.bottom
-                        cndTouch := _tc
-                        cndScore := _z.score
-                        cndStr   := _z.strength
-
-//  候補 Zone の Level (Entry 判定には使わない。Debug で touchCnt と対応を見るため)
-if cndId >= 0
-    zl.ZoneLevel _cl = zl.zoneByTrackId(lvlEng, cndId)
-    cndLevel := _cl.trackId >= 0 ? _cl.zoneLevel : 0
+                int  _tc  = f_zbTouchCnt(_id)
+                int  _dir = f_zbDir(_z.state, f_zbLastDir(_id))
+                bool _dirOk = (_dir > 0 and allowLong) or (_dir < 0 and allowShort)
+                if _dirOk and f_entryModeOk(_tc + 1)
+                    float _ref = _dir > 0 ? _z.top : _z.bottom
+                    float _d   = math.abs(close - _ref)
+                    if na(exDist) or _d < exDist
+                        exDist   := _d
+                        exDir    := _dir
+                        exId     := _id
+                        exRef    := _ref
+                        exTouch  := _tc
+                        //  Long  : 現在価格が ref より下なら Stop、上なら Limit
+                        //  Short : 現在価格が ref より上なら Stop、下なら Limit
+                        exIsStop := _dir > 0 ? close < _ref : close > _ref
 
 // ---- 8.2 待機注文の発注 / 取消 ---------------------------------------------
 //  ★ フラットのときだけ待機注文を置く ★
-//    ポジション保有中は両方取り消す。別 Zone / 同じ Zone へタッチしても
+//    ポジション保有中は両方取り消す。別 Zone / 同じ Zone へ到達しても
 //    新規エントリーしない。Touch 登録簿 (Section 07) は止めない。
-bool isFlat = strategy.position_size == 0
+bool exFlat = strategy.position_size == 0
 
 if enableStrategy and barstate.isconfirmed
-    if isFlat and cndDir == 1 and not na(cndPrice)
+    if exFlat and exDir == 1 and not na(exRef)
         strategy.cancel(ENTRY_S)
-        strategy.entry(ENTRY_L, strategy.long, limit = cndPrice)
-    else if isFlat and cndDir == -1 and not na(cndPrice)
+        if exIsStop
+            strategy.entry(ENTRY_L, strategy.long, stop = exRef)
+        else
+            strategy.entry(ENTRY_L, strategy.long, limit = exRef)
+    else if exFlat and exDir == -1 and not na(exRef)
         strategy.cancel(ENTRY_L)
-        strategy.entry(ENTRY_S, strategy.short, limit = cndPrice)
+        if exIsStop
+            strategy.entry(ENTRY_S, strategy.short, stop = exRef)
+        else
+            strategy.entry(ENTRY_S, strategy.short, limit = exRef)
     else
         strategy.cancel(ENTRY_L)
         strategy.cancel(ENTRY_S)
 
-// ---- 8.3 待機注文の紐付け (約定したときにどの Zone だったかを残す) ---------
-//  ★ 注文を出した足の候補情報を 1 本分だけ保持しておく ★
-//    約定は次の足なので、約定を検出したときに参照する。
-var int   pendDir   = 0
-var int   pendId    = -1
-var float pendPrice = na
-var float pendTop   = na
-var float pendBot   = na
-var int   pendTouch = 0
-var int   pendLevel = 0
-var float pendScore = na
-var int   pendStr   = 0
+// ---- 8.3 エグジット (SL / TP 固定幅) ---------------------------------------
+//  ★ 実約定価格 (strategy.position_avg_price) から測る ★
+//    ここは実発注側なので、ギャップで不利/有利に約定した場合もその価格基準。
+//    CSV Virtual 側は Zone の端を基準にしており、両者は別管理。
+//  ★ strategy.exit はポジションを持っている足の終値で置くので、有効になるのは
+//    次の足から。CSV Virtual の「Touch 足は評価対象外」と位相が揃う。
+float exEntryPx = strategy.position_avg_price
+float exSl = strategy.position_size > 0 ? exEntryPx - slDollar :
+     strategy.position_size < 0 ? exEntryPx + slDollar : na
+float exTp = strategy.position_size > 0 ? exEntryPx + tpDollar :
+     strategy.position_size < 0 ? exEntryPx - tpDollar : na
 
-if enableStrategy and barstate.isconfirmed and isFlat
-    pendDir   := cndDir
-    pendId    := cndId
-    pendPrice := cndPrice
-    pendTop   := cndTop
-    pendBot   := cndBot
-    pendTouch := cndTouch
-    pendLevel := cndLevel
-    pendScore := cndScore
-    pendStr   := cndStr
-
-// ---- 8.4 エグジット (SL / TP 固定幅) ---------------------------------------
-//  ★ Touch 足自身は評価対象外 ★
-//    strategy.exit はポジションを持っている足の終値で置くので、有効になるのは
-//    次の足から。CSV 側も「Touch 足は評価対象外、次のバーから Evaluation」
-//    という定義なので位相が一致する。
-//  ★ SL / TP は実際の約定価格 (strategy.position_avg_price) から測る ★
-//    ギャップで limit より有利に約定した場合もその価格基準になる。
-float posEntry = strategy.position_avg_price
-float exitSl = strategy.position_size > 0 ? posEntry - slDollar :
-     strategy.position_size < 0 ? posEntry + slDollar : na
-float exitTp = strategy.position_size > 0 ? posEntry + tpDollar :
-     strategy.position_size < 0 ? posEntry - tpDollar : na
-
-if enableStrategy and strategy.position_size != 0 and not na(posEntry)
-    strategy.exit("ZB_X", stop = exitSl, limit = exitTp)
+if enableStrategy and strategy.position_size != 0 and not na(exEntryPx)
+    strategy.exit("ZB_X", stop = exSl, limit = exTp)
 
 // ============================================================================
-// 09. VIRTUAL BACKTEST  (SL 優先 / CSV 集計と同じルール)
+// 09. 集計テーブル
 // ----------------------------------------------------------------------------
-//  ★ なぜ Strategy Tester と別に集計するのか ★
-//    同じ 5分足の中で TP と SL の両方に到達した場合、TradingView の
-//    Broker Emulator はバー内の価格経路を知らないため、TP を先に約定させる
-//    ことがある。CSV 側は保守的に「SL 優先 = LOSS」で集計している。
-//    そこでこのセクションで、同じエントリーをバー単位で追跡し直し、
-//    必ず SL 優先で WIN / LOSS を数える。
-//      Long  : low  <= SL なら (high >= TP でも) LOSS
-//      Short : high >= SL なら (low  <= TP でも) LOSS
-//    ★ 推奨条件 FIRST_2 では CSV 上この同時到達ケースは 0 件だったため、
-//      FIRST_2 の再現結果には基本的に影響しない (ALL では 2 件存在)。
-//
-//  ★ エントリーは実際の約定を採用する ★
-//    仮想側で約定判定をやり直すと Strategy Tester とズレるため、
-//    エントリー価格 / 時刻は strategy 側の実約定をそのまま使い、
-//    決済判定だけ SL 優先でやり直す。
-//    通常のバーでは実約定と仮想の決済バーは一致するので、
-//    両者がズレるのは「同一足で TP / SL 同時到達」の 1 ケースだけ。
-//
-//  ★ Touch 足自身は評価対象外 ★
-//    bar_index > vEntryBar のバーから判定を始める。CSV と同じ位相。
+//  ① CSV Virtual      ← CSV の 87 trades / 57 WIN / 30 LOSS と突き合わせるのはこれ
+//  ② CSV 基準値        ← Entry Mode に応じた目標値
+//  ③ Strategy Tester  ← 実発注の結果。①との一致は二次目標
 // ============================================================================
-var string G_DBG = "22 · Debug / Virtual Backtest"
-debugMode = input.bool(false, "Debug Mode (ラベル表示)", group = G_DBG,
-     tooltip = "エントリー / 決済ラベルを描く。トレードが多いと重くなるので既定 OFF。")
-showStatTable = input.bool(true, "Virtual Backtest 集計テーブル", group = G_DBG)
+var string G_TBL = "23 · Debug"
+showStatTable = input.bool(true, "集計テーブル表示", group = G_TBL)
 
-var bool  vOpen     = false
-var int   vDir      = 0
-var float vEntry    = na
-var float vSl       = na
-var float vTp       = na
-var int   vEntryBar = 0
-var int   vEntryMs  = 0
-var int   vZoneId   = -1
-var int   vTouchNo  = 0
-var int   vLevel    = 0
-var float vScore    = na
-var int   vStr      = 0
-var float vTop      = na
-var float vBot      = na
-
-var int   vTrades    = 0
-var int   vWin       = 0
-var int   vLoss      = 0
-var float vGrossWin  = 0.0
-var float vGrossLoss = 0.0
-var int   vLongCnt   = 0
-var int   vShortCnt  = 0
-var int   vBothHit   = 0     // 同一足で TP / SL 同時到達 (SL 優先で LOSS にした件数)
-
-if barstate.isconfirmed
-    // ---- 9.1 仮想ポジションの決済判定 (SL 優先) ----------------------------
-    if vOpen and bar_index > vEntryBar
-        bool _hitSl = vDir > 0 ? low  <= vSl : high >= vSl
-        bool _hitTp = vDir > 0 ? high >= vTp : low  <= vTp
-        if _hitSl or _hitTp
-            if _hitSl and _hitTp
-                vBothHit := vBothHit + 1
-            //  ★ 同時到達は必ず SL 優先 ★
-            bool  _isWin = _hitSl ? false : true
-            float _exit  = _hitSl ? vSl : vTp
-            float _pnl   = vDir > 0 ? _exit - vEntry : vEntry - _exit
-            vTrades := vTrades + 1
-            if _isWin
-                vWin      := vWin + 1
-                vGrossWin := vGrossWin + math.abs(_pnl)
-            else
-                vLoss      := vLoss + 1
-                vGrossLoss := vGrossLoss + math.abs(_pnl)
-            if debugMode
-                label.new(
-                     x         = bar_index,
-                     y         = vDir > 0 ? high : low,
-                     text      = (_isWin ? "WIN" : "LOSS") +
-                          (_hitSl and _hitTp ? " (TP/SL同時→SL優先)" : "") +
-                          "\nEntry " + f_num(vEntry, "#.##") +
-                          "\nExit  " + f_num(_exit, "#.##") +
-                          "\nSL " + f_num(vSl, "#.##") + " / TP " + f_num(vTp, "#.##") +
-                          "\n保有 " + str.tostring(bar_index - vEntryBar) + " bars",
-                     xloc      = xloc.bar_index,
-                     style     = vDir > 0 ? label.style_label_down : label.style_label_up,
-                     color     = color.new(_isWin ? color.teal : color.maroon, 15),
-                     textcolor = color.white,
-                     size      = size.small)
-            vOpen := false
-
-    // ---- 9.2 実約定の検出 → 仮想ポジションを開く ---------------------------
-    //    strategy.position_size は足の終値時点の値。前足が 0 で今足が 0 でなければ
-    //    この足で待機注文が約定したということ。
-    if not vOpen and strategy.position_size != 0 and nz(strategy.position_size[1], 0) == 0
-        vOpen     := true
-        vDir      := strategy.position_size > 0 ? 1 : -1
-        vEntry    := strategy.position_avg_price
-        vSl       := vDir > 0 ? vEntry - slDollar : vEntry + slDollar
-        vTp       := vDir > 0 ? vEntry + tpDollar : vEntry - tpDollar
-        vEntryBar := bar_index
-        vEntryMs  := time
-        //  この約定を出した待機注文の候補情報 (前足で保存したもの)
-        vZoneId   := pendId
-        vTouchNo  := pendTouch + 1
-        vLevel    := pendLevel
-        vScore    := pendScore
-        vStr      := pendStr
-        vTop      := pendTop
-        vBot      := pendBot
-        if vDir > 0
-            vLongCnt := vLongCnt + 1
-        else
-            vShortCnt := vShortCnt + 1
-        if debugMode
-            label.new(
-                 x         = bar_index,
-                 y         = vDir > 0 ? low : high,
-                 text      = (vDir > 0 ? "LONG" : "SHORT") +
-                      "  Zone #" + str.tostring(vZoneId) +
-                      "\nEntry " + f_num(vEntry, "#.##") +
-                      "  (ref " + f_num(vDir > 0 ? vTop : vBot, "#.##") + ")" +
-                      "\ntouchCnt " + str.tostring(vTouchNo) +
-                      " / zoneLevel " + zl.levelName(vLevel) + " (" + str.tostring(vLevel) + ")" +
-                      "\nScore " + f_num(vScore, "#.##") +
-                      " / Strength " + zn.strengthName(vStr) +
-                      "\nTop " + f_num(vTop, "#.##") + " / Bottom " + f_num(vBot, "#.##") +
-                      "\n" + str.format_time(vEntryMs, "yyyy-MM-dd HH:mm", "UTC") + " UTC",
-                 xloc      = xloc.bar_index,
-                 style     = vDir > 0 ? label.style_label_up : label.style_label_down,
-                 color     = color.new(vDir > 0 ? color.blue : color.red, 20),
-                 textcolor = color.white,
-                 size      = size.small)
-
-    // ---- 9.3 実ポジションが閉じたのに仮想が開いたままなら同期を取り直す ----
-    //    Broker Emulator と仮想判定がズレた場合の保険。通常は発生しない。
-    if vOpen and strategy.position_size == 0 and bar_index > vEntryBar
-        float _pnl = vDir > 0 ? close - vEntry : vEntry - close
-        vTrades := vTrades + 1
-        if _pnl > 0
-            vWin      := vWin + 1
-            vGrossWin := vGrossWin + _pnl
-        else
-            vLoss      := vLoss + 1
-            vGrossLoss := vGrossLoss + math.abs(_pnl)
-        vOpen := false
-
-// ============================================================================
-// 10. STAT TABLE  (CSV 基準値との比較)
-// ============================================================================
-f_pf() =>
+f_vPf() =>
     vGrossLoss > 0 ? vGrossWin / vGrossLoss : na
 
-f_wr() =>
+f_vWr() =>
     vTrades > 0 ? vWin * 100.0 / vTrades : na
 
 //  Entry Mode ごとの CSV 基準値 (SL15 / TP20 / 時系列再計算)
 f_csvRef() =>
-    entryMode == "ALL"        ? "400 trades / 191 W / 209 L / 47.75% / PF 1.22" :
-     entryMode == "FIRST_3"   ? "123 trades /  74 W /  49 L / 60.16% / PF 2.01" :
-     entryMode == "FIRST_2"   ? " 87 trades /  57 W /  30 L / 65.52% / PF 2.53" :
-     entryMode == "FIRST_ONLY"? " 55 trades /  39 W /  16 L / 70.91% / PF 3.25" : "-"
+    entryMode == "ALL"         ? "400 trades  |  191 WIN / 209 LOSS  |  47.75%  |  PF 1.22" :
+     entryMode == "FIRST_3"    ? "123 trades  |   74 WIN /  49 LOSS  |  60.16%  |  PF 2.01" :
+     entryMode == "FIRST_2"    ? " 87 trades  |   57 WIN /  30 LOSS  |  65.52%  |  PF 2.53" :
+     entryMode == "FIRST_ONLY" ? " 55 trades  |   39 WIN /  16 LOSS  |  70.91%  |  PF 3.25" : "-"
 
 var table zbTable = table.new(position.top_right, 2, 9,
      border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50))
 
 if showStatTable and barstate.islast
-    color _bh = color.new(color.gray,  70)
-    color _bs = color.new(color.blue,  75)
-    color _bc = color.new(color.black, 60)
+    color _bh = color.new(color.gray,   70)
+    color _b1 = color.new(color.teal,   70)
+    color _b2 = color.new(color.black,  55)
+    color _b3 = color.new(color.blue,   75)
 
     table.cell(zbTable, 0, 0, "ZONE BOUNCE", text_color = color.white, bgcolor = _bh, text_size = size.small)
     table.cell(zbTable, 1, 0, "XAUUSD 5m  |  SL " + f_num(slDollar, "#.#") +
-         " / TP " + f_num(tpDollar, "#.#") + "  |  " + entryMode,
+         " / TP " + f_num(tpDollar, "#.#") + "  |  Entry Mode " + entryMode,
          text_color = color.white, bgcolor = _bh, text_size = size.small)
 
-    table.cell(zbTable, 0, 1, "Virtual (SL優先)", text_color = color.white, bgcolor = _bs, text_size = size.small)
+    // ---- ① CSV Virtual (Touch Event 駆動 / 注文を使わない) ----
+    table.cell(zbTable, 0, 1, "① CSV Virtual", text_color = color.white, bgcolor = _b1, text_size = size.small)
     table.cell(zbTable, 1, 1, str.tostring(vTrades) + " trades  |  " +
          str.tostring(vWin) + " WIN / " + str.tostring(vLoss) + " LOSS  |  " +
-         f_num(f_wr(), "#.##") + "%  |  PF " + f_num(f_pf(), "#.##"),
-         text_color = color.white, bgcolor = _bs, text_size = size.small)
+         f_num(f_vWr(), "#.##") + "%  |  PF " + f_num(f_vPf(), "#.##") +
+         (vOpen ? "   (+ 保有中 1)" : ""),
+         text_color = color.white, bgcolor = _b1, text_size = size.small)
 
-    table.cell(zbTable, 0, 2, "CSV 基準値", text_color = color.white, bgcolor = _bc, text_size = size.small)
-    table.cell(zbTable, 1, 2, f_csvRef(), text_color = color.white, bgcolor = _bc, text_size = size.small)
+    // ---- ② CSV 基準値 ----
+    table.cell(zbTable, 0, 2, "② CSV 基準値", text_color = color.white, bgcolor = _b2, text_size = size.small)
+    table.cell(zbTable, 1, 2, f_csvRef(), text_color = color.white, bgcolor = _b2, text_size = size.small)
 
-    table.cell(zbTable, 0, 3, "Strategy Tester", text_color = color.white, bgcolor = _bs, text_size = size.small)
+    // ---- ③ Strategy Tester (実発注) ----
+    table.cell(zbTable, 0, 3, "③ Strategy Tester", text_color = color.white, bgcolor = _b3, text_size = size.small)
     table.cell(zbTable, 1, 3, str.tostring(strategy.closedtrades) + " closed  |  " +
          str.tostring(strategy.wintrades) + " WIN / " + str.tostring(strategy.losstrades) + " LOSS  |  " +
          "PF " + f_num(strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na, "#.##") +
-         (vBothHit > 0 ? "   ← TP/SL同時到達 " + str.tostring(vBothHit) + " 件あり (Virtual と差が出る)" : ""),
-         text_color = color.white, bgcolor = _bs, text_size = size.small)
+         "   ← ①との一致は二次目標",
+         text_color = color.white, bgcolor = _b3, text_size = size.small)
 
-    table.cell(zbTable, 0, 4, "方向内訳", text_color = color.white, bgcolor = _bc, text_size = size.small)
-    table.cell(zbTable, 1, 4, "LONG " + str.tostring(vLongCnt) + " / SHORT " + str.tostring(vShortCnt) +
-         "   |   TP/SL同時到達 " + str.tostring(vBothHit) + " 件 (SL優先で LOSS)",
-         text_color = color.white, bgcolor = _bc, text_size = size.small)
+    // ---- 差分調査用 ----
+    table.cell(zbTable, 0, 4, "① Touch イベント", text_color = color.white, bgcolor = _b2, text_size = size.small)
+    table.cell(zbTable, 1, 4, "全 Zone の Touch 検出 " + str.tostring(zbTouchEvents) + " 件" +
+         "  |  Entry Mode 通過 " + str.tostring(zbModeOkEvents) + " 件" +
+         "  |  保有中で見送り " + str.tostring(zbSkipHolding) + " 件",
+         text_color = color.white, bgcolor = _b2, text_size = size.small)
 
-    table.cell(zbTable, 0, 5, "Touch イベント", text_color = color.white, bgcolor = _bs, text_size = size.small)
-    table.cell(zbTable, 1, 5, "全 Zone の Touch 検出 " + str.tostring(zbTouchEvents) + " 件" +
-         "   |   Re-arm " + f_num(touchRearmDist, "#.#") + "$" +
-         "   |   登録簿 " + str.tostring(map.size(zbLastSeen)) + " trackId",
-         text_color = color.white, bgcolor = _bs, text_size = size.small)
+    table.cell(zbTable, 0, 5, "④ 方向内訳", text_color = color.white, bgcolor = _b2, text_size = size.small)
+    table.cell(zbTable, 1, 5, "LONG " + str.tostring(vLongCnt) + " / SHORT " + str.tostring(vShortCnt) +
+         "  |  TP/SL 同時到達 " + str.tostring(vBothHit) + " 件 (SL 優先で LOSS)" +
+         "  |  Re-arm " + f_num(touchRearmDist, "#.#") + "$" +
+         "  |  登録簿 " + str.tostring(map.size(zbLastSeen)) + " trackId",
+         text_color = color.white, bgcolor = _b2, text_size = size.small)
 
-    table.cell(zbTable, 0, 6, "現在の候補", text_color = color.white, bgcolor = _bc, text_size = size.small)
-    table.cell(zbTable, 1, 6, cndDir == 0 ? "なし" :
-         (cndDir > 0 ? "LONG " : "SHORT ") + "Zone #" + str.tostring(cndId) +
-         "  |  limit " + f_num(cndPrice, "#.##") +
-         "  |  次は " + str.tostring(cndTouch + 1) + " 回目" +
-         "  |  zoneLevel " + zl.levelName(cndLevel) +
-         "  |  距離 " + f_num(cndDist, "#.##") + "$",
-         text_color = color.white, bgcolor = _bc, text_size = size.small)
-
-    table.cell(zbTable, 0, 7, "保有中", text_color = color.white, bgcolor = _bs, text_size = size.small)
-    table.cell(zbTable, 1, 7, not vOpen ? "フラット" :
+    table.cell(zbTable, 0, 6, "① 保有中", text_color = color.white, bgcolor = _b1, text_size = size.small)
+    table.cell(zbTable, 1, 6, not vOpen ? "フラット" :
          (vDir > 0 ? "LONG " : "SHORT ") + "Zone #" + str.tostring(vZoneId) +
          "  |  Entry " + f_num(vEntry, "#.##") +
          "  |  SL " + f_num(vSl, "#.##") + " / TP " + f_num(vTp, "#.##") +
          "  |  touchCnt " + str.tostring(vTouchNo) +
          "  |  zoneLevel " + zl.levelName(vLevel) +
+         "  |  Score " + f_num(vScore, "#.##") +
          "  |  " + str.tostring(bar_index - vEntryBar) + " bars",
-         text_color = color.white, bgcolor = _bs, text_size = size.small)
+         text_color = color.white, bgcolor = _b1, text_size = size.small)
 
-    table.cell(zbTable, 0, 8, "注意", text_color = color.white, bgcolor = _bc, text_size = size.small)
-    table.cell(zbTable, 1, 8, "Virtual が CSV 基準値。Strategy Tester はバー内経路の扱いが違うため TP/SL 同時到達時のみズレる。",
-         text_color = color.white, bgcolor = _bc, text_size = size.small)
+    table.cell(zbTable, 0, 7, "③ 待機注文", text_color = color.white, bgcolor = _b3, text_size = size.small)
+    table.cell(zbTable, 1, 7, not enableStrategy ? "Executable Strategy = OFF" :
+         exDir == 0 ? "なし" :
+         (exDir > 0 ? "LONG " : "SHORT ") + (exIsStop ? "STOP " : "LIMIT ") +
+         "Zone #" + str.tostring(exId) +
+         "  |  " + f_num(exRef, "#.##") +
+         "  |  次は " + str.tostring(exTouch + 1) + " 回目" +
+         "  |  距離 " + f_num(exDist, "#.##") + "$",
+         text_color = color.white, bgcolor = _b3, text_size = size.small)
+
+    table.cell(zbTable, 0, 8, "注意", text_color = color.white, bgcolor = _b2, text_size = size.small)
+    table.cell(zbTable, 1, 8,
+         "① は Touch Event だけで組み立てており strategy.* を一切参照しない。CSV 再現の確認は必ず ① を見ること。",
+         text_color = color.white, bgcolor = _b2, text_size = size.small)
