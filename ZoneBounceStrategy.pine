@@ -885,6 +885,17 @@ var map<int, int> zbLastDir  = map.new<int, int>()   // vzLastDir
 
 //  全 Zone の Touch 検出件数 (CSV のイベント総数 564 と突き合わせる用)
 var int zbTouchEvents = 0
+//  ★ TradingView 上どうしても再現できないケースの計測 (観測のみ / 判定には使わない) ★
+//    (a) Zone 誕生バー = Touch バー
+//        Section 07 は zn.update() の後に走るので、そのバーで生まれた Zone を
+//        そのバーで Touch できる。Executable Strategy は前バー終値でしか注文を
+//        置けないため、この Entry は原理的に再現不可能。
+//    (b) 同一バーに複数の有効 Zone へ Touch
+//        CSV Virtual は Zone 走査順 (= CSV の行順) で先頭を採るが、
+//        Broker Emulator はバー内の価格経路で決める。5分足 OHLC からは
+//        どちらへ先に到達したか判定できないため、選ばれる Zone が食い違いうる。
+var int zbSameBarBirthTouch = 0
+var int zbMultiTouchBars    = 0
 //  Entry Mode を通った Touch 件数 (保有中で見送った分も含む)
 var int zbModeOkEvents = 0
 //  保有中だったため Entry にならなかった Touch 件数
@@ -940,6 +951,9 @@ f_entryModeOk(int touchNo) =>
      entryMode == "FIRST_ONLY" ? touchNo == 1 : false
 
 if barstate.isconfirmed
+    //  このバーで Entry Mode を通った Touch の件数 (観測のみ)
+    int _barModeOkTouches = 0
+
     // ---- 7.1 Zone 全件走査: 登録簿更新 + Touch 検出 + Virtual Entry ---------
     //    ★ 条件式・順序は Zone Validation Logger の 10.6.1 と同じ ★
     //
@@ -1003,7 +1017,8 @@ if barstate.isconfirmed
                         bool  _dirOk = (_dir > 0 and allowLong) or (_dir < 0 and allowShort)
                         bool  _modeOk = f_entryModeOk(_touchNo)
                         if _modeOk and _dirOk
-                            zbModeOkEvents := zbModeOkEvents + 1
+                            zbModeOkEvents  := zbModeOkEvents + 1
+                            _barModeOkTouches := _barModeOkTouches + 1
                             if vOpen
                                 //  保有中の Touch では新しい Entry を作らない。
                                 //  登録簿 (touchCnt / armed / lastDir) は上で更新済み。
@@ -1027,6 +1042,11 @@ if barstate.isconfirmed
                                 vStr      := _z.strength
                                 vTop      := _z.top
                                 vBot      := _z.bottom
+                                //  ★ 再現不可能ケース (a) の計測 ★
+                                //    この Zone がこのバーで生まれていたら、
+                                //    Executable 側は注文を置けていない。
+                                if map.get(zbBornBar, _id) == bar_index
+                                    zbSameBarBirthTouch := zbSameBarBirthTouch + 1
                                 if _dir > 0
                                     vLongCnt := vLongCnt + 1
                                 else
@@ -1058,6 +1078,10 @@ if barstate.isconfirmed
                     //    ACTIVE → SUPPORT などの state 変化だけでは再 arm しない
                     if _dist >= touchRearmDist
                         map.put(zbArmed, _id, 1)
+
+    //  ★ 再現不可能ケース (b) の計測 ★
+    if _barModeOkTouches >= 2
+        zbMultiTouchBars := zbMultiTouchBars + 1
 
     // ---- 7.2 CSV Virtual の決済判定 (SL 優先) ------------------------------
     //    ★ 7.1 の Touch 判定より「後」に実行する ★
@@ -1120,105 +1144,125 @@ if barstate.isconfirmed
                     map.remove(zbLastDir,  _k)
 
 // ============================================================================
-// 08. EXECUTABLE STRATEGY  (実際に発注する側 / CSV Virtual とは別物)
+// 08. EXECUTABLE STRATEGY  (実発注 / 候補集合は CSV Virtual と完全に同じ)
 // ----------------------------------------------------------------------------
-//  ★ Section 07 の CSV Virtual とは完全に独立した層 ★
-//    CSV Virtual は注文を置かず Touch Event だけで組み立てる。
-//    こちらは Broker Emulator に実際の注文を出す。
-//    前バーの終値時点で待機注文を置く必要があるため、両者は完全一致しない。
-//    それは仕様であって不具合ではない。
-//      CSV の 87 trades / 57 WIN / 30 LOSS を突き合わせるのは CSV Virtual。
-//      Strategy Tester の結果ではない。
+//  ★ CSV Virtual (Section 07) の Entry 候補条件をそのまま使う ★
+//      trackId >= 0
+//      armed == 1
+//      direction != 0        (SUPPORT → Long / RESIST → Short / ACTIVE → lastDir)
+//      allowLong / allowShort を通過
+//      f_entryModeOk(touchCnt + 1) を通過
+//    これらは注文を置く時点で全部わかる値なので、未来情報にはならない。
+//    Direction は f_zbDir() を共用する。独自判定は持たない。
 //
-//  ★ 注文種別を価格の位置で切り替える ★
+//  ★ 条件を満たす Zone「すべて」に待機注文を置く ★
+//    以前は「終値から最も近い Zone 1 本」に絞っていたが、これは CSV Virtual
+//    とは別の戦略だった。CSV Virtual は全 Zone を走査して最初に Touch が
+//    成立したものを採るので、「終値に近い Zone」と「最初に到達する Zone」が
+//    食い違うたびにトレードを取りこぼしていた。
+//      → 1 本方式は廃止。Zone ごとに一意の Entry ID を作って全部置く。
+//           Long  : "ZBL_" + trackId
+//           Short : "ZBS_" + trackId
+//
+//  ★ 注文種別は現在価格と refPrice の位置関係で決める ★
+//      Long  / refPrice = zone.top
+//          close > ref → Buy Limit  (上から下りてきて Top に触れる)
+//          close < ref → Buy Stop   (下から上がってきて Top に触れる)
+//      Short / refPrice = zone.bottom
+//          close < ref → Sell Limit (下から上がってきて Bottom に触れる)
+//          close > ref → Sell Stop  (上から下りてきて Bottom に触れる)
 //    Logger の Touch は「Zone のレンジに触れたこと」なので、Zone の端へは
-//    上からも下からも到達しうる。片側だけ limit を置くと片方向を取り逃がす。
-//      Long  / refPrice = zoneTop
-//          現在価格 > zoneTop → Buy Limit  (上から下りてきて Zone Top に触れる)
-//          現在価格 < zoneTop → Buy Stop   (下から上がってきて Zone Top に触れる)
-//      Short / refPrice = zoneBottom
-//          現在価格 < zoneBottom → Sell Limit (下から上がってきて Bottom に触れる)
-//          現在価格 > zoneBottom → Sell Stop  (上から下りてきて Bottom に触れる)
-//    ★ 接近方向を条件にはしない ★
-//      どちら側にいても候補にする。方向は Section 07 と同じ
-//      SUPPORT / RESIST / ACTIVE 継承だけで決める。
+//    上からも下からも到達しうる。片側だけ limit にすると片方向を取り逃がす。
 //
-//  ★ 待機注文は常に 1 本だけ ★
-//    Long / Short を同時に置くと、大きな 1 本の足で両方約定してドテンする。
-//    refPrice が現在の終値に最も近い候補 1 本だけを置く。
+//  ★ 同時保有は 1 ポジションのみ ★
+//    pyramiding = 0 に加えて、全 Entry 注文を同じ OCA グループへ入れる。
+//      oca_name = "ZB_ENTRY_OCA" / oca_type = strategy.oca.cancel
+//    最初の 1 件が約定した時点で、残りの待機 Entry 注文が全部取り消される。
+//    OCA が無いと、大きな 1 本の足で Long と Short が両方約定してドテンする。
 //
-//  ★ 未来情報は一切使わない ★
-//    判定に使うのは「確定した Zone 情報」と「現在の終値」だけ。
-//    MFE / maxPenetration / hit10 / hit20 / hit30 / barsTo* / broken /
-//    reclaimed / trackingLost のような Touch 後に確定する値は使わない。
+//  ★ フラット時は毎バー注文を作り直す ★
+//    Zone は毎バー 位置 / State / trackId / armed / touchCnt が変わりうるので、
+//    前バーまでの待機 Entry 注文を全部取り消してから置き直す。
+//    ★ strategy.cancel_all() は使わない ★
+//      保有中の strategy.exit("ZB_X") まで消してしまうため。
+//      自分で置いた Entry ID だけを exPendIds に控えて個別に取り消す。
+//
+//  ★ 保有中は新規 Entry しない ★
+//    待機 Entry 注文を全部取り消すだけ。Touch Registry (Section 07) は
+//    保有中も通常どおり touchCnt / armed / lastDir / lastSeen を進める。
+//    決済後、armed な有効 Zone へ次に Touch したときから再 Entry 可能。
+//
+//  ★ CSV Virtual とは独立 ★
+//    こちらの結果は CSV Virtual へ一切フィードバックしない。
+//    合わせるのは Executable 側であって、CSV Virtual を動かしてはいけない。
 // ============================================================================
 var string G_EXEC = "22 · Executable Strategy (実発注)"
 enableStrategy = input.bool(true, "Enable Executable Strategy", group = G_EXEC,
      tooltip = "OFF にすると発注しない。CSV Virtual の集計は OFF でも動く。")
 
-string ENTRY_L = "ZB_LONG"
-string ENTRY_S = "ZB_SHORT"
+string OCA_ENTRY = "ZB_ENTRY_OCA"
 
-// ---- 8.1 待機注文の候補選定 -------------------------------------------------
-//  候補条件 : trackId が有効 / armed == 1 / direction が確定できる /
-//             Touch が成立したら Entry Mode を通る (touchCnt + 1 で判定)
-int   exDir   = 0        // 1 = Long / -1 = Short / 0 = 候補なし
-int   exId    = -1
-float exRef   = na       // Long なら zoneTop / Short なら zoneBottom
-float exDist  = na
-int   exTouch = 0        // 現在の touchCnt (Touch すれば +1 回目になる)
-bool  exIsStop = false   // true = Stop 注文 / false = Limit 注文
+//  現在置いてある待機 Entry 注文の ID (これだけを個別に取り消す)
+var array<string> exPendIds = array.new<string>()
 
-if enableStrategy and barstate.isconfirmed
-    int _zc = zn.zoneCount(zoneEng)
-    if _zc > 0
-        for _i = 0 to _zc - 1
-            zn.Zone _z = zn.zoneAt(zoneEng, _i)
-            int _id = _z.trackId
-            if _id >= 0 and f_zbArmed(_id) == 1 and not na(_z.top) and not na(_z.bottom)
-                int  _tc  = f_zbTouchCnt(_id)
-                int  _dir = f_zbDir(_z.state, f_zbLastDir(_id))
-                bool _dirOk = (_dir > 0 and allowLong) or (_dir < 0 and allowShort)
-                if _dirOk and f_entryModeOk(_tc + 1)
-                    float _ref = _dir > 0 ? _z.top : _z.bottom
-                    float _d   = math.abs(close - _ref)
-                    if na(exDist) or _d < exDist
-                        exDist   := _d
-                        exDir    := _dir
-                        exId     := _id
-                        exRef    := _ref
-                        exTouch  := _tc
-                        //  Long  : 現在価格が ref より下なら Stop、上なら Limit
-                        //  Short : 現在価格が ref より上なら Stop、下なら Limit
-                        exIsStop := _dir > 0 ? close < _ref : close > _ref
+//  実約定の方向別件数 (CSV Virtual の vLongCnt / vShortCnt と比較する)
+var int exLongFills  = 0
+var int exShortFills = 0
 
-// ---- 8.2 待機注文の発注 / 取消 ---------------------------------------------
-//  ★ フラットのときだけ待機注文を置く ★
-//    ポジション保有中は両方取り消す。別 Zone / 同じ Zone へ到達しても
-//    新規エントリーしない。Touch 登録簿 (Section 07) は止めない。
-bool exFlat = strategy.position_size == 0
+//  このバーで置いた待機注文の本数 (表示用)
+int exOrdersNow = 0
 
 if enableStrategy and barstate.isconfirmed
-    if exFlat and exDir == 1 and not na(exRef)
-        strategy.cancel(ENTRY_S)
-        if exIsStop
-            strategy.entry(ENTRY_L, strategy.long, stop = exRef)
-        else
-            strategy.entry(ENTRY_L, strategy.long, limit = exRef)
-    else if exFlat and exDir == -1 and not na(exRef)
-        strategy.cancel(ENTRY_L)
-        if exIsStop
-            strategy.entry(ENTRY_S, strategy.short, stop = exRef)
-        else
-            strategy.entry(ENTRY_S, strategy.short, limit = exRef)
-    else
-        strategy.cancel(ENTRY_L)
-        strategy.cancel(ENTRY_S)
+    // ---- 8.1 前バーまでの待機 Entry 注文を取り消す --------------------------
+    //    strategy.exit("ZB_X") には触らない (ID 指定の cancel なので安全)
+    if array.size(exPendIds) > 0
+        for _pi = 0 to array.size(exPendIds) - 1
+            strategy.cancel(array.get(exPendIds, _pi))
+        array.clear(exPendIds)
 
-// ---- 8.3 エグジット (SL / TP 固定幅) ---------------------------------------
+    // ---- 8.2 フラットのときだけ、有効な全 Zone へ注文を置き直す ------------
+    if strategy.position_size == 0
+        int _zc2 = zn.zoneCount(zoneEng)
+        if _zc2 > 0
+            for _i = 0 to _zc2 - 1
+                zn.Zone _z = zn.zoneAt(zoneEng, _i)
+                int _id = _z.trackId
+                if _id >= 0 and f_zbArmed(_id) == 1 and not na(_z.top) and not na(_z.bottom)
+                    //  ★ 判定は CSV Virtual と同じ関数を使う ★
+                    int  _dir   = f_zbDir(_z.state, f_zbLastDir(_id))
+                    bool _dirOk = (_dir > 0 and allowLong) or (_dir < 0 and allowShort)
+                    if _dir != 0 and _dirOk and f_entryModeOk(f_zbTouchCnt(_id) + 1)
+                        //  refPrice = CSV の EV_refPrice と同じ定義
+                        float  _ref  = _dir > 0 ? _z.top : _z.bottom
+                        string _oid  = (_dir > 0 ? "ZBL_" : "ZBS_") + str.tostring(_id)
+                        bool   _stopOrd = _dir > 0 ? close < _ref : close > _ref
+                        if _dir > 0
+                            if _stopOrd
+                                strategy.entry(_oid, strategy.long, stop = _ref,
+                                     oca_name = OCA_ENTRY, oca_type = strategy.oca.cancel)
+                            else
+                                strategy.entry(_oid, strategy.long, limit = _ref,
+                                     oca_name = OCA_ENTRY, oca_type = strategy.oca.cancel)
+                        else
+                            if _stopOrd
+                                strategy.entry(_oid, strategy.short, stop = _ref,
+                                     oca_name = OCA_ENTRY, oca_type = strategy.oca.cancel)
+                            else
+                                strategy.entry(_oid, strategy.short, limit = _ref,
+                                     oca_name = OCA_ENTRY, oca_type = strategy.oca.cancel)
+                        array.push(exPendIds, _oid)
+                        exOrdersNow := exOrdersNow + 1
+
+    // ---- 8.3 実約定の方向別カウント ----------------------------------------
+    if strategy.position_size != 0 and nz(strategy.position_size[1], 0) == 0
+        if strategy.position_size > 0
+            exLongFills := exLongFills + 1
+        else
+            exShortFills := exShortFills + 1
+
+// ---- 8.4 エグジット (SL / TP 固定幅) ---------------------------------------
 //  ★ 実約定価格 (strategy.position_avg_price) から測る ★
-//    ここは実発注側なので、ギャップで不利/有利に約定した場合もその価格基準。
-//    CSV Virtual 側は Zone の端を基準にしており、両者は別管理。
+//    ここは実発注側。CSV Virtual は Zone の端を基準にしており、別管理。
 //  ★ strategy.exit はポジションを持っている足の終値で置くので、有効になるのは
 //    次の足から。CSV Virtual の「Touch 足は評価対象外」と位相が揃う。
 float exEntryPx = strategy.position_avg_price
@@ -1253,7 +1297,7 @@ f_csvRef() =>
      entryMode == "FIRST_2"    ? " 87 trades  |   57 WIN /  30 LOSS  |  65.52%  |  PF 2.53" :
      entryMode == "FIRST_ONLY" ? " 55 trades  |   40 WIN /  15 LOSS  |  72.73%  |  PF 3.56" : "-"
 
-var table zbTable = table.new(position.top_right, 2, 9,
+var table zbTable = table.new(position.top_right, 2, 10,
      border_width = 1, frame_width = 1, frame_color = color.new(color.gray, 50))
 
 if showStatTable and barstate.islast
@@ -1287,22 +1331,34 @@ if showStatTable and barstate.islast
          "   ← ①との一致は二次目標",
          text_color = color.white, bgcolor = _b3, text_size = size.small)
 
+    // ---- Entry 数 / 方向内訳の突き合わせ (① vs ③) ----
+    table.cell(zbTable, 0, 4, "Entry 数 ① vs ③", text_color = color.white, bgcolor = _b3, text_size = size.small)
+    table.cell(zbTable, 1, 4,
+         "① Virtual  " + str.tostring(vTrades + (vOpen ? 1 : 0)) + " entries" +
+         "  (L " + str.tostring(vLongCnt) + " / S " + str.tostring(vShortCnt) + ")" +
+         "     ③ Strategy  " + str.tostring(exLongFills + exShortFills) + " entries" +
+         "  (L " + str.tostring(exLongFills) + " / S " + str.tostring(exShortFills) + ")" +
+         "     待機注文 " + str.tostring(exOrdersNow) + " 本",
+         text_color = color.white, bgcolor = _b3, text_size = size.small)
+
     // ---- 差分調査用 ----
-    table.cell(zbTable, 0, 4, "① Touch イベント", text_color = color.white, bgcolor = _b2, text_size = size.small)
-    table.cell(zbTable, 1, 4, "全 Zone の Touch 検出 " + str.tostring(zbTouchEvents) + " 件" +
+    table.cell(zbTable, 0, 5, "① Touch イベント", text_color = color.white, bgcolor = _b2, text_size = size.small)
+    table.cell(zbTable, 1, 5, "全 Zone の Touch 検出 " + str.tostring(zbTouchEvents) + " 件" +
          "  |  Entry Mode 通過 " + str.tostring(zbModeOkEvents) + " 件" +
-         "  |  保有中で見送り " + str.tostring(zbSkipHolding) + " 件",
+         "  |  保有中で見送り " + str.tostring(zbSkipHolding) + " 件" +
+         "  ||  再現不可: 誕生足Touch " + str.tostring(zbSameBarBirthTouch) + " 件" +
+         " / 同一足 複数Touch " + str.tostring(zbMultiTouchBars) + " 本",
          text_color = color.white, bgcolor = _b2, text_size = size.small)
 
-    table.cell(zbTable, 0, 5, "④ 方向内訳", text_color = color.white, bgcolor = _b2, text_size = size.small)
-    table.cell(zbTable, 1, 5, "LONG " + str.tostring(vLongCnt) + " / SHORT " + str.tostring(vShortCnt) +
+    table.cell(zbTable, 0, 6, "④ 方向内訳", text_color = color.white, bgcolor = _b2, text_size = size.small)
+    table.cell(zbTable, 1, 6, "LONG " + str.tostring(vLongCnt) + " / SHORT " + str.tostring(vShortCnt) +
          "  |  TP/SL 同時到達 " + str.tostring(vBothHit) + " 件 (SL 優先で LOSS)" +
          "  |  Re-arm " + f_num(touchRearmDist, "#.#") + "$" +
          "  |  登録簿 " + str.tostring(map.size(zbLastSeen)) + " trackId",
          text_color = color.white, bgcolor = _b2, text_size = size.small)
 
-    table.cell(zbTable, 0, 6, "① 保有中", text_color = color.white, bgcolor = _b1, text_size = size.small)
-    table.cell(zbTable, 1, 6, not vOpen ? "フラット" :
+    table.cell(zbTable, 0, 7, "① 保有中", text_color = color.white, bgcolor = _b1, text_size = size.small)
+    table.cell(zbTable, 1, 7, not vOpen ? "フラット" :
          (vDir > 0 ? "LONG " : "SHORT ") + "Zone #" + str.tostring(vZoneId) +
          "  |  Entry " + f_num(vEntry, "#.##") +
          "  |  SL " + f_num(vSl, "#.##") + " / TP " + f_num(vTp, "#.##") +
@@ -1312,17 +1368,15 @@ if showStatTable and barstate.islast
          "  |  " + str.tostring(bar_index - vEntryBar) + " bars",
          text_color = color.white, bgcolor = _b1, text_size = size.small)
 
-    table.cell(zbTable, 0, 7, "③ 待機注文", text_color = color.white, bgcolor = _b3, text_size = size.small)
-    table.cell(zbTable, 1, 7, not enableStrategy ? "Executable Strategy = OFF" :
-         exDir == 0 ? "なし" :
-         (exDir > 0 ? "LONG " : "SHORT ") + (exIsStop ? "STOP " : "LIMIT ") +
-         "Zone #" + str.tostring(exId) +
-         "  |  " + f_num(exRef, "#.##") +
-         "  |  次は " + str.tostring(exTouch + 1) + " 回目" +
-         "  |  距離 " + f_num(exDist, "#.##") + "$",
+    table.cell(zbTable, 0, 8, "③ 待機注文", text_color = color.white, bgcolor = _b3, text_size = size.small)
+    table.cell(zbTable, 1, 8, not enableStrategy ? "Executable Strategy = OFF" :
+         strategy.position_size != 0 ? "保有中のため待機注文なし" :
+         exOrdersNow == 0 ? "候補 Zone なし" :
+         str.tostring(exOrdersNow) + " 本 (有効な全 Zone へ Limit / Stop を同時発注 · OCA cancel)",
          text_color = color.white, bgcolor = _b3, text_size = size.small)
 
-    table.cell(zbTable, 0, 8, "注意", text_color = color.white, bgcolor = _b2, text_size = size.small)
-    table.cell(zbTable, 1, 8,
-         "① は Touch Event だけで組み立てており strategy.* を一切参照しない。CSV 再現の確認は必ず ① を見ること。",
+    table.cell(zbTable, 0, 9, "注意", text_color = color.white, bgcolor = _b2, text_size = size.small)
+    table.cell(zbTable, 1, 9,
+         "① は Touch Event だけで組み立てており strategy.* を一切参照しない。CSV 再現の確認は必ず ① を見ること。" +
+         " ③ の候補 Zone / Direction / Entry Mode / refPrice は ① と同一。残差は約定タイミングの制約のみ。",
          text_color = color.white, bgcolor = _b2, text_size = size.small)
