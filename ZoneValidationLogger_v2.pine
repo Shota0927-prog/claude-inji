@@ -1,0 +1,1796 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  Zone Validation Logger  ―  Zone 検証用 CSV ロガー (観測専用 Indicator)
+//  ★ ZoneEngine v11 + ZoneLevelEngine v2 対応版 ★
+// ----------------------------------------------------------------------------
+//  ■ 今回の変更点 (既存の検証方式は一切壊していない)
+//    1) import を ZoneEngine/11 + ZoneLevelEngine/2 へ更新。
+//       v11 の変更点は trackId continuity だけ:
+//         ・center 距離 <= clusterDist
+//         ・共通 UID >= 1
+//         ・commonUID / OLD source count >= trackContinuity
+//       Source が追加されただけでは新 ID にしない。
+//    2) ZoneFeed へ base* を追加 (v10 以降の ZoneEngine は Zone State 更新に
+//       これらを使うため必須)。このロガーは XAUUSD 5分足専用なので
+//       Base TF = チャート 5分足。したがって built-in をそのまま渡す。
+//       brClose / brHigh / brLow / brEval の定義と位相は一切変更していない。
+//    3) zn.update() を barstate.isconfirmed でゲート (確定5分足 1 本につき 1 回)。
+//    4) ZoneLevelEngine v2 を追加し、同じく確定5分足 1 本につき 1 回だけ
+//       beginBaseBar -> feedZone -> endBaseBar を回す。
+//    5) VEvent / CSV へ Zone Level 列を 4 本追加 (zoneLevel / levelTouchCnt /
+//       levelBirthScore / levelSync)。既存列は 1 本も削除していない。
+//
+//    ★ 既存の MFE / Hit / Break / Queue / Source追加分析 / Freshness /
+//      vzTouchCnt / vzArmed / vzLastDir / Birth Snapshot は削除も置換もしていない ★
+//      ZoneLevelEngine の TouchCount と既存 Logger の TouchCount が一致するかを
+//      EV_levelSync で CSV 上から確認できるようにしてある。
+//
+//    ★ Level を Logger 側で再計算していない ★
+//      EV_zoneLevel は必ず ZoneLevelEngine v2 の zoneLevel をそのまま保存する。
+//      birthScore >= 10 / touchCnt >= 3 のような独自計算はこのファイルに無い。
+//      Strategy / Display / Validation がすべて同じ LevelEngine を参照する。
+//
+// ----------------------------------------------------------------------------
+//  ★ このファイルは「Zone Box Display」をベースにした 検証専用 Indicator。
+//    Zone Engine 本体部分 (01 / 01D / 02 / 03 / zn.update) は Zone Box Display から
+//    1行も書き換えずに移植している。
+//    Section 09 (DISPLAY) は表示のみ Raw Strength + Freshness (FRESH / USED) 表示へ
+//    拡張しているが、ZoneEngine の状態 / Score / Strength / Zone生成 には影響しない
+//    (読み取りのみ / 書き戻し無し)。
+//    → 同じ銘柄・同じ時間足・同じ設定なら
+//      Zone位置 / Zone数 / Score / Strength / State / Reaction / HTF / Sources は
+//      Zone Box Display と一致する。
+//    ※ Reaction Score Bonus を既定 OFF にしているため、Reaction が発生した Zone の
+//      Score / Strength だけは Zone Box Display と異なる (下記参照)。
+//      input "Use Reaction Score Bonus" を ON にすれば旧来と同じ値に戻る。
+//
+//  ★ 検証処理は必ず zn.update() より後ろ (Section 08b / 09 / 10) にある。
+//    ZoneEngine の状態を読むだけで、書き戻しは一切行わない。
+//    検証側で Zone を作らない / 消さない / Score も Strength も State も触らない。
+//    → 検証処理を ON/OFF しても Zone の位置・数・Score・Strength・State は不変。
+//
+//  ★ Strength と Freshness は「完全な別軸」
+//    ・Strength は常に Raw Strength (ZoneEngine が Score / HTF条件 から算出した
+//      z.strength) をそのまま使う。Touch 回数による降格は行わない。
+//      → Raw Very Strong は Touch 何回でも Very Strong のまま。
+//    ・Touch による消耗は Freshness として別に持つ (Section 08b)。
+//        Touch 0〜2回 → FRESH / Touch 3回以上 → USED
+//    ・分析は「Raw Strength × Freshness」で行う
+//      (CSV では EV_originalStrength × EV_durability)。
+//    ・さらに今回、実戦用 Zone Level (EV_zoneLevel) が第3の軸として加わる。
+//      Raw Strength / Freshness / Zone Level の 3 つはすべて別軸。
+//
+//  ★ 目的
+//    TradingView の「Export chart data」で CSV 化し、Python 等で
+//    「どの条件の Zone が機能し、どの条件で突破されるか」を統計解析する。
+//
+//  ★ このファイルが持たないもの
+//    Entry判定 / 発注 / SL・TP / アラート / Strategy要素は一切無い。
+//    ZoneEngine Library も Zone Box Display も Zone Strategy も変更していない。
+//
+//  ★ Reaction Score Bonus は既定 OFF
+//    Reaction 回数に応じた Score 加点だけを止めている
+//    (ZoneCfg へ reactionBonus1/2/3 = 0.0 を渡す。ZoneEngineLib は未変更)。
+//    Reaction 検出 / reactionCnt / Reaction Re-arm / Reaction 表示 は従来どおり維持。
+//    input "Use Reaction Score Bonus" を ON にすれば旧仕様に戻せる。
+//
+//  ★ 「やらないこと」(ZoneEngine 本体へは手を入れない)
+//    Strength Threshold変更 / Very Strong条件変更 / Score Weight変更 /
+//    Score からの減点 (Touch / Zone Age いずれも) /
+//    Source Weight変更 / HTF条件変更 / Break Buffer変更 / Zone Width変更。
+//    検証用 Strength 分類 / Base Strength / Freshness はすべて「別変数」であり、
+//    ZoneEngine の score / strength は不変。
+//
+//  セクション構成:
+//    01.  ZONE ENGINE INPUTS   (Zone Box Display からそのまま)
+//    01D. DISPLAY INPUTS       (同上)
+//    02.  ENGINE INITIALIZATION(同上)
+//    03.  EXTERNAL DATA FEED   (同上・zn.update() まで)
+//    08b. ZONE FRESHNESS       (TouchCount と FRESH / USED)
+//    09.  DISPLAY              (Zone Box Display ベース。Raw Strength + Freshness 表示)
+//    10.  VALIDATION LOGGER    (CSV検証イベント)
+//    10.2b ZONE LEVEL ENGINE   (★ 今回追加。確定5分足1本につき1回)
+//
+//  前提: チャート時間足 = 5分足 / 銘柄 = XAUUSD 系。
+//        ★ Base TF もこのチャート時間足 (5分) と同一 ★
+// ============================================================================
+
+//@version=5
+indicator(
+     title             = "Zone Validation Logger",
+     shorttitle        = "ZONE VAL",
+     overlay           = true,
+     dynamic_requests  = true,
+     max_boxes_count   = 500,
+     max_labels_count  = 500,
+     max_lines_count   = 200
+ )
+
+// ★★★ Library import ★★★
+//  ZoneEngine      … Zone生成 / 位置 / State / trackId / Score / Strength
+//  ZoneLevelEngine … BirthScore + TouchCount から実戦用 Zone Level を算出
+//  SignalEngine は使わない。
+//
+//  ※ publish 後のバージョン番号が下記と違う場合は、この 2 行を実際の番号へ
+//    書き換えること。
+import sekine3310/ZoneEngine/11 as zn
+import sekine3310/ZoneLevelEngine/2 as zl
+
+// Library内の定数と同じ値 (定数exportはPineのバージョン依存機能のため再宣言する)
+int ST_ACTIVE  = 0
+int ST_SUPPORT = 1
+int ST_RESIST  = 2
+int ST_BROKEN  = 3
+int SR_WEAK    = 1
+int SR_MEDIUM  = 2
+int SR_STRONG  = 3
+int SR_VSTRONG = 4
+
+// ---- Gold Only (表示ゲート) ------------------------------------------------
+//  ★ このIndicatorは XAUUSD / GOLD 系チャート専用。
+//    Gold以外の銘柄では Zone Box / Strength Label / 詳細 Zone Label /
+//    MA Source Lines を一切描画しない。
+//  ★ 完全一致判定にしない理由:
+//    ブローカーによって XAUUSD / XAUUSD.P / GOLD / GOLDUSD など表記が異なるため、
+//    syminfo.ticker に "XAU" または "GOLD" を含んでいればGoldとして扱う。
+//  ★ Gold判定は「表示ゲート」にだけ使う。
+//    request.security() / ZoneFeed / zn.update() / ZoneCfg / Zone生成 / Score /
+//    Strength / Cluster / Reaction / Break / Flip / Lifetime には一切入れない。
+//    → Gold上での Zone位置 / Zone数 / Score / Strength / State は
+//      この修正の前後で完全に一致する。
+bool isGold = str.contains(str.upper(syminfo.ticker), "XAU") or
+     str.contains(str.upper(syminfo.ticker), "GOLD")
+
+// 表示用の小さなヘルパー (Zone Label のスコア表示に使う)
+f_num(float v, string fmt) =>
+    na(v) ? "-" : str.tostring(v, fmt)
+
+// ============================================================================
+// 01. ZONE ENGINE INPUTS
+// ----------------------------------------------------------------------------
+//  ★ 元 Strategy の「01-2. ZONE ENGINE INPUTS」をそのまま移植。
+//    変数名 / 初期値 / options / minval / maxval / step / tooltip は一切変更していない。
+// ============================================================================
+// ---- 2.1 Zone Geometry -----------------------------------------------------
+var string G_ZONE = "02 · Zone Geometry"
+zoneHalfWidth = input.float(5.0, "Zone Half Width ($)", minval = 0.1, step = 0.5, group = G_ZONE,
+     tooltip = "Zone = 中心価格 ± この値。Strengthによって幅は変えない。")
+
+// ---- 2.2 MA Source (1分足コンテキストで直接計算) ---------------------------
+var string G_MA = "02 · MA Source"
+maTf = input.timeframe("1", "MA Timeframe", group = G_MA,
+     tooltip = "既定 1分足。1分足コンテキスト内でMAを計算し、その結果を5分足へ取得する。")
+maType = input.string("EMA", "MA Type", options = ["SMA", "EMA"], group = G_MA)
+useMaSource = input.bool(true, "Enable MA Source", group = G_MA)
+// ★ ma1Len / ma2Len / 各TF は request.security・zn.maPack へ渡すため
+//   「input変数のまま (simple修飾)」保持する。UDTのフィールド読み出しは series 扱いになり、
+//   request.security の timeframe や ta.ema の length には使えないため。
+ma1Len = input.int(2000, "MA #1 Length", minval = 1, maxval = 4999, group = G_MA)
+ma2Len = input.int(3000, "MA #2 Length", minval = 1, maxval = 4999, group = G_MA)
+slopeLookback = input.int(60, "Slope Lookback (MA TF bars)", minval = 1, group = G_MA)
+scoreMa1 = input.float(2.0, "Base Score · MA #1", step = 0.5, group = G_MA)
+scoreMa2 = input.float(2.0, "Base Score · MA #2", step = 0.5, group = G_MA)
+
+// ---- 2.3 MA Slope ----------------------------------------------------------
+var string G_SLOPE = "02 · MA Slope"
+slopeThrMod = input.float(1.0, "Slope Threshold · Moderate ($/lookback)", step = 0.1, group = G_SLOPE)
+slopeThrStrong = input.float(3.0, "Slope Threshold · Strong ($/lookback)",   step = 0.1, group = G_SLOPE)
+slopeBonusFlat = input.float(0.0, "Slope Bonus · Flat",     step = 0.5, group = G_SLOPE)
+slopeBonusMod = input.float(1.0, "Slope Bonus · Moderate", step = 0.5, group = G_SLOPE)
+slopeBonusStr = input.float(2.0, "Slope Bonus · Strong",   step = 0.5, group = G_SLOPE)
+slopeBonusMode = input.string("Sum (per MA)", "Slope Bonus Aggregation in Cluster",
+     options = ["Sum (per MA)", "Max"], group = G_SLOPE,
+     tooltip = "同一Cluster内に2000MAと3000MAが両方入った場合、Slope Bonusを合算するか最大値のみ採用するか。")
+maClusterDist = input.float(20.0, "MA Cluster Distance ($)", step = 1.0, group = G_SLOPE)
+maClusterBonus = input.float(1.0, "MA Cluster Bonus",              step = 0.5, group = G_SLOPE)
+maClusterDirBonus = input.float(1.0, "MA Cluster Bonus · Same Slope", step = 0.5, group = G_SLOPE)
+
+// ---- 2.4 Horizontal Source -------------------------------------------------
+var string G_HZ = "02 · Horizontal Source (Swing)"
+useHzSource = input.bool(true, "Enable Horizontal Source", group = G_HZ)
+hzTf1 = input.timeframe("5",  "Horizontal TF #1", group = G_HZ)
+hzTf2 = input.timeframe("15", "Horizontal TF #2", group = G_HZ)
+hzTf3 = input.timeframe("60", "Horizontal TF #3", group = G_HZ)
+pivLen1 = input.int(10, "Swing Pivot Length · TF #1", minval = 1, group = G_HZ)
+pivLen2 = input.int(8,  "Swing Pivot Length · TF #2", minval = 1, group = G_HZ)
+pivLen3 = input.int(6,  "Swing Pivot Length · TF #3", minval = 1, group = G_HZ)
+scoreHz1 = input.float(1.0, "Base Score · TF #1 Swing", step = 0.5, group = G_HZ)
+scoreHz2 = input.float(2.0, "Base Score · TF #2 Swing", step = 0.5, group = G_HZ)
+scoreHz3 = input.float(3.0, "Base Score · TF #3 Swing", step = 0.5, group = G_HZ)
+
+// ---- 2.5 Horizontal Reaction ----------------------------------------------
+var string G_REACT = "02 · Horizontal Reaction"
+reactionDist = input.float(20.0, "Reaction Distance ($)", step = 0.5, group = G_REACT,
+     tooltip = "Zoneに接触したあと、来た方向へこの距離以上戻ればReaction 1回。")
+reactionBonus1 = input.float(1.0, "Reaction Bonus · 1 time",   step = 0.5, group = G_REACT)
+reactionBonus2 = input.float(2.0, "Reaction Bonus · 2 times",  step = 0.5, group = G_REACT)
+reactionBonus3 = input.float(3.0, "Reaction Bonus · 3+ times", step = 0.5, group = G_REACT)
+//  ★ Reaction回数によるScore加点の ON/OFF (既定 OFF = 新仕様)。
+//    OFF のとき ZoneCfg へ 0.0 を渡すため、Reaction が何回起きても Score は動かない。
+//    Reaction検出 / reactionCnt / Re-arm / 表示 / デバッグはそのまま残る
+//    (ZoneEngine 側で reactionBonus が使われているのは Score の合計式だけ)。
+//    上の reactionBonus1/2/3 は設定崩れを避けるため input として残す。
+useReactionScoreBonus = input.bool(false, "Use Reaction Score Bonus (旧仕様)", group = G_REACT,
+     tooltip = "ON にすると従来どおり Reaction 回数に応じて Score を加点する。\n" +
+     "既定 OFF: 「過去に何度も反発した = さらに強い」という評価を行わない。")
+reactionRearmDist = input.float(10.0, "Reaction Re-arm Distance ($)", step = 0.5, group = G_REACT)
+reactionAllSrc = input.bool(false, "Track Reaction on Accum / DayHL too", group = G_REACT)
+
+// ---- 2.6 Day High / Low ----------------------------------------------------
+var string G_DHL = "02 · Day High / Low"
+useDayHL = input.bool(true, "Enable Day High / Low Source", group = G_DHL)
+dayTz        = input.string("Asia/Tokyo", "Day Session Timezone", group = G_DHL)
+dayResetHour = input.int(5, "Day Reset Hour (取引日の開始時刻)", minval = 0, maxval = 23, group = G_DHL,
+     tooltip = "既定 5 = 日本時間 05:00 ～ 翌 04:59 を1取引日として扱う。0 にすると暦日基準。")
+scoreDayHL = input.float(3.0, "Base Score · Day High / Low", step = 0.5, group = G_DHL)
+carryPrevDayHL = input.bool(false, "Carry Previous Day H/L as Horizontal Zone", group = G_DHL)
+scorePrevDayHL = input.float(2.0, "Base Score · Carried Prev Day H/L", step = 0.5, group = G_DHL)
+lifePrevDayHL = input.float(5.0, "Lifetime · Carried Prev Day H/L (days)", step = 1.0, group = G_DHL)
+
+// ---- 2.7 Accumulation ------------------------------------------------------
+var string G_ACC = "02 · Accumulation"
+useAccSource = input.bool(true, "Enable Accumulation Source", group = G_ACC)
+accumModule = input.string("Accum Box (ported)", "Accum Detection Module",
+     options = ["Accum Box (ported)", "Provisional ATR (暫定)"], group = G_ACC)
+accTf1 = input.timeframe("60",  "Accum TF #1", group = G_ACC)
+accTf2 = input.timeframe("240", "Accum TF #2", group = G_ACC)
+accTf3 = input.timeframe("D",   "Accum TF #3", group = G_ACC)
+scoreAcc1 = input.float(3.0, "Base Score · TF #1 Accum", step = 0.5, group = G_ACC)
+scoreAcc2 = input.float(4.0, "Base Score · TF #2 Accum", step = 0.5, group = G_ACC)
+scoreAcc3 = input.float(5.0, "Base Score · TF #3 Accum", step = 0.5, group = G_ACC)
+accKeep1 = input.int(3, "Keep Count · TF #1 Accum (instances)", minval = 1, group = G_ACC)
+accKeep2 = input.int(2, "Keep Count · TF #2 Accum (instances)", minval = 1, group = G_ACC)
+accKeep3 = input.int(1, "Keep Count · TF #3 Accum (instances)", minval = 1, group = G_ACC)
+
+var string G_ACCP = "02a · Accum Box (ported) Parameters"
+accumRangeLen        = input.int(10,   "Accum判定レンジ本数",  minval = 6,  group = G_ACCP)
+accumBaseLen         = input.int(20,   "基準平均本数",         minval = 10, group = G_ACCP)
+accumAtrLen          = input.int(14,   "ATR本数",             minval = 1,  group = G_ACCP)
+accumMinUpperCloses  = input.int(4,    "上半分の最低終値本数",  minval = 1,  group = G_ACCP)
+accumMinLowerCloses  = input.int(4,    "下半分の最低終値本数",  minval = 1,  group = G_ACCP)
+accumMaxSameColorRun = input.int(4,    "同色連続の上限",       minval = 1,  group = G_ACCP)
+accumAtrMult         = input.float(2.5,  "Accum レンジ幅 / ATR 上限",    minval = 0.5,  step = 0.1,  group = G_ACCP)
+accumBarRatioMax     = input.float(0.70, "Accum 平均値幅/基準平均 上限", minval = 0.1,  step = 0.01, group = G_ACCP)
+accumDriftMax        = input.float(0.30, "Accum ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = G_ACCP)
+
+var string G_ACCQ = "02b · Provisional ATR Accum (暫定・本番未使用)"
+accLen1 = input.int(20, "[暫定] Accum Lookback · TF #1 (bars)", minval = 3, group = G_ACCQ)
+accLen2 = input.int(20, "[暫定] Accum Lookback · TF #2 (bars)", minval = 3, group = G_ACCQ)
+accLen3 = input.int(15, "[暫定] Accum Lookback · TF #3 (bars)", minval = 3, group = G_ACCQ)
+accMult = input.float(1.2, "[暫定] Accum Max Range / ATR", step = 0.1, minval = 0.1, group = G_ACCQ)
+
+// ---- 2.8 Cluster / Score / HTF --------------------------------------------
+var string G_CLU = "02 · Cluster"
+clusterDist = input.float(20.0, "Cluster Distance ($)", step = 1.0, group = G_CLU)
+
+var string G_SCORE = "02 · Strength Score"
+thrMedium = input.float(5.0,  "Medium Score Threshold",      step = 0.5, group = G_SCORE)
+thrStrong = input.float(10.0, "Strong Score Threshold",      step = 0.5, group = G_SCORE)
+thrVStrong = input.float(15.0, "Very Strong Score Threshold", step = 0.5, group = G_SCORE)
+confBonus2 = input.float(1.0, "Confluence Bonus · 2 categories",  step = 0.5, group = G_SCORE)
+confBonus3 = input.float(2.0, "Confluence Bonus · 3 categories",  step = 0.5, group = G_SCORE)
+confBonus4 = input.float(3.0, "Confluence Bonus · 4+ categories", step = 0.5, group = G_SCORE)
+flipBonus = input.float(2.0, "Flip Bonus", step = 0.5, group = G_SCORE)
+
+var string G_HTF = "02a · Very Strong · Higher TF Structure"
+requireHtfForVStrong = input.bool(true, "Require Higher TF Structure for Very Strong", group = G_HTF)
+htfSwing1H = input.bool(true,  "Count 1H Swing (TF #3) as Higher TF",    group = G_HTF)
+htfAccum1H = input.bool(true,  "Count 1H Accum (TF #1) as Higher TF",    group = G_HTF)
+htfAccum4H = input.bool(true,  "Count 4H Accum (TF #2) as Higher TF",    group = G_HTF)
+htfAccumD = input.bool(true,  "Count Daily Accum (TF #3) as Higher TF", group = G_HTF)
+htfSwing15M = input.bool(false, "Count 15M Swing (TF #2) as Higher TF",   group = G_HTF)
+htfMa1 = input.bool(false, "Count MA #1 (2000) as Higher TF",        group = G_HTF)
+htfMa2 = input.bool(false, "Count MA #2 (3000) as Higher TF",        group = G_HTF)
+htfDayHL = input.bool(false, "Count Day High / Low as Higher TF",      group = G_HTF)
+
+// ---- 2.9 Break / Flip / Lifetime ------------------------------------------
+var string G_BF = "02 · Break / Flip"
+breakTf = input.timeframe("5", "Break Evaluation Timeframe", group = G_BF,
+     tooltip = "Breakはヒゲではなくこの時間足の確定終値で判定する。")
+breakBuffer = input.float(5.0,  "Break Buffer ($)",         step = 0.5, group = G_BF)
+flipConfirmDist = input.float(10.0, "Flip Confirm Distance ($)", step = 0.5, group = G_BF)
+resetOnReclaim = input.bool(true,  "Reset Broken on Reclaim", group = G_BF)
+trackStaleBars = input.int(500, "Zone State Retention (bars without match)", minval = 10, group = G_BF)
+trackContinuity = input.float(0.5, "Zone Track · Min Source Continuity", minval = 0.01, maxval = 1.0, step = 0.05, group = G_BF)
+
+var string G_LIFE = "02 · Zone Lifetime"
+lifeHz1 = input.float(5.0,  "Lifetime · TF #1 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeHz2 = input.float(10.0, "Lifetime · TF #2 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeHz3 = input.float(30.0, "Lifetime · TF #3 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeExtendOn = input.bool(true,  "Extend Lifetime on Reaction / Flip", group = G_LIFE)
+lifeExtendRatio = input.float(0.5,  "Lifetime Extension Ratio", step = 0.1, minval = 0.0, group = G_LIFE)
+maxPersistZones = input.int(200, "Max Persistent Raw Zones", minval = 20, maxval = 800, group = G_LIFE)
+
+// ---- 2.10 Structural SL / TP ----------------------------------------------
+var string G_SLTP = "02 · Structural SL / TP"
+slBuffer = input.float(5.0,  "SL Buffer ($)", step = 0.5, group = G_SLTP)
+tpBuffer = input.float(0.0,  "TP Buffer ($)", step = 0.5, group = G_SLTP)
+maxSlDist = input.float(30.0, "Max SL Distance ($)", step = 1.0, group = G_SLTP)
+minStructRR = input.float(1,  "Minimum Structural RR", step = 0.1, group = G_SLTP,
+     tooltip = "Structural TPが存在する場合、この値未満のRRならエントリー禁止 (固定RR TPへ逃げない)。")
+tpMode = input.string("BOTH", "TP Mode", options = ["BOTH", "STRUCTURAL_ONLY", "FALLBACK_ONLY"], group = G_SLTP,
+     tooltip = "Structural TP と Fallback RR TP の成績を切り分けて検証するための採用フィルター。\n" +
+     "BOTH            : 現行動作。Structural TPがあればそれを使い、無ければFallback RR TP。\n" +
+     "STRUCTURAL_ONLY : Structural TPが存在するトレードのみ発注。無い場合はFallbackを作らずNoTrade。\n" +
+     "FALLBACK_ONLY   : Structural TPが存在しなかったシグナルのみFallback RR TPで発注。\n" +
+     "                  (Structural TPを無視してRR TPへ差し替えるのではなく、そのシグナル自体を除外する)\n" +
+     "SL判定 (Active Zone / SL Zone / SL距離) は3モードとも完全共通。")
+slMinScore = input.float(4.0,  "SL Zone · Min Score", step = 0.5, group = G_SLTP)
+slMinStrStr  = input.string("Medium", "SL Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+tpMinScore = input.float(7.0,  "TP Zone · Min Score", step = 0.5, group = G_SLTP)
+tpMinStrStr  = input.string("Strong", "TP Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+obsMinStrStr = input.string("Medium", "Obstacle · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+activeNoTradeMinStrStr = input.string("Medium", "Active Zone NoTrade · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP,
+     tooltip = "Entry価格がこのStrength以上の ACTIVE Zone (現在価格がZone内部) の中に\n" +
+               "ある場合は NO TRADE にする。Structural SL / TP が存在しても、\n" +
+               "Fallback RR TP も使わずエントリーを見送る。Long / Short 共通。")
+fallbackRR = input.float(2.0, "Fallback RR (Structural TPが無い場合のみ使用)", step = 0.1, minval = 0.1, group = G_SLTP,
+     tooltip = "有効なTP Zoneが見つからない場合のみ、Structural SL距離 × この値でTPを作る。")
+
+
+// ============================================================================
+// 01D. DISPLAY INPUTS
+// ----------------------------------------------------------------------------
+//  ★ 元 Strategy の「01-5. DISPLAY / DEBUG INPUTS」のうち Zone Display だけ。
+//    Zone表示専用Indicatorとしての既定値だけを変更している:
+//      showMaLines   : 削除 (Section 09.2 参照 / plot枠 64 本制限)
+//      showLabels    : true  → false  (Zone Labelは既定OFF)
+//    それ以外 (変数名 / options / minval / maxval / step) は変更していない。
+//    Zone Label をONにすれば State / Score / Strength / HTF / Reaction /
+//    Flip / Sources は従来どおり表示できる。
+// ============================================================================
+// ---- 2.11 Zone Display -----------------------------------------------------
+var string G_DISP = "05 · Display · Zone"
+showZones     = input.bool(true,  "Show Zones (box)",          group = G_DISP)
+showLabels    = input.bool(false, "Show Zone Labels",          group = G_DISP)
+showDetailLbl = input.bool(false, "Detailed Labels (sources)", group = G_DISP)
+//  ★ showLabels (詳細ラベル: State / Score / Strength / HTF / Reaction / Flip /
+//    Sources) とは完全に別物。こちらは Strength だけを常時簡潔に表示する専用ラベル。
+//    両方ONにすれば簡易ラベルと詳細ラベルが両方出る。
+showStrengthLabel = input.bool(true, "Show Strength Label", group = G_DISP)
+maxZonesDraw  = input.int(30, "Max Zones Drawn", minval = 1, maxval = 120, group = G_DISP)
+zoneLeftBars  = input.int(150, "Zone Box · Left Extension (bars)",  minval = 1, group = G_DISP)
+zoneRightBars = input.int(30,  "Zone Box · Right Extension (bars)", minval = 1, group = G_DISP)
+colSupport    = input.color(color.new(#26A69A, 0), "Color · Support",    group = G_DISP)
+colResistance = input.color(color.new(#EF5350, 0), "Color · Resistance", group = G_DISP)
+colActive     = input.color(color.new(#FFB300, 0), "Color · Active",     group = G_DISP)
+colBroken     = input.color(color.new(#78909C, 0), "Color · Broken",     group = G_DISP)
+trWeak        = input.int(90, "Transparency · Weak",        minval = 0, maxval = 100, group = G_DISP)
+trMedium      = input.int(80, "Transparency · Medium",      minval = 0, maxval = 100, group = G_DISP)
+trStrong      = input.int(68, "Transparency · Strong",      minval = 0, maxval = 100, group = G_DISP)
+trVStrong     = input.int(55, "Transparency · Very Strong", minval = 0, maxval = 100, group = G_DISP)
+
+// ============================================================================
+// 02. ENGINE INITIALIZATION
+// ----------------------------------------------------------------------------
+//  Zone Engine のみ。SignalEngine 系の Engine は持たない。
+// ============================================================================
+
+// ---- 2.1 Engine ------------------------------------------------------------
+var zn.ZoneEngine zoneEng = zn.newEngine()
+
+// ---- 2.2 Zone Engine Config (元 Strategy の 2.2 をそのまま移植) ------------
+zn.ZoneCfg zoneCfg = zn.newCfg()
+zoneCfg.zoneHalfWidth        := zoneHalfWidth
+zoneCfg.useMaSource          := useMaSource
+zoneCfg.maTfName             := maTf
+zoneCfg.ma1Len               := ma1Len
+zoneCfg.ma2Len               := ma2Len
+zoneCfg.scoreMa1             := scoreMa1
+zoneCfg.scoreMa2             := scoreMa2
+zoneCfg.slopeThrMod          := slopeThrMod
+zoneCfg.slopeThrStrong       := slopeThrStrong
+zoneCfg.slopeBonusFlat       := slopeBonusFlat
+zoneCfg.slopeBonusMod        := slopeBonusMod
+zoneCfg.slopeBonusStr        := slopeBonusStr
+zoneCfg.slopeBonusMax        := slopeBonusMode == "Max"
+zoneCfg.maClusterDist        := maClusterDist
+zoneCfg.maClusterBonus       := maClusterBonus
+zoneCfg.maClusterDirBonus    := maClusterDirBonus
+zoneCfg.useHzSource          := useHzSource
+zoneCfg.hzTf1                := hzTf1
+zoneCfg.hzTf2                := hzTf2
+zoneCfg.hzTf3                := hzTf3
+zoneCfg.scoreHz1             := scoreHz1
+zoneCfg.scoreHz2             := scoreHz2
+zoneCfg.scoreHz3             := scoreHz3
+zoneCfg.reactionDist         := reactionDist
+//  ★ useReactionScoreBonus == false のとき 0.0 を渡し、Score加点だけを無効化する。
+//    ZoneEngineLib は未変更 (f_reactionBonus が 0.0 を返すだけ)。
+zoneCfg.reactionBonus1       := useReactionScoreBonus ? reactionBonus1 : 0.0
+zoneCfg.reactionBonus2       := useReactionScoreBonus ? reactionBonus2 : 0.0
+zoneCfg.reactionBonus3       := useReactionScoreBonus ? reactionBonus3 : 0.0
+zoneCfg.reactionRearmDist    := reactionRearmDist
+zoneCfg.reactionAllSrc       := reactionAllSrc
+zoneCfg.useDayHL             := useDayHL
+zoneCfg.scoreDayHL           := scoreDayHL
+zoneCfg.carryPrevDayHL       := carryPrevDayHL
+zoneCfg.scorePrevDayHL       := scorePrevDayHL
+zoneCfg.lifePrevDayHL        := lifePrevDayHL
+zoneCfg.useAccSource         := useAccSource
+zoneCfg.accTf1               := accTf1
+zoneCfg.accTf2               := accTf2
+zoneCfg.accTf3               := accTf3
+zoneCfg.scoreAcc1            := scoreAcc1
+zoneCfg.scoreAcc2            := scoreAcc2
+zoneCfg.scoreAcc3            := scoreAcc3
+zoneCfg.accKeep1             := accKeep1
+zoneCfg.accKeep2             := accKeep2
+zoneCfg.accKeep3             := accKeep3
+zoneCfg.clusterDist          := clusterDist
+zoneCfg.thrMedium            := thrMedium
+zoneCfg.thrStrong            := thrStrong
+zoneCfg.thrVStrong           := thrVStrong
+zoneCfg.confBonus2           := confBonus2
+zoneCfg.confBonus3           := confBonus3
+zoneCfg.confBonus4           := confBonus4
+zoneCfg.flipBonus            := flipBonus
+zoneCfg.requireHtfForVStrong := requireHtfForVStrong
+zoneCfg.htfSwing1H           := htfSwing1H
+zoneCfg.htfAccum1H           := htfAccum1H
+zoneCfg.htfAccum4H           := htfAccum4H
+zoneCfg.htfAccumD            := htfAccumD
+zoneCfg.htfSwing15M          := htfSwing15M
+zoneCfg.htfMa1               := htfMa1
+zoneCfg.htfMa2               := htfMa2
+zoneCfg.htfDayHL             := htfDayHL
+zoneCfg.breakBuffer          := breakBuffer
+zoneCfg.flipConfirmDist      := flipConfirmDist
+zoneCfg.resetOnReclaim       := resetOnReclaim
+zoneCfg.trackStaleBars       := trackStaleBars
+zoneCfg.trackContinuity      := trackContinuity
+zoneCfg.lifeHz1              := lifeHz1
+zoneCfg.lifeHz2              := lifeHz2
+zoneCfg.lifeHz3              := lifeHz3
+zoneCfg.lifeExtendOn         := lifeExtendOn
+zoneCfg.lifeExtendRatio      := lifeExtendRatio
+zoneCfg.maxPersistZones      := maxPersistZones
+zoneCfg.slBuffer             := slBuffer
+zoneCfg.tpBuffer             := tpBuffer
+zoneCfg.maxSlDist            := maxSlDist
+zoneCfg.minStructRR          := minStructRR
+zoneCfg.slMinScore           := slMinScore
+zoneCfg.slMinStrength        := zn.strengthIdx(slMinStrStr)
+zoneCfg.tpMinScore           := tpMinScore
+zoneCfg.tpMinStrength        := zn.strengthIdx(tpMinStrStr)
+zoneCfg.obsMinStrength       := zn.strengthIdx(obsMinStrStr)
+zoneCfg.activeNoTradeMinStrength := zn.strengthIdx(activeNoTradeMinStrStr)
+zoneCfg.fallbackRR           := fallbackRR
+
+// ============================================================================
+// 03. EXTERNAL DATA FEED
+// ----------------------------------------------------------------------------
+//  Library は request.*() を呼べないため、外部足の取得はすべてここで行う。
+//  ★ 元 Strategy の「03.2 Zone Engine Feed」をそのまま移植 ★
+//    request.security の TF / 式 / lookahead / 取得条件 (if useXxxSource) も
+//    1行も変更していない。したがって Zone 時系列は Strategy と完全一致する。
+//
+//  ★ request.* の本数
+//    MA×1 / Swing×3 / Accum×3 / Break×1 = 8 (Strategy の Zone分と同数)
+// ============================================================================
+
+// ---- 3.2 Zone Engine Feed --------------------------------------------------
+// ★ MA2000 / MA3000 : zn.maPack() を 1分足コンテキストで評価させる。
+//   maPack() の中身は ta.ema(close, 2000) 等であり、この close は1分足のclose。
+//   → 5分足closeからの再計算ではない。
+//  ★ Source が OFF のときは取得自体を行わない (結果不変・下の理由による) ★
+//    Library 側は MA / Swing / Accum のどれも
+//      「c.useXxxSource が true」かつ「値が na でない」
+//    ときにしか Zone を登録しない。OFF のとき取得値は元々一切使われていないため、
+//    na を渡すのと実測値を渡すのは Zone 時系列に対して完全に等価。
+//    エッジ検出 (nPh1 / nAc1 等) も not na(...) を要求するので false のまま。
+float ma1Val   = na
+float ma1Delta = na
+float ma2Val   = na
+float ma2Delta = na
+if useMaSource
+    [_m1, _m1d, _m2, _m2d] = request.security(syminfo.tickerid, maTf,
+         zn.maPack(maType, ma1Len, ma2Len, slopeLookback), lookahead = barmerge.lookahead_off)
+    ma1Val   := _m1
+    ma1Delta := _m1d
+    ma2Val   := _m2
+    ma2Delta := _m2d
+
+float ph1 = na
+int   ph1T = na
+float pl1 = na
+int   pl1T = na
+float ph2 = na
+int   ph2T = na
+float pl2 = na
+int   pl2T = na
+float ph3 = na
+int   ph3T = na
+float pl3 = na
+int   pl3T = na
+if useHzSource
+    [_h1, _h1t, _l1, _l1t] = request.security(syminfo.tickerid, hzTf1, zn.pivotPack(pivLen1), lookahead = barmerge.lookahead_off)
+    [_h2, _h2t, _l2, _l2t] = request.security(syminfo.tickerid, hzTf2, zn.pivotPack(pivLen2), lookahead = barmerge.lookahead_off)
+    [_h3, _h3t, _l3, _l3t] = request.security(syminfo.tickerid, hzTf3, zn.pivotPack(pivLen3), lookahead = barmerge.lookahead_off)
+    ph1 := _h1
+    ph1T := _h1t
+    pl1 := _l1
+    pl1T := _l1t
+    ph2 := _h2
+    ph2T := _h2t
+    pl2 := _l2
+    pl2T := _l2t
+    ph3 := _h3
+    ph3T := _h3t
+    pl3 := _l3
+    pl3T := _l3t
+
+bool usePortedAccum = accumModule == "Accum Box (ported)"
+float acc1Hi = na
+float acc1Lo = na
+int   acc1Id = na
+float acc2Hi = na
+float acc2Lo = na
+int   acc2Id = na
+float acc3Hi = na
+float acc3Lo = na
+int   acc3Id = na
+if useAccSource
+    [_a1h, _a1l, _a1i] = request.security(syminfo.tickerid, accTf1,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen1, accMult), lookahead = barmerge.lookahead_off)
+    [_a2h, _a2l, _a2i] = request.security(syminfo.tickerid, accTf2,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen2, accMult), lookahead = barmerge.lookahead_off)
+    [_a3h, _a3l, _a3i] = request.security(syminfo.tickerid, accTf3,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen3, accMult), lookahead = barmerge.lookahead_off)
+    acc1Hi := _a1h
+    acc1Lo := _a1l
+    acc1Id := _a1i
+    acc2Hi := _a2h
+    acc2Lo := _a2l
+    acc2Id := _a2i
+    acc3Hi := _a3h
+    acc3Lo := _a3l
+    acc3Id := _a3i
+
+// Break判定は breakTf の「確定終値」のみ (ヒゲでは判定しない)
+//  ★ 定義と位相は一切変更していない ★
+[brCloseRaw, brHighRaw, brLowRaw] = request.security(syminfo.tickerid, breakTf, [close, high, low],
+     lookahead = barmerge.lookahead_off)
+bool  brBarClosed = bar_index > 0 and not na(time(breakTf)) and nz(ta.change(time(breakTf)), 0) != 0
+float brClose = brBarClosed ? brCloseRaw[1] : na
+float brHigh  = brBarClosed ? brHighRaw[1]  : na
+float brLow   = brBarClosed ? brLowRaw[1]   : na
+bool  brEval  = brBarClosed and not na(brClose)
+
+// 取引日ID (timestamp/hour の timezone は series 不可なので Main で計算する)
+int _locY = year(time, dayTz)
+int _locM = month(time, dayTz)
+int _locD = dayofmonth(time, dayTz)
+int _locH = hour(time, dayTz)
+int _calDayNo    = int(timestamp(dayTz, _locY, _locM, _locD, 0, 0) / 86400000)
+int tradingDayId = _locH < dayResetHour ? _calDayNo - 1 : _calDayNo
+
+//  ★ v11 対応 : base* を追加 ★
+//    v10 以降の ZoneEngine は Zone State 更新 (Day H/L / Reaction / Natural State /
+//    MA slope / createdBar / breakBar / lastSeenBar / Zone 寿命) に
+//    built-in ではなく ZoneFeed の base* を使う。未指定だと na になり、
+//    Zone が常に ACTIVE のままになるため必須。
+//    このロガーは XAUUSD 5分足専用で Base TF = チャート 5分足なので、
+//    built-in をそのまま渡せば v9 以前と同じ意味になる。
+zn.ZoneFeed zoneFeed = zn.ZoneFeed.new(
+     ma1 = ma1Val, ma1d = ma1Delta, ma2 = ma2Val, ma2d = ma2Delta,
+     ph1 = ph1, ph1t = ph1T, pl1 = pl1, pl1t = pl1T,
+     ph2 = ph2, ph2t = ph2T, pl2 = pl2, pl2t = pl2T,
+     ph3 = ph3, ph3t = ph3T, pl3 = pl3, pl3t = pl3T,
+     acc1Hi = acc1Hi, acc1Lo = acc1Lo, acc1Id = acc1Id,
+     acc2Hi = acc2Hi, acc2Lo = acc2Lo, acc2Id = acc2Id,
+     acc3Hi = acc3Hi, acc3Lo = acc3Lo, acc3Id = acc3Id,
+     dayId = tradingDayId,
+     brClose = brClose, brHigh = brHigh, brLow = brLow, brEval = brEval,
+     baseOpen      = open,
+     baseHigh      = high,
+     baseLow       = low,
+     baseClose     = close,
+     basePrevClose = close[1],
+     baseTime      = time,
+     baseBarSeq    = bar_index)
+
+//  ★ ZoneEngine は確定5分足 1 本につき 1 回だけ進める ★
+//    未確定足では状態を進めない。リアルタイム足はティックごとに再実行されるため、
+//    ここを通すと Break / Flip / Lifetime / trackId が同じ足で何度も動いてしまう。
+//    ヒストリカルバーでは barstate.isconfirmed が常に true なので、
+//    CSV 出力 (過去バー) の結果はこのゲートの有無で変わらない。
+//    zoneCountNow は var。更新しないバーでは直前の Zone 数を保持する。
+var int zoneCountNow = 0
+//  診断用 : zn.update() を呼んだ回数 (Zone判定には使わない / Section 10.9 で表示)
+var int zoneUpdateCnt = 0
+if barstate.isconfirmed
+    zoneCountNow  := zn.update(zoneEng, zoneCfg, zoneFeed)
+    zoneUpdateCnt := zoneUpdateCnt + 1
+
+// ============================================================================
+// 08b. ZONE FRESHNESS (Touch回数 / FRESH · USED)
+// ----------------------------------------------------------------------------
+//  ★★★ Strength と Freshness は「完全に別軸」で持つ。
+//    ・Strength は ZoneEngine が Score / HTF条件 から算出した z.strength を
+//      そのまま使う (構造的な強さ)。Touch 回数では一切変更しない。
+//      → Raw Very Strong は Touch 5回でも Very Strong のまま。
+//    ・Touch による消耗は Freshness (FRESH / USED) として別軸で持つ。
+//    ★ Touch 回数で Strength を格下げする方式 (Very Strong → Strong 等) は
+//      採用しない。格下げすると「消耗した Very Strong」が Strong 群へ大量に
+//      混ざり、Strong 自体の統計が悪化するため。
+//  ★ Freshness 判定:
+//      Touch 0〜2回 → FRESH (2) / Touch 3回以上 → USED (1)
+//  ★ Touch 定義 (変更なし):
+//    バーのレンジが Zone と重なったら Touch。一度 Re-arm Distance 以上
+//    離れてから再接触した場合のみ次の Touch として数える。
+//    同じ接近中に Zone 内で複数バー推移しても加算されない。
+//  ★ TouchCount は vzTouchCnt 1本だけで管理する (二重管理しない)。
+//    宣言はここ (Section 09 の描画より前で必要なため)、更新は Section 10.6.1 のみ。
+//    10.6.1 は useValidation ではなく barstate.isconfirmed だけでゲートしているので、
+//    Enable Validation Logger = OFF でも TouchCount / FRESH · USED は正しく進む。
+//    Validation Logger 側の CSVイベントも同じ vzTouchCnt を参照する。
+//  ★ この既存 TouchCount は今回も削除・置換していない。
+//    ZoneLevelEngine v2 側の TouchCount とは別管理で、両者が一致するかを
+//    EV_levelSync で確認できるようにしてある。
+var map<int, int> vzTouchCnt = map.new<int, int>()
+
+var string G_FRESH = "08b · Zone Freshness (FRESH / USED)"
+durUsedTouch = input.int(3, "Freshness · USED になる Touch 回数", minval = 2, maxval = 20, group = G_FRESH,
+     tooltip = "TouchCount がこの回数以上で USED(1)。未満は FRESH(2)。\n" +
+     "Strength そのものは変更しない (完全な別軸)。現段階では細分化しない。")
+
+//  ★ Freshness コード: 2 = FRESH (Touch 0〜2回) / 1 = USED (Touch 3回以上)
+f_valDurability(int tc) =>
+    tc >= durUsedTouch ? 1 : 2
+
+f_valDurName(int d) =>
+    d == 1 ? "USED" : "FRESH"
+
+//  ★ 表示用: Zone の現在の Touch 回数 (登録簿に無ければ 0回)
+f_zoneTouchCnt(int tid) =>
+    tid >= 0 and map.contains(vzTouchCnt, tid) ? map.get(vzTouchCnt, tid) : 0
+
+// ============================================================================
+// 09. DISPLAY
+// ----------------------------------------------------------------------------
+//  ★ 元 Strategy の「09.1 Zone 描画」「09.2 MA Source の可視化」をそのまま移植。
+//    top = z.top / bottom = z.bottom / zn.drawOrder / zn.zoneAt も変更していない。
+// ============================================================================
+// ---- 9.1 Zone 描画 ---------------------------------------------------------
+var array<box>   gBoxes  = array.new<box>()
+var array<label> gLabels = array.new<label>()
+
+f_clearDrawings() =>
+    while array.size(gBoxes) > 0
+        box.delete(array.pop(gBoxes))
+    while array.size(gLabels) > 0
+        label.delete(array.pop(gLabels))
+    true
+
+f_zoneColor(int st) =>
+    st == ST_SUPPORT ? colSupport : st == ST_RESIST ? colResistance : st == ST_ACTIVE ? colActive : colBroken
+
+f_zoneTransp(int strength) =>
+    strength == SR_VSTRONG ? trVStrong : strength == SR_STRONG ? trStrong : strength == SR_MEDIUM ? trMedium : trWeak
+
+//  ★ Gold以外では描画そのものを行わない (box.new / label.new を1つも実行しない)。
+if isGold and barstate.islast
+    f_clearDrawings()
+    if showZones and zn.zoneCount(zoneEng) > 0
+        array<int> ord = zn.drawOrder(zoneEng, maxZonesDraw)
+        if array.size(ord) > 0
+            for k = 0 to array.size(ord) - 1
+                zn.Zone z = zn.zoneAt(zoneEng, array.get(ord, k))
+                color bc = f_zoneColor(z.state)
+                //  ★ Strength は Raw (z.strength) をそのまま使う。
+                //    Touch 回数による降格は行わない (Freshness は別軸)。
+                int   tr = f_zoneTransp(z.strength)
+                //  ★ Freshness (別軸): Touch 0〜2 = FRESH / 3回以上 = USED
+                int    zTc    = f_zoneTouchCnt(z.trackId)
+                string zFresh = f_valDurName(f_valDurability(zTc))
+                box b = box.new(
+                     left         = bar_index - zoneLeftBars,
+                     top          = z.top,
+                     right        = bar_index + zoneRightBars,
+                     bottom       = z.bottom,
+                     bgcolor      = color.new(bc, tr),
+                     border_color = color.new(bc, math.max(tr - 30, 0)),
+                     border_width = z.strength >= SR_STRONG ? 2 : 1,
+                     border_style = z.state == ST_BROKEN ? line.style_dashed : line.style_solid,
+                     xloc         = xloc.bar_index)
+                array.push(gBoxes, b)
+
+                //  Strength 簡易ラベル (表示専用)
+                //   ・判定は行わない。取得済みの z.strength / z.state をそのまま使う。
+                //   ・"Very Strong / USED" のように Raw Strength と Freshness を併記する。
+                //   ・Zone の位置 / 数 / 色 / 状態には一切影響しない。
+                if showStrengthLabel
+                    label sl = label.new(
+                         x         = bar_index + zoneRightBars,
+                         y         = (z.top + z.bottom) / 2,
+                         text      = zn.strengthName(z.strength) + " / " + zFresh,
+                         xloc      = xloc.bar_index,
+                         style     = label.style_label_left,
+                         color     = color.new(bc, tr),
+                         textcolor = color.white,
+                         size      = size.small)
+                    array.push(gLabels, sl)
+
+                if showLabels
+                    //  ★ 1行目: Raw Strength | Freshness | TouchCount
+                    //    2行目: State | Score | HTF   /   3行目: ReactionCnt
+                    string txt = zn.strengthName(z.strength) + " | " + zFresh + " | Touch " + str.tostring(zTc)
+                    txt := txt + "\n" + zn.stateName(z.state) + " | Score " + f_num(z.score, "#.#")
+                    txt := txt + " | HTF: " + (z.hasHtf ? z.htfSources : "NO")
+                    txt := txt + "\nReact " + str.tostring(z.reactionCnt)
+                    if z.flipped
+                        txt := txt + " | FLIP"
+                    if showDetailLbl
+                        txt := txt + "\n" + z.sources
+                    label lb = label.new(
+                         x         = bar_index + zoneRightBars,
+                         y         = z.top,
+                         text      = txt,
+                         xloc      = xloc.bar_index,
+                         style     = label.style_label_left,
+                         color     = color.new(bc, 20),
+                         textcolor = color.white,
+                         size      = size.small)
+                    array.push(gLabels, lb)
+
+// ---- 9.2 MA Source の可視化 (★ 削除: plot枠 64 本制限のため) ---------------
+//  ★★★ 重要 : TradingView の plot() 上限は 1 スクリプト 64 本 ★★★
+//    v2 化前のこのロガーは plot() を 62 本使っていた。
+//      CSV 用 EV_*                     : 56 本
+//      診断用 EV_queueLen 〜 EV_unknown: 4 本
+//      MA Source Line (表示専用)       : 2 本
+//    今回 EV_zoneLevel / EV_levelTouchCnt / EV_levelBirthScore / EV_levelSync の
+//    4 本を追加すると 66 本になり RE10140 (65 or more plots) でコンパイルできない。
+//
+//  ★ そこで「CSV列ではない plot」だけを 2 本削って 64 本ちょうどに収めた。
+//    削除したのは MA #1 (1M) / MA #2 (1M) の表示専用ライン 2 本だけ。
+//    ・既存の EV_* CSV 列は 1 本も削除していない。
+//    ・MA線は元々このロガーでは既定 OFF (showMaLines = false) だった。
+//    ・ma1Val / ma2Val は ZoneFeed へは従来どおり渡しているので、
+//      MA を Source とする Zone の生成 / Score / Strength は一切変わらない。
+//    ・MA が Source に入っているかは EV_sourceMask の bit0 / bit1 で判別できる。
+//  ★ 入力 showMaLines も「何も動かさないトグル」になるため同時に削除した。
+
+// ============================================================================
+// 10. ZONE VALIDATION LOGGER (検証専用 / 観測のみ)
+// ----------------------------------------------------------------------------
+//  ★★★ この Section より前 (01〜08 + zn.update) は Zone Box Display と完全に同一。
+//    ここから下は「既に確定した ZoneEngine の結果を観測するだけ」の処理であり、
+//    ZoneCfg / ZoneFeed / zn.update() / Zone生成 / Score / Strength / Cluster /
+//    Reaction / Break / Flip / Lifetime へは一切フィードバックしない。
+//
+//  ★ 観測専用であることの担保:
+//    ・zoneEng / zoneCfg / zoneFeed を書き換えない (読み取りのみ)。
+//    ・使用する Library 関数は zn.zoneCount() / zn.zoneAt() のみ (どちらも参照系)。
+//    ・request.security() を1本も追加しない。
+//    ・Section 09 (Zone描画) の後ろに置き、Section 09 が参照する変数を
+//      一切変更しない。
+//
+//  ★ 出力方式:
+//    完成した検証イベントを Queue に積み、1バーにつき1件だけ EV_* plot に
+//    出力する (display.data_window)。TradingView の「データウィンドウ /
+//    Export chart data」から CSV として取り出し、Python 等で集計する想定。
+// ============================================================================
+
+// ---- 10.1 検証用 Inputs ----------------------------------------------------
+var string G_VAL = "10 · Zone Validation (検証専用)"
+useValidation = input.bool(true, "Enable Validation Logger", group = G_VAL,
+     tooltip = "CSVイベント生成 / MFE追跡 / Queue出力 だけを ON/OFF する。\n" +
+     "Zone登録簿 / Touch判定 / Re-arm / TouchCount加算 は常時動作するため、\n" +
+     "OFF にしても TouchCount と FRESH / USED は正しく更新される。\n" +
+     "ZoneEngine側の結果は ON/OFF で変化しない。")
+touchRearmDist = input.float(10.0, "Touch Re-arm Distance ($)", minval = 0.0, step = 0.5, group = G_VAL,
+     tooltip = "Zoneから終値がこの距離以上離れて初めて再Touchを計上する。ZoneEngineのReaction判定とは無関係。\n" +
+     "★ この TouchCount は Freshness (FRESH / USED) の判定にも使われるため、\n" +
+     "  useValidation = false でも常時更新される。")
+evalBars = input.int(48, "Evaluation Bars", minval = 1, maxval = 500, group = G_VAL,
+     tooltip = "Touch後に追跡するバー数。5分足で48 = 4時間。")
+vSplitStrong = input.float(12.5, "Split · Strong L/H (score)", step = 0.5, group = G_VAL)
+vSplitVs1    = input.float(18.0, "Split · VeryStrong 1/2 (score)", step = 0.5, group = G_VAL)
+vSplitVs2    = input.float(22.0, "Split · VeryStrong 2/3 (score)", step = 0.5, group = G_VAL)
+vHitLv1 = input.float(10.0, "Hit Level #1 ($)", minval = 0.1, step = 0.5, group = G_VAL)
+vHitLv2 = input.float(20.0, "Hit Level #2 ($)", minval = 0.1, step = 0.5, group = G_VAL)
+vHitLv3 = input.float(30.0, "Hit Level #3 ($)", minval = 0.1, step = 0.5, group = G_VAL)
+maxActiveEvents = input.int(40, "Max Concurrent Events", minval = 1, maxval = 200, group = G_VAL,
+     tooltip = "同時に追跡中の検証イベント上限。超過分は破棄され EV_dropped に計上される。")
+maxQueue = input.int(300, "Max Output Queue", minval = 10, maxval = 2000, group = G_VAL,
+     tooltip = "出力待ちイベントの上限。1バーにつき1件出力されるため、超過時は破棄して EV_dropped に計上する。")
+maxTrackedZones = input.int(400, "Max Tracked Zone IDs", minval = 50, maxval = 4000, group = G_VAL,
+     tooltip = "Zone単位の登録簿(Touch回数/生成バー)の上限。超過時は古いIDから破棄する。")
+
+// ---- 10.1b Base Strength × Durability (検証専用 / 本番ロジック未適用) --------
+//  ★ ここで作る分類は CSV / 検証ラベル表示にしか使わない。
+//    ZoneEngine の Score / Strength / Reaction / Source 処理へは一切影響しない。
+var string G_VALB = "10b · Base Strength / Durability (検証専用)"
+baseSplit1 = input.float(10.0, "Base Split · BASE1/BASE2 (birthScore)", step = 0.5, group = G_VALB,
+     tooltip = "birthScore がこの値未満なら BASE1。暫定値。")
+baseSplit2 = input.float(15.0, "Base Split · BASE2/BASE3 (birthScore)", step = 0.5, group = G_VALB,
+     tooltip = "birthScore がこの値以上なら BASE3。暫定値。")
+showValLabel = input.bool(false, "Show Validation Label (BASE / FRESH)", group = G_VALB,
+     tooltip = "検証用の Composite ラベルをチャートへ表示する。ZoneEngine の Strength 名や\n" +
+     "Section 09 の Zone 描画には一切影響しない。既定 OFF。")
+
+// ---- 10.2 検証用ヘルパー ---------------------------------------------------
+//  ★ Zone.sources / Zone.htfSources は " / " 区切りの文字列。
+//    "5 Swing" が "15 Swing" に部分一致してしまうのを避けるため、
+//    先頭一致 または " / " + key での一致だけを採用する。
+f_valHasSrc(string s, string key) =>
+    na(s) or s == "" ? false : (str.startswith(s, key) or str.contains(s, " / " + key))
+
+//  ★ ZoneEngineLib 内の f_tfName() と同じ変換 (htfSources の表記に合わせるため)。
+//    Library側を変更しないため、ここにローカルコピーを置く。
+f_valTfName(string tf) =>
+    tf == "1" ? "1M" : tf == "3" ? "3M" : tf == "5" ? "5M" : tf == "15" ? "15M" :
+     tf == "30" ? "30M" : tf == "45" ? "45M" : tf == "60" ? "1H" : tf == "120" ? "2H" :
+     tf == "180" ? "3H" : tf == "240" ? "4H" : tf == "360" ? "6H" : tf == "720" ? "12H" : tf
+
+//  ★ 検証用 Strength 分類 (ZoneEngine の strength は一切変更しない)
+//    1=Weak / 2=Medium / 3=Strong-L / 4=Strong-H / 5=VS1 / 6=VS2 / 7=VS3
+f_valStrength(int st, float sc) =>
+    int r = 1
+    if st == SR_VSTRONG
+        r := sc < vSplitVs1 ? 5 : sc < vSplitVs2 ? 6 : 7
+    else if st == SR_STRONG
+        r := sc < vSplitStrong ? 3 : 4
+    else if st == SR_MEDIUM
+        r := 2
+    else
+        r := 1
+    r
+
+//  ★ Base Strength: Touch時点のScoreではなく「誕生時Score」で分類する。
+//    1 = BASE1 (birthScore < baseSplit1)
+//    2 = BASE2 (baseSplit1 <= birthScore < baseSplit2)
+//    3 = BASE3 (baseSplit2 <= birthScore)
+//    0 = 判定不能 (birthScore が na)
+f_valBase(float bs) =>
+    na(bs) ? 0 : bs < baseSplit1 ? 1 : bs < baseSplit2 ? 2 : 3
+
+f_valBaseName(int b) =>
+    b == 3 ? "BASE3" : b == 2 ? "BASE2" : b == 1 ? "BASE1" : "BASE?"
+
+//  ★ ビット演算ヘルパー
+//    Pine Script v5 には &  |  ~ などのビット演算子が無いため、
+//    「bit値で割って 2 で割った余り」で 1bit ずつ判定する。
+//    sourceMask は bit0(1) 〜 bit9(512) の 10bit。
+int VAL_SRC_BITS = 10
+
+f_bitOn(int m, int b) =>
+    na(m) or b <= 0 ? false : int(m / b) % 2 == 1
+
+//  cur に有り prev に無いビットだけを取り出す (= 新しく追加された Source)
+f_maskAdded(int cur, int prev) =>
+    int r = 0
+    int b = 1
+    for _bi = 0 to VAL_SRC_BITS - 1
+        if f_bitOn(cur, b) and not f_bitOn(prev, b)
+            r += b
+        b := b * 2
+    r
+
+//  2つの mask の論理和 (累積用)
+f_maskOr(int m1, int m2) =>
+    int r = 0
+    int b = 1
+    for _bi = 0 to VAL_SRC_BITS - 1
+        if f_bitOn(m1, b) or f_bitOn(m2, b)
+            r += b
+        b := b * 2
+    r
+
+//  ★ sourceMask ビット割当 (Zone.sources / 生TF表記)
+//    ★ 今回この割当は一切変更していない。ZoneLevelDisplay / Strategy と同一。
+//    bit0(1)   = MA #1        (str.tostring(ma1Len) + "MA")
+//    bit1(2)   = MA #2        (str.tostring(ma2Len) + "MA")
+//    bit2(4)   = Swing TF#1   (hzTf1 + " Swing")
+//    bit3(8)   = Swing TF#2   (hzTf2 + " Swing")
+//    bit4(16)  = Swing TF#3   (hzTf3 + " Swing")
+//    bit5(32)  = Day High / Day Low
+//    bit6(64)  = Prev Day High / Prev Day Low
+//    bit7(128) = Accum TF#1   (accTf1 + " Accum")
+//    bit8(256) = Accum TF#2   (accTf2 + " Accum")
+//    bit9(512) = Accum TF#3   (accTf3 + " Accum")
+f_valSrcMask(string s) =>
+    int m = 0
+    if f_valHasSrc(s, str.tostring(ma1Len) + "MA")
+        m += 1
+    if f_valHasSrc(s, str.tostring(ma2Len) + "MA")
+        m += 2
+    if f_valHasSrc(s, hzTf1 + " Swing")
+        m += 4
+    if f_valHasSrc(s, hzTf2 + " Swing")
+        m += 8
+    if f_valHasSrc(s, hzTf3 + " Swing")
+        m += 16
+    if f_valHasSrc(s, "Day High") or f_valHasSrc(s, "Day Low")
+        m += 32
+    if f_valHasSrc(s, "Prev Day High") or f_valHasSrc(s, "Prev Day Low")
+        m += 64
+    if f_valHasSrc(s, accTf1 + " Accum")
+        m += 128
+    if f_valHasSrc(s, accTf2 + " Accum")
+        m += 256
+    if f_valHasSrc(s, accTf3 + " Accum")
+        m += 512
+    m
+
+//  ★ htfMask ビット割当 (Zone.htfSources / f_tfName 表記)
+//    bit0(1)   = f_tfName(hzTf3) + " Swing"
+//    bit1(2)   = f_tfName(accTf1) + " Accum"
+//    bit2(4)   = f_tfName(accTf2) + " Accum"
+//    bit3(8)   = f_tfName(accTf3) + " Accum"
+//    bit4(16)  = f_tfName(hzTf2) + " Swing"
+//    bit5(32)  = str.tostring(ma1Len) + "MA"
+//    bit6(64)  = str.tostring(ma2Len) + "MA"
+//    bit7(128) = "Day H/L"
+f_valHtfMask(string s) =>
+    int m = 0
+    if f_valHasSrc(s, f_valTfName(hzTf3) + " Swing")
+        m += 1
+    if f_valHasSrc(s, f_valTfName(accTf1) + " Accum")
+        m += 2
+    if f_valHasSrc(s, f_valTfName(accTf2) + " Accum")
+        m += 4
+    if f_valHasSrc(s, f_valTfName(accTf3) + " Accum")
+        m += 8
+    if f_valHasSrc(s, f_valTfName(hzTf2) + " Swing")
+        m += 16
+    if f_valHasSrc(s, str.tostring(ma1Len) + "MA")
+        m += 32
+    if f_valHasSrc(s, str.tostring(ma2Len) + "MA")
+        m += 64
+    if f_valHasSrc(s, "Day H/L")
+        m += 128
+    m
+
+// ============================================================================
+// 10.2b ZONE LEVEL ENGINE v2 の更新 (★ 今回追加 / 確定5分足1本につき1回)
+// ----------------------------------------------------------------------------
+//  ★ 実戦用 Zone Level は ZoneLevelEngine v2 が算出する ★
+//    Logger 側では Level を一切再計算しない。
+//    birthScore >= 10 / touchCnt >= 3 のような独自判定はこのファイルに無い。
+//    Strategy / ZoneLevelDisplay / この Logger がすべて同じ LevelEngine を
+//    参照するので、チャートで見える Level と CSV の Level が必ず一致する。
+//
+//  ★ Level 設定は zl.newCfg() の既定値をそのまま使う (Logger 独自の閾値を足さない)
+//      birthScoreHigh = 10
+//      Touch 0〜1 : birthScore >= 10 → Very Strong / < 10 → Strong
+//      Touch 2    : birthScore >= 10 → Strong      / < 10 → Medium
+//      Touch 3+   : Weak
+//      touchRearmDist = 10
+//
+//  ★ 更新タイミング ★
+//    Base TF = チャート 5分足なので、beginBaseBar へ built-in をそのまま渡す。
+//      baseBarSeq = bar_index / baseTime = time
+//      baseHigh   = high      / baseLow  = low / baseClose = close
+//    barstate.isconfirmed のときだけ 1 回実行する。未確定足では TouchCount と
+//    登録簿を進めない。v2 側にも「同じ baseBarSeq では 2 回以上進めない」
+//    ガードがあるので二重加算は二重に防がれている。
+//
+//  ★ 配置 ★
+//    f_valSrcMask() の定義より後 / Validation Event 生成 (10.6.1) より前。
+//    これにより Touch Event を作る時点で、その確定足ぶんの Level / TouchCount が
+//    既に LevelEngine 側へ反映されている。
+//    → 既存 Logger の TouchCount (_tc) と LevelEngine の touchCount を
+//      同じ足の同じ状態で比較できる (EV_levelSync)。
+//
+//  ★ この処理は観測専用。ZoneEngine へ一切書き戻さない。
+// ============================================================================
+var zl.ZoneLevelCfg    lvlCfg = zl.newCfg()
+var zl.ZoneLevelEngine lvlEng = zl.newEngine()
+
+//  診断用カウンタ (Level 判定には使わない)
+var int lvlUpdateCnt = 0
+
+if barstate.isconfirmed
+    zl.beginBaseBar(
+         lvlEng,
+         bar_index,
+         time,
+         high,
+         low,
+         close)
+
+    int _lvlN = zn.zoneCount(zoneEng)
+    if _lvlN > 0
+        for _li = 0 to _lvlN - 1
+            zn.Zone _lz = zn.zoneAt(zoneEng, _li)
+
+            zl.feedZone(
+                 lvlEng,
+                 lvlCfg,
+                 _lz.trackId,
+                 _lz.top,
+                 _lz.bottom,
+                 _lz.state,
+                 _lz.score,
+                 _lz.strength,
+                 _lz.flipped,
+                 f_valSrcMask(_lz.sources))
+
+    zl.endBaseBar(lvlEng, lvlCfg)
+    lvlUpdateCnt := lvlUpdateCnt + 1
+
+// ---- 10.3 検証イベント型 ---------------------------------------------------
+//  ★ Touch時点のSnapshot + Touch後の追跡結果を1件にまとめて保持する。
+//  ★ 今回 zoneLevel / levelTouchCnt / levelBirthScore / levelSync を追加。
+//    既存フィールドは 1 つも削除・改名していない。
+type VEvent
+    int   zoneId        = -1
+    int   touchTimeMs   = 0
+    int   touchBar      = 0
+    int   direction     = 0
+    float zTop          = na
+    float zBot          = na
+    float zCtr          = na
+    float score         = na
+    int   oStr          = 0
+    int   eStr          = 0
+    int   vStr          = 0
+    int   hasHtf        = 0
+    int   reactionCnt   = 0
+    int   touchCnt      = 0
+    int   ageBars       = 0
+    int   ageMin        = 0
+    int   flipped       = 0
+    int   srcMask       = 0
+    int   htfMask       = 0
+    float refPrice      = na
+    float bScore        = na
+    int   bStr          = 0
+    int   bVStr         = 0
+    int   bHasHtf       = 0
+    int   bSrcMask      = 0
+    int   bHtfMask      = 0
+    float bTop          = na
+    float bBot          = na
+    int   hasAdd        = 0
+    int   addPhase      = 0
+    int   firstAddMs    = 0
+    int   firstAddMask  = 0
+    int   addedMask     = 0
+    int   barsSinceAdd  = 0
+    int   minSinceAdd   = 0
+    float addScoreBef   = na
+    float addScoreAft   = na
+    int   addStrBef     = 0
+    int   addStrAft     = 0
+    float mfe           = 0.0
+    float maxPen        = 0.0
+    int   hit1          = 0
+    int   hit2          = 0
+    int   hit3          = 0
+    int   barsTo1       = -1
+    int   barsTo2       = -1
+    int   barsTo3       = -1
+    int   broken        = 0
+    int   barsToBreak   = -1
+    int   reclaimed     = 0
+    int   barsToReclaim = -1
+    int   trackLost     = 0
+    int   elapsed       = 0
+    //  ★ 今回追加 : ZoneLevelEngine v2 から取得した実戦用 Zone Level 情報
+    //    Logger 側で再計算していない。LevelEngine の値をそのまま保存する。
+    int   zoneLevel       = 0
+    int   levelTouchCnt   = 0
+    float levelBirthScore = na
+    int   levelSync       = 0
+
+// ---- 10.4 永続ステート -----------------------------------------------------
+//  ★ Zone単位の登録簿。key は Zone.trackId (ZoneEngine が memberUids / overlap で
+//    バー跨ぎに引き継ぐ安定ID)。配列インデックスは毎バー並び替わるため使わない。
+var map<int, int> vzBornBar  = map.new<int, int>()
+var map<int, int> vzBornMs   = map.new<int, int>()
+//  vzTouchCnt は Section 08b で宣言済み (Section 09 の描画より前で必要なため)。
+var map<int, int> vzArmed    = map.new<int, int>()
+var map<int, int> vzLastSeen = map.new<int, int>()
+
+//  ★ Zoneごとの「直前の方向性State」。
+//    ST_SUPPORT を観測したら 1 / ST_RESIST を観測したら -1 を保存し、
+//    ST_ACTIVE / ST_BROKEN では上書きしない (直前方向を保持する)。
+//    0 = 方向不明 (一度も SUPPORT / RESIST を観測していない)。
+//    ZoneEngine 側の state 判定には一切影響しない検証専用の記憶。
+var map<int, int> vzLastDir = map.new<int, int>()
+
+//  ★ 「方向不明の ACTIVE Zone への接触」を1接近につき1回だけ数えるためのフラグ。
+//    再arm (Re-arm Distance 到達) でクリアする。
+var map<int, int> vzUnkSeen = map.new<int, int>()
+
+//  ★ Zone誕生時Snapshot (trackId が初めて観測された瞬間の値を固定保存する)
+//    ・書き込みは「登録簿に trackId が無い」ブロックの中だけ = Zone 1本につき1回。
+//    ・その後 Score / Sources / Strength / top / bottom が変化しても更新しない。
+//    ・目的: 「誕生時点の根拠品質」と「その後のTouchによる消耗」を分離すること。
+//      birth系 = Zone初検出時の固定値 / EV_score 等 = Touch時点の現在値。
+var map<int, float> vzBirthScore   = map.new<int, float>()
+var map<int, int>   vzBirthStr     = map.new<int, int>()
+var map<int, int>   vzBirthVStr    = map.new<int, int>()
+var map<int, int>   vzBirthHasHtf  = map.new<int, int>()
+var map<int, int>   vzBirthSrcMask = map.new<int, int>()
+var map<int, int>   vzBirthHtfMask = map.new<int, int>()
+var map<int, float> vzBirthTop     = map.new<int, float>()
+var map<int, float> vzBirthBot     = map.new<int, float>()
+
+//  ★ Zone誕生「後」の Source 追加履歴 (観測のみ)
+//    ・vzSeenSrcMask は「この Zone でこれまでに一度でも観測した Source」の累積。
+//      初期値は誕生時 sourceMask。毎バー現在 mask を OR で足し込む。
+//      追加判定はこの「一度でも見た集合」との比較で行うため、
+//      誕生時からあった Source が一度消えて再登場しても追加扱いにならない。
+//    ・vzPrevScore / vzPrevStr は「前バーで最後に観測した値」。
+//      scoreBeforeFirstAdd / strengthBeforeFirstAdd に使う。
+//    ・vzAddedSrcMask は誕生後に初めて登場した bit の累積。
+//      Source が後から消えても履歴は消さない。
+//    ・vzFirstAdd* / vzAddScore* / vzAddStr* は最初の追加を検出した瞬間だけ
+//      書き込み、以降は上書きしない (vzFirstAddBar < 0 が「未追加」の印)。
+var map<int, int>   vzSeenSrcMask  = map.new<int, int>()
+var map<int, float> vzPrevScore    = map.new<int, float>()
+var map<int, int>   vzPrevStr      = map.new<int, int>()
+var map<int, int>   vzAddedSrcMask = map.new<int, int>()
+var map<int, int>   vzFirstAddBar  = map.new<int, int>()
+var map<int, int>   vzFirstAddMs   = map.new<int, int>()
+var map<int, int>   vzFirstAddMask = map.new<int, int>()
+var map<int, float> vzAddScoreBef  = map.new<int, float>()
+var map<int, float> vzAddScoreAft  = map.new<int, float>()
+var map<int, int>   vzAddStrBef    = map.new<int, int>()
+var map<int, int>   vzAddStrAft    = map.new<int, int>()
+
+//  ★ 毎バー作り直す「trackId → 現在のZone配列index」。var + clear で再利用する。
+var map<int, int> vLiveIdx = map.new<int, int>()
+
+var array<VEvent> vActive = array.new<VEvent>()
+var array<VEvent> vQueue  = array.new<VEvent>()
+var int vDropped = 0
+
+//  ★ 診断用: 方向不明 (lastDir == 0) の ACTIVE Zone への接触の累積件数。
+//    Event は生成していない = 取りこぼしの目安。
+var int vUnknownActive = 0
+
+// ---- 10.5 出力スロット (plot用グローバル) ---------------------------------
+float ev_zoneId            = na
+float ev_touchTime         = na
+float ev_direction         = na
+float ev_zoneTop           = na
+float ev_zoneBottom        = na
+float ev_zoneCenter        = na
+float ev_score             = na
+float ev_originalStrength  = na
+float ev_validationStrength = na
+float ev_hasHtf            = na
+float ev_reactionCnt       = na
+float ev_touchCnt          = na
+float ev_zoneAgeBars       = na
+float ev_zoneAgeMin        = na
+float ev_flipped           = na
+float ev_sourceMask        = na
+float ev_htfMask           = na
+float ev_refPrice          = na
+float ev_mfe               = na
+float ev_maxPenetration    = na
+float ev_hit10             = na
+float ev_hit20             = na
+float ev_hit30             = na
+float ev_barsTo10          = na
+float ev_barsTo20          = na
+float ev_barsTo30          = na
+float ev_broken            = na
+float ev_barsToBreak       = na
+float ev_reclaimed         = na
+float ev_barsToReclaim     = na
+float ev_trackingLost      = na
+//  ★ Zone誕生時Snapshot 系 (Touch時点の現在値である EV_score 等とは別列)
+float ev_birthScore        = na
+float ev_birthStrength     = na
+float ev_birthValidationStrength = na
+float ev_birthHasHtf       = na
+float ev_birthSourceMask   = na
+float ev_birthHtfMask      = na
+float ev_birthTop          = na
+float ev_birthBottom       = na
+float ev_birthWidth        = na
+float ev_scoreGrowth       = na
+//  ★ Base Strength × Durability (検証専用 / 本番ロジックへは未適用)
+float ev_baseStrength      = na
+float ev_durability        = na
+float ev_addedHtf          = na
+//  ★ 旧仕様との比較用に列だけ残している。Touch 回数で Strength を変更しないため、
+//    常に EV_originalStrength (Raw Strength) と同値になる。
+float ev_effectiveStrength = na
+//  ★ Zone誕生「後」の Source 追加ログ (Birth Snapshot 系とは別列)
+//    hasAdd = 0 の行では時刻 / mask / bars / score / strength は na になる。
+float ev_hasAddedSource          = na
+//  0 = 追加前 / 1 = 追加後 / 2 = 追加と Touch が同一バー (AMBIGUOUS)
+float ev_sourceAddPhase          = na
+float ev_firstAddedSourceTime    = na
+float ev_firstAddedSourceMask    = na
+float ev_addedSourceMask         = na
+float ev_barsSinceFirstSourceAdd = na
+float ev_minutesSinceFirstSourceAdd = na
+float ev_scoreBeforeFirstAdd     = na
+float ev_scoreAfterFirstAdd      = na
+float ev_strengthBeforeFirstAdd  = na
+float ev_strengthAfterFirstAdd   = na
+//  ★ 今回追加 : 実戦用 Zone Level (ZoneLevelEngine v2 の値そのもの)
+float ev_zoneLevel       = na
+float ev_levelTouchCnt   = na
+float ev_levelBirthScore = na
+float ev_levelSync       = na
+
+// ---- 10.6 本体 (確定バーのみ) ----------------------------------------------
+//  ★ barstate.isconfirmed ゲート:
+//    リアルタイムバーの再実行で Touch が二重計上されるのを防ぐ。
+//    var の map / array はティック毎ロールバックされないため、確定バーだけで
+//    状態を進める。
+//  ★★★ useValidation からの独立:
+//    10.6.1 (Zone登録簿 / Touch判定 / Re-arm / TouchCount加算 / 誕生時Snapshot) と
+//    10.6.3 (登録簿の間引き) は Freshness (FRESH / USED) が依存する Zone評価機能なので、
+//    useValidation の ON/OFF に関係なく常時動作させる。
+//    useValidation が制御するのは CSVイベント生成 / MFE追跡 / Queue出力だけ。
+//    → useValidation = false でも Touch 0〜2回 = FRESH / 3回以上 = USED は動く。
+//      Strength は常に Raw Strength のままで、Touch による降格は行わない。
+//    TouchCount は vzTouchCnt 1本だけで管理し、二重管理しない。
+if barstate.isconfirmed
+    //  10.6.1 Zone全件走査: 登録簿更新 + Touch検出 + LiveIndex構築  ★常時動作★
+    //    ・走査は1バー1回だけ。過去バーの再走査は行わない。
+    //    ・useValidation には依存しない (Freshness が使う Zone評価機能)。
+    //    ・Event生成 / TouchCount は direction が確定できた接触のみ
+    //      (SUPPORT / RESIST、および直前方向を引き継げる ACTIVE)。
+    //      BROKEN と 方向不明ACTIVE では新規Eventを作らない。
+    map.clear(vLiveIdx)
+    int _zc = zn.zoneCount(zoneEng)
+    if _zc > 0
+        for _i = 0 to _zc - 1
+            zn.Zone _z = zn.zoneAt(zoneEng, _i)
+            int _id = _z.trackId
+            if _id >= 0
+                map.put(vLiveIdx, _id, _i)
+                if not map.contains(vzBornBar, _id)
+                    map.put(vzBornBar, _id, bar_index)
+                    map.put(vzBornMs, _id, time)
+                    map.put(vzTouchCnt, _id, 0)
+                    map.put(vzArmed, _id, 1)
+                    //  初検出時点で既に ACTIVE の場合は方向不明 (0) から始める。
+                    map.put(vzLastDir, _id, 0)
+                    map.put(vzUnkSeen, _id, 0)
+                    //  ★ 誕生時Snapshot (この if ブロック = trackId 1本につき1回だけ実行)
+                    //    以降どこからも上書きしないため、Score / Sources / Strength /
+                    //    top / bottom が変化しても固定値のまま残る。
+                    map.put(vzBirthScore,   _id, _z.score)
+                    map.put(vzBirthStr,     _id, _z.strength)
+                    map.put(vzBirthVStr,    _id, f_valStrength(_z.strength, _z.score))
+                    map.put(vzBirthHasHtf,  _id, _z.hasHtf ? 1 : 0)
+                    map.put(vzBirthSrcMask, _id, f_valSrcMask(_z.sources))
+                    map.put(vzBirthHtfMask, _id, f_valHtfMask(_z.htfSources))
+                    map.put(vzBirthTop,     _id, _z.top)
+                    map.put(vzBirthBot,     _id, _z.bottom)
+                    //  ★ Source追加追跡の初期値。
+                    //    「一度でも観測した集合」に誕生時 Source を入れておくことで、
+                    //    誕生時 Source は (消えて再登場しても) 追加扱いにならない。
+                    map.put(vzSeenSrcMask,  _id, f_valSrcMask(_z.sources))
+                    map.put(vzPrevScore,    _id, _z.score)
+                    map.put(vzPrevStr,      _id, _z.strength)
+                    map.put(vzAddedSrcMask, _id, 0)
+                    map.put(vzFirstAddBar,  _id, -1)
+                    map.put(vzFirstAddMs,   _id, 0)
+                    map.put(vzFirstAddMask, _id, 0)
+                    map.put(vzAddScoreBef,  _id, na)
+                    map.put(vzAddScoreAft,  _id, na)
+                    map.put(vzAddStrBef,    _id, 0)
+                    map.put(vzAddStrAft,    _id, 0)
+                map.put(vzLastSeen, _id, bar_index)
+
+                //  ★ Source追加の検出 (観測のみ / ZoneEngine へは書き戻さない)
+                //    「この Zone でこれまでに一度も観測していない Source カテゴリが
+                //    初めて現れた」場合だけを追加とみなす。
+                //     ・誕生時 Source は vzSeenSrcMask の初期値に入っているので対象外
+                //     ・一度消えた Source の再登場も対象外 (既に "見た" 集合にある)
+                //     ・Source が消えただけでは追加扱いにならない
+                //     ・同じ Source が継続しているだけでは再追加されない
+                //     ・同一バーで複数追加された場合は全 bit が入る
+                //     ・Sources 文字列の順序変化は mask に影響しない
+                int _curSrc  = f_valSrcMask(_z.sources)
+                int _newBits = f_maskAdded(_curSrc, map.get(vzSeenSrcMask, _id))
+                if _newBits != 0
+                    map.put(vzAddedSrcMask, _id, f_maskOr(map.get(vzAddedSrcMask, _id), _newBits))
+                    //  最初の追加だけ固定保存する (以降は上書きしない)
+                    if map.get(vzFirstAddBar, _id) < 0
+                        map.put(vzFirstAddBar,  _id, bar_index)
+                        map.put(vzFirstAddMs,   _id, time)
+                        map.put(vzFirstAddMask, _id, _newBits)
+                        //  Before = 前バーで最後に観測した値 / After = 検出バーの値
+                        map.put(vzAddScoreBef,  _id, map.get(vzPrevScore, _id))
+                        map.put(vzAddScoreAft,  _id, _z.score)
+                        map.put(vzAddStrBef,    _id, map.get(vzPrevStr, _id))
+                        map.put(vzAddStrAft,    _id, _z.strength)
+                //  「一度でも観測した Source」へ現在 mask を足し込む (OR / 減らさない)
+                map.put(vzSeenSrcMask, _id, f_maskOr(map.get(vzSeenSrcMask, _id), _curSrc))
+                //  次バー比較用に「前バー観測値」を更新する (Before 用)
+                map.put(vzPrevScore,   _id, _z.score)
+                map.put(vzPrevStr,     _id, _z.strength)
+
+                //  ★ 直前方向Stateの更新 (観測のみ / ZoneEngine へは書き戻さない)
+                //    ST_ACTIVE / ST_BROKEN では上書きせず、直前方向を保持する。
+                if _z.state == ST_SUPPORT
+                    map.put(vzLastDir, _id, 1)
+                else if _z.state == ST_RESIST
+                    map.put(vzLastDir, _id, -1)
+
+                //  Touch定義: そのバーのレンジが Zone [bottom, top] と重なること。
+                //    ZoneEngine の Reaction 判定とは独立した検証専用カウンタ。
+                //    Touch足自身は評価対象外で、次のバーから Evaluation を開始する。
+                bool _inZone = low <= _z.top and high >= _z.bottom
+                float _dist = close < _z.bottom ? _z.bottom - close : close > _z.top ? close - _z.top : 0.0
+                int _armed = map.get(vzArmed, _id)
+                //  ★ Touch時の direction 判定
+                //    ① 現在 ST_SUPPORT           → 1
+                //    ② 現在 ST_RESIST            → -1
+                //    ③ 現在 ST_ACTIVE            → vzLastDir (直前方向を引き継ぐ)
+                //    ④ 現在 ST_BROKEN            → 0 (新規Eventを作らない)
+                //    ③で vzLastDir == 0 (方向不明) の場合も 0 となり、
+                //    Support / Resistance を推測せず Event生成を見送る。
+                //
+                //    価格がZoneへ侵入した瞬間に ZoneEngine 側が ST_ACTIVE へ
+                //    変化するケースでも、直前の SUPPORT / RESIST を引き継いで
+                //    Touch を取得できる。
+                int _lastDir = map.get(vzLastDir, _id)
+                int _dir = _z.state == ST_SUPPORT ? 1 : _z.state == ST_RESIST ? -1 :
+                 _z.state == ST_ACTIVE ? _lastDir : 0
+                if _inZone
+                    if _armed == 1 and _dir != 0
+                        //  ★ 方向が確定できた接触は ACTIVE でも正式なTouchとして扱い、
+                        //    ここで armed を落とす。
+                        //    → 「ACTIVEでEvent生成 → 次バーSUPPORTへ戻る → まだZone内」
+                        //      でも同じTouchを二重計上しない。
+                        map.put(vzArmed, _id, 0)
+                        int _tc = map.get(vzTouchCnt, _id) + 1
+                        map.put(vzTouchCnt, _id, _tc)
+                        if useValidation
+                            //  ★ Event生成だけ useValidation で切る。
+                            //    TouchCount の加算 (直上) はここより前で完了しているため、
+                            //    useValidation = false でも Touch 回数は正しく進む。
+                            if array.size(vActive) < maxActiveEvents
+                                //  ★ refPrice = 反発の起点となる Zone境界価格。
+                                //    direction = 1  → z.top    (境界から上へどれだけ伸びたか)
+                                //    direction = -1 → z.bottom (境界から下へどれだけ伸びたか)
+                                //    Touch足の終値を基準にすると、その足で大きく反発して
+                                //    Zoneから離れて引けた場合に反発幅を過小評価するため、
+                                //    終値基準にはしない。
+                                float _ref = _dir == 1 ? _z.top : _z.bottom
+                                //  ★ 同じ trackId の Zone Level 情報を取得する ★
+                                //    10.2b で当該確定足ぶんの feedZone が既に完了しているので、
+                                //    ここで読む touchCount はこの足の Touch を反映済み。
+                                //    Logger 側で Level を再計算はしない。
+                                zl.ZoneLevel _levelZ = zl.zoneByTrackId(lvlEng, _id)
+                                VEvent _ne = VEvent.new()
+                                _ne.zoneId      := _id
+                                _ne.touchTimeMs := time
+                                _ne.touchBar    := bar_index
+                                _ne.direction   := _dir
+                                _ne.zTop        := _z.top
+                                _ne.zBot        := _z.bottom
+                                _ne.zCtr        := (_z.top + _z.bottom) / 2
+                                _ne.score       := _z.score
+                                _ne.oStr        := _z.strength
+                                //  ★ EV_effectiveStrength は旧仕様との比較用に列だけ残す。
+                                //    Touch 回数で Strength を変更しないため、Raw と同値。
+                                _ne.eStr        := _z.strength
+                                _ne.vStr        := f_valStrength(_z.strength, _z.score)
+                                _ne.hasHtf      := _z.hasHtf ? 1 : 0
+                                _ne.reactionCnt := _z.reactionCnt
+                                _ne.touchCnt    := _tc
+                                _ne.ageBars     := bar_index - map.get(vzBornBar, _id)
+                                _ne.ageMin      := int((time - map.get(vzBornMs, _id)) / 60000)
+                                _ne.flipped     := _z.flipped ? 1 : 0
+                                _ne.srcMask     := f_valSrcMask(_z.sources)
+                                _ne.htfMask     := f_valHtfMask(_z.htfSources)
+                                _ne.refPrice    := _ref
+                                //  ★ 誕生時Snapshot をそのまま転記 (ここでも再計算しない)
+                                _ne.bScore      := map.get(vzBirthScore, _id)
+                                _ne.bStr        := map.get(vzBirthStr, _id)
+                                _ne.bVStr       := map.get(vzBirthVStr, _id)
+                                _ne.bHasHtf     := map.get(vzBirthHasHtf, _id)
+                                _ne.bSrcMask    := map.get(vzBirthSrcMask, _id)
+                                _ne.bHtfMask    := map.get(vzBirthHtfMask, _id)
+                                _ne.bTop        := map.get(vzBirthTop, _id)
+                                _ne.bBot        := map.get(vzBirthBot, _id)
+                                //  ★ Zone Level (ZoneLevelEngine v2 の値そのもの) ★
+                                //    Logger 側で birthScore / touchCount から
+                                //    Level を再計算することはしない。
+                                _ne.zoneLevel       := _levelZ.trackId >= 0 ? _levelZ.zoneLevel : 0
+                                _ne.levelTouchCnt   := _levelZ.trackId >= 0 ? _levelZ.touchCount : 0
+                                _ne.levelBirthScore := _levelZ.trackId >= 0 ? _levelZ.birthScore : na
+                                //  ★ levelSync : 既存 Logger と LevelEngine の一致確認
+                                //    _touchOk … LevelEngine の touchCount が
+                                //               既存 Logger の _tc と一致するか
+                                //    _birthOk … LevelEngine の birthScore が
+                                //               既存 Logger の vzBirthScore と一致するか
+                                //    両方一致で 1。片方でもズレたら 0。
+                                bool _touchOk = _levelZ.trackId >= 0 and _levelZ.touchCount == _tc
+                                bool _birthOk = _levelZ.trackId >= 0 and
+                                     not na(_levelZ.birthScore) and
+                                     math.abs(_levelZ.birthScore - map.get(vzBirthScore, _id)) < 0.0001
+                                _ne.levelSync := _touchOk and _birthOk ? 1 : 0
+                                //  ★ Source追加履歴の転記 (ここでも再計算しない)
+                                //    Touch 時点で最初の追加が済んでいれば hasAdd = 1。
+                                int _fab = map.get(vzFirstAddBar, _id)
+                                _ne.hasAdd       := _fab >= 0 ? 1 : 0
+                                //  ★ sourceAddPhase (Touchバーと firstAddBar の関係)
+                                //    0 = Source追加前 / まだ一度も追加なし
+                                //    1 = 追加後 (Touchバー > firstAddBar)
+                                //    2 = 追加と Touch が同一バー (AMBIGUOUS)
+                                //        同じ5分足内では Source追加確定と Touch の
+                                //        前後が判別できないため、分析では除外する。
+                                _ne.addPhase     := _fab < 0 ? 0 : bar_index == _fab ? 2 : 1
+                                _ne.firstAddMs   := map.get(vzFirstAddMs, _id)
+                                _ne.firstAddMask := map.get(vzFirstAddMask, _id)
+                                _ne.addedMask    := map.get(vzAddedSrcMask, _id)
+                                _ne.barsSinceAdd := _fab >= 0 ? bar_index - _fab : 0
+                                _ne.minSinceAdd  := _fab >= 0 ? int((time - map.get(vzFirstAddMs, _id)) / 60000) : 0
+                                _ne.addScoreBef  := map.get(vzAddScoreBef, _id)
+                                _ne.addScoreAft  := map.get(vzAddScoreAft, _id)
+                                _ne.addStrBef    := map.get(vzAddStrBef, _id)
+                                _ne.addStrAft    := map.get(vzAddStrAft, _id)
+                                array.push(vActive, _ne)
+                            else
+                                vDropped += 1
+                    else if _armed == 1 and _z.state == ST_ACTIVE
+                        //  方向不明 (lastDir == 0) の ACTIVE への接触。
+                        //   ・Support / Resistance を推測しないため Event は作らない
+                        //   ・TouchCount も加算しない
+                        //   ・armed も落とさない
+                        //     (同じ接近中に SUPPORT / RESIST へ確定したら拾えるように)
+                        //   ・診断用に1接近あたり1回だけカウントする
+                        if map.get(vzUnkSeen, _id) == 0
+                            map.put(vzUnkSeen, _id, 1)
+                            vUnknownActive += 1
+                else
+                    //  ★ 再arm は「終値が Zone から Re-arm Distance 以上離れたこと」のみ。
+                    //    ACTIVE → SUPPORT などの state 変化だけでは再arm しない。
+                    if _dist >= touchRearmDist
+                        map.put(vzArmed, _id, 1)
+                        map.put(vzUnkSeen, _id, 0)
+
+    //  10.6.3 登録簿の間引き (上限超過時のみ / 古いIDから)  ★常時動作★
+    //    ・10.6.1 が常に登録簿を伸ばすため、間引きも useValidation に依存させない。
+    if map.size(vzLastSeen) > maxTrackedZones
+        array<int> _ks = map.keys(vzLastSeen)
+        if array.size(_ks) > 0
+            for _ki = 0 to array.size(_ks) - 1
+                int _k = array.get(_ks, _ki)
+                if bar_index - map.get(vzLastSeen, _k) > trackStaleBars
+                    map.remove(vzLastSeen, _k)
+                    map.remove(vzBornBar, _k)
+                    map.remove(vzBornMs, _k)
+                    map.remove(vzTouchCnt, _k)
+                    map.remove(vzArmed, _k)
+                    map.remove(vzLastDir, _k)
+                    map.remove(vzUnkSeen, _k)
+                    map.remove(vzBirthScore, _k)
+                    map.remove(vzBirthStr, _k)
+                    map.remove(vzBirthVStr, _k)
+                    map.remove(vzBirthHasHtf, _k)
+                    map.remove(vzBirthSrcMask, _k)
+                    map.remove(vzBirthHtfMask, _k)
+                    map.remove(vzBirthTop, _k)
+                    map.remove(vzBirthBot, _k)
+                    map.remove(vzSeenSrcMask, _k)
+                    map.remove(vzPrevScore, _k)
+                    map.remove(vzPrevStr, _k)
+                    map.remove(vzAddedSrcMask, _k)
+                    map.remove(vzFirstAddBar, _k)
+                    map.remove(vzFirstAddMs, _k)
+                    map.remove(vzFirstAddMask, _k)
+                    map.remove(vzAddScoreBef, _k)
+                    map.remove(vzAddScoreAft, _k)
+                    map.remove(vzAddStrBef, _k)
+                    map.remove(vzAddStrAft, _k)
+
+    //  ★ ここから下は CSV検証専用 (useValidation で ON/OFF)。
+    //    Touch判定 / TouchCount / 登録簿は上で完了済みなので影響を受けない。
+    if useValidation
+        //  10.6.2 追跡中イベントの更新 (Touchしたバー自身はスキップ)
+        //    ・同一Zoneの同時追跡を許可する (Zone毎1件に制限しない)。
+        //    ・全体件数は maxActiveEvents で上限を掛けてタイムアウトを防ぐ。
+        int _ai = 0
+        while _ai < array.size(vActive)
+            VEvent _e = array.get(vActive, _ai)
+            bool _fin = false
+            if _e.touchBar != bar_index
+                _e.elapsed := _e.elapsed + 1
+
+                //  MFE: Touch時点の Zone境界価格 (refPrice) を基準にした最大有利変動。
+                //    SUPPORT なら refPrice = zTop からの上方向、
+                //    RESIST  なら refPrice = zBot からの下方向。
+                //  maxPenetration: Touch時点のZone形状に対する最大貫入量。
+                //  ★ Touch足そのものは OHLC の順序が判別できないため、
+                //    _e.touchBar != bar_index のゲートにより MFE / HIT 判定から
+                //    除外している (評価は次のバーから開始)。
+                if _e.direction == 1
+                    float _fav = high - _e.refPrice
+                    if _fav > _e.mfe
+                        _e.mfe := _fav
+                    float _pen = _e.zTop - low
+                    if _pen > _e.maxPen
+                        _e.maxPen := _pen
+                else if _e.direction == -1
+                    float _favS = _e.refPrice - low
+                    if _favS > _e.mfe
+                        _e.mfe := _favS
+                    float _penS = high - _e.zBot
+                    if _penS > _e.maxPen
+                        _e.maxPen := _penS
+
+                //  到達判定 (direction が未定義の ACTIVE / BROKEN では計上しない)
+                if _e.direction == 1 or _e.direction == -1
+                    if _e.hit1 == 0 and _e.mfe >= vHitLv1
+                        _e.hit1 := 1
+                        _e.barsTo1 := _e.elapsed
+                    if _e.hit2 == 0 and _e.mfe >= vHitLv2
+                        _e.hit2 := 1
+                        _e.barsTo2 := _e.elapsed
+                    if _e.hit3 == 0 and _e.mfe >= vHitLv3
+                        _e.hit3 := 1
+                        _e.barsTo3 := _e.elapsed
+
+                //  Break / Reclaim は ZoneEngine の state だけから取得する。
+                //  独自の Break Buffer は一切使わない。
+                if map.contains(vLiveIdx, _e.zoneId)
+                    zn.Zone _cz = zn.zoneAt(zoneEng, map.get(vLiveIdx, _e.zoneId))
+                    if _e.broken == 0
+                        if _cz.state == ST_BROKEN
+                            _e.broken := 1
+                            _e.barsToBreak := _e.elapsed
+                    else if _e.reclaimed == 0
+                        if _cz.state == ST_SUPPORT or _cz.state == ST_RESIST
+                            _e.reclaimed := 1
+                            _e.barsToReclaim := _e.elapsed
+                else
+                    //  Zone が消滅 (Lifetime / stale) した場合も窓の終わりまで
+                    //  価格側の追跡は続け、trackingLost = 1 を立てる。
+                    _e.trackLost := 1
+
+                if _e.elapsed >= evalBars
+                    _fin := true
+            if _fin
+                array.remove(vActive, _ai)
+                if array.size(vQueue) < maxQueue
+                    array.push(vQueue, _e)
+                else
+                    vDropped += 1
+            else
+                _ai += 1
+
+        //  10.6.4 Queue から1バー1件だけ出力
+        if array.size(vQueue) > 0
+            VEvent _o = array.shift(vQueue)
+            ev_zoneId             := _o.zoneId
+            ev_touchTime          := math.floor(_o.touchTimeMs / 1000.0)
+            ev_direction          := _o.direction
+            ev_zoneTop            := _o.zTop
+            ev_zoneBottom         := _o.zBot
+            ev_zoneCenter         := _o.zCtr
+            ev_score              := _o.score
+            ev_originalStrength   := _o.oStr
+            ev_validationStrength := _o.vStr
+            ev_hasHtf             := _o.hasHtf
+            ev_reactionCnt        := _o.reactionCnt
+            ev_touchCnt           := _o.touchCnt
+            ev_zoneAgeBars        := _o.ageBars
+            ev_zoneAgeMin         := _o.ageMin
+            ev_flipped            := _o.flipped
+            ev_sourceMask         := _o.srcMask
+            ev_htfMask            := _o.htfMask
+            ev_refPrice           := _o.refPrice
+            ev_mfe                := _o.mfe
+            ev_maxPenetration     := _o.maxPen
+            ev_hit10              := _o.hit1
+            ev_hit20              := _o.hit2
+            ev_hit30              := _o.hit3
+            ev_barsTo10           := _o.barsTo1
+            ev_barsTo20           := _o.barsTo2
+            ev_barsTo30           := _o.barsTo3
+            ev_broken             := _o.broken
+            ev_barsToBreak        := _o.barsToBreak
+            ev_reclaimed          := _o.reclaimed
+            ev_barsToReclaim      := _o.barsToReclaim
+            ev_trackingLost       := _o.trackLost
+            ev_birthScore              := _o.bScore
+            ev_birthStrength           := _o.bStr
+            ev_birthValidationStrength := _o.bVStr
+            ev_birthHasHtf             := _o.bHasHtf
+            ev_birthSourceMask         := _o.bSrcMask
+            ev_birthHtfMask            := _o.bHtfMask
+            ev_birthTop                := _o.bTop
+            ev_birthBottom             := _o.bBot
+            ev_birthWidth              := _o.bTop - _o.bBot
+            ev_scoreGrowth             := _o.score - _o.bScore
+            ev_baseStrength            := f_valBase(_o.bScore)
+            ev_durability              := f_valDurability(_o.touchCnt)
+            //  Birth時点でHTFが無く、Touch時点でHTFが付いていれば 1
+            ev_addedHtf                := _o.bHasHtf == 0 and _o.hasHtf == 1 ? 1 : 0
+            ev_effectiveStrength       := _o.eStr
+            //  ★ Source追加ログ。EV_sourceAddPhase は Touch 時点の判定で
+            //    0 = 最初の Source 追加より前 (または一度も追加なし)
+            //    1 = 追加後 (Touchバー > firstAddBar)
+            //    2 = 追加と Touch が同一バー (AMBIGUOUS / 分析では除外)
+            ev_hasAddedSource          := _o.hasAdd
+            ev_sourceAddPhase          := _o.addPhase
+            ev_addedSourceMask         := _o.addedMask
+            ev_firstAddedSourceTime    := _o.hasAdd == 1 ? math.floor(_o.firstAddMs / 1000.0) : na
+            ev_firstAddedSourceMask    := _o.hasAdd == 1 ? _o.firstAddMask : na
+            ev_barsSinceFirstSourceAdd := _o.hasAdd == 1 ? _o.barsSinceAdd : na
+            ev_minutesSinceFirstSourceAdd := _o.hasAdd == 1 ? _o.minSinceAdd : na
+            ev_scoreBeforeFirstAdd     := _o.addScoreBef
+            ev_scoreAfterFirstAdd      := _o.addScoreAft
+            ev_strengthBeforeFirstAdd  := _o.hasAdd == 1 ? _o.addStrBef : na
+            ev_strengthAfterFirstAdd   := _o.hasAdd == 1 ? _o.addStrAft : na
+            //  ★ 今回追加 : Zone Level (LevelEngine の値そのもの)
+            ev_zoneLevel               := _o.zoneLevel
+            ev_levelTouchCnt           := _o.levelTouchCnt
+            ev_levelBirthScore         := _o.levelBirthScore
+            ev_levelSync               := _o.levelSync
+
+// ---- 10.7 CSV出力列 (display.data_window) ----------------------------------
+//  ★ チャートには一切描画しない (display.data_window のみ)。
+//    データウィンドウ / Export chart data から CSV として取得する。
+//    値が na の行 = そのバーには出力イベントが無い、という意味。
+//  ★ 既存列は 1 本も削除していない (旧分析との比較に使うため)。
+plot(ev_zoneId,             "EV_zoneId",             display = display.data_window)
+plot(ev_touchTime,          "EV_touchTime",          display = display.data_window)
+plot(ev_direction,          "EV_direction",          display = display.data_window)
+plot(ev_zoneTop,            "EV_zoneTop",            display = display.data_window)
+plot(ev_zoneBottom,         "EV_zoneBottom",         display = display.data_window)
+plot(ev_zoneCenter,         "EV_zoneCenter",         display = display.data_window)
+plot(ev_score,              "EV_score",              display = display.data_window)
+plot(ev_originalStrength,   "EV_originalStrength",   display = display.data_window)
+plot(ev_validationStrength, "EV_validationStrength", display = display.data_window)
+plot(ev_hasHtf,             "EV_hasHtf",             display = display.data_window)
+plot(ev_reactionCnt,        "EV_reactionCnt",        display = display.data_window)
+plot(ev_touchCnt,           "EV_touchCnt",           display = display.data_window)
+plot(ev_zoneAgeBars,        "EV_zoneAgeBars",        display = display.data_window)
+plot(ev_zoneAgeMin,         "EV_zoneAgeMin",         display = display.data_window)
+plot(ev_flipped,            "EV_flipped",            display = display.data_window)
+plot(ev_sourceMask,         "EV_sourceMask",         display = display.data_window)
+plot(ev_htfMask,            "EV_htfMask",            display = display.data_window)
+plot(ev_refPrice,           "EV_refPrice",           display = display.data_window)
+plot(ev_mfe,                "EV_MFE",                display = display.data_window)
+plot(ev_maxPenetration,     "EV_maxPenetration",     display = display.data_window)
+plot(ev_hit10,              "EV_hit10",              display = display.data_window)
+plot(ev_hit20,              "EV_hit20",              display = display.data_window)
+plot(ev_hit30,              "EV_hit30",              display = display.data_window)
+plot(ev_barsTo10,           "EV_barsTo10",           display = display.data_window)
+plot(ev_barsTo20,           "EV_barsTo20",           display = display.data_window)
+plot(ev_barsTo30,           "EV_barsTo30",           display = display.data_window)
+plot(ev_broken,             "EV_broken",             display = display.data_window)
+plot(ev_barsToBreak,        "EV_barsToBreak",        display = display.data_window)
+plot(ev_reclaimed,          "EV_reclaimed",          display = display.data_window)
+plot(ev_barsToReclaim,      "EV_barsToReclaim",      display = display.data_window)
+plot(ev_trackingLost,       "EV_trackingLost",       display = display.data_window)
+plot(ev_birthScore,              "EV_birthScore",              display = display.data_window)
+plot(ev_birthStrength,           "EV_birthStrength",           display = display.data_window)
+plot(ev_birthValidationStrength, "EV_birthValidationStrength", display = display.data_window)
+plot(ev_birthHasHtf,             "EV_birthHasHtf",             display = display.data_window)
+plot(ev_birthSourceMask,         "EV_birthSourceMask",         display = display.data_window)
+plot(ev_birthHtfMask,            "EV_birthHtfMask",            display = display.data_window)
+plot(ev_birthTop,                "EV_birthTop",                display = display.data_window)
+plot(ev_birthBottom,             "EV_birthBottom",             display = display.data_window)
+plot(ev_birthWidth,              "EV_birthWidth",              display = display.data_window)
+plot(ev_scoreGrowth,             "EV_scoreGrowth",             display = display.data_window)
+plot(ev_baseStrength,            "EV_baseStrength",            display = display.data_window)
+plot(ev_durability,              "EV_durability",              display = display.data_window)
+plot(ev_addedHtf,                "EV_addedHtf",                display = display.data_window)
+plot(ev_effectiveStrength,       "EV_effectiveStrength",       display = display.data_window)
+plot(ev_hasAddedSource,          "EV_hasAddedSource",          display = display.data_window)
+plot(ev_sourceAddPhase,          "EV_sourceAddPhase",          display = display.data_window)
+plot(ev_firstAddedSourceTime,    "EV_firstAddedSourceTime",    display = display.data_window)
+plot(ev_firstAddedSourceMask,    "EV_firstAddedSourceMask",    display = display.data_window)
+plot(ev_addedSourceMask,         "EV_addedSourceMask",         display = display.data_window)
+plot(ev_barsSinceFirstSourceAdd, "EV_barsSinceFirstSourceAdd", display = display.data_window)
+plot(ev_minutesSinceFirstSourceAdd, "EV_minutesSinceFirstSourceAdd", display = display.data_window)
+plot(ev_scoreBeforeFirstAdd,     "EV_scoreBeforeFirstAdd",     display = display.data_window)
+plot(ev_scoreAfterFirstAdd,      "EV_scoreAfterFirstAdd",      display = display.data_window)
+plot(ev_strengthBeforeFirstAdd,  "EV_strengthBeforeFirstAdd",  display = display.data_window)
+plot(ev_strengthAfterFirstAdd,   "EV_strengthAfterFirstAdd",   display = display.data_window)
+//  ★ 今回追加 : 実戦用 Zone Level (ZoneLevelEngine v2 の値そのもの)
+//    EV_zoneLevel       1 = Weak / 2 = Medium / 3 = Strong / 4 = Very Strong
+//    EV_levelTouchCnt   LevelEngine 側の TouchCount (既存 EV_touchCnt とは別管理)
+//    EV_levelBirthScore LevelEngine 側の BirthScore (既存 EV_birthScore とは別管理)
+//    EV_levelSync       1 = TouchCount も BirthScore も既存 Logger と一致
+//                       0 = どちらかがズレている (要調査)
+plot(ev_zoneLevel,       "EV_zoneLevel",       display = display.data_window)
+plot(ev_levelTouchCnt,   "EV_levelTouchCnt",   display = display.data_window)
+plot(ev_levelBirthScore, "EV_levelBirthScore", display = display.data_window)
+plot(ev_levelSync,       "EV_levelSync",       display = display.data_window)
+//  ★ 診断用 (検証処理そのものの健全性確認)
+float ev_queueLen     = useValidation ? array.size(vQueue)  : na
+float ev_activeEvents = useValidation ? array.size(vActive) : na
+float ev_dropped      = useValidation ? vDropped            : na
+float ev_unknownAct   = useValidation ? vUnknownActive      : na
+plot(ev_queueLen,     "EV_queueLen",     display = display.data_window)
+plot(ev_activeEvents, "EV_activeEvents", display = display.data_window)
+plot(ev_dropped,      "EV_dropped",      display = display.data_window)
+plot(ev_unknownAct,   "EV_unknownActiveTouches", display = display.data_window)
+//  ★ 診断用 : ZoneEngine / ZoneLevelEngine の更新回数 (どちらも確定足で1回)
+//    ★ plot() ではなく Section 10.9 のラベルで出す。
+//      plot枠 64 本を使い切っているため (Section 09.2 のコメント参照)。
+
+// ---- 10.8 Composite 検証ラベル (表示専用 / 既定OFF) ------------------------
+//  ★ ZoneEngine の Strength 名 (zn.strengthName) は変更しない。
+//    Section 09 の Zone 描画 / Strength ラベル / 詳細ラベルにも一切触れず、
+//    専用の label 配列へ「BASE3 / FRESH」形式の検証ラベルだけを描く。
+//  ★ 描画位置は Zone Box の左端側 (Section 09 のラベルは右端側) なので重ならない。
+//  ★ 参照するのは vzBirthScore (誕生時Snapshot) と vzTouchCnt (既存TouchCount) の
+//    読み取りだけ。どちらにも書き込まない。
+//  ★ Composite は CSV 側でも EV_baseStrength × EV_durability で再現できる。
+var array<label> gValLabels = array.new<label>()
+
+f_valClearLabels() =>
+    while array.size(gValLabels) > 0
+        label.delete(array.pop(gValLabels))
+    true
+
+if isGold and barstate.islast
+    f_valClearLabels()
+    if useValidation and showValLabel and zn.zoneCount(zoneEng) > 0
+        array<int> vOrd = zn.drawOrder(zoneEng, maxZonesDraw)
+        if array.size(vOrd) > 0
+            for vk = 0 to array.size(vOrd) - 1
+                zn.Zone vz = zn.zoneAt(zoneEng, array.get(vOrd, vk))
+                int vId = vz.trackId
+                //  登録簿に載っていない (今バー生まれ等) Zone はラベルを出さない。
+                if vId >= 0 and map.contains(vzBirthScore, vId)
+                    int vBase = f_valBase(map.get(vzBirthScore, vId))
+                    int vTc   = map.get(vzTouchCnt, vId)
+                    int vDur  = f_valDurability(vTc)
+                    string vTxt = f_valBaseName(vBase) + " / " + f_valDurName(vDur)
+                    vTxt := vTxt + "  (birth " + f_num(map.get(vzBirthScore, vId), "#.#") +
+                     " / touch " + str.tostring(vTc) + ")"
+                    label vlb = label.new(
+                         x         = bar_index - zoneLeftBars,
+                         y         = (vz.top + vz.bottom) / 2,
+                         text      = vTxt,
+                         xloc      = xloc.bar_index,
+                         style     = label.style_label_right,
+                         color     = color.new(vBase == 3 ? color.teal : vBase == 2 ? color.gray : color.maroon, 20),
+                         textcolor = color.white,
+                         size      = size.small)
+                    array.push(gValLabels, vlb)
+
+// ============================================================================
+// 10.9 ENGINE 更新診断ラベル (表示専用 / plot枠を使わない)
+// ----------------------------------------------------------------------------
+//  ★ 目的 : 「ZoneEngine も ZoneLevelEngine も確定足 1 本につき 1 回だけ進む」
+//    ことをチャート上で実測確認するための表示。
+//    plot() 枠 (64本) を使い切っているので label で出す。
+//  ★ 観測専用。ZoneEngine / ZoneLevelEngine / 検証ロジックへ一切書き戻さない。
+//  ★ showValLabel と同じトグルで出る (既定 OFF)。
+//
+//  ★ 読み方 ★
+//    confirmed bars と zn.update() と zl.endBaseBar() の 3 つが同じ数字なら、
+//    どちらのエンジンも確定足 1 本につきちょうど 1 回だけ進んでいる。
+// ============================================================================
+var label gEngDiagLbl = na
+
+if isGold and barstate.islast and showValLabel
+    label.delete(gEngDiagLbl)
+    string dTxt = "ENGINE UPDATE DIAG" +
+     "\nconfirmed bars   : " + str.tostring(zoneUpdateCnt) +
+     "\nzn.update()      : " + str.tostring(zoneUpdateCnt) +
+     "\nzl.endBaseBar()  : " + str.tostring(lvlUpdateCnt) +
+     "\nzn.zoneCount()   : " + str.tostring(zn.zoneCount(zoneEng)) +
+     "\nzl.zoneCount()   : " + str.tostring(zl.zoneCount(lvlEng)) +
+     "\nsync (zn == zl)  : " + (zoneUpdateCnt == lvlUpdateCnt ? "OK" : "NG")
+    gEngDiagLbl := label.new(
+         x         = bar_index,
+         y         = high,
+         text      = dTxt,
+         xloc      = xloc.bar_index,
+         yloc      = yloc.price,
+         style     = label.style_label_down,
+         color     = color.new(zoneUpdateCnt == lvlUpdateCnt ? color.teal : color.maroon, 15),
+         textcolor = color.white,
+         size      = size.small)
