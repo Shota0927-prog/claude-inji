@@ -2639,31 +2639,54 @@ int zoneEntryMinLevel = zoneEntryMinLevelStr == "Very Strong" ? zl.levelVeryStro
 //    ・SAT_ONLY のときもこのブロックは走るが、発注に使われないので
 //      既存のバックテスト結果は 1 トレードも変わらない。
 //
-//  ★ 実行順序 (これが判定の正しさそのもの) ★
-//      zn.update()  →  zl.beginBaseBar()  →  zl.feedZone()  →  zl.endBaseBar()
-//      →  ここ (Zone T1 Setup 判定)
-//    このセクションは 05b の LevelEngine 更新より必ず後ろに置いてある。
-//    そのため参照する touchCount / zoneLevel / direction は、その確定5分足を
-//    反映済みの値になる。更新前の touchCount は絶対に使わない。
+//  ★★★ Touch 検出と TouchCount 更新は完全に別物 ★★★
+//
+//    ZoneLevelEngine の公式 TouchCount
+//        → 従来どおり Base TF 確定5分足でのみ更新 (05b)。
+//          zl.beginBaseBar / feedZone / endBaseBar の周期・処理は無変更。
+//
+//    Entry Setup 用の Touch 検出
+//        → ここで 15秒足ごとにリアルタイム検出する。
+//          公式 TouchCount を 15秒で増やしているわけではない。
+//
+//    これを分けている理由 :
+//      公式 TouchCount が 1 になるのは Base TF 足が確定した瞬間なので、
+//      それを Setup 開始条件にすると実際の Touch から最大 5 分遅れる。
+//      Setup は「価格が Zone に触れた直後」から始めたいので、
+//      Touch 検出だけ 15秒足に降ろしている。
+//
+//  ★ Setup 開始条件 ★
+//    直近確定 Base TF の Zone Level スナップショットから
+//        touchCount == 0                  (公式にはまだ未接触の Fresh Zone)
+//        zoneLevel  >= zoneEntryMinLevel
+//        LONG  : direction == SUPPORT
+//        SHORT : direction == RESISTANCE
+//    を満たす Zone を候補にし、現在の確定15秒足が
+//        low <= zone.top and high >= zone.bottom
+//    を「初めて」満たした瞬間を T1 Touch Event とする。
+//
+//  ★ Setup 後に公式 TouchCount が 1 になるのは正常 ★
+//    Setup 時は T0。次の Base TF 確定でその5分足の Touch が公式に数えられ
+//    T1 になるが、Setup は継続する。再タッチして T2 になったら失効。
 //
 //  ★ 判定に使うのは ZoneLevelEngine v2 の値だけ ★
 //      zoneLevel / touchCount / direction / trackId
 //    Raw Score / Raw Strength は使わない。
+//    スナップショット (top / bottom / direction / zoneLevel / touchCount) は
+//    Base TF 確定足で作ったものをそのまま読むだけで、書き戻しは一切しない。
 //
-//  ★ 「新しく T1 になった瞬間」だけを Setup にする ★
-//    touchCount == 1 の Zone は複数の5分足にわたって T1 のまま存在するので、
-//    touchCount == 1 だけを見ると毎足 Setup を作ってしまう。
-//    trackId ごとに「この T1 は判定済み」を zoneT1Seen に記録し、
-//    1 trackId につき 1 回しか T1 Event を作らない。
-//    ★ Level が下限未満だった trackId も「判定済み」にする ★
-//      あとから同じ T1 を拾い直さないため (Fresh Setup 厳守)。
+//  ★ 重複防止 ★
+//    同じ Zone の中に 15秒足が何本滞在しても Setup は 1 回だけ。
+//    15秒で最初に Touch した時点で trackId を zoneT1Seen へ入れる。
+//    ★ Level 未達 / 方向不一致の Zone も、最初の Touch 時点で処理済みにする ★
+//      あとから同じ初回 Touch を拾い直さないため (Fresh Setup 厳守)。
 //
-//  ★ 同じ5分足で複数 Zone が T1 になった場合 ★
+//  ★ 同じ15秒足で複数の Fresh Zone へ Touch した場合 ★
 //    LONG / SHORT それぞれ 1 本だけ採用する。
 //      ① Zone Level が高い方
-//      ② 同 Level なら bClose から Zone center が近い方
+//      ② 同 Level なら 15秒 close から Zone center が近い方
 //    採用されなかった Zone も zoneT1Seen へ入れるので、後のバーで
-//    「古い T1」として再 Setup されることはない。
+//    「古い初回 Touch」として再 Setup されることはない。
 // ============================================================================
 //  この trackId の T1 を既に判定したか (Level 未達で見送った分も含む)
 var map<int, bool> zoneT1Seen = map.new<int, bool>()
@@ -2689,7 +2712,11 @@ var int zsSetupCnt   = 0
 var int zsSignalCnt  = 0
 var int zsExpiredCnt = 0
 
-//  ---- 1) 確定5分足で「新 T1 Event」を探す ----------------------------------
+//  ---- 1) 15秒足で Fresh Zone への初回 Touch を探す --------------------------
+//    ★ ここは毎15秒足で走る (newBaseBar ではない) ★
+//      参照するスナップショットは Base TF 確定足で作ったものなので、
+//      Base TF 足の途中では top / bottom / direction / zoneLevel /
+//      touchCount は動かない。動くのは「現在の15秒足の high / low」だけ。
 bool  zsNewLong       = false
 int   zsNewLongId     = -1
 int   zsNewLongLevel  = 0
@@ -2701,69 +2728,76 @@ int   zsNewShortLevel = 0
 int   zsNewShortTouch = 0
 float zsNewShortCtr   = na
 
-if newBaseBar and not na(bTime) and not na(bClose) and not na(bHigh) and not na(bLow)
-    //  ---- 登録簿の掃除 ----
-    //    現在の Zone スナップショットに居ない trackId は二度と T1 判定に
-    //    出てこないので、記録として保持する意味がない。
-    //    Pine の map 要素数上限に長期バックテストで当たらないようにする。
-    //    (掃除しても、生きている trackId の判定済みフラグは失われない)
-    if map.size(zoneT1Seen) > 2000
-        int _lz0 = zl.zoneCount(levelEng)
-        array<int> _keep = array.new_int(0)
-        if _lz0 > 0
-            for _i = 0 to _lz0 - 1
-                zl.ZoneLevel _kz = zl.zoneAt(levelEng, _i)
-                if _kz.trackId >= 0 and map.contains(zoneT1Seen, _kz.trackId)
-                    array.push(_keep, _kz.trackId)
-        map.clear(zoneT1Seen)
-        if array.size(_keep) > 0
-            for _i = 0 to array.size(_keep) - 1
-                map.put(zoneT1Seen, array.get(_keep, _i), true)
+//  ---- 登録簿の掃除 (Base TF 更新時だけ) ----
+//    現在の Zone スナップショットに居ない trackId は二度と Touch 判定に
+//    出てこないので、記録として保持する意味がない。
+//    Pine の map 要素数上限に長期バックテストで当たらないようにする。
+//    (掃除しても、生きている trackId の処理済みフラグは失われない)
+//    スナップショットが入れ替わるのは Base TF 確定時だけなので、
+//    掃除もそのタイミングでだけ行う。
+if newBaseBar and map.size(zoneT1Seen) > 2000
+    int _lz0 = zl.zoneCount(levelEng)
+    array<int> _keep = array.new_int(0)
+    if _lz0 > 0
+        for _i = 0 to _lz0 - 1
+            zl.ZoneLevel _kz = zl.zoneAt(levelEng, _i)
+            if _kz.trackId >= 0 and map.contains(zoneT1Seen, _kz.trackId)
+                array.push(_keep, _kz.trackId)
+    map.clear(zoneT1Seen)
+    if array.size(_keep) > 0
+        for _i = 0 to array.size(_keep) - 1
+            map.put(zoneT1Seen, array.get(_keep, _i), true)
 
-    int _zlN = zl.zoneCount(levelEng)
-    if _zlN > 0
-        for _i = 0 to _zlN - 1
-            zl.ZoneLevel _lz = zl.zoneAt(levelEng, _i)
-            //  Overlap : この確定5分足が Zone に触れているか
-            bool _ovl = not na(_lz.top) and not na(_lz.bottom) and
-                 bLow <= _lz.top and bHigh >= _lz.bottom
-            if _lz.trackId >= 0 and _lz.touchCount == 1 and _ovl and
-                 not map.contains(zoneT1Seen, _lz.trackId)
-                //  Level 未達でも「判定済み」にする (再利用させない)
-                map.put(zoneT1Seen, _lz.trackId, true)
-                if _lz.zoneLevel >= zoneEntryMinLevel
-                    float _ctr = (_lz.top + _lz.bottom) / 2
-                    if _lz.direction == 1
-                        //  SUPPORT → LONG 候補
-                        bool _better = not zsNewLong or
-                             _lz.zoneLevel > zsNewLongLevel or
-                             (_lz.zoneLevel == zsNewLongLevel and
-                             math.abs(_ctr - bClose) < math.abs(zsNewLongCtr - bClose))
-                        if _better
-                            zsNewLong      := true
-                            zsNewLongId    := _lz.trackId
-                            zsNewLongLevel := _lz.zoneLevel
-                            zsNewLongTouch := _lz.touchCount
-                            zsNewLongCtr   := _ctr
-                    else if _lz.direction == -1
-                        //  RESIST → SHORT 候補
-                        bool _better = not zsNewShort or
-                             _lz.zoneLevel > zsNewShortLevel or
-                             (_lz.zoneLevel == zsNewShortLevel and
-                             math.abs(_ctr - bClose) < math.abs(zsNewShortCtr - bClose))
-                        if _better
-                            zsNewShort      := true
-                            zsNewShortId    := _lz.trackId
-                            zsNewShortLevel := _lz.zoneLevel
-                            zsNewShortTouch := _lz.touchCount
-                            zsNewShortCtr   := _ctr
+int _zlN = zl.zoneCount(levelEng)
+if _zlN > 0
+    for _i = 0 to _zlN - 1
+        zl.ZoneLevel _lz = zl.zoneAt(levelEng, _i)
+        //  Overlap : 現在の確定15秒足が Zone に触れているか
+        bool _ovl = not na(_lz.top) and not na(_lz.bottom) and
+             low <= _lz.top and high >= _lz.bottom
+        if _lz.trackId >= 0 and _lz.touchCount == 0 and _ovl and
+             not map.contains(zoneT1Seen, _lz.trackId)
+            //  Level 未達 / 方向不一致でも「処理済み」にする (再利用させない)
+            map.put(zoneT1Seen, _lz.trackId, true)
+            if _lz.zoneLevel >= zoneEntryMinLevel
+                float _ctr = (_lz.top + _lz.bottom) / 2
+                if _lz.direction == 1
+                    //  SUPPORT → LONG 候補
+                    bool _better = not zsNewLong or
+                         _lz.zoneLevel > zsNewLongLevel or
+                         (_lz.zoneLevel == zsNewLongLevel and
+                         math.abs(_ctr - close) < math.abs(zsNewLongCtr - close))
+                    if _better
+                        zsNewLong      := true
+                        zsNewLongId    := _lz.trackId
+                        zsNewLongLevel := _lz.zoneLevel
+                        zsNewLongTouch := _lz.touchCount
+                        zsNewLongCtr   := _ctr
+                else if _lz.direction == -1
+                    //  RESIST → SHORT 候補
+                    bool _better = not zsNewShort or
+                         _lz.zoneLevel > zsNewShortLevel or
+                         (_lz.zoneLevel == zsNewShortLevel and
+                         math.abs(_ctr - close) < math.abs(zsNewShortCtr - close))
+                    if _better
+                        zsNewShort      := true
+                        zsNewShortId    := _lz.trackId
+                        zsNewShortLevel := _lz.zoneLevel
+                        zsNewShortTouch := _lz.touchCount
+                        zsNewShortCtr   := _ctr
 
 //  ---- 2) 既存 Setup の失効判定 ---------------------------------------------
 //    ・Setup Valid Minutes 経過
 //    ・対象 trackId が消失
 //    ・LONG が SUPPORT でなくなった / SHORT が RESISTANCE でなくなった
-//    ・TouchCount が 2 以上になった (T1 Setup 中の再タッチ → 失効)
+//    ・公式 TouchCount が 2 以上になった
 //    ・Zone Level が下限未満になった
+//
+//    ★ Setup 時は公式 T0。次の Base TF 確定でその5分足の Touch が公式に
+//      数えられて T1 になるが、これは正常なので Setup は継続する。
+//      そこから再タッチして公式 T2 になったときだけ失効する。
+//        Setup(T0) → 5分確定で公式 T1 → 継続
+//                  → 再タッチで公式 T2 → 失効
 int zsValidMs = zoneSetupValidMin * 60000
 
 if zsLongAlive
