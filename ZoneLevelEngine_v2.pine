@@ -1,0 +1,686 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  ZoneLevelEngine  ―  実戦用 Zone Level 共通ライブラリ
+//  ★ v2 : Base TF 対応版 (チャート時間足から Zone Level の時間軸を切り離した) ★
+// ============================================================================
+//  ■ v1 → v2 の変更点
+//    v1 は Touch / Birth / Age 管理にチャート足の built-in
+//    (high / low / close / time / bar_index) を直接使っていた。
+//    そのため 15秒チャートから呼ぶと、ZoneEngine が Base TF = 5分で動いていても
+//    TouchCount だけ 15秒足で進んでしまい、時間軸がズレる。
+//
+//    v2 は「その足の情報」を外から渡す設計にした。
+//      Touch 判定   : baseLow <= zone.top かつ baseHigh >= zone.bottom
+//      Re-arm 距離  : baseClose と Zone の距離
+//      Birth bar    : baseBarSeq
+//      Birth time   : baseTime
+//      Age          : baseBarSeq - birthBaseBar
+//      staleBars    : baseBarSeq 基準
+//
+//    ★ Touch 仕様そのものは v1 から変更していない ★
+//      ・SUPPORT → Touch 対象
+//      ・RESIST  → Touch 対象
+//      ・ACTIVE  → lastDir を引き継ぐ
+//      ・ACTIVE + lastDir なし → Touch 対象外 (armed も消費しない)
+//      ・BROKEN  → Touch 対象外
+//      ・armed 方式 (同じ接近中は 1 回だけ)
+//      ・Re-arm 距離の既定 10 ドル
+//      ・Level 判定 (birthScore + touchCount) と Touch1 / Touch2 / Touch3+ の定義
+//      いずれも v1 と同一。
+//
+//    ★ API 名の変更 ★
+//      beginBar() / endBar()  →  beginBaseBar() / endBaseBar()
+//      呼び出し側が Base TF の確定足 1 本につき 1 回だけ呼ぶことを明示するため。
+//      v1 は残してあるので、チャート足で動かしたい用途は v1 を使うこと。
+//
+// ----------------------------------------------------------------------------
+//  ★ 目的
+//    ZoneEngine が生成した Zone を、実際の Entry / TP / SL / Obstacle /
+//    NoTrade 判定で「どのレベルの支持・抵抗として扱うか」に変換する。
+//    Zone反発専用ではなく、Zoneブレイク / FVG反発 / FVG吸収 / BOS系 など
+//    複数の Strategy / SignalEngine から共通で使う基盤。
+//
+//  ★ ZoneEngine は一切変更しない / 依存もしない
+//    このライブラリは ZoneEngine を import しない。
+//    呼び出し側が「Zone 1本ぶんの素の値」を feedZone() へ渡す設計にしてある。
+//    理由: Strategy ごとに import している ZoneEngine のバージョンが違うと
+//    UDT の型が別物になり受け渡しできないため。
+//    → ZoneEngine のどのバージョンからでも使える。
+//
+//  ★ Raw Strength と Zone Level は完全な別軸
+//    rawScore / rawStrength   … ZoneEngine が算出した現在の構造 (そのまま保持)
+//    zoneLevel                … 実戦で使う支持・抵抗レベル (birthScore + touchCount)
+//    「Raw = Very Strong / Level = Medium」は正常な状態。
+//
+//  ★ Level は誕生後の Source 追加では昇格しない
+//    Level 判定に使うのは birthScore と touchCount だけ。
+//    現在 Score / rawStrength / reactionCnt / Reaction Bonus / addedSourceMask は
+//    Level 判定に一切使わない (addedSourceMask は参考情報として保持するだけ)。
+//
+//  ★ このライブラリが持たないもの
+//    Long / Short Entry 判定 / 発注 / RR / TP確定 / SL確定 / Signal条件 は無い。
+//    SL Buffer の付与も行わない (Strategy 側の責務)。
+//    「Zone を評価する → 検索する → 結果を返す」だけ。
+//
+//  ★ 想定する呼び出し順 (Base TF の確定足 1 本につき 1 回)
+//      if newBaseBar
+//          zl.beginBaseBar(lvlEng, baseBarSeq, baseTime, baseHigh, baseLow, baseClose)
+//          for i = 0 to zn.zoneCount(zoneEng) - 1
+//              zn.Zone z = zn.zoneAt(zoneEng, i)
+//              zl.feedZone(lvlEng, lvlCfg, z.trackId, z.top, z.bottom, z.state,
+//                   z.score, z.strength, z.flipped, sourceMask)
+//          zl.endBaseBar(lvlEng, lvlCfg)
+//    その後、チャート足のどのタイミングでも nearestResistance() などの
+//    検索関数を呼べる (スナップショットは次の Base TF 確定足まで保持される)。
+//
+//  ★ state コード (ZoneEngine と同じ並びを前提にしている)
+//      0 = ACTIVE / 1 = SUPPORT / 2 = RESIST / 3 = BROKEN
+//    別の並びのエンジンから使う場合は呼び出し側で変換して渡すこと。
+//
+//  ★ Reaction Score Bonus について
+//    ZoneEngine 側へ reactionBonus1/2/3 = 0 を渡す運用を前提にしているが、
+//    このライブラリは reactionCnt も Reaction Bonus も参照しないため、
+//    渡す値がどうであれ Level 判定は変わらない。
+// ============================================================================
+
+//@version=5
+library("ZoneLevelEngine", overlay = true)
+
+// ============================================================================
+// 00. 定数
+// ============================================================================
+//  Zone Level (実戦用) ― ZoneEngine の Raw Strength とは別物
+int LEVEL_NONE    = 0
+int LEVEL_WEAK    = 1
+int LEVEL_MEDIUM  = 2
+int LEVEL_STRONG  = 3
+int LEVEL_VSTRONG = 4
+
+//  Zone State (ZoneEngine と同じ並び)
+int ZS_ACTIVE  = 0
+int ZS_SUPPORT = 1
+int ZS_RESIST  = 2
+int ZS_BROKEN  = 3
+
+//  direction ― 1 = 支持 / -1 = 抵抗 / 0 = ACTIVE (未確定) / -2 = BROKEN
+int DIR_SUPPORT = 1
+int DIR_RESIST  = -1
+int DIR_ACTIVE  = 0
+int DIR_BROKEN  = -2
+
+// ============================================================================
+// 01. TYPES
+// ============================================================================
+
+// ---- 1.1 設定 --------------------------------------------------------------
+export type ZoneLevelCfg
+    //  Level 判定
+    float birthScoreHigh  = 10.0   // birthScore がこの値以上を「高スコア誕生」とする
+    int   touchMidMin     = 2      // touchCount がこの回数以上で1段階低下
+    int   touchWeakMin    = 3      // touchCount がこの回数以上で Weak 固定
+    //  TouchCount
+    float touchRearmDist  = 10.0   // Zone から Base TF 終値がこの距離以上離れて再Touch可能
+    //  検索対象に含める state
+    bool  includeActive   = true   // ACTIVE の Zone も支持・抵抗として扱う
+    bool  includeBroken   = false  // BROKEN の Zone も支持・抵抗として扱う
+    bool  requireDirState = true   // true: 抵抗検索は RESIST、支持検索は SUPPORT のみ
+                                   //       (既定 true。ACTIVE Zone は最寄り検索の候補に
+                                   //        含めず、zoneAtPrice() 側で使う)
+    //  登録簿
+    int   maxTracked      = 400    // trackId 登録簿の上限 (超過時に古いものから破棄)
+    int   staleBars       = 500    // この本数 (Base TF) 観測されなかった trackId を破棄対象にする
+    //  参考情報
+    bool  trackAddedSrc   = true   // 誕生後に追加された Source の mask を記録する
+    int   srcMaskBits     = 16     // sourceMask のビット数 (追加検出のループ回数)
+
+// ---- 1.2 Zone 1本ぶんの評価結果 (当該 Base TF 足のスナップショット) ---------
+export type ZoneLevel
+    int    trackId         = -1
+    float  top             = na
+    float  bottom          = na
+    float  center          = na
+    int    state           = 0
+    int    direction       = 0
+    //  ZoneEngine の現在値 (Raw) ― Level 判定には使わない
+    float  rawScore        = na
+    int    rawStrength     = 0
+    //  誕生時に固定した値
+    float  birthScore      = na
+    int    birthStrength   = 0
+    int    birthBar        = -1     // ★ v2 : Base TF の論理バー番号 (baseBarSeq)
+    int    birthTime       = 0      // ★ v2 : Base TF 確定足の time
+    int    birthSourceMask = 0
+    //  参考情報 (Level 判定には使わない)
+    int    addedSourceMask = 0
+    //  実戦用
+    int    touchCount      = 0
+    int    lastDir         = 0      // 直前に観測した SUPPORT / RESIST 方向 (Touch判定用)
+    int    zoneLevel       = 0
+    string zoneLevelName   = "-"
+    int    ageBars         = 0      // ★ v2 : Base TF 本数
+    bool   flipped         = false
+
+// ---- 1.3 検索結果 ----------------------------------------------------------
+export type ZoneLevelResult
+    bool   found      = false
+    int    trackId    = -1
+    int    level      = 0
+    string levelName  = "-"
+    float  top        = na
+    float  bottom     = na
+    float  center     = na
+    float  distance   = na
+    int    direction  = 0
+    float  birthScore = na
+    int    touchCount = 0
+
+// ---- 1.4 エンジン本体 ------------------------------------------------------
+//  ★ zones は「当該 Base TF 足のスナップショット」。beginBaseBar() で作り直す。
+//  ★ tk* は trackId をキーにした登録簿。バーを跨いで保持する。
+//  ★ v2 : cur* は beginBaseBar() で受け取った Base TF 確定足の値。
+//    feedZone() の Touch 判定はチャート足の built-in ではなくこちらを使う。
+export type ZoneLevelEngine
+    array<ZoneLevel>    zones
+    map<int, float>     tkBirthScore
+    map<int, int>       tkBirthStr
+    map<int, int>       tkBirthBar
+    map<int, int>       tkBirthMs
+    map<int, int>       tkBirthSrc
+    map<int, int>       tkSeenSrc
+    map<int, int>       tkAddedSrc
+    map<int, int>       tkTouchCnt
+    map<int, int>       tkArmed
+    map<int, int>       tkLastDir
+    map<int, int>       tkLastSeen
+    int                 lastAdvSeq = -1     // ★ v2 : 直近に進めた baseBarSeq
+    bool                advance    = false
+    int                 curSeq     = -1     // ★ v2 : 現在の Base TF 論理バー番号
+    int                 curTime    = 0      // ★ v2 : 現在の Base TF 確定足の time
+    float               curHigh    = na     // ★ v2 : 現在の Base TF 確定足の high
+    float               curLow     = na     // ★ v2 : 現在の Base TF 確定足の low
+    float               curClose   = na     // ★ v2 : 現在の Base TF 確定足の close
+
+// ============================================================================
+// 02. 内部ヘルパー
+// ============================================================================
+
+//  ★ Pine Script v5 にはビット演算子 (& | ~) が無いため、
+//    「bit値で割って 2 で割った余り」で 1bit ずつ判定する。
+f_bitOn(int m, int b) =>
+    na(m) or b <= 0 ? false : int(m / b) % 2 == 1
+
+//  cur に有り seen に無いビットだけを取り出す
+f_maskAdded(int cur, int seen, int bits) =>
+    int r = 0
+    int b = 1
+    for _i = 0 to bits - 1
+        if f_bitOn(cur, b) and not f_bitOn(seen, b)
+            r += b
+        b := b * 2
+    r
+
+//  2つの mask の論理和
+f_maskOr(int m1, int m2, int bits) =>
+    int r = 0
+    int b = 1
+    for _i = 0 to bits - 1
+        if f_bitOn(m1, b) or f_bitOn(m2, b)
+            r += b
+        b := b * 2
+    r
+
+//  state → direction
+f_dirOf(int st) =>
+    st == ZS_SUPPORT ? DIR_SUPPORT : st == ZS_RESIST ? DIR_RESIST :
+     st == ZS_BROKEN ? DIR_BROKEN : DIR_ACTIVE
+
+//  ★ Level 判定の本体 ― 使うのは birthScore と touchCount だけ。
+//    現在 Score / rawStrength / 追加 Source / reactionCnt は一切使わない。
+//      touchCount >= touchWeakMin        → Weak
+//      touchCount >= touchMidMin         → 高スコア誕生: Strong / それ以外: Medium
+//      touchCount 0〜1 (未接触 / 初回)   → 高スコア誕生: Very Strong / それ以外: Strong
+//    Touch 0 と Touch 1 は Level は同じだが touchCount で区別できる。
+f_levelOf(float bScore, int tc, ZoneLevelCfg c) =>
+    bool _hi = not na(bScore) and bScore >= c.birthScoreHigh
+    int r = tc >= c.touchWeakMin ? LEVEL_WEAK :
+     tc >= c.touchMidMin ? (_hi ? LEVEL_STRONG : LEVEL_MEDIUM) :
+     (_hi ? LEVEL_VSTRONG : LEVEL_STRONG)
+    r
+
+f_levelName(int lvl) =>
+    lvl == LEVEL_VSTRONG ? "Very Strong" : lvl == LEVEL_STRONG ? "Strong" :
+     lvl == LEVEL_MEDIUM ? "Medium" : lvl == LEVEL_WEAK ? "Weak" : "-"
+
+//  検索対象に含めてよい state かどうか
+f_usable(int st, ZoneLevelCfg c) =>
+    st == ZS_SUPPORT or st == ZS_RESIST or (st == ZS_ACTIVE and c.includeActive) or
+     (st == ZS_BROKEN and c.includeBroken)
+
+//  ZoneLevel → ZoneLevelResult
+f_toResult(ZoneLevel z, float dist) =>
+    ZoneLevelResult r = ZoneLevelResult.new()
+    r.found      := true
+    r.trackId    := z.trackId
+    r.level      := z.zoneLevel
+    r.levelName  := z.zoneLevelName
+    r.top        := z.top
+    r.bottom     := z.bottom
+    r.center     := z.center
+    r.distance   := dist
+    r.direction  := z.direction
+    r.birthScore := z.birthScore
+    r.touchCount := z.touchCount
+    r
+
+// ============================================================================
+// 03. 生成
+// ============================================================================
+
+// @function            Zone Level 判定の設定を既定値で作る。
+//                      Pine の Library では export した関数の引数に既定値を書けないため、
+//                      ZoneEngineLib の newCfg() と同じく「空で作って個別に代入する」形にする。
+//                        zl.ZoneLevelCfg cfg = zl.newCfg()
+//                        cfg.birthScoreHigh := 10.0
+//                        cfg.touchRearmDist := 10.0
+//                      既定値: birthScoreHigh = 10.0 / touchMidMin = 2 / touchWeakMin = 3 /
+//                      touchRearmDist = 10.0 / includeActive = true / includeBroken = false /
+//                      requireDirState = true / maxTracked = 400 / staleBars = 500 /
+//                      trackAddedSrc = true / srcMaskBits = 16
+// @returns             ZoneLevelCfg
+export newCfg() =>
+    ZoneLevelCfg.new()
+
+// @function            ZoneLevelEngine を1つ作る。`var` で1回だけ生成すること。
+// @returns             ZoneLevelEngine
+export newEngine() =>
+    ZoneLevelEngine.new(
+     zones        = array.new<ZoneLevel>(),
+     tkBirthScore = map.new<int, float>(),
+     tkBirthStr   = map.new<int, int>(),
+     tkBirthBar   = map.new<int, int>(),
+     tkBirthMs    = map.new<int, int>(),
+     tkBirthSrc   = map.new<int, int>(),
+     tkSeenSrc    = map.new<int, int>(),
+     tkAddedSrc   = map.new<int, int>(),
+     tkTouchCnt   = map.new<int, int>(),
+     tkArmed      = map.new<int, int>(),
+     tkLastDir    = map.new<int, int>(),
+     tkLastSeen   = map.new<int, int>())
+
+// ============================================================================
+// 04. Base TF 確定足 1 本ぶんの更新
+// ============================================================================
+
+// @function            Base TF の確定足の先頭で呼ぶ。スナップショットを空にし、
+//                      その足の high / low / close / time / 論理バー番号を保存する。
+//                      ★ チャート足ごとに呼んではいけない ★
+//                      ZoneEngine の update() を呼ぶのと完全に同じタイミング
+//                      (Base TF 足 1 本につき 1 回) で呼ぶこと。
+// @param e             ZoneLevelEngine
+// @param baseBarSeq    Base TF の論理バー番号 (1 本確定するたびに +1 される通し番号)。
+//                      同じ番号で 2 回以上呼んでも状態は 1 回しか進まない。
+// @param baseTime      Base TF 確定足の time
+// @param baseHigh      Base TF 確定足の high  (Touch 判定に使う)
+// @param baseLow       Base TF 確定足の low   (Touch 判定に使う)
+// @param baseClose     Base TF 確定足の close (Re-arm 距離に使う)
+// @returns             true
+export beginBaseBar(ZoneLevelEngine e, int baseBarSeq, int baseTime, float baseHigh,
+     float baseLow, float baseClose) =>
+    array.clear(e.zones)
+    e.curSeq   := baseBarSeq
+    e.curTime  := baseTime
+    e.curHigh  := baseHigh
+    e.curLow   := baseLow
+    e.curClose := baseClose
+    //  同じ Base TF 論理バーで 2 回以上進めないよう保護する
+    e.advance := baseBarSeq != e.lastAdvSeq
+    if e.advance
+        e.lastAdvSeq := baseBarSeq
+    true
+
+// @function            Zone 1本を投入する。誕生時情報の固定保存 / TouchCount 更新 /
+//                      Level 判定を行い、当該 Base TF 足のスナップショットへ積む。
+//                      beginBaseBar() と endBaseBar() の間で Zone の本数ぶん呼ぶこと。
+// @param e             ZoneLevelEngine
+// @param c             ZoneLevelCfg
+// @param trackId       ZoneEngine の Zone.trackId (バーを跨いで安定する ID)。負値は無視する。
+// @param top           Zone 上端
+// @param bottom        Zone 下端
+// @param state         0 = ACTIVE / 1 = SUPPORT / 2 = RESIST / 3 = BROKEN
+// @param rawScore      ZoneEngine の現在 Score (Level 判定には使わない)
+// @param rawStrength   ZoneEngine の現在 Strength (Level 判定には使わない)
+// @param flipped       ZoneEngine の flipped
+// @param sourceMask    Source のビットマスク。使わない場合は 0 を渡す。
+// @returns             ZoneLevel (trackId < 0 のときは zoneLevel = 0 の空レコード)
+//                      TouchCount は v1 と同じ仕様:
+//                      Zone と重なり / armed / direction != 0 の3条件を満たしたときだけ加算。
+//                      ★ v2 : 重なり判定と距離判定に Base TF の high / low / close を使う。
+export feedZone(ZoneLevelEngine e, ZoneLevelCfg c, int trackId, float top, float bottom,
+     int state, float rawScore, int rawStrength, bool flipped, int sourceMask) =>
+    ZoneLevel zl = ZoneLevel.new()
+    if trackId >= 0
+        //  ---- 誕生時情報の固定保存 (trackId 1本につき1回だけ) ----
+        //    birthScore は一度保存したら上書きしない。
+        //    ZoneEngine 側の現在 Score が変化しても birthScore は変えない。
+        //    ★ v2 : birthBar は Base TF の論理バー番号 / birthTime は Base TF の time
+        if not map.contains(e.tkBirthScore, trackId)
+            map.put(e.tkBirthScore, trackId, rawScore)
+            map.put(e.tkBirthStr,   trackId, rawStrength)
+            map.put(e.tkBirthBar,   trackId, e.curSeq)
+            map.put(e.tkBirthMs,    trackId, e.curTime)
+            map.put(e.tkBirthSrc,   trackId, sourceMask)
+            map.put(e.tkSeenSrc,    trackId, sourceMask)
+            map.put(e.tkAddedSrc,   trackId, 0)
+            map.put(e.tkTouchCnt,   trackId, 0)
+            map.put(e.tkArmed,      trackId, 1)
+            map.put(e.tkLastDir,    trackId, 0)
+        map.put(e.tkLastSeen, trackId, e.curSeq)
+
+        if e.advance
+            //  ---- 誕生後に追加された Source (参考情報のみ / Level には使わない) ----
+            //    「これまでに一度も観測していない bit」だけを追加として記録する。
+            //    誕生時 Source や、一度消えて再登場した Source は追加扱いにならない。
+            if c.trackAddedSrc
+                int _seen = map.get(e.tkSeenSrc, trackId)
+                if sourceMask != _seen
+                    int _new = f_maskAdded(sourceMask, _seen, c.srcMaskBits)
+                    if _new != 0
+                        map.put(e.tkAddedSrc, trackId,
+                         f_maskOr(map.get(e.tkAddedSrc, trackId), _new, c.srcMaskBits))
+                    map.put(e.tkSeenSrc, trackId, f_maskOr(_seen, sourceMask, c.srcMaskBits))
+
+            //  ---- 直前方向 State (Touch判定用) ----
+            //    SUPPORT / RESIST を観測したときだけ更新する。
+            //    ACTIVE / BROKEN では上書きせず、直前方向を保持する。
+            if state == ZS_SUPPORT
+                map.put(e.tkLastDir, trackId, DIR_SUPPORT)
+            else if state == ZS_RESIST
+                map.put(e.tkLastDir, trackId, DIR_RESIST)
+
+            //  ---- TouchCount (v1 と完全に同じ仕様) ----
+            //    Touch の direction:
+            //      SUPPORT → +1 / RESIST → -1 / ACTIVE → tkLastDir を引き継ぐ /
+            //      BROKEN  → 0
+            //    加算するのは「Zone と重なっている」「armed == 1」「direction != 0」
+            //    の3つを全て満たしたときだけ。
+            //      ACTIVE + 過去方向あり → Touch対象
+            //      ACTIVE + 過去方向なし → Touch対象外 (armed も消費しない。
+            //                              同じ接近中に方向確定したら拾えるようにする)
+            //      BROKEN                → Touch対象外
+            //    同じ接近中に Zone 内で何本推移しても 1 回だけ (armed を消費する)。
+            //    終値が Zone から touchRearmDist 以上離れて初めて再び armed になる。
+            //
+            //    ★ v2 : ここだけが v1 との実質的な違い ★
+            //      v1 : low <= top and high >= bottom   / close で距離
+            //      v2 : curLow <= top and curHigh >= bottom / curClose で距離
+            //      判定式そのものは同じで、参照する足が Base TF になっただけ。
+            int _ldir = map.get(e.tkLastDir, trackId)
+            int _tdir = state == ZS_SUPPORT ? DIR_SUPPORT : state == ZS_RESIST ? DIR_RESIST :
+             state == ZS_ACTIVE ? _ldir : 0
+            bool _inZone = not na(e.curLow) and not na(e.curHigh) and
+             e.curLow <= top and e.curHigh >= bottom
+            float _dist = na(e.curClose) ? na :
+             e.curClose < bottom ? bottom - e.curClose :
+             e.curClose > top ? e.curClose - top : 0.0
+            if _inZone
+                if map.get(e.tkArmed, trackId) == 1 and _tdir != 0
+                    map.put(e.tkArmed, trackId, 0)
+                    map.put(e.tkTouchCnt, trackId, map.get(e.tkTouchCnt, trackId) + 1)
+            else
+                if not na(_dist) and _dist >= c.touchRearmDist
+                    map.put(e.tkArmed, trackId, 1)
+
+        //  ---- スナップショット構築 ----
+        float _bs = map.get(e.tkBirthScore, trackId)
+        int   _tc = map.get(e.tkTouchCnt, trackId)
+        int   _lv = f_levelOf(_bs, _tc, c)
+        zl.trackId         := trackId
+        zl.top             := top
+        zl.bottom          := bottom
+        zl.center          := (top + bottom) / 2
+        zl.state           := state
+        zl.direction       := f_dirOf(state)
+        zl.rawScore        := rawScore
+        zl.rawStrength     := rawStrength
+        zl.birthScore      := _bs
+        zl.birthStrength   := map.get(e.tkBirthStr, trackId)
+        zl.birthBar        := map.get(e.tkBirthBar, trackId)
+        zl.birthTime       := map.get(e.tkBirthMs, trackId)
+        zl.birthSourceMask := map.get(e.tkBirthSrc, trackId)
+        zl.addedSourceMask := map.get(e.tkAddedSrc, trackId)
+        zl.touchCount      := _tc
+        zl.lastDir         := map.get(e.tkLastDir, trackId)
+        zl.zoneLevel       := _lv
+        zl.zoneLevelName   := f_levelName(_lv)
+        //  ★ v2 : Age は Base TF の本数
+        zl.ageBars         := e.curSeq - map.get(e.tkBirthBar, trackId)
+        zl.flipped         := flipped
+        array.push(e.zones, zl)
+    zl
+
+// @function            Base TF 確定足の末尾で呼ぶ。登録簿が上限を超えていたら
+//                      古い trackId を破棄する。
+//                      ★ v2 : 経過本数の判定は Base TF の論理バー番号で行う。
+// @param e             ZoneLevelEngine
+// @param c             ZoneLevelCfg
+// @returns             破棄した trackId の件数
+export endBaseBar(ZoneLevelEngine e, ZoneLevelCfg c) =>
+    int removed = 0
+    if e.advance and map.size(e.tkLastSeen) > c.maxTracked
+        array<int> _ks = map.keys(e.tkLastSeen)
+        if array.size(_ks) > 0
+            for _i = 0 to array.size(_ks) - 1
+                int _k = array.get(_ks, _i)
+                if e.curSeq - map.get(e.tkLastSeen, _k) > c.staleBars
+                    map.remove(e.tkLastSeen,   _k)
+                    map.remove(e.tkBirthScore, _k)
+                    map.remove(e.tkBirthStr,   _k)
+                    map.remove(e.tkBirthBar,   _k)
+                    map.remove(e.tkBirthMs,    _k)
+                    map.remove(e.tkBirthSrc,   _k)
+                    map.remove(e.tkSeenSrc,    _k)
+                    map.remove(e.tkAddedSrc,   _k)
+                    map.remove(e.tkTouchCnt,   _k)
+                    map.remove(e.tkArmed,      _k)
+                    map.remove(e.tkLastDir,    _k)
+                    removed += 1
+    removed
+
+// ============================================================================
+// 05. スナップショットの参照
+// ============================================================================
+
+// @function            当該 Base TF 足のスナップショットに入っている Zone の本数。
+// @param e             ZoneLevelEngine
+// @returns             本数
+export zoneCount(ZoneLevelEngine e) =>
+    array.size(e.zones)
+
+// @function            スナップショットの i 番目の Zone を返す。
+// @param e             ZoneLevelEngine
+// @param i             インデックス (0 〜 zoneCount-1)。範囲外は空レコード。
+// @returns             ZoneLevel
+export zoneAt(ZoneLevelEngine e, int i) =>
+    i >= 0 and i < array.size(e.zones) ? array.get(e.zones, i) : ZoneLevel.new()
+
+// @function            trackId で Zone を引く。見つからなければ trackId = -1 の空レコード。
+// @param e             ZoneLevelEngine
+// @param trackId       探す trackId
+// @returns             ZoneLevel
+export zoneByTrackId(ZoneLevelEngine e, int trackId) =>
+    ZoneLevel r = ZoneLevel.new()
+    int n = array.size(e.zones)
+    if n > 0 and trackId >= 0
+        for _i = 0 to n - 1
+            ZoneLevel _z = array.get(e.zones, _i)
+            if _z.trackId == trackId
+                r := _z
+                break
+    r
+
+// @function            Level コードを表示名にする ("Very Strong" / "Strong" / "Medium" / "Weak")。
+// @param lvl           1 〜 4
+// @returns             表示名
+export levelName(int lvl) =>
+    f_levelName(lvl)
+
+// @function            Level 定数 Weak (= 1)。
+// @returns             1
+export levelWeak() =>
+    LEVEL_WEAK
+
+// @function            Level 定数 Medium (= 2)。
+// @returns             2
+export levelMedium() =>
+    LEVEL_MEDIUM
+
+// @function            Level 定数 Strong (= 3)。
+// @returns             3
+export levelStrong() =>
+    LEVEL_STRONG
+
+// @function            Level 定数 Very Strong (= 4)。
+// @returns             4
+export levelVeryStrong() =>
+    LEVEL_VSTRONG
+
+// @function            birthScore と touchCount から Level を直接計算する (検証用)。
+// @param birthScore    誕生時 Score
+// @param touchCount    Touch 回数
+// @param c             ZoneLevelCfg
+// @returns             1 〜 4
+export levelFrom(float birthScore, int touchCount, ZoneLevelCfg c) =>
+    f_levelOf(birthScore, touchCount, c)
+
+// ============================================================================
+// 06. 検索 (TP / SL / Obstacle / NoTrade 用)
+// ----------------------------------------------------------------------------
+//  ★ Short でも同じ関数をそのまま使う。
+//    Long : TP  = nearestResistance() / SL = nearestSupport()
+//    Short: TP  = nearestSupport()    / SL = nearestResistance()
+//  ★ distance は「価格から Zone の手前側の端までの距離」。
+//    抵抗 = bottom - price / 支持 = price - top。Zone 内部にいる場合は 0。
+//  ★ requireDirState は既定 true。
+//    nearestResistance() は RESIST、nearestSupport() は SUPPORT の Zone だけを
+//    候補にする。ACTIVE Zone は最寄り検索の候補に含めない。
+//    ACTIVE Zone は zoneAtPrice() の「現在価格が Zone 内部か」判定で使う
+//    (includeActive は既定 true のまま)。
+//  ★ SL Buffer の付与や TP の最終決定はこのライブラリでは行わない。
+//  ★ 検索はチャート足のどのタイミングで呼んでもよい。
+//    参照するのは直近の Base TF 確定足で作ったスナップショットなので、
+//    15秒足の途中で呼んでも Zone Level は変わらない。
+// ============================================================================
+
+// @function            price より上にある、minLevel 以上の最寄り抵抗 Zone を返す。
+//                      requireDirState = true (既定) なら RESIST の Zone のみが候補。
+// @param e             ZoneLevelEngine
+// @param c             ZoneLevelCfg
+// @param price         基準価格 (Entry Price など)
+// @param minLevel      必要な最低 Level (1 〜 4)
+// @returns             ZoneLevelResult (found = false なら該当なし)
+export nearestResistance(ZoneLevelEngine e, ZoneLevelCfg c, float price, int minLevel) =>
+    ZoneLevelResult r = ZoneLevelResult.new()
+    int n = array.size(e.zones)
+    if n > 0 and not na(price)
+        float _best = 1e20
+        for _i = 0 to n - 1
+            ZoneLevel _z = array.get(e.zones, _i)
+            if _z.zoneLevel >= minLevel and f_usable(_z.state, c)
+                if not c.requireDirState or _z.direction == DIR_RESIST
+                    if _z.bottom > price
+                        float _d = _z.bottom - price
+                        if _d < _best
+                            _best := _d
+                            r := f_toResult(_z, _d)
+    r
+
+// @function            price より下にある、minLevel 以上の最寄り支持 Zone を返す。
+//                      requireDirState = true (既定) なら SUPPORT の Zone のみが候補。
+// @param e             ZoneLevelEngine
+// @param c             ZoneLevelCfg
+// @param price         基準価格 (Entry Price など)
+// @param minLevel      必要な最低 Level (1 〜 4)
+// @returns             ZoneLevelResult (found = false なら該当なし)
+export nearestSupport(ZoneLevelEngine e, ZoneLevelCfg c, float price, int minLevel) =>
+    ZoneLevelResult r = ZoneLevelResult.new()
+    int n = array.size(e.zones)
+    if n > 0 and not na(price)
+        float _best = 1e20
+        for _i = 0 to n - 1
+            ZoneLevel _z = array.get(e.zones, _i)
+            if _z.zoneLevel >= minLevel and f_usable(_z.state, c)
+                if not c.requireDirState or _z.direction == DIR_SUPPORT
+                    if _z.top < price
+                        float _d = price - _z.top
+                        if _d < _best
+                            _best := _d
+                            r := f_toResult(_z, _d)
+    r
+
+// @function            price が minLevel 以上の Zone の内部にあるかを返す。
+//                      複数該当する場合は Level が最も高いものを返す。
+// @param e             ZoneLevelEngine
+// @param c             ZoneLevelCfg
+// @param price         判定する価格
+// @param minLevel      必要な最低 Level (1 〜 4)
+// @returns             ZoneLevelResult (found = true なら内部。distance は 0)
+export zoneAtPrice(ZoneLevelEngine e, ZoneLevelCfg c, float price, int minLevel) =>
+    ZoneLevelResult r = ZoneLevelResult.new()
+    int n = array.size(e.zones)
+    if n > 0 and not na(price)
+        int _bestLv = 0
+        for _i = 0 to n - 1
+            ZoneLevel _z = array.get(e.zones, _i)
+            if _z.zoneLevel >= minLevel and f_usable(_z.state, c)
+                if price >= _z.bottom and price <= _z.top
+                    if _z.zoneLevel > _bestLv
+                        _bestLv := _z.zoneLevel
+                        r := f_toResult(_z, 0.0)
+    r
+
+// @function            price から maxDistance 以内の上方向に、minLevel 以上の Zone があるか。
+//                      Long の TP 手前 Obstacle 判定などに使う。
+// @param e             ZoneLevelEngine
+// @param c             ZoneLevelCfg
+// @param price         基準価格
+// @param maxDistance   探す距離 ($)
+// @param minLevel      必要な最低 Level (1 〜 4)
+// @returns             ZoneLevelResult (距離を超えていれば found = false)
+export hasResistanceAhead(ZoneLevelEngine e, ZoneLevelCfg c, float price, float maxDistance,
+     int minLevel) =>
+    ZoneLevelResult r = nearestResistance(e, c, price, minLevel)
+    if r.found and not na(maxDistance) and r.distance > maxDistance
+        r := ZoneLevelResult.new()
+    r
+
+// @function            price から maxDistance 以内の下方向に、minLevel 以上の Zone があるか。
+//                      Long の SL 候補 / Short の TP 手前 Obstacle 判定などに使う。
+// @param e             ZoneLevelEngine
+// @param c             ZoneLevelCfg
+// @param price         基準価格
+// @param maxDistance   探す距離 ($)
+// @param minLevel      必要な最低 Level (1 〜 4)
+// @returns             ZoneLevelResult (距離を超えていれば found = false)
+export hasSupportBelow(ZoneLevelEngine e, ZoneLevelCfg c, float price, float maxDistance,
+     int minLevel) =>
+    ZoneLevelResult r = nearestSupport(e, c, price, minLevel)
+    if r.found and not na(maxDistance) and r.distance > maxDistance
+        r := ZoneLevelResult.new()
+    r
+
+// @function            minLevel 以上の Zone が当該 Base TF 足に何本あるかを数える (デバッグ用)。
+// @param e             ZoneLevelEngine
+// @param c             ZoneLevelCfg
+// @param minLevel      必要な最低 Level (1 〜 4)
+// @returns             本数
+export countAtLeast(ZoneLevelEngine e, ZoneLevelCfg c, int minLevel) =>
+    int cnt = 0
+    int n = array.size(e.zones)
+    if n > 0
+        for _i = 0 to n - 1
+            ZoneLevel _z = array.get(e.zones, _i)
+            if _z.zoneLevel >= minLevel and f_usable(_z.state, c)
+                cnt += 1
+    cnt
