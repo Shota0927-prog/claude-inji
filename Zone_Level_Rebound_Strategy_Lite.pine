@@ -407,13 +407,21 @@ zoneRightBars  = input.int(30,  "Right Extension (bars)", minval = 1, group = G_
 var string G_LOGGER = "07 · Logger Repro"
 useLoggerRepro = input.bool(false, "Enable Logger Repro", group = G_LOGGER,
      tooltip = "OFF のときは集計処理もテーブル生成も一切行わない (既定OFF)。\n" +
-     "ON にしても Entry / SL / TP / Qty / Break Even の結果は変わらない。")
-loggerMinLevelStr = input.string("Strong", "Minimum Level",
-     options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_LOGGER)
+     "ON にしても Entry / SL / TP / Qty / Break Even の結果は変わらない。\n" +
+     "評価期間はタッチ足を除く その後48本の確定5分足で固定 (元CSVと同じ仕様)。")
+loggerLevelStr = input.string("Strong", "Level",
+     options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_LOGGER,
+     tooltip = "抽出対象にする Zone Level。EXACT / MINIMUM は下の Level Match で決める。")
+loggerLevelMatch = input.string("EXACT", "Level Match",
+     options = ["EXACT", "MINIMUM"], group = G_LOGGER,
+     tooltip = "EXACT   : その Level ちょうどだけを対象 (例 Strong なら Strong のみ)。\n" +
+     "          元CSVの「Strong T1」はこの EXACT 集計なので、CSV再現の既定値。\n" +
+     "MINIMUM : その Level 以上を対象 (例 Strong なら Strong + Very Strong)。")
 loggerLevelTiming = input.string("POST_TOUCH", "Level Timing",
      options = ["PRE_TOUCH", "POST_TOUCH"], group = G_LOGGER,
      tooltip = "PRE_TOUCH  : タッチ直前 (1本前の確定足時点) の Level で抽出。\n" +
      "POST_TOUCH : タッチを反映した後の Level で抽出。\n" +
+     "★ 元CSVの EV_zoneLevel は Touch後の Level なので、CSV再現の既定は POST_TOUCH。\n" +
      "★ Main Entry の Entry Level Timing とは完全に独立した設定。")
 loggerTouchMode = input.string("T1_ONLY", "Touch Filter",
      options = ["ALL", "T1_ONLY"], group = G_LOGGER,
@@ -422,6 +430,8 @@ loggerTouchMode = input.string("T1_ONLY", "Touch Filter",
 loggerTarget1 = input.float(10.0, "Target #1 ($)", minval = 0.1, step = 1.0, group = G_LOGGER)
 loggerTarget2 = input.float(20.0, "Target #2 ($)", minval = 0.1, step = 1.0, group = G_LOGGER)
 loggerTarget3 = input.float(30.0, "Target #3 ($)", minval = 0.1, step = 1.0, group = G_LOGGER)
+//  ★ 評価期間は「タッチ足を除く その後48本」固定 (Section 10 · LOG_HORIZON)。
+//    元CSVの再解析で確定した値なので input にしていない。
 
 // ============================================================================
 // 02. ENGINE INITIALIZATION
@@ -806,7 +816,7 @@ f_levelName(int lvl) =>
 int minEntryLevel   = f_levelIdx(minEntryLevelStr)
 int minTpLevel      = f_levelIdx(minTpLevelStr)
 int minDisplayLevel = f_levelIdx(minDisplayLevelStr)
-int loggerMinLevel  = f_levelIdx(loggerMinLevelStr)
+int loggerLevel     = f_levelIdx(loggerLevelStr)
 
 // ============================================================================
 // 06. ENTRY / SL / TP HELPERS
@@ -1167,6 +1177,7 @@ if showZones and barstate.islast
                                  size      = size.small)
                             array.push(gLabels, _l)
 
+
 // ============================================================================
 // 10. LOGGER REPRO (診断専用 · 既定OFF)
 // ----------------------------------------------------------------------------
@@ -1181,44 +1192,57 @@ if showZones and barstate.islast
 //    ・SignalEngine / Event Engine / Dynamic TP を追加しない
 //    ・ZoneLevel を Main 側で再計算しない
 //
-//  ★ 反発の基準価格 (refPrice) は Zone の「手前端」 ★
-//    Long  (SUPPORT) : refPrice = Zone Top    → MFE = 最高値 - refPrice
-//    Short (RESIST)  : refPrice = Zone Bottom → MFE = refPrice - 最安値
+//  ★★ 評価期間は「タッチ足を除いた その後 48本の確定5分足」固定 ★★
+//    元CSV (OANDA_XAUUSD, 5) の全 Touch Event を再解析した結果、EV_MFE は
+//    タッチ足を含まない +1 ～ +48 本の MFE と一致した。よってここも同じにする。
+//      Long  : MFE = max(high of bars +1 ～ +48) - refPrice
+//      Short : MFE = refPrice - min(low  of bars +1 ～ +48)
+//      MFE の下限は 0 (不利側へしか動かなかった Event は 0)。
+//    ・Event 作成足は age = 0。この足では MFE を更新しない。
+//    ・次の確定足が age = 1。age 1 ～ 48 だけ更新する。
+//    ・age = 48 を評価した後に Event を削除する。
+//
+//  ★★ 48本の間は途中終了しない ★★
+//    元CSVでは、同じZoneへ次のTouchが来ても / BROKEN になっても /
+//    tracking lost になっても、その Touch Event 自身の MFE はタッチ後48本で
+//    評価されている。したがって以下は「終了条件にしない」:
+//      ・新しい Touch    ・BROKEN    ・tracking lost    ・全Target到達
+//    唯一の終了条件は age = 48 に到達すること。
+//
+//  ★ Event の一意キーは trackId + touchCount ★
+//    同じ trackId の T1 / T2 は別 Event として同時に保持する
+//    (T1 は自分の48本評価を続けたまま、T2 が新しく始まる)。
 //
 //  ★ 新規 Touch Event の起点は ZoneLevelEngine の TouchCount 増加だけ ★
 //    同じ trackId について「今回の touchCount > 1本前の touchCount」。
 //    Zoneタッチ条件を Strategy 側で再実装しない。
-//    ※ 1本前の記録が無い trackId (snapshotに初登場) は起点にしない。
-//      「増加した」と言えないため。POST_TOUCH Level で代用もしない。
+//    ※ 1本前の記録が無い trackId (snapshotに初登場) は起点にしない
+//      (「増加した」と言えないため)。
 //
-//  ★ MFE には「タッチした確定足そのもの」も含める ★
-//    Event はその足の endBaseBar 後に作られ、そのまま同じ足の high / low で
-//    1回目の更新を受ける (タッチ足の反発ぶんを捨てない)。以降は確定足ごとに更新。
+//  ★ refPrice は Zone の「手前端」(現行仕様のまま) ★
+//    Long  (SUPPORT) : refPrice = Zone Top
+//    Short (RESIST)  : refPrice = Zone Bottom
 //
-//  ★★ Approximate Logger termination ★★
-//    元の CSV Logger の正確なイベント終了条件は、このリポジトリ内のコードから
-//    確認できなかった (Logger本体のソースが無い)。そのため終了条件を推測で
-//    作らず、現在の ZoneEngine / ZoneLevelEngine から確実に分かる範囲だけの
-//    簡易版にしている:
-//      ・Zone が BROKEN になったら終了
-//      ・trackId が snapshot から消えたら終了 (tracking lost)
-//      ・同じ trackId に新しい Touch Event が来たら切替 (前のEventは終了)
-//    加えて、3つの Target をすべて達成した Event は追跡を打ち切る
-//    (Hit は達成時点で集計済みなので、集計結果は打ち切っても変わらない)。
+//  ※ チャート末尾 48本以内に発生した Event は、48本ぶんの評価が終わらないまま
+//    Events に計上される (途中までの Hit だけが数えられる)。期間末尾の
+//    数イベントぶんだけ Hit率がわずかに下振れしうる点に注意。
 //
 //  ★ 軽量性 : useLoggerRepro = false のときはこのセクションを一切実行しない。
-//    テーブルも作らない。Event 管理は trackId 単位の小さな配列と map 1本だけ。
+//    テーブルも作らない。Event 管理は小さな配列だけ (追加 request は無し)。
 // ============================================================================
+//  ★ 評価期間は固定 48本 (元CSV解析で確定した値なので input にしない)
+int LOG_HORIZON = 48
+
 //  Active Event (配列は必ず同じ index で対応している)
-var array<int>   gLogId  = array.new_int()     // trackId
-var array<int>   gLogDir = array.new_int()     // 1 = Long(SUPPORT) / -1 = Short(RESIST)
-var array<float> gLogRef = array.new_float()   // refPrice (Zone手前端)
-var array<float> gLogMfe = array.new_float()   // Max Favorable Excursion
-var array<bool>  gLogH1  = array.new_bool()    // Target #1 到達済み (集計済み)
-var array<bool>  gLogH2  = array.new_bool()
-var array<bool>  gLogH3  = array.new_bool()
-//  現在 snapshot の trackId → state (終了判定用。毎バー作り直す)
-var map<int, int> gLogState = map.new<int, int>()
+var array<int>   gLogId    = array.new_int()     // trackId       (キーの一部)
+var array<int>   gLogTc    = array.new_int()     // touchCount    (キーの一部)
+var array<int>   gLogDir   = array.new_int()     // 1 = Long(SUPPORT) / -1 = Short(RESIST)
+var array<float> gLogRef   = array.new_float()   // refPrice (Zone手前端)
+var array<int>   gLogStart = array.new_int()     // startBar (= Touch足の bar_index)
+var array<float> gLogMfe   = array.new_float()   // Max Favorable Excursion (下限 0)
+var array<bool>  gLogH1    = array.new_bool()    // Target #1 到達済み (集計済み)
+var array<bool>  gLogH2    = array.new_bool()
+var array<bool>  gLogH3    = array.new_bool()
 //  集計カウンタ (表示専用)
 var int gLogEvents = 0
 var int gLogHit1   = 0
@@ -1226,14 +1250,50 @@ var int gLogHit2   = 0
 var int gLogHit3   = 0
 
 if useLoggerRepro and barstate.isconfirmed
-    // ---- 10.1 新規 Touch Event 検出 (snapshot を1回だけ走査) -------------
-    map.clear(gLogState)
+    // ---- 10.1 MFE 更新 / Target 判定 / 48本で終了 -------------------------
+    //  ★ 先に既存 Event を処理する。こうすると、この足で作られる新しい Event
+    //    (age = 0) がこの足の high / low で更新されることが構造的に起きない。
+    //  ★ 後ろから回すのは、48本を終えた Event を安全に取り除くため。
+    int _lgEn = array.size(gLogId)
+    if _lgEn > 0
+        for _lgK = _lgEn - 1 to 0
+            int _lgAge = bar_index - array.get(gLogStart, _lgK)
+            if _lgAge >= 1 and _lgAge <= LOG_HORIZON
+                int   _lgD   = array.get(gLogDir, _lgK)
+                float _lgRef = array.get(gLogRef, _lgK)
+                //  Long : 最高値 - refPrice  /  Short : refPrice - 最安値
+                float _lgFav = _lgD > 0 ? high - _lgRef : _lgRef - low
+                float _lgMfe = math.max(math.max(array.get(gLogMfe, _lgK), _lgFav), 0.0)
+                array.set(gLogMfe, _lgK, _lgMfe)
+                //  Target 到達は「初めて超えた時」に1回だけ集計する
+                if not array.get(gLogH1, _lgK) and _lgMfe >= loggerTarget1
+                    array.set(gLogH1, _lgK, true)
+                    gLogHit1 := gLogHit1 + 1
+                if not array.get(gLogH2, _lgK) and _lgMfe >= loggerTarget2
+                    array.set(gLogH2, _lgK, true)
+                    gLogHit2 := gLogHit2 + 1
+                if not array.get(gLogH3, _lgK) and _lgMfe >= loggerTarget3
+                    array.set(gLogH3, _lgK, true)
+                    gLogHit3 := gLogHit3 + 1
+            //  ★ 終了条件は age = 48 に到達したときだけ ★
+            //    BROKEN / tracking lost / 新Touch / 全Target到達では終了しない。
+            if _lgAge >= LOG_HORIZON
+                array.remove(gLogId,    _lgK)
+                array.remove(gLogTc,    _lgK)
+                array.remove(gLogDir,   _lgK)
+                array.remove(gLogRef,   _lgK)
+                array.remove(gLogStart, _lgK)
+                array.remove(gLogMfe,   _lgK)
+                array.remove(gLogH1,    _lgK)
+                array.remove(gLogH2,    _lgK)
+                array.remove(gLogH3,    _lgK)
+
+    // ---- 10.2 新規 Touch Event 検出 (snapshot を1回だけ走査) -------------
     int _lgN = zl.zoneCount(lvlEng)
     if _lgN > 0
         for _lgI = 0 to _lgN - 1
             zl.ZoneLevel _lgZ = zl.zoneAt(lvlEng, _lgI)
             if _lgZ.trackId >= 0
-                gLogState.put(_lgZ.trackId, _lgZ.state)
                 //  TouchCount 増加の検出 (ZoneLevelEngine の認識をそのまま使う)
                 int  _lgPrevTc = gLogPrevTouch.contains(_lgZ.trackId) ? gLogPrevTouch.get(_lgZ.trackId) : -1
                 bool _lgNewTouch = _lgPrevTc >= 0 and _lgZ.touchCount > _lgPrevTc
@@ -1243,91 +1303,47 @@ if useLoggerRepro and barstate.isconfirmed
                     //  抽出に使う Level (Main Entry の entryLevelMode とは独立)
                     int _lgPreLv = gPreTouchLevel.contains(_lgZ.trackId) ? gPreTouchLevel.get(_lgZ.trackId) : -1
                     int _lgLv = loggerLevelTiming == "PRE_TOUCH" ? _lgPreLv : _lgZ.zoneLevel
-                    bool _lgLvOk = _lgLv >= loggerMinLevel
+                    //  EXACT : そのLevelちょうど / MINIMUM : そのLevel以上
+                    bool _lgLvOk = loggerLevelMatch == "EXACT" ? _lgLv == loggerLevel : _lgLv >= loggerLevel
                     bool _lgTcOk = loggerTouchMode == "ALL" or _lgZ.touchCount == 1
                     if _lgDir != 0 and _lgLvOk and _lgTcOk
-                        //  同じ trackId の Event が生きていれば、新しい Touch へ切替
-                        int _lgOld = array.indexof(gLogId, _lgZ.trackId)
-                        if _lgOld >= 0
-                            array.remove(gLogId,  _lgOld)
-                            array.remove(gLogDir, _lgOld)
-                            array.remove(gLogRef, _lgOld)
-                            array.remove(gLogMfe, _lgOld)
-                            array.remove(gLogH1,  _lgOld)
-                            array.remove(gLogH2,  _lgOld)
-                            array.remove(gLogH3,  _lgOld)
-                        array.push(gLogId,  _lgZ.trackId)
-                        array.push(gLogDir, _lgDir)
-                        array.push(gLogRef, _lgDir > 0 ? _lgZ.top : _lgZ.bottom)
-                        array.push(gLogMfe, 0.0)
-                        array.push(gLogH1,  false)
-                        array.push(gLogH2,  false)
-                        array.push(gLogH3,  false)
+                        //  ★ 同じ trackId に既存 Event があっても消さない ★
+                        //    trackId + touchCount が別なら別 Event として同時保持する。
+                        array.push(gLogId,    _lgZ.trackId)
+                        array.push(gLogTc,    _lgZ.touchCount)
+                        array.push(gLogDir,   _lgDir)
+                        array.push(gLogRef,   _lgDir > 0 ? _lgZ.top : _lgZ.bottom)
+                        array.push(gLogStart, bar_index)
+                        array.push(gLogMfe,   0.0)
+                        array.push(gLogH1,    false)
+                        array.push(gLogH2,    false)
+                        array.push(gLogH3,    false)
                         gLogEvents := gLogEvents + 1
-
-    // ---- 10.2 MFE 更新 / Target 判定 / 終了判定 --------------------------
-    //  後ろから回すのは、終了した Event を安全に取り除くため。
-    int _lgEn = array.size(gLogId)
-    if _lgEn > 0
-        for _lgK = _lgEn - 1 to 0
-            int   _lgTid = array.get(gLogId,  _lgK)
-            int   _lgD   = array.get(gLogDir, _lgK)
-            float _lgRef = array.get(gLogRef, _lgK)
-            //  Long : 最高値 - refPrice  /  Short : refPrice - 最安値
-            float _lgMfe = math.max(array.get(gLogMfe, _lgK), _lgD > 0 ? high - _lgRef : _lgRef - low)
-            array.set(gLogMfe, _lgK, _lgMfe)
-            //  Target 到達は「初めて超えた時」に1回だけ集計する
-            bool _lgH1 = array.get(gLogH1, _lgK)
-            bool _lgH2 = array.get(gLogH2, _lgK)
-            bool _lgH3 = array.get(gLogH3, _lgK)
-            if not _lgH1 and _lgMfe >= loggerTarget1
-                _lgH1 := true
-                array.set(gLogH1, _lgK, true)
-                gLogHit1 := gLogHit1 + 1
-            if not _lgH2 and _lgMfe >= loggerTarget2
-                _lgH2 := true
-                array.set(gLogH2, _lgK, true)
-                gLogHit2 := gLogHit2 + 1
-            if not _lgH3 and _lgMfe >= loggerTarget3
-                _lgH3 := true
-                array.set(gLogH3, _lgK, true)
-                gLogHit3 := gLogHit3 + 1
-            //  ★ Approximate Logger termination (上のセクション注記を参照)
-            bool _lgAlive = gLogState.contains(_lgTid)
-            if _lgAlive
-                _lgAlive := gLogState.get(_lgTid) != ST_BROKEN
-            bool _lgDone = _lgH1 and _lgH2 and _lgH3
-            if not _lgAlive or _lgDone
-                array.remove(gLogId,  _lgK)
-                array.remove(gLogDir, _lgK)
-                array.remove(gLogRef, _lgK)
-                array.remove(gLogMfe, _lgK)
-                array.remove(gLogH1,  _lgK)
-                array.remove(gLogH2,  _lgK)
-                array.remove(gLogH3,  _lgK)
 
 // ---- 10.3 集計テーブル (表示専用) ------------------------------------------
 //  Logger Repro が OFF のときは table.new すら呼ばない。
 var table gLogTbl = na
 if useLoggerRepro and barstate.islast
     if na(gLogTbl)
-        gLogTbl := table.new(position.bottom_left, 3, 5, border_width = 1,
+        gLogTbl := table.new(position.bottom_left, 3, 6, border_width = 1,
              frame_width = 1, frame_color = color.new(color.gray, 40))
     float _lgTot = gLogEvents
-    string _lgCond = loggerMinLevelStr + " / " + loggerLevelTiming + " / " + loggerTouchMode
     color _lgHdr = color.new(color.black, 0)
     table.cell(gLogTbl, 0, 0, "LOGGER REPRO", text_color = color.white, bgcolor = _lgHdr, text_size = size.small)
-    table.cell(gLogTbl, 1, 0, _lgCond,        text_color = color.white, bgcolor = _lgHdr, text_size = size.small)
-    table.cell(gLogTbl, 2, 0, "",             text_color = color.white, bgcolor = _lgHdr, text_size = size.small)
-    table.cell(gLogTbl, 0, 1, "Events", text_color = color.white, text_size = size.small)
-    table.cell(gLogTbl, 1, 1, str.tostring(gLogEvents), text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 1, 0, loggerLevelStr + " / " + loggerLevelMatch, text_color = color.white, bgcolor = _lgHdr, text_size = size.small)
+    table.cell(gLogTbl, 2, 0, str.tostring(LOG_HORIZON) + " bars", text_color = color.white, bgcolor = _lgHdr, text_size = size.small)
+    table.cell(gLogTbl, 0, 1, "Filter", text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 1, 1, loggerLevelTiming + " / " + loggerTouchMode, text_color = color.white, text_size = size.small)
     table.cell(gLogTbl, 2, 1, "", text_color = color.white, text_size = size.small)
-    table.cell(gLogTbl, 0, 2, "$" + f_num(loggerTarget1, "#.#"), text_color = color.white, text_size = size.small)
-    table.cell(gLogTbl, 1, 2, str.tostring(gLogHit1) + " / " + str.tostring(gLogEvents), text_color = color.white, text_size = size.small)
-    table.cell(gLogTbl, 2, 2, f_num(_lgTot > 0 ? gLogHit1 / _lgTot * 100.0 : na, "#.#") + "%", text_color = color.white, text_size = size.small)
-    table.cell(gLogTbl, 0, 3, "$" + f_num(loggerTarget2, "#.#"), text_color = color.white, text_size = size.small)
-    table.cell(gLogTbl, 1, 3, str.tostring(gLogHit2) + " / " + str.tostring(gLogEvents), text_color = color.white, text_size = size.small)
-    table.cell(gLogTbl, 2, 3, f_num(_lgTot > 0 ? gLogHit2 / _lgTot * 100.0 : na, "#.#") + "%", text_color = color.white, text_size = size.small)
-    table.cell(gLogTbl, 0, 4, "$" + f_num(loggerTarget3, "#.#"), text_color = color.white, text_size = size.small)
-    table.cell(gLogTbl, 1, 4, str.tostring(gLogHit3) + " / " + str.tostring(gLogEvents), text_color = color.white, text_size = size.small)
-    table.cell(gLogTbl, 2, 4, f_num(_lgTot > 0 ? gLogHit3 / _lgTot * 100.0 : na, "#.#") + "%", text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 0, 2, "Events", text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 1, 2, str.tostring(gLogEvents), text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 2, 2, "", text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 0, 3, "$" + f_num(loggerTarget1, "#.#"), text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 1, 3, str.tostring(gLogHit1) + " / " + str.tostring(gLogEvents), text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 2, 3, f_num(_lgTot > 0 ? gLogHit1 / _lgTot * 100.0 : na, "#.#") + "%", text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 0, 4, "$" + f_num(loggerTarget2, "#.#"), text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 1, 4, str.tostring(gLogHit2) + " / " + str.tostring(gLogEvents), text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 2, 4, f_num(_lgTot > 0 ? gLogHit2 / _lgTot * 100.0 : na, "#.#") + "%", text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 0, 5, "$" + f_num(loggerTarget3, "#.#"), text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 1, 5, str.tostring(gLogHit3) + " / " + str.tostring(gLogEvents), text_color = color.white, text_size = size.small)
+    table.cell(gLogTbl, 2, 5, f_num(_lgTot > 0 ? gLogHit3 / _lgTot * 100.0 : na, "#.#") + "%", text_color = color.white, text_size = size.small)
