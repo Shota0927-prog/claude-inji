@@ -11,8 +11,11 @@
 
 | ファイル | 種別 | 行数 | 内容 |
 |---|---|---:|---|
-| `ZoneEngineV2.pine` | Pine v5 library (`ZoneEngineV2`) | 3795 | v2 定義の Zone Engine 本体。旧 ZoneEngine とは別名・別実装。 |
-| `ZoneEngineV2_VisualHarness.pine` | Pine v5 indicator | 626 | Zone / Root / Event / 診断値の目視確認専用。Strategy 注文は一切無し。 |
+| `ZoneEngineV2.pine` | Pine v6 library (`ZoneEngineV2`) | 4466 | v2 定義の Zone Engine 本体。旧 ZoneEngine とは別名・別実装。 |
+| `ZoneEngineV2_VisualHarness.pine` | Pine v6 indicator | 1062 | Zone / Root / Event / 診断値の目視確認専用。Strategy 注文は一切無し。 |
+| `ZoneEngineV2_ParityHarness.pine` | Pine v6 indicator (検証専用) | 708 | Version 3 と新版を同じ Feed で同時に回し、全項目を照らす。本番には使わない。 |
+| `profiler/ZoneEngineV2_VisualHarness_Profiler.pine` | Pine v6 indicator (計測専用) | 1088 | 本番 Harness と同一。`shorttitle` と `calc_bars_count` だけ違う。 |
+| `baseline/ZoneEngineV2_baseline.pine` / `baseline/ZoneEngineV2_VisualHarness_baseline.pine` | Pine v6 (A/B 用) | - | 最適化前 (commit `d528a1e`) の控え。 |
 | `ZoneEngineV2_Implementation_Report.md` | ドキュメント | - | 本書。 |
 
 既存ファイルの変更: **なし**。
@@ -21,8 +24,10 @@
 - リポジトリ内の既存ファイル `indicator.pine` (無関係のテンプレート) も変更していない。
 - v2 は新しい Library 名 (`ZoneEngineV2`) で、旧 Library を import している既存スクリプトへ影響しない。
 
-Harness の import 行は `import shota0927-prog/ZoneEngineV2/1 as zn2` としてある。
-TradingView へ Library を Publish したあと、実際の `<username>/<name>/<version>` に合わせること。
+Harness の import 行は現在 `import sekine3310/ZoneEngineV2/3 as zn2`。
+`3` = Phase 3A までを反映して公開済みの Version 3。
+Phase 3B/3C 版を Publish したら、TradingView が発行した実番号へこの 1 行だけを上げること
+(番号は推測していない)。新 API を使うため `/3` のままだとコンパイルできない。
 
 ---
 
@@ -194,20 +199,32 @@ View は該当する Zone を全件返し、距離や Grade で 1 件へ絞ら�
 
 ## Storage and request usage
 
-### request.security (Harness / 合計 10 call)
+### request.security (Harness / 合計 6 call ← 旧 10 call)
 
 | 用途 | 時間足 | call 数 | lookahead |
 |---|---|---:|---|
 | MA (`maPackV2`) | 1分 | 1 | off |
-| Swing (`pivotPackV2`) | 5分 / 15分 / 1時間 | 3 | off |
-| Accum (`accumPackV2`) | 1時間 / 4時間 / 日足 | 3 | off |
-| FVG (`fvgPackV2`) | 1時間 / 4時間 / 日足 | 3 | off |
+| Swing #1 (`pivotPackV2`) | 5分 | 1 | off |
+| Swing #2 (`pivotPackV2`) | 15分 | 1 | off |
+| Swing #3 + Accum #1 + FVG #1 (`swingAccumFvgPackV2`) | 1時間 | 1 | off |
+| Accum #2 + FVG #2 (`accumFvgPackV2`) | 4時間 | 1 | off |
+| Accum #3 + FVG #3 (`accumFvgPackV2`) | 日足 | 1 | off |
 | Base 5分 | (チャート足 built-in) | 0 | - |
 
+- `swingAccumFvgPackV2()` / `accumFvgPackV2()` は既存の `pivotPackV2()` /
+  `accumPackV2()` / `fvgPackV2()` をそのまま呼んで戻り値を連結するだけで、
+  計算内容も順序も個別に呼んだときと完全に同じ。
+- まとめる条件は「時間足文字列が完全に一致すること」。
+  `timeframe.in_seconds()` ではなく文字列で見ているのは、"1440" と "D" が
+  秒数では同じでも足の区切り方が違うから。1 つでも違えばそのグループだけが
+  従来どおり 2、3 本の個別 request へ自動で戻る (値はどちらでも同じ)。
+- `time(tf)` の要求も 9 本 → 5 本。まとめられたグループは同じ `time()` 系列を共有する。
+  `ta.change()` は全て global scope で無条件に呼んでいる (履歴がすれない)。
 - すべての pack は「完全に確定した 1 本」しか返さない (内部で index [1] 以降のみ参照)。
 - Harness は `ta.change(time(tf)) != 0` でその時間足の確定を検出し、1 回だけ Feed へ入れる。
 - Library は `request.*` を 1 つも呼ばない。
-- 同じ (時間足, 式) の重複 request は無い。5分 Swing だけはチャート足と同じ時間足だが、位相を他 TF と揃えるため同じ `pivotPackV2` 経路を使っている。
+- 5分 Swing だけはチャート足と同じ時間足だが、位相を他 TF と揃えるため同じ
+  `pivotPackV2` 経路を使っている (直接計算への置き換えは同値を証明できないので採用しない)。
 
 ### 保存上限と診断値
 
@@ -568,7 +585,213 @@ Merge / Split / Core ID / Generation ID、`request.security` の内容、履歴�
 - `f_fvgAttachAndStandalone()` の attach 試行 Candidate の削減
 - `f_rebuildCores()` のスキップや dirty 化
 
+### Phase 3B / 3C : 探索の増分化と request 統合 (実装済み)
+
+対象 commit
+
+| 内容 | commit |
+|---|---|
+| Engine 内部 (探索 / 集合比較 / registry / allocation) | `710326b` |
+| まとめ Pack と Harness (request 統合 / 数値 Event ログ) | `51bfbcb` |
+| Parity Harness 追加 / profiler 再同期 | `c5076b7` |
+| `f_countAccumBoxes()` の map 化 / 本レポート | 本 commit |
+
+#### 1. commit hash
+
+上表のとおり。ブランチは `claude/tender-dijkstra-dh7v3f`。
+
+#### 2. request 呼び出し回数の変化
+
+| | Version 3 | Phase 3B/3C |
+|---|---:|---:|
+| `request.security` | 10 | **6** |
+| `time(tf)` | 9 | **5** |
+| 合計 (request 系) | 19 | **11** |
+
+内訳は上の "request.security (Harness)" 節の表。時間足を別々のものへ変えた場合は
+そのグループだけが自動で旧構成 (最大 10 call / 9 time) へ戻る。
+
+#### 3. Dense 探索の計算量 (before / after)
+
+記号 : `R` = 窓 (現在価格 ± `dormantDistance`) 内の点 Root 数、`W` = dense 窓の数 (≤ R)、
+`K` = 1 窓に入る Root 数、`D` = dense ラウンド数 (最大 12)。
+
+| | Version 3 | Phase 3B/3C |
+|---|---|---|
+| Root の価格昇順並べ替え | 探索のたびに挿入ソート `O(R²)`、Side ごとに毎足 | `f_buildPointSnapshot()` で `array.sort_indices` + 同価格内だけの tie 修正 `O(R log R)`、Side ごとに毎足 1 回 |
+| 1 窓の評価 | `ZoneCand` 生成 + `array.copy` + 品質関数再計算 `O(K)` 割と定数倍が大きい | 増分スカラ (catMask / cCount / hasNonPsych / minRootId / firstConfirmTime / カテゴリフラグ) を窓の進行とともに更新 `O(1)` 摊還 |
+| 1 ラウンド | `O(W · K)` + 毎窓 allocation | `O(R)` (two-pointer で窓を進める) + allocation なし |
+| 全体 | `O(D · W · K + R²)` | `O(R log R + D · R)` |
+| 保存候補の生成 | 窓ごと | 採用された 1 窓だけ (`f_materializeBest()` → 未変更の `f_buildCand()`) |
+
+探索する窓の集合、continue / break の位置、衝突判定の位置、比較子
+(`C desc → H desc → 幅 asc → firstConfirmTime asc → minRootId asc`) は 1 つも変えていない。
+dense ラウンドは最大 12 のまま。
+
+#### 4. 部分窓あたりの allocation
+
+| | Version 3 | Phase 3B/3C |
+|---|---:|---:|
+| `ZoneCand` 新規 | 1 / 窓 | **0** (engine 保持の scratch 1 個を使い回す) |
+| `array.new_int` / `array.copy` | 2〜4 / 窓 | **0** |
+| 品質判定用の一時配列 | 1〜2 / 窓 | **0** |
+| 文字列連結 (Accum 衝突の pairKey) | 窓内 Accum 数分 | **0** (int token) |
+
+保存する候補を作るときだけ `f_buildCand()` が従来どおり配列を新規作成する。
+FVG attach も同じで、試行中は scratch (`f_fvgTrialEval()`)、採用されたときだけ
+`f_materializeAttach()` が本体を作る。
+
+#### 5. Hot loop に残っている `array.includes()`
+
+ファイル全体で 20 箰所 → **15 箰所** (うち 1 つはコメント)。
+クラスタリング / 同一性判定 / Core マッチングの hot path からは **全部消えている**
+(two-pointer `f_sharedSorted()` と二分探索 `f_containsSorted()` へ置換)。
+残っているのは次の 3 種類で、いずれも毎足の全探索ではない。
+
+| 場所 | 残した理由 |
+|---|---|
+| `f_markCoreFvgInvalid()` (3) | FVG Root が構造無効化された足だけ。探す配列は 1 View の rootIds (数件) |
+| `f_rootEssentialByCore()` (6) | 保存上限超過時の prune 内だけ。しかも hot core に限定済み |
+| `f_identityIds()` / `f_refPrice()` の EMA 判定 (4) | 候補 1 件の ids (数件〜数十件) の重複排除。ソートを入れると push 順が変わる |
+
+`f_countAccumBoxes()` の pairKey 文字列線形探索 (`O(n²)`) は `map<string, bool>` へ置換して
+消した。数える対象と件数の定義は Version 3 と同じ。
+
+#### 6. Hot loop に残っている `f_rootIdxById()`
+
+`f_rootIdxById()` 自体は map 引き + ID 照合 + (古いときだけ) 線形フォールバックなので、
+平均 `O(1)`。`f_reindexRoots()` は `rootIdxDirty` が立っているときだけ map を作り直す。
+dirty を立てるのは `f_pushRoot()` / `f_removeRootAt()` の 2 つだけで、ここを通らない
+配列操作は無い。
+
+呼び出し箰所は 33 → 38 へ増えているが、増えた分は「毎足 1 回の snapshot 作成」と
+「候補を保存するとき」で、代わりに **窓ごと / ペアごとの呼び出しが消えている**。
+探索中 (`f_searchDenseBest()` の窓ループ) からは 1 回も呼ばない — 必要な値は全て
+snapshot 配列 (`snRootId` / `snPrice` / `snCat` / `snTf` / `snDir` / `snPair` など) から直読する。
+
+#### 7. 毎足の全走査をやめたもの
+
+| 処理 | Version 3 | Phase 3B/3C |
+|---|---|---|
+| `f_reindexRoots()` | 毎足 map 再構築 | `rootIdxDirty` が立った足だけ |
+| `validateCfg()` | 毎足 | 初回 + Cfg 変更時だけ |
+| `f_removeRetiredRoots()` | 毎足全走査 | `retiredDirty` (= `f_retireRoot()` が味方したとき) だけ |
+| カテゴリ別上限 prune (Swing / Accum / FVG / TimeHL) | 毎足 4 回の全走査 | `capDirty<cat>` が立ったカテゴリだけ |
+| `f_countAccumBoxes()` | 毎足 `O(n²)` 文字列比較 | prune が dirty のときだけ、かつ `O(n)` |
+| `originKey` から Root を引く | 毎回線形走査 | `originKeyMap` (map) |
+| 心理価格の重複判定 / 不要判定 | 毎回線形走査 | 正規化 tick を鍵にした map |
+| 点 Root の価格昇順並べ替え | 探索のたび | 毎足 Side ごとに 1 回 (snapshot) |
+
+`zn2.update()` と `f_rebuildCores()` は毎確定足 1 回、従来どおり必ず実行する。
+「HTF 更新が無いから Core 再構築を飛ばす」などの危うい全体スキップは入れていない
+(価格が動けば Touch / Break / Dormant / 距離判定は変わるため)。
+
+#### 8. Deep copy の所有権境界
+
+| 配列 | 所有者 | 新規作成される場所 |
+|---|---|---|
+| `ZoneCand.rootIds` / `identityIds` / `rootIdsSorted` / `identitySorted` / `nonFvgIdentitySorted` / `fvgIds` | その Candidate | `f_buildCand()` のみ (scratch は `f_newScratchCand()` の 1 個きり) |
+| engine scratch (`scRawPrice` / `scWinIdx` / `scBestIdx` / `scCurIds` / `scAccTok` / `scMedian` / `scCatPrices` / `scFvgIds` 他) | `ZoneEngine` | `newEngine()` で 1 回だけ。以降は `array.clear()` で使い回す |
+| snapshot (`snRootId` / `snPrice` / `snCat` / …) | `ZoneEngine` | 同上。毎足 Side ごとに詰め直す |
+| `SideViewState.rootIds` / `rootIdsSorted` | その View | `f_applyCandToView()` の `array.copy()` (Candidate と共有しない) |
+| `ZoneCore.originRootIds` / `originRootIdsSorted` | その Core | `f_applyCoreCand()` / `f_mergeCore()` の `array.copy()` |
+| `TouchStartSnapshot.rootIds` / `BreakSnapshot.rootIds` | その Snapshot | 取得時の `array.copy()` (以後不変) |
+
+規則は 1 つ : **scratch は絶対に保存されるオブジェクトへ渡さない**。採用が決まった時点で
+`f_materializeBest()` / `f_materializeAttach()` が未変更の `f_buildCand()` を呼び、そこで新しい
+配列を持った候補を作る。これにより scratch を `clear()` しても保存済みの内容は変わらない。
+`SideViewState.rootIdsSorted` は比較専用の昇順コピーで、意味のある順序を持つ `rootIds`
+自体は一切並べ替えていない。
+
+#### 9. Version 3 とロジックが変わっていない根拠
+
+| 項目 | 根拠 |
+|---|---|
+| Root 生成条件 | 各 `f_sync*Roots()` の条件式は未変更。変えたのは「どう引くか (map)」だけ |
+| 探索する窓 | `f_buildPointSnapshot()` のフィルタは Version 3 の `f_collectPointRoots()` と同一条件 (窓 / 非 FVG / pointPrice あり / ROOT_ACTIVE) |
+| Root の順序 | `array.sort_indices` の後、**完全に同価格の範囲内だけ** rootId 昇順へ tie 修正。Version 3 の挿入ソートと全順序が一致 |
+| 候補の比較 | `f_candBetter()` 未変更。tie-break 順も未変更 |
+| dense 回数 | 最大 12 のまま。探索の打ち切り位置 (continue / break) も同じ |
+| C / H / Density / BaseStrong | 品質関数の条件式は未変更。増分スカラは同じ式を逐次更新しているだけ |
+| Accum 排他 | `pairKey` 文字列比較 → int token 比較。token は pairKey と 1:1 なので判定結果は同じ |
+| 集合の共有数 | `array.includes()` の入れ子 → 重複の無い昇順コピーの two-pointer。同じ件数を返す |
+| gap 判定と共有数の順 | 元々 `and` の連言なので順番を入れ替えても真偽は変わらない |
+| Touch / Weak / Break / Flip / Reclaim | 8 章は 1 行も触っていない |
+| FVG Fresh / Inverse / 方向 | 5.5 節は未変更。attach は評価を scratch へ移しただけで試行集合も順番も同じ |
+| Accum 条件 | `rangeShort` は `ta.highest(bodyTop, rangeLen) - ta.lowest(bodyBot, rangeLen)` で `rangeNow` と同じ式だったので再呼び出しをやめただけ |
+| 公開 API | `export` 行を Version 3 と diff して完全一致 (新規 2 関数の追加のみ) |
+| イベント | 生成箇所・順番未変更。Harness 側で文字列化を遅らせただけ |
+
+実機での照らし合わせは `ZoneEngineV2_ParityHarness.pine` で行う (下記)。
+
+#### 10. 意図的に残したボトルネック
+
+| 残したもの | なぜ残したか |
+|---|---|
+| クラスタリングは依然として `O(bars · R · D)` | dense ラウンドを減らす / 探索を間引くのは禁止されている。定数倍だけを落とした |
+| `f_rebuildCores()` の Core × Candidate マッチング | 順序と tie-break を変えずに探索を落とす方法がない。集合比較だけ two-pointer 化した |
+| `request.security` 6 本 | MA (1分) と Swing 5分 / 15分 は他と時間足が違うのでまとめられない |
+| EMA2000 / EMA3000 の 1分足計算 | 仕様そのもの。期間を短くするのはロジック変更 |
+| `f_rootEssentialByCore()` の `array.includes()` 群 | prune が必要な足だけしか走らない上、hot core に限定済み |
+| 描画・テーブル | すでにプール + 最終足のみ。これ以上は表示内容を削ることになる |
+
+これでも RE10110 が残る場合、残る重さは「足数 × 窓内 Root 数」で、そこを下げるには
+禁止されている手段 (履歴削減 / 上限縮小 / 探索間引き) に触るため、ここでは入れていない。
+次に取るべきは Phase 5 (Alert consumer の分離 : 描画を持たない軽い消費側を別スクリプトにする)
+と思うが、それは別途指示を待つ。
+
+#### 11. Publish 後に差し替える import 行
+
+`ZoneEngineV2_VisualHarness.pine` の次の 1 行だけ。
+
+```
+import sekine3310/ZoneEngineV2/3 as zn2          // ← ★ Publish 後に番号を上げる
+```
+
+- 現在の `3` は「Phase 3A までを反映して公開済みの Version 3」。
+- 今回の Library を Publishしたら、TradingView が発行した実番号へ上げること。番号は推測していない。
+- 今回は新 API (`swingAccumFvgPackV2` / `accumFvgPackV2`) を使うため、`/3` のままだと
+  関数が見つからずコンパイルできない。
+- `profiler/ZoneEngineV2_VisualHarness_Profiler.pine` と
+  `ZoneEngineV2_ParityHarness.pine` (vB 側) にも同じ番号を入れる。
+  Parity Harness の vB は仮置き (`/4`) のままなので必ず確認して直すこと。
+
+#### Phase 3B / 3C で入れていないもの (禁止事項の確認)
+
+`calc_bars_count` / 開始日時による切り捨て / Root・Core・Touch 上限の縮小 /
+dense 12 回の削減 / Root・Candidate・FVG attach 試行の間引き / カテゴリ・時間足の無効化 /
+価格のバケット化・丸め方の変更 / 「N 足に 1 回だけ再計算」/ `dormantDistance` や Zone 幅の既定値変更 /
+`request.security` の確定足・`lookahead_off` の意味変更 / Root・Candidate・Core・Event 順の変更 /
+tie-break の変更 / Touch・Weak・Break・Flip・Reclaim のタイミング変更 /
+FVG Fresh・Inverse・方向の変更 / Accum 条件の変更 — いずれも行っていない。
+本番 Harness (`ZoneEngineV2_VisualHarness.pine`) に `calc_bars_count` は無い。
+
+### Parity Harness (`ZoneEngineV2_ParityHarness.pine`)
+
+本番 Harness とは別ファイルの検証専用スクリプト。
+
+- 公開済み Version 3 を `vA`、Phase 3B/3C 版を `vB` として **同時に import** する。
+- ZoneCfg を 2 つ同じ値で作り、`vA` の個別 Pack から取った **まったく同じ値** を両方へ流す。
+  これにより違いが出たときは Engine 内部の違いと断定できる。
+- 毎確定 5分足で照らす項目 : `processedBars` / `configValid` / `configError` /
+  Root ・ Core ・ View ・ Event ・ 終了世代の件数 /
+  ZoneView の全フィールド (ID / Phase / Grade / C / H / Density / Touch 番号 /
+  Fresh / WeakReason / MaxDepth / FVG 方向・件数・状態 mask / Pending / Snapshot 範囲 /
+  物理範囲 / Flip 試行回数 / 表示文字列) /
+  RootDebugView の全フィールド + `rootLabelMaskAt()` / ZoneEvent の全フィールド。
+  Merge / Split は coreId ・ generationId の推移と Event で見る。
+- まとめ Pack と個別 Pack の同値性も同じ仕組みで照らす。
+- 違いは **最初の 1 件だけ** 残し、足の時刻 / 項目名 / Version 3 の値 / 新版の値を表へ出す。
+  プロットにも 0 (一致) / 1 (不一致) を出す。
+- このファイルにだけ `calc_bars_count` がある。目的は「2 つの Engine を同じ本数だけ回して
+  照らす」ことで、本番の RE10110 を退けるためのものではない。本番 Harness には入れていない。
+- 比較コストはこのファイルの中だけで、本番 Harness は 1 行も背負っていない。
+
 ### 同値検証 (未実施)
+
+★ Phase 3B/3C 分の照らし合わせは `ZoneEngineV2_ParityHarness.pine` を使う。
+人間が目で表を見比べる必要は無く、差が 1 件でもあれば "DIFF FOUND" とその場所が出る。
+手順 : 新版を Publish → Parity Harness の vB import を発行番号へ→ XAUUSD 5分足へ適用。
 
 Phase 2 の変更は「Engine へ渡る Cfg / Feed の値と順序が毎足同一」「Engine 内部の処理は
 未変更」という構成上の理由で結果は一致するはずだが、指示どおり Baseline との A/B 比較を
