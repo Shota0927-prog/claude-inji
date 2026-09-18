@@ -71,6 +71,11 @@ int CAT_TIME_HL = 3
 int CAT_FVG     = 4
 int CAT_PSYCH   = 5
 int CAT_COUNT   = 6
+//  ★ Phase10 : Pine のコレクション上限 (map 50,000 組 / 配列 100,000 要素) に対する
+//    安全余裕。乗算でサイズが決まるキャッシュはこの値を超えたら「キャッシュしない」
+//    に落とし、比較そのものは従来式で正確に再計算する (Core / Candidate は捨てない)。
+int CC_CACHE_MAX    = 40000
+int PREFIX_CACHE_MAX = 60000
 
 // ---- Side ------------------------------------------------------------------
 int SIDE_SUPPORT    = 1
@@ -876,7 +881,11 @@ export type ZoneEngine
     //  key -> ID 索引 (毎足の線形探索をなくす)
     map<string, int> originKeyMap    // Root.originKey -> rootId
     map<int, int>    psychKeyMap     // 心理価格 tick   -> rootId
-    map<string, int> pairTokenMap    // Accum pairKey   -> 整数 pair token
+    map<string, int> pairTokenMap
+    //  ★ Phase10 : pairKey ごとの生存 Root 参照数。0 になったら pairTokenMap から外す。
+    //    これを入れないと pairTokenMap が「履歴で一度でも出た Box の累積」になり、
+    //    map 上限 50,000 組へ向かって無制限に増える。
+    map<string, int> pairTokenRef    // Accum pairKey   -> 整数 pair token
     int    pairTokenSeq  = 0
     //  保存整理の dirty (毎足の全走査をやめる)
     bool   retiredDirty  = false
@@ -906,19 +915,11 @@ export type ZoneEngine
     //    waEpoch 側 : dense の開始位置ごと / 通常 Sweep のクラスタごと
     //    qaEpoch 側 : f_fillCandFrom() の 1 Candidate ごと
     //    2 組に分けているのは、片方の走査中にもう片方が走っても混入しないようにするため。
-    int             waEpoch = 1
-    map<int, int>   waTokEp
     map<int, int>   waTokCnt
-    array<int>      waTfEp
     array<int>      waTfCnt
-    map<int, int>   waPairEp
     map<int, int>   waPairCnt
-    int             qaEpoch = 1
-    map<int, int>   qaTokEp
     map<int, int>   qaTokCnt
-    array<int>      qaTfEp
     array<int>      qaTfCnt
-    map<int, int>   qaPairEp
     map<int, int>   qaPairCnt
     //  ★ Phase9 : f_fillCandFrom() の 1 回走査で集めた FVG Root index
     array<int>      scFvgIdxTmp
@@ -997,6 +998,16 @@ export type ZoneEngine
     array<int>      catTime
     //  ★ Phase8 : Accum Box の distinct pairKey 集計用 scratch (毎回の map.new をやめる)
     map<string, bool> scAccumBoxKeys
+    //  ★ Phase10 : prune できない Accum Box (pairKey) の集合。
+    //    片側でも protected / essential なら Box 全体を残す。
+    map<string, bool> scAccumBoxBlocked
+    //  ★ Phase10 : f_refPrice() の 1 回走査用 (カテゴリ別価格)
+    array<float> scRpSwing
+    array<float> scRpAccum
+    array<float> scRpTime
+    array<float> scRpPsych
+    //  ★ Phase10 : f_mergeCore() の重複判定用 seen (追加ごとの再 sort をやめる)
+    map<int, bool> scMergeSeen
     //  ★ Phase7 : FVG x Candidate の価格帯索引。
     //    fvcBot : Side の Candidate の「索引作成時点の bottom」昇順
     //    fvcOrd : 同じ並びの Candidate index
@@ -1135,6 +1146,7 @@ export newEngine() =>
          originKeyMap = map.new<string, int>(),
          psychKeyMap  = map.new<int, int>(),
          pairTokenMap = map.new<string, int>(),
+         pairTokenRef = map.new<string, int>(),
          snRootId  = array.new_int(),
          snIdx     = array.new_int(),
          snPrice   = array.new_float(),
@@ -1148,17 +1160,11 @@ export newEngine() =>
          snPair    = array.new_int(),
          snTick      = array.new_int(),
          snCatPrefix = array.new_int(),
-         waTokEp     = map.new<int, int>(),
          waTokCnt    = map.new<int, int>(),
-         waTfEp      = array.new_int(8, 0),
          waTfCnt     = array.new_int(8, 0),
-         waPairEp    = map.new<int, int>(),
          waPairCnt   = map.new<int, int>(),
-         qaTokEp     = map.new<int, int>(),
          qaTokCnt    = map.new<int, int>(),
-         qaTfEp      = array.new_int(8, 0),
          qaTfCnt     = array.new_int(8, 0),
-         qaPairEp    = map.new<int, int>(),
          qaPairCnt   = map.new<int, int>(),
          scFvgIdxTmp = array.new_int(),
          scRawPrice = array.new_float(),
@@ -1206,6 +1212,12 @@ export newEngine() =>
          catFvg      = array.new_int(),
          catTime     = array.new_int(),
          scAccumBoxKeys = map.new<string, bool>(),
+         scAccumBoxBlocked = map.new<string, bool>(),
+         scRpSwing  = array.new_float(),
+         scRpAccum  = array.new_float(),
+         scRpTime   = array.new_float(),
+         scRpPsych  = array.new_float(),
+         scMergeSeen = map.new<int, bool>(),
          fvcBot      = array.new_float(),
          fvcOrd      = array.new_int(),
          fvcHit      = array.new_int(),
@@ -1695,15 +1707,26 @@ f_reindexRoots(ZoneEngine e) =>
         e.rootIdxDirty := false
     array.size(e.roots)
 
+//  ★ Phase10 : 索引が clean (rootIdxDirty == false) なら map は e.roots と
+//    完全に一致している :
+//      ・append は f_pushRoot() が新 index を map へ入れる (既存 index は動かない)
+//      ・index がずれる f_removeRootAt() は必ず rootIdxDirty を立てる
+//      ・f_reindexRoots() は dirty のときだけ全再構築して dirty を落とす
+//    したがって clean で map に ID が無ければ、その ID の Root は存在しない。
+//    失効 ID を毎回全 Root 線形探索するのをやめる (結果は -1 のままで同じ)。
+//    dirty のとき / index が範囲外のとき / ID 照合が一致しないときは、
+//    従来どおり線形探索のフォールバックを通す (安全経路は消していない)。
 f_rootIdxById(ZoneEngine e, int id) =>
     int idx = -1
     int n = array.size(e.roots)
-    if map.contains(e.rootIdx, id)
+    bool hit = map.contains(e.rootIdx, id)
+    if hit
         int cand = map.get(e.rootIdx, id)
         if cand >= 0 and cand < n
             if array.get(e.roots, cand).rootId == id
                 idx := cand
-    if idx < 0 and n > 0
+    bool mustScan = idx < 0 and (e.rootIdxDirty or hit)
+    if mustScan and n > 0
         for i = 0 to n - 1
             if array.get(e.roots, i).rootId == id
                 idx := i
@@ -1712,6 +1735,28 @@ f_rootIdxById(ZoneEngine e, int id) =>
 
 //  ★ Phase3A : e.roots の構造変更 (追加 / 削除) は必ずこの 2 つを通す。
 //    ここでしか rootIdxDirty を立てないので、立て忘れが起きない。
+//  ★ Phase10 : pairKey の参照数を増減する。0 になった時点で token を回収する。
+//    token の値は「同じバー内での等値比較」と「バー内 scratch map の key」にしか
+//    使わない (snPair は毎足作り直し、wa / qa は窓ごとに clear) ので、
+//    同じ pairKey へ後から別の token を再発行しても結果は変わらない。
+f_pairTokenRetain(ZoneEngine e, string pairKey) =>
+    if pairKey != ""
+        int n0 = map.contains(e.pairTokenRef, pairKey) ? map.get(e.pairTokenRef, pairKey) : 0
+        map.put(e.pairTokenRef, pairKey, n0 + 1)
+    true
+
+f_pairTokenRelease(ZoneEngine e, string pairKey) =>
+    if pairKey != ""
+        if map.contains(e.pairTokenRef, pairKey)
+            int n0 = map.get(e.pairTokenRef, pairKey)
+            if n0 <= 1
+                map.remove(e.pairTokenRef, pairKey)
+                if map.contains(e.pairTokenMap, pairKey)
+                    map.remove(e.pairTokenMap, pairKey)
+            else
+                map.put(e.pairTokenRef, pairKey, n0 - 1)
+    true
+
 f_pushRoot(ZoneEngine e, Root r) =>
     //  ★ Phase8 : e.roots 末尾への append では既存 Root の index は 1 つも動かない。
     //    よって「append だけ」を理由に索引を捨てる必要はなく、新しい 1 件を
@@ -1734,6 +1779,8 @@ f_pushRoot(ZoneEngine e, Root r) =>
     else if r.category == CAT_ACCUM
         e.capDirtyAccum := true
         array.push(e.catAccum, r.rootId)
+        //  ★ Phase10 : pairToken の参照数 +1
+        f_pairTokenRetain(e, r.pairKey)
     else if r.category == CAT_FVG
         e.capDirtyFvg := true
         array.push(e.catFvg, r.rootId)
@@ -1760,6 +1807,8 @@ f_removeRootAt(ZoneEngine e, int i) =>
         f_catListRemove(e.catSwing, r.rootId)
     else if r.category == CAT_ACCUM
         f_catListRemove(e.catAccum, r.rootId)
+        //  ★ Phase10 : pairToken の参照数 -1 (0 で token を回収)
+        f_pairTokenRelease(e, r.pairKey)
     else if r.category == CAT_FVG
         f_catListRemove(e.catFvg, r.rootId)
     else if r.category == CAT_TIME_HL
@@ -2415,6 +2464,27 @@ f_removeRetiredRoots(ZoneEngine e) =>
 //      stillDirty をここで返し、f_pruneCatIfDirty() 側の再集計を廃止できる。
 //    最大 64 回、protected / essential / current TimeHL の条件、削除対象の選択順、
 //    Accum の pair 単位削除、上限判定はすべて現行のまま。
+//  ★ Phase10 (バグ修正) : Accum は「Box (同一 pairKey の上下 2 本) 単位」で削除する。
+//    旧実装は候補 1 本についてだけ f_rootProtected / f_rootEssential を見たあと、
+//    同じ pairKey の Root を**全部**消していた。したがって
+//    「上辺は非 essential、下辺は ActiveTouch 等で essential」の Box では、
+//    保持すべき下辺まで消えていた。
+//    ここで先に「片側でも protected / essential な pairKey」を集め、
+//    その Box は削除候補から外す (仕様上保持すべき Root を消さない)。
+//    この是正で保持量は増える方向に変わる (= 出力が変わる修正)。
+f_buildAccumBlocked(ZoneEngine e) =>
+    map.clear(e.scAccumBoxBlocked)
+    int n = array.size(e.catAccum)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(e.catAccum, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if r.category == CAT_ACCUM and r.pairKey != ""
+                    if f_rootProtected(r) or f_rootEssential(e, r.rootId)
+                        map.put(e.scAccumBoxBlocked, r.pairKey, true)
+    map.size(e.scAccumBoxBlocked)
+
 f_pruneCategoryToCap(ZoneEngine e, ZoneCfg c, ZoneFeed f, int cat, int cap) =>
     int  removed    = 0
     bool stillDirty = false
@@ -2427,6 +2497,9 @@ f_pruneCategoryToCap(ZoneEngine e, ZoneCfg c, ZoneFeed f, int cat, int cap) =>
         int  worstIdx  = -1
         int  worstTime = na
         int  worstId   = na
+        //  ★ Phase10 : Accum は Box 単位の削除可否を先に決める
+        if cat == CAT_ACCUM
+            f_buildAccumBlocked(e)
         array<int> lst = f_catListOf(e, cat)
         int n = array.size(lst)
         if n > 0
@@ -2434,7 +2507,12 @@ f_pruneCategoryToCap(ZoneEngine e, ZoneCfg c, ZoneFeed f, int cat, int cap) =>
                 int i = f_rootIdxById(e, array.get(lst, k))
                 if i >= 0
                     Root r = array.get(e.roots, i)
-                    if r.category == cat and r.state != ROOT_RETIRED and not f_rootProtected(r)
+                    //  ★ Phase10 : Accum は「その Box のどちらかが protected / essential」
+                    //    なら Box 全体を候補から外す
+                    bool boxBlocked = cat == CAT_ACCUM
+                         and (r.pairKey == "" or map.contains(e.scAccumBoxBlocked, r.pairKey))
+                    if not boxBlocked
+                         and r.category == cat and r.state != ROOT_RETIRED and not f_rootProtected(r)
                          and not f_rootEssential(e, r.rootId)
                          and not (cat == CAT_TIME_HL and r.isCurrentPeriod)
                         bool older = worstIdx < 0 or nz(r.confirmedTime, 0) < nz(worstTime, 0)
@@ -2585,101 +2663,73 @@ f_pairTokenOf(ZoneEngine e, string pairKey) =>
 //
 //    tf は 0..6 (TF_NONE..TF_D) なので固定長 8 の配列で足りる。
 //    pair の key は tok * 8 + tf (tf < 8 なので単射)。
-//    epoch は「窓が変わったら以前の件数を 0 とみなす」ための世代番号で、
-//    桁が大きくなる前に実体を捨てて 1 から数え直す (論理リセットと同じ意味)。
+//  ★ Phase10 : epoch 方式 (論理リセット) をやめ、窓の先頭で**実体を clear** する。
+//    epoch は件数を 0 とみなすだけで古い key が残り続けるため、
+//    key は「履歴で一度でも出た pairToken の累積」になり、
+//    Pine の map 上限 50,000 組に対して無制限に増える危険があった。
+//    実体 clear なら map に残るのは「その窓に入っている Accum Root の件数」だけで、
+//    これは Root 上限で上から抑えられる (履歴長に依存しない)。
+//    窓内の Accum 件数は通常 0〜数件なので、clear の費用は無視できる
+//    (旧実装も同じ tiny 配列を線形走査していた)。
 f_accTfSlot(int tf) =>
     tf >= 0 and tf < 8 ? tf : 7
 
-f_accSeenTokOf(map<int, int> ep, map<int, int> cnt, int epoch, int tok) =>
-    int v = 0
-    if map.contains(ep, tok)
-        if map.get(ep, tok) == epoch
-            v := map.get(cnt, tok)
-    v
+f_accSeenTokOf(map<int, int> cnt, int tok) =>
+    map.contains(cnt, tok) ? map.get(cnt, tok) : 0
 
-f_accSeenTfOf(array<int> ep, array<int> cnt, int epoch, int tf) =>
-    int sl = f_accTfSlot(tf)
-    int v = 0
-    if array.get(ep, sl) == epoch
-        v := array.get(cnt, sl)
-    v
+f_accSeenTfOf(array<int> cnt, int tf) =>
+    array.get(cnt, f_accTfSlot(tf))
 
-f_accSeenPairOf(map<int, int> ep, map<int, int> cnt, int epoch, int tok, int tf) =>
+f_accSeenPairOf(map<int, int> cnt, int tok, int tf) =>
     int key = tok * 8 + f_accTfSlot(tf)
-    int v = 0
-    if map.contains(ep, key)
-        if map.get(ep, key) == epoch
-            v := map.get(cnt, key)
-    v
+    map.contains(cnt, key) ? map.get(cnt, key) : 0
 
-f_accSeenAddOf(map<int, int> tokEp, map<int, int> tokCnt, array<int> tfEp, array<int> tfCnt,
-     map<int, int> prEp, map<int, int> prCnt, int epoch, int tok, int tf) =>
-    int ct = f_accSeenTokOf(tokEp, tokCnt, epoch, tok)
-    map.put(tokEp, tok, epoch)
-    map.put(tokCnt, tok, ct + 1)
+f_accSeenAddOf(map<int, int> tokCnt, array<int> tfCnt, map<int, int> prCnt, int tok, int tf) =>
+    map.put(tokCnt, tok, f_accSeenTokOf(tokCnt, tok) + 1)
     int sl = f_accTfSlot(tf)
-    int cf = f_accSeenTfOf(tfEp, tfCnt, epoch, tf)
-    array.set(tfEp, sl, epoch)
-    array.set(tfCnt, sl, cf + 1)
+    array.set(tfCnt, sl, array.get(tfCnt, sl) + 1)
     int key = tok * 8 + sl
-    int cp = f_accSeenPairOf(prEp, prCnt, epoch, tok, tf)
-    map.put(prEp, key, epoch)
-    map.put(prCnt, key, cp + 1)
+    map.put(prCnt, key, f_accSeenPairOf(prCnt, tok, tf) + 1)
+    true
+
+f_accSeenResetOf(map<int, int> tokCnt, array<int> tfCnt, map<int, int> prCnt) =>
+    map.clear(tokCnt)
+    map.clear(prCnt)
+    for sl = 0 to 7
+        array.set(tfCnt, sl, 0)
     true
 
 //  ---- 窓 (dense の開始位置 / 通常 Sweep のクラスタ) 用 ----
 f_waEpochNext(ZoneEngine e) =>
-    if e.waEpoch > 1000000000
-        map.clear(e.waTokEp)
-        map.clear(e.waTokCnt)
-        map.clear(e.waPairEp)
-        map.clear(e.waPairCnt)
-        f_fillInt(e.waTfEp, 8, 0)
-        f_fillInt(e.waTfCnt, 8, 0)
-        e.waEpoch := 1
-    else
-        e.waEpoch := e.waEpoch + 1
-    e.waEpoch
+    f_accSeenResetOf(e.waTokCnt, e.waTfCnt, e.waPairCnt)
 
 f_waSeenTok(ZoneEngine e, int tok) =>
-    f_accSeenTokOf(e.waTokEp, e.waTokCnt, e.waEpoch, tok)
+    f_accSeenTokOf(e.waTokCnt, tok)
 
 f_waSeenTf(ZoneEngine e, int tf) =>
-    f_accSeenTfOf(e.waTfEp, e.waTfCnt, e.waEpoch, tf)
+    f_accSeenTfOf(e.waTfCnt, tf)
 
 f_waSeenPair(ZoneEngine e, int tok, int tf) =>
-    f_accSeenPairOf(e.waPairEp, e.waPairCnt, e.waEpoch, tok, tf)
+    f_accSeenPairOf(e.waPairCnt, tok, tf)
 
 f_waSeenAdd(ZoneEngine e, int tok, int tf) =>
-    f_accSeenAddOf(e.waTokEp, e.waTokCnt, e.waTfEp, e.waTfCnt,
-         e.waPairEp, e.waPairCnt, e.waEpoch, tok, tf)
+    f_accSeenAddOf(e.waTokCnt, e.waTfCnt, e.waPairCnt, tok, tf)
 
 //  ---- Candidate 品質 (f_fillCandFrom の 1 Candidate) 用 ----
 f_qaEpochNext(ZoneEngine e) =>
-    if e.qaEpoch > 1000000000
-        map.clear(e.qaTokEp)
-        map.clear(e.qaTokCnt)
-        map.clear(e.qaPairEp)
-        map.clear(e.qaPairCnt)
-        f_fillInt(e.qaTfEp, 8, 0)
-        f_fillInt(e.qaTfCnt, 8, 0)
-        e.qaEpoch := 1
-    else
-        e.qaEpoch := e.qaEpoch + 1
-    e.qaEpoch
+    f_accSeenResetOf(e.qaTokCnt, e.qaTfCnt, e.qaPairCnt)
 
 f_qaSeenTok(ZoneEngine e, int tok) =>
-    f_accSeenTokOf(e.qaTokEp, e.qaTokCnt, e.qaEpoch, tok)
+    f_accSeenTokOf(e.qaTokCnt, tok)
 
 f_qaSeenTf(ZoneEngine e, int tf) =>
-    f_accSeenTfOf(e.qaTfEp, e.qaTfCnt, e.qaEpoch, tf)
+    f_accSeenTfOf(e.qaTfCnt, tf)
 
 f_qaSeenPair(ZoneEngine e, int tok, int tf) =>
-    f_accSeenPairOf(e.qaPairEp, e.qaPairCnt, e.qaEpoch, tok, tf)
+    f_accSeenPairOf(e.qaPairCnt, tok, tf)
 
 f_qaSeenAdd(ZoneEngine e, int tok, int tf) =>
-    f_accSeenAddOf(e.qaTokEp, e.qaTokCnt, e.qaTfEp, e.qaTfCnt,
-         e.qaPairEp, e.qaPairCnt, e.qaEpoch, tok, tf)
+    f_accSeenAddOf(e.qaTokCnt, e.qaTfCnt, e.qaPairCnt, tok, tf)
 
 // ---- 6.2 Category 品質 (High は 1 カテゴリにつき最大 1) --------------------
 //  参加 Root だけで評価する。Adjacent / core 外 Root は品質を上げない。
@@ -2691,26 +2741,43 @@ f_qaSeenAdd(ZoneEngine e, int tok, int tf) =>
 //  加重平均は作らない。各点カテゴリ代表の単純中央値。FVG 50% は使わない。
 //  ★ Phase3C : カテゴリごとに配列を作らず、engine の scratch を clear して使い回す。
 //    取り出す価格・除外条件・中央値の取り方は Version 3 と同じ。
-f_catPricesMedianSc(ZoneEngine e, array<int> ids, int cat) =>
+//  ★ Phase10 : ids の Root 解決を 1 回にして、5 カテゴリの価格を同じ走査で集める。
+//    旧版は f_catPricesMedianSc() を 4 回 + MA 用ループ 1 回で、同じ ids を 5 周し
+//    そのたびに f_rootIdxById() を呼んでいた。
+//    取り出す価格・除外条件 (isRangeRoot / na の扱い)・中央値の取り方
+//    (f_medianInPlace / 偶数件の平均) ・MA の選択規則・FVG の side 別参照・
+//    tick 比較はすべて従来と同じ。scMedian への push 順も同じ
+//    (Swing -> Accum -> TimeHL -> Psych -> MA)。
+f_refPrice(ZoneEngine e, ZoneCfg c, int side, array<int> ids, float bot, float top) =>
+    array.clear(e.scMedian)
+    array.clear(e.scRpSwing)
+    array.clear(e.scRpAccum)
+    array.clear(e.scRpTime)
+    array.clear(e.scRpPsych)
     array.clear(e.scCatPrices)
     int n = array.size(ids)
     if n > 0
         for k = 0 to n - 1
-            //  ★ e.scIdxOfIds は別 Candidate の内容で上書きされる scratch なので、
-            //    この関数 (View 適用時に呼ばれる) では流用しない。
             int i = f_rootIdxById(e, array.get(ids, k))
             if i >= 0
                 Root r = array.get(e.roots, i)
-                if r.category == cat and not r.isRangeRoot and not na(r.pointPrice)
+                //  f_catPricesMedianSc() と同じ除外条件
+                if not r.isRangeRoot and not na(r.pointPrice)
+                    if r.category == CAT_SWING
+                        array.push(e.scRpSwing, r.pointPrice)
+                    else if r.category == CAT_ACCUM
+                        array.push(e.scRpAccum, r.pointPrice)
+                    else if r.category == CAT_TIME_HL
+                        array.push(e.scRpTime, r.pointPrice)
+                    else if r.category == CAT_PSYCH
+                        array.push(e.scRpPsych, r.pointPrice)
+                //  MA は isRangeRoot を見ない (旧 MA ループと同じ条件)
+                if r.category == CAT_MA and not na(r.pointPrice)
                     array.push(e.scCatPrices, r.pointPrice)
-    array.size(e.scCatPrices) > 0 ? f_medianInPlace(e.scCatPrices) : float(na)
-
-f_refPrice(ZoneEngine e, ZoneCfg c, int side, array<int> ids, float bot, float top) =>
-    array.clear(e.scMedian)
-    float repSwing = f_catPricesMedianSc(e, ids, CAT_SWING)
-    float repAccum = f_catPricesMedianSc(e, ids, CAT_ACCUM)
-    float repTime  = f_catPricesMedianSc(e, ids, CAT_TIME_HL)
-    float repPsych = f_catPricesMedianSc(e, ids, CAT_PSYCH)
+    float repSwing = array.size(e.scRpSwing) > 0 ? f_medianInPlace(e.scRpSwing) : float(na)
+    float repAccum = array.size(e.scRpAccum) > 0 ? f_medianInPlace(e.scRpAccum) : float(na)
+    float repTime  = array.size(e.scRpTime)  > 0 ? f_medianInPlace(e.scRpTime)  : float(na)
+    float repPsych = array.size(e.scRpPsych) > 0 ? f_medianInPlace(e.scRpPsych) : float(na)
     if not na(repSwing)
         array.push(e.scMedian, repSwing)
     if not na(repAccum)
@@ -2720,15 +2787,6 @@ f_refPrice(ZoneEngine e, ZoneCfg c, int side, array<int> ids, float bot, float t
     if not na(repPsych)
         array.push(e.scMedian, repPsych)
     // MA : 他カテゴリ core に近い実 EMA を代表にする (2 本だけなら中間値は表示中心)
-    array.clear(e.scCatPrices)
-    int n = array.size(ids)
-    if n > 0
-        for k = 0 to n - 1
-            int i = f_rootIdxById(e, array.get(ids, k))
-            if i >= 0
-                Root r = array.get(e.roots, i)
-                if r.category == CAT_MA and not na(r.pointPrice)
-                    array.push(e.scCatPrices, r.pointPrice)
     if array.size(e.scCatPrices) > 0
         float maRep = na
         if array.size(e.scMedian) > 0
@@ -3111,7 +3169,7 @@ f_candBetter(ZoneCand a, ZoneCand b, ZoneCfg c) =>
 //    挿入処理をそのまま再現する (使う配列を scratch にしただけ)。
 //
 //  クラスタリング対象を現在価格から dormantDistance 以内へ絞るのも Version 3 と同じ。
-ff_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
+f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
     //  ★ Phase7 : 2 段構造。全体配列への途中 insert をやめ、
     //    同 tick グループの中だけで旧版と同じ挿入処理を行う。
     //
@@ -3320,14 +3378,20 @@ f_buildDenseBounds(ZoneEngine e, ZoneCfg c, float maxWidth) =>
     //  ★ Phase9 : prefix は必要サイズまで一度だけ伸ばす (毎足の clear + push をしない)。
     //    行 0 だけ明示的に 0 へ戻し、行 1..n は下のループが全要素を上書きする。
     //    行 n より後ろは j <= n なので一切読まない。
-    int pfNeed = (n + 1) * CAT_COUNT
-    int pfCur  = array.size(e.snCatPrefix)
-    if pfCur < pfNeed
-        for q = pfCur to pfNeed - 1
-            array.push(e.snCatPrefix, 0)
-    for cat0 = 0 to CAT_COUNT - 1
-        array.set(e.snCatPrefix, cat0, 0)
-    if n > 0
+    //  ★ Phase10 : (n + 1) * CAT_COUNT も乗算サイズなので、上限を超える足は
+    //    prefix を作らず、[a, lim) の mask 集計 (Phase 8c までの式) へ落とす。
+    //    どちらの経路でも「窓内の distinct category 数」は同じ値になる。
+    bool pfFits = n >= 0 and n + 1 <= PREFIX_CACHE_MAX
+         and (n + 1) * CAT_COUNT <= PREFIX_CACHE_MAX
+    if pfFits
+        int pfNeed = (n + 1) * CAT_COUNT
+        int pfCur  = array.size(e.snCatPrefix)
+        if pfCur < pfNeed
+            for q = pfCur to pfNeed - 1
+                array.push(e.snCatPrefix, 0)
+        for cat0 = 0 to CAT_COUNT - 1
+            array.set(e.snCatPrefix, cat0, 0)
+    if n > 0 and pfFits
         //  (B) prefix count を 1 回だけ作る
         for i = 0 to n - 1
             int base0 = i * CAT_COUNT
@@ -3348,11 +3412,21 @@ f_buildDenseBounds(ZoneEngine e, ZoneCfg c, float maxWidth) =>
                 j := j + 1
             array.set(e.dsHardEnd, a, j)
             int cnt = 0
-            int baseA = a * CAT_COUNT
-            int baseL = j * CAT_COUNT
-            for cat = 0 to CAT_COUNT - 1
-                if array.get(e.snCatPrefix, baseL + cat) > array.get(e.snCatPrefix, baseA + cat)
-                    cnt := cnt + 1
+            if pfFits
+                int baseA = a * CAT_COUNT
+                int baseL = j * CAT_COUNT
+                for cat = 0 to CAT_COUNT - 1
+                    if array.get(e.snCatPrefix, baseL + cat) > array.get(e.snCatPrefix, baseA + cat)
+                        cnt := cnt + 1
+            else
+                //  prefix が使えない足は窓を直接数える (Phase 8c までと同じ式)
+                int msk = 0
+                if j > a
+                    for b = a to j - 1
+                        int rcat = array.get(e.snCat, b)
+                        if not f_maskHas(msk, rcat)
+                            msk := f_maskAdd(msk, rcat)
+                            cnt := cnt + 1
             array.set(e.dsMaxCatCnt, a, cnt)
     n
 
@@ -4255,8 +4329,17 @@ f_pairSides(ZoneEngine e, ZoneCfg c, array<ZoneCand> sup, array<ZoneCand> res,
                         int shAll    = 0
                         if near
                             //  ★ Phase3B : two-pointer (昇順コピー同士) で完全一致判定
-                            shNonFvg = f_sharedSorted(sc.nonFvgIdentitySorted, rc.identitySorted)
-                            shAll    = f_sharedSorted(sc.identitySorted, rc.identitySorted)
+                            //  ★ Phase10 (バグ修正) : ここは `=` ではなく `:=`。
+                            //    `=` は同名ローカルの **新規宣言** (shadowing) なので、
+                            //    外側の shNonFvg / shAll は 0 のままになり、直後の
+                            //    `shNonFvg >= 1 or shAll >= 1` が絶対に成立しなかった。
+                            //    その結果 Support と Resistance が共有 Root を持っていても
+                            //    同一 Core へ結合せず、常に別 Core 候補になっていた。
+                            //    Version 3 (baseline) は near の外で無条件に計算していたので、
+                            //    := へ直すと baseline と同じ意味に戻る (near が false の
+                            //    ときは両方 使われないため、計算順の違いは結果に出ない)。
+                            shNonFvg := f_sharedSorted(sc.nonFvgIdentitySorted, rc.identitySorted)
+                            shAll    := f_sharedSorted(sc.identitySorted, rc.identitySorted)
                         if near and (shNonFvg >= 1 or shAll >= 1)
                             bool better = bestRi < 0 or shAll > bestShared
                                  or (shAll == bestShared and not na(gap) and gap < nz(bestGap, 1e20))
@@ -4562,11 +4645,27 @@ f_assignSplitHistory(ZoneEngine e, ZoneCfg c, ZoneCore child, ZoneCore parent) =
 f_mergeCore(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore prim, ZoneCore other) =>
     int on = array.size(other.originRootIds)
     if on > 0
+        //  ★ Phase10 : 旧実装は追加 ID 1 件ごとに originRootIdsSorted を作り直して
+        //    いた (O(add * n log n))。重複判定を map の seen へ移し、一括追加後に
+        //    **1 回だけ** sort する。
+        //    ・seen の初期値は prim.originRootIds そのままなので、除外する ID は同じ
+        //    ・push 順は other.originRootIds の順のままなので originRootIds も同じ
+        //    ・originRootIdsSorted は最終内容を sort した結果で、途中経過を
+        //      sort し直したものと同じ集合・同じ昇順
+        map.clear(e.scMergeSeen)
+        int pn0 = array.size(prim.originRootIds)
+        if pn0 > 0
+            for k0 = 0 to pn0 - 1
+                map.put(e.scMergeSeen, array.get(prim.originRootIds, k0), true)
+        bool added = false
         for k = 0 to on - 1
             int rid = array.get(other.originRootIds, k)
-            if not f_containsSorted(prim.originRootIdsSorted, rid)
+            if not map.contains(e.scMergeSeen, rid)
                 array.push(prim.originRootIds, rid)
-                f_sortedCopy(prim.originRootIds, prim.originRootIdsSorted)
+                map.put(e.scMergeSeen, rid, true)
+                added := true
+        if added
+            f_sortedCopy(prim.originRootIds, prim.originRootIdsSorted)
     int tn = array.size(other.touchMarks)
     if tn > 0
         for i = 0 to tn - 1
@@ -4721,7 +4820,14 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     //    全要素へ書き込み、Pass 4 が読むのは同じ (ci, k) 範囲だけなので、
     //    今回使う範囲より後ろに残っている前足の値は一切読まれない。
     //    値・index 式 (ci * nk + k)・Pass 順は変更していない。
-    int ccN = int(math.max(nc * nk, 1))
+    //  ★ Phase10 : nc * nk は maxZoneCores / 候補数で上から抑えられない
+    //    (f_pruneCores() は削除可能な Dormant Core が無ければ終了する)。
+    //    配列上限 100,000 要素を超えないよう、乗算の**前**に必要量を見て、
+    //    入りきらない足はキャッシュを使わない (Pass 4 が従来式で再計算する)。
+    //    Core も Candidate も捨てない。
+    bool ccFits = nc > 0 and nk > 0 and nc <= CC_CACHE_MAX and nk <= CC_CACHE_MAX
+         and nc * nk <= CC_CACHE_MAX
+    int ccN = ccFits ? nc * nk : 1
     int ccCur = array.size(e.ccGap)
     if ccCur < ccN
         for q = ccCur to ccN - 1
@@ -4748,8 +4854,10 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
                 bool nearOk = not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
                 int sh = nearOk ? f_sharedSorted(z.originRootIdsSorted, cc.originRootIdsSorted) : 0
                 //  ★ Phase7 : Pass 4 で再利用するために保持する
-                array.set(e.ccGap, ci * nk + k, gap)
-                array.set(e.ccSh, ci * nk + k, sh)
+                //  ★ Phase10 : キャッシュが入りきらない足は保持しない
+                if ccFits
+                    array.set(e.ccGap, ci * nk + k, gap)
+                    array.set(e.ccSh, ci * nk + k, sh)
                 if sh >= 1 and nearOk
                     bool better = best < 0 or sh > bestSh
                          or (sh == bestSh and gap < nz(bestGap, 1e20))
@@ -4821,7 +4929,9 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
                             //    書き換わっていたら従来どおり再計算する。
                             float gap = float(na)
                             int sh = 0
-                            if array.get(e.coreTouched, ci)
+                            //  ★ Phase10 : キャッシュが無い足 (ccFits == false) も
+                            //    Core が書き換わった場合と同じく従来式で再計算する。
+                            if not ccFits or array.get(e.coreTouched, ci)
                                 gap := f_intervalGap(zp.physBottom, zp.physTop, cc.bottom, cc.top)
                                 bool nk2 = not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
                                 sh := nk2 ? f_sharedSorted(zp.originRootIdsSorted, cc.originRootIdsSorted) : 0
@@ -5698,6 +5808,22 @@ export rootStateName(int v) =>
 
 // @function      FVG 方向 mask 名
 // @param mask    fvgDirectionMask
+// @returns       string
+// @function  この Library ソースのビルド識別文字列。
+//            Harness から表示して「チャート上の実体がどのソースか」を突き合わせる。
+// @returns   string
+export buildId() =>
+    "ZoneEngineV2 engine 2026-09-18 phase10"
+
+// @function      Root.direction (FVG_NONE / FVG_BULLISH / FVG_BEARISH の enum) の名前。
+//                fvgDirectionName() は bitmask 用なので enum をそのまま渡してはいけない。
+// @param dir     Root.direction / Root.inverseDir
+// @returns       string
+export fvgDirectionEnumName(int dir) =>
+    dir == FVG_BULLISH ? "Bullish" : dir == FVG_BEARISH ? "Bearish" : "None"
+
+// @function      FVG 方向 bitmask の名前 (ZoneView 用)
+// @param mask    FVG_BULLISH / FVG_BEARISH の bit を立てた mask
 // @returns       string
 export fvgDirectionName(int mask) =>
     bool b = f_maskHas(mask, FVG_BULLISH)

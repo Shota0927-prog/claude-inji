@@ -207,6 +207,116 @@ def check(path):
             problems.append((n0, '-', 'for %s+1 to %s-1 without a %s < %s-1 guard'
                              % (A, N, A, N), ln.strip()[:60]))
 
+    # ---- calls to f_* functions that are never declared anywhere -------------
+    # This is the gap that let `ff_buildPointSnapshot` through: the declaration
+    # regex did not match the typo, so the CALL to f_buildPointSnapshot was
+    # simply not in decl_line and the ordering check stayed silent.
+    declared_any = set(decl_line)
+    for n0, ln in enumerate(lines, 1):
+        code = ln.split('//')[0]
+        m = re.match(r'^([A-Za-z_]\w*)\s*\(', code)
+        if m:                                   # a declaration line of any name
+            declared_any.add(m.group(1))
+    for n0, ln in enumerate(lines, 1):
+        code = ln.split('//')[0]
+        if re.match(r'^f_\w+\s*\(', code):
+            continue
+        for nm in set(re.findall(r'\b(f_\w+)\s*\(', code)):
+            if nm not in declared_any:
+                problems.append((n0, '-', 'call to undeclared function: %s' % nm,
+                                 ln.strip()[:60]))
+    # a declaration whose name is never called is dead code worth reporting
+    for nm, dl in sorted(decl_line.items()):
+        if not nm.startswith('f_'):
+            continue
+        used = False
+        for n0, ln in enumerate(lines, 1):
+            if n0 == dl:
+                continue
+            code = ln.split('//')[0]
+            if re.match(r'^' + re.escape(nm) + r'\s*\(', code):
+                continue
+            if re.search(r'\b' + re.escape(nm) + r'\s*\(', code):
+                used = True
+                break
+        if not used:
+            problems.append((dl, '-', 'declared but never called: %s' % nm, ''))
+
+    # ---- accidental shadowing: `TYPE x = ...` inside a nested block when x -----
+    # already exists in an enclosing scope of the same function. In Pine `=` is a
+    # NEW declaration, so the outer variable keeps its old value. This is the gap
+    # that let f_pairSides()'s `shNonFvg = ...` through.
+    i = 0
+    while i < len(lines):
+        if not re.match(r'^[A-Za-z_]\w*\s*\(', lines[i]):
+            i += 1
+            continue
+        # signatures may span several lines; join until the text ends with "=>"
+        sig = lines[i].split('//')[0].rstrip()
+        k = i
+        while not sig.endswith('=>') and k + 1 < len(lines) and \
+                (lines[k + 1].startswith((' ', '\t')) or not lines[k + 1].strip()):
+            k += 1
+            sig += ' ' + lines[k].split('//')[0].strip()
+        if not sig.endswith('=>'):
+            i += 1
+            continue
+        fname = re.match(r'^([A-Za-z_]\w*)', sig).group(1)
+        j = k + 1
+        body = []
+        while j < len(lines):
+            l2 = lines[j]
+            if l2.strip() and not l2.startswith((' ', '\t')):
+                break
+            body.append((j + 1, l2))
+            j += 1
+        try:
+            params = sig[sig.index('(') + 1:sig.rindex(')')]
+        except ValueError:
+            params = ''
+        live = [(-1, nm) for nm in re.findall(
+            r'(?:^|,)\s*(?:simple\s+|series\s+|const\s+|input\s+)?'
+            r'(?:' + TYPE + r'\s+)?([A-Za-z_]\w*)\s*(?=,|$|=)', params)]
+        KW = {'for', 'if', 'while', 'else', 'switch', 'break', 'continue',
+              'true', 'false', 'na', 'and', 'or', 'not', 'to', 'by', 'var', 'varip'}
+        DECL = re.compile(r'(\s*)(?:(?:var|varip)\s+)?(?:' + TYPE + r'\s+)?'
+                          r'([A-Za-z_]\w*)\s*(:?=)(?!=)')
+        depth = 0
+        for lineno, l2 in body:
+            code = l2.split('//')[0]
+            bare = re.sub(r'"[^"]*"', '""', code)
+            at_start = depth
+            depth += bare.count('(') + bare.count('[') - bare.count(')') - bare.count(']')
+            if not code.strip() or code.lstrip().startswith('//'):
+                continue
+            # a line continuing an open call/array is not a declaration site
+            # (e.g. a named argument `originTime = originTime` inside Root.new(...))
+            if at_start > 0:
+                continue
+            ind = len(code) - len(code.lstrip(' '))
+            live = [(d, nm) for (d, nm) in live if d <= ind]
+            lv = re.match(r'\s*for\s+([A-Za-z_]\w*)\s*=', code)
+            if lv:
+                live.append((ind, lv.group(1)))
+                continue
+            dm = DECL.match(code)
+            # In Pine `=` is always a DECLARATION (the type is optional) and `:=`
+            # is the only assignment, so any `name = expr` deeper than a live
+            # `name` silently shadows it. This is exactly what f_pairSides()'s
+            # `shNonFvg = ...` did: the outer value stayed 0 and the pairing
+            # condition could never fire.
+            if not dm or dm.group(3) != '=' or dm.group(2) in KW:
+                continue
+            nm = dm.group(2)
+            outer = [d for (d, x) in live if x == nm and d < ind]
+            if outer:
+                problems.append((lineno, fname,
+                                 'shadowing declaration of %s (outer at indent %d)'
+                                 % (nm, max(outer)), code.strip()[:60]))
+            else:
+                live.append((ind, nm))
+        i = j
+
     # ---- display calls must sit behind a last-bar gate (harness only) --------
     # Drawing, tables and display string building must never run on history bars.
     # A call qualifies if some enclosing `if` (any level) names a last-bar gate,

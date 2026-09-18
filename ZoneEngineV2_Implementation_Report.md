@@ -2077,6 +2077,122 @@ import sekine3310/ZoneEngineV2/3 as zn2     ← この 3 を Publish 後の実�
 Event log OFF / 全履歴 Event OFF / `denseRoundCache` ON / XAUUSD 5 分足 / 履歴削減なし)
 で RE10110 が出ないかどうかは確認できていない。上記は静的検査と計算量の議論のみ。
 
+## Phase 10 : 外部監査書への対応 (バグ修正 + 上限対策 + 出力不変の性能改善)
+
+監査書の指摘はすべて**自分のファイルで再現を確認**してから直した。
+以下は 3 つのバケツに分けてある。**バケツ A は出力が変わる是正**なので、
+「旧版と完全同値」とは報告しない。
+
+### A. 確定した不具合 (出力が変わる是正)
+
+| # | 指摘 | 自分のファイルでの確認 | 修正 |
+|---|---|---|---|
+| 3.1 | `ff_buildPointSnapshot` 定義 / `f_buildPointSnapshot` 呼び出し | **再現。L3114 が `ff_`**。`git log -S` で Phase 9 (`a6cd0c3`) の私の編集が原因 (`f_pairTokenOf` を移動したときの 1 文字ずれで、外れた `f` が次の定義の頭へくっついた)。**コンパイル不能** | 定義を `f_buildPointSnapshot` へ統一。全呼び出しを確認 (呼び出しは 1 箇所) |
+| 3.2 | `f_pairSides()` の `shNonFvg = ` / `shAll = ` が shadowing | **再現。L4254〜4259**。`git log -S` で Phase 3B (`710326b`) の私の編集が原因。baseline は `if near` の外で無条件に計算していた。**Support と Resistance が共有 Root を持っていても絶対に同一 Core へ結合しない** | `:=` へ修正。`near` が false のとき両方使われないので、baseline と同じ意味に戻る |
+| 4.3 | Accum の片側だけ保護検査して相方も削除 | **再現**。worst 1 本について `f_rootProtected` / `f_rootEssential` を見たあと、同じ `pairKey` の Root を全部削除していた。`f_rootProtected` は FVG 専用なので、実際に効く保護は `f_rootEssential` | `f_buildAccumBlocked()` を追加し、**片側でも protected / essential な pairKey は Box 全体を削除候補から外す**。保持量は増える方向 |
+| 6.1 | 週区切りが JST で火曜へずれる | **再現**。`timestamp(zoneTz, Y, M, D, 0, 0)` は現地 00:00 の **UTC ms** なので、JST では商が「暦日番号 − 1」。`tradingWeek = floor((tradingDay − 4) / 7)` がそのずれを受け、週の切り替わりが火曜になっていた | `timestamp("UTC", locY, locM, locD, 0, 0)` へ。現地 Y/M/D を UTC 00:00 として数えると商が暦日番号そのものになる。1970-01-05 = 月曜の起点計算はそのまま |
+| 6.2 | 未対応時間足が日足扱い | **再現**。`tfCodeOf()` は 5 / 15 / 60 / 240 以外を全部 `TF_D` にしていた。`input.timeframe` は自由入力なので "30" が日足 Root になっていた | 対応表を 1 / 5 / 15 / 60 / 240 / D の 6 つに正し、**それ以外は `TF_NONE`**。`tfInputsValid` で Engine 更新を止め、警告ラベルに該当入力名を出す (黙って別設定へ変換しない) |
+| 6.4 | Root Debug の FVG 方向 | **再現**。`r.direction` は enum (1 / 2)、`fvgDirectionName()` は bitmask 用。`f_maskHas(1, 1)` は false なので Bullish が "None" と出ていた | Engine へ `export fvgDirectionEnumName(int dir)` を追加し、Root 表はそちらを使う。ZoneView 用の mask→文字列はそのまま |
+| 3.3 | 描画の `varip` と rollback の不整合 | **再現**。未確定足では box / line / label / table への変更が巻き戻るのに `varip drawnOnce` / `drawnProcessed` は残るため、市場が開いている最中に読み込むと **tick 2 で Zone と表が消えて戻らない**。`varip` を `var` にしても両方が同じ確定時点へ巻き戻るので `needRedraw` は false のままで解決しない | `needRedraw = barstate.islast` にして、**最終足では毎ティック描画を再適用**する。Engine 更新は従来どおり確定 5 分足 1 回 (描画のために Engine を回さない)。再適用するのは setter とテーブルセルだけで、対象は 1 本なので全履歴の実行時間には加算されない |
+
+### B. 次の実行時エラーを防ぐ構造修正
+
+| # | 指摘 | 修正 |
+|---|---|---|
+| 4.1a | `waTokEp` / `qaPairEp` 等の epoch 方式は古い key を残す (map 上限 50,000 組) | **epoch を廃止し、窓 / Candidate の先頭で実体を `map.clear()`** する。map に残るのは「その窓に入っている Accum Root の件数」だけで、履歴長に依存しない。窓内 Accum は通常 0〜数件なので clear は無視できる (旧実装も同じ tiny 配列を線形走査していた) |
+| 4.1b | `pairTokenMap` が履歴の累積 Box 数へ向かって増える | `pairTokenRef` (pairKey → 生存 Root 参照数) を追加。`f_pushRoot()` で +1、`f_removeRootAt()` で −1、0 で `pairTokenMap` から除去。token の値は**同一バー内の等値比較とバー内 scratch の key** にしか使わない (`snPair` は毎足作り直し、wa / qa は窓ごとに clear) ので、同じ pairKey へ後から別 token を再発行しても結果は変わらない |
+| 4.2a | `ccN = nc * nk` が無制限 (配列上限 100,000 要素) | 乗算の**前**に `CC_CACHE_MAX = 40000` と照合し、入りきらない足は `ccFits = false` にして**キャッシュを使わない**。Pass 4 は `coreTouched` の場合と同じ従来式で正確に再計算する。Core も Candidate も捨てない。Pass 間の無効化条件 (`coreTouched`) はそのまま |
+| 4.2b | `snCatPrefix` の `(n + 1) * CAT_COUNT` も積サイズ | `PREFIX_CACHE_MAX = 60000` を超える足は prefix を作らず、`[a, lim)` の mask 集計 (Phase 8c までの式) へ落とす。同じ窓の distinct category 数はどちらの経路でも同値 |
+| 4.4 | 入力値・履歴参照・描画座標の技術上限 | `zoneLeftBars` maxval 5000 / `zoneRightBars` maxval 450 (`xloc.bar_index` は未来 500 / 過去 10,000 が限度)。`emaSlopeLookback` 2000 (`e1[1 + slopeLb]`)、`swLen1/2/3` 500 (`time[len + 1]`)、`accumRangeLen` 200 / `accumBaseLen` 300 / `accumAtrLen` 500 / `accumMaxSameColorRun` 100 (`ACCUM_RUN_SCAN_MAX = 400` の内側)。**既存の走査上限 400 / 600 は縮小していない**。index を丸める / `na` を返す / `continue` で候補を捨てる修正はしていない |
+
+### C. 出力を変えない性能改善
+
+| # | 内容 | 同値性 |
+|---|---|---|
+| 5.1 | `f_rootIdxById()` : 索引が clean なら「map に無い ID」は即 -1 | clean (`rootIdxDirty == false`) のとき map は `e.roots` と一致する : append は `f_pushRoot()` が新 index を入れ既存 index は動かない / index がずれる `f_removeRootAt()` は必ず dirty を立てる / `f_reindexRoots()` は dirty のときだけ全再構築。よって clean で map に無ければ Root は存在せず、線形探索しても -1。**dirty のとき・index 範囲外・ID 照合不一致では従来どおり線形探索を通す** (フォールバックは消していない) |
+| 5.2 | `f_refPrice()` : ids の Root 解決を 1 回にし、5 カテゴリの価格を同じ走査で集める | 旧版は `f_catPricesMedianSc()` × 4 + MA ループで ids を 5 周していた。取り出す価格・除外条件 (`isRangeRoot` / `na`)・中央値の取り方 (`f_medianInPlace`、偶数件の扱い)・MA の選択規則・FVG の side 別参照・tick 比較・`scMedian` への push 順 (Swing → Accum → TimeHL → Psych → MA) はすべて同じ。**履歴足で呼ぶのをやめてはいない** (後から Root を読むと当時の値を失うため) |
+| 5.3 | `f_mergeCore()` : 追加 ID ごとの `f_sortedCopy` を一括追加後の 1 回へ | 重複判定を `scMergeSeen` (初期値は `prim.originRootIds` そのまま) へ移した。除外する ID・push 順 (`other.originRootIds` の順) は同じなので `originRootIds` が同一、`originRootIdsSorted` は最終内容の昇順で途中 sort を繰り返した結果と同じ |
+
+### D. 静的検査を「この 2 件を見逃さない」形へ直した
+
+監査書が見つけた 2 件は、**私の静的検査がどちらも通していた**。原因と対策 :
+
+| 見逃した理由 | 追加した検査 | 回帰確認 |
+|---|---|---|
+| 宣言順検査の正規表現が `^f_\w+\(` で、`ff_buildPointSnapshot` は `f_` で始まらないので**宣言として登録されず**、呼び出し側の `f_buildPointSnapshot` も「未登録だから報告しない」経路へ落ちていた | **未宣言関数呼び出し検査**。ファイル内のどこにも宣言が無い `f_*(` 呼び出しを報告する。併せて「宣言されているが 1 度も呼ばれない `f_*`」も報告 (削除漏れ検出) | `f_` → `ff_` に戻すと `L4773 call to undeclared function: f_buildPointSnapshot` を検出 |
+| 未定義変数検査は `shNonFvg` を「宣言済み」と見るだけで、**内側ブロックの再宣言 (shadowing)** を区別していなかった | **shadowing 検査**。Pine では `=` が常に宣言 (型は省略可) で `:=` だけが代入なので、外側で生きている名前より深いインデントの `name = expr` を報告する。スコープは「インデントが下がったら閉じる」で追い、兄弟ブロックの同名は誤検出しない。引数も深さ -1 の宣言として登録。複数行シグネチャと、開き括弧の途中行 (`Root.new(... originTime = originTime`) は除外 | `:=` を `=` に戻すと `L4338 / L4339 shadowing declaration of shNonFvg / shAll (outer at indent 24)` を検出 |
+
+現在の検査項目 (全 8 種) と結果 :
+
+| 検査 | Engine | FULL | SAFE |
+|---|---|---|---|
+| 関数スコープ未定義変数 | 0 | 0 | 0 |
+| **未宣言関数呼び出し / 未使用 `f_*`** | 0 | 0 | 0 |
+| **意図しない shadowing** | 0 | 0 | 0 |
+| 宣言順 (前方参照) | 0 | 0 | 0 |
+| `for A + 1 to N - 1` のガード | 0 | 0 | 0 |
+| 表示呼び出しの最終バーゲート | — | 0 | 0 |
+| `request.*` tuple 要素数 | — | 104 / 127 | 104 / 127 |
+| 括弧 / 行跨ぎ文字列 / 継続行インデント | 0 | 0 | 0 |
+
+### E. ビルド識別 (監査書 1 章)
+
+| 項目 | 値 |
+|---|---|
+| commit | 下記の commit hash |
+| Engine SHA-256 | `dfffd4ea67981f97804760b3a84d867024613e9850bbb6ebbb21867e6a547b07` |
+| Harness FULL SHA-256 | `cdc09e97228f431766b7c0becc0278535745e1c5eb640e90548519276fb3e176` |
+| Harness SAFE SHA-256 | `380a258561e8d339232027e4359b932cfe4785dc04e92e03166d245d1a1421c3` |
+| Engine 内のビルド文字列 | `zn2.buildId()` = `"ZoneEngineV2 engine 2026-09-18 phase10"` |
+| Harness 内のビルド文字列 | `HARNESS_BUILD` = `"ZoneEngineV2 Harness 2026-09-18 phase10"` |
+| 実際の Publish 番号 | **未発行**。`import sekine3310/ZoneEngineV2/3` は書き換えていない (推測で番号を入れない) |
+
+Debug table の 0 行目に `Build: <Harness build> | lib <zn2.buildId()>` を出すようにした。
+これでチャート上の実体がどのソース / どの Library かを目視で突き合わせできる。
+
+### F. 未対応 / 判断が必要な項目
+
+| # | 項目 | 状態 |
+|---|---|---|
+| 6.3 | HTF の確定値と Feed 更新時点の不整合 | **未変更 (仕様判断が必要)**。監査書のとおり、`lookahead_off` 必須という既存制約と、HTF の全返却値を offset した `lookahead_on` 方式のどちらを採るかは利用者の判断。性能改善に紛れ込ませないため手を付けていない。下の「選択肢」を参照 |
+| 8 | Profiler による関数別計測 | **未実施**。TradingView 実行環境が無い |
+| 9 | 全受け入れ条件の実機確認 | **未実施**。コンパイル・状態遷移・表示継続・全履歴実行時間のいずれも実機で確認できていない |
+
+#### 6.3 の選択肢 (どちらを採るかの判断を待つ)
+
+1. **既存制約 (`lookahead_off`) のまま**: pack / bundle が返す `sourceOpenTime` / `sourceCloseTime` /
+   `confirmedTime` と、それを取り込んだ base bar 時刻を Engine 側に記録し、
+   再ロード前後で照合する診断を先に入れる。ずれが確認できた場合のみ、
+   pack 側の参照位置 (`[1]` の取り方) を時間足ごとに見直す。
+   → `request.security` の lookahead は変えない。
+2. **`lookahead_on` + 全返却値の offset**: HTF の全フィールドを 1 本ぶん offset して
+   「その HTF が閉じた時刻」を明示的に返す。確定値の時刻は正しくなるが、
+   **過去の実装指示にある `lookahead_off` 必須という制約を破る**。
+
+私の側からは 1 を推奨するが、2 を選ぶ判断は利用者のもの。無断で変更していない。
+
+### G. RE10110 と実測について
+
+**未実測。** TradingView での Publish・コンパイル・実行・Profiler 計測はいずれも行えていない。
+したがって以下は**主張していない** :
+
+- 「次は絶対にエラーが出ない」
+- 「結果が完全に同じ」(A バケツは意図的に出力を変える是正)
+- 「最大限の軽量化が完了」
+- 「RE10110 が解消した」
+
+3.2 の pairing バグは、Support と Resistance が結合しないことで
+CoreCand 数・Core 数・`nc × nk`・prune 量をすべて増やす方向に働くため、
+40 秒超過への寄与がある**可能性**は高い。ただし寄与率は未測定で、
+これを RE10110 の原因と断定はしない。
+
+実機で測るときに記録してほしい値 (監査書 8 章のもの) :
+履歴本数 / データ提供元 / チャート時間足 / 設定 / 公開番号 /
+最大・終了時の Root 数・Core 数・side Candidate 数・CoreCandidate 数 /
+`nc * nk` / pairing 成功数 / 各 map の実サイズ / 各配列の最大サイズ /
+dense 候補評価数 / キャッシュ hit・再計算数 / clean map miss の線形探索回数 /
+各処理の Profiler 負荷。
+
 ## Known limitations
 
 - **Pine Editor でのコンパイル・実行を確認していない。** スクリプトサイズ上限、`request.security` の
