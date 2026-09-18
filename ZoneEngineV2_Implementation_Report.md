@@ -443,6 +443,83 @@ XAUUSD 5分足チャートで Harness を実行し、Bar Replay と Debug table 
 
 ---
 
+## Performance work (RE10110 対応)
+
+`Runtime error: RE10110 The script takes too long to execute. The time limit is 40 seconds.`
+に対して、**Zone 判定ロジックを 1 行も変えずに**負荷を下げる作業。指示された Phase 順で進める。
+
+### Phase 1 : 計測 (準備のみ完了 / 計測は未実施)
+
+- Baseline を `baseline/` へ保存した。
+  - `baseline/ZoneEngineV2_baseline.pine`
+  - `baseline/ZoneEngineV2_VisualHarness_baseline.pine`
+  - (= git `d528a1e` 時点。v6 化直後・最適化前)
+- Profiler 用の一時コピーを `profiler/ZoneEngineV2_VisualHarness_Profiler.pine` に作成した。
+  本番コードとの違いは `calc_bars_count = 3000` と `shorttitle` だけ。ヘッダに
+  「PROFILER ONLY / 本番では使わない / ここで出た Zone を判定結果として扱わない」と明記済み。
+- **Profiler の実行はこの環境からできない (TradingView 非接続)。**
+  `Pine Editor -> More -> Profiler mode` で上記コピーを実行し、次の実行回数と負荷割合を
+  記録して共有してほしい: `request.security` 10 本 / `zn2.update()` / `f_rebuildCores()` /
+  `f_buildSideCands()` / `f_pickBestWindow()` / `f_fvgAttachAndStandalone()` / `f_pairSides()` /
+  `f_buildViews()` / `f_reindexRoots()` / 描画・テーブル・Event Log。
+
+### Phase 2 : Harness の低リスク軽量化 (実装済み)
+
+すべて「表示専用」または「allocation 削減」で、Engine へ渡る値・順序・タイミングは不変。
+
+| # | 変更 | 分類 |
+|---|---|---|
+| 2-1 | `ZoneCfg` を `var` の永続オブジェクトにし、初回 1 回だけ全フィールドを設定 (`cfgInitialized` フラグ)。input 変更時はスクリプト全体が再計算されるため値は維持される | allocation 削減 |
+| 2-2 | `zn2.constOf()` の 21 個を `var int` にして初回 1 回だけ取得 | allocation 削減 |
+| 2-3 | `tfCodeOf()` の 9 回呼び出しを `var int swCode1..fvgCode3` として初回だけ算出 | allocation 削減 |
+| 2-4 | `ZoneFeed` を毎足 `newFeed()` せず 1 つを使い回す。Library へ `resetFeed()` を追加し、各足の先頭で `swings`/`accums`/`fvgs` を clear + スカラーを既定値へ戻してから従来どおり全フィールドを代入 | allocation 削減 |
+| 2-5 | Event Log 文字列の生成を `if showEventLog and isFiveMin and barstate.isconfirmed` の中へ移動 (Engine 内部の Event 生成は従来どおり) | 表示専用 |
+| 2-6 | Zone ラベル文字列 / Root Debug View / Root 並べ替え / Event Log / Debug table / FVG 50% を、対応する表示 input が ON のときだけ実行。Library へ表示専用フラグ `ZoneCfg.buildDisplayStrings` を追加し、ラベル非表示なら `ZoneView` の説明文字列も作らない | 表示専用 |
+| 2-7 | box / line / label を毎回全削除して作り直す方式をやめ、プールを `box.set_*` / `line.set_*` / `label.set_*` で更新。余った分だけ削除、足りない分だけ新規作成。さらに **未確定ティックごとの再構築をやめ、Engine の確定状態 (`processedBars`) が進んだときだけ**描画・テーブル・警告を更新 (`varip` の表示用カウンタで判定) | 表示専用 |
+
+Library 側の変更は次の 2 つだけで、どちらも追加のみ・判定に不参加:
+`export resetFeed(ZoneFeed f)` の追加、`ZoneCfg.buildDisplayStrings` (表示文字列生成の ON/OFF) の追加。
+
+**Phase 2 だけでは RE10110 が消えない可能性が高い。** 40 秒制限の主因は、全ヒストリカル足で回る
+Engine 内部のクラスタリング (`f_buildSideCands` -> `f_pickBestWindow` -> `f_buildCand`) の
+重複計算と一時配列生成であり、そこは Phase 3 の対象。Phase 2 が主に効くのは
+リアルタイムの毎ティック描画コストと、1 足あたりの UDT / 配列生成コスト。
+
+### Phase 3 : Engine 内部の安全な軽量化 (未着手)
+
+指示どおり Phase 2 のコンパイルと同値確認の後に着手する。予定内容 (すべて結果不変):
+`f_reindexRoots()` を dirty フラグ化 / `validateCfg()` を初回・値変化時のみ /
+Candidate 作成時に identity Root 一覧・category mask・high mask・C/H・minRootId・
+firstConfirmTime を 1 度だけ計算して保持 / `array.includes()` の入れ子をソート済み
+Root ID の two-pointer 比較へ / scratch 配列の再利用。
+Dense 候補優先・最大 12 回・使用済み Root の扱い・tie-break 順・`f_rebuildCores()` の
+実行契約は変更しない。
+
+### 同値検証 (未実施)
+
+Phase 2 の変更は「Engine へ渡る Cfg / Feed の値と順序が毎足同一」「Engine 内部の処理は
+未変更」という構成上の理由で結果は一致するはずだが、指示どおり Baseline との A/B 比較を
+実機で行うこと。比較は同一 XAUUSD 5分足・同一設定・同一計算期間で、Debug table の
+Live cores / views / Roots / Pending / Merge・Split / Events、および Zone ラベルの
+Core ID / Gen ID / Phase / Grade / C / H / Density / Touch 番号 / WeakReason / MaxDepth /
+EffectiveRange / ReferencePrice を突き合わせる。1 項目でも差があればその最適化は採用しない。
+
+### 履歴制限 (Phase 4) について
+
+現時点では `FULL_PARITY` のみ。本番コード (`ZoneEngineV2_VisualHarness.pine`) に
+`calc_bars_count` は入れていない。`LIVE_LIGHT` モードは Phase 3 の効果を測ってからでなければ
+Warmup 本数を決められない (EMA3000 / EMA slope lookback / Pivot 確認期間 / Accum 最大走査 600 本 /
+日足・週足の現行＋前期間 / Zone の Touch・Break・Flip 履歴を全部含める必要がある)。
+`calc_bars_count` だけでエラーを隠して完了扱いにはしない。
+
+### Alert Consumer 分離 (Phase 5) について
+
+構造としては既に分離可能: Engine 更新に必要なのは Library の
+`newEngine()` / `newCfg()` / `newFeed()` / `resetFeed()` / `feedSwing()` / `feedAccum()` /
+`feedFvg()` / `update()` と、読み出しの `eventCount()` / `eventAt()` / `viewCount()` / `viewAt()` だけで、
+描画・テーブル・Event Log・Root Debug は Harness 側にしか無い。
+Alert 条件は今回決めない (指示どおり)。
+
 ## Known limitations
 
 - **Pine Editor でのコンパイル・実行を確認していない。** スクリプトサイズ上限、`request.security` の
