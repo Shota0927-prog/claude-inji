@@ -175,6 +175,38 @@ def check(path):
                 problems.append((n, '-', 'type used before declaration: %s (declared L%d)'
                                  % (nm, decl_line[nm]), ln.strip()[:60]))
 
+    # ---- `for v = A + 1 to N - 1` with a reachable A == N - 1 ----------------
+    # Pine runs `for b = n to n - 1` DESCENDING, so the body executes with
+    # b == n and array.get(arr, n) reads out of bounds. Require an explicit
+    # guard: either `A < N - 1` in an enclosing line, or the outer loop that
+    # declares A bounded by `to N - 2` under an `N >= 2` test.
+    for n0, ln in enumerate(lines, 1):
+        code = ln.split('//')[0]
+        m = re.search(r'\bfor\s+\w+\s*=\s*(\w+)\s*\+\s*1\s+to\s+(\w+)\s*-\s*1\b', code)
+        if not m:
+            continue
+        A, N = m.group(1), m.group(2)
+        ind = len(code) - len(code.lstrip(' '))
+        guarded = False
+        for j2 in range(n0 - 2, -1, -1):
+            prev = lines[j2].split('//')[0]
+            if not prev.strip():
+                continue
+            pind = len(prev) - len(prev.lstrip(' '))
+            if pind >= ind:
+                continue
+            if re.search(r'\b%s\s*<\s*%s\s*-\s*1\b' % (re.escape(A), re.escape(N)), prev):
+                guarded = True
+                break
+            if re.search(r'\bfor\s+%s\s*=.*\bto\s+%s\s*-\s*2\b' % (re.escape(A), re.escape(N)), prev):
+                guarded = True
+                break
+            if pind == 0:
+                break
+        if not guarded:
+            problems.append((n0, '-', 'for %s+1 to %s-1 without a %s < %s-1 guard'
+                             % (A, N, A, N), ln.strip()[:60]))
+
     # ---- request.* tuple budget (Pine caps the script total at 127) ----------
     # Counted over EVERY source branch, not just the executed one. A UDT return
     # counts as 1 element; a [a, b, c] destructuring counts as its arity.

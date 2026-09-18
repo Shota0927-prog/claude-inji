@@ -1809,6 +1809,68 @@ Accum の pair 単位削除 / 上限判定 (`cnt > cap`) / Zone ロジック / P
 
 **RE10110 は未確認** (TradingView での Publish・コンパイル・実行・Profiler 計測を行えていない)。
 
+## Phase 8c : `f_buildDenseBounds()` の境界外アクセス修正
+
+### 不具合
+
+```pine
+for a = 0 to n - 1
+    ...
+    for b = a + 1 to n - 1        // ← a == n - 1 のとき for b = n to n - 1
+```
+
+Pine は開始値が終了値を超える `for` を**降順ループとして実行する**ため、
+`a == n - 1` の周回で `b == n` の本体が走り、`array.get(e.snPrice, n)` が
+境界外アクセスになる。Phase 5 で `f_buildDenseBounds()` を追加したときに入った。
+Version 3 (baseline) にはこの関数が無いので、baseline は影響を受けない。
+
+### 修正 (内側ループだけをガード)
+
+```pine
+int lim = n
+if a < n - 1
+    for b = a + 1 to n - 1
+        if int(f_tickOf(array.get(e.snPrice, b), c.mintick)) - ta > wLim
+            lim := b
+            break
+array.set(e.dsHardEnd, a, lim)
+```
+
+- `a == n - 1` のときの `lim` は初期値 `n` のままで、これは
+  「a より後ろに Root が無い」= 従来意図していた値と同じ。結果は変わらない。
+- `n > 1` で関数全体や外側ループを囲っては**いない** (`n == 1` でもその 1 件の
+  `dsHardEnd` / `dsMaxCatCnt` は計算しなければならない)。
+- `math.min()` で配列サイズへ丸める修正もしていない。
+- 続く `for b = a to lim - 1` は安全 : `lim` は `n` か `b >= a + 1` のいずれかなので
+  常に `lim - 1 >= a`。
+- Zone ロジック・Dense 探索条件 (`wLim`、break 条件、`dsMaxCatCnt < 2` の事前除外) は未変更。
+
+### 全ソースの `for x = y + 1 to n - 1` 監査
+
+| 箇所 | 外側の形 | 判定 |
+|---|---|---|
+| `f_qualityAccum()` L2580 | `if ... and n >= 2` → `for a = 0 to n - 2` | 変更不要 (`a <= n-2` → `a+1 <= n-1`) |
+| `f_qualityTimeHl()` L2613 | 同上 | 変更不要 |
+| `f_qualityFvg()` L2646 | 同上 | 変更不要 |
+| **`f_buildDenseBounds()` L3191** | `for a = 0 to n - 1` | **修正 (`if a < n - 1`)** |
+| `f_qualityFvgWith()` L3720 | `if ... and n >= 2` → `for a = 0 to n - 2` | 変更不要 |
+| `f_fvgAttachAndStandalone()` の standalone L3939 | `if i < sn - 1` | 変更不要 (既にガード済み) |
+| `f_buildSideCands()` の sweep L4008 | `if i < n - 1` | 変更不要 (既にガード済み) |
+
+Visual Harness FULL / SAFE、`indicator.pine`、`baseline/` の 2 ファイルには
+この形のループは 1 件も無い (または既にガード済み)。
+
+### 静的検査に追加した規則
+
+`tools/check_pine.py` に **`for v = A + 1 to N - 1` のガード検査**を追加した。
+囲いの行に `A < N - 1` があるか、`A` を宣言する外側ループが `to N - 2` で
+抑えられているかを確認し、どちらも無ければ報告する。
+
+- 現行 5 ファイル : **0 件**
+- 回帰確認 : ガードを外すと `L3191 for a+1 to n-1 without a a < n-1 guard` を検出
+
+**RE10110 は未確認** (TradingView での実測を行えていない)。
+
 ## Known limitations
 
 - **Pine Editor でのコンパイル・実行を確認していない。** スクリプトサイズ上限、`request.security` の
