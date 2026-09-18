@@ -273,6 +273,33 @@ f_sortedCopy(array<int> src, array<int> dst) =>
         array.sort(dst, order.ascending)
     array.size(dst)
 
+//  ★ Phase3E : 既に所有権を持っている配列へ中身を入れ直す deep copy。
+//    array.copy() と同じ結果で、新しい配列を作らない。
+//    src と dst は別の配列でなければならない (呼び出し側で保証)。
+f_copyInto(array<int> src, array<int> dst) =>
+    array.clear(dst)
+    int n = array.size(src)
+    if n > 0
+        for i = 0 to n - 1
+            array.push(dst, array.get(src, i))
+    array.size(dst)
+
+//  ★ Phase3E : array.new_bool(max(n,1), v) / array.new_int(max(n,1), v) の代わり。
+//    長さも初期値も従来と同じ (max(n,1) 件)。
+f_fillBool(array<bool> a, int n, bool v) =>
+    array.clear(a)
+    int m = int(math.max(n, 1))
+    for i = 0 to m - 1
+        array.push(a, v)
+    array.size(a)
+
+f_fillInt(array<int> a, int n, int v) =>
+    array.clear(a)
+    int m = int(math.max(n, 1))
+    for i = 0 to m - 1
+        array.push(a, v)
+    array.size(a)
+
 f_sharedSorted(array<int> a, array<int> b) =>
     int i = 0
     int j = 0
@@ -868,6 +895,18 @@ export type ZoneEngine
     //  心理価格同期用 scratch (毎足の array.new / map.new をなくす)
     array<float>   scPsychNeed
     map<int, bool> scPsychSeen
+    //  ★ Phase3E : Core 再構築の入れ物をプール化する。
+    //    毎足 array.new<ZoneCand> / array.new<CoreCand> / array.new_bool / array.new_int を
+    //    やめ、clear + push で使い回す。中に入れる ZoneCand / CoreCand は
+    //    従来どおり毎足新規に作る (永続オブジェクトへは必ず deep copy する)。
+    //    ZoneCand / CoreCand の参照は 1 回の f_rebuildCores() の外へ出ない。
+    array<ZoneCand> poolSup
+    array<ZoneCand> poolRes
+    array<CoreCand> poolCcs
+    array<bool>     pRUsed
+    array<int>      pCoreToCand
+    array<bool>     pCoreMerged
+    array<int>      pCandPrimary
 
 // ---- 2.17 統合 Pack 専用の返却型 (request.security の tuple 要素数対策) --------
 //  Pine の request.* は「スクリプト内の全 request の tuple 要素数の合計」に
@@ -1005,6 +1044,13 @@ export newEngine() =>
          scStandUsed = array.new_bool(),
          scPsychNeed = array.new_float(),
          scPsychSeen = map.new<int, bool>(),
+         poolSup     = array.new<ZoneCand>(),
+         poolRes     = array.new<ZoneCand>(),
+         poolCcs     = array.new<CoreCand>(),
+         pRUsed      = array.new_bool(),
+         pCoreToCand = array.new_int(),
+         pCoreMerged = array.new_bool(),
+         pCandPrimary = array.new_int(),
          rootSeq    = RID_FIXED_MAX)
 
 // @function  空の ZoneFeed を作る。配列フィールドが確保済みになる。
@@ -3137,8 +3183,11 @@ f_fvgAttachAndStandalone(ZoneEngine e, ZoneCfg c, int side, float refClose, arra
 //  段階C : 残 Root だけを価格昇順に左から貪欲クラスタ化して通常候補にする
 //          (決定論的な一方向スイープ。バーごとに結果が揺れない)
 //  段階B : FVG の attach / 局所化 / 単独候補
-f_buildSideCands(ZoneEngine e, ZoneCfg c, ZoneFeed f, int side) =>
-    array<ZoneCand> out = array.new<ZoneCand>()
+//  ★ Phase3E : out (ZoneCand の入れ物) を呼び出し側のプールから受け取る。
+//    入れる ZoneCand 自体は従来どおり f_buildCand() が毎足新規に作るので、
+//    容器を使い回しても保存先が scratch を参照共有することはない。
+f_buildSideCands(ZoneEngine e, ZoneCfg c, ZoneFeed f, int side, array<ZoneCand> out) =>
+    array.clear(out)
     int n = array.size(e.snRootId)
     array.clear(e.scUsed)
     if n > 0
@@ -3206,11 +3255,15 @@ f_buildSideCands(ZoneEngine e, ZoneCfg c, ZoneFeed f, int side) =>
 //    Version 2 では Support x Resistance の組み合わせごとに f_identityIds() を
 //    作り直していた。中身・順序・Broad FVG 除外規則はまったく同じで、
 //    「同じ Candidate に対して何度も作り直さない」だけの違い。
-f_pairSides(ZoneEngine e, ZoneCfg c, array<ZoneCand> sup, array<ZoneCand> res) =>
-    array<CoreCand> out = array.new<CoreCand>()
+//  ★ Phase3E : out (CoreCand の入れ物) と rUsed を呼び出し側のプールから受け取る。
+//    探索順・比較条件・CoreCand の作り方・push 順は一切変えていない。
+f_pairSides(ZoneEngine e, ZoneCfg c, array<ZoneCand> sup, array<ZoneCand> res,
+     array<CoreCand> out) =>
+    array.clear(out)
     int ns = array.size(sup)
     int nr = array.size(res)
-    array<bool> rUsed = array.new_bool(int(math.max(nr, 1)), false)
+    array<bool> rUsed = e.pRUsed
+    f_fillBool(rUsed, nr, false)
     if ns > 0
         for si = 0 to ns - 1
             ZoneCand sc = array.get(sup, si)
@@ -3307,8 +3360,10 @@ f_applyCandToView(ZoneEngine e, ZoneCfg c, int side, SideViewState v, ZoneCand c
     if na(cd)
         f_clearView(v)
     else
-        v.rootIds         := array.copy(cd.rootIds)
-        v.rootIdsSorted   := array.copy(cd.rootIdsSorted)
+        //  ★ Phase3E : View は自分の配列をすでに所有しているので、新しい配列を
+        //    作らず中身を入れ直す (deep copy なので Candidate と参照共有しない)。
+        f_copyInto(cd.rootIds, v.rootIds)
+        f_copyInto(cd.rootIdsSorted, v.rootIdsSorted)
         v.effectiveBottom := cd.bottom
         v.effectiveTop    := cd.top
         //  ★ Phase3C : 正式 Candidate ごとに 1 度だけ計算し、以後は使い回す
@@ -3602,8 +3657,9 @@ f_applyCoreCand(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z, CoreCand cc,
     else
         f_applyCandToView(e, c, SIDE_SUPPORT,    z.supportView,    sc)
         f_applyCandToView(e, c, SIDE_RESISTANCE, z.resistanceView, rc)
-        z.originRootIds   := array.copy(cc.originRootIds)
-        z.originRootIdsSorted := array.copy(cc.originRootIdsSorted)
+        //  ★ Phase3E : Core も既に自分の配列を所有している (deep copy のまま)
+        f_copyInto(cc.originRootIds, z.originRootIds)
+        f_copyInto(cc.originRootIdsSorted, z.originRootIdsSorted)
         [pb, pt] = f_corePhysRange(z)
         z.physBottom      := pb
         z.physTop         := pt
@@ -3651,15 +3707,24 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     //  ★ Phase3B : 点 Root の収集とソートは Side に依存しないので 1 回だけ作り、
     //    Support / Resistance で共有する (順序は Version 3 と同一)。
     f_buildPointSnapshot(e, c, f.baseClose)
-    array<ZoneCand> sup = f_buildSideCands(e, c, f, SIDE_SUPPORT)
-    array<ZoneCand> res = f_buildSideCands(e, c, f, SIDE_RESISTANCE)
-    array<CoreCand> ccs = f_pairSides(e, c, sup, res)
+    //  ★ Phase3E : Support 候補 / Resistance 候補 / CoreCand の入れ物と、
+    //    rUsed / coreToCand / coreMerged / candPrimary を Engine のプールで使い回す。
+    //    長さ・初期値・使い方は従来と同じで、確保の回数だけが減る。
+    array<ZoneCand> sup = e.poolSup
+    array<ZoneCand> res = e.poolRes
+    array<CoreCand> ccs = e.poolCcs
+    f_buildSideCands(e, c, f, SIDE_SUPPORT,    sup)
+    f_buildSideCands(e, c, f, SIDE_RESISTANCE, res)
+    f_pairSides(e, c, sup, res, ccs)
 
     int nc = array.size(e.cores)
     int nk = array.size(ccs)
-    array<int>   coreToCand = array.new_int(int(math.max(nc, 1)), -1)
-    array<bool>  coreMerged = array.new_bool(int(math.max(nc, 1)), false)
-    array<int>   candPrimary = array.new_int(int(math.max(nk, 1)), -1)
+    array<int>   coreToCand  = e.pCoreToCand
+    array<bool>  coreMerged  = e.pCoreMerged
+    array<int>   candPrimary = e.pCandPrimary
+    f_fillInt(coreToCand, nc, -1)
+    f_fillBool(coreMerged, nc, false)
+    f_fillInt(candPrimary, nk, -1)
 
     if nc > 0
         for ci = 0 to nc - 1
@@ -3848,7 +3913,7 @@ f_doBreak(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z, int side,
     bs.oldSide      := side
     bs.rangeBottom  := refBot
     bs.rangeTop     := refTop
-    bs.rootIds      := array.copy(v.rootIds)
+    f_copyInto(v.rootIds, bs.rootIds)
     bs.breakSeq     := f.baseSeq
     bs.breakTime    := f.baseCloseTime
     bs.wasGapBreak  := isGap
@@ -3882,7 +3947,7 @@ f_touchStart(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z, int side, float re
     s.side            := side
     s.rangeBottom     := refBot
     s.rangeTop        := refTop
-    s.rootIds         := array.copy(v.rootIds)
+    f_copyInto(v.rootIds, s.rootIds)
     s.catMask         := v.catMask
     s.highMask        := v.highMask
     s.cCount          := v.cCount

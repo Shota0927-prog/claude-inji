@@ -11,12 +11,17 @@
 
 | ファイル | 種別 | 行数 | 内容 |
 |---|---|---:|---|
-| `ZoneEngineV2.pine` | Pine v6 library (`ZoneEngineV2`) | 4466 | v2 定義の Zone Engine 本体。旧 ZoneEngine とは別名・別実装。 |
-| `ZoneEngineV2_VisualHarness.pine` | Pine v6 indicator | 1062 | Zone / Root / Event / 診断値の目視確認専用。Strategy 注文は一切無し。 |
-| `ZoneEngineV2_ParityHarness.pine` | Pine v6 indicator (検証専用) | 708 | Version 3 と新版を同じ Feed で同時に回し、全項目を照らす。本番には使わない。 |
-| `profiler/ZoneEngineV2_VisualHarness_Profiler.pine` | Pine v6 indicator (計測専用) | 1088 | 本番 Harness と同一。`shorttitle` と `calc_bars_count` だけ違う。 |
-| `baseline/ZoneEngineV2_baseline.pine` / `baseline/ZoneEngineV2_VisualHarness_baseline.pine` | Pine v6 (A/B 用) | - | 最適化前 (commit `d528a1e`) の控え。 |
+| `ZoneEngineV2.pine` | Pine v6 library (`ZoneEngineV2`) | 4725 | v2 定義の Zone Engine 本体。 |
+| `ZoneEngineV2_VisualHarness_FULL.pine` | Pine v6 indicator (**本番**) | 1189 | 全履歴。`calc_bars_count` なし。これが原本。 |
+| `ZoneEngineV2_VisualHarness_SAFE.pine` | Pine v6 indicator (検証用 / 自動生成) | 1215 | FULL から `tools/sync_harness.py` で生成。`calc_bars_count` だけ違う。 |
+| `tools/sync_harness.py` | 生成スクリプト | - | SAFE を FULL から作る。`python3 tools/sync_harness.py <本数>` |
+| `ZoneEngineV2_ParityHarness.pine` | Pine v6 indicator (検証専用) | 715 | Version 3 と新版を照らす。**Phase 3D 以降は対象外 / 未変更**。 |
+| `baseline/*.pine` | Pine v6 (A/B 用) | - | 最適化前 (commit `d528a1e`) の控え。 |
 | `ZoneEngineV2_Implementation_Report.md` | ドキュメント | - | 本書。 |
+
+旧 `ZoneEngineV2_VisualHarness.pine` は `..._FULL.pine` へリネーム。
+旧 `profiler/ZoneEngineV2_VisualHarness_Profiler.pine` は SAFE 版が役割を兼ねるため削除
+(同一内容のコピーを 3 つ維持すると古い方を計測してしまうため)。
 
 既存ファイルの変更: **なし**。
 - 旧 `ZoneEngine` (v9 / v10 / v11) のソースはこのリポジトリに存在せず、1 文字も変更していない。
@@ -984,6 +989,41 @@ Core ID / Generation ID、Touch / Weak / Break / Flip / Reclaim、Grade / Densit
 - 500 でも落ちる → 1 足の処理量そのものが重いので、
   `f_buildPointSnapshot` / `f_searchDenseBest` / `f_fvgAttachAndStandalone` /
   `f_pairSides` / `f_rebuildCores` を Profiler で特定してから scratch / プールを追加する
+
+### Phase 3E : Core 再構築の入れ物をプール化 (実装済み)
+
+毎足の `array.new*` / `array.copy()` を減らした。探索順・比較条件・push 順は未変更。
+
+| 対象 | 変更前 (毎足) | 変更後 |
+|---|---|---|
+| Support 候補の容器 | `array.new<ZoneCand>()` | `e.poolSup` を clear + push |
+| Resistance 候補の容器 | `array.new<ZoneCand>()` | `e.poolRes` を clear + push |
+| CoreCand の容器 | `array.new<CoreCand>()` | `e.poolCcs` を clear + push |
+| `rUsed` | `array.new_bool(max(nr,1), false)` | `e.pRUsed` + `f_fillBool()` |
+| `coreToCand` | `array.new_int(max(nc,1), -1)` | `e.pCoreToCand` + `f_fillInt()` |
+| `coreMerged` | `array.new_bool(max(nc,1), false)` | `e.pCoreMerged` + `f_fillBool()` |
+| `candPrimary` | `array.new_int(max(nk,1), -1)` | `e.pCandPrimary` + `f_fillInt()` |
+| `f_applyCandToView()` の View 配列 | `v.rootIds := array.copy(...)` × 2 | `f_copyInto()` × 2 (View がすでに所有している配列へ deep copy) |
+| Core の origin 配列 | `z.originRootIds := array.copy(...)` × 2 | `f_copyInto()` × 2 |
+| BreakSnapshot / TouchStartSnapshot | `rootIds := array.copy(v.rootIds)` | `f_copyInto()` |
+
+`f_fillBool()` / `f_fillInt()` は長さも初期値も従来と同じ (`max(n, 1)` 件)。
+
+#### 参照共有をしていないことの根拠
+
+- プールしたのは「容器」だけ。中に入る `ZoneCand` / `CoreCand` は従来どおり
+  `f_buildCand()` / `CoreCand.new()` が毎足新規に作る。
+- `ZoneCand` / `CoreCand` の参照は 1 回の `f_rebuildCores()` の外へ出ない。
+  `CoreCand` は sup / res を **index** でしか指していない。
+- 永続オブジェクト (`ZoneCore` / `SideViewState` / Snapshot) へは必ず
+  `f_copyInto()` または `array.copy()` で deep copy している。
+- 新しい `ZoneCore` を作る箇所 (`f_applyCoreCand()` の新規 / `f_archiveCore()`) と
+  `f_buildCand()` の `rootIds` だけは、新しい配列が必要なので `array.copy()` を残している。
+
+#### dirty skip は入れていない
+
+Phase 3E では「依存値が変わっていないと証明できない skip」を 1 つも入れていない。
+`f_rebuildCores()` は全確定足で従来どおり実行する。
 
 ### Parity Harness (`ZoneEngineV2_ParityHarness.pine`)
 
