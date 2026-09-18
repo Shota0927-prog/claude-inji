@@ -1109,6 +1109,94 @@ EMA2000 / EMA3000、Root 保存上限、lookahead、Feed 値、tie-break — い
 よって、`f_rebuildCores()` は引き続き **全確定足で実行** する。
 Break / Touch / Flip / Reclaim の状態更新も従来どおり全確定足。
 
+### 指示 1 (topology dirty / cache) : 実装しても発火しないことを確認
+
+指示の dirty 条件には「Root の価格・範囲変更」が入っている。
+`f_upsertMa()` は毎確定足で次を書き換える。
+
+```
+r.pointPrice    := price          // 1分足 EMA2000 / EMA3000 の値
+r.direction     := dir
+r.confirmedTime := f.maConfirmTime
+```
+
+- `pointPrice` は 1 分足 EMA なので、ほぼ毎 5 分足で値が動く。
+- `maConfirmTime` は 1 分足の `time_close[1]` なので **必ず毎足進む**。
+
+この 2 つはどちらもクラスタリングの直接入力。
+
+| 値 | 影響するところ |
+|---|---|
+| `pointPrice` | 窓の内外判定 / snapshot の並び / Candidate の bottom・top / Density / `f_qualityMa` の `abs(e1p - e2p)` |
+| `confirmedTime` | `firstConfirmTime` = `f_candBetter()` の **tie-break 項** |
+
+よって `useMa = true` (既定。EMA 削除は禁止) の間、**dirty は毎足 true になる**。
+topology dirty / cache を入れても 1 度も skip できず、fingerprint 計算 (`O(roots + cores)`)
+の分だけ **遅くなる**。だから入れていない (判断の問題ではなく算数の問題)。
+
+代わりに、同じ発想 (入力が変わらない作業をやり直さない) を
+**実際に成立する粒度** で適用したのが下の Phase 3G。
+
+### Phase 3G (実験 / 既定 OFF) : dense 探索のラウンド間キャッシュ
+
+`ZoneCfg.denseRoundCache` (既定 `false`)。Harness の Debug グループに input を用意してある。
+**OFF の間は Phase 3F と完全に同じ経路を通る** (`f_searchDenseBest()` 本体は一切未変更)。
+
+#### 何を削るのか
+
+`f_buildSideCands()` は同じ引数で `f_searchDenseBest()` を 12 回呼ぶ。
+ラウンド間で変わるのは `e.scUsed` だけなのに、毎回全開始位置を走査し直している。
+
+| | Phase 3F | Phase 3G (ON) |
+|---|---|---|
+| 1 ラウンド目 | `O(n · k)` | `O(n · k)` (変わらない) |
+| 2〜12 ラウンド目 | 毎回 `O(n · k)` | `O(|affected| · k)` |
+| 合計 (Side ごと) | `12 · O(n · k)` | `≈ O(n · k) + 11 · O(|affected| · k)` |
+
+`|affected|` = 前ラウンドで used になった index を読み範囲に含む開始位置の数。
+既定では dense 幅 = `M × denseRatio` = 10、snapshot は ±`dormantDistance` = 500 なので、
+通常は snapshot 全体のごく一部だけが affected になる。
+
+#### 同値性の根拠 (3 点)
+
+1. **スカン本体は切り出しただけ。** `f_scanStartDense()` は `f_searchDenseBest()` の
+   `a` ループの中身を 1 行ずつそのまま切り出して dedent したもの (式に手を入れていない)。
+   continue / break の位置、衝突判定、比較子も同一。
+2. **全体 best の取り方 (argmax の分解)。** 比較は厳密不等号だけで、完全同値なら
+   先に見つけた方が勝つ。`a` を昇順に見て各 `a` の best (= その `a` の中で最初の best)
+   を同じ比較で結んでいくと、全走査したときの「最初の best」と必ず一致する。
+3. **影響範囲は superset を使う。** used を `continue` で飛ばすため break 位置自体が
+   used でずれ得る。そこで「確実にこれ以降は読まない」位置 `dsEnd[a]` を使う :
+   並びの正規化 tick は非減少なので、`tick(price[b]) - tick(price[a])` が
+   `tick(maxWidth) + 1` を超えた位置以降は幅で必ず break する。
+   `+1` は「差の丸め」と「丸めの差」のずれを吸収する余裕。
+   superset なので、余分に再計算することはあっても見落とすことはない。
+
+勝った `a` の窓 index 列は `a..dsB[a]` を used を飛ばして歩き直して得る。
+`dsB[a]` まで到達した = その途中で break していないので、used でない b は全て push されていた。
+
+#### なぜ既定 OFF なのか
+
+上の 3 点は紙の上では成立するが、**私は実機で A/B を走らせていない**。
+指示 5 の「1 項目でも差が出たら採用しない」を満たしていない状態で、
+一番 parity に厳しい関数を既定経路にするのは危う。
+そのため **既定 OFF (= Phase 3F と完全一致) で出し、A/B で全一致を確かめてから ON にする**
+手順にしている。A/B を通したら既定を ON へ切り替える。
+
+#### 指示 3 (Root snapshot / Candidate metadata のキャッシュ) の現状
+
+| 項目 | 状況 | どこで |
+|---|---|---|
+| Root index | 済 | `map<int,int> rootIdx` + dirty。dense 探索からは 1 回も引かない |
+| category / timeframe / direction / confirmedTime / originTime | 済 | `snCat` / `snTf` / `snDir` / `snConfirm` / `snOrigin` (1 足 1 回) |
+| identityIds | 済 | Candidate 生成時に 1 回 (Phase 3A) |
+| rootIdsSorted / nonFvgIdentitySorted | 済 | `f_finishCandArrays()` で 1 回 |
+| C / H / catMask / highMask | 済 | 探索中は増分スカラ、保存時に 1 回 |
+| FVG direction / Fresh / structural | 済 | `f_fillCandFrom()` で 1 回、attach 試行は scratch |
+| Support×Resistance ごとの `f_identityIds()` | 済 (再実行しない) | Phase 3A |
+
+指示 3 は新規作業なしで完了している。
+
 ### Parity Harness (`ZoneEngineV2_ParityHarness.pine`)
 
 ★ Phase 3D では対象外。1 行も変更していない。比較コードは本番 Harness へ一切入っていない。

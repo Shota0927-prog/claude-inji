@@ -420,6 +420,10 @@ export type ZoneCfg
     // -- 表示専用 : ZoneView の rootSummary / categorySummary を作るか --
     //    false でも Zone 判定・Grade・Event は一切変わらない (文字列を作らないだけ)。
     bool   buildDisplayStrings = true
+    //  ★ Phase3G 実験 : dense 探索のラウンド間キャッシュを使うか。
+    //    既定 false = Phase 3F と完全に同じ経路 (本体は 1 行も通らない)。
+    //    true にするには先に A/B で全項目一致を確かめること。
+    bool   denseRoundCache = false
 
 // ---- 2.2 Feed 部品 (外部足 helper の戻り値をそのまま入れる箱) -------------
 export type SwingIn
@@ -922,6 +926,17 @@ export type ZoneEngine
     ZoneCand        scBest
     //  ★ Phase3F : CoreCand の originRootIds 重複判定用 (追加ごとの再ソートをなくす)
     map<int, bool>  ccSeen
+    //  ★ Phase3G 実験 : dense 探索の a ごとの best キャッシュ (cfg で OFF なら使わない)
+    array<bool>     dsFound
+    array<int>      dsC
+    array<int>      dsH
+    array<float>    dsW
+    array<int>      dsT
+    array<int>      dsId
+    array<int>      dsB
+    array<int>      dsEnd
+    array<bool>     dsDirty
+    bool            dsValid = false
 
 // ---- 2.17 統合 Pack 専用の返却型 (request.security の tuple 要素数対策) --------
 //  Pine の request.* は「スクリプト内の全 request の tuple 要素数の合計」に
@@ -1077,6 +1092,15 @@ export newEngine() =>
          scTrial     = f_newScratchCand(),
          scBest      = f_newScratchCand(),
          ccSeen      = map.new<int, bool>(),
+         dsFound     = array.new_bool(),
+         dsC         = array.new_int(),
+         dsH         = array.new_int(),
+         dsW         = array.new_float(),
+         dsT         = array.new_int(),
+         dsId        = array.new_int(),
+         dsB         = array.new_int(),
+         dsEnd       = array.new_int(),
+         dsDirty     = array.new_bool(),
          rootSeq    = RID_FIXED_MAX)
 
 // @function  空の ZoneFeed を作る。配列フィールドが確保済みになる。
@@ -3006,6 +3030,271 @@ f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requir
                                     array.push(e.scBestIdx, array.get(e.scWinIdx, q))
     found
 
+//  1 つの開始位置 a だけを走査する。中身は f_searchDenseBest() の a ループを
+//  1 行ずつそのまま切り出したもの。返すのは a の中の best とその窓の終端 b。
+f_scanStartDense(ZoneEngine e, ZoneCfg c, int side, int a, float maxWidth,
+     bool requireStrong, float denseW) =>
+    bool  found  = false
+    int   bestC  = 0
+    int   bestH  = 0
+    float bestW  = 0.0
+    int   bestT  = 0
+    int   bestId = 0
+    int   bestB  = -1
+    int   n      = array.size(e.snRootId)
+    array.clear(e.scWinIdx)
+    array.clear(e.scAccTok)
+    array.clear(e.scAccTf)
+    float lo = array.get(e.snPrice, a)
+    //  ★ 探索の打ち切り用の幅は Version 3 と同じ (price[b] - lo)。
+    //    Candidate の実幅は窓内の真の max - min なので別に持つ。
+    //    並びは Version 3 の挿入条件を再現しているため、
+    //    生価格の完全な昇順になるとは限らない。
+    float wPmin  = na
+    float wPmax  = na
+    int   wCat   = 0
+    int   wC     = 0
+    bool  wNonPsych = false
+    int   wMinId = 0
+    int   wFirst = 0
+    bool  wFirstSet = false
+    bool  hasE1  = false
+    bool  hasE2  = false
+    float e1p    = na
+    float e2p    = na
+    int   e1d    = 0
+    int   e2d    = 0
+    bool  swHigh = false
+    bool  accHigh = false
+    bool  tlHigh = false
+    bool  tlSeen = false
+    int   tlOrigin = 0
+    for b = a to n - 1
+        if b > a
+            if array.get(e.scUsed, b)
+                continue
+            float w = array.get(e.snPrice, b) - lo
+            if f_gtT(w, maxWidth, c.mintick)
+                break
+            if f_accTokenConflict(e, array.get(e.snPair, b))
+                break
+        //  --- 窓へ 1 Root 追加 (増分更新) ---
+        int rcat = array.get(e.snCat, b)
+        int rid  = array.get(e.snRootId, b)
+        float rpx = array.get(e.snPrice, b)
+        //  f_fillCandFrom() の pmin / pmax と同じものを逐次作る
+        wPmin := na(wPmin) ? rpx : math.min(wPmin, rpx)
+        wPmax := na(wPmax) ? rpx : math.max(wPmax, rpx)
+        if not f_maskHas(wCat, rcat)
+            wCat := f_maskAdd(wCat, rcat)
+            wC   := wC + 1
+        if rcat != CAT_PSYCH
+            wNonPsych := true
+        wMinId := wMinId == 0 ? rid : math.min(wMinId, rid)
+        int cft = array.get(e.snConfirm, b)
+        wFirst := wFirstSet ? math.min(wFirst, cft) : cft
+        wFirstSet := true
+        if rcat == CAT_MA
+            if rid == RID_EMA1
+                hasE1 := true
+                e1p := array.get(e.snPrice, b)
+                e1d := array.get(e.snDir, b)
+            else if rid == RID_EMA2
+                hasE2 := true
+                e2p := array.get(e.snPrice, b)
+                e2d := array.get(e.snDir, b)
+        else if rcat == CAT_SWING
+            if not swHigh
+                int stf = array.get(e.snTf, b)
+                int stm = array.get(e.snTfMask, b)
+                if stf == TF_1H or (f_maskHas(stm, TF_15M) and f_maskHas(stm, TF_5M))
+                    swHigh := true
+        else if rcat == CAT_ACCUM
+            int atf  = array.get(e.snTf, b)
+            int atok = array.get(e.snPair, b)
+            if not accHigh
+                if atf == TF_4H or atf == TF_D
+                    accHigh := true
+                else
+                    int an = array.size(e.scAccTok)
+                    if an > 0
+                        for q = 0 to an - 1
+                            if array.get(e.scAccTok, q) != atok and array.get(e.scAccTf, q) != atf
+                                accHigh := true
+                                break
+            array.push(e.scAccTok, atok)
+            array.push(e.scAccTf, atf)
+        else if rcat == CAT_TIME_HL
+            if not tlHigh
+                int lm = array.get(e.snLabel, b)
+                if f_maskHas(lm, f_timeLabelBit(PER_WEEK, true))
+                     or f_maskHas(lm, f_timeLabelBit(PER_WEEK, false))
+                     or f_maskHas(lm, f_timeLabelBit(PER_DAY, false))
+                    tlHigh := true
+                else
+                    int og = array.get(e.snOrigin, b)
+                    if not tlSeen
+                        tlSeen := true
+                        tlOrigin := og
+                    else if og != tlOrigin
+                        tlHigh := true
+        array.push(e.scWinIdx, b)
+        //  --- 評価 (Base Strong は C >= 2 が必須 -> 1 本だけの窓は作らない) ---
+        if not requireStrong or array.size(e.scWinIdx) >= 2
+            //  ★ Candidate の幅 = 窓内の真の max - min
+            //    (f_fillCandFrom() が top - bottom として使う値と同じ)。
+            //    探索を打ち切る幅 (price[b] - lo) とは別の値であることに注意。
+            float wid = na(wPmin) or na(wPmax) ? float(na) : wPmax - wPmin
+            int dens = na(wid) or f_gtT(wid, c.clusterMaxWidth, c.mintick) ? DEN_BROAD_CONTEXT
+                 : (f_leT(wid, denseW, c.mintick) ? DEN_HIGH : DEN_NORMAL)
+            int wH = 0
+            if hasE1 and hasE2
+                bool near = f_leT(math.abs(e1p - e2p), denseW, c.mintick)
+                bool dirOk = side == SIDE_SUPPORT ? (e1d > 0 and e2d > 0) : (e1d < 0 and e2d < 0)
+                if near and dirOk
+                    wH := wH + 1
+            if swHigh
+                wH := wH + 1
+            if accHigh
+                wH := wH + 1
+            if tlHigh
+                wH := wH + 1
+            bool bStrong = dens == DEN_HIGH and wNonPsych
+                 and ((wC == 2 and wH >= 1) or wC >= 3)
+            bool okStrong = not requireStrong or bStrong
+            if wNonPsych and okStrong
+                bool better = not found
+                if found
+                    //  f_candBetter() と同じ順序 (本体と同一)
+                    if wC != bestC
+                        better := wC > bestC
+                    else if wH != bestH
+                        better := wH > bestH
+                    else if not f_eqT(nz(wid, 0), bestW, c.mintick)
+                        better := nz(wid, 0) < bestW
+                    else if wFirst != bestT
+                        better := wFirst < bestT
+                    else
+                        better := wMinId < bestId
+                if better
+                    found  := true
+                    bestC  := wC
+                    bestH  := wH
+                    bestW  := nz(wid, 0)
+                    bestT  := wFirst
+                    bestId := wMinId
+                    bestB  := b
+    [found, bestC, bestH, bestW, bestT, bestId, bestB]
+
+//  a ごとのキャッシュを使って全体 best を出す。初回は全 a を走査し、
+//  2 回目以降は dsDirty の a だけ再計算する。
+f_searchDenseBestCached(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requireStrong) =>
+    array.clear(e.scBestIdx)
+    float denseW = f_denseWidth(c)
+    int n = array.size(e.snRootId)
+    if not e.dsValid
+        //  この足 / この Side の初回 : 長さを揃えて全 a を dirty にする。
+        f_fillBool(e.dsFound, n, false)
+        f_fillInt(e.dsC, n, 0)
+        f_fillInt(e.dsH, n, 0)
+        array.clear(e.dsW)
+        int mw = int(math.max(n, 1))
+        for i = 0 to mw - 1
+            array.push(e.dsW, 0.0)
+        f_fillInt(e.dsT, n, 0)
+        f_fillInt(e.dsId, n, 0)
+        f_fillInt(e.dsB, n, -1)
+        f_fillBool(e.dsDirty, n, true)
+        //  読み範囲の superset : tick 差が tick(maxWidth) + 1 を超えた位置以降は
+        //  幅で必ず break する (並びの正規化 tick は非減少)。
+        f_fillInt(e.dsEnd, n, n)
+        if n > 0
+            int wLim = int(f_tickOf(maxWidth, c.mintick)) + 1
+            for a = 0 to n - 1
+                int ta = int(f_tickOf(array.get(e.snPrice, a), c.mintick))
+                int lim = n
+                for b = a + 1 to n - 1
+                    if int(f_tickOf(array.get(e.snPrice, b), c.mintick)) - ta > wLim
+                        lim := b
+                        break
+                array.set(e.dsEnd, a, lim)
+        e.dsValid := true
+    if n > 0
+        for a = 0 to n - 1
+            if array.get(e.dsDirty, a)
+                array.set(e.dsDirty, a, false)
+                if array.get(e.scUsed, a)
+                    array.set(e.dsFound, a, false)
+                else
+                    [fo, bc, bh, bw, bt, bi, bb] =
+                         f_scanStartDense(e, c, side, a, maxWidth, requireStrong, denseW)
+                    array.set(e.dsFound, a, fo)
+                    array.set(e.dsC, a, bc)
+                    array.set(e.dsH, a, bh)
+                    array.set(e.dsW, a, bw)
+                    array.set(e.dsT, a, bt)
+                    array.set(e.dsId, a, bi)
+                    array.set(e.dsB, a, bb)
+    //  全体 best : a を昇順に見て本体と同じ比較で結ぶ (同値なら先勝ち)
+    bool  found  = false
+    int   bestA  = -1
+    int   bestC  = 0
+    int   bestH  = 0
+    float bestW  = 0.0
+    int   bestT  = 0
+    int   bestId = 0
+    if n > 0
+        for a = 0 to n - 1
+            if array.get(e.dsFound, a)
+                int   wC     = array.get(e.dsC, a)
+                int   wH     = array.get(e.dsH, a)
+                float wid    = array.get(e.dsW, a)
+                int   wFirst = array.get(e.dsT, a)
+                int   wMinId = array.get(e.dsId, a)
+                bool better = not found
+                if found
+                    if wC != bestC
+                        better := wC > bestC
+                    else if wH != bestH
+                        better := wH > bestH
+                    else if not f_eqT(wid, bestW, c.mintick)
+                        better := wid < bestW
+                    else if wFirst != bestT
+                        better := wFirst < bestT
+                    else
+                        better := wMinId < bestId
+                if better
+                    found  := true
+                    bestA  := a
+                    bestC  := wC
+                    bestH  := wH
+                    bestW  := wid
+                    bestT  := wFirst
+                    bestId := wMinId
+    //  勝った a の窓 index 列を再現する (a..dsB[a] のうち used でないもの、本体と同じ順)
+    if found
+        int bEnd = array.get(e.dsB, bestA)
+        for b = bestA to bEnd
+            if b == bestA or not array.get(e.scUsed, b)
+                array.push(e.scBestIdx, b)
+    found
+
+//  used になった index の影響を受ける a を dirty にする。
+//  a の読み範囲は [a, dsEnd[a]) の superset なので、そこに u が入れば dirty。
+f_markDenseDirty(ZoneEngine e) =>
+    int n = array.size(e.dsDirty)
+    int m = array.size(e.scBestIdx)
+    if n > 0 and m > 0
+        for a = 0 to n - 1
+            if not array.get(e.dsDirty, a)
+                int lim = array.get(e.dsEnd, a)
+                for q = 0 to m - 1
+                    int u = array.get(e.scBestIdx, q)
+                    if u >= a and u < lim
+                        array.set(e.dsDirty, a, true)
+                        break
+    true
+
 //  best 窓 (スナップショット位置の列) から正式 Candidate を作り、used を立てる。
 //  rootIds の並びは Version 3 と同じ「スナップショット昇順」。
 f_materializeBest(ZoneEngine e, ZoneCfg c, int side) =>
@@ -3286,10 +3575,18 @@ f_buildSideCands(ZoneEngine e, ZoneCfg c, ZoneFeed f, int side, array<ZoneCand> 
         for i = 0 to n - 1
             array.push(e.scUsed, false)
     //  段階A : Base Strong を満たす Dense core を比較関数で先に確定する (最大 12 回)
+    //  ★ Phase3G : c.denseRoundCache が true のときだけラウンド間キャッシュ経路を使う。
+    //    既定 (false) では f_searchDenseBest() を 12 回呼ぶ Phase 3F と完全に同じ経路。
+    //    キャッシュは Side ごとに作り直す (dsValid を倒す)。
+    e.dsValid := false
     for g = 1 to 12
-        if not f_searchDenseBest(e, c, side, f_denseWidth(c), true)
+        bool got = c.denseRoundCache ? f_searchDenseBestCached(e, c, side, f_denseWidth(c), true)
+             : f_searchDenseBest(e, c, side, f_denseWidth(c), true)
+        if not got
             break
         array.push(out, f_materializeBest(e, c, side))
+        if c.denseRoundCache
+            f_markDenseDirty(e)
     //  段階C : 残 Root だけを価格昇順に左から貪欲クラスタ化 (決定論的な一方向スイープ)
     if n > 0
         for i = 0 to n - 1
