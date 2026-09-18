@@ -1701,6 +1701,114 @@ rootId は単調増加の一意値なので、append で既存 key を上書き�
 **未確認。** TradingView での Publish・コンパイル・実行・Profiler 計測を行えていないため、
 RE10110 が解消したかどうかは断言できない。上記は静的検査と計算量の議論のみ。
 
+## Phase 8b : cap prune の件数追跡と reindex 位置の修正
+
+Phase 8 の他の変更 (Essential Set の cap dirty 時限定構築 / `scAccumBoxKeys` の再利用 /
+append 時の `rootIdx` 差分更新 / TimeHL のカテゴリ一覧走査) はすべて維持している。
+
+### 1. `f_reindexRoots(e)` を count より前へ
+
+**ご指摘の問題** : Phase 8 では順序が
+
+1. `f_countRootsInCategory()` / `f_countAccumBoxes()`
+2. `f_reindexRoots(e)`
+
+だった。1 件削除すると `f_removeRootAt()` が `rootIdxDirty := true` を立てるため、
+次の周回の count はカテゴリ内の各 Root について `f_rootIdxById()` の全 Root 線形探索へ
+フォールバックし、`O(カテゴリ Root 数 × 全 Root 数)` になっていた。
+結果は変わらないが RE10110 対策としては逆効果。
+
+**修正** : `f_reindexRoots(e)` を
+
+- ループに入る前 (最初の count より前)
+- 各削除の直後 (次の対象探索より前)
+
+の 2 箇所へ置いた。ループ内の count 自体は下記 2 で廃止したので、
+「count が dirty な索引を引く」経路は無くなった。
+
+### 2. 件数を開始時に 1 回だけ取り、削除ごとに減算する
+
+```pine
+f_pruneCategoryToCap(ZoneEngine e, ZoneCfg c, ZoneFeed f, int cat, int cap) =>
+    int  removed    = 0
+    bool stillDirty = false
+    f_reindexRoots(e)                                    // count より前
+    int cnt = cat == CAT_ACCUM ? f_countAccumBoxes(e) : f_countRootsInCategory(e, cat)
+    for guard = 1 to 64
+        if cnt <= cap
+            break
+        ... worst 探索 (protected / essential / current TimeHL / 選択順は現行のまま) ...
+        if worstIdx < 0
+            break
+        if cat == CAT_ACCUM
+            ... 同一 pairKey を全削除 ...
+            cnt := cnt - 1
+        else
+            f_removeRootAt(e, worstIdx)
+            removed := removed + 1
+            cnt := cnt - 1
+        f_reindexRoots(e)                                // 次の対象探索より前
+    stillDirty := cnt > cap
+    [removed, stillDirty]
+```
+
+`f_pruneCatIfDirty()` は追跡された `stillDirty` をそのまま受け取り、**終了後の再集計を廃止**した。
+
+```pine
+    if dirty
+        [rm2, sd2] = f_pruneCategoryToCap(e, c, f, cat, cap)
+        rm         := rm2
+        stillDirty := sd2
+```
+
+### 3. `cnt` を減算できる根拠 (厳密同値)
+
+| ケース | 削除するもの | 件数の変化 |
+|---|---|---|
+| 非 Accum | worst 探索のフィルタが `category == cat and state != ROOT_RETIRED` を要求するので、**必ず非 RETIRED の当該カテゴリ Root を 1 件** | `f_countRootsInCategory()` はちょうど 1 減る |
+| Accum | `worstIdx` の Root は非 RETIRED でその `pairKey` を持つ。削除ループは state を問わず同じ `pairKey` の `CAT_ACCUM` Root を**すべて**外す | distinct `pairKey` 件数はちょうど 1 減る (他の `pairKey` には触らない) |
+
+ループ中に削除以外の state 変更は一切ない (`f_rootProtected()` / `f_rootEssential()` は
+読み取りのみ、`f_removeRootAt()` は削除のみ、`e.essIds` はループに入る前に確定している)。
+カテゴリ別一覧に同じ rootId が二重に入ることもない (`f_pushRoot()` は 1 回 append、
+rootId は単調増加の一意値)。したがって終了時の `cnt` は「その場で再集計した値」と
+必ず一致し、`stillDirty` の真偽は従来と同一になる。
+
+各終了経路も従来と一致する。
+
+| 終了経路 | 旧 (ループ後に再集計) | 新 (追跡値) |
+|---|---|---|
+| 入口で `cnt <= cap` | 即 break → 再集計 → false | false |
+| 減算で `cnt <= cap` | break → 再集計 → false | false |
+| `worstIdx < 0` (全部 protected / essential) | break → 再集計 → `cnt > cap` = true | true |
+| guard 64 回打ち切り | 再集計 → `cnt > cap` | 同値 |
+
+### 4. count / reindex の呼び出し回数 (R = その足で削除した件数)
+
+| | 旧 | 新 |
+|---|---:|---:|
+| `f_countRootsInCategory()` / `f_countAccumBoxes()` | `R + 2` (ループ先頭 `R+1` 回 + `f_pruneCatIfDirty` の 1 回) | **1** |
+| うち dirty な索引を引く count | `R` | **0** |
+| `f_reindexRoots()` | `R` (count より後) | `R + 1` (すべて count / 探索より前。`rootIdxDirty == false` なら no-op) |
+
+### 5. 変えていないもの
+
+最大 64 回 / protected / essential / current TimeHL の条件 / 削除対象の選択順 /
+Accum の pair 単位削除 / 上限判定 (`cnt > cap`) / Zone ロジック / Public API
+(`f_pruneCategoryToCap()` と `f_pruneCatIfDirty()` はどちらも非 export の内部関数で、
+呼び出し元は `f_pruneRoots()` 1 箇所のみ)。
+
+### 6. 静的検査
+
+| 検査 | 結果 |
+|---|---|
+| 関数スコープ未定義変数 | 3 ファイル 0 件 |
+| 宣言順 (`f_*` / UDT の前方参照) | 3 ファイル 0 件 |
+| `request.*` tuple 要素数 | FULL / SAFE とも 104 / 127 |
+| 括弧バランス / 行跨ぎ文字列 / 継続行インデント %4 | 0 件 |
+
+**RE10110 は未確認** (TradingView での Publish・コンパイル・実行・Profiler 計測を行えていない)。
+
 ## Known limitations
 
 - **Pine Editor でのコンパイル・実行を確認していない。** スクリプトサイズ上限、`request.security` の
