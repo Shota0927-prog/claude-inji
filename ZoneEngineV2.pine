@@ -811,6 +811,9 @@ export type ZoneEngine
     //  Root ID -> index の map が古いか。e.roots の「要素の追加・削除・並び替え」
     //  でだけ true にする。Root の価格や state を変えただけでは index は動かない。
     bool   rootIdxDirty  = true
+    //  表示専用 : ZoneEvent を e.events へ溜めるか。false でも Event を起こす判定自体は
+    //  まったく同じに走る (f_emit の push をやめるだけ)。既定は true = 従来どおり。
+    bool   captureEvents = true
     // 診断
     int    pendingTopologyCount   = 0
     int    pendingGenerationCount = 0
@@ -1446,11 +1449,16 @@ export accumFvgBundleV2(simple int rangeLen, simple int baseLen, simple int atrL
 f_sign(float v) =>
     na(v) ? 0 : v > 0 ? 1 : v < 0 ? -1 : 0
 
+//  ★ e.captureEvents が false のときは ZoneEvent を作らない (保存もしない)。
+//    e.events は Engine 内部の判定から一切読まれない (読み出しは eventCount() /
+//    eventAt() だけ) ので、push をやめても Zone の判定結果は 1 つも変わらない。
+//    f_emit() の戻り値を使っている呼び出し側は 1 つもない (全 14 箇所を確認済み)。
 f_emit(ZoneEngine e, ZoneFeed f, int etype, int coreId, int genId, int side,
      float bot, float top, int touchNo, int gradeAtStart, int weakReason, int rootId, string info) =>
-    array.push(e.events, ZoneEvent.new(eventType = etype, eventTime = f.baseCloseTime, baseSeq = f.baseSeq,
-         coreId = coreId, generationId = genId, side = side, rangeBottom = bot, rangeTop = top,
-         touchNo = touchNo, gradeAtStart = gradeAtStart, weakReason = weakReason, rootId = rootId, info = info))
+    if e.captureEvents
+        array.push(e.events, ZoneEvent.new(eventType = etype, eventTime = f.baseCloseTime, baseSeq = f.baseSeq,
+             coreId = coreId, generationId = genId, side = side, rangeBottom = bot, rangeTop = top,
+             touchNo = touchNo, gradeAtStart = gradeAtStart, weakReason = weakReason, rootId = rootId, info = info))
     array.size(e.events)
 
 f_nextRootId(ZoneEngine e) =>
@@ -2171,7 +2179,7 @@ f_pruneRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
         e.storagePruned   := true
         e.prunedRootCount := e.prunedRootCount + removed
         f_emit(e, f, EV_STORAGE_PRUNE, 0, 0, SIDE_NONE, na, na, 0, GR_UNAVAILABLE, WEAK_NONE, 0,
-             "ROOT_PRUNED " + str.tostring(removed))
+             e.captureEvents ? "ROOT_PRUNED " + str.tostring(removed) : "")
     removed
 
 // ============================================================================
@@ -3553,7 +3561,7 @@ f_mergeCore(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore prim, ZoneCore other) 
         prim.touchHistoryTruncated := true
     e.mergeCount := e.mergeCount + 1
     f_emit(e, f, EV_MERGE, prim.coreId, prim.generationId, SIDE_NONE, prim.physBottom, prim.physTop,
-         0, GR_UNAVAILABLE, WEAK_NONE, 0, "MERGED_CORE " + str.tostring(other.coreId))
+         0, GR_UNAVAILABLE, WEAK_NONE, 0, e.captureEvents ? "MERGED_CORE " + str.tostring(other.coreId) : "")
     true
 
 f_archiveCore(ZoneEngine e, ZoneCfg c, ZoneCore z, string why) =>
@@ -3759,7 +3767,7 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
                         e.splitCount := e.splitCount + 1
                         f_emit(e, f, EV_SPLIT, child.coreId, child.generationId, SIDE_NONE,
                              child.physBottom, child.physTop, 0, GR_UNAVAILABLE, WEAK_NONE, 0,
-                             "SPLIT_FROM " + str.tostring(zp2.coreId))
+                             e.captureEvents ? "SPLIT_FROM " + str.tostring(zp2.coreId) : "")
 
     // Pass 5 : Merge 済み Core を外し、未マッチ Core の存続を判定する
     int n5 = array.size(e.cores)
@@ -4252,7 +4260,7 @@ f_pruneCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
         e.storagePruned   := true
         e.prunedZoneCount := e.prunedZoneCount + removed
         f_emit(e, f, EV_STORAGE_PRUNE, 0, 0, SIDE_NONE, na, na, 0, GR_UNAVAILABLE, WEAK_NONE, 0,
-             "ZONE_PRUNED " + str.tostring(removed))
+             e.captureEvents ? "ZONE_PRUNED " + str.tostring(removed) : "")
     removed
 
 f_categoryMaskText(int mask) =>
@@ -4334,15 +4342,11 @@ f_buildViews(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
             f_pushView(e, c, f, z, SIDE_RESISTANCE)
     array.size(e.views)
 
-// @function   Zone Engine v2 を確定 Base TF (5分) 足 1 本ぶん更新する。
-//             ★ 確定足 1 本につき 1 回だけ呼ぶこと ★
-//             同じ baseOpenTime / baseSeq を二度渡しても状態は更新されない。
-//             config が不正なら状態を更新せず、理由を engine.configError へ残す。
-// @param e    ZoneEngine (var 宣言した永続状態)
-// @param c    ZoneCfg
-// @param f    ZoneFeed
-// @returns    int  読み出し可能な ZoneView の件数
-export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+//  ★ update() / updateVisualLite() の共通本体。
+//    buildProjection / captureEvents 以外の処理と順序は Version 3 と 1 行も変わらない。
+f_updateCore(ZoneEngine e, ZoneCfg c, ZoneFeed f, bool buildProjection, bool captureEvents) =>
+    //  表示専用フラグを先に反映する (f_emit が参照する)
+    e.captureEvents := captureEvents
     //  ★ Phase3A : ZoneCfg は呼び出し側で初回に確定させる前提なので、
     //    validateCfg() は最初の update だけ実行する。
     //    (input を変えると TradingView がスクリプト全体を再計算し、Engine も
@@ -4428,8 +4432,50 @@ export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
         e.lastBaseSeq   := f.baseSeq
         e.processedBars := e.processedBars + 1
 
-        f_buildViews(e, c, f)
+        //  ★ 表示専用 : ZoneView は「表示する足」だけで作る。
+        //    e.views は Engine 内部の判定から一切読まれない (読み出しは
+        //    viewCount() / viewAt() だけ) ので、作らなくても判定結果は変わらない。
+        //    rootSummary / categorySummary の文字列生成も f_pushView() の中なので
+        //    ここを飛ばせば同時に消える。
+        if buildProjection
+            f_buildViews(e, c, f)
+        else
+            array.clear(e.views)
+        true
     array.size(e.views)
+
+// @function   Zone Engine v2 を確定 Base TF (5分) 足 1 本ぶん更新する。
+//             ★ 確定足 1 本につき 1 回だけ呼ぶこと ★
+//             従来とまったく同じ。ZoneView と ZoneEvent を常に作る。
+// @param e    ZoneEngine (var で保持)
+// @param c    ZoneCfg
+// @param f    ZoneFeed (確定足の入力一式)
+// @returns    読み出せる ZoneView の件数
+export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    f_updateCore(e, c, f, true, true)
+
+// @function   表示専用の軽量更新経路。Zone の判定は update() と完全に同じで、
+//             「表示のためにしか使わないもの」を作るかどうかを呼び出し側が決める。
+//             過去履歴の足では両方 false 、表示する足でだけ true にすると、
+//             Root 生成 / クラスタリング / Merge / Split / Touch / Break / Flip /
+//             Grade / Core ID / Generation ID は一切変わらずに表示分の重さだけが消える。
+//
+//             ★ これが安全な理由 ★
+//               e.views  : 書くのは f_pushView() だけ、読むのは viewCount() / viewAt() だけ。
+//               e.events : 書くのは f_emit() だけ、読むのは eventCount() / eventAt() だけ。
+//               どちらも Engine 内部の判定から読まれていない。
+//
+//             ★ 履歴本数は削らない。全足で Root / Core / Touch / Generation の
+//               履歴は従来どおり積み上がる。
+// @param e                ZoneEngine (var で保持)
+// @param c                ZoneCfg
+// @param f                ZoneFeed (確定足の入力一式)
+// @param buildProjection  true のときだけ ZoneView と表示文字列を作る
+// @param captureEvents    true のときだけ ZoneEvent を e.events へ溜める
+// @returns                読み出せる ZoneView の件数 (buildProjection = false なら 0)
+export updateVisualLite(ZoneEngine e, ZoneCfg c, ZoneFeed f,
+     bool buildProjection, bool captureEvents) =>
+    f_updateCore(e, c, f, buildProjection, captureEvents)
 
 // ============================================================================
 // 10. READ-ONLY API

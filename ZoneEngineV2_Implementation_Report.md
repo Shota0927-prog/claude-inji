@@ -912,7 +912,84 @@ tie-break の変更 / Touch・Weak・Break・Flip・Reclaim のタイミング�
 FVG Fresh・Inverse・方向の変更 / Accum 条件の変更 — いずれも行っていない。
 本番 Harness (`ZoneEngineV2_VisualHarness.pine`) に `calc_bars_count` は無い。
 
+### Phase 3D : 表示専用の軽量更新経路 (実装済み)
+
+RE10110 の残る重さは「全履歴 × 1 足あたりの処理量」で、request 統合と
+配列再利用だけでは主処理量が減らない。そこで **表示のためにしか使わないもの**
+を「表示する足」だけで作る経路を追加した。
+
+#### 追加した API (既存 `update()` はそのまま残してある)
+
+```
+export updateVisualLite(ZoneEngine e, ZoneCfg c, ZoneFeed f,
+     bool buildProjection, bool captureEvents)
+```
+
+- `update(e, c, f)` = `f_updateCore(e, c, f, true, true)` — 従来と完全に同じ。
+- `updateVisualLite()` は同じ `f_updateCore()` へ渡すだけ。
+- `f_updateCore()` の中身は旧 `update()` の本体と diff を取って次の 2 箇所のだけ違い。
+  1. 先頭で `e.captureEvents := captureEvents`
+  2. 末尾の `f_buildViews(e, c, f)` を `if buildProjection` で囲んだ (else は `array.clear(e.views)`)
+
+#### 過去履歴の足で作らないもの
+
+| やめたもの | 場所 |
+|---|---|
+| ZoneView の生成 | `f_buildViews()` → `f_pushView()` |
+| `rootSummary` / `categorySummary` の文字列生成 | `f_pushView()` の中 (上を飛ばせば同時に消える) |
+| ZoneEvent オブジェクトの生成と保存 | `f_emit()` の `array.push` を `e.captureEvents` で gate |
+| Event の `info` 文字列連結 (4 箇所) | `e.captureEvents ? ... : ""` (v6 の三項演算子は遅延評価) |
+| Event ログ配列への格納 | Harness 側 : `lastWantEvents` で gate |
+| 表示文字列・描画・テーブル | 従来どおり `needRedraw` (= `barstate.islast` 必須) の下だけ |
+
+#### Projection / Event を作る足
+
+```
+bool wantProjection = barstate.islastconfirmedhistory or (barstate.islast and barstate.isconfirmed)
+bool wantEvents     = wantProjection or fullHistoryEvents
+```
+
+`fullHistoryEvents` は新規 input (既定 OFF)。ON にすると全確定足で ZoneEvent を
+作って過去分も Event log へ溜められる (その分重い)。ON / OFF どちらでも
+Zone の判定・Root・Core ID・Generation ID・Touch・Grade は変わらない。
+
+#### これが安全な根拠 (指示 6 の確認)
+
+`e.views` と `e.events` は Engine 内部の判定から一切読まれていない。全参照箇所を列挙して確認済み。
+
+| 配列 | 書く場所 | 読む場所 | 判定で使っているか |
+|---|---|---|---|
+| `e.events` | `f_emit()` の push / 足頭の `array.clear` | `eventCount()` / `eventAt()` / `f_emit()` の戻り値 | 使っていない |
+| `e.views` | `f_pushView()` の push / `f_buildViews()` の `array.clear` | `viewCount()` / `viewAt()` / `update()` の戻り値 | 使っていない |
+
+`f_emit()` の戻り値 (`array.size(e.events)`) を使っている呼び出し側は 14 箇所全部で 0 件。
+`f_pushView()` は `ZoneView` を作って push するだけで、Core / View / Snapshot を書き換えない。
+
+#### 変えていないもの (指示 5)
+
+Root 生成 / 失効、EMA2000 / EMA3000、Swing / Accum / FVG / TimeHL / Psych、
+Candidate 探索条件と最大 12 回、Support / Resistance 判定、Merge / Split、
+Core ID / Generation ID、Touch / Weak / Break / Flip / Reclaim、Grade / Density / High 判定、
+保存上限、Feed 値、`request.security` の `lookahead_off`、Engine の処理順 —
+いずれも 1 行も変えていない。旧 `update()` 本体との diff は上記 2 箇所だけ。
+
+#### 履歴本数の切り分け確認 (本番とは別)
+
+本番 `ZoneEngineV2_VisualHarness.pine` に `calc_bars_count` は入れていない。
+履歴本数が主因かを見るのは `profiler/ZoneEngineV2_VisualHarness_Profiler.pine`
+(本番と同一内容 + `shorttitle` + `calc_bars_count`)。現在 `calc_bars_count = 1000`。
+500 / 1000 / 2000 と変えて、
+
+- 1000 で動き全履歴で落ちる → 主因は履歴本数 × 1 足の処理量
+- 500 でも落ちる → 1 足の処理量そのものが重いので、
+  `f_buildPointSnapshot` / `f_searchDenseBest` / `f_fvgAttachAndStandalone` /
+  `f_pairSides` / `f_rebuildCores` を Profiler で特定してから scratch / プールを追加する
+
 ### Parity Harness (`ZoneEngineV2_ParityHarness.pine`)
+
+★ Phase 3D では対象外。1 行も変更していない。比較コードは本番 Harness へ一切入っていない。
+(Parity Harness は `vA.update()` / `vB.update()` の完全版同じを照らすツールのまま)
+
 
 本番 Harness とは別ファイルの検証専用スクリプト。
 
