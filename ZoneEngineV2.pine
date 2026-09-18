@@ -926,6 +926,10 @@ export type ZoneEngine
     ZoneCand        scBest
     //  ★ Phase3F : CoreCand の originRootIds 重複判定用 (追加ごとの再ソートをなくす)
     map<int, bool>  ccSeen
+    //  ★ Phase4 : FVG Root の 1 足 1 回の索引。e.roots の順で、窓 (dormantDistance) 内の
+    //    CAT_FVG Root の index を保持する。Side に依存するのは適格判定だけなので、
+    //    窓判定と category 判定を Support / Resistance で 2 回やらないようにする。
+    array<int>      fvIdx
     //  ★ Phase3G 実験 : dense 探索の a ごとの best キャッシュ (cfg で OFF なら使わない)
     array<bool>     dsFound
     array<int>      dsC
@@ -1092,6 +1096,7 @@ export newEngine() =>
          scTrial     = f_newScratchCand(),
          scBest      = f_newScratchCand(),
          ccSeen      = map.new<int, bool>(),
+         fvIdx       = array.new_int(),
          dsFound     = array.new_bool(),
          dsC         = array.new_int(),
          dsH         = array.new_int(),
@@ -1494,7 +1499,7 @@ export accumFvgPackV2(simple int rangeLen, simple int baseLen, simple int atrLen
 //    中身は既存の pivotPackV2() / accumPackV2() / fvgPackV2() をそのまま呼んで、
 //    結果を UDT のフィールドへ詰め直すだけで、計算式に一切手を入れていない。
 //  ★ tuple 版 (swingAccumFvgPackV2 / accumFvgPackV2) は互換性のため残してあるが、
-//    Visual Harness / Parity Harness の request.security はこの UDT 版を使う。
+//    Visual Harness の request.security はこの UDT 版を使う。
 
 // @function   同じ時間足の Swing + Accum + FVG を 1 回の request で取る (UDT 版)。
 // @returns    SwingAccumFvgBundle (tuple 要素数 1)
@@ -2834,6 +2839,23 @@ f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
             array.push(e.snPair, r.category == CAT_ACCUM ? f_pairTokenOf(e, r.pairKey) : 0)
     array.size(e.snRootId)
 
+//  ★ Phase4 : FVG Root の索引を 1 足 1 回だけ作る。
+//    抽出条件は Version 3 の f_collectFvgRoots() のうち **Side に依存しない部分** だけ、
+//    すなわち「現在価格から NativeRange までの距離 <= dormantDistance」と
+//    「category == CAT_FVG」。Side ごとの f_rootEligibleForSide() は従来どおり
+//    f_collectFvgRoots() の中で行うので、集合と push 順は完全に同じ。
+f_buildFvgIndex(ZoneEngine e, ZoneCfg c, float refClose) =>
+    array.clear(e.fvIdx)
+    int n = array.size(e.roots)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = array.get(e.roots, i)
+            if r.category == CAT_FVG
+                float d = na(refClose) ? 0.0 : f_distanceToRangeRaw(refClose, r.nativeBottom, r.nativeTop)
+                if nz(d, 0.0) <= c.dormantDistance
+                    array.push(e.fvIdx, i)
+    array.size(e.fvIdx)
+
 //  窓に入っている Accum Root の pair token 一覧 (e.scAccTok / e.scAccTf) に対する
 //  O(窓内 Accum 数) の衝突判定。Version 3 の f_accumPairConflict() は
 //  「同じ pairKey を持つ別 Root が窓にいるか」を見ていたので、判定結果は同じ。
@@ -3317,14 +3339,16 @@ f_materializeBest(ZoneEngine e, ZoneCfg c, int side) =>
 //  ・同方向 FVG 同士が実際に重なる   : 共通区間
 //  ・同方向でも非重複なら距離 M 以内だけでは結合しない
 //  ・Broad FVG は複数の局所 Zone へ共有可 (共有だけでは候補同士を結合しない)
+//  ★ Phase4 : 全 Root 走査をやめ、f_buildFvgIndex() が作った索引を使う。
+//    索引は e.roots の順なので push 順は従来と同じ、最後の sort も従来と同じ。
+//    Side に依存する f_rootEligibleForSide() はここで従来どおり呼ぶ。
 f_collectFvgRoots(ZoneEngine e, ZoneCfg c, int side, float refClose, array<int> out) =>
     array.clear(out)
-    int n = array.size(e.roots)
-    if n > 0
-        for i = 0 to n - 1
-            Root r = array.get(e.roots, i)
-            float d = na(refClose) ? 0.0 : f_distanceToRangeRaw(refClose, r.nativeBottom, r.nativeTop)
-            if nz(d, 0.0) <= c.dormantDistance and r.category == CAT_FVG and f_rootEligibleForSide(c, r, side)
+    int m = array.size(e.fvIdx)
+    if m > 0
+        for k = 0 to m - 1
+            Root r = array.get(e.roots, array.get(e.fvIdx, k))
+            if f_rootEligibleForSide(c, r, side)
                 array.push(out, r.rootId)
     array.sort(out, order.ascending)
     array.size(out)
@@ -4108,6 +4132,8 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     //  ★ Phase3B : 点 Root の収集とソートは Side に依存しないので 1 回だけ作り、
     //    Support / Resistance で共有する (順序は Version 3 と同一)。
     f_buildPointSnapshot(e, c, f.baseClose)
+    //  ★ Phase4 : FVG の窓判定を Side ごとに 2 回やらない (1 足 1 回)
+    f_buildFvgIndex(e, c, f.baseClose)
     //  ★ Phase3E : Support 候補 / Resistance 候補 / CoreCand の入れ物と、
     //    rUsed / coreToCand / coreMerged / candPrimary を Engine のプールで使い回す。
     //    長さ・初期値・使い方は従来と同じで、確保の回数だけが減る。

@@ -15,7 +15,6 @@
 | `ZoneEngineV2_VisualHarness_FULL.pine` | Pine v6 indicator (**本番**) | 1189 | 全履歴。`calc_bars_count` なし。これが原本。 |
 | `ZoneEngineV2_VisualHarness_SAFE.pine` | Pine v6 indicator (検証用 / 自動生成) | 1215 | FULL から `tools/sync_harness.py` で生成。`calc_bars_count` だけ違う。 |
 | `tools/sync_harness.py` | 生成スクリプト | - | SAFE を FULL から作る。`python3 tools/sync_harness.py <本数>` |
-| `ZoneEngineV2_ParityHarness.pine` | Pine v6 indicator (検証専用) | 715 | Version 3 と新版を照らす。**Phase 3D 以降は対象外 / 未変更**。 |
 | `baseline/*.pine` | Pine v6 (A/B 用) | - | 最適化前 (commit `d528a1e`) の控え。 |
 | `ZoneEngineV2_Implementation_Report.md` | ドキュメント | - | 本書。 |
 
@@ -287,7 +286,6 @@ Visual Harness / Parity Harness / profiler コピーの `request.security` か�
 | ファイル | UDT 化前 | UDT 化後 | 上限 127 |
 |---|---:|---:|---|
 | `ZoneEngineV2_VisualHarness.pine` | 192 | **104** | OK |
-| `ZoneEngineV2_ParityHarness.pine` | 163 | **95** | OK |
 | `profiler/...Profiler.pine` (本番と同一) | 192 | **104** | OK |
 
 Visual Harness の内訳 (ソース上の全分岐の合算)
@@ -872,7 +870,6 @@ snapshot 配列 (`snRootId` / `snPrice` / `snCat` / `snTf` / `snDir` / `snPair` 
 | 公開 API | `export` 行を Version 3 と diff して完全一致 (新規 2 関数の追加のみ) |
 | イベント | 生成箇所・順番未変更。Harness 側で文字列化を遅らせただけ |
 
-実機での照らし合わせは `ZoneEngineV2_ParityHarness.pine` で行う (下記)。
 
 #### 10. 意図的に残したボトルネック
 
@@ -904,7 +901,6 @@ import sekine3310/ZoneEngineV2/4 as zn2          // ← ★ Publish 後の実番
 - 今回は新 API (`swingAccumFvgPackV2` / `accumFvgPackV2`) を使うため、`/3` のままだと
   関数が見つからずコンパイルできない。
 - `profiler/ZoneEngineV2_VisualHarness_Profiler.pine` と
-  `ZoneEngineV2_ParityHarness.pine` (vB 側) にも同じ番号を入れる。
   Parity Harness の vB は仮置き (`/4`) のままなので必ず確認して直すこと。
 
 #### Phase 3B / 3C で入れていないもの (禁止事項の確認)
@@ -1197,34 +1193,8 @@ topology dirty / cache を入れても 1 度も skip できず、fingerprint 計
 
 指示 3 は新規作業なしで完了している。
 
-### Parity Harness (`ZoneEngineV2_ParityHarness.pine`)
-
-★ Phase 3D では対象外。1 行も変更していない。比較コードは本番 Harness へ一切入っていない。
-(Parity Harness は `vA.update()` / `vB.update()` の完全版同じを照らすツールのまま)
-
-
-本番 Harness とは別ファイルの検証専用スクリプト。
-
-- 公開済み Version 3 を `vA`、Phase 3B/3C 版を `vB` として **同時に import** する。
-- ZoneCfg を 2 つ同じ値で作り、`vA` の個別 Pack から取った **まったく同じ値** を両方へ流す。
-  これにより違いが出たときは Engine 内部の違いと断定できる。
-- 毎確定 5分足で照らす項目 : `processedBars` / `configValid` / `configError` /
-  Root ・ Core ・ View ・ Event ・ 終了世代の件数 /
-  ZoneView の全フィールド (ID / Phase / Grade / C / H / Density / Touch 番号 /
-  Fresh / WeakReason / MaxDepth / FVG 方向・件数・状態 mask / Pending / Snapshot 範囲 /
-  物理範囲 / Flip 試行回数 / 表示文字列) /
-  RootDebugView の全フィールド + `rootLabelMaskAt()` / ZoneEvent の全フィールド。
-  Merge / Split は coreId ・ generationId の推移と Event で見る。
-- まとめ Pack と個別 Pack の同値性も同じ仕組みで照らす。
-- 違いは **最初の 1 件だけ** 残し、足の時刻 / 項目名 / Version 3 の値 / 新版の値を表へ出す。
-  プロットにも 0 (一致) / 1 (不一致) を出す。
-- このファイルにだけ `calc_bars_count` がある。目的は「2 つの Engine を同じ本数だけ回して
-  照らす」ことで、本番の RE10110 を退けるためのものではない。本番 Harness には入れていない。
-- 比較コストはこのファイルの中だけで、本番 Harness は 1 行も背負っていない。
-
 ### 同値検証 (未実施)
 
-★ Phase 3B/3C 分の照らし合わせは `ZoneEngineV2_ParityHarness.pine` を使う。
 人間が目で表を見比べる必要は無く、差が 1 件でもあれば "DIFF FOUND" とその場所が出る。
 手順 : 新版を Publish → Parity Harness の vB import を発行番号へ→ XAUUSD 5分足へ適用。
 
@@ -1250,6 +1220,55 @@ Warmup 本数を決められない (EMA3000 / EMA slope lookback / Pivot 確認�
 `feedFvg()` / `update()` と、読み出しの `eventCount()` / `eventAt()` / `viewCount()` / `viewAt()` だけで、
 描画・テーブル・Event Log・Root Debug は Harness 側にしか無い。
 Alert 条件は今回決めない (指示どおり)。
+
+## Phase 4 : 一括軽量化の実施状況
+
+### 実施したもの
+
+| 項目 | 内容 |
+|---|---|
+| Parity Harness の廃止 | `ZoneEngineV2_ParityHarness.pine` を削除。参照も全削除。Harness の Engine import は FULL / SAFE とも **1 つだけ** (検査済み) |
+| FVG 索引 (項目 6) | `f_buildFvgIndex()` を 1 足 1 回。従来 `f_collectFvgRoots()` が Side ごとに全 Root を走査していた (2 回/足) のを 1 回へ。距離計算も 1 回へ |
+| BarContext (項目 1) の既存部分 | 点 Root snapshot (`snRootId` / `snIdx` / `snPrice` / `snCat` / `snTf` / `snTfMask` / `snDir` / `snConfirm` / `snOrigin` / `snLabel` / `snPair`) は 1 足 1 回。FVG 索引をここへ追加 |
+| インデックスの mutation gateway (項目 2) | Root の追加 / 削除 / retire は `f_pushRoot()` / `f_removeRootAt()` / `f_retireRoot()` の 3 つだけを通る。`rootIdx` / `originKeyMap` / `psychKeyMap` / `pairTokenMap` / cap dirty をここで維持 |
+| Candidate 一括化 (項目 4) | 1 つの snapshot から Dense / Sweep / FVG attach / standalone を作る構造は Phase 3B で完了。nested loop 内の `array.new` / `array.copy` は 0 (機械的に確認済み) |
+| Dense 事前計算 (項目 5) | 価格 / category mask / Accum token / side 適格 / 窓の終了 index は snapshot と `dsEnd` で事前計算済み |
+| Visual Harness (項目 9) | Engine import 1 つ / 描画・テーブル・Event 文字列は `needRedraw` (= `barstate.islast` 必須) と `show*` の両方が true のときだけ / 過去足では Projection も Event も作らない (Phase 3D) / 描画配列は persistent pool |
+
+### 項目 3 (dirty 統合による topology 再構築の省略) を入れていない理由
+
+指示の dirty 条件には「Root の価格・range 変更」が含まれている。
+`f_upsertMa()` は毎確定足で EMA2000 / EMA3000 Root の
+
+```
+r.pointPrice    := price          // 1分足 EMA の値 → ほぼ毎足動く
+r.confirmedTime := f.maConfirmTime // 1分足 time_close[1] → 必ず毎足進む
+```
+
+を書き換える。`pointPrice` は窓判定 / 並び / Candidate の bottom・top / Density /
+`f_qualityMa` に、`confirmedTime` は `firstConfirmTime` (= `f_candBetter()` の tie-break 項) に
+直接入る。よって `useMa = true` (既定、EMA 削除は禁止) の間は **dirty が毎足 true**。
+ゲートを入れても 1 度も skip できず、dirty 判定の分だけ FULL が遅くなる。
+
+これは実装の良し悪しではなく、**指示された dirty 条件をそのまま適用した結果**。
+これを回避するには EMA Root を dirty 判定から外すしかなく、それは
+「価格が変わっても再構築しない」= 結果が変わる可能性のある skip になるので行わない。
+
+### 項目 7 (Core 再構築の条件実行) を入れていない理由
+
+上と同じ。加えて、`f_rebuildCores()` の Pass 1〜4 は `ZoneCore` の phase /
+physRange / pendingTopology / pendingGeneration / breakSnap を読むが、それらは毎足
+`f_rebuildCores()` の前に走る `f_processSide()` / `f_processBreakState()` /
+`f_generationSwitch()` が書き換える。
+
+### 残っている支配項 (Profiler の数値がないと次を決められない)
+
+| 箇所 | 計算量 | 削るには |
+|---|---|---|
+| `f_searchDenseBest()` × 12 × 2 side | `12 · O(n · k)` | Phase 3G (既定 OFF。A/B 後に ON) |
+| `f_fvgAttachAndStandalone()` | `O(fvg · cand)` | 試行を減らす = attach 順変更になるため不可 |
+| `f_rebuildCores()` Pass 1 / 2 / 4 | `O(cores · cands)` | 価格帯索引で `nearOk` が偽の組を事前除外 (未実装 / 要計測) |
+| `f_pairSides()` | `O(sup · res)` | 同上 |
 
 ## Known limitations
 
