@@ -225,17 +225,18 @@ f_eqT(float a, float b, float mintick) =>
     na(a) or na(b) ? false : f_tickOf(a, mintick) == f_tickOf(b, mintick)
 
 // ---- 中央値 (加重しない。仕様 5.6) ----------------------------------------
-f_median(array<float> src) =>
+//  ★ Phase3C : 渡された配列をそのまま sort して中央値を返す (コピーを作らない)。
+//    scratch 配列にだけ使うこと。値の選び方は Version 3 の f_median() と完全に同じ。
+f_medianInPlace(array<float> a) =>
     float r = na
-    int n = array.size(src)
+    int n = array.size(a)
     if n > 0
-        array<float> s = array.copy(src)
-        array.sort(s, order.ascending)
+        array.sort(a, order.ascending)
         int h = int(math.floor(n / 2))
         if n % 2 == 1
-            r := array.get(s, h)
+            r := array.get(a, h)
         else
-            r := (array.get(s, h - 1) + array.get(s, h)) / 2
+            r := (array.get(a, h - 1) + array.get(a, h)) / 2
     r
 
 f_clamp(float v, float lo, float hi) =>
@@ -258,6 +259,54 @@ f_distanceToRangeRaw(float price, float bot, float top) =>
     if not na(price) and not na(bot) and not na(top)
         d := price < bot ? bot - price : price > top ? price - top : 0.0
     d
+
+// ---- ソート済み Root ID 配列の two-pointer 比較 ----------------------------
+//  rootIds / originRootIds は「意味のある順序」を保つため sort しない。
+//  比較専用に作った昇順コピー同士を突き合わせる。重複が無い配列なので
+//  結果は array.includes() の入れ子と完全に同じ件数になる。
+f_sortedCopy(array<int> src, array<int> dst) =>
+    array.clear(dst)
+    int n = array.size(src)
+    if n > 0
+        for i = 0 to n - 1
+            array.push(dst, array.get(src, i))
+        array.sort(dst, order.ascending)
+    array.size(dst)
+
+f_sharedSorted(array<int> a, array<int> b) =>
+    int i = 0
+    int j = 0
+    int cnt = 0
+    int na1 = array.size(a)
+    int nb1 = array.size(b)
+    while i < na1 and j < nb1
+        int x = array.get(a, i)
+        int y = array.get(b, j)
+        if x == y
+            cnt := cnt + 1
+            i := i + 1
+            j := j + 1
+        else if x < y
+            i := i + 1
+        else
+            j := j + 1
+    cnt
+
+f_containsSorted(array<int> a, int v) =>
+    bool found = false
+    int lo = 0
+    int hi = array.size(a) - 1
+    while lo <= hi
+        int mid = int(math.floor((lo + hi) / 2))
+        int x = array.get(a, mid)
+        if x == v
+            found := true
+            break
+        else if x < v
+            lo := mid + 1
+        else
+            hi := mid - 1
+    found
 
 // ---- inclusive intersection 判定 ------------------------------------------
 f_rangesTouch(float aBot, float aTop, float bBot, float bTop, float mintick) =>
@@ -527,6 +576,8 @@ export type SideHistory
 // ---- 2.9 SideViewState -----------------------------------------------------
 export type SideViewState
     array<int> rootIds
+    //  ★ Phase3B : 比較専用の Root ID 昇順コピー (表示・保存用の rootIds 順は変えない)
+    array<int> rootIdsSorted
     float  effectiveBottom  = na
     float  effectiveTop     = na
     float  referencePrice   = na
@@ -551,6 +602,8 @@ export type ZoneCore
     int    coreId        = 0
     int    generationId  = 0
     array<int> originRootIds
+    //  ★ Phase3B : 比較専用の Root ID 昇順コピー (originRootIds の順序は不変)
+    array<int> originRootIdsSorted
     SideViewState supportView
     SideViewState resistanceView
     bool   zoneFresh     = true
@@ -669,6 +722,12 @@ type ZoneCand
     //  ★ Phase3A : 同一性判定用 Root ID 一覧 (Broad FVG 除外規則は f_identityIds のまま)。
     //    候補が確定・保存される時点で 1 度だけ作り、f_pairSides で使い回す。
     array<int>  identityIds
+    //  ★ Phase3B : two-pointer 比較専用の昇順コピー (元の順序は上の 2 本が保持する)
+    array<int>  rootIdsSorted
+    array<int>  identitySorted
+    array<int>  nonFvgIdentitySorted
+    //  ★ Phase3C : この候補に含まれる FVG Root ID (attach 試行の品質判定用)
+    array<int>  fvgIds
     float  bottom        = na
     float  top           = na
     float  refPrice      = na
@@ -691,6 +750,7 @@ type CoreCand
     int    supIdx        = -1
     int    resIdx        = -1
     array<int> originRootIds
+    array<int> originRootIdsSorted
     float  bottom        = na
     float  top           = na
     int    matchedCoreIdx = -1
@@ -756,6 +816,51 @@ export type ZoneEngine
     int    pendingGenerationCount = 0
     int    mergeCount    = 0
     int    splitCount    = 0
+    // ------------------------------------------------------------------
+    //  ★ Phase3B/3C : 高速化のための索引・dirty・scratch ★
+    //    ここから下は「判定結果を変えないための道具」だけ。Zone の意味を持つ
+    //    状態 (Root / Core / View / Snapshot / Event) は一切含まない。
+    //    scratch 配列は 1 回の update() の中でしか使わず、永続オブジェクトへ
+    //    参照を渡さない (保存時は必ず deep copy する)。
+    // ------------------------------------------------------------------
+    //  key -> ID 索引 (毎足の線形探索をなくす)
+    map<string, int> originKeyMap    // Root.originKey -> rootId
+    map<int, int>    psychKeyMap     // 心理価格 tick   -> rootId
+    map<string, int> pairTokenMap    // Accum pairKey   -> 整数 pair token
+    int    pairTokenSeq  = 0
+    //  保存整理の dirty (毎足の全走査をやめる)
+    bool   retiredDirty  = false
+    bool   capDirtySwing = true
+    bool   capDirtyAccum = true
+    bool   capDirtyFvg   = true
+    bool   capDirtyTime  = true
+    //  点 Root スナップショット (Support / Resistance で共有。価格昇順 / 同値は Root ID 昇順)
+    array<int>   snRootId
+    array<int>   snIdx
+    array<float> snPrice
+    array<int>   snCat
+    array<int>   snTf
+    array<int>   snTfMask
+    array<int>   snDir
+    array<int>   snConfirm
+    array<int>   snOrigin
+    array<int>   snLabel
+    array<int>   snPair
+    //  クラスタリング作業用 scratch
+    array<float> scRawPrice
+    array<int>   scRawIdx
+    array<bool>  scUsed
+    array<int>   scWinIdx
+    array<int>   scBestIdx
+    array<int>   scCurIds
+    array<int>   scAccTok
+    array<int>   scAccTf
+    array<int>   scIdTmp
+    array<float> scMedian
+    array<float> scCatPrices
+    array<int>   scFvgIds
+    array<int>   scStandIds
+    array<bool>  scStandUsed
 
 // ============================================================================
 // 03. FACTORIES / CONFIG VALIDATION
@@ -776,7 +881,7 @@ f_newBreakSnap() =>
     BreakSnapshot.new(valid = false, rootIds = array.new_int())
 
 f_newSideView(int side) =>
-    SideViewState.new(rootIds = array.new_int(), density = DEN_NORMAL,
+    SideViewState.new(rootIds = array.new_int(), rootIdsSorted = array.new_int(), density = DEN_NORMAL,
          history = f_newHistory(), touchSnapshot = f_newSnapshot())
 
 // @function  Zone Engine v2 の永続状態を作る。Harness / Main で var 宣言すること。
@@ -791,6 +896,34 @@ export newEngine() =>
          psychPrices = array.new_float(),
          psychRootIds = array.new_int(),
          rootIdx    = map.new<int, int>(),
+         originKeyMap = map.new<string, int>(),
+         psychKeyMap  = map.new<int, int>(),
+         pairTokenMap = map.new<string, int>(),
+         snRootId  = array.new_int(),
+         snIdx     = array.new_int(),
+         snPrice   = array.new_float(),
+         snCat     = array.new_int(),
+         snTf      = array.new_int(),
+         snTfMask  = array.new_int(),
+         snDir     = array.new_int(),
+         snConfirm = array.new_int(),
+         snOrigin  = array.new_int(),
+         snLabel   = array.new_int(),
+         snPair    = array.new_int(),
+         scRawPrice = array.new_float(),
+         scRawIdx   = array.new_int(),
+         scUsed     = array.new_bool(),
+         scWinIdx   = array.new_int(),
+         scBestIdx  = array.new_int(),
+         scCurIds   = array.new_int(),
+         scAccTok   = array.new_int(),
+         scAccTf    = array.new_int(),
+         scIdTmp    = array.new_int(),
+         scMedian   = array.new_float(),
+         scCatPrices = array.new_float(),
+         scFvgIds   = array.new_int(),
+         scStandIds = array.new_int(),
+         scStandUsed = array.new_bool(),
          rootSeq    = RID_FIXED_MAX)
 
 // @function  空の ZoneFeed を作る。配列フィールドが確保済みになる。
@@ -1052,7 +1185,9 @@ f_accumCondV2(simple int rangeLen, simple int baseLen, simple int atrLen,
     float endMid   = (open + close) * 0.5
     float drift    = math.abs(endMid - startMid)
 
-    float rangeShort = ta.highest(bodyTop, rangeLen) - ta.lowest(bodyBot, rangeLen)
+    //  ★ Phase3C : rangeShort は rangeHigh - rangeLow (= rangeNow) と同じ計算なので、
+    //    ta.highest / ta.lowest を呼び直さず確定済みの値を使う (値は同一)。
+    float rangeShort = rangeNow
     float rangeBase  = ta.highest(bodyTop, baseLen)  - ta.lowest(bodyBot, baseLen)
 
     bool condAtr      = not na(atrv) and atrv > 0 and rangeNow <= atrv * atrMult
@@ -1209,21 +1344,47 @@ f_rootIdxById(ZoneEngine e, int id) =>
 f_pushRoot(ZoneEngine e, Root r) =>
     array.push(e.roots, r)
     e.rootIdxDirty := true
+    //  ★ Phase3C : originKey -> rootId 索引を同時に維持する (毎足の線形探索をなくす)
+    if r.originKey != ""
+        map.put(e.originKeyMap, r.originKey, r.rootId)
+    //  ★ Phase3C : 上限チェックが必要になるのは「そのカテゴリへ足したとき」だけ
+    if r.category == CAT_SWING
+        e.capDirtySwing := true
+    else if r.category == CAT_ACCUM
+        e.capDirtyAccum := true
+    else if r.category == CAT_FVG
+        e.capDirtyFvg := true
+    else if r.category == CAT_TIME_HL
+        e.capDirtyTime := true
     array.size(e.roots)
 
 f_removeRootAt(ZoneEngine e, int i) =>
     Root r = array.remove(e.roots, i)
     e.rootIdxDirty := true
+    if r.originKey != ""
+        if map.contains(e.originKeyMap, r.originKey)
+            if map.get(e.originKeyMap, r.originKey) == r.rootId
+                map.remove(e.originKeyMap, r.originKey)
     r
 
+//  ★ Phase3C : Root を Retired にする唯一の入口。ここでだけ retiredDirty を立てる。
+f_retireRoot(ZoneEngine e, Root r) =>
+    r.state := ROOT_RETIRED
+    e.retiredDirty := true
+    true
+
+//  ★ Phase3C : originKey -> rootId の索引で引く。
+//    索引は f_pushRoot() / f_removeRootAt() でしか変えないので、e.roots に
+//    存在する originKey は必ず載っている (= Version 3 の線形探索と同じ結果)。
+//    見つけた Root の originKey を必ず照合してから index を返す。
 f_rootIdxByKey(ZoneEngine e, string key) =>
     int idx = -1
-    int n = array.size(e.roots)
-    if n > 0
-        for i = 0 to n - 1
+    if map.contains(e.originKeyMap, key)
+        int rid = map.get(e.originKeyMap, key)
+        int i = f_rootIdxById(e, rid)
+        if i >= 0
             if array.get(e.roots, i).originKey == key
                 idx := i
-                break
     idx
 
 f_rootActive(Root r) =>
@@ -1233,7 +1394,7 @@ f_retireRootById(ZoneEngine e, int id) =>
     int i = f_rootIdxById(e, id)
     if i >= 0
         Root rr = array.get(e.roots, i)
-        rr.state := ROOT_RETIRED
+        f_retireRoot(e, rr)
     i >= 0
 
 // ---- 5.1 MA ----------------------------------------------------------------
@@ -1245,7 +1406,7 @@ f_upsertMa(ZoneEngine e, ZoneCfg c, ZoneFeed f, int rid, int sub, float price, i
     if na(price)
         if i >= 0
             Root rm = array.get(e.roots, i)
-            rm.state := ROOT_RETIRED
+            f_retireRoot(e, rm)
     else
         if i < 0
             f_pushRoot(e, Root.new(rootId = rid, originKey = sub == SUB_EMA1 ? "MA:EMA1" : "MA:EMA2",
@@ -1500,7 +1661,7 @@ f_releaseTimeRoot(ZoneEngine e, int rid, int periodKind, bool isCurrent) =>
             if f_maskHas(r.labelMask, bit)
                 r.labelMask := r.labelMask - f_pow2(bit)
             if f_timeLabelRemaining(r.labelMask) == 0
-                r.state := ROOT_RETIRED
+                f_retireRoot(e, r)
     true
 
 f_moveTimeRootToPrev(ZoneEngine e, int rid, int periodKind) =>
@@ -1567,7 +1728,7 @@ f_updateTimeHlRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
             for i = 0 to n - 1
                 Root rt = array.get(e.roots, i)
                 if rt.category == CAT_TIME_HL
-                    rt.state := ROOT_RETIRED
+                    f_retireRoot(e, rt)
     else
         // ---- セッション ----
         if na(e.curSessionId) or f.sessionId != e.curSessionId
@@ -1642,7 +1803,9 @@ f_updateTimeHlRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
 // ---- 5.7 心理価格 ----------------------------------------------------------
 //  無限に事前生成しない。非心理 Root の周辺 M 以内に存在する 50 ドル刻みだけ合成する。
 //  100 ドル倍数は Major 1 Root だけ (同じ価格に Standard を重複生成しない)。
-f_psychNeedPush(array<float> need, ZoneCfg c, float price) =>
+//  ★ Phase3C : 必要価格の重複判定を正規化 tick の map で行う (push 順は不変)。
+//    seen は 1 回の f_syncPsychRoots() の中だけで使う。
+f_psychNeedPush(array<float> need, map<int, bool> seen, ZoneCfg c, float price) =>
     if not na(price)
         float lo = price - c.clusterMaxWidth
         float hi = price + c.clusterMaxWidth
@@ -1651,19 +1814,15 @@ f_psychNeedPush(array<float> need, ZoneCfg c, float price) =>
             float q = start + k * c.psychStdStep
             if f_gtT(q, hi, c.mintick)
                 break
-            bool dup = false
-            int n = array.size(need)
-            if n > 0
-                for i = 0 to n - 1
-                    if f_eqT(array.get(need, i), q, c.mintick)
-                        dup := true
-                        break
-            if not dup
+            int qk = int(f_tickOf(q, c.mintick))
+            if not map.contains(seen, qk)
+                map.put(seen, qk, true)
                 array.push(need, q)
     true
 
 f_syncPsychRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     array<float> need = array.new_float()
+    map<int, bool> seen = map.new<int, bool>()
     if c.usePsych
         int rn = array.size(e.roots)
         if rn > 0
@@ -1674,10 +1833,10 @@ f_syncPsychRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
                      : (na(f.baseClose) or na(r.pointPrice) ? 0.0 : math.abs(r.pointPrice - f.baseClose))
                 if r.category != CAT_PSYCH and f_rootActive(r) and nz(dRef, 0.0) <= c.dormantDistance
                     if r.isRangeRoot
-                        f_psychNeedPush(need, c, r.nativeBottom)
-                        f_psychNeedPush(need, c, r.nativeTop)
+                        f_psychNeedPush(need, seen, c, r.nativeBottom)
+                        f_psychNeedPush(need, seen, c, r.nativeTop)
                     else
-                        f_psychNeedPush(need, c, r.pointPrice)
+                        f_psychNeedPush(need, seen, c, r.pointPrice)
     // 既存レジストリのうち不要になったものを外す
     int pn = array.size(e.psychPrices)
     if pn > 0
@@ -1685,31 +1844,21 @@ f_syncPsychRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
             if i < array.size(e.psychPrices)
                 float p   = array.get(e.psychPrices, i)
                 int   rid = array.get(e.psychRootIds, i)
-                bool keep = false
-                int nn = array.size(need)
-                if nn > 0
-                    for k = 0 to nn - 1
-                        if f_eqT(array.get(need, k), p, c.mintick)
-                            keep := true
-                            break
+                bool keep = map.contains(seen, int(f_tickOf(p, c.mintick)))
                 if not keep
                     f_retireRootById(e, rid)
                     array.remove(e.psychPrices, i)
                     array.remove(e.psychRootIds, i)
+                    map.remove(e.psychKeyMap, int(f_tickOf(p, c.mintick)))
     // 必要な価格の Root を用意する (安定 ID)
     int nn2 = array.size(need)
     if nn2 > 0
         for k = 0 to nn2 - 1
             float q = array.get(need, k)
-            int found = -1
-            int cn = array.size(e.psychPrices)
-            if cn > 0
-                for i = 0 to cn - 1
-                    if f_eqT(array.get(e.psychPrices, i), q, c.mintick)
-                        found := i
-                        break
-            if found >= 0
-                int rid = array.get(e.psychRootIds, found)
+            int qk = int(f_tickOf(q, c.mintick))
+            bool found = map.contains(e.psychKeyMap, qk)
+            if found
+                int rid = map.get(e.psychKeyMap, qk)
                 int ri  = f_rootIdxById(e, rid)
                 if ri >= 0
                     Root rr = array.get(e.roots, ri)
@@ -1726,6 +1875,7 @@ f_syncPsychRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
                      isDynamic = true, lastUpdateSeq = f.baseSeq))
                 array.push(e.psychPrices, q)
                 array.push(e.psychRootIds, newId)
+                map.put(e.psychKeyMap, qk, newId)
     true
 
 // ---- 5.8 Root 保存整理 -----------------------------------------------------
@@ -1828,12 +1978,39 @@ f_pruneCategoryToCap(ZoneEngine e, ZoneCfg c, ZoneFeed f, int cat, int cap) =>
             removed := removed + 1
     removed
 
+//  ★ Phase3C : 毎足の全走査をやめ、必要になったときだけ走らせる。
+//    ・Retired 全走査は「Root が Retired になった足」以降だけ
+//    ・件数確認と prune は「そのカテゴリへ Root を足した」以降だけ
+//    ・上限を超えたまま prune できなかった場合は dirty を落とさない
+//      (Version 3 は毎足再挑戦していたので、その挙動を保つ)
+//    削除順・古い順・同時刻時 Root ID 順・protected / essential /
+//    current TimeHL の条件・Accum の pair 単位削除は一切変更していない。
+f_pruneCatIfDirty(ZoneEngine e, ZoneCfg c, ZoneFeed f, int cat, int cap, bool dirty) =>
+    int  rm = 0
+    bool stillDirty = false
+    if dirty
+        rm := f_pruneCategoryToCap(e, c, f, cat, cap)
+        int cnt = cat == CAT_ACCUM ? f_countAccumBoxes(e) : f_countRootsInCategory(e, cat)
+        stillDirty := cnt > cap
+    [rm, stillDirty]
+
 f_pruneRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
-    int removed = f_removeRetiredRoots(e)
-    removed := removed + f_pruneCategoryToCap(e, c, f, CAT_SWING, c.maxSwingRoots)
-    removed := removed + f_pruneCategoryToCap(e, c, f, CAT_ACCUM, c.maxAccumBoxes)
-    removed := removed + f_pruneCategoryToCap(e, c, f, CAT_FVG, c.maxFvgRoots)
-    removed := removed + f_pruneCategoryToCap(e, c, f, CAT_TIME_HL, c.maxTimeRoots)
+    int removed = 0
+    if e.retiredDirty
+        removed := f_removeRetiredRoots(e)
+        e.retiredDirty := false
+    [rmSw, dtSw] = f_pruneCatIfDirty(e, c, f, CAT_SWING, c.maxSwingRoots, e.capDirtySwing)
+    removed := removed + rmSw
+    e.capDirtySwing := dtSw
+    [rmAc, dtAc] = f_pruneCatIfDirty(e, c, f, CAT_ACCUM, c.maxAccumBoxes, e.capDirtyAccum)
+    removed := removed + rmAc
+    e.capDirtyAccum := dtAc
+    [rmFv, dtFv] = f_pruneCatIfDirty(e, c, f, CAT_FVG, c.maxFvgRoots, e.capDirtyFvg)
+    removed := removed + rmFv
+    e.capDirtyFvg := dtFv
+    [rmTl, dtTl] = f_pruneCatIfDirty(e, c, f, CAT_TIME_HL, c.maxTimeRoots, e.capDirtyTime)
+    removed := removed + rmTl
+    e.capDirtyTime := dtTl
     if removed > 0
         e.storagePruned   := true
         e.prunedRootCount := e.prunedRootCount + removed
@@ -2005,8 +2182,10 @@ f_qualityFvg(ZoneEngine e, ZoneCfg c, array<int> ids, bool broadLocalized) =>
 
 // ---- 6.3 ZoneReferencePrice (表示・追跡用。ロジック判定には使わない) ------
 //  加重平均は作らない。各点カテゴリ代表の単純中央値。FVG 50% は使わない。
-f_catPricesMedian(ZoneEngine e, array<int> ids, int cat) =>
-    array<float> ps = array.new_float()
+//  ★ Phase3C : カテゴリごとに配列を作らず、engine の scratch を clear して使い回す。
+//    取り出す価格・除外条件・中央値の取り方は Version 3 と同じ。
+f_catPricesMedianSc(ZoneEngine e, array<int> ids, int cat) =>
+    array.clear(e.scCatPrices)
     int n = array.size(ids)
     if n > 0
         for k = 0 to n - 1
@@ -2014,25 +2193,25 @@ f_catPricesMedian(ZoneEngine e, array<int> ids, int cat) =>
             if i >= 0
                 Root r = array.get(e.roots, i)
                 if r.category == cat and not r.isRangeRoot and not na(r.pointPrice)
-                    array.push(ps, r.pointPrice)
-    array.size(ps) > 0 ? f_median(ps) : float(na)
+                    array.push(e.scCatPrices, r.pointPrice)
+    array.size(e.scCatPrices) > 0 ? f_medianInPlace(e.scCatPrices) : float(na)
 
 f_refPrice(ZoneEngine e, ZoneCfg c, int side, array<int> ids, float bot, float top) =>
-    array<float> reps = array.new_float()
-    float repSwing = f_catPricesMedian(e, ids, CAT_SWING)
-    float repAccum = f_catPricesMedian(e, ids, CAT_ACCUM)
-    float repTime  = f_catPricesMedian(e, ids, CAT_TIME_HL)
-    float repPsych = f_catPricesMedian(e, ids, CAT_PSYCH)
+    array.clear(e.scMedian)
+    float repSwing = f_catPricesMedianSc(e, ids, CAT_SWING)
+    float repAccum = f_catPricesMedianSc(e, ids, CAT_ACCUM)
+    float repTime  = f_catPricesMedianSc(e, ids, CAT_TIME_HL)
+    float repPsych = f_catPricesMedianSc(e, ids, CAT_PSYCH)
     if not na(repSwing)
-        array.push(reps, repSwing)
+        array.push(e.scMedian, repSwing)
     if not na(repAccum)
-        array.push(reps, repAccum)
+        array.push(e.scMedian, repAccum)
     if not na(repTime)
-        array.push(reps, repTime)
+        array.push(e.scMedian, repTime)
     if not na(repPsych)
-        array.push(reps, repPsych)
+        array.push(e.scMedian, repPsych)
     // MA : 他カテゴリ core に近い実 EMA を代表にする (2 本だけなら中間値は表示中心)
-    array<float> maPs = array.new_float()
+    array.clear(e.scCatPrices)
     int n = array.size(ids)
     if n > 0
         for k = 0 to n - 1
@@ -2040,23 +2219,24 @@ f_refPrice(ZoneEngine e, ZoneCfg c, int side, array<int> ids, float bot, float t
             if i >= 0
                 Root r = array.get(e.roots, i)
                 if r.category == CAT_MA and not na(r.pointPrice)
-                    array.push(maPs, r.pointPrice)
-    if array.size(maPs) > 0
+                    array.push(e.scCatPrices, r.pointPrice)
+    if array.size(e.scCatPrices) > 0
         float maRep = na
-        if array.size(reps) > 0
-            float others = f_median(reps)
+        if array.size(e.scMedian) > 0
+            //  中央値は並び順に依存しないので、ここで scMedian が sort されても結果は同じ
+            float others = f_medianInPlace(e.scMedian)
             float bestD  = na
-            for k = 0 to array.size(maPs) - 1
-                float p = array.get(maPs, k)
-                float d = math.abs(p - others)
+            for k = 0 to array.size(e.scCatPrices) - 1
+                float pp = array.get(e.scCatPrices, k)
+                float d = math.abs(pp - others)
                 if na(bestD) or d < bestD
-                    bestD  := d
-                    maRep  := p
+                    bestD := d
+                    maRep := pp
         else
-            maRep := f_median(maPs)
-        array.push(reps, maRep)
+            maRep := f_medianInPlace(e.scCatPrices)
+        array.push(e.scMedian, maRep)
     //  FVG : 内部に点 Root があれば中央値へ入れない。FVG only は接近側 Proximal edge。
-    array.size(reps) > 0 ? f_median(reps) : (side == SIDE_SUPPORT ? top : bot)
+    array.size(e.scMedian) > 0 ? f_medianInPlace(e.scMedian) : (side == SIDE_SUPPORT ? top : bot)
 
 //  ---- 同一性判定用 Root 集合 (7 章の Identity / Merge / Split と共用) ----
 f_isBroadFvgRoot(ZoneEngine e, int rootId) =>
@@ -2084,6 +2264,32 @@ f_identityIds(ZoneEngine e, array<int> ids, array<int> out) =>
                 if not array.includes(out, rid2)
                     array.push(out, rid2)
     array.size(out)
+
+//  ★ Phase3B : 保存用 Candidate の「比較専用ソート済みコピー」を作る。
+//    rootIds / identityIds の元の順序は一切変えない。
+f_finishCandArrays(ZoneEngine e, ZoneCand cd) =>
+    f_sortedCopy(cd.rootIds, cd.rootIdsSorted)
+    f_sortedCopy(cd.identityIds, cd.identitySorted)
+    array.clear(cd.nonFvgIdentitySorted)
+    array.clear(cd.fvgIds)
+    int rn = array.size(cd.rootIds)
+    if rn > 0
+        for k = 0 to rn - 1
+            int rid0 = array.get(cd.rootIds, k)
+            int i0 = f_rootIdxById(e, rid0)
+            if i0 >= 0
+                if array.get(e.roots, i0).category == CAT_FVG
+                    array.push(cd.fvgIds, rid0)
+    int n = array.size(cd.identitySorted)
+    if n > 0
+        for k = 0 to n - 1
+            int rid = array.get(cd.identitySorted, k)
+            int i = f_rootIdxById(e, rid)
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if r.category != CAT_FVG
+                    array.push(cd.nonFvgIdentitySorted, rid)
+    array.size(cd.rootIdsSorted)
 
 // ---- 6.4a 候補スカラーの計算 (探索中の評価用) ------------------------------
 //  ★ Phase3A : 評価だけの候補と、保存する候補を分けた。
@@ -2182,7 +2388,9 @@ f_fillCandFrom(ZoneEngine e, ZoneCfg c, int side, array<int> ids,
 
 //  評価専用の scratch Candidate (rootIds / identityIds は空のまま使う)
 f_newScratchCand() =>
-    ZoneCand.new(rootIds = array.new_int(), identityIds = array.new_int())
+    ZoneCand.new(rootIds = array.new_int(), identityIds = array.new_int(),
+         rootIdsSorted = array.new_int(), identitySorted = array.new_int(),
+         nonFvgIdentitySorted = array.new_int(), fvgIds = array.new_int())
 
 // ---- 6.4b 保存用 Candidate の生成 ------------------------------------------
 //  Base Strong (仕様 6.2 / 指示書 10.3)
@@ -2193,24 +2401,13 @@ f_newScratchCand() =>
 //  ★ 保存される Candidate はここで作る。rootIds と identityIds を必ず自分で所有する。
 f_buildCand(ZoneEngine e, ZoneCfg c, int side, array<int> ids,
      float forcedBottom, float forcedTop, bool forceBroadContext, bool proximalDense) =>
-    ZoneCand cd = ZoneCand.new(side = side, rootIds = array.copy(ids), identityIds = array.new_int())
+    ZoneCand cd = ZoneCand.new(side = side, rootIds = array.copy(ids), identityIds = array.new_int(),
+         rootIdsSorted = array.new_int(), identitySorted = array.new_int(),
+         nonFvgIdentitySorted = array.new_int(), fvgIds = array.new_int())
     f_fillCandFrom(e, c, side, ids, forcedBottom, forcedTop, forceBroadContext, proximalDense, cd)
     f_identityIds(e, cd.rootIds, cd.identityIds)
+    f_finishCandArrays(e, cd)
     cd
-
-//  ★ scratch から保存用 Candidate を作る deep copy。
-//    rootIds は渡された ids から新しい配列として複製し、identityIds も新規に作る。
-//    以後 scratch や ids を clear しても、この Candidate は一切変化しない。
-f_cloneCand(ZoneEngine e, ZoneCand src, array<int> ids) =>
-    ZoneCand o = ZoneCand.new(side = src.side, rootIds = array.copy(ids), identityIds = array.new_int(),
-         catMask = src.catMask, highMask = src.highMask, bottom = src.bottom, top = src.top,
-         refPrice = src.refPrice, cCount = src.cCount, hCount = src.hCount, density = src.density,
-         baseStrong = src.baseStrong, hasNonPsych = src.hasNonPsych, isBroadContext = src.isBroadContext,
-         minRootId = src.minRootId, firstConfirmTime = src.firstConfirmTime, fvgDirMask = src.fvgDirMask,
-         fvgRootCount = src.fvgRootCount, fvgFreshCount = src.fvgFreshCount, fvgStateMask = src.fvgStateMask,
-         selected = src.selected)
-    f_identityIds(e, o.rootIds, o.identityIds)
-    o
 
 //  候補比較 : C 降順 -> H 降順 -> 幅昇順 -> core 成立時刻昇順 -> 最小 Root ID 昇順
 //  (sort の同値結果がバーごとに変わらないよう必ず ID まで tie-break する)
@@ -2231,106 +2428,275 @@ f_candBetter(ZoneCand a, ZoneCand b, ZoneCfg c) =>
             better := a.minRootId < b.minRootId
     better
 
-// ---- 6.5 点 Root の収集とソート (price 昇順 / 同値は Root ID 昇順) --------
-//  ★ クラスタリング対象は現在価格から dormantDistance 以内の Root だけに絞る ★
-//    仕様 14 章の Dormant (現在価格から遠い Zone は計算を休止し履歴は保持する) を
-//    Root 収集の段階で実現している。窓の外の Root を持つ Core は「未マッチ」として
-//    Dormant のまま保持され、価格が戻れば同じ Core ID / 世代 / 消耗履歴で復帰する。
-f_collectPointRoots(ZoneEngine e, ZoneCfg c, int side, float refClose, array<int> outIds, array<float> outPrices) =>
-    array.clear(outIds)
-    array.clear(outPrices)
+// ---- 6.5 点 Root スナップショット (Support / Resistance で共有) -----------
+//  ★ Phase3B ★
+//  非 FVG Root の参加資格は Side に依存しない (f_rootEligibleForSide() の
+//  非 FVG 分岐は state == ROOT_ACTIVE だけ) ので、収集とソートは 1 回で足りる。
+//  抽出条件 (dormantDistance 窓 / 非 FVG / pointPrice あり / ACTIVE) と
+//  全順序 (価格昇順、生の価格が完全一致するときだけ Root ID 昇順) は
+//  Version 3 の f_collectPointRoots() と同一。
+//  ソートだけ O(n^2) の挿入ソートから array.sort_indices + 同値グループ内の
+//  Root ID 整列へ変えている (同じ全順序を、より少ない比較で作る)。
+f_pairTokenOf(ZoneEngine e, string pairKey) =>
+    int tok = 0
+    if pairKey != ""
+        if map.contains(e.pairTokenMap, pairKey)
+            tok := map.get(e.pairTokenMap, pairKey)
+        else
+            e.pairTokenSeq := e.pairTokenSeq + 1
+            tok := e.pairTokenSeq
+            map.put(e.pairTokenMap, pairKey, tok)
+    tok
+
+f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
+    array.clear(e.scRawPrice)
+    array.clear(e.scRawIdx)
     int n = array.size(e.roots)
     if n > 0
         for i = 0 to n - 1
             Root r = array.get(e.roots, i)
             bool inWindow = na(refClose) or na(r.pointPrice)
                  or math.abs(r.pointPrice - refClose) <= c.dormantDistance
-            if inWindow and r.category != CAT_FVG and not na(r.pointPrice) and f_rootEligibleForSide(c, r, side)
-                //  挿入ソート (price, rootId) : 決定論的な順序を保証する
-                int pos = array.size(outIds)
-                if pos > 0
-                    for k = 0 to pos - 1
-                        float pk = array.get(outPrices, k)
-                        int   ik = array.get(outIds, k)
-                        if r.pointPrice < pk or (f_eqT(r.pointPrice, pk, c.mintick) and r.rootId < ik)
-                            pos := k
-                            break
-                array.insert(outIds, pos, r.rootId)
-                array.insert(outPrices, pos, r.pointPrice)
-    array.size(outIds)
+            if inWindow and r.category != CAT_FVG and not na(r.pointPrice) and r.state == ROOT_ACTIVE
+                array.push(e.scRawPrice, r.pointPrice)
+                array.push(e.scRawIdx, i)
+    array.clear(e.snRootId)
+    array.clear(e.snIdx)
+    array.clear(e.snPrice)
+    array.clear(e.snCat)
+    array.clear(e.snTf)
+    array.clear(e.snTfMask)
+    array.clear(e.snDir)
+    array.clear(e.snConfirm)
+    array.clear(e.snOrigin)
+    array.clear(e.snLabel)
+    array.clear(e.snPair)
+    int m = array.size(e.scRawIdx)
+    if m > 0
+        array<int> ord = array.sort_indices(e.scRawPrice, order.ascending)
+        //  生の価格が完全一致するグループの中だけ Root ID 昇順へ整える
+        //  (Version 3 の比較器は「生の価格 < 」優先、完全同値のときだけ Root ID)
+        int gs = 0
+        for i = 1 to m
+            bool same = false
+            if i < m
+                same := array.get(e.scRawPrice, array.get(ord, i)) == array.get(e.scRawPrice, array.get(ord, gs))
+            if not same
+                if i - gs > 1
+                    for x = gs + 1 to i - 1
+                        int vIdx = array.get(ord, x)
+                        int vId  = array.get(e.roots, vIdx).rootId
+                        int pos  = x
+                        for y = x - 1 to gs
+                            if array.get(e.roots, array.get(ord, y)).rootId > vId
+                                array.set(ord, y + 1, array.get(ord, y))
+                                pos := y
+                            else
+                                break
+                        array.set(ord, pos, vIdx)
+                gs := i
+        for k = 0 to m - 1
+            int ri = array.get(ord, k)
+            Root r = array.get(e.roots, ri)
+            array.push(e.snRootId, r.rootId)
+            array.push(e.snIdx, ri)
+            array.push(e.snPrice, r.pointPrice)
+            array.push(e.snCat, r.category)
+            array.push(e.snTf, r.tfCode)
+            array.push(e.snTfMask, r.tfMask)
+            array.push(e.snDir, r.direction)
+            array.push(e.snConfirm, nz(r.confirmedTime, 0))
+            array.push(e.snOrigin, nz(r.originTime, 0))
+            array.push(e.snLabel, r.labelMask)
+            array.push(e.snPair, r.category == CAT_ACCUM ? f_pairTokenOf(e, r.pairKey) : 0)
+    array.size(e.snRootId)
 
-//  同じ Accum Box の上下限を同じ候補へ入れない (Mutually Exclusive Pair)
-f_accumPairConflict(ZoneEngine e, array<int> ids, int newRootId) =>
+//  窓に入っている Accum Root の pair token 一覧 (e.scAccTok / e.scAccTf) に対する
+//  O(窓内 Accum 数) の衝突判定。Version 3 の f_accumPairConflict() は
+//  「同じ pairKey を持つ別 Root が窓にいるか」を見ていたので、判定結果は同じ。
+f_accTokenConflict(ZoneEngine e, int tok) =>
     bool conflict = false
-    int ni = f_rootIdxById(e, newRootId)
-    if ni >= 0
-        Root nr = array.get(e.roots, ni)
-        if nr.category == CAT_ACCUM and nr.pairKey != ""
-            int n = array.size(ids)
-            if n > 0
-                for k = 0 to n - 1
-                    int i = f_rootIdxById(e, array.get(ids, k))
-                    if i >= 0
-                        Root r = array.get(e.roots, i)
-                        if r.category == CAT_ACCUM and r.pairKey == nr.pairKey and r.rootId != nr.rootId
-                            conflict := true
-                            break
+    if tok > 0
+        int an = array.size(e.scAccTok)
+        if an > 0
+            for q = 0 to an - 1
+                if array.get(e.scAccTok, q) == tok
+                    conflict := true
+                    break
     conflict
 
-// ---- 6.6 未使用 Root から候補を 1 つ選ぶ (Dense 優先 -> 通常) -------------
-//  幅は候補 EffectiveZoneRange の全幅で判断する。A-B / B-C が近くても
-//  A-C 全幅が超えるものは 1 Zone にしない。
-//  ★ Phase3A : 探索順・評価結果・比較順は Version 2 と同一のまま、
-//    部分窓ごとの ZoneCand / rootIds コピー / カテゴリ配列の生成をやめた。
-//      ・cur       : この呼び出しで 1 本だけ作り、窓の開始ごとに clear して使い回す
-//      ・scratch   : 評価専用の ZoneCand を 1 個だけ作り、毎窓上書きする
-//      ・best 更新時だけ f_cloneCand() で rootIds / identityIds を deep copy する
-//    scratch と cur は best / out / Core へ一切参照渡ししない。
-f_pickBestWindow(ZoneEngine e, ZoneCfg c, int side, array<int> ids, array<float> prices,
-     array<bool> used, float maxWidth, bool requireStrong) =>
-    ZoneCand best    = na
-    ZoneCand scratch = f_newScratchCand()
-    array<int> cur   = array.new_int()
-    int n = array.size(ids)
+// ---- 6.6 Dense 候補の増分探索 ---------------------------------------------
+//  ★ Phase3B ★ 部分窓が 1 Root 伸びるたびに Candidate 全体を作り直す方式をやめ、
+//  窓のスカラーを増分更新する。評価している値・比較順・break / continue の位置は
+//  Version 3 と 1 つずつ同じ:
+//      catMask / cCount / highMask / hCount / bottom / top / minRootId /
+//      firstConfirmTime / hasNonPsych / Density / BaseStrong
+//  点 Root 探索には FVG が入らないため、High 判定は MA / Swing / Accum / 時間高安
+//  の 4 カテゴリだけ (心理価格は常に Normal)。
+//  best は「スカラー」と「スナップショット上の位置」だけを scratch へ残し、
+//  探索終了後に一度だけ正式 Candidate を作る。
+f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requireStrong) =>
+    bool  found  = false
+    int   bestC  = 0
+    int   bestH  = 0
+    float bestW  = 0.0
+    int   bestT  = 0
+    int   bestId = 0
+    array.clear(e.scBestIdx)
+    float denseW = f_denseWidth(c)
+    int n = array.size(e.snRootId)
     if n > 0
         for a = 0 to n - 1
-            if not array.get(used, a)
-                array.clear(cur)
-                array.push(cur, array.get(ids, a))
-                float lo = array.get(prices, a)
+            if not array.get(e.scUsed, a)
+                array.clear(e.scWinIdx)
+                array.clear(e.scAccTok)
+                array.clear(e.scAccTf)
+                float lo = array.get(e.snPrice, a)
+                int   wCat   = 0
+                int   wC     = 0
+                bool  wNonPsych = false
+                int   wMinId = 0
+                int   wFirst = 0
+                bool  wFirstSet = false
+                bool  hasE1  = false
+                bool  hasE2  = false
+                float e1p    = na
+                float e2p    = na
+                int   e1d    = 0
+                int   e2d    = 0
+                bool  swHigh = false
+                bool  accHigh = false
+                bool  tlHigh = false
+                bool  tlSeen = false
+                int   tlOrigin = 0
                 for b = a to n - 1
                     if b > a
-                        if array.get(used, b)
+                        if array.get(e.scUsed, b)
                             continue
-                        float w = array.get(prices, b) - lo
+                        float w = array.get(e.snPrice, b) - lo
                         if f_gtT(w, maxWidth, c.mintick)
                             break
-                        if f_accumPairConflict(e, cur, array.get(ids, b))
+                        if f_accTokenConflict(e, array.get(e.snPair, b))
                             break
-                        array.push(cur, array.get(ids, b))
-                    //  Base Strong は C >= 2 が必須 -> 1 本だけの窓は Dense 探索では作らない
-                    if not requireStrong or array.size(cur) >= 2
-                        f_fillCandFrom(e, c, side, cur, na, na, false, false, scratch)
-                        bool okStrong = not requireStrong or scratch.baseStrong
-                        if scratch.hasNonPsych and okStrong
-                            if na(best)
-                                best := f_cloneCand(e, scratch, cur)
-                            else if f_candBetter(scratch, best, c)
-                                best := f_cloneCand(e, scratch, cur)
-    best
+                    //  --- 窓へ 1 Root 追加 (増分更新) ---
+                    int rcat = array.get(e.snCat, b)
+                    int rid  = array.get(e.snRootId, b)
+                    if not f_maskHas(wCat, rcat)
+                        wCat := f_maskAdd(wCat, rcat)
+                        wC   := wC + 1
+                    if rcat != CAT_PSYCH
+                        wNonPsych := true
+                    wMinId := wMinId == 0 ? rid : math.min(wMinId, rid)
+                    int cft = array.get(e.snConfirm, b)
+                    wFirst := wFirstSet ? math.min(wFirst, cft) : cft
+                    wFirstSet := true
+                    if rcat == CAT_MA
+                        if rid == RID_EMA1
+                            hasE1 := true
+                            e1p := array.get(e.snPrice, b)
+                            e1d := array.get(e.snDir, b)
+                        else if rid == RID_EMA2
+                            hasE2 := true
+                            e2p := array.get(e.snPrice, b)
+                            e2d := array.get(e.snDir, b)
+                    else if rcat == CAT_SWING
+                        if not swHigh
+                            int stf = array.get(e.snTf, b)
+                            int stm = array.get(e.snTfMask, b)
+                            if stf == TF_1H or (f_maskHas(stm, TF_15M) and f_maskHas(stm, TF_5M))
+                                swHigh := true
+                    else if rcat == CAT_ACCUM
+                        int atf  = array.get(e.snTf, b)
+                        int atok = array.get(e.snPair, b)
+                        if not accHigh
+                            if atf == TF_4H or atf == TF_D
+                                accHigh := true
+                            else
+                                int an = array.size(e.scAccTok)
+                                if an > 0
+                                    for q = 0 to an - 1
+                                        if array.get(e.scAccTok, q) != atok and array.get(e.scAccTf, q) != atf
+                                            accHigh := true
+                                            break
+                        array.push(e.scAccTok, atok)
+                        array.push(e.scAccTf, atf)
+                    else if rcat == CAT_TIME_HL
+                        if not tlHigh
+                            int lm = array.get(e.snLabel, b)
+                            if f_maskHas(lm, f_timeLabelBit(PER_WEEK, true))
+                                 or f_maskHas(lm, f_timeLabelBit(PER_WEEK, false))
+                                 or f_maskHas(lm, f_timeLabelBit(PER_DAY, false))
+                                tlHigh := true
+                            else
+                                int og = array.get(e.snOrigin, b)
+                                if not tlSeen
+                                    tlSeen := true
+                                    tlOrigin := og
+                                else if og != tlOrigin
+                                    tlHigh := true
+                    array.push(e.scWinIdx, b)
+                    //  --- 評価 (Base Strong は C >= 2 が必須 -> 1 本だけの窓は作らない) ---
+                    if not requireStrong or array.size(e.scWinIdx) >= 2
+                        float wid = array.get(e.snPrice, b) - lo
+                        int dens = f_gtT(wid, c.clusterMaxWidth, c.mintick) ? DEN_BROAD_CONTEXT
+                             : (f_leT(wid, denseW, c.mintick) ? DEN_HIGH : DEN_NORMAL)
+                        int wH = 0
+                        if hasE1 and hasE2
+                            bool near = f_leT(math.abs(e1p - e2p), denseW, c.mintick)
+                            bool dirOk = side == SIDE_SUPPORT ? (e1d > 0 and e2d > 0) : (e1d < 0 and e2d < 0)
+                            if near and dirOk
+                                wH := wH + 1
+                        if swHigh
+                            wH := wH + 1
+                        if accHigh
+                            wH := wH + 1
+                        if tlHigh
+                            wH := wH + 1
+                        bool bStrong = dens == DEN_HIGH and wNonPsych
+                             and ((wC == 2 and wH >= 1) or wC >= 3)
+                        bool okStrong = not requireStrong or bStrong
+                        if wNonPsych and okStrong
+                            bool better = not found
+                            if found
+                                //  f_candBetter() と同じ順序
+                                //  C 降順 -> H 降順 -> 幅昇順 -> 成立時刻昇順 -> 最小 Root ID 昇順
+                                if wC != bestC
+                                    better := wC > bestC
+                                else if wH != bestH
+                                    better := wH > bestH
+                                else if not f_eqT(wid, bestW, c.mintick)
+                                    better := wid < bestW
+                                else if wFirst != bestT
+                                    better := wFirst < bestT
+                                else
+                                    better := wMinId < bestId
+                            if better
+                                found  := true
+                                bestC  := wC
+                                bestH  := wH
+                                bestW  := wid
+                                bestT  := wFirst
+                                bestId := wMinId
+                                array.clear(e.scBestIdx)
+                                int wn = array.size(e.scWinIdx)
+                                for q = 0 to wn - 1
+                                    array.push(e.scBestIdx, array.get(e.scWinIdx, q))
+    found
 
-f_markUsed(ZoneEngine e, array<int> ids, array<int> candIds, array<bool> used) =>
-    int m = array.size(candIds)
-    if m > 0
-        for k = 0 to m - 1
-            int rid = array.get(candIds, k)
-            int n = array.size(ids)
-            if n > 0
-                for i = 0 to n - 1
-                    if array.get(ids, i) == rid
-                        array.set(used, i, true)
-                        break
-    true
+//  best 窓 (スナップショット位置の列) から正式 Candidate を作り、used を立てる。
+//  rootIds の並びは Version 3 と同じ「スナップショット昇順」。
+f_materializeBest(ZoneEngine e, ZoneCfg c, int side) =>
+    array.clear(e.scCurIds)
+    int bn = array.size(e.scBestIdx)
+    if bn > 0
+        for q = 0 to bn - 1
+            array.push(e.scCurIds, array.get(e.snRootId, array.get(e.scBestIdx, q)))
+    ZoneCand cd = f_buildCand(e, c, side, e.scCurIds, na, na, false, false)
+    if bn > 0
+        for q = 0 to bn - 1
+            array.set(e.scUsed, array.get(e.scBestIdx, q), true)
+    cd
+
 
 // ---- 6.7 FVG の attach / 局所化 / 単独候補 --------------------------------
 //  ・非 Broad FVG 単独        : NativeRange
@@ -2351,76 +2717,216 @@ f_collectFvgRoots(ZoneEngine e, ZoneCfg c, int side, float refClose, array<int> 
     array.sort(out, order.ascending)
     array.size(out)
 
+//  ★ Phase3C : attach 試行を「元 Candidate の確定済みスカラー + FVG 1 件」の
+//  増分評価にする。不採用の試行では配列も Candidate も一切作らない。
+//  評価している値 (範囲 / C / H / Density / BaseStrong / FVG 品質) と
+//  採用条件 (okWidth / keepStrong) は Version 3 と同じ。
+f_copyCandScalars(ZoneCand src, ZoneCand dst) =>
+    dst.side             := src.side
+    dst.catMask          := src.catMask
+    dst.highMask         := src.highMask
+    dst.bottom           := src.bottom
+    dst.top              := src.top
+    dst.cCount           := src.cCount
+    dst.hCount           := src.hCount
+    dst.density          := src.density
+    dst.baseStrong       := src.baseStrong
+    dst.hasNonPsych      := src.hasNonPsych
+    dst.isBroadContext   := src.isBroadContext
+    dst.minRootId        := src.minRootId
+    dst.firstConfirmTime := src.firstConfirmTime
+    dst.fvgDirMask       := src.fvgDirMask
+    dst.fvgRootCount     := src.fvgRootCount
+    dst.fvgFreshCount    := src.fvgFreshCount
+    dst.fvgStateMask     := src.fvgStateMask
+    dst
+
+//  FVG カテゴリ品質を「既存 FVG Root 集合 + 追加 1 件」で評価する。
+//  f_qualityFvg() を組み合わせ集合に対して実行したのと同じ結果になるよう、
+//  単独条件 (非 Broad の 4H / 日足、局所化された Broad) と
+//  ペア条件 (異なる時間足 / 同方向 / NativeRange が実際に重なる) の両方を
+//  「既存同士」「既存 x 追加」の順で見る (bool なので順序は結果に影響しない)。
+f_qualityFvgWith(ZoneEngine e, ZoneCfg c, array<int> fvgIds, int extraId, bool broadLocalized) =>
+    bool isHighQuality = false
+    int n = array.size(fvgIds)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(fvgIds, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if not r.isBroadFvg and (r.tfCode == TF_4H or r.tfCode == TF_D)
+                    isHighQuality := true
+                    break
+                if r.isBroadFvg and broadLocalized
+                    isHighQuality := true
+                    break
+    int xi = f_rootIdxById(e, extraId)
+    if not isHighQuality and xi >= 0
+        Root rx = array.get(e.roots, xi)
+        if not rx.isBroadFvg and (rx.tfCode == TF_4H or rx.tfCode == TF_D)
+            isHighQuality := true
+        else if rx.isBroadFvg and broadLocalized
+            isHighQuality := true
+    if not isHighQuality and n >= 2
+        for a = 0 to n - 2
+            int ia = f_rootIdxById(e, array.get(fvgIds, a))
+            if ia >= 0
+                Root ra = array.get(e.roots, ia)
+                for b = a + 1 to n - 1
+                    int ib = f_rootIdxById(e, array.get(fvgIds, b))
+                    if ib >= 0
+                        Root rb = array.get(e.roots, ib)
+                        if rb.tfCode != ra.tfCode and f_effectiveFvgDir(rb) == f_effectiveFvgDir(ra)
+                             and f_rangesTouch(ra.nativeBottom, ra.nativeTop, rb.nativeBottom, rb.nativeTop, c.mintick)
+                            isHighQuality := true
+                            break
+            if isHighQuality
+                break
+    if not isHighQuality and n > 0 and xi >= 0
+        Root rx2 = array.get(e.roots, xi)
+        for k = 0 to n - 1
+            int i2 = f_rootIdxById(e, array.get(fvgIds, k))
+            if i2 >= 0
+                Root r2 = array.get(e.roots, i2)
+                if r2.tfCode != rx2.tfCode and f_effectiveFvgDir(r2) == f_effectiveFvgDir(rx2)
+                     and f_rangesTouch(r2.nativeBottom, r2.nativeTop, rx2.nativeBottom, rx2.nativeTop, c.mintick)
+                    isHighQuality := true
+                    break
+    isHighQuality
+
+f_fvgTrialEval(ZoneEngine e, ZoneCfg c, int side, ZoneCand base, int fid, Root r,
+     float fb, float ft, bool proximal, ZoneCand sc) =>
+    sc.side   := side
+    sc.bottom := fb
+    sc.top    := ft
+    //  Category : FVG ビットを足すだけ (非 FVG カテゴリは変わらない)
+    bool baseHadFvg = f_maskHas(base.catMask, CAT_FVG)
+    sc.catMask := f_maskAdd(base.catMask, CAT_FVG)
+    sc.cCount  := base.cCount + (baseHadFvg ? 0 : 1)
+    sc.hasNonPsych := true
+    sc.minRootId   := base.minRootId == 0 ? fid : math.min(base.minRootId, fid)
+    sc.firstConfirmTime := math.min(nz(base.firstConfirmTime, 0), nz(r.confirmedTime, 0))
+    sc.fvgRootCount  := base.fvgRootCount + 1
+    sc.fvgDirMask    := f_maskAdd(base.fvgDirMask, f_effectiveFvgDir(r))
+    sc.fvgStateMask  := f_maskAdd(base.fvgStateMask, r.state)
+    sc.fvgFreshCount := base.fvgFreshCount + (r.fvgFresh ? 1 : 0)
+    //  Density は新しい範囲から決め直す
+    float width = na(fb) or na(ft) ? na : ft - fb
+    if na(width) or f_gtT(width, c.clusterMaxWidth, c.mintick)
+        sc.density := DEN_BROAD_CONTEXT
+    else if f_leT(width, f_denseWidth(c), c.mintick)
+        sc.density := DEN_HIGH
+    else
+        sc.density := DEN_NORMAL
+    //  非 FVG カテゴリの High は元 Candidate のものをそのまま使う
+    //  (MA / Swing / Accum / 時間高安 の品質は FVG Root を足しても変わらない)
+    int nonFvgHigh = f_maskHas(base.highMask, CAT_FVG) ? base.highMask - f_pow2(CAT_FVG) : base.highMask
+    int nonFvgHighCnt = base.hCount - (f_maskHas(base.highMask, CAT_FVG) ? 1 : 0)
+    int nonFvgC = base.cCount - (baseHadFvg ? 1 : 0)
+    bool anyOtherHigh = nonFvgHighCnt > 0
+    bool broadLocalized = proximal or anyOtherHigh or (nonFvgC >= 2 and sc.density == DEN_HIGH)
+    bool fvgHigh = f_qualityFvgWith(e, c, base.fvgIds, fid, broadLocalized)
+    sc.highMask := fvgHigh ? f_maskAdd(nonFvgHigh, CAT_FVG) : nonFvgHigh
+    sc.hCount   := nonFvgHighCnt + (fvgHigh ? 1 : 0)
+    sc.isBroadContext := sc.density == DEN_BROAD_CONTEXT
+    sc.baseStrong := not sc.isBroadContext and sc.hasNonPsych and sc.density == DEN_HIGH
+         and ((sc.cCount == 2 and sc.hCount >= 1) or sc.cCount >= 3)
+    sc
+
+//  採用が決まった時だけ正式 Candidate を作る (rootIds の並びは 元 + 追加 FVG)
+f_materializeAttach(ZoneEngine e, ZoneCfg c, int side, ZoneCand base, int fid,
+     float fb, float ft, bool proximal) =>
+    array.clear(e.scIdTmp)
+    int n = array.size(base.rootIds)
+    if n > 0
+        for k = 0 to n - 1
+            array.push(e.scIdTmp, array.get(base.rootIds, k))
+    array.push(e.scIdTmp, fid)
+    f_buildCand(e, c, side, e.scIdTmp, fb, ft, false, proximal)
+
 f_fvgAttachAndStandalone(ZoneEngine e, ZoneCfg c, int side, float refClose, array<ZoneCand> cands) =>
-    array<int> fids = array.new_int()
-    f_collectFvgRoots(e, c, side, refClose, fids)
-    array<int> stand = array.new_int()
-    int fn = array.size(fids)
+    f_collectFvgRoots(e, c, side, refClose, e.scFvgIds)
+    array.clear(e.scStandIds)
+    ZoneCand scTrial = f_newScratchCand()
+    ZoneCand scBest  = f_newScratchCand()
+    int fn = array.size(e.scFvgIds)
     if fn > 0
         for k = 0 to fn - 1
-            int      fid = array.get(fids, k)
-            int      fi  = f_rootIdxById(e, fid)
+            int fid = array.get(e.scFvgIds, k)
+            int fi  = f_rootIdxById(e, fid)
             if fi >= 0
                 Root r = array.get(e.roots, fi)
-                bool attached = false
-                int      bestIdx = -1
-                ZoneCand bestCd  = na
+                bool  attached = false
+                int   bestIdx  = -1
+                float bestFb   = na
+                float bestFt   = na
+                bool  bestProx = false
                 int cn = array.size(cands)
                 if cn > 0
                     for ci = 0 to cn - 1
                         ZoneCand cd = array.get(cands, ci)
-                        if not cd.isBroadContext and not array.includes(cd.rootIds, fid)
+                        if not cd.isBroadContext and not f_containsSorted(cd.rootIdsSorted, fid)
                             bool inside = f_rangesTouch(cd.bottom, cd.top, r.nativeBottom, r.nativeTop, c.mintick)
                             float gap = f_intervalGap(cd.bottom, cd.top, r.nativeBottom, r.nativeTop)
                             bool proximal = not inside and not na(gap) and gap > 0
                                  and f_leT(gap, f_denseWidth(c), c.mintick) and cd.density == DEN_HIGH
                             if inside or proximal
-                                array<int> ids2 = array.copy(cd.rootIds)
-                                array.push(ids2, fid)
                                 float fb = cd.bottom
                                 float ft = cd.top
                                 if proximal
                                     float pedge = side == SIDE_SUPPORT ? r.nativeTop : r.nativeBottom
                                     fb := math.min(cd.bottom, pedge)
                                     ft := math.max(cd.top, pedge)
-                                ZoneCand nc = f_buildCand(e, c, side, ids2, fb, ft, false, proximal)
-                                bool okWidth = f_leT(nc.top - nc.bottom, c.clusterMaxWidth, c.mintick)
+                                f_fvgTrialEval(e, c, side, cd, fid, r, fb, ft, proximal, scTrial)
+                                bool okWidth = f_leT(scTrial.top - scTrial.bottom, c.clusterMaxWidth, c.mintick)
                                 //  Dense Base Strong を attach で薄めない
-                                bool keepStrong = not cd.baseStrong or nc.baseStrong
+                                bool keepStrong = not cd.baseStrong or scTrial.baseStrong
                                 if okWidth and keepStrong
                                     if r.isBroadFvg
-                                        array.set(cands, ci, nc)
+                                        //  Broad は複数の局所 Zone へ共有される。反映が決まった時だけ生成。
+                                        array.set(cands, ci, f_materializeAttach(e, c, side, cd, fid, fb, ft, proximal))
                                         attached := true
                                     else if bestIdx < 0
-                                        bestIdx := ci
-                                        bestCd  := nc
-                                    else if f_candBetter(nc, bestCd, c)
-                                        bestIdx := ci
-                                        bestCd  := nc
+                                        bestIdx  := ci
+                                        bestFb   := fb
+                                        bestFt   := ft
+                                        bestProx := proximal
+                                        f_copyCandScalars(scTrial, scBest)
+                                    else if f_candBetter(scTrial, scBest, c)
+                                        bestIdx  := ci
+                                        bestFb   := fb
+                                        bestFt   := ft
+                                        bestProx := proximal
+                                        f_copyCandScalars(scTrial, scBest)
                 if not r.isBroadFvg and bestIdx >= 0
-                    array.set(cands, bestIdx, bestCd)
+                    //  非 Broad は最終 best が決まった時に一度だけ生成する
+                    ZoneCand baseCd = array.get(cands, bestIdx)
+                    array.set(cands, bestIdx, f_materializeAttach(e, c, side, baseCd, fid, bestFb, bestFt, bestProx))
                     attached := true
                 if not attached
-                    array.push(stand, fid)
+                    array.push(e.scStandIds, fid)
     // ---- 単独 FVG 候補 (同方向で実際に重なるものは共通区間へまとめる) ----
-    int sn = array.size(stand)
+    //  グループ化の順序と共通区間の計算は Version 3 のまま。
+    int sn = array.size(e.scStandIds)
     if sn > 0
-        array<bool> gused = array.new_bool(sn, false)
+        array.clear(e.scStandUsed)
+        for q = 0 to sn - 1
+            array.push(e.scStandUsed, false)
         for i = 0 to sn - 1
-            if not array.get(gused, i)
-                array.set(gused, i, true)
-                int ia = f_rootIdxById(e, array.get(stand, i))
+            if not array.get(e.scStandUsed, i)
+                array.set(e.scStandUsed, i, true)
+                int ia = f_rootIdxById(e, array.get(e.scStandIds, i))
                 if ia >= 0
                     Root ra = array.get(e.roots, ia)
-                    array<int> gids = array.new_int()
-                    array.push(gids, ra.rootId)
+                    array.clear(e.scIdTmp)
+                    array.push(e.scIdTmp, ra.rootId)
                     float gb = ra.nativeBottom
                     float gt = ra.nativeTop
                     int dirA = f_effectiveFvgDir(ra)
                     if i < sn - 1
                         for j = i + 1 to sn - 1
-                            if not array.get(gused, j)
-                                int ib = f_rootIdxById(e, array.get(stand, j))
+                            if not array.get(e.scStandUsed, j)
+                                int ib = f_rootIdxById(e, array.get(e.scStandIds, j))
                                 if ib >= 0
                                     Root rb = array.get(e.roots, ib)
                                     if f_effectiveFvgDir(rb) == dirA
@@ -2430,10 +2936,10 @@ f_fvgAttachAndStandalone(ZoneEngine e, ZoneCfg c, int side, float refClose, arra
                                         if f_leT(nb, nt, c.mintick)
                                             gb := nb
                                             gt := nt
-                                            array.push(gids, rb.rootId)
-                                            array.set(gused, j, true)
-                    bool forceBroad = array.size(gids) == 1 and ra.isBroadFvg
-                    array.push(cands, f_buildCand(e, c, side, gids, gb, gt, forceBroad, false))
+                                            array.push(e.scIdTmp, rb.rootId)
+                                            array.set(e.scStandUsed, j, true)
+                    bool forceBroad = array.size(e.scIdTmp) == 1 and ra.isBroadFvg
+                    array.push(cands, f_buildCand(e, c, side, e.scIdTmp, gb, gt, forceBroad, false))
     array.size(cands)
 
 // ---- 6.8 Side 候補の生成パイプライン --------------------------------------
@@ -2444,43 +2950,52 @@ f_fvgAttachAndStandalone(ZoneEngine e, ZoneCfg c, int side, float refClose, arra
 //  段階B : FVG の attach / 局所化 / 単独候補
 f_buildSideCands(ZoneEngine e, ZoneCfg c, ZoneFeed f, int side) =>
     array<ZoneCand> out = array.new<ZoneCand>()
-    array<int>   ids    = array.new_int()
-    array<float> prices = array.new_float()
-    int n = f_collectPointRoots(e, c, side, f.baseClose, ids, prices)
-    array<bool> used = array.new_bool(int(math.max(n, 1)), false)
-    for g = 1 to 12
-        ZoneCand cd = f_pickBestWindow(e, c, side, ids, prices, used, f_denseWidth(c), true)
-        if na(cd)
-            break
-        array.push(out, cd)
-        f_markUsed(e, ids, cd.rootIds, used)
-    //  ★ Phase3A : スイープ用の一時配列も 1 本ずつだけ作り、各反復の先頭で clear する。
-    //    f_buildCand() が rootIds を array.copy() するので、保存される Candidate は
-    //    この cur とは別の配列を所有する (clear しても影響しない)。
-    array<int> cur    = array.new_int()
-    array<int> curIdx = array.new_int()
+    int n = array.size(e.snRootId)
+    array.clear(e.scUsed)
     if n > 0
         for i = 0 to n - 1
-            if not array.get(used, i)
-                array.clear(cur)
-                array.clear(curIdx)
-                array.push(cur, array.get(ids, i))
-                array.push(curIdx, i)
-                float lo = array.get(prices, i)
+            array.push(e.scUsed, false)
+    //  段階A : Base Strong を満たす Dense core を比較関数で先に確定する (最大 12 回)
+    for g = 1 to 12
+        if not f_searchDenseBest(e, c, side, f_denseWidth(c), true)
+            break
+        array.push(out, f_materializeBest(e, c, side))
+    //  段階C : 残 Root だけを価格昇順に左から貪欲クラスタ化 (決定論的な一方向スイープ)
+    if n > 0
+        for i = 0 to n - 1
+            if not array.get(e.scUsed, i)
+                array.clear(e.scCurIds)
+                array.clear(e.scWinIdx)
+                array.clear(e.scAccTok)
+                array.clear(e.scAccTf)
+                array.push(e.scCurIds, array.get(e.snRootId, i))
+                array.push(e.scWinIdx, i)
+                int tok0 = array.get(e.snPair, i)
+                if tok0 > 0
+                    array.push(e.scAccTok, tok0)
+                    array.push(e.scAccTf, array.get(e.snTf, i))
+                float lo = array.get(e.snPrice, i)
                 if i < n - 1
                     for k = i + 1 to n - 1
-                        if not array.get(used, k)
-                            if f_gtT(array.get(prices, k) - lo, c.clusterMaxWidth, c.mintick)
+                        if not array.get(e.scUsed, k)
+                            if f_gtT(array.get(e.snPrice, k) - lo, c.clusterMaxWidth, c.mintick)
                                 break
-                            if f_accumPairConflict(e, cur, array.get(ids, k))
+                            int tokk = array.get(e.snPair, k)
+                            if f_accTokenConflict(e, tokk)
                                 break
-                            array.push(cur, array.get(ids, k))
-                            array.push(curIdx, k)
-                ZoneCand cd = f_buildCand(e, c, side, cur, na, na, false, false)
+                            array.push(e.scCurIds, array.get(e.snRootId, k))
+                            array.push(e.scWinIdx, k)
+                            if tokk > 0
+                                array.push(e.scAccTok, tokk)
+                                array.push(e.scAccTf, array.get(e.snTf, k))
+                ZoneCand cd = f_buildCand(e, c, side, e.scCurIds, na, na, false, false)
                 if cd.hasNonPsych
                     array.push(out, cd)
-                for m = 0 to array.size(curIdx) - 1
-                    array.set(used, array.get(curIdx, m), true)
+                int wn = array.size(e.scWinIdx)
+                if wn > 0
+                    for m2 = 0 to wn - 1
+                        array.set(e.scUsed, array.get(e.scWinIdx, m2), true)
+    //  段階B : FVG の attach / 局所化 / 単独候補
     f_fvgAttachAndStandalone(e, c, side, f.baseClose, out)
     out
 
@@ -2492,27 +3007,6 @@ f_buildSideCands(ZoneEngine e, ZoneCfg c, ZoneFeed f, int side) =>
 //    2) 旧範囲と新範囲の interval gap が M 以内 (重なれば gap = 0)
 //  Center 距離では判定しない。中央値の移動だけでは新世代にしない。
 // ============================================================================
-
-f_sharedCount(array<int> a, array<int> b) =>
-    int c = 0
-    int n = array.size(a)
-    if n > 0
-        for i = 0 to n - 1
-            if array.includes(b, array.get(a, i))
-                c := c + 1
-    c
-
-f_nonFvgSharedCount(ZoneEngine e, array<int> a, array<int> b) =>
-    int c = 0
-    int n = array.size(a)
-    if n > 0
-        for i = 0 to n - 1
-            int rid = array.get(a, i)
-            if array.includes(b, rid)
-                int idx = f_rootIdxById(e, rid)
-                if idx >= 0 and array.get(e.roots, idx).category != CAT_FVG
-                    c := c + 1
-    c
 
 // ---- 7.1 Support 候補と Resistance 候補を 1 つの ZoneCore 候補へ ----------
 //  同じ非 FVG origin Root を 1 つ以上共有し、価格的連続性が M 以内なら 1 Core。
@@ -2539,11 +3033,16 @@ f_pairSides(ZoneEngine e, ZoneCfg c, array<ZoneCand> sup, array<ZoneCand> res) =
                 for ri = 0 to nr - 1
                     if not array.get(rUsed, ri)
                         ZoneCand rc = array.get(res, ri)
-                        array<int> rIds = rc.identityIds
-                        int shNonFvg = f_nonFvgSharedCount(e, sIds, rIds)
-                        int shAll    = f_sharedCount(sIds, rIds)
+                        //  ★ Phase3B : 先に gap を見る (near が false なら共有 Root 数は
+                        //    条件にも比較にも使われないので、計算順を変えても結果は同じ)。
                         float gap = f_intervalGap(sc.bottom, sc.top, rc.bottom, rc.top)
                         bool near = not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
+                        int shNonFvg = 0
+                        int shAll    = 0
+                        if near
+                            //  ★ Phase3B : two-pointer (昇順コピー同士) で完全一致判定
+                            shNonFvg = f_sharedSorted(sc.nonFvgIdentitySorted, rc.identitySorted)
+                            shAll    = f_sharedSorted(sc.identitySorted, rc.identitySorted)
                         if near and (shNonFvg >= 1 or shAll >= 1)
                             bool better = bestRi < 0 or shAll > bestShared
                                  or (shAll == bestShared and not na(gap) and gap < nz(bestGap, 1e20))
@@ -2551,7 +3050,8 @@ f_pairSides(ZoneEngine e, ZoneCfg c, array<ZoneCand> sup, array<ZoneCand> res) =
                                 bestRi     := ri
                                 bestShared := shAll
                                 bestGap    := gap
-            CoreCand cc = CoreCand.new(supIdx = si, resIdx = bestRi, originRootIds = array.new_int())
+            CoreCand cc = CoreCand.new(supIdx = si, resIdx = bestRi, originRootIds = array.new_int(),
+                 originRootIdsSorted = array.new_int())
             if bestRi >= 0
                 array.set(rUsed, bestRi, true)
                 ZoneCand rc = array.get(res, bestRi)
@@ -2565,31 +3065,37 @@ f_pairSides(ZoneEngine e, ZoneCfg c, array<ZoneCand> sup, array<ZoneCand> res) =
             if sn > 0
                 for k = 0 to sn - 1
                     array.push(cc.originRootIds, array.get(sIds, k))
+            f_sortedCopy(cc.originRootIds, cc.originRootIdsSorted)
             if bestRi >= 0
                 ZoneCand rc2 = array.get(res, bestRi)
                 array<int> extra = rc2.identityIds
                 int en = array.size(extra)
                 if en > 0
                     for k = 0 to en - 1
-                        if not array.includes(cc.originRootIds, array.get(extra, k))
-                            array.push(cc.originRootIds, array.get(extra, k))
+                        //  ★ Phase3B : 重複判定は昇順コピーへの二分探索 (結果は includes と同じ)
+                        int xid = array.get(extra, k)
+                        if not f_containsSorted(cc.originRootIdsSorted, xid)
+                            array.push(cc.originRootIds, xid)
+                            f_sortedCopy(cc.originRootIds, cc.originRootIdsSorted)
             array.push(out, cc)
     if nr > 0
         for ri = 0 to nr - 1
             if not array.get(rUsed, ri)
                 ZoneCand rc = array.get(res, ri)
                 CoreCand cc = CoreCand.new(supIdx = -1, resIdx = ri, originRootIds = array.new_int(),
-                     bottom = rc.bottom, top = rc.top)
+                     originRootIdsSorted = array.new_int(), bottom = rc.bottom, top = rc.top)
                 int rn2 = array.size(rc.identityIds)
                 if rn2 > 0
                     for k = 0 to rn2 - 1
                         array.push(cc.originRootIds, array.get(rc.identityIds, k))
+                f_sortedCopy(cc.originRootIds, cc.originRootIdsSorted)
                 array.push(out, cc)
     out
 
 // ---- 7.2 View / Core への適用 ---------------------------------------------
 f_clearView(SideViewState v) =>
     array.clear(v.rootIds)
+    array.clear(v.rootIdsSorted)
     v.effectiveBottom := na
     v.effectiveTop    := na
     v.referencePrice  := na
@@ -2613,9 +3119,13 @@ f_applyCandToView(ZoneEngine e, ZoneCfg c, int side, SideViewState v, ZoneCand c
         f_clearView(v)
     else
         v.rootIds         := array.copy(cd.rootIds)
+        v.rootIdsSorted   := array.copy(cd.rootIdsSorted)
         v.effectiveBottom := cd.bottom
         v.effectiveTop    := cd.top
-        v.referencePrice  := f_refPrice(e, c, side, cd.rootIds, cd.bottom, cd.top)
+        //  ★ Phase3C : 正式 Candidate ごとに 1 度だけ計算し、以後は使い回す
+        if na(cd.refPrice)
+            cd.refPrice := f_refPrice(e, c, side, cd.rootIds, cd.bottom, cd.top)
+        v.referencePrice  := cd.refPrice
         v.cCount          := cd.cCount
         v.hCount          := cd.hCount
         v.density         := cd.density
@@ -2671,12 +3181,9 @@ f_viewDiffers(ZoneCfg c, SideViewState v, ZoneCand cd) =>
     else if array.size(v.rootIds) != array.size(cd.rootIds)
         differs := true
     else
-        int n = array.size(cd.rootIds)
-        if n > 0
-            for k = 0 to n - 1
-                if not array.includes(v.rootIds, array.get(cd.rootIds, k))
-                    differs := true
-                    break
+        //  ★ Phase3B : 件数が同じで、昇順コピー同士の共有数も同じなら集合として一致。
+        //    (どちらも重複の無い Root ID 集合なので includes の入れ子と同じ判定)
+        differs := f_sharedSorted(v.rootIdsSorted, cd.rootIdsSorted) != array.size(cd.rootIds)
     differs
 
 f_corePhysRange(ZoneCore z) =>
@@ -2714,6 +3221,7 @@ f_newCore(ZoneEngine e, ZoneCfg c, ZoneFeed f, CoreCand cc, array<ZoneCand> sup,
     e.genSeq  := e.genSeq + 1
     ZoneCore z = ZoneCore.new(coreId = e.coreSeq, generationId = e.genSeq,
          originRootIds = array.copy(cc.originRootIds),
+         originRootIdsSorted = array.copy(cc.originRootIdsSorted),
          supportView = f_newSideView(SIDE_SUPPORT), resistanceView = f_newSideView(SIDE_RESISTANCE),
          zoneFresh = true, createdTime = f.baseCloseTime, lastSeenTime = f.baseCloseTime,
          lastSeenSeq = f.baseSeq, touchMarks = array.new<TouchMark>(), breakSnap = f_newBreakSnap())
@@ -2828,8 +3336,9 @@ f_mergeCore(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore prim, ZoneCore other) 
     if on > 0
         for k = 0 to on - 1
             int rid = array.get(other.originRootIds, k)
-            if not array.includes(prim.originRootIds, rid)
+            if not f_containsSorted(prim.originRootIdsSorted, rid)
                 array.push(prim.originRootIds, rid)
+                f_sortedCopy(prim.originRootIds, prim.originRootIdsSorted)
     int tn = array.size(other.touchMarks)
     if tn > 0
         for i = 0 to tn - 1
@@ -2869,6 +3378,7 @@ f_mergeCore(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore prim, ZoneCore other) 
 f_archiveCore(ZoneEngine e, ZoneCfg c, ZoneCore z, string why) =>
     ZoneCore a = ZoneCore.new(coreId = z.coreId, generationId = z.generationId,
          originRootIds = array.copy(z.originRootIds),
+         originRootIdsSorted = array.copy(z.originRootIdsSorted),
          supportView = f_newSideView(SIDE_SUPPORT), resistanceView = f_newSideView(SIDE_RESISTANCE),
          zoneFresh = z.zoneFresh, physBottom = z.physBottom, physTop = z.physTop,
          createdTime = z.createdTime, lastSeenTime = z.lastSeenTime, lastSeenSeq = z.lastSeenSeq,
@@ -2904,6 +3414,7 @@ f_applyCoreCand(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z, CoreCand cc,
         f_applyCandToView(e, c, SIDE_SUPPORT,    z.supportView,    sc)
         f_applyCandToView(e, c, SIDE_RESISTANCE, z.resistanceView, rc)
         z.originRootIds   := array.copy(cc.originRootIds)
+        z.originRootIdsSorted := array.copy(cc.originRootIdsSorted)
         [pb, pt] = f_corePhysRange(z)
         z.physBottom      := pb
         z.physTop         := pt
@@ -2948,6 +3459,9 @@ f_coreMustKeep(ZoneEngine e, ZoneCore z) =>
 
 // ---- 7.6 Core の再構築 -----------------------------------------------------
 f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    //  ★ Phase3B : 点 Root の収集とソートは Side に依存しないので 1 回だけ作り、
+    //    Support / Resistance で共有する (順序は Version 3 と同一)。
+    f_buildPointSnapshot(e, c, f.baseClose)
     array<ZoneCand> sup = f_buildSideCands(e, c, f, SIDE_SUPPORT)
     array<ZoneCand> res = f_buildSideCands(e, c, f, SIDE_RESISTANCE)
     array<CoreCand> ccs = f_pairSides(e, c, sup, res)
@@ -2972,9 +3486,12 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
             float bestGap = na
             for k = 0 to nk - 1
                 CoreCand cc = array.get(ccs, k)
-                int sh = f_sharedCount(z.originRootIds, cc.originRootIds)
+                //  ★ Phase3B : gap を先に判定し、範囲が離れていれば共有 Root 数を数えない
+                //    (どちらも満たさないと採用されないので結果は同じ)
                 float gap = f_intervalGap(z.physBottom, z.physTop, cc.bottom, cc.top)
-                if sh >= 1 and not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
+                bool nearOk = not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
+                int sh = nearOk ? f_sharedSorted(z.originRootIdsSorted, cc.originRootIdsSorted) : 0
+                if sh >= 1 and nearOk
                     bool better = best < 0 or sh > bestSh
                          or (sh == bestSh and gap < nz(bestGap, 1e20))
                     if better
@@ -3033,9 +3550,10 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
                     for ci = 0 to nc - 1
                         if not array.get(coreMerged, ci)
                             ZoneCore zp = array.get(e.cores, ci)
-                            int sh = f_sharedCount(zp.originRootIds, cc.originRootIds)
                             float gap = f_intervalGap(zp.physBottom, zp.physTop, cc.bottom, cc.top)
-                            if sh >= 1 and not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
+                            bool nearOk2 = not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
+                            int sh = nearOk2 ? f_sharedSorted(zp.originRootIdsSorted, cc.originRootIdsSorted) : 0
+                            if sh >= 1 and nearOk2
                                 bool takeP = parentIdx < 0
                                 if not takeP
                                     ZoneCore zpp = array.get(e.cores, parentIdx)
