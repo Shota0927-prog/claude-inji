@@ -618,15 +618,38 @@ Merge / Split / Core ID / Generation ID、`request.security` の内容、履歴�
 
 | | Version 3 | Phase 3B/3C |
 |---|---|---|
-| Root の価格昇順並べ替え | 探索のたびに挿入ソート `O(R²)`、Side ごとに毎足 | `f_buildPointSnapshot()` で `array.sort_indices` + 同価格内だけの tie 修正 `O(R log R)`、Side ごとに毎足 1 回 |
+| Root の並び作成 | Version 3 の挿入処理 `O(R²)` を **Side ごとに 2 回 / 毎足** | **まったく同じ挿入処理** を **1 足に 1 回だけ** (`f_buildPointSnapshot()`)。並び順は完全一致。汎用ソートは使わない |
 | 1 窓の評価 | `ZoneCand` 生成 + `array.copy` + 品質関数再計算 `O(K)` 割と定数倍が大きい | 増分スカラ (catMask / cCount / hasNonPsych / minRootId / firstConfirmTime / カテゴリフラグ) を窓の進行とともに更新 `O(1)` 摊還 |
 | 1 ラウンド | `O(W · K)` + 毎窓 allocation | `O(R)` (two-pointer で窓を進める) + allocation なし |
-| 全体 | `O(D · W · K + R²)` | `O(R log R + D · R)` |
+| 全体 | `O(2 · R² + D · W · K)` | `O(R² + D · R)` (`R²` の並び作成は 1 回だけ) |
 | 保存候補の生成 | 窓ごと | 採用された 1 窓だけ (`f_materializeBest()` → 未変更の `f_buildCand()`) |
 
 探索する窓の集合、continue / break の位置、衝突判定の位置、比較子
 (`C desc → H desc → 幅 asc → firstConfirmTime asc → minRootId asc`) は 1 つも変えていない。
 dense ラウンドは最大 12 のまま。
+
+#### 3-b. 並び順の同値性 (汎用ソートを使わない理由)
+
+Version 3 の挿入条件は
+
+```
+r.pointPrice < pk or (f_eqT(r.pointPrice, pk, c.mintick) and r.rootId < ik)
+```
+
+これは「生の価格の大小」と「正規化 tick の同値判定」を混ぜているため、
+**一般の sort comparator としては推移律を満たさない**。生価格が違っていても同一 tick と
+判定されれば Root ID で順番が決まるからで、`array.sort` / `array.sort_indices` でも
+「生価格が完全一致したときだけ ID 比較」でも同じ列にならない。
+
+よって `f_buildPointSnapshot()` は **汎用ソートを使わず**、`e.roots` の元の走査順で
+Version 3 と同じ挿入処理をそのまま再現する。削ったのは次の 2 点だけ。
+
+- Side ごとに 2 回やっていたものを 1 足 1 回にした (非 FVG Root の参加資格は
+  `f_rootEligibleForSide()` の非 FVG 分岐が `state == ROOT_ACTIVE` だけなので Side に依存しない)。
+- 毎回の `array.new_int` / `array.new_float` をやめ、永続 scratch
+  (`scRawPrice` / `scRawId` / `scRawIdx`) へ挿入するようにした。
+
+挿入比較の回数も打ち切り位置 (`break`) も Version 3 と同じ。
 
 #### 4. 部分窓あたりの allocation
 
@@ -637,9 +660,44 @@ dense ラウンドは最大 12 のまま。
 | 品質判定用の一時配列 | 1〜2 / 窓 | **0** |
 | 文字列連結 (Accum 衝突の pairKey) | 窓内 Accum 数分 | **0** (int token) |
 
+足ごとの allocation (窓単位ではないもの)
+
+| | Version 3 | Phase 3B/3C |
+|---|---:|---:|
+| 点 Root 並び用の `array.new_*` | 4 本 / 足 (ids × 2 + prices × 2、Side ごと) | **0** (`scRawPrice` / `scRawId` / `scRawIdx` を使い回す) |
+| `used` の `array.new_bool` | 2 本 / 足 | **0** (`scUsed` を clear + push) |
+| 心理価格の `array.new_float` + `map.new` | 2 個 / 足 | **0** (`scPsychNeed` / `scPsychSeen`) |
+| FVG attach / standalone の一時配列 | attach 試行ごと | **0** (scratch。採用時だけ `f_buildCand()`) |
+
 保存する候補を作るときだけ `f_buildCand()` が従来どおり配列を新規作成する。
 FVG attach も同じで、試行中は scratch (`f_fvgTrialEval()`)、採用されたときだけ
 `f_materializeAttach()` が本体を作る。
+
+#### 4-b. break 用の幅と Candidate 実幅の分離
+
+並びが生価格の完全な昇順になるとは限らないので (上記 3-b)、
+`f_searchDenseBest()` では 2 種類の幅を完全に別に持っている。
+
+| | 式 | 使い道 |
+|---|---|---|
+| 探索の打ち切り | `array.get(e.snPrice, b) - lo` (`lo` = 探索開始位置 `a` の価格) | `if f_gtT(w, maxWidth, c.mintick)` → `break`。**Version 3 の式そのまま** |
+| Candidate の実幅 | `wPmax - wPmin` (窓へ Root を追加するたびに逐次更新) | 幅 / Density / tie-break / BaseStrong / 評価値 |
+
+実装箇所 (`ZoneEngineV2.pine`)
+
+- `wPmin` / `wPmax` の宣言 : `f_searchDenseBest()` の窓開始直後 (`float lo = ...` の直下)
+- 逐次更新 : 「窓へ 1 Root 追加 (増分更新)」の先頭で
+  `wPmin := na(wPmin) ? rpx : math.min(wPmin, rpx)` / `wPmax := ... math.max ...`
+  — `f_fillCandFrom()` の `pmin` / `pmax` と同じ式
+- Candidate 幅 : `float wid = na(wPmin) or na(wPmax) ? float(na) : wPmax - wPmin`
+- Density : `wid` を `c.clusterMaxWidth` / `f_denseWidth(c)` と比較 (`f_fillCandFrom()` と同じ順)
+- tie-break : `f_candBetter()` が `nz(top - bottom, 0)` を使うのに合わせて `nz(wid, 0)` で比較
+- break 式 : `float w = array.get(e.snPrice, b) - lo` のまま (未変更)
+
+保存される Candidate の `bottom` / `top` は従来どおり `f_buildCand()` → `f_fillCandFrom()` が
+ids を走査して `pmin` / `pmax` を作るので、ここは元から真の max - min だった。
+今回直したのは **探索中の評価値** で、ここを `price[b] - lo` で代用していたのは
+Version 3 と違う候補を選び得る真の不一致だった。
 
 #### 5. Hot loop に残っている `array.includes()`
 
@@ -709,7 +767,8 @@ snapshot 配列 (`snRootId` / `snPrice` / `snCat` / `snTf` / `snDir` / `snPair` 
 |---|---|
 | Root 生成条件 | 各 `f_sync*Roots()` の条件式は未変更。変えたのは「どう引くか (map)」だけ |
 | 探索する窓 | `f_buildPointSnapshot()` のフィルタは Version 3 の `f_collectPointRoots()` と同一条件 (窓 / 非 FVG / pointPrice あり / ROOT_ACTIVE) |
-| Root の順序 | `array.sort_indices` の後、**完全に同価格の範囲内だけ** rootId 昇順へ tie 修正。Version 3 の挿入ソートと全順序が一致 |
+| Root の順序 | Version 3 の挿入条件 (`price < pk or (f_eqT(price, pk) and rootId < ik)`) を `e.roots` の元の走査順でそのまま再現。汎用ソートは使っていない (理由は 3-b) |
+| Candidate の幅 | 探索中も `wPmax - wPmin` (`f_fillCandFrom()` の `pmin` / `pmax` と同じ)。break 式とは分離 (4-b) |
 | 候補の比較 | `f_candBetter()` 未変更。tie-break 順も未変更 |
 | dense 回数 | 最大 12 のまま。探索の打ち切り位置 (continue / break) も同じ |
 | C / H / Density / BaseStrong | 品質関数の条件式は未変更。増分スカラは同じ式を逐次更新しているだけ |

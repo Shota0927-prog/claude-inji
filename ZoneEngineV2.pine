@@ -849,6 +849,7 @@ export type ZoneEngine
     //  クラスタリング作業用 scratch
     array<float> scRawPrice
     array<int>   scRawIdx
+    array<int>   scRawId
     array<bool>  scUsed
     array<int>   scWinIdx
     array<int>   scBestIdx
@@ -861,6 +862,9 @@ export type ZoneEngine
     array<int>   scFvgIds
     array<int>   scStandIds
     array<bool>  scStandUsed
+    //  心理価格同期用 scratch (毎足の array.new / map.new をなくす)
+    array<float>   scPsychNeed
+    map<int, bool> scPsychSeen
 
 // ============================================================================
 // 03. FACTORIES / CONFIG VALIDATION
@@ -912,6 +916,7 @@ export newEngine() =>
          snPair    = array.new_int(),
          scRawPrice = array.new_float(),
          scRawIdx   = array.new_int(),
+         scRawId    = array.new_int(),
          scUsed     = array.new_bool(),
          scWinIdx   = array.new_int(),
          scBestIdx  = array.new_int(),
@@ -924,6 +929,8 @@ export newEngine() =>
          scFvgIds   = array.new_int(),
          scStandIds = array.new_int(),
          scStandUsed = array.new_bool(),
+         scPsychNeed = array.new_float(),
+         scPsychSeen = map.new<int, bool>(),
          rootSeq    = RID_FIXED_MAX)
 
 // @function  空の ZoneFeed を作る。配列フィールドが確保済みになる。
@@ -1834,7 +1841,7 @@ f_updateTimeHlRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
 //  無限に事前生成しない。非心理 Root の周辺 M 以内に存在する 50 ドル刻みだけ合成する。
 //  100 ドル倍数は Major 1 Root だけ (同じ価格に Standard を重複生成しない)。
 //  ★ Phase3C : 必要価格の重複判定を正規化 tick の map で行う (push 順は不変)。
-//    seen は 1 回の f_syncPsychRoots() の中だけで使う。
+//    need / seen は 1 回の f_syncPsychRoots() の中だけで使う Engine 所有の scratch。
 f_psychNeedPush(array<float> need, map<int, bool> seen, ZoneCfg c, float price) =>
     if not na(price)
         float lo = price - c.clusterMaxWidth
@@ -1851,8 +1858,13 @@ f_psychNeedPush(array<float> need, map<int, bool> seen, ZoneCfg c, float price) 
     true
 
 f_syncPsychRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
-    array<float> need = array.new_float()
-    map<int, bool> seen = map.new<int, bool>()
+    //  ★ Phase3B : 毎足 array.new_float / map.new をしない。Engine 所有の scratch を
+    //    clear して使い回す。push 順・重複判定・走査順は従来と完全に同じで、
+    //    scratch の中身はこの関数から外へ一切渡さない (参照を保存しない)。
+    array<float>   need = e.scPsychNeed
+    map<int, bool> seen = e.scPsychSeen
+    array.clear(need)
+    map.clear(seen)
     if c.usePsych
         int rn = array.size(e.roots)
         if rn > 0
@@ -2464,12 +2476,21 @@ f_candBetter(ZoneCand a, ZoneCand b, ZoneCfg c) =>
 // ---- 6.5 点 Root スナップショット (Support / Resistance で共有) -----------
 //  ★ Phase3B ★
 //  非 FVG Root の参加資格は Side に依存しない (f_rootEligibleForSide() の
-//  非 FVG 分岐は state == ROOT_ACTIVE だけ) ので、収集とソートは 1 回で足りる。
-//  抽出条件 (dormantDistance 窓 / 非 FVG / pointPrice あり / ACTIVE) と
-//  全順序 (価格昇順、生の価格が完全一致するときだけ Root ID 昇順) は
-//  Version 3 の f_collectPointRoots() と同一。
-//  ソートだけ O(n^2) の挿入ソートから array.sort_indices + 同値グループ内の
-//  Root ID 整列へ変えている (同じ全順序を、より少ない比較で作る)。
+//  非 FVG 分岐は state == ROOT_ACTIVE だけ) なので、収集と並びの作成は
+//  1 足に 1 回で足りる。ここで削るのは「Side ごとに 2 回やっていた」分と
+//  毎回の array.new_* だけで、並び順そのものは一切変えない。
+//
+//  ★★ 並び順は Version 3 の f_collectPointRoots() と完全に同じ手順で作る ★★
+//    Version 3 の挿入位置条件は
+//        r.pointPrice < pk or (f_eqT(r.pointPrice, pk, c.mintick) and r.rootId < ik)
+//    これは「生の価格の大小」と「正規化 tick の同値判定」を混ぜているため、
+//    一般の sort comparator としては推移律を満たさない (生価格が違っていても
+//    同一 tick と判定されれば Root ID で順番が決まる)。
+//    だから array.sort / array.sort_indices や「生価格が完全一致したときだけ
+//    ID 比較」では同値にならない。e.roots の元の走査順で、Version 3 と同じ
+//    挿入処理をそのまま再現する (使う配列を scratch にしただけ)。
+//
+//  クラスタリング対象を現在価格から dormantDistance 以内へ絞るのも Version 3 と同じ。
 f_pairTokenOf(ZoneEngine e, string pairKey) =>
     int tok = 0
     if pairKey != ""
@@ -2482,7 +2503,10 @@ f_pairTokenOf(ZoneEngine e, string pairKey) =>
     tok
 
 f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
+    //  scRawPrice / scRawId / scRawIdx は 3 本並びで Version 3 の (prices, ids) と
+    //  同じ挿入列を作る。scRawIdx は e.roots 上の index (後で項目を拾うため)。
     array.clear(e.scRawPrice)
+    array.clear(e.scRawId)
     array.clear(e.scRawIdx)
     int n = array.size(e.roots)
     if n > 0
@@ -2491,8 +2515,19 @@ f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
             bool inWindow = na(refClose) or na(r.pointPrice)
                  or math.abs(r.pointPrice - refClose) <= c.dormantDistance
             if inWindow and r.category != CAT_FVG and not na(r.pointPrice) and r.state == ROOT_ACTIVE
-                array.push(e.scRawPrice, r.pointPrice)
-                array.push(e.scRawIdx, i)
+                //  ★ Version 3 と 1 行ずつ同じ挿入位置探し
+                int pos = array.size(e.scRawId)
+                if pos > 0
+                    for k = 0 to pos - 1
+                        float pk = array.get(e.scRawPrice, k)
+                        int   ik = array.get(e.scRawId, k)
+                        if r.pointPrice < pk or (f_eqT(r.pointPrice, pk, c.mintick) and r.rootId < ik)
+                            pos := k
+                            break
+                array.insert(e.scRawId, pos, r.rootId)
+                array.insert(e.scRawPrice, pos, r.pointPrice)
+                array.insert(e.scRawIdx, pos, i)
+    //  確定した並びのまま、探索で読む項目を並行配列へ写す (順番はここで変えない)
     array.clear(e.snRootId)
     array.clear(e.snIdx)
     array.clear(e.snPrice)
@@ -2506,30 +2541,8 @@ f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
     array.clear(e.snPair)
     int m = array.size(e.scRawIdx)
     if m > 0
-        array<int> ord = array.sort_indices(e.scRawPrice, order.ascending)
-        //  生の価格が完全一致するグループの中だけ Root ID 昇順へ整える
-        //  (Version 3 の比較器は「生の価格 < 」優先、完全同値のときだけ Root ID)
-        int gs = 0
-        for i = 1 to m
-            bool same = false
-            if i < m
-                same := array.get(e.scRawPrice, array.get(ord, i)) == array.get(e.scRawPrice, array.get(ord, gs))
-            if not same
-                if i - gs > 1
-                    for x = gs + 1 to i - 1
-                        int vIdx = array.get(ord, x)
-                        int vId  = array.get(e.roots, vIdx).rootId
-                        int pos  = x
-                        for y = x - 1 to gs
-                            if array.get(e.roots, array.get(ord, y)).rootId > vId
-                                array.set(ord, y + 1, array.get(ord, y))
-                                pos := y
-                            else
-                                break
-                        array.set(ord, pos, vIdx)
-                gs := i
         for k = 0 to m - 1
-            int ri = array.get(ord, k)
+            int ri = array.get(e.scRawIdx, k)
             Root r = array.get(e.roots, ri)
             array.push(e.snRootId, r.rootId)
             array.push(e.snIdx, ri)
@@ -2566,6 +2579,17 @@ f_accTokenConflict(ZoneEngine e, int tok) =>
 //      firstConfirmTime / hasNonPsych / Density / BaseStrong
 //  点 Root 探索には FVG が入らないため、High 判定は MA / Swing / Accum / 時間高安
 //  の 4 カテゴリだけ (心理価格は常に Normal)。
+//
+//  ★★ 2 種類の「幅」を分けて持つ ★★
+//    (1) 探索を打ち切る幅   = array.get(snPrice, b) - lo   (lo = 開始位置 a の価格)
+//        → Version 3 の break 式そのまま。ここは絶対に変えない。
+//    (2) Candidate の実幅         = 窓内の真の wPmax - wPmin
+//        → f_fillCandFrom() が top - bottom として使う値と同じ。
+//          幅 / Density / tie-break / BaseStrong はすべてこちらを使う。
+//    並びは Version 3 の挿入条件 (生価格の大小 + 同一 tick なら Root ID) を再現して
+//    いるため、配列が生価格の完全な昇順になるとは限らない。だから (1) と (2) が
+//    一致しないことがあり、混同すると Version 3 と違う候補を選んでしまう。
+//
 //  best は「スカラー」と「スナップショット上の位置」だけを scratch へ残し、
 //  探索終了後に一度だけ正式 Candidate を作る。
 f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requireStrong) =>
@@ -2585,6 +2609,12 @@ f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requir
                 array.clear(e.scAccTok)
                 array.clear(e.scAccTf)
                 float lo = array.get(e.snPrice, a)
+                //  ★ 探索の打ち切り用の幅は Version 3 と同じ (price[b] - lo)。
+                //    Candidate の実幅は窓内の真の max - min なので別に持つ。
+                //    並びは Version 3 の挿入条件を再現しているため、
+                //    生価格の完全な昇順になるとは限らない。
+                float wPmin  = na
+                float wPmax  = na
                 int   wCat   = 0
                 int   wC     = 0
                 bool  wNonPsych = false
@@ -2614,6 +2644,10 @@ f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requir
                     //  --- 窓へ 1 Root 追加 (増分更新) ---
                     int rcat = array.get(e.snCat, b)
                     int rid  = array.get(e.snRootId, b)
+                    float rpx = array.get(e.snPrice, b)
+                    //  f_fillCandFrom() の pmin / pmax と同じものを逐次作る
+                    wPmin := na(wPmin) ? rpx : math.min(wPmin, rpx)
+                    wPmax := na(wPmax) ? rpx : math.max(wPmax, rpx)
                     if not f_maskHas(wCat, rcat)
                         wCat := f_maskAdd(wCat, rcat)
                         wC   := wC + 1
@@ -2670,8 +2704,11 @@ f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requir
                     array.push(e.scWinIdx, b)
                     //  --- 評価 (Base Strong は C >= 2 が必須 -> 1 本だけの窓は作らない) ---
                     if not requireStrong or array.size(e.scWinIdx) >= 2
-                        float wid = array.get(e.snPrice, b) - lo
-                        int dens = f_gtT(wid, c.clusterMaxWidth, c.mintick) ? DEN_BROAD_CONTEXT
+                        //  ★ Candidate の幅 = 窓内の真の max - min
+                        //    (f_fillCandFrom() が top - bottom として使う値と同じ)。
+                        //    探索を打ち切る幅 (price[b] - lo) とは別の値であることに注意。
+                        float wid = na(wPmin) or na(wPmax) ? float(na) : wPmax - wPmin
+                        int dens = na(wid) or f_gtT(wid, c.clusterMaxWidth, c.mintick) ? DEN_BROAD_CONTEXT
                              : (f_leT(wid, denseW, c.mintick) ? DEN_HIGH : DEN_NORMAL)
                         int wH = 0
                         if hasE1 and hasE2
@@ -2697,8 +2734,8 @@ f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requir
                                     better := wC > bestC
                                 else if wH != bestH
                                     better := wH > bestH
-                                else if not f_eqT(wid, bestW, c.mintick)
-                                    better := wid < bestW
+                                else if not f_eqT(nz(wid, 0), bestW, c.mintick)
+                                    better := nz(wid, 0) < bestW
                                 else if wFirst != bestT
                                     better := wFirst < bestT
                                 else
@@ -2707,7 +2744,7 @@ f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requir
                                 found  := true
                                 bestC  := wC
                                 bestH  := wH
-                                bestW  := wid
+                                bestW  := nz(wid, 0)
                                 bestT  := wFirst
                                 bestId := wMinId
                                 array.clear(e.scBestIdx)
