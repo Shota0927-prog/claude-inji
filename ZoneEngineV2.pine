@@ -889,6 +889,19 @@ export type ZoneEngine
     array<int>   scRawId
     //  ★ Phase6 : 挿入位置探しを tick の二分探索で絞るための正規化 tick
     array<int>   scRawTick
+    //  ★ Phase7 : tick グループ構造で使う作業配列
+    array<int>   scRawKey
+    array<int>   gpId
+    array<float> gpPrice
+    array<int>   gpIdx
+    //  ★ Phase7 : prune の「essential Root」集合を 1 回だけ作って引く
+    map<int, bool>  essIds
+    //  ★ Phase7 : Core × Candidate の gap / shared を Pass 1 で 1 回計算して保持し、
+    //    Pass 4 の親探しで再利用する。Core が書き換わった時点でその Core の行を
+    //    無効にし (coreTouched)、無効なら従来どおり再計算する。
+    array<float>    ccGap
+    array<int>      ccSh
+    array<bool>     coreTouched
     array<bool>  scUsed
     array<int>   scWinIdx
     array<int>   scBestIdx
@@ -935,6 +948,14 @@ export type ZoneEngine
     //    CAT_FVG Root の index を保持する。Side に依存するのは適格判定だけなので、
     //    窓判定と category 判定を Support / Resistance で 2 回やらないようにする。
     array<int>      fvIdx
+    //  ★ Phase7 : カテゴリ別の Root ID 一覧 (永続)。e.roots と同じ相対順を保つ。
+    //    push で append、remove で除去する。e.roots は並び替えをしない (append と
+    //    array.remove だけ) なので、この一覧を走ることは「e.roots を走って
+    //    そのカテゴリだけ抾う」と完全に同じ順序になる。
+    array<int>      catSwing
+    array<int>      catAccum
+    array<int>      catFvg
+    array<int>      catTime
     //  ★ Phase5 : dense 探索の事前境界 (1 足 1 Side に 1 回だけ作る。既定経路でも使う)
     //    dsHardEnd[a]  : a の走査が確実に読まなくなる index (真の読み範囲の superset)
     //    dsMaxCatCnt[a]: [a, dsHardEnd[a]) の category 数 (used を無視した上限)
@@ -1081,6 +1102,14 @@ export newEngine() =>
          scRawIdx   = array.new_int(),
          scRawId    = array.new_int(),
          scRawTick  = array.new_int(),
+         scRawKey   = array.new_int(),
+         gpId       = array.new_int(),
+         gpPrice    = array.new_float(),
+         gpIdx      = array.new_int(),
+         essIds     = map.new<int, bool>(),
+         ccGap      = array.new_float(),
+         ccSh       = array.new_int(),
+         coreTouched = array.new_bool(),
          scUsed     = array.new_bool(),
          scWinIdx   = array.new_int(),
          scBestIdx  = array.new_int(),
@@ -1109,6 +1138,10 @@ export newEngine() =>
          scBest      = f_newScratchCand(),
          ccSeen      = map.new<int, bool>(),
          fvIdx       = array.new_int(),
+         catSwing    = array.new_int(),
+         catAccum    = array.new_int(),
+         catFvg      = array.new_int(),
+         catTime     = array.new_int(),
          dsHardEnd   = array.new_int(),
          dsMaxCatCnt = array.new_int(),
          dsFound     = array.new_bool(),
@@ -1619,19 +1652,43 @@ f_pushRoot(ZoneEngine e, Root r) =>
     if r.originKey != ""
         map.put(e.originKeyMap, r.originKey, r.rootId)
     //  ★ Phase3C : 上限チェックが必要になるのは「そのカテゴリへ足したとき」だけ
+    //  ★ Phase7 : カテゴリ別一覧へも同じ順で append する
     if r.category == CAT_SWING
         e.capDirtySwing := true
+        array.push(e.catSwing, r.rootId)
     else if r.category == CAT_ACCUM
         e.capDirtyAccum := true
+        array.push(e.catAccum, r.rootId)
     else if r.category == CAT_FVG
         e.capDirtyFvg := true
+        array.push(e.catFvg, r.rootId)
     else if r.category == CAT_TIME_HL
         e.capDirtyTime := true
+        array.push(e.catTime, r.rootId)
     array.size(e.roots)
+
+//  ★ Phase7 : カテゴリ別一覧から rootId を 1 つ除く (相対順は保たれる)
+f_catListRemove(array<int> lst, int rootId) =>
+    int n = array.size(lst)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(lst, i) == rootId
+                array.remove(lst, i)
+                break
+    array.size(lst)
 
 f_removeRootAt(ZoneEngine e, int i) =>
     Root r = array.remove(e.roots, i)
     e.rootIdxDirty := true
+    //  ★ Phase7 : カテゴリ別一覧からも外す
+    if r.category == CAT_SWING
+        f_catListRemove(e.catSwing, r.rootId)
+    else if r.category == CAT_ACCUM
+        f_catListRemove(e.catAccum, r.rootId)
+    else if r.category == CAT_FVG
+        f_catListRemove(e.catFvg, r.rootId)
+    else if r.category == CAT_TIME_HL
+        f_catListRemove(e.catTime, r.rootId)
     if r.originKey != ""
         if map.contains(e.originKeyMap, r.originKey)
             if map.get(e.originKeyMap, r.originKey) == r.rootId
@@ -1719,11 +1776,14 @@ f_registerSwing(ZoneEngine e, ZoneCfg c, ZoneFeed f, int tfCode, bool isHigh,
         if f_rootIdxByKey(e, key) >= 0
             done := true                       // 同じ Pivot イベントの再配信
         else
-            int n = array.size(e.roots)
+            //  ★ Phase7 : 全 Root でなく Swing カテゴリ一覧を走る。
+            //    一覧の順は e.roots 順なので「最初の一致で break」の結果も同じ。
+            int n = array.size(e.catSwing)
             if n > 0
-                for i = 0 to n - 1
-                    Root r = array.get(e.roots, i)
-                    if r.category == CAT_SWING and r.subtype == sub and r.state != ROOT_RETIRED
+                for si = 0 to n - 1
+                    int i = f_rootIdxById(e, array.get(e.catSwing, si))
+                    Root r = i >= 0 ? array.get(e.roots, i) : na
+                    if not na(r) and r.category == CAT_SWING and r.subtype == sub and r.state != ROOT_RETIRED
                          and f_eqT(r.pointPrice, price, c.mintick)
                         bool lowerIntoHigher = tfCode < r.tfCode and not na(r.originEndTime)
                              and origin >= r.originTime and origin < r.originEndTime
@@ -1835,14 +1895,16 @@ f_markCoreFvgInvalid(ZoneEngine e, ZoneFeed f, int rootId) =>
 
 f_updateFvgStructural(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     int fn = array.size(f.fvgs)
-    int rn = array.size(e.roots)
+    //  ★ Phase7 : 全 Root でなく FVG カテゴリ一覧を走る (順序と集合は同じ)
+    int rn = array.size(e.catFvg)
     if c.useFvg and fn > 0 and rn > 0
         for k = 0 to fn - 1
             FvgIn v = array.get(f.fvgs, k)
             if v.newBar and not na(v.srcClose)
                 for i = 0 to rn - 1
-                    Root r = array.get(e.roots, i)
-                    if r.category == CAT_FVG and r.tfCode == v.tfCode and r.state == ROOT_ACTIVE
+                    int ri = f_rootIdxById(e, array.get(e.catFvg, i))
+                    Root r = ri >= 0 ? array.get(e.roots, ri) : na
+                    if not na(r) and r.category == CAT_FVG and r.tfCode == v.tfCode and r.state == ROOT_ACTIVE
                          and not na(v.srcCloseTime) and not na(r.confirmedTime) and v.srcCloseTime > r.confirmedTime
                         bool inval = r.direction == FVG_BULLISH ? f_ltT(v.srcClose, r.nativeBottom, c.mintick)
                              : f_gtT(v.srcClose, r.nativeTop, c.mintick)
@@ -1862,11 +1924,13 @@ f_updateFvgStructural(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
 //  Inverse FVG は一般 Flip とは別階層。FVG Root 単位で NativeRange を基準に進める。
 //  movedAway と再接触は別の確定足で判定する (足内部の値動き順序を推測しない)。
 f_updateFvgInverse(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
-    int rn = array.size(e.roots)
+    //  ★ Phase7 : FVG カテゴリ一覧を走る (順序と集合は全 Root 走査と同じ)
+    int rn = array.size(e.catFvg)
     if c.useFvg and rn > 0
         for i = 0 to rn - 1
-            Root r = array.get(e.roots, i)
-            if r.category == CAT_FVG and (r.state == ROOT_INVALIDATED or r.state == ROOT_INVERSE_WAIT)
+            int ri = f_rootIdxById(e, array.get(e.catFvg, i))
+            Root r = ri >= 0 ? array.get(e.roots, ri) : na
+            if not na(r) and r.category == CAT_FVG and (r.state == ROOT_INVALIDATED or r.state == ROOT_INVERSE_WAIT)
                 bool wasBull = r.direction == FVG_BULLISH
                 if r.state == ROOT_INVALIDATED and r.invalidatedSeq < f.baseSeq
                     bool away = wasBull ? f_leT(f.baseClose, r.nativeBottom - c.touchResetDistance, c.mintick)
@@ -1898,11 +1962,13 @@ f_updateFvgInverse(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
 //  FVG Fresh は NativeRange 固有。確定 3 本目の足そのものでは消費せず、
 //  confirmedTime より後の確定 Base 足の High / Low と inclusive intersection で終了。
 f_updateFvgFresh(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
-    int rn = array.size(e.roots)
+    //  ★ Phase7 : FVG カテゴリ一覧を走る (順序と集合は全 Root 走査と同じ)
+    int rn = array.size(e.catFvg)
     if c.useFvg and rn > 0
         for i = 0 to rn - 1
-            Root r = array.get(e.roots, i)
-            if r.category == CAT_FVG and r.fvgFresh and r.state != ROOT_RETIRED
+            int ri = f_rootIdxById(e, array.get(e.catFvg, i))
+            Root r = ri >= 0 ? array.get(e.roots, ri) : na
+            if not na(r) and r.category == CAT_FVG and r.fvgFresh and r.state != ROOT_RETIRED
                  and not na(r.confirmedTime) and not na(f.baseCloseTime) and f.baseCloseTime > r.confirmedTime
                 if f_rangesTouch(f.baseLow, f.baseHigh, r.nativeBottom, r.nativeTop, c.mintick)
                     r.fvgFresh      := false
@@ -2157,8 +2223,19 @@ f_syncPsychRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
 // ---- 5.8 Root 保存整理 -----------------------------------------------------
 //  ActiveTouch / Broken / FlipWait / InverseWait / PendingGeneration に
 //  関係する Root は削除しない (指示書 4.4)。削除したら必ず診断値へ残す。
-f_rootEssential(ZoneEngine e, int rootId) =>
-    bool ess = false
+//  ★ Phase7 : hot Core の membership の合併を 1 回だけ作る。
+//    従来は Root 1 件ごとに「全 Core × 6 配列を array.includes」を回していた。
+//    集合は全く同じ (hot の定義も 6 本の配列も変えていない) ので、
+//    「どこかの hot Core に入っているか」の真偽は完全に一致する。
+f_addIdsToSet(map<int, bool> st, array<int> ids) =>
+    int n = array.size(ids)
+    if n > 0
+        for k = 0 to n - 1
+            map.put(st, array.get(ids, k), true)
+    map.size(st)
+
+f_buildEssentialSet(ZoneEngine e) =>
+    map.clear(e.essIds)
     int n = array.size(e.cores)
     if n > 0
         for i = 0 to n - 1
@@ -2169,29 +2246,37 @@ f_rootEssential(ZoneEngine e, int rootId) =>
                  or pr == PH_ACTIVE_TOUCH or pr == PH_BROKEN or pr == PH_FLIP_WAIT
                  or z.pendingTopology or z.pendingGeneration or z.breakSnap.valid
             if hot
-                bool hit = array.includes(z.originRootIds, rootId)
-                     or array.includes(z.supportView.rootIds, rootId)
-                     or array.includes(z.resistanceView.rootIds, rootId)
-                     or array.includes(z.supportView.touchSnapshot.rootIds, rootId)
-                     or array.includes(z.resistanceView.touchSnapshot.rootIds, rootId)
-                     or array.includes(z.breakSnap.rootIds, rootId)
-                if hit
-                    ess := true
-                    break
-    ess
+                f_addIdsToSet(e.essIds, z.originRootIds)
+                f_addIdsToSet(e.essIds, z.supportView.rootIds)
+                f_addIdsToSet(e.essIds, z.resistanceView.rootIds)
+                f_addIdsToSet(e.essIds, z.supportView.touchSnapshot.rootIds)
+                f_addIdsToSet(e.essIds, z.resistanceView.touchSnapshot.rootIds)
+                f_addIdsToSet(e.essIds, z.breakSnap.rootIds)
+    map.size(e.essIds)
+
+f_rootEssential(ZoneEngine e, int rootId) =>
+    map.contains(e.essIds, rootId)
 
 f_rootProtected(Root r) =>
     //  FVG の Invalidated / InverseWait は削除禁止 (Inverse 待ちの明示状態)
     r.category == CAT_FVG and (r.state == ROOT_INVALIDATED or r.state == ROOT_INVERSE_WAIT)
 
+//  ★ Phase7 : カテゴリ別一覧を走る (数える対象と条件は従来と同じ)
+f_catListOf(ZoneEngine e, int cat) =>
+    cat == CAT_SWING ? e.catSwing : cat == CAT_ACCUM ? e.catAccum :
+     cat == CAT_FVG ? e.catFvg : e.catTime
+
 f_countRootsInCategory(ZoneEngine e, int cat) =>
     int c = 0
-    int n = array.size(e.roots)
+    array<int> lst = f_catListOf(e, cat)
+    int n = array.size(lst)
     if n > 0
-        for i = 0 to n - 1
-            Root r = array.get(e.roots, i)
-            if r.category == cat and r.state != ROOT_RETIRED
-                c := c + 1
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(lst, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if r.category == cat and r.state != ROOT_RETIRED
+                    c := c + 1
     c
 
 //  ★ Phase3C : distinct な pairKey の件数を array.includes() の文字列線形探索ではなく
@@ -2199,12 +2284,15 @@ f_countRootsInCategory(ZoneEngine e, int cat) =>
 //    1 件と数えるところも Version 3 と完全に同じ。O(n²) が O(n) になるだけ。
 f_countAccumBoxes(ZoneEngine e) =>
     map<string, bool> keys = map.new<string, bool>()
-    int n = array.size(e.roots)
+    //  ★ Phase7 : Accum カテゴリ一覧を走る
+    int n = array.size(e.catAccum)
     if n > 0
-        for i = 0 to n - 1
-            Root r = array.get(e.roots, i)
-            if r.category == CAT_ACCUM and r.state != ROOT_RETIRED
-                map.put(keys, r.pairKey, true)
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(e.catAccum, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if r.category == CAT_ACCUM and r.state != ROOT_RETIRED
+                    map.put(keys, r.pairKey, true)
     map.size(keys)
 
 f_removeRetiredRoots(ZoneEngine e) =>
@@ -2274,6 +2362,12 @@ f_pruneCatIfDirty(ZoneEngine e, ZoneCfg c, ZoneFeed f, int cat, int cap, bool di
     [rm, stillDirty]
 
 f_pruneRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    //  ★ Phase7 : essential Root 集合をこの時点で 1 回だけ作る。
+    //    以降の f_rootEssential() は map 引きのみ (全 Core × 6 配列の走査をやめる)。
+    //    Core の phase / pending / breakSnap と membership はこの時点で確定している
+    //    (f_rebuildCores → f_finalizeCore の後でこの関数が呼ばれる) ので、
+    //    ループ中に hot の集合が変わることはない。
+    f_buildEssentialSet(e)
     int removed = 0
     if e.retiredDirty
         removed := f_removeRetiredRoots(e)
@@ -2479,7 +2573,9 @@ f_catPricesMedianSc(ZoneEngine e, array<int> ids, int cat) =>
     int n = array.size(ids)
     if n > 0
         for k = 0 to n - 1
-            int i = array.get(idx, k)
+            //  ★ e.scIdxOfIds は別 Candidate の内容で上書きされる scratch なので、
+            //    この関数 (View 適用時に呼ばれる) では流用しない。
+            int i = f_rootIdxById(e, array.get(ids, k))
             if i >= 0
                 Root r = array.get(e.roots, i)
                 if r.category == cat and not r.isRangeRoot and not na(r.pointPrice)
@@ -2814,12 +2910,29 @@ f_pairTokenOf(ZoneEngine e, string pairKey) =>
     tok
 
 f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
-    //  scRawPrice / scRawId / scRawIdx は 3 本並びで Version 3 の (prices, ids) と
-    //  同じ挿入列を作る。scRawIdx は e.roots 上の index (後で項目を拾うため)。
+    //  ★ Phase7 : 2 段構造。全体配列への途中 insert をやめ、
+    //    同 tick グループの中だけで旧版と同じ挿入処理を行う。
+    //
+    //  なぜこれが Version 3 と完全に同じ並びになるか
+    //    旧版の挿入条件は `price < pk or (eqT(price, pk) and rootId < ik)`。
+    //    tick が違う 2 値は、tick の大小と raw の大小が必ず一致する
+    //    (round(p/mt) が小さければ p も小さい)。したがって
+    //      ・tick が小さい位置 : 条件は必ず偽 (跳び越える)
+    //      ・tick が大きい位置 : 条件は必ず真 (そこで止まる)
+    //    だから旧版の配列は「tick 昇順のグループ列」で、
+    //    1 件の挿入が並びを動かすのは自分と同じ tick の群の中だけ。
+    //    よって群ごとに分けて、群のメンバを **e.roots の元の走査順** で
+    //    同じ挿入処理にかけ、tick 昇順に連結すれば同一の配列になる。
+    //
+    //  グループ化のやり方
+    //    key = tick * 1000000 + 元の順番 を sort_indices する。key は一意なので
+    //    同値なし = 結果は一意に決まる。tick でまとまり、群の中は元の順。
+    //    (価格での単純な array.sort 置換ではない。群の中の比較は旧版のまま)
     array.clear(e.scRawPrice)
     array.clear(e.scRawId)
     array.clear(e.scRawIdx)
     array.clear(e.scRawTick)
+    array.clear(e.scRawKey)
     int n = array.size(e.roots)
     if n > 0
         for i = 0 to n - 1
@@ -2827,40 +2940,10 @@ f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
             bool inWindow = na(refClose) or na(r.pointPrice)
                  or math.abs(r.pointPrice - refClose) <= c.dormantDistance
             if inWindow and r.category != CAT_FVG and not na(r.pointPrice) and r.state == ROOT_ACTIVE
-                //  ★ Version 3 と 1 行ずつ同じ挿入位置探し。
-                //    ★ Phase6 : 線形走査の開始位置を tick の二分探索で絞る。
-                //
-                //    根拠 : 挿入条件は `price < pk or (eqT(price,pk) and rootId < ik)`。
-                //      tick が違う 2 値の大小は必ず raw の大小と一致する
-                //      (round(p/mt) が小さければ p も小さい) ので、
-                //        tick(pk) < tick(price)  → price > pk かつ eqT は偽 → 条件は必ず偽
-                //      したがってその範囲は調べる必要がない。
-                //      配列の tick 列は非減少に保たれるので二分探索できる。
-                //      同 tick の群の中だけは Version 3 と完全に同じ線形走査を行う
-                //      (ここの比較は raw 価格と rootId が混ざり推移律がないため)。
-                int nowTick = int(f_tickOf(r.pointPrice, c.mintick))
-                int sz  = array.size(e.scRawId)
-                int pos = sz
-                int loB = 0
-                int hiB = sz
-                while loB < hiB
-                    int mid = int(math.floor((loB + hiB) / 2))
-                    if array.get(e.scRawTick, mid) < nowTick
-                        loB := mid + 1
-                    else
-                        hiB := mid
-                if loB < sz
-                    for k = loB to sz - 1
-                        float pk = array.get(e.scRawPrice, k)
-                        int   ik = array.get(e.scRawId, k)
-                        if r.pointPrice < pk or (f_eqT(r.pointPrice, pk, c.mintick) and r.rootId < ik)
-                            pos := k
-                            break
-                array.insert(e.scRawId, pos, r.rootId)
-                array.insert(e.scRawPrice, pos, r.pointPrice)
-                array.insert(e.scRawIdx, pos, i)
-                array.insert(e.scRawTick, pos, nowTick)
-    //  確定した並びのまま、探索で読む項目を並行配列へ写す (順番はここで変えない)
+                array.push(e.scRawPrice, r.pointPrice)
+                array.push(e.scRawId, r.rootId)
+                array.push(e.scRawIdx, i)
+                array.push(e.scRawTick, int(f_tickOf(r.pointPrice, c.mintick)))
     array.clear(e.snRootId)
     array.clear(e.snIdx)
     array.clear(e.snPrice)
@@ -2874,20 +2957,58 @@ f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
     array.clear(e.snPair)
     int m = array.size(e.scRawIdx)
     if m > 0
-        for k = 0 to m - 1
-            int ri = array.get(e.scRawIdx, k)
-            Root r = array.get(e.roots, ri)
-            array.push(e.snRootId, r.rootId)
-            array.push(e.snIdx, ri)
-            array.push(e.snPrice, r.pointPrice)
-            array.push(e.snCat, r.category)
-            array.push(e.snTf, r.tfCode)
-            array.push(e.snTfMask, r.tfMask)
-            array.push(e.snDir, r.direction)
-            array.push(e.snConfirm, nz(r.confirmedTime, 0))
-            array.push(e.snOrigin, nz(r.originTime, 0))
-            array.push(e.snLabel, r.labelMask)
-            array.push(e.snPair, r.category == CAT_ACCUM ? f_pairTokenOf(e, r.pairKey) : 0)
+        for q = 0 to m - 1
+            array.push(e.scRawKey, array.get(e.scRawTick, q) * 1000000 + q)
+        array<int> ord = array.sort_indices(e.scRawKey, order.ascending)
+        int pp = 0
+        while pp < m
+            int tk = array.get(e.scRawTick, array.get(ord, pp))
+            array.clear(e.gpId)
+            array.clear(e.gpPrice)
+            array.clear(e.gpIdx)
+            int q2 = pp
+            bool more = true
+            while more
+                if q2 >= m
+                    more := false
+                else if array.get(e.scRawTick, array.get(ord, q2)) != tk
+                    more := false
+                else
+                    int src = array.get(ord, q2)
+                    float pr = array.get(e.scRawPrice, src)
+                    int rid  = array.get(e.scRawId, src)
+                    int ri   = array.get(e.scRawIdx, src)
+                    //  ★ ここだけが旧版と完全に同じ挿入処理 (同 tick 群の中)
+                    int pos = array.size(e.gpId)
+                    int gn  = pos
+                    if gn > 0
+                        for k = 0 to gn - 1
+                            float pk = array.get(e.gpPrice, k)
+                            int   ik = array.get(e.gpId, k)
+                            if pr < pk or (f_eqT(pr, pk, c.mintick) and rid < ik)
+                                pos := k
+                                break
+                    array.insert(e.gpId, pos, rid)
+                    array.insert(e.gpPrice, pos, pr)
+                    array.insert(e.gpIdx, pos, ri)
+                    q2 := q2 + 1
+            int gm = array.size(e.gpIdx)
+            if gm > 0
+                for k = 0 to gm - 1
+                    int ri2 = array.get(e.gpIdx, k)
+                    Root r2 = array.get(e.roots, ri2)
+                    array.push(e.snRootId, r2.rootId)
+                    array.push(e.snIdx, ri2)
+                    array.push(e.snPrice, r2.pointPrice)
+                    array.push(e.snCat, r2.category)
+                    array.push(e.snTf, r2.tfCode)
+                    array.push(e.snTfMask, r2.tfMask)
+                    array.push(e.snDir, r2.direction)
+                    array.push(e.snConfirm, nz(r2.confirmedTime, 0))
+                    array.push(e.snOrigin, nz(r2.originTime, 0))
+                    array.push(e.snLabel, r2.labelMask)
+                    array.push(e.snPair, r2.category == CAT_ACCUM ? f_pairTokenOf(e, r2.pairKey) : 0)
+            pp := q2
     array.size(e.snRootId)
 
 //  ★ Phase4 : FVG Root の索引を 1 足 1 回だけ作る。
@@ -2897,11 +3018,14 @@ f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
 //    f_collectFvgRoots() の中で行うので、集合と push 順は完全に同じ。
 f_buildFvgIndex(ZoneEngine e, ZoneCfg c, float refClose) =>
     array.clear(e.fvIdx)
-    int n = array.size(e.roots)
+    //  ★ Phase7 : 全 Root 走査をやめ FVG カテゴリ一覧を走る。
+    //    一覧の順は e.roots 順なので push 順は従来と同じ。
+    int n = array.size(e.catFvg)
     if n > 0
-        for i = 0 to n - 1
-            Root r = array.get(e.roots, i)
-            if r.category == CAT_FVG
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(e.catFvg, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
                 float d = na(refClose) ? 0.0 : f_distanceToRangeRaw(refClose, r.nativeBottom, r.nativeTop)
                 if nz(d, 0.0) <= c.dormantDistance
                     array.push(e.fvIdx, i)
@@ -4247,6 +4371,15 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     f_fillInt(coreToCand, nc, -1)
     f_fillBool(coreMerged, nc, false)
     f_fillInt(candPrimary, nk, -1)
+    //  ★ Phase7 : Core × Candidate の比較値キャッシュ (nc × nk)。
+    //    Pass 1 で埋め、Pass 4 で coreTouched でない Core についてだけ使う。
+    f_fillBool(e.coreTouched, nc, false)
+    array.clear(e.ccGap)
+    array.clear(e.ccSh)
+    int ccN = int(math.max(nc * nk, 1))
+    for q = 0 to ccN - 1
+        array.push(e.ccGap, float(na))
+        array.push(e.ccSh, 0)
 
     if nc > 0
         for ci = 0 to nc - 1
@@ -4267,6 +4400,9 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
                 float gap = f_intervalGap(z.physBottom, z.physTop, cc.bottom, cc.top)
                 bool nearOk = not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
                 int sh = nearOk ? f_sharedSorted(z.originRootIdsSorted, cc.originRootIdsSorted) : 0
+                //  ★ Phase7 : Pass 4 で再利用するために保持する
+                array.set(e.ccGap, ci * nk + k, gap)
+                array.set(e.ccSh, ci * nk + k, sh)
                 if sh >= 1 and nearOk
                     bool better = best < 0 or sh > bestSh
                          or (sh == bestSh and gap < nz(bestGap, 1e20))
@@ -4311,6 +4447,10 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
                         else
                             f_mergeCore(e, c, f, pz, oz)
                             array.set(coreMerged, ci, true)
+                            //  ★ Phase7 : merge は pz の physRange / originRootIdsSorted を
+                            //    書き換えるので、両方の行を無効にする
+                            array.set(e.coreTouched, prim, true)
+                            array.set(e.coreTouched, ci, true)
 
     // Pass 4 : 候補を Core へ適用 / 新規 Core 作成 (Split 判定つき)
     if nk > 0
@@ -4321,15 +4461,27 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
                 ZoneCore z = array.get(e.cores, prim)
                 f_applyCoreCand(e, c, f, z, cc, sup, res)
                 z.matched := true
+                //  ★ Phase7 : apply も physRange / originRootIdsSorted を書き換え得る
+                array.set(e.coreTouched, prim, true)
             else
                 int parentIdx = -1
                 if nc > 0
                     for ci = 0 to nc - 1
                         if not array.get(coreMerged, ci)
                             ZoneCore zp = array.get(e.cores, ci)
-                            float gap = f_intervalGap(zp.physBottom, zp.physTop, cc.bottom, cc.top)
+                            //  ★ Phase7 : その Core が Pass 1 以降書き換わっていなければ
+                            //    Pass 1 の値をそのまま使う (同じ式・同じ入力なので同じ値)。
+                            //    書き換わっていたら従来どおり再計算する。
+                            float gap = float(na)
+                            int sh = 0
+                            if array.get(e.coreTouched, ci)
+                                gap := f_intervalGap(zp.physBottom, zp.physTop, cc.bottom, cc.top)
+                                bool nk2 = not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
+                                sh := nk2 ? f_sharedSorted(zp.originRootIdsSorted, cc.originRootIdsSorted) : 0
+                            else
+                                gap := array.get(e.ccGap, ci * nk + k)
+                                sh  := array.get(e.ccSh, ci * nk + k)
                             bool nearOk2 = not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
-                            int sh = nearOk2 ? f_sharedSorted(zp.originRootIdsSorted, cc.originRootIdsSorted) : 0
                             if sh >= 1 and nearOk2
                                 bool takeP = parentIdx < 0
                                 if not takeP

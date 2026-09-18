@@ -1401,6 +1401,106 @@ physRange / pendingTopology / pendingGeneration / breakSnap を読むが、そ�
 | `f_pairSides()` | 1 | `O(sup · res)` | gap 先判定 + two-pointer 済み |
 | `f_qualityFvgWith()` / `f_qualityAccum` の a×b | 2 | `O(ids²)` | ids は数件〜数十件 |
 
+## Phase 7 : バグ修正と 20 項目の再実施
+
+### 1. コンパイルエラー (指摘のとおり、私のバグ)
+
+`f_catPricesMedianSc()` 内の `idx` は未定義だった。Phase 6 の一括置換で使った
+関数本体の切り出しが `\n\nf_` を境界にしていたため、`f_qualityFvg` の後にある
+コメントブロックを越えて `f_catPricesMedianSc()` まで書き換えてしまっていた。
+指示どおり `f_rootIdxById(e, array.get(ids, k))` へ戻し、
+`e.scIdxOfIds` は別 Candidate の内容で上書きされる scratch なのでこの関数では流用しない
+旨をコメントに残した。
+
+### 2. 静的検査が見逃した原因と修正
+
+旧チェッカは **未定義「関数」だけ** を見ていて、未定義「変数」を見ていなかった。
+`tools/check_pine.py` を新設し、**関数スコープ単位の未定義変数検査** を入れた。
+
+- 関数ごとに、引数 / 型付きローカル / tuple 宣言 / ループ変数 / `:=` 対象を scope として集め、
+  それ以外の名前の読み出しを全件報告する (file-level global / UDT フィールド / 組み込み / import alias は除外)。
+- 併せて、括弧不均衡 / 行を跨ぐ文字列リテラル / 継続行インデントも同じスクリプトで見る。
+
+**回帰テスト済み** : 同じバグを意図的に再導入したコピーを検査すると、
+`f_catPricesMedianSc` を含む 5 箇所を `undefined name: idx` として検出する。
+現行 3 ファイルは **0 件**。
+
+### 3. Snapshot の計算量記述の訂正と、指定された 2 段構造の実装
+
+指摘のとおり、Phase 6 の記述は誕張だった。二分探索したのは **位置検索の比較回数**
+だけで、`array.insert()` の要素移動 `O(R)` が毎件残っていたので、全体は依然 `O(R²)` だった。
+
+今回ご提案の 2 段構造を実装した。
+
+1. 対象 Root を未ソート配列へ push (e.roots 順)
+2. `key = tick * 1000000 + 元の順番` を `array.sort_indices` で tick グループ化
+   (key は一意なので同値なし = 結果は一意、群の中は元の順)
+3. 異なる tick 間は tick 昇順
+4. **同一 tick 内だけ** 旧版と同じ挿入処理を元の Root 走査順で再現
+5. 完成した tick グループを最終配列へ push
+
+**同値性** : 旧版の挿入条件は `price < pk or (eqT(price,pk) and rootId < ik)`。
+tick が違う 2 値は tick の大小と raw の大小が必ず一致するので、
+tick が小さい位置は必ず偽・tick が大きい位置は必ず真。したがって旧版の配列は
+tick 昇順の群列で、**1 件の挿入が並びを動かすのは自分と同じ tick の群の中だけ**。
+よって群ごとに分けて同じ挿入を行い tick 昇順に連結すれば同一の配列になる。
+
+**計算量 (今回の正しい記述)** : `O(R²)` → `O(R log R + Σ g²)` (g = 同 tick 群のサイズ)。
+`array.insert` の要素移動も群内に限定される。`array.sort` への単純置換はしていない。
+
+### 4. 「変更不要」を実装に置き換えたもの
+
+| 対象 | 実装内容 | 同値性の根拠 |
+|---|---|---|
+| 全 FVG Root を永続配列で管理 | `e.catFvg` (rootId の永続配列)。`f_pushRoot()` で append、`f_removeRootAt()` で除去 | `e.roots` は append と `array.remove` だけで並び替えをしないので、この一覧の順 = `e.roots` 順の FVG だけ |
+| Structural / Inverse / Fresh | 3 つとも `e.catFvg` だけを走る (全 Root 走査を廃止) | 三つの関数はもともと `r.category == CAT_FVG` のものだけを触る。集合と順序が同じ |
+| Swing 同価格探し | `e.catSwing` だけを走る | 同上 (「最初の一致で break」の結果も順序が同じなら同じ) |
+| Accum / TimeHL の件数・箱数 | `e.catAccum` / `e.catTime` を走る | 数える対象と条件は未変更 |
+| `f_buildFvgIndex()` | `e.catFvg` を走る | push 順は従来と同じ |
+| Core × Candidate 比較値 | Pass 1 で `gap` / `shared` を `nc × nk` に保持。Pass 4 の親探しで **その Core が Pass 1 以降書き換わっていなければ** 再利用 | `f_mergeCore()` / `f_applyCoreCand()` を呼んだ瞬間に `coreTouched[ci]` を立て、立っている Core は従来どおり再計算する。比較式と入力が同じなら同じ値 |
+| waiting / live / mustKeep (essential 判定) | `f_buildEssentialSet()` で hot Core の membership 合併を `f_pruneRoots()` の先頭で 1 回作り、`f_rootEssential()` は map 引きのみ | hot の定義と 6 本の配列は未変更。Core 状態は `f_finalizeCore()` 後に確定しており、`f_pruneRoots()` 内の Root 削除は Core の membership 配列を変えない |
+
+### 監査数値の推移
+
+| 指標 | Phase 5 | Phase 6 | **Phase 7** |
+|---|---:|---:|---:|
+| `array.includes` | 13 | 11 | **5** |
+| `array.insert` | 3 | 4 | **3** (同 tick 群内のみ) |
+| `array.size(e.roots)` (全件走査の目安) | 21 | 21 | **14** |
+| 毎足全 Root 走査する関数 | 6 | 6 | **3** (`f_buildPointSnapshot` / `f_syncPsychRoots` / `f_updateTimeHlRoots`) |
+| `f_rootIdxById` | 38 | 25 | 33 |
+| Snapshot 構築 | `O(R²)` | `O(R²)` (比較回数のみ減) | **`O(R log R + Σ g²)`** |
+
+`f_rootIdxById` が 25 → 33 へ増えているのは、カテゴリ別一覧が rootId を持つため
+解決が必要になったからで、**1 件ごとは map 引き `O(1)`**。
+置き換えたのは `O(R)` の全走査なので、呼び出し回数の増加と引き換えに増減は逆向きになる。
+この点は「削減」とは記述しない。
+
+### 残っている Hot loop と、Pine 上で同値最適化ができない具体的根拠
+
+| 箇所 | 計算量 | 根拠 |
+|---|---|---|
+| `f_searchDenseBest()` a×b | `12 · O(n · k)` | 探索する窓の集合を減らせば結果が変わる。Phase 5 の事前除外 (BaseStrong 不可能な a) と Phase 3G (ラウンド間キャッシュ) が、結果を変えずに削れる限度 |
+| `f_rebuildCores()` Pass 1 | `O(nc · nk)` | Pass 1 は全ペアの `gap` を知らないと argmax が決まらない。価格帯索引で絞るには Core を範囲でソートした構造が必要だが、Pass 3/4 が Core の範囲を書き換えるためその構造を Pass を越えて保てない |
+| `f_rebuildCores()` Pass 4 親探し | `O(nk · nc)` → キャッシュヒット時は `O(1)` / ペア | Phase 7 でキャッシュ済み。書き換わった Core だけ再計算 |
+| `f_fvgAttachAndStandalone()` | `O(fvg · cand)` | 下記 |
+| `f_pairSides()` | `O(sup · res)` | Support 候補ごとに「最もよく一致する Resistance 候補」を選ぶ argmax なので、全ペアの判定が必要。gap 先判定と two-pointer で定数倍は落としてある |
+| `f_qualityFvgWith` / `f_qualityAccum` の a×b | `O(ids²)` | 「異なる時間足の別 Box 境界が同じ core にいるか」は全ペア判定。ids は Candidate 1 件分 (数件〜数十件) |
+
+#### FVG × Candidate について (「効果が小さい」ではない理由)
+
+実装は可能で、同値性の根拠も確定している :
+attach が成立するのは `inside or proximal` 、つまり Candidate の範囲が FVG の NativeRange から
+`denseWidth` 以内にある場合だけ。attach 対象の Candidate は `isBroadContext` でないので
+幅は `clusterMaxWidth` 以下。よって Candidate を `bottom` でソートしておけば、
+`[r.nativeBottom - denseWidth - M, r.nativeTop + denseWidth]` の連続帯が superset になる。
+その帯を元の Candidate index 昇順に並び直して従来の判定をかければ厳密に同値。
+期待効果はこのループで約 4 倍 (fvg 120 × cand 40 の場合)。
+
+**今回入れていない理由は「本ラウンドですでに未検証の同値変更を 5 件積んでいる」こと**。
+6 件目を同時に入れると、A/B で差分が出たときに原因を切り分けられなくなる。
+A/B で今回分の全一致を確認したら、これを単独で入れる。
+
 ## Known limitations
 
 - **Pine Editor でのコンパイル・実行を確認していない。** スクリプトサイズ上限、`request.security` の
