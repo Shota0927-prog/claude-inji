@@ -52,6 +52,34 @@ Harness の `ev.time`。呼び出し側へ渡す値 (`f.baseLow` / `f.baseHigh` 
 (`maPackV2` / `pivotPackV2` / `accumPackV2` / `fvgPackV2` 内の `high` / `low` / `close` / `time` は
 外部足コンテキストで価格データを読んでいる正規の使用なので変更していない)。
 
+### 2 回目のコンパイル結果 (利用者側で実施) と v6 移行
+
+`Script has too many local scopes: 774. The limit is 550` (v5 のスコープ総数上限)。
+仕様条件やロジックを削って 550 以下へ収める対応はせず、**両ファイルを Pine v6 へ移行**して解消する
+(v6 はこのスコープ総数上限が撤廃されている)。
+
+| 変更 | ファイル | 変更前 | 変更後 |
+|---|---|---|---|
+| バージョン宣言 | `ZoneEngineV2.pine` L54 | `//@version=5` | `//@version=6` |
+| バージョン宣言 | `ZoneEngineV2_VisualHarness.pine` L34 | `//@version=5` | `//@version=6` |
+| bool の `nz()` (v6 非対応) | `ZoneEngineV2.pine` `accumPackV2` L1045 | `bool endedNow = nz(cond[2], false) and not nz(cond[1], false)` | `bool endedNow = cond[2] and not cond[1]` |
+| bool の `nz()` (v6 非対応) | `ZoneEngineV2.pine` `accumPackV2` L1050 | `if nz(cond[i], false)` | `if cond[i]` |
+
+v6 では bool が `na` にならず履歴不足は `false` になるため、この 2 箇所は従来の `false` フォールバックと
+同じ挙動のまま。Zone / Root / Touch / Break / Flip / Generation の判定式、ループ、配列上限、保持履歴は
+1 箇所も変更していない。
+
+`nz(boolValue, false)` / `na(boolValue)` / `fixnan(boolValue)` が他に残っていないことを両ファイルで確認
+(`nz()` の残り 30 箇所はすべて int / float、`na()` は float・int・UDT・table・label が対象。`fixnan` は不使用)。
+v6 で厳格化された組み込み名シャドーイングも、広い組み込み名リスト (価格・時刻・名前空間・定数系) で
+再走査して 0 件を確認した。
+
+v6 の遅延評価 (`and` / `or` / 三項) は、既に「na オブジェクトや負 index を第 2 項で評価しない」形へ
+分解済みのため挙動は変わらない。
+
+**Harness の import 番号**: `ZoneEngineV2.pine` を v6 で再 Publish したあと、
+`import shota0927-prog/ZoneEngineV2/<新しい番号> as zn2` へ差し替えること (現状は `/1` のまま)。
+
 ### 静的確認 (共通)
 
 この実装環境から TradingView / Pine Editor へアクセスできないため、「コンパイル済み」とは書かない。
