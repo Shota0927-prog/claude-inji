@@ -1355,6 +1355,52 @@ physRange / pendingTopology / pendingGeneration / breakSnap を読むが、そ�
 指定された dirty 条件 (「Root の価格・range 変更」) に毎足該当する。
 詳細は上の Phase 4 節に記載。
 
+## Phase 6 : 20 項目の一括処理結果
+
+分類は 3 つだけ : **実装済み** / **変更不要** / **結果同値を保証できないため未変更**。
+
+| # | 項目 | 分類 | 内容 / 理由 |
+|---|---|---|---|
+| 1 | `f_rebuildCores()` の毎バー廃止 + Topology dirty | **結果同値を保証できないため未変更** | `f_upsertMa()` が毎確定足で EMA Root の `pointPrice` と `confirmedTime` を書き換える。この 2 つは窓判定・並び・Candidate range・Density・`f_qualityMa`・`firstConfirmTime` (tie-break) の直接入力。よって指定された dirty 条件が毎足 true になり skip できない。加えて Pass 1〜4 は Core の phase / physRange / pending / breakSnap を読み、それらは毎足 `f_processSide()` 等が書き換える |
+| 2 | `f_buildPointSnapshot()` の挿入順キャッシュ | **一部実装済み** (キャッシュは未変更) | キャッシュは #1 と同じ理由で不可。代わりに **挿入位置探しを tick の二分探索で絞った** (`O(R²)` → `O(R log R + 同 tick 群)`)。tick が違う 2 値の大小は必ず raw の大小と一致するので、tick が小さい範囲は条件が必ず偽 → 調べる必要がない。同 tick 群の中は Version 3 と完全に同じ線形走査。`array.sort` への置換はしていない |
+| 3 | Root ID / category / TF / direction / state / FVG / Core membership の全索引化 | **一部実装済み + 変更不要** | 実装済み : `rootIdx` (ID→index) / `originKeyMap` / `psychKeyMap` / `pairTokenMap` / `fvIdx` (FVG)。変更不要 : category / TF / direction 別一覧は、監査の結果毎足全 Root 走査が残る 6 箇所がすべて「指示 9 が毎足必須とした状態更新」または「1 足 1 回の Snapshot 作成」で、索引を作る自体が同じ全走査になる |
+| 4 | Hot loop の `f_rootIdxById()` を事前 index 参照へ | **実装済み** | `f_fillCandFrom()` の既存ループで ids の Root index を 1 回解決し `e.scIdxOfIds` へ保持。`f_qualityMa/Swing/Accum/TimeHl/Fvg` はこれを読む。全体 38 → **25 件**、ループ深度 2 の箇所 14 → **2 件**。dense 探索からは引き続き **0 件** |
+| 5 | Hot loop の `array.includes()` を mask / map / ソート済みへ | **実装済み** | クラスタリング / Core マッチングの hot path は **0 件** (two-pointer `f_sharedSorted` / 二分探索 `f_containsSorted`)。全体 13 → **11 件** (`f_qualityMa` の 2 件を今回除去)。残りは `f_rootEssential` 6 (prune 時のみ) / `f_markCoreFvgInvalid` 3 (構造無効化足のみ) / `f_identityIds` 2 (push 順を変えられない) |
+| 6 | Candidate の C/H/Density/identity/median/range/FVG 品質を 1 回計算し共有 | **実装済み** | Phase 3A/3B。探索中は増分スカラ、保存時に 1 回。`refPrice` も Candidate ごと 1 回キャッシュ |
+| 7 | Dense / Sweep / Support / Resistance で同じ Root Snapshot を共有 | **実装済み** | Phase 3B。1 足 1 回の 11 本の並行配列 (`snRootId` 他) を 4 経路で共有 |
+| 8 | FVG attach/standalone の FVG×Candidate を事前索引で絞る | **変更不要** | 高コストな `f_fvgTrialEval()` はすでに安価な幾何判定 (`f_rangesTouch` / `f_intervalGap`) で gate されており、索引を入れても除外できるのは同じ幾何判定の再実施分のみ。FVG 側の窓絞りは `f_buildFvgIndex()` で Phase 4 に実装済み |
+| 9 | Core×Candidate の gap / shared / membership を 1 回計算し全 Pass で共有 | **結果同値を保証できないため未変更** | Pass 3 の `f_mergeCore()` と Pass 4 の `f_applyCoreCand()` が Core の `physBottom/physTop` と `originRootIdsSorted` を書き換えるため、Pass 1 で求めた gap / shared は Pass 4 時点では古い。キャッシュして共有すると Split 先の選択が変わり得る |
+| 10 | Merge / Split / primary Core 選択の重複走査統合 | **実装済み** | Pass 2 を `O(k × cores)` の二重ループから **Core 1 周 `O(cores)`** へ。結果は「k を選んだ Core の coreId 最小」= argmin で、Core ID は一意なので走査順に依らない → 厳密に同値 |
+| 11 | Core の waiting/live/mustKeep 用 Root 状態キャッシュ | **変更不要** | `f_coreHasWaitingRoot` / `f_coreHasAnyLiveRoot` はその Core 自身の origin 一覧 (数件) を走るだけで、引きはすでに map で `O(1)`。全 Root 走査ではない |
+| 12 | FVG Structural/Fresh/Inverse の全 Root・全 Core 再走査を索引化 | **変更不要** | 索引を作るには同じバー内で全 Root 走査が必要 (この 3 処理の途中で FVG Root が生成されるため)。FVG Root は全体の約 20% なので、全走査 3 回 → 索引再構築 2 回 + 索引走査 3 回 で正味が小さい (約 13%)。無効化リスクに見合わない |
+| 13 | Swing/Accum/TimeHL/Psych の全 Root 検索を category/key 索引へ | **一部実装済み + 変更不要** | 実装済み : Swing/Accum/FVG/TimeHL は `originKeyMap`、Psych は `psychKeyMap`。変更不要 : `f_registerSwing()` の同価格探しは新規 Pivot イベントのときだけ (毎足ではない) で、且つ最初の一致で break する順序依存がある |
+| 14 | Retired Root / category cap / Core prune / Pending 集計を dirty 時だけ | **実装済み** | `retiredDirty` / `capDirtySwing/Accum/Fvg/Time`。Pending 集計は `O(cores)` の軽いループで、Core prune も dirty 条件付き |
+| 15 | Source helper の Accum/Swing/FVG/MA 計算と scratch 再利用 | **実装済み + 変更不要** | 実装済み : `accumCondV2` の `rangeShort = rangeNow` 再利用 (`ta.highest`/`ta.lowest` 2 回削減)。変更不要 : Pack は `request.security` の別評価コンテキストで走るので Engine の scratch を共有できない。`ACCUM_RUN_SCAN_MAX` は未変更 |
+| 16 | `request.security` を同一 symbol・同一時間足で統合 | **実装済み** | 10 → **6 call** (既定設定)。`time(tf)` も 9 → **5 本**。UDT Bundle で tuple 要素 192 → **104** (上限 127) |
+| 17 | Candidate/CoreCand/一時配列/map/median/sort 配列を pool・scratch 化 | **実装済み** | Phase 3E/3F。定常状態で `ZoneCand.new` / `CoreCand.new` は **0**。nested loop 内の `array.new` / `array.copy` は **0** |
+| 18 | 過去足の View/Event/Label/Line/Box/Table 生成を完全停止 | **実装済み** | Phase 3D。`updateVisualLite(buildProjection, captureEvents)`。Library 内の描画生成は監査上 **0 件** |
+| 19 | Visual Harness を Engine 1 つの standalone 构成に | **実装済み** | Parity Harness 削除済み。FULL / SAFE とも import 行数 = 1 (検査済み) |
+| 20 | 全 `for/while/array.new/copy/insert/sort/includes/f_rootIdxById` の監査 | **実装済み** | `tools/audit_hotspots.py`。包囲関数とループ深度付きで全件抽出し、各群の処置を記録 |
+
+### 旧版 (Phase 5) との差分
+
+| 指標 | Phase 5 | Phase 6 |
+|---|---:|---:|
+| `f_buildPointSnapshot()` の挿入探索 | `O(R²)` | `O(R log R + 同 tick 群)` |
+| `f_rebuildCores()` Pass 2 | `O(k × cores)` | `O(cores)` |
+| `f_rootIdxById` 篇所 (全体 / 深度2) | 38 / 14 | **25 / 2** |
+| `array.includes` 篇所 | 13 | **11** |
+
+### 残っている Hot loop (全件)
+
+| 箇所 | 深度 | 計算量 | 状態 |
+|---|---:|---|---|
+| `f_searchDenseBest()` a×b | 2 | `12 · O(n · k)` / Side | Phase 5 の事前除外で `dsMaxCatCnt < 2` の a を全ラウンドスキップ。Phase 3G (既定 OFF) で 2〜12 ラウンドを affected のみへ |
+| `f_fvgAttachAndStandalone()` | 2 | `O(fvg · cand)` | 高コスト部分は幾何判定で gate 済み |
+| `f_rebuildCores()` Pass 1 / Pass 4 | 1 | `O(cores · cands)` | #9 の理由で共有不可 |
+| `f_pairSides()` | 1 | `O(sup · res)` | gap 先判定 + two-pointer 済み |
+| `f_qualityFvgWith()` / `f_qualityAccum` の a×b | 2 | `O(ids²)` | ids は数件〜数十件 |
+
 ## Known limitations
 
 - **Pine Editor でのコンパイル・実行を確認していない。** スクリプトサイズ上限、`request.security` の
