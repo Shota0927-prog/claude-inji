@@ -1025,6 +1025,90 @@ Core ID / Generation ID、Touch / Weak / Break / Flip / Reclaim、Grade / Densit
 Phase 3E では「依存値が変わっていないと証明できない skip」を 1 つも入れていない。
 `f_rebuildCores()` は全確定足で従来どおり実行する。
 
+### Phase 3F : Candidate / CoreCand のオブジェクトプール化 (実装済み)
+
+#### 先に見つけたコンパイルエラー (Phase 3E で入れてしまっていた)
+
+`export type ZoneEngine` に `array<ZoneCand>` / `array<CoreCand>` のフィールドを追加したのに、
+`ZoneCand` / `CoreCand` が非 export のままだった。Pine の export type は非 export 型を
+フィールドに持てないので、両型を export した (使うのは Library 内部だけ)。
+
+#### 1 足あたりの allocation
+
+`N_c` = 保存する Candidate 数、`N_k` = CoreCand 数、`W` = dense 窓数。
+
+| | Version 3 | Phase 3F |
+|---|---|---|
+| `ZoneCand.new` | `N_c` + 探索用 scratch 1 + attach 用 2 | **0** (プールが育ち切った後) |
+| Candidate の配列 (6 本/件) | `6 × (N_c + 3)` | **0** (clear + push で使い回す) |
+| `CoreCand.new` | `N_k` | **0** |
+| CoreCand の配列 (2 本/件) | `2 × N_k` | **0** |
+| `array.new<ZoneCand>` / `array.new<CoreCand>` (入れ物) | 3 | **0** (Phase 3E) |
+| `array.new_bool` / `array.new_int` (rUsed 他) | 4 | **0** (Phase 3E) |
+| `f_newScratchCand()` | 3 (探索 1 + attach 2) | **0** (永続 scratch + プール) |
+| `originRootIdsSorted` の再ソート | 追加 Root ごと (`O(n² log n)`) | **1 回だけ** (`O(n log n)`) |
+| 窓ごとの allocation | すでに 0 (Phase 3B) | 0 |
+
+ソース上に残っている `ZoneCand.new` / `CoreCand.new` は、
+`f_newScratchCand()` と `f_acquireCoreCand()` の **プールが足りないときの伸長分** と
+`newEngine()` の初期化だけ。定常状態では 1 つも走らない。
+
+#### originRootIds の重複判定 (同値性)
+
+Version 3 の判定は `array.includes(cc.originRootIds, xid)` 、つまり「すでに push されているか」
+だけ。これを `map<int, bool>` に置き換えたので、答えは完全に同じ。
+push 順も `originRootIds` の元の順序も変わらず、昇順コピーは最後に 1 回作る。
+(Phase 3B で入れた「追加ごとに `f_sortedCopy`」が一番重かった)
+
+#### 参照共有をしていない根拠
+
+- プールの巻き戻しは **1 足に 1 回だけ**、`f_updateCore()` の先頭で行う。
+  足の途中では `used` が増えるだけなので、同じ足の中で 2 つの生きた Candidate が
+  同じスロットを共有することはない。
+  (`f_liveStructurePrune()` が `f_rebuildCores()` より前で `f_buildCand()` を呼ぶため、
+   リセットを `f_rebuildCores()` 内に置くのは危険 — ここを直した)
+- `f_acquireCand()` / `f_acquireCoreCand()` は取り出し時に **全フィールド** を宣言時の
+  既定値へ戻す (`f_fillCandFrom()` が書かない `refPrice` / `selected` も含む)。
+- 永続先 (`ZoneCore` / `SideViewState` / Snapshot) へは必ず `f_copyInto()` または
+  `array.copy()` で deep copy してから渡す。`ZoneCore` / `SideViewState` は
+  `ZoneCand` / `CoreCand` をフィールドとして保持していない (型定義を確認済み)。
+- `CoreCand` は sup / res を **index** でしか指していない。
+
+#### 変えていないもの
+
+`export` 関数の署名は全て同一 (diff で確認。差分は `export type ZoneCand` と
+`export type CoreCand` の 2 行追加だけ)。探索最大 12 回、dense 探索順、
+C / H / Density / BaseStrong、FVG attach 順、Support / Resistance の走査順、
+Merge / Split 条件、Core ID / Generation ID、Touch / Weak / Break / Flip / Reclaim、
+EMA2000 / EMA3000、Root 保存上限、lookahead、Feed 値、tie-break — いずれも未変更。
+
+### 指示 5 (f_rebuildCores の dirty ゲート) : 検証して **実装しない** と判断
+
+指示の「証明できない場合は skip しない」に従い、入れていない。理由は 4 つ。
+
+1. **窓は毎足動く。** `f_buildPointSnapshot()` と `f_collectFvgRoots()` は
+   `refClose = f.baseClose` から `dormantDistance` 以内で絞る。baseClose はほぼ毎足変わるので、
+   Root が 1 つも変わらなくても参加 Root 集合は変わり得る。
+   したがって dirty 判定自体が毎足窓を再評価する必要があり、安くなるのは
+   「窓と全フィールドが完全に一致したときだけ」。
+2. **fingerprint に入れなければならないフィールドが多い。**
+   rootId / pointPrice / nativeBottom / nativeTop / state / category / subtype /
+   tfCode / tfMask / direction / inverseDir / isBroadFvg / fvgFresh /
+   confirmedTime / originTime / labelMask / pairKey / isRangeRoot。
+   1 つ漏れれば黙って結果がずれる (エラーにならないのが一番悪い)。
+3. **後半はどうしても skip できない。** `f_rebuildCores()` のマッチング / Merge / Split は
+   `ZoneCore` の physBottom / physTop / phase / matched / pendingTopology /
+   pendingGeneration / breakSnap を読む。これらは毎足 `f_rebuildCores()` の前に走る
+   `f_processSide()` / `f_processBreakState()` / `f_generationSwitch()` が書き換える。
+   つまり skip できるのは前半 (snapshot + 候補生成 + pairSides) だけ。
+4. **前半を skip するには前足の sup / res / ccs を残す必要があり、Phase 3F の
+   プール化と真っ向から矛盾する。** プールは 1 足ごとに巻き戻す前提で安全になっている。
+   両方を成立させるには Candidate を足をまたいで immutable に保持することになり、
+   毎足 allocation が戻ってくる (1〜3 の成果を消してしまう)。
+
+よって、`f_rebuildCores()` は引き続き **全確定足で実行** する。
+Break / Touch / Flip / Reclaim の状態更新も従来どおり全確定足。
+
 ### Parity Harness (`ZoneEngineV2_ParityHarness.pine`)
 
 ★ Phase 3D では対象外。1 行も変更していない。比較コードは本番 Harness へ一切入っていない。

@@ -738,8 +738,11 @@ export type RootDebugView
     int    periodKind    = 0
     bool   isCurrentPeriod = false
 
-// ---- 2.14 内部型 : クラスタ候補 -------------------------------------------
-type ZoneCand
+// ---- 2.14 クラスタ候補 -----------------------------------------------------
+//  ★ export なのは、export type ZoneEngine がプールとして array<ZoneCand> /
+//    array<CoreCand> を持つため (Pine の export type は非 export 型を持てない)。
+//    使うのは Library 内部だけで、呼び出し側は触る必要がない。
+export type ZoneCand
     int    side          = 0
     array<int>  rootIds
     //  ★ Phase3A : Candidate ごとに bool 配列を 2 本作らず、int mask で持つ。
@@ -772,8 +775,8 @@ type ZoneCand
     int    fvgStateMask  = 0
     bool   selected      = false
 
-// ---- 2.15 内部型 : ZoneCore 候補 (Support 候補 + Resistance 候補) --------
-type CoreCand
+// ---- 2.15 ZoneCore 候補 (Support 候補 + Resistance 候補) ----------------------
+export type CoreCand
     int    supIdx        = -1
     int    resIdx        = -1
     array<int> originRootIds
@@ -907,6 +910,18 @@ export type ZoneEngine
     array<int>      pCoreToCand
     array<bool>     pCoreMerged
     array<int>      pCandPrimary
+    //  ★ Phase3F : ZoneCand / CoreCand 本体のオブジェクトプール。
+    //    1 足の先頭で used を 0 へ戻し、使い回す (足をまたいで参照を持たない)。
+    //    取り出すときに全フィールドを既定値へ戻すので、前の足の値が漏れない。
+    array<ZoneCand> candPool
+    int             candPoolUsed = 0
+    array<CoreCand> ccPool
+    int             ccPoolUsed   = 0
+    //  ★ Phase3F : FVG attach 試行用の永続 scratch (毎回 f_newScratchCand() しない)
+    ZoneCand        scTrial
+    ZoneCand        scBest
+    //  ★ Phase3F : CoreCand の originRootIds 重複判定用 (追加ごとの再ソートをなくす)
+    map<int, bool>  ccSeen
 
 // ---- 2.17 統合 Pack 専用の返却型 (request.security の tuple 要素数対策) --------
 //  Pine の request.* は「スクリプト内の全 request の tuple 要素数の合計」に
@@ -978,6 +993,12 @@ export type AccumFvgBundle
     float srcClose             = na
     int   srcOpenTime          = na
     int   srcCloseTime         = na
+
+//  評価専用の scratch Candidate (rootIds / identityIds は空のまま使う)
+f_newScratchCand() =>
+    ZoneCand.new(rootIds = array.new_int(), identityIds = array.new_int(),
+         rootIdsSorted = array.new_int(), identitySorted = array.new_int(),
+         nonFvgIdentitySorted = array.new_int(), fvgIds = array.new_int())
 
 // ============================================================================
 // 03. FACTORIES / CONFIG VALIDATION
@@ -1051,6 +1072,11 @@ export newEngine() =>
          pCoreToCand = array.new_int(),
          pCoreMerged = array.new_bool(),
          pCandPrimary = array.new_int(),
+         candPool    = array.new<ZoneCand>(),
+         ccPool      = array.new<CoreCand>(),
+         scTrial     = f_newScratchCand(),
+         scBest      = f_newScratchCand(),
+         ccSeen      = map.new<int, bool>(),
          rootSeq    = RID_FIXED_MAX)
 
 // @function  空の ZoneFeed を作る。配列フィールドが確保済みになる。
@@ -2596,11 +2622,72 @@ f_fillCandFrom(ZoneEngine e, ZoneCfg c, int side, array<int> ids,
     //  View へ適用するときだけ f_refPrice() で作る (f_applyCandToView)。
     cd
 
-//  評価専用の scratch Candidate (rootIds / identityIds は空のまま使う)
-f_newScratchCand() =>
-    ZoneCand.new(rootIds = array.new_int(), identityIds = array.new_int(),
-         rootIdsSorted = array.new_int(), identitySorted = array.new_int(),
-         nonFvgIdentitySorted = array.new_int(), fvgIds = array.new_int())
+// ---- 6.4a-2 Candidate / CoreCand プール ------------------------------------
+//  ★ Phase3F : 毎足 ZoneCand.new / CoreCand.new を呼ばない。
+//    1 足の先頭 (f_rebuildCores) で used を 0 へ戻し、同じオブジェクトを使い回す。
+//    取り出し時に全フィールドを宣言時の既定値へ戻すので、前の足の値は残らない。
+//
+//  ★ 参照共有をしていない根拠
+//      ZoneCand / CoreCand の参照は 1 回の f_rebuildCores() の外へ出ない。
+//      永続先 (ZoneCore / SideViewState / Snapshot) へは必ず f_copyInto() または
+//      array.copy() で deep copy してから渡している。
+//      CoreCand は sup / res を index でしか指していない。
+f_resetCand(ZoneCand cd) =>
+    array.clear(cd.rootIds)
+    array.clear(cd.identityIds)
+    array.clear(cd.rootIdsSorted)
+    array.clear(cd.identitySorted)
+    array.clear(cd.nonFvgIdentitySorted)
+    array.clear(cd.fvgIds)
+    cd.side            := 0
+    cd.catMask         := 0
+    cd.highMask        := 0
+    cd.bottom          := na
+    cd.top             := na
+    cd.refPrice        := na
+    cd.cCount          := 0
+    cd.hCount          := 0
+    cd.density         := DEN_NORMAL
+    cd.baseStrong      := false
+    cd.hasNonPsych     := false
+    cd.isBroadContext  := false
+    cd.minRootId       := 0
+    cd.firstConfirmTime := na
+    cd.fvgDirMask      := 0
+    cd.fvgRootCount    := 0
+    cd.fvgFreshCount   := 0
+    cd.fvgStateMask    := 0
+    cd.selected        := false
+    cd
+
+f_acquireCand(ZoneEngine e) =>
+    ZoneCand cd = na
+    if e.candPoolUsed < array.size(e.candPool)
+        cd := array.get(e.candPool, e.candPoolUsed)
+        f_resetCand(cd)
+    else
+        cd := f_newScratchCand()
+        array.push(e.candPool, cd)
+    e.candPoolUsed := e.candPoolUsed + 1
+    cd
+
+f_acquireCoreCand(ZoneEngine e) =>
+    CoreCand cc = na
+    if e.ccPoolUsed < array.size(e.ccPool)
+        cc := array.get(e.ccPool, e.ccPoolUsed)
+        array.clear(cc.originRootIds)
+        array.clear(cc.originRootIdsSorted)
+    else
+        cc := CoreCand.new(originRootIds = array.new_int(), originRootIdsSorted = array.new_int())
+        array.push(e.ccPool, cc)
+    cc.supIdx         := -1
+    cc.resIdx         := -1
+    cc.bottom         := na
+    cc.top            := na
+    cc.matchedCoreIdx := -1
+    cc.coreId         := 0
+    e.ccPoolUsed := e.ccPoolUsed + 1
+    cc
 
 // ---- 6.4b 保存用 Candidate の生成 ------------------------------------------
 //  Base Strong (仕様 6.2 / 指示書 10.3)
@@ -2611,9 +2698,10 @@ f_newScratchCand() =>
 //  ★ 保存される Candidate はここで作る。rootIds と identityIds を必ず自分で所有する。
 f_buildCand(ZoneEngine e, ZoneCfg c, int side, array<int> ids,
      float forcedBottom, float forcedTop, bool forceBroadContext, bool proximalDense) =>
-    ZoneCand cd = ZoneCand.new(side = side, rootIds = array.copy(ids), identityIds = array.new_int(),
-         rootIdsSorted = array.new_int(), identitySorted = array.new_int(),
-         nonFvgIdentitySorted = array.new_int(), fvgIds = array.new_int())
+    //  ★ Phase3F : プールから取る。rootIds はこの Candidate が所有する配列へ
+    //    deep copy する (array.copy() と同じ結果で、新しい配列を作らない)。
+    ZoneCand cd = f_acquireCand(e)
+    f_copyInto(ids, cd.rootIds)
     f_fillCandFrom(e, c, side, ids, forcedBottom, forcedTop, forceBroadContext, proximalDense, cd)
     f_identityIds(e, cd.rootIds, cd.identityIds)
     f_finishCandArrays(e, cd)
@@ -3082,8 +3170,12 @@ f_materializeAttach(ZoneEngine e, ZoneCfg c, int side, ZoneCand base, int fid,
 f_fvgAttachAndStandalone(ZoneEngine e, ZoneCfg c, int side, float refClose, array<ZoneCand> cands) =>
     f_collectFvgRoots(e, c, side, refClose, e.scFvgIds)
     array.clear(e.scStandIds)
-    ZoneCand scTrial = f_newScratchCand()
-    ZoneCand scBest  = f_newScratchCand()
+    //  ★ Phase3F : 試行用 scratch を毎回作らない。Engine 保有の 2 つを reset して使う。
+    //    不採用の試行では Candidate 本体も配列も文字列も作らない (従来どおり)。
+    ZoneCand scTrial = e.scTrial
+    ZoneCand scBest  = e.scBest
+    f_resetCand(scTrial)
+    f_resetCand(scBest)
     int fn = array.size(e.scFvgIds)
     if fn > 0
         for k = 0 to fn - 1
@@ -3292,8 +3384,10 @@ f_pairSides(ZoneEngine e, ZoneCfg c, array<ZoneCand> sup, array<ZoneCand> res,
                                 bestRi     := ri
                                 bestShared := shAll
                                 bestGap    := gap
-            CoreCand cc = CoreCand.new(supIdx = si, resIdx = bestRi, originRootIds = array.new_int(),
-                 originRootIdsSorted = array.new_int())
+            //  ★ Phase3F : CoreCand もプールから取る (毎組み合わせで配列を作らない)
+            CoreCand cc = f_acquireCoreCand(e)
+            cc.supIdx := si
+            cc.resIdx := bestRi
             if bestRi >= 0
                 array.set(rUsed, bestRi, true)
                 ZoneCand rc = array.get(res, bestRi)
@@ -3303,29 +3397,39 @@ f_pairSides(ZoneEngine e, ZoneCfg c, array<ZoneCand> sup, array<ZoneCand> res,
                 cc.bottom := sc.bottom
                 cc.top    := sc.top
             //  originRootIds は CoreCand が所有する独立配列 (identityIds を複製する)
+            //  ★ Phase3F : 重複判定を map にし、昇順コピーは最後に 1 回だけ作る。
+            //    Version 3 の判定は array.includes(cc.originRootIds, xid)、すなわち
+            //    「すでに push されているか」だけなので map と完全に同じ答えになる。
+            //    push 順も originRootIds の元の順序も変わらない。
+            map<int, bool> seen = e.ccSeen
+            map.clear(seen)
             int sn = array.size(sIds)
             if sn > 0
                 for k = 0 to sn - 1
-                    array.push(cc.originRootIds, array.get(sIds, k))
-            f_sortedCopy(cc.originRootIds, cc.originRootIdsSorted)
+                    int sid = array.get(sIds, k)
+                    array.push(cc.originRootIds, sid)
+                    map.put(seen, sid, true)
             if bestRi >= 0
                 ZoneCand rc2 = array.get(res, bestRi)
                 array<int> extra = rc2.identityIds
                 int en = array.size(extra)
                 if en > 0
                     for k = 0 to en - 1
-                        //  ★ Phase3B : 重複判定は昇順コピーへの二分探索 (結果は includes と同じ)
                         int xid = array.get(extra, k)
-                        if not f_containsSorted(cc.originRootIdsSorted, xid)
+                        if not map.contains(seen, xid)
                             array.push(cc.originRootIds, xid)
-                            f_sortedCopy(cc.originRootIds, cc.originRootIdsSorted)
+                            map.put(seen, xid, true)
+            f_sortedCopy(cc.originRootIds, cc.originRootIdsSorted)
             array.push(out, cc)
     if nr > 0
         for ri = 0 to nr - 1
             if not array.get(rUsed, ri)
                 ZoneCand rc = array.get(res, ri)
-                CoreCand cc = CoreCand.new(supIdx = -1, resIdx = ri, originRootIds = array.new_int(),
-                     originRootIdsSorted = array.new_int(), bottom = rc.bottom, top = rc.top)
+                CoreCand cc = f_acquireCoreCand(e)
+                cc.supIdx := -1
+                cc.resIdx := ri
+                cc.bottom := rc.bottom
+                cc.top    := rc.top
                 int rn2 = array.size(rc.identityIds)
                 if rn2 > 0
                     for k = 0 to rn2 - 1
@@ -4437,6 +4541,13 @@ f_updateCore(ZoneEngine e, ZoneCfg c, ZoneFeed f, bool buildProjection, bool cap
     if gate and not dup
         array.clear(e.events)
         e.storagePruned := false
+        //  ★ Phase3F : Candidate / CoreCand プールを 1 足に 1 回だけ巻き戻す。
+        //    足の途中では used が増えるだけなので、同じ足の中で 2 つの生きた
+        //    Candidate が同じスロットを共有することは絶対にない。
+        //    (f_liveStructurePrune() のように f_rebuildCores() より前で
+        //     f_buildCand() を呼ぶ経路があるため、リセットはここで行う)
+        e.candPoolUsed := 0
+        e.ccPoolUsed   := 0
 
         // ---- E-1 : FVG 構造無効化 (Reclaim との優先順位のため先に確定する) ----
         f_updateFvgStructural(e, c, f)
