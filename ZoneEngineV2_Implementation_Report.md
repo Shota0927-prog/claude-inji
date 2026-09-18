@@ -1270,6 +1270,91 @@ physRange / pendingTopology / pendingGeneration / breakSnap を読むが、そ�
 | `f_rebuildCores()` Pass 1 / 2 / 4 | `O(cores · cands)` | 価格帯索引で `nearOk` が偽の組を事前除外 (未実装 / 要計測) |
 | `f_pairSides()` | `O(sup · res)` | 同上 |
 
+## Phase 5 : 全コード監査と dense 探索の事前除外
+
+### 監査結果 (ファイル全体 / 全件抽出)
+
+`tools` の監査スクリプトで、指定された構造を全件抽出し、
+包囲関数とループ深度を付けて分類した (Engine 5160 行)。
+
+| 構造 | 件数 | 最大ループ深度 | 処置 |
+|---|---:|---:|---|
+| `request.*` | **0** | - | Library は 1 つも呼ばない (Feed は Harness から) |
+| `label` / `line` / `box` / `table` 生成 | **0** | - | Library に描画なし |
+| `array.copy` | 4 | 0 | 全て「新しい ZoneCore を作る箇所」(`f_newCore` / `f_archiveCore`)。新規オブジェクトには新規配列が必要なので削除不可 |
+| `array.insert` | 3 | 1 | `f_buildPointSnapshot()` の Version 3 準拠挿入。`array.sort` への置換は禁止されているので維持 |
+| `array.sort` | 3 | 0 | `f_medianInPlace` (scratch) / `f_sortedCopy` (比較専用コピー) / `f_collectFvgRoots` (走査順の一部) — いずれも結果に必要 |
+| `array.new` | 63 | 0 | 53 件は `newEngine()` (生涉 1 回)。残りは pool 伸長分と Snapshot / View 生成。**nested loop 内は 0** |
+| `map.new` | 7 | 0 | 6 件は `newEngine()`。残り 1 件は `f_countAccumBoxes()` (cap dirty 時だけ) |
+| `array.includes` | 13 | 1 | 下記内訳 |
+| `f_rootIdxById` | 38 | 2 | 下記内訳 |
+| 文字列生成 | 10 | 1 | 9 件は originKey / pairKey の組み立て (Root 同一性の鍵。削除不可)。1 件は `f_rootSummary` (表示足のみ) |
+| Candidate / Core 生成 | 13 | 1 | 全て pool 経由または新規 Root / Core 生成。毎足の ZoneCand / CoreCand 新規は 0 |
+| `array.size(e.roots)` (全件走査の目安) | 21 | 2 | 下記内訳 |
+| `for` / `while` | 129 | **2** | 深度 2 は `f_searchDenseBest` / `f_scanStartDense` の a×b と、品質関数 × ids だけ |
+
+#### `array.includes` 13 件の内訳
+
+| 箇所 | 件数 | 処置 |
+|---|---:|---|
+| `f_rootEssential()` | 6 | prune が必要な足だけ、かつ hot core に限定済み。毎足の hot path ではない |
+| `f_markCoreFvgInvalid()` | 3 | FVG が構造無効化した足だけ。探す配列は 1 View の rootIds (数件) |
+| `f_qualityMa()` | 2 | ids に EMA1 / EMA2 がいるかの判定。ids は数件〜数十件 |
+| `f_identityIds()` | 2 | 重複排除。ソートを入れると push 順 (= identity の順) が変わるので不可 |
+
+クラスタリング / Core マッチングの hot path からは **0 件** (two-pointer / 二分探索へ置換済み)。
+
+#### `f_rootIdxById` 38 件の内訳
+
+- **dense 探索 (最も重い経路) からは 0 件**。必要な値は全て snapshot 配列から直読。
+- 深度 2 の 14 件は品質関数 (`f_qualityFvgWith` / `Accum` / `TimeHl` / `Fvg`) 内。
+  呼ばれるのは **保存する Candidate ごと 1 回** で、ids は数件。
+  1 パスへ統合するには品質判定式を 2 箇所に複写することになり、
+  仕様がずれるリスクに見合わないため入れていない (理由を記録)。
+- 残りは Root 更新経路の 1 件ずつ (`f_upsertMa` など)。map 引き O(1)。
+
+#### `array.size(e.roots)` 21 件の内訳
+
+毎足全 Root を走査するのは **6 箇所** (`f_updateFvgStructural` / `f_updateFvgInverse` /
+`f_updateFvgFresh` / `f_updateTimeHlRoots` / `f_syncPsychRoots` / `f_buildPointSnapshot` +
+`f_buildFvgIndex`)。いずれも「Root の状態更新そのもの」または「1 足 1 回の Snapshot 作成」で、
+指示 9 が「毎バー必ず実行」と指定している処理。残りは dirty 時のみ
+(`f_reindexRoots` / `f_removeRetiredRoots` / `f_pruneCategoryToCap` / `f_countAccumBoxes`)。
+
+### 実施 : dense 探索の事前除外 (項目 5 / **既定経路**)
+
+監査で唤一のループ深度 2 かつ 12 × 2 side 呼び出しと分かった
+`f_searchDenseBest()` に、**結果が変わらないと証明できる除外** を入れた。
+
+`f_buildDenseBounds()` を 1 足 1 Side に 1 回だけ走らせ、各開始位置 `a` について
+
+- `dsHardEnd[a]` : `a` の走査が確実に読まなくなる index (真の読み範囲の superset)
+- `dsMaxCatCnt[a]` : `[a, dsHardEnd[a])` の category 数 (used を無視した上限)
+
+を求め、`requireStrong` かつ `dsMaxCatCnt[a] < 2` の `a` を丸こと飛ばす。
+
+**同値性の証明**
+
+1. `requireStrong` のとき BaseStrong は `(wC == 2 and wH >= 1) or wC >= 3` を要求するので、
+   必ず `wC >= 2`。
+2. いかなるラウンドでも `a` の窓は `[a, dsHardEnd[a])` の部分集合 (used は Root を
+   減らすだけ、break 位置はこの境界を越えない)。
+3. よってその窓の `wC <= dsMaxCatCnt[a]`。`dsMaxCatCnt[a] < 2` なら
+   `a` からのどの窓でも BaseStrong になり得ない → best に影響しない。
+
+探索回数 (最大 12)、走査順、break / continue の位置、tie-break、`f_candBetter()` は
+1 つも変えていない。近似ではなく、**結果が変わらないと証明できる組み合わせだけの除外**。
+
+心理価格 Root は 50 ドル刻みで大量に生成されるため、孤立した Psych のみの `a` が
+多いと見込まれる。そこは 12 ラウンド全てでスキップされる。
+(実際の削減率は銘柄と設定依存なので、Profiler での確認が必要)
+
+### 項目 3 / 8 (dirty で Candidate・Core 再構築を省略) を入れていない理由
+
+`f_upsertMa()` が毎確定足で EMA Root の `pointPrice` と `confirmedTime` を書き換えるため、
+指定された dirty 条件 (「Root の価格・range 変更」) に毎足該当する。
+詳細は上の Phase 4 節に記載。
+
 ## Known limitations
 
 - **Pine Editor でのコンパイル・実行を確認していない。** スクリプトサイズ上限、`request.security` の

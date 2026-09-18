@@ -930,6 +930,11 @@ export type ZoneEngine
     //    CAT_FVG Root の index を保持する。Side に依存するのは適格判定だけなので、
     //    窓判定と category 判定を Support / Resistance で 2 回やらないようにする。
     array<int>      fvIdx
+    //  ★ Phase5 : dense 探索の事前境界 (1 足 1 Side に 1 回だけ作る。既定経路でも使う)
+    //    dsHardEnd[a]  : a の走査が確実に読まなくなる index (真の読み範囲の superset)
+    //    dsMaxCatCnt[a]: [a, dsHardEnd[a]) の category 数 (used を無視した上限)
+    array<int>      dsHardEnd
+    array<int>      dsMaxCatCnt
     //  ★ Phase3G 実験 : dense 探索の a ごとの best キャッシュ (cfg で OFF なら使わない)
     array<bool>     dsFound
     array<int>      dsC
@@ -1097,6 +1102,8 @@ export newEngine() =>
          scBest      = f_newScratchCand(),
          ccSeen      = map.new<int, bool>(),
          fvIdx       = array.new_int(),
+         dsHardEnd   = array.new_int(),
+         dsMaxCatCnt = array.new_int(),
          dsFound     = array.new_bool(),
          dsC         = array.new_int(),
          dsH         = array.new_int(),
@@ -2891,6 +2898,51 @@ f_accTokenConflict(ZoneEngine e, int tok) =>
 //
 //  best は「スカラー」と「スナップショット上の位置」だけを scratch へ残し、
 //  探索終了後に一度だけ正式 Candidate を作る。
+//  ★ Phase5 : dense 探索の事前境界を 1 足 1 Side に 1 回だけ作る。
+//
+//  dsHardEnd[a]
+//    並びの正規化 tick は非減少なので、tick(price[b]) - tick(price[a]) が
+//    tick(maxWidth) + 1 を超えた位置以降は幅で必ず break する。
+//    used を continue で飛ばすと break 位置は後ろへずれ得るが、この境界を
+//    越えることはない。+1 は「差の丸め」と「丸めの差」のずれを吸収する余裕。
+//
+//  dsMaxCatCnt[a]
+//    [a, dsHardEnd[a]) に入る Root の category 数 (used を無視)。
+//    いかなるラウンドでも a の窓はこの範囲の部分集合なので、
+//    その窓の wC は必ず dsMaxCatCnt[a] 以下になる (used は Root を減らすだけ)。
+//
+//  ★ これを使った事前除外が厳密に同値である根拠
+//    requireStrong のとき BaseStrong は
+//        (wC == 2 and wH >= 1) or wC >= 3
+//    を要求するので、必ず wC >= 2。
+//    dsMaxCatCnt[a] < 2 なら a からのどの窓でも wC >= 2 になり得ないので、
+//    a を丸こと飛ばしても best は 1 ビットも変わらない。
+//    探索回数 (最大 12) も走査順も tie-break も変えていない。
+//    (近似ではなく、結果が変わらないと証明できる組み合わせだけの除外)
+f_buildDenseBounds(ZoneEngine e, ZoneCfg c, float maxWidth) =>
+    int n = array.size(e.snRootId)
+    f_fillInt(e.dsHardEnd, n, n)
+    f_fillInt(e.dsMaxCatCnt, n, 0)
+    if n > 0
+        int wLim = int(f_tickOf(maxWidth, c.mintick)) + 1
+        for a = 0 to n - 1
+            int ta = int(f_tickOf(array.get(e.snPrice, a), c.mintick))
+            int lim = n
+            for b = a + 1 to n - 1
+                if int(f_tickOf(array.get(e.snPrice, b), c.mintick)) - ta > wLim
+                    lim := b
+                    break
+            array.set(e.dsHardEnd, a, lim)
+            int msk = 0
+            int cnt = 0
+            for b = a to lim - 1
+                int rcat = array.get(e.snCat, b)
+                if not f_maskHas(msk, rcat)
+                    msk := f_maskAdd(msk, rcat)
+                    cnt := cnt + 1
+            array.set(e.dsMaxCatCnt, a, cnt)
+    n
+
 f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requireStrong) =>
     bool  found  = false
     int   bestC  = 0
@@ -2903,7 +2955,10 @@ f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requir
     int n = array.size(e.snRootId)
     if n > 0
         for a = 0 to n - 1
-            if not array.get(e.scUsed, a)
+            //  ★ Phase5 : requireStrong なのに a の最大窓でも category が 2 未満なら、
+            //    BaseStrong になり得ないので a を丸こと飛ばす (結果は変わらない)。
+            bool skipA = requireStrong and array.get(e.dsMaxCatCnt, a) < 2
+            if not skipA and not array.get(e.scUsed, a)
                 array.clear(e.scWinIdx)
                 array.clear(e.scAccTok)
                 array.clear(e.scAccTf)
@@ -3227,25 +3282,19 @@ f_searchDenseBestCached(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool 
         f_fillInt(e.dsId, n, 0)
         f_fillInt(e.dsB, n, -1)
         f_fillBool(e.dsDirty, n, true)
-        //  読み範囲の superset : tick 差が tick(maxWidth) + 1 を超えた位置以降は
-        //  幅で必ず break する (並びの正規化 tick は非減少)。
+        //  ★ Phase5 : 読み範囲の superset は f_buildDenseBounds() が作ったものを共有する。
         f_fillInt(e.dsEnd, n, n)
         if n > 0
-            int wLim = int(f_tickOf(maxWidth, c.mintick)) + 1
             for a = 0 to n - 1
-                int ta = int(f_tickOf(array.get(e.snPrice, a), c.mintick))
-                int lim = n
-                for b = a + 1 to n - 1
-                    if int(f_tickOf(array.get(e.snPrice, b), c.mintick)) - ta > wLim
-                        lim := b
-                        break
-                array.set(e.dsEnd, a, lim)
+                array.set(e.dsEnd, a, array.get(e.dsHardEnd, a))
         e.dsValid := true
     if n > 0
         for a = 0 to n - 1
             if array.get(e.dsDirty, a)
                 array.set(e.dsDirty, a, false)
-                if array.get(e.scUsed, a)
+                //  ★ Phase5 : 本体と同じ事前除外
+                bool skipA = requireStrong and array.get(e.dsMaxCatCnt, a) < 2
+                if skipA or array.get(e.scUsed, a)
                     array.set(e.dsFound, a, false)
                 else
                     [fo, bc, bh, bw, bt, bi, bb] =
@@ -3602,6 +3651,8 @@ f_buildSideCands(ZoneEngine e, ZoneCfg c, ZoneFeed f, int side, array<ZoneCand> 
     //  ★ Phase3G : c.denseRoundCache が true のときだけラウンド間キャッシュ経路を使う。
     //    既定 (false) では f_searchDenseBest() を 12 回呼ぶ Phase 3F と完全に同じ経路。
     //    キャッシュは Side ごとに作り直す (dsValid を倒す)。
+    //  ★ Phase5 : dense 探索の事前境界を Side ごとに 1 回作る (12 ラウンドで共有)
+    f_buildDenseBounds(e, c, f_denseWidth(c))
     e.dsValid := false
     for g = 1 to 12
         bool got = c.denseRoundCache ? f_searchDenseBestCached(e, c, side, f_denseWidth(c), true)
