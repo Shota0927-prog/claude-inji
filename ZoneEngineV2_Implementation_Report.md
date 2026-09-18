@@ -208,9 +208,9 @@ View は該当する Zone を全件返し、距離や Grade で 1 件へ絞ら�
 | MA (`maPackV2`) | 1分 | 1 | off |
 | Swing #1 (`pivotPackV2`) | 5分 | 1 | off |
 | Swing #2 (`pivotPackV2`) | 15分 | 1 | off |
-| Swing #3 + Accum #1 + FVG #1 (`swingAccumFvgPackV2`) | 1時間 | 1 | off |
-| Accum #2 + FVG #2 (`accumFvgPackV2`) | 4時間 | 1 | off |
-| Accum #3 + FVG #3 (`accumFvgPackV2`) | 日足 | 1 | off |
+| Swing #3 + Accum #1 + FVG #1 (`swingAccumFvgBundleV2` / UDT) | 1時間 | 1 | off |
+| Accum #2 + FVG #2 (`accumFvgBundleV2` / UDT) | 4時間 | 1 | off |
+| Accum #3 + FVG #3 (`accumFvgBundleV2` / UDT) | 日足 | 1 | off |
 | Base 5分 | (チャート足 built-in) | 0 | - |
 | **合計** | | **6** (旧 10) | |
 
@@ -218,12 +218,12 @@ View は該当する Zone を全件返し、距離や Grade で 1 件へ絞ら�
 
 | グループ | 時間足の一致状態 | 呼ぶ Pack | request.security | time(tf) |
 |---|---|---|---:|---:|
-| Group 60 | Swing#3 = Accum#1 = FVG#1 | `swingAccumFvgPackV2` | 1 | 1 |
-| Group 60 | Accum#1 = FVG#1 のみ | `accumFvgPackV2` + `pivotPackV2` | 2 | 2 |
+| Group 60 | Swing#3 = Accum#1 = FVG#1 | `swingAccumFvgBundleV2` (UDT) | 1 | 1 |
+| Group 60 | Accum#1 = FVG#1 のみ | `accumFvgBundleV2` (UDT) + `pivotPackV2` | 2 | 2 |
 | Group 60 | 不一致 | `pivotPackV2` + `accumPackV2` + `fvgPackV2` | 3 | 3 |
-| Group 240 | Accum#2 = FVG#2 | `accumFvgPackV2` | 1 | 1 |
+| Group 240 | Accum#2 = FVG#2 | `accumFvgBundleV2` (UDT) | 1 | 1 |
 | Group 240 | 不一致 | `accumPackV2` + `fvgPackV2` | 2 | 2 |
-| Group D | Accum#3 = FVG#3 | `accumFvgPackV2` | 1 | 1 |
+| Group D | Accum#3 = FVG#3 | `accumFvgBundleV2` (UDT) | 1 | 1 |
 | Group D | 不一致 | `accumPackV2` + `fvgPackV2` | 2 | 2 |
 
 これに MA 1 本と Swing #1 / #2 の 2 本 (time も 2 本) が常に加わるので、
@@ -257,6 +257,60 @@ View は該当する Zone を全件返し、距離や Grade で 1 件へ絞ら�
   組み合わせが爆発して割当先を間違えるリスクが高いため入れていない。
 - 5分 Swing だけはチャート足と同じ時間足だが、位相を他 TF と揃えるため同じ
   `pivotPackV2` 経路を使っている。
+
+### request.* の tuple 要素数 (上限 127)
+
+Pine の `request.*` には「スクリプト内の全 request の tuple 要素数の合計」に
+127 の上限がある。`if / else` で実行時に 1 分岐しか通らなくても、input で
+分岐する以上はソース上の全分岐が合算される。
+そのため統合 Pack は **UDT を 1 つ返す形 (tuple 要素 1)** を使う。
+
+新規の export 型と API (中身は既存 Pack をそのまま呼んで詰め直すだけ)
+
+| 名前 | 中身 | フィールド | tuple 要素 |
+|---|---|---:|---:|
+| `SwingAccumFvgBundle` | Swing 8 + Accum 6 + FVG 15 | 29 (bool/int/float のスカラーのみ) | — |
+| `AccumFvgBundle` | Accum 6 + FVG 15 | 21 (同上) | — |
+| `swingAccumFvgBundleV2()` | `pivotPackV2` + `accumPackV2` + `fvgPackV2` | → `SwingAccumFvgBundle` | **1** |
+| `accumFvgBundleV2()` | `accumPackV2` + `fvgPackV2` | → `AccumFvgBundle` | **1** |
+
+tuple 版 (`swingAccumFvgPackV2` / `accumFvgPackV2`) は互換性のため export したまま残してあるが、
+Visual Harness / Parity Harness / profiler コピーの `request.security` からは呼んでいない。
+
+#### ファイルごとの tuple 要素合計
+
+| ファイル | UDT 化前 | UDT 化後 | 上限 127 |
+|---|---:|---:|---|
+| `ZoneEngineV2_VisualHarness.pine` | 192 | **104** | OK |
+| `ZoneEngineV2_ParityHarness.pine` | 163 | **95** | OK |
+| `profiler/...Profiler.pine` (本番と同一) | 192 | **104** | OK |
+
+Visual Harness の内訳 (ソース上の全分岐の合算)
+
+| 箇所 | 内容 | 要素 |
+|---|---|---:|
+| 固定部分 | `maPackV2` 5 + `pivotPackV2` 8 × 2 | 21 |
+| Group 60 ① | `swingAccumFvgBundleV2` | 1 |
+| Group 60 ② | `pivotPackV2` 8 + `accumFvgBundleV2` 1 | 9 |
+| Group 60 ③ | `pivotPackV2` 8 + `accumPackV2` 6 + `fvgPackV2` 15 | 29 |
+| Group 240 ① / ② | `accumFvgBundleV2` 1 / (`accumPackV2` 6 + `fvgPackV2` 15) | 22 |
+| Group D ① / ② | 同上 | 22 |
+| **合計** | | **104** |
+
+Parity Harness の内訳
+
+| 箇所 | 内容 | 要素 |
+|---|---|---:|
+| Version 3 側 (個別 Pack / 変更なし) | `maPackV2` 5 + `pivotPackV2` 8×3 + `accumPackV2` 6×3 + `fvgPackV2` 15×3 | 92 |
+| 新版側 (UDT) | `swingAccumFvgBundleV2` 1 + `accumFvgBundleV2` 1×2 | 3 |
+| **合計** | | **95** |
+
+#### UDT が na のとき
+
+HTF の確定足がまだ無い間は UDT 自体が `na` になるので、Harness は
+`if not na(bundle)` で囲ってからフィールドを読む。`na` のときは宣言時の既定値
+(float / int は `na`、bool は `false`) がそのまま残るので、tuple 版で各要素が
+`na` / `false` で返ってくるのと同じ状態になる。
 
 ### 保存上限と診断値
 
