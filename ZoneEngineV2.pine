@@ -1,0 +1,3797 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  ZoneEngineV2  —  Support / Resistance Zone Engine (Zone definition spec v2)
+// ============================================================================
+//  ■ このファイルは旧 ZoneEngine (v9 / v10 / v11) の改造ではない。
+//    `Zone_definition_spec_v2.md` を唯一の正本として新規実装した別 Library。
+//    旧 ZoneEngine / 旧 Main Strategy は 1 文字も変更していない。
+//
+//  ■ 旧 Engine から意図的に持ち込んでいないもの (仕様書 3 章 / 指示書 3 章)
+//      zoneHalfWidth による中心±固定幅 / score・baseSum・各種 Bonus 合計 /
+//      EMA2000・EMA3000 の個別加点 / Reaction 回数と Bonus / Confluence Bonus /
+//      Flip Bonus / 過去反発による昇格 / Weak = Score 不足 /
+//      経過日数による一般 Root 失効 / 単一 state で Support・Resistance 共用 /
+//      加重平均 Center を判定価格に使う設計 / FVG 50% をロジックへ使う処理 /
+//      ATR で Zone 幅・Break 幅・Reset 距離を変える処理 / BOS / Strategy 要素。
+//
+//  ■ v2 の基本原則
+//      1. Strong は構造 (独立カテゴリ数 C / 高品質カテゴリ数 H / 密集度)。
+//      2. Weak は消耗 (タッチ番号 / 終値侵入率)。Score は一切使わない。
+//      3. Support View と Resistance View を 1 つの ZoneCore の中で別管理する。
+//      4. Phase (接触段階) と Grade (評価) を分離する。
+//      5. NativeRange (FVG 固定範囲) と EffectiveZoneRange (判定範囲) を分離する。
+//      6. 確定情報しか使わない。未来結果で過去ラベルを書き換えない。
+//      7. TouchStartSnapshot / BreakSnapshot は作成後に構造を書き換えない。
+//      8. 消耗履歴をリセットできるのは条件を満たした新 Zone 世代だけ。
+//      9. FVG だけが方向性 (Bullish / Bearish / Inverse) を持つ。
+//     10. Engine は候補 Zone をすべて返し、Entry 判断をしない。
+//
+//  ■ 更新契約 (Harness / 将来の Main Strategy 側の責務)
+//      ・確定した Base TF (5分) 足 1 本につき update() を 1 回だけ呼ぶ。
+//      ・同じ baseOpenTime / baseSeq を二度渡しても状態は二重更新されない
+//        (duplicate base bar guard)。
+//      ・request.security は Library 内では一切呼ばない。外部足は Feed で渡す。
+//      ・すべての外部足 Source helper は「完全に確定した 1 本」の値を返す。
+//        呼び出し側はその時間足が切り替わった足で 1 回だけ Feed へ入れる。
+//      ・セッション / 日 / 週 の ID は timezone 依存のため呼び出し側で計算して渡す
+//        (Pine の hour()/timestamp() の timezone 引数は series 化できない)。
+//
+//  ■ セクション構成
+//      01. Constants / primitive helpers
+//      02. Types
+//      03. Factories / config validation
+//      04. Source helpers (maPackV2 / pivotPackV2 / accumPackV2 / fvgPackV2)
+//      05. Root registry (MA / Swing / Accum / TimeHL / FVG / Psych)
+//      06. Side eligibility / clustering / category quality / reference price
+//      07. ZoneCore identity / merge / split / generation
+//      08. Phase / Grade / Armed / Touch / Break / Flip / Reclaim / Inverse
+//      09. update() orchestration
+//      10. Read-only API (views / events / roots / name helpers)
+// ============================================================================
+
+//@version=5
+library("ZoneEngineV2", overlay = true)
+
+// ============================================================================
+// 01. CONSTANTS / PRIMITIVE HELPERS
+// ----------------------------------------------------------------------------
+//  内部判定は int 定数だけで行う。文字列比較は Hot loop へ入れない
+//  (表示のための名称変換は 10 章の export 関数だけが行う)。
+//  Pine v5 にはビット演算子が無いため、mask は 2 のべき乗の整数和で表現し、
+//  f_maskHas() / f_maskAdd() だけで読み書きする。
+// ============================================================================
+
+// ---- Category --------------------------------------------------------------
+int CAT_MA      = 0
+int CAT_SWING   = 1
+int CAT_ACCUM   = 2
+int CAT_TIME_HL = 3
+int CAT_FVG     = 4
+int CAT_PSYCH   = 5
+int CAT_COUNT   = 6
+
+// ---- Side ------------------------------------------------------------------
+int SIDE_SUPPORT    = 1
+int SIDE_RESISTANCE = -1
+int SIDE_NONE       = 0
+
+// ---- Phase -----------------------------------------------------------------
+int PH_WAITING      = 0
+int PH_ARMED        = 1
+int PH_ACTIVE_TOUCH = 2
+int PH_BROKEN       = 3
+int PH_FLIP_WAIT    = 4
+int PH_DORMANT      = 5
+
+// ---- Grade -----------------------------------------------------------------
+int GR_STRONG      = 0
+int GR_NEUTRAL     = 1
+int GR_WEAK        = 2
+int GR_UNAVAILABLE = 3
+
+// ---- Density ---------------------------------------------------------------
+int DEN_HIGH          = 0
+int DEN_NORMAL        = 1
+int DEN_BROAD_CONTEXT = 2
+
+// ---- Root state ------------------------------------------------------------
+int ROOT_CANDIDATE      = 0
+int ROOT_ACTIVE         = 1
+int ROOT_INVALIDATED    = 2
+int ROOT_INVERSE_WAIT   = 3
+int ROOT_INVERSE_ACTIVE = 4
+int ROOT_RETIRED        = 5
+
+// ---- FVG direction (mask bit index でもある) -------------------------------
+int FVG_NONE    = 0
+int FVG_BULLISH = 1
+int FVG_BEARISH = 2
+
+// ---- Weak reason -----------------------------------------------------------
+int WEAK_NONE     = 0
+int WEAK_BY_TOUCH = 1
+int WEAK_BY_DEPTH = 2
+int WEAK_BY_BOTH  = 3
+
+// ---- Event type ------------------------------------------------------------
+int EV_TOUCH_START      = 0
+int EV_TOUCH_RESET      = 1
+int EV_WEAK_DEPTH       = 2
+int EV_LOCAL_BREAK      = 3
+int EV_GAP_BREAK        = 4
+int EV_FLIP_ATTEMPT     = 5
+int EV_FLIP_CONFIRM     = 6
+int EV_RECLAIM          = 7
+int EV_FVG_INVALIDATE   = 8
+int EV_INVERSE_ATTEMPT  = 9
+int EV_INVERSE_CONFIRM  = 10
+int EV_GENERATION_START = 11
+int EV_MERGE            = 12
+int EV_SPLIT            = 13
+int EV_STORAGE_PRUNE    = 14
+
+// ---- Timeframe code (tfRank も兼ねる。大きいほど上位足) --------------------
+int TF_NONE = 0
+int TF_1M   = 1
+int TF_5M   = 2
+int TF_15M  = 3
+int TF_1H   = 4
+int TF_4H   = 5
+int TF_D    = 6
+
+// ---- Subtype (起源タグ。現在の役割ではない) --------------------------------
+int SUB_NONE        = 0
+int SUB_EMA1        = 1
+int SUB_EMA2        = 2
+int SUB_SWING_H     = 3
+int SUB_SWING_L     = 4
+int SUB_ACC_UPPER   = 5
+int SUB_ACC_LOWER   = 6
+int SUB_HL_HIGH     = 7
+int SUB_HL_LOW      = 8
+int SUB_FVG         = 9
+int SUB_PSYCH_MAJOR = 10
+int SUB_PSYCH_STD   = 11
+
+// ---- 時間区切り高安の期間種別 ---------------------------------------------
+int PER_NONE    = 0
+int PER_SESSION = 1
+int PER_DAY     = 2
+int PER_WEEK    = 3
+
+// ---- セッションコード (Feed から受ける) -----------------------------------
+int SESS_NONE   = 0
+int SESS_ASIA   = 1
+int SESS_EUROPE = 2
+int SESS_NY     = 3
+
+// ---- 内部固定 Root ID (MA だけは価格更新型の固定 ID) ----------------------
+int RID_EMA1 = 1
+int RID_EMA2 = 2
+int RID_FIXED_MAX = 2
+
+// ---- Accum の Candidate 連続本数を遡る上限 (Pine のループ実行時間対策) ----
+int ACCUM_RUN_SCAN_MAX = 400
+
+// ---- 内部ループの安全上限 --------------------------------------------------
+int CAND_SCAN_MAX = 400
+
+// ---- 2 のべき乗 (ビット演算子が無いため) ----------------------------------
+f_pow2(int b) =>
+    b <= 0 ? 1 : b == 1 ? 2 : b == 2 ? 4 : b == 3 ? 8 : b == 4 ? 16 :
+     b == 5 ? 32 : b == 6 ? 64 : b == 7 ? 128 : b == 8 ? 256 : b == 9 ? 512 :
+     b == 10 ? 1024 : b == 11 ? 2048 : b == 12 ? 4096 : b == 13 ? 8192 : 16384
+
+f_maskHas(int mask, int bit) =>
+    int p = f_pow2(bit)
+    math.floor(nz(mask) / p) % 2 == 1
+
+f_maskAdd(int mask, int bit) =>
+    f_maskHas(mask, bit) ? nz(mask) : nz(mask) + f_pow2(bit)
+
+f_maskCount(int mask, int bits) =>
+    int c = 0
+    if bits > 0
+        for i = 0 to bits - 1
+            if f_maskHas(mask, i)
+                c := c + 1
+    c
+
+// ---- 最小ティック正規化つき比較 -------------------------------------------
+//  仕様 18 章「価格比較前に最小ティックへ正規化する」。
+//  同値・境界値 (Touch / Armed / Break / Reset / M / dense 幅) の判定は
+//  すべてこの 5 関数を通す。生の float 比較を境界へ使わない。
+f_mt(float mintick) =>
+    na(mintick) or mintick <= 0 ? 0.01 : mintick
+
+f_tickOf(float price, float mintick) =>
+    math.round(price / f_mt(mintick))
+
+f_geT(float a, float b, float mintick) =>
+    na(a) or na(b) ? false : f_tickOf(a, mintick) >= f_tickOf(b, mintick)
+
+f_leT(float a, float b, float mintick) =>
+    na(a) or na(b) ? false : f_tickOf(a, mintick) <= f_tickOf(b, mintick)
+
+f_gtT(float a, float b, float mintick) =>
+    na(a) or na(b) ? false : f_tickOf(a, mintick) > f_tickOf(b, mintick)
+
+f_ltT(float a, float b, float mintick) =>
+    na(a) or na(b) ? false : f_tickOf(a, mintick) < f_tickOf(b, mintick)
+
+f_eqT(float a, float b, float mintick) =>
+    na(a) or na(b) ? false : f_tickOf(a, mintick) == f_tickOf(b, mintick)
+
+// ---- 中央値 (加重しない。仕様 5.6) ----------------------------------------
+f_median(array<float> src) =>
+    float r = na
+    int n = array.size(src)
+    if n > 0
+        array<float> s = array.copy(src)
+        array.sort(s, order.ascending)
+        int h = int(math.floor(n / 2))
+        if n % 2 == 1
+            r := array.get(s, h)
+        else
+            r := (array.get(s, h - 1) + array.get(s, h)) / 2
+    r
+
+f_clamp(float v, float lo, float hi) =>
+    math.max(lo, math.min(hi, v))
+
+// ---- 2 区間の interval gap (重なれば 0) -----------------------------------
+f_intervalGap(float aBot, float aTop, float bBot, float bTop) =>
+    float g = 0.0
+    if na(aBot) or na(aTop) or na(bBot) or na(bTop)
+        g := na
+    else if aTop < bBot
+        g := bBot - aTop
+    else if bTop < aBot
+        g := aBot - bTop
+    g
+
+// ---- 価格から区間までの距離 (区間内は 0) ---------------------------------
+f_distanceToRangeRaw(float price, float bot, float top) =>
+    float d = na
+    if not na(price) and not na(bot) and not na(top)
+        d := price < bot ? bot - price : price > top ? price - top : 0.0
+    d
+
+// ---- inclusive intersection 判定 ------------------------------------------
+f_rangesTouch(float aBot, float aTop, float bBot, float bTop, float mintick) =>
+    f_geT(aTop, bBot, mintick) and f_leT(aBot, bTop, mintick)
+
+// ============================================================================
+// 02. TYPES
+// ----------------------------------------------------------------------------
+//  Pine の UDT 既定値は literal しか書けないため、Phase / Grade / Density の
+//  既定値は数値で書いている。01 章の定数と同じ値であることをコメントで示す。
+//  配列フィールドは Factory で必ず確保する (na 配列へ array.* を呼ばないため)。
+// ============================================================================
+
+// ---- 2.1 ZoneCfg -----------------------------------------------------------
+export type ZoneCfg
+    // -- 論理パラメータ (仕様 18 章 / 指示書 4.1) --
+    float  clusterMaxWidth     = 20.0    // M
+    float  denseRatio          = 0.50    // dense 幅 = M * denseRatio
+    float  touchResetDistance  = 10.0
+    int    strongUntilTouch    = 1
+    bool   strongUnlimited     = false
+    int    weakFromTouch       = 2
+    bool   weakFromTouchOff    = false
+    float  weakDepthPct        = 50.0
+    bool   weakDepthOff        = false
+    float  breakBuffer         = 2.0
+    float  touchTolerance      = 0.0
+    int    emaSlopeLookback    = 60
+    int    swingLen5m          = 10
+    int    swingLen15m         = 8
+    int    swingLen1h          = 6
+    // -- カテゴリ ON / OFF --
+    bool   useMa               = true
+    bool   useSwing            = true
+    bool   useAccum            = true
+    bool   useTimeHL           = true
+    bool   useFvg              = true
+    bool   usePsych            = true
+    // -- Accum 検出 (仕様 3.3 / 指示書 4.2) --
+    int    accumRangeLen       = 10
+    int    accumBaseLen        = 20
+    int    accumAtrLen         = 14
+    int    accumMinUpperCloses = 4
+    int    accumMinLowerCloses = 4
+    int    accumMaxSameColorRun = 4
+    float  accumAtrMult        = 2.5
+    float  accumBarRatioMax    = 0.70
+    float  accumDriftMax       = 0.30
+    // -- 心理価格 --
+    float  psychMajorStep      = 100.0
+    float  psychStdStep        = 50.0
+    // -- 時間設定 (実際の区切り判定は Feed の ID で行う。ここは検証・表示用) --
+    string zoneTimezone        = "Asia/Tokyo"
+    int    dayResetHour        = 5
+    int    asiaStartHour       = 9
+    int    europeStartHour     = 14
+    int    nyStartHour         = 19
+    int    nyEndHour           = 3
+    // -- 時間足文字列 (Feed の tfCode と一致するか検証するためだけに保持) --
+    string tfMa                = "1"
+    string tfSwing1            = "5"
+    string tfSwing2            = "15"
+    string tfSwing3            = "60"
+    string tfAccum1            = "60"
+    string tfAccum2            = "240"
+    string tfAccum3            = "D"
+    string tfFvg1              = "60"
+    string tfFvg2              = "240"
+    string tfFvg3              = "D"
+    string tfBase              = "5"
+    // -- 保存上限 (指示書 4.4) --
+    int    maxSwingRoots       = 180
+    int    maxAccumBoxes       = 60
+    int    maxFvgRoots         = 120
+    int    maxTimeRoots        = 32
+    int    maxZoneCores        = 80
+    int    maxEndedGenerations = 30
+    int    maxTouchMarksPerCore = 64
+    float  dormantDistance     = 500.0
+    int    maxZonesDrawn       = 30
+    int    maxLabelsDrawn      = 30
+    // -- 最小ティック (原則 Feed から受けた syminfo.mintick を使う) --
+    float  mintick             = 0.01
+
+// ---- 2.2 Feed 部品 (外部足 helper の戻り値をそのまま入れる箱) -------------
+export type SwingIn
+    bool   newBar      = false
+    int    tfCode      = 0
+    float  ph          = na
+    int    phOrigin    = na
+    int    phOriginEnd = na
+    int    phConfirm   = na
+    float  pl          = na
+    int    plOrigin    = na
+    int    plOriginEnd = na
+    int    plConfirm   = na
+
+export type AccumIn
+    bool   newBox      = false
+    int    tfCode      = 0
+    float  boxTop      = na
+    float  boxBottom   = na
+    int    boxId       = na
+    int    candStart   = na
+    int    confirmTime = na
+
+export type FvgIn
+    bool   newBar      = false
+    int    tfCode      = 0
+    bool   bullNew     = false
+    float  bullTop     = na
+    float  bullBottom  = na
+    int    bullOrigin  = na
+    int    bullConfirm = na
+    bool   bearNew     = false
+    float  bearTop     = na
+    float  bearBottom  = na
+    int    bearOrigin  = na
+    int    bearConfirm = na
+    float  srcHigh     = na
+    float  srcLow      = na
+    float  srcClose    = na
+    int    srcOpenTime = na
+    int    srcCloseTime = na
+
+// ---- 2.3 ZoneFeed ----------------------------------------------------------
+//  Base は「確定した 5 分足 1 本」。time (足の開始時刻) と time_close
+//  (確定時刻) を必ず分けて渡す。
+export type ZoneFeed
+    float  baseOpen      = na
+    float  baseHigh      = na
+    float  baseLow       = na
+    float  baseClose     = na
+    float  basePrevClose = na
+    int    baseOpenTime  = na
+    int    baseCloseTime = na
+    int    baseSeq       = 0
+    bool   baseConfirmed = false
+    float  mintick       = na
+    // MA (1分足 EMA と確定済み傾き)
+    bool   maValid       = false
+    float  ema1          = na
+    float  ema1Delta     = na
+    float  ema2          = na
+    float  ema2Delta     = na
+    int    maConfirmTime = na
+    // 期間 ID (timezone 計算は呼び出し側の責務)
+    int    sessionCode   = 0
+    int    sessionId     = na
+    int    dayId         = na
+    int    weekId        = na
+    // 外部足 helper の結果
+    array<SwingIn> swings
+    array<AccumIn> accums
+    array<FvgIn>   fvgs
+
+// ---- 2.4 Root --------------------------------------------------------------
+export type Root
+    int    rootId        = 0
+    string originKey     = ""
+    int    category      = 0
+    int    subtype       = 0
+    int    tfCode        = 0
+    int    tfMask        = 0      // 同一イベントを検出した時間足の集合
+    int    originTime    = na
+    int    originEndTime = na
+    int    confirmedTime = na
+    float  pointPrice    = na
+    float  nativeBottom  = na
+    float  nativeTop     = na
+    bool   isRangeRoot   = false
+    bool   isDynamic     = false
+    int    state         = 1      // ROOT_ACTIVE
+    string pairKey       = ""     // 同じ Accum Box の上下限を識別する
+    int    direction     = 0      // FVG のみ Bullish / Bearish
+    bool   fvgFresh      = false
+    bool   isBroadFvg    = false
+    int    labelMask     = 0      // 時間高安のラベル (期間種別 + current/prev)
+    int    periodKind    = 0
+    bool   isCurrentPeriod = false
+    int    lastUpdateSeq = 0
+    // Inverse FVG 進行状態
+    bool   invMovedAway  = false
+    bool   invRetestSeen = false
+    int    invalidatedSeq = 0
+    int    invMovedAwaySeq = -1
+    int    inverseDir    = 0
+
+// ---- 2.5 TouchMark (結合 / 分裂後の履歴割当に使う実接触記録) --------------
+export type TouchMark
+    int    baseSeq       = 0
+    int    time          = na
+    int    side          = 0
+    float  contactBottom = na
+    float  contactTop    = na
+    float  closeAtTouch  = na
+    int    generationId  = 0
+    bool   isNormalTouch = true
+
+// ---- 2.6 TouchStartSnapshot (開始後に構造を書き換えない) ------------------
+export type TouchStartSnapshot
+    bool   valid           = false
+    int    coreId          = 0
+    int    generationId    = 0
+    int    side            = 0
+    float  rangeBottom     = na
+    float  rangeTop        = na
+    array<int> rootIds
+    int    catMask         = 0
+    int    highMask        = 0
+    int    cCount          = 0
+    int    hCount          = 0
+    int    density         = 1     // DEN_NORMAL
+    bool   baseStrong      = false
+    int    touchStartGrade = 1     // GR_NEUTRAL
+    int    currentTouchNo  = 0
+    int    approachSide    = 0
+    int    startSeq        = 0
+    int    startTime       = na
+    float  deepestClose    = na
+    float  maxDepthPct     = 0.0
+
+// ---- 2.7 BreakSnapshot (Flip / FlipAttempt / Reclaim の価格基準) ----------
+export type BreakSnapshot
+    bool   valid       = false
+    int    coreId      = 0
+    int    generationId = 0
+    int    oldSide     = 0
+    float  rangeBottom = na
+    float  rangeTop    = na
+    array<int> rootIds
+    int    breakSeq    = 0
+    int    breakTime   = na
+    bool   wasGapBreak = false
+    bool   movedAway   = false
+    int    movedAwaySeq = -1
+    bool   retestSeen  = false
+    bool   flipped     = false
+
+// ---- 2.8 SideHistory (Support / Resistance で別インスタンス) --------------
+export type SideHistory
+    int    sideTouchCount   = 0
+    bool   weakByTouch      = false
+    bool   weakByDepth      = false
+    float  maxDepthPct      = 0.0
+    bool   sideFresh        = true
+    int    phase            = 0     // PH_WAITING
+    int    grade            = 3     // GR_UNAVAILABLE
+    int    currentTouchNo   = 0
+    int    upcomingTouchNo  = 1
+    int    armedFromSeq     = 0
+    int    armBlockSeq      = -1    // この seq 以下では Armed 化しない
+    float  lastArmedRangeBottom = na
+    float  lastArmedRangeTop    = na
+    int    lastNormalTouchTime  = na
+    int    flipAttemptCount     = 0
+    int    inverseAttemptCount  = 0
+    int    lastFlipConfirmSeq   = -1
+    bool   everUsed         = false
+    bool   flipPending      = false
+    int    prevPhase        = 0
+    int    weakDepthEventSeq = -1
+
+// ---- 2.9 SideViewState -----------------------------------------------------
+export type SideViewState
+    array<int> rootIds
+    float  effectiveBottom  = na
+    float  effectiveTop     = na
+    float  referencePrice   = na
+    int    cCount           = 0
+    int    hCount           = 0
+    int    catMask          = 0
+    int    highMask         = 0
+    int    density          = 1     // DEN_NORMAL
+    bool   baseStrong       = false
+    bool   hasNonPsychRoot  = false
+    bool   isBroadContext   = false
+    bool   eligible         = false
+    int    fvgDirMask       = 0
+    int    fvgRootCount     = 0
+    int    fvgFreshCount    = 0
+    int    fvgStateMask     = 0
+    SideHistory        history
+    TouchStartSnapshot touchSnapshot
+
+// ---- 2.10 ZoneCore (物理 Zone。Support / Resistance の 2 View を内包) ----
+export type ZoneCore
+    int    coreId        = 0
+    int    generationId  = 0
+    array<int> originRootIds
+    SideViewState supportView
+    SideViewState resistanceView
+    bool   zoneFresh     = true
+    float  physBottom    = na
+    float  physTop       = na
+    int    createdTime   = na
+    int    lastSeenTime  = na
+    int    lastSeenSeq   = 0
+    bool   dormant       = false
+    bool   pendingTopology   = false
+    bool   pendingGeneration = false
+    array<TouchMark> touchMarks
+    BreakSnapshot breakSnap
+    // 世代基準構造 (新世代候補の「基準構造」)
+    float  genBaseBottom = na
+    float  genBaseTop    = na
+    int    genBaseCatMask = 0
+    // 新世代候補の進行状態
+    bool   genCandArmed  = false
+    int    genCandSide   = 0
+    float  genCandBottom = na
+    float  genCandTop    = na
+    int    genCandCatMask = 0
+    bool   touchHistoryTruncated = false
+    bool   matched       = false
+    bool   ended         = false
+    int    endedSeq      = 0
+    int    fvgInvalidatedSeq = -1
+
+// ---- 2.11 ZoneEvent --------------------------------------------------------
+export type ZoneEvent
+    int    eventType    = 0
+    int    time         = na
+    int    baseSeq      = 0
+    int    coreId       = 0
+    int    generationId = 0
+    int    side         = 0
+    float  rangeBottom  = na
+    float  rangeTop     = na
+    int    touchNo      = 0
+    int    gradeAtStart = 1
+    int    weakReason   = 0
+    int    rootId       = 0
+    string info         = ""
+
+// ---- 2.12 ZoneView (読み出し専用 Projection) ------------------------------
+export type ZoneView
+    int    coreId          = 0
+    int    generationId    = 0
+    int    side            = 0
+    float  effectiveBottom = na
+    float  effectiveTop    = na
+    float  referencePrice  = na
+    int    phase           = 0
+    int    grade           = 3
+    int    cCount          = 0
+    int    hCount          = 0
+    int    density         = 1
+    bool   baseStrong      = false
+    int    currentTouchNo  = 0
+    int    upcomingTouchNo = 1
+    bool   zoneFresh       = true
+    bool   sideFresh       = true
+    int    weakReason      = 0
+    float  maxDepthPct     = 0.0
+    bool   isBroadContext  = false
+    int    fvgDirectionMask = 0
+    int    fvgRootCount    = 0
+    int    fvgFreshCount   = 0
+    int    fvgStructuralStateMask = 0
+    bool   eligible        = false
+    bool   dormant         = false
+    bool   pendingTopology = false
+    bool   pendingGeneration = false
+    int    catMask         = 0
+    int    highMask        = 0
+    int    touchStartGrade = 1
+    float  snapshotBottom  = na
+    float  snapshotTop     = na
+    float  physBottom      = na
+    float  physTop         = na
+    int    flipAttemptCount = 0
+    string rootSummary     = ""
+    string categorySummary = ""
+
+// ---- 2.13 RootDebugView ----------------------------------------------------
+export type RootDebugView
+    int    rootId        = 0
+    int    category      = 0
+    int    subtype       = 0
+    int    tfCode        = 0
+    int    tfMask        = 0
+    int    state         = 1
+    float  pointPrice    = na
+    float  nativeBottom  = na
+    float  nativeTop     = na
+    bool   isRangeRoot   = false
+    bool   isBroadFvg    = false
+    bool   fvgFresh      = false
+    int    direction     = 0
+    int    confirmedTime = na
+    int    originTime    = na
+    string originKey     = ""
+    string pairKey       = ""
+    int    periodKind    = 0
+    bool   isCurrentPeriod = false
+
+// ---- 2.14 内部型 : クラスタ候補 -------------------------------------------
+type ZoneCand
+    int    side          = 0
+    array<int>  rootIds
+    array<bool> catUsed
+    array<bool> catHigh
+    float  bottom        = na
+    float  top           = na
+    float  refPrice      = na
+    int    cCount        = 0
+    int    hCount        = 0
+    int    density       = 1
+    bool   baseStrong    = false
+    bool   hasNonPsych   = false
+    bool   isBroadContext = false
+    int    minRootId     = 0
+    int    firstConfirmTime = na
+    int    fvgDirMask    = 0
+    int    fvgRootCount  = 0
+    int    fvgFreshCount = 0
+    int    fvgStateMask  = 0
+    bool   selected      = false
+
+// ---- 2.15 内部型 : ZoneCore 候補 (Support 候補 + Resistance 候補) --------
+type CoreCand
+    int    supIdx        = -1
+    int    resIdx        = -1
+    array<int> originRootIds
+    float  bottom        = na
+    float  top           = na
+    int    matchedCoreIdx = -1
+    int    coreId        = 0
+
+// ---- 2.16 ZoneEngine (永続状態一式。Main / Harness で var 宣言する) ------
+export type ZoneEngine
+    array<Root>          roots
+    array<ZoneCore>      cores
+    array<ZoneCore>      endedCores
+    array<ZoneEvent>     events
+    array<ZoneView>      views
+    array<float>         psychPrices
+    array<int>           psychRootIds
+    map<int, int>        rootIdx
+    int    rootSeq       = 2      // RID_FIXED_MAX
+    int    coreSeq       = 0
+    int    genSeq        = 0
+    int    lastBaseTime  = na
+    int    lastBaseSeq   = na
+    int    processedBars = 0
+    bool   duplicateBarSkipped = false
+    // MA 診断
+    int    maSlope1      = 0
+    int    maSlope2      = 0
+    // 時間区切り高安の現在状態
+    int    curSessionCode = 0
+    int    curSessionId  = na
+    int    curDayId      = na
+    int    curWeekId     = na
+    float  sessHigh      = na
+    float  sessLow       = na
+    float  dayHigh       = na
+    float  dayLow        = na
+    float  weekHigh      = na
+    float  weekLow       = na
+    int    sessHighRid   = 0
+    int    sessLowRid    = 0
+    int    dayHighRid    = 0
+    int    dayLowRid     = 0
+    int    weekHighRid   = 0
+    int    weekLowRid    = 0
+    int    prevSessHighRid = 0
+    int    prevSessLowRid  = 0
+    int    prevDayHighRid  = 0
+    int    prevDayLowRid   = 0
+    int    prevWeekHighRid = 0
+    int    prevWeekLowRid  = 0
+    // 保存整理の診断値
+    bool   storagePruned = false
+    int    prunedRootCount = 0
+    int    prunedZoneCount = 0
+    bool   touchHistoryTruncated = false
+    // 設定検証
+    bool   configValid   = true
+    string configError   = ""
+    // 診断
+    int    pendingTopologyCount   = 0
+    int    pendingGenerationCount = 0
+    int    mergeCount    = 0
+    int    splitCount    = 0
+
+// ============================================================================
+// 03. FACTORIES / CONFIG VALIDATION
+// ============================================================================
+
+// @function  既定値の ZoneCfg を作る。呼び出し側が input でフィールドを上書きする。
+// @returns   ZoneCfg
+export newCfg() =>
+    ZoneCfg.new()
+
+f_newHistory() =>
+    SideHistory.new(phase = PH_WAITING, grade = GR_UNAVAILABLE)
+
+f_newSnapshot() =>
+    TouchStartSnapshot.new(valid = false, rootIds = array.new_int(), density = DEN_NORMAL, touchStartGrade = GR_NEUTRAL)
+
+f_newBreakSnap() =>
+    BreakSnapshot.new(valid = false, rootIds = array.new_int())
+
+f_newSideView(int side) =>
+    SideViewState.new(rootIds = array.new_int(), density = DEN_NORMAL,
+         history = f_newHistory(), touchSnapshot = f_newSnapshot())
+
+// @function  Zone Engine v2 の永続状態を作る。Harness / Main で var 宣言すること。
+// @returns   ZoneEngine
+export newEngine() =>
+    ZoneEngine.new(
+         roots      = array.new<Root>(),
+         cores      = array.new<ZoneCore>(),
+         endedCores = array.new<ZoneCore>(),
+         events     = array.new<ZoneEvent>(),
+         views      = array.new<ZoneView>(),
+         psychPrices = array.new_float(),
+         psychRootIds = array.new_int(),
+         rootIdx    = map.new<int, int>(),
+         rootSeq    = RID_FIXED_MAX)
+
+// @function  空の ZoneFeed を作る。配列フィールドが確保済みになる。
+// @returns   ZoneFeed
+export newFeed() =>
+    ZoneFeed.new(swings = array.new<SwingIn>(), accums = array.new<AccumIn>(), fvgs = array.new<FvgIn>())
+
+// @function       Swing helper の結果を Feed へ追加する。
+// @param f        ZoneFeed
+// @param tfCode   TF_5M / TF_15M / TF_1H
+// @param newBar   その時間足が新しく 1 本確定したか
+// @returns        追加後の要素数
+export feedSwing(ZoneFeed f, int tfCode, bool newBar, float ph, int phOrigin, int phOriginEnd, int phConfirm,
+     float pl, int plOrigin, int plOriginEnd, int plConfirm) =>
+    array.push(f.swings, SwingIn.new(newBar = newBar, tfCode = tfCode,
+         ph = ph, phOrigin = phOrigin, phOriginEnd = phOriginEnd, phConfirm = phConfirm,
+         pl = pl, plOrigin = plOrigin, plOriginEnd = plOriginEnd, plConfirm = plConfirm))
+    array.size(f.swings)
+
+// @function       Accum helper の結果を Feed へ追加する。
+// @returns        追加後の要素数
+export feedAccum(ZoneFeed f, int tfCode, bool newBar, bool newBox, float boxTop, float boxBottom,
+     int boxId, int candStart, int confirmTime) =>
+    array.push(f.accums, AccumIn.new(newBox = newBar and newBox, tfCode = tfCode,
+         boxTop = boxTop, boxBottom = boxBottom, boxId = boxId, candStart = candStart, confirmTime = confirmTime))
+    array.size(f.accums)
+
+// @function       FVG helper の結果を Feed へ追加する。
+// @returns        追加後の要素数
+export feedFvg(ZoneFeed f, int tfCode, bool newBar,
+     bool bullNew, float bullTop, float bullBottom, int bullOrigin, int bullConfirm,
+     bool bearNew, float bearTop, float bearBottom, int bearOrigin, int bearConfirm,
+     float srcHigh, float srcLow, float srcClose, int srcOpenTime, int srcCloseTime) =>
+    array.push(f.fvgs, FvgIn.new(newBar = newBar, tfCode = tfCode,
+         bullNew = newBar and bullNew, bullTop = bullTop, bullBottom = bullBottom,
+         bullOrigin = bullOrigin, bullConfirm = bullConfirm,
+         bearNew = newBar and bearNew, bearTop = bearTop, bearBottom = bearBottom,
+         bearOrigin = bearOrigin, bearConfirm = bearConfirm,
+         srcHigh = srcHigh, srcLow = srcLow, srcClose = srcClose,
+         srcOpenTime = srcOpenTime, srcCloseTime = srcCloseTime))
+    array.size(f.fvgs)
+
+// @function   ZoneCfg の整合性を検証する。不正なら理由を返し、勝手に補正しない。
+// @param c    ZoneCfg
+// @returns    [valid, reason]
+export validateCfg(ZoneCfg c) =>
+    bool   ok  = true
+    string why = ""
+    if c.clusterMaxWidth <= 0
+        ok := false
+        why := "clusterMaxWidth must be > 0"
+    else if c.denseRatio <= 0 or c.denseRatio > 1.0
+        ok := false
+        why := "denseRatio must be in (0, 1.0]"
+    else if c.touchResetDistance <= 0
+        ok := false
+        why := "touchResetDistance must be > 0"
+    else if c.breakBuffer < 0
+        ok := false
+        why := "breakBuffer must be >= 0"
+    else if c.touchTolerance < 0
+        ok := false
+        why := "touchTolerance must be >= 0"
+    else if not c.weakDepthOff and (c.weakDepthPct < 0 or c.weakDepthPct > 100)
+        ok := false
+        why := "weakDepthPct must be 0..100 or weakDepthOff"
+    else if c.strongUnlimited and not c.weakFromTouchOff
+        // 指示書 4.1 : この組み合わせは不正設定。黙って補正しない。
+        ok := false
+        why := "strongUnlimited=true requires weakFromTouchOff=true"
+    else if not c.strongUnlimited and c.strongUntilTouch < 1
+        ok := false
+        why := "strongUntilTouch must be >= 1 or strongUnlimited"
+    else if not c.weakFromTouchOff and c.weakFromTouch < 2
+        ok := false
+        why := "weakFromTouch must be >= 2 or weakFromTouchOff"
+    else if not c.strongUnlimited and not c.weakFromTouchOff and c.strongUntilTouch >= c.weakFromTouch
+        ok := false
+        why := "strongUntilTouch must be < weakFromTouch"
+    else if c.emaSlopeLookback < 1
+        ok := false
+        why := "emaSlopeLookback must be >= 1"
+    else if c.swingLen5m < 1 or c.swingLen15m < 1 or c.swingLen1h < 1
+        ok := false
+        why := "swing pivot length must be >= 1"
+    else if c.accumRangeLen < 6 or c.accumBaseLen < c.accumRangeLen or c.accumAtrLen < 1
+        ok := false
+        why := "accum length settings invalid (need rangeLen >= 6, baseLen >= rangeLen, atrLen >= 1)"
+    else if c.accumAtrMult <= 0 or c.accumBarRatioMax <= 0 or c.accumDriftMax <= 0
+        ok := false
+        why := "accum ratio settings must be > 0"
+    else if c.psychMajorStep <= 0 or c.psychStdStep <= 0 or c.psychMajorStep <= c.psychStdStep
+        ok := false
+        why := "psych steps invalid (need majorStep > stdStep > 0)"
+    else if c.dormantDistance <= 0
+        ok := false
+        why := "dormantDistance must be > 0"
+    else if c.maxSwingRoots < 1 or c.maxAccumBoxes < 1 or c.maxFvgRoots < 1 or c.maxTimeRoots < 1
+         or c.maxZoneCores < 1 or c.maxEndedGenerations < 1 or c.maxTouchMarksPerCore < 1
+        ok := false
+        why := "storage limits must be >= 1"
+    else if c.mintick <= 0
+        ok := false
+        why := "mintick must be > 0"
+    [ok, why]
+
+// @function     Library と同じ定数値を名前で取得する (呼び出し側で再宣言しないため)。
+// @param key    定数名 ("SIDE_SUPPORT" / "PH_ARMED" / "GR_STRONG" など)
+// @returns      int  未知のキーは na
+export constOf(string key) =>
+    key == "CAT_MA" ? CAT_MA : key == "CAT_SWING" ? CAT_SWING : key == "CAT_ACCUM" ? CAT_ACCUM :
+     key == "CAT_TIME_HL" ? CAT_TIME_HL : key == "CAT_FVG" ? CAT_FVG : key == "CAT_PSYCH" ? CAT_PSYCH :
+     key == "CAT_COUNT" ? CAT_COUNT :
+     key == "SIDE_SUPPORT" ? SIDE_SUPPORT : key == "SIDE_RESISTANCE" ? SIDE_RESISTANCE : key == "SIDE_NONE" ? SIDE_NONE :
+     key == "PH_WAITING" ? PH_WAITING : key == "PH_ARMED" ? PH_ARMED : key == "PH_ACTIVE_TOUCH" ? PH_ACTIVE_TOUCH :
+     key == "PH_BROKEN" ? PH_BROKEN : key == "PH_FLIP_WAIT" ? PH_FLIP_WAIT : key == "PH_DORMANT" ? PH_DORMANT :
+     key == "GR_STRONG" ? GR_STRONG : key == "GR_NEUTRAL" ? GR_NEUTRAL : key == "GR_WEAK" ? GR_WEAK :
+     key == "GR_UNAVAILABLE" ? GR_UNAVAILABLE :
+     key == "DEN_HIGH" ? DEN_HIGH : key == "DEN_NORMAL" ? DEN_NORMAL : key == "DEN_BROAD_CONTEXT" ? DEN_BROAD_CONTEXT :
+     key == "ROOT_CANDIDATE" ? ROOT_CANDIDATE : key == "ROOT_ACTIVE" ? ROOT_ACTIVE :
+     key == "ROOT_INVALIDATED" ? ROOT_INVALIDATED : key == "ROOT_INVERSE_WAIT" ? ROOT_INVERSE_WAIT :
+     key == "ROOT_INVERSE_ACTIVE" ? ROOT_INVERSE_ACTIVE : key == "ROOT_RETIRED" ? ROOT_RETIRED :
+     key == "FVG_NONE" ? FVG_NONE : key == "FVG_BULLISH" ? FVG_BULLISH : key == "FVG_BEARISH" ? FVG_BEARISH :
+     key == "WEAK_NONE" ? WEAK_NONE : key == "WEAK_BY_TOUCH" ? WEAK_BY_TOUCH : key == "WEAK_BY_DEPTH" ? WEAK_BY_DEPTH :
+     key == "WEAK_BY_BOTH" ? WEAK_BY_BOTH :
+     key == "TF_1M" ? TF_1M : key == "TF_5M" ? TF_5M : key == "TF_15M" ? TF_15M : key == "TF_1H" ? TF_1H :
+     key == "TF_4H" ? TF_4H : key == "TF_D" ? TF_D :
+     key == "SESS_NONE" ? SESS_NONE : key == "SESS_ASIA" ? SESS_ASIA : key == "SESS_EUROPE" ? SESS_EUROPE :
+     key == "SESS_NY" ? SESS_NY :
+     key == "PER_SESSION" ? PER_SESSION : key == "PER_DAY" ? PER_DAY : key == "PER_WEEK" ? PER_WEEK :
+     key == "EV_TOUCH_START" ? EV_TOUCH_START : key == "EV_TOUCH_RESET" ? EV_TOUCH_RESET :
+     key == "EV_WEAK_DEPTH" ? EV_WEAK_DEPTH : key == "EV_LOCAL_BREAK" ? EV_LOCAL_BREAK :
+     key == "EV_GAP_BREAK" ? EV_GAP_BREAK : key == "EV_FLIP_ATTEMPT" ? EV_FLIP_ATTEMPT :
+     key == "EV_FLIP_CONFIRM" ? EV_FLIP_CONFIRM : key == "EV_RECLAIM" ? EV_RECLAIM :
+     key == "EV_FVG_INVALIDATE" ? EV_FVG_INVALIDATE : key == "EV_INVERSE_ATTEMPT" ? EV_INVERSE_ATTEMPT :
+     key == "EV_INVERSE_CONFIRM" ? EV_INVERSE_CONFIRM : key == "EV_GENERATION_START" ? EV_GENERATION_START :
+     key == "EV_MERGE" ? EV_MERGE : key == "EV_SPLIT" ? EV_SPLIT : key == "EV_STORAGE_PRUNE" ? EV_STORAGE_PRUNE :
+     int(na)
+
+// ============================================================================
+// 04. SOURCE HELPERS
+// ----------------------------------------------------------------------------
+//  ★ この 4 関数はすべて「完全に確定した 1 本」の値だけを返す ★
+//    呼び出し側は request.security(sym, tf, zn2.xxxPackV2(...), lookahead_off)
+//    で取得し、その時間足が切り替わった足で 1 回だけ Feed へ入れる。
+//    そのため内部では常に index [1] 以降 (= 確定済み) しか参照しない。
+//    未確定足の値は 1 つも外へ出さない。
+// ============================================================================
+
+int ACCUM_WINDOW_MAX = 600
+
+// ---- 4.1 MA ----------------------------------------------------------------
+// @function        1分足 EMA2000 / EMA3000 と、確定値から測った傾きを返す。
+// @param len1      EMA #1 期間 (既定 2000)
+// @param len2      EMA #2 期間 (既定 3000)
+// @param slopeLb   傾きを測る 1分足本数 (既定 60)
+// @returns         [ema1, ema1Delta, ema2, ema2Delta, confirmedTime]
+export maPackV2(simple int len1, simple int len2, simple int slopeLb) =>
+    float e1 = ta.ema(close, len1)
+    float e2 = ta.ema(close, len2)
+    float e1c = e1[1]
+    float e2c = e2[1]
+    float d1  = e1[1] - e1[1 + slopeLb]
+    float d2  = e2[1] - e2[1 + slopeLb]
+    int   ct  = time_close[1]
+    [e1c, d1, e2c, d2, ct]
+
+// ---- 4.2 Swing -------------------------------------------------------------
+// @function      Pivot High / Low を OriginTime / OriginEndTime / ConfirmedTime
+//                に分けて返す。旧 helper のように「確認足の時刻」だけを返さない。
+// @param len     Pivot Length (左右同数)
+// @returns       [ph, phOriginTime, phOriginEndTime, phConfirmedTime,
+//                 pl, plOriginTime, plOriginEndTime, plConfirmedTime]
+export pivotPackV2(simple int len) =>
+    float phRaw = ta.pivothigh(high, len, len)
+    float plRaw = ta.pivotlow(low, len, len)
+    float ph = phRaw[1]
+    float pl = plRaw[1]
+    int   phO  = na(ph) ? int(na) : time[len + 1]
+    int   phOE = na(ph) ? int(na) : time_close[len + 1]
+    int   phC  = na(ph) ? int(na) : time_close[1]
+    int   plO  = na(pl) ? int(na) : time[len + 1]
+    int   plOE = na(pl) ? int(na) : time_close[len + 1]
+    int   plC  = na(pl) ? int(na) : time_close[1]
+    [ph, phO, phOE, phC, pl, plO, plOE, plC]
+
+// ---- 4.3 Accum -------------------------------------------------------------
+//  形成条件式は旧 Engine から流用してよい範囲 (指示書 3 章)。
+//  ATR はここ (レンジ性の検出) の中だけで使い、確定後の Root / Zone へ
+//  値を持ち出さない。
+f_accumCondV2(simple int rangeLen, simple int baseLen, simple int atrLen,
+     simple int minUpper, simple int minLower, simple int maxRun,
+     float atrMult, float barRatioMax, float driftMax) =>
+    float atrv = ta.atr(atrLen)
+
+    float bodyTop = math.max(open, close)
+    float bodyBot = math.min(open, close)
+    float rangeHigh = ta.highest(bodyTop, rangeLen)
+    float rangeLow  = ta.lowest(bodyBot, rangeLen)
+    float rangeNow  = rangeHigh - rangeLow
+    float rangeMid  = (rangeHigh + rangeLow) * 0.5
+
+    int upperCloses = 0
+    int lowerCloses = 0
+    int bullRun = 0
+    int bearRun = 0
+    int maxBullRun = 0
+    int maxBearRun = 0
+    for i = 0 to rangeLen - 1
+        upperCloses += close[i] > rangeMid ? 1 : 0
+        lowerCloses += close[i] < rangeMid ? 1 : 0
+        bool isBull = close[i] > open[i]
+        bool isBear = close[i] < open[i]
+        if isBull
+            bullRun += 1
+            bearRun := 0
+        else if isBear
+            bearRun += 1
+            bullRun := 0
+        else
+            bullRun := 0
+            bearRun := 0
+        maxBullRun := math.max(maxBullRun, bullRun)
+        maxBearRun := math.max(maxBearRun, bearRun)
+
+    float startMid = (open[rangeLen - 1] + close[rangeLen - 1]) * 0.5
+    float endMid   = (open + close) * 0.5
+    float drift    = math.abs(endMid - startMid)
+
+    float rangeShort = ta.highest(bodyTop, rangeLen) - ta.lowest(bodyBot, rangeLen)
+    float rangeBase  = ta.highest(bodyTop, baseLen)  - ta.lowest(bodyBot, baseLen)
+
+    bool condAtr      = not na(atrv) and atrv > 0 and rangeNow <= atrv * atrMult
+    bool condBar      = rangeBase > 0 and rangeShort <= rangeBase * barRatioMax
+    bool condBalance  = upperCloses >= minUpper and lowerCloses >= minLower
+    bool condDrift    = rangeNow > 0 and (drift / rangeNow) <= driftMax
+    bool condColorRun = maxBullRun <= maxRun and maxBearRun <= maxRun
+
+    condAtr and condBar and condBalance and condDrift and condColorRun
+
+// @function            Accum Box の「確定イベント」だけを返す。
+//                      Candidate は外へ Root として出さない (仕様 3.3)。
+//                      条件が true -> false になった確定足で 1 度だけ
+//                      newConfirmedBox = true になり、false になった終了足は
+//                      Box 範囲へ含めない。
+// @param rangeLen      判定レンジ本数
+// @param baseLen       基準平均本数
+// @param atrLen        ATR 本数
+// @param minUpper      上半分の最低終値本数
+// @param minLower      下半分の最低終値本数
+// @param maxRun        同色連続の上限
+// @param atrMult       レンジ幅 / ATR 上限
+// @param barRatioMax   短期幅 / 基準幅 上限
+// @param driftMax      ドリフト上限
+// @returns             [newConfirmedBox, boxTop, boxBottom, boxId,
+//                       candidateStartTime, confirmedTime]
+export accumPackV2(simple int rangeLen, simple int baseLen, simple int atrLen,
+     simple int minUpper, simple int minLower, simple int maxRun,
+     float atrMult, float barRatioMax, float driftMax) =>
+    bool cond = f_accumCondV2(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
+
+    // 確定足 = index [1]。その 1 本前 [2] が true で [1] が false なら Box 確定。
+    bool endedNow = nz(cond[2], false) and not nz(cond[1], false)
+
+    int runLen = 0
+    if endedNow
+        for i = 2 to ACCUM_RUN_SCAN_MAX
+            if nz(cond[i], false)
+                runLen := runLen + 1
+            else
+                break
+
+    float top = na
+    float bot = na
+    int   candStart = na
+    int   boxId     = na
+    if endedNow and runLen >= 1
+        int startIdx = 2 + runLen - 1
+        int lastIdx  = startIdx + rangeLen - 1
+        for i = 2 to ACCUM_WINDOW_MAX
+            if i > lastIdx
+                break
+            float bt = math.max(open[i], close[i])
+            float bb = math.min(open[i], close[i])
+            if not na(bt)
+                top := na(top) ? bt : math.max(top, bt)
+            if not na(bb)
+                bot := na(bot) ? bb : math.min(bot, bb)
+        candStart := time[startIdx]
+        boxId     := time[startIdx]
+
+    bool newBox = endedNow and runLen >= 1 and not na(top) and not na(bot)
+    int  confirmedTime = time_close[1]
+    [newBox, top, bot, boxId, candStart, confirmedTime]
+
+// ---- 4.4 FVG ---------------------------------------------------------------
+// @function   確定済み 3 本だけで HTF FVG を判定し、NativeRange と
+//             その時間足で新しく確定した足の OHLC / 時刻を返す。
+//             Bullish : low[1] > high[3]、NativeRange = high[3] 〜 low[1]
+//             Bearish : high[1] < low[3]、NativeRange = high[1] 〜 low[3]
+//             ★ 形成した 3 本目そのものを「再訪」として Fresh 消費しないため、
+//               Fresh 評価は Library 側が confirmedTime より後の Base 足で行う。
+// @returns    [bullNew, bullTop, bullBottom, bullOriginTime, bullConfirmedTime,
+//              bearNew, bearTop, bearBottom, bearOriginTime, bearConfirmedTime,
+//              srcHigh, srcLow, srcClose, srcOpenTime, srcCloseTime]
+export fvgPackV2() =>
+    float mt = syminfo.mintick
+    float h1 = high[1]
+    float l1 = low[1]
+    float h3 = high[3]
+    float l3 = low[3]
+    bool bull = f_gtT(l1, h3, mt)
+    bool bear = f_ltT(h1, l3, mt)
+    float bullBot = bull ? h3 : na
+    float bullTop = bull ? l1 : na
+    float bearBot = bear ? h1 : na
+    float bearTop = bear ? l3 : na
+    int   org = time[1]
+    int   cft = time_close[1]
+    [bull, bullTop, bullBot, bull ? org : int(na), bull ? cft : int(na),
+     bear, bearTop, bearBot, bear ? org : int(na), bear ? cft : int(na),
+     h1, l1, close[1], time[1], time_close[1]]
+
+// ============================================================================
+// 05. ROOT REGISTRY
+// ----------------------------------------------------------------------------
+//  Root は「実価格と起源」を保持する。加重平均の架空 Root は作らない。
+//  Root ID 方針 (指示書 6.2)
+//    EMA2000 / EMA3000 : 固定 ID (RID_EMA1 / RID_EMA2) で価格だけ更新。
+//    Swing             : Pivot 起源イベントごとに固定 ID (originKey で同一性)。
+//    Accum             : 時間足 + Candidate 開始時刻 + 境界種別 で固定。
+//    時間高安          : 極値更新ごとに新 ID。ラベル移行では ID 維持。
+//    FVG               : 時間足 + 3本目の起源時刻 + 方向 で固定。
+//    心理価格          : 正規化価格から安定 ID (psychPrices / psychRootIds)。
+// ============================================================================
+
+f_sign(float v) =>
+    na(v) ? 0 : v > 0 ? 1 : v < 0 ? -1 : 0
+
+f_emit(ZoneEngine e, ZoneFeed f, int etype, int coreId, int genId, int side,
+     float bot, float top, int touchNo, int gradeAtStart, int weakReason, int rootId, string info) =>
+    array.push(e.events, ZoneEvent.new(eventType = etype, time = f.baseCloseTime, baseSeq = f.baseSeq,
+         coreId = coreId, generationId = genId, side = side, rangeBottom = bot, rangeTop = top,
+         touchNo = touchNo, gradeAtStart = gradeAtStart, weakReason = weakReason, rootId = rootId, info = info))
+    array.size(e.events)
+
+f_nextRootId(ZoneEngine e) =>
+    e.rootSeq := e.rootSeq + 1
+    e.rootSeq
+
+//  Root ID -> 配列 index の索引。Hot loop (クラスタリング) から毎回線形探索しないため。
+//  索引が古い場合は必ず線形探索へフォールバックする (結果は常に正しい)。
+f_reindexRoots(ZoneEngine e) =>
+    map.clear(e.rootIdx)
+    int n = array.size(e.roots)
+    if n > 0
+        for i = 0 to n - 1
+            map.put(e.rootIdx, array.get(e.roots, i).rootId, i)
+    n
+
+f_rootIdxById(ZoneEngine e, int id) =>
+    int idx = -1
+    int n = array.size(e.roots)
+    if map.contains(e.rootIdx, id)
+        int cand = map.get(e.rootIdx, id)
+        if cand >= 0 and cand < n
+            if array.get(e.roots, cand).rootId == id
+                idx := cand
+    if idx < 0 and n > 0
+        for i = 0 to n - 1
+            if array.get(e.roots, i).rootId == id
+                idx := i
+                break
+    idx
+
+f_rootIdxByKey(ZoneEngine e, string key) =>
+    int idx = -1
+    int n = array.size(e.roots)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(e.roots, i).originKey == key
+                idx := i
+                break
+    idx
+
+f_rootActive(Root r) =>
+    r.state == ROOT_ACTIVE or r.state == ROOT_INVERSE_ACTIVE
+
+f_retireRootById(ZoneEngine e, int id) =>
+    int i = f_rootIdxById(e, id)
+    if i >= 0
+        Root rr = array.get(e.roots, i)
+        rr.state := ROOT_RETIRED
+    i >= 0
+
+// ---- 5.1 MA ----------------------------------------------------------------
+//  常に現在の EMA 価格だけを持つ。過去に通過した価格は残さない。
+//  傾きは確定 1分足値から測った差を符号だけで使う (Moderate / Strong 閾値なし)。
+//  direction フィールドを MA の傾き方向 (+1 / -1 / 0) として使う。
+f_upsertMa(ZoneEngine e, ZoneCfg c, ZoneFeed f, int rid, int sub, float price, int dir) =>
+    int i = f_rootIdxById(e, rid)
+    if na(price)
+        if i >= 0
+            Root rm = array.get(e.roots, i)
+            rm.state := ROOT_RETIRED
+    else
+        if i < 0
+            array.push(e.roots, Root.new(rootId = rid, originKey = sub == SUB_EMA1 ? "MA:EMA1" : "MA:EMA2",
+                 category = CAT_MA, subtype = sub, tfCode = TF_1M, tfMask = f_maskAdd(0, TF_1M),
+                 originTime = f.baseOpenTime, originEndTime = f.baseCloseTime, confirmedTime = f.maConfirmTime,
+                 pointPrice = price, isDynamic = true, state = ROOT_ACTIVE, direction = dir,
+                 lastUpdateSeq = f.baseSeq))
+        else
+            Root r = array.get(e.roots, i)
+            r.pointPrice    := price
+            r.direction     := dir
+            r.confirmedTime := f.maConfirmTime
+            r.state         := ROOT_ACTIVE
+            r.lastUpdateSeq := f.baseSeq
+    true
+
+f_updateMaRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    int d1 = f_sign(f.ema1Delta)
+    int d2 = f_sign(f.ema2Delta)
+    e.maSlope1 := d1
+    e.maSlope2 := d2
+    if c.useMa and f.maValid
+        f_upsertMa(e, c, f, RID_EMA1, SUB_EMA1, f.ema1, d1)
+        f_upsertMa(e, c, f, RID_EMA2, SUB_EMA2, f.ema2, d2)
+    else
+        f_retireRootById(e, RID_EMA1)
+        f_retireRootById(e, RID_EMA2)
+    true
+
+// ---- 5.2 Swing -------------------------------------------------------------
+//  同一イベント統合 : 価格 tick 一致 かつ 下位足 OriginTime が上位足 Pivot 区間
+//  [OriginTime, OriginEndTime) へ入る場合だけ 1 Root へまとめ、検出 TF mask を残す。
+f_registerSwing(ZoneEngine e, ZoneCfg c, ZoneFeed f, int tfCode, bool isHigh,
+     float price, int origin, int originEnd, int confirm) =>
+    bool done = false
+    if not na(price) and not na(confirm) and not na(origin)
+        int sub = isHigh ? SUB_SWING_H : SUB_SWING_L
+        string key = "SW:" + str.tostring(tfCode) + ":" + str.tostring(origin) + ":" + (isHigh ? "H" : "L")
+        if f_rootIdxByKey(e, key) >= 0
+            done := true                       // 同じ Pivot イベントの再配信
+        else
+            int n = array.size(e.roots)
+            if n > 0
+                for i = 0 to n - 1
+                    Root r = array.get(e.roots, i)
+                    if r.category == CAT_SWING and r.subtype == sub and r.state != ROOT_RETIRED
+                         and f_eqT(r.pointPrice, price, c.mintick)
+                        bool lowerIntoHigher = tfCode < r.tfCode and not na(r.originEndTime)
+                             and origin >= r.originTime and origin < r.originEndTime
+                        bool higherOverLower = tfCode > r.tfCode and not na(originEnd)
+                             and r.originTime >= origin and r.originTime < originEnd
+                        if lowerIntoHigher
+                            r.tfMask       := f_maskAdd(r.tfMask, tfCode)
+                            r.lastUpdateSeq := f.baseSeq
+                            done := true
+                            break
+                        else if higherOverLower
+                            //  上位足が後から確定した : 同一 Root を上位足へ格上げする。
+                            //  ID と最初の ConfirmedTime は維持する (履歴の同一性)。
+                            r.tfMask        := f_maskAdd(f_maskAdd(r.tfMask, tfCode), r.tfCode)
+                            r.tfCode        := tfCode
+                            r.originTime    := origin
+                            r.originEndTime := originEnd
+                            r.lastUpdateSeq := f.baseSeq
+                            done := true
+                            break
+            if not done
+                array.push(e.roots, Root.new(rootId = f_nextRootId(e), originKey = key,
+                     category = CAT_SWING, subtype = sub, tfCode = tfCode, tfMask = f_maskAdd(0, tfCode),
+                     originTime = origin, originEndTime = originEnd, confirmedTime = confirm,
+                     pointPrice = price, state = ROOT_ACTIVE, lastUpdateSeq = f.baseSeq))
+                done := true
+    done
+
+f_updateSwingRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    if c.useSwing
+        int n = array.size(f.swings)
+        if n > 0
+            for i = 0 to n - 1
+                SwingIn s = array.get(f.swings, i)
+                if s.newBar
+                    f_registerSwing(e, c, f, s.tfCode, true,  s.ph, s.phOrigin, s.phOriginEnd, s.phConfirm)
+                    f_registerSwing(e, c, f, s.tfCode, false, s.pl, s.plOrigin, s.plOriginEnd, s.plConfirm)
+    true
+
+// ---- 5.3 Accum -------------------------------------------------------------
+//  Confirmed Box だけを Root 化する。上限 / 下限は Mutually Exclusive Pair。
+f_updateAccumRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    if c.useAccum
+        int n = array.size(f.accums)
+        if n > 0
+            for i = 0 to n - 1
+                AccumIn a = array.get(f.accums, i)
+                if a.newBox and not na(a.boxTop) and not na(a.boxBottom) and not na(a.confirmTime)
+                    string pk  = "ACC:" + str.tostring(a.tfCode) + ":" + str.tostring(a.boxId)
+                    string kU  = pk + ":U"
+                    string kL  = pk + ":L"
+                    if f_rootIdxByKey(e, kU) < 0 and f_rootIdxByKey(e, kL) < 0
+                        array.push(e.roots, Root.new(rootId = f_nextRootId(e), originKey = kU,
+                             category = CAT_ACCUM, subtype = SUB_ACC_UPPER, tfCode = a.tfCode,
+                             tfMask = f_maskAdd(0, a.tfCode), originTime = a.candStart,
+                             originEndTime = a.confirmTime, confirmedTime = a.confirmTime,
+                             pointPrice = a.boxTop, state = ROOT_ACTIVE, pairKey = pk, lastUpdateSeq = f.baseSeq))
+                        array.push(e.roots, Root.new(rootId = f_nextRootId(e), originKey = kL,
+                             category = CAT_ACCUM, subtype = SUB_ACC_LOWER, tfCode = a.tfCode,
+                             tfMask = f_maskAdd(0, a.tfCode), originTime = a.candStart,
+                             originEndTime = a.confirmTime, confirmedTime = a.confirmTime,
+                             pointPrice = a.boxBottom, state = ROOT_ACTIVE, pairKey = pk, lastUpdateSeq = f.baseSeq))
+    true
+
+// ---- 5.4 FVG : 形成 --------------------------------------------------------
+f_registerFvgOne(ZoneEngine e, ZoneCfg c, ZoneFeed f, int tfCode, int dir,
+     float top, float bottom, int origin, int confirm) =>
+    bool done = false
+    if not na(top) and not na(bottom) and not na(origin) and not na(confirm)
+        string key = "FVG:" + str.tostring(tfCode) + ":" + str.tostring(origin) + ":" + (dir == FVG_BULLISH ? "B" : "S")
+        if f_rootIdxByKey(e, key) < 0
+            float w = top - bottom
+            bool broad = f_gtT(w, c.clusterMaxWidth, c.mintick)
+            array.push(e.roots, Root.new(rootId = f_nextRootId(e), originKey = key,
+                 category = CAT_FVG, subtype = SUB_FVG, tfCode = tfCode, tfMask = f_maskAdd(0, tfCode),
+                 originTime = origin, originEndTime = confirm, confirmedTime = confirm,
+                 nativeBottom = bottom, nativeTop = top, isRangeRoot = true, state = ROOT_ACTIVE,
+                 direction = dir, fvgFresh = true, isBroadFvg = broad, lastUpdateSeq = f.baseSeq))
+            done := true
+    done
+
+f_updateFvgNew(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    if c.useFvg
+        int n = array.size(f.fvgs)
+        if n > 0
+            for i = 0 to n - 1
+                FvgIn v = array.get(f.fvgs, i)
+                if v.newBar
+                    if v.bullNew
+                        f_registerFvgOne(e, c, f, v.tfCode, FVG_BULLISH, v.bullTop, v.bullBottom, v.bullOrigin, v.bullConfirm)
+                    if v.bearNew
+                        f_registerFvgOne(e, c, f, v.tfCode, FVG_BEARISH, v.bearTop, v.bearBottom, v.bearOrigin, v.bearConfirm)
+    true
+
+// ---- 5.5 FVG : 構造無効化 / Inverse / Fresh --------------------------------
+//  構造無効化は「その FVG 元時間足の新規確定 Close」だけで判定する。
+//  Distal と同値では無効化しない。Zone 用 BreakBuffer は一切加えない。
+f_markCoreFvgInvalid(ZoneEngine e, ZoneFeed f, int rootId) =>
+    int n = array.size(e.cores)
+    if n > 0
+        for i = 0 to n - 1
+            ZoneCore z = array.get(e.cores, i)
+            bool hit = array.includes(z.originRootIds, rootId)
+                 or array.includes(z.supportView.rootIds, rootId)
+                 or array.includes(z.resistanceView.rootIds, rootId)
+            if hit
+                z.fvgInvalidatedSeq := f.baseSeq
+    true
+
+f_updateFvgStructural(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    int fn = array.size(f.fvgs)
+    int rn = array.size(e.roots)
+    if c.useFvg and fn > 0 and rn > 0
+        for k = 0 to fn - 1
+            FvgIn v = array.get(f.fvgs, k)
+            if v.newBar and not na(v.srcClose)
+                for i = 0 to rn - 1
+                    Root r = array.get(e.roots, i)
+                    if r.category == CAT_FVG and r.tfCode == v.tfCode and r.state == ROOT_ACTIVE
+                         and not na(v.srcCloseTime) and not na(r.confirmedTime) and v.srcCloseTime > r.confirmedTime
+                        bool inval = r.direction == FVG_BULLISH ? f_ltT(v.srcClose, r.nativeBottom, c.mintick)
+                             : f_gtT(v.srcClose, r.nativeTop, c.mintick)
+                        if inval
+                            r.state          := ROOT_INVALIDATED
+                            r.invalidatedSeq := f.baseSeq
+                            r.invMovedAway   := false
+                            r.invMovedAwaySeq := -1
+                            r.invRetestSeen  := false
+                            r.lastUpdateSeq  := f.baseSeq
+                            f_markCoreFvgInvalid(e, f, r.rootId)
+                            f_emit(e, f, EV_FVG_INVALIDATE, 0, 0, SIDE_NONE,
+                                 r.nativeBottom, r.nativeTop, 0, GR_UNAVAILABLE, WEAK_NONE, r.rootId,
+                                 r.direction == FVG_BULLISH ? "BULL_INVALIDATED" : "BEAR_INVALIDATED")
+    true
+
+//  Inverse FVG は一般 Flip とは別階層。FVG Root 単位で NativeRange を基準に進める。
+//  movedAway と再接触は別の確定足で判定する (足内部の値動き順序を推測しない)。
+f_updateFvgInverse(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    int rn = array.size(e.roots)
+    if c.useFvg and rn > 0
+        for i = 0 to rn - 1
+            Root r = array.get(e.roots, i)
+            if r.category == CAT_FVG and (r.state == ROOT_INVALIDATED or r.state == ROOT_INVERSE_WAIT)
+                bool wasBull = r.direction == FVG_BULLISH
+                if r.state == ROOT_INVALIDATED and r.invalidatedSeq < f.baseSeq
+                    bool away = wasBull ? f_leT(f.baseClose, r.nativeBottom - c.touchResetDistance, c.mintick)
+                         : f_geT(f.baseClose, r.nativeTop + c.touchResetDistance, c.mintick)
+                    if away
+                        r.state           := ROOT_INVERSE_WAIT
+                        r.invMovedAway    := true
+                        r.invMovedAwaySeq := f.baseSeq
+                        r.lastUpdateSeq   := f.baseSeq
+                else if r.state == ROOT_INVERSE_WAIT and r.invMovedAwaySeq < f.baseSeq
+                    bool retest = f_rangesTouch(f.baseLow, f.baseHigh, r.nativeBottom, r.nativeTop, c.mintick)
+                    if retest and not r.invRetestSeen
+                        r.invRetestSeen := true
+                        f_emit(e, f, EV_INVERSE_ATTEMPT, 0, 0, SIDE_NONE, r.nativeBottom, r.nativeTop,
+                             0, GR_UNAVAILABLE, WEAK_NONE, r.rootId, "INVERSE_RETEST")
+                    if r.invRetestSeen
+                        bool confirm = wasBull ? f_leT(f.baseClose, r.nativeBottom, c.mintick)
+                             : f_geT(f.baseClose, r.nativeTop, c.mintick)
+                        if confirm
+                            r.state         := ROOT_INVERSE_ACTIVE
+                            r.inverseDir    := wasBull ? FVG_BEARISH : FVG_BULLISH
+                            r.lastUpdateSeq := f.baseSeq
+                            f_emit(e, f, EV_INVERSE_CONFIRM, 0, 0,
+                                 r.inverseDir == FVG_BULLISH ? SIDE_SUPPORT : SIDE_RESISTANCE,
+                                 r.nativeBottom, r.nativeTop, 0, GR_UNAVAILABLE, WEAK_NONE, r.rootId,
+                                 r.inverseDir == FVG_BULLISH ? "INVERSE_BULLISH" : "INVERSE_BEARISH")
+    true
+
+//  FVG Fresh は NativeRange 固有。確定 3 本目の足そのものでは消費せず、
+//  confirmedTime より後の確定 Base 足の High / Low と inclusive intersection で終了。
+f_updateFvgFresh(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    int rn = array.size(e.roots)
+    if c.useFvg and rn > 0
+        for i = 0 to rn - 1
+            Root r = array.get(e.roots, i)
+            if r.category == CAT_FVG and r.fvgFresh and r.state != ROOT_RETIRED
+                 and not na(r.confirmedTime) and not na(f.baseCloseTime) and f.baseCloseTime > r.confirmedTime
+                if f_rangesTouch(f.baseLow, f.baseHigh, r.nativeBottom, r.nativeTop, c.mintick)
+                    r.fvgFresh      := false
+                    r.lastUpdateSeq := f.baseSeq
+    true
+
+// ---- 5.6 時間区切り高安 ----------------------------------------------------
+//  labelMask のビット : periodKind * 2 + (current ? 0 : 1)
+//    session current = 2 / session prev = 3 / day current = 4 / day prev = 5 /
+//    week current = 6 / week prev = 7
+f_timeLabelBit(int periodKind, bool isCurrent) =>
+    periodKind * 2 + (isCurrent ? 0 : 1)
+
+f_timeLabelRemaining(int mask) =>
+    int c = 0
+    for b = 2 to 7
+        if f_maskHas(mask, b)
+            c := c + 1
+    c
+
+f_releaseTimeRoot(ZoneEngine e, int rid, int periodKind, bool isCurrent) =>
+    if rid > 0
+        int i = f_rootIdxById(e, rid)
+        if i >= 0
+            Root r = array.get(e.roots, i)
+            int bit = f_timeLabelBit(periodKind, isCurrent)
+            if f_maskHas(r.labelMask, bit)
+                r.labelMask := r.labelMask - f_pow2(bit)
+            if f_timeLabelRemaining(r.labelMask) == 0
+                r.state := ROOT_RETIRED
+    true
+
+f_moveTimeRootToPrev(ZoneEngine e, int rid, int periodKind) =>
+    if rid > 0
+        int i = f_rootIdxById(e, rid)
+        if i >= 0
+            Root r = array.get(e.roots, i)
+            int cb = f_timeLabelBit(periodKind, true)
+            if f_maskHas(r.labelMask, cb)
+                r.labelMask := r.labelMask - f_pow2(cb)
+            r.labelMask       := f_maskAdd(r.labelMask, f_timeLabelBit(periodKind, false))
+            r.isCurrentPeriod := f_timeLabelRemaining(r.labelMask) > 0 and
+                 (f_maskHas(r.labelMask, f_timeLabelBit(PER_SESSION, true))
+                  or f_maskHas(r.labelMask, f_timeLabelBit(PER_DAY, true))
+                  or f_maskHas(r.labelMask, f_timeLabelBit(PER_WEEK, true)))
+    true
+
+//  同じ OriginTime・同じ価格 tick の期間ラベルは 1 Root へ集約する。
+f_acquireTimeRoot(ZoneEngine e, ZoneCfg c, ZoneFeed f, int periodKind, bool isHigh, float price, int originTime) =>
+    int sub = isHigh ? SUB_HL_HIGH : SUB_HL_LOW
+    int rid = 0
+    int n = array.size(e.roots)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = array.get(e.roots, i)
+            if r.category == CAT_TIME_HL and r.subtype == sub and r.state != ROOT_RETIRED
+                 and r.originTime == originTime and f_eqT(r.pointPrice, price, c.mintick)
+                r.labelMask       := f_maskAdd(r.labelMask, f_timeLabelBit(periodKind, true))
+                r.isCurrentPeriod := true
+                r.lastUpdateSeq   := f.baseSeq
+                rid := r.rootId
+                break
+    if rid == 0
+        int newId = f_nextRootId(e)
+        array.push(e.roots, Root.new(rootId = newId,
+             originKey = "HL:" + str.tostring(originTime) + ":" + (isHigh ? "H" : "L"),
+             category = CAT_TIME_HL, subtype = sub, tfCode = TF_5M, tfMask = f_maskAdd(0, TF_5M),
+             originTime = originTime, originEndTime = f.baseCloseTime, confirmedTime = f.baseCloseTime,
+             pointPrice = price, state = ROOT_ACTIVE, periodKind = periodKind, isCurrentPeriod = true,
+             labelMask = f_maskAdd(0, f_timeLabelBit(periodKind, true)), lastUpdateSeq = f.baseSeq))
+        rid := newId
+    rid
+
+//  新極値は厳密な > / < で更新。同値は同じ Root のまま。
+//  ★ 確定した現在足で生まれた新極値は、その足のヒゲを自身のタッチとして数えない。
+//    そのため Root 更新はタッチ評価より後 (9 章の順序) で呼ぶ。
+f_extremeStep(ZoneEngine e, ZoneCfg c, ZoneFeed f, int periodKind, bool isHigh, float curPrice, int curRid) =>
+    float p   = curPrice
+    int   rid = curRid
+    float v   = isHigh ? f.baseHigh : f.baseLow
+    if not na(v)
+        bool isNew = na(p) or (isHigh ? f_gtT(v, p, c.mintick) : f_ltT(v, p, c.mintick))
+        if isNew
+            if rid > 0
+                f_releaseTimeRoot(e, rid, periodKind, true)
+            p   := v
+            rid := f_acquireTimeRoot(e, c, f, periodKind, isHigh, v, f.baseOpenTime)
+    [p, rid]
+
+f_updateTimeHlRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    if not c.useTimeHL
+        int n = array.size(e.roots)
+        if n > 0
+            for i = 0 to n - 1
+                Root rt = array.get(e.roots, i)
+                if rt.category == CAT_TIME_HL
+                    rt.state := ROOT_RETIRED
+    else
+        // ---- セッション ----
+        if na(e.curSessionId) or f.sessionId != e.curSessionId
+            if e.sessHighRid > 0
+                f_releaseTimeRoot(e, e.prevSessHighRid, PER_SESSION, false)
+                f_moveTimeRootToPrev(e, e.sessHighRid, PER_SESSION)
+                e.prevSessHighRid := e.sessHighRid
+                e.sessHighRid     := 0
+            if e.sessLowRid > 0
+                f_releaseTimeRoot(e, e.prevSessLowRid, PER_SESSION, false)
+                f_moveTimeRootToPrev(e, e.sessLowRid, PER_SESSION)
+                e.prevSessLowRid := e.sessLowRid
+                e.sessLowRid     := 0
+            e.sessHigh      := na
+            e.sessLow       := na
+            e.curSessionId  := f.sessionId
+        e.curSessionCode := f.sessionCode
+        // ---- 日 ----
+        if na(e.curDayId) or f.dayId != e.curDayId
+            if e.dayHighRid > 0
+                f_releaseTimeRoot(e, e.prevDayHighRid, PER_DAY, false)
+                f_moveTimeRootToPrev(e, e.dayHighRid, PER_DAY)
+                e.prevDayHighRid := e.dayHighRid
+                e.dayHighRid     := 0
+            if e.dayLowRid > 0
+                f_releaseTimeRoot(e, e.prevDayLowRid, PER_DAY, false)
+                f_moveTimeRootToPrev(e, e.dayLowRid, PER_DAY)
+                e.prevDayLowRid := e.dayLowRid
+                e.dayLowRid     := 0
+            e.dayHigh   := na
+            e.dayLow    := na
+            e.curDayId  := f.dayId
+        // ---- 週 ----
+        if na(e.curWeekId) or f.weekId != e.curWeekId
+            if e.weekHighRid > 0
+                f_releaseTimeRoot(e, e.prevWeekHighRid, PER_WEEK, false)
+                f_moveTimeRootToPrev(e, e.weekHighRid, PER_WEEK)
+                e.prevWeekHighRid := e.weekHighRid
+                e.weekHighRid     := 0
+            if e.weekLowRid > 0
+                f_releaseTimeRoot(e, e.prevWeekLowRid, PER_WEEK, false)
+                f_moveTimeRootToPrev(e, e.weekLowRid, PER_WEEK)
+                e.prevWeekLowRid := e.weekLowRid
+                e.weekLowRid     := 0
+            e.weekHigh  := na
+            e.weekLow   := na
+            e.curWeekId := f.weekId
+
+        // ---- 現在期間の極値更新 ----
+        //  03:00〜09:00 JST (SESS_NONE) は現在セッション Root を作らない。
+        if f.sessionCode != SESS_NONE
+            [sh, shr] = f_extremeStep(e, c, f, PER_SESSION, true,  e.sessHigh, e.sessHighRid)
+            e.sessHigh    := sh
+            e.sessHighRid := shr
+            [sl, slr] = f_extremeStep(e, c, f, PER_SESSION, false, e.sessLow,  e.sessLowRid)
+            e.sessLow    := sl
+            e.sessLowRid := slr
+        [dh, dhr] = f_extremeStep(e, c, f, PER_DAY, true,  e.dayHigh, e.dayHighRid)
+        e.dayHigh    := dh
+        e.dayHighRid := dhr
+        [dl, dlr] = f_extremeStep(e, c, f, PER_DAY, false, e.dayLow,  e.dayLowRid)
+        e.dayLow    := dl
+        e.dayLowRid := dlr
+        [wh, whr] = f_extremeStep(e, c, f, PER_WEEK, true,  e.weekHigh, e.weekHighRid)
+        e.weekHigh    := wh
+        e.weekHighRid := whr
+        [wl, wlr] = f_extremeStep(e, c, f, PER_WEEK, false, e.weekLow,  e.weekLowRid)
+        e.weekLow    := wl
+        e.weekLowRid := wlr
+    true
+
+// ---- 5.7 心理価格 ----------------------------------------------------------
+//  無限に事前生成しない。非心理 Root の周辺 M 以内に存在する 50 ドル刻みだけ合成する。
+//  100 ドル倍数は Major 1 Root だけ (同じ価格に Standard を重複生成しない)。
+f_psychNeedPush(array<float> need, ZoneCfg c, float price) =>
+    if not na(price)
+        float lo = price - c.clusterMaxWidth
+        float hi = price + c.clusterMaxWidth
+        float start = math.ceil(lo / c.psychStdStep) * c.psychStdStep
+        for k = 0 to 16
+            float q = start + k * c.psychStdStep
+            if f_gtT(q, hi, c.mintick)
+                break
+            bool dup = false
+            int n = array.size(need)
+            if n > 0
+                for i = 0 to n - 1
+                    if f_eqT(array.get(need, i), q, c.mintick)
+                        dup := true
+                        break
+            if not dup
+                array.push(need, q)
+    true
+
+f_syncPsychRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    array<float> need = array.new_float()
+    if c.usePsych
+        int rn = array.size(e.roots)
+        if rn > 0
+            for i = 0 to rn - 1
+                Root r = array.get(e.roots, i)
+                //  表示・計算は現在価格周辺だけに限定できる (仕様 3.6)
+                float dRef = r.isRangeRoot ? f_distanceToRangeRaw(f.baseClose, r.nativeBottom, r.nativeTop)
+                     : (na(f.baseClose) or na(r.pointPrice) ? 0.0 : math.abs(r.pointPrice - f.baseClose))
+                if r.category != CAT_PSYCH and f_rootActive(r) and nz(dRef, 0.0) <= c.dormantDistance
+                    if r.isRangeRoot
+                        f_psychNeedPush(need, c, r.nativeBottom)
+                        f_psychNeedPush(need, c, r.nativeTop)
+                    else
+                        f_psychNeedPush(need, c, r.pointPrice)
+    // 既存レジストリのうち不要になったものを外す
+    int pn = array.size(e.psychPrices)
+    if pn > 0
+        for i = pn - 1 to 0
+            if i < array.size(e.psychPrices)
+                float p   = array.get(e.psychPrices, i)
+                int   rid = array.get(e.psychRootIds, i)
+                bool keep = false
+                int nn = array.size(need)
+                if nn > 0
+                    for k = 0 to nn - 1
+                        if f_eqT(array.get(need, k), p, c.mintick)
+                            keep := true
+                            break
+                if not keep
+                    f_retireRootById(e, rid)
+                    array.remove(e.psychPrices, i)
+                    array.remove(e.psychRootIds, i)
+    // 必要な価格の Root を用意する (安定 ID)
+    int nn2 = array.size(need)
+    if nn2 > 0
+        for k = 0 to nn2 - 1
+            float q = array.get(need, k)
+            int found = -1
+            int cn = array.size(e.psychPrices)
+            if cn > 0
+                for i = 0 to cn - 1
+                    if f_eqT(array.get(e.psychPrices, i), q, c.mintick)
+                        found := i
+                        break
+            if found >= 0
+                int rid = array.get(e.psychRootIds, found)
+                int ri  = f_rootIdxById(e, rid)
+                if ri >= 0
+                    Root rr = array.get(e.roots, ri)
+                    rr.state         := ROOT_ACTIVE
+                    rr.lastUpdateSeq := f.baseSeq
+            else
+                bool isMajor = f_eqT(math.round(q / c.psychMajorStep) * c.psychMajorStep, q, c.mintick)
+                int newId = f_nextRootId(e)
+                array.push(e.roots, Root.new(rootId = newId,
+                     originKey = "PSY:" + str.tostring(f_tickOf(q, c.mintick)),
+                     category = CAT_PSYCH, subtype = isMajor ? SUB_PSYCH_MAJOR : SUB_PSYCH_STD,
+                     tfCode = TF_NONE, originTime = f.baseOpenTime, originEndTime = f.baseCloseTime,
+                     confirmedTime = f.baseCloseTime, pointPrice = q, state = ROOT_ACTIVE,
+                     isDynamic = true, lastUpdateSeq = f.baseSeq))
+                array.push(e.psychPrices, q)
+                array.push(e.psychRootIds, newId)
+    true
+
+// ---- 5.8 Root 保存整理 -----------------------------------------------------
+//  ActiveTouch / Broken / FlipWait / InverseWait / PendingGeneration に
+//  関係する Root は削除しない (指示書 4.4)。削除したら必ず診断値へ残す。
+f_rootEssential(ZoneEngine e, int rootId) =>
+    bool ess = false
+    int n = array.size(e.cores)
+    if n > 0
+        for i = 0 to n - 1
+            ZoneCore z = array.get(e.cores, i)
+            int ps = z.supportView.history.phase
+            int pr = z.resistanceView.history.phase
+            bool hot = ps == PH_ACTIVE_TOUCH or ps == PH_BROKEN or ps == PH_FLIP_WAIT
+                 or pr == PH_ACTIVE_TOUCH or pr == PH_BROKEN or pr == PH_FLIP_WAIT
+                 or z.pendingTopology or z.pendingGeneration or z.breakSnap.valid
+            if hot
+                bool hit = array.includes(z.originRootIds, rootId)
+                     or array.includes(z.supportView.rootIds, rootId)
+                     or array.includes(z.resistanceView.rootIds, rootId)
+                     or array.includes(z.supportView.touchSnapshot.rootIds, rootId)
+                     or array.includes(z.resistanceView.touchSnapshot.rootIds, rootId)
+                     or array.includes(z.breakSnap.rootIds, rootId)
+                if hit
+                    ess := true
+                    break
+    ess
+
+f_rootProtected(Root r) =>
+    //  FVG の Invalidated / InverseWait は削除禁止 (Inverse 待ちの明示状態)
+    r.category == CAT_FVG and (r.state == ROOT_INVALIDATED or r.state == ROOT_INVERSE_WAIT)
+
+f_countRootsInCategory(ZoneEngine e, int cat) =>
+    int c = 0
+    int n = array.size(e.roots)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = array.get(e.roots, i)
+            if r.category == cat and r.state != ROOT_RETIRED
+                c := c + 1
+    c
+
+f_countAccumBoxes(ZoneEngine e) =>
+    array<string> keys = array.new_string()
+    int n = array.size(e.roots)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = array.get(e.roots, i)
+            if r.category == CAT_ACCUM and r.state != ROOT_RETIRED and not array.includes(keys, r.pairKey)
+                array.push(keys, r.pairKey)
+    array.size(keys)
+
+f_removeRetiredRoots(ZoneEngine e) =>
+    int removed = 0
+    int n = array.size(e.roots)
+    if n > 0
+        for i = n - 1 to 0
+            if i < array.size(e.roots)
+                if array.get(e.roots, i).state == ROOT_RETIRED
+                    array.remove(e.roots, i)
+                    removed := removed + 1
+    removed
+
+f_pruneCategoryToCap(ZoneEngine e, ZoneCfg c, ZoneFeed f, int cat, int cap) =>
+    int removed = 0
+    for guard = 1 to 64
+        int cnt = cat == CAT_ACCUM ? f_countAccumBoxes(e) : f_countRootsInCategory(e, cat)
+        if cnt <= cap
+            break
+        int  worstIdx  = -1
+        int  worstTime = na
+        int  worstId   = na
+        int n = array.size(e.roots)
+        if n > 0
+            for i = 0 to n - 1
+                Root r = array.get(e.roots, i)
+                if r.category == cat and r.state != ROOT_RETIRED and not f_rootProtected(r)
+                     and not f_rootEssential(e, r.rootId)
+                     and not (cat == CAT_TIME_HL and r.isCurrentPeriod)
+                    bool older = worstIdx < 0 or nz(r.confirmedTime, 0) < nz(worstTime, 0)
+                         or (nz(r.confirmedTime, 0) == nz(worstTime, 0) and r.rootId < nz(worstId, 0))
+                    if older
+                        worstIdx  := i
+                        worstTime := r.confirmedTime
+                        worstId   := r.rootId
+        if worstIdx < 0
+            break
+        if cat == CAT_ACCUM
+            //  同じ Box の上下限はセットで外す (片側だけ残さない)
+            string pk = array.get(e.roots, worstIdx).pairKey
+            int m = array.size(e.roots)
+            for i = m - 1 to 0
+                if i < array.size(e.roots)
+                    Root rr = array.get(e.roots, i)
+                    if rr.category == CAT_ACCUM and rr.pairKey == pk
+                        array.remove(e.roots, i)
+                        removed := removed + 1
+        else
+            array.remove(e.roots, worstIdx)
+            removed := removed + 1
+    removed
+
+f_pruneRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    int removed = f_removeRetiredRoots(e)
+    removed := removed + f_pruneCategoryToCap(e, c, f, CAT_SWING, c.maxSwingRoots)
+    removed := removed + f_pruneCategoryToCap(e, c, f, CAT_ACCUM, c.maxAccumBoxes)
+    removed := removed + f_pruneCategoryToCap(e, c, f, CAT_FVG, c.maxFvgRoots)
+    removed := removed + f_pruneCategoryToCap(e, c, f, CAT_TIME_HL, c.maxTimeRoots)
+    if removed > 0
+        e.storagePruned   := true
+        e.prunedRootCount := e.prunedRootCount + removed
+        f_emit(e, f, EV_STORAGE_PRUNE, 0, 0, SIDE_NONE, na, na, 0, GR_UNAVAILABLE, WEAK_NONE, 0,
+             "ROOT_PRUNED " + str.tostring(removed))
+    removed
+
+// ============================================================================
+// 06. SIDE ELIGIBILITY / CLUSTERING / CATEGORY QUALITY / REFERENCE PRICE
+// ----------------------------------------------------------------------------
+//  Side ごとに候補を作り、そのあと Support 候補と Resistance 候補を
+//  1 つの物理 ZoneCore へ対応付ける (7 章)。
+//  距離は Center ではなく候補 EffectiveZoneRange の最安値〜最高値で判断する
+//  (数珠つなぎ禁止)。
+// ============================================================================
+
+f_denseWidth(ZoneCfg c) =>
+    c.clusterMaxWidth * c.denseRatio
+
+// ---- 6.1 Side 別 Root 資格 -------------------------------------------------
+f_rootEligibleForSide(ZoneCfg c, Root r, int side) =>
+    bool ok = false
+    if r.state == ROOT_RETIRED
+        ok := false
+    else if r.category == CAT_FVG
+        if r.state == ROOT_ACTIVE
+            ok := (r.direction == FVG_BULLISH and side == SIDE_SUPPORT)
+                 or (r.direction == FVG_BEARISH and side == SIDE_RESISTANCE)
+        else if r.state == ROOT_INVERSE_ACTIVE
+            ok := (r.inverseDir == FVG_BULLISH and side == SIDE_SUPPORT)
+                 or (r.inverseDir == FVG_BEARISH and side == SIDE_RESISTANCE)
+        else
+            ok := false          // Invalidated / InverseWait はどちらにも参加しない
+    else
+        ok := r.state == ROOT_ACTIVE
+    ok
+
+f_effectiveFvgDir(Root r) =>
+    r.state == ROOT_INVERSE_ACTIVE ? r.inverseDir : r.direction
+
+// ---- 6.2 Category 品質 (High は 1 カテゴリにつき最大 1) --------------------
+//  参加 Root だけで評価する。Adjacent / core 外 Root は品質を上げない。
+f_qualityMa(ZoneEngine e, ZoneCfg c, array<int> ids, int side) =>
+    int i1 = array.includes(ids, RID_EMA1) ? f_rootIdxById(e, RID_EMA1) : -1
+    int i2 = array.includes(ids, RID_EMA2) ? f_rootIdxById(e, RID_EMA2) : -1
+    bool high = false
+    if i1 >= 0 and i2 >= 0
+        Root a = array.get(e.roots, i1)
+        Root b = array.get(e.roots, i2)
+        bool near = f_leT(math.abs(a.pointPrice - b.pointPrice), f_denseWidth(c), c.mintick)
+        bool dirOk = side == SIDE_SUPPORT ? (a.direction > 0 and b.direction > 0)
+             : (a.direction < 0 and b.direction < 0)
+        high := near and dirOk
+    high
+
+f_qualitySwing(ZoneEngine e, array<int> ids) =>
+    bool high = false
+    int n = array.size(ids)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(ids, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if r.category == CAT_SWING
+                    if r.tfCode == TF_1H
+                        high := true
+                        break
+                    if f_maskHas(r.tfMask, TF_15M) and f_maskHas(r.tfMask, TF_5M)
+                        high := true
+                        break
+    high
+
+f_qualityAccum(ZoneEngine e, array<int> ids) =>
+    bool high = false
+    int n = array.size(ids)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(ids, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if r.category == CAT_ACCUM and (r.tfCode == TF_4H or r.tfCode == TF_D)
+                    high := true
+                    break
+        //  異なる時間足の別 Box 境界が同じ core で重なる (同じ Box 同士は補強禁止)
+        if not high and n >= 2
+            for a = 0 to n - 2
+                int ia = f_rootIdxById(e, array.get(ids, a))
+                if ia >= 0
+                    Root ra = array.get(e.roots, ia)
+                    if ra.category == CAT_ACCUM
+                        for b = a + 1 to n - 1
+                            int ib = f_rootIdxById(e, array.get(ids, b))
+                            if ib >= 0
+                                Root rb = array.get(e.roots, ib)
+                                if rb.category == CAT_ACCUM and rb.pairKey != ra.pairKey and rb.tfCode != ra.tfCode
+                                    high := true
+                                    break
+                if high
+                    break
+    high
+
+f_qualityTimeHl(ZoneEngine e, array<int> ids) =>
+    bool high = false
+    int n = array.size(ids)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(ids, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if r.category == CAT_TIME_HL
+                    bool weekCur  = f_maskHas(r.labelMask, f_timeLabelBit(PER_WEEK, true))
+                    bool weekPrev = f_maskHas(r.labelMask, f_timeLabelBit(PER_WEEK, false))
+                    bool dayPrev  = f_maskHas(r.labelMask, f_timeLabelBit(PER_DAY, false))
+                    if weekCur or weekPrev or dayPrev
+                        high := true
+                        break
+        //  別起源 (OriginTime が違う) の期間高安が同じ core で重なる
+        if not high and n >= 2
+            for a = 0 to n - 2
+                int ia = f_rootIdxById(e, array.get(ids, a))
+                if ia >= 0
+                    Root ra = array.get(e.roots, ia)
+                    if ra.category == CAT_TIME_HL
+                        for b = a + 1 to n - 1
+                            int ib = f_rootIdxById(e, array.get(ids, b))
+                            if ib >= 0
+                                Root rb = array.get(e.roots, ib)
+                                if rb.category == CAT_TIME_HL and nz(rb.originTime, 0) != nz(ra.originTime, 0)
+                                    high := true
+                                    break
+                if high
+                    break
+    high
+
+f_qualityFvg(ZoneEngine e, ZoneCfg c, array<int> ids, bool broadLocalized) =>
+    bool high = false
+    int n = array.size(ids)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(ids, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if r.category == CAT_FVG
+                    if not r.isBroadFvg and (r.tfCode == TF_4H or r.tfCode == TF_D)
+                        high := true
+                        break
+                    if r.isBroadFvg and broadLocalized
+                        high := true
+                        break
+        //  異なる時間足の同方向 FVG が実際に重なる (同じ時間足同士は Normal)
+        if not high and n >= 2
+            for a = 0 to n - 2
+                int ia = f_rootIdxById(e, array.get(ids, a))
+                if ia >= 0
+                    Root ra = array.get(e.roots, ia)
+                    if ra.category == CAT_FVG
+                        for b = a + 1 to n - 1
+                            int ib = f_rootIdxById(e, array.get(ids, b))
+                            if ib >= 0
+                                Root rb = array.get(e.roots, ib)
+                                if rb.category == CAT_FVG and rb.tfCode != ra.tfCode
+                                     and f_effectiveFvgDir(rb) == f_effectiveFvgDir(ra)
+                                     and f_rangesTouch(ra.nativeBottom, ra.nativeTop, rb.nativeBottom, rb.nativeTop, c.mintick)
+                                    high := true
+                                    break
+                if high
+                    break
+    high
+
+// ---- 6.3 ZoneReferencePrice (表示・追跡用。ロジック判定には使わない) ------
+//  加重平均は作らない。各点カテゴリ代表の単純中央値。FVG 50% は使わない。
+f_catPricesMedian(ZoneEngine e, array<int> ids, int cat) =>
+    array<float> ps = array.new_float()
+    int n = array.size(ids)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(ids, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if r.category == cat and not r.isRangeRoot and not na(r.pointPrice)
+                    array.push(ps, r.pointPrice)
+    array.size(ps) > 0 ? f_median(ps) : float(na)
+
+f_refPrice(ZoneEngine e, ZoneCfg c, int side, array<int> ids, float bot, float top) =>
+    array<float> reps = array.new_float()
+    float repSwing = f_catPricesMedian(e, ids, CAT_SWING)
+    float repAccum = f_catPricesMedian(e, ids, CAT_ACCUM)
+    float repTime  = f_catPricesMedian(e, ids, CAT_TIME_HL)
+    float repPsych = f_catPricesMedian(e, ids, CAT_PSYCH)
+    if not na(repSwing)
+        array.push(reps, repSwing)
+    if not na(repAccum)
+        array.push(reps, repAccum)
+    if not na(repTime)
+        array.push(reps, repTime)
+    if not na(repPsych)
+        array.push(reps, repPsych)
+    // MA : 他カテゴリ core に近い実 EMA を代表にする (2 本だけなら中間値は表示中心)
+    array<float> maPs = array.new_float()
+    int n = array.size(ids)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(ids, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if r.category == CAT_MA and not na(r.pointPrice)
+                    array.push(maPs, r.pointPrice)
+    if array.size(maPs) > 0
+        float maRep = na
+        if array.size(reps) > 0
+            float others = f_median(reps)
+            float bestD  = na
+            for k = 0 to array.size(maPs) - 1
+                float p = array.get(maPs, k)
+                float d = math.abs(p - others)
+                if na(bestD) or d < bestD
+                    bestD  := d
+                    maRep  := p
+        else
+            maRep := f_median(maPs)
+        array.push(reps, maRep)
+    //  FVG : 内部に点 Root があれば中央値へ入れない。FVG only は接近側 Proximal edge。
+    array.size(reps) > 0 ? f_median(reps) : (side == SIDE_SUPPORT ? top : bot)
+
+// ---- 6.4 候補の組み立て ----------------------------------------------------
+//  Base Strong (仕様 6.2 / 指示書 10.3)
+//    C == 1                          -> false
+//    C == 2 and HighDensity and H>=1 -> true
+//    C >= 3 and HighDensity          -> true
+//    otherwise                       -> false
+f_buildCand(ZoneEngine e, ZoneCfg c, int side, array<int> ids,
+     float forcedBottom, float forcedTop, bool forceBroadContext, bool proximalDense) =>
+    ZoneCand cd = ZoneCand.new(side = side, rootIds = array.copy(ids),
+         catUsed = array.new_bool(CAT_COUNT, false), catHigh = array.new_bool(CAT_COUNT, false))
+    float pmin = na
+    float pmax = na
+    bool  hasNonPsych = false
+    int   minId  = na
+    int   firstT = na
+    int   fvgDirMask = 0
+    int   fvgCnt = 0
+    int   freshCnt = 0
+    int   stateMask = 0
+    int n = array.size(ids)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(ids, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                array.set(cd.catUsed, r.category, true)
+                if r.category != CAT_PSYCH
+                    hasNonPsych := true
+                minId  := na(minId)  ? r.rootId : math.min(minId, r.rootId)
+                firstT := na(firstT) ? nz(r.confirmedTime, 0) : math.min(firstT, nz(r.confirmedTime, 0))
+                if r.category == CAT_FVG
+                    fvgCnt     := fvgCnt + 1
+                    fvgDirMask := f_maskAdd(fvgDirMask, f_effectiveFvgDir(r))
+                    stateMask  := f_maskAdd(stateMask, r.state)
+                    if r.fvgFresh
+                        freshCnt := freshCnt + 1
+                else
+                    pmin := na(pmin) ? r.pointPrice : math.min(pmin, r.pointPrice)
+                    pmax := na(pmax) ? r.pointPrice : math.max(pmax, r.pointPrice)
+    cd.bottom      := na(forcedBottom) ? pmin : forcedBottom
+    cd.top         := na(forcedTop)    ? pmax : forcedTop
+    cd.minRootId   := nz(minId, 0)
+    cd.firstConfirmTime := firstT
+    cd.hasNonPsych := hasNonPsych
+    cd.fvgRootCount := fvgCnt
+    cd.fvgFreshCount := freshCnt
+    cd.fvgDirMask  := fvgDirMask
+    cd.fvgStateMask := stateMask
+
+    float width = na(cd.bottom) or na(cd.top) ? na : cd.top - cd.bottom
+    if forceBroadContext or na(width) or f_gtT(width, c.clusterMaxWidth, c.mintick)
+        cd.density := DEN_BROAD_CONTEXT
+    else if f_leT(width, f_denseWidth(c), c.mintick)
+        cd.density := DEN_HIGH
+    else
+        cd.density := DEN_NORMAL
+
+    // 非 FVG カテゴリの品質を先に決める (Broad 局所化条件が参照する)
+    if array.get(cd.catUsed, CAT_MA)
+        array.set(cd.catHigh, CAT_MA, f_qualityMa(e, c, ids, side))
+    if array.get(cd.catUsed, CAT_SWING)
+        array.set(cd.catHigh, CAT_SWING, f_qualitySwing(e, ids))
+    if array.get(cd.catUsed, CAT_ACCUM)
+        array.set(cd.catHigh, CAT_ACCUM, f_qualityAccum(e, ids))
+    if array.get(cd.catUsed, CAT_TIME_HL)
+        array.set(cd.catHigh, CAT_TIME_HL, f_qualityTimeHl(e, ids))
+    // 心理価格は常に Normal (High にならない)
+
+    int nonFvgC = 0
+    bool anyOtherHigh = false
+    for cat = 0 to CAT_COUNT - 1
+        if cat != CAT_FVG and array.get(cd.catUsed, cat)
+            nonFvgC := nonFvgC + 1
+            if array.get(cd.catHigh, cat)
+                anyOtherHigh := true
+    //  Broad FVG の局所化条件 (仕様 3.5 の 4 条件のいずれか)
+    //    1) Proximal edge 周辺に別カテゴリが高密集
+    //    2) 同方向の別時間足 FVG と実際に重なる  (f_qualityFvg 内で判定)
+    //    3) 内部に高品質な別カテゴリがある
+    //    4) 内部に FVG 以外の独立カテゴリが 2 つ以上高密集
+    bool broadLocalized = proximalDense or anyOtherHigh or (nonFvgC >= 2 and cd.density == DEN_HIGH)
+    if array.get(cd.catUsed, CAT_FVG)
+        array.set(cd.catHigh, CAT_FVG, f_qualityFvg(e, c, ids, broadLocalized))
+
+    int cc = 0
+    int hh = 0
+    for cat = 0 to CAT_COUNT - 1
+        if array.get(cd.catUsed, cat)
+            cc := cc + 1
+        if array.get(cd.catHigh, cat)
+            hh := hh + 1
+    cd.cCount := cc
+    cd.hCount := hh
+    cd.isBroadContext := cd.density == DEN_BROAD_CONTEXT
+    cd.baseStrong := not cd.isBroadContext and cd.hasNonPsych and cd.density == DEN_HIGH
+         and ((cc == 2 and hh >= 1) or cc >= 3)
+    //  ZoneReferencePrice は表示・追跡用なので、候補探索中は計算しない。
+    //  View へ適用するときだけ f_refPrice() で作る (f_applyCandToView)。
+    cd
+
+//  候補比較 : C 降順 -> H 降順 -> 幅昇順 -> core 成立時刻昇順 -> 最小 Root ID 昇順
+//  (sort の同値結果がバーごとに変わらないよう必ず ID まで tie-break する)
+f_candBetter(ZoneCand a, ZoneCand b, ZoneCfg c) =>
+    bool better = false
+    if a.cCount != b.cCount
+        better := a.cCount > b.cCount
+    else if a.hCount != b.hCount
+        better := a.hCount > b.hCount
+    else
+        float wa = nz(a.top - a.bottom, 0)
+        float wb = nz(b.top - b.bottom, 0)
+        if not f_eqT(wa, wb, c.mintick)
+            better := wa < wb
+        else if nz(a.firstConfirmTime, 0) != nz(b.firstConfirmTime, 0)
+            better := nz(a.firstConfirmTime, 0) < nz(b.firstConfirmTime, 0)
+        else
+            better := a.minRootId < b.minRootId
+    better
+
+// ---- 6.5 点 Root の収集とソート (price 昇順 / 同値は Root ID 昇順) --------
+//  ★ クラスタリング対象は現在価格から dormantDistance 以内の Root だけに絞る ★
+//    仕様 14 章の Dormant (現在価格から遠い Zone は計算を休止し履歴は保持する) を
+//    Root 収集の段階で実現している。窓の外の Root を持つ Core は「未マッチ」として
+//    Dormant のまま保持され、価格が戻れば同じ Core ID / 世代 / 消耗履歴で復帰する。
+f_collectPointRoots(ZoneEngine e, ZoneCfg c, int side, float refClose, array<int> outIds, array<float> outPrices) =>
+    array.clear(outIds)
+    array.clear(outPrices)
+    int n = array.size(e.roots)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = array.get(e.roots, i)
+            bool inWindow = na(refClose) or na(r.pointPrice)
+                 or math.abs(r.pointPrice - refClose) <= c.dormantDistance
+            if inWindow and r.category != CAT_FVG and not na(r.pointPrice) and f_rootEligibleForSide(c, r, side)
+                //  挿入ソート (price, rootId) : 決定論的な順序を保証する
+                int pos = array.size(outIds)
+                if pos > 0
+                    for k = 0 to pos - 1
+                        float pk = array.get(outPrices, k)
+                        int   ik = array.get(outIds, k)
+                        if r.pointPrice < pk or (f_eqT(r.pointPrice, pk, c.mintick) and r.rootId < ik)
+                            pos := k
+                            break
+                array.insert(outIds, pos, r.rootId)
+                array.insert(outPrices, pos, r.pointPrice)
+    array.size(outIds)
+
+//  同じ Accum Box の上下限を同じ候補へ入れない (Mutually Exclusive Pair)
+f_accumPairConflict(ZoneEngine e, array<int> ids, int newRootId) =>
+    bool conflict = false
+    int ni = f_rootIdxById(e, newRootId)
+    if ni >= 0
+        Root nr = array.get(e.roots, ni)
+        if nr.category == CAT_ACCUM and nr.pairKey != ""
+            int n = array.size(ids)
+            if n > 0
+                for k = 0 to n - 1
+                    int i = f_rootIdxById(e, array.get(ids, k))
+                    if i >= 0
+                        Root r = array.get(e.roots, i)
+                        if r.category == CAT_ACCUM and r.pairKey == nr.pairKey and r.rootId != nr.rootId
+                            conflict := true
+                            break
+    conflict
+
+// ---- 6.6 未使用 Root から候補を 1 つ選ぶ (Dense 優先 -> 通常) -------------
+//  幅は候補 EffectiveZoneRange の全幅で判断する。A-B / B-C が近くても
+//  A-C 全幅が超えるものは 1 Zone にしない。
+f_pickBestWindow(ZoneEngine e, ZoneCfg c, int side, array<int> ids, array<float> prices,
+     array<bool> used, float maxWidth, bool requireStrong) =>
+    ZoneCand best = na
+    int n = array.size(ids)
+    if n > 0
+        for a = 0 to n - 1
+            if not array.get(used, a)
+                array<int> cur = array.new_int()
+                array.push(cur, array.get(ids, a))
+                float lo = array.get(prices, a)
+                for b = a to n - 1
+                    if b > a
+                        if array.get(used, b)
+                            continue
+                        float w = array.get(prices, b) - lo
+                        if f_gtT(w, maxWidth, c.mintick)
+                            break
+                        if f_accumPairConflict(e, cur, array.get(ids, b))
+                            break
+                        array.push(cur, array.get(ids, b))
+                    //  Base Strong は C >= 2 が必須 -> 1 本だけの窓は Dense 探索では作らない
+                    if not requireStrong or array.size(cur) >= 2
+                        ZoneCand cd = f_buildCand(e, c, side, cur, na, na, false, false)
+                        bool okStrong = not requireStrong or cd.baseStrong
+                        if cd.hasNonPsych and okStrong
+                            if na(best)
+                                best := cd
+                            else if f_candBetter(cd, best, c)
+                                best := cd
+    best
+
+f_markUsed(ZoneEngine e, array<int> ids, array<int> candIds, array<bool> used) =>
+    int m = array.size(candIds)
+    if m > 0
+        for k = 0 to m - 1
+            int rid = array.get(candIds, k)
+            int n = array.size(ids)
+            if n > 0
+                for i = 0 to n - 1
+                    if array.get(ids, i) == rid
+                        array.set(used, i, true)
+                        break
+    true
+
+// ---- 6.7 FVG の attach / 局所化 / 単独候補 --------------------------------
+//  ・非 Broad FVG 単独        : NativeRange
+//  ・FVG 内部に点 Root がある : EffectiveRange は局所参加点 Root の実分布
+//  ・Proximal 外側に別 Root が高密集 : Proximal edge 〜 局所 Root 分布
+//  ・同方向 FVG 同士が実際に重なる   : 共通区間
+//  ・同方向でも非重複なら距離 M 以内だけでは結合しない
+//  ・Broad FVG は複数の局所 Zone へ共有可 (共有だけでは候補同士を結合しない)
+f_collectFvgRoots(ZoneEngine e, ZoneCfg c, int side, float refClose, array<int> out) =>
+    array.clear(out)
+    int n = array.size(e.roots)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = array.get(e.roots, i)
+            float d = na(refClose) ? 0.0 : f_distanceToRangeRaw(refClose, r.nativeBottom, r.nativeTop)
+            if nz(d, 0.0) <= c.dormantDistance and r.category == CAT_FVG and f_rootEligibleForSide(c, r, side)
+                array.push(out, r.rootId)
+    array.sort(out, order.ascending)
+    array.size(out)
+
+f_fvgAttachAndStandalone(ZoneEngine e, ZoneCfg c, int side, float refClose, array<ZoneCand> cands) =>
+    array<int> fids = array.new_int()
+    f_collectFvgRoots(e, c, side, refClose, fids)
+    array<int> stand = array.new_int()
+    int fn = array.size(fids)
+    if fn > 0
+        for k = 0 to fn - 1
+            int      fid = array.get(fids, k)
+            int      fi  = f_rootIdxById(e, fid)
+            if fi >= 0
+                Root r = array.get(e.roots, fi)
+                bool attached = false
+                int      bestIdx = -1
+                ZoneCand bestCd  = na
+                int cn = array.size(cands)
+                if cn > 0
+                    for ci = 0 to cn - 1
+                        ZoneCand cd = array.get(cands, ci)
+                        if not cd.isBroadContext and not array.includes(cd.rootIds, fid)
+                            bool inside = f_rangesTouch(cd.bottom, cd.top, r.nativeBottom, r.nativeTop, c.mintick)
+                            float gap = f_intervalGap(cd.bottom, cd.top, r.nativeBottom, r.nativeTop)
+                            bool proximal = not inside and not na(gap) and gap > 0
+                                 and f_leT(gap, f_denseWidth(c), c.mintick) and cd.density == DEN_HIGH
+                            if inside or proximal
+                                array<int> ids2 = array.copy(cd.rootIds)
+                                array.push(ids2, fid)
+                                float fb = cd.bottom
+                                float ft = cd.top
+                                if proximal
+                                    float pedge = side == SIDE_SUPPORT ? r.nativeTop : r.nativeBottom
+                                    fb := math.min(cd.bottom, pedge)
+                                    ft := math.max(cd.top, pedge)
+                                ZoneCand nc = f_buildCand(e, c, side, ids2, fb, ft, false, proximal)
+                                bool okWidth = f_leT(nc.top - nc.bottom, c.clusterMaxWidth, c.mintick)
+                                //  Dense Base Strong を attach で薄めない
+                                bool keepStrong = not cd.baseStrong or nc.baseStrong
+                                if okWidth and keepStrong
+                                    if r.isBroadFvg
+                                        array.set(cands, ci, nc)
+                                        attached := true
+                                    else if bestIdx < 0
+                                        bestIdx := ci
+                                        bestCd  := nc
+                                    else if f_candBetter(nc, bestCd, c)
+                                        bestIdx := ci
+                                        bestCd  := nc
+                if not r.isBroadFvg and bestIdx >= 0
+                    array.set(cands, bestIdx, bestCd)
+                    attached := true
+                if not attached
+                    array.push(stand, fid)
+    // ---- 単独 FVG 候補 (同方向で実際に重なるものは共通区間へまとめる) ----
+    int sn = array.size(stand)
+    if sn > 0
+        array<bool> gused = array.new_bool(sn, false)
+        for i = 0 to sn - 1
+            if not array.get(gused, i)
+                array.set(gused, i, true)
+                int ia = f_rootIdxById(e, array.get(stand, i))
+                if ia >= 0
+                    Root ra = array.get(e.roots, ia)
+                    array<int> gids = array.new_int()
+                    array.push(gids, ra.rootId)
+                    float gb = ra.nativeBottom
+                    float gt = ra.nativeTop
+                    int dirA = f_effectiveFvgDir(ra)
+                    if i < sn - 1
+                        for j = i + 1 to sn - 1
+                            if not array.get(gused, j)
+                                int ib = f_rootIdxById(e, array.get(stand, j))
+                                if ib >= 0
+                                    Root rb = array.get(e.roots, ib)
+                                    if f_effectiveFvgDir(rb) == dirA
+                                         and f_rangesTouch(gb, gt, rb.nativeBottom, rb.nativeTop, c.mintick)
+                                        float nb = math.max(gb, rb.nativeBottom)
+                                        float nt = math.min(gt, rb.nativeTop)
+                                        if f_leT(nb, nt, c.mintick)
+                                            gb := nb
+                                            gt := nt
+                                            array.push(gids, rb.rootId)
+                                            array.set(gused, j, true)
+                    bool forceBroad = array.size(gids) == 1 and ra.isBroadFvg
+                    array.push(cands, f_buildCand(e, c, side, gids, gb, gt, forceBroad, false))
+    array.size(cands)
+
+// ---- 6.8 Side 候補の生成パイプライン --------------------------------------
+//  段階A : Base Strong を満たす Dense core を比較関数で先に確定する
+//          (Dense core 優先。core 外 Root を後付けして幅を広げない)
+//  段階C : 残 Root だけを価格昇順に左から貪欲クラスタ化して通常候補にする
+//          (決定論的な一方向スイープ。バーごとに結果が揺れない)
+//  段階B : FVG の attach / 局所化 / 単独候補
+f_buildSideCands(ZoneEngine e, ZoneCfg c, ZoneFeed f, int side) =>
+    array<ZoneCand> out = array.new<ZoneCand>()
+    array<int>   ids    = array.new_int()
+    array<float> prices = array.new_float()
+    int n = f_collectPointRoots(e, c, side, f.baseClose, ids, prices)
+    array<bool> used = array.new_bool(int(math.max(n, 1)), false)
+    for g = 1 to 12
+        ZoneCand cd = f_pickBestWindow(e, c, side, ids, prices, used, f_denseWidth(c), true)
+        if na(cd)
+            break
+        array.push(out, cd)
+        f_markUsed(e, ids, cd.rootIds, used)
+    if n > 0
+        for i = 0 to n - 1
+            if not array.get(used, i)
+                array<int> cur    = array.new_int()
+                array<int> curIdx = array.new_int()
+                array.push(cur, array.get(ids, i))
+                array.push(curIdx, i)
+                float lo = array.get(prices, i)
+                if i < n - 1
+                    for k = i + 1 to n - 1
+                        if not array.get(used, k)
+                            if f_gtT(array.get(prices, k) - lo, c.clusterMaxWidth, c.mintick)
+                                break
+                            if f_accumPairConflict(e, cur, array.get(ids, k))
+                                break
+                            array.push(cur, array.get(ids, k))
+                            array.push(curIdx, k)
+                ZoneCand cd = f_buildCand(e, c, side, cur, na, na, false, false)
+                if cd.hasNonPsych
+                    array.push(out, cd)
+                for m = 0 to array.size(curIdx) - 1
+                    array.set(used, array.get(curIdx, m), true)
+    f_fvgAttachAndStandalone(e, c, side, f.baseClose, out)
+    out
+
+// ============================================================================
+// 07. ZoneCore : 同一性 / 結合 / 分裂 / 世代
+// ----------------------------------------------------------------------------
+//  同一性 (仕様 12.1)
+//    1) Broad FVG だけではない共通 origin Root ID を 1 つ以上共有
+//    2) 旧範囲と新範囲の interval gap が M 以内 (重なれば gap = 0)
+//  Center 距離では判定しない。中央値の移動だけでは新世代にしない。
+// ============================================================================
+
+f_isBroadFvgRoot(ZoneEngine e, int rootId) =>
+    int i = f_rootIdxById(e, rootId)
+    bool b = false
+    if i >= 0
+        Root r = array.get(e.roots, i)
+        b := r.category == CAT_FVG and r.isBroadFvg
+    b
+
+//  同一性判定に使う Root 集合。Broad FVG は「共有だけで Zone を結び付けない」ため
+//  原則除外する。ただし候補が Broad FVG だけで出来ている (Broad context Zone) 場合は、
+//  同一性の手がかりが無くなってしまうので、その Broad FVG 自身を使う。
+f_identityIds(ZoneEngine e, array<int> ids, array<int> out) =>
+    array.clear(out)
+    int n = array.size(ids)
+    if n > 0
+        for k = 0 to n - 1
+            int rid = array.get(ids, k)
+            if not f_isBroadFvgRoot(e, rid) and not array.includes(out, rid)
+                array.push(out, rid)
+        if array.size(out) == 0
+            for k = 0 to n - 1
+                int rid2 = array.get(ids, k)
+                if not array.includes(out, rid2)
+                    array.push(out, rid2)
+    array.size(out)
+
+f_sharedCount(array<int> a, array<int> b) =>
+    int c = 0
+    int n = array.size(a)
+    if n > 0
+        for i = 0 to n - 1
+            if array.includes(b, array.get(a, i))
+                c := c + 1
+    c
+
+f_nonFvgSharedCount(ZoneEngine e, array<int> a, array<int> b) =>
+    int c = 0
+    int n = array.size(a)
+    if n > 0
+        for i = 0 to n - 1
+            int rid = array.get(a, i)
+            if array.includes(b, rid)
+                int idx = f_rootIdxById(e, rid)
+                if idx >= 0 and array.get(e.roots, idx).category != CAT_FVG
+                    c := c + 1
+    c
+
+// ---- 7.1 Support 候補と Resistance 候補を 1 つの ZoneCore 候補へ ----------
+//  同じ非 FVG origin Root を 1 つ以上共有し、価格的連続性が M 以内なら 1 Core。
+//  Inverse 前後の同じ FVG origin も 1 Core。
+//  単に範囲が重なるだけの別起源 FVG 同士 / Bullish と Bearish /
+//  Broad FVG 共有だけの候補は同一 Core にしない。
+f_pairSides(ZoneEngine e, ZoneCfg c, array<ZoneCand> sup, array<ZoneCand> res) =>
+    array<CoreCand> out = array.new<CoreCand>()
+    int ns = array.size(sup)
+    int nr = array.size(res)
+    array<bool> rUsed = array.new_bool(int(math.max(nr, 1)), false)
+    if ns > 0
+        for si = 0 to ns - 1
+            ZoneCand sc = array.get(sup, si)
+            array<int> sIds = array.new_int()
+            f_identityIds(e, sc.rootIds, sIds)
+            int   bestRi     = -1
+            int   bestShared = 0
+            float bestGap    = na
+            if nr > 0
+                for ri = 0 to nr - 1
+                    if not array.get(rUsed, ri)
+                        ZoneCand rc = array.get(res, ri)
+                        array<int> rIds = array.new_int()
+                        f_identityIds(e, rc.rootIds, rIds)
+                        int shNonFvg = f_nonFvgSharedCount(e, sIds, rIds)
+                        int shAll    = f_sharedCount(sIds, rIds)
+                        float gap = f_intervalGap(sc.bottom, sc.top, rc.bottom, rc.top)
+                        bool near = not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
+                        if near and (shNonFvg >= 1 or shAll >= 1)
+                            bool better = bestRi < 0 or shAll > bestShared
+                                 or (shAll == bestShared and not na(gap) and gap < nz(bestGap, 1e20))
+                            if better
+                                bestRi     := ri
+                                bestShared := shAll
+                                bestGap    := gap
+            CoreCand cc = CoreCand.new(supIdx = si, resIdx = bestRi, originRootIds = array.new_int())
+            if bestRi >= 0
+                array.set(rUsed, bestRi, true)
+                ZoneCand rc = array.get(res, bestRi)
+                cc.bottom := math.min(sc.bottom, rc.bottom)
+                cc.top    := math.max(sc.top, rc.top)
+            else
+                cc.bottom := sc.bottom
+                cc.top    := sc.top
+            f_identityIds(e, sc.rootIds, cc.originRootIds)
+            if bestRi >= 0
+                ZoneCand rc2 = array.get(res, bestRi)
+                array<int> extra = array.new_int()
+                f_identityIds(e, rc2.rootIds, extra)
+                int en = array.size(extra)
+                if en > 0
+                    for k = 0 to en - 1
+                        if not array.includes(cc.originRootIds, array.get(extra, k))
+                            array.push(cc.originRootIds, array.get(extra, k))
+            array.push(out, cc)
+    if nr > 0
+        for ri = 0 to nr - 1
+            if not array.get(rUsed, ri)
+                ZoneCand rc = array.get(res, ri)
+                CoreCand cc = CoreCand.new(supIdx = -1, resIdx = ri, originRootIds = array.new_int(),
+                     bottom = rc.bottom, top = rc.top)
+                f_identityIds(e, rc.rootIds, cc.originRootIds)
+                array.push(out, cc)
+    out
+
+// ---- 7.2 View / Core への適用 ---------------------------------------------
+f_clearView(SideViewState v) =>
+    array.clear(v.rootIds)
+    v.effectiveBottom := na
+    v.effectiveTop    := na
+    v.referencePrice  := na
+    v.cCount          := 0
+    v.hCount          := 0
+    v.catMask         := 0
+    v.highMask        := 0
+    v.density         := DEN_NORMAL
+    v.baseStrong      := false
+    v.hasNonPsychRoot := false
+    v.isBroadContext  := false
+    v.eligible        := false
+    v.fvgDirMask      := 0
+    v.fvgRootCount    := 0
+    v.fvgFreshCount   := 0
+    v.fvgStateMask    := 0
+    true
+
+f_applyCandToView(ZoneEngine e, ZoneCfg c, int side, SideViewState v, ZoneCand cd) =>
+    if na(cd)
+        f_clearView(v)
+    else
+        v.rootIds         := array.copy(cd.rootIds)
+        v.effectiveBottom := cd.bottom
+        v.effectiveTop    := cd.top
+        v.referencePrice  := f_refPrice(e, c, side, cd.rootIds, cd.bottom, cd.top)
+        v.cCount          := cd.cCount
+        v.hCount          := cd.hCount
+        v.density         := cd.density
+        v.baseStrong      := cd.baseStrong
+        v.hasNonPsychRoot := cd.hasNonPsych
+        v.isBroadContext  := cd.isBroadContext
+        v.fvgDirMask      := cd.fvgDirMask
+        v.fvgRootCount    := cd.fvgRootCount
+        v.fvgFreshCount   := cd.fvgFreshCount
+        v.fvgStateMask    := cd.fvgStateMask
+        int cmask = 0
+        int hmask = 0
+        for cat = 0 to CAT_COUNT - 1
+            if array.get(cd.catUsed, cat)
+                cmask := f_maskAdd(cmask, cat)
+            if array.get(cd.catHigh, cat)
+                hmask := f_maskAdd(hmask, cat)
+        v.catMask  := cmask
+        v.highMask := hmask
+    true
+
+//  LiveStructure : Root の参加資格喪失は ActiveTouch 中でも即時反映する。
+//  ただし範囲 (形状) は変えない → 現在 Episode は Snapshot 基準のまま最後まで記録できる。
+f_liveStructurePrune(ZoneEngine e, ZoneCfg c, int side, SideViewState v) =>
+    bool changed = false
+    int n = array.size(v.rootIds)
+    if n > 0
+        for i = n - 1 to 0
+            if i < array.size(v.rootIds)
+                int rid = array.get(v.rootIds, i)
+                int ri  = f_rootIdxById(e, rid)
+                bool keep = false
+                if ri >= 0
+                    keep := f_rootEligibleForSide(c, array.get(e.roots, ri), side)
+                if not keep
+                    array.remove(v.rootIds, i)
+                    changed := true
+    if changed
+        if array.size(v.rootIds) == 0
+            float b = v.effectiveBottom
+            float t = v.effectiveTop
+            f_clearView(v)
+            v.effectiveBottom := b
+            v.effectiveTop    := t
+        else
+            //  残 Root だけで Side View を再計算する (範囲は据え置き)
+            ZoneCand cd = f_buildCand(e, c, side, v.rootIds, v.effectiveBottom, v.effectiveTop, v.isBroadContext, false)
+            f_applyCandToView(e, c, side, v, cd)
+    changed
+
+f_viewDiffers(ZoneCfg c, SideViewState v, ZoneCand cd) =>
+    bool differs = false
+    if na(cd)
+        differs := array.size(v.rootIds) > 0
+    else if not f_eqT(nz(v.effectiveBottom, -1e9), nz(cd.bottom, -1e9), c.mintick)
+         or not f_eqT(nz(v.effectiveTop, -1e9), nz(cd.top, -1e9), c.mintick)
+        differs := true
+    else if array.size(v.rootIds) != array.size(cd.rootIds)
+        differs := true
+    else
+        int n = array.size(cd.rootIds)
+        if n > 0
+            for k = 0 to n - 1
+                if not array.includes(v.rootIds, array.get(cd.rootIds, k))
+                    differs := true
+                    break
+    differs
+
+f_corePhysRange(ZoneCore z) =>
+    float b = na
+    float t = na
+    if not na(z.supportView.effectiveBottom)
+        b := z.supportView.effectiveBottom
+        t := z.supportView.effectiveTop
+    if not na(z.resistanceView.effectiveBottom)
+        b := na(b) ? z.resistanceView.effectiveBottom : math.min(b, z.resistanceView.effectiveBottom)
+        t := na(t) ? z.resistanceView.effectiveTop    : math.max(t, z.resistanceView.effectiveTop)
+    [b, t]
+
+f_pushTouchMark(ZoneEngine e, ZoneCfg c, ZoneCore z, TouchMark tm) =>
+    //  同一 Side・同一時刻・同一接触は 1 回へ dedupe する
+    bool dup = false
+    int n = array.size(z.touchMarks)
+    if n > 0
+        for i = 0 to n - 1
+            TouchMark t = array.get(z.touchMarks, i)
+            if t.side == tm.side and nz(t.time, 0) == nz(tm.time, 0) and t.isNormalTouch == tm.isNormalTouch
+                dup := true
+                break
+    if not dup
+        array.push(z.touchMarks, tm)
+        while array.size(z.touchMarks) > c.maxTouchMarksPerCore
+            array.shift(z.touchMarks)
+            z.touchHistoryTruncated := true
+            e.touchHistoryTruncated := true
+    not dup
+
+// ---- 7.3 新しい ZoneCore を作る --------------------------------------------
+f_newCore(ZoneEngine e, ZoneCfg c, ZoneFeed f, CoreCand cc, array<ZoneCand> sup, array<ZoneCand> res) =>
+    e.coreSeq := e.coreSeq + 1
+    e.genSeq  := e.genSeq + 1
+    ZoneCore z = ZoneCore.new(coreId = e.coreSeq, generationId = e.genSeq,
+         originRootIds = array.copy(cc.originRootIds),
+         supportView = f_newSideView(SIDE_SUPPORT), resistanceView = f_newSideView(SIDE_RESISTANCE),
+         zoneFresh = true, createdTime = f.baseCloseTime, lastSeenTime = f.baseCloseTime,
+         lastSeenSeq = f.baseSeq, touchMarks = array.new<TouchMark>(), breakSnap = f_newBreakSnap())
+    ZoneCand sc0 = na
+    ZoneCand rc0 = na
+    if cc.supIdx >= 0
+        sc0 := array.get(sup, cc.supIdx)
+    if cc.resIdx >= 0
+        rc0 := array.get(res, cc.resIdx)
+    f_applyCandToView(e, c, SIDE_SUPPORT,    z.supportView,    sc0)
+    f_applyCandToView(e, c, SIDE_RESISTANCE, z.resistanceView, rc0)
+    [pb, pt] = f_corePhysRange(z)
+    z.physBottom    := pb
+    z.physTop       := pt
+    z.genBaseBottom := pb
+    z.genBaseTop    := pt
+    //  世代基準カテゴリは Support / Resistance 両 View の和集合とする
+    int gm = z.supportView.catMask
+    for cat = 0 to CAT_COUNT - 1
+        if f_maskHas(z.resistanceView.catMask, cat)
+            gm := f_maskAdd(gm, cat)
+    z.genBaseCatMask := gm
+    //  Zone 成立時に価格が中にいる場合は Waiting (過去ヒゲを遡ってタッチにしない)
+    array.push(e.cores, z)
+    z
+
+// ---- 7.4 履歴の割当 (Merge / Split) ---------------------------------------
+f_copyHistory(SideHistory h) =>
+    SideHistory o = f_newHistory()
+    o.sideTouchCount  := h.sideTouchCount
+    o.weakByTouch     := h.weakByTouch
+    o.weakByDepth     := h.weakByDepth
+    o.maxDepthPct     := h.maxDepthPct
+    o.sideFresh       := h.sideFresh
+    o.phase           := h.phase
+    o.grade           := h.grade
+    o.currentTouchNo  := h.currentTouchNo
+    o.upcomingTouchNo := h.upcomingTouchNo
+    o.flipAttemptCount := h.flipAttemptCount
+    o.inverseAttemptCount := h.inverseAttemptCount
+    o.everUsed        := h.everUsed
+    o.flipPending     := h.flipPending
+    o
+
+f_catMaskOfIds(ZoneEngine e, array<int> ids) =>
+    int m = 0
+    int n = array.size(ids)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(ids, k))
+            if i >= 0
+                m := f_maskAdd(m, array.get(e.roots, i).category)
+    m
+
+f_countMarksForSide(ZoneCfg c, ZoneCore z, int side, float bot, float top) =>
+    int cnt = 0
+    int n = array.size(z.touchMarks)
+    if n > 0 and not na(bot)
+        for i = 0 to n - 1
+            TouchMark t = array.get(z.touchMarks, i)
+            if t.side == side and t.isNormalTouch
+                 and f_rangesTouch(bot, top, t.contactBottom, t.contactTop, c.mintick)
+                cnt := cnt + 1
+    cnt
+
+//  分裂 : 子の EffectiveRange と TouchMark の contact range が交差する履歴だけ引き継ぐ。
+//  交差しない子は未タッチ (Fresh) にできる。上限で TouchMark が欠けている場合は
+//  推測で Fresh へ戻さず touchHistoryTruncated を立てる。
+f_assignSplitHistory(ZoneEngine e, ZoneCfg c, ZoneCore child, ZoneCore parent) =>
+    int n = array.size(parent.touchMarks)
+    if n > 0
+        for i = 0 to n - 1
+            TouchMark t = array.get(parent.touchMarks, i)
+            float cb = t.side == SIDE_SUPPORT ? child.supportView.effectiveBottom : child.resistanceView.effectiveBottom
+            float ct = t.side == SIDE_SUPPORT ? child.supportView.effectiveTop    : child.resistanceView.effectiveTop
+            if not na(cb) and f_rangesTouch(cb, ct, t.contactBottom, t.contactTop, c.mintick)
+                f_pushTouchMark(e, c, child, t)
+    int sN = f_countMarksForSide(c, child, SIDE_SUPPORT,    child.supportView.effectiveBottom,    child.supportView.effectiveTop)
+    int rN = f_countMarksForSide(c, child, SIDE_RESISTANCE, child.resistanceView.effectiveBottom, child.resistanceView.effectiveTop)
+    child.generationId := parent.generationId
+    child.createdTime  := parent.createdTime
+    child.supportView.history.sideTouchCount     := sN
+    child.supportView.history.upcomingTouchNo    := sN + 1
+    child.supportView.history.sideFresh          := sN == 0
+    child.supportView.history.everUsed           := sN > 0
+    child.resistanceView.history.sideTouchCount  := rN
+    child.resistanceView.history.upcomingTouchNo := rN + 1
+    child.resistanceView.history.sideFresh       := rN == 0
+    child.resistanceView.history.everUsed        := rN > 0
+    child.zoneFresh := sN == 0 and rN == 0
+    //  Weak は「その Side が実接触を引き継いだ場合だけ」親から復元する
+    if sN > 0
+        child.supportView.history.weakByTouch := parent.supportView.history.weakByTouch
+        child.supportView.history.weakByDepth := parent.supportView.history.weakByDepth
+        child.supportView.history.maxDepthPct := parent.supportView.history.maxDepthPct
+    if rN > 0
+        child.resistanceView.history.weakByTouch := parent.resistanceView.history.weakByTouch
+        child.resistanceView.history.weakByDepth := parent.resistanceView.history.weakByDepth
+        child.resistanceView.history.maxDepthPct := parent.resistanceView.history.maxDepthPct
+    if parent.touchHistoryTruncated
+        child.touchHistoryTruncated := true
+        e.touchHistoryTruncated     := true
+    child.genBaseBottom  := parent.genBaseBottom
+    child.genBaseTop     := parent.genBaseTop
+    child.genBaseCatMask := parent.genBaseCatMask
+    true
+
+//  結合 : Root を統合して再評価。タッチ履歴をゼロにしない。
+//  同一 Side・同一時刻・同一接触は 1 回へ dedupe (f_pushTouchMark)。
+f_mergeCore(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore prim, ZoneCore other) =>
+    int on = array.size(other.originRootIds)
+    if on > 0
+        for k = 0 to on - 1
+            int rid = array.get(other.originRootIds, k)
+            if not array.includes(prim.originRootIds, rid)
+                array.push(prim.originRootIds, rid)
+    int tn = array.size(other.touchMarks)
+    if tn > 0
+        for i = 0 to tn - 1
+            f_pushTouchMark(e, c, prim, array.get(other.touchMarks, i))
+    //  消耗履歴は OR / max で残す
+    prim.supportView.history.weakByTouch := prim.supportView.history.weakByTouch or other.supportView.history.weakByTouch
+    prim.supportView.history.weakByDepth := prim.supportView.history.weakByDepth or other.supportView.history.weakByDepth
+    prim.supportView.history.maxDepthPct := math.max(prim.supportView.history.maxDepthPct, other.supportView.history.maxDepthPct)
+    prim.resistanceView.history.weakByTouch := prim.resistanceView.history.weakByTouch or other.resistanceView.history.weakByTouch
+    prim.resistanceView.history.weakByDepth := prim.resistanceView.history.weakByDepth or other.resistanceView.history.weakByDepth
+    prim.resistanceView.history.maxDepthPct := math.max(prim.resistanceView.history.maxDepthPct, other.resistanceView.history.maxDepthPct)
+    //  新範囲へ実際に接触した履歴だけを数え直す (ゼロへは戻さない)
+    int sN = f_countMarksForSide(c, prim, SIDE_SUPPORT,    prim.supportView.effectiveBottom,    prim.supportView.effectiveTop)
+    int rN = f_countMarksForSide(c, prim, SIDE_RESISTANCE, prim.resistanceView.effectiveBottom, prim.resistanceView.effectiveTop)
+    prim.supportView.history.sideTouchCount := math.max(prim.supportView.history.sideTouchCount,
+         math.max(sN, other.supportView.history.sideTouchCount))
+    prim.resistanceView.history.sideTouchCount := math.max(prim.resistanceView.history.sideTouchCount,
+         math.max(rN, other.resistanceView.history.sideTouchCount))
+    prim.supportView.history.upcomingTouchNo    := prim.supportView.history.sideTouchCount + 1
+    prim.resistanceView.history.upcomingTouchNo := prim.resistanceView.history.sideTouchCount + 1
+    prim.supportView.history.sideFresh    := prim.supportView.history.sideTouchCount == 0
+         and prim.supportView.history.sideFresh and other.supportView.history.sideFresh
+    prim.resistanceView.history.sideFresh := prim.resistanceView.history.sideTouchCount == 0
+         and prim.resistanceView.history.sideFresh and other.resistanceView.history.sideFresh
+    prim.zoneFresh := prim.zoneFresh and other.zoneFresh
+         and prim.supportView.history.sideTouchCount == 0 and prim.resistanceView.history.sideTouchCount == 0
+    prim.createdTime := math.min(nz(prim.createdTime, nz(other.createdTime, 0)), nz(other.createdTime, nz(prim.createdTime, 0)))
+    if not prim.breakSnap.valid and other.breakSnap.valid
+        prim.breakSnap := other.breakSnap
+    if other.touchHistoryTruncated
+        prim.touchHistoryTruncated := true
+    e.mergeCount := e.mergeCount + 1
+    f_emit(e, f, EV_MERGE, prim.coreId, prim.generationId, SIDE_NONE, prim.physBottom, prim.physTop,
+         0, GR_UNAVAILABLE, WEAK_NONE, 0, "MERGED_CORE " + str.tostring(other.coreId))
+    true
+
+f_archiveCore(ZoneEngine e, ZoneCfg c, ZoneCore z, string why) =>
+    ZoneCore a = ZoneCore.new(coreId = z.coreId, generationId = z.generationId,
+         originRootIds = array.copy(z.originRootIds),
+         supportView = f_newSideView(SIDE_SUPPORT), resistanceView = f_newSideView(SIDE_RESISTANCE),
+         zoneFresh = z.zoneFresh, physBottom = z.physBottom, physTop = z.physTop,
+         createdTime = z.createdTime, lastSeenTime = z.lastSeenTime, lastSeenSeq = z.lastSeenSeq,
+         touchMarks = array.new<TouchMark>(), breakSnap = f_newBreakSnap(), ended = true)
+    a.supportView.history    := f_copyHistory(z.supportView.history)
+    a.resistanceView.history := f_copyHistory(z.resistanceView.history)
+    a.supportView.effectiveBottom    := z.supportView.effectiveBottom
+    a.supportView.effectiveTop       := z.supportView.effectiveTop
+    a.resistanceView.effectiveBottom := z.resistanceView.effectiveBottom
+    a.resistanceView.effectiveTop    := z.resistanceView.effectiveTop
+    array.push(e.endedCores, a)
+    while array.size(e.endedCores) > c.maxEndedGenerations
+        array.shift(e.endedCores)
+    true
+
+// ---- 7.5 候補の適用 (ActiveTouch 中は形状変更を PendingTopology へ) -------
+f_applyCoreCand(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z, CoreCand cc,
+     array<ZoneCand> sup, array<ZoneCand> res) =>
+    ZoneCand sc = na
+    ZoneCand rc = na
+    if cc.supIdx >= 0
+        sc := array.get(sup, cc.supIdx)
+    if cc.resIdx >= 0
+        rc := array.get(res, cc.resIdx)
+    bool active = z.supportView.history.phase == PH_ACTIVE_TOUCH
+         or z.resistanceView.history.phase == PH_ACTIVE_TOUCH
+    if active
+        //  Root の参加資格喪失だけ即時反映し、形状再編は Episode 終了後へ送る
+        f_liveStructurePrune(e, c, SIDE_SUPPORT,    z.supportView)
+        f_liveStructurePrune(e, c, SIDE_RESISTANCE, z.resistanceView)
+        z.pendingTopology := f_viewDiffers(c, z.supportView, sc) or f_viewDiffers(c, z.resistanceView, rc)
+    else
+        f_applyCandToView(e, c, SIDE_SUPPORT,    z.supportView,    sc)
+        f_applyCandToView(e, c, SIDE_RESISTANCE, z.resistanceView, rc)
+        z.originRootIds   := array.copy(cc.originRootIds)
+        [pb, pt] = f_corePhysRange(z)
+        z.physBottom      := pb
+        z.physTop         := pt
+        z.pendingTopology := false
+    z.lastSeenTime := f.baseCloseTime
+    z.lastSeenSeq  := f.baseSeq
+    true
+
+f_coreHasWaitingRoot(ZoneEngine e, ZoneCore z) =>
+    bool w = false
+    int n = array.size(z.originRootIds)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(z.originRootIds, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if r.category == CAT_FVG and (r.state == ROOT_INVALIDATED or r.state == ROOT_INVERSE_WAIT)
+                    w := true
+                    break
+    w
+
+//  心理価格だけになった Core は維持しない (仕様 14 章)
+f_coreHasAnyLiveRoot(ZoneEngine e, ZoneCore z) =>
+    bool alive = false
+    int n = array.size(z.originRootIds)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(z.originRootIds, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                if r.state != ROOT_RETIRED and r.category != CAT_PSYCH
+                    alive := true
+                    break
+    alive
+
+f_coreMustKeep(ZoneEngine e, ZoneCore z) =>
+    int ps = z.supportView.history.phase
+    int pr = z.resistanceView.history.phase
+    ps == PH_ACTIVE_TOUCH or ps == PH_BROKEN or ps == PH_FLIP_WAIT
+     or pr == PH_ACTIVE_TOUCH or pr == PH_BROKEN or pr == PH_FLIP_WAIT
+     or z.breakSnap.valid or z.pendingTopology or z.pendingGeneration or f_coreHasWaitingRoot(e, z)
+
+// ---- 7.6 Core の再構築 -----------------------------------------------------
+f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    array<ZoneCand> sup = f_buildSideCands(e, c, f, SIDE_SUPPORT)
+    array<ZoneCand> res = f_buildSideCands(e, c, f, SIDE_RESISTANCE)
+    array<CoreCand> ccs = f_pairSides(e, c, sup, res)
+
+    int nc = array.size(e.cores)
+    int nk = array.size(ccs)
+    array<int>   coreToCand = array.new_int(int(math.max(nc, 1)), -1)
+    array<bool>  coreMerged = array.new_bool(int(math.max(nc, 1)), false)
+    array<int>   candPrimary = array.new_int(int(math.max(nk, 1)), -1)
+
+    if nc > 0
+        for ci = 0 to nc - 1
+            ZoneCore zr = array.get(e.cores, ci)
+            zr.matched := false
+
+    // Pass 1 : 各既存 Core が最もよく一致する候補を選ぶ
+    if nc > 0 and nk > 0
+        for ci = 0 to nc - 1
+            ZoneCore z = array.get(e.cores, ci)
+            int   best   = -1
+            int   bestSh = 0
+            float bestGap = na
+            for k = 0 to nk - 1
+                CoreCand cc = array.get(ccs, k)
+                int sh = f_sharedCount(z.originRootIds, cc.originRootIds)
+                float gap = f_intervalGap(z.physBottom, z.physTop, cc.bottom, cc.top)
+                if sh >= 1 and not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
+                    bool better = best < 0 or sh > bestSh
+                         or (sh == bestSh and gap < nz(bestGap, 1e20))
+                    if better
+                        best    := k
+                        bestSh  := sh
+                        bestGap := gap
+            array.set(coreToCand, ci, best)
+
+    // Pass 2 : 候補ごとの primary Core (最小 Core ID) を決める
+    if nk > 0 and nc > 0
+        for k = 0 to nk - 1
+            int prim = -1
+            for ci = 0 to nc - 1
+                if array.get(coreToCand, ci) == k
+                    bool take = prim < 0
+                    if not take
+                        ZoneCore zc = array.get(e.cores, ci)
+                        ZoneCore zp = array.get(e.cores, prim)
+                        take := zc.coreId < zp.coreId
+                    if take
+                        prim := ci
+            array.set(candPrimary, k, prim)
+
+    // Pass 3 : 同じ候補を選んだ他 Core を primary へ Merge
+    if nk > 0 and nc > 0
+        for k = 0 to nk - 1
+            int prim = array.get(candPrimary, k)
+            if prim >= 0
+                ZoneCore pz = array.get(e.cores, prim)
+                bool pActive = pz.supportView.history.phase == PH_ACTIVE_TOUCH
+                     or pz.resistanceView.history.phase == PH_ACTIVE_TOUCH
+                for ci = 0 to nc - 1
+                    if ci != prim and array.get(coreToCand, ci) == k
+                        ZoneCore oz = array.get(e.cores, ci)
+                        bool oActive = oz.supportView.history.phase == PH_ACTIVE_TOUCH
+                             or oz.resistanceView.history.phase == PH_ACTIVE_TOUCH
+                        if pActive or oActive
+                            pz.pendingTopology := true
+                            oz.pendingTopology := true
+                        else
+                            f_mergeCore(e, c, f, pz, oz)
+                            array.set(coreMerged, ci, true)
+
+    // Pass 4 : 候補を Core へ適用 / 新規 Core 作成 (Split 判定つき)
+    if nk > 0
+        for k = 0 to nk - 1
+            int prim = array.get(candPrimary, k)
+            CoreCand cc = array.get(ccs, k)
+            if prim >= 0
+                ZoneCore z = array.get(e.cores, prim)
+                f_applyCoreCand(e, c, f, z, cc, sup, res)
+                z.matched := true
+            else
+                int parentIdx = -1
+                if nc > 0
+                    for ci = 0 to nc - 1
+                        if not array.get(coreMerged, ci)
+                            ZoneCore zp = array.get(e.cores, ci)
+                            int sh = f_sharedCount(zp.originRootIds, cc.originRootIds)
+                            float gap = f_intervalGap(zp.physBottom, zp.physTop, cc.bottom, cc.top)
+                            if sh >= 1 and not na(gap) and f_leT(gap, c.clusterMaxWidth, c.mintick)
+                                bool takeP = parentIdx < 0
+                                if not takeP
+                                    ZoneCore zpp = array.get(e.cores, parentIdx)
+                                    takeP := zp.coreId < zpp.coreId
+                                if takeP
+                                    parentIdx := ci
+                bool parentActive = false
+                if parentIdx >= 0
+                    ZoneCore zpa = array.get(e.cores, parentIdx)
+                    parentActive := zpa.supportView.history.phase == PH_ACTIVE_TOUCH
+                         or zpa.resistanceView.history.phase == PH_ACTIVE_TOUCH
+                if parentActive
+                    //  ActiveTouch 中の分裂は保留 (現在 Episode へ後付けしない)
+                    ZoneCore zpa2 = array.get(e.cores, parentIdx)
+                    zpa2.pendingTopology := true
+                else
+                    ZoneCore child = f_newCore(e, c, f, cc, sup, res)
+                    child.matched := true
+                    if parentIdx >= 0
+                        ZoneCore zp2 = array.get(e.cores, parentIdx)
+                        f_assignSplitHistory(e, c, child, zp2)
+                        e.splitCount := e.splitCount + 1
+                        f_emit(e, f, EV_SPLIT, child.coreId, child.generationId, SIDE_NONE,
+                             child.physBottom, child.physTop, 0, GR_UNAVAILABLE, WEAK_NONE, 0,
+                             "SPLIT_FROM " + str.tostring(zp2.coreId))
+
+    // Pass 5 : Merge 済み Core を外し、未マッチ Core の存続を判定する
+    int n5 = array.size(e.cores)
+    if n5 > 0
+        for i = n5 - 1 to 0
+            if i < array.size(e.cores)
+                ZoneCore z = array.get(e.cores, i)
+                bool merged = i < nc and array.get(coreMerged, i)
+                if merged
+                    array.remove(e.cores, i)
+                else if not z.matched and i < nc
+                    //  クラスタ窓の外 (現在価格から dormantDistance より遠い) の Zone は
+                    //  候補が作られないだけなので、Dormant として同じ Core ID / 世代 /
+                    //  消耗履歴のまま保持する (価格が戻れば復帰する)。
+                    //  一方、価格の近くにいるのに一致する候補が無い Core は、Root が
+                    //  M を超えて不連続になったか Root が無くなった Core なので世代終了。
+                    float dFar = f_distanceToRangeRaw(f.baseClose, z.physBottom, z.physTop)
+                    bool farAway = na(dFar) or dFar > c.dormantDistance
+                    if f_coreMustKeep(e, z) or (f_coreHasAnyLiveRoot(e, z) and farAway)
+                        z.dormant := true
+                    else
+                        //  世代終了 (保存整理ではないので prunedZoneCount へは数えない)
+                        f_archiveCore(e, c, z, "GENERATION_END_NO_CANDIDATE")
+                        array.remove(e.cores, i)
+    array.size(e.cores)
+
+// ============================================================================
+// 08. PHASE / GRADE / ARMED / TOUCH / BREAK / FLIP / RECLAIM
+// ----------------------------------------------------------------------------
+//  Grade 判定順 (仕様 7.2 / 指示書 13.4) は必ずこの順序
+//    1. 有効な非心理 Root がない、または Flip 未確定 : Unavailable
+//    2. WeakByDepth、または対象 Touch 番号が WeakFromTouch 以上 : Weak
+//    3. Base Strong かつ対象 Touch 番号が StrongUntilTouch 以内 : Strong
+//    4. それ以外 : Neutral
+// ============================================================================
+
+f_weakReason(SideHistory h) =>
+    h.weakByTouch and h.weakByDepth ? WEAK_BY_BOTH : h.weakByDepth ? WEAK_BY_DEPTH :
+     h.weakByTouch ? WEAK_BY_TOUCH : WEAK_NONE
+
+f_computeGrade(ZoneCfg c, SideViewState v, SideHistory h, int touchNo) =>
+    int g = GR_NEUTRAL
+    bool weakTouch = h.weakByTouch or (not c.weakFromTouchOff and touchNo >= c.weakFromTouch)
+    //  未解決の Break を持つ側 (Broken) と Flip 未確定側 (FlipWait) は通常 Zone として
+    //  Unavailable (仕様 4.2 / 7.2 の例 "FlipWait｜Unavailable")
+    if not v.hasNonPsychRoot or h.flipPending or h.phase == PH_BROKEN or h.phase == PH_FLIP_WAIT
+        g := GR_UNAVAILABLE
+    else if h.weakByDepth or weakTouch
+        g := GR_WEAK
+    else if v.baseStrong and (c.strongUnlimited or touchNo <= c.strongUntilTouch)
+        g := GR_STRONG
+    g
+
+//  幅ありは inclusive 交差。一本線 (幅 0) は TouchTolerance だけを使う。
+f_touchIntersect(ZoneCfg c, float low, float high, float bot, float top) =>
+    bool r = false
+    if not na(bot) and not na(top) and not na(low) and not na(high)
+        if f_eqT(bot, top, c.mintick)
+            r := f_leT(low, top + c.touchTolerance, c.mintick) and f_geT(high, bot - c.touchTolerance, c.mintick)
+        else
+            r := f_geT(high, bot, c.mintick) and f_leT(low, top, c.mintick)
+    r
+
+f_sideView(ZoneCore z, int side) =>
+    side == SIDE_SUPPORT ? z.supportView : z.resistanceView
+
+// ---- 8.1 Break (Local / Gap) -----------------------------------------------
+//  確定終値だけを使う。ヒゲ抜けでは Broken にしない。
+//  Break は Zone Phase を変える処理であり、一般 Root を削除しない。
+f_doBreak(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z, int side,
+     float refBot, float refTop, bool isGap) =>
+    SideViewState v  = f_sideView(z, side)
+    SideViewState ov = f_sideView(z, side == SIDE_SUPPORT ? SIDE_RESISTANCE : SIDE_SUPPORT)
+    BreakSnapshot bs = f_newBreakSnap()
+    bs.valid        := true
+    bs.coreId       := z.coreId
+    bs.generationId := z.generationId
+    bs.oldSide      := side
+    bs.rangeBottom  := refBot
+    bs.rangeTop     := refTop
+    bs.rootIds      := array.copy(v.rootIds)
+    bs.breakSeq     := f.baseSeq
+    bs.breakTime    := f.baseCloseTime
+    bs.wasGapBreak  := isGap
+    z.breakSnap     := bs
+    v.history.phase          := PH_BROKEN
+    v.history.currentTouchNo := 0
+    ov.history.phase         := PH_FLIP_WAIT
+    ov.history.flipPending   := true
+    f_emit(e, f, isGap ? EV_GAP_BREAK : EV_LOCAL_BREAK, z.coreId, z.generationId, side,
+         refBot, refTop, v.history.sideTouchCount, v.touchSnapshot.touchStartGrade,
+         f_weakReason(v.history), 0, isGap ? "GAP_BREAK" : "LOCAL_BREAK")
+    true
+
+// ---- 8.2 タッチ開始 --------------------------------------------------------
+f_touchStart(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z, int side, float refBot, float refTop) =>
+    SideViewState v = f_sideView(z, side)
+    SideHistory   h = v.history
+    h.sideTouchCount := h.sideTouchCount + 1
+    h.currentTouchNo := h.sideTouchCount
+    h.upcomingTouchNo := h.sideTouchCount + 1
+    h.phase          := PH_ACTIVE_TOUCH
+    h.everUsed       := true
+    h.sideFresh      := false
+    h.lastNormalTouchTime := f.baseCloseTime
+    z.zoneFresh      := false
+    //  Snapshot は「開始時構造」= 前足確定時点の Side View。以後書き換えない。
+    TouchStartSnapshot s = f_newSnapshot()
+    s.valid           := true
+    s.coreId          := z.coreId
+    s.generationId    := z.generationId
+    s.side            := side
+    s.rangeBottom     := refBot
+    s.rangeTop        := refTop
+    s.rootIds         := array.copy(v.rootIds)
+    s.catMask         := v.catMask
+    s.highMask        := v.highMask
+    s.cCount          := v.cCount
+    s.hCount          := v.hCount
+    s.density         := v.density
+    s.baseStrong      := v.baseStrong
+    s.currentTouchNo  := h.currentTouchNo
+    s.approachSide    := side
+    s.startSeq        := f.baseSeq
+    s.startTime       := f.baseCloseTime
+    s.maxDepthPct     := 0.0
+    s.touchStartGrade := f_computeGrade(c, v, h, h.currentTouchNo)
+    v.touchSnapshot   := s
+    f_pushTouchMark(e, c, z, TouchMark.new(baseSeq = f.baseSeq, time = f.baseCloseTime, side = side,
+         contactBottom = math.max(f.baseLow, refBot), contactTop = math.min(f.baseHigh, refTop),
+         closeAtTouch = f.baseClose, generationId = z.generationId, isNormalTouch = true))
+    f_emit(e, f, EV_TOUCH_START, z.coreId, z.generationId, side, refBot, refTop,
+         h.currentTouchNo, s.touchStartGrade, f_weakReason(h), 0, "TOUCH_START")
+    true
+
+// ---- 8.3 Episode 進行 (Break 優先 -> WeakDepth -> Reset) ------------------
+f_episodeStep(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z, int side) =>
+    SideViewState v = f_sideView(z, side)
+    SideHistory   h = v.history
+    TouchStartSnapshot s = v.touchSnapshot
+    if s.valid and h.phase == PH_ACTIVE_TOUCH
+        float sb = s.rangeBottom
+        float st = s.rangeTop
+        bool brk = side == SIDE_SUPPORT ? f_leT(f.baseClose, sb - c.breakBuffer, c.mintick)
+             : f_geT(f.baseClose, st + c.breakBuffer, c.mintick)
+        if brk
+            //  Local Break と WeakDepth が同時なら Break 優先。WeakDepth は確定しない。
+            f_doBreak(e, c, f, z, side, sb, st, false)
+        else
+            float width = st - sb
+            if not c.weakDepthOff and f_gtT(width, 0.0, c.mintick)
+                float depth = side == SIDE_SUPPORT ? (st - f.baseClose) / width * 100.0
+                     : (f.baseClose - sb) / width * 100.0
+                depth := f_clamp(depth, 0.0, 100.0)
+                if depth > s.maxDepthPct
+                    s.maxDepthPct  := depth
+                    s.deepestClose := f.baseClose
+                if depth > h.maxDepthPct
+                    h.maxDepthPct := depth
+                if depth >= c.weakDepthPct and not h.weakByDepth
+                    h.weakByDepth := true
+                    h.weakDepthEventSeq := f.baseSeq
+                    f_emit(e, f, EV_WEAK_DEPTH, z.coreId, z.generationId, side, sb, st,
+                         h.currentTouchNo, s.touchStartGrade, f_weakReason(h), 0, "WEAK_DEPTH")
+            bool reset = side == SIDE_SUPPORT ? f_geT(f.baseClose, st + c.touchResetDistance, c.mintick)
+                 : f_leT(f.baseClose, sb - c.touchResetDistance, c.mintick)
+            if reset
+                h.phase          := PH_ARMED
+                h.armedFromSeq   := f.baseSeq + 1
+                h.currentTouchNo := 0
+                f_emit(e, f, EV_TOUCH_RESET, z.coreId, z.generationId, side, sb, st,
+                     s.currentTouchNo, s.touchStartGrade, f_weakReason(h), 0, "TOUCH_RESET")
+    true
+
+// ---- 8.4 Side 検出 (前足 Armed だけがタッチを開始できる) ------------------
+f_processSide(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z, int side) =>
+    SideViewState v = f_sideView(z, side)
+    SideHistory   h = v.history
+    h.prevPhase := h.phase
+    if h.phase == PH_ACTIVE_TOUCH
+        f_episodeStep(e, c, f, z, side)
+    else if h.phase == PH_ARMED and f.baseSeq >= h.armedFromSeq
+        float rb = h.lastArmedRangeBottom
+        float rt = h.lastArmedRangeTop
+        if not na(rb) and not na(rt)
+            if f_touchIntersect(c, f.baseLow, f.baseHigh, rb, rt)
+                f_touchStart(e, c, f, z, side, rb, rt)
+                //  タッチ開始足でも Break / WeakDepth / Reset を同じ処理で評価する
+                f_episodeStep(e, c, f, z, side)
+            else
+                //  完全 Gap + Break Close = GapBreak
+                //  SideTouchCount / WeakDepth / Fresh は一切変えない。
+                bool gapAway = side == SIDE_SUPPORT ? f_ltT(f.baseHigh, rb, c.mintick)
+                     : f_gtT(f.baseLow, rt, c.mintick)
+                bool brk = side == SIDE_SUPPORT ? f_leT(f.baseClose, rb - c.breakBuffer, c.mintick)
+                     : f_geT(f.baseClose, rt + c.breakBuffer, c.mintick)
+                if gapAway and brk
+                    f_doBreak(e, c, f, z, side, rb, rt, true)
+    true
+
+// ---- 8.5 Break 後の Reclaim / FlipAttempt / FlipConfirm -------------------
+//  価格基準は必ず BreakSnapshot。EMA 移動や再クラスタ後の範囲は使わない。
+//  GapBreak 確定足と同じ足では Flip / Reclaim を確定しない。
+f_processBreakState(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z) =>
+    BreakSnapshot bs = z.breakSnap
+    if bs.valid and bs.breakSeq < f.baseSeq
+        int old = bs.oldSide
+        SideViewState ov = f_sideView(z, old)
+        SideViewState nv = f_sideView(z, old == SIDE_SUPPORT ? SIDE_RESISTANCE : SIDE_SUPPORT)
+        SideHistory oldH = ov.history
+        SideHistory newH = nv.history
+        //  FVG 構造無効化と Reclaim が同時なら FVG 構造無効化を優先する
+        bool fvgInvalidNow = z.fvgInvalidatedSeq == f.baseSeq
+        bool reclaim = not bs.flipped and (old == SIDE_SUPPORT
+             ? f_geT(f.baseClose, bs.rangeTop + c.breakBuffer, c.mintick)
+             : f_leT(f.baseClose, bs.rangeBottom - c.breakBuffer, c.mintick))
+        if reclaim and not fvgInvalidNow
+            //  元側履歴をそのまま復元する。Fresh / Weak は復活も解除もしない。
+            oldH.phase       := PH_WAITING
+            oldH.armBlockSeq := f.baseSeq
+            newH.phase       := PH_WAITING
+            newH.flipPending := false
+            newH.armBlockSeq := f.baseSeq
+            f_emit(e, f, EV_RECLAIM, z.coreId, z.generationId, old, bs.rangeBottom, bs.rangeTop,
+                 oldH.sideTouchCount, ov.touchSnapshot.touchStartGrade, f_weakReason(oldH), 0, "RECLAIM")
+            z.breakSnap := f_newBreakSnap()
+        else if not bs.movedAway
+            bool away = old == SIDE_SUPPORT
+                 ? f_leT(f.baseClose, bs.rangeBottom - c.touchResetDistance, c.mintick)
+                 : f_geT(f.baseClose, bs.rangeTop + c.touchResetDistance, c.mintick)
+            if away
+                bs.movedAway    := true
+                bs.movedAwaySeq := f.baseSeq
+        else if bs.movedAwaySeq < f.baseSeq
+            if f_rangesTouch(f.baseLow, f.baseHigh, bs.rangeBottom, bs.rangeTop, c.mintick)
+                bs.retestSeen := true
+                bool confirm = old == SIDE_SUPPORT ? f_leT(f.baseClose, bs.rangeBottom, c.mintick)
+                     : f_geT(f.baseClose, bs.rangeTop, c.mintick)
+                int newSide = old == SIDE_SUPPORT ? SIDE_RESISTANCE : SIDE_SUPPORT
+                //  Flip 確認接触も FlipAttempt も通常タッチではない
+                //  (SideTouchCount / WeakDepth / ZoneFresh / SideFresh を変えない)
+                f_pushTouchMark(e, c, z, TouchMark.new(baseSeq = f.baseSeq, time = f.baseCloseTime,
+                     side = newSide, contactBottom = math.max(f.baseLow, bs.rangeBottom),
+                     contactTop = math.min(f.baseHigh, bs.rangeTop), closeAtTouch = f.baseClose,
+                     generationId = z.generationId, isNormalTouch = false))
+                if confirm
+                    bs.flipped := true
+                    newH.flipPending        := false
+                    newH.phase              := PH_WAITING
+                    newH.armBlockSeq        := f.baseSeq
+                    newH.lastFlipConfirmSeq := f.baseSeq
+                    newH.everUsed           := true
+                    oldH.phase              := PH_WAITING
+                    oldH.armBlockSeq        := f.baseSeq
+                    f_emit(e, f, EV_FLIP_CONFIRM, z.coreId, z.generationId, newSide,
+                         bs.rangeBottom, bs.rangeTop, newH.sideTouchCount, newH.grade,
+                         f_weakReason(newH), 0, "FLIP_CONFIRM")
+                    z.breakSnap := f_newBreakSnap()
+                else
+                    newH.flipAttemptCount := newH.flipAttemptCount + 1
+                    f_emit(e, f, EV_FLIP_ATTEMPT, z.coreId, z.generationId, newSide,
+                         bs.rangeBottom, bs.rangeTop, newH.sideTouchCount, newH.grade,
+                         f_weakReason(newH), 0, "FLIP_ATTEMPT")
+    true
+
+// ---- 8.6 新しい Zone 世代 --------------------------------------------------
+//  世代リセットは最も慎重に扱う。Root 追加や EMA 接近だけで Touch 履歴を消さない。
+//  基準構造の優先順 : 直近 TouchStartSnapshot -> BreakSnapshot -> 世代開始時構造
+f_genBaselineCatMask(ZoneEngine e, ZoneCore z) =>
+    TouchStartSnapshot ss = z.supportView.touchSnapshot
+    TouchStartSnapshot rs = z.resistanceView.touchSnapshot
+    int mask = z.genBaseCatMask
+    if ss.valid or rs.valid
+        bool useS = ss.valid and (not rs.valid or ss.startSeq >= rs.startSeq)
+        mask := useS ? ss.catMask : rs.catMask
+    else if z.breakSnap.valid
+        mask := f_catMaskOfIds(e, z.breakSnap.rootIds)
+    mask
+
+f_startNewGeneration(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z) =>
+    f_archiveCore(e, c, z, "GENERATION_END")
+    e.genSeq        := e.genSeq + 1
+    z.generationId  := e.genSeq
+    z.zoneFresh     := true
+    array.clear(z.touchMarks)
+    z.touchHistoryTruncated := false
+    z.breakSnap     := f_newBreakSnap()
+    //  新世代開始時だけ、両 Side の Touch / Weak / Fresh / Broken / FlipWait をリセット
+    z.supportView.history    := f_newHistory()
+    z.resistanceView.history := f_newHistory()
+    z.supportView.touchSnapshot    := f_newSnapshot()
+    z.resistanceView.touchSnapshot := f_newSnapshot()
+    z.genBaseBottom  := z.genCandBottom
+    z.genBaseTop     := z.genCandTop
+    z.genBaseCatMask := z.genCandCatMask
+    z.pendingGeneration := false
+    z.genCandArmed   := false
+    //  交差足でそのまま新世代の Touch 1 を記録できるよう、候補 Side だけ Armed を与える
+    //  (Reset 距離は候補 Armed 時点で満たしている)
+    SideViewState cv = f_sideView(z, z.genCandSide)
+    cv.history.phase          := PH_ARMED
+    cv.history.armedFromSeq   := f.baseSeq
+    cv.history.lastArmedRangeBottom := z.genCandBottom
+    cv.history.lastArmedRangeTop    := z.genCandTop
+    f_emit(e, f, EV_GENERATION_START, z.coreId, z.generationId, z.genCandSide,
+         z.genCandBottom, z.genCandTop, 0, GR_NEUTRAL, WEAK_NONE, 0, "NEW_GENERATION")
+    true
+
+//  決定論的な「再接近」: Reset 完了後、前足までに世代候補が Armed され、
+//  その後の確定 5分足 Range が新 EffectiveRange へ初めて交差した足で切り替える。
+f_generationSwitch(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z) =>
+    if z.genCandArmed and z.genCandSide != SIDE_NONE and not na(z.genCandBottom)
+        bool active = z.supportView.history.phase == PH_ACTIVE_TOUCH
+             or z.resistanceView.history.phase == PH_ACTIVE_TOUCH
+        if active
+            z.pendingGeneration := true
+        else if f_touchIntersect(c, f.baseLow, f.baseHigh, z.genCandBottom, z.genCandTop)
+            f_startNewGeneration(e, c, f, z)
+    true
+
+f_generationRefresh(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z) =>
+    bool active = z.supportView.history.phase == PH_ACTIVE_TOUCH
+         or z.resistanceView.history.phase == PH_ACTIVE_TOUCH
+    int ps = z.supportView.history.phase
+    int pr = z.resistanceView.history.phase
+    bool oldEligible = not z.zoneFresh or ps == PH_BROKEN or ps == PH_FLIP_WAIT
+         or pr == PH_BROKEN or pr == PH_FLIP_WAIT
+    if not oldEligible
+        //  未タッチ Zone へ Root が増えただけなら同世代 (履歴リセット不要)
+        z.genBaseBottom := z.physBottom
+        z.genBaseTop    := z.physTop
+        int gm = z.supportView.catMask
+        for cat = 0 to CAT_COUNT - 1
+            if f_maskHas(z.resistanceView.catMask, cat)
+                gm := f_maskAdd(gm, cat)
+        z.genBaseCatMask    := gm
+        z.genCandArmed      := false
+        z.genCandSide       := SIDE_NONE
+        z.pendingGeneration := false
+    else
+        int baseMask = f_genBaselineCatMask(e, z)
+        int   candSide = SIDE_NONE
+        float cb = na
+        float ct = na
+        int   cmask = 0
+        for si = 0 to 1
+            int side = si == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE
+            SideViewState v = f_sideView(z, side)
+            if candSide == SIDE_NONE and v.baseStrong and v.hasNonPsychRoot
+                bool newCat = false
+                for cat = 0 to CAT_COUNT - 1
+                    //  心理価格は新カテゴリ条件から除外。同カテゴリ Root 追加も不可。
+                    if cat != CAT_PSYCH and f_maskHas(v.catMask, cat) and not f_maskHas(baseMask, cat)
+                        newCat := true
+                        break
+                if newCat
+                    candSide := side
+                    cb       := v.effectiveBottom
+                    ct       := v.effectiveTop
+                    cmask    := v.catMask
+        if candSide == SIDE_NONE
+            z.genCandArmed := false
+            z.genCandSide  := SIDE_NONE
+        else
+            bool same = z.genCandSide == candSide and f_eqT(nz(z.genCandBottom, -1e9), nz(cb, -1e9), c.mintick)
+                 and f_eqT(nz(z.genCandTop, -1e9), nz(ct, -1e9), c.mintick)
+            if not same
+                z.genCandSide    := candSide
+                z.genCandBottom  := cb
+                z.genCandTop     := ct
+                z.genCandCatMask := cmask
+                z.genCandArmed   := false
+            if not z.genCandArmed
+                bool away = candSide == SIDE_SUPPORT
+                     ? f_geT(f.baseClose, ct + c.touchResetDistance, c.mintick)
+                     : f_leT(f.baseClose, cb - c.touchResetDistance, c.mintick)
+                if away
+                    z.genCandArmed := true
+            if active and z.genCandArmed
+                z.pendingGeneration := true
+    true
+
+// ---- 8.7 Phase / Grade / Armed の確定 (次足用) ----------------------------
+f_distanceToRange(float price, float bot, float top) =>
+    f_distanceToRangeRaw(price, bot, top)
+
+f_finalizeSide(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z, int side) =>
+    SideViewState v = f_sideView(z, side)
+    SideHistory   h = v.history
+    h.upcomingTouchNo := h.sideTouchCount + 1
+    int touchNo = h.phase == PH_ACTIVE_TOUCH ? h.currentTouchNo : h.upcomingTouchNo
+    //  Touch 回数条件へ到達した Side は WeakByTouch を保持する
+    //  (Reclaim / 離脱 / Root 増減 / 反対側への Flip では解除しない)
+    if not c.weakFromTouchOff and touchNo >= c.weakFromTouch
+        h.weakByTouch := true
+    v.eligible := v.hasNonPsychRoot and not h.flipPending and h.phase != PH_BROKEN and h.phase != PH_FLIP_WAIT
+    h.grade    := f_computeGrade(c, v, h, touchNo)
+
+    //  Dormant は論理無効化ではない。ActiveTouch / Broken / FlipWait /
+    //  InverseWait / Pending は Dormant へ落とさない。
+    if z.dormant and (h.phase == PH_WAITING or h.phase == PH_ARMED)
+        h.phase := PH_DORMANT
+    else if h.phase == PH_DORMANT and not z.dormant
+        h.phase := PH_WAITING
+
+    if h.phase == PH_WAITING or h.phase == PH_ARMED
+        bool hasRange = not na(v.effectiveBottom) and not na(v.effectiveTop)
+        bool distOk = hasRange and (side == SIDE_SUPPORT
+             ? f_geT(f.baseClose, v.effectiveTop + c.touchResetDistance, c.mintick)
+             : f_leT(f.baseClose, v.effectiveBottom - c.touchResetDistance, c.mintick))
+        bool insideZone = hasRange and f_geT(f.baseClose, v.effectiveBottom, c.mintick)
+             and f_leT(f.baseClose, v.effectiveTop, c.mintick)
+        if h.phase == PH_WAITING
+            //  距離条件を現在足で初めて満たした場合、使用開始は次足から
+            if distOk and v.hasNonPsychRoot and not h.flipPending and f.baseSeq > h.armBlockSeq
+                h.phase        := PH_ARMED
+                h.armedFromSeq := f.baseSeq + 1
+        else if insideZone or not v.hasNonPsychRoot or h.flipPending
+            //  Zone 内で終値確定 / 参加 Root 喪失 / Flip 未確定 なら Waiting へ戻す
+            h.phase        := PH_WAITING
+            h.armBlockSeq  := f.baseSeq
+        if h.phase == PH_ARMED
+            //  次足のタッチ判定はこの「前足確定時点の EffectiveZoneRange」を使う
+            h.lastArmedRangeBottom := v.effectiveBottom
+            h.lastArmedRangeTop    := v.effectiveTop
+    true
+
+f_finalizeCore(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z) =>
+    [pb, pt] = f_corePhysRange(z)
+    if not na(pb)
+        z.physBottom := pb
+        z.physTop    := pt
+    float dist = f_distanceToRange(f.baseClose, z.physBottom, z.physTop)
+    bool  hot  = f_coreMustKeep(e, z)
+    z.dormant := not na(dist) and dist > c.dormantDistance and not hot
+    f_finalizeSide(e, c, f, z, SIDE_SUPPORT)
+    f_finalizeSide(e, c, f, z, SIDE_RESISTANCE)
+    f_generationRefresh(e, c, f, z)
+    true
+
+// ============================================================================
+// 09. UPDATE ORCHESTRATION
+// ----------------------------------------------------------------------------
+//  「現在足で起きた事実の検出」と「次足から有効な構造」を分離する。
+//
+//    A. prev 時点で Armed だった View だけ、現在 High / Low で Touch / GapBreak
+//    B. 既存 ActiveTouch を TouchStartSnapshot 基準で評価
+//    C. Break / WeakDepth / Reset / Flip / Reclaim / Inverse の事実を検出
+//    D. 同時イベントの優先順位を解決
+//         ・Local Break と WeakDepth   -> Break 優先 (f_episodeStep)
+//         ・FVG 構造無効化と Reclaim   -> FVG 構造無効化優先 (f_processBreakState)
+//         ・新 Root による Strong 化   -> 現在 Snapshot へ反映しない
+//         ・現在足終値で初めて Armed   -> 次足から
+//         ・現在足で初めて Root 確定   -> 現在足ヒゲをタッチにしない
+//         ・GapBreak 足                -> 同足で Flip / Reclaim を確定しない
+//    E. FVG 構造無効化 / 新 Root / Root 更新 / Root 失効 を反映
+//    F. LiveStructure の参加資格を即時更新 (f_applyCoreCand 内)
+//    G. ActiveTouch 関連の形状変更は PendingTopology へ送り、それ以外を再クラスタ
+//    H. Merge / Split / Identity / PendingGeneration を更新
+//    I. 次足用 Phase / Grade / Armed を確定
+//    J. 安全な保存整理と read-only View 生成
+// ============================================================================
+
+f_pruneCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    int removed = 0
+    for guard = 1 to 32
+        if array.size(e.cores) <= c.maxZoneCores
+            break
+        int worst = -1
+        int worstRoots = na
+        int worstSeq = na
+        int n = array.size(e.cores)
+        if n > 0
+            for i = 0 to n - 1
+                ZoneCore z = array.get(e.cores, i)
+                if z.dormant and not f_coreMustKeep(e, z)
+                    int rn = array.size(z.originRootIds)
+                    bool better = worst < 0 or rn < nz(worstRoots, 9999)
+                         or (rn == nz(worstRoots, 9999) and nz(z.lastSeenSeq, 0) < nz(worstSeq, 0))
+                    if better
+                        worst      := i
+                        worstRoots := rn
+                        worstSeq   := z.lastSeenSeq
+        if worst < 0
+            break
+        f_archiveCore(e, c, array.get(e.cores, worst), "STORAGE_PRUNE")
+        array.remove(e.cores, worst)
+        removed := removed + 1
+    if removed > 0
+        e.storagePruned   := true
+        e.prunedZoneCount := e.prunedZoneCount + removed
+        f_emit(e, f, EV_STORAGE_PRUNE, 0, 0, SIDE_NONE, na, na, 0, GR_UNAVAILABLE, WEAK_NONE, 0,
+             "ZONE_PRUNED " + str.tostring(removed))
+    removed
+
+f_categoryMaskText(int mask) =>
+    string s = ""
+    if f_maskHas(mask, CAT_MA)
+        s := s + (s == "" ? "" : "+") + "MA"
+    if f_maskHas(mask, CAT_SWING)
+        s := s + (s == "" ? "" : "+") + "Swing"
+    if f_maskHas(mask, CAT_ACCUM)
+        s := s + (s == "" ? "" : "+") + "Accum"
+    if f_maskHas(mask, CAT_TIME_HL)
+        s := s + (s == "" ? "" : "+") + "TimeHL"
+    if f_maskHas(mask, CAT_FVG)
+        s := s + (s == "" ? "" : "+") + "FVG"
+    if f_maskHas(mask, CAT_PSYCH)
+        s := s + (s == "" ? "" : "+") + "Psych"
+    s == "" ? "-" : s
+
+f_subtypeText(int sub) =>
+    sub == SUB_EMA1 ? "EMA1" : sub == SUB_EMA2 ? "EMA2" : sub == SUB_SWING_H ? "SwingH" :
+     sub == SUB_SWING_L ? "SwingL" : sub == SUB_ACC_UPPER ? "AccUpper" : sub == SUB_ACC_LOWER ? "AccLower" :
+     sub == SUB_HL_HIGH ? "PeriodHigh" : sub == SUB_HL_LOW ? "PeriodLow" : sub == SUB_FVG ? "FVG" :
+     sub == SUB_PSYCH_MAJOR ? "PsychMajor" : sub == SUB_PSYCH_STD ? "PsychStd" : "-"
+
+f_tfText(int tfCode) =>
+    tfCode == TF_1M ? "1M" : tfCode == TF_5M ? "5M" : tfCode == TF_15M ? "15M" : tfCode == TF_1H ? "1H" :
+     tfCode == TF_4H ? "4H" : tfCode == TF_D ? "D" : "-"
+
+//  Root 一覧の表示文字列。Hot loop では作らず、最終バーだけで組み立てる。
+f_rootSummary(ZoneEngine e, ZoneCfg c, array<int> ids) =>
+    string s = ""
+    int n = array.size(ids)
+    if n > 0
+        for k = 0 to n - 1
+            int i = f_rootIdxById(e, array.get(ids, k))
+            if i >= 0
+                Root r = array.get(e.roots, i)
+                string one = f_subtypeText(r.subtype) + "/" + f_tfText(r.tfCode) + "#" + str.tostring(r.rootId)
+                s := s + (s == "" ? "" : ", ") + one
+    s == "" ? "-" : s
+
+f_pushView(ZoneEngine e, ZoneCfg c, ZoneFeed f, ZoneCore z, int side) =>
+    SideViewState v = f_sideView(z, side)
+    SideHistory   h = v.history
+    bool emitIt = array.size(v.rootIds) > 0 or h.phase == PH_BROKEN or h.phase == PH_FLIP_WAIT
+         or z.breakSnap.valid or f_coreHasWaitingRoot(e, z)
+    if emitIt
+        ZoneView w = ZoneView.new(coreId = z.coreId, generationId = z.generationId, side = side,
+             effectiveBottom = v.effectiveBottom, effectiveTop = v.effectiveTop,
+             referencePrice = v.referencePrice, phase = h.phase, grade = h.grade,
+             cCount = v.cCount, hCount = v.hCount, density = v.density, baseStrong = v.baseStrong,
+             currentTouchNo = h.currentTouchNo, upcomingTouchNo = h.upcomingTouchNo,
+             zoneFresh = z.zoneFresh, sideFresh = h.sideFresh, weakReason = f_weakReason(h),
+             maxDepthPct = h.maxDepthPct, isBroadContext = v.isBroadContext,
+             fvgDirectionMask = v.fvgDirMask, fvgRootCount = v.fvgRootCount,
+             fvgFreshCount = v.fvgFreshCount, fvgStructuralStateMask = v.fvgStateMask,
+             eligible = v.eligible, dormant = z.dormant, pendingTopology = z.pendingTopology,
+             pendingGeneration = z.pendingGeneration, catMask = v.catMask, highMask = v.highMask,
+             touchStartGrade = v.touchSnapshot.valid ? v.touchSnapshot.touchStartGrade : GR_NEUTRAL,
+             snapshotBottom = v.touchSnapshot.valid ? v.touchSnapshot.rangeBottom : float(na),
+             snapshotTop = v.touchSnapshot.valid ? v.touchSnapshot.rangeTop : float(na),
+             physBottom = z.physBottom, physTop = z.physTop, flipAttemptCount = h.flipAttemptCount)
+        if barstate.islast
+            w.rootSummary     := f_rootSummary(e, c, v.rootIds)
+            w.categorySummary := f_categoryMaskText(v.catMask) + " | High: " + f_categoryMaskText(v.highMask)
+        array.push(e.views, w)
+    emitIt
+
+f_buildViews(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    array.clear(e.views)
+    int n = array.size(e.cores)
+    if n > 0
+        for i = 0 to n - 1
+            ZoneCore z = array.get(e.cores, i)
+            f_pushView(e, c, f, z, SIDE_SUPPORT)
+            f_pushView(e, c, f, z, SIDE_RESISTANCE)
+    array.size(e.views)
+
+// @function   Zone Engine v2 を確定 Base TF (5分) 足 1 本ぶん更新する。
+//             ★ 確定足 1 本につき 1 回だけ呼ぶこと ★
+//             同じ baseOpenTime / baseSeq を二度渡しても状態は更新されない。
+//             config が不正なら状態を更新せず、理由を engine.configError へ残す。
+// @param e    ZoneEngine (var 宣言した永続状態)
+// @param c    ZoneCfg
+// @param f    ZoneFeed
+// @returns    int  読み出し可能な ZoneView の件数
+export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
+    [ok, why] = validateCfg(c)
+    e.configValid         := ok
+    e.configError         := why
+    e.duplicateBarSkipped := false
+    //  最小ティックは原則 Feed (syminfo.mintick) から受ける
+    if ok and not na(f.mintick) and f.mintick > 0
+        c.mintick := f.mintick
+    bool gate = ok and f.baseConfirmed and not na(f.baseOpenTime) and not na(f.baseClose)
+         and not na(f.baseHigh) and not na(f.baseLow)
+    bool dup = gate and not na(e.lastBaseTime)
+         and (f.baseOpenTime <= e.lastBaseTime or f.baseSeq <= nz(e.lastBaseSeq, -1))
+    if dup
+        e.duplicateBarSkipped := true
+    if gate and not dup
+        array.clear(e.events)
+        e.storagePruned := false
+
+        // ---- E-1 : FVG 構造無効化 (Reclaim との優先順位のため先に確定する) ----
+        f_updateFvgStructural(e, c, f)
+
+        // ---- A / B / C / D : 現在足で起きた事実の検出 ----
+        int nc = array.size(e.cores)
+        if nc > 0
+            for i = 0 to nc - 1
+                ZoneCore z = array.get(e.cores, i)
+                if not z.dormant
+                    f_generationSwitch(e, c, f, z)
+                    f_processBreakState(e, c, f, z)
+                    f_processSide(e, c, f, z, SIDE_SUPPORT)
+                    f_processSide(e, c, f, z, SIDE_RESISTANCE)
+
+        // ---- C : Inverse FVG の進行 (Root 単位 / Base 確定終値基準) ----
+        f_updateFvgInverse(e, c, f)
+
+        // ---- E-2 : 新 Root / Root 更新 / Root 失効 ----
+        //  時間高安の Root 更新はタッチ評価より後 (新極値足のヒゲを自身のタッチにしない)
+        f_updateMaRoots(e, c, f)
+        f_updateSwingRoots(e, c, f)
+        f_updateAccumRoots(e, c, f)
+        f_updateFvgNew(e, c, f)
+        f_updateFvgFresh(e, c, f)
+        f_updateTimeHlRoots(e, c, f)
+        f_syncPsychRoots(e, c, f)
+        f_reindexRoots(e)
+
+        // ---- F / G / H : LiveStructure / 再クラスタ / Merge / Split / Identity ----
+        f_rebuildCores(e, c, f)
+
+        // ---- I : 次足用 Phase / Grade / Armed ----
+        int nf = array.size(e.cores)
+        if nf > 0
+            for i = 0 to nf - 1
+                f_finalizeCore(e, c, f, array.get(e.cores, i))
+
+        // ---- J : 保存整理 (ActiveTouch / Broken / FlipWait / Pending は消さない) ----
+        f_pruneRoots(e, c, f)
+        f_reindexRoots(e)
+        f_pruneCores(e, c, f)
+
+        // ---- 診断値 ----
+        int pt = 0
+        int pg = 0
+        int nd = array.size(e.cores)
+        if nd > 0
+            for i = 0 to nd - 1
+                ZoneCore z = array.get(e.cores, i)
+                if z.pendingTopology
+                    pt := pt + 1
+                if z.pendingGeneration
+                    pg := pg + 1
+        e.pendingTopologyCount   := pt
+        e.pendingGenerationCount := pg
+        e.lastBaseTime  := f.baseOpenTime
+        e.lastBaseSeq   := f.baseSeq
+        e.processedBars := e.processedBars + 1
+
+        f_buildViews(e, c, f)
+    array.size(e.views)
+
+// ============================================================================
+// 10. READ-ONLY API
+// ----------------------------------------------------------------------------
+//  Signal / Strategy 側は Library 内部の可変状態 (roots / cores) を直接触らず、
+//  ここの Projection だけを読む。Engine は Entry Signal を作らない。
+// ============================================================================
+
+// @function   読み出せる ZoneView の件数
+// @param e    ZoneEngine
+// @returns    int
+export viewCount(ZoneEngine e) =>
+    array.size(e.views)
+
+// @function   i 番目の ZoneView (Side 別 Projection)
+// @param e    ZoneEngine
+// @param i    index
+// @returns    ZoneView
+export viewAt(ZoneEngine e, int i) =>
+    array.get(e.views, i)
+
+// @function   現在の Base 足で発生した Event の件数
+// @param e    ZoneEngine
+// @returns    int
+export eventCount(ZoneEngine e) =>
+    array.size(e.events)
+
+// @function   i 番目の Event
+// @param e    ZoneEngine
+// @param i    index
+// @returns    ZoneEvent
+export eventAt(ZoneEngine e, int i) =>
+    array.get(e.events, i)
+
+// @function   Root registry の件数
+// @param e    ZoneEngine
+// @returns    int
+export rootCount(ZoneEngine e) =>
+    array.size(e.roots)
+
+// @function   i 番目の Root の読み出し専用 View
+// @param e    ZoneEngine
+// @param i    index
+// @returns    RootDebugView
+export rootAt(ZoneEngine e, int i) =>
+    Root r = array.get(e.roots, i)
+    RootDebugView.new(rootId = r.rootId, category = r.category, subtype = r.subtype, tfCode = r.tfCode,
+         tfMask = r.tfMask, state = r.state, pointPrice = r.pointPrice, nativeBottom = r.nativeBottom,
+         nativeTop = r.nativeTop, isRangeRoot = r.isRangeRoot, isBroadFvg = r.isBroadFvg,
+         fvgFresh = r.fvgFresh, direction = r.state == ROOT_INVERSE_ACTIVE ? r.inverseDir : r.direction,
+         confirmedTime = r.confirmedTime, originTime = r.originTime, originKey = r.originKey,
+         pairKey = r.pairKey, periodKind = r.periodKind, isCurrentPeriod = r.isCurrentPeriod)
+
+// @function   Live ZoneCore の件数 (Support / Resistance を二重に数えない)
+// @param e    ZoneEngine
+// @returns    int
+export coreCount(ZoneEngine e) =>
+    array.size(e.cores)
+
+// @function   終了世代の限定履歴の件数
+// @param e    ZoneEngine
+// @returns    int
+export endedGenerationCount(ZoneEngine e) =>
+    array.size(e.endedCores)
+
+// ---- 名称変換 (表示専用) ---------------------------------------------------
+// @function  Phase 名
+// @param v   PH_*
+// @returns   string
+export phaseName(int v) =>
+    v == PH_WAITING ? "Waiting" : v == PH_ARMED ? "Armed" : v == PH_ACTIVE_TOUCH ? "ActiveTouch" :
+     v == PH_BROKEN ? "Broken" : v == PH_FLIP_WAIT ? "FlipWait" : v == PH_DORMANT ? "Dormant" : "-"
+
+// @function  Grade 名
+// @param v   GR_*
+// @returns   string
+export gradeName(int v) =>
+    v == GR_STRONG ? "Strong" : v == GR_NEUTRAL ? "Neutral" : v == GR_WEAK ? "Weak" :
+     v == GR_UNAVAILABLE ? "Unavailable" : "-"
+
+// @function  Density 名
+// @param v   DEN_*
+// @returns   string
+export densityName(int v) =>
+    v == DEN_HIGH ? "HighDensity" : v == DEN_NORMAL ? "NormalDensity" :
+     v == DEN_BROAD_CONTEXT ? "BroadContext" : "-"
+
+// @function  Weak 理由名
+// @param v   WEAK_*
+// @returns   string
+export weakReasonName(int v) =>
+    v == WEAK_BY_TOUCH ? "WeakByTouch" : v == WEAK_BY_DEPTH ? "WeakByDepth" :
+     v == WEAK_BY_BOTH ? "WeakByBoth" : "None"
+
+// @function      Category mask 名 ("MA+Swing+FVG" のような表示)
+// @param mask    catMask / highMask
+// @returns       string
+export categoryMaskName(int mask) =>
+    f_categoryMaskText(mask)
+
+// @function  Event 名
+// @param v   EV_*
+// @returns   string
+export eventName(int v) =>
+    v == EV_TOUCH_START ? "TouchStart" : v == EV_TOUCH_RESET ? "TouchReset" :
+     v == EV_WEAK_DEPTH ? "WeakDepth" : v == EV_LOCAL_BREAK ? "LocalBreak" :
+     v == EV_GAP_BREAK ? "GapBreak" : v == EV_FLIP_ATTEMPT ? "FlipAttempt" :
+     v == EV_FLIP_CONFIRM ? "FlipConfirm" : v == EV_RECLAIM ? "Reclaim" :
+     v == EV_FVG_INVALIDATE ? "FvgInvalidate" : v == EV_INVERSE_ATTEMPT ? "InverseAttempt" :
+     v == EV_INVERSE_CONFIRM ? "InverseConfirm" : v == EV_GENERATION_START ? "GenerationStart" :
+     v == EV_MERGE ? "Merge" : v == EV_SPLIT ? "Split" : v == EV_STORAGE_PRUNE ? "StoragePrune" : "-"
+
+// @function  Side 名
+// @param v   SIDE_*
+// @returns   string
+export sideName(int v) =>
+    v == SIDE_SUPPORT ? "Support" : v == SIDE_RESISTANCE ? "Resistance" : "-"
+
+// @function  Root state 名
+// @param v   ROOT_*
+// @returns   string
+export rootStateName(int v) =>
+    v == ROOT_CANDIDATE ? "Candidate" : v == ROOT_ACTIVE ? "Active" : v == ROOT_INVALIDATED ? "Invalidated" :
+     v == ROOT_INVERSE_WAIT ? "InverseWait" : v == ROOT_INVERSE_ACTIVE ? "InverseActive" :
+     v == ROOT_RETIRED ? "Retired" : "-"
+
+// @function      FVG 方向 mask 名
+// @param mask    fvgDirectionMask
+// @returns       string
+export fvgDirectionName(int mask) =>
+    bool b = f_maskHas(mask, FVG_BULLISH)
+    bool s = f_maskHas(mask, FVG_BEARISH)
+    b and s ? "Bullish+Bearish" : b ? "Bullish" : s ? "Bearish" : "None"
+
+// @function  Category 名
+// @param v   CAT_*
+// @returns   string
+export categoryName(int v) =>
+    v == CAT_MA ? "MA" : v == CAT_SWING ? "Swing" : v == CAT_ACCUM ? "Accum" :
+     v == CAT_TIME_HL ? "TimeHL" : v == CAT_FVG ? "FVG" : v == CAT_PSYCH ? "Psych" : "-"
+
+// @function  Root subtype 名
+// @param v   SUB_*
+// @returns   string
+export subtypeName(int v) =>
+    f_subtypeText(v)
+
+// @function  Timeframe code 名
+// @param v   TF_*
+// @returns   string
+export tfName(int v) =>
+    f_tfText(v)
+
+// @function      時間高安 Root のラベル名 ("CurWeek+PrevDay" のような表示)
+// @param mask    Root.labelMask
+// @returns       string
+export timeLabelName(int mask) =>
+    string s = ""
+    if f_maskHas(mask, f_timeLabelBit(PER_SESSION, true))
+        s := s + (s == "" ? "" : "+") + "CurSession"
+    if f_maskHas(mask, f_timeLabelBit(PER_SESSION, false))
+        s := s + (s == "" ? "" : "+") + "PrevSession"
+    if f_maskHas(mask, f_timeLabelBit(PER_DAY, true))
+        s := s + (s == "" ? "" : "+") + "CurDay"
+    if f_maskHas(mask, f_timeLabelBit(PER_DAY, false))
+        s := s + (s == "" ? "" : "+") + "PrevDay"
+    if f_maskHas(mask, f_timeLabelBit(PER_WEEK, true))
+        s := s + (s == "" ? "" : "+") + "CurWeek"
+    if f_maskHas(mask, f_timeLabelBit(PER_WEEK, false))
+        s := s + (s == "" ? "" : "+") + "PrevWeek"
+    s == "" ? "-" : s
+
+// @function  Root の labelMask を取得する (rootAt では返していないため)
+// @param e   ZoneEngine
+// @param i   index
+// @returns   int
+export rootLabelMaskAt(ZoneEngine e, int i) =>
+    array.get(e.roots, i).labelMask
+
+// ============================================================================
+//  END OF ZoneEngineV2
+// ============================================================================

@@ -1,0 +1,626 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  ZoneEngineV2 Visual Harness  (indicator / 表示検証専用)
+// ============================================================================
+//  目的
+//    ZoneEngineV2 が作る Zone の生成 / 状態遷移 / 診断値を目視確認する。
+//
+//  ★ このスクリプトがやらないこと (指示書 22.5) ★
+//      strategy() 宣言 / Entry / Exit / 勝敗集計 / 環境認識フィルター /
+//      Zone 選択を 1 件へ絞る処理。
+//    Zone は該当するものを全件表示する (距離や Grade で勝手に 1 つへ絞らない)。
+//
+//  ★ 前提 ★
+//    ・チャート時間足 = 5分足。5分足以外では状態を更新せず警告を出す。
+//      (Library 自体は将来、別チャート足から確定 5分足 Feed を渡せる構造のまま)
+//    ・対象は XAUUSD。別銘柄では警告を出すだけで、Zone ロジックは一切変えない。
+//    ・外部足はすべて lookahead_off。未確定値で Engine を更新しない。
+//
+//  ★ request.security の本数 (同じ式 / 同じ時間足はまとめる) ★
+//      MA 1分       : 1 call
+//      Swing 5/15/60: 3 calls
+//      Accum 60/240/D : 3 calls
+//      FVG 60/240/D   : 3 calls
+//      Base 5分     : built-in (このスクリプトが 5分足なので request 不要)
+//      合計 10 calls
+//
+//  ★ セッション / 日 / 週 の ID はここで計算して Feed へ渡す ★
+//    Pine の hour()/timestamp() の timezone 引数は series 化できないため、
+//    timezone 依存の区切り判定は Library ではなく呼び出し側の責務にしている。
+// ============================================================================
+
+//@version=5
+indicator(
+     title            = "ZoneEngineV2 Visual Harness",
+     shorttitle        = "ZONEv2-HARNESS",
+     overlay           = true,
+     max_boxes_count   = 500,
+     max_labels_count  = 500,
+     max_lines_count   = 500,
+     dynamic_requests  = true
+ )
+
+//  ★ 公開した Library の <username>/<name>/<version> に合わせること ★
+import shota0927-prog/ZoneEngineV2/1 as zn2
+
+// ============================================================================
+// 01. INPUTS
+// ============================================================================
+var string G_CORE  = "01 · Zone 論理パラメータ"
+var string G_CAT   = "02 · カテゴリ ON / OFF"
+var string G_TF    = "03 · 時間足"
+var string G_ACC   = "04 · Accum 検出"
+var string G_TIME  = "05 · セッション / 日 / 週"
+var string G_STORE = "06 · 保存上限 / Dormant"
+var string G_DISP  = "07 · 表示"
+var string G_DBG   = "08 · Debug"
+
+clusterMaxWidth    = input.float(20.0, "M : Zone 全幅の上限 ($)", minval = 0.1, step = 0.5, group = G_CORE)
+denseRatio         = input.float(0.50, "DenseRatio (dense 幅 = M × これ)", minval = 0.01, maxval = 1.0, step = 0.05, group = G_CORE)
+touchResetDistance = input.float(10.0, "TouchResetDistance ($)", minval = 0.1, step = 0.5, group = G_CORE)
+strongUnlimited    = input.bool(false, "StrongUntilTouch = Unlimited", group = G_CORE)
+strongUntilTouch   = input.int(1, "StrongUntilTouch", minval = 1, group = G_CORE)
+weakFromTouchOff   = input.bool(false, "WeakFromTouch = OFF", group = G_CORE)
+weakFromTouch      = input.int(2, "WeakFromTouch", minval = 2, group = G_CORE)
+weakDepthOff       = input.bool(false, "WeakDepth = OFF", group = G_CORE)
+weakDepthPct       = input.float(50.0, "WeakDepthPct (%)", minval = 0.0, maxval = 100.0, step = 5.0, group = G_CORE)
+breakBuffer        = input.float(2.0, "BreakBuffer ($)", minval = 0.0, step = 0.5, group = G_CORE)
+touchTolerance     = input.float(0.0, "TouchTolerance ($ · 一本線 Zone 専用)", minval = 0.0, step = 0.1, group = G_CORE)
+
+useMa    = input.bool(true, "MA 系",          group = G_CAT)
+useSwing = input.bool(true, "Swing 系",       group = G_CAT)
+useAccum = input.bool(true, "Accum 系",       group = G_CAT)
+useTime  = input.bool(true, "時間区切り高安系", group = G_CAT)
+useFvg   = input.bool(true, "HTF FVG 系",     group = G_CAT)
+usePsych = input.bool(true, "心理価格系",     group = G_CAT)
+
+maTf            = input.timeframe("1", "MA 時間足", group = G_TF)
+emaLen1         = input.int(2000, "EMA #1 期間", minval = 1, maxval = 4999, group = G_TF)
+emaLen2         = input.int(3000, "EMA #2 期間", minval = 1, maxval = 4999, group = G_TF)
+emaSlopeLookback = input.int(60, "EMA 傾き Lookback (1分足本数)", minval = 1, group = G_TF)
+swTf1 = input.timeframe("5",  "Swing TF #1", group = G_TF)
+swTf2 = input.timeframe("15", "Swing TF #2", group = G_TF)
+swTf3 = input.timeframe("60", "Swing TF #3", group = G_TF)
+swLen1 = input.int(10, "Swing Pivot Length #1", minval = 1, group = G_TF)
+swLen2 = input.int(8,  "Swing Pivot Length #2", minval = 1, group = G_TF)
+swLen3 = input.int(6,  "Swing Pivot Length #3", minval = 1, group = G_TF)
+accTf1 = input.timeframe("60",  "Accum TF #1", group = G_TF)
+accTf2 = input.timeframe("240", "Accum TF #2", group = G_TF)
+accTf3 = input.timeframe("D",   "Accum TF #3", group = G_TF)
+fvgTf1 = input.timeframe("60",  "FVG TF #1", group = G_TF)
+fvgTf2 = input.timeframe("240", "FVG TF #2", group = G_TF)
+fvgTf3 = input.timeframe("D",   "FVG TF #3", group = G_TF)
+
+accumRangeLen        = input.int(10,  "Accum 判定レンジ本数", minval = 6, group = G_ACC)
+accumBaseLen         = input.int(20,  "Accum 基準本数",      minval = 10, group = G_ACC)
+accumAtrLen          = input.int(14,  "Accum ATR 本数",      minval = 1, group = G_ACC)
+accumMinUpperCloses  = input.int(4,   "上半分 最低終値本数",  minval = 1, group = G_ACC)
+accumMinLowerCloses  = input.int(4,   "下半分 最低終値本数",  minval = 1, group = G_ACC)
+accumMaxSameColorRun = input.int(4,   "同色連続上限",        minval = 1, group = G_ACC)
+accumAtrMult         = input.float(2.5,  "レンジ幅 / ATR 上限",    minval = 0.1, step = 0.1, group = G_ACC)
+accumBarRatioMax     = input.float(0.70, "短期幅 / 基準幅 上限",   minval = 0.1, step = 0.05, group = G_ACC)
+accumDriftMax        = input.float(0.30, "ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = G_ACC)
+
+zoneTz       = input.string("Asia/Tokyo", "Timezone", group = G_TIME)
+dayResetHour = input.int(5,  "日区切り (時)",     minval = 0, maxval = 23, group = G_TIME)
+asiaStart    = input.int(9,  "Asia 開始 (時)",    minval = 0, maxval = 23, group = G_TIME)
+euStart      = input.int(14, "Europe 開始 (時)",  minval = 0, maxval = 23, group = G_TIME)
+nyStart      = input.int(19, "New York 開始 (時)", minval = 0, maxval = 23, group = G_TIME)
+nyEnd        = input.int(3,  "New York 終了 (時)", minval = 0, maxval = 23, group = G_TIME)
+
+maxSwingRoots       = input.int(180, "最大 Swing Root 数",   minval = 1, group = G_STORE)
+maxAccumBoxes       = input.int(60,  "最大 Accum Box 数",    minval = 1, group = G_STORE)
+maxFvgRoots         = input.int(120, "最大 FVG Root 数",     minval = 1, group = G_STORE)
+maxTimeRoots        = input.int(32,  "最大 時間高安 Root 数", minval = 1, group = G_STORE)
+maxZoneCores        = input.int(80,  "最大 ZoneCore 数",     minval = 1, group = G_STORE)
+maxEndedGenerations = input.int(30,  "終了世代の保存数",     minval = 1, group = G_STORE)
+maxTouchMarks       = input.int(64,  "Core ごとの TouchMark 上限", minval = 1, group = G_STORE)
+dormantDistance     = input.float(500.0, "Dormant 距離 ($)", minval = 1.0, step = 10.0, group = G_STORE)
+
+showZones     = input.bool(true, "Zone を描画", group = G_DISP)
+showLabels    = input.bool(true, "Zone ラベルを表示", group = G_DISP)
+showFvg50     = input.bool(false, "FVG 50% を表示 (DISPLAY ONLY)", group = G_DISP,
+     tooltip = "表示専用。Library の Zone 計算へは一切渡していない。")
+maxZonesDrawn  = input.int(30, "描画する Zone 数", minval = 1, maxval = 120, group = G_DISP)
+zoneLeftBars   = input.int(120, "Zone Box 左方向の長さ (bars)", minval = 1, group = G_DISP)
+zoneRightBars  = input.int(30,  "Zone Box 右方向の長さ (bars)", minval = 1, group = G_DISP)
+colSupport     = input.color(color.new(#26A69A, 0), "色 · Support", group = G_DISP)
+colResistance  = input.color(color.new(#EF5350, 0), "色 · Resistance", group = G_DISP)
+colInactive    = input.color(color.new(#78909C, 0), "色 · Unavailable / FlipWait", group = G_DISP)
+
+showDebugTable = input.bool(true,  "Debug table を表示", group = G_DBG)
+showRootTable  = input.bool(true,  "Root Debug table を表示", group = G_DBG)
+showEventLog   = input.bool(true,  "Event log を表示", group = G_DBG)
+rootTableMax   = input.int(18, "Root table の行数", minval = 1, maxval = 40, group = G_DBG)
+eventLogMax    = input.int(14, "Event log の行数", minval = 1, maxval = 40, group = G_DBG)
+dbgTextSize    = input.string("Small", "Table 文字サイズ", options = ["Tiny", "Small", "Normal"], group = G_DBG)
+
+// ============================================================================
+// 02. 環境チェック (ロジックへは影響させない)
+// ============================================================================
+bool isFiveMin = timeframe.in_seconds() == timeframe.in_seconds("5")
+bool isGold    = str.contains(str.upper(syminfo.ticker), "XAU") or str.contains(str.upper(syminfo.ticker), "GOLD")
+
+// ============================================================================
+// 03. ENGINE / CONFIG
+// ============================================================================
+var zn2.ZoneEngine eng = zn2.newEngine()
+
+zn2.ZoneCfg cfg = zn2.newCfg()
+cfg.clusterMaxWidth     := clusterMaxWidth
+cfg.denseRatio          := denseRatio
+cfg.touchResetDistance  := touchResetDistance
+cfg.strongUntilTouch    := strongUntilTouch
+cfg.strongUnlimited     := strongUnlimited
+cfg.weakFromTouch       := weakFromTouch
+cfg.weakFromTouchOff    := weakFromTouchOff
+cfg.weakDepthPct        := weakDepthPct
+cfg.weakDepthOff        := weakDepthOff
+cfg.breakBuffer         := breakBuffer
+cfg.touchTolerance      := touchTolerance
+cfg.emaSlopeLookback    := emaSlopeLookback
+cfg.swingLen5m          := swLen1
+cfg.swingLen15m         := swLen2
+cfg.swingLen1h          := swLen3
+cfg.useMa               := useMa
+cfg.useSwing            := useSwing
+cfg.useAccum            := useAccum
+cfg.useTimeHL           := useTime
+cfg.useFvg              := useFvg
+cfg.usePsych            := usePsych
+cfg.accumRangeLen       := accumRangeLen
+cfg.accumBaseLen        := accumBaseLen
+cfg.accumAtrLen         := accumAtrLen
+cfg.accumMinUpperCloses := accumMinUpperCloses
+cfg.accumMinLowerCloses := accumMinLowerCloses
+cfg.accumMaxSameColorRun := accumMaxSameColorRun
+cfg.accumAtrMult        := accumAtrMult
+cfg.accumBarRatioMax    := accumBarRatioMax
+cfg.accumDriftMax       := accumDriftMax
+cfg.zoneTimezone        := zoneTz
+cfg.dayResetHour        := dayResetHour
+cfg.asiaStartHour       := asiaStart
+cfg.europeStartHour     := euStart
+cfg.nyStartHour         := nyStart
+cfg.nyEndHour           := nyEnd
+cfg.tfMa                := maTf
+cfg.tfSwing1            := swTf1
+cfg.tfSwing2            := swTf2
+cfg.tfSwing3            := swTf3
+cfg.tfAccum1            := accTf1
+cfg.tfAccum2            := accTf2
+cfg.tfAccum3            := accTf3
+cfg.tfFvg1              := fvgTf1
+cfg.tfFvg2              := fvgTf2
+cfg.tfFvg3              := fvgTf3
+cfg.maxSwingRoots       := maxSwingRoots
+cfg.maxAccumBoxes       := maxAccumBoxes
+cfg.maxFvgRoots         := maxFvgRoots
+cfg.maxTimeRoots        := maxTimeRoots
+cfg.maxZoneCores        := maxZoneCores
+cfg.maxEndedGenerations := maxEndedGenerations
+cfg.maxTouchMarksPerCore := maxTouchMarks
+cfg.dormantDistance     := dormantDistance
+cfg.maxZonesDrawn       := maxZonesDrawn
+cfg.maxLabelsDrawn      := maxZonesDrawn
+cfg.mintick             := syminfo.mintick
+
+// Library と同じ定数値を名前で取得する (再宣言しない)
+int SIDE_SUPPORT    = zn2.constOf("SIDE_SUPPORT")
+int SIDE_RESISTANCE = zn2.constOf("SIDE_RESISTANCE")
+int PH_ACTIVE_TOUCH = zn2.constOf("PH_ACTIVE_TOUCH")
+int PH_BROKEN       = zn2.constOf("PH_BROKEN")
+int PH_FLIP_WAIT    = zn2.constOf("PH_FLIP_WAIT")
+int PH_DORMANT      = zn2.constOf("PH_DORMANT")
+int GR_STRONG       = zn2.constOf("GR_STRONG")
+int GR_NEUTRAL      = zn2.constOf("GR_NEUTRAL")
+int GR_WEAK         = zn2.constOf("GR_WEAK")
+int GR_UNAVAILABLE  = zn2.constOf("GR_UNAVAILABLE")
+int DEN_BROAD       = zn2.constOf("DEN_BROAD_CONTEXT")
+int TF_5M           = zn2.constOf("TF_5M")
+int TF_15M          = zn2.constOf("TF_15M")
+int TF_1H           = zn2.constOf("TF_1H")
+int TF_4H           = zn2.constOf("TF_4H")
+int TF_D            = zn2.constOf("TF_D")
+int SESS_NONE       = zn2.constOf("SESS_NONE")
+int SESS_ASIA       = zn2.constOf("SESS_ASIA")
+int SESS_EUROPE     = zn2.constOf("SESS_EUROPE")
+int SESS_NY         = zn2.constOf("SESS_NY")
+int CAT_FVG         = zn2.constOf("CAT_FVG")
+
+// ============================================================================
+// 04. セッション / 日 / 週 ID (timezone 依存部分は Harness の責務)
+// ----------------------------------------------------------------------------
+//  ・Base 足の time (足の開始時刻) で判定する。
+//    14:00 開始足は Europe / 19:00 開始足は New York /
+//    03:00 開始足はセッションなし / 05:00 開始足は新取引日。
+// ============================================================================
+int locY = year(time, zoneTz)
+int locM = month(time, zoneTz)
+int locD = dayofmonth(time, zoneTz)
+int locH = hour(time, zoneTz)
+int calDayNo    = int(timestamp(zoneTz, locY, locM, locD, 0, 0) / 86400000)
+int tradingDay  = locH < dayResetHour ? calDayNo - 1 : calDayNo
+//  1970-01-01 は木曜。1970-01-05 が月曜なので、月曜起点は (day - 4) / 7。
+int tradingWeek = int(math.floor((tradingDay - 4) / 7.0))
+int sessCode = locH >= asiaStart and locH < euStart ? SESS_ASIA :
+     locH >= euStart and locH < nyStart ? SESS_EUROPE :
+     (locH >= nyStart or locH < nyEnd) ? SESS_NY : SESS_NONE
+int sessId = tradingDay * 8 + sessCode
+
+// ============================================================================
+// 05. EXTERNAL DATA FEED (すべて lookahead_off / 確定足のみ)
+// ============================================================================
+// ---- MA (1分足コンテキストで EMA と傾きを計算) ----
+[ema1, ema1d, ema2, ema2d, maCt] = request.security(syminfo.tickerid, maTf,
+     zn2.maPackV2(emaLen1, emaLen2, emaSlopeLookback), lookahead = barmerge.lookahead_off)
+
+// ---- Swing (Pivot 価格 / OriginTime / OriginEndTime / ConfirmedTime) ----
+[s1ph, s1phO, s1phE, s1phC, s1pl, s1plO, s1plE, s1plC] =
+     request.security(syminfo.tickerid, swTf1, zn2.pivotPackV2(swLen1), lookahead = barmerge.lookahead_off)
+[s2ph, s2phO, s2phE, s2phC, s2pl, s2plO, s2plE, s2plC] =
+     request.security(syminfo.tickerid, swTf2, zn2.pivotPackV2(swLen2), lookahead = barmerge.lookahead_off)
+[s3ph, s3phO, s3phE, s3phC, s3pl, s3plO, s3plE, s3plC] =
+     request.security(syminfo.tickerid, swTf3, zn2.pivotPackV2(swLen3), lookahead = barmerge.lookahead_off)
+
+// ---- Accum (Confirmed Box イベントだけ) ----
+[a1New, a1Top, a1Bot, a1Id, a1Cs, a1Ct] = request.security(syminfo.tickerid, accTf1,
+     zn2.accumPackV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+     accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax), lookahead = barmerge.lookahead_off)
+[a2New, a2Top, a2Bot, a2Id, a2Cs, a2Ct] = request.security(syminfo.tickerid, accTf2,
+     zn2.accumPackV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+     accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax), lookahead = barmerge.lookahead_off)
+[a3New, a3Top, a3Bot, a3Id, a3Cs, a3Ct] = request.security(syminfo.tickerid, accTf3,
+     zn2.accumPackV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+     accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax), lookahead = barmerge.lookahead_off)
+
+// ---- FVG (確定 3 本 + その時間足の新規確定足 OHLC) ----
+[f1bN, f1bT, f1bB, f1bO, f1bC, f1sN, f1sT, f1sB, f1sO, f1sC, f1h, f1l, f1c, f1ot, f1ct] =
+     request.security(syminfo.tickerid, fvgTf1, zn2.fvgPackV2(), lookahead = barmerge.lookahead_off)
+[f2bN, f2bT, f2bB, f2bO, f2bC, f2sN, f2sT, f2sB, f2sO, f2sC, f2h, f2l, f2c, f2ot, f2ct] =
+     request.security(syminfo.tickerid, fvgTf2, zn2.fvgPackV2(), lookahead = barmerge.lookahead_off)
+[f3bN, f3bT, f3bB, f3bO, f3bC, f3sN, f3sT, f3sB, f3sO, f3sC, f3h, f3l, f3c, f3ot, f3ct] =
+     request.security(syminfo.tickerid, fvgTf3, zn2.fvgPackV2(), lookahead = barmerge.lookahead_off)
+
+// ---- 各時間足が「新しく 1 本確定した」5分足を 1 回だけ検出する ----
+bool nSw1 = nz(ta.change(time(swTf1)), 0) != 0
+bool nSw2 = nz(ta.change(time(swTf2)), 0) != 0
+bool nSw3 = nz(ta.change(time(swTf3)), 0) != 0
+bool nAc1 = nz(ta.change(time(accTf1)), 0) != 0
+bool nAc2 = nz(ta.change(time(accTf2)), 0) != 0
+bool nAc3 = nz(ta.change(time(accTf3)), 0) != 0
+bool nFv1 = nz(ta.change(time(fvgTf1)), 0) != 0
+bool nFv2 = nz(ta.change(time(fvgTf2)), 0) != 0
+bool nFv3 = nz(ta.change(time(fvgTf3)), 0) != 0
+
+//  時間足文字列 -> Library の tfCode
+tfCodeOf(simple string tf) =>
+    timeframe.in_seconds(tf) == timeframe.in_seconds("5")   ? TF_5M :
+     timeframe.in_seconds(tf) == timeframe.in_seconds("15") ? TF_15M :
+     timeframe.in_seconds(tf) == timeframe.in_seconds("60") ? TF_1H :
+     timeframe.in_seconds(tf) == timeframe.in_seconds("240") ? TF_4H : TF_D
+
+// ============================================================================
+// 06. ENGINE UPDATE (確定 5分足 1 本につき 1 回だけ)
+// ============================================================================
+var int baseSeq  = 0
+var int viewsNow = 0
+if isFiveMin and barstate.isconfirmed
+    baseSeq += 1
+    zn2.ZoneFeed fd = zn2.newFeed()
+    fd.baseOpen      := open
+    fd.baseHigh      := high
+    fd.baseLow       := low
+    fd.baseClose     := close
+    fd.basePrevClose := close[1]
+    fd.baseOpenTime  := time
+    fd.baseCloseTime := time_close
+    fd.baseSeq       := baseSeq
+    fd.baseConfirmed := true
+    fd.mintick       := syminfo.mintick
+    fd.maValid       := not na(ema1) and not na(ema2)
+    fd.ema1          := ema1
+    fd.ema1Delta     := ema1d
+    fd.ema2          := ema2
+    fd.ema2Delta     := ema2d
+    fd.maConfirmTime := maCt
+    fd.sessionCode   := sessCode
+    fd.sessionId     := sessId
+    fd.dayId         := tradingDay
+    fd.weekId        := tradingWeek
+    zn2.feedSwing(fd, tfCodeOf(swTf1), nSw1, s1ph, s1phO, s1phE, s1phC, s1pl, s1plO, s1plE, s1plC)
+    zn2.feedSwing(fd, tfCodeOf(swTf2), nSw2, s2ph, s2phO, s2phE, s2phC, s2pl, s2plO, s2plE, s2plC)
+    zn2.feedSwing(fd, tfCodeOf(swTf3), nSw3, s3ph, s3phO, s3phE, s3phC, s3pl, s3plO, s3plE, s3plC)
+    zn2.feedAccum(fd, tfCodeOf(accTf1), nAc1, a1New, a1Top, a1Bot, a1Id, a1Cs, a1Ct)
+    zn2.feedAccum(fd, tfCodeOf(accTf2), nAc2, a2New, a2Top, a2Bot, a2Id, a2Cs, a2Ct)
+    zn2.feedAccum(fd, tfCodeOf(accTf3), nAc3, a3New, a3Top, a3Bot, a3Id, a3Cs, a3Ct)
+    zn2.feedFvg(fd, tfCodeOf(fvgTf1), nFv1, f1bN, f1bT, f1bB, f1bO, f1bC, f1sN, f1sT, f1sB, f1sO, f1sC,
+         f1h, f1l, f1c, f1ot, f1ct)
+    zn2.feedFvg(fd, tfCodeOf(fvgTf2), nFv2, f2bN, f2bT, f2bB, f2bO, f2bC, f2sN, f2sT, f2sB, f2sO, f2sC,
+         f2h, f2l, f2c, f2ot, f2ct)
+    zn2.feedFvg(fd, tfCodeOf(fvgTf3), nFv3, f3bN, f3bT, f3bB, f3bO, f3bC, f3sN, f3sT, f3sB, f3sO, f3sC,
+         f3h, f3l, f3c, f3ot, f3ct)
+    viewsNow := zn2.update(eng, cfg, fd)
+
+// ============================================================================
+// 07. EVENT LOG (表示専用)
+// ============================================================================
+var array<string> evLog = array.new_string()
+if isFiveMin and barstate.isconfirmed
+    int ec = zn2.eventCount(eng)
+    if ec > 0
+        for i = 0 to ec - 1
+            zn2.ZoneEvent ev = zn2.eventAt(eng, i)
+            string one = str.format_time(nz(ev.time, time), "MM-dd HH:mm", zoneTz) + "  " +
+                 zn2.eventName(ev.eventType) + "  core " + str.tostring(ev.coreId) +
+                 "/g" + str.tostring(ev.generationId) + "  " + zn2.sideName(ev.side) +
+                 "  T" + str.tostring(ev.touchNo) +
+                 "  [" + str.tostring(ev.rangeBottom, "#.##") + " - " + str.tostring(ev.rangeTop, "#.##") + "]" +
+                 (ev.rootId != 0 ? "  root#" + str.tostring(ev.rootId) : "") +
+                 (ev.info == "" ? "" : "  " + ev.info)
+            array.push(evLog, one)
+    while array.size(evLog) > 60
+        array.shift(evLog)
+
+// ============================================================================
+// 08. 描画 (表示はロジックへ一切影響しない)
+// ============================================================================
+var array<box>   gBoxes  = array.new<box>()
+var array<line>  gLines  = array.new<line>()
+var array<label> gLabels = array.new<label>()
+
+f_clearDrawings() =>
+    while array.size(gBoxes) > 0
+        box.delete(array.pop(gBoxes))
+    while array.size(gLines) > 0
+        line.delete(array.pop(gLines))
+    while array.size(gLabels) > 0
+        label.delete(array.pop(gLabels))
+    true
+
+f_num(float v, string fmt) =>
+    na(v) ? "-" : str.tostring(v, fmt)
+
+f_viewColor(int side, int grade, int phase) =>
+    grade == GR_UNAVAILABLE or phase == PH_FLIP_WAIT ? colInactive :
+     side == SIDE_SUPPORT ? colSupport : colResistance
+
+f_viewTransp(int grade, bool broad) =>
+    broad ? 92 : grade == GR_STRONG ? 55 : grade == GR_NEUTRAL ? 75 : grade == GR_WEAK ? 88 : 92
+
+f_viewLabel(zn2.ZoneView w) =>
+    string t = "Core " + str.tostring(w.coreId) + " / Gen " + str.tostring(w.generationId) +
+         " / " + zn2.sideName(w.side)
+    t := t + "\n" + zn2.phaseName(w.phase) + " | " + zn2.gradeName(w.grade) +
+         (w.baseStrong ? " (BaseStrong)" : "")
+    t := t + "\nRange " + f_num(w.effectiveBottom, "#.##") + " - " + f_num(w.effectiveTop, "#.##") +
+         " / Ref " + f_num(w.referencePrice, "#.##")
+    t := t + "\nC " + str.tostring(w.cCount) + " / H " + str.tostring(w.hCount) +
+         " / " + zn2.densityName(w.density)
+    t := t + "\n" + (w.phase == PH_ACTIVE_TOUCH ? "Current Touch " + str.tostring(w.currentTouchNo)
+         : "Upcoming Touch " + str.tostring(w.upcomingTouchNo))
+    t := t + "\n" + zn2.weakReasonName(w.weakReason) + " / MaxDepth " + f_num(w.maxDepthPct, "#.#") + "%"
+    t := t + "\nZoneFresh " + (w.zoneFresh ? "Y" : "N") + " / SideFresh " + (w.sideFresh ? "Y" : "N")
+    t := t + "\nFVG " + zn2.fvgDirectionName(w.fvgDirectionMask) + " / roots " + str.tostring(w.fvgRootCount) +
+         " / fresh " + str.tostring(w.fvgFreshCount) + " / state " + str.tostring(w.fvgStructuralStateMask)
+    t := t + "\n" + w.categorySummary
+    t := t + "\nRoots: " + w.rootSummary
+    if w.phase == PH_ACTIVE_TOUCH and not na(w.snapshotBottom)
+        t := t + "\nSnapshot " + f_num(w.snapshotBottom, "#.##") + " - " + f_num(w.snapshotTop, "#.##") +
+             " | StartGrade " + zn2.gradeName(w.touchStartGrade)
+    if w.pendingTopology
+        t := t + "\nPendingTopology"
+    if w.pendingGeneration
+        t := t + "\nPendingGeneration"
+    if w.isBroadContext
+        t := t + "\nBROAD CONTEXT (not Strong)"
+    if w.flipAttemptCount > 0
+        t := t + "\nFlipAttempt x" + str.tostring(w.flipAttemptCount)
+    t
+
+if barstate.islast and isFiveMin
+    f_clearDrawings()
+    int vc = zn2.viewCount(eng)
+    if showZones and vc > 0
+        //  現在価格に近い順に並べ、描画本数だけ表示する (Zone の選別ではなく描画上限)
+        array<float> dist = array.new_float()
+        for i = 0 to vc - 1
+            zn2.ZoneView w = zn2.viewAt(eng, i)
+            float d = na(w.effectiveBottom) ? 1e9 :
+                 close < w.effectiveBottom ? w.effectiveBottom - close :
+                 close > w.effectiveTop ? close - w.effectiveTop : 0.0
+            array.push(dist, d)
+        array<int> ord = array.sort_indices(dist, order.ascending)
+        int lim = int(math.min(vc, maxZonesDrawn))
+        for k = 0 to lim - 1
+            zn2.ZoneView w = zn2.viewAt(eng, array.get(ord, k))
+            if not na(w.effectiveBottom) and not na(w.effectiveTop)
+                color bc = f_viewColor(w.side, w.grade, w.phase)
+                int   tr = f_viewTransp(w.grade, w.isBroadContext)
+                bool  dashed = w.phase == PH_BROKEN or w.phase == PH_FLIP_WAIT or w.isBroadContext
+                int   bw = w.phase == PH_ACTIVE_TOUCH ? 3 : w.grade == GR_STRONG ? 2 : 1
+                if w.effectiveTop - w.effectiveBottom <= syminfo.mintick
+                    //  一本線 Zone : 描画は line だが、ロジック上の幅は 0 のまま
+                    line ln = line.new(bar_index - zoneLeftBars, w.effectiveBottom,
+                         bar_index + zoneRightBars, w.effectiveBottom,
+                         xloc = xloc.bar_index, color = color.new(bc, math.max(tr - 40, 0)),
+                         width = bw, style = dashed ? line.style_dashed : line.style_solid)
+                    array.push(gLines, ln)
+                else
+                    box bx = box.new(bar_index - zoneLeftBars, w.effectiveTop,
+                         bar_index + zoneRightBars, w.effectiveBottom,
+                         xloc = xloc.bar_index, bgcolor = color.new(bc, tr),
+                         border_color = color.new(bc, math.max(tr - 35, 0)), border_width = bw,
+                         border_style = dashed ? line.style_dashed : line.style_solid)
+                    array.push(gBoxes, bx)
+                if showLabels
+                    label lb = label.new(bar_index + zoneRightBars,
+                         w.side == SIDE_SUPPORT ? w.effectiveBottom : w.effectiveTop,
+                         text = f_viewLabel(w), xloc = xloc.bar_index, style = label.style_label_left,
+                         color = color.new(bc, 25), textcolor = color.white, size = size.small)
+                    array.push(gLabels, lb)
+    //  FVG 50% : 表示専用。Library の Zone 計算へは渡していない。
+    if showFvg50
+        int rc = zn2.rootCount(eng)
+        if rc > 0
+            for i = 0 to rc - 1
+                zn2.RootDebugView r = zn2.rootAt(eng, i)
+                if r.category == CAT_FVG and not na(r.nativeBottom) and not na(r.nativeTop)
+                    float mid = (r.nativeBottom + r.nativeTop) / 2
+                    line l50 = line.new(bar_index - zoneLeftBars, mid, bar_index + zoneRightBars, mid,
+                         xloc = xloc.bar_index, color = color.new(color.gray, 40),
+                         style = line.style_dotted, width = 1)
+                    array.push(gLines, l50)
+                    label l5l = label.new(bar_index + zoneRightBars, mid,
+                         text = "FVG 50% DISPLAY ONLY (root#" + str.tostring(r.rootId) + ")",
+                         xloc = xloc.bar_index, style = label.style_label_left,
+                         color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
+                    array.push(gLabels, l5l)
+
+// ============================================================================
+// 09. DEBUG TABLES
+// ============================================================================
+f_txtSize(string s) =>
+    s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
+
+f_sessName(int code) =>
+    code == SESS_ASIA ? "Asia" : code == SESS_EUROPE ? "Europe" : code == SESS_NY ? "NewYork" : "None"
+
+var table dbg = na
+if na(dbg)
+    dbg := table.new(position.top_right, 2, 18, border_width = 1, frame_width = 1,
+         frame_color = color.new(color.gray, 40))
+
+f_dbgRow(int row, string k, string v, color bg) =>
+    table.cell(dbg, 0, row, k, text_color = color.white, bgcolor = bg, text_size = f_txtSize(dbgTextSize),
+         text_halign = text.align_left)
+    table.cell(dbg, 1, row, v, text_color = color.white, bgcolor = color.new(bg, 80),
+         text_size = f_txtSize(dbgTextSize), text_halign = text.align_left)
+
+if barstate.islast and showDebugTable
+    table.clear(dbg, 0, 0, 1, 17)
+    color hdr = color.new(color.gray, 30)
+    color ok  = color.new(color.teal, 40)
+    color bad = color.new(color.red, 30)
+    f_dbgRow(0, "ZoneEngineV2 Harness", "v2 / display verification only", hdr)
+    f_dbgRow(1, "Chart TF", isFiveMin ? "5M (OK)" : timeframe.period + "  ★5分足以外のため更新停止★",
+         isFiveMin ? ok : bad)
+    f_dbgRow(2, "Symbol", syminfo.ticker + (isGold ? " (XAUUSD OK)" : "  ★XAUUSD 以外★"), isGold ? ok : bad)
+    f_dbgRow(3, "Config", eng.configValid ? "valid" : "INVALID : " + eng.configError, eng.configValid ? ok : bad)
+    f_dbgRow(4, "Live cores / views", str.tostring(zn2.coreCount(eng)) + " cores / " +
+         str.tostring(zn2.viewCount(eng)) + " views", hdr)
+    f_dbgRow(5, "Roots", str.tostring(zn2.rootCount(eng)) + " (ended generations " +
+         str.tostring(zn2.endedGenerationCount(eng)) + ")", hdr)
+    f_dbgRow(6, "Pending", "topology " + str.tostring(eng.pendingTopologyCount) +
+         " / generation " + str.tostring(eng.pendingGenerationCount), hdr)
+    f_dbgRow(7, "Merge / Split", str.tostring(eng.mergeCount) + " / " + str.tostring(eng.splitCount), hdr)
+    f_dbgRow(8, "Storage", (eng.storagePruned ? "PRUNED this bar" : "ok") +
+         "  roots " + str.tostring(eng.prunedRootCount) + " / zones " + str.tostring(eng.prunedZoneCount) +
+         (eng.touchHistoryTruncated ? "  ★touchHistoryTruncated★" : ""),
+         eng.storagePruned or eng.touchHistoryTruncated ? bad : ok)
+    f_dbgRow(9, "MA slope", "EMA" + str.tostring(emaLen1) + " " +
+         (eng.maSlope1 > 0 ? "Up" : eng.maSlope1 < 0 ? "Down" : "Flat") + "  /  EMA" + str.tostring(emaLen2) + " " +
+         (eng.maSlope2 > 0 ? "Up" : eng.maSlope2 < 0 ? "Down" : "Flat"), hdr)
+    f_dbgRow(10, "Session", f_sessName(sessCode) + "  id " + str.tostring(sessId), hdr)
+    f_dbgRow(11, "Day / Week id", str.tostring(tradingDay) + " / " + str.tostring(tradingWeek), hdr)
+    f_dbgRow(12, "Session H/L", f_num(eng.sessHigh, "#.##") + " / " + f_num(eng.sessLow, "#.##"), hdr)
+    f_dbgRow(13, "Day H/L", f_num(eng.dayHigh, "#.##") + " / " + f_num(eng.dayLow, "#.##"), hdr)
+    f_dbgRow(14, "Week H/L", f_num(eng.weekHigh, "#.##") + " / " + f_num(eng.weekLow, "#.##"), hdr)
+    f_dbgRow(15, "Processed bars", str.tostring(eng.processedBars) +
+         (eng.duplicateBarSkipped ? "  (duplicate base bar skipped)" : ""), hdr)
+    f_dbgRow(16, "Last base time", na(eng.lastBaseTime) ? "-" :
+         str.format_time(eng.lastBaseTime, "yyyy-MM-dd HH:mm", zoneTz) + "  seq " + str.tostring(eng.lastBaseSeq), hdr)
+    f_dbgRow(17, "Events this bar", str.tostring(zn2.eventCount(eng)) +
+         "  (last update returned " + str.tostring(viewsNow) + " views)", hdr)
+
+// ---- Root Debug table ------------------------------------------------------
+var table rtb = na
+if na(rtb)
+    rtb := table.new(position.bottom_left, 6, 41, border_width = 1, frame_width = 1,
+         frame_color = color.new(color.gray, 40))
+
+f_rtbCell(int col, int row, string v, color bg) =>
+    table.cell(rtb, col, row, v, text_color = color.white, bgcolor = bg,
+         text_size = f_txtSize(dbgTextSize), text_halign = text.align_left)
+
+if barstate.islast and showRootTable
+    table.clear(rtb, 0, 0, 5, 40)
+    color hdr = color.new(color.gray, 30)
+    f_rtbCell(0, 0, "Root", hdr)
+    f_rtbCell(1, 0, "Category / Subtype", hdr)
+    f_rtbCell(2, 0, "TF", hdr)
+    f_rtbCell(3, 0, "State", hdr)
+    f_rtbCell(4, 0, "Price / NativeRange", hdr)
+    f_rtbCell(5, 0, "Detail", hdr)
+    int rc = zn2.rootCount(eng)
+    if rc > 0
+        array<float> rd = array.new_float()
+        for i = 0 to rc - 1
+            zn2.RootDebugView r = zn2.rootAt(eng, i)
+            float p = r.isRangeRoot ? (r.nativeBottom + r.nativeTop) / 2 : r.pointPrice
+            array.push(rd, na(p) ? 1e9 : math.abs(p - close))
+        array<int> ord = array.sort_indices(rd, order.ascending)
+        int lim = int(math.min(rc, rootTableMax))
+        for k = 0 to lim - 1
+            int idx = array.get(ord, k)
+            zn2.RootDebugView r = zn2.rootAt(eng, idx)
+            color bg = color.new(color.gray, 70)
+            f_rtbCell(0, k + 1, "#" + str.tostring(r.rootId), bg)
+            f_rtbCell(1, k + 1, zn2.categoryName(r.category) + " / " + zn2.subtypeName(r.subtype), bg)
+            f_rtbCell(2, k + 1, zn2.tfName(r.tfCode), bg)
+            f_rtbCell(3, k + 1, zn2.rootStateName(r.state), bg)
+            f_rtbCell(4, k + 1, r.isRangeRoot ? f_num(r.nativeBottom, "#.##") + " - " + f_num(r.nativeTop, "#.##")
+                 : f_num(r.pointPrice, "#.##"), bg)
+            string det = ""
+            if r.category == CAT_FVG
+                det := zn2.fvgDirectionName(r.direction == 0 ? 0 : r.direction) +
+                     (r.fvgFresh ? " / Fresh" : " / FreshUsed") + (r.isBroadFvg ? " / BROAD" : "")
+            else if r.pairKey != ""
+                det := "pair " + r.pairKey
+            else if r.periodKind != 0
+                det := zn2.timeLabelName(zn2.rootLabelMaskAt(eng, idx))
+            else
+                det := r.originKey
+            f_rtbCell(5, k + 1, det, bg)
+
+// ---- Event log table -------------------------------------------------------
+var table etb = na
+if na(etb)
+    etb := table.new(position.bottom_right, 1, 41, border_width = 1, frame_width = 1,
+         frame_color = color.new(color.gray, 40))
+
+if barstate.islast and showEventLog
+    table.clear(etb, 0, 0, 0, 40)
+    table.cell(etb, 0, 0, "ZoneEngineV2 Events (newest first)", text_color = color.white,
+         bgcolor = color.new(color.gray, 30), text_size = f_txtSize(dbgTextSize), text_halign = text.align_left)
+    int n = array.size(evLog)
+    int lim = int(math.min(n, eventLogMax))
+    if lim > 0
+        for k = 0 to lim - 1
+            string one = array.get(evLog, n - 1 - k)
+            table.cell(etb, 0, k + 1, one, text_color = color.white, bgcolor = color.new(color.gray, 80),
+                 text_size = f_txtSize(dbgTextSize), text_halign = text.align_left)
+
+// ============================================================================
+// 10. 環境警告 (チャート上でも分かるように出す)
+// ============================================================================
+var label warnLbl = na
+if barstate.islast
+    if not na(warnLbl)
+        label.delete(warnLbl)
+    string w = ""
+    if not isFiveMin
+        w := w + "★ チャート時間足が " + timeframe.period + " です。ZoneEngineV2 Harness は 5分足専用のため Engine を更新していません。\n"
+    if not isGold
+        w := w + "★ 銘柄が " + syminfo.ticker + " です (想定は XAUUSD)。Zone ロジックは変更していません。\n"
+    if not eng.configValid
+        w := w + "★ ZoneCfg が不正です : " + eng.configError + " (更新を停止しています)\n"
+    if w != ""
+        warnLbl := label.new(bar_index, high, text = w, style = label.style_label_down,
+             color = color.new(color.red, 15), textcolor = color.white, size = size.normal)
+
+// ============================================================================
+//  END OF ZoneEngineV2 Visual Harness
+// ============================================================================
