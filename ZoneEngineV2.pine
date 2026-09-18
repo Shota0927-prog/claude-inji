@@ -319,6 +319,19 @@ f_sharedSorted(array<int> a, array<int> b) =>
             j := j + 1
     cnt
 
+//  ソート済み float 配列で v 以上になる最初の index (lower_bound)。
+//  存在しなければ size を返す。値の比較そのものは変えない (範囲の入口を決めるだけ)。
+f_lowerBoundFloat(array<float> a, float v) =>
+    int lo = 0
+    int hi = array.size(a)
+    while lo < hi
+        int mid = int(math.floor((lo + hi) / 2))
+        if array.get(a, mid) < v
+            lo := mid + 1
+        else
+            hi := mid
+    lo
+
 f_containsSorted(array<int> a, int v) =>
     bool found = false
     int lo = 0
@@ -956,6 +969,13 @@ export type ZoneEngine
     array<int>      catAccum
     array<int>      catFvg
     array<int>      catTime
+    //  ★ Phase7 : FVG x Candidate の価格帯索引。
+    //    fvcBot : Side の Candidate の「索引作成時点の bottom」昇順
+    //    fvcOrd : 同じ並びの Candidate index
+    //    fvcHit : 帯に入った Candidate index (最後に昇順へ並べ直して元の順序で処理する)
+    array<float>    fvcBot
+    array<int>      fvcOrd
+    array<int>      fvcHit
     //  ★ Phase5 : dense 探索の事前境界 (1 足 1 Side に 1 回だけ作る。既定経路でも使う)
     //    dsHardEnd[a]  : a の走査が確実に読まなくなる index (真の読み範囲の superset)
     //    dsMaxCatCnt[a]: [a, dsHardEnd[a]) の category 数 (used を無視した上限)
@@ -1142,6 +1162,9 @@ export newEngine() =>
          catAccum    = array.new_int(),
          catFvg      = array.new_int(),
          catTime     = array.new_int(),
+         fvcBot      = array.new_float(),
+         fvcOrd      = array.new_int(),
+         fvcHit      = array.new_int(),
          dsHardEnd   = array.new_int(),
          dsMaxCatCnt = array.new_int(),
          dsFound     = array.new_bool(),
@@ -3697,6 +3720,48 @@ f_materializeAttach(ZoneEngine e, ZoneCfg c, int side, ZoneCand base, int fid,
     array.push(e.scIdTmp, fid)
     f_buildCand(e, c, side, e.scIdTmp, fb, ft, false, proximal)
 
+//  ★ Phase7 : FVG x Candidate の価格帯索引 (attach 判定の superset を作る)
+//
+//  attach が成立するのは `inside or proximal` のときだけで、これは
+//      cd.top    >= r.nativeBottom - denseWidth  (tick 許容 1 tick)
+//      cd.bottom <= r.nativeTop    + denseWidth  (同)
+//  を必ず満たす。さらに attach 対象の Candidate は `not cd.isBroadContext` なので
+//  幅は必ず clusterMaxWidth 以下 (W と書く)。よって live な bottom は
+//      r.nativeBottom - denseWidth - W - tol  <=  bottom  <=  r.nativeTop + denseWidth + tol
+//  の帯に必ず入る。
+//
+//  索引の key は「索引作成時点の bottom」で固定する (足の途中で作り直さない)。
+//  attach による差し替えは fb = min(cd.bottom, pedge) なので bottom は減る一方で、
+//  かつ差し替え後も okWidth (幅 <= W) を満たすので
+//      live <= key      かつ      key <= live + W
+//  が常に成り立つ。したがって key に対する帯を両側へ W だけ広げれば superset になる。
+//
+//  帯に入った Candidate は最後に **元の Candidate index 昇順** へ並べ直してから
+//  従来どおりの判定にかけるので、first-wins と f_candBetter の tie-break は不変。
+//  (int の昇順は全順序なので、ここでの array.sort は Snapshot の特殊比較とは無関係)
+f_buildFvgCandBand(ZoneEngine e, array<ZoneCand> cands) =>
+    int cn = array.size(cands)
+    array.clear(e.fvcBot)
+    array.clear(e.fvcOrd)
+    bool ok = cn > 0
+    if cn > 0
+        for ci = 0 to cn - 1
+            float b = array.get(cands, ci).bottom
+            if na(b)
+                ok := false
+            array.push(e.fvcBot, b)
+    if ok
+        array<int> ord = array.sort_indices(e.fvcBot, order.ascending)
+        for q = 0 to cn - 1
+            array.push(e.fvcOrd, array.get(ord, q))
+        //  値そのものは昇順に並べ直す。同値の並び順が sort と sort_indices で違っても、
+        //  同値なので帯に入る集合は変わらない (集合内の順序は後で index 昇順に直す)。
+        array.sort(e.fvcBot, order.ascending)
+    else
+        array.clear(e.fvcBot)
+        array.clear(e.fvcOrd)
+    ok
+
 f_fvgAttachAndStandalone(ZoneEngine e, ZoneCfg c, int side, float refClose, array<ZoneCand> cands) =>
     f_collectFvgRoots(e, c, side, refClose, e.scFvgIds)
     array.clear(e.scStandIds)
@@ -3707,6 +3772,9 @@ f_fvgAttachAndStandalone(ZoneEngine e, ZoneCfg c, int side, float refClose, arra
     f_resetCand(scTrial)
     f_resetCand(scBest)
     int fn = array.size(e.scFvgIds)
+    //  ★ Phase7 : 価格帯索引は 1 Side 1 回だけ作る (fid ごとに作り直さない)
+    bool  bandOk = f_buildFvgCandBand(e, cands)
+    float bandW  = f_denseWidth(c) + c.clusterMaxWidth + 4.0 * f_mt(c.mintick)
     if fn > 0
         for k = 0 to fn - 1
             int fid = array.get(e.scFvgIds, k)
@@ -3719,8 +3787,26 @@ f_fvgAttachAndStandalone(ZoneEngine e, ZoneCfg c, int side, float refClose, arra
                 float bestFt   = na
                 bool  bestProx = false
                 int cn = array.size(cands)
-                if cn > 0
-                    for ci = 0 to cn - 1
+                //  ★ Phase7 : 帯に入る Candidate だけを、元の index 昇順で処理する。
+                bool useBand = bandOk and cn > 0 and array.size(e.fvcBot) == cn
+                     and not na(r.nativeBottom) and not na(r.nativeTop)
+                array.clear(e.fvcHit)
+                if useBand
+                    float bLo = r.nativeBottom - bandW
+                    float bHi = r.nativeTop    + bandW
+                    int q = f_lowerBoundFloat(e.fvcBot, bLo)
+                    while q < cn and array.get(e.fvcBot, q) <= bHi
+                        array.push(e.fvcHit, array.get(e.fvcOrd, q))
+                        q := q + 1
+                    if array.size(e.fvcHit) >= cn
+                        //  帯が全体なら並べ替えを足さない (従来どおりの全走査)
+                        useBand := false
+                    else if array.size(e.fvcHit) > 1
+                        array.sort(e.fvcHit, order.ascending)
+                int loopN = useBand ? array.size(e.fvcHit) : cn
+                if loopN > 0
+                    for cq = 0 to loopN - 1
+                        int ci = useBand ? array.get(e.fvcHit, cq) : cq
                         ZoneCand cd = array.get(cands, ci)
                         if not cd.isBroadContext and not f_containsSorted(cd.rootIdsSorted, fid)
                             bool inside = f_rangesTouch(cd.bottom, cd.top, r.nativeBottom, r.nativeTop, c.mintick)
@@ -3819,8 +3905,12 @@ f_buildSideCands(ZoneEngine e, ZoneCfg c, ZoneFeed f, int side, array<ZoneCand> 
     //  ★ Phase3G : c.denseRoundCache が true のときだけラウンド間キャッシュ経路を使う。
     //    既定 (false) では f_searchDenseBest() を 12 回呼ぶ Phase 3F と完全に同じ経路。
     //    キャッシュは Side ごとに作り直す (dsValid を倒す)。
-    //  ★ Phase5 : dense 探索の事前境界を Side ごとに 1 回作る (12 ラウンドで共有)
-    f_buildDenseBounds(e, c, f_denseWidth(c))
+    //  ★ Phase7 : dense 探索の事前境界 (dsHardEnd / dsMaxCatCnt) は
+    //    snRootId / snPrice / snCat / c.mintick / maxWidth だけから決まり、
+    //    side にも scUsed にも依存しない。Snapshot は 1 足 1 回しか作られず、
+    //    Support 側の探索は Snapshot を書き換えないので、Resistance 側で
+    //    作り直しても 1 ビットも変わらない。よって f_rebuildCores() 側で
+    //    1 足 1 回だけ作り、両 Side で共有する (Phase5 は Side ごとに 2 回)。
     e.dsValid := false
     for g = 1 to 12
         bool got = c.denseRoundCache ? f_searchDenseBestCached(e, c, side, f_denseWidth(c), true)
@@ -4359,6 +4449,8 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     array<ZoneCand> sup = e.poolSup
     array<ZoneCand> res = e.poolRes
     array<CoreCand> ccs = e.poolCcs
+    //  ★ Phase7 : dense 探索の事前境界も Side に依存しないので 1 足 1 回にする。
+    f_buildDenseBounds(e, c, f_denseWidth(c))
     f_buildSideCands(e, c, f, SIDE_SUPPORT,    sup)
     f_buildSideCands(e, c, f, SIDE_RESISTANCE, res)
     f_pairSides(e, c, sup, res, ccs)

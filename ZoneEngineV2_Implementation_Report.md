@@ -1468,6 +1468,8 @@ tick 昇順の群列で、**1 件の挿入が並びを動かすのは自分と�
 | `array.insert` | 3 | 4 | **3** (同 tick 群内のみ) |
 | `array.size(e.roots)` (全件走査の目安) | 21 | 21 | **14** |
 | 毎足全 Root 走査する関数 | 6 | 6 | **3** (`f_buildPointSnapshot` / `f_syncPsychRoots` / `f_updateTimeHlRoots`) |
+| `f_buildDenseBounds()` の呼び出し | 2 / 足 (Side ごと) | 2 / 足 | **1 / 足** (両 Side 共有) |
+| FVG attach の Candidate 走査 | 全件 (`O(fvg · cand)`) | 全件 | **帯のみ** (`O(fvg · log cand + Σ hits)`) |
 | `f_rootIdxById` | 38 | 25 | 33 |
 | Snapshot 構築 | `O(R²)` | `O(R²)` (比較回数のみ減) | **`O(R log R + Σ g²)`** |
 
@@ -1483,13 +1485,13 @@ tick 昇順の群列で、**1 件の挿入が並びを動かすのは自分と�
 | `f_searchDenseBest()` a×b | `12 · O(n · k)` | 探索する窓の集合を減らせば結果が変わる。Phase 5 の事前除外 (BaseStrong 不可能な a) と Phase 3G (ラウンド間キャッシュ) が、結果を変えずに削れる限度 |
 | `f_rebuildCores()` Pass 1 | `O(nc · nk)` | Pass 1 は全ペアの `gap` を知らないと argmax が決まらない。価格帯索引で絞るには Core を範囲でソートした構造が必要だが、Pass 3/4 が Core の範囲を書き換えるためその構造を Pass を越えて保てない |
 | `f_rebuildCores()` Pass 4 親探し | `O(nk · nc)` → キャッシュヒット時は `O(1)` / ペア | Phase 7 でキャッシュ済み。書き換わった Core だけ再計算 |
-| `f_fvgAttachAndStandalone()` | `O(fvg · cand)` | 下記 |
+| `f_fvgAttachAndStandalone()` | `O(fvg · log cand + Σ hits)` | Phase 7 で価格帯索引を実装。残るのは帯に入った Candidate の従来判定そのもの (これを減らすと結果が変わる) |
 | `f_pairSides()` | `O(sup · res)` | Support 候補ごとに「最もよく一致する Resistance 候補」を選ぶ argmax なので、全ペアの判定が必要。gap 先判定と two-pointer で定数倍は落としてある |
 | `f_qualityFvgWith` / `f_qualityAccum` の a×b | `O(ids²)` | 「異なる時間足の別 Box 境界が同じ core にいるか」は全ペア判定。ids は Candidate 1 件分 (数件〜数十件) |
 
-#### FVG × Candidate について (「効果が小さい」ではない理由)
+#### FVG × Candidate (Phase 7 で実装) の同値性
 
-実装は可能で、同値性の根拠も確定している :
+同値性の根拠 :
 attach が成立するのは `inside or proximal` 、つまり Candidate の範囲が FVG の NativeRange から
 `denseWidth` 以内にある場合だけ。attach 対象の Candidate は `isBroadContext` でないので
 幅は `clusterMaxWidth` 以下。よって Candidate を `bottom` でソートしておけば、
@@ -1497,9 +1499,81 @@ attach が成立するのは `inside or proximal` 、つまり Candidate の範�
 その帯を元の Candidate index 昇順に並び直して従来の判定をかければ厳密に同値。
 期待効果はこのループで約 4 倍 (fvg 120 × cand 40 の場合)。
 
-**今回入れていない理由は「本ラウンドですでに未検証の同値変更を 5 件積んでいる」こと**。
-6 件目を同時に入れると、A/B で差分が出たときに原因を切り分けられなくなる。
-A/B で今回分の全一致を確認したら、これを単独で入れる。
+索引の key は「索引作成時点の bottom」で固定する。attach による差し替えは
+`fb = math.min(cd.bottom, pedge)` なので bottom は減る一方で、かつ差し替え後も
+`okWidth` (幅 <= `clusterMaxWidth` = W) を満たすので、常に
+
+    live <= key      かつ      key <= live + W        (key <= live_top <= live + W)
+
+が成り立つ。よって key に対する帯を両側へ W だけ広げれば live な bottom の
+必要条件をすべて含む superset になり、足の途中で索引を作り直す必要がない。
+`isBroadContext` の Candidate は幅が W を超え得るが、従来の判定でも最初に
+`not cd.isBroadContext` で落ちるので、帯に入るかどうかは結果に影響しない。
+
+処理順は帯の中を **元の Candidate index 昇順**へ並べ直してから回すので、
+`bestIdx < 0` の first-wins と `f_candBetter()` の tie-break は不変。
+Broad FVG の `array.set(cands, ci, ...)` の適用順も index 昇順で変わらない。
+(ここで使う `array.sort` は int の昇順 = 全順序であり、Snapshot の非推移的
+比較順の代用ではない)
+
+`r.nativeBottom` / `r.nativeTop` が `na` のときは帯を使わず従来の全走査に落とす
+(従来もその FVG は 1 件も通らないので結果は同じ)。
+
+### 5. 指示 4 (毎バーの Core 再構築) — 副項目ごとの判定
+
+`f_rebuildCores()` 全体スキップはしていない。指定された 6 つの副項目を個別に判定した。
+
+| 副項目 | 分類 | 内容 / 根拠 |
+|---|---|---|
+| 静的 Root メタデータの再利用 | **実装済み** | Root は永続 UDT で、`category` / `tf` / `direction` / `nativeTop` / `nativeBottom` / `rootId` / `firstConfirmTime` は `f_pushRoot()` の 1 回しか書かない。毎足 再導出している箇所は監査上 0 件 |
+| EMA 2 本だけの価格更新 | **実装済み** | `f_upsertMa()` は `rootIdx` 経由で該当 2 件だけを引き、`pointPrice` / `confirmedTime` を書く。EMA のために全 Root を走る処理はない |
+| Snapshot の全フィールド再コピー削減 | **変更不要** | 11 本の並行配列は 1 足 **1 回** 作られ、dense 12 ラウンド × 2 Side + sweep + pair から **`O(n·k)` 回読まれる**。コピーを止めて `snRootId` だけ持ち `rootIdx` + field 参照に変えると、削るのは 1 足 1 回の `O(R)` で、増やすのは最内ループの map 引き。つまり平坦配列化そのものが hot loop を安くしている構造なので、コピー削減はコストを hot 側へ移す変更になる (「効果が小さい」ではなく、方向が逆) |
+| Snapshot の**増分**更新 (EMA の移動分だけ差し替え) | **結果同値を保証できないため未変更** | 同 tick 群内の挿入条件 `pr < pk or (eqT and rid < ik)` は非推移的なので、**群から 1 要素を抜くと残りの相対順が変わり得る**。反例 : A, B, C をこの順に挿入し、C の述語が A に対して真・B に対して偽のとき順は `C, A, B` (C は B より前)。A が無い場合は `B, C` (C は B より後)。したがって「EMA Root を抜いて入れ直す」だけでは V3 と同じ配列を再現できない |
+| 変化しないカテゴリ品質結果の再利用 (足内) | **実装済み** | 品質 (`f_qualityMa/Swing/Accum/TimeHl/Fvg`) は探索中には一切呼ばれず、確定した Candidate の保存時に 1 回だけ計算する (Phase 3A/3B)。同一 ids に対する足内の重複計算は 0 |
+| 変化しないカテゴリ品質結果の再利用 (足をまたぐ) | **結果同値を保証できないため未変更** | cross-bar キャッシュの key には、品質関数が読む可変フィールドを全部入れる必要がある : MA Root の `pointPrice` (毎足変化) と、FVG Root の Fresh / Inverse / Broad フラグ (指示 9 で毎足更新が必須)。ids に MA か FVG が 1 件でも入ると key が毎足変わるため、成立する窓が「MA も FVG も含まない窓」に限定され、しかもその判定自体に全 Root 分の dirty stamp 管理が必要になる。同値を保証できる形にできていない |
+| Support / Resistance 共有値の再利用 | **実装済み (Phase 7 で追加)** | Phase 5 では `f_buildDenseBounds()` を Side ごとに 2 回呼んでいた。これは `snRootId` / `snPrice` / `snCat` / `c.mintick` / `maxWidth` だけの関数で、`side` も `scUsed` も読まない。Snapshot は 1 足 1 回しか作られず Support 側の探索も書き換えないので、**1 足 1 回に括り出して両 Side で共有**した。出力は 1 ビットも変わらない |
+| Pass ごとの比較結果キャッシュ | **実装済み** | 上の `ccGap` / `ccSh` + `coreTouched`。Pass 1 で保存し、Pass 4 の親探しで未書き換え Core だけ再利用 |
+
+### 6. 20 項目の再確認 (Phase 7 時点)
+
+分類は指定の 3 つだけ。Phase 6 の表で「一部実装済み」としていたものは、Phase 7 の
+実装で片付いた分を **実装済み** に、残した分の理由を分けて書き直した。
+
+| # | 項目 | 分類 (Phase 6 → Phase 7) | Phase 7 での状態 |
+|---|---|---|---|
+| 1 | `f_rebuildCores()` 毎バー廃止 + Topology dirty | 未変更 → **結果同値を保証できないため未変更** | 全体スキップは不可 (EMA が毎足 `pointPrice` / `confirmedTime` を動かし、それが窓判定・並び・range・Density・`f_qualityMa`・`firstConfirmTime` の直接入力)。代わりに上記 §5 の 8 副項目を個別に処置した |
+| 2 | Snapshot の挿入順キャッシュ | 一部 → **実装済み** (キャッシュ本体は結果同値を保証できないため未変更) | 指定の 2 段構造を実装。`O(R log R + Σg²)`。キャッシュ (足をまたぐ再利用) は §5 の非推移性の反例により不可 |
+| 3 | Root ID / category / TF / direction / state / FVG / Core membership の索引化 | 一部 → **実装済み** | `rootIdx` / `originKeyMap` / `psychKeyMap` / `pairTokenMap` / `fvIdx` に加え、Phase 7 で **category 別永続一覧** (`catSwing` / `catAccum` / `catFvg` / `catTime`) を追加。毎足全 Root 走査は 6 → **3** |
+| 4 | Hot loop の `f_rootIdxById()` を事前 index へ | 実装済み | 維持 (`e.scIdxOfIds`)。深度 2 の箇所は **2 件**。総数 33 は category 一覧が rootId 持ちのため増えたもので、1 件は map 引き `O(1)` (削減とは書かない) |
+| 5 | Hot loop の `array.includes()` を mask / map / ソート済みへ | 実装済み | 13 → **5 件**。クラスタリングと Core マッチングの hot path は 0 件 |
+| 6 | Candidate の品質・identity・median・range を 1 回計算し共有 | 実装済み | 維持 |
+| 7 | Dense / Sweep / Support / Resistance で Snapshot 共有 | 実装済み | 維持 + Phase 7 で `dsHardEnd` / `dsMaxCatCnt` も 1 足 1 回の共有に |
+| 8 | FVG×Candidate を事前索引で絞る | 変更不要 → **実装済み** | `f_buildFvgCandBand()` で Candidate を bottom 昇順に索引化し (1 Side 1 回)、FVG ごとに `[nativeBottom - bandW, nativeTop + bandW]` (`bandW = denseWidth + clusterMaxWidth + 4 tick`) を二分探索で切り出し、**元の Candidate index 昇順へ並べ直して**従来の判定にかける。帯が全 Candidate になる場合は並べ替えを足さず従来どおりの全走査に落とす |
+| 9 | Core×Candidate の比較値を全 Pass で共有 | 未変更 → **実装済み (Pass 1 → Pass 4、無効化付き)** | `ccGap` / `ccSh` を Pass 1 で保持、`coreTouched[ci]` が立った Core だけ再計算。Pass 3 の merge / Pass 4 の apply が書き換えた瞬間にフラグを立てるので、古い値を読むことはない |
+| 10 | Merge / Split / primary Core 選択の統合 | 実装済み | 維持 (Pass 2 一本化 `O(cores)`) |
+| 11 | waiting / live / mustKeep の Root 状態キャッシュ | 変更不要 → **実装済み** | `f_buildEssentialSet()` を `f_pruneRoots()` 先頭で 1 回。`f_rootEssential()` は map 引きのみ (旧 : Core × 6 配列の `array.includes`) |
+| 12 | FVG Structural / Fresh / Inverse の索引化 | 変更不要 → **実装済み** | 3 つとも `e.catFvg` だけを走る。`f_buildFvgIndex()` も同じ |
+| 13 | Swing / Accum / TimeHL / Psych の検索索引化 | 一部 → **実装済み** | `f_registerSwing()` の同価格探しは `catSwing` のみ、件数系は `catAccum` / `catTime` のみ。Psych は `psychKeyMap` |
+| 14 | Retired / cap / prune / Pending を dirty 時だけ | 実装済み | 維持 |
+| 15 | Source helper の再利用 | 実装済み (+ 変更不要) | 維持。Pack は `request.security` の別評価コンテキストなので Engine scratch は共有不可 (Pine の構造上) |
+| 16 | `request.security` の統合 | 実装済み | 6 call / `time(tf)` 5 本 / tuple 要素 104 |
+| 17 | Candidate / CoreCand / 一時配列の pool 化 | 実装済み | 定常状態で `ZoneCand.new` / `CoreCand.new` は 0、nested loop 内の `array.new` / `array.copy` は 0 |
+| 18 | 過去足の View / Event / 描画生成の停止 | 実装済み | `updateVisualLite(buildProjection, captureEvents)` |
+| 19 | Visual Harness を Engine 1 つの standalone に | 実装済み | Parity Harness 削除済み。FULL / SAFE とも import 1 行 |
+| 20 | 全 hot spot の監査 | 実装済み | `tools/audit_hotspots.py` + **`tools/check_pine.py`** (関数スコープ未定義変数検査) |
+
+### 7. Phase 7 の完了条件に対する自己申告
+
+| 条件 | 状態 |
+|---|---|
+| Pine コンパイルエラー 0 件 | **静的検査では 0 件** (括弧・文字列・継続行インデント・未定義変数)。TradingView 上でのコンパイルは未実施 (私は TradingView にアクセスできない) |
+| 未定義変数 0 件 | `tools/check_pine.py` で 3 ファイルすべて 0 件。バグを戻すと 5 箇所検出することで回帰確認済み |
+| 20 項目すべて再確認 | 上記 §6 |
+| 「効果が小さい」を未変更理由にしない | 20 項目のうち未変更は **3 件** で、理由は (a) EMA が毎足 `pointPrice` / `confirmedTime` (窓判定・並び・range・Density・`f_qualityMa`・`firstConfirmTime` の直接入力) を書き換える、(b) 同 tick 群挿入の非推移性による反例 (`C,A,B` → `B,C` の順序反転)、(c) cross-bar キャッシュ key に毎足変化するフィールド (MA の `pointPrice`、FVG の Fresh/Inverse/Broad) が入る — いずれも構造的不可能性。Phase 6 で「変更不要」としていた 5 件 (項目 8 / 9 / 11 / 12 / 13) はすべて実装に置き換えた |
+| 残した Hot loop の根拠 | §「残っている Hot loop」の表 |
+| Snapshot の計算量説明の訂正 | `O(R²)` → **`O(R log R + Σg²)`** と、Phase 6 の記述が「位置検索の比較回数削減」に過ぎなかったことを明記 |
+| **RE10110 解消** | **未確認**。Publish・コンパイル・実行・Profiler 計測をいずれも行えていないため、RE10110 が消えたかどうかは検証できていない |
+| Root index 共有 / Core Pass 2 一本化の維持 | 両方維持 (`e.scIdxOfIds` / Pass 2 の `O(cores)` 一周)。ただし `f_catPricesMedianSc()` では `scIdxOfIds` を使わない (別 Candidate に上書きされる scratch のため) |
 
 ## Known limitations
 
