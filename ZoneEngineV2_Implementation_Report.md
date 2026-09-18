@@ -485,15 +485,88 @@ Engine 内部のクラスタリング (`f_buildSideCands` -> `f_pickBestWindow` 
 重複計算と一時配列生成であり、そこは Phase 3 の対象。Phase 2 が主に効くのは
 リアルタイムの毎ティック描画コストと、1 足あたりの UDT / 配列生成コスト。
 
-### Phase 3 : Engine 内部の安全な軽量化 (未着手)
+### Phase 3A : Engine 内部の安全な軽量化 (実装済み)
 
-指示どおり Phase 2 のコンパイルと同値確認の後に着手する。予定内容 (すべて結果不変):
-`f_reindexRoots()` を dirty フラグ化 / `validateCfg()` を初回・値変化時のみ /
-Candidate 作成時に identity Root 一覧・category mask・high mask・C/H・minRootId・
-firstConfirmTime を 1 度だけ計算して保持 / `array.includes()` の入れ子をソート済み
-Root ID の two-pointer 比較へ / scratch 配列の再利用。
-Dense 候補優先・最大 12 回・使用済み Root の扱い・tie-break 順・`f_rebuildCores()` の
-実行契約は変更しない。
+比較基準は公開済み **Version 2** (`sekine3310/ZoneEngineV2/2`)。Version 2 は A/B 比較用に残し、
+本リポジトリの `ZoneEngineV2.pine` を新バージョンとして Publish する。
+
+| # | 変更 | 分類 |
+|---|---|---|
+| 3A-1 | `ZoneEngine.rootIdxDirty` (初期値 true) を追加。`e.roots` の追加・削除は `f_pushRoot()` / `f_removeRootAt()` の 2 関数だけを通し、そこでだけ dirty を立てる。`f_reindexRoots()` は dirty が false なら map の clear / 再構築をせず終了し、再構築後に false へ戻す | 探索高速化 |
+| 3A-2 | `validateCfg()` を最初の `update()` だけで実行 (`cfgValidated`)。Feed 有効性 / duplicate bar / baseConfirmed / mintick 反映 / configValid・configError の保持は毎足のまま | 探索高速化 |
+| 3A-3 | 内部型 `ZoneCand` の `array<bool> catUsed` / `catHigh` を `int catMask` / `int highMask` へ。C・H は mask から 1 度だけ数え、`f_applyCandToView()` は再ループせず計算済みの mask / C / H をそのまま渡す | allocation 削減 |
+| 3A-4 | `f_pickBestWindow()` の部分窓ごとの `ZoneCand` 生成・`rootIds` コピー・カテゴリ配列生成を廃止。評価は使い回しの scratch Candidate (`f_fillCandFrom()`) で行い、best 更新時だけ `f_cloneCand()` で deep copy する | allocation 削減 |
+| 3A-5 | `f_pickBestWindow()` の `cur`、通常候補スイープの `cur` / `curIdx` を関数内で 1 本だけ作り、各反復の先頭で `array.clear()` して再利用 | allocation 削減 |
+| 3A-6 | Candidate 生成時に identity Root ID 一覧 (`ZoneCand.identityIds`) を 1 度だけ作り、`f_pairSides()` は Support × Resistance の組み合わせごとに作り直さず再利用する | allocation 削減 |
+
+#### `e.roots` を構造変更する箇所と dirty 設定
+
+追加 7 / 削除 3 = 10 箇所。すべて `f_pushRoot()` / `f_removeRootAt()` 経由へ変更し、
+生の `array.push(e.roots, ...)` / `array.remove(e.roots, ...)` はこの 2 関数の中だけに残した。
+
+| 関数 | 操作 |
+|---|---|
+| `f_upsertMa()` | push (EMA Root 新規作成) |
+| `f_registerSwing()` | push |
+| `f_updateAccumRoots()` | push × 2 (Box 上限 / 下限) |
+| `f_registerFvgOne()` | push |
+| `f_acquireTimeRoot()` | push |
+| `f_syncPsychRoots()` | push |
+| `f_removeRetiredRoots()` | remove |
+| `f_pruneCategoryToCap()` | remove × 2 (Accum pair 一括 / 単体) |
+
+`array.insert` / `array.shift` / `array.pop` / `array.clear` / sort は `e.roots` に対して 1 箇所も存在しない
+(全文検索で確認)。Root オブジェクト内部の価格・state・labelMask・fvgFresh の変更では dirty を立てない
+(配列 index が動かないため)。`f_rootIdxById()` の ID 照合と線形探索フォールバックはそのまま残してあるので、
+万一 map が古くても返る index は常に正しい。
+
+#### Candidate 評価中に削減した allocation
+
+| 箇所 | Version 2 | Phase 3A |
+|---|---|---|
+| Dense 探索の 1 部分窓ごと | `ZoneCand` 1 + `array.copy(rootIds)` 1 + `array.new_bool(6)` 2 = 4 オブジェクト | 0 (scratch を上書き) |
+| Dense 探索の窓の開始ごと | `array.new_int()` (cur) | 0 (呼び出し内で 1 本を clear 再利用) |
+| best 更新時 | 0 (参照代入) | `f_cloneCand()` 1 回 (rootIds / identityIds を deep copy) |
+| 通常候補スイープ 1 クラスタごと | `cur` / `curIdx` 2 本 | 0 (1 組を clear 再利用) |
+| `f_pairSides()` の Support × Resistance 組み合わせごと | `array.new_int()` + `f_identityIds()` | 0 (Candidate の identityIds を参照) |
+| `f_pairSides()` の CoreCand ごと | `f_identityIds()` 2 回ぶんの再計算 | 0 (キャッシュ済み ID を push するだけ) |
+| すべての `ZoneCand` | bool 配列 2 本 | 0 (int mask) |
+
+#### deep copy した所有境界
+
+- `f_buildCand()` : `rootIds = array.copy(ids)` / `identityIds` は新規配列。保存用 Candidate は必ず自分の配列を所有する。
+- `f_cloneCand()` : `rootIds = array.copy(ids)` (scratch の配列は使わない) / `identityIds` も新規作成。
+  clone 後に scratch や `cur` を clear しても保存済み Candidate は一切変化しない。
+- scratch Candidate の `rootIds` / `identityIds` は空のまま一度も読まれない (`f_candBetter()` はスカラーのみ比較)。
+- `f_applyCandToView()` : `v.rootIds := array.copy(cd.rootIds)`。
+- `f_pairSides()` : `cc.originRootIds` は新規配列に identityIds の「値」を push (参照共有しない)。
+- Engine のフィールドへ scratch 配列を保存して足をまたいで共有する処理は入れていない。
+
+#### Version 2 から処理順・tie-break を変更していないこと
+
+- `f_candBetter()` (C 降順 -> H 降順 -> 幅昇順 -> 成立時刻昇順 -> 最小 Root ID 昇順) は 1 文字も変更なし。
+- Dense 候補探索の最大 12 回、`requireStrong`、`continue` / `break`、Accum pair conflict の位置と条件は不変。
+- 通常候補スイープの走査順、使用済み Root の marking、FVG attach / standalone の順序は不変。
+- `f_pairSides()` の Support 走査順・Resistance 選択条件 (shAll / gap / near) と `originRootIds` の並び順は不変。
+- `f_identityIds()` の中身 (Broad FVG 除外規則と、Broad のみの場合のフォールバック) は不変。
+  評価タイミングだけが「pairing 時」から「Candidate 確定時」へ移ったが、`isBroadFvg` は Root 生成時に確定して
+  以後変化せず、Root の削除は `update()` の末尾でしか起きないため、同じバー内では同じ結果になる。
+
+#### Zone ロジックを変更していないこと
+
+Root の生成・更新・失効条件、クラスタリング、Dense 判定、C / H / Density / BaseStrong / Grade、
+Support・Resistance の参加方向、FVG の方向・Fresh・Inverse、Touch / Weak / Break / Flip / Reclaim、
+Merge / Split / Core ID / Generation ID、`request.security` の内容、履歴期間、`dormantDistance`、
+各保存上限、有効カテゴリは 1 つも変更していない。`calc_bars_count` は本番コードに無い。
+
+#### Phase 3A で意図的に未実装とした最適化
+
+- `array.includes()` -> two-pointer 比較 (rootIds / originRootIds が Root ID 昇順でないため、
+  Phase 3B で「比較専用のソート済みコピー」を別に作る形で検討する)
+- 既存配列の sort、Root 順 / Core 順の変更
+- Candidate 探索の省略、近似計算、キャッシュ結果の足またぎ利用
+- `f_fvgAttachAndStandalone()` の attach 試行 Candidate の削減
+- `f_rebuildCores()` のスキップや dirty 化
 
 ### 同値検証 (未実施)
 
