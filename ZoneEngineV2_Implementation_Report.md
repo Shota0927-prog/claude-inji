@@ -24,10 +24,10 @@
 - リポジトリ内の既存ファイル `indicator.pine` (無関係のテンプレート) も変更していない。
 - v2 は新しい Library 名 (`ZoneEngineV2`) で、旧 Library を import している既存スクリプトへ影響しない。
 
-Harness の import 行は現在 `import sekine3310/ZoneEngineV2/3 as zn2`。
-`3` = Phase 3A までを反映して公開済みの Version 3。
-Phase 3B/3C 版を Publish したら、TradingView が発行した実番号へこの 1 行だけを上げること
-(番号は推測していない)。新 API を使うため `/3` のままだとコンパイルできない。
+Harness の import 行は `import sekine3310/ZoneEngineV2/4 as zn2`。
+直前の公開が `/3` (Phase 3A) だったので連番として `/4` を入れているが、
+**Publish 直後に TradingView が実際に発行した番号を確認して、違っていたら直すこと**。
+profiler コピーと Parity Harness の vB も同じ番号へ揃える。
 
 ---
 
@@ -199,7 +199,9 @@ View は該当する Zone を全件返し、距離や Grade で 1 件へ絞ら�
 
 ## Storage and request usage
 
-### request.security (Harness / 合計 6 call ← 旧 10 call)
+### request.security (Harness / 既定 6 call ← 旧 10 call)
+
+既定設定 (MA 1 / Swing 5、15、60 / Accum 60、240、D / FVG 60、240、D)
 
 | 用途 | 時間足 | call 数 | lookahead |
 |---|---|---:|---|
@@ -210,21 +212,51 @@ View は該当する Zone を全件返し、距離や Grade で 1 件へ絞ら�
 | Accum #2 + FVG #2 (`accumFvgPackV2`) | 4時間 | 1 | off |
 | Accum #3 + FVG #3 (`accumFvgPackV2`) | 日足 | 1 | off |
 | Base 5分 | (チャート足 built-in) | 0 | - |
+| **合計** | | **6** (旧 10) | |
+
+グループごとの場合分け (時間足設定の自由度は落とさない)
+
+| グループ | 時間足の一致状態 | 呼ぶ Pack | request.security | time(tf) |
+|---|---|---|---:|---:|
+| Group 60 | Swing#3 = Accum#1 = FVG#1 | `swingAccumFvgPackV2` | 1 | 1 |
+| Group 60 | Accum#1 = FVG#1 のみ | `accumFvgPackV2` + `pivotPackV2` | 2 | 2 |
+| Group 60 | 不一致 | `pivotPackV2` + `accumPackV2` + `fvgPackV2` | 3 | 3 |
+| Group 240 | Accum#2 = FVG#2 | `accumFvgPackV2` | 1 | 1 |
+| Group 240 | 不一致 | `accumPackV2` + `fvgPackV2` | 2 | 2 |
+| Group D | Accum#3 = FVG#3 | `accumFvgPackV2` | 1 | 1 |
+| Group D | 不一致 | `accumPackV2` + `fvgPackV2` | 2 | 2 |
+
+これに MA 1 本と Swing #1 / #2 の 2 本 (time も 2 本) が常に加わるので、
+
+| 時間足パターン | request.security | time(tf) |
+|---|---:|---:|
+| 全グループで完全一致 (既定設定) | **6** | **5** |
+| Group 60 が Accum+FVG のみ一致、240 / D は一致 | 7 | 6 |
+| Group 60 不一致、240 / D は一致 | 8 | 7 |
+| Group 60 不一致、240 不一致、D 一致 | 9 | 8 |
+| 全グループ不一致 (最悪) | **10** (= 旧と同じ) | **9** (= 旧と同じ) |
 
 - `swingAccumFvgPackV2()` / `accumFvgPackV2()` は既存の `pivotPackV2()` /
   `accumPackV2()` / `fvgPackV2()` をそのまま呼んで戻り値を連結するだけで、
   計算内容も順序も個別に呼んだときと完全に同じ。
 - まとめる条件は「時間足文字列が完全に一致すること」。
   `timeframe.in_seconds()` ではなく文字列で見ているのは、"1440" と "D" が
-  秒数では同じでも足の区切り方が違うから。1 つでも違えばそのグループだけが
-  従来どおり 2、3 本の個別 request へ自動で戻る (値はどちらでも同じ)。
-- `time(tf)` の要求も 9 本 → 5 本。まとめられたグループは同じ `time()` 系列を共有する。
-  `ta.change()` は全て global scope で無条件に呼んでいる (履歴がすれない)。
+  秒数では同じでも足の区切り方が違うから。
+- 各グループは `if / else if / else` なので同時に成立せず、まとめたデータを
+  別 request で二重に取ることはない。
+- `time(tf)` も同じグループ内で共有する。文字列が同じなら `time()` の値も
+  必ず同じなので完全に同値。merge フラグは入力だけで決まりバーをまたいで
+  変わらないため、三項演算子の遅延評価で `time()` の履歴がすれることはない。
+  `ta.change()` は全て global scope で無条件に呼んでいる。
 - すべての pack は「完全に確定した 1 本」しか返さない (内部で index [1] 以降のみ参照)。
-- Harness は `ta.change(time(tf)) != 0` でその時間足の確定を検出し、1 回だけ Feed へ入れる。
+  Harness は `ta.change(time(tf)) != 0` でその時間足の確定を検出し、1 回だけ Feed へ入れる。
 - Library は `request.*` を 1 つも呼ばない。
+- 注意 (既存の挙動と同じ) : 別スロット同士 (例として Accum #1 と Accum #2) を
+  同じ時間足にした場合は、その 2 本は別 request のままになる。
+  これは Version 3 でも同じで、既定設定では発生しない。スロットを越えた統合は
+  組み合わせが爆発して割当先を間違えるリスクが高いため入れていない。
 - 5分 Swing だけはチャート足と同じ時間足だが、位相を他 TF と揃えるため同じ
-  `pivotPackV2` 経路を使っている (直接計算への置き換えは同値を証明できないので採用しない)。
+  `pivotPackV2` 経路を使っている。
 
 ### 保存上限と診断値
 
@@ -602,14 +634,14 @@ Merge / Split / Core ID / Generation ID、`request.security` の内容、履歴�
 
 #### 2. request 呼び出し回数の変化
 
-| | Version 3 | Phase 3B/3C |
-|---|---:|---:|
-| `request.security` | 10 | **6** |
-| `time(tf)` | 9 | **5** |
-| 合計 (request 系) | 19 | **11** |
+| | Version 3 | Phase 3B/3C (既定設定) | Phase 3B/3C (全グループ不一致) |
+|---|---:|---:|---:|
+| `request.security` | 10 | **6** | 10 |
+| `time(tf)` | 9 | **5** | 9 |
+| 合計 (request 系) | 19 | **11** | 19 |
 
-内訳は上の "request.security (Harness)" 節の表。時間足を別々のものへ変えた場合は
-そのグループだけが自動で旧構成 (最大 10 call / 9 time) へ戻る。
+時間足を別のものへ変えても動作は変わらず、そのグループだけが自動で旧構成へ戻る。
+グループ別の場合分けは上の "request.security (Harness)" 節の表。
 
 #### 3. Dense 探索の計算量 (before / after)
 
@@ -804,11 +836,12 @@ snapshot 配列 (`snRootId` / `snPrice` / `snCat` / `snTf` / `snDir` / `snPair` 
 `ZoneEngineV2_VisualHarness.pine` の次の 1 行だけ。
 
 ```
-import sekine3310/ZoneEngineV2/3 as zn2          // ← ★ Publish 後に番号を上げる
+import sekine3310/ZoneEngineV2/4 as zn2          // ← ★ Publish 後の実番号を確認すること
 ```
 
-- 現在の `3` は「Phase 3A までを反映して公開済みの Version 3」。
-- 今回の Library を Publishしたら、TradingView が発行した実番号へ上げること。番号は推測していない。
+- 直前の公開が `/3` (Phase 3A) だったので、連番として `/4` を入れている。
+- ★ `/4` は仮の値。Publish 直後に TradingView が実際に発行した番号を見て、
+  違っていたらこの 1 行を直すこと。
 - 今回は新 API (`swingAccumFvgPackV2` / `accumFvgPackV2`) を使うため、`/3` のままだと
   関数が見つからずコンパイルできない。
 - `profiler/ZoneEngineV2_VisualHarness_Profiler.pine` と
