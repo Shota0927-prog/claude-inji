@@ -153,6 +153,61 @@ def check(path):
         if pc.endswith((',', '(', '[', '+', '-', '*', '/', '?', ':', '=')) or re.search(r'\b(and|or)$', pc):
             ind = len(ln) - len(ln.lstrip(' '))
             if ind % 4 == 0: problems.append((n, '-', 'continuation indent %%4==0 (%d)' % ind, ln.strip()[:60]))
+    # ---- declaration order: every f_* / UDT must be declared before first use --
+    decl_line = {}
+    for n, ln in enumerate(lines, 1):
+        m = re.match(r'^(f_\w+)\s*\(', ln)
+        if m and m.group(1) not in decl_line:
+            decl_line[m.group(1)] = n
+        m = re.match(r'^(?:export\s+)?type\s+(\w+)', ln)
+        if m and m.group(1) not in decl_line:
+            decl_line[m.group(1)] = n
+    for n, ln in enumerate(lines, 1):
+        code = ln.split('//')[0]
+        if re.match(r'^f_\w+\s*\(', code):      # the declaration line itself
+            code = code.split('=>')[0].split('(', 1)[-1]
+        for nm in set(re.findall(r'\bf_\w+\b', code)):
+            if nm in decl_line and decl_line[nm] > n:
+                problems.append((n, '-', 'used before declaration: %s (declared L%d)'
+                                 % (nm, decl_line[nm]), ln.strip()[:60]))
+        for nm in set(re.findall(r'\b([A-Z]\w*)\.new\b', code)):
+            if nm in decl_line and decl_line[nm] > n:
+                problems.append((n, '-', 'type used before declaration: %s (declared L%d)'
+                                 % (nm, decl_line[nm]), ln.strip()[:60]))
+
+    # ---- request.* tuple budget (Pine caps the script total at 127) ----------
+    # Counted over EVERY source branch, not just the executed one. A UDT return
+    # counts as 1 element; a [a, b, c] destructuring counts as its arity.
+    def owner_of(i):
+        # walk back to the statement start: a line is a continuation when the
+        # previous code line ends with '=', ',' or '(' (Pine line wrapping).
+        while i > 0:
+            prev = lines[i - 1].split('//')[0].rstrip()
+            if prev.endswith(('=', ',', '(')) and not prev.endswith('=>'):
+                i -= 1
+            else:
+                break
+        return i
+    total = 0
+    seen_owner = set()
+    for n, ln in enumerate(lines, 1):
+        code = ln.split('//')[0]
+        if 'request.security' not in code and 'request.' not in code:
+            continue
+        if 'request.' not in code:
+            continue
+        o = owner_of(n - 1)
+        if o in seen_owner:
+            continue
+        seen_owner.add(o)
+        own = lines[o].split('//')[0]
+        m = re.match(r'\s*\[([^\]]*)\]\s*=', own)
+        total += len([x for x in m.group(1).split(',') if x.strip()]) if m else 1
+    if total > 127:
+        problems.append((0, '-', 'request.* tuple elements %d > 127' % total, ''))
+    elif total:
+        print('   (info) %s : request.* tuple elements = %d / 127' % (path, total))
+
     return problems
 
 bad = 0

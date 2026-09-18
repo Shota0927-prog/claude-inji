@@ -1575,6 +1575,132 @@ Broad FVG の `array.set(cands, ci, ...)` の適用順も index 昇順で変わ�
 | **RE10110 解消** | **未確認**。Publish・コンパイル・実行・Profiler 計測をいずれも行えていないため、RE10110 が消えたかどうかは検証できていない |
 | Root index 共有 / Core Pass 2 一本化の維持 | 両方維持 (`e.scIdxOfIds` / Pass 2 の `O(cores)` 一周)。ただし `f_catPricesMedianSc()` では `scIdxOfIds` を使わない (別 Candidate に上書きされる scratch のため) |
 
+## Phase 8 : 残存オーバーヘッドの削減 (必須 3 件 + 再監査分)
+
+Zone 定義・Root 参加条件・方向判定・探索回数/範囲/走査順・C/H/Density/BaseStrong/Grade・
+FVG Fresh/Inverse/attach/standalone・Touch/Weak/Break/Flip/Reclaim・Merge/Split/Core ID/
+Generation ID・tie-break/first-wins・`request.security` の意味と lookahead・履歴期間・
+保存上限・`denseRoundCache` の既定値 (OFF)・Public API は 1 つも変えていない。
+
+### 必須修正 1 : Essential Set を必要な足だけ構築
+
+```pine
+bool needCapPrune = e.capDirtySwing or e.capDirtyAccum or e.capDirtyFvg or e.capDirtyTime
+if needCapPrune
+    f_buildEssentialSet(e)
+```
+
+**同値性** : `e.essIds` を読むのは `f_rootEssential()` だけ。`f_rootEssential()` を呼ぶのは
+`f_pruneCategoryToCap()` だけ。`f_pruneCategoryToCap()` を呼ぶのは `f_pruneCatIfDirty()` の
+`dirty == true` の枝だけ。よって 4 つの cap dirty が 1 つも立っていない足では
+`essIds` の中身は参照されず、prune の選択結果・削除順・削除件数は 1 件も変わらない。
+`retiredDirty` だけの足は `f_removeRetiredRoots()` が `state` しか見ないので構築しない。
+構築位置は従来どおり Root 削除より前 (`f_removeRetiredRoots()` の手前)。
+
+**削減** : 全 Core × 6 配列 (`originRootIds` / support view / resistance view /
+2 つの touchSnapshot / breakSnap) の走査が、cap dirty が立っていない足では 0 回になる。
+
+### 必須修正 2 : Accum Box 集計用 map の scratch 化
+
+`ZoneEngine` へ `map<string, bool> scAccumBoxKeys` を追加し、生成時に 1 回だけ
+`map.new<string, bool>()`。`f_countAccumBoxes()` は `map.clear(e.scAccumBoxKeys)` で再利用する。
+集計対象 (`CAT_ACCUM` かつ非 `ROOT_RETIRED`)、key (`r.pairKey`)、返却する `map.size()` は不変。
+中身は関数の外へ渡さない。
+
+**呼び出し頻度** : `f_pruneCatIfDirty(CAT_ACCUM)` から 1 回 + `f_pruneCategoryToCap()` の
+guard ループ 1 周ごとに 1 回。**これで Engine 内の `map.new` は 1 足あたり 0 件になった。**
+
+### 必須修正 3 : Root 追加時の全 reindex を廃止
+
+```pine
+int newIdx = array.size(e.roots)
+array.push(e.roots, r)
+if not e.rootIdxDirty
+    map.put(e.rootIdx, r.rootId, newIdx)
+```
+
+**同値性** : `e.roots` 末尾への append では既存 Root の index が 1 つも動かない。
+したがって dirty でない (= map が完全に正しい) 状態から 1 件足しても map は正しいまま。
+すでに dirty だった場合は `true` のまま維持し、次の `f_reindexRoots()` に再構築させる
+(古い map を部分更新して「一見きれい」な状態にはしない)。
+index がずれる `f_removeRootAt()` は従来どおり `rootIdxDirty := true`。
+`f_rootIdxById()` の Root ID 照合と線形探索フォールバックは残してある。
+rootId は単調増加の一意値なので、append で既存 key を上書きすることはない。
+
+**削減** : Root が 1 件増えるたびに走っていた `f_reindexRoots()` の
+`map.clear` + 全 Root ループ `O(R)` が、append 経路では `map.put` 1 回になる。
+心理価格 Root が毎足生成される構成では、この全走査が毎足発生していた。
+
+### 再監査で同じコミットに入れた分
+
+| 対象 | 変更 | 同値性の根拠 |
+|---|---|---|
+| `f_updateTimeHlRoots()` の `useTimeHL == false` 経路 | 全 Root 走査 → `e.catTime` 走査 | 対象は `CAT_TIME_HL` のみで、`catTime` はその rootId をちょうど保持している。`f_retireRoot()` は `state` と `retiredDirty` を立てるだけなので順序に依存しない |
+| `f_pruneCategoryToCap()` の worst 探索 | 全 Root 走査 → カテゴリ別一覧の走査 | 選ぶのは (`confirmedTime` 昇順 → `rootId` 昇順) の**厳密な argmin**。`rootId` は一意なので同値になるペアが存在せず、argmin は走査順に依存せず一意に決まる。よって返す `worstIdx` が指す Root は同じ 1 件で、削除される Root も削除順も不変 |
+| 同ループ先頭の `f_reindexRoots(e)` | 追加 | 索引キャッシュの再構築のみ。`f_rootIdxById()` は ID 照合 + 線形探索フォールバックを持つので結果は不変。`f_removeRetiredRoots()` が直前に Root を消して map を dirty にした状態で、カテゴリ別一覧の引きが `O(R)` 線形フォールバックへ落ちるのを防ぐ |
+
+### 静的検査 (完了条件 4)
+
+`tools/check_pine.py` に 2 種を追加した。
+
+| 検査 | 結果 |
+|---|---|
+| 関数スコープ未定義変数 | 3 ファイル **0 件** |
+| **宣言順** (`f_*` / UDT が使用箇所より後で宣言されていないか) | 3 ファイル **0 件**。回帰確認 : `f_lowerBoundFloat` をファイル末尾へ移すと `used before declaration (declared L5530)` を検出 |
+| **`request.*` tuple 要素数** (Pine の上限 127、全分岐合計。継続行に分かれた statement の所有者を辿って数える) | FULL / SAFE とも **104 / 127** |
+| local scope / 引数照合 | 未定義変数検査に含む。回帰確認 : 旧 `idx` バグを戻すと `f_catPricesMedianSc` で検出 |
+| 括弧バランス / 行跨ぎ文字列 / 継続行インデント %4 | 3 ファイル 0 件 |
+
+### 生の `e.roots` 追加・削除 (完了条件 3)
+
+```
+1672: array.push(e.roots, r)      → f_pushRoot() の中
+1704: Root r = array.remove(...)  → f_removeRootAt() の中
+```
+
+`e.roots` に対する `push` / `remove` / `insert` / `set` / `clear` / `pop` / `shift` は
+この 2 箇所だけで、どちらも gateway の内側。gateway 外に生の追加・削除はない。
+
+### 残存 hot loop (今回変えていないもの)
+
+| 箇所 | 計算量 | 残す理由 |
+|---|---|---|
+| `f_searchDenseBest()` a×b | `12 · O(n · k)` / Side | 探索する窓の集合を減らせば結果が変わる。除外できるのは「BaseStrong になり得ない a」だけ (Phase 5 で実装済み) |
+| `f_rebuildCores()` Pass 1 | `O(nc · nk)` | 全ペアの `gap` を知らないと argmax が決まらない。価格帯で絞るには Core を範囲でソートした構造が必要だが、Pass 3/4 が Core の範囲を書き換えるため Pass を越えて保てない |
+| `f_pairSides()` | `O(sup · res)` | Support 候補ごとの argmax なので全ペア判定が必要 |
+| `f_syncPsychRoots()` の全 Root 走査 | `O(R)` / 足 | `f.baseClose` が毎足変わるため dirty で止められない。さらに `need` への push 順が新規 Psych Root の rootId を決めるので、カテゴリ別一覧に分けると **e.roots 順の interleave が崩れて rootId が変わる**。CAT_PSYCH 以外の全カテゴリを 1 本の順序で走る必要がある |
+| `f_removeRetiredRoots()` の逆順全走査 | `O(R)`、`retiredDirty` の足のみ | 対象は全カテゴリ (MA / Psych を含む) なので、どのカテゴリ別一覧でも覆えない。逆順走査は削除中の index 有効性を保つため |
+| `f_pruneCategoryToCap()` の ACCUM pairKey 一括削除 | `O(R)`、実際に削除する足のみ | 同じ `pairKey` の上下限を両方外すため逆順で全走査する。カテゴリ別一覧に置き換えると削除順と index 有効性の保証を作り直す必要があり、厳密同値を示せていない |
+| `f_qualityFvgWith` / `f_qualityAccum` の a×b | `O(ids²)` | 「別時間足の別 Box 境界が同じ core にいるか」は全ペア判定。ids は Candidate 1 件分 (数件〜数十件) |
+| `f_updateAccumRoots()` の key 文字列生成 | 3 本 / Box / 足 | `pairKey` は `map<string, bool>` の distinct 判定キーで、Root にも保存され `f_countAccumBoxes()` と ACCUM 一括削除の照合に使われる。int token へ変えると `boxId` の上限を仮定しないと単射性を示せないため、厳密同値を保証できない |
+
+### 残存 allocation (削除できないもの)
+
+| 箇所 | 頻度 | 残す理由 |
+|---|---|---|
+| `f_newCore()` の `array.copy(cc.originRootIds)` / `array.copy(...Sorted)` / `array.new<TouchMark>()` / `f_newBreakSnap()` | 新 Core 生成時のみ | 生成された `ZoneCore` が配列を**所有**する。CoreCand の scratch を共有すると次の足で上書きされるので、永続オブジェクトへの所有権移動が必須 |
+| `f_archiveCore()` の `array.copy` 2 本 + `array.new<TouchMark>()` + `f_newBreakSnap()` | Core 終了時のみ | archive は live Core と別実体でなければならない (live 側の後続変更が履歴へ漏れる) |
+| `f_acquireCoreCand()` の `CoreCand.new(array.new_int(), array.new_int())` | **プールを伸ばすときだけ** (定常状態 0) | プールの成長分。1 足あたりの新規生成は定常状態で 0 |
+| `array.sort_indices()` × 2 (`f_buildPointSnapshot` / `f_buildFvgCandBand`) | 1 足 1 回 / 1 Side 1 回 | Pine に in-place の `sort_indices` がない。独自ソートへの置換は、Snapshot の非推移的な挿入順・FVG Candidate の元 index 順・負 tick・同 tick・最大 Root 数・int overflow まで含めた厳密同値を示せていないため実施しない (`key = tick * 1000000 + 元 index` の一意性に依存している現行のままにする) |
+| `f_emit()` の Event UDT | `captureEvents` が true の足のみ | `updateVisualLite()` の `captureEvents = false` では文字列も UDT も作らない |
+| `f_buildViews()` の View / 文字列 | `buildProjection` が true の足のみ | 同上 |
+
+### 1 足あたりの allocation (Phase 8 時点)
+
+| 種別 | 件数 / 足 (定常状態) |
+|---|---:|
+| `map.new` | **0** |
+| `array.new` / `array.copy` (Core 生成・終了以外) | **0** |
+| `ZoneCand.new` / `CoreCand.new` | **0** |
+| nested loop 内の一時配列・一時 UDT・文字列 | **0** |
+| `f_reindexRoots()` の全 Root ループ (append 起因) | **0** |
+| `f_buildEssentialSet()` (cap dirty なしの足) | **0** |
+
+### RE10110
+
+**未確認。** TradingView での Publish・コンパイル・実行・Profiler 計測を行えていないため、
+RE10110 が解消したかどうかは断言できない。上記は静的検査と計算量の議論のみ。
+
 ## Known limitations
 
 - **Pine Editor でのコンパイル・実行を確認していない。** スクリプトサイズ上限、`request.security` の

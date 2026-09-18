@@ -969,6 +969,8 @@ export type ZoneEngine
     array<int>      catAccum
     array<int>      catFvg
     array<int>      catTime
+    //  ★ Phase8 : Accum Box の distinct pairKey 集計用 scratch (毎回の map.new をやめる)
+    map<string, bool> scAccumBoxKeys
     //  ★ Phase7 : FVG x Candidate の価格帯索引。
     //    fvcBot : Side の Candidate の「索引作成時点の bottom」昇順
     //    fvcOrd : 同じ並びの Candidate index
@@ -1162,6 +1164,7 @@ export newEngine() =>
          catAccum    = array.new_int(),
          catFvg      = array.new_int(),
          catTime     = array.new_int(),
+         scAccumBoxKeys = map.new<string, bool>(),
          fvcBot      = array.new_float(),
          fvcOrd      = array.new_int(),
          fvcHit      = array.new_int(),
@@ -1669,8 +1672,16 @@ f_rootIdxById(ZoneEngine e, int id) =>
 //  ★ Phase3A : e.roots の構造変更 (追加 / 削除) は必ずこの 2 つを通す。
 //    ここでしか rootIdxDirty を立てないので、立て忘れが起きない。
 f_pushRoot(ZoneEngine e, Root r) =>
+    //  ★ Phase8 : e.roots 末尾への append では既存 Root の index は 1 つも動かない。
+    //    よって「append だけ」を理由に索引を捨てる必要はなく、新しい 1 件を
+    //    map へ足せば索引は正しいままになる (f_reindexRoots の全走査を毎足やめる)。
+    //    すでに dirty なら dirty のまま維持し、次の f_reindexRoots() に再構築させる
+    //    (古い map を部分更新して「一見きれい」にしてしまわない)。
+    //    Root ID 照合と線形探索フォールバックは f_rootIdxById に残してある。
+    int newIdx = array.size(e.roots)
     array.push(e.roots, r)
-    e.rootIdxDirty := true
+    if not e.rootIdxDirty
+        map.put(e.rootIdx, r.rootId, newIdx)
     //  ★ Phase3C : originKey -> rootId 索引を同時に維持する (毎足の線形探索をなくす)
     if r.originKey != ""
         map.put(e.originKeyMap, r.originKey, r.rootId)
@@ -2083,12 +2094,16 @@ f_extremeStep(ZoneEngine e, ZoneCfg c, ZoneFeed f, int periodKind, bool isHigh, 
 
 f_updateTimeHlRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     if not c.useTimeHL
-        int n = array.size(e.roots)
+        //  ★ Phase8 : 対象は CAT_TIME_HL だけなので、カテゴリ別一覧を走る。
+        //    f_retireRoot() は state と retiredDirty を立てるだけで順序に依存しない。
+        int n = array.size(e.catTime)
         if n > 0
-            for i = 0 to n - 1
-                Root rt = array.get(e.roots, i)
-                if rt.category == CAT_TIME_HL
-                    f_retireRoot(e, rt)
+            for k = 0 to n - 1
+                int i = f_rootIdxById(e, array.get(e.catTime, k))
+                if i >= 0
+                    Root rt = array.get(e.roots, i)
+                    if rt.category == CAT_TIME_HL
+                        f_retireRoot(e, rt)
     else
         // ---- セッション ----
         if na(e.curSessionId) or f.sessionId != e.curSessionId
@@ -2306,7 +2321,11 @@ f_countRootsInCategory(ZoneEngine e, int cat) =>
 //    map で数える。数える対象 (CAT_ACCUM かつ非 RETIRED) も、同じ pairKey を
 //    1 件と数えるところも Version 3 と完全に同じ。O(n²) が O(n) になるだけ。
 f_countAccumBoxes(ZoneEngine e) =>
-    map<string, bool> keys = map.new<string, bool>()
+    //  ★ Phase8 : 毎回の map.new<string, bool> をやめ、Engine 所有の scratch を
+    //    clear して使い回す。中身はこの関数の外へ一切渡さない (map.size を返すだけ)。
+    //    集計対象 (CAT_ACCUM かつ非 RETIRED)、key (r.pairKey)、返却件数は従来と同じ。
+    map<string, bool> keys = e.scAccumBoxKeys
+    map.clear(keys)
     //  ★ Phase7 : Accum カテゴリ一覧を走る
     int n = array.size(e.catAccum)
     if n > 0
@@ -2329,6 +2348,13 @@ f_removeRetiredRoots(ZoneEngine e) =>
                     removed := removed + 1
     removed
 
+//  ★ Phase8 : worst 探索は「そのカテゴリの Root」しか見ないので、全 Root 走査を
+//    カテゴリ別一覧の走査へ置き換える。選ぶのは (confirmedTime 昇順 -> rootId 昇順)
+//    の厳密な argmin で、rootId は一意なので同値になるペアが存在しない。
+//    つまり argmin は走査順に依存せず一意に決まり、返す worstIdx が指す Root は
+//    どちらの走査でも同じ 1 件になる (削除される Root も削除順も不変)。
+//    ループの先頭で f_reindexRoots() を呼ぶのは索引キャッシュの再構築だけで、
+//    f_rootIdxById() は ID 照合 + 線形探索フォールバックを持つため結果は不変。
 f_pruneCategoryToCap(ZoneEngine e, ZoneCfg c, ZoneFeed f, int cat, int cap) =>
     int removed = 0
     for guard = 1 to 64
@@ -2338,19 +2364,23 @@ f_pruneCategoryToCap(ZoneEngine e, ZoneCfg c, ZoneFeed f, int cat, int cap) =>
         int  worstIdx  = -1
         int  worstTime = na
         int  worstId   = na
-        int n = array.size(e.roots)
+        f_reindexRoots(e)
+        array<int> lst = f_catListOf(e, cat)
+        int n = array.size(lst)
         if n > 0
-            for i = 0 to n - 1
-                Root r = array.get(e.roots, i)
-                if r.category == cat and r.state != ROOT_RETIRED and not f_rootProtected(r)
-                     and not f_rootEssential(e, r.rootId)
-                     and not (cat == CAT_TIME_HL and r.isCurrentPeriod)
-                    bool older = worstIdx < 0 or nz(r.confirmedTime, 0) < nz(worstTime, 0)
-                         or (nz(r.confirmedTime, 0) == nz(worstTime, 0) and r.rootId < nz(worstId, 0))
-                    if older
-                        worstIdx  := i
-                        worstTime := r.confirmedTime
-                        worstId   := r.rootId
+            for k = 0 to n - 1
+                int i = f_rootIdxById(e, array.get(lst, k))
+                if i >= 0
+                    Root r = array.get(e.roots, i)
+                    if r.category == cat and r.state != ROOT_RETIRED and not f_rootProtected(r)
+                         and not f_rootEssential(e, r.rootId)
+                         and not (cat == CAT_TIME_HL and r.isCurrentPeriod)
+                        bool older = worstIdx < 0 or nz(r.confirmedTime, 0) < nz(worstTime, 0)
+                             or (nz(r.confirmedTime, 0) == nz(worstTime, 0) and r.rootId < nz(worstId, 0))
+                        if older
+                            worstIdx  := i
+                            worstTime := r.confirmedTime
+                            worstId   := r.rootId
         if worstIdx < 0
             break
         if cat == CAT_ACCUM
@@ -2390,7 +2420,17 @@ f_pruneRoots(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     //    Core の phase / pending / breakSnap と membership はこの時点で確定している
     //    (f_rebuildCores → f_finalizeCore の後でこの関数が呼ばれる) ので、
     //    ループ中に hot の集合が変わることはない。
-    f_buildEssentialSet(e)
+    //  ★ Phase8 : e.essIds を読むのは f_rootEssential() だけで、それを呼ぶのは
+    //    f_pruneCategoryToCap() だけ。さらに f_pruneCategoryToCap() を呼ぶのは
+    //    f_pruneCatIfDirty() の dirty == true の枝だけなので、cap dirty が 1 つも
+    //    立っていない足では essIds の中身は一切参照されない。
+    //    よって構築を needCapPrune で囲っても、prune の選択結果・削除順・
+    //    削除件数は 1 件も変わらない。retiredDirty だけの足は Essential Set を
+    //    使わない (f_removeRetiredRoots は state だけを見る) ので構築しない。
+    //    構築位置は従来どおり Root 削除より前。
+    bool needCapPrune = e.capDirtySwing or e.capDirtyAccum or e.capDirtyFvg or e.capDirtyTime
+    if needCapPrune
+        f_buildEssentialSet(e)
     int removed = 0
     if e.retiredDirty
         removed := f_removeRetiredRoots(e)
