@@ -1871,6 +1871,212 @@ Visual Harness FULL / SAFE、`indicator.pine`、`baseline/` の 2 ファイル�
 
 **RE10110 は未確認** (TradingView での実測を行えていない)。
 
+## Phase 9 : 結果不変の追加軽量化 (6 項目 + 表示側の再監査)
+
+Zone の結果・履歴・処理順・探索回数 (最大 12 回) / Candidate 選択順 / tie-break /
+Root 順 / Candidate 順 / Core 順 / Core ID / Generation ID / Merge / Split /
+Touch / Weak / Break / Flip / Reclaim / C / H / Density / Grade / Range /
+ReferencePrice / `request.security` の値と lookahead と確定タイミング は 1 つも変えていない。
+`calc_bars_count` / 開始日時制限 / 履歴切り捨て / Root・Core 上限縮小 / カテゴリ停止 /
+`denseRoundCache` の既定値 (OFF) / Public API も未変更。近似・打ち切り・省略も入れていない。
+
+### 1. 変更した関数
+
+| 関数 | 変更 |
+|---|---|
+| `f_buildPointSnapshot()` | `snTick` (正規化 tick) を並行配列として 1 足 1 回だけ保存 |
+| `f_buildDenseBounds()` | `dsHardEnd` を two-pointer、`dsMaxCatCnt` をカテゴリ別 prefix count で作る。二重ループ廃止 |
+| `f_markDenseDirty()` | `scBestIdx` に対する単調 pointer (lower-bound 相当) 1 本へ。二重ループ廃止 |
+| `f_accTokenConflict()` | `scAccTok` の線形探索 → epoch 付き seen map の `O(1)` 引き |
+| `f_searchDenseBest()` / `f_scanStartDense()` | Accum High の内側ループを包含排除の `O(1)` 判定へ。窓の先頭で `f_waEpochNext()` |
+| `f_buildSideCands()` (通常 Sweep) | クラスタの先頭で `f_waEpochNext()`、push と同時に seen へ登録 |
+| `f_fillCandFrom()` | MA / Swing / Accum / TimeHL / FVG の品質を **1 回の ids 走査**へ統合。`f_qualityMa` / `f_qualitySwing` / `f_qualityAccum` / `f_qualityTimeHl` / `f_qualityFvg` は削除 (中身をここへ移した)。`e.scIdxOfIds` への push も廃止 (再検索が 0 回になり共有配列が不要になった) |
+| `f_rebuildCores()` | `ccGap` / `ccSh` を毎足 clear + `nc*nk` 件 push せず、必要サイズまで一度だけ拡張 |
+| `f_pairTokenOf()` | 宣言位置だけ 6.1b より前へ移動 (処理は未変更) |
+| 新規 `f_accSeenTokOf` / `TfOf` / `PairOf` / `AddOf`、`f_waEpochNext` 他、`f_accTfSlot` | epoch で論理リセットする窓内集計 |
+| `tools/check_pine.py` | 表示呼び出しが最終バーゲートの外に出ていないかの検査を追加 |
+
+### 2. 変更前後の計算量
+
+| 箇所 | 変更前 | 変更後 |
+|---|---|---|
+| `f_buildDenseBounds()` | `O(n²)` / 足 | **`O(n × CAT_COUNT)`** / 足 (`CAT_COUNT = 6`) |
+| `f_markDenseDirty()` | `O(n × used)` × 最大 12 × 2 Side | **`O(n + used)`** × 同 |
+| `f_accTokenConflict()` | `O(窓内 Accum 数)` / 窓の 1 要素ごと | **`O(1)`** |
+| Dense の Accum High | `O(窓内 Accum 数)` / Accum 1 件ごと | **`O(1)`** |
+| `f_fillCandFrom()` の品質 | ids 走査 1 + 品質 5 走査 + Accum / TimeHL / FVG の `O(ids²)` 3 本 | **ids 走査 1 本**。`O(ids²)` は FVG 同士の実重複だけ (しかも FVG Root だけを走る `O(fvg²)`) |
+| `ccGap` / `ccSh` | 毎足 `array.clear` + `nc·nk` 件 push | **拡張時のみ push、定常状態 0** |
+| `snCatPrefix` | (新規) | 拡張時のみ push、定常状態 0 |
+
+### 3. 同値性の根拠
+
+**(1) `dsHardEnd` の two-pointer**
+`snTick` は非減少 (Snapshot は tick 昇順のグループを順に append する)。
+よってしきい値 `snTick[a] + wLim` も `a` について非減少で、
+「`snTick[b] - snTick[a] > wLim` となる最初の `b`」も非減少。
+すでに `j` まで進んでいる場合、`[a+1, j)` の各要素は
+`snTick[·] - snTick[a-1] <= wLim` かつ `snTick[a] >= snTick[a-1]` より
+`snTick[·] - snTick[a] <= wLim` を必ず満たすので、読み飛ばして良い。
+`j >= a + 1` を維持するので `b > a` の制約も保たれ、`a == n-1` では `j == n`
+(= 従来の「存在しなければ n」) になる。`snTick[i]` の値は旧版が毎回計算していた
+`int(f_tickOf(snPrice[i], mintick))` と同じ。
+
+**(2) `dsMaxCatCnt` の prefix count**
+`snCatPrefix[i·6 + cat]` = `snCat[0..i-1]` のうち `cat` の件数。
+`[a, lim)` に `cat` が 1 件以上あるか ⟺ `prefix[lim] > prefix[a]`。
+distinct category 数は旧版の mask 集計と同じ値。
+
+**(3) `f_markDenseDirty()` の単調 pointer**
+`scBestIdx` は昇順 (`scWinIdx` = `b` 昇順のコピー、cached 側も `bestA..bestB` 昇順)。
+`u* = min{ u ∈ scBestIdx | u >= a }` は `a` について非減少。
+「`[a, dsEnd[a])` に `u` が 1 つでも入る」⟺ 「`u* < dsEnd[a]`」:
+範囲内の `u` があればその `u >= a` なので `u* <= u < dsEnd[a]`、
+逆に `u* < dsEnd[a]` なら `u*` 自身が範囲内。`dsEnd` の単調性には依存しない。
+
+**(4) Accum 衝突判定**
+「`tok > 0` かつ `scAccTok` に `tok` がある」⟺ 「`tok > 0` かつ 窓内の同 tok 件数 > 0」。
+`scAccTok` / `scAccTf` の push は従来どおり残し、同じ場所で seen へも登録している。
+
+**(5) Accum High の包含排除**
+`A = {tok が一致}`、`B = {tf が一致}` として
+`|¬A ∩ ¬B| = total − |A| − |B| + |A ∩ B|`。
+これは旧内側ループの「`tok != atok` かつ `tf != atf` の先行要素が 1 件以上」と厳密に同値。
+`tf` は 0..6 (`TF_NONE`..`TF_D`) なので固定長 8 の配列で足り、
+pair の key は `tok * 8 + tf` (tf < 8 なので単射)。
+4H または日足なら単独で High になる現行条件はそのまま残している。
+検証した具体例 (すべて旧ロジックと一致) :
+
+| ids | 旧 | 新 |
+|---|---|---|
+| `A(5M,tok1)`, `B(5M,tok2)` (同 TF) | false | `1 − 0 − 1 + 0 = 0` → false |
+| `A(5M,tok1)`, `B(15M,tok1)` (同 pair) | false | `1 − 1 − 0 + 0 = 0` → false |
+| `A(5M,tok1)`, `B(15M,tok2)` | true | `1 − 0 − 0 + 0 = 1` → true |
+| `A(5M,tok1)`, `B(5M,tok2)`, `C(15M,tok1)` | true (B,C) | `2 − 1 − 0 + 0 = 1` → true |
+
+**(6) epoch による窓の分離**
+`f_waEpochNext()` を呼ぶのは 3 箇所だけ :
+`f_searchDenseBest()` の各開始位置 `a`、`f_scanStartDense()` の入口 (= 各開始位置)、
+`f_buildSideCands()` の各通常 Sweep クラスタ。
+いずれも `array.clear(e.scAccTok)` と同じ位置なので、seen のリセットと
+`scAccTok` のリセットが完全に一致する。
+epoch が一致しないエントリは件数 0 とみなすので、窓をまたいだ混入は起きない。
+桁が大きくなる前 (`> 1e9`) に実体を捨てて 1 から数え直す (論理リセットと同じ意味)。
+窓用 (`wa*`) と Candidate 品質用 (`qa*`) は**別の epoch / 別の実体**にしてあるので、
+片方の走査中にもう片方が走っても干渉しない。
+
+**(7) `f_fillCandFrom()` の 1 回走査**
+各カテゴリの High 条件はいずれも「ids に含まれる Root に対する存在量化 (∃)」なので、
+走る順序を変えても真偽は変わらない。
+
+- MA : `rootId == RID_EMA1` / `RID_EMA2` の Root index を拾い、旧 `f_qualityMa()` と同じ
+  `near and dirOk` を後段で 1 回評価する (`i >= 0` でないときは拾わない = 旧版で `i1 < 0` と同じ)。
+- Swing : `∃ SWING with (1H or (15M and 5M))`。
+- Accum : `(∃ ACCUM with 4H or D) or (∃ pair with 別 pairKey かつ 別 TF)` の論理和。
+  旧版は前者を全件走ってから後者を回していたが、論理和なので混ぜても同じ。
+- TimeHL : `(∃ 週現在 / 週前 / 前日ラベル) or (∃ pair with 別 OriginTime)`。
+  ラベル条件が 1 件でも成立すれば旧版は pair ループに入らないので、
+  「ラベルが全滅のときだけ全 TIME_HL の OriginTime を記録する」現方式で集合は一致する
+  (これは `f_searchDenseBest()` が以前から使っていた `tlSeen` / `tlOrigin` と同じ形)。
+- FVG : `(∃ 非 Broad で 4H or D) or (∃ Broad かつ broadLocalized) or (∃ 別 TF 同方向で実重複)`。
+  **Broad 局所化の評価順は維持** : 非 FVG 品質 (`hmask`) と `cd.density` が確定してから
+  `broadLocalized` を作り、そのあとで FVG の High を決める。
+  第 3 条件だけ総当たりが必要なので残したが、走るのは `ids` 全体ではなく
+  走査中に集めた **FVG Root だけ** (`e.scFvgIdxTmp`)。非 FVG は旧版でも `continue` 相当だった。
+  Root index の再検索は 0 回。
+
+**(8) `ccGap` / `ccSh` の再利用**
+Pass 1 は `nc > 0` かつ `nk > 0` のとき `ci ∈ [0, nc) × k ∈ [0, nk)` の全要素へ書き込み、
+Pass 4 が読むのは同じ `(ci, k)` 範囲だけ。よって今回使う範囲より後ろに残っている
+前足の値は一切読まれない。値・index 式 (`ci * nk + k`)・Pass 順は未変更。
+
+### 4. Root / Candidate / Core の順序を変えていない根拠
+
+| 対象 | 根拠 |
+|---|---|
+| Root 順 (`e.roots`) | 変更なし。`f_pushRoot()` / `f_removeRootAt()` に手を入れていない |
+| Snapshot 順 (`snRootId` 他) | `snTick` を**追加**しただけ。挿入処理・tick グループ構造・並びは 1 行も変えていない |
+| Dense 探索の走査順 | `a` は 0..n-1 昇順、`b` は `a`..n-1 昇順のまま。事前除外の条件 (`dsMaxCatCnt < 2`) も式そのまま。break 条件は `f_gtT(price[b] - lo, maxWidth)` のままで、`snTick` は事前境界にしか使わない |
+| Candidate 順 (`out`) | `f_materializeBest()` / Sweep / FVG の push 順は未変更。最大 12 ラウンドも未変更 |
+| Candidate 比較 | `f_candBetter()` と dense 内のインライン比較 (C→H→幅→時刻→ID) は未変更 |
+| Core 順 (`e.cores`) | `f_pairSides()` / Pass 1〜4 の走査順は未変更。Pass 2 は Phase 6 の一本化のまま |
+| `dsDirty` の集合 | 上記 (3) により従来と完全一致 |
+| Accum 品質 | 上記 (5) により真偽が一致。`scAccTok` / `scAccTf` の push 順も不変 |
+
+### 5. 未変更で残る全 Hot loop
+
+| 箇所 | 計算量 | 残す理由 |
+|---|---|---|
+| `f_searchDenseBest()` / `f_scanStartDense()` の `a × b` | `12 · O(n · k)` / Side | 探索する窓の集合を減らせば結果が変わる。除外できるのは「BaseStrong になり得ない a」だけ (Phase 5) |
+| `f_buildPointSnapshot()` の同 tick 群挿入 | `O(R log R + Σg²)` | 群内の挿入条件が非推移的で、汎用ソートでは再現できない |
+| `f_rebuildCores()` Pass 1 | `O(nc · nk)` | 全ペアの `gap` を知らないと argmax が決まらない。価格帯索引には Core を範囲でソートした構造が必要だが、Pass 3/4 が Core の範囲を書き換えるため Pass を越えて保てない |
+| `f_pairSides()` | `O(sup · res)` | Support 候補ごとの argmax なので全ペア判定が必要 |
+| `f_fvgAttachAndStandalone()` の帯内 | `O(fvg · log cand + Σ hits)` | 帯の中は従来判定そのもの (減らすと結果が変わる) |
+| `f_fillCandFrom()` の FVG 実重複 | `O(fvg²)` (FVG Root だけ) | 「別 TF・同方向・実際に重なる」は全ペア判定。fvg は Candidate 1 件分 |
+| `f_qualityFvgWith()` | `O(fvgIds²)` | 同上 (attach 試行用) |
+| `f_syncPsychRoots()` の全 Root 走査 | `O(R)` / 足 | `f.baseClose` が毎足変わるため dirty 化できない。加えて `need` への push 順が新規 Psych Root の rootId を決めるので、カテゴリ別一覧に分けると **e.roots 順の interleave が崩れて rootId が変わる** |
+| `f_removeRetiredRoots()` の逆順全走査 | `O(R)`、`retiredDirty` の足のみ | 対象が MA / Psych を含む全カテゴリなので、どのカテゴリ別一覧でも覆えない |
+| ACCUM `pairKey` 一括削除 | `O(R)`、実際に削除する足のみ | 削除順と index 有効性の保証を作り直す必要があり、厳密同値を示せていない |
+
+### 6. 表示側の再監査 (項目 7)
+
+**表示を OFF にすることは解決策にしていない。** 現状を機械的に検査した結果 :
+
+| 対象 | ゲート |
+|---|---|
+Zone box / line / label | `needRedraw = barstate.islast and (not drawnOnce or barstate.isnew or eng.processedBars != drawnProcessed)` |
+| Debug table (`f_dbgRow`) | `if needRedraw` |
+| Root Debug table | `if needRedraw and showRootTable` |
+| Event log table | `if needRedraw and showEventLog` |
+| 警告ラベル | `if needRedraw` |
+| Event の拾い上げ (`array.push` 10 本 + `f_evTrim`) | `showEventLog and isFiveMin and barstate.isconfirmed and lastWantEvents` (`fullHistoryEvents = false` なら最終確定足のみ) |
+| 行文字列化 (`f_evLine` / `str.format_time`) | 表へ出す `eventLogMax` 件だけ、`needRedraw and showEventLog` の中 |
+| `table.new` × 3 | `var table` + `na()` チェックで 1 回だけ |
+| Engine 側の View / Event 生成 | `updateVisualLite(buildProjection, captureEvents)` |
+
+`tools/check_pine.py` に **表示呼び出しのゲート検査**を追加した。
+`box/line/label/table.*` と `str.format_time` の呼び出しを全部拾い、
+囲いの `if` に最終バーゲート (`barstate.islast` / `needRedraw` / `wantProjection` /
+`lastWantEvents` / `na(`) が無ければ報告する。表示ヘルパ関数の中にある場合は、
+**そのヘルパの全呼び出し箇所**がゲートされているかを追って検査する。
+
+- FULL / SAFE : **0 件**
+- 回帰確認 : `if needRedraw and showRootTable` を `if showRootTable` に変えると
+  `L1112 display call not behind a last-bar gate` を検出
+
+### 7. 静的検査
+
+| 検査 | 結果 |
+|---|---|
+| 関数スコープ未定義変数 | 3 ファイル 0 件 |
+| 宣言順 (`f_*` / UDT の前方参照) | 3 ファイル 0 件 |
+| `for A + 1 to N - 1` のガード | 0 件 |
+| 表示呼び出しの最終バーゲート | 0 件 |
+| `request.*` tuple 要素数 | FULL / SAFE とも 104 / 127 |
+| 括弧バランス / 行跨ぎ文字列 / 継続行インデント %4 | 0 件 |
+| 1 足あたりの `map.new` / `array.new` / `array.copy` (Core 生成・終了以外) | 0 件 |
+
+### 8. Publish 後に差し替える Library 番号
+
+FULL / SAFE の **1 行だけ**を書き換える。
+
+- `ZoneEngineV2_VisualHarness_FULL.pine` L105
+- `ZoneEngineV2_VisualHarness_SAFE.pine` L131
+
+```
+import sekine3310/ZoneEngineV2/3 as zn2     ← この 3 を Publish 後の実番号へ
+```
+
+現在の `/3` は Phase 9 の API (`updateVisualLite` / `swingAccumFvgBundleV2` /
+`accumFvgBundleV2`) を持っていないため、書き換えるまでコンパイルできない。
+`/4` や `/5` を推測で入れてはいない。**TradingView が発行した実際の番号**に置き換えること。
+
+### 9. RE10110
+
+**未実測。** TradingView での Publish・コンパイル・実行・Profiler 計測を行えていないため、
+完了条件 (Zone 描画 ON / Zone ラベル ON / Debug table ON / Root Debug table OFF /
+Event log OFF / 全履歴 Event OFF / `denseRoundCache` ON / XAUUSD 5 分足 / 履歴削減なし)
+で RE10110 が出ないかどうかは確認できていない。上記は静的検査と計算量の議論のみ。
+
 ## Known limitations
 
 - **Pine Editor でのコンパイル・実行を確認していない。** スクリプトサイズ上限、`request.security` の

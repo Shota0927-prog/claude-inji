@@ -896,6 +896,32 @@ export type ZoneEngine
     array<int>   snOrigin
     array<int>   snLabel
     array<int>   snPair
+    //  ★ Phase9 : snPrice と並行する正規化 tick。事前境界 (dsHardEnd) にだけ使う。
+    //    本探索の break 条件 (f_gtT) はこれを使わない。
+    array<int>   snTick
+    //  ★ Phase9 : カテゴリ別 prefix count。snCatPrefix[i * CAT_COUNT + cat] =
+    //    snCat[0..i-1] のうち cat の件数 (i は 0..n)。
+    array<int>   snCatPrefix
+    //  ★ Phase9 : Accum の窓内 seen / 件数を epoch で論理リセットする 2 組。
+    //    waEpoch 側 : dense の開始位置ごと / 通常 Sweep のクラスタごと
+    //    qaEpoch 側 : f_fillCandFrom() の 1 Candidate ごと
+    //    2 組に分けているのは、片方の走査中にもう片方が走っても混入しないようにするため。
+    int             waEpoch = 1
+    map<int, int>   waTokEp
+    map<int, int>   waTokCnt
+    array<int>      waTfEp
+    array<int>      waTfCnt
+    map<int, int>   waPairEp
+    map<int, int>   waPairCnt
+    int             qaEpoch = 1
+    map<int, int>   qaTokEp
+    map<int, int>   qaTokCnt
+    array<int>      qaTfEp
+    array<int>      qaTfCnt
+    map<int, int>   qaPairEp
+    map<int, int>   qaPairCnt
+    //  ★ Phase9 : f_fillCandFrom() の 1 回走査で集めた FVG Root index
+    array<int>      scFvgIdxTmp
     //  クラスタリング作業用 scratch
     array<float> scRawPrice
     array<int>   scRawIdx
@@ -1120,6 +1146,21 @@ export newEngine() =>
          snOrigin  = array.new_int(),
          snLabel   = array.new_int(),
          snPair    = array.new_int(),
+         snTick      = array.new_int(),
+         snCatPrefix = array.new_int(),
+         waTokEp     = map.new<int, int>(),
+         waTokCnt    = map.new<int, int>(),
+         waTfEp      = array.new_int(8, 0),
+         waTfCnt     = array.new_int(8, 0),
+         waPairEp    = map.new<int, int>(),
+         waPairCnt   = map.new<int, int>(),
+         qaTokEp     = map.new<int, int>(),
+         qaTokCnt    = map.new<int, int>(),
+         qaTfEp      = array.new_int(8, 0),
+         qaTfCnt     = array.new_int(8, 0),
+         qaPairEp    = map.new<int, int>(),
+         qaPairCnt   = map.new<int, int>(),
+         scFvgIdxTmp = array.new_int(),
          scRawPrice = array.new_float(),
          scRawIdx   = array.new_int(),
          scRawId    = array.new_int(),
@@ -2516,146 +2557,136 @@ f_rootEligibleForSide(ZoneCfg c, Root r, int side) =>
 f_effectiveFvgDir(Root r) =>
     r.state == ROOT_INVERSE_ACTIVE ? r.inverseDir : r.direction
 
+//  ★ Phase3C : Accum の pairKey を整数トークンへ写す (比較は必ず等値だけ)。
+//  ★ Phase9 : f_fillCandFrom() の品質集計から呼ぶため 6.1b より前へ移した
+//    (処理内容は変更なし。トークンの値は等値比較と map の key にしか使わない)。
+f_pairTokenOf(ZoneEngine e, string pairKey) =>
+    int tok = 0
+    if pairKey != ""
+        if map.contains(e.pairTokenMap, pairKey)
+            tok := map.get(e.pairTokenMap, pairKey)
+        else
+            e.pairTokenSeq := e.pairTokenSeq + 1
+            tok := e.pairTokenSeq
+            map.put(e.pairTokenMap, pairKey, tok)
+    tok
+
+// ---- 6.1b Accum の窓内集計 (epoch で論理リセットする seen / 件数) ----------
+//  ★ Phase9 : 「同じ pairToken が窓内にすでにあるか」と
+//    「異なる pairToken かつ異なる時間足の Accum が窓内にすでにあるか」を
+//    O(1) で答えるための構造。線形探索と同じ結果になる根拠は :
+//
+//    (1) 衝突判定   conflict(tok) = tok > 0 かつ (窓内の同 tok 件数 > 0)
+//        これは「scAccTok の中に tok がある」と同値。
+//    (2) High 判定  包含排除で
+//          differentBoth = total - sameTok - sameTf + sameTokAndTf
+//        A = {tok が一致}, B = {tf が一致} として |¬A ∩ ¬B| を数えているので、
+//        「tok が違い、かつ tf も違う先行要素が 1 件以上ある」と厳密に同値。
+//
+//    tf は 0..6 (TF_NONE..TF_D) なので固定長 8 の配列で足りる。
+//    pair の key は tok * 8 + tf (tf < 8 なので単射)。
+//    epoch は「窓が変わったら以前の件数を 0 とみなす」ための世代番号で、
+//    桁が大きくなる前に実体を捨てて 1 から数え直す (論理リセットと同じ意味)。
+f_accTfSlot(int tf) =>
+    tf >= 0 and tf < 8 ? tf : 7
+
+f_accSeenTokOf(map<int, int> ep, map<int, int> cnt, int epoch, int tok) =>
+    int v = 0
+    if map.contains(ep, tok)
+        if map.get(ep, tok) == epoch
+            v := map.get(cnt, tok)
+    v
+
+f_accSeenTfOf(array<int> ep, array<int> cnt, int epoch, int tf) =>
+    int sl = f_accTfSlot(tf)
+    int v = 0
+    if array.get(ep, sl) == epoch
+        v := array.get(cnt, sl)
+    v
+
+f_accSeenPairOf(map<int, int> ep, map<int, int> cnt, int epoch, int tok, int tf) =>
+    int key = tok * 8 + f_accTfSlot(tf)
+    int v = 0
+    if map.contains(ep, key)
+        if map.get(ep, key) == epoch
+            v := map.get(cnt, key)
+    v
+
+f_accSeenAddOf(map<int, int> tokEp, map<int, int> tokCnt, array<int> tfEp, array<int> tfCnt,
+     map<int, int> prEp, map<int, int> prCnt, int epoch, int tok, int tf) =>
+    int ct = f_accSeenTokOf(tokEp, tokCnt, epoch, tok)
+    map.put(tokEp, tok, epoch)
+    map.put(tokCnt, tok, ct + 1)
+    int sl = f_accTfSlot(tf)
+    int cf = f_accSeenTfOf(tfEp, tfCnt, epoch, tf)
+    array.set(tfEp, sl, epoch)
+    array.set(tfCnt, sl, cf + 1)
+    int key = tok * 8 + sl
+    int cp = f_accSeenPairOf(prEp, prCnt, epoch, tok, tf)
+    map.put(prEp, key, epoch)
+    map.put(prCnt, key, cp + 1)
+    true
+
+//  ---- 窓 (dense の開始位置 / 通常 Sweep のクラスタ) 用 ----
+f_waEpochNext(ZoneEngine e) =>
+    if e.waEpoch > 1000000000
+        map.clear(e.waTokEp)
+        map.clear(e.waTokCnt)
+        map.clear(e.waPairEp)
+        map.clear(e.waPairCnt)
+        f_fillInt(e.waTfEp, 8, 0)
+        f_fillInt(e.waTfCnt, 8, 0)
+        e.waEpoch := 1
+    else
+        e.waEpoch := e.waEpoch + 1
+    e.waEpoch
+
+f_waSeenTok(ZoneEngine e, int tok) =>
+    f_accSeenTokOf(e.waTokEp, e.waTokCnt, e.waEpoch, tok)
+
+f_waSeenTf(ZoneEngine e, int tf) =>
+    f_accSeenTfOf(e.waTfEp, e.waTfCnt, e.waEpoch, tf)
+
+f_waSeenPair(ZoneEngine e, int tok, int tf) =>
+    f_accSeenPairOf(e.waPairEp, e.waPairCnt, e.waEpoch, tok, tf)
+
+f_waSeenAdd(ZoneEngine e, int tok, int tf) =>
+    f_accSeenAddOf(e.waTokEp, e.waTokCnt, e.waTfEp, e.waTfCnt,
+         e.waPairEp, e.waPairCnt, e.waEpoch, tok, tf)
+
+//  ---- Candidate 品質 (f_fillCandFrom の 1 Candidate) 用 ----
+f_qaEpochNext(ZoneEngine e) =>
+    if e.qaEpoch > 1000000000
+        map.clear(e.qaTokEp)
+        map.clear(e.qaTokCnt)
+        map.clear(e.qaPairEp)
+        map.clear(e.qaPairCnt)
+        f_fillInt(e.qaTfEp, 8, 0)
+        f_fillInt(e.qaTfCnt, 8, 0)
+        e.qaEpoch := 1
+    else
+        e.qaEpoch := e.qaEpoch + 1
+    e.qaEpoch
+
+f_qaSeenTok(ZoneEngine e, int tok) =>
+    f_accSeenTokOf(e.qaTokEp, e.qaTokCnt, e.qaEpoch, tok)
+
+f_qaSeenTf(ZoneEngine e, int tf) =>
+    f_accSeenTfOf(e.qaTfEp, e.qaTfCnt, e.qaEpoch, tf)
+
+f_qaSeenPair(ZoneEngine e, int tok, int tf) =>
+    f_accSeenPairOf(e.qaPairEp, e.qaPairCnt, e.qaEpoch, tok, tf)
+
+f_qaSeenAdd(ZoneEngine e, int tok, int tf) =>
+    f_accSeenAddOf(e.qaTokEp, e.qaTokCnt, e.qaTfEp, e.qaTfCnt,
+         e.qaPairEp, e.qaPairCnt, e.qaEpoch, tok, tf)
+
 // ---- 6.2 Category 品質 (High は 1 カテゴリにつき最大 1) --------------------
 //  参加 Root だけで評価する。Adjacent / core 外 Root は品質を上げない。
-//  ★ Phase6 : idx は ids と並行な Root index (f_fillCandFrom が 1 回だけ解決したもの)。
-//    ids に同じ Root ID は入らないので、走査して見つけた index は
-//    array.includes + f_rootIdxById と完全に同じ値になる。
-f_qualityMa(ZoneEngine e, ZoneCfg c, array<int> ids, array<int> idx, int side) =>
-    int i1 = -1
-    int i2 = -1
-    int nm = array.size(ids)
-    if nm > 0
-        for k = 0 to nm - 1
-            int rid = array.get(ids, k)
-            if rid == RID_EMA1
-                i1 := array.get(idx, k)
-            else if rid == RID_EMA2
-                i2 := array.get(idx, k)
-    bool isHighQuality = false
-    if i1 >= 0 and i2 >= 0
-        Root a = array.get(e.roots, i1)
-        Root b = array.get(e.roots, i2)
-        bool near = f_leT(math.abs(a.pointPrice - b.pointPrice), f_denseWidth(c), c.mintick)
-        bool dirOk = side == SIDE_SUPPORT ? (a.direction > 0 and b.direction > 0)
-             : (a.direction < 0 and b.direction < 0)
-        isHighQuality := near and dirOk
-    isHighQuality
-
-f_qualitySwing(ZoneEngine e, array<int> ids, array<int> idx) =>
-    bool isHighQuality = false
-    int n = array.size(ids)
-    if n > 0
-        for k = 0 to n - 1
-            int i = array.get(idx, k)
-            if i >= 0
-                Root r = array.get(e.roots, i)
-                if r.category == CAT_SWING
-                    if r.tfCode == TF_1H
-                        isHighQuality := true
-                        break
-                    if f_maskHas(r.tfMask, TF_15M) and f_maskHas(r.tfMask, TF_5M)
-                        isHighQuality := true
-                        break
-    isHighQuality
-
-f_qualityAccum(ZoneEngine e, array<int> ids, array<int> idx) =>
-    bool isHighQuality = false
-    int n = array.size(ids)
-    if n > 0
-        for k = 0 to n - 1
-            int i = array.get(idx, k)
-            if i >= 0
-                Root r = array.get(e.roots, i)
-                if r.category == CAT_ACCUM and (r.tfCode == TF_4H or r.tfCode == TF_D)
-                    isHighQuality := true
-                    break
-        //  異なる時間足の別 Box 境界が同じ core で重なる (同じ Box 同士は補強禁止)
-        if not isHighQuality and n >= 2
-            for a = 0 to n - 2
-                int ia = array.get(idx, a)
-                if ia >= 0
-                    Root ra = array.get(e.roots, ia)
-                    if ra.category == CAT_ACCUM
-                        for b = a + 1 to n - 1
-                            int ib = array.get(idx, b)
-                            if ib >= 0
-                                Root rb = array.get(e.roots, ib)
-                                if rb.category == CAT_ACCUM and rb.pairKey != ra.pairKey and rb.tfCode != ra.tfCode
-                                    isHighQuality := true
-                                    break
-                if isHighQuality
-                    break
-    isHighQuality
-
-f_qualityTimeHl(ZoneEngine e, array<int> ids, array<int> idx) =>
-    bool isHighQuality = false
-    int n = array.size(ids)
-    if n > 0
-        for k = 0 to n - 1
-            int i = array.get(idx, k)
-            if i >= 0
-                Root r = array.get(e.roots, i)
-                if r.category == CAT_TIME_HL
-                    bool weekCur  = f_maskHas(r.labelMask, f_timeLabelBit(PER_WEEK, true))
-                    bool weekPrev = f_maskHas(r.labelMask, f_timeLabelBit(PER_WEEK, false))
-                    bool dayPrev  = f_maskHas(r.labelMask, f_timeLabelBit(PER_DAY, false))
-                    if weekCur or weekPrev or dayPrev
-                        isHighQuality := true
-                        break
-        //  別起源 (OriginTime が違う) の期間高安が同じ core で重なる
-        if not isHighQuality and n >= 2
-            for a = 0 to n - 2
-                int ia = array.get(idx, a)
-                if ia >= 0
-                    Root ra = array.get(e.roots, ia)
-                    if ra.category == CAT_TIME_HL
-                        for b = a + 1 to n - 1
-                            int ib = array.get(idx, b)
-                            if ib >= 0
-                                Root rb = array.get(e.roots, ib)
-                                if rb.category == CAT_TIME_HL and nz(rb.originTime, 0) != nz(ra.originTime, 0)
-                                    isHighQuality := true
-                                    break
-                if isHighQuality
-                    break
-    isHighQuality
-
-f_qualityFvg(ZoneEngine e, ZoneCfg c, array<int> ids, array<int> idx, bool broadLocalized) =>
-    bool isHighQuality = false
-    int n = array.size(ids)
-    if n > 0
-        for k = 0 to n - 1
-            int i = array.get(idx, k)
-            if i >= 0
-                Root r = array.get(e.roots, i)
-                if r.category == CAT_FVG
-                    if not r.isBroadFvg and (r.tfCode == TF_4H or r.tfCode == TF_D)
-                        isHighQuality := true
-                        break
-                    if r.isBroadFvg and broadLocalized
-                        isHighQuality := true
-                        break
-        //  異なる時間足の同方向 FVG が実際に重なる (同じ時間足同士は Normal)
-        if not isHighQuality and n >= 2
-            for a = 0 to n - 2
-                int ia = array.get(idx, a)
-                if ia >= 0
-                    Root ra = array.get(e.roots, ia)
-                    if ra.category == CAT_FVG
-                        for b = a + 1 to n - 1
-                            int ib = array.get(idx, b)
-                            if ib >= 0
-                                Root rb = array.get(e.roots, ib)
-                                if rb.category == CAT_FVG and rb.tfCode != ra.tfCode
-                                     and f_effectiveFvgDir(rb) == f_effectiveFvgDir(ra)
-                                     and f_rangesTouch(ra.nativeBottom, ra.nativeTop, rb.nativeBottom, rb.nativeTop, c.mintick)
-                                    isHighQuality := true
-                                    break
-                if isHighQuality
-                    break
-    isHighQuality
-
+//  ★ Phase9 : MA / Swing / Accum / TimeHL / FVG の品質は、専用関数で ids を
+//    もう一度走り直すのをやめ、f_fillCandFrom() の 1 回の ids 走査の中で
+//    同時に集計する (条件式・対象 Root・High の意味は一切変えていない)。
+//    ここに残しているのは FVG の組み合わせ評価だけ (f_qualityFvgWith)。
 // ---- 6.3 ZoneReferencePrice (表示・追跡用。ロジック判定には使わない) ------
 //  加重平均は作らない。各点カテゴリ代表の単純中央値。FVG 50% は使わない。
 //  ★ Phase3C : カテゴリごとに配列を作らず、engine の scratch を clear して使い回す。
@@ -2787,14 +2818,31 @@ f_fillCandFrom(ZoneEngine e, ZoneCfg c, int side, array<int> ids,
     int   freshCnt = 0
     int   stateMask = 0
     int   cmask = 0
+    //  ★ Phase9 : 品質判定の材料もこの 1 回の走査で全部集める。
+    //    旧版は ids を 1 回走ったあと f_qualityMa / Swing / Accum / TimeHl / Fvg が
+    //    同じ Root 集合をもう 5 回走り、Accum / TimeHL / FVG はさらに O(ids^2) の
+    //    内側ループを回していた。条件式・対象 Root・High の意味は変えていない。
+    int   i1 = -1
+    int   i2 = -1
+    bool  swHigh  = false
+    bool  accHigh = false
+    bool  tlHigh  = false
+    bool  tlSeen  = false
+    int   tlOrigin = 0
+    bool  fvgNonBroadHigh = false
+    bool  fvgHasBroad     = false
+    int   accTot = 0
+    f_qaEpochNext(e)
+    array.clear(e.scFvgIdxTmp)
     int n = array.size(ids)
-    //  ★ Phase6 : ids の Root index をこの 1 ループで解決して保持し、
-    //    品質関数は再検索せずこれを読む (値は同じ)。
-    array.clear(e.scIdxOfIds)
+    //  ★ Phase9 : Phase6 の e.scIdxOfIds 共有 (1 回解決して品質関数へ渡す) は、
+    //    品質判定そのものをこのループへ取り込んだことで不要になった。
+    //    Root index の再検索は 0 回 (共有配列を作るより 1 段強い) なので、
+    //    もう誰も読まない scratch への push もやめる。
+    //    フィールド自体は export 型 ZoneEngine の形を変えないため残している。
     if n > 0
         for k = 0 to n - 1
             int i = f_rootIdxById(e, array.get(ids, k))
-            array.push(e.scIdxOfIds, i)
             if i >= 0
                 Root r = array.get(e.roots, i)
                 cmask := f_maskAdd(cmask, r.category)
@@ -2808,9 +2856,56 @@ f_fillCandFrom(ZoneEngine e, ZoneCfg c, int side, array<int> ids,
                     stateMask  := f_maskAdd(stateMask, r.state)
                     if r.fvgFresh
                         freshCnt := freshCnt + 1
+                    array.push(e.scFvgIdxTmp, i)
+                    //  旧 f_qualityFvg() の単体条件。Broad 側は broadLocalized が
+                    //  確定したあとで判定するので、ここでは「Broad が居る」だけ覚える。
+                    if not r.isBroadFvg
+                        if r.tfCode == TF_4H or r.tfCode == TF_D
+                            fvgNonBroadHigh := true
+                    else
+                        fvgHasBroad := true
                 else
                     pmin := na(pmin) ? r.pointPrice : math.min(pmin, r.pointPrice)
                     pmax := na(pmax) ? r.pointPrice : math.max(pmax, r.pointPrice)
+                //  --- 旧 f_qualityMa() : Root ID だけで EMA1 / EMA2 を拾う ---
+                if r.rootId == RID_EMA1
+                    i1 := i
+                else if r.rootId == RID_EMA2
+                    i2 := i
+                //  --- 旧 f_qualitySwing() ---
+                if r.category == CAT_SWING
+                    if not swHigh
+                        if r.tfCode == TF_1H
+                             or (f_maskHas(r.tfMask, TF_15M) and f_maskHas(r.tfMask, TF_5M))
+                            swHigh := true
+                //  --- 旧 f_qualityAccum() : 4H / D 単独 or (別 pairKey かつ別 TF) ---
+                else if r.category == CAT_ACCUM
+                    int atf  = r.tfCode
+                    int atok = f_pairTokenOf(e, r.pairKey)
+                    if not accHigh
+                        if atf == TF_4H or atf == TF_D
+                            accHigh := true
+                        else
+                            int dBoth = accTot - f_qaSeenTok(e, atok) - f_qaSeenTf(e, atf)
+                                 + f_qaSeenPair(e, atok, atf)
+                            if dBoth > 0
+                                accHigh := true
+                    f_qaSeenAdd(e, atok, atf)
+                    accTot := accTot + 1
+                //  --- 旧 f_qualityTimeHl() : 週 / 前日ラベル単独 or 別 OriginTime ---
+                else if r.category == CAT_TIME_HL
+                    if not tlHigh
+                        if f_maskHas(r.labelMask, f_timeLabelBit(PER_WEEK, true))
+                             or f_maskHas(r.labelMask, f_timeLabelBit(PER_WEEK, false))
+                             or f_maskHas(r.labelMask, f_timeLabelBit(PER_DAY, false))
+                            tlHigh := true
+                        else
+                            int og = nz(r.originTime, 0)
+                            if not tlSeen
+                                tlSeen := true
+                                tlOrigin := og
+                            else if og != tlOrigin
+                                tlHigh := true
     cd.bottom      := na(forcedBottom) ? pmin : forcedBottom
     cd.top         := na(forcedTop)    ? pmax : forcedTop
     cd.minRootId   := nz(minId, 0)
@@ -2830,14 +2925,23 @@ f_fillCandFrom(ZoneEngine e, ZoneCfg c, int side, array<int> ids,
         cd.density := DEN_NORMAL
 
     // 非 FVG カテゴリの品質を先に決める (Broad 局所化条件が参照する)
+    //  ★ Phase9 : 上の 1 回走査で集めた値から作る (旧 f_quality* と同じ式)。
+    bool maHigh = false
+    if i1 >= 0 and i2 >= 0
+        Root ra1 = array.get(e.roots, i1)
+        Root ra2 = array.get(e.roots, i2)
+        bool maNear = f_leT(math.abs(ra1.pointPrice - ra2.pointPrice), f_denseWidth(c), c.mintick)
+        bool maDirOk = side == SIDE_SUPPORT ? (ra1.direction > 0 and ra2.direction > 0)
+             : (ra1.direction < 0 and ra2.direction < 0)
+        maHigh := maNear and maDirOk
     int hmask = 0
-    if f_maskHas(cmask, CAT_MA) and f_qualityMa(e, c, ids, e.scIdxOfIds, side)
+    if f_maskHas(cmask, CAT_MA) and maHigh
         hmask := f_maskAdd(hmask, CAT_MA)
-    if f_maskHas(cmask, CAT_SWING) and f_qualitySwing(e, ids, e.scIdxOfIds)
+    if f_maskHas(cmask, CAT_SWING) and swHigh
         hmask := f_maskAdd(hmask, CAT_SWING)
-    if f_maskHas(cmask, CAT_ACCUM) and f_qualityAccum(e, ids, e.scIdxOfIds)
+    if f_maskHas(cmask, CAT_ACCUM) and accHigh
         hmask := f_maskAdd(hmask, CAT_ACCUM)
-    if f_maskHas(cmask, CAT_TIME_HL) and f_qualityTimeHl(e, ids, e.scIdxOfIds)
+    if f_maskHas(cmask, CAT_TIME_HL) and tlHigh
         hmask := f_maskAdd(hmask, CAT_TIME_HL)
     // 心理価格は常に Normal (High にならない)
 
@@ -2850,11 +2954,28 @@ f_fillCandFrom(ZoneEngine e, ZoneCfg c, int side, array<int> ids,
                 anyOtherHigh := true
     //  Broad FVG の局所化条件 (仕様 3.5 の 4 条件のいずれか)
     //    1) Proximal edge 周辺に別カテゴリが高密集
-    //    2) 同方向の別時間足 FVG と実際に重なる  (f_qualityFvg 内で判定)
+    //    2) 同方向の別時間足 FVG と実際に重なる  (下の FVG 総当たりで判定)
     //    3) 内部に高品質な別カテゴリがある
     //    4) 内部に FVG 以外の独立カテゴリが 2 つ以上高密集
     bool broadLocalized = proximalDense or anyOtherHigh or (nonFvgC >= 2 and cd.density == DEN_HIGH)
-    if f_maskHas(cmask, CAT_FVG) and f_qualityFvg(e, c, ids, e.scIdxOfIds, broadLocalized)
+    //  ★ Phase9 : 旧 f_qualityFvg() と同じ 3 条件の論理和。
+    //    単体条件は上の 1 回走査で集めてあり、残る「異なる時間足の同方向 FVG が
+    //    実際に重なる」だけ FVG Root 同士の総当たりで見る (FVG だけを走る)。
+    bool fvgHigh = fvgNonBroadHigh or (fvgHasBroad and broadLocalized)
+    if not fvgHigh
+        int fvn = array.size(e.scFvgIdxTmp)
+        if fvn >= 2
+            for a2 = 0 to fvn - 2
+                Root ra = array.get(e.roots, array.get(e.scFvgIdxTmp, a2))
+                for b2 = a2 + 1 to fvn - 1
+                    Root rb = array.get(e.roots, array.get(e.scFvgIdxTmp, b2))
+                    if rb.tfCode != ra.tfCode and f_effectiveFvgDir(rb) == f_effectiveFvgDir(ra)
+                         and f_rangesTouch(ra.nativeBottom, ra.nativeTop, rb.nativeBottom, rb.nativeTop, c.mintick)
+                        fvgHigh := true
+                        break
+                if fvgHigh
+                    break
+    if f_maskHas(cmask, CAT_FVG) and fvgHigh
         hmask := f_maskAdd(hmask, CAT_FVG)
 
     cd.catMask  := cmask
@@ -2990,18 +3111,7 @@ f_candBetter(ZoneCand a, ZoneCand b, ZoneCfg c) =>
 //    挿入処理をそのまま再現する (使う配列を scratch にしただけ)。
 //
 //  クラスタリング対象を現在価格から dormantDistance 以内へ絞るのも Version 3 と同じ。
-f_pairTokenOf(ZoneEngine e, string pairKey) =>
-    int tok = 0
-    if pairKey != ""
-        if map.contains(e.pairTokenMap, pairKey)
-            tok := map.get(e.pairTokenMap, pairKey)
-        else
-            e.pairTokenSeq := e.pairTokenSeq + 1
-            tok := e.pairTokenSeq
-            map.put(e.pairTokenMap, pairKey, tok)
-    tok
-
-f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
+ff_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
     //  ★ Phase7 : 2 段構造。全体配列への途中 insert をやめ、
     //    同 tick グループの中だけで旧版と同じ挿入処理を行う。
     //
@@ -3047,6 +3157,7 @@ f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
     array.clear(e.snOrigin)
     array.clear(e.snLabel)
     array.clear(e.snPair)
+    array.clear(e.snTick)
     int m = array.size(e.scRawIdx)
     if m > 0
         for q = 0 to m - 1
@@ -3100,6 +3211,11 @@ f_buildPointSnapshot(ZoneEngine e, ZoneCfg c, float refClose) =>
                     array.push(e.snOrigin, nz(r2.originTime, 0))
                     array.push(e.snLabel, r2.labelMask)
                     array.push(e.snPair, r2.category == CAT_ACCUM ? f_pairTokenOf(e, r2.pairKey) : 0)
+                    //  ★ Phase9 : 事前境界専用の正規化 tick。
+                    //    値は f_buildDenseBounds() が毎回計算していた
+                    //    int(f_tickOf(snPrice[i], mintick)) と同じ。
+                    //    グループは tick 昇順に append されるので snTick は非減少。
+                    array.push(e.snTick, int(f_tickOf(r2.pointPrice, c.mintick)))
             pp := q2
     array.size(e.snRootId)
 
@@ -3126,16 +3242,14 @@ f_buildFvgIndex(ZoneEngine e, ZoneCfg c, float refClose) =>
 //  窓に入っている Accum Root の pair token 一覧 (e.scAccTok / e.scAccTf) に対する
 //  O(窓内 Accum 数) の衝突判定。Version 3 の f_accumPairConflict() は
 //  「同じ pairKey を持つ別 Root が窓にいるか」を見ていたので、判定結果は同じ。
+//  ★ Phase9 : scAccTok の線形探索を O(1) の seen 引きへ置き換える。
+//    「tok > 0 かつ scAccTok の中に tok がある」は
+//    「tok > 0 かつ 窓内の同 tok 件数 > 0」と同値。
+//    seen は各開始位置 / 各 Sweep クラスタの先頭で f_waEpochNext() により
+//    論理リセットされるので、窓をまたいだ状態は絶対に混ざらない。
+//    scAccTok / scAccTf の push 自体は従来どおり残している (件数と順序は不変)。
 f_accTokenConflict(ZoneEngine e, int tok) =>
-    bool conflict = false
-    if tok > 0
-        int an = array.size(e.scAccTok)
-        if an > 0
-            for q = 0 to an - 1
-                if array.get(e.scAccTok, q) == tok
-                    conflict := true
-                    break
-    conflict
+    tok > 0 and f_waSeenTok(e, tok) > 0
 
 // ---- 6.6 Dense 候補の増分探索 ---------------------------------------------
 //  ★ Phase3B ★ 部分窓が 1 Root 伸びるたびに Candidate 全体を作り直す方式をやめ、
@@ -3179,35 +3293,65 @@ f_accTokenConflict(ZoneEngine e, int tok) =>
 //    a を丸こと飛ばしても best は 1 ビットも変わらない。
 //    探索回数 (最大 12) も走査順も tie-break も変えていない。
 //    (近似ではなく、結果が変わらないと証明できる組み合わせだけの除外)
+//  ★ Phase9 : 二重ループを廃止して O(n^2) -> O(n * CAT_COUNT) にする。
+//
+//  (A) dsHardEnd : two-pointer
+//      snTick は非減少 (Snapshot は tick 昇順のグループを順に append する) なので、
+//      しきい値 snTick[a] + wLim も a について非減少。したがって
+//      「snTick[b] - snTick[a] > wLim となる最初の b」も a について非減少で、
+//      pointer を戻さずに前へ進めるだけで全部の a を求められる。
+//      b は必ず a より後ろ (j >= a + 1 を維持) なので、a == n - 1 では j == n、
+//      つまり従来と同じ「存在しなければ n」になる。
+//      すでに j まで進んでいる場合、[a+1, j) の各要素は
+//        snTick[.] - snTick[a-1] <= wLim かつ snTick[a] >= snTick[a-1]
+//      より snTick[.] - snTick[a] <= wLim を必ず満たすので、読み飛ばして良い。
+//
+//  (B) dsMaxCatCnt : カテゴリ別 prefix count
+//      snCatPrefix[i * CAT_COUNT + cat] = snCat[0..i-1] のうち cat の件数。
+//      [a, lim) に cat が 1 件以上あるかは prefix[lim] > prefix[a] で判る。
+//      「窓内の distinct category 数」は旧版の mask 集計と同じ値になる。
+//
+//  本探索 (f_searchDenseBest / f_scanStartDense) の break 条件は f_gtT のままで、
+//  snTick はこの事前境界にしか使わない。
 f_buildDenseBounds(ZoneEngine e, ZoneCfg c, float maxWidth) =>
     int n = array.size(e.snRootId)
     f_fillInt(e.dsHardEnd, n, n)
     f_fillInt(e.dsMaxCatCnt, n, 0)
+    //  ★ Phase9 : prefix は必要サイズまで一度だけ伸ばす (毎足の clear + push をしない)。
+    //    行 0 だけ明示的に 0 へ戻し、行 1..n は下のループが全要素を上書きする。
+    //    行 n より後ろは j <= n なので一切読まない。
+    int pfNeed = (n + 1) * CAT_COUNT
+    int pfCur  = array.size(e.snCatPrefix)
+    if pfCur < pfNeed
+        for q = pfCur to pfNeed - 1
+            array.push(e.snCatPrefix, 0)
+    for cat0 = 0 to CAT_COUNT - 1
+        array.set(e.snCatPrefix, cat0, 0)
     if n > 0
+        //  (B) prefix count を 1 回だけ作る
+        for i = 0 to n - 1
+            int base0 = i * CAT_COUNT
+            int base1 = base0 + CAT_COUNT
+            for cat = 0 to CAT_COUNT - 1
+                array.set(e.snCatPrefix, base1 + cat, array.get(e.snCatPrefix, base0 + cat))
+            int rc = array.get(e.snCat, i)
+            array.set(e.snCatPrefix, base1 + rc, array.get(e.snCatPrefix, base1 + rc) + 1)
         int wLim = int(f_tickOf(maxWidth, c.mintick)) + 1
+        int j = 1
         for a = 0 to n - 1
-            int ta = int(f_tickOf(array.get(e.snPrice, a), c.mintick))
-            int lim = n
-            //  ★ Phase8c : a == n - 1 のとき `for b = a + 1 to n - 1` は
-            //    `for b = n to n - 1` になり、Pine は降順ループとして実行するので
-            //    array.get(e.snPrice, n) で境界外アクセスになる。
-            //    内側ループだけを a < n - 1 でガードする。
-            //    a == n - 1 のときの lim は初期値 n のままで、これは
-            //    「a より後ろに Root が無い」= 従来意図した値と同じ。
-            //    (n > 1 で関数全体や外側ループを囲うと n == 1 のときに
-            //     dsHardEnd / dsMaxCatCnt が計算されなくなるので、そうはしない)
-            if a < n - 1
-                for b = a + 1 to n - 1
-                    if int(f_tickOf(array.get(e.snPrice, b), c.mintick)) - ta > wLim
-                        lim := b
-                        break
-            array.set(e.dsHardEnd, a, lim)
-            int msk = 0
+            int ta = array.get(e.snTick, a)
+            if j < a + 1
+                j := a + 1
+            while j < n
+                if array.get(e.snTick, j) - ta > wLim
+                    break
+                j := j + 1
+            array.set(e.dsHardEnd, a, j)
             int cnt = 0
-            for b = a to lim - 1
-                int rcat = array.get(e.snCat, b)
-                if not f_maskHas(msk, rcat)
-                    msk := f_maskAdd(msk, rcat)
+            int baseA = a * CAT_COUNT
+            int baseL = j * CAT_COUNT
+            for cat = 0 to CAT_COUNT - 1
+                if array.get(e.snCatPrefix, baseL + cat) > array.get(e.snCatPrefix, baseA + cat)
                     cnt := cnt + 1
             array.set(e.dsMaxCatCnt, a, cnt)
     n
@@ -3231,6 +3375,8 @@ f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requir
                 array.clear(e.scWinIdx)
                 array.clear(e.scAccTok)
                 array.clear(e.scAccTf)
+                //  ★ Phase9 : この開始位置の窓の seen を論理リセットする
+                f_waEpochNext(e)
                 float lo = array.get(e.snPrice, a)
                 //  ★ 探索の打ち切り用の幅は Version 3 と同じ (price[b] - lo)。
                 //    Candidate の実幅は窓内の真の max - min なので別に持つ。
@@ -3302,14 +3448,17 @@ f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requir
                             if atf == TF_4H or atf == TF_D
                                 accHigh := true
                             else
-                                int an = array.size(e.scAccTok)
-                                if an > 0
-                                    for q = 0 to an - 1
-                                        if array.get(e.scAccTok, q) != atok and array.get(e.scAccTf, q) != atf
-                                            accHigh := true
-                                            break
+                                //  ★ Phase9 : 包含排除で「tok も tf も違う先行要素の件数」
+                                //    dBoth = total - sameTok - sameTf + sameTokAndTf
+                                //    これは旧内側ループの条件と厳密に同値 (|not A and not B|)。
+                                int atot = array.size(e.scAccTok)
+                                int dBoth = atot - f_waSeenTok(e, atok) - f_waSeenTf(e, atf)
+                                     + f_waSeenPair(e, atok, atf)
+                                if dBoth > 0
+                                    accHigh := true
                         array.push(e.scAccTok, atok)
                         array.push(e.scAccTf, atf)
+                        f_waSeenAdd(e, atok, atf)
                     else if rcat == CAT_TIME_HL
                         if not tlHigh
                             int lm = array.get(e.snLabel, b)
@@ -3391,6 +3540,8 @@ f_scanStartDense(ZoneEngine e, ZoneCfg c, int side, int a, float maxWidth,
     array.clear(e.scWinIdx)
     array.clear(e.scAccTok)
     array.clear(e.scAccTf)
+    //  ★ Phase9 : この開始位置の窓の seen を論理リセットする
+    f_waEpochNext(e)
     float lo = array.get(e.snPrice, a)
     //  ★ 探索の打ち切り用の幅は Version 3 と同じ (price[b] - lo)。
     //    Candidate の実幅は窓内の真の max - min なので別に持つ。
@@ -3462,14 +3613,17 @@ f_scanStartDense(ZoneEngine e, ZoneCfg c, int side, int a, float maxWidth,
                 if atf == TF_4H or atf == TF_D
                     accHigh := true
                 else
-                    int an = array.size(e.scAccTok)
-                    if an > 0
-                        for q = 0 to an - 1
-                            if array.get(e.scAccTok, q) != atok and array.get(e.scAccTf, q) != atf
-                                accHigh := true
-                                break
+                    //  ★ Phase9 : 包含排除で「tok も tf も違う先行要素の件数」
+                    //    dBoth = total - sameTok - sameTf + sameTokAndTf
+                    //    これは旧内側ループの条件と厳密に同値 (|not A and not B|)。
+                    int atot = array.size(e.scAccTok)
+                    int dBoth = atot - f_waSeenTok(e, atok) - f_waSeenTf(e, atf)
+                         + f_waSeenPair(e, atok, atf)
+                    if dBoth > 0
+                        accHigh := true
             array.push(e.scAccTok, atok)
             array.push(e.scAccTf, atf)
+            f_waSeenAdd(e, atok, atf)
         else if rcat == CAT_TIME_HL
             if not tlHigh
                 int lm = array.get(e.snLabel, b)
@@ -3621,18 +3775,32 @@ f_searchDenseBestCached(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool 
 
 //  used になった index の影響を受ける a を dirty にする。
 //  a の読み範囲は [a, dsEnd[a]) の superset なので、そこに u が入れば dirty。
+//
+//  ★ Phase9 : 二重ループを廃止して O(n * used) -> O(n + used) にする。
+//    scBestIdx は昇順 (scWinIdx = b 昇順のコピー) なので、
+//      u* = min{ u in scBestIdx | u >= a }
+//    は a について非減少 -> 単調 pointer 1 本で求まる。
+//    「[a, dsEnd[a]) に u が 1 つでも入る」は「u* < dsEnd[a]」と厳密に同値 :
+//      ・範囲内の u が存在すれば、その u は u >= a なので u* <= u < dsEnd[a]
+//      ・u* < dsEnd[a] なら u* 自身が u* >= a かつ u* < dsEnd[a] で範囲内
+//    dsEnd の単調性には依存しない (pointer は scBestIdx 側だけを進める)。
+//    dirty になる a の集合は従来と完全一致する。
 f_markDenseDirty(ZoneEngine e) =>
     int n = array.size(e.dsDirty)
     int m = array.size(e.scBestIdx)
     if n > 0 and m > 0
+        int pt = 0
         for a = 0 to n - 1
+            while pt < m
+                if array.get(e.scBestIdx, pt) >= a
+                    break
+                pt := pt + 1
+            if pt >= m
+                //  これ以降の a には a 以上の used index が 1 つもない
+                break
             if not array.get(e.dsDirty, a)
-                int lim = array.get(e.dsEnd, a)
-                for q = 0 to m - 1
-                    int u = array.get(e.scBestIdx, q)
-                    if u >= a and u < lim
-                        array.set(e.dsDirty, a, true)
-                        break
+                if array.get(e.scBestIdx, pt) < array.get(e.dsEnd, a)
+                    array.set(e.dsDirty, a, true)
     true
 
 //  best 窓 (スナップショット位置の列) から正式 Candidate を作り、used を立てる。
@@ -4006,12 +4174,15 @@ f_buildSideCands(ZoneEngine e, ZoneCfg c, ZoneFeed f, int side, array<ZoneCand> 
                 array.clear(e.scWinIdx)
                 array.clear(e.scAccTok)
                 array.clear(e.scAccTf)
+                //  ★ Phase9 : このクラスタの seen を論理リセットする
+                f_waEpochNext(e)
                 array.push(e.scCurIds, array.get(e.snRootId, i))
                 array.push(e.scWinIdx, i)
                 int tok0 = array.get(e.snPair, i)
                 if tok0 > 0
                     array.push(e.scAccTok, tok0)
                     array.push(e.scAccTf, array.get(e.snTf, i))
+                    f_waSeenAdd(e, tok0, array.get(e.snTf, i))
                 float lo = array.get(e.snPrice, i)
                 if i < n - 1
                     for k = i + 1 to n - 1
@@ -4026,6 +4197,7 @@ f_buildSideCands(ZoneEngine e, ZoneCfg c, ZoneFeed f, int side, array<ZoneCand> 
                             if tokk > 0
                                 array.push(e.scAccTok, tokk)
                                 array.push(e.scAccTf, array.get(e.snTf, k))
+                                f_waSeenAdd(e, tokk, array.get(e.snTf, k))
                 ZoneCand cd = f_buildCand(e, c, side, e.scCurIds, na, na, false, false)
                 if cd.hasNonPsych
                     array.push(out, cd)
@@ -4544,12 +4716,17 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     //  ★ Phase7 : Core × Candidate の比較値キャッシュ (nc × nk)。
     //    Pass 1 で埋め、Pass 4 で coreTouched でない Core についてだけ使う。
     f_fillBool(e.coreTouched, nc, false)
-    array.clear(e.ccGap)
-    array.clear(e.ccSh)
+    //  ★ Phase9 : 毎足 clear + nc*nk 件 push をやめ、必要サイズまで一度だけ伸ばす。
+    //    Pass 1 は nc > 0 かつ nk > 0 のとき ci in [0, nc) x k in [0, nk) の
+    //    全要素へ書き込み、Pass 4 が読むのは同じ (ci, k) 範囲だけなので、
+    //    今回使う範囲より後ろに残っている前足の値は一切読まれない。
+    //    値・index 式 (ci * nk + k)・Pass 順は変更していない。
     int ccN = int(math.max(nc * nk, 1))
-    for q = 0 to ccN - 1
-        array.push(e.ccGap, float(na))
-        array.push(e.ccSh, 0)
+    int ccCur = array.size(e.ccGap)
+    if ccCur < ccN
+        for q = ccCur to ccN - 1
+            array.push(e.ccGap, float(na))
+            array.push(e.ccSh, 0)
 
     if nc > 0
         for ci = 0 to nc - 1

@@ -207,6 +207,87 @@ def check(path):
             problems.append((n0, '-', 'for %s+1 to %s-1 without a %s < %s-1 guard'
                              % (A, N, A, N), ln.strip()[:60]))
 
+    # ---- display calls must sit behind a last-bar gate (harness only) --------
+    # Drawing, tables and display string building must never run on history bars.
+    # A call qualifies if some enclosing `if` (any level) names a last-bar gate,
+    # or it is the one-time `var t = na` / `if na(t)` object creation.
+    helper_display = set()
+    DRAW = re.compile(r'\b(?:box|line|label|table)\.(?:new|set_\w+|cell|clear|delete)\b'
+                      r'|\bstr\.format_time\b')
+    GATE = re.compile(r'barstate\.islast|barstate\.islastconfirmedhistory|needRedraw'
+                      r'|wantProjection|lastWantEvents|na\(')
+    if 'indicator(' in src or 'strategy(' in src:
+        for n0, ln in enumerate(lines, 1):
+            code = ln.split('//')[0]
+            if not DRAW.search(code):
+                continue
+            ind = len(code) - len(code.lstrip(' '))
+            gated = False
+            cur = ind
+            for j2 in range(n0 - 2, -1, -1):
+                prev = lines[j2].split('//')[0]
+                if not prev.strip():
+                    continue
+                pind = len(prev) - len(prev.lstrip(' '))
+                if pind >= cur:
+                    continue
+                cur = pind
+                if GATE.search(prev):
+                    gated = True
+                    break
+                if pind == 0:
+                    break
+            if gated:
+                continue
+            # The call may sit inside a display HELPER (f_boxAt, f_dbgRow, ...).
+            # Then the requirement moves to every call site of that helper.
+            owner = None
+            for j2 in range(n0 - 1, -1, -1):
+                m2 = re.match(r'^(f_\w+)\s*\(', lines[j2])
+                if m2:
+                    owner = m2.group(1)
+                    break
+                if lines[j2].strip() and not lines[j2].startswith((' ', '\t')) \
+                        and not lines[j2].lstrip().startswith('//'):
+                    break
+            if owner is None:
+                problems.append((n0, '-', 'display call not behind a last-bar gate',
+                                 ln.strip()[:60]))
+                continue
+            helper_display.add(owner)
+
+        # every call site of a display helper must itself be gated
+        for nm in sorted(helper_display):
+            for n0, ln in enumerate(lines, 1):
+                code = ln.split('//')[0]
+                if re.match(r'^(?:\s*)' + re.escape(nm) + r'\s*\(', code):
+                    continue                      # its own declaration
+                if not re.search(r'\b' + re.escape(nm) + r'\s*\(', code):
+                    continue
+                ind = len(code) - len(code.lstrip(' '))
+                if ind == 0:
+                    problems.append((n0, '-', 'display helper %s called unconditionally' % nm,
+                                     ln.strip()[:60]))
+                    continue
+                gated = False
+                cur = ind
+                for j2 in range(n0 - 2, -1, -1):
+                    prev = lines[j2].split('//')[0]
+                    if not prev.strip():
+                        continue
+                    pind = len(prev) - len(prev.lstrip(' '))
+                    if pind >= cur:
+                        continue
+                    cur = pind
+                    if GATE.search(prev) or re.match(r'^f_\w+\s*\(', prev):
+                        gated = True
+                        break
+                    if pind == 0:
+                        break
+                if not gated:
+                    problems.append((n0, '-', 'display helper %s call not gated' % nm,
+                                     ln.strip()[:60]))
+
     # ---- request.* tuple budget (Pine caps the script total at 127) ----------
     # Counted over EVERY source branch, not just the executed one. A UDT return
     # counts as 1 element; a [a, b, c] destructuring counts as its arity.
