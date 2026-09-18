@@ -28,7 +28,31 @@ TradingView へ Library を Publish したあと、実際の `<username>/<name>/
 
 ## Compile status
 
-**静的確認のみ (Pine Editor でのコンパイル未確認)。**
+**Pine Editor 1 回目: エラー 9 件 → 修正済み。2 回目のコンパイルは未確認 (この実装環境から Pine Editor を開けないため)。**
+
+### 1 回目のコンパイル結果 (利用者側で実施)
+
+`Cannot shadow the built-in variable` 系 9 件。原因は Pine 組み込み名をローカル変数 / 引数 / UDT フィールドとして
+再定義していたこと。判定ロジックを一切変えずに名前だけを変更して解消した。
+
+| # | 箇所 | 変更前 | 変更後 |
+|---:|---|---|---|
+| 1-5 | `f_qualityMa` / `f_qualitySwing` / `f_qualityAccum` / `f_qualityTimeHl` / `f_qualityFvg` | `bool high` | `bool isHighQuality` |
+| 6-7 | `f_touchIntersect` の引数 | `float low, float high` | `float barLow, float barHigh` |
+| 8 | `TouchMark` のフィールド | `int time` | `int touchTime` |
+| 9 | `ZoneEvent` のフィールド | `int time` | `int eventTime` |
+
+追従した参照: `high := ...` / 戻り値の `high`、`f_touchIntersect` 内部の `low` / `high`、
+`TouchMark.new(time = ...)` と `t.time` / `tm.time`、`ZoneEvent.new(time = ...)`、
+Harness の `ev.time`。呼び出し側へ渡す値 (`f.baseLow` / `f.baseHigh` / `f.baseCloseTime`) と
+判定式は変更していない。
+
+`open` / `high` / `low` / `close` / `time` / `time_close` / `volume` / `bar_index` を
+宣言名・引数名・UDT フィールド名として使っている箇所が他に無いことを両ファイルで機械走査し、0 件を確認した
+(`maPackV2` / `pivotPackV2` / `accumPackV2` / `fvgPackV2` 内の `high` / `low` / `close` / `time` は
+外部足コンテキストで価格データを読んでいる正規の使用なので変更していない)。
+
+### 静的確認 (共通)
 
 この実装環境から TradingView / Pine Editor へアクセスできないため、「コンパイル済み」とは書かない。
 実施した静的確認は次のとおり。
