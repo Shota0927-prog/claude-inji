@@ -417,6 +417,39 @@ P・Q（片Side CoreのEpisode prune / Split後の無関係履歴復活なし）
 
 静的にコードを直したことと、実機で仕様適合を確認したことは別です。
 
+### 6.1 コンパイルエラー修正（2026-09-19）
+
+TradingViewでの実コンパイルで `Error at 221:16 no viable alternative at character "&"` が発生しました。
+Pine Script v6には `&` / `|` / `<<` のビット演算子が存在しないため、ビットマスク処理を以下へ置換しました（Build IDは `ZEV2R-20260919-006` のまま据え置き）。
+
+| 旧表記 | 新表記 | 箇所数 |
+|---|---|---|
+| `(a & b)` | `bitwise.and(a, b)` | 20 |
+| ビットOR（`a` OR `b`） | `bitOr(a, b)` | 14 |
+| `(1 << n)` | `bitPow2(n)` | 7 |
+
+補助関数（Library内部、非export、セクション2冒頭に定義）:
+
+```pine
+bitOr(int a, int b) =>
+    a + b - bitwise.and(a, b)
+
+bitPow2(int n) =>
+    int v = 1
+    if n > 0
+        for i = 1 to n
+            v *= 2
+    v
+```
+
+`a + b - bitwise.and(a, b)` は非負整数に対してビットORと値が完全に一致し、`bitPow2(n)` は `1 << n` と一致します。
+本ファイルで扱うマスク（catMask / highMask / labelMask / fvgDirMask / fvgStateMask / acTfMask）はすべて非負であるため、**Zoneロジックの動作は一切変わりません**（Pine v6構文互換のみの修正）。
+
+静的確認：`ZoneEngineV2_Rebuild.pine` / `ZoneEngineV2_Rebuild_VisualHarness.pine` の両方で、文字列リテラルとコメントを除いたコード部分に `&` `|` `<<` は **0件**。
+（残る `|` は `" | "` のような表示用文字列と説明コメントのみ。）
+
+再コンパイルは **NOT RUN** です。
+
 ---
 
 ## 7. 計算構造
@@ -527,5 +560,6 @@ Debug表の時刻も同じ`i_tz`で表示します。
 | 4 | -004 | 段階Bの完成（残Point Rootへの局所化）、心理価格を候補列挙Rootから除外、Touch Episode単位の履歴、Zone lifetimeを仕様14へ、Stale Side Structureの失効、非BroadのFVG重複Highの空間結合、FVG 50%表示の削除、Harnessの5分足強制、Debug timezone、段階表記の統一 |
 | 5 | -005 | Core物理範囲/Originの無条件再構築、Episode dedupeキーの統一、心理価格構成の全評価、片Side Coreでも有効なEpisode prune |
 | 6 | -006 | Core associationの7フェーズ化（順序非依存）、Root ownershipの一括確定、Psychの同Side ownership、TouchEpisode + ContactSpanによる実接触履歴、Episode単位truncate、Split/Merge履歴配分 |
+| 6a | -006（据え置き） | Pine v6構文互換修正のみ：ビットAND→`bitwise.and()`、ビットOR→`bitOr()`、`1 << n`→`bitPow2()`。ロジック変更なし |
 
 各改訂の差分はgit履歴（ブランチ `claude/new-session-vss3r2`）に保存されています。
