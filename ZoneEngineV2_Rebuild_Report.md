@@ -592,6 +592,66 @@ Library / Visual Harness の全宣言（型付きローカル宣言・`var` / `v
 
 ---
 
+### 6.4 UDTオブジェクトの直接比較の解消（2026-09-19）
+
+TradingViewでの実コンパイルで
+`Error around line 2534: Cannot call "operator ==" with argument "expr0"="c.supportView.activeEpisode". An argument of "TouchEpisode" type was used...`
+が出ました。Pine v6はUDTオブジェクト同士を `==` / `!=` で比較できません。
+
+#### 修正（`pruneEpisodesToRange()` 1箇所）
+
+```pine
+// 旧
+bool isActive = (not na(c.supportView.activeEpisode) and c.supportView.activeEpisode == ep) or
+     (not na(c.resistanceView.activeEpisode) and c.resistanceView.activeEpisode == ep)
+
+// 新
+bool supActive = not na(c.supportView.activeEpisode) and
+     c.supportView.activeEpisode.episodeId == ep.episodeId
+bool resActive = not na(c.resistanceView.activeEpisode) and
+     c.resistanceView.activeEpisode.episodeId == ep.episodeId
+bool isActive = supActive or resActive
+```
+
+`episodeId` は `newEpisode()` が `e.nextEpisodeId` から採番するTouchEpisodeの安定IDで、Merge / Split / truncate を通じて不変です。
+`na` ガードの位置と `or` の短絡順序も旧式と同一のため、**判定結果は完全に一致**します（「同じActive Episodeか」の判定方法のみ変更）。
+
+#### 全体走査
+
+Library / Visual Harness の全 `==` / `!=` / `<` / `>` / `<=` / `>=` について、両辺の式の型を解決して確認しました。
+型解決は、UDT定義17種のフィールド型表、関数シグネチャの引数型（複数行シグネチャを結合）、関数スコープ単位のローカル宣言、
+`array<T>` の要素型経由の `array.get()`、UDTを返すユーザー関数の戻り型、の各経路で行っています。
+
+| 対象UDT | 直接比較 |
+|---|---|
+| `TouchEpisode` | **0件**（修正後） |
+| `ZoneCore` / `SideViewState` / `SideHistory` | 0件 |
+| `Root` / `ContactSpan` | 0件 |
+| `TouchStartSnapshot` / `BreakSnapshot` | 0件 |
+| `ZoneCfg` / `ZoneEngine` / `ZoneEvent` / `ZoneView` | 0件 |
+| `BaseFeed` / `MaPack` / `PivotPack` / `AccumPack` / `FvgPack` | 0件 |
+
+Visual Harnessは0件（元から該当なし）。
+
+#### 既存の同一性判定（変更なし）
+
+以下はすべて元からprimitive field比較であり、そのまま維持しています。
+
+| 箇所 | 比較キー |
+|---|---|
+| `episodeIsDuplicate()` | `o.episodeId == ep.episodeId` または `sameEpisodeKey()` |
+| `sameEpisodeKey()` | Side + time + 接触レンジtick + normalフラグのfield単位比較 |
+| `sortEpisodesByStart()` | `a.startSeq` / `a.episodeId` |
+| Core同一性 | `coreId` |
+| Root同一性 | `rootId`（`candIdentityHasRoot()` 等） |
+| ContactSpan | `baseSeq` / `time` / bottom・top tick |
+
+**ロジック変更は0件**（比較方法のみ）。
+
+再コンパイルは **NOT RUN** です。
+
+---
+
 ## 7. 計算構造
 
 ### 7.1 キャッシュ（キー／失効／容量／fallback／所有）
@@ -703,5 +763,6 @@ Debug表の時刻も同じ`i_tz`で表示します。
 | 6a | -006（据え置き） | Pine v6構文互換修正のみ：ビットマスク処理を算術方式へ統一（`maskHas` / `maskSet` / `bitPow2`）。ビット演算子と`bitwise.*`を全廃。ロジック・mask値の変更なし |
 | 6b | -006（据え置き） | Pine v6構文互換修正のみ：side-effect専用29関数の末尾に固定 `0` を追加し、関数戻り値型を安定化。ロジック変更なし |
 | 6c | -006（据え置き） | Pine v6構文互換修正のみ：組み込み `high` をshadowするローカル変数2件を `fvgHigh` へrename。ロジック変更なし |
+| 6d | -006（据え置き） | Pine v6構文互換修正のみ：TouchEpisodeの直接 `==` 比較を `episodeId` 比較へ変更。ロジック変更なし |
 
 各改訂の差分はgit履歴（ブランチ `claude/new-session-vss3r2`）に保存されています。
