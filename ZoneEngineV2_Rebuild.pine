@@ -1,0 +1,2666 @@
+//@version=6
+// =============================================================================
+//  ZoneEngineV2_Rebuild
+//  Zone definition spec v2 (Zone_definition_spec_v2.md) - logic unchanged.
+//  Rebuilt data structures / evaluation order for runtime + memory economy.
+//
+//  Build ID .......... ZEV2R-20260919-001
+//  Base timeframe .... confirmed 5m bar, engine updates exactly once per bar
+//  Logic contract .... spec v2 sections 1-21 + instruction appendix A
+//
+//  Layering (instruction M3). Do not reorder State/Candidate execution:
+//    Source/Feed      -> helper packs evaluated in their own request context
+//    Root registry    -> id/slot split, origin + category indices
+//    Candidate eval   -> per-side dense/normal/FVG candidates, numeric only
+//    Core association -> identity / merge / split / pending topology
+//    State transition -> touch / weak / break / flip / reclaim / inverse
+//    Read API         -> views + events, read-only projections
+//    Presentation     -> harness only, never feeds back into logic
+// =============================================================================
+library("ZoneEngineV2_Rebuild", overlay = true)
+
+// -----------------------------------------------------------------------------
+// 0. Build identity
+// -----------------------------------------------------------------------------
+export buildId() =>
+    "ZEV2R-20260919-001"
+
+// -----------------------------------------------------------------------------
+// 1. Constants (int codes only; strings are produced at presentation time)
+// -----------------------------------------------------------------------------
+// Category
+var int CAT_MA      = 0
+var int CAT_SWING   = 1
+var int CAT_ACCUM   = 2
+var int CAT_TIME_HL = 3
+var int CAT_FVG     = 4
+var int CAT_PSYCH   = 5
+var int CAT_COUNT   = 6
+
+// Side
+var int SIDE_SUPPORT    = 1
+var int SIDE_RESISTANCE = -1
+var int SIDE_NONE       = 0
+
+// Phase
+var int PH_WAITING      = 0
+var int PH_ARMED        = 1
+var int PH_ACTIVE_TOUCH = 2
+var int PH_BROKEN       = 3
+var int PH_FLIP_WAIT    = 4
+var int PH_DORMANT      = 5
+
+// Grade
+var int GR_STRONG      = 0
+var int GR_NEUTRAL     = 1
+var int GR_WEAK        = 2
+var int GR_UNAVAILABLE = 3
+
+// Density
+var int DEN_HIGH          = 0
+var int DEN_NORMAL        = 1
+var int DEN_BROAD_CONTEXT = 2
+
+// Root state
+var int ROOT_CANDIDATE      = 0
+var int ROOT_ACTIVE         = 1
+var int ROOT_INVALIDATED    = 2
+var int ROOT_INVERSE_WAIT   = 3
+var int ROOT_INVERSE_ACTIVE = 4
+var int ROOT_RETIRED        = 5
+
+// FVG direction
+var int FVG_NONE    = 0
+var int FVG_BULLISH = 1
+var int FVG_BEARISH = 2
+
+// Weak reason
+var int WEAK_NONE     = 0
+var int WEAK_BY_TOUCH = 1
+var int WEAK_BY_DEPTH = 2
+var int WEAK_BY_BOTH  = 3
+
+// Event type
+var int EV_TOUCH_START      = 0
+var int EV_TOUCH_RESET      = 1
+var int EV_WEAK_DEPTH       = 2
+var int EV_LOCAL_BREAK      = 3
+var int EV_GAP_BREAK        = 4
+var int EV_FLIP_ATTEMPT     = 5
+var int EV_FLIP_CONFIRM     = 6
+var int EV_RECLAIM          = 7
+var int EV_FVG_INVALIDATE   = 8
+var int EV_INVERSE_ATTEMPT  = 9
+var int EV_INVERSE_CONFIRM  = 10
+var int EV_GENERATION_START = 11
+var int EV_MERGE            = 12
+var int EV_SPLIT            = 13
+var int EV_STORAGE_PRUNE    = 14
+
+// Timeframe codes (minutes; daily = 1440). tfRank uses the same ordering.
+var int TF_1M  = 1
+var int TF_5M  = 5
+var int TF_15M = 15
+var int TF_1H  = 60
+var int TF_4H  = 240
+var int TF_D   = 1440
+
+// Subtypes
+var int SUB_EMA2000      = 0
+var int SUB_EMA3000      = 1
+var int SUB_SWING_HIGH   = 2
+var int SUB_SWING_LOW    = 3
+var int SUB_ACCUM_UPPER  = 4
+var int SUB_ACCUM_LOWER  = 5
+var int SUB_PSYCH_MAJOR  = 6
+var int SUB_PSYCH_STD    = 7
+var int SUB_FVG          = 8
+var int SUB_TIME_HIGH    = 9
+var int SUB_TIME_LOW     = 10
+
+// Time high/low period labels (bit mask; one root can carry several labels)
+var int LBL_CUR_SESSION  = 1
+var int LBL_LAST_SESSION = 2
+var int LBL_TODAY        = 4
+var int LBL_PREV_DAY     = 8
+var int LBL_CUR_WEEK     = 16
+var int LBL_PREV_WEEK    = 32
+
+// Swing detection timeframe mask (same-event merge keeps every detecting TF)
+var int SWM_5M  = 1
+var int SWM_15M = 2
+var int SWM_1H  = 4
+
+var int MS_DAY  = 86400000
+var int MS_HOUR = 3600000
+
+// Internal fixed capacities for scratch structures (not logical storage limits;
+// exceeding them routes to the exact recomputation path, never to empty results)
+var int SCRATCH_MAX_ROOTS = 512
+var int MAX_PSYCH_ROOTS   = 64
+
+// -----------------------------------------------------------------------------
+// 2. Name conversion (presentation only) and code accessors for the harness
+// -----------------------------------------------------------------------------
+export categoryName(int c) =>
+    switch c
+        0 => "MA"
+        1 => "Swing"
+        2 => "Accum"
+        3 => "TimeHL"
+        4 => "FVG"
+        5 => "Psych"
+        => "?"
+
+export sideName(int s) =>
+    s == 1 ? "Support" : s == -1 ? "Resistance" : "None"
+
+export phaseName(int p) =>
+    switch p
+        0 => "Waiting"
+        1 => "Armed"
+        2 => "ActiveTouch"
+        3 => "Broken"
+        4 => "FlipWait"
+        5 => "Dormant"
+        => "?"
+
+export gradeName(int g) =>
+    switch g
+        0 => "Strong"
+        1 => "Neutral"
+        2 => "Weak"
+        3 => "Unavailable"
+        => "?"
+
+export densityName(int d) =>
+    switch d
+        0 => "High"
+        1 => "Normal"
+        2 => "BroadContext"
+        => "?"
+
+export weakReasonName(int w) =>
+    switch w
+        0 => "None"
+        1 => "WeakByTouch"
+        2 => "WeakByDepth"
+        3 => "WeakByBoth"
+        => "?"
+
+export rootStateName(int s) =>
+    switch s
+        0 => "Candidate"
+        1 => "Active"
+        2 => "Invalidated"
+        3 => "InverseWait"
+        4 => "InverseActive"
+        5 => "Retired"
+        => "?"
+
+export fvgDirName(int d) =>
+    d == 1 ? "Bullish" : d == 2 ? "Bearish" : "None"
+
+export eventName(int e) =>
+    switch e
+        0  => "TouchStart"
+        1  => "TouchReset"
+        2  => "WeakDepth"
+        3  => "LocalBreak"
+        4  => "GapBreak"
+        5  => "FlipAttempt"
+        6  => "FlipConfirm"
+        7  => "Reclaim"
+        8  => "FvgInvalidate"
+        9  => "InverseAttempt"
+        10 => "InverseConfirm"
+        11 => "GenerationStart"
+        12 => "Merge"
+        13 => "Split"
+        14 => "StoragePrune"
+        => "?"
+
+export tfName(int tf) =>
+    switch tf
+        1    => "1m"
+        5    => "5m"
+        15   => "15m"
+        60   => "1H"
+        240  => "4H"
+        1440 => "1D"
+        => str.tostring(tf) + "m"
+
+// Code accessors: the harness must never hardcode the numeric codes.
+export codeSideSupport()    => 1
+export codeSideResistance() => -1
+export codeGradeStrong()    => 0
+export codeGradeNeutral()   => 1
+export codeGradeWeak()      => 2
+export codeGradeUnavail()   => 3
+export codePhaseWaiting()   => 0
+export codePhaseArmed()     => 1
+export codePhaseActive()    => 2
+export codePhaseBroken()    => 3
+export codePhaseFlipWait()  => 4
+export codePhaseDormant()   => 5
+export codeDensityHigh()    => 0
+export codeDensityNormal()  => 1
+export codeDensityBroad()   => 2
+export codeCatCount()       => 6
+
+// -----------------------------------------------------------------------------
+// 3. Types
+// -----------------------------------------------------------------------------
+export type ZoneCfg
+    // --- logical parameters (appendix A 4.1) -------------------------------
+    float clusterMaxWidth    = 20.0
+    float denseRatio         = 0.50
+    float touchResetDistance = 10.0
+    int   strongUntilTouch   = 1
+    bool  strongUnlimited    = false
+    int   weakFromTouch      = 2
+    bool  weakFromTouchOff   = false
+    float weakDepthPct       = 50.0
+    bool  weakDepthOff       = false
+    float breakBuffer        = 2.0
+    float touchTolerance     = 0.0
+    int   emaSlopeLookback   = 60
+    int   swingLen5m         = 10
+    int   swingLen15m        = 8
+    int   swingLen1h         = 6
+    // --- accum detection (appendix A 4.2) ----------------------------------
+    int   accumRangeLen       = 10
+    int   accumBaseLen        = 20
+    int   accumAtrLen         = 14
+    int   accumMinUpperCloses = 4
+    int   accumMinLowerCloses = 4
+    int   accumMaxSameColorRun = 4
+    float accumAtrMult        = 2.5
+    float accumBarRatioMax    = 0.70
+    float accumDriftMax       = 0.30
+    // --- time settings (appendix A 4.3) ------------------------------------
+    string zoneTimezone   = "Asia/Tokyo"
+    int    asiaStartMin   = 540    // 09:00
+    int    europeStartMin = 840    // 14:00
+    int    nyStartMin     = 1140   // 19:00
+    int    nyEndMin       = 180    // 03:00 next day
+    int    dayCutMin      = 300    // 05:00
+    int    weekCutDow     = 2      // dayofweek.monday
+    // --- categories on/off --------------------------------------------------
+    bool catMa    = true
+    bool catSwing = true
+    bool catAccum = true
+    bool catTime  = true
+    bool catFvg   = true
+    bool catPsych = true
+    // --- storage / display limits (appendix A 4.4) --------------------------
+    int   maxSwingRoots       = 180
+    int   maxAccumBoxes       = 60
+    int   maxFvgRoots         = 120
+    int   maxTimeRoots        = 32
+    int   maxZoneCores        = 80
+    int   maxEndedGenerations = 30
+    int   maxTouchMarksPerCore = 64
+    float dormantDistance     = 500.0
+    // --- feed ---------------------------------------------------------------
+    float mintick = 0.01
+    // --- derived / validation ----------------------------------------------
+    float denseWidth = 10.0
+    bool  valid      = true
+    string errorText = ""
+
+export type BaseFeed
+    float o         = na
+    float h         = na
+    float l         = na
+    float c         = na
+    float prevClose = na
+    int   openTime  = na
+    int   closeTime = na
+    int   seq       = 0
+    bool  confirmed = false
+    float mintick   = 0.01
+
+export type MaPack
+    float ema2000      = na
+    float ema2000Slope = na
+    float ema3000      = na
+    float ema3000Slope = na
+    int   srcCloseTime = na
+
+export type PivotPack
+    int   tfCode        = 0
+    float highPrice     = na
+    int   highOrigin    = na
+    int   highOriginEnd = na
+    int   highConfirmed = na
+    float lowPrice      = na
+    int   lowOrigin     = na
+    int   lowOriginEnd  = na
+    int   lowConfirmed  = na
+
+export type AccumPack
+    int   tfCode        = 0
+    bool  newBox        = false
+    float boxTop        = na
+    float boxBottom     = na
+    int   boxId         = na
+    int   candStartTime = na
+    int   confirmedTime = na
+
+export type FvgPack
+    int   tfCode         = 0
+    bool  bullNew        = false
+    float bullTop        = na
+    float bullBottom     = na
+    int   bullOrigin     = na
+    int   bullConfirmed  = na
+    bool  bearNew        = false
+    float bearTop        = na
+    float bearBottom     = na
+    int   bearOrigin     = na
+    int   bearConfirmed  = na
+    float srcHigh        = na
+    float srcLow         = na
+    float srcClose       = na
+    int   srcOpenTime    = na
+    int   srcCloseTime   = na
+
+export type Root
+    int   rootId        = 0
+    int   originKey     = 0
+    int   category      = 0
+    int   subtype       = 0
+    int   tfCode        = 0
+    int   originTime    = na
+    int   originEndTime = na
+    int   confirmedTime = na
+    float pointPrice    = na
+    float nativeBottom  = na
+    float nativeTop     = na
+    int   priceTick     = na
+    int   bottomTick    = na
+    int   topTick       = na
+    bool  isRangeRoot   = false
+    bool  isDynamic     = false
+    int   state         = 1
+    int   pairKey       = 0
+    int   direction     = 0
+    bool  fvgFresh      = true
+    bool  isBroadFvg    = false
+    int   labelMask     = 0
+    int   slopeDir      = 0     // MA only: +1 up, -1 down, 0 flat
+    int   lastUpdateSeq = 0
+    bool  movedAway     = false // FVG inverse staging
+    bool  pendingInvalidate = false
+    bool  retestSeen    = false
+
+export type SideHistory
+    int   sideTouchCount   = 0
+    bool  weakByTouch      = false
+    bool  weakByDepth      = false
+    float maxDepthPct      = 0.0
+    bool  sideFresh        = true
+    int   phase            = 0
+    int   grade            = 3
+    int   currentTouchNo   = 0
+    int   upcomingTouchNo  = 1
+    int   armedFromSeq     = -1
+    float lastArmedRangeBottom = na
+    float lastArmedRangeTop    = na
+    int   lastNormalTouchTime  = na
+    int   flipAttemptCount     = 0
+    int   inverseAttemptCount  = 0
+    int   lastFlipConfirmSeq   = -1
+    bool  everUsed             = false
+
+export type TouchMark
+    int   baseSeq       = 0
+    int   time          = na
+    int   side          = 0
+    float contactBottom = na
+    float contactTop    = na
+    float closeAtTouch  = na
+    int   generationId  = 0
+    bool  isNormalTouch = true
+
+export type TouchStartSnapshot
+    bool  valid         = false
+    int   coreId        = 0
+    int   generationId  = 0
+    int   side          = 0
+    float rangeBottom   = na
+    float rangeTop      = na
+    array<int> rootIds  = na
+    int   catMask       = 0
+    int   highMask      = 0
+    int   cCount        = 0
+    int   hCount        = 0
+    int   density       = 1
+    int   touchStartGrade = 1
+    int   currentTouchNo  = 0
+    int   approachSide    = 0
+    int   startSeq        = 0
+    int   startTime       = na
+    float deepestClose    = na
+    float maxDepthPct     = 0.0
+
+export type BreakSnapshot
+    bool  valid        = false
+    int   coreId       = 0
+    int   generationId = 0
+    int   oldSide      = 0
+    float rangeBottom  = na
+    float rangeTop     = na
+    array<int> rootIds = na
+    int   breakSeq     = 0
+    int   breakTime    = na
+    bool  wasGapBreak  = false
+    bool  movedAway    = false
+    bool  retestSeen   = false
+
+export type SideViewState
+    array<int> rootIds   = na
+    float effectiveBottom = na
+    float effectiveTop    = na
+    float referencePrice  = na
+    int   cCount          = 0
+    int   hCount          = 0
+    int   catMask         = 0
+    int   highMask        = 0
+    int   density         = 1
+    bool  baseStrong      = false
+    bool  hasNonPsychRoot = false
+    bool  isBroadContext  = false
+    bool  eligible        = false
+    int   fvgDirMask      = 0
+    int   fvgRootCount    = 0
+    int   fvgFreshCount   = 0
+    int   fvgStateMask    = 0
+    SideHistory history   = na
+    TouchStartSnapshot touchSnapshot = na
+
+export type ZoneCore
+    int   coreId       = 0
+    int   generationId = 0
+    array<int> originRootIds = na
+    SideViewState supportView    = na
+    SideViewState resistanceView = na
+    bool  zoneFresh     = true
+    float physBottom    = na
+    float physTop       = na
+    int   createdTime   = na
+    int   lastSeenTime  = na
+    bool  dormant       = false
+    bool  pendingTopology   = false
+    bool  pendingGeneration = false
+    array<TouchMark> touchMarks = na
+    BreakSnapshot breakSnap     = na
+    int   genBaselineCatMask    = 0
+    bool  genCandidateReady     = false   // new independent category + base strong seen
+    bool  genCandidateMovedAway = false
+    int   genCandidateSide      = 0
+    bool  alive         = true
+    int   lastMatchSeq  = -1
+    int   appliedSupSeq = -1
+    int   appliedResSeq = -1
+
+export type ZoneEvent
+    int   eventType    = 0
+    int   time         = na
+    int   baseSeq      = 0
+    int   coreId       = 0
+    int   generationId = 0
+    int   side         = 0
+    float rangeBottom  = na
+    float rangeTop     = na
+    int   touchNo      = 0
+    int   gradeAtStart = 1
+    int   weakReason   = 0
+    int   rootId       = 0
+
+export type ZoneView
+    int   coreId        = 0
+    int   generationId  = 0
+    int   side          = 0
+    float effectiveBottom = na
+    float effectiveTop    = na
+    float referencePrice  = na
+    int   phase           = 0
+    int   grade           = 3
+    int   cCount          = 0
+    int   hCount          = 0
+    int   density         = 1
+    bool  baseStrong      = false
+    int   currentTouchNo  = 0
+    int   upcomingTouchNo = 1
+    bool  zoneFresh       = true
+    bool  sideFresh       = true
+    int   weakReason      = 0
+    float maxDepthPct     = 0.0
+    bool  isBroadContext  = false
+    int   fvgDirMask      = 0
+    int   fvgRootCount    = 0
+    int   fvgFreshCount   = 0
+    int   fvgStateMask    = 0
+    bool  eligible        = false
+    int   catMask         = 0
+    int   highMask        = 0
+    array<int> rootIds    = na
+
+export type ZoneEngine
+    // --- root registry: logical id and storage slot are separate -----------
+    array<Root> roots        = na   // slot storage; freed slots are reused
+    array<int>  freeSlots    = na
+    array<int>  liveOrder    = na   // slots of live roots, id ascending order
+    map<int,int> idToSlot    = na
+    map<int,int> originToId  = na   // origin key -> root id (event dedupe)
+    map<int,int> psychTickToId = na
+    array<int> catCount      = na   // live root count per category
+    array<int> idxMa         = na   // category -> slots (exact, index maintained on change)
+    array<int> idxSwing      = na
+    array<int> idxAccum      = na
+    array<int> idxTime       = na
+    array<int> idxFvg        = na
+    array<int> idxPsych      = na
+    // --- cores --------------------------------------------------------------
+    array<ZoneCore> cores    = na
+    array<ZoneEvent> events  = na
+    array<ZoneView> views    = na
+    array<int> endedGenCores = na
+    array<int> endedGenIds   = na
+    // --- id counters --------------------------------------------------------
+    int nextRootId = 1
+    int nextCoreId = 1
+    int nextGenId  = 1
+    // --- processing bookkeeping --------------------------------------------
+    int  lastBaseOpenTime  = na
+    int  lastBaseSeq       = -1
+    int  seq               = 0
+    int  lastMaSrcTime     = na
+    int  lastSw5Origin     = na
+    int  lastSw5LowOrigin  = na
+    int  lastSw15Origin    = na
+    int  lastSw15LowOrigin = na
+    int  lastSw1hOrigin    = na
+    int  lastSw1hLowOrigin = na
+    int  lastAccum1hConfirm = na
+    int  lastAccum4hConfirm = na
+    int  lastAccumDConfirm  = na
+    int  lastFvg1hSrcClose  = na
+    int  lastFvg4hSrcClose  = na
+    int  lastFvgDSrcClose   = na
+    // --- time high/low state ------------------------------------------------
+    int   curSessionId   = na
+    int   curDayKey      = na
+    int   curWeekKey     = na
+    float curSessHigh    = na
+    float curSessLow     = na
+    int   curSessHighRoot = 0
+    int   curSessLowRoot  = 0
+    int   lastSessHighRoot = 0
+    int   lastSessLowRoot  = 0
+    float curDayHigh     = na
+    float curDayLow      = na
+    int   curDayHighRoot = 0
+    int   curDayLowRoot  = 0
+    int   prevDayHighRoot = 0
+    int   prevDayLowRoot  = 0
+    float curWeekHigh    = na
+    float curWeekLow     = na
+    int   curWeekHighRoot = 0
+    int   curWeekLowRoot  = 0
+    int   prevWeekHighRoot = 0
+    int   prevWeekLowRoot  = 0
+    // --- dirty flags (instruction M10): per purpose, never one global flag --
+    bool  dirtyRootSet    = true   // add / remove
+    bool  dirtyRootPrice  = true   // price or native range moved
+    bool  dirtyQuality    = true   // slope / tf mask / period label
+    bool  dirtyFvgState   = true   // direction or structural state
+    bool  dirtyCore       = true   // core range / origin set
+    // --- diagnostics --------------------------------------------------------
+    bool  storagePruned   = false
+    int   prunedRootCount = 0
+    int   prunedZoneCount = 0
+    bool  touchHistoryTruncated = false
+    bool  configValid     = true
+    float cfgPrint        = na
+    string configError    = ""
+    int   statCandidates  = 0
+    int   statWindowEvals = 0
+    int   statDenseRounds = 0
+    int   statCoreMatches = 0
+    int   statMerges      = 0
+    int   statSplits      = 0
+    int   statRecluster   = 0
+    bool  scratchOverflow = false
+    // --- scratch (owned by the engine, reused; logical length tracked) ------
+    array<int>   sLotSlot   = na  // candidate root slots, price ordered
+    array<float> sLotPrice  = na
+    array<int>   sLotTick   = na
+    array<int>   sUsed      = na  // 1 = root already consumed this side/round
+    array<int>   sCatCnt    = na
+    array<int>   sTmpA      = na
+    array<int>   sTmpB      = na
+    array<float> sTmpF      = na
+    array<float> sRefs      = na
+    array<int>   sOrder     = na
+    array<int>   sPairs     = na  // accum pairKeys inside the window under test
+    // --- adopted candidate buffers (per side, rebuilt each recluster) ------
+    array<int>   candSide   = na
+    array<int>   candStart  = na  // index into candRootIds
+    array<int>   candLen    = na
+    array<int>   candRootIds = na
+    array<float> candBottom = na
+    array<float> candTop    = na
+    array<int>   candC      = na
+    array<int>   candH      = na
+    array<int>   candDensity = na
+    array<int>   candStrong = na
+    array<int>   candCatMask = na
+    array<int>   candHighMask = na
+    array<float> candRefPrice = na
+
+// -----------------------------------------------------------------------------
+// 4. Small numeric helpers
+// -----------------------------------------------------------------------------
+toTick(float price, float mintick) =>
+    na(price) or na(mintick) or mintick <= 0.0 ? na : int(math.round(price / mintick))
+
+// Deterministic 31-bit origin key from up to three components.
+originKey3(int a, int b, int c) =>
+    int h = 2166136261
+    h := (h * 16777619 + a) % 2147483647
+    h := (h * 16777619 + b) % 2147483647
+    h := (h * 16777619 + c) % 2147483647
+    h < 0 ? -h : h
+
+intervalGap(float aBot, float aTop, float bBot, float bTop) =>
+    aTop < bBot ? bBot - aTop : bTop < aBot ? aBot - bTop : 0.0
+
+intersects(float aBot, float aTop, float bBot, float bTop) =>
+    aTop >= bBot and bTop >= aBot
+
+// bit helpers
+bitSet(int mask, int bit) => mask | (1 << bit)
+bitHas(int mask, int bit) => (mask & (1 << bit)) != 0
+popCount6(int mask) =>
+    int n = 0
+    for i = 0 to 5
+        n += (mask & (1 << i)) != 0 ? 1 : 0
+    n
+
+// -----------------------------------------------------------------------------
+// 5. Configuration factory and validation
+// -----------------------------------------------------------------------------
+export newCfg() =>
+    ZoneCfg.new()
+
+// Validation is re-run whenever the configuration object changes. It never
+// silently repairs an invalid combination: it stops the update instead.
+export validateCfg(ZoneCfg cfg) =>
+    string err = ""
+    err := cfg.clusterMaxWidth <= 0.0 ? err + "clusterMaxWidth<=0; " : err
+    err := cfg.denseRatio <= 0.0 or cfg.denseRatio > 1.0 ? err + "denseRatio out of (0,1]; " : err
+    err := cfg.touchResetDistance <= 0.0 ? err + "touchResetDistance<=0; " : err
+    err := cfg.breakBuffer < 0.0 ? err + "breakBuffer<0; " : err
+    err := cfg.touchTolerance < 0.0 ? err + "touchTolerance<0; " : err
+    err := cfg.emaSlopeLookback < 1 ? err + "emaSlopeLookback<1; " : err
+    err := cfg.swingLen5m < 1 or cfg.swingLen15m < 1 or cfg.swingLen1h < 1 ? err + "swing pivot length<1; " : err
+    err := cfg.weakDepthPct < 0.0 or cfg.weakDepthPct > 100.0 ? err + "weakDepthPct out of [0,100]; " : err
+    err := cfg.strongUnlimited and not cfg.weakFromTouchOff ? err + "strongUnlimited requires weakFromTouchOff; " : err
+    err := not cfg.strongUnlimited and cfg.strongUntilTouch < 1 ? err + "strongUntilTouch<1; " : err
+    err := not cfg.weakFromTouchOff and cfg.weakFromTouch < 2 ? err + "weakFromTouch<2; " : err
+    err := not cfg.strongUnlimited and not cfg.weakFromTouchOff and cfg.strongUntilTouch >= cfg.weakFromTouch ? err + "strongUntilTouch must be < weakFromTouch; " : err
+    err := cfg.mintick <= 0.0 ? err + "mintick<=0; " : err
+    err := cfg.accumRangeLen < 2 or cfg.accumBaseLen < cfg.accumRangeLen ? err + "accum range/base length invalid; " : err
+    err := cfg.accumAtrLen < 1 ? err + "accumAtrLen<1; " : err
+    err := cfg.dormantDistance <= 0.0 ? err + "dormantDistance<=0; " : err
+    cfg.denseWidth := cfg.clusterMaxWidth * cfg.denseRatio
+    cfg.valid := str.length(err) == 0
+    cfg.errorText := err
+    cfg.valid
+
+export cfgValid(ZoneCfg cfg) => cfg.valid
+export cfgError(ZoneCfg cfg) => cfg.errorText
+export cfgDenseWidth(ZoneCfg cfg) => cfg.denseWidth
+
+// =============================================================================
+// 6. Source / Feed helpers
+//    These are evaluated inside the caller's request.security() context. The
+//    library itself never calls request.*. Every helper reports the source bar
+//    close time so the engine can refuse values from a still forming source bar
+//    instead of relying on a blanket [1] offset.
+// =============================================================================
+
+// 6.1 MA pack - one 1m context for both EMAs, both slopes and the source time.
+export maPackV2(simple int slopeLookback) =>
+    float e2 = ta.ema(close, 2000)
+    float e3 = ta.ema(close, 3000)
+    float s2 = e2 - e2[slopeLookback]
+    float s3 = e3 - e3[slopeLookback]
+    [e2, s2, e3, s3, time_close]
+
+// 6.2 Pivot pack - price, OriginTime, OriginEndTime and ConfirmedTime split.
+export pivotPackV2(simple int len) =>
+    var float phP = na
+    var int   phO = na
+    var int   phE = na
+    var int   phC = na
+    var float plP = na
+    var int   plO = na
+    var int   plE = na
+    var int   plC = na
+    float ph = ta.pivothigh(len, len)
+    float pl = ta.pivotlow(len, len)
+    if not na(ph)
+        phP := ph
+        phO := time[len]
+        phE := time_close[len]
+        phC := time_close
+    if not na(pl)
+        plP := pl
+        plO := time[len]
+        plE := time_close[len]
+        plC := time_close
+    [phP, phO, phE, phC, plP, plO, plE, plC]
+
+// 6.3 Accum detection.
+//     NOTE: the v2 specification fixes the parameter names and initial values
+//     but not the arithmetic of the range test itself, and no reference v2
+//     source was available in this repository. The expression below is the
+//     documented interpretation and is deliberately isolated in this single
+//     function so it can be replaced without touching any other layer.
+accumCondV2(simple int rangeLen, simple int baseLen, simple int atrLen,
+     simple int minUpper, simple int minLower, simple int maxRun,
+     float atrMult, float barRatioMax, float driftMax) =>
+    float sHigh = ta.highest(high, rangeLen)
+    float sLow  = ta.lowest(low, rangeLen)
+    float sRange = sHigh - sLow
+    float bHigh = ta.highest(high, baseLen)
+    float bLow  = ta.lowest(low, baseLen)
+    float bRange = bHigh - bLow
+    float atrV = ta.atr(atrLen)
+    float mid = (sHigh + sLow) * 0.5
+    int upperCloses = 0
+    int lowerCloses = 0
+    int runNow = 0
+    int runMax = 0
+    int prevDir = 0
+    for i = rangeLen - 1 to 0
+        float ci = close[i]
+        upperCloses += ci > mid ? 1 : 0
+        lowerCloses += ci < mid ? 1 : 0
+        int dir = ci > open[i] ? 1 : ci < open[i] ? -1 : 0
+        runNow := dir != 0 and dir == prevDir ? runNow + 1 : dir != 0 ? 1 : 0
+        runMax := math.max(runMax, runNow)
+        prevDir := dir
+    float drift = sRange > 0.0 ? math.abs(close - close[rangeLen]) / sRange : 1.0e9
+    bool ok = not na(atrV) and not na(bRange) and sRange > 0.0
+    ok := ok and sRange <= atrV * atrMult
+    ok := ok and sRange <= bRange * barRatioMax
+    ok := ok and upperCloses >= minUpper
+    ok := ok and lowerCloses >= minLower
+    ok := ok and runMax <= maxRun
+    ok := ok and drift <= driftMax
+    ok
+
+// Candidate is never exported as a Root. A Box is emitted exactly once, on the
+// source bar where the condition turns true -> false, and that closing bar is
+// not part of the Box.
+export accumPackV2(simple int rangeLen, simple int baseLen, simple int atrLen,
+     simple int minUpper, simple int minLower, simple int maxRun,
+     float atrMult, float barRatioMax, float driftMax) =>
+    var bool  inCand   = false
+    var float candTop  = na
+    var float candBot  = na
+    var int   candStart = na
+    var bool  outNew   = false
+    var float outTop   = na
+    var float outBot   = na
+    var int   outId    = na
+    var int   outStart = na
+    var int   outConf  = na
+    bool cond = accumCondV2(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
+    float bodyTop = math.max(open, close)
+    float bodyBot = math.min(open, close)
+    outNew := false
+    if cond and not inCand
+        inCand := true
+        candStart := time
+        float t = bodyTop
+        float b = bodyBot
+        for i = 0 to rangeLen - 1
+            t := math.max(t, math.max(open[i], close[i]))
+            b := math.min(b, math.min(open[i], close[i]))
+        candTop := t
+        candBot := b
+    else if cond and inCand
+        candTop := math.max(candTop, bodyTop)
+        candBot := math.min(candBot, bodyBot)
+    else if not cond and inCand
+        outNew := true
+        outTop := candTop
+        outBot := candBot
+        outStart := candStart
+        outConf := time_close
+        outId := originKey3(candStart, int(math.round(candTop * 100000)), int(math.round(candBot * 100000)))
+        inCand := false
+        candTop := na
+        candBot := na
+        candStart := na
+    [outNew, outTop, outBot, outId, outStart, outConf]
+
+// 6.4 FVG pack - three confirmed source bars, plus the newly confirmed source
+//     bar used for structural invalidation and for Fresh bookkeeping.
+export fvgPackV2() =>
+    var bool  bullNew = false
+    var float bullTop = na
+    var float bullBot = na
+    var int   bullOrg = na
+    var int   bullCnf = na
+    var bool  bearNew = false
+    var float bearTop = na
+    var float bearBot = na
+    var int   bearOrg = na
+    var int   bearCnf = na
+    bool isBull = low > high[2]
+    bool isBear = high < low[2]
+    bullNew := isBull
+    bearNew := isBear
+    if isBull
+        bullBot := high[2]
+        bullTop := low
+        bullOrg := time
+        bullCnf := time_close
+    if isBear
+        bearBot := high
+        bearTop := low[2]
+        bearOrg := time
+        bearCnf := time_close
+    [bullNew, bullTop, bullBot, bullOrg, bullCnf, bearNew, bearTop, bearBot, bearOrg, bearCnf, high, low, close, time, time_close]
+
+// 6.5 Consolidated per-timeframe packs. One request context per timeframe.
+//     1H carries Swing + Accum + FVG + confirmed source bar in a single call.
+export htfPackSwingV2(simple int swingLen, simple int rangeLen, simple int baseLen,
+     simple int atrLen, simple int minUpper, simple int minLower, simple int maxRun,
+     float atrMult, float barRatioMax, float driftMax) =>
+    [phP, phO, phE, phC, plP, plO, plE, plC] = pivotPackV2(swingLen)
+    [aNew, aTop, aBot, aId, aStart, aConf] = accumPackV2(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
+    [fbN, fbT, fbB, fbO, fbC, fsN, fsT, fsB, fsO, fsC, sH, sL, sC, sOT, sCT] = fvgPackV2()
+    [phP, phO, phE, phC, plP, plO, plE, plC, aNew, aTop, aBot, aId, aStart, aConf, fbN, fbT, fbB, fbO, fbC, fsN, fsT, fsB, fsO, fsC, sH, sL, sC, sOT, sCT]
+
+export htfPackV2(simple int rangeLen, simple int baseLen, simple int atrLen,
+     simple int minUpper, simple int minLower, simple int maxRun,
+     float atrMult, float barRatioMax, float driftMax) =>
+    [aNew, aTop, aBot, aId, aStart, aConf] = accumPackV2(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
+    [fbN, fbT, fbB, fbO, fbC, fsN, fsT, fsB, fsO, fsC, sH, sL, sC, sOT, sCT] = fvgPackV2()
+    [aNew, aTop, aBot, aId, aStart, aConf, fbN, fbT, fbB, fbO, fbC, fsN, fsT, fsB, fsO, fsC, sH, sL, sC, sOT, sCT]
+
+// 6.6 Pack constructors used by the harness after destructuring the tuples.
+export newBaseFeed(float o, float h, float l, float c, float prevClose,
+     int openTime, int closeTime, int seq, bool confirmed, float mintick) =>
+    BaseFeed.new(o, h, l, c, prevClose, openTime, closeTime, seq, confirmed, mintick)
+
+export newMaPack(float e2, float s2, float e3, float s3, int srcCloseTime) =>
+    MaPack.new(e2, s2, e3, s3, srcCloseTime)
+
+export newPivotPack(int tfCode, float hP, int hO, int hE, int hC, float lP, int lO, int lE, int lC) =>
+    PivotPack.new(tfCode, hP, hO, hE, hC, lP, lO, lE, lC)
+
+export newAccumPack(int tfCode, bool newBox, float top, float bottom, int boxId, int candStart, int confirmed) =>
+    AccumPack.new(tfCode, newBox, top, bottom, boxId, candStart, confirmed)
+
+export newFvgPack(int tfCode, bool bullNew, float bullTop, float bullBot, int bullOrg, int bullCnf,
+     bool bearNew, float bearTop, float bearBot, int bearOrg, int bearCnf,
+     float srcHigh, float srcLow, float srcClose, int srcOpenTime, int srcCloseTime) =>
+    FvgPack.new(tfCode, bullNew, bullTop, bullBot, bullOrg, bullCnf, bearNew, bearTop, bearBot, bearOrg, bearCnf, srcHigh, srcLow, srcClose, srcOpenTime, srcCloseTime)
+
+// =============================================================================
+// 7. Engine factory and root registry
+//    Logical Root ID and physical slot are separate. Freed slots are reused,
+//    logical IDs are never reused. liveOrder keeps the deterministic scan order
+//    (ascending Root ID) independently of the physical slot layout.
+// =============================================================================
+export newEngine() =>
+    ZoneEngine e = ZoneEngine.new()
+    e.roots      := array.new<Root>()
+    e.freeSlots  := array.new<int>()
+    e.liveOrder  := array.new<int>()
+    e.idToSlot   := map.new<int, int>()
+    e.originToId := map.new<int, int>()
+    e.psychTickToId := map.new<int, int>()
+    e.catCount   := array.new<int>(6, 0)
+    e.idxMa      := array.new<int>()
+    e.idxSwing   := array.new<int>()
+    e.idxAccum   := array.new<int>()
+    e.idxTime    := array.new<int>()
+    e.idxFvg     := array.new<int>()
+    e.idxPsych   := array.new<int>()
+    e.cores      := array.new<ZoneCore>()
+    e.events     := array.new<ZoneEvent>()
+    e.views      := array.new<ZoneView>()
+    e.endedGenCores := array.new<int>()
+    e.endedGenIds   := array.new<int>()
+    e.sLotSlot   := array.new<int>()
+    e.sLotPrice  := array.new<float>()
+    e.sLotTick   := array.new<int>()
+    e.sUsed      := array.new<int>()
+    e.sCatCnt    := array.new<int>(6, 0)
+    e.sTmpA      := array.new<int>()
+    e.sTmpB      := array.new<int>()
+    e.sTmpF      := array.new<float>()
+    e.sRefs      := array.new<float>()
+    e.sOrder     := array.new<int>()
+    e.sPairs     := array.new<int>()
+    e.candSide   := array.new<int>()
+    e.candStart  := array.new<int>()
+    e.candLen    := array.new<int>()
+    e.candRootIds := array.new<int>()
+    e.candBottom := array.new<float>()
+    e.candTop    := array.new<float>()
+    e.candC      := array.new<int>()
+    e.candH      := array.new<int>()
+    e.candDensity := array.new<int>()
+    e.candStrong := array.new<int>()
+    e.candCatMask := array.new<int>()
+    e.candHighMask := array.new<int>()
+    e.candRefPrice := array.new<float>()
+    e
+
+catIndexArr(ZoneEngine e, int cat) =>
+    switch cat
+        0 => e.idxMa
+        1 => e.idxSwing
+        2 => e.idxAccum
+        3 => e.idxTime
+        4 => e.idxFvg
+        => e.idxPsych
+
+slotOf(ZoneEngine e, int rootId) =>
+    int s = map.contains(e.idToSlot, rootId) ? map.get(e.idToSlot, rootId) : -1
+    s
+
+rootOf(ZoneEngine e, int rootId) =>
+    int s = slotOf(e, rootId)
+    s >= 0 ? array.get(e.roots, s) : na
+
+// liveOrder keeps ascending Root ID. New sequential IDs append in O(1); a
+// re-created stable ID (psychological price) is inserted at its ordered place.
+liveOrderInsert(ZoneEngine e, int slot, int rootId) =>
+    int n = array.size(e.liveOrder)
+    Root rlast = n > 0 ? array.get(e.roots, array.get(e.liveOrder, n - 1)) : na
+    if n == 0 or rlast.rootId < rootId
+        array.push(e.liveOrder, slot)
+    else
+        int lo = 0
+        int hi = n
+        while lo < hi
+            int mid = int((lo + hi) / 2)
+            Root rm = array.get(e.roots, array.get(e.liveOrder, mid))
+            if rm.rootId < rootId
+                lo := mid + 1
+            else
+                hi := mid
+        array.insert(e.liveOrder, lo, slot)
+
+liveOrderRemove(ZoneEngine e, int slot) =>
+    int n = array.size(e.liveOrder)
+    int found = -1
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(e.liveOrder, i) == slot
+                found := i
+                break
+    if found >= 0
+        array.remove(e.liveOrder, found)
+
+registerRoot(ZoneEngine e, Root r) =>
+    int slot = array.size(e.freeSlots) > 0 ? array.pop(e.freeSlots) : -1
+    if slot >= 0
+        array.set(e.roots, slot, r)
+    else
+        array.push(e.roots, r)
+        slot := array.size(e.roots) - 1
+    map.put(e.idToSlot, r.rootId, slot)
+    map.put(e.originToId, r.originKey, r.rootId)
+    liveOrderInsert(e, slot, r.rootId)
+    array.push(catIndexArr(e, r.category), slot)
+    array.set(e.catCount, r.category, array.get(e.catCount, r.category) + 1)
+    e.dirtyRootSet := true
+    e.dirtyRootPrice := true
+    slot
+
+unregisterRoot(ZoneEngine e, int rootId) =>
+    int slot = slotOf(e, rootId)
+    if slot >= 0
+        Root r = array.get(e.roots, slot)
+        array<int> ci = catIndexArr(e, r.category)
+        int n = array.size(ci)
+        int at = -1
+        if n > 0
+            for i = 0 to n - 1
+                if array.get(ci, i) == slot
+                    at := i
+                    break
+        if at >= 0
+            array.remove(ci, at)
+        liveOrderRemove(e, slot)
+        map.remove(e.idToSlot, rootId)
+        if map.contains(e.originToId, r.originKey) and map.get(e.originToId, r.originKey) == rootId
+            map.remove(e.originToId, r.originKey)
+        // psychTickToId is intentionally persistent: the same psychological
+        // price must come back with the same stable Root ID (spec 7.7).
+        array.set(e.catCount, r.category, math.max(0, array.get(e.catCount, r.category) - 1))
+        r.state := 5
+        array.push(e.freeSlots, slot)
+        e.dirtyRootSet := true
+        e.dirtyRootPrice := true
+    slot >= 0
+
+export rootCount(ZoneEngine e) =>
+    array.size(e.liveOrder)
+
+export rootAt(ZoneEngine e, int i) =>
+    array.get(e.roots, array.get(e.liveOrder, i))
+
+export rootInfo(Root r) =>
+    categoryName(r.category) + "#" + str.tostring(r.rootId) + " " + tfName(r.tfCode) + " " +
+     (r.isRangeRoot ? str.tostring(r.nativeBottom, format.mintick) + "-" + str.tostring(r.nativeTop, format.mintick)
+      : str.tostring(r.pointPrice, format.mintick)) + " " + rootStateName(r.state)
+
+// =============================================================================
+// 8. Root ingestion (step E of the bar update)
+// =============================================================================
+
+// 8.1 MA - two fixed IDs, current price only, no historical EMA trail.
+ingestMa(ZoneEngine e, ZoneCfg cfg, MaPack ma, int baseCloseTime) =>
+    if cfg.catMa and not na(ma.ema2000) and not na(ma.srcCloseTime) and ma.srcCloseTime <= baseCloseTime
+        e.lastMaSrcTime := ma.srcCloseTime
+        for k = 0 to 1
+            float px = k == 0 ? ma.ema2000 : ma.ema3000
+            float slp = k == 0 ? ma.ema2000Slope : ma.ema3000Slope
+            int   sub = k == 0 ? 0 : 1
+            int   ok = originKey3(1000 + 0, sub, 0)
+            int   dir = na(slp) ? 0 : slp > 0.0 ? 1 : slp < 0.0 ? -1 : 0
+            int   tick = toTick(px, cfg.mintick)
+            if map.contains(e.originToId, ok)
+                Root r = rootOf(e, map.get(e.originToId, ok))
+                if not na(r)
+                    e.dirtyRootPrice := e.dirtyRootPrice or r.priceTick != tick
+                    e.dirtyQuality := e.dirtyQuality or r.slopeDir != dir
+                    r.pointPrice := px
+                    r.priceTick := tick
+                    r.slopeDir := dir
+                    r.lastUpdateSeq := e.seq
+            else
+                Root r = Root.new(rootId = e.nextRootId, originKey = ok, category = 0, subtype = sub, tfCode = 1,
+                     originTime = ma.srcCloseTime, originEndTime = ma.srcCloseTime, confirmedTime = ma.srcCloseTime,
+                     pointPrice = px, priceTick = tick, isRangeRoot = false, isDynamic = true, state = 1,
+                     fvgFresh = false, slopeDir = dir, lastUpdateSeq = e.seq)
+                e.nextRootId += 1
+                registerRoot(e, r)
+
+// 8.2 Swing - ConfirmedTime gate, same-event merge across timeframes.
+swingIngestOne(ZoneEngine e, ZoneCfg cfg, int tfCode, int tfMask, float price,
+     int originTime, int originEndTime, int confirmedTime, bool isHigh) =>
+    int tick = toTick(price, cfg.mintick)
+    int mergeId = 0
+    int n = array.size(e.idxSwing)
+    if n > 0
+        for i = n - 1 to 0
+            Root r = array.get(e.roots, array.get(e.idxSwing, i))
+            bool sameTick = r.priceTick == tick
+            bool contained = originTime >= r.originTime and originTime < r.originEndTime
+            bool contains = r.originTime >= originTime and r.originTime < originEndTime
+            if sameTick and (contained or contains)
+                mergeId := r.rootId
+                break
+    if mergeId != 0
+        Root r = rootOf(e, mergeId)
+        if not na(r) and (r.labelMask & tfMask) == 0
+            r.labelMask := r.labelMask | tfMask
+            if tfCode > r.tfCode
+                r.tfCode := tfCode
+                r.originTime := originTime
+                r.originEndTime := originEndTime
+            r.confirmedTime := confirmedTime < r.confirmedTime ? confirmedTime : r.confirmedTime
+            e.dirtyQuality := true
+    else
+        int ok = originKey3(2000 + tfCode, originTime, tick)
+        Root r = Root.new(rootId = e.nextRootId, originKey = ok, category = 1, subtype = isHigh ? 2 : 3, tfCode = tfCode,
+             originTime = originTime, originEndTime = originEndTime, confirmedTime = confirmedTime,
+             pointPrice = price, priceTick = tick, isRangeRoot = false, state = 1, fvgFresh = false,
+             labelMask = tfMask, lastUpdateSeq = e.seq)
+        e.nextRootId += 1
+        registerRoot(e, r)
+
+ingestSwing(ZoneEngine e, ZoneCfg cfg, PivotPack pk, int tfMask, int baseCloseTime, int lastHighOrigin, int lastLowOrigin) =>
+    int newHigh = lastHighOrigin
+    int newLow  = lastLowOrigin
+    if cfg.catSwing
+        if not na(pk.highPrice) and not na(pk.highConfirmed) and pk.highConfirmed <= baseCloseTime and pk.highOrigin != lastHighOrigin
+            swingIngestOne(e, cfg, pk.tfCode, tfMask, pk.highPrice, pk.highOrigin, pk.highOriginEnd, pk.highConfirmed, true)
+            newHigh := pk.highOrigin
+        if not na(pk.lowPrice) and not na(pk.lowConfirmed) and pk.lowConfirmed <= baseCloseTime and pk.lowOrigin != lastLowOrigin
+            swingIngestOne(e, cfg, pk.tfCode, tfMask, pk.lowPrice, pk.lowOrigin, pk.lowOriginEnd, pk.lowConfirmed, false)
+            newLow := pk.lowOrigin
+    [newHigh, newLow]
+
+// 8.3 Accum - confirmed Box only, upper and lower are a mutually exclusive pair.
+ingestAccum(ZoneEngine e, ZoneCfg cfg, AccumPack ap, int baseCloseTime, int lastConfirm) =>
+    int outConfirm = lastConfirm
+    if cfg.catAccum and ap.newBox and not na(ap.confirmedTime) and ap.confirmedTime <= baseCloseTime and ap.confirmedTime != lastConfirm and not na(ap.boxTop) and not na(ap.boxBottom)
+        int pairKey = originKey3(3000 + ap.tfCode, ap.candStartTime, ap.boxId)
+        if not map.contains(e.originToId, originKey3(pairKey, 1, 0))
+            for k = 0 to 1
+                bool isUpper = k == 0
+                float px = isUpper ? ap.boxTop : ap.boxBottom
+                int ok = originKey3(pairKey, isUpper ? 1 : 2, 0)
+                Root r = Root.new(rootId = e.nextRootId, originKey = ok, category = 2, subtype = isUpper ? 4 : 5,
+                     tfCode = ap.tfCode, originTime = ap.candStartTime, originEndTime = ap.confirmedTime,
+                     confirmedTime = ap.confirmedTime, pointPrice = px, priceTick = toTick(px, cfg.mintick),
+                     isRangeRoot = false, state = 1, pairKey = pairKey, fvgFresh = false, lastUpdateSeq = e.seq)
+                e.nextRootId += 1
+                registerRoot(e, r)
+        outConfirm := ap.confirmedTime
+    outConfirm
+
+// 8.4 FVG creation - third source bar must be confirmed.
+fvgIngestOne(ZoneEngine e, ZoneCfg cfg, int tfCode, int dir, float top, float bottom, int originTime, int confirmedTime) =>
+    int ok = originKey3(4000 + tfCode, originTime, dir)
+    if not map.contains(e.originToId, ok) and not na(top) and not na(bottom) and top > bottom
+        Root r = Root.new(rootId = e.nextRootId, originKey = ok, category = 4, subtype = 8, tfCode = tfCode,
+             originTime = originTime, originEndTime = originTime, confirmedTime = confirmedTime,
+             nativeBottom = bottom, nativeTop = top, bottomTick = toTick(bottom, cfg.mintick),
+             topTick = toTick(top, cfg.mintick), isRangeRoot = true, state = 1, direction = dir,
+             fvgFresh = true, isBroadFvg = (top - bottom) > cfg.clusterMaxWidth, lastUpdateSeq = e.seq)
+        e.nextRootId += 1
+        registerRoot(e, r)
+        e.dirtyFvgState := true
+
+ingestFvgNew(ZoneEngine e, ZoneCfg cfg, FvgPack fp, int baseCloseTime) =>
+    if cfg.catFvg and not na(fp.srcCloseTime) and fp.srcCloseTime <= baseCloseTime
+        if fp.bullNew and not na(fp.bullConfirmed) and fp.bullConfirmed <= baseCloseTime
+            fvgIngestOne(e, cfg, fp.tfCode, 1, fp.bullTop, fp.bullBottom, fp.bullOrigin, fp.bullConfirmed)
+        if fp.bearNew and not na(fp.bearConfirmed) and fp.bearConfirmed <= baseCloseTime
+            fvgIngestOne(e, cfg, fp.tfCode, 2, fp.bearTop, fp.bearBottom, fp.bearOrigin, fp.bearConfirmed)
+
+// 8.5 Session / day / week keys (JST cuts by default, all configurable).
+minOfDayTz(int t, string tz) =>
+    hour(t, tz) * 60 + minute(t, tz)
+
+dayKeyTz(int t, ZoneCfg cfg) =>
+    int t2 = t - cfg.dayCutMin * 60000
+    year(t2, cfg.zoneTimezone) * 10000 + month(t2, cfg.zoneTimezone) * 100 + dayofmonth(t2, cfg.zoneTimezone)
+
+weekKeyTz(int t, ZoneCfg cfg) =>
+    int t2 = t - cfg.dayCutMin * 60000
+    int dow = dayofweek(t2, cfg.zoneTimezone)
+    int back = (dow + 7 - cfg.weekCutDow) % 7
+    int t3 = t2 - back * MS_DAY
+    year(t3, cfg.zoneTimezone) * 10000 + month(t3, cfg.zoneTimezone) * 100 + dayofmonth(t3, cfg.zoneTimezone)
+
+sessionIdxOf(int m, ZoneCfg cfg) =>
+    m >= cfg.asiaStartMin and m < cfg.europeStartMin ? 1 :
+     m >= cfg.europeStartMin and m < cfg.nyStartMin ? 2 :
+     (m >= cfg.nyStartMin or m < cfg.nyEndMin) ? 3 : 0
+
+// 8.6 Time high/low label handling. One real extreme event = one Root; the
+//     labels (current session / last session / today / prev day / week) are a
+//     bit mask on that Root, so a period rollover keeps the same Root ID.
+timeLabelDrop(ZoneEngine e, int rootId, int bit) =>
+    if rootId != 0
+        Root r = rootOf(e, rootId)
+        if not na(r)
+            r.labelMask := (r.labelMask & bit) != 0 ? r.labelMask - bit : r.labelMask
+            if r.labelMask == 0
+                unregisterRoot(e, rootId)
+
+timeLabelMove(ZoneEngine e, int rootId, int fromBit, int toBit) =>
+    int outId = 0
+    if rootId != 0
+        Root r = rootOf(e, rootId)
+        if not na(r)
+            r.labelMask := (r.labelMask & fromBit) != 0 ? r.labelMask - fromBit : r.labelMask
+            r.labelMask := r.labelMask | toBit
+            outId := rootId
+    outId
+
+timeLabelSet(ZoneEngine e, ZoneCfg cfg, int bit, float price, int t, bool isHigh) =>
+    int tick = toTick(price, cfg.mintick)
+    int found = 0
+    int n = array.size(e.idxTime)
+    if n > 0
+        for i = n - 1 to 0
+            Root r = array.get(e.roots, array.get(e.idxTime, i))
+            if r.priceTick == tick and r.originTime == t
+                found := r.rootId
+                break
+    if found != 0
+        Root r = rootOf(e, found)
+        r.labelMask := r.labelMask | bit
+    else
+        Root r = Root.new(rootId = e.nextRootId, originKey = originKey3(5000, t, tick), category = 3,
+             subtype = isHigh ? 9 : 10, tfCode = 5, originTime = t, originEndTime = t, confirmedTime = t,
+             pointPrice = price, priceTick = tick, isRangeRoot = false, state = 1, fvgFresh = false,
+             labelMask = bit, lastUpdateSeq = e.seq)
+        e.nextRootId += 1
+        registerRoot(e, r)
+        found := r.rootId
+    e.dirtyQuality := true
+    found
+
+updateTimeHL(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
+    if cfg.catTime
+        int m = minOfDayTz(f.openTime, cfg.zoneTimezone)
+        int sIdx = sessionIdxOf(m, cfg)
+        int dKey = dayKeyTz(f.openTime, cfg)
+        int wKey = weekKeyTz(f.openTime, cfg)
+        int sKey = sIdx == 0 ? -1 : dKey * 10 + sIdx
+        // --- week rollover ---
+        if na(e.curWeekKey) or e.curWeekKey != wKey
+            if not na(e.curWeekKey)
+                timeLabelDrop(e, e.prevWeekHighRoot, 32)
+                timeLabelDrop(e, e.prevWeekLowRoot, 32)
+                e.prevWeekHighRoot := timeLabelMove(e, e.curWeekHighRoot, 16, 32)
+                e.prevWeekLowRoot  := timeLabelMove(e, e.curWeekLowRoot, 16, 32)
+            e.curWeekKey := wKey
+            e.curWeekHigh := na
+            e.curWeekLow := na
+            e.curWeekHighRoot := 0
+            e.curWeekLowRoot := 0
+        // --- day rollover ---
+        if na(e.curDayKey) or e.curDayKey != dKey
+            if not na(e.curDayKey)
+                timeLabelDrop(e, e.prevDayHighRoot, 8)
+                timeLabelDrop(e, e.prevDayLowRoot, 8)
+                e.prevDayHighRoot := timeLabelMove(e, e.curDayHighRoot, 4, 8)
+                e.prevDayLowRoot  := timeLabelMove(e, e.curDayLowRoot, 4, 8)
+            e.curDayKey := dKey
+            e.curDayHigh := na
+            e.curDayLow := na
+            e.curDayHighRoot := 0
+            e.curDayLowRoot := 0
+        // --- session rollover ---
+        if na(e.curSessionId) or e.curSessionId != sKey
+            if not na(e.curSessionId) and e.curSessionId != -1
+                timeLabelDrop(e, e.lastSessHighRoot, 2)
+                timeLabelDrop(e, e.lastSessLowRoot, 2)
+                e.lastSessHighRoot := timeLabelMove(e, e.curSessHighRoot, 1, 2)
+                e.lastSessLowRoot  := timeLabelMove(e, e.curSessLowRoot, 1, 2)
+            e.curSessionId := sKey
+            e.curSessHigh := na
+            e.curSessLow := na
+            e.curSessHighRoot := 0
+            e.curSessLowRoot := 0
+        // --- extremes: strict > / <, one new Root ID per new extreme --------
+        if na(e.curWeekHigh) or f.h > e.curWeekHigh
+            e.curWeekHigh := f.h
+            timeLabelDrop(e, e.curWeekHighRoot, 16)
+            e.curWeekHighRoot := timeLabelSet(e, cfg, 16, f.h, f.openTime, true)
+        if na(e.curWeekLow) or f.l < e.curWeekLow
+            e.curWeekLow := f.l
+            timeLabelDrop(e, e.curWeekLowRoot, 16)
+            e.curWeekLowRoot := timeLabelSet(e, cfg, 16, f.l, f.openTime, false)
+        if na(e.curDayHigh) or f.h > e.curDayHigh
+            e.curDayHigh := f.h
+            timeLabelDrop(e, e.curDayHighRoot, 4)
+            e.curDayHighRoot := timeLabelSet(e, cfg, 4, f.h, f.openTime, true)
+        if na(e.curDayLow) or f.l < e.curDayLow
+            e.curDayLow := f.l
+            timeLabelDrop(e, e.curDayLowRoot, 4)
+            e.curDayLowRoot := timeLabelSet(e, cfg, 4, f.l, f.openTime, false)
+        if sIdx != 0
+            if na(e.curSessHigh) or f.h > e.curSessHigh
+                e.curSessHigh := f.h
+                timeLabelDrop(e, e.curSessHighRoot, 1)
+                e.curSessHighRoot := timeLabelSet(e, cfg, 1, f.h, f.openTime, true)
+            if na(e.curSessLow) or f.l < e.curSessLow
+                e.curSessLow := f.l
+                timeLabelDrop(e, e.curSessLowRoot, 1)
+                e.curSessLowRoot := timeLabelSet(e, cfg, 1, f.l, f.openTime, false)
+
+// 8.7 FVG per-bar state, split in two so that the structural invalidation fact
+//     is known before Reclaim is decided (spec 15: invalidation wins).
+markFvgInvalidation(ZoneEngine e, ZoneCfg cfg, BaseFeed f, FvgPack fp, int lastSrcClose) =>
+    bool newSrc = not na(fp.srcCloseTime) and fp.srcCloseTime <= f.closeTime and fp.srcCloseTime != lastSrcClose
+    int n = array.size(e.idxFvg)
+    if newSrc and n > 0 and cfg.catFvg and not na(fp.srcClose)
+        for i = 0 to n - 1
+            Root r = array.get(e.roots, array.get(e.idxFvg, i))
+            if r.tfCode == fp.tfCode and r.state == 1
+                r.pendingInvalidate := (r.direction == 1 and fp.srcClose < r.nativeBottom) or
+                     (r.direction == 2 and fp.srcClose > r.nativeTop)
+
+applyFvgState(ZoneEngine e, ZoneCfg cfg, BaseFeed f, FvgPack fp, int lastSrcClose) =>
+    int outSrc = lastSrcClose
+    bool newSrc = not na(fp.srcCloseTime) and fp.srcCloseTime <= f.closeTime and fp.srcCloseTime != lastSrcClose
+    int n = array.size(e.idxFvg)
+    if n > 0 and cfg.catFvg
+        for i = 0 to n - 1
+            Root r = array.get(e.roots, array.get(e.idxFvg, i))
+            if r.tfCode == fp.tfCode
+                r.isBroadFvg := (r.nativeTop - r.nativeBottom) > cfg.clusterMaxWidth
+                if r.fvgFresh and f.closeTime > r.confirmedTime and intersects(f.l, f.h, r.nativeBottom, r.nativeTop)
+                    r.fvgFresh := false
+                    e.dirtyFvgState := true
+                if r.pendingInvalidate
+                    r.pendingInvalidate := false
+                    r.state := 3
+                    r.movedAway := false
+                    r.retestSeen := false
+                    e.dirtyFvgState := true
+                    array.push(e.events, ZoneEvent.new(eventType = 8, time = f.closeTime, baseSeq = f.seq,
+                         side = 0, rangeBottom = r.nativeBottom, rangeTop = r.nativeTop, rootId = r.rootId))
+    if newSrc
+        outSrc := fp.srcCloseTime
+    outSrc
+
+// Inverse staging runs on confirmed base closes for every waiting FVG root.
+updateFvgInverse(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
+    int n = array.size(e.idxFvg)
+    if n > 0 and cfg.catFvg
+        for i = 0 to n - 1
+            Root r = array.get(e.roots, array.get(e.idxFvg, i))
+            if r.state == 3
+                bool bull = r.direction == 1
+                float awayLevel = bull ? r.nativeBottom - cfg.touchResetDistance : r.nativeTop + cfg.touchResetDistance
+                if not r.movedAway and ((bull and f.c <= awayLevel) or (not bull and f.c >= awayLevel))
+                    r.movedAway := true
+                else if r.movedAway
+                    bool retest = intersects(f.l, f.h, r.nativeBottom, r.nativeTop)
+                    bool confirm = bull ? f.c <= r.nativeBottom : f.c >= r.nativeTop
+                    if retest and confirm
+                        r.state := 4
+                        r.retestSeen := true
+                        e.dirtyFvgState := true
+                        array.push(e.events, ZoneEvent.new(eventType = 10, time = f.closeTime, baseSeq = f.seq,
+                             side = bull ? -1 : 1, rangeBottom = r.nativeBottom, rangeTop = r.nativeTop, rootId = r.rootId))
+                    else if retest
+                        r.retestSeen := true
+                        array.push(e.events, ZoneEvent.new(eventType = 9, time = f.closeTime, baseSeq = f.seq,
+                             side = bull ? -1 : 1, rangeBottom = r.nativeBottom, rangeTop = r.nativeTop, rootId = r.rootId))
+
+// =============================================================================
+// 9. Price ordering and psychological price synthesis
+//    One native sort per bar over the live point roots, then a deterministic
+//    tie pass so equal price ticks always scan in ascending Root ID order.
+// =============================================================================
+collectPoints(ZoneEngine e, ZoneCfg cfg, bool includePsych) =>
+    array.clear(e.sTmpA)
+    array.clear(e.sTmpF)
+    for c = 0 to 5
+        if c != 4 and (c != 5 or includePsych)
+            array<int> ci = catIndexArr(e, c)
+            int n = array.size(ci)
+            if n > 0
+                for i = 0 to n - 1
+                    int slot = array.get(ci, i)
+                    Root r = array.get(e.roots, slot)
+                    if r.state == 1 and not r.isRangeRoot and not na(r.pointPrice)
+                        array.push(e.sTmpA, slot)
+                        array.push(e.sTmpF, r.pointPrice)
+    array.clear(e.sLotSlot)
+    array.clear(e.sLotPrice)
+    array.clear(e.sLotTick)
+    int m = array.size(e.sTmpA)
+    if m > SCRATCH_MAX_ROOTS
+        e.scratchOverflow := true
+    if m > 0
+        array<int> ord = array.sort_indices(e.sTmpF, order.ascending)
+        for i = 0 to m - 1
+            int slot = array.get(e.sTmpA, array.get(ord, i))
+            Root r = array.get(e.roots, slot)
+            array.push(e.sLotSlot, slot)
+            array.push(e.sLotPrice, r.pointPrice)
+            array.push(e.sLotTick, r.priceTick)
+        if m > 1
+            for i = 1 to m - 1
+                int j = i
+                bool go = true
+                while j > 0 and go
+                    Root ra = array.get(e.roots, array.get(e.sLotSlot, j))
+                    Root rb = array.get(e.roots, array.get(e.sLotSlot, j - 1))
+                    if ra.priceTick == rb.priceTick and ra.rootId < rb.rootId
+                        int sTmp = array.get(e.sLotSlot, j)
+                        array.set(e.sLotSlot, j, array.get(e.sLotSlot, j - 1))
+                        array.set(e.sLotSlot, j - 1, sTmp)
+                        float pTmp = array.get(e.sLotPrice, j)
+                        array.set(e.sLotPrice, j, array.get(e.sLotPrice, j - 1))
+                        array.set(e.sLotPrice, j - 1, pTmp)
+                        int tTmp = array.get(e.sLotTick, j)
+                        array.set(e.sLotTick, j, array.get(e.sLotTick, j - 1))
+                        array.set(e.sLotTick, j - 1, tTmp)
+                        j -= 1
+                    else
+                        go := false
+    m
+
+sortedHasTick(array<int> a, int tick) =>
+    int lo = 0
+    int hi = array.size(a) - 1
+    bool found = false
+    while lo <= hi and not found
+        int mid = int((lo + hi) / 2)
+        int v = array.get(a, mid)
+        if v == tick
+            found := true
+        else if v < tick
+            lo := mid + 1
+        else
+            hi := mid - 1
+    found
+
+// Psychological prices are synthesised only around live non-psych roots that
+// are inside the monitored distance (spec 3.6: display/computation may be
+// limited to the current price area). 2 * M < 50 so each root contributes at
+// most one level, which keeps the generated list ascending and deduplicated.
+syncPsych(ZoneEngine e, ZoneCfg cfg, float refClose) =>
+    array.clear(e.sTmpB)
+    if cfg.catPsych
+        int m = array.size(e.sLotSlot)
+        if m > 0
+            for i = 0 to m - 1
+                float p = array.get(e.sLotPrice, i)
+                if math.abs(p - refClose) <= cfg.dormantDistance
+                    float lo = p - cfg.clusterMaxWidth
+                    float hi = p + cfg.clusterMaxWidth
+                    float v = math.ceil(lo / 50.0) * 50.0
+                    while v <= hi
+                        int tk = toTick(v, cfg.mintick)
+                        int sz = array.size(e.sTmpB)
+                        if sz == 0 or array.get(e.sTmpB, sz - 1) < tk
+                            array.push(e.sTmpB, tk)
+                        v += 50.0
+    int pn = array.size(e.idxPsych)
+    if pn > 0
+        for i = pn - 1 to 0
+            Root r = array.get(e.roots, array.get(e.idxPsych, i))
+            if not sortedHasTick(e.sTmpB, r.priceTick)
+                unregisterRoot(e, r.rootId)
+    int wn = array.size(e.sTmpB)
+    if wn > 0
+        if map.size(e.psychTickToId) > 512
+            e.psychTickToId := map.new<int, int>()
+        for i = 0 to wn - 1
+            int tk = array.get(e.sTmpB, i)
+            int known = map.contains(e.psychTickToId, tk) ? map.get(e.psychTickToId, tk) : 0
+            if known == 0 or slotOf(e, known) < 0
+                float px = tk * cfg.mintick
+                bool major = math.abs(px / 100.0 - math.round(px / 100.0)) < 1.0e-9
+                int rid = known == 0 ? e.nextRootId : known
+                if known == 0
+                    e.nextRootId += 1
+                Root r = Root.new(rootId = rid, originKey = originKey3(6000, tk, 0), category = 5,
+                     subtype = major ? 6 : 7, tfCode = 5, originTime = 0, originEndTime = 0, confirmedTime = 0,
+                     pointPrice = px, priceTick = tk, isRangeRoot = false, isDynamic = true, state = 1,
+                     fvgFresh = false, lastUpdateSeq = e.seq)
+                registerRoot(e, r)
+                map.put(e.psychTickToId, tk, rid)
+
+// =============================================================================
+// 10. Candidate evaluation (per Side)
+//     Dense Base Strong cores are selected first, then the remaining roots form
+//     normal candidates, then FVG localisation / standalone candidates.
+//     Every window is compared on the single fixed comparator:
+//       C desc, H desc, effective width asc, formation time asc, min Root ID asc
+// =============================================================================
+denseTickLimit(ZoneCfg cfg) => int(math.round(cfg.denseWidth / cfg.mintick))
+mTickLimit(ZoneCfg cfg)     => int(math.round(cfg.clusterMaxWidth / cfg.mintick))
+
+// Scans every contiguous window (over still unused roots) whose width fits the
+// limit and returns the best one. Sub-windows are compared individually; the
+// widest window is never used as a substitute for them.
+scanBest(ZoneEngine e, ZoneCfg cfg, int side, int limitTick, bool requireStrong) =>
+    int n = array.size(e.sLotSlot)
+    int denseTick = denseTickLimit(cfg)
+    int bestI = -1
+    int bestJ = -1
+    int bestC = -1
+    int bestH = -1
+    int bestW = 0
+    int bestT = 0
+    int bestId = 0
+    int bestMask = 0
+    int bestHMask = 0
+    int bestDen = 1
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(e.sUsed, i) == 0
+                array.fill(e.sCatCnt, 0)
+                array.clear(e.sPairs)
+                int catMask = 0
+                int maCnt = 0
+                int maUp = 0
+                int maDn = 0
+                bool swHas1h = false
+                bool swHasBoth = false
+                bool acHas4hD = false
+                int acTfMask = 0
+                int acFirstPair = 0
+                bool acMultiBox = false
+                int tmCnt = 0
+                bool tmStrongLabel = false
+                int formTime = 0
+                int minId = 0
+                int nonPsych = 0
+                int baseTick = array.get(e.sLotTick, i)
+                for j = i to n - 1
+                    if array.get(e.sUsed, j) == 1
+                        continue
+                    int wTick = array.get(e.sLotTick, j) - baseTick
+                    if wTick > limitTick
+                        break
+                    Root r = array.get(e.roots, array.get(e.sLotSlot, j))
+                    bool conflict = false
+                    int np = array.size(e.sPairs)
+                    if r.pairKey != 0 and np > 0
+                        for q = 0 to np - 1
+                            if array.get(e.sPairs, q) == r.pairKey
+                                conflict := true
+                                break
+                    if conflict
+                        break
+                    if r.pairKey != 0
+                        array.push(e.sPairs, r.pairKey)
+                        acMultiBox := acMultiBox or (acFirstPair != 0 and acFirstPair != r.pairKey)
+                        acFirstPair := acFirstPair == 0 ? r.pairKey : acFirstPair
+                    catMask := catMask | (1 << r.category)
+                    array.set(e.sCatCnt, r.category, array.get(e.sCatCnt, r.category) + 1)
+                    nonPsych += r.category != 5 ? 1 : 0
+                    int rct = nz(r.confirmedTime)
+                    formTime := rct > formTime ? rct : formTime
+                    minId := minId == 0 or r.rootId < minId ? r.rootId : minId
+                    if r.category == 0
+                        maCnt += 1
+                        maUp += r.slopeDir > 0 ? 1 : 0
+                        maDn += r.slopeDir < 0 ? 1 : 0
+                    else if r.category == 1
+                        swHas1h := swHas1h or r.tfCode >= 60
+                        swHasBoth := swHasBoth or ((r.labelMask & 1) != 0 and (r.labelMask & 2) != 0)
+                    else if r.category == 2
+                        acHas4hD := acHas4hD or r.tfCode >= 240
+                        acTfMask := acTfMask | (1 << (r.tfCode == 60 ? 0 : r.tfCode == 240 ? 1 : 2))
+                    else if r.category == 3
+                        tmCnt += 1
+                        tmStrongLabel := tmStrongLabel or (r.labelMask & (16 + 32 + 8)) != 0
+                    // --- window evaluation ---------------------------------
+                    if nonPsych > 0
+                        int den = wTick <= denseTick ? 0 : 1
+                        int hMask = 0
+                        hMask := maCnt == 2 and den == 0 and (side == 1 ? maUp == 2 : maDn == 2) ? hMask | 1 : hMask
+                        hMask := swHas1h or swHasBoth ? hMask | 2 : hMask
+                        hMask := acHas4hD or (acMultiBox and popCount6(acTfMask) >= 2) ? hMask | 4 : hMask
+                        hMask := tmStrongLabel or tmCnt >= 2 ? hMask | 8 : hMask
+                        int cCnt = popCount6(catMask)
+                        int hCnt = popCount6(hMask)
+                        bool strong = den == 0 and ((cCnt == 2 and hCnt >= 1) or cCnt >= 3)
+                        if not requireStrong or strong
+                            bool better = cCnt > bestC
+                            better := better or (cCnt == bestC and hCnt > bestH)
+                            better := better or (cCnt == bestC and hCnt == bestH and wTick < bestW)
+                            better := better or (cCnt == bestC and hCnt == bestH and wTick == bestW and formTime < bestT)
+                            better := better or (cCnt == bestC and hCnt == bestH and wTick == bestW and formTime == bestT and minId < bestId)
+                            if bestI < 0 or better
+                                bestI := i
+                                bestJ := j
+                                bestC := cCnt
+                                bestH := hCnt
+                                bestW := wTick
+                                bestT := formTime
+                                bestId := minId
+                                bestMask := catMask
+                                bestHMask := hMask
+                                bestDen := den
+                    e.statWindowEvals += 1
+    [bestI, bestJ, bestC, bestH, bestDen, bestMask, bestHMask]
+
+// Adoption: only now is the per candidate data materialised.
+adoptWindow(ZoneEngine e, int side, int i, int j, int c, int h, int den, int mask, int hMask) =>
+    bool strong = den == 0 and ((c == 2 and h >= 1) or c >= 3)
+    int start = array.size(e.candRootIds)
+    float bot = na
+    float top = na
+    int len = 0
+    for k = i to j
+        if array.get(e.sUsed, k) == 0
+            Root r = array.get(e.roots, array.get(e.sLotSlot, k))
+            array.push(e.candRootIds, r.rootId)
+            array.set(e.sUsed, k, 1)
+            bot := na(bot) ? r.pointPrice : math.min(bot, r.pointPrice)
+            top := na(top) ? r.pointPrice : math.max(top, r.pointPrice)
+            len += 1
+    array.push(e.candSide, side)
+    array.push(e.candStart, start)
+    array.push(e.candLen, len)
+    array.push(e.candBottom, bot)
+    array.push(e.candTop, top)
+    array.push(e.candC, c)
+    array.push(e.candH, h)
+    array.push(e.candDensity, den)
+    array.push(e.candStrong, strong ? 1 : 0)
+    array.push(e.candCatMask, mask)
+    array.push(e.candHighMask, hMask)
+    array.push(e.candRefPrice, na)
+    e.statCandidates += 1
+    array.size(e.candSide) - 1
+
+// 10.1 FVG participation.
+//      A root is eligible on a side only through its formation direction or a
+//      confirmed Inverse; Bullish and Bearish never reinforce each other.
+fvgSideEligible(Root r, int side) =>
+    (r.direction == 1 and r.state == 1 and side == 1) or
+     (r.direction == 2 and r.state == 1 and side == -1) or
+     (r.direction == 1 and r.state == 4 and side == -1) or
+     (r.direction == 2 and r.state == 4 and side == 1)
+
+// Proximal edge as seen from the approach side of the view.
+fvgProximal(Root r, int side) => side == 1 ? r.nativeTop : r.nativeBottom
+
+// Re-evaluate a candidate after an FVG joined it.
+candRefresh(ZoneEngine e, ZoneCfg cfg, int k, bool fvgHigh) =>
+    int mask = array.get(e.candCatMask, k) | (1 << 4)
+    int hMask = fvgHigh ? array.get(e.candHighMask, k) | 16 : array.get(e.candHighMask, k)
+    float bot = array.get(e.candBottom, k)
+    float top = array.get(e.candTop, k)
+    int wTick = toTick(top, cfg.mintick) - toTick(bot, cfg.mintick)
+    int den = wTick <= denseTickLimit(cfg) ? 0 : wTick <= mTickLimit(cfg) ? 1 : 1
+    int c = popCount6(mask)
+    int h = popCount6(hMask)
+    bool strong = den == 0 and ((c == 2 and h >= 1) or c >= 3)
+    array.set(e.candCatMask, k, mask)
+    array.set(e.candHighMask, k, hMask)
+    array.set(e.candC, k, c)
+    array.set(e.candH, k, h)
+    array.set(e.candDensity, k, den)
+    array.set(e.candStrong, k, strong ? 1 : 0)
+
+// Broad localisation (spec 3.5): one of the four listed conditions must hold.
+broadLocalizeOk(ZoneEngine e, int k, bool proximalAnchored, bool overlapOtherTf) =>
+    int hMask = array.get(e.candHighMask, k)
+    int catMask = array.get(e.candCatMask, k)
+    int nonFvgCats = popCount6(catMask - (catMask & 16))
+    bool highDense = array.get(e.candDensity, k) == 0
+    bool cond1 = proximalAnchored and highDense
+    bool cond2 = overlapOtherTf
+    bool cond3 = (hMask - (hMask & 16)) != 0
+    bool cond4 = nonFvgCats >= 2 and highDense
+    cond1 or cond2 or cond3 or cond4
+
+attachFvg(ZoneEngine e, ZoneCfg cfg, int side, int candFrom) =>
+    int nf = array.size(e.idxFvg)
+    int nc = array.size(e.candSide)
+    if nf > 0 and cfg.catFvg
+        array.clear(e.sTmpA)          // consumed flags per FVG index
+        for i = 0 to nf - 1
+            array.push(e.sTmpA, 0)
+        // --- localisation onto existing point candidates -------------------
+        for i = 0 to nf - 1
+            Root r = array.get(e.roots, array.get(e.idxFvg, i))
+            if fvgSideEligible(r, side)
+                bool overlapOtherTf = false
+                for q = 0 to nf - 1
+                    Root r2 = array.get(e.roots, array.get(e.idxFvg, q))
+                    if q != i and r2.tfCode != r.tfCode and fvgSideEligible(r2, side) and intersects(r.nativeBottom, r.nativeTop, r2.nativeBottom, r2.nativeTop)
+                        overlapOtherTf := true
+                        break
+                bool consumed = false
+                float prox = fvgProximal(r, side)
+                if nc > candFrom
+                    for k = candFrom to nc - 1
+                        if array.get(e.candSide, k) == side and (not consumed or r.isBroadFvg)
+                            float cb = array.get(e.candBottom, k)
+                            float ct = array.get(e.candTop, k)
+                            bool inside = intersects(cb, ct, r.nativeBottom, r.nativeTop)
+                            bool proximalAnchored = false
+                            float nb = cb
+                            float nt = ct
+                            if not inside
+                                float gap = side == 1 ? cb - prox : prox - ct
+                                if gap > 0.0 and gap <= cfg.denseWidth and array.get(e.candDensity, k) == 0
+                                    float tb = side == 1 ? prox : cb
+                                    float tt = side == 1 ? ct : prox
+                                    int wT = toTick(tt, cfg.mintick) - toTick(tb, cfg.mintick)
+                                    if wT <= denseTickLimit(cfg)
+                                        proximalAnchored := true
+                                        nb := tb
+                                        nt := tt
+                            if inside or proximalAnchored
+                                bool fvgHigh = r.isBroadFvg ? broadLocalizeOk(e, k, proximalAnchored, overlapOtherTf) : (r.tfCode >= 240 or overlapOtherTf)
+                                array.set(e.candBottom, k, nb)
+                                array.set(e.candTop, k, nt)
+                                int st = array.get(e.candStart, k)
+                                int ln = array.get(e.candLen, k)
+                                array.insert(e.candRootIds, st + ln, r.rootId)
+                                array.set(e.candLen, k, ln + 1)
+                                for k2 = 0 to array.size(e.candStart) - 1
+                                    if array.get(e.candStart, k2) > st
+                                        array.set(e.candStart, k2, array.get(e.candStart, k2) + 1)
+                                candRefresh(e, cfg, k, fvgHigh)
+                                consumed := true
+                                array.set(e.sTmpA, i, 1)
+        // --- standalone FVG candidates -------------------------------------
+        for i = 0 to nf - 1
+            Root r = array.get(e.roots, array.get(e.idxFvg, i))
+            if fvgSideEligible(r, side) and array.get(e.sTmpA, i) == 0
+                float bot = r.nativeBottom
+                float top = r.nativeTop
+                bool overlapHigh = false
+                array.clear(e.sTmpB)
+                array.push(e.sTmpB, r.rootId)
+                if i + 1 <= nf - 1
+                    for q = i + 1 to nf - 1
+                        Root r2 = array.get(e.roots, array.get(e.idxFvg, q))
+                        if array.get(e.sTmpA, q) == 0 and fvgSideEligible(r2, side) and r2.direction == r.direction and intersects(bot, top, r2.nativeBottom, r2.nativeTop)
+                            bot := math.max(bot, r2.nativeBottom)
+                            top := math.min(top, r2.nativeTop)
+                            overlapHigh := overlapHigh or r2.tfCode != r.tfCode
+                            array.push(e.sTmpB, r2.rootId)
+                            array.set(e.sTmpA, q, 1)
+                array.set(e.sTmpA, i, 1)
+                bool broad = r.isBroadFvg and array.size(e.sTmpB) == 1
+                int wTick = toTick(top, cfg.mintick) - toTick(bot, cfg.mintick)
+                int den = broad ? 2 : wTick <= denseTickLimit(cfg) ? 0 : 1
+                bool high = overlapHigh or (not r.isBroadFvg and r.tfCode >= 240)
+                int start = array.size(e.candRootIds)
+                for q = 0 to array.size(e.sTmpB) - 1
+                    array.push(e.candRootIds, array.get(e.sTmpB, q))
+                array.push(e.candSide, side)
+                array.push(e.candStart, start)
+                array.push(e.candLen, array.size(e.sTmpB))
+                array.push(e.candBottom, bot)
+                array.push(e.candTop, top)
+                array.push(e.candC, 1)
+                array.push(e.candH, high ? 1 : 0)
+                array.push(e.candDensity, den)
+                array.push(e.candStrong, 0)
+                array.push(e.candCatMask, 16)
+                array.push(e.candHighMask, high ? 16 : 0)
+                array.push(e.candRefPrice, na)
+                e.statCandidates += 1
+
+// 10.2 Reference price - display / tracking only, computed once per adopted
+//      candidate. Never used for touch, break, density, Strong or Weak.
+medianOfScratch(array<float> a) =>
+    int n = array.size(a)
+    float out = na
+    if n > 0
+        array.sort(a, order.ascending)
+        out := n % 2 == 1 ? array.get(a, int(n / 2)) : (array.get(a, int(n / 2) - 1) + array.get(a, int(n / 2))) * 0.5
+    out
+
+computeRefPrice(ZoneEngine e, ZoneCfg cfg, int k) =>
+    int side = array.get(e.candSide, k)
+    int st = array.get(e.candStart, k)
+    int ln = array.get(e.candLen, k)
+    array.clear(e.sRefs)
+    int pointCats = 0
+    float maA = na
+    float maB = na
+    for c = 0 to 5
+        if c != 0 and c != 4
+            array.clear(e.sTmpF)
+            for q = st to st + ln - 1
+                Root r = rootOf(e, array.get(e.candRootIds, q))
+                if not na(r) and r.category == c and not r.isRangeRoot
+                    array.push(e.sTmpF, r.pointPrice)
+            if array.size(e.sTmpF) > 0
+                array.push(e.sRefs, medianOfScratch(e.sTmpF))
+                pointCats += 1
+    for q = st to st + ln - 1
+        Root r = rootOf(e, array.get(e.candRootIds, q))
+        if not na(r) and r.category == 0
+            maA := na(maA) ? r.pointPrice : maA
+            maB := na(maA) or r.pointPrice == maA ? maB : r.pointPrice
+    float out = na
+    if not na(maA)
+        float anchor = array.size(e.sRefs) > 0 ? medianOfScratch(e.sRefs) : na
+        float maRep = na(maB) ? maA : na(anchor) ? (maA + maB) * 0.5 :
+             math.abs(maA - anchor) <= math.abs(maB - anchor) ? maA : maB
+        array.push(e.sRefs, maRep)
+        pointCats += 1
+    if pointCats > 0
+        out := medianOfScratch(e.sRefs)
+    else
+        out := side == 1 ? array.get(e.candTop, k) : array.get(e.candBottom, k)
+    array.set(e.candRefPrice, k, out)
+
+// 10.3 Per bar candidate build for both sides.
+buildCandidates(ZoneEngine e, ZoneCfg cfg) =>
+    array.clear(e.candSide)
+    array.clear(e.candStart)
+    array.clear(e.candLen)
+    array.clear(e.candRootIds)
+    array.clear(e.candBottom)
+    array.clear(e.candTop)
+    array.clear(e.candC)
+    array.clear(e.candH)
+    array.clear(e.candDensity)
+    array.clear(e.candStrong)
+    array.clear(e.candCatMask)
+    array.clear(e.candHighMask)
+    array.clear(e.candRefPrice)
+    int n = array.size(e.sLotSlot)
+    for si = 0 to 1
+        int side = si == 0 ? 1 : -1
+        int candFrom = array.size(e.candSide)
+        array.clear(e.sUsed)
+        if n > 0
+            for i = 0 to n - 1
+                array.push(e.sUsed, 0)
+        bool more = true
+        while more
+            [bi, bj, bc, bh, bden, bmask, bhmask] = scanBest(e, cfg, side, denseTickLimit(cfg), true)
+            if bi < 0
+                more := false
+            else
+                adoptWindow(e, side, bi, bj, bc, bh, bden, bmask, bhmask)
+                e.statDenseRounds += 1
+        more := true
+        while more
+            [bi, bj, bc, bh, bden, bmask, bhmask] = scanBest(e, cfg, side, mTickLimit(cfg), false)
+            if bi < 0
+                more := false
+            else
+                adoptWindow(e, side, bi, bj, bc, bh, bden, bmask, bhmask)
+        attachFvg(e, cfg, side, candFrom)
+    int kn = array.size(e.candSide)
+    if kn > 0
+        for k = 0 to kn - 1
+            computeRefPrice(e, cfg, k)
+    e.statRecluster += 1
+    kn
+
+// =============================================================================
+// 11. Core association: identity, merge, split, pending topology
+// =============================================================================
+newSideView() =>
+    SideViewState.new(rootIds = array.new<int>(), history = SideHistory.new(),
+         touchSnapshot = TouchStartSnapshot.new())
+
+viewOf(ZoneCore c, int side) =>
+    side == 1 ? c.supportView : c.resistanceView
+
+pushEvent(ZoneEngine e, int evType, BaseFeed f, ZoneCore c, int side, float bot, float top, int touchNo, int gradeAtStart, int weakReason, int rootId) =>
+    array.push(e.events, ZoneEvent.new(eventType = evType, time = f.closeTime, baseSeq = f.seq,
+         coreId = na(c) ? 0 : c.coreId, generationId = na(c) ? 0 : c.generationId, side = side,
+         rangeBottom = bot, rangeTop = top, touchNo = touchNo, gradeAtStart = gradeAtStart,
+         weakReason = weakReason, rootId = rootId))
+
+weakReasonOf(ZoneCfg cfg, SideHistory h, int targetTouchNo) =>
+    bool byTouch = not cfg.weakFromTouchOff and targetTouchNo >= cfg.weakFromTouch
+    byTouch and h.weakByDepth ? 3 : byTouch ? 1 : h.weakByDepth ? 2 : 0
+
+gradeOf(ZoneCfg cfg, SideViewState sv, int targetTouchNo) =>
+    SideHistory h = sv.history
+    bool byTouch = not cfg.weakFromTouchOff and targetTouchNo >= cfg.weakFromTouch
+    not sv.eligible or not sv.hasNonPsychRoot ? 3 :
+     (h.weakByDepth or byTouch) ? 2 :
+     (sv.baseStrong and (cfg.strongUnlimited or targetTouchNo <= cfg.strongUntilTouch)) ? 0 : 1
+
+// Physical range of the core = union of the side view ranges actually in use.
+refreshCoreRange(ZoneCore c) =>
+    float bot = na
+    float top = na
+    if not na(c.supportView.effectiveBottom)
+        bot := c.supportView.effectiveBottom
+        top := c.supportView.effectiveTop
+    if not na(c.resistanceView.effectiveBottom)
+        bot := na(bot) ? c.resistanceView.effectiveBottom : math.min(bot, c.resistanceView.effectiveBottom)
+        top := na(top) ? c.resistanceView.effectiveTop : math.max(top, c.resistanceView.effectiveTop)
+    c.physBottom := bot
+    c.physTop := top
+
+rebuildOriginIds(ZoneEngine e, ZoneCore c) =>
+    array.clear(c.originRootIds)
+    for si = 0 to 1
+        SideViewState sv = si == 0 ? c.supportView : c.resistanceView
+        int n = array.size(sv.rootIds)
+        if n > 0
+            for i = 0 to n - 1
+                int rid = array.get(sv.rootIds, i)
+                Root r = rootOf(e, rid)
+                bool broad = not na(r) and r.isBroadFvg
+                if not broad and not array.includes(c.originRootIds, rid)
+                    array.push(c.originRootIds, rid)
+
+applyCandidate(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int k, BaseFeed f) =>
+    int side = array.get(e.candSide, k)
+    SideViewState sv = viewOf(c, side)
+    int st = array.get(e.candStart, k)
+    int ln = array.get(e.candLen, k)
+    array.clear(sv.rootIds)
+    bool nonPsych = false
+    int fvgDirMask = 0
+    int fvgCount = 0
+    int fvgFresh = 0
+    int fvgStateMask = 0
+    for q = st to st + ln - 1
+        int rid = array.get(e.candRootIds, q)
+        array.push(sv.rootIds, rid)
+        Root r = rootOf(e, rid)
+        if not na(r)
+            nonPsych := nonPsych or r.category != 5
+            if r.category == 4
+                fvgCount += 1
+                fvgDirMask := fvgDirMask | (1 << r.direction)
+                fvgFresh += r.fvgFresh ? 1 : 0
+                fvgStateMask := fvgStateMask | (1 << r.state)
+    sv.effectiveBottom := array.get(e.candBottom, k)
+    sv.effectiveTop := array.get(e.candTop, k)
+    sv.referencePrice := array.get(e.candRefPrice, k)
+    sv.cCount := array.get(e.candC, k)
+    sv.hCount := array.get(e.candH, k)
+    sv.catMask := array.get(e.candCatMask, k)
+    sv.highMask := array.get(e.candHighMask, k)
+    sv.density := array.get(e.candDensity, k)
+    sv.baseStrong := array.get(e.candStrong, k) == 1
+    sv.hasNonPsychRoot := nonPsych
+    sv.isBroadContext := sv.density == 2
+    sv.fvgDirMask := fvgDirMask
+    sv.fvgRootCount := fvgCount
+    sv.fvgFreshCount := fvgFresh
+    sv.fvgStateMask := fvgStateMask
+    sv.eligible := nonPsych and not c.breakSnap.valid
+    c.lastSeenTime := f.openTime
+    refreshCoreRange(c)
+    rebuildOriginIds(e, c)
+
+candSharesOrigin(ZoneEngine e, ZoneCore c, int k) =>
+    int st = array.get(e.candStart, k)
+    int ln = array.get(e.candLen, k)
+    bool share = false
+    for q = st to st + ln - 1
+        int rid = array.get(e.candRootIds, q)
+        Root r = rootOf(e, rid)
+        bool broad = not na(r) and r.isBroadFvg
+        if not broad and array.includes(c.originRootIds, rid)
+            share := true
+            break
+    share
+
+// Touch history follows the real contact price / time, never a bare counter.
+recountSide(ZoneCore c, int side, float bot, float top) =>
+    int n = array.size(c.touchMarks)
+    int cnt = 0
+    int lastT = na
+    if n > 0
+        for i = 0 to n - 1
+            TouchMark tm = array.get(c.touchMarks, i)
+            if tm.side == side and tm.isNormalTouch and intersects(tm.contactBottom, tm.contactTop, bot, top)
+                if na(lastT) or tm.time != lastT
+                    cnt += 1
+                    lastT := tm.time
+    cnt
+
+mergeCores(ZoneEngine e, ZoneCfg cfg, ZoneCore dst, ZoneCore src, BaseFeed f) =>
+    int n = array.size(src.touchMarks)
+    if n > 0
+        for i = 0 to n - 1
+            array.push(dst.touchMarks, array.get(src.touchMarks, i))
+    for si = 0 to 1
+        int side = si == 0 ? 1 : -1
+        SideHistory a = viewOf(dst, side).history
+        SideHistory b = viewOf(src, side).history
+        a.weakByTouch := a.weakByTouch or b.weakByTouch
+        a.weakByDepth := a.weakByDepth or b.weakByDepth
+        a.maxDepthPct := math.max(a.maxDepthPct, b.maxDepthPct)
+        a.sideTouchCount := b.sideTouchCount > a.sideTouchCount ? b.sideTouchCount : a.sideTouchCount
+        a.flipAttemptCount := a.flipAttemptCount + b.flipAttemptCount
+        a.inverseAttemptCount := a.inverseAttemptCount + b.inverseAttemptCount
+        a.everUsed := a.everUsed or b.everUsed
+        a.sideFresh := a.sideFresh and b.sideFresh
+    dst.zoneFresh := dst.zoneFresh and src.zoneFresh
+    if not dst.breakSnap.valid and src.breakSnap.valid
+        dst.breakSnap := src.breakSnap
+    src.alive := false
+    e.statMerges += 1
+    pushEvent(e, 12, f, dst, 0, dst.physBottom, dst.physTop, 0, 1, 0, src.coreId)
+
+splitCore(ZoneEngine e, ZoneCfg cfg, ZoneCore parent, int k, BaseFeed f) =>
+    ZoneCore child = ZoneCore.new(coreId = e.nextCoreId, generationId = e.nextGenId,
+         originRootIds = array.new<int>(), supportView = newSideView(), resistanceView = newSideView(),
+         touchMarks = array.new<TouchMark>(), breakSnap = BreakSnapshot.new(),
+         createdTime = f.openTime, lastSeenTime = f.openTime)
+    e.nextCoreId += 1
+    e.nextGenId += 1
+    float bot = array.get(e.candBottom, k)
+    float top = array.get(e.candTop, k)
+    int n = array.size(parent.touchMarks)
+    if n > 0
+        for i = 0 to n - 1
+            TouchMark tm = array.get(parent.touchMarks, i)
+            if intersects(tm.contactBottom, tm.contactTop, bot, top)
+                array.push(child.touchMarks, tm)
+    applyCandidate(e, cfg, child, k, f)
+    for si = 0 to 1
+        int side = si == 0 ? 1 : -1
+        SideViewState sv = viewOf(child, side)
+        SideHistory h = sv.history
+        h.sideTouchCount := recountSide(child, side, bot, top)
+        h.sideFresh := h.sideTouchCount == 0
+        h.upcomingTouchNo := h.sideTouchCount + 1
+        SideHistory ph = viewOf(parent, side).history
+        h.weakByTouch := h.sideTouchCount > 0 and ph.weakByTouch
+        h.weakByDepth := h.sideTouchCount > 0 and ph.weakByDepth
+        h.maxDepthPct := h.sideTouchCount > 0 ? ph.maxDepthPct : 0.0
+    child.zoneFresh := array.size(child.touchMarks) == 0
+    array.push(e.cores, child)
+    e.statSplits += 1
+    pushEvent(e, 13, f, child, 0, bot, top, 0, 1, 0, parent.coreId)
+    child
+
+// 11.1 Association pass. A core whose side is in ActiveTouch keeps its shape;
+//      the new geometry is deferred through pendingTopology.
+associateCandidates(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
+    int kn = array.size(e.candSide)
+    int cn = array.size(e.cores)
+    if cn > 0
+        for i = 0 to cn - 1
+            ZoneCore c = array.get(e.cores, i)
+            c.supportView.history.everUsed := c.supportView.history.everUsed or not na(c.supportView.effectiveBottom)
+            c.resistanceView.history.everUsed := c.resistanceView.history.everUsed or not na(c.resistanceView.effectiveBottom)
+    if kn > 0
+        for k = 0 to kn - 1
+            int side = array.get(e.candSide, k)
+            float cb = array.get(e.candBottom, k)
+            float ct = array.get(e.candTop, k)
+            ZoneCore primary = na
+            int cn2 = array.size(e.cores)
+            if cn2 > 0
+                for i = 0 to cn2 - 1
+                    ZoneCore c = array.get(e.cores, i)
+                    if c.alive and not na(c.physBottom) and intervalGap(c.physBottom, c.physTop, cb, ct) <= cfg.clusterMaxWidth and candSharesOrigin(e, c, k)
+                        e.statCoreMatches += 1
+                        if na(primary)
+                            primary := c
+                        else if c.coreId < primary.coreId
+                            mergeCores(e, cfg, c, primary, f)
+                            primary := c
+                        else
+                            mergeCores(e, cfg, primary, c, f)
+            if na(primary)
+                ZoneCore c = ZoneCore.new(coreId = e.nextCoreId, generationId = e.nextGenId,
+                     originRootIds = array.new<int>(), supportView = newSideView(), resistanceView = newSideView(),
+                     touchMarks = array.new<TouchMark>(), breakSnap = BreakSnapshot.new(),
+                     createdTime = f.openTime, lastSeenTime = f.openTime)
+                e.nextCoreId += 1
+                e.nextGenId += 1
+                applyCandidate(e, cfg, c, k, f)
+                c.genBaselineCatMask := array.get(e.candCatMask, k)
+                c.lastMatchSeq := f.seq
+                array.push(e.cores, c)
+            else
+                SideViewState sv = viewOf(primary, side)
+                bool alreadyApplied = (side == 1 ? primary.appliedSupSeq : primary.appliedResSeq) == f.seq
+                if sv.history.phase == 2
+                    primary.pendingTopology := true
+                else if alreadyApplied
+                    ZoneCore ch = splitCore(e, cfg, primary, k, f)
+                    ch.lastMatchSeq := f.seq
+                    if side == 1
+                        ch.appliedSupSeq := f.seq
+                    else
+                        ch.appliedResSeq := f.seq
+                else
+                    applyCandidate(e, cfg, primary, k, f)
+                    if side == 1
+                        primary.appliedSupSeq := f.seq
+                    else
+                        primary.appliedResSeq := f.seq
+                primary.lastMatchSeq := f.seq
+    // cores that received nothing this bar
+    int cn3 = array.size(e.cores)
+    if cn3 > 0
+        for i = cn3 - 1 to 0
+            ZoneCore c = array.get(e.cores, i)
+            bool protectedPhase = c.supportView.history.phase == 2 or c.resistanceView.history.phase == 2 or
+                 c.supportView.history.phase == 3 or c.supportView.history.phase == 4 or
+                 c.resistanceView.history.phase == 3 or c.resistanceView.history.phase == 4 or
+                 c.pendingGeneration or c.pendingTopology
+            bool waitingRoot = false
+            int on = array.size(c.originRootIds)
+            if on > 0
+                for q = 0 to on - 1
+                    Root r = rootOf(e, array.get(c.originRootIds, q))
+                    if not na(r) and (r.state == 3 or r.state == 4)
+                        waitingRoot := true
+                        break
+            if not c.alive
+                array.remove(e.cores, i)
+            else if c.lastMatchSeq != f.seq and not protectedPhase and not waitingRoot
+                array.push(e.endedGenCores, c.coreId)
+                array.push(e.endedGenIds, c.generationId)
+                array.remove(e.cores, i)
+            else if c.lastMatchSeq != f.seq
+                c.supportView.eligible := false
+                c.resistanceView.eligible := false
+
+// =============================================================================
+// 12. State transitions
+//     Detection runs against the structure that was final at the previous
+//     confirmed bar: last armed range, TouchStartSnapshot, BreakSnapshot.
+// =============================================================================
+// Live participation test (LiveStructure): a root that lost its eligibility
+// this bar is excluded immediately, without waiting for the re-clustering.
+sideHasLiveNonPsych(ZoneEngine e, SideViewState sv, int side) =>
+    int n = array.size(sv.rootIds)
+    bool ok = false
+    if n > 0
+        for i = 0 to n - 1
+            Root r = rootOf(e, array.get(sv.rootIds, i))
+            if not na(r) and r.category != 5
+                bool live = r.category == 4 ? (fvgSideEligible(r, side) and not r.pendingInvalidate) : r.state == 1
+                if live
+                    ok := true
+                    break
+    ok
+
+trimTouchMarks(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
+    while array.size(c.touchMarks) > cfg.maxTouchMarksPerCore
+        array.shift(c.touchMarks)
+        e.touchHistoryTruncated := true
+
+startGeneration(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, int catMaskNow) =>
+    c.generationId := e.nextGenId
+    e.nextGenId += 1
+    for si = 0 to 1
+        SideViewState sv = si == 0 ? c.supportView : c.resistanceView
+        SideHistory h = sv.history
+        h.sideTouchCount := 0
+        h.weakByTouch := false
+        h.weakByDepth := false
+        h.maxDepthPct := 0.0
+        h.sideFresh := true
+        h.currentTouchNo := 0
+        h.upcomingTouchNo := 1
+        h.flipAttemptCount := 0
+        h.inverseAttemptCount := 0
+        h.phase := h.phase == 1 ? 1 : 0
+        sv.touchSnapshot.valid := false
+    c.zoneFresh := true
+    c.breakSnap := BreakSnapshot.new()
+    array.clear(c.touchMarks)
+    c.genCandidateReady := false
+    c.genCandidateMovedAway := false
+    c.genCandidateSide := 0
+    c.pendingGeneration := false
+    c.genBaselineCatMask := catMaskNow
+    pushEvent(e, 11, f, c, 0, c.physBottom, c.physTop, 0, 1, 0, 0)
+
+applyBreak(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, int side, float bot, float top, bool gap, int touchNo) =>
+    SideViewState ov = viewOf(c, side)
+    BreakSnapshot bs = c.breakSnap
+    bs.valid := true
+    bs.coreId := c.coreId
+    bs.generationId := c.generationId
+    bs.oldSide := side
+    bs.rangeBottom := bot
+    bs.rangeTop := top
+    bs.rootIds := array.copy(ov.rootIds)
+    bs.breakSeq := f.seq
+    bs.breakTime := f.closeTime
+    bs.wasGapBreak := gap
+    bs.movedAway := false
+    bs.retestSeen := false
+    ov.history.phase := 3
+    viewOf(c, -side).history.phase := 4
+    ov.history.currentTouchNo := 0
+    c.supportView.eligible := false
+    c.resistanceView.eligible := false
+    c.genBaselineCatMask := ov.catMask
+    pushEvent(e, gap ? 4 : 3, f, c, side, bot, top, touchNo, ov.history.grade, weakReasonOf(cfg, ov.history, touchNo), 0)
+
+activeEval(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, int side) =>
+    TouchStartSnapshot sn = sv.touchSnapshot
+    SideHistory h = sv.history
+    float bot = sn.rangeBottom
+    float top = sn.rangeTop
+    bool brk = side == 1 ? f.c <= bot - cfg.breakBuffer : f.c >= top + cfg.breakBuffer
+    if brk
+        applyBreak(e, cfg, f, c, side, bot, top, false, h.currentTouchNo)
+    else
+        float width = top - bot
+        if width > 0.0 and not cfg.weakDepthOff
+            float raw = side == 1 ? (top - f.c) / width * 100.0 : (f.c - bot) / width * 100.0
+            float depth = math.max(0.0, math.min(100.0, raw))
+            if depth > sn.maxDepthPct
+                sn.maxDepthPct := depth
+                sn.deepestClose := f.c
+            h.maxDepthPct := math.max(h.maxDepthPct, depth)
+            if depth >= cfg.weakDepthPct and not h.weakByDepth
+                h.weakByDepth := true
+                pushEvent(e, 2, f, c, side, bot, top, h.currentTouchNo, sn.touchStartGrade, weakReasonOf(cfg, h, h.currentTouchNo), 0)
+        bool reset = side == 1 ? f.c >= top + cfg.touchResetDistance : f.c <= bot - cfg.touchResetDistance
+        if reset
+            h.phase := 0
+            pushEvent(e, 1, f, c, side, bot, top, h.currentTouchNo, sn.touchStartGrade, weakReasonOf(cfg, h, h.currentTouchNo), 0)
+            h.currentTouchNo := 0
+
+startTouch(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, int side) =>
+    SideHistory h = sv.history
+    bool otherActive = viewOf(c, -side).history.phase == 2
+    if c.genCandidateReady and c.genCandidateMovedAway and c.genCandidateSide == side and not otherActive
+        startGeneration(e, cfg, f, c, sv.catMask)
+    else if c.genCandidateReady and c.genCandidateMovedAway and otherActive
+        c.pendingGeneration := true
+    h.sideTouchCount += 1
+    h.currentTouchNo := h.sideTouchCount
+    h.upcomingTouchNo := h.sideTouchCount + 1
+    h.phase := 2
+    h.sideFresh := false
+    h.everUsed := true
+    h.lastNormalTouchTime := f.closeTime
+    c.zoneFresh := false
+    int gr = gradeOf(cfg, sv, h.currentTouchNo)
+    TouchStartSnapshot sn = sv.touchSnapshot
+    sn.valid := true
+    sn.coreId := c.coreId
+    sn.generationId := c.generationId
+    sn.side := side
+    sn.rangeBottom := h.lastArmedRangeBottom
+    sn.rangeTop := h.lastArmedRangeTop
+    sn.rootIds := array.copy(sv.rootIds)
+    sn.catMask := sv.catMask
+    sn.highMask := sv.highMask
+    sn.cCount := sv.cCount
+    sn.hCount := sv.hCount
+    sn.density := sv.density
+    sn.touchStartGrade := gr
+    sn.currentTouchNo := h.currentTouchNo
+    sn.approachSide := side
+    sn.startSeq := f.seq
+    sn.startTime := f.closeTime
+    sn.deepestClose := na
+    sn.maxDepthPct := 0.0
+    c.genBaselineCatMask := sv.catMask
+    array.push(c.touchMarks, TouchMark.new(baseSeq = f.seq, time = f.closeTime, side = side,
+         contactBottom = math.max(f.l, sn.rangeBottom), contactTop = math.min(f.h, sn.rangeTop),
+         closeAtTouch = f.c, generationId = c.generationId, isNormalTouch = true))
+    trimTouchMarks(e, cfg, c)
+    pushEvent(e, 0, f, c, side, sn.rangeBottom, sn.rangeTop, h.currentTouchNo, gr, weakReasonOf(cfg, h, h.currentTouchNo), 0)
+    activeEval(e, cfg, f, c, sv, side)
+
+// Armed side: normal touch, otherwise a full gap break.
+armedEval(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, int side) =>
+    SideHistory h = sv.history
+    float bot = h.lastArmedRangeBottom
+    float top = h.lastArmedRangeTop
+    if not na(bot) and h.armedFromSeq <= f.seq
+        bool touched = top > bot ? (f.h >= bot and f.l <= top) :
+             (f.l <= bot + cfg.touchTolerance and f.h >= bot - cfg.touchTolerance)
+        if touched
+            startTouch(e, cfg, f, c, sv, side)
+        else
+            bool gapBrk = side == 1 ? (f.h < bot and f.c <= bot - cfg.breakBuffer) :
+                 (f.l > top and f.c >= top + cfg.breakBuffer)
+            if gapBrk
+                applyBreak(e, cfg, f, c, side, bot, top, true, 0)
+
+processBreakState(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c) =>
+    BreakSnapshot bs = c.breakSnap
+    if bs.valid and bs.breakSeq != f.seq
+        int oldSide = bs.oldSide
+        SideViewState ov = viewOf(c, oldSide)
+        SideViewState nv = viewOf(c, -oldSide)
+        bool oldRootsLive = sideHasLiveNonPsych(e, ov, oldSide)
+        bool reclaim = oldSide == 1 ? f.c >= bs.rangeTop + cfg.breakBuffer : f.c <= bs.rangeBottom - cfg.breakBuffer
+        if reclaim and oldRootsLive
+            bs.valid := false
+            ov.history.phase := 0
+            nv.history.phase := 0
+            pushEvent(e, 7, f, c, oldSide, bs.rangeBottom, bs.rangeTop, 0, ov.history.grade, weakReasonOf(cfg, ov.history, ov.history.sideTouchCount + 1), 0)
+        else if not reclaim
+            float awayLevel = oldSide == 1 ? bs.rangeBottom - cfg.touchResetDistance : bs.rangeTop + cfg.touchResetDistance
+            if not bs.movedAway
+                bs.movedAway := oldSide == 1 ? f.c <= awayLevel : f.c >= awayLevel
+            else
+                bool retest = intersects(f.l, f.h, bs.rangeBottom, bs.rangeTop)
+                if retest
+                    bs.retestSeen := true
+                    bool confirm = oldSide == 1 ? f.c <= bs.rangeBottom : f.c >= bs.rangeTop
+                    if confirm
+                        bs.valid := false
+                        nv.history.phase := 0
+                        nv.history.lastFlipConfirmSeq := f.seq
+                        ov.history.phase := 0
+                        array.push(c.touchMarks, TouchMark.new(baseSeq = f.seq, time = f.closeTime,
+                             side = -oldSide, contactBottom = bs.rangeBottom, contactTop = bs.rangeTop,
+                             closeAtTouch = f.c, generationId = c.generationId, isNormalTouch = false))
+                        trimTouchMarks(e, cfg, c)
+                        pushEvent(e, 6, f, c, -oldSide, bs.rangeBottom, bs.rangeTop, 0, nv.history.grade, 0, 0)
+                    else
+                        nv.history.flipAttemptCount += 1
+                        pushEvent(e, 5, f, c, -oldSide, bs.rangeBottom, bs.rangeTop, 0, nv.history.grade, 0, 0)
+
+// =============================================================================
+// 13. Generation candidate, per bar finalisation, storage, views
+// =============================================================================
+updateGenerationCandidate(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c) =>
+    for si = 0 to 1
+        int side = si == 0 ? 1 : -1
+        SideViewState sv = viewOf(c, side)
+        SideHistory h = sv.history
+        if sv.baseStrong and not na(sv.effectiveBottom)
+            int newCats = sv.catMask - (sv.catMask & c.genBaselineCatMask)
+            newCats := newCats - (newCats & 32)
+            bool consumed = h.sideTouchCount > 0 or h.weakByDepth or c.breakSnap.valid or not c.zoneFresh
+            if newCats != 0 and consumed
+                c.genCandidateReady := true
+                c.genCandidateSide := side
+    if c.genCandidateReady and c.genCandidateSide != 0
+        SideViewState gv = viewOf(c, c.genCandidateSide)
+        if not na(gv.effectiveBottom)
+            bool away = c.genCandidateSide == 1 ? f.c >= gv.effectiveTop + cfg.touchResetDistance :
+                 f.c <= gv.effectiveBottom - cfg.touchResetDistance
+            c.genCandidateMovedAway := c.genCandidateMovedAway or away
+
+finalizeSide(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, int side) =>
+    SideHistory h = sv.history
+    if not na(sv.effectiveBottom)
+        if h.phase == 5 and not na(sv.referencePrice) and math.abs(f.c - sv.referencePrice) <= cfg.dormantDistance
+            h.phase := 0
+        if h.phase == 0 and sv.eligible
+            bool armCond = side == 1 ? f.c >= sv.effectiveTop + cfg.touchResetDistance :
+                 f.c <= sv.effectiveBottom - cfg.touchResetDistance
+            if armCond
+                h.phase := 1
+                h.armedFromSeq := f.seq + 1
+        if h.phase == 1
+            h.lastArmedRangeBottom := sv.effectiveBottom
+            h.lastArmedRangeTop := sv.effectiveTop
+        if (h.phase == 0 or h.phase == 1) and not na(sv.referencePrice) and math.abs(f.c - sv.referencePrice) > cfg.dormantDistance
+            h.phase := 5
+    h.upcomingTouchNo := h.sideTouchCount + 1
+    int target = h.phase == 2 ? h.currentTouchNo : h.upcomingTouchNo
+    h.weakByTouch := not cfg.weakFromTouchOff and target >= cfg.weakFromTouch
+    h.grade := gradeOf(cfg, sv, target)
+
+// 13.1 Storage. Protected items are never pruned; the oldest dormant Core with
+//      the fewest roots goes first.
+buildProtectedSet(ZoneEngine e) =>
+    map<int, int> prot = map.new<int, int>()
+    int cn = array.size(e.cores)
+    if cn > 0
+        for i = 0 to cn - 1
+            ZoneCore c = array.get(e.cores, i)
+            for si = 0 to 1
+                SideViewState sv = si == 0 ? c.supportView : c.resistanceView
+                int n = array.size(sv.rootIds)
+                if n > 0
+                    for q = 0 to n - 1
+                        map.put(prot, array.get(sv.rootIds, q), 1)
+                if sv.touchSnapshot.valid and not na(sv.touchSnapshot.rootIds)
+                    int m = array.size(sv.touchSnapshot.rootIds)
+                    if m > 0
+                        for q = 0 to m - 1
+                            map.put(prot, array.get(sv.touchSnapshot.rootIds, q), 1)
+            if c.breakSnap.valid and not na(c.breakSnap.rootIds)
+                int m2 = array.size(c.breakSnap.rootIds)
+                if m2 > 0
+                    for q = 0 to m2 - 1
+                        map.put(prot, array.get(c.breakSnap.rootIds, q), 1)
+    prot
+
+pruneCategory(ZoneEngine e, map<int, int> prot, int cat, int limit) =>
+    array<int> ci = catIndexArr(e, cat)
+    int guard = 0
+    while array.size(ci) > limit and guard < 512
+        guard += 1
+        int victim = 0
+        int oldest = 0
+        int n = array.size(ci)
+        for i = 0 to n - 1
+            Root r = array.get(e.roots, array.get(ci, i))
+            bool isProt = map.contains(prot, r.rootId) or r.state == 3 or r.state == 4
+            if not isProt and (victim == 0 or nz(r.confirmedTime) < oldest)
+                victim := r.rootId
+                oldest := nz(r.confirmedTime)
+        if victim == 0
+            break
+        unregisterRoot(e, victim)
+        e.prunedRootCount += 1
+        e.storagePruned := true
+
+pruneStorage(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
+    bool needRoot = array.size(e.idxSwing) > cfg.maxSwingRoots or array.size(e.idxFvg) > cfg.maxFvgRoots or
+         array.size(e.idxAccum) > cfg.maxAccumBoxes * 2 or array.size(e.idxTime) > cfg.maxTimeRoots
+    if needRoot
+        map<int, int> prot = buildProtectedSet(e)
+        pruneCategory(e, prot, 1, cfg.maxSwingRoots)
+        pruneCategory(e, prot, 4, cfg.maxFvgRoots)
+        pruneCategory(e, prot, 2, cfg.maxAccumBoxes * 2)
+        pruneCategory(e, prot, 3, cfg.maxTimeRoots)
+        pushEvent(e, 14, f, na, 0, na, na, 0, 1, 0, 0)
+    int guard = 0
+    while array.size(e.cores) > cfg.maxZoneCores and guard < 256
+        guard += 1
+        int victim = -1
+        int fewest = 0
+        int oldest = 0
+        int n = array.size(e.cores)
+        for i = 0 to n - 1
+            ZoneCore c = array.get(e.cores, i)
+            bool protectedPhase = c.supportView.history.phase == 2 or c.resistanceView.history.phase == 2 or
+                 c.supportView.history.phase == 3 or c.supportView.history.phase == 4 or
+                 c.resistanceView.history.phase == 3 or c.resistanceView.history.phase == 4 or
+                 c.pendingGeneration or c.pendingTopology or c.breakSnap.valid
+            if not protectedPhase
+                int roots = array.size(c.originRootIds)
+                bool better = victim < 0 or roots < fewest or (roots == fewest and nz(c.lastSeenTime) < oldest)
+                if c.dormant or c.supportView.history.phase == 5 or c.resistanceView.history.phase == 5 or victim < 0
+                    if better
+                        victim := i
+                        fewest := roots
+                        oldest := nz(c.lastSeenTime)
+        if victim < 0
+            break
+        ZoneCore vc = array.get(e.cores, victim)
+        array.push(e.endedGenCores, vc.coreId)
+        array.push(e.endedGenIds, vc.generationId)
+        array.remove(e.cores, victim)
+        e.prunedZoneCount += 1
+        e.storagePruned := true
+        pushEvent(e, 14, f, na, 0, na, na, 0, 1, 0, 0)
+    while array.size(e.endedGenCores) > cfg.maxEndedGenerations
+        array.shift(e.endedGenCores)
+        array.shift(e.endedGenIds)
+
+// 13.2 Read only projections. Every zone is returned; nothing is filtered by
+//      distance or strength inside the engine.
+buildViews(ZoneEngine e, ZoneCfg cfg) =>
+    array.clear(e.views)
+    int n = array.size(e.cores)
+    if n > 0
+        for i = 0 to n - 1
+            ZoneCore c = array.get(e.cores, i)
+            for si = 0 to 1
+                int side = si == 0 ? 1 : -1
+                SideViewState sv = viewOf(c, side)
+                if not na(sv.effectiveBottom)
+                    SideHistory h = sv.history
+                    int target = h.phase == 2 ? h.currentTouchNo : h.upcomingTouchNo
+                    array.push(e.views, ZoneView.new(coreId = c.coreId, generationId = c.generationId,
+                         side = side, effectiveBottom = sv.effectiveBottom, effectiveTop = sv.effectiveTop,
+                         referencePrice = sv.referencePrice, phase = h.phase, grade = h.grade,
+                         cCount = sv.cCount, hCount = sv.hCount, density = sv.density,
+                         baseStrong = sv.baseStrong, currentTouchNo = h.currentTouchNo,
+                         upcomingTouchNo = h.upcomingTouchNo, zoneFresh = c.zoneFresh,
+                         sideFresh = h.sideTouchCount == 0, weakReason = weakReasonOf(cfg, h, target),
+                         maxDepthPct = h.maxDepthPct, isBroadContext = sv.isBroadContext,
+                         fvgDirMask = sv.fvgDirMask, fvgRootCount = sv.fvgRootCount,
+                         fvgFreshCount = sv.fvgFreshCount, fvgStateMask = sv.fvgStateMask,
+                         eligible = sv.eligible, catMask = sv.catMask, highMask = sv.highMask,
+                         rootIds = array.copy(sv.rootIds)))
+
+// =============================================================================
+// 14. Public API
+// =============================================================================
+cfgFingerprint(ZoneCfg cfg) =>
+    float v = cfg.clusterMaxWidth * 1.0 + cfg.denseRatio * 7.0 + cfg.touchResetDistance * 13.0
+    v += cfg.strongUntilTouch * 17.0 + cfg.weakFromTouch * 19.0 + cfg.weakDepthPct * 23.0
+    v += cfg.breakBuffer * 29.0 + cfg.touchTolerance * 31.0 + cfg.emaSlopeLookback * 37.0
+    v += cfg.swingLen5m * 41.0 + cfg.swingLen15m * 43.0 + cfg.swingLen1h * 47.0
+    v += cfg.mintick * 53.0 + cfg.dormantDistance * 59.0
+    v += (cfg.strongUnlimited ? 61.0 : 0.0) + (cfg.weakFromTouchOff ? 67.0 : 0.0) + (cfg.weakDepthOff ? 71.0 : 0.0)
+    v += (cfg.catMa ? 73.0 : 0.0) + (cfg.catSwing ? 79.0 : 0.0) + (cfg.catAccum ? 83.0 : 0.0)
+    v += (cfg.catTime ? 89.0 : 0.0) + (cfg.catFvg ? 97.0 : 0.0) + (cfg.catPsych ? 101.0 : 0.0)
+    v += cfg.accumRangeLen * 103.0 + cfg.accumBaseLen * 107.0 + cfg.accumAtrLen * 109.0
+    v += cfg.accumAtrMult * 113.0 + cfg.accumBarRatioMax * 127.0 + cfg.accumDriftMax * 131.0
+    v += cfg.maxZoneCores * 137.0 + cfg.maxSwingRoots * 139.0 + cfg.maxFvgRoots * 149.0
+    v
+
+// Single entry point. Exactly one engine update per confirmed base bar.
+export update(ZoneEngine e, ZoneCfg cfg, BaseFeed bf, MaPack ma,
+     PivotPack sw5, PivotPack sw15, PivotPack sw1h,
+     AccumPack ac1, AccumPack ac4, AccumPack acD,
+     FvgPack fv1, FvgPack fv4, FvgPack fvD) =>
+    bool processed = false
+    float print = cfgFingerprint(cfg)
+    if na(e.cfgPrint) or e.cfgPrint != print
+        e.cfgPrint := print
+        e.configValid := validateCfg(cfg)
+        e.configError := cfg.errorText
+    if e.configValid and bf.confirmed and not na(bf.openTime) and (na(e.lastBaseOpenTime) or bf.openTime > e.lastBaseOpenTime)
+        e.lastBaseOpenTime := bf.openTime
+        e.seq += 1
+        e.lastBaseSeq := e.seq
+        bf.seq := e.seq
+        cfg.mintick := not na(bf.mintick) and bf.mintick > 0.0 ? bf.mintick : cfg.mintick
+        array.clear(e.events)
+        e.statWindowEvals := 0
+        e.statDenseRounds := 0
+        e.statCoreMatches := 0
+        e.statCandidates := 0
+        // --- facts that outrank later structure changes --------------------
+        markFvgInvalidation(e, cfg, bf, fv1, e.lastFvg1hSrcClose)
+        markFvgInvalidation(e, cfg, bf, fv4, e.lastFvg4hSrcClose)
+        markFvgInvalidation(e, cfg, bf, fvD, e.lastFvgDSrcClose)
+        // --- A..D: detection against the previous confirmed structure ------
+        int cn = array.size(e.cores)
+        if cn > 0
+            for i = 0 to cn - 1
+                ZoneCore c = array.get(e.cores, i)
+                c.pendingTopology := false
+                processBreakState(e, cfg, bf, c)
+                for si = 0 to 1
+                    int side = si == 0 ? 1 : -1
+                    SideViewState sv = viewOf(c, side)
+                    int ph = sv.history.phase
+                    if ph == 2
+                        activeEval(e, cfg, bf, c, sv, side)
+                    else if ph == 1
+                        armedEval(e, cfg, bf, c, sv, side)
+        // --- E: root registry changes --------------------------------------
+        e.lastFvg1hSrcClose := applyFvgState(e, cfg, bf, fv1, e.lastFvg1hSrcClose)
+        e.lastFvg4hSrcClose := applyFvgState(e, cfg, bf, fv4, e.lastFvg4hSrcClose)
+        e.lastFvgDSrcClose  := applyFvgState(e, cfg, bf, fvD, e.lastFvgDSrcClose)
+        updateFvgInverse(e, cfg, bf)
+        ingestMa(e, cfg, ma, bf.closeTime)
+        [h5, l5] = ingestSwing(e, cfg, sw5, 1, bf.closeTime, e.lastSw5Origin, e.lastSw5LowOrigin)
+        e.lastSw5Origin := h5
+        e.lastSw5LowOrigin := l5
+        [h15, l15] = ingestSwing(e, cfg, sw15, 2, bf.closeTime, e.lastSw15Origin, e.lastSw15LowOrigin)
+        e.lastSw15Origin := h15
+        e.lastSw15LowOrigin := l15
+        [h1h, l1h] = ingestSwing(e, cfg, sw1h, 4, bf.closeTime, e.lastSw1hOrigin, e.lastSw1hLowOrigin)
+        e.lastSw1hOrigin := h1h
+        e.lastSw1hLowOrigin := l1h
+        e.lastAccum1hConfirm := ingestAccum(e, cfg, ac1, bf.closeTime, e.lastAccum1hConfirm)
+        e.lastAccum4hConfirm := ingestAccum(e, cfg, ac4, bf.closeTime, e.lastAccum4hConfirm)
+        e.lastAccumDConfirm  := ingestAccum(e, cfg, acD, bf.closeTime, e.lastAccumDConfirm)
+        ingestFvgNew(e, cfg, fv1, bf.closeTime)
+        ingestFvgNew(e, cfg, fv4, bf.closeTime)
+        ingestFvgNew(e, cfg, fvD, bf.closeTime)
+        updateTimeHL(e, cfg, bf)
+        // --- G: re-clustering ----------------------------------------------
+        collectPoints(e, cfg, false)
+        syncPsych(e, cfg, bf.c)
+        collectPoints(e, cfg, true)
+        buildCandidates(e, cfg)
+        associateCandidates(e, cfg, bf)
+        // --- H, I: generation candidates and next bar state ----------------
+        int cn2 = array.size(e.cores)
+        if cn2 > 0
+            for i = 0 to cn2 - 1
+                ZoneCore c = array.get(e.cores, i)
+                updateGenerationCandidate(e, cfg, bf, c)
+                finalizeSide(e, cfg, bf, c, c.supportView, 1)
+                finalizeSide(e, cfg, bf, c, c.resistanceView, -1)
+                c.dormant := c.supportView.history.phase == 5 and c.resistanceView.history.phase == 5
+                c.pendingGeneration := c.pendingGeneration and (c.supportView.history.phase == 2 or c.resistanceView.history.phase == 2)
+        // --- J: storage and read only projections --------------------------
+        pruneStorage(e, cfg, bf)
+        buildViews(e, cfg)
+        e.dirtyRootSet := false
+        e.dirtyRootPrice := false
+        e.dirtyQuality := false
+        e.dirtyFvgState := false
+        processed := true
+    processed
+
+export viewCount(ZoneEngine e) => array.size(e.views)
+export viewAt(ZoneEngine e, int i) => array.get(e.views, i)
+export eventCount(ZoneEngine e) => array.size(e.events)
+export eventAt(ZoneEngine e, int i) => array.get(e.events, i)
+export coreCount(ZoneEngine e) => array.size(e.cores)
+export lastBaseTime(ZoneEngine e) => e.lastBaseOpenTime
+export lastBaseSeq(ZoneEngine e) => e.lastBaseSeq
+export engineConfigValid(ZoneEngine e) => e.configValid
+export engineConfigError(ZoneEngine e) => e.configError
+export storagePruned(ZoneEngine e) => e.storagePruned
+export prunedRootCount(ZoneEngine e) => e.prunedRootCount
+export prunedZoneCount(ZoneEngine e) => e.prunedZoneCount
+export touchHistoryTruncated(ZoneEngine e) => e.touchHistoryTruncated
+export pendingTopologyCount(ZoneEngine e) =>
+    int n = array.size(e.cores)
+    int k = 0
+    if n > 0
+        for i = 0 to n - 1
+            k += array.get(e.cores, i).pendingTopology ? 1 : 0
+    k
+export pendingGenerationCount(ZoneEngine e) =>
+    int n = array.size(e.cores)
+    int k = 0
+    if n > 0
+        for i = 0 to n - 1
+            k += array.get(e.cores, i).pendingGeneration ? 1 : 0
+    k
+export statWindowEvals(ZoneEngine e) => e.statWindowEvals
+export statDenseRounds(ZoneEngine e) => e.statDenseRounds
+export statCoreMatches(ZoneEngine e) => e.statCoreMatches
+export statCandidates(ZoneEngine e) => e.statCandidates
+export statMerges(ZoneEngine e) => e.statMerges
+export statSplits(ZoneEngine e) => e.statSplits
+export maSlopeText(ZoneEngine e) =>
+    string s = ""
+    int n = array.size(e.idxMa)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = array.get(e.roots, array.get(e.idxMa, i))
+            s += (r.subtype == 0 ? "EMA2000 " : "EMA3000 ") + (r.slopeDir > 0 ? "up" : r.slopeDir < 0 ? "down" : "flat") + " "
+    s
+
+// Presentation helpers. Producing these strings never changes engine state and
+// they are only called for the zones the harness actually draws.
+export categorySummary(ZoneEngine e, ZoneView v) =>
+    string s = ""
+    for c = 0 to 5
+        if (v.catMask & (1 << c)) != 0
+            s += categoryName(c) + ((v.highMask & (1 << c)) != 0 ? "(H) " : " ")
+    s
+
+export viewLabelText(ZoneEngine e, ZoneView v) =>
+    string s = "#" + str.tostring(v.coreId) + "/G" + str.tostring(v.generationId) + "/" + sideName(v.side) + "\n"
+    s += phaseName(v.phase) + " | " + gradeName(v.grade) + "\n"
+    s += str.tostring(v.effectiveBottom, format.mintick) + "-" + str.tostring(v.effectiveTop, format.mintick) +
+         " / " + str.tostring(v.referencePrice, format.mintick) + "\n"
+    s += "C" + str.tostring(v.cCount) + " H" + str.tostring(v.hCount) + " " + densityName(v.density) + "\n"
+    s += (v.phase == 2 ? "Touch " + str.tostring(v.currentTouchNo) : "Upcoming " + str.tostring(v.upcomingTouchNo)) + "\n"
+    s += weakReasonName(v.weakReason) + " / " + str.tostring(v.maxDepthPct, "#.#") + "%\n"
+    s += "ZF " + (v.zoneFresh ? "Y" : "N") + " / SF " + (v.sideFresh ? "Y" : "N") + "\n"
+    s += "FVG " + str.tostring(v.fvgRootCount) + " fresh " + str.tostring(v.fvgFreshCount) +
+         (v.isBroadContext ? " BROAD" : "") + "\n"
+    s += categorySummary(e, v)
+    s
