@@ -1,0 +1,586 @@
+//@version=6
+// ============================================================================
+// Zone Strategy - Strong Bounce (STEP3)
+//
+// Entry logic ONLY. Zone generation, Grade, Touch, WeakDepth, Break, Flip and
+// Reclaim are owned entirely by the published ZoneEngineV2_Rebuild library.
+// This file never re-derives any Zone fact; it reads Engine output and Engine
+// events, and places orders.
+//
+// Source plumbing (requests, HTF bootstrap, feed) is byte-identical in behavior
+// to ZoneEngineV2_Rebuild_VisualHarness_14D_HTFBOOT_NEAREST so that the zones
+// this strategy trades are the zones that harness draws.
+// ============================================================================
+strategy("Zone Strategy - Strong Bounce",
+     overlay = true,
+     pyramiding = 0,
+     calc_on_every_tick = false,
+     process_orders_on_close = false,
+     calc_bars_count = 5000,
+     max_labels_count = 100,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 10,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.0)
+
+// Keep this import identical to the Visual Harness so both read the same Engine.
+import sekine3310/ZoneEngineV2_Rebuild/11 as ze
+
+// ============================================================================
+// Engine constant mirror.
+// These numeric values are defined as `const int` inside the library and are not
+// exported. They are mirrored here exactly as the Visual Harness mirrors them
+// (it uses v.side == 1 / v.phase == 3 inline). If the library ever renumbers a
+// constant, update this block only.
+// ============================================================================
+const int SIDE_SUPPORT    = 1
+const int SIDE_RESISTANCE = -1
+
+const int PH_BROKEN    = 4
+const int PH_FLIP_WAIT = 5
+
+const int GR_STRONG      = 1
+const int GR_WEAK        = 3
+const int GR_UNAVAILABLE = 4
+
+const int EV_TOUCH_START = 1
+const int EV_TOUCH_RESET = 2
+const int EV_LOCAL_BREAK = 4
+const int EV_GAP_BREAK   = 5
+
+// ============================================================================
+// Inputs - Engine logic block. Values match the Visual Harness defaults exactly.
+// Do not tune these for strategy performance; they define the Zones themselves.
+// ============================================================================
+gLogic = "Zone Logic (must match Visual Harness)"
+clusterMaxWidth = input.float(20.0, "M / max width ($)", minval = 0.01, group = gLogic)
+denseRatio = input.float(0.50, "Dense ratio", minval = 0.01, maxval = 1.0, group = gLogic)
+touchResetDistance = input.float(10.0, "Touch reset distance ($)", minval = 0.01, group = gLogic)
+strongUntilTouch = input.int(1, "Strong until touch", minval = 1, group = gLogic)
+strongUnlimited = input.bool(false, "Strong unlimited", group = gLogic)
+weakFromTouch = input.int(2, "Weak from touch", minval = 2, group = gLogic)
+weakFromTouchOff = input.bool(false, "Weak-by-touch OFF", group = gLogic)
+weakDepthPct = input.float(50.0, "Weak depth %", minval = 0, maxval = 100, group = gLogic)
+weakDepthOff = input.bool(false, "Weak-depth OFF", group = gLogic)
+breakBuffer = input.float(2.0, "Break buffer ($)", minval = 0, group = gLogic)
+touchTolerance = input.float(0.0, "Line touch tolerance ($)", minval = 0, group = gLogic)
+
+const int historyDays = 14
+const int bootstrapDays = 90
+const float bootstrapDistance = 500.0
+
+gSource = "Zone Source (must match Visual Harness)"
+emaSlopeLookback = input.int(60, "EMA slope lookback (1m bars)", minval = 1, group = gSource)
+swingLen5m = input.int(10, "Swing length 5m", minval = 1, group = gSource)
+swingLen15m = input.int(8, "Swing length 15m", minval = 1, group = gSource)
+swingLen1h = input.int(6, "Swing length 1h", minval = 1, group = gSource)
+accumRangeLen = input.int(10, "Accum range length", minval = 2, group = gSource)
+accumBaseLen = input.int(20, "Accum base length", minval = 2, group = gSource)
+accumAtrLen = input.int(14, "Accum ATR length", minval = 1, group = gSource)
+accumMinUpper = input.int(4, "Accum min upper closes", minval = 0, group = gSource)
+accumMinLower = input.int(4, "Accum min lower closes", minval = 0, group = gSource)
+accumMaxRun = input.int(4, "Accum max same-color run", minval = 0, group = gSource)
+accumAtrMult = input.float(2.5, "Accum range/ATR max", minval = 0.01, group = gSource)
+accumBarRatio = input.float(0.70, "Accum short/base width max", minval = 0.01, group = gSource)
+accumDriftMax = input.float(0.30, "Accum drift max", minval = 0.0, group = gSource)
+
+gCategory = "Zone Categories (must match Visual Harness)"
+enableMA = input.bool(true, "MA", group = gCategory)
+enableSwing = input.bool(true, "Swing", group = gCategory)
+enableAccum = input.bool(true, "Accum", group = gCategory)
+enableTimeHL = input.bool(true, "Session / Day / Week H-L", group = gCategory)
+enableFVG = input.bool(true, "HTF FVG", group = gCategory)
+enablePsych = input.bool(true, "Psychological prices", group = gCategory)
+
+// ============================================================================
+// Inputs - Strategy block. These are the only performance-facing parameters.
+// ============================================================================
+gEntry = "Strong Bounce Entry"
+slBuffer = input.float(5.0, "SL buffer beyond zone ($)", minval = 0.0, step = 0.5, group = gEntry)
+rrCap = input.float(3.0, "Zone-TP RR cap", minval = 0.1, step = 0.1, group = gEntry)
+fixedRR = input.float(1.5, "Fixed RR when over cap / no zone", minval = 0.1, step = 0.1, group = gEntry)
+allowLong = input.bool(true, "Allow Support -> Long", group = gEntry)
+allowShort = input.bool(true, "Allow Resistance -> Short", group = gEntry)
+
+gDebug = "Debug"
+showSignals = input.bool(true, "Plot entry markers", group = gDebug)
+showDebug = input.bool(true, "Show debug table", group = gDebug)
+
+// ============================================================================
+// Engine configuration. Identical construction to the Visual Harness.
+// ============================================================================
+var ze.ZoneCfg cfg = ze.newCfg(syminfo.mintick)
+if barstate.isfirst
+    cfg.clusterMaxWidth := clusterMaxWidth
+    cfg.denseRatio := denseRatio
+    cfg.touchResetDistance := touchResetDistance
+    cfg.strongUntilTouch := strongUntilTouch
+    cfg.strongUnlimited := strongUnlimited
+    cfg.weakFromTouch := weakFromTouch
+    cfg.weakFromTouchOff := weakFromTouchOff
+    cfg.weakDepthPct := weakDepthPct
+    cfg.weakDepthOff := weakDepthOff
+    cfg.breakBuffer := breakBuffer
+    cfg.touchTolerance := touchTolerance
+    cfg.emaSlopeLookback := emaSlopeLookback
+    cfg.swingLen5m := swingLen5m
+    cfg.swingLen15m := swingLen15m
+    cfg.swingLen1h := swingLen1h
+    cfg.accumRangeLen := accumRangeLen
+    cfg.accumBaseLen := accumBaseLen
+    cfg.accumAtrLen := accumAtrLen
+    cfg.accumMinUpperCloses := accumMinUpper
+    cfg.accumMinLowerCloses := accumMinLower
+    cfg.accumMaxSameColorRun := accumMaxRun
+    cfg.accumAtrMult := accumAtrMult
+    cfg.accumBarRatioMax := accumBarRatio
+    cfg.accumDriftMax := accumDriftMax
+    cfg.enableMA := enableMA
+    cfg.enableSwing := enableSwing
+    cfg.enableAccum := enableAccum
+    cfg.enableTimeHL := enableTimeHL
+    cfg.enableFVG := enableFVG
+    cfg.enablePsych := enablePsych
+    cfg.maxZonesDrawn := 30
+    cfg.maxLabelsDrawn := 30
+    cfg.mintick := syminfo.mintick
+    cfg.revision := 1
+
+// ============================================================================
+// Source feed. Identical to the Visual Harness so the traded Zones are exactly
+// the Zones the harness renders. Decision (1c): keep the 14-day state window
+// and prove correctness first; runtime scaling is handled as a separate task.
+// ============================================================================
+bool is5m = timeframe.in_seconds(timeframe.period) == 300
+const int MS_PER_DAY = 86400000
+int historyAnchorTime = na(last_bar_time) ? timenow : last_bar_time
+int historyStartTime = historyAnchorTime - historyDays * MS_PER_DAY
+int bootstrapStartTime = historyAnchorTime - bootstrapDays * MS_PER_DAY
+bool inEngineWindow = is5m and time_close >= historyStartTime
+
+const int req1mBars = 23000
+const int req15mBars = 1500
+const int req1hBars = 450
+const int req4hBars = 130
+const int req1dBars = 45
+const int boot4hBars = 650
+const int boot1dBars = 130
+
+ze.MAPack ma1m = na
+ze.SwingPack sw15 = na
+ze.TFPack p1h = na
+ze.TFPack p4h = na
+ze.TFPack p1d = na
+ze.HTFBootstrapPack boot4h = na
+ze.HTFBootstrapPack boot1d = na
+
+var bool bootstrapInjected = false
+var int bootstrapAccumInjected = 0
+var int bootstrapFvgInjected = 0
+
+f_rangeDistance(float px, float b, float t) =>
+    float lo = math.min(b, t)
+    float hi = math.max(b, t)
+    px < lo ? lo - px : px > hi ? px - hi : 0.0
+
+if inEngineWindow
+    if not bootstrapInjected
+        boot4h := request.security(syminfo.tickerid, "240",
+            ze.bootstrap4hPackV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpper, accumMinLower,
+                accumMaxRun, accumAtrMult, accumBarRatio, accumDriftMax),
+            gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = boot4hBars)
+        boot1d := request.security(syminfo.tickerid, "1D",
+            ze.bootstrap1dPackV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpper, accumMinLower,
+                accumMaxRun, accumAtrMult, accumBarRatio, accumDriftMax),
+            gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = boot1dBars)
+
+    ma1m := request.security(syminfo.tickerid, "1", ze.maPackV2(emaSlopeLookback),
+        gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = req1mBars)
+    sw15 := request.security(syminfo.tickerid, "15", ze.swingPackV2(swingLen15m),
+        gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = req15mBars)
+    p1h := request.security(syminfo.tickerid, "60",
+        ze.pack1hV2(swingLen1h, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpper, accumMinLower,
+            accumMaxRun, accumAtrMult, accumBarRatio, accumDriftMax),
+        gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = req1hBars)
+    p4h := request.security(syminfo.tickerid, "240",
+        ze.pack4hV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpper, accumMinLower,
+            accumMaxRun, accumAtrMult, accumBarRatio, accumDriftMax),
+        gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = req4hBars)
+    p1d := request.security(syminfo.tickerid, "1D",
+        ze.pack1dV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpper, accumMinLower,
+            accumMaxRun, accumAtrMult, accumBarRatio, accumDriftMax),
+        gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = req1dBars)
+
+ze.SwingPack sw5 = ze.swingPackV2(swingLen5m)
+
+var ze.ZoneFeed feed = na
+var ze.ZoneEngine engine = ze.newEngine()
+bool engineAdvanced = false
+
+if inEngineWindow and not bootstrapInjected
+    if not na(boot4h)
+        int an4 = array.size(boot4h.accumPairKeys)
+        if an4 > 0
+            for i = 0 to an4 - 1
+                float b = array.get(boot4h.accumBottoms, i)
+                float t = array.get(boot4h.accumTops, i)
+                int confirmed = array.get(boot4h.accumConfirmed, i)
+                if confirmed >= bootstrapStartTime and confirmed < historyStartTime and f_rangeDistance(close, b, t) <= bootstrapDistance
+                    bool added = ze.bootstrapAccumRoot(engine, cfg, 240,
+                        array.get(boot4h.accumPairKeys, i), t, b,
+                        array.get(boot4h.accumOrigins, i), confirmed,
+                        bar_index, time_close)
+                    if added
+                        bootstrapAccumInjected += 1
+        int fn4 = array.size(boot4h.fvgDirs)
+        if fn4 > 0
+            for i = 0 to fn4 - 1
+                float b = array.get(boot4h.fvgBottoms, i)
+                float t = array.get(boot4h.fvgTops, i)
+                int confirmed = array.get(boot4h.fvgConfirmed, i)
+                if confirmed >= bootstrapStartTime and confirmed < historyStartTime and f_rangeDistance(close, b, t) <= bootstrapDistance
+                    bool added = ze.bootstrapFvgRoot(engine, cfg, 240,
+                        array.get(boot4h.fvgDirs, i), b, t,
+                        array.get(boot4h.fvgOrigins, i), confirmed,
+                        bar_index, time_close, array.get(boot4h.fvgFresh, i))
+                    if added
+                        bootstrapFvgInjected += 1
+
+    if not na(boot1d)
+        int anD = array.size(boot1d.accumPairKeys)
+        if anD > 0
+            for i = 0 to anD - 1
+                float b = array.get(boot1d.accumBottoms, i)
+                float t = array.get(boot1d.accumTops, i)
+                int confirmed = array.get(boot1d.accumConfirmed, i)
+                if confirmed >= bootstrapStartTime and confirmed < historyStartTime and f_rangeDistance(close, b, t) <= bootstrapDistance
+                    bool added = ze.bootstrapAccumRoot(engine, cfg, 1440,
+                        array.get(boot1d.accumPairKeys, i), t, b,
+                        array.get(boot1d.accumOrigins, i), confirmed,
+                        bar_index, time_close)
+                    if added
+                        bootstrapAccumInjected += 1
+        int fnD = array.size(boot1d.fvgDirs)
+        if fnD > 0
+            for i = 0 to fnD - 1
+                float b = array.get(boot1d.fvgBottoms, i)
+                float t = array.get(boot1d.fvgTops, i)
+                int confirmed = array.get(boot1d.fvgConfirmed, i)
+                if confirmed >= bootstrapStartTime and confirmed < historyStartTime and f_rangeDistance(close, b, t) <= bootstrapDistance
+                    bool added = ze.bootstrapFvgRoot(engine, cfg, 1440,
+                        array.get(boot1d.fvgDirs, i), b, t,
+                        array.get(boot1d.fvgOrigins, i), confirmed,
+                        bar_index, time_close, array.get(boot1d.fvgFresh, i))
+                    if added
+                        bootstrapFvgInjected += 1
+    bootstrapInjected := true
+
+if inEngineWindow
+    if na(feed)
+        feed := ze.makeFeed(open, high, low, close, close[1], time, time_close, bar_index,
+            barstate.isconfirmed and is5m, syminfo.mintick, ma1m, sw5, sw15, p1h, p4h, p1d)
+    else
+        feed.baseOpen := open
+        feed.baseHigh := high
+        feed.baseLow := low
+        feed.baseClose := close
+        feed.basePrevClose := close[1]
+        feed.baseOpenTime := time
+        feed.baseCloseTime := time_close
+        feed.baseSeq := bar_index
+        feed.baseConfirmed := barstate.isconfirmed and is5m
+        feed.mintick := syminfo.mintick
+        feed.ma1m := ma1m
+        feed.swing5m := sw5
+        feed.swing15m := sw15
+        feed.oneHour := p1h
+        feed.fourHour := p4h
+        feed.oneDay := p1d
+    engineAdvanced := ze.updateConfirmedBase(engine, cfg, feed)
+
+// ============================================================================
+// Touch episode registry.
+//
+// This is an EVENT LOG, not a copy of Zone state. The Engine announces
+// EV_TOUCH_START with the Grade and the Zone range captured at touch start;
+// this registry stores that announcement so it survives the Engine's own
+// TouchReset (which invalidates the internal snapshot on the same bar that
+// price recovers past top + touchResetDistance).
+//
+// Nothing here decides Grade, Touch, Break, Weak or Zone geometry. Every value
+// originates from a library event.
+// ============================================================================
+const int MAX_EPISODES = 256
+const int EPISODE_MAX_AGE_BARS = 2000
+
+var array<int> epKey = array.new<int>()        // coreId * 2 + (support ? 0 : 1)
+var array<int> epGrade = array.new<int>()      // gradeAtStart, verbatim from EV_TOUCH_START
+var array<int> epGen = array.new<int>()        // generationId at touch start
+var array<int> epSeq = array.new<int>()        // bar_index of touch start
+var array<float> epBottom = array.new<float>() // rangeBottom, verbatim from the event
+var array<float> epTop = array.new<float>()    // rangeTop, verbatim from the event
+var array<bool> epSignaled = array.new<bool>() // this strategy already fired on this episode
+
+f_epKeyOf(int coreId, int side) => coreId * 2 + (side == SIDE_SUPPORT ? 0 : 1)
+f_epSideOf(int key) => key % 2 == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE
+
+f_epSlot(int key) =>
+    int found = -1
+    int n = array.size(epKey)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(epKey, i) == key
+                found := i
+                break
+    found
+
+f_epRemoveAt(int i) =>
+    array.remove(epKey, i)
+    array.remove(epGrade, i)
+    array.remove(epGen, i)
+    array.remove(epSeq, i)
+    array.remove(epBottom, i)
+    array.remove(epTop, i)
+    array.remove(epSignaled, i)
+    true
+
+f_epKill(int key) =>
+    int slot = f_epSlot(key)
+    if slot >= 0
+        f_epRemoveAt(slot)
+    true
+
+// A new EV_TOUCH_START for the same Zone side replaces the previous episode and
+// re-enables signalling, which is what "decompose after exit, re-entry allowed
+// from the same Zone" requires.
+f_epUpsert(int key, int grade, int gen, int seq, float bottom, float top) =>
+    int slot = f_epSlot(key)
+    if slot >= 0
+        array.set(epGrade, slot, grade)
+        array.set(epGen, slot, gen)
+        array.set(epSeq, slot, seq)
+        array.set(epBottom, slot, bottom)
+        array.set(epTop, slot, top)
+        array.set(epSignaled, slot, false)
+    else
+        array.push(epKey, key)
+        array.push(epGrade, grade)
+        array.push(epGen, gen)
+        array.push(epSeq, seq)
+        array.push(epBottom, bottom)
+        array.push(epTop, top)
+        array.push(epSignaled, false)
+    true
+
+f_epPrune(int nowSeq) =>
+    if array.size(epKey) > MAX_EPISODES / 2
+        int i = array.size(epKey) - 1
+        while i >= 0
+            if nowSeq - array.get(epSeq, i) > EPISODE_MAX_AGE_BARS
+                f_epRemoveAt(i)
+            i -= 1
+    while array.size(epKey) > MAX_EPISODES
+        f_epRemoveAt(0)
+    true
+
+// ============================================================================
+// Event ingestion. Runs only on bars where the Engine actually advanced, so the
+// same event is never consumed twice.
+// ============================================================================
+if engineAdvanced
+    int evN = ze.eventCount(engine)
+    if evN > 0
+        for i = 0 to evN - 1
+            ze.ZoneEvent ev = ze.eventAt(engine, i)
+            if not na(ev) and (ev.side == SIDE_SUPPORT or ev.side == SIDE_RESISTANCE) and not na(ev.coreId)
+                int key = f_epKeyOf(ev.coreId, ev.side)
+                if ev.eventType == EV_TOUCH_START
+                    f_epUpsert(key, ev.gradeAtStart, ev.generationId, bar_index, ev.rangeBottom, ev.rangeTop)
+                else if ev.eventType == EV_LOCAL_BREAK or ev.eventType == EV_GAP_BREAK
+                    // A broken Zone is no longer a bounce candidate on either side.
+                    f_epKill(f_epKeyOf(ev.coreId, SIDE_SUPPORT))
+                    f_epKill(f_epKeyOf(ev.coreId, SIDE_RESISTANCE))
+    f_epPrune(bar_index)
+
+// ============================================================================
+// Nearest opposite Zone lookup for TP.
+// Decision (3): only eligible, non-Unavailable, non-Broken / non-FlipWait views
+// qualify, and the Zone the entry came from is excluded.
+// ============================================================================
+f_viewUsableForTp(ze.ZoneView v, int excludeCoreId) =>
+    bool ok = not na(v)
+    ok := ok and v.eligible
+    ok := ok and v.grade != GR_UNAVAILABLE
+    ok := ok and v.phase != PH_BROKEN and v.phase != PH_FLIP_WAIT
+    ok := ok and not na(v.effectiveBottom) and not na(v.effectiveTop)
+    ok := ok and (na(excludeCoreId) or v.coreId != excludeCoreId)
+    ok
+
+f_nearestResistanceBottom(ze.ZoneEngine eng, float px, int excludeCoreId) =>
+    float best = na
+    int n = ze.viewCount(eng)
+    if n > 0
+        for i = 0 to n - 1
+            ze.ZoneView v = ze.viewAt(eng, i)
+            if f_viewUsableForTp(v, excludeCoreId) and v.side == SIDE_RESISTANCE and v.effectiveBottom > px
+                best := na(best) ? v.effectiveBottom : math.min(best, v.effectiveBottom)
+    best
+
+f_nearestSupportTop(ze.ZoneEngine eng, float px, int excludeCoreId) =>
+    float best = na
+    int n = ze.viewCount(eng)
+    if n > 0
+        for i = 0 to n - 1
+            ze.ZoneView v = ze.viewAt(eng, i)
+            if f_viewUsableForTp(v, excludeCoreId) and v.side == SIDE_SUPPORT and v.effectiveTop < px
+                best := na(best) ? v.effectiveTop : math.max(best, v.effectiveTop)
+    best
+
+// Decision (4): no opposite Zone -> fixed RR fallback.
+f_resolveTp(int dir, float entryPx, float sl, float zoneTp) =>
+    float risk = math.abs(entryPx - sl)
+    float tp = na
+    if risk > 0
+        bool zoneOk = not na(zoneTp) and (dir > 0 ? zoneTp > entryPx : zoneTp < entryPx)
+        float rr = zoneOk ? math.abs(zoneTp - entryPx) / risk : na
+        tp := zoneOk and rr <= rrCap ? zoneTp : dir > 0 ? entryPx + risk * fixedRR : entryPx - risk * fixedRR
+    tp
+
+// ============================================================================
+// Order state.
+// pyramiding = 0 and the `flat` guard below enforce one position at a time;
+// any signal raised while a position is open is ignored, not queued.
+// ============================================================================
+var int pendDir = 0
+var float pendSL = na
+var float pendZoneTP = na
+var int pendCore = na
+var int pendSeq = na
+var bool awaitingFill = false
+
+var int tradeCount = 0
+
+// --- Step 1: resolve a fill from the previous bar's signal.
+// The entry order was placed on the signal bar's close and filled at this bar's
+// open (process_orders_on_close = false), so the real entry price is known now
+// and the RR decision is made against it.
+if awaitingFill and strategy.position_size != 0
+    float entryPx = strategy.position_avg_price
+    float tp = f_resolveTp(pendDir, entryPx, pendSL, pendZoneTP)
+    if not na(tp)
+        if pendDir > 0
+            strategy.exit("SB-XL", from_entry = "SB-L", stop = pendSL, limit = tp)
+        else
+            strategy.exit("SB-XS", from_entry = "SB-S", stop = pendSL, limit = tp)
+    awaitingFill := false
+    tradeCount += 1
+else if awaitingFill and strategy.position_size == 0
+    // Entry never filled. Clear it rather than letting it linger.
+    strategy.cancel("SB-L")
+    strategy.cancel("SB-S")
+    awaitingFill := false
+    pendDir := 0
+
+if strategy.position_size == 0 and not awaitingFill
+    pendDir := 0
+
+// --- Step 2: detect a new Strong bounce.
+bool sigLong = false
+bool sigShort = false
+float sigSL = na
+float sigZoneTP = na
+int sigCore = na
+
+bool flat = strategy.position_size == 0 and not awaitingFill
+
+if engineAdvanced and inEngineWindow and flat
+    int n = array.size(epKey)
+    if n > 0
+        for i = 0 to n - 1
+            // Decision (5): recovery is close strictly beyond the touched Zone
+            // boundary, with no tolerance applied.
+            if not array.get(epSignaled, i) and array.get(epGrade, i) == GR_STRONG
+                int key = array.get(epKey, i)
+                int side = f_epSideOf(key)
+                float zb = array.get(epBottom, i)
+                float zt = array.get(epTop, i)
+                bool okLong = allowLong and side == SIDE_SUPPORT and not na(zt) and close > zt
+                bool okShort = allowShort and side == SIDE_RESISTANCE and not na(zb) and close < zb
+                if okLong or okShort
+                    array.set(epSignaled, i, true)
+                    sigCore := int(math.floor(key / 2.0))
+                    if okLong
+                        sigLong := true
+                        sigSL := zb - slBuffer
+                    else
+                        sigShort := true
+                        sigSL := zt + slBuffer
+                    break
+
+if sigLong
+    sigZoneTP := f_nearestResistanceBottom(engine, close, sigCore)
+else if sigShort
+    sigZoneTP := f_nearestSupportTop(engine, close, sigCore)
+
+// --- Step 3: place the entry. It fills at the NEXT 5m open by design.
+if sigLong or sigShort
+    int dir = sigLong ? 1 : -1
+    float estTp = f_resolveTp(dir, close, sigSL, sigZoneTP)
+    bool riskOk = not na(sigSL) and (dir > 0 ? sigSL < close : sigSL > close)
+    if riskOk and not na(estTp)
+        pendDir := dir
+        pendSL := sigSL
+        pendZoneTP := sigZoneTP
+        pendCore := sigCore
+        pendSeq := bar_index
+        awaitingFill := true
+        if dir > 0
+            strategy.entry("SB-L", strategy.long)
+            // Provisional bracket so the position is protected from its first
+            // bar. It is replaced on the fill bar using the real entry price.
+            strategy.exit("SB-XL", from_entry = "SB-L", stop = sigSL, limit = estTp)
+        else
+            strategy.entry("SB-S", strategy.short)
+            strategy.exit("SB-XS", from_entry = "SB-S", stop = sigSL, limit = estTp)
+    else
+        sigLong := false
+        sigShort := false
+
+// ============================================================================
+// Presentation
+// ============================================================================
+plotshape(showSignals and sigLong, title = "Strong bounce long", style = shape.triangleup,
+     location = location.belowbar, color = color.new(color.green, 0), size = size.tiny, text = "SB-L")
+plotshape(showSignals and sigShort, title = "Strong bounce short", style = shape.triangledown,
+     location = location.abovebar, color = color.new(color.red, 0), size = size.tiny, text = "SB-S")
+
+plot(strategy.position_size != 0 ? pendSL : na, title = "Active SL", color = color.new(color.red, 0),
+     style = plot.style_linebr, linewidth = 1)
+
+var table dbg = table.new(position.top_right, 2, 11, border_width = 1)
+if barstate.islast and showDebug
+    table.cell(dbg, 0, 0, "Build")
+    table.cell(dbg, 1, 0, ze.buildId())
+    table.cell(dbg, 0, 1, "Chart")
+    table.cell(dbg, 1, 1, is5m ? "5m OK" : "ERROR: use 5m")
+    table.cell(dbg, 0, 2, "Config")
+    table.cell(dbg, 1, 2, ze.configValid(engine) ? "OK" : ze.configError(engine))
+    table.cell(dbg, 0, 3, "Core / View / Root")
+    table.cell(dbg, 1, 3, str.tostring(ze.liveCoreCount(engine)) + " / " + str.tostring(ze.viewCount(engine)) + " / " + str.tostring(ze.rootCount(engine)))
+    table.cell(dbg, 0, 4, "Touch episodes")
+    table.cell(dbg, 1, 4, str.tostring(array.size(epKey)))
+    table.cell(dbg, 0, 5, "State window")
+    table.cell(dbg, 1, 5, str.tostring(historyDays) + "d (decision 1c)")
+    table.cell(dbg, 0, 6, "Boot Accum / FVG")
+    table.cell(dbg, 1, 6, str.tostring(bootstrapAccumInjected) + " / " + str.tostring(bootstrapFvgInjected))
+    table.cell(dbg, 0, 7, "Position")
+    table.cell(dbg, 1, 7, strategy.position_size == 0 ? "flat" : str.tostring(strategy.position_size))
+    table.cell(dbg, 0, 8, "Pending fill")
+    table.cell(dbg, 1, 8, str.tostring(awaitingFill) + (na(pendCore) ? "" : " core " + str.tostring(pendCore)))
+    table.cell(dbg, 0, 9, "Active SL / zoneTP")
+    table.cell(dbg, 1, 9, str.tostring(pendSL, format.mintick) + " / " + str.tostring(pendZoneTP, format.mintick))
+    table.cell(dbg, 0, 10, "Entries filled")
+    table.cell(dbg, 1, 10, str.tostring(tradeCount))
+else if barstate.islast
+    table.clear(dbg, 0, 0, 1, 10)
