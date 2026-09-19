@@ -550,6 +550,48 @@ new Root側が `registerRoot(e, r)`（int）だったためです。
 
 ---
 
+### 6.3 組み込み識別子のshadowing解消（2026-09-19）
+
+TradingViewでの実コンパイルで
+`Error around line 1762: Cannot shadow the built-in variable "high" because it has already been used as a built-in.`
+が出ました。
+
+セクション6の `fvgPackV2()` が組み込み `high` / `low` を読んでおり、その後にローカル変数 `bool high` を宣言していたためです。
+
+#### rename（2スコープ・7行）
+
+| 関数 | 行 | 旧 | 新 |
+|---|---|---|---|
+| `fvgAugment()` | 1762 / 1765 / 1767 / 1772 | `high` | `fvgHigh` |
+| `fvgStandalone()` | 2094 / 2105 / 2109 | `high` | `fvgHigh` |
+
+いずれも「そのFVG系候補がHigh densityに寄与するか」を表すbool。**値・条件式・処理順は不変**で、変数名のみの変更です。
+
+#### 全体走査
+
+Library / Visual Harness の全宣言（型付きローカル宣言・`var` / `varip`・`for` ループ変数・tuple分解・関数引数、複数行シグネチャを結合して解析）を、
+組み込み識別子 約70語（`open` `high` `low` `close` `time` `volume` `hl2` `hlc3` `ohlc4` `bar_index` `na` `math` `array` `map` `str` `timeframe` `syminfo` および `ta` `request` `color` `line` `label` `box` `table` `input` `format` `size` `position` `text` `source` `order` `log` `alert` `chart` `session` `barstate` `runtime` `strategy` 等）と突き合わせました。
+
+| 項目 | 結果 |
+|---|---|
+| 組み込みをshadowする宣言 | **0件**（rename後） |
+| ユーザー定義関数名と衝突する変数宣言 | **0件** |
+| Visual Harnessのshadowing | **0件**（元から該当なし） |
+
+#### 変更しなかったもの（shadowingではない）
+
+- **セクション6の組み込み読み取り**：`maPackV2` / `pivotPackV2` / `accumCondV2` / `accumPackV2` / `fvgPackV2` 内の `open` `high` `low` `close` `time`。
+  これらは呼び出し側のrequest contextで評価される正規の組み込み参照で、宣言ではありません（計33箇所）。
+- **UDTフィールド `ContactSpan.time` / `ZoneEvent.time`**：フィールド名は型の名前空間に属し、組み込み変数をshadowしません
+  （Pine組み込みの `chart.point` にも `time` フィールドがあります）。`ContactSpan.new(time = ...)` / `ZoneEvent.new(time = ...)` は名前付き引数で、同じく宣言ではありません。
+- **関数引数 `mintick`**：`toTick(float price, float mintick)` 等。`mintick` は単独の組み込み変数ではなく `syminfo.mintick` の一部であり、衝突しません。
+
+**ロジック変更は0件**（変数名のみ）。
+
+再コンパイルは **NOT RUN** です。
+
+---
+
 ## 7. 計算構造
 
 ### 7.1 キャッシュ（キー／失効／容量／fallback／所有）
@@ -660,5 +702,6 @@ Debug表の時刻も同じ`i_tz`で表示します。
 | 6 | -006 | Core associationの7フェーズ化（順序非依存）、Root ownershipの一括確定、Psychの同Side ownership、TouchEpisode + ContactSpanによる実接触履歴、Episode単位truncate、Split/Merge履歴配分 |
 | 6a | -006（据え置き） | Pine v6構文互換修正のみ：ビットマスク処理を算術方式へ統一（`maskHas` / `maskSet` / `bitPow2`）。ビット演算子と`bitwise.*`を全廃。ロジック・mask値の変更なし |
 | 6b | -006（据え置き） | Pine v6構文互換修正のみ：side-effect専用29関数の末尾に固定 `0` を追加し、関数戻り値型を安定化。ロジック変更なし |
+| 6c | -006（据え置き） | Pine v6構文互換修正のみ：組み込み `high` をshadowするローカル変数2件を `fvgHigh` へrename。ロジック変更なし |
 
 各改訂の差分はgit履歴（ブランチ `claude/new-session-vss3r2`）に保存されています。
