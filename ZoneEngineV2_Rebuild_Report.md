@@ -419,20 +419,22 @@ P・Q（片Side CoreのEpisode prune / Split後の無関係履歴復活なし）
 
 ### 6.1 コンパイルエラー修正（2026-09-19）
 
-TradingViewでの実コンパイルで `Error at 221:16 no viable alternative at character "&"` が発生しました。
-Pine Script v6には `&` / `|` / `<<` のビット演算子が存在しないため、ビットマスク処理を以下へ置換しました（Build IDは `ZEV2R-20260919-006` のまま据え置き）。
+TradingViewでの実コンパイルで2件のエラーが出ました。
 
-| 旧表記 | 新表記 | 箇所数 |
-|---|---|---|
-| `(a & b)` | `bitwise.and(a, b)` | 20 |
-| ビットOR（`a` OR `b`） | `bitOr(a, b)` | 14 |
-| `(1 << n)` | `bitPow2(n)` | 7 |
+1. `Error at 221:16 no viable alternative at character "&"` — Pine v6に `&` 演算子がない
+2. `Error at 136:21 Mismatched input "and" expecting "set ID"` — Pine v6に `bitwise.and()` も存在しない
 
-補助関数（Library内部、非export、セクション2冒頭に定義）:
+Pine Script v6にはビット演算子（`&` `|` `<<` `>>`）もビット演算関数（`bitwise.*`）も存在しないため、
+ビットマスク処理を**算術方式へ完全統一**しました（Build IDは `ZEV2R-20260919-006` のまま据え置き）。
+
+#### helper（Library内部、非export、セクション2冒頭）
 
 ```pine
-bitOr(int a, int b) =>
-    a + b - bitwise.and(a, b)
+maskHas(int mask, int bit) =>
+    int(math.floor(mask / bit)) % 2 == 1
+
+maskSet(int mask, int bit) =>
+    maskHas(mask, bit) ? mask : mask + bit
 
 bitPow2(int n) =>
     int v = 1
@@ -442,11 +444,52 @@ bitPow2(int n) =>
     v
 ```
 
-`a + b - bitwise.and(a, b)` は非負整数に対してビットORと値が完全に一致し、`bitPow2(n)` は `1 << n` と一致します。
-本ファイルで扱うマスク（catMask / highMask / labelMask / fvgDirMask / fvgStateMask / acTfMask）はすべて非負であるため、**Zoneロジックの動作は一切変わりません**（Pine v6構文互換のみの修正）。
+`maskOr` は定義していません。本Engineのビット結合はすべて右辺が単一bit（1/2/4/8/16/32 または `bitPow2(n)`）であり、
+`maskSet` で完全に足ります。使用されないhelperを残さないため省略しました。
+`bitwise.and()` を使う旧helper `bitOr()` は削除済みです。
 
-静的確認：`ZoneEngineV2_Rebuild.pine` / `ZoneEngineV2_Rebuild_VisualHarness.pine` の両方で、文字列リテラルとコメントを除いたコード部分に `&` `|` `<<` は **0件**。
-（残る `|` は `" | "` のような表示用文字列と説明コメントのみ。）
+#### 置換内容
+
+| 旧表記 | 新表記 | 箇所数 |
+|---|---|---|
+| `(mask & bit) != 0` | `maskHas(mask, bit)` | 18 |
+| `(mask & bit) == 0` | `not maskHas(mask, bit)` | 1 |
+| `mask \| bit` | `maskSet(mask, bit)` | 14 |
+| `(1 << n)` | `bitPow2(n)` | 7 |
+| `m - (m & 16)`（単一bitクリア） | `maskHas(m, 16) ? m - 16 : m` | 2 |
+| `(m & 56) != 0`（複合bitテスト） | `maskHas(m,8) or maskHas(m,16) or maskHas(m,32)` | 1 |
+| `catMask - (catMask & baseline)` からさらに bit32 を除去（複合AND-NOT） | bit 0〜5 の明示ループ（`maskHas` + `maskSet`） | 1 |
+
+#### 対象マスク（全件確認済み）
+
+FVG state mask / FVG direction mask / category mask / high mask / label mask（Time H/L）/
+Swing TF mask / Accum TF mask / candidate cat・high mask / Generation category mask。
+いずれも使用bitは 1 / 2 / 4 / 8 / 16 / 32 のみ（最大bit index 5）で、負値を取りません。
+
+#### 値同一性の確認
+
+mask 0〜63 × bit 1〜32 の全組み合わせで、`maskHas` = `(m & b) != 0`、`maskSet` = `m | b`、
+`bitPow2(n)` = `1 << n` が一致することを確認しました。
+複合bitテスト（56）、単一bitクリア、Generation category の AND-NOT ループも、
+catMask 0〜63 × baseline 0〜63 の全組み合わせで旧式と同値です（不一致 0 件）。
+**Zoneロジック・mask値・bitの意味は一切変更していません**（Pine v6構文互換のみ）。
+
+#### 静的確認
+
+`ZoneEngineV2_Rebuild.pine` / `ZoneEngineV2_Rebuild_VisualHarness.pine` の両方で、
+文字列リテラルとコメントを除いた実行コード内の出現数：
+
+| 検索文字列 | 件数 |
+|---|---|
+| `&` | 0 |
+| `\|` | 0 |
+| `<<` | 0 |
+| `>>` | 0 |
+| `bitwise.` | 0 |
+| `bitOr` | 0 |
+
+`maskHas` 定義136行／初回使用140行、`maskSet` 定義139行／初回使用1266行、`bitPow2` 定義142行／初回使用771行。
+前方参照なし、未使用helperなし。Visual Harnessは元からビット演算を使用しておらず変更0行です。
 
 再コンパイルは **NOT RUN** です。
 
@@ -560,6 +603,6 @@ Debug表の時刻も同じ`i_tz`で表示します。
 | 4 | -004 | 段階Bの完成（残Point Rootへの局所化）、心理価格を候補列挙Rootから除外、Touch Episode単位の履歴、Zone lifetimeを仕様14へ、Stale Side Structureの失効、非BroadのFVG重複Highの空間結合、FVG 50%表示の削除、Harnessの5分足強制、Debug timezone、段階表記の統一 |
 | 5 | -005 | Core物理範囲/Originの無条件再構築、Episode dedupeキーの統一、心理価格構成の全評価、片Side Coreでも有効なEpisode prune |
 | 6 | -006 | Core associationの7フェーズ化（順序非依存）、Root ownershipの一括確定、Psychの同Side ownership、TouchEpisode + ContactSpanによる実接触履歴、Episode単位truncate、Split/Merge履歴配分 |
-| 6a | -006（据え置き） | Pine v6構文互換修正のみ：ビットAND→`bitwise.and()`、ビットOR→`bitOr()`、`1 << n`→`bitPow2()`。ロジック変更なし |
+| 6a | -006（据え置き） | Pine v6構文互換修正のみ：ビットマスク処理を算術方式へ統一（`maskHas` / `maskSet` / `bitPow2`）。ビット演算子と`bitwise.*`を全廃。ロジック・mask値の変更なし |
 
 各改訂の差分はgit履歴（ブランチ `claude/new-session-vss3r2`）に保存されています。
