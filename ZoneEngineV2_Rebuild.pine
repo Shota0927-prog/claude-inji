@@ -5,14 +5,16 @@
 //  A-D, M0-M19) are the only normative sources. Zone logic is unchanged; the
 //  data structures and the evaluation order are built for runtime and memory.
 //
-//  Build ID .......... ZEV2R-20260919-003
+//  Build ID .......... ZEV2R-20260919-004
 //  Base timeframe .... confirmed 5m bar, engine updates exactly once per bar
 //
 //  Layering (M3). State transition never runs after candidate evaluation:
 //    Source/Feed      -> helper packs evaluated in their own request context
 //    Root registry    -> id/slot split, origin + category indices
-//    Candidate eval   -> stage A dense (psych + FVG included before Base
-//                        Strong), stage C normal, stage B standalone FVG
+//    Candidate eval   -> stage A dense point cores, stage B FVG candidates
+//                        (local point roots inside an FVG, Proximal
+//                        localisation, same-direction overlap, standalone,
+//                        Broad context), stage C normal candidates
 //    Core association -> identity / merge / split / pending topology
 //    State transition -> touch / weak / break / flip / reclaim / inverse
 //    Read API         -> views + events, read-only projections
@@ -21,7 +23,7 @@
 library("ZoneEngineV2_Rebuild", overlay = true)
 
 export buildId() =>
-    "ZEV2R-20260919-003"
+    "ZEV2R-20260919-004"
 
 // -----------------------------------------------------------------------------
 // 1. Constants (int codes only; strings are produced at presentation time)
@@ -403,6 +405,10 @@ export type SideHistory
     int   lastFlipConfirmSeq   = -1
     bool  everUsed             = false
 
+// One record per touch Episode. A normal touch keeps its own consumption
+// facts (deepest close, max depth, WeakByDepth) so Merge and Split can rebuild
+// the side history from the Episodes that actually belong to the new range
+// instead of copying an aggregated parent value.
 export type TouchMark
     int   baseSeq       = 0
     int   time          = na
@@ -412,6 +418,12 @@ export type TouchMark
     float closeAtTouch  = na
     int   generationId  = 0
     bool  isNormalTouch = true
+    int   touchNo       = 0
+    float snapBottom    = na
+    float snapTop       = na
+    float deepestClose  = na
+    float maxDepthPct   = 0.0
+    bool  weakByDepth   = false
 
 export type TouchStartSnapshot
     bool  valid         = false
@@ -466,10 +478,10 @@ export type SideViewState
     int   fvgRootCount    = 0
     int   fvgFreshCount   = 0
     int   fvgStateMask    = 0
-    float fvgNativeBottom = na
-    float fvgNativeTop    = na
+    // --- persistent, never cleared by a re-cluster -------------------------
     SideHistory history   = na
     TouchStartSnapshot touchSnapshot = na
+    TouchMark activeMark  = na
 
 export type ZoneCore
     int   coreId       = 0
@@ -494,6 +506,7 @@ export type ZoneCore
     bool  alive         = true
     bool  isBroadContextCore = false
     bool  marksTruncated = false
+    bool  historyDirty   = false
     int   lastMatchSeq  = -1
     int   appliedSupSeq = -1
     int   appliedResSeq = -1
@@ -536,8 +549,6 @@ export type ZoneView
     int   fvgRootCount    = 0
     int   fvgFreshCount   = 0
     int   fvgStateMask    = 0
-    float fvgNativeBottom = na
-    float fvgNativeTop    = na
     bool  eligible        = false
     int   catMask         = 0
     int   highMask        = 0
@@ -550,6 +561,7 @@ export type ZoneEngine
     array<int>  liveOrder    = na
     map<int,int> idToSlot    = na
     map<int,int> originToId  = na
+    map<int,int> ownerOfRoot = na   // rootId -> coreId assigned on this bar
     array<int> catCount      = na
     array<int> idxMa         = na
     array<int> idxSwing      = na
@@ -650,9 +662,6 @@ export type ZoneEngine
     array<int>   sFvgConf   = na
     array<int>   sFvgUsed   = na
     array<int>   sFvgLocal  = na
-    array<int>   sFvgOvlOk  = na
-    array<float> sFvgOvlBot = na
-    array<float> sFvgOvlTop = na
     array<int>   sAttach    = na
     // --- adopted candidate buffers -----------------------------------------
     array<int>   candSide   = na
@@ -959,6 +968,7 @@ export newEngine() =>
     e.liveOrder  := array.new<int>()
     e.idToSlot   := map.new<int, int>()
     e.originToId := map.new<int, int>()
+    e.ownerOfRoot := map.new<int, int>()
     e.catCount   := array.new<int>(6, 0)
     e.idxMa      := array.new<int>()
     e.idxSwing   := array.new<int>()
@@ -991,9 +1001,6 @@ export newEngine() =>
     e.sFvgConf   := array.new<int>()
     e.sFvgUsed   := array.new<int>()
     e.sFvgLocal  := array.new<int>()
-    e.sFvgOvlOk  := array.new<int>()
-    e.sFvgOvlBot := array.new<float>()
-    e.sFvgOvlTop := array.new<float>()
     e.sAttach    := array.new<int>()
     e.candSide   := array.new<int>()
     e.candStart  := array.new<int>()
@@ -1437,12 +1444,15 @@ updateFvgInverse(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
 
 // =============================================================================
 // 9. Price ordering, psychological prices, and the per side FVG working set
+//    Only non-FVG, non-psychological roots enter the ordered list: appendix A
+//    10.2 stage A enumerates candidate windows from those roots and only then
+//    synthesises psychological prices around the candidate.
 // =============================================================================
-collectPoints(ZoneEngine e, ZoneCfg cfg, bool includePsych) =>
+collectPoints(ZoneEngine e, ZoneCfg cfg) =>
     array.clear(e.sTmpA)
     array.clear(e.sTmpF)
-    for c = 0 to 5
-        if c != 4 and (c != 5 or includePsych) and catEnabled(cfg, c)
+    for c = 0 to 3
+        if catEnabled(cfg, c)
             array<int> ci = catIndexArr(e, c)
             int n = array.size(ci)
             if n > 0
@@ -1502,11 +1512,8 @@ sortedHasInt(array<int> a, int v) =>
             hi := mid - 1
     found
 
-// Psychological prices are synthesised only around live non-psych roots inside
-// the monitored distance (spec 3.6 / 7.7). 2 * M < 50 so each root contributes
-// at most one level, which keeps the generated list ascending. The logical ID
-// comes from the 50-dollar level itself, so the same price always returns the
-// same ID and no lookup table can change it.
+// The logical ID of a psychological price comes from its 50-dollar level, so
+// the same price always returns the same ID (spec 7.7) without a lookup table.
 psychIdOfLevel(int level) =>
     PSYCH_ID_BASE + level
 
@@ -1568,7 +1575,6 @@ buildFvgSet(ZoneEngine e, ZoneCfg cfg, int side) =>
     array.clear(e.sFvgConf)
     array.clear(e.sFvgUsed)
     array.clear(e.sFvgLocal)
-    array.clear(e.sFvgOvlOk)
     int n = array.size(e.idxFvg)
     if n > 0 and cfg.catFvg
         for i = 0 to n - 1
@@ -1584,20 +1590,13 @@ buildFvgSet(ZoneEngine e, ZoneCfg cfg, int side) =>
                 array.push(e.sFvgConf, r.confirmedTime)
                 array.push(e.sFvgUsed, 0)
                 array.push(e.sFvgLocal, 0)
-                array.push(e.sFvgOvlOk, 0)
-    int m = array.size(e.sFvgId)
-    if m > 1
-        for i = 0 to m - 1
-            for q = 0 to m - 1
-                if q != i and array.get(e.sFvgDir, q) == array.get(e.sFvgDir, i) and array.get(e.sFvgTf, q) != array.get(e.sFvgTf, i)
-                    if intersectsT(array.get(e.sFvgBot, i), array.get(e.sFvgTop, i), array.get(e.sFvgBot, q), array.get(e.sFvgTop, q), cfg.mintick)
-                        array.set(e.sFvgOvlOk, i, 1)
-                        break
-    m
+    array.size(e.sFvgId)
 
 // Does the common interval of FVG i with a same-direction, different timeframe
-// FVG actually cover the candidate range? Broad localisation condition 2 must
-// be spatially tied to that common interval, not to the whole NativeRange.
+// FVG actually cover this candidate range? Both the Broad localisation
+// condition 2 and the non-Broad "different timeframe overlap" quality must be
+// spatially tied to that common interval: quality is only evaluated from roots
+// that really take part in the EffectiveZoneRange.
 fvgOverlapCovers(ZoneEngine e, ZoneCfg cfg, int i, float bot, float top) =>
     int m = array.size(e.sFvgId)
     bool ok = false
@@ -1615,8 +1614,9 @@ denseTickLimit(ZoneCfg cfg) => int(math.round(cfg.denseWidth / cfg.mintick))
 mTickLimit(ZoneCfg cfg)     => int(math.round(cfg.clusterMaxWidth / cfg.mintick))
 
 // Broad FVG localisation: one of the four conditions of spec 3.5 must hold.
-// Geometry alone is never enough, and a single normal-quality category inside
-// the Broad range does not localise it.
+// Conditions 3 and 4 say "inside", so they are only evaluated when the
+// candidate actually intersects the NativeRange; the Proximal case is
+// condition 1 and the real FVG overlap is condition 2.
 broadLocalizeOkAt(ZoneEngine e, ZoneCfg cfg, int i, float bot, float top, int den,
      int hMaskPoint, int catMaskPoint, bool inside, bool proximalAnchored) =>
     int nonFvgCats = popCount6(catMaskPoint - (catMaskPoint & 16))
@@ -1628,9 +1628,9 @@ broadLocalizeOkAt(ZoneEngine e, ZoneCfg cfg, int i, float bot, float top, int de
 
 // FVG localisation onto a point-root window. Returns the completed range and
 // masks; the attached working-set indices are left in e.sAttach.
-// preDenseStrong is the Base Strong state of the point-root window BEFORE any
-// FVG joined it, so a candidate that only becomes Strong through the FVG is
-// never treated as an established Dense Base Strong core.
+// preDenseStrong is the Base Strong state of the point window BEFORE any FVG
+// joined it, so a candidate that only becomes Strong through the FVG is never
+// treated as an established Dense Base Strong core.
 fvgAugment(ZoneEngine e, ZoneCfg cfg, int side, float bot, float top, int catMask, int hMask,
      int den, bool preDenseStrong) =>
     array.clear(e.sAttach)
@@ -1650,11 +1650,11 @@ fvgAugment(ZoneEngine e, ZoneCfg cfg, int side, float bot, float top, int catMas
                 float tb = nb
                 float tt = nt
                 if not inside and den == 0
-                    float p = array.get(e.sFvgProx, i)
-                    bool outside = side == 1 ? tGt(nb, p, cfg.mintick) : tLt(nt, p, cfg.mintick)
+                    float pEdge = array.get(e.sFvgProx, i)
+                    bool outside = side == 1 ? tGt(nb, pEdge, cfg.mintick) : tLt(nt, pEdge, cfg.mintick)
                     if outside
-                        float cb2 = side == 1 ? p : nb
-                        float ct2 = side == 1 ? nt : p
+                        float cb2 = side == 1 ? pEdge : nb
+                        float ct2 = side == 1 ? nt : pEdge
                         int wT = toTick(ct2, cfg.mintick) - toTick(cb2, cfg.mintick)
                         int limitT = preDenseStrong ? denseTickLimit(cfg) : mTickLimit(cfg)
                         if wT <= limitT
@@ -1668,7 +1668,7 @@ fvgAugment(ZoneEngine e, ZoneCfg cfg, int side, float bot, float top, int catMas
                         localOk := broadLocalizeOkAt(e, cfg, i, nb, nt, den, hm, cm, inside, prox)
                         high := localOk
                     else
-                        high := array.get(e.sFvgTf, i) >= 240 or array.get(e.sFvgOvlOk, i) == 1
+                        high := array.get(e.sFvgTf, i) >= 240 or fvgOverlapCovers(e, cfg, i, nb, nt)
                     if localOk
                         nb := tb
                         nt := tt
@@ -1679,25 +1679,88 @@ fvgAugment(ZoneEngine e, ZoneCfg cfg, int side, float bot, float top, int catMas
 
 // =============================================================================
 // 10. Candidate evaluation per Side (appendix A 10.2)
-//     Stage A : dense point-root windows, psychological prices already in the
-//               ordered list, FVG localisation applied, and only then Base
-//               Strong and the competition comparator.
-//     Stage B : same-direction FVG overlap, FVG standalone, Broad context.
-//     Stage C : normal candidates from the roots stage A did not take.
-//     Comparator, used in exactly one place:
+//     Stage A : dense windows of non-FVG, non-psych roots; psychological
+//               prices are synthesised onto the candidate and the FVG
+//               localisation is applied, and only then Base Strong and the
+//               competition comparator run.
+//     Stage B : FVG candidates - local point roots inside an FVG, Proximal
+//               localisation, same-direction real overlap, FVG standalone and
+//               Broad context, in that order.
+//     Stage C : normal candidates from the roots stages A and B did not take.
+//     Comparator, in exactly one place:
 //       C desc, H desc, effective width asc, formation time asc, min Root ID asc
 // =============================================================================
-scanBest(ZoneEngine e, ZoneCfg cfg, int side, int limitTick, bool requireStrong) =>
-    int n = array.size(e.sLotSlot)
+
+// Synthesise the psychological price that can take part in this candidate.
+// It never starts or maintains a candidate on its own and it is never a window
+// boundary during enumeration: it is only added to an existing candidate.
+psychAugment(ZoneEngine e, ZoneCfg cfg, float bot, float top, int limitTick) =>
+    int bestLvl = 0
+    int bestW = 0
+    float bestBot = na
+    float bestTop = na
+    if cfg.catPsych
+        int loLvl = int(math.floor((bot - cfg.clusterMaxWidth) / 50.0))
+        int hiLvl = int(math.ceil((top + cfg.clusterMaxWidth) / 50.0))
+        for lvl = loLvl to hiLvl
+            int rid = psychIdOfLevel(lvl)
+            if slotOf(e, rid) >= 0
+                float px = lvl * 50.0
+                bool near = tLe(px, top + cfg.clusterMaxWidth, cfg.mintick) and tGe(px, bot - cfg.clusterMaxWidth, cfg.mintick)
+                float nb = math.min(bot, px)
+                float nt = math.max(top, px)
+                int wT = toTick(nt, cfg.mintick) - toTick(nb, cfg.mintick)
+                if near and wT <= limitTick and (bestLvl == 0 or wT < bestW or (wT == bestW and lvl < bestLvl))
+                    bestLvl := lvl
+                    bestW := wT
+                    bestBot := nb
+                    bestTop := nt
+    [bestLvl == 0 ? 0 : psychIdOfLevel(bestLvl), bestBot, bestTop]
+
+// Complete a candidate: MA quality from the final point density, then the FVG
+// localisation, then C / H / Density / Base Strong. Attached FVG working-set
+// indices are left in e.sAttach.
+completeCandidate(ZoneEngine e, ZoneCfg cfg, int side, float bot, float top, int catMask,
+     int hMaskNoMa, int maCnt, int maUp, int maDn, int maGapTick, bool useFvg) =>
     int denseTick = denseTickLimit(cfg)
+    int wT = toTick(top, cfg.mintick) - toTick(bot, cfg.mintick)
+    int denP = wT <= denseTick ? 0 : 1
+    int hm0 = hMaskNoMa
+    hm0 := maCnt == 2 and denP == 0 and maGapTick <= denseTick and (side == 1 ? maUp == 2 : maDn == 2) ? hm0 | 1 : hm0
+    int cP = popCount6(catMask)
+    int hP = popCount6(hm0)
+    bool preStrong = denP == 0 and ((cP == 2 and hP >= 1) or cP >= 3)
+    float aBot = bot
+    float aTop = top
+    int aCm = catMask
+    int aHm = hm0
+    array.clear(e.sAttach)
+    if useFvg and array.size(e.sFvgId) > 0
+        [nb, nt, cm, hm] = fvgAugment(e, cfg, side, bot, top, catMask, hm0, denP, preStrong)
+        aBot := nb
+        aTop := nt
+        aCm := cm
+        aHm := hm
+    int awT = toTick(aTop, cfg.mintick) - toTick(aBot, cfg.mintick)
+    int aden = awT <= denseTick ? 0 : 1
+    int cCnt = popCount6(aCm)
+    int hCnt = popCount6(aHm)
+    bool strong = aden == 0 and ((cCnt == 2 and hCnt >= 1) or cCnt >= 3)
+    [aBot, aTop, aCm, aHm, awT, aden, cCnt, hCnt, strong ? 1 : 0]
+
+scanBest(ZoneEngine e, ZoneCfg cfg, int side, int limitTick, bool requireStrong, bool requireFvg, bool useFvg) =>
+    int n = array.size(e.sLotSlot)
     int bestI = -1
     int bestJ = -1
     float bestBot = na
     float bestTop = na
-    int bestCmP = 0
-    int bestHmP = 0
-    int bestDenP = 1
-    int bestPre = 0
+    int bestCm = 0
+    int bestHm = 0
+    int bestMaCnt = 0
+    int bestMaUp = 0
+    int bestMaDn = 0
+    int bestMaGap = 0
+    int bestPsych = 0
     int bestC = -1
     int bestH = -1
     int bestW = 0
@@ -1711,6 +1774,8 @@ scanBest(ZoneEngine e, ZoneCfg cfg, int side, int limitTick, bool requireStrong)
                 int maCnt = 0
                 int maUp = 0
                 int maDn = 0
+                int maMinT = 0
+                int maMaxT = 0
                 bool swHas1h = false
                 bool swHasBoth = false
                 bool acHas4hD = false
@@ -1721,7 +1786,6 @@ scanBest(ZoneEngine e, ZoneCfg cfg, int side, int limitTick, bool requireStrong)
                 bool tmStrongLabel = false
                 int formTime = 0
                 int minId = 0
-                int nonPsych = 0
                 int baseTick = array.get(e.sLotTick, i)
                 for j = i to n - 1
                     if array.get(e.sUsed, j) == 1
@@ -1744,7 +1808,6 @@ scanBest(ZoneEngine e, ZoneCfg cfg, int side, int limitTick, bool requireStrong)
                         acMultiBox := acMultiBox or (acFirstPair != 0 and acFirstPair != r.pairKey)
                         acFirstPair := acFirstPair == 0 ? r.pairKey : acFirstPair
                     catMask := catMask | (1 << r.category)
-                    nonPsych += r.category != 5 ? 1 : 0
                     int rct = nz(r.confirmedTime)
                     formTime := rct > formTime ? rct : formTime
                     minId := minId == 0 or r.rootId < minId ? r.rootId : minId
@@ -1752,6 +1815,8 @@ scanBest(ZoneEngine e, ZoneCfg cfg, int side, int limitTick, bool requireStrong)
                         maCnt += 1
                         maUp += r.slopeDir > 0 ? 1 : 0
                         maDn += r.slopeDir < 0 ? 1 : 0
+                        maMinT := maMinT == 0 or r.priceTick < maMinT ? r.priceTick : maMinT
+                        maMaxT := maMaxT == 0 or r.priceTick > maMaxT ? r.priceTick : maMaxT
                     else if r.category == 1
                         swHas1h := swHas1h or r.tfCode >= 60
                         swHasBoth := swHasBoth or ((r.labelMask & 1) != 0 and (r.labelMask & 2) != 0)
@@ -1761,81 +1826,66 @@ scanBest(ZoneEngine e, ZoneCfg cfg, int side, int limitTick, bool requireStrong)
                     else if r.category == 3
                         tmCnt += 1
                         tmStrongLabel := tmStrongLabel or (r.labelMask & 56) != 0
-                    if nonPsych > 0
-                        float wBot = array.get(e.sLotPrice, i)
-                        float wTop = array.get(e.sLotPrice, j)
-                        int denP = wTick <= denseTick ? 0 : 1
-                        int hMaskP = 0
-                        hMaskP := maCnt == 2 and denP == 0 and (side == 1 ? maUp == 2 : maDn == 2) ? hMaskP | 1 : hMaskP
-                        hMaskP := swHas1h or swHasBoth ? hMaskP | 2 : hMaskP
-                        hMaskP := acHas4hD or (acMultiBox and popCount6(acTfMask) >= 2) ? hMaskP | 4 : hMaskP
-                        hMaskP := tmStrongLabel or tmCnt >= 2 ? hMaskP | 8 : hMaskP
-                        int cP = popCount6(catMask)
-                        int hP = popCount6(hMaskP)
-                        bool preStrong = denP == 0 and ((cP == 2 and hP >= 1) or cP >= 3)
-                        float aBot = wBot
-                        float aTop = wTop
-                        int aCm = catMask
-                        int aHm = hMaskP
-                        int aFt = formTime
-                        int aId = minId
-                        if array.size(e.sFvgId) > 0
-                            [nb, nt, cm, hm] = fvgAugment(e, cfg, side, wBot, wTop, catMask, hMaskP, denP, preStrong)
-                            aBot := nb
-                            aTop := nt
-                            aCm := cm
-                            aHm := hm
-                            int na2 = array.size(e.sAttach)
-                            if na2 > 0
-                                for q = 0 to na2 - 1
-                                    int fi = array.get(e.sAttach, q)
-                                    int fct = nz(array.get(e.sFvgConf, fi))
-                                    aFt := fct > aFt ? fct : aFt
-                                    int fid = array.get(e.sFvgId, fi)
-                                    aId := fid < aId ? fid : aId
-                        int awT = toTick(aTop, cfg.mintick) - toTick(aBot, cfg.mintick)
-                        int aden = awT <= denseTick ? 0 : 1
-                        int cCnt = popCount6(aCm)
-                        int hCnt = popCount6(aHm)
-                        bool strong = aden == 0 and ((cCnt == 2 and hCnt >= 1) or cCnt >= 3)
-                        if not requireStrong or strong
-                            bool better = cCnt > bestC
-                            better := better or (cCnt == bestC and hCnt > bestH)
-                            better := better or (cCnt == bestC and hCnt == bestH and awT < bestW)
-                            better := better or (cCnt == bestC and hCnt == bestH and awT == bestW and aFt < bestT)
-                            better := better or (cCnt == bestC and hCnt == bestH and awT == bestW and aFt == bestT and aId < bestId)
-                            if bestI < 0 or better
-                                bestI := i
-                                bestJ := j
-                                bestBot := wBot
-                                bestTop := wTop
-                                bestCmP := catMask
-                                bestHmP := hMaskP
-                                bestDenP := denP
-                                bestPre := preStrong ? 1 : 0
-                                bestC := cCnt
-                                bestH := hCnt
-                                bestW := awT
-                                bestT := aFt
-                                bestId := aId
-                    e.statWindowEvals += 1
-    [bestI, bestJ, bestBot, bestTop, bestCmP, bestHmP, bestDenP, bestPre]
+                    int hMaskNoMa = 0
+                    hMaskNoMa := swHas1h or swHasBoth ? hMaskNoMa | 2 : hMaskNoMa
+                    hMaskNoMa := acHas4hD or (acMultiBox and popCount6(acTfMask) >= 2) ? hMaskNoMa | 4 : hMaskNoMa
+                    hMaskNoMa := tmStrongLabel or tmCnt >= 2 ? hMaskNoMa | 8 : hMaskNoMa
+                    int maGap = maCnt == 2 ? maMaxT - maMinT : 0
+                    float wBot = array.get(e.sLotPrice, i)
+                    float wTop = array.get(e.sLotPrice, j)
+                    [pId, pBot, pTop] = psychAugment(e, cfg, wBot, wTop, limitTick)
+                    for vi = 0 to 1
+                        if vi == 0 or pId != 0
+                            float vBot = vi == 0 ? wBot : pBot
+                            float vTop = vi == 0 ? wTop : pTop
+                            int vCm = vi == 0 ? catMask : catMask | 32
+                            [aBot, aTop, aCm, aHm, awT, aden, cCnt, hCnt, strongI] =
+                                 completeCandidate(e, cfg, side, vBot, vTop, vCm, hMaskNoMa, maCnt, maUp, maDn, maGap, useFvg)
+                            bool okStrong = not requireStrong or strongI == 1
+                            bool okFvg = not requireFvg or (aCm & 16) != 0
+                            if okStrong and okFvg
+                                int aFt = formTime
+                                int aId = minId
+                                int an = array.size(e.sAttach)
+                                if an > 0
+                                    for q = 0 to an - 1
+                                        int fi = array.get(e.sAttach, q)
+                                        int fct = nz(array.get(e.sFvgConf, fi))
+                                        aFt := fct > aFt ? fct : aFt
+                                        int fid = array.get(e.sFvgId, fi)
+                                        aId := fid < aId ? fid : aId
+                                bool better = cCnt > bestC
+                                better := better or (cCnt == bestC and hCnt > bestH)
+                                better := better or (cCnt == bestC and hCnt == bestH and awT < bestW)
+                                better := better or (cCnt == bestC and hCnt == bestH and awT == bestW and aFt < bestT)
+                                better := better or (cCnt == bestC and hCnt == bestH and awT == bestW and aFt == bestT and aId < bestId)
+                                if bestI < 0 or better
+                                    bestI := i
+                                    bestJ := j
+                                    bestBot := vBot
+                                    bestTop := vTop
+                                    bestCm := vCm
+                                    bestHm := hMaskNoMa
+                                    bestMaCnt := maCnt
+                                    bestMaUp := maUp
+                                    bestMaDn := maDn
+                                    bestMaGap := maGap
+                                    bestPsych := vi == 0 ? 0 : pId
+                                    bestC := cCnt
+                                    bestH := hCnt
+                                    bestW := awT
+                                    bestT := aFt
+                                    bestId := aId
+                        e.statWindowEvals += 1
+    [bestI, bestJ, bestBot, bestTop, bestCm, bestHm, bestMaCnt, bestMaUp, bestMaDn, bestMaGap, bestPsych]
 
-// Adoption: only now is per candidate data materialised. The FVG augmentation
-// is replayed for the winning window, which is deterministic for the same
-// inputs, and the attached roots are consumed here.
+// Adoption: only now is per candidate data materialised. The completion is
+// replayed for the winning window, which is deterministic for the same inputs,
+// and the participating roots are consumed here.
 adoptWindow(ZoneEngine e, ZoneCfg cfg, int side, int i, int j, float wBot, float wTop,
-     int cmP, int hmP, int denP, bool preStrong) =>
-    float nb = wBot
-    float nt = wTop
-    int cm = cmP
-    int hm = hmP
-    if array.size(e.sFvgId) > 0
-        [b2, t2, c2, h2] = fvgAugment(e, cfg, side, wBot, wTop, cmP, hmP, denP, preStrong)
-        nb := b2
-        nt := t2
-        cm := c2
-        hm := h2
+     int cm, int hmNoMa, int maCnt, int maUp, int maDn, int maGap, int psychId, bool useFvg) =>
+    [nb, nt, aCm, aHm, awT, aden, c, h, strongI] =
+         completeCandidate(e, cfg, side, wBot, wTop, cm, hmNoMa, maCnt, maUp, maDn, maGap, useFvg)
     int start = array.size(e.candRootIds)
     int len = 0
     for k = i to j
@@ -1844,6 +1894,9 @@ adoptWindow(ZoneEngine e, ZoneCfg cfg, int side, int i, int j, float wBot, float
             array.push(e.candRootIds, r.rootId)
             array.set(e.sUsed, k, 1)
             len += 1
+    if psychId != 0
+        array.push(e.candRootIds, psychId)
+        len += 1
     int an = array.size(e.sAttach)
     if an > 0
         for q = 0 to an - 1
@@ -1854,11 +1907,6 @@ adoptWindow(ZoneEngine e, ZoneCfg cfg, int side, int i, int j, float wBot, float
                 array.set(e.sFvgLocal, fi, 1)
             else
                 array.set(e.sFvgUsed, fi, 1)
-    int awT = toTick(nt, cfg.mintick) - toTick(nb, cfg.mintick)
-    int den = awT <= denseTickLimit(cfg) ? 0 : 1
-    int c = popCount6(cm)
-    int h = popCount6(hm)
-    bool strong = den == 0 and ((c == 2 and h >= 1) or c >= 3)
     array.push(e.candSide, side)
     array.push(e.candStart, start)
     array.push(e.candLen, len)
@@ -1866,17 +1914,17 @@ adoptWindow(ZoneEngine e, ZoneCfg cfg, int side, int i, int j, float wBot, float
     array.push(e.candTop, nt)
     array.push(e.candC, c)
     array.push(e.candH, h)
-    array.push(e.candDensity, den)
-    array.push(e.candStrong, strong ? 1 : 0)
-    array.push(e.candCatMask, cm)
-    array.push(e.candHighMask, hm)
+    array.push(e.candDensity, aden)
+    array.push(e.candStrong, strongI)
+    array.push(e.candCatMask, aCm)
+    array.push(e.candHighMask, aHm)
     array.push(e.candRefPrice, na)
     array.push(e.candBroadCtx, 0)
     e.statCandidates += 1
 
-// Stage B: same-direction actual overlap, FVG standalone, Broad context.
-// A Broad FVG that never localised keeps its whole NativeRange as a Broad
-// Neutral context; it is never dropped.
+// Stage B, steps 3-5: same-direction real overlap, FVG standalone, Broad
+// context. A Broad FVG that never localised keeps its whole NativeRange as a
+// Broad Neutral context; it is never dropped.
 fvgStandalone(ZoneEngine e, ZoneCfg cfg, int side) =>
     int m = array.size(e.sFvgId)
     if m > 0
@@ -1993,22 +2041,33 @@ buildCandidates(ZoneEngine e, ZoneCfg cfg) =>
         // --- stage A: dense Base Strong cores ------------------------------
         bool more = true
         while more
-            [bi, bj, bBot, bTop, bCm, bHm, bDen, bPre] = scanBest(e, cfg, side, denseTickLimit(cfg), true)
+            [bi, bj, bBot, bTop, bCm, bHm, bMaC, bMaU, bMaD, bMaG, bPsy] =
+                 scanBest(e, cfg, side, denseTickLimit(cfg), true, false, true)
             if bi < 0
                 more := false
             else
-                adoptWindow(e, cfg, side, bi, bj, bBot, bTop, bCm, bHm, bDen, bPre == 1)
+                adoptWindow(e, cfg, side, bi, bj, bBot, bTop, bCm, bHm, bMaC, bMaU, bMaD, bMaG, bPsy, true)
                 e.statDenseRounds += 1
-        // --- stage B: FVG overlap / standalone / Broad context -------------
-        fvgStandalone(e, cfg, side)
-        // --- stage C: normal candidates from the remaining roots -----------
+        // --- stage B steps 1-2: FVG localised onto the remaining point roots
         more := true
         while more
-            [bi, bj, bBot, bTop, bCm, bHm, bDen, bPre] = scanBest(e, cfg, side, mTickLimit(cfg), false)
+            [bi, bj, bBot, bTop, bCm, bHm, bMaC, bMaU, bMaD, bMaG, bPsy] =
+                 scanBest(e, cfg, side, mTickLimit(cfg), false, true, true)
             if bi < 0
                 more := false
             else
-                adoptWindow(e, cfg, side, bi, bj, bBot, bTop, bCm, bHm, bDen, bPre == 1)
+                adoptWindow(e, cfg, side, bi, bj, bBot, bTop, bCm, bHm, bMaC, bMaU, bMaD, bMaG, bPsy, true)
+        // --- stage B steps 3-5: overlap / standalone / Broad context -------
+        fvgStandalone(e, cfg, side)
+        // --- stage C: normal candidates from the roots A and B did not take
+        more := true
+        while more
+            [bi, bj, bBot, bTop, bCm, bHm, bMaC, bMaU, bMaD, bMaG, bPsy] =
+                 scanBest(e, cfg, side, mTickLimit(cfg), false, false, false)
+            if bi < 0
+                more := false
+            else
+                adoptWindow(e, cfg, side, bi, bj, bBot, bTop, bCm, bHm, bMaC, bMaU, bMaD, bMaG, bPsy, false)
     int kn = array.size(e.candSide)
     if kn > 0
         for k = 0 to kn - 1
@@ -2083,6 +2142,27 @@ rebuildOriginIds(ZoneEngine e, ZoneCore c) =>
                     if not array.includes(c.originRootIds, rid)
                         array.push(c.originRootIds, rid)
 
+// Live Side Structure is rebuilt every bar. Clearing it never touches the
+// persistent side history, snapshots or generation records.
+clearLiveSide(SideViewState sv) =>
+    array.clear(sv.rootIds)
+    sv.effectiveBottom := na
+    sv.effectiveTop := na
+    sv.referencePrice := na
+    sv.cCount := 0
+    sv.hCount := 0
+    sv.catMask := 0
+    sv.highMask := 0
+    sv.density := 1
+    sv.baseStrong := false
+    sv.hasNonPsychRoot := false
+    sv.isBroadContext := false
+    sv.eligible := false
+    sv.fvgDirMask := 0
+    sv.fvgRootCount := 0
+    sv.fvgFreshCount := 0
+    sv.fvgStateMask := 0
+
 applyCandidate(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int k, BaseFeed f) =>
     int side = array.get(e.candSide, k)
     SideViewState sv = viewOf(c, side)
@@ -2094,21 +2174,20 @@ applyCandidate(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int k, BaseFeed f) =>
     int fvgCount = 0
     int fvgFresh = 0
     int fvgStateMask = 0
-    float fnb = na
-    float fnt = na
     for q = st to st + ln - 1
         int rid = array.get(e.candRootIds, q)
         array.push(sv.rootIds, rid)
         Root r = rootOf(e, rid)
         if not na(r)
             nonPsych := nonPsych or r.category != 5
+            bool broadFvg = r.category == 4 and r.isBroadFvg
+            if not broadFvg
+                map.put(e.ownerOfRoot, rid, c.coreId)
             if r.category == 4
                 fvgCount += 1
                 fvgDirMask := fvgDirMask | (1 << r.direction)
                 fvgFresh += r.fvgFresh ? 1 : 0
                 fvgStateMask := fvgStateMask | (1 << r.state)
-                fnb := na(fnb) ? r.nativeBottom : math.min(fnb, r.nativeBottom)
-                fnt := na(fnt) ? r.nativeTop : math.max(fnt, r.nativeTop)
     sv.effectiveBottom := array.get(e.candBottom, k)
     sv.effectiveTop := array.get(e.candTop, k)
     sv.referencePrice := array.get(e.candRefPrice, k)
@@ -2124,8 +2203,6 @@ applyCandidate(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int k, BaseFeed f) =>
     sv.fvgRootCount := fvgCount
     sv.fvgFreshCount := fvgFresh
     sv.fvgStateMask := fvgStateMask
-    sv.fvgNativeBottom := fnb
-    sv.fvgNativeTop := fnt
     sv.eligible := nonPsych and not c.breakSnap.valid
     c.lastSeenTime := f.openTime
     refreshCoreRange(c)
@@ -2172,36 +2249,53 @@ trimTouchMarks(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
         c.marksTruncated := true
         e.touchHistoryTruncated := true
 
-countNormalTouches(ZoneCfg cfg, ZoneCore c, int side, float bot, float top) =>
-    int n = array.size(c.touchMarks)
-    int cnt = 0
-    int lastT = na
-    if n > 0
-        for i = 0 to n - 1
-            TouchMark tm = array.get(c.touchMarks, i)
-            if tm.side == side and tm.isNormalTouch and intersectsT(tm.contactBottom, tm.contactTop, bot, top, cfg.mintick)
-                if na(lastT) or tm.time != lastT
-                    cnt += 1
-                    lastT := tm.time
-    cnt
-
 // Rebuild one side's consumption history from the retained TouchMarks. Only
 // normal touches consume Fresh. When the mark history was truncated the count
 // can never fall below what was already recorded and Fresh is not revived.
 rebuildSideHistory(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int side) =>
     SideViewState sv = viewOf(c, side)
     SideHistory h = sv.history
-    if not na(sv.effectiveBottom)
-        int cnt = countNormalTouches(cfg, c, side, sv.effectiveBottom, sv.effectiveTop)
-        if c.marksTruncated and cnt < h.sideTouchCount
-            cnt := h.sideTouchCount
+    float rb = na(sv.effectiveBottom) ? c.physBottom : sv.effectiveBottom
+    float rt = na(sv.effectiveBottom) ? c.physTop : sv.effectiveTop
+    if not na(rb)
+        int cnt = 0
+        int lastT = na
+        bool wDepth = false
+        float mDepth = 0.0
+        int n = array.size(c.touchMarks)
+        if n > 0
+            for i = 0 to n - 1
+                TouchMark tm = array.get(c.touchMarks, i)
+                if tm.side == side and tm.isNormalTouch and intersectsT(tm.contactBottom, tm.contactTop, rb, rt, cfg.mintick)
+                    if na(lastT) or tm.time != lastT
+                        cnt += 1
+                        lastT := tm.time
+                    wDepth := wDepth or tm.weakByDepth
+                    mDepth := math.max(mDepth, tm.maxDepthPct)
+        // A truncated mark history can never lower the count, clear Weak or
+        // revive Fresh: the missing past is not assumed to be untouched.
+        if c.marksTruncated
+            cnt := cnt < h.sideTouchCount ? h.sideTouchCount : cnt
+            wDepth := wDepth or h.weakByDepth
+            mDepth := math.max(mDepth, h.maxDepthPct)
         h.sideTouchCount := cnt
         h.upcomingTouchNo := cnt + 1
         h.sideFresh := cnt == 0
-        if cnt == 0 and not c.marksTruncated
-            h.weakByTouch := false
-            h.weakByDepth := false
-            h.maxDepthPct := 0.0
+        h.weakByDepth := wDepth
+        h.maxDepthPct := mDepth
+        h.weakByTouch := not cfg.weakFromTouchOff and (cnt + 1) >= cfg.weakFromTouch
+
+// After a Merge or a Split the Episodes that do not belong to the new physical
+// range are dropped, so a later Split cannot re-use unrelated history. Split
+// children are all created from the pre-split set before this runs.
+pruneMarksToRange(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
+    if not na(c.supportView.effectiveBottom) and not na(c.resistanceView.effectiveBottom)
+        int n = array.size(c.touchMarks)
+        if n > 0
+            for i = n - 1 to 0
+                TouchMark tm = array.get(c.touchMarks, i)
+                if not intersectsT(tm.contactBottom, tm.contactTop, c.physBottom, c.physTop, cfg.mintick)
+                    array.remove(c.touchMarks, i)
 
 rebuildCoreHistory(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
     rebuildSideHistory(e, cfg, c, 1)
@@ -2239,6 +2333,7 @@ mergeCores(ZoneEngine e, ZoneCfg cfg, ZoneCore dst, ZoneCore src, BaseFeed f) =>
     if not dst.breakSnap.valid and src.breakSnap.valid
         dst.breakSnap := src.breakSnap
     src.alive := false
+    dst.historyDirty := true
     e.statMerges += 1
     pushEvent(e, 12, f, dst, 0, dst.physBottom, dst.physTop, 0, 1, 0, src.coreId)
 
@@ -2270,6 +2365,8 @@ splitCore(ZoneEngine e, ZoneCfg cfg, ZoneCore parent, int k, BaseFeed f) =>
         h.everUsed := ph.everUsed
     applyCandidate(e, cfg, child, k, f)
     rebuildCoreHistory(e, cfg, child)
+    child.historyDirty := true
+    parent.historyDirty := true
     array.push(e.cores, child)
     e.statSplits += 1
     pushEvent(e, 13, f, child, 0, bot, top, 0, 1, 0, parent.coreId)
@@ -2354,31 +2451,53 @@ associateCandidates(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
                     else
                         primary.appliedResSeq := f.seq
                 primary.lastMatchSeq := f.seq
+    // --- ownership handover, stale Side Structure, Zone lifetime -----------
+    // Being unmatched on this bar is NOT an end condition (spec 14). A Core
+    // ends only when it owns no effective non-psychological Root and no
+    // waiting Root any more, which is what a hand-over to another Core through
+    // Merge / Split / re-clustering produces.
     int cn3 = array.size(e.cores)
     if cn3 > 0
         for i = cn3 - 1 to 0
             ZoneCore c = array.get(e.cores, i)
-            bool protectedPhase = coreHasActiveTouch(c) or
-                 c.supportView.history.phase == 3 or c.supportView.history.phase == 4 or
-                 c.resistanceView.history.phase == 3 or c.resistanceView.history.phase == 4 or
-                 c.pendingGeneration or c.pendingTopology or c.breakSnap.valid
-            bool waitingRoot = false
-            int on = array.size(c.originRootIds)
-            if on > 0
-                for q = 0 to on - 1
-                    Root r = rootOf(e, array.get(c.originRootIds, q))
-                    if not na(r) and (r.state == 3 or r.state == 4)
-                        waitingRoot := true
-                        break
             if not c.alive
                 array.remove(e.cores, i)
-            else if c.lastMatchSeq != f.seq and not protectedPhase and not waitingRoot
-                array.push(e.endedGenCores, c.coreId)
-                array.push(e.endedGenIds, c.generationId)
-                array.remove(e.cores, i)
-            else if c.lastMatchSeq != f.seq
-                c.supportView.eligible := false
-                c.resistanceView.eligible := false
+            else
+                int on = array.size(c.originRootIds)
+                if on > 0
+                    for q = on - 1 to 0
+                        int rid = array.get(c.originRootIds, q)
+                        Root r = rootOf(e, rid)
+                        bool moved = map.contains(e.ownerOfRoot, rid) and map.get(e.ownerOfRoot, rid) != c.coreId
+                        if na(r) or moved
+                            array.remove(c.originRootIds, q)
+                for si = 0 to 1
+                    int side = si == 0 ? 1 : -1
+                    SideViewState sv = viewOf(c, side)
+                    bool applied = (side == 1 ? c.appliedSupSeq : c.appliedResSeq) == f.seq
+                    if not applied and sv.history.phase != 2
+                        clearLiveSide(sv)
+                if c.historyDirty
+                    refreshCoreRange(c)
+                    if not na(c.supportView.effectiveBottom) and not na(c.resistanceView.effectiveBottom)
+                        pruneMarksToRange(e, cfg, c)
+                        c.historyDirty := false
+                bool waitingState = coreHasActiveTouch(c) or c.breakSnap.valid or c.pendingTopology or
+                     c.pendingGeneration or c.supportView.history.phase == 3 or c.supportView.history.phase == 4 or
+                     c.resistanceView.history.phase == 3 or c.resistanceView.history.phase == 4
+                bool hasEffective = false
+                bool hasWaitingRoot = false
+                int on2 = array.size(c.originRootIds)
+                if on2 > 0
+                    for q = 0 to on2 - 1
+                        Root r = rootOf(e, array.get(c.originRootIds, q))
+                        if not na(r) and r.category != 5
+                            hasEffective := hasEffective or r.state == 1 or r.state == 4
+                            hasWaitingRoot := hasWaitingRoot or r.state == 3
+                if not hasEffective and not hasWaitingRoot and not waitingState
+                    array.push(e.endedGenCores, c.coreId)
+                    array.push(e.endedGenIds, c.generationId)
+                    array.remove(e.cores, i)
 
 // =============================================================================
 // 12. State transitions
@@ -2421,6 +2540,7 @@ startGeneration(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, int catMaskNo
         h.inverseAttemptCount := 0
         h.phase := h.phase == 1 ? 1 : 0
         sv.touchSnapshot.valid := false
+        sv.activeMark := na
     c.zoneFresh := true
     c.breakSnap := BreakSnapshot.new()
     array.clear(c.touchMarks)
@@ -2462,6 +2582,7 @@ activeEval(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, 
     bool brk = side == 1 ? tLe(f.c, bot - cfg.breakBuffer, cfg.mintick) : tGe(f.c, top + cfg.breakBuffer, cfg.mintick)
     if brk
         applyBreak(e, cfg, f, c, side, bot, top, false, h.currentTouchNo)
+        sv.activeMark := na
     else
         int botT = toTick(bot, cfg.mintick)
         int topT = toTick(top, cfg.mintick)
@@ -2474,14 +2595,24 @@ activeEval(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, 
                 sn.maxDepthPct := depth
                 sn.deepestClose := f.c
             h.maxDepthPct := math.max(h.maxDepthPct, depth)
+            if not na(sv.activeMark)
+                TouchMark am = sv.activeMark
+                if depth > am.maxDepthPct
+                    am.maxDepthPct := depth
+                    am.deepestClose := f.c
             if depth >= cfg.weakDepthPct and not h.weakByDepth
                 h.weakByDepth := true
+                if not na(sv.activeMark)
+                    sv.activeMark.weakByDepth := true
                 pushEvent(e, 2, f, c, side, bot, top, h.currentTouchNo, sn.touchStartGrade, weakReasonOf(cfg, h, h.currentTouchNo), 0)
+            else if depth >= cfg.weakDepthPct and not na(sv.activeMark)
+                sv.activeMark.weakByDepth := true
         bool reset = side == 1 ? tGe(f.c, top + cfg.touchResetDistance, cfg.mintick) : tLe(f.c, bot - cfg.touchResetDistance, cfg.mintick)
         if reset
             h.phase := 0
             pushEvent(e, 1, f, c, side, bot, top, h.currentTouchNo, sn.touchStartGrade, weakReasonOf(cfg, h, h.currentTouchNo), 0)
             h.currentTouchNo := 0
+            sv.activeMark := na
 
 startTouch(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, int side) =>
     SideHistory h = sv.history
@@ -2520,9 +2651,13 @@ startTouch(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, 
     sn.deepestClose := na
     sn.maxDepthPct := 0.0
     c.genBaselineCatMask := sv.catMask
-    array.push(c.touchMarks, TouchMark.new(baseSeq = f.seq, time = f.closeTime, side = side,
+    TouchMark tm = TouchMark.new(baseSeq = f.seq, time = f.closeTime, side = side,
          contactBottom = math.max(f.l, sn.rangeBottom), contactTop = math.min(f.h, sn.rangeTop),
-         closeAtTouch = f.c, generationId = c.generationId, isNormalTouch = true))
+         closeAtTouch = f.c, generationId = c.generationId, isNormalTouch = true,
+         touchNo = h.currentTouchNo, snapBottom = sn.rangeBottom, snapTop = sn.rangeTop,
+         deepestClose = na, maxDepthPct = 0.0, weakByDepth = false)
+    array.push(c.touchMarks, tm)
+    sv.activeMark := tm
     trimTouchMarks(e, cfg, c)
     pushEvent(e, 0, f, c, side, sn.rangeBottom, sn.rangeTop, h.currentTouchNo, gr, weakReasonOf(cfg, h, h.currentTouchNo), 0)
     activeEval(e, cfg, f, c, sv, side)
@@ -2531,7 +2666,7 @@ armedEval(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, i
     SideHistory h = sv.history
     float bot = h.lastArmedRangeBottom
     float top = h.lastArmedRangeTop
-    if not na(bot) and h.armedFromSeq <= f.seq
+    if not na(bot) and h.armedFromSeq <= f.seq and sv.eligible
         bool touched = toTick(top, cfg.mintick) > toTick(bot, cfg.mintick) ?
              (tGe(f.h, bot, cfg.mintick) and tLe(f.l, top, cfg.mintick)) :
              (tLe(f.l, bot + cfg.touchTolerance, cfg.mintick) and tGe(f.h, bot - cfg.touchTolerance, cfg.mintick))
@@ -2618,6 +2753,8 @@ sideInverseConfirmedNow(ZoneEngine e, SideViewState sv, int seq) =>
 // display-only reference price.
 finalizeSide(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, int side) =>
     SideHistory h = sv.history
+    if h.phase == 2
+        sv.eligible := sideHasLiveNonPsych(e, cfg, sv, side)
     if not na(sv.effectiveBottom)
         float dist = intervalGap(sv.effectiveBottom, sv.effectiveTop, f.c, f.c)
         if h.phase == 5 and dist <= cfg.dormantDistance
@@ -2820,7 +2957,6 @@ buildViews(ZoneEngine e, ZoneCfg cfg) =>
                          maxDepthPct = h.maxDepthPct, isBroadContext = sv.isBroadContext,
                          fvgDirMask = sv.fvgDirMask, fvgRootCount = sv.fvgRootCount,
                          fvgFreshCount = sv.fvgFreshCount, fvgStateMask = sv.fvgStateMask,
-                         fvgNativeBottom = sv.fvgNativeBottom, fvgNativeTop = sv.fvgNativeTop,
                          eligible = sv.eligible, catMask = sv.catMask, highMask = sv.highMask,
                          rootIds = array.copy(sv.rootIds)))
 
@@ -2889,9 +3025,9 @@ export update(ZoneEngine e, ZoneCfg cfg, BaseFeed bf, MaPack ma,
         ingestFvgNew(e, cfg, fvD, bf.closeTime)
         updateTimeHL(e, cfg, bf)
         // --- G: re-clustering ----------------------------------------------
-        collectPoints(e, cfg, false)
+        collectPoints(e, cfg)
         syncPsych(e, cfg, bf.c)
-        collectPoints(e, cfg, true)
+        map.clear(e.ownerOfRoot)
         buildCandidates(e, cfg)
         associateCandidates(e, cfg, bf)
         // --- H, I: generation candidates and next bar state ----------------
@@ -2986,12 +3122,6 @@ export rootSummary(ZoneEngine e, ZoneView v) =>
             if not na(r)
                 s += categoryName(r.category) + str.tostring(r.rootId) + "/" + tfName(r.tfCode) + " "
     s == "" ? "-" : s
-
-// FVG 50% is display only. It is the midpoint of the participating FVG
-// NativeRange, never the midpoint of the EffectiveZoneRange, and na when the
-// view has no FVG root.
-export fvgNativeMid(ZoneView v) =>
-    v.fvgRootCount > 0 and not na(v.fvgNativeBottom) ? (v.fvgNativeBottom + v.fvgNativeTop) * 0.5 : na
 
 export viewLabelText(ZoneEngine e, ZoneView v) =>
     string s = "#" + str.tostring(v.coreId) + " / G" + str.tostring(v.generationId) + " / " + sideName(v.side) + "\n"
