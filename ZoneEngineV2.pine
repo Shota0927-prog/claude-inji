@@ -1008,6 +1008,9 @@ export type ZoneEngine
     array<float> scRpPsych
     //  ★ Phase10 : f_mergeCore() の重複判定用 seen (追加ごとの再 sort をやめる)
     map<int, bool> scMergeSeen
+    //  ★ Phase11 : prefix を使えない足の dsMaxCatCnt スライディング集計用
+    //    (固定 CAT_COUNT 件。毎回 array.new_* しない)
+    array<int> scCatCnt
     //  ★ Phase7 : FVG x Candidate の価格帯索引。
     //    fvcBot : Side の Candidate の「索引作成時点の bottom」昇順
     //    fvcOrd : 同じ並びの Candidate index
@@ -1218,6 +1221,7 @@ export newEngine() =>
          scRpTime   = array.new_float(),
          scRpPsych  = array.new_float(),
          scMergeSeen = map.new<int, bool>(),
+         scCatCnt   = array.new_int(6, 0),
          fvcBot      = array.new_float(),
          fvcOrd      = array.new_int(),
          fvcHit      = array.new_int(),
@@ -3375,14 +3379,16 @@ f_buildDenseBounds(ZoneEngine e, ZoneCfg c, float maxWidth) =>
     int n = array.size(e.snRootId)
     f_fillInt(e.dsHardEnd, n, n)
     f_fillInt(e.dsMaxCatCnt, n, 0)
-    //  ★ Phase9 : prefix は必要サイズまで一度だけ伸ばす (毎足の clear + push をしない)。
-    //    行 0 だけ明示的に 0 へ戻し、行 1..n は下のループが全要素を上書きする。
-    //    行 n より後ろは j <= n なので一切読まない。
-    //  ★ Phase10 : (n + 1) * CAT_COUNT も乗算サイズなので、上限を超える足は
-    //    prefix を作らず、[a, lim) の mask 集計 (Phase 8c までの式) へ落とす。
-    //    どちらの経路でも「窓内の distinct category 数」は同じ値になる。
+    //  ★ Phase11 (バグ修正) : Phase10 では two-pointer と dsMaxCatCnt の両方が
+    //    `if n > 0 and pfFits` の中にあり、さらに内側の else が外側 pfFits と
+    //    矛盾していて絶対に通らなかった。その結果 pfFits == false の足では
+    //    dsHardEnd が初期値 n、dsMaxCatCnt が初期値 0 のままになり、
+    //    requireStrong の dense 開始位置が全部 skip されて Zone 結果が変わっていた。
+    //    外側を `if n > 0` にし、pfFits は dsMaxCatCnt の求め方だけを分ける。
+    //  ★ Phase11 (B-2) : 容量判定は乗算を評価する前に除算で行う
+    //    ((n + 1) * CAT_COUNT を先に計算しない)。
     bool pfFits = n >= 0 and n + 1 <= PREFIX_CACHE_MAX
-         and (n + 1) * CAT_COUNT <= PREFIX_CACHE_MAX
+         and n + 1 <= PREFIX_CACHE_MAX / CAT_COUNT
     if pfFits
         int pfNeed = (n + 1) * CAT_COUNT
         int pfCur  = array.size(e.snCatPrefix)
@@ -3391,15 +3397,17 @@ f_buildDenseBounds(ZoneEngine e, ZoneCfg c, float maxWidth) =>
                 array.push(e.snCatPrefix, 0)
         for cat0 = 0 to CAT_COUNT - 1
             array.set(e.snCatPrefix, cat0, 0)
-    if n > 0 and pfFits
-        //  (B) prefix count を 1 回だけ作る
-        for i = 0 to n - 1
-            int base0 = i * CAT_COUNT
-            int base1 = base0 + CAT_COUNT
-            for cat = 0 to CAT_COUNT - 1
-                array.set(e.snCatPrefix, base1 + cat, array.get(e.snCatPrefix, base0 + cat))
-            int rc = array.get(e.snCat, i)
-            array.set(e.snCatPrefix, base1 + rc, array.get(e.snCatPrefix, base1 + rc) + 1)
+    if n > 0
+        if pfFits
+            //  (B-a) カテゴリ別 prefix count を 1 回だけ作る
+            for i = 0 to n - 1
+                int base0 = i * CAT_COUNT
+                int base1 = base0 + CAT_COUNT
+                for cat = 0 to CAT_COUNT - 1
+                    array.set(e.snCatPrefix, base1 + cat, array.get(e.snCatPrefix, base0 + cat))
+                int rc = array.get(e.snCat, i)
+                array.set(e.snCatPrefix, base1 + rc, array.get(e.snCatPrefix, base1 + rc) + 1)
+        //  (A) dsHardEnd : two-pointer (pfFits に依存しない)
         int wLim = int(f_tickOf(maxWidth, c.mintick)) + 1
         int j = 1
         for a = 0 to n - 1
@@ -3411,23 +3419,39 @@ f_buildDenseBounds(ZoneEngine e, ZoneCfg c, float maxWidth) =>
                     break
                 j := j + 1
             array.set(e.dsHardEnd, a, j)
-            int cnt = 0
-            if pfFits
+        //  (B) dsMaxCatCnt
+        if pfFits
+            for a = 0 to n - 1
+                int lim = array.get(e.dsHardEnd, a)
+                int cnt = 0
                 int baseA = a * CAT_COUNT
-                int baseL = j * CAT_COUNT
+                int baseL = lim * CAT_COUNT
                 for cat = 0 to CAT_COUNT - 1
                     if array.get(e.snCatPrefix, baseL + cat) > array.get(e.snCatPrefix, baseA + cat)
                         cnt := cnt + 1
-            else
-                //  prefix が使えない足は窓を直接数える (Phase 8c までと同じ式)
-                int msk = 0
-                if j > a
-                    for b = a to j - 1
-                        int rcat = array.get(e.snCat, b)
-                        if not f_maskHas(msk, rcat)
-                            msk := f_maskAdd(msk, rcat)
-                            cnt := cnt + 1
-            array.set(e.dsMaxCatCnt, a, cnt)
+                array.set(e.dsMaxCatCnt, a, cnt)
+        else
+            //  ★ Phase11 : prefix 配列へ一切触らない O(n) スライディング集計。
+            //    dsHardEnd は a について非減少なので right は戻さない。
+            //    ループ先頭で件数は [a, right) を表し、right を lim まで進めると
+            //    ちょうど窓 [a, lim) になる。次の a へ進む前に左端 a を 1 件減らす。
+            //    dsHardEnd[a] >= a + 1 が常に成り立つので件数は負にならない。
+            //    窓ごとに [a, lim) を数え直す O(n^2) 経路は使わない。
+            f_fillInt(e.scCatCnt, CAT_COUNT, 0)
+            int right = 0
+            for a = 0 to n - 1
+                int lim = array.get(e.dsHardEnd, a)
+                while right < lim
+                    int rc2 = array.get(e.snCat, right)
+                    array.set(e.scCatCnt, rc2, array.get(e.scCatCnt, rc2) + 1)
+                    right := right + 1
+                int cnt = 0
+                for cat = 0 to CAT_COUNT - 1
+                    if array.get(e.scCatCnt, cat) > 0
+                        cnt := cnt + 1
+                array.set(e.dsMaxCatCnt, a, cnt)
+                int lc = array.get(e.snCat, a)
+                array.set(e.scCatCnt, lc, array.get(e.scCatCnt, lc) - 1)
     n
 
 f_searchDenseBest(ZoneEngine e, ZoneCfg c, int side, float maxWidth, bool requireStrong) =>
@@ -4825,8 +4849,9 @@ f_rebuildCores(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     //    配列上限 100,000 要素を超えないよう、乗算の**前**に必要量を見て、
     //    入りきらない足はキャッシュを使わない (Pass 4 が従来式で再計算する)。
     //    Core も Candidate も捨てない。
-    bool ccFits = nc > 0 and nk > 0 and nc <= CC_CACHE_MAX and nk <= CC_CACHE_MAX
-         and nc * nk <= CC_CACHE_MAX
+    //  ★ Phase11 (B-2) : 乗算を評価する前に除算で判定する (nc > 0 を確認済み)
+    bool ccFits = nc > 0 and nk > 0 and nc <= CC_CACHE_MAX
+         and nk <= CC_CACHE_MAX / nc
     int ccN = ccFits ? nc * nk : 1
     int ccCur = array.size(e.ccGap)
     if ccCur < ccN
@@ -5813,7 +5838,7 @@ export rootStateName(int v) =>
 //            Harness から表示して「チャート上の実体がどのソースか」を突き合わせる。
 // @returns   string
 export buildId() =>
-    "ZoneEngineV2 engine 2026-09-18 phase10"
+    "ZoneEngineV2 engine 2026-09-19 phase11"
 
 // @function      Root.direction (FVG_NONE / FVG_BULLISH / FVG_BEARISH の enum) の名前。
 //                fvgDirectionName() は bitmask 用なので enum をそのまま渡してはいけない。

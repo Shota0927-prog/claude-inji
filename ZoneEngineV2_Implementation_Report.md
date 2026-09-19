@@ -2193,6 +2193,290 @@ CoreCand 数・Core 数・`nc × nk`・prune 量をすべて増やす方向に�
 dense 候補評価数 / キャッシュ hit・再計算数 / clean map miss の線形探索回数 /
 各処理の Profiler 負荷。
 
+## Phase 11 : 再監査への対応
+
+指摘 4 件すべて、**自分のファイルで再現を確認してから**直した。
+
+### 1. 実行対象の固定 (A)
+
+**私は TradingView で Compile / Publish / 実行 / Profiler を実行できない。**
+したがって A-1 の手順 (Compile → Publish → 実番号を記録 → import 1 行を差し替え →
+Harness Compile → 古い `ZONEv2-HARNESS` を削除して最新版 1 個だけ追加) は
+そちらで実施してもらう必要がある。`/3` はプレースホルダーのままで、
+**`/6` などの番号は推測で書いていない**。
+
+指摘のとおり、画面のエラーは `/6`、添付 Harness は `/3` の指定で、
+**監査対象と実行対象が別物**だった。これが分からないままだと原因をコードへ
+帰属させられないので、A-2 の Build ID 表示を独立 2 行にした。
+
+| Debug table | 内容 |
+|---|---|
+| 行 0 `Harness build` | `HARNESS_BUILD` = `ZoneEngineV2 Harness 2026-09-19 phase11` |
+| 行 18 `Library build` | `zn2.buildId()` = `ZoneEngineV2 engine 2026-09-19 phase11` (+ import 番号の在り処) |
+
+Phase 10 では 1 行にまとめており、しかも行 0 を二重に書いていた
+(`f_dbgRow(0, "ZoneEngineV2 Harness", ...)` を後の `f_dbgRow(0, "Build", ...)` が
+上書きしていた)。表を 2 × 19 にして両方を別行で残すようにした。
+
+### 2. 必須修正1 : `f_buildDenseBounds()` の死んだフォールバック (B)
+
+**再現。しかも指摘より重い。** two-pointer と `dsHardEnd` の書き込みまで
+`if n > 0 and pfFits` の中にあったため、`pfFits == false` の足では
+
+- `dsHardEnd[a]` が初期値 `n` のまま
+- `dsMaxCatCnt[a]` が初期値 `0` のまま
+
+になり、`f_searchDenseBest()` の `skipA = requireStrong and dsMaxCatCnt[a] < 2` が
+**全 `a` で true** になって dense 開始位置が全滅していた。
+内側の `else` は外側 `pfFits` と矛盾しており絶対に通らない (指摘どおり)。
+
+#### B-1 の実装
+
+外側を `if n > 0` にし、`pfFits` は **`dsMaxCatCnt` の求め方だけ**を分けた。
+
+```pine
+if n > 0
+    if pfFits
+        ... カテゴリ別 prefix count を作る ...
+    //  (A) dsHardEnd : two-pointer (pfFits に依存しない)
+    int j = 1
+    for a = 0 to n - 1
+        ... j を進めて array.set(e.dsHardEnd, a, j) ...
+    //  (B) dsMaxCatCnt
+    if pfFits
+        ... prefix の差分で数える ...
+    else
+        //  prefix 配列へ一切触らない O(n) スライディング集計
+        f_fillInt(e.scCatCnt, CAT_COUNT, 0)
+        int right = 0
+        for a = 0 to n - 1
+            int lim = array.get(e.dsHardEnd, a)
+            while right < lim
+                ... scCatCnt[snCat[right]] += 1 ; right += 1 ...
+            ... 0 より大きいカテゴリ数を dsMaxCatCnt[a] へ ...
+            ... scCatCnt[snCat[a]] -= 1   (次の a へ進む前に左端を抜く) ...
+```
+
+- `right` は戻さない。`dsHardEnd` が `a` について非減少なので単調に進められる。
+- ループ先頭で件数は `[a, right)` を表し、`right` を `lim` まで進めるとちょうど窓 `[a, lim)`。
+- `dsHardEnd[a] >= a + 1` が常に成り立つので件数は負にならない。
+- **窓ごとに `for b = a to j - 1` を回す `O(n²)` フォールバックは使っていない。**
+- カテゴリ Count は Engine 所有の `scCatCnt` (固定 `CAT_COUNT` 件) 1 本。毎回 `array.new_*` しない。
+- `n == 0` では `dsHardEnd` / `dsMaxCatCnt` を初期化したまま `array.get` を 1 回も実行しない。
+
+#### B-2 : 容量判定を乗算前に
+
+```pine
+bool pfFits = n >= 0 and n + 1 <= PREFIX_CACHE_MAX
+     and n + 1 <= PREFIX_CACHE_MAX / CAT_COUNT
+bool ccFits = nc > 0 and nk > 0 and nc <= CC_CACHE_MAX
+     and nk <= CC_CACHE_MAX / nc
+```
+
+`ccFits == false` のときは Core / Candidate を削除せず、Pass 4 が `gap` / `shared` を
+従来式で正確に再計算する (`coreTouched` の経路と同じ)。
+キャッシュを使わないことと候補を捨てることは分けている。
+
+#### B-3 : 独立モデルでの照合 (Python、Pine ではない)
+
+`tools/` の外に置いた独立実装で **200,000 ケース**を照合した。
+
+| 検証 | 結果 |
+|---|---|
+| `dsHardEnd` : two-pointer vs `O(n²)` 素朴実装 | 全一致 |
+| `dsMaxCatCnt` : prefix 経路 vs sliding 経路 vs 素朴 `len(set(cat[a:lim]))` | 3 つ全一致 |
+| sliding の件数が負にならない | 全ケースで成立 |
+| `dsHardEnd[a] >= a + 1` | 全ケースで成立 |
+
+ケースの内訳 : `n` = 0 / 1 / 2 / 3 / 5 / 10 / 40、tick は非減少で**同 tick と負値を含む**、
+`wLim` = 0 / 1 / 2 / 3 / 10 / 100、カテゴリ種類数 1 / 2 / 6。
+**これは Python モデルでの照合であり、Pine 上の実行検証ではない。**
+`n=9999` / `n=10000` 相当の境界、`requireStrong` の false/true、
+dense cache OFF/ON での Core ID / Generation ID / Phase / Grade / C / H / Density /
+Touch / WeakReason / MaxDepth / Range / Ref の一致は **Pine 上で未検証**。
+
+### 3. 必須修正2 : 時間足入力の誤変換 (C)
+
+**再現。** `tfCodeOf()` は `timeframe.in_seconds` 比較だったので、
+`timeframe.in_seconds("1440") == timeframe.in_seconds("1D")` により
+**"1440" が TF_D になっていた**。
+
+```pine
+tfCodeOf(simple string tf) =>
+    tf == "1"   ? TF_1M :
+     tf == "5"   ? TF_5M :
+     tf == "15"  ? TF_15M :
+     tf == "60"  ? TF_1H :
+     tf == "240" ? TF_4H :
+     tf == "D"   ? TF_D : TF_NONE
+```
+
+許可文字列以外は `TF_NONE` を返し、`tfInputsValid` が Engine 更新を止めて
+警告ラベルに該当入力名と許可文字列を出す。
+`request` の merge 判定 (同一時間足なら 1 本へまとめる) も**同じ文字列比較**を
+使っているので、対応規則は一本化されている。秒数が同じという理由だけで D へ変換しない。
+
+**MA は仕様どおり 1 分固定にした (選択肢 1)。** 指摘のとおり、Engine の MA Root は
+`tfCode = TF_1M` 固定で登録される (Engine L1865) のに入力は可変で、
+「入力は可変、Root は `TF_1M` 固定」という不許可の状態だった。
+`input.timeframe("1", "MA 時間足")` を廃止して `string maTf = "1"` の定数にした
+(選択不可)。MA 時間足を可変にする選択肢 2 は Feed / Root の tfCode / High 判定 /
+表示 / 設定検証すべての仕様変更になるので採っていない。
+
+### 4. 必須修正3 : Visual Harness の軽量化 (D)
+
+指摘 3 のとおり **`updateVisualLite()` は表示用 View / Event を軽くするだけで、
+全履歴の Root・Candidate・Dense/Sweep・FVG・Core 処理は実行する。**
+これは設計どおりで、RE10110 が設定スイッチだけで消えるとは主張していない。
+
+| 項目 | 状態 |
+|---|---|
+| Engine 更新は確定 5 分足 1 回 | 実装済み (`if isFiveMin and barstate.isconfirmed and tfInputsValid`) |
+| 過去足で ZoneView / 説明文字列 / 表示用 Event を作らない | 実装済み (`buildProjection` / `captureEvents`) |
+| 最終確定足だけ Projection | 実装済み (`wantProjection`) |
+| rollback 対策の再適用を Engine 再計算と分離 | 実装済み。描画は `needRedraw` / `needTableRefresh` の 2 本で、どちらも Engine 更新ブロックの外 |
+| **`showEventLog == false` なら `captureEvents` も false** | **Phase 11 で実装**。`wantEvents = showEventLog and (wantProjection or fullHistoryEvents)`。`e.events` は Engine 内部の判定から一度も読まれない (書くのは `f_emit()` だけ、読むのは `eventCount()` / `eventAt()` だけ。grep で確認) |
+| Debug / Root / Event table は表示 ON のときだけ | 実装済み (`showDebugTable` / `showRootTable` / `showEventLog`)。フラグは `needTableRefresh` で box/line/label の `needRedraw` と分離した |
+| table 更新を「確定状態が進んだときだけ」にするか | **していない。理由 :** table のセルも drawing object なので未確定ティックで rollback される。「進んだときだけ」にすると 2 ティック目に表が空になる (3.3 と同じ症状)。最終足の 1 本だけなので全履歴の実行時間には加算されない |
+
+#### D-2 は実装しない (条件が満たされなかった)
+
+指摘の条件「もし内部状態が参照していることが判明したら実装しない」に**該当した**。
+
+`referencePrice` / `cd.refPrice` の全参照を追ったところ、状態遷移・Touch・Break・
+Merge・Split は読んでいない (書き込みは `f_applyCandToView()` の 1 箇所、
+読み出しは View の export 1 箇所だけ)。ここまでは指摘の前提どおり。
+
+**ただし ActiveTouch 中は `f_applyCandToView()` が呼ばれない** (`f_applyCoreCand()` の
+`if active` 分岐は `f_liveStructurePrune()` だけを実行し、View への再適用をしない)。
+つまり `v.referencePrice` は **ActiveTouch に入る前の足で計算した値を保持し続ける**。
+
+したがって `buildProjection == false` の足で `f_refPrice()` を呼ばないようにすると :
+
+- ActiveTouch に入る前の足 : projection なし → `v.referencePrice` が `na` のまま
+- ActiveTouch 中 : 再適用されないので `na` のまま
+- 最終足 : まだ ActiveTouch なら再適用されず、**export される値が `na`**
+
+現状ならそこには「凍結された当時の値」が入る。つまり**表示値が変わる**。
+指摘の「後から Root を読むと当時の値を失い結果が変わる場合がある」に正確に当たるため、
+実装しない。代わりに Phase 10 で `f_refPrice()` 自体を 1 回走査へ直してある
+(ids を 5 周 → 1 周)。
+
+#### D-3 : 描画オブジェクト上限
+
+`zoneLeftBars` 5000 / `zoneRightBars` 450 は維持。
+`f_trimPools()` の直後に使用数 (`drawUsedBox` / `Line` / `Label`) を記録し、
+`max_boxes_count` / `max_lines_count` / `max_labels_count` (各 500) に達したら
+**警告ラベルに出す**ようにした。
+
+> ★ 描画オブジェクトが上限に達しています (box .../500, line .../500, label .../500)。
+> Zone / Root / Candidate は 1 件も削除していません。表示だけが欠けます。
+
+候補を黙って削除する処理は入れていない。
+
+### 5. 配列・Map・履歴参照の全件監査 (E)
+
+`tools/audit_access.py` を追加した。`array.get` / `set` / `remove` / `insert` / `pop` /
+`map.get` / `map.remove` / `for 0 to n - 1` / `time[i]` 等の履歴参照 / `request.*` を
+全件抽出し、包囲関数と**同一行または囲いの行にあるガード**を併記する。
+
+| 種別 | Engine | Harness FULL |
+|---|---:|---:|
+| `array.get` | 259 | 13 |
+| `for 0 to n - 1` | 103 | 7 |
+| `array.set` | 36 | — |
+| 履歴参照 (`close[i]` 等) | 24 | 1 |
+| `map.get` | 9 | — |
+| `array.remove` | 8 | — |
+| `map.remove` | 4 | — |
+| `array.insert` | 3 | — |
+| `array.pop` | — | 3 |
+| `request.*` | 0 | 15 |
+| **ガードが自動検出できず個別確認が必要** | 71 | 27 |
+
+「ガード自動検出なし」は**レビュー待ち行列**であって不具合判定ではない。
+内訳を個別に確認した結果 :
+
+| 群 | 件数 | 確認結果 |
+|---|---:|---|
+| `f_fillBool` / `f_fillInt` の `for i = 0 to m - 1` | 2 | `m = max(n, 1) >= 1` なので構造上安全 |
+| `f_sharedSorted` / `f_lowerBoundFloat` / `f_containsSorted` | 4 | `while i < na1 and j < nb1` / `while lo < hi` / `while lo <= hi` が境界。検出器の正規表現が `while` の複合条件を拾えなかっただけ |
+| `map.get` を三項演算子で `map.contains` と同一行に書いている箇所 | 4 | ガードは同一行にある |
+| `f_accSeenTfOf` / `AddOf` / `ResetOf` の `array.get/set(.., f_accTfSlot(tf))` | 4 | `f_accTfSlot()` が `[0, 8)` に収め、配列は固定 8 件 |
+| `f_rootIdxById` の `map.get` | 1 | 直前行の `bool hit = map.contains(...)` と `if hit` |
+| `f_upsertMa` の `array.get(e.roots, i)` | 1 | `if i < 0` の `else` 側。`i` は `f_rootIdxById()` の戻り値 |
+| `f_pruneCategoryToCap` の `array.get(e.roots, worstIdx)` | 1 | `if worstIdx < 0 break` の後。`worstIdx` は同じ周回の `f_reindexRoots()` 後に取得し、取得から使用までに削除は起きない |
+| `f_removeRootAt(e, i)` の呼び出し 3 箇所 | 3 | `f_removeRetiredRoots` と ACCUM pair 一括削除は `if i < array.size(e.roots)`、残り 1 つは `worstIdx` |
+| `for cat = 0 to CAT_COUNT - 1` | 多数 | `CAT_COUNT` は定数 6 |
+| pack helper の履歴参照 (`e1[1 + slopeLb]` / `time[len + 1]` / `close[i]`) | 24 | 入力上限で抑えた (下表) |
+| dense 探索内の `array.get(e.sn*, b)` | 多数 | `for b = a to n - 1` と `n = array.size(e.snRootId)`。全 `sn*` は同じ 1 回の push ループで同数 push される |
+
+指摘で名指しされた項目 :
+
+| 確認項目 | 結果 |
+|---|---|
+| `f_buildDenseBounds()` の prefix 配列を `pfFits` でない経路から読まない | **確認済み**。sliding 経路は `e.scCatCnt` と `e.snCat` / `e.dsHardEnd` だけを読む。`e.snCatPrefix` への `array.get` / `array.set` はすべて `if pfFits` の内側 |
+| `ccGap` / `ccSh` を `ccFits == false` のとき読まない | **確認済み**。Pass 1 の書き込みは `if ccFits`、Pass 4 の読み出しは `if not ccFits or coreTouched[ci]` の `else` 側だけ |
+| `ds*` 配列の size と全アクセス範囲 | `f_fillInt(e.dsHardEnd, n, n)` / `f_fillInt(e.dsMaxCatCnt, n, 0)` は `max(n,1)` 件。アクセスは `for a = 0 to n - 1` と `dsHardEnd[a] <= n`。cache 経路の `ds*` は `f_fillInt(.., n, ..)` 後に `for a = 0 to n - 1` のみ |
+| `sc*` scratch を候補をまたいで参照共有しない | `scFvgIdxTmp` / `scRp*` / `scCatCnt` / `scMergeSeen` はいずれも 1 回の呼び出しの中で clear → 書き → 読むだけで、外へ参照を渡さない。`scIdxOfIds` は Phase 9 で書き込み自体を廃止 |
+| Root 削除後の `rootIdx` / カテゴリ配列 / `originKeyMap` / `pairTokenRef` の整合 | `f_removeRootAt()` が 1 箇所で全部処理する : `array.remove` → `rootIdxDirty := true` → カテゴリ一覧から除去 → `pairTokenRelease` → `originKeyMap` から (値が一致するときだけ) 除去 |
+| pair token の参照数 0 で回収し、履歴だけで map が増え続けない | `pairTokenRef` で実装済み (Phase 10)。`wa*` / `qa*` は窓ごとに実体 `clear` |
+| `maxSwingRoots` 等の保存入力の技術上限 | **未対応**。下の「残る未対応」を参照 |
+
+履歴参照に対して付けた入力上限 :
+
+| 入力 | 上限 | 対応する履歴参照 |
+|---|---:|---|
+| `emaSlopeLookback` | 2000 | `e1[1 + slopeLb]` |
+| `swLen1/2/3` | 500 | `time[len + 1]` / `time_close[len + 1]` |
+| `accumRangeLen` | 200 | `close[i]` / `open[rangeLen - 1]` |
+| `accumBaseLen` | 300 | `ACCUM_RUN_SCAN_MAX = 400` の内側 |
+| `accumAtrLen` | 500 | ATR |
+| `zoneLeftBars` / `zoneRightBars` | 5000 / 450 | `xloc.bar_index` (過去 10,000 / 未来 500) |
+
+index を最終要素へ丸める、`na` を無条件に返す、`continue` で候補を捨てる修正は
+1 箇所も入れていない。
+
+### 6. 静的検査に追加した規則 (この 3 件を見逃さないため)
+
+| 見逃していた理由 | 追加した規則 | 回帰確認 (Phase 10 の実物 `1934bc2` に対して) |
+|---|---|---|
+| 到達不能な分岐を見ていなかった | **`unreachable else`** : 内側 `if <bare flag>` に `else` があり、その flag が囲いの `if` の `and` 連言で既に真になっている場合に報告 | `L3415 unreachable else: pfFits is already true here` を検出 |
+| 容量判定の中で乗算を評価していることを見ていなかった | **`size guard evaluates a product`** : `_MAX` を含む行で `*` と `<=` が同時に出たら報告 | `L3385 (n + 1) * CAT_COUNT <= PREFIX_CACHE_MAX` と `L4829 nc * nk <= CC_CACHE_MAX` を検出 |
+
+現在の検査 11 種、3 ファイルすべて **0 件** :
+未定義変数 / 未宣言関数呼び出し / 未使用 `f_*` / 意図しない shadowing / 宣言順 /
+`for A + 1 to N - 1` のガード / **到達不能 else** / **乗算を含む容量判定** /
+表示呼び出しの最終バーゲート / `request.*` tuple 要素数 (104 / 127) /
+括弧・行跨ぎ文字列・継続行インデント。
+
+### 7. ファイル識別
+
+| 項目 | 値 |
+|---|---|
+| Engine SHA-256 | `f886e535ea094bcda3df68c77487df0022eaac18ed93fd8c0a560470a7c43ce8` (5,905 行) |
+| Harness FULL SHA-256 | `e5b5c611d1d7f378293602bdd16e561d7445e19ab1e869cb5cf843f4787ef270` (1,319 行) |
+| Harness SAFE SHA-256 | `0f52f5bbc9a77b8c1cf988687b7855bd286ebd262b382502fb1ceda8283d9c8e` |
+| `zn2.buildId()` | `ZoneEngineV2 engine 2026-09-19 phase11` |
+| `HARNESS_BUILD` | `ZoneEngineV2 Harness 2026-09-19 phase11` |
+| import 行 | FULL **L105** / SAFE **L131** の 1 行だけ。`/3` のまま (推測で書き換えない) |
+
+### 8. 残る未対応と未検証 (F / G)
+
+| 項目 | 状態 |
+|---|---|
+| Compile / Publish / 実番号の記録 / チャート実行 / Profiler | **未実施**。この環境から TradingView を操作できない |
+| `RE10110` が 40 秒枠に収まるか | **未実測**。設定 OFF の一回の成功でも判定しない |
+| `RE10045` (配列範囲) / Map・配列上限 / 履歴参照エラーが出ないこと | **未実測** (静的検査と監査表まで) |
+| dense cache OFF/ON での全項目一致 | **Pine 上で未検証**。Python モデルでの照合のみ |
+| `n=10000` 相当の prefix 非使用経路 | **Pine 上で未検証**。Python モデルで結果一致と `O(n)` は確認 |
+| 初回ロード / 2 ティック目 / 足確定 / 次足 / Replay / 休場時の表示継続 | **未検証**。3.3 の修正は入れたが実機で確認していない |
+| Zone 0 件時の Debug 確認 | Debug table に処理済みバー数 / Root 数 / Core 数 / views を出す実装は入っている。**実機未確認** |
+| `maxSwingRoots` 等の保存入力の技術上限と容量予算 | **未対応**。上限を付けると保存方針の変更になるため、数値の決定はそちらの判断が必要。現状は `maxSwingRoots` 等に `maxval` が無く、「配列エラーは出ない」とは報告しない |
+| 6.3 (HTF 確定値と Feed 更新時点) | **未変更** (前回と同じ。仕様判断が必要) |
+
+**「次は絶対にエラーが出ない」「軽量化完了」「RE10110 が解消した」とは報告しない。**
+
 ## Known limitations
 
 - **Pine Editor でのコンパイル・実行を確認していない。** スクリプトサイズ上限、`request.security` の

@@ -317,6 +317,63 @@ def check(path):
                 live.append((ind, nm))
         i = j
 
+    # ---- an `else` that can never run because its `if` is already asserted ----
+    # This is the gap that let f_buildDenseBounds()'s `if pfFits / else` through:
+    # the enclosing block was `if n > 0 and pfFits`, so the inner else was dead
+    # and dsHardEnd/dsMaxCatCnt silently kept their initial values.
+    for n0, ln in enumerate(lines, 1):
+        code = ln.split('//')[0]
+        m = re.match(r'^(\s*)if\s+(.+?)\s*$', code)
+        if not m:
+            continue
+        ind, cond = len(m.group(1)), m.group(2).strip()
+        if not re.match(r'^[A-Za-z_]\w*$', cond):       # only a bare flag
+            continue
+        # does this if-block have an else at the same indent?
+        has_else = False
+        for j2 in range(n0, len(lines)):
+            c2 = lines[j2].split('//')[0]
+            if not c2.strip() or c2.lstrip().startswith('//'):
+                continue
+            i2 = len(c2) - len(c2.lstrip(' '))
+            if i2 < ind:
+                break
+            if i2 == ind:
+                has_else = re.match(r'^\s*else\b', c2) is not None
+                break
+        if not has_else:
+            continue
+        # is `cond` asserted true by an enclosing if?
+        asserted = False
+        cur = ind
+        for j2 in range(n0 - 2, -1, -1):
+            c2 = lines[j2].split('//')[0]
+            if not c2.strip() or c2.lstrip().startswith('//'):
+                continue
+            i2 = len(c2) - len(c2.lstrip(' '))
+            if i2 >= cur:
+                continue
+            cur = i2
+            m2 = re.match(r'^\s*(?:else\s+)?if\s+(.+?)\s*$', c2)
+            if m2 and cond in [x.strip() for x in re.split(r'\band\b', m2.group(1))]:
+                asserted = True
+                break
+            if i2 == 0:
+                break
+        if asserted:
+            problems.append((n0, '-', 'unreachable else: %s is already true here' % cond,
+                             code.strip()[:60]))
+
+    # ---- multiply inside a size guard (evaluate the product only after -------
+    # the per-factor check, so the guard cannot itself overflow/allocate)
+    for n0, ln in enumerate(lines, 1):
+        code = ln.split('//')[0]
+        if not re.search(r'_MAX\b', code):
+            continue
+        if re.search(r'\*[^=]*<=|<=[^=]*\*', code):
+            problems.append((n0, '-', 'size guard evaluates a product; divide instead',
+                             code.strip()[:60]))
+
     # ---- display calls must sit behind a last-bar gate (harness only) --------
     # Drawing, tables and display string building must never run on history bars.
     # A call qualifies if some enclosing `if` (any level) names a last-bar gate,
@@ -325,7 +382,7 @@ def check(path):
     DRAW = re.compile(r'\b(?:box|line|label|table)\.(?:new|set_\w+|cell|clear|delete)\b'
                       r'|\bstr\.format_time\b')
     GATE = re.compile(r'barstate\.islast|barstate\.islastconfirmedhistory|needRedraw'
-                      r'|wantProjection|lastWantEvents|na\(')
+                      r'|needTableRefresh|wantProjection|lastWantEvents|na\(')
     if 'indicator(' in src or 'strategy(' in src:
         for n0, ln in enumerate(lines, 1):
             code = ln.split('//')[0]
