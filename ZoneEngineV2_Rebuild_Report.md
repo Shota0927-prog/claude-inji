@@ -495,6 +495,61 @@ catMask 0〜63 × baseline 0〜63 の全組み合わせで旧式と同値です�
 
 ---
 
+### 6.2 関数の戻り値型の安定化（2026-09-19）
+
+TradingViewでの実コンパイルで
+`Error around line 1263: Return type of one of the "if" or "switch" blocks is not compatible with return type of other block(s) (series bool; series int)`
+が出ました。
+
+`swingIngestOne()` の最終statementが `if mergeId != 0 / else` で、
+merge側の最終expressionが `e.dirtyQuality := true`（bool）、
+new Root側が `registerRoot(e, r)`（int）だったためです。
+
+同種エラーを1件ずつ出さないよう、Library全体を静的走査しました。
+
+**走査条件**：ユーザー定義関数の最終top-level statementが `if` / `switch` / `for` / `while`（`else` は対応する `if` まで遡る）。
+
+**該当39関数**のうち、
+
+- 戻り値を呼び出し側で使用していない**side-effect専用29関数**：末尾に固定 `0`（int）を追加
+- 戻り値を使用している**10関数**：変更なし（全branchが同一型 + default branchあり）
+
+#### `0` を追加した29関数（すべてlocal、bare callのみ）
+
+| セクション | 関数 |
+|---|---|
+| 7 Root registry | `liveOrderInsert` / `liveOrderRemove` |
+| 8 Ingestion | `ingestMa` / `swingIngestOne` / `fvgIngestOne` / `ingestFvgNew` / `timeLabelDrop` / `updateTimeHL` / `markFvgInvalidation` / `updateFvgInverse` |
+| 9 Candidate入力 | `syncPsych` |
+| 10 Candidate生成 | `fvgStandalone` |
+| 11 Core association | `rebuildOriginIds` / `addContactSpan` / `trimEpisodes` / `rebuildSideHistory` / `rebuildCoreHistory` / `pruneEpisodesToRange` / `ufUnion` / `sortEpisodesByStart` / `associateCandidates` |
+| 12 状態遷移 | `activeEval` / `armedEval` / `processBreakState` |
+| 13 Generation / 保存整理 / 投影 | `updateGenerationCandidate` / `pruneCategorySimple` / `pruneAccumBoxes` / `pruneStorage` / `buildViews` |
+
+#### 変更しなかった10関数
+
+`categoryName` / `phaseName` / `gradeName` / `densityName` / `weakReasonName` / `rootStateName` / `eventName` / `tfName`（全branch string、default `=> "?"` 等あり）、
+`catIndexArr`（全branch `array<int>`、default `=> e.idxPsych`）、`catEnabled`（全branch bool、default `=> cfg.catPsych`）。
+
+#### 呼び出し側への影響確認
+
+`0` を追加した関数のbare callが「呼び出し元関数の最終expression」になっている箇所は3件でした。
+
+| 呼び出し | 呼び出し元 | 影響 |
+|---|---|---|
+| `fvgIngestOne` | `ingestFvgNew` | `ingestFvgNew` 自身も本修正対象（末尾 `0`）。戻り値未使用 |
+| `trimEpisodes` | `assignEpisodesFromSnapshot` | `assignEpisodesFromSnapshot` の戻り値は未使用（bare callのみ） |
+| `activeEval` | `startTouch` | `startTouch` の戻り値は未使用（bare callのみ） |
+
+いずれも戻り値を読む箇所がなく、`update()` の戻り値（`processed`、bool）にも影響しません。
+`export update()` の最終expressionは `processed` のままです。
+
+**ロジック変更は0件**（statementの追加のみ、既存の分岐・代入・呼び出し順序は不変）。
+
+再コンパイルは **NOT RUN** です。
+
+---
+
 ## 7. 計算構造
 
 ### 7.1 キャッシュ（キー／失効／容量／fallback／所有）
@@ -604,5 +659,6 @@ Debug表の時刻も同じ`i_tz`で表示します。
 | 5 | -005 | Core物理範囲/Originの無条件再構築、Episode dedupeキーの統一、心理価格構成の全評価、片Side Coreでも有効なEpisode prune |
 | 6 | -006 | Core associationの7フェーズ化（順序非依存）、Root ownershipの一括確定、Psychの同Side ownership、TouchEpisode + ContactSpanによる実接触履歴、Episode単位truncate、Split/Merge履歴配分 |
 | 6a | -006（据え置き） | Pine v6構文互換修正のみ：ビットマスク処理を算術方式へ統一（`maskHas` / `maskSet` / `bitPow2`）。ビット演算子と`bitwise.*`を全廃。ロジック・mask値の変更なし |
+| 6b | -006（据え置き） | Pine v6構文互換修正のみ：side-effect専用29関数の末尾に固定 `0` を追加し、関数戻り値型を安定化。ロジック変更なし |
 
 各改訂の差分はgit履歴（ブランチ `claude/new-session-vss3r2`）に保存されています。
