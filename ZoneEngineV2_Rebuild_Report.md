@@ -45,7 +45,7 @@ Xを先にapplyするとCore originが[R1]へ変わり、Yが一致しなくな�
 | 1 | 全Live Coreの不変Snapshot（Core ID / Generation / 前バーorigin / 前バーphysBottom・physTop / Broad Contextか / ActiveTouch有無）。association完了まで変更しない | `snapshotCores()` → `snapCoreIdx` / `snapOriginStart` / `snapOriginLen` / `snapOrigins` / `snapBot` / `snapTop` / `snapBroadCtx` / `snapActive` |
 | 2 | 全Candidate × 全旧Core Snapshotのmatchだけを作る（正本12.1：同一性に使えるRoot IDを1つ以上共有＋前回範囲との連続性がM以内）。apply / merge / split / 削除 / origin更新は一切しない | `candMatchesSnap()`。Broad FVG originだけでは局所Zone同一性にならず、Broad standalone contextはBroad originで継続追跡（`candIsBroadContext()` と `snapBroadCtx` の一致を要求） |
 | 3 | Candidate ∪ Snapshot の二部グラフをunion-findでconnected componentへ分類。Candidate同士も、非Broad起源共有かつM以内なら同一component（仕様10.7の「Support候補とResistance候補を同じCoreへ」） | `ufFind()` / `ufUnion()` / `candSharesWithCand()` |
-| 4 | componentにActiveTouch Coreが1つでもあれば、そのcomponentのMerge / Split / Live Structure変更 / Root ownership移動を**一切行わず**PendingTopologyとして保持 | `anyActive`分岐。TouchStartSnapshotは固定、Root失効による`eligible=false`だけは`finalizeSide()`で即時反映 |
+| 4 | componentにActiveTouch Coreが1つでもあれば、そのcomponentのMerge / Split / Live Structure変更 / Root ownership移動を**一切行わず**PendingTopologyとして保持 | `anyActive`分岐。TouchStartSnapshotは固定、Root失効による`eligible=false`だけは`finalizeSide()`で即時反映。**Phase 6でも`pendingTopology`のCoreは凍結**（6章参照） |
 | 5 | 決定済みTopologyを初めてLive Coreへ適用 | 下記 |
 | 6 | Root ownershipを1回だけ確定 → 各Coreの範囲・originを再構築 | 下記 B |
 | 7 | Zone lifetime（仕様14） | 有効非心理Root・待機Root・待機状態がすべて0のときだけ終了 |
@@ -76,15 +76,29 @@ Xを先にapplyするとCore originが[R1]へ変わり、Yが一致しなくな�
 ### B. Root ownershipをTopology適用後に一括確定
 
 `ownerOfRoot`はCandidate処理途中で更新しません。Phase 6で、
-死んだCoreを除去したうえでCore ID昇順に走査し、非Broad Rootについて
-Root ID → 最終Core ID を1回だけ確定します。
-既に他Coreが所有している非Broad Rootは、そのSideの`rootIds`から除去し
-`statOwnerConflict`へ計上します（Phase 3のcandidate–candidate辺により本来発生しません）。
-Broad FVGだけが複数局所Zoneへ共有されます。
+死んだCoreを除去したうえで次の順に1回だけ確定します。
 
-その後、各Coreで
+1. **PendingTopology Coreの非Broad Rootを先に登録**する。これらのRootは他Coreへ移動しない。
+2. PendingTopology以外のCoreだけが通常の最終ownership確定を行う。既に他Coreが所有している
+   非Broad Rootは、その（非Pending）Sideの`rootIds`から除去する。所有者がPendingTopology Coreなら
+   `statPendingHold`、そうでなければ`statOwnerConflict`へ計上する
+   （後者はPhase 3のcandidate–candidate辺により本来発生しません）。
+3. Broad FVGだけが複数局所Zoneへ共有される。
+
+**PendingTopology CoreはPhase 6で一切変更しません。**
+`clearLiveSide()`せず、Support / Resistanceの`rootIds`・EffectiveRange・`physBottom` /
+`physTop`・`originRootIds`をTopology都合で変更せず、所有Rootも他Coreへ移しません。
+`rootIds`からownership conflictを理由にRootを除去することもありません。
+TouchStartSnapshotは従来どおり固定で、Root自体の状態失効に伴う`eligible = false`だけは
+`finalizeSide()`が即時反映します。
+
+PendingTopology以外のCoreについては、
 「applyされなかったSide（ActiveTouch中を除く）を`clearLiveSide()`」→
 `refreshCoreRange()`→`rebuildCoreOrigins()`の順に実行します。
+
+Pendingの解除は状態を持ち越しません。`update()`が毎足の冒頭で`pendingTopology := false`へ戻し、
+ActiveTouch終了後の再クラスタでcomponent内のActiveTouchが0になった時点で、
+**その足の最新Candidate**を使って通常どおりTopologyを解決します（古いPending Candidateは保存しません）。
 `rebuildCoreOrigins()`はLive Side Structureからoriginを作り直したうえで、
 **このCoreがまだ所有するInverseWait Root**をwaiting originとして戻すため、
 `ownerOfRoot`と矛盾せず、他Core所有の非Broad RootがSide rootIdsにもoriginにも残りません。
@@ -168,7 +182,8 @@ FVG 50%完全不使用、保存上限保護、Accum Box pair整理、Generation�
 | R1 | 旧Core origins=[A,B]、Candidate X=[A] / Y=[B] → Splitとして処理。X→Y / Y→X で同じ最終結果 | 両Candidateが同じSnapshotとunion（Phase 2/3）。slot割当はバッファ順ではなく`candBetter()`の正本競合順で行い、同Sideは別slot＝Split。最小Root IDまで比較するため完全同値は起こらない | 経路あり |
 | R2 | 旧Core1=[A] / 旧Core2=[B]、Candidate=[A,B] → Merge | 1 Candidateが2 Snapshotとunion → 同一component、`cs = 2` → `mergeCoreInto()`で最小Core IDへ集約 | 経路あり |
 | R3 | 旧Core1=[A,B] / 旧Core2=[C]、Candidate X=[A] / Y=[B,C] → connected componentとして順序非依存に解決 | X–Core1、Y–Core1、Y–Core2 の辺で1 component。Merge（Core2→Core1）→ slot割当（競合順）→ slot1がSplit子 | 経路あり |
-| R4 | 上記componentにActiveTouch Coreあり → Topology即時変更なし | `anyActive`分岐でmerge / split / apply / ownership移動を行わず、component内の全旧Coreへ`pendingTopology = true`、`statDeferred`計上 | 経路あり |
+| R4 | 上記componentにActiveTouch Coreあり → Topology即時変更なし | `anyActive`分岐でmerge / split / apply / ownership移動を行わず、component内の全旧Coreへ`pendingTopology = true`、`statDeferred`計上。Phase 6も`pendingTopology`のCoreを完全に凍結（clearLiveSideなし・範囲/origin再構築なし・Root移動なし） | 経路あり |
+| R4b | 旧Core：Support = ActiveTouch、Resistance = 有効Live Structure。今バー新RootでSplit候補発生 | `pendingTopology = true`、Support / Resistance 両方のLive Structureを維持、Root ownership維持、Merge / Splitなし。Episode終了後の次の再クラスタで最新CandidateからTopologyを解決 | 経路あり |
 | R5 | 同一Psych 4500が2候補へ参加可能 → 競合で採用された片方だけ所有、もう片方はPsychなしで再評価 | `sPsyUsed`（Side別）。採用時に`collectPsychRoots()`がlevelをusedにし、次ラウンドの`psychVariants()` / `collectPsychRoots()`が除外。Psychを失った候補はPsychなし構成として再評価 | 経路あり |
 | R6 | Broad FVG → 複数局所Zone共有可能 | `adoptWindow()`はBroadを`sFvgLocal`にするだけで`sFvgUsed`にしない。Phase 6のownershipもBroadを除外 | 経路あり |
 | R7 | Episode開始足はZone上部のみ接触、途中で下部にも接触 → Split後、上下両子へEpisode履歴を配分 | ContactSpanが足ごとに積まれ、`episodeTouchesRange()`が各子範囲に対して個別に交差判定。両子で真なら両方へ配分 | 経路あり |
