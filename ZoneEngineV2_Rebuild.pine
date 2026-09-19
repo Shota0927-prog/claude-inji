@@ -4,7 +4,7 @@
 //  Zone definition spec v2 (Zone_definition_spec_v2.md) - logic unchanged.
 //  Rebuilt data structures / evaluation order for runtime + memory economy.
 //
-//  Build ID .......... ZEV2R-20260919-001
+//  Build ID .......... ZEV2R-20260919-002
 //  Base timeframe .... confirmed 5m bar, engine updates exactly once per bar
 //  Logic contract .... spec v2 sections 1-21 + instruction appendix A
 //
@@ -23,7 +23,7 @@ library("ZoneEngineV2_Rebuild", overlay = true)
 // 0. Build identity
 // -----------------------------------------------------------------------------
 export buildId() =>
-    "ZEV2R-20260919-001"
+    "ZEV2R-20260919-002"
 
 // -----------------------------------------------------------------------------
 // 1. Constants (int codes only; strings are produced at presentation time)
@@ -137,7 +137,6 @@ var int MS_HOUR = 3600000
 // Internal fixed capacities for scratch structures (not logical storage limits;
 // exceeding them routes to the exact recomputation path, never to empty results)
 var int SCRATCH_MAX_ROOTS = 512
-var int MAX_PSYCH_ROOTS   = 64
 
 // -----------------------------------------------------------------------------
 // 2. Name conversion (presentation only) and code accessors for the harness
@@ -766,44 +765,55 @@ export pivotPackV2(simple int len) =>
     [phP, phO, phE, phC, plP, plO, plE, plC]
 
 // 6.3 Accum detection.
-//     NOTE: the v2 specification fixes the parameter names and initial values
-//     but not the arithmetic of the range test itself, and no reference v2
-//     source was available in this repository. The expression below is the
-//     documented interpretation and is deliberately isolated in this single
-//     function so it can be replaced without touching any other layer.
+//     Formation condition transcribed from appendix A 7.4 of the instruction
+//     document (the normative f_accumBoxCore expression). Body extremes, the
+//     single window rangeMid, the body-midpoint drift, and the separate bull /
+//     bear run counters are reproduced exactly, including the comparison
+//     operators and the counter initialisation. No rounding, no tick
+//     normalisation and no extra warm-up guard is added to these intermediates.
+//     rangeHigh / rangeLow are returned so the Candidate start range uses the
+//     same intermediate values instead of recomputing the window.
 accumCondV2(simple int rangeLen, simple int baseLen, simple int atrLen,
      simple int minUpper, simple int minLower, simple int maxRun,
      float atrMult, float barRatioMax, float driftMax) =>
-    float sHigh = ta.highest(high, rangeLen)
-    float sLow  = ta.lowest(low, rangeLen)
-    float sRange = sHigh - sLow
-    float bHigh = ta.highest(high, baseLen)
-    float bLow  = ta.lowest(low, baseLen)
-    float bRange = bHigh - bLow
-    float atrV = ta.atr(atrLen)
-    float mid = (sHigh + sLow) * 0.5
+    float bodyTop = math.max(open, close)
+    float bodyBot = math.min(open, close)
+    float rangeHigh = ta.highest(bodyTop, rangeLen)
+    float rangeLow  = ta.lowest(bodyBot, rangeLen)
+    float rangeNow  = rangeHigh - rangeLow
+    float rangeMid  = (rangeHigh + rangeLow) * 0.5
+    float rangeBase = ta.highest(bodyTop, baseLen) - ta.lowest(bodyBot, baseLen)
+    float atrValue  = ta.atr(atrLen)
     int upperCloses = 0
     int lowerCloses = 0
-    int runNow = 0
-    int runMax = 0
-    int prevDir = 0
-    for i = rangeLen - 1 to 0
-        float ci = close[i]
-        upperCloses += ci > mid ? 1 : 0
-        lowerCloses += ci < mid ? 1 : 0
-        int dir = ci > open[i] ? 1 : ci < open[i] ? -1 : 0
-        runNow := dir != 0 and dir == prevDir ? runNow + 1 : dir != 0 ? 1 : 0
-        runMax := math.max(runMax, runNow)
-        prevDir := dir
-    float drift = sRange > 0.0 ? math.abs(close - close[rangeLen]) / sRange : 1.0e9
-    bool ok = not na(atrV) and not na(bRange) and sRange > 0.0
-    ok := ok and sRange <= atrV * atrMult
-    ok := ok and sRange <= bRange * barRatioMax
-    ok := ok and upperCloses >= minUpper
-    ok := ok and lowerCloses >= minLower
-    ok := ok and runMax <= maxRun
-    ok := ok and drift <= driftMax
-    ok
+    int bullRun     = 0
+    int bearRun     = 0
+    int maxBullRun  = 0
+    int maxBearRun  = 0
+    for i = 0 to rangeLen - 1
+        upperCloses += close[i] > rangeMid ? 1 : 0
+        lowerCloses += close[i] < rangeMid ? 1 : 0
+        if close[i] > open[i]
+            bullRun += 1
+            bearRun := 0
+        else if close[i] < open[i]
+            bearRun += 1
+            bullRun := 0
+        else
+            bullRun := 0
+            bearRun := 0
+        maxBullRun := bullRun > maxBullRun ? bullRun : maxBullRun
+        maxBearRun := bearRun > maxBearRun ? bearRun : maxBearRun
+    float startMid = (open[rangeLen - 1] + close[rangeLen - 1]) * 0.5
+    float endMid   = (open + close) * 0.5
+    float drift    = math.abs(endMid - startMid)
+    bool condAtr      = atrValue > 0 and rangeNow <= atrValue * atrMult
+    bool condBar      = rangeBase > 0 and rangeNow <= rangeBase * barRatioMax
+    bool condBalance  = upperCloses >= minUpper and lowerCloses >= minLower
+    bool condDrift    = rangeNow > 0 and drift / rangeNow <= driftMax
+    bool condColorRun = maxBullRun <= maxRun and maxBearRun <= maxRun
+    bool isAccum = condAtr and condBar and condBalance and condDrift and condColorRun
+    [isAccum, rangeHigh, rangeLow]
 
 // Candidate is never exported as a Root. A Box is emitted exactly once, on the
 // source bar where the condition turns true -> false, and that closing bar is
@@ -821,20 +831,15 @@ export accumPackV2(simple int rangeLen, simple int baseLen, simple int atrLen,
     var int   outId    = na
     var int   outStart = na
     var int   outConf  = na
-    bool cond = accumCondV2(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
+    [cond, rangeHigh, rangeLow] = accumCondV2(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
     float bodyTop = math.max(open, close)
     float bodyBot = math.min(open, close)
     outNew := false
     if cond and not inCand
         inCand := true
         candStart := time
-        float t = bodyTop
-        float b = bodyBot
-        for i = 0 to rangeLen - 1
-            t := math.max(t, math.max(open[i], close[i]))
-            b := math.min(b, math.min(open[i], close[i]))
-        candTop := t
-        candBot := b
+        candTop := rangeHigh
+        candBot := rangeLow
     else if cond and inCand
         candTop := math.max(candTop, bodyTop)
         candBot := math.min(candBot, bodyBot)
@@ -1051,7 +1056,8 @@ unregisterRoot(ZoneEngine e, int rootId) =>
             map.remove(e.originToId, r.originKey)
         // psychTickToId is intentionally persistent: the same psychological
         // price must come back with the same stable Root ID (spec 7.7).
-        array.set(e.catCount, r.category, math.max(0, array.get(e.catCount, r.category) - 1))
+        int cc = array.get(e.catCount, r.category) - 1
+        array.set(e.catCount, r.category, cc < 0 ? 0 : cc)
         r.state := 5
         array.push(e.freeSlots, slot)
         e.dirtyRootSet := true
@@ -1717,12 +1723,23 @@ attachFvg(ZoneEngine e, ZoneCfg cfg, int side, int candFrom) =>
                             float nb = cb
                             float nt = ct
                             if not inside
+                                // Proximal-outside localisation (spec 5.5):
+                                // the candidate must be a High Density cluster
+                                // sitting outside the Proximal edge, and the
+                                // EffectiveRange becomes Proximal edge ~ local
+                                // root distribution.
                                 float gap = side == 1 ? cb - prox : prox - ct
-                                if gap > 0.0 and gap <= cfg.denseWidth and array.get(e.candDensity, k) == 0
+                                if gap > 0.0 and array.get(e.candDensity, k) == 0
                                     float tb = side == 1 ? prox : cb
                                     float tt = side == 1 ? ct : prox
                                     int wT = toTick(tt, cfg.mintick) - toTick(tb, cfg.mintick)
-                                    if wT <= denseTickLimit(cfg)
+                                    // Only protection applied: an already Base
+                                    // Strong dense core is not widened past dense
+                                    // width (spec 5.2, acceptance case 45). Any
+                                    // other candidate uses the ordinary M limit,
+                                    // because a zone wider than M is not a zone.
+                                    int limitT = array.get(e.candStrong, k) == 1 ? denseTickLimit(cfg) : mTickLimit(cfg)
+                                    if wT <= limitT
                                         proximalAnchored := true
                                         nb := tb
                                         nt := tt
@@ -2405,9 +2422,7 @@ buildProtectedSet(ZoneEngine e) =>
 
 pruneCategory(ZoneEngine e, map<int, int> prot, int cat, int limit) =>
     array<int> ci = catIndexArr(e, cat)
-    int guard = 0
-    while array.size(ci) > limit and guard < 512
-        guard += 1
+    while array.size(ci) > limit
         int victim = 0
         int oldest = 0
         int n = array.size(ci)
@@ -2433,9 +2448,7 @@ pruneStorage(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
         pruneCategory(e, prot, 2, cfg.maxAccumBoxes * 2)
         pruneCategory(e, prot, 3, cfg.maxTimeRoots)
         pushEvent(e, 14, f, na, 0, na, na, 0, 1, 0, 0)
-    int guard = 0
-    while array.size(e.cores) > cfg.maxZoneCores and guard < 256
-        guard += 1
+    while array.size(e.cores) > cfg.maxZoneCores
         int victim = -1
         int fewest = 0
         int oldest = 0
