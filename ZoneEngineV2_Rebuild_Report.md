@@ -652,6 +652,63 @@ Visual Harnessは0件（元から該当なし）。
 
 ---
 
+### 6.5 式の戻り値への直接field assignmentの解消（2026-09-19）
+
+TradingViewでの実コンパイルで
+`Unable to determine the object for the field assignment. Try putting the object into a separate variable before assigning values to its fields.`
+が出ました。Pine v6は `array.get(...).field := value` のように、式の戻り値へ直接fieldを代入できません。
+
+#### 修正（2箇所）
+
+**1. `associateCandidates()` Phase 5（候補なしcomponentのCore保持）**
+
+```pine
+// 旧
+for q = 0 to cs - 1
+    array.get(e.cores, array.get(e.snapCoreIdx, array.get(e.compSnapBuf, q))).lastMatchSeq := f.seq
+
+// 新
+for q = 0 to cs - 1
+    int snapIdxK = array.get(e.compSnapBuf, q)
+    int coreIdxK = array.get(e.snapCoreIdx, snapIdxK)
+    ZoneCore cKeep = array.get(e.cores, coreIdxK)
+    cKeep.lastMatchSeq := f.seq
+```
+
+**2. `applyBreak()`（反対SideのFlipWait遷移）**
+
+```pine
+// 旧
+viewOf(c, -side).history.phase := 4
+
+// 新
+SideViewState oppView = viewOf(c, -side)
+oppView.history.phase := 4
+```
+
+どちらもローカル変数への取得を1段挟んだだけで、参照先オブジェクト・代入値・実行位置は同一です。
+Pine のUDTは参照型のため、ローカル変数経由の代入は元のオブジェクトを書き換えます（**挙動は完全に一致**）。
+
+#### 全体走査
+
+Library / Visual Harness の全代入（`:=` `+=` `-=` `*=` `/=` `%=`）について、左辺が
+「`)` の直後に `.field`（複数段含む）」の形になっているものを検索しました。
+`array.get(...)` / `map.get(...)` / `array.pop(...)` / `array.shift(...)` / 任意のユーザー関数呼び出し / `Type.new(...)` すべてを対象としています。
+
+| ファイル | 該当数 |
+|---|---|
+| `ZoneEngineV2_Rebuild.pine` | **0件**（修正後） |
+| `ZoneEngineV2_Rebuild_VisualHarness.pine` | **0件**（元から該当なし） |
+
+primitive値の取得（`int x = array.get(...)`）やfieldの**読み取り**（`array.get(c.episodes, i).isNormalTouch` 等）は
+Pineで問題がないため変更していません。
+
+**ロジック変更は0件**（ローカル変数への分割のみ）。
+
+再コンパイルは **NOT RUN** です。
+
+---
+
 ## 7. 計算構造
 
 ### 7.1 キャッシュ（キー／失効／容量／fallback／所有）
@@ -764,5 +821,6 @@ Debug表の時刻も同じ`i_tz`で表示します。
 | 6b | -006（据え置き） | Pine v6構文互換修正のみ：side-effect専用29関数の末尾に固定 `0` を追加し、関数戻り値型を安定化。ロジック変更なし |
 | 6c | -006（据え置き） | Pine v6構文互換修正のみ：組み込み `high` をshadowするローカル変数2件を `fvgHigh` へrename。ロジック変更なし |
 | 6d | -006（据え置き） | Pine v6構文互換修正のみ：TouchEpisodeの直接 `==` 比較を `episodeId` 比較へ変更。ロジック変更なし |
+| 6e | -006（据え置き） | Pine v6構文互換修正のみ：式の戻り値への直接field assignment 2件をローカル変数経由へ分割。ロジック変更なし |
 
 各改訂の差分はgit履歴（ブランチ `claude/new-session-vss3r2`）に保存されています。
