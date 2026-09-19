@@ -5,7 +5,7 @@
 //  A-D, M0-M19) are the only normative sources. Zone logic is unchanged; the
 //  data structures and the evaluation order are built for runtime and memory.
 //
-//  Build ID .......... ZEV2R-20260919-005
+//  Build ID .......... ZEV2R-20260919-006
 //  Base timeframe .... confirmed 5m bar, engine updates exactly once per bar
 //
 //  Layering (M3). State transition never runs after candidate evaluation:
@@ -23,7 +23,7 @@
 library("ZoneEngineV2_Rebuild", overlay = true)
 
 export buildId() =>
-    "ZEV2R-20260919-005"
+    "ZEV2R-20260919-006"
 
 // -----------------------------------------------------------------------------
 // 1. Constants (int codes only; strings are produced at presentation time)
@@ -405,25 +405,35 @@ export type SideHistory
     int   lastFlipConfirmSeq   = -1
     bool  everUsed             = false
 
-// One record per touch Episode. A normal touch keeps its own consumption
-// facts (deepest close, max depth, WeakByDepth) so Merge and Split can rebuild
-// the side history from the Episodes that actually belong to the new range
-// instead of copying an aggregated parent value.
-export type TouchMark
-    int   baseSeq       = 0
-    int   time          = na
+// One ContactSpan per confirmed base bar on which the bar range actually
+// intersected the TouchStartSnapshot range. The real contact prices and times
+// are kept (spec 12.3), so a Merge or a Split decides membership from the real
+// contacts and never from a min..max envelope of the whole Episode.
+export type ContactSpan
+    int   baseSeq = 0
+    int   time    = na
+    float bottom  = na
+    float top     = na
+
+// One record per touch Episode. A normal touch keeps its own consumption facts
+// (deepest close, max depth, WeakByDepth) so Merge and Split rebuild the side
+// history from the Episodes that really belong to the new range instead of
+// copying an aggregated parent value.
+export type TouchEpisode
+    int   episodeId     = 0
     int   side          = 0
-    float contactBottom = na
-    float contactTop    = na
-    float closeAtTouch  = na
+    int   startSeq      = 0
+    int   startTime     = na
     int   generationId  = 0
-    bool  isNormalTouch = true
     int   touchNo       = 0
     float snapBottom    = na
     float snapTop       = na
+    float closeAtTouch  = na
     float deepestClose  = na
     float maxDepthPct   = 0.0
     bool  weakByDepth   = false
+    bool  isNormalTouch = true
+    array<ContactSpan> spans = na
 
 export type TouchStartSnapshot
     bool  valid         = false
@@ -481,7 +491,7 @@ export type SideViewState
     // --- persistent, never cleared by a re-cluster -------------------------
     SideHistory history   = na
     TouchStartSnapshot touchSnapshot = na
-    TouchMark activeMark  = na
+    TouchEpisode activeEpisode = na
 
 export type ZoneCore
     int   coreId       = 0
@@ -497,7 +507,7 @@ export type ZoneCore
     bool  dormant       = false
     bool  pendingTopology   = false
     bool  pendingGeneration = false
-    array<TouchMark> touchMarks = na
+    array<TouchEpisode> episodes = na
     BreakSnapshot breakSnap     = na
     int   genBaselineCatMask    = 0
     bool  genCandidateReady     = false
@@ -579,6 +589,7 @@ export type ZoneEngine
     int nextRootId = 1
     int nextCoreId = 1
     int nextGenId  = 1
+    int nextEpisodeId = 1
     // --- processing bookkeeping --------------------------------------------
     int  lastBaseOpenTime  = na
     int  lastBaseSeq       = -1
@@ -639,6 +650,8 @@ export type ZoneEngine
     int   statMerges      = 0
     int   statSplits      = 0
     int   statDeferred    = 0
+    int   statComponents  = 0
+    int   statOwnerConflict = 0
     bool  scratchOverflow = false
     // --- scratch (engine owned, reused, logical length tracked) ------------
     array<int>   sLotSlot   = na
@@ -665,6 +678,7 @@ export type ZoneEngine
     array<int>   sAttach    = na
     array<float> sPsyBot    = na
     array<float> sPsyTop    = na
+    array<int>   sPsyUsed   = na   // psychological levels already owned on this side
     // --- adopted candidate buffers -----------------------------------------
     array<int>   candSide   = na
     array<int>   candStart  = na
@@ -680,6 +694,30 @@ export type ZoneEngine
     array<int>   candHighMask = na
     array<float> candRefPrice = na
     array<int>   candBroadCtx = na
+    array<int>   candFormTime = na
+    array<int>   candMinId    = na
+    // --- association: immutable old Core snapshot + topology graph ---------
+    array<int>   snapCoreIdx    = na
+    array<int>   snapOriginStart = na
+    array<int>   snapOriginLen  = na
+    array<int>   snapOrigins    = na
+    array<float> snapBot        = na
+    array<float> snapTop        = na
+    array<int>   snapBroadCtx   = na
+    array<int>   snapActive     = na
+    array<int>   edgeCand       = na
+    array<int>   edgeNode       = na
+    array<int>   ufParent       = na
+    array<int>   compOfCand     = na
+    array<int>   compOfSnap     = na
+    array<int>   slotCoreIdx    = na
+    array<int>   slotSupCand    = na
+    array<int>   slotResCand    = na
+    array<int>   orderBuf       = na
+    array<int>   compRep        = na
+    array<int>   compMinCore    = na
+    array<int>   compSnapBuf    = na
+    array<TouchEpisode> episodeSnap = na
 
 // -----------------------------------------------------------------------------
 // 4. Numeric helpers. Every price comparison that decides a boundary goes
@@ -1006,6 +1044,7 @@ export newEngine() =>
     e.sAttach    := array.new<int>()
     e.sPsyBot    := array.new<float>()
     e.sPsyTop    := array.new<float>()
+    e.sPsyUsed   := array.new<int>()
     e.candSide   := array.new<int>()
     e.candStart  := array.new<int>()
     e.candLen    := array.new<int>()
@@ -1020,6 +1059,29 @@ export newEngine() =>
     e.candHighMask := array.new<int>()
     e.candRefPrice := array.new<float>()
     e.candBroadCtx := array.new<int>()
+    e.candFormTime := array.new<int>()
+    e.candMinId    := array.new<int>()
+    e.snapCoreIdx    := array.new<int>()
+    e.snapOriginStart := array.new<int>()
+    e.snapOriginLen  := array.new<int>()
+    e.snapOrigins    := array.new<int>()
+    e.snapBot        := array.new<float>()
+    e.snapTop        := array.new<float>()
+    e.snapBroadCtx   := array.new<int>()
+    e.snapActive     := array.new<int>()
+    e.edgeCand       := array.new<int>()
+    e.edgeNode       := array.new<int>()
+    e.ufParent       := array.new<int>()
+    e.compOfCand     := array.new<int>()
+    e.compOfSnap     := array.new<int>()
+    e.slotCoreIdx    := array.new<int>()
+    e.slotSupCand    := array.new<int>()
+    e.slotResCand    := array.new<int>()
+    e.orderBuf       := array.new<int>()
+    e.compRep        := array.new<int>()
+    e.compMinCore    := array.new<int>()
+    e.compSnapBuf    := array.new<int>()
+    e.episodeSnap    := array.new<TouchEpisode>()
     e
 
 catIndexArr(ZoneEngine e, int cat) =>
@@ -1702,6 +1764,9 @@ fvgAugment(ZoneEngine e, ZoneCfg cfg, int side, float bot, float top, int catMas
 // reachable candidate is lost when clusterMaxWidth is raised and several
 // 50 dollar levels fall inside M. A level that lies inside the resulting range
 // always takes part, so a range fully determines the participating set.
+psychLevelFree(ZoneEngine e, int lvl) =>
+    not array.includes(e.sPsyUsed, lvl)
+
 psychVariants(ZoneEngine e, ZoneCfg cfg, float bot, float top, int limitTick) =>
     array.clear(e.sPsyBot)
     array.clear(e.sPsyTop)
@@ -1710,7 +1775,7 @@ psychVariants(ZoneEngine e, ZoneCfg cfg, float bot, float top, int limitTick) =>
         int loLvl = int(math.floor((bot - cfg.clusterMaxWidth) / 50.0))
         int hiLvl = int(math.ceil((top + cfg.clusterMaxWidth) / 50.0))
         for lvl = loLvl to hiLvl
-            if slotOf(e, psychIdOfLevel(lvl)) >= 0
+            if slotOf(e, psychIdOfLevel(lvl)) >= 0 and psychLevelFree(e, lvl)
                 float px = lvl * 50.0
                 if tGe(px, bot - cfg.clusterMaxWidth, cfg.mintick) and tLe(px, top + cfg.clusterMaxWidth, cfg.mintick)
                     array.push(e.sTmpA, lvl)
@@ -1736,17 +1801,21 @@ psychVariants(ZoneEngine e, ZoneCfg cfg, float bot, float top, int limitTick) =>
                         array.push(e.sPsyTop, nt)
     array.size(e.sPsyBot)
 
-// Every live psychological price inside the adopted range takes part.
+// Every live, still unowned psychological price inside the adopted range takes
+// part, and is then owned by this Zone for the rest of this Side's stages. A
+// psychological Root is an ordinary Root: it is never shared between two Zones
+// of the same Side (only a Broad FVG may be shared).
 collectPsychRoots(ZoneEngine e, ZoneCfg cfg, float bot, float top) =>
     array.clear(e.sTmpB)
     int loLvl = int(math.floor(bot / 50.0))
     int hiLvl = int(math.ceil(top / 50.0))
     for lvl = loLvl to hiLvl
         int rid = psychIdOfLevel(lvl)
-        if slotOf(e, rid) >= 0
+        if slotOf(e, rid) >= 0 and psychLevelFree(e, lvl)
             float px = lvl * 50.0
             if tGe(px, bot, cfg.mintick) and tLe(px, top, cfg.mintick)
                 array.push(e.sTmpB, rid)
+                array.push(e.sPsyUsed, lvl)
     array.size(e.sTmpB)
 
 // Complete a candidate: MA quality from the final point density, then the FVG
@@ -1954,6 +2023,16 @@ adoptWindow(ZoneEngine e, ZoneCfg cfg, int side, int i, int j, float wBot, float
     array.push(e.candHighMask, aHm)
     array.push(e.candRefPrice, na)
     array.push(e.candBroadCtx, 0)
+    int fTime = 0
+    int mId = 0
+    for q = start to start + len - 1
+        Root r = rootOf(e, array.get(e.candRootIds, q))
+        if not na(r)
+            int rct = nz(r.confirmedTime)
+            fTime := rct > fTime ? rct : fTime
+            mId := mId == 0 or r.rootId < mId ? r.rootId : mId
+    array.push(e.candFormTime, fTime)
+    array.push(e.candMinId, mId)
     e.statCandidates += 1
 
 // Stage B, steps 3-5: same-direction real overlap, FVG standalone, Broad
@@ -2000,6 +2079,16 @@ fvgStandalone(ZoneEngine e, ZoneCfg cfg, int side) =>
                 array.push(e.candHighMask, high ? 16 : 0)
                 array.push(e.candRefPrice, na)
                 array.push(e.candBroadCtx, broadCtx ? 1 : 0)
+                int fTime2 = 0
+                int mId2 = 0
+                for q = start to start + cnt - 1
+                    Root r2 = rootOf(e, array.get(e.candRootIds, q))
+                    if not na(r2)
+                        int rct2 = nz(r2.confirmedTime)
+                        fTime2 := rct2 > fTime2 ? rct2 : fTime2
+                        mId2 := mId2 == 0 or r2.rootId < mId2 ? r2.rootId : mId2
+                array.push(e.candFormTime, fTime2)
+                array.push(e.candMinId, mId2)
                 e.statCandidates += 1
 
 // 10.1 Reference price - display and tracking only. It is never read by any
@@ -2064,10 +2153,13 @@ buildCandidates(ZoneEngine e, ZoneCfg cfg) =>
     array.clear(e.candHighMask)
     array.clear(e.candRefPrice)
     array.clear(e.candBroadCtx)
+    array.clear(e.candFormTime)
+    array.clear(e.candMinId)
     int n = array.size(e.sLotSlot)
     for si = 0 to 1
         int side = si == 0 ? 1 : -1
         array.clear(e.sUsed)
+        array.clear(e.sPsyUsed)
         if n > 0
             for i = 0 to n - 1
                 array.push(e.sUsed, 0)
@@ -2109,7 +2201,16 @@ buildCandidates(ZoneEngine e, ZoneCfg cfg) =>
     kn
 
 // =============================================================================
-// 11. Core association: identity, merge, split, pending topology
+// 11. Core association - fully order independent (spec 12.1 / 12.2 / 12.3)
+//     Phase 1  immutable snapshot of every live Core
+//     Phase 2  match every Candidate against the snapshot only
+//     Phase 3  connected components of the Candidate / Core graph
+//     Phase 4  a component containing an ActiveTouch Core is deferred
+//     Phase 5  the resolved topology is applied to the live Cores
+//     Phase 6  Root ownership is finalised once, then ranges and origins
+//     Phase 7  Zone lifetime
+//     Nothing in phases 1-4 reads or writes live Core state, so the order in
+//     which Candidates happen to sit in the buffer cannot change the result.
 // =============================================================================
 newSideView() =>
     SideViewState.new(rootIds = array.new<int>(), history = SideHistory.new(),
@@ -2197,10 +2298,9 @@ clearLiveSide(SideViewState sv) =>
     sv.fvgFreshCount := 0
     sv.fvgStateMask := 0
 
-// Rebuild the Core origin set from the CURRENT Live Side Structure only, then
-// give back the waiting Roots this Core still owns (an invalidated FVG takes
-// part in no Side, but keeps the Core alive as InverseWait | Unavailable).
-// Roots that another Core took over on this bar, and dead Roots, are dropped.
+// Rebuild the Core origin set from the CURRENT Live Side Structure, then give
+// back the waiting Roots this Core still owns (an invalidated FVG takes part in
+// no Side but keeps the Core alive as InverseWait | Unavailable).
 rebuildCoreOrigins(ZoneEngine e, ZoneCore c) =>
     array.clear(e.sTmpB)
     int on = array.size(c.originRootIds)
@@ -2245,9 +2345,6 @@ applyCandidate(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int k, BaseFeed f) =>
         Root r = rootOf(e, rid)
         if not na(r)
             nonPsych := nonPsych or r.category != 5
-            bool broadFvg = r.category == 4 and r.isBroadFvg
-            if not broadFvg
-                map.put(e.ownerOfRoot, rid, c.coreId)
             if r.category == 4
                 fvgCount += 1
                 fvgDirMask := fvgDirMask | (1 << r.direction)
@@ -2270,58 +2367,78 @@ applyCandidate(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int k, BaseFeed f) =>
     sv.fvgStateMask := fvgStateMask
     sv.eligible := nonPsych and not c.breakSnap.valid
     c.lastSeenTime := f.openTime
-    refreshCoreRange(c)
-    rebuildOriginIds(e, c)
 
-candIsBroadContext(ZoneEngine e, int k) =>
-    array.get(e.candBroadCtx, k) == 1
+// ---------------------------------------------------------------------------
+// 11.1 Touch Episodes
+// ---------------------------------------------------------------------------
+// Stable Episode identity across Cores: two Cores that recorded the same real
+// event carry the same Side, start time and sequence, touch number, generation
+// and TouchStartSnapshot range. Two different Episodes on the same 5m bar are
+// never merged just because the bar is the same.
+sameEpisodeKey(ZoneCfg cfg, TouchEpisode a, TouchEpisode b) =>
+    a.side == b.side and a.startTime == b.startTime and a.startSeq == b.startSeq and
+     a.touchNo == b.touchNo and a.generationId == b.generationId and
+     a.isNormalTouch == b.isNormalTouch and
+     toTick(a.snapBottom, cfg.mintick) == toTick(b.snapBottom, cfg.mintick) and
+     toTick(a.snapTop, cfg.mintick) == toTick(b.snapTop, cfg.mintick)
 
-candSharesOrigin(ZoneEngine e, ZoneCore c, int k) =>
-    int st = array.get(e.candStart, k)
-    int ln = array.get(e.candLen, k)
-    bool broadCtx = candIsBroadContext(e, k)
-    bool share = false
-    if broadCtx == c.isBroadContextCore
-        for q = st to st + ln - 1
-            int rid = array.get(e.candRootIds, q)
-            Root r = rootOf(e, rid)
-            bool broad = not na(r) and r.category == 4 and r.isBroadFvg
-            bool usable = broadCtx ? broad : not broad
-            if usable and array.includes(c.originRootIds, rid)
-                share := true
-                break
-    share
+newEpisode(ZoneEngine e, int side, int seq, int t, int genId, int touchNo,
+     float snapBot, float snapTop, float closeAtTouch, bool isNormal) =>
+    TouchEpisode ep = TouchEpisode.new(episodeId = e.nextEpisodeId, side = side, startSeq = seq,
+         startTime = t, generationId = genId, touchNo = touchNo, snapBottom = snapBot,
+         snapTop = snapTop, closeAtTouch = closeAtTouch, deepestClose = na, maxDepthPct = 0.0,
+         weakByDepth = false, isNormalTouch = isNormal, spans = array.new<ContactSpan>())
+    e.nextEpisodeId += 1
+    ep
 
-// Touch history is always rebuilt from the real TouchMarks: same Side, same
-// time and same contact range count once, and only marks that actually touch
-// the current range are kept.
-// Episode identity (spec 12.2 "same time and same contact counts once"):
-// Side + time + contact range in ticks + normal/non-normal. Two contacts on the
-// same bar at different price bands are different Episodes.
-sameEpisode(ZoneCfg cfg, TouchMark a, TouchMark b) =>
-    a.side == b.side and a.time == b.time and a.isNormalTouch == b.isNormalTouch and
-     toTick(a.contactBottom, cfg.mintick) == toTick(b.contactBottom, cfg.mintick) and
-     toTick(a.contactTop, cfg.mintick) == toTick(b.contactTop, cfg.mintick)
-
-markIsDuplicate(ZoneEngine e, ZoneCfg cfg, ZoneCore c, TouchMark tm) =>
-    int n = array.size(c.touchMarks)
+// One span per confirmed bar; the same bar and the same range is not stored twice.
+addContactSpan(ZoneCfg cfg, TouchEpisode ep, int seq, int t, float bottom, float top) =>
+    int n = array.size(ep.spans)
     bool dup = false
     if n > 0
         for i = 0 to n - 1
-            if sameEpisode(cfg, array.get(c.touchMarks, i), tm)
+            ContactSpan cs = array.get(ep.spans, i)
+            if cs.baseSeq == seq and toTick(cs.bottom, cfg.mintick) == toTick(bottom, cfg.mintick) and
+                 toTick(cs.top, cfg.mintick) == toTick(top, cfg.mintick)
+                dup := true
+                break
+    if not dup
+        array.push(ep.spans, ContactSpan.new(baseSeq = seq, time = t, bottom = bottom, top = top))
+
+// Membership is decided by the real contacts, never by an envelope.
+episodeTouchesRange(ZoneCfg cfg, TouchEpisode ep, float bot, float top) =>
+    int n = array.size(ep.spans)
+    bool hit = false
+    if n > 0
+        for i = 0 to n - 1
+            ContactSpan cs = array.get(ep.spans, i)
+            if intersectsT(cs.bottom, cs.top, bot, top, cfg.mintick)
+                hit := true
+                break
+    hit
+
+episodeIsDuplicate(ZoneCfg cfg, array<TouchEpisode> dst, TouchEpisode ep) =>
+    int n = array.size(dst)
+    bool dup = false
+    if n > 0
+        for i = 0 to n - 1
+            TouchEpisode o = array.get(dst, i)
+            if o.episodeId == ep.episodeId or sameEpisodeKey(cfg, o, ep)
                 dup := true
                 break
     dup
 
-trimTouchMarks(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
-    while array.size(c.touchMarks) > cfg.maxTouchMarksPerCore
-        array.shift(c.touchMarks)
+// maxTouchMarksPerCore is the Episode history limit. Whole Episodes are dropped,
+// never single ContactSpans, so an incomplete Episode is never produced.
+trimEpisodes(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
+    while array.size(c.episodes) > cfg.maxTouchMarksPerCore
+        array.shift(c.episodes)
         c.marksTruncated := true
         e.touchHistoryTruncated := true
 
-// Rebuild one side's consumption history from the retained TouchMarks. Only
-// normal touches consume Fresh. When the mark history was truncated the count
-// can never fall below what was already recorded and Fresh is not revived.
+// Rebuild one Side's consumption history from the Episodes that really touch
+// the current range. A truncated history can never lower the count, clear Weak
+// or revive Fresh.
 rebuildSideHistory(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int side) =>
     SideViewState sv = viewOf(c, side)
     SideHistory h = sv.history
@@ -2331,24 +2448,22 @@ rebuildSideHistory(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int side) =>
         int cnt = 0
         bool wDepth = false
         float mDepth = 0.0
-        int n = array.size(c.touchMarks)
+        int n = array.size(c.episodes)
         if n > 0
             for i = 0 to n - 1
-                TouchMark tm = array.get(c.touchMarks, i)
-                if tm.side == side and tm.isNormalTouch and intersectsT(tm.contactBottom, tm.contactTop, rb, rt, cfg.mintick)
+                TouchEpisode ep = array.get(c.episodes, i)
+                if ep.side == side and ep.isNormalTouch and episodeTouchesRange(cfg, ep, rb, rt)
                     bool seen = false
                     if i > 0
                         for q = 0 to i - 1
-                            TouchMark o = array.get(c.touchMarks, q)
-                            if o.side == side and o.isNormalTouch and intersectsT(o.contactBottom, o.contactTop, rb, rt, cfg.mintick) and sameEpisode(cfg, o, tm)
+                            TouchEpisode o = array.get(c.episodes, q)
+                            if o.side == side and o.isNormalTouch and episodeTouchesRange(cfg, o, rb, rt) and sameEpisodeKey(cfg, o, ep)
                                 seen := true
                                 break
                     if not seen
                         cnt += 1
-                    wDepth := wDepth or tm.weakByDepth
-                    mDepth := math.max(mDepth, tm.maxDepthPct)
-        // A truncated mark history can never lower the count, clear Weak or
-        // revive Fresh: the missing past is not assumed to be untouched.
+                    wDepth := wDepth or ep.weakByDepth
+                    mDepth := math.max(mDepth, ep.maxDepthPct)
         if c.marksTruncated
             cnt := cnt < h.sideTouchCount ? h.sideTouchCount : cnt
             wDepth := wDepth or h.weakByDepth
@@ -2360,224 +2475,509 @@ rebuildSideHistory(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int side) =>
         h.maxDepthPct := mDepth
         h.weakByTouch := not cfg.weakFromTouchOff and (cnt + 1) >= cfg.weakFromTouch
 
-// After a Merge or a Split the Episodes that do not belong to the new physical
-// range are dropped, so a later Split cannot re-use unrelated history. Split
-// children are all created from the pre-split set before this runs.
-// Episodes that no longer belong to the current physical Core range are
-// dropped after a Merge or a Split, for one sided Cores as well. The Episode of
-// a running ActiveTouch is never removed, and Split children are all built from
-// the pre-split set before this runs.
-pruneMarksToRange(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
-    if not na(c.physBottom)
-        int n = array.size(c.touchMarks)
-        if n > 0
-            for i = n - 1 to 0
-                TouchMark tm = array.get(c.touchMarks, i)
-                bool isActive = (not na(c.supportView.activeMark) and c.supportView.activeMark == tm) or
-                     (not na(c.resistanceView.activeMark) and c.resistanceView.activeMark == tm)
-                if not isActive and not intersectsT(tm.contactBottom, tm.contactTop, c.physBottom, c.physTop, cfg.mintick)
-                    array.remove(c.touchMarks, i)
-
 rebuildCoreHistory(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
     rebuildSideHistory(e, cfg, c, 1)
     rebuildSideHistory(e, cfg, c, -1)
-    int n = array.size(c.touchMarks)
+    int n = array.size(c.episodes)
     int normals = 0
     if n > 0
         for i = 0 to n - 1
-            normals += array.get(c.touchMarks, i).isNormalTouch ? 1 : 0
+            normals += array.get(c.episodes, i).isNormalTouch ? 1 : 0
     if not c.marksTruncated
         c.zoneFresh := normals == 0
 
-mergeCores(ZoneEngine e, ZoneCfg cfg, ZoneCore dst, ZoneCore src, BaseFeed f) =>
-    int n = array.size(src.touchMarks)
+// Episodes that never touched the current physical Core range are dropped after
+// a Merge or a Split, for one sided Cores as well. The Episode of a running
+// ActiveTouch is never removed.
+pruneEpisodesToRange(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
+    if not na(c.physBottom)
+        int n = array.size(c.episodes)
+        if n > 0
+            for i = n - 1 to 0
+                TouchEpisode ep = array.get(c.episodes, i)
+                bool isActive = (not na(c.supportView.activeEpisode) and c.supportView.activeEpisode == ep) or
+                     (not na(c.resistanceView.activeEpisode) and c.resistanceView.activeEpisode == ep)
+                if not isActive and not episodeTouchesRange(cfg, ep, c.physBottom, c.physTop)
+                    array.remove(c.episodes, i)
+
+// ---------------------------------------------------------------------------
+// 11.2 Phase 1: immutable snapshot of the live Cores
+// ---------------------------------------------------------------------------
+snapshotCores(ZoneEngine e) =>
+    array.clear(e.snapCoreIdx)
+    array.clear(e.snapOriginStart)
+    array.clear(e.snapOriginLen)
+    array.clear(e.snapOrigins)
+    array.clear(e.snapBot)
+    array.clear(e.snapTop)
+    array.clear(e.snapBroadCtx)
+    array.clear(e.snapActive)
+    int n = array.size(e.cores)
     if n > 0
         for i = 0 to n - 1
-            TouchMark tm = array.get(src.touchMarks, i)
-            if not markIsDuplicate(e, cfg, dst, tm)
-                array.push(dst.touchMarks, tm)
-    trimTouchMarks(e, cfg, dst)
+            ZoneCore c = array.get(e.cores, i)
+            if c.alive
+                int start = array.size(e.snapOrigins)
+                int on = array.size(c.originRootIds)
+                if on > 0
+                    for q = 0 to on - 1
+                        array.push(e.snapOrigins, array.get(c.originRootIds, q))
+                array.push(e.snapCoreIdx, i)
+                array.push(e.snapOriginStart, start)
+                array.push(e.snapOriginLen, array.size(e.snapOrigins) - start)
+                array.push(e.snapBot, c.physBottom)
+                array.push(e.snapTop, c.physTop)
+                array.push(e.snapBroadCtx, c.isBroadContextCore ? 1 : 0)
+                array.push(e.snapActive, coreHasActiveTouch(c) ? 1 : 0)
+    array.size(e.snapCoreIdx)
+
+candIsBroadContext(ZoneEngine e, int k) =>
+    array.get(e.candBroadCtx, k) == 1
+
+// Roots of candidate k that can decide identity: every non-Broad Root, or the
+// Broad FVG origins when the candidate is a standalone Broad context.
+candIdentityHasRoot(ZoneEngine e, int k, int rid, bool broadCtx) =>
+    int st = array.get(e.candStart, k)
+    int ln = array.get(e.candLen, k)
+    bool found = false
+    for q = st to st + ln - 1
+        if array.get(e.candRootIds, q) == rid
+            Root r = rootOf(e, rid)
+            bool broad = not na(r) and r.category == 4 and r.isBroadFvg
+            if broadCtx == broad
+                found := true
+                break
+    found
+
+// Phase 2: match against the snapshot only.
+candMatchesSnap(ZoneEngine e, ZoneCfg cfg, int k, int si) =>
+    bool broadCtx = candIsBroadContext(e, k)
+    bool ok = false
+    if broadCtx == (array.get(e.snapBroadCtx, si) == 1)
+        float sb = array.get(e.snapBot, si)
+        float stp = array.get(e.snapTop, si)
+        if not na(sb) and tLe(intervalGap(sb, stp, array.get(e.candBottom, k), array.get(e.candTop, k)), cfg.clusterMaxWidth, cfg.mintick)
+            int os = array.get(e.snapOriginStart, si)
+            int ol = array.get(e.snapOriginLen, si)
+            if ol > 0
+                for q = os to os + ol - 1
+                    if candIdentityHasRoot(e, k, array.get(e.snapOrigins, q), broadCtx)
+                        ok := true
+                        break
+    ok
+
+// Two candidates belong to the same physical Core when they share a non-Broad
+// origin Root and stay within M of each other (spec 10.7).
+candSharesWithCand(ZoneEngine e, ZoneCfg cfg, int k1, int k2) =>
+    bool ok = false
+    if tLe(intervalGap(array.get(e.candBottom, k1), array.get(e.candTop, k1),
+         array.get(e.candBottom, k2), array.get(e.candTop, k2)), cfg.clusterMaxWidth, cfg.mintick)
+        int st = array.get(e.candStart, k1)
+        int ln = array.get(e.candLen, k1)
+        for q = st to st + ln - 1
+            int rid = array.get(e.candRootIds, q)
+            Root r = rootOf(e, rid)
+            bool broad = not na(r) and r.category == 4 and r.isBroadFvg
+            if not broad and candIdentityHasRoot(e, k2, rid, false)
+                ok := true
+                break
+    ok
+
+// ---------------------------------------------------------------------------
+// 11.3 Phase 3: connected components. Node ids are [0, kn) for candidates and
+//      [kn, kn + sn) for Core snapshots.
+// ---------------------------------------------------------------------------
+ufFind(ZoneEngine e, int x) =>
+    int r = x
+    while array.get(e.ufParent, r) != r
+        r := array.get(e.ufParent, r)
+    int cur = x
+    while array.get(e.ufParent, cur) != cur
+        int nxt = array.get(e.ufParent, cur)
+        array.set(e.ufParent, cur, r)
+        cur := nxt
+    r
+
+ufUnion(ZoneEngine e, int a, int b) =>
+    int ra = ufFind(e, a)
+    int rb = ufFind(e, b)
+    if ra != rb
+        if ra < rb
+            array.set(e.ufParent, rb, ra)
+        else
+            array.set(e.ufParent, ra, rb)
+
+// Canonical competition order of two candidates (spec 10.4), with the buffer
+// index only as the very last, never reachable, tie break.
+candBetter(ZoneEngine e, ZoneCfg cfg, int k1, int k2) =>
+    int c1 = array.get(e.candC, k1)
+    int c2 = array.get(e.candC, k2)
+    int h1 = array.get(e.candH, k1)
+    int h2 = array.get(e.candH, k2)
+    int w1 = toTick(array.get(e.candTop, k1), cfg.mintick) - toTick(array.get(e.candBottom, k1), cfg.mintick)
+    int w2 = toTick(array.get(e.candTop, k2), cfg.mintick) - toTick(array.get(e.candBottom, k2), cfg.mintick)
+    int t1 = array.get(e.candFormTime, k1)
+    int t2 = array.get(e.candFormTime, k2)
+    int i1 = array.get(e.candMinId, k1)
+    int i2 = array.get(e.candMinId, k2)
+    c1 != c2 ? c1 > c2 : h1 != h2 ? h1 > h2 : w1 != w2 ? w1 < w2 :
+     t1 != t2 ? t1 < t2 : i1 != i2 ? i1 < i2 : k1 < k2
+
+// ---------------------------------------------------------------------------
+// 11.4 Phase 5 helpers: Merge and Split on the resolved topology
+// ---------------------------------------------------------------------------
+sortEpisodesByStart(ZoneCore c) =>
+    int n = array.size(c.episodes)
+    if n > 1
+        for i = 1 to n - 1
+            int j = i
+            bool go = true
+            while j > 0 and go
+                TouchEpisode a = array.get(c.episodes, j)
+                TouchEpisode b = array.get(c.episodes, j - 1)
+                bool swap = a.startSeq < b.startSeq or (a.startSeq == b.startSeq and a.episodeId < b.episodeId)
+                if swap
+                    array.set(c.episodes, j, b)
+                    array.set(c.episodes, j - 1, a)
+                    j -= 1
+                else
+                    go := false
+
+// All Episodes of the merged Cores are collected once, deduplicated on the
+// stable Episode key, and only then does the side history get rebuilt.
+mergeCoreInto(ZoneEngine e, ZoneCfg cfg, ZoneCore dst, ZoneCore src, BaseFeed f) =>
+    int n = array.size(src.episodes)
+    if n > 0
+        for i = 0 to n - 1
+            TouchEpisode ep = array.get(src.episodes, i)
+            if not episodeIsDuplicate(cfg, dst.episodes, ep)
+                array.push(dst.episodes, ep)
+    sortEpisodesByStart(dst)
+    trimEpisodes(e, cfg, dst)
     for si = 0 to 1
         int side = si == 0 ? 1 : -1
         SideHistory a = viewOf(dst, side).history
         SideHistory b = viewOf(src, side).history
-        a.weakByTouch := a.weakByTouch or b.weakByTouch
-        a.weakByDepth := a.weakByDepth or b.weakByDepth
-        a.maxDepthPct := math.max(a.maxDepthPct, b.maxDepthPct)
-        a.sideTouchCount := b.sideTouchCount > a.sideTouchCount ? b.sideTouchCount : a.sideTouchCount
         a.flipAttemptCount := a.flipAttemptCount + b.flipAttemptCount
         a.inverseAttemptCount := a.inverseAttemptCount + b.inverseAttemptCount
         a.everUsed := a.everUsed or b.everUsed
-        a.sideFresh := a.sideFresh and b.sideFresh
+        // only the truncated floor is carried; the real values come from the
+        // Episodes in rebuildSideHistory()
+        a.sideTouchCount := b.sideTouchCount > a.sideTouchCount ? b.sideTouchCount : a.sideTouchCount
+        a.weakByDepth := a.weakByDepth or b.weakByDepth
+        a.maxDepthPct := math.max(a.maxDepthPct, b.maxDepthPct)
     dst.zoneFresh := dst.zoneFresh and src.zoneFresh
     dst.marksTruncated := dst.marksTruncated or src.marksTruncated
     if not dst.breakSnap.valid and src.breakSnap.valid
         dst.breakSnap := src.breakSnap
     src.alive := false
-    dst.historyDirty := true
     e.statMerges += 1
     pushEvent(e, 12, f, dst, 0, dst.physBottom, dst.physTop, 0, 1, 0, src.coreId)
 
-// Split children keep the parent's Generation ID: a split is not a new Zone
-// generation and never resets Touch / Weak / Fresh.
-splitCore(ZoneEngine e, ZoneCfg cfg, ZoneCore parent, int k, BaseFeed f) =>
-    ZoneCore child = ZoneCore.new(coreId = e.nextCoreId, generationId = parent.generationId,
+newCoreFrom(ZoneEngine e, BaseFeed f, ZoneCore parent) =>
+    ZoneCore c = ZoneCore.new(coreId = e.nextCoreId,
+         generationId = na(parent) ? e.nextGenId : parent.generationId,
          originRootIds = array.new<int>(), supportView = newSideView(), resistanceView = newSideView(),
-         touchMarks = array.new<TouchMark>(), breakSnap = BreakSnapshot.new(),
-         createdTime = f.openTime, lastSeenTime = f.openTime, zoneFresh = parent.zoneFresh,
-         genBaselineCatMask = parent.genBaselineCatMask, marksTruncated = parent.marksTruncated)
+         episodes = array.new<TouchEpisode>(), breakSnap = BreakSnapshot.new(),
+         createdTime = f.openTime, lastSeenTime = f.openTime,
+         zoneFresh = na(parent) ? true : parent.zoneFresh,
+         genBaselineCatMask = na(parent) ? 0 : parent.genBaselineCatMask,
+         marksTruncated = na(parent) ? false : parent.marksTruncated)
     e.nextCoreId += 1
-    float bot = array.get(e.candBottom, k)
-    float top = array.get(e.candTop, k)
-    int n = array.size(parent.touchMarks)
-    if n > 0
-        for i = 0 to n - 1
-            TouchMark tm = array.get(parent.touchMarks, i)
-            if intersectsT(tm.contactBottom, tm.contactTop, bot, top, cfg.mintick)
-                array.push(child.touchMarks, tm)
-    for si = 0 to 1
-        int side = si == 0 ? 1 : -1
-        SideHistory ph = viewOf(parent, side).history
-        SideHistory h = viewOf(child, side).history
-        h.weakByTouch := ph.weakByTouch
-        h.weakByDepth := ph.weakByDepth
-        h.maxDepthPct := ph.maxDepthPct
-        h.sideTouchCount := ph.sideTouchCount
-        h.everUsed := ph.everUsed
-    applyCandidate(e, cfg, child, k, f)
-    rebuildCoreHistory(e, cfg, child)
-    child.historyDirty := true
-    parent.historyDirty := true
-    array.push(e.cores, child)
-    e.statSplits += 1
-    pushEvent(e, 13, f, child, 0, bot, top, 0, 1, 0, parent.coreId)
-    child
+    if na(parent)
+        e.nextGenId += 1
+    else
+        for si = 0 to 1
+            int side = si == 0 ? 1 : -1
+            SideHistory ph = viewOf(parent, side).history
+            SideHistory h = viewOf(c, side).history
+            h.weakByTouch := ph.weakByTouch
+            h.weakByDepth := ph.weakByDepth
+            h.maxDepthPct := ph.maxDepthPct
+            h.sideTouchCount := ph.sideTouchCount
+            h.everUsed := ph.everUsed
+    array.push(e.cores, c)
+    c
 
-// 11.1 Association. While any related Core is in ActiveTouch nothing is merged,
-//      split, retired or reshaped: the change is held as PendingTopology and
-//      applied by the re-clustering after the episode ends.
+// Split children are all built from the same pre-split Episode snapshot, so
+// giving history to one child can never keep it from another.
+assignEpisodesFromSnapshot(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
+    array.clear(c.episodes)
+    int n = array.size(e.episodeSnap)
+    if n > 0 and not na(c.physBottom)
+        for i = 0 to n - 1
+            TouchEpisode ep = array.get(e.episodeSnap, i)
+            if episodeTouchesRange(cfg, ep, c.physBottom, c.physTop)
+                array.push(c.episodes, ep)
+    trimEpisodes(e, cfg, c)
+
+// ---------------------------------------------------------------------------
+// 11.5 The association pass
+// ---------------------------------------------------------------------------
 associateCandidates(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
     int kn = array.size(e.candSide)
-    int cn = array.size(e.cores)
-    if cn > 0
-        for i = 0 to cn - 1
+    int sn = snapshotCores(e)
+    int total = kn + sn
+    int cn0 = array.size(e.cores)
+    if cn0 > 0
+        for i = 0 to cn0 - 1
             ZoneCore c = array.get(e.cores, i)
             c.supportView.history.everUsed := c.supportView.history.everUsed or not na(c.supportView.effectiveBottom)
             c.resistanceView.history.everUsed := c.resistanceView.history.everUsed or not na(c.resistanceView.effectiveBottom)
-    if kn > 0
+    // --- Phase 2 / 3: match against the snapshot, then components ----------
+    array.clear(e.ufParent)
+    if total > 0
+        for i = 0 to total - 1
+            array.push(e.ufParent, i)
+    if kn > 0 and sn > 0
         for k = 0 to kn - 1
-            int side = array.get(e.candSide, k)
-            float cb = array.get(e.candBottom, k)
-            float ct = array.get(e.candTop, k)
-            ZoneCore primary = na
-            bool anyActive = false
-            array.clear(e.sTmpA)
-            int cn2 = array.size(e.cores)
-            if cn2 > 0
-                for i = 0 to cn2 - 1
-                    ZoneCore c = array.get(e.cores, i)
-                    if c.alive and not na(c.physBottom) and tLe(intervalGap(c.physBottom, c.physTop, cb, ct), cfg.clusterMaxWidth, cfg.mintick) and candSharesOrigin(e, c, k)
-                        e.statCoreMatches += 1
-                        array.push(e.sTmpA, i)
-                        anyActive := anyActive or coreHasActiveTouch(c)
-                        if na(primary) or c.coreId < primary.coreId
-                            primary := c
-            if na(primary)
-                ZoneCore c = ZoneCore.new(coreId = e.nextCoreId, generationId = e.nextGenId,
-                     originRootIds = array.new<int>(), supportView = newSideView(), resistanceView = newSideView(),
-                     touchMarks = array.new<TouchMark>(), breakSnap = BreakSnapshot.new(),
-                     createdTime = f.openTime, lastSeenTime = f.openTime)
-                e.nextCoreId += 1
-                e.nextGenId += 1
-                applyCandidate(e, cfg, c, k, f)
-                c.genBaselineCatMask := array.get(e.candCatMask, k)
-                c.lastMatchSeq := f.seq
-                if side == 1
-                    c.appliedSupSeq := f.seq
+            for si = 0 to sn - 1
+                if candMatchesSnap(e, cfg, k, si)
+                    e.statCoreMatches += 1
+                    ufUnion(e, k, kn + si)
+    if kn > 1
+        for k1 = 0 to kn - 2
+            for k2 = k1 + 1 to kn - 1
+                if candSharesWithCand(e, cfg, k1, k2)
+                    ufUnion(e, k1, k2)
+    // component representatives in a canonical order: lowest old Core ID first,
+    // then, for components without an old Core, the best Candidate
+    array.clear(e.compRep)
+    array.clear(e.compMinCore)
+    if total > 0
+        for i = 0 to total - 1
+            int r = ufFind(e, i)
+            if not array.includes(e.compRep, r)
+                array.push(e.compRep, r)
+                array.push(e.compMinCore, 2147483647)
+    int rn = array.size(e.compRep)
+    if rn > 0 and sn > 0
+        for si = 0 to sn - 1
+            int r = ufFind(e, kn + si)
+            int at = array.indexof(e.compRep, r)
+            ZoneCore c = array.get(e.cores, array.get(e.snapCoreIdx, si))
+            if at >= 0 and c.coreId < array.get(e.compMinCore, at)
+                array.set(e.compMinCore, at, c.coreId)
+    if rn > 1
+        for i = 1 to rn - 1
+            int j = i
+            bool go = true
+            while j > 0 and go
+                int ra = array.get(e.compRep, j)
+                int rb = array.get(e.compRep, j - 1)
+                int ma = array.get(e.compMinCore, j)
+                int mb = array.get(e.compMinCore, j - 1)
+                bool swap = ma < mb
+                if ma == mb and ma == 2147483647
+                    int ba = -1
+                    int bb = -1
+                    if kn > 0
+                        for k = 0 to kn - 1
+                            int rr = ufFind(e, k)
+                            if rr == ra and (ba < 0 or candBetter(e, cfg, k, ba))
+                                ba := k
+                            if rr == rb and (bb < 0 or candBetter(e, cfg, k, bb))
+                                bb := k
+                    swap := ba >= 0 and bb >= 0 and candBetter(e, cfg, ba, bb)
+                if swap
+                    array.set(e.compRep, j, rb)
+                    array.set(e.compRep, j - 1, ra)
+                    array.set(e.compMinCore, j, mb)
+                    array.set(e.compMinCore, j - 1, ma)
+                    j -= 1
                 else
-                    c.appliedResSeq := f.seq
-                array.push(e.cores, c)
-            else if anyActive
-                int mn = array.size(e.sTmpA)
-                if mn > 0
-                    for q = 0 to mn - 1
-                        ZoneCore c = array.get(e.cores, array.get(e.sTmpA, q))
+                    go := false
+    e.statComponents += rn
+    // --- Phase 4 / 5: resolve each component -------------------------------
+    if rn > 0
+        for ri = 0 to rn - 1
+            int rep = array.get(e.compRep, ri)
+            // snapshots of this component, ordered by Core ID
+            array.clear(e.compSnapBuf)
+            bool anyActive = false
+            if sn > 0
+                for si = 0 to sn - 1
+                    if ufFind(e, kn + si) == rep
+                        array.push(e.compSnapBuf, si)
+                        anyActive := anyActive or array.get(e.snapActive, si) == 1
+            int cs = array.size(e.compSnapBuf)
+            if cs > 1
+                for i = 1 to cs - 1
+                    int j = i
+                    bool go = true
+                    while j > 0 and go
+                        ZoneCore ca = array.get(e.cores, array.get(e.snapCoreIdx, array.get(e.compSnapBuf, j)))
+                        ZoneCore cb = array.get(e.cores, array.get(e.snapCoreIdx, array.get(e.compSnapBuf, j - 1)))
+                        if ca.coreId < cb.coreId
+                            int tmp = array.get(e.compSnapBuf, j)
+                            array.set(e.compSnapBuf, j, array.get(e.compSnapBuf, j - 1))
+                            array.set(e.compSnapBuf, j - 1, tmp)
+                            j -= 1
+                        else
+                            go := false
+            // candidates of this component, in canonical competition order
+            array.clear(e.orderBuf)
+            if kn > 0
+                for k = 0 to kn - 1
+                    if ufFind(e, k) == rep
+                        array.push(e.orderBuf, k)
+            int ck = array.size(e.orderBuf)
+            if ck > 1
+                for i = 1 to ck - 1
+                    int j = i
+                    bool go = true
+                    while j > 0 and go
+                        int ka = array.get(e.orderBuf, j)
+                        int kb = array.get(e.orderBuf, j - 1)
+                        if candBetter(e, cfg, ka, kb)
+                            array.set(e.orderBuf, j, kb)
+                            array.set(e.orderBuf, j - 1, ka)
+                            j -= 1
+                        else
+                            go := false
+            if anyActive
+                // Phase 4: nothing in this component is merged, split, reshaped
+                // or re-owned while an Episode is running.
+                if cs > 0
+                    for q = 0 to cs - 1
+                        ZoneCore c = array.get(e.cores, array.get(e.snapCoreIdx, array.get(e.compSnapBuf, q)))
                         c.pendingTopology := true
                         c.lastMatchSeq := f.seq
                 e.statDeferred += 1
             else
+                ZoneCore primary = na
                 bool merged = false
-                int mn = array.size(e.sTmpA)
-                if mn > 0
-                    for q = 0 to mn - 1
-                        ZoneCore c = array.get(e.cores, array.get(e.sTmpA, q))
-                        if c.coreId != primary.coreId and c.alive
-                            mergeCores(e, cfg, primary, c, f)
+                if cs > 0
+                    primary := array.get(e.cores, array.get(e.snapCoreIdx, array.get(e.compSnapBuf, 0)))
+                    if cs > 1
+                        for q = 1 to cs - 1
+                            ZoneCore other = array.get(e.cores, array.get(e.snapCoreIdx, array.get(e.compSnapBuf, q)))
+                            mergeCoreInto(e, cfg, primary, other, f)
                             merged := true
-                bool alreadyApplied = (side == 1 ? primary.appliedSupSeq : primary.appliedResSeq) == f.seq
-                if alreadyApplied
-                    ZoneCore ch = splitCore(e, cfg, primary, k, f)
-                    ch.lastMatchSeq := f.seq
-                    if side == 1
-                        ch.appliedSupSeq := f.seq
-                    else
-                        ch.appliedResSeq := f.seq
-                    rebuildCoreHistory(e, cfg, primary)
-                else
-                    applyCandidate(e, cfg, primary, k, f)
-                    if merged
-                        rebuildCoreHistory(e, cfg, primary)
-                    if side == 1
-                        primary.appliedSupSeq := f.seq
-                    else
-                        primary.appliedResSeq := f.seq
-                primary.lastMatchSeq := f.seq
-    // --- ownership handover, stale Side Structure, Zone lifetime -----------
-    // Being unmatched on this bar is NOT an end condition (spec 14). A Core
-    // ends only when it owns no effective non-psychological Root and no
-    // waiting Root any more, which is what a hand-over to another Core through
-    // Merge / Split / re-clustering produces.
-    int cn3 = array.size(e.cores)
-    if cn3 > 0
-        for i = cn3 - 1 to 0
-            ZoneCore c = array.get(e.cores, i)
-            if not c.alive
+                // Episode snapshot taken once, before any child is created
+                array.clear(e.episodeSnap)
+                if not na(primary)
+                    int pn = array.size(primary.episodes)
+                    if pn > 0
+                        for q = 0 to pn - 1
+                            array.push(e.episodeSnap, array.get(primary.episodes, q))
+                // slot assignment: one slot is one physical Core
+                array.clear(e.slotCoreIdx)
+                array.clear(e.slotSupCand)
+                array.clear(e.slotResCand)
+                if ck > 0
+                    for q = 0 to ck - 1
+                        int k = array.get(e.orderBuf, q)
+                        int side = array.get(e.candSide, k)
+                        int placed = -1
+                        int slots = array.size(e.slotSupCand)
+                        if slots > 0
+                            for sl = 0 to slots - 1
+                                int mine = side == 1 ? array.get(e.slotSupCand, sl) : array.get(e.slotResCand, sl)
+                                int other = side == 1 ? array.get(e.slotResCand, sl) : array.get(e.slotSupCand, sl)
+                                if placed < 0 and mine < 0 and (other < 0 or candSharesWithCand(e, cfg, k, other))
+                                    placed := sl
+                        if placed < 0
+                            array.push(e.slotSupCand, -1)
+                            array.push(e.slotResCand, -1)
+                            array.push(e.slotCoreIdx, -1)
+                            placed := array.size(e.slotSupCand) - 1
+                        if side == 1
+                            array.set(e.slotSupCand, placed, k)
+                        else
+                            array.set(e.slotResCand, placed, k)
+                int slotN = array.size(e.slotSupCand)
+                bool splitHappened = slotN > 1 and not na(primary)
+                if slotN > 0
+                    for sl = 0 to slotN - 1
+                        ZoneCore target = na
+                        bool isChild = false
+                        if sl == 0 and not na(primary)
+                            target := primary
+                        else
+                            target := newCoreFrom(e, f, primary)
+                            isChild := not na(primary)
+                        int kSup = array.get(e.slotSupCand, sl)
+                        int kRes = array.get(e.slotResCand, sl)
+                        if kSup >= 0
+                            applyCandidate(e, cfg, target, kSup, f)
+                            target.appliedSupSeq := f.seq
+                            if target.genBaselineCatMask == 0
+                                target.genBaselineCatMask := array.get(e.candCatMask, kSup)
+                        if kRes >= 0
+                            applyCandidate(e, cfg, target, kRes, f)
+                            target.appliedResSeq := f.seq
+                            if target.genBaselineCatMask == 0
+                                target.genBaselineCatMask := array.get(e.candCatMask, kRes)
+                        target.lastMatchSeq := f.seq
+                        refreshCoreRange(target)
+                        if isChild
+                            e.statSplits += 1
+                            pushEvent(e, 13, f, target, 0, target.physBottom, target.physTop, 0, 1, 0, primary.coreId)
+                        if merged or splitHappened
+                            if sl == 0 and not na(primary)
+                                pruneEpisodesToRange(e, cfg, target)
+                            else if not na(primary)
+                                assignEpisodesFromSnapshot(e, cfg, target)
+                            rebuildCoreHistory(e, cfg, target)
+                else if cs > 0
+                    // no candidate in this component: the old Cores keep their
+                    // state and the lifetime check below decides
+                    for q = 0 to cs - 1
+                        array.get(e.cores, array.get(e.snapCoreIdx, array.get(e.compSnapBuf, q))).lastMatchSeq := f.seq
+    // --- Phase 6: single ownership pass, then ranges and origins -----------
+    int cnA = array.size(e.cores)
+    if cnA > 0
+        for i = cnA - 1 to 0
+            if not array.get(e.cores, i).alive
                 array.remove(e.cores, i)
-            else
-                // 1) Side apply / clear is already done for the applied sides
-                for si = 0 to 1
-                    int side = si == 0 ? 1 : -1
-                    SideViewState sv = viewOf(c, side)
-                    bool applied = (side == 1 ? c.appliedSupSeq : c.appliedResSeq) == f.seq
-                    if not applied and sv.history.phase != 2
-                        clearLiveSide(sv)
-                // 2) physical range and 3) origin set always come from the
-                //    current Live Side Structure, independently of historyDirty
-                refreshCoreRange(c)
-                rebuildCoreOrigins(e, c)
-                // 4) Touch Episode re-allocation only after a Merge or a Split
-                if c.historyDirty and not na(c.physBottom)
-                    pruneMarksToRange(e, cfg, c)
-                    rebuildCoreHistory(e, cfg, c)
-                    c.historyDirty := false
-                // 5) Zone lifetime
-                bool waitingState = coreHasActiveTouch(c) or c.breakSnap.valid or c.pendingTopology or
-                     c.pendingGeneration or c.supportView.history.phase == 3 or c.supportView.history.phase == 4 or
-                     c.resistanceView.history.phase == 3 or c.resistanceView.history.phase == 4
-                bool hasEffective = false
-                bool hasWaitingRoot = false
-                int on2 = array.size(c.originRootIds)
-                if on2 > 0
-                    for q = 0 to on2 - 1
-                        Root r = rootOf(e, array.get(c.originRootIds, q))
-                        if not na(r) and r.category != 5
-                            hasEffective := hasEffective or r.state == 1 or r.state == 4
-                            hasWaitingRoot := hasWaitingRoot or r.state == 3
-                if not hasEffective and not hasWaitingRoot and not waitingState
-                    array.push(e.endedGenCores, c.coreId)
-                    array.push(e.endedGenIds, c.generationId)
-                    array.remove(e.cores, i)
-
+    map.clear(e.ownerOfRoot)
+    int cnB = array.size(e.cores)
+    if cnB > 0
+        for i = 0 to cnB - 1
+            ZoneCore c = array.get(e.cores, i)
+            for si = 0 to 1
+                SideViewState sv = si == 0 ? c.supportView : c.resistanceView
+                int rn2 = array.size(sv.rootIds)
+                if rn2 > 0
+                    for q = rn2 - 1 to 0
+                        int rid = array.get(sv.rootIds, q)
+                        Root r = rootOf(e, rid)
+                        bool broad = not na(r) and r.category == 4 and r.isBroadFvg
+                        if not broad
+                            if map.contains(e.ownerOfRoot, rid) and map.get(e.ownerOfRoot, rid) != c.coreId
+                                array.remove(sv.rootIds, q)
+                                e.statOwnerConflict += 1
+                            else
+                                map.put(e.ownerOfRoot, rid, c.coreId)
+    if cnB > 0
+        for i = cnB - 1 to 0
+            ZoneCore c = array.get(e.cores, i)
+            for si = 0 to 1
+                int side = si == 0 ? 1 : -1
+                SideViewState sv = viewOf(c, side)
+                bool applied = (side == 1 ? c.appliedSupSeq : c.appliedResSeq) == f.seq
+                if not applied and sv.history.phase != 2
+                    clearLiveSide(sv)
+            refreshCoreRange(c)
+            rebuildCoreOrigins(e, c)
+            // --- Phase 7: Zone lifetime (spec 14) --------------------------
+            bool waitingState = coreHasActiveTouch(c) or c.breakSnap.valid or c.pendingTopology or
+                 c.pendingGeneration or c.supportView.history.phase == 3 or c.supportView.history.phase == 4 or
+                 c.resistanceView.history.phase == 3 or c.resistanceView.history.phase == 4
+            bool hasEffective = false
+            bool hasWaitingRoot = false
+            int on2 = array.size(c.originRootIds)
+            if on2 > 0
+                for q = 0 to on2 - 1
+                    Root r = rootOf(e, array.get(c.originRootIds, q))
+                    if not na(r) and r.category != 5
+                        hasEffective := hasEffective or r.state == 1 or r.state == 4
+                        hasWaitingRoot := hasWaitingRoot or r.state == 3
+            if not hasEffective and not hasWaitingRoot and not waitingState
+                array.push(e.endedGenCores, c.coreId)
+                array.push(e.endedGenIds, c.generationId)
+                array.remove(e.cores, i)
 // =============================================================================
 // 12. State transitions
 //     Detection runs against the structure that was final at the previous
@@ -2619,10 +3019,10 @@ startGeneration(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, int catMaskNo
         h.inverseAttemptCount := 0
         h.phase := h.phase == 1 ? 1 : 0
         sv.touchSnapshot.valid := false
-        sv.activeMark := na
+        sv.activeEpisode := na
     c.zoneFresh := true
     c.breakSnap := BreakSnapshot.new()
-    array.clear(c.touchMarks)
+    array.clear(c.episodes)
     c.genCandidateReady := false
     c.genCandidateMovedAway := false
     c.genCandidateSide := 0
@@ -2661,8 +3061,11 @@ activeEval(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, 
     bool brk = side == 1 ? tLe(f.c, bot - cfg.breakBuffer, cfg.mintick) : tGe(f.c, top + cfg.breakBuffer, cfg.mintick)
     if brk
         applyBreak(e, cfg, f, c, side, bot, top, false, h.currentTouchNo)
-        sv.activeMark := na
+        sv.activeEpisode := na
     else
+        // real contact of this confirmed bar, kept as its own ContactSpan
+        if not na(sv.activeEpisode) and intersectsT(f.l, f.h, bot, top, cfg.mintick)
+            addContactSpan(cfg, sv.activeEpisode, f.seq, f.closeTime, math.max(f.l, bot), math.min(f.h, top))
         int botT = toTick(bot, cfg.mintick)
         int topT = toTick(top, cfg.mintick)
         int cT = toTick(f.c, cfg.mintick)
@@ -2674,24 +3077,24 @@ activeEval(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, 
                 sn.maxDepthPct := depth
                 sn.deepestClose := f.c
             h.maxDepthPct := math.max(h.maxDepthPct, depth)
-            if not na(sv.activeMark)
-                TouchMark am = sv.activeMark
+            if not na(sv.activeEpisode)
+                TouchEpisode am = sv.activeEpisode
                 if depth > am.maxDepthPct
                     am.maxDepthPct := depth
                     am.deepestClose := f.c
             if depth >= cfg.weakDepthPct and not h.weakByDepth
                 h.weakByDepth := true
-                if not na(sv.activeMark)
-                    sv.activeMark.weakByDepth := true
+                if not na(sv.activeEpisode)
+                    sv.activeEpisode.weakByDepth := true
                 pushEvent(e, 2, f, c, side, bot, top, h.currentTouchNo, sn.touchStartGrade, weakReasonOf(cfg, h, h.currentTouchNo), 0)
-            else if depth >= cfg.weakDepthPct and not na(sv.activeMark)
-                sv.activeMark.weakByDepth := true
+            else if depth >= cfg.weakDepthPct and not na(sv.activeEpisode)
+                sv.activeEpisode.weakByDepth := true
         bool reset = side == 1 ? tGe(f.c, top + cfg.touchResetDistance, cfg.mintick) : tLe(f.c, bot - cfg.touchResetDistance, cfg.mintick)
         if reset
             h.phase := 0
             pushEvent(e, 1, f, c, side, bot, top, h.currentTouchNo, sn.touchStartGrade, weakReasonOf(cfg, h, h.currentTouchNo), 0)
             h.currentTouchNo := 0
-            sv.activeMark := na
+            sv.activeEpisode := na
 
 startTouch(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, int side) =>
     SideHistory h = sv.history
@@ -2730,14 +3133,12 @@ startTouch(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv, 
     sn.deepestClose := na
     sn.maxDepthPct := 0.0
     c.genBaselineCatMask := sv.catMask
-    TouchMark tm = TouchMark.new(baseSeq = f.seq, time = f.closeTime, side = side,
-         contactBottom = math.max(f.l, sn.rangeBottom), contactTop = math.min(f.h, sn.rangeTop),
-         closeAtTouch = f.c, generationId = c.generationId, isNormalTouch = true,
-         touchNo = h.currentTouchNo, snapBottom = sn.rangeBottom, snapTop = sn.rangeTop,
-         deepestClose = na, maxDepthPct = 0.0, weakByDepth = false)
-    array.push(c.touchMarks, tm)
-    sv.activeMark := tm
-    trimTouchMarks(e, cfg, c)
+    TouchEpisode ep = newEpisode(e, side, f.seq, f.closeTime, c.generationId, h.currentTouchNo,
+         sn.rangeBottom, sn.rangeTop, f.c, true)
+    addContactSpan(cfg, ep, f.seq, f.closeTime, math.max(f.l, sn.rangeBottom), math.min(f.h, sn.rangeTop))
+    array.push(c.episodes, ep)
+    sv.activeEpisode := ep
+    trimEpisodes(e, cfg, c)
     pushEvent(e, 0, f, c, side, sn.rangeBottom, sn.rangeTop, h.currentTouchNo, gr, weakReasonOf(cfg, h, h.currentTouchNo), 0)
     activeEval(e, cfg, f, c, sv, side)
 
@@ -2784,10 +3185,11 @@ processBreakState(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c) =>
                         nv.history.phase := 0
                         nv.history.lastFlipConfirmSeq := f.seq
                         ov.history.phase := 0
-                        array.push(c.touchMarks, TouchMark.new(baseSeq = f.seq, time = f.closeTime,
-                             side = -oldSide, contactBottom = bs.rangeBottom, contactTop = bs.rangeTop,
-                             closeAtTouch = f.c, generationId = c.generationId, isNormalTouch = false))
-                        trimTouchMarks(e, cfg, c)
+                        TouchEpisode fep = newEpisode(e, -oldSide, f.seq, f.closeTime, c.generationId, 0,
+                             bs.rangeBottom, bs.rangeTop, f.c, false)
+                        addContactSpan(cfg, fep, f.seq, f.closeTime, math.max(f.l, bs.rangeBottom), math.min(f.h, bs.rangeTop))
+                        array.push(c.episodes, fep)
+                        trimEpisodes(e, cfg, c)
                         pushEvent(e, 6, f, c, -oldSide, bs.rangeBottom, bs.rangeTop, 0, nv.history.grade, 0, 0)
                     else
                         nv.history.flipAttemptCount += 1
@@ -3062,6 +3464,7 @@ export update(ZoneEngine e, ZoneCfg cfg, BaseFeed bf, MaPack ma,
         e.statCoreMatches := 0
         e.statCandidates := 0
         e.statDeferred := 0
+        e.statComponents := 0
         // --- facts that outrank later structure changes --------------------
         markFvgInvalidation(e, cfg, bf, fv1, e.lastFvg1hSrcClose)
         markFvgInvalidation(e, cfg, bf, fv4, e.lastFvg4hSrcClose)
@@ -3106,7 +3509,6 @@ export update(ZoneEngine e, ZoneCfg cfg, BaseFeed bf, MaPack ma,
         // --- G: re-clustering ----------------------------------------------
         collectPoints(e, cfg)
         syncPsych(e, cfg, bf.c)
-        map.clear(e.ownerOfRoot)
         buildCandidates(e, cfg)
         associateCandidates(e, cfg, bf)
         // --- H, I: generation candidates and next bar state ----------------
@@ -3174,6 +3576,8 @@ export statCoreMatches(ZoneEngine e) => e.statCoreMatches
 export statMerges(ZoneEngine e) => e.statMerges
 export statSplits(ZoneEngine e) => e.statSplits
 export statDeferred(ZoneEngine e) => e.statDeferred
+export statComponents(ZoneEngine e) => e.statComponents
+export statOwnerConflict(ZoneEngine e) => e.statOwnerConflict
 export maSlopeText(ZoneEngine e) =>
     string s = ""
     int n = array.size(e.idxMa)

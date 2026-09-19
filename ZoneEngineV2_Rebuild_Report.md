@@ -1,9 +1,11 @@
 # ZoneEngineV2_Rebuild 実装レポート
 
-作成日：2026-09-19（改訂5：TradingView実機検証前の最終静的版）
-Build ID：**`ZEV2R-20260919-005`**（Library / Visual Harness / 本書で共通）
+作成日：2026-09-19（改訂6：静的最終版）
+Build ID：**`ZEV2R-20260919-006`**（Library / Visual Harness / 本書で共通）
 対象：XAUUSD / 確定5分足 / Pine Script v6
 正本：`Zone_definition_spec_v2.md` 全21節 ＋ 軽量化実装指示書 M0〜M19 ＋ 付録A〜D
+
+**静的実装完成。正本に対する既知の静的不一致0。実機適合性は未検証。**
 
 ---
 
@@ -14,6 +16,7 @@ Build ID：**`ZEV2R-20260919-005`**（Library / Visual Harness / 本書で共通
 | 仕様上の未解決事項 | **0件** |
 | 実装上の既知の暫定処理 | **0件** |
 | 結果へ影響する独自解釈 | **0件** |
+| **Core associationのCandidate処理順依存** | **0件** |
 
 ### Zone判定結果へ影響しない実装決定（全Cfg範囲で不変なもののみ）
 
@@ -22,141 +25,163 @@ Build ID：**`ZEV2R-20260919-005`**（Library / Visual Harness / 本書で共通
   Touch / Weak / Fresh のリセットは行いません。影響は表示されるGeneration IDのみで、
   いずれの設定値でもZone判定（Phase / Grade / C / H / Density / Touch / Break / Flip / 世代）は変わりません。
 
-改訂4で「影響しない実装決定」として記載していた**心理価格の1本選択は削除しました**。
-`clusterMaxWidth`を変更すると結果が変わり得るため、この区分に該当しません。
-改訂5では選択自体を廃止し、参加可能な全ての心理価格構成を評価します（1章 #3）。
-
-**実機適合性は未検証です。** Compile / 実チャート / Profiler / 75ケース / M15重点ケース /
-Bar Replay / reload一致 / リアルタイム一致は**すべて NOT RUN**（6章）。
-
 ---
 
-## 1. 改訂5の修正（4項目）
+## 1. 改訂6の修正
 
-### #1 clearLiveSide後にCore物理範囲とOriginを必ず再構築
+### A. Core Associationの完全な順序非依存化
 
-**仕様根拠**：仕様4.3（方向別に独立評価）、12.1（同一性）、14（Zone lifetime）。
+**変更前の問題**：Candidate単位の逐次処理で、Candidate 1のapplyが旧Core状態
+（`originRootIds`・範囲）を変えてからCandidate 2を照合していました。
+旧Core origins=[R1,R2]／今バーCandidate X=[R1], Y=[R2] のとき、
+Xを先にapplyするとCore originが[R1]へ変わり、Yが一致しなくなって新規Core化する、
+という処理順依存が起こり得ました。
 
-**変更前の問題**：`refreshCoreRange()`が`historyDirty`条件の内側にあり、
-`rebuildOriginIds()`は`applyCandidate()`内でしか呼ばれていませんでした。
-Supportだけ今バー更新・ResistanceはclearLiveSideかつ`historyDirty = false`のとき、
-`physBottom` / `physTop` / `originRootIds` に前バーResistanceの情報が残り得ました。
-これは次バーのCore identity、`candSharesOrigin()`、価格的連続性、Dormant距離、
-Zone lifetime、Root ownershipへ影響し得ます。
+**変更後の処理**：`associateCandidates()`を7フェーズへ分離しました。
+**Phase 1〜4はLive Coreを一切読み書きしません。**
 
-**変更後の処理**：`associateCandidates()`末尾のCore単位処理を明示的な5段階にしました。
+| Phase | 内容 | 実装 |
+|---|---|---|
+| 1 | 全Live Coreの不変Snapshot（Core ID / Generation / 前バーorigin / 前バーphysBottom・physTop / Broad Contextか / ActiveTouch有無）。association完了まで変更しない | `snapshotCores()` → `snapCoreIdx` / `snapOriginStart` / `snapOriginLen` / `snapOrigins` / `snapBot` / `snapTop` / `snapBroadCtx` / `snapActive` |
+| 2 | 全Candidate × 全旧Core Snapshotのmatchだけを作る（正本12.1：同一性に使えるRoot IDを1つ以上共有＋前回範囲との連続性がM以内）。apply / merge / split / 削除 / origin更新は一切しない | `candMatchesSnap()`。Broad FVG originだけでは局所Zone同一性にならず、Broad standalone contextはBroad originで継続追跡（`candIsBroadContext()` と `snapBroadCtx` の一致を要求） |
+| 3 | Candidate ∪ Snapshot の二部グラフをunion-findでconnected componentへ分類。Candidate同士も、非Broad起源共有かつM以内なら同一component（仕様10.7の「Support候補とResistance候補を同じCoreへ」） | `ufFind()` / `ufUnion()` / `candSharesWithCand()` |
+| 4 | componentにActiveTouch Coreが1つでもあれば、そのcomponentのMerge / Split / Live Structure変更 / Root ownership移動を**一切行わず**PendingTopologyとして保持 | `anyActive`分岐。TouchStartSnapshotは固定、Root失効による`eligible=false`だけは`finalizeSide()`で即時反映 |
+| 5 | 決定済みTopologyを初めてLive Coreへ適用 | 下記 |
+| 6 | Root ownershipを1回だけ確定 → 各Coreの範囲・originを再構築 | 下記 B |
+| 7 | Zone lifetime（仕様14） | 有効非心理Root・待機Root・待機状態がすべて0のときだけ終了 |
+
+**決定論的な処理順**：
+
+- component の処理順＝「component内の最小旧Core ID昇順」。旧Coreを含まないcomponentは
+  そのcomponentの最良Candidate（正本競合順）で順序付け。
+- component内のSnapshotは旧Core ID昇順、Candidateは**正本競合順**
+  （C降順 → H降順 → Effective幅昇順 → 成立時刻昇順 → Root ID昇順）。
+  `candFormTime` / `candMinId` を採用時に確定して`candBetter()`で比較します。
+  最小Root IDまで比較するため、異なるCandidate同士が完全同値になることはありません
+  （バッファ添字は到達不能な最終tie-breakとしてのみ存在）。
+
+**Phase 5の適用規則**：
+
+- **Merge**：component内の旧Coreを最小Core IDへ集約（`mergeCoreInto()`）。
+  Episodeを一度集約してからdedupe、`startSeq`順へ整列、Episode単位でtrim。
+- **Slot割当**：1 slot = 1物理Core。Candidateを正本競合順に見て、
+  「そのSideが空いていて、かつ反対Sideに既に入っているCandidateと非Broad起源を共有しM以内」
+  の最初のslotへ入れる。入らなければ新slot（＝Split子）。
+  これによりSupport/Resistanceの2 Viewは1 Coreへ、同Sideの複数Candidateは別Coreへ、
+  いずれも順序非依存で決まります。
+- **1対1**：slot 0が旧Core（Core ID維持）。
+- **Split**：slot 1以降が子Core。親のGeneration IDを継承。
+- **新規**：どの旧CoreともmatchしないCandidateだけが新Coreになります。
+
+### B. Root ownershipをTopology適用後に一括確定
+
+`ownerOfRoot`はCandidate処理途中で更新しません。Phase 6で、
+死んだCoreを除去したうえでCore ID昇順に走査し、非Broad Rootについて
+Root ID → 最終Core ID を1回だけ確定します。
+既に他Coreが所有している非Broad Rootは、そのSideの`rootIds`から除去し
+`statOwnerConflict`へ計上します（Phase 3のcandidate–candidate辺により本来発生しません）。
+Broad FVGだけが複数局所Zoneへ共有されます。
+
+その後、各Coreで
+「applyされなかったSide（ActiveTouch中を除く）を`clearLiveSide()`」→
+`refreshCoreRange()`→`rebuildCoreOrigins()`の順に実行します。
+`rebuildCoreOrigins()`はLive Side Structureからoriginを作り直したうえで、
+**このCoreがまだ所有するInverseWait Root**をwaiting originとして戻すため、
+`ownerOfRoot`と矛盾せず、他Core所有の非Broad RootがSide rootIdsにもoriginにも残りません。
+
+### C. 心理価格Rootの同Side ownership
+
+Psych Rootは通常Rootです（Broad FVGではありません）。Sideごとに`sPsyUsed`（使用済みlevel集合）を持ち、
+
+- `psychVariants()`：`psychLevelFree()`が偽のlevelを構成候補から除外。
+- `collectPsychRoots()`：使用済みlevelを返さず、採用したlevelを`sPsyUsed`へ追加。
+- Stage A次ラウンド・Stage B・Stage Cはすべて同じ`sPsyUsed`を見るため、再利用されません。
+- `buildCandidates()`がSide切替時に`sPsyUsed`をクリアするので、
+  Supportで使用済みでもResistanceでは独立に評価されます。
+- 競合でPsychを失った候補は、次ラウンドの`scanBest()`がPsychなしの構成として再評価します。
+
+### D. Touch Episodeの実接触履歴
+
+`TouchMark`を廃止し、`TouchEpisode` ＋ `ContactSpan`へ置き換えました（旧経路は残していません）。
 
 ```text
-1) Side apply / clear      applyされなかったSideへ clearLiveSide()（ActiveTouch中は除く）
-2) refreshCoreRange(c)     現在のLive Side Structureだけから phys range を再構築（無条件）
-3) rebuildCoreOrigins(e,c) 現在のLive Side Structureだけから origin 集合を再構築（無条件）
-4) historyDirty のときだけ pruneMarksToRange() → rebuildCoreHistory()
-5) Zone lifetime 判定
+TouchEpisode : episodeId / side / startSeq / startTime / generationId / touchNo
+               snapBottom / snapTop / closeAtTouch / deepestClose / maxDepthPct
+               weakByDepth / isNormalTouch / spans[]
+ContactSpan  : baseSeq / time / bottom / top
 ```
 
-`historyDirty`は**Touch Episode再配分が必要かどうかだけ**に使い、
-Coreの現在物理範囲・現在Origin集合の再構築条件には使いません。
+- ActiveTouch中の各確定5分足で、High/LowがTouchStartSnapshot範囲と交差したら
+  `contactBottom = max(low, snapBottom)` / `contactTop = min(high, snapTop)` を
+  `addContactSpan()`でEpisodeへ追加（同じ足・同じ範囲はdedupe）。
+- Episodeは Reset / Break まで同一。所属判定は`episodeTouchesRange()`が
+  **いずれかのContactSpanと交差するか**で行い、Episode全体のmin〜max envelopeは使いません。
+- Split時：ContactSpanが子範囲と交差したEpisodeだけを子へ配分。
+  同じEpisodeが2子へ実接触していれば**両方へ配分**します（Root二重参加禁止とは別）。
+- Merge時：`sameEpisodeKey()`（episodeId一致、または Side＋startTime＋startSeq＋touchNo＋
+  Generation＋TouchStartSnapshot範囲tick＋通常/非通常）でdedupe。
+  「同じ5分足だった」だけでは統合しません。
+- WeakByDepth / maxDepthPct はEpisode単位で保持し、履歴再構築はEpisode集合から行います。
 
-`rebuildCoreOrigins()`は次を行います。
+### E. truncateをEpisode単位に
 
-1. 現在の`originRootIds`から、**まだこのCoreが所有していて**（他Coreへ移っておらず生存）、
-   かつ`state = InverseWait`の待機Rootを退避。
-2. `rebuildOriginIds()`で現在のLive Side Structureだけから origin を作り直す。
-3. 退避した待機Rootを戻す（無効化FVGはどのSideにも参加しないが、
-   Coreを`InverseWait | Unavailable`として維持するため）。
-4. 非Broad起源の有無から`isBroadContextCore`を再計算し、Broad standalone contextの
-   特殊identityを再構築後も維持する。
+`maxTouchMarksPerCore`は「保存するTouch Episode履歴上限」です。`trimEpisodes()`が
+**Episode単位で**古いものから削除し、ContactSpanの部分削除による不完全Episodeを作りません。
+truncate後は`marksTruncated`（Core単位）により、TouchCountを減らさない／Weakを解除しない／
+Freshへ戻さない、を維持し、Split子へ継承します。
 
-### #2 Touch Episodeのdedupeキーを統一
+### F. Split履歴配分
 
-**仕様根拠**：仕様12.2「同一Side、同一時刻、同一接触を1回へdedupe」。
+Split開始前に親CoreのEpisode集合を`episodeSnap`へ完全Snapshotし、
+**全子が同じSnapshotから**`assignEpisodesFromSnapshot()`で配分します。
+子1へ配ったことで親配列から消えて子2へ届かない経路は存在しません。
+順序は「全子作成 → 各子へContactSpan交差で配分 → 各子で`rebuildCoreHistory()` →
+最後に親側のprune/再構築」です。Split自体ではTouchCount / Weak / Fresh のリセットも
+新Generation開始も行わず、その子へ実配分された履歴だけから再構築します
+（truncate時のみ保守的継承）。
 
-**変更前の問題**：`markIsDuplicate()`は Side＋time＋接触範囲tick＋種別 で判定していましたが、
-`rebuildSideHistory()`のTouchCount計算は`lastT`（時刻）だけで重複を潰していたため、
-同じ5分足内の別価格帯への2接触まで1回にまとめていました。
+### G. Merge履歴配分
 
-**変更後の処理**：Episodeの一意キーを1か所へ集約しました。
+Merge対象の全旧CoreのEpisodeを一度集約 → dedupe → `startSeq`整列 → trim。
+その後、Merge後EffectiveRangeへ一度も接触していないEpisodeを`pruneEpisodesToRange()`で除外し、
+残Episodeから Support / Resistance 別に
+SideTouchCount / UpcomingTouchNo / WeakByTouch / WeakByDepth / MaxDepth / SideFresh / ZoneFresh を
+`rebuildSideHistory()` / `rebuildCoreHistory()`で再構築します。
+親の集約値の単純max / ORを最終結果にはしません
+（`mergeCoreInto()`が残すmax / ORは、truncate時の保守的な下限としてのみ機能します）。
 
-```pine
-sameEpisode(cfg, a, b) =>
-    a.side == b.side and a.time == b.time and a.isNormalTouch == b.isNormalTouch and
-     toTick(a.contactBottom) == toTick(b.contactBottom) and
-     toTick(a.contactTop)    == toTick(b.contactTop)
-```
+### I. それ以外は未変更
 
-`markIsDuplicate()`（Merge時のdedupe）と`rebuildSideHistory()`（SideTouchCountの計上）が
-**同じ`sameEpisode()`**を使います。同Side・同時刻でも接触範囲が違うEpisodeは別Touchです。
-
-### #3 心理価格を1本に限定しない
-
-**仕様根拠**：仕様3.6、7.7、5.4、付録A 10.2 段階A 手順6。
-
-**変更前の問題**：`psychAugment()`が参加可能な心理価格を「結果幅が狭い→levelが小さい」で
-1本だけ選んでいました。`clusterMaxWidth`は変更可能で、例えばM=60では複数の50ドル刻みが
-同じ候補のM以内へ入るため、本来評価されるべき候補を落とし得ます。
-
-**変更後の処理**：`psychVariants()`が、参加可能な心理価格の**全構成**を候補範囲として列挙します。
-
-- 候補範囲に内包される心理価格は必ず参加するため、**範囲が決まれば参加集合が一意に決まります**。
-  そこで下方向の拡張本数 × 上方向の拡張本数の全組合せを候補範囲として生成します
-  （内側に心理価格があれば拡張0でも参加あり）。
-- 幅が`limitTick`（段階A＝denseWidth、段階B/C＝M）を超える組合せは生成しません。
-- `scanBest()`は「心理価格なし」＋各構成を**すべて**同じ比較関数で評価します。
-- `adoptWindow()`は`collectPsychRoots()`で、採用範囲に入る生存心理価格Rootを**全て**
-  候補のRoot一覧へ加えます（EffectiveRangeは実参加価格を反映）。
-
-維持している性質：心理価格単独で候補を開始・維持しない（価格順配列に入らない）、
-PsychカテゴリのCは最大1（catMaskのPsychビット32だけを立てる）、Hは常に0（`hMaskNoMa`に心理ビットなし）、
-100ドル価格はMajorの1Rootのみ（level偶数）、列挙順は下→上で決定論的、幅M超の組合せは不可。
-
-### #4 Touch Episode pruneを片Side Coreでも実行
-
-**仕様根拠**：仕様12.2 / 12.3。
-
-**変更前の問題**：`pruneMarksToRange()`が「Support ViewとResistance Viewの両方に
-EffectiveRangeが存在する」場合だけ実行されており、片Sideだけ有効なCoreでは
-現在の物理範囲外のEpisodeが残り続けました。
-
-**変更後の処理**：条件を`not na(c.physBottom)`（#1で無条件に再構築済み）へ変更しました。
-併せて、
-
-- 進行中のActiveTouch Episode（いずれかのSideの`activeMark`）は削除しません。
-- `TouchStartSnapshot` / `BreakSnapshot`はEpisode配列とは独立に`array.copy()`で保持されており、
-  pruneの影響を受けません。
-- `marksTruncated`はCore単位で保持され、`rebuildSideHistory()`が回数を下げず・Weakを解除せず・
-  Freshへ戻さない契約を維持します。
-- Splitは従来どおり、分裂前のEpisode集合から全ての子へ配分した**後**に、
-  各Core（親・子）で`pruneMarksToRange()` → `rebuildCoreHistory()`の順で処理します
-  （両方に`historyDirty`が立ち、末尾の5段階処理で実行されます）。
+A→B→C候補生成順、Broad局所化4条件、Dense Strong保護、FVG方向とSide資格の分離、
+異TF同方向FVG実重複、心理価格は候補開始Rootではない、ReferencePriceのロジック不使用、
+ConfirmedTime gate、TouchStartSnapshot、BreakSnapshot、前足Armed gate、
+FlipConfirm / InverseConfirm同足再Armed禁止、Fresh / Weakルール、Zone lifetime、
+Config validation、tick正規化、5分Harness限定、request 5件 / tuple 84要素、
+FVG 50%完全不使用、保存上限保護、Accum Box pair整理、Generation条件 — いずれも変更していません。
 
 ---
 
-## 2. 追加静的監査（ケースJ〜Q）
+## 2. 追加静的監査（ケースR1〜R10）
 
 | # | ケース | 経路 | 結果 |
 |---|---|---|---|
-| J | Supportのみ今バーapply、Resistanceがclearされた後、`physBottom/physTop`・`originRootIds`に前バーResistance Rootが残らない | 末尾処理の 1)→2)→3)。`refreshCoreRange()`はLive Side Structureのみ参照、`rebuildCoreOrigins()`は`rebuildOriginIds()`（Live Side Structureのみ）から作り直す | 経路あり |
-| K | Stale Sideにしか存在しなかったRootが、次バーのCore identity一致へ使われない | 同上。`clearLiveSide()`で`rootIds`が空になり、`rebuildOriginIds()`がそのRootを含めない。`candSharesOrigin()`は`originRootIds`のみ参照 | 経路あり |
-| L | 同時刻・同Side・異なる接触RangeのEpisode 2件をMerge → TouchCount = 2 | `sameEpisode()`が接触範囲tickも比較するため別Episode。`markIsDuplicate()`は重複と判定せず両方保持、`rebuildSideHistory()`も2件として計上 | 経路あり |
-| M | 同時刻・同Side・同一接触Rangeの重複Episode → TouchCount = 1 | `markIsDuplicate()`がMerge時に片方を捨て、仮に両方残っても`rebuildSideHistory()`の`sameEpisode()`重複判定で1件 | 経路あり |
-| N | M=20で心理価格参加結果が改訂4と一致 | M=20では候補幅+2M ≤ 60 のため参加可能な心理価格は最大1本、生成される構成も最大1つで、改訂4が選んでいた「最も狭い構成」と同一範囲。**ただし**心理価格の拡張で新たにFVGが交差する構成は、改訂4では評価されず改訂5では評価されます（これが#3の修正点そのものです） | 経路あり・注記 |
-| O | M=60等で同一候補周辺へ複数心理価格が存在する場合 | `psychVariants()`が下方向×上方向の全組合せを生成し、`scanBest()`が全て評価。CはPsychビット（32）の1ビットのみでPsychは1、Hは0のまま、`collectPsychRoots()`が採用範囲内の全心理RootをRoot一覧へ入れるためEffectiveRangeは実参加Rootを反映 | 経路あり |
-| P | 片Sideだけ存在するMerge後Coreで、現在物理範囲外の古いTouch Episodeが残らない | `pruneMarksToRange()`の条件が`not na(c.physBottom)`。`physBottom`は末尾処理2)で常に再構築済み | 経路あり |
-| Q | その後Splitしても、一度Coreから外れた無関係Episodeが復活しない | `splitCore()`は親の**現在の**`touchMarks`からのみ配分。pruneで外れたEpisodeは親配列から物理的に削除済みで、復元経路が存在しない | 経路あり |
+| R1 | 旧Core origins=[A,B]、Candidate X=[A] / Y=[B] → Splitとして処理。X→Y / Y→X で同じ最終結果 | 両Candidateが同じSnapshotとunion（Phase 2/3）。slot割当はバッファ順ではなく`candBetter()`の正本競合順で行い、同Sideは別slot＝Split。最小Root IDまで比較するため完全同値は起こらない | 経路あり |
+| R2 | 旧Core1=[A] / 旧Core2=[B]、Candidate=[A,B] → Merge | 1 Candidateが2 Snapshotとunion → 同一component、`cs = 2` → `mergeCoreInto()`で最小Core IDへ集約 | 経路あり |
+| R3 | 旧Core1=[A,B] / 旧Core2=[C]、Candidate X=[A] / Y=[B,C] → connected componentとして順序非依存に解決 | X–Core1、Y–Core1、Y–Core2 の辺で1 component。Merge（Core2→Core1）→ slot割当（競合順）→ slot1がSplit子 | 経路あり |
+| R4 | 上記componentにActiveTouch Coreあり → Topology即時変更なし | `anyActive`分岐でmerge / split / apply / ownership移動を行わず、component内の全旧Coreへ`pendingTopology = true`、`statDeferred`計上 | 経路あり |
+| R5 | 同一Psych 4500が2候補へ参加可能 → 競合で採用された片方だけ所有、もう片方はPsychなしで再評価 | `sPsyUsed`（Side別）。採用時に`collectPsychRoots()`がlevelをusedにし、次ラウンドの`psychVariants()` / `collectPsychRoots()`が除外。Psychを失った候補はPsychなし構成として再評価 | 経路あり |
+| R6 | Broad FVG → 複数局所Zone共有可能 | `adoptWindow()`はBroadを`sFvgLocal`にするだけで`sFvgUsed`にしない。Phase 6のownershipもBroadを除外 | 経路あり |
+| R7 | Episode開始足はZone上部のみ接触、途中で下部にも接触 → Split後、上下両子へEpisode履歴を配分 | ContactSpanが足ごとに積まれ、`episodeTouchesRange()`が各子範囲に対して個別に交差判定。両子で真なら両方へ配分 | 経路あり |
+| R8 | Episode中に100〜102と108〜110だけ接触 → 子103〜107には配らない | 判定はContactSpan単位。min〜max envelope（100〜110）は使用しない | 経路あり |
+| R9 | 同じEpisodeをMerge元2Coreが保持 → 1回。異なるEpisodeが同じ5分足に存在 → 2回 | `sameEpisodeKey()`がepisodeIdまたは Side＋startTime＋startSeq＋touchNo＋Generation＋Snapshot範囲で判定。同じ足でもtouchNoやSnapshot範囲が違えば別Episode | 経路あり |
+| R10 | Candidate配列順を逆転しても Core ID / Generation ID / Root ownership / Touch履歴 / Phase / Grade / イベント列が一致 | Phase 1〜4がLive Coreを読み書きしない。component順は最小旧Core ID、component内は`candBetter()`の正本競合順。ownershipはPhase 6で一括。Core ID採番はcomponent順とslot順にのみ依存 | 経路あり |
 
-### 改訂4からの確認ケース（A〜I）
+### 改訂4〜5からの確認ケース（A〜I / J〜Q）
 
-| # | ケース | 結果 |
-|---|---|---|
-| A | Stage AでStrongにならなかったPoint RootがStage BでFVG内部局所Rootになる | 経路あり |
-| B | Stage BでFVG局所Zoneへ使われた通常RootがStage Cで再利用されない | 経路あり |
-| C | 心理価格が単独で候補列挙を開始しない | 経路あり（#3で更に強化：価格順配列に入らない） |
-| D | 親に2 Episode、片方だけWeakDepth到達 → Split後、正しい子だけへ引き継ぐ | 経路あり |
-| E | WeakByTouchの親をSplit、Touch 1件を引き継ぐ子 | 経路あり。親のフラグは継承せず子の実Episode数から再計算。`weakFromTouch = 2`で1件継承なら`UpcomingTouchNo = 2`となりWaiting / ArmedでWeak（仕様9.1・受入50どおり）。0件継承なら非Weak |
-| F | 有効Rootを持つが今バー未照合のCoreが終了しない | 経路あり |
-| G | Supportだけ更新、Resistanceの前バーLiveStructureが残らない | 経路あり（#1で物理範囲・Originまで完全化） |
-| H | 重複区間外のPoint局所候補が異TF重複だけでFVG Highにならない | 経路あり |
-| I | 5分足以外でEngineが実行されない | 経路あり |
+A〜I、J〜Q の全ケースは改訂6でも同じ経路で成立します。
+特にJ・K（Stale Side後の物理範囲・Origin）はPhase 6で無条件に再構築、
+P・Q（片Side CoreのEpisode prune / Split後の無関係履歴復活なし）は
+`pruneEpisodesToRange()`と`episodeSnap`方式で維持しています。
 
 ---
 
@@ -268,8 +293,8 @@ EffectiveRangeが存在する」場合だけ実行されており、片Sideだ�
 |---:|---|---|
 | 66 | ActiveTouch中の新RootでTouchStartGradeを書き換えない | Snapshotは`array.copy()`で凍結。関係CoreがActiveTouchならMerge/Split/applyを行わず`pendingTopology` |
 | 67 | ActiveTouch中のRoot失効後もOutcome記録は継続、新Signalには使わない | `activeEval`はSnapshot範囲で継続、`finalizeSide`が`eligible := sideHasLiveNonPsych()`で即時反映 |
-| 68 | Mergeで同一接触を二重カウントしない | `sameEpisode()`（Side・時刻・接触範囲tick・種別）を`markIsDuplicate()`と`rebuildSideHistory()`の両方で使用。同時刻でも接触範囲が違えば別Touch |
-| 69 | Splitで実際に触れていない子はFreshになれる | `splitCore`が`intersectsT`で配分、`rebuildCoreHistory`が通常Episodeのみで判定。`marksTruncated`時はFresh復活しない |
+| 68 | Mergeで同一接触を二重カウントしない | `sameEpisodeKey()`（episodeId、または Side＋startTime＋startSeq＋touchNo＋Generation＋Snapshot範囲）を`episodeIsDuplicate()`と`rebuildSideHistory()`の両方で使用 |
+| 69 | Splitで実際に触れていない子はFreshになれる | `assignEpisodesFromSnapshot()`がContactSpan交差で配分、`rebuildCoreHistory()`が通常Episodeのみで判定。`marksTruncated`時はFresh復活しない |
 | 70 | 未タッチZoneへのRoot追加は同世代 | `updateGenerationCandidate`：`consumed`（Touch/Weak/Break/非Fresh）が必要 |
 | 71 | 同カテゴリRoot追加・EMA移動・心理価格追加だけでは新世代にならない | `catMask`差分から心理ビット(32)を除去。同カテゴリは`catMask`を変えない |
 | 72 | 新独立カテゴリ＋Base Strong＋Reset＋再接触でだけ新世代Touch 1 | `genCandidateReady` ＋ `genCandidateMovedAway` ＋ 接触足で`startGeneration()` |
@@ -282,11 +307,11 @@ EffectiveRangeが存在する」場合だけ実行されており、片Sideだ�
 | ケース | 経路 |
 |---|---|
 | Root削除＋slot再利用 | `unregisterRoot`が`freeSlots`へ返却、`registerRoot`が再利用。論理IDは再利用しない（心理価格のみ価格由来の固定ID） |
-| Merge後の後続照合再評価 | `mergeCores`後に`refreshCoreRange` / `rebuildOriginIds`が更新され、後続候補は更新後のCoreに対して照合 |
+| Merge後の後続照合再評価 | 照合はPhase 2でSnapshotに対してのみ行われるため、Merge結果が後続照合へ影響しない（順序非依存） |
 | 保存上限 直前／到達／超過 | `pruneStorage`：Core整理→保護集合再構築→Swing/FVG/Time整理→Accum Box整理 |
 | 保護対象だけが残る | `coreProtected` / `rootProtected`が全て真なら`storageOverLimit = true`、削除しない |
 | Accum片側保護 | `pruneAccumBoxes`が同一`pairKey`の全Rootの保護状態を確認してから両方を削除 |
-| Touch履歴truncate | `trimTouchMarks`が`marksTruncated`（Core単位）と`touchHistoryTruncated`（診断）を設定、`rebuildSideHistory`がFresh復活を禁止 |
+| Touch履歴truncate | `trimEpisodes()`がEpisode単位で削除し`marksTruncated`（Core単位）と`touchHistoryTruncated`（診断）を設定、`rebuildSideHistory()`がFresh復活を禁止 |
 | scratch容量超過時のexact fallback | `SCRATCH_MAX_ROOTS`超過は`scratchOverflow`診断のみ。探索・候補は一切削らないため代替経路が不要 |
 | リアルタイム／reload／Bar Replay同値 | 更新は`barstate.isconfirmed`かつ`openTime`単調増加の足のみ。描画は`varip`を使わず毎回再構成 |
 
@@ -392,6 +417,8 @@ EffectiveRangeが存在する」場合だけ実行されており、片Sideだ�
 | `sLot*`（価格順） | なし（毎足再構築） | 毎足 | 生存点Root数 | 打切りなし。`scratchOverflow`診断のみ | Engine |
 | `sFvg*`（Side別FVG集合） | Side | Side切替ごとに再構築 | 当該Sideの適格FVG数 | なし | Engine |
 | `sPsyBot` / `sPsyTop`（心理価格構成） | なし（窓ごとに再構築） | 窓ごと | 下方向×上方向の組合せ数 | なし | Engine |
+| `sPsyUsed`（Side別Psych所有） | Side | Side切替でクリア | 当該Sideの採用level数 | なし | Engine |
+| `snap*` / `edge*` / `uf*` / `comp*` / `slot*` / `episodeSnap` | なし（毎足再構築） | association開始時 | Core数＋Candidate数 | なし | Engine |
 | `cand*`（採用候補） | なし（毎足再構築） | 毎足 | 候補数 | なし | Engine |
 | Feed重複排除 | 元足closeTime／originTime | 新しい元足 | 各1 | なし | Engine |
 | 設定検証 | なし（毎確定足実行） | 毎足 | - | - | Engine |
@@ -456,7 +483,7 @@ Debug表の時刻も同じ`i_tz`で表示します。
 1. `ZoneEngineV2_Rebuild.pine` を **Add to chart** でコンパイル確認（エラーは行番号とメッセージを共有）。
 2. **Publish library** → 発行された `<username>/ZoneEngineV2_Rebuild/<version>` を控える。
 3. Harnessの `import YOUR_TV_USERNAME/ZoneEngineV2_Rebuild/1` を実番号へ置換。
-4. **XAUUSD 5分足**へHarnessを追加。Debug表の`build`が`ZEV2R-20260919-005`であることを確認
+4. **XAUUSD 5分足**へHarnessを追加。Debug表の`build`が`ZEV2R-20260919-006`であることを確認
    （5分足以外ではruntime errorになります）。
 5. 通常実行の完走可否 → 別実行でProfiler。
 6. 計測条件を記録：ticker ID、時間足、セッション、履歴開始/終了と本数、全パラメータ、
@@ -467,14 +494,13 @@ Debug表の時刻も同じ`i_tz`で表示します。
 
 ## 10. まとめ
 
-- Zone定義v2の論理は変更していません。改訂5は既存契約へ合わせる静的修正4件のみです。
-- **仕様上の未解決事項0件 / 実装上の暫定処理0件 / 結果へ影響する独自解釈0件。**
+- Zone定義v2の論理は変更していません。
+- **静的実装完成。正本に対する既知の静的不一致0。実機適合性は未検証。**
+- 仕様上の未解決事項0件 / 実装上の暫定処理0件 / 結果へ影響する独自解釈0件 /
+  Core associationのCandidate処理順依存0件。
 - Zone判定結果へ影響しない実装決定は、Split子のGeneration ID継承（履歴リセットなし・表示のみ、
-  全Cfg範囲で不変）の1件だけです。心理価格の1本選択は設定依存だったため廃止しました。
-- 実機適合性・実行時間・描画・再現性はすべて未検証（`NOT RUN`）です。
-- 次は追加設計修正ではなく、9章の手順によるTradingView実機検証へ進みます。
-
----
+  全Cfg範囲で不変）の1件だけです。
+- 次はTradingView実機検証（9章の手順）です。
 
 ## 11. 改訂履歴（実装状態の由来）
 
@@ -484,6 +510,7 @@ Debug表の時刻も同じ`i_tz`で表示します。
 | 2 | -002 | 付録A 7.4のAccum形成式を正本として一致（実体端レンジ、単一rangeMid、実体中点ドリフト、bull/bear別ラン、条件別ガード）。CandidateはrangeHigh/rangeLowを共有。Broad保護をBase Strong候補へ限定 |
 | 3 | -003 | 全34項目の静的監査：段階Aの完成候補評価、Broad局所化4条件、Bullish/Bearish非補強、ActiveTouch中のMerge/Split遅延、Merge履歴再構築、Flip/Inverse後の再Armed抑止、Broad context同一性、心理価格の安定ID、保存整理の優先順とBox単位Accum、毎足validate、起源タグ衝突、全比較のtick正規化、Debug/表示の完成 |
 | 4 | -004 | 段階Bの完成（残Point Rootへの局所化）、心理価格を候補列挙Rootから除外、Touch Episode単位の履歴、Zone lifetimeを仕様14へ、Stale Side Structureの失効、非BroadのFVG重複Highの空間結合、FVG 50%表示の削除、Harnessの5分足強制、Debug timezone、段階表記の統一 |
-| 5 | -005 | 本書1章の4項目：Core物理範囲/Originの無条件再構築、Episode dedupeキーの統一、心理価格構成の全評価、片Side Coreでも有効なEpisode prune |
+| 5 | -005 | Core物理範囲/Originの無条件再構築、Episode dedupeキーの統一、心理価格構成の全評価、片Side Coreでも有効なEpisode prune |
+| 6 | -006 | Core associationの7フェーズ化（順序非依存）、Root ownershipの一括確定、Psychの同Side ownership、TouchEpisode + ContactSpanによる実接触履歴、Episode単位truncate、Split/Merge履歴配分 |
 
 各改訂の差分はgit履歴（ブランチ `claude/new-session-vss3r2`）に保存されています。
