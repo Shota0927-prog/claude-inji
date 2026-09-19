@@ -1097,6 +1097,30 @@ Psych ownership（`sPsyUsed` / `psychLevelFree()` / `collectPsychRoots()`）も�
 
 ---
 
+### 12.17 ZoneEngine.new の external elements 対応（2026-09-19）
+
+TradingViewで `The "ZoneEngine.new" function uses 266 external elements. The limit is 254.` が出ました。
+ZoneEngine の自動constructorがPineのelement上限を超えたためで、**ロジック・性能アルゴリズムは一切変更していません**。
+
+| 変更 | 内容 |
+|---|---|
+| `EngineDiag` 新設 | Diagnostics 18フィールドを移動、ZoneEngineには `EngineDiag diag` 1件 |
+| `EngineCursor` 新設 | processing bookkeeping 16フィールドを移動、ZoneEngineには `EngineCursor cursor` 1件 |
+| 初期化 | `newEngine()` で `EngineDiag.new()` / `EngineCursor.new()` を各1回のみ（barごとのnewは0） |
+| 参照置換 | `e.<field>` → `e.diag.<field>` / `e.cursor.<field>` を101箇所、機械的に全件置換 |
+| 外部API | export名・引数・戻り値は無変更（例：`export statMerges(ZoneEngine e) => e.diag.statMerges`）。Visual Harnessは変更0行 |
+
+ZoneEngine直下のフィールド数は **196 → 164**（-32）。
+`EngineDiag` だけでは -17（推定249）で目標240に届かないため、指示どおり `EngineCursor` も同じ方法で適用しました。
+
+確認：移動した34フィールドがZoneEngine直下に重複して残っていない（0件）、旧参照 `e.storagePruned` 等が **0件**、
+二重ネスト `e.diag.diag` / `e.cursor.cursor` が0件、`EngineDiag.new` / `EngineCursor.new` は各1回のみ、
+Harnessの `ze.*` は全解決・直接フィールドアクセス0件。
+
+再コンパイルは **NOT RUN** です。
+
+---
+
 ### 12.16 削減した走査・sort・lookupの一覧
 
 | 項目 | 旧 | 新 |
@@ -1132,5 +1156,6 @@ Psych ownership（`sPsyUsed` / `psychLevelFree()` / `collectPsychRoots()`）も�
 | 6d | -006（据え置き） | Pine v6構文互換修正のみ：TouchEpisodeの直接 `==` 比較を `episodeId` 比較へ変更。ロジック変更なし |
 | 6e | -006（据え置き） | Pine v6構文互換修正のみ：式の戻り値への直接field assignment 2件をローカル変数経由へ分割。ロジック変更なし |
 | 7 | -006（据え置き） | RE10110対策の構造最適化（§12）。active Point working set / Root UDT lookup全廃 / FVG 2 sorted index / 逆引きassociation / component 1パス構築 / ufFind 1回 / ReferencePrice採用時のみ / scratch new排除 / Debug分離。結果不変、仕様変更0 |
+| 7a | -006（据え置き） | `ZoneEngine.new` のexternal elements超過対策（§12.17）：Diagnostics 18＋bookkeeping 16フィールドを `EngineDiag` / `EngineCursor` へネスト化。ロジック・性能アルゴリズム変更0、外部API不変 |
 
 各改訂の差分はgit履歴（ブランチ `claude/new-session-vss3r2`）に保存されています。
