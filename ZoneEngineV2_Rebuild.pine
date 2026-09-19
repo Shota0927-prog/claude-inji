@@ -582,6 +582,20 @@ export type ZoneView
     int   highMask        = 0
     array<int> rootIds    = na
 
+// Reverse index bucket: the Snapshot or Candidate indices that carry one Root.
+// Buckets are pooled by the engine, so a steady state bar allocates nothing.
+export type IntBucket
+    array<int> values = na
+
+// One connected component of the Candidate / Core snapshot graph, built once
+// from a single node pass instead of re-scanning every Candidate and Snapshot.
+export type ComponentBucket
+    int rep           = -1
+    int minCoreId     = 2147483647
+    int bestCandidate = -1
+    array<int> candidates = na
+    array<int> snapshots  = na
+
 export type ZoneEngine
     // --- root registry: logical id and storage slot are separate ------------
     array<Root> roots        = na
@@ -676,7 +690,6 @@ export type ZoneEngine
     array<int>   sLotSlot   = na
     array<float> sLotPrice  = na
     array<int>   sLotTick   = na
-    array<int>   sUsed      = na
     array<int>   sCatCnt    = na
     array<int>   sPairs     = na
     array<int>   sTmpA      = na
@@ -737,6 +750,67 @@ export type ZoneEngine
     array<int>   compMinCore    = na
     array<int>   compSnapBuf    = na
     array<TouchEpisode> episodeSnap = na
+    // --- master ordered Point Root table (built once per bar) --------------
+    array<int>   sLotRootId = na
+    array<int>   sLotCat    = na
+    array<int>   sLotPair   = na
+    array<int>   sLotTf     = na
+    array<int>   sLotLabel  = na
+    array<int>   sLotSlope  = na
+    array<int>   sLotConf   = na
+    // --- per side active (still unused) Point Root working set -------------
+    array<int>   activeRootId        = na
+    array<int>   activeSlot          = na
+    array<float> activePrice         = na
+    array<int>   activeTick          = na
+    array<int>   activeCategory      = na
+    array<int>   activePairKey       = na
+    array<int>   activeTfCode        = na
+    array<int>   activeLabelMask     = na
+    array<int>   activeSlopeDir      = na
+    array<int>   activeConfirmedTime = na
+    array<int>   activeTaken         = na
+    array<int>   tmpActRootId        = na
+    array<int>   tmpActSlot          = na
+    array<float> tmpActPrice         = na
+    array<int>   tmpActTick          = na
+    array<int>   tmpActCategory      = na
+    array<int>   tmpActPairKey       = na
+    array<int>   tmpActTfCode        = na
+    array<int>   tmpActLabelMask     = na
+    array<int>   tmpActSlopeDir      = na
+    array<int>   tmpActConfirmedTime = na
+    // --- per side FVG sorted indexes (built once per side) -----------------
+    array<int>   fvgBotTickOf        = na
+    array<int>   fvgTopTickOf        = na
+    array<int>   fvgBottomTicksSorted = na
+    array<int>   fvgBottomOrder      = na
+    array<int>   fvgTopTicksSorted   = na
+    array<int>   fvgTopOrder         = na
+    array<int>   fvgCandBuf          = na
+    // --- association reverse indexes and component buckets -----------------
+    map<int, IntBucket> rootToSnapshots      = na
+    map<int, IntBucket> broadRootToSnapshots = na
+    map<int, IntBucket> rootToCandidates     = na
+    map<int, int> seenSnap  = na
+    map<int, int> seenCand  = na
+    array<int>    nodeRep   = na
+    map<int, ComponentBucket> repToComponent = na
+    array<int>    compBest  = na
+    array<IntBucket> bucketPool = na
+    int           bucketUsed = 0
+    array<ComponentBucket> compPool = na
+    int           compPoolUsed = 0
+    // --- reference price is computed only for adopted Live Side candidates -
+    array<int>   candRefComputed = na
+    // --- reused storage protection map --------------------------------------
+    map<int,int> protMap = na
+    // --- optimisation counters (primitive only, never strings) -------------
+    int  statFvgPrefiltered = 0
+    int  statFvgScanned     = 0
+    int  statPairChecks     = 0
+    int  statSnapChecks     = 0
+    int  statRefPriceCalls  = 0
 
 // -----------------------------------------------------------------------------
 // 4. Numeric helpers. Every price comparison that decides a boundary goes
@@ -779,37 +853,71 @@ popCount6(int mask) =>
 export newCfg() =>
     ZoneCfg.new()
 
+// Every check is a primitive comparison. The error text is only materialised
+// when a check actually failed, so a valid configuration - the normal case on
+// every confirmed bar - builds no strings at all.
 export validateCfg(ZoneCfg cfg) =>
-    string err = ""
-    err := cfg.clusterMaxWidth <= 0.0 ? err + "clusterMaxWidth<=0; " : err
-    err := cfg.denseRatio <= 0.0 or cfg.denseRatio > 1.0 ? err + "denseRatio out of range; " : err
-    err := cfg.touchResetDistance <= 0.0 ? err + "touchResetDistance<=0; " : err
-    err := cfg.breakBuffer < 0.0 ? err + "breakBuffer<0; " : err
-    err := cfg.touchTolerance < 0.0 ? err + "touchTolerance<0; " : err
-    err := cfg.emaSlopeLookback < 1 ? err + "emaSlopeLookback<1; " : err
-    err := cfg.swingLen5m < 1 or cfg.swingLen15m < 1 or cfg.swingLen1h < 1 ? err + "swing pivot length<1; " : err
-    err := cfg.weakDepthPct < 0.0 or cfg.weakDepthPct > 100.0 ? err + "weakDepthPct out of range; " : err
-    err := cfg.strongUnlimited and not cfg.weakFromTouchOff ? err + "strongUnlimited requires weakFromTouchOff; " : err
-    err := not cfg.strongUnlimited and cfg.strongUntilTouch < 1 ? err + "strongUntilTouch<1; " : err
-    err := not cfg.weakFromTouchOff and cfg.weakFromTouch < 2 ? err + "weakFromTouch<2; " : err
-    err := not cfg.strongUnlimited and not cfg.weakFromTouchOff and cfg.strongUntilTouch >= cfg.weakFromTouch ? err + "strongUntilTouch must be < weakFromTouch; " : err
-    err := cfg.mintick <= 0.0 ? err + "mintick<=0; " : err
-    err := cfg.accumRangeLen < 2 or cfg.accumBaseLen < cfg.accumRangeLen ? err + "accum range/base length invalid; " : err
-    err := cfg.accumAtrLen < 1 ? err + "accumAtrLen<1; " : err
-    err := cfg.accumMinUpperCloses < 0 or cfg.accumMinUpperCloses > cfg.accumRangeLen ? err + "accumMinUpperCloses out of range; " : err
-    err := cfg.accumMinLowerCloses < 0 or cfg.accumMinLowerCloses > cfg.accumRangeLen ? err + "accumMinLowerCloses out of range; " : err
-    err := cfg.accumMaxSameColorRun < 1 ? err + "accumMaxSameColorRun<1; " : err
-    err := cfg.accumAtrMult <= 0.0 or cfg.accumBarRatioMax <= 0.0 or cfg.accumDriftMax < 0.0 ? err + "accum ratio invalid; " : err
-    err := cfg.dormantDistance <= 0.0 ? err + "dormantDistance<=0; " : err
-    err := cfg.maxSwingRoots < 1 or cfg.maxAccumBoxes < 1 or cfg.maxFvgRoots < 1 or cfg.maxTimeRoots < 1 ? err + "root storage limit<1; " : err
-    err := cfg.maxZoneCores < 1 or cfg.maxEndedGenerations < 0 or cfg.maxTouchMarksPerCore < 1 ? err + "core storage limit invalid; " : err
-    err := str.length(cfg.zoneTimezone) == 0 ? err + "zoneTimezone empty; " : err
-    err := cfg.asiaStartMin < 0 or cfg.asiaStartMin > 1440 or cfg.europeStartMin < 0 or cfg.europeStartMin > 1440 ? err + "session start out of range; " : err
-    err := cfg.nyStartMin < 0 or cfg.nyStartMin > 1440 or cfg.nyEndMin < 0 or cfg.nyEndMin > 1440 ? err + "NY session out of range; " : err
-    err := cfg.dayCutMin < 0 or cfg.dayCutMin >= 1440 ? err + "dayCutMin out of range; " : err
-    err := cfg.weekCutDow < 1 or cfg.weekCutDow > 7 ? err + "weekCutDow out of range; " : err
+    bool b01 = cfg.clusterMaxWidth <= 0.0
+    bool b02 = cfg.denseRatio <= 0.0 or cfg.denseRatio > 1.0
+    bool b03 = cfg.touchResetDistance <= 0.0
+    bool b04 = cfg.breakBuffer < 0.0
+    bool b05 = cfg.touchTolerance < 0.0
+    bool b06 = cfg.emaSlopeLookback < 1
+    bool b07 = cfg.swingLen5m < 1 or cfg.swingLen15m < 1 or cfg.swingLen1h < 1
+    bool b08 = cfg.weakDepthPct < 0.0 or cfg.weakDepthPct > 100.0
+    bool b09 = cfg.strongUnlimited and not cfg.weakFromTouchOff
+    bool b10 = not cfg.strongUnlimited and cfg.strongUntilTouch < 1
+    bool b11 = not cfg.weakFromTouchOff and cfg.weakFromTouch < 2
+    bool b12 = not cfg.strongUnlimited and not cfg.weakFromTouchOff and cfg.strongUntilTouch >= cfg.weakFromTouch
+    bool b13 = cfg.mintick <= 0.0
+    bool b14 = cfg.accumRangeLen < 2 or cfg.accumBaseLen < cfg.accumRangeLen
+    bool b15 = cfg.accumAtrLen < 1
+    bool b16 = cfg.accumMinUpperCloses < 0 or cfg.accumMinUpperCloses > cfg.accumRangeLen
+    bool b17 = cfg.accumMinLowerCloses < 0 or cfg.accumMinLowerCloses > cfg.accumRangeLen
+    bool b18 = cfg.accumMaxSameColorRun < 1
+    bool b19 = cfg.accumAtrMult <= 0.0 or cfg.accumBarRatioMax <= 0.0 or cfg.accumDriftMax < 0.0
+    bool b20 = cfg.dormantDistance <= 0.0
+    bool b21 = cfg.maxSwingRoots < 1 or cfg.maxAccumBoxes < 1 or cfg.maxFvgRoots < 1 or cfg.maxTimeRoots < 1
+    bool b22 = cfg.maxZoneCores < 1 or cfg.maxEndedGenerations < 0 or cfg.maxTouchMarksPerCore < 1
+    bool b23 = str.length(cfg.zoneTimezone) == 0
+    bool b24 = cfg.asiaStartMin < 0 or cfg.asiaStartMin > 1440 or cfg.europeStartMin < 0 or cfg.europeStartMin > 1440
+    bool b25 = cfg.nyStartMin < 0 or cfg.nyStartMin > 1440 or cfg.nyEndMin < 0 or cfg.nyEndMin > 1440
+    bool b26 = cfg.dayCutMin < 0 or cfg.dayCutMin >= 1440
+    bool b27 = cfg.weekCutDow < 1 or cfg.weekCutDow > 7
+    bool bad = b01 or b02 or b03 or b04 or b05 or b06 or b07 or b08 or b09 or b10 or
+         b11 or b12 or b13 or b14 or b15 or b16 or b17 or b18 or b19 or b20 or
+         b21 or b22 or b23 or b24 or b25 or b26 or b27
     cfg.denseWidth := cfg.clusterMaxWidth * cfg.denseRatio
-    cfg.valid := str.length(err) == 0
+    cfg.valid := not bad
+    string err = ""
+    if bad
+        err := b01 ? err + "clusterMaxWidth<=0; " : err
+        err := b02 ? err + "denseRatio out of range; " : err
+        err := b03 ? err + "touchResetDistance<=0; " : err
+        err := b04 ? err + "breakBuffer<0; " : err
+        err := b05 ? err + "touchTolerance<0; " : err
+        err := b06 ? err + "emaSlopeLookback<1; " : err
+        err := b07 ? err + "swing pivot length<1; " : err
+        err := b08 ? err + "weakDepthPct out of range; " : err
+        err := b09 ? err + "strongUnlimited requires weakFromTouchOff; " : err
+        err := b10 ? err + "strongUntilTouch<1; " : err
+        err := b11 ? err + "weakFromTouch<2; " : err
+        err := b12 ? err + "strongUntilTouch must be < weakFromTouch; " : err
+        err := b13 ? err + "mintick<=0; " : err
+        err := b14 ? err + "accum range/base length invalid; " : err
+        err := b15 ? err + "accumAtrLen<1; " : err
+        err := b16 ? err + "accumMinUpperCloses out of range; " : err
+        err := b17 ? err + "accumMinLowerCloses out of range; " : err
+        err := b18 ? err + "accumMaxSameColorRun<1; " : err
+        err := b19 ? err + "accum ratio invalid; " : err
+        err := b20 ? err + "dormantDistance<=0; " : err
+        err := b21 ? err + "root storage limit<1; " : err
+        err := b22 ? err + "core storage limit invalid; " : err
+        err := b23 ? err + "zoneTimezone empty; " : err
+        err := b24 ? err + "session start out of range; " : err
+        err := b25 ? err + "NY session out of range; " : err
+        err := b26 ? err + "dayCutMin out of range; " : err
+        err := b27 ? err + "weekCutDow out of range; " : err
     cfg.errorText := err
     cfg.valid
 
@@ -1043,7 +1151,6 @@ export newEngine() =>
     e.sLotSlot   := array.new<int>()
     e.sLotPrice  := array.new<float>()
     e.sLotTick   := array.new<int>()
-    e.sUsed      := array.new<int>()
     e.sCatCnt    := array.new<int>(6, 0)
     e.sPairs     := array.new<int>()
     e.sTmpA      := array.new<int>()
@@ -1101,6 +1208,53 @@ export newEngine() =>
     e.compMinCore    := array.new<int>()
     e.compSnapBuf    := array.new<int>()
     e.episodeSnap    := array.new<TouchEpisode>()
+    e.sLotRootId := array.new<int>()
+    e.sLotCat    := array.new<int>()
+    e.sLotPair   := array.new<int>()
+    e.sLotTf     := array.new<int>()
+    e.sLotLabel  := array.new<int>()
+    e.sLotSlope  := array.new<int>()
+    e.sLotConf   := array.new<int>()
+    e.activeRootId        := array.new<int>()
+    e.activeSlot          := array.new<int>()
+    e.activePrice         := array.new<float>()
+    e.activeTick          := array.new<int>()
+    e.activeCategory      := array.new<int>()
+    e.activePairKey       := array.new<int>()
+    e.activeTfCode        := array.new<int>()
+    e.activeLabelMask     := array.new<int>()
+    e.activeSlopeDir      := array.new<int>()
+    e.activeConfirmedTime := array.new<int>()
+    e.activeTaken         := array.new<int>()
+    e.tmpActRootId        := array.new<int>()
+    e.tmpActSlot          := array.new<int>()
+    e.tmpActPrice         := array.new<float>()
+    e.tmpActTick          := array.new<int>()
+    e.tmpActCategory      := array.new<int>()
+    e.tmpActPairKey       := array.new<int>()
+    e.tmpActTfCode        := array.new<int>()
+    e.tmpActLabelMask     := array.new<int>()
+    e.tmpActSlopeDir      := array.new<int>()
+    e.tmpActConfirmedTime := array.new<int>()
+    e.fvgBotTickOf         := array.new<int>()
+    e.fvgTopTickOf         := array.new<int>()
+    e.fvgBottomTicksSorted := array.new<int>()
+    e.fvgBottomOrder       := array.new<int>()
+    e.fvgTopTicksSorted    := array.new<int>()
+    e.fvgTopOrder          := array.new<int>()
+    e.fvgCandBuf           := array.new<int>()
+    e.rootToSnapshots      := map.new<int, IntBucket>()
+    e.broadRootToSnapshots := map.new<int, IntBucket>()
+    e.rootToCandidates     := map.new<int, IntBucket>()
+    e.seenSnap  := map.new<int, int>()
+    e.seenCand  := map.new<int, int>()
+    e.nodeRep   := array.new<int>()
+    e.repToComponent := map.new<int, ComponentBucket>()
+    e.compBest  := array.new<int>()
+    e.bucketPool := array.new<IntBucket>()
+    e.compPool   := array.new<ComponentBucket>()
+    e.candRefComputed := array.new<int>()
+    e.protMap := map.new<int, int>()
     e
 
 catIndexArr(ZoneEngine e, int cat) =>
@@ -1543,6 +1697,10 @@ updateFvgInverse(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
 //    10.2 stage A enumerates candidate windows from those roots and only then
 //    synthesises psychological prices around the candidate.
 // =============================================================================
+// The master ordered Point Root table. The order is exactly the previous
+// sLot order: price ascending from one array.sort_indices() call, then the
+// stable tick-tie insertion sort on Root ID. Every field scanBest() needs is
+// materialised here once, so the window scan never touches a Root UDT again.
 collectPoints(ZoneEngine e, ZoneCfg cfg) =>
     array.clear(e.sTmpA)
     array.clear(e.sTmpF)
@@ -1560,37 +1718,133 @@ collectPoints(ZoneEngine e, ZoneCfg cfg) =>
     array.clear(e.sLotSlot)
     array.clear(e.sLotPrice)
     array.clear(e.sLotTick)
+    array.clear(e.sLotRootId)
+    array.clear(e.sLotCat)
+    array.clear(e.sLotPair)
+    array.clear(e.sLotTf)
+    array.clear(e.sLotLabel)
+    array.clear(e.sLotSlope)
+    array.clear(e.sLotConf)
+    array.clear(e.sTmpB)
     int m = array.size(e.sTmpA)
     e.scratchOverflow := e.scratchOverflow or m > SCRATCH_MAX_ROOTS
     if m > 0
         array<int> ord = array.sort_indices(e.sTmpF, order.ascending)
         for i = 0 to m - 1
-            int slot = array.get(e.sTmpA, array.get(ord, i))
-            Root r = array.get(e.roots, slot)
-            array.push(e.sLotSlot, slot)
-            array.push(e.sLotPrice, r.pointPrice)
-            array.push(e.sLotTick, r.priceTick)
+            array.push(e.sTmpB, array.get(e.sTmpA, array.get(ord, i)))
         if m > 1
             for i = 1 to m - 1
                 int j = i
                 bool go = true
                 while j > 0 and go
-                    Root ra = array.get(e.roots, array.get(e.sLotSlot, j))
-                    Root rb = array.get(e.roots, array.get(e.sLotSlot, j - 1))
+                    Root ra = array.get(e.roots, array.get(e.sTmpB, j))
+                    Root rb = array.get(e.roots, array.get(e.sTmpB, j - 1))
                     if ra.priceTick == rb.priceTick and ra.rootId < rb.rootId
-                        int sTmp = array.get(e.sLotSlot, j)
-                        array.set(e.sLotSlot, j, array.get(e.sLotSlot, j - 1))
-                        array.set(e.sLotSlot, j - 1, sTmp)
-                        float pTmp = array.get(e.sLotPrice, j)
-                        array.set(e.sLotPrice, j, array.get(e.sLotPrice, j - 1))
-                        array.set(e.sLotPrice, j - 1, pTmp)
-                        int tTmp = array.get(e.sLotTick, j)
-                        array.set(e.sLotTick, j, array.get(e.sLotTick, j - 1))
-                        array.set(e.sLotTick, j - 1, tTmp)
+                        int sTmp = array.get(e.sTmpB, j)
+                        array.set(e.sTmpB, j, array.get(e.sTmpB, j - 1))
+                        array.set(e.sTmpB, j - 1, sTmp)
                         j -= 1
                     else
                         go := false
+        for i = 0 to m - 1
+            int slot = array.get(e.sTmpB, i)
+            Root r = array.get(e.roots, slot)
+            array.push(e.sLotSlot, slot)
+            array.push(e.sLotPrice, r.pointPrice)
+            array.push(e.sLotTick, r.priceTick)
+            array.push(e.sLotRootId, r.rootId)
+            array.push(e.sLotCat, r.category)
+            array.push(e.sLotPair, r.pairKey)
+            array.push(e.sLotTf, r.tfCode)
+            array.push(e.sLotLabel, r.labelMask)
+            array.push(e.sLotSlope, r.slopeDir)
+            array.push(e.sLotConf, nz(r.confirmedTime))
     m
+
+// The per Side active working set holds only the Point Roots that are still
+// unused, in the master order. Rebuilding it for a Side is exactly the old
+// "clear sUsed to 0" reset.
+resetActivePoints(ZoneEngine e) =>
+    array.clear(e.activeRootId)
+    array.clear(e.activeSlot)
+    array.clear(e.activePrice)
+    array.clear(e.activeTick)
+    array.clear(e.activeCategory)
+    array.clear(e.activePairKey)
+    array.clear(e.activeTfCode)
+    array.clear(e.activeLabelMask)
+    array.clear(e.activeSlopeDir)
+    array.clear(e.activeConfirmedTime)
+    array.clear(e.activeTaken)
+    int m = array.size(e.sLotSlot)
+    if m > 0
+        for i = 0 to m - 1
+            array.push(e.activeRootId, array.get(e.sLotRootId, i))
+            array.push(e.activeSlot, array.get(e.sLotSlot, i))
+            array.push(e.activePrice, array.get(e.sLotPrice, i))
+            array.push(e.activeTick, array.get(e.sLotTick, i))
+            array.push(e.activeCategory, array.get(e.sLotCat, i))
+            array.push(e.activePairKey, array.get(e.sLotPair, i))
+            array.push(e.activeTfCode, array.get(e.sLotTf, i))
+            array.push(e.activeLabelMask, array.get(e.sLotLabel, i))
+            array.push(e.activeSlopeDir, array.get(e.sLotSlope, i))
+            array.push(e.activeConfirmedTime, array.get(e.sLotConf, i))
+            array.push(e.activeTaken, 0)
+    m
+
+// One pass compaction after a Candidate was adopted: the Roots the Candidate
+// consumed are dropped, the rest keep their relative order. No array.remove.
+compactActivePoints(ZoneEngine e) =>
+    int m = array.size(e.activeRootId)
+    if m > 0
+        array.clear(e.tmpActRootId)
+        array.clear(e.tmpActSlot)
+        array.clear(e.tmpActPrice)
+        array.clear(e.tmpActTick)
+        array.clear(e.tmpActCategory)
+        array.clear(e.tmpActPairKey)
+        array.clear(e.tmpActTfCode)
+        array.clear(e.tmpActLabelMask)
+        array.clear(e.tmpActSlopeDir)
+        array.clear(e.tmpActConfirmedTime)
+        for i = 0 to m - 1
+            if array.get(e.activeTaken, i) == 0
+                array.push(e.tmpActRootId, array.get(e.activeRootId, i))
+                array.push(e.tmpActSlot, array.get(e.activeSlot, i))
+                array.push(e.tmpActPrice, array.get(e.activePrice, i))
+                array.push(e.tmpActTick, array.get(e.activeTick, i))
+                array.push(e.tmpActCategory, array.get(e.activeCategory, i))
+                array.push(e.tmpActPairKey, array.get(e.activePairKey, i))
+                array.push(e.tmpActTfCode, array.get(e.activeTfCode, i))
+                array.push(e.tmpActLabelMask, array.get(e.activeLabelMask, i))
+                array.push(e.tmpActSlopeDir, array.get(e.activeSlopeDir, i))
+                array.push(e.tmpActConfirmedTime, array.get(e.activeConfirmedTime, i))
+        array.clear(e.activeRootId)
+        array.clear(e.activeSlot)
+        array.clear(e.activePrice)
+        array.clear(e.activeTick)
+        array.clear(e.activeCategory)
+        array.clear(e.activePairKey)
+        array.clear(e.activeTfCode)
+        array.clear(e.activeLabelMask)
+        array.clear(e.activeSlopeDir)
+        array.clear(e.activeConfirmedTime)
+        array.clear(e.activeTaken)
+        int q = array.size(e.tmpActRootId)
+        if q > 0
+            for i = 0 to q - 1
+                array.push(e.activeRootId, array.get(e.tmpActRootId, i))
+                array.push(e.activeSlot, array.get(e.tmpActSlot, i))
+                array.push(e.activePrice, array.get(e.tmpActPrice, i))
+                array.push(e.activeTick, array.get(e.tmpActTick, i))
+                array.push(e.activeCategory, array.get(e.tmpActCategory, i))
+                array.push(e.activePairKey, array.get(e.tmpActPairKey, i))
+                array.push(e.activeTfCode, array.get(e.tmpActTfCode, i))
+                array.push(e.activeLabelMask, array.get(e.tmpActLabelMask, i))
+                array.push(e.activeSlopeDir, array.get(e.tmpActSlopeDir, i))
+                array.push(e.activeConfirmedTime, array.get(e.tmpActConfirmedTime, i))
+                array.push(e.activeTaken, 0)
+    array.size(e.activeRootId)
 
 sortedHasInt(array<int> a, int v) =>
     int lo = 0
@@ -1660,6 +1914,36 @@ fvgSideEligible(Root r, int side, ZoneCfg cfg) =>
 
 fvgProximal(Root r, int side) => side == 1 ? r.nativeTop : r.nativeBottom
 
+// Binary search boundaries on a tick sorted ascending array. Both boundaries
+// are inclusive on equal ticks; the built in search is only used to land near
+// the boundary and the short correction walk makes the result exact whatever
+// convention array.binary_search_* follows.
+sortedCountLe(array<int> a, int v) =>
+    int n = array.size(a)
+    int out = 0
+    if n > 0
+        int idx = array.binary_search_rightmost(a, v)
+        int p = idx < 0 ? -1 : idx > n - 1 ? n - 1 : idx
+        while p >= 0 and array.get(a, p) > v
+            p -= 1
+        while p + 1 <= n - 1 and array.get(a, p + 1) <= v
+            p += 1
+        out := p + 1
+    out
+
+sortedFirstGe(array<int> a, int v) =>
+    int n = array.size(a)
+    int out = n
+    if n > 0
+        int idx = array.binary_search_leftmost(a, v)
+        int p = idx < 0 ? 0 : idx > n - 1 ? n - 1 : idx
+        while p > 0 and array.get(a, p - 1) >= v
+            p -= 1
+        while p <= n - 1 and array.get(a, p) < v
+            p += 1
+        out := p
+    out
+
 buildFvgSet(ZoneEngine e, ZoneCfg cfg, int side) =>
     array.clear(e.sFvgId)
     array.clear(e.sFvgBot)
@@ -1686,7 +1970,30 @@ buildFvgSet(ZoneEngine e, ZoneCfg cfg, int side) =>
                 array.push(e.sFvgConf, r.confirmedTime)
                 array.push(e.sFvgUsed, 0)
                 array.push(e.sFvgLocal, 0)
-    array.size(e.sFvgId)
+    // Two sorted indexes over the working set, built once per Side. The order
+    // arrays carry the original working set index, so the evaluation order of
+    // the FVG loop itself is never taken from them.
+    array.clear(e.fvgBotTickOf)
+    array.clear(e.fvgTopTickOf)
+    array.clear(e.fvgBottomTicksSorted)
+    array.clear(e.fvgBottomOrder)
+    array.clear(e.fvgTopTicksSorted)
+    array.clear(e.fvgTopOrder)
+    int fm = array.size(e.sFvgId)
+    if fm > 0
+        for i = 0 to fm - 1
+            array.push(e.fvgBotTickOf, toTick(array.get(e.sFvgBot, i), cfg.mintick))
+            array.push(e.fvgTopTickOf, toTick(array.get(e.sFvgTop, i), cfg.mintick))
+        array<int> bo = array.sort_indices(e.fvgBotTickOf, order.ascending)
+        array<int> to = array.sort_indices(e.fvgTopTickOf, order.ascending)
+        for i = 0 to fm - 1
+            int bi = array.get(bo, i)
+            array.push(e.fvgBottomOrder, bi)
+            array.push(e.fvgBottomTicksSorted, array.get(e.fvgBotTickOf, bi))
+            int ti = array.get(to, i)
+            array.push(e.fvgTopOrder, ti)
+            array.push(e.fvgTopTicksSorted, array.get(e.fvgTopTickOf, ti))
+    fm
 
 // Does the common interval of FVG i with a same-direction, different timeframe
 // FVG actually cover this candidate range? Both the Broad localisation
@@ -1735,8 +2042,55 @@ fvgAugment(ZoneEngine e, ZoneCfg cfg, int side, float bot, float top, int catMas
     int cm = catMask
     int hm = hMask
     int m = array.size(e.sFvgId)
+    // Pre-filter. The evolving range always contains [bot, top] and its tick
+    // width never exceeds M, because a Proximal attachment is only accepted
+    // when the resulting width is <= limitT <= MTick and an inside attachment
+    // does not move the range at all. So an FVG can only ever be attached when
+    // fvgBottomTick <= topTick + MTick and fvgTopTick >= bottomTick - MTick.
+    // Everything outside that band is unreachable for inside, for Proximal on
+    // both Sides, and therefore for every rule that follows.
+    array.clear(e.fvgCandBuf)
     if m > 0
-        for i = 0 to m - 1
+        int mT = mTickLimit(cfg)
+        int searchBottomMax = toTick(top, cfg.mintick) + mT
+        int searchTopMin    = toTick(bot, cfg.mintick) - mT
+        int aCnt  = sortedCountLe(e.fvgBottomTicksSorted, searchBottomMax)
+        int bStart = sortedFirstGe(e.fvgTopTicksSorted, searchTopMin)
+        int bCnt  = m - bStart
+        if aCnt <= bCnt
+            if aCnt > 0
+                for p = 0 to aCnt - 1
+                    int fi = array.get(e.fvgBottomOrder, p)
+                    if array.get(e.fvgTopTickOf, fi) >= searchTopMin
+                        array.push(e.fvgCandBuf, fi)
+        else
+            if bStart <= m - 1
+                for p = bStart to m - 1
+                    int fi = array.get(e.fvgTopOrder, p)
+                    if array.get(e.fvgBotTickOf, fi) <= searchBottomMax
+                        array.push(e.fvgCandBuf, fi)
+        // Restore the original working set order: the loop below widens the
+        // range as it goes, so it must visit the surviving FVGs in exactly the
+        // ascending index order the full scan used.
+        int fc = array.size(e.fvgCandBuf)
+        if fc > 1
+            for a = 1 to fc - 1
+                int b = a
+                bool go2 = true
+                while b > 0 and go2
+                    if array.get(e.fvgCandBuf, b) < array.get(e.fvgCandBuf, b - 1)
+                        int sw = array.get(e.fvgCandBuf, b)
+                        array.set(e.fvgCandBuf, b, array.get(e.fvgCandBuf, b - 1))
+                        array.set(e.fvgCandBuf, b - 1, sw)
+                        b -= 1
+                    else
+                        go2 := false
+        e.statFvgPrefiltered += m - fc
+        e.statFvgScanned += fc
+    int fn = array.size(e.fvgCandBuf)
+    if fn > 0
+        for z = 0 to fn - 1
+            int i = array.get(e.fvgCandBuf, z)
             if array.get(e.sFvgUsed, i) == 0
                 float fb = array.get(e.sFvgBot, i)
                 float ft = array.get(e.sFvgTop, i)
@@ -1880,7 +2234,7 @@ completeCandidate(ZoneEngine e, ZoneCfg cfg, int side, float bot, float top, int
     [aBot, aTop, aCm, aHm, awT, aden, cCnt, hCnt, strong ? 1 : 0]
 
 scanBest(ZoneEngine e, ZoneCfg cfg, int side, int limitTick, bool requireStrong, bool requireFvg, bool useFvg) =>
-    int n = array.size(e.sLotSlot)
+    int n = array.size(e.activeRootId)
     int bestI = -1
     int bestJ = -1
     float bestBot = na
@@ -1899,114 +2253,117 @@ scanBest(ZoneEngine e, ZoneCfg cfg, int side, int limitTick, bool requireStrong,
     int bestId = 0
     if n > 0
         for i = 0 to n - 1
-            if array.get(e.sUsed, i) == 0
-                array.clear(e.sPairs)
-                int catMask = 0
-                int maCnt = 0
-                int maUp = 0
-                int maDn = 0
-                int maMinT = 0
-                int maMaxT = 0
-                bool swHas1h = false
-                bool swHasBoth = false
-                bool acHas4hD = false
-                int acTfMask = 0
-                int acFirstPair = 0
-                bool acMultiBox = false
-                int tmCnt = 0
-                bool tmStrongLabel = false
-                int formTime = 0
-                int minId = 0
-                int baseTick = array.get(e.sLotTick, i)
-                for j = i to n - 1
-                    if array.get(e.sUsed, j) == 1
-                        continue
-                    int wTick = array.get(e.sLotTick, j) - baseTick
-                    if wTick > limitTick
-                        break
-                    Root r = array.get(e.roots, array.get(e.sLotSlot, j))
-                    bool conflict = false
-                    int np = array.size(e.sPairs)
-                    if r.pairKey != 0 and np > 0
-                        for q = 0 to np - 1
-                            if array.get(e.sPairs, q) == r.pairKey
-                                conflict := true
-                                break
-                    if conflict
-                        break
-                    if r.pairKey != 0
-                        array.push(e.sPairs, r.pairKey)
-                        acMultiBox := acMultiBox or (acFirstPair != 0 and acFirstPair != r.pairKey)
-                        acFirstPair := acFirstPair == 0 ? r.pairKey : acFirstPair
-                    catMask := maskSet(catMask, bitPow2(r.category))
-                    int rct = nz(r.confirmedTime)
-                    formTime := rct > formTime ? rct : formTime
-                    minId := minId == 0 or r.rootId < minId ? r.rootId : minId
-                    if r.category == 0
-                        maCnt += 1
-                        maUp += r.slopeDir > 0 ? 1 : 0
-                        maDn += r.slopeDir < 0 ? 1 : 0
-                        maMinT := maMinT == 0 or r.priceTick < maMinT ? r.priceTick : maMinT
-                        maMaxT := maMaxT == 0 or r.priceTick > maMaxT ? r.priceTick : maMaxT
-                    else if r.category == 1
-                        swHas1h := swHas1h or r.tfCode >= 60
-                        swHasBoth := swHasBoth or (maskHas(r.labelMask, 1) and maskHas(r.labelMask, 2))
-                    else if r.category == 2
-                        acHas4hD := acHas4hD or r.tfCode >= 240
-                        acTfMask := maskSet(acTfMask, bitPow2(r.tfCode == 60 ? 0 : r.tfCode == 240 ? 1 : 2))
-                    else if r.category == 3
-                        tmCnt += 1
-                        tmStrongLabel := tmStrongLabel or maskHas(r.labelMask, 8) or maskHas(r.labelMask, 16) or maskHas(r.labelMask, 32)
-                    int hMaskNoMa = 0
-                    hMaskNoMa := swHas1h or swHasBoth ? maskSet(hMaskNoMa, 2) : hMaskNoMa
-                    hMaskNoMa := acHas4hD or (acMultiBox and popCount6(acTfMask) >= 2) ? maskSet(hMaskNoMa, 4) : hMaskNoMa
-                    hMaskNoMa := tmStrongLabel or tmCnt >= 2 ? maskSet(hMaskNoMa, 8) : hMaskNoMa
-                    int maGap = maCnt == 2 ? maMaxT - maMinT : 0
-                    float wBot = array.get(e.sLotPrice, i)
-                    float wTop = array.get(e.sLotPrice, j)
-                    int pv = psychVariants(e, cfg, wBot, wTop, limitTick)
-                    for vi = 0 to pv
-                        float vBot = vi == 0 ? wBot : array.get(e.sPsyBot, vi - 1)
-                        float vTop = vi == 0 ? wTop : array.get(e.sPsyTop, vi - 1)
-                        int vCm = vi == 0 ? catMask : maskSet(catMask, 32)
-                        [aBot, aTop, aCm, aHm, awT, aden, cCnt, hCnt, strongI] =
-                             completeCandidate(e, cfg, side, vBot, vTop, vCm, hMaskNoMa, maCnt, maUp, maDn, maGap, useFvg)
-                        bool okStrong = not requireStrong or strongI == 1
-                        bool okFvg = not requireFvg or maskHas(aCm, 16)
-                        if okStrong and okFvg
-                            int aFt = formTime
-                            int aId = minId
-                            int an = array.size(e.sAttach)
-                            if an > 0
-                                for q = 0 to an - 1
-                                    int fi = array.get(e.sAttach, q)
-                                    int fct = nz(array.get(e.sFvgConf, fi))
-                                    aFt := fct > aFt ? fct : aFt
-                                    int fid = array.get(e.sFvgId, fi)
-                                    aId := fid < aId ? fid : aId
-                            bool better = cCnt > bestC
-                            better := better or (cCnt == bestC and hCnt > bestH)
-                            better := better or (cCnt == bestC and hCnt == bestH and awT < bestW)
-                            better := better or (cCnt == bestC and hCnt == bestH and awT == bestW and aFt < bestT)
-                            better := better or (cCnt == bestC and hCnt == bestH and awT == bestW and aFt == bestT and aId < bestId)
-                            if bestI < 0 or better
-                                bestI := i
-                                bestJ := j
-                                bestBot := vBot
-                                bestTop := vTop
-                                bestCm := vCm
-                                bestHm := hMaskNoMa
-                                bestMaCnt := maCnt
-                                bestMaUp := maUp
-                                bestMaDn := maDn
-                                bestMaGap := maGap
-                                bestPsych := vi == 0 ? 0 : 1
-                                bestC := cCnt
-                                bestH := hCnt
-                                bestW := awT
-                                bestT := aFt
-                                bestId := aId
-                        e.statWindowEvals += 1
+            array.clear(e.sPairs)
+            int catMask = 0
+            int maCnt = 0
+            int maUp = 0
+            int maDn = 0
+            int maMinT = 0
+            int maMaxT = 0
+            bool swHas1h = false
+            bool swHasBoth = false
+            bool acHas4hD = false
+            int acTfMask = 0
+            int acFirstPair = 0
+            bool acMultiBox = false
+            int tmCnt = 0
+            bool tmStrongLabel = false
+            int formTime = 0
+            int minId = 0
+            int baseTick = array.get(e.activeTick, i)
+            for j = i to n - 1
+                int jTick = array.get(e.activeTick, j)
+                int wTick = jTick - baseTick
+                if wTick > limitTick
+                    break
+                int jRid   = array.get(e.activeRootId, j)
+                int jCat   = array.get(e.activeCategory, j)
+                int jPair  = array.get(e.activePairKey, j)
+                int jTf    = array.get(e.activeTfCode, j)
+                int jLabel = array.get(e.activeLabelMask, j)
+                int jSlope = array.get(e.activeSlopeDir, j)
+                int jConf  = array.get(e.activeConfirmedTime, j)
+                bool conflict = false
+                int np = array.size(e.sPairs)
+                if jPair != 0 and np > 0
+                    for q = 0 to np - 1
+                        if array.get(e.sPairs, q) == jPair
+                            conflict := true
+                            break
+                if conflict
+                    break
+                if jPair != 0
+                    array.push(e.sPairs, jPair)
+                    acMultiBox := acMultiBox or (acFirstPair != 0 and acFirstPair != jPair)
+                    acFirstPair := acFirstPair == 0 ? jPair : acFirstPair
+                catMask := maskSet(catMask, bitPow2(jCat))
+                formTime := jConf > formTime ? jConf : formTime
+                minId := minId == 0 or jRid < minId ? jRid : minId
+                if jCat == 0
+                    maCnt += 1
+                    maUp += jSlope > 0 ? 1 : 0
+                    maDn += jSlope < 0 ? 1 : 0
+                    maMinT := maMinT == 0 or jTick < maMinT ? jTick : maMinT
+                    maMaxT := maMaxT == 0 or jTick > maMaxT ? jTick : maMaxT
+                else if jCat == 1
+                    swHas1h := swHas1h or jTf >= 60
+                    swHasBoth := swHasBoth or (maskHas(jLabel, 1) and maskHas(jLabel, 2))
+                else if jCat == 2
+                    acHas4hD := acHas4hD or jTf >= 240
+                    acTfMask := maskSet(acTfMask, bitPow2(jTf == 60 ? 0 : jTf == 240 ? 1 : 2))
+                else if jCat == 3
+                    tmCnt += 1
+                    tmStrongLabel := tmStrongLabel or maskHas(jLabel, 8) or maskHas(jLabel, 16) or maskHas(jLabel, 32)
+                int hMaskNoMa = 0
+                hMaskNoMa := swHas1h or swHasBoth ? maskSet(hMaskNoMa, 2) : hMaskNoMa
+                hMaskNoMa := acHas4hD or (acMultiBox and popCount6(acTfMask) >= 2) ? maskSet(hMaskNoMa, 4) : hMaskNoMa
+                hMaskNoMa := tmStrongLabel or tmCnt >= 2 ? maskSet(hMaskNoMa, 8) : hMaskNoMa
+                int maGap = maCnt == 2 ? maMaxT - maMinT : 0
+                float wBot = array.get(e.activePrice, i)
+                float wTop = array.get(e.activePrice, j)
+                int pv = psychVariants(e, cfg, wBot, wTop, limitTick)
+                for vi = 0 to pv
+                    float vBot = vi == 0 ? wBot : array.get(e.sPsyBot, vi - 1)
+                    float vTop = vi == 0 ? wTop : array.get(e.sPsyTop, vi - 1)
+                    int vCm = vi == 0 ? catMask : maskSet(catMask, 32)
+                    [aBot, aTop, aCm, aHm, awT, aden, cCnt, hCnt, strongI] =
+                         completeCandidate(e, cfg, side, vBot, vTop, vCm, hMaskNoMa, maCnt, maUp, maDn, maGap, useFvg)
+                    bool okStrong = not requireStrong or strongI == 1
+                    bool okFvg = not requireFvg or maskHas(aCm, 16)
+                    if okStrong and okFvg
+                        int aFt = formTime
+                        int aId = minId
+                        int an = array.size(e.sAttach)
+                        if an > 0
+                            for q = 0 to an - 1
+                                int fi = array.get(e.sAttach, q)
+                                int fct = nz(array.get(e.sFvgConf, fi))
+                                aFt := fct > aFt ? fct : aFt
+                                int fid = array.get(e.sFvgId, fi)
+                                aId := fid < aId ? fid : aId
+                        bool better = cCnt > bestC
+                        better := better or (cCnt == bestC and hCnt > bestH)
+                        better := better or (cCnt == bestC and hCnt == bestH and awT < bestW)
+                        better := better or (cCnt == bestC and hCnt == bestH and awT == bestW and aFt < bestT)
+                        better := better or (cCnt == bestC and hCnt == bestH and awT == bestW and aFt == bestT and aId < bestId)
+                        if bestI < 0 or better
+                            bestI := i
+                            bestJ := j
+                            bestBot := vBot
+                            bestTop := vTop
+                            bestCm := vCm
+                            bestHm := hMaskNoMa
+                            bestMaCnt := maCnt
+                            bestMaUp := maUp
+                            bestMaDn := maDn
+                            bestMaGap := maGap
+                            bestPsych := vi == 0 ? 0 : 1
+                            bestC := cCnt
+                            bestH := hCnt
+                            bestW := awT
+                            bestT := aFt
+                            bestId := aId
+                    e.statWindowEvals += 1
     [bestI, bestJ, bestBot, bestTop, bestCm, bestHm, bestMaCnt, bestMaUp, bestMaDn, bestMaGap, bestPsych]
 
 // Adoption: only now is per candidate data materialised. The completion is
@@ -2019,11 +2376,9 @@ adoptWindow(ZoneEngine e, ZoneCfg cfg, int side, int i, int j, float wBot, float
     int start = array.size(e.candRootIds)
     int len = 0
     for k = i to j
-        if array.get(e.sUsed, k) == 0
-            Root r = array.get(e.roots, array.get(e.sLotSlot, k))
-            array.push(e.candRootIds, r.rootId)
-            array.set(e.sUsed, k, 1)
-            len += 1
+        array.push(e.candRootIds, array.get(e.activeRootId, k))
+        array.set(e.activeTaken, k, 1)
+        len += 1
     if psychJoins != 0
         int pn = collectPsychRoots(e, cfg, wBot, wTop)
         if pn > 0
@@ -2052,6 +2407,7 @@ adoptWindow(ZoneEngine e, ZoneCfg cfg, int side, int i, int j, float wBot, float
     array.push(e.candCatMask, aCm)
     array.push(e.candHighMask, aHm)
     array.push(e.candRefPrice, na)
+    array.push(e.candRefComputed, 0)
     array.push(e.candBroadCtx, 0)
     int fTime = 0
     int mId = 0
@@ -2064,6 +2420,8 @@ adoptWindow(ZoneEngine e, ZoneCfg cfg, int side, int i, int j, float wBot, float
     array.push(e.candFormTime, fTime)
     array.push(e.candMinId, mId)
     e.statCandidates += 1
+    compactActivePoints(e)
+    0
 
 // Stage B, steps 3-5: same-direction real overlap, FVG standalone, Broad
 // context. A Broad FVG that never localised keeps its whole NativeRange as a
@@ -2108,6 +2466,7 @@ fvgStandalone(ZoneEngine e, ZoneCfg cfg, int side) =>
                 array.push(e.candCatMask, 16)
                 array.push(e.candHighMask, fvgHigh ? 16 : 0)
                 array.push(e.candRefPrice, na)
+                array.push(e.candRefComputed, 0)
                 array.push(e.candBroadCtx, broadCtx ? 1 : 0)
                 int fTime2 = 0
                 int mId2 = 0
@@ -2183,17 +2542,14 @@ buildCandidates(ZoneEngine e, ZoneCfg cfg) =>
     array.clear(e.candCatMask)
     array.clear(e.candHighMask)
     array.clear(e.candRefPrice)
+    array.clear(e.candRefComputed)
     array.clear(e.candBroadCtx)
     array.clear(e.candFormTime)
     array.clear(e.candMinId)
-    int n = array.size(e.sLotSlot)
     for si = 0 to 1
         int side = si == 0 ? 1 : -1
-        array.clear(e.sUsed)
+        resetActivePoints(e)
         array.clear(e.sPsyUsed)
-        if n > 0
-            for i = 0 to n - 1
-                array.push(e.sUsed, 0)
         buildFvgSet(e, cfg, side)
         // --- stage A: dense Base Strong cores ------------------------------
         bool more = true
@@ -2225,11 +2581,7 @@ buildCandidates(ZoneEngine e, ZoneCfg cfg) =>
                 more := false
             else
                 adoptWindow(e, cfg, side, bi, bj, bBot, bTop, bCm, bHm, bMaC, bMaU, bMaD, bMaG, bPsy, false)
-    int kn = array.size(e.candSide)
-    if kn > 0
-        for k = 0 to kn - 1
-            computeRefPrice(e, cfg, k)
-    kn
+    array.size(e.candSide)
 
 // =============================================================================
 // 11. Core association - fully order independent (spec 12.1 / 12.2 / 12.3)
@@ -2384,6 +2736,12 @@ applyCandidate(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int k, BaseFeed f) =>
                 fvgStateMask := maskSet(fvgStateMask, bitPow2(r.state))
     sv.effectiveBottom := array.get(e.candBottom, k)
     sv.effectiveTop := array.get(e.candTop, k)
+    // Reference price is display only, so it is computed once, here, and only
+    // for a Candidate that actually reaches a Live Side.
+    if array.get(e.candRefComputed, k) == 0
+        computeRefPrice(e, cfg, k)
+        array.set(e.candRefComputed, k, 1)
+        e.statRefPriceCalls += 1
     sv.referencePrice := array.get(e.candRefPrice, k)
     sv.cCount := array.get(e.candC, k)
     sv.hCount := array.get(e.candH, k)
@@ -2541,6 +2899,58 @@ pruneEpisodesToRange(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
     0
 
 // ---------------------------------------------------------------------------
+// 11.1b Pooled reverse index buckets. The pool grows once and is reused, so a
+//       steady state bar allocates no arrays and no maps for the association.
+// ---------------------------------------------------------------------------
+resetBucketPool(ZoneEngine e) =>
+    e.bucketUsed := 0
+    map.clear(e.rootToSnapshots)
+    map.clear(e.broadRootToSnapshots)
+    map.clear(e.rootToCandidates)
+    map.clear(e.seenSnap)
+    map.clear(e.seenCand)
+    0
+
+acquireBucket(ZoneEngine e) =>
+    if e.bucketUsed >= array.size(e.bucketPool)
+        array.push(e.bucketPool, IntBucket.new(values = array.new<int>()))
+    IntBucket b = array.get(e.bucketPool, e.bucketUsed)
+    e.bucketUsed += 1
+    array.clear(b.values)
+    b
+
+bucketPut(ZoneEngine e, map<int, IntBucket> mp, int key, int value) =>
+    IntBucket b = na
+    if map.contains(mp, key)
+        b := map.get(mp, key)
+    if na(b)
+        b := acquireBucket(e)
+        map.put(mp, key, b)
+    array.push(b.values, value)
+    0
+
+resetComponentPool(ZoneEngine e) =>
+    e.compPoolUsed := 0
+    map.clear(e.repToComponent)
+    0
+
+acquireComponent(ZoneEngine e, int rep) =>
+    if e.compPoolUsed >= array.size(e.compPool)
+        array.push(e.compPool, ComponentBucket.new(candidates = array.new<int>(), snapshots = array.new<int>()))
+    ComponentBucket cb = array.get(e.compPool, e.compPoolUsed)
+    e.compPoolUsed += 1
+    cb.rep := rep
+    cb.minCoreId := 2147483647
+    cb.bestCandidate := -1
+    array.clear(cb.candidates)
+    array.clear(cb.snapshots)
+    cb
+
+rootIsBroadFvg(ZoneEngine e, int rid) =>
+    Root r = rootOf(e, rid)
+    not na(r) and r.category == 4 and r.isBroadFvg
+
+// ---------------------------------------------------------------------------
 // 11.2 Phase 1: immutable snapshot of the live Cores
 // ---------------------------------------------------------------------------
 snapshotCores(ZoneEngine e) =>
@@ -2570,6 +2980,26 @@ snapshotCores(ZoneEngine e) =>
                 array.push(e.snapBroadCtx, c.isBroadContextCore ? 1 : 0)
                 array.push(e.snapActive, coreHasActiveTouch(c) ? 1 : 0)
     array.size(e.snapCoreIdx)
+
+// Root -> Snapshot reverse index. candMatchesSnap() can only be true when the
+// Candidate and the Snapshot share an identity Root whose Broad FVG nature
+// equals the Candidate's Broad context flag, so only those Roots are indexed.
+buildSnapshotIndex(ZoneEngine e) =>
+    int sn = array.size(e.snapCoreIdx)
+    if sn > 0
+        for si = 0 to sn - 1
+            bool bctx = array.get(e.snapBroadCtx, si) == 1
+            int os = array.get(e.snapOriginStart, si)
+            int ol = array.get(e.snapOriginLen, si)
+            if ol > 0
+                for q = os to os + ol - 1
+                    int rid = array.get(e.snapOrigins, q)
+                    if rootIsBroadFvg(e, rid) == bctx
+                        if bctx
+                            bucketPut(e, e.broadRootToSnapshots, rid, si)
+                        else
+                            bucketPut(e, e.rootToSnapshots, rid, si)
+    sn
 
 candIsBroadContext(ZoneEngine e, int k) =>
     array.get(e.candBroadCtx, k) == 1
@@ -2767,65 +3197,129 @@ associateCandidates(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
             c.supportView.history.everUsed := c.supportView.history.everUsed or not na(c.supportView.effectiveBottom)
             c.resistanceView.history.everUsed := c.resistanceView.history.everUsed or not na(c.resistanceView.effectiveBottom)
     // --- Phase 2 / 3: match against the snapshot, then components ----------
+    // Both graph passes are driven from Root reverse indexes. A Candidate and a
+    // Snapshot, or two Candidates, can only be joined when they share an
+    // identity Root, so a pair without a shared Root can never produce an edge
+    // and is not examined. Every pair that does share one is still decided by
+    // the unchanged candMatchesSnap() / candSharesWithCand() predicates.
+    resetBucketPool(e)
+    buildSnapshotIndex(e)
     array.clear(e.ufParent)
     if total > 0
         for i = 0 to total - 1
             array.push(e.ufParent, i)
     if kn > 0 and sn > 0
         for k = 0 to kn - 1
-            for si = 0 to sn - 1
-                if candMatchesSnap(e, cfg, k, si)
-                    e.statCoreMatches += 1
-                    ufUnion(e, k, kn + si)
+            bool bctx = candIsBroadContext(e, k)
+            int st = array.get(e.candStart, k)
+            int ln = array.get(e.candLen, k)
+            if ln > 0
+                for q = st to st + ln - 1
+                    int rid = array.get(e.candRootIds, q)
+                    if rootIsBroadFvg(e, rid) == bctx
+                        IntBucket bk = na
+                        if bctx
+                            if map.contains(e.broadRootToSnapshots, rid)
+                                bk := map.get(e.broadRootToSnapshots, rid)
+                        else
+                            if map.contains(e.rootToSnapshots, rid)
+                                bk := map.get(e.rootToSnapshots, rid)
+                        if not na(bk)
+                            int bs = array.size(bk.values)
+                            if bs > 0
+                                for z = 0 to bs - 1
+                                    int si = array.get(bk.values, z)
+                                    bool seen = map.contains(e.seenSnap, si) and map.get(e.seenSnap, si) == k
+                                    if not seen
+                                        map.put(e.seenSnap, si, k)
+                                        e.statSnapChecks += 1
+                                        if candMatchesSnap(e, cfg, k, si)
+                                            e.statCoreMatches += 1
+                                            ufUnion(e, k, kn + si)
     if kn > 1
-        for k1 = 0 to kn - 2
-            for k2 = k1 + 1 to kn - 1
-                if candSharesWithCand(e, cfg, k1, k2)
-                    ufUnion(e, k1, k2)
-    // component representatives in a canonical order: lowest old Core ID first,
-    // then, for components without an old Core, the best Candidate
-    array.clear(e.compRep)
-    array.clear(e.compMinCore)
+        for k = 0 to kn - 1
+            int st = array.get(e.candStart, k)
+            int ln = array.get(e.candLen, k)
+            if ln > 0
+                for q = st to st + ln - 1
+                    int rid = array.get(e.candRootIds, q)
+                    if not rootIsBroadFvg(e, rid) and map.contains(e.rootToCandidates, rid)
+                        IntBucket bk = map.get(e.rootToCandidates, rid)
+                        int bs = array.size(bk.values)
+                        if bs > 0
+                            for z = 0 to bs - 1
+                                int k2 = array.get(bk.values, z)
+                                bool seen = map.contains(e.seenCand, k2) and map.get(e.seenCand, k2) == k
+                                if not seen
+                                    map.put(e.seenCand, k2, k)
+                                    e.statPairChecks += 1
+                                    if candSharesWithCand(e, cfg, k2, k)
+                                        ufUnion(e, k2, k)
+                for q = st to st + ln - 1
+                    int rid = array.get(e.candRootIds, q)
+                    if not rootIsBroadFvg(e, rid)
+                        bucketPut(e, e.rootToCandidates, rid, k)
+    // Every node resolves its final representative exactly once; nothing below
+    // calls ufFind() again.
+    array.clear(e.nodeRep)
     if total > 0
         for i = 0 to total - 1
-            int r = ufFind(e, i)
-            if not array.includes(e.compRep, r)
-                array.push(e.compRep, r)
-                array.push(e.compMinCore, 2147483647)
+            array.push(e.nodeRep, ufFind(e, i))
+    // component representatives in a canonical order: lowest old Core ID first,
+    // then, for components without an old Core, the best Candidate. Components
+    // are built from one node pass, not by re-scanning every Candidate and
+    // Snapshot per component.
+    resetComponentPool(e)
+    array.clear(e.compRep)
+    array.clear(e.compMinCore)
+    array.clear(e.compBest)
+    if total > 0
+        for i = 0 to total - 1
+            int rp = array.get(e.nodeRep, i)
+            ComponentBucket cb = na
+            if map.contains(e.repToComponent, rp)
+                cb := map.get(e.repToComponent, rp)
+            if na(cb)
+                cb := acquireComponent(e, rp)
+                map.put(e.repToComponent, rp, cb)
+                array.push(e.compRep, rp)
+            if i < kn
+                array.push(cb.candidates, i)
+                if cb.bestCandidate < 0 or candBetter(e, cfg, i, cb.bestCandidate)
+                    cb.bestCandidate := i
+            else
+                int si2 = i - kn
+                array.push(cb.snapshots, si2)
+                ZoneCore cSnap = array.get(e.cores, array.get(e.snapCoreIdx, si2))
+                if cSnap.coreId < cb.minCoreId
+                    cb.minCoreId := cSnap.coreId
     int rn = array.size(e.compRep)
-    if rn > 0 and sn > 0
-        for si = 0 to sn - 1
-            int r = ufFind(e, kn + si)
-            int at = array.indexof(e.compRep, r)
-            ZoneCore c = array.get(e.cores, array.get(e.snapCoreIdx, si))
-            if at >= 0 and c.coreId < array.get(e.compMinCore, at)
-                array.set(e.compMinCore, at, c.coreId)
+    if rn > 0
+        for i = 0 to rn - 1
+            ComponentBucket cb2 = map.get(e.repToComponent, array.get(e.compRep, i))
+            array.push(e.compMinCore, cb2.minCoreId)
+            array.push(e.compBest, cb2.bestCandidate)
     if rn > 1
         for i = 1 to rn - 1
             int j = i
             bool go = true
             while j > 0 and go
-                int ra = array.get(e.compRep, j)
-                int rb = array.get(e.compRep, j - 1)
                 int ma = array.get(e.compMinCore, j)
                 int mb = array.get(e.compMinCore, j - 1)
+                int ba = array.get(e.compBest, j)
+                int bb = array.get(e.compBest, j - 1)
                 bool swap = ma < mb
                 if ma == mb and ma == 2147483647
-                    int ba = -1
-                    int bb = -1
-                    if kn > 0
-                        for k = 0 to kn - 1
-                            int rr = ufFind(e, k)
-                            if rr == ra and (ba < 0 or candBetter(e, cfg, k, ba))
-                                ba := k
-                            if rr == rb and (bb < 0 or candBetter(e, cfg, k, bb))
-                                bb := k
                     swap := ba >= 0 and bb >= 0 and candBetter(e, cfg, ba, bb)
                 if swap
+                    int ra = array.get(e.compRep, j)
+                    int rb = array.get(e.compRep, j - 1)
                     array.set(e.compRep, j, rb)
                     array.set(e.compRep, j - 1, ra)
                     array.set(e.compMinCore, j, mb)
                     array.set(e.compMinCore, j - 1, ma)
+                    array.set(e.compBest, j, bb)
+                    array.set(e.compBest, j - 1, ba)
                     j -= 1
                 else
                     go := false
@@ -2834,14 +3328,16 @@ associateCandidates(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
     if rn > 0
         for ri = 0 to rn - 1
             int rep = array.get(e.compRep, ri)
+            ComponentBucket cbk = map.get(e.repToComponent, rep)
             // snapshots of this component, ordered by Core ID
             array.clear(e.compSnapBuf)
             bool anyActive = false
-            if sn > 0
-                for si = 0 to sn - 1
-                    if ufFind(e, kn + si) == rep
-                        array.push(e.compSnapBuf, si)
-                        anyActive := anyActive or array.get(e.snapActive, si) == 1
+            int csn = array.size(cbk.snapshots)
+            if csn > 0
+                for z = 0 to csn - 1
+                    int si = array.get(cbk.snapshots, z)
+                    array.push(e.compSnapBuf, si)
+                    anyActive := anyActive or array.get(e.snapActive, si) == 1
             int cs = array.size(e.compSnapBuf)
             if cs > 1
                 for i = 1 to cs - 1
@@ -2859,10 +3355,10 @@ associateCandidates(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
                             go := false
             // candidates of this component, in canonical competition order
             array.clear(e.orderBuf)
-            if kn > 0
-                for k = 0 to kn - 1
-                    if ufFind(e, k) == rep
-                        array.push(e.orderBuf, k)
+            int ckn = array.size(cbk.candidates)
+            if ckn > 0
+                for z = 0 to ckn - 1
+                    array.push(e.orderBuf, array.get(cbk.candidates, z))
             int ck = array.size(e.orderBuf)
             if ck > 1
                 for i = 1 to ck - 1
@@ -3340,7 +3836,8 @@ finalizeSide(ZoneEngine e, ZoneCfg cfg, BaseFeed f, ZoneCore c, SideViewState sv
 //      considered when no unprotected Dormant Core exists at all. When only
 //      protected items remain above the limit nothing is deleted silently.
 buildProtectedSet(ZoneEngine e) =>
-    map<int, int> prot = map.new<int, int>()
+    map<int, int> prot = e.protMap
+    map.clear(prot)
     int cn = array.size(e.cores)
     if cn > 0
         for i = 0 to cn - 1
@@ -3547,6 +4044,11 @@ export update(ZoneEngine e, ZoneCfg cfg, BaseFeed bf, MaPack ma,
         e.statCandidates := 0
         e.statDeferred := 0
         e.statComponents := 0
+        e.statFvgPrefiltered := 0
+        e.statFvgScanned := 0
+        e.statPairChecks := 0
+        e.statSnapChecks := 0
+        e.statRefPriceCalls := 0
         // --- facts that outrank later structure changes --------------------
         markFvgInvalidation(e, cfg, bf, fv1, e.lastFvg1hSrcClose)
         markFvgInvalidation(e, cfg, bf, fv4, e.lastFvg4hSrcClose)
@@ -3661,6 +4163,11 @@ export statDeferred(ZoneEngine e) => e.statDeferred
 export statComponents(ZoneEngine e) => e.statComponents
 export statOwnerConflict(ZoneEngine e) => e.statOwnerConflict
 export statPendingHold(ZoneEngine e) => e.statPendingHold
+export statFvgPrefiltered(ZoneEngine e) => e.statFvgPrefiltered
+export statFvgScanned(ZoneEngine e)     => e.statFvgScanned
+export statPairChecks(ZoneEngine e)     => e.statPairChecks
+export statSnapChecks(ZoneEngine e)     => e.statSnapChecks
+export statRefPriceCalls(ZoneEngine e)  => e.statRefPriceCalls
 export maSlopeText(ZoneEngine e) =>
     string s = ""
     int n = array.size(e.idxMa)

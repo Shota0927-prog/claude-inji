@@ -405,9 +405,10 @@ P・Q（片Side CoreのEpisode prune / Split後の無関係履歴復活なし）
 | 検証 | 状態 |
 |---|---|
 | Pineコンパイル | **NOT RUN** |
+| RE10110（実行時間超過）の解消 | **NOT RUN** |
 | 実チャート実行（XAUUSD 5分足） | **NOT RUN** |
 | Profiler | **NOT RUN** |
-| 実行時間（40秒制限に対する0.5L=20秒目標） | **NOT RUN** |
+| Runtime < 40 sec | **NOT RUN** |
 | 付録B 75ケース | **全件 NOT RUN** |
 | M15重点ケース | **全件 NOT RUN** |
 | Bar Replay | **NOT RUN** |
@@ -758,7 +759,7 @@ CoreID / GenerationID / Side、Phase | Grade、Range / Reference、C / H / Densi
 Current または Upcoming Touch、WeakReason / MaxDepth、ZoneFresh / SideFresh、
 FVG direction / Fresh count / state（＋BROAD CONTEXT）、Category summary（Highは`(H)`）、Root summary。
 
-### Debug table（18行）
+### Debug table（20行）
 
 build ID / config validation / 最終Base足時刻＋seq / 採用した1m MA元足時刻 /
 採用したFVG元足時刻（1H・4H・日）/ 採用したAccum確定時刻（1H・4H・日）/
@@ -807,6 +808,314 @@ Debug表の時刻も同じ`i_tz`で表示します。
   全Cfg範囲で不変）の1件だけです。
 - 次はTradingView実機検証（9章の手順）です。
 
+## 12. 構造最適化（改訂7・結果不変）
+
+目的は **RE10110（実行時間超過）の解消**のみで、Zone仕様・判定結果は一切変更していません。
+履歴bar削減・直近N本限定・Root/FVG/Zone上限削減・カテゴリ削減・探索回数上限・timeout回避break・近似・
+M変更・初期値変更・仕様条件削除は **すべて0件** です。変更したのは「同じ結果に到達するまでの計算方法」だけです。
+
+| 禁止項目 | 件数 |
+|---|---:|
+| 履歴bar skip | **0** |
+| 直近N本限定 | **0** |
+| Root / FVG / Zone / カテゴリ上限の削減 | **0** |
+| 探索回数上限・打切りbreak | **0** |
+| 近似（median近似を含む） | **0** |
+| M・初期値・仕様条件の変更 | **0** |
+
+---
+
+### 12.1 Point Root working setのcompact化（指示1）
+
+| | 旧 | 新 |
+|---|---|---|
+| 保持 | `sLotSlot` / `sLotPrice` / `sLotTick` ＋ `sUsed` フラグ | `activeRootId` / `activeSlot` / `activePrice` / `activeTick` / `activeCategory` / `activePairKey` / `activeTfCode` / `activeLabelMask` / `activeSlopeDir` / `activeConfirmedTime` |
+| `scanBest()`の走査対象 | 採用済みRootを含む全Root（`sUsed`で毎回skip） | 未使用Rootのみ |
+| 採用後の除去 | `sUsed[k] := 1`（配列長は不変） | `compactActivePoints()` 1回 |
+
+`collectPoints()` は master table（`sLotRootId` / `sLotCat` / `sLotPair` / `sLotTf` / `sLotLabel` / `sLotSlope` / `sLotConf`）を
+**bar内で1回だけ**作ります。順序は旧 `sLot` と完全一致で、`array.sort_indices()` による価格昇順 1回 ＋
+同tick時のRoot ID昇順 stable insertion sort（比較式は旧コードのまま）です。
+
+`resetActivePoints()` は master をそのままコピーするだけで、旧 `array.clear(e.sUsed)` ＋ 全要素0 push と等価です。
+Support評価の終了後に再構築し、Resistanceを独立に評価します。Psych / FVG はこの配列に入れません。
+
+`compactActivePoints()` は `array.remove` を使わず、
+**未採用Rootをtmp parallel arraysへ元順序のまま1回コピー → active clear → 戻す**、の1パスです。
+Stage A → B → C は同Sideの同じactive setを引き継ぎます。
+
+**結果不変の理由**：旧 `scanBest()` の内側ループは `sUsed[j]==1` を `continue` で読み飛ばしていたので、
+実際に評価された j の列は「未使用Rootの列」そのものです。compact後のactive配列はその列と
+Root ID・価格順まで一致します（下の機械検証で20,000試行・不一致0）。
+
+---
+
+### 12.2 scanBest内のRoot UDT lookup全廃（指示2）
+
+inner loopの `rootOf()` と `array.get(e.roots, ...)` を **0回** にしました。
+`r.pairKey` / `r.category` / `r.confirmedTime` / `r.rootId` / `r.slopeDir` / `r.priceTick` / `r.tfCode` / `r.labelMask`
+はすべて `active*` parallel arrayから読みます（`activeConfirmedTime` は master生成時に `nz()` 済み＝旧 `int rct = nz(r.confirmedTime)` と同値）。
+
+Root UDT取得はCandidate採用後（`adoptWindow()` 末尾の formTime / minId 再計算、`applyCandidate()`、`computeRefPrice()`）
+だけに残しています。
+
+| 位置 | 旧 lookup回数 | 新 |
+|---|---|---|
+| `scanBest()` inner loop | 窓評価ごとに1回 | **0** |
+| `adoptWindow()` の採用Root列挙 | 採用Rootごとに1回 | **0**（`activeRootId` から直接） |
+
+---
+
+### 12.3 greedy意味の維持（指示3）
+
+`i` → `j` を右へ進める → 幅超過で即 `break`、Accum pair conflictで `break`、という意味は変更していません。
+comparator（C降順 / H降順 / Effective幅昇順 / 成立時刻昇順 / Root ID昇順）も、
+`scanBest()` 内の `better` 連鎖も `candBetter()` も**1文字も変えていません**。
+「Candidate採用 → active set compact → 再度 `scanBest()`」というgreedy順序も同じです。
+全Candidateを一括生成してsortする方式は採用していません。
+
+---
+
+### 12.4 Psych検索範囲（指示4）
+
+`sPsyUsed` によるownership仕様は変更なし。
+`psychVariants()` は `floor((bot - M) / 50)` 〜 `ceil((top + M) / 50)` のlevel範囲だけを走査し、
+各levelを `slotOf(e, psychIdOfLevel(lvl))`（ID直引き）で確認します。
+`collectPsychRoots()` も `floor(bot / 50)` 〜 `ceil(top / 50)` のlevelを直接計算します。
+**Psych Root配列の全走査は0件**（`e.idxPsych` を走査するのは `syncPsych()` の生成・失効処理だけで、Candidate評価経路にはありません）。
+
+---
+
+### 12.5 FVGの2 sorted index（指示5）
+
+`buildFvgSet()` がSideごとに**1回だけ**次を作ります。
+
+- `fvgBotTickOf` / `fvgTopTickOf`（working set index → tick）
+- `fvgBottomTicksSorted` ＋ `fvgBottomOrder`
+- `fvgTopTicksSorted` ＋ `fvgTopOrder`
+
+sortはSideあたり bottom 1回 / top 1回のみ。Candidateごとのsortはしていません。
+
+`fvgAugment()` は Candidate範囲から
+
+```
+searchBottomMax = candidateTopTick    + MTick
+searchTopMin    = candidateBottomTick - MTick
+```
+
+を計算し、専用helper `sortedCountLe()` / `sortedFirstGe()`（`array.binary_search_rightmost` /
+`array.binary_search_leftmost` を起点に、同値境界をtick単位でinclusiveに補正）で
+
+- A：`bottomTick <= searchBottomMax` を満たす prefix
+- B：`topTick >= searchTopMin` を満たす suffix
+
+を求め、**件数の少ない側だけ**を走査します。A側走査時は `fvgTopTick >= searchTopMin` を、
+B側走査時は `fvgBottomTick <= searchBottomMax` を必ず追加確認するので、
+最終集合は常に完全intersection `fvgBottom <= candidateTop + M AND fvgTop >= candidateBottom - M` です。
+
+**結果不変の理由（証明）**：`fvgAugment()` の評価中レンジ `[nb, nt]` は
+
+1. `inside` 経路ではレンジを動かさない
+2. `prox` 経路は `wT <= limitT`（`limitT` は `denseTickLimit` または `mTickLimit`、いずれも `<= MTick`）を満たすときだけ採用され、
+   side==1 では下方向、side==-1 では上方向にしか広がらない
+
+ため、常に初期 `[bot, top]` を含み、tick幅は `MTick` を超えません。
+したがって attach され得るFVGは必ず
+
+- inside：`fbT <= ntT <= botT + MTick` かつ `ftT >= nbT >= topT - MTick >= botT - MTick`
+- prox(side=1)：`ftT < nbT <= botT` かつ `ftT >= ntT - MTick >= botT - MTick`
+- prox(side=-1)：`fbT > ntT >= topT` かつ `fbT <= nbT + MTick <= topT + MTick`
+
+を満たし、pre-filterの帯の外にあるFVGは **inside でも prox でも到達不能**です。
+落としているのは「既存判定上、絶対に参加不可能なFVG」だけで、direction / inside / proximal /
+Broad 4条件 / Dense Strong保護 / same-direction overlap / High判定は pre-filter後にそのまま実行します。
+
+なお pre-filter後のindex bufferは、走査前に**working set index昇順へ戻して**います。
+`fvgAugment()` はレンジを逐次広げるため、評価順序が結果に影響するからです（対象は通過FVGのみで、Root集合のsortではありません）。
+
+---
+
+### 12.6 Candidate ↔ Core の逆引き（指示6）
+
+全Candidate × 全Snapshot ループを削除しました。
+
+```pine
+export type IntBucket
+    array<int> values = na
+```
+
+- `map<int, IntBucket> rootToSnapshots`：通常Coreの**非Broad** origin Root ID → Snapshot index
+- `map<int, IntBucket> broadRootToSnapshots`：Broad standalone contextの**Broad FVG** Root ID → Snapshot index
+
+`snapshotCores()` の直後に `buildSnapshotIndex()` が1回だけ構築します。
+Candidateは、通常Candidateなら自分の非Broad identity Rootから `rootToSnapshots` だけを、
+Broad contextなら `broadRootToSnapshots` だけを引き、`seenSnap` scratch mapでdedupeしてから
+**`candMatchesSnap()` の最終判定式をそのまま**実行します。
+
+**結果不変の理由**：`candMatchesSnap(k, si)` が true になるには、
+「Snapshot si の origin Root rid が Candidate k にも含まれ、かつ `isBroadFvg(rid) == candBroadCtx(k) == snapBroadCtx(si)`」
+が必要です。indexはまさにその条件でしか登録・参照されないため、
+true になり得るpairは全列挙され、共有Rootを持たないpair（必ずfalse）だけが事前除外されます。
+
+---
+
+### 12.7 Candidate ↔ Candidate の逆引き（指示7）
+
+`for k1 / for k2` の総当たりを削除し、`map<int, IntBucket> rootToCandidates` に置換しました。
+Candidateを正順に1件ずつ処理し、非Broad identity Rootごとに既存Candidate indexを引いて
+`seenCand` でdedupeし、そのpairだけ `candSharesWithCand()` を実行して `ufUnion()`。
+処理後にCandidate kを各非Broad Root bucketへ追加します。Broad FVG Rootはこのmapへ入れません。
+
+**結果不変の理由**：`candSharesWithCand(k1, k2)` は
+「`rid ∈ roots(k1) ∧ rid ∈ roots(k2) ∧ ¬isBroadFvg(rid)`」＋ gap ≤ M であり、Root共有部分は完全に対称です。
+非Broad Rootを共有しないpairは必ずfalseなので、呼び出しを省いても結果は変わりません。
+また union-find は常に小さいindexを代表にするため、union の呼び出し順序は最終componentに影響しません。
+
+---
+
+### 12.8 Component構築の1パス化（指示8）
+
+```pine
+export type ComponentBucket
+    int rep           = -1
+    int minCoreId     = 2147483647
+    int bestCandidate = -1
+    array<int> candidates = na
+    array<int> snapshots  = na
+```
+
+`map<int, ComponentBucket> repToComponent` により、**node列 1回の走査**でcomponentを構築します。
+componentごとに全Candidate / 全Snapshotをscanして所属を探す処理は削除しました。
+Phase 4 / 5 は bucket内の candidate / snapshot だけを処理します。
+
+component処理順は旧仕様のまま（minCoreId昇順、旧Coreなしcomponent同士は `bestCandidate` の `candBetter()` 比較）。
+`bestCandidate` は bucket構築時に「component内candidateをindex昇順に見て `ba < 0 or candBetter(k, ba)`」で1回決めます
+（旧コードがinsertion sortの内側で毎回全Candidateをscanして求めていたものと同一規則）。
+この順序比較は全順序（最終tie-breakが `k1 < k2`）なので、初期並びに依存しません。
+
+---
+
+### 12.9 ufFindの重複呼出し禁止（指示9）
+
+union構築完了後に `nodeRep` へ各nodeのfinal representativeを**1回だけ**保存し、
+component sort / membership / topology処理は `nodeRep` と bucket だけを読みます。
+path compressionは `ufFind()` 内に維持しています。
+
+| 位置 | 旧 `ufFind()` 呼出し | 新 |
+|---|---|---|
+| component代表の収集 | `total` 回 | `total` 回（唯一の呼出し） |
+| minCoreId 決定 | `sn` 回 | 0 |
+| component sortの内側 | 比較ごとに `kn` 回 | 0 |
+| snapshot所属判定 | component数 × `sn` 回 | 0 |
+| candidate所属判定 | component数 × `kn` 回 | 0 |
+
+---
+
+### 12.10 ReferencePriceは採用Live Sideだけ（指示10・11）
+
+`buildCandidates()` 末尾の「全Candidate → `computeRefPrice()`」ループを削除し、
+`applyCandidate()` が Live Side へ採用したCandidateについてのみ、`candRefComputed` で1回だけ計算します。
+
+ReferencePriceは表示・追跡専用で、Candidate競合・Topology・Phase・Grade・Touch・Break・Merge・Split・世代判定の
+どこからも読まれません（`sv.referencePrice` への代入と `ZoneView.referencePrice` の出力だけ）。
+`computeRefPrice()` は候補buffer（association中は不変）とRootのみを読む純関数なので、**値は旧実装と完全一致**します。
+同一barで同じCandidateを2回計算することはありません。
+
+内部の median sort は据え置きです。同一呼出し内で同じcategory値集合を2回sortすることはありません
+（`sRefs` の2回目は maRep を追加した別集合）。median近似は入れていません。
+
+---
+
+### 12.11 scratch配列のnew排除（指示12）
+
+bar処理中の `array.new` / `map.new` を排除しました。
+
+| 対象 | 旧 | 新 |
+|---|---|---|
+| `buildProtectedSet()` | 毎bar `map.new<int,int>()` | `e.protMap` を `map.clear()` して再利用 |
+| 逆引きbucket | （新規） | `e.bucketPool` からpool取得（初回のみ確保、以後 `array.clear()`） |
+| ComponentBucket | （新規） | `e.compPool` からpool取得（同上） |
+| active / tmpAct / FVG sorted index | （新規） | `newEngine()` で1回確保、毎bar `array.clear()` |
+
+例外として残したのは、bar跨ぎで保存が必要な状態データだけです：
+`TouchStartSnapshot` / `BreakSnapshot` / `TouchEpisode` / `ContactSpan` / `newSideView()` / `newCoreFrom()`。
+状態データをscratchへ流用してはいません。
+
+---
+
+### 12.12 sort回数（指示13）
+
+| sort | 1 Side / 1 bar |
+|---|---:|
+| Point Root 価格 sort（`array.sort_indices`） | **1回**（barで1回、両Sideが共有するmaster table） |
+| Point Root 同tick時のRoot ID stable sort | **1回**（同上） |
+| FVG bottom sort | **1回** |
+| FVG top sort | **1回** |
+| Candidate単位のRoot全体sort | **0回** |
+| component単位の全Candidate再sort | **0回**（bucket内candidateのみ） |
+
+---
+
+### 12.13 Debug / Presentationの分離（指示14）
+
+`update()` から到達可能な116関数を機械走査した結果、`str.tostring` / `str.format` は **0件**です。
+Libraryが持つのは primitive counter / state だけで、文字列化は Visual Harness の
+`barstate.islast` かつ表示ONのときだけ行います。
+
+`validateCfg()` も、全チェックを primitive の bool 比較にしてから `if bad` の中でだけ error text を組み立てるよう変更しました。
+**valid時（通常のbar）は文字列連結が1回も起きません**。invalid時のテキストは旧実装と1文字も同じです。
+
+追加した primitive counter（Zoneロジック値には一切影響しません）：
+`statFvgPrefiltered` / `statFvgScanned` / `statSnapChecks` / `statPairChecks` / `statRefPriceCalls`。
+Harnessのdebug tableに2行（18・19行目）として追加しました。
+
+---
+
+### 12.14 触っていない処理（指示15）
+
+Touch / Weak / Break / Flip / Inverse / Generation / Storage prune / Accum detection / Swing detection /
+Time H/L / MA detection のロジックは**1行も変更していません**。
+性能のために条件式を省略・統合した箇所も0件です。
+
+最適化対象は `buildCandidates` / `scanBest` / `fvgAugment` / association / ReferencePrice / scratch allocation のみです。
+
+---
+
+### 12.15 更新前後の同値チェック（指示16）
+
+コード上の同値性に加えて、各変換を抽象モデル化して機械検証しました。
+
+| 検証 | 試行数 | 結果 |
+|---|---:|---|
+| FVG pre-filter：全走査 vs pre-filter後走査の attach集合・最終レンジ | 40,000 | 不一致 **0**（除外率 72.2%、参加不可能FVGのみ除外） |
+| 逆引きassociation：全pair総当たり vs 逆引きの component分割 | 8,000 | 不一致 **0**（pair判定呼出しは 22.5% に減少） |
+| active compact：旧 `sUsed==0` のRoot列との一致（Root ID・価格順） | 20,000 | 不一致 **0** |
+| binary search境界helper：組込みが**どのindexを返しても**正しい境界になるか | 200,000 | 誤り **0** |
+
+Candidate comparatorは旧コードと文字単位で同一（`candBetter()` と `scanBest()` の `better` 連鎖を無変更）。
+Psych ownership（`sPsyUsed` / `psychLevelFree()` / `collectPsychRoots()`）も無変更です。
+
+---
+
+### 12.16 削減した走査・sort・lookupの一覧
+
+| 項目 | 旧 | 新 |
+|---|---|---|
+| `scanBest()` の外側 i ループ | 全Point Root（採用済み含む） | 未使用Point Rootのみ |
+| `scanBest()` の `sUsed` 判定 | i と j で毎回 | **全廃** |
+| `scanBest()` inner loopのRoot UDT lookup | 窓評価ごとに1回 | **0** |
+| `fvgAugment()` のFVG走査 | working set全件 | binary searchのintersectionのみ |
+| Candidate × Snapshot | `kn × sn` 件の `candMatchesSnap()` | 共有Rootを持つpairのみ |
+| Candidate × Candidate | `kn(kn-1)/2` 件の `candSharesWithCand()` | 非Broad Root共有pairのみ |
+| component所属の再走査 | component数 ×（`kn` + `sn`） | **0**（1パスbucket構築） |
+| component sort内の `ufFind()` | 比較ごとに `kn` 回 | **0** |
+| `ufFind()` 総数 | union後も各所で再計算 | node 1回だけ |
+| `computeRefPrice()` | 全Candidate | Live Side採用Candidateのみ |
+| `map.new` / `array.new`（bar内） | `buildProtectedSet()` で毎bar | **0** |
+| `update()` 内の文字列生成 | `validateCfg()` が毎bar連結 | **0**（invalid時のみ） |
+
+---
+
 ## 11. 改訂履歴（実装状態の由来）
 
 | 改訂 | Build ID | 主な内容 |
@@ -822,5 +1131,6 @@ Debug表の時刻も同じ`i_tz`で表示します。
 | 6c | -006（据え置き） | Pine v6構文互換修正のみ：組み込み `high` をshadowするローカル変数2件を `fvgHigh` へrename。ロジック変更なし |
 | 6d | -006（据え置き） | Pine v6構文互換修正のみ：TouchEpisodeの直接 `==` 比較を `episodeId` 比較へ変更。ロジック変更なし |
 | 6e | -006（据え置き） | Pine v6構文互換修正のみ：式の戻り値への直接field assignment 2件をローカル変数経由へ分割。ロジック変更なし |
+| 7 | -006（据え置き） | RE10110対策の構造最適化（§12）。active Point working set / Root UDT lookup全廃 / FVG 2 sorted index / 逆引きassociation / component 1パス構築 / ufFind 1回 / ReferencePrice採用時のみ / scratch new排除 / Debug分離。結果不変、仕様変更0 |
 
 各改訂の差分はgit履歴（ブランチ `claude/new-session-vss3r2`）に保存されています。
