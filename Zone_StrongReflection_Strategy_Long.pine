@@ -1,0 +1,681 @@
+//@version=6
+// ============================================================================
+// Zone Strong Reflection Strategy - LONG BACKTEST BUILD
+//
+// Purpose: run the SAME ZoneEngineV2_Rebuild zone logic over 1/3/5 years.
+// Nothing about Zone generation, Grade, Touch, WeakDepth, Break, Flip,
+// Generation or Storage is simplified, approximated or disabled. What changed
+// is only HOW data reaches the Engine and how this file reacts to it.
+//
+// HOST TIMEFRAME : 1m   (so EMA2000 / EMA3000 / slope are computed natively)
+// ENGINE BASE TF : 5m   (unchanged - the Engine still advances once per
+//                        confirmed 5m bar, exactly as on a 5m chart)
+//
+// There is deliberately NO visual output and NO debug table in this file.
+// Visual verification belongs to ZoneEngineV2_Rebuild_VisualHarness_14D.
+// ============================================================================
+strategy("Zone Strong Reflection - Long Backtest",
+     overlay = true,
+     pyramiding = 0,
+     calc_on_every_tick = false,
+     process_orders_on_close = false,
+     max_bars_back = 500,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 10,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.0)
+
+import sekine3310/ZoneEngineV2_Rebuild/11 as ze
+
+// ============================================================================
+// Engine constant mirror + read-only predicates.
+//
+// The library defines these as `const int` and does not export them, so they
+// are mirrored here once and only referenced through the predicates below. No
+// magic number appears anywhere in the trading logic.
+//
+// If you later prefer these to live in the library, the additive getters
+// isTouchStartEvent() / isStrongGrade() / isSupportSide() / isResistanceSide()
+// can be added there without touching any state machine. That was not required
+// to build this file, so no library change was made.
+// ============================================================================
+const int SIDE_SUPPORT    = 1
+const int SIDE_RESISTANCE = -1
+
+const int PH_BROKEN    = 4
+const int PH_FLIP_WAIT = 5
+
+const int GR_STRONG      = 1
+const int GR_UNAVAILABLE = 4
+
+const int EV_TOUCH_START = 1
+const int EV_LOCAL_BREAK = 4
+const int EV_GAP_BREAK   = 5
+
+f_isTouchStartEvent(ze.ZoneEvent ev) => ev.eventType == EV_TOUCH_START
+f_isBreakEvent(ze.ZoneEvent ev) => ev.eventType == EV_LOCAL_BREAK or ev.eventType == EV_GAP_BREAK
+f_isStrongGrade(int grade) => grade == GR_STRONG
+f_isSupportSide(int side) => side == SIDE_SUPPORT
+f_isResistanceSide(int side) => side == SIDE_RESISTANCE
+f_isTradableSide(int side) => f_isSupportSide(side) or f_isResistanceSide(side)
+
+// ============================================================================
+// Inputs - Zone logic. Values are the Visual Harness defaults, unchanged.
+// These define the Zones themselves and must not be tuned for performance.
+// ============================================================================
+gLogic = "Zone Logic (must match Visual Harness)"
+clusterMaxWidth = input.float(20.0, "M / max width ($)", minval = 0.01, group = gLogic)
+denseRatio = input.float(0.50, "Dense ratio", minval = 0.01, maxval = 1.0, group = gLogic)
+touchResetDistance = input.float(10.0, "Touch reset distance ($)", minval = 0.01, group = gLogic)
+strongUntilTouch = input.int(1, "Strong until touch", minval = 1, group = gLogic)
+strongUnlimited = input.bool(false, "Strong unlimited", group = gLogic)
+weakFromTouch = input.int(2, "Weak from touch", minval = 2, group = gLogic)
+weakFromTouchOff = input.bool(false, "Weak-by-touch OFF", group = gLogic)
+weakDepthPct = input.float(50.0, "Weak depth %", minval = 0, maxval = 100, group = gLogic)
+weakDepthOff = input.bool(false, "Weak-depth OFF", group = gLogic)
+breakBuffer = input.float(2.0, "Break buffer ($)", minval = 0, group = gLogic)
+touchTolerance = input.float(0.0, "Line touch tolerance ($)", minval = 0, group = gLogic)
+
+gSource = "Zone Source (must match Visual Harness)"
+// Capped at 300 so max_bars_back = 500 always covers the slope reference.
+emaSlopeLookback = input.int(60, "EMA slope lookback (1m bars)", minval = 1, maxval = 300, group = gSource)
+swingLen5m = input.int(10, "Swing length 5m", minval = 1, group = gSource)
+swingLen15m = input.int(8, "Swing length 15m", minval = 1, group = gSource)
+swingLen1h = input.int(6, "Swing length 1h", minval = 1, group = gSource)
+accumRangeLen = input.int(10, "Accum range length", minval = 2, group = gSource)
+accumBaseLen = input.int(20, "Accum base length", minval = 2, group = gSource)
+accumAtrLen = input.int(14, "Accum ATR length", minval = 1, group = gSource)
+accumMinUpper = input.int(4, "Accum min upper closes", minval = 0, group = gSource)
+accumMinLower = input.int(4, "Accum min lower closes", minval = 0, group = gSource)
+accumMaxRun = input.int(4, "Accum max same-color run", minval = 0, group = gSource)
+accumAtrMult = input.float(2.5, "Accum range/ATR max", minval = 0.01, group = gSource)
+accumBarRatio = input.float(0.70, "Accum short/base width max", minval = 0.01, group = gSource)
+accumDriftMax = input.float(0.30, "Accum drift max", minval = 0.0, group = gSource)
+
+gCategory = "Zone Categories (must match Visual Harness)"
+enableMA = input.bool(true, "MA", group = gCategory)
+enableSwing = input.bool(true, "Swing", group = gCategory)
+enableAccum = input.bool(true, "Accum", group = gCategory)
+enableTimeHL = input.bool(true, "Session / Day / Week H-L", group = gCategory)
+enableFVG = input.bool(true, "HTF FVG", group = gCategory)
+enablePsych = input.bool(true, "Psychological prices", group = gCategory)
+
+// ============================================================================
+// Inputs - Run mode and warmup / test separation.
+// ============================================================================
+gMode = "Run Mode"
+runMode = input.string("Long (continuous replay)", "Mode",
+     options = ["Long (continuous replay)", "Compatibility (14D + 90D bootstrap)"], group = gMode,
+     tooltip = "Long: the Engine is replayed continuously from Engine start. " +
+               "Compatibility: reproduces the Visual Harness 14-day window and 90-day HTF bootstrap for parity testing.")
+engineStartInput = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Engine start (warmup begins)", group = gMode)
+tradeStartInput = input.time(timestamp("01 Feb 2024 00:00 +0000"), "Trade start (entries recorded from)", group = gMode,
+     tooltip = "Keep this well after Engine start so Zones, Touch counts and Generations are already populated.")
+
+// ============================================================================
+// Inputs - Entry management. Ported verbatim from Zone_Strategy_StrongBounce.
+// ============================================================================
+gEntry = "Strong Reflection Entry"
+entryTrigger = input.string("Recovery close (ported)", "Entry trigger",
+     options = ["Recovery close (ported)", "TouchStart immediate"], group = gEntry,
+     tooltip = "Recovery close: Strong TouchStart arms the candidate, entry fires once a confirmed 5m close " +
+               "recovers beyond the touched boundary. TouchStart immediate: entry fires on the Strong TouchStart bar itself.")
+slBuffer = input.float(5.0, "SL buffer beyond zone ($)", minval = 0.0, step = 0.5, group = gEntry)
+rrCap = input.float(3.0, "Zone-TP RR cap", minval = 0.1, step = 0.1, group = gEntry)
+fixedRR = input.float(1.5, "Fixed RR when over cap / no zone", minval = 0.1, step = 0.1, group = gEntry)
+allowLong = input.bool(true, "Allow Support -> Long", group = gEntry)
+allowShort = input.bool(true, "Allow Resistance -> Short", group = gEntry)
+
+// ============================================================================
+// Engine configuration. Storage limits, dormant distance and pruning are left
+// at the library defaults on purpose - a long backtest is not a reason to grow
+// the Engine's arrays without bound.
+// ============================================================================
+var ze.ZoneCfg cfg = ze.newCfg(syminfo.mintick)
+if barstate.isfirst
+    cfg.clusterMaxWidth := clusterMaxWidth
+    cfg.denseRatio := denseRatio
+    cfg.touchResetDistance := touchResetDistance
+    cfg.strongUntilTouch := strongUntilTouch
+    cfg.strongUnlimited := strongUnlimited
+    cfg.weakFromTouch := weakFromTouch
+    cfg.weakFromTouchOff := weakFromTouchOff
+    cfg.weakDepthPct := weakDepthPct
+    cfg.weakDepthOff := weakDepthOff
+    cfg.breakBuffer := breakBuffer
+    cfg.touchTolerance := touchTolerance
+    cfg.emaSlopeLookback := emaSlopeLookback
+    cfg.swingLen5m := swingLen5m
+    cfg.swingLen15m := swingLen15m
+    cfg.swingLen1h := swingLen1h
+    cfg.accumRangeLen := accumRangeLen
+    cfg.accumBaseLen := accumBaseLen
+    cfg.accumAtrLen := accumAtrLen
+    cfg.accumMinUpperCloses := accumMinUpper
+    cfg.accumMinLowerCloses := accumMinLower
+    cfg.accumMaxSameColorRun := accumMaxRun
+    cfg.accumAtrMult := accumAtrMult
+    cfg.accumBarRatioMax := accumBarRatio
+    cfg.accumDriftMax := accumDriftMax
+    cfg.enableMA := enableMA
+    cfg.enableSwing := enableSwing
+    cfg.enableAccum := enableAccum
+    cfg.enableTimeHL := enableTimeHL
+    cfg.enableFVG := enableFVG
+    cfg.enablePsych := enablePsych
+    cfg.mintick := syminfo.mintick
+    cfg.revision := 1
+
+// ============================================================================
+// Base 5m pack.
+//
+// One request carries the whole 5m Base bar plus the 5m Swing, so the same 5m
+// data is never requested twice. This type is local to the strategy; adding it
+// to the library was unnecessary because a local UDT can be returned from
+// request.security() directly.
+// ============================================================================
+type Base5mPack
+    float o
+    float h
+    float l
+    float c
+    float prevC
+    int openTime
+    int closeTime
+    ze.SwingPack swing
+
+f_base5mPack(int swingLen) =>
+    ze.SwingPack s = ze.swingPackV2(swingLen)
+    Base5mPack.new(o = open, h = high, l = low, c = close, prevC = close[1],
+         openTime = time, closeTime = time_close, swing = s)
+
+// ============================================================================
+// Mode and time window.
+// ============================================================================
+bool is1m = timeframe.in_seconds(timeframe.period) == 60
+bool compatMode = runMode == "Compatibility (14D + 90D bootstrap)"
+const int MS_PER_DAY = 86400000
+const int COMPAT_HISTORY_DAYS = 14
+const int COMPAT_BOOTSTRAP_DAYS = 90
+const float COMPAT_BOOTSTRAP_DISTANCE = 500.0
+
+int compatAnchorTime = na(last_bar_time) ? timenow : last_bar_time
+int compatStartTime = compatAnchorTime - COMPAT_HISTORY_DAYS * MS_PER_DAY
+int compatBootstrapStartTime = compatAnchorTime - COMPAT_BOOTSTRAP_DAYS * MS_PER_DAY
+
+// Long mode replays continuously from the user's Engine start. Compatibility
+// mode reproduces the harness window instead.
+int engineStartTime = compatMode ? compatStartTime : engineStartInput
+int tradeStartTime = compatMode ? compatStartTime : math.max(tradeStartInput, engineStartInput)
+
+bool engineWindow = is1m and time_close >= engineStartTime
+
+// ============================================================================
+// Requests.
+//
+// Every requested timeframe is HIGHER than the 1m host chart, so there is not a
+// single lower-timeframe request in this file. That is the whole reason the
+// host chart is 1m: EMA2000 / EMA3000 / slope are computed natively below.
+//
+//   "5"   -> Base5mPack (5m OHLC + prevClose + times + 5m Swing)   [1 request]
+//   "15"  -> SwingPack                                             [1 request]
+//   "60"  -> TFPack (Swing + Accum + FVG)                          [1 request]
+//   "240" -> TFPack (Swing stub + Accum + FVG)                     [1 request]
+//   "1D"  -> TFPack (Swing stub + Accum + FVG)                     [1 request]
+//   Compatibility mode only: "240" / "1D" bootstrap packs          [2 requests]
+// ============================================================================
+const int boot4hBars = 650
+const int boot1dBars = 130
+
+Base5mPack b5 = na
+ze.SwingPack sw15 = na
+ze.TFPack p1h = na
+ze.TFPack p4h = na
+ze.TFPack p1d = na
+ze.HTFBootstrapPack boot4h = na
+ze.HTFBootstrapPack boot1d = na
+
+var bool bootstrapInjected = false
+var int bootstrapAccumInjected = 0
+var int bootstrapFvgInjected = 0
+
+f_rangeDistance(float px, float b, float t) =>
+    float lo = math.min(b, t)
+    float hi = math.max(b, t)
+    px < lo ? lo - px : px > hi ? px - hi : 0.0
+
+if engineWindow
+    if compatMode and not bootstrapInjected
+        boot4h := request.security(syminfo.tickerid, "240",
+             ze.bootstrap4hPackV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpper, accumMinLower,
+                 accumMaxRun, accumAtrMult, accumBarRatio, accumDriftMax),
+             gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = boot4hBars)
+        boot1d := request.security(syminfo.tickerid, "1D",
+             ze.bootstrap1dPackV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpper, accumMinLower,
+                 accumMaxRun, accumAtrMult, accumBarRatio, accumDriftMax),
+             gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = boot1dBars)
+
+    b5 := request.security(syminfo.tickerid, "5", f_base5mPack(swingLen5m),
+         gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+    sw15 := request.security(syminfo.tickerid, "15", ze.swingPackV2(swingLen15m),
+         gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+    p1h := request.security(syminfo.tickerid, "60",
+         ze.pack1hV2(swingLen1h, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpper, accumMinLower,
+             accumMaxRun, accumAtrMult, accumBarRatio, accumDriftMax),
+         gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+    p4h := request.security(syminfo.tickerid, "240",
+         ze.pack4hV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpper, accumMinLower,
+             accumMaxRun, accumAtrMult, accumBarRatio, accumDriftMax),
+         gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+    p1d := request.security(syminfo.tickerid, "1D",
+         ze.pack1dV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpper, accumMinLower,
+             accumMaxRun, accumAtrMult, accumBarRatio, accumDriftMax),
+         gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+// ============================================================================
+// Native 1m MA.
+//
+// ze.maPackV2() runs on the host chart, so EMA2000 / EMA3000 / slope2000 /
+// slope3000 keep their exact published definitions. No request.security("1"),
+// no 5m EMA approximation, no MA disabled.
+//
+// It is evaluated on EVERY 1m bar so the EMA recursion stays continuous, and a
+// snapshot is retained at each 5m boundary. The Engine requires
+// ma1m.confirmedTime <= baseCloseTime, so the snapshot taken exactly at the 5m
+// close is the value handed over, regardless of which 1m bar the "5" request
+// happens to deliver that Base bar on. Taking the value at time T and using it
+// at a bar whose close is >= T can never introduce lookahead.
+// ============================================================================
+ze.MAPack maNative = ze.maPackV2(emaSlopeLookback)
+
+// Fixed-size rotating buffer, written with array.set - no push/shift churn on
+// 1m bars. Keyed by the 1m bar's own close time rather than by testing for a
+// 5m boundary, so nothing depends on 5m bars being epoch-aligned for this
+// instrument's session.
+const int MA_SNAP_MAX = 8
+var array<int> maSnapTime = array.new<int>(MA_SNAP_MAX, na)
+var array<float> maSnapE2 = array.new<float>(MA_SNAP_MAX, na)
+var array<float> maSnapS2 = array.new<float>(MA_SNAP_MAX, na)
+var array<float> maSnapE3 = array.new<float>(MA_SNAP_MAX, na)
+var array<float> maSnapS3 = array.new<float>(MA_SNAP_MAX, na)
+var int maSnapIdx = -1
+
+f_maSnapFind(int t) =>
+    int found = -1
+    for i = 0 to MA_SNAP_MAX - 1
+        if array.get(maSnapTime, i) == t
+            found := i
+            break
+    found
+
+if engineWindow
+    maSnapIdx := (maSnapIdx + 1) % MA_SNAP_MAX
+    array.set(maSnapTime, maSnapIdx, time_close)
+    array.set(maSnapE2, maSnapIdx, maNative.ema2000)
+    array.set(maSnapS2, maSnapIdx, maNative.slope2000)
+    array.set(maSnapE3, maSnapIdx, maNative.ema3000)
+    array.set(maSnapS3, maSnapIdx, maNative.slope3000)
+
+// ============================================================================
+// Compatibility-mode HTF bootstrap. Skipped entirely in Long mode, where the
+// Engine is replayed continuously and therefore needs no seeding.
+// ============================================================================
+var ze.ZoneFeed feed = na
+var ze.MAPack maFeed = na
+var ze.ZoneEngine engine = ze.newEngine()
+bool engineAdvanced = false
+
+if engineWindow and compatMode and not bootstrapInjected
+    if not na(boot4h)
+        int an4 = array.size(boot4h.accumPairKeys)
+        if an4 > 0
+            for i = 0 to an4 - 1
+                float b = array.get(boot4h.accumBottoms, i)
+                float t = array.get(boot4h.accumTops, i)
+                int confirmed = array.get(boot4h.accumConfirmed, i)
+                if confirmed >= compatBootstrapStartTime and confirmed < compatStartTime and f_rangeDistance(close, b, t) <= COMPAT_BOOTSTRAP_DISTANCE
+                    if ze.bootstrapAccumRoot(engine, cfg, 240, array.get(boot4h.accumPairKeys, i), t, b,
+                         array.get(boot4h.accumOrigins, i), confirmed, 0, time_close)
+                        bootstrapAccumInjected += 1
+        int fn4 = array.size(boot4h.fvgDirs)
+        if fn4 > 0
+            for i = 0 to fn4 - 1
+                float b = array.get(boot4h.fvgBottoms, i)
+                float t = array.get(boot4h.fvgTops, i)
+                int confirmed = array.get(boot4h.fvgConfirmed, i)
+                if confirmed >= compatBootstrapStartTime and confirmed < compatStartTime and f_rangeDistance(close, b, t) <= COMPAT_BOOTSTRAP_DISTANCE
+                    if ze.bootstrapFvgRoot(engine, cfg, 240, array.get(boot4h.fvgDirs, i), b, t,
+                         array.get(boot4h.fvgOrigins, i), confirmed, 0, time_close, array.get(boot4h.fvgFresh, i))
+                        bootstrapFvgInjected += 1
+    if not na(boot1d)
+        int anD = array.size(boot1d.accumPairKeys)
+        if anD > 0
+            for i = 0 to anD - 1
+                float b = array.get(boot1d.accumBottoms, i)
+                float t = array.get(boot1d.accumTops, i)
+                int confirmed = array.get(boot1d.accumConfirmed, i)
+                if confirmed >= compatBootstrapStartTime and confirmed < compatStartTime and f_rangeDistance(close, b, t) <= COMPAT_BOOTSTRAP_DISTANCE
+                    if ze.bootstrapAccumRoot(engine, cfg, 1440, array.get(boot1d.accumPairKeys, i), t, b,
+                         array.get(boot1d.accumOrigins, i), confirmed, 0, time_close)
+                        bootstrapAccumInjected += 1
+        int fnD = array.size(boot1d.fvgDirs)
+        if fnD > 0
+            for i = 0 to fnD - 1
+                float b = array.get(boot1d.fvgBottoms, i)
+                float t = array.get(boot1d.fvgTops, i)
+                int confirmed = array.get(boot1d.fvgConfirmed, i)
+                if confirmed >= compatBootstrapStartTime and confirmed < compatStartTime and f_rangeDistance(close, b, t) <= COMPAT_BOOTSTRAP_DISTANCE
+                    if ze.bootstrapFvgRoot(engine, cfg, 1440, array.get(boot1d.fvgDirs, i), b, t,
+                         array.get(boot1d.fvgOrigins, i), confirmed, 0, time_close, array.get(boot1d.fvgFresh, i))
+                        bootstrapFvgInjected += 1
+    bootstrapInjected := true
+
+// ============================================================================
+// Engine advance gate.
+//
+// The Engine is advanced EXACTLY ONCE per confirmed 5m bar. The 1m bar index is
+// never used as baseSeq; baseSeq5m increments by one per advance, so the
+// Engine's Armed/Generation sequencing keeps its Base-bar meaning.
+// ============================================================================
+var int lastProcessed5mCloseTime = na
+var int baseSeq5m = 0
+var int skippedBaseBars = 0
+
+bool haveBase = engineWindow and not na(b5) and not na(b5.closeTime)
+// b5.closeTime <= time_close rejects a Base bar that has not closed yet.
+bool newBase = haveBase and b5.closeTime <= time_close and (na(lastProcessed5mCloseTime) or b5.closeTime > lastProcessed5mCloseTime)
+
+if newBase
+    int snap = f_maSnapFind(b5.closeTime)
+    if snap < 0 and enableMA
+        // No 1m MA snapshot for this Base close. Skipping keeps the Engine's MA
+        // Roots consistent rather than feeding it a mismatched timestamp.
+        skippedBaseBars += 1
+        lastProcessed5mCloseTime := b5.closeTime
+    else
+        baseSeq5m += 1
+        if na(maFeed)
+            maFeed := ze.MAPack.new(ema2000 = na, slope2000 = na, ema3000 = na, slope3000 = na, confirmedTime = na)
+        maFeed.ema2000 := snap >= 0 ? array.get(maSnapE2, snap) : na
+        maFeed.slope2000 := snap >= 0 ? array.get(maSnapS2, snap) : na
+        maFeed.ema3000 := snap >= 0 ? array.get(maSnapE3, snap) : na
+        maFeed.slope3000 := snap >= 0 ? array.get(maSnapS3, snap) : na
+        maFeed.confirmedTime := b5.closeTime
+
+        if na(feed)
+            feed := ze.makeFeed(b5.o, b5.h, b5.l, b5.c, b5.prevC, b5.openTime, b5.closeTime,
+                 baseSeq5m, true, syminfo.mintick, maFeed, b5.swing, sw15, p1h, p4h, p1d)
+        else
+            feed.baseOpen := b5.o
+            feed.baseHigh := b5.h
+            feed.baseLow := b5.l
+            feed.baseClose := b5.c
+            feed.basePrevClose := b5.prevC
+            feed.baseOpenTime := b5.openTime
+            feed.baseCloseTime := b5.closeTime
+            feed.baseSeq := baseSeq5m
+            feed.baseConfirmed := true
+            feed.mintick := syminfo.mintick
+            feed.ma1m := maFeed
+            feed.swing5m := b5.swing
+            feed.swing15m := sw15
+            feed.oneHour := p1h
+            feed.fourHour := p4h
+            feed.oneDay := p1d
+        engineAdvanced := ze.updateConfirmedBase(engine, cfg, feed)
+        lastProcessed5mCloseTime := b5.closeTime
+
+// ============================================================================
+// Strong detection - EVENT DRIVEN.
+//
+// No viewCount() / viewAt() sweep runs on a Base bar. The only Zone-side
+// trigger is EV_TOUCH_START with gradeAtStart == Strong, read from the events
+// the Engine emitted during THIS advance (it clears its event array at the
+// start of every updateConfirmedBase, so what is present is this bar's output).
+//
+// Support Strong TouchStart -> Long candidate
+// Resistance Strong TouchStart -> Short candidate
+//
+// The candidate array is bounded and holds only live candidates. No per-bar
+// trade trigger history is accumulated.
+// ============================================================================
+const int MAX_CANDIDATES = 128
+
+var array<int> cdKey = array.new<int>()        // coreId * 2 + (support ? 0 : 1)
+var array<int> cdSeq = array.new<int>()        // baseSeq5m of the TouchStart
+var array<float> cdBottom = array.new<float>() // rangeBottom, verbatim from the event
+var array<float> cdTop = array.new<float>()    // rangeTop, verbatim from the event
+
+f_cdKeyOf(int coreId, int side) => coreId * 2 + (f_isSupportSide(side) ? 0 : 1)
+f_cdSideOf(int key) => key % 2 == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE
+f_cdCoreOf(int key) => int(math.floor(key / 2.0))
+
+f_cdSlot(int key) =>
+    int found = -1
+    int n = array.size(cdKey)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(cdKey, i) == key
+                found := i
+                break
+    found
+
+f_cdRemoveAt(int i) =>
+    array.remove(cdKey, i)
+    array.remove(cdSeq, i)
+    array.remove(cdBottom, i)
+    array.remove(cdTop, i)
+    true
+
+f_cdDrop(int key) =>
+    int slot = f_cdSlot(key)
+    if slot >= 0
+        f_cdRemoveAt(slot)
+    true
+
+f_cdUpsert(int key, int seq, float bottom, float top) =>
+    int slot = f_cdSlot(key)
+    if slot >= 0
+        array.set(cdSeq, slot, seq)
+        array.set(cdBottom, slot, bottom)
+        array.set(cdTop, slot, top)
+    else
+        array.push(cdKey, key)
+        array.push(cdSeq, seq)
+        array.push(cdBottom, bottom)
+        array.push(cdTop, top)
+        while array.size(cdKey) > MAX_CANDIDATES
+            f_cdRemoveAt(0)
+    true
+
+bool strongTouchThisBar = false
+int strongTouchSide = 0
+float strongTouchBottom = na
+float strongTouchTop = na
+int strongTouchCore = na
+
+if engineAdvanced
+    int evN = ze.eventCount(engine)
+    if evN > 0
+        for i = 0 to evN - 1
+            ze.ZoneEvent ev = ze.eventAt(engine, i)
+            if not na(ev) and not na(ev.coreId) and f_isTradableSide(ev.side)
+                if f_isTouchStartEvent(ev) and f_isStrongGrade(ev.gradeAtStart)
+                    f_cdUpsert(f_cdKeyOf(ev.coreId, ev.side), baseSeq5m, ev.rangeBottom, ev.rangeTop)
+                    strongTouchThisBar := true
+                    strongTouchSide := ev.side
+                    strongTouchBottom := ev.rangeBottom
+                    strongTouchTop := ev.rangeTop
+                    strongTouchCore := ev.coreId
+                else if f_isBreakEvent(ev)
+                    // A broken Zone stops being a reflection candidate on both sides.
+                    f_cdDrop(f_cdKeyOf(ev.coreId, SIDE_SUPPORT))
+                    f_cdDrop(f_cdKeyOf(ev.coreId, SIDE_RESISTANCE))
+
+// ============================================================================
+// Nearest opposite Zone for TP.
+//
+// This is the one place a View sweep happens, and it runs only on the Base bar
+// that actually produces an entry - never on every Base bar.
+// ============================================================================
+f_viewUsableForTp(ze.ZoneView v, int excludeCoreId) =>
+    bool ok = not na(v)
+    ok := ok and v.eligible
+    ok := ok and v.grade != GR_UNAVAILABLE
+    ok := ok and v.phase != PH_BROKEN and v.phase != PH_FLIP_WAIT
+    ok := ok and not na(v.effectiveBottom) and not na(v.effectiveTop)
+    ok := ok and (na(excludeCoreId) or v.coreId != excludeCoreId)
+    ok
+
+f_nearestResistanceBottom(ze.ZoneEngine eng, float px, int excludeCoreId) =>
+    float best = na
+    int n = ze.viewCount(eng)
+    if n > 0
+        for i = 0 to n - 1
+            ze.ZoneView v = ze.viewAt(eng, i)
+            if f_viewUsableForTp(v, excludeCoreId) and f_isResistanceSide(v.side) and v.effectiveBottom > px
+                best := na(best) ? v.effectiveBottom : math.min(best, v.effectiveBottom)
+    best
+
+f_nearestSupportTop(ze.ZoneEngine eng, float px, int excludeCoreId) =>
+    float best = na
+    int n = ze.viewCount(eng)
+    if n > 0
+        for i = 0 to n - 1
+            ze.ZoneView v = ze.viewAt(eng, i)
+            if f_viewUsableForTp(v, excludeCoreId) and f_isSupportSide(v.side) and v.effectiveTop < px
+                best := na(best) ? v.effectiveTop : math.max(best, v.effectiveTop)
+    best
+
+f_resolveTp(int dir, float entryPx, float sl, float zoneTp) =>
+    float risk = math.abs(entryPx - sl)
+    float tp = na
+    if risk > 0
+        bool zoneOk = not na(zoneTp) and (dir > 0 ? zoneTp > entryPx : zoneTp < entryPx)
+        float rr = zoneOk ? math.abs(zoneTp - entryPx) / risk : na
+        tp := zoneOk and rr <= rrCap ? zoneTp : dir > 0 ? entryPx + risk * fixedRR : entryPx - risk * fixedRR
+    tp
+
+// ============================================================================
+// Entry management. Ported verbatim from Zone_Strategy_StrongBounce:
+//   SL  = touched Zone boundary +/- slBuffer
+//   TP  = nearest opposite Zone while RR <= rrCap, otherwise fixed RR
+//   one position at a time, signals during a position are ignored
+//
+// Timing note: the entry order is issued on the 1m bar that carried the
+// confirmed 5m Base bar, so it fills at the next 1m open. That is never before
+// the 5m close, so no lookahead is introduced; it is simply up to a few minutes
+// earlier than the 5m-chart build's "next 5m open".
+// ============================================================================
+var int pendDir = 0
+var float pendSL = na
+var float pendZoneTP = na
+var int pendCore = na
+var bool awaitingFill = false
+var int tradeCount = 0
+
+bool tradingOpen = time >= tradeStartTime
+
+// --- Resolve a fill from the previous bar's order.
+if awaitingFill and strategy.position_size != 0
+    float entryPx = strategy.position_avg_price
+    float tp = f_resolveTp(pendDir, entryPx, pendSL, pendZoneTP)
+    if not na(tp)
+        if pendDir > 0
+            strategy.exit("SR-XL", from_entry = "SR-L", stop = pendSL, limit = tp)
+        else
+            strategy.exit("SR-XS", from_entry = "SR-S", stop = pendSL, limit = tp)
+    awaitingFill := false
+    tradeCount += 1
+else if awaitingFill and strategy.position_size == 0
+    strategy.cancel("SR-L")
+    strategy.cancel("SR-S")
+    awaitingFill := false
+    pendDir := 0
+
+if strategy.position_size == 0 and not awaitingFill
+    pendDir := 0
+
+// --- Raise a signal. Only evaluated on a Base advance, never on plain 1m bars.
+bool sigLong = false
+bool sigShort = false
+float sigSL = na
+int sigCore = na
+
+bool flat = strategy.position_size == 0 and not awaitingFill
+bool mayEnter = engineAdvanced and tradingOpen and flat
+
+if mayEnter and entryTrigger == "TouchStart immediate"
+    if strongTouchThisBar
+        if allowLong and f_isSupportSide(strongTouchSide)
+            sigLong := true
+            sigSL := strongTouchBottom - slBuffer
+            sigCore := strongTouchCore
+            f_cdDrop(f_cdKeyOf(strongTouchCore, strongTouchSide))
+        else if allowShort and f_isResistanceSide(strongTouchSide)
+            sigShort := true
+            sigSL := strongTouchTop + slBuffer
+            sigCore := strongTouchCore
+            f_cdDrop(f_cdKeyOf(strongTouchCore, strongTouchSide))
+else if mayEnter
+    // Recovery close: the confirmed 5m close must be beyond the touched
+    // boundary, with no tolerance applied.
+    int n = array.size(cdKey)
+    if n > 0
+        for i = 0 to n - 1
+            int key = array.get(cdKey, i)
+            int side = f_cdSideOf(key)
+            float zb = array.get(cdBottom, i)
+            float zt = array.get(cdTop, i)
+            bool okLong = allowLong and f_isSupportSide(side) and not na(zt) and b5.c > zt
+            bool okShort = allowShort and f_isResistanceSide(side) and not na(zb) and b5.c < zb
+            if okLong or okShort
+                sigCore := f_cdCoreOf(key)
+                if okLong
+                    sigLong := true
+                    sigSL := zb - slBuffer
+                else
+                    sigShort := true
+                    sigSL := zt + slBuffer
+                f_cdRemoveAt(i)
+                break
+
+// --- Place the order.
+if sigLong or sigShort
+    int dir = sigLong ? 1 : -1
+    float refPx = b5.c
+    float zoneTp = dir > 0 ? f_nearestResistanceBottom(engine, refPx, sigCore) : f_nearestSupportTop(engine, refPx, sigCore)
+    float estTp = f_resolveTp(dir, refPx, sigSL, zoneTp)
+    bool riskOk = not na(sigSL) and (dir > 0 ? sigSL < refPx : sigSL > refPx)
+    if riskOk and not na(estTp)
+        pendDir := dir
+        pendSL := sigSL
+        pendZoneTP := zoneTp
+        pendCore := sigCore
+        awaitingFill := true
+        if dir > 0
+            strategy.entry("SR-L", strategy.long)
+            // Provisional bracket so the position is protected from its first
+            // bar. Replaced on the fill bar using the real entry price.
+            strategy.exit("SR-XL", from_entry = "SR-L", stop = sigSL, limit = estTp)
+        else
+            strategy.entry("SR-S", strategy.short)
+            strategy.exit("SR-XS", from_entry = "SR-S", stop = sigSL, limit = estTp)
+
+// ============================================================================
+// Parity instrumentation.
+//
+// These are plot() series only - no box, line, label or table is ever created.
+// Set "Strong TouchStart parity" values are directly comparable with the
+// EV_TOUCH_START rows the Visual Harness reports for the same period.
+// Compare rangeBottom / rangeTop / side / touchNo / gradeAtStart, NOT coreId or
+// generationId: a longer replay changes ID numbering by design.
+// ============================================================================
+plot(strongTouchThisBar ? strongTouchBottom : na, "Parity: Strong touch rangeBottom", display = display.data_window)
+plot(strongTouchThisBar ? strongTouchTop : na, "Parity: Strong touch rangeTop", display = display.data_window)
+plot(strongTouchThisBar ? strongTouchSide : na, "Parity: Strong touch side", display = display.data_window)
+plot(engineAdvanced ? baseSeq5m : na, "Engine baseSeq5m", display = display.data_window)
+plot(skippedBaseBars, "Skipped base bars (must stay 0)", display = display.data_window)
+plot(ze.liveCoreCount(engine), "Live cores", display = display.data_window)
+plot(array.size(cdKey), "Live Strong candidates", display = display.data_window)
