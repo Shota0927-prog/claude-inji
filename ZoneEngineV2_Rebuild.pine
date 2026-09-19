@@ -5,7 +5,7 @@
 //  A-D, M0-M19) are the only normative sources. Zone logic is unchanged; the
 //  data structures and the evaluation order are built for runtime and memory.
 //
-//  Build ID .......... ZEV2R-20260919-004
+//  Build ID .......... ZEV2R-20260919-005
 //  Base timeframe .... confirmed 5m bar, engine updates exactly once per bar
 //
 //  Layering (M3). State transition never runs after candidate evaluation:
@@ -23,7 +23,7 @@
 library("ZoneEngineV2_Rebuild", overlay = true)
 
 export buildId() =>
-    "ZEV2R-20260919-004"
+    "ZEV2R-20260919-005"
 
 // -----------------------------------------------------------------------------
 // 1. Constants (int codes only; strings are produced at presentation time)
@@ -663,6 +663,8 @@ export type ZoneEngine
     array<int>   sFvgUsed   = na
     array<int>   sFvgLocal  = na
     array<int>   sAttach    = na
+    array<float> sPsyBot    = na
+    array<float> sPsyTop    = na
     // --- adopted candidate buffers -----------------------------------------
     array<int>   candSide   = na
     array<int>   candStart  = na
@@ -1002,6 +1004,8 @@ export newEngine() =>
     e.sFvgUsed   := array.new<int>()
     e.sFvgLocal  := array.new<int>()
     e.sAttach    := array.new<int>()
+    e.sPsyBot    := array.new<float>()
+    e.sPsyTop    := array.new<float>()
     e.candSide   := array.new<int>()
     e.candStart  := array.new<int>()
     e.candLen    := array.new<int>()
@@ -1691,31 +1695,59 @@ fvgAugment(ZoneEngine e, ZoneCfg cfg, int side, float bot, float top, int catMas
 //       C desc, H desc, effective width asc, formation time asc, min Root ID asc
 // =============================================================================
 
-// Synthesise the psychological price that can take part in this candidate.
-// It never starts or maintains a candidate on its own and it is never a window
-// boundary during enumeration: it is only added to an existing candidate.
-psychAugment(ZoneEngine e, ZoneCfg cfg, float bot, float top, int limitTick) =>
-    int bestLvl = 0
-    int bestW = 0
-    float bestBot = na
-    float bestTop = na
+// Synthesise the psychological prices that can take part in this candidate.
+// They never start or maintain a candidate and are never window boundaries
+// during enumeration: they are only added to an already enumerated window.
+// Every distinct participation is produced as its own candidate range, so no
+// reachable candidate is lost when clusterMaxWidth is raised and several
+// 50 dollar levels fall inside M. A level that lies inside the resulting range
+// always takes part, so a range fully determines the participating set.
+psychVariants(ZoneEngine e, ZoneCfg cfg, float bot, float top, int limitTick) =>
+    array.clear(e.sPsyBot)
+    array.clear(e.sPsyTop)
     if cfg.catPsych
+        array.clear(e.sTmpA)
         int loLvl = int(math.floor((bot - cfg.clusterMaxWidth) / 50.0))
         int hiLvl = int(math.ceil((top + cfg.clusterMaxWidth) / 50.0))
         for lvl = loLvl to hiLvl
-            int rid = psychIdOfLevel(lvl)
-            if slotOf(e, rid) >= 0
+            if slotOf(e, psychIdOfLevel(lvl)) >= 0
                 float px = lvl * 50.0
-                bool near = tLe(px, top + cfg.clusterMaxWidth, cfg.mintick) and tGe(px, bot - cfg.clusterMaxWidth, cfg.mintick)
-                float nb = math.min(bot, px)
-                float nt = math.max(top, px)
-                int wT = toTick(nt, cfg.mintick) - toTick(nb, cfg.mintick)
-                if near and wT <= limitTick and (bestLvl == 0 or wT < bestW or (wT == bestW and lvl < bestLvl))
-                    bestLvl := lvl
-                    bestW := wT
-                    bestBot := nb
-                    bestTop := nt
-    [bestLvl == 0 ? 0 : psychIdOfLevel(bestLvl), bestBot, bestTop]
+                if tGe(px, bot - cfg.clusterMaxWidth, cfg.mintick) and tLe(px, top + cfg.clusterMaxWidth, cfg.mintick)
+                    array.push(e.sTmpA, lvl)
+        int n = array.size(e.sTmpA)
+        if n > 0
+            int belowCnt = 0
+            int insideCnt = 0
+            for i = 0 to n - 1
+                float px = array.get(e.sTmpA, i) * 50.0
+                if tLt(px, bot, cfg.mintick)
+                    belowCnt += 1
+                else if tLe(px, top, cfg.mintick)
+                    insideCnt += 1
+            int aboveCnt = n - belowCnt - insideCnt
+            for dLow = 0 to belowCnt
+                for dHigh = 0 to aboveCnt
+                    float nb = dLow == 0 ? bot : array.get(e.sTmpA, belowCnt - dLow) * 50.0
+                    float nt = dHigh == 0 ? top : array.get(e.sTmpA, belowCnt + insideCnt + dHigh - 1) * 50.0
+                    bool joins = dLow > 0 or dHigh > 0 or insideCnt > 0
+                    int wT = toTick(nt, cfg.mintick) - toTick(nb, cfg.mintick)
+                    if joins and wT <= limitTick
+                        array.push(e.sPsyBot, nb)
+                        array.push(e.sPsyTop, nt)
+    array.size(e.sPsyBot)
+
+// Every live psychological price inside the adopted range takes part.
+collectPsychRoots(ZoneEngine e, ZoneCfg cfg, float bot, float top) =>
+    array.clear(e.sTmpB)
+    int loLvl = int(math.floor(bot / 50.0))
+    int hiLvl = int(math.ceil(top / 50.0))
+    for lvl = loLvl to hiLvl
+        int rid = psychIdOfLevel(lvl)
+        if slotOf(e, rid) >= 0
+            float px = lvl * 50.0
+            if tGe(px, bot, cfg.mintick) and tLe(px, top, cfg.mintick)
+                array.push(e.sTmpB, rid)
+    array.size(e.sTmpB)
 
 // Complete a candidate: MA quality from the final point density, then the FVG
 // localisation, then C / H / Density / Base Strong. Attached FVG working-set
@@ -1833,49 +1865,48 @@ scanBest(ZoneEngine e, ZoneCfg cfg, int side, int limitTick, bool requireStrong,
                     int maGap = maCnt == 2 ? maMaxT - maMinT : 0
                     float wBot = array.get(e.sLotPrice, i)
                     float wTop = array.get(e.sLotPrice, j)
-                    [pId, pBot, pTop] = psychAugment(e, cfg, wBot, wTop, limitTick)
-                    for vi = 0 to 1
-                        if vi == 0 or pId != 0
-                            float vBot = vi == 0 ? wBot : pBot
-                            float vTop = vi == 0 ? wTop : pTop
-                            int vCm = vi == 0 ? catMask : catMask | 32
-                            [aBot, aTop, aCm, aHm, awT, aden, cCnt, hCnt, strongI] =
-                                 completeCandidate(e, cfg, side, vBot, vTop, vCm, hMaskNoMa, maCnt, maUp, maDn, maGap, useFvg)
-                            bool okStrong = not requireStrong or strongI == 1
-                            bool okFvg = not requireFvg or (aCm & 16) != 0
-                            if okStrong and okFvg
-                                int aFt = formTime
-                                int aId = minId
-                                int an = array.size(e.sAttach)
-                                if an > 0
-                                    for q = 0 to an - 1
-                                        int fi = array.get(e.sAttach, q)
-                                        int fct = nz(array.get(e.sFvgConf, fi))
-                                        aFt := fct > aFt ? fct : aFt
-                                        int fid = array.get(e.sFvgId, fi)
-                                        aId := fid < aId ? fid : aId
-                                bool better = cCnt > bestC
-                                better := better or (cCnt == bestC and hCnt > bestH)
-                                better := better or (cCnt == bestC and hCnt == bestH and awT < bestW)
-                                better := better or (cCnt == bestC and hCnt == bestH and awT == bestW and aFt < bestT)
-                                better := better or (cCnt == bestC and hCnt == bestH and awT == bestW and aFt == bestT and aId < bestId)
-                                if bestI < 0 or better
-                                    bestI := i
-                                    bestJ := j
-                                    bestBot := vBot
-                                    bestTop := vTop
-                                    bestCm := vCm
-                                    bestHm := hMaskNoMa
-                                    bestMaCnt := maCnt
-                                    bestMaUp := maUp
-                                    bestMaDn := maDn
-                                    bestMaGap := maGap
-                                    bestPsych := vi == 0 ? 0 : pId
-                                    bestC := cCnt
-                                    bestH := hCnt
-                                    bestW := awT
-                                    bestT := aFt
-                                    bestId := aId
+                    int pv = psychVariants(e, cfg, wBot, wTop, limitTick)
+                    for vi = 0 to pv
+                        float vBot = vi == 0 ? wBot : array.get(e.sPsyBot, vi - 1)
+                        float vTop = vi == 0 ? wTop : array.get(e.sPsyTop, vi - 1)
+                        int vCm = vi == 0 ? catMask : catMask | 32
+                        [aBot, aTop, aCm, aHm, awT, aden, cCnt, hCnt, strongI] =
+                             completeCandidate(e, cfg, side, vBot, vTop, vCm, hMaskNoMa, maCnt, maUp, maDn, maGap, useFvg)
+                        bool okStrong = not requireStrong or strongI == 1
+                        bool okFvg = not requireFvg or (aCm & 16) != 0
+                        if okStrong and okFvg
+                            int aFt = formTime
+                            int aId = minId
+                            int an = array.size(e.sAttach)
+                            if an > 0
+                                for q = 0 to an - 1
+                                    int fi = array.get(e.sAttach, q)
+                                    int fct = nz(array.get(e.sFvgConf, fi))
+                                    aFt := fct > aFt ? fct : aFt
+                                    int fid = array.get(e.sFvgId, fi)
+                                    aId := fid < aId ? fid : aId
+                            bool better = cCnt > bestC
+                            better := better or (cCnt == bestC and hCnt > bestH)
+                            better := better or (cCnt == bestC and hCnt == bestH and awT < bestW)
+                            better := better or (cCnt == bestC and hCnt == bestH and awT == bestW and aFt < bestT)
+                            better := better or (cCnt == bestC and hCnt == bestH and awT == bestW and aFt == bestT and aId < bestId)
+                            if bestI < 0 or better
+                                bestI := i
+                                bestJ := j
+                                bestBot := vBot
+                                bestTop := vTop
+                                bestCm := vCm
+                                bestHm := hMaskNoMa
+                                bestMaCnt := maCnt
+                                bestMaUp := maUp
+                                bestMaDn := maDn
+                                bestMaGap := maGap
+                                bestPsych := vi == 0 ? 0 : 1
+                                bestC := cCnt
+                                bestH := hCnt
+                                bestW := awT
+                                bestT := aFt
+                                bestId := aId
                         e.statWindowEvals += 1
     [bestI, bestJ, bestBot, bestTop, bestCm, bestHm, bestMaCnt, bestMaUp, bestMaDn, bestMaGap, bestPsych]
 
@@ -1883,7 +1914,7 @@ scanBest(ZoneEngine e, ZoneCfg cfg, int side, int limitTick, bool requireStrong,
 // replayed for the winning window, which is deterministic for the same inputs,
 // and the participating roots are consumed here.
 adoptWindow(ZoneEngine e, ZoneCfg cfg, int side, int i, int j, float wBot, float wTop,
-     int cm, int hmNoMa, int maCnt, int maUp, int maDn, int maGap, int psychId, bool useFvg) =>
+     int cm, int hmNoMa, int maCnt, int maUp, int maDn, int maGap, int psychJoins, bool useFvg) =>
     [nb, nt, aCm, aHm, awT, aden, c, h, strongI] =
          completeCandidate(e, cfg, side, wBot, wTop, cm, hmNoMa, maCnt, maUp, maDn, maGap, useFvg)
     int start = array.size(e.candRootIds)
@@ -1894,9 +1925,12 @@ adoptWindow(ZoneEngine e, ZoneCfg cfg, int side, int i, int j, float wBot, float
             array.push(e.candRootIds, r.rootId)
             array.set(e.sUsed, k, 1)
             len += 1
-    if psychId != 0
-        array.push(e.candRootIds, psychId)
-        len += 1
+    if psychJoins != 0
+        int pn = collectPsychRoots(e, cfg, wBot, wTop)
+        if pn > 0
+            for q = 0 to pn - 1
+                array.push(e.candRootIds, array.get(e.sTmpB, q))
+                len += 1
     int an = array.size(e.sAttach)
     if an > 0
         for q = 0 to an - 1
@@ -2163,6 +2197,37 @@ clearLiveSide(SideViewState sv) =>
     sv.fvgFreshCount := 0
     sv.fvgStateMask := 0
 
+// Rebuild the Core origin set from the CURRENT Live Side Structure only, then
+// give back the waiting Roots this Core still owns (an invalidated FVG takes
+// part in no Side, but keeps the Core alive as InverseWait | Unavailable).
+// Roots that another Core took over on this bar, and dead Roots, are dropped.
+rebuildCoreOrigins(ZoneEngine e, ZoneCore c) =>
+    array.clear(e.sTmpB)
+    int on = array.size(c.originRootIds)
+    if on > 0
+        for q = 0 to on - 1
+            int rid = array.get(c.originRootIds, q)
+            Root r = rootOf(e, rid)
+            bool moved = map.contains(e.ownerOfRoot, rid) and map.get(e.ownerOfRoot, rid) != c.coreId
+            if not na(r) and not moved and r.state == 3
+                array.push(e.sTmpB, rid)
+    rebuildOriginIds(e, c)
+    int wn = array.size(e.sTmpB)
+    if wn > 0
+        for q = 0 to wn - 1
+            int rid = array.get(e.sTmpB, q)
+            if not array.includes(c.originRootIds, rid)
+                array.push(c.originRootIds, rid)
+    bool anyNonBroad = false
+    int n2 = array.size(c.originRootIds)
+    if n2 > 0
+        for q = 0 to n2 - 1
+            Root r = rootOf(e, array.get(c.originRootIds, q))
+            if not na(r) and not (r.category == 4 and r.isBroadFvg)
+                anyNonBroad := true
+                break
+    c.isBroadContextCore := not anyNonBroad
+
 applyCandidate(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int k, BaseFeed f) =>
     int side = array.get(e.candSide, k)
     SideViewState sv = viewOf(c, side)
@@ -2230,15 +2295,20 @@ candSharesOrigin(ZoneEngine e, ZoneCore c, int k) =>
 // Touch history is always rebuilt from the real TouchMarks: same Side, same
 // time and same contact range count once, and only marks that actually touch
 // the current range are kept.
+// Episode identity (spec 12.2 "same time and same contact counts once"):
+// Side + time + contact range in ticks + normal/non-normal. Two contacts on the
+// same bar at different price bands are different Episodes.
+sameEpisode(ZoneCfg cfg, TouchMark a, TouchMark b) =>
+    a.side == b.side and a.time == b.time and a.isNormalTouch == b.isNormalTouch and
+     toTick(a.contactBottom, cfg.mintick) == toTick(b.contactBottom, cfg.mintick) and
+     toTick(a.contactTop, cfg.mintick) == toTick(b.contactTop, cfg.mintick)
+
 markIsDuplicate(ZoneEngine e, ZoneCfg cfg, ZoneCore c, TouchMark tm) =>
     int n = array.size(c.touchMarks)
     bool dup = false
     if n > 0
         for i = 0 to n - 1
-            TouchMark o = array.get(c.touchMarks, i)
-            if o.side == tm.side and o.time == tm.time and o.isNormalTouch == tm.isNormalTouch and
-                 toTick(o.contactBottom, cfg.mintick) == toTick(tm.contactBottom, cfg.mintick) and
-                 toTick(o.contactTop, cfg.mintick) == toTick(tm.contactTop, cfg.mintick)
+            if sameEpisode(cfg, array.get(c.touchMarks, i), tm)
                 dup := true
                 break
     dup
@@ -2259,7 +2329,6 @@ rebuildSideHistory(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int side) =>
     float rt = na(sv.effectiveBottom) ? c.physTop : sv.effectiveTop
     if not na(rb)
         int cnt = 0
-        int lastT = na
         bool wDepth = false
         float mDepth = 0.0
         int n = array.size(c.touchMarks)
@@ -2267,9 +2336,15 @@ rebuildSideHistory(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int side) =>
             for i = 0 to n - 1
                 TouchMark tm = array.get(c.touchMarks, i)
                 if tm.side == side and tm.isNormalTouch and intersectsT(tm.contactBottom, tm.contactTop, rb, rt, cfg.mintick)
-                    if na(lastT) or tm.time != lastT
+                    bool seen = false
+                    if i > 0
+                        for q = 0 to i - 1
+                            TouchMark o = array.get(c.touchMarks, q)
+                            if o.side == side and o.isNormalTouch and intersectsT(o.contactBottom, o.contactTop, rb, rt, cfg.mintick) and sameEpisode(cfg, o, tm)
+                                seen := true
+                                break
+                    if not seen
                         cnt += 1
-                        lastT := tm.time
                     wDepth := wDepth or tm.weakByDepth
                     mDepth := math.max(mDepth, tm.maxDepthPct)
         // A truncated mark history can never lower the count, clear Weak or
@@ -2288,13 +2363,19 @@ rebuildSideHistory(ZoneEngine e, ZoneCfg cfg, ZoneCore c, int side) =>
 // After a Merge or a Split the Episodes that do not belong to the new physical
 // range are dropped, so a later Split cannot re-use unrelated history. Split
 // children are all created from the pre-split set before this runs.
+// Episodes that no longer belong to the current physical Core range are
+// dropped after a Merge or a Split, for one sided Cores as well. The Episode of
+// a running ActiveTouch is never removed, and Split children are all built from
+// the pre-split set before this runs.
 pruneMarksToRange(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
-    if not na(c.supportView.effectiveBottom) and not na(c.resistanceView.effectiveBottom)
+    if not na(c.physBottom)
         int n = array.size(c.touchMarks)
         if n > 0
             for i = n - 1 to 0
                 TouchMark tm = array.get(c.touchMarks, i)
-                if not intersectsT(tm.contactBottom, tm.contactTop, c.physBottom, c.physTop, cfg.mintick)
+                bool isActive = (not na(c.supportView.activeMark) and c.supportView.activeMark == tm) or
+                     (not na(c.resistanceView.activeMark) and c.resistanceView.activeMark == tm)
+                if not isActive and not intersectsT(tm.contactBottom, tm.contactTop, c.physBottom, c.physTop, cfg.mintick)
                     array.remove(c.touchMarks, i)
 
 rebuildCoreHistory(ZoneEngine e, ZoneCfg cfg, ZoneCore c) =>
@@ -2463,25 +2544,23 @@ associateCandidates(ZoneEngine e, ZoneCfg cfg, BaseFeed f) =>
             if not c.alive
                 array.remove(e.cores, i)
             else
-                int on = array.size(c.originRootIds)
-                if on > 0
-                    for q = on - 1 to 0
-                        int rid = array.get(c.originRootIds, q)
-                        Root r = rootOf(e, rid)
-                        bool moved = map.contains(e.ownerOfRoot, rid) and map.get(e.ownerOfRoot, rid) != c.coreId
-                        if na(r) or moved
-                            array.remove(c.originRootIds, q)
+                // 1) Side apply / clear is already done for the applied sides
                 for si = 0 to 1
                     int side = si == 0 ? 1 : -1
                     SideViewState sv = viewOf(c, side)
                     bool applied = (side == 1 ? c.appliedSupSeq : c.appliedResSeq) == f.seq
                     if not applied and sv.history.phase != 2
                         clearLiveSide(sv)
-                if c.historyDirty
-                    refreshCoreRange(c)
-                    if not na(c.supportView.effectiveBottom) and not na(c.resistanceView.effectiveBottom)
-                        pruneMarksToRange(e, cfg, c)
-                        c.historyDirty := false
+                // 2) physical range and 3) origin set always come from the
+                //    current Live Side Structure, independently of historyDirty
+                refreshCoreRange(c)
+                rebuildCoreOrigins(e, c)
+                // 4) Touch Episode re-allocation only after a Merge or a Split
+                if c.historyDirty and not na(c.physBottom)
+                    pruneMarksToRange(e, cfg, c)
+                    rebuildCoreHistory(e, cfg, c)
+                    c.historyDirty := false
+                // 5) Zone lifetime
                 bool waitingState = coreHasActiveTouch(c) or c.breakSnap.valid or c.pendingTopology or
                      c.pendingGeneration or c.supportView.history.phase == 3 or c.supportView.history.phase == 4 or
                      c.resistanceView.history.phase == 3 or c.resistanceView.history.phase == 4
