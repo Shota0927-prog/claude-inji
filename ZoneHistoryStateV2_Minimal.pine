@@ -25,7 +25,7 @@ library("ZoneHistoryStateV2_Minimal", overlay = true)
 //   Root composition remain owned by ZoneCoreV2_Common / ZoneCurrentEngineV2.
 //   This file never becomes the source of truth for where a Zone is.
 // ============================================================================
-const string HIST_BUILD_ID = "ZONEHIST-V2-MIN-20260920"
+const string HIST_BUILD_ID = "ZONEHIST-V2-MIN-20260920-R2"
 export histBuildId() => HIST_BUILD_ID
 
 import sekine3310/ZoneCoreV2_Common/1 as zc
@@ -133,10 +133,25 @@ export type TrackedZone
     bool genCandAway
     int genCandArmedFromSeq
     int lastRelevantTime
-    // Reference structure for the New Generation test (section 31): the
-    // category mask of the latest TouchSnapshot, else the BreakSnapshot, else
-    // the structure this generation started with. A scalar, not an event log.
-    int refCategoryMask
+    // Section 6. Reference structure for the New Generation test, resolved as
+    // latest TouchSnapshot, else BreakSnapshot, else generation start.
+    int liveCategoryMask
+    int touchSnapshotCategoryMask
+    int breakSnapshotCategoryMask
+    int generationStartCategoryMask
+    bool hasTouchSnapshotMask
+    bool hasBreakSnapshotMask
+    // Section 7. A Zone inside the build window that no Candidate produced is
+    // no longer structurally there and must stop being tracked or matched.
+    bool structurallyPresent
+    int lastSeenBuildSeq
+    // Section 8. Previous-bar window membership, for the re-entry rebuild.
+    bool wasInBuildWindow
+    // Section 11. Depth of the CURRENT episode only.
+    float episodeMaxDepthPct
+    bool episodeWeakByDepth
+    // Section 12. Transient per-build claim counter for Merge / Split ambiguity.
+    int buildMatchCount
 
 export type HistEngine
     // The SAME Collector the Current engine fills. Source collection is never
@@ -198,6 +213,12 @@ export type HistEngine
     int emaGuardBreaches
     int maxTouchMarkUsage
     int maxTrackedSeen
+    int retiredZones
+    int flipCount
+    int mergeSplitEvents
+    // Transient result of the last f_matchTracked call (section 12).
+    int lastMatchTotal
+    int lastMatchTaken
     // Set when a Generation commits (section 11 event 12), so the next bar
     // rebuilds the local topology once.
     bool pendingTopology
@@ -218,7 +239,8 @@ export newHistEngine(ze.Collector col) => HistEngine.new(
      wCurWeekHigh = na, wCurWeekLow = na,
      histBars = 0, topologyEvents = 0, localBuilds = 0, noBuildBars = 0, touchEvents = 0,
      generationCount = 0, emaGuardHits = 0, emaGuardBreaches = 0, maxTouchMarkUsage = 0,
-     maxTrackedSeen = 0, pendingTopology = false)
+     maxTrackedSeen = 0, retiredZones = 0, flipCount = 0, mergeSplitEvents = 0,
+     lastMatchTotal = 0, lastMatchTaken = 0, pendingTopology = false)
 
 // ============================================================================
 // Step 3a: Root assembly.
@@ -256,7 +278,7 @@ f_insertByPriority(array<int> order, array<float> dists, array<int> confs, int i
     array.insert(order, pos, idx)
     true
 
-f_addSwingsFromRing(SwingRing r, array<float> px, array<int> sub, array<int> ori,
+f_addSwingsFromRing(ze.SwingRing r, array<float> px, array<int> sub, array<int> ori,
                     array<int> oriEnd, array<int> conf, array<int> tf, float lo, float hi) =>
     int n = array.size(r.price)
     if n > 0
@@ -345,7 +367,7 @@ f_buildSwingRoots(HistEngine eng, zc.ZoneCfg c, float refClose, float lo, float 
                      array.get(px, i), 0, 0, 0, false, c)
     true
 
-f_addAccumFromRing(AccumRing r, array<float> top, array<float> bot, array<int> pk,
+f_addAccumFromRing(ze.AccumRing r, array<float> top, array<float> bot, array<int> pk,
                    array<int> ori, array<int> conf, array<int> tf, float lo, float hi) =>
     int n = array.size(r.top)
     if n > 0
@@ -397,7 +419,7 @@ f_buildAccumRoots(HistEngine eng, zc.ZoneCfg c, float refClose, float lo, float 
                      array.get(bot, i), array.get(pk, i), 0, 0, false, c)
     true
 
-f_addFvgFromRing(FvgRing r, array<int> dir, array<float> bot, array<float> top, array<int> ori,
+f_addFvgFromRing(ze.FvgRing r, array<int> dir, array<float> bot, array<float> top, array<int> ori,
                  array<int> conf, array<bool> fresh, array<int> st, array<int> tf, float lo, float hi) =>
     int n = array.size(r.direction)
     if n > 0
@@ -462,7 +484,7 @@ f_addTimeRoot(HistEngine eng, zc.ZoneCfg c, int subtype, float price, int origin
 
 f_buildTimeRoots(HistEngine eng, zc.ZoneCfg c, float lo, float hi, int nowTime) =>
     if c.enableTimeHL
-        TimeHLState t = eng.col.tm
+        ze.TimeHLState t = eng.col.tm
         f_addTimeRoot(eng, c, zc.subTimeHigh(), t.curSessionHigh, t.curSessionHighOrigin, TL_CUR_SESSION, lo, hi, nowTime)
         f_addTimeRoot(eng, c, zc.subTimeLow(), t.curSessionLow, t.curSessionLowOrigin, TL_CUR_SESSION, lo, hi, nowTime)
         f_addTimeRoot(eng, c, zc.subTimeHigh(), t.prevSessionHigh, t.prevSessionHighOrigin, TL_PREV_SESSION, lo, hi, nowTime)
@@ -562,9 +584,17 @@ f_shareStableOrigin(array<string> a, array<string> b) =>
 // ============================================================================
 f_inWindow(float px, float lo, float hi) => not na(px) and px >= lo and px <= hi
 
-f_newestSwingPrice(ze.SwingRing r) =>
+// Section 9: the newest entry of ONE subtype. The ring is only walked when a
+// watermark actually moved, so an ordinary bar never reaches this.
+f_newestSwingPriceOf(ze.SwingRing r, int subtype) =>
+    float p = na
     int n = array.size(r.price)
-    n > 0 ? array.get(r.price, n - 1) : na
+    if n > 0
+        for i = n - 1 to 0
+            if array.get(r.subtype, i) == subtype
+                p := array.get(r.price, i)
+                break
+    p
 
 f_newestFvgConf(ze.FvgRing r) =>
     int n = array.size(r.confirmedTime)
@@ -572,10 +602,13 @@ f_newestFvgConf(ze.FvgRing r) =>
 
 f_swingEvent(HistEngine eng, ze.SwingRing r, int wHigh, int wLow, float lo, float hi) =>
     bool ev = false
+    // Section 9: a High watermark change is tested against the newest SWING
+    // HIGH and a Low change against the newest SWING LOW, never against a
+    // shared "newest of the ring" that may be the wrong side.
     if (na(wHigh) and not na(r.lastHighConfirmed)) or (not na(r.lastHighConfirmed) and r.lastHighConfirmed != wHigh)
-        ev := f_inWindow(f_newestSwingPrice(r), lo, hi)
+        ev := f_inWindow(f_newestSwingPriceOf(r, zc.subSwingHigh()), lo, hi)
     if not ev and ((na(wLow) and not na(r.lastLowConfirmed)) or (not na(r.lastLowConfirmed) and r.lastLowConfirmed != wLow))
-        ev := f_inWindow(f_newestSwingPrice(r), lo, hi)
+        ev := f_inWindow(f_newestSwingPriceOf(r, zc.subSwingLow()), lo, hi)
     ev
 
 f_accumEvent(ze.AccumRing r, int w, float lo, float hi) =>
@@ -588,16 +621,55 @@ f_accumEvent(ze.AccumRing r, int w, float lo, float hi) =>
             ev := t >= lo and b <= hi
     ev
 
+// Section 10: a bare size() cannot see one InverseWait entry leaving while
+// another arrives on the same bar. Fold count, index sum and a position
+// weighted sum into one scalar instead. Only the InverseWait list is walked,
+// never the whole FVG ring.
+f_fvgInvSignature(ze.FvgRing r) =>
+    int n = array.size(r.inverseWaitIndexes)
+    int sum = 0
+    int wsum = 0
+    if n > 0
+        for i = 0 to n - 1
+            int v = array.get(r.inverseWaitIndexes, i)
+            sum += v
+            wsum += v * (i + 1)
+    n * 1000003 + sum * 31 + wsum
+
 f_fvgEvent(ze.FvgRing r, int wSize, int wInv, int wConf) =>
     // Formation changes the ring size, or at capacity changes the newest
     // confirmed time. Structural invalidation and inverse confirmation both
-    // change the InverseWait list size.
+    // change the InverseWait signature.
     int sz = array.size(r.direction)
-    int iw = array.size(r.inverseWaitIndexes)
+    int iw = f_fvgInvSignature(r)
     int cf = f_newestFvgConf(r)
     bool ev = sz != wSize or iw != wInv
     ev := ev or (not na(cf) and (na(wConf) or cf != wConf))
     ev
+
+// Section 8: a Zone that was outside the build window and is now back inside
+// it missed every structural change that happened meanwhile, so it needs one
+// Local Build before this bar's touch judgment.
+f_zoneInBuildWindow(TrackedZone z, float lo, float hi) =>
+    not na(z.bottom) and not na(z.top) and z.top >= lo and z.bottom <= hi
+
+f_windowReentry(HistEngine eng, float lo, float hi) =>
+    bool ev = false
+    int n = array.size(eng.zones)
+    if n > 0
+        for i = 0 to n - 1
+            TrackedZone z = array.get(eng.zones, i)
+            if not ev and z.alive and f_zoneInBuildWindow(z, lo, hi) and not z.wasInBuildWindow
+                ev := true
+    ev
+
+f_syncWindowFlags(HistEngine eng, float lo, float hi) =>
+    int n = array.size(eng.zones)
+    if n > 0
+        for i = 0 to n - 1
+            TrackedZone z = array.get(eng.zones, i)
+            z.wasInBuildWindow := f_zoneInBuildWindow(z, lo, hi)
+    true
 
 f_emaGuardCheck(HistEngine eng, ze.Collector col, zc.ZoneCfg c) =>
     bool breach = false
@@ -617,6 +689,8 @@ f_detectTopologyEvent(HistEngine eng, ze.Collector col, zc.ZoneCfg c, float refC
     float lo = refClose - HIST_BUILD_DISTANCE
     float hi = refClose + HIST_BUILD_DISTANCE
     bool ev = eng.pendingTopology
+    // Section 8: window re-entry is a topology event in its own right.
+    ev := ev or f_windowReentry(eng, lo, hi)
 
     if c.enableSwing
         ev := ev or f_swingEvent(eng, col.sw5, eng.w5High, eng.w5Low, lo, hi)
@@ -659,9 +733,9 @@ f_syncWatermarks(HistEngine eng, ze.Collector col) =>
     eng.wFvg1hSize := array.size(col.fvg1h.direction)
     eng.wFvg4hSize := array.size(col.fvg4h.direction)
     eng.wFvg1dSize := array.size(col.fvg1d.direction)
-    eng.wFvg1hInv := array.size(col.fvg1h.inverseWaitIndexes)
-    eng.wFvg4hInv := array.size(col.fvg4h.inverseWaitIndexes)
-    eng.wFvg1dInv := array.size(col.fvg1d.inverseWaitIndexes)
+    eng.wFvg1hInv := f_fvgInvSignature(col.fvg1h)
+    eng.wFvg4hInv := f_fvgInvSignature(col.fvg4h)
+    eng.wFvg1dInv := f_fvgInvSignature(col.fvg1d)
     eng.wFvg1hConf := f_newestFvgConf(col.fvg1h)
     eng.wFvg4hConf := f_newestFvgConf(col.fvg4h)
     eng.wFvg1dConf := f_newestFvgConf(col.fvg1d)
@@ -755,6 +829,13 @@ f_addedIndependentCategory(int newMask, int refMask) =>
 f_zoneConsumed(TrackedZone z) =>
     z.touchCount > 0 or z.weakByDepth or z.weakByTouch or z.breakValid or not z.zoneFresh
 
+// Section 6: the structure a New Generation is measured AGAINST. The latest
+// TouchSnapshot wins, else the BreakSnapshot, else the structure this
+// generation started from. The live mask is never the reference, or a Zone
+// would be compared against itself.
+f_refMask(TrackedZone z) =>
+    z.hasTouchSnapshotMask ? z.touchSnapshotCategoryMask : z.hasBreakSnapshotMask ? z.breakSnapshotCategoryMask : z.generationStartCategoryMask
+
 f_newTracked(HistEngine eng, int side, bool historyKnown, int nowTime) =>
     TrackedZone z = TrackedZone.new(alive = true, trackerId = eng.nextTrackerId, side = side,
          stableOrigins = array.new<string>(), generationId = 1, historyKnown = historyKnown,
@@ -767,7 +848,11 @@ f_newTracked(HistEngine eng, int side, bool historyKnown, int nowTime) =>
          generationWatch = false, createdTime = nowTime, lastTopologySeenTime = nowTime,
          dormant = false, touchMarks = array.new<TouchMark>(), touchHistoryTruncated = false,
          genCandBottom = na, genCandTop = na, genCandMask = 0, genCandAway = false,
-         genCandArmedFromSeq = na, lastRelevantTime = nowTime, refCategoryMask = 0)
+         genCandArmedFromSeq = na, lastRelevantTime = nowTime,
+         liveCategoryMask = 0, touchSnapshotCategoryMask = 0, breakSnapshotCategoryMask = 0,
+         generationStartCategoryMask = 0, hasTouchSnapshotMask = false, hasBreakSnapshotMask = false,
+         structurallyPresent = true, lastSeenBuildSeq = na, wasInBuildWindow = false,
+         episodeMaxDepthPct = 0.0, episodeWeakByDepth = false, buildMatchCount = 0)
     eng.nextTrackerId += 1
     array.push(eng.zones, z)
     z
@@ -778,16 +863,31 @@ f_newTracked(HistEngine eng, int side, bool historyKnown, int nowTime) =>
 f_matchTracked(HistEngine eng, zc.Candidate cnd, int side, zc.ZoneCfg c, array<string> keys, int nowTime) =>
     TrackedZone best = na
     float bestGap = 1e12
+    int total = 0
+    int taken = 0
+    float cb = zc.candidateBottom(cnd)
+    float ct = zc.candidateTop(cnd)
     int n = array.size(eng.zones)
     if n > 0
         for i = 0 to n - 1
             TrackedZone z = array.get(eng.zones, i)
-            if z.alive and z.side == side and z.lastTopologySeenTime != nowTime and not na(z.bottom)
-                float g = f_gapBetween(z.bottom, z.top, zc.candidateBottom(cnd), zc.candidateTop(cnd))
-                if g <= c.clusterMaxWidth and g < bestGap
-                    if f_shareStableOrigin(z.stableOrigins, keys)
+            if z.alive and z.side == side and not na(z.bottom)
+                float g = f_gapBetween(z.bottom, z.top, cb, ct)
+                if g <= c.clusterMaxWidth and f_shareStableOrigin(z.stableOrigins, keys)
+                    total += 1
+                    if z.lastTopologySeenTime == nowTime
+                        // Section 12: a Zone an earlier Candidate already
+                        // claimed on this build. The split is not uniquely
+                        // provable, so that Zone loses its proven past. It is
+                        // NOT reset to Touch 0 / Fresh / Strong.
+                        taken += 1
+                        z.historyKnown := false
+                        eng.mergeSplitEvents += 1
+                    else if g < bestGap
                         bestGap := g
                         best := z
+    eng.lastMatchTotal := total
+    eng.lastMatchTaken := taken
     best
 
 // Section 15: historyKnown may only be true when the tracker can PROVE the Zone
@@ -829,13 +929,21 @@ f_applyStructure(HistEngine eng, TrackedZone z, zc.Candidate cnd, array<string> 
     z.lastTopologySeenTime := nowTime
     z.lastRelevantTime := nowTime
 
+    // Section 7: this Zone was produced by a Candidate on this build, so it is
+    // structurally there.
+    z.structurallyPresent := true
+    z.lastSeenBuildSeq := seq
+    z.buildMatchCount += 1
+
     int newMask = zc.candidateCategoryMask(cnd)
-    if z.refCategoryMask == 0
-        z.refCategoryMask := newMask
+    z.liveCategoryMask := newMask
+    if z.generationStartCategoryMask == 0
+        z.generationStartCategoryMask := newMask
+    int refMask = f_refMask(z)
     // Section 31: a consumed Zone that gains an independent non-Psych, non-MA
     // category and is Base Strong becomes a New Generation candidate. It still
     // has to leave by ResetDistance and come back before the generation turns.
-    if not z.generationWatch and f_zoneConsumed(z) and zc.candidateBaseStrong(cnd) and f_addedIndependentCategory(newMask, z.refCategoryMask)
+    if not z.generationWatch and f_zoneConsumed(z) and zc.candidateBaseStrong(cnd) and f_addedIndependentCategory(newMask, refMask)
         z.generationWatch := true
         z.genCandMask := newMask
         z.genCandBottom := z.bottom
@@ -851,8 +959,20 @@ f_reconcile(HistEngine eng, array<zc.Candidate> cands, int side, zc.ZoneCfg c, i
             zc.Candidate cnd = array.get(cands, i)
             array<string> keys = f_candidateKeys(eng, cnd, c)
             TrackedZone z = f_matchTracked(eng, cnd, side, c, keys, nowTime)
+            // Section 12: lineage has to be UNIQUELY provable. One Candidate
+            // covering several tracked Zones (a merge) or several Candidates
+            // covering one tracked Zone (a split) leaves the past unproven.
+            bool ambiguous = eng.lastMatchTotal > 1 or eng.lastMatchTaken > 0
             if na(z)
-                z := f_newTracked(eng, side, f_birthObserved(eng, cnd, c), nowTime)
+                bool observed = f_birthObserved(eng, cnd, c) and not ambiguous
+                z := f_newTracked(eng, side, observed, nowTime)
+                if ambiguous
+                    eng.mergeSplitEvents += 1
+            else if ambiguous
+                // Truncated TouchMarks plus a merge / split can never stay
+                // known; neither can an untruncated one, so this is flat.
+                z.historyKnown := false
+                eng.mergeSplitEvents += 1
             f_applyStructure(eng, z, cnd, keys, c, seq, nowTime)
     true
 
@@ -883,10 +1003,37 @@ f_enforceCapacity(HistEngine eng, float refClose) =>
         array.remove(eng.zones, worst)
     true
 
+// Section 7: every Zone inside the build window starts the build unclaimed.
+// Zones OUTSIDE the window are left alone: absence there proves nothing, so a
+// far Dormant Zone is never retired for it.
+f_markBuildWindow(HistEngine eng, float lo, float hi) =>
+    int n = array.size(eng.zones)
+    if n > 0
+        for i = 0 to n - 1
+            TrackedZone z = array.get(eng.zones, i)
+            z.buildMatchCount := 0
+            if f_zoneInBuildWindow(z, lo, hi)
+                z.structurallyPresent := false
+    true
+
+// Section 7: a Zone inside the window that no Candidate produced is no longer
+// structurally there. It stops being tracked and stops being matchable.
+f_retireVanished(HistEngine eng, float lo, float hi) =>
+    int i = array.size(eng.zones) - 1
+    while i >= 0
+        TrackedZone z = array.get(eng.zones, i)
+        if f_zoneInBuildWindow(z, lo, hi) and not z.structurallyPresent
+            z.alive := false
+            array.remove(eng.zones, i)
+            eng.retiredZones += 1
+        i -= 1
+    true
+
 f_localBuild(HistEngine eng, zc.ZoneCfg c, float refClose, int seq, int nowTime) =>
     zc.clearRoots(eng.roots)
     float lo = refClose - HIST_BUILD_DISTANCE
     float hi = refClose + HIST_BUILD_DISTANCE
+    f_markBuildWindow(eng, lo, hi)
     f_buildMaRoots(eng, c, lo, hi, nowTime)
     f_buildSwingRoots(eng, c, refClose, lo, hi)
     f_buildAccumRoots(eng, c, refClose, lo, hi)
@@ -897,6 +1044,7 @@ f_localBuild(HistEngine eng, zc.ZoneCfg c, float refClose, int seq, int nowTime)
     array<zc.Candidate> res = zc.buildCandidates(eng.roots, c, zc.sideConstResistance(), lo, hi, refClose, seq, nowTime)
     f_reconcile(eng, sup, zc.sideConstSupport(), c, seq, nowTime)
     f_reconcile(eng, res, zc.sideConstResistance(), c, seq, nowTime)
+    f_retireVanished(eng, lo, hi)
     f_enforceCapacity(eng, refClose)
     f_refreshEmaGuards(eng, eng.col, c)
     eng.localBuilds += 1
@@ -911,14 +1059,23 @@ f_localBuild(HistEngine eng, zc.ZoneCfg c, float refClose, int seq, int nowTime)
 // ============================================================================
 export upcomingTouchNo(TrackedZone z) => z.touchCount + 1
 
-f_gradeOf(TrackedZone z, zc.ZoneCfg c) =>
-    int up = z.touchCount + 1
+// Section 2: the grade is always evaluated on an EXPLICIT touch number. A
+// TouchStartSnapshot is graded on the touch that is happening, not on the one
+// after it, so Touch 1 can never come out Weak on a WeakFromTouch of 2.
+f_gradeAt(TrackedZone z, zc.ZoneCfg c, int touchNo) =>
     int g = GR_UNAVAILABLE
     if z.historyKnown
-        bool weak = z.weakByDepth or (not c.weakFromTouchOff and up >= c.weakFromTouch)
-        bool strong = z.baseStrong and not z.weakByDepth and (c.strongUnlimited or up <= c.strongUntilTouch)
+        bool weak = z.weakByDepth or (not c.weakFromTouchOff and touchNo >= c.weakFromTouch)
+        bool strong = z.baseStrong and not z.weakByDepth and (c.strongUnlimited or touchNo <= c.strongUntilTouch)
         g := weak ? GR_WEAK : strong ? GR_STRONG : GR_NEUTRAL
     g
+
+f_gradeOf(TrackedZone z, zc.ZoneCfg c) => f_gradeAt(z, c, z.touchCount + 1)
+
+// Section 3: a Zone in ActiveTouch is described by the touch it is IN. A Zone
+// waiting for the next one is described by the touch that is coming.
+f_displayTouchNo(TrackedZone z) =>
+    (z.touchActive or z.phase == PH_ACTIVE_TOUCH) ? z.touchCount : z.touchCount + 1
 
 f_pushTouchMark(HistEngine eng, TrackedZone z, int nowTime, float barHigh, float barLow) =>
     float cb = math.max(barLow, z.touchSnapshotBottom)
@@ -941,25 +1098,108 @@ f_sealTouchMark(TrackedZone z) =>
     if n > 0
         TouchMark tm = array.get(z.touchMarks, n - 1)
         if tm.generationId == z.generationId and tm.touchNo == z.touchCount
-            tm.maxDepthPct := z.maxDepthPct
-            tm.weakByDepth := z.weakByDepth
+            // Section 11: a TouchMark records the depth of ITS OWN episode. The
+            // generation level z.maxDepthPct / z.weakByDepth stay cumulative.
+            tm.maxDepthPct := z.episodeMaxDepthPct
+            tm.weakByDepth := z.episodeWeakByDepth
     true
 
 f_startTouch(HistEngine eng, TrackedZone z, zc.ZoneCfg c, float barHigh, float barLow, int seq, int nowTime) =>
     z.touchCount += 1
     z.zoneFresh := false
     z.sideFresh := false
-    z.weakByTouch := not c.weakFromTouchOff and (z.touchCount + 1) >= c.weakFromTouch
+    // Section 2: judged on THIS touch, after the increment.
+    z.weakByTouch := not c.weakFromTouchOff and z.touchCount >= c.weakFromTouch
+    // Section 11: the episode depth starts empty; the generation total does not.
+    z.episodeMaxDepthPct := 0.0
+    z.episodeWeakByDepth := false
     // Section 22: the episode is decided by this snapshot alone from here on.
     z.touchSnapshotBottom := z.bottom
     z.touchSnapshotTop := z.top
     z.touchSnapshotReference := z.reference
-    z.touchSnapshotGrade := f_gradeOf(z, c)
+    z.touchSnapshotGrade := f_gradeAt(z, c, z.touchCount)
+    // Section 6: the structure this episode is measured against from here on.
+    z.touchSnapshotCategoryMask := z.liveCategoryMask
+    z.hasTouchSnapshotMask := true
     z.touchActive := true
     z.phase := PH_ACTIVE_TOUCH
     z.armedFromSeq := na
     f_pushTouchMark(eng, z, nowTime, barHigh, barLow)
     eng.touchEvents += 1
+    true
+
+// Section 4. The outcome of an ActiveTouch, evaluated on the SAME bar the touch
+// started on as well as on every later bar of the episode. The order is fixed:
+// WeakDepth, then Break, then Reset. Break beats Reset on the same bar. Every
+// test uses the TouchStartSnapshot only, and the next Touch can never start
+// before seq + 1.
+f_processActiveTouchOutcome(TrackedZone z, zc.ZoneCfg c, float barClose, int seq) =>
+    bool handled = false
+    if z.touchActive
+        bool support = z.side == zc.sideConstSupport()
+        float sb = z.touchSnapshotBottom
+        float st = z.touchSnapshotTop
+
+        // Section 24: confirmed close only, snapshot width, no WeakDepth on a
+        // line Zone, and never cleared inside the generation.
+        float width = st - sb
+        if width > 0 and not c.weakDepthOff
+            float depth = support ? (st - barClose) / width * 100.0 : (barClose - sb) / width * 100.0
+            depth := math.max(0.0, math.min(100.0, depth))
+            z.maxDepthPct := math.max(z.maxDepthPct, depth)
+            z.episodeMaxDepthPct := math.max(z.episodeMaxDepthPct, depth)
+            if depth >= c.weakDepthPct
+                z.weakByDepth := true
+                z.episodeWeakByDepth := true
+
+        // Section 26: Break is judged against the TouchStartSnapshot only.
+        bool broken = support ? barClose <= sb - c.breakBuffer : barClose >= st + c.breakBuffer
+        if broken
+            f_sealTouchMark(z)
+            z.touchActive := false
+            z.phase := PH_BROKEN
+            z.breakValid := true
+            z.breakSnapshotBottom := sb
+            z.breakSnapshotTop := st
+            // Section 6: the Break inherits the structure of the episode it ends.
+            z.breakSnapshotCategoryMask := z.touchSnapshotCategoryMask
+            z.hasBreakSnapshotMask := true
+            z.breakMovedAway := false
+            handled := true
+        else
+            // Section 25: Reset may land on the Touch bar, but the next Touch
+            // cannot start on it.
+            bool reset = support ? barClose >= st + c.touchResetDistance : barClose <= sb - c.touchResetDistance
+            if reset
+                f_sealTouchMark(z)
+                z.touchActive := false
+                z.phase := PH_ARMED
+                z.armedFromSeq := seq + 1
+                handled := true
+    handled
+
+// Section 13. A confirmed re-break from the far side is a FLIP. The Zone does
+// not carry on as the old side in WAITING. Side history cannot be proven across
+// the flip, so the new side starts UNKNOWN; it is never reset to Touch 0 /
+// Fresh / Strong, and it can never be matched to a Current Zone of the old side.
+f_flipSide(HistEngine eng, TrackedZone z) =>
+    z.side := z.side == zc.sideConstSupport() ? zc.sideConstResistance() : zc.sideConstSupport()
+    z.historyKnown := false
+    z.zoneFresh := false
+    z.sideFresh := false
+    z.touchActive := false
+    z.breakValid := false
+    z.breakMovedAway := false
+    z.hasTouchSnapshotMask := false
+    z.hasBreakSnapshotMask := false
+    z.generationWatch := false
+    z.genCandAway := false
+    z.genCandArmedFromSeq := na
+    // The TouchMarks on record belong to the side that is gone.
+    z.touchHistoryTruncated := true
+    z.phase := PH_WAITING
+    z.armedFromSeq := na
+    eng.flipCount += 1
     true
 
 // Section 31. The generation turns BEFORE the contact is counted, so the very
@@ -984,7 +1224,16 @@ f_generationStep(HistEngine eng, TrackedZone z, zc.ZoneCfg c, float barHigh, flo
                 z.maxDepthPct := 0.0
                 array.clear(z.touchMarks)
                 z.touchHistoryTruncated := false
-                z.refCategoryMask := z.genCandMask
+                // Section 6: the new generation starts from the structure that
+                // created it, with no snapshot of the previous one left.
+                z.generationStartCategoryMask := z.genCandMask
+                z.liveCategoryMask := z.genCandMask
+                z.touchSnapshotCategoryMask := 0
+                z.breakSnapshotCategoryMask := 0
+                z.hasTouchSnapshotMask := false
+                z.hasBreakSnapshotMask := false
+                z.episodeMaxDepthPct := 0.0
+                z.episodeWeakByDepth := false
                 z.generationWatch := false
                 z.genCandAway := false
                 z.genCandArmedFromSeq := na
@@ -1015,7 +1264,16 @@ f_trackZone(HistEngine eng, TrackedZone z, zc.ZoneCfg c, float barHigh, float ba
 
     if not z.dormant and not na(z.bottom)
         z.lastRelevantTime := nowTime
-        bool handled = f_generationStep(eng, z, c, barHigh, barLow, barClose, seq)
+        // Section 5: the generation is judged FIRST, so no old generation touch
+        // judgment can run on this bar.
+        bool committed = f_generationStep(eng, z, c, barHigh, barLow, barClose, seq)
+        bool handled = false
+        if committed
+            // The very contact that turned the generation IS Touch 1 of the new
+            // one, on this same bar, with this same bar's outcome applied.
+            f_startTouch(eng, z, c, barHigh, barLow, seq, nowTime)
+            f_processActiveTouchOutcome(z, c, barClose, seq)
+            handled := true
 
         if not handled and z.breakValid
             // Section 28: Reclaim needs no MovedAway.
@@ -1038,50 +1296,18 @@ f_trackZone(HistEngine eng, TrackedZone z, zc.ZoneCfg c, float barHigh, float ba
                 if recontact
                     bool confirm = support ? barClose <= z.breakSnapshotBottom : barClose >= z.breakSnapshotTop
                     if confirm
-                        z.breakValid := false
-                        z.breakMovedAway := false
-                        z.phase := PH_WAITING
+                        f_flipSide(eng, z)
                         handled := true
 
         if not handled and z.touchActive
-            float sb = z.touchSnapshotBottom
-            float st = z.touchSnapshotTop
-            // Section 26: Break is judged against the TouchStartSnapshot only.
-            bool broken = support ? barClose <= sb - c.breakBuffer : barClose >= st + c.breakBuffer
-            if broken
-                f_sealTouchMark(z)
-                z.touchActive := false
-                z.phase := PH_BROKEN
-                z.breakValid := true
-                z.breakSnapshotBottom := sb
-                z.breakSnapshotTop := st
-                z.breakMovedAway := false
-                z.refCategoryMask := z.refCategoryMask
-                handled := true
-            else
-                // Section 24: confirmed close only, snapshot width, no WeakDepth
-                // on a line Zone, and never cleared inside the generation.
-                float width = st - sb
-                if width > 0 and not c.weakDepthOff
-                    float depth = support ? (st - barClose) / width * 100.0 : (barClose - sb) / width * 100.0
-                    depth := math.max(0.0, math.min(100.0, depth))
-                    z.maxDepthPct := math.max(z.maxDepthPct, depth)
-                    if depth >= c.weakDepthPct
-                        z.weakByDepth := true
-                // Section 25: Reset may land on the Touch bar, but the next Touch
-                // cannot start on it.
-                bool reset = support ? barClose >= st + c.touchResetDistance : barClose <= sb - c.touchResetDistance
-                if reset
-                    f_sealTouchMark(z)
-                    z.touchActive := false
-                    z.phase := PH_ARMED
-                    z.armedFromSeq := seq + 1
-                    handled := true
+            handled := f_processActiveTouchOutcome(z, c, barClose, seq)
 
         if not handled and z.phase == PH_ARMED and not na(z.armedFromSeq) and seq >= z.armedFromSeq
             bool touches = barHigh >= z.bottom and barLow <= z.top
             if touches
                 f_startTouch(eng, z, c, barHigh, barLow, seq, nowTime)
+                // Section 4: the same bar may already resolve this touch.
+                f_processActiveTouchOutcome(z, c, barClose, seq)
                 handled := true
             else
                 // Section 27: a complete gap, no Touch, no Fresh change.
@@ -1091,6 +1317,8 @@ f_trackZone(HistEngine eng, TrackedZone z, zc.ZoneCfg c, float barHigh, float ba
                     z.breakValid := true
                     z.breakSnapshotBottom := z.bottom
                     z.breakSnapshotTop := z.top
+                    z.breakSnapshotCategoryMask := z.liveCategoryMask
+                    z.hasBreakSnapshotMask := true
                     z.breakMovedAway := false
                     z.armedFromSeq := na
                     handled := true
@@ -1132,6 +1360,9 @@ export updateBar(HistEngine eng, zc.ZoneCfg c, float barHigh, float barLow, floa
             f_localBuild(eng, c, barClose, seq, nowTime)
         else
             eng.noBuildBars += 1
+    // Section 8: record window membership for the NEXT bar's re-entry test,
+    // after any build has moved the geometry and before touch judgment.
+    f_syncWindowFlags(eng, barClose - HIST_BUILD_DISTANCE, barClose + HIST_BUILD_DISTANCE)
     f_trackAll(eng, c, barHigh, barLow, barClose, seq, nowTime)
     eng.histBars += 1
     true
@@ -1154,7 +1385,11 @@ export matchCurrent(HistEngine eng, ze.CurrentEngine ce, zc.ZoneCfg c, int curre
             if n > 0
                 for i = 0 to n - 1
                     TrackedZone z = array.get(eng.zones, i)
-                    if z.alive and z.side == cz.side and not na(z.bottom)
+                    // Section 7: a Zone the last build did not produce is no
+                    // longer structurally there and must not be matched.
+                    // Section 13: the Side test also keeps a flipped Support
+                    // history off a Current Resistance.
+                    if z.alive and z.structurallyPresent and z.side == cz.side and not na(z.bottom)
                         float g = f_gapBetween(z.bottom, z.top, cz.bottom, cz.top)
                         if g <= c.clusterMaxWidth and g < bestGap
                             if f_shareStableOrigin(z.stableOrigins, cz.originKeys)
@@ -1194,7 +1429,9 @@ export trackedWeakReason(HistEngine eng, zc.ZoneCfg c, int index) =>
     TrackedZone z = trackedAt(eng, index)
     int r = WEAK_NONE
     if not na(z)
-        bool wt = not c.weakFromTouchOff and (z.touchCount + 1) >= c.weakFromTouch
+        // Section 3: in ActiveTouch this is the touch being served, otherwise
+        // the one that is coming.
+        bool wt = not c.weakFromTouchOff and f_displayTouchNo(z) >= c.weakFromTouch
         r := wt and z.weakByDepth ? WEAK_BY_BOTH : wt ? WEAK_BY_TOUCH : z.weakByDepth ? WEAK_BY_DEPTH : WEAK_NONE
     r
 
@@ -1212,7 +1449,8 @@ export gradeText(HistEngine eng, zc.ZoneCfg c, int index, bool currentBaseStrong
     string s = currentBaseStrong ? "STRUCT STRONG / HIST ?" : "STRUCT NEUTRAL / HIST ?"
     TrackedZone z = trackedAt(eng, index)
     if not na(z) and z.historyKnown
-        int up = z.touchCount + 1
+        // Section 3: ActiveTouch is described by the touch it is in.
+        int up = f_displayTouchNo(z)
         bool weak = z.weakByDepth or (not c.weakFromTouchOff and up >= c.weakFromTouch)
         bool strong = currentBaseStrong and not z.weakByDepth and (c.strongUnlimited or up <= c.strongUntilTouch)
         s := weak ? "WEAK" : strong ? "STRONG" : "NEUTRAL"
@@ -1232,6 +1470,23 @@ export generationCount(HistEngine eng) => eng.generationCount
 export emaGuardHits(HistEngine eng) => eng.emaGuardHits
 export emaGuardBreaches(HistEngine eng) => eng.emaGuardBreaches
 export maxTouchMarkUsage(HistEngine eng) => eng.maxTouchMarkUsage
+export retiredZoneCount(HistEngine eng) => eng.retiredZones
+export flipCount(HistEngine eng) => eng.flipCount
+export mergeSplitEvents(HistEngine eng) => eng.mergeSplitEvents
+
+// Section 3: the touch number the display is describing.
+export displayTouchNo(HistEngine eng, int index) =>
+    TrackedZone z = trackedAt(eng, index)
+    na(z) ? na : f_displayTouchNo(z)
+
+// Section 11: the depth of the CURRENT episode, not of the whole generation.
+export trackedEpisodeDepth(HistEngine eng, int index) =>
+    TrackedZone z = trackedAt(eng, index)
+    na(z) ? na : z.episodeMaxDepthPct
+
+export trackedStructurallyPresent(HistEngine eng, int index) =>
+    TrackedZone z = trackedAt(eng, index)
+    na(z) ? false : z.structurallyPresent
 
 export knownZoneCount(HistEngine eng) =>
     int cnt = 0
