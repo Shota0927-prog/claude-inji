@@ -25,7 +25,7 @@ library("ZoneEngineV2_FullHistory_ED", overlay = true)
 // reference build. Differences are intentional and listed in
 // ZoneEngineV2_FullHistory_ED_Report.md section D.
 // ============================================================================
-const string BUILD_ID = "ZEV2-FULLHIST-ED-20260920"
+const string BUILD_ID = "ZEV2-FULLHIST-ED-GUARD-20260920"
 
 // Root change classes. A single topologyDirty flag is deliberately not used:
 // each class implies a different, narrower recomputation.
@@ -319,6 +319,13 @@ export type Root
     bool inverseMovedAway
     bool inverseRetestSeen
     int lastSourceCloseTime
+    // EMA Topology Guard (sections 2-4). Rebuilt in the Slow Path only. While a
+    // new EMA value stays inside [emaGuardLow, emaGuardHigh] and the slope sign
+    // is unchanged, no Root, FVG, Core or Candidate is examined at all.
+    float emaGuardLow
+    float emaGuardHigh
+    int emaGuardSlopeSign
+    bool emaGuardValid
     // Scratch-only selection stamp. It never participates in Zone logic.
     int workStamp
 
@@ -340,6 +347,9 @@ export type SideHistory
     int inverseAttemptCount
     int lastFlipConfirmSeq
     int currentMarkSeq
+    // Section 31. Truncation is tracked per Core and Side. One Core losing a
+    // TouchMark must never make another Core's history look incomplete.
+    bool historyIncomplete
 
 export type TouchMark
     int baseSeq
@@ -357,8 +367,10 @@ export type TouchMark
     int markSeq
     int touchNo
     int startGrade
-    bool weakByDepth
-    float maxDepthPct
+    // Section 30. These are the EPISODE's own results, never a copy of the
+    // cumulative SideHistory.
+    bool episodeWeakByDepth
+    float episodeMaxDepthPct
 
 export type TouchStartSnapshot
     bool valid
@@ -439,11 +451,28 @@ export type ZoneCore
     float generationCandidateTop
     int generationCandidateArmedFromSeq
     bool generationCandidateAway
+    // Section 29. Only the Side that became the candidate is armed on the
+    // re-approach bar; the opposite Side stays Waiting.
+    int generationCandidateSide
     array<TouchMark> touchMarks
     int generationStartCategoryMask
     int lastTouchCategoryMask
     int lastBreakCategoryMask
     int lastTouchTime
+    // State-set membership (sections 8-13). Kept as flags so add / remove is
+    // idempotent and never needs a search to decide.
+    bool inArmedSup
+    bool inArmedRes
+    bool inActiveSet
+    bool inBreakSet
+    bool inGenSet
+    bool inDormantSet
+    bool inWaitSet
+    bool inPendingTopoSet
+    // Section 19. Saved when the Core goes Dormant; it is re-evaluated only when
+    // the bar reaches this corridor.
+    float dormantWakeLow
+    float dormantWakeHigh
 
 export type ZoneEvent
     int eventType
@@ -514,6 +543,31 @@ export type ZoneEngine
     map<int, int> coreIndex
     array<int> liveCoreSlots
     array<int> freeCoreSlots
+    // ---- State-specific work sets (sections 8-13). A normal Base bar iterates
+    // ONLY these, never liveCoreSlots.
+    array<int> armedSupportSlots
+    array<int> armedResistanceSlots
+    array<int> activeTouchSlots
+    array<int> brokenFlipWaitSlots
+    array<int> generationWatchSlots
+    array<int> dormantSlots
+    array<int> waitingSlots
+    array<int> pendingTopoSlots
+    // ---- EMA -> Core reverse index (section 6). The EMA Fast Path updates only
+    // the Cores listed here.
+    array<int> ema2000CoreSlots
+    array<int> ema3000CoreSlots
+    // Reusable snapshot buffer, so a set can be iterated while transitions
+    // mutate it. Cleared and refilled, never reallocated.
+    array<int> workSetSnapshot
+    // ---- Aggregate Dormant wake guard (section 19). While the bar stays inside
+    // this interval, no Dormant Core can wake, so the Dormant set is not walked.
+    float dormantGuardLow
+    float dormantGuardHigh
+    bool dormantGuardValid
+    // Scratch for EMA Guard construction (Slow Path only).
+    float workGuardLow
+    float workGuardHigh
     array<ZoneEvent> events
     array<EndedGeneration> endedGenerations
     int nextRootId
@@ -598,6 +652,9 @@ export type ZoneEngine
     int maxLiveRoots
     int maxLiveCores
     int coresVisitedLast
+    int emaGuardHits
+    int emaGuardBreaches
+    int fvgFullScanCount
 
     // Reusable candidate-search scratch. These arrays are capacity buffers only;
     // logical results are copied into Candidate/Core-owned arrays before reuse.
@@ -733,7 +790,7 @@ f_emptyHistory() => SideHistory.new(
      sideFresh = true, phase = PH_WAITING, grade = GR_UNAVAILABLE, currentTouchNo = 0,
      upcomingTouchNo = 1, armedFromSeq = na, lastArmedRangeBottom = na, lastArmedRangeTop = na,
      lastNormalTouchTime = na, flipAttemptCount = 0, inverseAttemptCount = 0, lastFlipConfirmSeq = na,
-     currentMarkSeq = na)
+     currentMarkSeq = na, historyIncomplete = false)
 
 f_emptyTouchSnapshot() => TouchStartSnapshot.new(
      valid = false, coreId = na, generationId = na, side = SIDE_NONE,
@@ -761,8 +818,12 @@ f_emptyCore(int coreId, int generationId, int t) => ZoneCore.new(
      pendingTopology = false, pendingGeneration = false, pendingAffectedBottom = na, pendingAffectedTop = na,
      generationCandidateMask = 0, generationCandidateBottom = na, generationCandidateTop = na,
      generationCandidateArmedFromSeq = na, generationCandidateAway = false,
+     generationCandidateSide = SIDE_NONE,
      touchMarks = array.new<TouchMark>(), generationStartCategoryMask = 0, lastTouchCategoryMask = 0,
-     lastBreakCategoryMask = 0, lastTouchTime = na)
+     lastBreakCategoryMask = 0, lastTouchTime = na,
+     inArmedSup = false, inArmedRes = false, inActiveSet = false, inBreakSet = false,
+     inGenSet = false, inDormantSet = false, inWaitSet = false, inPendingTopoSet = false,
+     dormantWakeLow = na, dormantWakeHigh = na)
 
 // ============================================================================
 // Public configuration API
@@ -839,7 +900,16 @@ export newEngine() => ZoneEngine.new(
     swingSlots = array.new<int>(), accumSlots = array.new<int>(), timeSlots = array.new<int>(),
     fvgSlots = array.new<int>(), freeRootSlots = array.new<int>(), freshFvgSlots = array.new<int>(),
     inverseWaitSlots = array.new<int>(), cores = array.new<ZoneCore>(), coreIndex = map.new<int, int>(),
-    liveCoreSlots = array.new<int>(), freeCoreSlots = array.new<int>(), events = array.new<ZoneEvent>(),
+    liveCoreSlots = array.new<int>(), freeCoreSlots = array.new<int>(),
+    armedSupportSlots = array.new<int>(), armedResistanceSlots = array.new<int>(),
+    activeTouchSlots = array.new<int>(), brokenFlipWaitSlots = array.new<int>(),
+    generationWatchSlots = array.new<int>(), dormantSlots = array.new<int>(),
+    waitingSlots = array.new<int>(), pendingTopoSlots = array.new<int>(),
+    ema2000CoreSlots = array.new<int>(), ema3000CoreSlots = array.new<int>(),
+    workSetSnapshot = array.new<int>(),
+    dormantGuardLow = na, dormantGuardHigh = na, dormantGuardValid = false,
+    workGuardLow = na, workGuardHigh = na,
+    events = array.new<ZoneEvent>(),
     endedGenerations = array.new<EndedGeneration>(),
     nextRootId = ROOT_ID_FIRST_DYNAMIC, nextCoreId = 1, nextGenerationId = 1, nextMarkSeq = 1,
     lastBaseOpenTime = na, lastBaseSeq = na, lastCfgRevision = na, lastCfgMintick = na,
@@ -863,7 +933,7 @@ export newEngine() => ZoneEngine.new(
     coreFullScanCount = 0, dirtyBandCount = 0, maxDirtyBandWidth = 0.0,
     mergeEvalCount = 0, splitEvalCount = 0, referenceCalcCount = 0,
     maFastUpdates = 0, maSlowUpdates = 0, maxLiveRoots = 0, maxLiveCores = 0,
-    coresVisitedLast = 0,
+    coresVisitedLast = 0, emaGuardHits = 0, emaGuardBreaches = 0, fvgFullScanCount = 0,
     workStampSeq = 0, workPointSlots = array.new<int>(), workPsychSlots = array.new<int>(),
     workFvgSlots = array.new<int>(), workStartFvgSlots = array.new<int>(), workPairs = array.new<int>(), workTempIds = array.new<int>(),
     workUpdatedSup = array.new<int>(), workUpdatedRes = array.new<int>(), workLocalCoreSlots = array.new<int>(),
@@ -1296,7 +1366,8 @@ f_newRoot(ZoneEngine e, int fixedId, int originKey, int category, int subtype, i
         isRangeRoot = isRangeRoot, isDynamic = isDynamic, state = state, pairKey = pairKey,
         direction = direction, fvgFresh = fvgFresh, isBroadFvg = isBroadFvg, labelMask = labelMask,
         lastUpdateSeq = seq, slopeSign = slopeSign, inverseMovedAway = false, inverseRetestSeen = false,
-        lastSourceCloseTime = confirmedTime, workStamp = 0)
+        lastSourceCloseTime = confirmedTime, emaGuardLow = na, emaGuardHigh = na,
+        emaGuardSlopeSign = 0, emaGuardValid = false, workStamp = 0)
     f_allocRoot(e, r)
     id
 
@@ -1327,26 +1398,6 @@ f_retireRoot(ZoneEngine e, int rootId, ZoneCfg c) =>
             array.push(e.freeRootSlots, slot)
             e.liveRootCount -= 1
             e.eligibilityDirty := true
-    true
-
-f_updatePointRoot(ZoneEngine e, int rootId, float newPrice, int seq, int slopeSign, ZoneCfg c) =>
-    Root r = f_getRoot(e, rootId)
-    if not na(r)
-        float old = r.pointPrice
-        float np = f_norm(newPrice, c.mintick)
-        bool priceChanged = na(old) or not f_eq(old, np, c.mintick)
-        bool changed = priceChanged or r.slopeSign != slopeSign
-        int oldIndexPos = priceChanged ? f_pointIndexFindByPrice(e, rootId, old) : na
-        if changed
-            f_markDirty(e, old, old, c)
-            r.pointPrice := np
-            r.nativeBottom := np
-            r.nativeTop := np
-            r.slopeSign := slopeSign
-            r.lastUpdateSeq := seq
-            if priceChanged
-                f_pointIndexRepositionAt(e, rootId, oldIndexPos)
-            f_markDirty(e, np, np, c)
     true
 
 f_psychId(float level, float mt) => -2000000000 + f_tick(level, mt)
@@ -1563,6 +1614,10 @@ f_emit(ZoneEngine e, int typ, ZoneFeed f, int coreId, int genId, int side, float
 
 f_invalidateFvgsForSource(ZoneEngine e, FvgPack p, ZoneFeed f, ZoneCfg c) =>
     if c.enableFVG and not na(p) and not na(p.sourceCloseTime) and p.sourceCloseTime <= f.baseCloseTime
+        // Section 21 gates this to a newly confirmed source bar only, so it is
+        // an event scan, not a per-Base-bar scan.
+        if c.countersOn
+            e.fvgFullScanCount += 1
         int n = array.size(e.fvgSlots)
         if n > 0
             for k = 0 to n - 1
@@ -2747,7 +2802,107 @@ f_buildSideCandidates(ZoneEngine e, int side, ZoneFeed f, ZoneCfg c) =>
 // ============================================================================
 // Core identity / allocation / merge-split support
 // ============================================================================
-f_allocCore(ZoneEngine e, int t) =>
+// ============================================================================
+// State-specific work sets (sections 8-13, 19).
+//
+// Membership is a flag on the Core, so adding and removing is decided without
+// searching. f_syncCoreSets is idempotent and is called wherever a phase, a
+// pending flag or liveness can have changed. A normal Base bar then iterates
+// only the sets it needs and never liveCoreSlots.
+// ============================================================================
+f_setAddRemove(array<int> set, int slot, bool want, bool has) =>
+    if want != has
+        if want
+            array.push(set, slot)
+        else
+            f_removeSlotValue(set, slot)
+    true
+
+f_syncCoreSets(ZoneEngine e, int slot, ZoneCfg c) =>
+    if slot >= 0 and slot < array.size(e.cores)
+        ZoneCore z = array.get(e.cores, slot)
+        int sp = z.supportView.history.phase
+        int rp = z.resistanceView.history.phase
+        bool alive = z.alive
+
+        bool wArmSup = alive and sp == PH_ARMED
+        f_setAddRemove(e.armedSupportSlots, slot, wArmSup, z.inArmedSup)
+        z.inArmedSup := wArmSup
+
+        bool wArmRes = alive and rp == PH_ARMED
+        f_setAddRemove(e.armedResistanceSlots, slot, wArmRes, z.inArmedRes)
+        z.inArmedRes := wArmRes
+
+        bool wActive = alive and (sp == PH_ACTIVE_TOUCH or rp == PH_ACTIVE_TOUCH)
+        f_setAddRemove(e.activeTouchSlots, slot, wActive, z.inActiveSet)
+        z.inActiveSet := wActive
+
+        bool wBreak = alive and (sp == PH_BROKEN or rp == PH_BROKEN or sp == PH_FLIP_WAIT or rp == PH_FLIP_WAIT)
+        f_setAddRemove(e.brokenFlipWaitSlots, slot, wBreak, z.inBreakSet)
+        z.inBreakSet := wBreak
+
+        bool wGen = alive and z.pendingGeneration
+        f_setAddRemove(e.generationWatchSlots, slot, wGen, z.inGenSet)
+        z.inGenSet := wGen
+
+        bool wPend = alive and z.pendingTopology
+        f_setAddRemove(e.pendingTopoSlots, slot, wPend, z.inPendingTopoSet)
+        z.inPendingTopoSet := wPend
+
+        // Dormant: parked behind a price corridor and not walked again until the
+        // bar reaches it (section 19).
+        bool quiet = alive and not wActive and not wBreak
+        bool wDormant = quiet and not z.pendingTopology and not z.pendingGeneration and (sp == PH_DORMANT or rp == PH_DORMANT) and not wArmSup and not wArmRes
+        if wDormant != z.inDormantSet
+            f_setAddRemove(e.dormantSlots, slot, wDormant, z.inDormantSet)
+            z.inDormantSet := wDormant
+            if wDormant
+                z.dormantWakeLow := na(z.physicalBottom) ? na : z.physicalBottom - c.dormantDistance
+                z.dormantWakeHigh := na(z.physicalTop) ? na : z.physicalTop + c.dormantDistance
+            // Membership changed, so the aggregate corridor must be rebuilt.
+            e.dormantGuardValid := false
+
+        // Everything else quiet still needs the cheap Arm / Dormant refresh.
+        bool wWait = quiet and not wDormant
+        f_setAddRemove(e.waitingSlots, slot, wWait, z.inWaitSet)
+        z.inWaitSet := wWait
+    true
+
+// Snapshot a set before iterating it, because transitions mutate the set.
+// Reuses one buffer; nothing is allocated after the first bar.
+f_snapshotSet(ZoneEngine e, array<int> src) =>
+    array.clear(e.workSetSnapshot)
+    int n = array.size(src)
+    if n > 0
+        for i = 0 to n - 1
+            array.push(e.workSetSnapshot, array.get(src, i))
+    e.workSetSnapshot
+
+// Nearest Dormant corridor edge below and above the reference price. While the
+// bar stays strictly between them, no Dormant Core can wake.
+f_rebuildDormantGuard(ZoneEngine e, float px) =>
+    float lo = na
+    float hi = na
+    bool blocked = false
+    int n = array.size(e.dormantSlots)
+    if n > 0
+        for k = 0 to n - 1
+            ZoneCore z = array.get(e.cores, array.get(e.dormantSlots, k))
+            if not na(z.dormantWakeLow) and not na(z.dormantWakeHigh)
+                if z.dormantWakeHigh < px
+                    lo := na(lo) ? z.dormantWakeHigh : math.max(lo, z.dormantWakeHigh)
+                else if z.dormantWakeLow > px
+                    hi := na(hi) ? z.dormantWakeLow : math.min(hi, z.dormantWakeLow)
+                else
+                    blocked := true
+            else
+                blocked := true
+    e.dormantGuardLow := blocked ? na : lo
+    e.dormantGuardHigh := blocked ? na : hi
+    e.dormantGuardValid := not blocked
+    true
+
+f_allocCore(ZoneEngine e, int t, ZoneCfg c) =>
     int coreId = e.nextCoreId
     e.nextCoreId += 1
     int genId = e.nextGenerationId
@@ -2764,6 +2919,7 @@ f_allocCore(ZoneEngine e, int t) =>
     array.push(e.liveCoreSlots, slot)
     e.liveCoreCount += 1
     e.storageCheckDirty := true
+    f_syncCoreSets(e, slot, c)
     slot
 
 f_coreHasSharedIdentityRoot(ZoneEngine e, ZoneCore z, Candidate cnd) =>
@@ -2818,15 +2974,15 @@ f_marksSummaryForSide(ZoneCore z, int side, float b, float t, bool useRange, Zon
             if tm.side == side and tm.isNormalTouch
                 if not useRange or f_intersects(tm.contactBottom, tm.contactTop, b, t, c.mintick)
                     cnt += 1
-                    anyDepth := anyDepth or tm.weakByDepth
-                    maxDepth := math.max(maxDepth, tm.maxDepthPct)
+                    anyDepth := anyDepth or tm.episodeWeakByDepth
+                    maxDepth := math.max(maxDepth, tm.episodeMaxDepthPct)
                     lastTime := na(lastTime) ? tm.time : math.max(lastTime, tm.time)
     [cnt, anyDepth, maxDepth, lastTime]
 
 // Rewrites a Side's history so it cannot contradict the marks it actually owns.
 f_rebuildSideHistoryFromMarks(ZoneEngine e, ZoneCore z, SideViewState v, int side, ZoneCfg c) =>
     [cnt, anyDepth, maxDepth, lastTime] = f_marksSummaryForSide(z, side, na, na, false, c)
-    bool truncated = e.touchHistoryTruncated and v.history.sideTouchCount > cnt
+    bool truncated = v.history.historyIncomplete and v.history.sideTouchCount > cnt
     v.history.sideTouchCount := truncated ? v.history.sideTouchCount : cnt
     v.history.sideFresh := v.history.sideTouchCount == 0
     v.history.weakByDepth := anyDepth or (truncated and v.history.weakByDepth)
@@ -2864,7 +3020,11 @@ f_mergeTouchMarks(ZoneEngine e, ZoneCore dst, ZoneCore src, ZoneCfg c) =>
             if not dup
                 array.push(dst.touchMarks, tm)
     while array.size(dst.touchMarks) > c.maxTouchMarksPerCore
-        array.shift(dst.touchMarks)
+        TouchMark dropped = array.shift(dst.touchMarks)
+        if dropped.side == SIDE_SUPPORT
+            dst.supportView.history.historyIncomplete := true
+        else
+            dst.resistanceView.history.historyIncomplete := true
         e.touchHistoryTruncated := true
     true
 
@@ -2898,11 +3058,13 @@ f_mergeHistory(SideHistory a, SideHistory b) =>
     a.inverseAttemptCount += b.inverseAttemptCount
     true
 
-f_retireCoreSlot(ZoneEngine e, int slot) =>
+f_retireCoreSlot(ZoneEngine e, int slot, ZoneCfg c) =>
     if slot >= 0 and slot < array.size(e.cores)
         ZoneCore z = array.get(e.cores, slot)
         if z.alive
             z.alive := false
+            // Drop the Core from every work set before its slot is reused.
+            f_syncCoreSets(e, slot, c)
             map.remove(e.coreIndex, z.coreId)
             f_removeSlotValue(e.liveCoreSlots, slot)
             array.push(e.freeCoreSlots, slot)
@@ -2931,7 +3093,8 @@ f_mergeCoreInto(ZoneEngine e, int dstSlot, int srcSlot, ZoneFeed f, ZoneCfg c) =
             dst.physicalBottom := na(dst.physicalBottom) ? src.physicalBottom : na(src.physicalBottom) ? dst.physicalBottom : math.min(dst.physicalBottom, src.physicalBottom)
             dst.physicalTop := na(dst.physicalTop) ? src.physicalTop : na(src.physicalTop) ? dst.physicalTop : math.max(dst.physicalTop, src.physicalTop)
             f_emit(e, EV_MERGE, f, dst.coreId, dst.generationId, SIDE_NONE, dst.physicalBottom, dst.physicalTop, 0, GR_UNAVAILABLE, WEAK_NONE, src.coreId)
-            f_retireCoreSlot(e, srcSlot)
+            f_retireCoreSlot(e, srcSlot, c)
+            f_syncCoreSets(e, dstSlot, c)
     true
 
 // FIX 22.6. The child Zone inherits exactly the episodes whose contact actually
@@ -2943,13 +3106,14 @@ f_filteredHistoryForSplit(ZoneEngine e, ZoneCore parent, int side, Candidate cnd
     SideHistory h = f_emptyHistory()
     [assigned, anyDepth, maxDepth, lastTime] = f_marksSummaryForSide(parent, side, cnd.bottom, cnd.top, true, c)
     // Only an actually truncated history may fall back to the parent aggregate.
-    bool truncated = e.touchHistoryTruncated and src.sideTouchCount > assigned
+    bool truncated = src.historyIncomplete and src.sideTouchCount > assigned
     h.sideTouchCount := assigned
     h.sideFresh := assigned == 0 and not truncated
     h.weakByDepth := anyDepth or (truncated and src.weakByDepth)
     h.maxDepthPct := truncated ? math.max(maxDepth, src.maxDepthPct) : maxDepth
     h.weakByTouch := not c.weakFromTouchOff and assigned >= c.weakFromTouch
     h.lastNormalTouchTime := na(lastTime) and truncated ? src.lastNormalTouchTime : lastTime
+    h.historyIncomplete := truncated
     h.upcomingTouchNo := h.sideTouchCount + 1
     h
 
@@ -2979,73 +3143,98 @@ f_updatePhysicalRange(ZoneCore z) =>
     true
 
 // ============================================================================
-// MA Fast Path (section 9).
+// EMA Topology Guard (sections 1-7).
 //
-// EMA2000 / EMA3000 move on almost every Base bar. Treating every tick of that
-// movement as a topology change is what made the reference build rebuild
-// candidates on essentially every bar of a long run.
+// EMA2000 / EMA3000 move on almost every Base bar. Examining Roots, psych
+// levels, FVGs or Cores on each of those moves is not a Fast Path, so it is
+// gone. Instead each EMA Root carries the price interval inside which NO
+// topology relationship can change, plus the slope sign it was built with.
 //
-// An EMA move can only change the result if it changes a RELATIONSHIP: whether
-// some other Root is within M, whether it is within DenseWidth, or which side of
-// the EMA it sits on; plus FVG containment and proximal classification. Those
-// are enumerated exactly below. When none of them changes, the Cores carrying
-// the EMA are updated in place and no band is marked dirty.
+// Normal Base bar, per EMA Root, O(1):
+//
+//     newEMA > emaGuardLow and newEMA < emaGuardHigh and slope == guardSlope
+//         -> price update + the Cores in the EMA reverse index. Nothing else.
+//
+// The guard is rebuilt ONLY in the Slow Path.
+//
+// SECTION 5 - the one accepted compromise. While the guard holds, participating
+// Roots, C, H, Density class, FVG participation and MA slope quality are all
+// unchanged, so the winner cannot change for any structural reason. The only
+// thing the EMA still shifts is a candidate's WIDTH, so two candidates with
+// identical C and H could in principle swap the "narrower wins" tie-break. That
+// is deliberately not tracked until the next guard event.
 // ============================================================================
-f_maClassSig(float ema, float q, float mw, float dw, float mt) =>
-    float lo = math.min(ema, q)
-    float hi = math.max(ema, q)
-    int sig = f_widthLe(lo, hi, mw, mt) ? 1 : 0
-    sig += f_widthLe(lo, hi, dw, mt) ? 2 : 0
-    sig += f_ge(q, ema, mt) ? 4 : 0
-    sig
+f_guardOne(ZoneEngine e, float b, float ema, float mt) =>
+    if not na(b)
+        if f_eq(b, ema, mt)
+            // Sitting exactly on a boundary: any move at all must breach.
+            e.workGuardLow := ema
+            e.workGuardHigh := ema
+        else if b < ema
+            if na(e.workGuardLow) or b > e.workGuardLow
+                e.workGuardLow := b
+        else
+            if na(e.workGuardHigh) or b < e.workGuardHigh
+                e.workGuardHigh := b
+    true
 
-f_maMoveChangesRelationships(ZoneEngine e, Root r, float oldP, float newP, ZoneCfg c) =>
+// Section 3: every boundary at which a relationship to `base` can change.
+f_guardFold(ZoneEngine e, float base, float ema, float mw, float dw, float mt) =>
+    f_guardOne(e, base, ema, mt)
+    f_guardOne(e, base - mw, ema, mt)
+    f_guardOne(e, base + mw, ema, mt)
+    f_guardOne(e, base - dw, ema, mt)
+    f_guardOne(e, base + dw, ema, mt)
+    true
+
+f_buildEmaGuard(ZoneEngine e, Root r, ZoneCfg c) =>
+    float ema = r.pointPrice
     float mw = c.clusterMaxWidth
     float dw = c.clusterMaxWidth * c.denseRatio
-    float lo = math.min(oldP, newP) - 2.0 * mw
-    float hi = math.max(oldP, newP) + 2.0 * mw
-    bool changed = false
+    e.workGuardLow := na
+    e.workGuardHigh := na
+    float lo = ema - 3.0 * mw
+    float hi = ema + 3.0 * mw
 
+    // Point Roots, including the other EMA.
     int i = f_pointIndexLowerBound(e, lo)
     int n = array.size(e.pointPriceIndex)
     bool done = false
-    while i < n and not done and not changed
+    while i < n and not done
         Root q = array.get(e.roots, array.get(e.pointPriceIndex, i))
         if not q.alive
             i += 1
         else if q.pointPrice > hi
             done := true
         else
-            if q.rootId != r.rootId and f_maClassSig(oldP, q.pointPrice, mw, dw, c.mintick) != f_maClassSig(newP, q.pointPrice, mw, dw, c.mintick)
-                changed := true
+            if q.rootId != r.rootId
+                f_guardFold(e, q.pointPrice, ema, mw, dw, c.mintick)
             i += 1
 
-    // Psychological levels are derived here rather than scanned, so the test
-    // does not depend on which of them happen to be materialised as Roots.
-    if not changed and c.enablePsych
-        int k0 = int(math.ceil(lo / 50.0))
-        int k1 = int(math.floor(hi / 50.0))
-        if k1 >= k0
-            for k = k0 to k1
-                float pl = k * 50.0
-                if f_maClassSig(oldP, pl, mw, dw, c.mintick) != f_maClassSig(newP, pl, mw, dw, c.mintick)
-                    changed := true
-                    break
+    // Section 3: only the two psych levels bracketing the EMA, derived, never
+    // scanned across the price range.
+    if c.enablePsych
+        f_guardFold(e, math.floor(ema / 50.0) * 50.0, ema, mw, dw, c.mintick)
+        f_guardFold(e, math.ceil(ema / 50.0) * 50.0, ema, mw, dw, c.mintick)
 
-    if not changed and c.enableFVG
+    // FVG NativeRange edges. Folding both edges also covers the proximal edge of
+    // either Side.
+    if c.enableFVG
         int fn = array.size(e.fvgSlots)
         if fn > 0
             for k = 0 to fn - 1
                 Root fr = array.get(e.roots, array.get(e.fvgSlots, k))
-                if fr.alive and f_intersects(fr.nativeBottom, fr.nativeTop, lo, hi, c.mintick)
-                    bool inOld = f_ge(oldP, fr.nativeBottom, c.mintick) and f_le(oldP, fr.nativeTop, c.mintick)
-                    bool inNew = f_ge(newP, fr.nativeBottom, c.mintick) and f_le(newP, fr.nativeTop, c.mintick)
-                    bool topDiff = f_maClassSig(oldP, fr.nativeTop, mw, dw, c.mintick) != f_maClassSig(newP, fr.nativeTop, mw, dw, c.mintick)
-                    bool botDiff = f_maClassSig(oldP, fr.nativeBottom, mw, dw, c.mintick) != f_maClassSig(newP, fr.nativeBottom, mw, dw, c.mintick)
-                    if inOld != inNew or topDiff or botDiff
-                        changed := true
-                        break
-    changed
+                if fr.alive and f_intersects(fr.nativeBottom - mw, fr.nativeTop + mw, lo, hi, c.mintick)
+                    f_guardFold(e, fr.nativeBottom, ema, mw, dw, c.mintick)
+                    f_guardFold(e, fr.nativeTop, ema, mw, dw, c.mintick)
+
+    // With nothing within 3M, a move of 2M still cannot bring anything within
+    // M or DenseWidth, so that is a safe fallback bound.
+    r.emaGuardLow := na(e.workGuardLow) ? ema - 2.0 * mw : e.workGuardLow
+    r.emaGuardHigh := na(e.workGuardHigh) ? ema + 2.0 * mw : e.workGuardHigh
+    r.emaGuardSlopeSign := r.slopeSign
+    r.emaGuardValid := true
+    true
 
 // Recomputes one View's geometry from its unchanged membership. Category counts
 // and High masks are untouched because the relationship test proved they cannot
@@ -3087,24 +3276,42 @@ f_maRecomputeView(ZoneEngine e, SideViewState v, int side, ZoneCfg c) =>
             e.referenceCalcCount += 1
     true
 
-f_maLocalCoreUpdate(ZoneEngine e, Root r, ZoneCfg c) =>
-    float mw = c.clusterMaxWidth
+// Section 6 / 7. Only the Cores in the EMA reverse index are touched, and only
+// their LiveStructure. A running TouchStartSnapshot is never modified.
+f_emaFastCoreUpdate(ZoneEngine e, Root r, array<int> coreSlots, ZoneCfg c) =>
+    int n = array.size(coreSlots)
+    if n > 0
+        for k = 0 to n - 1
+            int slot = array.get(coreSlots, k)
+            if slot >= 0 and slot < array.size(e.cores)
+                ZoneCore z = array.get(e.cores, slot)
+                if z.alive
+                    bool touched = false
+                    if f_arrayHasInt(z.supportView.rootIds, r.rootId)
+                        f_maRecomputeView(e, z.supportView, SIDE_SUPPORT, c)
+                        touched := true
+                    if f_arrayHasInt(z.resistanceView.rootIds, r.rootId)
+                        f_maRecomputeView(e, z.resistanceView, SIDE_RESISTANCE, c)
+                        touched := true
+                    if touched
+                        f_updatePhysicalRange(z)
+    true
+
+// Rebuilt at the end of a Slow Path only: membership cannot change without a
+// topology event, so the Fast Path may trust it.
+f_rebuildEmaCoreIndex(ZoneEngine e) =>
+    array.clear(e.ema2000CoreSlots)
+    array.clear(e.ema3000CoreSlots)
     int n = array.size(e.liveCoreSlots)
     if n > 0
         for k = 0 to n - 1
-            ZoneCore z = array.get(e.cores, array.get(e.liveCoreSlots, k))
-            // Cheap geometric reject before any Root-id scan.
-            bool near = na(z.physicalBottom) or f_intersects(z.physicalBottom - mw, z.physicalTop + mw, r.pointPrice - mw, r.pointPrice + mw, c.mintick)
-            if z.alive and near
-                bool touched = false
-                if f_arrayHasInt(z.supportView.rootIds, r.rootId)
-                    f_maRecomputeView(e, z.supportView, SIDE_SUPPORT, c)
-                    touched := true
-                if f_arrayHasInt(z.resistanceView.rootIds, r.rootId)
-                    f_maRecomputeView(e, z.resistanceView, SIDE_RESISTANCE, c)
-                    touched := true
-                if touched
-                    f_updatePhysicalRange(z)
+            int slot = array.get(e.liveCoreSlots, k)
+            ZoneCore z = array.get(e.cores, slot)
+            if z.alive
+                if f_arrayHasInt(z.supportView.rootIds, ROOT_ID_EMA2000) or f_arrayHasInt(z.resistanceView.rootIds, ROOT_ID_EMA2000)
+                    array.push(e.ema2000CoreSlots, slot)
+                if f_arrayHasInt(z.supportView.rootIds, ROOT_ID_EMA3000) or f_arrayHasInt(z.resistanceView.rootIds, ROOT_ID_EMA3000)
+                    array.push(e.ema3000CoreSlots, slot)
     true
 
 f_updateMaRoot(ZoneEngine e, int rootId, float newPrice, int seq, int slopeSign, ZoneCfg c) =>
@@ -3115,11 +3322,12 @@ f_updateMaRoot(ZoneEngine e, int rootId, float newPrice, int seq, int slopeSign,
         bool priceChanged = na(old) or not f_eq(old, np, c.mintick)
         bool slopeChanged = r.slopeSign != slopeSign
         if priceChanged or slopeChanged
-            // A slope sign flip changes the MA High condition directly, so it is
-            // never eligible for the fast path.
-            bool needRebuild = slopeChanged or not c.maFastPath or na(old)
-            if priceChanged and not needRebuild
-                needRebuild := f_maMoveChangesRelationships(e, r, old, np, c)
+            // ---- O(1) guard test. No array is walked here. ----
+            bool inGuard = c.maFastPath and r.emaGuardValid and not na(r.emaGuardLow) and not na(r.emaGuardHigh)
+            inGuard := inGuard and slopeSign == r.emaGuardSlopeSign
+            // Strict comparison, so reaching a boundary breaches (safe side).
+            inGuard := inGuard and f_gt(np, r.emaGuardLow, c.mintick) and f_lt(np, r.emaGuardHigh, c.mintick)
+
             int oldIndexPos = priceChanged ? f_pointIndexFindByPrice(e, rootId, old) : na
             r.pointPrice := np
             r.nativeBottom := np
@@ -3128,15 +3336,19 @@ f_updateMaRoot(ZoneEngine e, int rootId, float newPrice, int seq, int slopeSign,
             r.lastUpdateSeq := seq
             if priceChanged
                 f_pointIndexRepositionAt(e, rootId, oldIndexPos)
-            if needRebuild
+
+            if inGuard
+                f_emaFastCoreUpdate(e, r, rootId == ROOT_ID_EMA2000 ? e.ema2000CoreSlots : e.ema3000CoreSlots, c)
+                if c.countersOn
+                    e.emaGuardHits += 1
+                    e.maFastUpdates += 1
+            else
+                r.emaGuardValid := false
                 f_markDirty(e, old, old, c)
                 f_markDirty(e, np, np, c)
                 if c.countersOn
+                    e.emaGuardBreaches += 1
                     e.maSlowUpdates += 1
-            else
-                f_maLocalCoreUpdate(e, r, c)
-                if c.countersOn
-                    e.maFastUpdates += 1
     true
 
 f_ensureMA(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
@@ -3210,7 +3422,7 @@ f_applyCandidate(ZoneEngine e, ZoneCore z, Candidate cnd, int side, ZoneFeed f, 
         if remapHistory
             f_filterMarksForSideRange(z, side, cnd.bottom, cnd.top, c)
             int mappedTouches = f_countMarksForSide(z, side)
-            if not e.touchHistoryTruncated
+            if not v.history.historyIncomplete
                 v.history.sideTouchCount := mappedTouches
                 v.history.sideFresh := mappedTouches == 0
             else
@@ -3230,6 +3442,8 @@ f_applyCandidate(ZoneEngine e, ZoneCore z, Candidate cnd, int side, ZoneFeed f, 
         bool oldConsumed = v.history.sideTouchCount > 0 or otherH.sideTouchCount > 0 or v.history.weakByDepth or v.history.weakByTouch or otherH.weakByDepth or otherH.weakByTouch or v.history.phase == PH_BROKEN or v.history.phase == PH_FLIP_WAIT or otherH.phase == PH_BROKEN or otherH.phase == PH_FLIP_WAIT
         if oldConsumed and addedNonPsych != 0 and cnd.baseStrong
             z.pendingGeneration := true
+            // Section 29.
+            z.generationCandidateSide := side
             z.generationCandidateMask := cnd.categoryMask
             z.generationCandidateBottom := cnd.bottom
             z.generationCandidateTop := cnd.top
@@ -3321,13 +3535,13 @@ f_reconcileCandidates(ZoneEngine e, array<Candidate> candidates, int side, ZoneF
                     else
                         split := true
                         parent := dz
-                        dstSlot := f_allocCore(e, f.baseCloseTime)
+                        dstSlot := f_allocCore(e, f.baseCloseTime, c)
                         ZoneCore nz = array.get(e.cores, dstSlot)
                         nz.generationId := parent.generationId
                         f_emit(e, EV_SPLIT, f, parent.coreId, parent.generationId, side, cnd.bottom, cnd.top, 0, GR_UNAVAILABLE, WEAK_NONE, nz.coreId)
             if not splitDeferred
                 if na(dstSlot)
-                    dstSlot := f_allocCore(e, f.baseCloseTime)
+                    dstSlot := f_allocCore(e, f.baseCloseTime, c)
                 ZoneCore z = array.get(e.cores, dstSlot)
                 // Read the parent's marks before any of them move.
                 SideHistory splitHist = split ? f_filteredHistoryForSplit(e, parent, side, cnd, c) : f_emptyHistory()
@@ -3338,6 +3552,7 @@ f_reconcileCandidates(ZoneEngine e, array<Candidate> candidates, int side, ZoneF
                     parent.zoneFresh := array.size(parent.touchMarks) == 0 and parent.zoneFresh
                     z.zoneFresh := array.size(z.touchMarks) == 0
                 f_applyCandidate(e, z, cnd, side, f, c, split or didMerge, split, splitHist)
+                f_syncCoreSets(e, dstSlot, c)
                 f_arrayAddUnique(updatedCoreIds, z.coreId)
                 f_arrayAddUnique(localCoreSlots, dstSlot)
     true
@@ -3382,6 +3597,7 @@ f_clearStaleSideInDirty(ZoneEngine e, int side, array<int> updatedCoreIds, ZoneC
                             v.eligible := false
                             v.history.grade := GR_UNAVAILABLE
                             f_updatePhysicalRange(z)
+                    f_syncCoreSets(e, slot, c)
     true
 
 
@@ -3505,15 +3721,20 @@ f_addTouchMark(ZoneEngine e, ZoneCore z, SideViewState v, ZoneFeed f, int side, 
     array.push(z.touchMarks, TouchMark.new(baseSeq = f.baseSeq, time = f.baseCloseTime, side = side,
         contactBottom = cb, contactTop = ct, closeAtTouch = f.baseClose, generationId = z.generationId,
         isNormalTouch = true, markSeq = seq, touchNo = touchNo, startGrade = startGrade,
-        weakByDepth = false, maxDepthPct = 0.0))
+        episodeWeakByDepth = false, episodeMaxDepthPct = 0.0))
     while array.size(z.touchMarks) > c.maxTouchMarksPerCore
-        array.shift(z.touchMarks)
+        TouchMark dropped = array.shift(z.touchMarks)
+        // Section 31: only THIS Core and Side become incomplete.
+        if dropped.side == SIDE_SUPPORT
+            z.supportView.history.historyIncomplete := true
+        else
+            z.resistanceView.history.historyIncomplete := true
         e.touchHistoryTruncated := true
     true
 
 // Called once per episode end (Reset or Break). The mark then carries the depth
 // facts that a later Merge or Split needs in order to rebuild history honestly.
-f_sealTouchMark(ZoneCore z, SideViewState v) =>
+f_sealTouchMark(ZoneCore z, SideViewState v, ZoneCfg c) =>
     int want = v.history.currentMarkSeq
     if not na(want)
         int n = array.size(z.touchMarks)
@@ -3521,8 +3742,10 @@ f_sealTouchMark(ZoneCore z, SideViewState v) =>
             for i = n - 1 to 0
                 TouchMark tm = array.get(z.touchMarks, i)
                 if tm.markSeq == want
-                    tm.maxDepthPct := math.max(tm.maxDepthPct, v.touchSnapshot.maxDepthPct)
-                    tm.weakByDepth := tm.weakByDepth or v.history.weakByDepth
+                    // Section 30: the episode's own depth, never the cumulative
+                    // SideHistory.
+                    tm.episodeMaxDepthPct := v.touchSnapshot.maxDepthPct
+                    tm.episodeWeakByDepth := not c.weakDepthOff and v.touchSnapshot.maxDepthPct >= c.weakDepthPct
                     break
     v.history.currentMarkSeq := na
     true
@@ -3562,7 +3785,7 @@ f_breakSide(ZoneEngine e, ZoneCore z, SideViewState v, SideViewState opposite, i
         z.lastBreakCategoryMask := f_categoryMaskFromIds(e, bs.rootIds)
     v.history.phase := PH_BROKEN
     v.history.grade := GR_UNAVAILABLE
-    f_sealTouchMark(z, v)
+    f_sealTouchMark(z, v, c)
     v.touchSnapshot.valid := false
     opposite.history.phase := PH_FLIP_WAIT
     opposite.history.grade := GR_UNAVAILABLE
@@ -3613,7 +3836,7 @@ f_processActiveSide(ZoneEngine e, ZoneCore z, SideViewState v, SideViewState opp
                 v.history.upcomingTouchNo := v.history.sideTouchCount + 1
                 v.history.lastArmedRangeBottom := v.effectiveBottom
                 v.history.lastArmedRangeTop := v.effectiveTop
-                f_sealTouchMark(z, v)
+                f_sealTouchMark(z, v, c)
                 v.touchSnapshot.valid := false
                 v.history.grade := f_gradeFor(v, c, false)
                 f_emit(e, EV_TOUCH_RESET, f, z.coreId, z.generationId, side, b, t, v.history.sideTouchCount,
@@ -3713,6 +3936,7 @@ f_startNewGeneration(ZoneEngine e, ZoneCore z, ZoneFeed f, ZoneCfg c) =>
     z.generationCandidateAway := false
     z.generationCandidateArmedFromSeq := na
     z.generationCandidateMask := 0
+    z.generationCandidateSide := SIDE_NONE
     f_emit(e, EV_GENERATION_START, f, z.coreId, z.generationId, SIDE_NONE, z.physicalBottom, z.physicalTop, 0, GR_UNAVAILABLE, WEAK_NONE, 0)
     true
 
@@ -3742,19 +3966,17 @@ f_processGenerationReapproach(ZoneEngine e, ZoneCore z, ZoneFeed f, ZoneCfg c) =
         bool active = z.supportView.history.phase == PH_ACTIVE_TOUCH or z.resistanceView.history.phase == PH_ACTIVE_TOUCH
         if not active and not na(z.generationCandidateBottom)
             if f_intersects(f.baseLow, f.baseHigh, z.generationCandidateBottom, z.generationCandidateTop, c.mintick)
+                int candidateSide = z.generationCandidateSide
                 f_startNewGeneration(e, z, f, c)
-                // Arm from THIS bar, not the next one, so the contact that caused
-                // the switch is the new generation's first Touch.
-                if z.supportView.eligible and not na(z.supportView.effectiveBottom)
-                    z.supportView.history.phase := PH_ARMED
-                    z.supportView.history.armedFromSeq := f.baseSeq
-                    z.supportView.history.lastArmedRangeBottom := z.supportView.effectiveBottom
-                    z.supportView.history.lastArmedRangeTop := z.supportView.effectiveTop
-                if z.resistanceView.eligible and not na(z.resistanceView.effectiveBottom)
-                    z.resistanceView.history.phase := PH_ARMED
-                    z.resistanceView.history.armedFromSeq := f.baseSeq
-                    z.resistanceView.history.lastArmedRangeBottom := z.resistanceView.effectiveBottom
-                    z.resistanceView.history.lastArmedRangeTop := z.resistanceView.effectiveTop
+                // Section 29. Only the Side that became the candidate is armed
+                // from THIS bar, so the contact is that Side's Touch 1. The
+                // opposite Side stays Waiting.
+                SideViewState gv = candidateSide == SIDE_SUPPORT ? z.supportView : z.resistanceView
+                if candidateSide != SIDE_NONE and gv.eligible and not na(gv.effectiveBottom)
+                    gv.history.phase := PH_ARMED
+                    gv.history.armedFromSeq := f.baseSeq
+                    gv.history.lastArmedRangeBottom := gv.effectiveBottom
+                    gv.history.lastArmedRangeTop := gv.effectiveTop
     true
 
 f_viewInverseConfirmedThisBar(ZoneEngine e, SideViewState v) =>
@@ -3791,40 +4013,56 @@ f_refreshArmDormant(ZoneEngine e, ZoneCore z, SideViewState v, int side, ZoneFee
             v.history.grade := f_gradeFor(v, c, false)
     true
 
-f_coreIdleDormant(ZoneCore z) =>
-    SideViewState sv = z.supportView
-    SideViewState rv = z.resistanceView
-    bool sIdle = not sv.hasNonPsychRoot or not sv.eligible or sv.history.phase == PH_DORMANT
-    bool rIdle = not rv.hasNonPsychRoot or not rv.eligible or rv.history.phase == PH_DORMANT
-    sIdle and rIdle and not z.pendingTopology and not z.pendingGeneration
-
-f_barNearCore(ZoneCore z, ZoneFeed f, ZoneCfg c) =>
-    bool near = true
-    if not na(z.physicalBottom) and not na(z.physicalTop)
-        float lo = z.physicalBottom - c.dormantDistance
-        float hi = z.physicalTop + c.dormantDistance
-        near := f.baseHigh >= lo and f.baseLow <= hi
-    near
-
+// ============================================================================
+// Phases J-early, A, B, C. Sections 8-12: each phase walks ONLY its own work
+// set. liveCoreSlots is never iterated here.
+// ============================================================================
 f_processExistingState(ZoneEngine e, ZoneFeed f, ZoneCfg c) =>
-    int n = array.size(e.liveCoreSlots)
-    if n > 0
-        for k = 0 to n - 1
-            ZoneCore z = array.get(e.cores, array.get(e.liveCoreSlots, k))
-            // Dormant/unavailable cores can be skipped while the whole current
-            // bar remains outside their wake corridor. This is exactly the
-            // Dormant contract: history is retained, calculations rest.
-            bool sleep = f_coreIdleDormant(z) and not f_barNearCore(z, f, c)
-            if not sleep
-                // J (early): a pending new generation that is re-approached now
-                // takes effect before any Touch is counted.
+    // J (early): a pending new generation that is re-approached now takes effect
+    // before any Touch is counted (FIX 22.7).
+    array<int> genSnap = f_snapshotSet(e, e.generationWatchSlots)
+    int gn = array.size(genSnap)
+    if gn > 0
+        for k = 0 to gn - 1
+            int slot = array.get(genSnap, k)
+            ZoneCore z = array.get(e.cores, slot)
+            if z.alive
                 f_processGenerationReapproach(e, z, f, c)
-                // A: only Views armed before the current bar may start Touch/GapBreak.
+                f_syncCoreSets(e, slot, c)
+
+    // A/B: only Views that were Armed before this bar may start a Touch or a
+    // GapBreak. Waiting, Dormant, Broken and ActiveTouch Cores are not searched.
+    array<int> armSup = f_snapshotSet(e, e.armedSupportSlots)
+    int an = array.size(armSup)
+    if an > 0
+        for k = 0 to an - 1
+            int slot = array.get(armSup, k)
+            ZoneCore z = array.get(e.cores, slot)
+            if z.alive
                 f_processArmedSide(e, z, z.supportView, z.resistanceView, SIDE_SUPPORT, f, c)
+                f_syncCoreSets(e, slot, c)
+
+    array<int> armRes = f_snapshotSet(e, e.armedResistanceSlots)
+    int rn = array.size(armRes)
+    if rn > 0
+        for k = 0 to rn - 1
+            int slot = array.get(armRes, k)
+            ZoneCore z = array.get(e.cores, slot)
+            if z.alive
                 f_processArmedSide(e, z, z.resistanceView, z.supportView, SIDE_RESISTANCE, f, c)
-                // B/C: existing episode outcomes; Break has priority over WeakDepth.
+                f_syncCoreSets(e, slot, c)
+
+    // C: running episodes, evaluated against their frozen TouchStartSnapshot.
+    array<int> actSnap = f_snapshotSet(e, e.activeTouchSlots)
+    int cn = array.size(actSnap)
+    if cn > 0
+        for k = 0 to cn - 1
+            int slot = array.get(actSnap, k)
+            ZoneCore z = array.get(e.cores, slot)
+            if z.alive
                 f_processActiveSide(e, z, z.supportView, z.resistanceView, SIDE_SUPPORT, f, c)
                 f_processActiveSide(e, z, z.resistanceView, z.supportView, SIDE_RESISTANCE, f, c)
+                f_syncCoreSets(e, slot, c)
     true
 
 f_refreshLiveEligibility(ZoneEngine e, ZoneCfg c) =>
@@ -3850,31 +4088,81 @@ f_refreshLiveEligibility(ZoneEngine e, ZoneCfg c) =>
                         v.history.grade := GR_UNAVAILABLE
     true
 
+// ============================================================================
+// Phases I, J, K. Sections 11, 12, 19: Break / Flip / Reclaim from the break
+// set, Generation from the generation set, Arm / Dormant refresh from the
+// waiting set, and the Dormant set only when the aggregate corridor is reached.
+// ============================================================================
 f_processPostRootTransitions(ZoneEngine e, ZoneFeed f, ZoneCfg c) =>
-    int n = array.size(e.liveCoreSlots)
-    e.pendingTopologyCount := 0
-    e.pendingGenerationCount := 0
-    if n > 0
-        for k = 0 to n - 1
-            ZoneCore z = array.get(e.cores, array.get(e.liveCoreSlots, k))
-            bool supportTransition = z.supportView.history.phase == PH_BROKEN or z.supportView.history.phase == PH_FLIP_WAIT
-            bool resistanceTransition = z.resistanceView.history.phase == PH_BROKEN or z.resistanceView.history.phase == PH_FLIP_WAIT
-            bool hasTransition = supportTransition or resistanceTransition
-            bool sleep = f_coreIdleDormant(z) and not hasTransition and not f_barNearCore(z, f, c)
-            if not sleep
+    // I: Break / Flip / Reclaim.
+    array<int> brkSnap = f_snapshotSet(e, e.brokenFlipWaitSlots)
+    int bn = array.size(brkSnap)
+    if bn > 0
+        for k = 0 to bn - 1
+            int slot = array.get(brkSnap, k)
+            ZoneCore z = array.get(e.cores, slot)
+            if z.alive
                 f_processBreakWait(e, z, SIDE_SUPPORT, f, c)
                 f_processBreakWait(e, z, SIDE_RESISTANCE, f, c)
+                f_syncCoreSets(e, slot, c)
+
+    // J: generation candidates only.
+    array<int> genSnap = f_snapshotSet(e, e.generationWatchSlots)
+    int gn = array.size(genSnap)
+    if gn > 0
+        for k = 0 to gn - 1
+            int slot = array.get(genSnap, k)
+            ZoneCore z = array.get(e.cores, slot)
+            if z.alive
                 f_processGeneration(e, z, f, c)
+                f_syncCoreSets(e, slot, c)
+
+    // FIX 22.4 safety net, now bounded to Cores that actually hold pending work.
+    array<int> pendSnap = f_snapshotSet(e, e.pendingTopoSlots)
+    int pn = array.size(pendSnap)
+    if pn > 0
+        for k = 0 to pn - 1
+            int slot = array.get(pendSnap, k)
+            ZoneCore z = array.get(e.cores, slot)
+            if z.alive
+                f_flushPendingTopologyIfIdle(e, z, c)
+                f_syncCoreSets(e, slot, c)
+
+    // K: next-bar Phase / Grade / Armed for the quiet Cores.
+    array<int> waitSnap = f_snapshotSet(e, e.waitingSlots)
+    int wn = array.size(waitSnap)
+    if wn > 0
+        for k = 0 to wn - 1
+            int slot = array.get(waitSnap, k)
+            ZoneCore z = array.get(e.cores, slot)
+            if z.alive
                 f_refreshArmDormant(e, z, z.supportView, SIDE_SUPPORT, f, c)
                 f_refreshArmDormant(e, z, z.resistanceView, SIDE_RESISTANCE, f, c)
-            // FIX 22.4 safety net. Any Core that left ActiveTouch on an earlier
-            // bar without flushing is flushed here, so pendingTopology can never
-            // become permanent.
-            f_flushPendingTopologyIfIdle(e, z, c)
-            if z.pendingTopology
-                e.pendingTopologyCount += 1
-            if z.pendingGeneration
-                e.pendingGenerationCount += 1
+                f_syncCoreSets(e, slot, c)
+
+    // Section 19. Dormant Cores are parked behind a price corridor. While the
+    // bar stays strictly inside the aggregate guard, not one of them is walked.
+    bool dormantMayWake = not e.dormantGuardValid
+    if e.dormantGuardValid
+        bool belowHit = not na(e.dormantGuardLow) and f.baseLow <= e.dormantGuardLow
+        bool aboveHit = not na(e.dormantGuardHigh) and f.baseHigh >= e.dormantGuardHigh
+        dormantMayWake := belowHit or aboveHit
+    if dormantMayWake and array.size(e.dormantSlots) > 0
+        array<int> dorSnap = f_snapshotSet(e, e.dormantSlots)
+        int dn = array.size(dorSnap)
+        if dn > 0
+            for k = 0 to dn - 1
+                int slot = array.get(dorSnap, k)
+                ZoneCore z = array.get(e.cores, slot)
+                if z.alive
+                    f_refreshArmDormant(e, z, z.supportView, SIDE_SUPPORT, f, c)
+                    f_refreshArmDormant(e, z, z.resistanceView, SIDE_RESISTANCE, f, c)
+                    f_syncCoreSets(e, slot, c)
+    if dormantMayWake
+        f_rebuildDormantGuard(e, f.baseClose)
+
+    e.pendingTopologyCount := array.size(e.pendingTopoSlots)
+    e.pendingGenerationCount := array.size(e.generationWatchSlots)
     true
 
 // ============================================================================
@@ -3997,7 +4285,7 @@ f_pruneStorage(ZoneEngine e, ZoneFeed f, ZoneCfg c) =>
             break
         ZoneCore vz = array.get(e.cores, victim)
         f_emit(e, EV_STORAGE_PRUNE, f, vz.coreId, vz.generationId, SIDE_NONE, vz.physicalBottom, vz.physicalTop, 0, GR_UNAVAILABLE, WEAK_NONE, 0)
-        f_retireCoreSlot(e, victim)
+        f_retireCoreSlot(e, victim, c)
         e.storagePruned := true
         e.prunedZoneCount += 1
 
@@ -4135,6 +4423,24 @@ export updateConfirmedBase(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
         // Base bar leaves it false and no candidate search runs at all.
         bool slowPath = e.topologyDirty
         f_rebuildDirtyTopology(e, f, c)
+
+        // Slow Path only (sections 3, 6, 17, 18): resync the work sets, rebuild
+        // the EMA -> Core reverse index, and rebuild each EMA Topology Guard.
+        // None of this runs on a Fast Path bar.
+        if slowPath
+            int csn = array.size(e.liveCoreSlots)
+            if csn > 0
+                for ci = 0 to csn - 1
+                    f_syncCoreSets(e, array.get(e.liveCoreSlots, ci), c)
+            f_rebuildEmaCoreIndex(e)
+            e.dormantGuardValid := false
+            if c.enableMA
+                Root ema2 = f_getRoot(e, ROOT_ID_EMA2000)
+                if not na(ema2)
+                    f_buildEmaGuard(e, ema2, c)
+                Root ema3 = f_getRoot(e, ROOT_ID_EMA3000)
+                if not na(ema3)
+                    f_buildEmaGuard(e, ema3, c)
 
         // I. Break/Flip/Reclaim/Generation and next-bar Armed state.
         f_processPostRootTransitions(e, f, c)
@@ -4294,6 +4600,15 @@ export maFastUpdates(ZoneEngine e) => e.maFastUpdates
 export maSlowUpdates(ZoneEngine e) => e.maSlowUpdates
 export maxLiveRoots(ZoneEngine e) => e.maxLiveRoots
 export maxLiveCores(ZoneEngine e) => e.maxLiveCores
+export emaGuardHits(ZoneEngine e) => e.emaGuardHits
+export emaGuardBreaches(ZoneEngine e) => e.emaGuardBreaches
+export fvgFullScanCount(ZoneEngine e) => e.fvgFullScanCount
+export armedSetSize(ZoneEngine e, int side) => side == SIDE_SUPPORT ? array.size(e.armedSupportSlots) : array.size(e.armedResistanceSlots)
+export activeTouchSetSize(ZoneEngine e) => array.size(e.activeTouchSlots)
+export breakFlipSetSize(ZoneEngine e) => array.size(e.brokenFlipWaitSlots)
+export generationWatchSetSize(ZoneEngine e) => array.size(e.generationWatchSlots)
+export dormantSetSize(ZoneEngine e) => array.size(e.dormantSlots)
+export waitingSetSize(ZoneEngine e) => array.size(e.waitingSlots)
 export requestContextCount() => 6
 export isFullHistory() => true
 
