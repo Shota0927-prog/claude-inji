@@ -20,7 +20,7 @@ library("ZoneCoreV2_Common", overlay = true)
 // ZoneEngineV2_Rebuild, carried over unchanged. It is not simplified for speed:
 // a Current build runs once, not once per historical bar.
 // ============================================================================
-const string CORE_BUILD_ID = "ZONECORE-V2-20260920-P1"
+const string CORE_BUILD_ID = "ZONECORE-V2-20260920-P2"
 export coreBuildId() => CORE_BUILD_ID
 
 // Categories
@@ -1287,10 +1287,16 @@ f_scoreStartCache(RootSet e, int startIdx, int side, float widthLimit, bool requ
                 array.set(e.cacheTop, startIdx, bestTop)
     true
 
-f_cacheBestIndex(RootSet e, int n) =>
-    int bestIdx = na
-    if n > 0
-        for i = 0 to n - 1
+// Section 3. The competition scan, sliced. The running best is carried INTO
+// each chunk and out of it, so every entry is still compared against the same
+// incumbent, in the same ascending index order, through the same f_scoreBetter
+// call with the same tie-break (C, H, width, created, minRootId). Slicing a
+// left-to-right "is this one better than the best so far" scan into contiguous
+// pieces cannot change its result.
+f_cacheBestIndexChunk(RootSet e, int fromIdx, int toIdx, int curBest) =>
+    int bestIdx = curBest
+    if toIdx > fromIdx
+        for i = fromIdx to toIdx - 1
             int en = array.get(e.cacheEnd, i)
             if en >= 0
                 bool better = na(bestIdx)
@@ -1306,6 +1312,28 @@ f_cacheBestIndex(RootSet e, int n) =>
                         array.get(e.cacheMinId, i), bc, bh, bb, bt, bcr, bmi, true)
                 if better
                     bestIdx := i
+    bestIdx
+
+// Four chunks of 24, called one after another. No for, no while.
+f_cacheBestBlock96(RootSet e, int base, int n, int curBest) =>
+    int b = curBest
+    b := f_cacheBestIndexChunk(e, math.min(base +  0, n), math.min(base + 24, n), b)
+    b := f_cacheBestIndexChunk(e, math.min(base + 24, n), math.min(base + 48, n), b)
+    b := f_cacheBestIndexChunk(e, math.min(base + 48, n), math.min(base + 72, n), b)
+    b := f_cacheBestIndexChunk(e, math.min(base + 72, n), math.min(base + 96, n), b)
+    b
+
+f_cacheBestIndex(RootSet e, int n) =>
+    int bestIdx = na
+    if n > 0
+        bestIdx := f_cacheBestBlock96(e, 0, n, bestIdx)
+        bestIdx := f_cacheBestBlock96(e, 96, n, bestIdx)
+        bestIdx := f_cacheBestBlock96(e, 192, n, bestIdx)
+        bestIdx := f_cacheBestBlock96(e, 288, n, bestIdx)
+        // Exact tail. Never reached with the existing Root capacities, and it
+        // covers every remaining entry rather than truncating the scan.
+        if n > 384
+            bestIdx := f_cacheBestIndexChunk(e, 384, n, bestIdx)
     bestIdx
 
 f_materializePointCandidate(RootSet e, int startIdx, int endIdx, int side, float widthLimit, int stamp, ZoneCfg c) =>
@@ -1449,56 +1477,183 @@ f_scoreStartChunk(RootSet e, int fromIdx, int toIdx, int side, float widthLimit,
             f_scoreStartCache(e, i, side, widthLimit, requireStrong, stamp, c)
     true
 
+// Section 2. Four chunks of SCORE_CHUNK, called one after another. The
+// enclosing while is gone, so no loop statement spans more than 24 starts.
+f_scoreBlock96(RootSet e, int base, int n, int side, float widthLimit, bool requireStrong,
+               int stamp, ZoneCfg c) =>
+    f_scoreStartChunk(e, math.min(base + SCORE_CHUNK * 0, n), math.min(base + SCORE_CHUNK * 1, n), side, widthLimit, requireStrong, stamp, c)
+    f_scoreStartChunk(e, math.min(base + SCORE_CHUNK * 1, n), math.min(base + SCORE_CHUNK * 2, n), side, widthLimit, requireStrong, stamp, c)
+    f_scoreStartChunk(e, math.min(base + SCORE_CHUNK * 2, n), math.min(base + SCORE_CHUNK * 3, n), side, widthLimit, requireStrong, stamp, c)
+    f_scoreStartChunk(e, math.min(base + SCORE_CHUNK * 3, n), math.min(base + SCORE_CHUNK * 4, n), side, widthLimit, requireStrong, stamp, c)
+    true
+
 f_scoreAllStarts(RootSet e, int n, int side, float widthLimit, bool requireStrong,
                  int stamp, ZoneCfg c) =>
-    int chunkStart = 0
-    while chunkStart < n
-        int chunkEnd = math.min(chunkStart + SCORE_CHUNK, n)
-        f_scoreStartChunk(e, chunkStart, chunkEnd, side, widthLimit, requireStrong, stamp, c)
-        chunkStart := chunkEnd
+    f_scoreBlock96(e, 0, n, side, widthLimit, requireStrong, stamp, c)
+    f_scoreBlock96(e, 96, n, side, widthLimit, requireStrong, stamp, c)
+    f_scoreBlock96(e, 192, n, side, widthLimit, requireStrong, stamp, c)
+    f_scoreBlock96(e, 288, n, side, widthLimit, requireStrong, stamp, c)
+    // Exact tail. Never reached with the existing Root capacities, and it
+    // scores every remaining start rather than dropping any.
+    if n > 384
+        f_scoreStartChunk(e, 384, n, side, widthLimit, requireStrong, stamp, c)
     true
+
+// ============================================================================
+// Section 6. The affected re-score, sliced.
+//
+// The span [i0, i1) is chosen exactly as before - affLo / affHi from
+// f_selectedAffectedRange, the two binary bounds, the two-tick padding - and
+// f_startDependsOnSelected still decides each start inside it. Only the number
+// of starts one for statement covers has changed.
+// ============================================================================
+const int RESCORE_CHUNK = 16
+
+f_rescoreAffectedChunk(RootSet e, int fromIdx, int toIdx, Candidate best, int side,
+                       float widthLimit, bool requireStrong, int stamp, ZoneCfg c) =>
+    if toIdx > fromIdx
+        for i = fromIdx to toIdx - 1
+            if f_startDependsOnSelected(e, i, best, stamp, widthLimit, c)
+                f_scoreStartCache(e, i, side, widthLimit, requireStrong, stamp, c)
+    true
+
+f_rescoreBlock64(RootSet e, int base, int i1, Candidate best, int side,
+                 float widthLimit, bool requireStrong, int stamp, ZoneCfg c) =>
+    f_rescoreAffectedChunk(e, math.min(base + RESCORE_CHUNK * 0, i1), math.min(base + RESCORE_CHUNK * 1, i1), best, side, widthLimit, requireStrong, stamp, c)
+    f_rescoreAffectedChunk(e, math.min(base + RESCORE_CHUNK * 1, i1), math.min(base + RESCORE_CHUNK * 2, i1), best, side, widthLimit, requireStrong, stamp, c)
+    f_rescoreAffectedChunk(e, math.min(base + RESCORE_CHUNK * 2, i1), math.min(base + RESCORE_CHUNK * 3, i1), best, side, widthLimit, requireStrong, stamp, c)
+    f_rescoreAffectedChunk(e, math.min(base + RESCORE_CHUNK * 3, i1), math.min(base + RESCORE_CHUNK * 4, i1), best, side, widthLimit, requireStrong, stamp, c)
+    true
+
+f_rescoreAffected(RootSet e, int i0, int i1, Candidate best, int side,
+                  float widthLimit, bool requireStrong, int stamp, ZoneCfg c) =>
+    if i1 > i0
+        f_rescoreBlock64(e, i0 + 0, i1, best, side, widthLimit, requireStrong, stamp, c)
+        f_rescoreBlock64(e, i0 + 64, i1, best, side, widthLimit, requireStrong, stamp, c)
+        f_rescoreBlock64(e, i0 + 128, i1, best, side, widthLimit, requireStrong, stamp, c)
+        f_rescoreBlock64(e, i0 + 192, i1, best, side, widthLimit, requireStrong, stamp, c)
+        f_rescoreBlock64(e, i0 + 256, i1, best, side, widthLimit, requireStrong, stamp, c)
+        f_rescoreBlock64(e, i0 + 320, i1, best, side, widthLimit, requireStrong, stamp, c)
+        // Exact tail. It re-scores every remaining start in the span.
+        if i1 > i0 + 384
+            f_rescoreAffectedChunk(e, i0 + 384, i1, best, side, widthLimit, requireStrong, stamp, c)
+    true
+
+// ============================================================================
+// Sections 4 and 5. One turn of the old while body, and the batches that
+// replace the while itself.
+//
+// f_selectOnePointCandidate does exactly what one iteration did, in the same
+// order, and returns whether the old loop would have iterated again - which was
+// decided by one thing only: whether f_cacheBestIndex still found an entry.
+// ============================================================================
+f_selectOnePointCandidate(RootSet e, int n, int side, float widthLimit, bool requireStrong,
+                          int stamp, array<Candidate> selected, ZoneCfg c) =>
+    bool more = false
+    int bestIdx = f_cacheBestIndex(e, n)
+    if not na(bestIdx)
+        more := true
+        int bestEnd = array.get(e.cacheEnd, bestIdx)
+        Candidate best = f_materializePointCandidate(e, bestIdx, bestEnd, side, widthLimit, stamp, c)
+        bool valid = not na(best) and (not requireStrong or best.baseStrong) and not f_candidateUsesStamp(e, best, stamp)
+        if not valid
+            // Exact fallback: invalidate only this cached descriptor and let
+            // the remaining exact cache entries compete. This path should be
+            // rare and never converts an uncertain candidate into an empty result.
+            f_cacheInvalidate(e, bestIdx)
+        else
+            f_finalizeCandidateReference(e, best)
+            array.push(selected, best)
+            f_markCandidateUsedStamp(e, best, stamp)
+            // Section 8: only starts inside the support of
+            // f_startDependsOnSelected can have changed, and workPointSlots is
+            // price ascending, so that span is found by binary search instead
+            // of walking all n starts. The predicate is still applied inside
+            // the span, and the span is padded by two ticks to absorb the tick
+            // rounding the predicate's comparisons use, so the set of re-scored
+            // starts is identical to the full walk's.
+            [affLo, affHi] = f_selectedAffectedRange(e, best, stamp, widthLimit, c)
+            if not na(affLo) and not na(affHi)
+                int i0 = f_workPointLowerBound(e, affLo - 2.0 * c.mintick)
+                int i1 = f_workPointUpperBound(e, affHi + 2.0 * c.mintick)
+                f_rescoreAffected(e, i0, i1, best, side, widthLimit, requireStrong, stamp, c)
+    more
+
+// Eight turns, guarded so a finished selection stops doing work. No for, no while.
+f_selectBatch8(RootSet e, int n, int side, float widthLimit, bool requireStrong,
+               int stamp, array<Candidate> selected, ZoneCfg c) =>
+    bool more = true
+    if more
+        more := f_selectOnePointCandidate(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+    if more
+        more := f_selectOnePointCandidate(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+    if more
+        more := f_selectOnePointCandidate(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+    if more
+        more := f_selectOnePointCandidate(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+    if more
+        more := f_selectOnePointCandidate(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+    if more
+        more := f_selectOnePointCandidate(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+    if more
+        more := f_selectOnePointCandidate(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+    if more
+        more := f_selectOnePointCandidate(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+    more
+
+f_selectBatch32(RootSet e, int n, int side, float widthLimit, bool requireStrong,
+                int stamp, array<Candidate> selected, ZoneCfg c) =>
+    bool more = true
+    if more
+        more := f_selectBatch8(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+    if more
+        more := f_selectBatch8(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+    if more
+        more := f_selectBatch8(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+    if more
+        more := f_selectBatch8(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+    more
 
 f_selectPointCandidatesLight(RootSet e, int side, float widthLimit, bool requireStrong,
                              int stamp, array<Candidate> selected, ZoneCfg c) =>
     int n = array.size(e.workPointSlots)
     f_cacheEnsure(e, n)
     if n > 0
-        // Section 9: every start is scored exactly once, in fixed-size chunks.
+        // Section 2: every start is scored exactly once, in fixed-size chunks.
         f_scoreAllStarts(e, n, side, widthLimit, requireStrong, stamp, c)
-        bool keepGoing = true
-        while keepGoing
-            int bestIdx = f_cacheBestIndex(e, n)
-            if na(bestIdx)
-                keepGoing := false
-            else
-                int bestEnd = array.get(e.cacheEnd, bestIdx)
-                Candidate best = f_materializePointCandidate(e, bestIdx, bestEnd, side, widthLimit, stamp, c)
-                bool valid = not na(best) and (not requireStrong or best.baseStrong) and not f_candidateUsesStamp(e, best, stamp)
-                if not valid
-                    // Exact fallback: invalidate only this cached descriptor and let
-                    // the remaining exact cache entries compete. This path should be
-                    // rare and never converts an uncertain candidate into an empty result.
-                    f_cacheInvalidate(e, bestIdx)
-                else
-                    f_finalizeCandidateReference(e, best)
-                    array.push(selected, best)
-                    f_markCandidateUsedStamp(e, best, stamp)
-                    // Section 8: only starts inside the support of
-                    // f_startDependsOnSelected can have changed, and
-                    // workPointSlots is price ascending, so that span is found
-                    // by binary search instead of walking all n starts. The
-                    // predicate is still applied inside the span, and the span
-                    // is padded by two ticks to absorb the tick rounding the
-                    // predicate's comparisons use, so the set of re-scored
-                    // starts is identical to the full walk's.
-                    [affLo, affHi] = f_selectedAffectedRange(e, best, stamp, widthLimit, c)
-                    if not na(affLo) and not na(affHi)
-                        int i0 = f_workPointLowerBound(e, affLo - 2.0 * c.mintick)
-                        int i1 = f_workPointUpperBound(e, affHi + 2.0 * c.mintick)
-                        if i1 > i0
-                            for i = i0 to i1 - 1
-                                if f_startDependsOnSelected(e, i, best, stamp, widthLimit, c)
-                                    f_scoreStartCache(e, i, side, widthLimit, requireStrong, stamp, c)
+        // Section 5: twelve batches of 32, called explicitly. 384 turns is far
+        // beyond what the existing Root capacities can produce; it is a
+        // scheduling limit, never a Candidate cap.
+        bool more = true
+        if more
+            more := f_selectBatch32(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+        if more
+            more := f_selectBatch32(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+        if more
+            more := f_selectBatch32(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+        if more
+            more := f_selectBatch32(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+        if more
+            more := f_selectBatch32(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+        if more
+            more := f_selectBatch32(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+        if more
+            more := f_selectBatch32(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+        if more
+            more := f_selectBatch32(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+        if more
+            more := f_selectBatch32(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+        if more
+            more := f_selectBatch32(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+        if more
+            more := f_selectBatch32(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+        if more
+            more := f_selectBatch32(e, n, side, widthLimit, requireStrong, stamp, selected, c)
+        // Exact fallback. Only a competition that has not finished after 384
+        // turns reaches this, and it finishes it rather than truncating the
+        // Candidate set. A normal Current build never enters it.
+        while more
+            more := f_selectOnePointCandidate(e, n, side, widthLimit, requireStrong, stamp, selected, c)
     true
 
 f_candidateContainsRoot(Candidate cnd, int id) => not na(cnd) and f_arrayHasInt(cnd.rootIds, id)
