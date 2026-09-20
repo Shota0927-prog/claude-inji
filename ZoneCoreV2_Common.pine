@@ -20,7 +20,7 @@ library("ZoneCoreV2_Common", overlay = true)
 // ZoneEngineV2_Rebuild, carried over unchanged. It is not simplified for speed:
 // a Current build runs once, not once per historical bar.
 // ============================================================================
-const string CORE_BUILD_ID = "ZONECORE-V2-20260920"
+const string CORE_BUILD_ID = "ZONECORE-V2-20260920-P1"
 export coreBuildId() => CORE_BUILD_ID
 
 // Categories
@@ -1368,13 +1368,103 @@ f_startDependsOnSelected(RootSet e, int startIdx, Candidate selected, int stamp,
                     break
     affected
 
+// ============================================================================
+// RE10022 work reduction. Nothing below changes which Candidates are produced:
+// every new function either issues the SAME calls in a different shape, or
+// narrows a walk to the exact span outside which the original predicate is
+// provably false. The predicate itself is still applied inside that span.
+// ============================================================================
+
+// workPointSlots is filled from the global stable price index, so it is in
+// ascending pointPrice order. These two bounds locate a price span in it
+// without walking it.
+f_workPointLowerBound(RootSet e, float price) =>
+    int lo = 0
+    int hi = array.size(e.workPointSlots)
+    while lo < hi
+        int mid = int(math.floor((lo + hi) * 0.5))
+        Root q = array.get(e.roots, array.get(e.workPointSlots, mid))
+        if q.pointPrice >= price
+            hi := mid
+        else
+            lo := mid + 1
+    lo
+
+f_workPointUpperBound(RootSet e, float price) =>
+    int lo = 0
+    int hi = array.size(e.workPointSlots)
+    while lo < hi
+        int mid = int(math.floor((lo + hi) * 0.5))
+        Root q = array.get(e.roots, array.get(e.workPointSlots, mid))
+        if q.pointPrice > price
+            hi := mid
+        else
+            lo := mid + 1
+    lo
+
+// The exact support of f_startDependsOnSelected for one selected Candidate:
+// the union, over that Candidate's stamped Roots, of the start prices the
+// predicate can answer true for. Read straight off the predicate's own tests:
+//
+//   FVG    intersects(nb, nt, sp - w, sp + w)  <=>  nb - w <= sp <= nt + w
+//   Psych  abs(pp - sp) <= w                   <=>  pp - w <= sp <= pp + w
+//   other  sp <= pp and pp - sp <= w           <=>  pp - w <= sp <= pp
+//
+// A start outside this union cannot depend on the Candidate, so not re-scoring
+// it is not an approximation.
+f_selectedAffectedRange(RootSet e, Candidate selected, int stamp, float widthLimit, ZoneCfg c) =>
+    float lo = na
+    float hi = na
+    int rn = array.size(selected.rootIds)
+    if rn > 0
+        for rix = 0 to rn - 1
+            Root r = f_getRoot(e, array.get(selected.rootIds, rix))
+            if not na(r) and r.workStamp == stamp
+                float a = na
+                float b = na
+                if r.category == CAT_FVG
+                    a := r.nativeBottom - widthLimit
+                    b := r.nativeTop + widthLimit
+                else if r.category == CAT_PSYCH
+                    a := r.pointPrice - widthLimit
+                    b := r.pointPrice + widthLimit
+                else
+                    a := r.pointPrice - widthLimit
+                    b := r.pointPrice
+                lo := na(lo) ? a : math.min(lo, a)
+                hi := na(hi) ? b : math.max(hi, b)
+    [lo, hi]
+
+// Section 9. Exactly the same n calls to f_scoreStartCache, issued as a
+// sequence of fixed-size inner loops instead of one loop of n iterations.
+// Every start is still evaluated exactly once - nothing is skipped, capped,
+// approximated or cut short. This exists only to keep any single loop short,
+// never to reduce the work.
+const int SCORE_CHUNK = 24
+
+f_scoreStartChunk(RootSet e, int fromIdx, int toIdx, int side, float widthLimit,
+                  bool requireStrong, int stamp, ZoneCfg c) =>
+    if toIdx > fromIdx
+        for i = fromIdx to toIdx - 1
+            f_scoreStartCache(e, i, side, widthLimit, requireStrong, stamp, c)
+    true
+
+f_scoreAllStarts(RootSet e, int n, int side, float widthLimit, bool requireStrong,
+                 int stamp, ZoneCfg c) =>
+    int chunkStart = 0
+    while chunkStart < n
+        int chunkEnd = math.min(chunkStart + SCORE_CHUNK, n)
+        f_scoreStartChunk(e, chunkStart, chunkEnd, side, widthLimit, requireStrong, stamp, c)
+        chunkStart := chunkEnd
+    true
+
 f_selectPointCandidatesLight(RootSet e, int side, float widthLimit, bool requireStrong,
                              int stamp, array<Candidate> selected, ZoneCfg c) =>
     int n = array.size(e.workPointSlots)
     f_cacheEnsure(e, n)
     if n > 0
-        for i = 0 to n - 1
-            f_scoreStartCache(e, i, side, widthLimit, requireStrong, stamp, c)
+        // Section 9: every start is scored exactly once, in fixed-size chunks.
+        f_scoreAllStarts(e, n, side, widthLimit, requireStrong, stamp, c)
         bool keepGoing = true
         while keepGoing
             int bestIdx = f_cacheBestIndex(e, n)
@@ -1393,9 +1483,22 @@ f_selectPointCandidatesLight(RootSet e, int side, float widthLimit, bool require
                     f_finalizeCandidateReference(e, best)
                     array.push(selected, best)
                     f_markCandidateUsedStamp(e, best, stamp)
-                    for i = 0 to n - 1
-                        if f_startDependsOnSelected(e, i, best, stamp, widthLimit, c)
-                            f_scoreStartCache(e, i, side, widthLimit, requireStrong, stamp, c)
+                    // Section 8: only starts inside the support of
+                    // f_startDependsOnSelected can have changed, and
+                    // workPointSlots is price ascending, so that span is found
+                    // by binary search instead of walking all n starts. The
+                    // predicate is still applied inside the span, and the span
+                    // is padded by two ticks to absorb the tick rounding the
+                    // predicate's comparisons use, so the set of re-scored
+                    // starts is identical to the full walk's.
+                    [affLo, affHi] = f_selectedAffectedRange(e, best, stamp, widthLimit, c)
+                    if not na(affLo) and not na(affHi)
+                        int i0 = f_workPointLowerBound(e, affLo - 2.0 * c.mintick)
+                        int i1 = f_workPointUpperBound(e, affHi + 2.0 * c.mintick)
+                        if i1 > i0
+                            for i = i0 to i1 - 1
+                                if f_startDependsOnSelected(e, i, best, stamp, widthLimit, c)
+                                    f_scoreStartCache(e, i, side, widthLimit, requireStrong, stamp, c)
     true
 
 f_candidateContainsRoot(Candidate cnd, int id) => not na(cnd) and f_arrayHasInt(cnd.rootIds, id)
