@@ -1,29 +1,31 @@
 //@version=6
 // ============================================================================
-// Zone v2 Current Snapshot - Visual WITH History Tracking
+// Zone v2 Current Snapshot - Visual with FAST V3 Touch History
 //
-// Historical bars do exactly one thing: feed the Source Collectors. No
-// Candidate, no clustering, no Zone state machine, no drawing.
+// Historical bars do exactly two things: feed the Source Collectors, and write
+// one 5m bar into the FAST V3 OHLC ring (four array.set calls). No Candidate,
+// no Root build, no clustering, no Zone state machine, no topology event, no
+// drawing.
 //
 // The current Zone set is built ONCE at barstate.islastconfirmedhistory, and
 // after that once per confirmed 5m bar. Drawing happens only on barstate.islast.
 //
 // Zone POSITION and structure come from ZoneCurrentEngineV2 and nowhere else.
-// ZoneHistoryStateV2_Minimal runs alongside it carrying only the wear state -
-// Touch count, Fresh, Weak, Break, Flip, Generation - so a current Zone can be
-// labelled Touch 0 / Next T1 / Strong instead of "history unknown".
+// ZoneTouchHistoryFastV3 then replays the stored ring against each current
+// Zone's CURRENT EffectiveRange, at most two Zones per bar, to recover Touch
+// count / Fresh / Weak / Break.
 //
-// A Zone the tracker did not watch from birth stays HIST UNKNOWN and is never
-// shown as STRONG, however good its structure looks.
+// A Zone older than the ring, or one whose history crosses a Break, stays
+// HIST ? and is never shown as STRONG, however good its structure looks.
 // ============================================================================
-indicator("Zone v2 Current Snapshot Tracked", overlay = true,
+indicator("Zone v2 Current Snapshot FastV3", overlay = true,
      max_boxes_count = 30, max_lines_count = 30, max_labels_count = 30)
 
 // IMPORTANT: publish both libraries first and put their real publication
 // numbers here. Do not guess them.
 import sekine3310/ZoneCoreV2_Common/1 as zc
 import sekine3310/ZoneCurrentEngineV2/1 as ze
-import sekine3310/ZoneHistoryStateV2_Minimal/1 as hs
+import sekine3310/ZoneTouchHistoryFastV3/1 as fh
 
 // ============================================================================
 // Inputs - Zone definition. Do not tune these for appearance.
@@ -140,9 +142,9 @@ ze.TFPack p1d = request.security(syminfo.tickerid, "1D",
 // with no event does no array work. Nothing below builds a Zone.
 // ============================================================================
 var ze.CurrentEngine eng = ze.newCurrentEngine()
-// Section 7: the tracker is handed the SAME Collector, so source collection is
-// never done twice.
-var hs.HistEngine hist = hs.newHistEngine(eng.col)
+// FAST V3 keeps its own fixed-length OHLC ring. It shares nothing with the
+// Collector because it needs nothing from it.
+var fh.FastEngine hist = fh.newFastEngine()
 
 if is5m and barstate.isconfirmed
     ze.collectMA(eng.col, ma1m, time_close)
@@ -155,9 +157,9 @@ if is5m and barstate.isconfirmed
     // index lists (Fresh, InverseWait) and nothing else.
     ze.updateFvgBaseBar(eng.col, high, low, close, time_close, cfg)
     ze.collectTimeHL(eng.col, high, low, time, cfg)
-    // History Tracker. On an ordinary bar this is a scalar pass over at most 64
-    // tracked zones: no Candidate build, no Root build, no FVG or Root scan.
-    hs.updateBar(hist, cfg, high, low, close, bar_index, time_close)
+    // FAST V3 section 4 / 20: the ONLY thing a historical bar does for the
+    // Touch history. Four array.set calls into a pre-allocated ring.
+    fh.pushBar(hist, high, low, close, time_close)
 
 // ============================================================================
 // Current build.
@@ -177,6 +179,12 @@ else if is5m and barstate.isconfirmed and ze.isBuilt(eng) and time_close > ze.bo
     ze.buildCurrent(eng, cfg, close, bar_index, time_close)
     didBuild := true
 
+// FAST V3 sections 7 / 17 / 18 / 19. Runs only after a Current build, never on
+// a historical bar. At most two first-time history scans per bar; every already
+// scanned Zone advances by exactly one bar.
+if didBuild
+    fh.syncCurrent(hist, eng, cfg, close, high, low, close, time_close)
+
 // ============================================================================
 // Presentation (sections 42, 43). Nothing here runs on a historical bar.
 // ============================================================================
@@ -195,8 +203,8 @@ f_ensurePools(int n) =>
 
 f_viewColor(ze.ZoneViewOut v, int trackIdx) =>
     color base = v.side == 1 ? color.green : color.red
-    bool known = trackIdx >= 0 and hs.trackedHistoryKnown(hist, trackIdx)
-    string g = hs.gradeText(hist, cfg, trackIdx, v.baseStrong)
+    bool known = trackIdx >= 0 and fh.entryKnown(hist, trackIdx)
+    string g = fh.entryGradeText(hist, cfg, trackIdx, v.baseStrong)
     if v.broadContext
         color.new(base, 90)
     else if not known
@@ -212,22 +220,22 @@ f_viewColor(ze.ZoneViewOut v, int trackIdx) =>
 
 // Section 44 label layout.
 f_labelText(ze.ZoneViewOut v, int trackIdx, string rootSummary) =>
-    bool known = trackIdx >= 0 and hs.trackedHistoryKnown(hist, trackIdx)
+    bool known = trackIdx >= 0 and fh.entryKnown(hist, trackIdx)
     string txt = "Z" + str.tostring(v.zoneId) + " / " + ze.sideLabel(v.side) + " / " + ze.phaseLabel(v.phase) + "\n"
-    txt := txt + hs.gradeText(hist, cfg, trackIdx, v.baseStrong) + "\n"
+    txt := txt + fh.entryGradeText(hist, cfg, trackIdx, v.baseStrong) + "\n"
     if known
-        int tc = hs.trackedTouchCount(hist, trackIdx)
-        // Section 3: "Judging T" is the touch being served while the Zone is in
-        // ActiveTouch, and the one that is coming while it waits.
-        txt := txt + "Touch " + str.tostring(tc) + " | Judging T" + str.tostring(hs.displayTouchNo(hist, trackIdx)) + "\n"
-        txt := txt + "Fresh " + (hs.trackedFresh(hist, trackIdx) ? "YES" : "NO") + "\n"
-        txt := txt + "Weak " + hs.weakReasonText(hs.trackedWeakReason(hist, cfg, trackIdx)) + "\n"
-        txt := txt + "Gen " + str.tostring(hs.trackedGeneration(hist, trackIdx)) + " | Hist KNOWN\n"
+        int tc = fh.entryTouchCount(hist, trackIdx)
+        // "Judging T" is the Touch being served while an episode is open, and
+        // the one that is coming while the Zone waits.
+        txt := txt + "Touch " + str.tostring(tc) + " | Judging T" + str.tostring(fh.entryDisplayTouchNo(hist, trackIdx)) + "\n"
+        txt := txt + "Fresh " + (fh.entryFresh(hist, trackIdx) ? "YES" : "NO") + "\n"
+        txt := txt + "Weak " + fh.weakReasonText(fh.entryWeakReason(hist, cfg, trackIdx)) + "\n"
+        txt := txt + "Depth " + str.tostring(fh.entryDepth(hist, trackIdx), "#.0") + "% | " + fh.entryStatusText(hist, trackIdx) + "\n"
     else
-        txt := txt + "Touch ? | Next T?\n"
+        txt := txt + "Touch ? | Judging T?\n"
         txt := txt + "Fresh ?\n"
         txt := txt + "Weak ?\n"
-        txt := txt + "Gen ? | Hist UNKNOWN\n"
+        txt := txt + (trackIdx >= 0 ? fh.entryStatusText(hist, trackIdx) : "HIST ?") + "\n"
     txt := txt + str.tostring(v.bottom, format.mintick) + " - " + str.tostring(v.top, format.mintick) + " | Ref " + str.tostring(v.reference, format.mintick) + "\n"
     txt := txt + "C" + str.tostring(v.cCount) + " / H" + str.tostring(v.hCount) + " / " + ze.densityLabel(v.density)
     txt := str.length(rootSummary) == 0 ? txt : txt + "\n" + rootSummary
@@ -317,7 +325,7 @@ if barstate.islast
             ze.ZoneViewOut v = ze.viewAt(eng, cfg, viewIdx)
             // Section 41: the tracked history is attached to the CURRENT Zone,
             // never the other way round.
-            int trackIdx = not na(v) ? hs.matchCurrent(hist, eng, cfg, viewIdx) : -1
+            int trackIdx = not na(v) ? fh.entryIndex(hist, eng, cfg, viewIdx) : -1
             bool lineZone = not na(v) and v.bottom == v.top
             color vc = not na(v) ? f_viewColor(v, trackIdx) : na
             if not na(v) and lineZone
@@ -353,39 +361,43 @@ if barstate.islast
             label.set_color(lb, na)
 
 // ============================================================================
-// Debug (section 44)
+// Debug (FAST V3 section 24)
 // ============================================================================
 var table dbg = table.new(position.top_right, 2, 16, border_width = 1)
 if barstate.islast and showDebug
     table.cell(dbg, 0, 0, "Build")
-    table.cell(dbg, 1, 0, zc.coreBuildId() + " / " + ze.currentBuildId() + " / " + hs.histBuildId())
+    table.cell(dbg, 1, 0, zc.coreBuildId() + " / " + ze.currentBuildId() + " / " + fh.fastBuildId())
     table.cell(dbg, 0, 1, "Chart")
     table.cell(dbg, 1, 1, is5m ? "5m OK" : "ERROR: use 5m")
-    table.cell(dbg, 0, 2, "Historical bars")
-    table.cell(dbg, 1, 2, str.tostring(hs.histBars(hist)))
-    table.cell(dbg, 0, 3, "Topology events")
-    table.cell(dbg, 1, 3, str.tostring(hs.topologyEvents(hist)))
-    table.cell(dbg, 0, 4, "Local builds")
-    table.cell(dbg, 1, 4, str.tostring(hs.localBuilds(hist)))
-    table.cell(dbg, 0, 5, "No-build bars")
-    table.cell(dbg, 1, 5, str.tostring(hs.noBuildBars(hist)))
-    table.cell(dbg, 0, 6, "No-build rate")
-    table.cell(dbg, 1, 6, str.tostring(hs.noBuildRate(hist), "#.00") + "%")
-    table.cell(dbg, 0, 7, "Max tracked zones")
-    table.cell(dbg, 1, 7, str.tostring(hs.maxTrackedSeen(hist)) + " / 64")
-    table.cell(dbg, 0, 8, "Known / Unknown")
-    table.cell(dbg, 1, 8, str.tostring(hs.knownZoneCount(hist)) + " / " + str.tostring(hs.unknownZoneCount(hist)))
-    table.cell(dbg, 0, 9, "Dormant zones")
-    table.cell(dbg, 1, 9, str.tostring(hs.dormantZoneCount(hist)))
-    table.cell(dbg, 0, 10, "Touch / Generation events")
-    table.cell(dbg, 1, 10, str.tostring(hs.touchEventCount(hist)) + " / " + str.tostring(hs.generationCount(hist)))
-    table.cell(dbg, 0, 11, "EMA guard hit / breach")
-    table.cell(dbg, 1, 11, str.tostring(hs.emaGuardHits(hist)) + " / " + str.tostring(hs.emaGuardBreaches(hist)))
-    table.cell(dbg, 0, 12, "Max TouchMark usage")
-    table.cell(dbg, 1, 12, str.tostring(hs.maxTouchMarkUsage(hist)) + " / 8")
-    table.cell(dbg, 0, 13, "Retired / Flip / MergeSplit")
-    table.cell(dbg, 1, 13, str.tostring(hs.retiredZoneCount(hist)) + " / " + str.tostring(hs.flipCount(hist)) + " / " + str.tostring(hs.mergeSplitEvents(hist)))
+    // Section 20: these three are 0 by construction. A historical bar reaches
+    // no Candidate build, no Root build and no Zone loop at all.
+    table.cell(dbg, 0, 2, "Hist Cand / Root / ZoneLoop")
+    table.cell(dbg, 1, 2, "0 / 0 / 0 (by construction)")
+    table.cell(dbg, 0, 3, "OHLC ring bars")
+    table.cell(dbg, 1, 3, str.tostring(fh.ringBars(hist)) + " / " + str.tostring(fh.ringCapacity()))
+    table.cell(dbg, 0, 4, "Ring writes")
+    table.cell(dbg, 1, 4, str.tostring(fh.ringWrites(hist)))
+    table.cell(dbg, 0, 5, "Current zones")
+    table.cell(dbg, 1, 5, str.tostring(ze.currentZoneCount(eng)))
+    table.cell(dbg, 0, 6, "In scan range (+/-150)")
+    table.cell(dbg, 1, 6, str.tostring(fh.inRangeCount(hist)))
+    table.cell(dbg, 0, 7, "History scanned")
+    table.cell(dbg, 1, 7, str.tostring(fh.scannedCount(hist)) + " / " + str.tostring(fh.entryCount(hist)))
+    table.cell(dbg, 0, 8, "History queued")
+    table.cell(dbg, 1, 8, str.tostring(fh.queuedCount(hist)))
+    table.cell(dbg, 0, 9, "Known / Unknown")
+    table.cell(dbg, 1, 9, str.tostring(fh.knownCount(hist)) + " / " + str.tostring(fh.unknownCount(hist)))
+    table.cell(dbg, 0, 10, "Max scans on one bar")
+    table.cell(dbg, 1, 10, str.tostring(fh.maxScansOneBar(hist)) + " / " + str.tostring(fh.maxScansPerBarLimit()))
+    table.cell(dbg, 0, 11, "Scans done / bars walked")
+    table.cell(dbg, 1, 11, str.tostring(fh.scansDone(hist)) + " / " + str.tostring(fh.barsScannedTotal(hist)))
+    table.cell(dbg, 0, 12, "Live incremental steps")
+    table.cell(dbg, 1, 12, str.tostring(fh.liveSteps(hist)))
+    table.cell(dbg, 0, 13, "Entries evicted")
+    table.cell(dbg, 1, 13, str.tostring(fh.evictedEntries(hist)))
     table.cell(dbg, 0, 14, "Current Root / Cand / Core")
     table.cell(dbg, 1, 14, str.tostring(ze.currentRootCount(eng)) + " / " + str.tostring(ze.currentCandidateCount(eng)) + " / " + str.tostring(ze.currentZoneCount(eng)))
+    table.cell(dbg, 0, 15, "Historical Zone ops")
+    table.cell(dbg, 1, 15, str.tostring(ze.historicalZoneOps(eng)))
 else if barstate.islast
     table.clear(dbg, 0, 0, 1, 15)

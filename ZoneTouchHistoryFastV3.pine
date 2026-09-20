@@ -1,0 +1,608 @@
+//@version=6
+//@description Zone Touch History FAST V3. Restores the past Touch / Fresh / Weak wear of the Zones a Current Snapshot holds RIGHT NOW, by replaying a fixed-length OHLC ring against each Zone's current EffectiveRange. A historical bar writes four array slots and does nothing else - no Candidate, no Root, no Zone, no FVG, no topology.
+library("ZoneTouchHistoryFastV3", overlay = true)
+
+// ============================================================================
+// ZoneTouchHistoryFastV3
+//
+// WHY THIS REPLACES THE HISTORICAL TOPOLOGY REPLAY
+//   ZoneHistoryStateV2_Minimal R2 rebuilt the Zone topology on every Topology
+//   Event bar. On XAUUSD 5m that hit RE10110 (40 s runtime). No amount of extra
+//   guarding fixes it, because the work is proportional to how often the market
+//   changes structure. FAST V3 removes the historical rebuild entirely.
+//
+// WHAT IT DOES INSTEAD (section 22, the one deliberate approximation)
+//   It does NOT reconstruct what a Zone's range was in the past. It takes the
+//   Zone's CURRENT EffectiveRange, fixes it, and replays the stored 5m bars
+//   from the Zone's structural birth forward through the same Armed / Touch /
+//   Reset / WeakDepth / Break state machine.
+//
+// PERFORMANCE CONTRACT (enforced by construction, not by comment)
+//   Historical 5m bar:
+//       buildCandidates = 0   (the identifier does not occur in this file)
+//       Root build      = 0
+//       Zone loop       = 0
+//       FVG scan        = 0
+//       Topology event  = does not exist
+//       work            = 4 x array.set into a pre-allocated ring
+//   Current / confirmed bar:
+//       at most MAX_NEW_SCANS_PER_BAR (2) first-time history scans,
+//       plus ONE incremental bar per already-scanned Zone.
+//
+// AUTHORITY
+//   Zone position, EffectiveRange, C, H, Density, BaseStrong, ReferencePrice
+//   and Root composition stay owned by ZoneCoreV2_Common / ZoneCurrentEngineV2.
+//   This file never produces a Zone.
+//
+// NO FALSE STRONG
+//   A Zone whose birth is older than the ring, or whose history crosses a
+//   Break this file refuses to reconstruct past, reports historyKnown = false
+//   and is shown as "STRUCT STRONG / HIST ?" - never STRONG.
+// ============================================================================
+const string FAST_BUILD_ID = "ZONEFAST-V3-20260920"
+export fastBuildId() => FAST_BUILD_ID
+
+import sekine3310/ZoneCoreV2_Common/1 as zc
+import sekine3310/ZoneCurrentEngineV2/1 as ze
+
+// Fixed by the specification. Not tunable.
+const int   HISTORY_BARS          = 12000    // ~41.7 days of 5m bars
+const float SCAN_DISTANCE         = 150.0    // section 7
+const int   MAX_NEW_SCANS_PER_BAR = 2        // section 17
+
+// Cache capacity. Not a Zone-logic parameter: it only bounds how many distinct
+// Zone identities keep a stored history at once.
+const int MAX_HISTORY_ENTRIES = 128
+
+const int PH_WAITING      = 1
+const int PH_ARMED        = 2
+const int PH_ACTIVE_TOUCH = 3
+const int PH_BROKEN       = 4
+
+const int WEAK_NONE     = 0
+const int WEAK_BY_TOUCH = 1
+const int WEAK_BY_DEPTH = 2
+const int WEAK_BY_BOTH  = 3
+
+const int ST_UNSCANNED = 0
+const int ST_QUEUED    = 1
+const int ST_SCANNED   = 2
+
+// ============================================================================
+// Types
+// ============================================================================
+
+// Section 8. One cached history, keyed by Side + stable origin keys. The keys
+// are stored as they are rather than folded into a string, so identity is
+// tested with exactly the same rule the engines use for Zone continuity:
+// same Side, gap within M, and at least one shared stable origin.
+export type ZoneHistory
+    bool alive
+    int side
+    array<string> originKeys
+    // Section 10. The fixed range the replay is judged against. It follows the
+    // Current Zone while no Touch episode is open, and is held for the length
+    // of an open episode.
+    float snapBottom
+    float snapTop
+    int structuralCreatedTime
+
+    bool scanned
+    bool historyKnown
+    int touchCount
+    bool fresh
+    bool weakByTouch
+    bool weakByDepth
+    float maxDepthPct
+    bool breakSeen
+
+    // Replay state machine
+    int phase
+    bool touchActive
+    int armedFromSeq
+    int stepSeq
+
+    int lastProcessedTime
+    int lastSeenBuildTime
+    int scannedBars
+
+export type FastEngine
+    // ---- Section 5: fixed-length circular OHLC ring ----
+    array<float> histHigh
+    array<float> histLow
+    array<float> histClose
+    array<int>   histTime
+    int writeIndex
+    int filledCount
+    int newestTime
+
+    // ---- Section 8: analysis cache ----
+    array<ZoneHistory> entries
+
+    // ---- Debug counters (section 24) ----
+    int ringWrites
+    int scansDone
+    int scansThisBar
+    int maxScansOneBar
+    int barsScannedTotal
+    int inRangeCount
+    int queuedCount
+    int liveSteps
+    int evictedEntries
+
+export newFastEngine() => FastEngine.new(
+     histHigh = array.new<float>(HISTORY_BARS, na),
+     histLow = array.new<float>(HISTORY_BARS, na),
+     histClose = array.new<float>(HISTORY_BARS, na),
+     histTime = array.new<int>(HISTORY_BARS, na),
+     writeIndex = 0, filledCount = 0, newestTime = na,
+     entries = array.new<ZoneHistory>(),
+     ringWrites = 0, scansDone = 0, scansThisBar = 0, maxScansOneBar = 0,
+     barsScannedTotal = 0, inRangeCount = 0, queuedCount = 0, liveSteps = 0,
+     evictedEntries = 0)
+
+// ============================================================================
+// Section 4 / 5 / 20: the ONLY thing a historical bar is allowed to do.
+//
+// Four array.set calls into a pre-allocated ring. No push, no shift, no
+// allocation, no scan, no branch over Zones.
+// ============================================================================
+export pushBar(FastEngine e, float barHigh, float barLow, float barClose, int barTime) =>
+    array.set(e.histHigh, e.writeIndex, barHigh)
+    array.set(e.histLow, e.writeIndex, barLow)
+    array.set(e.histClose, e.writeIndex, barClose)
+    array.set(e.histTime, e.writeIndex, barTime)
+    e.writeIndex := e.writeIndex + 1 >= HISTORY_BARS ? 0 : e.writeIndex + 1
+    e.filledCount := math.min(e.filledCount + 1, HISTORY_BARS)
+    e.newestTime := barTime
+    e.ringWrites += 1
+    true
+
+// ============================================================================
+// Ring addressing. Logical index k runs 0 .. filledCount - 1, oldest first.
+// ============================================================================
+f_ringStart(FastEngine e) => e.filledCount < HISTORY_BARS ? 0 : e.writeIndex
+f_ringAt(FastEngine e, int k) => (f_ringStart(e) + k) % HISTORY_BARS
+
+export ringBars(FastEngine e) => e.filledCount
+export ringCapacity() => HISTORY_BARS
+
+export ringOldestTime(FastEngine e) =>
+    int t = na
+    if e.filledCount > 0
+        t := array.get(e.histTime, f_ringAt(e, 0))
+    t
+
+export ringNewestTime(FastEngine e) => e.newestTime
+
+// Section 9: the first stored bar at or after `t`, by binary search. A scan
+// never walks the ring looking for its own start.
+f_lowerBound(FastEngine e, int t) =>
+    int lo = 0
+    int hi = e.filledCount - 1
+    int ans = e.filledCount
+    while lo <= hi
+        int mid = int((lo + hi) / 2)
+        int tv = array.get(e.histTime, f_ringAt(e, mid))
+        if na(tv) or tv >= t
+            ans := mid
+            hi := mid - 1
+        else
+            lo := mid + 1
+    ans
+
+// ============================================================================
+// Identity (sections 8 and 19)
+//
+// Same rule the Current engine uses for Zone continuity, so a history can only
+// follow a Zone that is provably the same Zone: same Side, gap within M, and at
+// least one shared stable origin. MA, Psych and Broad FVG contribute no key, so
+// they can never carry a Touch history onto a different Zone.
+// ============================================================================
+f_dist(float px, float a, float b) =>
+    float lo = math.min(a, b)
+    float hi = math.max(a, b)
+    px < lo ? lo - px : px > hi ? px - hi : 0.0
+
+f_gapBetween(float a0, float a1, float b0, float b1) =>
+    a1 < b0 ? b0 - a1 : b1 < a0 ? a0 - b1 : 0.0
+
+f_shareStableOrigin(array<string> a, array<string> b) =>
+    bool yes = false
+    int an = array.size(a)
+    int bn = array.size(b)
+    if an > 0 and bn > 0
+        for i = 0 to an - 1
+            string ka = array.get(a, i)
+            for j = 0 to bn - 1
+                if ka == array.get(b, j)
+                    yes := true
+                    break
+            if yes
+                break
+    yes
+
+f_copyKeys(array<string> dst, array<string> src) =>
+    array.clear(dst)
+    int n = array.size(src)
+    if n > 0
+        for i = 0 to n - 1
+            array.push(dst, array.get(src, i))
+    true
+
+f_newEntry(FastEngine e, int side, int nowTime) =>
+    ZoneHistory z = ZoneHistory.new(alive = true, side = side, originKeys = array.new<string>(),
+         snapBottom = na, snapTop = na, structuralCreatedTime = na,
+         scanned = false, historyKnown = false, touchCount = 0, fresh = true,
+         weakByTouch = false, weakByDepth = false, maxDepthPct = 0.0, breakSeen = false,
+         phase = PH_WAITING, touchActive = false, armedFromSeq = na, stepSeq = 0,
+         lastProcessedTime = na, lastSeenBuildTime = nowTime, scannedBars = 0)
+    array.push(e.entries, z)
+    z
+
+// Section 19: continuity must be PROVEN. When it cannot be, the Candidate gets
+// a NEW entry, which is re-scanned from its own structural birth rather than
+// inheriting a history it cannot claim.
+f_findEntry(FastEngine e, int side, float bottom, float top, array<string> keys,
+            zc.ZoneCfg c, int nowTime) =>
+    ZoneHistory best = na
+    float bestGap = 1e12
+    int n = array.size(e.entries)
+    if n > 0
+        for i = 0 to n - 1
+            ZoneHistory z = array.get(e.entries, i)
+            if z.alive and z.side == side and z.lastSeenBuildTime != nowTime and not na(z.snapBottom)
+                float g = f_gapBetween(z.snapBottom, z.snapTop, bottom, top)
+                if g <= c.clusterMaxWidth and g < bestGap
+                    if f_shareStableOrigin(z.originKeys, keys)
+                        bestGap := g
+                        best := z
+    best
+
+// Cache capacity. Evict the entry that has gone unseen the longest. An entry
+// refreshed on this bar is only ever evicted if every entry was.
+f_enforceEntryCap(FastEngine e, int nowTime) =>
+    while array.size(e.entries) > MAX_HISTORY_ENTRIES
+        int worst = 0
+        int worstRank = -1
+        int worstTime = na
+        int n = array.size(e.entries)
+        for i = 0 to n - 1
+            ZoneHistory z = array.get(e.entries, i)
+            int rank = z.lastSeenBuildTime == nowTime ? 0 : 1
+            bool worse = rank > worstRank
+            if not worse and rank == worstRank
+                worse := na(worstTime) or z.lastSeenBuildTime < worstTime
+            if worse
+                worstRank := rank
+                worstTime := z.lastSeenBuildTime
+                worst := i
+        array.remove(e.entries, worst)
+        e.evictedEntries += 1
+    true
+
+// ============================================================================
+// Sections 11-15: the wear state machine.
+//
+// This is the ONLY place the state machine lives, so a replayed historical bar
+// and a live confirmed bar are judged by identical code. Every test uses the
+// entry's fixed snapshot range.
+// ============================================================================
+
+// Section 14 / 15 / 13: the outcome of an open Touch episode on one bar.
+// Order is fixed: WeakDepth, then Break, then Reset. Break beats Reset. The
+// next Touch can never start before stepSeq + 1.
+f_touchOutcome(ZoneHistory z, zc.ZoneCfg c, float barClose) =>
+    bool handled = false
+    if z.touchActive
+        bool support = z.side == zc.sideConstSupport()
+        float sb = z.snapBottom
+        float st = z.snapTop
+
+        // Section 14: confirmed close only, snapshot width, never on a line
+        // Zone, and never cleared once set.
+        float width = st - sb
+        if width > 0 and not c.weakDepthOff
+            float depth = support ? (st - barClose) / width * 100.0 : (barClose - sb) / width * 100.0
+            depth := math.max(0.0, math.min(100.0, depth))
+            z.maxDepthPct := math.max(z.maxDepthPct, depth)
+            if depth >= c.weakDepthPct
+                z.weakByDepth := true
+
+        // Section 15: Break. FAST V3 refuses to reconstruct the Flip /
+        // Generation topology on the far side of a Break, so continuity past it
+        // cannot be proven and the history stops being KNOWN. The replay keeps
+        // running so the live state stays coherent, but the Zone can no longer
+        // be published as STRONG.
+        bool broken = support ? barClose <= sb - c.breakBuffer : barClose >= st + c.breakBuffer
+        if broken
+            z.touchActive := false
+            z.phase := PH_BROKEN
+            z.armedFromSeq := na
+            z.breakSeen := true
+            z.historyKnown := false
+            handled := true
+        else
+            // Section 13: Reset may land on the Touch bar, but the next Touch
+            // cannot start on it, so one approach is never counted twice.
+            bool reset = support ? barClose >= st + c.touchResetDistance : barClose <= sb - c.touchResetDistance
+            if reset
+                z.touchActive := false
+                z.phase := PH_ARMED
+                z.armedFromSeq := z.stepSeq + 1
+                handled := true
+    handled
+
+// One 5m bar of wear.
+f_stepBar(ZoneHistory z, zc.ZoneCfg c, float barHigh, float barLow, float barClose) =>
+    bool support = z.side == zc.sideConstSupport()
+    int k = z.stepSeq
+
+    bool handled = f_touchOutcome(z, c, barClose)
+
+    // Section 12: a Touch is only possible from an Armed state, and never on
+    // the bar that armed it.
+    if not handled and z.phase == PH_ARMED and not na(z.armedFromSeq) and k >= z.armedFromSeq
+        bool touches = barHigh >= z.snapBottom and barLow <= z.snapTop
+        if touches
+            z.touchCount += 1
+            z.fresh := false
+            // Touch 1 is a Strong candidate; Touch 2+ is Weak.
+            z.weakByTouch := not c.weakFromTouchOff and z.touchCount >= c.weakFromTouch
+            z.touchActive := true
+            z.phase := PH_ACTIVE_TOUCH
+            z.armedFromSeq := na
+            // The same bar may already resolve this Touch.
+            f_touchOutcome(z, c, barClose)
+            handled := true
+
+    // Section 11: arming. Inclusive, and never starts a Touch on its own bar.
+    if not handled and not z.touchActive and z.phase != PH_ARMED
+        bool arm = support ? barClose >= z.snapTop + c.touchResetDistance : barClose <= z.snapBottom - c.touchResetDistance
+        if arm
+            z.phase := PH_ARMED
+            z.armedFromSeq := k + 1
+
+    z.stepSeq := k + 1
+    true
+
+// ============================================================================
+// Section 9 / 17: one full history scan for one Zone.
+//
+// Bounded by HISTORY_BARS. At most MAX_NEW_SCANS_PER_BAR of these run on any
+// one bar, so a single bar can never carry an unbounded loop.
+// ============================================================================
+f_scanEntry(FastEngine e, ZoneHistory z, zc.ZoneCfg c) =>
+    int startK = 0
+    bool known = false
+    if e.filledCount > 0 and not na(z.structuralCreatedTime)
+        int oldest = array.get(e.histTime, f_ringAt(e, 0))
+        if not na(oldest) and z.structuralCreatedTime >= oldest
+            // The ring reaches back past this Zone's birth, so the replay can
+            // see everything that ever happened to it.
+            known := true
+            startK := f_lowerBound(e, z.structuralCreatedTime)
+    // Section 9: a Zone older than the ring is NOT assumed to be Touch 0 or
+    // Fresh. It is replayed from the oldest stored bar purely so the live state
+    // is coherent, and it stays UNKNOWN for good.
+
+    z.touchCount := 0
+    z.fresh := true
+    z.weakByTouch := false
+    z.weakByDepth := false
+    z.maxDepthPct := 0.0
+    z.breakSeen := false
+    z.phase := PH_WAITING
+    z.touchActive := false
+    z.armedFromSeq := na
+    z.stepSeq := 0
+    z.historyKnown := known
+
+    int n = e.filledCount
+    int walked = 0
+    if n > startK
+        for k = startK to n - 1
+            int idx = f_ringAt(e, k)
+            float bh = array.get(e.histHigh, idx)
+            if not na(bh)
+                f_stepBar(z, c, bh, array.get(e.histLow, idx), array.get(e.histClose, idx))
+                walked += 1
+
+    z.scanned := true
+    z.scannedBars := walked
+    z.lastProcessedTime := e.newestTime
+    e.scansDone += 1
+    e.barsScannedTotal += walked
+    true
+
+// ============================================================================
+// Sections 7, 17, 18, 19: the per-bar entry point.
+//
+// Call this ONLY on the bootstrap bar and on confirmed bars, AFTER
+// ze.buildCurrent. A historical bar must never reach it.
+// ============================================================================
+export syncCurrent(FastEngine e, ze.CurrentEngine ce, zc.ZoneCfg c, float refClose,
+                   float barHigh, float barLow, float barClose, int nowTime) =>
+    e.scansThisBar := 0
+    e.inRangeCount := 0
+    e.queuedCount := 0
+    int n = array.size(ce.zones)
+    if n > 0
+        for i = 0 to n - 1
+            ze.CurrentZone cz = array.get(ce.zones, i)
+            if cz.alive and not na(cz.bottom)
+                ZoneHistory z = f_findEntry(e, cz.side, cz.bottom, cz.top, cz.originKeys, c, nowTime)
+                if na(z)
+                    z := f_newEntry(e, cz.side, nowTime)
+                z.lastSeenBuildTime := nowTime
+                z.structuralCreatedTime := cz.structuralCreatedTime
+                // Keep the identity fresh, so a Zone that gains a stable origin
+                // stays matchable next bar.
+                f_copyKeys(z.originKeys, cz.originKeys)
+                // Section 10 / 22: the snapshot range follows the Current Zone
+                // while no Touch episode is open, and is held for the length of
+                // an open episode so one approach is judged against one range.
+                if not z.touchActive
+                    z.snapBottom := cz.bottom
+                    z.snapTop := cz.top
+
+                // Section 7: only Zones within +/- SCAN_DISTANCE of price are
+                // analysed. A far Zone is left completely alone - not scanned,
+                // not stepped, and NOT deleted. It gets its scan the first time
+                // it comes inside.
+                float d = f_dist(refClose, cz.bottom, cz.top)
+                if d <= SCAN_DISTANCE
+                    e.inRangeCount += 1
+                    if not z.scanned
+                        // Section 17 / 18: at most two first-time scans on any
+                        // one bar. The rest wait for the next confirmed bar.
+                        if e.scansThisBar < MAX_NEW_SCANS_PER_BAR
+                            f_scanEntry(e, z, c)
+                            e.scansThisBar += 1
+                        else
+                            e.queuedCount += 1
+                    else if not na(z.lastProcessedTime) and nowTime > z.lastProcessedTime
+                        // Section 19: one incremental bar. The past is never
+                        // re-scanned for a Zone that already has a history.
+                        f_stepBar(z, c, barHigh, barLow, barClose)
+                        z.lastProcessedTime := nowTime
+                        e.liveSteps += 1
+    f_enforceEntryCap(e, nowTime)
+    e.maxScansOneBar := math.max(e.maxScansOneBar, e.scansThisBar)
+    true
+
+// ============================================================================
+// Section 16: reading a Current Zone's history back out.
+// ============================================================================
+f_entryAt(FastEngine e, int index) =>
+    ZoneHistory z = na
+    if index >= 0 and index < array.size(e.entries)
+        z := array.get(e.entries, index)
+    z
+
+// The entry that belongs to Current Zone `currentIndex`, or -1. Same identity
+// rule as everywhere else: same Side, gap within M, shared stable origin.
+export entryIndex(FastEngine e, ze.CurrentEngine ce, zc.ZoneCfg c, int currentIndex) =>
+    int found = -1
+    if currentIndex >= 0 and currentIndex < array.size(ce.zones)
+        ze.CurrentZone cz = array.get(ce.zones, currentIndex)
+        if cz.alive and not na(cz.bottom)
+            float bestGap = 1e12
+            int n = array.size(e.entries)
+            if n > 0
+                for i = 0 to n - 1
+                    ZoneHistory z = array.get(e.entries, i)
+                    if z.alive and z.side == cz.side and not na(z.snapBottom)
+                        float g = f_gapBetween(z.snapBottom, z.snapTop, cz.bottom, cz.top)
+                        if g <= c.clusterMaxWidth and g < bestGap
+                            if f_shareStableOrigin(z.originKeys, cz.originKeys)
+                                bestGap := g
+                                found := i
+    found
+
+export entryCount(FastEngine e) => array.size(e.entries)
+
+export entryScanned(FastEngine e, int index) =>
+    ZoneHistory z = f_entryAt(e, index)
+    na(z) ? false : z.scanned
+
+export entryKnown(FastEngine e, int index) =>
+    ZoneHistory z = f_entryAt(e, index)
+    na(z) ? false : (z.scanned and z.historyKnown)
+
+export entryTouchCount(FastEngine e, int index) =>
+    ZoneHistory z = f_entryAt(e, index)
+    na(z) ? na : z.touchCount
+
+// The Touch number being described: the one in progress during an open episode,
+// otherwise the one that is coming.
+export entryDisplayTouchNo(FastEngine e, int index) =>
+    ZoneHistory z = f_entryAt(e, index)
+    na(z) ? na : (z.touchActive ? z.touchCount : z.touchCount + 1)
+
+export entryFresh(FastEngine e, int index) =>
+    ZoneHistory z = f_entryAt(e, index)
+    na(z) ? false : z.fresh
+
+export entryDepth(FastEngine e, int index) =>
+    ZoneHistory z = f_entryAt(e, index)
+    na(z) ? na : z.maxDepthPct
+
+export entryBroken(FastEngine e, int index) =>
+    ZoneHistory z = f_entryAt(e, index)
+    na(z) ? false : z.breakSeen
+
+export entryPhase(FastEngine e, int index) =>
+    ZoneHistory z = f_entryAt(e, index)
+    na(z) ? na : z.phase
+
+export entryScannedBars(FastEngine e, int index) =>
+    ZoneHistory z = f_entryAt(e, index)
+    na(z) ? na : z.scannedBars
+
+export entryWeakReason(FastEngine e, zc.ZoneCfg c, int index) =>
+    ZoneHistory z = f_entryAt(e, index)
+    int r = WEAK_NONE
+    if not na(z) and z.scanned and z.historyKnown
+        bool wt = not c.weakFromTouchOff and (z.touchActive ? z.touchCount : z.touchCount + 1) >= c.weakFromTouch
+        r := wt and z.weakByDepth ? WEAK_BY_BOTH : wt ? WEAK_BY_TOUCH : z.weakByDepth ? WEAK_BY_DEPTH : WEAK_NONE
+    r
+
+export weakReasonText(int r) => r == WEAK_BY_TOUCH ? "TOUCH" : r == WEAK_BY_DEPTH ? "DEPTH" : r == WEAK_BY_BOTH ? "BOTH" : "NONE"
+
+export phaseText(int p) => p == PH_WAITING ? "Waiting" : p == PH_ARMED ? "Armed" : p == PH_ACTIVE_TOUCH ? "ActiveTouch" : p == PH_BROKEN ? "Broken" : "?"
+
+// Section 17: a Zone waiting for its first scan is never shown as Strong.
+export entryStatusText(FastEngine e, int index) =>
+    ZoneHistory z = f_entryAt(e, index)
+    na(z) ? "HIST ?" : z.scanned ? (z.historyKnown ? "HIST KNOWN" : "HIST ?") : "HIST SCANNING"
+
+// Section 16: the display verdict.
+//   historyKnown = false            -> STRUCT STRONG / HIST ?  (never STRONG)
+//   Touch 0 + BaseStrong + no depth -> STRONG
+//   Touch >= 1 or weakByDepth       -> WEAK   (the next Touch is T2+)
+//   otherwise                       -> NEUTRAL
+export entryGradeText(FastEngine e, zc.ZoneCfg c, int index, bool currentBaseStrong) =>
+    string s = currentBaseStrong ? "STRUCT STRONG / HIST ?" : "STRUCT NEUTRAL / HIST ?"
+    ZoneHistory z = f_entryAt(e, index)
+    if not na(z) and z.scanned and z.historyKnown
+        bool strong = z.touchCount == 0 and currentBaseStrong and not z.weakByDepth
+        bool weak = z.touchCount >= 1 or z.weakByDepth
+        s := strong ? "STRONG" : weak ? "WEAK" : "NEUTRAL"
+    s
+
+// ============================================================================
+// Debug counters (section 24)
+// ============================================================================
+export ringWrites(FastEngine e) => e.ringWrites
+export scansDone(FastEngine e) => e.scansDone
+export scansThisBar(FastEngine e) => e.scansThisBar
+export maxScansOneBar(FastEngine e) => e.maxScansOneBar
+export maxScansPerBarLimit() => MAX_NEW_SCANS_PER_BAR
+export barsScannedTotal(FastEngine e) => e.barsScannedTotal
+export inRangeCount(FastEngine e) => e.inRangeCount
+export queuedCount(FastEngine e) => e.queuedCount
+export liveSteps(FastEngine e) => e.liveSteps
+export evictedEntries(FastEngine e) => e.evictedEntries
+export scanDistance() => SCAN_DISTANCE
+
+export scannedCount(FastEngine e) =>
+    int n = 0
+    int m = array.size(e.entries)
+    if m > 0
+        for i = 0 to m - 1
+            if array.get(e.entries, i).scanned
+                n += 1
+    n
+
+export knownCount(FastEngine e) =>
+    int n = 0
+    int m = array.size(e.entries)
+    if m > 0
+        for i = 0 to m - 1
+            ZoneHistory z = array.get(e.entries, i)
+            if z.scanned and z.historyKnown
+                n += 1
+    n
+
+export unknownCount(FastEngine e) => array.size(e.entries) - knownCount(e)
