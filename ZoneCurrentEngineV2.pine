@@ -267,7 +267,10 @@ export type SwingRing
     array<int> originEnd
     array<int> confirmedTime
     int tfCode
-    int lastConfirmed
+    // FIX 3. High and Low are gated separately, so a bar that confirms both a
+    // pivot high and a pivot low stores both. One shared gate dropped the second.
+    int lastHighConfirmed
+    int lastLowConfirmed
 
 export type AccumRing
     array<float> top
@@ -286,6 +289,13 @@ export type FvgRing
     array<int> confirmedTime
     array<bool> fresh
     array<int> state
+    // FIX 2. Per-entry Inverse progress.
+    array<bool> movedAway
+    array<int> invalidTime
+    // FIX 1 / FIX 2. The only entries a Base bar looks at. Everything else in
+    // the ring is untouched, so there is never a full FVG sweep.
+    array<int> freshIndexes
+    array<int> inverseWaitIndexes
     int tfCode
     int lastSourceClose
 
@@ -337,7 +347,7 @@ export type Collector
 
 f_newSwingRing(int tfCode) => SwingRing.new(price = array.new<float>(), subtype = array.new<int>(),
      originTime = array.new<int>(), originEnd = array.new<int>(), confirmedTime = array.new<int>(),
-     tfCode = tfCode, lastConfirmed = na)
+     tfCode = tfCode, lastHighConfirmed = na, lastLowConfirmed = na)
 
 f_newAccumRing(int tfCode) => AccumRing.new(top = array.new<float>(), bottom = array.new<float>(),
      pairKey = array.new<int>(), originTime = array.new<int>(), confirmedTime = array.new<int>(),
@@ -345,7 +355,9 @@ f_newAccumRing(int tfCode) => AccumRing.new(top = array.new<float>(), bottom = a
 
 f_newFvgRing(int tfCode) => FvgRing.new(direction = array.new<int>(), bottom = array.new<float>(),
      top = array.new<float>(), originTime = array.new<int>(), confirmedTime = array.new<int>(),
-     fresh = array.new<bool>(), state = array.new<int>(), tfCode = tfCode, lastSourceClose = na)
+     fresh = array.new<bool>(), state = array.new<int>(), movedAway = array.new<bool>(),
+     invalidTime = array.new<int>(), freshIndexes = array.new<int>(),
+     inverseWaitIndexes = array.new<int>(), tfCode = tfCode, lastSourceClose = na)
 
 export newCollector() => Collector.new(
      sw5 = f_newSwingRing(TF_5M), sw15 = f_newSwingRing(TF_15M), sw1h = f_newSwingRing(TF_1H),
@@ -380,12 +392,12 @@ f_collectSwingRing(SwingRing r, SwingPack s, int baseCloseTime) =>
     if not na(s)
         // The gate makes a repeated mapped value a no-op, so an ordinary bar
         // touches no array.
-        if not na(s.highConfirmedTime) and s.highConfirmedTime <= baseCloseTime and (na(r.lastConfirmed) or s.highConfirmedTime > r.lastConfirmed)
+        if not na(s.highConfirmedTime) and s.highConfirmedTime <= baseCloseTime and (na(r.lastHighConfirmed) or s.highConfirmedTime > r.lastHighConfirmed)
             f_pushSwing(r, s.pivotHigh, zc.subSwingHigh(), s.highOriginTime, s.highOriginEndTime, s.highConfirmedTime)
-            r.lastConfirmed := s.highConfirmedTime
-        if not na(s.lowConfirmedTime) and s.lowConfirmedTime <= baseCloseTime and (na(r.lastConfirmed) or s.lowConfirmedTime > r.lastConfirmed)
+            r.lastHighConfirmed := s.highConfirmedTime
+        if not na(s.lowConfirmedTime) and s.lowConfirmedTime <= baseCloseTime and (na(r.lastLowConfirmed) or s.lowConfirmedTime > r.lastLowConfirmed)
             f_pushSwing(r, s.pivotLow, zc.subSwingLow(), s.lowOriginTime, s.lowOriginEndTime, s.lowConfirmedTime)
-            r.lastConfirmed := s.lowConfirmedTime
+            r.lastLowConfirmed := s.lowConfirmedTime
     true
 
 export collectSwings(Collector col, SwingPack s5, SwingPack s15, SwingPack s1h, int baseCloseTime) =>
@@ -418,10 +430,75 @@ export collectAccums(Collector col, AccumPack a1h, AccumPack a4h, AccumPack a1d,
     f_collectAccumRing(col.ac1d, a1d, baseCloseTime)
     true
 
-// ---- FVG: section 38, add on formation, change state on HTF invalidation ----
-f_collectFvgRing(FvgRing r, FvgPack p, int baseCloseTime, zc.ZoneCfg c) =>
+// ---- FVG ----
+// Three separate concerns, deliberately kept apart:
+//   f_collectFvgRing  : HTF source event only. Adds a new FVG, or registers a
+//                       structural invalidation as InverseWait. It never
+//                       advances the Inverse state machine.
+//   f_fvgFreshBar     : Base bar, walks freshIndexes only.
+//   f_fvgInverseBar   : Base bar, walks inverseWaitIndexes only.
+// No function here ever walks the whole ring.
+
+// A ring shift renumbers every entry, so the index lists shift with it.
+f_shiftIndexList(array<int> lst) =>
+    int i = array.size(lst) - 1
+    while i >= 0
+        int v = array.get(lst, i) - 1
+        if v < 0
+            array.remove(lst, i)
+        else
+            array.set(lst, i, v)
+        i -= 1
+    true
+
+f_fvgRingTrim(FvgRing r) =>
+    while array.size(r.direction) > CAP_FVG_PER_TF
+        array.shift(r.direction)
+        array.shift(r.bottom)
+        array.shift(r.top)
+        array.shift(r.originTime)
+        array.shift(r.confirmedTime)
+        array.shift(r.fresh)
+        array.shift(r.state)
+        array.shift(r.movedAway)
+        array.shift(r.invalidTime)
+        f_shiftIndexList(r.freshIndexes)
+        f_shiftIndexList(r.inverseWaitIndexes)
+    true
+
+f_dropIndex(array<int> lst, int idx) =>
+    int n = array.size(lst)
+    if n > 0
+        for i = n - 1 to 0
+            if array.get(lst, i) == idx
+                array.remove(lst, i)
+                break
+    true
+
+f_pushFvg(FvgRing r, int dir, float bottom, float top, int originTime, int confirmedTime) =>
+    array.push(r.direction, dir)
+    array.push(r.bottom, bottom)
+    array.push(r.top, top)
+    array.push(r.originTime, originTime)
+    array.push(r.confirmedTime, confirmedTime)
+    array.push(r.fresh, true)
+    array.push(r.state, zc.rootStateActive())
+    array.push(r.movedAway, false)
+    array.push(r.invalidTime, na)
+    // FIX 1. A new FVG is registered for Fresh watching here and nowhere else.
+    array.push(r.freshIndexes, array.size(r.direction) - 1)
+    true
+
+f_collectFvgRing(FvgRing r, FvgPack p, int baseCloseTime) =>
     if not na(p) and not na(p.sourceCloseTime) and p.sourceCloseTime <= baseCloseTime and (na(r.lastSourceClose) or p.sourceCloseTime > r.lastSourceClose)
-        // One newly confirmed source bar. Invalidate first, then add.
+        // FIX 2. Structural invalidation on a newly confirmed HTF bar registers
+        // InverseWait and stops. MoveAway, recontact and confirm are Base-bar
+        // work and may not happen on this same bar.
+        //
+        // This pass reads the whole ring, but it is reached ONLY on a newly
+        // confirmed 1H / 4H / 1D bar - an HTF source event, which the
+        // performance rules allow. No Base bar reaches it: the gate above
+        // rejects a repeated mapped source value.
         int n = array.size(r.direction)
         if n > 0
             for i = 0 to n - 1
@@ -431,45 +508,85 @@ f_collectFvgRing(FvgRing r, FvgPack p, int baseCloseTime, zc.ZoneCfg c) =>
                     if inv
                         array.set(r.state, i, zc.rootStateInverseWait())
                         array.set(r.fresh, i, false)
-                else if array.get(r.state, i) == zc.rootStateInverseWait()
-                    // The inverse confirms when the source closes back through
-                    // the range it broke.
-                    int dir = array.get(r.direction, i)
-                    bool confirm = dir == zc.fvgDirBullish() ? p.sourceClose <= array.get(r.bottom, i) : p.sourceClose >= array.get(r.top, i)
-                    if confirm and p.sourceHigh >= array.get(r.bottom, i) and p.sourceLow <= array.get(r.top, i)
-                        array.set(r.direction, i, -dir)
-                        array.set(r.state, i, zc.rootStateInverseActive())
+                        array.set(r.movedAway, i, false)
+                        array.set(r.invalidTime, i, p.sourceCloseTime)
+                        f_dropIndex(r.freshIndexes, i)
+                        array.push(r.inverseWaitIndexes, i)
         if p.newBull and not na(p.bullConfirmedTime)
-            array.push(r.direction, zc.fvgDirBullish())
-            array.push(r.bottom, p.bullBottom)
-            array.push(r.top, p.bullTop)
-            array.push(r.originTime, p.bullOriginTime)
-            array.push(r.confirmedTime, p.bullConfirmedTime)
-            array.push(r.fresh, true)
-            array.push(r.state, zc.rootStateActive())
+            f_pushFvg(r, zc.fvgDirBullish(), p.bullBottom, p.bullTop, p.bullOriginTime, p.bullConfirmedTime)
         if p.newBear and not na(p.bearConfirmedTime)
-            array.push(r.direction, zc.fvgDirBearish())
-            array.push(r.bottom, p.bearBottom)
-            array.push(r.top, p.bearTop)
-            array.push(r.originTime, p.bearOriginTime)
-            array.push(r.confirmedTime, p.bearConfirmedTime)
-            array.push(r.fresh, true)
-            array.push(r.state, zc.rootStateActive())
-        while array.size(r.direction) > CAP_FVG_PER_TF
-            array.shift(r.direction)
-            array.shift(r.bottom)
-            array.shift(r.top)
-            array.shift(r.originTime)
-            array.shift(r.confirmedTime)
-            array.shift(r.fresh)
-            array.shift(r.state)
+            f_pushFvg(r, zc.fvgDirBearish(), p.bearBottom, p.bearTop, p.bearOriginTime, p.bearConfirmedTime)
+        f_fvgRingTrim(r)
         r.lastSourceClose := p.sourceCloseTime
     true
 
-export collectFvgs(Collector col, FvgPack p1h, FvgPack p4h, FvgPack p1d, int baseCloseTime, zc.ZoneCfg c) =>
-    f_collectFvgRing(col.fvg1h, p1h, baseCloseTime, c)
-    f_collectFvgRing(col.fvg4h, p4h, baseCloseTime, c)
-    f_collectFvgRing(col.fvg1d, p1d, baseCloseTime, c)
+export collectFvgs(Collector col, FvgPack p1h, FvgPack p4h, FvgPack p1d, int baseCloseTime) =>
+    f_collectFvgRing(col.fvg1h, p1h, baseCloseTime)
+    f_collectFvgRing(col.fvg4h, p4h, baseCloseTime)
+    f_collectFvgRing(col.fvg1d, p1d, baseCloseTime)
+    true
+
+// FIX 1. Fresh ends the first time a LATER Base bar trades into the range. The
+// formation bar itself never consumes Fresh.
+f_fvgFreshBar(FvgRing r, float barHigh, float barLow, int baseCloseTime) =>
+    int i = array.size(r.freshIndexes) - 1
+    while i >= 0
+        int k = array.get(r.freshIndexes, i)
+        if k >= 0 and k < array.size(r.direction)
+            if array.get(r.fresh, k) and baseCloseTime > array.get(r.confirmedTime, k)
+                if barHigh >= array.get(r.bottom, k) and barLow <= array.get(r.top, k)
+                    array.set(r.fresh, k, false)
+                    array.remove(r.freshIndexes, i)
+            else if not array.get(r.fresh, k)
+                array.remove(r.freshIndexes, i)
+        else
+            array.remove(r.freshIndexes, i)
+        i -= 1
+    true
+
+// FIX 2. The Inverse state machine, advanced only on Base bars strictly after
+// the bar that registered the invalidation.
+f_fvgInverseBar(FvgRing r, float barHigh, float barLow, float barClose, int baseCloseTime, zc.ZoneCfg c) =>
+    int i = array.size(r.inverseWaitIndexes) - 1
+    while i >= 0
+        int k = array.get(r.inverseWaitIndexes, i)
+        bool done = true
+        if k >= 0 and k < array.size(r.direction) and array.get(r.state, k) == zc.rootStateInverseWait()
+            done := false
+            int it = array.get(r.invalidTime, k)
+            if na(it) or baseCloseTime > it
+                int dir = array.get(r.direction, k)
+                float nb = array.get(r.bottom, k)
+                float nt = array.get(r.top, k)
+                if not array.get(r.movedAway, k)
+                    bool away = dir == zc.fvgDirBullish() ? barClose <= nb - c.touchResetDistance : barClose >= nt + c.touchResetDistance
+                    if away
+                        array.set(r.movedAway, k, true)
+                else
+                    bool retest = barHigh >= nb and barLow <= nt
+                    if retest
+                        // Confirmation is a Base close on the NEW role's side.
+                        bool confirm = dir == zc.fvgDirBullish() ? barClose <= nb : barClose >= nt
+                        if confirm
+                            array.set(r.direction, k, -dir)
+                            array.set(r.state, k, zc.rootStateInverseActive())
+                            array.set(r.movedAway, k, false)
+                            done := true
+        if done
+            array.remove(r.inverseWaitIndexes, i)
+        i -= 1
+    true
+
+// Called once per confirmed Base bar. Touches only the two index lists.
+export updateFvgBaseBar(Collector col, float barHigh, float barLow, float barClose,
+                        int baseCloseTime, zc.ZoneCfg c) =>
+    if c.enableFVG
+        f_fvgFreshBar(col.fvg1h, barHigh, barLow, baseCloseTime)
+        f_fvgFreshBar(col.fvg4h, barHigh, barLow, baseCloseTime)
+        f_fvgFreshBar(col.fvg1d, barHigh, barLow, baseCloseTime)
+        f_fvgInverseBar(col.fvg1h, barHigh, barLow, barClose, baseCloseTime, c)
+        f_fvgInverseBar(col.fvg4h, barHigh, barLow, barClose, baseCloseTime, c)
+        f_fvgInverseBar(col.fvg1d, barHigh, barLow, barClose, baseCloseTime, c)
     true
 
 export collectMA(Collector col, MAPack ma, int baseCloseTime) =>
@@ -529,6 +646,19 @@ export collectTimeHL(Collector col, float barHigh, float barLow, int barOpenTime
                 if barLow < t.curSessionLow
                     t.curSessionLow := barLow
                     t.curSessionLowOrigin := barOpenTime
+        else if not na(t.sessionKey)
+            // FIX 4. Entering the gap between sessions (03:00-09:00 JST by the
+            // default hours) closes the session that just ended: it becomes
+            // Previous Session, and there is no Current Session until 09:00.
+            t.prevSessionHigh := t.curSessionHigh
+            t.prevSessionLow := t.curSessionLow
+            t.prevSessionHighOrigin := t.curSessionHighOrigin
+            t.prevSessionLowOrigin := t.curSessionLowOrigin
+            t.sessionKey := na
+            t.curSessionHigh := na
+            t.curSessionLow := na
+            t.curSessionHighOrigin := na
+            t.curSessionLowOrigin := na
 
         int dk = f_dayKey(barOpenTime, c)
         if na(t.dayKey) or dk != t.dayKey
@@ -584,6 +714,11 @@ export type CurrentZone
     int zoneId
     int side
     array<int> rootIds
+    // FIX 5. Deterministic identity of the Roots this Zone is made of. Root ids
+    // are regenerated on every rebuild, so they cannot carry identity; these
+    // keys are derived from what a Root actually IS. Broad FVG contributes no
+    // key, so sharing one can never prove continuity on its own.
+    array<string> originKeys
     float bottom
     float top
     float reference
@@ -634,11 +769,13 @@ export type CurrentEngine
     int currentCandidateCount
     int currentZoneCount
     int historicalZoneOps
+    array<string> workKeys
 
 export newCurrentEngine() => CurrentEngine.new(
      col = newCollector(), roots = zc.newRootSet(), zones = array.new<CurrentZone>(),
      nextZoneId = 1, bootstrapBaseTime = na, bootstrapSeq = na, built = false, lastBuildTime = na,
-     currentRootCount = 0, currentCandidateCount = 0, currentZoneCount = 0, historicalZoneOps = 0)
+     currentRootCount = 0, currentCandidateCount = 0, currentZoneCount = 0, historicalZoneOps = 0,
+     workKeys = array.new<string>())
 
 // ============================================================================
 // Current Root Registry assembly (sections 15-18, 40)
@@ -689,6 +826,15 @@ f_addSwingsFromRing(SwingRing r, array<float> px, array<int> sub, array<int> ori
                 array.push(tf, r.tfCode)
     true
 
+f_maskOr3(int a, int b) =>
+    int out = a
+    out := b % 2 == 1 and a % 2 == 0 ? out + 1 : out
+    out := int(b / 2) % 2 == 1 and int(a / 2) % 2 == 0 ? out + 2 : out
+    out := int(b / 4) % 2 == 1 and int(a / 4) % 2 == 0 ? out + 4 : out
+    out
+
+f_tfBit(int tfCode) => tfCode == TF_5M ? MASK_5M : tfCode == TF_15M ? MASK_15M : MASK_1H
+
 f_buildSwingRoots(CurrentEngine eng, zc.ZoneCfg c, float refClose, float lo, float hi) =>
     if c.enableSwing
         array<float> px = array.new<float>()
@@ -701,25 +847,56 @@ f_buildSwingRoots(CurrentEngine eng, zc.ZoneCfg c, float refClose, float lo, flo
         f_addSwingsFromRing(eng.col.sw15, px, sub, ori, oriEnd, conf, tf, lo, hi)
         f_addSwingsFromRing(eng.col.sw1h, px, sub, ori, oriEnd, conf, tf, lo, hi)
 
-        array<float> dists = array.new<float>()
         int n = array.size(px)
+        array<int> mask = array.new<int>()
+        array<bool> dead = array.new<bool>()
         if n > 0
             for i = 0 to n - 1
-                array.push(dists, math.abs(array.get(px, i) - refClose))
+                array.push(mask, f_tfBit(array.get(tf, i)))
+                array.push(dead, false)
+
+        // FIX 3. Same-event merge, done ONLY here at Current build time. Two
+        // entries are the same real Swing when the tick price and the subtype
+        // match and the lower timeframe pivot originates inside the higher
+        // timeframe pivot interval. The survivor keeps the higher timeframe and
+        // carries both timeframe bits, which is what the High-quality test reads.
+        if n > 1
+            for i = 0 to n - 2
+                if not array.get(dead, i)
+                    for j = i + 1 to n - 1
+                        if not array.get(dead, j) and array.get(sub, i) == array.get(sub, j) and array.get(tf, i) != array.get(tf, j)
+                            int ti = int(math.round(array.get(px, i) / c.mintick))
+                            int tj = int(math.round(array.get(px, j) / c.mintick))
+                            if ti == tj
+                                bool sameEvent = false
+                                if array.get(tf, i) > array.get(tf, j)
+                                    sameEvent := array.get(ori, j) >= array.get(ori, i) and array.get(ori, j) < array.get(oriEnd, i)
+                                else
+                                    sameEvent := array.get(ori, i) >= array.get(ori, j) and array.get(ori, i) < array.get(oriEnd, j)
+                                if sameEvent
+                                    array.set(mask, i, f_maskOr3(array.get(mask, i), array.get(mask, j)))
+                                    if array.get(tf, j) > array.get(tf, i)
+                                        array.set(tf, i, array.get(tf, j))
+                                        array.set(ori, i, array.get(ori, j))
+                                        array.set(oriEnd, i, array.get(oriEnd, j))
+                                    array.set(conf, i, math.min(array.get(conf, i), array.get(conf, j)))
+                                    array.set(dead, j, true)
+
+        array<float> dists = array.new<float>()
+        if n > 0
+            for i = 0 to n - 1
+                array.push(dists, array.get(dead, i) ? 1e12 : math.abs(array.get(px, i) - refClose))
         array<int> order = array.new<int>()
         if n > 0
             for i = 0 to n - 1
-                f_insertByPriority(order, dists, conf, i)
+                if not array.get(dead, i)
+                    f_insertByPriority(order, dists, conf, i)
         int take = math.min(array.size(order), CAP_SWING_TOTAL)
         if take > 0
             for k = 0 to take - 1
                 int i = array.get(order, k)
-                // A Swing seen on more than one timeframe at the same price and
-                // origin is one Root carrying both timeframe bits.
-                int tfc = array.get(tf, i)
-                int mask = tfc == TF_5M ? MASK_5M : tfc == TF_15M ? MASK_15M : MASK_1H
-                zc.addPointRoot(eng.roots, zc.catSwing(), array.get(sub, i), tfc, mask,
-                     array.get(ori, i), array.get(oriEnd, i), array.get(conf, i),
+                zc.addPointRoot(eng.roots, zc.catSwing(), array.get(sub, i), array.get(tf, i),
+                     array.get(mask, i), array.get(ori, i), array.get(oriEnd, i), array.get(conf, i),
                      array.get(px, i), 0, 0, 0, false, c)
     true
 
@@ -873,11 +1050,62 @@ f_buildMaRoots(CurrentEngine eng, zc.ZoneCfg c, float lo, float hi, int nowTime)
 f_gapBetween(float a0, float a1, float b0, float b1) =>
     a1 < b0 ? b0 - a1 : b1 < a0 ? a0 - b1 : 0.0
 
+// FIX 5. A Root's identity, derived from what it IS rather than from the id it
+// happened to receive in this rebuild. A Broad FVG returns an empty key, so it
+// can never on its own prove that two Zones are the same Zone.
+f_stableKey(zc.RootSet rs, int rootId, zc.ZoneCfg c) =>
+    string k = ""
+    zc.Root r = zc.getRootById(rs, rootId)
+    if not na(r)
+        if r.category == zc.catFVG()
+            if not r.isBroadFvg
+                k := "FV:" + str.tostring(r.tfCode) + ":" + str.tostring(r.originTime) + ":" + str.tostring(r.direction)
+        else if r.category == zc.catMA()
+            // The EMA moves every bar, so its identity is the moving average
+            // itself, never its price or the time it was rebuilt.
+            k := "MA:" + str.tostring(r.subtype)
+        else if r.category == zc.catAccum()
+            k := "AC:" + str.tostring(r.pairKey) + ":" + str.tostring(r.subtype)
+        else if r.category == zc.catSwing()
+            k := "SW:" + str.tostring(r.subtype) + ":" + str.tostring(r.originTime) + ":" + str.tostring(int(math.round(r.pointPrice / c.mintick)))
+        else if r.category == zc.catTimeHL()
+            k := "TH:" + str.tostring(r.subtype) + ":" + str.tostring(r.originTime)
+        else
+            k := "PS:" + str.tostring(int(math.round(r.pointPrice / c.mintick)))
+    k
+
+f_candidateKeys(CurrentEngine eng, zc.Candidate cnd, zc.ZoneCfg c) =>
+    array.clear(eng.workKeys)
+    array<int> ids = zc.candidateRootIds(cnd)
+    int n = array.size(ids)
+    if n > 0
+        for i = 0 to n - 1
+            string k = f_stableKey(eng.roots, array.get(ids, i), c)
+            if str.length(k) > 0
+                array.push(eng.workKeys, k)
+    eng.workKeys
+
+f_shareStableOrigin(array<string> a, array<string> b) =>
+    bool yes = false
+    int an = array.size(a)
+    int bn = array.size(b)
+    if an > 0 and bn > 0
+        for i = 0 to an - 1
+            string ka = array.get(a, i)
+            for j = 0 to bn - 1
+                if ka == array.get(b, j)
+                    yes := true
+                    break
+            if yes
+                break
+    yes
+
 f_newZone(CurrentEngine eng, int side, bool historyKnown, int seq) =>
     CurrentZone z = CurrentZone.new(alive = true, zoneId = eng.nextZoneId, side = side,
          rootIds = array.new<int>(), bottom = na, top = na, reference = na, cCount = 0, hCount = 0,
          density = 0, baseStrong = false, broadContext = false, categoryMask = 0, highMask = 0,
          fvgDirectionMask = 0, fvgRootCount = 0, fvgFreshCount = 0,
+         originKeys = array.new<string>(),
          historyKnown = historyKnown, phase = PH_WAITING, touchCount = 0, currentTouchNo = 0,
          weakByTouch = false, weakByDepth = false, maxDepthPct = 0.0, zoneFresh = true,
          armedFromSeq = na, armedBottom = na, armedTop = na, touchActive = false,
@@ -888,7 +1116,12 @@ f_newZone(CurrentEngine eng, int side, bool historyKnown, int seq) =>
     array.push(eng.zones, z)
     z
 
-f_applyStructure(CurrentEngine eng, CurrentZone z, zc.Candidate cnd, int seq) =>
+f_applyStructure(CurrentEngine eng, CurrentZone z, zc.Candidate cnd, array<string> keys, int seq) =>
+    array.clear(z.originKeys)
+    int kn = array.size(keys)
+    if kn > 0
+        for i = 0 to kn - 1
+            array.push(z.originKeys, array.get(keys, i))
     array.clear(z.rootIds)
     array<int> ids = zc.candidateRootIds(cnd)
     int n = array.size(ids)
@@ -911,10 +1144,12 @@ f_applyStructure(CurrentEngine eng, CurrentZone z, zc.Candidate cnd, int seq) =>
     z.lastSeenSeq := seq
     true
 
-// Continuity is geometric: Root ids are regenerated on every rebuild, so they
-// cannot identify a Zone across builds. Same Side plus a gap within M is the
-// stable test.
-f_matchZone(CurrentEngine eng, zc.Candidate cnd, int side, int seq, zc.ZoneCfg c) =>
+// FIX 5. Continuity must be PROVEN, not assumed. Geometry alone would let a
+// Touch / Weak history slide onto a different Zone that merely happens to sit
+// nearby, so a shared stable non-Broad-FVG origin is required as well. When
+// that cannot be shown, no match is returned and the Candidate becomes a new
+// Zone with historyKnown = false.
+f_matchZone(CurrentEngine eng, zc.Candidate cnd, int side, int seq, zc.ZoneCfg c, array<string> keys) =>
     CurrentZone best = na
     float bestGap = 1e12
     int n = array.size(eng.zones)
@@ -924,8 +1159,9 @@ f_matchZone(CurrentEngine eng, zc.Candidate cnd, int side, int seq, zc.ZoneCfg c
             if z.alive and z.side == side and z.lastSeenSeq != seq and not na(z.bottom)
                 float g = f_gapBetween(z.bottom, z.top, zc.candidateBottom(cnd), zc.candidateTop(cnd))
                 if g <= c.clusterMaxWidth and g < bestGap
-                    bestGap := g
-                    best := z
+                    if f_shareStableOrigin(z.originKeys, keys)
+                        bestGap := g
+                        best := z
     best
 
 f_reconcileZones(CurrentEngine eng, array<zc.Candidate> cands, int side, int seq, zc.ZoneCfg c) =>
@@ -933,14 +1169,15 @@ f_reconcileZones(CurrentEngine eng, array<zc.Candidate> cands, int side, int seq
     if n > 0
         for i = 0 to n - 1
             zc.Candidate cnd = array.get(cands, i)
-            CurrentZone z = f_matchZone(eng, cnd, side, seq, c)
+            array<string> keys = f_candidateKeys(eng, cnd, c)
+            CurrentZone z = f_matchZone(eng, cnd, side, seq, c, keys)
             if na(z)
                 // Section 25A: a Zone only counts as fully tracked when it was
                 // born after the engine started watching. Everything present at
                 // bootstrap stays historyKnown = false.
                 bool born = eng.built and not na(eng.bootstrapBaseTime) and zc.candidateCreatedTime(cnd) > eng.bootstrapBaseTime
                 z := f_newZone(eng, side, born, seq)
-            f_applyStructure(eng, z, cnd, seq)
+            f_applyStructure(eng, z, cnd, keys, seq)
     true
 
 f_retireUnseen(CurrentEngine eng, int seq, float refClose) =>
