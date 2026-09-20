@@ -1,0 +1,1622 @@
+//@version=6
+//@description Zone definition v2 core. Root definition, Candidate formation, C, H, Density, BaseStrong, EffectiveZoneRange, ReferencePrice, FVG localization, Psychological participation, Candidate competition and Root eligibility. Contains NO engine state and NO bar-by-bar replay, so the Current Snapshot indicator and a future Strategy state engine can share exactly one definition of what a Zone is.
+library("ZoneCoreV2_Common", overlay = true)
+
+// ============================================================================
+// ZoneCoreV2_Common
+//
+// WHAT THIS FILE IS
+//   Given a set of Roots and a price window, it produces the Candidates that
+//   Zone definition v2 says exist there. That is all.
+//
+// WHAT THIS FILE IS NOT
+//   No Touch, Weak, Break, Flip, Reclaim, Generation, Merge, Split, Dormant or
+//   PendingTopology. No historical replay. No bootstrap. No Strategy code.
+//   Those belong to whichever state engine imports this library:
+//     ZoneCurrentEngineV2      - current snapshot, no history replay
+//     ZoneStrategyStateEngine  - future, replays its own backtest window
+//
+// The structural logic below is the reference implementation from
+// ZoneEngineV2_Rebuild, carried over unchanged. It is not simplified for speed:
+// a Current build runs once, not once per historical bar.
+// ============================================================================
+const string CORE_BUILD_ID = "ZONECORE-V2-20260920"
+export coreBuildId() => CORE_BUILD_ID
+
+// Categories
+const int CAT_MA      = 1
+const int CAT_SWING   = 2
+const int CAT_ACCUM   = 3
+const int CAT_TIME_HL = 4
+const int CAT_FVG     = 5
+const int CAT_PSYCH   = 6
+
+// Sides
+const int SIDE_SUPPORT    = 1
+const int SIDE_RESISTANCE = -1
+const int SIDE_NONE       = 0
+
+// Phase
+const int PH_WAITING      = 1
+const int PH_ARMED        = 2
+const int PH_ACTIVE_TOUCH = 3
+const int PH_BROKEN       = 4
+const int PH_FLIP_WAIT    = 5
+const int PH_DORMANT      = 6
+
+// Grade
+const int GR_STRONG      = 1
+const int GR_NEUTRAL     = 2
+const int GR_WEAK        = 3
+const int GR_UNAVAILABLE = 4
+
+// Density
+const int DEN_HIGH          = 1
+const int DEN_NORMAL        = 2
+const int DEN_BROAD_CONTEXT = 3
+
+// Root state
+const int ROOT_CANDIDATE      = 1
+const int ROOT_ACTIVE         = 2
+const int ROOT_INVALIDATED    = 3
+const int ROOT_INVERSE_WAIT   = 4
+const int ROOT_INVERSE_ACTIVE = 5
+const int ROOT_RETIRED        = 6
+
+// FVG direction
+const int FVG_NONE    = 0
+const int FVG_BULLISH = 1
+const int FVG_BEARISH = -1
+
+// Weak reason
+const int WEAK_NONE     = 0
+const int WEAK_BY_TOUCH = 1
+const int WEAK_BY_DEPTH = 2
+const int WEAK_BY_BOTH  = 3
+
+// Event type
+const int EV_TOUCH_START      = 1
+const int EV_TOUCH_RESET      = 2
+const int EV_WEAK_DEPTH       = 3
+const int EV_LOCAL_BREAK      = 4
+const int EV_GAP_BREAK        = 5
+const int EV_FLIP_ATTEMPT     = 6
+const int EV_FLIP_CONFIRM     = 7
+const int EV_RECLAIM          = 8
+const int EV_FVG_INVALIDATE   = 9
+const int EV_INVERSE_ATTEMPT  = 10
+const int EV_INVERSE_CONFIRM  = 11
+const int EV_GENERATION_START = 12
+const int EV_MERGE            = 13
+const int EV_SPLIT            = 14
+const int EV_STORAGE_PRUNE    = 15
+
+// TF codes / masks
+const int TF_1M  = 1
+const int TF_5M  = 5
+const int TF_15M = 15
+const int TF_1H  = 60
+const int TF_4H  = 240
+const int TF_1D  = 1440
+const int MASK_5M  = 1
+const int MASK_15M = 2
+const int MASK_1H  = 4
+
+// Time label mask
+const int TL_CUR_SESSION  = 1
+const int TL_PREV_SESSION = 2
+const int TL_CUR_DAY      = 4
+const int TL_PREV_DAY     = 8
+const int TL_CUR_WEEK     = 16
+const int TL_PREV_WEEK    = 32
+
+// Root subtype
+const int SUB_MA_2000       = 1
+const int SUB_MA_3000       = 2
+const int SUB_SWING_HIGH    = 10
+const int SUB_SWING_LOW     = 11
+const int SUB_ACCUM_TOP     = 20
+const int SUB_ACCUM_BOTTOM  = 21
+const int SUB_TIME_HIGH     = 30
+const int SUB_TIME_LOW      = 31
+const int SUB_FVG           = 40
+const int SUB_PSYCH_MAJOR   = 50
+const int SUB_PSYCH_STD     = 51
+
+// Reserved stable IDs. Event roots use positive sequence >= 100.
+const int ROOT_ID_EMA2000 = 1
+const int ROOT_ID_EMA3000 = 2
+const int ROOT_ID_FIRST_DYNAMIC = 100
+
+export type ZoneCfg
+    float clusterMaxWidth
+    float denseRatio
+    float touchResetDistance
+    int strongUntilTouch
+    bool strongUnlimited
+    int weakFromTouch
+    bool weakFromTouchOff
+    float weakDepthPct
+    bool weakDepthOff
+    float breakBuffer
+    float touchTolerance
+    int emaSlopeLookback
+    int swingLen5m
+    int swingLen15m
+    int swingLen1h
+    int accumRangeLen
+    int accumBaseLen
+    int accumAtrLen
+    int accumMinUpperCloses
+    int accumMinLowerCloses
+    int accumMaxSameColorRun
+    float accumAtrMult
+    float accumBarRatioMax
+    float accumDriftMax
+    string zoneTimezone
+    int asiaStartHour
+    int asiaEndHour
+    int europeStartHour
+    int europeEndHour
+    int nyStartHour
+    int nyEndHour
+    int dayStartHour
+    int weekStartHour
+    int maxSwingRoots
+    int maxAccumBoxes
+    int maxFvgRoots
+    int maxTimeRoots
+    int maxZoneCores
+    int maxEndedGenerations
+    int maxTouchMarksPerCore
+    float dormantDistance
+    int maxZonesDrawn
+    int maxLabelsDrawn
+    bool enableMA
+    bool enableSwing
+    bool enableAccum
+    bool enableTimeHL
+    bool enableFVG
+    bool enablePsych
+    float mintick
+    // Increment only when a caller mutates logical configuration without a script reload.
+    // TradingView input changes reload the script, so the Visual Harness keeps this at 1.
+    int revision
+
+export type Root
+    bool alive
+    int rootId
+    int originKey
+    int category
+    int subtype
+    int tfCode
+    int tfMask
+    int originTime
+    int originEndTime
+    int confirmedTime
+    float pointPrice
+    float nativeBottom
+    float nativeTop
+    bool isRangeRoot
+    bool isDynamic
+    int state
+    int pairKey
+    int direction
+    bool fvgFresh
+    bool isBroadFvg
+    int labelMask
+    int lastUpdateSeq
+    int slopeSign
+    bool inverseMovedAway
+    bool inverseRetestSeen
+    int lastSourceCloseTime
+    // Scratch-only selection stamp. It never participates in Zone logic.
+    int workStamp
+
+// ============================================================================
+// Small helpers
+// ============================================================================
+f_clamp(float x, float lo, float hi) => math.max(lo, math.min(hi, x))
+f_tick(float price, float mintick) => int(math.round(price / mintick))
+f_fromTick(int t, float mintick) => t * mintick
+f_norm(float price, float mintick) => f_fromTick(f_tick(price, mintick), mintick)
+f_le(float a, float b, float mt) => f_tick(a, mt) <= f_tick(b, mt)
+f_ge(float a, float b, float mt) => f_tick(a, mt) >= f_tick(b, mt)
+f_lt(float a, float b, float mt) => f_tick(a, mt) < f_tick(b, mt)
+f_gt(float a, float b, float mt) => f_tick(a, mt) > f_tick(b, mt)
+f_eq(float a, float b, float mt) => f_tick(a, mt) == f_tick(b, mt)
+f_intersects(float a0, float a1, float b0, float b1, float mt) => f_ge(a1, b0, mt) and f_ge(b1, a0, mt)
+f_gap(float a0, float a1, float b0, float b1) => a1 < b0 ? b0 - a1 : b1 < a0 ? a0 - b1 : 0.0
+f_widthTicks(float bottom, float top, float mt) => f_tick(top, mt) - f_tick(bottom, mt)
+f_widthLe(float bottom, float top, float maxWidth, float mt) => f_widthTicks(bottom, top, mt) <= int(math.round(maxWidth / mt))
+f_widthGt(float bottom, float top, float maxWidth, float mt) => f_widthTicks(bottom, top, mt) > int(math.round(maxWidth / mt))
+f_bit(int idx) => int(math.pow(2, idx))
+f_catBit(int cat) => f_bit(cat - 1)
+f_hasBit(int mask, int bit) => bit > 0 and int(math.floor(mask / bit)) % 2 == 1
+f_maskAdd(int mask, int bit) => f_hasBit(mask, bit) ? mask : mask + bit
+f_maskRemove(int mask, int bit) => f_hasBit(mask, bit) ? mask - bit : mask
+f_maskUnion(int a, int b) =>
+    int out = a
+    out := f_hasBit(b, 1) ? f_maskAdd(out, 1) : out
+    out := f_hasBit(b, 2) ? f_maskAdd(out, 2) : out
+    out := f_hasBit(b, 4) ? f_maskAdd(out, 4) : out
+    out := f_hasBit(b, 8) ? f_maskAdd(out, 8) : out
+    out := f_hasBit(b, 16) ? f_maskAdd(out, 16) : out
+    out := f_hasBit(b, 32) ? f_maskAdd(out, 32) : out
+    out
+f_pop6(int mask) =>
+    // Six categories are fixed by the specification. Unrolling avoids a tiny loop
+    // in the candidate hot path, where this helper is called very frequently.
+    int n = 0
+    n += f_hasBit(mask, 1) ? 1 : 0
+    n += f_hasBit(mask, 2) ? 1 : 0
+    n += f_hasBit(mask, 4) ? 1 : 0
+    n += f_hasBit(mask, 8) ? 1 : 0
+    n += f_hasBit(mask, 16) ? 1 : 0
+    n += f_hasBit(mask, 32) ? 1 : 0
+    n
+f_newNonPsychCategoryMask(int newMask, int baseMask) =>
+    int out = 0
+    for cat = CAT_MA to CAT_FVG
+        int bit = f_catBit(cat)
+        if f_hasBit(newMask, bit) and not f_hasBit(baseMask, bit)
+            out := f_maskAdd(out, bit)
+    out
+f_slopeSign(float x) => na(x) ? 0 : x > 0 ? 1 : x < 0 ? -1 : 0
+f_tfMask(int tfCode) => tfCode == TF_5M ? MASK_5M : tfCode == TF_15M ? MASK_15M : tfCode == TF_1H ? MASK_1H : 0
+f_isFvgLive(Root r) => r.alive and (r.state == ROOT_ACTIVE or r.state == ROOT_INVERSE_ACTIVE)
+f_rootBottom(Root r) => r.isRangeRoot ? r.nativeBottom : r.pointPrice
+f_rootTop(Root r) => r.isRangeRoot ? r.nativeTop : r.pointPrice
+
+f_arrayHasInt(array<int> a, int v) =>
+    bool found = false
+    int n = array.size(a)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(a, i) == v
+                found := true
+                break
+    found
+
+f_arrayAddUnique(array<int> a, int v) =>
+    if not f_arrayHasInt(a, v)
+        array.push(a, v)
+    true
+
+f_copyInts(array<int> src) =>
+    array<int> dst = array.new<int>()
+    int n = array.size(src)
+    if n > 0
+        for i = 0 to n - 1
+            array.push(dst, array.get(src, i))
+    dst
+
+
+// Exported so a Strategy state engine can consume the same Candidate objects.
+export type Candidate
+    int side
+    array<int> rootIds
+    float bottom
+    float top
+    float referencePrice
+    int cCount
+    int hCount
+    int density
+    bool baseStrong
+    bool broadContext
+    bool broadLocalized
+    int categoryMask
+    int highMask
+    int fvgDirectionMask
+    int fvgRootCount
+    int fvgFreshCount
+    int fvgStructuralStateMask
+    int createdTime
+    int minRootId
+
+// ============================================================================
+// RootSet
+//
+// A registry of Roots plus the indexes and reusable scratch the Candidate
+// search needs. It holds no Zone state and no history: a caller fills it, asks
+// for Candidates, and may clear and refill it whenever it likes.
+//
+// `winBottom` / `winTop` are the active price window for the current build.
+// ============================================================================
+export type RootSet
+    array<Root> roots
+    map<int, int> rootIndex
+    array<int> pointPriceIndex
+    array<int> swingSlots
+    array<int> accumSlots
+    array<int> timeSlots
+    array<int> fvgSlots
+    array<int> freeRootSlots
+    int nextRootId
+    int liveRootCount
+    bool storageCheckDirty
+    // Active window for this build. Named dirtyBottom / dirtyTop because the
+    // carried-over Candidate code reads them under those names.
+    float dirtyBottom
+    float dirtyTop
+    // Reusable scratch. Logical results are copied out before reuse.
+    int workStampSeq
+    array<int> workPointSlots
+    array<int> workPsychSlots
+    array<int> workFvgSlots
+    array<int> workStartFvgSlots
+    array<int> workPairs
+    array<int> workTempIds
+    array<int> cacheEnd
+    array<int> cacheC
+    array<int> cacheH
+    array<int> cacheCreated
+    array<int> cacheMinId
+    array<float> cacheBottom
+    array<float> cacheTop
+    array<int> fvgInsideMask
+    array<float> fvgInsideBottom
+    array<float> fvgInsideTop
+    array<float> refVals
+    array<float> refReps
+    array<float> refMa
+    array<float> refNonMa
+
+export newRootSet() => RootSet.new(
+    roots = array.new<Root>(), rootIndex = map.new<int, int>(), pointPriceIndex = array.new<int>(),
+    swingSlots = array.new<int>(), accumSlots = array.new<int>(), timeSlots = array.new<int>(),
+    fvgSlots = array.new<int>(), freeRootSlots = array.new<int>(),
+    nextRootId = ROOT_ID_FIRST_DYNAMIC, liveRootCount = 0, storageCheckDirty = false,
+    dirtyBottom = na, dirtyTop = na,
+    workStampSeq = 0, workPointSlots = array.new<int>(), workPsychSlots = array.new<int>(),
+    workFvgSlots = array.new<int>(), workStartFvgSlots = array.new<int>(),
+    workPairs = array.new<int>(), workTempIds = array.new<int>(),
+    cacheEnd = array.new<int>(), cacheC = array.new<int>(), cacheH = array.new<int>(),
+    cacheCreated = array.new<int>(), cacheMinId = array.new<int>(), cacheBottom = array.new<float>(),
+    cacheTop = array.new<float>(), fvgInsideMask = array.new<int>(), fvgInsideBottom = array.new<float>(),
+    fvgInsideTop = array.new<float>(), refVals = array.new<float>(), refReps = array.new<float>(),
+    refMa = array.new<float>(), refNonMa = array.new<float>())
+
+// Empties the registry without discarding any buffer. The Current engine calls
+// this before every rebuild, so no allocation accumulates across rebuilds.
+export clearRoots(RootSet e) =>
+    array.clear(e.roots)
+    array.clear(e.pointPriceIndex)
+    array.clear(e.swingSlots)
+    array.clear(e.accumSlots)
+    array.clear(e.timeSlots)
+    array.clear(e.fvgSlots)
+    array.clear(e.freeRootSlots)
+    e.rootIndex := map.new<int, int>()
+    e.nextRootId := ROOT_ID_FIRST_DYNAMIC
+    e.liveRootCount := 0
+    e.dirtyBottom := na
+    e.dirtyTop := na
+    true
+
+export rootCount(RootSet e) => e.liveRootCount
+export getRootById(RootSet e, int rootId) => f_getRoot(e, rootId)
+
+
+// ============================================================================
+// Root registry and price index
+// ============================================================================
+f_rootSlot(RootSet e, int rootId) =>
+    int slot = na
+    if map.contains(e.rootIndex, rootId)
+        slot := map.get(e.rootIndex, rootId)
+    slot
+
+f_getRoot(RootSet e, int rootId) =>
+    Root out = na
+    int slot = f_rootSlot(e, rootId)
+    if not na(slot) and slot >= 0 and slot < array.size(e.roots)
+        Root r = array.get(e.roots, slot)
+        if r.alive and r.rootId == rootId
+            out := r
+    out
+
+// --------------------------------------------------------------------------
+// Hot-path indexes
+// --------------------------------------------------------------------------
+f_isIndexedPointRoot(Root r) =>
+    not na(r) and r.alive and not r.isRangeRoot and r.category != CAT_FVG and not na(r.pointPrice)
+
+f_pointBefore(Root a, Root b) =>
+    a.pointPrice < b.pointPrice or (a.pointPrice == b.pointPrice and a.rootId < b.rootId)
+
+f_pointIndexInsert(RootSet e, int rootId) =>
+    int slot = f_rootSlot(e, rootId)
+    if not na(slot)
+        Root r = array.get(e.roots, slot)
+        if f_isIndexedPointRoot(r)
+            int lo = 0
+            int hi = array.size(e.pointPriceIndex)
+            while lo < hi
+                int mid = int(math.floor((lo + hi) * 0.5))
+                int qSlot = array.get(e.pointPriceIndex, mid)
+                Root q = array.get(e.roots, qSlot)
+                bool before = not q.alive or f_pointBefore(r, q)
+                if before
+                    hi := mid
+                else
+                    lo := mid + 1
+            array.insert(e.pointPriceIndex, lo, slot)
+    true
+
+f_pointIndexLowerBound(RootSet e, float price) =>
+    int lo = 0
+    int hi = array.size(e.pointPriceIndex)
+    while lo < hi
+        int mid = int(math.floor((lo + hi) * 0.5))
+        Root q = array.get(e.roots, array.get(e.pointPriceIndex, mid))
+        if not q.alive or q.pointPrice >= price
+            hi := mid
+        else
+            lo := mid + 1
+    lo
+
+f_pointIndexFindByPrice(RootSet e, int rootId, float price) =>
+    int pos = na
+    if not na(price)
+        int i = f_pointIndexLowerBound(e, price)
+        int n = array.size(e.pointPriceIndex)
+        bool done = false
+        while i < n and not done
+            int slot = array.get(e.pointPriceIndex, i)
+            Root q = array.get(e.roots, slot)
+            if not q.alive or q.pointPrice != price
+                done := true
+            else
+                if q.rootId == rootId
+                    pos := i
+                    done := true
+                else
+                    i += 1
+    pos
+
+f_pointIndexRepositionAt(RootSet e, int rootId, int pos) =>
+    int curPos = pos
+    int slot = f_rootSlot(e, rootId)
+    if not na(slot) and not na(curPos) and curPos >= 0 and curPos < array.size(e.pointPriceIndex)
+        Root r = array.get(e.roots, slot)
+        bool moving = true
+        while moving and curPos > 0
+            int prevSlot = array.get(e.pointPriceIndex, curPos - 1)
+            Root prev = array.get(e.roots, prevSlot)
+            if prev.alive and f_pointBefore(r, prev)
+                array.set(e.pointPriceIndex, curPos - 1, slot)
+                array.set(e.pointPriceIndex, curPos, prevSlot)
+                curPos -= 1
+            else
+                moving := false
+        moving := true
+        while moving and curPos + 1 < array.size(e.pointPriceIndex)
+            int nextSlot = array.get(e.pointPriceIndex, curPos + 1)
+            Root nxt = array.get(e.roots, nextSlot)
+            if nxt.alive and f_pointBefore(nxt, r)
+                array.set(e.pointPriceIndex, curPos + 1, slot)
+                array.set(e.pointPriceIndex, curPos, nextSlot)
+                curPos += 1
+            else
+                moving := false
+    true
+
+f_removeSlotValue(array<int> slots, int slot) =>
+    int n = array.size(slots)
+    if n > 0
+        for i = n - 1 to 0
+            if array.get(slots, i) == slot
+                array.remove(slots, i)
+                break
+    true
+
+f_categoryMaskFromIds(RootSet e, array<int> ids) =>
+    int mask = 0
+    int n = array.size(ids)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = f_getRoot(e, array.get(ids, i))
+            if not na(r)
+                mask := f_maskAdd(mask, f_catBit(r.category))
+    mask
+
+f_allocRoot(RootSet e, Root r) =>
+    int slot = na
+    if array.size(e.freeRootSlots) > 0
+        slot := array.pop(e.freeRootSlots)
+        array.set(e.roots, slot, r)
+    else
+        slot := array.size(e.roots)
+        array.push(e.roots, r)
+    map.put(e.rootIndex, r.rootId, slot)
+    if f_isIndexedPointRoot(r)
+        f_pointIndexInsert(e, r.rootId)
+    if r.category == CAT_SWING
+        array.push(e.swingSlots, slot)
+    else if r.category == CAT_ACCUM
+        array.push(e.accumSlots, slot)
+    else if r.category == CAT_TIME_HL
+        array.push(e.timeSlots, slot)
+    else if r.category == CAT_FVG
+        array.push(e.fvgSlots, slot)
+    e.liveRootCount += 1
+    e.storageCheckDirty := true
+    slot
+
+
+f_allocRoot(RootSet e, Root r) =>
+    int slot = na
+    if array.size(e.freeRootSlots) > 0
+        slot := array.pop(e.freeRootSlots)
+        array.set(e.roots, slot, r)
+    else
+        slot := array.size(e.roots)
+        array.push(e.roots, r)
+    map.put(e.rootIndex, r.rootId, slot)
+    if f_isIndexedPointRoot(r)
+        f_pointIndexInsert(e, r.rootId)
+    if r.category == CAT_SWING
+        array.push(e.swingSlots, slot)
+    else if r.category == CAT_ACCUM
+        array.push(e.accumSlots, slot)
+    else if r.category == CAT_TIME_HL
+        array.push(e.timeSlots, slot)
+    else if r.category == CAT_FVG
+        array.push(e.fvgSlots, slot)
+    e.liveRootCount += 1
+    e.storageCheckDirty := true
+    slot
+
+f_newRoot(RootSet e, int fixedId, int originKey, int category, int subtype, int tfCode, int tfMask,
+          int originTime, int originEndTime, int confirmedTime, float pointPrice, float nativeBottom,
+          float nativeTop, bool isRangeRoot, bool isDynamic, int state, int pairKey, int direction,
+          bool fvgFresh, bool isBroadFvg, int labelMask, int seq, int slopeSign) =>
+    int id = na(fixedId) ? e.nextRootId : fixedId
+    if na(fixedId)
+        e.nextRootId += 1
+    Root r = Root.new(alive = true, rootId = id, originKey = originKey, category = category, subtype = subtype,
+        tfCode = tfCode, tfMask = tfMask, originTime = originTime, originEndTime = originEndTime,
+        confirmedTime = confirmedTime, pointPrice = pointPrice, nativeBottom = nativeBottom, nativeTop = nativeTop,
+        isRangeRoot = isRangeRoot, isDynamic = isDynamic, state = state, pairKey = pairKey,
+        direction = direction, fvgFresh = fvgFresh, isBroadFvg = isBroadFvg, labelMask = labelMask,
+        lastUpdateSeq = seq, slopeSign = slopeSign, inverseMovedAway = false, inverseRetestSeen = false,
+        lastSourceCloseTime = confirmedTime, workStamp = 0)
+    f_allocRoot(e, r)
+    id
+
+f_psychId(float level, float mt) => -2000000000 + f_tick(level, mt)
+
+// Psychological levels are materialised into the RootSet only for the duration
+// of a build, derived deterministically from the window: $100 is Major, $50 is
+// Standard, and the same level is never added twice. Nothing stores them.
+f_ensurePsychLevelForBuild(RootSet e, float level, int seq, int t, ZoneCfg c) =>
+    if c.enablePsych
+        float p = f_norm(level, c.mintick)
+        int id = f_psychId(p, c.mintick)
+        if na(f_getRoot(e, id))
+            float rem100 = math.abs(p - math.round(p / 100.0) * 100.0)
+            bool major = rem100 <= c.mintick * 0.5
+            int st = major ? SUB_PSYCH_MAJOR : SUB_PSYCH_STD
+            f_newRoot(e, id, id, CAT_PSYCH, st, 0, 0, t, t, t, p, p, p,
+                false, false, ROOT_ACTIVE, 0, FVG_NONE, false, false, 0, seq, 0)
+    true
+
+f_ensurePsychNearForBuild(RootSet e, float bottom, float top, int seq, int t, ZoneCfg c) =>
+    if c.enablePsych and not na(bottom) and not na(top)
+        float lo = math.min(bottom, top) - c.clusterMaxWidth
+        float hi = math.max(bottom, top) + c.clusterMaxWidth
+        int k0 = int(math.ceil(lo / 50.0))
+        int k1 = int(math.floor(hi / 50.0))
+        if k1 >= k0
+            for k = k0 to k1
+                f_ensurePsychLevelForBuild(e, k * 50.0, seq, t, c)
+    true
+
+
+// ============================================================================
+// Configuration
+// ============================================================================
+export newCfg(float mintick = 0.01) => ZoneCfg.new(
+    clusterMaxWidth = 20.0, denseRatio = 0.50, touchResetDistance = 10.0,
+    strongUntilTouch = 1, strongUnlimited = false, weakFromTouch = 2, weakFromTouchOff = false,
+    weakDepthPct = 50.0, weakDepthOff = false, breakBuffer = 2.0, touchTolerance = 0.0,
+    emaSlopeLookback = 60, swingLen5m = 10, swingLen15m = 8, swingLen1h = 6,
+    accumRangeLen = 10, accumBaseLen = 20, accumAtrLen = 14, accumMinUpperCloses = 4,
+    accumMinLowerCloses = 4, accumMaxSameColorRun = 4, accumAtrMult = 2.5,
+    accumBarRatioMax = 0.70, accumDriftMax = 0.30, zoneTimezone = "Asia/Tokyo",
+    asiaStartHour = 9, asiaEndHour = 14, europeStartHour = 14, europeEndHour = 19,
+    nyStartHour = 19, nyEndHour = 3, dayStartHour = 5, weekStartHour = 5,
+    maxSwingRoots = 180, maxAccumBoxes = 60, maxFvgRoots = 120, maxTimeRoots = 32,
+    maxZoneCores = 80, maxEndedGenerations = 30, maxTouchMarksPerCore = 64,
+    dormantDistance = 500.0, maxZonesDrawn = 30, maxLabelsDrawn = 30,
+    enableMA = true, enableSwing = true, enableAccum = true, enableTimeHL = true,
+    enableFVG = true, enablePsych = true, mintick = mintick, revision = 1)
+
+export validateCfg(ZoneCfg c) =>
+    bool ok = true
+    string err = ""
+    if c.clusterMaxWidth <= 0
+        ok := false
+        err := "clusterMaxWidth must be > 0"
+    else if c.denseRatio <= 0 or c.denseRatio > 1
+        ok := false
+        err := "denseRatio must be in (0, 1]"
+    else if c.touchResetDistance <= 0
+        ok := false
+        err := "touchResetDistance must be > 0"
+    else if c.breakBuffer < 0 or c.touchTolerance < 0
+        ok := false
+        err := "breakBuffer/touchTolerance must be >= 0"
+    else if c.strongUnlimited and not c.weakFromTouchOff
+        ok := false
+        err := "strongUnlimited requires weakFromTouchOff"
+    else if not c.strongUnlimited and c.strongUntilTouch < 1
+        ok := false
+        err := "strongUntilTouch must be >= 1"
+    else if not c.weakFromTouchOff and c.weakFromTouch < 2
+        ok := false
+        err := "weakFromTouch must be >= 2"
+    else if not c.strongUnlimited and not c.weakFromTouchOff and c.strongUntilTouch >= c.weakFromTouch
+        ok := false
+        err := "strongUntilTouch must be < weakFromTouch"
+    else if not c.weakDepthOff and (c.weakDepthPct < 0 or c.weakDepthPct > 100)
+        ok := false
+        err := "weakDepthPct must be in [0,100]"
+    else if c.emaSlopeLookback < 1 or c.swingLen5m < 1 or c.swingLen15m < 1 or c.swingLen1h < 1
+        ok := false
+        err := "lookbacks must be >= 1"
+    else if c.accumRangeLen < 2 or c.accumBaseLen < c.accumRangeLen or c.accumAtrLen < 1
+        ok := false
+        err := "invalid Accum lengths"
+    else if c.mintick <= 0
+        ok := false
+        err := "mintick must be > 0"
+    else if c.maxSwingRoots < 1 or c.maxAccumBoxes < 1 or c.maxFvgRoots < 1 or c.maxZoneCores < 1
+        ok := false
+        err := "storage limits must be > 0"
+    [ok, err]
+
+// ============================================================================
+// Candidate formation (Zone definition v2, carried over unchanged)
+// ============================================================================
+f_rootEligibleSide(Root r, int side) =>
+    bool ok = r.alive and r.state != ROOT_RETIRED
+    if ok and r.category == CAT_FVG
+        ok := f_isFvgLive(r) and ((side == SIDE_SUPPORT and r.direction == FVG_BULLISH) or (side == SIDE_RESISTANCE and r.direction == FVG_BEARISH))
+    ok
+
+f_categoryEnabled(int cat, ZoneCfg c) => cat == CAT_MA ? c.enableMA : cat == CAT_SWING ? c.enableSwing : cat == CAT_ACCUM ? c.enableAccum : cat == CAT_TIME_HL ? c.enableTimeHL : cat == CAT_FVG ? c.enableFVG : cat == CAT_PSYCH ? c.enablePsych : false
+
+f_masksIntersect6(int a, int b) =>
+    bool yes = f_hasBit(a, 1) and f_hasBit(b, 1)
+    yes := yes or (f_hasBit(a, 2) and f_hasBit(b, 2))
+    yes := yes or (f_hasBit(a, 4) and f_hasBit(b, 4))
+    yes := yes or (f_hasBit(a, 8) and f_hasBit(b, 8))
+    yes := yes or (f_hasBit(a, 16) and f_hasBit(b, 16))
+    yes := yes or (f_hasBit(a, 32) and f_hasBit(b, 32))
+    yes
+
+// Winner-only point quality aggregation. No temporary category arrays.
+f_pointMasks(RootSet e, array<int> ids, int side, float denseWidth, ZoneCfg c) =>
+    int catMask = 0
+    int highMask = 0
+    int minId = 2147483647
+    int created = 0
+    bool hasNonPsych = false
+    int maN = 0
+    float ma1 = na
+    float ma2 = na
+    int maSlope1 = 0
+    int maSlope2 = 0
+    int accumTfMask = 0
+    int accumPair1 = na
+    bool accumMultiPair = false
+    int timeOrigin1 = na
+    bool timeMultiOrigin = false
+    int n = array.size(ids)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = f_getRoot(e, array.get(ids, i))
+            if not na(r) and r.category != CAT_FVG
+                catMask := f_maskAdd(catMask, f_catBit(r.category))
+                minId := math.min(minId, r.rootId)
+                created := math.max(created, r.confirmedTime)
+                if r.category != CAT_PSYCH
+                    hasNonPsych := true
+                if r.category == CAT_MA
+                    maN += 1
+                    if maN == 1
+                        ma1 := r.pointPrice
+                        maSlope1 := r.slopeSign
+                    else if maN == 2
+                        ma2 := r.pointPrice
+                        maSlope2 := r.slopeSign
+                else if r.category == CAT_SWING
+                    bool hiSwing = r.tfCode == TF_1H or (f_hasBit(r.tfMask, MASK_5M) and f_hasBit(r.tfMask, MASK_15M))
+                    if hiSwing
+                        highMask := f_maskAdd(highMask, f_catBit(CAT_SWING))
+                else if r.category == CAT_ACCUM
+                    if r.tfCode == TF_4H or r.tfCode == TF_1D
+                        highMask := f_maskAdd(highMask, f_catBit(CAT_ACCUM))
+                    int tfBit = r.tfCode == TF_1H ? 1 : r.tfCode == TF_4H ? 2 : r.tfCode == TF_1D ? 4 : 0
+                    accumTfMask := f_maskAdd(accumTfMask, tfBit)
+                    if na(accumPair1)
+                        accumPair1 := r.pairKey
+                    else if r.pairKey != accumPair1
+                        accumMultiPair := true
+                else if r.category == CAT_TIME_HL
+                    if f_hasBit(r.labelMask, TL_CUR_WEEK) or f_hasBit(r.labelMask, TL_PREV_WEEK) or f_hasBit(r.labelMask, TL_PREV_DAY)
+                        highMask := f_maskAdd(highMask, f_catBit(CAT_TIME_HL))
+                    if na(timeOrigin1)
+                        timeOrigin1 := r.originKey
+                    else if r.originKey != timeOrigin1
+                        timeMultiOrigin := true
+        if maN >= 2 and not na(ma1) and not na(ma2) and f_widthLe(math.min(ma1, ma2), math.max(ma1, ma2), denseWidth, c.mintick)
+            bool slopeOk = side == SIDE_SUPPORT ? (maSlope1 > 0 and maSlope2 > 0) : (maSlope1 < 0 and maSlope2 < 0)
+            if slopeOk
+                highMask := f_maskAdd(highMask, f_catBit(CAT_MA))
+        if f_pop6(accumTfMask) >= 2 and accumMultiPair
+            highMask := f_maskAdd(highMask, f_catBit(CAT_ACCUM))
+        if timeMultiOrigin
+            highMask := f_maskAdd(highMask, f_catBit(CAT_TIME_HL))
+    [catMask, highMask, hasNonPsych, minId == 2147483647 ? na : minId, created]
+
+// Winner-only FVG attachment. pointIds is owned by the candidate being built and
+// may be extended in place because it is never reused after selection.
+f_attachFvgs(RootSet e, array<int> pointIds, array<int> fvgIds, int side, float pBottom, float pTop, float attachWidth, ZoneCfg c) =>
+    array<int> ids = pointIds
+    float bottom = pBottom
+    float top = pTop
+    bool broadLocalized = false
+    float denseWidth = c.clusterMaxWidth * c.denseRatio
+    [preMask, preHigh, preNonPsych, preMin, preCreated] = f_pointMasks(e, pointIds, side, denseWidth, c)
+    int preC = f_pop6(f_maskRemove(preMask, f_catBit(CAT_FVG)))
+    int n = array.size(fvgIds)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = f_getRoot(e, array.get(fvgIds, i))
+            if not na(r)
+                bool inDirty = na(e.dirtyBottom) or f_intersects(r.nativeBottom, r.nativeTop, e.dirtyBottom, e.dirtyTop, c.mintick)
+                if inDirty
+                    bool anyPointInside = false
+                    int insideCatMask = 0
+                    int insideHighMask = 0
+                    float insideBottom = na
+                    float insideTop = na
+                    int pn = array.size(pointIds)
+                    if pn > 0
+                        for k = 0 to pn - 1
+                            Root pr = f_getRoot(e, array.get(pointIds, k))
+                            if not na(pr) and f_ge(pr.pointPrice, r.nativeBottom, c.mintick) and f_le(pr.pointPrice, r.nativeTop, c.mintick)
+                                anyPointInside := true
+                                insideCatMask := f_maskAdd(insideCatMask, f_catBit(pr.category))
+                                if f_hasBit(preHigh, f_catBit(pr.category))
+                                    insideHighMask := f_maskAdd(insideHighMask, f_catBit(pr.category))
+                                insideBottom := na(insideBottom) ? pr.pointPrice : math.min(insideBottom, pr.pointPrice)
+                                insideTop := na(insideTop) ? pr.pointPrice : math.max(insideTop, pr.pointPrice)
+                    float proximal = side == SIDE_SUPPORT ? r.nativeTop : r.nativeBottom
+                    bool proximalWithinAttach = false
+                    bool proximalDense = false
+                    float newBottom = bottom
+                    float newTop = top
+                    if not na(bottom) and not na(top)
+                        if side == SIDE_SUPPORT and f_ge(bottom, proximal, c.mintick)
+                            newBottom := proximal
+                            newTop := top
+                            proximalWithinAttach := f_widthLe(newBottom, newTop, attachWidth, c.mintick)
+                            proximalDense := f_widthLe(newBottom, newTop, denseWidth, c.mintick)
+                        else if side == SIDE_RESISTANCE and f_le(top, proximal, c.mintick)
+                            newBottom := bottom
+                            newTop := proximal
+                            proximalWithinAttach := f_widthLe(newBottom, newTop, attachWidth, c.mintick)
+                            proximalDense := f_widthLe(newBottom, newTop, denseWidth, c.mintick)
+                    bool attach = false
+                    bool loc = false
+                    if not r.isBroadFvg
+                        attach := anyPointInside or proximalWithinAttach
+                        loc := attach
+                    else
+                        bool internalHighOther = f_pop6(insideHighMask) >= 1
+                        bool internalTwoCats = f_pop6(insideCatMask) >= 2 and not na(insideBottom) and f_widthLe(insideBottom, insideTop, denseWidth, c.mintick)
+                        proximalDense := proximalDense and preC >= 1
+                        attach := internalHighOther or internalTwoCats or proximalDense
+                        loc := attach
+                    if attach
+                        array.push(ids, r.rootId)
+                        if proximalWithinAttach and not anyPointInside
+                            bottom := newBottom
+                            top := newTop
+                        broadLocalized := broadLocalized or (r.isBroadFvg and loc)
+    [ids, bottom, top, broadLocalized, preMask, preHigh, preNonPsych, preMin, preCreated]
+
+f_medianScratch(array<float> vals) =>
+    float out = na
+    int n = array.size(vals)
+    if n > 0
+        array.sort(vals, order.ascending)
+        int mid = int(math.floor(n * 0.5))
+        out := n % 2 == 1 ? array.get(vals, mid) : (array.get(vals, mid - 1) + array.get(vals, mid)) * 0.5
+    out
+
+// ReferencePrice is computed only for a selected candidate. All temporary float
+// arrays are Engine-owned buffers and are cleared/reused between winners.
+f_referencePrice(RootSet e, array<int> ids, int side, float bottom, float top) =>
+    array.clear(e.refReps)
+    array.clear(e.refMa)
+    array.clear(e.refNonMa)
+    for cat = CAT_MA to CAT_PSYCH
+        if cat != CAT_FVG
+            array.clear(e.refVals)
+            int n = array.size(ids)
+            if n > 0
+                for i = 0 to n - 1
+                    Root r = f_getRoot(e, array.get(ids, i))
+                    if not na(r) and r.category == cat and not r.isRangeRoot
+                        array.push(e.refVals, r.pointPrice)
+                        if cat == CAT_MA
+                            array.push(e.refMa, r.pointPrice)
+                        else
+                            array.push(e.refNonMa, r.pointPrice)
+            if array.size(e.refVals) > 0 and cat != CAT_MA
+                array.push(e.refReps, f_medianScratch(e.refVals))
+    if array.size(e.refMa) > 0
+        float maRep = na
+        if array.size(e.refNonMa) > 0
+            float target = f_medianScratch(e.refNonMa)
+            float bestD = 1e20
+            int mn = array.size(e.refMa)
+            for i = 0 to mn - 1
+                float v = array.get(e.refMa, i)
+                float d = math.abs(v - target)
+                if d < bestD
+                    bestD := d
+                    maRep := v
+        else
+            maRep := f_medianScratch(e.refMa)
+        array.push(e.refReps, maRep)
+    float out = na
+    if array.size(e.refReps) > 0
+        out := f_medianScratch(e.refReps)
+    else
+        out := side == SIDE_SUPPORT ? top : bottom
+    out
+
+f_evalCandidatePrepared(RootSet e, array<int> ids, int side, float bottom, float top,
+                        bool broadContext, bool broadLocalized,
+                        int pointCatMask, int pointHighMask, bool pointHasNonPsych,
+                        int pointMinId, int pointCreated, ZoneCfg c) =>
+    Candidate out = na
+    if array.size(ids) > 0
+        float denseWidth = c.clusterMaxWidth * c.denseRatio
+        int catMask = pointCatMask
+        int highMask = pointHighMask
+        bool hasNonPsych = pointHasNonPsych
+        int minId = na(pointMinId) ? 2147483647 : pointMinId
+        int created = pointCreated
+        int fvgDirMask = 0
+        int fvgCount = 0
+        int fvgFreshCount = 0
+        int fvgStateMask = 0
+        int fvgTfMask = 0
+        int n = array.size(ids)
+        if n > 0
+            for i = 0 to n - 1
+                Root r = f_getRoot(e, array.get(ids, i))
+                if not na(r) and r.category == CAT_FVG and f_rootEligibleSide(r, side)
+                    catMask := f_maskAdd(catMask, f_catBit(CAT_FVG))
+                    hasNonPsych := true
+                    minId := math.min(minId, r.rootId)
+                    created := math.max(created, r.confirmedTime)
+                    fvgCount += 1
+                    if r.fvgFresh
+                        fvgFreshCount += 1
+                    fvgDirMask := f_maskAdd(fvgDirMask, r.direction == FVG_BULLISH ? 1 : 2)
+                    fvgStateMask := f_maskAdd(fvgStateMask, f_bit(math.min(r.state, 20)))
+                    fvgTfMask := f_maskAdd(fvgTfMask, r.tfCode == TF_1H ? 1 : r.tfCode == TF_4H ? 2 : r.tfCode == TF_1D ? 4 : 0)
+                    if (not r.isBroadFvg and (r.tfCode == TF_4H or r.tfCode == TF_1D)) or (r.isBroadFvg and broadLocalized)
+                        highMask := f_maskAdd(highMask, f_catBit(CAT_FVG))
+        if f_pop6(fvgTfMask) >= 2 and fvgCount >= 2
+            highMask := f_maskAdd(highMask, f_catBit(CAT_FVG))
+        int den = broadContext ? DEN_BROAD_CONTEXT : f_widthLe(bottom, top, denseWidth, c.mintick) ? DEN_HIGH : DEN_NORMAL
+        int cc = f_pop6(catMask)
+        int hh = f_pop6(highMask)
+        bool baseStrong = not broadContext and den == DEN_HIGH and ((cc == 2 and hh >= 1) or cc >= 3)
+        if hasNonPsych
+            out := Candidate.new(side = side, rootIds = ids, bottom = bottom, top = top,
+                referencePrice = na, cCount = cc, hCount = hh, density = den, baseStrong = baseStrong,
+                broadContext = broadContext, broadLocalized = broadLocalized, categoryMask = catMask,
+                highMask = highMask, fvgDirectionMask = fvgDirMask, fvgRootCount = fvgCount,
+                fvgFreshCount = fvgFreshCount, fvgStructuralStateMask = fvgStateMask,
+                createdTime = created, minRootId = minId == 2147483647 ? na : minId)
+    out
+
+f_finalizeCandidateReference(RootSet e, Candidate cnd) =>
+    if not na(cnd) and na(cnd.referencePrice)
+        cnd.referencePrice := f_referencePrice(e, cnd.rootIds, cnd.side, cnd.bottom, cnd.top)
+    cnd
+
+f_scoreBetter(int cc, int hh, float bottom, float top, int created, int minId,
+              int bestC, int bestH, float bestBottom, float bestTop, int bestCreated, int bestMinId, bool bestValid) =>
+    bool better = not bestValid
+    if bestValid
+        if cc != bestC
+            better := cc > bestC
+        else if hh != bestH
+            better := hh > bestH
+        else if (top - bottom) != (bestTop - bestBottom)
+            better := (top - bottom) < (bestTop - bestBottom)
+        else if created != bestCreated
+            better := created < bestCreated
+        else
+            better := minId < bestMinId
+    better
+
+f_nextWorkStamp(RootSet e) =>
+    e.workStampSeq += 1
+    e.workStampSeq
+
+f_candidateUsesStamp(RootSet e, Candidate cnd, int stamp) =>
+    bool yes = false
+    int n = array.size(cnd.rootIds)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = f_getRoot(e, array.get(cnd.rootIds, i))
+            if not na(r) and not (r.category == CAT_FVG and r.isBroadFvg) and r.workStamp == stamp
+                yes := true
+                break
+    yes
+
+f_markCandidateUsedStamp(RootSet e, Candidate cnd, int stamp) =>
+    int n = array.size(cnd.rootIds)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = f_getRoot(e, array.get(cnd.rootIds, i))
+            if not na(r) and not (r.category == CAT_FVG and r.isBroadFvg)
+                r.workStamp := stamp
+    true
+
+f_cacheEnsure(RootSet e, int n) =>
+    while array.size(e.cacheEnd) < n
+        array.push(e.cacheEnd, -1)
+        array.push(e.cacheC, 0)
+        array.push(e.cacheH, 0)
+        array.push(e.cacheCreated, 0)
+        array.push(e.cacheMinId, 2147483647)
+        array.push(e.cacheBottom, na)
+        array.push(e.cacheTop, na)
+    true
+
+f_cacheInvalidate(RootSet e, int i) =>
+    array.set(e.cacheEnd, i, -1)
+    array.set(e.cacheC, i, 0)
+    array.set(e.cacheH, i, 0)
+    array.set(e.cacheCreated, i, 0)
+    array.set(e.cacheMinId, i, 2147483647)
+    array.set(e.cacheBottom, i, na)
+    array.set(e.cacheTop, i, na)
+    true
+
+f_fvgScratchEnsure(RootSet e, int n) =>
+    while array.size(e.fvgInsideMask) < n
+        array.push(e.fvgInsideMask, 0)
+        array.push(e.fvgInsideBottom, na)
+        array.push(e.fvgInsideTop, na)
+    true
+
+// Collect live local slots once per Side rebuild. Point order is inherited from
+// the global stable price index, so no per-bar sort is performed.
+f_collectPointSlots(RootSet e, int side, float lo, float hi, ZoneCfg c) =>
+    array.clear(e.workPointSlots)
+    int i = f_pointIndexLowerBound(e, lo)
+    int n = array.size(e.pointPriceIndex)
+    bool done = false
+    while i < n and not done
+        int slot = array.get(e.pointPriceIndex, i)
+        Root r = array.get(e.roots, slot)
+        if not r.alive
+            i += 1
+        else if r.pointPrice > hi
+            done := true
+        else
+            if r.category != CAT_PSYCH and f_categoryEnabled(r.category, c) and f_rootEligibleSide(r, side)
+                array.push(e.workPointSlots, slot)
+            i += 1
+    true
+
+f_collectPsychSlots(RootSet e, int side, float lo, float hi, ZoneCfg c) =>
+    array.clear(e.workPsychSlots)
+    if c.enablePsych
+        int i = f_pointIndexLowerBound(e, lo)
+        int n = array.size(e.pointPriceIndex)
+        bool done = false
+        while i < n and not done
+            int slot = array.get(e.pointPriceIndex, i)
+            Root r = array.get(e.roots, slot)
+            if not r.alive
+                i += 1
+            else if r.pointPrice > hi
+                done := true
+            else
+                if r.category == CAT_PSYCH and f_rootEligibleSide(r, side)
+                    array.push(e.workPsychSlots, slot)
+                i += 1
+    true
+
+f_collectFvgSlots(RootSet e, int side, float lo, float hi, ZoneCfg c) =>
+    array.clear(e.workFvgSlots)
+    if c.enableFVG
+        float padLo = lo - c.clusterMaxWidth
+        float padHi = hi + c.clusterMaxWidth
+        int n = array.size(e.fvgSlots)
+        if n > 0
+            for k = 0 to n - 1
+                int slot = array.get(e.fvgSlots, k)
+                Root r = array.get(e.roots, slot)
+                if r.alive and f_rootEligibleSide(r, side) and f_intersects(r.nativeBottom, r.nativeTop, padLo, padHi, c.mintick)
+                    array.push(e.workFvgSlots, slot)
+    true
+
+// Scores all windows reachable from one start using only primitive state. The
+// best descriptor is written into reusable parallel arrays at startIdx.
+f_scoreStartCache(RootSet e, int startIdx, int side, float widthLimit, bool requireStrong, int stamp, ZoneCfg c) =>
+    f_cacheInvalidate(e, startIdx)
+    int pn = array.size(e.workPointSlots)
+    if startIdx >= 0 and startIdx < pn
+        int startSlot = array.get(e.workPointSlots, startIdx)
+        Root ri = array.get(e.roots, startSlot)
+        if ri.alive and ri.workStamp != stamp
+            array.clear(e.workPairs)
+            // A start can only reach an FVG whose NativeRange/proximal geometry
+            // intersects startPrice +/- widthLimit. Build that exact subset once
+            // for this start, then reuse it for every end window.
+            array.clear(e.workStartFvgSlots)
+            float reachLo = ri.pointPrice - widthLimit
+            float reachHi = ri.pointPrice + widthLimit
+            int allFn = array.size(e.workFvgSlots)
+            if allFn > 0
+                for fi = 0 to allFn - 1
+                    int fs = array.get(e.workFvgSlots, fi)
+                    Root frReach = array.get(e.roots, fs)
+                    if frReach.alive and f_intersects(frReach.nativeBottom, frReach.nativeTop, reachLo, reachHi, c.mintick)
+                        array.push(e.workStartFvgSlots, fs)
+            int fn = array.size(e.workStartFvgSlots)
+            f_fvgScratchEnsure(e, fn)
+            if fn > 0
+                for fi = 0 to fn - 1
+                    array.set(e.fvgInsideMask, fi, 0)
+                    array.set(e.fvgInsideBottom, fi, na)
+                    array.set(e.fvgInsideTop, fi, na)
+
+            float bottom = ri.pointPrice
+            float top = ri.pointPrice
+            int catMask = 0
+            int highMask = 0
+            int minId = 2147483647
+            int created = 0
+            int maN = 0
+            float ma1 = na
+            float ma2 = na
+            int maSlope1 = 0
+            int maSlope2 = 0
+            int accumTfMask = 0
+            int timeOrigin1 = na
+            bool timeMultiOrigin = false
+
+            bool bestValid = false
+            int bestEnd = -1
+            int bestC = 0
+            int bestH = 0
+            int bestCreated = 0
+            int bestMinId = 2147483647
+            float bestBottom = na
+            float bestTop = na
+
+            int j = startIdx
+            bool stopStart = false
+            while j < pn and not stopStart
+                int slotJ = array.get(e.workPointSlots, j)
+                Root rj = array.get(e.roots, slotJ)
+                if not rj.alive or f_widthGt(bottom, rj.pointPrice, widthLimit, c.mintick)
+                    stopStart := true
+                else
+                    if rj.workStamp != stamp
+                        bool pairConflict = rj.category == CAT_ACCUM and rj.pairKey != 0 and f_arrayHasInt(e.workPairs, rj.pairKey)
+                        if pairConflict
+                            stopStart := true
+                        else
+                            if rj.category == CAT_ACCUM and rj.pairKey != 0
+                                array.push(e.workPairs, rj.pairKey)
+                            top := math.max(top, rj.pointPrice)
+                            catMask := f_maskAdd(catMask, f_catBit(rj.category))
+                            minId := math.min(minId, rj.rootId)
+                            created := math.max(created, rj.confirmedTime)
+                            if rj.category == CAT_MA
+                                maN += 1
+                                if maN == 1
+                                    ma1 := rj.pointPrice
+                                    maSlope1 := rj.slopeSign
+                                else if maN == 2
+                                    ma2 := rj.pointPrice
+                                    maSlope2 := rj.slopeSign
+                            else if rj.category == CAT_SWING
+                                bool hiSwing = rj.tfCode == TF_1H or (f_hasBit(rj.tfMask, MASK_5M) and f_hasBit(rj.tfMask, MASK_15M))
+                                if hiSwing
+                                    highMask := f_maskAdd(highMask, f_catBit(CAT_SWING))
+                            else if rj.category == CAT_ACCUM
+                                if rj.tfCode == TF_4H or rj.tfCode == TF_1D
+                                    highMask := f_maskAdd(highMask, f_catBit(CAT_ACCUM))
+                                int tfBit = rj.tfCode == TF_1H ? 1 : rj.tfCode == TF_4H ? 2 : rj.tfCode == TF_1D ? 4 : 0
+                                accumTfMask := f_maskAdd(accumTfMask, tfBit)
+                                if f_pop6(accumTfMask) >= 2 and array.size(e.workPairs) >= 2
+                                    highMask := f_maskAdd(highMask, f_catBit(CAT_ACCUM))
+                            else if rj.category == CAT_TIME_HL
+                                if f_hasBit(rj.labelMask, TL_CUR_WEEK) or f_hasBit(rj.labelMask, TL_PREV_WEEK) or f_hasBit(rj.labelMask, TL_PREV_DAY)
+                                    highMask := f_maskAdd(highMask, f_catBit(CAT_TIME_HL))
+                                if na(timeOrigin1)
+                                    timeOrigin1 := rj.originKey
+                                else if rj.originKey != timeOrigin1
+                                    timeMultiOrigin := true
+                                    highMask := f_maskAdd(highMask, f_catBit(CAT_TIME_HL))
+                            if maN >= 2 and not na(ma1) and not na(ma2) and f_widthLe(math.min(ma1, ma2), math.max(ma1, ma2), c.clusterMaxWidth * c.denseRatio, c.mintick)
+                                bool maSlopeOk = side == SIDE_SUPPORT ? (maSlope1 > 0 and maSlope2 > 0) : (maSlope1 < 0 and maSlope2 < 0)
+                                if maSlopeOk
+                                    highMask := f_maskAdd(highMask, f_catBit(CAT_MA))
+
+                            // Increment FVG-inside summaries only when a point Root
+                            // actually enters the current unused window.
+                            if fn > 0
+                                for fi = 0 to fn - 1
+                                    Root frInside = array.get(e.roots, array.get(e.workStartFvgSlots, fi))
+                                    if f_ge(rj.pointPrice, frInside.nativeBottom, c.mintick) and f_le(rj.pointPrice, frInside.nativeTop, c.mintick)
+                                        int im = array.get(e.fvgInsideMask, fi)
+                                        im := f_maskAdd(im, f_catBit(rj.category))
+                                        array.set(e.fvgInsideMask, fi, im)
+                                        float ib = array.get(e.fvgInsideBottom, fi)
+                                        float it = array.get(e.fvgInsideTop, fi)
+                                        array.set(e.fvgInsideBottom, fi, na(ib) ? rj.pointPrice : math.min(ib, rj.pointPrice))
+                                        array.set(e.fvgInsideTop, fi, na(it) ? rj.pointPrice : math.max(it, rj.pointPrice))
+
+                            // Psych roots are tested independently against the
+                            // original non-psych point window, matching the prior
+                            // implementation exactly.
+                            int pCatMask = catMask
+                            int pHighMask = highMask
+                            int pMinId = minId
+                            int pCreated = created
+                            float pBottom = bottom
+                            float pTop = top
+                            bool usedConflict = false
+                            int psn = array.size(e.workPsychSlots)
+                            if psn > 0
+                                for pi = 0 to psn - 1
+                                    int pslot = array.get(e.workPsychSlots, pi)
+                                    Root pr = array.get(e.roots, pslot)
+                                    float nbp = math.min(bottom, pr.pointPrice)
+                                    float ntp = math.max(top, pr.pointPrice)
+                                    if f_widthLe(nbp, ntp, widthLimit, c.mintick)
+                                        pCatMask := f_maskAdd(pCatMask, f_catBit(CAT_PSYCH))
+                                        pMinId := math.min(pMinId, pr.rootId)
+                                        pCreated := math.max(pCreated, pr.confirmedTime)
+                                        pBottom := math.min(pBottom, pr.pointPrice)
+                                        pTop := math.max(pTop, pr.pointPrice)
+                                        usedConflict := usedConflict or pr.workStamp == stamp
+
+                            float finalBottom = pBottom
+                            float finalTop = pTop
+                            int finalCatMask = pCatMask
+                            int finalHighMask = pHighMask
+                            int finalMinId = pMinId
+                            int finalCreated = pCreated
+                            int fvgTfMask = 0
+                            int fvgCount = 0
+                            bool broadLocalized = false
+                            int preC = f_pop6(f_maskRemove(pCatMask, f_catBit(CAT_FVG)))
+
+                            if fn > 0
+                                for fi = 0 to fn - 1
+                                    int fslot = array.get(e.workStartFvgSlots, fi)
+                                    Root fr = array.get(e.roots, fslot)
+                                    bool inDirty = na(e.dirtyBottom) or f_intersects(fr.nativeBottom, fr.nativeTop, e.dirtyBottom, e.dirtyTop, c.mintick)
+                                    if inDirty
+                                        int insideCatMask = array.get(e.fvgInsideMask, fi)
+                                        float insideBottom = array.get(e.fvgInsideBottom, fi)
+                                        float insideTop = array.get(e.fvgInsideTop, fi)
+                                        bool anyPointInside = insideCatMask != 0
+
+                                        if psn > 0
+                                            for pi = 0 to psn - 1
+                                                int pslot = array.get(e.workPsychSlots, pi)
+                                                Root pr = array.get(e.roots, pslot)
+                                                float nbp = math.min(bottom, pr.pointPrice)
+                                                float ntp = math.max(top, pr.pointPrice)
+                                                bool psychAttached = f_widthLe(nbp, ntp, widthLimit, c.mintick)
+                                                if psychAttached and f_ge(pr.pointPrice, fr.nativeBottom, c.mintick) and f_le(pr.pointPrice, fr.nativeTop, c.mintick)
+                                                    anyPointInside := true
+                                                    insideCatMask := f_maskAdd(insideCatMask, f_catBit(CAT_PSYCH))
+                                                    insideBottom := na(insideBottom) ? pr.pointPrice : math.min(insideBottom, pr.pointPrice)
+                                                    insideTop := na(insideTop) ? pr.pointPrice : math.max(insideTop, pr.pointPrice)
+
+                                        float proximal = side == SIDE_SUPPORT ? fr.nativeTop : fr.nativeBottom
+                                        bool proximalWithinAttach = false
+                                        bool proximalDense = false
+                                        float newBottom = finalBottom
+                                        float newTop = finalTop
+                                        if not na(finalBottom) and not na(finalTop)
+                                            if side == SIDE_SUPPORT and f_ge(finalBottom, proximal, c.mintick)
+                                                newBottom := proximal
+                                                newTop := finalTop
+                                                proximalWithinAttach := f_widthLe(newBottom, newTop, widthLimit, c.mintick)
+                                                proximalDense := f_widthLe(newBottom, newTop, c.clusterMaxWidth * c.denseRatio, c.mintick)
+                                            else if side == SIDE_RESISTANCE and f_le(finalTop, proximal, c.mintick)
+                                                newBottom := finalBottom
+                                                newTop := proximal
+                                                proximalWithinAttach := f_widthLe(newBottom, newTop, widthLimit, c.mintick)
+                                                proximalDense := f_widthLe(newBottom, newTop, c.clusterMaxWidth * c.denseRatio, c.mintick)
+                                        bool attach = false
+                                        bool loc = false
+                                        if not fr.isBroadFvg
+                                            attach := anyPointInside or proximalWithinAttach
+                                            loc := attach
+                                        else
+                                            bool internalHighOther = f_masksIntersect6(insideCatMask, pHighMask)
+                                            bool internalTwoCats = f_pop6(insideCatMask) >= 2 and not na(insideBottom) and f_widthLe(insideBottom, insideTop, c.clusterMaxWidth * c.denseRatio, c.mintick)
+                                            proximalDense := proximalDense and preC >= 1
+                                            attach := internalHighOther or internalTwoCats or proximalDense
+                                            loc := attach
+                                        if attach
+                                            finalCatMask := f_maskAdd(finalCatMask, f_catBit(CAT_FVG))
+                                            finalMinId := math.min(finalMinId, fr.rootId)
+                                            finalCreated := math.max(finalCreated, fr.confirmedTime)
+                                            fvgCount += 1
+                                            int tfBitF = fr.tfCode == TF_1H ? 1 : fr.tfCode == TF_4H ? 2 : fr.tfCode == TF_1D ? 4 : 0
+                                            fvgTfMask := f_maskAdd(fvgTfMask, tfBitF)
+                                            broadLocalized := broadLocalized or (fr.isBroadFvg and loc)
+                                            if (not fr.isBroadFvg and (fr.tfCode == TF_4H or fr.tfCode == TF_1D)) or (fr.isBroadFvg and loc)
+                                                finalHighMask := f_maskAdd(finalHighMask, f_catBit(CAT_FVG))
+                                            if proximalWithinAttach and not anyPointInside
+                                                finalBottom := newBottom
+                                                finalTop := newTop
+                                            if not fr.isBroadFvg and fr.workStamp == stamp
+                                                usedConflict := true
+                            if f_pop6(fvgTfMask) >= 2 and fvgCount >= 2
+                                finalHighMask := f_maskAdd(finalHighMask, f_catBit(CAT_FVG))
+
+                            int cc = f_pop6(finalCatMask)
+                            int hh = f_pop6(finalHighMask)
+                            int den = f_widthLe(finalBottom, finalTop, c.clusterMaxWidth * c.denseRatio, c.mintick) ? DEN_HIGH : DEN_NORMAL
+                            bool strong = den == DEN_HIGH and ((cc == 2 and hh >= 1) or cc >= 3)
+                            bool valid = not usedConflict and (not requireStrong or strong)
+                            if valid and f_scoreBetter(cc, hh, finalBottom, finalTop, finalCreated, finalMinId,
+                                bestC, bestH, bestBottom, bestTop, bestCreated, bestMinId, bestValid)
+                                bestValid := true
+                                bestEnd := j
+                                bestC := cc
+                                bestH := hh
+                                bestBottom := finalBottom
+                                bestTop := finalTop
+                                bestCreated := finalCreated
+                                bestMinId := finalMinId
+                    j += 1
+
+            if bestValid
+                array.set(e.cacheEnd, startIdx, bestEnd)
+                array.set(e.cacheC, startIdx, bestC)
+                array.set(e.cacheH, startIdx, bestH)
+                array.set(e.cacheCreated, startIdx, bestCreated)
+                array.set(e.cacheMinId, startIdx, bestMinId)
+                array.set(e.cacheBottom, startIdx, bestBottom)
+                array.set(e.cacheTop, startIdx, bestTop)
+    true
+
+f_cacheBestIndex(RootSet e, int n) =>
+    int bestIdx = na
+    if n > 0
+        for i = 0 to n - 1
+            int en = array.get(e.cacheEnd, i)
+            if en >= 0
+                bool better = na(bestIdx)
+                if not better
+                    int bc = array.get(e.cacheC, bestIdx)
+                    int bh = array.get(e.cacheH, bestIdx)
+                    float bb = array.get(e.cacheBottom, bestIdx)
+                    float bt = array.get(e.cacheTop, bestIdx)
+                    int bcr = array.get(e.cacheCreated, bestIdx)
+                    int bmi = array.get(e.cacheMinId, bestIdx)
+                    better := f_scoreBetter(array.get(e.cacheC, i), array.get(e.cacheH, i),
+                        array.get(e.cacheBottom, i), array.get(e.cacheTop, i), array.get(e.cacheCreated, i),
+                        array.get(e.cacheMinId, i), bc, bh, bb, bt, bcr, bmi, true)
+                if better
+                    bestIdx := i
+    bestIdx
+
+f_materializePointCandidate(RootSet e, int startIdx, int endIdx, int side, float widthLimit, int stamp, ZoneCfg c) =>
+    Candidate out = na
+    array<int> ids = array.new<int>()
+    float bottom = na
+    float top = na
+    int pn = array.size(e.workPointSlots)
+    if startIdx >= 0 and endIdx >= startIdx and endIdx < pn
+        for k = startIdx to endIdx
+            Root r = array.get(e.roots, array.get(e.workPointSlots, k))
+            if r.alive and r.workStamp != stamp
+                array.push(ids, r.rootId)
+                bottom := na(bottom) ? r.pointPrice : math.min(bottom, r.pointPrice)
+                top := na(top) ? r.pointPrice : math.max(top, r.pointPrice)
+    if array.size(ids) > 0
+        float baseBottom = bottom
+        float baseTop = top
+        int psn = array.size(e.workPsychSlots)
+        if psn > 0
+            for pi = 0 to psn - 1
+                Root pr = array.get(e.roots, array.get(e.workPsychSlots, pi))
+                float nb = math.min(baseBottom, pr.pointPrice)
+                float nt = math.max(baseTop, pr.pointPrice)
+                if f_widthLe(nb, nt, widthLimit, c.mintick)
+                    array.push(ids, pr.rootId)
+                    bottom := math.min(bottom, pr.pointPrice)
+                    top := math.max(top, pr.pointPrice)
+        array.clear(e.workTempIds)
+        int fn = array.size(e.workFvgSlots)
+        if fn > 0
+            for fi = 0 to fn - 1
+                Root fr = array.get(e.roots, array.get(e.workFvgSlots, fi))
+                array.push(e.workTempIds, fr.rootId)
+        [allIds, cb, ct, broadLoc, pointMask, pointHigh, pointNonPsych, pointMin, pointCreated] = f_attachFvgs(e, ids, e.workTempIds, side, bottom, top, widthLimit, c)
+        out := f_evalCandidatePrepared(e, allIds, side, cb, ct, false, broadLoc,
+            pointMask, pointHigh, pointNonPsych, pointMin, pointCreated, c)
+    out
+
+f_startDependsOnSelected(RootSet e, int startIdx, Candidate selected, int stamp, float widthLimit, ZoneCfg c) =>
+    bool affected = false
+    int pn = array.size(e.workPointSlots)
+    if startIdx >= 0 and startIdx < pn
+        Root sr = array.get(e.roots, array.get(e.workPointSlots, startIdx))
+        float sp = sr.pointPrice
+        int rn = array.size(selected.rootIds)
+        if rn > 0
+            for rix = 0 to rn - 1
+                Root r = f_getRoot(e, array.get(selected.rootIds, rix))
+                if not na(r) and r.workStamp == stamp
+                    if r.category == CAT_FVG
+                        float lo = sp - widthLimit
+                        float hi = sp + widthLimit
+                        affected := f_intersects(r.nativeBottom, r.nativeTop, lo, hi, c.mintick)
+                    else if r.category == CAT_PSYCH
+                        affected := math.abs(r.pointPrice - sp) <= widthLimit
+                    else
+                        affected := f_ge(r.pointPrice, sp, c.mintick) and f_widthLe(sp, r.pointPrice, widthLimit, c.mintick)
+                if affected
+                    break
+    affected
+
+f_selectPointCandidatesLight(RootSet e, int side, float widthLimit, bool requireStrong,
+                             int stamp, array<Candidate> selected, ZoneCfg c) =>
+    int n = array.size(e.workPointSlots)
+    f_cacheEnsure(e, n)
+    if n > 0
+        for i = 0 to n - 1
+            f_scoreStartCache(e, i, side, widthLimit, requireStrong, stamp, c)
+        bool keepGoing = true
+        while keepGoing
+            int bestIdx = f_cacheBestIndex(e, n)
+            if na(bestIdx)
+                keepGoing := false
+            else
+                int bestEnd = array.get(e.cacheEnd, bestIdx)
+                Candidate best = f_materializePointCandidate(e, bestIdx, bestEnd, side, widthLimit, stamp, c)
+                bool valid = not na(best) and (not requireStrong or best.baseStrong) and not f_candidateUsesStamp(e, best, stamp)
+                if not valid
+                    // Exact fallback: invalidate only this cached descriptor and let
+                    // the remaining exact cache entries compete. This path should be
+                    // rare and never converts an uncertain candidate into an empty result.
+                    f_cacheInvalidate(e, bestIdx)
+                else
+                    f_finalizeCandidateReference(e, best)
+                    array.push(selected, best)
+                    f_markCandidateUsedStamp(e, best, stamp)
+                    for i = 0 to n - 1
+                        if f_startDependsOnSelected(e, i, best, stamp, widthLimit, c)
+                            f_scoreStartCache(e, i, side, widthLimit, requireStrong, stamp, c)
+    true
+
+f_candidateContainsRoot(Candidate cnd, int id) => not na(cnd) and f_arrayHasInt(cnd.rootIds, id)
+
+f_selectedContainsNonBroadRoot(RootSet e, array<Candidate> selected, int rootId) =>
+    bool found = false
+    Root rr = f_getRoot(e, rootId)
+    if not na(rr) and not (rr.category == CAT_FVG and rr.isBroadFvg)
+        int n = array.size(selected)
+        if n > 0
+            for i = 0 to n - 1
+                Candidate cnd = array.get(selected, i)
+                if f_candidateContainsRoot(cnd, rootId)
+                    found := true
+                    break
+    found
+
+f_buildFvgCandidatesLight(RootSet e, int side, array<Candidate> selected, int stamp, ZoneCfg c) =>
+    int fN = array.size(e.workFvgSlots)
+    if fN > 0
+        for fi = 0 to fN - 1
+            Root r = array.get(e.roots, array.get(e.workFvgSlots, fi))
+            bool rUsed = not r.isBroadFvg and r.workStamp == stamp
+            bool inDirty = na(e.dirtyBottom) or f_intersects(r.nativeBottom, r.nativeTop, e.dirtyBottom, e.dirtyTop, c.mintick)
+            bool already = rUsed or f_selectedContainsNonBroadRoot(e, selected, r.rootId)
+            if inDirty and (r.isBroadFvg or not already)
+                array.clear(e.workTempIds)
+                array.push(e.workTempIds, r.rootId)
+                float ob = r.nativeBottom
+                float ot = r.nativeTop
+                if fi + 1 < fN
+                    for fj = fi + 1 to fN - 1
+                        Root q = array.get(e.roots, array.get(e.workFvgSlots, fj))
+                        bool qAvailable = q.isBroadFvg or q.workStamp != stamp
+                        if qAvailable and q.rootId != r.rootId and q.direction == r.direction
+                            float nb = math.max(ob, q.nativeBottom)
+                            float nt = math.min(ot, q.nativeTop)
+                            if f_le(nb, nt, c.mintick)
+                                f_arrayAddUnique(e.workTempIds, q.rootId)
+                                ob := nb
+                                ot := nt
+                int fn = array.size(e.workTempIds)
+                bool context = fn == 1 and r.isBroadFvg
+                array<int> ownedIds = f_copyInts(e.workTempIds)
+                Candidate fc = f_evalCandidatePrepared(e, ownedIds, side,
+                    context ? r.nativeBottom : ob, context ? r.nativeTop : ot,
+                    context, false, 0, 0, false, na, 0, c)
+                if not na(fc)
+                    f_finalizeCandidateReference(e, fc)
+                    array.push(selected, fc)
+                    // All selected normal Roots are single-use on the same Side.
+                    // Broad FVG is the sole sharing exception in the specification.
+                    f_markCandidateUsedStamp(e, fc, stamp)
+    true
+
+f_buildSideCandidates(RootSet e, int side, float baseClose, int baseSeq, int baseCloseTime, ZoneCfg c) =>
+    var array<Candidate> selected = array.new<Candidate>()
+    array.clear(selected)
+    float lo = na(e.dirtyBottom) ? baseClose - c.dormantDistance : e.dirtyBottom
+    float hi = na(e.dirtyTop) ? baseClose + c.dormantDistance : e.dirtyTop
+    f_ensurePsychNearForBuild(e, lo, hi, baseSeq, baseCloseTime, c)
+
+    f_collectPointSlots(e, side, lo, hi, c)
+    f_collectPsychSlots(e, side, lo - c.clusterMaxWidth, hi + c.clusterMaxWidth, c)
+    f_collectFvgSlots(e, side, lo, hi, c)
+    int stamp = f_nextWorkStamp(e)
+    float denseWidth = c.clusterMaxWidth * c.denseRatio
+
+    // Stage A: exact Dense Base-Strong greedy selection using primitive caches.
+    f_selectPointCandidatesLight(e, side, denseWidth, true, stamp, selected, c)
+
+    // Stage B: FVG standalone/overlap/Broad context. Broad FVG may be shared.
+    f_buildFvgCandidatesLight(e, side, selected, stamp, c)
+
+    // Stage C: remaining normal point Roots. Stage-A work stamps stay active.
+    f_selectPointCandidatesLight(e, side, c.clusterMaxWidth, false, stamp, selected, c)
+    selected
+
+// ============================================================================
+// Public Root construction
+//
+// Every Root a caller adds is already confirmed: this library never decides
+// when a Swing, an Accum box or an FVG came into existence.
+// ============================================================================
+export addPointRoot(RootSet e, int category, int subtype, int tfCode, int tfMask,
+                    int originTime, int originEndTime, int confirmedTime, float price,
+                    int pairKey, int labelMask, int slopeSign, bool isDynamic, ZoneCfg c) =>
+    float p = f_norm(price, c.mintick)
+    int id = f_newRoot(e, na, e.nextRootId, category, subtype, tfCode, tfMask, originTime,
+         originEndTime, confirmedTime, p, p, p, false, isDynamic, ROOT_ACTIVE, pairKey,
+         FVG_NONE, false, false, labelMask, 0, slopeSign)
+    Root r = f_getRoot(e, id)
+    r.originKey := id
+    id
+
+export addFvgRoot(RootSet e, int tfCode, int direction, float nativeBottom, float nativeTop,
+                  int originTime, int confirmedTime, bool fresh, int state, ZoneCfg c) =>
+    float b = f_norm(math.min(nativeBottom, nativeTop), c.mintick)
+    float t = f_norm(math.max(nativeBottom, nativeTop), c.mintick)
+    bool broad = f_widthGt(b, t, c.clusterMaxWidth, c.mintick)
+    int id = f_newRoot(e, na, e.nextRootId, CAT_FVG, SUB_FVG, tfCode, 0, originTime,
+         confirmedTime, confirmedTime, na, b, t, true, false, state, 0, direction, fresh,
+         broad, 0, 0, 0)
+    Root r = f_getRoot(e, id)
+    r.originKey := id
+    id
+
+// A Root already carrying a Time H/L label, merged onto the same real event.
+export mergeTimeLabel(RootSet e, int rootId, int labelMask) =>
+    Root r = f_getRoot(e, rootId)
+    if not na(r)
+        r.labelMask := f_maskUnion(r.labelMask, labelMask)
+    true
+
+export findTimeRootSameOrigin(RootSet e, int subtype, float price, int originTime, ZoneCfg c) =>
+    int found = na
+    int n = array.size(e.timeSlots)
+    if n > 0
+        float p = f_norm(price, c.mintick)
+        for k = 0 to n - 1
+            Root r = array.get(e.roots, array.get(e.timeSlots, k))
+            if r.alive and r.subtype == subtype and r.originTime == originTime and f_eq(r.pointPrice, p, c.mintick)
+                found := r.rootId
+                break
+    found
+
+// ============================================================================
+// Public Candidate build
+//
+// `winBottom` / `winTop` is the price window the caller wants Candidates for.
+// Psychological levels are DERIVED here from the non-psychological Roots in the
+// window; they are never stored by the caller and never form a Zone alone.
+// ============================================================================
+export buildCandidates(RootSet e, ZoneCfg c, int side, float winBottom, float winTop,
+                       float referenceClose, int seq, int nowTime) =>
+    e.dirtyBottom := winBottom
+    e.dirtyTop := winTop
+    array<Candidate> found = f_buildSideCandidates(e, side, referenceClose, seq, nowTime, c)
+    // The internal selection buffer is reused between calls, so the result is
+    // copied out. Without this, asking for Support and then Resistance would
+    // hand back the same array twice.
+    array<Candidate> out = array.new<Candidate>()
+    int n = array.size(found)
+    if n > 0
+        for i = 0 to n - 1
+            array.push(out, array.get(found, i))
+    out
+
+// Convenience accessors so a consumer does not need the Candidate internals.
+export candidateRootIds(Candidate cnd) => cnd.rootIds
+export candidateBottom(Candidate cnd) => cnd.bottom
+export candidateTop(Candidate cnd) => cnd.top
+export candidateReference(Candidate cnd) => cnd.referencePrice
+export candidateC(Candidate cnd) => cnd.cCount
+export candidateH(Candidate cnd) => cnd.hCount
+export candidateDensity(Candidate cnd) => cnd.density
+export candidateBaseStrong(Candidate cnd) => cnd.baseStrong
+export candidateBroadContext(Candidate cnd) => cnd.broadContext
+export candidateCategoryMask(Candidate cnd) => cnd.categoryMask
+export candidateHighMask(Candidate cnd) => cnd.highMask
+export candidateFvgDirectionMask(Candidate cnd) => cnd.fvgDirectionMask
+export candidateFvgRootCount(Candidate cnd) => cnd.fvgRootCount
+export candidateFvgFreshCount(Candidate cnd) => cnd.fvgFreshCount
+export candidateFvgStateMask(Candidate cnd) => cnd.fvgStructuralStateMask
+export candidateCreatedTime(Candidate cnd) => cnd.createdTime
+export candidateMinRootId(Candidate cnd) => cnd.minRootId
+
+export sideName(int side) => side == SIDE_SUPPORT ? "Support" : side == SIDE_RESISTANCE ? "Resistance" : "None"
+export densityName(int density) => density == DEN_HIGH ? "High" : density == DEN_NORMAL ? "Normal" : "BroadContext"
+export categoryTag(int category) => category == CAT_MA ? "MA" : category == CAT_SWING ? "SW" : category == CAT_ACCUM ? "AC" : category == CAT_TIME_HL ? "TH" : category == CAT_FVG ? "FVG" : "PSY"
+
+export rootSummary(RootSet e, array<int> ids) =>
+    string s = ""
+    int n = array.size(ids)
+    if n > 0
+        for i = 0 to n - 1
+            Root r = f_getRoot(e, array.get(ids, i))
+            if not na(r)
+                s += (str.length(s) == 0 ? "" : ",") + categoryTag(r.category) + "#" + str.tostring(r.rootId)
+    s
+
+export sideConstSupport() => SIDE_SUPPORT
+export sideConstResistance() => SIDE_RESISTANCE
+export densityConstHigh() => DEN_HIGH
+export fvgDirBullish() => FVG_BULLISH
+export fvgDirBearish() => FVG_BEARISH
+export rootStateActive() => ROOT_ACTIVE
+export rootStateInverseWait() => ROOT_INVERSE_WAIT
+export rootStateInverseActive() => ROOT_INVERSE_ACTIVE
+export catMA() => CAT_MA
+export catSwing() => CAT_SWING
+export catAccum() => CAT_ACCUM
+export catTimeHL() => CAT_TIME_HL
+export catFVG() => CAT_FVG
+export subSwingHigh() => SUB_SWING_HIGH
+export subSwingLow() => SUB_SWING_LOW
+export subAccumTop() => SUB_ACCUM_TOP
+export subAccumBottom() => SUB_ACCUM_BOTTOM
+export subTimeHigh() => SUB_TIME_HIGH
+export subTimeLow() => SUB_TIME_LOW
+export subMA2000() => SUB_MA_2000
+export subMA3000() => SUB_MA_3000
