@@ -610,6 +610,10 @@ export type ZoneEngine
     array<int>   rootFreeSlots
     array<int>   rootLiveSlots
     array<int>   rootIdOrderSlots
+    // W02 Batch 4 : I11-1 Root ID -> rootSlot. Live keys only: a freed Root ID is
+    // removed from the map, ID_NONE is never a key, and one rootId never maps to
+    // two slots. A map hit alone is not ownership proof (see the Batch 2 helpers).
+    map<int, int> rootIdToSlot
 
     // ---- Core SoA (A6.8), index = coreSlot ----
     array<int>   coreIds
@@ -642,6 +646,10 @@ export type ZoneEngine
     array<bool>  coreSlotLiveFlags
     array<int>   coreFreeSlots
     array<int>   coreLiveSlots
+    // W02 Batch 4 : I11-8 Core ID -> coreSlot. Keys are the Core IDs whose slot is
+    // currently owned, Dormant Cores included: only a free removes a key. ID_NONE is
+    // never a key, and Support / Resistance never get separate keys.
+    map<int, int> coreIdToSlot
 
     // ---- Side SoA (A6.3 SideHistory), index = sideSlot = coreSlot * 2 + sideIndex ----
     array<int>   sideTouchCounts
@@ -721,6 +729,8 @@ export newEngine(ZoneCfg cfg) =>
     e.rootFreeSlots             := array.new_int(0)
     e.rootLiveSlots             := array.new_int(0)
     e.rootIdOrderSlots          := array.new_int(0)
+    // W02 Batch 4 : per-Engine Root ID index, never a global.
+    e.rootIdToSlot              := map.new<int, int>()
 
     e.coreIds                   := array.new_int(0)
     e.coreGenerationIds         := array.new_int(0)
@@ -735,6 +745,8 @@ export newEngine(ZoneCfg cfg) =>
     e.coreSlotLiveFlags         := array.new_bool(0)
     e.coreFreeSlots             := array.new_int(0)
     e.coreLiveSlots             := array.new_int(0)
+    // W02 Batch 4 : per-Engine Core ID index, never a global.
+    e.coreIdToSlot              := map.new<int, int>()
 
     e.sideTouchCounts           := array.new_int(0)
     e.sideWeakByTouchFlags      := array.new_bool(0)
@@ -793,9 +805,13 @@ export newEngine(ZoneCfg cfg) =>
 // Source: I6.2, I17.1, D02, D12
 //
 // Internal only. These three helpers own the physical Root slot lifecycle of the
-// Root SoA and of the Batch 1 lifecycle arrays, and nothing else:
-//   - no Root ID -> slot index, no origin index, no price order, no
-//     category/tf/state index, no participation index
+// Root SoA, of the Batch 1 lifecycle arrays and of the Batch 4 Root ID index, and
+// nothing else:
+//   - Batch 2 built the raw lifecycle; Batch 4 connected the I11-1
+//     Root ID -> rootSlot index (rootIdToSlot) into the alloc / free paths below,
+//     where a free also requires the index entry to agree with the slot
+//   - still not connected: origin tuple index, price order, category/tf/state
+//     index, participation index
 //   - no revision increment (I9 revisions stay untouched here)
 //   - no Root content (category, price, tick, time, state semantics)
 // They are therefore not wired into any Stage or Public API in this Batch:
@@ -886,6 +902,9 @@ rootAllocSlotRaw(ZoneEngine engine) =>
     // Step 4 : slot ownership starts. rootIds[rootSlot] is the ownership token.
     array.set(engine.rootIds,           rootSlot, newRootId)
     array.set(engine.rootSlotLiveFlags, rootSlot, true)
+    // W02 Batch 4 : I11-1 index entry for the new Root ID. Root IDs are never
+    // reused, so this key is always new and is never written twice.
+    map.put(engine.rootIdToSlot, newRootId, rootSlot)
     // Step 5 : Live collection. One push per ownership start, never twice.
     array.push(engine.rootLiveSlots, rootSlot)
     // Step 6 : Root ID order. Root IDs increase monotonically and are never reused,
@@ -903,6 +922,10 @@ rootFreeSlotRaw(ZoneEngine engine, int rootSlot) =>
     // Step 1 : validity
     bool validSlot = rootSlot >= 0 and rootSlot < array.size(engine.rootIds)
     bool isLive    = validSlot and array.get(engine.rootSlotLiveFlags, rootSlot)
+    // W02 Batch 4 Step A : the Root ID owning this slot, read before any mutation.
+    int  oldRootId = isLive ? array.get(engine.rootIds, rootSlot) : ID_NONE
+    // W02 Batch 4 Step B : the I11-1 index must already agree with this slot.
+    bool idIndexValid = isLive and oldRootId != ID_NONE and map.contains(engine.rootIdToSlot, oldRootId) and map.get(engine.rootIdToSlot, oldRootId) == rootSlot
     bool freed     = false
     if isLive
         // Step 2 : position inside rootLiveSlots. The index always advances.
@@ -921,8 +944,9 @@ rootFreeSlotRaw(ZoneEngine engine, int rootSlot) =>
                 idOrderPos := k
             else
                 k += 1
-        // Step 4 : atomic guard. Either both positions exist or nothing is mutated.
-        if livePos != SLOT_INVALID and idOrderPos != SLOT_INVALID
+        // Step 4 : atomic guard. Both positions and the ID index entry must agree,
+        // otherwise nothing is mutated and the inconsistency is never repaired here.
+        if livePos != SLOT_INVALID and idOrderPos != SLOT_INVALID and idIndexValid
             // Step 5 : rootLiveSlots has no order semantics -> swap-pop.
             int liveLastPos = array.size(engine.rootLiveSlots) - 1
             if livePos != liveLastPos
@@ -936,6 +960,9 @@ rootFreeSlotRaw(ZoneEngine engine, int rootSlot) =>
                 array.set(engine.rootIdOrderSlots, j, array.get(engine.rootIdOrderSlots, j + 1))
                 j += 1
             array.pop(engine.rootIdOrderSlots)
+            // W02 Batch 4 Step D : the freed Root ID leaves the I11-1 index. A freed
+            // Root ID is never kept as a stale key and is never re-added.
+            map.remove(engine.rootIdToSlot, oldRootId)
             // Step 7 : field reset, including rootSlotLiveFlags -> false.
             rootResetSlotRaw(engine, rootSlot)
             // Step 8 : freed slot enters the free stack exactly once.
@@ -952,9 +979,12 @@ rootFreeSlotRaw(ZoneEngine engine, int rootSlot) =>
 // the physical Core slot and its two flattened Side slots
 // (sideSlot = coreSlot * 2 + sideIndex, sideIndex 0 = Support, 1 = Resistance)
 // and nothing else:
-//   - no Core ID -> slot index, no Phase index, no Root participation, no Zone
-//     origin Root set, no TouchMark block / ring, no Snapshot, no PendingTopology,
-//     no PendingGeneration
+//   - Batch 3 built the raw lifecycle; Batch 4 connected the I11-8
+//     Core ID -> coreSlot index (coreIdToSlot) into the alloc / free paths below,
+//     where a free also requires the index entry to agree with the slot
+//   - still not connected: Phase index, Root participation, Zone origin Root set,
+//     range / topology index, TouchMark block / ring, Snapshot, PendingTopology,
+//     PendingGeneration
 //   - no revision increment (I9 revisions stay untouched here)
 //   - no Generation start: nextGenerationId is never read or written and
 //     coreGenerationIds stays ID_NONE. Physical slot ownership and the logical Zone
@@ -1144,6 +1174,9 @@ coreAllocSlotRaw(ZoneEngine engine) =>
     // Step 6 : slot ownership starts. coreIds[coreSlot] is the ownership token.
     array.set(engine.coreIds,           coreSlot, newCoreId)
     array.set(engine.coreSlotLiveFlags, coreSlot, true)
+    // W02 Batch 4 : I11-8 index entry for the new Core ID. Core IDs are never
+    // reused, so this key is always new and is never written twice.
+    map.put(engine.coreIdToSlot, newCoreId, coreSlot)
     // Step 7 : held-Core collection. One push per ownership start, never one per Side.
     array.push(engine.coreLiveSlots, coreSlot)
     // Step 8
@@ -1160,6 +1193,10 @@ coreFreeSlotRaw(ZoneEngine engine, int coreSlot) =>
     // Step 1 : validity
     bool validSlot = coreSlot >= 0 and coreSlot < array.size(engine.coreIds)
     bool isLive    = validSlot and array.get(engine.coreSlotLiveFlags, coreSlot)
+    // W02 Batch 4 Step A : the Core ID owning this slot, read before any mutation.
+    int  oldCoreId = isLive ? array.get(engine.coreIds, coreSlot) : ID_NONE
+    // W02 Batch 4 Step B : the I11-8 index must already agree with this slot.
+    bool idIndexValid = isLive and oldCoreId != ID_NONE and map.contains(engine.coreIdToSlot, oldCoreId) and map.get(engine.coreIdToSlot, oldCoreId) == coreSlot
     bool freed     = false
     if isLive
         // Step 2 : position inside coreLiveSlots. The index always advances.
@@ -1170,14 +1207,18 @@ coreFreeSlotRaw(ZoneEngine engine, int coreSlot) =>
                 livePos := i
             else
                 i += 1
-        // Step 3 : atomic guard. Without the position nothing is mutated.
-        if livePos != SLOT_INVALID
+        // Step 3 : atomic guard. The position and the ID index entry must agree,
+        // otherwise nothing is mutated and the inconsistency is never repaired here.
+        if livePos != SLOT_INVALID and idIndexValid
             // Step 4 : coreLiveSlots carries no public View or Merge / Split order
             // semantics -> swap-pop.
             int lastPos = array.size(engine.coreLiveSlots) - 1
             if livePos != lastPos
                 array.set(engine.coreLiveSlots, livePos, array.get(engine.coreLiveSlots, lastPos))
             array.pop(engine.coreLiveSlots)
+            // W02 Batch 4 Step D : the freed Core ID leaves the I11-8 index. A freed
+            // Core ID is never kept as a stale key and is never re-added.
+            map.remove(engine.coreIdToSlot, oldCoreId)
             // Step 5 : Core 8 + coreSlotLiveFlags + Support 26 + Resistance 26 reset.
             coreResetSlotRaw(engine, coreSlot)
             // Step 6 : freed slot enters the free stack exactly once. Physical array
