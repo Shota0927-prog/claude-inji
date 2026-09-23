@@ -4148,70 +4148,6 @@ rootAllocSlotRaw(ZoneEngine engine) =>
     // Step 7
     rootSlot
 
-// Moves one currently Live physical Root slot back to the free state.
-// Returns true only when the slot was freed. An invalid slot, a non-live slot or a
-// lifecycle collection that does not hold the slot returns false with no mutation:
-// this raw helper never repairs an inconsistent lifecycle state by itself and never
-// raises runtime.error.
-rootFreeSlotRaw(ZoneEngine engine, int rootSlot) =>
-    // Step 1 : validity
-    bool validSlot = rootSlot >= 0 and rootSlot < array.size(engine.rootIds)
-    bool isLive    = validSlot and array.get(engine.rootSlotLiveFlags, rootSlot)
-    // W02 Batch 4 Step A : the Root ID owning this slot, read before any mutation.
-    int  oldRootId = isLive ? array.get(engine.rootIds, rootSlot) : ID_NONE
-    // W02 Batch 4 Step B : the I11-1 index must already agree with this slot.
-    bool idIndexValid = isLive and oldRootId != ID_NONE and map.contains(engine.rootIdToSlot, oldRootId) and map.get(engine.rootIdToSlot, oldRootId) == rootSlot
-    bool freed     = false
-    if isLive
-        // Step 2 : position inside rootLiveSlots. The index always advances.
-        int livePos = SLOT_INVALID
-        int i = 0
-        while i < array.size(engine.rootLiveSlots) and livePos == SLOT_INVALID
-            if array.get(engine.rootLiveSlots, i) == rootSlot
-                livePos := i
-            else
-                i += 1
-        // Step 3 : position inside rootIdOrderSlots. The index always advances.
-        int idOrderPos = SLOT_INVALID
-        int k = 0
-        while k < array.size(engine.rootIdOrderSlots) and idOrderPos == SLOT_INVALID
-            if array.get(engine.rootIdOrderSlots, k) == rootSlot
-                idOrderPos := k
-            else
-                k += 1
-        // Step 4 : atomic guard. Both positions and the ID index entry must agree,
-        // otherwise nothing is mutated and the inconsistency is never repaired here.
-        if livePos != SLOT_INVALID and idOrderPos != SLOT_INVALID and idIndexValid
-            // W02 Batch 29 : every participation edge of this Root is released before
-            // any Root lifecycle state is written (I11-7). The detach-all helper is
-            // itself all-or-nothing, so a false here leaves the participation index
-            // and the Root equally untouched and this free simply does not happen.
-            bool participationDetached = participationDetachAllForRootRaw(engine, rootSlot)
-            if participationDetached
-                // Step 5 : rootLiveSlots has no order semantics -> swap-pop.
-                int liveLastPos = array.size(engine.rootLiveSlots) - 1
-                if livePos != liveLastPos
-                    array.set(engine.rootLiveSlots, livePos, array.get(engine.rootLiveSlots, liveLastPos))
-                array.pop(engine.rootLiveSlots)
-                // Step 6 : rootIdOrderSlots must keep Root ID ascending order ->
-                // order preserving shift with array.set / array.get, then pop.
-                int idSize = array.size(engine.rootIdOrderSlots)
-                int j = idOrderPos
-                while j < idSize - 1
-                    array.set(engine.rootIdOrderSlots, j, array.get(engine.rootIdOrderSlots, j + 1))
-                    j += 1
-                array.pop(engine.rootIdOrderSlots)
-                // W02 Batch 4 Step D : the freed Root ID leaves the I11-1 index. A freed
-                // Root ID is never kept as a stale key and is never re-added.
-                map.remove(engine.rootIdToSlot, oldRootId)
-                // Step 7 : field reset, including rootSlotLiveFlags -> false.
-                rootResetSlotRaw(engine, rootSlot)
-                // Step 8 : freed slot enters the free stack exactly once.
-                array.push(engine.rootFreeSlots, rootSlot)
-                freed := true
-    // Step 9
-    freed
-
 // ============================================================
 // W02 Batch 49 : Root float + tick raw write foundation
 // Source: I6.4, D12
@@ -5302,6 +5238,296 @@ rootSetDetachAllRaw(ZoneEngine engine, int rootSlot) =>
         array.set(engine.rootStateSetPositions, rootSlot, SLOT_INVALID)
         detached := true
     detached
+
+// ============================================================
+// W03 Batch 13 : rootFreeSlotRaw moved here and wired to every W03 index
+// Source: I6.2, I11-1 .. I11-7, I17.1, D02, D12
+//
+// Moved below rootSetDetachAllRaw only so that every detach helper it calls is
+// defined first (Pine definition-before-use); the signature is unchanged.
+// A free now releases the Root from every index it belongs to before the slot is
+// reset, in this order:
+//   1. lifecycle ownership (Root ID index, rootLiveSlots, rootIdOrderSlots)
+//   2. read-only preflight of every non-participation index, including the entry
+//      each swap-pop / shift would move: general Category / TF / state sets,
+//      origin bucket, the common price order (point Roots) or the NativeRange
+//      orders (FVG), the Accum pair side (Accum), the FVG non-price sets (FVG)
+//   3. participation detach-all (all-or-nothing; false = nothing mutated)
+//   4. origin -> price index -> Category-specific -> general sets, each already
+//      proven by step 2, then the existing lifecycle detach / reset / free stack
+// A Root is reset only after it has left every index. No rollback, no repair and
+// no runtime.error; an inconsistency anywhere returns false with zero mutation.
+// A non-FVG Root must hold no FVG position, an FVG Root no common price-order
+// position. An FVG is freeable only while ACTIVE or INVALIDATED: W03 defines no
+// Inverse or Retired FVG free. No revision is written, and W03 has no call site.
+// ============================================================
+
+// Moves one currently Live physical Root slot back to the free state.
+// Returns true only when the slot was freed. An invalid slot, a non-live slot, a
+// lifecycle collection that does not hold the slot, or any index membership that
+// is not exactly consistent returns false with no mutation: this raw helper never
+// repairs an inconsistent state by itself and never raises runtime.error.
+rootFreeSlotRaw(ZoneEngine engine, int rootSlot) =>
+    // Step 1 : validity
+    bool validSlot = rootSlot >= 0 and rootSlot < array.size(engine.rootIds)
+    bool isLive    = validSlot and array.get(engine.rootSlotLiveFlags, rootSlot)
+    // W02 Batch 4 Step A : the Root ID owning this slot, read before any mutation.
+    int  oldRootId = isLive ? array.get(engine.rootIds, rootSlot) : ID_NONE
+    // W02 Batch 4 Step B : the I11-1 index must already agree with this slot.
+    bool idIndexValid = isLive and oldRootId != ID_NONE and map.contains(engine.rootIdToSlot, oldRootId) and map.get(engine.rootIdToSlot, oldRootId) == rootSlot
+    bool freed     = false
+    if isLive
+        // Step 2 : position inside rootLiveSlots. The index always advances.
+        int livePos = SLOT_INVALID
+        int i = 0
+        while i < array.size(engine.rootLiveSlots) and livePos == SLOT_INVALID
+            if array.get(engine.rootLiveSlots, i) == rootSlot
+                livePos := i
+            else
+                i += 1
+        // Step 3 : position inside rootIdOrderSlots. The index always advances.
+        int idOrderPos = SLOT_INVALID
+        int k = 0
+        while k < array.size(engine.rootIdOrderSlots) and idOrderPos == SLOT_INVALID
+            if array.get(engine.rootIdOrderSlots, k) == rootSlot
+                idOrderPos := k
+            else
+                k += 1
+        // Step 4 : atomic guard. Both positions and the ID index entry must agree,
+        // otherwise nothing is mutated and the inconsistency is never repaired here.
+        if livePos != SLOT_INVALID and idOrderPos != SLOT_INVALID and idIndexValid
+            // W03 Batch 13 Step 4a : common facts, read before any mutation
+            bool ok = rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootDirections) and rootSlot < array.size(engine.rootPairKeys) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootPointTicks) and rootSlot < array.size(engine.rootOriginKeys) and rootSlot < array.size(engine.rootFvgFreshFlags) and rootSlot < array.size(engine.rootIsBroadFvgFlags) and rootSlot < array.size(engine.rootNativeBottomTicks) and rootSlot < array.size(engine.rootNativeTopTicks) and rootSlot < array.size(engine.rootCategorySetPositions) and rootSlot < array.size(engine.rootTfSetPositions) and rootSlot < array.size(engine.rootStateSetPositions) and rootSlot < array.size(engine.rootPriceOrderPositions) and rootSlot < array.size(engine.rootFvgFreshSetPositions) and rootSlot < array.size(engine.rootFvgStructuralStateSetPositions) and rootSlot < array.size(engine.rootFvgDirectionSetPositions) and rootSlot < array.size(engine.rootFvgBroadSetPositions) and rootSlot < array.size(engine.rootFvgNativeBottomOrderPositions) and rootSlot < array.size(engine.rootFvgNativeTopOrderPositions) and rootSlot < array.size(engine.w02Aux.rootOriginBucketPrevRootSlots) and rootSlot < array.size(engine.w02Aux.rootOriginBucketNextRootSlots) and rootSlot < array.size(engine.w02Aux.rootOriginBucketExpectedRootIds)
+            int category = int(na)
+            int tfCode   = int(na)
+            int state    = int(na)
+            int pairKey  = ID_NONE
+            bool upperOwn = false
+            if ok
+                category := array.get(engine.rootCategories, rootSlot)
+                tfCode   := array.get(engine.rootTfCodes,    rootSlot)
+                state    := array.get(engine.rootStates,     rootSlot)
+                pairKey  := array.get(engine.rootPairKeys,   rootSlot)
+                ok := category == CAT_MA or category == CAT_SWING or category == CAT_ACCUM or category == CAT_TIME_HL or category == CAT_FVG or category == CAT_PSYCH
+            bool isFvg = category == CAT_FVG
+            // Step 4b : general Category / TF / state membership and each moved-last entry
+            if ok
+                ok := rootSetMembershipValidRaw(engine, rootSlot)
+            array<int> categorySet = category == CAT_MA ? engine.categoryMaRootSlots : category == CAT_SWING ? engine.categorySwingRootSlots : category == CAT_ACCUM ? engine.categoryAccumRootSlots : category == CAT_TIME_HL ? engine.categoryTimeHlRootSlots : category == CAT_FVG ? engine.categoryFvgRootSlots : engine.categoryPsychRootSlots
+            array<int> tfSet       = tfCode == TF_1M ? engine.tf1mRootSlots : tfCode == TF_5M ? engine.tf5mRootSlots : tfCode == TF_15M ? engine.tf15mRootSlots : tfCode == TF_1H ? engine.tf1hRootSlots : tfCode == TF_4H ? engine.tf4hRootSlots : engine.tfDRootSlots
+            array<int> stateSet    = state == ROOT_CANDIDATE ? engine.stateCandidateRootSlots : state == ROOT_ACTIVE ? engine.stateActiveRootSlots : state == ROOT_INVALIDATED ? engine.stateInvalidatedRootSlots : state == ROOT_INVERSE_WAIT ? engine.stateInverseWaitRootSlots : state == ROOT_INVERSE_ACTIVE ? engine.stateInverseActiveRootSlots : engine.stateRetiredRootSlots
+            int catPos   = ok ? array.get(engine.rootCategorySetPositions, rootSlot) : SLOT_INVALID
+            int tfPos    = ok ? array.get(engine.rootTfSetPositions,       rootSlot) : SLOT_INVALID
+            int statePos = ok ? array.get(engine.rootStateSetPositions,    rootSlot) : SLOT_INVALID
+            if ok
+                ok := catPos >= 0 and catPos < array.size(categorySet)
+                if ok
+                    ok := array.get(categorySet, catPos) == rootSlot
+                if ok
+                    int lastPos      = array.size(categorySet) - 1
+                    int lastRootSlot = array.get(categorySet, lastPos)
+                    ok := lastRootSlot >= 0 and lastRootSlot < array.size(engine.rootIds) and lastRootSlot < array.size(engine.rootSlotLiveFlags) and lastRootSlot < array.size(engine.rootCategorySetPositions)
+                    if ok
+                        ok := array.get(engine.rootSlotLiveFlags, lastRootSlot) and array.get(engine.rootIds, lastRootSlot) != ID_NONE and array.get(engine.rootCategorySetPositions, lastRootSlot) == lastPos and array.get(categorySet, lastPos) == lastRootSlot
+            if ok
+                ok := tfPos >= 0 and tfPos < array.size(tfSet)
+                if ok
+                    ok := array.get(tfSet, tfPos) == rootSlot
+                if ok
+                    int lastPos      = array.size(tfSet) - 1
+                    int lastRootSlot = array.get(tfSet, lastPos)
+                    ok := lastRootSlot >= 0 and lastRootSlot < array.size(engine.rootIds) and lastRootSlot < array.size(engine.rootSlotLiveFlags) and lastRootSlot < array.size(engine.rootTfSetPositions)
+                    if ok
+                        ok := array.get(engine.rootSlotLiveFlags, lastRootSlot) and array.get(engine.rootIds, lastRootSlot) != ID_NONE and array.get(engine.rootTfSetPositions, lastRootSlot) == lastPos and array.get(tfSet, lastPos) == lastRootSlot
+            if ok
+                ok := statePos >= 0 and statePos < array.size(stateSet)
+                if ok
+                    ok := array.get(stateSet, statePos) == rootSlot
+                if ok
+                    int lastPos      = array.size(stateSet) - 1
+                    int lastRootSlot = array.get(stateSet, lastPos)
+                    ok := lastRootSlot >= 0 and lastRootSlot < array.size(engine.rootIds) and lastRootSlot < array.size(engine.rootSlotLiveFlags) and lastRootSlot < array.size(engine.rootStateSetPositions)
+                    if ok
+                        ok := array.get(engine.rootSlotLiveFlags, lastRootSlot) and array.get(engine.rootIds, lastRootSlot) != ID_NONE and array.get(engine.rootStateSetPositions, lastRootSlot) == lastPos and array.get(stateSet, lastPos) == lastRootSlot
+            // Step 4c : origin bucket, mirroring originBucketDetachRaw read-only
+            if ok
+                int originKey = array.get(engine.rootOriginKeys, rootSlot)
+                int prev      = array.get(engine.w02Aux.rootOriginBucketPrevRootSlots, rootSlot)
+                int next      = array.get(engine.w02Aux.rootOriginBucketNextRootSlots, rootSlot)
+                ok := originKey != ID_NONE and array.get(engine.w02Aux.rootOriginBucketExpectedRootIds, rootSlot) == oldRootId and prev != rootSlot and next != rootSlot
+                if ok
+                    if prev == SLOT_INVALID
+                        ok := map.contains(engine.w02Aux.originKeyBucketHeadRootSlots, originKey)
+                        if ok
+                            ok := map.get(engine.w02Aux.originKeyBucketHeadRootSlots, originKey) == rootSlot
+                    else
+                        ok := prev >= 0 and prev < array.size(engine.rootIds)
+                        if ok
+                            ok := array.get(engine.rootSlotLiveFlags, prev)
+                        if ok
+                            ok := array.get(engine.w02Aux.rootOriginBucketExpectedRootIds, prev) == array.get(engine.rootIds, prev) and array.get(engine.rootOriginKeys, prev) == originKey and array.get(engine.w02Aux.rootOriginBucketNextRootSlots, prev) == rootSlot
+                if ok and next != SLOT_INVALID
+                    ok := next >= 0 and next < array.size(engine.rootIds)
+                    if ok
+                        ok := array.get(engine.rootSlotLiveFlags, next)
+                    if ok
+                        ok := array.get(engine.w02Aux.rootOriginBucketExpectedRootIds, next) == array.get(engine.rootIds, next) and array.get(engine.rootOriginKeys, next) == originKey and array.get(engine.w02Aux.rootOriginBucketPrevRootSlots, next) == rootSlot
+            // Step 4d : point Root - common price order, no FVG position, pair side
+            if ok and not isFvg
+                ok := not array.get(engine.rootIsRangeRootFlags, rootSlot) and not na(array.get(engine.rootPointTicks, rootSlot)) and array.get(engine.rootFvgFreshSetPositions, rootSlot) == SLOT_INVALID and array.get(engine.rootFvgStructuralStateSetPositions, rootSlot) == SLOT_INVALID and array.get(engine.rootFvgDirectionSetPositions, rootSlot) == SLOT_INVALID and array.get(engine.rootFvgBroadSetPositions, rootSlot) == SLOT_INVALID and array.get(engine.rootFvgNativeBottomOrderPositions, rootSlot) == SLOT_INVALID and array.get(engine.rootFvgNativeTopOrderPositions, rootSlot) == SLOT_INVALID
+                if ok
+                    int pricePos  = array.get(engine.rootPriceOrderPositions, rootSlot)
+                    int priceSize = array.size(engine.rootPriceOrderSlots)
+                    ok := pricePos >= 0 and pricePos < priceSize
+                    if ok
+                        ok := array.get(engine.rootPriceOrderSlots, pricePos) == rootSlot
+                    int p = pricePos + 1
+                    while ok and p < priceSize
+                        int slot = array.get(engine.rootPriceOrderSlots, p)
+                        ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootPointTicks) and slot < array.size(engine.rootIsRangeRootFlags) and slot < array.size(engine.rootPriceOrderPositions)
+                        if ok
+                            ok := array.get(engine.rootSlotLiveFlags, slot) and array.get(engine.rootIds, slot) != ID_NONE and not array.get(engine.rootIsRangeRootFlags, slot) and not na(array.get(engine.rootPointTicks, slot)) and array.get(engine.rootPriceOrderPositions, slot) == p
+                        p += 1
+                if ok
+                    if category == CAT_ACCUM
+                        // exactly one side of the pair must point at this Root
+                        ok := pairKey != ID_NONE
+                        if ok
+                            upperOwn := map.contains(engine.accumPairUpperRootSlotByKey, pairKey) and map.get(engine.accumPairUpperRootSlotByKey, pairKey) == rootSlot
+                            bool lowerOwn = map.contains(engine.accumPairLowerRootSlotByKey, pairKey) and map.get(engine.accumPairLowerRootSlotByKey, pairKey) == rootSlot
+                            ok := upperOwn != lowerOwn
+                        if ok
+                            ok := accumPairMembershipValidRaw(engine, rootSlot, oldRootId, upperOwn)
+                    else
+                        ok := pairKey == ID_NONE
+            // Step 4e : FVG - no common price order, non-price sets, NativeRange orders
+            if ok and isFvg
+                ok := array.get(engine.rootIsRangeRootFlags, rootSlot) and array.get(engine.rootPriceOrderPositions, rootSlot) == SLOT_INVALID and (state == ROOT_ACTIVE or state == ROOT_INVALIDATED)
+                if ok
+                    ok := fvgSetMembershipValidRaw(engine, rootSlot, oldRootId)
+            int  fvgDir     = ok and isFvg ? array.get(engine.rootDirections, rootSlot) : int(na)
+            bool fvgFresh   = ok and isFvg ? array.get(engine.rootFvgFreshFlags, rootSlot) : false
+            bool fvgBroad   = ok and isFvg ? array.get(engine.rootIsBroadFvgFlags, rootSlot) : false
+            array<int> freshSet  = tfCode == TF_1H ? engine.freshFvg1hRootSlots : tfCode == TF_4H ? engine.freshFvg4hRootSlots : engine.freshFvgDRootSlots
+            array<int> activeSet = tfCode == TF_1H ? engine.structurallyActiveFvg1hRootSlots : tfCode == TF_4H ? engine.structurallyActiveFvg4hRootSlots : engine.structurallyActiveFvgDRootSlots
+            array<int> dirSet    = fvgDir == FVG_BULLISH ? engine.bullishFvgRootSlots : engine.bearishFvgRootSlots
+            int freshPos  = ok and isFvg ? array.get(engine.rootFvgFreshSetPositions,           rootSlot) : SLOT_INVALID
+            int structPos = ok and isFvg ? array.get(engine.rootFvgStructuralStateSetPositions, rootSlot) : SLOT_INVALID
+            int dirPos    = ok and isFvg ? array.get(engine.rootFvgDirectionSetPositions,       rootSlot) : SLOT_INVALID
+            int broadPos  = ok and isFvg ? array.get(engine.rootFvgBroadSetPositions,           rootSlot) : SLOT_INVALID
+            if isFvg and fvgFresh
+                if ok
+                    ok := freshPos >= 0 and freshPos < array.size(freshSet)
+                    if ok
+                        ok := array.get(freshSet, freshPos) == rootSlot
+                    if ok
+                        int lastPos      = array.size(freshSet) - 1
+                        int lastRootSlot = array.get(freshSet, lastPos)
+                        ok := lastRootSlot >= 0 and lastRootSlot < array.size(engine.rootIds) and lastRootSlot < array.size(engine.rootSlotLiveFlags) and lastRootSlot < array.size(engine.rootFvgFreshSetPositions)
+                        if ok
+                            ok := array.get(engine.rootSlotLiveFlags, lastRootSlot) and array.get(engine.rootIds, lastRootSlot) != ID_NONE and array.get(engine.rootFvgFreshSetPositions, lastRootSlot) == lastPos and array.get(freshSet, lastPos) == lastRootSlot
+            if isFvg and state == ROOT_ACTIVE
+                if ok
+                    ok := structPos >= 0 and structPos < array.size(activeSet)
+                    if ok
+                        ok := array.get(activeSet, structPos) == rootSlot
+                    if ok
+                        int lastPos      = array.size(activeSet) - 1
+                        int lastRootSlot = array.get(activeSet, lastPos)
+                        ok := lastRootSlot >= 0 and lastRootSlot < array.size(engine.rootIds) and lastRootSlot < array.size(engine.rootSlotLiveFlags) and lastRootSlot < array.size(engine.rootFvgStructuralStateSetPositions)
+                        if ok
+                            ok := array.get(engine.rootSlotLiveFlags, lastRootSlot) and array.get(engine.rootIds, lastRootSlot) != ID_NONE and array.get(engine.rootFvgStructuralStateSetPositions, lastRootSlot) == lastPos and array.get(activeSet, lastPos) == lastRootSlot
+            if isFvg
+                if ok
+                    ok := dirPos >= 0 and dirPos < array.size(dirSet)
+                    if ok
+                        ok := array.get(dirSet, dirPos) == rootSlot
+                    if ok
+                        int lastPos      = array.size(dirSet) - 1
+                        int lastRootSlot = array.get(dirSet, lastPos)
+                        ok := lastRootSlot >= 0 and lastRootSlot < array.size(engine.rootIds) and lastRootSlot < array.size(engine.rootSlotLiveFlags) and lastRootSlot < array.size(engine.rootFvgDirectionSetPositions)
+                        if ok
+                            ok := array.get(engine.rootSlotLiveFlags, lastRootSlot) and array.get(engine.rootIds, lastRootSlot) != ID_NONE and array.get(engine.rootFvgDirectionSetPositions, lastRootSlot) == lastPos and array.get(dirSet, lastPos) == lastRootSlot
+            if isFvg and fvgBroad
+                if ok
+                    ok := broadPos >= 0 and broadPos < array.size(engine.broadFvgRootSlots)
+                    if ok
+                        ok := array.get(engine.broadFvgRootSlots, broadPos) == rootSlot
+                    if ok
+                        int lastPos      = array.size(engine.broadFvgRootSlots) - 1
+                        int lastRootSlot = array.get(engine.broadFvgRootSlots, lastPos)
+                        ok := lastRootSlot >= 0 and lastRootSlot < array.size(engine.rootIds) and lastRootSlot < array.size(engine.rootSlotLiveFlags) and lastRootSlot < array.size(engine.rootFvgBroadSetPositions)
+                        if ok
+                            ok := array.get(engine.rootSlotLiveFlags, lastRootSlot) and array.get(engine.rootIds, lastRootSlot) != ID_NONE and array.get(engine.rootFvgBroadSetPositions, lastRootSlot) == lastPos and array.get(engine.broadFvgRootSlots, lastPos) == lastRootSlot
+            if ok and isFvg
+                // NativeRange orders, mirroring fvgNativeRangeOrderDetachRaw read-only
+                int bottomTick = array.get(engine.rootNativeBottomTicks, rootSlot)
+                int topTick    = array.get(engine.rootNativeTopTicks,    rootSlot)
+                int bottomPos  = array.get(engine.rootFvgNativeBottomOrderPositions, rootSlot)
+                int topPos     = array.get(engine.rootFvgNativeTopOrderPositions,    rootSlot)
+                int bottomSize = array.size(engine.fvgNativeBottomOrderRootSlots)
+                int topSize    = array.size(engine.fvgNativeTopOrderRootSlots)
+                ok := not na(bottomTick) and not na(topTick) and bottomTick <= topTick and bottomPos != SLOT_INVALID and topPos != SLOT_INVALID and bottomPos >= 0 and topPos >= 0 and bottomPos < bottomSize and topPos < topSize
+                if ok
+                    ok := array.get(engine.fvgNativeBottomOrderRootSlots, bottomPos) == rootSlot and array.get(engine.fvgNativeTopOrderRootSlots, topPos) == rootSlot
+                int b = bottomPos + 1
+                while ok and b < bottomSize
+                    int slot = array.get(engine.fvgNativeBottomOrderRootSlots, b)
+                    ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootCategories) and slot < array.size(engine.rootTfCodes) and slot < array.size(engine.rootDirections) and slot < array.size(engine.rootIsRangeRootFlags) and slot < array.size(engine.rootNativeBottomTicks) and slot < array.size(engine.rootFvgNativeBottomOrderPositions)
+                    if ok
+                        int entryTf  = array.get(engine.rootTfCodes,    slot)
+                        int entryDir = array.get(engine.rootDirections, slot)
+                        ok := array.get(engine.rootSlotLiveFlags, slot) and array.get(engine.rootIds, slot) != ID_NONE and array.get(engine.rootCategories, slot) == CAT_FVG and (entryTf == TF_1H or entryTf == TF_4H or entryTf == TF_D) and (entryDir == FVG_BULLISH or entryDir == FVG_BEARISH) and array.get(engine.rootIsRangeRootFlags, slot) and not na(array.get(engine.rootNativeBottomTicks, slot)) and array.get(engine.rootFvgNativeBottomOrderPositions, slot) == b
+                    b += 1
+                int t = topPos + 1
+                while ok and t < topSize
+                    int slot = array.get(engine.fvgNativeTopOrderRootSlots, t)
+                    ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootCategories) and slot < array.size(engine.rootTfCodes) and slot < array.size(engine.rootDirections) and slot < array.size(engine.rootIsRangeRootFlags) and slot < array.size(engine.rootNativeTopTicks) and slot < array.size(engine.rootFvgNativeTopOrderPositions)
+                    if ok
+                        int entryTf  = array.get(engine.rootTfCodes,    slot)
+                        int entryDir = array.get(engine.rootDirections, slot)
+                        ok := array.get(engine.rootSlotLiveFlags, slot) and array.get(engine.rootIds, slot) != ID_NONE and array.get(engine.rootCategories, slot) == CAT_FVG and (entryTf == TF_1H or entryTf == TF_4H or entryTf == TF_D) and (entryDir == FVG_BULLISH or entryDir == FVG_BEARISH) and array.get(engine.rootIsRangeRootFlags, slot) and not na(array.get(engine.rootNativeTopTicks, slot)) and array.get(engine.rootFvgNativeTopOrderPositions, slot) == t
+                    t += 1
+            // Step 4f : participation last among the checks - it is all-or-nothing, so
+            // a false here still leaves every index and the Root untouched.
+            if ok
+                bool participationDetached = participationDetachAllForRootRaw(engine, rootSlot)
+                if participationDetached
+                    // Commit 1 : origin bucket
+                    bool originDone = originBucketDetachRaw(engine, rootSlot, oldRootId)
+                    // Commit 2 : price index - common order for a point Root, NativeRange for FVG
+                    bool priceDone = isFvg ? fvgNativeRangeOrderDetachRaw(engine, rootSlot, oldRootId) : rootPriceOrderDetachRaw(engine, rootSlot, oldRootId)
+                    // Commit 3 : Category-specific index
+                    if category == CAT_ACCUM
+                        bool pairDone = accumPairDetachRaw(engine, rootSlot, oldRootId, upperOwn)
+                    else if isFvg
+                        bool fvgSetDone = fvgSetDetachAllRaw(engine, rootSlot, oldRootId)
+                    // Commit 4 : general Category / TF / state sets
+                    bool setDone = rootSetDetachAllRaw(engine, rootSlot)
+                    // Step 5 : rootLiveSlots has no order semantics -> swap-pop.
+                    int liveLastPos = array.size(engine.rootLiveSlots) - 1
+                    if livePos != liveLastPos
+                        array.set(engine.rootLiveSlots, livePos, array.get(engine.rootLiveSlots, liveLastPos))
+                    array.pop(engine.rootLiveSlots)
+                    // Step 6 : rootIdOrderSlots must keep Root ID ascending order ->
+                    // order preserving shift with array.set / array.get, then pop.
+                    int idSize = array.size(engine.rootIdOrderSlots)
+                    int j = idOrderPos
+                    while j < idSize - 1
+                        array.set(engine.rootIdOrderSlots, j, array.get(engine.rootIdOrderSlots, j + 1))
+                        j += 1
+                    array.pop(engine.rootIdOrderSlots)
+                    // W02 Batch 4 Step D : the freed Root ID leaves the I11-1 index. A freed
+                    // Root ID is never kept as a stale key and is never re-added.
+                    map.remove(engine.rootIdToSlot, oldRootId)
+                    // Step 7 : field reset, including rootSlotLiveFlags -> false. Every
+                    // index above has already released the Root.
+                    rootResetSlotRaw(engine, rootSlot)
+                    // Step 8 : freed slot enters the free stack exactly once.
+                    array.push(engine.rootFreeSlots, rootSlot)
+                    freed := true
+    // Step 9
+    freed
 
 // ============================================================
 // W02 Batch 14 : Side Phase set index raw helpers (I11-9)
