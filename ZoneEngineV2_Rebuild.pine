@@ -1454,6 +1454,14 @@ const int SUB_ACCUM_LOWER  = 2
 const int SUB_TIMEHL_HIGH  = 1
 const int SUB_TIMEHL_LOW   = 2
 
+// W03 Batch 16 : TimeHL period label bits (internal). A combined mask is 0 .. 63.
+const int TIMEHL_LABEL_CUR_SESSION  = 1
+const int TIMEHL_LABEL_LAST_SESSION = 2
+const int TIMEHL_LABEL_TODAY        = 4
+const int TIMEHL_LABEL_PREV_DAY     = 8
+const int TIMEHL_LABEL_CUR_WEEK     = 16
+const int TIMEHL_LABEL_PREV_WEEK    = 32
+
 // ============================================================
 // W03 Batch 02 : W03SourceRootStore - Engine-owned Source / Root scalar store
 // Source: I7.1, I10, A7.4, A7.6, D02, D12
@@ -5726,6 +5734,171 @@ maUpdateApplyRaw(ZoneEngine engine, int journalRow, float mintick) =>
         array.set(engine.rootLastUpdateSeqs, rootSlot, engine.w03Store.journalBaseSeq)
         bool moved = rootPriceOrderMoveRaw(engine, rootSlot, expectedRootId, pointPrice, mintick)
     ok
+
+// ============================================================
+// W03 Batch 16 : SWING_TF_MERGE, TIMEHL_LABEL and ROOT_RETIRE apply helpers
+// Source: I8 (Stage F / E3 / E4), I10, A7.3, A7.6, D12
+//
+// Internal only. Each applies one journal row to the existing point Root it names,
+// after validating the row and the target Root, and writes only:
+//   swingTfMergeApplyRaw : rootSwingTfMasks (exactly one new TF bit). The merged
+//                          Root keeps its creation TF, times and price.
+//   timeHlLabelApplyRaw  : rootLabelMasks (0 is legal; ROOT_RETIRE follows in E4).
+//                          Why the labels changed is the emitter's decision.
+//   rootRetireApplyRaw   : a TimeHL Root with labelMask 0, ACTIVE -> RETIRED, the
+//                          state set through rootStateSetMoveRaw, then rootStates.
+// A retired Root is not freed: its origin bucket, Category / TF sets, common price
+// order and lifecycle entries stay. No price, time, lastUpdateSeq, origin,
+// revision or journal field is written. Business call sites = 0.
+// ============================================================
+
+// Adds one detection TF bit to a Swing Root. true when applied; false with zero
+// mutation when the row or the target Root does not meet the merge contract.
+swingTfMergeApplyRaw(ZoneEngine engine, int journalRow) =>
+    // Step 1 : an E3 SWING_TF_MERGE row
+    bool ok = journalRow >= 0 and journalRow < engine.w03Store.journalCount and journalRow < array.size(engine.w03Store.journalOps) and journalRow < array.size(engine.w03Store.journalGroups) and journalRow < array.size(engine.w03Store.journalTargetRootSlots) and journalRow < array.size(engine.w03Store.journalExpectedRootIds) and journalRow < array.size(engine.w03Store.journalCategories) and journalRow < array.size(engine.w03Store.journalSubtypes) and journalRow < array.size(engine.w03Store.journalTfCodes) and journalRow < array.size(engine.w03Store.journalOriginKeys) and journalRow < array.size(engine.w03Store.journalOriginTimes) and journalRow < array.size(engine.w03Store.journalOriginEndTimes) and journalRow < array.size(engine.w03Store.journalConfirmedTimes) and journalRow < array.size(engine.w03Store.journalPointPrices) and journalRow < array.size(engine.w03Store.journalNativeBottoms) and journalRow < array.size(engine.w03Store.journalNativeTops) and journalRow < array.size(engine.w03Store.journalOldStates) and journalRow < array.size(engine.w03Store.journalNewStates) and journalRow < array.size(engine.w03Store.journalFvgFreshFlags) and journalRow < array.size(engine.w03Store.journalIsBroadFlags) and journalRow < array.size(engine.w03Store.journalDirections) and journalRow < array.size(engine.w03Store.journalOldMasks) and journalRow < array.size(engine.w03Store.journalNewMasks) and journalRow < array.size(engine.w03Store.journalPairKeys) and journalRow < array.size(engine.w03Store.journalSlopeDirs)
+    int rootSlot       = SLOT_INVALID
+    int expectedRootId = ID_NONE
+    int subtype        = int(na)
+    int originKey      = ID_NONE
+    int oldMask        = int(na)
+    int newMask        = int(na)
+    if ok
+        rootSlot       := array.get(engine.w03Store.journalTargetRootSlots, journalRow)
+        expectedRootId := array.get(engine.w03Store.journalExpectedRootIds, journalRow)
+        subtype        := array.get(engine.w03Store.journalSubtypes,        journalRow)
+        originKey      := array.get(engine.w03Store.journalOriginKeys,      journalRow)
+        oldMask        := array.get(engine.w03Store.journalOldMasks,        journalRow)
+        newMask        := array.get(engine.w03Store.journalNewMasks,        journalRow)
+        ok := array.get(engine.w03Store.journalOps, journalRow) == JOP_SWING_TF_MERGE and array.get(engine.w03Store.journalGroups, journalRow) == JGROUP_E3 and rootSlot != SLOT_INVALID and expectedRootId != ID_NONE and engine.w03Store.journalBaseSeq != SEQ_UNSET and array.get(engine.w03Store.journalOldStates, journalRow) == ROOT_ACTIVE and array.get(engine.w03Store.journalNewStates, journalRow) == ROOT_ACTIVE and array.get(engine.w03Store.journalPairKeys, journalRow) == ID_NONE and array.get(engine.w03Store.journalDirections, journalRow) == FVG_NONE and not array.get(engine.w03Store.journalFvgFreshFlags, journalRow) and not array.get(engine.w03Store.journalIsBroadFlags, journalRow)
+    // Step 2 : the Swing row contract and exactly one new incoming TF bit
+    if ok
+        int tfCode = array.get(engine.w03Store.journalTfCodes, journalRow)
+        ok := array.get(engine.w03Store.journalCategories, journalRow) == CAT_SWING and (subtype == SUB_SWING_HIGH or subtype == SUB_SWING_LOW) and (tfCode == TF_5M or tfCode == TF_15M or tfCode == TF_1H)
+        if ok
+            if tfCode == TF_5M
+                ok := (oldMask == 2 or oldMask == 4 or oldMask == 6) and newMask == oldMask + SWING_TF_MASK_5M
+            else if tfCode == TF_15M
+                ok := (oldMask == 1 or oldMask == 4 or oldMask == 5) and newMask == oldMask + SWING_TF_MASK_15M
+            else
+                ok := (oldMask == 1 or oldMask == 2 or oldMask == 3) and newMask == oldMask + SWING_TF_MASK_1H
+    // Step 3 : the target Swing Root (its creation TF is not required to match)
+    if ok
+        ok := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootOriginKeys) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootSubtypes) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootPairKeys) and rootSlot < array.size(engine.rootDirections) and rootSlot < array.size(engine.rootFvgFreshFlags) and rootSlot < array.size(engine.rootIsBroadFvgFlags) and rootSlot < array.size(engine.rootLabelMasks) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootIsDynamicFlags) and rootSlot < array.size(engine.rootPointPrices) and rootSlot < array.size(engine.rootNativeBottoms) and rootSlot < array.size(engine.rootNativeTops) and rootSlot < array.size(engine.rootPriceOrderPositions) and rootSlot < array.size(engine.rootStateSetPositions) and rootSlot < array.size(engine.w03Store.rootSwingTfMasks)
+    if ok
+        ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId and array.get(engine.rootSubtypes, rootSlot) == subtype and array.get(engine.rootStates, rootSlot) == ROOT_ACTIVE and not array.get(engine.rootIsRangeRootFlags, rootSlot) and not array.get(engine.rootIsDynamicFlags, rootSlot) and array.get(engine.rootPairKeys, rootSlot) == ID_NONE and array.get(engine.rootDirections, rootSlot) == FVG_NONE and not array.get(engine.rootFvgFreshFlags, rootSlot) and not array.get(engine.rootIsBroadFvgFlags, rootSlot) and not na(array.get(engine.rootPointPrices, rootSlot)) and na(array.get(engine.rootNativeBottoms, rootSlot)) and na(array.get(engine.rootNativeTops, rootSlot))
+    if ok
+        ok := rootSetMembershipValidRaw(engine, rootSlot)
+    if ok
+        int pricePos = array.get(engine.rootPriceOrderPositions, rootSlot)
+        ok := pricePos >= 0 and pricePos < array.size(engine.rootPriceOrderSlots)
+        if ok
+            ok := array.get(engine.rootPriceOrderSlots, pricePos) == rootSlot
+    if ok
+        int rootTf = array.get(engine.rootTfCodes, rootSlot)
+        ok := array.get(engine.rootCategories, rootSlot) == CAT_SWING and (rootTf == TF_5M or rootTf == TF_15M or rootTf == TF_1H) and array.get(engine.rootLabelMasks, rootSlot) == 0 and array.get(engine.w03Store.rootSwingTfMasks, rootSlot) == oldMask
+    // Step 4 : commit, exactly one write
+    if ok
+        array.set(engine.w03Store.rootSwingTfMasks, rootSlot, newMask)
+    ok
+
+// Replaces one TimeHL Root's period label mask. true when applied; false with zero
+// mutation when the row or the target Root does not meet the label contract.
+timeHlLabelApplyRaw(ZoneEngine engine, int journalRow) =>
+    // Step 1 : an E3 TIMEHL_LABEL row
+    bool ok = journalRow >= 0 and journalRow < engine.w03Store.journalCount and journalRow < array.size(engine.w03Store.journalOps) and journalRow < array.size(engine.w03Store.journalGroups) and journalRow < array.size(engine.w03Store.journalTargetRootSlots) and journalRow < array.size(engine.w03Store.journalExpectedRootIds) and journalRow < array.size(engine.w03Store.journalCategories) and journalRow < array.size(engine.w03Store.journalSubtypes) and journalRow < array.size(engine.w03Store.journalTfCodes) and journalRow < array.size(engine.w03Store.journalOriginKeys) and journalRow < array.size(engine.w03Store.journalOriginTimes) and journalRow < array.size(engine.w03Store.journalOriginEndTimes) and journalRow < array.size(engine.w03Store.journalConfirmedTimes) and journalRow < array.size(engine.w03Store.journalPointPrices) and journalRow < array.size(engine.w03Store.journalNativeBottoms) and journalRow < array.size(engine.w03Store.journalNativeTops) and journalRow < array.size(engine.w03Store.journalOldStates) and journalRow < array.size(engine.w03Store.journalNewStates) and journalRow < array.size(engine.w03Store.journalFvgFreshFlags) and journalRow < array.size(engine.w03Store.journalIsBroadFlags) and journalRow < array.size(engine.w03Store.journalDirections) and journalRow < array.size(engine.w03Store.journalOldMasks) and journalRow < array.size(engine.w03Store.journalNewMasks) and journalRow < array.size(engine.w03Store.journalPairKeys) and journalRow < array.size(engine.w03Store.journalSlopeDirs)
+    int rootSlot       = SLOT_INVALID
+    int expectedRootId = ID_NONE
+    int subtype        = int(na)
+    int originKey      = ID_NONE
+    int oldMask        = int(na)
+    int newMask        = int(na)
+    if ok
+        rootSlot       := array.get(engine.w03Store.journalTargetRootSlots, journalRow)
+        expectedRootId := array.get(engine.w03Store.journalExpectedRootIds, journalRow)
+        subtype        := array.get(engine.w03Store.journalSubtypes,        journalRow)
+        originKey      := array.get(engine.w03Store.journalOriginKeys,      journalRow)
+        oldMask        := array.get(engine.w03Store.journalOldMasks,        journalRow)
+        newMask        := array.get(engine.w03Store.journalNewMasks,        journalRow)
+        ok := array.get(engine.w03Store.journalOps, journalRow) == JOP_TIMEHL_LABEL and array.get(engine.w03Store.journalGroups, journalRow) == JGROUP_E3 and rootSlot != SLOT_INVALID and expectedRootId != ID_NONE and engine.w03Store.journalBaseSeq != SEQ_UNSET and array.get(engine.w03Store.journalOldStates, journalRow) == ROOT_ACTIVE and array.get(engine.w03Store.journalNewStates, journalRow) == ROOT_ACTIVE and array.get(engine.w03Store.journalPairKeys, journalRow) == ID_NONE and array.get(engine.w03Store.journalDirections, journalRow) == FVG_NONE and not array.get(engine.w03Store.journalFvgFreshFlags, journalRow) and not array.get(engine.w03Store.journalIsBroadFlags, journalRow)
+    // Step 2 : the TimeHL row contract; newMask 0 is legal
+    if ok
+        ok := array.get(engine.w03Store.journalCategories, journalRow) == CAT_TIME_HL and (subtype == SUB_TIMEHL_HIGH or subtype == SUB_TIMEHL_LOW) and array.get(engine.w03Store.journalTfCodes, journalRow) == TF_5M and oldMask >= 1 and oldMask <= 63 and newMask >= 0 and newMask <= 63 and newMask != oldMask
+    // Step 3 : the target TimeHL Root
+    if ok
+        ok := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootOriginKeys) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootSubtypes) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootPairKeys) and rootSlot < array.size(engine.rootDirections) and rootSlot < array.size(engine.rootFvgFreshFlags) and rootSlot < array.size(engine.rootIsBroadFvgFlags) and rootSlot < array.size(engine.rootLabelMasks) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootIsDynamicFlags) and rootSlot < array.size(engine.rootPointPrices) and rootSlot < array.size(engine.rootNativeBottoms) and rootSlot < array.size(engine.rootNativeTops) and rootSlot < array.size(engine.rootPriceOrderPositions) and rootSlot < array.size(engine.rootStateSetPositions) and rootSlot < array.size(engine.w03Store.rootSwingTfMasks)
+    if ok
+        ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId and array.get(engine.rootSubtypes, rootSlot) == subtype and array.get(engine.rootStates, rootSlot) == ROOT_ACTIVE and not array.get(engine.rootIsRangeRootFlags, rootSlot) and not array.get(engine.rootIsDynamicFlags, rootSlot) and array.get(engine.rootPairKeys, rootSlot) == ID_NONE and array.get(engine.rootDirections, rootSlot) == FVG_NONE and not array.get(engine.rootFvgFreshFlags, rootSlot) and not array.get(engine.rootIsBroadFvgFlags, rootSlot) and not na(array.get(engine.rootPointPrices, rootSlot)) and na(array.get(engine.rootNativeBottoms, rootSlot)) and na(array.get(engine.rootNativeTops, rootSlot))
+    if ok
+        ok := rootSetMembershipValidRaw(engine, rootSlot)
+    if ok
+        int pricePos = array.get(engine.rootPriceOrderPositions, rootSlot)
+        ok := pricePos >= 0 and pricePos < array.size(engine.rootPriceOrderSlots)
+        if ok
+            ok := array.get(engine.rootPriceOrderSlots, pricePos) == rootSlot
+    if ok
+        ok := array.get(engine.rootCategories, rootSlot) == CAT_TIME_HL and array.get(engine.rootTfCodes, rootSlot) == TF_5M and array.get(engine.rootLabelMasks, rootSlot) == oldMask and array.get(engine.w03Store.rootSwingTfMasks, rootSlot) == SWING_TF_MASK_NONE and (originKey == ID_NONE or array.get(engine.rootOriginKeys, rootSlot) == originKey)
+    // Step 4 : commit, exactly one write
+    if ok
+        array.set(engine.rootLabelMasks, rootSlot, newMask)
+    ok
+
+// Retires one TimeHL Root whose labels are all gone: ACTIVE -> RETIRED in the state
+// set and then in rootStates. true when applied; false with zero mutation when the
+// row, the target Root or the ACTIVE set entry it would move does not hold.
+rootRetireApplyRaw(ZoneEngine engine, int journalRow) =>
+    // Step 1 : an E4 ROOT_RETIRE row
+    bool ok = journalRow >= 0 and journalRow < engine.w03Store.journalCount and journalRow < array.size(engine.w03Store.journalOps) and journalRow < array.size(engine.w03Store.journalGroups) and journalRow < array.size(engine.w03Store.journalTargetRootSlots) and journalRow < array.size(engine.w03Store.journalExpectedRootIds) and journalRow < array.size(engine.w03Store.journalCategories) and journalRow < array.size(engine.w03Store.journalSubtypes) and journalRow < array.size(engine.w03Store.journalTfCodes) and journalRow < array.size(engine.w03Store.journalOriginKeys) and journalRow < array.size(engine.w03Store.journalOriginTimes) and journalRow < array.size(engine.w03Store.journalOriginEndTimes) and journalRow < array.size(engine.w03Store.journalConfirmedTimes) and journalRow < array.size(engine.w03Store.journalPointPrices) and journalRow < array.size(engine.w03Store.journalNativeBottoms) and journalRow < array.size(engine.w03Store.journalNativeTops) and journalRow < array.size(engine.w03Store.journalOldStates) and journalRow < array.size(engine.w03Store.journalNewStates) and journalRow < array.size(engine.w03Store.journalFvgFreshFlags) and journalRow < array.size(engine.w03Store.journalIsBroadFlags) and journalRow < array.size(engine.w03Store.journalDirections) and journalRow < array.size(engine.w03Store.journalOldMasks) and journalRow < array.size(engine.w03Store.journalNewMasks) and journalRow < array.size(engine.w03Store.journalPairKeys) and journalRow < array.size(engine.w03Store.journalSlopeDirs)
+    int rootSlot       = SLOT_INVALID
+    int expectedRootId = ID_NONE
+    int subtype        = int(na)
+    int originKey      = ID_NONE
+    int oldMask        = int(na)
+    int newMask        = int(na)
+    if ok
+        rootSlot       := array.get(engine.w03Store.journalTargetRootSlots, journalRow)
+        expectedRootId := array.get(engine.w03Store.journalExpectedRootIds, journalRow)
+        subtype        := array.get(engine.w03Store.journalSubtypes,        journalRow)
+        originKey      := array.get(engine.w03Store.journalOriginKeys,      journalRow)
+        oldMask        := array.get(engine.w03Store.journalOldMasks,        journalRow)
+        newMask        := array.get(engine.w03Store.journalNewMasks,        journalRow)
+        ok := array.get(engine.w03Store.journalOps, journalRow) == JOP_ROOT_RETIRE and array.get(engine.w03Store.journalGroups, journalRow) == JGROUP_E4 and rootSlot != SLOT_INVALID and expectedRootId != ID_NONE and engine.w03Store.journalBaseSeq != SEQ_UNSET and array.get(engine.w03Store.journalOldStates, journalRow) == ROOT_ACTIVE and array.get(engine.w03Store.journalNewStates, journalRow) == ROOT_RETIRED and array.get(engine.w03Store.journalPairKeys, journalRow) == ID_NONE and array.get(engine.w03Store.journalDirections, journalRow) == FVG_NONE and not array.get(engine.w03Store.journalFvgFreshFlags, journalRow) and not array.get(engine.w03Store.journalIsBroadFlags, journalRow)
+    // Step 2 : W03 retires TimeHL Roots only, and only with no label left
+    if ok
+        ok := array.get(engine.w03Store.journalCategories, journalRow) == CAT_TIME_HL and (subtype == SUB_TIMEHL_HIGH or subtype == SUB_TIMEHL_LOW) and array.get(engine.w03Store.journalTfCodes, journalRow) == TF_5M and oldMask == 0 and newMask == 0
+    // Step 3 : the target TimeHL Root
+    if ok
+        ok := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootOriginKeys) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootSubtypes) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootPairKeys) and rootSlot < array.size(engine.rootDirections) and rootSlot < array.size(engine.rootFvgFreshFlags) and rootSlot < array.size(engine.rootIsBroadFvgFlags) and rootSlot < array.size(engine.rootLabelMasks) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootIsDynamicFlags) and rootSlot < array.size(engine.rootPointPrices) and rootSlot < array.size(engine.rootNativeBottoms) and rootSlot < array.size(engine.rootNativeTops) and rootSlot < array.size(engine.rootPriceOrderPositions) and rootSlot < array.size(engine.rootStateSetPositions) and rootSlot < array.size(engine.w03Store.rootSwingTfMasks)
+    if ok
+        ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId and array.get(engine.rootSubtypes, rootSlot) == subtype and array.get(engine.rootStates, rootSlot) == ROOT_ACTIVE and not array.get(engine.rootIsRangeRootFlags, rootSlot) and not array.get(engine.rootIsDynamicFlags, rootSlot) and array.get(engine.rootPairKeys, rootSlot) == ID_NONE and array.get(engine.rootDirections, rootSlot) == FVG_NONE and not array.get(engine.rootFvgFreshFlags, rootSlot) and not array.get(engine.rootIsBroadFvgFlags, rootSlot) and not na(array.get(engine.rootPointPrices, rootSlot)) and na(array.get(engine.rootNativeBottoms, rootSlot)) and na(array.get(engine.rootNativeTops, rootSlot))
+    if ok
+        ok := rootSetMembershipValidRaw(engine, rootSlot)
+    if ok
+        int pricePos = array.get(engine.rootPriceOrderPositions, rootSlot)
+        ok := pricePos >= 0 and pricePos < array.size(engine.rootPriceOrderSlots)
+        if ok
+            ok := array.get(engine.rootPriceOrderSlots, pricePos) == rootSlot
+    if ok
+        ok := array.get(engine.rootCategories, rootSlot) == CAT_TIME_HL and array.get(engine.rootTfCodes, rootSlot) == TF_5M and array.get(engine.rootLabelMasks, rootSlot) == 0 and array.get(engine.w03Store.rootSwingTfMasks, rootSlot) == SWING_TF_MASK_NONE
+    // Step 4 : its ACTIVE state-set entry and the entry the swap-pop would move
+    if ok
+        int statePos = array.get(engine.rootStateSetPositions, rootSlot)
+        ok := statePos >= 0 and statePos < array.size(engine.stateActiveRootSlots)
+        if ok
+            ok := array.get(engine.stateActiveRootSlots, statePos) == rootSlot
+        if ok
+            int lastPos      = array.size(engine.stateActiveRootSlots) - 1
+            int lastRootSlot = array.get(engine.stateActiveRootSlots, lastPos)
+            ok := lastPos >= 0 and lastRootSlot >= 0 and lastRootSlot < array.size(engine.rootIds) and lastRootSlot < array.size(engine.rootSlotLiveFlags) and lastRootSlot < array.size(engine.rootStateSetPositions)
+            if ok
+                ok := array.get(engine.rootSlotLiveFlags, lastRootSlot) and array.get(engine.rootIds, lastRootSlot) != ID_NONE and array.get(engine.rootStateSetPositions, lastRootSlot) == lastPos and array.get(engine.stateActiveRootSlots, lastPos) == lastRootSlot
+    // Step 5 : commit. The state set first, then the logical state it now reflects.
+    bool retired = false
+    if ok
+        retired := rootStateSetMoveRaw(engine, rootSlot, expectedRootId, ROOT_ACTIVE, ROOT_RETIRED)
+        if retired
+            array.set(engine.rootStates, rootSlot, ROOT_RETIRED)
+    retired
 
 // ============================================================
 // W02 Batch 14 : Side Phase set index raw helpers (I11-9)
