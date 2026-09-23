@@ -7405,6 +7405,162 @@ w03StageFPreflightRaw(ZoneEngine engine, float mintick) =>
     ok
 
 // ============================================================
+// W03 Batch 18B : Stage F executor F0 -> F5 (journal apply and revision commit)
+// Source: I8 (Stage F / F0 - F5), I9, I11-1 .. I11-6, D12
+//
+// Internal only. w03StageFApplyThroughF5Raw runs, in this exact order:
+//   F0 w03StageFPreflightRaw - nothing is written before it succeeds
+//   F1 E1 rows (FVG_INVALIDATE)                          -> fvgInvalidateApplyRaw
+//   F2 E2 rows (NEW_ROOT)                                -> newRootApplyRaw
+//   F3 E3 rows (MA_UPDATE / SWING_TF_MERGE / TIMEHL_LABEL / FVG_FRESH_END)
+//   F4 E4 rows (ROOT_RETIRE)                             -> rootRetireApplyRaw
+//   F5 each dirty revision of the eight W03 revisions + 1, at most once per bar
+// Inside a group the rows are applied in append order; the journal is never
+// sorted. The only journal write is the canonical Path B handoff: right before F3
+// applies a FVG_FRESH_END row carrying SLOT_INVALID / ID_NONE, the target and Root
+// ID that newRootApplyRaw wrote back into its one matching NEW_ROOT FVG row are
+// copied into it. F6 (lastConsumed, MA / TimeHL refs, Accum mirror, TimeHL tracker,
+// nextAccumPairKey) and the journal lifetime belong to B18C: nothing of them is
+// written here and the journal is left as it is. F0 proved every apply, so a false
+// return is an invariant breach: runtime.error("W03_JOURNAL_PREFLIGHT"), no
+// rollback, no recovery. Business call sites = 0 in this Batch.
+// ============================================================
+
+// Runs Stage F F0 -> F5 on this bar's journal. Returns true.
+w03StageFApplyThroughF5Raw(ZoneEngine engine, float mintick) =>
+    // F0 : whole-journal preflight (raises W03_JOURNAL_PREFLIGHT on any failure)
+    bool ok = w03StageFPreflightRaw(engine, mintick)
+    // the eight W03 revision dirty flags of this bar (local only)
+    bool dirtyRootRegistry          = false
+    bool dirtyRootPrice             = false
+    bool dirtyEligibilitySupport    = false
+    bool dirtyEligibilityResistance = false
+    bool dirtyRootQuality           = false
+    bool dirtyFvgState              = false
+    bool dirtyFvgFresh              = false
+    bool dirtyPriceOrder            = false
+    // the slope sign each MA Root had before the current row: the persistent value,
+    // then the slopeDir of every MA_UPDATE row of that EMA already applied this bar
+    int  virtualSlope2000 = engine.w03Store.ema2000SlopeDir
+    int  virtualSlope3000 = engine.w03Store.ema3000SlopeDir
+    int  count = engine.w03Store.journalCount
+    // F1 - F4 : group E1 -> E4, append order inside each group
+    int group = JGROUP_E1
+    while ok and group <= JGROUP_E4
+        int row = 0
+        while ok and row < count
+            if array.get(engine.w03Store.journalGroups, row) == group
+                int op        = array.get(engine.w03Store.journalOps,        row)
+                int category  = array.get(engine.w03Store.journalCategories, row)
+                int direction = array.get(engine.w03Store.journalDirections, row)
+                if op == JOP_FVG_INVALIDATE
+                    // F1
+                    ok := fvgInvalidateApplyRaw(engine, row)
+                    if ok
+                        dirtyFvgState := true
+                        if direction == FVG_BULLISH
+                            dirtyEligibilitySupport := true
+                        else
+                            dirtyEligibilityResistance := true
+                else if op == JOP_NEW_ROOT
+                    // F2 : alloc + identity write-back + attaches, all inside the helper
+                    ok := newRootApplyRaw(engine, row, mintick) != SLOT_INVALID
+                    if ok
+                        dirtyRootRegistry := true
+                        dirtyPriceOrder   := true
+                        if category == CAT_FVG
+                            if direction == FVG_BULLISH
+                                dirtyEligibilitySupport := true
+                            else
+                                dirtyEligibilityResistance := true
+                        else
+                            dirtyEligibilitySupport    := true
+                            dirtyEligibilityResistance := true
+                else if op == JOP_MA_UPDATE
+                    // F3 : what the move changes, captured before the apply
+                    int rootSlot  = array.get(engine.w03Store.journalTargetRootSlots, row)
+                    int oldTick   = array.get(engine.rootPointTicks,          rootSlot)
+                    int oldPos    = array.get(engine.rootPriceOrderPositions, rootSlot)
+                    int subtype   = array.get(engine.w03Store.journalSubtypes,  row)
+                    int newSlope  = array.get(engine.w03Store.journalSlopeDirs, row)
+                    int prevSlope = subtype == SUB_MA_EMA2000 ? virtualSlope2000 : virtualSlope3000
+                    ok := maUpdateApplyRaw(engine, row, mintick)
+                    if ok
+                        int newTick = array.get(engine.rootPointTicks,          rootSlot)
+                        int newPos  = array.get(engine.rootPriceOrderPositions, rootSlot)
+                        if newTick != oldTick
+                            dirtyRootPrice := true
+                        if newPos != oldPos
+                            dirtyPriceOrder := true
+                        // na is its own value: na -> sign and sign -> na are changes
+                        bool slopeChanged = na(prevSlope) != na(newSlope) or (not na(prevSlope) and not na(newSlope) and prevSlope != newSlope)
+                        if slopeChanged
+                            dirtyRootQuality := true
+                        if subtype == SUB_MA_EMA2000
+                            virtualSlope2000 := newSlope
+                        else
+                            virtualSlope3000 := newSlope
+                else if op == JOP_SWING_TF_MERGE
+                    // F3
+                    ok := swingTfMergeApplyRaw(engine, row)
+                    if ok
+                        dirtyRootQuality := true
+                else if op == JOP_TIMEHL_LABEL
+                    // F3
+                    ok := timeHlLabelApplyRaw(engine, row)
+                    if ok
+                        dirtyRootQuality := true
+                else if op == JOP_FVG_FRESH_END
+                    // F3 : canonical Path B - physical identity handoff from the NEW_ROOT FVG
+                    // row newRootApplyRaw already wrote back in F2, right before the apply
+                    if array.get(engine.w03Store.journalTargetRootSlots, row) == SLOT_INVALID and array.get(engine.w03Store.journalExpectedRootIds, row) == ID_NONE
+                        [newRow, matchCount] = pendingNewFvgRowRaw(engine, row)
+                        ok := matchCount == 1 and newRow >= 0 and newRow < count
+                        if ok
+                            int actualSlot = array.get(engine.w03Store.journalTargetRootSlots, newRow)
+                            int actualId   = array.get(engine.w03Store.journalExpectedRootIds, newRow)
+                            ok := actualSlot != SLOT_INVALID and actualId != ID_NONE
+                            if ok
+                                array.set(engine.w03Store.journalTargetRootSlots, row, actualSlot)
+                                array.set(engine.w03Store.journalExpectedRootIds, row, actualId)
+                    if ok
+                        ok := fvgFreshEndApplyRaw(engine, row)
+                    if ok
+                        dirtyFvgFresh := true
+                else if op == JOP_ROOT_RETIRE
+                    // F4
+                    ok := rootRetireApplyRaw(engine, row)
+                    if ok
+                        dirtyRootRegistry          := true
+                        dirtyEligibilitySupport    := true
+                        dirtyEligibilityResistance := true
+                else
+                    ok := false
+            row += 1
+        group += 1
+    // an apply F0 proved cannot fail did: an invariant breach, never repaired
+    if not ok
+        runtime.error("W03_JOURNAL_PREFLIGHT")
+    // F5 : each dirty revision exactly once per bar
+    if dirtyRootRegistry
+        engine.rootRegistryRevision := engine.rootRegistryRevision + 1
+    if dirtyRootPrice
+        engine.rootPriceRevision := engine.rootPriceRevision + 1
+    if dirtyEligibilitySupport
+        engine.rootEligibilityRevisionSupport := engine.rootEligibilityRevisionSupport + 1
+    if dirtyEligibilityResistance
+        engine.rootEligibilityRevisionResistance := engine.rootEligibilityRevisionResistance + 1
+    if dirtyRootQuality
+        engine.rootQualityRevision := engine.rootQualityRevision + 1
+    if dirtyFvgState
+        engine.fvgStateRevision := engine.fvgStateRevision + 1
+    if dirtyFvgFresh
+        engine.fvgFreshRevision := engine.fvgFreshRevision + 1
+    if dirtyPriceOrder
+        engine.priceOrderRevision := engine.priceOrderRevision + 1
+    ok
+
+// ============================================================
 // W02 Batch 14 : Side Phase set index raw helpers (I11-9)
 //
 // Internal only. They maintain the Batch 13 membership of one Side in the Phase set
