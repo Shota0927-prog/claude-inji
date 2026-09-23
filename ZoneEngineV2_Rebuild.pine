@@ -6273,8 +6273,10 @@ virtualFvgFreshBeforeRaw(ZoneEngine engine, int rootSlot, int expectedRootId, in
 // of this bar first, in committed position order, then placed members in the Stage
 // F order of their latest placement (NEW_ROOT insert or MA_UPDATE move, even at an
 // unchanged tick) - exactly the upper_bound insert and the equal-tick-passing move.
-// Every virtual position is derived by counting members; the committed order is
-// read through rootPriceOrderUpperBoundRaw and local walks only.
+// Every virtual position is derived by counting members. The committed upper bound
+// (rootPriceOrderUpperBoundRaw) gives only the committed base rank: a committed
+// entry moved by an earlier MA_UPDATE has its committed-tick contribution removed and
+// its latest virtual tick added; an earlier NEW_ROOT adds its virtual tick only.
 virtualPointOrderPreflightRaw(ZoneEngine engine, int row, float mintick) =>
     int  count     = engine.w03Store.journalCount
     int  op        = array.get(engine.w03Store.journalOps, row)
@@ -6298,25 +6300,144 @@ virtualPointOrderPreflightRaw(ZoneEngine engine, int row, float mintick) =>
         [ubPos, ubOk] = rootPriceOrderUpperBoundRaw(engine, newTick)
         ok        := ubOk
         newUpperC := ubPos
+    // the moving target (MA_UPDATE only): a committed entry (exactly one, at its
+    // stored position) or the one earlier NEW_ROOT MA of this bar with this address
+    int  rootSlot       = SLOT_INVALID
+    int  expectedRootId = ID_NONE
+    bool eCommitted     = false
+    int  eCpos          = SLOT_INVALID
+    int  eNewRow        = SLOT_INVALID
+    int  oldTick        = int(na)
+    int  oldPlace       = SLOT_INVALID
+    int  eCommittedTick = int(na)
+    if ok and op == JOP_MA_UPDATE
+        rootSlot       := array.get(engine.w03Store.journalTargetRootSlots, row)
+        expectedRootId := array.get(engine.w03Store.journalExpectedRootIds, row)
+        if rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootPointTicks) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootPriceOrderPositions)
+            if array.get(engine.rootSlotLiveFlags, rootSlot) and expectedRootId != ID_NONE and array.get(engine.rootIds, rootSlot) == expectedRootId
+                eCommitted := true
+                eCpos      := array.get(engine.rootPriceOrderPositions, rootSlot)
+                ok := eCpos >= 0 and eCpos < orderSize and not array.get(engine.rootIsRangeRootFlags, rootSlot)
+                if ok
+                    ok := array.get(engine.rootPriceOrderSlots, eCpos) == rootSlot
+        if ok and not eCommitted
+            [newRow, newCount] = pendingNewRootRowByAddressRaw(engine, rootSlot, expectedRootId, row)
+            ok := newCount == 1
+            if ok
+                eNewRow := newRow
+                ok := array.get(engine.w03Store.journalCategories, newRow) == CAT_MA
+    // the target's current tick and latest placement (its last earlier MA_UPDATE)
+    if ok and op == JOP_MA_UPDATE
+        if eCommitted
+            eCommittedTick := array.get(engine.rootPointTicks, rootSlot)
+            oldTick        := eCommittedTick
+        else
+            oldTick  := int(math.round(array.get(engine.w03Store.journalPointPrices, eNewRow) / mintick))
+            oldPlace := eNewRow
+        int j = 0
+        while j < count
+            if j != row and array.get(engine.w03Store.journalOps, j) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, j, row) and array.get(engine.w03Store.journalTargetRootSlots, j) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, j) == expectedRootId
+                if oldPlace == SLOT_INVALID or journalAppliedBeforeRaw(engine, oldPlace, j)
+                    oldPlace := j
+                    oldTick  := int(math.round(array.get(engine.w03Store.journalPointPrices, j) / mintick))
+            j += 1
+        ok := not na(oldTick)
+    bool eUnplaced = eCommitted and oldPlace == SLOT_INVALID
+    int  oldUpperC = SLOT_INVALID
+    if ok and op == JOP_MA_UPDATE
+        [oPos, oOk] = rootPriceOrderUpperBoundRaw(engine, oldTick)
+        ok        := oOk
+        oldUpperC := oPos
+    // every other member with a placement event this bar: committed entries moved by
+    // an earlier MA_UPDATE (their committed-tick contribution to a committed upper
+    // bound is removed, their latest virtual tick is added) and earlier point
+    // NEW_ROOT rows (no committed contribution, virtual tick only)
+    int movedBeforeCpos = 0          // moved committed entries at committed index < eCpos
+    int movedLeOld      = 0          // moved committed entries, committed tick <= oldTick
+    int movedLeNew      = 0          // moved committed entries, committed tick <= newTick
+    int placedLessOld   = 0          // placed members before the target now
+    int placedLeNew     = 0          // placed members with virtual tick <= newTick
+    int rightStopTick   = int(na)    // placed member with the lowest key, tick > newTick
+    int rightStopPlace  = SLOT_INVALID
+    int leftStopTick    = int(na)    // placed member with the highest key, tick <= newTick
+    int leftStopPlace   = SLOT_INVALID
+    if ok
+        int f = 0
+        while ok and f < count
+            bool fMember = false
+            int  fTick   = int(na)
+            int  fPlace  = SLOT_INVALID
+            bool fMoved  = false
+            int  fCTick  = int(na)
+            int  fCPos   = SLOT_INVALID
+            if f != row and journalAppliedBeforeRaw(engine, f, row)
+                int fOp = array.get(engine.w03Store.journalOps, f)
+                if fOp == JOP_MA_UPDATE
+                    // a committed Root this MA_UPDATE moved, counted once (its latest move); a
+                    // pending NEW_ROOT target is counted through its own NEW_ROOT row
+                    int  fSlot   = array.get(engine.w03Store.journalTargetRootSlots, f)
+                    int  fId     = array.get(engine.w03Store.journalExpectedRootIds, f)
+                    bool fLatest = not (fSlot == rootSlot and fId == expectedRootId)
+                    int  fK      = 0
+                    while fLatest and fK < count
+                        if fK != row and fK != f and array.get(engine.w03Store.journalOps, fK) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, fK, row) and journalAppliedBeforeRaw(engine, f, fK) and array.get(engine.w03Store.journalTargetRootSlots, fK) == fSlot and array.get(engine.w03Store.journalExpectedRootIds, fK) == fId
+                            fLatest := false
+                        fK += 1
+                    if fLatest and fSlot >= 0 and fSlot < array.size(engine.rootIds) and fSlot < array.size(engine.rootSlotLiveFlags) and fSlot < array.size(engine.rootPointTicks) and fSlot < array.size(engine.rootPriceOrderPositions)
+                        if array.get(engine.rootSlotLiveFlags, fSlot) and fId != ID_NONE and array.get(engine.rootIds, fSlot) == fId
+                            fCPos := array.get(engine.rootPriceOrderPositions, fSlot)
+                            ok := fCPos >= 0 and fCPos < orderSize and not na(array.get(engine.rootPointTicks, fSlot))
+                            if ok
+                                ok := array.get(engine.rootPriceOrderSlots, fCPos) == fSlot
+                            if ok
+                                fMoved  := true
+                                fMember := true
+                                fCTick  := array.get(engine.rootPointTicks, fSlot)
+                                fTick   := int(math.round(array.get(engine.w03Store.journalPointPrices, f) / mintick))
+                                fPlace  := f
+                else if fOp == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, f) != CAT_FVG and f != eNewRow
+                    // an earlier point NEW_ROOT: its own price and placement, or its latest move
+                    int fSlot = predictedNewRootSlotRaw(engine, f)
+                    int fId   = predictedNewRootIdRaw(engine, f)
+                    fMember := true
+                    fTick   := int(math.round(array.get(engine.w03Store.journalPointPrices, f) / mintick))
+                    fPlace  := f
+                    int fK = 0
+                    while fK < count
+                        if fK != row and array.get(engine.w03Store.journalOps, fK) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, fK, row) and array.get(engine.w03Store.journalTargetRootSlots, fK) == fSlot and array.get(engine.w03Store.journalExpectedRootIds, fK) == fId
+                            if journalAppliedBeforeRaw(engine, fPlace, fK)
+                                fPlace := fK
+                                fTick  := int(math.round(array.get(engine.w03Store.journalPointPrices, fK) / mintick))
+                        fK += 1
+            if ok and fMember
+                ok := not na(fTick)
+            if ok and fMember
+                if fMoved
+                    movedBeforeCpos += eUnplaced and fCPos < eCpos ? 1 : 0
+                    movedLeOld      += fCTick <= oldTick ? 1 : 0
+                    movedLeNew      += fCTick <= newTick ? 1 : 0
+                // before the target: lower tick, or an equal tick placed earlier than
+                // the target's own placement (an unplaced target comes first)
+                if fTick < oldTick or (fTick == oldTick and oldPlace != SLOT_INVALID and journalAppliedBeforeRaw(engine, fPlace, oldPlace))
+                    placedLessOld += 1
+                if fTick <= newTick
+                    placedLeNew += 1
+                    if leftStopPlace == SLOT_INVALID or fTick > leftStopTick or (fTick == leftStopTick and journalAppliedBeforeRaw(engine, leftStopPlace, fPlace))
+                        leftStopTick  := fTick
+                        leftStopPlace := fPlace
+                else
+                    if rightStopPlace == SLOT_INVALID or fTick < rightStopTick or (fTick == rightStopTick and journalAppliedBeforeRaw(engine, fPlace, rightStopPlace))
+                        rightStopTick  := fTick
+                        rightStopPlace := fPlace
+            f += 1
     // ---------------- E2 : point NEW_ROOT insert ----------------
     if ok and op == JOP_NEW_ROOT
-        // no MA_UPDATE is applied before an E2 row: every earlier member keeps its
-        // committed tick, and an earlier NEW_ROOT keeps its own price and placement
-        int j = 0
-        while ok and j < count
-            if j != row and array.get(engine.w03Store.journalOps, j) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, j, row)
-                ok := false
-            j += 1
-        // insert position = members with tick <= newTick (upper_bound: after the
-        // equal-tick group, whose placements are all earlier than this row)
-        int insertPos = newUpperC
-        if ok
-            int p = 0
-            while p < count
-                if p != row and array.get(engine.w03Store.journalOps, p) == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, p) != CAT_FVG and journalAppliedBeforeRaw(engine, p, row)
-                    if int(math.round(array.get(engine.w03Store.journalPointPrices, p) / mintick)) <= newTick
-                        insertPos += 1
-                p += 1
+        // insert position = members with virtual tick <= newTick (upper_bound: after the
+        // equal-tick group, whose placements are all earlier than this row). Unplaced
+        // committed members: the committed upper bound minus the moved entries it
+        // counted at their committed tick; placed members: by their virtual tick.
+        int insertPos = newUpperC - movedLeNew + placedLeNew
+        ok := insertPos >= 0 and insertPos <= virtualSize
         // phase 0 : the binary search rootPriceOrderUpperBoundRaw runs on the virtual
         // order, probe by probe; phase 1 : left neighbour; phase 2 : right neighbour
         int lo    = 0
@@ -6342,41 +6463,201 @@ virtualPointOrderPreflightRaw(ZoneEngine engine, int row, float mintick) =>
                 else
                     phase := 3
             if ok and probe != SLOT_INVALID
-                // the member at virtual index probe: an earlier NEW_ROOT whose own
-                // virtual position is probe, else the committed entry at probe minus
-                // the earlier NEW_ROOT members placed before it
-                int  probeTick  = int(na)
-                bool pendingHit = false
-                int  pendingLess = 0
-                int  p = 0
-                while ok and p < count
-                    if p != row and array.get(engine.w03Store.journalOps, p) == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, p) != CAT_FVG and journalAppliedBeforeRaw(engine, p, row)
-                        int pTick = int(math.round(array.get(engine.w03Store.journalPointPrices, p) / mintick))
-                        [pUpper, pUpperOk] = rootPriceOrderUpperBoundRaw(engine, pTick)
-                        ok := pUpperOk
-                        int pPos = pUpper
-                        int q = 0
-                        while q < count
-                            if q != row and q != p and array.get(engine.w03Store.journalOps, q) == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, q) != CAT_FVG and journalAppliedBeforeRaw(engine, q, row)
-                                int qTick = int(math.round(array.get(engine.w03Store.journalPointPrices, q) / mintick))
-                                if qTick < pTick or (qTick == pTick and journalAppliedBeforeRaw(engine, q, p))
-                                    pPos += 1
-                            q += 1
-                        if pPos == probe
-                            pendingHit := true
-                            probeTick  := pTick
-                        else if pPos < probe
-                            pendingLess += 1
-                    p += 1
-                if ok and not pendingHit
-                    // a committed entry: the upper-bound / neighbour member checks
-                    int c = probe - pendingLess
-                    ok := c >= 0 and c < orderSize
+                // the member at virtual index probe: a placed member whose own virtual
+                // position is probe, else the unplaced committed entry of that rank
+                int  probeTick    = int(na)
+                bool placedHit    = false
+                int  placedBefore = 0
+                int  a = 0
+                while ok and a < count
+                    bool aMember = false
+                    int  aTick   = int(na)
+                    int  aPlace  = SLOT_INVALID
+                    bool aMoved  = false
+                    int  aCTick  = int(na)
+                    int  aCPos   = SLOT_INVALID
+                    if a != row and journalAppliedBeforeRaw(engine, a, row)
+                        int aOp = array.get(engine.w03Store.journalOps, a)
+                        if aOp == JOP_MA_UPDATE
+                            // a committed Root this MA_UPDATE moved, counted once (its latest move); a
+                            // pending NEW_ROOT target is counted through its own NEW_ROOT row
+                            int  aSlot   = array.get(engine.w03Store.journalTargetRootSlots, a)
+                            int  aId     = array.get(engine.w03Store.journalExpectedRootIds, a)
+                            bool aLatest = not (aSlot == rootSlot and aId == expectedRootId)
+                            int  aK      = 0
+                            while aLatest and aK < count
+                                if aK != row and aK != a and array.get(engine.w03Store.journalOps, aK) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, aK, row) and journalAppliedBeforeRaw(engine, a, aK) and array.get(engine.w03Store.journalTargetRootSlots, aK) == aSlot and array.get(engine.w03Store.journalExpectedRootIds, aK) == aId
+                                    aLatest := false
+                                aK += 1
+                            if aLatest and aSlot >= 0 and aSlot < array.size(engine.rootIds) and aSlot < array.size(engine.rootSlotLiveFlags) and aSlot < array.size(engine.rootPointTicks) and aSlot < array.size(engine.rootPriceOrderPositions)
+                                if array.get(engine.rootSlotLiveFlags, aSlot) and aId != ID_NONE and array.get(engine.rootIds, aSlot) == aId
+                                    aCPos := array.get(engine.rootPriceOrderPositions, aSlot)
+                                    ok := aCPos >= 0 and aCPos < orderSize and not na(array.get(engine.rootPointTicks, aSlot))
+                                    if ok
+                                        ok := array.get(engine.rootPriceOrderSlots, aCPos) == aSlot
+                                    if ok
+                                        aMoved  := true
+                                        aMember := true
+                                        aCTick  := array.get(engine.rootPointTicks, aSlot)
+                                        aTick   := int(math.round(array.get(engine.w03Store.journalPointPrices, a) / mintick))
+                                        aPlace  := a
+                        else if aOp == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, a) != CAT_FVG and a != eNewRow
+                            // an earlier point NEW_ROOT: its own price and placement, or its latest move
+                            int aSlot = predictedNewRootSlotRaw(engine, a)
+                            int aId   = predictedNewRootIdRaw(engine, a)
+                            aMember := true
+                            aTick   := int(math.round(array.get(engine.w03Store.journalPointPrices, a) / mintick))
+                            aPlace  := a
+                            int aK = 0
+                            while aK < count
+                                if aK != row and array.get(engine.w03Store.journalOps, aK) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, aK, row) and array.get(engine.w03Store.journalTargetRootSlots, aK) == aSlot and array.get(engine.w03Store.journalExpectedRootIds, aK) == aId
+                                    if journalAppliedBeforeRaw(engine, aPlace, aK)
+                                        aPlace := aK
+                                        aTick  := int(math.round(array.get(engine.w03Store.journalPointPrices, aK) / mintick))
+                                aK += 1
+                    if ok and aMember
+                        ok := not na(aTick)
+                    if ok and aMember
+                        // its virtual position: unplaced committed members with tick <= its
+                        // tick, plus placed members ordered before it
+                        [aUpper, aUpperOk] = rootPriceOrderUpperBoundRaw(engine, aTick)
+                        ok := aUpperOk
+                        int aPos = aUpper
+                        int b = 0
+                        while ok and b < count
+                            bool bMember = false
+                            int  bTick   = int(na)
+                            int  bPlace  = SLOT_INVALID
+                            bool bMoved  = false
+                            int  bCTick  = int(na)
+                            int  bCPos   = SLOT_INVALID
+                            if b != row and journalAppliedBeforeRaw(engine, b, row)
+                                int bOp = array.get(engine.w03Store.journalOps, b)
+                                if bOp == JOP_MA_UPDATE
+                                    // a committed Root this MA_UPDATE moved, counted once (its latest move); a
+                                    // pending NEW_ROOT target is counted through its own NEW_ROOT row
+                                    int  bSlot   = array.get(engine.w03Store.journalTargetRootSlots, b)
+                                    int  bId     = array.get(engine.w03Store.journalExpectedRootIds, b)
+                                    bool bLatest = not (bSlot == rootSlot and bId == expectedRootId)
+                                    int  bK      = 0
+                                    while bLatest and bK < count
+                                        if bK != row and bK != b and array.get(engine.w03Store.journalOps, bK) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, bK, row) and journalAppliedBeforeRaw(engine, b, bK) and array.get(engine.w03Store.journalTargetRootSlots, bK) == bSlot and array.get(engine.w03Store.journalExpectedRootIds, bK) == bId
+                                            bLatest := false
+                                        bK += 1
+                                    if bLatest and bSlot >= 0 and bSlot < array.size(engine.rootIds) and bSlot < array.size(engine.rootSlotLiveFlags) and bSlot < array.size(engine.rootPointTicks) and bSlot < array.size(engine.rootPriceOrderPositions)
+                                        if array.get(engine.rootSlotLiveFlags, bSlot) and bId != ID_NONE and array.get(engine.rootIds, bSlot) == bId
+                                            bCPos := array.get(engine.rootPriceOrderPositions, bSlot)
+                                            ok := bCPos >= 0 and bCPos < orderSize and not na(array.get(engine.rootPointTicks, bSlot))
+                                            if ok
+                                                ok := array.get(engine.rootPriceOrderSlots, bCPos) == bSlot
+                                            if ok
+                                                bMoved  := true
+                                                bMember := true
+                                                bCTick  := array.get(engine.rootPointTicks, bSlot)
+                                                bTick   := int(math.round(array.get(engine.w03Store.journalPointPrices, b) / mintick))
+                                                bPlace  := b
+                                else if bOp == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, b) != CAT_FVG and b != eNewRow
+                                    // an earlier point NEW_ROOT: its own price and placement, or its latest move
+                                    int bSlot = predictedNewRootSlotRaw(engine, b)
+                                    int bId   = predictedNewRootIdRaw(engine, b)
+                                    bMember := true
+                                    bTick   := int(math.round(array.get(engine.w03Store.journalPointPrices, b) / mintick))
+                                    bPlace  := b
+                                    int bK = 0
+                                    while bK < count
+                                        if bK != row and array.get(engine.w03Store.journalOps, bK) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, bK, row) and array.get(engine.w03Store.journalTargetRootSlots, bK) == bSlot and array.get(engine.w03Store.journalExpectedRootIds, bK) == bId
+                                            if journalAppliedBeforeRaw(engine, bPlace, bK)
+                                                bPlace := bK
+                                                bTick  := int(math.round(array.get(engine.w03Store.journalPointPrices, bK) / mintick))
+                                        bK += 1
+                            if ok and bMember
+                                ok := not na(bTick)
+                            if ok and bMember
+                                if bMoved and bCTick <= aTick
+                                    aPos -= 1
+                                if b != a and (bTick < aTick or (bTick == aTick and journalAppliedBeforeRaw(engine, bPlace, aPlace)))
+                                    aPos += 1
+                            b += 1
+                        if aPos == probe
+                            placedHit := true
+                            probeTick := aTick
+                        else if aPos < probe
+                            placedBefore += 1
+                    a += 1
+                if ok and not placedHit
+                    // the unplaced committed entry of rank probe - placedBefore: the least
+                    // committed index whose unplaced prefix holds exactly that rank
+                    int  unplacedRank = probe - placedBefore
+                    int  cIdx         = unplacedRank
+                    bool settled      = false
+                    int  guard        = 0
+                    while ok and not settled and guard <= count
+                        int movedUpTo = 0
+                        int m = 0
+                        while ok and m < count
+                            bool mMember = false
+                            int  mTick   = int(na)
+                            int  mPlace  = SLOT_INVALID
+                            bool mMoved  = false
+                            int  mCTick  = int(na)
+                            int  mCPos   = SLOT_INVALID
+                            if m != row and journalAppliedBeforeRaw(engine, m, row)
+                                int mOp = array.get(engine.w03Store.journalOps, m)
+                                if mOp == JOP_MA_UPDATE
+                                    // a committed Root this MA_UPDATE moved, counted once (its latest move); a
+                                    // pending NEW_ROOT target is counted through its own NEW_ROOT row
+                                    int  mSlot   = array.get(engine.w03Store.journalTargetRootSlots, m)
+                                    int  mId     = array.get(engine.w03Store.journalExpectedRootIds, m)
+                                    bool mLatest = not (mSlot == rootSlot and mId == expectedRootId)
+                                    int  mK      = 0
+                                    while mLatest and mK < count
+                                        if mK != row and mK != m and array.get(engine.w03Store.journalOps, mK) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, mK, row) and journalAppliedBeforeRaw(engine, m, mK) and array.get(engine.w03Store.journalTargetRootSlots, mK) == mSlot and array.get(engine.w03Store.journalExpectedRootIds, mK) == mId
+                                            mLatest := false
+                                        mK += 1
+                                    if mLatest and mSlot >= 0 and mSlot < array.size(engine.rootIds) and mSlot < array.size(engine.rootSlotLiveFlags) and mSlot < array.size(engine.rootPointTicks) and mSlot < array.size(engine.rootPriceOrderPositions)
+                                        if array.get(engine.rootSlotLiveFlags, mSlot) and mId != ID_NONE and array.get(engine.rootIds, mSlot) == mId
+                                            mCPos := array.get(engine.rootPriceOrderPositions, mSlot)
+                                            ok := mCPos >= 0 and mCPos < orderSize and not na(array.get(engine.rootPointTicks, mSlot))
+                                            if ok
+                                                ok := array.get(engine.rootPriceOrderSlots, mCPos) == mSlot
+                                            if ok
+                                                mMoved  := true
+                                                mMember := true
+                                                mCTick  := array.get(engine.rootPointTicks, mSlot)
+                                                mTick   := int(math.round(array.get(engine.w03Store.journalPointPrices, m) / mintick))
+                                                mPlace  := m
+                                else if mOp == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, m) != CAT_FVG and m != eNewRow
+                                    // an earlier point NEW_ROOT: its own price and placement, or its latest move
+                                    int mSlot = predictedNewRootSlotRaw(engine, m)
+                                    int mId   = predictedNewRootIdRaw(engine, m)
+                                    mMember := true
+                                    mTick   := int(math.round(array.get(engine.w03Store.journalPointPrices, m) / mintick))
+                                    mPlace  := m
+                                    int mK = 0
+                                    while mK < count
+                                        if mK != row and array.get(engine.w03Store.journalOps, mK) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, mK, row) and array.get(engine.w03Store.journalTargetRootSlots, mK) == mSlot and array.get(engine.w03Store.journalExpectedRootIds, mK) == mId
+                                            if journalAppliedBeforeRaw(engine, mPlace, mK)
+                                                mPlace := mK
+                                                mTick  := int(math.round(array.get(engine.w03Store.journalPointPrices, mK) / mintick))
+                                        mK += 1
+                            if ok and mMember
+                                ok := not na(mTick)
+                            if ok and mMoved and mCPos <= cIdx
+                                movedUpTo += 1
+                            m += 1
+                        int nextIdx = unplacedRank + movedUpTo
+                        if nextIdx == cIdx
+                            settled := true
+                        else
+                            cIdx := nextIdx
+                        guard += 1
+                    ok := ok and settled and unplacedRank >= 0 and cIdx >= 0 and cIdx < orderSize
                     if ok
-                        int slot = array.get(engine.rootPriceOrderSlots, c)
+                        // the upper-bound / neighbour member checks
+                        int slot = array.get(engine.rootPriceOrderSlots, cIdx)
                         ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootPointTicks) and slot < array.size(engine.rootIsRangeRootFlags) and slot < array.size(engine.rootPriceOrderPositions)
                         if ok
-                            ok := array.get(engine.rootSlotLiveFlags, slot) and not array.get(engine.rootIsRangeRootFlags, slot) and not na(array.get(engine.rootPointTicks, slot)) and array.get(engine.rootPriceOrderPositions, slot) == c
+                            ok := array.get(engine.rootSlotLiveFlags, slot) and not array.get(engine.rootIsRangeRootFlags, slot) and not na(array.get(engine.rootPointTicks, slot)) and array.get(engine.rootPriceOrderPositions, slot) == cIdx
                         if ok
                             probeTick := array.get(engine.rootPointTicks, slot)
                 if ok
@@ -6393,139 +6674,25 @@ virtualPointOrderPreflightRaw(ZoneEngine engine, int row, float mintick) =>
                         // right neighbour: tick > newTick
                         ok    := probeTick > newTick
                         phase := 3
-        // every member the insert shifts right: the committed ones are the committed
-        // entries with tick > newTick; earlier NEW_ROOT members were placed by F2
+        // every member the insert shifts right: the unplaced committed entries with
+        // tick > newTick; placed members were placed by F2 / an earlier row
         if ok
             int c = newUpperC
             while ok and c < orderSize
                 int slot = array.get(engine.rootPriceOrderSlots, c)
                 ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootPointTicks) and slot < array.size(engine.rootIsRangeRootFlags) and slot < array.size(engine.rootPriceOrderPositions)
+                bool placed = false
                 if ok
+                    int k = 0
+                    while not placed and k < count
+                        if k != row and array.get(engine.w03Store.journalOps, k) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, k, row) and array.get(engine.w03Store.journalTargetRootSlots, k) == slot and array.get(engine.w03Store.journalExpectedRootIds, k) == array.get(engine.rootIds, slot)
+                            placed := true
+                        k += 1
+                if ok and not placed
                     ok := array.get(engine.rootSlotLiveFlags, slot) and not array.get(engine.rootIsRangeRootFlags, slot) and not na(array.get(engine.rootPointTicks, slot)) and array.get(engine.rootPriceOrderPositions, slot) == c
                 c += 1
     // ---------------- E3 : MA_UPDATE move ----------------
     if ok and op == JOP_MA_UPDATE
-        int rootSlot       = array.get(engine.w03Store.journalTargetRootSlots, row)
-        int expectedRootId = array.get(engine.w03Store.journalExpectedRootIds, row)
-        // the target: a committed entry (exactly one, at its stored position) or the
-        // one earlier NEW_ROOT MA of this bar with this predicted address
-        bool eCommitted = false
-        int  eCpos      = SLOT_INVALID
-        int  eNewRow    = SLOT_INVALID
-        if rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootPointTicks) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootPriceOrderPositions)
-            if array.get(engine.rootSlotLiveFlags, rootSlot) and expectedRootId != ID_NONE and array.get(engine.rootIds, rootSlot) == expectedRootId
-                eCommitted := true
-                eCpos      := array.get(engine.rootPriceOrderPositions, rootSlot)
-                ok := eCpos >= 0 and eCpos < orderSize and not array.get(engine.rootIsRangeRootFlags, rootSlot)
-                if ok
-                    ok := array.get(engine.rootPriceOrderSlots, eCpos) == rootSlot
-        if ok and not eCommitted
-            [newRow, newCount] = pendingNewRootRowByAddressRaw(engine, rootSlot, expectedRootId, row)
-            ok := newCount == 1
-            if ok
-                eNewRow := newRow
-                ok := array.get(engine.w03Store.journalCategories, newRow) == CAT_MA
-        // the target's current tick and latest placement (its last earlier MA_UPDATE)
-        int oldTick        = int(na)
-        int oldPlace       = SLOT_INVALID
-        int eCommittedTick = int(na)
-        if ok
-            if eCommitted
-                eCommittedTick := array.get(engine.rootPointTicks, rootSlot)
-                oldTick        := eCommittedTick
-            else
-                oldTick  := int(math.round(array.get(engine.w03Store.journalPointPrices, eNewRow) / mintick))
-                oldPlace := eNewRow
-            int j = 0
-            while j < count
-                if j != row and array.get(engine.w03Store.journalOps, j) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, j, row) and array.get(engine.w03Store.journalTargetRootSlots, j) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, j) == expectedRootId
-                    if oldPlace == SLOT_INVALID or journalAppliedBeforeRaw(engine, oldPlace, j)
-                        oldPlace := j
-                        oldTick  := int(math.round(array.get(engine.w03Store.journalPointPrices, j) / mintick))
-                j += 1
-            ok := not na(oldTick)
-        bool eUnplaced = eCommitted and oldPlace == SLOT_INVALID
-        int  oldUpperC = SLOT_INVALID
-        if ok
-            [oPos, oOk] = rootPriceOrderUpperBoundRaw(engine, oldTick)
-            ok        := oOk
-            oldUpperC := oPos
-        // the other placed members: committed entries moved earlier this bar (latest
-        // MA_UPDATE per Root) and earlier point NEW_ROOT rows (their latest placement)
-        int movedBeforeCpos = 0          // moved committed entries at committed index < eCpos
-        int movedLeOld      = 0          // moved committed entries, committed tick <= oldTick
-        int movedLeNew      = 0          // moved committed entries, committed tick <= newTick
-        int placedLessOld   = 0          // placed members before the target now
-        int placedLeNew     = 0          // placed members with tick <= newTick
-        int rightStopTick   = int(na)    // placed member with the lowest key, tick > newTick
-        int rightStopPlace  = SLOT_INVALID
-        int leftStopTick    = int(na)    // placed member with the highest key, tick <= newTick
-        int leftStopPlace   = SLOT_INVALID
-        if ok
-            int f = 0
-            while ok and f < count
-                bool isMember = false
-                int  fTick    = int(na)
-                int  fPlace   = SLOT_INVALID
-                int  fSlot    = SLOT_INVALID
-                int  fId      = ID_NONE
-                if f != row and journalAppliedBeforeRaw(engine, f, row)
-                    int fOp = array.get(engine.w03Store.journalOps, f)
-                    if fOp == JOP_MA_UPDATE
-                        fSlot := array.get(engine.w03Store.journalTargetRootSlots, f)
-                        fId   := array.get(engine.w03Store.journalExpectedRootIds, f)
-                        bool latest = not (fSlot == rootSlot and fId == expectedRootId)
-                        int  k = 0
-                        while latest and k < count
-                            if k != row and k != f and array.get(engine.w03Store.journalOps, k) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, k, row) and journalAppliedBeforeRaw(engine, f, k) and array.get(engine.w03Store.journalTargetRootSlots, k) == fSlot and array.get(engine.w03Store.journalExpectedRootIds, k) == fId
-                                latest := false
-                            k += 1
-                        // a committed Root moved this bar; a pending NEW_ROOT target is
-                        // counted through its own NEW_ROOT row below
-                        if latest and fSlot >= 0 and fSlot < array.size(engine.rootIds) and fSlot < array.size(engine.rootSlotLiveFlags) and fSlot < array.size(engine.rootPointTicks) and fSlot < array.size(engine.rootPriceOrderPositions)
-                            if array.get(engine.rootSlotLiveFlags, fSlot) and fId != ID_NONE and array.get(engine.rootIds, fSlot) == fId
-                                int xCpos = array.get(engine.rootPriceOrderPositions, fSlot)
-                                ok := xCpos >= 0 and xCpos < orderSize and not na(array.get(engine.rootPointTicks, fSlot))
-                                if ok
-                                    ok := array.get(engine.rootPriceOrderSlots, xCpos) == fSlot
-                                if ok
-                                    int xTick = array.get(engine.rootPointTicks, fSlot)
-                                    movedBeforeCpos += eUnplaced and xCpos < eCpos ? 1 : 0
-                                    movedLeOld      += xTick <= oldTick ? 1 : 0
-                                    movedLeNew      += xTick <= newTick ? 1 : 0
-                                    isMember := true
-                                    fTick    := int(math.round(array.get(engine.w03Store.journalPointPrices, f) / mintick))
-                                    fPlace   := f
-                    else if fOp == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, f) != CAT_FVG and f != eNewRow
-                        fSlot    := predictedNewRootSlotRaw(engine, f)
-                        fId      := predictedNewRootIdRaw(engine, f)
-                        isMember := true
-                        fTick    := int(math.round(array.get(engine.w03Store.journalPointPrices, f) / mintick))
-                        fPlace   := f
-                        int k = 0
-                        while k < count
-                            if k != row and array.get(engine.w03Store.journalOps, k) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, k, row) and array.get(engine.w03Store.journalTargetRootSlots, k) == fSlot and array.get(engine.w03Store.journalExpectedRootIds, k) == fId
-                                if journalAppliedBeforeRaw(engine, fPlace, k)
-                                    fPlace := k
-                                    fTick  := int(math.round(array.get(engine.w03Store.journalPointPrices, k) / mintick))
-                            k += 1
-                if ok and isMember
-                    ok := not na(fTick)
-                    if ok
-                        // before the target: lower tick, or an equal tick placed earlier
-                        // than the target's own placement (an unplaced target comes first)
-                        if fTick < oldTick or (fTick == oldTick and oldPlace != SLOT_INVALID and journalAppliedBeforeRaw(engine, fPlace, oldPlace))
-                            placedLessOld += 1
-                        if fTick <= newTick
-                            placedLeNew += 1
-                            if leftStopPlace == SLOT_INVALID or fTick > leftStopTick or (fTick == leftStopTick and journalAppliedBeforeRaw(engine, leftStopPlace, fPlace))
-                                leftStopTick  := fTick
-                                leftStopPlace := fPlace
-                        else
-                            if rightStopPlace == SLOT_INVALID or fTick < rightStopTick or (fTick == rightStopTick and journalAppliedBeforeRaw(engine, fPlace, rightStopPlace))
-                                rightStopTick  := fTick
-                                rightStopPlace := fPlace
-                f += 1
         // oldPos : members before the target; targetPos : members (other than the
         // target) with tick <= newTick - where the move leaves it, the end of the
         // newTick group, for both scan directions
@@ -6961,31 +7128,9 @@ w03StageFPreflightRaw(ZoneEngine engine, float mintick) =>
                                     ok := freshResolved and virtualState == ROOT_ACTIVE and virtualFresh == fvgFresh and array.get(engine.rootIsBroadFvgFlags, rootSlot) == isBroad
                                 else
                                     ok := freshResolved and virtualState == oldState and virtualFresh and array.get(engine.rootIsBroadFvgFlags, rootSlot) == isBroad
-                        else if ok and op == JOP_FVG_FRESH_END
-                            // an FVG created earlier this bar, named by its predicted address (E1
-                            // runs before E2, so FVG_INVALIDATE never reaches here)
-                            [newRow, newCount] = pendingNewRootRowByAddressRaw(engine, rootSlot, expectedRootId, row)
-                            ok := newCount == 1
-                            if ok
-                                // that NEW_ROOT row passed F0 above: its FVG contract and attaches give
-                                // the range Root, both NativeRange positions and every FVG set entry
-                                ok := array.get(engine.w03Store.journalCategories, newRow) == CAT_FVG and array.get(engine.w03Store.journalTfCodes, newRow) == tfCode and array.get(engine.w03Store.journalOriginKeys, newRow) == originKey and array.get(engine.w03Store.journalSubtypes, newRow) == subtype and array.get(engine.w03Store.journalDirections, newRow) == direction and array.get(engine.w03Store.journalIsBroadFlags, newRow) == isBroad
-                            if ok
-                                int pendingState = virtualRootStateBeforeRaw(engine, rootSlot, expectedRootId, row)
-                                [pendingFresh, pendingResolved] = virtualFvgFreshBeforeRaw(engine, rootSlot, expectedRootId, row)
-                                ok := pendingResolved and pendingState == oldState and pendingFresh
-                            if ok
-                                // a Path B row on the same new FVG ends the same Fresh: whichever of
-                                // the two F3 applies second fails, so the journal fails here
-                                int newTf     = array.get(engine.w03Store.journalTfCodes,     newRow)
-                                int newDir    = array.get(engine.w03Store.journalDirections,  newRow)
-                                int newOrigin = array.get(engine.w03Store.journalOriginTimes, newRow)
-                                int j = 0
-                                while ok and j < count
-                                    if j != row and array.get(engine.w03Store.journalOps, j) == JOP_FVG_FRESH_END and array.get(engine.w03Store.journalTargetRootSlots, j) == SLOT_INVALID and array.get(engine.w03Store.journalExpectedRootIds, j) == ID_NONE and array.get(engine.w03Store.journalTfCodes, j) == newTf and array.get(engine.w03Store.journalDirections, j) == newDir and array.get(engine.w03Store.journalOriginTimes, j) == newOrigin
-                                        ok := false
-                                    j += 1
                         else
+                            // not a committed Root: an FVG created this bar is reached only by
+                            // canonical Path B above, never by a predicted address
                             ok := false
             row += 1
         group += 1
