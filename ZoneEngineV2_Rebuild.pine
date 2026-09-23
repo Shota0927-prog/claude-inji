@@ -801,13 +801,13 @@ export type ZoneEngine
     // comparator, Root ID, Core ID, View, Event, Merge / Split or price order.
     // This storage is neither the A6.7 list of currently valid Root IDs of a Side
     // View nor the A6.8 Zone origin Root set; neither is replaced by it.
-    // Batch 23 added this storage and Batch 24 connected the two Root metadata
-    // arrays (head, count) to the Root physical slot growth / reset lifecycle, so a
-    // fresh or reset slot reads head = SLOT_INVALID and count = 0. The edge pool
-    // itself is still untouched: edge data is 0 entries and its call sites = 0.
-    // Still missing, deliberately: edge alloc / free, edge validation, add and
-    // detach, duplicate prevention, the Root free and Core free detach, the Core
-    // lifecycle connection, Candidate adoption and Core association.
+    // Implemented so far: this storage (Batch 23), the Root head / count lifecycle
+    // on physical slot growth and reset (Batch 24), the edge row physical lifecycle
+    // (Batch 25) and the chain validation, duplicate prevention and atomic add
+    // (Batch 26).
+    // Still missing, deliberately: detach, the Root free and Core free detach, the
+    // Core lifecycle connection, Candidate adoption and Core association. No
+    // Production business path calls any of it, so the runtime holds 0 edges.
     array<int>   rootParticipationHeadEdgeIndexes
     array<int>   rootParticipationCounts
     array<int>   participationEdgeRootSlots
@@ -1470,9 +1470,12 @@ rootFreeSlotRaw(ZoneEngine engine, int rootSlot) =>
 // participationEdgeFreeIndexes is a LIFO stack: alloc pops, free pushes, and
 // array.remove(0) / array.shift() / array.unshift() are never used. The six row
 // arrays always share one size and are never shrunk.
-// Call sites = 0 in this Batch, so there is no physical edge row, no free row and
-// no live edge. Duplicate prevention, add, detach and the Root / Core free detach
-// are still absent.
+// Call sites: participationEdgeResetRaw is called by the alloc and free helpers
+// below, and participationEdgeAllocRaw by the Batch 26 add helper.
+// participationEdgeFreeRaw has none, since detach is still absent. No Production
+// Stage, Candidate or Core logic calls any of them, so the runtime still holds no
+// physical edge row, no free row and no live edge. The Root free and Core free
+// detach are still absent too.
 // ============================================================
 
 // Returns one existing physical edge row to the unused / free sentinel state: it
@@ -1520,6 +1523,163 @@ participationEdgeFreeRaw(ZoneEngine engine, int edgeIndex) =>
             array.push(engine.participationEdgeFreeIndexes, edgeIndex)
             freed := true
     freed
+
+// ============================================================
+// W02 Batch 26 : participation chain validation, duplicate check, atomic add (I11-7)
+//
+// Internal only. An edge's identity is Root ID + Core ID + Side, never a rootSlot
+// or a sideSlot on its own, so the row keeps expectedRootId and expectedCoreId and
+// both are re-checked against the slots that hold them.
+// The two validation helpers are strictly read-only: no head, count, row, chain or
+// free stack write, and no repair of an inconsistency they find.
+// The add helper decides everything before it touches anything: Root ownership,
+// Side address and Core ownership, the whole chain, the duplicate check and the
+// free stack top are all settled first, so a rejected add allocates nothing, frees
+// nothing and mutates nothing. Only after that does it take a row, fill it, link it
+// at the head, raise the count and set the live flag last, as the commit marker,
+// with no fallible step after it.
+// A new edge goes to the head because the chain has no order semantics: it is never
+// a Root ID, Core ID, Side, Candidate or price order.
+// Detach, the Root free detach and the Core free detach are still absent, so
+// participationEdgeFreeRaw keeps zero call sites, and no Production Stage,
+// Candidate or Core logic calls any of this yet: the runtime still holds 0 edges.
+// ============================================================
+
+// True only when this Root's participation chain is exactly consistent: the Root is
+// live and owned, the six edge row arrays share one size, head and count agree with
+// each other, and walking count edges from the head visits count live rows that all
+// belong to this Root, whose Side address and Core ownership still hold, and ends
+// exactly at SLOT_INVALID. A short chain, a long chain, a cycle or a stale row makes
+// it false. Read-only: nothing is mutated and nothing is repaired.
+participationRootChainValidRaw(ZoneEngine engine, int rootSlot) =>
+    bool valid = false
+    bool ok = rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootParticipationHeadEdgeIndexes) and rootSlot < array.size(engine.rootParticipationCounts)
+    if ok
+        ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) != ID_NONE
+    int edgeRowCount = array.size(engine.participationEdgeRootSlots)
+    if ok
+        // every edge row array must share one physical size
+        ok := edgeRowCount == array.size(engine.participationEdgeExpectedRootIds) and edgeRowCount == array.size(engine.participationEdgeSideSlots) and edgeRowCount == array.size(engine.participationEdgeExpectedCoreIds) and edgeRowCount == array.size(engine.participationEdgeNextByRootIndexes) and edgeRowCount == array.size(engine.participationEdgeLiveFlags)
+    if ok
+        int rootId = array.get(engine.rootIds,                           rootSlot)
+        int head   = array.get(engine.rootParticipationHeadEdgeIndexes,  rootSlot)
+        int count  = array.get(engine.rootParticipationCounts,           rootSlot)
+        if count < 0 or count > edgeRowCount
+            ok := false
+        if ok and count == 0
+            valid := head == SLOT_INVALID
+        if ok and count > 0
+            bool chainOk   = head != SLOT_INVALID
+            int  edgeIndex = head
+            int  seen      = 0
+            // bounded by count: every pass either advances seen or ends the walk
+            while chainOk and seen < count
+                bool rowOk = edgeIndex >= 0 and edgeIndex < edgeRowCount
+                if rowOk
+                    rowOk := array.get(engine.participationEdgeLiveFlags, edgeIndex)
+                if rowOk
+                    rowOk := array.get(engine.participationEdgeRootSlots, edgeIndex) == rootSlot and array.get(engine.participationEdgeExpectedRootIds, edgeIndex) == rootId
+                int edgeSideSlot = SLOT_INVALID
+                int edgeCoreSlot = SLOT_INVALID
+                if rowOk
+                    edgeSideSlot := array.get(engine.participationEdgeSideSlots, edgeIndex)
+                    rowOk := edgeSideSlot >= 0 and edgeSideSlot < array.size(engine.sidePhases)
+                if rowOk
+                    edgeCoreSlot := int(math.floor(edgeSideSlot / 2))
+                    int edgeSideIndex = edgeSideSlot - edgeCoreSlot * 2
+                    rowOk := (edgeSideIndex == 0 or edgeSideIndex == 1) and edgeCoreSlot >= 0 and edgeCoreSlot < array.size(engine.coreIds) and edgeCoreSlot < array.size(engine.coreSlotLiveFlags)
+                if rowOk
+                    rowOk := array.get(engine.coreSlotLiveFlags, edgeCoreSlot)
+                if rowOk
+                    int edgeExpectedCoreId = array.get(engine.participationEdgeExpectedCoreIds, edgeIndex)
+                    rowOk := edgeExpectedCoreId != ID_NONE and array.get(engine.coreIds, edgeCoreSlot) == edgeExpectedCoreId
+                if rowOk
+                    edgeIndex := array.get(engine.participationEdgeNextByRootIndexes, edgeIndex)
+                    seen      += 1
+                else
+                    chainOk := false
+            if chainOk
+                valid := seen == count and edgeIndex == SLOT_INVALID
+    valid
+
+// True when this Root already holds a live edge with the same Root ID, Side address
+// and Core ID. The caller has validated the chain and the ownership first; the walk
+// is bounded by the Root's count. Read-only.
+participationDuplicateExistsRaw(ZoneEngine engine, int rootSlot, int expectedRootId, int sideSlot, int expectedCoreId) =>
+    bool found = false
+    int edgeRowCount = array.size(engine.participationEdgeRootSlots)
+    if rootSlot >= 0 and rootSlot < array.size(engine.rootParticipationHeadEdgeIndexes) and rootSlot < array.size(engine.rootParticipationCounts)
+        int count     = array.get(engine.rootParticipationCounts,          rootSlot)
+        int edgeIndex = array.get(engine.rootParticipationHeadEdgeIndexes, rootSlot)
+        int seen      = 0
+        while not found and seen < count and edgeIndex >= 0 and edgeIndex < edgeRowCount
+            bool sameEdge = array.get(engine.participationEdgeLiveFlags, edgeIndex)
+            if sameEdge
+                sameEdge := array.get(engine.participationEdgeRootSlots, edgeIndex) == rootSlot and array.get(engine.participationEdgeExpectedRootIds, edgeIndex) == expectedRootId and array.get(engine.participationEdgeSideSlots, edgeIndex) == sideSlot and array.get(engine.participationEdgeExpectedCoreIds, edgeIndex) == expectedCoreId
+            if sameEdge
+                found := true
+            else
+                edgeIndex := array.get(engine.participationEdgeNextByRootIndexes, edgeIndex)
+                seen      += 1
+    found
+
+// Adds one participation edge for this Root and this physical Side, returning true
+// only when it was committed. Every rejection happens before the row is taken, so a
+// false result means zero mutation: no alloc, no free, no head, count or row write.
+participationAddRaw(ZoneEngine engine, int rootSlot, int sideSlot) =>
+    bool added = false
+    // Step 1 : Root ownership preflight
+    bool rootOk         = rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags)
+    int  expectedRootId = ID_NONE
+    if rootOk
+        rootOk := array.get(engine.rootSlotLiveFlags, rootSlot)
+    if rootOk
+        expectedRootId := array.get(engine.rootIds, rootSlot)
+        rootOk         := expectedRootId != ID_NONE
+    // Step 2 : target Side address and Core ownership preflight
+    bool sideOk         = rootOk and sideSlot >= 0 and sideSlot < array.size(engine.sidePhases)
+    int  coreSlot       = SLOT_INVALID
+    int  expectedCoreId = ID_NONE
+    if sideOk
+        coreSlot      := int(math.floor(sideSlot / 2))
+        int sideIndex = sideSlot - coreSlot * 2
+        sideOk        := (sideIndex == 0 or sideIndex == 1) and coreSlot >= 0 and coreSlot < array.size(engine.coreIds) and coreSlot < array.size(engine.coreSlotLiveFlags)
+    if sideOk
+        sideOk := array.get(engine.coreSlotLiveFlags, coreSlot)
+    if sideOk
+        expectedCoreId := array.get(engine.coreIds, coreSlot)
+        sideOk         := expectedCoreId != ID_NONE
+    // Step 3 : the Root's whole chain must already be consistent
+    bool ready = sideOk
+    if ready
+        ready := participationRootChainValidRaw(engine, rootSlot)
+    // Step 4 : one live edge per Root ID + Core ID + Side
+    if ready
+        ready := not participationDuplicateExistsRaw(engine, rootSlot, expectedRootId, sideSlot, expectedCoreId)
+    // Step 5 : the row the free stack would hand back must be usable
+    if ready
+        int freeCount = array.size(engine.participationEdgeFreeIndexes)
+        if freeCount > 0
+            int topIndex = array.get(engine.participationEdgeFreeIndexes, freeCount - 1)
+            ready := topIndex >= 0 and topIndex < array.size(engine.participationEdgeRootSlots)
+            if ready
+                ready := not array.get(engine.participationEdgeLiveFlags, topIndex)
+    // Step 6..9 : commit. Nothing below can fail.
+    if ready
+        int oldHead   = array.get(engine.rootParticipationHeadEdgeIndexes, rootSlot)
+        int oldCount  = array.get(engine.rootParticipationCounts,          rootSlot)
+        int edgeIndex = participationEdgeAllocRaw(engine)
+        array.set(engine.participationEdgeRootSlots,         edgeIndex, rootSlot)
+        array.set(engine.participationEdgeExpectedRootIds,   edgeIndex, expectedRootId)
+        array.set(engine.participationEdgeSideSlots,         edgeIndex, sideSlot)
+        array.set(engine.participationEdgeExpectedCoreIds,   edgeIndex, expectedCoreId)
+        array.set(engine.participationEdgeNextByRootIndexes, edgeIndex, oldHead)
+        array.set(engine.rootParticipationHeadEdgeIndexes,   rootSlot,  edgeIndex)
+        array.set(engine.rootParticipationCounts,            rootSlot,  oldCount + 1)
+        // live last: this is the commit marker of the whole add
+        array.set(engine.participationEdgeLiveFlags,         edgeIndex, true)
+        added := true
+    added
 
 // ============================================================
 // W02 Batch 17 : Root Category / TF / state set raw helpers (I11-4)
