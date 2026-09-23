@@ -766,10 +766,14 @@ export type W02AuxStore
     // Real Root-copy nodes = 0 and every rootCount is 0, because no path copies a
     // Root ID yet. rootCount > 0 would still never mean a Snapshot exists: the
     // valid flag stays the only truth, and nothing writes it true.
-    // Not implemented here: the Root ID copy itself, the node alloc / free /
-    // append / detach-all and validation helpers, and the Snapshot clear that a
-    // later Batch must connect before a reset can ever meet a live node - at that
-    // point coreResetSlotRaw will return the nodes to the free stack first.
+    // W02 Batch 41 adds the raw physical node lifecycle for this pool - reset,
+    // alloc and free - in its own section further below. Those three helpers have
+    // no Production call site, so real nodes are still 0 and both the node arrays
+    // and the free stack stay size 0.
+    // Still not implemented: the Root ID copy itself, the append and detach-all
+    // helpers, the ownership validation, and the Snapshot clear that a later Batch
+    // must connect before a reset can ever meet a live node - at that point
+    // coreResetSlotRaw will return the nodes to the free stack first.
     array<int>   sideTouchStartSnapshotRootHeadNodeIndexes
     array<int>   sideTouchStartSnapshotRootTailNodeIndexes
     array<int>   sideTouchStartSnapshotRootCounts
@@ -2325,6 +2329,92 @@ participationDetachAllForCoreRaw(ZoneEngine engine, int coreSlot) =>
             freeIdx += 1
         done := true
     done
+
+// ============================================================
+// W02 Batch 41 : TouchStartSnapshot Root-copy node raw lifecycle
+// Source: A6.5, I6.1, D02, D12
+//
+// Internal only, and raw in the same sense as the Batch 25 participation edge
+// helpers: they own one physical row of the Batch 40 Root-copy node pool and
+// nothing else. They never touch a Side's head, tail or count, never follow or
+// repair a chain, never look at ownerSideSlot / expectedCoreId /
+// expectedGenerationId / expectedTouchNo to decide anything, and never read or
+// write a Snapshot scalar.
+// The seven node arrays always share one physical size, so one node index names
+// the same row in all seven. They are never shrunk: a freed row goes back through
+// the free stack (LIFO) and is reused, exactly as the Root, Core and participation
+// pools do. Only a row that is currently not live and not reachable from any chain
+// may sit in the free stack, and never twice.
+// alloc is not an ownership commit: a newly allocated row stays live = false and
+// carries only sentinels. A later append helper writes the Root ID, the owner
+// token and the chain link, updates the Side metadata and sets live = true last,
+// so a row that is live is a row that is fully committed. Batch 41 never writes
+// live = true and never writes a real Root ID, Core ID, Generation ID or TouchNo.
+// free is the mirror: it only accepts a live row, resets it and returns it to the
+// free stack, so freeing the same row twice pushes it once. Its precondition is
+// that the caller has already detached the row from its chain - this helper leaves
+// head, tail, count and every other node's next untouched, and validates no
+// ownership. That detach helper does not exist yet.
+// Production call sites = 0 in this Batch: nothing allocates or frees a node, so
+// the pool and the free stack both stay empty and real Root-copy nodes = 0.
+// ============================================================
+
+// Returns one existing physical Root-copy node row to the unset sentinel.
+// Precondition: the row already exists in the seven node arrays. No range check
+// and no runtime.error is added here, and the free stack is not touched.
+touchStartSnapshotRootNodeResetRaw(ZoneEngine engine, int nodeIndex) =>
+    array.set(engine.w02Aux.touchStartSnapshotRootNodeRootIds,               nodeIndex, ID_NONE)
+    array.set(engine.w02Aux.touchStartSnapshotRootNodeNextIndexes,           nodeIndex, SLOT_INVALID)
+    array.set(engine.w02Aux.touchStartSnapshotRootNodeOwnerSideSlots,        nodeIndex, SLOT_INVALID)
+    array.set(engine.w02Aux.touchStartSnapshotRootNodeExpectedCoreIds,       nodeIndex, ID_NONE)
+    array.set(engine.w02Aux.touchStartSnapshotRootNodeExpectedGenerationIds, nodeIndex, ID_NONE)
+    array.set(engine.w02Aux.touchStartSnapshotRootNodeExpectedTouchNos,      nodeIndex, 0)
+    array.set(engine.w02Aux.touchStartSnapshotRootNodeLiveFlags,             nodeIndex, false)
+
+// Starts one physical Root-copy node row and returns its node index.
+// Free rows are reused first (LIFO pop, then reset); otherwise the seven node
+// arrays grow by one sentinel entry each. The returned row is NOT committed: it
+// stays live = false with sentinel identity, and a later append helper is what
+// turns it into a member of a Snapshot's chain.
+touchStartSnapshotRootNodeAllocRaw(ZoneEngine engine) =>
+    int nodeIndex = SLOT_INVALID
+    // Step 1 / Step 2 : free stack first, LIFO. Never array.shift / array.remove(0).
+    if array.size(engine.w02Aux.touchStartSnapshotRootNodeFreeIndexes) > 0
+        nodeIndex := array.pop(engine.w02Aux.touchStartSnapshotRootNodeFreeIndexes)
+        touchStartSnapshotRootNodeResetRaw(engine, nodeIndex)
+    else
+        nodeIndex := array.size(engine.w02Aux.touchStartSnapshotRootNodeRootIds)
+        array.push(engine.w02Aux.touchStartSnapshotRootNodeRootIds,               ID_NONE)
+        array.push(engine.w02Aux.touchStartSnapshotRootNodeNextIndexes,           SLOT_INVALID)
+        array.push(engine.w02Aux.touchStartSnapshotRootNodeOwnerSideSlots,        SLOT_INVALID)
+        array.push(engine.w02Aux.touchStartSnapshotRootNodeExpectedCoreIds,       ID_NONE)
+        array.push(engine.w02Aux.touchStartSnapshotRootNodeExpectedGenerationIds, ID_NONE)
+        array.push(engine.w02Aux.touchStartSnapshotRootNodeExpectedTouchNos,      0)
+        array.push(engine.w02Aux.touchStartSnapshotRootNodeLiveFlags,             false)
+    // Step 3 : the row exists and is unset. live stays false - allocation is not
+    // ownership, and nothing here joins a chain or a Side.
+    nodeIndex
+
+// Moves one currently live physical Root-copy node row back to the free state.
+// Returns true only when the row was freed. An out-of-range index or a row that is
+// not live returns false with no mutation, so a second free of the same row never
+// pushes it into the free stack twice.
+// Precondition: the caller has already detached this row from its Side's chain.
+// This helper never touches head, tail, count or another node's next, and never
+// validates the owner token.
+touchStartSnapshotRootNodeFreeRaw(ZoneEngine engine, int nodeIndex) =>
+    bool freed = false
+    // Step 1 : range. The live read is nested so it never runs on a bad index.
+    if nodeIndex >= 0 and nodeIndex < array.size(engine.w02Aux.touchStartSnapshotRootNodeLiveFlags)
+        if array.get(engine.w02Aux.touchStartSnapshotRootNodeLiveFlags, nodeIndex)
+            // Step 2 : the row goes back to the unset sentinel, live last of all
+            // because the reset writes it false.
+            touchStartSnapshotRootNodeResetRaw(engine, nodeIndex)
+            // Step 3 : freed row enters the free stack exactly once. The arrays are
+            // never shrunk.
+            array.push(engine.w02Aux.touchStartSnapshotRootNodeFreeIndexes, nodeIndex)
+            freed := true
+    freed
 
 // ============================================================
 // W02 Batch 2 : Root physical slot lifecycle (raw helpers)
