@@ -804,10 +804,12 @@ export type ZoneEngine
     // Implemented so far: this storage (Batch 23), the Root head / count lifecycle
     // on physical slot growth and reset (Batch 24), the edge row physical lifecycle
     // (Batch 25), the chain validation, duplicate prevention and atomic add
-    // (Batch 26) and the atomic detach (Batch 27).
-    // Still missing, deliberately: the Root free and Core free detach, the Core
-    // lifecycle connection, Candidate adoption and Core association. No Production
-    // business path calls any of it, so the runtime holds 0 edges.
+    // (Batch 26), the atomic single detach (Batch 27) and the atomic detach-all for
+    // one Root (Batch 28).
+    // Still missing, deliberately: the rootFreeSlotRaw connection, the Core free
+    // detach, the Core lifecycle connection, Candidate adoption and Core
+    // association. No Production business path calls any of it, so the runtime
+    // holds 0 edges.
     array<int>   rootParticipationHeadEdgeIndexes
     array<int>   rootParticipationCounts
     array<int>   participationEdgeRootSlots
@@ -1223,9 +1225,12 @@ export newEngine(ZoneCfg cfg) =>
 //   - Batch 24 connected the I11-7 participation Root metadata (head edge index,
 //     live edge count) to the same growth / reset lifecycle; the edge pool itself
 //     stays empty
+//   - the I11-7 participation helpers exist (edge row lifecycle, chain validation,
+//     add, single detach and detach-all for a Root) but rootFreeSlotRaw does not
+//     call them yet, so a freed Root's edges are not released here
 //   - still not connected: Category / TF / state membership, FVG membership, FVG
-//     NativeRange order maintenance, participation edge alloc / free / add / detach,
-//     origin tuple index, price order
+//     NativeRange order maintenance, the participation detach on Root free, origin
+//     tuple index, price order
 //   - no revision increment (I9 revisions stay untouched here)
 //   - no Root content (category, price, tick, time, state semantics)
 // They are therefore not wired into any Stage or Public API in this Batch:
@@ -1698,9 +1703,11 @@ participationAddRaw(ZoneEngine engine, int rootSlot, int sideSlot) =>
 // the free.
 // The chain keeps no order semantics after a detach either: it is never a Root ID,
 // Core ID, Side, Candidate, price or Event order.
-// The Root free and Core free detach, Candidate adoption and Core association are
-// still absent, and no Production business path calls this, so the runtime still
-// holds 0 edges.
+// This helper removes ONE edge. Releasing every edge of a Root is the Batch 28
+// helper below, which is a separate all-or-nothing implementation and never a loop
+// over this one. Neither is wired into rootFreeSlotRaw yet; the Core free detach,
+// Candidate adoption and Core association are still absent, and no Production
+// business path calls any of it, so the runtime still holds 0 edges.
 // ============================================================
 
 // Removes this Root's live edge for the given physical Side and returns true only
@@ -1791,6 +1798,85 @@ participationDetachRaw(ZoneEngine engine, int rootSlot, int sideSlot) =>
         // free last: the row was verified live above and its flag was not touched since
         detached := participationEdgeFreeRaw(engine, targetEdgeIndex)
     detached
+
+// ============================================================
+// W02 Batch 28 : participation atomic detach-all for Root (I11-7)
+//
+// Internal only. This releases every participation edge of one Root in a single
+// all-or-nothing step. It is deliberately NOT a loop over the Batch 27 single
+// detach: repeating that helper would leave the earlier edges gone if a later one
+// failed, which is exactly the partial detach this contract forbids. Instead the
+// whole chain is validated and re-walked first, and only then is anything written.
+// A rejection leaves the head, the count, every row and the free stack untouched,
+// and a broken chain or an edge pointing at a stale Core is never repaired here.
+// The free order follows the chain from head to tail, which carries no meaning: it
+// is never a Root ID, Core ID, Side, Candidate, price or Event order.
+// No Production path and no rootFreeSlotRaw calls this yet, so the runtime still
+// holds 0 edges; the Root free connection and the Core free detach come later.
+// ============================================================
+
+// Detaches and frees all participation edges of this Root, returning true when the
+// Root ends with no participation. A Root that already has none returns true
+// without mutating anything. Returns false with zero mutation when the Root is not
+// a live owned slot, when its chain is inconsistent, or when the pre-commit walk
+// does not match the recorded count exactly.
+participationDetachAllForRootRaw(ZoneEngine engine, int rootSlot) =>
+    bool done = false
+    // Step 1 : Root ownership preflight
+    bool rootOk         = rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootParticipationHeadEdgeIndexes) and rootSlot < array.size(engine.rootParticipationCounts)
+    int  expectedRootId = ID_NONE
+    if rootOk
+        rootOk := array.get(engine.rootSlotLiveFlags, rootSlot)
+    if rootOk
+        expectedRootId := array.get(engine.rootIds, rootSlot)
+        rootOk         := expectedRootId != ID_NONE
+    // Step 2 : the whole chain must already be consistent
+    bool ready = rootOk
+    if ready
+        ready := participationRootChainValidRaw(engine, rootSlot)
+    int oldHead  = SLOT_INVALID
+    int oldCount = 0
+    if ready
+        oldHead  := array.get(engine.rootParticipationHeadEdgeIndexes, rootSlot)
+        oldCount := array.get(engine.rootParticipationCounts,          rootSlot)
+    // Step 3 : nothing to detach is a success, and writes nothing. The chain
+    // validation already guarantees head = SLOT_INVALID when the count is 0.
+    if ready and oldCount == 0
+        done := true
+    // Step 4 : pre-commit walk of exactly oldCount edges
+    bool commitReady = ready and oldCount > 0
+    if commitReady
+        int  edgeRowCount  = array.size(engine.participationEdgeRootSlots)
+        int  scanEdgeIndex = oldHead
+        int  seen          = 0
+        bool scanOk        = true
+        // bounded by oldCount: every pass advances seen or ends the walk
+        while scanOk and seen < oldCount
+            bool rowOk = scanEdgeIndex >= 0 and scanEdgeIndex < edgeRowCount
+            if rowOk
+                rowOk := array.get(engine.participationEdgeLiveFlags, scanEdgeIndex)
+            if rowOk
+                rowOk := array.get(engine.participationEdgeRootSlots, scanEdgeIndex) == rootSlot and array.get(engine.participationEdgeExpectedRootIds, scanEdgeIndex) == expectedRootId
+            if rowOk
+                scanEdgeIndex := array.get(engine.participationEdgeNextByRootIndexes, scanEdgeIndex)
+                seen          += 1
+            else
+                scanOk := false
+        commitReady := scanOk and seen == oldCount and scanEdgeIndex == SLOT_INVALID
+    // Step 5 : commit. Root metadata first, then every row. Nothing below can fail.
+    if commitReady
+        array.set(engine.rootParticipationHeadEdgeIndexes, rootSlot, SLOT_INVALID)
+        array.set(engine.rootParticipationCounts,          rootSlot, 0)
+        int freeEdgeIndex = oldHead
+        int freed         = 0
+        while freed < oldCount
+            // read the successor before the row is reset by the free
+            int nextEdgeIndex = array.get(engine.participationEdgeNextByRootIndexes, freeEdgeIndex)
+            participationEdgeFreeRaw(engine, freeEdgeIndex)
+            freeEdgeIndex := nextEdgeIndex
+            freed         += 1
+        done := true
+    done
 
 // ============================================================
 // W02 Batch 17 : Root Category / TF / state set raw helpers (I11-4)
