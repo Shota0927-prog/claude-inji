@@ -803,11 +803,11 @@ export type ZoneEngine
     // View nor the A6.8 Zone origin Root set; neither is replaced by it.
     // Implemented so far: this storage (Batch 23), the Root head / count lifecycle
     // on physical slot growth and reset (Batch 24), the edge row physical lifecycle
-    // (Batch 25) and the chain validation, duplicate prevention and atomic add
-    // (Batch 26).
-    // Still missing, deliberately: detach, the Root free and Core free detach, the
-    // Core lifecycle connection, Candidate adoption and Core association. No
-    // Production business path calls any of it, so the runtime holds 0 edges.
+    // (Batch 25), the chain validation, duplicate prevention and atomic add
+    // (Batch 26) and the atomic detach (Batch 27).
+    // Still missing, deliberately: the Root free and Core free detach, the Core
+    // lifecycle connection, Candidate adoption and Core association. No Production
+    // business path calls any of it, so the runtime holds 0 edges.
     array<int>   rootParticipationHeadEdgeIndexes
     array<int>   rootParticipationCounts
     array<int>   participationEdgeRootSlots
@@ -1471,11 +1471,11 @@ rootFreeSlotRaw(ZoneEngine engine, int rootSlot) =>
 // array.remove(0) / array.shift() / array.unshift() are never used. The six row
 // arrays always share one size and are never shrunk.
 // Call sites: participationEdgeResetRaw is called by the alloc and free helpers
-// below, and participationEdgeAllocRaw by the Batch 26 add helper.
-// participationEdgeFreeRaw has none, since detach is still absent. No Production
-// Stage, Candidate or Core logic calls any of them, so the runtime still holds no
-// physical edge row, no free row and no live edge. The Root free and Core free
-// detach are still absent too.
+// below, participationEdgeAllocRaw by the Batch 26 add helper and
+// participationEdgeFreeRaw by the Batch 27 detach helper. No Production Stage,
+// Candidate or Core logic calls any of them, so the runtime still holds no physical
+// edge row, no free row and no live edge. The Root free and Core free detach are
+// still absent.
 // ============================================================
 
 // Returns one existing physical edge row to the unused / free sentinel state: it
@@ -1540,9 +1540,10 @@ participationEdgeFreeRaw(ZoneEngine engine, int edgeIndex) =>
 // with no fallible step after it.
 // A new edge goes to the head because the chain has no order semantics: it is never
 // a Root ID, Core ID, Side, Candidate or price order.
-// Detach, the Root free detach and the Core free detach are still absent, so
-// participationEdgeFreeRaw keeps zero call sites, and no Production Stage,
-// Candidate or Core logic calls any of this yet: the runtime still holds 0 edges.
+// The atomic detach lives in the Batch 27 section below. The Root free detach, the
+// Core free detach, Candidate adoption and Core association are still absent, and no
+// Production Stage, Candidate or Core logic calls any of this: the runtime holds 0
+// edges.
 // ============================================================
 
 // True only when this Root's participation chain is exactly consistent: the Root is
@@ -1680,6 +1681,116 @@ participationAddRaw(ZoneEngine engine, int rootSlot, int sideSlot) =>
         array.set(engine.participationEdgeLiveFlags,         edgeIndex, true)
         added := true
     added
+
+// ============================================================
+// W02 Batch 27 : participation atomic detach (I11-7)
+//
+// Internal only. The edge to remove is identified as Root ID + Core ID + Side, so
+// all four stored fields (rootSlot, expectedRootId, sideSlot, expectedCoreId) must
+// match; a rootSlot or a sideSlot alone never selects an edge.
+// Nothing is written until the target and its predecessor are fully settled: the
+// Root ownership, the Side address, the Core ownership, the whole chain, a unique
+// match and the predecessor link are all decided first. A rejection therefore
+// leaves head, count, every row and the free stack untouched - no repair, no
+// partial detach, and a broken or duplicated chain is never patched up here.
+// Once it commits, the order is fixed: unlink (Root head or the predecessor's
+// next), decrement the count, and free the row last, with nothing fallible after
+// the free.
+// The chain keeps no order semantics after a detach either: it is never a Root ID,
+// Core ID, Side, Candidate, price or Event order.
+// The Root free and Core free detach, Candidate adoption and Core association are
+// still absent, and no Production business path calls this, so the runtime still
+// holds 0 edges.
+// ============================================================
+
+// Removes this Root's live edge for the given physical Side and returns true only
+// when it was committed. Returns false with zero mutation when any preflight fails,
+// when the chain is inconsistent, when no edge matches, or when more than one does.
+participationDetachRaw(ZoneEngine engine, int rootSlot, int sideSlot) =>
+    bool detached = false
+    // Step 1 : Root ownership preflight
+    bool rootOk         = rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootParticipationHeadEdgeIndexes) and rootSlot < array.size(engine.rootParticipationCounts)
+    int  expectedRootId = ID_NONE
+    if rootOk
+        rootOk := array.get(engine.rootSlotLiveFlags, rootSlot)
+    if rootOk
+        expectedRootId := array.get(engine.rootIds, rootSlot)
+        rootOk         := expectedRootId != ID_NONE
+    // Step 2 : target Side address and Core ownership preflight
+    bool sideOk         = rootOk and sideSlot >= 0 and sideSlot < array.size(engine.sidePhases)
+    int  coreSlot       = SLOT_INVALID
+    int  expectedCoreId = ID_NONE
+    if sideOk
+        coreSlot      := int(math.floor(sideSlot / 2))
+        int sideIndex = sideSlot - coreSlot * 2
+        sideOk        := (sideIndex == 0 or sideIndex == 1) and coreSlot >= 0 and coreSlot < array.size(engine.coreIds) and coreSlot < array.size(engine.coreSlotLiveFlags)
+    if sideOk
+        sideOk := array.get(engine.coreSlotLiveFlags, coreSlot)
+    if sideOk
+        expectedCoreId := array.get(engine.coreIds, coreSlot)
+        sideOk         := expectedCoreId != ID_NONE
+    // Step 3 : the whole chain must already be consistent, and hold at least one edge
+    bool ready    = sideOk
+    if ready
+        ready := participationRootChainValidRaw(engine, rootSlot)
+    int oldHead  = SLOT_INVALID
+    int oldCount = 0
+    if ready
+        oldHead  := array.get(engine.rootParticipationHeadEdgeIndexes, rootSlot)
+        oldCount := array.get(engine.rootParticipationCounts,          rootSlot)
+        ready    := oldCount > 0
+    // Step 4 : bounded scan for the target, its predecessor and its successor
+    int targetEdgeIndex         = SLOT_INVALID
+    int targetPreviousEdgeIndex = SLOT_INVALID
+    int targetNextEdgeIndex     = SLOT_INVALID
+    int matchCount              = 0
+    int seen                    = 0
+    int scanEdgeIndex           = oldHead
+    int previousEdgeIndex       = SLOT_INVALID
+    if ready
+        int edgeRowCount = array.size(engine.participationEdgeRootSlots)
+        // bounded by oldCount: every pass advances seen
+        while seen < oldCount and scanEdgeIndex >= 0 and scanEdgeIndex < edgeRowCount
+            bool isTarget = array.get(engine.participationEdgeLiveFlags, scanEdgeIndex)
+            if isTarget
+                isTarget := array.get(engine.participationEdgeRootSlots, scanEdgeIndex) == rootSlot and array.get(engine.participationEdgeExpectedRootIds, scanEdgeIndex) == expectedRootId and array.get(engine.participationEdgeSideSlots, scanEdgeIndex) == sideSlot and array.get(engine.participationEdgeExpectedCoreIds, scanEdgeIndex) == expectedCoreId
+            int nextEdgeIndex = array.get(engine.participationEdgeNextByRootIndexes, scanEdgeIndex)
+            if isTarget
+                matchCount += 1
+                if matchCount == 1
+                    targetEdgeIndex         := scanEdgeIndex
+                    targetPreviousEdgeIndex := previousEdgeIndex
+                    targetNextEdgeIndex     := nextEdgeIndex
+            previousEdgeIndex := scanEdgeIndex
+            scanEdgeIndex     := nextEdgeIndex
+            seen              += 1
+        // the scan itself must have covered exactly the whole chain
+        ready := seen == oldCount and scanEdgeIndex == SLOT_INVALID
+    // Step 5 : exactly one edge may match. 0 = nothing to detach, >1 = corruption.
+    if ready
+        ready := matchCount == 1
+    if ready
+        ready := targetEdgeIndex >= 0 and targetEdgeIndex < array.size(engine.participationEdgeLiveFlags)
+    if ready
+        ready := array.get(engine.participationEdgeLiveFlags, targetEdgeIndex)
+    // Step 6 : the predecessor link must agree with where the target was found
+    if ready
+        if targetPreviousEdgeIndex == SLOT_INVALID
+            ready := targetEdgeIndex == oldHead
+        else
+            ready := targetPreviousEdgeIndex >= 0 and targetPreviousEdgeIndex < array.size(engine.participationEdgeNextByRootIndexes)
+            if ready
+                ready := array.get(engine.participationEdgeNextByRootIndexes, targetPreviousEdgeIndex) == targetEdgeIndex
+    // Step 7 : commit. Unlink, then the count, then the row. Nothing below can fail.
+    if ready
+        if targetPreviousEdgeIndex == SLOT_INVALID
+            array.set(engine.rootParticipationHeadEdgeIndexes, rootSlot, targetNextEdgeIndex)
+        else
+            array.set(engine.participationEdgeNextByRootIndexes, targetPreviousEdgeIndex, targetNextEdgeIndex)
+        array.set(engine.rootParticipationCounts, rootSlot, oldCount - 1)
+        // free last: the row was verified live above and its flag was not touched since
+        detached := participationEdgeFreeRaw(engine, targetEdgeIndex)
+    detached
 
 // ============================================================
 // W02 Batch 17 : Root Category / TF / state set raw helpers (I11-4)
