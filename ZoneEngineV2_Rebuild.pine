@@ -2910,6 +2910,113 @@ originBucketDetachRaw(ZoneEngine engine, int rootSlot, int expectedRootId) =>
     ok
 
 // ============================================================
+// W03 Batch 06 : full origin tuple comparator and unique origin lookup (I11-2)
+// Source: I4, I11-2, A7.3 - A7.7, D02, D12
+//
+// Internal only. Root identity is decided as: originKey bucket -> ownership
+// validation -> full tuple comparison. An originKey match alone is never
+// identity, and no fallback (lowest Root ID, first or last Root) is ever chosen.
+// The lookup reads the committed origin bucket and the current Base bar's pending
+// NEW_ROOT journal rows. Its only write is raising journalInvariantViolation, which
+// only journalResetRaw clears. A matched Swing Root keeps its creation tfCode,
+// originTime and originEndTime: nothing here writes a Root field.
+// Business call sites = 0 in this Batch.
+// ============================================================
+
+// True when the incoming origin and the stored origin are the same Root origin.
+// Read-only. An unknown incoming Category is a runtime error.
+originTupleEqualRaw(int incomingCategory, int incomingSubtype, int incomingTfCode, int incomingPointTick, int incomingOriginTime, int incomingOriginEndTime, int incomingDirection, int storedCategory, int storedSubtype, int storedTfCode, int storedPointTick, int storedOriginTime, int storedOriginEndTime, int storedDirection) =>
+    bool equal = false
+    if incomingCategory == CAT_MA
+        // fixed Root per EMA subtype on the 1m timeframe
+        equal := storedCategory == CAT_MA and incomingTfCode == TF_1M and storedTfCode == TF_1M and not na(incomingSubtype) and incomingSubtype == storedSubtype
+    else if incomingCategory == CAT_SWING
+        bool tfOk   = (incomingTfCode == TF_5M or incomingTfCode == TF_15M or incomingTfCode == TF_1H) and (storedTfCode == TF_5M or storedTfCode == TF_15M or storedTfCode == TF_1H)
+        bool baseOk = storedCategory == CAT_SWING and tfOk and not na(incomingSubtype) and incomingSubtype == storedSubtype and not na(incomingPointTick) and not na(storedPointTick) and incomingPointTick == storedPointTick
+        bool timeOk = not na(incomingOriginTime) and not na(incomingOriginEndTime) and not na(storedOriginTime) and not na(storedOriginEndTime)
+        if baseOk and timeOk
+            if incomingTfCode == storedTfCode
+                // same TF: the same pivot only
+                equal := incomingOriginTime == storedOriginTime and incomingOriginEndTime == storedOriginEndTime
+            else if storedTfCode < incomingTfCode
+                // stored is the lower TF: its origin inside the incoming [start, end)
+                equal := storedOriginTime >= incomingOriginTime and storedOriginTime < incomingOriginEndTime
+            else
+                // incoming is the lower TF: its origin inside the stored [start, end)
+                equal := incomingOriginTime >= storedOriginTime and incomingOriginTime < storedOriginEndTime
+    else if incomingCategory == CAT_ACCUM
+        // originTime is the Candidate start time; pairKey is never identity
+        equal := storedCategory == CAT_ACCUM and not na(incomingTfCode) and incomingTfCode == storedTfCode and not na(incomingSubtype) and incomingSubtype == storedSubtype and not na(incomingOriginTime) and not na(storedOriginTime) and incomingOriginTime == storedOriginTime
+    else if incomingCategory == CAT_TIME_HL
+        equal := storedCategory == CAT_TIME_HL and incomingTfCode == TF_5M and storedTfCode == TF_5M and not na(incomingSubtype) and incomingSubtype == storedSubtype and not na(incomingOriginTime) and not na(storedOriginTime) and incomingOriginTime == storedOriginTime and not na(incomingPointTick) and not na(storedPointTick) and incomingPointTick == storedPointTick
+    else if incomingCategory == CAT_FVG
+        // originTime is the 3rd source bar open time
+        equal := storedCategory == CAT_FVG and not na(incomingTfCode) and incomingTfCode == storedTfCode and (incomingDirection == FVG_BULLISH or incomingDirection == FVG_BEARISH) and incomingDirection == storedDirection and not na(incomingOriginTime) and not na(storedOriginTime) and incomingOriginTime == storedOriginTime
+    else if incomingCategory == CAT_PSYCH
+        // pointTick is the caller-normalized 50-dollar tick
+        equal := storedCategory == CAT_PSYCH and not na(incomingPointTick) and not na(storedPointTick) and incomingPointTick == storedPointTick
+    else
+        runtime.error("W03_ORIGIN_CATEGORY")
+    equal
+
+// Finds the unique existing origin among the committed bucket chain and the
+// current bar's pending NEW_ROOT rows. Returns [rootSlot, pendingJournalRow]:
+// [-1, -1] no match, [slot, -1] one committed match, [-1, row] one pending match.
+// Two or more matches, a broken chain node or a chain longer than the Root slot
+// count raise journalInvariantViolation and return [-1, -1].
+originLookupUniqueRaw(ZoneEngine engine, int originKey, int category, int subtype, int tfCode, int pointTick, int originTime, int originEndTime, int direction, float mintick) =>
+    int  matchCount        = 0
+    int  matchedRootSlot   = SLOT_INVALID
+    int  matchedPendingRow = SLOT_INVALID
+    bool violation         = false
+    if originKey != ID_NONE
+        // Step 1 : committed Roots of this bucket only, never every Root
+        if map.contains(engine.w02Aux.originKeyBucketHeadRootSlots, originKey)
+            int slot      = map.get(engine.w02Aux.originKeyBucketHeadRootSlots, originKey)
+            int stepLimit = array.size(engine.rootIds)
+            int steps     = 0
+            while slot != SLOT_INVALID and not violation and steps < stepLimit
+                bool nodeOk = slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootOriginKeys) and slot < array.size(engine.w02Aux.rootOriginBucketNextRootSlots) and slot < array.size(engine.w02Aux.rootOriginBucketExpectedRootIds)
+                if nodeOk
+                    nodeOk := array.get(engine.rootSlotLiveFlags, slot)
+                if nodeOk
+                    int bucketRootId = array.get(engine.w02Aux.rootOriginBucketExpectedRootIds, slot)
+                    nodeOk := bucketRootId != ID_NONE and bucketRootId == array.get(engine.rootIds, slot) and array.get(engine.rootOriginKeys, slot) == originKey
+                if not nodeOk
+                    violation := true
+                else
+                    if originTupleEqualRaw(category, subtype, tfCode, pointTick, originTime, originEndTime, direction, array.get(engine.rootCategories, slot), array.get(engine.rootSubtypes, slot), array.get(engine.rootTfCodes, slot), array.get(engine.rootPointTicks, slot), array.get(engine.rootOriginTimes, slot), array.get(engine.rootOriginEndTimes, slot), array.get(engine.rootDirections, slot))
+                        matchCount += 1
+                        if matchCount == 1
+                            matchedRootSlot := slot
+                        else
+                            violation := true
+                    slot  := array.get(engine.w02Aux.rootOriginBucketNextRootSlots, slot)
+                    steps += 1
+            // a chain still running after one step per Root slot is a cycle
+            if not violation and slot != SLOT_INVALID
+                violation := true
+        // Step 2 : pending NEW_ROOT rows of the current bar, logical rows only
+        if not violation
+            int journalCount = engine.w03Store.journalCount
+            int row = 0
+            while row < journalCount and not violation
+                if array.get(engine.w03Store.journalOps, row) == JOP_NEW_ROOT and array.get(engine.w03Store.journalOriginKeys, row) == originKey
+                    float pendingPrice = array.get(engine.w03Store.journalPointPrices, row)
+                    int   pendingTick  = na(pendingPrice) ? int(na) : int(math.round(pendingPrice / mintick))
+                    if originTupleEqualRaw(category, subtype, tfCode, pointTick, originTime, originEndTime, direction, array.get(engine.w03Store.journalCategories, row), array.get(engine.w03Store.journalSubtypes, row), array.get(engine.w03Store.journalTfCodes, row), pendingTick, array.get(engine.w03Store.journalOriginTimes, row), array.get(engine.w03Store.journalOriginEndTimes, row), array.get(engine.w03Store.journalDirections, row))
+                        matchCount += 1
+                        if matchCount == 1
+                            matchedPendingRow := row
+                        else
+                            violation := true
+                row += 1
+    // Step 3 : the only write - raise the preflight flag, never clear it
+    if violation
+        engine.w03Store.journalInvariantViolation := true
+    [violation ? SLOT_INVALID : matchedRootSlot, violation ? SLOT_INVALID : matchedPendingRow]
+
+// ============================================================
 // W02 Batch 25 : participation edge row physical lifecycle (I11-7)
 //
 // Internal only, and physical only: these three helpers own one row of the flat
