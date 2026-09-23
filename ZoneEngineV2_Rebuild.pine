@@ -6092,6 +6092,39 @@ predictedNewRootSlotRaw(ZoneEngine engine, int newRow) =>
         slot := rank < freeSize ? array.get(engine.rootFreeSlots, freeSize - 1 - rank) : array.size(engine.rootIds) + (rank - freeSize)
     slot
 
+// The Root ID rootAllocSlotRaw will hand to NEW_ROOT row newRow in F2: F0 runs
+// before any E2 alloc, so engine.nextRootId is this bar's first new Root ID and every
+// NEW_ROOT applied before newRow takes exactly one. Read-only; ID_NONE when newRow is
+// not a NEW_ROOT row.
+predictedNewRootIdRaw(ZoneEngine engine, int newRow) =>
+    int rootId = ID_NONE
+    if array.get(engine.w03Store.journalOps, newRow) == JOP_NEW_ROOT
+        int rank = 0
+        int row  = 0
+        while row < engine.w03Store.journalCount
+            if row != newRow and array.get(engine.w03Store.journalOps, row) == JOP_NEW_ROOT and journalAppliedBeforeRaw(engine, row, newRow)
+                rank += 1
+            row += 1
+        rootId := engine.nextRootId + rank
+    rootId
+
+// The NEW_ROOT rows applied before beforeRow whose predicted rootSlot and predicted
+// Root ID are exactly (rootSlot, expectedRootId). Returns [matchRow, matchCount]:
+// 0 = not a Root of this bar, 1 = that row creates it, 2+ = invariant failure.
+// Read-only.
+pendingNewRootRowByAddressRaw(ZoneEngine engine, int rootSlot, int expectedRootId, int beforeRow) =>
+    int matchRow   = SLOT_INVALID
+    int matchCount = 0
+    if rootSlot != SLOT_INVALID and expectedRootId != ID_NONE
+        int row = 0
+        while row < engine.w03Store.journalCount
+            if row != beforeRow and array.get(engine.w03Store.journalOps, row) == JOP_NEW_ROOT and journalAppliedBeforeRaw(engine, row, beforeRow)
+                if predictedNewRootSlotRaw(engine, row) == rootSlot and predictedNewRootIdRaw(engine, row) == expectedRootId
+                    matchRow   := row
+                    matchCount += 1
+            row += 1
+    [matchRow, matchCount]
+
 // Path B: the NEW_ROOT FVG rows applied before FRESH_END row freshRow with the same
 // FVG identity (Category, TF, Direction, originTime). Returns [matchRow, matchCount];
 // matchRow is the last match or SLOT_INVALID. Read-only.
@@ -6110,66 +6143,455 @@ pendingNewFvgRowRaw(ZoneEngine engine, int freshRow) =>
         row += 1
     [matchRow, matchCount]
 
-// rootStates of an existing Root as row beforeRow will see it: the committed state,
-// then the newState of every FVG_INVALIDATE / ROOT_RETIRE row on the same Root
-// applied before it, in Stage F order. Read-only. rootSlot is a valid physical slot.
+// rootStates of a Root as row beforeRow will see it. Base: the committed state of a
+// live Root owned by expectedRootId, else the newState of the one NEW_ROOT row of this
+// bar that creates (rootSlot, expectedRootId). Then the newState of every
+// FVG_INVALIDATE / ROOT_RETIRE row on the same Root applied after the base and before
+// beforeRow, in Stage F order. Read-only. int(na) when neither base exists.
 virtualRootStateBeforeRaw(ZoneEngine engine, int rootSlot, int expectedRootId, int beforeRow) =>
-    int state = array.get(engine.rootStates, rootSlot)
-    int group = JGROUP_E1
-    while group <= JGROUP_E4
-        int row = 0
-        while row < engine.w03Store.journalCount
-            if row != beforeRow and array.get(engine.w03Store.journalGroups, row) == group and journalAppliedBeforeRaw(engine, row, beforeRow) and array.get(engine.w03Store.journalTargetRootSlots, row) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, row) == expectedRootId
-                int op = array.get(engine.w03Store.journalOps, row)
-                if op == JOP_FVG_INVALIDATE or op == JOP_ROOT_RETIRE
-                    state := array.get(engine.w03Store.journalNewStates, row)
-            row += 1
-        group += 1
+    int  state    = int(na)
+    int  baseRow  = SLOT_INVALID
+    bool resolved = false
+    if rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootStates)
+        if array.get(engine.rootSlotLiveFlags, rootSlot) and expectedRootId != ID_NONE and array.get(engine.rootIds, rootSlot) == expectedRootId
+            state    := array.get(engine.rootStates, rootSlot)
+            resolved := true
+    if not resolved
+        [newRow, newCount] = pendingNewRootRowByAddressRaw(engine, rootSlot, expectedRootId, beforeRow)
+        if newCount == 1
+            state    := array.get(engine.w03Store.journalNewStates, newRow)
+            baseRow  := newRow
+            resolved := true
+    if resolved
+        int group = JGROUP_E1
+        while group <= JGROUP_E4
+            int row = 0
+            while row < engine.w03Store.journalCount
+                if row != beforeRow and array.get(engine.w03Store.journalGroups, row) == group and journalAppliedBeforeRaw(engine, row, beforeRow) and (baseRow == SLOT_INVALID or journalAppliedBeforeRaw(engine, baseRow, row)) and array.get(engine.w03Store.journalTargetRootSlots, row) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, row) == expectedRootId
+                    int op = array.get(engine.w03Store.journalOps, row)
+                    if op == JOP_FVG_INVALIDATE or op == JOP_ROOT_RETIRE
+                        state := array.get(engine.w03Store.journalNewStates, row)
+                row += 1
+            group += 1
     state
 
-// rootSwingTfMasks of an existing Root as row beforeRow will see it: the committed
-// mask, then the newMask of every SWING_TF_MERGE row on the same Root applied before
-// it. Read-only. rootSlot is a valid physical slot.
+// rootSwingTfMasks of a Root as row beforeRow will see it. Base: the committed mask,
+// else the pending NEW_ROOT row's newMask for a Swing (SWING_TF_MASK_NONE otherwise).
+// Then the newMask of every later SWING_TF_MERGE row on the same Root applied before
+// beforeRow. Read-only. int(na) when neither base exists.
 virtualSwingTfMaskBeforeRaw(ZoneEngine engine, int rootSlot, int expectedRootId, int beforeRow) =>
-    int mask  = array.get(engine.w03Store.rootSwingTfMasks, rootSlot)
-    int group = JGROUP_E1
-    while group <= JGROUP_E4
-        int row = 0
-        while row < engine.w03Store.journalCount
-            if row != beforeRow and array.get(engine.w03Store.journalGroups, row) == group and journalAppliedBeforeRaw(engine, row, beforeRow) and array.get(engine.w03Store.journalTargetRootSlots, row) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, row) == expectedRootId
-                if array.get(engine.w03Store.journalOps, row) == JOP_SWING_TF_MERGE
-                    mask := array.get(engine.w03Store.journalNewMasks, row)
-            row += 1
-        group += 1
+    int  mask     = int(na)
+    int  baseRow  = SLOT_INVALID
+    bool resolved = false
+    if rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.w03Store.rootSwingTfMasks)
+        if array.get(engine.rootSlotLiveFlags, rootSlot) and expectedRootId != ID_NONE and array.get(engine.rootIds, rootSlot) == expectedRootId
+            mask     := array.get(engine.w03Store.rootSwingTfMasks, rootSlot)
+            resolved := true
+    if not resolved
+        [newRow, newCount] = pendingNewRootRowByAddressRaw(engine, rootSlot, expectedRootId, beforeRow)
+        if newCount == 1
+            mask     := array.get(engine.w03Store.journalCategories, newRow) == CAT_SWING ? array.get(engine.w03Store.journalNewMasks, newRow) : SWING_TF_MASK_NONE
+            baseRow  := newRow
+            resolved := true
+    if resolved
+        int group = JGROUP_E1
+        while group <= JGROUP_E4
+            int row = 0
+            while row < engine.w03Store.journalCount
+                if row != beforeRow and array.get(engine.w03Store.journalGroups, row) == group and journalAppliedBeforeRaw(engine, row, beforeRow) and (baseRow == SLOT_INVALID or journalAppliedBeforeRaw(engine, baseRow, row)) and array.get(engine.w03Store.journalTargetRootSlots, row) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, row) == expectedRootId
+                    if array.get(engine.w03Store.journalOps, row) == JOP_SWING_TF_MERGE
+                        mask := array.get(engine.w03Store.journalNewMasks, row)
+                row += 1
+            group += 1
     mask
 
-// rootLabelMasks of an existing Root as row beforeRow will see it: the committed
-// mask, then the newMask of every TIMEHL_LABEL row on the same Root applied before
-// it. Read-only. rootSlot is a valid physical slot.
+// rootLabelMasks of a Root as row beforeRow will see it. Base: the committed mask,
+// else the pending NEW_ROOT row's newMask for a TimeHL (0 otherwise). Then the
+// newMask of every later TIMEHL_LABEL row on the same Root applied before beforeRow.
+// Read-only. int(na) when neither base exists.
 virtualTimeHlLabelMaskBeforeRaw(ZoneEngine engine, int rootSlot, int expectedRootId, int beforeRow) =>
-    int mask  = array.get(engine.rootLabelMasks, rootSlot)
-    int group = JGROUP_E1
-    while group <= JGROUP_E4
-        int row = 0
-        while row < engine.w03Store.journalCount
-            if row != beforeRow and array.get(engine.w03Store.journalGroups, row) == group and journalAppliedBeforeRaw(engine, row, beforeRow) and array.get(engine.w03Store.journalTargetRootSlots, row) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, row) == expectedRootId
-                if array.get(engine.w03Store.journalOps, row) == JOP_TIMEHL_LABEL
-                    mask := array.get(engine.w03Store.journalNewMasks, row)
-            row += 1
-        group += 1
+    int  mask     = int(na)
+    int  baseRow  = SLOT_INVALID
+    bool resolved = false
+    if rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootLabelMasks)
+        if array.get(engine.rootSlotLiveFlags, rootSlot) and expectedRootId != ID_NONE and array.get(engine.rootIds, rootSlot) == expectedRootId
+            mask     := array.get(engine.rootLabelMasks, rootSlot)
+            resolved := true
+    if not resolved
+        [newRow, newCount] = pendingNewRootRowByAddressRaw(engine, rootSlot, expectedRootId, beforeRow)
+        if newCount == 1
+            mask     := array.get(engine.w03Store.journalCategories, newRow) == CAT_TIME_HL ? array.get(engine.w03Store.journalNewMasks, newRow) : 0
+            baseRow  := newRow
+            resolved := true
+    if resolved
+        int group = JGROUP_E1
+        while group <= JGROUP_E4
+            int row = 0
+            while row < engine.w03Store.journalCount
+                if row != beforeRow and array.get(engine.w03Store.journalGroups, row) == group and journalAppliedBeforeRaw(engine, row, beforeRow) and (baseRow == SLOT_INVALID or journalAppliedBeforeRaw(engine, baseRow, row)) and array.get(engine.w03Store.journalTargetRootSlots, row) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, row) == expectedRootId
+                    if array.get(engine.w03Store.journalOps, row) == JOP_TIMEHL_LABEL
+                        mask := array.get(engine.w03Store.journalNewMasks, row)
+                row += 1
+            group += 1
     mask
 
-// rootFvgFreshFlags of an existing Root as row beforeRow will see it: the committed
-// flag, false once any FVG_FRESH_END row on the same Root is applied before it.
-// Read-only. rootSlot is a valid physical slot.
+// rootFvgFreshFlags of a Root as row beforeRow will see it. Base: the committed flag,
+// else the pending NEW_ROOT row's Fresh flag for an FVG (false otherwise); false once
+// a later FVG_FRESH_END row on the same Root is applied before beforeRow.
+// Returns [fresh, resolved]; resolved is false (fresh false) when neither base
+// exists, so a caller always fails on it. Read-only.
 virtualFvgFreshBeforeRaw(ZoneEngine engine, int rootSlot, int expectedRootId, int beforeRow) =>
-    bool fresh = array.get(engine.rootFvgFreshFlags, rootSlot)
-    int  row   = 0
-    while row < engine.w03Store.journalCount
-        if row != beforeRow and journalAppliedBeforeRaw(engine, row, beforeRow) and array.get(engine.w03Store.journalOps, row) == JOP_FVG_FRESH_END and array.get(engine.w03Store.journalTargetRootSlots, row) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, row) == expectedRootId
-            fresh := false
-        row += 1
-    fresh
+    bool fresh    = false
+    int  baseRow  = SLOT_INVALID
+    bool resolved = false
+    if rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootFvgFreshFlags)
+        if array.get(engine.rootSlotLiveFlags, rootSlot) and expectedRootId != ID_NONE and array.get(engine.rootIds, rootSlot) == expectedRootId
+            fresh    := array.get(engine.rootFvgFreshFlags, rootSlot)
+            resolved := true
+    if not resolved
+        [newRow, newCount] = pendingNewRootRowByAddressRaw(engine, rootSlot, expectedRootId, beforeRow)
+        if newCount == 1
+            fresh    := array.get(engine.w03Store.journalCategories, newRow) == CAT_FVG ? array.get(engine.w03Store.journalFvgFreshFlags, newRow) : false
+            baseRow  := newRow
+            resolved := true
+    if resolved
+        int row = 0
+        while row < engine.w03Store.journalCount
+            if row != beforeRow and journalAppliedBeforeRaw(engine, row, beforeRow) and (baseRow == SLOT_INVALID or journalAppliedBeforeRaw(engine, baseRow, row)) and array.get(engine.w03Store.journalOps, row) == JOP_FVG_FRESH_END and array.get(engine.w03Store.journalTargetRootSlots, row) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, row) == expectedRootId
+                fresh := false
+            row += 1
+    [fresh, resolved]
+
+// Virtual common price order for one point NEW_ROOT (E2 insert) or MA_UPDATE (E3
+// move) row: proves that rootPriceOrderInsertRaw / rootPriceOrderMoveRaw succeed on
+// the order that exists right before this row in Stage F. Read-only; true / false.
+// The virtual order is never materialised. Its members are the committed entries of
+// rootPriceOrderSlots plus the point NEW_ROOT rows applied before this row (no point
+// Root leaves the order in W03 Stage F). A member's current tick is its committed
+// tick or round(NEW price / mintick), replaced by its last MA_UPDATE applied before
+// this row. Order: tick ascending; equal ticks put members with no placement event
+// of this bar first, in committed position order, then placed members in the Stage
+// F order of their latest placement (NEW_ROOT insert or MA_UPDATE move, even at an
+// unchanged tick) - exactly the upper_bound insert and the equal-tick-passing move.
+// Every virtual position is derived by counting members; the committed order is
+// read through rootPriceOrderUpperBoundRaw and local walks only.
+virtualPointOrderPreflightRaw(ZoneEngine engine, int row, float mintick) =>
+    int  count     = engine.w03Store.journalCount
+    int  op        = array.get(engine.w03Store.journalOps, row)
+    int  orderSize = array.size(engine.rootPriceOrderSlots)
+    bool ok        = not na(mintick) and mintick > 0 and ((op == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, row) != CAT_FVG) or op == JOP_MA_UPDATE) and not na(array.get(engine.w03Store.journalPointPrices, row))
+    int  newTick   = int(na)
+    if ok
+        newTick := int(math.round(array.get(engine.w03Store.journalPointPrices, row) / mintick))
+        ok      := not na(newTick)
+    // virtual size before this row: committed entries + earlier point NEW_ROOT rows
+    int virtualSize = orderSize
+    if ok
+        int j = 0
+        while j < count
+            if j != row and array.get(engine.w03Store.journalOps, j) == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, j) != CAT_FVG and journalAppliedBeforeRaw(engine, j, row)
+                virtualSize += 1
+            j += 1
+    // committed members with tick <= newTick (the committed upper bound)
+    int newUpperC = SLOT_INVALID
+    if ok
+        [ubPos, ubOk] = rootPriceOrderUpperBoundRaw(engine, newTick)
+        ok        := ubOk
+        newUpperC := ubPos
+    // ---------------- E2 : point NEW_ROOT insert ----------------
+    if ok and op == JOP_NEW_ROOT
+        // no MA_UPDATE is applied before an E2 row: every earlier member keeps its
+        // committed tick, and an earlier NEW_ROOT keeps its own price and placement
+        int j = 0
+        while ok and j < count
+            if j != row and array.get(engine.w03Store.journalOps, j) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, j, row)
+                ok := false
+            j += 1
+        // insert position = members with tick <= newTick (upper_bound: after the
+        // equal-tick group, whose placements are all earlier than this row)
+        int insertPos = newUpperC
+        if ok
+            int p = 0
+            while p < count
+                if p != row and array.get(engine.w03Store.journalOps, p) == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, p) != CAT_FVG and journalAppliedBeforeRaw(engine, p, row)
+                    if int(math.round(array.get(engine.w03Store.journalPointPrices, p) / mintick)) <= newTick
+                        insertPos += 1
+                p += 1
+        // phase 0 : the binary search rootPriceOrderUpperBoundRaw runs on the virtual
+        // order, probe by probe; phase 1 : left neighbour; phase 2 : right neighbour
+        int lo    = 0
+        int hi    = virtualSize
+        int phase = 0
+        while ok and phase < 3
+            int probe = SLOT_INVALID
+            if phase == 0
+                if lo < hi
+                    probe := int(math.floor((lo + hi) / 2.0))
+                else
+                    // the simulated upper bound is the derived insert position
+                    ok    := lo == insertPos
+                    phase := 1
+            if ok and phase == 1 and probe == SLOT_INVALID
+                if insertPos > 0
+                    probe := insertPos - 1
+                else
+                    phase := 2
+            if ok and phase == 2 and probe == SLOT_INVALID
+                if insertPos < virtualSize
+                    probe := insertPos
+                else
+                    phase := 3
+            if ok and probe != SLOT_INVALID
+                // the member at virtual index probe: an earlier NEW_ROOT whose own
+                // virtual position is probe, else the committed entry at probe minus
+                // the earlier NEW_ROOT members placed before it
+                int  probeTick  = int(na)
+                bool pendingHit = false
+                int  pendingLess = 0
+                int  p = 0
+                while ok and p < count
+                    if p != row and array.get(engine.w03Store.journalOps, p) == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, p) != CAT_FVG and journalAppliedBeforeRaw(engine, p, row)
+                        int pTick = int(math.round(array.get(engine.w03Store.journalPointPrices, p) / mintick))
+                        [pUpper, pUpperOk] = rootPriceOrderUpperBoundRaw(engine, pTick)
+                        ok := pUpperOk
+                        int pPos = pUpper
+                        int q = 0
+                        while q < count
+                            if q != row and q != p and array.get(engine.w03Store.journalOps, q) == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, q) != CAT_FVG and journalAppliedBeforeRaw(engine, q, row)
+                                int qTick = int(math.round(array.get(engine.w03Store.journalPointPrices, q) / mintick))
+                                if qTick < pTick or (qTick == pTick and journalAppliedBeforeRaw(engine, q, p))
+                                    pPos += 1
+                            q += 1
+                        if pPos == probe
+                            pendingHit := true
+                            probeTick  := pTick
+                        else if pPos < probe
+                            pendingLess += 1
+                    p += 1
+                if ok and not pendingHit
+                    // a committed entry: the upper-bound / neighbour member checks
+                    int c = probe - pendingLess
+                    ok := c >= 0 and c < orderSize
+                    if ok
+                        int slot = array.get(engine.rootPriceOrderSlots, c)
+                        ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootPointTicks) and slot < array.size(engine.rootIsRangeRootFlags) and slot < array.size(engine.rootPriceOrderPositions)
+                        if ok
+                            ok := array.get(engine.rootSlotLiveFlags, slot) and not array.get(engine.rootIsRangeRootFlags, slot) and not na(array.get(engine.rootPointTicks, slot)) and array.get(engine.rootPriceOrderPositions, slot) == c
+                        if ok
+                            probeTick := array.get(engine.rootPointTicks, slot)
+                if ok
+                    if phase == 0
+                        if probeTick <= newTick
+                            lo := probe + 1
+                        else
+                            hi := probe
+                    else if phase == 1
+                        // left neighbour: tick <= newTick
+                        ok    := probeTick <= newTick
+                        phase := 2
+                    else
+                        // right neighbour: tick > newTick
+                        ok    := probeTick > newTick
+                        phase := 3
+        // every member the insert shifts right: the committed ones are the committed
+        // entries with tick > newTick; earlier NEW_ROOT members were placed by F2
+        if ok
+            int c = newUpperC
+            while ok and c < orderSize
+                int slot = array.get(engine.rootPriceOrderSlots, c)
+                ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootPointTicks) and slot < array.size(engine.rootIsRangeRootFlags) and slot < array.size(engine.rootPriceOrderPositions)
+                if ok
+                    ok := array.get(engine.rootSlotLiveFlags, slot) and not array.get(engine.rootIsRangeRootFlags, slot) and not na(array.get(engine.rootPointTicks, slot)) and array.get(engine.rootPriceOrderPositions, slot) == c
+                c += 1
+    // ---------------- E3 : MA_UPDATE move ----------------
+    if ok and op == JOP_MA_UPDATE
+        int rootSlot       = array.get(engine.w03Store.journalTargetRootSlots, row)
+        int expectedRootId = array.get(engine.w03Store.journalExpectedRootIds, row)
+        // the target: a committed entry (exactly one, at its stored position) or the
+        // one earlier NEW_ROOT MA of this bar with this predicted address
+        bool eCommitted = false
+        int  eCpos      = SLOT_INVALID
+        int  eNewRow    = SLOT_INVALID
+        if rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootPointTicks) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootPriceOrderPositions)
+            if array.get(engine.rootSlotLiveFlags, rootSlot) and expectedRootId != ID_NONE and array.get(engine.rootIds, rootSlot) == expectedRootId
+                eCommitted := true
+                eCpos      := array.get(engine.rootPriceOrderPositions, rootSlot)
+                ok := eCpos >= 0 and eCpos < orderSize and not array.get(engine.rootIsRangeRootFlags, rootSlot)
+                if ok
+                    ok := array.get(engine.rootPriceOrderSlots, eCpos) == rootSlot
+        if ok and not eCommitted
+            [newRow, newCount] = pendingNewRootRowByAddressRaw(engine, rootSlot, expectedRootId, row)
+            ok := newCount == 1
+            if ok
+                eNewRow := newRow
+                ok := array.get(engine.w03Store.journalCategories, newRow) == CAT_MA
+        // the target's current tick and latest placement (its last earlier MA_UPDATE)
+        int oldTick        = int(na)
+        int oldPlace       = SLOT_INVALID
+        int eCommittedTick = int(na)
+        if ok
+            if eCommitted
+                eCommittedTick := array.get(engine.rootPointTicks, rootSlot)
+                oldTick        := eCommittedTick
+            else
+                oldTick  := int(math.round(array.get(engine.w03Store.journalPointPrices, eNewRow) / mintick))
+                oldPlace := eNewRow
+            int j = 0
+            while j < count
+                if j != row and array.get(engine.w03Store.journalOps, j) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, j, row) and array.get(engine.w03Store.journalTargetRootSlots, j) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, j) == expectedRootId
+                    if oldPlace == SLOT_INVALID or journalAppliedBeforeRaw(engine, oldPlace, j)
+                        oldPlace := j
+                        oldTick  := int(math.round(array.get(engine.w03Store.journalPointPrices, j) / mintick))
+                j += 1
+            ok := not na(oldTick)
+        bool eUnplaced = eCommitted and oldPlace == SLOT_INVALID
+        int  oldUpperC = SLOT_INVALID
+        if ok
+            [oPos, oOk] = rootPriceOrderUpperBoundRaw(engine, oldTick)
+            ok        := oOk
+            oldUpperC := oPos
+        // the other placed members: committed entries moved earlier this bar (latest
+        // MA_UPDATE per Root) and earlier point NEW_ROOT rows (their latest placement)
+        int movedBeforeCpos = 0          // moved committed entries at committed index < eCpos
+        int movedLeOld      = 0          // moved committed entries, committed tick <= oldTick
+        int movedLeNew      = 0          // moved committed entries, committed tick <= newTick
+        int placedLessOld   = 0          // placed members before the target now
+        int placedLeNew     = 0          // placed members with tick <= newTick
+        int rightStopTick   = int(na)    // placed member with the lowest key, tick > newTick
+        int rightStopPlace  = SLOT_INVALID
+        int leftStopTick    = int(na)    // placed member with the highest key, tick <= newTick
+        int leftStopPlace   = SLOT_INVALID
+        if ok
+            int f = 0
+            while ok and f < count
+                bool isMember = false
+                int  fTick    = int(na)
+                int  fPlace   = SLOT_INVALID
+                int  fSlot    = SLOT_INVALID
+                int  fId      = ID_NONE
+                if f != row and journalAppliedBeforeRaw(engine, f, row)
+                    int fOp = array.get(engine.w03Store.journalOps, f)
+                    if fOp == JOP_MA_UPDATE
+                        fSlot := array.get(engine.w03Store.journalTargetRootSlots, f)
+                        fId   := array.get(engine.w03Store.journalExpectedRootIds, f)
+                        bool latest = not (fSlot == rootSlot and fId == expectedRootId)
+                        int  k = 0
+                        while latest and k < count
+                            if k != row and k != f and array.get(engine.w03Store.journalOps, k) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, k, row) and journalAppliedBeforeRaw(engine, f, k) and array.get(engine.w03Store.journalTargetRootSlots, k) == fSlot and array.get(engine.w03Store.journalExpectedRootIds, k) == fId
+                                latest := false
+                            k += 1
+                        // a committed Root moved this bar; a pending NEW_ROOT target is
+                        // counted through its own NEW_ROOT row below
+                        if latest and fSlot >= 0 and fSlot < array.size(engine.rootIds) and fSlot < array.size(engine.rootSlotLiveFlags) and fSlot < array.size(engine.rootPointTicks) and fSlot < array.size(engine.rootPriceOrderPositions)
+                            if array.get(engine.rootSlotLiveFlags, fSlot) and fId != ID_NONE and array.get(engine.rootIds, fSlot) == fId
+                                int xCpos = array.get(engine.rootPriceOrderPositions, fSlot)
+                                ok := xCpos >= 0 and xCpos < orderSize and not na(array.get(engine.rootPointTicks, fSlot))
+                                if ok
+                                    ok := array.get(engine.rootPriceOrderSlots, xCpos) == fSlot
+                                if ok
+                                    int xTick = array.get(engine.rootPointTicks, fSlot)
+                                    movedBeforeCpos += eUnplaced and xCpos < eCpos ? 1 : 0
+                                    movedLeOld      += xTick <= oldTick ? 1 : 0
+                                    movedLeNew      += xTick <= newTick ? 1 : 0
+                                    isMember := true
+                                    fTick    := int(math.round(array.get(engine.w03Store.journalPointPrices, f) / mintick))
+                                    fPlace   := f
+                    else if fOp == JOP_NEW_ROOT and array.get(engine.w03Store.journalCategories, f) != CAT_FVG and f != eNewRow
+                        fSlot    := predictedNewRootSlotRaw(engine, f)
+                        fId      := predictedNewRootIdRaw(engine, f)
+                        isMember := true
+                        fTick    := int(math.round(array.get(engine.w03Store.journalPointPrices, f) / mintick))
+                        fPlace   := f
+                        int k = 0
+                        while k < count
+                            if k != row and array.get(engine.w03Store.journalOps, k) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, k, row) and array.get(engine.w03Store.journalTargetRootSlots, k) == fSlot and array.get(engine.w03Store.journalExpectedRootIds, k) == fId
+                                if journalAppliedBeforeRaw(engine, fPlace, k)
+                                    fPlace := k
+                                    fTick  := int(math.round(array.get(engine.w03Store.journalPointPrices, k) / mintick))
+                            k += 1
+                if ok and isMember
+                    ok := not na(fTick)
+                    if ok
+                        // before the target: lower tick, or an equal tick placed earlier
+                        // than the target's own placement (an unplaced target comes first)
+                        if fTick < oldTick or (fTick == oldTick and oldPlace != SLOT_INVALID and journalAppliedBeforeRaw(engine, fPlace, oldPlace))
+                            placedLessOld += 1
+                        if fTick <= newTick
+                            placedLeNew += 1
+                            if leftStopPlace == SLOT_INVALID or fTick > leftStopTick or (fTick == leftStopTick and journalAppliedBeforeRaw(engine, leftStopPlace, fPlace))
+                                leftStopTick  := fTick
+                                leftStopPlace := fPlace
+                        else
+                            if rightStopPlace == SLOT_INVALID or fTick < rightStopTick or (fTick == rightStopTick and journalAppliedBeforeRaw(engine, fPlace, rightStopPlace))
+                                rightStopTick  := fTick
+                                rightStopPlace := fPlace
+                f += 1
+        // oldPos : members before the target; targetPos : members (other than the
+        // target) with tick <= newTick - where the move leaves it, the end of the
+        // newTick group, for both scan directions
+        int oldPos    = SLOT_INVALID
+        int targetPos = SLOT_INVALID
+        if ok
+            int unplacedLessOld = eUnplaced ? eCpos - movedBeforeCpos : oldUpperC - movedLeOld - (eCommitted and eCommittedTick <= oldTick ? 1 : 0)
+            int unplacedLeNew   = newUpperC - movedLeNew - (eCommitted and eCommittedTick <= newTick ? 1 : 0)
+            oldPos    := unplacedLessOld + placedLessOld
+            targetPos := unplacedLeNew + placedLeNew
+            ok := oldPos >= 0 and oldPos < virtualSize and targetPos >= 0 and targetPos < virtualSize and (newTick >= oldTick ? targetPos >= oldPos : targetPos <= oldPos)
+        // the committed unplaced members the scan passes, then its stop neighbour
+        if ok
+            bool rightScan = newTick >= oldTick
+            int  cFrom     = rightScan ? (eUnplaced ? eCpos + 1 : oldUpperC) : newUpperC
+            int  cTo       = rightScan ? newUpperC : (eUnplaced ? eCpos : oldUpperC)
+            int  phase     = 0
+            int  c         = cFrom
+            while ok and phase < 2
+                int  slot    = SLOT_INVALID
+                bool inRange = false
+                if phase == 0
+                    inRange := c < cTo
+                    if not inRange
+                        // the stop neighbour: the first unplaced committed entry past the range
+                        phase := 1
+                        c     := rightScan ? newUpperC : newUpperC - 1
+                if phase == 1
+                    inRange := rightScan ? c < orderSize : c >= 0
+                    if not inRange
+                        phase := 2
+                if ok and inRange
+                    slot := array.get(engine.rootPriceOrderSlots, c)
+                    ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootPointTicks) and slot < array.size(engine.rootIsRangeRootFlags) and slot < array.size(engine.rootPriceOrderPositions)
+                    // skip the target and every entry an earlier MA_UPDATE moved
+                    bool placed = false
+                    if ok
+                        placed := eCommitted and slot == rootSlot
+                        int k = 0
+                        while not placed and k < count
+                            if k != row and array.get(engine.w03Store.journalOps, k) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, k, row) and array.get(engine.w03Store.journalTargetRootSlots, k) == slot and array.get(engine.w03Store.journalExpectedRootIds, k) == array.get(engine.rootIds, slot)
+                                placed := true
+                            k += 1
+                    if ok and not placed
+                        // phase 1 : this unplaced entry is the stop neighbour only when no
+                        // placed member is nearer (equal tick: unplaced members come first)
+                        int  cTick   = array.get(engine.rootPointTicks, slot)
+                        bool visited = phase == 0 or (rightScan ? (rightStopPlace == SLOT_INVALID or na(cTick) or cTick <= rightStopTick) : (leftStopPlace == SLOT_INVALID or na(cTick) or cTick > leftStopTick))
+                        if visited
+                            // the move-scan member checks
+                            ok := array.get(engine.rootSlotLiveFlags, slot) and array.get(engine.rootIds, slot) != ID_NONE and not array.get(engine.rootIsRangeRootFlags, slot) and not na(cTick) and array.get(engine.rootPriceOrderPositions, slot) == c
+                            if ok and phase == 1
+                                // the stop condition of the scan direction
+                                ok := rightScan ? cTick > newTick : cTick <= newTick
+                        if phase == 1
+                            phase := 2
+                    if phase == 0
+                        c += 1
+                    else if phase == 1
+                        c := rightScan ? c + 1 : c - 1
+            // a nearer placed stop neighbour was placed by F2 / an earlier F3 row
+            if ok and rightScan and rightStopPlace != SLOT_INVALID
+                ok := rightStopTick > newTick
+            if ok and not rightScan and leftStopPlace != SLOT_INVALID
+                ok := leftStopTick <= newTick
+    ok
 
 // F0 : proves the whole journal applies in F1 - F4 with no apply helper returning
 // false. Read-only. Returns true; any failure is runtime.error("W03_JOURNAL_PREFLIGHT").
@@ -6180,10 +6602,8 @@ w03StageFPreflightRaw(ZoneEngine engine, float mintick) =>
     if ok and count > 0
         ok := engine.w03Store.journalBaseSeq != SEQ_UNSET
     // Step 2 : op / group pairing, and what the later steps must cover
-    bool anyPointNew     = false
     bool anyFvgNew       = false
     int  newRowCount     = 0
-    int  maRowCount      = 0
     int  popsStateActive = 0
     int  popsStruct1h    = 0
     int  popsStruct4h    = 0
@@ -6203,10 +6623,6 @@ w03StageFPreflightRaw(ZoneEngine engine, float mintick) =>
                     newRowCount += 1
                     if array.get(engine.w03Store.journalCategories, row) == CAT_FVG
                         anyFvgNew := true
-                    else
-                        anyPointNew := true
-                else if rowOp == JOP_MA_UPDATE
-                    maRowCount += 1
                 else if rowOp == JOP_FVG_INVALIDATE
                     popsStateActive += 1
                     popsStruct1h    += rowTf == TF_1H ? 1 : 0
@@ -6234,23 +6650,8 @@ w03StageFPreflightRaw(ZoneEngine engine, float mintick) =>
                 ok := array.get(engine.rootFreeSlots, j) != slot
                 j += 1
             i += 1
-    // Step 4 : common price order, whole, when E2 inserts point Roots (every insert
-    // and every later E3 MA move then only meets valid, tick-sorted entries)
-    if ok and anyPointNew
-        int orderSize = array.size(engine.rootPriceOrderSlots)
-        int prevTick  = int(na)
-        int i = 0
-        while ok and i < orderSize
-            int slot = array.get(engine.rootPriceOrderSlots, i)
-            ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootPointTicks) and slot < array.size(engine.rootIsRangeRootFlags) and slot < array.size(engine.rootPriceOrderPositions)
-            if ok
-                ok := array.get(engine.rootSlotLiveFlags, slot) and array.get(engine.rootIds, slot) != ID_NONE and not array.get(engine.rootIsRangeRootFlags, slot) and not na(array.get(engine.rootPointTicks, slot)) and array.get(engine.rootPriceOrderPositions, slot) == i
-            if ok
-                int tick = array.get(engine.rootPointTicks, slot)
-                if i > 0
-                    ok := prevTick <= tick
-                prevTick := tick
-            i += 1
+    // Step 4 : the common price order is proven row by row on the virtual order of
+    // each point NEW_ROOT / MA_UPDATE row (virtualPointOrderPreflightRaw, Step 7)
     // Step 5 : both NativeRange orders, whole, when E2 inserts FVG Roots
     if ok and anyFvgNew
         int side = 0
@@ -6363,7 +6764,7 @@ w03StageFPreflightRaw(ZoneEngine engine, float mintick) =>
                                 ok := array.get(engine.rootSlotLiveFlags, oldHead)
                             if ok
                                 ok := array.get(engine.w02Aux.rootOriginBucketExpectedRootIds, oldHead) == array.get(engine.rootIds, oldHead) and array.get(engine.rootOriginKeys, oldHead) == originKey
-                    // Attach 4 : the Accum pair side (the price attaches are Step 4 / 5)
+                    // Attach 4 : the Accum pair side (the price attach follows below / Step 5)
                     if ok and category == CAT_ACCUM
                         bool isUpper = subtype == SUB_ACCUM_UPPER
                         map<int, int> chosenMap   = isUpper ? engine.accumPairUpperRootSlotByKey : engine.accumPairLowerRootSlotByKey
@@ -6387,79 +6788,49 @@ w03StageFPreflightRaw(ZoneEngine engine, float mintick) =>
                             if ok
                                 int mateTf = array.get(engine.rootTfCodes, mateSlot)
                                 ok := array.get(engine.rootSlotLiveFlags, mateSlot) and array.get(engine.rootIds, mateSlot) != ID_NONE and array.get(engine.rootCategories, mateSlot) == CAT_ACCUM and (mateTf == TF_1H or mateTf == TF_4H or mateTf == TF_D) and array.get(engine.rootPairKeys, mateSlot) == pairKey
+                    // Attach 3 : the common price order insert of a point Root, proven on the
+                    // virtual order this row meets in F2 (NativeRange for FVG is Step 5)
+                    if ok and category != CAT_FVG
+                        ok := virtualPointOrderPreflightRaw(engine, row, mintick)
                 else if op == JOP_MA_UPDATE
                     // maUpdateApplyRaw Step 1 - 2 : the row contract
                     ok := rootSlot != SLOT_INVALID and expectedRootId != ID_NONE and not na(mintick) and mintick > 0
                     if ok
                         ok := category == CAT_MA and (subtype == SUB_MA_EMA2000 or subtype == SUB_MA_EMA3000) and tfCode == TF_1M and originKey != ID_NONE and not na(originTime) and not na(confirmedTime) and not na(pointPrice) and na(nativeBottom) and na(nativeTop) and oldState == ROOT_ACTIVE and newState == ROOT_ACTIVE and pairKey == ID_NONE and direction == FVG_NONE and not fvgFresh and not isBroad and oldMask == 0 and newMask == 0 and (na(slopeDir) or slopeDir == -1 or slopeDir == 0 or slopeDir == 1)
-                    // Step 3 - 4 : the target MA Root
+                    // Step 3 - 4 : the target MA Root - a committed live Root, or the Root one
+                    // earlier NEW_ROOT MA of this bar creates at this predicted address
+                    bool committedTarget = false
                     if ok
-                        ok := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootOriginKeys) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootSubtypes) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootOriginTimes) and rootSlot < array.size(engine.rootConfirmedTimes) and rootSlot < array.size(engine.rootPointPrices) and rootSlot < array.size(engine.rootNativeBottoms) and rootSlot < array.size(engine.rootNativeTops) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootIsDynamicFlags) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootPairKeys) and rootSlot < array.size(engine.rootDirections) and rootSlot < array.size(engine.rootFvgFreshFlags) and rootSlot < array.size(engine.rootIsBroadFvgFlags) and rootSlot < array.size(engine.rootLabelMasks) and rootSlot < array.size(engine.rootLastUpdateSeqs) and rootSlot < array.size(engine.rootPointTicks) and rootSlot < array.size(engine.rootPriceOrderPositions) and rootSlot < array.size(engine.w03Store.rootSwingTfMasks) and rootSlot < array.size(engine.rootNativeBottomTicks) and rootSlot < array.size(engine.rootNativeTopTicks)
-                    if ok
-                        ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId
-                    if ok
-                        ok := array.get(engine.rootCategories, rootSlot) == CAT_MA and array.get(engine.rootSubtypes, rootSlot) == subtype and array.get(engine.rootTfCodes, rootSlot) == TF_1M and array.get(engine.rootOriginKeys, rootSlot) == originKey and virtualRootStateBeforeRaw(engine, rootSlot, expectedRootId, row) == ROOT_ACTIVE and not array.get(engine.rootIsRangeRootFlags, rootSlot) and array.get(engine.rootIsDynamicFlags, rootSlot) and array.get(engine.rootPairKeys, rootSlot) == ID_NONE and array.get(engine.rootDirections, rootSlot) == FVG_NONE and not array.get(engine.rootFvgFreshFlags, rootSlot) and not array.get(engine.rootIsBroadFvgFlags, rootSlot) and array.get(engine.rootLabelMasks, rootSlot) == 0 and array.get(engine.w03Store.rootSwingTfMasks, rootSlot) == SWING_TF_MASK_NONE and na(array.get(engine.rootNativeBottoms, rootSlot)) and na(array.get(engine.rootNativeTops, rootSlot))
-                    if ok
-                        ok := rootSetMembershipValidRaw(engine, rootSlot)
-                    int pricePos  = SLOT_INVALID
-                    int orderSize = array.size(engine.rootPriceOrderSlots)
-                    if ok
-                        pricePos := array.get(engine.rootPriceOrderPositions, rootSlot)
-                        ok := pricePos >= 0 and pricePos < orderSize
+                        committedTarget := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags)
+                        if committedTarget
+                            committedTarget := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId
+                    if ok and committedTarget
                         if ok
-                            ok := array.get(engine.rootPriceOrderSlots, pricePos) == rootSlot
-                    // Step 5 : rootPriceOrderMoveRaw - new tick and the committed tick
-                    int newTick       = int(na)
-                    int committedTick = int(na)
+                            ok := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootOriginKeys) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootSubtypes) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootOriginTimes) and rootSlot < array.size(engine.rootConfirmedTimes) and rootSlot < array.size(engine.rootPointPrices) and rootSlot < array.size(engine.rootNativeBottoms) and rootSlot < array.size(engine.rootNativeTops) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootIsDynamicFlags) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootPairKeys) and rootSlot < array.size(engine.rootDirections) and rootSlot < array.size(engine.rootFvgFreshFlags) and rootSlot < array.size(engine.rootIsBroadFvgFlags) and rootSlot < array.size(engine.rootLabelMasks) and rootSlot < array.size(engine.rootLastUpdateSeqs) and rootSlot < array.size(engine.rootPointTicks) and rootSlot < array.size(engine.rootPriceOrderPositions) and rootSlot < array.size(engine.w03Store.rootSwingTfMasks) and rootSlot < array.size(engine.rootNativeBottomTicks) and rootSlot < array.size(engine.rootNativeTopTicks)
+                        if ok
+                            ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId
+                        if ok
+                            ok := array.get(engine.rootCategories, rootSlot) == CAT_MA and array.get(engine.rootSubtypes, rootSlot) == subtype and array.get(engine.rootTfCodes, rootSlot) == TF_1M and array.get(engine.rootOriginKeys, rootSlot) == originKey and virtualRootStateBeforeRaw(engine, rootSlot, expectedRootId, row) == ROOT_ACTIVE and not array.get(engine.rootIsRangeRootFlags, rootSlot) and array.get(engine.rootIsDynamicFlags, rootSlot) and array.get(engine.rootPairKeys, rootSlot) == ID_NONE and array.get(engine.rootDirections, rootSlot) == FVG_NONE and not array.get(engine.rootFvgFreshFlags, rootSlot) and not array.get(engine.rootIsBroadFvgFlags, rootSlot) and array.get(engine.rootLabelMasks, rootSlot) == 0 and array.get(engine.w03Store.rootSwingTfMasks, rootSlot) == SWING_TF_MASK_NONE and na(array.get(engine.rootNativeBottoms, rootSlot)) and na(array.get(engine.rootNativeTops, rootSlot))
+                        if ok
+                            ok := rootSetMembershipValidRaw(engine, rootSlot)
+                        int pricePos  = SLOT_INVALID
+                        int orderSize = array.size(engine.rootPriceOrderSlots)
+                        if ok
+                            pricePos := array.get(engine.rootPriceOrderPositions, rootSlot)
+                            ok := pricePos >= 0 and pricePos < orderSize
+                            if ok
+                                ok := array.get(engine.rootPriceOrderSlots, pricePos) == rootSlot
+                    else if ok
+                        [newRow, newCount] = pendingNewRootRowByAddressRaw(engine, rootSlot, expectedRootId, row)
+                        ok := newCount == 1
+                        if ok
+                            // that NEW_ROOT row passed F0 above; its MA contract fixes TF 1M, point
+                            // Root, dynamic, no pair / direction / Fresh / Broad / label / Swing mask,
+                            // and its attaches give the general set and price-order membership
+                            ok := array.get(engine.w03Store.journalCategories, newRow) == CAT_MA and array.get(engine.w03Store.journalSubtypes, newRow) == subtype and array.get(engine.w03Store.journalOriginKeys, newRow) == originKey and virtualRootStateBeforeRaw(engine, rootSlot, expectedRootId, row) == ROOT_ACTIVE
+                    // Step 5 : rootPriceOrderMoveRaw, proven on the virtual order this row meets
                     if ok
-                        newTick       := int(math.round(pointPrice / mintick))
-                        committedTick := array.get(engine.rootPointTicks, rootSlot)
-                        ok := not na(newTick) and not na(committedTick)
-                    // the scan: Step 4 already proved the whole order when E2 inserts;
-                    // otherwise every entry any move of this Root can reach, locally
-                    if ok and not anyPointNew
-                        // the tick this row moves from: the last earlier MA_UPDATE of this Root
-                        int oldTick = committedTick
-                        int j = 0
-                        while j < count
-                            if j != row and array.get(engine.w03Store.journalOps, j) == JOP_MA_UPDATE and journalAppliedBeforeRaw(engine, j, row) and array.get(engine.w03Store.journalTargetRootSlots, j) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, j) == expectedRootId
-                                oldTick := int(math.round(array.get(engine.w03Store.journalPointPrices, j) / mintick))
-                            j += 1
-                        int lowTick  = math.min(committedTick, math.min(oldTick, newTick))
-                        int highTick = math.max(committedTick, math.max(oldTick, newTick))
-                        // entries moved by other MA rows may sit inside the walk: one more
-                        // entry beyond the range per MA row, then the real stopper
-                        int extra    = maRowCount + 1
-                        int beyond   = 0
-                        int prevTick = committedTick
-                        int i = pricePos + 1
-                        while ok and beyond < extra and i < orderSize
-                            int slot = array.get(engine.rootPriceOrderSlots, i)
-                            ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootPointTicks) and slot < array.size(engine.rootIsRangeRootFlags) and slot < array.size(engine.rootPriceOrderPositions)
-                            if ok
-                                ok := array.get(engine.rootSlotLiveFlags, slot) and array.get(engine.rootIds, slot) != ID_NONE and not array.get(engine.rootIsRangeRootFlags, slot) and not na(array.get(engine.rootPointTicks, slot)) and array.get(engine.rootPriceOrderPositions, slot) == i
-                            if ok
-                                int tick = array.get(engine.rootPointTicks, slot)
-                                ok := tick >= prevTick
-                                prevTick := tick
-                                if tick > highTick
-                                    beyond += 1
-                            i += 1
-                        beyond   := 0
-                        prevTick := committedTick
-                        i        := pricePos - 1
-                        while ok and beyond < extra and i >= 0
-                            int slot = array.get(engine.rootPriceOrderSlots, i)
-                            ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootPointTicks) and slot < array.size(engine.rootIsRangeRootFlags) and slot < array.size(engine.rootPriceOrderPositions)
-                            if ok
-                                ok := array.get(engine.rootSlotLiveFlags, slot) and array.get(engine.rootIds, slot) != ID_NONE and not array.get(engine.rootIsRangeRootFlags, slot) and not na(array.get(engine.rootPointTicks, slot)) and array.get(engine.rootPriceOrderPositions, slot) == i
-                            if ok
-                                int tick = array.get(engine.rootPointTicks, slot)
-                                ok := tick <= prevTick
-                                prevTick := tick
-                                if tick < lowTick
-                                    beyond += 1
-                            i -= 1
+                        ok := virtualPointOrderPreflightRaw(engine, row, mintick)
                 else if op == JOP_SWING_TF_MERGE or op == JOP_TIMEHL_LABEL or op == JOP_ROOT_RETIRE
                     // Step 1 : the row contract shared by the three point-Root helpers
                     int rowNewState = op == JOP_ROOT_RETIRE ? ROOT_RETIRED : ROOT_ACTIVE
@@ -6479,29 +6850,57 @@ w03StageFPreflightRaw(ZoneEngine engine, float mintick) =>
                             ok := category == CAT_TIME_HL and (subtype == SUB_TIMEHL_HIGH or subtype == SUB_TIMEHL_LOW) and tfCode == TF_5M and oldMask >= 1 and oldMask <= 63 and newMask >= 0 and newMask <= 63 and newMask != oldMask
                         else
                             ok := category == CAT_TIME_HL and (subtype == SUB_TIMEHL_HIGH or subtype == SUB_TIMEHL_LOW) and tfCode == TF_5M and oldMask == 0 and newMask == 0
-                    // Step 3 : the target point Root
+                    // Step 3 : the target point Root - a committed live Root, or the Root one
+                    // earlier NEW_ROOT of this bar creates at this predicted address
+                    bool committedTarget = false
+                    int  targetCategory  = int(na)
+                    int  targetTf        = int(na)
+                    int  targetOriginKey = ID_NONE
                     if ok
-                        ok := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootOriginKeys) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootSubtypes) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootPairKeys) and rootSlot < array.size(engine.rootDirections) and rootSlot < array.size(engine.rootFvgFreshFlags) and rootSlot < array.size(engine.rootIsBroadFvgFlags) and rootSlot < array.size(engine.rootLabelMasks) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootIsDynamicFlags) and rootSlot < array.size(engine.rootPointPrices) and rootSlot < array.size(engine.rootNativeBottoms) and rootSlot < array.size(engine.rootNativeTops) and rootSlot < array.size(engine.rootPriceOrderPositions) and rootSlot < array.size(engine.rootStateSetPositions) and rootSlot < array.size(engine.w03Store.rootSwingTfMasks)
-                    if ok
-                        ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId and array.get(engine.rootSubtypes, rootSlot) == subtype and virtualRootStateBeforeRaw(engine, rootSlot, expectedRootId, row) == ROOT_ACTIVE and not array.get(engine.rootIsRangeRootFlags, rootSlot) and not array.get(engine.rootIsDynamicFlags, rootSlot) and array.get(engine.rootPairKeys, rootSlot) == ID_NONE and array.get(engine.rootDirections, rootSlot) == FVG_NONE and not array.get(engine.rootFvgFreshFlags, rootSlot) and not array.get(engine.rootIsBroadFvgFlags, rootSlot) and not na(array.get(engine.rootPointPrices, rootSlot)) and na(array.get(engine.rootNativeBottoms, rootSlot)) and na(array.get(engine.rootNativeTops, rootSlot))
-                    if ok
-                        ok := rootSetMembershipValidRaw(engine, rootSlot)
-                    if ok
-                        int pricePos = array.get(engine.rootPriceOrderPositions, rootSlot)
-                        ok := pricePos >= 0 and pricePos < array.size(engine.rootPriceOrderSlots)
+                        committedTarget := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags)
+                        if committedTarget
+                            committedTarget := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId
+                    if ok and committedTarget
                         if ok
-                            ok := array.get(engine.rootPriceOrderSlots, pricePos) == rootSlot
+                            ok := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootOriginKeys) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootSubtypes) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootPairKeys) and rootSlot < array.size(engine.rootDirections) and rootSlot < array.size(engine.rootFvgFreshFlags) and rootSlot < array.size(engine.rootIsBroadFvgFlags) and rootSlot < array.size(engine.rootLabelMasks) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootIsDynamicFlags) and rootSlot < array.size(engine.rootPointPrices) and rootSlot < array.size(engine.rootNativeBottoms) and rootSlot < array.size(engine.rootNativeTops) and rootSlot < array.size(engine.rootPriceOrderPositions) and rootSlot < array.size(engine.rootStateSetPositions) and rootSlot < array.size(engine.w03Store.rootSwingTfMasks)
+                        if ok
+                            ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId and array.get(engine.rootSubtypes, rootSlot) == subtype and virtualRootStateBeforeRaw(engine, rootSlot, expectedRootId, row) == ROOT_ACTIVE and not array.get(engine.rootIsRangeRootFlags, rootSlot) and not array.get(engine.rootIsDynamicFlags, rootSlot) and array.get(engine.rootPairKeys, rootSlot) == ID_NONE and array.get(engine.rootDirections, rootSlot) == FVG_NONE and not array.get(engine.rootFvgFreshFlags, rootSlot) and not array.get(engine.rootIsBroadFvgFlags, rootSlot) and not na(array.get(engine.rootPointPrices, rootSlot)) and na(array.get(engine.rootNativeBottoms, rootSlot)) and na(array.get(engine.rootNativeTops, rootSlot))
+                        if ok
+                            ok := rootSetMembershipValidRaw(engine, rootSlot)
+                        if ok
+                            int pricePos = array.get(engine.rootPriceOrderPositions, rootSlot)
+                            ok := pricePos >= 0 and pricePos < array.size(engine.rootPriceOrderSlots)
+                            if ok
+                                ok := array.get(engine.rootPriceOrderSlots, pricePos) == rootSlot
+                        if ok
+                            targetCategory  := array.get(engine.rootCategories, rootSlot)
+                            targetTf        := array.get(engine.rootTfCodes,    rootSlot)
+                            targetOriginKey := array.get(engine.rootOriginKeys, rootSlot)
+                    else if ok
+                        [newRow, newCount] = pendingNewRootRowByAddressRaw(engine, rootSlot, expectedRootId, row)
+                        ok := newCount == 1
+                        if ok
+                            // the Root identity comes from that NEW_ROOT row, which passed F0 above:
+                            // a point Root (not FVG), not dynamic (not MA), no pair / direction /
+                            // Fresh / Broad; its attaches give the general set membership (ACTIVE
+                            // set) and the price-order membership, kept by every later move
+                            int newCategory = array.get(engine.w03Store.journalCategories, newRow)
+                            ok := newCategory != CAT_FVG and newCategory != CAT_MA and array.get(engine.w03Store.journalSubtypes, newRow) == subtype and virtualRootStateBeforeRaw(engine, rootSlot, expectedRootId, row) == ROOT_ACTIVE and array.get(engine.w03Store.journalPairKeys, newRow) == ID_NONE and array.get(engine.w03Store.journalDirections, newRow) == FVG_NONE and not array.get(engine.w03Store.journalFvgFreshFlags, newRow) and not array.get(engine.w03Store.journalIsBroadFlags, newRow) and not na(array.get(engine.w03Store.journalPointPrices, newRow)) and na(array.get(engine.w03Store.journalNativeBottoms, newRow)) and na(array.get(engine.w03Store.journalNativeTops, newRow))
+                            if ok
+                                targetCategory  := newCategory
+                                targetTf        := array.get(engine.w03Store.journalTfCodes,    newRow)
+                                targetOriginKey := array.get(engine.w03Store.journalOriginKeys, newRow)
                     // the op's own Root contract, on the virtual masks
                     if ok
                         if op == JOP_SWING_TF_MERGE
-                            int rootTf = array.get(engine.rootTfCodes, rootSlot)
-                            ok := array.get(engine.rootCategories, rootSlot) == CAT_SWING and (rootTf == TF_5M or rootTf == TF_15M or rootTf == TF_1H) and virtualTimeHlLabelMaskBeforeRaw(engine, rootSlot, expectedRootId, row) == 0 and virtualSwingTfMaskBeforeRaw(engine, rootSlot, expectedRootId, row) == oldMask
+                            ok := targetCategory == CAT_SWING and (targetTf == TF_5M or targetTf == TF_15M or targetTf == TF_1H) and virtualTimeHlLabelMaskBeforeRaw(engine, rootSlot, expectedRootId, row) == 0 and virtualSwingTfMaskBeforeRaw(engine, rootSlot, expectedRootId, row) == oldMask
                         else if op == JOP_TIMEHL_LABEL
-                            ok := array.get(engine.rootCategories, rootSlot) == CAT_TIME_HL and array.get(engine.rootTfCodes, rootSlot) == TF_5M and virtualTimeHlLabelMaskBeforeRaw(engine, rootSlot, expectedRootId, row) == oldMask and virtualSwingTfMaskBeforeRaw(engine, rootSlot, expectedRootId, row) == SWING_TF_MASK_NONE and (originKey == ID_NONE or array.get(engine.rootOriginKeys, rootSlot) == originKey)
+                            ok := targetCategory == CAT_TIME_HL and targetTf == TF_5M and virtualTimeHlLabelMaskBeforeRaw(engine, rootSlot, expectedRootId, row) == oldMask and virtualSwingTfMaskBeforeRaw(engine, rootSlot, expectedRootId, row) == SWING_TF_MASK_NONE and (originKey == ID_NONE or targetOriginKey == originKey)
                         else
                             // ROOT_RETIRE : no label left; the ACTIVE entry is proven by the
-                            // membership above and the moved last entry by Step 6
-                            ok := array.get(engine.rootCategories, rootSlot) == CAT_TIME_HL and array.get(engine.rootTfCodes, rootSlot) == TF_5M and virtualTimeHlLabelMaskBeforeRaw(engine, rootSlot, expectedRootId, row) == 0 and virtualSwingTfMaskBeforeRaw(engine, rootSlot, expectedRootId, row) == SWING_TF_MASK_NONE
+                            // membership above (or the pending NEW attach) and the moved last
+                            // entry by Step 6
+                            ok := targetCategory == CAT_TIME_HL and targetTf == TF_5M and virtualTimeHlLabelMaskBeforeRaw(engine, rootSlot, expectedRootId, row) == 0 and virtualSwingTfMaskBeforeRaw(engine, rootSlot, expectedRootId, row) == SWING_TF_MASK_NONE
                 else
                     // FVG_INVALIDATE (E1) or FVG_FRESH_END (E3): the common FVG row identity
                     ok := category == CAT_FVG and (tfCode == TF_1H or tfCode == TF_4H or tfCode == TF_D) and originKey != ID_NONE and pairKey == ID_NONE and (direction == FVG_BULLISH or direction == FVG_BEARISH) and oldMask == 0 and newMask == 0
@@ -6526,35 +6925,68 @@ w03StageFPreflightRaw(ZoneEngine engine, float mintick) =>
                                     ok := false
                                 j += 1
                     else if ok
-                        // a committed FVG Root: ownership, identity and every index it holds
+                        // an existing FVG Root named by (rootSlot, expectedRootId)
                         ok := rootSlot != SLOT_INVALID and expectedRootId != ID_NONE
+                        bool committedTarget = false
                         if ok
-                            ok := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootOriginKeys) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootSubtypes) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootPairKeys) and rootSlot < array.size(engine.rootDirections) and rootSlot < array.size(engine.rootFvgFreshFlags) and rootSlot < array.size(engine.rootIsBroadFvgFlags) and rootSlot < array.size(engine.rootLabelMasks) and rootSlot < array.size(engine.rootLastUpdateSeqs) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootIsDynamicFlags) and rootSlot < array.size(engine.rootPointPrices) and rootSlot < array.size(engine.rootPointTicks) and rootSlot < array.size(engine.rootNativeBottoms) and rootSlot < array.size(engine.rootNativeTops) and rootSlot < array.size(engine.rootNativeBottomTicks) and rootSlot < array.size(engine.rootNativeTopTicks) and rootSlot < array.size(engine.rootPriceOrderPositions) and rootSlot < array.size(engine.rootFvgFreshSetPositions) and rootSlot < array.size(engine.rootFvgStructuralStateSetPositions) and rootSlot < array.size(engine.rootFvgDirectionSetPositions) and rootSlot < array.size(engine.rootFvgBroadSetPositions) and rootSlot < array.size(engine.rootFvgNativeBottomOrderPositions) and rootSlot < array.size(engine.rootFvgNativeTopOrderPositions) and rootSlot < array.size(engine.w03Store.rootSwingTfMasks)
-                        if ok
-                            ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId
-                        if ok
-                            int bottomTick = array.get(engine.rootNativeBottomTicks, rootSlot)
-                            int topTick    = array.get(engine.rootNativeTopTicks,    rootSlot)
-                            ok := array.get(engine.rootCategories, rootSlot) == CAT_FVG and array.get(engine.rootTfCodes, rootSlot) == tfCode and array.get(engine.rootOriginKeys, rootSlot) == originKey and array.get(engine.rootSubtypes, rootSlot) == subtype and array.get(engine.rootPairKeys, rootSlot) == ID_NONE and array.get(engine.rootDirections, rootSlot) == direction and array.get(engine.rootIsRangeRootFlags, rootSlot) and not array.get(engine.rootIsDynamicFlags, rootSlot) and array.get(engine.rootLabelMasks, rootSlot) == 0 and array.get(engine.w03Store.rootSwingTfMasks, rootSlot) == SWING_TF_MASK_NONE and na(array.get(engine.rootPointPrices, rootSlot)) and not na(array.get(engine.rootNativeBottoms, rootSlot)) and not na(array.get(engine.rootNativeTops, rootSlot)) and not na(bottomTick) and not na(topTick) and bottomTick <= topTick and array.get(engine.rootPriceOrderPositions, rootSlot) == SLOT_INVALID
-                        if ok
-                            int bottomPos = array.get(engine.rootFvgNativeBottomOrderPositions, rootSlot)
-                            int topPos    = array.get(engine.rootFvgNativeTopOrderPositions,    rootSlot)
-                            ok := bottomPos >= 0 and topPos >= 0 and bottomPos < array.size(engine.fvgNativeBottomOrderRootSlots) and topPos < array.size(engine.fvgNativeTopOrderRootSlots)
+                            committedTarget := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags)
+                            if committedTarget
+                                committedTarget := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId
+                        if ok and committedTarget
+                            // a committed FVG Root: ownership, identity and every index it holds
                             if ok
-                                ok := array.get(engine.fvgNativeBottomOrderRootSlots, bottomPos) == rootSlot and array.get(engine.fvgNativeTopOrderRootSlots, topPos) == rootSlot
-                        // the committed memberships; every earlier move keeps them exact
-                        if ok
-                            ok := rootSetMembershipValidRaw(engine, rootSlot)
-                        if ok
-                            ok := fvgSetMembershipValidRaw(engine, rootSlot, expectedRootId)
-                        // Step 4 : the virtual state / Fresh this row sees; Broad never changes
-                        if ok
-                            int  virtualState = virtualRootStateBeforeRaw(engine, rootSlot, expectedRootId, row)
-                            bool virtualFresh = virtualFvgFreshBeforeRaw(engine, rootSlot, expectedRootId, row)
-                            if op == JOP_FVG_INVALIDATE
-                                ok := virtualState == ROOT_ACTIVE and virtualFresh == fvgFresh and array.get(engine.rootIsBroadFvgFlags, rootSlot) == isBroad
-                            else
-                                ok := virtualState == oldState and virtualFresh and array.get(engine.rootIsBroadFvgFlags, rootSlot) == isBroad
+                                ok := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootOriginKeys) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootSubtypes) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootPairKeys) and rootSlot < array.size(engine.rootDirections) and rootSlot < array.size(engine.rootFvgFreshFlags) and rootSlot < array.size(engine.rootIsBroadFvgFlags) and rootSlot < array.size(engine.rootLabelMasks) and rootSlot < array.size(engine.rootLastUpdateSeqs) and rootSlot < array.size(engine.rootIsRangeRootFlags) and rootSlot < array.size(engine.rootIsDynamicFlags) and rootSlot < array.size(engine.rootPointPrices) and rootSlot < array.size(engine.rootPointTicks) and rootSlot < array.size(engine.rootNativeBottoms) and rootSlot < array.size(engine.rootNativeTops) and rootSlot < array.size(engine.rootNativeBottomTicks) and rootSlot < array.size(engine.rootNativeTopTicks) and rootSlot < array.size(engine.rootPriceOrderPositions) and rootSlot < array.size(engine.rootFvgFreshSetPositions) and rootSlot < array.size(engine.rootFvgStructuralStateSetPositions) and rootSlot < array.size(engine.rootFvgDirectionSetPositions) and rootSlot < array.size(engine.rootFvgBroadSetPositions) and rootSlot < array.size(engine.rootFvgNativeBottomOrderPositions) and rootSlot < array.size(engine.rootFvgNativeTopOrderPositions) and rootSlot < array.size(engine.w03Store.rootSwingTfMasks)
+                            if ok
+                                ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId
+                            if ok
+                                int bottomTick = array.get(engine.rootNativeBottomTicks, rootSlot)
+                                int topTick    = array.get(engine.rootNativeTopTicks,    rootSlot)
+                                ok := array.get(engine.rootCategories, rootSlot) == CAT_FVG and array.get(engine.rootTfCodes, rootSlot) == tfCode and array.get(engine.rootOriginKeys, rootSlot) == originKey and array.get(engine.rootSubtypes, rootSlot) == subtype and array.get(engine.rootPairKeys, rootSlot) == ID_NONE and array.get(engine.rootDirections, rootSlot) == direction and array.get(engine.rootIsRangeRootFlags, rootSlot) and not array.get(engine.rootIsDynamicFlags, rootSlot) and array.get(engine.rootLabelMasks, rootSlot) == 0 and array.get(engine.w03Store.rootSwingTfMasks, rootSlot) == SWING_TF_MASK_NONE and na(array.get(engine.rootPointPrices, rootSlot)) and not na(array.get(engine.rootNativeBottoms, rootSlot)) and not na(array.get(engine.rootNativeTops, rootSlot)) and not na(bottomTick) and not na(topTick) and bottomTick <= topTick and array.get(engine.rootPriceOrderPositions, rootSlot) == SLOT_INVALID
+                            if ok
+                                int bottomPos = array.get(engine.rootFvgNativeBottomOrderPositions, rootSlot)
+                                int topPos    = array.get(engine.rootFvgNativeTopOrderPositions,    rootSlot)
+                                ok := bottomPos >= 0 and topPos >= 0 and bottomPos < array.size(engine.fvgNativeBottomOrderRootSlots) and topPos < array.size(engine.fvgNativeTopOrderRootSlots)
+                                if ok
+                                    ok := array.get(engine.fvgNativeBottomOrderRootSlots, bottomPos) == rootSlot and array.get(engine.fvgNativeTopOrderRootSlots, topPos) == rootSlot
+                            // the committed memberships; every earlier move keeps them exact
+                            if ok
+                                ok := rootSetMembershipValidRaw(engine, rootSlot)
+                            if ok
+                                ok := fvgSetMembershipValidRaw(engine, rootSlot, expectedRootId)
+                            // Step 4 : the virtual state / Fresh this row sees; Broad never changes
+                            if ok
+                                int virtualState = virtualRootStateBeforeRaw(engine, rootSlot, expectedRootId, row)
+                                [virtualFresh, freshResolved] = virtualFvgFreshBeforeRaw(engine, rootSlot, expectedRootId, row)
+                                if op == JOP_FVG_INVALIDATE
+                                    ok := freshResolved and virtualState == ROOT_ACTIVE and virtualFresh == fvgFresh and array.get(engine.rootIsBroadFvgFlags, rootSlot) == isBroad
+                                else
+                                    ok := freshResolved and virtualState == oldState and virtualFresh and array.get(engine.rootIsBroadFvgFlags, rootSlot) == isBroad
+                        else if ok and op == JOP_FVG_FRESH_END
+                            // an FVG created earlier this bar, named by its predicted address (E1
+                            // runs before E2, so FVG_INVALIDATE never reaches here)
+                            [newRow, newCount] = pendingNewRootRowByAddressRaw(engine, rootSlot, expectedRootId, row)
+                            ok := newCount == 1
+                            if ok
+                                // that NEW_ROOT row passed F0 above: its FVG contract and attaches give
+                                // the range Root, both NativeRange positions and every FVG set entry
+                                ok := array.get(engine.w03Store.journalCategories, newRow) == CAT_FVG and array.get(engine.w03Store.journalTfCodes, newRow) == tfCode and array.get(engine.w03Store.journalOriginKeys, newRow) == originKey and array.get(engine.w03Store.journalSubtypes, newRow) == subtype and array.get(engine.w03Store.journalDirections, newRow) == direction and array.get(engine.w03Store.journalIsBroadFlags, newRow) == isBroad
+                            if ok
+                                int pendingState = virtualRootStateBeforeRaw(engine, rootSlot, expectedRootId, row)
+                                [pendingFresh, pendingResolved] = virtualFvgFreshBeforeRaw(engine, rootSlot, expectedRootId, row)
+                                ok := pendingResolved and pendingState == oldState and pendingFresh
+                            if ok
+                                // a Path B row on the same new FVG ends the same Fresh: whichever of
+                                // the two F3 applies second fails, so the journal fails here
+                                int newTf     = array.get(engine.w03Store.journalTfCodes,     newRow)
+                                int newDir    = array.get(engine.w03Store.journalDirections,  newRow)
+                                int newOrigin = array.get(engine.w03Store.journalOriginTimes, newRow)
+                                int j = 0
+                                while ok and j < count
+                                    if j != row and array.get(engine.w03Store.journalOps, j) == JOP_FVG_FRESH_END and array.get(engine.w03Store.journalTargetRootSlots, j) == SLOT_INVALID and array.get(engine.w03Store.journalExpectedRootIds, j) == ID_NONE and array.get(engine.w03Store.journalTfCodes, j) == newTf and array.get(engine.w03Store.journalDirections, j) == newDir and array.get(engine.w03Store.journalOriginTimes, j) == newOrigin
+                                        ok := false
+                                    j += 1
+                        else
+                            ok := false
             row += 1
         group += 1
     // Step 8 : any failure stops the bar before F1 writes anything
