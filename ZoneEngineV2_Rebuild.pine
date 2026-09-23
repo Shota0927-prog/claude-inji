@@ -1419,6 +1419,24 @@ export type W02AuxStore
     array<int>   pendingTopologyRootNodeFreeIndexes
 
 // ============================================================
+// W03 Batch 03 : Root mutation journal group / op codes (internal)
+// Source: I8 Stage E (E1 .. E4)
+// ============================================================
+const int JGROUP_E1 = 1   // FVG structural invalidation
+const int JGROUP_E2 = 2   // NEW_ROOT
+const int JGROUP_E3 = 3   // Root update
+const int JGROUP_E4 = 4   // ROOT_RETIRE
+
+// Accum Confirmed uses JOP_NEW_ROOT; there is no Accum Candidate op.
+const int JOP_FVG_INVALIDATE = 1
+const int JOP_NEW_ROOT       = 2
+const int JOP_MA_UPDATE      = 3
+const int JOP_SWING_TF_MERGE = 4
+const int JOP_TIMEHL_LABEL   = 5
+const int JOP_FVG_FRESH_END  = 6
+const int JOP_ROOT_RETIRE    = 7
+
+// ============================================================
 // W03 Batch 02 : W03SourceRootStore - Engine-owned Source / Root scalar store
 // Source: I7.1, I10, A7.4, A7.6, D02, D12
 //
@@ -1501,6 +1519,41 @@ export type W03SourceRootStore
 
     // ---- Accum pair sequence. 1-based, 0 = no pair, shared by Upper / Lower ----
     int   nextAccumPairKey                       = 1
+
+    // ---- W03 Batch 03 : Root mutation journal meta ----
+    // journalCount is the logical length of the current Base bar's journal;
+    // journalInvariantViolation is the future preflight flag (nothing sets it yet).
+    int   journalCount                           = 0
+    int   journalBaseSeq                         = -1
+    int   journalBaseCloseTime                   = na
+    bool  journalInvariantViolation              = false
+
+    // ---- W03 Batch 03 : Root mutation journal SoA (one row = one mutation) ----
+    // Reuse pool: rows 0 .. journalCount - 1 are logically valid. All 23 arrays
+    // share one physical size and are never cleared or shrunk.
+    array<int>   journalOps
+    array<int>   journalGroups
+    array<int>   journalTargetRootSlots
+    array<int>   journalExpectedRootIds
+    array<int>   journalCategories
+    array<int>   journalSubtypes
+    array<int>   journalTfCodes
+    array<int>   journalOriginKeys
+    array<int>   journalOriginTimes
+    array<int>   journalOriginEndTimes
+    array<int>   journalConfirmedTimes
+    array<float> journalPointPrices
+    array<float> journalNativeBottoms
+    array<float> journalNativeTops
+    array<int>   journalOldStates
+    array<int>   journalNewStates
+    array<bool>  journalFvgFreshFlags
+    array<bool>  journalIsBroadFlags
+    array<int>   journalDirections
+    array<int>   journalOldMasks
+    array<int>   journalNewMasks
+    array<int>   journalPairKeys
+    array<int>   journalSlopeDirs
 
 export type ZoneEngine
     // ---- scalar : config validation (Batch 5 connects validateCfg results) ----
@@ -2571,6 +2624,31 @@ export newEngine(ZoneCfg cfg) =>
     // W03 Batch 02 : one W03SourceRootStore per Engine, all fields at their type
     // default sentinels. No collection is created.
     W03SourceRootStore w03 = W03SourceRootStore.new()
+    // W03 Batch 03 : 23 independent, empty journal arrays. Journal meta keeps its
+    // type defaults.
+    w03.journalOps              := array.new_int(0)
+    w03.journalGroups           := array.new_int(0)
+    w03.journalTargetRootSlots  := array.new_int(0)
+    w03.journalExpectedRootIds  := array.new_int(0)
+    w03.journalCategories       := array.new_int(0)
+    w03.journalSubtypes         := array.new_int(0)
+    w03.journalTfCodes          := array.new_int(0)
+    w03.journalOriginKeys       := array.new_int(0)
+    w03.journalOriginTimes      := array.new_int(0)
+    w03.journalOriginEndTimes   := array.new_int(0)
+    w03.journalConfirmedTimes   := array.new_int(0)
+    w03.journalPointPrices      := array.new_float(0)
+    w03.journalNativeBottoms    := array.new_float(0)
+    w03.journalNativeTops       := array.new_float(0)
+    w03.journalOldStates        := array.new_int(0)
+    w03.journalNewStates        := array.new_int(0)
+    w03.journalFvgFreshFlags    := array.new_bool(0)
+    w03.journalIsBroadFlags     := array.new_bool(0)
+    w03.journalDirections       := array.new_int(0)
+    w03.journalOldMasks         := array.new_int(0)
+    w03.journalNewMasks         := array.new_int(0)
+    w03.journalPairKeys         := array.new_int(0)
+    w03.journalSlopeDirs        := array.new_int(0)
     e.w03Store := w03
 
     // W02 Batch 9 : four independent Candidate scratch regions, empty and logically
@@ -2607,6 +2685,84 @@ export newEngine(ZoneCfg cfg) =>
     e.cfgFingerprintB  := cfgFingerprint(cfg, FP_SEED_B, FP_MULT_B)
 
     e
+
+// ============================================================
+// W03 Batch 03 : Root mutation journal raw helpers
+// Source: I8 (Stage E / F), I17.1, D12
+//
+// Internal only and physical only. The journal is a reuse pool: a reset puts the
+// logical length back to 0 and never clears, pops or recreates the 23 arrays, and
+// an append overwrites an existing physical row or grows all 23 arrays by one row.
+// The 23 arrays always keep one physical size: an append writes all of them or
+// pushes all of them, never part. Values are stored exactly as the caller passes
+// them - no sentinel is filled in, inferred or corrected here.
+// No Stage, Root mutation, preflight, revision or index is touched, and call
+// sites = 0 in this Batch.
+// ============================================================
+
+// Starts a new logical journal for one Base bar. Scalars only.
+journalResetRaw(ZoneEngine engine, int baseSeq, int baseCloseTime) =>
+    engine.w03Store.journalCount              := 0
+    engine.w03Store.journalBaseSeq            := baseSeq
+    engine.w03Store.journalBaseCloseTime      := baseCloseTime
+    engine.w03Store.journalInvariantViolation := false
+
+// Appends one journal row at the logical tail and returns its row index. The
+// logical length grows only after all 23 fields are written.
+journalAppendRaw(ZoneEngine engine, int op, int group, int targetRootSlot, int expectedRootId, int category, int subtype, int tfCode, int originKey, int originTime, int originEndTime, int confirmedTime, float pointPrice, float nativeBottom, float nativeTop, int oldState, int newState, bool fvgFresh, bool isBroad, int direction, int oldMask, int newMask, int pairKey, int slopeDir) =>
+    int row = engine.w03Store.journalCount
+    if row < array.size(engine.w03Store.journalOps)
+        // the physical row exists -> overwrite all 23 fields
+        array.set(engine.w03Store.journalOps,             row, op)
+        array.set(engine.w03Store.journalGroups,          row, group)
+        array.set(engine.w03Store.journalTargetRootSlots, row, targetRootSlot)
+        array.set(engine.w03Store.journalExpectedRootIds, row, expectedRootId)
+        array.set(engine.w03Store.journalCategories,      row, category)
+        array.set(engine.w03Store.journalSubtypes,        row, subtype)
+        array.set(engine.w03Store.journalTfCodes,         row, tfCode)
+        array.set(engine.w03Store.journalOriginKeys,      row, originKey)
+        array.set(engine.w03Store.journalOriginTimes,     row, originTime)
+        array.set(engine.w03Store.journalOriginEndTimes,  row, originEndTime)
+        array.set(engine.w03Store.journalConfirmedTimes,  row, confirmedTime)
+        array.set(engine.w03Store.journalPointPrices,     row, pointPrice)
+        array.set(engine.w03Store.journalNativeBottoms,   row, nativeBottom)
+        array.set(engine.w03Store.journalNativeTops,      row, nativeTop)
+        array.set(engine.w03Store.journalOldStates,       row, oldState)
+        array.set(engine.w03Store.journalNewStates,       row, newState)
+        array.set(engine.w03Store.journalFvgFreshFlags,   row, fvgFresh)
+        array.set(engine.w03Store.journalIsBroadFlags,    row, isBroad)
+        array.set(engine.w03Store.journalDirections,      row, direction)
+        array.set(engine.w03Store.journalOldMasks,        row, oldMask)
+        array.set(engine.w03Store.journalNewMasks,        row, newMask)
+        array.set(engine.w03Store.journalPairKeys,        row, pairKey)
+        array.set(engine.w03Store.journalSlopeDirs,       row, slopeDir)
+    else
+        // the pool has never been this long -> grow all 23 arrays by one row
+        array.push(engine.w03Store.journalOps,             op)
+        array.push(engine.w03Store.journalGroups,          group)
+        array.push(engine.w03Store.journalTargetRootSlots, targetRootSlot)
+        array.push(engine.w03Store.journalExpectedRootIds, expectedRootId)
+        array.push(engine.w03Store.journalCategories,      category)
+        array.push(engine.w03Store.journalSubtypes,        subtype)
+        array.push(engine.w03Store.journalTfCodes,         tfCode)
+        array.push(engine.w03Store.journalOriginKeys,      originKey)
+        array.push(engine.w03Store.journalOriginTimes,     originTime)
+        array.push(engine.w03Store.journalOriginEndTimes,  originEndTime)
+        array.push(engine.w03Store.journalConfirmedTimes,  confirmedTime)
+        array.push(engine.w03Store.journalPointPrices,     pointPrice)
+        array.push(engine.w03Store.journalNativeBottoms,   nativeBottom)
+        array.push(engine.w03Store.journalNativeTops,      nativeTop)
+        array.push(engine.w03Store.journalOldStates,       oldState)
+        array.push(engine.w03Store.journalNewStates,       newState)
+        array.push(engine.w03Store.journalFvgFreshFlags,   fvgFresh)
+        array.push(engine.w03Store.journalIsBroadFlags,    isBroad)
+        array.push(engine.w03Store.journalDirections,      direction)
+        array.push(engine.w03Store.journalOldMasks,        oldMask)
+        array.push(engine.w03Store.journalNewMasks,        newMask)
+        array.push(engine.w03Store.journalPairKeys,        pairKey)
+        array.push(engine.w03Store.journalSlopeDirs,       slopeDir)
+    engine.w03Store.journalCount := row + 1
+    row
 
 // ============================================================
 // W02 Batch 25 : participation edge row physical lifecycle (I11-7)
