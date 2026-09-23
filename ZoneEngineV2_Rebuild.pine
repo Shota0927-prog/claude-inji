@@ -6760,6 +6760,294 @@ virtualPointOrderPreflightRaw(ZoneEngine engine, int row, float mintick) =>
                 ok := leftStopTick <= newTick
     ok
 
+// ============================================================
+// W03 Batch 18A-R2 : chained swap-pop replay for F0
+// Source: I8 (Stage F / F0), I11-4, I11-6, D12
+//
+// Internal only and READ-ONLY for the Engine. Seven swap-pop sets are replayed
+// exactly in Stage F order (E1 -> E4, append order inside a group):
+//   ACTIVE state set                : POP FVG_INVALIDATE (E1), PUSH NEW_ROOT (E2,
+//                                     every Category), POP ROOT_RETIRE (E4)
+//   FVG structurally-active 1H/4H/D : POP FVG_INVALIDATE (E1), PUSH NEW_ROOT FVG (E2)
+//   FVG Fresh 1H/4H/D               : PUSH NEW_ROOT FVG Fresh (E2), POP FVG_FRESH_END
+//                                     (E3; canonical Path B for a same-bar FVG)
+// The virtual set is the committed set plus an overlay held in two local scratch
+// arrays owned by w03StageFPreflightRaw: scratchRootSlots[i] -> its current virtual
+// position scratchVirtualPositions[i] (SLOT_INVALID once detached). Only Roots whose
+// position changes in this bar enter the overlay (pushed, detached, moved-last), so
+// its size is bounded by the journal, never by the Root count. A POP reproduces the
+// raw swap-pop exactly: target position, the virtual last entry, its reverse
+// position, target -> SLOT_INVALID, moved-last -> target position, size - 1.
+// No committed set is copied or scanned, and no Engine or journal field is written.
+// Business call sites = 0 (only F0 calls them).
+// ============================================================
+
+const int SET_SIM_ACTIVE         = 1   // general ACTIVE state set
+const int SET_SIM_FVG_STRUCTURAL = 2   // FVG structurally-active set of one TF
+const int SET_SIM_FVG_FRESH      = 3   // FVG Fresh set of one TF
+
+// Committed size of the simulated set; SLOT_INVALID for an unknown set / TF.
+virtualSetCommittedSizeRaw(ZoneEngine engine, int setKind, int tfCode) =>
+    int size = SLOT_INVALID
+    if setKind == SET_SIM_ACTIVE
+        size := array.size(engine.stateActiveRootSlots)
+    else if setKind == SET_SIM_FVG_STRUCTURAL
+        if tfCode == TF_1H
+            size := array.size(engine.structurallyActiveFvg1hRootSlots)
+        else if tfCode == TF_4H
+            size := array.size(engine.structurallyActiveFvg4hRootSlots)
+        else if tfCode == TF_D
+            size := array.size(engine.structurallyActiveFvgDRootSlots)
+    else if setKind == SET_SIM_FVG_FRESH
+        if tfCode == TF_1H
+            size := array.size(engine.freshFvg1hRootSlots)
+        else if tfCode == TF_4H
+            size := array.size(engine.freshFvg4hRootSlots)
+        else if tfCode == TF_D
+            size := array.size(engine.freshFvgDRootSlots)
+    size
+
+// Committed member rootSlot at index of the simulated set; SLOT_INVALID when the
+// index is outside the committed set or the set / TF is unknown.
+virtualSetCommittedSlotAtRaw(ZoneEngine engine, int setKind, int tfCode, int index) =>
+    int slot = SLOT_INVALID
+    if index >= 0 and index < virtualSetCommittedSizeRaw(engine, setKind, tfCode)
+        if setKind == SET_SIM_ACTIVE
+            slot := array.get(engine.stateActiveRootSlots, index)
+        else if setKind == SET_SIM_FVG_STRUCTURAL
+            if tfCode == TF_1H
+                slot := array.get(engine.structurallyActiveFvg1hRootSlots, index)
+            else if tfCode == TF_4H
+                slot := array.get(engine.structurallyActiveFvg4hRootSlots, index)
+            else if tfCode == TF_D
+                slot := array.get(engine.structurallyActiveFvgDRootSlots, index)
+        else if setKind == SET_SIM_FVG_FRESH
+            if tfCode == TF_1H
+                slot := array.get(engine.freshFvg1hRootSlots, index)
+            else if tfCode == TF_4H
+                slot := array.get(engine.freshFvg4hRootSlots, index)
+            else if tfCode == TF_D
+                slot := array.get(engine.freshFvgDRootSlots, index)
+    slot
+
+// Committed reverse position of rootSlot in the simulated set: the stored position
+// of a live Root that belongs to this set (ACTIVE state; FVG of this TF), else
+// SLOT_INVALID. A slot outside the Root arrays or a free slot has none.
+virtualSetCommittedPositionRaw(ZoneEngine engine, int setKind, int tfCode, int rootSlot) =>
+    int pos = SLOT_INVALID
+    if rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootStateSetPositions) and rootSlot < array.size(engine.rootFvgStructuralStateSetPositions) and rootSlot < array.size(engine.rootFvgFreshSetPositions)
+        if array.get(engine.rootSlotLiveFlags, rootSlot)
+            if setKind == SET_SIM_ACTIVE
+                if array.get(engine.rootStates, rootSlot) == ROOT_ACTIVE
+                    pos := array.get(engine.rootStateSetPositions, rootSlot)
+            else if array.get(engine.rootCategories, rootSlot) == CAT_FVG and array.get(engine.rootTfCodes, rootSlot) == tfCode and (tfCode == TF_1H or tfCode == TF_4H or tfCode == TF_D)
+                if setKind == SET_SIM_FVG_STRUCTURAL
+                    pos := array.get(engine.rootFvgStructuralStateSetPositions, rootSlot)
+                else if setKind == SET_SIM_FVG_FRESH
+                    pos := array.get(engine.rootFvgFreshSetPositions, rootSlot)
+    pos
+
+// Current virtual position of rootSlot: the overlay entry when the Root is in it,
+// else the committed reverse position, which must then point back at the Root inside
+// the committed set. Returns [position, ok]; ok false on a broken committed entry.
+virtualSetOverlayPositionRaw(ZoneEngine engine, int setKind, int tfCode, array<int> scratchRootSlots, array<int> scratchVirtualPositions, int rootSlot) =>
+    int  pos   = SLOT_INVALID
+    bool ok    = rootSlot >= 0
+    bool found = false
+    if ok
+        int i = 0
+        while not found and i < array.size(scratchRootSlots)
+            if array.get(scratchRootSlots, i) == rootSlot
+                found := true
+                pos   := array.get(scratchVirtualPositions, i)
+            i += 1
+    if ok and not found
+        pos := virtualSetCommittedPositionRaw(engine, setKind, tfCode, rootSlot)
+        if pos != SLOT_INVALID
+            ok := pos >= 0 and pos < virtualSetCommittedSizeRaw(engine, setKind, tfCode) and virtualSetCommittedSlotAtRaw(engine, setKind, tfCode, pos) == rootSlot
+    [pos, ok]
+
+// Replays every PUSH / POP of one simulated set over the whole journal in Stage F
+// order and proves each raw helper step succeeds on the virtual set it meets.
+// The overlay arrays are the caller's local scratch, cleared before the call.
+virtualSwapPopSetReplayRaw(ZoneEngine engine, int setKind, int tfCode, array<int> scratchRootSlots, array<int> scratchVirtualPositions) =>
+    int  count         = engine.w03Store.journalCount
+    int  committedSize = virtualSetCommittedSizeRaw(engine, setKind, tfCode)
+    bool ok            = committedSize >= 0 and array.size(scratchRootSlots) == 0 and array.size(scratchVirtualPositions) == 0
+    int  virtualSize   = committedSize
+    int  group         = JGROUP_E1
+    while ok and group <= JGROUP_E4
+        int row = 0
+        while ok and row < count
+            if array.get(engine.w03Store.journalGroups, row) == group
+                int  op        = array.get(engine.w03Store.journalOps,     row)
+                int  rowTf     = array.get(engine.w03Store.journalTfCodes, row)
+                bool isFvgRow  = array.get(engine.w03Store.journalCategories, row) == CAT_FVG
+                bool isPush    = false
+                bool isPop     = false
+                int  eventSlot = SLOT_INVALID
+                // the operations of this set, and nothing else
+                if op == JOP_NEW_ROOT
+                    isPush := setKind == SET_SIM_ACTIVE or (isFvgRow and rowTf == tfCode and (setKind == SET_SIM_FVG_STRUCTURAL or (setKind == SET_SIM_FVG_FRESH and array.get(engine.w03Store.journalFvgFreshFlags, row))))
+                    if isPush
+                        eventSlot := predictedNewRootSlotRaw(engine, row)
+                else if op == JOP_FVG_INVALIDATE
+                    isPop := setKind == SET_SIM_ACTIVE or (setKind == SET_SIM_FVG_STRUCTURAL and rowTf == tfCode)
+                else if op == JOP_ROOT_RETIRE
+                    isPop := setKind == SET_SIM_ACTIVE
+                else if op == JOP_FVG_FRESH_END
+                    isPop := setKind == SET_SIM_FVG_FRESH and rowTf == tfCode
+                // the POP target rootSlot: committed, canonical Path B, or a pending NEW
+                if isPop
+                    int targetSlot = array.get(engine.w03Store.journalTargetRootSlots, row)
+                    int targetId   = array.get(engine.w03Store.journalExpectedRootIds, row)
+                    if op == JOP_FVG_FRESH_END and targetSlot == SLOT_INVALID and targetId == ID_NONE
+                        [matchRow, matchCount] = pendingNewFvgRowRaw(engine, row)
+                        ok := matchCount == 1
+                        if ok
+                            eventSlot := predictedNewRootSlotRaw(engine, matchRow)
+                    else
+                        bool committedTarget = targetSlot >= 0 and targetSlot < array.size(engine.rootIds) and targetSlot < array.size(engine.rootSlotLiveFlags)
+                        if committedTarget
+                            committedTarget := array.get(engine.rootSlotLiveFlags, targetSlot) and targetId != ID_NONE and array.get(engine.rootIds, targetSlot) == targetId
+                        if committedTarget
+                            eventSlot := targetSlot
+                        else if op == JOP_ROOT_RETIRE
+                            [newRow, newCount] = pendingNewRootRowByAddressRaw(engine, targetSlot, targetId, row)
+                            ok := newCount == 1
+                            if ok
+                                eventSlot := predictedNewRootSlotRaw(engine, newRow)
+                        else
+                            ok := false
+                // PUSH : a non-member goes to the tail
+                if ok and isPush
+                    [curPos, curOk] = virtualSetOverlayPositionRaw(engine, setKind, tfCode, scratchRootSlots, scratchVirtualPositions, eventSlot)
+                    ok := eventSlot >= 0 and curOk and curPos == SLOT_INVALID
+                    if ok
+                        int wIdx = SLOT_INVALID
+                        int w    = 0
+                        while wIdx == SLOT_INVALID and w < array.size(scratchRootSlots)
+                            if array.get(scratchRootSlots, w) == eventSlot
+                                wIdx := w
+                            w += 1
+                        if wIdx == SLOT_INVALID
+                            array.push(scratchRootSlots,        eventSlot)
+                            array.push(scratchVirtualPositions, virtualSize)
+                        else
+                            array.set(scratchVirtualPositions, wIdx, virtualSize)
+                        virtualSize += 1
+                // POP : the exact swap-pop
+                if ok and isPop
+                    [targetPos, targetOk] = virtualSetOverlayPositionRaw(engine, setKind, tfCode, scratchRootSlots, scratchVirtualPositions, eventSlot)
+                    ok := targetOk and targetPos >= 0 and targetPos < virtualSize
+                    int lastIndex    = virtualSize - 1
+                    int lastRootSlot = SLOT_INVALID
+                    // the virtual entry at lastIndex: exactly one overlay Root there, else the
+                    // committed entry, unless that entry already moved or left in this replay
+                    if ok
+                        int hitCount = 0
+                        int hitSlot  = SLOT_INVALID
+                        int s = 0
+                        while s < array.size(scratchVirtualPositions)
+                            if array.get(scratchVirtualPositions, s) == lastIndex
+                                hitCount += 1
+                                hitSlot  := array.get(scratchRootSlots, s)
+                            s += 1
+                        if hitCount == 1
+                            lastRootSlot := hitSlot
+                        else if hitCount > 1
+                            ok := false
+                        else if lastIndex < committedSize
+                            int candidate = virtualSetCommittedSlotAtRaw(engine, setKind, tfCode, lastIndex)
+                            bool candidateMoved = false
+                            int  candidateMovedI = 0
+                            while not candidateMoved and candidateMovedI < array.size(scratchRootSlots)
+                                if array.get(scratchRootSlots, candidateMovedI) == candidate
+                                    candidateMoved := true
+                                candidateMovedI += 1
+                            ok := candidate != SLOT_INVALID and not candidateMoved
+                            if ok
+                                lastRootSlot := candidate
+                                // a committed last entry: the live, owned Root the swap-pop moves
+                                ok := candidate >= 0 and candidate < array.size(engine.rootIds) and candidate < array.size(engine.rootSlotLiveFlags)
+                                if ok
+                                    ok := array.get(engine.rootSlotLiveFlags, candidate) and array.get(engine.rootIds, candidate) != ID_NONE
+                        else
+                            ok := false
+                    // its reverse position is exactly lastIndex
+                    if ok
+                        [lastPos, lastOk] = virtualSetOverlayPositionRaw(engine, setKind, tfCode, scratchRootSlots, scratchVirtualPositions, lastRootSlot)
+                        ok := lastOk and lastPos == lastIndex
+                    // commit to the overlay: target out, moved-last into the target position
+                    if ok
+                        if targetPos == lastIndex
+                            ok := lastRootSlot == eventSlot
+                            if ok
+                                int wIdx = SLOT_INVALID
+                                int w    = 0
+                                while wIdx == SLOT_INVALID and w < array.size(scratchRootSlots)
+                                    if array.get(scratchRootSlots, w) == eventSlot
+                                        wIdx := w
+                                    w += 1
+                                if wIdx == SLOT_INVALID
+                                    array.push(scratchRootSlots,        eventSlot)
+                                    array.push(scratchVirtualPositions, SLOT_INVALID)
+                                else
+                                    array.set(scratchVirtualPositions, wIdx, SLOT_INVALID)
+                        else
+                            ok := lastRootSlot != eventSlot
+                            if ok
+                                int wIdx = SLOT_INVALID
+                                int w    = 0
+                                while wIdx == SLOT_INVALID and w < array.size(scratchRootSlots)
+                                    if array.get(scratchRootSlots, w) == eventSlot
+                                        wIdx := w
+                                    w += 1
+                                if wIdx == SLOT_INVALID
+                                    array.push(scratchRootSlots,        eventSlot)
+                                    array.push(scratchVirtualPositions, SLOT_INVALID)
+                                else
+                                    array.set(scratchVirtualPositions, wIdx, SLOT_INVALID)
+                                int movedIdx = SLOT_INVALID
+                                int mv = 0
+                                while movedIdx == SLOT_INVALID and mv < array.size(scratchRootSlots)
+                                    if array.get(scratchRootSlots, mv) == lastRootSlot
+                                        movedIdx := mv
+                                    mv += 1
+                                if movedIdx == SLOT_INVALID
+                                    array.push(scratchRootSlots,        lastRootSlot)
+                                    array.push(scratchVirtualPositions, targetPos)
+                                else
+                                    array.set(scratchVirtualPositions, movedIdx, targetPos)
+                        if ok
+                            virtualSize -= 1
+                            ok := virtualSize >= 0
+                    // after the POP: target out, moved-last at the old target position, and
+                    // nothing left at the old last index
+                    if ok
+                        [afterTargetPos, afterTargetOk] = virtualSetOverlayPositionRaw(engine, setKind, tfCode, scratchRootSlots, scratchVirtualPositions, eventSlot)
+                        ok := afterTargetOk and afterTargetPos == SLOT_INVALID and virtualSize == lastIndex
+                    if ok and targetPos != lastIndex
+                        [afterLastPos, afterLastOk] = virtualSetOverlayPositionRaw(engine, setKind, tfCode, scratchRootSlots, scratchVirtualPositions, lastRootSlot)
+                        ok := afterLastOk and afterLastPos == targetPos
+                    if ok
+                        int s = 0
+                        while ok and s < array.size(scratchVirtualPositions)
+                            ok := array.get(scratchVirtualPositions, s) != lastIndex
+                            s += 1
+                        if ok and lastIndex < committedSize
+                            int oldLast = virtualSetCommittedSlotAtRaw(engine, setKind, tfCode, lastIndex)
+                            bool oldLastLeft = false
+                            int  oldLastLeftI = 0
+                            while not oldLastLeft and oldLastLeftI < array.size(scratchRootSlots)
+                                if array.get(scratchRootSlots, oldLastLeftI) == oldLast
+                                    oldLastLeft := true
+                                oldLastLeftI += 1
+                            ok := oldLastLeft
+            row += 1
+        group += 1
+    ok
+
 // F0 : proves the whole journal applies in F1 - F4 with no apply helper returning
 // false. Read-only. Returns true; any failure is runtime.error("W03_JOURNAL_PREFLIGHT").
 w03StageFPreflightRaw(ZoneEngine engine, float mintick) =>
@@ -6771,36 +7059,17 @@ w03StageFPreflightRaw(ZoneEngine engine, float mintick) =>
     // Step 2 : op / group pairing, and what the later steps must cover
     bool anyFvgNew       = false
     int  newRowCount     = 0
-    int  popsStateActive = 0
-    int  popsStruct1h    = 0
-    int  popsStruct4h    = 0
-    int  popsStructD     = 0
-    int  popsFresh1h     = 0
-    int  popsFresh4h     = 0
-    int  popsFreshD      = 0
     if ok
         int row = 0
         while ok and row < count
             int rowOp    = array.get(engine.w03Store.journalOps,     row)
             int rowGroup = array.get(engine.w03Store.journalGroups,  row)
-            int rowTf    = array.get(engine.w03Store.journalTfCodes, row)
             ok := (rowOp == JOP_FVG_INVALIDATE and rowGroup == JGROUP_E1) or (rowOp == JOP_NEW_ROOT and rowGroup == JGROUP_E2) or ((rowOp == JOP_MA_UPDATE or rowOp == JOP_SWING_TF_MERGE or rowOp == JOP_TIMEHL_LABEL or rowOp == JOP_FVG_FRESH_END) and rowGroup == JGROUP_E3) or (rowOp == JOP_ROOT_RETIRE and rowGroup == JGROUP_E4)
             if ok
                 if rowOp == JOP_NEW_ROOT
                     newRowCount += 1
                     if array.get(engine.w03Store.journalCategories, row) == CAT_FVG
                         anyFvgNew := true
-                else if rowOp == JOP_FVG_INVALIDATE
-                    popsStateActive += 1
-                    popsStruct1h    += rowTf == TF_1H ? 1 : 0
-                    popsStruct4h    += rowTf == TF_4H ? 1 : 0
-                    popsStructD     += rowTf == TF_D  ? 1 : 0
-                else if rowOp == JOP_FVG_FRESH_END
-                    popsFresh1h += rowTf == TF_1H ? 1 : 0
-                    popsFresh4h += rowTf == TF_4H ? 1 : 0
-                    popsFreshD  += rowTf == TF_D  ? 1 : 0
-                else if rowOp == JOP_ROOT_RETIRE
-                    popsStateActive += 1
             row += 1
     // Step 3 : the free-stack entries F2 will pop - in range, not live, distinct
     if ok and newRowCount > 0
@@ -6843,23 +7112,19 @@ w03StageFPreflightRaw(ZoneEngine engine, float mintick) =>
                     prevTick := tick
                 i += 1
             side += 1
-    // Step 6 : swap-pop sets. Only an entry at index >= committed size - pops can be
-    // the last entry a swap-pop moves; tail pushes of this bar are new, valid entries.
+    // Step 6 : the seven swap-pop sets, each replayed exactly in Stage F order on its
+    // own overlay (virtualSwapPopSetReplayRaw). The two scratch arrays live only in
+    // this call, are cleared before each set and never reach the Engine or journal.
     if ok
+        array<int> scratchRootSlots        = array.new_int(0)
+        array<int> scratchVirtualPositions = array.new_int(0)
         int k = 0
         while ok and k < 7
-            array<int> tailSet       = k == 0 ? engine.stateActiveRootSlots : k == 1 ? engine.structurallyActiveFvg1hRootSlots : k == 2 ? engine.structurallyActiveFvg4hRootSlots : k == 3 ? engine.structurallyActiveFvgDRootSlots : k == 4 ? engine.freshFvg1hRootSlots : k == 5 ? engine.freshFvg4hRootSlots : engine.freshFvgDRootSlots
-            array<int> tailPositions = k == 0 ? engine.rootStateSetPositions : k <= 3 ? engine.rootFvgStructuralStateSetPositions : engine.rootFvgFreshSetPositions
-            int pops    = k == 0 ? popsStateActive : k == 1 ? popsStruct1h : k == 2 ? popsStruct4h : k == 3 ? popsStructD : k == 4 ? popsFresh1h : k == 5 ? popsFresh4h : popsFreshD
-            int setSize = array.size(tailSet)
-            if pops > 0
-                int i = math.max(0, setSize - pops)
-                while ok and i < setSize
-                    int slot = array.get(tailSet, i)
-                    ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(tailPositions)
-                    if ok
-                        ok := array.get(engine.rootSlotLiveFlags, slot) and array.get(engine.rootIds, slot) != ID_NONE and array.get(tailPositions, slot) == i
-                    i += 1
+            int setKind = k == 0 ? SET_SIM_ACTIVE : k <= 3 ? SET_SIM_FVG_STRUCTURAL : SET_SIM_FVG_FRESH
+            int setTf   = k == 0 ? int(na) : (k == 1 or k == 4) ? TF_1H : (k == 2 or k == 5) ? TF_4H : TF_D
+            array.clear(scratchRootSlots)
+            array.clear(scratchVirtualPositions)
+            ok := virtualSwapPopSetReplayRaw(engine, setKind, setTf, scratchRootSlots, scratchVirtualPositions)
             k += 1
     // Step 7 : every row in Stage F order, against the state it will see
     int group = JGROUP_E1
