@@ -942,10 +942,14 @@ export type W02AuxStore
     // Real Root-copy nodes = 0 and every rootCount is 0. A rootCount above 0 would
     // still never mean a BreakSnapshot exists: sideBreakSnapshotValidFlags stays the
     // only truth and nothing writes it true.
-    // Not implemented here: the Root ID copy itself, the node reset / alloc / free
-    // helpers, append, detach-all, the ownership validation, the BreakSnapshot clear
-    // that a later Batch must connect before a reset can meet a live node, the Break
-    // capture and the Flip / Reclaim logic.
+    // W02 Batch 45 adds the raw physical node lifecycle for this pool - reset,
+    // alloc and free - in its own section further below, kept separate from the
+    // TouchStart helpers. Those three have no Production call site, so real nodes
+    // are still 0 and both the node arrays and the free stack stay size 0.
+    // Still not implemented: the Root ID copy itself, append, detach-all, the
+    // ownership validation, the BreakSnapshot clear that a later Batch must connect
+    // before a reset can meet a live node, the Break capture and the Flip / Reclaim
+    // logic.
     array<int>   sideBreakSnapshotRootHeadNodeIndexes
     array<int>   sideBreakSnapshotRootTailNodeIndexes
     array<int>   sideBreakSnapshotRootCounts
@@ -2631,6 +2635,97 @@ touchStartSnapshotRootNodeFreeRaw(ZoneEngine engine, int nodeIndex) =>
             // Step 3 : freed row enters the free stack exactly once. The arrays are
             // never shrunk.
             array.push(engine.w02Aux.touchStartSnapshotRootNodeFreeIndexes, nodeIndex)
+            freed := true
+    freed
+
+// ============================================================
+// W02 Batch 45 : BreakSnapshot Root-copy node raw lifecycle
+// Source: A6.6, A6.7, I6.1, D02, D12
+//
+// Internal only, and raw in the same sense as the Batch 41 TouchStart node helpers:
+// they own one physical row of the Batch 44 BreakSnapshot Root-copy pool and
+// nothing else. They never touch a Side's head, tail or count, never follow or
+// repair a chain, never look at ownerSideSlot / expectedCoreId /
+// expectedGenerationId / expectedBreakSeq to decide anything, and never read or
+// write a BreakSnapshot scalar.
+// This is a separate pool from the TouchStart one, so these three helpers are
+// separate too: they are never merged with the Batch 41 helpers and never touch
+// the TouchStart arrays or its free stack.
+// The seven node arrays always share one physical size, so one node index names
+// the same row in all seven. They are never shrunk: a freed row goes back through
+// the free stack (LIFO) and is reused, as the Root, Core, participation and
+// TouchStart pools all do. Only a row that is not live and reachable from no chain
+// may sit in the free stack, and never twice.
+// alloc is not an ownership commit: a newly allocated row stays live = false and
+// carries only sentinels. A later append helper writes the Root ID, the owner token
+// (sideSlot, Core ID, Generation ID, break Seq) and the chain link, updates the Side
+// metadata and sets live = true last, so a live row is a fully committed row. Batch
+// 45 never writes live = true and never writes a real Root ID, Core ID, Generation
+// ID or break Seq.
+// free is the mirror: it accepts only a live row, resets it and returns it to the
+// free stack, so freeing the same row twice pushes it once. Its precondition is
+// that the caller has already detached the row from its chain - this helper leaves
+// head, tail, count and every other node's next untouched, and validates no
+// ownership. That detach helper does not exist yet.
+// Production call sites = 0 in this Batch: nothing allocates or frees a node, so
+// the pool and the free stack both stay empty and real Root-copy nodes = 0.
+// ============================================================
+
+// Returns one existing physical BreakSnapshot Root-copy node row to the unset
+// sentinel. Precondition: the row already exists in the seven node arrays. No range
+// check and no runtime.error is added here, and the free stack is not touched.
+breakSnapshotRootNodeResetRaw(ZoneEngine engine, int nodeIndex) =>
+    array.set(engine.w02Aux.breakSnapshotRootNodeRootIds,               nodeIndex, ID_NONE)
+    array.set(engine.w02Aux.breakSnapshotRootNodeNextIndexes,           nodeIndex, SLOT_INVALID)
+    array.set(engine.w02Aux.breakSnapshotRootNodeOwnerSideSlots,        nodeIndex, SLOT_INVALID)
+    array.set(engine.w02Aux.breakSnapshotRootNodeExpectedCoreIds,       nodeIndex, ID_NONE)
+    array.set(engine.w02Aux.breakSnapshotRootNodeExpectedGenerationIds, nodeIndex, ID_NONE)
+    array.set(engine.w02Aux.breakSnapshotRootNodeExpectedBreakSeqs,     nodeIndex, SEQ_UNSET)
+    array.set(engine.w02Aux.breakSnapshotRootNodeLiveFlags,             nodeIndex, false)
+
+// Starts one physical BreakSnapshot Root-copy node row and returns its node index.
+// Free rows are reused first (LIFO pop, then reset); otherwise the seven node
+// arrays grow by one sentinel entry each. The returned row is NOT committed: it
+// stays live = false with sentinel identity, and a later append helper is what
+// turns it into a member of a Snapshot's chain.
+breakSnapshotRootNodeAllocRaw(ZoneEngine engine) =>
+    int nodeIndex = SLOT_INVALID
+    // Step 1 / Step 2 : free stack first, LIFO. Never array.shift / array.remove(0).
+    if array.size(engine.w02Aux.breakSnapshotRootNodeFreeIndexes) > 0
+        nodeIndex := array.pop(engine.w02Aux.breakSnapshotRootNodeFreeIndexes)
+        breakSnapshotRootNodeResetRaw(engine, nodeIndex)
+    else
+        nodeIndex := array.size(engine.w02Aux.breakSnapshotRootNodeRootIds)
+        array.push(engine.w02Aux.breakSnapshotRootNodeRootIds,               ID_NONE)
+        array.push(engine.w02Aux.breakSnapshotRootNodeNextIndexes,           SLOT_INVALID)
+        array.push(engine.w02Aux.breakSnapshotRootNodeOwnerSideSlots,        SLOT_INVALID)
+        array.push(engine.w02Aux.breakSnapshotRootNodeExpectedCoreIds,       ID_NONE)
+        array.push(engine.w02Aux.breakSnapshotRootNodeExpectedGenerationIds, ID_NONE)
+        array.push(engine.w02Aux.breakSnapshotRootNodeExpectedBreakSeqs,     SEQ_UNSET)
+        array.push(engine.w02Aux.breakSnapshotRootNodeLiveFlags,             false)
+    // Step 3 : the row exists and is unset. live stays false - allocation is not
+    // ownership, and nothing here joins a chain or a Side.
+    nodeIndex
+
+// Moves one currently live physical BreakSnapshot Root-copy node row back to the
+// free state. Returns true only when the row was freed. An out-of-range index or a
+// row that is not live returns false with no mutation, so a second free of the same
+// row never pushes it into the free stack twice.
+// Precondition: the caller has already detached this row from its Side's chain.
+// This helper never touches head, tail, count or another node's next, and never
+// validates the owner token.
+breakSnapshotRootNodeFreeRaw(ZoneEngine engine, int nodeIndex) =>
+    bool freed = false
+    // Step 1 : range. The live read is nested rather than joined by and, because
+    // Pine evaluates both sides of an and eagerly.
+    if nodeIndex >= 0 and nodeIndex < array.size(engine.w02Aux.breakSnapshotRootNodeLiveFlags)
+        if array.get(engine.w02Aux.breakSnapshotRootNodeLiveFlags, nodeIndex)
+            // Step 2 : the row goes back to the unset sentinel, live included
+            // because the reset writes it false.
+            breakSnapshotRootNodeResetRaw(engine, nodeIndex)
+            // Step 3 : freed row enters the free stack exactly once. The arrays are
+            // never shrunk.
+            array.push(engine.w02Aux.breakSnapshotRootNodeFreeIndexes, nodeIndex)
             freed := true
     freed
 
