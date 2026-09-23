@@ -594,6 +594,52 @@ export type W02AuxStore
     array<int>   pruneTimeHlRootStateSnapshots
     array<int>   pruneTimeHlRootConfirmedTimeSnapshots
 
+    // ---- W02 Batch 37 : Core prune priority-queue foundation (I11-13 / I17.3) ----
+    // The Core half of I11-13, built exactly like the Root half above and living in
+    // this same singleton so that ZoneEngine.new stays under its external-element
+    // limit. One queue only: the Dormant Zone Cores. A Core that is not Dormant is
+    // never put into it, but the Dormant test and the queue eligibility test are
+    // not written here.
+    // The four queue arrays are one logical heap row per index:
+    //   Core ID                     -> pruneCoreIds
+    //   Core prune revision         -> pruneCoreRevisions
+    //   unique Root count snapshot  -> pruneCoreRootCountSnapshots
+    //   lastSeenTime snapshot       -> pruneCoreLastSeenTimeSnapshots
+    // As on the Root side, an entry never holds a physical coreSlot as its identity
+    // token: coreSlots are reused, Core IDs are not (D02).
+    // The priority a later heap must implement is fixed here as a contract, in this
+    // exact order: lastSeenTime ascending, then unique Root count ascending, then
+    // Core ID ascending - oldest first, then the ones holding the fewest Roots,
+    // then the lowest Core ID. No comparator is written.
+    // What counts as the unique Root count is deliberately NOT decided here: it is
+    // not fixed to the participation edge count, to a per-Side Root count or to the
+    // plain sum of Support and Resistance, and no counting helper is added.
+    // corePruneRevisions is a Core-SoA-shaped array indexed by physical coreSlot,
+    // starting at 0, used only to tell a live entry from a stale one. It is not a
+    // Core ID and it is not an eighteenth I9 revision.
+    // The stale test a later reader is expected to perform - resolve the Core ID to
+    // a slot, require the slot live, coreIds[slot] == the entry's Core ID,
+    // corePruneRevisions[slot] == the entry's revision, the current unique Root
+    // count == the entry's count snapshot and coreLastSeenTimes[slot] == the
+    // lastSeenTime snapshot - is a contract only: no validation helper is created,
+    // and freeing a Core never scans the heap to delete entries linearly.
+    // Real queue entries in this Batch = 0: all four queue arrays stay size 0.
+    // Not implemented here: the heap operations (push, pop, swap, bubble up / down,
+    // head read, front removal), any sort or per-bar full rebuild over all Cores,
+    // the Dormant eligibility test, the unique Root count, the protection rules
+    // (an ActiveTouch, Broken, FlipWait or PendingGeneration Core is never pruned,
+    // and no new eligibility condition such as PendingTopology is decided here),
+    // the Stage K connection and EV_STORAGE_PRUNE. The revision is never
+    // incremented yet: a later Batch advances it on a Phase change, a Root
+    // membership change, a PendingGeneration change or any other change that moves
+    // this Core's priority, and requeues it.
+    array<int>   corePruneRevisions
+
+    array<int>   pruneCoreIds
+    array<int>   pruneCoreRevisions
+    array<int>   pruneCoreRootCountSnapshots
+    array<int>   pruneCoreLastSeenTimeSnapshots
+
 export type ZoneEngine
     // ---- scalar : config validation (Batch 5 connects validateCfg results) ----
     bool  configValid            = false
@@ -1448,6 +1494,16 @@ export newEngine(ZoneCfg cfg) =>
     aux.pruneTimeHlRootStateSnapshots         := array.new_int(0)
     aux.pruneTimeHlRootConfirmedTimeSnapshots := array.new_int(0)
 
+    // W02 Batch 37 : the I11-13 Core prune foundation, on the same single
+    // W02AuxStore instance. corePruneRevisions grows with the physical Core slots;
+    // the Dormant Core heap stays empty until a later Batch enqueues anything.
+    aux.corePruneRevisions                    := array.new_int(0)
+
+    aux.pruneCoreIds                          := array.new_int(0)
+    aux.pruneCoreRevisions                    := array.new_int(0)
+    aux.pruneCoreRootCountSnapshots           := array.new_int(0)
+    aux.pruneCoreLastSeenTimeSnapshots        := array.new_int(0)
+
     e.w02Aux := aux
 
     // W02 Batch 9 : four independent Candidate scratch regions, empty and logically
@@ -2189,9 +2245,11 @@ rootResetSlotRaw(ZoneEngine engine, int rootSlot) =>
     // never scanned, detached or mutated in this Batch, and real membership is 0.
     array.set(engine.rootPriceOrderPositions, rootSlot, SLOT_INVALID)
     // W02 Batch 36 : the prune revision of this slot restarts at 0 (I11-13). The
-    // four prune heaps are never scanned or mutated here: an entry of the previous
-    // owner simply stops matching, because its Root ID is never reused and its
-    // recorded revision no longer agrees with this slot.
+    // four prune heaps are never scanned or mutated here. An entry of the previous
+    // owner is judged by the full match of Root ID, revision, state and
+    // confirmedTime, and since Root IDs are never reused (D02) its Root ID alone
+    // can never match this slot's next owner - the restart to 0 is not what makes
+    // it stale, and a later entry may legitimately carry revision 0 again.
     array.set(engine.w02Aux.rootPruneRevisions, rootSlot, 0)
 
 // Starts ownership of one physical Root slot and returns that rootSlot.
@@ -2969,6 +3027,12 @@ coreResetSlotRaw(ZoneEngine engine, int coreSlot) =>
     array.set(engine.sideHasNonPsychRootFlags,  resistanceSideSlot, false)
     array.set(engine.sideIsBroadContextFlags,   resistanceSideSlot, false)
     array.set(engine.sideEligibleFlags,         resistanceSideSlot, false)
+    // W02 Batch 37 : the prune revision of this Core slot restarts at 0 (I11-13).
+    // The Dormant Core heap is never scanned or mutated here: an entry of the
+    // previous owner is judged by the full match of Core ID, revision, unique Root
+    // count and lastSeenTime, and since Core IDs are never reused (D02) its Core ID
+    // alone can never match this slot's next owner.
+    array.set(engine.w02Aux.corePruneRevisions, coreSlot, 0)
 
 // Starts ownership of one physical Core slot and returns that coreSlot.
 // Free slots are reused first (LIFO pop, then reset); only a genuinely new physical
@@ -3107,6 +3171,13 @@ coreAllocSlotRaw(ZoneEngine engine) =>
         array.push(engine.sideBrokenSnapshotTopOrderPositions,    SLOT_INVALID)
         array.push(engine.sideFlipSnapshotBottomOrderPositions,   SLOT_INVALID)
         array.push(engine.sideFlipSnapshotTopOrderPositions,      SLOT_INVALID)
+        // W02 Batch 37 : the prune revision of this new physical Core slot starts
+        // at 0, so size(corePruneRevisions) stays equal to size(coreIds) (I11-13).
+        // One entry per Core, not per Side. A reused slot never comes here -
+        // coreResetSlotRaw puts its revision back to 0 instead - and a free never
+        // shrinks the array. The four Dormant Core heap arrays are not touched:
+        // they are a logical heap and do not grow with the physical Core slots.
+        array.push(engine.w02Aux.corePruneRevisions, 0)
     // Step 4 : new Core ID. 1-based, 0 = none, never reused (D02).
     int newCoreId = engine.nextCoreId
     engine.nextCoreId := newCoreId + 1
