@@ -2780,6 +2780,137 @@ journalAppendRaw(ZoneEngine engine, int op, int group, int targetRootSlot, int e
     row
 
 // ============================================================
+// W03 Batch 05 : originKey and origin bucket lifecycle helpers (I11-2)
+// Source: I4, I11-2, D02, D10, D12
+//
+// Internal only. An originKey is a coarse bucket / prefilter, never an identity
+// proof: several Roots may share one key, and a key, hash or fingerprint match
+// alone never makes two Roots the same. Identity is decided only by the full
+// origin comparator (a later Batch).
+// The bucket is the existing W02 Batch 42 storage: the originKey -> head rootSlot
+// map plus the prev / next / expectedRootId chain arrays indexed by rootSlot. The
+// chain carries no order semantics; a new Root is inserted at the head.
+// attach and detach validate everything first and only then mutate, so a false
+// result means zero mutation, no repair and no rebuild. Neither scans all Roots.
+// Call sites = 0 in this Batch.
+// ============================================================
+
+// Computes the coarse origin bucket key from the Category's bucket fields only,
+// mixed in a fixed per-Category order with the existing fpMixInt (seed / mult A).
+// na is mixed through the existing fpIntKey. A result of 0 becomes 1, because
+// ID_NONE is never a key. An unknown Category is a runtime error, never a fallback.
+originKeyComputeRaw(int category, int subtype, int tfCode, int pointTick, int originTime, int direction) =>
+    int h = FP_SEED_A
+    h := fpMixInt(h, FP_MULT_A, fpIntKey(category))
+    if category == CAT_MA
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(subtype))
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(tfCode))
+    else if category == CAT_SWING
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(subtype))
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(pointTick))
+    else if category == CAT_ACCUM
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(tfCode))
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(subtype))
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(originTime))
+    else if category == CAT_TIME_HL
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(subtype))
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(originTime))
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(pointTick))
+    else if category == CAT_FVG
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(tfCode))
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(direction))
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(originTime))
+    else if category == CAT_PSYCH
+        // pointTick is the normalized 50-dollar psych tick
+        h := fpMixInt(h, FP_MULT_A, fpIntKey(pointTick))
+    else
+        runtime.error("W03_ORIGIN_CATEGORY")
+    h == 0 ? 1 : h
+
+// Inserts one owned Root at the head of the bucket of rootOriginKeys[rootSlot].
+// Returns true when committed; false with zero mutation on any failed check.
+originBucketAttachRaw(ZoneEngine engine, int rootSlot, int expectedRootId) =>
+    bool ok = rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootOriginKeys) and rootSlot < array.size(engine.w02Aux.rootOriginBucketPrevRootSlots) and rootSlot < array.size(engine.w02Aux.rootOriginBucketNextRootSlots) and rootSlot < array.size(engine.w02Aux.rootOriginBucketExpectedRootIds)
+    int key     = ID_NONE
+    int oldHead = SLOT_INVALID
+    // Step 1 : the Root itself is live, owned and not linked anywhere
+    if ok
+        ok := array.get(engine.rootSlotLiveFlags, rootSlot) and expectedRootId != ID_NONE and array.get(engine.rootIds, rootSlot) == expectedRootId
+    if ok
+        key := array.get(engine.rootOriginKeys, rootSlot)
+        ok  := key != ID_NONE and array.get(engine.w02Aux.rootOriginBucketPrevRootSlots, rootSlot) == SLOT_INVALID and array.get(engine.w02Aux.rootOriginBucketNextRootSlots, rootSlot) == SLOT_INVALID and array.get(engine.w02Aux.rootOriginBucketExpectedRootIds, rootSlot) == ID_NONE
+    // Step 2 : an existing head must be a valid, owned member of the same bucket
+    if ok and map.contains(engine.w02Aux.originKeyBucketHeadRootSlots, key)
+        oldHead := map.get(engine.w02Aux.originKeyBucketHeadRootSlots, key)
+        ok      := oldHead != rootSlot and oldHead >= 0 and oldHead < array.size(engine.rootIds)
+        if ok
+            ok := array.get(engine.rootSlotLiveFlags, oldHead)
+        if ok
+            ok := array.get(engine.w02Aux.rootOriginBucketExpectedRootIds, oldHead) == array.get(engine.rootIds, oldHead) and array.get(engine.rootOriginKeys, oldHead) == key
+    // Step 3 : commit. Nothing below can fail.
+    if ok
+        array.set(engine.w02Aux.rootOriginBucketPrevRootSlots,   rootSlot, SLOT_INVALID)
+        array.set(engine.w02Aux.rootOriginBucketNextRootSlots,   rootSlot, oldHead)
+        array.set(engine.w02Aux.rootOriginBucketExpectedRootIds, rootSlot, expectedRootId)
+        if oldHead != SLOT_INVALID
+            array.set(engine.w02Aux.rootOriginBucketPrevRootSlots, oldHead, rootSlot)
+        map.put(engine.w02Aux.originKeyBucketHeadRootSlots, key, rootSlot)
+    ok
+
+// Unlinks one owned Root from its bucket. Returns true when committed; false with
+// zero mutation when the Root, its own chain entry or either neighbour fails.
+originBucketDetachRaw(ZoneEngine engine, int rootSlot, int expectedRootId) =>
+    bool ok = rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootOriginKeys) and rootSlot < array.size(engine.w02Aux.rootOriginBucketPrevRootSlots) and rootSlot < array.size(engine.w02Aux.rootOriginBucketNextRootSlots) and rootSlot < array.size(engine.w02Aux.rootOriginBucketExpectedRootIds)
+    int key  = ID_NONE
+    int prev = SLOT_INVALID
+    int next = SLOT_INVALID
+    // Step 1 : the Root is live, owned and indexed under the same Root ID
+    if ok
+        ok := array.get(engine.rootSlotLiveFlags, rootSlot) and expectedRootId != ID_NONE and array.get(engine.rootIds, rootSlot) == expectedRootId
+    if ok
+        key  := array.get(engine.rootOriginKeys, rootSlot)
+        ok   := key != ID_NONE and array.get(engine.w02Aux.rootOriginBucketExpectedRootIds, rootSlot) == expectedRootId
+    if ok
+        prev := array.get(engine.w02Aux.rootOriginBucketPrevRootSlots, rootSlot)
+        next := array.get(engine.w02Aux.rootOriginBucketNextRootSlots, rootSlot)
+        ok   := prev != rootSlot and next != rootSlot
+    // Step 2 : predecessor, or the map head when there is none
+    if ok
+        if prev == SLOT_INVALID
+            ok := map.contains(engine.w02Aux.originKeyBucketHeadRootSlots, key)
+            if ok
+                ok := map.get(engine.w02Aux.originKeyBucketHeadRootSlots, key) == rootSlot
+        else
+            ok := prev >= 0 and prev < array.size(engine.rootIds)
+            if ok
+                ok := array.get(engine.rootSlotLiveFlags, prev)
+            if ok
+                ok := array.get(engine.w02Aux.rootOriginBucketExpectedRootIds, prev) == array.get(engine.rootIds, prev) and array.get(engine.rootOriginKeys, prev) == key and array.get(engine.w02Aux.rootOriginBucketNextRootSlots, prev) == rootSlot
+    // Step 3 : successor
+    if ok and next != SLOT_INVALID
+        ok := next >= 0 and next < array.size(engine.rootIds)
+        if ok
+            ok := array.get(engine.rootSlotLiveFlags, next)
+        if ok
+            ok := array.get(engine.w02Aux.rootOriginBucketExpectedRootIds, next) == array.get(engine.rootIds, next) and array.get(engine.rootOriginKeys, next) == key and array.get(engine.w02Aux.rootOriginBucketPrevRootSlots, next) == rootSlot
+    // Step 4 : commit. Unlink, then clear this Root's own entry. Nothing can fail.
+    if ok
+        if prev == SLOT_INVALID
+            if next == SLOT_INVALID
+                map.remove(engine.w02Aux.originKeyBucketHeadRootSlots, key)
+            else
+                map.put(engine.w02Aux.originKeyBucketHeadRootSlots, key, next)
+                array.set(engine.w02Aux.rootOriginBucketPrevRootSlots, next, SLOT_INVALID)
+        else
+            array.set(engine.w02Aux.rootOriginBucketNextRootSlots, prev, next)
+            if next != SLOT_INVALID
+                array.set(engine.w02Aux.rootOriginBucketPrevRootSlots, next, prev)
+        array.set(engine.w02Aux.rootOriginBucketPrevRootSlots,   rootSlot, SLOT_INVALID)
+        array.set(engine.w02Aux.rootOriginBucketNextRootSlots,   rootSlot, SLOT_INVALID)
+        array.set(engine.w02Aux.rootOriginBucketExpectedRootIds, rootSlot, ID_NONE)
+    ok
+
+// ============================================================
 // W02 Batch 25 : participation edge row physical lifecycle (I11-7)
 //
 // Internal only, and physical only: these three helpers own one row of the flat
