@@ -7901,6 +7901,93 @@ w03StageEMaRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed) =>
     true
 
 // ============================================================
+// W03 Batch 20 : E-stage Swing (5m event, 15m / 1H Source adoption, TF merge)
+// Source: I7 (Source adoption), I10, I11-2, A7.3, D12
+//
+// Internal only. Six Swing events in this fixed order: 5m HIGH, 5m LOW, 15m HIGH,
+// 15m LOW, 1H HIGH, 1H LOW, so a pivot seen on several TFs is created once by the
+// first (lowest) TF and the later TFs merge into it.
+//   5m      : a current-bar event; no lastConsumed, no sourceAdoptableRaw.
+//   15m / 1H: the Source bar is adopted once through sourceAdoptableRaw; an adopted
+//             Source close is consumed (returned lastConsumed local) whether or not
+//             it carries a HIGH / LOW event.
+// Each usable event is identified through originKeyComputeRaw / originLookupUniqueRaw
+// only and emits exactly one of: NEW_ROOT (E2, newMask = its TF bit) when nothing
+// matches; SWING_TF_MERGE (E3, oldMask -> oldMask + TF bit) when the matched Root
+// (committed, or a pending NEW_ROOT of this bar at its predicted address) does not
+// carry that TF bit yet in its virtual mask (the stored / pending mask replayed
+// through the MERGE rows already journaled); nothing otherwise. A merge never moves
+// the Root's creation TF, times or price. Only journal rows are written (and the
+// lookup's own violation flag, which stops the rest); persistent lastConsumed is
+// never written - the two values are returned for F6. Business call sites = 0.
+// ============================================================
+
+// E-stage Swing. Returns [true, 15m Swing lastConsumed, 1H Swing lastConsumed].
+w03StageESwingRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed, int nextLastConsumed15mSwingCloseTime, int nextLastConsumed1hSwingCloseTime) =>
+    int  out15m   = nextLastConsumed15mSwingCloseTime
+    int  out1h    = nextLastConsumed1hSwingCloseTime
+    bool stopped  = not cfg.useSwing
+    bool adopt15m = false
+    bool adopt1h  = false
+    int  e = 0
+    // fixed order: 5m HIGH, 5m LOW, 15m HIGH, 15m LOW, 1H HIGH, 1H LOW
+    while not stopped and e < 6
+        // the 15m / 1H Source bar is adopted (and consumed) once, before its HIGH event
+        if e == 2
+            adopt15m := sourceAdoptableRaw(feed.src15mOpenTime, feed.src15mCloseTime, nextLastConsumed15mSwingCloseTime, feed.baseCloseTime)
+            if adopt15m
+                out15m := feed.src15mCloseTime
+        if e == 4
+            adopt1h := sourceAdoptableRaw(feed.src1hOpenTime, feed.src1hCloseTime, nextLastConsumed1hSwingCloseTime, feed.baseCloseTime)
+            if adopt1h
+                out1h := feed.src1hCloseTime
+        bool  sourceOk      = e < 2 or (e < 4 and adopt15m) or (e >= 4 and adopt1h)
+        int   subtype       = e % 2 == 0 ? SUB_SWING_HIGH : SUB_SWING_LOW
+        int   tfCode        = e < 2 ? TF_5M : e < 4 ? TF_15M : TF_1H
+        int   tfMask        = e < 2 ? SWING_TF_MASK_5M : e < 4 ? SWING_TF_MASK_15M : SWING_TF_MASK_1H
+        float pointPrice    = e == 0 ? feed.swing5mHighPrice         : e == 1 ? feed.swing5mLowPrice         : e == 2 ? feed.swing15mHighPrice         : e == 3 ? feed.swing15mLowPrice         : e == 4 ? feed.swing1hHighPrice         : feed.swing1hLowPrice
+        int   originTime    = e == 0 ? feed.swing5mHighOriginTime    : e == 1 ? feed.swing5mLowOriginTime    : e == 2 ? feed.swing15mHighOriginTime    : e == 3 ? feed.swing15mLowOriginTime    : e == 4 ? feed.swing1hHighOriginTime    : feed.swing1hLowOriginTime
+        int   originEndTime = e == 0 ? feed.swing5mHighOriginEndTime : e == 1 ? feed.swing5mLowOriginEndTime : e == 2 ? feed.swing15mHighOriginEndTime : e == 3 ? feed.swing15mLowOriginEndTime : e == 4 ? feed.swing1hHighOriginEndTime : feed.swing1hLowOriginEndTime
+        int   confirmedTime = e == 0 ? feed.swing5mHighConfirmedTime : e == 1 ? feed.swing5mLowConfirmedTime : e == 2 ? feed.swing15mHighConfirmedTime : e == 3 ? feed.swing15mLowConfirmedTime : e == 4 ? feed.swing1hHighConfirmedTime : feed.swing1hLowConfirmedTime
+        // each HIGH / LOW event is usable on its own
+        bool usable = sourceOk and not na(pointPrice) and not na(originTime) and not na(originEndTime) and not na(confirmedTime) and not na(feed.baseCloseTime) and confirmedTime <= feed.baseCloseTime and not na(feed.mintick) and feed.mintick > 0
+        if usable
+            int pointTick = int(math.round(pointPrice / feed.mintick))
+            int originKey = originKeyComputeRaw(CAT_SWING, subtype, tfCode, pointTick, originTime, FVG_NONE)
+            [rootSlot, pendingRow] = originLookupUniqueRaw(engine, originKey, CAT_SWING, subtype, tfCode, pointTick, originTime, originEndTime, FVG_NONE, feed.mintick)
+            if engine.w03Store.journalInvariantViolation
+                // a broken identity: emit nothing more, F0 stops the bar
+                stopped := true
+            else if rootSlot == SLOT_INVALID and pendingRow == SLOT_INVALID
+                // no match: a new Swing Root created by this TF
+                int newRow = journalAppendRaw(engine, JOP_NEW_ROOT, JGROUP_E2, SLOT_INVALID, ID_NONE, CAT_SWING, subtype, tfCode, originKey, originTime, originEndTime, confirmedTime, pointPrice, float(na), float(na), ROOT_ACTIVE, ROOT_ACTIVE, false, false, FVG_NONE, SWING_TF_MASK_NONE, tfMask, ID_NONE, int(na))
+            else
+                // the matched Root: committed, or a pending NEW_ROOT of this bar
+                int targetSlot  = SLOT_INVALID
+                int targetId    = ID_NONE
+                int virtualMask = int(na)
+                if rootSlot != SLOT_INVALID
+                    targetSlot  := rootSlot
+                    targetId    := array.get(engine.rootIds, rootSlot)
+                    virtualMask := array.get(engine.w03Store.rootSwingTfMasks, rootSlot)
+                else
+                    targetSlot  := predictedNewRootSlotRaw(engine, pendingRow)
+                    targetId    := predictedNewRootIdRaw(engine, pendingRow)
+                    virtualMask := array.get(engine.w03Store.journalNewMasks, pendingRow)
+                // the MERGE rows already journaled for this Root, in append order
+                int row = 0
+                while row < engine.w03Store.journalCount
+                    if array.get(engine.w03Store.journalOps, row) == JOP_SWING_TF_MERGE and array.get(engine.w03Store.journalTargetRootSlots, row) == targetSlot and array.get(engine.w03Store.journalExpectedRootIds, row) == targetId
+                        virtualMask := array.get(engine.w03Store.journalNewMasks, row)
+                    row += 1
+                // a TF bit not yet carried: merge it (the bit is OFF, so + is an exact OR)
+                bool bitOn = int(math.floor(virtualMask / tfMask)) % 2 == 1
+                if not bitOn
+                    int mergeRow = journalAppendRaw(engine, JOP_SWING_TF_MERGE, JGROUP_E3, targetSlot, targetId, CAT_SWING, subtype, tfCode, originKey, originTime, originEndTime, confirmedTime, pointPrice, float(na), float(na), ROOT_ACTIVE, ROOT_ACTIVE, false, false, FVG_NONE, virtualMask, virtualMask + tfMask, ID_NONE, int(na))
+        e += 1
+    [true, out15m, out1h]
+
+// ============================================================
 // W02 Batch 14 : Side Phase set index raw helpers (I11-9)
 //
 // Internal only. They maintain the Batch 13 membership of one Side in the Phase set
