@@ -9012,6 +9012,151 @@ w03StageDFvgFactsRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed, int nextLastCons
     [true, outLastConsumed1hFvgStructuralCloseTime, outLastConsumed4hFvgStructuralCloseTime, outLastConsumedDFvgStructuralCloseTime]
 
 // ============================================================
+// W05 Batch 03 : Side eligibility + Point / FVG eligible scratch build
+// Source: I12.1, I17.1, I18, D02, D12, D13, HANDOFF_W04 section 7 (refEligible,
+//         refBuildPointOrder)
+//
+// Internal only. Business call sites = 0 in this Batch.
+//   candEligibleRaw             : refEligible, plus the Cfg Category ON / OFF.
+//   candBuildEligibleScratchRaw : the Side's Point Root scratch, pointTick ASC then
+//                                 rootId ASC, from one pass over rootPriceOrderSlots.
+//                                 Only an equal-tick group is re-ordered, by rootId,
+//                                 inside the scratch; the price order itself is read only.
+//   candBuildFvgScratchRaw      : the Side's eligible FVG scratch, rootId ASC, from one
+//                                 pass over rootIdOrderSlots (Live Roots, rootId ASC).
+// Both builders read the Side's used flags and skip used Roots; they never write a
+// used flag. Scratch arrays keep their capacity: the logical length restarts at 0 and
+// rows are overwritten, grown only by a tail push. The Side's scratch-position and
+// used arrays are grown here (tail push only) to size(rootIds), since the W03
+// Workers never grow them; existing rows are never re-initialised or shrunk.
+// Scratch position by rootSlot is never valid alone. A reader must check
+//   pos >= 0, pos < candidateScratch*NewLength, candidateScratch*NewRootSlots[pos] == rootSlot
+// because stale positions of Roots left out of this build are not reset.
+// No array.new / copy / clear / sort / insert / remove / shift / unshift.
+// ============================================================
+
+// True when the Root in rootSlot may enter the Candidate input of `side`.
+//   Category off in Cfg, Psych, unknown Category, dead slot or bad side : false
+//   MA / Swing / Accum / TimeHL : ROOT_ACTIVE only, both Sides
+//   FVG Bullish : ROOT_ACTIVE -> Support, ROOT_INVERSE_ACTIVE -> Resistance
+//   FVG Bearish : ROOT_ACTIVE -> Resistance, ROOT_INVERSE_ACTIVE -> Support
+// Fresh and Broad never change the result. Read-only.
+candEligibleRaw(ZoneEngine engine, ZoneCfg cfg, int rootSlot, int side) =>
+    bool eligible = false
+    bool ok = (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootDirections)
+    if ok
+        ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) != ID_NONE
+    if ok
+        int category = array.get(engine.rootCategories, rootSlot)
+        int state    = array.get(engine.rootStates, rootSlot)
+        if category == CAT_MA or category == CAT_SWING or category == CAT_ACCUM or category == CAT_TIME_HL
+            bool categoryOn = category == CAT_MA ? cfg.useMa : category == CAT_SWING ? cfg.useSwing : category == CAT_ACCUM ? cfg.useAccum : cfg.useTimeHl
+            eligible := categoryOn and state == ROOT_ACTIVE
+        else if category == CAT_FVG and cfg.useFvg
+            int direction = array.get(engine.rootDirections, rootSlot)
+            if direction == FVG_BULLISH
+                if state == ROOT_ACTIVE
+                    eligible := side == SIDE_SUPPORT
+                else if state == ROOT_INVERSE_ACTIVE
+                    eligible := side == SIDE_RESISTANCE
+            else if direction == FVG_BEARISH
+                if state == ROOT_ACTIVE
+                    eligible := side == SIDE_RESISTANCE
+                else if state == ROOT_INVERSE_ACTIVE
+                    eligible := side == SIDE_SUPPORT
+    eligible
+
+// Builds the Side's Point Root eligible scratch and returns its logical length.
+// A bad side returns 0 and writes nothing.
+candBuildEligibleScratchRaw(ZoneEngine engine, ZoneCfg cfg, int side) =>
+    int len = 0
+    if side == SIDE_SUPPORT or side == SIDE_RESISTANCE
+        bool        isSupport  = side == SIDE_SUPPORT
+        array<int>  scratch    = isSupport ? engine.candidateScratchSupportNewRootSlots : engine.candidateScratchResistanceNewRootSlots
+        array<int>  posBySlot  = isSupport ? engine.w03Store.candidateSupportScratchPosByRootSlot : engine.w03Store.candidateResistanceScratchPosByRootSlot
+        array<bool> usedBySlot = isSupport ? engine.w03Store.candidateSupportUsedByRootSlot : engine.w03Store.candidateResistanceUsedByRootSlot
+        int rootCount = array.size(engine.rootIds)
+        // capacity: new rows only (SLOT_INVALID / false); existing rows kept
+        while array.size(posBySlot) < rootCount
+            array.push(posBySlot, SLOT_INVALID)
+        while array.size(usedBySlot) < rootCount
+            array.push(usedBySlot, false)
+        int orderSize  = array.size(engine.rootPriceOrderSlots)
+        int groupStart = 0
+        int groupTick  = int(na)
+        int p = 0
+        while p < orderSize
+            int s = array.get(engine.rootPriceOrderSlots, p)
+            if s >= 0 and s < rootCount and s < array.size(engine.rootSlotLiveFlags) and s < array.size(engine.rootPointTicks)
+                if array.get(engine.rootSlotLiveFlags, s)
+                    if candEligibleRaw(engine, cfg, s, side)
+                        int category = array.get(engine.rootCategories, s)
+                        if category != CAT_FVG and category != CAT_PSYCH and not array.get(usedBySlot, s)
+                            int t = array.get(engine.rootPointTicks, s)
+                            if not na(t)
+                                // a new equal-tick group starts at the current logical end
+                                if len == 0 or t != groupTick
+                                    groupStart := len
+                                    groupTick  := t
+                                if len < array.size(scratch)
+                                    array.set(scratch, len, s)
+                                else
+                                    array.push(scratch, s)
+                                // rootId ASC inside the equal-tick group only
+                                int sId = array.get(engine.rootIds, s)
+                                int k   = len
+                                while k > groupStart and array.get(engine.rootIds, array.get(scratch, k - 1)) > sId
+                                    array.set(scratch, k, array.get(scratch, k - 1))
+                                    k -= 1
+                                array.set(scratch, k, s)
+                                len += 1
+            p += 1
+        // second pass: reverse positions of the final order
+        int pos = 0
+        while pos < len
+            array.set(posBySlot, array.get(scratch, pos), pos)
+            pos += 1
+        if isSupport
+            engine.candidateScratchSupportNewLength := len
+        else
+            engine.candidateScratchResistanceNewLength := len
+    len
+
+// Builds the Side's eligible FVG scratch (rootId ASC) and returns its logical length.
+// A bad side returns 0 and writes nothing.
+candBuildFvgScratchRaw(ZoneEngine engine, ZoneCfg cfg, int side) =>
+    int len = 0
+    if side == SIDE_SUPPORT or side == SIDE_RESISTANCE
+        bool        isSupport  = side == SIDE_SUPPORT
+        array<int>  scratch    = isSupport ? engine.w03Store.candidateSupportFvgRootSlots : engine.w03Store.candidateResistanceFvgRootSlots
+        array<int>  posBySlot  = isSupport ? engine.w03Store.candidateSupportScratchPosByRootSlot : engine.w03Store.candidateResistanceScratchPosByRootSlot
+        array<bool> usedBySlot = isSupport ? engine.w03Store.candidateSupportUsedByRootSlot : engine.w03Store.candidateResistanceUsedByRootSlot
+        int rootCount = array.size(engine.rootIds)
+        // capacity: new rows only (SLOT_INVALID / false); existing rows kept
+        while array.size(posBySlot) < rootCount
+            array.push(posBySlot, SLOT_INVALID)
+        while array.size(usedBySlot) < rootCount
+            array.push(usedBySlot, false)
+        int orderSize = array.size(engine.rootIdOrderSlots)
+        int p = 0
+        while p < orderSize
+            int s = array.get(engine.rootIdOrderSlots, p)
+            if s >= 0 and s < rootCount and s < array.size(engine.rootSlotLiveFlags) and s < array.size(engine.rootCategories)
+                if array.get(engine.rootSlotLiveFlags, s) and array.get(engine.rootCategories, s) == CAT_FVG
+                    if candEligibleRaw(engine, cfg, s, side) and not array.get(usedBySlot, s)
+                        if len < array.size(scratch)
+                            array.set(scratch, len, s)
+                        else
+                            array.push(scratch, s)
+                        len += 1
+            p += 1
+        if isSupport
+            engine.w03Store.candidateSupportFvgLength := len
+        else
+            engine.w03Store.candidateResistanceFvgLength := len
+    len
+
+// ============================================================
 // W02 Batch 14 : Side Phase set index raw helpers (I11-9)
 //
 // Internal only. They maintain the Batch 13 membership of one Side in the Phase set
