@@ -8,7 +8,8 @@
 
 ## 2. Final files / HEAD
 
-- final HEAD `c42d92faf66c1d29a49a80fde75075c004da9437`（branch `claude/laughing-dijkstra-3w3zgr`）
+- code-final HEAD：`c42d92faf66c1d29a49a80fde75075c004da9437`
+- W03 handoff / branch HEAD：`8138b369d54c398bbe3034895f9cfbc54c8d021f`（branch `claude/laughing-dijkstra-3w3zgr`）
 - Production：`sekine3310/ZoneEngineV2_Rebuild/20`（`ZoneEngineV2_Rebuild.pine`）
 - Worker：`sekine3310/ZoneEngineV2_W03F0_Worker/2`、`.../ZoneEngineV2_W03Apply_Worker/1`、`.../ZoneEngineV2_W03ETimeFvg_Worker/1`
 - Harness：`ZoneEngineV2_Rebuild_W03Harness.pine`（`/20` を import）
