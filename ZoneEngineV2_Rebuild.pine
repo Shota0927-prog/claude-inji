@@ -1650,6 +1650,15 @@ export type W03SourceRootStore
     array<int>   candidateResistanceFvgRootSlots
     int          candidateResistanceFvgLength            = 0
 
+    // ---- W05 Batch 04 : Candidate window monotonic deques (I12.2) ----
+    // Temporary, shared by both Sides (Stage G runs the Sides one after the other).
+    // Values are indexes into the current Side's Point eligible scratch, never rootSlots,
+    // Root IDs or times. The logical range head .. tail - 1 lives in the caller's
+    // scalars; a new traversal resets head = tail = 0 and reuses the capacity. Never a
+    // business identity, winner storage or Snapshot.
+    array<int>   candidateWindowMinRootIdDequeScratchIndexes
+    array<int>   candidateWindowMaxConfirmedTimeDequeScratchIndexes
+
 export type ZoneEngine
     // ---- scalar : config validation (Batch 5 connects validateCfg results) ----
     bool  configValid            = false
@@ -2755,6 +2764,9 @@ export newEngine(ZoneCfg cfg) =>
     w03.candidateSupportFvgLength               := 0
     w03.candidateResistanceFvgRootSlots         := array.new_int(0)
     w03.candidateResistanceFvgLength            := 0
+    // W05 Batch 04 : Candidate window deques, each its own instance
+    w03.candidateWindowMinRootIdDequeScratchIndexes        := array.new_int(0)
+    w03.candidateWindowMaxConfirmedTimeDequeScratchIndexes := array.new_int(0)
     e.w03Store := w03
 
     // W02 Batch 9 : four independent Candidate scratch regions, empty and logically
@@ -9155,6 +9167,338 @@ candBuildFvgScratchRaw(ZoneEngine engine, ZoneCfg cfg, int side) =>
         else
             engine.w03Store.candidateResistanceFvgLength := len
     len
+
+// ============================================================
+// W05 Batch 04 : Candidate differential window state
+// Source: I12.2, I18, A10.3, 6.1, HANDOFF_W04 section 7 (refCategoryHigh,
+//         refQualityAggregate, refAccumPairValid, refAppendDenseCandidate)
+//
+// Internal only. Business call sites = 0 in this Batch.
+// A window is the contiguous run [windowLeft .. windowRight] of the Side's Point
+// eligible scratch (B03). Only Point Roots (MA / Swing / Accum / TimeHL) enter it:
+// FVG and Psych never do. A Root is resolved as scratch[scratchIndex] -> rootSlot.
+// The window state is 18 caller-held scalars, passed in and returned in this order:
+//   maCount, swingCount, accumCount, timeHlCount,
+//   swingHighRootCount, accumHighRootCount, timeHlHighLabelCount,
+//   ema2000WantedCount, ema3000WantedCount, accumConflictCount,
+//   categoryMask, highMask, minRootId, maxConfirmedTime,
+//   minIdDequeHead, minIdDequeTail, maxTimeDequeHead, maxTimeDequeTail
+// categoryMask / highMask change only on a count 0 <-> 1 (TimeHL High on its
+// boolean). highMask carries Swing / Accum / TimeHL only: the MA bit needs the final
+// density, gap and Stage (B05), the FVG bit the variant (B06), Psych is never High.
+//   Swing High  : rootSwingTfMasks >= 4 (1H) or == 3 (5m + 15m), per Root
+//   Accum High  : TF_4H or TF_D Root (Accum TFs are 1H / 4H / D only, so the
+//                 different-TF pair clause always holds a 4H / D Root)
+//   TimeHL High : timeHlHighLabelCount > 0 (labelMask 8 .. 63) or timeHlCount >= 2
+//   EMA wanted  : EMA2000 / EMA3000 whose persistent slope is +1 (Support) / -1
+//                 (Resistance)
+//   Accum conflict : +1 when an entering Accum Root's pair mate (other boundary of
+//                 its non-zero pairKey, from the pair maps) sits in the window, -1 when
+//                 a leaving one's mate stays; the mate position is used only after the
+//                 back-pointer check pos < scratch length and scratch[pos] == mateSlot.
+// minRootId / maxConfirmedTime come from the two monotonic deques of W03SourceRootStore
+// (scratch indexes only): ENTER pops the tail while its Root ID is greater (min) or its
+// confirmedTime is less or equal (max) and appends; EXIT advances the head when it
+// holds the leaving index. Nothing re-scans the window.
+// ENTER must add scratchIndex == windowRight to [windowLeft .. windowRight - 1]; EXIT
+// must remove scratchIndex == windowLeft - 1, leaving [windowLeft .. windowRight]
+// (empty when windowLeft > windowRight). The bounds passed are the window AFTER the
+// move. Every check runs before any write: ok = false returns the state unchanged and
+// writes nothing (a na confirmedTime, a count below 0 or a broken deque is never ok).
+// No array.new / copy / clear / sort / insert / remove / shift / unshift.
+// ============================================================
+
+// The empty window state, in the order above.
+candWindowResetRaw() =>
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, CAT_MASK_NONE, CAT_MASK_NONE, ID_NONE, int(na), 0, 0, 0, 0]
+
+// Adds the Point Root at scratchIndex (== windowRight) to the window.
+// Returns [ok, the 18 state scalars].
+candWindowEnterRaw(ZoneEngine engine, int side, int scratchIndex, int windowLeft, int windowRight, int maCountIn, int swingCountIn, int accumCountIn, int timeHlCountIn, int swingHighRootCountIn, int accumHighRootCountIn, int timeHlHighLabelCountIn, int ema2000WantedCountIn, int ema3000WantedCountIn, int accumConflictCountIn, int categoryMaskIn, int highMaskIn, int minRootIdIn, int maxConfirmedTimeIn, int minIdDequeHeadIn, int minIdDequeTailIn, int maxTimeDequeHeadIn, int maxTimeDequeTailIn) =>
+    int maCount              = maCountIn
+    int swingCount           = swingCountIn
+    int accumCount           = accumCountIn
+    int timeHlCount          = timeHlCountIn
+    int swingHighRootCount   = swingHighRootCountIn
+    int accumHighRootCount   = accumHighRootCountIn
+    int timeHlHighLabelCount = timeHlHighLabelCountIn
+    int ema2000WantedCount   = ema2000WantedCountIn
+    int ema3000WantedCount   = ema3000WantedCountIn
+    int accumConflictCount   = accumConflictCountIn
+    int categoryMask         = categoryMaskIn
+    int highMask             = highMaskIn
+    int minRootId            = minRootIdIn
+    int maxConfirmedTime     = maxConfirmedTimeIn
+    int minIdDequeHead       = minIdDequeHeadIn
+    int minIdDequeTail       = minIdDequeTailIn
+    int maxTimeDequeHead     = maxTimeDequeHeadIn
+    int maxTimeDequeTail     = maxTimeDequeTailIn
+    bool        isSupport     = side == SIDE_SUPPORT
+    array<int>  scratch       = isSupport ? engine.candidateScratchSupportNewRootSlots : engine.candidateScratchResistanceNewRootSlots
+    int         scratchLength = isSupport ? engine.candidateScratchSupportNewLength : engine.candidateScratchResistanceNewLength
+    array<int>  posBySlot     = isSupport ? engine.w03Store.candidateSupportScratchPosByRootSlot : engine.w03Store.candidateResistanceScratchPosByRootSlot
+    array<int>  minDeque      = engine.w03Store.candidateWindowMinRootIdDequeScratchIndexes
+    array<int>  maxDeque      = engine.w03Store.candidateWindowMaxConfirmedTimeDequeScratchIndexes
+    // ---- checks, no write ----
+    bool ok = (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and windowLeft >= 0 and scratchIndex == windowRight and windowLeft <= windowRight and scratchIndex < scratchLength and scratchIndex < array.size(scratch)
+    if ok
+        ok := minIdDequeHead >= 0 and minIdDequeHead <= minIdDequeTail and minIdDequeTail <= array.size(minDeque) and maxTimeDequeHead >= 0 and maxTimeDequeHead <= maxTimeDequeTail and maxTimeDequeTail <= array.size(maxDeque)
+    int rootSlot = SLOT_INVALID
+    if ok
+        rootSlot := array.get(scratch, scratchIndex)
+        ok := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootSubtypes) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootConfirmedTimes) and rootSlot < array.size(engine.rootPairKeys) and rootSlot < array.size(engine.rootLabelMasks) and rootSlot < array.size(engine.w03Store.rootSwingTfMasks)
+    int category      = -1
+    int rootId        = ID_NONE
+    int confirmedTime = int(na)
+    if ok
+        category      := array.get(engine.rootCategories, rootSlot)
+        rootId        := array.get(engine.rootIds, rootSlot)
+        confirmedTime := array.get(engine.rootConfirmedTimes, rootSlot)
+        ok := rootId != ID_NONE and not na(confirmedTime) and (category == CAT_MA or category == CAT_SWING or category == CAT_ACCUM or category == CAT_TIME_HL)
+    bool ema2000Wanted   = false
+    bool ema3000Wanted   = false
+    bool swingHigh       = false
+    bool accumHigh       = false
+    bool timeHlHighLabel = false
+    bool conflict        = false
+    if ok
+        int wantedSlope = isSupport ? 1 : -1
+        if category == CAT_MA
+            int subtype = array.get(engine.rootSubtypes, rootSlot)
+            if subtype == SUB_MA_EMA2000
+                int slope = engine.w03Store.ema2000SlopeDir
+                ema2000Wanted := not na(slope) and slope == wantedSlope
+            else if subtype == SUB_MA_EMA3000
+                int slope = engine.w03Store.ema3000SlopeDir
+                ema3000Wanted := not na(slope) and slope == wantedSlope
+            else
+                ok := false
+        else if category == CAT_SWING
+            int tfMask = array.get(engine.w03Store.rootSwingTfMasks, rootSlot)
+            swingHigh := tfMask >= SWING_TF_MASK_1H or tfMask == SWING_TF_MASK_5M + SWING_TF_MASK_15M
+        else if category == CAT_ACCUM
+            int tf = array.get(engine.rootTfCodes, rootSlot)
+            accumHigh := tf == TF_4H or tf == TF_D
+            int pairKey = array.get(engine.rootPairKeys, rootSlot)
+            if pairKey != ID_NONE
+                int subtype = array.get(engine.rootSubtypes, rootSlot)
+                if subtype == SUB_ACCUM_UPPER or subtype == SUB_ACCUM_LOWER
+                    map<int, int> mateMap = subtype == SUB_ACCUM_UPPER ? engine.accumPairLowerRootSlotByKey : engine.accumPairUpperRootSlotByKey
+                    if map.contains(mateMap, pairKey)
+                        int mateSlot = map.get(mateMap, pairKey)
+                        if mateSlot >= 0 and mateSlot != rootSlot and mateSlot < array.size(posBySlot) and mateSlot < array.size(engine.rootPairKeys)
+                            int matePos = array.get(posBySlot, mateSlot)
+                            if matePos >= 0 and matePos < scratchLength and matePos < array.size(scratch)
+                                if array.get(scratch, matePos) == mateSlot and array.get(engine.rootPairKeys, mateSlot) == pairKey
+                                    conflict := matePos >= windowLeft and matePos <= windowRight
+                else
+                    ok := false
+        else
+            int labelMask = array.get(engine.rootLabelMasks, rootSlot)
+            timeHlHighLabel := labelMask >= TIMEHL_LABEL_PREV_DAY and labelMask <= 63
+    // ---- commit ----
+    if ok
+        if category == CAT_MA
+            maCount += 1
+            if maCount == 1
+                categoryMask += CAT_MASK_MA
+            if ema2000Wanted
+                ema2000WantedCount += 1
+            if ema3000Wanted
+                ema3000WantedCount += 1
+        else if category == CAT_SWING
+            swingCount += 1
+            if swingCount == 1
+                categoryMask += CAT_MASK_SWING
+            if swingHigh
+                swingHighRootCount += 1
+                if swingHighRootCount == 1
+                    highMask += CAT_MASK_SWING
+        else if category == CAT_ACCUM
+            accumCount += 1
+            if accumCount == 1
+                categoryMask += CAT_MASK_ACCUM
+            if accumHigh
+                accumHighRootCount += 1
+                if accumHighRootCount == 1
+                    highMask += CAT_MASK_ACCUM
+            if conflict
+                accumConflictCount += 1
+        else
+            bool timeHlHighBefore = timeHlHighLabelCount > 0 or timeHlCount >= 2
+            timeHlCount += 1
+            if timeHlCount == 1
+                categoryMask += CAT_MASK_TIME_HL
+            if timeHlHighLabel
+                timeHlHighLabelCount += 1
+            bool timeHlHighAfter = timeHlHighLabelCount > 0 or timeHlCount >= 2
+            if timeHlHighAfter and not timeHlHighBefore
+                highMask += CAT_MASK_TIME_HL
+        // min Root ID deque: drop tail entries with a greater Root ID (IDs are unique)
+        while minIdDequeTail > minIdDequeHead and array.get(engine.rootIds, array.get(scratch, array.get(minDeque, minIdDequeTail - 1))) > rootId
+            minIdDequeTail -= 1
+        if minIdDequeTail < array.size(minDeque)
+            array.set(minDeque, minIdDequeTail, scratchIndex)
+        else
+            array.push(minDeque, scratchIndex)
+        minIdDequeTail += 1
+        minRootId := array.get(engine.rootIds, array.get(scratch, array.get(minDeque, minIdDequeHead)))
+        // max confirmedTime deque: drop tail entries with a time <= the new one
+        while maxTimeDequeTail > maxTimeDequeHead and array.get(engine.rootConfirmedTimes, array.get(scratch, array.get(maxDeque, maxTimeDequeTail - 1))) <= confirmedTime
+            maxTimeDequeTail -= 1
+        if maxTimeDequeTail < array.size(maxDeque)
+            array.set(maxDeque, maxTimeDequeTail, scratchIndex)
+        else
+            array.push(maxDeque, scratchIndex)
+        maxTimeDequeTail += 1
+        maxConfirmedTime := array.get(engine.rootConfirmedTimes, array.get(scratch, array.get(maxDeque, maxTimeDequeHead)))
+    [ok, maCount, swingCount, accumCount, timeHlCount, swingHighRootCount, accumHighRootCount, timeHlHighLabelCount, ema2000WantedCount, ema3000WantedCount, accumConflictCount, categoryMask, highMask, minRootId, maxConfirmedTime, minIdDequeHead, minIdDequeTail, maxTimeDequeHead, maxTimeDequeTail]
+
+// Removes the Point Root at scratchIndex (== windowLeft - 1) from the window; the
+// window left is [windowLeft .. windowRight], empty when windowLeft > windowRight.
+// Returns [ok, the 18 state scalars].
+candWindowExitRaw(ZoneEngine engine, int side, int scratchIndex, int windowLeft, int windowRight, int maCountIn, int swingCountIn, int accumCountIn, int timeHlCountIn, int swingHighRootCountIn, int accumHighRootCountIn, int timeHlHighLabelCountIn, int ema2000WantedCountIn, int ema3000WantedCountIn, int accumConflictCountIn, int categoryMaskIn, int highMaskIn, int minRootIdIn, int maxConfirmedTimeIn, int minIdDequeHeadIn, int minIdDequeTailIn, int maxTimeDequeHeadIn, int maxTimeDequeTailIn) =>
+    int maCount              = maCountIn
+    int swingCount           = swingCountIn
+    int accumCount           = accumCountIn
+    int timeHlCount          = timeHlCountIn
+    int swingHighRootCount   = swingHighRootCountIn
+    int accumHighRootCount   = accumHighRootCountIn
+    int timeHlHighLabelCount = timeHlHighLabelCountIn
+    int ema2000WantedCount   = ema2000WantedCountIn
+    int ema3000WantedCount   = ema3000WantedCountIn
+    int accumConflictCount   = accumConflictCountIn
+    int categoryMask         = categoryMaskIn
+    int highMask             = highMaskIn
+    int minRootId            = minRootIdIn
+    int maxConfirmedTime     = maxConfirmedTimeIn
+    int minIdDequeHead       = minIdDequeHeadIn
+    int minIdDequeTail       = minIdDequeTailIn
+    int maxTimeDequeHead     = maxTimeDequeHeadIn
+    int maxTimeDequeTail     = maxTimeDequeTailIn
+    bool        isSupport     = side == SIDE_SUPPORT
+    array<int>  scratch       = isSupport ? engine.candidateScratchSupportNewRootSlots : engine.candidateScratchResistanceNewRootSlots
+    int         scratchLength = isSupport ? engine.candidateScratchSupportNewLength : engine.candidateScratchResistanceNewLength
+    array<int>  posBySlot     = isSupport ? engine.w03Store.candidateSupportScratchPosByRootSlot : engine.w03Store.candidateResistanceScratchPosByRootSlot
+    array<int>  minDeque      = engine.w03Store.candidateWindowMinRootIdDequeScratchIndexes
+    array<int>  maxDeque      = engine.w03Store.candidateWindowMaxConfirmedTimeDequeScratchIndexes
+    bool        windowEmpty   = windowLeft > windowRight
+    // ---- checks, no write ----
+    bool ok = (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and scratchIndex >= 0 and scratchIndex == windowLeft - 1 and scratchIndex < scratchLength and scratchIndex < array.size(scratch) and (windowEmpty or windowRight < scratchLength)
+    if ok
+        ok := minIdDequeHead >= 0 and minIdDequeHead <= minIdDequeTail and minIdDequeTail <= array.size(minDeque) and maxTimeDequeHead >= 0 and maxTimeDequeHead <= maxTimeDequeTail and maxTimeDequeTail <= array.size(maxDeque)
+    int rootSlot = SLOT_INVALID
+    if ok
+        rootSlot := array.get(scratch, scratchIndex)
+        ok := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootSubtypes) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootConfirmedTimes) and rootSlot < array.size(engine.rootPairKeys) and rootSlot < array.size(engine.rootLabelMasks) and rootSlot < array.size(engine.w03Store.rootSwingTfMasks)
+    int category = -1
+    if ok
+        category := array.get(engine.rootCategories, rootSlot)
+        ok := array.get(engine.rootIds, rootSlot) != ID_NONE and not na(array.get(engine.rootConfirmedTimes, rootSlot)) and (category == CAT_MA or category == CAT_SWING or category == CAT_ACCUM or category == CAT_TIME_HL)
+    bool ema2000Wanted   = false
+    bool ema3000Wanted   = false
+    bool swingHigh       = false
+    bool accumHigh       = false
+    bool timeHlHighLabel = false
+    bool conflict        = false
+    if ok
+        int wantedSlope = isSupport ? 1 : -1
+        if category == CAT_MA
+            int subtype = array.get(engine.rootSubtypes, rootSlot)
+            if subtype == SUB_MA_EMA2000
+                int slope = engine.w03Store.ema2000SlopeDir
+                ema2000Wanted := not na(slope) and slope == wantedSlope
+            else if subtype == SUB_MA_EMA3000
+                int slope = engine.w03Store.ema3000SlopeDir
+                ema3000Wanted := not na(slope) and slope == wantedSlope
+            else
+                ok := false
+            if ok
+                ok := maCount > 0 and (not ema2000Wanted or ema2000WantedCount > 0) and (not ema3000Wanted or ema3000WantedCount > 0)
+        else if category == CAT_SWING
+            int tfMask = array.get(engine.w03Store.rootSwingTfMasks, rootSlot)
+            swingHigh := tfMask >= SWING_TF_MASK_1H or tfMask == SWING_TF_MASK_5M + SWING_TF_MASK_15M
+            ok := swingCount > 0 and (not swingHigh or swingHighRootCount > 0)
+        else if category == CAT_ACCUM
+            int tf = array.get(engine.rootTfCodes, rootSlot)
+            accumHigh := tf == TF_4H or tf == TF_D
+            int pairKey = array.get(engine.rootPairKeys, rootSlot)
+            if pairKey != ID_NONE
+                int subtype = array.get(engine.rootSubtypes, rootSlot)
+                if subtype == SUB_ACCUM_UPPER or subtype == SUB_ACCUM_LOWER
+                    map<int, int> mateMap = subtype == SUB_ACCUM_UPPER ? engine.accumPairLowerRootSlotByKey : engine.accumPairUpperRootSlotByKey
+                    if map.contains(mateMap, pairKey)
+                        int mateSlot = map.get(mateMap, pairKey)
+                        if mateSlot >= 0 and mateSlot != rootSlot and mateSlot < array.size(posBySlot) and mateSlot < array.size(engine.rootPairKeys)
+                            int matePos = array.get(posBySlot, mateSlot)
+                            if matePos >= 0 and matePos < scratchLength and matePos < array.size(scratch)
+                                if array.get(scratch, matePos) == mateSlot and array.get(engine.rootPairKeys, mateSlot) == pairKey
+                                    conflict := not windowEmpty and matePos >= windowLeft and matePos <= windowRight
+                else
+                    ok := false
+            if ok
+                ok := accumCount > 0 and (not accumHigh or accumHighRootCount > 0) and (not conflict or accumConflictCount > 0)
+        else
+            int labelMask = array.get(engine.rootLabelMasks, rootSlot)
+            timeHlHighLabel := labelMask >= TIMEHL_LABEL_PREV_DAY and labelMask <= 63
+            ok := timeHlCount > 0 and (not timeHlHighLabel or timeHlHighLabelCount > 0)
+    // deque heads after the exit: the leaving index can only sit at a head
+    int newMinHead = minIdDequeHead
+    int newMaxHead = maxTimeDequeHead
+    if ok
+        if newMinHead < minIdDequeTail and array.get(minDeque, newMinHead) == scratchIndex
+            newMinHead += 1
+        if newMaxHead < maxTimeDequeTail and array.get(maxDeque, newMaxHead) == scratchIndex
+            newMaxHead += 1
+        if not windowEmpty
+            ok := newMinHead < minIdDequeTail and newMaxHead < maxTimeDequeTail
+    // ---- commit ----
+    if ok
+        if category == CAT_MA
+            maCount -= 1
+            if maCount == 0
+                categoryMask -= CAT_MASK_MA
+            if ema2000Wanted
+                ema2000WantedCount -= 1
+            if ema3000Wanted
+                ema3000WantedCount -= 1
+        else if category == CAT_SWING
+            swingCount -= 1
+            if swingCount == 0
+                categoryMask -= CAT_MASK_SWING
+            if swingHigh
+                swingHighRootCount -= 1
+                if swingHighRootCount == 0
+                    highMask -= CAT_MASK_SWING
+        else if category == CAT_ACCUM
+            accumCount -= 1
+            if accumCount == 0
+                categoryMask -= CAT_MASK_ACCUM
+            if accumHigh
+                accumHighRootCount -= 1
+                if accumHighRootCount == 0
+                    highMask -= CAT_MASK_ACCUM
+            if conflict
+                accumConflictCount -= 1
+        else
+            bool timeHlHighBefore = timeHlHighLabelCount > 0 or timeHlCount >= 2
+            timeHlCount -= 1
+            if timeHlCount == 0
+                categoryMask -= CAT_MASK_TIME_HL
+            if timeHlHighLabel
+                timeHlHighLabelCount -= 1
+            bool timeHlHighAfter = timeHlHighLabelCount > 0 or timeHlCount >= 2
+            if timeHlHighBefore and not timeHlHighAfter
+                highMask -= CAT_MASK_TIME_HL
+        minIdDequeHead   := newMinHead
+        maxTimeDequeHead := newMaxHead
+        if windowEmpty
+            minRootId        := ID_NONE
+            maxConfirmedTime := int(na)
+        else
+            minRootId        := array.get(engine.rootIds, array.get(scratch, array.get(minDeque, minIdDequeHead)))
+            maxConfirmedTime := array.get(engine.rootConfirmedTimes, array.get(scratch, array.get(maxDeque, maxTimeDequeHead)))
+    [ok, maCount, swingCount, accumCount, timeHlCount, swingHighRootCount, accumHighRootCount, timeHlHighLabelCount, ema2000WantedCount, ema3000WantedCount, accumConflictCount, categoryMask, highMask, minRootId, maxConfirmedTime, minIdDequeHead, minIdDequeTail, maxTimeDequeHead, maxTimeDequeTail]
 
 // ============================================================
 // W02 Batch 14 : Side Phase set index raw helpers (I11-9)
