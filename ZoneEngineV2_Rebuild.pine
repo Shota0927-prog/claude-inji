@@ -1693,6 +1693,47 @@ export type W03SourceRootStore
     bool         candidateFailedSupport           = false
     bool         candidateFailedResistance        = false
 
+    // ---- W05 Batch 12 : winner-only storage (Structure of Arrays) ----
+    // One record per materialized winner, index 0 .. candidateWinnerLogicalCount - 1
+    // in Reference winner order. Written only by candMaterializeWinnerRaw, append
+    // only; a later Batch owns the reset of the logical counts. A loser Candidate is
+    // never materialized: comparison stays on the 16 I12.3 scalars (candidateBest*).
+    // BroadContext is density == DEN_BROAD_CONTEXT. No physical FVG slot is kept:
+    // the identity is side, stage, EffectiveRange, the Root ID set, the Psych level
+    // (na when absent) and fvgMode. The Root ID set of record r is the flat segment
+    // candidateWinnerRootIds[offset .. offset + length - 1], real Roots only (never a
+    // Virtual Psych), rootId ASC. Physical sizes may exceed the logical counts.
+    array<int>   candidateWinnerSides
+    array<int>   candidateWinnerStages
+    array<int>   candidateWinnerEffectiveBottomTicks
+    array<int>   candidateWinnerEffectiveTopTicks
+    array<int>   candidateWinnerCCounts
+    array<int>   candidateWinnerHCounts
+    array<int>   candidateWinnerDensities
+    array<bool>  candidateWinnerBaseStrongFlags
+    array<int>   candidateWinnerCategoryMasks
+    array<int>   candidateWinnerHighMasks
+    array<int>   candidateWinnerCreatedTimes
+    array<int>   candidateWinnerMinRootIds
+    array<int>   candidateWinnerFvgModes
+    array<int>   candidateWinnerPsychLevelTicks
+    array<float> candidateWinnerReferencePrices
+
+    array<int>   candidateWinnerRootIdOffsets
+    array<int>   candidateWinnerRootIdLengths
+    array<int>   candidateWinnerRootIds
+
+    int          candidateWinnerLogicalCount      = 0
+    int          candidateWinnerRootIdLength      = 0
+
+    // ---- W05 Batch 12 : winner-only ReferencePrice scratch ----
+    // Reused by logical length (reset to 0, grown by push only when full, ordered by
+    // local array.set insertion). Never cleared, sorted, inserted or removed.
+    array<float> candidateWinnerRefValueScratch
+    int          candidateWinnerRefValueLength    = 0
+    array<float> candidateWinnerRefRepScratch
+    int          candidateWinnerRefRepLength      = 0
+
 export type ZoneEngine
     // ---- scalar : config validation (Batch 5 connects validateCfg results) ----
     bool  configValid            = false
@@ -2801,6 +2842,28 @@ export newEngine(ZoneCfg cfg) =>
     // W05 Batch 04 : Candidate window deques, each its own instance
     w03.candidateWindowMinRootIdDequeScratchIndexes        := array.new_int(0)
     w03.candidateWindowMaxConfirmedTimeDequeScratchIndexes := array.new_int(0)
+    // W05 Batch 12 : winner-only storage and ReferencePrice scratch, each its own
+    // instance; logical counts / lengths keep their type default 0
+    w03.candidateWinnerSides                := array.new_int(0)
+    w03.candidateWinnerStages               := array.new_int(0)
+    w03.candidateWinnerEffectiveBottomTicks := array.new_int(0)
+    w03.candidateWinnerEffectiveTopTicks    := array.new_int(0)
+    w03.candidateWinnerCCounts              := array.new_int(0)
+    w03.candidateWinnerHCounts              := array.new_int(0)
+    w03.candidateWinnerDensities            := array.new_int(0)
+    w03.candidateWinnerBaseStrongFlags      := array.new_bool(0)
+    w03.candidateWinnerCategoryMasks        := array.new_int(0)
+    w03.candidateWinnerHighMasks            := array.new_int(0)
+    w03.candidateWinnerCreatedTimes         := array.new_int(0)
+    w03.candidateWinnerMinRootIds           := array.new_int(0)
+    w03.candidateWinnerFvgModes             := array.new_int(0)
+    w03.candidateWinnerPsychLevelTicks      := array.new_int(0)
+    w03.candidateWinnerReferencePrices      := array.new_float(0)
+    w03.candidateWinnerRootIdOffsets        := array.new_int(0)
+    w03.candidateWinnerRootIdLengths        := array.new_int(0)
+    w03.candidateWinnerRootIds              := array.new_int(0)
+    w03.candidateWinnerRefValueScratch      := array.new_float(0)
+    w03.candidateWinnerRefRepScratch        := array.new_float(0)
     e.w03Store := w03
 
     // W02 Batch 9 : four independent Candidate scratch regions, empty and logically
@@ -10910,6 +10973,356 @@ candEnumerateStageCRaw(ZoneEngine engine, ZoneCfg cfg, float mintick, int side, 
                             ok := candOfferRaw(engine, cfg, mintick, side, CAND_STAGE_C, SLOT_INVALID, SLOT_INVALID, zvBottom, zvTop, zqC, zqH, zqDensity, zqStrong, zCreated, faId, zMode, fa, zqCategory, zqHigh, zt, fb)
             fj += 1
         fi += 1
+    ok
+
+// ============================================================
+// W05 Batch 12 : winner-only materialization + ReferencePrice
+// Source: I12.3, I12.6, A10.4, HANDOFF_W04 section 7
+//         (refReferencePrice, refCandidateToResult, refBuildReferenceResults)
+//
+// Internal only. Business call sites = 0 in this Batch (the winner loop of a later
+// Batch calls candMaterializeWinnerRaw once per confirmed winner, never for a
+// loser, never from an enumerator or candOfferRaw).
+// candReferencePriceRaw : ReferencePrice of one materialized Root ID segment. The
+//   plain median of one representative per present Category, float, never rounded
+//   to a tick, display / tracking only (never Touch, Break, Density, the Comparator
+//   or winner selection). Median: odd -> middle value, even -> mean of the two middle
+//   values, ordered by local array.set insertion in the winner-only scratch.
+//     Swing / Accum / TimeHL : median of the participating rootPointPrices
+//     Psych                  : psychLevelTick * mintick (no Root)
+//     MA  : one EMA -> its price; EMA2000 + EMA3000 with other Point representatives
+//           (Swing / Accum / TimeHL / Psych) -> the EMA nearest to their median
+//           (equal distance -> smaller rootId); without them -> the mean of both;
+//           a second EMA of one subtype or another MA subtype -> failure
+//     FVG by fvgMode (native float prices, never the 50% point):
+//       NONE          -> 0 FVG, no representative
+//       INSIDE        -> 1 FVG, no representative (a Point / Psych one is required)
+//       PROXIMAL / STANDALONE -> 1 FVG, approach edge (Support nativeTop,
+//                        Resistance nativeBottom)
+//       OVERLAP       -> 2 FVGs of one direction, ob = max(nativeBottom) <= ot =
+//                        min(nativeTop) recomputed from the NativeRanges (never the
+//                        Psych-widened EffectiveRange), Support ot / Resistance ob
+//       BROAD_CONTEXT -> exactly 1 Root, a Broad FVG, no Psych, approach edge
+// candMaterializeWinnerRaw : converts the given 16 Candidate scalars (a best or a
+//   BroadContext) into one winner record. The hidden completion (psychLevelTick,
+//   fvgRootSlot2) must be unique (candCompletionCountRaw count 1) and agree with the
+//   Psych bit. Real Roots only: the Point scratch window [left .. right] (live, rootId
+//   set, MA / Swing / Accum / TimeHL), the primary FVG and the second FVG (live,
+//   CAT_FVG, rootId set); >= 1 Root, no repeated Root ID. The segment is ordered
+//   rootId ASC by local insertion; createdTime = max confirmedTime and minRootId =
+//   min rootId are re-checked. Append is atomic: the Root IDs are written past the
+//   logical length, and the logical count / length move only after every check and
+//   the ReferencePrice passed. No best / tie / failure / used write, no reset.
+// ============================================================
+
+candReferencePriceRaw(ZoneEngine engine, float mintick, int side, int fvgMode, int effectiveBottomTick, int effectiveTopTick, int psychLevelTick, int rootIdOffset, int rootIdLength) =>
+    array<int>   ids  = engine.w03Store.candidateWinnerRootIds
+    array<float> vals = engine.w03Store.candidateWinnerRefValueScratch
+    array<float> reps = engine.w03Store.candidateWinnerRefRepScratch
+    bool psychPresent = not na(psychLevelTick)
+    bool ok = (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and not na(mintick) and mintick > 0 and not na(effectiveBottomTick) and not na(effectiveTopTick) and effectiveBottomTick <= effectiveTopTick and fvgMode >= CAND_FVG_RANGE_NONE and fvgMode <= CAND_FVG_RANGE_BROAD_CONTEXT and not na(rootIdOffset) and not na(rootIdLength) and rootIdOffset >= 0 and rootIdLength >= 1 and rootIdOffset + rootIdLength <= array.size(ids)
+    // ---- pass 1 : resolve every Root ID, validate, MA / FVG facts ----
+    int   fvgCount     = 0
+    int   fvgSlotA     = SLOT_INVALID
+    int   fvgSlotB     = SLOT_INVALID
+    int   ema2000Count = 0
+    int   ema3000Count = 0
+    float ema2000Price = na
+    float ema3000Price = na
+    int   ema2000Id    = ID_NONE
+    int   ema3000Id    = ID_NONE
+    int i = 0
+    while ok and i < rootIdLength
+        int id = array.get(ids, rootIdOffset + i)
+        ok := not na(id) and id != ID_NONE and map.contains(engine.rootIdToSlot, id)
+        // a Root ID appears once
+        int d = 0
+        while ok and d < i
+            ok := array.get(ids, rootIdOffset + d) != id
+            d += 1
+        int s = ok ? map.get(engine.rootIdToSlot, id) : SLOT_INVALID
+        if ok
+            ok := s >= 0 and s < array.size(engine.rootIds) and s < array.size(engine.rootSlotLiveFlags) and s < array.size(engine.rootCategories) and s < array.size(engine.rootSubtypes) and s < array.size(engine.rootPointPrices) and s < array.size(engine.rootNativeBottoms) and s < array.size(engine.rootNativeTops) and s < array.size(engine.rootIsBroadFvgFlags) and s < array.size(engine.rootDirections)
+        if ok
+            ok := array.get(engine.rootSlotLiveFlags, s) and array.get(engine.rootIds, s) == id
+        if ok
+            int category = array.get(engine.rootCategories, s)
+            if category == CAT_FVG
+                float nb = array.get(engine.rootNativeBottoms, s)
+                float nt = array.get(engine.rootNativeTops, s)
+                ok := not na(nb) and not na(nt) and nb <= nt
+                if ok
+                    fvgCount += 1
+                    if fvgCount == 1
+                        fvgSlotA := s
+                    else if fvgCount == 2
+                        fvgSlotB := s
+            else if category == CAT_MA or category == CAT_SWING or category == CAT_ACCUM or category == CAT_TIME_HL
+                float price = array.get(engine.rootPointPrices, s)
+                ok := not na(price)
+                if ok and category == CAT_MA
+                    int subtype = array.get(engine.rootSubtypes, s)
+                    if subtype == SUB_MA_EMA2000
+                        ema2000Count += 1
+                        ema2000Price := price
+                        ema2000Id    := id
+                    else if subtype == SUB_MA_EMA3000
+                        ema3000Count += 1
+                        ema3000Price := price
+                        ema3000Id    := id
+                    else
+                        ok := false
+            else
+                ok := false
+        i += 1
+    // MA : EMA2000 / EMA3000 at most once each (so never more than 2 MA Roots)
+    if ok
+        ok := ema2000Count <= 1 and ema3000Count <= 1
+    // ---- pass 2 : Swing / Accum / TimeHL medians, then Psych -> other reps ----
+    int repLen = 0
+    int c = 0
+    while ok and c < 4
+        float rep = na
+        if c < 3
+            int wanted = c == 0 ? CAT_SWING : c == 1 ? CAT_ACCUM : CAT_TIME_HL
+            int valLen = 0
+            int k = 0
+            while k < rootIdLength
+                int s = map.get(engine.rootIdToSlot, array.get(ids, rootIdOffset + k))
+                if array.get(engine.rootCategories, s) == wanted
+                    float price = array.get(engine.rootPointPrices, s)
+                    if valLen == array.size(vals)
+                        array.push(vals, price)
+                    int  pos    = valLen
+                    bool moving = true
+                    while moving and pos > 0
+                        float prev = array.get(vals, pos - 1)
+                        if price < prev
+                            array.set(vals, pos, prev)
+                            pos -= 1
+                        else
+                            moving := false
+                    array.set(vals, pos, price)
+                    valLen += 1
+                k += 1
+            engine.w03Store.candidateWinnerRefValueLength := valLen
+            if valLen > 0
+                rep := valLen % 2 == 1 ? array.get(vals, int((valLen - 1) / 2)) : (array.get(vals, int(valLen / 2) - 1) + array.get(vals, int(valLen / 2))) / 2.0
+        else if psychPresent
+            rep := float(psychLevelTick) * mintick
+        if not na(rep)
+            if repLen == array.size(reps)
+                array.push(reps, rep)
+            int  pos    = repLen
+            bool moving = true
+            while moving and pos > 0
+                float prev = array.get(reps, pos - 1)
+                if rep < prev
+                    array.set(reps, pos, prev)
+                    pos -= 1
+                else
+                    moving := false
+            array.set(reps, pos, rep)
+            repLen += 1
+        c += 1
+    int otherLen = repLen
+    // ---- MA representative ----
+    float maRep = na
+    if ok
+        if ema2000Count == 1 and ema3000Count == 1
+            if otherLen > 0
+                float target = otherLen % 2 == 1 ? array.get(reps, int((otherLen - 1) / 2)) : (array.get(reps, int(otherLen / 2) - 1) + array.get(reps, int(otherLen / 2))) / 2.0
+                float d2000  = math.abs(ema2000Price - target)
+                float d3000  = math.abs(ema3000Price - target)
+                maRep := d2000 < d3000 ? ema2000Price : d3000 < d2000 ? ema3000Price : (ema2000Id < ema3000Id ? ema2000Price : ema3000Price)
+            else
+                maRep := (ema2000Price + ema3000Price) / 2.0
+        else if ema2000Count == 1
+            maRep := ema2000Price
+        else if ema3000Count == 1
+            maRep := ema3000Price
+    // ---- FVG representative by fvgMode ----
+    float fvgRep = na
+    if ok
+        if fvgMode == CAND_FVG_RANGE_NONE
+            ok := fvgCount == 0
+        else if fvgMode == CAND_FVG_RANGE_INSIDE
+            ok := fvgCount == 1 and (otherLen > 0 or not na(maRep))
+        else if fvgMode == CAND_FVG_RANGE_PROXIMAL or fvgMode == CAND_FVG_RANGE_STANDALONE or fvgMode == CAND_FVG_RANGE_BROAD_CONTEXT
+            ok := fvgCount == 1
+            if ok and fvgMode == CAND_FVG_RANGE_BROAD_CONTEXT
+                ok := rootIdLength == 1 and array.get(engine.rootIsBroadFvgFlags, fvgSlotA) and not psychPresent
+            if ok
+                fvgRep := side == SIDE_SUPPORT ? array.get(engine.rootNativeTops, fvgSlotA) : array.get(engine.rootNativeBottoms, fvgSlotA)
+        else
+            // OVERLAP : the common NativeRange of the two FVGs
+            ok := fvgCount == 2
+            if ok
+                ok := array.get(engine.rootDirections, fvgSlotA) == array.get(engine.rootDirections, fvgSlotB)
+            if ok
+                float ob = math.max(array.get(engine.rootNativeBottoms, fvgSlotA), array.get(engine.rootNativeBottoms, fvgSlotB))
+                float ot = math.min(array.get(engine.rootNativeTops,    fvgSlotA), array.get(engine.rootNativeTops,    fvgSlotB))
+                ok := ob <= ot
+                if ok
+                    fvgRep := side == SIDE_SUPPORT ? ot : ob
+    // ---- overall : plain median of the Category representatives ----
+    float refPrice = na
+    if ok
+        int e = 0
+        while e < 2
+            float rep = e == 0 ? maRep : fvgRep
+            if not na(rep)
+                if repLen == array.size(reps)
+                    array.push(reps, rep)
+                int  pos    = repLen
+                bool moving = true
+                while moving and pos > 0
+                    float prev = array.get(reps, pos - 1)
+                    if rep < prev
+                        array.set(reps, pos, prev)
+                        pos -= 1
+                    else
+                        moving := false
+                array.set(reps, pos, rep)
+                repLen += 1
+            e += 1
+        ok := repLen > 0
+        if ok
+            refPrice := repLen % 2 == 1 ? array.get(reps, int((repLen - 1) / 2)) : (array.get(reps, int(repLen / 2) - 1) + array.get(reps, int(repLen / 2))) / 2.0
+    engine.w03Store.candidateWinnerRefRepLength := repLen
+    [ok, ok ? refPrice : float(na)]
+
+candMaterializeWinnerRaw(ZoneEngine engine, ZoneCfg cfg, float mintick, int side, int stage, int leftIndex, int rightIndex, int effectiveBottomTick, int effectiveTopTick, int cCount, int hCount, int density, bool baseStrong, int createdTime, int minRootId, int fvgMode, int fvgRootSlot, int categoryMask, int highMask) =>
+    // ---- the unique hidden completion ----
+    [cOk, completionCount, psychLevelTick, fvgRootSlot2] = candCompletionCountRaw(engine, cfg, mintick, side, stage, leftIndex, rightIndex, effectiveBottomTick, effectiveTopTick, cCount, hCount, density, baseStrong, createdTime, minRootId, fvgMode, fvgRootSlot, categoryMask, highMask)
+    bool ok = cOk and completionCount == 1
+    // the Psych bit and the completion agree (na = no Psych)
+    if ok
+        bool psychBit   = categoryMask % (2 * CAT_MASK_PSYCH) >= CAT_MASK_PSYCH
+        bool psychFound = not na(psychLevelTick)
+        ok := psychBit == psychFound
+    // FVG slots agree with the mode (a second FVG only on OVERLAP)
+    if ok
+        ok := fvgMode == CAND_FVG_RANGE_NONE ? (fvgRootSlot == SLOT_INVALID and fvgRootSlot2 == SLOT_INVALID) : fvgMode == CAND_FVG_RANGE_OVERLAP ? (fvgRootSlot != SLOT_INVALID and fvgRootSlot2 != SLOT_INVALID) : (fvgRootSlot != SLOT_INVALID and fvgRootSlot2 == SLOT_INVALID)
+    // ---- storage shape: every record array has one physical size ----
+    int recordIndex = engine.w03Store.candidateWinnerLogicalCount
+    int rootStart   = engine.w03Store.candidateWinnerRootIdLength
+    int recordSize  = array.size(engine.w03Store.candidateWinnerSides)
+    array<int> ids  = engine.w03Store.candidateWinnerRootIds
+    if ok
+        ok := array.size(engine.w03Store.candidateWinnerStages) == recordSize and array.size(engine.w03Store.candidateWinnerEffectiveBottomTicks) == recordSize and array.size(engine.w03Store.candidateWinnerEffectiveTopTicks) == recordSize and array.size(engine.w03Store.candidateWinnerCCounts) == recordSize and array.size(engine.w03Store.candidateWinnerHCounts) == recordSize and array.size(engine.w03Store.candidateWinnerDensities) == recordSize and array.size(engine.w03Store.candidateWinnerBaseStrongFlags) == recordSize and array.size(engine.w03Store.candidateWinnerCategoryMasks) == recordSize and array.size(engine.w03Store.candidateWinnerHighMasks) == recordSize and array.size(engine.w03Store.candidateWinnerCreatedTimes) == recordSize and array.size(engine.w03Store.candidateWinnerMinRootIds) == recordSize and array.size(engine.w03Store.candidateWinnerFvgModes) == recordSize and array.size(engine.w03Store.candidateWinnerPsychLevelTicks) == recordSize and array.size(engine.w03Store.candidateWinnerReferencePrices) == recordSize and array.size(engine.w03Store.candidateWinnerRootIdOffsets) == recordSize and array.size(engine.w03Store.candidateWinnerRootIdLengths) == recordSize
+    if ok
+        ok := recordIndex >= 0 and recordIndex <= recordSize and rootStart >= 0 and rootStart <= array.size(ids)
+    // ---- real Roots into the segment past the logical length ----
+    int  rootCount  = 0
+    int  maxCreated = int(na)
+    int  minId      = ID_NONE
+    bool isSupport  = side == SIDE_SUPPORT
+    array<int> scratch = isSupport ? engine.candidateScratchSupportNewRootSlots : engine.candidateScratchResistanceNewRootSlots
+    int  scratchLength = isSupport ? engine.candidateScratchSupportNewLength : engine.candidateScratchResistanceNewLength
+    bool noPoint = leftIndex == SLOT_INVALID and rightIndex == SLOT_INVALID
+    if ok and not noPoint
+        ok := leftIndex >= 0 and rightIndex >= leftIndex and rightIndex < scratchLength and rightIndex < array.size(scratch)
+    // member m : Point window positions first, then the primary FVG, then the second
+    int nPoint  = ok and not noPoint ? rightIndex - leftIndex + 1 : 0
+    int nMember = nPoint + 2
+    int m = 0
+    while ok and m < nMember
+        bool isPoint = m < nPoint
+        int  slot    = fvgRootSlot2
+        if isPoint
+            slot := array.get(scratch, leftIndex + m)
+        else if m == nPoint
+            slot := fvgRootSlot
+        if slot != SLOT_INVALID or isPoint
+            ok := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootCategories) and slot < array.size(engine.rootConfirmedTimes)
+            int id = ID_NONE
+            if ok
+                int category = array.get(engine.rootCategories, slot)
+                id := array.get(engine.rootIds, slot)
+                ok := array.get(engine.rootSlotLiveFlags, slot) and not na(id) and id != ID_NONE and not na(array.get(engine.rootConfirmedTimes, slot)) and (isPoint ? (category == CAT_MA or category == CAT_SWING or category == CAT_ACCUM or category == CAT_TIME_HL) : category == CAT_FVG)
+            // a repeated real Root ID is an identity failure, never de-duplicated
+            int d = 0
+            while ok and d < rootCount
+                ok := array.get(ids, rootStart + d) != id
+                d += 1
+            if ok
+                int at = rootStart + rootCount
+                if at == array.size(ids)
+                    array.push(ids, id)
+                else
+                    array.set(ids, at, id)
+                rootCount += 1
+                int conf = array.get(engine.rootConfirmedTimes, slot)
+                maxCreated := na(maxCreated) ? conf : math.max(maxCreated, conf)
+                minId      := minId == ID_NONE ? id : math.min(minId, id)
+        m += 1
+    // >= 1 real Root; createdTime / minRootId rebuilt from the Roots (Psych excluded)
+    if ok
+        ok := rootCount >= 1 and maxCreated == createdTime and minId == minRootId
+    // ---- the segment rootId ASC (local insertion, array.get / array.set only) ----
+    if ok
+        int x = 1
+        while x < rootCount
+            int  v      = array.get(ids, rootStart + x)
+            int  pos    = x
+            bool moving = true
+            while moving and pos > 0
+                int prev = array.get(ids, rootStart + pos - 1)
+                if v < prev
+                    array.set(ids, rootStart + pos, prev)
+                    pos -= 1
+                else
+                    moving := false
+            array.set(ids, rootStart + pos, v)
+            x += 1
+    // ---- ReferencePrice on the ordered segment ----
+    float referencePrice = na
+    if ok
+        [pOk, pPrice] = candReferencePriceRaw(engine, mintick, side, fvgMode, effectiveBottomTick, effectiveTopTick, psychLevelTick, rootStart, rootCount)
+        ok             := pOk
+        referencePrice := pPrice
+    // ---- commit: the record, then the logical length and count ----
+    if ok
+        bool grow = recordIndex == recordSize
+        if grow
+            array.push(engine.w03Store.candidateWinnerSides,                side)
+            array.push(engine.w03Store.candidateWinnerStages,               stage)
+            array.push(engine.w03Store.candidateWinnerEffectiveBottomTicks, effectiveBottomTick)
+            array.push(engine.w03Store.candidateWinnerEffectiveTopTicks,    effectiveTopTick)
+            array.push(engine.w03Store.candidateWinnerCCounts,              cCount)
+            array.push(engine.w03Store.candidateWinnerHCounts,              hCount)
+            array.push(engine.w03Store.candidateWinnerDensities,            density)
+            array.push(engine.w03Store.candidateWinnerBaseStrongFlags,      baseStrong)
+            array.push(engine.w03Store.candidateWinnerCategoryMasks,        categoryMask)
+            array.push(engine.w03Store.candidateWinnerHighMasks,            highMask)
+            array.push(engine.w03Store.candidateWinnerCreatedTimes,         createdTime)
+            array.push(engine.w03Store.candidateWinnerMinRootIds,           minRootId)
+            array.push(engine.w03Store.candidateWinnerFvgModes,             fvgMode)
+            array.push(engine.w03Store.candidateWinnerPsychLevelTicks,      psychLevelTick)
+            array.push(engine.w03Store.candidateWinnerReferencePrices,      referencePrice)
+            array.push(engine.w03Store.candidateWinnerRootIdOffsets,        rootStart)
+            array.push(engine.w03Store.candidateWinnerRootIdLengths,        rootCount)
+        else
+            array.set(engine.w03Store.candidateWinnerSides,                recordIndex, side)
+            array.set(engine.w03Store.candidateWinnerStages,               recordIndex, stage)
+            array.set(engine.w03Store.candidateWinnerEffectiveBottomTicks, recordIndex, effectiveBottomTick)
+            array.set(engine.w03Store.candidateWinnerEffectiveTopTicks,    recordIndex, effectiveTopTick)
+            array.set(engine.w03Store.candidateWinnerCCounts,              recordIndex, cCount)
+            array.set(engine.w03Store.candidateWinnerHCounts,              recordIndex, hCount)
+            array.set(engine.w03Store.candidateWinnerDensities,            recordIndex, density)
+            array.set(engine.w03Store.candidateWinnerBaseStrongFlags,      recordIndex, baseStrong)
+            array.set(engine.w03Store.candidateWinnerCategoryMasks,        recordIndex, categoryMask)
+            array.set(engine.w03Store.candidateWinnerHighMasks,            recordIndex, highMask)
+            array.set(engine.w03Store.candidateWinnerCreatedTimes,         recordIndex, createdTime)
+            array.set(engine.w03Store.candidateWinnerMinRootIds,           recordIndex, minRootId)
+            array.set(engine.w03Store.candidateWinnerFvgModes,             recordIndex, fvgMode)
+            array.set(engine.w03Store.candidateWinnerPsychLevelTicks,      recordIndex, psychLevelTick)
+            array.set(engine.w03Store.candidateWinnerReferencePrices,      recordIndex, referencePrice)
+            array.set(engine.w03Store.candidateWinnerRootIdOffsets,        recordIndex, rootStart)
+            array.set(engine.w03Store.candidateWinnerRootIdLengths,        recordIndex, rootCount)
+        engine.w03Store.candidateWinnerRootIdLength := rootStart + rootCount
+        engine.w03Store.candidateWinnerLogicalCount := recordIndex + 1
     ok
 
 // ============================================================
