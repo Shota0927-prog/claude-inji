@@ -9501,6 +9501,149 @@ candWindowExitRaw(ZoneEngine engine, int side, int scratchIndex, int windowLeft,
     [ok, maCount, swingCount, accumCount, timeHlCount, swingHighRootCount, accumHighRootCount, timeHlHighLabelCount, ema2000WantedCount, ema3000WantedCount, accumConflictCount, categoryMask, highMask, minRootId, maxConfirmedTime, minIdDequeHead, minIdDequeTail, maxTimeDequeHead, maxTimeDequeTail]
 
 // ============================================================
+// W05 Batch 05 : Virtual Psych level bounds + final Candidate quality
+// Source: I12.2, I18, A10.1, A10.3, 5.1, 6.1, 6.2, HANDOFF_W04 section 7
+//         (refBuildPsychLevels, refPointEffectiveRange, refDensity, refCategoryHigh,
+//          refQualityAggregate, refBaseStrong)
+//
+// Internal only. Business call sites = 0 in this Batch. Scalar arithmetic only.
+// Virtual Psych: a level L is the 50-dollar price L * 50 (L even = 100-dollar Major,
+// odd = Standard), tick = round(L * 50 / mintick). It is never a Root: no rootId, no
+// time, never used, never in minRootId / createdTime, never alone. One Candidate
+// variant carries at most one level; the no-Psych variant always stays, and every
+// level of the bounds is its own variant (the enumerator walks lo .. hi and keeps one
+// entry per tick, Major first, as refBuildPsychLevels does).
+// A Psych variant's range is [min(base bottom, level tick), max(base top, level tick)];
+// its caller passes categoryMask + CAT_MASK_PSYCH to candQualityFinishRaw. Psych adds
+// at most 1 to C and never to H.
+// Known, intended difference from refBuildPsychLevels: cfg.usePsych == false gives no
+// level (D05 Category ON / OFF); the Reference takes no Cfg and is compared with
+// usePsych = true only.
+// ============================================================
+
+// Level bounds of the single Virtual Psych levels that may join a non-Psych base
+// [bottomTick, topTick] with the new width <= limitTick (denseTick on Stage A, the
+// Reference limit, normally mTick, on Stage B / C). Returns [loLevel, hiLevel,
+// hasLevels]; every level in lo .. hi passes the tick test and none outside does.
+// The start range is the Reference's floor(lowerAllowedPrice / 50) - 1 ..
+// ceil(upperAllowedPrice / 50) + 1, so no true level is lost at a float boundary;
+// each end then moves inward, tick-tested, until it is accepted:
+//   lowerAllowedTick <= pTick <= upperAllowedTick and
+//   max(topTick, pTick) - min(bottomTick, pTick) <= limitTick
+// pTick is monotone in the level, so the accepted levels form one run.
+candPsychLevelBoundsRaw(ZoneCfg cfg, int bottomTick, int topTick, int limitTick, float mintick) =>
+    int  loLevel   = 0
+    int  hiLevel   = -1
+    bool hasLevels = false
+    bool ok = cfg.usePsych and not na(bottomTick) and not na(topTick) and bottomTick <= topTick and limitTick >= 0 and not na(mintick) and mintick > 0
+    if ok
+        ok := topTick - bottomTick <= limitTick
+    if ok
+        int   lowerAllowedTick  = topTick - limitTick
+        int   upperAllowedTick  = bottomTick + limitTick
+        float lowerAllowedPrice = lowerAllowedTick * mintick
+        float upperAllowedPrice = upperAllowedTick * mintick
+        loLevel := int(math.floor(lowerAllowedPrice / 50.0)) - 1
+        hiLevel := int(math.ceil(upperAllowedPrice / 50.0)) + 1
+        // lower end: advance until accepted (loLevel always increases)
+        bool loFound = false
+        while not loFound and loLevel <= hiLevel
+            int loTick  = int(math.round((loLevel * 50.0) / mintick))
+            int loWidth = math.max(topTick, loTick) - math.min(bottomTick, loTick)
+            if lowerAllowedTick <= loTick and loTick <= upperAllowedTick and loWidth <= limitTick
+                loFound := true
+            else
+                loLevel += 1
+        // upper end: retreat until accepted (hiLevel always decreases)
+        bool hiFound = false
+        while loFound and not hiFound and hiLevel >= loLevel
+            int hiTick  = int(math.round((hiLevel * 50.0) / mintick))
+            int hiWidth = math.max(topTick, hiTick) - math.min(bottomTick, hiTick)
+            if lowerAllowedTick <= hiTick and hiTick <= upperAllowedTick and hiWidth <= limitTick
+                hiFound := true
+            else
+                hiLevel -= 1
+        hasLevels := loFound and hiFound and loLevel <= hiLevel
+    [loLevel, hiLevel, hasLevels]
+
+// Final quality of one Candidate variant from its final EffectiveRange and masks.
+// categoryMask / highMask come from the window state (B04), plus CAT_MASK_PSYCH for a
+// Psych variant and the FVG bits for an FVG variant (B06). Returns
+// [ok, outCategoryMask, outHighMask, cCount, hCount, density, baseStrong].
+//   Density : BroadContext -> DEN_BROAD_CONTEXT; else width <= denseTick -> DEN_HIGH,
+//             width <= mTick -> DEN_NORMAL, wider -> ok = false (equal goes narrow)
+//   MA High : maCount >= 2, both EMA wanted counts > 0, density DEN_HIGH, Stage not
+//             C, and |EMA2000 tick - EMA3000 tick| <= denseTick on the persistent EMA
+//             refs (live, owned, CAT_MA, right subtype, tick set). The wanted counts
+//             of the window prove both EMAs take part; the refs only give the ticks.
+//   C / H   : popcount of the 6-bit masks. Psych never High.
+//   BaseStrong : C == 2 and DEN_HIGH and H >= 1, or C >= 3 and DEN_HIGH; never for
+//             BroadContext or Normal.
+// Any invalid input returns ok = false with nothing derived; nothing is corrected.
+candQualityFinishRaw(ZoneEngine engine, int side, int stage, int effectiveBottomTick, int effectiveTopTick, int denseTick, int mTick, int maCount, int ema2000WantedCount, int ema3000WantedCount, int categoryMask, int highMask, bool isBroadContext) =>
+    int  outCategoryMask = categoryMask
+    int  outHighMask     = highMask
+    int  cCount          = 0
+    int  hCount          = 0
+    int  density         = -1
+    bool baseStrong      = false
+    bool ok = (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and (stage == CAND_STAGE_A or stage == CAND_STAGE_B or stage == CAND_STAGE_C or stage == CAND_STAGE_BROAD_CONTEXT) and not na(effectiveBottomTick) and not na(effectiveTopTick) and effectiveBottomTick <= effectiveTopTick and denseTick >= 0 and mTick >= 0 and denseTick <= mTick and categoryMask >= 0 and categoryMask <= CAT_MASK_ALL and highMask >= 0 and highMask <= CAT_MASK_ALL and maCount >= 0 and ema2000WantedCount >= 0 and ema3000WantedCount >= 0
+    // highMask must be inside categoryMask, and Psych is never High
+    if ok
+        ok := highMask % (2 * CAT_MASK_PSYCH) < CAT_MASK_PSYCH
+        int bit = 1
+        while ok and bit <= CAT_MASK_PSYCH
+            if highMask % (2 * bit) >= bit and categoryMask % (2 * bit) < bit
+                ok := false
+            bit := bit * 2
+    // Density on the final effective tick width
+    if ok
+        int widthTick = effectiveTopTick - effectiveBottomTick
+        if isBroadContext
+            density := DEN_BROAD_CONTEXT
+        else if widthTick <= denseTick
+            density := DEN_HIGH
+        else if widthTick <= mTick
+            density := DEN_NORMAL
+        else
+            ok := false
+    // MA High (W04 frozen: not on Stage C)
+    if ok and density == DEN_HIGH and stage != CAND_STAGE_C and maCount >= 2 and ema2000WantedCount > 0 and ema3000WantedCount > 0 and categoryMask % (2 * CAT_MASK_MA) >= CAT_MASK_MA and outHighMask % (2 * CAT_MASK_MA) < CAT_MASK_MA
+        int slot2000 = engine.w03Store.ema2000RootSlot
+        int id2000   = engine.w03Store.ema2000ExpectedRootId
+        int slot3000 = engine.w03Store.ema3000RootSlot
+        int id3000   = engine.w03Store.ema3000ExpectedRootId
+        bool refsOk = slot2000 >= 0 and slot2000 < array.size(engine.rootIds) and slot2000 < array.size(engine.rootSlotLiveFlags) and slot2000 < array.size(engine.rootCategories) and slot2000 < array.size(engine.rootSubtypes) and slot2000 < array.size(engine.rootPointTicks) and slot3000 >= 0 and slot3000 < array.size(engine.rootIds) and slot3000 < array.size(engine.rootSlotLiveFlags) and slot3000 < array.size(engine.rootCategories) and slot3000 < array.size(engine.rootSubtypes) and slot3000 < array.size(engine.rootPointTicks)
+        if refsOk
+            refsOk := array.get(engine.rootSlotLiveFlags, slot2000) and id2000 != ID_NONE and array.get(engine.rootIds, slot2000) == id2000 and array.get(engine.rootCategories, slot2000) == CAT_MA and array.get(engine.rootSubtypes, slot2000) == SUB_MA_EMA2000 and not na(array.get(engine.rootPointTicks, slot2000)) and array.get(engine.rootSlotLiveFlags, slot3000) and id3000 != ID_NONE and array.get(engine.rootIds, slot3000) == id3000 and array.get(engine.rootCategories, slot3000) == CAT_MA and array.get(engine.rootSubtypes, slot3000) == SUB_MA_EMA3000 and not na(array.get(engine.rootPointTicks, slot3000))
+        if refsOk
+            if math.abs(array.get(engine.rootPointTicks, slot2000) - array.get(engine.rootPointTicks, slot3000)) <= denseTick
+                outHighMask += CAT_MASK_MA
+    // C / H : 6-bit popcount
+    if ok
+        int bit = 1
+        while bit <= CAT_MASK_PSYCH
+            if outCategoryMask % (2 * bit) >= bit
+                cCount += 1
+            if outHighMask % (2 * bit) >= bit
+                hCount += 1
+            bit := bit * 2
+    // BaseStrong
+    if ok and not isBroadContext and density == DEN_HIGH
+        if cCount == 2
+            baseStrong := hCount >= 1
+        else if cCount >= 3
+            baseStrong := true
+    if not ok
+        outCategoryMask := categoryMask
+        outHighMask     := highMask
+        cCount          := 0
+        hCount          := 0
+        density         := -1
+        baseStrong      := false
+    [ok, outCategoryMask, outHighMask, cCount, hCount, density, baseStrong]
+
+// ============================================================
 // W02 Batch 14 : Side Phase set index raw helpers (I11-9)
 //
 // Internal only. They maintain the Batch 13 membership of one Side in the Phase set
