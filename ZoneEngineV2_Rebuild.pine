@@ -8660,6 +8660,169 @@ w03StageETimeHlRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed, int nextTimeHlSess
 
 
 // ============================================================
+// W03 Batch 24 : E-stage FVG formation and Fresh end
+// Source: I7 (Source adoption), I10, I11-6, I14, A7.5, D12
+//
+// Internal only.
+//   Formation : 1H, 4H, then D; each TF Source bar is adopted once through
+//               sourceAdoptableRaw with the FVG-formation lastConsumed local and is
+//               consumed whether or not it forms an FVG. Bull then Bear: a usable new
+//               FVG (ticks bottom <= top) is identified by Category, TF, Direction and
+//               originTime (the 3rd Source bar open) through originKeyComputeRaw /
+//               originLookupUniqueRaw only; no match -> NEW_ROOT (E2, Fresh true,
+//               Broad = width ticks > round(clusterMaxWidth / mintick)); a committed or
+//               pending match -> nothing (NativeRange, Fresh, Broad never touched).
+//   Fresh end : after all formation rows, a Fresh FVG ends its Fresh on a Base bar
+//               closing strictly after its confirm time whose tick range touches its
+//               NativeRange (inclusive, both directions). Committed Roots are read
+//               from the three Fresh sets only; their row carries the virtual state
+//               after this bar's E1 FVG_INVALIDATE rows. A NEW_ROOT FVG of this bar
+//               ends through canonical Path B: a FRESH_END row with SLOT_INVALID /
+//               ID_NONE copying the NEW row identity (resolved in Stage F).
+// The physical FVG subtype is the sentinel FVG_NONE (never identity). Only journal
+// rows and the violation flag are written; the returned lastConsumed locals go to
+// F6. Business call sites = 0 in this Batch.
+// ============================================================
+
+// E-stage FVG. Returns [true, 1H / 4H / D FVG-formation lastConsumed].
+w03StageEFvgRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed, int nextLastConsumed1hFvgFormationCloseTime, int nextLastConsumed4hFvgFormationCloseTime, int nextLastConsumedDFvgFormationCloseTime) =>
+    int  outLastConsumed1hFvgFormationCloseTime = nextLastConsumed1hFvgFormationCloseTime
+    int  outLastConsumed4hFvgFormationCloseTime = nextLastConsumed4hFvgFormationCloseTime
+    int  outLastConsumedDFvgFormationCloseTime  = nextLastConsumedDFvgFormationCloseTime
+    bool stopped = not cfg.useFvg
+    bool mintickOk = not na(feed.mintick) and feed.mintick > 0
+    // ---- Formation : 1H Bull, 1H Bear, 4H Bull, 4H Bear, D Bull, D Bear ----
+    bool adoptedTf = false
+    int  e = 0
+    while not stopped and e < 6
+        int  t         = int(math.floor(e / 2))
+        bool isBull    = e % 2 == 0
+        int  tfCode    = t == 0 ? TF_1H : t == 1 ? TF_4H : TF_D
+        int  srcOpen   = t == 0 ? feed.src1hOpenTime  : t == 1 ? feed.src4hOpenTime  : feed.srcDOpenTime
+        int  srcClose  = t == 0 ? feed.src1hCloseTime : t == 1 ? feed.src4hCloseTime : feed.srcDCloseTime
+        if isBull
+            // the TF Source bar is adopted (and consumed) once, before its Bull event
+            int lastClose = t == 0 ? outLastConsumed1hFvgFormationCloseTime : t == 1 ? outLastConsumed4hFvgFormationCloseTime : outLastConsumedDFvgFormationCloseTime
+            adoptedTf := sourceAdoptableRaw(srcOpen, srcClose, lastClose, feed.baseCloseTime)
+            if adoptedTf
+                if t == 0
+                    outLastConsumed1hFvgFormationCloseTime := srcClose
+                else if t == 1
+                    outLastConsumed4hFvgFormationCloseTime := srcClose
+                else
+                    outLastConsumedDFvgFormationCloseTime := srcClose
+        if adoptedTf
+            bool  isNew      = e == 0 ? feed.fvg1hBullNew    : e == 1 ? feed.fvg1hBearNew    : e == 2 ? feed.fvg4hBullNew    : e == 3 ? feed.fvg4hBearNew    : e == 4 ? feed.fvgDBullNew    : feed.fvgDBearNew
+            float bottom     = e == 0 ? feed.fvg1hBullBottom : e == 1 ? feed.fvg1hBearBottom : e == 2 ? feed.fvg4hBullBottom : e == 3 ? feed.fvg4hBearBottom : e == 4 ? feed.fvgDBullBottom : feed.fvgDBearBottom
+            float top        = e == 0 ? feed.fvg1hBullTop    : e == 1 ? feed.fvg1hBearTop    : e == 2 ? feed.fvg4hBullTop    : e == 3 ? feed.fvg4hBearTop    : e == 4 ? feed.fvgDBullTop    : feed.fvgDBearTop
+            int   direction  = isBull ? FVG_BULLISH : FVG_BEARISH
+            bool  usable     = isNew and not na(bottom) and not na(top) and not na(srcOpen) and not na(srcClose) and mintickOk
+            int   bottomTick = int(na)
+            int   topTick    = int(na)
+            if usable
+                bottomTick := int(math.round(bottom / feed.mintick))
+                topTick    := int(math.round(top    / feed.mintick))
+                usable     := bottomTick <= topTick
+            if usable
+                int originKey = originKeyComputeRaw(CAT_FVG, FVG_NONE, tfCode, int(na), srcOpen, direction)
+                [rootSlot, pendingRow] = originLookupUniqueRaw(engine, originKey, CAT_FVG, FVG_NONE, tfCode, int(na), srcOpen, srcClose, direction, feed.mintick)
+                if engine.w03Store.journalInvariantViolation
+                    // a broken identity: emit nothing more, F0 stops the bar
+                    stopped := true
+                else if rootSlot == SLOT_INVALID and pendingRow == SLOT_INVALID
+                    // a new FVG: always Fresh at creation; Broad by ticks, strictly wider than M
+                    int  mTick   = int(math.round(cfg.clusterMaxWidth / feed.mintick))
+                    bool isBroad = topTick - bottomTick > mTick
+                    int  newRow  = journalAppendRaw(engine, JOP_NEW_ROOT, JGROUP_E2, SLOT_INVALID, ID_NONE, CAT_FVG, FVG_NONE, tfCode, originKey, srcOpen, srcClose, srcClose, float(na), bottom, top, ROOT_ACTIVE, ROOT_ACTIVE, true, isBroad, direction, 0, 0, ID_NONE, int(na))
+                // a committed or pending match: a duplicate Source event, nothing
+        e += 1
+    // ---- Fresh end (after every formation row) ----
+    bool freshGate = not na(feed.baseCloseTime) and not na(feed.baseHigh) and not na(feed.baseLow) and mintickOk
+    if not stopped and freshGate
+        int baseLowTick  = int(math.round(feed.baseLow  / feed.mintick))
+        int baseHighTick = int(math.round(feed.baseHigh / feed.mintick))
+        // committed Fresh FVG Roots: the three Fresh sets only, 1H -> 4H -> D, index order
+        int t = 0
+        while not stopped and t < 3
+            array<int> freshSet = t == 0 ? engine.freshFvg1hRootSlots : t == 1 ? engine.freshFvg4hRootSlots : engine.freshFvgDRootSlots
+            int scanTf = t == 0 ? TF_1H : t == 1 ? TF_4H : TF_D
+            int i = 0
+            while not stopped and i < array.size(freshSet)
+                int  slot = array.get(freshSet, i)
+                bool valid = slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootCategories) and slot < array.size(engine.rootSubtypes) and slot < array.size(engine.rootTfCodes) and slot < array.size(engine.rootFvgFreshFlags) and slot < array.size(engine.rootDirections) and slot < array.size(engine.rootNativeBottoms) and slot < array.size(engine.rootNativeTops) and slot < array.size(engine.rootNativeBottomTicks) and slot < array.size(engine.rootNativeTopTicks) and slot < array.size(engine.rootConfirmedTimes) and slot < array.size(engine.rootOriginTimes) and slot < array.size(engine.rootOriginEndTimes) and slot < array.size(engine.rootOriginKeys) and slot < array.size(engine.rootStates) and slot < array.size(engine.rootIsBroadFvgFlags)
+                int  rootId = ID_NONE
+                if valid
+                    rootId := array.get(engine.rootIds, slot)
+                    int dir = array.get(engine.rootDirections, slot)
+                    int bTick = array.get(engine.rootNativeBottomTicks, slot)
+                    int tTick = array.get(engine.rootNativeTopTicks,    slot)
+                    valid := array.get(engine.rootSlotLiveFlags, slot) and rootId != ID_NONE and array.get(engine.rootCategories, slot) == CAT_FVG and array.get(engine.rootTfCodes, slot) == scanTf and array.get(engine.rootFvgFreshFlags, slot) and (dir == FVG_BULLISH or dir == FVG_BEARISH) and not na(bTick) and not na(tTick) and bTick <= tTick and not na(array.get(engine.rootConfirmedTimes, slot)) and not na(array.get(engine.rootOriginTimes, slot)) and array.get(engine.rootOriginKeys, slot) != ID_NONE
+                if not valid
+                    engine.w03Store.journalInvariantViolation := true
+                    stopped := true
+                else
+                    // the state this bar's E1 rows leave (at most one FVG_INVALIDATE per Root);
+                    // and whether a FRESH_END row for this Root already exists
+                    int  virtualState = array.get(engine.rootStates, slot)
+                    int  invalidates  = 0
+                    bool freshEnded   = false
+                    int  row = 0
+                    while row < engine.w03Store.journalCount
+                        if array.get(engine.w03Store.journalTargetRootSlots, row) == slot and array.get(engine.w03Store.journalExpectedRootIds, row) == rootId
+                            int op = array.get(engine.w03Store.journalOps, row)
+                            if op == JOP_FVG_INVALIDATE and array.get(engine.w03Store.journalGroups, row) == JGROUP_E1
+                                invalidates += 1
+                                virtualState := ROOT_INVALIDATED
+                            else if op == JOP_FVG_FRESH_END
+                                freshEnded := true
+                        row += 1
+                    if invalidates > 1 or not (virtualState == ROOT_ACTIVE or virtualState == ROOT_INVALIDATED)
+                        engine.w03Store.journalInvariantViolation := true
+                        stopped := true
+                    else if not freshEnded
+                        bool touched = baseLowTick <= array.get(engine.rootNativeTopTicks, slot) and baseHighTick >= array.get(engine.rootNativeBottomTicks, slot)
+                        if feed.baseCloseTime > array.get(engine.rootConfirmedTimes, slot) and touched
+                            int freshRow = journalAppendRaw(engine, JOP_FVG_FRESH_END, JGROUP_E3, slot, rootId, CAT_FVG, array.get(engine.rootSubtypes, slot), array.get(engine.rootTfCodes, slot), array.get(engine.rootOriginKeys, slot), array.get(engine.rootOriginTimes, slot), array.get(engine.rootOriginEndTimes, slot), array.get(engine.rootConfirmedTimes, slot), float(na), array.get(engine.rootNativeBottoms, slot), array.get(engine.rootNativeTops, slot), virtualState, virtualState, false, array.get(engine.rootIsBroadFvgFlags, slot), array.get(engine.rootDirections, slot), 0, 0, ID_NONE, int(na))
+                i += 1
+            t += 1
+        // NEW_ROOT FVG rows of this bar: canonical Path B, append order
+        int scanEnd = engine.w03Store.journalCount
+        int n = 0
+        while not stopped and n < scanEnd
+            if array.get(engine.w03Store.journalOps, n) == JOP_NEW_ROOT and array.get(engine.w03Store.journalGroups, n) == JGROUP_E2 and array.get(engine.w03Store.journalCategories, n) == CAT_FVG
+                int   nTf        = array.get(engine.w03Store.journalTfCodes,        n)
+                int   nDir       = array.get(engine.w03Store.journalDirections,     n)
+                int   nOrigin    = array.get(engine.w03Store.journalOriginTimes,    n)
+                int   nConfirmed = array.get(engine.w03Store.journalConfirmedTimes, n)
+                float nBottom    = array.get(engine.w03Store.journalNativeBottoms,  n)
+                float nTop       = array.get(engine.w03Store.journalNativeTops,     n)
+                bool  valid = (nTf == TF_1H or nTf == TF_4H or nTf == TF_D) and (nDir == FVG_BULLISH or nDir == FVG_BEARISH) and not na(nOrigin) and not na(nConfirmed) and not na(nBottom) and not na(nTop) and array.get(engine.w03Store.journalOriginKeys, n) != ID_NONE and array.get(engine.w03Store.journalFvgFreshFlags, n) and array.get(engine.w03Store.journalTargetRootSlots, n) == SLOT_INVALID and array.get(engine.w03Store.journalExpectedRootIds, n) == ID_NONE
+                // exactly one NEW row per FVG identity, and no Path B row for it yet
+                int  sameNew    = 0
+                bool pathBFound = false
+                int  j = 0
+                while valid and j < engine.w03Store.journalCount
+                    int jOp = array.get(engine.w03Store.journalOps, j)
+                    if array.get(engine.w03Store.journalCategories, j) == CAT_FVG and array.get(engine.w03Store.journalTfCodes, j) == nTf and array.get(engine.w03Store.journalDirections, j) == nDir and array.get(engine.w03Store.journalOriginTimes, j) == nOrigin
+                        if jOp == JOP_NEW_ROOT
+                            sameNew += 1
+                        else if jOp == JOP_FVG_FRESH_END and array.get(engine.w03Store.journalTargetRootSlots, j) == SLOT_INVALID and array.get(engine.w03Store.journalExpectedRootIds, j) == ID_NONE
+                            pathBFound := true
+                    j += 1
+                if not valid or sameNew != 1
+                    engine.w03Store.journalInvariantViolation := true
+                    stopped := true
+                else if not pathBFound
+                    int  nBottomTick = int(math.round(nBottom / feed.mintick))
+                    int  nTopTick    = int(math.round(nTop    / feed.mintick))
+                    bool touched     = baseLowTick <= nTopTick and baseHighTick >= nBottomTick
+                    if feed.baseCloseTime > nConfirmed and touched
+                        // SLOT_INVALID / ID_NONE: the NEW row's identity is resolved in Stage F
+                        int pathBRow = journalAppendRaw(engine, JOP_FVG_FRESH_END, JGROUP_E3, SLOT_INVALID, ID_NONE, CAT_FVG, array.get(engine.w03Store.journalSubtypes, n), nTf, array.get(engine.w03Store.journalOriginKeys, n), nOrigin, array.get(engine.w03Store.journalOriginEndTimes, n), nConfirmed, float(na), nBottom, nTop, ROOT_ACTIVE, ROOT_ACTIVE, false, array.get(engine.w03Store.journalIsBroadFlags, n), nDir, 0, 0, ID_NONE, int(na))
+            n += 1
+    [true, outLastConsumed1hFvgFormationCloseTime, outLastConsumed4hFvgFormationCloseTime, outLastConsumedDFvgFormationCloseTime]
+
+// ============================================================
 // W02 Batch 14 : Side Phase set index raw helpers (I11-9)
 //
 // Internal only. They maintain the Batch 13 membership of one Side in the Phase set
