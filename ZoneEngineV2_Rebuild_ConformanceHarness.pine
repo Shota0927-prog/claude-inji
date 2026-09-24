@@ -33,6 +33,19 @@ const int REF_FVG_BEARISH         = 2
 const int REF_DEN_HIGH            = 0
 const int REF_DEN_NORMAL          = 1
 const int REF_DEN_BROAD_CONTEXT   = 2
+const int REF_CAT_MA              = 0
+const int REF_CAT_SWING           = 1
+const int REF_CAT_TIMEHL          = 3
+const int REF_SUB_MA_EMA2000      = 1
+const int REF_SUB_MA_EMA3000      = 2
+const int REF_SWING_TF_MASK_5M    = 1
+const int REF_SWING_TF_MASK_15M   = 2
+const int REF_SWING_TF_MASK_1H    = 4
+const int REF_TIMEHL_LABEL_PREV_DAY  = 8
+const int REF_TIMEHL_LABEL_CUR_WEEK  = 16
+const int REF_TIMEHL_LABEL_PREV_WEEK = 32
+const int REF_TF_4H               = 240
+const int REF_TF_D                = 1440
 
 // ---- RefRoot : one Fixture Root record (W04 D25 input contract) ----
 // Filled by the Fixture only; never read from the Production Public API.
@@ -304,5 +317,148 @@ refBaseStrong(int cCount, int hCount, int density) =>
         else if cCount >= 3
             strong := true
     strong
+
+
+// ============================================================
+// W04 B05 : non-FVG Category High + C / H masks
+// Category bits match Production: MA 1, Swing 2, Accum 4, TimeHL 8, FVG 16, Psych 32.
+// ============================================================
+
+// True when `category` is High inside the candidate, judged only on the Roots of
+// rootIndexes that have that category and are refEligible for `side`. At most one
+// High per Category. Invalid index or side -> false.
+//   MA     : not Stage C, REF_DEN_HIGH, denseTick >= 0, and some EMA2000 x EMA3000 pair
+//            with abs(tick gap) <= denseTick and both slopes 1 (Support) / -1 (Resistance)
+//   Swing  : one Root with swingTfMask >= 4 (1H) or == 3 (5m + 15m); masks of
+//            different Roots are never combined
+//   Accum  : a 4H / D Root, or two Roots of different TF and different non-zero pairKey
+//   TimeHL : a Root whose labelMask (0..63) is >= 8 (PrevDay / CurWeek / PrevWeek), or
+//            two different TimeHL Roots in the candidate (different origins)
+//   Psych  : always false
+//   FVG    : false here; FVG High is judged in B06
+refCategoryHigh(array<RefRoot> roots, array<int> rootIndexes, int category, int side, int stage, int density, int denseTick) =>
+    int  n     = array.size(rootIndexes)
+    int  nRoot = array.size(roots)
+    bool ok    = side == REF_SIDE_SUPPORT or side == REF_SIDE_RESISTANCE
+    int  i = 0
+    while ok and i < n
+        int idx = array.get(rootIndexes, i)
+        if idx < 0 or idx >= nRoot
+            ok := false
+        i += 1
+    bool high = false
+    if ok and category == REF_CAT_MA
+        if stage != REF_STAGE_C and density == REF_DEN_HIGH and denseTick >= 0
+            int slopeWanted = side == REF_SIDE_SUPPORT ? 1 : -1
+            i := 0
+            while not high and i < n
+                RefRoot a = array.get(roots, array.get(rootIndexes, i))
+                if a.category == REF_CAT_MA and a.subtype == REF_SUB_MA_EMA2000 and refEligible(a, side) and not na(a.pointTick) and a.maSlopeDir == slopeWanted
+                    int j = 0
+                    while not high and j < n
+                        RefRoot b = array.get(roots, array.get(rootIndexes, j))
+                        if b.category == REF_CAT_MA and b.subtype == REF_SUB_MA_EMA3000 and refEligible(b, side) and not na(b.pointTick) and b.maSlopeDir == slopeWanted
+                            if math.abs(a.pointTick - b.pointTick) <= denseTick
+                                high := true
+                        j += 1
+                i += 1
+    else if ok and category == REF_CAT_SWING
+        i := 0
+        while not high and i < n
+            RefRoot r = array.get(roots, array.get(rootIndexes, i))
+            if r.category == REF_CAT_SWING and refEligible(r, side)
+                if r.swingTfMask >= REF_SWING_TF_MASK_1H or r.swingTfMask == REF_SWING_TF_MASK_5M + REF_SWING_TF_MASK_15M
+                    high := true
+            i += 1
+    else if ok and category == REF_CAT_ACCUM
+        i := 0
+        while not high and i < n
+            RefRoot a = array.get(roots, array.get(rootIndexes, i))
+            if a.category == REF_CAT_ACCUM and refEligible(a, side)
+                if a.tfCode == REF_TF_4H or a.tfCode == REF_TF_D
+                    high := true
+                else
+                    int j = i + 1
+                    while not high and j < n
+                        RefRoot b = array.get(roots, array.get(rootIndexes, j))
+                        if b.category == REF_CAT_ACCUM and refEligible(b, side)
+                            if a.tfCode != b.tfCode and a.pairKey != 0 and b.pairKey != 0 and a.pairKey != b.pairKey
+                                high := true
+                        j += 1
+            i += 1
+    else if ok and category == REF_CAT_TIMEHL
+        int firstIdx = -1
+        i := 0
+        while not high and i < n
+            int     idx = array.get(rootIndexes, i)
+            RefRoot r   = array.get(roots, idx)
+            if r.category == REF_CAT_TIMEHL and refEligible(r, side)
+                if r.labelMask >= REF_TIMEHL_LABEL_PREV_DAY and r.labelMask <= 63
+                    high := true
+                else if firstIdx == -1
+                    firstIdx := idx
+                else if idx != firstIdx
+                    // a second, different TimeHL Root: a different origin overlapping
+                    high := true
+            i += 1
+    high
+
+// C / H of one candidate, counted naively from its materialized Roots plus an
+// attached Virtual Psych (C only, never H). Returns
+// [valid, categoryMask, highMask, cCount, hCount]; invalid -> [false, 0, 0, 0, 0]
+// when rootIndexes is empty (no Psych-only candidate), an index is out of range or
+// repeated, a category is outside 0..4 (no RefRoot Psych), a Root is not refEligible,
+// a non-FVG pointTick is na, stage is not A / B / C, or density is not HIGH / NORMAL.
+// FVG enters categoryMask / C here; its High bit is added in B06. BaseStrong is
+// refBaseStrong's job, never re-implemented here.
+refQualityAggregate(array<RefRoot> roots, array<int> rootIndexes, bool psychPresent, int side, int stage, int density, int denseTick) =>
+    int  n     = array.size(rootIndexes)
+    int  nRoot = array.size(roots)
+    bool valid = n > 0 and (stage == REF_STAGE_A or stage == REF_STAGE_B or stage == REF_STAGE_C) and (density == REF_DEN_HIGH or density == REF_DEN_NORMAL)
+    bool hasMa     = false
+    bool hasSwing  = false
+    bool hasAccum  = false
+    bool hasTimeHl = false
+    bool hasFvg    = false
+    int  i = 0
+    while valid and i < n
+        int idx = array.get(rootIndexes, i)
+        if idx < 0 or idx >= nRoot
+            valid := false
+        else
+            int j = 0
+            while valid and j < i
+                if array.get(rootIndexes, j) == idx
+                    valid := false
+                j += 1
+        if valid
+            RefRoot r = array.get(roots, idx)
+            if not (r.category >= 0 and r.category <= 4)
+                valid := false
+            else if not refEligible(r, side)
+                valid := false
+            else if r.category != REF_CAT_FVG and na(r.pointTick)
+                valid := false
+            else
+                hasMa     := hasMa     or r.category == REF_CAT_MA
+                hasSwing  := hasSwing  or r.category == REF_CAT_SWING
+                hasAccum  := hasAccum  or r.category == REF_CAT_ACCUM
+                hasTimeHl := hasTimeHl or r.category == REF_CAT_TIMEHL
+                hasFvg    := hasFvg    or r.category == REF_CAT_FVG
+        i += 1
+    int categoryMask = 0
+    int highMask     = 0
+    int cCount       = 0
+    int hCount       = 0
+    if valid
+        categoryMask := (hasMa ? 1 : 0) + (hasSwing ? 2 : 0) + (hasAccum ? 4 : 0) + (hasTimeHl ? 8 : 0) + (hasFvg ? 16 : 0) + (psychPresent ? 32 : 0)
+        cCount       := (hasMa ? 1 : 0) + (hasSwing ? 1 : 0) + (hasAccum ? 1 : 0) + (hasTimeHl ? 1 : 0) + (hasFvg ? 1 : 0) + (psychPresent ? 1 : 0)
+        bool maHigh     = hasMa     and refCategoryHigh(roots, rootIndexes, REF_CAT_MA,     side, stage, density, denseTick)
+        bool swingHigh  = hasSwing  and refCategoryHigh(roots, rootIndexes, REF_CAT_SWING,  side, stage, density, denseTick)
+        bool accumHigh  = hasAccum  and refCategoryHigh(roots, rootIndexes, REF_CAT_ACCUM,  side, stage, density, denseTick)
+        bool timeHlHigh = hasTimeHl and refCategoryHigh(roots, rootIndexes, REF_CAT_TIMEHL, side, stage, density, denseTick)
+        highMask := (maHigh ? 1 : 0) + (swingHigh ? 2 : 0) + (accumHigh ? 4 : 0) + (timeHlHigh ? 8 : 0)
+        hCount   := (maHigh ? 1 : 0) + (swingHigh ? 1 : 0) + (accumHigh ? 1 : 0) + (timeHlHigh ? 1 : 0)
+    [valid, categoryMask, highMask, cCount, hCount]
 
 plot(na, title = "Compile anchor", display = display.none)
