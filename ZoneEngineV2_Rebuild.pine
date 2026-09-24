@@ -9931,6 +9931,369 @@ candCompareRaw(int aCCount, int aHCount, int aBottomTick, int aTopTick, int aCre
     result
 
 // ============================================================
+// W05 Batch 08 : exact hidden-completion reconstruction + the offer step
+// Source: I12.3, I12.4, I12.6, A10.2, A10.4, HANDOFF_W04 section 7
+//         (refSelectReferenceWinners identity / tie, refAppendStageAVariants,
+//          refEnumerateStageB, refEnumerateStageC)
+//
+// Internal only. Business call sites = 0 in this Batch.
+// The best Candidate is held as the 16 I12.3 scalars only. Its hidden identity, a
+// completion, is the pair (psychLevelTick, fvgRootSlot2): na / SLOT_INVALID when
+// absent. candCompletionCountRaw counts the completions that rebuild a Candidate with
+// exactly the given 16 scalars in the current round (current Side scratch, current
+// used flags), by re-running the Reference variant rules on the named Point window,
+// the Psych levels inside the EffectiveRange and, for OVERLAP, the Side FVG scratch:
+//   Stage A : Point window (base width <= denseTick, no Accum pair), Psych limit
+//             denseTick, variant width <= denseTick, final density HIGH; NONE, or
+//             one FVG: non-Broad unused INSIDE / PROXIMAL, Broad C1 (PROXIMAL mode)
+//             or C3 / C4 (INSIDE mode)
+//   Stage B : FVG only; non-Broad unused STANDALONE, or OVERLAP of two FVGs
+//             (both non-Broad unused: ordinary overlap; with a Broad: Broad C2);
+//             Psych limit mTick on the FVG base
+//   Stage C : as Stage A with width / Psych limit mTick and Stage C quality, or the
+//             Stage B FVG-only forms re-staged
+//   BROAD_CONTEXT : one Broad FVG, no point, no Psych, NativeRange
+// Counted is the Candidate identity, never the rule path: C3 and C4 giving the same
+// Candidate count once, one Psych tick counts once (Major / Standard on one tick are
+// one identity). Result 0 none, 1 unique (with its pair), 2 multiple (saturated).
+// Only [leftIndex .. rightIndex] and the Side FVG scratch are read; the B04 deques
+// are never touched, and no array, UDT or string is created.
+// candOfferRaw runs the round's best selection on the 16 scalars (B07 comparator):
+// no best / better -> copy all 16, roundTie = false; worse -> nothing; a 5-key tie ->
+// a differing direct identity (side, stage, left, right, effective ticks, fvgMode,
+// fvgRootSlot) sets roundTie; an equal one asks the best's completions: several ->
+// roundTie, one equal to the current hidden pair -> duplicate, one different ->
+// roundTie. Completion scans run only on a 5-key tie. Side failure flags are never
+// written here.
+// ============================================================
+
+// Counts the completions (psychLevelTick, fvgRootSlot2) of the given 16 scalars.
+// Returns [ok, completionCount, uniquePsychLevelTick, uniqueFvgRootSlot2]; ok = false
+// only for malformed input. The unique pair is meaningful only for count 1.
+candCompletionCountRaw(ZoneEngine engine, ZoneCfg cfg, float mintick, int side, int stage, int leftIndex, int rightIndex, int effectiveBottomTick, int effectiveTopTick, int cCount, int hCount, int density, bool baseStrong, int createdTime, int minRootId, int fvgMode, int fvgRootSlot, int categoryMask, int highMask) =>
+    int  count        = 0
+    int  uniquePsych  = int(na)
+    int  uniquePeer   = SLOT_INVALID
+    [denseTick, mTick] = candTickLimitsRaw(cfg, mintick)
+    bool ok = (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and (stage == CAND_STAGE_A or stage == CAND_STAGE_B or stage == CAND_STAGE_C or stage == CAND_STAGE_BROAD_CONTEXT) and not na(mintick) and mintick > 0 and denseTick >= 0 and mTick >= denseTick and not na(effectiveBottomTick) and not na(effectiveTopTick) and effectiveBottomTick <= effectiveTopTick and fvgMode >= CAND_FVG_RANGE_NONE and fvgMode <= CAND_FVG_RANGE_BROAD_CONTEXT and categoryMask >= 0 and categoryMask <= CAT_MASK_ALL
+    bool        isSupport     = side == SIDE_SUPPORT
+    array<int>  scratch       = isSupport ? engine.candidateScratchSupportNewRootSlots : engine.candidateScratchResistanceNewRootSlots
+    int         scratchLength = isSupport ? engine.candidateScratchSupportNewLength : engine.candidateScratchResistanceNewLength
+    array<int>  fvgScratch    = isSupport ? engine.w03Store.candidateSupportFvgRootSlots : engine.w03Store.candidateResistanceFvgRootSlots
+    int         fvgLength     = isSupport ? engine.w03Store.candidateSupportFvgLength : engine.w03Store.candidateResistanceFvgLength
+    array<bool> usedBySlot    = isSupport ? engine.w03Store.candidateSupportUsedByRootSlot : engine.w03Store.candidateResistanceUsedByRootSlot
+    // ---- the Point window ----
+    bool noPoint      = leftIndex == SLOT_INVALID and rightIndex == SLOT_INVALID
+    bool pointPresent = false
+    if ok
+        ok := noPoint or (leftIndex >= 0 and rightIndex >= leftIndex and rightIndex < scratchLength and rightIndex < array.size(scratch))
+        pointPresent := ok and not noPoint
+    // Stage / mode / Point shape (malformed -> ok = false)
+    if ok
+        if stage == CAND_STAGE_A
+            ok := pointPresent and (fvgMode == CAND_FVG_RANGE_NONE or fvgMode == CAND_FVG_RANGE_INSIDE or fvgMode == CAND_FVG_RANGE_PROXIMAL)
+        else if stage == CAND_STAGE_B
+            ok := not pointPresent and (fvgMode == CAND_FVG_RANGE_STANDALONE or fvgMode == CAND_FVG_RANGE_OVERLAP)
+        else if stage == CAND_STAGE_C
+            ok := pointPresent ? (fvgMode == CAND_FVG_RANGE_NONE or fvgMode == CAND_FVG_RANGE_INSIDE or fvgMode == CAND_FVG_RANGE_PROXIMAL) : (fvgMode == CAND_FVG_RANGE_STANDALONE or fvgMode == CAND_FVG_RANGE_OVERLAP)
+        else
+            ok := not pointPresent and fvgMode == CAND_FVG_RANGE_BROAD_CONTEXT
+    if ok and fvgMode == CAND_FVG_RANGE_NONE
+        ok := fvgRootSlot == SLOT_INVALID
+    // rare-path scalar aggregate of [leftIndex .. rightIndex] (B04 rules, no deque)
+    int  pointBottom       = int(na)
+    int  pointTop          = int(na)
+    int  maCount           = 0
+    int  swingCount        = 0
+    int  accumCount        = 0
+    int  timeHlCount       = 0
+    int  swingHighCount    = 0
+    int  accumHighCount    = 0
+    int  timeHlLabelCount  = 0
+    int  ema2000Wanted     = 0
+    int  ema3000Wanted     = 0
+    int  pointCreated      = int(na)
+    int  pointMinId        = ID_NONE
+    bool pairConflict      = false
+    if ok and pointPresent
+        int wantedSlope = isSupport ? 1 : -1
+        int i = leftIndex
+        while ok and i <= rightIndex
+            int s = array.get(scratch, i)
+            ok := s >= 0 and s < array.size(engine.rootIds) and s < array.size(engine.rootSlotLiveFlags) and s < array.size(engine.rootCategories) and s < array.size(engine.rootSubtypes) and s < array.size(engine.rootTfCodes) and s < array.size(engine.rootConfirmedTimes) and s < array.size(engine.rootPairKeys) and s < array.size(engine.rootLabelMasks) and s < array.size(engine.rootPointTicks) and s < array.size(engine.w03Store.rootSwingTfMasks)
+            if ok
+                ok := array.get(engine.rootSlotLiveFlags, s) and candEligibleRaw(engine, cfg, s, side)
+            int category = -1
+            int tick     = int(na)
+            int confTime = int(na)
+            int rootId   = ID_NONE
+            if ok
+                category := array.get(engine.rootCategories, s)
+                tick     := array.get(engine.rootPointTicks, s)
+                confTime := array.get(engine.rootConfirmedTimes, s)
+                rootId   := array.get(engine.rootIds, s)
+                ok := (category == CAT_MA or category == CAT_SWING or category == CAT_ACCUM or category == CAT_TIME_HL) and not na(tick) and not na(confTime) and rootId != ID_NONE
+            if ok
+                pointBottom  := na(pointBottom) ? tick : math.min(pointBottom, tick)
+                pointTop     := na(pointTop)    ? tick : math.max(pointTop,    tick)
+                pointCreated := na(pointCreated) ? confTime : math.max(pointCreated, confTime)
+                pointMinId   := pointMinId == ID_NONE ? rootId : math.min(pointMinId, rootId)
+                if category == CAT_MA
+                    maCount += 1
+                    int subtype = array.get(engine.rootSubtypes, s)
+                    if subtype == SUB_MA_EMA2000
+                        int slope = engine.w03Store.ema2000SlopeDir
+                        if not na(slope) and slope == wantedSlope
+                            ema2000Wanted += 1
+                    else if subtype == SUB_MA_EMA3000
+                        int slope = engine.w03Store.ema3000SlopeDir
+                        if not na(slope) and slope == wantedSlope
+                            ema3000Wanted += 1
+                else if category == CAT_SWING
+                    swingCount += 1
+                    int tfMask = array.get(engine.w03Store.rootSwingTfMasks, s)
+                    if tfMask >= SWING_TF_MASK_1H or tfMask == SWING_TF_MASK_5M + SWING_TF_MASK_15M
+                        swingHighCount += 1
+                else if category == CAT_ACCUM
+                    accumCount += 1
+                    int tf = array.get(engine.rootTfCodes, s)
+                    if tf == TF_4H or tf == TF_D
+                        accumHighCount += 1
+                    // Accum pair: two Accum Roots of one non-zero pairKey in the window
+                    int pairKey = array.get(engine.rootPairKeys, s)
+                    if pairKey != ID_NONE
+                        int j = i + 1
+                        while not pairConflict and j <= rightIndex
+                            int s2 = array.get(scratch, j)
+                            if s2 >= 0 and s2 < array.size(engine.rootCategories) and s2 < array.size(engine.rootPairKeys)
+                                if array.get(engine.rootCategories, s2) == CAT_ACCUM and array.get(engine.rootPairKeys, s2) == pairKey
+                                    pairConflict := true
+                            j += 1
+                else
+                    timeHlCount += 1
+                    int labelMask = array.get(engine.rootLabelMasks, s)
+                    if labelMask >= TIMEHL_LABEL_PREV_DAY and labelMask <= 63
+                        timeHlLabelCount += 1
+            i += 1
+    int pointCategoryMask = (maCount > 0 ? CAT_MASK_MA : 0) + (swingCount > 0 ? CAT_MASK_SWING : 0) + (accumCount > 0 ? CAT_MASK_ACCUM : 0) + (timeHlCount > 0 ? CAT_MASK_TIME_HL : 0)
+    int pointHighMask     = (swingHighCount > 0 ? CAT_MASK_SWING : 0) + (accumHighCount > 0 ? CAT_MASK_ACCUM : 0) + (timeHlLabelCount > 0 or timeHlCount >= 2 ? CAT_MASK_TIME_HL : 0)
+    // base width of the window (Stage A denseTick, Stage C mTick); a pair conflict or
+    // a wider base rebuilds nothing
+    bool rebuildable = ok and not pairConflict
+    if rebuildable and pointPresent
+        rebuildable := pointTop - pointBottom <= (stage == CAND_STAGE_A ? denseTick : mTick)
+    // ---- the primary FVG ----
+    bool primaryBroad   = false
+    int  primaryBottom  = int(na)
+    int  primaryTop     = int(na)
+    int  primaryConf    = int(na)
+    int  primaryId      = ID_NONE
+    if ok and fvgMode != CAND_FVG_RANGE_NONE
+        ok := fvgRootSlot >= 0 and fvgRootSlot < array.size(engine.rootIds) and fvgRootSlot < array.size(engine.rootCategories) and fvgRootSlot < array.size(engine.rootIsBroadFvgFlags) and fvgRootSlot < array.size(engine.rootNativeBottomTicks) and fvgRootSlot < array.size(engine.rootNativeTopTicks) and fvgRootSlot < array.size(engine.rootConfirmedTimes) and fvgRootSlot < array.size(usedBySlot)
+        if ok
+            ok := array.get(engine.rootCategories, fvgRootSlot) == CAT_FVG
+        if ok
+            primaryBroad  := array.get(engine.rootIsBroadFvgFlags, fvgRootSlot)
+            primaryBottom := array.get(engine.rootNativeBottomTicks, fvgRootSlot)
+            primaryTop    := array.get(engine.rootNativeTopTicks, fvgRootSlot)
+            primaryConf   := array.get(engine.rootConfirmedTimes, fvgRootSlot)
+            primaryId     := array.get(engine.rootIds, fvgRootSlot)
+        if ok and rebuildable
+            rebuildable := candEligibleRaw(engine, cfg, fvgRootSlot, side) and not na(primaryConf) and primaryId != ID_NONE and (primaryBroad or not array.get(usedBySlot, fvgRootSlot))
+            if fvgMode == CAND_FVG_RANGE_STANDALONE
+                rebuildable := rebuildable and not primaryBroad
+            else if fvgMode == CAND_FVG_RANGE_BROAD_CONTEXT
+                rebuildable := rebuildable and primaryBroad
+    // ---- completions: Psych tick (outer), second FVG (inner) ----
+    bool psychWanted = categoryMask % (2 * CAT_MASK_PSYCH) >= CAT_MASK_PSYCH
+    if ok and rebuildable and psychWanted
+        rebuildable := cfg.usePsych and fvgMode != CAND_FVG_RANGE_BROAD_CONTEXT
+    if ok and rebuildable
+        int  loLevel  = 0
+        int  hiLevel  = 0
+        if psychWanted
+            loLevel := int(math.floor((effectiveBottomTick * mintick) / 50.0)) - 1
+            hiLevel := int(math.ceil((effectiveTopTick * mintick) / 50.0)) + 1
+        int  level    = loLevel
+        int  lastTick = int(na)
+        bool levelsDone = false
+        while not levelsDone and count < 2
+            int  t   = int(na)
+            bool tOk = true
+            if psychWanted
+                t   := int(math.round((level * 50.0) / mintick))
+                tOk := effectiveBottomTick <= t and t <= effectiveTopTick and (na(lastTick) or t != lastTick)
+                lastTick := t
+            if tOk
+                int peerTotal = fvgMode == CAND_FVG_RANGE_OVERLAP ? fvgLength : 1
+                int q = 0
+                while count < 2 and q < peerTotal
+                    int  peer   = SLOT_INVALID
+                    bool valid  = true
+                    bool peerBroad = false
+                    int  peerConf  = int(na)
+                    int  peerId    = ID_NONE
+                    if fvgMode == CAND_FVG_RANGE_OVERLAP
+                        peer  := q < array.size(fvgScratch) ? array.get(fvgScratch, q) : SLOT_INVALID
+                        valid := peer >= 0 and peer != fvgRootSlot and peer < array.size(engine.rootIds) and peer < array.size(engine.rootIsBroadFvgFlags) and peer < array.size(engine.rootConfirmedTimes)
+                        if valid
+                            peerBroad := array.get(engine.rootIsBroadFvgFlags, peer)
+                            peerConf  := array.get(engine.rootConfirmedTimes, peer)
+                            peerId    := array.get(engine.rootIds, peer)
+                            // the primary is the smaller Root ID of the pair
+                            valid := peerId > primaryId and not na(peerConf)
+                    // local participant range: real points, widened by the Psych tick
+                    int  localBottom = pointPresent ? (psychWanted ? math.min(pointBottom, t) : pointBottom) : t
+                    int  localTop    = pointPresent ? (psychWanted ? math.max(pointTop,    t) : pointTop)    : t
+                    int  rb = int(na)
+                    int  rt = int(na)
+                    bool broadLocalized = false
+                    bool isContext      = false
+                    if valid
+                        if pointPresent
+                            // Psych joins the Point base within the Stage limit
+                            if psychWanted
+                                valid := localTop - localBottom <= (stage == CAND_STAGE_A ? denseTick : mTick)
+                            if valid
+                                if fvgMode == CAND_FVG_RANGE_NONE
+                                    rb := localBottom
+                                    rt := localTop
+                                else if not primaryBroad
+                                    [gOk, gBottom, gTop] = candFvgRangeRaw(engine, cfg, side, fvgMode, fvgRootSlot, SLOT_INVALID, true, localBottom, localTop, denseTick)
+                                    valid := gOk
+                                    rb    := gBottom
+                                    rt    := gTop
+                                else if fvgMode == CAND_FVG_RANGE_PROXIMAL
+                                    [lOk, lLoc, lBottom, lTop] = candBroadLocalizationRaw(engine, cfg, side, stage, CAND_BROAD_LOCAL_C1, fvgRootSlot, SLOT_INVALID, true, pointBottom, pointTop, psychWanted, t, maCount, ema2000Wanted, ema3000Wanted, pointCategoryMask, pointHighMask, denseTick, mTick)
+                                    valid := lOk and lLoc
+                                    rb    := lBottom
+                                    rt    := lTop
+                                    broadLocalized := true
+                                else
+                                    // Broad INSIDE : C3 or C4, one identity
+                                    [c3Ok, c3Loc, c3Bottom, c3Top] = candBroadLocalizationRaw(engine, cfg, side, stage, CAND_BROAD_LOCAL_C3, fvgRootSlot, SLOT_INVALID, true, pointBottom, pointTop, psychWanted, t, maCount, ema2000Wanted, ema3000Wanted, pointCategoryMask, pointHighMask, denseTick, mTick)
+                                    [c4Ok, c4Loc, c4Bottom, c4Top] = candBroadLocalizationRaw(engine, cfg, side, stage, CAND_BROAD_LOCAL_C4, fvgRootSlot, SLOT_INVALID, true, pointBottom, pointTop, psychWanted, t, maCount, ema2000Wanted, ema3000Wanted, pointCategoryMask, pointHighMask, denseTick, mTick)
+                                    valid := (c3Ok and c3Loc) or (c4Ok and c4Loc)
+                                    rb    := localBottom
+                                    rt    := localTop
+                                    broadLocalized := true
+                        else
+                            // FVG-only base
+                            int baseBottom = int(na)
+                            int baseTop    = int(na)
+                            if fvgMode == CAND_FVG_RANGE_STANDALONE
+                                [sOk, sBottom, sTop] = candFvgRangeRaw(engine, cfg, side, CAND_FVG_RANGE_STANDALONE, fvgRootSlot, SLOT_INVALID, false, int(na), int(na), denseTick)
+                                valid      := sOk
+                                baseBottom := sBottom
+                                baseTop    := sTop
+                            else if fvgMode == CAND_FVG_RANGE_OVERLAP
+                                if not primaryBroad and not peerBroad
+                                    [oOk, oBottom, oTop] = candFvgRangeRaw(engine, cfg, side, CAND_FVG_RANGE_OVERLAP, fvgRootSlot, peer, false, int(na), int(na), denseTick)
+                                    valid      := oOk
+                                    baseBottom := oBottom
+                                    baseTop    := oTop
+                                else
+                                    int broadSlot = primaryBroad ? fvgRootSlot : peer
+                                    int otherSlot = primaryBroad ? peer : fvgRootSlot
+                                    [c2Ok, c2Loc, c2Bottom, c2Top] = candBroadLocalizationRaw(engine, cfg, side, stage == CAND_STAGE_C ? CAND_STAGE_C : CAND_STAGE_B, CAND_BROAD_LOCAL_C2, broadSlot, otherSlot, false, int(na), int(na), false, int(na), 0, 0, 0, CAT_MASK_NONE, CAT_MASK_NONE, denseTick, mTick)
+                                    valid          := c2Ok and c2Loc
+                                    baseBottom     := c2Bottom
+                                    baseTop        := c2Top
+                                    broadLocalized := true
+                            else
+                                [xOk, xBottom, xTop] = candFvgRangeRaw(engine, cfg, side, CAND_FVG_RANGE_BROAD_CONTEXT, fvgRootSlot, SLOT_INVALID, false, int(na), int(na), denseTick)
+                                valid     := xOk
+                                baseBottom := xBottom
+                                baseTop    := xTop
+                                isContext  := true
+                            if valid
+                                rb := psychWanted ? math.min(baseBottom, t) : baseBottom
+                                rt := psychWanted ? math.max(baseTop,    t) : baseTop
+                                if psychWanted
+                                    valid := rt - rb <= mTick
+                    // quality, times, IDs, then the 16-scalar match
+                    if valid
+                        bool hasFvg  = fvgMode != CAND_FVG_RANGE_NONE
+                        bool fvgHigh = false
+                        if hasFvg and not isContext
+                            [hOk, hHigh] = candFvgHighRaw(engine, cfg, side, fvgRootSlot, peer, broadLocalized)
+                            valid   := hOk
+                            fvgHigh := hHigh
+                        int catIn  = pointCategoryMask + (psychWanted ? CAT_MASK_PSYCH : 0) + (hasFvg ? CAT_MASK_FVG : 0)
+                        int highIn = pointHighMask + (fvgHigh ? CAT_MASK_FVG : 0)
+                        if valid
+                            [qOk, qCategoryMask, qHighMask, qC, qH, qDensity, qBaseStrong] = candQualityFinishRaw(engine, side, stage, rb, rt, denseTick, mTick, maCount, ema2000Wanted, ema3000Wanted, catIn, highIn, isContext)
+                            valid := qOk and (stage != CAND_STAGE_A or qDensity == DEN_HIGH)
+                            int created = pointCreated
+                            int minId   = pointMinId
+                            if hasFvg
+                                created := na(created) ? primaryConf : math.max(created, primaryConf)
+                                minId   := minId == ID_NONE ? primaryId : math.min(minId, primaryId)
+                            if peer != SLOT_INVALID
+                                created := math.max(created, peerConf)
+                                minId   := math.min(minId, peerId)
+                            if valid and rb == effectiveBottomTick and rt == effectiveTopTick and qC == cCount and qH == hCount and qDensity == density and qBaseStrong == baseStrong and created == createdTime and minId == minRootId and qCategoryMask == categoryMask and qHighMask == highMask
+                                count += 1
+                                if count == 1
+                                    uniquePsych := t
+                                    uniquePeer  := peer
+                    q += 1
+            if psychWanted
+                level += 1
+                levelsDone := level > hiLevel
+            else
+                levelsDone := true
+    if not ok
+        count := 0
+    [ok, count, count == 1 ? uniquePsych : int(na), count == 1 ? uniquePeer : SLOT_INVALID]
+
+// Offers one valid Candidate (16 scalars + its hidden pair) to the round's best.
+// Returns true when handled; false only when the best cannot be rebuilt on a 5-key
+// tie (an internal reconstruction failure; no Side failure flag is written here).
+candOfferRaw(ZoneEngine engine, ZoneCfg cfg, float mintick, int side, int stage, int leftIndex, int rightIndex, int effectiveBottomTick, int effectiveTopTick, int cCount, int hCount, int density, bool baseStrong, int createdTime, int minRootId, int fvgMode, int fvgRootSlot, int categoryMask, int highMask, int currentPsychLevelTick, int currentFvgRootSlot2) =>
+    bool handled = true
+    bool noBest  = engine.w03Store.candidateBestSide == SIDE_NONE
+    int  cmp     = 1
+    if not noBest
+        cmp := candCompareRaw(cCount, hCount, effectiveBottomTick, effectiveTopTick, createdTime, minRootId, engine.w03Store.candidateBestCCount, engine.w03Store.candidateBestHCount, engine.w03Store.candidateBestEffectiveBottomTick, engine.w03Store.candidateBestEffectiveTopTick, engine.w03Store.candidateBestCreatedTime, engine.w03Store.candidateBestMinRootId)
+    if noBest or cmp == 1
+        // the first or a strictly better Candidate: all 16 scalars, tie cleared
+        engine.w03Store.candidateBestSide                := side
+        engine.w03Store.candidateBestStage               := stage
+        engine.w03Store.candidateBestLeftIndex           := leftIndex
+        engine.w03Store.candidateBestRightIndex          := rightIndex
+        engine.w03Store.candidateBestEffectiveBottomTick := effectiveBottomTick
+        engine.w03Store.candidateBestEffectiveTopTick    := effectiveTopTick
+        engine.w03Store.candidateBestCCount              := cCount
+        engine.w03Store.candidateBestHCount              := hCount
+        engine.w03Store.candidateBestDensity             := density
+        engine.w03Store.candidateBestBaseStrong          := baseStrong
+        engine.w03Store.candidateBestCreatedTime         := createdTime
+        engine.w03Store.candidateBestMinRootId           := minRootId
+        engine.w03Store.candidateBestFvgMode             := fvgMode
+        engine.w03Store.candidateBestFvgRootSlot         := fvgRootSlot
+        engine.w03Store.candidateBestCategoryMask        := categoryMask
+        engine.w03Store.candidateBestHighMask            := highMask
+        engine.w03Store.candidateRoundTie                := false
+    else if cmp == 0
+        bool sameDirect = engine.w03Store.candidateBestSide == side and engine.w03Store.candidateBestStage == stage and engine.w03Store.candidateBestLeftIndex == leftIndex and engine.w03Store.candidateBestRightIndex == rightIndex and engine.w03Store.candidateBestEffectiveBottomTick == effectiveBottomTick and engine.w03Store.candidateBestEffectiveTopTick == effectiveTopTick and engine.w03Store.candidateBestFvgMode == fvgMode and engine.w03Store.candidateBestFvgRootSlot == fvgRootSlot
+        if not sameDirect
+            engine.w03Store.candidateRoundTie := true
+        else
+            [cOk, cCountOut, cPsych, cPeer] = candCompletionCountRaw(engine, cfg, mintick, engine.w03Store.candidateBestSide, engine.w03Store.candidateBestStage, engine.w03Store.candidateBestLeftIndex, engine.w03Store.candidateBestRightIndex, engine.w03Store.candidateBestEffectiveBottomTick, engine.w03Store.candidateBestEffectiveTopTick, engine.w03Store.candidateBestCCount, engine.w03Store.candidateBestHCount, engine.w03Store.candidateBestDensity, engine.w03Store.candidateBestBaseStrong, engine.w03Store.candidateBestCreatedTime, engine.w03Store.candidateBestMinRootId, engine.w03Store.candidateBestFvgMode, engine.w03Store.candidateBestFvgRootSlot, engine.w03Store.candidateBestCategoryMask, engine.w03Store.candidateBestHighMask)
+            if not cOk or cCountOut == 0
+                handled := false
+            else if cCountOut >= 2
+                engine.w03Store.candidateRoundTie := true
+            else
+                bool samePsych = (na(cPsych) and na(currentPsychLevelTick)) or (not na(cPsych) and not na(currentPsychLevelTick) and cPsych == currentPsychLevelTick)
+                bool samePeer  = cPeer == currentFvgRootSlot2
+                if not (samePsych and samePeer)
+                    engine.w03Store.candidateRoundTie := true
+    // cmp == -1 : the best and the tie state stay as they are
+    handled
+
+// ============================================================
 // W02 Batch 14 : Side Phase set index raw helpers (I11-9)
 //
 // Internal only. They maintain the Batch 13 membership of one Side in the Phase set
