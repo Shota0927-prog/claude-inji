@@ -2,7 +2,20 @@
 
 ## 1. STATUS
 
-CODE_COMPLETE_PENDING_B10_TV_COMPILE
+COMPLETE
+
+W04 COMPLETE が意味するもの:
+- Reference Candidate 実装完了
+- B01〜B10 compile 確認完了
+- W04 static audit 完了
+- W05 exact-equivalence contract 固定
+
+W04 COMPLETE が意味しないもの（後続 Window 担当）:
+- 75 tests PASS
+- I22 PASS
+- 365d benchmark PASS
+- Production performance PASS
+- 全 Project COMPLETE
 
 ## 2. AUTHORITY
 
@@ -14,6 +27,8 @@ CODE_COMPLETE_PENDING_B10_TV_COMPILE
 - branch: `claude/laughing-dijkstra-3w3zgr`
 - Start HEAD (W04 PHASE A): `b2d019176a02cf694adb56e61e1da32732135c81`
 - B10 New HEAD (code commit): `7679e952b8c01310e7ffac17fab6c7ea2b577961`
+- B10 final pre-closeout HEAD: `207731404a2366bf12b1de5ea4d82f870b11a21c`
+- W04 Closeout HEAD: `see W04 CLOSEOUT completion report`
 
 ## 4. FILES
 
@@ -69,17 +84,23 @@ W05 Production Candidate は Side 別に W04 Reference と以下が一致必須:
 - Production <=12 sec: NOT RUN
 - Strategy <=20 sec: NOT RUN
 - Visual <=20 sec: NOT RUN
-- Reference の動作確認は Python 模擬のみ（TradingView 実行なし）。
+- Reference logic tests: Python mirror tests completed
+- TradingView: compile confirmed 0 error
+- TradingView runtime/conformance execution: NOT RUN
 
 ## 11. TRADINGVIEW COMPILE
 
 - B01〜B09: CONFIRMED 0 ERROR
-- B10: PENDING USER VERIFICATION
+- B10: CONFIRMED 0 ERROR
+- W04 Reference Harness: CONFIRMED COMPILE 0 ERROR
+- 上記は compile 確認のみ。75 Conformance runtime test / I22 / 365d benchmark ではない。
 
 ## 12. W05 START GATE
 
 - expected branch: `claude/laughing-dijkstra-3w3zgr`
-- expected HEAD: B10 New HEAD（本ファイルを最終更新した commit `W04 B10 record final handoff head` の HEAD）
+- expected baseline: `W04 CLOSEOUT final HEAD reported in the W04 CLOSEOUT completion report`
+- local HEAD: must equal that reported final HEAD
+- remote HEAD: must equal that reported final HEAD
 - git status: clean
 - divergence: 0 / 0
 
