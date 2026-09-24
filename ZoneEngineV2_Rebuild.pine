@@ -7832,6 +7832,75 @@ w03StageFApplyAndCommitRaw(ZoneEngine engine, float mintick, int nextLastConsume
     ok
 
 // ============================================================
+// W03 Batch 19 : Source adoption predicate and E-stage MA emission
+// Source: I7.1 (1m EMA adoption), I7 (Source adoption), I10, A7.2, D12
+//
+// Internal only.
+//   sourceAdoptableRaw : whether an HTF / event Source closing at sourceCloseTime is
+//                        newly adoptable on this Base bar - closed by the Base close
+//                        and not consumed before. Used by B20 - B25; MA never uses it.
+//   maSlopeDirRaw      : the sign of the Harness raw EMA slope (1 / 0 / -1, na kept).
+//   w03StageEMaRaw     : E-stage MA. On each confirmed Base bar the last confirmed 1m
+//                        tuple in the Feed is evaluated for EMA2000 then EMA3000. Each
+//                        EMA is one fixed Root per subtype: no Root -> one NEW_ROOT
+//                        (E2) row; the committed Root -> one MA_UPDATE (E3) row only
+//                        when the price, the slope sign or a source time changed; a
+//                        pending NEW_ROOT of this bar -> nothing.
+// Identity goes through originKeyComputeRaw / originLookupUniqueRaw only. The only
+// writes are journal rows (and the lookup's own violation flag); no Root, index,
+// revision, lastConsumed or MA ref / slope scalar is written - F6 commits those.
+// Business call sites = 0 in this Batch (Stage E wiring is B26).
+// ============================================================
+
+// true when a Source closing at sourceCloseTime is newly adoptable on the Base bar
+// closing at baseCloseTime: closed by the Base close and never consumed before.
+sourceAdoptableRaw(int sourceOpenTime, int sourceCloseTime, int lastConsumedCloseTime, int baseCloseTime) =>
+    not na(sourceOpenTime) and not na(sourceCloseTime) and not na(baseCloseTime) and baseCloseTime >= sourceCloseTime and (na(lastConsumedCloseTime) or sourceCloseTime > lastConsumedCloseTime)
+
+// The sign of a raw EMA slope: 1, -1, 0, or na for na. No epsilon, no rounding.
+maSlopeDirRaw(float rawSlope) =>
+    int dir = int(na)
+    if not na(rawSlope)
+        dir := rawSlope > 0 ? 1 : rawSlope < 0 ? -1 : 0
+    dir
+
+// E-stage MA: journals EMA2000 then EMA3000 from this Base bar's 1m tuple. Returns true.
+w03StageEMaRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed) =>
+    // the 1m tuple is usable when it closed by the Base close (no lastConsumed for MA)
+    bool usable  = cfg.useMa and not na(feed.maSourceOpenTime) and not na(feed.maSourceCloseTime) and not na(feed.baseCloseTime) and feed.maSourceCloseTime <= feed.baseCloseTime and not na(feed.mintick) and feed.mintick > 0
+    bool stopped = false
+    int  k = 0
+    // fixed order: EMA2000, then EMA3000
+    while usable and not stopped and k < 2
+        int   subtype  = k == 0 ? SUB_MA_EMA2000 : SUB_MA_EMA3000
+        float emaPrice = k == 0 ? feed.ema2000 : feed.ema3000
+        float rawSlope = k == 0 ? feed.ema2000Slope : feed.ema3000Slope
+        int   oldSlope = k == 0 ? engine.w03Store.ema2000SlopeDir : engine.w03Store.ema3000SlopeDir
+        if not na(emaPrice)
+            int pointTick = int(math.round(emaPrice / feed.mintick))
+            int originKey = originKeyComputeRaw(CAT_MA, subtype, TF_1M, pointTick, feed.maSourceOpenTime, FVG_NONE)
+            int newSlope  = maSlopeDirRaw(rawSlope)
+            [rootSlot, pendingRow] = originLookupUniqueRaw(engine, originKey, CAT_MA, subtype, TF_1M, pointTick, feed.maSourceOpenTime, int(na), FVG_NONE, feed.mintick)
+            if engine.w03Store.journalInvariantViolation
+                // the lookup found a broken identity: emit nothing more, F0 stops the bar
+                stopped := true
+            else if rootSlot == SLOT_INVALID and pendingRow == SLOT_INVALID
+                // no Root yet: the fixed Root of this EMA is created in E2
+                int newRow = journalAppendRaw(engine, JOP_NEW_ROOT, JGROUP_E2, SLOT_INVALID, ID_NONE, CAT_MA, subtype, TF_1M, originKey, feed.maSourceOpenTime, int(na), feed.maSourceCloseTime, emaPrice, float(na), float(na), ROOT_ACTIVE, ROOT_ACTIVE, false, false, FVG_NONE, SWING_TF_MASK_NONE, SWING_TF_MASK_NONE, ID_NONE, newSlope)
+            else if rootSlot != SLOT_INVALID and pendingRow == SLOT_INVALID
+                // the committed Root: update only when something it carries changed
+                int  expectedRootId   = array.get(engine.rootIds, rootSlot)
+                bool priceChanged     = array.get(engine.rootPointPrices, rootSlot) != emaPrice
+                bool slopeChanged     = (na(oldSlope) and not na(newSlope)) or (not na(oldSlope) and na(newSlope)) or (not na(oldSlope) and not na(newSlope) and oldSlope != newSlope)
+                bool openTimeChanged  = array.get(engine.rootOriginTimes, rootSlot) != feed.maSourceOpenTime
+                bool closeTimeChanged = array.get(engine.rootConfirmedTimes, rootSlot) != feed.maSourceCloseTime
+                if priceChanged or slopeChanged or openTimeChanged or closeTimeChanged
+                    int updateRow = journalAppendRaw(engine, JOP_MA_UPDATE, JGROUP_E3, rootSlot, expectedRootId, CAT_MA, subtype, TF_1M, originKey, feed.maSourceOpenTime, int(na), feed.maSourceCloseTime, emaPrice, float(na), float(na), ROOT_ACTIVE, ROOT_ACTIVE, false, false, FVG_NONE, SWING_TF_MASK_NONE, SWING_TF_MASK_NONE, ID_NONE, newSlope)
+            // a pending NEW_ROOT of this EMA in this bar: nothing more is emitted
+        k += 1
+    true
+
+// ============================================================
 // W02 Batch 14 : Side Phase set index raw helpers (I11-9)
 //
 // Internal only. They maintain the Batch 13 membership of one Side in the Phase set
