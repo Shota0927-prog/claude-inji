@@ -46,6 +46,7 @@ const int REF_TIMEHL_LABEL_CUR_WEEK  = 16
 const int REF_TIMEHL_LABEL_PREV_WEEK = 32
 const int REF_TF_4H               = 240
 const int REF_TF_D                = 1440
+const int REF_FVG_RANGE_NONE          = 0
 const int REF_FVG_RANGE_STANDALONE    = 1
 const int REF_FVG_RANGE_INSIDE        = 2
 const int REF_FVG_RANGE_PROXIMAL      = 3
@@ -692,5 +693,167 @@ refFvgHigh(array<RefRoot> roots, array<int> fvgIndexes, int side, bool broadLoca
                     j += 1
             i += 1
     isHigh
+
+
+// ============================================================
+// W04 B07 : Stage A brute-force enumeration (Dense candidates only)
+// ============================================================
+
+// Completes one Stage A Dense candidate and appends it to outCandidates.
+// Returns true when appended, false when invalid, not Dense, or an exact duplicate.
+// Density = refDensity(..., false) and must be REF_DEN_HIGH. C / H come from
+// refQualityAggregate (stage A, REF_DEN_HIGH); refFvgHigh adds the FVG High bit 16
+// and one H at most once. BaseStrong = refBaseStrong only; a non-Strong candidate is
+// still appended. createdTime = max(confirmedTime) and minRootId = min(rootId) over
+// the materialized Roots only (a Virtual Psych never takes part). rootIndexes is an
+// independent copy. A duplicate is only an exact match of side, stage, the whole
+// materialized Root index set, psychPresent / psychLevelTick / psychIsMajor, both
+// effective ticks and fvgMode.
+refAppendDenseCandidate(array<RefRoot> roots, array<int> materializedRootIndexes, bool psychPresent, int psychLevelTick, bool psychIsMajor, int side, int effectiveBottomTick, int effectiveTopTick, int denseTick, int mTick, int fvgMode, bool broadLocalized, array<RefCandidate> outCandidates) =>
+    int  n     = array.size(materializedRootIndexes)
+    int  nRoot = array.size(roots)
+    bool valid = n > 0 and (side == REF_SIDE_SUPPORT or side == REF_SIDE_RESISTANCE) and not na(effectiveBottomTick) and not na(effectiveTopTick) and effectiveBottomTick <= effectiveTopTick and denseTick >= 0 and mTick >= denseTick
+    int  createdTime = int(na)
+    int  minRootId   = int(na)
+    array<int> fvgIndexes = array.new_int()
+    int i = 0
+    while valid and i < n
+        int idx = array.get(materializedRootIndexes, i)
+        if idx < 0 or idx >= nRoot
+            valid := false
+        else
+            int j = 0
+            while valid and j < i
+                if array.get(materializedRootIndexes, j) == idx
+                    valid := false
+                j += 1
+            if valid
+                RefRoot r = array.get(roots, idx)
+                if not refEligible(r, side) or na(r.confirmedTime) or na(r.rootId) or r.rootId <= 0
+                    valid := false
+                else
+                    createdTime := na(createdTime) ? r.confirmedTime : math.max(createdTime, r.confirmedTime)
+                    minRootId   := na(minRootId)   ? r.rootId        : math.min(minRootId,   r.rootId)
+                    if r.category == REF_CAT_FVG
+                        array.push(fvgIndexes, idx)
+        i += 1
+    if valid
+        valid := refDensity(effectiveBottomTick, effectiveTopTick, denseTick, mTick, false) == REF_DEN_HIGH
+    bool appended = false
+    if valid
+        [aggOk, aggCategoryMask, aggHighMask, aggC, aggH] = refQualityAggregate(roots, materializedRootIndexes, psychPresent, side, REF_STAGE_A, REF_DEN_HIGH, denseTick)
+        if aggOk
+            int highMask = aggHighMask
+            int hCount   = aggH
+            // FVG High bit 16 at most once (B05 highMask never carries bit 16, max 15)
+            if array.size(fvgIndexes) > 0 and highMask < 16
+                if refFvgHigh(roots, fvgIndexes, side, broadLocalized)
+                    highMask += 16
+                    hCount   += 1
+            bool baseStrong = refBaseStrong(aggC, hCount, REF_DEN_HIGH)
+            int  tick       = psychPresent ? psychLevelTick : int(na)
+            bool major      = psychPresent ? psychIsMajor : false
+            // exact-duplicate check only
+            bool duplicate = false
+            int  k = 0
+            while not duplicate and k < array.size(outCandidates)
+                RefCandidate c = array.get(outCandidates, k)
+                bool same = c.side == side and c.stage == REF_STAGE_A and c.psychPresent == psychPresent and ((na(c.psychLevelTick) and na(tick)) or c.psychLevelTick == tick) and c.psychIsMajor == major and c.effectiveBottomTick == effectiveBottomTick and c.effectiveTopTick == effectiveTopTick and c.fvgMode == fvgMode and array.size(c.rootIndexes) == n
+                int m = 0
+                while same and m < n
+                    same := array.includes(c.rootIndexes, array.get(materializedRootIndexes, m))
+                    m += 1
+                duplicate := same
+                k += 1
+            if not duplicate
+                array.push(outCandidates, RefCandidate.new(side = side, stage = REF_STAGE_A, rootIndexes = array.copy(materializedRootIndexes), psychPresent = psychPresent, psychLevelTick = tick, psychIsMajor = major, effectiveBottomTick = effectiveBottomTick, effectiveTopTick = effectiveTopTick, categoryMask = aggCategoryMask, highMask = highMask, cCount = aggC, hCount = hCount, density = REF_DEN_HIGH, baseStrong = baseStrong, isBroadContext = false, createdTime = createdTime, minRootId = minRootId, fvgMode = fvgMode))
+                appended := true
+    appended
+
+// Appends every Stage A variant of one contiguous Point window. Returns the number
+// of candidates this call appended. A window with an Accum pair conflict, an invalid
+// range or a base width > denseTick yields 0 (only this window is dropped).
+// Variants: no Psych, then each single Virtual Psych level of refBuildPsychLevels
+// (never two at once); for each of these, the plain Point candidate, then every
+// eligible FVG of roots (index 0 .. last): a non-Broad FVG not used -> INSIDE and
+// PROXIMAL both evaluated; a Broad FVG (shared, used ignored) -> C1 (PROXIMAL mode),
+// C3 and C4 (INSIDE mode), each independently. At most one FVG per candidate; FVG
+// pairs, Broad C2 and BroadContext belong to Stage B. used is read-only.
+refAppendStageAVariants(array<RefRoot> roots, array<bool> used, array<int> pointIndexes, int side, int denseTick, int mTick, float mintick, array<RefCandidate> outCandidates) =>
+    int nRoot = array.size(roots)
+    int added = 0
+    if array.size(used) == nRoot and refAccumPairValid(roots, pointIndexes)
+        [baseOk, baseBottom, baseTop] = refPointEffectiveRange(roots, pointIndexes, false, int(na))
+        if baseOk and baseTop - baseBottom <= denseTick
+            array<int>  levelTicks = array.new_int()
+            array<bool> levelMajor = array.new_bool()
+            int nLevel = refBuildPsychLevels(baseBottom, baseTop, denseTick, mintick, levelTicks, levelMajor)
+            // v = -1 : no Psych; v >= 0 : the single Psych level v
+            int v = -1
+            while v < nLevel
+                bool pp    = v >= 0
+                int  pt    = pp ? array.get(levelTicks, v) : int(na)
+                bool major = pp ? array.get(levelMajor, v) : false
+                [rOk, rBottom, rTop] = refPointEffectiveRange(roots, pointIndexes, pp, pt)
+                if rOk and rTop - rBottom <= denseTick
+                    if refAppendDenseCandidate(roots, pointIndexes, pp, pt, major, side, rBottom, rTop, denseTick, mTick, REF_FVG_RANGE_NONE, false, outCandidates)
+                        added += 1
+                    int k = 0
+                    while k < nRoot
+                        RefRoot f = array.get(roots, k)
+                        if f.category == REF_CAT_FVG and refEligible(f, side)
+                            array<int> withFvg = array.copy(pointIndexes)
+                            array.push(withFvg, k)
+                            if not f.isBroadFvg
+                                if not array.get(used, k)
+                                    [inOk, inBottom, inTop] = refFvgRange(roots, k, -1, pointIndexes, pp, pt, side, REF_FVG_RANGE_INSIDE, denseTick)
+                                    if inOk
+                                        if refAppendDenseCandidate(roots, withFvg, pp, pt, major, side, inBottom, inTop, denseTick, mTick, REF_FVG_RANGE_INSIDE, false, outCandidates)
+                                            added += 1
+                                    [pxOk, pxBottom, pxTop] = refFvgRange(roots, k, -1, pointIndexes, pp, pt, side, REF_FVG_RANGE_PROXIMAL, denseTick)
+                                    if pxOk
+                                        if refAppendDenseCandidate(roots, withFvg, pp, pt, major, side, pxBottom, pxTop, denseTick, mTick, REF_FVG_RANGE_PROXIMAL, false, outCandidates)
+                                            added += 1
+                            else
+                                [c1Ok, c1Bottom, c1Top] = refBroadLocalization(roots, k, pointIndexes, pp, pt, -1, side, denseTick, REF_BROAD_LOCAL_C1)
+                                if c1Ok
+                                    if refAppendDenseCandidate(roots, withFvg, pp, pt, major, side, c1Bottom, c1Top, denseTick, mTick, REF_FVG_RANGE_PROXIMAL, true, outCandidates)
+                                        added += 1
+                                [c3Ok, c3Bottom, c3Top] = refBroadLocalization(roots, k, pointIndexes, pp, pt, -1, side, denseTick, REF_BROAD_LOCAL_C3)
+                                if c3Ok
+                                    if refAppendDenseCandidate(roots, withFvg, pp, pt, major, side, c3Bottom, c3Top, denseTick, mTick, REF_FVG_RANGE_INSIDE, true, outCandidates)
+                                        added += 1
+                                [c4Ok, c4Bottom, c4Top] = refBroadLocalization(roots, k, pointIndexes, pp, pt, -1, side, denseTick, REF_BROAD_LOCAL_C4)
+                                if c4Ok
+                                    if refAppendDenseCandidate(roots, withFvg, pp, pt, major, side, c4Bottom, c4Top, denseTick, mTick, REF_FVG_RANGE_INSIDE, true, outCandidates)
+                                        added += 1
+                        k += 1
+                v += 1
+    added
+
+// Enumerates every Stage A candidate of `side` into outCandidates (cleared first)
+// and returns its size. Every contiguous window [i..j] (0 <= i <= j < N) of the
+// canonical Point order of refBuildPointOrder is built and passed to
+// refAppendStageAVariants: no two-pointer, no break on width, no cap, no early stop.
+// Invalid input (used / roots size mismatch, bad side, denseTick < 0,
+// mTick < denseTick, na / non-positive mintick) -> 0. used is read-only.
+refEnumerateStageA(array<RefRoot> roots, array<bool> used, int side, int denseTick, int mTick, float mintick, array<RefCandidate> outCandidates) =>
+    array.clear(outCandidates)
+    if array.size(used) == array.size(roots) and (side == REF_SIDE_SUPPORT or side == REF_SIDE_RESISTANCE) and denseTick >= 0 and mTick >= denseTick and not na(mintick) and mintick > 0
+        array<int> pointOrder = array.new_int()
+        int nOrder = refBuildPointOrder(roots, used, side, pointOrder)
+        int i = 0
+        while i < nOrder
+            int j = i
+            while j < nOrder
+                array<int> window = array.new_int()
+                int w = i
+                while w <= j
+                    array.push(window, array.get(pointOrder, w))
+                    w += 1
+                refAppendStageAVariants(roots, used, window, side, denseTick, mTick, mintick, outCandidates)
+                j += 1
+            i += 1
+    array.size(outCandidates)
 
 plot(na, title = "Compile anchor", display = display.none)
