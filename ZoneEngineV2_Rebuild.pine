@@ -8181,6 +8181,485 @@ timeHlPeriodKeysRaw(ZoneCfg cfg, int baseOpenTime) =>
     [sessionKind, sessionStartTime, dayStartTime, weekStartTime]
 
 // ============================================================
+// W03 Batch 23 : E-stage TimeHL (period rollover, new extremes, retirement)
+// Source: I7 (TimeHL), I10, A7.6, D12
+//
+// Internal only.
+//   timeHlVirtualMaskNowRaw : read-only label mask of a TimeHL Root as the journal
+//                             leaves it now - a committed live ACTIVE TF_5M TimeHL
+//                             Root, or the Root a pending NEW_ROOT TimeHL row of this
+//                             bar creates at its predicted address - replayed through
+//                             the TIMEHL_LABEL rows already journaled. na otherwise.
+//   w03StageETimeHlRaw      : on a usable Base bar, with the period keys of
+//                             timeHlPeriodKeysRaw (called once):
+//     1. rollover, WEEK -> DAY -> SESSION, HIGH then LOW: the old previous label is
+//        dropped, the old current label moves to previous (only when the old period
+//        existed; a session moves on active -> other / none, never none -> active);
+//     2. new extremes by tick (strictly higher High / lower Low; an empty current
+//        ref is a first bar): one High and one Low event each carrying all its
+//        current labels in one mask - no Root -> NEW_ROOT (E2) at once; an existing
+//        or pending Root gets the missing bits; the replaced current holders lose
+//        their bits;
+//     3. journal : every label change of steps 1 - 2 is a logical bit step, checked
+//        in order on a local planner (one entry per Root: its mask when first seen
+//        and after each step). Only after all planning, each changed Root gets ONE
+//        TIMEHL_LABEL (E3) initial -> final, and each Root ending at 0 ONE
+//        ROOT_RETIRE (E4). One row per Root keeps F6 from re-pointing a ref (ON -> ON
+//        is a set) back to an old holder after E2 moved it to the new Root.
+// The 12 persistent ref pairs are read into locals for this bar only; refs and the
+// tracker are never written here (F6 derives the refs, the 4 tracker values are
+// returned). Only journal rows, the violation flag and the local planner arrays are
+// written. Business call sites = 0 in this Batch.
+// ============================================================
+
+// Label mask of a TimeHL Root as the journal leaves it now, or na.
+timeHlVirtualMaskNowRaw(ZoneEngine engine, int rootSlot, int expectedRootId, int pendingNewRow) =>
+    int  mask = int(na)
+    bool ok   = false
+    if pendingNewRow == SLOT_INVALID
+        // committed : a live, owned, ACTIVE TF_5M TimeHL Root
+        if rootSlot != SLOT_INVALID and expectedRootId != ID_NONE and rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootCategories) and rootSlot < array.size(engine.rootTfCodes) and rootSlot < array.size(engine.rootStates) and rootSlot < array.size(engine.rootLabelMasks)
+            if array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == expectedRootId and array.get(engine.rootCategories, rootSlot) == CAT_TIME_HL and array.get(engine.rootTfCodes, rootSlot) == TF_5M and array.get(engine.rootStates, rootSlot) == ROOT_ACTIVE
+                mask := array.get(engine.rootLabelMasks, rootSlot)
+                ok   := true
+    else
+        // pending : a NEW_ROOT TimeHL row of this bar at its predicted address
+        if pendingNewRow >= 0 and pendingNewRow < engine.w03Store.journalCount
+            if array.get(engine.w03Store.journalOps, pendingNewRow) == JOP_NEW_ROOT and array.get(engine.w03Store.journalGroups, pendingNewRow) == JGROUP_E2 and array.get(engine.w03Store.journalCategories, pendingNewRow) == CAT_TIME_HL
+                if predictedNewRootSlotRaw(engine, pendingNewRow) == rootSlot and predictedNewRootIdRaw(engine, pendingNewRow) == expectedRootId
+                    mask := array.get(engine.w03Store.journalNewMasks, pendingNewRow)
+                    ok   := true
+    // the TIMEHL_LABEL rows already journaled for this Root, in append order
+    if ok
+        int row = 0
+        while row < engine.w03Store.journalCount
+            if array.get(engine.w03Store.journalOps, row) == JOP_TIMEHL_LABEL and array.get(engine.w03Store.journalTargetRootSlots, row) == rootSlot and array.get(engine.w03Store.journalExpectedRootIds, row) == expectedRootId
+                mask := array.get(engine.w03Store.journalNewMasks, row)
+            row += 1
+    mask
+
+// E-stage TimeHL. Returns [true, 4 TimeHL tracker values].
+w03StageETimeHlRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed, int nextTimeHlSessionKind, int nextTimeHlSessionStartTime, int nextTimeHlDayStartTime, int nextTimeHlWeekStartTime) =>
+    int  outTimeHlSessionKind      = nextTimeHlSessionKind
+    int  outTimeHlSessionStartTime = nextTimeHlSessionStartTime
+    int  outTimeHlDayStartTime     = nextTimeHlDayStartTime
+    int  outTimeHlWeekStartTime    = nextTimeHlWeekStartTime
+    bool usable  = cfg.useTimeHl and not na(feed.baseOpenTime) and not na(feed.baseCloseTime) and not na(feed.baseHigh) and not na(feed.baseLow) and not na(feed.mintick) and feed.mintick > 0
+    bool stopped = not usable
+    if usable
+        // the period keys of this Base bar (B22, exactly once)
+        [currentSessionKind, currentSessionStartTime, currentDayStartTime, currentWeekStartTime] = timeHlPeriodKeysRaw(cfg, feed.baseOpenTime)
+        // the label planner of this bar (local only): one entry per changed Root
+        array<int> planRootSlots       = array.new_int(0)
+        array<int> planExpectedRootIds = array.new_int(0)
+        array<int> planPendingNewRows  = array.new_int(0)
+        array<int> planInitialMasks    = array.new_int(0)
+        array<int> planFinalMasks      = array.new_int(0)
+        array<int> planSubtypes        = array.new_int(0)
+        // the 12 logical ref pairs, as locals for this bar only
+        int curSessionHighSlot = engine.w03Store.curSessionHighRootSlot
+        int curSessionHighId   = engine.w03Store.curSessionHighExpectedRootId
+        int curSessionLowSlot = engine.w03Store.curSessionLowRootSlot
+        int curSessionLowId   = engine.w03Store.curSessionLowExpectedRootId
+        int lastSessionHighSlot = engine.w03Store.lastSessionHighRootSlot
+        int lastSessionHighId   = engine.w03Store.lastSessionHighExpectedRootId
+        int lastSessionLowSlot = engine.w03Store.lastSessionLowRootSlot
+        int lastSessionLowId   = engine.w03Store.lastSessionLowExpectedRootId
+        int todayHighSlot = engine.w03Store.todayHighRootSlot
+        int todayHighId   = engine.w03Store.todayHighExpectedRootId
+        int todayLowSlot = engine.w03Store.todayLowRootSlot
+        int todayLowId   = engine.w03Store.todayLowExpectedRootId
+        int prevDayHighSlot = engine.w03Store.prevDayHighRootSlot
+        int prevDayHighId   = engine.w03Store.prevDayHighExpectedRootId
+        int prevDayLowSlot = engine.w03Store.prevDayLowRootSlot
+        int prevDayLowId   = engine.w03Store.prevDayLowExpectedRootId
+        int curWeekHighSlot = engine.w03Store.curWeekHighRootSlot
+        int curWeekHighId   = engine.w03Store.curWeekHighExpectedRootId
+        int curWeekLowSlot = engine.w03Store.curWeekLowRootSlot
+        int curWeekLowId   = engine.w03Store.curWeekLowExpectedRootId
+        int prevWeekHighSlot = engine.w03Store.prevWeekHighRootSlot
+        int prevWeekHighId   = engine.w03Store.prevWeekHighExpectedRootId
+        int prevWeekLowSlot = engine.w03Store.prevWeekLowRootSlot
+        int prevWeekLowId   = engine.w03Store.prevWeekLowExpectedRootId
+        // a ref is either a full pair or NONE (SLOT_INVALID + ID_NONE)
+        int k = 0
+        while not stopped and k < 12
+            int refSlot = k == 0 ? curSessionHighSlot : k == 1 ? curSessionLowSlot : k == 2 ? lastSessionHighSlot : k == 3 ? lastSessionLowSlot : k == 4 ? todayHighSlot : k == 5 ? todayLowSlot : k == 6 ? prevDayHighSlot : k == 7 ? prevDayLowSlot : k == 8 ? curWeekHighSlot : k == 9 ? curWeekLowSlot : k == 10 ? prevWeekHighSlot : prevWeekLowSlot
+            int refId   = k == 0 ? curSessionHighId : k == 1 ? curSessionLowId : k == 2 ? lastSessionHighId : k == 3 ? lastSessionLowId : k == 4 ? todayHighId : k == 5 ? todayLowId : k == 6 ? prevDayHighId : k == 7 ? prevDayLowId : k == 8 ? curWeekHighId : k == 9 ? curWeekLowId : k == 10 ? prevWeekHighId : prevWeekLowId
+            if (refSlot == SLOT_INVALID) != (refId == ID_NONE)
+                engine.w03Store.journalInvariantViolation := true
+                stopped := true
+            k += 1
+        // which periods rolled over
+        bool weekChanged    = na(nextTimeHlWeekStartTime) or nextTimeHlWeekStartTime != currentWeekStartTime
+        bool dayChanged     = na(nextTimeHlDayStartTime) or nextTimeHlDayStartTime != currentDayStartTime
+        bool sessionChanged = nextTimeHlSessionKind != currentSessionKind or na(nextTimeHlSessionStartTime) != na(currentSessionStartTime) or (not na(nextTimeHlSessionStartTime) and not na(currentSessionStartTime) and nextTimeHlSessionStartTime != currentSessionStartTime)
+        // the old period existed: its current labels move to previous
+        bool weekRoll    = weekChanged and not na(nextTimeHlWeekStartTime)
+        bool dayRoll     = dayChanged and not na(nextTimeHlDayStartTime)
+        bool sessionRoll = sessionChanged and nextTimeHlSessionKind != TIMEHL_SESSION_NONE and not na(nextTimeHlSessionStartTime)
+        // ---- 1. rollover : WEEK -> DAY -> SESSION; HIGH then LOW; drop previous, then move current ----
+        int s = 0
+        while not stopped and s < 12
+            int  period   = int(math.floor(s / 4))
+            int  side     = int(math.floor((s % 4) / 2))
+            int  part     = s % 2
+            bool doRoll   = period == 0 ? weekRoll : period == 1 ? dayRoll : sessionRoll
+            int  curLabel = period == 0 ? 4 : period == 1 ? 2 : 0
+            int  curBit   = period == 0 ? TIMEHL_LABEL_CUR_WEEK : period == 1 ? TIMEHL_LABEL_TODAY : TIMEHL_LABEL_CUR_SESSION
+            int  prevBit  = period == 0 ? TIMEHL_LABEL_PREV_WEEK : period == 1 ? TIMEHL_LABEL_PREV_DAY : TIMEHL_LABEL_LAST_SESSION
+            if doRoll
+                // part 0 : the previous holder loses the previous label;
+                // part 1 : the current holder trades the current label for the previous one
+                int kRef      = (part == 0 ? curLabel + 1 : curLabel) * 2 + side
+                int tSub      = side == 0 ? SUB_TIMEHL_HIGH : SUB_TIMEHL_LOW
+                int removeBit = part == 0 ? prevBit : curBit
+                int addBit    = part == 0 ? 0 : prevBit
+                int tSlot     = kRef == 0 ? curSessionHighSlot : kRef == 1 ? curSessionLowSlot : kRef == 2 ? lastSessionHighSlot : kRef == 3 ? lastSessionLowSlot : kRef == 4 ? todayHighSlot : kRef == 5 ? todayLowSlot : kRef == 6 ? prevDayHighSlot : kRef == 7 ? prevDayLowSlot : kRef == 8 ? curWeekHighSlot : kRef == 9 ? curWeekLowSlot : kRef == 10 ? prevWeekHighSlot : prevWeekLowSlot
+                int tId       = kRef == 0 ? curSessionHighId : kRef == 1 ? curSessionLowId : kRef == 2 ? lastSessionHighId : kRef == 3 ? lastSessionLowId : kRef == 4 ? todayHighId : kRef == 5 ? todayLowId : kRef == 6 ? prevDayHighId : kRef == 7 ? prevDayLowId : kRef == 8 ? curWeekHighId : kRef == 9 ? curWeekLowId : kRef == 10 ? prevWeekHighId : prevWeekLowId
+                if not (tSlot == SLOT_INVALID and tId == ID_NONE)
+                    int pIdx = SLOT_INVALID
+                    int pIdxI = 0
+                    while pIdx == SLOT_INVALID and pIdxI < array.size(planRootSlots)
+                        if array.get(planRootSlots, pIdxI) == tSlot and array.get(planExpectedRootIds, pIdxI) == tId
+                            pIdx := pIdxI
+                        pIdxI += 1
+                    int  curMask = int(na)
+                    bool valid   = true
+                    if pIdx == SLOT_INVALID
+                        // first change of this Root this bar: its mask as the journal leaves it now
+                        int tPending = SLOT_INVALID
+                        curMask := timeHlVirtualMaskNowRaw(engine, tSlot, tId, tPending)
+                        valid   := not na(curMask)
+                        if valid
+                            if tPending == SLOT_INVALID
+                                valid := tSlot < array.size(engine.rootSubtypes)
+                                if valid
+                                    valid := array.get(engine.rootSubtypes, tSlot) == tSub
+                            else
+                                valid := array.get(engine.w03Store.journalSubtypes, tPending) == tSub
+                        if valid
+                            array.push(planRootSlots,       tSlot)
+                            array.push(planExpectedRootIds, tId)
+                            array.push(planPendingNewRows,  tPending)
+                            array.push(planInitialMasks,    curMask)
+                            array.push(planFinalMasks,      curMask)
+                            array.push(planSubtypes,        tSub)
+                            pIdx := array.size(planRootSlots) - 1
+                    else
+                        // later changes of the same Root: the planner mask is the virtual mask
+                        curMask := array.get(planFinalMasks, pIdx)
+                        valid   := array.get(planSubtypes, pIdx) == tSub
+                    if valid and removeBit > 0
+                        valid := int(math.floor(curMask / removeBit)) % 2 == 1
+                    if valid and addBit > 0
+                        valid := int(math.floor((curMask - removeBit) / addBit)) % 2 == 0
+                    if valid
+                        array.set(planFinalMasks, pIdx, curMask - removeBit + addBit)
+                    else
+                        engine.w03Store.journalInvariantViolation := true
+                        stopped := true
+                if not stopped and part == 1
+                    // locals : previous = old current, current = NONE
+                    int kPrev = (curLabel + 1) * 2 + side
+                    if kPrev == 0
+                        curSessionHighSlot := tSlot
+                        curSessionHighId   := tId
+                    else if kPrev == 1
+                        curSessionLowSlot := tSlot
+                        curSessionLowId   := tId
+                    else if kPrev == 2
+                        lastSessionHighSlot := tSlot
+                        lastSessionHighId   := tId
+                    else if kPrev == 3
+                        lastSessionLowSlot := tSlot
+                        lastSessionLowId   := tId
+                    else if kPrev == 4
+                        todayHighSlot := tSlot
+                        todayHighId   := tId
+                    else if kPrev == 5
+                        todayLowSlot := tSlot
+                        todayLowId   := tId
+                    else if kPrev == 6
+                        prevDayHighSlot := tSlot
+                        prevDayHighId   := tId
+                    else if kPrev == 7
+                        prevDayLowSlot := tSlot
+                        prevDayLowId   := tId
+                    else if kPrev == 8
+                        curWeekHighSlot := tSlot
+                        curWeekHighId   := tId
+                    else if kPrev == 9
+                        curWeekLowSlot := tSlot
+                        curWeekLowId   := tId
+                    else if kPrev == 10
+                        prevWeekHighSlot := tSlot
+                        prevWeekHighId   := tId
+                    else if kPrev == 11
+                        prevWeekLowSlot := tSlot
+                        prevWeekLowId   := tId
+                    if kRef == 0
+                        curSessionHighSlot := SLOT_INVALID
+                        curSessionHighId   := ID_NONE
+                    else if kRef == 1
+                        curSessionLowSlot := SLOT_INVALID
+                        curSessionLowId   := ID_NONE
+                    else if kRef == 2
+                        lastSessionHighSlot := SLOT_INVALID
+                        lastSessionHighId   := ID_NONE
+                    else if kRef == 3
+                        lastSessionLowSlot := SLOT_INVALID
+                        lastSessionLowId   := ID_NONE
+                    else if kRef == 4
+                        todayHighSlot := SLOT_INVALID
+                        todayHighId   := ID_NONE
+                    else if kRef == 5
+                        todayLowSlot := SLOT_INVALID
+                        todayLowId   := ID_NONE
+                    else if kRef == 6
+                        prevDayHighSlot := SLOT_INVALID
+                        prevDayHighId   := ID_NONE
+                    else if kRef == 7
+                        prevDayLowSlot := SLOT_INVALID
+                        prevDayLowId   := ID_NONE
+                    else if kRef == 8
+                        curWeekHighSlot := SLOT_INVALID
+                        curWeekHighId   := ID_NONE
+                    else if kRef == 9
+                        curWeekLowSlot := SLOT_INVALID
+                        curWeekLowId   := ID_NONE
+                    else if kRef == 10
+                        prevWeekHighSlot := SLOT_INVALID
+                        prevWeekHighId   := ID_NONE
+                    else if kRef == 11
+                        prevWeekLowSlot := SLOT_INVALID
+                        prevWeekLowId   := ID_NONE
+            s += 1
+        // ---- 2. new extremes by tick (HIGH then LOW), all current labels in one mask ----
+        int baseHighTick = int(math.round(feed.baseHigh / feed.mintick))
+        int baseLowTick  = int(math.round(feed.baseLow  / feed.mintick))
+        int newHighMask  = 0
+        int newLowMask   = 0
+        int c = 0
+        while not stopped and c < 6
+            int side     = int(math.floor(c / 3))
+            int which    = c % 3
+            int curLabel = which == 0 ? 0 : which == 1 ? 2 : 4
+            int curBit   = which == 0 ? TIMEHL_LABEL_CUR_SESSION : which == 1 ? TIMEHL_LABEL_TODAY : TIMEHL_LABEL_CUR_WEEK
+            // no current session between sessions: CUR_SESSION is never set then
+            if which > 0 or currentSessionKind != TIMEHL_SESSION_NONE
+                int kRef  = curLabel * 2 + side
+                int tSlot = kRef == 0 ? curSessionHighSlot : kRef == 1 ? curSessionLowSlot : kRef == 2 ? lastSessionHighSlot : kRef == 3 ? lastSessionLowSlot : kRef == 4 ? todayHighSlot : kRef == 5 ? todayLowSlot : kRef == 6 ? prevDayHighSlot : kRef == 7 ? prevDayLowSlot : kRef == 8 ? curWeekHighSlot : kRef == 9 ? curWeekLowSlot : kRef == 10 ? prevWeekHighSlot : prevWeekLowSlot
+                int tId   = kRef == 0 ? curSessionHighId : kRef == 1 ? curSessionLowId : kRef == 2 ? lastSessionHighId : kRef == 3 ? lastSessionLowId : kRef == 4 ? todayHighId : kRef == 5 ? todayLowId : kRef == 6 ? prevDayHighId : kRef == 7 ? prevDayLowId : kRef == 8 ? curWeekHighId : kRef == 9 ? curWeekLowId : kRef == 10 ? prevWeekHighId : prevWeekLowId
+                bool isNew = false
+                if tSlot == SLOT_INVALID and tId == ID_NONE
+                    // the first bar of the period
+                    isNew := true
+                else
+                    // the planner mask when this Root already changed this bar, else the journal view
+                    int curMask = timeHlVirtualMaskNowRaw(engine, tSlot, tId, SLOT_INVALID)
+                    int cIdx = SLOT_INVALID
+                    int cIdxI = 0
+                    while cIdx == SLOT_INVALID and cIdxI < array.size(planRootSlots)
+                        if array.get(planRootSlots, cIdxI) == tSlot and array.get(planExpectedRootIds, cIdxI) == tId
+                            cIdx := cIdxI
+                        cIdxI += 1
+                    if cIdx != SLOT_INVALID
+                        curMask := array.get(planFinalMasks, cIdx)
+                    bool valid = not na(curMask)
+                    if valid
+                        valid := tSlot < array.size(engine.rootSubtypes) and tSlot < array.size(engine.rootPointTicks)
+                    if valid
+                        valid := array.get(engine.rootSubtypes, tSlot) == (side == 0 ? SUB_TIMEHL_HIGH : SUB_TIMEHL_LOW) and int(math.floor(curMask / curBit)) % 2 == 1 and not na(array.get(engine.rootPointTicks, tSlot))
+                    if valid
+                        int refTick = array.get(engine.rootPointTicks, tSlot)
+                        isNew := side == 0 ? baseHighTick > refTick : baseLowTick < refTick
+                    else
+                        engine.w03Store.journalInvariantViolation := true
+                        stopped := true
+                if not stopped and isNew
+                    if side == 0
+                        newHighMask += curBit
+                    else
+                        newLowMask += curBit
+            c += 1
+        // HIGH event, then its replaced holders; LOW event, then its replaced holders
+        int eventSlot = SLOT_INVALID
+        int eventId   = ID_NONE
+        int x = 0
+        while not stopped and x < 8
+            int   side    = int(math.floor(x / 4))
+            int   part    = x % 4
+            int   evMask  = side == 0 ? newHighMask : newLowMask
+            int   evSub   = side == 0 ? SUB_TIMEHL_HIGH : SUB_TIMEHL_LOW
+            int   evTick  = side == 0 ? baseHighTick : baseLowTick
+            float evPrice = side == 0 ? feed.baseHigh : feed.baseLow
+            if evMask != 0 and part == 0
+                // the event Root: new, or an existing / pending one missing some bits
+                eventSlot := SLOT_INVALID
+                eventId   := ID_NONE
+                int originKey = originKeyComputeRaw(CAT_TIME_HL, evSub, TF_5M, evTick, feed.baseOpenTime, FVG_NONE)
+                [rootSlot, pendingRow] = originLookupUniqueRaw(engine, originKey, CAT_TIME_HL, evSub, TF_5M, evTick, feed.baseOpenTime, feed.baseCloseTime, FVG_NONE, feed.mintick)
+                if engine.w03Store.journalInvariantViolation
+                    stopped := true
+                else if rootSlot == SLOT_INVALID and pendingRow == SLOT_INVALID
+                    // no match: the new Root carries every current label of the event (E2)
+                    int newRow = journalAppendRaw(engine, JOP_NEW_ROOT, JGROUP_E2, SLOT_INVALID, ID_NONE, CAT_TIME_HL, evSub, TF_5M, originKey, feed.baseOpenTime, feed.baseCloseTime, feed.baseCloseTime, evPrice, float(na), float(na), ROOT_ACTIVE, ROOT_ACTIVE, false, false, FVG_NONE, 0, evMask, ID_NONE, int(na))
+                else
+                    // an existing or pending Root: add each missing bit through the planner
+                    int evPending = SLOT_INVALID
+                    if rootSlot != SLOT_INVALID
+                        eventSlot := rootSlot
+                        eventId   := array.get(engine.rootIds, rootSlot)
+                    else
+                        evPending := pendingRow
+                        eventSlot := predictedNewRootSlotRaw(engine, pendingRow)
+                        eventId   := predictedNewRootIdRaw(engine, pendingRow)
+                    int bitLoop = 1
+                    while not stopped and bitLoop <= 16
+                        if int(math.floor(evMask / bitLoop)) % 2 == 1
+                            int haveMask = timeHlVirtualMaskNowRaw(engine, eventSlot, eventId, evPending)
+                            int hIdx = SLOT_INVALID
+                            int hIdxI = 0
+                            while hIdx == SLOT_INVALID and hIdxI < array.size(planRootSlots)
+                                if array.get(planRootSlots, hIdxI) == eventSlot and array.get(planExpectedRootIds, hIdxI) == eventId
+                                    hIdx := hIdxI
+                                hIdxI += 1
+                            if hIdx != SLOT_INVALID
+                                haveMask := array.get(planFinalMasks, hIdx)
+                            if na(haveMask)
+                                engine.w03Store.journalInvariantViolation := true
+                                stopped := true
+                            else if int(math.floor(haveMask / bitLoop)) % 2 == 0
+                                int tSlot     = eventSlot
+                                int tId       = eventId
+                                int tSub      = evSub
+                                int removeBit = 0
+                                int addBit    = bitLoop
+                                if not (tSlot == SLOT_INVALID and tId == ID_NONE)
+                                    int pIdx = SLOT_INVALID
+                                    int pIdxI = 0
+                                    while pIdx == SLOT_INVALID and pIdxI < array.size(planRootSlots)
+                                        if array.get(planRootSlots, pIdxI) == tSlot and array.get(planExpectedRootIds, pIdxI) == tId
+                                            pIdx := pIdxI
+                                        pIdxI += 1
+                                    int  curMask = int(na)
+                                    bool valid   = true
+                                    if pIdx == SLOT_INVALID
+                                        // first change of this Root this bar: its mask as the journal leaves it now
+                                        int tPending = evPending
+                                        curMask := timeHlVirtualMaskNowRaw(engine, tSlot, tId, tPending)
+                                        valid   := not na(curMask)
+                                        if valid
+                                            if tPending == SLOT_INVALID
+                                                valid := tSlot < array.size(engine.rootSubtypes)
+                                                if valid
+                                                    valid := array.get(engine.rootSubtypes, tSlot) == tSub
+                                            else
+                                                valid := array.get(engine.w03Store.journalSubtypes, tPending) == tSub
+                                        if valid
+                                            array.push(planRootSlots,       tSlot)
+                                            array.push(planExpectedRootIds, tId)
+                                            array.push(planPendingNewRows,  tPending)
+                                            array.push(planInitialMasks,    curMask)
+                                            array.push(planFinalMasks,      curMask)
+                                            array.push(planSubtypes,        tSub)
+                                            pIdx := array.size(planRootSlots) - 1
+                                    else
+                                        // later changes of the same Root: the planner mask is the virtual mask
+                                        curMask := array.get(planFinalMasks, pIdx)
+                                        valid   := array.get(planSubtypes, pIdx) == tSub
+                                    if valid and removeBit > 0
+                                        valid := int(math.floor(curMask / removeBit)) % 2 == 1
+                                    if valid and addBit > 0
+                                        valid := int(math.floor((curMask - removeBit) / addBit)) % 2 == 0
+                                    if valid
+                                        array.set(planFinalMasks, pIdx, curMask - removeBit + addBit)
+                                    else
+                                        engine.w03Store.journalInvariantViolation := true
+                                        stopped := true
+                        bitLoop := bitLoop * 4
+            else if part > 0
+                // the replaced current holder loses that current label (logical step)
+                int which     = part - 1
+                int curLabel  = which == 0 ? 0 : which == 1 ? 2 : 4
+                int removeBit = which == 0 ? TIMEHL_LABEL_CUR_SESSION : which == 1 ? TIMEHL_LABEL_TODAY : TIMEHL_LABEL_CUR_WEEK
+                if int(math.floor(evMask / removeBit)) % 2 == 1
+                    int kRef   = curLabel * 2 + side
+                    int tSub   = evSub
+                    int addBit = 0
+                    int tSlot  = kRef == 0 ? curSessionHighSlot : kRef == 1 ? curSessionLowSlot : kRef == 2 ? lastSessionHighSlot : kRef == 3 ? lastSessionLowSlot : kRef == 4 ? todayHighSlot : kRef == 5 ? todayLowSlot : kRef == 6 ? prevDayHighSlot : kRef == 7 ? prevDayLowSlot : kRef == 8 ? curWeekHighSlot : kRef == 9 ? curWeekLowSlot : kRef == 10 ? prevWeekHighSlot : prevWeekLowSlot
+                    int tId    = kRef == 0 ? curSessionHighId : kRef == 1 ? curSessionLowId : kRef == 2 ? lastSessionHighId : kRef == 3 ? lastSessionLowId : kRef == 4 ? todayHighId : kRef == 5 ? todayLowId : kRef == 6 ? prevDayHighId : kRef == 7 ? prevDayLowId : kRef == 8 ? curWeekHighId : kRef == 9 ? curWeekLowId : kRef == 10 ? prevWeekHighId : prevWeekLowId
+                    // the event Root itself (a re-seen identity) keeps its label
+                    if eventSlot != SLOT_INVALID and tSlot == eventSlot and tId == eventId
+                        tSlot := SLOT_INVALID
+                        tId   := ID_NONE
+                    if not (tSlot == SLOT_INVALID and tId == ID_NONE)
+                        int pIdx = SLOT_INVALID
+                        int pIdxI = 0
+                        while pIdx == SLOT_INVALID and pIdxI < array.size(planRootSlots)
+                            if array.get(planRootSlots, pIdxI) == tSlot and array.get(planExpectedRootIds, pIdxI) == tId
+                                pIdx := pIdxI
+                            pIdxI += 1
+                        int  curMask = int(na)
+                        bool valid   = true
+                        if pIdx == SLOT_INVALID
+                            // first change of this Root this bar: its mask as the journal leaves it now
+                            int tPending = SLOT_INVALID
+                            curMask := timeHlVirtualMaskNowRaw(engine, tSlot, tId, tPending)
+                            valid   := not na(curMask)
+                            if valid
+                                if tPending == SLOT_INVALID
+                                    valid := tSlot < array.size(engine.rootSubtypes)
+                                    if valid
+                                        valid := array.get(engine.rootSubtypes, tSlot) == tSub
+                                else
+                                    valid := array.get(engine.w03Store.journalSubtypes, tPending) == tSub
+                            if valid
+                                array.push(planRootSlots,       tSlot)
+                                array.push(planExpectedRootIds, tId)
+                                array.push(planPendingNewRows,  tPending)
+                                array.push(planInitialMasks,    curMask)
+                                array.push(planFinalMasks,      curMask)
+                                array.push(planSubtypes,        tSub)
+                                pIdx := array.size(planRootSlots) - 1
+                        else
+                            // later changes of the same Root: the planner mask is the virtual mask
+                            curMask := array.get(planFinalMasks, pIdx)
+                            valid   := array.get(planSubtypes, pIdx) == tSub
+                        if valid and removeBit > 0
+                            valid := int(math.floor(curMask / removeBit)) % 2 == 1
+                        if valid and addBit > 0
+                            valid := int(math.floor((curMask - removeBit) / addBit)) % 2 == 0
+                        if valid
+                            array.set(planFinalMasks, pIdx, curMask - removeBit + addBit)
+                        else
+                            engine.w03Store.journalInvariantViolation := true
+                            stopped := true
+            x += 1
+        // ---- 3. journal : one TIMEHL_LABEL (E3) per changed Root, initial -> final mask,
+        // then one ROOT_RETIRE (E4) per changed Root whose final mask is 0 ----
+        int p = 0
+        while not stopped and p < array.size(planRootSlots)
+            int initMask  = array.get(planInitialMasks, p)
+            int finalMask = array.get(planFinalMasks,   p)
+            if initMask != finalMask
+                int labelRow = journalAppendRaw(engine, JOP_TIMEHL_LABEL, JGROUP_E3, array.get(planRootSlots, p), array.get(planExpectedRootIds, p), CAT_TIME_HL, array.get(planSubtypes, p), TF_5M, ID_NONE, int(na), int(na), int(na), float(na), float(na), float(na), ROOT_ACTIVE, ROOT_ACTIVE, false, false, FVG_NONE, initMask, finalMask, ID_NONE, int(na))
+            p += 1
+        p := 0
+        while not stopped and p < array.size(planRootSlots)
+            if array.get(planInitialMasks, p) != array.get(planFinalMasks, p) and array.get(planFinalMasks, p) == 0
+                int retireRow = journalAppendRaw(engine, JOP_ROOT_RETIRE, JGROUP_E4, array.get(planRootSlots, p), array.get(planExpectedRootIds, p), CAT_TIME_HL, array.get(planSubtypes, p), TF_5M, ID_NONE, int(na), int(na), int(na), float(na), float(na), float(na), ROOT_ACTIVE, ROOT_RETIRED, false, false, FVG_NONE, 0, 0, ID_NONE, int(na))
+            p += 1
+        // the tracker of this bar (returned; F6 commits it)
+        outTimeHlSessionKind      := currentSessionKind
+        outTimeHlSessionStartTime := currentSessionStartTime
+        outTimeHlDayStartTime     := currentDayStartTime
+        outTimeHlWeekStartTime    := currentWeekStartTime
+    [true, outTimeHlSessionKind, outTimeHlSessionStartTime, outTimeHlDayStartTime, outTimeHlWeekStartTime]
+
+
+// ============================================================
 // W02 Batch 14 : Side Phase set index raw helpers (I11-9)
 //
 // Internal only. They maintain the Batch 13 membership of one Side in the Phase set
