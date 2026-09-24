@@ -601,6 +601,11 @@ const int CAND_BROAD_LOCAL_C1 = 1
 const int CAND_BROAD_LOCAL_C2 = 2
 const int CAND_BROAD_LOCAL_C3 = 3
 const int CAND_BROAD_LOCAL_C4 = 4
+// W05 B13: winner-loop pool mode (not a Stage, not a comparator key)
+const int CAND_POOL_NONE         = 0
+const int CAND_POOL_DENSE        = 1
+const int CAND_POOL_STAGE_C      = 2
+const int CAND_POOL_CONTEXT_SCAN = 3
 candTickLimitsRaw(ZoneCfg cfg, float mintick) =>
     int mTick     = int(math.round(cfg.clusterMaxWidth / mintick))
     int denseTick = int(math.round((cfg.clusterMaxWidth * cfg.denseRatio) / mintick))
@@ -745,6 +750,9 @@ export type W03SourceRootStore
     int          candidateWinnerRefValueLength    = 0
     array<float> candidateWinnerRefRepScratch
     int          candidateWinnerRefRepLength      = 0
+    int          candidatePoolMode                = 0
+    int          candidateBroadSeenEpoch          = 0
+    array<int>   candidateBroadSeenEpochByRootSlot
 export type ZoneEngine
     bool  configValid            = false
     int   cfgErrorCode           = 0
@@ -1301,6 +1309,7 @@ export newEngine(ZoneCfg cfg) =>
     w03.candidateWinnerRootIds              := array.new_int(0)
     w03.candidateWinnerRefValueScratch      := array.new_float(0)
     w03.candidateWinnerRefRepScratch        := array.new_float(0)
+    w03.candidateBroadSeenEpochByRootSlot   := array.new_int(0)
     e.w03Store := w03
     e.candidateScratchSupportOldRootSlots    := array.new_int(0)
     e.candidateScratchSupportOldLength       := 0
@@ -6796,13 +6805,89 @@ candCompletionCountRaw(ZoneEngine engine, ZoneCfg cfg, float mintick, int side, 
     if not ok
         count := 0
     [ok, count, count == 1 ? uniquePsych : int(na), count == 1 ? uniquePeer : SLOT_INVALID]
+// W05 B13: exact identity vs materialized winners (side, stage, ticks, Root ID set, Psych tick, fvgMode)
+candMatchesMaterializedWinnerRaw(ZoneEngine engine, int side, int stage, int leftIndex, int rightIndex, int effectiveBottomTick, int effectiveTopTick, int fvgMode, int fvgRootSlot, int currentPsychLevelTick, int currentFvgRootSlot2) =>
+    bool       ok        = side == SIDE_SUPPORT or side == SIDE_RESISTANCE
+    bool       already   = false
+    bool       isSupport = side == SIDE_SUPPORT
+    array<int> scratch   = isSupport ? engine.candidateScratchSupportNewRootSlots : engine.candidateScratchResistanceNewRootSlots
+    int        scratchLength = isSupport ? engine.candidateScratchSupportNewLength : engine.candidateScratchResistanceNewLength
+    array<int> ids       = engine.w03Store.candidateWinnerRootIds
+    bool noPoint = leftIndex == SLOT_INVALID and rightIndex == SLOT_INVALID
+    if ok and not noPoint
+        ok := leftIndex >= 0 and rightIndex >= leftIndex and rightIndex < scratchLength and rightIndex < array.size(scratch)
+    int nPoint = ok and not noPoint ? rightIndex - leftIndex + 1 : 0
+    int nReal  = nPoint + (fvgRootSlot != SLOT_INVALID ? 1 : 0) + (currentFvgRootSlot2 != SLOT_INVALID ? 1 : 0)
+    int count  = engine.w03Store.candidateWinnerLogicalCount
+    if ok
+        ok := count >= 0 and count <= array.size(engine.w03Store.candidateWinnerSides) and count <= array.size(engine.w03Store.candidateWinnerStages) and count <= array.size(engine.w03Store.candidateWinnerEffectiveBottomTicks) and count <= array.size(engine.w03Store.candidateWinnerEffectiveTopTicks) and count <= array.size(engine.w03Store.candidateWinnerFvgModes) and count <= array.size(engine.w03Store.candidateWinnerPsychLevelTicks) and count <= array.size(engine.w03Store.candidateWinnerRootIdOffsets) and count <= array.size(engine.w03Store.candidateWinnerRootIdLengths)
+    int r = 0
+    while ok and not already and r < count
+        int  wPsych    = array.get(engine.w03Store.candidateWinnerPsychLevelTicks, r)
+        bool samePsych = (na(wPsych) and na(currentPsychLevelTick)) or (not na(wPsych) and not na(currentPsychLevelTick) and wPsych == currentPsychLevelTick)
+        if array.get(engine.w03Store.candidateWinnerSides, r) == side and array.get(engine.w03Store.candidateWinnerStages, r) == stage and array.get(engine.w03Store.candidateWinnerEffectiveBottomTicks, r) == effectiveBottomTick and array.get(engine.w03Store.candidateWinnerEffectiveTopTicks, r) == effectiveTopTick and array.get(engine.w03Store.candidateWinnerFvgModes, r) == fvgMode and samePsych and array.get(engine.w03Store.candidateWinnerRootIdLengths, r) == nReal
+            int off = array.get(engine.w03Store.candidateWinnerRootIdOffsets, r)
+            ok := off >= 0 and off + nReal <= array.size(ids)
+            bool same = ok
+            // every current real Root ID is in the winner segment (scalar scan)
+            int m = 0
+            while ok and same and m < nPoint + 2
+                int slot = currentFvgRootSlot2
+                if m < nPoint
+                    slot := array.get(scratch, leftIndex + m)
+                else if m == nPoint
+                    slot := fvgRootSlot
+                if m < nPoint or slot != SLOT_INVALID
+                    ok := slot >= 0 and slot < array.size(engine.rootIds)
+                    if ok
+                        int  id    = array.get(engine.rootIds, slot)
+                        bool found = false
+                        int  q = 0
+                        while not found and q < nReal
+                            found := array.get(ids, off + q) == id
+                            q += 1
+                        same := found
+                m += 1
+            already := ok and same
+        r += 1
+    [ok, ok and already]
 candOfferRaw(ZoneEngine engine, ZoneCfg cfg, float mintick, int side, int stage, int leftIndex, int rightIndex, int effectiveBottomTick, int effectiveTopTick, int cCount, int hCount, int density, bool baseStrong, int createdTime, int minRootId, int fvgMode, int fvgRootSlot, int categoryMask, int highMask, int currentPsychLevelTick, int currentFvgRootSlot2) =>
     bool handled = true
+    // W05 B13 pool gate: NONE keeps the B08 behavior; CONTEXT_SCAN only marks Broad participants
+    int  poolMode = engine.w03Store.candidatePoolMode
+    bool compete  = true
+    if poolMode == CAND_POOL_DENSE
+        compete := (stage == CAND_STAGE_A or stage == CAND_STAGE_B) and density == DEN_HIGH and baseStrong
+    else if poolMode == CAND_POOL_STAGE_C
+        compete := stage == CAND_STAGE_C and (density == DEN_HIGH or density == DEN_NORMAL)
+    else if poolMode == CAND_POOL_CONTEXT_SCAN
+        compete := false
+        array<int> seen = engine.w03Store.candidateBroadSeenEpochByRootSlot
+        int g = 0
+        while handled and g < 2
+            int slot = g == 0 ? fvgRootSlot : currentFvgRootSlot2
+            if slot != SLOT_INVALID
+                handled := slot >= 0 and slot < array.size(engine.rootIds) and slot < array.size(engine.rootSlotLiveFlags) and slot < array.size(engine.rootCategories) and slot < array.size(engine.rootIsBroadFvgFlags) and slot < array.size(seen)
+                if handled
+                    if array.get(engine.rootSlotLiveFlags, slot) and array.get(engine.rootCategories, slot) == CAT_FVG and array.get(engine.rootIsBroadFvgFlags, slot)
+                        array.set(seen, slot, engine.w03Store.candidateBroadSeenEpoch)
+            g += 1
+    else if poolMode != CAND_POOL_NONE
+        compete := false
+        handled := false
+    // exact prior-winner identity skip (never a tie)
+    if compete and poolMode != CAND_POOL_NONE
+        [mOk, mAlready] = candMatchesMaterializedWinnerRaw(engine, side, stage, leftIndex, rightIndex, effectiveBottomTick, effectiveTopTick, fvgMode, fvgRootSlot, currentPsychLevelTick, currentFvgRootSlot2)
+        if not mOk
+            handled := false
+            compete := false
+        else if mAlready
+            compete := false
     bool noBest  = engine.w03Store.candidateBestSide == SIDE_NONE
     int  cmp     = 1
-    if not noBest
+    if compete and not noBest
         cmp := candCompareRaw(cCount, hCount, effectiveBottomTick, effectiveTopTick, createdTime, minRootId, engine.w03Store.candidateBestCCount, engine.w03Store.candidateBestHCount, engine.w03Store.candidateBestEffectiveBottomTick, engine.w03Store.candidateBestEffectiveTopTick, engine.w03Store.candidateBestCreatedTime, engine.w03Store.candidateBestMinRootId)
-    if noBest or cmp == 1
+    if compete and (noBest or cmp == 1)
         engine.w03Store.candidateBestSide                := side
         engine.w03Store.candidateBestStage               := stage
         engine.w03Store.candidateBestLeftIndex           := leftIndex
@@ -6820,7 +6905,7 @@ candOfferRaw(ZoneEngine engine, ZoneCfg cfg, float mintick, int side, int stage,
         engine.w03Store.candidateBestCategoryMask        := categoryMask
         engine.w03Store.candidateBestHighMask            := highMask
         engine.w03Store.candidateRoundTie                := false
-    else if cmp == 0
+    else if compete and cmp == 0
         bool sameDirect = engine.w03Store.candidateBestSide == side and engine.w03Store.candidateBestStage == stage and engine.w03Store.candidateBestLeftIndex == leftIndex and engine.w03Store.candidateBestRightIndex == rightIndex and engine.w03Store.candidateBestEffectiveBottomTick == effectiveBottomTick and engine.w03Store.candidateBestEffectiveTopTick == effectiveTopTick and engine.w03Store.candidateBestFvgMode == fvgMode and engine.w03Store.candidateBestFvgRootSlot == fvgRootSlot
         if not sameDirect
             engine.w03Store.candidateRoundTie := true
@@ -7633,6 +7718,145 @@ candMaterializeWinnerRaw(ZoneEngine engine, ZoneCfg cfg, float mintick, int side
         engine.w03Store.candidateWinnerRootIdLength := rootStart + rootCount
         engine.w03Store.candidateWinnerLogicalCount := recordIndex + 1
     ok
+// W05 B13: exact greedy winner selection of one Side (Dense A+B -> Stage C -> final BroadContext).
+// Support starts the winner storage at 0, Resistance appends. Returns the Side winner count or -1.
+candSelectWinnersRaw(ZoneEngine engine, ZoneCfg cfg, float mintick, int side, int denseTick, int mTick) =>
+    bool isSupport = side == SIDE_SUPPORT
+    bool ok = (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and not na(mintick) and mintick > 0 and not na(denseTick) and not na(mTick) and denseTick >= 0 and mTick >= 0 and denseTick <= mTick
+    if side == SIDE_SUPPORT
+        engine.w03Store.candidateFailedSupport      := false
+        engine.w03Store.candidateWinnerLogicalCount := 0
+        engine.w03Store.candidateWinnerRootIdLength := 0
+    else if side == SIDE_RESISTANCE
+        engine.w03Store.candidateFailedResistance := false
+    int sideStartWinnerCount  = engine.w03Store.candidateWinnerLogicalCount
+    int sideStartRootIdLength = engine.w03Store.candidateWinnerRootIdLength
+    engine.w03Store.candidatePoolMode := CAND_POOL_NONE
+    array<bool> usedBySlot = isSupport ? engine.w03Store.candidateSupportUsedByRootSlot : engine.w03Store.candidateResistanceUsedByRootSlot
+    // used : every rootSlot false (Broad included; Virtual Psych has no Root)
+    if ok
+        int rootCount = array.size(engine.rootIds)
+        int usedSize  = math.max(rootCount, array.size(usedBySlot))
+        int u = 0
+        while u < usedSize
+            if u < array.size(usedBySlot)
+                array.set(usedBySlot, u, false)
+            else
+                array.push(usedBySlot, false)
+            u += 1
+    // phase 0 : Dense (Stage A + B, DEN_HIGH and baseStrong), phase 1 : Stage C
+    int phase = 0
+    while ok and phase < 2
+        bool phaseDone = false
+        while ok and not phaseDone
+            int pointLen = candBuildEligibleScratchRaw(engine, cfg, side)
+            int fvgLen   = candBuildFvgScratchRaw(engine, cfg, side)
+            // round best reset : B07 defaults, all 16 + tie
+            engine.w03Store.candidateBestSide                := SIDE_NONE
+            engine.w03Store.candidateBestStage               := int(na)
+            engine.w03Store.candidateBestLeftIndex           := SLOT_INVALID
+            engine.w03Store.candidateBestRightIndex          := SLOT_INVALID
+            engine.w03Store.candidateBestEffectiveBottomTick := int(na)
+            engine.w03Store.candidateBestEffectiveTopTick    := int(na)
+            engine.w03Store.candidateBestCCount              := 0
+            engine.w03Store.candidateBestHCount              := 0
+            engine.w03Store.candidateBestDensity             := int(na)
+            engine.w03Store.candidateBestBaseStrong          := false
+            engine.w03Store.candidateBestCreatedTime         := int(na)
+            engine.w03Store.candidateBestMinRootId           := ID_NONE
+            engine.w03Store.candidateBestFvgMode             := CAND_FVG_RANGE_NONE
+            engine.w03Store.candidateBestFvgRootSlot         := SLOT_INVALID
+            engine.w03Store.candidateBestCategoryMask        := CAT_MASK_NONE
+            engine.w03Store.candidateBestHighMask            := CAT_MASK_NONE
+            engine.w03Store.candidateRoundTie                := false
+            if phase == 0
+                engine.w03Store.candidatePoolMode := CAND_POOL_DENSE
+                ok := candEnumerateStageARaw(engine, cfg, mintick, side, denseTick, mTick)
+                if ok
+                    ok := candEnumerateStageBRaw(engine, cfg, mintick, side, denseTick, mTick)
+            else
+                engine.w03Store.candidatePoolMode := CAND_POOL_STAGE_C
+                ok := candEnumerateStageCRaw(engine, cfg, mintick, side, denseTick, mTick)
+            engine.w03Store.candidatePoolMode := CAND_POOL_NONE
+            if ok
+                if engine.w03Store.candidateBestSide == SIDE_NONE
+                    phaseDone := true
+                else if engine.w03Store.candidateRoundTie
+                    ok := false
+                else
+                    ok := candMaterializeWinnerRaw(engine, cfg, mintick, engine.w03Store.candidateBestSide, engine.w03Store.candidateBestStage, engine.w03Store.candidateBestLeftIndex, engine.w03Store.candidateBestRightIndex, engine.w03Store.candidateBestEffectiveBottomTick, engine.w03Store.candidateBestEffectiveTopTick, engine.w03Store.candidateBestCCount, engine.w03Store.candidateBestHCount, engine.w03Store.candidateBestDensity, engine.w03Store.candidateBestBaseStrong, engine.w03Store.candidateBestCreatedTime, engine.w03Store.candidateBestMinRootId, engine.w03Store.candidateBestFvgMode, engine.w03Store.candidateBestFvgRootSlot, engine.w03Store.candidateBestCategoryMask, engine.w03Store.candidateBestHighMask)
+                    // used : Point Roots and non-Broad FVGs of the new winner; Broad never
+                    if ok
+                        int w   = engine.w03Store.candidateWinnerLogicalCount - 1
+                        int off = array.get(engine.w03Store.candidateWinnerRootIdOffsets, w)
+                        int len = array.get(engine.w03Store.candidateWinnerRootIdLengths, w)
+                        int m = 0
+                        while ok and m < len
+                            int id = array.get(engine.w03Store.candidateWinnerRootIds, off + m)
+                            ok := map.contains(engine.rootIdToSlot, id)
+                            int s = ok ? map.get(engine.rootIdToSlot, id) : SLOT_INVALID
+                            if ok
+                                ok := s >= 0 and s < array.size(engine.rootIds) and s < array.size(engine.rootSlotLiveFlags) and s < array.size(engine.rootCategories) and s < array.size(engine.rootIsBroadFvgFlags) and s < array.size(usedBySlot)
+                            if ok
+                                ok := array.get(engine.rootSlotLiveFlags, s) and array.get(engine.rootIds, s) == id
+                            if ok
+                                int category = array.get(engine.rootCategories, s)
+                                if category == CAT_MA or category == CAT_SWING or category == CAT_ACCUM or category == CAT_TIME_HL
+                                    array.set(usedBySlot, s, true)
+                                else if category == CAT_FVG
+                                    if not array.get(engine.rootIsBroadFvgFlags, s)
+                                        array.set(usedBySlot, s, true)
+                                else
+                                    ok := false
+                            m += 1
+        phase += 1
+    // final BroadContext : Broads in no non-context Candidate of the final used state
+    if ok
+        int pointLen  = candBuildEligibleScratchRaw(engine, cfg, side)
+        int fvgLen    = candBuildFvgScratchRaw(engine, cfg, side)
+        array<int> seen = engine.w03Store.candidateBroadSeenEpochByRootSlot
+        engine.w03Store.candidateBroadSeenEpoch += 1
+        int rootCount = array.size(engine.rootIds)
+        while array.size(seen) < rootCount
+            array.push(seen, 0)
+        engine.w03Store.candidatePoolMode := CAND_POOL_CONTEXT_SCAN
+        ok := candEnumerateStageARaw(engine, cfg, mintick, side, denseTick, mTick)
+        if ok
+            ok := candEnumerateStageBRaw(engine, cfg, mintick, side, denseTick, mTick)
+        if ok
+            ok := candEnumerateStageCRaw(engine, cfg, mintick, side, denseTick, mTick)
+        engine.w03Store.candidatePoolMode := CAND_POOL_NONE
+        // FVG scratch order = rootId ASC
+        array<int> fvgScratch = isSupport ? engine.w03Store.candidateSupportFvgRootSlots : engine.w03Store.candidateResistanceFvgRootSlots
+        int        fvgN       = isSupport ? engine.w03Store.candidateSupportFvgLength : engine.w03Store.candidateResistanceFvgLength
+        if ok
+            ok := fvgN >= 0 and fvgN <= array.size(fvgScratch)
+        int k = 0
+        while ok and k < fvgN
+            int f = array.get(fvgScratch, k)
+            ok := f >= 0 and f < array.size(engine.rootIds) and f < array.size(engine.rootSlotLiveFlags) and f < array.size(engine.rootCategories) and f < array.size(engine.rootIsBroadFvgFlags) and f < array.size(engine.rootNativeBottomTicks) and f < array.size(engine.rootNativeTopTicks) and f < array.size(engine.rootConfirmedTimes) and f < array.size(seen)
+            if ok
+                if array.get(engine.rootSlotLiveFlags, f) and array.get(engine.rootCategories, f) == CAT_FVG and array.get(engine.rootIsBroadFvgFlags, f) and candEligibleRaw(engine, cfg, f, side) and array.get(seen, f) != engine.w03Store.candidateBroadSeenEpoch
+                    int nb   = array.get(engine.rootNativeBottomTicks, f)
+                    int nt   = array.get(engine.rootNativeTopTicks, f)
+                    int conf = array.get(engine.rootConfirmedTimes, f)
+                    int id   = array.get(engine.rootIds, f)
+                    if not na(nb) and not na(nt) and nb <= nt and not na(conf) and id != ID_NONE
+                        ok := candMaterializeWinnerRaw(engine, cfg, mintick, side, CAND_STAGE_BROAD_CONTEXT, SLOT_INVALID, SLOT_INVALID, nb, nt, 1, 0, DEN_BROAD_CONTEXT, false, conf, id, CAND_FVG_RANGE_BROAD_CONTEXT, f, CAT_MASK_FVG, CAT_MASK_NONE)
+            k += 1
+    engine.w03Store.candidatePoolMode := CAND_POOL_NONE
+    int result = -1
+    if ok
+        result := engine.w03Store.candidateWinnerLogicalCount - sideStartWinnerCount
+    else
+        // Side failure : this Side's segment rolled back, the other Side untouched
+        engine.w03Store.candidateWinnerLogicalCount := sideStartWinnerCount
+        engine.w03Store.candidateWinnerRootIdLength := sideStartRootIdLength
+        if side == SIDE_SUPPORT
+            engine.w03Store.candidateFailedSupport := true
+        else if side == SIDE_RESISTANCE
+            engine.w03Store.candidateFailedResistance := true
+    result
 phaseSetMembershipValidRaw(ZoneEngine engine, int sideSlot) =>
     bool valid = false
     if sideSlot >= 0 and sideSlot < array.size(engine.sidePhases) and sideSlot < array.size(engine.sidePhaseSetPositions)
