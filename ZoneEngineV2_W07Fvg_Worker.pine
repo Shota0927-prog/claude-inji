@@ -214,3 +214,159 @@ export fvgIntervalQuery(array<int> bottomOrder, array<int> topOrder, array<int> 
             array.push(outSlots, array.get(src, j))
             j += 1
     ok ? array.size(outSlots) : -1
+
+// ---- W07 B03 : Fresh FVG NativeRange interval index maintenance ----
+// The Fresh index is two sorted slot orders over the Fresh FVG Roots, the same order
+// contract as fvgIntervalOrderBuild: bottom order ascending by (nativeBottomTick, rootId),
+// top order ascending by (nativeTopTick, rootId), each with a Root-slot -> position reverse
+// array (SLOT_INVALID when not in the order). Membership follows the caller's Fresh fact
+// only: no category / state / direction / TF / Broad / Side filter. Caller contract (not
+// detectable in Pine): the bottom order, top order, bottom positions, top positions and
+// rootFvgW07ExpectedRootIds are five distinct arrays, never aliased to one another.
+
+// Insert rootSlot into one sorted order (keyBottom: bottom order by (nativeBottomTick,
+// rootId), else top order by (nativeTopTick, rootId)). The position is the upper bound of
+// (tick, rootId) found by binary search; the tail is shifted right by one with array.set
+// after an array.push (no array.insert / unshift) and every shifted slot's position is
+// moved +1. Everything that can fail (rootSlot / rootId / ticks, positions[rootSlot] ==
+// SLOT_INVALID, each probed slot, each shifted slot with positions[s] == its index) is
+// checked before the first write; commit = false checks only and writes nothing.
+// Returns true when the insert is (or, dry run, would be) done; false leaves every array
+// unchanged.
+freshIndexInsertRaw(array<int> order, array<int> positions, array<int> rootIds, array<int> rootNativeBottomTicks, array<int> rootNativeTopTicks, bool keyBottom, int rootSlot, int rootId, bool commit) =>
+    bool ok = rootSlot >= 0 and rootSlot < array.size(rootIds) and rootSlot < array.size(rootNativeBottomTicks) and rootSlot < array.size(rootNativeTopTicks) and rootSlot < array.size(positions) and rootId > ID_NONE
+    int  key = int(na)
+    if ok
+        int bTick = array.get(rootNativeBottomTicks, rootSlot)
+        int tTick = array.get(rootNativeTopTicks,    rootSlot)
+        ok := array.get(rootIds, rootSlot) == rootId and not na(bTick) and not na(tTick) and bTick <= tTick and array.get(positions, rootSlot) == SLOT_INVALID
+        key := keyBottom ? bTick : tTick
+    int n  = array.size(order)
+    int lo = 0
+    int hi = n
+    while ok and lo < hi
+        int mid = int(math.floor((lo + hi) / 2))
+        int s   = array.get(order, mid)
+        ok := s >= 0 and s < array.size(rootIds) and s < array.size(rootNativeBottomTicks) and s < array.size(rootNativeTopTicks) and s != rootSlot
+        if ok
+            int sTick = keyBottom ? array.get(rootNativeBottomTicks, s) : array.get(rootNativeTopTicks, s)
+            int sId   = array.get(rootIds, s)
+            ok := not na(sTick) and sId > ID_NONE
+            if ok
+                if sTick < key or (sTick == key and sId <= rootId)
+                    lo := mid + 1
+                else
+                    hi := mid
+    int insertPos = lo
+    int j = insertPos
+    while ok and j < n
+        int s = array.get(order, j)
+        ok := s >= 0 and s < array.size(positions) and s != rootSlot
+        if ok
+            ok := array.get(positions, s) == j
+        j += 1
+    if ok and commit
+        array.push(order, SLOT_INVALID)
+        int k = n
+        while k > insertPos
+            int moved = array.get(order, k - 1)
+            array.set(order, k, moved)
+            array.set(positions, moved, k)
+            k -= 1
+        array.set(order, insertPos, rootSlot)
+        array.set(positions, rootSlot, insertPos)
+    ok
+
+// Detach rootSlot from one sorted order: positions[rootSlot] must be a valid index whose
+// entry is rootSlot, and every later entry s must have positions[s] == its index (all
+// checked before the first write; commit = false checks only). The tail is shifted left by
+// one with array.set (no array.remove(0) / unshift), each shifted slot's position moves -1,
+// then array.pop and positions[rootSlot] := SLOT_INVALID. Returns true when the detach is
+// (or, dry run, would be) done; false leaves every array unchanged.
+freshIndexDetachRaw(array<int> order, array<int> positions, int rootSlot, bool commit) =>
+    int  n   = array.size(order)
+    bool ok  = rootSlot >= 0 and rootSlot < array.size(positions)
+    int  pos = SLOT_INVALID
+    if ok
+        pos := array.get(positions, rootSlot)
+        ok  := pos != SLOT_INVALID and pos >= 0 and pos < n
+        if ok
+            ok := array.get(order, pos) == rootSlot
+    int j = pos + 1
+    while ok and j < n
+        int s = array.get(order, j)
+        ok := s >= 0 and s < array.size(positions) and s != rootSlot
+        if ok
+            ok := array.get(positions, s) == j
+        j += 1
+    if ok and commit
+        int k = pos
+        while k < n - 1
+            int moved = array.get(order, k + 1)
+            array.set(order, k, moved)
+            array.set(positions, moved, k)
+            k += 1
+        array.pop(order)
+        array.set(positions, rootSlot, SLOT_INVALID)
+    ok
+
+// W07 B03: bring the Fresh index membership of one resolved Root slot to shouldBeFresh.
+// Checks first: rootSlot in range, expectedRootId > 0 == rootIds[rootSlot], both native
+// ticks not na, bottom <= top. Then the position arrays and rootFvgW07ExpectedRootIds are
+// extended to rootSlot + 1 (SLOT_INVALID / ID_NONE) before any order write. Identity:
+// stored ID_NONE -> expectedRootId is recorded on success; stored == expectedRootId ->
+// continue; anything else -> false (slot reuse / stale W07 state, nothing overwritten).
+// Membership must be both-in (each position valid and pointing back at rootSlot) or
+// both-out (both SLOT_INVALID); a mixed state -> false. Already in the wanted state ->
+// true (idempotent). Otherwise both orders are dry-run checked, then both are written;
+// an unexpected second-order failure rolls the first order back and returns false, so no
+// partial membership is ever left. rootFvgW07ExpectedRootIds is never cleared (it is
+// shared with the later Inverse state).
+export freshIndexApply(int rootSlot, int expectedRootId, bool shouldBeFresh, array<int> rootIds, array<int> rootNativeBottomTicks, array<int> rootNativeTopTicks, array<int> rootFvgW07ExpectedRootIds, array<int> freshFvgNativeBottomOrderRootSlots, array<int> freshFvgNativeTopOrderRootSlots, array<int> rootFreshFvgNativeBottomOrderPositions, array<int> rootFreshFvgNativeTopOrderPositions) =>
+    bool ok = not na(rootSlot) and rootSlot >= 0 and rootSlot < array.size(rootIds) and rootSlot < array.size(rootNativeBottomTicks) and rootSlot < array.size(rootNativeTopTicks) and not na(expectedRootId) and expectedRootId > ID_NONE
+    if ok
+        int bTick = array.get(rootNativeBottomTicks, rootSlot)
+        int tTick = array.get(rootNativeTopTicks,    rootSlot)
+        ok := array.get(rootIds, rootSlot) == expectedRootId and not na(bTick) and not na(tTick) and bTick <= tTick
+    if ok
+        while array.size(rootFvgW07ExpectedRootIds) <= rootSlot
+            array.push(rootFvgW07ExpectedRootIds, ID_NONE)
+        while array.size(rootFreshFvgNativeBottomOrderPositions) <= rootSlot
+            array.push(rootFreshFvgNativeBottomOrderPositions, SLOT_INVALID)
+        while array.size(rootFreshFvgNativeTopOrderPositions) <= rootSlot
+            array.push(rootFreshFvgNativeTopOrderPositions, SLOT_INVALID)
+    int storedExpected = ok ? array.get(rootFvgW07ExpectedRootIds, rootSlot) : ID_NONE
+    if ok
+        ok := storedExpected == ID_NONE or storedExpected == expectedRootId
+    bool isIn  = false
+    if ok
+        int bPos = array.get(rootFreshFvgNativeBottomOrderPositions, rootSlot)
+        int tPos = array.get(rootFreshFvgNativeTopOrderPositions,    rootSlot)
+        bool bothOut = bPos == SLOT_INVALID and tPos == SLOT_INVALID
+        bool bothIn  = bPos >= 0 and tPos >= 0 and bPos < array.size(freshFvgNativeBottomOrderRootSlots) and tPos < array.size(freshFvgNativeTopOrderRootSlots)
+        if bothIn
+            bothIn := array.get(freshFvgNativeBottomOrderRootSlots, bPos) == rootSlot and array.get(freshFvgNativeTopOrderRootSlots, tPos) == rootSlot
+        ok   := bothOut or bothIn
+        isIn := bothIn
+    if ok and shouldBeFresh != isIn
+        if shouldBeFresh
+            ok := freshIndexInsertRaw(freshFvgNativeBottomOrderRootSlots, rootFreshFvgNativeBottomOrderPositions, rootIds, rootNativeBottomTicks, rootNativeTopTicks, true,  rootSlot, expectedRootId, false) and freshIndexInsertRaw(freshFvgNativeTopOrderRootSlots, rootFreshFvgNativeTopOrderPositions, rootIds, rootNativeBottomTicks, rootNativeTopTicks, false, rootSlot, expectedRootId, false)
+            if ok
+                ok := freshIndexInsertRaw(freshFvgNativeBottomOrderRootSlots, rootFreshFvgNativeBottomOrderPositions, rootIds, rootNativeBottomTicks, rootNativeTopTicks, true, rootSlot, expectedRootId, true)
+                if ok
+                    ok := freshIndexInsertRaw(freshFvgNativeTopOrderRootSlots, rootFreshFvgNativeTopOrderPositions, rootIds, rootNativeBottomTicks, rootNativeTopTicks, false, rootSlot, expectedRootId, true)
+                    if not ok
+                        // unexpected: undo the bottom insert, no partial membership
+                        freshIndexDetachRaw(freshFvgNativeBottomOrderRootSlots, rootFreshFvgNativeBottomOrderPositions, rootSlot, true)
+        else
+            ok := freshIndexDetachRaw(freshFvgNativeBottomOrderRootSlots, rootFreshFvgNativeBottomOrderPositions, rootSlot, false) and freshIndexDetachRaw(freshFvgNativeTopOrderRootSlots, rootFreshFvgNativeTopOrderPositions, rootSlot, false)
+            if ok
+                ok := freshIndexDetachRaw(freshFvgNativeBottomOrderRootSlots, rootFreshFvgNativeBottomOrderPositions, rootSlot, true)
+                if ok
+                    ok := freshIndexDetachRaw(freshFvgNativeTopOrderRootSlots, rootFreshFvgNativeTopOrderPositions, rootSlot, true)
+                    if not ok
+                        // unexpected: put the bottom entry back, no partial membership
+                        freshIndexInsertRaw(freshFvgNativeBottomOrderRootSlots, rootFreshFvgNativeBottomOrderPositions, rootIds, rootNativeBottomTicks, rootNativeTopTicks, true, rootSlot, expectedRootId, true)
+    if ok and storedExpected == ID_NONE
+        array.set(rootFvgW07ExpectedRootIds, rootSlot, expectedRootId)
+    ok
