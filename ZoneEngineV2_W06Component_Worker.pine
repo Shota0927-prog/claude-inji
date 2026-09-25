@@ -1,0 +1,197 @@
+//@version=6
+// ZoneEngineV2_W06Component_Worker - W06 dependency component / Candidate cache subsystem, kept out of
+// the Main library for the compiled token limit (PLAN A). Every enum value below mirrors the Production
+// Main constant of the same name; nothing here changes a Main or W05 Candidate rule.
+library("ZoneEngineV2_W06Component_Worker", overlay = false)
+import sekine3310/ZoneEngineV2_W05Candidate_Worker/3 as W05Cand
+
+const int ID_NONE         = 0
+const int SLOT_INVALID    = -1
+const int CAT_MA          = 0
+const int CAT_SWING       = 1
+const int CAT_ACCUM       = 2
+const int CAT_TIME_HL     = 3
+const int CAT_FVG         = 4
+const int ROOT_ACTIVE         = 1
+const int ROOT_INVERSE_ACTIVE = 4
+const int FVG_BULLISH  = 1
+const int FVG_BEARISH  = 2
+const int JGROUP_E1 = 1
+const int JGROUP_E4 = 4
+const int JOP_FVG_INVALIDATE = 1
+const int JOP_NEW_ROOT       = 2
+const int JOP_MA_UPDATE      = 3
+const int JOP_SWING_TF_MERGE = 4
+const int JOP_TIMEHL_LABEL   = 5
+const int JOP_FVG_FRESH_END  = 6
+const int JOP_ROOT_RETIRE    = 7
+const int SUB_MA_EMA2000   = 1
+const int SUB_MA_EMA3000   = 2
+// W06 B04 seed reason bits (private, never exported)
+const int CAND_SEED_REASON_ADDED     = 1
+const int CAND_SEED_REASON_STATE     = 2
+const int CAND_SEED_REASON_GEOMETRY  = 4
+const int CAND_SEED_REASON_QUALITY   = 8
+const int CAND_SEED_REASON_TIEBREAK  = 16
+const int CAND_SEED_REASON_FVG       = 32
+const int CAND_SEED_REASON_BROAD     = 64
+
+// W06 B04: dependency Side mask of one Root slot (a superset of the Candidate eligibility: no use flag, no Fresh, no TF).
+// 0 neither / 1 Support / 2 Resistance / 3 both.
+//   Point (MA / Swing / Accum / TimeHL): live, rootId != 0, ACTIVE, pointTick not na -> 3
+//   FVG: live, rootId != 0, Bullish / Bearish, ACTIVE / INVERSE_ACTIVE, native ticks not na and bottom <= top ->
+//        Support for Bullish ACTIVE or Bearish INVERSE_ACTIVE, Resistance for Bearish ACTIVE or Bullish INVERSE_ACTIVE
+compSideMaskRaw(int rootSlot, array<int> rootIds, array<bool> rootSlotLiveFlags, array<int> rootCategories, array<int> rootStates, array<int> rootDirections, array<int> rootPointTicks, array<int> rootNativeBottomTicks, array<int> rootNativeTopTicks) =>
+    int  mask = 0
+    bool ok   = rootSlot >= 0 and rootSlot < array.size(rootIds) and rootSlot < array.size(rootSlotLiveFlags) and rootSlot < array.size(rootCategories) and rootSlot < array.size(rootStates) and rootSlot < array.size(rootDirections) and rootSlot < array.size(rootPointTicks) and rootSlot < array.size(rootNativeBottomTicks) and rootSlot < array.size(rootNativeTopTicks)
+    if ok
+        ok := array.get(rootSlotLiveFlags, rootSlot) and array.get(rootIds, rootSlot) != ID_NONE
+    if ok
+        int category = array.get(rootCategories, rootSlot)
+        int state    = array.get(rootStates, rootSlot)
+        if category == CAT_MA or category == CAT_SWING or category == CAT_ACCUM or category == CAT_TIME_HL
+            if state == ROOT_ACTIVE and not na(array.get(rootPointTicks, rootSlot))
+                mask := 3
+        else if category == CAT_FVG
+            int direction  = array.get(rootDirections, rootSlot)
+            int bottomTick = array.get(rootNativeBottomTicks, rootSlot)
+            int topTick    = array.get(rootNativeTopTicks, rootSlot)
+            bool capable = (direction == FVG_BULLISH or direction == FVG_BEARISH) and (state == ROOT_ACTIVE or state == ROOT_INVERSE_ACTIVE) and not na(bottomTick) and not na(topTick) and bottomTick <= topTick
+            if capable
+                if (direction == FVG_BULLISH and state == ROOT_ACTIVE) or (direction == FVG_BEARISH and state == ROOT_INVERSE_ACTIVE)
+                    mask := 1
+                else
+                    mask := 2
+    mask
+
+// W06 B04: seed reasons of the committed Roots that the pending Stage F journal changes, read BEFORE the journal is
+// applied. Rows are visited in the Stage F apply order (group E1 .. E4, row ascending). A row whose target does not
+// resolve to a live committed Root with the expected rootId adds nothing (NEW_ROOT and same-bar targets: B05).
+//   MA_UPDATE      : GEOMETRY (float pointPrice or pointTick differs), TIEBREAK (confirmedTime differs, na-aware),
+//                    QUALITY (slope direction of its EMA subtype differs from the chained pre-apply slope, na-aware)
+//   SWING_TF_MERGE : QUALITY          TIMEHL_LABEL : QUALITY          ROOT_RETIRE : STATE
+//   FVG_INVALIDATE : STATE | FVG (| BROAD for a Broad FVG), and the FVG changed list
+//   FVG_FRESH_END  : the Fresh changed list only (never a Candidate seed)
+//   NEW_ROOT       : nothing here
+// Every output list keeps first-appearance order; a rootId already present is never appended again (seed masks OR).
+// Returns [seedCount, fvgChangedCount, freshCount].
+export seedPreApply(array<int> journalOps, array<int> journalGroups, array<int> journalTargetRootSlots, array<int> journalExpectedRootIds, array<int> journalCategories, array<int> journalSubtypes, array<int> journalTfCodes, array<int> journalOriginKeys, array<int> journalOriginTimes, array<int> journalOriginEndTimes, array<int> journalConfirmedTimes, array<float> journalPointPrices, array<float> journalNativeBottoms, array<float> journalNativeTops, array<int> journalOldStates, array<int> journalNewStates, array<bool> journalFvgFreshFlags, array<bool> journalIsBroadFlags, array<int> journalDirections, array<int> journalOldMasks, array<int> journalNewMasks, array<int> journalPairKeys, array<int> journalSlopeDirs, int journalCount, array<int> rootIds, array<bool> rootSlotLiveFlags, array<int> rootCategories, array<int> rootSubtypes, array<int> rootStates, array<int> rootDirections, array<float> rootPointPrices, array<int> rootPointTicks, array<int> rootConfirmedTimes, array<bool> rootIsBroadFvgFlags, int ema2000SlopeDir, int ema3000SlopeDir, float mintick, array<int> candSeedRootIds, array<int> candSeedReasonMasks, array<int> candFvgChangedRootIds, array<int> candFvgFreshChangedRootIds, int seedCount, int fvgChangedCount, int freshCount) =>
+    int seedLen  = seedCount
+    int fvgLen   = fvgChangedCount
+    int freshLen = freshCount
+    int virtualSlope2000 = ema2000SlopeDir
+    int virtualSlope3000 = ema3000SlopeDir
+    int count = journalCount
+    int group = JGROUP_E1
+    while group <= JGROUP_E4
+        int row = 0
+        while row < count
+            bool rowOk = row < array.size(journalOps) and row < array.size(journalGroups) and row < array.size(journalTargetRootSlots) and row < array.size(journalExpectedRootIds) and row < array.size(journalSubtypes) and row < array.size(journalConfirmedTimes) and row < array.size(journalPointPrices) and row < array.size(journalSlopeDirs)
+            if rowOk
+                rowOk := array.get(journalGroups, row) == group
+            if rowOk
+                int op             = array.get(journalOps, row)
+                int rootSlot       = array.get(journalTargetRootSlots, row)
+                int expectedRootId = array.get(journalExpectedRootIds, row)
+                bool targetOk = rootSlot != SLOT_INVALID and expectedRootId != ID_NONE and rootSlot >= 0 and rootSlot < array.size(rootIds) and rootSlot < array.size(rootSlotLiveFlags) and rootSlot < array.size(rootCategories) and rootSlot < array.size(rootSubtypes) and rootSlot < array.size(rootPointPrices) and rootSlot < array.size(rootPointTicks) and rootSlot < array.size(rootConfirmedTimes) and rootSlot < array.size(rootIsBroadFvgFlags)
+                if targetOk
+                    targetOk := array.get(rootSlotLiveFlags, rootSlot) and array.get(rootIds, rootSlot) == expectedRootId
+                int seedMask   = 0
+                bool fvgAdd    = false
+                bool freshAdd  = false
+                if op == JOP_MA_UPDATE
+                    // the chained pre-apply slope advances on every MA_UPDATE row, as in the Stage F apply loop
+                    int subtype   = array.get(journalSubtypes, row)
+                    int newSlope  = array.get(journalSlopeDirs, row)
+                    int prevSlope = subtype == SUB_MA_EMA2000 ? virtualSlope2000 : virtualSlope3000
+                    if targetOk
+                        float oldPrice  = array.get(rootPointPrices, rootSlot)
+                        float newPrice  = array.get(journalPointPrices, row)
+                        int   oldTick   = array.get(rootPointTicks, rootSlot)
+                        int   newTick   = na(newPrice) or na(mintick) or mintick <= 0 ? int(na) : int(math.round(newPrice / mintick))
+                        bool  priceDiff = na(oldPrice) != na(newPrice) or (not na(oldPrice) and not na(newPrice) and oldPrice != newPrice)
+                        bool  tickDiff  = na(oldTick) != na(newTick) or (not na(oldTick) and not na(newTick) and oldTick != newTick)
+                        if priceDiff or tickDiff
+                            seedMask += CAND_SEED_REASON_GEOMETRY
+                        int oldConfirmed = array.get(rootConfirmedTimes, rootSlot)
+                        int newConfirmed = array.get(journalConfirmedTimes, row)
+                        if na(oldConfirmed) != na(newConfirmed) or (not na(oldConfirmed) and not na(newConfirmed) and oldConfirmed != newConfirmed)
+                            seedMask += CAND_SEED_REASON_TIEBREAK
+                        if (subtype == SUB_MA_EMA2000 or subtype == SUB_MA_EMA3000) and array.get(rootSubtypes, rootSlot) == subtype
+                            if na(prevSlope) != na(newSlope) or (not na(prevSlope) and not na(newSlope) and prevSlope != newSlope)
+                                seedMask += CAND_SEED_REASON_QUALITY
+                    if subtype == SUB_MA_EMA2000
+                        virtualSlope2000 := newSlope
+                    else if subtype == SUB_MA_EMA3000
+                        virtualSlope3000 := newSlope
+                else if op == JOP_SWING_TF_MERGE
+                    if targetOk
+                        seedMask := CAND_SEED_REASON_QUALITY
+                else if op == JOP_TIMEHL_LABEL
+                    if targetOk
+                        seedMask := CAND_SEED_REASON_QUALITY
+                else if op == JOP_FVG_INVALIDATE
+                    if targetOk
+                        seedMask := CAND_SEED_REASON_STATE + CAND_SEED_REASON_FVG + (array.get(rootIsBroadFvgFlags, rootSlot) ? CAND_SEED_REASON_BROAD : 0)
+                        fvgAdd   := true
+                else if op == JOP_ROOT_RETIRE
+                    if targetOk
+                        seedMask := CAND_SEED_REASON_STATE
+                else if op == JOP_FVG_FRESH_END
+                    if targetOk
+                        freshAdd := true
+                else if op == JOP_NEW_ROOT
+                    seedMask := 0
+                if seedMask != 0
+                    int pos = SLOT_INVALID
+                    int i   = 0
+                    while pos == SLOT_INVALID and i < seedLen
+                        if array.get(candSeedRootIds, i) == expectedRootId
+                            pos := i
+                        i += 1
+                    if pos != SLOT_INVALID
+                        int oldMask = array.get(candSeedReasonMasks, pos)
+                        int merged  = 0
+                        int bit     = 1
+                        while bit <= CAND_SEED_REASON_BROAD
+                            if oldMask % (2 * bit) >= bit or seedMask % (2 * bit) >= bit
+                                merged += bit
+                            bit := bit * 2
+                        array.set(candSeedReasonMasks, pos, merged)
+                    else
+                        if seedLen < array.size(candSeedRootIds)
+                            array.set(candSeedRootIds, seedLen, expectedRootId)
+                        else
+                            array.push(candSeedRootIds, expectedRootId)
+                        if seedLen < array.size(candSeedReasonMasks)
+                            array.set(candSeedReasonMasks, seedLen, seedMask)
+                        else
+                            array.push(candSeedReasonMasks, seedMask)
+                        seedLen += 1
+                if fvgAdd
+                    bool found = false
+                    int  i     = 0
+                    while not found and i < fvgLen
+                        found := array.get(candFvgChangedRootIds, i) == expectedRootId
+                        i += 1
+                    if not found
+                        if fvgLen < array.size(candFvgChangedRootIds)
+                            array.set(candFvgChangedRootIds, fvgLen, expectedRootId)
+                        else
+                            array.push(candFvgChangedRootIds, expectedRootId)
+                        fvgLen += 1
+                if freshAdd
+                    bool found = false
+                    int  i     = 0
+                    while not found and i < freshLen
+                        found := array.get(candFvgFreshChangedRootIds, i) == expectedRootId
+                        i += 1
+                    if not found
+                        if freshLen < array.size(candFvgFreshChangedRootIds)
+                            array.set(candFvgFreshChangedRootIds, freshLen, expectedRootId)
+                        else
+                            array.push(candFvgFreshChangedRootIds, expectedRootId)
+                        freshLen += 1
+            row += 1
+        group += 1
+    [seedLen, fvgLen, freshLen]
