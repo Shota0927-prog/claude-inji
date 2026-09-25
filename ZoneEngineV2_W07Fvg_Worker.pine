@@ -26,6 +26,23 @@ const int FVG_INV_PROGRESS_ACTIVE          = 4
 // fvgIntervalOrderBuild internal status (B01 only; not the W06 Candidate status enum)
 const int FVG_INTERVAL_BUILD_OK            = 0
 const int FVG_INTERVAL_BUILD_INVALID_INPUT = 1
+// exact copies of the Main declarations used by the B04 Fresh facts
+const int CAT_FVG             = 4
+const int ROOT_ACTIVE         = 1
+const int ROOT_INVALIDATED    = 2
+const int ROOT_INVERSE_WAIT   = 3
+const int ROOT_INVERSE_ACTIVE = 4
+const int FVG_BULLISH = 1
+const int FVG_BEARISH = 2
+const int TF_1H = 60
+const int TF_4H = 240
+const int TF_D  = 1440
+const int JGROUP_E1 = 1
+const int JGROUP_E2 = 2
+const int JGROUP_E3 = 3
+const int JOP_FVG_INVALIDATE = 1
+const int JOP_NEW_ROOT       = 2
+const int JOP_FVG_FRESH_END  = 6
 
 // First index i in [0, array.size(order)) whose key tick (NativeBottomTick when keyBottom,
 // else NativeTopTick) of slot order[i] is > target (strictGreater) or >= target (not
@@ -370,3 +387,275 @@ export freshIndexApply(int rootSlot, int expectedRootId, bool shouldBeFresh, arr
     if ok and storedExpected == ID_NONE
         array.set(rootFvgW07ExpectedRootIds, rootSlot, expectedRootId)
     ok
+
+// ---- W07 B04 : indexed FVG Fresh facts (legacy W03 Path A / Path B journal parity) ----
+
+// Reorder the first matchCount slots of matchSlots into the live W03 Path A emission order:
+// ascending (TF rank, rootFvgFreshSetPositions[slot]) with TF rank 60 -> 0, 240 -> 1,
+// 1440 -> 2 (the 1H set, then 4H, then D, each in array index order). Only these K slots are
+// read (never a whole Fresh set). Every slot is checked first (slot in range of both arrays,
+// TF 60 / 240 / 1440, position >= 0); any failure -> -1 and matchSlots untouched. Stable
+// bottom-up merge (no array.sort), O(K log K); the result is written back only on success.
+// Returns matchCount on success.
+freshMatchLegacyOrderRaw(array<int> matchSlots, int matchCount, array<int> rootTfCodes, array<int> rootFvgFreshSetPositions) =>
+    bool ok = not na(matchCount) and matchCount >= 0 and matchCount <= array.size(matchSlots)
+    int  k  = ok ? matchCount : 0
+    array<int> src = array.new_int(k, SLOT_INVALID)
+    int i = 0
+    while ok and i < k
+        int slot = array.get(matchSlots, i)
+        ok := slot >= 0 and slot < array.size(rootTfCodes) and slot < array.size(rootFvgFreshSetPositions)
+        if ok
+            int tf = array.get(rootTfCodes, slot)
+            ok := (tf == TF_1H or tf == TF_4H or tf == TF_D) and array.get(rootFvgFreshSetPositions, slot) >= 0
+        if ok
+            array.set(src, i, slot)
+        i += 1
+    if ok and k > 1
+        array<int> tmp = array.new_int(k, SLOT_INVALID)
+        int width = 1
+        while width < k
+            int left = 0
+            while left < k
+                int mid   = math.min(left + width, k)
+                int right = math.min(left + 2 * width, k)
+                int a = left
+                int b = mid
+                int w = left
+                while w < right
+                    bool takeA = false
+                    if a < mid and b < right
+                        int sa = array.get(src, a)
+                        int sb = array.get(src, b)
+                        int tfA = array.get(rootTfCodes, sa)
+                        int tfB = array.get(rootTfCodes, sb)
+                        int rankA = tfA == TF_1H ? 0 : tfA == TF_4H ? 1 : 2
+                        int rankB = tfB == TF_1H ? 0 : tfB == TF_4H ? 1 : 2
+                        takeA := rankA < rankB or (rankA == rankB and array.get(rootFvgFreshSetPositions, sa) <= array.get(rootFvgFreshSetPositions, sb))
+                    else
+                        takeA := a < mid
+                    if takeA
+                        array.set(tmp, w, array.get(src, a))
+                        a += 1
+                    else
+                        array.set(tmp, w, array.get(src, b))
+                        b += 1
+                    w += 1
+                left += 2 * width
+            array<int> swap = src
+            src := tmp
+            tmp := swap
+            width := width * 2
+    if ok
+        int j = 0
+        while j < k
+            array.set(matchSlots, j, array.get(src, j))
+            j += 1
+    ok ? k : -1
+
+// W07 B04: the live W03 Fresh Path A and Path B (w03StageEFvgRaw Fresh section of
+// ZoneEngineV2_W03ETimeFvg_Worker /1), appending the same JOP_FVG_FRESH_END / JGROUP_E3 rows
+// in the same order with the same payload. Gate: cfgUseFvg, no incoming violation, base
+// close time / high / low not na, mintick > 0; closed gate -> no row, count and violation
+// returned unchanged.
+// Path A (committed Fresh Roots): fvgIntervalQuery on the Fresh index with the base bar's
+// [low tick, high tick] (inclusive) gives the K candidates only; they are put in the legacy
+// order (1H set, 4H set, D set, each by set position) by freshMatchLegacyOrderRaw; each is
+// checked against its TF fresh set position and the live Path A Root checks (live, rootId,
+// CAT_FVG, TF, Fresh flag, Bullish / Bearish, native ticks, confirmed / origin time, origin
+// key); its virtual state is the committed state, ROOT_INVALIDATED when this bar's journal
+// holds its JOP_FVG_INVALIDATE / JGROUP_E1 row (more than one -> violation), and it is
+// skipped when this bar's journal already holds its JOP_FVG_FRESH_END. Accepted virtual
+// states: ACTIVE, INVALIDATED (live) and INVERSE_WAIT, INVERSE_ACTIVE (strict extension).
+// A row is emitted when baseCloseTime > rootConfirmedTime (strict) and the native range
+// touches the bar (inclusive; the query already guarantees it and it is re-checked). All K
+// are checked before the first Path A row, so a failure appends no Path A row.
+// O(1) guard: the Fresh index size must equal the sum of the three Fresh set sizes.
+// Path B (Roots created on this bar): unchanged live journal scan, scanEnd = journal count
+// after Path A, JOP_NEW_ROOT / JGROUP_E2 / CAT_FVG rows in row order, target SLOT_INVALID,
+// state ROOT_ACTIVE; its rows are appended after the scan (a Path B violation appends none).
+// Only the journal arrays are written (rootFvgFreshFlags / rootStates / the index are not).
+// Returns [journalCountOut, violationOut].
+export freshFacts(bool cfgUseFvg, float feedBaseHigh, float feedBaseLow, int feedBaseCloseTime, float feedMintick, array<int> freshFvgNativeBottomOrderRootSlots, array<int> freshFvgNativeTopOrderRootSlots, array<int> rootIds, array<bool> rootSlotLiveFlags, array<int> rootCategories, array<int> rootSubtypes, array<int> rootTfCodes, array<int> rootOriginKeys, array<int> rootOriginTimes, array<int> rootOriginEndTimes, array<int> rootConfirmedTimes, array<float> rootNativeBottoms, array<float> rootNativeTops, array<int> rootNativeBottomTicks, array<int> rootNativeTopTicks, array<int> rootStates, array<int> rootDirections, array<bool> rootFvgFreshFlags, array<bool> rootIsBroadFvgFlags, array<int> rootFvgFreshSetPositions, array<int> freshFvg1hRootSlots, array<int> freshFvg4hRootSlots, array<int> freshFvgDRootSlots, array<int> journalOps, array<int> journalGroups, array<int> journalTargetRootSlots, array<int> journalExpectedRootIds, array<int> journalCategories, array<int> journalSubtypes, array<int> journalTfCodes, array<int> journalOriginKeys, array<int> journalOriginTimes, array<int> journalOriginEndTimes, array<int> journalConfirmedTimes, array<float> journalPointPrices, array<float> journalNativeBottoms, array<float> journalNativeTops, array<int> journalOldStates, array<int> journalNewStates, array<bool> journalFvgFreshFlags, array<bool> journalIsBroadFlags, array<int> journalDirections, array<int> journalOldMasks, array<int> journalNewMasks, array<int> journalPairKeys, array<int> journalSlopeDirs, int journalCountIn, bool journalInvariantViolationIn) =>
+    int  journalCountNow = journalCountIn
+    bool violation       = journalInvariantViolationIn
+    bool mintickOk = not na(feedMintick) and feedMintick > 0
+    bool freshGate = not na(feedBaseCloseTime) and not na(feedBaseHigh) and not na(feedBaseLow) and mintickOk
+    if cfgUseFvg and not journalInvariantViolationIn and freshGate
+        int baseLowTick  = int(math.round(feedBaseLow  / feedMintick))
+        int baseHighTick = int(math.round(feedBaseHigh / feedMintick))
+        // pending rows of the current phase: source 0 = committed Root slot (Path A), 1 = journal row (Path B)
+        array<int> specSources = array.new_int(0)
+        array<int> specIndexes = array.new_int(0)
+        array<int> specStates  = array.new_int(0)
+        int phase = 0
+        while not violation and phase < 2
+            array.clear(specSources)
+            array.clear(specIndexes)
+            array.clear(specStates)
+            if phase == 0
+                bool ok = array.size(freshFvgNativeBottomOrderRootSlots) == array.size(freshFvg1hRootSlots) + array.size(freshFvg4hRootSlots) + array.size(freshFvgDRootSlots)
+                array<int> matches = array.new_int(0)
+                int k = -1
+                if ok
+                    k := fvgIntervalQuery(freshFvgNativeBottomOrderRootSlots, freshFvgNativeTopOrderRootSlots, rootIds, rootNativeBottomTicks, rootNativeTopTicks, baseLowTick, baseHighTick, matches)
+                ok := k >= 0
+                if ok
+                    ok := freshMatchLegacyOrderRaw(matches, k, rootTfCodes, rootFvgFreshSetPositions) == k
+                int i = 0
+                while ok and i < k
+                    int  slot = array.get(matches, i)
+                    bool valid = slot >= 0 and slot < array.size(rootIds) and slot < array.size(rootSlotLiveFlags) and slot < array.size(rootCategories) and slot < array.size(rootSubtypes) and slot < array.size(rootTfCodes) and slot < array.size(rootFvgFreshFlags) and slot < array.size(rootDirections) and slot < array.size(rootNativeBottoms) and slot < array.size(rootNativeTops) and slot < array.size(rootNativeBottomTicks) and slot < array.size(rootNativeTopTicks) and slot < array.size(rootConfirmedTimes) and slot < array.size(rootOriginTimes) and slot < array.size(rootOriginEndTimes) and slot < array.size(rootOriginKeys) and slot < array.size(rootStates) and slot < array.size(rootIsBroadFvgFlags) and slot < array.size(rootFvgFreshSetPositions)
+                    int  rootId = ID_NONE
+                    if valid
+                        int tf = array.get(rootTfCodes, slot)
+                        array<int> freshSet = tf == TF_1H ? freshFvg1hRootSlots : tf == TF_4H ? freshFvg4hRootSlots : freshFvgDRootSlots
+                        int setPos = array.get(rootFvgFreshSetPositions, slot)
+                        valid := (tf == TF_1H or tf == TF_4H or tf == TF_D) and setPos >= 0 and setPos < array.size(freshSet)
+                        if valid
+                            valid := array.get(freshSet, setPos) == slot
+                    if valid
+                        rootId := array.get(rootIds, slot)
+                        int dir   = array.get(rootDirections, slot)
+                        int bTick = array.get(rootNativeBottomTicks, slot)
+                        int tTick = array.get(rootNativeTopTicks,    slot)
+                        valid := array.get(rootSlotLiveFlags, slot) and rootId != ID_NONE and array.get(rootCategories, slot) == CAT_FVG and array.get(rootFvgFreshFlags, slot) and (dir == FVG_BULLISH or dir == FVG_BEARISH) and not na(bTick) and not na(tTick) and bTick <= tTick and not na(array.get(rootConfirmedTimes, slot)) and not na(array.get(rootOriginTimes, slot)) and array.get(rootOriginKeys, slot) != ID_NONE
+                    if not valid
+                        ok := false
+                    else
+                        int  virtualState = array.get(rootStates, slot)
+                        int  invalidates  = 0
+                        bool freshEnded   = false
+                        int  row = 0
+                        while row < journalCountNow
+                            if array.get(journalTargetRootSlots, row) == slot and array.get(journalExpectedRootIds, row) == rootId
+                                int op = array.get(journalOps, row)
+                                if op == JOP_FVG_INVALIDATE and array.get(journalGroups, row) == JGROUP_E1
+                                    invalidates += 1
+                                    virtualState := ROOT_INVALIDATED
+                                else if op == JOP_FVG_FRESH_END
+                                    freshEnded := true
+                            row += 1
+                        if invalidates > 1 or not (virtualState == ROOT_ACTIVE or virtualState == ROOT_INVALIDATED or virtualState == ROOT_INVERSE_WAIT or virtualState == ROOT_INVERSE_ACTIVE)
+                            ok := false
+                        else if not freshEnded
+                            bool touched = baseLowTick <= array.get(rootNativeTopTicks, slot) and baseHighTick >= array.get(rootNativeBottomTicks, slot)
+                            if feedBaseCloseTime > array.get(rootConfirmedTimes, slot) and touched
+                                array.push(specSources, 0)
+                                array.push(specIndexes, slot)
+                                array.push(specStates,  virtualState)
+                    i += 1
+                if not ok
+                    violation := true
+            else
+                int scanEnd = journalCountNow
+                int n = 0
+                while not violation and n < scanEnd
+                    if array.get(journalOps, n) == JOP_NEW_ROOT and array.get(journalGroups, n) == JGROUP_E2 and array.get(journalCategories, n) == CAT_FVG
+                        int   nTf        = array.get(journalTfCodes,        n)
+                        int   nDir       = array.get(journalDirections,     n)
+                        int   nOrigin    = array.get(journalOriginTimes,    n)
+                        int   nConfirmed = array.get(journalConfirmedTimes, n)
+                        float nBottom    = array.get(journalNativeBottoms,  n)
+                        float nTop       = array.get(journalNativeTops,     n)
+                        bool  valid = (nTf == TF_1H or nTf == TF_4H or nTf == TF_D) and (nDir == FVG_BULLISH or nDir == FVG_BEARISH) and not na(nOrigin) and not na(nConfirmed) and not na(nBottom) and not na(nTop) and array.get(journalOriginKeys, n) != ID_NONE and array.get(journalFvgFreshFlags, n) and array.get(journalTargetRootSlots, n) == SLOT_INVALID and array.get(journalExpectedRootIds, n) == ID_NONE
+                        int  sameNew    = 0
+                        bool pathBFound = false
+                        int  j = 0
+                        while valid and j < journalCountNow
+                            int jOp = array.get(journalOps, j)
+                            if array.get(journalCategories, j) == CAT_FVG and array.get(journalTfCodes, j) == nTf and array.get(journalDirections, j) == nDir and array.get(journalOriginTimes, j) == nOrigin
+                                if jOp == JOP_NEW_ROOT
+                                    sameNew += 1
+                                else if jOp == JOP_FVG_FRESH_END and array.get(journalTargetRootSlots, j) == SLOT_INVALID and array.get(journalExpectedRootIds, j) == ID_NONE
+                                    pathBFound := true
+                            j += 1
+                        // Path B rows of this phase are still pending (the live code had appended them already)
+                        int p = 0
+                        while valid and p < array.size(specIndexes)
+                            int pn = array.get(specIndexes, p)
+                            if array.get(journalTfCodes, pn) == nTf and array.get(journalDirections, pn) == nDir and array.get(journalOriginTimes, pn) == nOrigin
+                                pathBFound := true
+                            p += 1
+                        if not valid or sameNew != 1
+                            violation := true
+                        else if not pathBFound
+                            int  nBottomTick = int(math.round(nBottom / feedMintick))
+                            int  nTopTick    = int(math.round(nTop    / feedMintick))
+                            bool touched     = baseLowTick <= nTopTick and baseHighTick >= nBottomTick
+                            if feedBaseCloseTime > nConfirmed and touched
+                                array.push(specSources, 1)
+                                array.push(specIndexes, n)
+                                array.push(specStates,  ROOT_ACTIVE)
+                    n += 1
+            // append the phase's rows (same payload as the live journalAppendRaw calls)
+            int r = 0
+            while not violation and r < array.size(specIndexes)
+                bool  fromRoot = array.get(specSources, r) == 0
+                int   idx      = array.get(specIndexes, r)
+                int   st       = array.get(specStates,  r)
+                int   target   = fromRoot ? idx : SLOT_INVALID
+                int   expected = fromRoot ? array.get(rootIds, idx) : ID_NONE
+                int   subtype  = fromRoot ? array.get(rootSubtypes, idx)       : array.get(journalSubtypes, idx)
+                int   tfCode   = fromRoot ? array.get(rootTfCodes, idx)        : array.get(journalTfCodes, idx)
+                int   oKey     = fromRoot ? array.get(rootOriginKeys, idx)     : array.get(journalOriginKeys, idx)
+                int   oTime    = fromRoot ? array.get(rootOriginTimes, idx)    : array.get(journalOriginTimes, idx)
+                int   oEnd     = fromRoot ? array.get(rootOriginEndTimes, idx) : array.get(journalOriginEndTimes, idx)
+                int   cTime    = fromRoot ? array.get(rootConfirmedTimes, idx) : array.get(journalConfirmedTimes, idx)
+                float nb       = fromRoot ? array.get(rootNativeBottoms, idx)  : array.get(journalNativeBottoms, idx)
+                float nt       = fromRoot ? array.get(rootNativeTops, idx)     : array.get(journalNativeTops, idx)
+                bool  broad    = fromRoot ? array.get(rootIsBroadFvgFlags, idx) : array.get(journalIsBroadFlags, idx)
+                int   dir      = fromRoot ? array.get(rootDirections, idx)     : array.get(journalDirections, idx)
+                int   row      = journalCountNow
+                if row < array.size(journalOps)
+                    array.set(journalOps,             row, JOP_FVG_FRESH_END)
+                    array.set(journalGroups,          row, JGROUP_E3)
+                    array.set(journalTargetRootSlots, row, target)
+                    array.set(journalExpectedRootIds, row, expected)
+                    array.set(journalCategories,      row, CAT_FVG)
+                    array.set(journalSubtypes,        row, subtype)
+                    array.set(journalTfCodes,         row, tfCode)
+                    array.set(journalOriginKeys,      row, oKey)
+                    array.set(journalOriginTimes,     row, oTime)
+                    array.set(journalOriginEndTimes,  row, oEnd)
+                    array.set(journalConfirmedTimes,  row, cTime)
+                    array.set(journalPointPrices,     row, float(na))
+                    array.set(journalNativeBottoms,   row, nb)
+                    array.set(journalNativeTops,      row, nt)
+                    array.set(journalOldStates,       row, st)
+                    array.set(journalNewStates,       row, st)
+                    array.set(journalFvgFreshFlags,   row, false)
+                    array.set(journalIsBroadFlags,    row, broad)
+                    array.set(journalDirections,      row, dir)
+                    array.set(journalOldMasks,        row, 0)
+                    array.set(journalNewMasks,        row, 0)
+                    array.set(journalPairKeys,        row, ID_NONE)
+                    array.set(journalSlopeDirs,       row, int(na))
+                else
+                    array.push(journalOps,             JOP_FVG_FRESH_END)
+                    array.push(journalGroups,          JGROUP_E3)
+                    array.push(journalTargetRootSlots, target)
+                    array.push(journalExpectedRootIds, expected)
+                    array.push(journalCategories,      CAT_FVG)
+                    array.push(journalSubtypes,        subtype)
+                    array.push(journalTfCodes,         tfCode)
+                    array.push(journalOriginKeys,      oKey)
+                    array.push(journalOriginTimes,     oTime)
+                    array.push(journalOriginEndTimes,  oEnd)
+                    array.push(journalConfirmedTimes,  cTime)
+                    array.push(journalPointPrices,     float(na))
+                    array.push(journalNativeBottoms,   nb)
+                    array.push(journalNativeTops,      nt)
+                    array.push(journalOldStates,       st)
+                    array.push(journalNewStates,       st)
+                    array.push(journalFvgFreshFlags,   false)
+                    array.push(journalIsBroadFlags,    broad)
+                    array.push(journalDirections,      dir)
+                    array.push(journalOldMasks,        0)
+                    array.push(journalNewMasks,        0)
+                    array.push(journalPairKeys,        ID_NONE)
+                    array.push(journalSlopeDirs,       int(na))
+                journalCountNow := row + 1
+                r += 1
+            phase += 1
+    [journalCountNow, violation]
