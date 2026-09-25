@@ -58,6 +58,10 @@ const int CAND_POOL_NONE         = 0
 const int CAND_POOL_DENSE        = 1
 const int CAND_POOL_STAGE_C      = 2
 const int CAND_POOL_CONTEXT_SCAN = 3
+// W06 B02 Candidate run domains (private, never exported)
+const int CAND_RUN_DOMAIN_FULL         = 0
+const int CAND_RUN_DOMAIN_LOCAL_NORMAL = 1
+const int CAND_RUN_DOMAIN_BROAD_ONLY   = 2
 
 type CandidateCtx
     array<int> rootIds
@@ -158,6 +162,7 @@ type CandidateCtx
     int candidateWinnerRefRepLength
     int candidatePoolMode
     int candidateBroadSeenEpoch
+    int runDomain = 0
 
 candTickLimitsRaw(CandidateCtx ctx, float mintick) =>
     int mTick     = int(math.round(ctx.clusterMaxWidth / mintick))
@@ -1109,75 +1114,95 @@ candMatchesMaterializedWinnerRaw(CandidateCtx ctx, int side, int stage, int left
             already := ok and same
         r += 1
     [ok, ok and already]
+// W06 B02: true when the Candidate belongs to ctx.runDomain. FULL: always; LOCAL_NORMAL: at least one normal Root
+// (a Point window, or a non-Broad FVG); BROAD_ONLY: no normal Root; any other runDomain: false
+candRunDomainAllowsRaw(CandidateCtx ctx, int leftIndex, int fvgRootSlot, int fvgRootSlot2) =>
+    bool primaryNormal   = fvgRootSlot != SLOT_INVALID and fvgRootSlot >= 0 and fvgRootSlot < array.size(ctx.rootIsBroadFvgFlags)
+    if primaryNormal
+        primaryNormal := not array.get(ctx.rootIsBroadFvgFlags, fvgRootSlot)
+    bool secondaryNormal = fvgRootSlot2 != SLOT_INVALID and fvgRootSlot2 >= 0 and fvgRootSlot2 < array.size(ctx.rootIsBroadFvgFlags)
+    if secondaryNormal
+        secondaryNormal := not array.get(ctx.rootIsBroadFvgFlags, fvgRootSlot2)
+    bool hasNormal = leftIndex != SLOT_INVALID or primaryNormal or secondaryNormal
+    bool allowed   = false
+    if ctx.runDomain == CAND_RUN_DOMAIN_FULL
+        allowed := true
+    else if ctx.runDomain == CAND_RUN_DOMAIN_LOCAL_NORMAL
+        allowed := hasNormal
+    else if ctx.runDomain == CAND_RUN_DOMAIN_BROAD_ONLY
+        allowed := not hasNormal
+    allowed
 candOfferRaw(CandidateCtx ctx, float mintick, int side, int stage, int leftIndex, int rightIndex, int effectiveBottomTick, int effectiveTopTick, int cCount, int hCount, int density, bool baseStrong, int createdTime, int minRootId, int fvgMode, int fvgRootSlot, int categoryMask, int highMask, int currentPsychLevelTick, int currentFvgRootSlot2) =>
     bool handled = true
-    // W05 B13 pool gate: NONE keeps the B08 behavior; CONTEXT_SCAN only marks Broad participants
-    int  poolMode = ctx.candidatePoolMode
-    bool compete  = true
-    if poolMode == CAND_POOL_DENSE
-        compete := (stage == CAND_STAGE_A or stage == CAND_STAGE_B) and density == DEN_HIGH and baseStrong
-    else if poolMode == CAND_POOL_STAGE_C
-        compete := stage == CAND_STAGE_C and (density == DEN_HIGH or density == DEN_NORMAL)
-    else if poolMode == CAND_POOL_CONTEXT_SCAN
-        compete := false
-        array<int> seen = ctx.candidateBroadSeenEpochByRootSlot
-        int g = 0
-        while handled and g < 2
-            int slot = g == 0 ? fvgRootSlot : currentFvgRootSlot2
-            if slot != SLOT_INVALID
-                handled := slot >= 0 and slot < array.size(ctx.rootIds) and slot < array.size(ctx.rootSlotLiveFlags) and slot < array.size(ctx.rootCategories) and slot < array.size(ctx.rootIsBroadFvgFlags) and slot < array.size(seen)
-                if handled
-                    if array.get(ctx.rootSlotLiveFlags, slot) and array.get(ctx.rootCategories, slot) == CAT_FVG and array.get(ctx.rootIsBroadFvgFlags, slot)
-                        array.set(seen, slot, ctx.candidateBroadSeenEpoch)
-            g += 1
-    else if poolMode != CAND_POOL_NONE
-        compete := false
-        handled := false
-    // exact prior-winner identity skip (never a tie)
-    if compete and poolMode != CAND_POOL_NONE
-        [mOk, mAlready] = candMatchesMaterializedWinnerRaw(ctx, side, stage, leftIndex, rightIndex, effectiveBottomTick, effectiveTopTick, fvgMode, fvgRootSlot, currentPsychLevelTick, currentFvgRootSlot2)
-        if not mOk
+    // W06 B02 run domain gate: a Candidate outside ctx.runDomain never enters the greedy competition (FULL always passes)
+    if candRunDomainAllowsRaw(ctx, leftIndex, fvgRootSlot, currentFvgRootSlot2)
+        // W05 B13 pool gate: NONE keeps the B08 behavior; CONTEXT_SCAN only marks Broad participants
+        int  poolMode = ctx.candidatePoolMode
+        bool compete  = true
+        if poolMode == CAND_POOL_DENSE
+            compete := (stage == CAND_STAGE_A or stage == CAND_STAGE_B) and density == DEN_HIGH and baseStrong
+        else if poolMode == CAND_POOL_STAGE_C
+            compete := stage == CAND_STAGE_C and (density == DEN_HIGH or density == DEN_NORMAL)
+        else if poolMode == CAND_POOL_CONTEXT_SCAN
+            compete := false
+            array<int> seen = ctx.candidateBroadSeenEpochByRootSlot
+            int g = 0
+            while handled and g < 2
+                int slot = g == 0 ? fvgRootSlot : currentFvgRootSlot2
+                if slot != SLOT_INVALID
+                    handled := slot >= 0 and slot < array.size(ctx.rootIds) and slot < array.size(ctx.rootSlotLiveFlags) and slot < array.size(ctx.rootCategories) and slot < array.size(ctx.rootIsBroadFvgFlags) and slot < array.size(seen)
+                    if handled
+                        if array.get(ctx.rootSlotLiveFlags, slot) and array.get(ctx.rootCategories, slot) == CAT_FVG and array.get(ctx.rootIsBroadFvgFlags, slot)
+                            array.set(seen, slot, ctx.candidateBroadSeenEpoch)
+                g += 1
+        else if poolMode != CAND_POOL_NONE
+            compete := false
             handled := false
-            compete := false
-        else if mAlready
-            compete := false
-    bool noBest  = ctx.candidateBestSide == SIDE_NONE
-    int  cmp     = 1
-    if compete and not noBest
-        cmp := candCompareRaw(cCount, hCount, effectiveBottomTick, effectiveTopTick, createdTime, minRootId, ctx.candidateBestCCount, ctx.candidateBestHCount, ctx.candidateBestEffectiveBottomTick, ctx.candidateBestEffectiveTopTick, ctx.candidateBestCreatedTime, ctx.candidateBestMinRootId)
-    if compete and (noBest or cmp == 1)
-        ctx.candidateBestSide                := side
-        ctx.candidateBestStage               := stage
-        ctx.candidateBestLeftIndex           := leftIndex
-        ctx.candidateBestRightIndex          := rightIndex
-        ctx.candidateBestEffectiveBottomTick := effectiveBottomTick
-        ctx.candidateBestEffectiveTopTick    := effectiveTopTick
-        ctx.candidateBestCCount              := cCount
-        ctx.candidateBestHCount              := hCount
-        ctx.candidateBestDensity             := density
-        ctx.candidateBestBaseStrong          := baseStrong
-        ctx.candidateBestCreatedTime         := createdTime
-        ctx.candidateBestMinRootId           := minRootId
-        ctx.candidateBestFvgMode             := fvgMode
-        ctx.candidateBestFvgRootSlot         := fvgRootSlot
-        ctx.candidateBestCategoryMask        := categoryMask
-        ctx.candidateBestHighMask            := highMask
-        ctx.candidateRoundTie                := false
-    else if compete and cmp == 0
-        bool sameDirect = ctx.candidateBestSide == side and ctx.candidateBestStage == stage and ctx.candidateBestLeftIndex == leftIndex and ctx.candidateBestRightIndex == rightIndex and ctx.candidateBestEffectiveBottomTick == effectiveBottomTick and ctx.candidateBestEffectiveTopTick == effectiveTopTick and ctx.candidateBestFvgMode == fvgMode and ctx.candidateBestFvgRootSlot == fvgRootSlot
-        if not sameDirect
-            ctx.candidateRoundTie := true
-        else
-            [cOk, cCountOut, cPsych, cPeer] = candCompletionCountRaw(ctx, mintick, ctx.candidateBestSide, ctx.candidateBestStage, ctx.candidateBestLeftIndex, ctx.candidateBestRightIndex, ctx.candidateBestEffectiveBottomTick, ctx.candidateBestEffectiveTopTick, ctx.candidateBestCCount, ctx.candidateBestHCount, ctx.candidateBestDensity, ctx.candidateBestBaseStrong, ctx.candidateBestCreatedTime, ctx.candidateBestMinRootId, ctx.candidateBestFvgMode, ctx.candidateBestFvgRootSlot, ctx.candidateBestCategoryMask, ctx.candidateBestHighMask)
-            if not cOk or cCountOut == 0
+        // exact prior-winner identity skip (never a tie)
+        if compete and poolMode != CAND_POOL_NONE
+            [mOk, mAlready] = candMatchesMaterializedWinnerRaw(ctx, side, stage, leftIndex, rightIndex, effectiveBottomTick, effectiveTopTick, fvgMode, fvgRootSlot, currentPsychLevelTick, currentFvgRootSlot2)
+            if not mOk
                 handled := false
-            else if cCountOut >= 2
+                compete := false
+            else if mAlready
+                compete := false
+        bool noBest  = ctx.candidateBestSide == SIDE_NONE
+        int  cmp     = 1
+        if compete and not noBest
+            cmp := candCompareRaw(cCount, hCount, effectiveBottomTick, effectiveTopTick, createdTime, minRootId, ctx.candidateBestCCount, ctx.candidateBestHCount, ctx.candidateBestEffectiveBottomTick, ctx.candidateBestEffectiveTopTick, ctx.candidateBestCreatedTime, ctx.candidateBestMinRootId)
+        if compete and (noBest or cmp == 1)
+            ctx.candidateBestSide                := side
+            ctx.candidateBestStage               := stage
+            ctx.candidateBestLeftIndex           := leftIndex
+            ctx.candidateBestRightIndex          := rightIndex
+            ctx.candidateBestEffectiveBottomTick := effectiveBottomTick
+            ctx.candidateBestEffectiveTopTick    := effectiveTopTick
+            ctx.candidateBestCCount              := cCount
+            ctx.candidateBestHCount              := hCount
+            ctx.candidateBestDensity             := density
+            ctx.candidateBestBaseStrong          := baseStrong
+            ctx.candidateBestCreatedTime         := createdTime
+            ctx.candidateBestMinRootId           := minRootId
+            ctx.candidateBestFvgMode             := fvgMode
+            ctx.candidateBestFvgRootSlot         := fvgRootSlot
+            ctx.candidateBestCategoryMask        := categoryMask
+            ctx.candidateBestHighMask            := highMask
+            ctx.candidateRoundTie                := false
+        else if compete and cmp == 0
+            bool sameDirect = ctx.candidateBestSide == side and ctx.candidateBestStage == stage and ctx.candidateBestLeftIndex == leftIndex and ctx.candidateBestRightIndex == rightIndex and ctx.candidateBestEffectiveBottomTick == effectiveBottomTick and ctx.candidateBestEffectiveTopTick == effectiveTopTick and ctx.candidateBestFvgMode == fvgMode and ctx.candidateBestFvgRootSlot == fvgRootSlot
+            if not sameDirect
                 ctx.candidateRoundTie := true
             else
-                bool samePsych = (na(cPsych) and na(currentPsychLevelTick)) or (not na(cPsych) and not na(currentPsychLevelTick) and cPsych == currentPsychLevelTick)
-                bool samePeer  = cPeer == currentFvgRootSlot2
-                if not (samePsych and samePeer)
+                [cOk, cCountOut, cPsych, cPeer] = candCompletionCountRaw(ctx, mintick, ctx.candidateBestSide, ctx.candidateBestStage, ctx.candidateBestLeftIndex, ctx.candidateBestRightIndex, ctx.candidateBestEffectiveBottomTick, ctx.candidateBestEffectiveTopTick, ctx.candidateBestCCount, ctx.candidateBestHCount, ctx.candidateBestDensity, ctx.candidateBestBaseStrong, ctx.candidateBestCreatedTime, ctx.candidateBestMinRootId, ctx.candidateBestFvgMode, ctx.candidateBestFvgRootSlot, ctx.candidateBestCategoryMask, ctx.candidateBestHighMask)
+                if not cOk or cCountOut == 0
+                    handled := false
+                else if cCountOut >= 2
                     ctx.candidateRoundTie := true
+                else
+                    bool samePsych = (na(cPsych) and na(currentPsychLevelTick)) or (not na(cPsych) and not na(currentPsychLevelTick) and cPsych == currentPsychLevelTick)
+                    bool samePeer  = cPeer == currentFvgRootSlot2
+                    if not (samePsych and samePeer)
+                        ctx.candidateRoundTie := true
     handled
 candEnumerateStageARaw(CandidateCtx ctx, float mintick, int side, int denseTick, int mTick) =>
     bool        ok        = (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and not na(mintick) and mintick > 0 and denseTick >= 0 and mTick >= 0 and denseTick <= mTick
@@ -2196,7 +2221,7 @@ candSelectWinnersRaw(CandidateCtx ctx, float mintick, int side, int denseTick, i
             int f = array.get(fvgScratch, k)
             ok := f >= 0 and f < array.size(ctx.rootIds) and f < array.size(ctx.rootSlotLiveFlags) and f < array.size(ctx.rootCategories) and f < array.size(ctx.rootIsBroadFvgFlags) and f < array.size(ctx.rootNativeBottomTicks) and f < array.size(ctx.rootNativeTopTicks) and f < array.size(ctx.rootConfirmedTimes) and f < array.size(seen)
             if ok
-                if array.get(ctx.rootSlotLiveFlags, f) and array.get(ctx.rootCategories, f) == CAT_FVG and array.get(ctx.rootIsBroadFvgFlags, f) and candEligibleRaw(ctx, f, side) and array.get(seen, f) != ctx.candidateBroadSeenEpoch
+                if array.get(ctx.rootSlotLiveFlags, f) and array.get(ctx.rootCategories, f) == CAT_FVG and array.get(ctx.rootIsBroadFvgFlags, f) and candEligibleRaw(ctx, f, side) and array.get(seen, f) != ctx.candidateBroadSeenEpoch and ctx.runDomain != CAND_RUN_DOMAIN_LOCAL_NORMAL
                     int nb   = array.get(ctx.rootNativeBottomTicks, f)
                     int nt   = array.get(ctx.rootNativeTopTicks, f)
                     int conf = array.get(ctx.rootConfirmedTimes, f)
@@ -2224,3 +2249,33 @@ export selectBothSides(array<int> rootIds, array<int> rootCategories, array<int>
     int supportWinnerCount    = candSelectWinnersRaw(ctx, ctx.mintick, SIDE_SUPPORT, candidateDenseTick, candidateMTick)
     int resistanceWinnerCount = candSelectWinnersRaw(ctx, ctx.mintick, SIDE_RESISTANCE, candidateDenseTick, candidateMTick)
     [supportWinnerCount, resistanceWinnerCount, ctx.candidateScratchSupportNewLength, ctx.candidateScratchResistanceNewLength, ctx.candidateSupportFvgLength, ctx.candidateResistanceFvgLength, ctx.candidateBestSide, ctx.candidateBestStage, ctx.candidateBestLeftIndex, ctx.candidateBestRightIndex, ctx.candidateBestEffectiveBottomTick, ctx.candidateBestEffectiveTopTick, ctx.candidateBestCCount, ctx.candidateBestHCount, ctx.candidateBestDensity, ctx.candidateBestBaseStrong, ctx.candidateBestCreatedTime, ctx.candidateBestMinRootId, ctx.candidateBestFvgMode, ctx.candidateBestFvgRootSlot, ctx.candidateBestCategoryMask, ctx.candidateBestHighMask, ctx.candidateRoundTie, ctx.candidateFailedSupport, ctx.candidateFailedResistance, ctx.candidateWinnerLogicalCount, ctx.candidateWinnerRootIdLength, ctx.candidateWinnerRefValueLength, ctx.candidateWinnerRefRepLength, ctx.candidatePoolMode, ctx.candidateBroadSeenEpoch]
+
+// W06 B02: thin export of the one 5-key Candidate comparator (candCompareRaw)
+export compareCandidates(int aCCount, int aHCount, int aBottomTick, int aTopTick, int aCreatedTime, int aMinRootId, int bCCount, int bHCount, int bBottomTick, int bTopTick, int bCreatedTime, int bMinRootId) =>
+    candCompareRaw(aCCount, aHCount, aBottomTick, aTopTick, aCreatedTime, aMinRootId, bCCount, bHCount, bBottomTick, bTopTick, bCreatedTime, bMinRootId)
+
+// W06 B02: selectBothSides with a Candidate run domain; returns its 31 values + the CONTEXT_SCAN epoch of each Side (na when not reached).
+// An invalid runDomain runs no scan and returns both Sides failed (-1, failed flags true, no winner).
+export selectComponentBothSides(array<int> rootIds, array<int> rootCategories, array<int> rootSubtypes, array<int> rootTfCodes, array<int> rootConfirmedTimes, array<float> rootPointPrices, array<int> rootPointTicks, array<float> rootNativeBottoms, array<float> rootNativeTops, array<int> rootNativeBottomTicks, array<int> rootNativeTopTicks, array<int> rootStates, array<int> rootPairKeys, array<int> rootDirections, array<bool> rootIsBroadFvgFlags, array<int> rootLabelMasks, array<bool> rootSlotLiveFlags, array<int> rootPriceOrderSlots, array<int> rootIdOrderSlots, map<int, int> rootIdToSlot, map<int, int> accumPairUpperRootSlotByKey, map<int, int> accumPairLowerRootSlotByKey, array<int> rootSwingTfMasks, int ema2000RootSlot, int ema2000ExpectedRootId, int ema2000SlopeDir, int ema3000RootSlot, int ema3000ExpectedRootId, int ema3000SlopeDir, float clusterMaxWidth, float denseRatio, bool useMa, bool useSwing, bool useAccum, bool useTimeHl, bool useFvg, bool usePsych, float mintick, array<int> candidateScratchSupportNewRootSlots, array<int> candidateScratchResistanceNewRootSlots, array<int> candidateSupportScratchPosByRootSlot, array<int> candidateResistanceScratchPosByRootSlot, array<bool> candidateSupportUsedByRootSlot, array<bool> candidateResistanceUsedByRootSlot, array<int> candidateSupportFvgRootSlots, array<int> candidateResistanceFvgRootSlots, array<int> candidateWindowMinRootIdDequeScratchIndexes, array<int> candidateWindowMaxConfirmedTimeDequeScratchIndexes, array<int> candidateWinnerSides, array<int> candidateWinnerStages, array<int> candidateWinnerEffectiveBottomTicks, array<int> candidateWinnerEffectiveTopTicks, array<int> candidateWinnerCCounts, array<int> candidateWinnerHCounts, array<int> candidateWinnerDensities, array<bool> candidateWinnerBaseStrongFlags, array<int> candidateWinnerCategoryMasks, array<int> candidateWinnerHighMasks, array<int> candidateWinnerCreatedTimes, array<int> candidateWinnerMinRootIds, array<int> candidateWinnerFvgModes, array<int> candidateWinnerPsychLevelTicks, array<float> candidateWinnerReferencePrices, array<int> candidateWinnerRootIdOffsets, array<int> candidateWinnerRootIdLengths, array<int> candidateWinnerRootIds, array<float> candidateWinnerRefValueScratch, array<float> candidateWinnerRefRepScratch, array<int> candidateBroadSeenEpochByRootSlot, int candidateScratchSupportNewLength, int candidateScratchResistanceNewLength, int candidateSupportFvgLength, int candidateResistanceFvgLength, int candidateBestSide, int candidateBestStage, int candidateBestLeftIndex, int candidateBestRightIndex, int candidateBestEffectiveBottomTick, int candidateBestEffectiveTopTick, int candidateBestCCount, int candidateBestHCount, int candidateBestDensity, bool candidateBestBaseStrong, int candidateBestCreatedTime, int candidateBestMinRootId, int candidateBestFvgMode, int candidateBestFvgRootSlot, int candidateBestCategoryMask, int candidateBestHighMask, bool candidateRoundTie, bool candidateFailedSupport, bool candidateFailedResistance, int candidateWinnerLogicalCount, int candidateWinnerRootIdLength, int candidateWinnerRefValueLength, int candidateWinnerRefRepLength, int candidatePoolMode, int candidateBroadSeenEpoch, int runDomain) =>
+    CandidateCtx ctx = CandidateCtx.new(rootIds, rootCategories, rootSubtypes, rootTfCodes, rootConfirmedTimes, rootPointPrices, rootPointTicks, rootNativeBottoms, rootNativeTops, rootNativeBottomTicks, rootNativeTopTicks, rootStates, rootPairKeys, rootDirections, rootIsBroadFvgFlags, rootLabelMasks, rootSlotLiveFlags, rootPriceOrderSlots, rootIdOrderSlots, rootIdToSlot, accumPairUpperRootSlotByKey, accumPairLowerRootSlotByKey, rootSwingTfMasks, ema2000RootSlot, ema2000ExpectedRootId, ema2000SlopeDir, ema3000RootSlot, ema3000ExpectedRootId, ema3000SlopeDir, clusterMaxWidth, denseRatio, useMa, useSwing, useAccum, useTimeHl, useFvg, usePsych, mintick, candidateScratchSupportNewRootSlots, candidateScratchResistanceNewRootSlots, candidateSupportScratchPosByRootSlot, candidateResistanceScratchPosByRootSlot, candidateSupportUsedByRootSlot, candidateResistanceUsedByRootSlot, candidateSupportFvgRootSlots, candidateResistanceFvgRootSlots, candidateWindowMinRootIdDequeScratchIndexes, candidateWindowMaxConfirmedTimeDequeScratchIndexes, candidateWinnerSides, candidateWinnerStages, candidateWinnerEffectiveBottomTicks, candidateWinnerEffectiveTopTicks, candidateWinnerCCounts, candidateWinnerHCounts, candidateWinnerDensities, candidateWinnerBaseStrongFlags, candidateWinnerCategoryMasks, candidateWinnerHighMasks, candidateWinnerCreatedTimes, candidateWinnerMinRootIds, candidateWinnerFvgModes, candidateWinnerPsychLevelTicks, candidateWinnerReferencePrices, candidateWinnerRootIdOffsets, candidateWinnerRootIdLengths, candidateWinnerRootIds, candidateWinnerRefValueScratch, candidateWinnerRefRepScratch, candidateBroadSeenEpochByRootSlot, candidateScratchSupportNewLength, candidateScratchResistanceNewLength, candidateSupportFvgLength, candidateResistanceFvgLength, candidateBestSide, candidateBestStage, candidateBestLeftIndex, candidateBestRightIndex, candidateBestEffectiveBottomTick, candidateBestEffectiveTopTick, candidateBestCCount, candidateBestHCount, candidateBestDensity, candidateBestBaseStrong, candidateBestCreatedTime, candidateBestMinRootId, candidateBestFvgMode, candidateBestFvgRootSlot, candidateBestCategoryMask, candidateBestHighMask, candidateRoundTie, candidateFailedSupport, candidateFailedResistance, candidateWinnerLogicalCount, candidateWinnerRootIdLength, candidateWinnerRefValueLength, candidateWinnerRefRepLength, candidatePoolMode, candidateBroadSeenEpoch, runDomain)
+    bool domainValid           = runDomain == CAND_RUN_DOMAIN_FULL or runDomain == CAND_RUN_DOMAIN_LOCAL_NORMAL or runDomain == CAND_RUN_DOMAIN_BROAD_ONLY
+    int  supportWinnerCount    = -1
+    int  resistanceWinnerCount = -1
+    int  supportScanEpoch      = int(na)
+    int  resistanceScanEpoch   = int(na)
+    if domainValid
+        [candidateDenseTick, candidateMTick] = candTickLimitsRaw(ctx, ctx.mintick)
+        int supportEpochBefore = ctx.candidateBroadSeenEpoch
+        supportWinnerCount := candSelectWinnersRaw(ctx, ctx.mintick, SIDE_SUPPORT, candidateDenseTick, candidateMTick)
+        if ctx.candidateBroadSeenEpoch != supportEpochBefore
+            supportScanEpoch := ctx.candidateBroadSeenEpoch
+        int resistanceEpochBefore = ctx.candidateBroadSeenEpoch
+        resistanceWinnerCount := candSelectWinnersRaw(ctx, ctx.mintick, SIDE_RESISTANCE, candidateDenseTick, candidateMTick)
+        if ctx.candidateBroadSeenEpoch != resistanceEpochBefore
+            resistanceScanEpoch := ctx.candidateBroadSeenEpoch
+    else
+        ctx.candidateFailedSupport      := true
+        ctx.candidateFailedResistance   := true
+        ctx.candidateWinnerLogicalCount := 0
+        ctx.candidateWinnerRootIdLength := 0
+    [supportWinnerCount, resistanceWinnerCount, ctx.candidateScratchSupportNewLength, ctx.candidateScratchResistanceNewLength, ctx.candidateSupportFvgLength, ctx.candidateResistanceFvgLength, ctx.candidateBestSide, ctx.candidateBestStage, ctx.candidateBestLeftIndex, ctx.candidateBestRightIndex, ctx.candidateBestEffectiveBottomTick, ctx.candidateBestEffectiveTopTick, ctx.candidateBestCCount, ctx.candidateBestHCount, ctx.candidateBestDensity, ctx.candidateBestBaseStrong, ctx.candidateBestCreatedTime, ctx.candidateBestMinRootId, ctx.candidateBestFvgMode, ctx.candidateBestFvgRootSlot, ctx.candidateBestCategoryMask, ctx.candidateBestHighMask, ctx.candidateRoundTie, ctx.candidateFailedSupport, ctx.candidateFailedResistance, ctx.candidateWinnerLogicalCount, ctx.candidateWinnerRootIdLength, ctx.candidateWinnerRefValueLength, ctx.candidateWinnerRefRepLength, ctx.candidatePoolMode, ctx.candidateBroadSeenEpoch, supportScanEpoch, resistanceScanEpoch]
