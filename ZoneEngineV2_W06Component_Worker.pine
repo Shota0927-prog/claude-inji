@@ -2185,3 +2185,314 @@ runComponentRaw(int row, int cfgRevision, array<int> rootIds, array<int> rootCat
             while array.size(candSeenBroadRootIds) > seenStart
                 array.pop(candSeenBroadRootIds)
     [ok, outEpoch]
+
+// W06 B11 W05 /3 record constants (exact copies): Candidate stages and the BROAD_CONTEXT FVG range mode
+const int W05_STAGE_A                  = 0
+const int W05_STAGE_B                  = 1
+const int W05_STAGE_C                  = 2
+const int W05_STAGE_BROAD_CONTEXT      = 3
+const int W05_FVG_RANGE_BROAD_CONTEXT  = 5
+
+// W06 B11: exact FULL-Side winner sequence from the component caches of one Side (sideBit 1 Support / 2 Resistance).
+// Every row is validated (ID > 0, kind, member slice, cfg / stage / used key, status not DIRTY and >= -1, record length
+// = status (0 for -1), record and seen slices inside the pools, exactly one BROAD_ONLY row). Each record slice is a W05
+// greedy round sequence (not comparator sorted) laid out [phase 0: Stage A / B][phase 1: Stage C][Context]; a LOCAL row
+// holds no Context record; every record has the Side's W05 value and a valid root slice of positive IDs; a Context
+// record's owner is its single root ID (W05 materializes BROAD_CONTEXT with the Broad FVG slot only: fvgMode 5,
+// root count 1, root = minRootId) and is an INCLUDED_BROAD of that row.
+// Seen: every row's seen slice (strictly ascending, each ID an INCLUDED_BROAD of the row and a current capable Broad FVG
+// with its expected rootId) is united by a k-way merge into mergedSeenBroadRootIds, rootId ascending, no duplicate.
+// Winners: phase 0 then phase 1 are each merged round by round: the current heads of all components are compared with
+// W05Cand.compareCandidates, the best head is copied and only that component's cursor advances; the best head tying
+// (cmp 0) with another component's head is the W05 FULL round tie -> computed Side failure. Then the BROAD_ONLY
+// Context records are appended in their slice order, except those whose owner is in the global seen union.
+// Record copy: fields 0-13, root IDs in order, reference price exact; field 14 rewritten to the merged root offset.
+// Returns [true, count] / [true, -1] (a component Side failure or a round tie; record outputs empty, seen union kept) /
+// [false, 0] (structural failure; all four outputs cleared). The four outputs must be empty on entry. Read-only input.
+mergeSideRaw(int sideBit, int cfgRevision, map<int, int> rootIdToSlot, array<int> rootIds, array<bool> rootSlotLiveFlags, array<int> rootCategories, array<int> rootStates, array<int> rootDirections, array<int> rootPointTicks, array<int> rootNativeBottomTicks, array<int> rootNativeTopTicks, array<bool> rootIsBroadFvgFlags, array<int> rootCandComponentExpectedRootIds, array<int> candComponentIds, array<int> candComponentKinds, array<int> candComponentMemberOffsets, array<int> candComponentMemberLengths, array<int> candComponentCfgRevisions, array<int> candComponentStageKeys, array<int> candComponentUsedEpochKeys, array<int> candComponentSupportStatuses, array<int> candComponentResistanceStatuses, array<int> candComponentSupportRecordOffsets, array<int> candComponentSupportRecordLengths, array<int> candComponentResistanceRecordOffsets, array<int> candComponentResistanceRecordLengths, array<int> candComponentSupportSeenOffsets, array<int> candComponentSupportSeenLengths, array<int> candComponentResistanceSeenOffsets, array<int> candComponentResistanceSeenLengths, array<int> candMemberRootIds, array<int> candMemberRoleFlags, array<int> candRecordInts, array<float> candRecordReferencePrices, array<int> candRecordRootIds, array<int> candSeenBroadRootIds, array<int> mergedRecordInts, array<float> mergedRecordReferencePrices, array<int> mergedRecordRootIds, array<int> mergedSeenBroadRootIds) =>
+    int  rowCount    = array.size(candComponentIds)
+    int  recIntLen   = array.size(candRecordInts)
+    int  recordCount = 0
+    int  rootPoolLen = array.size(candRecordRootIds)
+    int  memPoolLen  = array.size(candMemberRootIds)
+    bool ok = (sideBit == 1 or sideBit == 2) and array.size(mergedRecordInts) == 0 and array.size(mergedRecordReferencePrices) == 0 and array.size(mergedRecordRootIds) == 0 and array.size(mergedSeenBroadRootIds) == 0
+    if ok
+        ok := rowCount == array.size(candComponentKinds) and rowCount == array.size(candComponentMemberOffsets) and rowCount == array.size(candComponentMemberLengths) and rowCount == array.size(candComponentCfgRevisions) and rowCount == array.size(candComponentStageKeys) and rowCount == array.size(candComponentUsedEpochKeys) and rowCount == array.size(candComponentSupportStatuses) and rowCount == array.size(candComponentResistanceStatuses) and rowCount == array.size(candComponentSupportRecordOffsets) and rowCount == array.size(candComponentSupportRecordLengths) and rowCount == array.size(candComponentResistanceRecordOffsets) and rowCount == array.size(candComponentResistanceRecordLengths) and rowCount == array.size(candComponentSupportSeenOffsets) and rowCount == array.size(candComponentSupportSeenLengths) and rowCount == array.size(candComponentResistanceSeenOffsets) and rowCount == array.size(candComponentResistanceSeenLengths) and array.size(candMemberRoleFlags) == memPoolLen
+    if ok
+        ok := recIntLen % CAND_RECORD_INT_STRIDE == 0
+    if ok
+        recordCount := int(math.floor(recIntLen / CAND_RECORD_INT_STRIDE))
+        ok := array.size(candRecordReferencePrices) == recordCount
+    bool computedFailure = false
+    int  sideValue       = sideBit == 1 ? W05_SIDE_SUPPORT : W05_SIDE_RESISTANCE
+    // per-row absolute record bounds: [start, p0End) phase 0, [p0End, p1End) phase 1, [p1End, end) Context
+    array<int> rowStart = array.new_int(0)
+    array<int> rowP0End = array.new_int(0)
+    array<int> rowP1End = array.new_int(0)
+    array<int> rowEnd   = array.new_int(0)
+    int broadOnlyRow   = SLOT_INVALID
+    int broadOnlyCount = 0
+    int r = 0
+    while ok and r < rowCount
+        int kind   = array.get(candComponentKinds, r)
+        int mOff   = array.get(candComponentMemberOffsets, r)
+        int mLen   = array.get(candComponentMemberLengths, r)
+        int status = sideBit == 1 ? array.get(candComponentSupportStatuses, r) : array.get(candComponentResistanceStatuses, r)
+        int rOff   = sideBit == 1 ? array.get(candComponentSupportRecordOffsets, r) : array.get(candComponentResistanceRecordOffsets, r)
+        int rLen   = sideBit == 1 ? array.get(candComponentSupportRecordLengths, r) : array.get(candComponentResistanceRecordLengths, r)
+        int sOff   = sideBit == 1 ? array.get(candComponentSupportSeenOffsets, r) : array.get(candComponentResistanceSeenOffsets, r)
+        int sLen   = sideBit == 1 ? array.get(candComponentSupportSeenLengths, r) : array.get(candComponentResistanceSeenLengths, r)
+        ok := array.get(candComponentIds, r) > 0 and (kind == CAND_COMPONENT_KIND_LOCAL or kind == CAND_COMPONENT_KIND_BROAD_ONLY) and mOff >= 0 and mLen >= 0 and mOff + mLen <= memPoolLen and array.get(candComponentCfgRevisions, r) == cfgRevision and array.get(candComponentStageKeys, r) == CAND_CACHE_STAGE_FULL_GREEDY and array.get(candComponentUsedEpochKeys, r) == CAND_USED_EPOCH_ALL_CLEAR
+        if ok
+            ok := status != CAND_CACHE_STATUS_DIRTY and status >= -1 and (status == -1 ? rLen == 0 : rLen == status) and rOff >= 0 and rLen >= 0 and rOff + rLen <= recordCount and sOff >= 0 and sLen >= 0 and sOff + sLen <= array.size(candSeenBroadRootIds)
+        if ok and status == -1
+            computedFailure := true
+        if ok and kind == CAND_COMPONENT_KIND_BROAD_ONLY
+            broadOnlyRow   := r
+            broadOnlyCount += 1
+        // record slice: Side value, phase order, root slices, Context owner
+        int p0End = rOff
+        int p1End = rOff
+        int phase = 0
+        int i = rOff
+        while ok and i < rOff + rLen
+            int base     = i * CAND_RECORD_INT_STRIDE
+            int stage    = array.get(candRecordInts, base + 1)
+            int rootOff  = array.get(candRecordInts, base + CAND_RECORD_ROOT_OFFSET_FIELD)
+            int rootLen  = array.get(candRecordInts, base + CAND_RECORD_ROOT_LENGTH_FIELD)
+            int recPhase = stage == W05_STAGE_A or stage == W05_STAGE_B ? 0 : stage == W05_STAGE_C ? 1 : stage == W05_STAGE_BROAD_CONTEXT ? 2 : -1
+            ok := array.get(candRecordInts, base) == sideValue and recPhase >= phase and rootOff >= 0 and rootLen >= 0 and rootOff + rootLen <= rootPoolLen
+            if ok
+                phase := recPhase
+                int g = 0
+                while ok and g < rootLen
+                    ok := array.get(candRecordRootIds, rootOff + g) > 0
+                    g += 1
+            if ok and phase == 2
+                ok := kind == CAND_COMPONENT_KIND_BROAD_ONLY and rootLen == 1 and array.get(candRecordInts, base + 12) == W05_FVG_RANGE_BROAD_CONTEXT
+                if ok
+                    int ownerId = array.get(candRecordRootIds, rootOff)
+                    ok := array.get(candRecordInts, base + 11) == ownerId
+                    int ownerPos = SLOT_INVALID
+                    int ownerPosLo = 0
+                    int ownerPosHi = mLen - 1
+                    while ownerPos == SLOT_INVALID and ownerPosLo <= ownerPosHi
+                        int ownerPosMid = int(math.floor((ownerPosLo + ownerPosHi) / 2))
+                        int ownerPosVal = array.get(candMemberRootIds, mOff + ownerPosMid)
+                        if ownerPosVal == ownerId
+                            ownerPos := ownerPosMid
+                        else if ownerPosVal < ownerId
+                            ownerPosLo := ownerPosMid + 1
+                        else
+                            ownerPosHi := ownerPosMid - 1
+                    ok := ok and ownerPos != SLOT_INVALID
+                    if ok
+                        ok := array.get(candMemberRoleFlags, mOff + ownerPos) == CAND_MEMBER_ROLE_INCLUDED_BROAD
+            if ok
+                if phase == 0
+                    p0End := i + 1
+                    p1End := i + 1
+                else if phase == 1
+                    p1End := i + 1
+            i += 1
+        array.push(rowStart, rOff)
+        array.push(rowP0End, p0End)
+        array.push(rowP1End, p1End)
+        array.push(rowEnd, rOff + rLen)
+        // seen slice: strictly ascending INCLUDED_BROAD of the row, current capable Broad FVG
+        int prevSeen = 0
+        int k = 0
+        while ok and k < sLen
+            int seenId = array.get(candSeenBroadRootIds, sOff + k)
+            ok := seenId > prevSeen
+            int seenPos = SLOT_INVALID
+            int seenPosLo = 0
+            int seenPosHi = mLen - 1
+            while seenPos == SLOT_INVALID and seenPosLo <= seenPosHi
+                int seenPosMid = int(math.floor((seenPosLo + seenPosHi) / 2))
+                int seenPosVal = array.get(candMemberRootIds, mOff + seenPosMid)
+                if seenPosVal == seenId
+                    seenPos := seenPosMid
+                else if seenPosVal < seenId
+                    seenPosLo := seenPosMid + 1
+                else
+                    seenPosHi := seenPosMid - 1
+            ok := ok and seenPos != SLOT_INVALID
+            if ok
+                ok := array.get(candMemberRoleFlags, mOff + seenPos) == CAND_MEMBER_ROLE_INCLUDED_BROAD and map.contains(rootIdToSlot, seenId)
+            if ok
+                int seenSlot = map.get(rootIdToSlot, seenId)
+                ok := seenSlot >= 0 and seenSlot < array.size(rootIds) and seenSlot < array.size(rootSlotLiveFlags) and seenSlot < array.size(rootCandComponentExpectedRootIds) and seenSlot < array.size(rootIsBroadFvgFlags)
+                if ok
+                    ok := array.get(rootSlotLiveFlags, seenSlot) and array.get(rootIds, seenSlot) == seenId and array.get(rootCandComponentExpectedRootIds, seenSlot) == seenId
+                if ok
+                    ok := compSideMaskRaw(seenSlot, rootIds, rootSlotLiveFlags, rootCategories, rootStates, rootDirections, rootPointTicks, rootNativeBottomTicks, rootNativeTopTicks) != 0 and array.get(rootCategories, seenSlot) == CAT_FVG and array.get(rootIsBroadFvgFlags, seenSlot)
+            prevSeen := seenId
+            k += 1
+        r += 1
+    if ok
+        ok := broadOnlyCount == 1
+    // global seen union: k-way merge of the ascending row slices, duplicates skipped
+    if ok
+        array<int> seenCursor = array.new_int(0)
+        int q = 0
+        while q < rowCount
+            array.push(seenCursor, sideBit == 1 ? array.get(candComponentSupportSeenOffsets, q) : array.get(candComponentResistanceSeenOffsets, q))
+            q += 1
+        bool seenDone = false
+        while ok and not seenDone
+            int minId = 0
+            q := 0
+            while q < rowCount
+                int qEnd = sideBit == 1 ? array.get(candComponentSupportSeenOffsets, q) + array.get(candComponentSupportSeenLengths, q) : array.get(candComponentResistanceSeenOffsets, q) + array.get(candComponentResistanceSeenLengths, q)
+                int qCur = array.get(seenCursor, q)
+                if qCur < qEnd
+                    int qId = array.get(candSeenBroadRootIds, qCur)
+                    if minId == 0 or qId < minId
+                        minId := qId
+                q += 1
+            if minId == 0
+                seenDone := true
+            else
+                ok := array.size(mergedSeenBroadRootIds) < MAX_PHYSICAL_ARRAY_ELEMENTS
+                if ok
+                    array.push(mergedSeenBroadRootIds, minId)
+                q := 0
+                while q < rowCount
+                    int qEnd = sideBit == 1 ? array.get(candComponentSupportSeenOffsets, q) + array.get(candComponentSupportSeenLengths, q) : array.get(candComponentResistanceSeenOffsets, q) + array.get(candComponentResistanceSeenLengths, q)
+                    int qCur = array.get(seenCursor, q)
+                    if qCur < qEnd
+                        if array.get(candSeenBroadRootIds, qCur) == minId
+                            array.set(seenCursor, q, qCur + 1)
+                    q += 1
+    // exact output size (phase 0 / 1 records, Context records whose owner is unseen): physical bound per array
+    if ok and not computedFailure
+        int needRecords = 0
+        int needRoots   = 0
+        int seenCount   = array.size(mergedSeenBroadRootIds)
+        int q = 0
+        while q < rowCount
+            int e = array.get(rowStart, q)
+            while e < array.get(rowEnd, q)
+                int eBase = e * CAND_RECORD_INT_STRIDE
+                bool take = true
+                if e >= array.get(rowP1End, q)
+                    int eOwner = array.get(candRecordRootIds, array.get(candRecordInts, eBase + CAND_RECORD_ROOT_OFFSET_FIELD))
+                    int eSeen = SLOT_INVALID
+                    int eSeenLo = 0
+                    int eSeenHi = seenCount - 1
+                    while eSeen == SLOT_INVALID and eSeenLo <= eSeenHi
+                        int eSeenMid = int(math.floor((eSeenLo + eSeenHi) / 2))
+                        int eSeenVal = array.get(mergedSeenBroadRootIds, 0 + eSeenMid)
+                        if eSeenVal == eOwner
+                            eSeen := eSeenMid
+                        else if eSeenVal < eOwner
+                            eSeenLo := eSeenMid + 1
+                        else
+                            eSeenHi := eSeenMid - 1
+                    take := eSeen == SLOT_INVALID
+                if take
+                    needRecords += 1
+                    needRoots   += array.get(candRecordInts, eBase + CAND_RECORD_ROOT_LENGTH_FIELD)
+                e += 1
+            q += 1
+        ok := needRecords * CAND_RECORD_INT_STRIDE <= MAX_PHYSICAL_ARRAY_ELEMENTS and needRecords <= MAX_PHYSICAL_ARRAY_ELEMENTS and needRoots <= MAX_PHYSICAL_ARRAY_ELEMENTS
+    // phase 0, then phase 1: round-by-round best of the current component heads
+    bool roundTie = false
+    if ok and not computedFailure
+        array<int> cursor = array.new_int(0)
+        int ph = 0
+        while ok and not roundTie and ph < 2
+            array.clear(cursor)
+            int q = 0
+            while q < rowCount
+                array.push(cursor, ph == 0 ? array.get(rowStart, q) : array.get(rowP0End, q))
+                q += 1
+            bool phaseDone = false
+            while ok and not roundTie and not phaseDone
+                int  best    = SLOT_INVALID
+                bool bestTie = false
+                q := 0
+                while q < rowCount
+                    int qCur = array.get(cursor, q)
+                    int qEnd = ph == 0 ? array.get(rowP0End, q) : array.get(rowP1End, q)
+                    if qCur < qEnd
+                        if best == SLOT_INVALID
+                            best    := q
+                            bestTie := false
+                        else
+                            int aBase = qCur * CAND_RECORD_INT_STRIDE
+                            int bBase = array.get(cursor, best) * CAND_RECORD_INT_STRIDE
+                            int cmp = W05Cand.compareCandidates(array.get(candRecordInts, aBase + 4), array.get(candRecordInts, aBase + 5), array.get(candRecordInts, aBase + 2), array.get(candRecordInts, aBase + 3), array.get(candRecordInts, aBase + 10), array.get(candRecordInts, aBase + 11), array.get(candRecordInts, bBase + 4), array.get(candRecordInts, bBase + 5), array.get(candRecordInts, bBase + 2), array.get(candRecordInts, bBase + 3), array.get(candRecordInts, bBase + 10), array.get(candRecordInts, bBase + 11))
+                            if cmp == 1
+                                best    := q
+                                bestTie := false
+                            else if cmp == 0
+                                bestTie := true
+                    q += 1
+                if best == SLOT_INVALID
+                    phaseDone := true
+                else if bestTie
+                    roundTie := true
+                else
+                    int src     = array.get(cursor, best)
+                    int srcBase = src * CAND_RECORD_INT_STRIDE
+                    int srcRootOff = array.get(candRecordInts, srcBase + CAND_RECORD_ROOT_OFFSET_FIELD)
+                    int srcRootLen = array.get(candRecordInts, srcBase + CAND_RECORD_ROOT_LENGTH_FIELD)
+                    int newRootOff = array.size(mergedRecordRootIds)
+                    int g = 0
+                    while g < srcRootLen
+                        array.push(mergedRecordRootIds, array.get(candRecordRootIds, srcRootOff + g))
+                        g += 1
+                    int f = 0
+                    while f < CAND_RECORD_INT_STRIDE
+                        array.push(mergedRecordInts, f == CAND_RECORD_ROOT_OFFSET_FIELD ? newRootOff : array.get(candRecordInts, srcBase + f))
+                        f += 1
+                    array.push(mergedRecordReferencePrices, array.get(candRecordReferencePrices, src))
+                    array.set(cursor, best, src + 1)
+            ph += 1
+    // Context: BROAD_ONLY records in slice order whose owner Broad is not in the global seen union
+    if ok and not computedFailure and not roundTie
+        int seenCount = array.size(mergedSeenBroadRootIds)
+        int c = array.get(rowP1End, broadOnlyRow)
+        while c < array.get(rowEnd, broadOnlyRow)
+            int cBase    = c * CAND_RECORD_INT_STRIDE
+            int cRootOff = array.get(candRecordInts, cBase + CAND_RECORD_ROOT_OFFSET_FIELD)
+            int cOwner   = array.get(candRecordRootIds, cRootOff)
+            int cSeen = SLOT_INVALID
+            int cSeenLo = 0
+            int cSeenHi = seenCount - 1
+            while cSeen == SLOT_INVALID and cSeenLo <= cSeenHi
+                int cSeenMid = int(math.floor((cSeenLo + cSeenHi) / 2))
+                int cSeenVal = array.get(mergedSeenBroadRootIds, 0 + cSeenMid)
+                if cSeenVal == cOwner
+                    cSeen := cSeenMid
+                else if cSeenVal < cOwner
+                    cSeenLo := cSeenMid + 1
+                else
+                    cSeenHi := cSeenMid - 1
+            if cSeen == SLOT_INVALID
+                int newRootOff = array.size(mergedRecordRootIds)
+                array.push(mergedRecordRootIds, cOwner)
+                int f = 0
+                while f < CAND_RECORD_INT_STRIDE
+                    array.push(mergedRecordInts, f == CAND_RECORD_ROOT_OFFSET_FIELD ? newRootOff : array.get(candRecordInts, cBase + f))
+                    f += 1
+                array.push(mergedRecordReferencePrices, array.get(candRecordReferencePrices, c))
+            c += 1
+    if ok
+        ok := array.size(mergedRecordInts) % CAND_RECORD_INT_STRIDE == 0 and array.size(mergedRecordReferencePrices) == int(math.floor(array.size(mergedRecordInts) / CAND_RECORD_INT_STRIDE))
+    int mergedStatus = 0
+    if not ok
+        array.clear(mergedRecordInts)
+        array.clear(mergedRecordReferencePrices)
+        array.clear(mergedRecordRootIds)
+        array.clear(mergedSeenBroadRootIds)
+    else if computedFailure or roundTie
+        array.clear(mergedRecordInts)
+        array.clear(mergedRecordReferencePrices)
+        array.clear(mergedRecordRootIds)
+        mergedStatus := -1
+    else
+        mergedStatus := array.size(mergedRecordReferencePrices)
+    [ok, mergedStatus]
