@@ -1,0 +1,206 @@
+//@version=6
+// ============================================================
+// ZoneEngineV2_W07Fvg_Worker - W07 FVG state / index / localization worker
+//
+// B01 : shared FVG NativeRange interval helpers, used later by the Fresh path and the
+// Candidate path alike. A Root is the inclusive tick interval [nativeBottomTick,
+// nativeTopTick]; a query is the inclusive tick interval [queryLowTick, queryHighTick];
+// they intersect exactly when rootBottomTick <= queryHighTick and rootTopTick >=
+// queryLowTick (equality intersects, int ticks only, no epsilon, no float compare).
+// Pure price-intersection helpers: no category / Fresh / state / direction / Broad / TF /
+// Inverse / Side filter (callers filter). Inputs are never mutated; only the output
+// arrays named by each function are rebuilt, and only after the whole input validated.
+// No import, no type, no persistent storage, no request, no drawing.
+// ============================================================
+library("ZoneEngineV2_W07Fvg_Worker", overlay = false)
+
+// ---- constants ----
+const int ID_NONE      = 0
+const int SLOT_INVALID = -1
+// W07 FVG Inverse progress (int per Root; defined in B01, used from B08)
+const int FVG_INV_PROGRESS_NONE            = 0
+const int FVG_INV_PROGRESS_WAIT_MOVED_AWAY = 1
+const int FVG_INV_PROGRESS_MOVED_AWAY      = 2
+const int FVG_INV_PROGRESS_RETOUCHED       = 3
+const int FVG_INV_PROGRESS_ACTIVE          = 4
+// fvgIntervalOrderBuild internal status (B01 only; not the W06 Candidate status enum)
+const int FVG_INTERVAL_BUILD_OK            = 0
+const int FVG_INTERVAL_BUILD_INVALID_INPUT = 1
+
+// First index i in [0, array.size(order)) with ticks[order[i]] > target (strictGreater)
+// or ticks[order[i]] >= target (not strictGreater); array.size(order) when none.
+// order must already be ascending by ticks (the caller validates); binary search.
+fvgIntervalLowerBoundRaw(array<int> order, array<int> ticks, int target, bool strictGreater) =>
+    int lo = 0
+    int hi = array.size(order)
+    while lo < hi
+        int mid  = int(math.floor((lo + hi) / 2))
+        int tick = array.get(ticks, array.get(order, mid))
+        bool passed = strictGreater ? tick > target : tick >= target
+        if passed
+            hi := mid
+        else
+            lo := mid + 1
+    lo
+
+// W07 B01: build the NativeBottomTick order and the NativeTopTick order of the first len
+// slots of slots. Each order is ascending by its tick, equal tick by rootId ascending (a
+// physical order of this helper only, never a Candidate / Zone tie-break); equal tick and
+// equal rootId keep the input order (stable merge). Every one of the len slots is in each
+// order exactly once (no cap, no cut-off). Invalid input (len < 0, len > size, slot out of
+// range, rootId <= 0, na tick, bottom > top, duplicate slot) -> both outputs emptied and
+// FVG_INTERVAL_BUILD_INVALID_INPUT; otherwise both outputs rebuilt to exactly len slots
+// and FVG_INTERVAL_BUILD_OK.
+export fvgIntervalOrderBuild(array<int> slots, int len, array<int> rootIds, array<int> rootNativeBottomTicks, array<int> rootNativeTopTicks, array<int> outBottomOrder, array<int> outTopOrder) =>
+    bool ok = len >= 0 and len <= array.size(slots)
+    int  n  = ok ? len : 0
+    array<int> work = array.new_int(n, SLOT_INVALID)
+    map<int, int> seen = map.new<int, int>()
+    int i = 0
+    while ok and i < n
+        int slot = array.get(slots, i)
+        ok := slot >= 0 and slot < array.size(rootIds) and slot < array.size(rootNativeBottomTicks) and slot < array.size(rootNativeTopTicks)
+        if ok
+            int bTick = array.get(rootNativeBottomTicks, slot)
+            int tTick = array.get(rootNativeTopTicks,    slot)
+            ok := array.get(rootIds, slot) > ID_NONE and not na(bTick) and not na(tTick) and bTick <= tTick and not map.contains(seen, slot)
+        if ok
+            map.put(seen, slot, 1)
+            array.set(work, i, slot)
+        i += 1
+    array<int> bottomResult = array.new_int(0)
+    array<int> topResult    = array.new_int(0)
+    if ok
+        int m = 0
+        while m < 2
+            array<int> ticks = m == 0 ? rootNativeBottomTicks : rootNativeTopTicks
+            array<int> src   = array.copy(work)
+            array<int> tmp   = array.new_int(n, SLOT_INVALID)
+            int width = 1
+            while width < n
+                int left = 0
+                while left < n
+                    int mid   = math.min(left + width, n)
+                    int right = math.min(left + 2 * width, n)
+                    int a = left
+                    int b = mid
+                    int k = left
+                    while k < right
+                        bool takeA = false
+                        if a < mid and b < right
+                            int sa = array.get(src, a)
+                            int sb = array.get(src, b)
+                            int ta = array.get(ticks, sa)
+                            int tb = array.get(ticks, sb)
+                            takeA := ta < tb or (ta == tb and array.get(rootIds, sa) <= array.get(rootIds, sb))
+                        else
+                            takeA := a < mid
+                        if takeA
+                            array.set(tmp, k, array.get(src, a))
+                            a += 1
+                        else
+                            array.set(tmp, k, array.get(src, b))
+                            b += 1
+                        k += 1
+                    left += 2 * width
+                array<int> swap = src
+                src := tmp
+                tmp := swap
+                width := width * 2
+            if m == 0
+                bottomResult := src
+            else
+                topResult := src
+            m += 1
+    // outputs are written only after every input was read and validated
+    while array.size(outBottomOrder) > 0
+        array.pop(outBottomOrder)
+    while array.size(outTopOrder) > 0
+        array.pop(outTopOrder)
+    if ok
+        int j = 0
+        while j < n
+            array.push(outBottomOrder, array.get(bottomResult, j))
+            array.push(outTopOrder,    array.get(topResult,    j))
+            j += 1
+    ok ? FVG_INTERVAL_BUILD_OK : FVG_INTERVAL_BUILD_INVALID_INPUT
+
+// W07 B01: every slot of the order pair whose NativeRange intersects [queryLowTick,
+// queryHighTick] (rootBottomTick <= queryHighTick and rootTopTick >= queryLowTick), in
+// outSlots by rootId ascending (equal rootId: the order of the scanned side). Bottom prefix
+// (bottomTick <= queryHighTick) and top suffix (topTick >= queryLowTick) come from binary
+// search; the smaller one is scanned (equal sizes: the bottom prefix) and checked against
+// the other bound, so the result set is the same either way. Invalid input (low > high,
+// size mismatch, slot out of range, rootId <= 0, na tick, bottom > top, duplicate slot,
+// differing slot sets, an order not ascending by (tick, rootId)) -> outSlots emptied, -1.
+// Returns the match count (>= 0) otherwise. Only outSlots is written.
+export fvgIntervalQuery(array<int> bottomOrder, array<int> topOrder, array<int> rootIds, array<int> rootNativeBottomTicks, array<int> rootNativeTopTicks, int queryLowTick, int queryHighTick, array<int> outSlots) =>
+    int  n  = array.size(bottomOrder)
+    bool ok = not na(queryLowTick) and not na(queryHighTick) and queryLowTick <= queryHighTick and array.size(topOrder) == n
+    map<int, int> seen = map.new<int, int>()
+    int m = 0
+    while ok and m < 2
+        array<int> order = m == 0 ? bottomOrder : topOrder
+        array<int> ticks = m == 0 ? rootNativeBottomTicks : rootNativeTopTicks
+        int prevTick = int(na)
+        int prevId   = ID_NONE
+        int i = 0
+        while ok and i < n
+            int slot = array.get(order, i)
+            ok := slot >= 0 and slot < array.size(rootIds) and slot < array.size(rootNativeBottomTicks) and slot < array.size(rootNativeTopTicks)
+            int rootId = ID_NONE
+            int tick   = int(na)
+            if ok
+                int bTick = array.get(rootNativeBottomTicks, slot)
+                int tTick = array.get(rootNativeTopTicks,    slot)
+                rootId := array.get(rootIds, slot)
+                tick   := m == 0 ? bTick : tTick
+                ok := rootId > ID_NONE and not na(bTick) and not na(tTick) and bTick <= tTick
+            if ok and i > 0
+                ok := prevTick < tick or (prevTick == tick and prevId <= rootId)
+            if ok
+                // bottom pass: first sight -> 1 ; top pass: must be 1 -> 2 (same set, no duplicate)
+                if m == 0
+                    ok := not map.contains(seen, slot)
+                    if ok
+                        map.put(seen, slot, 1)
+                else
+                    ok := map.contains(seen, slot)
+                    if ok
+                        ok := map.get(seen, slot) == 1
+                    if ok
+                        map.put(seen, slot, 2)
+            prevTick := tick
+            prevId   := rootId
+            i += 1
+        m += 1
+    array<int> matches = array.new_int(0)
+    if ok
+        int prefixCount = fvgIntervalLowerBoundRaw(bottomOrder, rootNativeBottomTicks, queryHighTick, true)
+        int suffixStart = fvgIntervalLowerBoundRaw(topOrder,    rootNativeTopTicks,    queryLowTick,  false)
+        bool scanBottom = prefixCount <= n - suffixStart
+        int  from = scanBottom ? 0 : suffixStart
+        int  to   = scanBottom ? prefixCount : n
+        int  i = from
+        while i < to
+            int slot = array.get(scanBottom ? bottomOrder : topOrder, i)
+            bool hit = scanBottom ? array.get(rootNativeTopTicks, slot) >= queryLowTick : array.get(rootNativeBottomTicks, slot) <= queryHighTick
+            if hit
+                // insertion by rootId ascending (stable for equal rootId)
+                int id = array.get(rootIds, slot)
+                array.push(matches, slot)
+                int k = array.size(matches) - 1
+                while k > 0 and array.get(rootIds, array.get(matches, k - 1)) > id
+                    array.set(matches, k, array.get(matches, k - 1))
+                    k -= 1
+                array.set(matches, k, slot)
+            i += 1
+    // outSlots is written only after every input was read and validated
+    while array.size(outSlots) > 0
+        array.pop(outSlots)
+    if ok
+        int j = 0
+        while j < array.size(matches)
+            array.push(outSlots, array.get(matches, j))
+            j += 1
+    ok ? array.size(matches) : -1
