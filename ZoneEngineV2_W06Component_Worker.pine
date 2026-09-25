@@ -1103,7 +1103,8 @@ compInheritIdRaw(int newRow, array<int> rootIds, array<bool> rootSlotLiveFlags, 
 // W06 B09 build codes / canonical component x Side cache status / Pine physical array bound (private). Row Side status
 // is the canonical enum (never a winner count; the count is the record length): OK = W05 Side computed (winner records
 // stored), FAILED_AMBIGUOUS = W05 Side failure (-1) stored with record / seen length 0, kept while the Side key is equal,
-// NOT_STORED = reserved (never produced here), NOT_COMPUTED = not run yet (DIRTY). Any status != OK forces FULL fallback.
+// NOT_STORED = a DIRTY Side result that does not fit the capacity (record / seen length 0; FULL fallback with the cache
+// invalidated, as every capacity overflow), NOT_COMPUTED = not run yet (DIRTY). Any status != OK forces FULL fallback.
 // MAX_PHYSICAL_ARRAY_ELEMENTS is the Pine array size bound (hard ceiling, never a logical cap). The logical / testable
 // capacity is the capacity argument of buildComponents / recomputeAndMerge, clamped once at entry to
 // cap = math.max(0, math.min(capacity, MAX_PHYSICAL_ARRAY_ELEMENTS)) and passed unchanged to every private capacity guard;
@@ -2048,6 +2049,9 @@ runComponentRaw(int row, int cfgRevision, array<int> rootIds, array<int> rootCat
             int newRecords = 0
             int newRoots   = 0
             int newSeen    = 0
+            int sNewRecords = 0
+            int sNewRoots   = 0
+            int sNewSeen    = 0
             int side = 0
             while ok and side < 2
                 bool dirty = side == 0 ? sDirty : rDirty
@@ -2099,9 +2103,24 @@ runComponentRaw(int row, int cfgRevision, array<int> rootIds, array<int> rootCat
                                 if ok and array.get(candidateBroadSeenEpochByRootSlot, bSlot) == scan
                                     newSeen += 1
                             k += 1
+                if side == 0
+                    sNewRecords := newRecords
+                    sNewRoots   := newRoots
+                    sNewSeen    := newSeen
                 side += 1
+            // capacity (CLASS A, per Side, Support first): a DIRTY Side whose records / prices / roots / seen do not fit is
+            // NOT_STORED (nothing appended, record / seen length 0, no partial winner, no truncation)
+            bool sStore = true
+            bool rStore = true
             if ok
-                ok := intStart + newRecords * CAND_RECORD_INT_STRIDE <= capacity and priceStart + newRecords <= capacity and rootStart + newRoots <= capacity and seenStart + newSeen <= capacity
+                sStore := not sDirty or (intStart + sNewRecords * CAND_RECORD_INT_STRIDE <= capacity and priceStart + sNewRecords <= capacity and rootStart + sNewRoots <= capacity and seenStart + sNewSeen <= capacity)
+                int aRecords = sDirty and sStore ? sNewRecords : 0
+                int aRoots   = sDirty and sStore ? sNewRoots : 0
+                int aSeen    = sDirty and sStore ? sNewSeen : 0
+                int rNewRecords = newRecords - sNewRecords
+                int rNewRoots   = newRoots - sNewRoots
+                int rNewSeen    = newSeen - sNewSeen
+                rStore := not rDirty or (intStart + (aRecords + rNewRecords) * CAND_RECORD_INT_STRIDE <= capacity and priceStart + aRecords + rNewRecords <= capacity and rootStart + aRoots + rNewRoots <= capacity and seenStart + aSeen + rNewSeen <= capacity)
             // pass 2: append (Support then Resistance), new row fields kept local until every append is done
             int sStatusNew = COMP_STATUS_NOT_COMPUTED
             int sRecOffNew = 0
@@ -2116,7 +2135,13 @@ runComponentRaw(int row, int cfgRevision, array<int> rootIds, array<int> rootCat
             side := 0
             while ok and side < 2
                 bool dirty = side == 0 ? sDirty : rDirty
-                if dirty
+                bool store = side == 0 ? sStore : rStore
+                if dirty and not store
+                    if side == 0
+                        sStatusNew  := COMP_STATUS_NOT_STORED
+                    else
+                        rStatusNew  := COMP_STATUS_NOT_STORED
+                if dirty and store
                     int first  = side == 0 ? 0 : sCount
                     int count  = side == 0 ? sCount : rCount
                     int scan   = side == 0 ? wSupportScanEpoch : wResistanceScanEpoch
@@ -2563,16 +2588,23 @@ export recomputeAndMerge(array<int> rootIds, array<int> rootCategories, array<in
             r += 1
     // 3. every Side computed (NOT_COMPUTED left = structural); any other status != OK (FAILED_AMBIGUOUS / NOT_STORED) is a
     //    status fallback: the component cache stays valid and unchanged, the result comes from fullFallbackRaw
+    //    NOT_STORED (a capacity overflow of a component Side result) keeps the existing capacity overflow semantics: FULL
+    //    fallback with the W06 cache invalidated (retried from a rebuild), the NOT_STORED statuses left visible in the rows
     bool statusFallback = false
+    bool notStoredFallback = false
     if localOk
         int r = 0
         while localOk and r < array.size(candComponentIds)
             int sRowStatus = array.get(candComponentSupportStatuses, r)
             int rRowStatus = array.get(candComponentResistanceStatuses, r)
             localOk := sRowStatus != COMP_STATUS_NOT_COMPUTED and rRowStatus != COMP_STATUS_NOT_COMPUTED
-            if localOk and (sRowStatus != COMP_STATUS_OK or rRowStatus != COMP_STATUS_OK)
+            if localOk and (sRowStatus == COMP_STATUS_NOT_STORED or rRowStatus == COMP_STATUS_NOT_STORED)
+                notStoredFallback := true
+            else if localOk and (sRowStatus != COMP_STATUS_OK or rRowStatus != COMP_STATUS_OK)
                 statusFallback := true
             r += 1
+    if notStoredFallback
+        localOk := false
     // 4. global Side merges
     array<int>   mergedSupportInts       = array.new_int(0)
     array<float> mergedSupportPrices     = array.new_float(0)
