@@ -1,0 +1,287 @@
+//@version=6
+// ============================================================
+// ZoneEngineV2_W08Touch_Worker - W08 TouchMark worker
+//
+// Physical home of the W08 TouchMark algorithms (B10 ring append / truncation tracking / chronological extraction,
+// B11 Merge TouchMark inheritance planning; later Touch batches are added here, not to Main). It never imports the Main
+// library and owns no persistent state: the Main engine keeps the TouchMark ring (per Core slot, one ring shared by
+// both Sides, capacity touchMarkCapacityPerCore) and its W08TouchStore, and passes array references bundled in
+// TouchRing / TouchPlan (no copy; the arrays are the Main persistent arrays).
+//
+// TouchRing: the ring arrays (owner coreId / head / count per Core slot; per mark row baseSeq, time, Side, contact
+// bottom / top, close at touch, generationId, normal-touch flag), sideTouchHistoryTruncatedFlags (coreSlot * 2 +
+// 0 Support / + 1 Resistance), the Core registry coreIds / coreSlotLiveFlags and the ring capacity.
+// TouchPlan: the Merge TouchMark plan (per relation-side r * 2 + 0 Support / + 1 Resistance: row offset, count,
+// truncated; per mark row the full TouchMark payload).
+// ============================================================
+library("ZoneEngineV2_W08Touch_Worker", overlay = false)
+
+const int SLOT_INVALID    = -1
+const int SIDE_SUPPORT    = 1
+const int SIDE_RESISTANCE = -1
+const int SIDE_NONE       = 0
+
+export type TouchRing
+    array<int>   touchMarkRingOwnerCoreIds
+    array<int>   touchMarkRingHeads
+    array<int>   touchMarkRingCounts
+    array<int>   touchMarkBaseSeqs
+    array<int>   touchMarkTimes
+    array<int>   touchMarkSides
+    array<float> touchMarkContactBottoms
+    array<float> touchMarkContactTops
+    array<float> touchMarkCloseAtTouches
+    array<int>   touchMarkGenerationIds
+    array<bool>  touchMarkIsNormalTouchFlags
+    array<bool>  sideTouchHistoryTruncatedFlags
+    array<int>   coreIds
+    array<bool>  coreSlotLiveFlags
+    int          touchMarkCapacityPerCore = 0
+
+export type TouchPlan
+    array<int>   mergeTouchPlanOffsets
+    array<int>   mergeTouchPlanCounts
+    array<bool>  mergeTouchPlanTruncatedFlags
+    array<int>   mergeTouchPlanBaseSeqs
+    array<int>   mergeTouchPlanTimes
+    array<int>   mergeTouchPlanSides
+    array<float> mergeTouchPlanContactBottoms
+    array<float> mergeTouchPlanContactTops
+    array<float> mergeTouchPlanCloseAtTouches
+    array<int>   mergeTouchPlanGenerationIds
+    array<bool>  mergeTouchPlanIsNormalFlags
+
+// Appends one TouchMark to the ring of coreSlot (full ring: the oldest mark is overwritten). Returns the physical row
+// (SLOT_INVALID when the capacity is 0).
+// W08 B10: a mark that is dropped (capacity 0) or overwritten (full ring: the oldest mark) sets
+// sideTouchHistoryTruncatedFlags of the Side that loses it; a merely full ring does not.
+export markAppend(TouchRing ring, int coreSlot, int baseSeq, int touchTime, int side, float contactBottom, float contactTop, float closeAtTouch, int generationId, bool isNormalTouch) =>
+    int capacity      = ring.touchMarkCapacityPerCore
+    int physicalIndex = SLOT_INVALID
+    int lostSide      = capacity > 0 ? SIDE_NONE : side
+    if capacity > 0
+        int head      = array.get(ring.touchMarkRingHeads,  coreSlot)
+        int count     = array.get(ring.touchMarkRingCounts, coreSlot)
+        int blockBase = coreSlot * capacity
+        int ringOffset = count < capacity ? (head + count) % capacity : head
+        physicalIndex := blockBase + ringOffset
+        if count >= capacity
+            lostSide := array.get(ring.touchMarkSides, physicalIndex)
+        array.set(ring.touchMarkBaseSeqs,           physicalIndex, baseSeq)
+        array.set(ring.touchMarkTimes,              physicalIndex, touchTime)
+        array.set(ring.touchMarkSides,              physicalIndex, side)
+        array.set(ring.touchMarkContactBottoms,     physicalIndex, contactBottom)
+        array.set(ring.touchMarkContactTops,        physicalIndex, contactTop)
+        array.set(ring.touchMarkCloseAtTouches,     physicalIndex, closeAtTouch)
+        array.set(ring.touchMarkGenerationIds,      physicalIndex, generationId)
+        array.set(ring.touchMarkIsNormalTouchFlags, physicalIndex, isNormalTouch)
+        if count < capacity
+            array.set(ring.touchMarkRingCounts, coreSlot, count + 1)
+        else
+            array.set(ring.touchMarkRingHeads, coreSlot, (head + 1) % capacity)
+    if lostSide == SIDE_SUPPORT or lostSide == SIDE_RESISTANCE
+        array.set(ring.sideTouchHistoryTruncatedFlags, coreSlot * 2 + (lostSide == SIDE_SUPPORT ? 0 : 1), true)
+    physicalIndex
+// Physical row of the logicalIndex-th mark (0 = oldest) of coreSlot, SLOT_INVALID when out of range.
+export markPhysicalIndex(TouchRing ring, int coreSlot, int logicalIndex) =>
+    int capacity      = ring.touchMarkCapacityPerCore
+    int physicalIndex = SLOT_INVALID
+    if capacity > 0
+        int count = array.get(ring.touchMarkRingCounts, coreSlot)
+        if logicalIndex >= 0 and logicalIndex < count
+            int head       = array.get(ring.touchMarkRingHeads, coreSlot)
+            int ringOffset = (head + logicalIndex) % capacity
+            physicalIndex := coreSlot * capacity + ringOffset
+    physicalIndex
+// W08 B10: read-only extraction of the TouchMarks one Side of a live Core still holds, oldest first (ring logical order
+// from head = insertion order; the marks of the other Side are skipped). Output rows go to the caller-owned arrays
+// (cleared first): time, contact bottom, contact top, ring physical index (the payload row). Returns [count, stored truncated flag of that Side]; [-1, false]
+// with the outputs empty when the slot is not live with expectedCoreId (Core and ring owner), the Side is not
+// SIDE_SUPPORT / SIDE_RESISTANCE, the ring head / count / backing arrays are out of bounds, a held mark has no valid
+// Side, or a mark of this Side has a na time / contact, bottom > top or a time before the previous one.
+export historyExtract(TouchRing ring, int coreSlot, int expectedCoreId, int side, array<int> outTimes, array<float> outBottoms, array<float> outTops, array<int> outIndexes) =>
+    array.clear(outTimes)
+    array.clear(outBottoms)
+    array.clear(outTops)
+    array.clear(outIndexes)
+    int  cap = ring.touchMarkCapacityPerCore
+    bool ok  = coreSlot >= 0 and coreSlot < array.size(ring.coreIds) and coreSlot < array.size(ring.coreSlotLiveFlags) and coreSlot < array.size(ring.touchMarkRingOwnerCoreIds) and coreSlot < array.size(ring.touchMarkRingHeads) and coreSlot < array.size(ring.touchMarkRingCounts) and 2 * coreSlot + 1 < array.size(ring.sideTouchHistoryTruncatedFlags) and expectedCoreId >= 1 and (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and cap >= 0
+    if ok
+        ok := array.get(ring.coreSlotLiveFlags, coreSlot) and array.get(ring.coreIds, coreSlot) == expectedCoreId and array.get(ring.touchMarkRingOwnerCoreIds, coreSlot) == expectedCoreId
+    int head  = 0
+    int count = 0
+    if ok
+        head  := array.get(ring.touchMarkRingHeads, coreSlot)
+        count := array.get(ring.touchMarkRingCounts, coreSlot)
+    ok := ok and count >= 0 and count <= cap and head >= 0 and (head < cap or (cap == 0 and head == 0))
+    ok := ok and (count == 0 or ((coreSlot + 1) * cap <= array.size(ring.touchMarkTimes) and (coreSlot + 1) * cap <= array.size(ring.touchMarkSides) and (coreSlot + 1) * cap <= array.size(ring.touchMarkContactBottoms) and (coreSlot + 1) * cap <= array.size(ring.touchMarkContactTops)))
+    int i = 0
+    while ok and i < count
+        int phys = coreSlot * cap + (head + i) % cap
+        int ms   = array.get(ring.touchMarkSides, phys)
+        ok := ms == SIDE_SUPPORT or ms == SIDE_RESISTANCE
+        if ok and ms == side
+            int   t = array.get(ring.touchMarkTimes, phys)
+            float b = array.get(ring.touchMarkContactBottoms, phys)
+            float u = array.get(ring.touchMarkContactTops, phys)
+            ok := not na(t) and not na(b) and not na(u) and b <= u
+            if ok and array.size(outTimes) > 0
+                ok := t >= array.get(outTimes, array.size(outTimes) - 1)
+            if ok
+                array.push(outTimes, t)
+                array.push(outBottoms, b)
+                array.push(outTops, u)
+                array.push(outIndexes, phys)
+        i += 1
+    bool truncated = false
+    if ok
+        truncated := array.get(ring.sideTouchHistoryTruncatedFlags, coreSlot * 2 + (side == SIDE_SUPPORT ? 0 : 1))
+    else
+        array.clear(outTimes)
+        array.clear(outBottoms)
+        array.clear(outTops)
+        array.clear(outIndexes)
+    [ok ? array.size(outTimes) : -1, truncated]
+// W08 B11: canonical merged TouchMark order of two ring rows (physical indexes): time, baseSeq, Side rank (Support 0,
+// Resistance 1), contact bottom, contact top ASC. Used only to store / cap a Merge touch plan.
+mergeRowCompareRaw(TouchRing ring, int a, int b) =>
+    int c = array.get(ring.touchMarkTimes, a) - array.get(ring.touchMarkTimes, b)
+    if c == 0
+        c := array.get(ring.touchMarkBaseSeqs, a) - array.get(ring.touchMarkBaseSeqs, b)
+    if c == 0
+        c := (array.get(ring.touchMarkSides, a) == SIDE_SUPPORT ? 0 : 1) - (array.get(ring.touchMarkSides, b) == SIDE_SUPPORT ? 0 : 1)
+    if c == 0
+        float ba = array.get(ring.touchMarkContactBottoms, a)
+        float bb = array.get(ring.touchMarkContactBottoms, b)
+        float ta = array.get(ring.touchMarkContactTops, a)
+        float tb = array.get(ring.touchMarkContactTops, b)
+        c := ba < bb ? -1 : ba > bb ? 1 : ta < tb ? -1 : ta > tb ? 1 : 0
+    c > 0 ? 1 : c < 0 ? -1 : 0
+planClearRaw(TouchPlan plan) =>
+    array.clear(plan.mergeTouchPlanOffsets)
+    array.clear(plan.mergeTouchPlanCounts)
+    array.clear(plan.mergeTouchPlanTruncatedFlags)
+    array.clear(plan.mergeTouchPlanBaseSeqs)
+    array.clear(plan.mergeTouchPlanTimes)
+    array.clear(plan.mergeTouchPlanSides)
+    array.clear(plan.mergeTouchPlanContactBottoms)
+    array.clear(plan.mergeTouchPlanContactTops)
+    array.clear(plan.mergeTouchPlanCloseAtTouches)
+    array.clear(plan.mergeTouchPlanGenerationIds)
+    array.clear(plan.mergeTouchPlanIsNormalFlags)
+// W08 B11: Merge TouchMark inheritance plan (read-only; no ring is written) of the r B08 Merge relations (r = the Main
+// Merge plan result; -1 fails). Per Merge relation r (B08 order) and Side
+// (plan index r * 2 + 0 Support / + 1 Resistance): when the target Candidate has that Side winner, every source old
+// (survivor first, then mergeAbsorbed in old canonical order) is read with historyExtract; marks whose contact
+// intersects the winner exact EffectiveRange (inclusive, exact floats) are kept and one mark per (time, contact bottom,
+// contact top) survives: the first in source priority, then chronological order (payload kept whole). Both Sides are
+// ordered by mergeRowCompareRaw and capped once at the shared ring capacity (oldest rows dropped, each drop sets its
+// Side's truncated flag); truncated also ORs the same-Side source flags. A Side without a target winner holds 0 rows,
+// not truncated. Only the plan arrays are written. Returns the relation count; -1 with the plan empty on an upstream or
+// structural fault.
+export mergePlanBuild(TouchRing ring, TouchPlan plan, int r, int mergeRelationCount, array<int> mergeRelations, array<int> mergeAbsorbed, int physicalCount, array<int> supportWinnerIndexes, array<int> resistanceWinnerIndexes, array<float> winnerExactPrices) =>
+    planClearRaw(plan)
+    bool ok  = r >= 0 and r == mergeRelationCount and array.size(mergeRelations) == 5 * r
+    int  cap = ring.touchMarkCapacityPerCore
+    array<int>   tT   = array.new_int(0)
+    array<float> tB   = array.new_float(0)
+    array<float> tU   = array.new_float(0)
+    array<int>   tI   = array.new_int(0)
+    array<int>   rows = array.new_int(0)
+    int j = 0
+    while ok and j < r
+        int p   = array.get(mergeRelations, 5 * j)
+        int sSl = array.get(mergeRelations, 5 * j + 1)
+        int sId = array.get(mergeRelations, 5 * j + 2)
+        int off = array.get(mergeRelations, 5 * j + 3)
+        int cnt = array.get(mergeRelations, 5 * j + 4)
+        ok := p >= 0 and p < physicalCount and p < array.size(supportWinnerIndexes) and p < array.size(resistanceWinnerIndexes) and off >= 0 and cnt >= 1 and 2 * (off + cnt) <= array.size(mergeAbsorbed)
+        array.clear(rows)
+        bool trS  = false
+        bool trR  = false
+        int  side = 0
+        while ok and side < 2
+            int w = side == 0 ? array.get(supportWinnerIndexes, p) : array.get(resistanceWinnerIndexes, p)
+            if w >= 0
+                ok := 2 * w + 1 < array.size(winnerExactPrices)
+                float tb = na
+                float tt = na
+                if ok
+                    tb := array.get(winnerExactPrices, 2 * w)
+                    tt := array.get(winnerExactPrices, 2 * w + 1)
+                    ok := not na(tb) and not na(tt) and tb <= tt
+                int start = array.size(rows)
+                int s     = sId >= 1 ? -1 : 0
+                while ok and s < cnt
+                    int sl = sSl
+                    int id = sId
+                    if s >= 0
+                        sl := array.get(mergeAbsorbed, 2 * (off + s))
+                        id := array.get(mergeAbsorbed, 2 * (off + s) + 1)
+                        ok := id != sId
+                    [n, tr] = historyExtract(ring, sl, id, side == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE, tT, tB, tU, tI)
+                    ok := ok and n >= 0
+                    if side == 0
+                        trS := trS or tr
+                    else
+                        trR := trR or tr
+                    int k = 0
+                    while ok and k < n
+                        float b = array.get(tB, k)
+                        float u = array.get(tU, k)
+                        if u >= tb and b <= tt
+                            bool dup = false
+                            int  q   = start
+                            while not dup and q < array.size(rows)
+                                int x = array.get(rows, q)
+                                dup := array.get(ring.touchMarkTimes, x) == array.get(tT, k) and array.get(ring.touchMarkContactBottoms, x) == b and array.get(ring.touchMarkContactTops, x) == u
+                                q += 1
+                            if not dup
+                                array.push(rows, array.get(tI, k))
+                        k += 1
+                    s += 1
+            side += 1
+        // canonical order over both Sides (insertion sort; the order is total after the per-Side dedupe)
+        int a = 1
+        while ok and a < array.size(rows)
+            int x = array.get(rows, a)
+            int b = a - 1
+            while b >= 0 and mergeRowCompareRaw(ring, array.get(rows, b), x) > 0
+                array.set(rows, b + 1, array.get(rows, b))
+                b -= 1
+            array.set(rows, b + 1, x)
+            ok := b < 0 or mergeRowCompareRaw(ring, array.get(rows, b), x) < 0
+            a += 1
+        // shared S/R ring capacity: the oldest rows are dropped, each drop truncates its own Side
+        int drop = math.max(0, array.size(rows) - cap)
+        int k = 0
+        while ok and k < drop
+            if array.get(ring.touchMarkSides, array.get(rows, k)) == SIDE_SUPPORT
+                trS := true
+            else
+                trR := true
+            k += 1
+        side := 0
+        while ok and side < 2
+            int sv = side == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE
+            array.push(plan.mergeTouchPlanOffsets, array.size(plan.mergeTouchPlanTimes))
+            k := drop
+            while k < array.size(rows)
+                int x = array.get(rows, k)
+                if array.get(ring.touchMarkSides, x) == sv
+                    array.push(plan.mergeTouchPlanBaseSeqs,       array.get(ring.touchMarkBaseSeqs, x))
+                    array.push(plan.mergeTouchPlanTimes,          array.get(ring.touchMarkTimes, x))
+                    array.push(plan.mergeTouchPlanSides,          sv)
+                    array.push(plan.mergeTouchPlanContactBottoms, array.get(ring.touchMarkContactBottoms, x))
+                    array.push(plan.mergeTouchPlanContactTops,    array.get(ring.touchMarkContactTops, x))
+                    array.push(plan.mergeTouchPlanCloseAtTouches, array.get(ring.touchMarkCloseAtTouches, x))
+                    array.push(plan.mergeTouchPlanGenerationIds,  array.get(ring.touchMarkGenerationIds, x))
+                    array.push(plan.mergeTouchPlanIsNormalFlags,  array.get(ring.touchMarkIsNormalTouchFlags, x))
+                k += 1
+            array.push(plan.mergeTouchPlanCounts, array.size(plan.mergeTouchPlanTimes) - array.get(plan.mergeTouchPlanOffsets, 2 * j + side))
+            array.push(plan.mergeTouchPlanTruncatedFlags, side == 0 ? trS : trR)
+            side += 1
+        j += 1
+    if not ok
+        planClearRaw(plan)
+    ok ? r : -1
