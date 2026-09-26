@@ -6742,6 +6742,90 @@ identityExactMatchRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed, int candidateWi
                 a += 1
                 b += 1
     [ok, ok and originMatched and rangeMatched]
+// W08 B06-B: Side Candidate -> physical Core pairing of the current pass (A10.7 / I15.1 PATH A), read-only on the Engine.
+// Every winner (record index, Side 1 / -1) goes into the W08Core pairing indexes; W08Core.pairingCollectPairs gives the
+// Support x Resistance pairs with interval gap <= M (mTick as W05 / W06 / B04 / B05) in (supportIndex, resistanceIndex)
+// ASC order; each pair is kept only when the tick ranges re-check gap <= M and the two rootId ASC Root slices share at
+// least one non-FVG Root (two-pointer; normal, Broad and Inverse FVG never count). PATH B (the same FVG origin before /
+// after Inverse) cannot occur inside one pass: W05 makes an FVG Root eligible for one Side only, so a shared FVG Root
+// between a Support and a Resistance winner breaks that invariant and fails the whole call. Writes the kept pairs
+// (stride 2, order kept by in-place forward compaction) and returns their count; -1 with an empty outPairs on any
+// structural or invariant fault. No Core allocation, no Identity, no runtime call site yet.
+pairCurrentCandidatesRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed, array<int> outPairs) =>
+    W03SourceRootStore w3 = engine.w03Store
+    W08Core.W08Store   ws = engine.w08CoreStore
+    W08Core.pairingReset(ws)
+    array.clear(outPairs)
+    int  count       = w3.candidateWinnerLogicalCount
+    int  rootBacking = w3.candidateWinnerRootIdLength
+    bool ok = count >= 0 and count <= array.size(w3.candidateWinnerSides) and count <= array.size(w3.candidateWinnerEffectiveBottomTicks) and count <= array.size(w3.candidateWinnerEffectiveTopTicks) and count <= array.size(w3.candidateWinnerRootIdOffsets) and count <= array.size(w3.candidateWinnerRootIdLengths) and rootBacking >= 0 and rootBacking <= array.size(w3.candidateWinnerRootIds) and feed.mintick > 0 and cfg.clusterMaxWidth >= 0
+    int i = 0
+    while ok and i < count
+        int side = array.get(w3.candidateWinnerSides, i)
+        int bot  = array.get(w3.candidateWinnerEffectiveBottomTicks, i)
+        int top  = array.get(w3.candidateWinnerEffectiveTopTicks, i)
+        int off  = array.get(w3.candidateWinnerRootIdOffsets, i)
+        int len  = array.get(w3.candidateWinnerRootIdLengths, i)
+        ok := (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and bot <= top and off >= 0 and len >= 0 and off + len <= rootBacking
+        if ok
+            [addOk, addChanged] = W08Core.pairingAddCandidate(ws, side, i, bot, top)
+            ok := addOk
+        i += 1
+    int mTick = 0
+    int n     = 0
+    if ok
+        mTick := int(math.round(cfg.clusterMaxWidth / feed.mintick))
+        n     := W08Core.pairingCollectPairs(ws, mTick, outPairs)
+        ok    := n >= 0 and array.size(outPairs) == n * 2
+    int w = 0
+    int p = 0
+    while ok and p < n * 2
+        int sIdx = array.get(outPairs, p)
+        int rIdx = array.get(outPairs, p + 1)
+        ok := sIdx >= 0 and sIdx < count and rIdx >= 0 and rIdx < count
+        if ok
+            ok := array.get(w3.candidateWinnerSides, sIdx) == SIDE_SUPPORT and array.get(w3.candidateWinnerSides, rIdx) == SIDE_RESISTANCE
+        bool sharedNonFvg = false
+        if ok
+            int sOff = array.get(w3.candidateWinnerRootIdOffsets, sIdx)
+            int sEnd = sOff + array.get(w3.candidateWinnerRootIdLengths, sIdx)
+            int rOff = array.get(w3.candidateWinnerRootIdOffsets, rIdx)
+            int rEnd = rOff + array.get(w3.candidateWinnerRootIdLengths, rIdx)
+            while ok and sOff < sEnd and rOff < rEnd
+                int sRootId = array.get(w3.candidateWinnerRootIds, sOff)
+                int rRootId = array.get(w3.candidateWinnerRootIds, rOff)
+                if sRootId < rRootId
+                    sOff += 1
+                else if sRootId > rRootId
+                    rOff += 1
+                else
+                    int rootSlot = map.contains(engine.rootIdToSlot, sRootId) ? map.get(engine.rootIdToSlot, sRootId) : SLOT_INVALID
+                    ok := rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags) and rootSlot < array.size(engine.rootCategories)
+                    if ok
+                        ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == sRootId
+                    if ok
+                        ok := array.get(engine.rootCategories, rootSlot) != CAT_FVG
+                        sharedNonFvg := true
+                    sOff += 1
+                    rOff += 1
+        if ok and sharedNonFvg
+            int sBot = array.get(w3.candidateWinnerEffectiveBottomTicks, sIdx)
+            int sTop = array.get(w3.candidateWinnerEffectiveTopTicks,    sIdx)
+            int rBot = array.get(w3.candidateWinnerEffectiveBottomTicks, rIdx)
+            int rTop = array.get(w3.candidateWinnerEffectiveTopTicks,    rIdx)
+            if rBot <= sTop + mTick and rTop >= sBot - mTick
+                array.set(outPairs, w,     sIdx)
+                array.set(outPairs, w + 1, rIdx)
+                w += 2
+        p += 2
+    int result = -1
+    if ok
+        while array.size(outPairs) > w
+            array.pop(outPairs)
+        result := int(w / 2)
+    else
+        array.clear(outPairs)
+    result
 touchMarkAppendRaw(ZoneEngine engine, int coreSlot, int baseSeq, int touchTime, int side, float contactBottom, float contactTop, float closeAtTouch, int generationId, bool isNormalTouch) =>
     int capacity      = engine.touchMarkCapacityPerCore
     int physicalIndex = SLOT_INVALID
