@@ -108,6 +108,19 @@
 // (rootId ASC) and the parent coreId / generationId as expected IDs. Reentry = latest-state whole-component replace
 // (exact same snapshot = no-op). An inactive component that still holds pending is READY_TO_CONSUME (kept). No
 // Merge / Split / Touch plan is stored; corePendingGenerationFlags is not touched.
+//
+// B14: changed topology scope (I13 dependency closure, planning only). Seeds: every Candidate whose W06 dependency set
+// (MEMBER Root -> rootCandComponentIds, Broad FVG Root -> every row holding it as INCLUDED_BROAD, LOCAL or BROAD_ONLY)
+// meets the W06 semantic changed current component IDs, or whose Root union holds a semantic changed Root ID; every
+// live old Core whose origin Root set holds one; every READY_TO_CONSUME pending parent (pending, component without
+// ActiveTouch); all components when the W06 scope is full. The closure is the B13 topology component
+// (topologyComponentsRaw). Changed components are numbered in canonical order (components with an old Core by their
+// first old in old canonical order, then Candidate-only components by new canonical order, a complete tie between
+// edge-less Candidates by the B07-C fresh allocation rank). changedOldCores stride 2
+// [oldCoreSlot, component] in old canonical order; changedTargets stride 5 [physicalCandidateIndex, component, ownership
+// kind (0 continuation / 1 fresh), oldCoreSlot (-1 fresh), flags] in new canonical order; flags: 1 exact range changed,
+// 2 tick range changed, 4 origin Root set changed, 8 Pass1 re-evaluation, 16 pair re-evaluation. Absorbed / retired olds
+// follow from the Merge relations and the ownership plan. Nothing else (revision, cache, index) is written.
 // ============================================================
 library("ZoneEngineV2_W08Core_Worker", overlay = false)
 
@@ -115,6 +128,7 @@ const int ID_NONE = 0
 
 const int SLOT_INVALID = -1
 const int PH_ACTIVE_TOUCH = 2
+const int CAND_MEMBER_ROLE_INCLUDED_BROAD = 2
 
 export type W08Store
     array<int>  coreIntervalOrderData
@@ -169,6 +183,9 @@ export type W08Store
     array<int>   splitChildren
     int          splitRelationCount = 0
     int          splitChildLogicalCount = 0
+    array<int>   changedOldCores
+    array<int>   changedTargets
+    int          changedComponentCount = 0
 
 export newStore() =>
     W08Store s = W08Store.new()
@@ -213,6 +230,8 @@ export newStore() =>
     s.mergeAbsorbed                               := array.new_int(0)
     s.splitRelations                              := array.new_int(0)
     s.splitChildren                               := array.new_int(0)
+    s.changedOldCores                             := array.new_int(0)
+    s.changedTargets                              := array.new_int(0)
     s
 
 // currentCoreId = the Core ID of a live Core at coreSlot, ID_NONE when the slot is out of
@@ -1915,19 +1934,17 @@ pendingNewRootRaw(PendingTopologyStore ps) =>
         array.push(ps.pendingTopologyRootNodeLiveFlags, false)
     r
 
-// B13 PendingTopology planner over the current pass (upstreamResult = the Main B12 chain result, >= 0). F0 (read-only):
-// Identity edges as in mergePlanBuild, every physical Root union non-empty, strictly ascending, of issued live Roots, the
-// pool shape, every live old Core's existing pending chain (a dead slot holds none), the component classification, the
-// exact same-snapshot test and the pool capacity (free rows, rows freed by the replaced parents, then appended rows up to
-// 100000). Commit (only after F0): every parent of each changed active component is cleared, then rewritten (latest
-// state). Returns [immediate, pending, ready] component counts over live old Cores and physical Candidates; [-1, -1, -1]
-// with nothing written on any fault.
-export pendingPlanBuild(W08Store store, PendingTopologyStore ps, int upstreamResult, array<bool> coreLive, array<int> coreIds, array<int> coreGenerationIds, array<int> coreCreatedTimes, array<int> sidePhases, map<int, int> rootIdToSlot, array<int> rootIds, array<bool> rootSlotLiveFlags) =>
+// Shared B13 / B14 topology component builder (read-only on the stores): validates every physical Root union (non-empty,
+// strictly ascending, issued live Roots), the pool shape and every Identity edge (as in mergePlanBuild), unions each old
+// slot with its Candidates (uf over nc old slots + n Candidates), records each slot's edge run (runStart / runLen),
+// validates every live old Core's existing pending chain (a dead slot or a flag-false slot holds none), records its rows
+// (oldChildRows / oldRootRows) and unions pending parents that share a Root ID. The five arrays come in empty.
+topologyComponentsRaw(W08Store store, PendingTopologyStore ps, array<bool> coreLive, array<int> coreIds, array<int> coreGenerationIds, array<int> coreCreatedTimes, map<int, int> rootIdToSlot, array<int> rootIds, array<bool> rootSlotLiveFlags, array<int> uf, array<int> runStart, array<int> runLen, array<int> oldChildRows, array<int> oldRootRows) =>
     int  n  = store.physicalCandidateLogicalCount
     int  ne = store.physicalIdentityEdgeCount
     int  nc = array.size(coreLive)
     array<int> ed = store.physicalIdentityEdges
-    bool ok = upstreamResult >= 0 and n >= 0 and array.size(ed) == 3 * ne and array.size(coreIds) >= nc and array.size(coreGenerationIds) >= nc and array.size(coreCreatedTimes) >= nc and array.size(sidePhases) >= 2 * nc and array.size(ps.corePendingTopologyFlags) == nc and pendingPoolsOkRaw(ps) and n <= array.size(store.physicalCandidateRootIdOffsets) and n <= array.size(store.physicalCandidateRootIdLengths)
+    bool ok = n >= 0 and array.size(ed) == 3 * ne and array.size(coreIds) >= nc and array.size(coreGenerationIds) >= nc and array.size(coreCreatedTimes) >= nc and array.size(ps.corePendingTopologyFlags) == nc and pendingPoolsOkRaw(ps) and n <= array.size(store.physicalCandidateRootIdOffsets) and n <= array.size(store.physicalCandidateRootIdLengths)
     // physical Root unions
     int k = 0
     while ok and k < n
@@ -1948,12 +1965,16 @@ export pendingPlanBuild(W08Store store, PendingTopologyStore ps, int upstreamRes
             j += 1
         k += 1
     // Identity edges (validated as in mergePlanBuild); union old slot <-> Candidate; per-slot edge run
-    array<int> uf       = array.new_int(0)
-    array<int> runStart = array.new_int(ok ? nc : 0, -1)
-    array<int> runLen   = array.new_int(ok ? nc : 0, 0)
     k := 0
     while ok and k < nc + n
         array.push(uf, k)
+        k += 1
+    k := 0
+    while ok and k < nc
+        array.push(runStart, -1)
+        array.push(runLen, 0)
+        array.push(oldChildRows, 0)
+        array.push(oldRootRows, 0)
         k += 1
     map<int, int> slotOf = map.new<int, int>()
     int lastCt = 0
@@ -1981,8 +2002,6 @@ export pendingPlanBuild(W08Store store, PendingTopologyStore ps, int upstreamRes
             lastP  := p
         k += 1
     // existing pending: chain integrity, rows, and Root-sharing links between pending parents
-    array<int> oldChildRows = array.new_int(ok ? nc : 0, 0)
-    array<int> oldRootRows  = array.new_int(ok ? nc : 0, 0)
     map<int, int> rootOwner = map.new<int, int>()
     int cs = 0
     while ok and cs < nc
@@ -2009,6 +2028,29 @@ export pendingPlanBuild(W08Store store, PendingTopologyStore ps, int upstreamRes
                 ci := array.get(ps.pendingTopologyChildNextIndexes, ci)
                 c  += 1
         cs += 1
+    ok
+
+// B13 PendingTopology planner over the current pass (upstreamResult = the Main B12 chain result, >= 0). F0 (read-only):
+// Identity edges as in mergePlanBuild, every physical Root union non-empty, strictly ascending, of issued live Roots, the
+// pool shape, every live old Core's existing pending chain (a dead slot holds none), the component classification, the
+// exact same-snapshot test and the pool capacity (free rows, rows freed by the replaced parents, then appended rows up to
+// 100000). Commit (only after F0): every parent of each changed active component is cleared, then rewritten (latest
+// state). Returns [immediate, pending, ready] component counts over live old Cores and physical Candidates; [-1, -1, -1]
+// with nothing written on any fault.
+export pendingPlanBuild(W08Store store, PendingTopologyStore ps, int upstreamResult, array<bool> coreLive, array<int> coreIds, array<int> coreGenerationIds, array<int> coreCreatedTimes, array<int> sidePhases, map<int, int> rootIdToSlot, array<int> rootIds, array<bool> rootSlotLiveFlags) =>
+    int  n  = store.physicalCandidateLogicalCount
+    int  ne = store.physicalIdentityEdgeCount
+    int  nc = array.size(coreLive)
+    array<int> ed = store.physicalIdentityEdges
+    array<int> uf           = array.new_int(0)
+    array<int> runStart     = array.new_int(0)
+    array<int> runLen       = array.new_int(0)
+    array<int> oldChildRows = array.new_int(0)
+    array<int> oldRootRows  = array.new_int(0)
+    bool ok = upstreamResult >= 0 and array.size(sidePhases) >= 2 * nc
+    ok := ok and topologyComponentsRaw(store, ps, coreLive, coreIds, coreGenerationIds, coreCreatedTimes, rootIdToSlot, rootIds, rootSlotLiveFlags, uf, runStart, runLen, oldChildRows, oldRootRows)
+    int k  = 0
+    int cs = 0
     // component classification (roots of live old Cores and of Candidates)
     int m = nc + n
     array<bool> seenC  = array.new_bool(ok ? m : 0, false)
@@ -2142,3 +2184,179 @@ export pendingPlanBuild(W08Store store, PendingTopologyStore ps, int upstreamRes
                     array.set(ps.corePendingTopologyFlags, cs, true)
             cs += 1
     [ok ? imm : -1, ok ? pen : -1, ok ? rdy : -1]
+
+// B14 changed-topology planner (see the header). upstreamResult = the Main B13 result (>= 0). Old ranges are the Main
+// corePhysicalBottoms / Tops; Candidate ranges physicalCandidateExactPrices; ticks = round(price / mintick). Returns the
+// changed component count; -1 with the changed storage empty on any fault (nothing else is written).
+export changedPlanBuild(W08Store store, PendingTopologyStore ps, int upstreamResult, array<bool> coreLive, array<int> coreIds, array<int> coreGenerationIds, array<int> coreCreatedTimes, array<float> corePhysicalBottoms, array<float> corePhysicalTops, array<int> sidePhases, map<int, int> rootIdToSlot, array<int> rootIds, array<bool> rootSlotLiveFlags, array<int> rootCandComponentIds, array<int> candComponentIds, array<int> candComponentMemberOffsets, array<int> candComponentMemberLengths, array<int> candMemberRootIds, array<int> candMemberRoleFlags, array<int> changedRootIds, array<int> changedComponentIds, bool scopeFull, float mintick) =>
+    array.clear(store.changedOldCores)
+    array.clear(store.changedTargets)
+    int n  = store.physicalCandidateLogicalCount
+    int nc = array.size(coreLive)
+    array<int> uf           = array.new_int(0)
+    array<int> runStart     = array.new_int(0)
+    array<int> runLen       = array.new_int(0)
+    array<int> oldChildRows = array.new_int(0)
+    array<int> oldRootRows  = array.new_int(0)
+    bool ok = upstreamResult >= 0 and mintick > 0 and array.size(sidePhases) >= 2 * nc and array.size(corePhysicalBottoms) >= nc and array.size(corePhysicalTops) >= nc and array.size(rootCandComponentIds) >= array.size(rootIds) and array.size(candComponentMemberOffsets) == array.size(candComponentIds) and array.size(candComponentMemberLengths) == array.size(candComponentIds) and array.size(candMemberRoleFlags) == array.size(candMemberRootIds) and array.size(store.physicalOwnershipKinds) == n and array.size(store.physicalContinuationOldCoreSlots) == n and array.size(store.physicalFreshAllocationRanks) == n and array.size(store.physicalCandidateExactPrices) == 2 * n and array.size(store.mergeRelations) == 5 * store.mergeRelationCount and array.size(store.splitChildren) == store.splitChildLogicalCount
+    ok := ok and topologyComponentsRaw(store, ps, coreLive, coreIds, coreGenerationIds, coreCreatedTimes, rootIdToSlot, rootIds, rootSlotLiveFlags, uf, runStart, runLen, oldChildRows, oldRootRows)
+    // W06 semantic change sets
+    map<int, bool> chRoot  = map.new<int, bool>()
+    map<int, bool> chComp  = map.new<int, bool>()
+    map<int, bool> chBroad = map.new<int, bool>()
+    int k = 0
+    while ok and k < array.size(changedRootIds)
+        ok := array.get(changedRootIds, k) >= 1 and (k == 0 or array.get(changedRootIds, k) > array.get(changedRootIds, k - 1))
+        map.put(chRoot, array.get(changedRootIds, k), true)
+        k += 1
+    k := 0
+    while ok and k < array.size(changedComponentIds)
+        map.put(chComp, array.get(changedComponentIds, k), true)
+        k += 1
+    k := 0
+    while ok and k < array.size(candComponentIds)
+        if map.contains(chComp, array.get(candComponentIds, k))
+            int o = array.get(candComponentMemberOffsets, k)
+            int l = array.get(candComponentMemberLengths, k)
+            ok := o >= 0 and l >= 0 and o + l <= array.size(candMemberRootIds)
+            int j = 0
+            while ok and j < l
+                if array.get(candMemberRoleFlags, o + j) == CAND_MEMBER_ROLE_INCLUDED_BROAD
+                    map.put(chBroad, array.get(candMemberRootIds, o + j), true)
+                j += 1
+        k += 1
+    // seeds -> changed components (B13 topology closure)
+    int m = nc + n
+    array<bool> seedC   = array.new_bool(ok ? m : 0, scopeFull)
+    array<bool> activeC = array.new_bool(ok ? m : 0, false)
+    k := 0
+    while ok and k < n
+        int o = array.get(store.physicalCandidateRootIdOffsets, k)
+        int l = array.get(store.physicalCandidateRootIdLengths, k)
+        bool hit = false
+        int j = 0
+        while not hit and j < l
+            int id = array.get(store.physicalCandidateRootIds, o + j)
+            int cid = array.get(rootCandComponentIds, map.get(rootIdToSlot, id))
+            hit := map.contains(chRoot, id) or (cid != 0 and map.contains(chComp, cid)) or (cid == 0 and map.contains(chBroad, id))
+            j += 1
+        if hit
+            array.set(seedC, ufFindRaw(uf, nc + k), true)
+        k += 1
+    array<int> orig = array.new_int(0)
+    int cs = 0
+    while ok and cs < nc
+        if array.get(coreLive, cs)
+            int r = ufFindRaw(uf, cs)
+            if array.get(sidePhases, 2 * cs) == PH_ACTIVE_TOUCH or array.get(sidePhases, 2 * cs + 1) == PH_ACTIVE_TOUCH
+                array.set(activeC, r, true)
+            ok := originReadAsc(store, cs, array.get(coreIds, cs), orig) >= 0
+            int j = 0
+            while ok and j < array.size(orig)
+                if map.contains(chRoot, array.get(orig, j))
+                    array.set(seedC, r, true)
+                j += 1
+        cs += 1
+    cs := 0
+    while ok and cs < nc
+        if array.get(coreLive, cs) and array.get(ps.corePendingTopologyFlags, cs)
+            int r = ufFindRaw(uf, cs)
+            if not array.get(activeC, r)
+                array.set(seedC, r, true)
+        cs += 1
+    // canonical component numbering: live olds in old canonical order, then Candidates in new canonical order
+    array<int> olds = array.new_int(0)
+    cs := 0
+    while ok and cs < nc
+        if array.get(coreLive, cs)
+            ok := not na(array.get(coreCreatedTimes, cs))
+            int pos = array.size(olds)
+            while ok and pos > 0 and (array.get(coreCreatedTimes, array.get(olds, pos - 1)) > array.get(coreCreatedTimes, cs) or (array.get(coreCreatedTimes, array.get(olds, pos - 1)) == array.get(coreCreatedTimes, cs) and array.get(coreIds, array.get(olds, pos - 1)) > array.get(coreIds, cs)))
+                pos -= 1
+            array.insert(olds, pos, cs)
+        cs += 1
+    array<int> news = array.new_int(0)
+    k := 0
+    while ok and k < n
+        int pos = array.size(news)
+        int c   = 1
+        while ok and pos > 0 and c > 0
+            int q = array.get(news, pos - 1)
+            c := physicalNewCompareRaw(store, q, k)
+            if c == 0
+                // complete new-order tie: only edge-less (fresh) Candidates can tie; B07-C fresh allocation rank decides
+                ok := array.get(store.physicalFreshAllocationRanks, q) >= 0 and array.get(store.physicalFreshAllocationRanks, k) >= 0
+                c  := array.get(store.physicalFreshAllocationRanks, q) - array.get(store.physicalFreshAllocationRanks, k)
+            ok := ok and c != 0
+            if c > 0
+                pos -= 1
+        array.insert(news, pos, k)
+        k += 1
+    array<int> ord = array.new_int(ok ? m : 0, -1)
+    int nComp = 0
+    k := 0
+    while ok and k < array.size(olds) + array.size(news)
+        int node = SLOT_INVALID
+        if k < array.size(olds)
+            node := array.get(olds, k)
+        else
+            node := nc + array.get(news, k - array.size(olds))
+        int r = ufFindRaw(uf, node)
+        if array.get(seedC, r)
+            if array.get(ord, r) < 0
+                array.set(ord, r, nComp)
+                nComp += 1
+            if k < array.size(olds)
+                array.push(store.changedOldCores, node)
+                array.push(store.changedOldCores, array.get(ord, r))
+            else
+                int p     = node - nc
+                int kind  = array.get(store.physicalOwnershipKinds, p)
+                int osl   = kind == 0 ? array.get(store.physicalContinuationOldCoreSlots, p) : -1
+                int flags = 16
+                if kind == 0
+                    ok := osl >= 0 and osl < nc
+                    float ob = na
+                    float ot = na
+                    if ok
+                        ob := array.get(corePhysicalBottoms, osl)
+                        ot := array.get(corePhysicalTops, osl)
+                        ok := not na(ob) and not na(ot) and originReadAsc(store, osl, array.get(coreIds, osl), orig) >= 0
+                    if ok
+                        float nb = array.get(store.physicalCandidateExactPrices, 2 * p)
+                        float nt = array.get(store.physicalCandidateExactPrices, 2 * p + 1)
+                        if ob != nb or ot != nt
+                            flags += 1
+                        if int(math.round(ob / mintick)) != array.get(store.physicalCandidateBottomTicks, p) or int(math.round(ot / mintick)) != array.get(store.physicalCandidateTopTicks, p)
+                            flags += 2
+                        int o = array.get(store.physicalCandidateRootIdOffsets, p)
+                        int l = array.get(store.physicalCandidateRootIdLengths, p)
+                        bool same = l == array.size(orig)
+                        int j = 0
+                        while same and j < l
+                            same := array.get(orig, j) == array.get(store.physicalCandidateRootIds, o + j)
+                            j += 1
+                        if not same
+                            flags += 4
+                bool rel = false
+                int j = 0
+                while not rel and j < store.mergeRelationCount
+                    rel := array.get(store.mergeRelations, 5 * j) == p
+                    j += 1
+                j := 0
+                while not rel and j < store.splitChildLogicalCount
+                    rel := array.get(store.splitChildren, j) == p
+                    j += 1
+                if kind != 0 or rel or flags % 8 != 0
+                    flags += 8
+                array.push(store.changedTargets, p)
+                array.push(store.changedTargets, array.get(ord, r))
+                array.push(store.changedTargets, kind)
+                array.push(store.changedTargets, osl)
+                array.push(store.changedTargets, flags)
+        k += 1
+    if not ok
+        array.clear(store.changedOldCores)
+        array.clear(store.changedTargets)
+    store.changedComponentCount := ok ? nComp : 0
+    ok ? nComp : -1
