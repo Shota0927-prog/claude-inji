@@ -6597,6 +6597,96 @@ coreFreeSlotRaw(ZoneEngine engine, int coreSlot) =>
 // W08Core.intervalInsert / intervalDetach / intervalMove directly. Main keeps the Core state, the physical float range
 // (corePhysicalBottoms / Tops) and coreRangeRevision: after intervalMove returns changed = true the caller writes the new
 // physical range and bumps coreRangeRevision, also when the float range changes but its ticks do not.
+// W08 B04-C: indexed Identity candidate gather for one Candidate winner (record index, not a comparator order). Old
+// physical Cores are discovered through the Root -> participation chain of every Candidate Root, the W08Core interval
+// index (interval gap <= M on ticks, mTick = int(math.round(clusterMaxWidth / mintick)) as W05 / W06) and the W08Core
+// inverse-origin index of every FVG Root of the Candidate (no state / direction / Broad filter), each hit guarded by the
+// current registry (GUARD_03 / 01 / 02: live slot and coreIds[slot] == the stored expected Core ID; a stale hit is skipped),
+// then united in the W08Core gather scratch by coreId. Writes [coreSlot, coreId] (stride 2, coreId ASC) and returns the
+// count; a structural fault (winner slice, Root registry, participation chain, Worker call) returns -1 with an empty
+// outPairs. Candidate discovery only: no Identity decision. outPairs doubles as the collect scratch.
+identityGatherForCandidateRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed, int candidateWinnerIndex, array<int> outPairs) =>
+    W03SourceRootStore w3 = engine.w03Store
+    W08Core.W08Store   ws = engine.w08CoreStore
+    W08Core.identityGatherReset(ws)
+    array.clear(outPairs)
+    int  coreCount = array.size(engine.coreIds)
+    int  rootRows  = array.size(engine.rootIds)
+    int  edgeRows  = array.size(engine.participationEdgeRootSlots)
+    bool ok = candidateWinnerIndex >= 0 and candidateWinnerIndex < w3.candidateWinnerLogicalCount and candidateWinnerIndex < array.size(w3.candidateWinnerRootIdOffsets) and candidateWinnerIndex < array.size(w3.candidateWinnerRootIdLengths) and candidateWinnerIndex < array.size(w3.candidateWinnerEffectiveBottomTicks) and candidateWinnerIndex < array.size(w3.candidateWinnerEffectiveTopTicks) and feed.mintick > 0 and array.size(engine.coreSlotLiveFlags) == coreCount and array.size(engine.rootSlotLiveFlags) == rootRows and array.size(engine.rootCategories) == rootRows and array.size(engine.rootParticipationHeadEdgeIndexes) == rootRows and array.size(engine.rootParticipationCounts) == rootRows and array.size(engine.participationEdgeExpectedRootIds) == edgeRows and array.size(engine.participationEdgeSideSlots) == edgeRows and array.size(engine.participationEdgeExpectedCoreIds) == edgeRows and array.size(engine.participationEdgeNextByRootIndexes) == edgeRows and array.size(engine.participationEdgeLiveFlags) == edgeRows
+    int rootStart = 0
+    int rootLen   = 0
+    if ok
+        rootStart := array.get(w3.candidateWinnerRootIdOffsets, candidateWinnerIndex)
+        rootLen   := array.get(w3.candidateWinnerRootIdLengths, candidateWinnerIndex)
+        ok := rootStart >= 0 and rootLen >= 0 and rootStart + rootLen <= w3.candidateWinnerRootIdLength and rootStart + rootLen <= array.size(w3.candidateWinnerRootIds)
+    // PATH 1: Root -> participating Core (GUARD_03)
+    int r = 0
+    while ok and r < rootLen
+        int rootId   = array.get(w3.candidateWinnerRootIds, rootStart + r)
+        int rootSlot = map.contains(engine.rootIdToSlot, rootId) ? map.get(engine.rootIdToSlot, rootId) : SLOT_INVALID
+        ok := rootSlot >= 0 and rootSlot < rootRows
+        if ok
+            ok := array.get(engine.rootSlotLiveFlags, rootSlot) and array.get(engine.rootIds, rootSlot) == rootId
+        int count = 0
+        int edge  = SLOT_INVALID
+        int seen  = 0
+        if ok
+            count := array.get(engine.rootParticipationCounts, rootSlot)
+            edge  := array.get(engine.rootParticipationHeadEdgeIndexes, rootSlot)
+            ok    := count >= 0
+        while ok and seen < count
+            ok := edge >= 0 and edge < edgeRows
+            if ok
+                ok := array.get(engine.participationEdgeLiveFlags, edge) and array.get(engine.participationEdgeRootSlots, edge) == rootSlot and array.get(engine.participationEdgeExpectedRootIds, edge) == rootId
+            if ok
+                int sideSlot = array.get(engine.participationEdgeSideSlots, edge)
+                int coreSlot = int(math.floor(sideSlot / 2))
+                ok := sideSlot >= 0 and coreSlot < coreCount
+                if ok and array.get(engine.coreSlotLiveFlags, coreSlot) and array.get(engine.coreIds, coreSlot) == array.get(engine.participationEdgeExpectedCoreIds, edge)
+                    [rootOfferOk, rootOfferChanged] = W08Core.identityGatherOffer(ws, coreSlot, array.get(engine.coreIds, coreSlot))
+                    ok := rootOfferOk
+                edge := array.get(engine.participationEdgeNextByRootIndexes, edge)
+                seen += 1
+        ok := ok and edge == SLOT_INVALID
+        r += 1
+    // PATH 2: interval gap <= M (GUARD_01)
+    if ok
+        int mTick = int(math.round(cfg.clusterMaxWidth / feed.mintick))
+        int n     = W08Core.intervalCollect(ws, array.get(w3.candidateWinnerEffectiveBottomTicks, candidateWinnerIndex), array.get(w3.candidateWinnerEffectiveTopTicks, candidateWinnerIndex), mTick, outPairs)
+        ok := n >= 0 and array.size(outPairs) == n * 2
+        int i = 0
+        while ok and i < n * 2
+            int coreSlot = array.get(outPairs, i)
+            ok := coreSlot >= 0 and coreSlot < coreCount
+            if ok and array.get(engine.coreSlotLiveFlags, coreSlot) and array.get(engine.coreIds, coreSlot) == array.get(outPairs, i + 1)
+                [intervalOfferOk, intervalOfferChanged] = W08Core.identityGatherOffer(ws, coreSlot, array.get(engine.coreIds, coreSlot))
+                ok := intervalOfferOk
+            i += 2
+        array.clear(outPairs)
+    // PATH 3: inverse-origin of every FVG Root of the Candidate (GUARD_02)
+    r := 0
+    while ok and r < rootLen
+        int rootId   = array.get(w3.candidateWinnerRootIds, rootStart + r)
+        int rootSlot = map.get(engine.rootIdToSlot, rootId)
+        if array.get(engine.rootCategories, rootSlot) == CAT_FVG
+            int n = W08Core.inverseOriginCollect(ws, rootId, outPairs)
+            ok := n >= 0 and array.size(outPairs) == n * 2
+            int i = 0
+            while ok and i < n * 2
+                int coreSlot = array.get(outPairs, i)
+                ok := coreSlot >= 0 and coreSlot < coreCount
+                if ok and array.get(engine.coreSlotLiveFlags, coreSlot) and array.get(engine.coreIds, coreSlot) == array.get(outPairs, i + 1)
+                    [inverseOfferOk, inverseOfferChanged] = W08Core.identityGatherOffer(ws, coreSlot, array.get(engine.coreIds, coreSlot))
+                    ok := inverseOfferOk
+                i += 2
+            array.clear(outPairs)
+        r += 1
+    int result = -1
+    array.clear(outPairs)
+    if ok
+        result := W08Core.identityGatherReadAsc(ws, outPairs)
+    result
 touchMarkAppendRaw(ZoneEngine engine, int coreSlot, int baseSeq, int touchTime, int side, float contactBottom, float contactTop, float closeAtTouch, int generationId, bool isNormalTouch) =>
     int capacity      = engine.touchMarkCapacityPerCore
     int physicalIndex = SLOT_INVALID
