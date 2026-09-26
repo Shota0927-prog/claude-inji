@@ -99,12 +99,22 @@
 // [oldCoreSlot, oldCoreId, continuationPhysicalIndex (-1 none), childOffset (row in splitChildren), childCount];
 // splitChildren stride 1 [physicalCandidateIndex] in new canonical order. Children = every Candidate of the old's full
 // edge set (childCount = its degree), the B07-B continuation child included; Merge and Split relations coexist.
+//
+// B13: PendingTopology (recompute model). The persistent store is the Main W02Aux parent -> child -> Root-list pool,
+// passed by reference in PendingTopologyStore. Unit = Identity connected component over live old Cores and physical
+// Candidates (full Identity edges, plus old Cores whose existing pending Root lists share a Root ID). A component with
+// any old Side in PH_ACTIVE_TOUCH is pending: every live old Core of it is a parent (flag true) whose children are its
+// Identity-adjacent Candidates in new canonical order, each child holding the Candidate's complete physical Root union
+// (rootId ASC) and the parent coreId / generationId as expected IDs. Reentry = latest-state whole-component replace
+// (exact same snapshot = no-op). An inactive component that still holds pending is READY_TO_CONSUME (kept). No
+// Merge / Split / Touch plan is stored; corePendingGenerationFlags is not touched.
 // ============================================================
 library("ZoneEngineV2_W08Core_Worker", overlay = false)
 
 const int ID_NONE = 0
 
 const int SLOT_INVALID = -1
+const int PH_ACTIVE_TOUCH = 2
 
 export type W08Store
     array<int>  coreIntervalOrderData
@@ -1717,3 +1727,418 @@ export splitPlanBuild(W08Store store, int mergeResult, array<bool> coreLive, arr
     store.splitRelationCount     := ok ? int(array.size(store.splitRelations) / 5) : 0
     store.splitChildLogicalCount := ok ? array.size(store.splitChildren) : 0
     ok ? int(array.size(store.splitRelations) / 5) : -1
+
+export type PendingTopologyStore
+    array<bool>  corePendingTopologyFlags
+    array<int>   corePendingTopologyChildHeadIndexes
+    array<int>   corePendingTopologyChildTailIndexes
+    array<int>   corePendingTopologyChildCounts
+    array<int>   pendingTopologyChildNextIndexes
+    array<int>   pendingTopologyChildOwnerCoreSlots
+    array<int>   pendingTopologyChildExpectedCoreIds
+    array<int>   pendingTopologyChildExpectedGenerationIds
+    array<int>   pendingTopologyChildRootHeadNodeIndexes
+    array<int>   pendingTopologyChildRootTailNodeIndexes
+    array<int>   pendingTopologyChildRootCounts
+    array<bool>  pendingTopologyChildLiveFlags
+    array<int>   pendingTopologyChildFreeIndexes
+    array<int>   pendingTopologyRootNodeRootIds
+    array<int>   pendingTopologyRootNodeNextIndexes
+    array<int>   pendingTopologyRootNodeOwnerChildIndexes
+    array<int>   pendingTopologyRootNodeExpectedCoreIds
+    array<int>   pendingTopologyRootNodeExpectedGenerationIds
+    array<bool>  pendingTopologyRootNodeLiveFlags
+    array<int>   pendingTopologyRootNodeFreeIndexes
+
+// Pool shape: the 9 child arrays and the 7 Root-node arrays have one row count each, the per-Core arrays one size, and
+// every free-list entry is an in-range, non-live row listed once.
+pendingPoolsOkRaw(PendingTopologyStore ps) =>
+    int  cN = array.size(ps.pendingTopologyChildLiveFlags)
+    int  rN = array.size(ps.pendingTopologyRootNodeLiveFlags)
+    int  nC = array.size(ps.corePendingTopologyFlags)
+    bool ok = array.size(ps.pendingTopologyChildNextIndexes) == cN and array.size(ps.pendingTopologyChildOwnerCoreSlots) == cN and array.size(ps.pendingTopologyChildExpectedCoreIds) == cN and array.size(ps.pendingTopologyChildExpectedGenerationIds) == cN and array.size(ps.pendingTopologyChildRootHeadNodeIndexes) == cN and array.size(ps.pendingTopologyChildRootTailNodeIndexes) == cN and array.size(ps.pendingTopologyChildRootCounts) == cN
+    ok := ok and array.size(ps.pendingTopologyRootNodeRootIds) == rN and array.size(ps.pendingTopologyRootNodeNextIndexes) == rN and array.size(ps.pendingTopologyRootNodeOwnerChildIndexes) == rN and array.size(ps.pendingTopologyRootNodeExpectedCoreIds) == rN and array.size(ps.pendingTopologyRootNodeExpectedGenerationIds) == rN
+    ok := ok and array.size(ps.corePendingTopologyChildHeadIndexes) == nC and array.size(ps.corePendingTopologyChildTailIndexes) == nC and array.size(ps.corePendingTopologyChildCounts) == nC
+    map<int, bool> seen = map.new<int, bool>()
+    int k = 0
+    while ok and k < array.size(ps.pendingTopologyChildFreeIndexes)
+        int r = array.get(ps.pendingTopologyChildFreeIndexes, k)
+        ok := r >= 0 and r < cN and not map.contains(seen, r)
+        if ok
+            ok := not array.get(ps.pendingTopologyChildLiveFlags, r)
+            map.put(seen, r, true)
+        k += 1
+    map.clear(seen)
+    k := 0
+    while ok and k < array.size(ps.pendingTopologyRootNodeFreeIndexes)
+        int r = array.get(ps.pendingTopologyRootNodeFreeIndexes, k)
+        ok := r >= 0 and r < rN and not map.contains(seen, r)
+        if ok
+            ok := not array.get(ps.pendingTopologyRootNodeLiveFlags, r)
+            map.put(seen, r, true)
+        k += 1
+    ok
+
+// Chain integrity of the pending of coreSlot (coreSlot < per-Core size): flag false = empty chain; else exactly count
+// live children owned by coreSlot, each visited once, with the expected coreId / generationId, each holding exactly its
+// count of live Root nodes owned by it with the same expected IDs and strictly ascending Root IDs >= 1; head / tail /
+// next links consistent. Returns [ok, child rows, Root-node rows].
+pendingChainOkRaw(PendingTopologyStore ps, int coreSlot, int coreId, int generationId) =>
+    int  cN   = array.size(ps.pendingTopologyChildLiveFlags)
+    int  rN   = array.size(ps.pendingTopologyRootNodeLiveFlags)
+    int  cnt  = array.get(ps.corePendingTopologyChildCounts, coreSlot)
+    int  ci   = array.get(ps.corePendingTopologyChildHeadIndexes, coreSlot)
+    bool flag = array.get(ps.corePendingTopologyFlags, coreSlot)
+    bool ok   = cnt >= 0 and cnt <= cN and (flag or (cnt == 0 and ci == SLOT_INVALID and array.get(ps.corePendingTopologyChildTailIndexes, coreSlot) == SLOT_INVALID))
+    map<int, bool> vc = map.new<int, bool>()
+    int seen  = 0
+    int last  = SLOT_INVALID
+    int roots = 0
+    while ok and seen < cnt
+        ok := ci >= 0 and ci < cN and not map.contains(vc, ci)
+        if ok
+            map.put(vc, ci, true)
+            ok := array.get(ps.pendingTopologyChildLiveFlags, ci) and array.get(ps.pendingTopologyChildOwnerCoreSlots, ci) == coreSlot and array.get(ps.pendingTopologyChildExpectedCoreIds, ci) == coreId and array.get(ps.pendingTopologyChildExpectedGenerationIds, ci) == generationId
+        if ok
+            int rn  = array.get(ps.pendingTopologyChildRootHeadNodeIndexes, ci)
+            int rc  = array.get(ps.pendingTopologyChildRootCounts, ci)
+            int rs  = 0
+            int rl  = SLOT_INVALID
+            int rid = 0
+            ok := rc >= 0 and rc <= rN
+            while ok and rs < rc
+                ok := rn >= 0 and rn < rN
+                if ok
+                    ok := array.get(ps.pendingTopologyRootNodeLiveFlags, rn) and array.get(ps.pendingTopologyRootNodeOwnerChildIndexes, rn) == ci and array.get(ps.pendingTopologyRootNodeExpectedCoreIds, rn) == coreId and array.get(ps.pendingTopologyRootNodeExpectedGenerationIds, rn) == generationId and array.get(ps.pendingTopologyRootNodeRootIds, rn) > rid
+                if ok
+                    rid := array.get(ps.pendingTopologyRootNodeRootIds, rn)
+                    rl  := rn
+                    rn  := array.get(ps.pendingTopologyRootNodeNextIndexes, rn)
+                    rs  += 1
+            ok := ok and rn == SLOT_INVALID and array.get(ps.pendingTopologyChildRootTailNodeIndexes, ci) == rl
+            roots += rc
+            last := ci
+            if ok
+                ci := array.get(ps.pendingTopologyChildNextIndexes, ci)
+            seen += 1
+    ok := ok and ci == SLOT_INVALID and array.get(ps.corePendingTopologyChildTailIndexes, coreSlot) == last
+    [ok, cnt, roots]
+
+// Returns every child and Root node of coreSlot's pending to the free lists (sentinels reset) and empties the parent.
+// Callers run pendingChainOkRaw first.
+pendingClearChainRaw(PendingTopologyStore ps, int coreSlot) =>
+    int ci  = array.get(ps.corePendingTopologyChildHeadIndexes, coreSlot)
+    int cnt = array.get(ps.corePendingTopologyChildCounts, coreSlot)
+    int k   = 0
+    while k < cnt
+        int nx = array.get(ps.pendingTopologyChildNextIndexes, ci)
+        int rn = array.get(ps.pendingTopologyChildRootHeadNodeIndexes, ci)
+        int rc = array.get(ps.pendingTopologyChildRootCounts, ci)
+        int j  = 0
+        while j < rc
+            int nr = array.get(ps.pendingTopologyRootNodeNextIndexes, rn)
+            array.set(ps.pendingTopologyRootNodeRootIds, rn, ID_NONE)
+            array.set(ps.pendingTopologyRootNodeNextIndexes, rn, SLOT_INVALID)
+            array.set(ps.pendingTopologyRootNodeOwnerChildIndexes, rn, SLOT_INVALID)
+            array.set(ps.pendingTopologyRootNodeExpectedCoreIds, rn, ID_NONE)
+            array.set(ps.pendingTopologyRootNodeExpectedGenerationIds, rn, ID_NONE)
+            array.set(ps.pendingTopologyRootNodeLiveFlags, rn, false)
+            array.push(ps.pendingTopologyRootNodeFreeIndexes, rn)
+            rn := nr
+            j  += 1
+        array.set(ps.pendingTopologyChildNextIndexes, ci, SLOT_INVALID)
+        array.set(ps.pendingTopologyChildOwnerCoreSlots, ci, SLOT_INVALID)
+        array.set(ps.pendingTopologyChildExpectedCoreIds, ci, ID_NONE)
+        array.set(ps.pendingTopologyChildExpectedGenerationIds, ci, ID_NONE)
+        array.set(ps.pendingTopologyChildRootHeadNodeIndexes, ci, SLOT_INVALID)
+        array.set(ps.pendingTopologyChildRootTailNodeIndexes, ci, SLOT_INVALID)
+        array.set(ps.pendingTopologyChildRootCounts, ci, 0)
+        array.set(ps.pendingTopologyChildLiveFlags, ci, false)
+        array.push(ps.pendingTopologyChildFreeIndexes, ci)
+        ci := nx
+        k  += 1
+    array.set(ps.corePendingTopologyFlags, coreSlot, false)
+    array.set(ps.corePendingTopologyChildHeadIndexes, coreSlot, SLOT_INVALID)
+    array.set(ps.corePendingTopologyChildTailIndexes, coreSlot, SLOT_INVALID)
+    array.set(ps.corePendingTopologyChildCounts, coreSlot, 0)
+
+// Read-only preflight of pendingClearCore (pool shape + chain integrity of coreSlot for coreId / generationId).
+export pendingCanClearCore(PendingTopologyStore ps, int coreSlot, int coreId, int generationId) =>
+    bool ok = coreSlot >= 0 and coreSlot < array.size(ps.corePendingTopologyFlags) and pendingPoolsOkRaw(ps)
+    if ok
+        [cOk, cRows, rRows] = pendingChainOkRaw(ps, coreSlot, coreId, generationId)
+        ok := cOk
+    ok
+
+// Reclaims the whole pending of coreSlot (children and Root nodes back to the free lists, parent emptied). false with
+// nothing changed when pendingCanClearCore fails.
+export pendingClearCore(PendingTopologyStore ps, int coreSlot, int coreId, int generationId) =>
+    bool ok = pendingCanClearCore(ps, coreSlot, coreId, generationId)
+    if ok
+        pendingClearChainRaw(ps, coreSlot)
+    ok
+
+ufFindRaw(array<int> uf, int x) =>
+    int r = x
+    while array.get(uf, r) != r
+        array.set(uf, r, array.get(uf, array.get(uf, r)))
+        r := array.get(uf, r)
+    r
+
+pendingNewChildRaw(PendingTopologyStore ps) =>
+    int r = SLOT_INVALID
+    if array.size(ps.pendingTopologyChildFreeIndexes) > 0
+        r := array.pop(ps.pendingTopologyChildFreeIndexes)
+    else
+        r := array.size(ps.pendingTopologyChildLiveFlags)
+        array.push(ps.pendingTopologyChildNextIndexes, SLOT_INVALID)
+        array.push(ps.pendingTopologyChildOwnerCoreSlots, SLOT_INVALID)
+        array.push(ps.pendingTopologyChildExpectedCoreIds, ID_NONE)
+        array.push(ps.pendingTopologyChildExpectedGenerationIds, ID_NONE)
+        array.push(ps.pendingTopologyChildRootHeadNodeIndexes, SLOT_INVALID)
+        array.push(ps.pendingTopologyChildRootTailNodeIndexes, SLOT_INVALID)
+        array.push(ps.pendingTopologyChildRootCounts, 0)
+        array.push(ps.pendingTopologyChildLiveFlags, false)
+    r
+
+pendingNewRootRaw(PendingTopologyStore ps) =>
+    int r = SLOT_INVALID
+    if array.size(ps.pendingTopologyRootNodeFreeIndexes) > 0
+        r := array.pop(ps.pendingTopologyRootNodeFreeIndexes)
+    else
+        r := array.size(ps.pendingTopologyRootNodeLiveFlags)
+        array.push(ps.pendingTopologyRootNodeRootIds, ID_NONE)
+        array.push(ps.pendingTopologyRootNodeNextIndexes, SLOT_INVALID)
+        array.push(ps.pendingTopologyRootNodeOwnerChildIndexes, SLOT_INVALID)
+        array.push(ps.pendingTopologyRootNodeExpectedCoreIds, ID_NONE)
+        array.push(ps.pendingTopologyRootNodeExpectedGenerationIds, ID_NONE)
+        array.push(ps.pendingTopologyRootNodeLiveFlags, false)
+    r
+
+// B13 PendingTopology planner over the current pass (upstreamResult = the Main B12 chain result, >= 0). F0 (read-only):
+// Identity edges as in mergePlanBuild, every physical Root union non-empty, strictly ascending, of issued live Roots, the
+// pool shape, every live old Core's existing pending chain (a dead slot holds none), the component classification, the
+// exact same-snapshot test and the pool capacity (free rows, rows freed by the replaced parents, then appended rows up to
+// 100000). Commit (only after F0): every parent of each changed active component is cleared, then rewritten (latest
+// state). Returns [immediate, pending, ready] component counts over live old Cores and physical Candidates; [-1, -1, -1]
+// with nothing written on any fault.
+export pendingPlanBuild(W08Store store, PendingTopologyStore ps, int upstreamResult, array<bool> coreLive, array<int> coreIds, array<int> coreGenerationIds, array<int> coreCreatedTimes, array<int> sidePhases, map<int, int> rootIdToSlot, array<int> rootIds, array<bool> rootSlotLiveFlags) =>
+    int  n  = store.physicalCandidateLogicalCount
+    int  ne = store.physicalIdentityEdgeCount
+    int  nc = array.size(coreLive)
+    array<int> ed = store.physicalIdentityEdges
+    bool ok = upstreamResult >= 0 and n >= 0 and array.size(ed) == 3 * ne and array.size(coreIds) >= nc and array.size(coreGenerationIds) >= nc and array.size(coreCreatedTimes) >= nc and array.size(sidePhases) >= 2 * nc and array.size(ps.corePendingTopologyFlags) == nc and pendingPoolsOkRaw(ps) and n <= array.size(store.physicalCandidateRootIdOffsets) and n <= array.size(store.physicalCandidateRootIdLengths)
+    // physical Root unions
+    int k = 0
+    while ok and k < n
+        int o = array.get(store.physicalCandidateRootIdOffsets, k)
+        int l = array.get(store.physicalCandidateRootIdLengths, k)
+        ok := o >= 0 and l >= 1 and o + l <= array.size(store.physicalCandidateRootIds)
+        int j    = 0
+        int last = 0
+        while ok and j < l
+            int id = array.get(store.physicalCandidateRootIds, o + j)
+            ok := id > last and map.contains(rootIdToSlot, id)
+            if ok
+                int rs = map.get(rootIdToSlot, id)
+                ok := rs >= 0 and rs < array.size(rootIds) and rs < array.size(rootSlotLiveFlags)
+                if ok
+                    ok := array.get(rootSlotLiveFlags, rs) and array.get(rootIds, rs) == id
+            last := id
+            j += 1
+        k += 1
+    // Identity edges (validated as in mergePlanBuild); union old slot <-> Candidate; per-slot edge run
+    array<int> uf       = array.new_int(0)
+    array<int> runStart = array.new_int(ok ? nc : 0, -1)
+    array<int> runLen   = array.new_int(ok ? nc : 0, 0)
+    k := 0
+    while ok and k < nc + n
+        array.push(uf, k)
+        k += 1
+    map<int, int> slotOf = map.new<int, int>()
+    int lastCt = 0
+    int lastId = 0
+    int lastP  = -1
+    k := 0
+    while ok and k < ne
+        int p  = array.get(ed, 3 * k)
+        int sl = array.get(ed, 3 * k + 1)
+        int id = array.get(ed, 3 * k + 2)
+        ok := p >= 0 and p < n and sl >= 0 and sl < nc and id >= 1
+        if ok
+            ok := array.get(coreLive, sl) and array.get(coreIds, sl) == id and not na(array.get(coreCreatedTimes, sl)) and (not map.contains(slotOf, id) or map.get(slotOf, id) == sl)
+        if ok
+            int ct = array.get(coreCreatedTimes, sl)
+            ok := identityEdgeFollowsRaw(store, k, ct, id, p, lastCt, lastId, lastP)
+            map.put(slotOf, id, sl)
+            if array.get(runStart, sl) < 0
+                array.set(runStart, sl, k)
+            ok := ok and array.get(runStart, sl) + array.get(runLen, sl) == k
+            array.set(runLen, sl, array.get(runLen, sl) + 1)
+            array.set(uf, ufFindRaw(uf, sl), ufFindRaw(uf, nc + p))
+            lastCt := ct
+            lastId := id
+            lastP  := p
+        k += 1
+    // existing pending: chain integrity, rows, and Root-sharing links between pending parents
+    array<int> oldChildRows = array.new_int(ok ? nc : 0, 0)
+    array<int> oldRootRows  = array.new_int(ok ? nc : 0, 0)
+    map<int, int> rootOwner = map.new<int, int>()
+    int cs = 0
+    while ok and cs < nc
+        if not (array.get(coreLive, cs) and array.get(ps.corePendingTopologyFlags, cs))
+            ok := not array.get(ps.corePendingTopologyFlags, cs) and array.get(ps.corePendingTopologyChildCounts, cs) == 0 and array.get(ps.corePendingTopologyChildHeadIndexes, cs) == SLOT_INVALID and array.get(ps.corePendingTopologyChildTailIndexes, cs) == SLOT_INVALID
+        else
+            [cOk, cRows, rRows] = pendingChainOkRaw(ps, cs, array.get(coreIds, cs), array.get(coreGenerationIds, cs))
+            ok := cOk
+            array.set(oldChildRows, cs, cRows)
+            array.set(oldRootRows, cs, rRows)
+            int ci = array.get(ps.corePendingTopologyChildHeadIndexes, cs)
+            int c  = 0
+            while ok and c < cRows
+                int rn = array.get(ps.pendingTopologyChildRootHeadNodeIndexes, ci)
+                int r  = 0
+                while r < array.get(ps.pendingTopologyChildRootCounts, ci)
+                    int rid = array.get(ps.pendingTopologyRootNodeRootIds, rn)
+                    if map.contains(rootOwner, rid)
+                        array.set(uf, ufFindRaw(uf, cs), ufFindRaw(uf, map.get(rootOwner, rid)))
+                    else
+                        map.put(rootOwner, rid, cs)
+                    rn := array.get(ps.pendingTopologyRootNodeNextIndexes, rn)
+                    r  += 1
+                ci := array.get(ps.pendingTopologyChildNextIndexes, ci)
+                c  += 1
+        cs += 1
+    // component classification (roots of live old Cores and of Candidates)
+    int m = nc + n
+    array<bool> seenC  = array.new_bool(ok ? m : 0, false)
+    array<bool> active = array.new_bool(ok ? m : 0, false)
+    array<bool> pend   = array.new_bool(ok ? m : 0, false)
+    array<bool> diff   = array.new_bool(ok ? m : 0, false)
+    cs := 0
+    while ok and cs < nc
+        if array.get(coreLive, cs)
+            int r = ufFindRaw(uf, cs)
+            array.set(seenC, r, true)
+            if array.get(sidePhases, 2 * cs) == PH_ACTIVE_TOUCH or array.get(sidePhases, 2 * cs + 1) == PH_ACTIVE_TOUCH
+                array.set(active, r, true)
+            if array.get(ps.corePendingTopologyFlags, cs)
+                array.set(pend, r, true)
+        cs += 1
+    k := 0
+    while ok and k < n
+        array.set(seenC, ufFindRaw(uf, nc + k), true)
+        k += 1
+    // exact same-snapshot test per parent of an active component (children in edge-run order, exact Root lists)
+    cs := 0
+    while ok and cs < nc
+        if array.get(coreLive, cs)
+            int r = ufFindRaw(uf, cs)
+            if array.get(active, r) and not array.get(diff, r)
+                bool same = array.get(ps.corePendingTopologyFlags, cs) and array.get(ps.corePendingTopologyChildCounts, cs) == array.get(runLen, cs)
+                int  ci   = array.get(ps.corePendingTopologyChildHeadIndexes, cs)
+                int  c    = 0
+                while same and c < array.get(runLen, cs)
+                    int p  = array.get(ed, 3 * (array.get(runStart, cs) + c))
+                    int o  = array.get(store.physicalCandidateRootIdOffsets, p)
+                    int l  = array.get(store.physicalCandidateRootIdLengths, p)
+                    same := array.get(ps.pendingTopologyChildRootCounts, ci) == l
+                    int rn = array.get(ps.pendingTopologyChildRootHeadNodeIndexes, ci)
+                    int j  = 0
+                    while same and j < l
+                        same := array.get(ps.pendingTopologyRootNodeRootIds, rn) == array.get(store.physicalCandidateRootIds, o + j)
+                        rn   := array.get(ps.pendingTopologyRootNodeNextIndexes, rn)
+                        j    += 1
+                    ci := array.get(ps.pendingTopologyChildNextIndexes, ci)
+                    c  += 1
+                if not same
+                    array.set(diff, r, true)
+        cs += 1
+    // capacity: rows needed by the rewritten parents vs free rows + rows they release + appendable rows
+    int needC = 0
+    int needR = 0
+    int freeC = array.size(ps.pendingTopologyChildFreeIndexes)
+    int freeR = array.size(ps.pendingTopologyRootNodeFreeIndexes)
+    cs := 0
+    while ok and cs < nc
+        if array.get(coreLive, cs)
+            if array.get(diff, ufFindRaw(uf, cs))
+                freeC += array.get(oldChildRows, cs)
+                freeR += array.get(oldRootRows, cs)
+                needC += array.get(runLen, cs)
+                int c = 0
+                while c < array.get(runLen, cs)
+                    needR += array.get(store.physicalCandidateRootIdLengths, array.get(ed, 3 * (array.get(runStart, cs) + c)))
+                    c += 1
+        cs += 1
+    ok := ok and array.size(ps.pendingTopologyChildLiveFlags) + math.max(0, needC - freeC) <= 100000 and array.size(ps.pendingTopologyRootNodeLiveFlags) + math.max(0, needR - freeR) <= 100000
+    int imm = 0
+    int pen = 0
+    int rdy = 0
+    k := 0
+    while ok and k < m
+        if array.get(seenC, k) and ufFindRaw(uf, k) == k
+            if array.get(active, k)
+                pen += 1
+            else if array.get(pend, k)
+                rdy += 1
+            else
+                imm += 1
+        k += 1
+    // commit: clear every parent of a changed active component, then write its latest children / Root lists
+    if ok
+        cs := 0
+        while cs < nc
+            if array.get(coreLive, cs)
+                if array.get(diff, ufFindRaw(uf, cs))
+                    pendingClearChainRaw(ps, cs)
+            cs += 1
+        cs := 0
+        while cs < nc
+            if array.get(coreLive, cs)
+                if array.get(diff, ufFindRaw(uf, cs))
+                    int cid  = array.get(coreIds, cs)
+                    int gid  = array.get(coreGenerationIds, cs)
+                    int prev = SLOT_INVALID
+                    int c    = 0
+                    while c < array.get(runLen, cs)
+                        int p  = array.get(ed, 3 * (array.get(runStart, cs) + c))
+                        int o  = array.get(store.physicalCandidateRootIdOffsets, p)
+                        int l  = array.get(store.physicalCandidateRootIdLengths, p)
+                        int ci = pendingNewChildRaw(ps)
+                        array.set(ps.pendingTopologyChildNextIndexes, ci, SLOT_INVALID)
+                        array.set(ps.pendingTopologyChildOwnerCoreSlots, ci, cs)
+                        array.set(ps.pendingTopologyChildExpectedCoreIds, ci, cid)
+                        array.set(ps.pendingTopologyChildExpectedGenerationIds, ci, gid)
+                        array.set(ps.pendingTopologyChildRootCounts, ci, l)
+                        array.set(ps.pendingTopologyChildLiveFlags, ci, true)
+                        int rPrev = SLOT_INVALID
+                        int j     = 0
+                        while j < l
+                            int rn = pendingNewRootRaw(ps)
+                            array.set(ps.pendingTopologyRootNodeRootIds, rn, array.get(store.physicalCandidateRootIds, o + j))
+                            array.set(ps.pendingTopologyRootNodeNextIndexes, rn, SLOT_INVALID)
+                            array.set(ps.pendingTopologyRootNodeOwnerChildIndexes, rn, ci)
+                            array.set(ps.pendingTopologyRootNodeExpectedCoreIds, rn, cid)
+                            array.set(ps.pendingTopologyRootNodeExpectedGenerationIds, rn, gid)
+                            array.set(ps.pendingTopologyRootNodeLiveFlags, rn, true)
+                            if rPrev == SLOT_INVALID
+                                array.set(ps.pendingTopologyChildRootHeadNodeIndexes, ci, rn)
+                            else
+                                array.set(ps.pendingTopologyRootNodeNextIndexes, rPrev, rn)
+                            rPrev := rn
+                            j     += 1
+                        array.set(ps.pendingTopologyChildRootTailNodeIndexes, ci, rPrev)
+                        if rPrev == SLOT_INVALID
+                            array.set(ps.pendingTopologyChildRootHeadNodeIndexes, ci, SLOT_INVALID)
+                        if prev == SLOT_INVALID
+                            array.set(ps.corePendingTopologyChildHeadIndexes, cs, ci)
+                        else
+                            array.set(ps.pendingTopologyChildNextIndexes, prev, ci)
+                        prev := ci
+                        c    += 1
+                    array.set(ps.corePendingTopologyChildTailIndexes, cs, prev)
+                    array.set(ps.corePendingTopologyChildCounts, cs, array.get(runLen, cs))
+                    array.set(ps.corePendingTopologyFlags, cs, true)
+            cs += 1
+    [ok ? imm : -1, ok ? pen : -1, ok ? rdy : -1]
