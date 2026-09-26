@@ -13,6 +13,10 @@
 // 0 Support / + 1 Resistance), the Core registry coreIds / coreSlotLiveFlags and the ring capacity.
 // TouchPlan: the Merge TouchMark plan (per relation-side r * 2 + 0 Support / + 1 Resistance: row offset, count,
 // truncated; per mark row the full TouchMark payload).
+// SplitTouchPlan (B12): per SPLIT_LOCAL target row (a Split child that is not a Merge target): physical index, source
+// old slot / coreId, mark row offset / count (rows in the source ring logical order across both Sides), truncated per
+// row * 2 + 0 Support / + 1 Resistance; per mark row the full TouchMark payload. Merge-target children are delegated to
+// the B11 Merge plan and hold no row here.
 // ============================================================
 library("ZoneEngineV2_W08Touch_Worker", overlay = false)
 
@@ -50,6 +54,25 @@ export type TouchPlan
     array<float> mergeTouchPlanCloseAtTouches
     array<int>   mergeTouchPlanGenerationIds
     array<bool>  mergeTouchPlanIsNormalFlags
+
+export type SplitTouchPlan
+    array<int>   targetPhysicalIndexes
+    array<int>   sourceOldCoreSlots
+    array<int>   sourceOldCoreIds
+    array<int>   markOffsets
+    array<int>   markCounts
+    array<bool>  truncatedFlags
+    array<int>   baseSeqs
+    array<int>   times
+    array<int>   sides
+    array<float> contactBottoms
+    array<float> contactTops
+    array<float> closeAtTouches
+    array<int>   generationIds
+    array<bool>  isNormalFlags
+
+export newSplitTouchPlan() =>
+    SplitTouchPlan.new(array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_float(0), array.new_float(0), array.new_float(0), array.new_int(0), array.new_bool(0))
 
 // Appends one TouchMark to the ring of coreSlot (full ring: the oldest mark is overwritten). Returns the physical row
 // (SLOT_INVALID when the capacity is 0).
@@ -285,3 +308,131 @@ export mergePlanBuild(TouchRing ring, TouchPlan plan, int r, int mergeRelationCo
     if not ok
         planClearRaw(plan)
     ok ? r : -1
+splitPlanClearRaw(SplitTouchPlan plan) =>
+    array.clear(plan.targetPhysicalIndexes)
+    array.clear(plan.sourceOldCoreSlots)
+    array.clear(plan.sourceOldCoreIds)
+    array.clear(plan.markOffsets)
+    array.clear(plan.markCounts)
+    array.clear(plan.truncatedFlags)
+    array.clear(plan.baseSeqs)
+    array.clear(plan.times)
+    array.clear(plan.sides)
+    array.clear(plan.contactBottoms)
+    array.clear(plan.contactTops)
+    array.clear(plan.closeAtTouches)
+    array.clear(plan.generationIds)
+    array.clear(plan.isNormalFlags)
+// W08 B12: Split TouchMark assignment plan (read-only; no ring is written). s = the W08Core Split plan result (must equal
+// splitRelationCount), m = the B11 Merge TouchMark plan result (must equal mergeRelationCount; the B11 relation-side
+// arrays must hold 2 * m rows). A Split child that is a Merge target (one B08 relation per Candidate, else fail) is
+// delegated to the B11 plan (no row). Every other child is SPLIT_LOCAL: it must appear in one Split relation only (else
+// fail) and gets one row in Split relation / child order: the source old ring is read with historyExtract per Side (the
+// B10 validation) and walked in its logical order across both Sides; a mark is copied whole (no dedupe, no re-sort)
+// when the child has a winner on the mark's Side whose exact EffectiveRange intersects the contact (inclusive, exact
+// floats; na / inverted range fails). Truncated per Side = the child has that Side winner and the source Side flag is
+// set. A row above the ring capacity fails. Returns the SPLIT_LOCAL target count; -1 with the plan empty on any fault.
+export splitPlanBuild(TouchRing ring, SplitTouchPlan plan, int s, int splitRelationCount, array<int> splitRelations, array<int> splitChildren, int m, int mergeRelationCount, array<int> mergeRelations, array<int> mergePlanOffsets, array<int> mergePlanCounts, array<bool> mergePlanTruncatedFlags, int physicalCount, array<int> supportWinnerIndexes, array<int> resistanceWinnerIndexes, array<float> winnerExactPrices) =>
+    splitPlanClearRaw(plan)
+    int  cap = ring.touchMarkCapacityPerCore
+    bool ok  = s >= 0 and s == splitRelationCount and array.size(splitRelations) == 5 * s and m >= 0 and m == mergeRelationCount and array.size(mergeRelations) == 5 * m and array.size(mergePlanOffsets) == 2 * m and array.size(mergePlanCounts) == 2 * m and array.size(mergePlanTruncatedFlags) == 2 * m and physicalCount >= 0 and physicalCount <= array.size(supportWinnerIndexes) and physicalCount <= array.size(resistanceWinnerIndexes)
+    array<int>  mergeOf = array.new_int(ok ? physicalCount : 0, -1)
+    array<bool> seenLocal = array.new_bool(ok ? physicalCount : 0, false)
+    int j = 0
+    while ok and j < m
+        int p = array.get(mergeRelations, 5 * j)
+        ok := p >= 0 and p < physicalCount
+        if ok
+            ok := array.get(mergeOf, p) == -1
+            array.set(mergeOf, p, j)
+        j += 1
+    array<int>   tT  = array.new_int(0)
+    array<float> tB  = array.new_float(0)
+    array<float> tU  = array.new_float(0)
+    array<int>   iS  = array.new_int(0)
+    array<int>   iR  = array.new_int(0)
+    array<int>   src = array.new_int(0)
+    int i = 0
+    while ok and i < s
+        int sl  = array.get(splitRelations, 5 * i)
+        int id  = array.get(splitRelations, 5 * i + 1)
+        int off = array.get(splitRelations, 5 * i + 3)
+        int cnt = array.get(splitRelations, 5 * i + 4)
+        ok := off >= 0 and cnt >= 1 and off + cnt <= array.size(splitChildren)
+        // source ring in logical order across both Sides (merge of the two per-Side extractions by ring position)
+        [nS, trS] = historyExtract(ring, sl, id, SIDE_SUPPORT, tT, tB, tU, iS)
+        [nR, trR] = historyExtract(ring, sl, id, SIDE_RESISTANCE, tT, tB, tU, iR)
+        ok := ok and nS >= 0 and nR >= 0
+        array.clear(src)
+        if ok and nS + nR > 0
+            int base = sl * cap
+            int head = array.get(ring.touchMarkRingHeads, sl)
+            int a    = 0
+            int b    = 0
+            while a < nS or b < nR
+                bool takeS = b >= nR
+                if a < nS and b < nR
+                    takeS := (array.get(iS, a) - base - head + cap) % cap < (array.get(iR, b) - base - head + cap) % cap
+                if takeS
+                    array.push(src, array.get(iS, a))
+                    a += 1
+                else
+                    array.push(src, array.get(iR, b))
+                    b += 1
+        int k = 0
+        while ok and k < cnt
+            int p = array.get(splitChildren, off + k)
+            ok := p >= 0 and p < physicalCount
+            if ok and array.get(mergeOf, p) < 0
+                ok := not array.get(seenLocal, p)
+                array.set(seenLocal, p, true)
+                int   wS  = array.get(supportWinnerIndexes, p)
+                int   wR  = array.get(resistanceWinnerIndexes, p)
+                float sb  = na
+                float st  = na
+                float rb  = na
+                float rt  = na
+                if ok and wS >= 0
+                    ok := 2 * wS + 1 < array.size(winnerExactPrices)
+                    if ok
+                        sb := array.get(winnerExactPrices, 2 * wS)
+                        st := array.get(winnerExactPrices, 2 * wS + 1)
+                        ok := not na(sb) and not na(st) and sb <= st
+                if ok and wR >= 0
+                    ok := 2 * wR + 1 < array.size(winnerExactPrices)
+                    if ok
+                        rb := array.get(winnerExactPrices, 2 * wR)
+                        rt := array.get(winnerExactPrices, 2 * wR + 1)
+                        ok := not na(rb) and not na(rt) and rb <= rt
+                if ok
+                    int start = array.size(plan.times)
+                    array.push(plan.targetPhysicalIndexes, p)
+                    array.push(plan.sourceOldCoreSlots, sl)
+                    array.push(plan.sourceOldCoreIds, id)
+                    array.push(plan.markOffsets, start)
+                    int q = 0
+                    while q < array.size(src)
+                        int   x    = array.get(src, q)
+                        bool  isS  = array.get(ring.touchMarkSides, x) == SIDE_SUPPORT
+                        float cb   = array.get(ring.touchMarkContactBottoms, x)
+                        float ct   = array.get(ring.touchMarkContactTops, x)
+                        bool  take = isS ? (wS >= 0 and ct >= sb and cb <= st) : (wR >= 0 and ct >= rb and cb <= rt)
+                        if take
+                            array.push(plan.baseSeqs,       array.get(ring.touchMarkBaseSeqs, x))
+                            array.push(plan.times,          array.get(ring.touchMarkTimes, x))
+                            array.push(plan.sides,          array.get(ring.touchMarkSides, x))
+                            array.push(plan.contactBottoms, cb)
+                            array.push(plan.contactTops,    ct)
+                            array.push(plan.closeAtTouches, array.get(ring.touchMarkCloseAtTouches, x))
+                            array.push(plan.generationIds,  array.get(ring.touchMarkGenerationIds, x))
+                            array.push(plan.isNormalFlags,  array.get(ring.touchMarkIsNormalTouchFlags, x))
+                        q += 1
+                    array.push(plan.markCounts, array.size(plan.times) - start)
+                    array.push(plan.truncatedFlags, wS >= 0 and trS)
+                    array.push(plan.truncatedFlags, wR >= 0 and trR)
+                    ok := array.size(plan.times) - start <= cap
+            k += 1
+        i += 1
+    if not ok
+        splitPlanClearRaw(plan)
+    ok ? array.size(plan.targetPhysicalIndexes) : -1
