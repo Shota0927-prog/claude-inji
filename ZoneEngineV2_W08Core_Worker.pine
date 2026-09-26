@@ -93,6 +93,12 @@
 // absorbedOffset (row in mergeAbsorbed), absorbedCount]; mergeAbsorbed stride 2 [oldCoreSlot, oldCoreId] in old canonical
 // order (coreCreatedTime, coreId ASC). The survivor is the B07-B selected match of that Candidate (a fresh Candidate has
 // none); absorbed = every other old of its full edge set. Absorbed is a relation role only: never a free decision.
+//
+// B09: Split topology relations (old-centric planning only, nothing applied). One relation per old Core with >= 2
+// distinct physical Candidates in physicalIdentityEdges (the full graph), in old canonical order: splitRelations stride 5
+// [oldCoreSlot, oldCoreId, continuationPhysicalIndex (-1 none), childOffset (row in splitChildren), childCount];
+// splitChildren stride 1 [physicalCandidateIndex] in new canonical order. Children = every Candidate of the old's full
+// edge set (childCount = its degree), the B07-B continuation child included; Merge and Split relations coexist.
 // ============================================================
 library("ZoneEngineV2_W08Core_Worker", overlay = false)
 
@@ -149,6 +155,10 @@ export type W08Store
     array<int>   mergeAbsorbed
     int          mergeRelationCount = 0
     int          mergeAbsorbedLogicalCount = 0
+    array<int>   splitRelations
+    array<int>   splitChildren
+    int          splitRelationCount = 0
+    int          splitChildLogicalCount = 0
 
 export newStore() =>
     W08Store s = W08Store.new()
@@ -191,6 +201,8 @@ export newStore() =>
     s.physicalMaterializedGenerationIds           := array.new_int(0)
     s.mergeRelations                              := array.new_int(0)
     s.mergeAbsorbed                               := array.new_int(0)
+    s.splitRelations                              := array.new_int(0)
+    s.splitChildren                               := array.new_int(0)
     s
 
 // currentCoreId = the Core ID of a live Core at coreSlot, ID_NONE when the slot is out of
@@ -1516,6 +1528,14 @@ export coreIndexClean(W08Store store, int coreSlot) =>
         k += 3
     clean
 
+// Canonical Identity edge order: old canonical order (coreCreatedTime, coreId ASC), inside one old strictly ascending
+// physicalNewCompareRaw (so no edge repeats). Edge k (> 0) must follow the previous edge (lastCt, lastId, lastP).
+identityEdgeFollowsRaw(W08Store store, int k, int ct, int id, int p, int lastCt, int lastId, int lastP) =>
+    bool ok = k == 0 or ct > lastCt or (ct == lastCt and id > lastId)
+    if not ok and k > 0 and ct == lastCt and id == lastId
+        ok := physicalNewCompareRaw(store, lastP, p) < 0
+    ok
+
 // Builds the Merge relations of the current pass from physicalIdentityEdges and physicalIdentityMatches (ownershipResult
 // must equal this pass's physicalFreshAllocationCount) and returns the relation count. Every edge must name a live old
 // Core with coreIds[slot] == coreId >= 1, a set coreCreatedTime and one slot per coreId, edges in canonical old order
@@ -1556,10 +1576,7 @@ export mergePlanBuild(W08Store store, int ownershipResult, array<bool> coreLive,
             ok := array.get(coreLive, sl) and array.get(coreIds, sl) == id and not na(array.get(coreCreatedTimes, sl)) and (not map.contains(slotOf, id) or map.get(slotOf, id) == sl)
         if ok
             int ct = array.get(coreCreatedTimes, sl)
-            // canonical old order (createdTime, coreId), inside one old strictly ascending new order (no repeated edge)
-            ok := k == 0 or ct > lastCt or (ct == lastCt and id > lastId)
-            if not ok and k > 0 and ct == lastCt and id == lastId
-                ok := physicalNewCompareRaw(store, lastP, p) < 0
+            ok := identityEdgeFollowsRaw(store, k, ct, id, p, lastCt, lastId, lastP)
             map.put(slotOf, id, sl)
             array.set(deg, p, array.get(deg, p) + 1)
             if array.get(matchId, p) == id
@@ -1610,3 +1627,93 @@ export mergePlanBuild(W08Store store, int ownershipResult, array<bool> coreLive,
     store.mergeRelationCount        := ok ? array.size(targets) : 0
     store.mergeAbsorbedLogicalCount := ok ? int(array.size(store.mergeAbsorbed) / 2) : 0
     ok ? array.size(targets) : -1
+
+// Builds the Split relations of the current pass from physicalIdentityEdges, physicalIdentityMatches and the ownership
+// plan (mergeResult must equal this pass's mergeRelationCount) and returns the relation count. Edge rows are validated
+// as in mergePlanBuild; every match must be a full edge, each old / Candidate matched at most once, and the matched
+// Candidate must be the continuation of that old in the ownership plan (the continuation count equals the match
+// count). Edges already run in old canonical order with each old's Candidates in new canonical order, so a relation is
+// one old's edge run of length >= 2. Only the Split storage is written; -1 with it empty on any fault.
+export splitPlanBuild(W08Store store, int mergeResult, array<bool> coreLive, array<int> coreIds, array<int> coreCreatedTimes) =>
+    array.clear(store.splitRelations)
+    array.clear(store.splitChildren)
+    int  n  = store.physicalCandidateLogicalCount
+    int  ne = store.physicalIdentityEdgeCount
+    int  nm = store.physicalIdentityMatchCount
+    array<int> ed = store.physicalIdentityEdges
+    array<int> mt = store.physicalIdentityMatches
+    bool ok = mergeResult >= 0 and mergeResult == store.mergeRelationCount and array.size(ed) == 3 * ne and array.size(mt) == 3 * nm and array.size(store.physicalOwnershipKinds) == n and array.size(store.physicalContinuationOldCoreSlots) == n and array.size(store.physicalContinuationCoreIds) == n
+    map<int, int> contOf = map.new<int, int>()
+    array<bool> usedP = array.new_bool(ok ? n : 0, false)
+    int k = 0
+    while ok and k < nm
+        int p  = array.get(mt, 3 * k)
+        int sl = array.get(mt, 3 * k + 1)
+        int id = array.get(mt, 3 * k + 2)
+        ok := p >= 0 and p < n and id >= 1 and not map.contains(contOf, id)
+        if ok
+            ok := not array.get(usedP, p) and array.get(store.physicalOwnershipKinds, p) == 0 and array.get(store.physicalContinuationOldCoreSlots, p) == sl and array.get(store.physicalContinuationCoreIds, p) == id
+            array.set(usedP, p, true)
+            map.put(contOf, id, p)
+        k += 1
+    int conts = 0
+    k := 0
+    while ok and k < n
+        if array.get(store.physicalOwnershipKinds, k) == 0
+            conts += 1
+        k += 1
+    ok := ok and conts == nm
+    map<int, int> slotOf = map.new<int, int>()
+    int hits   = 0
+    int lastCt = 0
+    int lastId = 0
+    int lastP  = -1
+    k := 0
+    while ok and k < ne
+        int p  = array.get(ed, 3 * k)
+        int sl = array.get(ed, 3 * k + 1)
+        int id = array.get(ed, 3 * k + 2)
+        ok := p >= 0 and p < n and sl >= 0 and sl < array.size(coreLive) and sl < array.size(coreIds) and sl < array.size(coreCreatedTimes) and id >= 1
+        if ok
+            ok := array.get(coreLive, sl) and array.get(coreIds, sl) == id and not na(array.get(coreCreatedTimes, sl)) and (not map.contains(slotOf, id) or map.get(slotOf, id) == sl)
+        if ok
+            int ct = array.get(coreCreatedTimes, sl)
+            ok := identityEdgeFollowsRaw(store, k, ct, id, p, lastCt, lastId, lastP)
+            map.put(slotOf, id, sl)
+            if map.contains(contOf, id)
+                if map.get(contOf, id) == p
+                    ok := ok and array.get(store.physicalContinuationOldCoreSlots, p) == sl
+                    hits += 1
+            lastCt := ct
+            lastId := id
+            lastP  := p
+        k += 1
+    ok := ok and hits == nm
+    // one relation per old edge run of length >= 2 (run order = old canonical order, rows = new canonical order)
+    int a = 0
+    while ok and a < ne
+        int id = array.get(ed, 3 * a + 2)
+        int b  = a + 1
+        while b < ne and array.get(ed, 3 * b + 2) == id
+            b += 1
+        if b - a >= 2
+            int off  = array.size(store.splitChildren)
+            int cont = -1
+            if map.contains(contOf, id)
+                cont := map.get(contOf, id)
+            k := a
+            while k < b
+                array.push(store.splitChildren, array.get(ed, 3 * k))
+                k += 1
+            array.push(store.splitRelations, array.get(ed, 3 * a + 1))
+            array.push(store.splitRelations, id)
+            array.push(store.splitRelations, cont)
+            array.push(store.splitRelations, off)
+            array.push(store.splitRelations, b - a)
+        a := b
+    if not ok
+        array.clear(store.splitRelations)
+        array.clear(store.splitChildren)
+    store.splitRelationCount     := ok ? int(array.size(store.splitRelations) / 5) : 0
+    store.splitChildLogicalCount := ok ? array.size(store.splitChildren) : 0
+    ok ? int(array.size(store.splitRelations) / 5) : -1
