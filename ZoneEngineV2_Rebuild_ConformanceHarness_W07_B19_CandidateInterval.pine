@@ -1,0 +1,1169 @@
+//@version=6
+// ============================================================
+// ZoneEngineV2_Rebuild_ConformanceHarness_W07_B19_CandidateInterval.pine
+// W07 B19 Lane1 : FVG interval / Fresh interval / Broad (P) + Main E2E conformance. Build 190101.
+// P (58 fixtures) is an auxiliary parity of the W07Fvg /10 interval primitives plus one canonical semantic filter:
+//   raw  : per query, naive full scan (w07RefIntervalNaiveRaw, inclusive nativeBottom <= high and nativeTop >= low)
+//          vs W07Fvg.fvgIntervalOrderBuild + fvgIntervalQuery on every fixture FVG -> exact rootId set;
+//   pair : the same canonical filter (pSemRaw) over every FVG (Reference) and over the Side index hits of the
+//          query range (Optimized), plus the final BroadContext scan -> exact record multiset;
+//   Fresh: (D01 / D08) naive fresh-only scan vs a Fresh index kept by W07Fvg.freshIndexApply.
+//   P is NOT the W05 /4 actual Stage A / B pair parity (that is Lane2 AP).
+// Main E2E (8 fixtures) : Main /22 public API only (newCfg / validateCfg / newEngine / newFeed / updateConfirmed5m /
+//   rootCount / rootAt and read-only exported fields).
+// Fixture dispatch uses for loops only (no while in the dispatcher). No request.*, no bar_index / timenow, no random.
+// ============================================================
+indicator("ZoneEngineV2 W07 B19 Candidate Interval Lane1", overlay = false)
+
+import sekine3310/ZoneEngineV2_W07Fvg_Worker/10 as W07Fvg
+import sekine3310/ZoneEngineV2_Rebuild/22 as ZE
+
+// ---- canonical constants (mirrors of Main / W05 enums; mintick 1.0, clusterMaxWidth 20.0, denseRatio 0.50) ----
+const int   CAT_MA              = 0
+const int   CAT_SWING           = 1
+const int   CAT_ACCUM           = 2
+const int   CAT_TIME_HL         = 3
+const int   CAT_FVG             = 4
+const int   CAT_PSYCH           = 5
+const int   ROOT_ACTIVE         = 1
+const int   ROOT_INVALIDATED    = 2
+const int   ROOT_INVERSE_WAIT   = 3
+const int   ROOT_INVERSE_ACTIVE = 4
+const int   FVG_BULLISH         = 1
+const int   FVG_BEARISH         = 2
+const int   TF_1H               = 60
+const int   TF_4H               = 240
+const int   TF_D                = 1440
+const int   SIDE_SUPPORT        = 1
+const int   SIDE_RESISTANCE     = -1
+const int   M_TICK              = 20
+const int   D_TICK              = 10
+const int   FVG_INTERVAL_BUILD_OK = 0
+const float FX_MINTICK          = 1.0
+const int   FX_T0               = 1700000000000
+const int   FX_H                = 3600000
+const int   FX_M5               = 300000
+
+// query kinds / record modes / record stride
+const int Q_POINT            = 1
+const int Q_FVG              = 2
+const int MODE_STANDALONE    = 1
+const int MODE_INSIDE        = 2
+const int MODE_PROXIMAL      = 3
+const int MODE_OVERLAP       = 4
+const int MODE_BROAD_CONTEXT = 5
+// record : 0 query, 1 side, 2 mode, 3 fvgRootIdA, 4 fvgRootIdB, 5 effBottomTick, 6 effTopTick, 7 high, 8 broadContext, 9 broadLocalized
+const int REC = 10
+
+// compare codes
+const int CMP_NONE          = 0
+const int CMP_FIXTURE_ORDER = 1
+const int CMP_BUILD         = 2
+const int CMP_QUERY         = 3
+const int CMP_RAW_SET       = 4
+const int CMP_PAIR_SET      = 5
+const int CMP_FRESH_APPLY   = 6
+const int CMP_FRESH_SET     = 7
+const int CMP_M_CFG         = 8
+const int CMP_M_COMMIT      = 9
+const int CMP_M_ROOT        = 10
+const int CMP_M_BROAD       = 11
+const int CMP_M_FRESH       = 12
+const int CMP_M_FRESH_INDEX = 13
+const int CMP_M_STATE       = 14
+
+// one P fixture : FVG Roots (ascending rootId), point Roots, queries
+type PFx
+    array<int>  fId
+    array<int>  fTf
+    array<int>  fDir
+    array<int>  fState
+    array<int>  fBot
+    array<int>  fTop
+    array<bool> fFresh
+    array<int>  pId
+    array<int>  pCat
+    array<int>  pTick
+    array<bool> pHigh
+    array<int>  qKind
+    array<int>  qSide
+    array<int>  qA
+    array<int>  qB
+    bool        freshLane
+    bool        synthetic
+
+pNew() =>
+    PFx.new(array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), false, false)
+pAddF(PFx x, int id, int tf, int dir, int st, int bottomTick, int topTick, bool fresh) =>
+    array.push(x.fId, id)
+    array.push(x.fTf, tf)
+    array.push(x.fDir, dir)
+    array.push(x.fState, st)
+    array.push(x.fBot, bottomTick)
+    array.push(x.fTop, topTick)
+    array.push(x.fFresh, fresh)
+    true
+pAddP(PFx x, int id, int cat, int tick, bool isHigh) =>
+    array.push(x.pId, id)
+    array.push(x.pCat, cat)
+    array.push(x.pTick, tick)
+    array.push(x.pHigh, isHigh)
+    true
+pAddQ(PFx x, int kind, int side, int a, int b) =>
+    array.push(x.qKind, kind)
+    array.push(x.qSide, side)
+    array.push(x.qA, a)
+    array.push(x.qB, b)
+    true
+
+// A fixtures (code 1xx)
+pBuildA(PFx x, int code) =>
+    if code == 101
+        // A01
+        pAddP(x, 101, CAT_SWING, 100, false)
+        pAddP(x, 102, CAT_TIME_HL, 105, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 102
+        // A02
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 103, false)
+        pAddP(x, 102, CAT_TIME_HL, 106, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+    else if code == 103
+        // A03
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 95, false)
+        pAddP(x, 102, CAT_TIME_HL, 115, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+    else if code == 104
+        // A04
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 80, false)
+        pAddP(x, 102, CAT_TIME_HL, 85, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 105
+        // A05
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 120, false)
+        pAddP(x, 102, CAT_TIME_HL, 125, false)
+        pAddP(x, 103, CAT_SWING, 115, false)
+        pAddP(x, 104, CAT_ACCUM, 118, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 2, 3)
+    else if code == 106
+        // A06
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 105, 118, true)
+        pAddF(x, 3, TF_D, FVG_BULLISH, ROOT_ACTIVE, 130, 140, true)
+        pAddF(x, 4, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 90, 98, true)
+        pAddF(x, 5, TF_4H, FVG_BEARISH, ROOT_ACTIVE, 108, 112, true)
+        pAddF(x, 6, TF_D, FVG_BEARISH, ROOT_ACTIVE, 150, 160, true)
+        pAddP(x, 101, CAT_SWING, 104, false)
+        pAddP(x, 102, CAT_TIME_HL, 107, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_POINT, SIDE_RESISTANCE, 0, 1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 2, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 3, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 4, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 5, -1)
+    else if code == 107
+        // A07
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 102, false)
+        pAddP(x, 102, CAT_TIME_HL, 104, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+    else if code == 108
+        // A08
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 118, true)
+        pAddF(x, 2, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 104, 110, true)
+        pAddP(x, 101, CAT_SWING, 106, false)
+        pAddP(x, 102, CAT_TIME_HL, 108, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+    else if code == 109
+        // A09
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 106, 115, true)
+        pAddP(x, 101, CAT_SWING, 105, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 0)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+    else if code == 110
+        // A10
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 150, 160, true)
+        pAddF(x, 2, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 3, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 125, 135, true)
+        pAddF(x, 4, TF_D, FVG_BULLISH, ROOT_ACTIVE, 95, 105, true)
+        pAddP(x, 101, CAT_SWING, 102, false)
+        pAddP(x, 102, CAT_TIME_HL, 104, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 2, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 3, -1)
+    true
+// H fixtures (code 2xx)
+pBuildH(PFx x, int code) =>
+    if code == 201
+        // H01
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 110, false)
+        pAddP(x, 102, CAT_TIME_HL, 112, false)
+        pAddP(x, 103, CAT_ACCUM, 110, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 2, 2)
+    else if code == 202
+        // H02
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 95, false)
+        pAddP(x, 102, CAT_TIME_HL, 100, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 203
+        // H03
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 111, false)
+        pAddP(x, 102, CAT_TIME_HL, 113, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 204
+        // H04
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 96, false)
+        pAddP(x, 102, CAT_TIME_HL, 99, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 205
+        // H05 SYNTHETIC_INTERVAL_ONLY (bottom == top is never a canonical formation)
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 105, 105, true)
+        pAddF(x, 2, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 105, false)
+        pAddP(x, 102, CAT_TIME_HL, 104, false)
+        pAddP(x, 103, CAT_ACCUM, 106, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 0)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 1, 1)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 2, 2)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+        x.synthetic := true
+    else if code == 206
+        // H06
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 108, false)
+        pAddP(x, 102, CAT_TIME_HL, 110, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 207
+        // H07
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 111, false)
+        pAddP(x, 102, CAT_TIME_HL, 113, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 208
+        // H08
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 115, false)
+        pAddP(x, 102, CAT_TIME_HL, 120, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 209
+        // H09
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 116, false)
+        pAddP(x, 102, CAT_TIME_HL, 121, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 210
+        // H10
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 110, 118, true)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+    else if code == 213
+        // H13
+        pAddF(x, 1, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 100, false)
+        pAddP(x, 102, CAT_TIME_HL, 103, false)
+        pAddQ(x, Q_POINT, SIDE_RESISTANCE, 0, 1)
+    else if code == 214
+        // H14
+        pAddF(x, 1, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 97, false)
+        pAddP(x, 102, CAT_TIME_HL, 99, false)
+        pAddQ(x, Q_POINT, SIDE_RESISTANCE, 0, 1)
+    true
+// B fixtures (code 3xx)
+pBuildB(PFx x, int code) =>
+    if code == 301
+        // B01
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 105, 115, true)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+    else if code == 302
+        // B02
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 105, 115, true)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+    else if code == 303
+        // B03
+        pAddF(x, 1, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_D, FVG_BULLISH, ROOT_ACTIVE, 105, 115, true)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+    else if code == 304
+        // B04
+        pAddF(x, 1, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 105, 115, true)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 1, -1)
+    else if code == 305
+        // B05
+        pAddF(x, 1, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_D, FVG_BEARISH, ROOT_ACTIVE, 104, 112, true)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 1, -1)
+    else if code == 306
+        // B06
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 115, 125, true)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+    else if code == 307
+        // B07
+        pAddF(x, 1, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 111, 120, true)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 1, -1)
+    else if code == 308
+        // B08
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 110, 120, true)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+    true
+// C fixtures (code 4xx)
+pBuildC(PFx x, int code) =>
+    if code == 401
+        // C01
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 105, 115, true)
+        pAddP(x, 101, CAT_SWING, 106, false)
+        pAddP(x, 102, CAT_TIME_HL, 108, false)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 402
+        // C02
+        pAddF(x, 1, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_4H, FVG_BEARISH, ROOT_ACTIVE, 105, 115, true)
+        pAddP(x, 101, CAT_SWING, 106, false)
+        pAddP(x, 102, CAT_TIME_HL, 108, false)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 1, -1)
+        pAddQ(x, Q_POINT, SIDE_RESISTANCE, 0, 1)
+    else if code == 403
+        // C03
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_INVERSE_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 105, 115, true)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 1, -1)
+    else if code == 404
+        // C04
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_INVALIDATED, 100, 110, true)
+        pAddF(x, 2, TF_1H, FVG_BULLISH, ROOT_INVERSE_WAIT, 102, 108, true)
+        pAddF(x, 3, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 104, 112, true)
+        pAddP(x, 101, CAT_SWING, 105, false)
+        pAddP(x, 102, CAT_TIME_HL, 106, false)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 2, -1)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 405
+        // C05
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 120, 130, true)
+        pAddF(x, 3, TF_D, FVG_BULLISH, ROOT_ACTIVE, 140, 150, true)
+        pAddF(x, 4, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 5, TF_4H, FVG_BEARISH, ROOT_ACTIVE, 120, 130, true)
+        pAddF(x, 6, TF_D, FVG_BEARISH, ROOT_ACTIVE, 140, 150, true)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 2, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 3, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 4, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 5, -1)
+    else if code == 406
+        // C06
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 105, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 0)
+    true
+// D fixtures (code 5xx)
+pBuildD(PFx x, int code) =>
+    if code == 501
+        // D01
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 104, 114, true)
+        pAddF(x, 3, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 102, 108, true)
+        pAddF(x, 4, TF_D, FVG_BULLISH, ROOT_ACTIVE, 106, 120, false)
+        pAddF(x, 5, TF_4H, FVG_BEARISH, ROOT_ACTIVE, 95, 105, false)
+        pAddP(x, 101, CAT_SWING, 103, false)
+        pAddP(x, 102, CAT_TIME_HL, 107, false)
+        pAddP(x, 103, CAT_SWING, 115, false)
+        pAddP(x, 104, CAT_ACCUM, 125, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_POINT, SIDE_RESISTANCE, 0, 1)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 2, 3)
+        x.freshLane := true
+    else if code == 508
+        // D08
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 130, 140, true)
+        pAddF(x, 3, TF_D, FVG_BULLISH, ROOT_ACTIVE, 160, 170, true)
+        pAddF(x, 4, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 115, 125, true)
+        pAddF(x, 5, TF_4H, FVG_BEARISH, ROOT_ACTIVE, 145, 155, false)
+        pAddF(x, 6, TF_D, FVG_BEARISH, ROOT_ACTIVE, 175, 185, true)
+        pAddP(x, 101, CAT_SWING, 108, false)
+        pAddP(x, 102, CAT_TIME_HL, 132, false)
+        pAddP(x, 103, CAT_SWING, 150, false)
+        pAddP(x, 104, CAT_ACCUM, 165, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_POINT, SIDE_RESISTANCE, 0, 1)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 2, 3)
+        x.freshLane := true
+    true
+// E fixtures (code 6xx)
+pBuildE(PFx x, int code) =>
+    if code == 601
+        // E01
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 125, true)
+        pAddP(x, 101, CAT_SWING, 128, false)
+        pAddP(x, 102, CAT_MA, 130, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 602
+        // E02
+        pAddF(x, 1, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 100, 125, true)
+        pAddP(x, 101, CAT_SWING, 92, false)
+        pAddP(x, 102, CAT_MA, 95, false)
+        pAddQ(x, Q_POINT, SIDE_RESISTANCE, 0, 1)
+    else if code == 603
+        // E03
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 125, true)
+        pAddF(x, 2, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 110, 118, true)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+    else if code == 604
+        // E04
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 125, true)
+        pAddF(x, 2, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 110, 118, true)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+    else if code == 605
+        // E05
+        pAddF(x, 1, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 100, 130, true)
+        pAddP(x, 101, CAT_SWING, 112, true)
+        pAddP(x, 102, CAT_SWING, 115, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 606
+        // E06
+        pAddF(x, 1, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 100, 130, true)
+        pAddP(x, 101, CAT_MA, 112, true)
+        pAddP(x, 102, CAT_MA, 114, true)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 607
+        // E07
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 130, true)
+        pAddP(x, 101, CAT_SWING, 112, false)
+        pAddP(x, 102, CAT_TIME_HL, 115, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 608
+        // E08
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 130, true)
+        pAddP(x, 101, CAT_SWING, 112, false)
+        pAddP(x, 102, CAT_PSYCH, 115, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    true
+// F fixtures (code 7xx)
+pBuildF(PFx x, int code) =>
+    if code == 701
+        // F01
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 130, true)
+        pAddP(x, 101, CAT_SWING, 112, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 0)
+    else if code == 702
+        // F02
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 130, true)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+    else if code == 703
+        // F03
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 160, true)
+        pAddP(x, 101, CAT_SWING, 110, false)
+        pAddP(x, 102, CAT_TIME_HL, 113, false)
+        pAddP(x, 103, CAT_SWING, 140, false)
+        pAddP(x, 104, CAT_ACCUM, 143, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 2, 3)
+    else if code == 704
+        // F04
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 200, true)
+        pAddP(x, 101, CAT_SWING, 110, false)
+        pAddP(x, 102, CAT_TIME_HL, 112, false)
+        pAddP(x, 103, CAT_SWING, 130, false)
+        pAddP(x, 104, CAT_ACCUM, 132, false)
+        pAddP(x, 105, CAT_SWING, 150, false)
+        pAddP(x, 106, CAT_TIME_HL, 152, false)
+        pAddP(x, 107, CAT_SWING, 170, false)
+        pAddP(x, 108, CAT_ACCUM, 172, false)
+        pAddP(x, 109, CAT_SWING, 190, false)
+        pAddP(x, 110, CAT_TIME_HL, 192, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 2, 3)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 4, 5)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 6, 7)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 8, 9)
+    true
+// G fixtures (code 8xx)
+pBuildG(PFx x, int code) =>
+    if code == 801
+        // G01
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 113, false)
+        pAddP(x, 102, CAT_TIME_HL, 116, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 802
+        // G02
+        pAddF(x, 1, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 94, false)
+        pAddP(x, 102, CAT_TIME_HL, 97, false)
+        pAddQ(x, Q_POINT, SIDE_RESISTANCE, 0, 1)
+    else if code == 803
+        // G03
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 115, false)
+        pAddP(x, 102, CAT_TIME_HL, 120, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 804
+        // G04
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 116, false)
+        pAddP(x, 102, CAT_TIME_HL, 121, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+    else if code == 805
+        // G05
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddP(x, 101, CAT_SWING, 103, false)
+        pAddP(x, 102, CAT_TIME_HL, 106, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    else if code == 806
+        // G06
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 130, true)
+        pAddP(x, 101, CAT_SWING, 132, false)
+        pAddP(x, 102, CAT_TIME_HL, 135, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+    true
+// J fixtures (code 9xx)
+pBuildJ(PFx x, int code) =>
+    if code == 901
+        // J01
+        pAddF(x, 1, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_4H, FVG_BULLISH, ROOT_ACTIVE, 105, 118, true)
+        pAddF(x, 3, TF_D, FVG_BULLISH, ROOT_ACTIVE, 140, 150, true)
+        pAddF(x, 4, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 160, 190, true)
+        pAddF(x, 5, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 6, TF_1H, FVG_BULLISH, ROOT_INVERSE_WAIT, 120, 125, true)
+        pAddP(x, 101, CAT_SWING, 106, false)
+        pAddP(x, 102, CAT_TIME_HL, 108, false)
+        pAddP(x, 103, CAT_SWING, 152, false)
+        pAddP(x, 104, CAT_MA, 155, false)
+        pAddP(x, 105, CAT_SWING, 170, true)
+        pAddP(x, 106, CAT_ACCUM, 172, false)
+        pAddP(x, 107, CAT_PSYCH, 193, false)
+        pAddP(x, 108, CAT_SWING, 195, false)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 0, 1)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 2, 3)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 4, 5)
+        pAddQ(x, Q_POINT, SIDE_SUPPORT, 6, 7)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 1, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 2, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 3, -1)
+        pAddQ(x, Q_FVG, SIDE_SUPPORT, 5, -1)
+    else if code == 902
+        // J02
+        pAddF(x, 1, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 2, TF_4H, FVG_BEARISH, ROOT_ACTIVE, 95, 108, true)
+        pAddF(x, 3, TF_D, FVG_BEARISH, ROOT_ACTIVE, 60, 70, true)
+        pAddF(x, 4, TF_1H, FVG_BEARISH, ROOT_ACTIVE, 10, 40, true)
+        pAddF(x, 5, TF_1H, FVG_BULLISH, ROOT_ACTIVE, 100, 110, true)
+        pAddF(x, 6, TF_1H, FVG_BEARISH, ROOT_INVERSE_WAIT, 80, 85, true)
+        pAddP(x, 101, CAT_SWING, 102, false)
+        pAddP(x, 102, CAT_TIME_HL, 104, false)
+        pAddP(x, 103, CAT_SWING, 55, false)
+        pAddP(x, 104, CAT_MA, 57, false)
+        pAddP(x, 105, CAT_SWING, 20, true)
+        pAddP(x, 106, CAT_ACCUM, 22, false)
+        pAddP(x, 107, CAT_PSYCH, 5, false)
+        pAddP(x, 108, CAT_SWING, 7, false)
+        pAddQ(x, Q_POINT, SIDE_RESISTANCE, 0, 1)
+        pAddQ(x, Q_POINT, SIDE_RESISTANCE, 2, 3)
+        pAddQ(x, Q_POINT, SIDE_RESISTANCE, 4, 5)
+        pAddQ(x, Q_POINT, SIDE_RESISTANCE, 6, 7)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 0, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 1, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 2, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 3, -1)
+        pAddQ(x, Q_FVG, SIDE_RESISTANCE, 5, -1)
+    true
+
+pBuild(int code) =>
+    PFx x = pNew()
+    int g = int(math.floor(code / 100))
+    if g == 1
+        pBuildA(x, code)
+    else if g == 2
+        pBuildH(x, code)
+    else if g == 3
+        pBuildB(x, code)
+    else if g == 4
+        pBuildC(x, code)
+    else if g == 5
+        pBuildD(x, code)
+    else if g == 6
+        pBuildE(x, code)
+    else if g == 7
+        pBuildF(x, code)
+    else if g == 8
+        pBuildG(x, code)
+    else if g == 9
+        pBuildJ(x, code)
+    x
+
+// ---------------- canonical semantic filter (shared by Reference and Optimized) ----------------
+pIsBroad(PFx x, int i) =>
+    array.get(x.fTop, i) - array.get(x.fBot, i) > M_TICK
+pHighTf(PFx x, int i) =>
+    int tf = array.get(x.fTf, i)
+    tf == TF_4H or tf == TF_D
+// Bullish ACTIVE -> Support, INVERSE_ACTIVE -> Resistance; Bearish mirrored; other states never
+pElig(PFx x, int i, int side) =>
+    int  d  = array.get(x.fDir, i)
+    int  st = array.get(x.fState, i)
+    bool e  = false
+    if d == FVG_BULLISH
+        e := (st == ROOT_ACTIVE and side == SIDE_SUPPORT) or (st == ROOT_INVERSE_ACTIVE and side == SIDE_RESISTANCE)
+    else if d == FVG_BEARISH
+        e := (st == ROOT_ACTIVE and side == SIDE_RESISTANCE) or (st == ROOT_INVERSE_ACTIVE and side == SIDE_SUPPORT)
+    e
+// point cluster of query qi : [low, high, any high-quality non-Psych point, independent category count]
+pAgg(PFx x, int qi) =>
+    int lo = int(na)
+    int hi = int(na)
+    bool anyHigh = false
+    array<bool> seen = array.new_bool(6, false)
+    for p = array.get(x.qA, qi) to array.get(x.qB, qi)
+        int t = array.get(x.pTick, p)
+        int c = array.get(x.pCat, p)
+        lo := na(lo) ? t : math.min(lo, t)
+        hi := na(hi) ? t : math.max(hi, t)
+        if array.get(x.pHigh, p) and c != CAT_PSYCH
+            anyHigh := true
+        array.set(seen, c, true)
+    int cats = 0
+    for s in seen
+        if s
+            cats += 1
+    [lo, hi, anyHigh, cats]
+pRec(array<int> out, int qi, int side, int mode, int idA, int idB, int eb, int et, bool isHigh, bool broadCtx, bool broadLoc) =>
+    array.push(out, qi)
+    array.push(out, side)
+    array.push(out, mode)
+    array.push(out, idA)
+    array.push(out, idB)
+    array.push(out, eb)
+    array.push(out, et)
+    array.push(out, isHigh ? 1 : 0)
+    array.push(out, broadCtx ? 1 : 0)
+    array.push(out, broadLoc ? 1 : 0)
+    true
+// pairs of query qi over the FVG index list cand (any order) -> out
+//   point cluster (dense, width <= D) : non-Broad INSIDE / PROXIMAL (span from the Proximal edge <= D);
+//     Broad C1 (Proximal edge + cluster span <= D), C3 (inside + high-quality category), C4 (inside + >= 2 categories)
+//   FVG anchor : non-Broad standalone NativeRange; each same-direction eligible partner with a larger rootId and an
+//     actual overlap : non-Broad x non-Broad OVERLAP (High on different TF or a non-Broad 4H / D); Broad involved :
+//     C2 only on different TF. Non-overlapping partners never pair (no M-distance merge).
+pSemRaw(PFx x, int qi, array<int> cand, array<int> out) =>
+    int kind = array.get(x.qKind, qi)
+    int side = array.get(x.qSide, qi)
+    if kind == Q_POINT
+        [lo, hi, anyHigh, cats] = pAgg(x, qi)
+        if hi - lo <= D_TICK
+            for i in cand
+                if pElig(x, i, side)
+                    int  fb  = array.get(x.fBot, i)
+                    int  ft  = array.get(x.fTop, i)
+                    int  fid = array.get(x.fId, i)
+                    if not pIsBroad(x, i)
+                        bool hTf = pHighTf(x, i)
+                        if fb <= lo and hi <= ft
+                            pRec(out, qi, side, MODE_INSIDE, fid, 0, lo, hi, hTf, false, false)
+                        if side == SIDE_SUPPORT and lo > ft and hi - ft <= D_TICK
+                            pRec(out, qi, side, MODE_PROXIMAL, fid, 0, ft, hi, hTf, false, false)
+                        if side == SIDE_RESISTANCE and hi < fb and fb - lo <= D_TICK
+                            pRec(out, qi, side, MODE_PROXIMAL, fid, 0, lo, fb, hTf, false, false)
+                    else
+                        int prox = side == SIDE_SUPPORT ? ft : fb
+                        int cb   = math.min(prox, lo)
+                        int ct   = math.max(prox, hi)
+                        if ct - cb <= D_TICK
+                            pRec(out, qi, side, MODE_PROXIMAL, fid, 0, cb, ct, true, false, true)
+                        if fb <= lo and hi <= ft and (anyHigh or cats >= 2)
+                            pRec(out, qi, side, MODE_INSIDE, fid, 0, lo, hi, true, false, true)
+    else
+        int a = array.get(x.qA, qi)
+        if pElig(x, a, side)
+            int  aId    = array.get(x.fId, a)
+            int  aB     = array.get(x.fBot, a)
+            int  aT     = array.get(x.fTop, a)
+            bool aBroad = pIsBroad(x, a)
+            if not aBroad
+                pRec(out, qi, side, MODE_STANDALONE, aId, 0, aB, aT, pHighTf(x, a), false, false)
+            for j in cand
+                if array.get(x.fId, j) > aId and pElig(x, j, side) and array.get(x.fDir, j) == array.get(x.fDir, a)
+                    int ob = math.max(aB, array.get(x.fBot, j))
+                    int ot = math.min(aT, array.get(x.fTop, j))
+                    if ob <= ot
+                        bool diffTf = array.get(x.fTf, j) != array.get(x.fTf, a)
+                        if not aBroad and not pIsBroad(x, j)
+                            pRec(out, qi, side, MODE_OVERLAP, aId, array.get(x.fId, j), ob, ot, diffTf or pHighTf(x, a) or pHighTf(x, j), false, false)
+                        else if diffTf
+                            pRec(out, qi, side, MODE_OVERLAP, aId, array.get(x.fId, j), ob, ot, true, false, true)
+    true
+// final BroadContext : every eligible Broad FVG of a queried Side that no localized record of that Side uses
+pBroadCtxRaw(PFx x, array<int> recs, array<int> out) =>
+    int n  = array.size(x.fId)
+    int nr = int(array.size(recs) / REC)
+    for s in array.from(SIDE_SUPPORT, SIDE_RESISTANCE)
+        bool used = array.includes(x.qSide, s)
+        if used and n > 0
+            for i = 0 to n - 1
+                if pElig(x, i, s) and pIsBroad(x, i)
+                    int  id  = array.get(x.fId, i)
+                    bool loc = false
+                    if nr > 0
+                        for r = 0 to nr - 1
+                            if array.get(recs, r * REC + 1) == s and array.get(recs, r * REC + 9) == 1 and (array.get(recs, r * REC + 3) == id or array.get(recs, r * REC + 4) == id)
+                                loc := true
+                    if not loc
+                        pRec(out, -1, s, MODE_BROAD_CONTEXT, id, 0, array.get(x.fBot, i), array.get(x.fTop, i), false, true, false)
+    true
+// exact multiset equality of two record arrays (order-free, no sort)
+pMultisetEq(array<int> a, array<int> b) =>
+    int  nA = int(array.size(a) / REC)
+    int  nB = int(array.size(b) / REC)
+    bool eq = nA == nB and array.size(a) == nA * REC and array.size(b) == nB * REC
+    if eq and nA > 0
+        array<bool> used = array.new_bool(nB, false)
+        for i = 0 to nA - 1
+            bool found = false
+            for j = 0 to nB - 1
+                if not found and not array.get(used, j)
+                    bool same = true
+                    for k = 0 to REC - 1
+                        if array.get(a, i * REC + k) != array.get(b, j * REC + k)
+                            same := false
+                    if same
+                        array.set(used, j, true)
+                        found := true
+            if not found
+                eq := false
+    eq
+
+// ---------------- Reference (naive full scan, no Production index / helper) ----------------
+// rootIds (fixture order = ascending rootId) of every FVG whose NativeRange meets [lo, hi] inclusively
+w07RefIntervalNaiveRaw(PFx x, int lo, int hi, bool freshOnly, array<int> out) =>
+    array.clear(out)
+    int n = array.size(x.fId)
+    if n > 0
+        for i = 0 to n - 1
+            if (not freshOnly or array.get(x.fFresh, i)) and array.get(x.fBot, i) <= hi and array.get(x.fTop, i) >= lo
+                array.push(out, array.get(x.fId, i))
+    true
+pAllIdx(PFx x) =>
+    array<int> out = array.new_int(0)
+    int n = array.size(x.fId)
+    if n > 0
+        for i = 0 to n - 1
+            array.push(out, i)
+    out
+pSideIdx(PFx x, int side) =>
+    array<int> out = array.new_int(0)
+    int n = array.size(x.fId)
+    if n > 0
+        for i = 0 to n - 1
+            if pElig(x, i, side)
+                array.push(out, i)
+    out
+// query ranges : raw [lo, hi] and the widened Candidate range (point cluster +- 2D, FVG anchor NativeRange)
+pQRange(PFx x, int qi) =>
+    int rlo = int(na)
+    int rhi = int(na)
+    int wlo = int(na)
+    int whi = int(na)
+    if array.get(x.qKind, qi) == Q_POINT
+        [lo, hi, anyHigh, cats] = pAgg(x, qi)
+        rlo := lo
+        rhi := hi
+        wlo := lo - 2 * D_TICK
+        whi := hi + 2 * D_TICK
+    else
+        int a = array.get(x.qA, qi)
+        rlo := array.get(x.fBot, a)
+        rhi := array.get(x.fTop, a)
+        wlo := rlo
+        whi := rhi
+    [rlo, rhi, wlo, whi]
+pSlotsToIds(PFx x, array<int> slots) =>
+    array<int> out = array.new_int(0)
+    for s in slots
+        array.push(out, array.get(x.fId, s))
+    out
+pSameInts(array<int> a, array<int> b) =>
+    bool same = array.size(a) == array.size(b)
+    if same and array.size(a) > 0
+        for i = 0 to array.size(a) - 1
+            if array.get(a, i) != array.get(b, i)
+                same := false
+    same
+
+// ---------------- P fixture run ----------------
+// returns [code, field, refPairCount, optPairCount]
+runP(int code) =>
+    PFx x = pBuild(code)
+    int cmp   = CMP_NONE
+    int field = -1
+    int n = array.size(x.fId)
+    if n > 1
+        for i = 1 to n - 1
+            if array.get(x.fId, i) <= array.get(x.fId, i - 1)
+                cmp := CMP_FIXTURE_ORDER
+    // Optimized indexes (W07Fvg /10) : all FVGs (raw), Support-eligible, Resistance-eligible
+    array<int> allIdx = pAllIdx(x)
+    array<int> supIdx = pSideIdx(x, SIDE_SUPPORT)
+    array<int> resIdx = pSideIdx(x, SIDE_RESISTANCE)
+    array<int> allB = array.new_int(0)
+    array<int> allT = array.new_int(0)
+    array<int> supB = array.new_int(0)
+    array<int> supT = array.new_int(0)
+    array<int> resB = array.new_int(0)
+    array<int> resT = array.new_int(0)
+    if cmp == CMP_NONE
+        bool b1 = W07Fvg.fvgIntervalOrderBuild(allIdx, array.size(allIdx), x.fId, x.fBot, x.fTop, allB, allT) == FVG_INTERVAL_BUILD_OK
+        bool b2 = W07Fvg.fvgIntervalOrderBuild(supIdx, array.size(supIdx), x.fId, x.fBot, x.fTop, supB, supT) == FVG_INTERVAL_BUILD_OK
+        bool b3 = W07Fvg.fvgIntervalOrderBuild(resIdx, array.size(resIdx), x.fId, x.fBot, x.fTop, resB, resT) == FVG_INTERVAL_BUILD_OK
+        if not (b1 and b2 and b3)
+            cmp := CMP_BUILD
+    // Fresh index (D01 / D08) : every FVG enters, then every non-Fresh one is detached (W07Fvg.freshIndexApply)
+    array<int> frExp = array.new_int(0)
+    array<int> frB   = array.new_int(0)
+    array<int> frT   = array.new_int(0)
+    array<int> frPB  = array.new_int(0)
+    array<int> frPT  = array.new_int(0)
+    if cmp == CMP_NONE and x.freshLane and n > 0
+        bool fOk = true
+        for i = 0 to n - 1
+            if fOk
+                fOk := W07Fvg.freshIndexApply(i, array.get(x.fId, i), true, x.fId, x.fBot, x.fTop, frExp, frB, frT, frPB, frPT)
+        for i = 0 to n - 1
+            if fOk and not array.get(x.fFresh, i)
+                fOk := W07Fvg.freshIndexApply(i, array.get(x.fId, i), false, x.fId, x.fBot, x.fTop, frExp, frB, frT, frPB, frPT)
+        if not fOk
+            cmp := CMP_FRESH_APPLY
+    array<int> refRecs = array.new_int(0)
+    array<int> optRecs = array.new_int(0)
+    array<int> refRaw  = array.new_int(0)
+    array<int> hits    = array.new_int(0)
+    int nq = array.size(x.qKind)
+    if nq > 0
+        for qi = 0 to nq - 1
+            if cmp == CMP_NONE
+                [rlo, rhi, wlo, whi] = pQRange(x, qi)
+                int side = array.get(x.qSide, qi)
+                // raw interval parity on every FVG
+                w07RefIntervalNaiveRaw(x, rlo, rhi, false, refRaw)
+                int hc = W07Fvg.fvgIntervalQuery(allB, allT, x.fId, x.fBot, x.fTop, rlo, rhi, hits)
+                if hc < 0
+                    cmp := CMP_QUERY
+                else if not pSameInts(refRaw, pSlotsToIds(x, hits))
+                    cmp := CMP_RAW_SET
+                // Fresh interval parity
+                if cmp == CMP_NONE and x.freshLane
+                    w07RefIntervalNaiveRaw(x, rlo, rhi, true, refRaw)
+                    int fc = W07Fvg.fvgIntervalQuery(frB, frT, x.fId, x.fBot, x.fTop, rlo, rhi, hits)
+                    if fc < 0
+                        cmp := CMP_QUERY
+                    else if not pSameInts(refRaw, pSlotsToIds(x, hits))
+                        cmp := CMP_FRESH_SET
+                // semantic pairs : Reference over every FVG, Optimized over the Side index hits of the Candidate range
+                if cmp == CMP_NONE
+                    pSemRaw(x, qi, allIdx, refRecs)
+                    int sc = -1
+                    if side == SIDE_SUPPORT
+                        sc := W07Fvg.fvgIntervalQuery(supB, supT, x.fId, x.fBot, x.fTop, wlo, whi, hits)
+                    else
+                        sc := W07Fvg.fvgIntervalQuery(resB, resT, x.fId, x.fBot, x.fTop, wlo, whi, hits)
+                    if sc < 0
+                        cmp := CMP_QUERY
+                    else
+                        pSemRaw(x, qi, hits, optRecs)
+                if cmp != CMP_NONE and field < 0
+                    field := qi
+    if cmp == CMP_NONE
+        pBroadCtxRaw(x, refRecs, refRecs)
+        pBroadCtxRaw(x, optRecs, optRecs)
+        if not pMultisetEq(refRecs, optRecs)
+            cmp   := CMP_PAIR_SET
+            field := nq
+    [cmp, field, int(array.size(refRecs) / REC), int(array.size(optRecs) / REC)]
+
+// ---------------- Main E2E (Main /22 public API) ----------------
+// Main E2E fixture table: [bottom, top, bar count, expectBroad (-1 none)]; bars via mBar
+mSpec(int code) =>
+    if code == 211
+        // H11
+        [100.0, 120.0, 1, 0]
+    else if code == 212
+        // H12
+        [100.0, 121.0, 1, 1]
+    else if code == 502
+        // D02
+        [100.0, 110.0, 4, -1]
+    else if code == 503
+        // D03
+        [100.0, 110.0, 3, -1]
+    else if code == 504
+        // D04
+        [100.0, 110.0, 2, -1]
+    else if code == 505
+        // D05
+        [100.0, 110.0, 2, -1]
+    else if code == 506
+        // D06
+        [100.0, 110.0, 2, -1]
+    else if code == 507
+        // D07
+        [100.0, 110.0, 3, -1]
+    else
+        [float(na), float(na), 0, -1]
+
+// Main E2E bar table: [high, low, expected Fresh after this bar (1 / 0)]
+mBar(int code, int bi) =>
+    if code == 211 and bi == 0
+        [500.0, 490.0, 1]
+    else if code == 212 and bi == 0
+        [500.0, 490.0, 1]
+    else if code == 502 and bi == 0
+        [500.0, 490.0, 1]
+    else if code == 502 and bi == 1
+        [105.0, 95.0, 0]
+    else if code == 502 and bi == 2
+        [130.0, 120.0, 0]
+    else if code == 502 and bi == 3
+        [108.0, 102.0, 0]
+    else if code == 503 and bi == 0
+        [500.0, 490.0, 1]
+    else if code == 503 and bi == 1
+        [108.0, 102.0, 0]
+    else if code == 503 and bi == 2
+        [130.0, 120.0, 0]
+    else if code == 504 and bi == 0
+        [105.0, 95.0, 1]
+    else if code == 504 and bi == 1
+        [130.0, 120.0, 1]
+    else if code == 505 and bi == 0
+        [500.0, 490.0, 1]
+    else if code == 505 and bi == 1
+        [100.0, 90.0, 0]
+    else if code == 506 and bi == 0
+        [500.0, 490.0, 1]
+    else if code == 506 and bi == 1
+        [120.0, 110.0, 0]
+    else if code == 507 and bi == 0
+        [500.0, 490.0, 1]
+    else if code == 507 and bi == 1
+        [99.0, 90.0, 1]
+    else if code == 507 and bi == 2
+        [120.0, 111.0, 1]
+    else
+        [float(na), float(na), -1]
+
+mCfg() =>
+    ZE.ZoneCfg cfg = ZE.newCfg()
+    cfg.useMa          := false
+    cfg.useSwing       := false
+    cfg.useAccum       := false
+    cfg.useTimeHl      := false
+    cfg.usePsych       := false
+    cfg.useFvg         := true
+    cfg.chartTfMinutes := 5
+    cfg.mintick        := FX_MINTICK
+    cfg
+// seq 1 : the 1H Bullish FVG formation bar (source close = base close time); later bars carry base OHLC only
+mFeed(int seq, float high, float low, float bottom, float top) =>
+    int closeTime = seq == 1 ? FX_T0 + FX_H : FX_T0 + 2 * FX_H + (seq - 1) * FX_M5
+    float close = (high + low) / 2.0
+    ZE.Feed f = ZE.newFeed()
+    f.baseOpen       := close
+    f.baseHigh       := high
+    f.baseLow        := low
+    f.baseClose      := close
+    f.basePrevClose  := close
+    f.baseOpenTime   := closeTime - FX_M5
+    f.baseCloseTime  := closeTime
+    f.baseSeq        := seq
+    f.baseConfirmed  := true
+    f.mintick        := FX_MINTICK
+    f.chartTfMinutes := 5
+    if seq == 1
+        f.src1hOpenTime   := FX_T0
+        f.src1hCloseTime  := FX_T0 + FX_H
+        f.fvg1hBullNew    := true
+        f.fvg1hBullBottom := bottom
+        f.fvg1hBullTop    := top
+    f
+// returns [code, field]
+runM(int code) =>
+    [bottom, top, nBars, expBroad] = mSpec(code)
+    ZE.ZoneCfg    cfg = mCfg()
+    ZE.ZoneEngine e   = ZE.newEngine(cfg)
+    int cmp   = ZE.validateCfg(cfg) == 0 ? CMP_NONE : CMP_M_CFG
+    int field = -1
+    if nBars > 0
+        for bi = 0 to nBars - 1
+            if cmp == CMP_NONE
+                [h, l, expFresh] = mBar(code, bi)
+                bool committed = ZE.updateConfirmed5m(e, cfg, mFeed(bi + 1, h, l, bottom, top))
+                int idx = -1
+                int cnt = 0
+                if not committed
+                    cmp := CMP_M_COMMIT
+                else
+                    int rc = ZE.rootCount(e)
+                    if rc > 0
+                        for r = 0 to rc - 1
+                            ZE.Root rr = ZE.rootAt(e, r)
+                            if rr.category == CAT_FVG
+                                cnt += 1
+                                idx := r
+                    if cnt != 1
+                        cmp := CMP_M_ROOT
+                if cmp == CMP_NONE
+                    ZE.Root pr = ZE.rootAt(e, idx)
+                    int slot = array.get(e.rootIdOrderSlots, idx)
+                    if pr.tfCode != TF_1H or pr.direction != FVG_BULLISH or pr.nativeBottom != bottom or pr.nativeTop != top
+                        cmp := CMP_M_ROOT
+                    else if bi == 0 and expBroad >= 0 and pr.isBroadFvg != (expBroad == 1)
+                        cmp := CMP_M_BROAD
+                    else if pr.state != ROOT_ACTIVE
+                        cmp := CMP_M_STATE
+                    else if pr.fvgFresh != (expFresh == 1)
+                        cmp := CMP_M_FRESH
+                    else
+                        int posB = slot < array.size(e.w02Aux.rootFreshFvgNativeBottomOrderPositions) ? array.get(e.w02Aux.rootFreshFvgNativeBottomOrderPositions, slot) : -1
+                        int posT = slot < array.size(e.w02Aux.rootFreshFvgNativeTopOrderPositions) ? array.get(e.w02Aux.rootFreshFvgNativeTopOrderPositions, slot) : -1
+                        bool inIdx  = posB >= 0 and posT >= 0
+                        bool outIdx = posB == -1 and posT == -1
+                        if (expFresh == 1 and not inIdx) or (expFresh == 0 and not outIdx)
+                            cmp := CMP_M_FRESH_INDEX
+                if cmp != CMP_NONE and field < 0
+                    field := bi
+    [cmp, field]
+
+// ---------------- run all (for loops only) ----------------
+// returns [failures, executed, firstFail, firstCompare, firstField, intervalF, freshF, broadF, mainF, refPairs, optPairs]
+runAll() =>
+    array<int> pCodes = array.from(101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 213, 214, 301, 302, 303, 304, 305, 306, 307, 308, 401, 402, 403, 404, 405, 406, 501, 508, 601, 602, 603, 604, 605, 606, 607, 608, 701, 702, 703, 704, 801, 802, 803, 804, 805, 806, 901, 902)
+    array<int> mCodes = array.from(211, 212, 502, 503, 504, 505, 506, 507)
+    int failures = 0
+    int executed = 0
+    int firstFail = -1
+    int firstCompare = CMP_NONE
+    int firstField = -1
+    int intervalF = 0
+    int freshF = 0
+    int broadF = 0
+    int mainF = 0
+    int refPairs = 0
+    int optPairs = 0
+    for k = 0 to 58 - 1
+        int code = array.get(pCodes, k)
+        [c, f, rp, op] = runP(code)
+        executed += 1
+        refPairs += rp
+        optPairs += op
+        if c != CMP_NONE
+            failures += 1
+            int g = int(math.floor(code / 100))
+            if g == 5
+                freshF += 1
+            else if g == 6 or g == 7
+                broadF += 1
+            else
+                intervalF += 1
+            if firstFail < 0
+                firstFail    := code
+                firstCompare := c
+                firstField   := f
+    for k = 0 to 8 - 1
+        int code = array.get(mCodes, k)
+        [c, f] = runM(code)
+        executed += 1
+        if c != CMP_NONE
+            failures += 1
+            mainF += 1
+            if firstFail < 0
+                firstFail    := code
+                firstCompare := c
+                firstField   := f
+    [failures, executed, firstFail, firstCompare, firstField, intervalF, freshF, broadF, mainF, refPairs, optPairs]
+
+var int gFailures  = -1
+var int gExecuted  = 0
+var int gFirstFail = -1
+var int gFirstCmp  = -1
+var int gFirstFld  = -1
+var int gIntervalF = -1
+var int gFreshF    = -1
+var int gBroadF    = -1
+var int gMainF     = -1
+var int gRefPairs  = 0
+var int gOptPairs  = 0
+if barstate.islast and gExecuted == 0
+    [f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11] = runAll()
+    gFailures  := f1
+    gExecuted  := f2
+    gFirstFail := f3
+    gFirstCmp  := f4
+    gFirstFld  := f5
+    gIntervalF := f6
+    gFreshF    := f7
+    gBroadF    := f8
+    gMainF     := f9
+    gRefPairs  := f10
+    gOptPairs  := f11
+
+plot(190101,     "W07 B19 L1 Build",                  display = display.data_window)
+plot(gFailures,  "W07 B19 L1 Failures",               display = display.data_window)
+plot(gExecuted,  "W07 B19 L1 Fixture Count",          display = display.data_window)
+plot(gFirstFail, "W07 B19 L1 First Fail Fixture",     display = display.data_window)
+plot(gFirstCmp,  "W07 B19 L1 First Compare",          display = display.data_window)
+plot(gFirstFld,  "W07 B19 L1 First Field",            display = display.data_window)
+plot(gIntervalF, "W07 B19 L1 Interval Failures",      display = display.data_window)
+plot(gFreshF,    "W07 B19 L1 Fresh Interval Failures",display = display.data_window)
+plot(gBroadF,    "W07 B19 L1 Broad Failures",         display = display.data_window)
+plot(gMainF,     "W07 B19 L1 Main E2E Failures",      display = display.data_window)
+plot(gRefPairs,  "W07 B19 L1 Reference Pair Total",   display = display.data_window)
+plot(gOptPairs,  "W07 B19 L1 Optimized Pair Total",   display = display.data_window)
