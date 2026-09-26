@@ -80,6 +80,11 @@
 // = fresh (slot -1, IDs 0, fresh rank 0 .. freshCount - 1 in fresh allocation order: the new canonical order, then the
 // Support and the Resistance winner provenance: presence, Stage, bottom / top tick, minRootId, Root set lexicographic,
 // FVG mode, Psych presence, Psych tick). No ID, generation, counter or createdTime is written here.
+//
+// B07-D: materialized mapping (physicalMaterialized*, written by the Main materialization commit): per physical
+// Candidate the final Core slot / coreId / generationId; logical count 0 until a commit succeeds. coreIndexRelease
+// removes every Worker entry of one Core (origin nodes reclaimed to the free list, both interval tuples, every inverse
+// tuple); coreIndexClean tells whether a slot holds no Worker entry at all (slot-reuse precondition).
 // ============================================================
 library("ZoneEngineV2_W08Core_Worker", overlay = false)
 
@@ -128,6 +133,10 @@ export type W08Store
     array<int>   physicalContinuationGenerationIds
     array<int>   physicalFreshAllocationRanks
     int          physicalFreshAllocationCount = 0
+    array<int>   physicalMaterializedCoreSlots
+    array<int>   physicalMaterializedCoreIds
+    array<int>   physicalMaterializedGenerationIds
+    int          physicalMaterializedLogicalCount = 0
 
 export newStore() =>
     W08Store s = W08Store.new()
@@ -165,6 +174,9 @@ export newStore() =>
     s.physicalContinuationCoreIds                 := array.new_int(0)
     s.physicalContinuationGenerationIds           := array.new_int(0)
     s.physicalFreshAllocationRanks                := array.new_int(0)
+    s.physicalMaterializedCoreSlots               := array.new_int(0)
+    s.physicalMaterializedCoreIds                 := array.new_int(0)
+    s.physicalMaterializedGenerationIds           := array.new_int(0)
     s
 
 // currentCoreId = the Core ID of a live Core at coreSlot, ID_NONE when the slot is out of
@@ -1365,3 +1377,74 @@ export ownershipPlanBuild(W08Store store, int identityMatchCount, array<bool> co
         array.clear(store.physicalFreshAllocationRanks)
     store.physicalFreshAllocationCount := ok ? array.size(fresh) : 0
     ok ? array.size(fresh) : -1
+
+// Removes every Worker entry of the Core (coreSlot, expectedCoreId): its whole origin chain (each node reclaimed to the
+// free list, topologyRevision bumped once when a node goes), its interval tuple in both orders and every inverse-origin
+// tuple of that slot and ID. false (nothing changed) when the origin head belongs to another Core ID, a node is not a
+// live node of this slot / ID, or the interval / inverse storage is inconsistent.
+export coreIndexRelease(W08Store store, int coreSlot, int expectedCoreId) =>
+    bool ok    = coreSlot >= 0 and expectedCoreId != ID_NONE and array.size(store.inverseOriginData) % 3 == 0
+    bool hasRow = ok and coreSlot < array.size(store.coreZoneOriginRootCounts)
+    int  cur   = SLOT_INVALID
+    int  total = 0
+    if hasRow
+        cur   := array.get(store.coreZoneOriginRootHeadNodeIndexes, coreSlot)
+        total := array.get(store.coreZoneOriginRootCounts, coreSlot)
+    int  n     = 0
+    int  c     = cur
+    while ok and c != SLOT_INVALID
+        ok := c >= 0 and c < array.size(store.coreZoneOriginRootNodeRootIds) and n < total
+        if ok
+            ok := array.get(store.coreZoneOriginRootNodeLiveFlags, c) and array.get(store.coreZoneOriginRootNodeOwnerCoreSlots, c) == coreSlot and array.get(store.coreZoneOriginRootNodeExpectedCoreIds, c) == expectedCoreId
+        n += 1
+        if ok
+            c := array.get(store.coreZoneOriginRootNodeNextIndexes, c)
+    ok := ok and n == total
+    if ok
+        [iOk, iChanged] = intervalDetach(store, coreSlot, expectedCoreId)
+        ok := iOk
+    if ok
+        while cur != SLOT_INVALID
+            int nx = array.get(store.coreZoneOriginRootNodeNextIndexes, cur)
+            array.set(store.coreZoneOriginRootNodeRootIds,               cur, ID_NONE)
+            array.set(store.coreZoneOriginRootNodeNextIndexes,           cur, SLOT_INVALID)
+            array.set(store.coreZoneOriginRootNodeOwnerCoreSlots,        cur, SLOT_INVALID)
+            array.set(store.coreZoneOriginRootNodeExpectedCoreIds,       cur, ID_NONE)
+            array.set(store.coreZoneOriginRootNodeExpectedGenerationIds, cur, ID_NONE)
+            array.set(store.coreZoneOriginRootNodeLiveFlags,             cur, false)
+            array.push(store.coreZoneOriginRootNodeFreeIndexes, cur)
+            cur := nx
+        if n > 0
+            array.set(store.coreZoneOriginRootHeadNodeIndexes, coreSlot, SLOT_INVALID)
+            array.set(store.coreZoneOriginRootTailNodeIndexes, coreSlot, SLOT_INVALID)
+            array.set(store.coreZoneOriginRootCounts,          coreSlot, 0)
+            store.topologyRevision := store.topologyRevision + 1
+        array<int> d = store.inverseOriginData
+        int w = 0
+        int k = 0
+        while k < array.size(d)
+            if not (array.get(d, k + 1) == coreSlot and array.get(d, k + 2) == expectedCoreId)
+                array.set(d, w,     array.get(d, k))
+                array.set(d, w + 1, array.get(d, k + 1))
+                array.set(d, w + 2, array.get(d, k + 2))
+                w += 3
+            k += 3
+        while array.size(d) > w
+            array.pop(d)
+    ok
+
+// true when coreSlot holds no Worker entry of any Core ID: no origin node counted on the slot, no interval tuple in
+// either order and no inverse-origin tuple naming the slot.
+export coreIndexClean(W08Store store, int coreSlot) =>
+    bool clean = coreSlot >= 0 and array.size(store.coreIntervalTopOrderData) == array.size(store.coreIntervalOrderData)
+    if clean and coreSlot < array.size(store.coreZoneOriginRootCounts)
+        clean := array.get(store.coreZoneOriginRootCounts, coreSlot) == 0 and array.get(store.coreZoneOriginRootHeadNodeIndexes, coreSlot) == SLOT_INVALID
+    int k = 0
+    while clean and k < array.size(store.coreIntervalOrderData)
+        clean := array.get(store.coreIntervalOrderData, k) != coreSlot and array.get(store.coreIntervalTopOrderData, k) != coreSlot
+        k += 4
+    k := 0
+    while clean and k < array.size(store.inverseOriginData)
+        clean := array.get(store.inverseOriginData, k + 1) != coreSlot
+        k += 3
+    clean
