@@ -1,0 +1,508 @@
+//@version=6
+// ============================================================
+// ZoneEngineV2_Rebuild_ConformanceHarness_W07_B17_Structural.pine
+// W07 B17 : FVG structural invalidation conformance, end to end on the published Main.
+// Optimized side = ZoneEngineV2_Rebuild /21 through its public API only (newCfg / newEngine / newFeed /
+// updateConfirmed5m / rootCount / rootAt). The structural path is Main Stage D (w03StageDFvgFactsRaw, private);
+// Stage E (W03ETimeFvg formation, then W07 Fresh) runs after it on the same base update, then Stage F applies the
+// journal (an invalidated FVG enters ROOT_INVERSE_WAIT in the same Stage F).
+// Reference side = plain full scan kept here: per accepted base update, each TF source event is adopted when
+// baseCloseTime >= sourceCloseTime and sourceCloseTime > last adopted structural close of that TF; then every
+// active Root of that TF is checked (Bull: closeTick < NativeBottomTick, Bear: closeTick > NativeTopTick, equality
+// valid, no BreakBuffer); then this bar's formations are added; then Fresh (baseCloseTime > confirmedTime and
+// inclusive intersection). No Production helper is called by the Reference.
+// Roots are created in Production only through formation Feeds (fvg1h/4h/D Bull/Bear New). The Inverse lifecycle
+// beyond the wait entry is never driven (B18). 16 structural + 4 combined fixed deterministic fixtures, run once
+// on the last bar (no market data, no request.*, no bar_index / timenow dependency, no random).
+// Fixture numbering: 1 .. 16 = S01 .. S16, 17 .. 20 = C01 .. C04.
+// ============================================================
+indicator("ZoneEngineV2 W07 B17 Structural Conformance", overlay = false)
+
+import sekine3310/ZoneEngineV2_Rebuild/21 as ZE
+
+// exact mirrors of the current Main enums (ZoneEngineV2_Rebuild.pine)
+const int   CAT_FVG           = 4
+const int   ROOT_ACTIVE       = 1
+const int   ROOT_INVERSE_WAIT = 3
+const int   FVG_BULLISH       = 1
+const int   FVG_BEARISH       = 2
+const int   TF_1H             = 60
+const int   TF_4H             = 240
+const int   TF_D              = 1440
+const float FX_MINTICK        = 1.0
+const int   FX_T0             = 1700000000000
+const int   FX_H              = 3600000
+const int   FX_M5             = 300000
+const float FX_FAR_HIGH       = 500.0
+const float FX_FAR_LOW        = 490.0
+const int   FX_STRUCT_COUNT   = 16
+const int   FX_COMBINED_COUNT = 4
+
+// compare codes
+const int CMP_NONE          = 0
+const int CMP_CFG_INVALID   = 1
+const int CMP_NOT_COMMITTED = 2
+const int CMP_ROOT_COUNT    = 3
+const int CMP_ROOT_MISSING  = 4
+const int CMP_STATE         = 5
+const int CMP_FRESH         = 6
+const int CMP_ROOT_FIELDS   = 7
+const int CMP_INV_COUNT     = 8
+const int CMP_EXPECT_INV    = 9
+const int CMP_EXPECT_FRESH  = 10
+
+type FxSrc
+    int   tf
+    int   openTime
+    int   closeTime
+    float closePrice
+    bool  bullNew
+    float bullBottom
+    float bullTop
+    bool  bearNew
+    float bearBottom
+    float bearTop
+
+type FxBar
+    int          closeTime
+    float        high
+    float        low
+    array<FxSrc> srcs
+
+type RefWorld
+    array<int>   tfs
+    array<int>   dirs
+    array<float> bottoms
+    array<float> tops
+    array<int>   bottomTicks
+    array<int>   topTicks
+    array<int>   confs
+    array<bool>  active
+    array<bool>  fresh
+    int          last1h
+    int          last4h
+    int          lastD
+
+fxBar(array<FxBar> bars, int closeTime, float high, float low) =>
+    FxBar b = FxBar.new(closeTime, high, low, array.new<FxSrc>())
+    array.push(bars, b)
+    b
+fxSrc(FxBar b, int tf, int openTime, int closeTime, float closePrice) =>
+    FxSrc s = FxSrc.new(tf, openTime, closeTime, closePrice, false, na, na, false, na, na)
+    array.push(b.srcs, s)
+    s
+fxBull(FxSrc s, float bottom, float top) =>
+    s.bullNew    := true
+    s.bullBottom := bottom
+    s.bullTop    := top
+    true
+fxBear(FxSrc s, float bottom, float top) =>
+    s.bearNew    := true
+    s.bearBottom := bottom
+    s.bearTop    := top
+    true
+// formation bar (1H [T0, T0 + 1H], base close at the source close) then one structural 1H source on the next hour,
+// adopted `after` ms after its close
+fxTwo(array<FxBar> bars, bool bull, float closePrice, int after) =>
+    FxBar b1 = fxBar(bars, FX_T0 + FX_H, FX_FAR_HIGH, FX_FAR_LOW)
+    FxSrc s1 = fxSrc(b1, TF_1H, FX_T0, FX_T0 + FX_H, na)
+    if bull
+        fxBull(s1, 100.0, 110.0)
+    else
+        fxBear(s1, 100.0, 110.0)
+    FxBar b2 = fxBar(bars, FX_T0 + 2 * FX_H + after, FX_FAR_HIGH, FX_FAR_LOW)
+    fxSrc(b2, TF_1H, FX_T0 + FX_H, FX_T0 + 2 * FX_H, closePrice)
+    array.size(bars)
+
+// returns [bars, expectInvalidations, expectFreshEnded]
+fxBuild(int fx) =>
+    array<FxBar> bars = array.new<FxBar>()
+    int expectInv   = 0
+    int expectFresh = 0
+    if fx == 1
+        // S01 Bull close = Distal + 1 tick : valid
+        fxTwo(bars, true, 101.0, FX_M5)
+    else if fx == 2
+        // S02 Bull close = Distal : valid
+        fxTwo(bars, true, 100.0, FX_M5)
+    else if fx == 3
+        // S03 Bull close = Distal - 1 tick : invalidate
+        fxTwo(bars, true, 99.0, FX_M5)
+        expectInv := 1
+    else if fx == 4
+        // S04 Bear close = Distal - 1 tick : valid
+        fxTwo(bars, false, 109.0, FX_M5)
+    else if fx == 5
+        // S05 Bear close = Distal : valid
+        fxTwo(bars, false, 110.0, FX_M5)
+    else if fx == 6
+        // S06 Bear close = Distal + 1 tick : invalidate
+        fxTwo(bars, false, 111.0, FX_M5)
+        expectInv := 1
+    else if fx == 7
+        // S07 Bull far below Distal : invalidate (no BreakBuffer)
+        fxTwo(bars, true, 20.0, FX_M5)
+        expectInv := 1
+    else if fx == 8
+        // S08 Bear far above Distal : invalidate
+        fxTwo(bars, false, 400.0, FX_M5)
+        expectInv := 1
+    else if fx == 9
+        // S09 1H Root, only a new 4H source event (close far below): the 1H Root is not evaluated
+        FxBar b1 = fxBar(bars, FX_T0 + FX_H, FX_FAR_HIGH, FX_FAR_LOW)
+        fxBull(fxSrc(b1, TF_1H, FX_T0, FX_T0 + FX_H, na), 100.0, 110.0)
+        FxBar b2 = fxBar(bars, FX_T0 + 4 * FX_H + FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        fxSrc(b2, TF_4H, FX_T0, FX_T0 + 4 * FX_H, 20.0)
+    else if fx == 10
+        // S10 4H Root, only a new Daily source event: the 4H Root is not evaluated
+        FxBar b1 = fxBar(bars, FX_T0 + 4 * FX_H, FX_FAR_HIGH, FX_FAR_LOW)
+        fxBull(fxSrc(b1, TF_4H, FX_T0, FX_T0 + 4 * FX_H, na), 100.0, 110.0)
+        FxBar b2 = fxBar(bars, FX_T0 + 24 * FX_H + FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        fxSrc(b2, TF_D, FX_T0, FX_T0 + 24 * FX_H, 20.0)
+    else if fx == 11
+        // S11 baseCloseTime < sourceCloseTime : not adopted
+        FxBar b1 = fxBar(bars, FX_T0 + FX_H, FX_FAR_HIGH, FX_FAR_LOW)
+        fxBull(fxSrc(b1, TF_1H, FX_T0, FX_T0 + FX_H, na), 100.0, 110.0)
+        FxBar b2 = fxBar(bars, FX_T0 + 2 * FX_H - FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        fxSrc(b2, TF_1H, FX_T0 + FX_H, FX_T0 + 2 * FX_H, 20.0)
+    else if fx == 12
+        // S12 baseCloseTime == sourceCloseTime : first adoption
+        fxTwo(bars, true, 20.0, 0)
+        expectInv := 1
+    else if fx == 13
+        // S13 the same source bar presented again on the next base: no second processing
+        FxBar b1 = fxBar(bars, FX_T0 + FX_H, FX_FAR_HIGH, FX_FAR_LOW)
+        fxBull(fxSrc(b1, TF_1H, FX_T0, FX_T0 + FX_H, na), 100.0, 110.0)
+        FxBar b2 = fxBar(bars, FX_T0 + 2 * FX_H + FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        fxSrc(b2, TF_1H, FX_T0 + FX_H, FX_T0 + 2 * FX_H, 105.0)
+        FxBar b3 = fxBar(bars, FX_T0 + 2 * FX_H + 2 * FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        fxSrc(b3, TF_1H, FX_T0 + FX_H, FX_T0 + 2 * FX_H, 20.0)
+    else if fx == 14
+        // S14 1H / 4H / Daily Roots on the same range, only a new 4H source: only the 4H Root is evaluated
+        FxBar b1 = fxBar(bars, FX_T0 + 24 * FX_H, FX_FAR_HIGH, FX_FAR_LOW)
+        fxBull(fxSrc(b1, TF_1H, FX_T0 + 23 * FX_H, FX_T0 + 24 * FX_H, na), 100.0, 110.0)
+        fxBull(fxSrc(b1, TF_4H, FX_T0 + 20 * FX_H, FX_T0 + 24 * FX_H, na), 100.0, 110.0)
+        fxBull(fxSrc(b1, TF_D,  FX_T0,             FX_T0 + 24 * FX_H, na), 100.0, 110.0)
+        FxBar b2 = fxBar(bars, FX_T0 + 28 * FX_H + FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        fxSrc(b2, TF_4H, FX_T0 + 24 * FX_H, FX_T0 + 28 * FX_H, 20.0)
+        expectInv := 1
+    else if fx == 15
+        // S15 same TF, several Roots, several invalidations
+        FxBar b1 = fxBar(bars, FX_T0 + FX_H + FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        FxSrc s1 = fxSrc(b1, TF_1H, FX_T0, FX_T0 + FX_H, na)
+        fxBull(s1, 100.0, 110.0)
+        fxBear(s1, 200.0, 210.0)
+        FxBar b2 = fxBar(bars, FX_T0 + 2 * FX_H + FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        fxBull(fxSrc(b2, TF_1H, FX_T0 + FX_H, FX_T0 + 2 * FX_H, na), 95.0, 105.0)
+        FxBar b3 = fxBar(bars, FX_T0 + 3 * FX_H + FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        fxSrc(b3, TF_1H, FX_T0 + 2 * FX_H, FX_T0 + 3 * FX_H, 94.0)
+        expectInv := 2
+    else if fx == 16
+        // S16 an already structurally inactive Root next to an active one: only the active one is evaluated
+        FxBar b1 = fxBar(bars, FX_T0 + FX_H + FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        fxBull(fxSrc(b1, TF_1H, FX_T0, FX_T0 + FX_H, na), 100.0, 110.0)
+        FxBar b2 = fxBar(bars, FX_T0 + 2 * FX_H + FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        fxBull(fxSrc(b2, TF_1H, FX_T0 + FX_H, FX_T0 + 2 * FX_H, 99.0), 60.0, 70.0)
+        FxBar b3 = fxBar(bars, FX_T0 + 3 * FX_H + FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        fxSrc(b3, TF_1H, FX_T0 + 2 * FX_H, FX_T0 + 3 * FX_H, 50.0)
+        expectInv := 2
+    else if fx == 17
+        // C01 later 5m bar hits the NativeRange, no structural source: Fresh ends, state stays active
+        FxBar b1 = fxBar(bars, FX_T0 + FX_H, FX_FAR_HIGH, FX_FAR_LOW)
+        fxBull(fxSrc(b1, TF_1H, FX_T0, FX_T0 + FX_H, na), 100.0, 110.0)
+        fxBar(bars, FX_T0 + FX_H + 2 * FX_M5, 120.0, 108.0)
+        expectFresh := 1
+    else if fx == 18
+        // C02 no 5m hit, structural invalidation: Fresh kept, structural transition
+        fxTwo(bars, true, 99.0, FX_M5)
+        expectInv := 1
+    else if fx == 19
+        // C03 the same accepted base update hits the NativeRange and invalidates (Stage D, then Stage E Fresh)
+        FxBar b1 = fxBar(bars, FX_T0 + FX_H, FX_FAR_HIGH, FX_FAR_LOW)
+        fxBull(fxSrc(b1, TF_1H, FX_T0, FX_T0 + FX_H, na), 100.0, 110.0)
+        FxBar b2 = fxBar(bars, FX_T0 + 2 * FX_H + FX_M5, 108.0, 95.0)
+        fxSrc(b2, TF_1H, FX_T0 + FX_H, FX_T0 + 2 * FX_H, 99.0)
+        expectInv   := 1
+        expectFresh := 1
+    else
+        // C04 Fresh already false, later source close invalidates: no Fresh re-evaluation, structural transition
+        FxBar b1 = fxBar(bars, FX_T0 + FX_H, FX_FAR_HIGH, FX_FAR_LOW)
+        fxBull(fxSrc(b1, TF_1H, FX_T0, FX_T0 + FX_H, na), 100.0, 110.0)
+        fxBar(bars, FX_T0 + FX_H + 2 * FX_M5, 120.0, 108.0)
+        FxBar b3 = fxBar(bars, FX_T0 + 2 * FX_H + FX_M5, FX_FAR_HIGH, FX_FAR_LOW)
+        fxSrc(b3, TF_1H, FX_T0 + FX_H, FX_T0 + 2 * FX_H, 99.0)
+        expectInv   := 1
+        expectFresh := 1
+    [bars, expectInv, expectFresh]
+
+// ---------------- Reference : plain full scan ----------------
+refNew() =>
+    RefWorld.new(array.new_int(0), array.new_int(0), array.new_float(0), array.new_float(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_bool(0), int(na), int(na), int(na))
+refAddRoot(RefWorld r, int tf, int dir, float bottom, float top, int conf) =>
+    array.push(r.tfs,         tf)
+    array.push(r.dirs,        dir)
+    array.push(r.bottoms,     bottom)
+    array.push(r.tops,        top)
+    array.push(r.bottomTicks, int(math.round(bottom / FX_MINTICK)))
+    array.push(r.topTicks,    int(math.round(top    / FX_MINTICK)))
+    array.push(r.confs,       conf)
+    array.push(r.active,      true)
+    array.push(r.fresh,       true)
+    array.size(r.tfs)
+// one accepted base update; returns this bar's structural invalidation count
+refStep(RefWorld r, FxBar bar) =>
+    int inv = 0
+    int t = 0
+    while t < 3
+        int tf = t == 0 ? TF_1H : t == 1 ? TF_4H : TF_D
+        int si = 0
+        while si < array.size(bar.srcs)
+            FxSrc s = array.get(bar.srcs, si)
+            if s.tf == tf
+                int  last  = tf == TF_1H ? r.last1h : tf == TF_4H ? r.last4h : r.lastD
+                bool adopt = not na(s.openTime) and not na(s.closeTime) and bar.closeTime >= s.closeTime and (na(last) or s.closeTime > last)
+                if adopt
+                    if tf == TF_1H
+                        r.last1h := s.closeTime
+                    else if tf == TF_4H
+                        r.last4h := s.closeTime
+                    else
+                        r.lastD := s.closeTime
+                    if not na(s.closePrice)
+                        int closeTick = int(math.round(s.closePrice / FX_MINTICK))
+                        int k = 0
+                        while k < array.size(r.tfs)
+                            if array.get(r.tfs, k) == tf and array.get(r.active, k)
+                                bool broken = array.get(r.dirs, k) == FVG_BULLISH ? closeTick < array.get(r.bottomTicks, k) : closeTick > array.get(r.topTicks, k)
+                                if broken
+                                    array.set(r.active, k, false)
+                                    inv += 1
+                            k += 1
+            si += 1
+        t += 1
+    int fi = 0
+    while fi < array.size(bar.srcs)
+        FxSrc fs = array.get(bar.srcs, fi)
+        if fs.bullNew
+            refAddRoot(r, fs.tf, FVG_BULLISH, fs.bullBottom, fs.bullTop, fs.closeTime)
+        if fs.bearNew
+            refAddRoot(r, fs.tf, FVG_BEARISH, fs.bearBottom, fs.bearTop, fs.closeTime)
+        fi += 1
+    int hiTick = int(math.round(bar.high / FX_MINTICK))
+    int loTick = int(math.round(bar.low  / FX_MINTICK))
+    int rk = 0
+    while rk < array.size(r.tfs)
+        if array.get(r.fresh, rk) and bar.closeTime > array.get(r.confs, rk) and hiTick >= array.get(r.bottomTicks, rk) and loTick <= array.get(r.topTicks, rk)
+            array.set(r.fresh, rk, false)
+        rk += 1
+    inv
+
+// ---------------- Optimized : Main /21 public API ----------------
+fxCfg() =>
+    ZE.ZoneCfg cfg = ZE.newCfg()
+    cfg.useMa          := false
+    cfg.useSwing       := false
+    cfg.useAccum       := false
+    cfg.useTimeHl      := false
+    cfg.usePsych       := false
+    cfg.useFvg         := true
+    cfg.chartTfMinutes := 5
+    cfg.mintick        := FX_MINTICK
+    cfg
+optFeed(FxBar bar, int seq) =>
+    ZE.Feed f = ZE.newFeed()
+    float mid = (bar.high + bar.low) / 2.0
+    f.baseOpen       := mid
+    f.baseHigh       := bar.high
+    f.baseLow        := bar.low
+    f.baseClose      := mid
+    f.basePrevClose  := mid
+    f.baseOpenTime   := bar.closeTime - FX_M5
+    f.baseCloseTime  := bar.closeTime
+    f.baseSeq        := seq
+    f.baseConfirmed  := true
+    f.mintick        := FX_MINTICK
+    f.chartTfMinutes := 5
+    int si = 0
+    while si < array.size(bar.srcs)
+        FxSrc s = array.get(bar.srcs, si)
+        if s.tf == TF_1H
+            f.src1hOpenTime   := s.openTime
+            f.src1hCloseTime  := s.closeTime
+            f.htf1hClose      := s.closePrice
+            f.fvg1hBullNew    := s.bullNew
+            f.fvg1hBullBottom := s.bullBottom
+            f.fvg1hBullTop    := s.bullTop
+            f.fvg1hBearNew    := s.bearNew
+            f.fvg1hBearBottom := s.bearBottom
+            f.fvg1hBearTop    := s.bearTop
+        else if s.tf == TF_4H
+            f.src4hOpenTime   := s.openTime
+            f.src4hCloseTime  := s.closeTime
+            f.htf4hClose      := s.closePrice
+            f.fvg4hBullNew    := s.bullNew
+            f.fvg4hBullBottom := s.bullBottom
+            f.fvg4hBullTop    := s.bullTop
+            f.fvg4hBearNew    := s.bearNew
+            f.fvg4hBearBottom := s.bearBottom
+            f.fvg4hBearTop    := s.bearTop
+        else
+            f.srcDOpenTime    := s.openTime
+            f.srcDCloseTime   := s.closeTime
+            f.htfDClose       := s.closePrice
+            f.fvgDBullNew     := s.bullNew
+            f.fvgDBullBottom  := s.bullBottom
+            f.fvgDBullTop     := s.bullTop
+            f.fvgDBearNew     := s.bearNew
+            f.fvgDBearBottom  := s.bearBottom
+            f.fvgDBearTop     := s.bearTop
+        si += 1
+    f
+optFvgCount(ZE.ZoneEngine e) =>
+    int cnt = 0
+    int i = 0
+    while i < ZE.rootCount(e)
+        ZE.Root pr = ZE.rootAt(e, i)
+        if pr.category == CAT_FVG
+            cnt += 1
+        i += 1
+    cnt
+// the unique Production FVG Root with this TF / direction / NativeRange, or -1
+optFind(ZE.ZoneEngine e, int tf, int dir, float bottom, float top) =>
+    int found = -1
+    int cnt = 0
+    int i = 0
+    while i < ZE.rootCount(e)
+        ZE.Root pr = ZE.rootAt(e, i)
+        if pr.category == CAT_FVG and pr.tfCode == tf and pr.direction == dir and pr.nativeBottom == bottom and pr.nativeTop == top
+            cnt += 1
+            found := i
+        i += 1
+    cnt == 1 ? found : -1
+
+// runs one fixture; returns [code, field, refInvalidations, optInvalidations]
+runFixture(int fx) =>
+    [bars, expectInv, expectFresh] = fxBuild(fx)
+    RefWorld      r   = refNew()
+    ZE.ZoneCfg    cfg = fxCfg()
+    ZE.ZoneEngine e   = ZE.newEngine(cfg)
+    array<bool> optPrevActive = array.new_bool(0)
+    int code   = ZE.validateCfg(cfg) == 0 ? CMP_NONE : CMP_CFG_INVALID
+    int field  = -1
+    int refInv = 0
+    int optInv = 0
+    int bi = 0
+    while code == CMP_NONE and bi < array.size(bars)
+        FxBar bar = array.get(bars, bi)
+        int refInvBar = refStep(r, bar)
+        refInv += refInvBar
+        bool committed = ZE.updateConfirmed5m(e, cfg, optFeed(bar, bi + 1))
+        if not committed
+            code  := CMP_NOT_COMMITTED
+            field := bi
+        else if optFvgCount(e) != array.size(r.tfs)
+            code  := CMP_ROOT_COUNT
+            field := bi
+        int optInvBar = 0
+        int k = 0
+        while code == CMP_NONE and k < array.size(r.tfs)
+            int   tf     = array.get(r.tfs, k)
+            int   dir    = array.get(r.dirs, k)
+            float bottom = array.get(r.bottoms, k)
+            float top    = array.get(r.tops, k)
+            int idx = optFind(e, tf, dir, bottom, top)
+            if idx < 0
+                code  := CMP_ROOT_MISSING
+                field := bi * 100 + k
+            else
+                ZE.Root pr = ZE.rootAt(e, idx)
+                while array.size(optPrevActive) <= k
+                    array.push(optPrevActive, true)
+                bool nowActive = pr.state == ROOT_ACTIVE
+                if array.get(optPrevActive, k) and not nowActive
+                    optInvBar += 1
+                array.set(optPrevActive, k, nowActive)
+                int expectState = array.get(r.active, k) ? ROOT_ACTIVE : ROOT_INVERSE_WAIT
+                if pr.state != expectState
+                    code  := CMP_STATE
+                    field := bi * 100 + k
+                else if pr.fvgFresh != array.get(r.fresh, k)
+                    code  := CMP_FRESH
+                    field := bi * 100 + k
+                else if pr.tfCode != tf or pr.direction != dir or pr.nativeBottom != bottom or pr.nativeTop != top
+                    code  := CMP_ROOT_FIELDS
+                    field := bi * 100 + k
+            k += 1
+        optInv += optInvBar
+        if code == CMP_NONE and optInvBar != refInvBar
+            code  := CMP_INV_COUNT
+            field := bi
+        bi += 1
+    int refFreshEnded = 0
+    int k2 = 0
+    while k2 < array.size(r.fresh)
+        if not array.get(r.fresh, k2)
+            refFreshEnded += 1
+        k2 += 1
+    if code == CMP_NONE and refInv != expectInv
+        code := CMP_EXPECT_INV
+    if code == CMP_NONE and refFreshEnded != expectFresh
+        code := CMP_EXPECT_FRESH
+    [code, field, refInv, optInv]
+
+// returns [structFailures, combinedFailures, firstFail, firstCompare, firstField, refInvTotal, optInvTotal]
+runAll() =>
+    int structFailures   = 0
+    int combinedFailures = 0
+    int firstFail    = -1
+    int firstCompare = CMP_NONE
+    int firstField   = -1
+    int refTotal = 0
+    int optTotal = 0
+    int fx = 1
+    while fx <= FX_STRUCT_COUNT + FX_COMBINED_COUNT
+        [code, field, refInv, optInv] = runFixture(fx)
+        refTotal += refInv
+        optTotal += optInv
+        if code != CMP_NONE
+            if fx <= FX_STRUCT_COUNT
+                structFailures += 1
+            else
+                combinedFailures += 1
+            if firstFail < 0
+                firstFail    := fx
+                firstCompare := code
+                firstField   := field
+        fx += 1
+    [structFailures, combinedFailures, firstFail, firstCompare, firstField, refTotal, optTotal]
+
+var int gStructFailures   = -1
+var int gStructCount      = 0
+var int gCombinedFailures = -1
+var int gCombinedCount    = 0
+var int gFirstFail        = -1
+var int gFirstCompare     = -1
+var int gFirstField       = -1
+var int gRefInv           = 0
+var int gOptInv           = 0
+if barstate.islast and gStructCount == 0
+    [sf, cf, ff, fc, fd, ri, oi] = runAll()
+    gStructFailures   := sf
+    gStructCount      := FX_STRUCT_COUNT
+    gCombinedFailures := cf
+    gCombinedCount    := FX_COMBINED_COUNT
+    gFirstFail        := ff
+    gFirstCompare     := fc
+    gFirstField       := fd
+    gRefInv           := ri
+    gOptInv           := oi
+
+plot(gStructFailures,   "W07 B17 Structural Failures",           display = display.data_window)
+plot(gStructCount,      "W07 B17 Structural Fixture Count",      display = display.data_window)
+plot(gFirstFail,        "W07 B17 Structural First Fail Fixture", display = display.data_window)
+plot(gFirstCompare,     "W07 B17 Structural First Compare",      display = display.data_window)
+plot(gFirstField,       "W07 B17 Structural First Field",        display = display.data_window)
+plot(gRefInv,           "W07 B17 Structural Ref Invalidations",  display = display.data_window)
+plot(gOptInv,           "W07 B17 Structural Opt Invalidations",  display = display.data_window)
+plot(gCombinedCount,    "W07 B17 Combined Fixture Count",        display = display.data_window)
+plot(gCombinedFailures, "W07 B17 Combined Failures",             display = display.data_window)

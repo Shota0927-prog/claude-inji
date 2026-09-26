@@ -1,0 +1,382 @@
+//@version=6
+// ============================================================
+// ZoneEngineV2_Rebuild_ConformanceHarness_W07_B17_Fresh.pine
+// W07 B17 : FVG Fresh conformance. Optimized side = W07Fvg /10 freshFacts (the live Stage E Fresh entry, fed
+// with a fixture-built Fresh index); Reference side = plain full scan of the three TF Fresh sets in legacy order
+// (1H set, 4H set, D set, each by set position). The Reference never calls freshFacts / fvgIntervalQuery /
+// fvgIntervalOrderBuild. 16 fixed deterministic fixtures, run once on the last bar (no market data, no
+// request.*, no bar_index / timenow dependency, no random).
+// Invalid input (F15 / F16): only the final success / failure and the committed FRESH_END rows are compared
+// (a failure commits nothing); the optimized side's temporary scratch is not compared.
+// ============================================================
+indicator("ZoneEngineV2 W07 B17 Fresh Conformance", overlay = false)
+
+import sekine3310/ZoneEngineV2_W07Fvg_Worker/10 as W07Fvg
+
+const int   ID_NONE           = 0
+const int   CAT_FVG           = 4
+const int   ROOT_ACTIVE       = 1
+const int   ROOT_INVALIDATED  = 2
+const int   ROOT_INVERSE_WAIT = 3
+const int   ROOT_INVERSE_ACTIVE = 4
+const int   FVG_BULLISH       = 1
+const int   FVG_BEARISH       = 2
+const int   TF_1H             = 60
+const int   TF_4H             = 240
+const int   TF_D              = 1440
+const int   JOP_FVG_FRESH_END = 6
+const int   JGROUP_E3         = 3
+const float FX_MINTICK        = 1.0
+const int   FX_T0             = 1700000000000
+const int   FX_H              = 3600000
+const int   FX_M5             = 300000
+const int   FX_CONF           = FX_T0 + FX_H
+const int   FX_COUNT          = 16
+
+// compare codes
+const int CMP_NONE           = 0
+const int CMP_FAILURE_FLAG   = 1
+const int CMP_END_COUNT      = 2
+const int CMP_END_ROOT       = 3
+const int CMP_ROW_PAYLOAD    = 4
+const int CMP_EXPECT_FAILURE = 5
+const int CMP_EXPECT_COUNT   = 6
+
+type FreshWorld
+    array<int>   rootIds
+    array<bool>  live
+    array<int>   cats
+    array<int>   subtypes
+    array<int>   tfs
+    array<int>   originKeys
+    array<int>   originTimes
+    array<int>   originEndTimes
+    array<int>   confs
+    array<float> nativeBottoms
+    array<float> nativeTops
+    array<int>   bottomTicks
+    array<int>   topTicks
+    array<int>   states
+    array<int>   dirs
+    array<bool>  freshFlags
+    array<bool>  broadFlags
+    array<int>   setPositions
+    array<int>   set1h
+    array<int>   set4h
+    array<int>   setD
+    array<int>   bottomOrder
+    array<int>   topOrder
+
+fxNewWorld() =>
+    FreshWorld.new(array.new_int(0), array.new_bool(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_float(0), array.new_float(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_bool(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0))
+
+// one Root slot (SoA push); ticks from the same mintick rounding as the Production store
+fxRoot(FreshWorld w, int rootId, int tf, int dir, float bottom, float top, bool fresh) =>
+    array.push(w.rootIds,        rootId)
+    array.push(w.live,           true)
+    array.push(w.cats,           CAT_FVG)
+    array.push(w.subtypes,       0)
+    array.push(w.tfs,            tf)
+    array.push(w.originKeys,     1000 + rootId)
+    array.push(w.originTimes,    FX_CONF - FX_H)
+    array.push(w.originEndTimes, FX_CONF)
+    array.push(w.confs,          FX_CONF)
+    array.push(w.nativeBottoms,  bottom)
+    array.push(w.nativeTops,     top)
+    array.push(w.bottomTicks,    na(bottom) ? int(na) : int(math.round(bottom / FX_MINTICK)))
+    array.push(w.topTicks,       na(top)    ? int(na) : int(math.round(top    / FX_MINTICK)))
+    array.push(w.states,         ROOT_ACTIVE)
+    array.push(w.dirs,           dir)
+    array.push(w.freshFlags,     fresh)
+    array.push(w.broadFlags,     false)
+    array.push(w.setPositions,   -1)
+    array.size(w.rootIds) - 1
+
+// append a slot to the TF Fresh set (call order = set position order)
+fxPushSet(FreshWorld w, int slot, int tf) =>
+    array<int> s = tf == TF_1H ? w.set1h : tf == TF_4H ? w.set4h : w.setD
+    if slot >= 0 and slot < array.size(w.setPositions)
+        array.set(w.setPositions, slot, array.size(s))
+    array.push(s, slot)
+    array.size(s)
+
+// optimized-side input only: the Fresh index over every Fresh set slot, bottom order by (bottomTick, rootId) and
+// top order by (topTick, rootId); built here by insertion so malformed fixtures can still be expressed
+fxKeyTick(FreshWorld w, int slot, bool bottom) =>
+    slot >= 0 and slot < array.size(w.rootIds) ? (bottom ? array.get(w.bottomTicks, slot) : array.get(w.topTicks, slot)) : 0
+fxKeyId(FreshWorld w, int slot) =>
+    slot >= 0 and slot < array.size(w.rootIds) ? array.get(w.rootIds, slot) : 0
+fxInsert(FreshWorld w, array<int> order, int slot, bool bottom) =>
+    array.push(order, slot)
+    int k = array.size(order) - 1
+    while k > 0
+        int prev = array.get(order, k - 1)
+        int pt = fxKeyTick(w, prev, bottom)
+        int st = fxKeyTick(w, slot, bottom)
+        bool greater = pt > st or (pt == st and fxKeyId(w, prev) > fxKeyId(w, slot))
+        if greater
+            array.set(order, k, prev)
+            array.set(order, k - 1, slot)
+            k -= 1
+        else
+            k := 0
+    array.size(order)
+fxBuildIndex(FreshWorld w) =>
+    int t = 0
+    while t < 3
+        array<int> s = t == 0 ? w.set1h : t == 1 ? w.set4h : w.setD
+        int p = 0
+        while p < array.size(s)
+            fxInsert(w, w.bottomOrder, array.get(s, p), true)
+            fxInsert(w, w.topOrder,    array.get(s, p), false)
+            p += 1
+        t += 1
+    array.size(w.bottomOrder)
+
+// ---------------- Reference : plain full scan of the Fresh sets ----------------
+refRootValid(FreshWorld w, int slot, int tf) =>
+    bool ok = slot >= 0 and slot < array.size(w.rootIds)
+    if ok
+        int b = array.get(w.bottomTicks, slot)
+        int t = array.get(w.topTicks, slot)
+        int st = array.get(w.states, slot)
+        int d = array.get(w.dirs, slot)
+        ok := array.get(w.live, slot) and array.get(w.rootIds, slot) != ID_NONE and array.get(w.cats, slot) == CAT_FVG and array.get(w.tfs, slot) == tf and array.get(w.freshFlags, slot) and (d == FVG_BULLISH or d == FVG_BEARISH) and not na(b) and not na(t) and b <= t and not na(array.get(w.confs, slot)) and not na(array.get(w.originTimes, slot)) and array.get(w.originKeys, slot) != ID_NONE and (st == ROOT_ACTIVE or st == ROOT_INVALIDATED or st == ROOT_INVERSE_WAIT or st == ROOT_INVERSE_ACTIVE)
+    ok
+refFreshEnds(FreshWorld w, float baseHigh, float baseLow, int baseCloseTime, array<int> outSlots) =>
+    bool ok = true
+    int hiTick = int(math.round(baseHigh / FX_MINTICK))
+    int loTick = int(math.round(baseLow  / FX_MINTICK))
+    int t = 0
+    while ok and t < 3
+        int tf = t == 0 ? TF_1H : t == 1 ? TF_4H : TF_D
+        array<int> s = t == 0 ? w.set1h : t == 1 ? w.set4h : w.setD
+        int p = 0
+        while ok and p < array.size(s)
+            int slot = array.get(s, p)
+            ok := refRootValid(w, slot, tf)
+            if ok
+                bool afterFormation = baseCloseTime > array.get(w.confs, slot)
+                bool touched = hiTick >= array.get(w.bottomTicks, slot) and loTick <= array.get(w.topTicks, slot)
+                if afterFormation and touched
+                    array.push(outSlots, slot)
+            p += 1
+        t += 1
+    if not ok
+        array.clear(outSlots)
+    ok
+
+// ---------------- Optimized : W07Fvg /10 freshFacts ----------------
+optFreshEnds(FreshWorld w, float baseHigh, float baseLow, int baseCloseTime, array<int> outSlots, array<int> outIds) =>
+    array<int>   jOps       = array.new_int(0)
+    array<int>   jGroups    = array.new_int(0)
+    array<int>   jTargets   = array.new_int(0)
+    array<int>   jExpected  = array.new_int(0)
+    array<int>   jCats      = array.new_int(0)
+    array<int>   jSubtypes  = array.new_int(0)
+    array<int>   jTfs       = array.new_int(0)
+    array<int>   jOKeys     = array.new_int(0)
+    array<int>   jOTimes    = array.new_int(0)
+    array<int>   jOEnds     = array.new_int(0)
+    array<int>   jConfs     = array.new_int(0)
+    array<float> jPoints    = array.new_float(0)
+    array<float> jBottoms   = array.new_float(0)
+    array<float> jTops      = array.new_float(0)
+    array<int>   jOldStates = array.new_int(0)
+    array<int>   jNewStates = array.new_int(0)
+    array<bool>  jFresh     = array.new_bool(0)
+    array<bool>  jBroad     = array.new_bool(0)
+    array<int>   jDirs      = array.new_int(0)
+    array<int>   jOldMasks  = array.new_int(0)
+    array<int>   jNewMasks  = array.new_int(0)
+    array<int>   jPairKeys  = array.new_int(0)
+    array<int>   jSlopes    = array.new_int(0)
+    [cnt, violation] = W07Fvg.freshFacts(true, baseHigh, baseLow, baseCloseTime, FX_MINTICK, w.bottomOrder, w.topOrder, w.rootIds, w.live, w.cats, w.subtypes, w.tfs, w.originKeys, w.originTimes, w.originEndTimes, w.confs, w.nativeBottoms, w.nativeTops, w.bottomTicks, w.topTicks, w.states, w.dirs, w.freshFlags, w.broadFlags, w.setPositions, w.set1h, w.set4h, w.setD, jOps, jGroups, jTargets, jExpected, jCats, jSubtypes, jTfs, jOKeys, jOTimes, jOEnds, jConfs, jPoints, jBottoms, jTops, jOldStates, jNewStates, jFresh, jBroad, jDirs, jOldMasks, jNewMasks, jPairKeys, jSlopes, 0, false)
+    bool payloadOk = true
+    if not violation
+        int r = 0
+        while r < cnt
+            payloadOk := payloadOk and array.get(jOps, r) == JOP_FVG_FRESH_END and array.get(jGroups, r) == JGROUP_E3 and array.get(jCats, r) == CAT_FVG
+            array.push(outSlots, array.get(jTargets, r))
+            array.push(outIds,   array.get(jExpected, r))
+            r += 1
+    [not violation, payloadOk]
+
+// ---------------- fixtures ----------------
+// returns [world, baseHigh, baseLow, baseCloseTime, expectOk, expectEnds]
+fxBuild(int fx) =>
+    FreshWorld w = fxNewWorld()
+    float hi = na
+    float lo = na
+    int   bct = FX_CONF + FX_M5
+    bool  expectOk = true
+    int   expectEnds = 0
+    if fx == 1
+        // F01 formation bar itself (baseCloseTime == confirmedTime) intersecting: Fresh kept
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        fxPushSet(w, s0, TF_1H)
+        hi := 108.0, lo := 105.0, bct := FX_CONF
+    else if fx == 2
+        // F02 later bar, fully below
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        fxPushSet(w, s0, TF_1H)
+        hi := 90.0, lo := 80.0
+    else if fx == 3
+        // F03 later bar, fully above
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        fxPushSet(w, s0, TF_1H)
+        hi := 140.0, lo := 130.0
+    else if fx == 4
+        // F04 baseHigh == NativeBottom
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        fxPushSet(w, s0, TF_1H)
+        hi := 100.0, lo := 90.0, expectEnds := 1
+    else if fx == 5
+        // F05 baseLow == NativeTop
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        fxPushSet(w, s0, TF_1H)
+        hi := 120.0, lo := 110.0, expectEnds := 1
+    else if fx == 6
+        // F06 base range inside NativeRange
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        fxPushSet(w, s0, TF_1H)
+        hi := 108.0, lo := 102.0, expectEnds := 1
+    else if fx == 7
+        // F07 base range covers NativeRange
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        fxPushSet(w, s0, TF_1H)
+        hi := 120.0, lo := 90.0, expectEnds := 1
+    else if fx == 8
+        // F08 up to 1 tick below NativeBottom, no contact
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        fxPushSet(w, s0, TF_1H)
+        hi := 99.0, lo := 90.0
+    else if fx == 9
+        // F09 from 1 tick above NativeTop, no contact
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        fxPushSet(w, s0, TF_1H)
+        hi := 120.0, lo := 111.0
+    else if fx == 10
+        // F10 zero-width NativeRange touched
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 105.0, 105.0, true)
+        fxPushSet(w, s0, TF_1H)
+        hi := 110.0, lo := 100.0, expectEnds := 1
+    else if fx == 11
+        // F11 two Roots: one hit, one non-hit
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        int s1 = fxRoot(w, 2, TF_1H, FVG_BEARISH, 200.0, 210.0, true)
+        fxPushSet(w, s0, TF_1H)
+        fxPushSet(w, s1, TF_1H)
+        hi := 108.0, lo := 105.0, expectEnds := 1
+    else if fx == 12
+        // F12 three Roots on the same range; set order [2, 0, 1] differs from slot / rootId order
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        int s1 = fxRoot(w, 2, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        int s2 = fxRoot(w, 3, TF_1H, FVG_BEARISH, 100.0, 110.0, true)
+        fxPushSet(w, s2, TF_1H)
+        fxPushSet(w, s0, TF_1H)
+        fxPushSet(w, s1, TF_1H)
+        hi := 108.0, lo := 105.0, expectEnds := 3
+    else if fx == 13
+        // F13 1H / 4H / Daily mixed hits; legacy order 1H set [s3, s1], 4H [s0], D [s2]
+        int s0 = fxRoot(w, 1, TF_4H, FVG_BULLISH, 100.0, 110.0, true)
+        int s1 = fxRoot(w, 2, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        int s2 = fxRoot(w, 3, TF_D,  FVG_BEARISH, 100.0, 110.0, true)
+        int s3 = fxRoot(w, 4, TF_1H, FVG_BEARISH, 104.0, 106.0, true)
+        fxPushSet(w, s3, TF_1H)
+        fxPushSet(w, s1, TF_1H)
+        fxPushSet(w, s0, TF_4H)
+        fxPushSet(w, s2, TF_D)
+        hi := 108.0, lo := 105.0, expectEnds := 4
+    else if fx == 14
+        // F14 a Root already out of the Fresh set (fvgFresh false) is not ended again
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, false)
+        int s1 = fxRoot(w, 2, TF_1H, FVG_BULLISH, 300.0, 310.0, true)
+        fxPushSet(w, s1, TF_1H)
+        hi := 108.0, lo := 105.0
+    else if fx == 15
+        // F15 malformed NativeRange (bottom > top) in the Fresh set: failure on both sides, nothing committed
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 110.0, 100.0, true)
+        fxPushSet(w, s0, TF_1H)
+        hi := 108.0, lo := 105.0, expectOk := false
+    else
+        // F16 invalid slot (outside every Root SoA) in the Fresh set: failure on both sides, nothing committed
+        int s0 = fxRoot(w, 1, TF_1H, FVG_BULLISH, 100.0, 110.0, true)
+        fxPushSet(w, 5, TF_1H)
+        hi := 108.0, lo := 105.0, expectOk := false
+    fxBuildIndex(w)
+    [w, hi, lo, bct, expectOk, expectEnds]
+
+// runs every fixture; returns [failures, firstFailFixture, firstCompare, firstField, refEndsTotal, optEndsTotal]
+runAll() =>
+    int failures = 0
+    int firstFail = -1
+    int firstCompare = CMP_NONE
+    int firstField = -1
+    int refTotal = 0
+    int optTotal = 0
+    int fx = 1
+    while fx <= FX_COUNT
+        [w, hi, lo, bct, expectOk, expectEnds] = fxBuild(fx)
+        array<int> refSlots = array.new_int(0)
+        array<int> optSlots = array.new_int(0)
+        array<int> optIds   = array.new_int(0)
+        bool refOk = refFreshEnds(w, hi, lo, bct, refSlots)
+        [optOk, payloadOk] = optFreshEnds(w, hi, lo, bct, optSlots, optIds)
+        int refCommitted = refOk ? array.size(refSlots) : 0
+        int optCommitted = optOk ? array.size(optSlots) : 0
+        refTotal += refCommitted
+        optTotal += optCommitted
+        int code = CMP_NONE
+        int field = -1
+        if refOk != optOk
+            code := CMP_FAILURE_FLAG
+        else if refCommitted != optCommitted
+            code := CMP_END_COUNT
+        else if optOk and not payloadOk
+            code := CMP_ROW_PAYLOAD
+        else
+            int e = 0
+            while code == CMP_NONE and e < refCommitted
+                int rs = array.get(refSlots, e)
+                if array.get(optSlots, e) != rs or array.get(optIds, e) != array.get(w.rootIds, rs)
+                    code  := CMP_END_ROOT
+                    field := e
+                e += 1
+        if code == CMP_NONE and refOk != expectOk
+            code := CMP_EXPECT_FAILURE
+        if code == CMP_NONE and refCommitted != expectEnds
+            code := CMP_EXPECT_COUNT
+        if code != CMP_NONE
+            failures += 1
+            if firstFail < 0
+                firstFail    := fx
+                firstCompare := code
+                firstField   := field
+        fx += 1
+    [failures, firstFail, firstCompare, firstField, refTotal, optTotal]
+
+var int gFailures     = -1
+var int gFixtureCount = 0
+var int gFirstFail    = -1
+var int gFirstCompare = -1
+var int gFirstField   = -1
+var int gRefEnds      = 0
+var int gOptEnds      = 0
+if barstate.islast and gFixtureCount == 0
+    [f, ff, fc, fd, re, oe] = runAll()
+    gFailures     := f
+    gFixtureCount := FX_COUNT
+    gFirstFail    := ff
+    gFirstCompare := fc
+    gFirstField   := fd
+    gRefEnds      := re
+    gOptEnds      := oe
+
+plot(gFailures,     "W07 B17 Fresh Failures",           display = display.data_window)
+plot(gFixtureCount, "W07 B17 Fresh Fixture Count",      display = display.data_window)
+plot(gFirstFail,    "W07 B17 Fresh First Fail Fixture", display = display.data_window)
+plot(gFirstCompare, "W07 B17 Fresh First Compare",      display = display.data_window)
+plot(gFirstField,   "W07 B17 Fresh First Field",        display = display.data_window)
+plot(gRefEnds,      "W07 B17 Fresh Reference Ends",     display = display.data_window)
+plot(gOptEnds,      "W07 B17 Fresh Optimized Ends",     display = display.data_window)
