@@ -6,6 +6,7 @@ import sekine3310/ZoneEngineV2_W03ETimeFvg_Worker/2 as W03ETimeFvg
 import sekine3310/ZoneEngineV2_W05Candidate_Worker/4 as W05Cand
 import sekine3310/ZoneEngineV2_W06Component_Worker/16 as W06Comp
 import sekine3310/ZoneEngineV2_W07Fvg_Worker/10 as W07Fvg
+import sekine3310/ZoneEngineV2_W08Core_Worker/1 as W08Core
 const int ID_NONE         = 0
 const int SLOT_INVALID    = -1
 const int SEQ_UNSET       = -1
@@ -646,8 +647,6 @@ export type W02AuxStore
     int   fvgInversePendingCount                          = 0
     array<int>   fvgInverseConfirmRootIds
     int   fvgInverseConfirmCount                          = 0
-    // W08 B02: Core identity interval index (live physical Cores ordered by bottomTick ASC, topTick ASC, coreId ASC)
-    array<int>   coreIntervalOrderData
 const int JGROUP_E1 = 1   // FVG structural invalidation
 const int JGROUP_E2 = 2   // NEW_ROOT
 const int JGROUP_E3 = 3   // Root update
@@ -1012,6 +1011,7 @@ export type ZoneEngine
     array<int>   sideFlipSnapshotTopOrderPositions
     W02AuxStore  w02Aux
     W03SourceRootStore w03Store
+    W08Core.W08Store w08CoreStore
     array<int>   candidateScratchSupportOldRootSlots
     int          candidateScratchSupportOldLength       = 0
     array<int>   candidateScratchSupportNewRootSlots
@@ -1403,7 +1403,6 @@ export newEngine(ZoneCfg cfg) =>
     aux.fvgInversePendingCount                 := 0
     aux.fvgInverseConfirmRootIds               := array.new_int(0)
     aux.fvgInverseConfirmCount                 := 0
-    aux.coreIntervalOrderData                  := array.new_int(0)
     e.w02Aux := aux
     W03SourceRootStore w03 = W03SourceRootStore.new()
     w03.journalOps              := array.new_int(0)
@@ -1462,6 +1461,7 @@ export newEngine(ZoneCfg cfg) =>
     w03.candidateWinnerRefRepScratch        := array.new_float(0)
     w03.candidateBroadSeenEpochByRootSlot   := array.new_int(0)
     e.w03Store := w03
+    e.w08CoreStore := W08Core.newStore()
     e.candidateScratchSupportOldRootSlots    := array.new_int(0)
     e.candidateScratchSupportOldLength       := 0
     e.candidateScratchSupportNewRootSlots    := array.new_int(0)
@@ -6712,104 +6712,10 @@ coreOriginRootIdsAscRaw(ZoneEngine engine, int coreSlot, array<int> outRootIds) 
             else
                 array.clear(outRootIds)
     result
-// W08 B02: Core identity interval index. One entry per live physical Core (no state / Phase / Side filter), key =
-// (bottomTick ASC, topTick ASC, coreId ASC) with ticks = round(corePhysical price / mintick). Physical order only: it
-// never decides Identity (the gap <= M query and the Identity predicate belong to later Batches). Storage is the flat
-// coreIntervalOrderData, stride 4 per entry: [+0 coreSlot, +1 expectedCoreId, +2 bottomTick, +3 topTick]; entries always
-// move as whole 4-value groups and a size that is not a multiple of 4 fails the call. Each helper checks only its own
-// target (live slot, coreIds[slot] == expectedCoreId, entry matched by coreSlot + expectedCoreId); the entry is seated at
-// its canonical position by an insertion step. Stale entries are removed by the Core free path (W08_CARRY_B02_01).
-// No full-index validation, no cap, no array.remove(0) / unshift.
-coreIntervalIndexInsertRaw(ZoneEngine engine, int coreSlot, int expectedCoreId, float mintick) =>
-    array<int> d = engine.w02Aux.coreIntervalOrderData
-    bool ok       = false
-    bool changed  = false
-    int  dataSize = array.size(d)
-    if coreSlot >= 0 and coreSlot < array.size(engine.coreIds) and expectedCoreId != ID_NONE and mintick > 0 and dataSize % 4 == 0
-        float bottom = array.get(engine.corePhysicalBottoms, coreSlot)
-        float top    = array.get(engine.corePhysicalTops,    coreSlot)
-        if array.get(engine.coreSlotLiveFlags, coreSlot) and array.get(engine.coreIds, coreSlot) == expectedCoreId and bottom <= top
-            int bTick = int(math.round(bottom / mintick))
-            int tTick = int(math.round(top    / mintick))
-            int k     = 0
-            while k < dataSize and (array.get(d, k) != coreSlot or array.get(d, k + 1) != expectedCoreId)
-                k += 4
-            if k < dataSize
-                ok := array.get(d, k + 2) == bTick and array.get(d, k + 3) == tTick
-            else
-                ok := true
-                array.push(d, coreSlot)
-                array.push(d, expectedCoreId)
-                array.push(d, bTick)
-                array.push(d, tTick)
-                while k > 0 and (array.get(d, k - 2) > bTick or (array.get(d, k - 2) == bTick and (array.get(d, k - 1) > tTick or (array.get(d, k - 1) == tTick and array.get(d, k - 3) > expectedCoreId))))
-                    for n = 0 to 3
-                        array.set(d, k + n, array.get(d, k - 4 + n))
-                    k -= 4
-                array.set(d, k,     coreSlot)
-                array.set(d, k + 1, expectedCoreId)
-                array.set(d, k + 2, bTick)
-                array.set(d, k + 3, tTick)
-                changed := true
-    [ok, changed]
-coreIntervalIndexDetachRaw(ZoneEngine engine, int coreSlot, int expectedCoreId) =>
-    array<int> d = engine.w02Aux.coreIntervalOrderData
-    bool ok       = false
-    bool changed  = false
-    int  dataSize = array.size(d)
-    if coreSlot >= 0 and expectedCoreId != ID_NONE and dataSize % 4 == 0
-        ok := true
-        int k = 0
-        while k < dataSize and (array.get(d, k) != coreSlot or array.get(d, k + 1) != expectedCoreId)
-            k += 4
-        if k < dataSize
-            while k < dataSize - 4
-                array.set(d, k, array.get(d, k + 4))
-                k += 1
-            for n = 1 to 4
-                array.pop(d)
-            changed := true
-    [ok, changed]
-// Writes the new physical range of an indexed Core and re-seats its entry atomically. The old entry must exist and match
-// the current range ticks (no silent new duplicate). Identical range = no-op. coreRangeRevision moves only when the stored
-// range actually changes; the entry is re-seated (insertion step left or right, whole 4-value groups) only when its ticks change.
-coreIntervalIndexMoveRaw(ZoneEngine engine, int coreSlot, int expectedCoreId, float newBottom, float newTop, float mintick) =>
-    array<int> d = engine.w02Aux.coreIntervalOrderData
-    bool ok       = false
-    bool changed  = false
-    int  dataSize = array.size(d)
-    if coreSlot >= 0 and coreSlot < array.size(engine.coreIds) and expectedCoreId != ID_NONE and mintick > 0 and newBottom <= newTop and dataSize % 4 == 0
-        float oldBottom = array.get(engine.corePhysicalBottoms, coreSlot)
-        float oldTop    = array.get(engine.corePhysicalTops,    coreSlot)
-        if array.get(engine.coreSlotLiveFlags, coreSlot) and array.get(engine.coreIds, coreSlot) == expectedCoreId and not na(oldBottom) and not na(oldTop)
-            int k = 0
-            while k < dataSize and (array.get(d, k) != coreSlot or array.get(d, k + 1) != expectedCoreId)
-                k += 4
-            if k < dataSize
-                int oldBTick = array.get(d, k + 2)
-                int oldTTick = array.get(d, k + 3)
-                ok := oldBTick == int(math.round(oldBottom / mintick)) and oldTTick == int(math.round(oldTop / mintick))
-                if ok and (newBottom != oldBottom or newTop != oldTop)
-                    int bTick = int(math.round(newBottom / mintick))
-                    int tTick = int(math.round(newTop    / mintick))
-                    if bTick != oldBTick or tTick != oldTTick
-                        while k > 0 and (array.get(d, k - 2) > bTick or (array.get(d, k - 2) == bTick and (array.get(d, k - 1) > tTick or (array.get(d, k - 1) == tTick and array.get(d, k - 3) > expectedCoreId))))
-                            for n = 0 to 3
-                                array.set(d, k + n, array.get(d, k - 4 + n))
-                            k -= 4
-                        while k < dataSize - 4 and (array.get(d, k + 6) < bTick or (array.get(d, k + 6) == bTick and (array.get(d, k + 7) < tTick or (array.get(d, k + 7) == tTick and array.get(d, k + 5) < expectedCoreId))))
-                            for n = 0 to 3
-                                array.set(d, k + n, array.get(d, k + 4 + n))
-                            k += 4
-                        array.set(d, k,     coreSlot)
-                        array.set(d, k + 1, expectedCoreId)
-                        array.set(d, k + 2, bTick)
-                        array.set(d, k + 3, tTick)
-                    array.set(engine.corePhysicalBottoms, coreSlot, newBottom)
-                    array.set(engine.corePhysicalTops,    coreSlot, newTop)
-                    engine.coreRangeRevision := engine.coreRangeRevision + 1
-                    changed := true
-    [ok, changed]
+// W08 B02: the Core identity interval index is owned by W08Core (Worker /1, engine.w08CoreStore); callers use
+// W08Core.intervalInsert / intervalDetach / intervalMove directly. Main keeps the Core state, the physical float range
+// (corePhysicalBottoms / Tops) and coreRangeRevision: after intervalMove returns changed = true the caller writes the new
+// physical range and bumps coreRangeRevision, also when the float range changes but its ticks do not.
 touchMarkAppendRaw(ZoneEngine engine, int coreSlot, int baseSeq, int touchTime, int side, float contactBottom, float contactTop, float closeAtTouch, int generationId, bool isNormalTouch) =>
     int capacity      = engine.touchMarkCapacityPerCore
     int physicalIndex = SLOT_INVALID
