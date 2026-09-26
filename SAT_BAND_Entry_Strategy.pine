@@ -22,7 +22,9 @@
 //       リペイントしない組み合わせで、ヒストリカルとリアルタイムで見え方が一致する。
 //     ・State・LINE1・LINE2・STB・終値・高値・安値・足の時刻は
 //       同一の確定足からタプルで一括取得する。
-//     ・上下限を作った窓が判定足より前に閉じていることを時刻で検証する。
+//     ・上下限の窓は「候補足の開始時刻までに確定した算出足の直近 N 本」を
+//       候補足ごとに凍結して使う。候補足自身は窓に入らず、その 1 本前は入る。
+//       算出足と候補足の時間足が違っても同じ規則で対応づく。
 //
 //   ■ 約定
 //     ・process_orders_on_close = false → シグナル足の次の15秒足始値で約定。
@@ -30,7 +32,8 @@
 //     ・約定を最初に検知した実行で strategy.position_avg_price を読み、
 //       記録済みの境界価格から SL / TP を設置する。
 //     ・約定直後の追加実行は barstate.isconfirmed だけで見分けない。
-//       建玉から導いた inPosition / awaitingFill / exitedThisBar を併用し、
+//       取引履歴から導いた inPosition / awaitingFill /
+//       enteredThisBar / exitedThisBar を併用し、
 //       どの追加実行でも新規シグナルとセットアップの状態遷移を進めない。
 //       エントリー約定後は SL/TP 設置、決済約定後は再エントリー防止と
 //       セットアップ破棄を明示的に処理する。
@@ -224,44 +227,95 @@ f_satBand() =>
 //   ヒストリカルとリアルタイムで上位足の見え方が一致する。
 //   （lookahead_off + [1] だとヒストリカル側で余分に 1 本古い値になり、
 //     リアルタイムとの見え方の差が残るため使わない。）
-//   返す 8 値はすべて同じ 1 本の確定足から取っている。
+//   返す 8 値（State〜確定足の開始時刻）はすべて同じ 1 本の確定足から取っている。
+//   9 番目の time だけは「形成中の足の開始時刻」で、窓の凍結タイミングに使う。
+//   形成中の足の開始時刻はその足が始まった時点で確定しているので未来情報ではない。
 f_satBandHtf() =>
     [l1v, l2v, sbv, _d1, _d2, _sd, stv] = f_satBand()
     float l1c = l1v
     float l2c = l2v
     float sbc = sbv
     int   stc = stv
-    [stc[1], l1c[1], l2c[1], sbc[1], close[1], high[1], low[1], time[1]]
+    [stc[1], l1c[1], l2c[1], sbc[1], close[1], high[1], low[1], time[1], time]
 
-// 上下限：判定に使う足より前に確定した len 本の最高値・最安値。
-//   ta.highest(high, len)[1] で「その足自身を含めない len 本」にし、
-//   さらに [1] で「最後に確定した足の時点の値」にする。合計 [2]。
-//   tEnd はその窓の最後の足が閉じた時刻。判定足との前後関係の検証に使う。
+// 上下限：いま形成中の足を含めない直近 len 本の最高値・最安値と、その窓の開始・終了時刻。
+//   算出足の足 k で評価すると、窓は k-len 〜 k-1、つまり k の開始時刻までに
+//   確定した直近 len 本になる。窓の中身は k のデータを一切含まないので、
+//   lookahead_on で取っても未来情報は入らない。
+//   どの足に対応づけるかは呼び出し側の f_freezeWindow() で決める。
 f_rangeHL(simple int len) =>
     float hiv = ta.highest(high, len)[1]
     float lov = ta.lowest(low, len)[1]
-    [hiv[1], lov[1], time_close[2]]
+    [hiv, lov, time[len], time_close[1]]
 
-// ブレイク判定足の確定終値と、その足の開始時刻
+// ブレイク判定足：確定足の終値・開始時刻・終了時刻と、形成中の足の開始時刻
 f_brkBar() =>
     float c = close
     int   t = time
-    [c[1], t[1]]
+    int   tc = time_close
+    [c[1], t[1], tc[1], t]
+
+// 候補足の開始時点における「算出足の直近 len 本の窓」を凍結して返す。
+//
+//   formT        いま形成中の候補足の開始時刻
+//   hi/lo/st/en  そのバー時点の算出足の窓（その算出足の開始時刻までに確定した直近 len 本）
+//   戻り値       「確定した候補足」に対応する窓 [hi, lo, 開始時刻, 終了時刻]
+//
+//   候補足が始まったバーでその時点の窓を記録し、候補足が次へ進んだ時点で
+//   それを「確定した候補足の窓」へ繰り上げる。
+//   こうすると算出足と候補足の時間足が違っても、必ず
+//   「候補足の開始時刻までに確定した算出足の直近 len 本」が対応づく。
+//
+//   例1  算出足5分 / 候補足4時間・08:00〜12:00
+//        08:00 に始まる15秒足で 5分の窓（…〜08:00）を記録し、
+//        12:00 に候補足が確定した時点でその窓を使う。
+//   例2  算出足1時間 / 候補足5分・10:20〜10:25
+//        10:20 に始まる15秒足で 1時間の窓（…〜10:00）を記録し、
+//        10:25 に候補足が確定した時点でその窓を使う。
+//
+//   var は呼び出し箇所ごとに独立するので、ブレイク用と接近判定用で混ざらない。
+f_freezeWindow(int formT, float hi, float lo, int st, int en) =>
+    var int   curT  = na
+    var float curHi = na
+    var float curLo = na
+    var int   curS  = na
+    var int   curE  = na
+    var float prvHi = na
+    var float prvLo = na
+    var int   prvS  = na
+    var int   prvE  = na
+    if not na(formT) and (na(curT) or curT != formT)
+        prvHi := curHi
+        prvLo := curLo
+        prvS  := curS
+        prvE  := curE
+        curT  := formT
+        curHi := hi
+        curLo := lo
+        curS  := st
+        curE  := en
+    [prvHi, prvLo, prvS, prvE]
 
 // ============================================================================
 // 02｜上位足の取得（同一確定足からタプルで一括）
 // ============================================================================
 string SYM = syminfo.tickerid
 
-[st30S, l1_30S, l2_30S, sb_30S, c30S, h30S, lo30S, t30S] = request.security(SYM, "30S", f_satBandHtf(), lookahead = barmerge.lookahead_on)
-[st1,   l1_1,   l2_1,   sb_1,   c1,   h1,   lo1,   t1]   = request.security(SYM, "1",   f_satBandHtf(), lookahead = barmerge.lookahead_on)
-[st5,   l1_5,   l2_5,   sb_5,   c5,   h5,   lo5,   t5]   = request.security(SYM, "5",   f_satBandHtf(), lookahead = barmerge.lookahead_on)
-[st15,  l1_15,  l2_15,  sb_15,  c15,  h15,  lo15,  t15]  = request.security(SYM, "15",  f_satBandHtf(), lookahead = barmerge.lookahead_on)
-[st60,  l1_60,  l2_60,  sb_60,  c60,  h60,  lo60,  t60]  = request.security(SYM, "60",  f_satBandHtf(), lookahead = barmerge.lookahead_on)
-[st240, l1_240, l2_240, sb_240, c240, h240, lo240, t240] = request.security(SYM, "240", f_satBandHtf(), lookahead = barmerge.lookahead_on)
+[st30S, l1_30S, l2_30S, sb_30S, c30S, h30S, lo30S, t30S, tf30S] = request.security(SYM, "30S", f_satBandHtf(), lookahead = barmerge.lookahead_on)
+[st1,   l1_1,   l2_1,   sb_1,   c1,   h1,   lo1,   t1,   tf1]   = request.security(SYM, "1",   f_satBandHtf(), lookahead = barmerge.lookahead_on)
+[st5,   l1_5,   l2_5,   sb_5,   c5,   h5,   lo5,   t5,   tf5]   = request.security(SYM, "5",   f_satBandHtf(), lookahead = barmerge.lookahead_on)
+[st15,  l1_15,  l2_15,  sb_15,  c15,  h15,  lo15,  t15,  tf15]  = request.security(SYM, "15",  f_satBandHtf(), lookahead = barmerge.lookahead_on)
+[st60,  l1_60,  l2_60,  sb_60,  c60,  h60,  lo60,  t60,  tf60]  = request.security(SYM, "60",  f_satBandHtf(), lookahead = barmerge.lookahead_on)
+[st240, l1_240, l2_240, sb_240, c240, h240, lo240, t240, tf240] = request.security(SYM, "240", f_satBandHtf(), lookahead = barmerge.lookahead_on)
 
-[rgHigh, rgLow, rgEndT] = request.security(SYM, rgBoundTf, f_rangeHL(rgBoundLen), lookahead = barmerge.lookahead_on)
-[bkClose, bkBarT]       = request.security(SYM, bkTf,      f_brkBar(),            lookahead = barmerge.lookahead_on)
+// 算出足のナマの窓（その算出足の開始時刻までに確定した直近 N 本）
+[rgRawHi, rgRawLo, rgRawS, rgRawE] = request.security(SYM, rgBoundTf, f_rangeHL(rgBoundLen), lookahead = barmerge.lookahead_on)
+// ブレイク判定足の確定足と形成中の足
+[bkClose, bkCandOpenT, bkCandCloseT, bkFormT] = request.security(SYM, bkTf, f_brkBar(), lookahead = barmerge.lookahead_on)
+
+// 候補足ごとに窓を凍結する。ブレイク判定用と 5分接近判定用で別インスタンス。
+[bkWinHi, bkWinLo, bkWinS, bkWinE] = f_freezeWindow(bkFormT, rgRawHi, rgRawLo, rgRawS, rgRawE)
+[rbWinHi, rbWinLo, rbWinS, rbWinE] = f_freezeWindow(tf5,     rgRawHi, rgRawLo, rgRawS, rgRawE)
 
 // チャート足（15秒）はローカル計算
 [l1c15v, l2c15v, sbc15v, _cd1, _cd2, _csd, stChartV] = f_satBand()
@@ -381,12 +435,23 @@ f_stateOf(int tfMin) =>
 //
 //     inPosition     … 建玉あり。エントリー約定の追加実行はここで必ず弾かれる。
 //     awaitingFill   … 発注済み・約定待ち。
-//     exitedThisBar  … この足で決済が起きた。決済約定の追加実行と、同じ足の
-//                      バー確定時の実行の両方で true になる（バー履歴から導くため
-//                      リアルタイムの var ロールバックの影響を受けない）。
+//     enteredThisBar … この足で建玉が発生した（決済済みでも検出できる）。
+//     exitedThisBar  … この足で決済が起きた。
+//
+//   建玉サイズの前後比較（strategy.position_size[1]）は使わない。
+//   シグナル足 N の終値で発注 → N+1 の始値で約定 → N+1 の途中で SL/TP 決済、
+//   という並びでは position_size も position_size[1] もどちらも 0 になり、
+//   サイズ比較では決済を検出できないため。
+//   代わりに実際の取引履歴を見る。
+//     strategy.closedtrades                              … 決済済み取引の本数
+//     strategy.closedtrades.exit_bar_index(n-1)  == bar_index → この足で決済
+//     strategy.closedtrades.entry_bar_index(n-1) == bar_index → この足で建玉（決済済み）
+//     strategy.opentrades.entry_bar_index(m-1)   == bar_index → この足で建玉（保有中）
+//   取引履歴は var ではないのでリアルタイムのロールバックの影響を受けず、
+//   決済約定直後の追加実行でも、同じ足のバー確定時の実行でも同じ値になる。
 //
 //   mainEval が false の実行では、新規シグナルもセットアップの状態遷移も
-//   一切進めない。3 つのガードはどれか 1 つが効けば追加実行を止められる。
+//   一切進めない。4 つのガードはどれか 1 つが効けば追加実行を止められる。
 // ============================================================================
 var bool pendingEntry = false
 var int  pendingDir   = 0
@@ -394,14 +459,19 @@ var float setupSL     = na
 var string setupInfo  = ""
 var int  entryOrderBar = na
 
-// 建玉の増減をバー履歴から判定する（var ではないのでロールバックに強い）
-float prevBarPos  = nz(strategy.position_size[1], 0)
+// 建玉の発生・消滅を実際の取引履歴から判定する（var ではないのでロールバックに強い）
+int ctN = strategy.closedtrades
+int otN = strategy.opentrades
+int lastExitBar      = ctN > 0 ? nz(strategy.closedtrades.exit_bar_index(ctN - 1),  -1) : -1
+int lastClosedEntBar = ctN > 0 ? nz(strategy.closedtrades.entry_bar_index(ctN - 1), -1) : -1
+int lastOpenEntBar   = otN > 0 ? nz(strategy.opentrades.entry_bar_index(otN - 1),   -1) : -1
+
 bool inPosition   = strategy.position_size != 0
 bool awaitingFill = pendingEntry
-bool exitedThisBar  = strategy.position_size == 0 and prevBarPos != 0
-bool enteredThisBar = strategy.position_size != 0 and prevBarPos == 0
+bool exitedThisBar  = lastExitBar == bar_index
+bool enteredThisBar = lastOpenEntBar == bar_index or lastClosedEntBar == bar_index
 
-bool tradingIdle = not inPosition and not awaitingFill and not exitedThisBar
+bool tradingIdle = not inPosition and not awaitingFill and not exitedThisBar and not enteredThisBar
 bool mainEval = barstate.isconfirmed and envOk and modeOk and tradingIdle
 
 var int lastEntryBar = na
@@ -626,15 +696,18 @@ if rgUse240 and st240 != 0
     rgAllFlat := false
 if rgSelCount == 0
     rgAllFlat := false
-bool rgBoundOk = not na(rgHigh) and not na(rgLow) and rgHigh > rgLow
+// 凍結した窓の妥当性。ブレイク判定用と 5分接近判定用は別の窓を使う。
+bool bkBoundOk = not na(bkWinHi) and not na(bkWinLo) and bkWinHi > bkWinLo
+bool rbBoundOk = not na(rbWinHi) and not na(rbWinLo) and rbWinHi > rbWinLo
 
 // 時刻の前後関係の検証
-//   上下限算出足とブレイク判定足／接近判定足に別の時間足を選んだ場合でも、
-//   上下限を作った窓が判定足より前に閉じていることを必ず確認する。
-//   同じ 5分 どうしなら rgEndT は判定足の 1 本前の足が閉じた時刻になり、
-//   常に bkBarT（判定足の開始時刻）以下になる。
-bool rgBeforeBreak = not na(rgEndT) and not na(bkBarT) and rgEndT <= bkBarT
-bool rgBefore5m    = not na(rgEndT) and not na(t5)     and rgEndT <= t5
+//   f_freezeWindow() が「候補足の開始時刻までに確定した算出足の直近 N 本」を
+//   選んでいるので、窓の終了時刻は必ず候補足の開始時刻以下になる。
+//   ここはその不変条件が崩れていないことの確認（時間足の組み合わせに関わらず有効）。
+//   同じ 5分 どうしなら bkWinE はブレイク足の 1 本前の足が閉じた時刻、
+//   すなわち bkCandOpenT（ブレイク足の開始時刻）と一致する。
+bool rgBeforeBreak = not na(bkWinE) and not na(bkCandOpenT) and bkWinE <= bkCandOpenT
+bool rgBefore5m    = not na(rbWinE) and not na(t5)          and rbWinE <= t5
 
 // ============================================================================
 // 08｜レンジ端反発
@@ -666,15 +739,15 @@ if mainEval and mode == M_RBND
     // --- セットアップ開始 ---
     //   下限：5分足の確定終値が 下限以上・下限＋rbNear 以下（「下限±rbNear」ではない）
     //   上限：5分足の確定終値が 上限以下・上限−rbNear 以上
-    //   rgBefore5m で、上下限を作った窓が接近判定に使う 5分足より前に
-    //   閉じていることを確認する（上下限算出足に 5分 以外を選んだ場合の保険）。
-    if rbDir == 0 and rgAllFlat and rgBoundOk and rgBefore5m and not na(c5)
-        if allowLong and c5 >= rgLow and c5 <= rgLow + rbNear
+    //   窓は「その 5分確定足の開始時刻までに確定した算出足の直近 N 本」を
+    //   f_freezeWindow() で凍結したもの（rbWin*）。5分足自身は含まない。
+    if rbDir == 0 and rgAllFlat and rbBoundOk and rgBefore5m and not na(c5)
+        if allowLong and c5 >= rbWinLo and c5 <= rbWinLo + rbNear
             rbDir   := 1
-            rbBound := rgLow
-        else if allowShort and c5 <= rgHigh and c5 >= rgHigh - rbNear
+            rbBound := rbWinLo
+        else if allowShort and c5 <= rbWinHi and c5 >= rbWinHi - rbNear
             rbDir   := -1
-            rbBound := rgHigh
+            rbBound := rbWinHi
 
     if rbDir != 0
         int want = rbDir
@@ -741,13 +814,14 @@ var float bkBound    = na
 
 if mainEval and mode == M_BRK
     // レンジ判定足がすべてフラットの間だけ候補境界を更新する
-    if bkDir == 0 and rgAllFlat and rgBoundOk and rgBeforeBreak
-        bkCandHigh := rgHigh
-        bkCandLow  := rgLow
+    if bkDir == 0 and rgAllFlat and bkBoundOk and rgBeforeBreak
+        bkCandHigh := bkWinHi
+        bkCandLow  := bkWinLo
 
     // ブレイク成立（判定足の確定終値が、判定足より前に確定済みの境界を厳密に超える）
-    //   rgBeforeBreak で、上下限を作った窓が判定足より前に閉じていることを確認する。
-    //   ともに 5分 なら close[1] と ta.highest(high, N)[2] の比較になる。
+    //   bkWin* は「ブレイク判定足の開始時刻までに確定した算出足の直近 N 本」。
+    //   ブレイク足自身は窓に入らず、その 1 本前の足は入る。
+    //   ともに 5分・N=60 なら、ブレイク足 k の終値と 足 k-60〜k-1 の高値/安値の比較。
     if bkDir == 0 and not na(bkClose) and rgBeforeBreak
         if allowLong and not na(bkCandHigh) and bkClose > bkCandHigh
             bkDir   := 1
@@ -884,8 +958,10 @@ if pendingEntry and strategy.position_size == 0 and not na(entryOrderBar) and ba
     setupSL      := na
 
 // --- B. 決済約定 → 再エントリー防止とセットアップの破棄 ---
-//   exitedThisBar はバー履歴から導いているので、決済約定の追加実行でも
-//   同じ足の確定時の実行でも true になり、両方で同じリセットが走る。
+//   exitedThisBar は strategy.closedtrades の決済 bar_index から導いているので、
+//   同じ足でエントリーと決済が起きた場合（N の終値で発注 → N+1 始値で約定 →
+//   N+1 の途中で決済）でも true になる。決済約定直後の追加実行でも、
+//   N+1 のバー確定時の実行でも同じ値なので、両方で同じリセットが走る。
 //   lastEntryBar をこの足へ進めることで、決済と同じ 15秒足での再エントリーを防ぐ。
 if exitedThisBar
     pendingEntry := false
@@ -960,11 +1036,17 @@ plot(dbgMode ? sb_5 : na, "DBG 5m STB",   display = display.data_window)
 plot(dbgMode ? sup5 : na, "DBG 5m 支持(3本max)", display = display.data_window)
 plot(dbgMode ? res5 : na, "DBG 5m 抵抗(3本min)", display = display.data_window)
 
-plot(dbgMode ? rgHigh : na, "DBG レンジ上限", display = display.data_window)
-plot(dbgMode ? rgLow  : na, "DBG レンジ下限", display = display.data_window)
+plot(dbgMode ? bkWinHi : na, "DBG BK窓 上限", display = display.data_window)
+plot(dbgMode ? bkWinLo : na, "DBG BK窓 下限", display = display.data_window)
+plot(dbgMode ? bkWinS * 1.0 : na, "DBG BK窓 開始時刻", display = display.data_window)
+plot(dbgMode ? bkWinE * 1.0 : na, "DBG BK窓 終了時刻", display = display.data_window)
 plot(dbgMode ? bkClose : na, "DBG ブレイク判定足 終値", display = display.data_window)
-plot(dbgMode ? rgEndT * 1.0 : na,  "DBG 上下限窓の終了時刻",     display = display.data_window)
-plot(dbgMode ? bkBarT * 1.0 : na,  "DBG ブレイク判定足 開始時刻", display = display.data_window)
+plot(dbgMode ? bkCandOpenT  * 1.0 : na, "DBG ブレイク判定足 開始時刻", display = display.data_window)
+plot(dbgMode ? bkCandCloseT * 1.0 : na, "DBG ブレイク判定足 終了時刻", display = display.data_window)
+plot(dbgMode ? rbWinHi : na, "DBG 反発窓 上限", display = display.data_window)
+plot(dbgMode ? rbWinLo : na, "DBG 反発窓 下限", display = display.data_window)
+plot(dbgMode ? rbWinS * 1.0 : na, "DBG 反発窓 開始時刻", display = display.data_window)
+plot(dbgMode ? rbWinE * 1.0 : na, "DBG 反発窓 終了時刻", display = display.data_window)
 plot(dbgMode ? t5 * 1.0 : na,      "DBG 5分 確定足 開始時刻",     display = display.data_window)
 plot(dbgMode ? t1 * 1.0 : na,      "DBG 1分 確定足 開始時刻",     display = display.data_window)
 plot(dbgMode ? lo1 : na,           "DBG 1分 確定足 安値",         display = display.data_window)
@@ -977,6 +1059,8 @@ plot(dbgMode ? (rgBefore5m ? 1.0 : 0.0) : na,    "DBG 上下限窓 < 5分足",  
 plot(dbgMode ? (mainEval ? 1.0 : 0.0) : na,      "DBG mainEval",             display = display.data_window)
 plot(dbgMode ? (exitedThisBar ? 1.0 : 0.0) : na, "DBG 決済が起きた足",       display = display.data_window)
 plot(dbgMode ? (enteredThisBar ? 1.0 : 0.0) : na,"DBG 約定した足",           display = display.data_window)
+plot(dbgMode ? lastExitBar * 1.0 : na,           "DBG 最終決済 bar_index",   display = display.data_window)
+plot(dbgMode ? ctN * 1.0 : na,                   "DBG 決済済み取引数",       display = display.data_window)
 
 plot(dbgMode ? trDir * 1.0 : na,  "DBG 巡行 待機方向", display = display.data_window)
 plot(dbgMode ? trLine : na,       "DBG 巡行 記録線",   display = display.data_window)
