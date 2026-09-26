@@ -1,0 +1,888 @@
+// ============================================================================
+// SAT BAND Entry Strategy
+//   「SAT BAND Reconstruction Test」インジケーターの f_satBand() を計算上の唯一の
+//   基準として移植し、4 モードを個別に検証するための独立した strategy。
+//
+//   ※ 元ファイル（SAT_BAND_Reconstruction_Test.pine）は変更していない。
+//     ここへ必要な計算を移植しただけで、計算式・初期化・State 更新順序・
+//     青／赤／フラット判定はいずれも変えていない。
+//   ※ ZoneEngine、他の SAT 近似版、外部の点数判定は組み込んでいない。
+//   ※ 指示書にない売買フィルターや指標は追加していない。
+//
+//   ■ 実行前提
+//     ・XAUUSD / 15秒足チャート。ほかの銘柄・時間足では取引を停止し理由を表示する。
+//     ・モードは 巡行 / 逆行 / レンジ反発 / レンジブレイク から 1 つだけ選ぶ。
+//     ・同時保有は 1 件、pyramiding = 0。
+//
+//   ■ 確定足の扱い
+//     ・15秒足の判定は barstate.isconfirmed のみ。
+//     ・上位足は request.security(..., 式[1], lookahead_off) で最後に確定した足の
+//       値だけを取る。形成中の上位足は売買判定に使わない。
+//     ・State・LINE1・LINE2・STB・終値は同一の確定足からタプルで一括取得する。
+//
+//   ■ 約定
+//     ・process_orders_on_close = false → シグナル足の次の15秒足始値で約定。
+//     ・calc_on_every_tick = false / calc_on_order_fills = true。
+//     ・約定を最初に検知した実行で strategy.position_avg_price を読み、
+//       記録済みの境界価格から SL / TP を設置する。
+//     ・シグナル評価は barstate.isconfirmed の実行だけで行うため、約定直後の
+//       追加実行では新規シグナルを生成しない（同一イベントの二重発注を防ぐ）。
+//
+//   ■ 仕様上の解釈（利用者確認済み）
+//     ・§5-4：赤の15秒足自体が支持線±許容幅の圏内にあれば待機開始。
+//             交差足との前後関係は問わない。
+//     ・§8  ：15秒/30秒/1分の確定青は同時でなくてよい（各足が一度ずつ）。
+//             30秒の消灯と1分の支え確認は順不同。最後に30秒の再点灯でエントリー。
+//     ・§6  ：梯子は 15秒→30秒→1分→5分→15分→1時間 で固定。
+//             目標足は 5分 / 15分 / 1時間 のみ（背景足より短いもの）。
+// ============================================================================
+//@version=6
+strategy("SAT BAND Entry Strategy", shorttitle = "SAT Entry", overlay = true,
+     pyramiding                 = 0,
+     process_orders_on_close    = false,
+     calc_on_every_tick         = false,
+     calc_on_order_fills        = true,
+     default_qty_type           = strategy.fixed,
+     default_qty_value          = 1,
+     initial_capital            = 100000,
+     commission_type            = strategy.commission.percent,
+     commission_value           = 0,
+     slippage                   = 0,
+     max_labels_count           = 500)
+
+// ============================================================================
+// 00｜入力
+// ============================================================================
+string G_MODE = "00｜モード"
+string G_RISK = "01｜共通リスク"
+string G_TR   = "02｜トレンド巡行"
+string G_CN   = "03｜トレンド逆行"
+string G_RG   = "04｜レンジ定義"
+string G_RB   = "05｜レンジ端反発"
+string G_BK   = "06｜レンジ端ブレイク"
+string G_DBG  = "07｜デバッグ"
+
+string M_TREND = "トレンド巡行"
+string M_CNTR  = "トレンド逆行"
+string M_RBND  = "レンジ端反発"
+string M_BRK   = "レンジ端ブレイク"
+
+string D_BOTH  = "両方向"
+string D_LONG  = "ロングのみ"
+string D_SHORT = "ショートのみ"
+
+mode    = input.string(M_TREND, "モード", options = ["トレンド巡行", "トレンド逆行", "レンジ端反発", "レンジ端ブレイク"], group = G_MODE,
+     tooltip = "1 回に 1 モードだけを検証する。モード間で条件や約定を混ぜない。")
+dirMode = input.string(D_BOTH, "売買方向", options = ["両方向", "ロングのみ", "ショートのみ"], group = G_MODE)
+
+// --- 共通リスク ---
+slOffset = input.float(5.0, "SLオフセット（XAUUSDドル）", minval = 0.0, step = 0.1, group = G_RISK,
+     tooltip = "ロングSL = 消灯境界 − オフセット、ショートSL = 消灯境界 + オフセット。\nSL価格はエントリー時に一度だけ確定し、ポジション中にラインが動いても追従させない。")
+rrRatio  = input.float(1.0, "TPのRR", minval = 0.1, step = 0.1, group = G_RISK,
+     tooltip = "実際の約定価格と固定SLの距離を1RとしてTPを計算する。\nロング TP = 約定価格 + RR ×（約定価格 − SL）。")
+qtySize  = input.float(1.0, "数量（利用銘柄の取引数量）", minval = 0.0, step = 0.01, group = G_RISK,
+     tooltip = "利用銘柄の取引数量。1 を 1 ロットと決めつけていない。\n手数料・スプレッド・スリッページはストラテジーテスターのプロパティで設定し、\n報告時にその設定値を明示すること。スクリプト側の既定は 0 にしてある。")
+
+// --- 02 トレンド巡行 ---
+trUse5   = input.bool(true,  "5分",   group = G_TR, inline = "tr1")
+trUse15  = input.bool(false, "15分",  group = G_TR, inline = "tr1")
+trUse60  = input.bool(false, "1時間", group = G_TR, inline = "tr1")
+trUse240 = input.bool(false, "4時間", group = G_TR, inline = "tr1")
+trAgg    = input.string("OR", "集約", options = ["OR", "AND"], group = G_TR,
+     tooltip = "OR：選択足のどれか1つが最後の確定足で青（ショートは赤）。\nAND：選択足のすべて。\nANDは点灯の条件であって、すべての線に接近する条件ではない。")
+trNear   = input.float(1.0, "接近許容幅（XAUUSDドル）", minval = 0.0, step = 0.1, group = G_TR)
+trTrig   = input.string("A：赤の後にフラット", options = ["A：赤の後にフラット", "B：赤の後に青"], group = G_TR,
+     tooltip = "A（既定）：赤を見た後で15秒足が確定フラット(0)。\nB：赤を見た後で確定青(+1)。赤→フラット→青も有効。\nどちらもトリガー足の確定終値が記録した支持線より厳密に上であることを必須とする。")
+
+// --- 03 トレンド逆行 ---
+cnBgTf  = input.string("4時間", "背景足", options = ["5分", "15分", "1時間", "4時間"], group = G_CN,
+     tooltip = "ロングは背景足が確定赤、ショートは確定青。")
+cnTgtTf = input.string("15分", "目標足", options = ["5分", "15分", "1時間"], group = G_CN,
+     tooltip = "梯子は 15秒→30秒→1分→5分→15分→1時間 で固定。\n目標足は背景足より短いものだけ有効。目標15分なら 15秒・30秒・1分・5分・15分 の順に点灯を要求する。")
+
+// --- 04 レンジ定義 ---
+rgUse5   = input.bool(true,  "5分",   group = G_RG, inline = "rg1")
+rgUse15  = input.bool(false, "15分",  group = G_RG, inline = "rg1")
+rgUse60  = input.bool(false, "1時間", group = G_RG, inline = "rg1")
+rgUse240 = input.bool(false, "4時間", group = G_RG, inline = "rg1")
+rgBoundTf  = input.string("5", "上下限算出足", options = ["5", "15", "60", "240"], group = G_RG,
+     tooltip = "分表記。候補足より前に確定した指定本数の最高値を上限、最安値を下限とする。\n判定中の足の高値・安値は境界へ混ぜない。")
+rgBoundLen = input.int(60, "上下限の本数", minval = 2, maxval = 2000, group = G_RG)
+
+// --- 05 レンジ端反発 ---
+rbNear = input.float(5.0, "境界への接近幅（XAUUSDドル）", minval = 0.0, step = 0.1, group = G_RB,
+     tooltip = "5分足の確定終値が 下限以上・下限＋この幅以下 に入ったら下限セットアップを開始する。\n上下限算出足に5分以外を選んでも、接近判定の終値は5分足を使う。")
+
+// --- 06 レンジ端ブレイク ---
+bkTf    = input.string("5", "ブレイク判定足", options = ["5", "15", "60", "240"], group = G_BK, tooltip = "分表記。")
+bkUse5   = input.bool(true,  "5分",   group = G_BK, inline = "bk1")
+bkUse15  = input.bool(false, "15分",  group = G_BK, inline = "bk1")
+bkUse60  = input.bool(false, "1時間", group = G_BK, inline = "bk1")
+bkUse240 = input.bool(false, "4時間", group = G_BK, inline = "bk1")
+bkAgg    = input.string("OR", "確認上位足の集約", options = ["OR", "AND"], group = G_BK,
+     tooltip = "巡行フィルターとは独立した設定。")
+
+// --- 07 デバッグ ---
+dbgMode   = input.bool(false, "Debug（データウィンドウ出力）", group = G_DBG)
+dbgMarker = input.bool(false, "セットアップ／シグナルのマーカー表示", group = G_DBG)
+
+// ============================================================================
+// 01｜SAT BAND 本体（元インジケーターからの移植。式は一切変えていない）
+//   戻り値: [line1, line2, stb, dir1, dir2, stbDir, bandState]
+//   bandState は +1 = 青 / -1 = 赤 / 0 = フラット（等号は青・赤に含めない）
+// ============================================================================
+f_satBand() =>
+    float basisV  = ta.vwma(hlc3, 5)
+    float commonV = basisV * 0.5
+    float atr50V  = ta.atr(50)[1]
+    float srcV      = close[1] * 0.5
+    float trigLowV  = low[1]   * 0.5
+    float trigHighV = high[1]  * 0.5
+    bool readyV = not na(atr50V) and not na(srcV) and not na(trigLowV) and not na(trigHighV)
+
+    float k1V = 5.0
+    var float anchor1V = na
+    var int   dir1V    = 1
+    float prevAnchor1V = anchor1V
+    int   prevDir1V    = dir1V
+    if readyV
+        if na(prevAnchor1V)
+            anchor1V := srcV - k1V * atr50V
+            dir1V    := 1
+        else if prevDir1V == 1
+            if trigLowV < prevAnchor1V
+                dir1V    := -1
+                anchor1V := srcV + k1V * atr50V
+            else
+                dir1V    := 1
+                anchor1V := math.max(prevAnchor1V, srcV - k1V * atr50V)
+        else
+            if trigHighV > prevAnchor1V
+                dir1V    := 1
+                anchor1V := srcV - k1V * atr50V
+            else
+                dir1V    := -1
+                anchor1V := math.min(prevAnchor1V, srcV + k1V * atr50V)
+    float line1V = commonV + anchor1V
+
+    float k2V = 2.5
+    var float anchor2V = na
+    var int   dir2V    = 1
+    float prevAnchor2V = anchor2V
+    int   prevDir2V    = dir2V
+    if readyV
+        if na(prevAnchor2V)
+            anchor2V := srcV - k2V * atr50V
+            dir2V    := 1
+        else if prevDir2V == 1
+            if trigLowV < prevAnchor2V
+                dir2V    := -1
+                anchor2V := srcV + k2V * atr50V
+            else
+                dir2V    := 1
+                anchor2V := math.max(prevAnchor2V, srcV - k2V * atr50V)
+        else
+            if trigHighV > prevAnchor2V
+                dir2V    := 1
+                anchor2V := srcV - k2V * atr50V
+            else
+                dir2V    := -1
+                anchor2V := math.min(prevAnchor2V, srcV + k2V * atr50V)
+    float line2V = commonV + anchor2V
+
+    float stbUpperV   = ta.highest(high, 10)
+    float stbLowerV   = ta.lowest(low, 10)
+    float prev20HighV = ta.highest(high, 20)[1]
+    float prev20LowV  = ta.lowest(low, 20)[1]
+    var int stbDirV = 1
+    if not na(prev20HighV) and not na(prev20LowV)
+        if high > prev20HighV
+            stbDirV := 1
+        else if low < prev20LowV
+            stbDirV := -1
+    float stbV = stbDirV == 1 ? stbLowerV : stbUpperV
+
+    int stateV = 0
+    if close > line1V and close > line2V and close > stbV
+        stateV := 1
+    else if close < line1V and close < line2V and close < stbV
+        stateV := -1
+
+    [line1V, line2V, stbV, dir1V, dir2V, stbDirV, stateV]
+
+// 上位足用：State・3本の線・終値を「最後に確定した足」から一括で返す。
+//   [1] を式の内側に置き、lookahead_off と組み合わせて未来情報の混入を防ぐ。
+//   ヒストリカルとリアルタイムで上位足の見え方が変わらない。
+f_satBandHtf() =>
+    [l1v, l2v, sbv, _d1, _d2, _sd, stv] = f_satBand()
+    float l1c = l1v
+    float l2c = l2v
+    float sbc = sbv
+    int   stc = stv
+    [stc[1], l1c[1], l2c[1], sbc[1], close[1]]
+
+// 上下限：候補足より前に確定した len 本の最高値・最安値を、確定足の値として返す
+f_rangeHL(simple int len) =>
+    float hiv = ta.highest(high, len)[1]
+    float lov = ta.lowest(low, len)[1]
+    [hiv[1], lov[1]]
+
+// ブレイク判定足の確定終値
+f_brkClose() =>
+    float c = close
+    c[1]
+
+// ============================================================================
+// 02｜上位足の取得（同一確定足からタプルで一括）
+// ============================================================================
+string SYM = syminfo.tickerid
+
+[st30S, l1_30S, l2_30S, sb_30S, c30S] = request.security(SYM, "30S", f_satBandHtf(), lookahead = barmerge.lookahead_off)
+[st1,   l1_1,   l2_1,   sb_1,   c1]   = request.security(SYM, "1",   f_satBandHtf(), lookahead = barmerge.lookahead_off)
+[st5,   l1_5,   l2_5,   sb_5,   c5]   = request.security(SYM, "5",   f_satBandHtf(), lookahead = barmerge.lookahead_off)
+[st15,  l1_15,  l2_15,  sb_15,  c15]  = request.security(SYM, "15",  f_satBandHtf(), lookahead = barmerge.lookahead_off)
+[st60,  l1_60,  l2_60,  sb_60,  c60]  = request.security(SYM, "60",  f_satBandHtf(), lookahead = barmerge.lookahead_off)
+[st240, l1_240, l2_240, sb_240, c240] = request.security(SYM, "240", f_satBandHtf(), lookahead = barmerge.lookahead_off)
+
+[rgHigh, rgLow] = request.security(SYM, rgBoundTf, f_rangeHL(rgBoundLen), lookahead = barmerge.lookahead_off)
+float bkClose   = request.security(SYM, bkTf, f_brkClose(), lookahead = barmerge.lookahead_off)
+
+// チャート足（15秒）はローカル計算
+[l1c15v, l2c15v, sbc15v, _cd1, _cd2, _csd, stChartV] = f_satBand()
+
+// タプル分解した変数へ直接 history 参照をかけないよう、通常変数へコピーしておく
+float l1c15   = l1c15v
+float l2c15   = l2c15v
+float sbc15   = sbc15v
+int   stChart = stChartV
+int   s30S = st30S
+int   s1m  = st1
+int   s5m  = st5
+int   s15m = st15
+int   s60m = st60
+int   s240 = st240
+
+// 各足の消灯境界（青足＝3本の最大値＝支持、赤足＝3本の最小値＝抵抗）
+float sup5   = math.max(l1_5,   math.max(l2_5,   sb_5))
+float res5   = math.min(l1_5,   math.min(l2_5,   sb_5))
+float sup15  = math.max(l1_15,  math.max(l2_15,  sb_15))
+float res15  = math.min(l1_15,  math.min(l2_15,  sb_15))
+float sup60  = math.max(l1_60,  math.max(l2_60,  sb_60))
+float res60  = math.min(l1_60,  math.min(l2_60,  sb_60))
+float sup240 = math.max(l1_240, math.max(l2_240, sb_240))
+float res240 = math.min(l1_240, math.min(l2_240, sb_240))
+float sup1   = math.max(l1_1,   math.max(l2_1,   sb_1))
+float res1   = math.min(l1_1,   math.min(l2_1,   sb_1))
+
+// ============================================================================
+// 03｜実行環境ガードと共通ヘルパー
+// ============================================================================
+string symUp = str.upper(syminfo.ticker)
+bool isGold  = str.contains(symUp, "XAU") or str.contains(symUp, "GOLD") or str.startswith(symUp, "GC")
+bool isTf15S = timeframe.period == "15S"
+
+string guardMsg = ""
+if not isGold
+    guardMsg := "銘柄が XAUUSD 系ではありません（取引停止）"
+else if not isTf15S
+    guardMsg := "15秒足チャートではありません（取引停止）。現在: " + timeframe.period
+bool envOk = guardMsg == ""
+
+// 選択足が 0 件ならモード無効
+int  trSelCount = (trUse5 ? 1 : 0) + (trUse15 ? 1 : 0) + (trUse60 ? 1 : 0) + (trUse240 ? 1 : 0)
+int  rgSelCount = (rgUse5 ? 1 : 0) + (rgUse15 ? 1 : 0) + (rgUse60 ? 1 : 0) + (rgUse240 ? 1 : 0)
+int  bkSelCount = (bkUse5 ? 1 : 0) + (bkUse15 ? 1 : 0) + (bkUse60 ? 1 : 0) + (bkUse240 ? 1 : 0)
+
+// 背景足・目標足の分換算と整合チェック
+int cnBgMin  = cnBgTf  == "5分" ? 5 : cnBgTf  == "15分" ? 15 : cnBgTf == "1時間" ? 60 : 240
+int cnTgtMin = cnTgtTf == "5分" ? 5 : cnTgtTf == "15分" ? 15 : 60
+
+string modeMsg = ""
+if mode == M_TREND and trSelCount == 0
+    modeMsg := "巡行フィルターの選択足が 0 件です（モード無効）"
+else if mode == M_CNTR and cnTgtMin >= cnBgMin
+    modeMsg := "逆行の目標足が背景足以上です（モード無効）"
+else if mode == M_RBND and rgSelCount == 0
+    modeMsg := "レンジ判定足の選択が 0 件です（モード無効）"
+else if mode == M_BRK and rgSelCount == 0
+    modeMsg := "レンジ判定足の選択が 0 件です（モード無効）"
+else if mode == M_BRK and bkSelCount == 0
+    modeMsg := "ブレイク確認上位足の選択が 0 件です（モード無効）"
+bool modeOk = modeMsg == ""
+
+bool allowLong  = dirMode == D_BOTH or dirMode == D_LONG
+bool allowShort = dirMode == D_BOTH or dirMode == D_SHORT
+
+// 巡行フィルターの点灯集約（選択した赤・フラット足を青として扱わない）
+f_aggOk(bool agg_or, int wanted, bool u5, int s5, bool u15, int s15v, bool u60, int s60v, bool u240, int s240v) =>
+    bool anyOk = false
+    bool allOk = true
+    if u5
+        if s5 == wanted
+            anyOk := true
+        else
+            allOk := false
+    if u15
+        if s15v == wanted
+            anyOk := true
+        else
+            allOk := false
+    if u60
+        if s60v == wanted
+            anyOk := true
+        else
+            allOk := false
+    if u240
+        if s240v == wanted
+            anyOk := true
+        else
+            allOk := false
+    agg_or ? anyOk : allOk
+
+// 候補の選び方（第3節）
+//   15秒足終値からの絶対距離が最小のラインを選ぶ。同距離なら短い時間足。
+//   候補は必ず 5分 → 15分 → 1時間 → 4時間 の昇順で走査し、比較は厳密な「<」で行う。
+//   こうすると同距離のときは先に入った短い時間足がそのまま残る。
+
+// 指定分の時間足の State を返す
+f_stateOf(int tfMin) =>
+    int r = na
+    if tfMin == 5
+        r := st5
+    else if tfMin == 15
+        r := st15
+    else if tfMin == 60
+        r := st60
+    else
+        r := st240
+    r
+
+// ============================================================================
+// 04｜評価ゲート
+//   シグナル評価も State 遷移も、15秒足の確定した実行だけで行う。
+//   約定直後の追加実行（バー未確定）では barstate.isconfirmed が false になるため、
+//   ここを通らない＝新規シグナルを生成しない。
+// ============================================================================
+var bool pendingEntry = false
+var int  pendingDir   = 0
+var float setupSL     = na
+var string setupInfo  = ""
+
+bool mainEval = barstate.isconfirmed and envOk and modeOk
+bool flatNow  = strategy.position_size == 0 and not pendingEntry
+var int lastEntryBar = na
+bool canEnter = mainEval and flatNow and (na(lastEntryBar) or bar_index > lastEntryBar)
+
+// 発注要求（この足の評価で 1 回だけ立てる）
+float reqSL   = na
+int   reqDir  = 0
+string reqTag = ""
+
+// ============================================================================
+// 05｜トレンド巡行
+// ============================================================================
+bool trBullOk = f_aggOk(trAgg == "OR",  1, trUse5, st5, trUse15, st15, trUse60, st60, trUse240, st240)
+bool trBearOk = f_aggOk(trAgg == "OR", -1, trUse5, st5, trUse15, st15, trUse60, st60, trUse240, st240)
+
+var int   trDir  = 0       // 0=待機なし / 1=ロング待機 / -1=ショート待機
+var float trLine = na      // 記録した支持（ロング）／抵抗（ショート）
+var int   trTf   = 0       // 記録した時間足（分）
+
+if mainEval and mode == M_TREND
+    // --- 既存待機の破棄判定 ---
+    if trDir != 0
+        int recState = f_stateOf(trTf)
+        bool keep = true
+        if trDir == 1
+            if recState != 1 or not trBullOk
+                keep := false
+        else
+            if recState != -1 or not trBearOk
+                keep := false
+        if not keep
+            trDir  := 0
+            trLine := na
+            trTf   := 0
+
+    // --- 待機開始：赤(青)の15秒足自体が 境界±許容幅 の圏内にあること ---
+    //   まず「圏内にある青足の支持線」だけを候補にし、その中から
+    //   15秒足終値への絶対距離が最小のもの（同距離なら短い時間足）を選ぶ。
+    if trDir == 0 and allowLong and trBullOk and stChart == -1
+        bool z5   = trUse5   and st5   == 1 and not na(sup5)   and low <= sup5   + trNear and high >= sup5   - trNear
+        bool z15  = trUse15  and st15  == 1 and not na(sup15)  and low <= sup15  + trNear and high >= sup15  - trNear
+        bool z60  = trUse60  and st60  == 1 and not na(sup60)  and low <= sup60  + trNear and high >= sup60  - trNear
+        bool z240 = trUse240 and st240 == 1 and not na(sup240) and low <= sup240 + trNear and high >= sup240 - trNear
+        float bp = na
+        int   bt = 0
+        if z5
+            bp := sup5
+            bt := 5
+        if z15 and (na(bp) or math.abs(close - sup15) < math.abs(close - bp))
+            bp := sup15
+            bt := 15
+        if z60 and (na(bp) or math.abs(close - sup60) < math.abs(close - bp))
+            bp := sup60
+            bt := 60
+        if z240 and (na(bp) or math.abs(close - sup240) < math.abs(close - bp))
+            bp := sup240
+            bt := 240
+        if not na(bp)
+            trDir  := 1
+            trLine := bp
+            trTf   := bt
+    if trDir == 0 and allowShort and trBearOk and stChart == 1
+        bool y5   = trUse5   and st5   == -1 and not na(res5)   and low <= res5   + trNear and high >= res5   - trNear
+        bool y15  = trUse15  and st15  == -1 and not na(res15)  and low <= res15  + trNear and high >= res15  - trNear
+        bool y60  = trUse60  and st60  == -1 and not na(res60)  and low <= res60  + trNear and high >= res60  - trNear
+        bool y240 = trUse240 and st240 == -1 and not na(res240) and low <= res240 + trNear and high >= res240 - trNear
+        float sp = na
+        int   stf = 0
+        if y5
+            sp := res5
+            stf := 5
+        if y15 and (na(sp) or math.abs(close - res15) < math.abs(close - sp))
+            sp := res15
+            stf := 15
+        if y60 and (na(sp) or math.abs(close - res60) < math.abs(close - sp))
+            sp := res60
+            stf := 60
+        if y240 and (na(sp) or math.abs(close - res240) < math.abs(close - sp))
+            sp := res240
+            stf := 240
+        if not na(sp)
+            trDir  := -1
+            trLine := sp
+            trTf   := stf
+
+    // --- トリガー ---
+    if trDir != 0 and canEnter
+        bool trigA = trTrig == "A：赤の後にフラット"
+        if trDir == 1
+            bool hit = trigA ? stChart == 0 : stChart == 1
+            if hit and close > trLine and f_stateOf(trTf) == 1 and trBullOk
+                reqDir := 1
+                reqSL  := trLine - slOffset
+                reqTag := "巡行L " + str.tostring(trTf) + "m 支持=" + str.tostring(trLine, format.mintick)
+                // 1 セットアップにつき 1 回。新たな取引には新たな近接＋15秒赤が必要。
+                trDir  := 0
+                trLine := na
+                trTf   := 0
+        else
+            bool hit = trigA ? stChart == 0 : stChart == -1
+            if hit and close < trLine and f_stateOf(trTf) == -1 and trBearOk
+                reqDir := -1
+                reqSL  := trLine + slOffset
+                reqTag := "巡行S " + str.tostring(trTf) + "m 抵抗=" + str.tostring(trLine, format.mintick)
+                trDir  := 0
+                trLine := na
+                trTf   := 0
+
+// ============================================================================
+// 06｜トレンド逆行
+//   梯子：15秒 → 30秒 → 1分 → 5分 → 15分 → 1時間（固定）
+//   目標足までの各段階で「前回確定は青以外、今回確定は青」の転換を 1 回ずつ要求する。
+//   同一確定時刻に複数段階が進むことは許す。先行段階が未成立の時点で起きた
+//   後続段階の転換は遡って数えない。
+// ============================================================================
+int cnBgState = f_stateOf(cnBgMin)
+int cnNeed = cnTgtMin == 5 ? 4 : cnTgtMin == 15 ? 5 : 6
+
+// 各梯子足の「非青→青」「非赤→赤」転換（確定値の段差で検出）
+bool tr15sUp = stChart == 1  and nz(stChart[1], 0) != 1
+bool tr30sUp = s30S    == 1  and nz(s30S[1], 0)    != 1
+bool tr1Up   = s1m     == 1  and nz(s1m[1], 0)     != 1
+bool tr5Up   = s5m     == 1  and nz(s5m[1], 0)     != 1
+bool tr15Up  = s15m    == 1  and nz(s15m[1], 0)    != 1
+bool tr60Up  = s60m    == 1  and nz(s60m[1], 0)    != 1
+bool tr15sDn = stChart == -1 and nz(stChart[1], 0) != -1
+bool tr30sDn = s30S    == -1 and nz(s30S[1], 0)    != -1
+bool tr1Dn   = s1m     == -1 and nz(s1m[1], 0)     != -1
+bool tr5Dn   = s5m     == -1 and nz(s5m[1], 0)     != -1
+bool tr15Dn  = s15m    == -1 and nz(s15m[1], 0)    != -1
+bool tr60Dn  = s60m    == -1 and nz(s60m[1], 0)    != -1
+
+var int   cnDir   = 0    // 追跡中の方向（1=ロング狙い＝背景赤）
+var int   cnStage = 0
+var float cnSL    = na
+var int   cnPrevBg = na
+
+if mainEval and mode == M_CNTR
+    // 背景足の色が変わったら記録を空にする。ロード直後は最初に観測した確定状態を起点。
+    if na(cnPrevBg) or cnPrevBg != cnBgState
+        cnDir   := 0
+        cnStage := 0
+        cnSL    := na
+        cnPrevBg := cnBgState
+        if cnBgState == -1 and allowLong
+            cnDir := 1
+        else if cnBgState == 1 and allowShort
+            cnDir := -1
+
+    if cnDir == 1 and cnBgState != -1
+        cnDir   := 0
+        cnStage := 0
+    if cnDir == -1 and cnBgState != 1
+        cnDir   := 0
+        cnStage := 0
+
+    // 段階を順に進める。同一確定時刻に複数段階を進めてよい。
+    if cnDir == 1
+        if cnStage == 0 and tr15sUp
+            cnStage := 1
+        if cnStage == 1 and tr30sUp
+            cnStage := 2
+        if cnStage == 2 and tr1Up
+            cnStage := 3
+        if cnStage == 3 and tr5Up
+            cnStage := 4
+            if cnNeed == 4
+                cnSL := sup5
+        if cnStage == 4 and cnNeed >= 5 and tr15Up
+            cnStage := 5
+            if cnNeed == 5
+                cnSL := sup15
+        if cnStage == 5 and cnNeed >= 6 and tr60Up
+            cnStage := 6
+            cnSL := sup60
+    else if cnDir == -1
+        if cnStage == 0 and tr15sDn
+            cnStage := 1
+        if cnStage == 1 and tr30sDn
+            cnStage := 2
+        if cnStage == 2 and tr1Dn
+            cnStage := 3
+        if cnStage == 3 and tr5Dn
+            cnStage := 4
+            if cnNeed == 4
+                cnSL := res5
+        if cnStage == 4 and cnNeed >= 5 and tr15Dn
+            cnStage := 5
+            if cnNeed == 5
+                cnSL := res15
+        if cnStage == 5 and cnNeed >= 6 and tr60Dn
+            cnStage := 6
+            cnSL := res60
+
+    // 目標足到達で 1 回だけエントリー
+    if cnStage >= cnNeed and canEnter and not na(cnSL) and reqDir == 0
+        if cnDir == 1
+            reqDir := 1
+            reqSL  := cnSL - slOffset
+            reqTag := "逆行L 目標" + str.tostring(cnTgtMin) + "m 支持=" + str.tostring(cnSL, format.mintick)
+        else if cnDir == -1
+            reqDir := -1
+            reqSL  := cnSL + slOffset
+            reqTag := "逆行S 目標" + str.tostring(cnTgtMin) + "m 抵抗=" + str.tostring(cnSL, format.mintick)
+        cnStage := 0
+        cnSL    := na
+
+// ============================================================================
+// 07｜レンジ判定
+//   選んだすべての足で最後の確定 bandState が 0 のときだけ初期セットアップを許可。
+//   0 は 3 本の位置関係であって、価格が横ばいという意味ではない。
+// ============================================================================
+bool rgAllFlat = true
+if rgUse5 and st5 != 0
+    rgAllFlat := false
+if rgUse15 and st15 != 0
+    rgAllFlat := false
+if rgUse60 and st60 != 0
+    rgAllFlat := false
+if rgUse240 and st240 != 0
+    rgAllFlat := false
+if rgSelCount == 0
+    rgAllFlat := false
+bool rgBoundOk = not na(rgHigh) and not na(rgLow) and rgHigh > rgLow
+
+// ============================================================================
+// 08｜レンジ端反発
+//   ① 15秒/30秒/1分が個別に一度ずつ確定青（同時でなくてよい）
+//   ② 30秒が青以外へ　③ 1分足の支え成立　… ②③は順不同
+//   ④ 30秒が再び確定青 → エントリー
+// ============================================================================
+var int   rbDir      = 0
+var float rbBound    = na
+var bool  rbS15      = false
+var bool  rbS30      = false
+var bool  rbS1       = false
+var bool  rbOff30    = false
+var bool  rbSupport  = false
+var float rbSupLine  = na
+
+if mainEval and mode == M_RBND
+    // レンジ判定足が 1 つでも点灯したら待機を破棄
+    if rbDir != 0 and not rgAllFlat
+        rbDir     := 0
+        rbBound   := na
+        rbS15     := false
+        rbS30     := false
+        rbS1      := false
+        rbOff30   := false
+        rbSupport := false
+        rbSupLine := na
+
+    // --- セットアップ開始：5分足の確定終値が境界から rbNear 以内 ---
+    if rbDir == 0 and rgAllFlat and rgBoundOk
+        if allowLong and c5 >= rgLow and c5 <= rgLow + rbNear
+            rbDir   := 1
+            rbBound := rgLow
+        else if allowShort and c5 <= rgHigh and c5 >= rgHigh - rbNear
+            rbDir   := -1
+            rbBound := rgHigh
+
+    if rbDir != 0
+        int want = rbDir
+        // ① 各足が一度ずつ確定青（ショートは赤）
+        if stChart == want
+            rbS15 := true
+        if st30S == want
+            rbS30 := true
+        if st1 == want
+            rbS1 := true
+        bool stage1 = rbS15 and rbS30 and rbS1
+
+        // ② 30秒がいったん青以外
+        if stage1 and st30S != want
+            rbOff30 := true
+
+        // ③ 1分足の支え／抵抗の成立
+        if stage1 and not rbSupport
+            if rbDir == 1 and st1 == 1 and not na(sup1)
+                if low <= sup1 and c1 > sup1
+                    rbSupport := true
+                    rbSupLine := sup1
+            else if rbDir == -1 and st1 == -1 and not na(res1)
+                if high >= res1 and c1 < res1
+                    rbSupport := true
+                    rbSupLine := res1
+
+        // ④ 30秒の再点灯でエントリー
+        bool re30 = rbDir == 1 ? tr30sUp : tr30sDn
+        if stage1 and rbOff30 and rbSupport and re30 and canEnter and reqDir == 0
+            if st1 == want and not na(rbSupLine)
+                if rbDir == 1
+                    reqDir := 1
+                    reqSL  := rbSupLine - slOffset
+                    reqTag := "反発L 下限=" + str.tostring(rbBound, format.mintick) + " 支持=" + str.tostring(rbSupLine, format.mintick)
+                else
+                    reqDir := -1
+                    reqSL  := rbSupLine + slOffset
+                    reqTag := "反発S 上限=" + str.tostring(rbBound, format.mintick) + " 抵抗=" + str.tostring(rbSupLine, format.mintick)
+                // 同じ境界への接近から再発注しない
+                rbDir     := 0
+                rbBound   := na
+                rbS15     := false
+                rbS30     := false
+                rbS1      := false
+                rbOff30   := false
+                rbSupport := false
+                rbSupLine := na
+
+// ============================================================================
+// 09｜レンジ端ブレイク
+// ============================================================================
+bool bkBullOk = f_aggOk(bkAgg == "OR",  1, bkUse5, st5, bkUse15, st15, bkUse60, st60, bkUse240, st240)
+bool bkBearOk = f_aggOk(bkAgg == "OR", -1, bkUse5, st5, bkUse15, st15, bkUse60, st60, bkUse240, st240)
+
+var float bkCandHigh = na
+var float bkCandLow  = na
+var int   bkDir      = 0
+var float bkBound    = na
+
+if mainEval and mode == M_BRK
+    // レンジ判定足がすべてフラットの間だけ候補境界を更新する
+    if bkDir == 0 and rgAllFlat and rgBoundOk
+        bkCandHigh := rgHigh
+        bkCandLow  := rgLow
+
+    // ブレイク成立（判定足の確定終値が、判定足より前に確定済みの境界を厳密に超える）
+    if bkDir == 0 and not na(bkClose)
+        if allowLong and not na(bkCandHigh) and bkClose > bkCandHigh
+            bkDir   := 1
+            bkBound := bkCandHigh
+        else if allowShort and not na(bkCandLow) and bkClose < bkCandLow
+            bkDir   := -1
+            bkBound := bkCandLow
+
+    // ブレイク維持のチェック（終値が境界側へ戻ったら破棄）
+    if bkDir == 1 and not na(bkClose) and bkClose <= bkBound
+        bkDir   := 0
+        bkBound := na
+    if bkDir == -1 and not na(bkClose) and bkClose >= bkBound
+        bkDir   := 0
+        bkBound := na
+
+    // 上位足の確定点灯とブレイク維持が同時に成立した最初の15秒足確定で発注
+    if bkDir != 0 and canEnter and reqDir == 0
+        if bkDir == 1 and bkBullOk
+            float bp = na
+            int   bt = 0
+            if bkUse5 and st5 == 1 and not na(sup5)
+                bp := sup5
+                bt := 5
+            if bkUse15 and st15 == 1 and not na(sup15) and (na(bp) or math.abs(close - sup15) < math.abs(close - bp))
+                bp := sup15
+                bt := 15
+            if bkUse60 and st60 == 1 and not na(sup60) and (na(bp) or math.abs(close - sup60) < math.abs(close - bp))
+                bp := sup60
+                bt := 60
+            if bkUse240 and st240 == 1 and not na(sup240) and (na(bp) or math.abs(close - sup240) < math.abs(close - bp))
+                bp := sup240
+                bt := 240
+            if not na(bp)
+                reqDir := 1
+                reqSL  := bp - slOffset
+                reqTag := "上限BreakL 上限=" + str.tostring(bkBound, format.mintick) + " " + str.tostring(bt) + "m 支持=" + str.tostring(bp, format.mintick)
+                bkDir   := 0
+                bkBound := na
+        else if bkDir == -1 and bkBearOk
+            float sp = na
+            int   stf = 0
+            if bkUse5 and st5 == -1 and not na(res5)
+                sp := res5
+                stf := 5
+            if bkUse15 and st15 == -1 and not na(res15) and (na(sp) or math.abs(close - res15) < math.abs(close - sp))
+                sp := res15
+                stf := 15
+            if bkUse60 and st60 == -1 and not na(res60) and (na(sp) or math.abs(close - res60) < math.abs(close - sp))
+                sp := res60
+                stf := 60
+            if bkUse240 and st240 == -1 and not na(res240) and (na(sp) or math.abs(close - res240) < math.abs(close - sp))
+                sp := res240
+                stf := 240
+            if not na(sp)
+                reqDir := -1
+                reqSL  := sp + slOffset
+                reqTag := "下限BreakS 下限=" + str.tostring(bkBound, format.mintick) + " " + str.tostring(stf) + "m 抵抗=" + str.tostring(sp, format.mintick)
+                bkDir   := 0
+                bkBound := na
+
+// ============================================================================
+// 10｜発注
+//   シグナル確定時に SL の位置・正のリスク幅・na を検査し、不正なら発注しない。
+// ============================================================================
+var int rejectCount = 0
+
+if reqDir != 0 and canEnter
+    bool ok = not na(reqSL) and not na(close)
+    if ok
+        if reqDir == 1
+            ok := reqSL < close and (close - reqSL) > 0
+        else
+            ok := reqSL > close and (reqSL - close) > 0
+    if ok
+        pendingEntry := true
+        pendingDir   := reqDir
+        setupSL      := reqSL
+        setupInfo    := reqTag
+        lastEntryBar := bar_index
+        if reqDir == 1
+            strategy.entry("E", strategy.long, qty = qtySize, comment = reqTag)
+        else
+            strategy.entry("E", strategy.short, qty = qtySize, comment = reqTag)
+    else
+        rejectCount := rejectCount + 1
+
+// ============================================================================
+// 11｜約定検知 → SL / TP の設置
+//   約定を最初に検知した実行（calc_on_order_fills による追加実行、または次の確定足）で
+//   実際の strategy.position_avg_price を読み、記録済みの境界価格から SL / TP を出す。
+//   ここでは新規シグナルを一切生成しない。
+// ============================================================================
+var int abnormalCount = 0
+var float lastFillPrice = na
+var float lastTp = na
+
+if pendingEntry and strategy.position_size != 0
+    float avg = strategy.position_avg_price
+    float sl  = setupSL
+    bool abnormal = false
+    float tp = na
+    if pendingDir == 1
+        abnormal := na(avg) or na(sl) or avg <= sl
+        tp := avg + rrRatio * (avg - sl)
+    else
+        abnormal := na(avg) or na(sl) or avg >= sl
+        tp := avg - rrRatio * (sl - avg)
+    if abnormal
+        // 予想外のギャップで約定が SL の反対側になった場合。取り消したふりをせず、
+        // 可能な最初の時点で決済し、異常約定として別計上する。
+        abnormalCount := abnormalCount + 1
+        strategy.close("E", comment = "ABNORMAL FILL")
+    else
+        strategy.exit("X", from_entry = "E", stop = sl, limit = tp,
+             comment_loss = "SL", comment_profit = "TP")
+        lastFillPrice := avg
+        lastTp := tp
+    pendingEntry := false
+
+// ポジションが無くなったら発注ロックを解く（決済後は新しいセットアップを要求する）
+if strategy.position_size == 0 and not pendingEntry
+    lastFillPrice := na
+    lastTp := na
+
+// ============================================================================
+// 12｜表示
+//   通常表示は軽量にする。マーカーとデバッグ出力は既定 OFF。
+// ============================================================================
+plotshape(dbgMarker and mode == M_TREND and trDir == 1  and nz(trDir[1], 0) == 0,
+     title = "巡行L 待機開始", style = shape.triangleup, location = location.belowbar, color = color.new(#068C8C, 0), size = size.tiny)
+plotshape(dbgMarker and mode == M_TREND and trDir == -1 and nz(trDir[1], 0) == 0,
+     title = "巡行S 待機開始", style = shape.triangledown, location = location.abovebar, color = color.new(#F54230, 0), size = size.tiny)
+plotshape(dbgMarker and reqDir == 1,  title = "シグナル L", style = shape.labelup,   location = location.belowbar, color = color.new(#068C8C, 0), size = size.tiny)
+plotshape(dbgMarker and reqDir == -1, title = "シグナル S", style = shape.labeldown, location = location.abovebar, color = color.new(#F54230, 0), size = size.tiny)
+
+// 実行環境・モードのエラー表示
+var table infoTbl = table.new(position.top_right, 1, 2, border_width = 1)
+if barstate.islast
+    if not envOk
+        table.cell(infoTbl, 0, 0, guardMsg, text_color = color.white, bgcolor = color.new(color.red, 20), text_size = size.small)
+    else
+        table.cell(infoTbl, 0, 0, "OK: " + syminfo.ticker + " / " + timeframe.period, text_color = color.white, bgcolor = color.new(color.black, 40), text_size = size.small)
+    if not modeOk
+        table.cell(infoTbl, 0, 1, modeMsg, text_color = color.white, bgcolor = color.new(color.orange, 20), text_size = size.small)
+    else
+        table.cell(infoTbl, 0, 1, mode + " / " + dirMode, text_color = color.white, bgcolor = color.new(color.black, 40), text_size = size.small)
+
+// ============================================================================
+// 13｜デバッグ出力（データウィンドウのみ）
+//   元コードと同じ確定足で LINE1 / LINE2 / STB / bandState を並べて照合できるようにする。
+// ============================================================================
+plot(dbgMode ? l1c15 : na, "DBG 15S LINE1", display = display.data_window)
+plot(dbgMode ? l2c15 : na, "DBG 15S LINE2", display = display.data_window)
+plot(dbgMode ? sbc15 : na, "DBG 15S STB",   display = display.data_window)
+plot(dbgMode ? stChart * 1.0 : na, "DBG 15S state", display = display.data_window)
+
+plot(dbgMode ? st30S * 1.0 : na, "DBG 30S state", display = display.data_window)
+plot(dbgMode ? st1   * 1.0 : na, "DBG 1m state",  display = display.data_window)
+plot(dbgMode ? st5   * 1.0 : na, "DBG 5m state",  display = display.data_window)
+plot(dbgMode ? st15  * 1.0 : na, "DBG 15m state", display = display.data_window)
+plot(dbgMode ? st60  * 1.0 : na, "DBG 60m state", display = display.data_window)
+plot(dbgMode ? st240 * 1.0 : na, "DBG 240m state", display = display.data_window)
+
+plot(dbgMode ? l1_5 : na, "DBG 5m LINE1", display = display.data_window)
+plot(dbgMode ? l2_5 : na, "DBG 5m LINE2", display = display.data_window)
+plot(dbgMode ? sb_5 : na, "DBG 5m STB",   display = display.data_window)
+plot(dbgMode ? sup5 : na, "DBG 5m 支持(3本max)", display = display.data_window)
+plot(dbgMode ? res5 : na, "DBG 5m 抵抗(3本min)", display = display.data_window)
+
+plot(dbgMode ? rgHigh : na, "DBG レンジ上限", display = display.data_window)
+plot(dbgMode ? rgLow  : na, "DBG レンジ下限", display = display.data_window)
+plot(dbgMode ? bkClose : na, "DBG ブレイク判定足 終値", display = display.data_window)
+
+plot(dbgMode ? trDir * 1.0 : na,  "DBG 巡行 待機方向", display = display.data_window)
+plot(dbgMode ? trLine : na,       "DBG 巡行 記録線",   display = display.data_window)
+plot(dbgMode ? trTf * 1.0 : na,   "DBG 巡行 記録TF(分)", display = display.data_window)
+plot(dbgMode ? cnDir * 1.0 : na,  "DBG 逆行 方向",     display = display.data_window)
+plot(dbgMode ? cnStage * 1.0 : na,"DBG 逆行 段階",     display = display.data_window)
+plot(dbgMode ? rbDir * 1.0 : na,  "DBG 反発 方向",     display = display.data_window)
+plot(dbgMode ? rbBound : na,      "DBG 反発 境界",     display = display.data_window)
+plot(dbgMode ? rbSupLine : na,    "DBG 反発 支持/抵抗", display = display.data_window)
+plot(dbgMode ? bkDir * 1.0 : na,  "DBG Break 方向",    display = display.data_window)
+plot(dbgMode ? bkBound : na,      "DBG Break 境界",    display = display.data_window)
+
+plot(dbgMode ? setupSL : na,        "DBG 記録SL",     display = display.data_window)
+plot(dbgMode ? lastFillPrice : na,  "DBG 約定価格",   display = display.data_window)
+plot(dbgMode ? lastTp : na,         "DBG TP",         display = display.data_window)
+plot(dbgMode ? abnormalCount * 1.0 : na, "DBG 異常約定件数", display = display.data_window)
+plot(dbgMode ? rejectCount * 1.0 : na,   "DBG SL不正で見送り件数", display = display.data_window)
