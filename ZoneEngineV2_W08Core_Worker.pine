@@ -85,6 +85,14 @@
 // Candidate the final Core slot / coreId / generationId; logical count 0 until a commit succeeds. coreIndexRelease
 // removes every Worker entry of one Core (origin nodes reclaimed to the free list, both interval tuples, every inverse
 // tuple); coreIndexClean tells whether a slot holds no Worker entry at all (slot-reuse precondition).
+// The mapping is logically invalidated (count 0) whenever physicalBuild / identityPlanBuild / ownershipPlanBuild starts.
+//
+// B08: Merge topology relations (new-centric planning only, nothing applied). One relation per physical Candidate with
+// >= 2 distinct old Cores in physicalIdentityEdges (the full graph, never the matches alone), in new canonical order:
+// mergeRelations stride 5 [physicalCandidateIndex, survivorOldCoreSlot (-1 none), survivorOldCoreId (0 none),
+// absorbedOffset (row in mergeAbsorbed), absorbedCount]; mergeAbsorbed stride 2 [oldCoreSlot, oldCoreId] in old canonical
+// order (coreCreatedTime, coreId ASC). The survivor is the B07-B selected match of that Candidate (a fresh Candidate has
+// none); absorbed = every other old of its full edge set. Absorbed is a relation role only: never a free decision.
 // ============================================================
 library("ZoneEngineV2_W08Core_Worker", overlay = false)
 
@@ -137,6 +145,10 @@ export type W08Store
     array<int>   physicalMaterializedCoreIds
     array<int>   physicalMaterializedGenerationIds
     int          physicalMaterializedLogicalCount = 0
+    array<int>   mergeRelations
+    array<int>   mergeAbsorbed
+    int          mergeRelationCount = 0
+    int          mergeAbsorbedLogicalCount = 0
 
 export newStore() =>
     W08Store s = W08Store.new()
@@ -177,6 +189,8 @@ export newStore() =>
     s.physicalMaterializedCoreSlots               := array.new_int(0)
     s.physicalMaterializedCoreIds                 := array.new_int(0)
     s.physicalMaterializedGenerationIds           := array.new_int(0)
+    s.mergeRelations                              := array.new_int(0)
+    s.mergeAbsorbed                               := array.new_int(0)
     s
 
 // currentCoreId = the Core ID of a live Core at coreSlot, ID_NONE when the slot is out of
@@ -1117,6 +1131,7 @@ physicalAppendRaw(W08Store store, int sIdx, int rIdx, array<int> bottomTicks, ar
 // output) for bad sizes, an odd / out-of-range / wrong-Side / repeated matched endpoint, a pairing order entry that is
 // not a winner of that Side with the same ticks, a winner left unassigned, or any physicalAppendRaw failure.
 export physicalBuild(W08Store store, int candidateWinnerLogicalCount, array<int> candidateWinnerSides, array<int> candidateWinnerEffectiveBottomTicks, array<int> candidateWinnerEffectiveTopTicks, array<float> candidateWinnerExactPrices, array<int> candidateWinnerMinRootIds, array<int> candidateWinnerRootIdOffsets, array<int> candidateWinnerRootIdLengths, array<int> candidateWinnerRootIds, int candidateWinnerRootIdLength, array<int> matchedPairs, float mintick) =>
+    store.physicalMaterializedLogicalCount := 0
     array.clear(store.physicalCandidateSupportWinnerIndexes)
     array.clear(store.physicalCandidateResistanceWinnerIndexes)
     array.clear(store.physicalCandidateBottomTicks)
@@ -1205,6 +1220,7 @@ physicalNewCompareRaw(W08Store store, int p, int q) =>
 // bad input, an index out of range, a na createdTime, a coreId seen with another slot / createdTime, a repeated edge, or
 // two edge-bearing Candidates that tie on the complete new order. The physical Candidate storage is never touched.
 export identityPlanBuild(W08Store store, int physicalCount, array<int> rawEdges) =>
+    store.physicalMaterializedLogicalCount := 0
     array.clear(store.physicalIdentityEdges)
     array.clear(store.physicalIdentityMatches)
     int  rLen = array.size(rawEdges)
@@ -1329,6 +1345,7 @@ winnerProvenanceCompareRaw(int v, int w, array<int> stages, array<int> bottomTic
 // Fresh Candidates are ranked by physicalNewCompareRaw, then Support and Resistance winnerProvenanceCompareRaw; a
 // complete tie fails (no index or storage fallback). -1 with empty ownership storage on any fault.
 export ownershipPlanBuild(W08Store store, int identityMatchCount, array<bool> coreLive, array<int> coreIds, array<int> coreGenerationIds, array<int> candidateWinnerStages, array<int> candidateWinnerEffectiveBottomTicks, array<int> candidateWinnerEffectiveTopTicks, array<int> candidateWinnerMinRootIds, array<int> candidateWinnerFvgModes, array<int> candidateWinnerPsychLevelTicks, array<int> candidateWinnerRootIdOffsets, array<int> candidateWinnerRootIdLengths, array<int> candidateWinnerRootIds, int candidateWinnerRootIdLength) =>
+    store.physicalMaterializedLogicalCount := 0
     array.clear(store.physicalOwnershipKinds)
     array.clear(store.physicalContinuationOldCoreSlots)
     array.clear(store.physicalContinuationCoreIds)
@@ -1498,3 +1515,98 @@ export coreIndexClean(W08Store store, int coreSlot) =>
         clean := array.get(store.inverseOriginData, k + 1) != coreSlot
         k += 3
     clean
+
+// Builds the Merge relations of the current pass from physicalIdentityEdges and physicalIdentityMatches (ownershipResult
+// must equal this pass's physicalFreshAllocationCount) and returns the relation count. Every edge must name a live old
+// Core with coreIds[slot] == coreId >= 1, a set coreCreatedTime and one slot per coreId, edges in canonical old order
+// with no repeat; a Candidate holds at most one match and that match must be one of its edges. Relation order =
+// physicalNewCompareRaw (complete ties fail). Only the Merge storage is written; -1 with it empty on any fault.
+export mergePlanBuild(W08Store store, int ownershipResult, array<bool> coreLive, array<int> coreIds, array<int> coreCreatedTimes) =>
+    array.clear(store.mergeRelations)
+    array.clear(store.mergeAbsorbed)
+    int  n  = store.physicalCandidateLogicalCount
+    int  ne = store.physicalIdentityEdgeCount
+    int  nm = store.physicalIdentityMatchCount
+    array<int> ed = store.physicalIdentityEdges
+    bool ok = ownershipResult >= 0 and ownershipResult == store.physicalFreshAllocationCount and array.size(ed) == 3 * ne and array.size(store.physicalIdentityMatches) == 3 * nm
+    array<int>  deg      = array.new_int(ok ? n : 0, 0)
+    array<int>  matchId  = array.new_int(ok ? n : 0, 0)
+    array<int>  matchSl  = array.new_int(ok ? n : 0, -1)
+    array<bool> matchHit = array.new_bool(ok ? n : 0, false)
+    int k = 0
+    while ok and k < nm
+        int p = array.get(store.physicalIdentityMatches, 3 * k)
+        ok := p >= 0 and p < n
+        if ok
+            ok := array.get(matchId, p) == 0 and array.get(store.physicalIdentityMatches, 3 * k + 2) >= 1
+            array.set(matchSl, p, array.get(store.physicalIdentityMatches, 3 * k + 1))
+            array.set(matchId, p, array.get(store.physicalIdentityMatches, 3 * k + 2))
+        k += 1
+    map<int, int> slotOf = map.new<int, int>()
+    int lastCt = 0
+    int lastId = 0
+    int lastP  = -1
+    k := 0
+    while ok and k < ne
+        int p  = array.get(ed, 3 * k)
+        int sl = array.get(ed, 3 * k + 1)
+        int id = array.get(ed, 3 * k + 2)
+        ok := p >= 0 and p < n and sl >= 0 and sl < array.size(coreLive) and sl < array.size(coreIds) and sl < array.size(coreCreatedTimes) and id >= 1
+        if ok
+            ok := array.get(coreLive, sl) and array.get(coreIds, sl) == id and not na(array.get(coreCreatedTimes, sl)) and (not map.contains(slotOf, id) or map.get(slotOf, id) == sl)
+        if ok
+            int ct = array.get(coreCreatedTimes, sl)
+            // canonical old order (createdTime, coreId), inside one old strictly ascending new order (no repeated edge)
+            ok := k == 0 or ct > lastCt or (ct == lastCt and id > lastId)
+            if not ok and k > 0 and ct == lastCt and id == lastId
+                ok := physicalNewCompareRaw(store, lastP, p) < 0
+            map.put(slotOf, id, sl)
+            array.set(deg, p, array.get(deg, p) + 1)
+            if array.get(matchId, p) == id
+                ok := ok and array.get(matchSl, p) == sl and not array.get(matchHit, p)
+                array.set(matchHit, p, true)
+            lastCt := ct
+            lastId := id
+            lastP  := p
+        k += 1
+    k := 0
+    while ok and k < n
+        ok := array.get(matchId, k) == 0 or array.get(matchHit, k)
+        k += 1
+    // Merge targets (degree >= 2) in new canonical order
+    array<int> targets = array.new_int(0)
+    k := 0
+    while ok and k < n
+        if array.get(deg, k) >= 2
+            int pos = 0
+            int c   = 1
+            while ok and c > 0 and pos < array.size(targets)
+                c  := physicalNewCompareRaw(store, k, array.get(targets, pos))
+                ok := c != 0
+                if c > 0
+                    pos += 1
+            if ok
+                array.insert(targets, pos, k)
+        k += 1
+    int t = 0
+    while ok and t < array.size(targets)
+        int p   = array.get(targets, t)
+        int off = int(array.size(store.mergeAbsorbed) / 2)
+        k := 0
+        while k < ne
+            if array.get(ed, 3 * k) == p and array.get(ed, 3 * k + 2) != array.get(matchId, p)
+                array.push(store.mergeAbsorbed, array.get(ed, 3 * k + 1))
+                array.push(store.mergeAbsorbed, array.get(ed, 3 * k + 2))
+            k += 1
+        array.push(store.mergeRelations, p)
+        array.push(store.mergeRelations, array.get(matchSl, p))
+        array.push(store.mergeRelations, array.get(matchId, p))
+        array.push(store.mergeRelations, off)
+        array.push(store.mergeRelations, int(array.size(store.mergeAbsorbed) / 2) - off)
+        t += 1
+    if not ok
+        array.clear(store.mergeRelations)
+        array.clear(store.mergeAbsorbed)
+    store.mergeRelationCount        := ok ? array.size(targets) : 0
+    store.mergeAbsorbedLogicalCount := ok ? int(array.size(store.mergeAbsorbed) / 2) : 0
+    ok ? array.size(targets) : -1
