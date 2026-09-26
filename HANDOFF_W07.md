@@ -6,7 +6,8 @@
 - 未完了Batch 0 / 未解決canonical diff 0 / 未解決非I27質問 0 / Production未commit差分 0
 
 ## 2 最終HEAD
-- 本closeout commit（親 `c6aac0a`）= W08開始HEAD
+- W07 closeout base: `093f67b3c71f216acdeb7b3508b1d77859fe30e5`
+- W08開始HEAD: このHANDOFF最終commitのHEAD
 
 ## 3 Production published versions（source importで確認）
 - Main `ZoneEngineV2_Rebuild` /22（W07 B17〜B19 Harnessのimport）
@@ -32,10 +33,10 @@
 - B19 L2B（190202）: Failures 0、Fixture 50、Missing 0 / Extra 0、Offer 768 / 768
 - B19 L2C3（190203）/ L2C4（190204）: 各Failures 0、Fixture 53、Winner / Broad / Invalid 0
 
-## 6 B19 3-layer proof
-1. Lane1 interval primitive: Reference pair = interval-index pair
+## 6 B19 proof stack
+1. Lane1 interval primitive: Reference = interval-index
 2. L2A logical winner parity: W04 full Reference = W05 /3 = W05 /4（W 50）、/3 = /4（53）
-3. L2B actual offer trace parity: /3 BaselineProbe = /4 Probe の Stage A/B offer多重集合（pointRootOffsetは比較しない）
+3. L2B actual offer trace parity: /3 BaselineProbe = /4 Probe の Stage A/B offer多重集合
 4. L2C ProbeDrift: actual /3 = BaselineProbe /1、actual /4 = B19Probe /1（winner drift 0）
 
 ## 7 branch-and-bound注意
