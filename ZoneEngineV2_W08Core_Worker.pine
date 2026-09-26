@@ -49,6 +49,12 @@
 // result. Only Cores that already passed the caller's live guards (W08_B04_GUARD_01..03) are
 // offered; the scratch never reads the Core registry. The order is a deterministic physical
 // enumeration only: not a comparator key, Identity tie-break or survivor rule.
+//
+// B06-A: Side Candidate interval pairing (same pass, Support x Resistance, interval gap <= M
+// only: no Root / category / inverse test here). Four indexes, stride 3 per entry
+// [+0 candidateWinnerIndex, +1 bottomTick, +2 topTick]: per Side a bottom order (bottomTick,
+// topTick, winnerIndex ASC) and a top order (topTick, bottomTick, winnerIndex ASC), always the
+// same entry set per Side. These physical orders are not the Candidate comparator.
 // ============================================================
 library("ZoneEngineV2_W08Core_Worker", overlay = false)
 
@@ -72,6 +78,10 @@ export type W08Store
     int         topologyRevision = 0
     array<int>  inverseOriginData
     array<int>  identityGatherData
+    array<int>  pairingSupportBottomOrderData
+    array<int>  pairingSupportTopOrderData
+    array<int>  pairingResistanceBottomOrderData
+    array<int>  pairingResistanceTopOrderData
 
 export newStore() =>
     W08Store s = W08Store.new()
@@ -89,6 +99,10 @@ export newStore() =>
     s.coreZoneOriginRootNodeFreeIndexes           := array.new_int(0)
     s.inverseOriginData                           := array.new_int(0)
     s.identityGatherData                          := array.new_int(0)
+    s.pairingSupportBottomOrderData               := array.new_int(0)
+    s.pairingSupportTopOrderData                  := array.new_int(0)
+    s.pairingResistanceBottomOrderData            := array.new_int(0)
+    s.pairingResistanceTopOrderData               := array.new_int(0)
     s
 
 // currentCoreId = the Core ID of a live Core at coreSlot, ID_NONE when the slot is out of
@@ -514,4 +528,194 @@ export identityGatherReadAsc(W08Store store, array<int> outPairs) =>
         result := int(dataSize / 2)
     else
         array.clear(outPairs)
+    result
+
+export pairingReset(W08Store store) =>
+    array.clear(store.pairingSupportBottomOrderData)
+    array.clear(store.pairingSupportTopOrderData)
+    array.clear(store.pairingResistanceBottomOrderData)
+    array.clear(store.pairingResistanceTopOrderData)
+    true
+
+// side: Support = 1, Resistance = -1. The winner is located in both indexes of its Side before
+// any write: absent from both -> inserted into both at the canonical positions; present in both
+// with the same range -> no-op; any other case (other range, present in one index only, unequal
+// index sizes) -> ok = false with no write. Local checks only, no full audit.
+export pairingAddCandidate(W08Store store, int side, int candidateWinnerIndex, int bottomTick, int topTick) =>
+    bool ok      = false
+    bool changed = false
+    if (side == 1 or side == -1) and candidateWinnerIndex >= 0 and bottomTick <= topTick
+        array<int> d = side == 1 ? store.pairingSupportBottomOrderData : store.pairingResistanceBottomOrderData
+        array<int> e = side == 1 ? store.pairingSupportTopOrderData    : store.pairingResistanceTopOrderData
+        int dataSize = array.size(d)
+        if dataSize % 3 == 0 and array.size(e) == dataSize
+            int k = 0
+            while k < dataSize and array.get(d, k) != candidateWinnerIndex
+                k += 3
+            int j = 0
+            while j < dataSize and array.get(e, j) != candidateWinnerIndex
+                j += 3
+            if k < dataSize and j < dataSize
+                ok := array.get(d, k + 1) == bottomTick and array.get(d, k + 2) == topTick and array.get(e, j + 1) == bottomTick and array.get(e, j + 2) == topTick
+            else if k == dataSize and j == dataSize
+                ok := true
+                array.push(d, candidateWinnerIndex)
+                array.push(d, bottomTick)
+                array.push(d, topTick)
+                while k > 0 and (array.get(d, k - 2) > bottomTick or (array.get(d, k - 2) == bottomTick and (array.get(d, k - 1) > topTick or (array.get(d, k - 1) == topTick and array.get(d, k - 3) > candidateWinnerIndex))))
+                    for n = 0 to 2
+                        array.set(d, k + n, array.get(d, k - 3 + n))
+                    k -= 3
+                array.set(d, k,     candidateWinnerIndex)
+                array.set(d, k + 1, bottomTick)
+                array.set(d, k + 2, topTick)
+                array.push(e, candidateWinnerIndex)
+                array.push(e, bottomTick)
+                array.push(e, topTick)
+                while j > 0 and (array.get(e, j - 1) > topTick or (array.get(e, j - 1) == topTick and (array.get(e, j - 2) > bottomTick or (array.get(e, j - 2) == bottomTick and array.get(e, j - 3) > candidateWinnerIndex))))
+                    for n = 0 to 2
+                        array.set(e, j + n, array.get(e, j - 3 + n))
+                    j -= 3
+                array.set(e, j,     candidateWinnerIndex)
+                array.set(e, j + 1, bottomTick)
+                array.set(e, j + 2, topTick)
+                changed := true
+    [ok, changed]
+
+// Writes every (supportWinnerIndex, resistanceWinnerIndex) with R.bottom <= S.top + mTick and
+// R.top >= S.bottom - mTick (interval gap <= M, equality included) into outPairs, stride 2,
+// ordered by supportWinnerIndex ASC then resistanceWinnerIndex ASC, and returns the count; -1
+// with an empty outPairs for mTick < 0 or bad storage. Sweep over the Support intervals widened
+// by mTick and the Resistance intervals: starts come from the two bottom orders, expiries from
+// the two top orders; each new interval pairs with the live intervals of the other Side (exact
+// condition re-checked), so each pair is found once and no Support x Resistance scan is made.
+// The pairs are then put in canonical order by a stable two-pass counting sort.
+export pairingCollectPairs(W08Store store, int mTick, array<int> outPairs) =>
+    array<int> sb = store.pairingSupportBottomOrderData
+    array<int> st = store.pairingSupportTopOrderData
+    array<int> rb = store.pairingResistanceBottomOrderData
+    array<int> rt = store.pairingResistanceTopOrderData
+    array.clear(outPairs)
+    int  sSize = array.size(sb)
+    int  rSize = array.size(rb)
+    bool ok    = mTick >= 0 and sSize % 3 == 0 and rSize % 3 == 0 and array.size(st) == sSize and array.size(rt) == rSize
+    array<int> activeS = array.new_int(0)
+    array<int> activeR = array.new_int(0)
+    array<int> ps      = array.new_int(0)
+    array<int> pr      = array.new_int(0)
+    int maxS = 0
+    int maxR = 0
+    int si = 0
+    int ri = 0
+    int se = 0
+    int re = 0
+    while ok and (si < sSize or ri < rSize)
+        bool takeS    = ri >= rSize or (si < sSize and array.get(sb, si + 1) - mTick <= array.get(rb, ri + 1))
+        int  curStart = 0
+        if takeS
+            curStart := array.get(sb, si + 1) - mTick
+        else
+            curStart := array.get(rb, ri + 1)
+        while ok and se < sSize and array.get(st, se + 2) + mTick < curStart
+            int idx = array.get(st, se)
+            int a   = 0
+            while a < array.size(activeS) and array.get(activeS, a) != idx
+                a += 3
+            ok := a < array.size(activeS)
+            if ok
+                int last = array.size(activeS) - 3
+                for n = 0 to 2
+                    array.set(activeS, a + n, array.get(activeS, last + n))
+                for n = 1 to 3
+                    array.pop(activeS)
+            se += 3
+        while ok and re < rSize and array.get(rt, re + 2) < curStart
+            int idx = array.get(rt, re)
+            int a   = 0
+            while a < array.size(activeR) and array.get(activeR, a) != idx
+                a += 3
+            ok := a < array.size(activeR)
+            if ok
+                int last = array.size(activeR) - 3
+                for n = 0 to 2
+                    array.set(activeR, a + n, array.get(activeR, last + n))
+                for n = 1 to 3
+                    array.pop(activeR)
+            re += 3
+        if ok
+            if takeS
+                int sIdx = array.get(sb, si)
+                int sBot = array.get(sb, si + 1)
+                int sTop = array.get(sb, si + 2)
+                int a = 0
+                while a < array.size(activeR)
+                    if array.get(activeR, a + 1) <= sTop + mTick and array.get(activeR, a + 2) >= sBot - mTick
+                        array.push(ps, sIdx)
+                        array.push(pr, array.get(activeR, a))
+                        maxS := math.max(maxS, sIdx)
+                        maxR := math.max(maxR, array.get(activeR, a))
+                    a += 3
+                array.push(activeS, sIdx)
+                array.push(activeS, sBot)
+                array.push(activeS, sTop)
+                si += 3
+            else
+                int rIdx = array.get(rb, ri)
+                int rBot = array.get(rb, ri + 1)
+                int rTop = array.get(rb, ri + 2)
+                int a = 0
+                while a < array.size(activeS)
+                    if rBot <= array.get(activeS, a + 2) + mTick and rTop >= array.get(activeS, a + 1) - mTick
+                        array.push(ps, array.get(activeS, a))
+                        array.push(pr, rIdx)
+                        maxS := math.max(maxS, array.get(activeS, a))
+                        maxR := math.max(maxR, rIdx)
+                    a += 3
+                array.push(activeR, rIdx)
+                array.push(activeR, rBot)
+                array.push(activeR, rTop)
+                ri += 3
+    int result = -1
+    if ok
+        int count = array.size(ps)
+        array<int> byR  = array.new_int(count, 0)
+        array<int> cntR = array.new_int(maxR + 2, 0)
+        int x = 0
+        while x < count
+            array.set(cntR, array.get(pr, x) + 1, array.get(cntR, array.get(pr, x) + 1) + 1)
+            x += 1
+        x := 1
+        while x < maxR + 2
+            array.set(cntR, x, array.get(cntR, x) + array.get(cntR, x - 1))
+            x += 1
+        x := 0
+        while x < count
+            int key = array.get(pr, x)
+            array.set(byR, array.get(cntR, key), x)
+            array.set(cntR, key, array.get(cntR, key) + 1)
+            x += 1
+        array<int> finalOrder = array.new_int(count, 0)
+        array<int> cntS       = array.new_int(maxS + 2, 0)
+        x := 0
+        while x < count
+            array.set(cntS, array.get(ps, x) + 1, array.get(cntS, array.get(ps, x) + 1) + 1)
+            x += 1
+        x := 1
+        while x < maxS + 2
+            array.set(cntS, x, array.get(cntS, x) + array.get(cntS, x - 1))
+            x += 1
+        x := 0
+        while x < count
+            int p   = array.get(byR, x)
+            int key = array.get(ps, p)
+            array.set(finalOrder, array.get(cntS, key), p)
+            array.set(cntS, key, array.get(cntS, key) + 1)
+            x += 1
+        x := 0
+        while x < count
+            int p = array.get(finalOrder, x)
+            array.push(outPairs, array.get(ps, p))
+            array.push(outPairs, array.get(pr, p))
+            x += 1
+        result := count
     result
