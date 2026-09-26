@@ -2,65 +2,1924 @@
 // ============================================================
 // ZoneEngineV2_W08Runtime_Worker - W08 runtime orchestration worker
 //
-// Future home (B15-B1 onward) of the W08 confirmed-5m pass orchestration: moved identity gather, pairing collection,
-// chain orchestration, pass F0 and commit orchestration. Storage primitives stay in W08Core (registry, alloc / reset /
-// free, origin / interval / inverse, physical / Identity / Merge / Split / Pending / Changed) and W08Touch (ring, plans,
-// ring apply). It never imports the Main library; it imports W08Core and W08Touch only (no cycle).
+// Home of the W08 confirmed-5m pass orchestration (B15). It never imports the Main library and never sees the Main
+// ZoneEngine: callers pass reference views (no array copy) of the Main storage it reads / writes - RootView,
+// ParticipationView, PhaseSetView, WinnerView (W03 Candidate winners), ComponentMetaView (W06 /18 component dependency and
+// semantic change metadata), the W08Core W08Store (with the nested CoreRegistryStore), the W08Core PendingTopologyStore pool,
+// the W08Touch Merge / Split plans - bundled in ShadowContext, plus ShadowScalars (nextCoreId / nextGenerationId /
+// nextRootId / coreRangeRevision in, shadow results out; the caller reflects them). Imports W08Core /16 and W08Touch /3
+// only (no cycle). Storage primitives stay in W08Core (registry, origin / interval / inverse index, physical / Identity /
+// Merge / Split / Pending / Changed planning) and W08Touch (ring, plans, ring apply).
 //
-// B15-B0: type / reference probe only. The exports below take the real B15 UDTs (W08Core.W08Store,
-// W08Core.PendingTopologyStore, W08Touch.TouchRing / TouchPlan / SplitTouchPlan) and mutate through the array
-// references they carry, so a harness can prove that a cross-library UDT argument compiles and that every write is
-// visible to the caller (no copy). No production caller.
-// B15-B1 (/2, W08Core /16): two-level nesting probe. probeRegistryWrite reaches the CoreRegistryStore nested in
-// W08Store (store.coreRegistry) and probeRegistryDirectWrite takes the nested CoreRegistryStore itself; both mutate
-// caller-built scratch stores only. /1 remains the W08Core /15 probe and is not used by production.
+// B15-B2 (/3): the Main dead W08 chain (30 helpers) is ported here path-only (engine.X -> the owning view, cfg.clusterMaxWidth
+// / feed.mintick -> the context scalars, (engine, cfg, feed) -> ctx), keeping every condition, loop, comparator, ordering
+// and sentinel; the Main copies stay as the legacy reference. Deliberate deltas: coreResetSlotRaw writes the 73
+// Merge-deferred fields through coreDeferredStateRaw (same values), materializeAppliedRaw restricts the B07-D
+// materialization to the applied Candidates (fresh IDs consumed only by applied fresh rows, F0-only mode, the range
+// revision moved to the end of the pass), pendingStoreViewRaw returns the pass scratch pool, and coreFreeSlotRaw is split
+// into coreFreePreflightRaw / coreFreeCommitRaw without the per-free global pending pool scan.
+//
+// Shadow pass (no production call site yet): planPass (the chain once on a scratch copy of the pending pool: physical ->
+// Identity -> ownership -> Merge -> Split -> Merge Touch -> Split Touch -> Pending -> Changed), preflightPass (pass F0,
+// read-only on the persistent state) and commitPass (only after a passed F0; a failing commit step is an invariant break,
+// runtime.error). Apply set = the B14 changed components that are not pending (no old Side in ActiveTouch); a pending
+// component only gets its B13 latest-state pending. Free set = EXPLICIT_MERGE_ABSORBED old Cores only (I27-11 / I27-12):
+// not continued by an applied Candidate, every Merge-deferred state field at its reset default (MERGE_STATE_DEFAULT_GUARD),
+// free preflight passed. A no-successor old Core is retained untouched (I27-10). Commit order: 1 pending replace, 2
+// materialization (continuation re-install, fresh allocation, origin / inverse / participation / interval), 3 TouchMark ring
+// replacement (B11 Merge plan / B12 SPLIT_LOCAL rows), 4 (index: in 2), 5 invalidation counts, 6 consumed READY pending
+// clear, 7 absorbed free, 8 range revision.
 // ============================================================
 library("ZoneEngineV2_W08Runtime_Worker", overlay = false)
 
 import sekine3310/ZoneEngineV2_W08Core_Worker/16 as W08Core
-import sekine3310/ZoneEngineV2_W08Touch_Worker/2 as W08Touch
+import sekine3310/ZoneEngineV2_W08Touch_Worker/3 as W08Touch
 
-// Bare array argument: writes values[index] := value, returns the previous value.
-export probeArrayWrite(array<int> values, int index, int value) =>
-    int prev = array.get(values, index)
-    array.set(values, index, value)
-    prev
+const int ID_NONE         = 0
+const int SLOT_INVALID    = -1
+const int SEQ_UNSET       = -1
+const int CAT_FVG         = 4
+const int SIDE_SUPPORT    = 1
+const int SIDE_RESISTANCE = -1
+const int SIDE_NONE       = 0
+const int PH_WAITING      = 0
+const int PH_ARMED        = 1
+const int PH_ACTIVE_TOUCH = 2
+const int PH_BROKEN       = 3
+const int PH_FLIP_WAIT    = 4
+const int PH_DORMANT      = 5
+const int GR_UNAVAILABLE  = 3
+const int FVG_MASK_NONE   = 0
 
-// Array held inside a UDT: writes store.changedTargets[index] := value through a local alias of the field and bumps the
-// scalar field changedComponentCount. Returns the new changedComponentCount.
-export probeStoreWrite(W08Core.W08Store store, int index, int value) =>
-    array<int> targets = store.changedTargets
-    array.set(targets, index, value)
-    store.changedComponentCount := store.changedComponentCount + 1
-    store.changedComponentCount
+export type RootView
+    array<int>    rootIds
+    array<bool>   rootSlotLiveFlags
+    map<int, int> rootIdToSlot
+    array<int>    rootCategories
+    array<bool>   rootIsBroadFvgFlags
+    array<int>    rootParticipationHeadEdgeIndexes
+    array<int>    rootParticipationCounts
 
-// Worker-to-worker hand-off of a caller-built PendingTopologyStore: W08Core.pendingClearCore on it.
-export probePendingClear(W08Core.PendingTopologyStore ps, int coreSlot, int coreId, int generationId) =>
-    W08Core.pendingClearCore(ps, coreSlot, coreId, generationId)
+export type ParticipationView
+    array<int>  participationEdgeRootSlots
+    array<int>  participationEdgeExpectedRootIds
+    array<int>  participationEdgeSideSlots
+    array<int>  participationEdgeExpectedCoreIds
+    array<int>  participationEdgeNextByRootIndexes
+    array<bool> participationEdgeLiveFlags
+    array<int>  participationEdgeFreeIndexes
 
-// Worker-to-worker hand-off of a caller-built TouchRing: W08Touch.markAppend on it. Returns the written physical row.
-export probeTouchAppend(W08Touch.TouchRing ring, int coreSlot, int baseSeq, int touchTime, int side, float contactBottom, float contactTop, float closeAtTouch, int generationId) =>
-    W08Touch.markAppend(ring, coreSlot, baseSeq, touchTime, side, contactBottom, contactTop, closeAtTouch, generationId, true)
+export type PhaseSetView
+    array<int> phaseWaitingSideSlots
+    array<int> phaseArmedSideSlots
+    array<int> phaseActiveTouchSideSlots
+    array<int> phaseBrokenSideSlots
+    array<int> phaseFlipWaitSideSlots
+    array<int> phaseDormantSideSlots
 
-// Arrays held inside the two Touch plan UDTs: pushes value to plan.mergeTouchPlanOffsets and
-// splitPlan.targetPhysicalIndexes. Returns the sum of both sizes.
-export probeTouchPlanWrite(W08Touch.TouchPlan plan, W08Touch.SplitTouchPlan splitPlan, int value) =>
-    array.push(plan.mergeTouchPlanOffsets, value)
-    array.push(splitPlan.targetPhysicalIndexes, value)
-    array.size(plan.mergeTouchPlanOffsets) + array.size(splitPlan.targetPhysicalIndexes)
+export type WinnerView
+    int          candidateWinnerLogicalCount = 0
+    int          candidateWinnerRootIdLength = 0
+    array<int>   candidateWinnerSides
+    array<int>   candidateWinnerStages
+    array<int>   candidateWinnerEffectiveBottomTicks
+    array<int>   candidateWinnerEffectiveTopTicks
+    array<int>   candidateWinnerMinRootIds
+    array<int>   candidateWinnerFvgModes
+    array<int>   candidateWinnerPsychLevelTicks
+    array<float> candidateWinnerExactPrices
+    array<int>   candidateWinnerRootIdOffsets
+    array<int>   candidateWinnerRootIdLengths
+    array<int>   candidateWinnerRootIds
 
-// W08Store -> CoreRegistryStore (two levels): writes store.coreRegistry.coreIds[index] := value through a local alias of
-// the nested store and bumps the nested scalar touchMarkCapacityPerCore. Returns the new touchMarkCapacityPerCore.
-export probeRegistryWrite(W08Core.W08Store store, int index, int value) =>
-    W08Core.CoreRegistryStore reg = store.coreRegistry
-    array.set(reg.coreIds, index, value)
-    reg.touchMarkCapacityPerCore := reg.touchMarkCapacityPerCore + 1
-    reg.touchMarkCapacityPerCore
+export type ComponentMetaView
+    array<int>  rootCandComponentIds
+    array<int>  candComponentIds
+    array<int>  candComponentMemberOffsets
+    array<int>  candComponentMemberLengths
+    array<int>  candMemberRootIds
+    array<int>  candMemberRoleFlags
+    array<int>  candSemanticChangedRootIds
+    array<int>  candSemanticChangedCurrentComponentIds
+    array<bool> candChangedScopeFull
 
-// Nested CoreRegistryStore passed directly: pushes flag to sideTouchHistoryTruncatedFlags and value to
-// corePruneRevisions, puts key -> value into coreIdToSlot. Returns the new sideTouchHistoryTruncatedFlags size.
-export probeRegistryDirectWrite(W08Core.CoreRegistryStore reg, bool flag, int key, int value) =>
-    array.push(reg.sideTouchHistoryTruncatedFlags, flag)
-    array.push(reg.corePruneRevisions, value)
-    map.put(reg.coreIdToSlot, key, value)
-    array.size(reg.sideTouchHistoryTruncatedFlags)
+export type ShadowScalars
+    int  nextCoreId        = 1
+    int  nextGenerationId  = 1
+    int  nextRootId        = 1
+    int  coreRangeRevision = 0
+    bool rangeChanged      = false
+
+export type ShadowContext
+    W08Core.W08Store             ws
+    RootView                     rv
+    ParticipationView            pv
+    PhaseSetView                 hv
+    WinnerView                   wv
+    ComponentMetaView            mv
+    W08Core.PendingTopologyStore ps
+    W08Core.PendingTopologyStore psPlan
+    W08Touch.TouchPlan           tp
+    W08Touch.SplitTouchPlan      sp
+    ShadowScalars                sc
+    float                        clusterMaxWidth = 0.0
+    float                        mintick         = 0.0
+
+// One shadow pass. planResult = the B14 changed component count (-1 plan fault). Per changed component applyComp (not
+// pending); per physical Candidate applyP, mergeOfP (B08 relation of an applied Merge target) and splitOfP (B12
+// SPLIT_LOCAL row of an applied target); consumed READY pending parents; the EXPLICIT_MERGE_ABSORBED free set (canonical,
+// unique) with its expected IDs; counters of the plan, F0 and commit.
+export type ShadowPass
+    int         planResult        = -1
+    int         pendingComponents = 0
+    int         appliedComponents = 0
+    int         appliedTargets    = 0
+    int         retained          = 0
+    int         guardRejected     = 0
+    int         poolScans         = 0
+    int         invRange          = 0
+    int         invTick           = 0
+    int         invOrigin         = 0
+    int         invPass1          = 0
+    int         invPair           = 0
+    int         freshApplied      = 0
+    int         touchRowsWritten  = 0
+    int         freed             = 0
+    bool        preflightOk       = false
+    bool        committed         = false
+    array<bool> applyComp
+    array<bool> applyP
+    array<int>  mergeOfP
+    array<int>  splitOfP
+    array<int>  consumedSlots
+    array<int>  freeSlots
+    array<int>  freeCoreIds
+    array<int>  freeGenerationIds
+
+participationEdgeResetRaw(ShadowContext ctx, int edgeIndex) =>
+    array.set(ctx.pv.participationEdgeRootSlots,         edgeIndex, SLOT_INVALID)
+    array.set(ctx.pv.participationEdgeExpectedRootIds,   edgeIndex, ID_NONE)
+    array.set(ctx.pv.participationEdgeSideSlots,         edgeIndex, SLOT_INVALID)
+    array.set(ctx.pv.participationEdgeExpectedCoreIds,   edgeIndex, ID_NONE)
+    array.set(ctx.pv.participationEdgeNextByRootIndexes, edgeIndex, SLOT_INVALID)
+    array.set(ctx.pv.participationEdgeLiveFlags,         edgeIndex, false)
+participationEdgeAllocRaw(ShadowContext ctx) =>
+    int edgeIndex = SLOT_INVALID
+    if array.size(ctx.pv.participationEdgeFreeIndexes) > 0
+        edgeIndex := array.pop(ctx.pv.participationEdgeFreeIndexes)
+        participationEdgeResetRaw(ctx, edgeIndex)
+    else
+        edgeIndex := array.size(ctx.pv.participationEdgeRootSlots)
+        array.push(ctx.pv.participationEdgeRootSlots,         SLOT_INVALID)
+        array.push(ctx.pv.participationEdgeExpectedRootIds,   ID_NONE)
+        array.push(ctx.pv.participationEdgeSideSlots,         SLOT_INVALID)
+        array.push(ctx.pv.participationEdgeExpectedCoreIds,   ID_NONE)
+        array.push(ctx.pv.participationEdgeNextByRootIndexes, SLOT_INVALID)
+        array.push(ctx.pv.participationEdgeLiveFlags,         false)
+    edgeIndex
+participationEdgeFreeRaw(ShadowContext ctx, int edgeIndex) =>
+    bool freed = false
+    if edgeIndex >= 0 and edgeIndex < array.size(ctx.pv.participationEdgeLiveFlags)
+        if array.get(ctx.pv.participationEdgeLiveFlags, edgeIndex)
+            participationEdgeResetRaw(ctx, edgeIndex)
+            array.push(ctx.pv.participationEdgeFreeIndexes, edgeIndex)
+            freed := true
+    freed
+participationRootChainValidRaw(ShadowContext ctx, int rootSlot) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    bool valid = false
+    bool ok = rootSlot >= 0 and rootSlot < array.size(ctx.rv.rootIds) and rootSlot < array.size(ctx.rv.rootSlotLiveFlags) and rootSlot < array.size(ctx.rv.rootParticipationHeadEdgeIndexes) and rootSlot < array.size(ctx.rv.rootParticipationCounts)
+    if ok
+        ok := array.get(ctx.rv.rootSlotLiveFlags, rootSlot) and array.get(ctx.rv.rootIds, rootSlot) != ID_NONE
+    int edgeRowCount = array.size(ctx.pv.participationEdgeRootSlots)
+    if ok
+        ok := edgeRowCount == array.size(ctx.pv.participationEdgeExpectedRootIds) and edgeRowCount == array.size(ctx.pv.participationEdgeSideSlots) and edgeRowCount == array.size(ctx.pv.participationEdgeExpectedCoreIds) and edgeRowCount == array.size(ctx.pv.participationEdgeNextByRootIndexes) and edgeRowCount == array.size(ctx.pv.participationEdgeLiveFlags)
+    if ok
+        int rootId = array.get(ctx.rv.rootIds,                           rootSlot)
+        int head   = array.get(ctx.rv.rootParticipationHeadEdgeIndexes,  rootSlot)
+        int count  = array.get(ctx.rv.rootParticipationCounts,           rootSlot)
+        if count < 0 or count > edgeRowCount
+            ok := false
+        if ok and count == 0
+            valid := head == SLOT_INVALID
+        if ok and count > 0
+            bool chainOk   = head != SLOT_INVALID
+            int  edgeIndex = head
+            int  seen      = 0
+            while chainOk and seen < count
+                bool rowOk = edgeIndex >= 0 and edgeIndex < edgeRowCount
+                if rowOk
+                    rowOk := array.get(ctx.pv.participationEdgeLiveFlags, edgeIndex)
+                if rowOk
+                    rowOk := array.get(ctx.pv.participationEdgeRootSlots, edgeIndex) == rootSlot and array.get(ctx.pv.participationEdgeExpectedRootIds, edgeIndex) == rootId
+                int edgeSideSlot = SLOT_INVALID
+                int edgeCoreSlot = SLOT_INVALID
+                if rowOk
+                    edgeSideSlot := array.get(ctx.pv.participationEdgeSideSlots, edgeIndex)
+                    rowOk := edgeSideSlot >= 0 and edgeSideSlot < array.size(cr.sidePhases)
+                if rowOk
+                    edgeCoreSlot := int(math.floor(edgeSideSlot / 2))
+                    int edgeSideIndex = edgeSideSlot - edgeCoreSlot * 2
+                    rowOk := (edgeSideIndex == 0 or edgeSideIndex == 1) and edgeCoreSlot >= 0 and edgeCoreSlot < array.size(cr.coreIds) and edgeCoreSlot < array.size(cr.coreSlotLiveFlags)
+                if rowOk
+                    rowOk := array.get(cr.coreSlotLiveFlags, edgeCoreSlot)
+                if rowOk
+                    int edgeExpectedCoreId = array.get(ctx.pv.participationEdgeExpectedCoreIds, edgeIndex)
+                    rowOk := edgeExpectedCoreId != ID_NONE and array.get(cr.coreIds, edgeCoreSlot) == edgeExpectedCoreId
+                if rowOk
+                    edgeIndex := array.get(ctx.pv.participationEdgeNextByRootIndexes, edgeIndex)
+                    seen      += 1
+                else
+                    chainOk := false
+            if chainOk
+                valid := seen == count and edgeIndex == SLOT_INVALID
+    valid
+participationDuplicateExistsRaw(ShadowContext ctx, int rootSlot, int expectedRootId, int sideSlot, int expectedCoreId) =>
+    bool found = false
+    int edgeRowCount = array.size(ctx.pv.participationEdgeRootSlots)
+    if rootSlot >= 0 and rootSlot < array.size(ctx.rv.rootParticipationHeadEdgeIndexes) and rootSlot < array.size(ctx.rv.rootParticipationCounts)
+        int count     = array.get(ctx.rv.rootParticipationCounts,          rootSlot)
+        int edgeIndex = array.get(ctx.rv.rootParticipationHeadEdgeIndexes, rootSlot)
+        int seen      = 0
+        while not found and seen < count and edgeIndex >= 0 and edgeIndex < edgeRowCount
+            bool sameEdge = array.get(ctx.pv.participationEdgeLiveFlags, edgeIndex)
+            if sameEdge
+                sameEdge := array.get(ctx.pv.participationEdgeRootSlots, edgeIndex) == rootSlot and array.get(ctx.pv.participationEdgeExpectedRootIds, edgeIndex) == expectedRootId and array.get(ctx.pv.participationEdgeSideSlots, edgeIndex) == sideSlot and array.get(ctx.pv.participationEdgeExpectedCoreIds, edgeIndex) == expectedCoreId
+            if sameEdge
+                found := true
+            else
+                edgeIndex := array.get(ctx.pv.participationEdgeNextByRootIndexes, edgeIndex)
+                seen      += 1
+    found
+// W08 B07-D: the Root-side and free-list predicates of participationAddRaw (shared with the materialization preflight)
+participationRootAddableRaw(ShadowContext ctx, int rootSlot) =>
+    bool rootOk = rootSlot >= 0 and rootSlot < array.size(ctx.rv.rootIds) and rootSlot < array.size(ctx.rv.rootSlotLiveFlags)
+    if rootOk
+        rootOk := array.get(ctx.rv.rootSlotLiveFlags, rootSlot)
+    if rootOk
+        rootOk := array.get(ctx.rv.rootIds, rootSlot) != ID_NONE
+    rootOk and participationRootChainValidRaw(ctx, rootSlot)
+participationEdgeFreeEntryOkRaw(ShadowContext ctx, int edgeIndex) =>
+    edgeIndex >= 0 and edgeIndex < array.size(ctx.pv.participationEdgeRootSlots) and edgeIndex < array.size(ctx.pv.participationEdgeLiveFlags) and not array.get(ctx.pv.participationEdgeLiveFlags, edgeIndex)
+participationAddRaw(ShadowContext ctx, int rootSlot, int sideSlot) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    bool added = false
+    bool rootOk         = participationRootAddableRaw(ctx, rootSlot)
+    int  expectedRootId = ID_NONE
+    if rootOk
+        expectedRootId := array.get(ctx.rv.rootIds, rootSlot)
+    bool sideOk         = rootOk and sideSlot >= 0 and sideSlot < array.size(cr.sidePhases)
+    int  coreSlot       = SLOT_INVALID
+    int  expectedCoreId = ID_NONE
+    if sideOk
+        coreSlot      := int(math.floor(sideSlot / 2))
+        int sideIndex = sideSlot - coreSlot * 2
+        sideOk        := (sideIndex == 0 or sideIndex == 1) and coreSlot >= 0 and coreSlot < array.size(cr.coreIds) and coreSlot < array.size(cr.coreSlotLiveFlags)
+    if sideOk
+        sideOk := array.get(cr.coreSlotLiveFlags, coreSlot)
+    if sideOk
+        expectedCoreId := array.get(cr.coreIds, coreSlot)
+        sideOk         := expectedCoreId != ID_NONE
+    bool ready = sideOk
+    if ready
+        ready := not participationDuplicateExistsRaw(ctx, rootSlot, expectedRootId, sideSlot, expectedCoreId)
+    if ready
+        int freeCount = array.size(ctx.pv.participationEdgeFreeIndexes)
+        if freeCount > 0
+            ready := participationEdgeFreeEntryOkRaw(ctx, array.get(ctx.pv.participationEdgeFreeIndexes, freeCount - 1))
+    if ready
+        int oldHead   = array.get(ctx.rv.rootParticipationHeadEdgeIndexes, rootSlot)
+        int oldCount  = array.get(ctx.rv.rootParticipationCounts,          rootSlot)
+        int edgeIndex = participationEdgeAllocRaw(ctx)
+        array.set(ctx.pv.participationEdgeRootSlots,         edgeIndex, rootSlot)
+        array.set(ctx.pv.participationEdgeExpectedRootIds,   edgeIndex, expectedRootId)
+        array.set(ctx.pv.participationEdgeSideSlots,         edgeIndex, sideSlot)
+        array.set(ctx.pv.participationEdgeExpectedCoreIds,   edgeIndex, expectedCoreId)
+        array.set(ctx.pv.participationEdgeNextByRootIndexes, edgeIndex, oldHead)
+        array.set(ctx.rv.rootParticipationHeadEdgeIndexes,   rootSlot,  edgeIndex)
+        array.set(ctx.rv.rootParticipationCounts,            rootSlot,  oldCount + 1)
+        array.set(ctx.pv.participationEdgeLiveFlags,         edgeIndex, true)
+        added := true
+    added
+// W08 B07-D: read-only failure predicate of participationDetachAllForCoreRaw (shared with the materialization / free
+// preflight): Core live, edge / root table sizes, every live Root chain valid, dead Roots empty, each live edge's slot and
+// expected Core ID agree, chain total == live edge total. Returns [ready, expectedCoreId, targetEdgeCount].
+participationDetachAllReadyRaw(ShadowContext ctx, int coreSlot) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    bool coreOk         = coreSlot >= 0 and coreSlot < array.size(cr.coreIds) and coreSlot < array.size(cr.coreSlotLiveFlags)
+    int  expectedCoreId = ID_NONE
+    if coreOk
+        coreOk := array.get(cr.coreSlotLiveFlags, coreSlot)
+    if coreOk
+        expectedCoreId := array.get(cr.coreIds, coreSlot)
+        coreOk         := expectedCoreId != ID_NONE
+    int  supportSideSlot    = coreSlot * 2
+    int  resistanceSideSlot = coreSlot * 2 + 1
+    bool ready = coreOk and supportSideSlot >= 0 and resistanceSideSlot < array.size(cr.sidePhases)
+    int edgeRowCount = array.size(ctx.pv.participationEdgeRootSlots)
+    if ready
+        ready := edgeRowCount == array.size(ctx.pv.participationEdgeExpectedRootIds) and edgeRowCount == array.size(ctx.pv.participationEdgeSideSlots) and edgeRowCount == array.size(ctx.pv.participationEdgeExpectedCoreIds) and edgeRowCount == array.size(ctx.pv.participationEdgeNextByRootIndexes) and edgeRowCount == array.size(ctx.pv.participationEdgeLiveFlags)
+    int rootRowCount = array.size(ctx.rv.rootIds)
+    if ready
+        ready := rootRowCount == array.size(ctx.rv.rootSlotLiveFlags) and rootRowCount == array.size(ctx.rv.rootParticipationHeadEdgeIndexes) and rootRowCount == array.size(ctx.rv.rootParticipationCounts)
+    int chainEdgeCount = 0
+    if ready
+        int rootScan = 0
+        while ready and rootScan < rootRowCount
+            if array.get(ctx.rv.rootSlotLiveFlags, rootScan)
+                if participationRootChainValidRaw(ctx, rootScan)
+                    chainEdgeCount += array.get(ctx.rv.rootParticipationCounts, rootScan)
+                else
+                    ready := false
+            else
+                ready := array.get(ctx.rv.rootParticipationHeadEdgeIndexes, rootScan) == SLOT_INVALID and array.get(ctx.rv.rootParticipationCounts, rootScan) == 0
+            rootScan += 1
+    int liveEdgeCount   = 0
+    int targetEdgeCount = 0
+    if ready
+        int edgeScan = 0
+        while ready and edgeScan < edgeRowCount
+            if array.get(ctx.pv.participationEdgeLiveFlags, edgeScan)
+                liveEdgeCount += 1
+                int scanSideSlot = array.get(ctx.pv.participationEdgeSideSlots, edgeScan)
+                int scanCoreSlot = scanSideSlot >= 0 ? int(math.floor(scanSideSlot / 2)) : SLOT_INVALID
+                bool slotMatch = scanCoreSlot == coreSlot
+                bool idMatch   = array.get(ctx.pv.participationEdgeExpectedCoreIds, edgeScan) == expectedCoreId
+                if slotMatch != idMatch
+                    ready := false
+                else if slotMatch
+                    targetEdgeCount += 1
+            edgeScan += 1
+    if ready
+        ready := chainEdgeCount == liveEdgeCount
+    [ready, expectedCoreId, targetEdgeCount]
+participationDetachAllForCoreRaw(ShadowContext ctx, int coreSlot) =>
+    bool done = false
+    [ready, expectedCoreId, targetEdgeCount] = participationDetachAllReadyRaw(ctx, coreSlot)
+    int edgeRowCount = array.size(ctx.pv.participationEdgeRootSlots)
+    int rootRowCount = array.size(ctx.rv.rootIds)
+    if ready and targetEdgeCount == 0
+        done := true
+    bool commitReady = ready and targetEdgeCount > 0
+    if commitReady
+        int rootIdx = 0
+        while rootIdx < rootRowCount
+            if array.get(ctx.rv.rootSlotLiveFlags, rootIdx)
+                int oldHead  = array.get(ctx.rv.rootParticipationHeadEdgeIndexes, rootIdx)
+                int oldCount = array.get(ctx.rv.rootParticipationCounts,          rootIdx)
+                int removeCount = 0
+                int countIdx    = oldHead
+                int counted     = 0
+                while counted < oldCount
+                    int countSideSlot = array.get(ctx.pv.participationEdgeSideSlots, countIdx)
+                    int countCoreSlot = countSideSlot >= 0 ? int(math.floor(countSideSlot / 2)) : SLOT_INVALID
+                    if countCoreSlot == coreSlot and array.get(ctx.pv.participationEdgeExpectedCoreIds, countIdx) == expectedCoreId
+                        removeCount += 1
+                    countIdx := array.get(ctx.pv.participationEdgeNextByRootIndexes, countIdx)
+                    counted  += 1
+                if removeCount > 0
+                    int  newHead               = SLOT_INVALID
+                    int  previousKeptEdgeIndex = SLOT_INVALID
+                    int  keptCount             = 0
+                    int  rebuildIdx            = oldHead
+                    int  walked                = 0
+                    while walked < oldCount
+                        int  nextEdgeIndex   = array.get(ctx.pv.participationEdgeNextByRootIndexes, rebuildIdx)
+                        int  rebuildSideSlot = array.get(ctx.pv.participationEdgeSideSlots, rebuildIdx)
+                        int  rebuildCoreSlot = rebuildSideSlot >= 0 ? int(math.floor(rebuildSideSlot / 2)) : SLOT_INVALID
+                        bool isTarget        = rebuildCoreSlot == coreSlot and array.get(ctx.pv.participationEdgeExpectedCoreIds, rebuildIdx) == expectedCoreId
+                        if not isTarget
+                            if newHead == SLOT_INVALID
+                                newHead := rebuildIdx
+                            if previousKeptEdgeIndex != SLOT_INVALID
+                                array.set(ctx.pv.participationEdgeNextByRootIndexes, previousKeptEdgeIndex, rebuildIdx)
+                            previousKeptEdgeIndex := rebuildIdx
+                            keptCount             += 1
+                        rebuildIdx := nextEdgeIndex
+                        walked     += 1
+                    if previousKeptEdgeIndex != SLOT_INVALID
+                        array.set(ctx.pv.participationEdgeNextByRootIndexes, previousKeptEdgeIndex, SLOT_INVALID)
+                    array.set(ctx.rv.rootParticipationHeadEdgeIndexes, rootIdx, newHead)
+                    array.set(ctx.rv.rootParticipationCounts,          rootIdx, keptCount)
+            rootIdx += 1
+        int freeIdx = 0
+        while freeIdx < edgeRowCount
+            if array.get(ctx.pv.participationEdgeLiveFlags, freeIdx)
+                int freeSideSlot = array.get(ctx.pv.participationEdgeSideSlots, freeIdx)
+                int freeCoreSlot = freeSideSlot >= 0 ? int(math.floor(freeSideSlot / 2)) : SLOT_INVALID
+                if freeCoreSlot == coreSlot and array.get(ctx.pv.participationEdgeExpectedCoreIds, freeIdx) == expectedCoreId
+                    participationEdgeFreeRaw(ctx, freeIdx)
+            freeIdx += 1
+        done := true
+    done
+phaseSetMembershipValidRaw(ShadowContext ctx, int sideSlot) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    bool valid = false
+    if sideSlot >= 0 and sideSlot < array.size(cr.sidePhases) and sideSlot < array.size(cr.sidePhaseSetPositions)
+        int phase = array.get(cr.sidePhases,            sideSlot)
+        int pos   = array.get(cr.sidePhaseSetPositions, sideSlot)
+        if pos >= 0
+            if phase == PH_WAITING
+                if pos < array.size(ctx.hv.phaseWaitingSideSlots)
+                    valid := array.get(ctx.hv.phaseWaitingSideSlots, pos) == sideSlot
+            else if phase == PH_ARMED
+                if pos < array.size(ctx.hv.phaseArmedSideSlots)
+                    valid := array.get(ctx.hv.phaseArmedSideSlots, pos) == sideSlot
+            else if phase == PH_ACTIVE_TOUCH
+                if pos < array.size(ctx.hv.phaseActiveTouchSideSlots)
+                    valid := array.get(ctx.hv.phaseActiveTouchSideSlots, pos) == sideSlot
+            else if phase == PH_BROKEN
+                if pos < array.size(ctx.hv.phaseBrokenSideSlots)
+                    valid := array.get(ctx.hv.phaseBrokenSideSlots, pos) == sideSlot
+            else if phase == PH_FLIP_WAIT
+                if pos < array.size(ctx.hv.phaseFlipWaitSideSlots)
+                    valid := array.get(ctx.hv.phaseFlipWaitSideSlots, pos) == sideSlot
+            else if phase == PH_DORMANT
+                if pos < array.size(ctx.hv.phaseDormantSideSlots)
+                    valid := array.get(ctx.hv.phaseDormantSideSlots, pos) == sideSlot
+    valid
+phaseSetAddRaw(ShadowContext ctx, int sideSlot) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    bool added = false
+    if sideSlot >= 0 and sideSlot < array.size(cr.sidePhases) and sideSlot < array.size(cr.sidePhaseSetPositions)
+        int pos = array.get(cr.sidePhaseSetPositions, sideSlot)
+        if pos == SLOT_INVALID
+            int phase  = array.get(cr.sidePhases, sideSlot)
+            int newPos = SLOT_INVALID
+            if phase == PH_WAITING
+                newPos := array.size(ctx.hv.phaseWaitingSideSlots)
+                array.push(ctx.hv.phaseWaitingSideSlots, sideSlot)
+            else if phase == PH_ARMED
+                newPos := array.size(ctx.hv.phaseArmedSideSlots)
+                array.push(ctx.hv.phaseArmedSideSlots, sideSlot)
+            else if phase == PH_ACTIVE_TOUCH
+                newPos := array.size(ctx.hv.phaseActiveTouchSideSlots)
+                array.push(ctx.hv.phaseActiveTouchSideSlots, sideSlot)
+            else if phase == PH_BROKEN
+                newPos := array.size(ctx.hv.phaseBrokenSideSlots)
+                array.push(ctx.hv.phaseBrokenSideSlots, sideSlot)
+            else if phase == PH_FLIP_WAIT
+                newPos := array.size(ctx.hv.phaseFlipWaitSideSlots)
+                array.push(ctx.hv.phaseFlipWaitSideSlots, sideSlot)
+            else if phase == PH_DORMANT
+                newPos := array.size(ctx.hv.phaseDormantSideSlots)
+                array.push(ctx.hv.phaseDormantSideSlots, sideSlot)
+            if newPos != SLOT_INVALID
+                array.set(cr.sidePhaseSetPositions, sideSlot, newPos)
+                added := true
+    added
+phaseSetDetachRaw(ShadowContext ctx, int sideSlot) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    bool detached = false
+    if phaseSetMembershipValidRaw(ctx, sideSlot)
+        int phase        = array.get(cr.sidePhases,            sideSlot)
+        int pos          = array.get(cr.sidePhaseSetPositions, sideSlot)
+        int lastPos      = SLOT_INVALID
+        int lastSideSlot = SLOT_INVALID
+        if phase == PH_WAITING
+            lastPos      := array.size(ctx.hv.phaseWaitingSideSlots) - 1
+            lastSideSlot := array.get(ctx.hv.phaseWaitingSideSlots, lastPos)
+            if pos != lastPos
+                array.set(ctx.hv.phaseWaitingSideSlots, pos, lastSideSlot)
+                array.set(cr.sidePhaseSetPositions, lastSideSlot, pos)
+            array.pop(ctx.hv.phaseWaitingSideSlots)
+        else if phase == PH_ARMED
+            lastPos      := array.size(ctx.hv.phaseArmedSideSlots) - 1
+            lastSideSlot := array.get(ctx.hv.phaseArmedSideSlots, lastPos)
+            if pos != lastPos
+                array.set(ctx.hv.phaseArmedSideSlots, pos, lastSideSlot)
+                array.set(cr.sidePhaseSetPositions, lastSideSlot, pos)
+            array.pop(ctx.hv.phaseArmedSideSlots)
+        else if phase == PH_ACTIVE_TOUCH
+            lastPos      := array.size(ctx.hv.phaseActiveTouchSideSlots) - 1
+            lastSideSlot := array.get(ctx.hv.phaseActiveTouchSideSlots, lastPos)
+            if pos != lastPos
+                array.set(ctx.hv.phaseActiveTouchSideSlots, pos, lastSideSlot)
+                array.set(cr.sidePhaseSetPositions, lastSideSlot, pos)
+            array.pop(ctx.hv.phaseActiveTouchSideSlots)
+        else if phase == PH_BROKEN
+            lastPos      := array.size(ctx.hv.phaseBrokenSideSlots) - 1
+            lastSideSlot := array.get(ctx.hv.phaseBrokenSideSlots, lastPos)
+            if pos != lastPos
+                array.set(ctx.hv.phaseBrokenSideSlots, pos, lastSideSlot)
+                array.set(cr.sidePhaseSetPositions, lastSideSlot, pos)
+            array.pop(ctx.hv.phaseBrokenSideSlots)
+        else if phase == PH_FLIP_WAIT
+            lastPos      := array.size(ctx.hv.phaseFlipWaitSideSlots) - 1
+            lastSideSlot := array.get(ctx.hv.phaseFlipWaitSideSlots, lastPos)
+            if pos != lastPos
+                array.set(ctx.hv.phaseFlipWaitSideSlots, pos, lastSideSlot)
+                array.set(cr.sidePhaseSetPositions, lastSideSlot, pos)
+            array.pop(ctx.hv.phaseFlipWaitSideSlots)
+        else if phase == PH_DORMANT
+            lastPos      := array.size(ctx.hv.phaseDormantSideSlots) - 1
+            lastSideSlot := array.get(ctx.hv.phaseDormantSideSlots, lastPos)
+            if pos != lastPos
+                array.set(ctx.hv.phaseDormantSideSlots, pos, lastSideSlot)
+                array.set(cr.sidePhaseSetPositions, lastSideSlot, pos)
+            array.pop(ctx.hv.phaseDormantSideSlots)
+        array.set(cr.sidePhaseSetPositions, sideSlot, SLOT_INVALID)
+        detached := true
+    detached
+// W08 B15-B2 (I27-12): the Merge-deferred Core / Side state fields (73: the 55 MERGE_DEFERRED_STATE_FIELDS and the 18
+// Side re-evaluation fields without a W08 producer) at their coreResetSlotRaw defaults. write = true sets the defaults (the
+// reset); write = false only compares (the MERGE_STATE_DEFAULT_GUARD of an absorbed Core). One table for both, so the
+// guard can never drift from the reset. Returns true when every field already held its default.
+stateIntRaw(array<int> a, int i, int v, bool write) =>
+    int  x    = array.get(a, i)
+    bool same = na(v) ? na(x) : x == v
+    if write
+        array.set(a, i, v)
+    same
+stateFloatRaw(array<float> a, int i, float v, bool write) =>
+    float x    = array.get(a, i)
+    bool  same = na(v) ? na(x) : x == v
+    if write
+        array.set(a, i, v)
+    same
+stateBoolRaw(array<bool> a, int i, bool v, bool write) =>
+    bool same = array.get(a, i) == v
+    if write
+        array.set(a, i, v)
+    same
+coreDeferredStateRaw(W08Core.CoreRegistryStore cr, int coreSlot, bool write) =>
+    int  supportSideSlot    = coreSlot * 2
+    int  resistanceSideSlot = coreSlot * 2 + 1
+    bool same = true
+    same := stateBoolRaw(cr.coreZoneFreshFlags, coreSlot, false, write) and same
+    same := stateIntRaw(cr.coreLastSeenTimes, coreSlot, int(na), write) and same
+    same := stateBoolRaw(cr.coreDormantFlags, coreSlot, false, write) and same
+    same := stateIntRaw(cr.sideTouchCounts, supportSideSlot, 0, write) and same
+    same := stateBoolRaw(cr.sideWeakByTouchFlags, supportSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideWeakByDepthFlags, supportSideSlot, false, write) and same
+    same := stateFloatRaw(cr.sideMaxDepthPcts, supportSideSlot, 0.0, write) and same
+    same := stateBoolRaw(cr.sideFreshFlags, supportSideSlot, false, write) and same
+    same := stateIntRaw(cr.sidePhases, supportSideSlot, PH_WAITING, write) and same
+    same := stateIntRaw(cr.sideGrades, supportSideSlot, GR_UNAVAILABLE, write) and same
+    same := stateIntRaw(cr.sideCurrentTouchNos, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideUpcomingTouchNos, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideArmedFromSeqs, supportSideSlot, SEQ_UNSET, write) and same
+    same := stateFloatRaw(cr.sideLastArmedRangeBottoms, supportSideSlot, float(na), write) and same
+    same := stateFloatRaw(cr.sideLastArmedRangeTops, supportSideSlot, float(na), write) and same
+    same := stateIntRaw(cr.sideLastNormalTouchTimes, supportSideSlot, int(na), write) and same
+    same := stateIntRaw(cr.sideFlipAttemptCounts, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideInverseAttemptCounts, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideLastFlipConfirmSeqs, supportSideSlot, SEQ_UNSET, write) and same
+    same := stateFloatRaw(cr.sideEffectiveBottoms, supportSideSlot, float(na), write) and same
+    same := stateFloatRaw(cr.sideEffectiveTops, supportSideSlot, float(na), write) and same
+    same := stateFloatRaw(cr.sideReferencePrices, supportSideSlot, float(na), write) and same
+    same := stateIntRaw(cr.sideCCounts, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideHCounts, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideDensities, supportSideSlot, int(na), write) and same
+    same := stateBoolRaw(cr.sideBaseStrongFlags, supportSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideHasNonPsychRootFlags, supportSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideIsBroadContextFlags, supportSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideEligibleFlags, supportSideSlot, false, write) and same
+    same := stateIntRaw(cr.sideTouchCounts, resistanceSideSlot, 0, write) and same
+    same := stateBoolRaw(cr.sideWeakByTouchFlags, resistanceSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideWeakByDepthFlags, resistanceSideSlot, false, write) and same
+    same := stateFloatRaw(cr.sideMaxDepthPcts, resistanceSideSlot, 0.0, write) and same
+    same := stateBoolRaw(cr.sideFreshFlags, resistanceSideSlot, false, write) and same
+    same := stateIntRaw(cr.sidePhases, resistanceSideSlot, PH_WAITING, write) and same
+    same := stateIntRaw(cr.sideGrades, resistanceSideSlot, GR_UNAVAILABLE, write) and same
+    same := stateIntRaw(cr.sideCurrentTouchNos, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideUpcomingTouchNos, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideArmedFromSeqs, resistanceSideSlot, SEQ_UNSET, write) and same
+    same := stateFloatRaw(cr.sideLastArmedRangeBottoms, resistanceSideSlot, float(na), write) and same
+    same := stateFloatRaw(cr.sideLastArmedRangeTops, resistanceSideSlot, float(na), write) and same
+    same := stateIntRaw(cr.sideLastNormalTouchTimes, resistanceSideSlot, int(na), write) and same
+    same := stateIntRaw(cr.sideFlipAttemptCounts, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideInverseAttemptCounts, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideLastFlipConfirmSeqs, resistanceSideSlot, SEQ_UNSET, write) and same
+    same := stateFloatRaw(cr.sideEffectiveBottoms, resistanceSideSlot, float(na), write) and same
+    same := stateFloatRaw(cr.sideEffectiveTops, resistanceSideSlot, float(na), write) and same
+    same := stateFloatRaw(cr.sideReferencePrices, resistanceSideSlot, float(na), write) and same
+    same := stateIntRaw(cr.sideCCounts, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideHCounts, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideDensities, resistanceSideSlot, int(na), write) and same
+    same := stateBoolRaw(cr.sideBaseStrongFlags, resistanceSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideHasNonPsychRootFlags, resistanceSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideIsBroadContextFlags, resistanceSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideEligibleFlags, resistanceSideSlot, false, write) and same
+    same := stateIntRaw(cr.corePruneRevisions, coreSlot, 0, write) and same
+    same := stateBoolRaw(cr.sideTouchStartSnapshotValidFlags, supportSideSlot, false, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotCoreIds, supportSideSlot, ID_NONE, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotGenerationIds, supportSideSlot, ID_NONE, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotSides, supportSideSlot, SIDE_NONE, write) and same
+    same := stateFloatRaw(cr.sideTouchStartSnapshotRangeBottoms, supportSideSlot, float(na), write) and same
+    same := stateFloatRaw(cr.sideTouchStartSnapshotRangeTops, supportSideSlot, float(na), write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotCategoryMasks, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotHighMasks, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotCCounts, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotHCounts, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotDensities, supportSideSlot, int(na), write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotGrades, supportSideSlot, GR_UNAVAILABLE, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotCurrentTouchNos, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotApproachSides, supportSideSlot, SIDE_NONE, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotStartSeqs, supportSideSlot, SEQ_UNSET, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotStartTimes, supportSideSlot, int(na), write) and same
+    same := stateFloatRaw(cr.sideTouchStartSnapshotDeepestCloses, supportSideSlot, float(na), write) and same
+    same := stateFloatRaw(cr.sideTouchStartSnapshotMaxDepthPcts, supportSideSlot, 0.0, write) and same
+    same := stateBoolRaw(cr.sideTouchStartSnapshotValidFlags, resistanceSideSlot, false, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotCoreIds, resistanceSideSlot, ID_NONE, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotGenerationIds, resistanceSideSlot, ID_NONE, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotSides, resistanceSideSlot, SIDE_NONE, write) and same
+    same := stateFloatRaw(cr.sideTouchStartSnapshotRangeBottoms, resistanceSideSlot, float(na), write) and same
+    same := stateFloatRaw(cr.sideTouchStartSnapshotRangeTops, resistanceSideSlot, float(na), write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotCategoryMasks, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotHighMasks, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotCCounts, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotHCounts, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotDensities, resistanceSideSlot, int(na), write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotGrades, resistanceSideSlot, GR_UNAVAILABLE, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotCurrentTouchNos, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotApproachSides, resistanceSideSlot, SIDE_NONE, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotStartSeqs, resistanceSideSlot, SEQ_UNSET, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotStartTimes, resistanceSideSlot, int(na), write) and same
+    same := stateFloatRaw(cr.sideTouchStartSnapshotDeepestCloses, resistanceSideSlot, float(na), write) and same
+    same := stateFloatRaw(cr.sideTouchStartSnapshotMaxDepthPcts, resistanceSideSlot, 0.0, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotRootHeadNodeIndexes, supportSideSlot, SLOT_INVALID, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotRootTailNodeIndexes, supportSideSlot, SLOT_INVALID, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotRootCounts, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotRootHeadNodeIndexes, resistanceSideSlot, SLOT_INVALID, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotRootTailNodeIndexes, resistanceSideSlot, SLOT_INVALID, write) and same
+    same := stateIntRaw(cr.sideTouchStartSnapshotRootCounts, resistanceSideSlot, 0, write) and same
+    same := stateBoolRaw(cr.sideBreakSnapshotValidFlags, supportSideSlot, false, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotCoreIds, supportSideSlot, ID_NONE, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotGenerationIds, supportSideSlot, ID_NONE, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotOldSides, supportSideSlot, SIDE_NONE, write) and same
+    same := stateFloatRaw(cr.sideBreakSnapshotRangeBottoms, supportSideSlot, float(na), write) and same
+    same := stateFloatRaw(cr.sideBreakSnapshotRangeTops, supportSideSlot, float(na), write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotBreakSeqs, supportSideSlot, SEQ_UNSET, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotBreakTimes, supportSideSlot, int(na), write) and same
+    same := stateBoolRaw(cr.sideBreakSnapshotWasGapBreakFlags, supportSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideBreakSnapshotMovedAwayFlags, supportSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideBreakSnapshotRetestSeenFlags, supportSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideBreakSnapshotValidFlags, resistanceSideSlot, false, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotCoreIds, resistanceSideSlot, ID_NONE, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotGenerationIds, resistanceSideSlot, ID_NONE, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotOldSides, resistanceSideSlot, SIDE_NONE, write) and same
+    same := stateFloatRaw(cr.sideBreakSnapshotRangeBottoms, resistanceSideSlot, float(na), write) and same
+    same := stateFloatRaw(cr.sideBreakSnapshotRangeTops, resistanceSideSlot, float(na), write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotBreakSeqs, resistanceSideSlot, SEQ_UNSET, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotBreakTimes, resistanceSideSlot, int(na), write) and same
+    same := stateBoolRaw(cr.sideBreakSnapshotWasGapBreakFlags, resistanceSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideBreakSnapshotMovedAwayFlags, resistanceSideSlot, false, write) and same
+    same := stateBoolRaw(cr.sideBreakSnapshotRetestSeenFlags, resistanceSideSlot, false, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotRootHeadNodeIndexes, supportSideSlot, SLOT_INVALID, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotRootTailNodeIndexes, supportSideSlot, SLOT_INVALID, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotRootCounts, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotRootHeadNodeIndexes, resistanceSideSlot, SLOT_INVALID, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotRootTailNodeIndexes, resistanceSideSlot, SLOT_INVALID, write) and same
+    same := stateIntRaw(cr.sideBreakSnapshotRootCounts, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideCurrentRootHeadNodeIndexes, supportSideSlot, SLOT_INVALID, write) and same
+    same := stateIntRaw(cr.sideCurrentRootTailNodeIndexes, supportSideSlot, SLOT_INVALID, write) and same
+    same := stateIntRaw(cr.sideCurrentRootCounts, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideCurrentRootHeadNodeIndexes, resistanceSideSlot, SLOT_INVALID, write) and same
+    same := stateIntRaw(cr.sideCurrentRootTailNodeIndexes, resistanceSideSlot, SLOT_INVALID, write) and same
+    same := stateIntRaw(cr.sideCurrentRootCounts, resistanceSideSlot, 0, write) and same
+    same := stateBoolRaw(cr.corePendingGenerationFlags, coreSlot, false, write) and same
+    same := stateIntRaw(cr.sideFvgDirectionMasks, supportSideSlot, FVG_MASK_NONE, write) and same
+    same := stateIntRaw(cr.sideFvgRootCounts, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideFvgFreshCounts, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideFvgStructuralStateMasks, supportSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideFvgDirectionMasks, resistanceSideSlot, FVG_MASK_NONE, write) and same
+    same := stateIntRaw(cr.sideFvgRootCounts, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideFvgFreshCounts, resistanceSideSlot, 0, write) and same
+    same := stateIntRaw(cr.sideFvgStructuralStateMasks, resistanceSideSlot, 0, write) and same
+    same
+coreResetSlotRaw(ShadowContext ctx, int coreSlot) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    array.set(cr.coreIds,             coreSlot, ID_NONE)
+    array.set(cr.coreGenerationIds,   coreSlot, ID_NONE)
+    array.set(cr.corePhysicalBottoms, coreSlot, float(na))
+    array.set(cr.corePhysicalTops,    coreSlot, float(na))
+    array.set(cr.coreCreatedTimes,    coreSlot, int(na))
+    array.set(cr.coreSlotLiveFlags, coreSlot, false)
+    array.set(cr.touchMarkRingOwnerCoreIds, coreSlot, ID_NONE)
+    array.set(cr.touchMarkRingHeads,        coreSlot, 0)
+    array.set(cr.touchMarkRingCounts,       coreSlot, 0)
+    int supportSideSlot    = coreSlot * 2
+    int resistanceSideSlot = coreSlot * 2 + 1
+    array.set(cr.sideTouchHistoryTruncatedFlags, supportSideSlot   , false)
+    array.set(cr.sideTouchHistoryTruncatedFlags, resistanceSideSlot, false)
+    array.set(cr.sidePhaseSetPositions, supportSideSlot,    SLOT_INVALID)
+    array.set(cr.sidePhaseSetPositions, resistanceSideSlot, SLOT_INVALID)
+    array.set(cr.sideArmedEffectiveBottomOrderPositions,  supportSideSlot,    SLOT_INVALID)
+    array.set(cr.sideArmedEffectiveTopOrderPositions,     supportSideSlot,    SLOT_INVALID)
+    array.set(cr.sideDormantRecoveryBottomOrderPositions, supportSideSlot,    SLOT_INVALID)
+    array.set(cr.sideDormantRecoveryTopOrderPositions,    supportSideSlot,    SLOT_INVALID)
+    array.set(cr.sideArmedEffectiveBottomOrderPositions,  resistanceSideSlot, SLOT_INVALID)
+    array.set(cr.sideArmedEffectiveTopOrderPositions,     resistanceSideSlot, SLOT_INVALID)
+    array.set(cr.sideDormantRecoveryBottomOrderPositions, resistanceSideSlot, SLOT_INVALID)
+    array.set(cr.sideDormantRecoveryTopOrderPositions,    resistanceSideSlot, SLOT_INVALID)
+    array.set(cr.sideBrokenSnapshotBottomOrderPositions, supportSideSlot,    SLOT_INVALID)
+    array.set(cr.sideBrokenSnapshotTopOrderPositions,    supportSideSlot,    SLOT_INVALID)
+    array.set(cr.sideFlipSnapshotBottomOrderPositions,   supportSideSlot,    SLOT_INVALID)
+    array.set(cr.sideFlipSnapshotTopOrderPositions,      supportSideSlot,    SLOT_INVALID)
+    array.set(cr.sideBrokenSnapshotBottomOrderPositions, resistanceSideSlot, SLOT_INVALID)
+    array.set(cr.sideBrokenSnapshotTopOrderPositions,    resistanceSideSlot, SLOT_INVALID)
+    array.set(cr.sideFlipSnapshotBottomOrderPositions,   resistanceSideSlot, SLOT_INVALID)
+    array.set(cr.sideFlipSnapshotTopOrderPositions,      resistanceSideSlot, SLOT_INVALID)
+    array.set(cr.corePendingTopologyFlags,   coreSlot, false)
+    array.set(cr.corePendingTopologyChildHeadIndexes, coreSlot, SLOT_INVALID)
+    array.set(cr.corePendingTopologyChildTailIndexes, coreSlot, SLOT_INVALID)
+    array.set(cr.corePendingTopologyChildCounts     , coreSlot, 0)
+// W08 B07-D: one fresh Core on the next free slot (else an appended slot) with the caller-planned coreId / generationId /
+// coreCreatedTime. No ID counter is touched here: the caller plans the IDs in fresh rank order and moves nextCoreId /
+// nextGenerationId once, after the whole commit (IDs are never reused).
+    coreDeferredStateRaw(cr, coreSlot, true)
+// W08 B07-D: one fresh Core on the next free slot (else an appended slot) with the caller-planned coreId / generationId /
+// coreCreatedTime. No ID counter is touched here: the caller plans the IDs in fresh rank order and moves nextCoreId /
+// nextGenerationId once, after the whole commit (IDs are never reused).
+coreAllocSlotRaw(ShadowContext ctx, int newCoreId, int newGenerationId, int createdTime) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    int coreSlot = SLOT_INVALID
+    if array.size(cr.coreFreeSlots) > 0
+        coreSlot := array.pop(cr.coreFreeSlots)
+        coreResetSlotRaw(ctx, coreSlot)
+    else
+        coreSlot := array.size(cr.coreIds)
+        array.push(cr.coreIds,             ID_NONE)
+        array.push(cr.coreGenerationIds,   ID_NONE)
+        array.push(cr.coreZoneFreshFlags,  false)
+        array.push(cr.corePhysicalBottoms, float(na))
+        array.push(cr.corePhysicalTops,    float(na))
+        array.push(cr.coreCreatedTimes,    int(na))
+        array.push(cr.coreLastSeenTimes,   int(na))
+        array.push(cr.coreDormantFlags,    false)
+        array.push(cr.coreSlotLiveFlags, false)
+        array.push(cr.touchMarkRingOwnerCoreIds, ID_NONE)
+        array.push(cr.touchMarkRingHeads,        0)
+        array.push(cr.touchMarkRingCounts,       0)
+        int touchCapacity = cr.touchMarkCapacityPerCore
+        if touchCapacity > 0
+            for touchOffset = 0 to touchCapacity - 1
+                array.push(cr.touchMarkBaseSeqs,           SEQ_UNSET)
+                array.push(cr.touchMarkTimes,              int(na))
+                array.push(cr.touchMarkSides,              SIDE_NONE)
+                array.push(cr.touchMarkContactBottoms,     float(na))
+                array.push(cr.touchMarkContactTops,        float(na))
+                array.push(cr.touchMarkCloseAtTouches,     float(na))
+                array.push(cr.touchMarkGenerationIds,      ID_NONE)
+                array.push(cr.touchMarkIsNormalTouchFlags, false)
+        array.push(cr.sideTouchCounts,           0)
+        array.push(cr.sideWeakByTouchFlags,      false)
+        array.push(cr.sideWeakByDepthFlags,      false)
+        array.push(cr.sideMaxDepthPcts,          0.0)
+        array.push(cr.sideFreshFlags,            false)
+        array.push(cr.sidePhases,                PH_WAITING)
+        array.push(cr.sideGrades,                GR_UNAVAILABLE)
+        array.push(cr.sideCurrentTouchNos,       0)
+        array.push(cr.sideUpcomingTouchNos,      0)
+        array.push(cr.sideArmedFromSeqs,         SEQ_UNSET)
+        array.push(cr.sideLastArmedRangeBottoms, float(na))
+        array.push(cr.sideLastArmedRangeTops,    float(na))
+        array.push(cr.sideLastNormalTouchTimes,  int(na))
+        array.push(cr.sideFlipAttemptCounts,     0)
+        array.push(cr.sideInverseAttemptCounts,  0)
+        array.push(cr.sideLastFlipConfirmSeqs,   SEQ_UNSET)
+        array.push(cr.sideEffectiveBottoms,      float(na))
+        array.push(cr.sideEffectiveTops,         float(na))
+        array.push(cr.sideReferencePrices,       float(na))
+        array.push(cr.sideCCounts,               0)
+        array.push(cr.sideHCounts,               0)
+        array.push(cr.sideDensities,             int(na))
+        array.push(cr.sideBaseStrongFlags,       false)
+        array.push(cr.sideHasNonPsychRootFlags,  false)
+        array.push(cr.sideIsBroadContextFlags,   false)
+        array.push(cr.sideEligibleFlags,         false)
+        array.push(cr.sidePhaseSetPositions, SLOT_INVALID)
+        array.push(cr.sideTouchHistoryTruncatedFlags, false)
+        array.push(cr.sideTouchStartSnapshotValidFlags,      false)
+        array.push(cr.sideTouchStartSnapshotCoreIds,         ID_NONE)
+        array.push(cr.sideTouchStartSnapshotGenerationIds,   ID_NONE)
+        array.push(cr.sideTouchStartSnapshotSides,           SIDE_NONE)
+        array.push(cr.sideTouchStartSnapshotRangeBottoms,    float(na))
+        array.push(cr.sideTouchStartSnapshotRangeTops,       float(na))
+        array.push(cr.sideTouchStartSnapshotCategoryMasks,   0)
+        array.push(cr.sideTouchStartSnapshotHighMasks,       0)
+        array.push(cr.sideTouchStartSnapshotCCounts,         0)
+        array.push(cr.sideTouchStartSnapshotHCounts,         0)
+        array.push(cr.sideTouchStartSnapshotDensities,       int(na))
+        array.push(cr.sideTouchStartSnapshotGrades,          GR_UNAVAILABLE)
+        array.push(cr.sideTouchStartSnapshotCurrentTouchNos, 0)
+        array.push(cr.sideTouchStartSnapshotApproachSides,   SIDE_NONE)
+        array.push(cr.sideTouchStartSnapshotStartSeqs,       SEQ_UNSET)
+        array.push(cr.sideTouchStartSnapshotStartTimes,      int(na))
+        array.push(cr.sideTouchStartSnapshotDeepestCloses,   float(na))
+        array.push(cr.sideTouchStartSnapshotMaxDepthPcts,    0.0)
+        array.push(cr.sideTouchStartSnapshotRootHeadNodeIndexes, SLOT_INVALID)
+        array.push(cr.sideTouchStartSnapshotRootTailNodeIndexes, SLOT_INVALID)
+        array.push(cr.sideTouchStartSnapshotRootCounts,          0)
+        array.push(cr.sideBreakSnapshotValidFlags,       false)
+        array.push(cr.sideBreakSnapshotCoreIds,          ID_NONE)
+        array.push(cr.sideBreakSnapshotGenerationIds,    ID_NONE)
+        array.push(cr.sideBreakSnapshotOldSides,         SIDE_NONE)
+        array.push(cr.sideBreakSnapshotRangeBottoms,     float(na))
+        array.push(cr.sideBreakSnapshotRangeTops,        float(na))
+        array.push(cr.sideBreakSnapshotBreakSeqs,        SEQ_UNSET)
+        array.push(cr.sideBreakSnapshotBreakTimes,       int(na))
+        array.push(cr.sideBreakSnapshotWasGapBreakFlags, false)
+        array.push(cr.sideBreakSnapshotMovedAwayFlags,   false)
+        array.push(cr.sideBreakSnapshotRetestSeenFlags,  false)
+        array.push(cr.sideBreakSnapshotRootHeadNodeIndexes, SLOT_INVALID)
+        array.push(cr.sideBreakSnapshotRootTailNodeIndexes, SLOT_INVALID)
+        array.push(cr.sideBreakSnapshotRootCounts         , 0)
+        array.push(cr.sideCurrentRootHeadNodeIndexes, SLOT_INVALID)
+        array.push(cr.sideCurrentRootTailNodeIndexes, SLOT_INVALID)
+        array.push(cr.sideCurrentRootCounts         , 0)
+        array.push(cr.sideFvgDirectionMasks      , FVG_MASK_NONE)
+        array.push(cr.sideFvgRootCounts          , 0)
+        array.push(cr.sideFvgFreshCounts         , 0)
+        array.push(cr.sideFvgStructuralStateMasks, 0)
+        array.push(cr.sideArmedEffectiveBottomOrderPositions,  SLOT_INVALID)
+        array.push(cr.sideArmedEffectiveTopOrderPositions,     SLOT_INVALID)
+        array.push(cr.sideDormantRecoveryBottomOrderPositions, SLOT_INVALID)
+        array.push(cr.sideDormantRecoveryTopOrderPositions,    SLOT_INVALID)
+        array.push(cr.sideBrokenSnapshotBottomOrderPositions, SLOT_INVALID)
+        array.push(cr.sideBrokenSnapshotTopOrderPositions,    SLOT_INVALID)
+        array.push(cr.sideFlipSnapshotBottomOrderPositions,   SLOT_INVALID)
+        array.push(cr.sideFlipSnapshotTopOrderPositions,      SLOT_INVALID)
+        array.push(cr.sideTouchCounts,           0)
+        array.push(cr.sideWeakByTouchFlags,      false)
+        array.push(cr.sideWeakByDepthFlags,      false)
+        array.push(cr.sideMaxDepthPcts,          0.0)
+        array.push(cr.sideFreshFlags,            false)
+        array.push(cr.sidePhases,                PH_WAITING)
+        array.push(cr.sideGrades,                GR_UNAVAILABLE)
+        array.push(cr.sideCurrentTouchNos,       0)
+        array.push(cr.sideUpcomingTouchNos,      0)
+        array.push(cr.sideArmedFromSeqs,         SEQ_UNSET)
+        array.push(cr.sideLastArmedRangeBottoms, float(na))
+        array.push(cr.sideLastArmedRangeTops,    float(na))
+        array.push(cr.sideLastNormalTouchTimes,  int(na))
+        array.push(cr.sideFlipAttemptCounts,     0)
+        array.push(cr.sideInverseAttemptCounts,  0)
+        array.push(cr.sideLastFlipConfirmSeqs,   SEQ_UNSET)
+        array.push(cr.sideEffectiveBottoms,      float(na))
+        array.push(cr.sideEffectiveTops,         float(na))
+        array.push(cr.sideReferencePrices,       float(na))
+        array.push(cr.sideCCounts,               0)
+        array.push(cr.sideHCounts,               0)
+        array.push(cr.sideDensities,             int(na))
+        array.push(cr.sideBaseStrongFlags,       false)
+        array.push(cr.sideHasNonPsychRootFlags,  false)
+        array.push(cr.sideIsBroadContextFlags,   false)
+        array.push(cr.sideEligibleFlags,         false)
+        array.push(cr.sidePhaseSetPositions, SLOT_INVALID)
+        array.push(cr.sideTouchHistoryTruncatedFlags, false)
+        array.push(cr.sideArmedEffectiveBottomOrderPositions,  SLOT_INVALID)
+        array.push(cr.sideArmedEffectiveTopOrderPositions,     SLOT_INVALID)
+        array.push(cr.sideDormantRecoveryBottomOrderPositions, SLOT_INVALID)
+        array.push(cr.sideDormantRecoveryTopOrderPositions,    SLOT_INVALID)
+        array.push(cr.sideTouchStartSnapshotValidFlags,      false)
+        array.push(cr.sideTouchStartSnapshotCoreIds,         ID_NONE)
+        array.push(cr.sideTouchStartSnapshotGenerationIds,   ID_NONE)
+        array.push(cr.sideTouchStartSnapshotSides,           SIDE_NONE)
+        array.push(cr.sideTouchStartSnapshotRangeBottoms,    float(na))
+        array.push(cr.sideTouchStartSnapshotRangeTops,       float(na))
+        array.push(cr.sideTouchStartSnapshotCategoryMasks,   0)
+        array.push(cr.sideTouchStartSnapshotHighMasks,       0)
+        array.push(cr.sideTouchStartSnapshotCCounts,         0)
+        array.push(cr.sideTouchStartSnapshotHCounts,         0)
+        array.push(cr.sideTouchStartSnapshotDensities,       int(na))
+        array.push(cr.sideTouchStartSnapshotGrades,          GR_UNAVAILABLE)
+        array.push(cr.sideTouchStartSnapshotCurrentTouchNos, 0)
+        array.push(cr.sideTouchStartSnapshotApproachSides,   SIDE_NONE)
+        array.push(cr.sideTouchStartSnapshotStartSeqs,       SEQ_UNSET)
+        array.push(cr.sideTouchStartSnapshotStartTimes,      int(na))
+        array.push(cr.sideTouchStartSnapshotDeepestCloses,   float(na))
+        array.push(cr.sideTouchStartSnapshotMaxDepthPcts,    0.0)
+        array.push(cr.sideTouchStartSnapshotRootHeadNodeIndexes, SLOT_INVALID)
+        array.push(cr.sideTouchStartSnapshotRootTailNodeIndexes, SLOT_INVALID)
+        array.push(cr.sideTouchStartSnapshotRootCounts,          0)
+        array.push(cr.sideBreakSnapshotValidFlags,       false)
+        array.push(cr.sideBreakSnapshotCoreIds,          ID_NONE)
+        array.push(cr.sideBreakSnapshotGenerationIds,    ID_NONE)
+        array.push(cr.sideBreakSnapshotOldSides,         SIDE_NONE)
+        array.push(cr.sideBreakSnapshotRangeBottoms,     float(na))
+        array.push(cr.sideBreakSnapshotRangeTops,        float(na))
+        array.push(cr.sideBreakSnapshotBreakSeqs,        SEQ_UNSET)
+        array.push(cr.sideBreakSnapshotBreakTimes,       int(na))
+        array.push(cr.sideBreakSnapshotWasGapBreakFlags, false)
+        array.push(cr.sideBreakSnapshotMovedAwayFlags,   false)
+        array.push(cr.sideBreakSnapshotRetestSeenFlags,  false)
+        array.push(cr.sideBreakSnapshotRootHeadNodeIndexes, SLOT_INVALID)
+        array.push(cr.sideBreakSnapshotRootTailNodeIndexes, SLOT_INVALID)
+        array.push(cr.sideBreakSnapshotRootCounts         , 0)
+        array.push(cr.sideCurrentRootHeadNodeIndexes, SLOT_INVALID)
+        array.push(cr.sideCurrentRootTailNodeIndexes, SLOT_INVALID)
+        array.push(cr.sideCurrentRootCounts         , 0)
+        array.push(cr.sideFvgDirectionMasks      , FVG_MASK_NONE)
+        array.push(cr.sideFvgRootCounts          , 0)
+        array.push(cr.sideFvgFreshCounts         , 0)
+        array.push(cr.sideFvgStructuralStateMasks, 0)
+        array.push(cr.sideBrokenSnapshotBottomOrderPositions, SLOT_INVALID)
+        array.push(cr.sideBrokenSnapshotTopOrderPositions,    SLOT_INVALID)
+        array.push(cr.sideFlipSnapshotBottomOrderPositions,   SLOT_INVALID)
+        array.push(cr.sideFlipSnapshotTopOrderPositions,      SLOT_INVALID)
+        array.push(cr.corePruneRevisions, 0)
+        array.push(cr.corePendingTopologyFlags,   false)
+        array.push(cr.corePendingGenerationFlags, false)
+        array.push(cr.corePendingTopologyChildHeadIndexes, SLOT_INVALID)
+        array.push(cr.corePendingTopologyChildTailIndexes, SLOT_INVALID)
+        array.push(cr.corePendingTopologyChildCounts     , 0)
+    array.set(cr.coreIds,           coreSlot, newCoreId)
+    array.set(cr.coreGenerationIds, coreSlot, newGenerationId)
+    array.set(cr.coreCreatedTimes,  coreSlot, createdTime)
+    array.set(cr.coreSlotLiveFlags, coreSlot, true)
+    array.set(cr.touchMarkRingOwnerCoreIds, coreSlot, newCoreId)
+    array.set(cr.touchMarkRingHeads,        coreSlot, 0)
+    array.set(cr.touchMarkRingCounts,       coreSlot, 0)
+    phaseSetAddRaw(ctx, coreSlot * 2)
+    phaseSetAddRaw(ctx, coreSlot * 2 + 1)
+    map.put(cr.coreIdToSlot, newCoreId, coreSlot)
+    array.push(cr.coreLiveSlots, coreSlot)
+    array.push(cr.coreIdOrderSlots, coreSlot)
+    coreSlot
+// W08 B15-B2: the pending pool of the chain = the pass scratch copy (ctx.psPlan, made by planPass); the real pool
+// (ctx.ps) is written only by commitPass.
+pendingStoreViewRaw(ShadowContext ctx) =>
+    ctx.psPlan
+// W08 B01: the Core origin Root membership (rootId ASC chain per physical Core) and the W08 topology revision are
+// owned by W08Core (Worker /2, engine.w08CoreStore: originAdd / originRemove / originReadAsc, topologyRevision).
+// W08 B02: the Core identity interval index is owned by W08Core (Worker /1, engine.w08CoreStore); callers use
+// W08Core.intervalInsert / intervalDetach / intervalMove directly. Main keeps the Core state, the physical float range
+// (corePhysicalBottoms / Tops) and coreRangeRevision: after intervalMove returns changed = true the caller writes the new
+// physical range and bumps coreRangeRevision, also when the float range changes but its ticks do not.
+// W08 B04-C: indexed Identity candidate gather for one Candidate winner (record index, not a comparator order). Old
+// physical Cores are discovered through the Root -> participation chain of every Candidate Root, the W08Core interval
+// index (interval gap <= M on ticks, mTick = int(math.round(clusterMaxWidth / mintick)) as W05 / W06) and the W08Core
+// inverse-origin index of every FVG Root of the Candidate (no state / direction / Broad filter), each hit guarded by the
+// current registry (GUARD_03 / 01 / 02: live slot and coreIds[slot] == the stored expected Core ID; a stale hit is skipped),
+// then united in the W08Core gather scratch by coreId. Writes [coreSlot, coreId] (stride 2, coreId ASC) and returns the
+// count; a structural fault (winner slice, Root registry, participation chain, Worker call) returns -1 with an empty
+// outPairs. Candidate discovery only: no Identity decision. outPairs doubles as the collect scratch.
+identityGatherForCandidateRaw(ShadowContext ctx, int candidateWinnerIndex, array<int> outPairs) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    WinnerView w3 = ctx.wv
+    W08Core.W08Store   ws = ctx.ws
+    W08Core.identityGatherReset(ws)
+    array.clear(outPairs)
+    int  coreCount = array.size(cr.coreIds)
+    int  rootRows  = array.size(ctx.rv.rootIds)
+    int  edgeRows  = array.size(ctx.pv.participationEdgeRootSlots)
+    bool ok = candidateWinnerIndex >= 0 and candidateWinnerIndex < w3.candidateWinnerLogicalCount and candidateWinnerIndex < array.size(w3.candidateWinnerRootIdOffsets) and candidateWinnerIndex < array.size(w3.candidateWinnerRootIdLengths) and candidateWinnerIndex < array.size(w3.candidateWinnerEffectiveBottomTicks) and candidateWinnerIndex < array.size(w3.candidateWinnerEffectiveTopTicks) and ctx.mintick > 0 and array.size(cr.coreSlotLiveFlags) == coreCount and array.size(ctx.rv.rootSlotLiveFlags) == rootRows and array.size(ctx.rv.rootCategories) == rootRows and array.size(ctx.rv.rootParticipationHeadEdgeIndexes) == rootRows and array.size(ctx.rv.rootParticipationCounts) == rootRows and array.size(ctx.pv.participationEdgeExpectedRootIds) == edgeRows and array.size(ctx.pv.participationEdgeSideSlots) == edgeRows and array.size(ctx.pv.participationEdgeExpectedCoreIds) == edgeRows and array.size(ctx.pv.participationEdgeNextByRootIndexes) == edgeRows and array.size(ctx.pv.participationEdgeLiveFlags) == edgeRows
+    int rootStart = 0
+    int rootLen   = 0
+    if ok
+        rootStart := array.get(w3.candidateWinnerRootIdOffsets, candidateWinnerIndex)
+        rootLen   := array.get(w3.candidateWinnerRootIdLengths, candidateWinnerIndex)
+        ok := rootStart >= 0 and rootLen >= 0 and rootStart + rootLen <= w3.candidateWinnerRootIdLength and rootStart + rootLen <= array.size(w3.candidateWinnerRootIds)
+    // PATH 1: Root -> participating Core (GUARD_03)
+    int r = 0
+    while ok and r < rootLen
+        int rootId   = array.get(w3.candidateWinnerRootIds, rootStart + r)
+        int rootSlot = map.contains(ctx.rv.rootIdToSlot, rootId) ? map.get(ctx.rv.rootIdToSlot, rootId) : SLOT_INVALID
+        ok := rootSlot >= 0 and rootSlot < rootRows
+        if ok
+            ok := array.get(ctx.rv.rootSlotLiveFlags, rootSlot) and array.get(ctx.rv.rootIds, rootSlot) == rootId
+        int count = 0
+        int edge  = SLOT_INVALID
+        int seen  = 0
+        if ok
+            count := array.get(ctx.rv.rootParticipationCounts, rootSlot)
+            edge  := array.get(ctx.rv.rootParticipationHeadEdgeIndexes, rootSlot)
+            ok    := count >= 0
+        while ok and seen < count
+            ok := edge >= 0 and edge < edgeRows
+            if ok
+                ok := array.get(ctx.pv.participationEdgeLiveFlags, edge) and array.get(ctx.pv.participationEdgeRootSlots, edge) == rootSlot and array.get(ctx.pv.participationEdgeExpectedRootIds, edge) == rootId
+            if ok
+                int sideSlot = array.get(ctx.pv.participationEdgeSideSlots, edge)
+                int coreSlot = int(math.floor(sideSlot / 2))
+                ok := sideSlot >= 0 and coreSlot < coreCount
+                if ok and array.get(cr.coreSlotLiveFlags, coreSlot) and array.get(cr.coreIds, coreSlot) == array.get(ctx.pv.participationEdgeExpectedCoreIds, edge)
+                    [rootOfferOk, rootOfferChanged] = W08Core.identityGatherOffer(ws, coreSlot, array.get(cr.coreIds, coreSlot))
+                    ok := rootOfferOk
+                edge := array.get(ctx.pv.participationEdgeNextByRootIndexes, edge)
+                seen += 1
+        ok := ok and edge == SLOT_INVALID
+        r += 1
+    // PATH 2: interval gap <= M (GUARD_01)
+    if ok
+        int mTick = int(math.round(ctx.clusterMaxWidth / ctx.mintick))
+        int n     = W08Core.intervalCollect(ws, array.get(w3.candidateWinnerEffectiveBottomTicks, candidateWinnerIndex), array.get(w3.candidateWinnerEffectiveTopTicks, candidateWinnerIndex), mTick, outPairs)
+        ok := n >= 0 and array.size(outPairs) == n * 2
+        int i = 0
+        while ok and i < n * 2
+            int coreSlot = array.get(outPairs, i)
+            ok := coreSlot >= 0 and coreSlot < coreCount
+            if ok and array.get(cr.coreSlotLiveFlags, coreSlot) and array.get(cr.coreIds, coreSlot) == array.get(outPairs, i + 1)
+                [intervalOfferOk, intervalOfferChanged] = W08Core.identityGatherOffer(ws, coreSlot, array.get(cr.coreIds, coreSlot))
+                ok := intervalOfferOk
+            i += 2
+        array.clear(outPairs)
+    // PATH 3: inverse-origin of every FVG Root of the Candidate (GUARD_02)
+    r := 0
+    while ok and r < rootLen
+        int rootId   = array.get(w3.candidateWinnerRootIds, rootStart + r)
+        int rootSlot = map.get(ctx.rv.rootIdToSlot, rootId)
+        if array.get(ctx.rv.rootCategories, rootSlot) == CAT_FVG
+            int n = W08Core.inverseOriginCollect(ws, rootId, outPairs)
+            ok := n >= 0 and array.size(outPairs) == n * 2
+            int i = 0
+            while ok and i < n * 2
+                int coreSlot = array.get(outPairs, i)
+                ok := coreSlot >= 0 and coreSlot < coreCount
+                if ok and array.get(cr.coreSlotLiveFlags, coreSlot) and array.get(cr.coreIds, coreSlot) == array.get(outPairs, i + 1)
+                    [inverseOfferOk, inverseOfferChanged] = W08Core.identityGatherOffer(ws, coreSlot, array.get(cr.coreIds, coreSlot))
+                    ok := inverseOfferOk
+                i += 2
+            array.clear(outPairs)
+        r += 1
+    int result = -1
+    array.clear(outPairs)
+    if ok
+        result := W08Core.identityGatherReadAsc(ws, outPairs)
+    result
+// W08 B05: exact Identity predicate for one old physical Core x one Candidate winner (A17.1), read-only. matched = both
+// (A) a shared origin Root ID that is not a Broad FVG (two-pointer walk of the old Core's full origin set from W08Core
+// originReadAsc and the Candidate's rootId ASC Root slice; a shared Broad FVG alone never counts, Broad Roots stay stored)
+// and (B) interval gap <= M on ticks (old range = corePhysicalBottoms / Tops rounded only here, Candidate = its effective
+// ticks, gap = max(0, candidateBottom - oldTop, oldBottom - candidateTop), mTick as W05 / W06 / B04, equality included).
+// No centre / reference / median distance, no source, side, state, direction, generation or comparator term. Returns
+// [ok, matched]: ok = false on a structural fault (winner slice, old Core not live / not expectedOldCoreId, range, Worker
+// origin read, shared Root registry, mintick / M), else matched. Cannot pick among several matched Cores (B07).
+// W08 B07-B: the B05 predicate on any rootId ASC Root slice (rootIds[rootStart .. rootStart + rootLen)) with its
+// effective ticks [candBottomTick, candTopTick]: the Candidate winner (identityExactMatchRaw) and the physical Candidate
+// (buildPhysicalIdentityPlanRaw) share this one body, semantics unchanged.
+identityExactSliceRaw(ShadowContext ctx, array<int> rootIds, int rootStart, int rootLen, int candBottomTick, int candTopTick, int oldCoreSlot, int expectedOldCoreId) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    bool ok = ctx.mintick > 0 and ctx.clusterMaxWidth >= 0 and expectedOldCoreId >= 1 and oldCoreSlot >= 0 and oldCoreSlot < array.size(cr.coreIds) and oldCoreSlot < array.size(cr.coreSlotLiveFlags) and oldCoreSlot < array.size(cr.corePhysicalBottoms) and oldCoreSlot < array.size(cr.corePhysicalTops) and rootStart >= 0 and rootLen >= 0 and rootStart + rootLen <= array.size(rootIds)
+    if ok
+        ok := array.get(cr.coreSlotLiveFlags, oldCoreSlot) and array.get(cr.coreIds, oldCoreSlot) == expectedOldCoreId
+    bool rangeMatched = false
+    if ok
+        float oldBottom = array.get(cr.corePhysicalBottoms, oldCoreSlot)
+        float oldTop    = array.get(cr.corePhysicalTops,    oldCoreSlot)
+        int   oldBottomTick = int(math.round(oldBottom / ctx.mintick))
+        int   oldTopTick    = int(math.round(oldTop    / ctx.mintick))
+        ok := oldBottomTick <= oldTopTick and candBottomTick <= candTopTick
+        if ok
+            int mTick = int(math.round(ctx.clusterMaxWidth / ctx.mintick))
+            rangeMatched := math.max(0, candBottomTick - oldTopTick, oldBottomTick - candTopTick) <= mTick
+    bool originMatched = false
+    if ok
+        array<int> oldRoots = array.new_int(0)
+        int oldCount = W08Core.originReadAsc(ctx.ws, oldCoreSlot, expectedOldCoreId, oldRoots)
+        ok := oldCount >= 0 and oldCount == array.size(oldRoots)
+        int a = 0
+        int b = 0
+        while ok and not originMatched and a < oldCount and b < rootLen
+            int oldRootId  = array.get(oldRoots, a)
+            int candRootId = array.get(rootIds, rootStart + b)
+            if oldRootId < candRootId
+                a += 1
+            else if oldRootId > candRootId
+                b += 1
+            else
+                int rootSlot = map.contains(ctx.rv.rootIdToSlot, oldRootId) ? map.get(ctx.rv.rootIdToSlot, oldRootId) : SLOT_INVALID
+                ok := rootSlot >= 0 and rootSlot < array.size(ctx.rv.rootIds) and rootSlot < array.size(ctx.rv.rootSlotLiveFlags) and rootSlot < array.size(ctx.rv.rootCategories) and rootSlot < array.size(ctx.rv.rootIsBroadFvgFlags)
+                if ok
+                    ok := array.get(ctx.rv.rootSlotLiveFlags, rootSlot) and array.get(ctx.rv.rootIds, rootSlot) == oldRootId
+                if ok
+                    originMatched := not (array.get(ctx.rv.rootCategories, rootSlot) == CAT_FVG and array.get(ctx.rv.rootIsBroadFvgFlags, rootSlot))
+                a += 1
+                b += 1
+    [ok, ok and originMatched and rangeMatched]
+// W08 B06-B: Side Candidate -> physical Core pairing of the current pass (A10.7 / I15.1 PATH A), read-only on the Engine.
+// Every winner (record index, Side 1 / -1) goes into the W08Core pairing indexes; W08Core.pairingCollectPairs gives the
+// Support x Resistance pairs with interval gap <= M (mTick as W05 / W06 / B04 / B05) in (supportIndex, resistanceIndex)
+// ASC order; each pair is kept only when the tick ranges re-check gap <= M and the two rootId ASC Root slices share at
+// least one non-FVG Root (two-pointer; normal, Broad and Inverse FVG never count). PATH B (the same FVG origin before /
+// after Inverse) cannot occur inside one pass: W05 makes an FVG Root eligible for one Side only, so a shared FVG Root
+// between a Support and a Resistance winner breaks that invariant and fails the whole call. Writes the kept pairs
+// (stride 2, order kept by in-place forward compaction) and returns their count; -1 with an empty outPairs on any
+// structural or invariant fault. No Core allocation, no Identity, no runtime call site yet.
+pairCurrentCandidatesRaw(ShadowContext ctx, array<int> outPairs) =>
+    WinnerView w3 = ctx.wv
+    W08Core.W08Store   ws = ctx.ws
+    W08Core.pairingReset(ws)
+    array.clear(outPairs)
+    int  count       = w3.candidateWinnerLogicalCount
+    int  rootBacking = w3.candidateWinnerRootIdLength
+    bool ok = count >= 0 and count <= array.size(w3.candidateWinnerSides) and count <= array.size(w3.candidateWinnerEffectiveBottomTicks) and count <= array.size(w3.candidateWinnerEffectiveTopTicks) and count <= array.size(w3.candidateWinnerRootIdOffsets) and count <= array.size(w3.candidateWinnerRootIdLengths) and rootBacking >= 0 and rootBacking <= array.size(w3.candidateWinnerRootIds) and ctx.mintick > 0 and ctx.clusterMaxWidth >= 0
+    int i = 0
+    while ok and i < count
+        int side = array.get(w3.candidateWinnerSides, i)
+        int bot  = array.get(w3.candidateWinnerEffectiveBottomTicks, i)
+        int top  = array.get(w3.candidateWinnerEffectiveTopTicks, i)
+        int off  = array.get(w3.candidateWinnerRootIdOffsets, i)
+        int len  = array.get(w3.candidateWinnerRootIdLengths, i)
+        ok := (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and bot <= top and off >= 0 and len >= 0 and off + len <= rootBacking
+        if ok
+            [addOk, addChanged] = W08Core.pairingAddCandidate(ws, side, i, bot, top)
+            ok := addOk
+        i += 1
+    int mTick = 0
+    int n     = 0
+    if ok
+        mTick := int(math.round(ctx.clusterMaxWidth / ctx.mintick))
+        n     := W08Core.pairingCollectPairs(ws, mTick, outPairs)
+        ok    := n >= 0 and array.size(outPairs) == n * 2
+    int w = 0
+    int p = 0
+    while ok and p < n * 2
+        int sIdx = array.get(outPairs, p)
+        int rIdx = array.get(outPairs, p + 1)
+        ok := sIdx >= 0 and sIdx < count and rIdx >= 0 and rIdx < count
+        if ok
+            ok := array.get(w3.candidateWinnerSides, sIdx) == SIDE_SUPPORT and array.get(w3.candidateWinnerSides, rIdx) == SIDE_RESISTANCE
+        bool sharedNonFvg = false
+        if ok
+            int sOff = array.get(w3.candidateWinnerRootIdOffsets, sIdx)
+            int sEnd = sOff + array.get(w3.candidateWinnerRootIdLengths, sIdx)
+            int rOff = array.get(w3.candidateWinnerRootIdOffsets, rIdx)
+            int rEnd = rOff + array.get(w3.candidateWinnerRootIdLengths, rIdx)
+            while ok and sOff < sEnd and rOff < rEnd
+                int sRootId = array.get(w3.candidateWinnerRootIds, sOff)
+                int rRootId = array.get(w3.candidateWinnerRootIds, rOff)
+                if sRootId < rRootId
+                    sOff += 1
+                else if sRootId > rRootId
+                    rOff += 1
+                else
+                    int rootSlot = map.contains(ctx.rv.rootIdToSlot, sRootId) ? map.get(ctx.rv.rootIdToSlot, sRootId) : SLOT_INVALID
+                    ok := rootSlot >= 0 and rootSlot < array.size(ctx.rv.rootIds) and rootSlot < array.size(ctx.rv.rootSlotLiveFlags) and rootSlot < array.size(ctx.rv.rootCategories)
+                    if ok
+                        ok := array.get(ctx.rv.rootSlotLiveFlags, rootSlot) and array.get(ctx.rv.rootIds, rootSlot) == sRootId
+                    if ok
+                        ok := array.get(ctx.rv.rootCategories, rootSlot) != CAT_FVG
+                        sharedNonFvg := true
+                    sOff += 1
+                    rOff += 1
+        if ok and sharedNonFvg
+            int sBot = array.get(w3.candidateWinnerEffectiveBottomTicks, sIdx)
+            int sTop = array.get(w3.candidateWinnerEffectiveTopTicks,    sIdx)
+            int rBot = array.get(w3.candidateWinnerEffectiveBottomTicks, rIdx)
+            int rTop = array.get(w3.candidateWinnerEffectiveTopTicks,    rIdx)
+            if rBot <= sTop + mTick and rTop >= sBot - mTick
+                array.set(outPairs, w,     sIdx)
+                array.set(outPairs, w + 1, rIdx)
+                w += 2
+        p += 2
+    int result = -1
+    if ok
+        while array.size(outPairs) > w
+            array.pop(outPairs)
+        result := int(w / 2)
+    else
+        array.clear(outPairs)
+    result
+// W08 B07-A3: physical Candidates of the current pass into the W08Core physical storage: B06-B exact pairs ->
+// W08Core canonical maximum matching -> W08Core.physicalBuild (every winner exactly once, Root union, tick / exact float
+// envelope). Returns the physical Candidate count; -1 with empty physical storage (a failed step passes count -1 on).
+// No Core allocation, no Identity, no runtime call site yet.
+buildPhysicalCandidatesRaw(ShadowContext ctx) =>
+    WinnerView w3 = ctx.wv
+    array<int> eligiblePairs = array.new_int(0)
+    array<int> matchedPairs  = array.new_int(0)
+    int k = pairCurrentCandidatesRaw(ctx, eligiblePairs)
+    if k >= 0
+        k := W08Core.pairingSelectCanonicalMatching(ctx.ws, eligiblePairs, matchedPairs)
+    W08Core.physicalBuild(ctx.ws, k >= 0 ? w3.candidateWinnerLogicalCount : -1, w3.candidateWinnerSides, w3.candidateWinnerEffectiveBottomTicks, w3.candidateWinnerEffectiveTopTicks, w3.candidateWinnerExactPrices, w3.candidateWinnerMinRootIds, w3.candidateWinnerRootIdOffsets, w3.candidateWinnerRootIdLengths, w3.candidateWinnerRootIds, w3.candidateWinnerRootIdLength, matchedPairs, ctx.mintick)
+// W08 B07-B: physical Identity plan of the current pass. Per physical Candidate: old Core candidates = union of the
+// B04 gather of each constituent winner and the W08Core interval hits of the physical envelope (live and coreIds[slot]
+// == stored ID), united by coreId in the W08Core gather scratch (a coreId on two slots fails); each is kept when the B05
+// predicate holds on the physical Root union and envelope ticks (a live matched Core with na coreCreatedTime fails).
+// W08Core.identityPlanBuild stores every edge and the canonical continuation matching. Returns the match count; -1 with
+// an empty plan. No Core allocation, no ID inheritance, no runtime call site yet.
+buildPhysicalIdentityPlanRaw(ShadowContext ctx) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    W08Core.W08Store ws = ctx.ws
+    int  n     = buildPhysicalCandidatesRaw(ctx)
+    bool ok    = n >= 0
+    int  mTick = ok ? int(math.round(ctx.clusterMaxWidth / ctx.mintick)) : 0
+    array<int> rawEdges = array.new_int(0)
+    array<int> cand     = array.new_int(0)
+    array<int> hits     = array.new_int(0)
+    int p = 0
+    while ok and p < n
+        array.clear(cand)
+        int side = 0
+        while ok and side < 2
+            int w = side == 0 ? array.get(ws.physicalCandidateSupportWinnerIndexes, p) : array.get(ws.physicalCandidateResistanceWinnerIndexes, p)
+            if w >= 0
+                ok := identityGatherForCandidateRaw(ctx, w, hits) >= 0
+                int j = 0
+                while ok and j < array.size(hits)
+                    array.push(cand, array.get(hits, j))
+                    j += 1
+            side += 1
+        int bt = array.get(ws.physicalCandidateBottomTicks, p)
+        int tt = array.get(ws.physicalCandidateTopTicks, p)
+        if ok
+            ok := W08Core.intervalCollect(ws, bt, tt, mTick, hits) >= 0
+        int i = 0
+        while ok and i < array.size(hits)
+            int slot = array.get(hits, i)
+            if slot >= 0 and slot < array.size(cr.coreIds) and slot < array.size(cr.coreSlotLiveFlags)
+                if array.get(cr.coreSlotLiveFlags, slot) and array.get(cr.coreIds, slot) == array.get(hits, i + 1)
+                    array.push(cand, slot)
+                    array.push(cand, array.get(hits, i + 1))
+            i += 2
+        W08Core.identityGatherReset(ws)
+        i := 0
+        while ok and i < array.size(cand)
+            [offerOk, offerChanged] = W08Core.identityGatherOffer(ws, array.get(cand, i), array.get(cand, i + 1))
+            ok := offerOk
+            i += 2
+        if ok
+            ok := W08Core.identityGatherReadAsc(ws, hits) >= 0
+        i := 0
+        while ok and i < array.size(hits)
+            int slot = array.get(hits, i)
+            int id   = array.get(hits, i + 1)
+            [xOk, matched] = identityExactSliceRaw(ctx, ws.physicalCandidateRootIds, array.get(ws.physicalCandidateRootIdOffsets, p), array.get(ws.physicalCandidateRootIdLengths, p), bt, tt, slot, id)
+            ok := xOk
+            if ok and matched
+                int ct = array.get(cr.coreCreatedTimes, slot)
+                ok := not na(ct)
+                array.push(rawEdges, p)
+                array.push(rawEdges, slot)
+                array.push(rawEdges, id)
+                array.push(rawEdges, ct)
+            i += 2
+        p += 1
+    W08Core.identityPlanBuild(ws, ok ? n : -1, rawEdges)
+// W08 B07-C: ownership plan of the current pass (continuation = the B07-B selected match, inheriting the old coreId /
+// generationId; fresh = no match, ranked by W08Core fresh allocation order). Returns the fresh count; -1 with empty
+// ownership storage. No ID / generation counter, allocation, createdTime or runtime call site.
+buildPhysicalOwnershipPlanRaw(ShadowContext ctx) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    WinnerView w3 = ctx.wv
+    int k = buildPhysicalIdentityPlanRaw(ctx)
+    W08Core.ownershipPlanBuild(ctx.ws, k, cr.coreSlotLiveFlags, cr.coreIds, cr.coreGenerationIds, w3.candidateWinnerStages, w3.candidateWinnerEffectiveBottomTicks, w3.candidateWinnerEffectiveTopTicks, w3.candidateWinnerMinRootIds, w3.candidateWinnerFvgModes, w3.candidateWinnerPsychLevelTicks, w3.candidateWinnerRootIdOffsets, w3.candidateWinnerRootIdLengths, w3.candidateWinnerRootIds, w3.candidateWinnerRootIdLength)
+// W08 B08: Merge topology relations of the current pass (planning only): ownership plan, then W08Core.mergePlanBuild
+// over the full Identity edges and the B07-B survivor matches. Returns the relation count; -1 (Merge storage empty) when
+// any upstream stage or the Merge plan fails. Nothing is applied (no materialization, free or ID write); no runtime call site.
+buildPhysicalMergePlanRaw(ShadowContext ctx) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    int f = buildPhysicalOwnershipPlanRaw(ctx)
+    W08Core.mergePlanBuild(ctx.ws, f, cr.coreSlotLiveFlags, cr.coreIds, cr.coreCreatedTimes)
+// W08 B07-D: transactional materialization of the stored B07-C ownership plan (the plan is not rebuilt). F0 proves the
+// whole commit without any write, with the same predicates the commit primitives use: plan / physical sizes, fresh ranks
+// 0 .. F - 1 with sentinels, continuation targets (live, coreId, generationId, createdTime, each once; participation
+// detach ready, W08Core.coreIndexCanRelease), baseCloseTime, ID counters (fresh IDs never registered), the planned fresh
+// slots (free stack top first, then appended; no participation edge, W08Core.coreIndexClean), every Root ID (issued, live,
+// strictly ascending per slice, participationRootAddableRaw for the Side slices), the exact range against its ticks,
+// W08Core.coreIndexCanInstall per target, the participation free list and the array capacities. Commit (only after F0):
+// continuation release in place, fresh allocation in rank order with planned coreId = nextCoreId + rank /
+// generationId = nextGenerationId + rank / createdTime = baseCloseTime, then exact range, origin (rootId ASC), inverse per
+// FVG origin (Broad included), Side participation (own winner Root set), one interval tuple; the counters move once at the
+// end. A commit primitive reporting false after F0 is an invariant break (runtime.error), never a partial -1. Returns the
+// materialized count (mapping in physicalMaterialized*); -1 when F0 fails (nothing written). Unmatched old Cores are not
+// freed here. No runtime call site yet.
+// W08 B15-B2: materializeAppliedRaw = the B07-D materialization above restricted to applyP (the applied Candidates of the
+// shadow pass): applied fresh rows take ranks 0 .. fa - 1 in B07-C fresh rank order (coreId = nextCoreId + rank,
+// generationId = nextGenerationId + rank; a deferred fresh row reserves no ID / slot); commit = false stops after F0 (no
+// write); a non-applied Candidate keeps SLOT_INVALID / ID_NONE in physicalMaterialized*; the range change is recorded in
+// ctx.sc.rangeChanged and the revision moves once at the end of commitPass. Returns fa (applied fresh count); -1 when F0 fails.
+materializeAppliedRaw(ShadowContext ctx, array<bool> applyP, int materializeBaseCloseTime, bool commit) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    WinnerView w3 = ctx.wv
+    W08Core.W08Store   ws = ctx.ws
+    int  n      = ws.physicalCandidateLogicalCount
+    int  fc     = ws.physicalFreshAllocationCount
+    int  nFree  = array.size(cr.coreFreeSlots)
+    int  nCore  = array.size(cr.coreIds)
+    int  maxArr = 100000
+    bool ok = n >= 0 and fc >= 0 and fc <= n and array.size(ws.physicalOwnershipKinds) == n and array.size(ws.physicalContinuationOldCoreSlots) == n and array.size(ws.physicalContinuationCoreIds) == n and array.size(ws.physicalContinuationGenerationIds) == n and array.size(ws.physicalFreshAllocationRanks) == n and array.size(ws.physicalCandidateBottomTicks) == n and array.size(ws.physicalCandidateTopTicks) == n and array.size(ws.physicalCandidateRootIdOffsets) == n and array.size(ws.physicalCandidateRootIdLengths) == n and array.size(ws.physicalCandidateSupportWinnerIndexes) == n and array.size(ws.physicalCandidateResistanceWinnerIndexes) == n and array.size(ws.physicalCandidateExactPrices) == 2 * n and not na(materializeBaseCloseTime) and materializeBaseCloseTime > 0 and ctx.mintick > 0 and ctx.sc.nextCoreId >= 1 and ctx.sc.nextGenerationId >= 1 and array.size(applyP) == n
+    // B15-B2: only applied Candidates (changed component, not pending) materialize. Applied fresh rows take ranks 0 .. fa - 1
+    // in B07-C fresh rank order; a deferred fresh row reserves no ID / slot (no ID gap).
+    array<int> aRank = array.new_int(ok ? n : 0, -1)
+    array<int> rankP = array.new_int(ok ? fc : 0, SLOT_INVALID)
+    int freshRows = 0
+    int q0 = 0
+    while ok and q0 < n
+        if array.get(ws.physicalOwnershipKinds, q0) == 1
+            int rk = array.get(ws.physicalFreshAllocationRanks, q0)
+            ok := rk >= 0 and rk < fc
+            if ok
+                ok := array.get(rankP, rk) == SLOT_INVALID
+                array.set(rankP, rk, q0)
+            freshRows += 1
+        q0 += 1
+    ok := ok and freshRows == fc
+    int fa = 0
+    int f0 = 0
+    while ok and f0 < fc
+        int q = array.get(rankP, f0)
+        if array.get(applyP, q)
+            array.set(aRank, q, fa)
+            fa += 1
+        f0 += 1
+    array<int> byRank  = array.new_int(ok ? fa : 0, SLOT_INVALID)
+    array<int> tSlot   = array.new_int(ok ? n : 0, SLOT_INVALID)
+    array<int> tId     = array.new_int(ok ? n : 0, ID_NONE)
+    map<int, bool> contIds = map.new<int, bool>()
+    int newEdges = 0
+    int newNodes = 0
+    int newInv   = 0
+    int p = 0
+    while ok and p < n
+        if array.get(applyP, p)
+            int slot = array.get(ws.physicalContinuationOldCoreSlots, p)
+            int id   = array.get(ws.physicalContinuationCoreIds, p)
+            int gen  = array.get(ws.physicalContinuationGenerationIds, p)
+            int rank = array.get(ws.physicalFreshAllocationRanks, p)
+            if array.get(ws.physicalOwnershipKinds, p) == 1
+                ok := slot == SLOT_INVALID and id == ID_NONE and gen == ID_NONE and rank >= 0 and rank < fc
+                if ok
+                    ok := array.get(aRank, p) >= 0 and array.get(byRank, array.get(aRank, p)) == SLOT_INVALID
+                    if ok
+                        array.set(byRank, array.get(aRank, p), p)
+                    // planned fresh slot: the free stack top first (pop order), then appended slots; planned IDs by rank
+                    slot := nCore + array.get(aRank, p) - nFree
+                    if array.get(aRank, p) < nFree
+                        slot := array.get(cr.coreFreeSlots, nFree - 1 - array.get(aRank, p))
+                    id   := ctx.sc.nextCoreId + array.get(aRank, p)
+                    ok   := ok and slot >= 0 and not map.contains(cr.coreIdToSlot, id) and W08Core.coreIndexClean(ws, slot)
+                    if ok and slot < nCore
+                        ok := not array.get(cr.coreSlotLiveFlags, slot)
+                    int e = 0
+                    while ok and e < array.size(ctx.pv.participationEdgeSideSlots)
+                        ok := not (array.get(ctx.pv.participationEdgeLiveFlags, e) and int(math.floor(array.get(ctx.pv.participationEdgeSideSlots, e) / 2)) == slot)
+                        e += 1
+            else
+                ok := array.get(ws.physicalOwnershipKinds, p) == 0 and rank == -1 and slot >= 0 and slot < nCore and id >= 1 and gen >= 1 and not map.contains(contIds, id)
+                if ok
+                    ok := array.get(cr.coreSlotLiveFlags, slot) and array.get(cr.coreIds, slot) == id and array.get(cr.coreGenerationIds, slot) == gen and not na(array.get(cr.coreCreatedTimes, slot))
+                    map.put(contIds, id, true)
+                if ok
+                    [partReady, partCoreId, partTargets] = participationDetachAllReadyRaw(ctx, slot)
+                    ok := partReady and partCoreId == id and W08Core.coreIndexCanRelease(ws, slot, id)
+            if ok
+                array.set(tSlot, p, slot)
+                array.set(tId, p, id)
+            // exact range, then the install predicate of this target
+            float xb = array.get(ws.physicalCandidateExactPrices, 2 * p)
+            float xt = array.get(ws.physicalCandidateExactPrices, 2 * p + 1)
+            if ok
+                ok := not na(xb) and not na(xt) and xb <= xt and int(math.round(xb / ctx.mintick)) == array.get(ws.physicalCandidateBottomTicks, p) and int(math.round(xt / ctx.mintick)) == array.get(ws.physicalCandidateTopTicks, p)
+            if ok
+                ok := W08Core.coreIndexCanInstall(ws, slot, id, xb, xt, ctx.mintick, ws.physicalCandidateRootIds, array.get(ws.physicalCandidateRootIdOffsets, p), array.get(ws.physicalCandidateRootIdLengths, p))
+            // Root IDs: the physical union (Core origin) and the Side winner slices (participation), issued, live, resolved
+            int part = 0
+            while ok and part < 3
+                array<int> ids = part == 0 ? ws.physicalCandidateRootIds : w3.candidateWinnerRootIds
+                int w   = part == 1 ? array.get(ws.physicalCandidateSupportWinnerIndexes, p) : part == 2 ? array.get(ws.physicalCandidateResistanceWinnerIndexes, p) : 0
+                int off = 0
+                int len = 0
+                if part == 0
+                    off := array.get(ws.physicalCandidateRootIdOffsets, p)
+                    len := array.get(ws.physicalCandidateRootIdLengths, p)
+                else if w >= 0
+                    ok  := w < w3.candidateWinnerLogicalCount
+                    if ok
+                        off := array.get(w3.candidateWinnerRootIdOffsets, w)
+                        len := array.get(w3.candidateWinnerRootIdLengths, w)
+                ok := ok and off >= 0 and len >= 0 and off + len <= array.size(ids) and (part != 0 or len > 0)
+                int last = 0
+                int r = 0
+                while ok and r < len
+                    int rootId = array.get(ids, off + r)
+                    ok := rootId > last and rootId < ctx.sc.nextRootId and map.contains(ctx.rv.rootIdToSlot, rootId)
+                    last := rootId
+                    if ok
+                        int rs = map.get(ctx.rv.rootIdToSlot, rootId)
+                        ok := rs >= 0 and rs < array.size(ctx.rv.rootIds) and array.get(ctx.rv.rootSlotLiveFlags, rs) and array.get(ctx.rv.rootIds, rs) == rootId and rs < array.size(ctx.rv.rootCategories)
+                        if ok and part == 0 and array.get(ctx.rv.rootCategories, rs) == CAT_FVG
+                            newInv += 1
+                        if ok and part > 0
+                            ok := participationRootAddableRaw(ctx, rs)
+                    r += 1
+                if part == 0
+                    newNodes += len
+                else
+                    newEdges += len
+                part += 1
+        p += 1
+    // participation free list (each entry a distinct dead edge row) and array capacities
+    map<int, bool> freeSeen = map.new<int, bool>()
+    int fi = 0
+    while ok and fi < array.size(ctx.pv.participationEdgeFreeIndexes)
+        int edge = array.get(ctx.pv.participationEdgeFreeIndexes, fi)
+        ok := participationEdgeFreeEntryOkRaw(ctx, edge) and not map.contains(freeSeen, edge)
+        map.put(freeSeen, edge, true)
+        fi += 1
+    if ok
+        int appended = math.max(0, fa - nFree)
+        ok := 2 * (nCore + appended) <= maxArr and array.size(ctx.pv.participationEdgeRootSlots) + newEdges <= maxArr and array.size(ws.coreZoneOriginRootNodeRootIds) + newNodes <= maxArr and array.size(ws.coreIntervalOrderData) + 4 * n <= maxArr and array.size(ws.inverseOriginData) + 3 * newInv <= maxArr
+    // ---- commit (every step below was proven by F0) ----
+    if ok and commit
+        int baseId  = ctx.sc.nextCoreId
+        int baseGen = ctx.sc.nextGenerationId
+        array.clear(ws.physicalMaterializedCoreSlots)
+        array.clear(ws.physicalMaterializedCoreIds)
+        array.clear(ws.physicalMaterializedGenerationIds)
+        ws.physicalMaterializedLogicalCount := 0
+        bool fine = true
+        p := 0
+        while p < n
+            array.push(ws.physicalMaterializedCoreSlots, array.get(tSlot, p))
+            array.push(ws.physicalMaterializedCoreIds, array.get(tId, p))
+            array.push(ws.physicalMaterializedGenerationIds, array.get(applyP, p) ? array.get(ws.physicalContinuationGenerationIds, p) : ID_NONE)
+            if array.get(ws.physicalOwnershipKinds, p) == 0 and array.get(applyP, p)
+                fine := fine and participationDetachAllForCoreRaw(ctx, array.get(tSlot, p)) and W08Core.coreIndexRelease(ws, array.get(tSlot, p), array.get(tId, p))
+            p += 1
+        int f = 0
+        while f < fa
+            int q = array.get(byRank, f)
+            fine := fine and coreAllocSlotRaw(ctx, baseId + f, baseGen + f, materializeBaseCloseTime) == array.get(tSlot, q)
+            array.set(ws.physicalMaterializedGenerationIds, q, baseGen + f)
+            f += 1
+        bool rangeChanged = false
+        p := 0
+        while p < n
+            if array.get(applyP, p)
+                int   slot = array.get(tSlot, p)
+                int   id   = array.get(tId, p)
+                int   gen  = array.get(ws.physicalMaterializedGenerationIds, p)
+                float xb   = array.get(ws.physicalCandidateExactPrices, 2 * p)
+                float xt   = array.get(ws.physicalCandidateExactPrices, 2 * p + 1)
+                rangeChanged := rangeChanged or array.get(cr.corePhysicalBottoms, slot) != xb or array.get(cr.corePhysicalTops, slot) != xt
+                array.set(cr.corePhysicalBottoms, slot, xb)
+                array.set(cr.corePhysicalTops, slot, xt)
+                int off = array.get(ws.physicalCandidateRootIdOffsets, p)
+                int r = 0
+                while r < array.get(ws.physicalCandidateRootIdLengths, p)
+                    int rootId = array.get(ws.physicalCandidateRootIds, off + r)
+                    [aOk, aChanged] = W08Core.originAdd(ws, slot, id, gen, rootId)
+                    fine := fine and aOk
+                    if array.get(ctx.rv.rootCategories, map.get(ctx.rv.rootIdToSlot, rootId)) == CAT_FVG
+                        [vOk, vChanged] = W08Core.inverseOriginAdd(ws, rootId, slot, id)
+                        fine := fine and vOk
+                    r += 1
+                int side = 0
+                while side < 2
+                    int w = side == 0 ? array.get(ws.physicalCandidateSupportWinnerIndexes, p) : array.get(ws.physicalCandidateResistanceWinnerIndexes, p)
+                    if w >= 0
+                        int wo = array.get(w3.candidateWinnerRootIdOffsets, w)
+                        int wr = 0
+                        while wr < array.get(w3.candidateWinnerRootIdLengths, w)
+                            fine := fine and participationAddRaw(ctx, map.get(ctx.rv.rootIdToSlot, array.get(w3.candidateWinnerRootIds, wo + wr)), slot * 2 + side)
+                            wr += 1
+                    side += 1
+                [iOk, iChanged] = W08Core.intervalInsert(ws, slot, id, id, xb, xt, ctx.mintick)
+                fine := fine and iOk
+            p += 1
+        if not fine
+            runtime.error("W08 B07-D: materialization commit broke its F0 preflight")
+        // B15-B2: the range revision moves once at the end of the pass commit (commitPass)
+        ctx.sc.rangeChanged     := ctx.sc.rangeChanged or rangeChanged
+        ctx.sc.nextCoreId       := baseId + fa
+        ctx.sc.nextGenerationId := baseGen + fa
+        ws.physicalMaterializedLogicalCount := n
+    ok ? fa : -1
+// W08 B10 / B11: the TouchMark algorithms live in W08Touch (ring append / truncation, markPhysicalIndex, historyExtract,
+// Merge TouchMark plan); the ring lives in W08Core.CoreRegistryStore (B15-B1), the plans in W08TouchStore; Main passes
+// references (touchRingViewRaw).
+touchRingViewRaw(ShadowContext ctx) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    W08Touch.TouchRing.new(cr.touchMarkRingOwnerCoreIds, cr.touchMarkRingHeads, cr.touchMarkRingCounts, cr.touchMarkBaseSeqs, cr.touchMarkTimes, cr.touchMarkSides, cr.touchMarkContactBottoms, cr.touchMarkContactTops, cr.touchMarkCloseAtTouches, cr.touchMarkGenerationIds, cr.touchMarkIsNormalTouchFlags, cr.sideTouchHistoryTruncatedFlags, cr.coreIds, cr.coreSlotLiveFlags, cr.touchMarkCapacityPerCore)
+// W08 B11: Merge TouchMark inheritance plan of the current pass (W08Touch.mergePlanBuild over the B08 Merge plan and the
+// target winner exact EffectiveRanges; written to engine.w02Aux.w08Touch). Returns the relation count; -1 with the plan
+// empty on an upstream or structural fault. No ring write; no runtime call site.
+buildMergeTouchPlanRaw(ShadowContext ctx) =>
+    int r = buildPhysicalMergePlanRaw(ctx)
+    W08Core.W08Store ws = ctx.ws
+    W08Touch.TouchPlan t = ctx.tp
+    W08Touch.mergePlanBuild(touchRingViewRaw(ctx), t, r, ws.mergeRelationCount, ws.mergeRelations, ws.mergeAbsorbed, ws.physicalCandidateLogicalCount, ws.physicalCandidateSupportWinnerIndexes, ws.physicalCandidateResistanceWinnerIndexes, ctx.wv.candidateWinnerExactPrices)
+// W08 B12: Split TouchMark assignment plan of the current pass: B11 Merge TouchMark plan, W08Core Split plan, then
+// W08Touch.splitPlanBuild (SPLIT_LOCAL children only; Merge-target children stay with the B11 plan). An upstream -1 is
+// passed on so the Split plan is cleared and -1 returned. No ring write; no runtime call site.
+buildSplitTouchPlanRaw(ShadowContext ctx) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    int m = buildMergeTouchPlanRaw(ctx)
+    W08Core.W08Store ws = ctx.ws
+    W08Touch.TouchPlan t = ctx.tp
+    int s = W08Core.splitPlanBuild(ws, m, cr.coreSlotLiveFlags, cr.coreIds, cr.coreCreatedTimes)
+    W08Touch.splitPlanBuild(touchRingViewRaw(ctx), ctx.sp, s, ws.splitRelationCount, ws.splitRelations, ws.splitChildren, m, ws.mergeRelationCount, ws.mergeRelations, t.mergeTouchPlanOffsets, t.mergeTouchPlanCounts, t.mergeTouchPlanTruncatedFlags, ws.physicalCandidateLogicalCount, ws.physicalCandidateSupportWinnerIndexes, ws.physicalCandidateResistanceWinnerIndexes, ctx.wv.candidateWinnerExactPrices)
+// W08 B13: PendingTopology plan of the current pass (recompute model): the B12 chain once (buildSplitTouchPlanRaw), then
+// W08Core.pendingPlanBuild over the Identity components (any old Side in ActiveTouch -> the whole component is pending,
+// latest-state replace in the existing W02Aux pool). Returns [immediate, pending, ready] component counts, -1s on any
+// fault (pool unchanged). No topology / Touch / phase / generation write; no runtime call site.
+buildPendingTopologyPlanRaw(ShadowContext ctx) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    int s = buildSplitTouchPlanRaw(ctx)
+    W08Core.pendingPlanBuild(ctx.ws, pendingStoreViewRaw(ctx), s, cr.coreSlotLiveFlags, cr.coreIds, cr.coreGenerationIds, cr.coreCreatedTimes, cr.sidePhases, ctx.rv.rootIdToSlot, ctx.rv.rootIds, ctx.rv.rootSlotLiveFlags)
+// W08 B14: changed topology scope of the current pass: the B13 chain once, then W08Core.changedPlanBuild with the W06
+// /18 semantic change metadata (changed Root IDs, changed current component IDs, scope full) and the W06 component
+// dependency (rootCandComponentIds, member pool). Returns the changed component count; -1 on any fault. Planning only:
+// no revision / cache / index write; no runtime call site.
+buildChangedTopologyPlanRaw(ShadowContext ctx) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    [imm, pen, rdy] = buildPendingTopologyPlanRaw(ctx)
+    ComponentMetaView a = ctx.mv
+    W08Core.changedPlanBuild(ctx.ws, pendingStoreViewRaw(ctx), imm, cr.coreSlotLiveFlags, cr.coreIds, cr.coreGenerationIds, cr.coreCreatedTimes, cr.corePhysicalBottoms, cr.corePhysicalTops, cr.sidePhases, ctx.rv.rootIdToSlot, ctx.rv.rootIds, ctx.rv.rootSlotLiveFlags, a.rootCandComponentIds, a.candComponentIds, a.candComponentMemberOffsets, a.candComponentMemberLengths, a.candMemberRootIds, a.candMemberRoleFlags, a.candSemanticChangedRootIds, a.candSemanticChangedCurrentComponentIds, array.get(a.candChangedScopeFull, 0), ctx.mintick)
+// (W08 B15-B2: ported from W08Core /16, private there; same text.)
+// Pool shape: the 9 child arrays and the 7 Root-node arrays have one row count each, the per-Core arrays one size, and
+// every free-list entry is an in-range, non-live row listed once.
+pendingPoolsOkRaw(W08Core.PendingTopologyStore ps) =>
+    int  cN = array.size(ps.pendingTopologyChildLiveFlags)
+    int  rN = array.size(ps.pendingTopologyRootNodeLiveFlags)
+    int  nC = array.size(ps.corePendingTopologyFlags)
+    bool ok = array.size(ps.pendingTopologyChildNextIndexes) == cN and array.size(ps.pendingTopologyChildOwnerCoreSlots) == cN and array.size(ps.pendingTopologyChildExpectedCoreIds) == cN and array.size(ps.pendingTopologyChildExpectedGenerationIds) == cN and array.size(ps.pendingTopologyChildRootHeadNodeIndexes) == cN and array.size(ps.pendingTopologyChildRootTailNodeIndexes) == cN and array.size(ps.pendingTopologyChildRootCounts) == cN
+    ok := ok and array.size(ps.pendingTopologyRootNodeRootIds) == rN and array.size(ps.pendingTopologyRootNodeNextIndexes) == rN and array.size(ps.pendingTopologyRootNodeOwnerChildIndexes) == rN and array.size(ps.pendingTopologyRootNodeExpectedCoreIds) == rN and array.size(ps.pendingTopologyRootNodeExpectedGenerationIds) == rN
+    ok := ok and array.size(ps.corePendingTopologyChildHeadIndexes) == nC and array.size(ps.corePendingTopologyChildTailIndexes) == nC and array.size(ps.corePendingTopologyChildCounts) == nC
+    map<int, bool> seen = map.new<int, bool>()
+    int k = 0
+    while ok and k < array.size(ps.pendingTopologyChildFreeIndexes)
+        int r = array.get(ps.pendingTopologyChildFreeIndexes, k)
+        ok := r >= 0 and r < cN and not map.contains(seen, r)
+        if ok
+            ok := not array.get(ps.pendingTopologyChildLiveFlags, r)
+            map.put(seen, r, true)
+        k += 1
+    map.clear(seen)
+    k := 0
+    while ok and k < array.size(ps.pendingTopologyRootNodeFreeIndexes)
+        int r = array.get(ps.pendingTopologyRootNodeFreeIndexes, k)
+        ok := r >= 0 and r < rN and not map.contains(seen, r)
+        if ok
+            ok := not array.get(ps.pendingTopologyRootNodeLiveFlags, r)
+            map.put(seen, r, true)
+        k += 1
+    ok
+// (W08 B15-B2: ported from W08Core /16, private there; same text.)
+// Chain integrity of the pending of coreSlot (coreSlot < per-Core size): flag false = empty chain; else exactly count
+// live children owned by coreSlot, each visited once, with the expected coreId / generationId, each holding exactly its
+// count of live Root nodes owned by it with the same expected IDs and strictly ascending Root IDs >= 1; head / tail /
+// next links consistent. Returns [ok, child rows, Root-node rows].
+pendingChainOkRaw(W08Core.PendingTopologyStore ps, int coreSlot, int coreId, int generationId) =>
+    int  cN   = array.size(ps.pendingTopologyChildLiveFlags)
+    int  rN   = array.size(ps.pendingTopologyRootNodeLiveFlags)
+    int  cnt  = array.get(ps.corePendingTopologyChildCounts, coreSlot)
+    int  ci   = array.get(ps.corePendingTopologyChildHeadIndexes, coreSlot)
+    bool flag = array.get(ps.corePendingTopologyFlags, coreSlot)
+    bool ok   = cnt >= 0 and cnt <= cN and (flag or (cnt == 0 and ci == SLOT_INVALID and array.get(ps.corePendingTopologyChildTailIndexes, coreSlot) == SLOT_INVALID))
+    map<int, bool> vc = map.new<int, bool>()
+    int seen  = 0
+    int last  = SLOT_INVALID
+    int roots = 0
+    while ok and seen < cnt
+        ok := ci >= 0 and ci < cN and not map.contains(vc, ci)
+        if ok
+            map.put(vc, ci, true)
+            ok := array.get(ps.pendingTopologyChildLiveFlags, ci) and array.get(ps.pendingTopologyChildOwnerCoreSlots, ci) == coreSlot and array.get(ps.pendingTopologyChildExpectedCoreIds, ci) == coreId and array.get(ps.pendingTopologyChildExpectedGenerationIds, ci) == generationId
+        if ok
+            int rn  = array.get(ps.pendingTopologyChildRootHeadNodeIndexes, ci)
+            int rc  = array.get(ps.pendingTopologyChildRootCounts, ci)
+            int rs  = 0
+            int rl  = SLOT_INVALID
+            int rid = 0
+            ok := rc >= 0 and rc <= rN
+            while ok and rs < rc
+                ok := rn >= 0 and rn < rN
+                if ok
+                    ok := array.get(ps.pendingTopologyRootNodeLiveFlags, rn) and array.get(ps.pendingTopologyRootNodeOwnerChildIndexes, rn) == ci and array.get(ps.pendingTopologyRootNodeExpectedCoreIds, rn) == coreId and array.get(ps.pendingTopologyRootNodeExpectedGenerationIds, rn) == generationId and array.get(ps.pendingTopologyRootNodeRootIds, rn) > rid
+                if ok
+                    rid := array.get(ps.pendingTopologyRootNodeRootIds, rn)
+                    rl  := rn
+                    rn  := array.get(ps.pendingTopologyRootNodeNextIndexes, rn)
+                    rs  += 1
+            ok := ok and rn == SLOT_INVALID and array.get(ps.pendingTopologyChildRootTailNodeIndexes, ci) == rl
+            roots += rc
+            last := ci
+            if ok
+                ci := array.get(ps.pendingTopologyChildNextIndexes, ci)
+            seen += 1
+    ok := ok and ci == SLOT_INVALID and array.get(ps.corePendingTopologyChildTailIndexes, coreSlot) == last
+    [ok, cnt, roots]
+// (W08 B15-B2: ported from W08Core /16, private there; same text.)
+// Returns every child and Root node of coreSlot's pending to the free lists (sentinels reset) and empties the parent.
+// Callers run pendingChainOkRaw first.
+pendingClearChainRaw(W08Core.PendingTopologyStore ps, int coreSlot) =>
+    int ci  = array.get(ps.corePendingTopologyChildHeadIndexes, coreSlot)
+    int cnt = array.get(ps.corePendingTopologyChildCounts, coreSlot)
+    int k   = 0
+    while k < cnt
+        int nx = array.get(ps.pendingTopologyChildNextIndexes, ci)
+        int rn = array.get(ps.pendingTopologyChildRootHeadNodeIndexes, ci)
+        int rc = array.get(ps.pendingTopologyChildRootCounts, ci)
+        int j  = 0
+        while j < rc
+            int nr = array.get(ps.pendingTopologyRootNodeNextIndexes, rn)
+            array.set(ps.pendingTopologyRootNodeRootIds, rn, ID_NONE)
+            array.set(ps.pendingTopologyRootNodeNextIndexes, rn, SLOT_INVALID)
+            array.set(ps.pendingTopologyRootNodeOwnerChildIndexes, rn, SLOT_INVALID)
+            array.set(ps.pendingTopologyRootNodeExpectedCoreIds, rn, ID_NONE)
+            array.set(ps.pendingTopologyRootNodeExpectedGenerationIds, rn, ID_NONE)
+            array.set(ps.pendingTopologyRootNodeLiveFlags, rn, false)
+            array.push(ps.pendingTopologyRootNodeFreeIndexes, rn)
+            rn := nr
+            j  += 1
+        array.set(ps.pendingTopologyChildNextIndexes, ci, SLOT_INVALID)
+        array.set(ps.pendingTopologyChildOwnerCoreSlots, ci, SLOT_INVALID)
+        array.set(ps.pendingTopologyChildExpectedCoreIds, ci, ID_NONE)
+        array.set(ps.pendingTopologyChildExpectedGenerationIds, ci, ID_NONE)
+        array.set(ps.pendingTopologyChildRootHeadNodeIndexes, ci, SLOT_INVALID)
+        array.set(ps.pendingTopologyChildRootTailNodeIndexes, ci, SLOT_INVALID)
+        array.set(ps.pendingTopologyChildRootCounts, ci, 0)
+        array.set(ps.pendingTopologyChildLiveFlags, ci, false)
+        array.push(ps.pendingTopologyChildFreeIndexes, ci)
+        ci := nx
+        k  += 1
+    array.set(ps.corePendingTopologyFlags, coreSlot, false)
+    array.set(ps.corePendingTopologyChildHeadIndexes, coreSlot, SLOT_INVALID)
+    array.set(ps.corePendingTopologyChildTailIndexes, coreSlot, SLOT_INVALID)
+    array.set(ps.corePendingTopologyChildCounts, coreSlot, 0)
+// W08 B15-B2: the pass scratch copy of the pending pool (B13 pendingPlanBuild rewrites the pool while planning; the shadow
+// plan runs on this copy, the real pool changes only in commit step 1).
+pendingCopyRaw(W08Core.PendingTopologyStore ps) =>
+    W08Core.PendingTopologyStore.new(array.copy(ps.corePendingTopologyFlags), array.copy(ps.corePendingTopologyChildHeadIndexes), array.copy(ps.corePendingTopologyChildTailIndexes), array.copy(ps.corePendingTopologyChildCounts), array.copy(ps.pendingTopologyChildNextIndexes), array.copy(ps.pendingTopologyChildOwnerCoreSlots), array.copy(ps.pendingTopologyChildExpectedCoreIds), array.copy(ps.pendingTopologyChildExpectedGenerationIds), array.copy(ps.pendingTopologyChildRootHeadNodeIndexes), array.copy(ps.pendingTopologyChildRootTailNodeIndexes), array.copy(ps.pendingTopologyChildRootCounts), array.copy(ps.pendingTopologyChildLiveFlags), array.copy(ps.pendingTopologyChildFreeIndexes), array.copy(ps.pendingTopologyRootNodeRootIds), array.copy(ps.pendingTopologyRootNodeNextIndexes), array.copy(ps.pendingTopologyRootNodeOwnerChildIndexes), array.copy(ps.pendingTopologyRootNodeExpectedCoreIds), array.copy(ps.pendingTopologyRootNodeExpectedGenerationIds), array.copy(ps.pendingTopologyRootNodeLiveFlags), array.copy(ps.pendingTopologyRootNodeFreeIndexes))
+intReplaceRaw(array<int> dst, array<int> src) =>
+    array.clear(dst)
+    array.concat(dst, src)
+boolReplaceRaw(array<bool> dst, array<bool> src) =>
+    array.clear(dst)
+    array.concat(dst, src)
+// Commit step 1: the real pool (same array objects) takes the planned pool contents.
+pendingReplaceRaw(W08Core.PendingTopologyStore dst, W08Core.PendingTopologyStore src) =>
+    boolReplaceRaw(dst.corePendingTopologyFlags, src.corePendingTopologyFlags)
+    intReplaceRaw(dst.corePendingTopologyChildHeadIndexes, src.corePendingTopologyChildHeadIndexes)
+    intReplaceRaw(dst.corePendingTopologyChildTailIndexes, src.corePendingTopologyChildTailIndexes)
+    intReplaceRaw(dst.corePendingTopologyChildCounts, src.corePendingTopologyChildCounts)
+    intReplaceRaw(dst.pendingTopologyChildNextIndexes, src.pendingTopologyChildNextIndexes)
+    intReplaceRaw(dst.pendingTopologyChildOwnerCoreSlots, src.pendingTopologyChildOwnerCoreSlots)
+    intReplaceRaw(dst.pendingTopologyChildExpectedCoreIds, src.pendingTopologyChildExpectedCoreIds)
+    intReplaceRaw(dst.pendingTopologyChildExpectedGenerationIds, src.pendingTopologyChildExpectedGenerationIds)
+    intReplaceRaw(dst.pendingTopologyChildRootHeadNodeIndexes, src.pendingTopologyChildRootHeadNodeIndexes)
+    intReplaceRaw(dst.pendingTopologyChildRootTailNodeIndexes, src.pendingTopologyChildRootTailNodeIndexes)
+    intReplaceRaw(dst.pendingTopologyChildRootCounts, src.pendingTopologyChildRootCounts)
+    boolReplaceRaw(dst.pendingTopologyChildLiveFlags, src.pendingTopologyChildLiveFlags)
+    intReplaceRaw(dst.pendingTopologyChildFreeIndexes, src.pendingTopologyChildFreeIndexes)
+    intReplaceRaw(dst.pendingTopologyRootNodeRootIds, src.pendingTopologyRootNodeRootIds)
+    intReplaceRaw(dst.pendingTopologyRootNodeNextIndexes, src.pendingTopologyRootNodeNextIndexes)
+    intReplaceRaw(dst.pendingTopologyRootNodeOwnerChildIndexes, src.pendingTopologyRootNodeOwnerChildIndexes)
+    intReplaceRaw(dst.pendingTopologyRootNodeExpectedCoreIds, src.pendingTopologyRootNodeExpectedCoreIds)
+    intReplaceRaw(dst.pendingTopologyRootNodeExpectedGenerationIds, src.pendingTopologyRootNodeExpectedGenerationIds)
+    boolReplaceRaw(dst.pendingTopologyRootNodeLiveFlags, src.pendingTopologyRootNodeLiveFlags)
+    intReplaceRaw(dst.pendingTopologyRootNodeFreeIndexes, src.pendingTopologyRootNodeFreeIndexes)
+// W08 B15-B2: free preflight of one EXPLICIT_MERGE_ABSORBED old Core, read-only (the coreFreeSlotRaw preflight without the
+// per-free global pending pool scan, which the pass F0 runs once): live slot with the expected coreId / generationId,
+// live-list / ID-order / ID-map entries, Phase set membership of both Sides, participation detach ready,
+// W08Core.coreIndexCanRelease, the pending chain of the slot (per-Core chain check only).
+coreFreePreflightRaw(ShadowContext ctx, W08Core.PendingTopologyStore ps, int coreSlot, int expectedCoreId, int expectedGenerationId) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    bool ok = expectedCoreId != ID_NONE and coreSlot >= 0 and coreSlot < array.size(cr.coreIds) and coreSlot < array.size(cr.coreSlotLiveFlags) and coreSlot < array.size(cr.coreGenerationIds) and coreSlot < array.size(ps.corePendingTopologyFlags)
+    if ok
+        ok := array.get(cr.coreSlotLiveFlags, coreSlot) and array.get(cr.coreIds, coreSlot) == expectedCoreId and array.get(cr.coreGenerationIds, coreSlot) == expectedGenerationId and map.contains(cr.coreIdToSlot, expectedCoreId)
+    if ok
+        ok := map.get(cr.coreIdToSlot, expectedCoreId) == coreSlot and array.includes(cr.coreLiveSlots, coreSlot) and array.includes(cr.coreIdOrderSlots, coreSlot) and phaseSetMembershipValidRaw(ctx, coreSlot * 2) and phaseSetMembershipValidRaw(ctx, coreSlot * 2 + 1)
+    if ok
+        [partReady, partCoreId, partTargets] = participationDetachAllReadyRaw(ctx, coreSlot)
+        ok := partReady and partCoreId == expectedCoreId and W08Core.coreIndexCanRelease(ctx.ws, coreSlot, expectedCoreId)
+    if ok
+        [cOk, cRows, rRows] = pendingChainOkRaw(ps, coreSlot, expectedCoreId, expectedGenerationId)
+        ok := cOk
+    ok
+// Free commit (after coreFreePreflightRaw): the coreFreeSlotRaw apply - participation, Worker origin / interval / inverse
+// entries, pending chain (commit-only), Phase sets, live list (swap-remove) / ID order (shift) / ID map, reset, free stack.
+// No business failure: a step reporting false is an invariant break (runtime.error).
+coreFreeCommitRaw(ShadowContext ctx, W08Core.PendingTopologyStore ps, int coreSlot) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    int oldCoreId  = array.get(cr.coreIds, coreSlot)
+    int livePos    = array.indexof(cr.coreLiveSlots, coreSlot)
+    int idOrderPos = array.indexof(cr.coreIdOrderSlots, coreSlot)
+    if livePos < 0 or idOrderPos < 0 or not (participationDetachAllForCoreRaw(ctx, coreSlot) and W08Core.coreIndexRelease(ctx.ws, coreSlot, oldCoreId))
+        runtime.error("W08 B15-B2: core free commit broke its preflight")
+    pendingClearChainRaw(ps, coreSlot)
+    phaseSetDetachRaw(ctx, coreSlot * 2)
+    phaseSetDetachRaw(ctx, coreSlot * 2 + 1)
+    int lastPos = array.size(cr.coreLiveSlots) - 1
+    if livePos != lastPos
+        array.set(cr.coreLiveSlots, livePos, array.get(cr.coreLiveSlots, lastPos))
+    array.pop(cr.coreLiveSlots)
+    int idSize = array.size(cr.coreIdOrderSlots)
+    int j = idOrderPos
+    while j < idSize - 1
+        array.set(cr.coreIdOrderSlots, j, array.get(cr.coreIdOrderSlots, j + 1))
+        j += 1
+    array.pop(cr.coreIdOrderSlots)
+    map.remove(cr.coreIdToSlot, oldCoreId)
+    coreResetSlotRaw(ctx, coreSlot)
+    array.push(cr.coreFreeSlots, coreSlot)
+    true
+sideActiveRaw(W08Core.CoreRegistryStore cr, int coreSlot) =>
+    array.get(cr.sidePhases, coreSlot * 2) == PH_ACTIVE_TOUCH or array.get(cr.sidePhases, coreSlot * 2 + 1) == PH_ACTIVE_TOUCH
+// W08 B15-B2: plan of one shadow pass. The chain runs once (buildChangedTopologyPlanRaw) on a scratch copy of the pending
+// pool; nothing persistent is written (Core registry, participation, Phase sets, origin / interval / inverse index, ring,
+// pending pool, scalars). Then the apply set: a changed component is pending when one of its old Cores has a Side in
+// ActiveTouch (B13 unit), else applied; applied Candidates = the changedTargets rows of applied components (an unchanged
+// component is never planned for apply); the applied Merge target / SPLIT_LOCAL row of each applied Candidate (at most one
+// Touch source each); the consumed READY pending parents (old Cores of applied components still pending in the planned
+// pool); the EXPLICIT_MERGE_ABSORBED old Cores of applied Merge relations that no applied Candidate continues (canonical
+// relation / absorbed order, unique);
+// the retained no-successor count and the B14 invalidation flag counts of the applied Candidates.
+export planPass(ShadowContext ctx) =>
+    ctx.psPlan := pendingCopyRaw(ctx.ps)
+    ctx.sc.rangeChanged := false
+    int c = buildChangedTopologyPlanRaw(ctx)
+    W08Core.W08Store          ws = ctx.ws
+    W08Core.CoreRegistryStore cr = ws.coreRegistry
+    int  n  = ws.physicalCandidateLogicalCount
+    int  nt = int(array.size(ws.changedTargets) / 5)
+    int  no = int(array.size(ws.changedOldCores) / 2)
+    bool ok = c >= 0 and n >= 0 and array.size(ws.changedTargets) == 5 * nt and array.size(ws.changedOldCores) == 2 * no
+    ShadowPass pr = ShadowPass.new(applyComp = array.new_bool(ok ? c : 0, true), applyP = array.new_bool(ok ? n : 0, false), mergeOfP = array.new_int(ok ? n : 0, -1), splitOfP = array.new_int(ok ? n : 0, -1), consumedSlots = array.new_int(0), freeSlots = array.new_int(0), freeCoreIds = array.new_int(0), freeGenerationIds = array.new_int(0))
+    int i = 0
+    while ok and i < no
+        int slot = array.get(ws.changedOldCores, 2 * i)
+        int comp = array.get(ws.changedOldCores, 2 * i + 1)
+        ok := comp >= 0 and comp < c and slot >= 0 and 2 * slot + 1 < array.size(cr.sidePhases)
+        if ok
+            if sideActiveRaw(cr, slot)
+                array.set(pr.applyComp, comp, false)
+        i += 1
+    int k = 0
+    while ok and k < c
+        if array.get(pr.applyComp, k)
+            pr.appliedComponents := pr.appliedComponents + 1
+        else
+            pr.pendingComponents := pr.pendingComponents + 1
+        k += 1
+    array<bool> contOld = array.new_bool(ok ? array.size(cr.coreIds) : 0, false)
+    i := 0
+    while ok and i < nt
+        int p     = array.get(ws.changedTargets, 5 * i)
+        int comp  = array.get(ws.changedTargets, 5 * i + 1)
+        int flags = array.get(ws.changedTargets, 5 * i + 4)
+        ok := p >= 0 and p < n and comp >= 0 and comp < c
+        if ok and array.get(pr.applyComp, comp)
+            ok := not array.get(pr.applyP, p)
+            array.set(pr.applyP, p, true)
+            pr.appliedTargets := pr.appliedTargets + 1
+            pr.invRange  := pr.invRange + int(flags / 1) % 2
+            pr.invTick   := pr.invTick + int(flags / 2) % 2
+            pr.invOrigin := pr.invOrigin + int(flags / 4) % 2
+            pr.invPass1  := pr.invPass1 + int(flags / 8) % 2
+            pr.invPair   := pr.invPair + int(flags / 16) % 2
+            if ok and array.get(ws.physicalOwnershipKinds, p) == 0
+                int os = array.get(ws.physicalContinuationOldCoreSlots, p)
+                ok := os >= 0 and os < array.size(contOld)
+                if ok
+                    array.set(contOld, os, true)
+        i += 1
+    int m = ws.mergeRelationCount
+    ok := ok and array.size(ws.mergeRelations) == 5 * m
+    int j = 0
+    while ok and j < m
+        int p = array.get(ws.mergeRelations, 5 * j)
+        ok := p >= 0 and p < n
+        if ok and array.get(pr.applyP, p)
+            ok := array.get(pr.mergeOfP, p) == -1
+            array.set(pr.mergeOfP, p, j)
+        j += 1
+    k := 0
+    while ok and k < array.size(ctx.sp.targetPhysicalIndexes)
+        int p = array.get(ctx.sp.targetPhysicalIndexes, k)
+        ok := p >= 0 and p < n
+        if ok and array.get(pr.applyP, p)
+            ok := array.get(pr.splitOfP, p) == -1 and array.get(pr.mergeOfP, p) == -1
+            array.set(pr.splitOfP, p, k)
+        k += 1
+    // absorbed olds of applied Merge relations (EXPLICIT_MERGE_ABSORBED), canonical and unique
+    map<int, bool> absorbed = map.new<int, bool>()
+    j := 0
+    while ok and j < m
+        int p = array.get(ws.mergeRelations, 5 * j)
+        if array.get(pr.applyP, p)
+            int off = array.get(ws.mergeRelations, 5 * j + 3)
+            int cnt = array.get(ws.mergeRelations, 5 * j + 4)
+            ok := off >= 0 and cnt >= 1 and 2 * (off + cnt) <= array.size(ws.mergeAbsorbed)
+            int s = 0
+            while ok and s < cnt
+                int slot = array.get(ws.mergeAbsorbed, 2 * (off + s))
+                int id   = array.get(ws.mergeAbsorbed, 2 * (off + s) + 1)
+                ok := slot >= 0 and slot < array.size(cr.coreIds) and slot < array.size(cr.coreGenerationIds) and slot < array.size(contOld)
+                // an absorbed old that an applied Candidate continues (Merge / Split coexisting) keeps living there: it
+                // has a post-commit reference, so it is not freed (I27-11 condition 5)
+                if ok and not map.contains(absorbed, slot) and not array.get(contOld, slot)
+                    map.put(absorbed, slot, true)
+                    array.push(pr.freeSlots, slot)
+                    array.push(pr.freeCoreIds, id)
+                    array.push(pr.freeGenerationIds, array.get(cr.coreGenerationIds, slot))
+                s += 1
+        j += 1
+    // consumed READY parents and retained no-successor olds of applied components
+    i := 0
+    while ok and i < no
+        int slot = array.get(ws.changedOldCores, 2 * i)
+        int comp = array.get(ws.changedOldCores, 2 * i + 1)
+        if array.get(pr.applyComp, comp)
+            ok := slot < array.size(ctx.psPlan.corePendingTopologyFlags) and slot < array.size(contOld)
+            if ok and array.get(ctx.psPlan.corePendingTopologyFlags, slot)
+                array.push(pr.consumedSlots, slot)
+            if ok and not array.get(contOld, slot) and not map.contains(absorbed, slot)
+                pr.retained := pr.retained + 1
+        i += 1
+    pr.planResult := ok ? c : -1
+    pr
+// W08 B15-B2: pass F0, read-only on the persistent state. Checks: plan result; the planned pending pool shape once per pass
+// (the only global pool scan; per-Core checks below are chain-only); the materialization of the applied Candidates (B07-D
+// F0 predicates, applied fresh ranks); the Touch plan rows of every applied Merge target / SPLIT_LOCAL row (W08Touch
+// preflight); the consumed READY pending chains; per absorbed old Core: no applied Candidate continues it (no
+// post-commit reference), MERGE_STATE_DEFAULT_GUARD (every Merge-deferred field at its reset default, else the pass is
+// rejected), coreFreePreflightRaw. Returns ok and stores it in pass.preflightOk.
+export preflightPass(ShadowContext ctx, ShadowPass pr, int materializeBaseCloseTime) =>
+    W08Core.W08Store          ws = ctx.ws
+    W08Core.CoreRegistryStore cr = ws.coreRegistry
+    int  n  = ws.physicalCandidateLogicalCount
+    bool ok = pr.planResult >= 0 and array.size(pr.applyP) == n and array.size(ctx.tp.mergeTouchPlanOffsets) == 2 * ws.mergeRelationCount
+    if ok
+        pr.poolScans := pr.poolScans + 1
+        ok := pendingPoolsOkRaw(ctx.psPlan)
+    if ok
+        ok := materializeAppliedRaw(ctx, pr.applyP, materializeBaseCloseTime, false) >= 0
+    W08Touch.TouchRing ring = touchRingViewRaw(ctx)
+    int p = 0
+    while ok and p < n
+        if array.get(pr.mergeOfP, p) >= 0
+            ok := W08Touch.mergeApplyPreflight(ring, ctx.tp, array.get(pr.mergeOfP, p))
+        else if array.get(pr.splitOfP, p) >= 0
+            ok := W08Touch.splitApplyPreflight(ring, ctx.sp, array.get(pr.splitOfP, p))
+        p += 1
+    int i = 0
+    while ok and i < array.size(pr.consumedSlots)
+        int slot = array.get(pr.consumedSlots, i)
+        ok := slot < array.size(cr.coreIds) and slot < array.size(cr.coreGenerationIds)
+        if ok
+            [cOk, cRows, rRows] = pendingChainOkRaw(ctx.psPlan, slot, array.get(cr.coreIds, slot), array.get(cr.coreGenerationIds, slot))
+            ok := cOk
+        i += 1
+    i := 0
+    while ok and i < array.size(pr.freeSlots)
+        int slot = array.get(pr.freeSlots, i)
+        p := 0
+        while ok and p < n
+            if array.get(pr.applyP, p) and array.get(ws.physicalOwnershipKinds, p) == 0
+                ok := array.get(ws.physicalContinuationOldCoreSlots, p) != slot
+            p += 1
+        if ok
+            ok := slot < array.size(cr.coreIds) and array.get(cr.coreSlotLiveFlags, slot)
+        if ok
+            ok := coreDeferredStateRaw(cr, slot, false)
+            if not ok
+                pr.guardRejected := pr.guardRejected + 1
+        if ok
+            ok := coreFreePreflightRaw(ctx, ctx.psPlan, slot, array.get(pr.freeCoreIds, i), array.get(pr.freeGenerationIds, i))
+        i += 1
+    pr.preflightOk := ok
+    ok
+// W08 B15-B2: commit of a pass whose preflightPass passed (else runtime.error, nothing written). Order: 1 pending replace
+// (the planned pool), 2 materialization of the applied Candidates, 3 TouchMark ring replacement of every applied Merge
+// target / SPLIT_LOCAL row, 4 (index: in 2), 5 invalidation counts (pass.inv*), 6 consumed READY pending clear, 7 absorbed
+// free, 8 range revision (once). Every step was proven by the F0; a step reporting a fault is an invariant break
+// (runtime.error). Scalar results (nextCoreId / nextGenerationId / coreRangeRevision) stay in ctx.sc for the caller.
+export commitPass(ShadowContext ctx, ShadowPass pr, int materializeBaseCloseTime) =>
+    if not pr.preflightOk or pr.committed
+        runtime.error("W08 B15-B2: commitPass without a passed preflightPass")
+    W08Core.W08Store ws = ctx.ws
+    int n = ws.physicalCandidateLogicalCount
+    pendingReplaceRaw(ctx.ps, ctx.psPlan)
+    int fa = materializeAppliedRaw(ctx, pr.applyP, materializeBaseCloseTime, true)
+    if fa < 0
+        runtime.error("W08 B15-B2: materialization broke the pr preflight")
+    pr.freshApplied := fa
+    W08Touch.TouchRing ring = touchRingViewRaw(ctx)
+    int p = 0
+    while p < n
+        int rows = 0
+        if array.get(pr.mergeOfP, p) >= 0
+            rows := W08Touch.mergeApplyCommit(ring, ctx.tp, array.get(pr.mergeOfP, p), array.get(ws.physicalMaterializedCoreSlots, p), array.get(ws.physicalMaterializedCoreIds, p))
+        else if array.get(pr.splitOfP, p) >= 0
+            rows := W08Touch.splitApplyCommit(ring, ctx.sp, array.get(pr.splitOfP, p), array.get(ws.physicalMaterializedCoreSlots, p), array.get(ws.physicalMaterializedCoreIds, p))
+        if rows < 0
+            runtime.error("W08 B15-B2: TouchMark apply broke the pr preflight")
+        pr.touchRowsWritten := pr.touchRowsWritten + rows
+        p += 1
+    int i = 0
+    while i < array.size(pr.consumedSlots)
+        pendingClearChainRaw(ctx.ps, array.get(pr.consumedSlots, i))
+        i += 1
+    i := 0
+    while i < array.size(pr.freeSlots)
+        coreFreeCommitRaw(ctx, ctx.ps, array.get(pr.freeSlots, i))
+        pr.freed := pr.freed + 1
+        i += 1
+    if ctx.sc.rangeChanged
+        ctx.sc.coreRangeRevision := ctx.sc.coreRangeRevision + 1
+        ctx.sc.rangeChanged := false
+    pr.committed := true
+    pr
+// W08 B15-B2: plan -> F0 -> commit (only when the F0 passed). Returns the pass; pass.committed tells whether anything was
+// written.
+export runShadow(ShadowContext ctx, int materializeBaseCloseTime) =>
+    ShadowPass pr = planPass(ctx)
+    if preflightPass(ctx, pr, materializeBaseCloseTime)
+        commitPass(ctx, pr, materializeBaseCloseTime)
+    pr

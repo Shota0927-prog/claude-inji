@@ -17,6 +17,13 @@
 // old slot / coreId, mark row offset / count (rows in the source ring logical order across both Sides), truncated per
 // row * 2 + 0 Support / + 1 Resistance; per mark row the full TouchMark payload. Merge-target children are delegated to
 // the B11 Merge plan and hold no row here.
+// B15-B2 (/3): actual plan -> ring apply, split into a read-only preflight and a commit. The target Core ring is replaced
+// as a whole by the plan's final history (no append onto the old ring): rows 0 .. n - 1 of the target block, head 0,
+// count n, owner = target coreId, rows n .. capacity - 1 back to the empty-row defaults, per-Side truncated flags = the
+// plan flags. Merge (B11): the Support and Resistance rows of the relation are written in the B11 canonical order (time,
+// baseSeq, Support < Resistance, contact bottom, contact top), no re-dedupe, no re-cap. Split (B12): the SPLIT_LOCAL row
+// is written in plan order (source ring logical order), no dedupe. A commit after a passed preflight returns the row
+// count; -1 only on an invariant break (the caller raises runtime.error).
 // ============================================================
 library("ZoneEngineV2_W08Touch_Worker", overlay = false)
 
@@ -24,6 +31,8 @@ const int SLOT_INVALID    = -1
 const int SIDE_SUPPORT    = 1
 const int SIDE_RESISTANCE = -1
 const int SIDE_NONE       = 0
+const int ID_NONE         = 0
+const int SEQ_UNSET       = -1
 
 export type TouchRing
     array<int>   touchMarkRingOwnerCoreIds
@@ -436,3 +445,138 @@ export splitPlanBuild(TouchRing ring, SplitTouchPlan plan, int s, int splitRelat
     if not ok
         splitPlanClearRaw(plan)
     ok ? array.size(plan.targetPhysicalIndexes) : -1
+
+// W08 B15-B2: B11 canonical order of two Merge plan rows (the mergeRowCompareRaw keys on the copied payload).
+planRowCompareRaw(TouchPlan plan, int a, int b) =>
+    int c = array.get(plan.mergeTouchPlanTimes, a) - array.get(plan.mergeTouchPlanTimes, b)
+    if c == 0
+        c := array.get(plan.mergeTouchPlanBaseSeqs, a) - array.get(plan.mergeTouchPlanBaseSeqs, b)
+    if c == 0
+        c := (array.get(plan.mergeTouchPlanSides, a) == SIDE_SUPPORT ? 0 : 1) - (array.get(plan.mergeTouchPlanSides, b) == SIDE_SUPPORT ? 0 : 1)
+    if c == 0
+        float ba = array.get(plan.mergeTouchPlanContactBottoms, a)
+        float bb = array.get(plan.mergeTouchPlanContactBottoms, b)
+        float ta = array.get(plan.mergeTouchPlanContactTops, a)
+        float tb = array.get(plan.mergeTouchPlanContactTops, b)
+        c := ba < bb ? -1 : ba > bb ? 1 : ta < tb ? -1 : ta > tb ? 1 : 0
+    c > 0 ? 1 : c < 0 ? -1 : 0
+// Target ring block shape shared by both apply preflights: slot rows, truncated flags, payload capacity.
+ringTargetOkRaw(TouchRing ring, int targetSlot) =>
+    int cap = ring.touchMarkCapacityPerCore
+    int end = (targetSlot + 1) * cap
+    cap >= 0 and targetSlot >= 0 and targetSlot < array.size(ring.touchMarkRingOwnerCoreIds) and targetSlot < array.size(ring.touchMarkRingHeads) and targetSlot < array.size(ring.touchMarkRingCounts) and 2 * targetSlot + 1 < array.size(ring.sideTouchHistoryTruncatedFlags) and end <= array.size(ring.touchMarkBaseSeqs) and end <= array.size(ring.touchMarkTimes) and end <= array.size(ring.touchMarkSides) and end <= array.size(ring.touchMarkContactBottoms) and end <= array.size(ring.touchMarkContactTops) and end <= array.size(ring.touchMarkCloseAtTouches) and end <= array.size(ring.touchMarkGenerationIds) and end <= array.size(ring.touchMarkIsNormalTouchFlags)
+ringRowWriteRaw(TouchRing ring, int phys, int baseSeq, int t, int side, float b, float u, float c, int g, bool normal) =>
+    array.set(ring.touchMarkBaseSeqs,           phys, baseSeq)
+    array.set(ring.touchMarkTimes,              phys, t)
+    array.set(ring.touchMarkSides,              phys, side)
+    array.set(ring.touchMarkContactBottoms,     phys, b)
+    array.set(ring.touchMarkContactTops,        phys, u)
+    array.set(ring.touchMarkCloseAtTouches,     phys, c)
+    array.set(ring.touchMarkGenerationIds,      phys, g)
+    array.set(ring.touchMarkIsNormalTouchFlags, phys, normal)
+// Rows n .. capacity - 1 of the target block back to the empty-row defaults (coreAlloc values), then head / count / owner
+// / truncated flags.
+ringFinishRaw(TouchRing ring, int targetSlot, int targetCoreId, int n, bool trS, bool trR) =>
+    int cap = ring.touchMarkCapacityPerCore
+    int i   = n
+    while i < cap
+        ringRowWriteRaw(ring, targetSlot * cap + i, SEQ_UNSET, int(na), SIDE_NONE, float(na), float(na), float(na), ID_NONE, false)
+        i += 1
+    array.set(ring.touchMarkRingHeads,        targetSlot, 0)
+    array.set(ring.touchMarkRingCounts,       targetSlot, n)
+    array.set(ring.touchMarkRingOwnerCoreIds, targetSlot, targetCoreId)
+    array.set(ring.sideTouchHistoryTruncatedFlags, targetSlot * 2,     trS)
+    array.set(ring.sideTouchHistoryTruncatedFlags, targetSlot * 2 + 1, trR)
+// W08 B15-B2: read-only preflight of mergeApplyCommit for Merge relation j: plan relation-side rows (offset / count /
+// truncated for both Sides, equal payload array sizes), each Side block holds only its Side with a valid time / contact
+// (bottom <= top) in strictly increasing B11 order, both Sides together within the ring capacity. The target slot may not
+// exist yet (fresh Core appended by the commit), so its block shape is an invariant of the commit.
+export mergeApplyPreflight(TouchRing ring, TouchPlan plan, int j) =>
+    int  cap   = ring.touchMarkCapacityPerCore
+    int  nRows = array.size(plan.mergeTouchPlanTimes)
+    bool ok    = j >= 0 and 2 * j + 1 < array.size(plan.mergeTouchPlanOffsets) and 2 * j + 1 < array.size(plan.mergeTouchPlanCounts) and 2 * j + 1 < array.size(plan.mergeTouchPlanTruncatedFlags) and cap >= 0 and array.size(plan.mergeTouchPlanBaseSeqs) == nRows and array.size(plan.mergeTouchPlanSides) == nRows and array.size(plan.mergeTouchPlanContactBottoms) == nRows and array.size(plan.mergeTouchPlanContactTops) == nRows and array.size(plan.mergeTouchPlanCloseAtTouches) == nRows and array.size(plan.mergeTouchPlanGenerationIds) == nRows and array.size(plan.mergeTouchPlanIsNormalFlags) == nRows
+    int total = 0
+    int side  = 0
+    while ok and side < 2
+        int off = array.get(plan.mergeTouchPlanOffsets, 2 * j + side)
+        int cnt = array.get(plan.mergeTouchPlanCounts,  2 * j + side)
+        ok := off >= 0 and cnt >= 0 and off + cnt <= nRows
+        int k = 0
+        while ok and k < cnt
+            int   x = off + k
+            float b = array.get(plan.mergeTouchPlanContactBottoms, x)
+            float u = array.get(plan.mergeTouchPlanContactTops, x)
+            ok := array.get(plan.mergeTouchPlanSides, x) == (side == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE) and not na(array.get(plan.mergeTouchPlanTimes, x)) and not na(b) and not na(u) and b <= u
+            if ok and k > 0
+                ok := planRowCompareRaw(plan, x - 1, x) < 0
+            k += 1
+        total += cnt
+        side += 1
+    ok and total <= cap
+// Commit of Merge relation j onto targetSlot (after mergeApplyPreflight and the Core materialization): both Side blocks
+// merged in B11 order into rows 0 .. n - 1, the rest reset, owner targetCoreId, truncated flags = the plan relation-side
+// flags. Returns n; -1 when the target is not the live targetCoreId or its block does not exist (invariant break).
+export mergeApplyCommit(TouchRing ring, TouchPlan plan, int j, int targetSlot, int targetCoreId) =>
+    int  cap  = ring.touchMarkCapacityPerCore
+    int  offS = array.get(plan.mergeTouchPlanOffsets, 2 * j)
+    int  cntS = array.get(plan.mergeTouchPlanCounts,  2 * j)
+    int  offR = array.get(plan.mergeTouchPlanOffsets, 2 * j + 1)
+    int  cntR = array.get(plan.mergeTouchPlanCounts,  2 * j + 1)
+    bool ok   = targetCoreId >= 1 and ringTargetOkRaw(ring, targetSlot) and targetSlot < array.size(ring.coreIds) and targetSlot < array.size(ring.coreSlotLiveFlags) and cntS + cntR <= cap
+    if ok
+        ok := array.get(ring.coreSlotLiveFlags, targetSlot) and array.get(ring.coreIds, targetSlot) == targetCoreId
+    int a = 0
+    int b = 0
+    while ok and (a < cntS or b < cntR)
+        bool takeS = b >= cntR
+        if a < cntS and b < cntR
+            takeS := planRowCompareRaw(plan, offS + a, offR + b) < 0
+        int x = takeS ? offS + a : offR + b
+        ringRowWriteRaw(ring, targetSlot * cap + a + b, array.get(plan.mergeTouchPlanBaseSeqs, x), array.get(plan.mergeTouchPlanTimes, x), array.get(plan.mergeTouchPlanSides, x), array.get(plan.mergeTouchPlanContactBottoms, x), array.get(plan.mergeTouchPlanContactTops, x), array.get(plan.mergeTouchPlanCloseAtTouches, x), array.get(plan.mergeTouchPlanGenerationIds, x), array.get(plan.mergeTouchPlanIsNormalFlags, x))
+        if takeS
+            a += 1
+        else
+            b += 1
+    if ok
+        ringFinishRaw(ring, targetSlot, targetCoreId, cntS + cntR, array.get(plan.mergeTouchPlanTruncatedFlags, 2 * j), array.get(plan.mergeTouchPlanTruncatedFlags, 2 * j + 1))
+    ok ? cntS + cntR : -1
+// W08 B15-B2: read-only preflight of splitApplyCommit for SPLIT_LOCAL row k: plan row arrays (offset / count / two
+// truncated flags, equal payload sizes), every mark a Support / Resistance mark with a valid time / contact, count within
+// the ring capacity (target block shape: invariant of the commit, as for Merge).
+export splitApplyPreflight(TouchRing ring, SplitTouchPlan plan, int k) =>
+    int  cap   = ring.touchMarkCapacityPerCore
+    int  nRows = array.size(plan.times)
+    bool ok    = k >= 0 and k < array.size(plan.targetPhysicalIndexes) and k < array.size(plan.markOffsets) and k < array.size(plan.markCounts) and 2 * k + 1 < array.size(plan.truncatedFlags) and cap >= 0 and array.size(plan.baseSeqs) == nRows and array.size(plan.sides) == nRows and array.size(plan.contactBottoms) == nRows and array.size(plan.contactTops) == nRows and array.size(plan.closeAtTouches) == nRows and array.size(plan.generationIds) == nRows and array.size(plan.isNormalFlags) == nRows
+    int off = 0
+    int cnt = 0
+    if ok
+        off := array.get(plan.markOffsets, k)
+        cnt := array.get(plan.markCounts, k)
+    ok := ok and off >= 0 and cnt >= 0 and off + cnt <= nRows and cnt <= cap
+    int i = 0
+    while ok and i < cnt
+        int   x  = off + i
+        int   sd = array.get(plan.sides, x)
+        float b  = array.get(plan.contactBottoms, x)
+        float u  = array.get(plan.contactTops, x)
+        ok := (sd == SIDE_SUPPORT or sd == SIDE_RESISTANCE) and not na(array.get(plan.times, x)) and not na(b) and not na(u) and b <= u
+        i += 1
+    ok
+// Commit of SPLIT_LOCAL row k onto targetSlot (after splitApplyPreflight and the Core materialization): marks in plan order
+// into rows 0 .. n - 1, the rest reset, owner targetCoreId, truncated flags = the plan row flags. Returns n; -1 on an
+// invariant break as for Merge.
+export splitApplyCommit(TouchRing ring, SplitTouchPlan plan, int k, int targetSlot, int targetCoreId) =>
+    int  cap = ring.touchMarkCapacityPerCore
+    int  off = array.get(plan.markOffsets, k)
+    int  cnt = array.get(plan.markCounts, k)
+    bool ok  = targetCoreId >= 1 and ringTargetOkRaw(ring, targetSlot) and targetSlot < array.size(ring.coreIds) and targetSlot < array.size(ring.coreSlotLiveFlags) and cnt <= cap
+    if ok
+        ok := array.get(ring.coreSlotLiveFlags, targetSlot) and array.get(ring.coreIds, targetSlot) == targetCoreId
+    int i = 0
+    while ok and i < cnt
+        int x = off + i
+        ringRowWriteRaw(ring, targetSlot * cap + i, array.get(plan.baseSeqs, x), array.get(plan.times, x), array.get(plan.sides, x), array.get(plan.contactBottoms, x), array.get(plan.contactTops, x), array.get(plan.closeAtTouches, x), array.get(plan.generationIds, x), array.get(plan.isNormalFlags, x))
+        i += 1
+    if ok
+        ringFinishRaw(ring, targetSlot, targetCoreId, cnt, array.get(plan.truncatedFlags, 2 * k), array.get(plan.truncatedFlags, 2 * k + 1))
+    ok ? cnt : -1
