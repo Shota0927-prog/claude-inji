@@ -68,6 +68,12 @@
 // rootId ASC unique union of the winner Root slices (Psych is never a Root) and its first Root ID as minRootId.
 // Storage order: matched pairs in canonical matching order, then unmatched Support, then unmatched Resistance, each in
 // its Side bottom order (bottomTick, topTick, winnerIndex ASC). This order is storage only, never an Identity order.
+//
+// B07-B: physical Identity plan of the current pass. physicalIdentityEdges holds every exact Identity edge (stride 3
+// [physicalCandidateIndex, oldCoreSlot, oldCoreId]) in canonical order: old rank (coreCreatedTime, coreId ASC), then new
+// rank (bottomTick, topTick, minRootId, complete Root set lexicographic ASC; only Candidates with an edge are ranked).
+// physicalIdentityMatches holds the canonical maximum continuation matching (same layout and order). The full edge set
+// is kept for Merge / Split; the matching only decides ID continuation. Degree-0 Candidates have no row here.
 // ============================================================
 library("ZoneEngineV2_W08Core_Worker", overlay = false)
 
@@ -106,6 +112,10 @@ export type W08Store
     array<int>   physicalCandidateRootIdLengths
     array<int>   physicalCandidateRootIds
     int          physicalCandidateRootIdLength = 0
+    array<int>   physicalIdentityEdges
+    array<int>   physicalIdentityMatches
+    int          physicalIdentityEdgeCount = 0
+    int          physicalIdentityMatchCount = 0
 
 export newStore() =>
     W08Store s = W08Store.new()
@@ -136,6 +146,8 @@ export newStore() =>
     s.physicalCandidateRootIdOffsets              := array.new_int(0)
     s.physicalCandidateRootIdLengths              := array.new_int(0)
     s.physicalCandidateRootIds                    := array.new_int(0)
+    s.physicalIdentityEdges                       := array.new_int(0)
+    s.physicalIdentityMatches                     := array.new_int(0)
     s
 
 // currentCoreId = the Core ID of a live Core at coreSlot, ID_NONE when the slot is out of
@@ -813,6 +825,92 @@ matchingMaxCardinalityRaw(array<int> adjStart, array<int> edgeR, int nS, int nR,
 // duplicated edge or bad pairing storage. Step A: K = maximum cardinality. Step C: edges in
 // canonical order; an edge free of selected endpoints is taken when, forced in, the edges after
 // it still complete the remaining count. Nothing is deduplicated silently, no cap.
+// Canonical maximum matching over rank edges (es[i], er[i]) of nS row ranks and nR column ranks (B07-A1 machinery).
+// edgeS / edgeR receive the edges in canonical order (row rank, then column rank ASC, stable counting sorts); a repeated
+// edge fails. K = maximum cardinality, then each edge in canonical order free of chosen endpoints is taken when, forced
+// in, the edges after it still complete the remaining count. pickS / pickR receive the chosen edges in canonical order.
+// Returns K, or -1 (a repeated edge / incomplete selection).
+matchingCanonicalRaw(array<int> es, array<int> er, int nS, int nR, array<int> edgeS, array<int> edgeR, array<int> pickS, array<int> pickR) =>
+    int nE = array.size(es)
+    int result = -1
+    array.clear(edgeS)
+    array.clear(edgeR)
+    array.clear(pickS)
+    array.clear(pickR)
+    bool ok = true
+    if nS >= 0
+        // canonical edge order: stable counting sort by Resistance rank, then by Support rank
+        array<int> cnt  = array.new_int(nR + 1, 0)
+        array<int> byR  = array.new_int(nE, 0)
+        int x = 0
+        while x < nE
+            array.set(cnt, array.get(er, x) + 1, array.get(cnt, array.get(er, x) + 1) + 1)
+            x += 1
+        x := 1
+        while x <= nR
+            array.set(cnt, x, array.get(cnt, x) + array.get(cnt, x - 1))
+            x += 1
+        x := 0
+        while x < nE
+            int key = array.get(er, x)
+            array.set(byR, array.get(cnt, key), x)
+            array.set(cnt, key, array.get(cnt, key) + 1)
+            x += 1
+        array<int> adjStart = array.new_int(nS + 1, 0)
+        int x0 = 0
+        while x0 < nE
+            array.push(edgeS, 0)
+            array.push(edgeR, 0)
+            x0 += 1
+        x := 0
+        while x < nE
+            array.set(adjStart, array.get(es, x) + 1, array.get(adjStart, array.get(es, x) + 1) + 1)
+            x += 1
+        x := 1
+        while x <= nS
+            array.set(adjStart, x, array.get(adjStart, x) + array.get(adjStart, x - 1))
+            x += 1
+        array<int> fill = array.copy(adjStart)
+        x := 0
+        while x < nE
+            int p   = array.get(byR, x)
+            int key = array.get(es, p)
+            array.set(edgeS, array.get(fill, key), key)
+            array.set(edgeR, array.get(fill, key), array.get(er, p))
+            array.set(fill, key, array.get(fill, key) + 1)
+            x += 1
+        // a repeated (S, R) edge is a structural failure, never deduplicated
+        x := 1
+        while ok and x < nE
+            ok := not (array.get(edgeS, x) == array.get(edgeS, x - 1) and array.get(edgeR, x) == array.get(edgeR, x - 1))
+            x += 1
+        if ok
+            array<bool> usedS = array.new_bool(nS, false)
+            array<bool> usedR = array.new_bool(nR, false)
+            int need     = matchingMaxCardinalityRaw(adjStart, edgeR, nS, nR, -1, usedS, usedR)
+            int total    = need
+            int selected = 0
+            int e = 0
+            while need > 0 and e < nE
+                int s = array.get(edgeS, e)
+                int r = array.get(edgeR, e)
+                if not array.get(usedS, s) and not array.get(usedR, r)
+                    array.set(usedS, s, true)
+                    array.set(usedR, r, true)
+                    int rest = matchingMaxCardinalityRaw(adjStart, edgeR, nS, nR, e, usedS, usedR)
+                    if 1 + rest >= need
+                        array.push(pickS, s)
+                        array.push(pickR, r)
+                        selected += 1
+                        need     -= 1
+                    else
+                        array.set(usedS, s, false)
+                        array.set(usedR, r, false)
+                e += 1
+            if selected == total
+                result := total
+    result
+
 export pairingSelectCanonicalMatching(W08Store store, array<int> eligiblePairs, array<int> outMatchedPairs) =>
     array<int> sb = store.pairingSupportBottomOrderData
     array<int> rb = store.pairingResistanceBottomOrderData
@@ -867,81 +965,15 @@ export pairingSelectCanonicalMatching(W08Store store, array<int> eligiblePairs, 
         k += 2
     int result = -1
     if ok
-        // canonical edge order: stable counting sort by Resistance rank, then by Support rank
-        array<int> cnt  = array.new_int(nR + 1, 0)
-        array<int> byR  = array.new_int(nE, 0)
+        array<int> pickS = array.new_int(0)
+        array<int> pickR = array.new_int(0)
+        result := matchingCanonicalRaw(es, er, nS, nR, array.new_int(0), array.new_int(0), pickS, pickR)
+        ok := result >= 0
         int x = 0
-        while x < nE
-            array.set(cnt, array.get(er, x) + 1, array.get(cnt, array.get(er, x) + 1) + 1)
+        while ok and x < result
+            array.push(outMatchedPairs, array.get(sb, array.get(pickS, x) * 3))
+            array.push(outMatchedPairs, array.get(rb, array.get(pickR, x) * 3))
             x += 1
-        x := 1
-        while x <= nR
-            array.set(cnt, x, array.get(cnt, x) + array.get(cnt, x - 1))
-            x += 1
-        x := 0
-        while x < nE
-            int key = array.get(er, x)
-            array.set(byR, array.get(cnt, key), x)
-            array.set(cnt, key, array.get(cnt, key) + 1)
-            x += 1
-        array<int> adjStart = array.new_int(nS + 1, 0)
-        array<int> edgeS    = array.new_int(nE, 0)
-        array<int> edgeR    = array.new_int(nE, 0)
-        x := 0
-        while x < nE
-            array.set(adjStart, array.get(es, x) + 1, array.get(adjStart, array.get(es, x) + 1) + 1)
-            x += 1
-        x := 1
-        while x <= nS
-            array.set(adjStart, x, array.get(adjStart, x) + array.get(adjStart, x - 1))
-            x += 1
-        array<int> fill = array.copy(adjStart)
-        x := 0
-        while x < nE
-            int p   = array.get(byR, x)
-            int key = array.get(es, p)
-            array.set(edgeS, array.get(fill, key), key)
-            array.set(edgeR, array.get(fill, key), array.get(er, p))
-            array.set(fill, key, array.get(fill, key) + 1)
-            x += 1
-        // a repeated (S, R) edge is a structural failure, never deduplicated
-        x := 1
-        while ok and x < nE
-            ok := not (array.get(edgeS, x) == array.get(edgeS, x - 1) and array.get(edgeR, x) == array.get(edgeR, x - 1))
-            x += 1
-        if ok
-            array<bool> usedS = array.new_bool(nS, false)
-            array<bool> usedR = array.new_bool(nR, false)
-            int need     = matchingMaxCardinalityRaw(adjStart, edgeR, nS, nR, -1, usedS, usedR)
-            int total    = need
-            int selected = 0
-            array<int> pickS = array.new_int(0)
-            array<int> pickR = array.new_int(0)
-            int e = 0
-            while need > 0 and e < nE
-                int s = array.get(edgeS, e)
-                int r = array.get(edgeR, e)
-                if not array.get(usedS, s) and not array.get(usedR, r)
-                    array.set(usedS, s, true)
-                    array.set(usedR, r, true)
-                    int rest = matchingMaxCardinalityRaw(adjStart, edgeR, nS, nR, e, usedS, usedR)
-                    if 1 + rest >= need
-                        array.push(pickS, s)
-                        array.push(pickR, r)
-                        selected += 1
-                        need     -= 1
-                    else
-                        array.set(usedS, s, false)
-                        array.set(usedR, r, false)
-                e += 1
-            ok := selected == total
-            if ok
-                x := 0
-                while x < selected
-                    array.push(outMatchedPairs, array.get(sb, array.get(pickS, x) * 3))
-                    array.push(outMatchedPairs, array.get(rb, array.get(pickR, x) * 3))
-                    x += 1
-                result := total
     if not ok
         array.clear(outMatchedPairs)
     result
@@ -1090,3 +1122,120 @@ export physicalBuild(W08Store store, int candidateWinnerLogicalCount, array<int>
     store.physicalCandidateLogicalCount := ok ? count : 0
     store.physicalCandidateRootIdLength := ok ? array.size(store.physicalCandidateRootIds) : 0
     ok ? count : -1
+
+// New canonical order of two physical Candidates: bottomTick, topTick, minRootId, then the complete rootId ASC Root
+// set lexicographic (first differing ID, else the shorter set first). -1 / 1, or 0 on a complete tie.
+physicalNewCompareRaw(W08Store store, int p, int q) =>
+    int c  = 0
+    int ka = array.get(store.physicalCandidateBottomTicks, p) - array.get(store.physicalCandidateBottomTicks, q)
+    int kb = array.get(store.physicalCandidateTopTicks, p) - array.get(store.physicalCandidateTopTicks, q)
+    int kc = array.get(store.physicalCandidateMinRootIds, p) - array.get(store.physicalCandidateMinRootIds, q)
+    c := ka != 0 ? ka : kb != 0 ? kb : kc
+    int a    = array.get(store.physicalCandidateRootIdOffsets, p)
+    int b    = array.get(store.physicalCandidateRootIdOffsets, q)
+    int aEnd = a + array.get(store.physicalCandidateRootIdLengths, p)
+    int bEnd = b + array.get(store.physicalCandidateRootIdLengths, q)
+    while c == 0 and a < aEnd and b < bEnd
+        c := array.get(store.physicalCandidateRootIds, a) - array.get(store.physicalCandidateRootIds, b)
+        a += 1
+        b += 1
+    if c == 0
+        c := (aEnd - a) - (bEnd - b)
+    c > 0 ? 1 : c < 0 ? -1 : 0
+
+// Builds the physical Identity plan from rawEdges (stride 4 [physicalCandidateIndex, oldCoreSlot, oldCoreId,
+// oldCoreCreatedTime], any order; exact Identity already decided by the caller) for physicalCount Candidates (must be
+// this pass's physicalCandidateLogicalCount). Old / new ranks as in the header, canonical edges and the canonical
+// maximum continuation matching are stored; returns the match count. -1 with both lists empty (no partial plan) for
+// bad input, an index out of range, a na createdTime, a coreId seen with another slot / createdTime, a repeated edge, or
+// two edge-bearing Candidates that tie on the complete new order. The physical Candidate storage is never touched.
+export identityPlanBuild(W08Store store, int physicalCount, array<int> rawEdges) =>
+    array.clear(store.physicalIdentityEdges)
+    array.clear(store.physicalIdentityMatches)
+    int  rLen = array.size(rawEdges)
+    bool ok   = physicalCount >= 0 and physicalCount == store.physicalCandidateLogicalCount and rLen % 4 == 0
+    // old: distinct coreIds sorted by (createdTime, coreId); new: distinct Candidates sorted by the new order
+    array<int> oldIds   = array.new_int(0)
+    array<int> oldSlots = array.new_int(0)
+    array<int> oldTimes = array.new_int(0)
+    array<int> newIdx   = array.new_int(0)
+    int k = 0
+    while ok and k < rLen
+        int p  = array.get(rawEdges, k)
+        int sl = array.get(rawEdges, k + 1)
+        int id = array.get(rawEdges, k + 2)
+        int ct = array.get(rawEdges, k + 3)
+        ok := p >= 0 and p < physicalCount and sl >= 0 and id >= 1 and not na(ct)
+        int pos = 0
+        bool found = false
+        while ok and not found and pos < array.size(oldIds)
+            int oid = array.get(oldIds, pos)
+            if oid == id
+                found := true
+                ok    := array.get(oldSlots, pos) == sl and array.get(oldTimes, pos) == ct
+            else if array.get(oldTimes, pos) > ct or (array.get(oldTimes, pos) == ct and oid > id)
+                break
+            else
+                pos += 1
+        if ok and not found
+            array.insert(oldIds, pos, id)
+            array.insert(oldSlots, pos, sl)
+            array.insert(oldTimes, pos, ct)
+        pos   := 0
+        found := false
+        while ok and not found and pos < array.size(newIdx)
+            int c = array.get(newIdx, pos) == p ? 0 : physicalNewCompareRaw(store, p, array.get(newIdx, pos))
+            if array.get(newIdx, pos) == p
+                found := true
+            else if c == 0
+                ok := false
+            else if c < 0
+                break
+            else
+                pos += 1
+        if ok and not found
+            array.insert(newIdx, pos, p)
+        k += 4
+    map<int, int> oldRank = map.new<int, int>()
+    map<int, int> newRank = map.new<int, int>()
+    k := 0
+    while ok and k < array.size(oldIds)
+        map.put(oldRank, array.get(oldIds, k), k)
+        k += 1
+    k := 0
+    while ok and k < array.size(newIdx)
+        map.put(newRank, array.get(newIdx, k), k)
+        k += 1
+    array<int> es    = array.new_int(0)
+    array<int> er    = array.new_int(0)
+    k := 0
+    while ok and k < rLen
+        array.push(es, map.get(oldRank, array.get(rawEdges, k + 2)))
+        array.push(er, map.get(newRank, array.get(rawEdges, k)))
+        k += 4
+    array<int> edgeS = array.new_int(0)
+    array<int> edgeR = array.new_int(0)
+    array<int> pickS = array.new_int(0)
+    array<int> pickR = array.new_int(0)
+    int result = -1
+    if ok
+        result := matchingCanonicalRaw(es, er, array.size(oldIds), array.size(newIdx), edgeS, edgeR, pickS, pickR)
+        ok := result >= 0
+    int side = 0
+    while ok and side < 2
+        array<int> os  = side == 0 ? edgeS : pickS
+        array<int> ns  = side == 0 ? edgeR : pickR
+        array<int> out = side == 0 ? store.physicalIdentityEdges : store.physicalIdentityMatches
+        k := 0
+        while k < array.size(os)
+            array.push(out, array.get(newIdx, array.get(ns, k)))
+            array.push(out, array.get(oldSlots, array.get(os, k)))
+            array.push(out, array.get(oldIds, array.get(os, k)))
+            k += 1
+        side += 1
+    if not ok
+        array.clear(store.physicalIdentityEdges)
+        array.clear(store.physicalIdentityMatches)
+    store.physicalIdentityEdgeCount  := ok ? int(array.size(store.physicalIdentityEdges) / 3) : 0
+    store.physicalIdentityMatchCount := ok ? result : 0
+    ok ? result : -1
