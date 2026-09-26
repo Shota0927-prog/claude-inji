@@ -1,0 +1,116 @@
+//@version=6
+// ============================================================
+// ZoneEngineV2_W08Core_Worker - W08 Core Identity / Merge / Split worker
+//
+// Physical home of the W08 persistent index storage and index mutation, kept in its own
+// compile unit. It never imports the Main library and never sees the Main Engine: callers
+// pass the W08Store plus the primitive values each call needs.
+//
+// B02 (Repair 04-A): Core identity interval index. One entry per live physical Core (no
+// state / Phase / Side filter), key = (bottomTick ASC, topTick ASC, coreId ASC) with
+// ticks = round(price / mintick). Physical order only: it never decides Identity. Storage
+// is the flat coreIntervalOrderData, stride 4 per entry:
+//   [+0 coreSlot, +1 expectedCoreId, +2 bottomTick, +3 topTick]
+// Entries always move as whole 4-value groups; a size that is not a multiple of 4 fails
+// the call. Each call checks only its own target (entry matched by coreSlot +
+// expectedCoreId); the entry is seated at its canonical position by an insertion step.
+// No full-index validation, no cap, no bit packing, no array.remove(0) / unshift.
+// ============================================================
+library("ZoneEngineV2_W08Core_Worker", overlay = false)
+
+const int ID_NONE = 0
+
+export type W08Store
+    array<int> coreIntervalOrderData
+
+export newStore() =>
+    W08Store.new(array.new_int(0))
+
+// currentCoreId = the Core ID of a live Core at coreSlot, ID_NONE when the slot is out of
+// range or not live (caller side). The physical range is read by the caller and passed in.
+export intervalInsert(W08Store store, int coreSlot, int expectedCoreId, int currentCoreId, float physicalBottom, float physicalTop, float mintick) =>
+    array<int> d = store.coreIntervalOrderData
+    bool ok       = false
+    bool changed  = false
+    int  dataSize = array.size(d)
+    if coreSlot >= 0 and expectedCoreId != ID_NONE and currentCoreId == expectedCoreId and mintick > 0 and physicalBottom <= physicalTop and dataSize % 4 == 0
+        int bTick = int(math.round(physicalBottom / mintick))
+        int tTick = int(math.round(physicalTop    / mintick))
+        int k     = 0
+        while k < dataSize and (array.get(d, k) != coreSlot or array.get(d, k + 1) != expectedCoreId)
+            k += 4
+        if k < dataSize
+            ok := array.get(d, k + 2) == bTick and array.get(d, k + 3) == tTick
+        else
+            ok := true
+            array.push(d, coreSlot)
+            array.push(d, expectedCoreId)
+            array.push(d, bTick)
+            array.push(d, tTick)
+            while k > 0 and (array.get(d, k - 2) > bTick or (array.get(d, k - 2) == bTick and (array.get(d, k - 1) > tTick or (array.get(d, k - 1) == tTick and array.get(d, k - 3) > expectedCoreId))))
+                for n = 0 to 3
+                    array.set(d, k + n, array.get(d, k - 4 + n))
+                k -= 4
+            array.set(d, k,     coreSlot)
+            array.set(d, k + 1, expectedCoreId)
+            array.set(d, k + 2, bTick)
+            array.set(d, k + 3, tTick)
+            changed := true
+    [ok, changed]
+
+export intervalDetach(W08Store store, int coreSlot, int expectedCoreId) =>
+    array<int> d = store.coreIntervalOrderData
+    bool ok       = false
+    bool changed  = false
+    int  dataSize = array.size(d)
+    if coreSlot >= 0 and expectedCoreId != ID_NONE and dataSize % 4 == 0
+        ok := true
+        int k = 0
+        while k < dataSize and (array.get(d, k) != coreSlot or array.get(d, k + 1) != expectedCoreId)
+            k += 4
+        if k < dataSize
+            while k < dataSize - 4
+                array.set(d, k, array.get(d, k + 4))
+                k += 1
+            for n = 1 to 4
+                array.pop(d)
+            changed := true
+    [ok, changed]
+
+// Index side of a physical range change. oldBottom / oldTop = the Core's current physical
+// range, newBottom / newTop = the range the caller is about to store. The old entry must
+// exist and match the old range ticks (no silent new duplicate). changed = true exactly
+// when the range values differ and the index accepted the move; the caller then writes the
+// physical range and bumps coreRangeRevision (the Worker owns neither). The entry is
+// re-seated (insertion step left or right, whole 4-value groups) only when its ticks change.
+export intervalMove(W08Store store, int coreSlot, int expectedCoreId, int currentCoreId, float oldBottom, float oldTop, float newBottom, float newTop, float mintick) =>
+    array<int> d = store.coreIntervalOrderData
+    bool ok       = false
+    bool changed  = false
+    int  dataSize = array.size(d)
+    if coreSlot >= 0 and expectedCoreId != ID_NONE and currentCoreId == expectedCoreId and mintick > 0 and newBottom <= newTop and not na(oldBottom) and not na(oldTop) and dataSize % 4 == 0
+        int k = 0
+        while k < dataSize and (array.get(d, k) != coreSlot or array.get(d, k + 1) != expectedCoreId)
+            k += 4
+        if k < dataSize
+            int oldBTick = array.get(d, k + 2)
+            int oldTTick = array.get(d, k + 3)
+            ok := oldBTick == int(math.round(oldBottom / mintick)) and oldTTick == int(math.round(oldTop / mintick))
+            if ok and (newBottom != oldBottom or newTop != oldTop)
+                int bTick = int(math.round(newBottom / mintick))
+                int tTick = int(math.round(newTop    / mintick))
+                if bTick != oldBTick or tTick != oldTTick
+                    while k > 0 and (array.get(d, k - 2) > bTick or (array.get(d, k - 2) == bTick and (array.get(d, k - 1) > tTick or (array.get(d, k - 1) == tTick and array.get(d, k - 3) > expectedCoreId))))
+                        for n = 0 to 3
+                            array.set(d, k + n, array.get(d, k - 4 + n))
+                        k -= 4
+                    while k < dataSize - 4 and (array.get(d, k + 6) < bTick or (array.get(d, k + 6) == bTick and (array.get(d, k + 7) < tTick or (array.get(d, k + 7) == tTick and array.get(d, k + 5) < expectedCoreId))))
+                        for n = 0 to 3
+                            array.set(d, k + n, array.get(d, k + 4 + n))
+                        k += 4
+                    array.set(d, k,     coreSlot)
+                    array.set(d, k + 1, expectedCoreId)
+                    array.set(d, k + 2, bTick)
+                    array.set(d, k + 3, tTick)
+                changed := true
+    [ok, changed]
