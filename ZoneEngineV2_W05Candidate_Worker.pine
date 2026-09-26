@@ -281,26 +281,43 @@ candBuildFvgScratchRaw(CandidateCtx ctx, int side) =>
         else
             ctx.candidateResistanceFvgLength := len
     len
-// W07 B13: interval-index enumeration foundation (not called by Stage A / B yet). Builds the Side's FVG NativeRange
-// index over exactly the Side FVG scratch prefix 0 .. length - 1 (W07Fvg.fvgIntervalOrderBuild, Support and Resistance
-// orders kept apart) and queries [queryLowTick, queryHighTick] (W07Fvg.fvgIntervalQuery: rootBottomTick <= high and
-// rootTopTick >= low, no state / direction / Fresh filter). The query answers by rootId ascending; the scratch is
-// rootId ascending (rootIdOrderSlots subsequence), so each hit is located in the scratch by binary search on rootId and
-// must be that scratch slot at a strictly increasing position, which restores the scratch logical order. Everything is
-// checked before the first write to candidateFvgMatchSlots (array.set inside its physical size, array.push past it;
+// W07 B13: interval-index enumeration foundation (used by Stage A since B14). The Side's FVG scratch prefix
+// 0 .. length - 1 is walked once in scratch order: a slot outside rootIds or a rootId <= ID_NONE is a structural
+// failure (-1); a Root whose NativeRange cannot be indexed (slot outside the NativeBottom / NativeTop ticks, na tick,
+// bottom > top) is only left out of the index (W07 B14 repair: such a non-Broad FVG never passes candFvgRangeRaw, so
+// the full scan made no offer for it and kept ok; a Broad one already fails the caller's C1 prevalidation). The
+// indexable Roots (helper-local list) get the Side's NativeRange index (W07Fvg.fvgIntervalOrderBuild, Support and
+// Resistance orders kept apart), queried with [queryLowTick, queryHighTick] (W07Fvg.fvgIntervalQuery: rootBottomTick <=
+// high and rootTopTick >= low, no state / direction / Fresh filter). The query answers by rootId ascending; the scratch
+// is rootId ascending (rootIdOrderSlots subsequence), so each hit is located in the scratch by binary search on rootId
+// and must be that scratch slot at a strictly increasing position, which restores the scratch logical order. Everything
+// is checked before the first write to candidateFvgMatchSlots (array.set inside its physical size, array.push past it;
 // the tail beyond the count is not valid). Only FVG Roots intersecting the query are returned: no Candidate condition
-// (INSIDE / PROXIMAL / C1-C4 / OVERLAP), no validation of the other scratch Roots beyond the index build.
-// Returns the match count (>= 0), or -1 (bad Side, na / inverted query, index build or query failure, or a hit that is
-// not in the scratch order); -1 writes no match and has no fallback to the pair enumeration.
+// (INSIDE / PROXIMAL / C1-C4 / OVERLAP). Returns the match count (>= 0; no indexable Root -> 0), or -1 (bad Side,
+// na / inverted query, bad scratch length / slot / rootId, index build or query failure, or a hit that is not in the
+// scratch order); -1 writes no match and has no fallback to the pair enumeration.
 candFvgIndexedMatchesRaw(CandidateCtx ctx, int side, int queryLowTick, int queryHighTick) =>
     bool       isSupport   = side == SIDE_SUPPORT
     array<int> scratch     = isSupport ? ctx.candidateSupportFvgRootSlots : ctx.candidateResistanceFvgRootSlots
     int        scratchLen  = isSupport ? ctx.candidateSupportFvgLength : ctx.candidateResistanceFvgLength
     array<int> bottomOrder = isSupport ? ctx.candidateSupportFvgBottomOrder : ctx.candidateResistanceFvgBottomOrder
     array<int> topOrder    = isSupport ? ctx.candidateSupportFvgTopOrder : ctx.candidateResistanceFvgTopOrder
-    bool ok = (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and not na(queryLowTick) and not na(queryHighTick) and queryLowTick <= queryHighTick
+    bool ok = (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and not na(queryLowTick) and not na(queryHighTick) and queryLowTick <= queryHighTick and scratchLen >= 0 and scratchLen <= array.size(scratch)
+    array<int> indexableFvgSlots = array.new_int(0)
+    int sv = 0
+    while ok and sv < scratchLen
+        int svSlot = array.get(scratch, sv)
+        ok := svSlot >= 0 and svSlot < array.size(ctx.rootIds)
+        if ok
+            ok := array.get(ctx.rootIds, svSlot) > ID_NONE
+        if ok and svSlot < array.size(ctx.rootNativeBottomTicks) and svSlot < array.size(ctx.rootNativeTopTicks)
+            int svBottom = array.get(ctx.rootNativeBottomTicks, svSlot)
+            int svTop    = array.get(ctx.rootNativeTopTicks,    svSlot)
+            if not na(svBottom) and not na(svTop) and svBottom <= svTop
+                array.push(indexableFvgSlots, svSlot)
+        sv += 1
     if ok
-        ok := W07Fvg.fvgIntervalOrderBuild(scratch, scratchLen, ctx.rootIds, ctx.rootNativeBottomTicks, ctx.rootNativeTopTicks, bottomOrder, topOrder) == FVG_INTERVAL_BUILD_OK
+        ok := W07Fvg.fvgIntervalOrderBuild(indexableFvgSlots, array.size(indexableFvgSlots), ctx.rootIds, ctx.rootNativeBottomTicks, ctx.rootNativeTopTicks, bottomOrder, topOrder) == FVG_INTERVAL_BUILD_OK
     array<int> hits = array.new_int(0)
     int hitCount = -1
     if ok
@@ -1284,6 +1301,7 @@ candEnumerateStageARaw(CandidateCtx ctx, float mintick, int side, int denseTick,
     // W07 B14: FVG interval index state of this call (built on the first FVG pass, reused by every later variant)
     bool fvgIndexReady = false
     int  fvgMatchN     = 0
+    int  fvgReplayEnd  = 0
     while ok and left < n
         if boundRight < left
             boundRight := left
@@ -1427,25 +1445,31 @@ candEnumerateStageARaw(CandidateCtx ctx, float mintick, int side, int denseTick,
                             ok := candOfferRaw(ctx, mintick, side, CAND_STAGE_A, left, j, localBottom, localTop, pC, pH, pDensity, pStrong, wMaxConfirmedTime, wMinRootId, CAND_FVG_RANGE_NONE, SLOT_INVALID, pCategory, pHigh, pt, SLOT_INVALID)
                         // W07 B14: at the first FVG pass of this call, every FVG scratch entry gets the per-FVG checks that set
                         // ok = false in the FVG loop below (slot / rootId / confirmedTime; a Broad FVG also the C1 localization
-                        // validation, the same call and arguments as below), so the index never drops a failure. Then one Side query:
+                        // validation, the same call and arguments as below), so the index never drops a failure. A failing entry
+                        // at position p: no index; this pass replays the loop over the scratch 0 .. p exactly as the full scan did
+                        // (same offers before p, same ok = false at p). Otherwise one Side query:
                         // every variant range [min(baseBottom, pt), max(baseTop, pt)] lies in [minPointTick - D, maxPointTick + D]
                         // (runVariant keeps each variant within D), widened by D; an FVG outside it meets no INSIDE / PROXIMAL /
                         // C1 / C3 / C4 range and makes no offer. The loop then runs on the matches only, in FVG scratch order.
                         if ok and not fvgIndexReady
-                            int pv = 0
-                            while ok and pv < fvgN
+                            int  pv   = 0
+                            bool pvOk = true
+                            while pvOk and pv < fvgN
                                 int vf = array.get(fvgScratch, pv)
-                                ok := vf >= 0 and vf < array.size(ctx.rootIds) and vf < array.size(ctx.rootIsBroadFvgFlags) and vf < array.size(ctx.rootConfirmedTimes)
-                                if ok
-                                    ok := not na(array.get(ctx.rootConfirmedTimes, vf)) and array.get(ctx.rootIds, vf) != ID_NONE
-                                if ok and array.get(ctx.rootIsBroadFvgFlags, vf)
+                                pvOk := vf >= 0 and vf < array.size(ctx.rootIds) and vf < array.size(ctx.rootIsBroadFvgFlags) and vf < array.size(ctx.rootConfirmedTimes)
+                                if pvOk
+                                    pvOk := not na(array.get(ctx.rootConfirmedTimes, vf)) and array.get(ctx.rootIds, vf) != ID_NONE
+                                if pvOk and array.get(ctx.rootIsBroadFvgFlags, vf)
                                     [vOk, vLoc, vBottom, vTop] = candBroadLocalizationRaw(ctx, side, CAND_STAGE_A, CAND_BROAD_LOCAL_C1, vf, SLOT_INVALID, true, baseBottom, baseTop, pp, pt, wMa, wEma2000, wEma3000, wCategoryMask, wHighMask, denseTick, mTick)
-                                    ok := vOk
-                                pv += 1
+                                    pvOk := vOk
+                                if pvOk
+                                    pv += 1
+                            if not pvOk
+                                fvgReplayEnd := pv + 1
                             int qMin = int(na)
                             int qMax = int(na)
                             int pq = 0
-                            while ok and pq < n
+                            while ok and pvOk and pq < n
                                 int qSlot = array.get(scratch, pq)
                                 if qSlot >= 0 and qSlot < array.size(ctx.rootPointTicks)
                                     int qTick = array.get(ctx.rootPointTicks, qSlot)
@@ -1453,13 +1477,13 @@ candEnumerateStageARaw(CandidateCtx ctx, float mintick, int side, int denseTick,
                                         qMin := na(qMin) ? qTick : math.min(qMin, qTick)
                                         qMax := na(qMax) ? qTick : math.max(qMax, qTick)
                                 pq += 1
-                            if ok
+                            if ok and pvOk
                                 fvgMatchN := candFvgIndexedMatchesRaw(ctx, side, qMin - denseTick - denseTick, qMax + denseTick + denseTick)
                                 ok := fvgMatchN >= 0
                             fvgIndexReady := true
                         int k = 0
-                        while ok and k < fvgMatchN
-                            int f = array.get(ctx.candidateFvgMatchSlots, k)
+                        while ok and k < (fvgReplayEnd > 0 ? fvgReplayEnd : fvgMatchN)
+                            int f = fvgReplayEnd > 0 ? array.get(fvgScratch, k) : array.get(ctx.candidateFvgMatchSlots, k)
                             ok := f >= 0 and f < array.size(ctx.rootIds) and f < array.size(ctx.rootIsBroadFvgFlags) and f < array.size(ctx.rootConfirmedTimes)
                             bool fBroad = false
                             int  fConf  = int(na)
@@ -1514,6 +1538,8 @@ candEnumerateStageARaw(CandidateCtx ctx, float mintick, int side, int denseTick,
                                             ok := candOfferRaw(ctx, mintick, side, CAND_STAGE_A, left, j, gBottom, gTop, qC, qH, qDensity, qStrong, vCreated, vMinId, mode, f, qCategory, qHigh, pt, SLOT_INVALID)
                                 a += 1
                             k += 1
+                        if fvgReplayEnd > 0
+                            ok := false
             j += 1
         left += 1
     ok
