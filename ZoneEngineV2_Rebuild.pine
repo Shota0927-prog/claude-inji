@@ -1881,15 +1881,22 @@ participationDuplicateExistsRaw(ZoneEngine engine, int rootSlot, int expectedRoo
                 edgeIndex := array.get(engine.participationEdgeNextByRootIndexes, edgeIndex)
                 seen      += 1
     found
-participationAddRaw(ZoneEngine engine, int rootSlot, int sideSlot) =>
-    bool added = false
-    bool rootOk         = rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags)
-    int  expectedRootId = ID_NONE
+// W08 B07-D: the Root-side and free-list predicates of participationAddRaw (shared with the materialization preflight)
+participationRootAddableRaw(ZoneEngine engine, int rootSlot) =>
+    bool rootOk = rootSlot >= 0 and rootSlot < array.size(engine.rootIds) and rootSlot < array.size(engine.rootSlotLiveFlags)
     if rootOk
         rootOk := array.get(engine.rootSlotLiveFlags, rootSlot)
     if rootOk
+        rootOk := array.get(engine.rootIds, rootSlot) != ID_NONE
+    rootOk and participationRootChainValidRaw(engine, rootSlot)
+participationEdgeFreeEntryOkRaw(ZoneEngine engine, int edgeIndex) =>
+    edgeIndex >= 0 and edgeIndex < array.size(engine.participationEdgeRootSlots) and edgeIndex < array.size(engine.participationEdgeLiveFlags) and not array.get(engine.participationEdgeLiveFlags, edgeIndex)
+participationAddRaw(ZoneEngine engine, int rootSlot, int sideSlot) =>
+    bool added = false
+    bool rootOk         = participationRootAddableRaw(engine, rootSlot)
+    int  expectedRootId = ID_NONE
+    if rootOk
         expectedRootId := array.get(engine.rootIds, rootSlot)
-        rootOk         := expectedRootId != ID_NONE
     bool sideOk         = rootOk and sideSlot >= 0 and sideSlot < array.size(engine.sidePhases)
     int  coreSlot       = SLOT_INVALID
     int  expectedCoreId = ID_NONE
@@ -1904,16 +1911,11 @@ participationAddRaw(ZoneEngine engine, int rootSlot, int sideSlot) =>
         sideOk         := expectedCoreId != ID_NONE
     bool ready = sideOk
     if ready
-        ready := participationRootChainValidRaw(engine, rootSlot)
-    if ready
         ready := not participationDuplicateExistsRaw(engine, rootSlot, expectedRootId, sideSlot, expectedCoreId)
     if ready
         int freeCount = array.size(engine.participationEdgeFreeIndexes)
         if freeCount > 0
-            int topIndex = array.get(engine.participationEdgeFreeIndexes, freeCount - 1)
-            ready := topIndex >= 0 and topIndex < array.size(engine.participationEdgeRootSlots)
-            if ready
-                ready := not array.get(engine.participationEdgeLiveFlags, topIndex)
+            ready := participationEdgeFreeEntryOkRaw(engine, array.get(engine.participationEdgeFreeIndexes, freeCount - 1))
     if ready
         int oldHead   = array.get(engine.rootParticipationHeadEdgeIndexes, rootSlot)
         int oldCount  = array.get(engine.rootParticipationCounts,          rootSlot)
@@ -2052,8 +2054,10 @@ participationDetachAllForRootRaw(ZoneEngine engine, int rootSlot) =>
             freed         += 1
         done := true
     done
-participationDetachAllForCoreRaw(ZoneEngine engine, int coreSlot) =>
-    bool done = false
+// W08 B07-D: read-only failure predicate of participationDetachAllForCoreRaw (shared with the materialization / free
+// preflight): Core live, edge / root table sizes, every live Root chain valid, dead Roots empty, each live edge's slot and
+// expected Core ID agree, chain total == live edge total. Returns [ready, expectedCoreId, targetEdgeCount].
+participationDetachAllReadyRaw(ZoneEngine engine, int coreSlot) =>
     bool coreOk         = coreSlot >= 0 and coreSlot < array.size(engine.coreIds) and coreSlot < array.size(engine.coreSlotLiveFlags)
     int  expectedCoreId = ID_NONE
     if coreOk
@@ -2100,6 +2104,12 @@ participationDetachAllForCoreRaw(ZoneEngine engine, int coreSlot) =>
             edgeScan += 1
     if ready
         ready := chainEdgeCount == liveEdgeCount
+    [ready, expectedCoreId, targetEdgeCount]
+participationDetachAllForCoreRaw(ZoneEngine engine, int coreSlot) =>
+    bool done = false
+    [ready, expectedCoreId, targetEdgeCount] = participationDetachAllReadyRaw(engine, coreSlot)
+    int edgeRowCount = array.size(engine.participationEdgeRootSlots)
+    int rootRowCount = array.size(engine.rootIds)
     if ready and targetEdgeCount == 0
         done := true
     bool commitReady = ready and targetEdgeCount > 0
@@ -6346,9 +6356,10 @@ coreResetSlotRaw(ZoneEngine engine, int coreSlot) =>
     array.set(engine.w02Aux.corePendingTopologyChildHeadIndexes, coreSlot, SLOT_INVALID)
     array.set(engine.w02Aux.corePendingTopologyChildTailIndexes, coreSlot, SLOT_INVALID)
     array.set(engine.w02Aux.corePendingTopologyChildCounts     , coreSlot, 0)
-// W08 B07-D: one fresh Core with the next coreId and the next generationId (both issued here, in call order, never
-// reused) and coreCreatedTime = createdTime. Callers validate everything first (no counter is taken on a failed plan).
-coreAllocSlotRaw(ZoneEngine engine, int createdTime) =>
+// W08 B07-D: one fresh Core on the next free slot (else an appended slot) with the caller-planned coreId / generationId /
+// coreCreatedTime. No ID counter is touched here: the caller plans the IDs in fresh rank order and moves nextCoreId /
+// nextGenerationId once, after the whole commit (IDs are never reused).
+coreAllocSlotRaw(ZoneEngine engine, int newCoreId, int newGenerationId, int createdTime) =>
     int coreSlot = SLOT_INVALID
     if array.size(engine.coreFreeSlots) > 0
         coreSlot := array.pop(engine.coreFreeSlots)
@@ -6538,11 +6549,8 @@ coreAllocSlotRaw(ZoneEngine engine, int createdTime) =>
         array.push(engine.w02Aux.corePendingTopologyChildHeadIndexes, SLOT_INVALID)
         array.push(engine.w02Aux.corePendingTopologyChildTailIndexes, SLOT_INVALID)
         array.push(engine.w02Aux.corePendingTopologyChildCounts     , 0)
-    int newCoreId = engine.nextCoreId
-    engine.nextCoreId := newCoreId + 1
     array.set(engine.coreIds,           coreSlot, newCoreId)
-    array.set(engine.coreGenerationIds, coreSlot, engine.nextGenerationId)
-    engine.nextGenerationId := engine.nextGenerationId + 1
+    array.set(engine.coreGenerationIds, coreSlot, newGenerationId)
     array.set(engine.coreCreatedTimes,  coreSlot, createdTime)
     array.set(engine.coreSlotLiveFlags, coreSlot, true)
     array.set(engine.touchMarkRingOwnerCoreIds, coreSlot, newCoreId)
@@ -6554,6 +6562,11 @@ coreAllocSlotRaw(ZoneEngine engine, int createdTime) =>
     array.push(engine.coreLiveSlots, coreSlot)
     array.push(engine.coreIdOrderSlots, coreSlot)
     coreSlot
+// W08 B07-D: free = full preflight (live, live / ID-order / map entries, Phase set membership,
+// participationDetachAllReadyRaw, W08Core.coreIndexCanRelease), then an apply that cannot fail on a business condition:
+// participation, Worker origin / interval / inverse entries, Phase sets, registry orders / map, reset, free stack. A false
+// preflight changes nothing; an apply step that still reports false is an invariant break (runtime.error, not a partial
+// free).
 coreFreeSlotRaw(ZoneEngine engine, int coreSlot) =>
     bool validSlot = coreSlot >= 0 and coreSlot < array.size(engine.coreIds)
     bool isLive    = validSlot and array.get(engine.coreSlotLiveFlags, coreSlot)
@@ -6579,28 +6592,26 @@ coreFreeSlotRaw(ZoneEngine engine, int coreSlot) =>
         int  resistanceSideSlot   = coreSlot * 2 + 1
         bool supportPhaseValid    = phaseSetMembershipValidRaw(engine, supportSideSlot)
         bool resistancePhaseValid = phaseSetMembershipValidRaw(engine, resistanceSideSlot)
-        if livePos != SLOT_INVALID and idOrderPos != SLOT_INVALID and idIndexValid and supportPhaseValid and resistancePhaseValid
-            bool participationDetached = participationDetachAllForCoreRaw(engine, coreSlot)
-            // W08 B07-D: every Worker entry (origin nodes, interval tuples, inverse tuples) goes before the reset
-            if participationDetached
-                participationDetached := W08Core.coreIndexRelease(engine.w08CoreStore, coreSlot, oldCoreId)
-            if participationDetached
-                phaseSetDetachRaw(engine, supportSideSlot)
-                phaseSetDetachRaw(engine, resistanceSideSlot)
-                int lastPos = array.size(engine.coreLiveSlots) - 1
-                if livePos != lastPos
-                    array.set(engine.coreLiveSlots, livePos, array.get(engine.coreLiveSlots, lastPos))
-                array.pop(engine.coreLiveSlots)
-                int idSize = array.size(engine.coreIdOrderSlots)
-                int j = idOrderPos
-                while j < idSize - 1
-                    array.set(engine.coreIdOrderSlots, j, array.get(engine.coreIdOrderSlots, j + 1))
-                    j += 1
-                array.pop(engine.coreIdOrderSlots)
-                map.remove(engine.coreIdToSlot, oldCoreId)
-                coreResetSlotRaw(engine, coreSlot)
-                array.push(engine.coreFreeSlots, coreSlot)
-                freed := true
+        [partReady, partCoreId, partTargets] = participationDetachAllReadyRaw(engine, coreSlot)
+        if livePos != SLOT_INVALID and idOrderPos != SLOT_INVALID and idIndexValid and supportPhaseValid and resistancePhaseValid and partReady and W08Core.coreIndexCanRelease(engine.w08CoreStore, coreSlot, oldCoreId)
+            if not (participationDetachAllForCoreRaw(engine, coreSlot) and W08Core.coreIndexRelease(engine.w08CoreStore, coreSlot, oldCoreId))
+                runtime.error("W08 B07-D: core free apply broke its preflight")
+            phaseSetDetachRaw(engine, supportSideSlot)
+            phaseSetDetachRaw(engine, resistanceSideSlot)
+            int lastPos = array.size(engine.coreLiveSlots) - 1
+            if livePos != lastPos
+                array.set(engine.coreLiveSlots, livePos, array.get(engine.coreLiveSlots, lastPos))
+            array.pop(engine.coreLiveSlots)
+            int idSize = array.size(engine.coreIdOrderSlots)
+            int j = idOrderPos
+            while j < idSize - 1
+                array.set(engine.coreIdOrderSlots, j, array.get(engine.coreIdOrderSlots, j + 1))
+                j += 1
+            array.pop(engine.coreIdOrderSlots)
+            map.remove(engine.coreIdToSlot, oldCoreId)
+            coreResetSlotRaw(engine, coreSlot)
+            array.push(engine.coreFreeSlots, coreSlot)
+            freed := true
     freed
 // W08 B01: the Core origin Root membership (rootId ASC chain per physical Core) and the W08 topology revision are
 // owned by W08Core (Worker /2, engine.w08CoreStore: originAdd / originRemove / originReadAsc, topologyRevision).
@@ -6928,25 +6939,35 @@ buildPhysicalOwnershipPlanRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed) =>
     W03SourceRootStore w3 = engine.w03Store
     int k = buildPhysicalIdentityPlanRaw(engine, cfg, feed)
     W08Core.ownershipPlanBuild(engine.w08CoreStore, k, engine.coreSlotLiveFlags, engine.coreIds, engine.coreGenerationIds, w3.candidateWinnerStages, w3.candidateWinnerEffectiveBottomTicks, w3.candidateWinnerEffectiveTopTicks, w3.candidateWinnerMinRootIds, w3.candidateWinnerFvgModes, w3.candidateWinnerPsychLevelTicks, w3.candidateWinnerRootIdOffsets, w3.candidateWinnerRootIdLengths, w3.candidateWinnerRootIds, w3.candidateWinnerRootIdLength)
-// W08 B07-D: transactional materialization of the stored B07-C ownership plan (the plan is not rebuilt). F0 checks the
-// whole plan without any write: plan / physical sizes, fresh ranks 0 .. F - 1 with sentinels, continuation targets (live,
-// coreId, generationId, createdTime, each once), baseCloseTime, every Root ID of the physical unions and the Side winner
-// slices (issued, live, resolved), exact ranges against their ticks, ID counters, and each free slot that will be reused
-// (no participation edge, no Worker entry). Then: continuation Cores release participation and Worker entries in place
-// (slot / coreId / generation / createdTime kept); fresh Cores are allocated in rank order (coreId / generationId from
-// the counters in that order, createdTime = baseCloseTime); every target gets its exact range, origin = the Root union
-// (rootId ASC, final generation), Support / Resistance participation = its own winner Root set, one interval tuple and
-// one inverse tuple per FVG origin Root (Broad included). Returns the materialized count (mapping in
-// physicalMaterialized*); -1 when F0 fails (nothing written) or a commit step reports a registry fault. Unmatched old
-// Cores are not freed here. No runtime call site yet.
+// W08 B07-D: transactional materialization of the stored B07-C ownership plan (the plan is not rebuilt). F0 proves the
+// whole commit without any write, with the same predicates the commit primitives use: plan / physical sizes, fresh ranks
+// 0 .. F - 1 with sentinels, continuation targets (live, coreId, generationId, createdTime, each once; participation
+// detach ready, W08Core.coreIndexCanRelease), baseCloseTime, ID counters (fresh IDs never registered), the planned fresh
+// slots (free stack top first, then appended; no participation edge, W08Core.coreIndexClean), every Root ID (issued, live,
+// strictly ascending per slice, participationRootAddableRaw for the Side slices), the exact range against its ticks,
+// W08Core.coreIndexCanInstall per target, the participation free list and the array capacities. Commit (only after F0):
+// continuation release in place, fresh allocation in rank order with planned coreId = nextCoreId + rank /
+// generationId = nextGenerationId + rank / createdTime = baseCloseTime, then exact range, origin (rootId ASC), inverse per
+// FVG origin (Broad included), Side participation (own winner Root set), one interval tuple; the counters move once at the
+// end. A commit primitive reporting false after F0 is an invariant break (runtime.error), never a partial -1. Returns the
+// materialized count (mapping in physicalMaterialized*); -1 when F0 fails (nothing written). Unmatched old Cores are not
+// freed here. No runtime call site yet.
 materializePhysicalOwnershipRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed, int materializeBaseCloseTime) =>
     W03SourceRootStore w3 = engine.w03Store
     W08Core.W08Store   ws = engine.w08CoreStore
-    int  n  = ws.physicalCandidateLogicalCount
-    int  fc = ws.physicalFreshAllocationCount
+    int  n      = ws.physicalCandidateLogicalCount
+    int  fc     = ws.physicalFreshAllocationCount
+    int  nFree  = array.size(engine.coreFreeSlots)
+    int  nCore  = array.size(engine.coreIds)
+    int  maxArr = 100000
     bool ok = n >= 0 and fc >= 0 and fc <= n and array.size(ws.physicalOwnershipKinds) == n and array.size(ws.physicalContinuationOldCoreSlots) == n and array.size(ws.physicalContinuationCoreIds) == n and array.size(ws.physicalContinuationGenerationIds) == n and array.size(ws.physicalFreshAllocationRanks) == n and array.size(ws.physicalCandidateBottomTicks) == n and array.size(ws.physicalCandidateTopTicks) == n and array.size(ws.physicalCandidateRootIdOffsets) == n and array.size(ws.physicalCandidateRootIdLengths) == n and array.size(ws.physicalCandidateSupportWinnerIndexes) == n and array.size(ws.physicalCandidateResistanceWinnerIndexes) == n and array.size(ws.physicalCandidateExactPrices) == 2 * n and not na(materializeBaseCloseTime) and materializeBaseCloseTime > 0 and feed.mintick > 0 and engine.nextCoreId >= 1 and engine.nextGenerationId >= 1
-    array<int> byRank = array.new_int(ok ? fc : 0, SLOT_INVALID)
+    array<int> byRank  = array.new_int(ok ? fc : 0, SLOT_INVALID)
+    array<int> tSlot   = array.new_int(ok ? n : 0, SLOT_INVALID)
+    array<int> tId     = array.new_int(ok ? n : 0, ID_NONE)
     map<int, bool> contIds = map.new<int, bool>()
+    int newEdges = 0
+    int newNodes = 0
+    int newInv   = 0
     int p = 0
     while ok and p < n
         int slot = array.get(ws.physicalContinuationOldCoreSlots, p)
@@ -6958,17 +6979,37 @@ materializePhysicalOwnershipRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed, int m
             if ok
                 ok := array.get(byRank, rank) == SLOT_INVALID
                 array.set(byRank, rank, p)
+                // planned fresh slot: the free stack top first (pop order), then appended slots; planned IDs by rank
+                slot := nCore + rank - nFree
+                if rank < nFree
+                    slot := array.get(engine.coreFreeSlots, nFree - 1 - rank)
+                id   := engine.nextCoreId + rank
+                ok   := ok and slot >= 0 and not map.contains(engine.coreIdToSlot, id) and W08Core.coreIndexClean(ws, slot)
+                if ok and slot < nCore
+                    ok := not array.get(engine.coreSlotLiveFlags, slot)
+                int e = 0
+                while ok and e < array.size(engine.participationEdgeSideSlots)
+                    ok := not (array.get(engine.participationEdgeLiveFlags, e) and int(math.floor(array.get(engine.participationEdgeSideSlots, e) / 2)) == slot)
+                    e += 1
         else
-            ok := array.get(ws.physicalOwnershipKinds, p) == 0 and rank == -1 and slot >= 0 and slot < array.size(engine.coreIds) and id >= 1 and gen >= 1 and not map.contains(contIds, id)
+            ok := array.get(ws.physicalOwnershipKinds, p) == 0 and rank == -1 and slot >= 0 and slot < nCore and id >= 1 and gen >= 1 and not map.contains(contIds, id)
             if ok
                 ok := array.get(engine.coreSlotLiveFlags, slot) and array.get(engine.coreIds, slot) == id and array.get(engine.coreGenerationIds, slot) == gen and not na(array.get(engine.coreCreatedTimes, slot))
                 map.put(contIds, id, true)
-        // exact range and its ticks
+            if ok
+                [partReady, partCoreId, partTargets] = participationDetachAllReadyRaw(engine, slot)
+                ok := partReady and partCoreId == id and W08Core.coreIndexCanRelease(ws, slot, id)
+        if ok
+            array.set(tSlot, p, slot)
+            array.set(tId, p, id)
+        // exact range, then the install predicate of this target
         float xb = array.get(ws.physicalCandidateExactPrices, 2 * p)
         float xt = array.get(ws.physicalCandidateExactPrices, 2 * p + 1)
         if ok
             ok := not na(xb) and not na(xt) and xb <= xt and int(math.round(xb / feed.mintick)) == array.get(ws.physicalCandidateBottomTicks, p) and int(math.round(xt / feed.mintick)) == array.get(ws.physicalCandidateTopTicks, p)
-        // Root IDs: the physical union and the Side winner slices (issued, live, resolved)
+        if ok
+            ok := W08Core.coreIndexCanInstall(ws, slot, id, xb, xt, feed.mintick, ws.physicalCandidateRootIds, array.get(ws.physicalCandidateRootIdOffsets, p), array.get(ws.physicalCandidateRootIdLengths, p))
+        // Root IDs: the physical union (Core origin) and the Side winner slices (participation), issued, live, resolved
         int part = 0
         while ok and part < 3
             array<int> ids = part == 0 ? ws.physicalCandidateRootIds : w3.candidateWinnerRootIds
@@ -6984,59 +7025,65 @@ materializePhysicalOwnershipRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed, int m
                     off := array.get(w3.candidateWinnerRootIdOffsets, w)
                     len := array.get(w3.candidateWinnerRootIdLengths, w)
             ok := ok and off >= 0 and len >= 0 and off + len <= array.size(ids) and (part != 0 or len > 0)
+            int last = 0
             int r = 0
             while ok and r < len
                 int rootId = array.get(ids, off + r)
-                ok := rootId >= 1 and rootId < engine.nextRootId and map.contains(engine.rootIdToSlot, rootId)
+                ok := rootId > last and rootId < engine.nextRootId and map.contains(engine.rootIdToSlot, rootId)
+                last := rootId
                 if ok
                     int rs = map.get(engine.rootIdToSlot, rootId)
-                    ok := rs >= 0 and rs < array.size(engine.rootIds) and array.get(engine.rootSlotLiveFlags, rs) and array.get(engine.rootIds, rs) == rootId
+                    ok := rs >= 0 and rs < array.size(engine.rootIds) and array.get(engine.rootSlotLiveFlags, rs) and array.get(engine.rootIds, rs) == rootId and rs < array.size(engine.rootCategories)
+                    if ok and part == 0 and array.get(engine.rootCategories, rs) == CAT_FVG
+                        newInv += 1
+                    if ok and part > 0
+                        ok := participationRootAddableRaw(engine, rs)
                 r += 1
+            if part == 0
+                newNodes += len
+            else
+                newEdges += len
             part += 1
         p += 1
-    // fresh IDs never issued before; each free slot to be reused holds no stale participation / Worker entry
-    int f = 0
-    while ok and f < fc
-        ok := not map.contains(engine.coreIdToSlot, engine.nextCoreId + f)
-        int fi = array.size(engine.coreFreeSlots) - 1 - f
-        if ok and fi >= 0
-            int slot = array.get(engine.coreFreeSlots, fi)
-            ok := slot >= 0 and slot < array.size(engine.coreIds) and not array.get(engine.coreSlotLiveFlags, slot) and W08Core.coreIndexClean(ws, slot)
-            int e = 0
-            while ok and e < array.size(engine.participationEdgeSideSlots)
-                ok := not (array.get(engine.participationEdgeLiveFlags, e) and int(math.floor(array.get(engine.participationEdgeSideSlots, e) / 2)) == slot)
-                e += 1
-        f += 1
-    // ---- commit ----
-    int baseId  = engine.nextCoreId
-    int baseGen = engine.nextGenerationId
+    // participation free list (each entry a distinct dead edge row) and array capacities
+    map<int, bool> freeSeen = map.new<int, bool>()
+    int fi = 0
+    while ok and fi < array.size(engine.participationEdgeFreeIndexes)
+        int edge = array.get(engine.participationEdgeFreeIndexes, fi)
+        ok := participationEdgeFreeEntryOkRaw(engine, edge) and not map.contains(freeSeen, edge)
+        map.put(freeSeen, edge, true)
+        fi += 1
     if ok
+        int appended = math.max(0, fc - nFree)
+        ok := 2 * (nCore + appended) <= maxArr and array.size(engine.participationEdgeRootSlots) + newEdges <= maxArr and array.size(ws.coreZoneOriginRootNodeRootIds) + newNodes <= maxArr and array.size(ws.coreIntervalOrderData) + 4 * n <= maxArr and array.size(ws.inverseOriginData) + 3 * newInv <= maxArr
+    // ---- commit (every step below was proven by F0) ----
+    if ok
+        int baseId  = engine.nextCoreId
+        int baseGen = engine.nextGenerationId
         array.clear(ws.physicalMaterializedCoreSlots)
         array.clear(ws.physicalMaterializedCoreIds)
         array.clear(ws.physicalMaterializedGenerationIds)
         ws.physicalMaterializedLogicalCount := 0
+        bool fine = true
         p := 0
         while p < n
-            array.push(ws.physicalMaterializedCoreSlots, array.get(ws.physicalContinuationOldCoreSlots, p))
-            array.push(ws.physicalMaterializedCoreIds, array.get(ws.physicalContinuationCoreIds, p))
+            array.push(ws.physicalMaterializedCoreSlots, array.get(tSlot, p))
+            array.push(ws.physicalMaterializedCoreIds, array.get(tId, p))
             array.push(ws.physicalMaterializedGenerationIds, array.get(ws.physicalContinuationGenerationIds, p))
             if array.get(ws.physicalOwnershipKinds, p) == 0
-                int slot = array.get(ws.physicalContinuationOldCoreSlots, p)
-                ok := ok and participationDetachAllForCoreRaw(engine, slot) and W08Core.coreIndexRelease(ws, slot, array.get(ws.physicalContinuationCoreIds, p))
+                fine := fine and participationDetachAllForCoreRaw(engine, array.get(tSlot, p)) and W08Core.coreIndexRelease(ws, array.get(tSlot, p), array.get(tId, p))
             p += 1
-        f := 0
-        while ok and f < fc
-            int q    = array.get(byRank, f)
-            int slot = coreAllocSlotRaw(engine, materializeBaseCloseTime)
-            array.set(ws.physicalMaterializedCoreSlots, q, slot)
-            array.set(ws.physicalMaterializedCoreIds, q, array.get(engine.coreIds, slot))
-            array.set(ws.physicalMaterializedGenerationIds, q, array.get(engine.coreGenerationIds, slot))
+        int f = 0
+        while f < fc
+            int q = array.get(byRank, f)
+            fine := fine and coreAllocSlotRaw(engine, baseId + f, baseGen + f, materializeBaseCloseTime) == array.get(tSlot, q)
+            array.set(ws.physicalMaterializedGenerationIds, q, baseGen + f)
             f += 1
         bool rangeChanged = false
         p := 0
-        while ok and p < n
-            int   slot = array.get(ws.physicalMaterializedCoreSlots, p)
-            int   id   = array.get(ws.physicalMaterializedCoreIds, p)
+        while p < n
+            int   slot = array.get(tSlot, p)
+            int   id   = array.get(tId, p)
             int   gen  = array.get(ws.physicalMaterializedGenerationIds, p)
             float xb   = array.get(ws.physicalCandidateExactPrices, 2 * p)
             float xt   = array.get(ws.physicalCandidateExactPrices, 2 * p + 1)
@@ -7045,32 +7092,34 @@ materializePhysicalOwnershipRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed, int m
             array.set(engine.corePhysicalTops, slot, xt)
             int off = array.get(ws.physicalCandidateRootIdOffsets, p)
             int r = 0
-            while ok and r < array.get(ws.physicalCandidateRootIdLengths, p)
+            while r < array.get(ws.physicalCandidateRootIdLengths, p)
                 int rootId = array.get(ws.physicalCandidateRootIds, off + r)
                 [aOk, aChanged] = W08Core.originAdd(ws, slot, id, gen, rootId)
-                ok := aOk
-                if ok and array.get(engine.rootCategories, map.get(engine.rootIdToSlot, rootId)) == CAT_FVG
+                fine := fine and aOk
+                if array.get(engine.rootCategories, map.get(engine.rootIdToSlot, rootId)) == CAT_FVG
                     [vOk, vChanged] = W08Core.inverseOriginAdd(ws, rootId, slot, id)
-                    ok := vOk
+                    fine := fine and vOk
                 r += 1
             int side = 0
-            while ok and side < 2
+            while side < 2
                 int w = side == 0 ? array.get(ws.physicalCandidateSupportWinnerIndexes, p) : array.get(ws.physicalCandidateResistanceWinnerIndexes, p)
                 if w >= 0
                     int wo = array.get(w3.candidateWinnerRootIdOffsets, w)
                     int wr = 0
-                    while ok and wr < array.get(w3.candidateWinnerRootIdLengths, w)
-                        ok := participationAddRaw(engine, map.get(engine.rootIdToSlot, array.get(w3.candidateWinnerRootIds, wo + wr)), slot * 2 + side)
+                    while wr < array.get(w3.candidateWinnerRootIdLengths, w)
+                        fine := fine and participationAddRaw(engine, map.get(engine.rootIdToSlot, array.get(w3.candidateWinnerRootIds, wo + wr)), slot * 2 + side)
                         wr += 1
                 side += 1
-            if ok
-                [iOk, iChanged] = W08Core.intervalInsert(ws, slot, id, id, xb, xt, feed.mintick)
-                ok := iOk
+            [iOk, iChanged] = W08Core.intervalInsert(ws, slot, id, id, xb, xt, feed.mintick)
+            fine := fine and iOk
             p += 1
+        if not fine
+            runtime.error("W08 B07-D: materialization commit broke its F0 preflight")
         if rangeChanged
             engine.coreRangeRevision := engine.coreRangeRevision + 1
-        ok := ok and engine.nextCoreId == baseId + fc and engine.nextGenerationId == baseGen + fc
-        ws.physicalMaterializedLogicalCount := ok ? n : 0
+        engine.nextCoreId       := baseId + fc
+        engine.nextGenerationId := baseGen + fc
+        ws.physicalMaterializedLogicalCount := n
     ok ? n : -1
 touchMarkAppendRaw(ZoneEngine engine, int coreSlot, int baseSeq, int touchTime, int side, float contactBottom, float contactTop, float closeAtTouch, int generationId, bool isNormalTouch) =>
     int capacity      = engine.touchMarkCapacityPerCore
