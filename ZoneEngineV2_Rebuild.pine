@@ -646,6 +646,11 @@ export type W02AuxStore
     int   fvgInversePendingCount                          = 0
     array<int>   fvgInverseConfirmRootIds
     int   fvgInverseConfirmCount                          = 0
+    // W08 B02: Core identity interval index (live physical Cores ordered by bottomTick ASC, topTick ASC, coreId ASC)
+    array<int>   coreIntervalOrderCoreSlots
+    array<int>   coreIntervalOrderExpectedCoreIds
+    array<int>   coreIntervalOrderBottomTicks
+    array<int>   coreIntervalOrderTopTicks
 const int JGROUP_E1 = 1   // FVG structural invalidation
 const int JGROUP_E2 = 2   // NEW_ROOT
 const int JGROUP_E3 = 3   // Root update
@@ -1401,6 +1406,10 @@ export newEngine(ZoneCfg cfg) =>
     aux.fvgInversePendingCount                 := 0
     aux.fvgInverseConfirmRootIds               := array.new_int(0)
     aux.fvgInverseConfirmCount                 := 0
+    aux.coreIntervalOrderCoreSlots             := array.new_int(0)
+    aux.coreIntervalOrderExpectedCoreIds       := array.new_int(0)
+    aux.coreIntervalOrderBottomTicks           := array.new_int(0)
+    aux.coreIntervalOrderTopTicks              := array.new_int(0)
     e.w02Aux := aux
     W03SourceRootStore w03 = W03SourceRootStore.new()
     w03.journalOps              := array.new_int(0)
@@ -6781,6 +6790,202 @@ coreOriginRootIdsAscRaw(ZoneEngine engine, int coreSlot, array<int> outRootIds) 
         else
             array.clear(outRootIds)
     result
+// W08 B02: Core identity interval index. One entry per live physical Core (no state / Phase / Side filter), key =
+// (bottomTick ASC, topTick ASC, coreId ASC) with ticks = round(corePhysical price / mintick). Physical order only: it
+// never decides Identity (the gap <= M query and the Identity predicate belong to later Batches). Every call validates
+// the whole index (live slot, coreIds[slot] == expectedCoreId, strict key order, at most one entry for the target)
+// before any write; a failed check returns ok = false with no mutation. No cap, no array.remove(0) / unshift.
+coreIntervalIndexInsertRaw(ZoneEngine engine, int coreSlot, int expectedCoreId, float mintick) =>
+    W02AuxStore aux = engine.w02Aux
+    bool ok      = false
+    bool changed = false
+    bool slotOk  = coreSlot >= 0 and coreSlot < array.size(engine.coreIds) and coreSlot < array.size(engine.coreSlotLiveFlags) and coreSlot < array.size(engine.corePhysicalBottoms) and coreSlot < array.size(engine.corePhysicalTops)
+    if slotOk and expectedCoreId != ID_NONE and not na(mintick) and mintick > 0
+        float bottom = array.get(engine.corePhysicalBottoms, coreSlot)
+        float top    = array.get(engine.corePhysicalTops,    coreSlot)
+        if array.get(engine.coreSlotLiveFlags, coreSlot) and array.get(engine.coreIds, coreSlot) == expectedCoreId and not na(bottom) and not na(top) and bottom <= top
+            int  newBottomTick = int(math.round(bottom / mintick))
+            int  newTopTick    = int(math.round(top    / mintick))
+            int  orderSize     = array.size(aux.coreIntervalOrderCoreSlots)
+            bool indexOk       = newBottomTick <= newTopTick
+            int  foundCount    = 0
+            bool sameRange     = false
+            int  insertPos     = orderSize
+            int  prevB         = int(na)
+            int  prevT         = int(na)
+            int  prevId        = ID_NONE
+            int  i             = 0
+            while indexOk and i < orderSize
+                int  eSlot = array.get(aux.coreIntervalOrderCoreSlots,       i)
+                int  eId   = array.get(aux.coreIntervalOrderExpectedCoreIds, i)
+                int  eB    = array.get(aux.coreIntervalOrderBottomTicks,     i)
+                int  eT    = array.get(aux.coreIntervalOrderTopTicks,        i)
+                bool entryOk = eSlot >= 0 and eSlot < array.size(engine.coreIds) and eSlot < array.size(engine.coreSlotLiveFlags) and eId != ID_NONE and not na(eB) and not na(eT) and eB <= eT
+                if entryOk
+                    entryOk := array.get(engine.coreSlotLiveFlags, eSlot) and array.get(engine.coreIds, eSlot) == eId
+                if entryOk and i > 0
+                    entryOk := prevB < eB or (prevB == eB and (prevT < eT or (prevT == eT and prevId < eId)))
+                if not entryOk
+                    indexOk := false
+                else
+                    if eSlot == coreSlot
+                        foundCount += 1
+                        sameRange  := eB == newBottomTick and eT == newTopTick
+                    if insertPos == orderSize and (newBottomTick < eB or (newBottomTick == eB and (newTopTick < eT or (newTopTick == eT and expectedCoreId < eId))))
+                        insertPos := i
+                    prevB  := eB
+                    prevT  := eT
+                    prevId := eId
+                    i      += 1
+            if indexOk and foundCount == 0
+                ok := true
+                array.push(aux.coreIntervalOrderCoreSlots,       coreSlot)
+                array.push(aux.coreIntervalOrderExpectedCoreIds, expectedCoreId)
+                array.push(aux.coreIntervalOrderBottomTicks,     newBottomTick)
+                array.push(aux.coreIntervalOrderTopTicks,        newTopTick)
+                int j = orderSize
+                while j > insertPos
+                    array.set(aux.coreIntervalOrderCoreSlots,       j, array.get(aux.coreIntervalOrderCoreSlots,       j - 1))
+                    array.set(aux.coreIntervalOrderExpectedCoreIds, j, array.get(aux.coreIntervalOrderExpectedCoreIds, j - 1))
+                    array.set(aux.coreIntervalOrderBottomTicks,     j, array.get(aux.coreIntervalOrderBottomTicks,     j - 1))
+                    array.set(aux.coreIntervalOrderTopTicks,        j, array.get(aux.coreIntervalOrderTopTicks,        j - 1))
+                    j -= 1
+                array.set(aux.coreIntervalOrderCoreSlots,       insertPos, coreSlot)
+                array.set(aux.coreIntervalOrderExpectedCoreIds, insertPos, expectedCoreId)
+                array.set(aux.coreIntervalOrderBottomTicks,     insertPos, newBottomTick)
+                array.set(aux.coreIntervalOrderTopTicks,        insertPos, newTopTick)
+                changed := true
+            else if indexOk and foundCount == 1 and sameRange
+                ok := true
+    [ok, changed]
+coreIntervalIndexDetachRaw(ZoneEngine engine, int coreSlot, int expectedCoreId) =>
+    W02AuxStore aux = engine.w02Aux
+    bool ok      = false
+    bool changed = false
+    if coreSlot >= 0 and expectedCoreId != ID_NONE
+        int  orderSize  = array.size(aux.coreIntervalOrderCoreSlots)
+        bool indexOk    = true
+        int  foundCount = 0
+        int  targetPos  = SLOT_INVALID
+        int  prevB      = int(na)
+        int  prevT      = int(na)
+        int  prevId     = ID_NONE
+        int  i          = 0
+        while indexOk and i < orderSize
+            int  eSlot = array.get(aux.coreIntervalOrderCoreSlots,       i)
+            int  eId   = array.get(aux.coreIntervalOrderExpectedCoreIds, i)
+            int  eB    = array.get(aux.coreIntervalOrderBottomTicks,     i)
+            int  eT    = array.get(aux.coreIntervalOrderTopTicks,        i)
+            bool entryOk = eSlot >= 0 and eSlot < array.size(engine.coreIds) and eSlot < array.size(engine.coreSlotLiveFlags) and eId != ID_NONE and not na(eB) and not na(eT) and eB <= eT
+            if entryOk
+                entryOk := array.get(engine.coreSlotLiveFlags, eSlot) and array.get(engine.coreIds, eSlot) == eId
+            if entryOk and i > 0
+                entryOk := prevB < eB or (prevB == eB and (prevT < eT or (prevT == eT and prevId < eId)))
+            if not entryOk
+                indexOk := false
+            else
+                if eSlot == coreSlot and eId == expectedCoreId
+                    foundCount += 1
+                    targetPos  := i
+                prevB  := eB
+                prevT  := eT
+                prevId := eId
+                i      += 1
+        if indexOk and foundCount <= 1
+            ok := true
+            if foundCount == 1
+                int j = targetPos
+                while j < orderSize - 1
+                    array.set(aux.coreIntervalOrderCoreSlots,       j, array.get(aux.coreIntervalOrderCoreSlots,       j + 1))
+                    array.set(aux.coreIntervalOrderExpectedCoreIds, j, array.get(aux.coreIntervalOrderExpectedCoreIds, j + 1))
+                    array.set(aux.coreIntervalOrderBottomTicks,     j, array.get(aux.coreIntervalOrderBottomTicks,     j + 1))
+                    array.set(aux.coreIntervalOrderTopTicks,        j, array.get(aux.coreIntervalOrderTopTicks,        j + 1))
+                    j += 1
+                array.pop(aux.coreIntervalOrderCoreSlots)
+                array.pop(aux.coreIntervalOrderExpectedCoreIds)
+                array.pop(aux.coreIntervalOrderBottomTicks)
+                array.pop(aux.coreIntervalOrderTopTicks)
+                changed := true
+    [ok, changed]
+// Writes the new physical range of an indexed Core and re-seats its entry atomically. The old entry must exist and match
+// the current range ticks (no silent new duplicate). Identical range = no-op. coreRangeRevision moves only when the stored
+// range actually changes; the entry is re-seated only when its ticks change. Range decision logic stays with the caller.
+coreIntervalIndexMoveRaw(ZoneEngine engine, int coreSlot, int expectedCoreId, float newBottom, float newTop, float mintick) =>
+    W02AuxStore aux = engine.w02Aux
+    bool ok      = false
+    bool changed = false
+    bool slotOk  = coreSlot >= 0 and coreSlot < array.size(engine.coreIds) and coreSlot < array.size(engine.coreSlotLiveFlags) and coreSlot < array.size(engine.corePhysicalBottoms) and coreSlot < array.size(engine.corePhysicalTops)
+    if slotOk and expectedCoreId != ID_NONE and not na(mintick) and mintick > 0 and not na(newBottom) and not na(newTop) and newBottom <= newTop
+        float oldBottom = array.get(engine.corePhysicalBottoms, coreSlot)
+        float oldTop    = array.get(engine.corePhysicalTops,    coreSlot)
+        if array.get(engine.coreSlotLiveFlags, coreSlot) and array.get(engine.coreIds, coreSlot) == expectedCoreId and not na(oldBottom) and not na(oldTop)
+            int  oldBottomTick = int(math.round(oldBottom / mintick))
+            int  oldTopTick    = int(math.round(oldTop    / mintick))
+            int  newBottomTick = int(math.round(newBottom / mintick))
+            int  newTopTick    = int(math.round(newTop    / mintick))
+            int  orderSize     = array.size(aux.coreIntervalOrderCoreSlots)
+            bool indexOk       = newBottomTick <= newTopTick
+            int  foundCount    = 0
+            int  oldPos        = SLOT_INVALID
+            int  lessCount     = 0
+            int  prevB         = int(na)
+            int  prevT         = int(na)
+            int  prevId        = ID_NONE
+            int  i             = 0
+            while indexOk and i < orderSize
+                int  eSlot = array.get(aux.coreIntervalOrderCoreSlots,       i)
+                int  eId   = array.get(aux.coreIntervalOrderExpectedCoreIds, i)
+                int  eB    = array.get(aux.coreIntervalOrderBottomTicks,     i)
+                int  eT    = array.get(aux.coreIntervalOrderTopTicks,        i)
+                bool entryOk = eSlot >= 0 and eSlot < array.size(engine.coreIds) and eSlot < array.size(engine.coreSlotLiveFlags) and eId != ID_NONE and not na(eB) and not na(eT) and eB <= eT
+                if entryOk
+                    entryOk := array.get(engine.coreSlotLiveFlags, eSlot) and array.get(engine.coreIds, eSlot) == eId
+                if entryOk and i > 0
+                    entryOk := prevB < eB or (prevB == eB and (prevT < eT or (prevT == eT and prevId < eId)))
+                if not entryOk
+                    indexOk := false
+                else
+                    if eSlot == coreSlot
+                        foundCount += 1
+                        oldPos     := i
+                        if eB != oldBottomTick or eT != oldTopTick
+                            indexOk := false
+                    else if eB < newBottomTick or (eB == newBottomTick and (eT < newTopTick or (eT == newTopTick and eId < expectedCoreId)))
+                        lessCount += 1
+                    prevB  := eB
+                    prevT  := eT
+                    prevId := eId
+                    i      += 1
+            if indexOk and foundCount == 1
+                ok := true
+                if newBottom != oldBottom or newTop != oldTop
+                    int targetPos = lessCount
+                    if newBottomTick != oldBottomTick or newTopTick != oldTopTick
+                        if targetPos > oldPos
+                            int j = oldPos
+                            while j < targetPos
+                                array.set(aux.coreIntervalOrderCoreSlots,       j, array.get(aux.coreIntervalOrderCoreSlots,       j + 1))
+                                array.set(aux.coreIntervalOrderExpectedCoreIds, j, array.get(aux.coreIntervalOrderExpectedCoreIds, j + 1))
+                                array.set(aux.coreIntervalOrderBottomTicks,     j, array.get(aux.coreIntervalOrderBottomTicks,     j + 1))
+                                array.set(aux.coreIntervalOrderTopTicks,        j, array.get(aux.coreIntervalOrderTopTicks,        j + 1))
+                                j += 1
+                        else if targetPos < oldPos
+                            int j = oldPos
+                            while j > targetPos
+                                array.set(aux.coreIntervalOrderCoreSlots,       j, array.get(aux.coreIntervalOrderCoreSlots,       j - 1))
+                                array.set(aux.coreIntervalOrderExpectedCoreIds, j, array.get(aux.coreIntervalOrderExpectedCoreIds, j - 1))
+                                array.set(aux.coreIntervalOrderBottomTicks,     j, array.get(aux.coreIntervalOrderBottomTicks,     j - 1))
+                                array.set(aux.coreIntervalOrderTopTicks,        j, array.get(aux.coreIntervalOrderTopTicks,        j - 1))
+                                j -= 1
+                        array.set(aux.coreIntervalOrderCoreSlots,       targetPos, coreSlot)
+                        array.set(aux.coreIntervalOrderExpectedCoreIds, targetPos, expectedCoreId)
+                        array.set(aux.coreIntervalOrderBottomTicks,     targetPos, newBottomTick)
+                        array.set(aux.coreIntervalOrderTopTicks,        targetPos, newTopTick)
+                    array.set(engine.corePhysicalBottoms, coreSlot, newBottom)
+                    array.set(engine.corePhysicalTops,    coreSlot, newTop)
+                    engine.coreRangeRevision := engine.coreRangeRevision + 1
+                    changed := true
+    [ok, changed]
 touchMarkAppendRaw(ZoneEngine engine, int coreSlot, int baseSeq, int touchTime, int side, float contactBottom, float contactTop, float closeAtTouch, int generationId, bool isNormalTouch) =>
     int capacity      = engine.touchMarkCapacityPerCore
     int physicalIndex = SLOT_INVALID
