@@ -74,6 +74,12 @@
 // rank (bottomTick, topTick, minRootId, complete Root set lexicographic ASC; only Candidates with an edge are ranked).
 // physicalIdentityMatches holds the canonical maximum continuation matching (same layout and order). The full edge set
 // is kept for Merge / Split; the matching only decides ID continuation. Degree-0 Candidates have no row here.
+//
+// B07-C: ownership plan, one row per physical Candidate (lockstep with the physical storage). Kind 0 = continuation (the
+// Candidate holds a selected continuation match: old coreSlot / coreId / generationId to inherit, fresh rank -1), kind 1
+// = fresh (slot -1, IDs 0, fresh rank 0 .. freshCount - 1 in fresh allocation order: the new canonical order, then the
+// Support and the Resistance winner provenance: presence, Stage, bottom / top tick, minRootId, Root set lexicographic,
+// FVG mode, Psych presence, Psych tick). No ID, generation, counter or createdTime is written here.
 // ============================================================
 library("ZoneEngineV2_W08Core_Worker", overlay = false)
 
@@ -116,6 +122,12 @@ export type W08Store
     array<int>   physicalIdentityMatches
     int          physicalIdentityEdgeCount = 0
     int          physicalIdentityMatchCount = 0
+    array<int>   physicalOwnershipKinds
+    array<int>   physicalContinuationOldCoreSlots
+    array<int>   physicalContinuationCoreIds
+    array<int>   physicalContinuationGenerationIds
+    array<int>   physicalFreshAllocationRanks
+    int          physicalFreshAllocationCount = 0
 
 export newStore() =>
     W08Store s = W08Store.new()
@@ -148,6 +160,11 @@ export newStore() =>
     s.physicalCandidateRootIds                    := array.new_int(0)
     s.physicalIdentityEdges                       := array.new_int(0)
     s.physicalIdentityMatches                     := array.new_int(0)
+    s.physicalOwnershipKinds                      := array.new_int(0)
+    s.physicalContinuationOldCoreSlots            := array.new_int(0)
+    s.physicalContinuationCoreIds                 := array.new_int(0)
+    s.physicalContinuationGenerationIds           := array.new_int(0)
+    s.physicalFreshAllocationRanks                := array.new_int(0)
     s
 
 // currentCoreId = the Core ID of a live Core at coreSlot, ID_NONE when the slot is out of
@@ -1239,3 +1256,112 @@ export identityPlanBuild(W08Store store, int physicalCount, array<int> rawEdges)
     store.physicalIdentityEdgeCount  := ok ? int(array.size(store.physicalIdentityEdges) / 3) : 0
     store.physicalIdentityMatchCount := ok ? result : 0
     ok ? result : -1
+
+// Side provenance order of two winners (-1 = the Side is absent): presence, Stage, effective bottom / top tick,
+// minRootId, complete rootId ASC Root set lexicographic (shorter first on a common prefix), FVG mode, Psych presence,
+// Psych tick. -1 / 1, or 0 on a complete tie.
+winnerProvenanceCompareRaw(int v, int w, array<int> stages, array<int> bottomTicks, array<int> topTicks, array<int> minRootIds, array<int> fvgModes, array<int> psychLevelTicks, array<int> rootIdOffsets, array<int> rootIdLengths, array<int> rootIds) =>
+    int c = (v >= 0 ? 1 : 0) - (w >= 0 ? 1 : 0)
+    if c == 0 and v >= 0
+        int pv = array.get(psychLevelTicks, v)
+        int pw = array.get(psychLevelTicks, w)
+        int k  = 0
+        while c == 0 and k < 7
+            int x = k == 0 ? array.get(stages, v) : k == 1 ? array.get(bottomTicks, v) : k == 2 ? array.get(topTicks, v) : k == 3 ? array.get(minRootIds, v) : k == 4 ? array.get(fvgModes, v) : k == 5 ? (na(pv) ? 0 : 1) : (na(pv) ? 0 : pv)
+            int y = k == 0 ? array.get(stages, w) : k == 1 ? array.get(bottomTicks, w) : k == 2 ? array.get(topTicks, w) : k == 3 ? array.get(minRootIds, w) : k == 4 ? array.get(fvgModes, w) : k == 5 ? (na(pw) ? 0 : 1) : (na(pw) ? 0 : pw)
+            c := x - y
+            // the Root set is compared right after minRootId (key 4 of the descriptor)
+            if c == 0 and k == 3
+                int a    = array.get(rootIdOffsets, v)
+                int b    = array.get(rootIdOffsets, w)
+                int aEnd = a + array.get(rootIdLengths, v)
+                int bEnd = b + array.get(rootIdLengths, w)
+                while c == 0 and a < aEnd and b < bEnd
+                    c := array.get(rootIds, a) - array.get(rootIds, b)
+                    a += 1
+                    b += 1
+                if c == 0
+                    c := (aEnd - a) - (bEnd - b)
+            k += 1
+    c > 0 ? 1 : c < 0 ? -1 : 0
+
+// Builds the ownership plan of the current physical Candidates from physicalIdentityMatches (identityMatchCount must
+// equal this pass's physicalIdentityMatchCount) and returns the fresh count. Every selected match must name a live old
+// Core with coreIds[slot] == coreId >= 1 and generationId >= 1, each physical Candidate and each old Core at most once.
+// Fresh Candidates are ranked by physicalNewCompareRaw, then Support and Resistance winnerProvenanceCompareRaw; a
+// complete tie fails (no index or storage fallback). -1 with empty ownership storage on any fault.
+export ownershipPlanBuild(W08Store store, int identityMatchCount, array<bool> coreLive, array<int> coreIds, array<int> coreGenerationIds, array<int> candidateWinnerStages, array<int> candidateWinnerEffectiveBottomTicks, array<int> candidateWinnerEffectiveTopTicks, array<int> candidateWinnerMinRootIds, array<int> candidateWinnerFvgModes, array<int> candidateWinnerPsychLevelTicks, array<int> candidateWinnerRootIdOffsets, array<int> candidateWinnerRootIdLengths, array<int> candidateWinnerRootIds, int candidateWinnerRootIdLength) =>
+    array.clear(store.physicalOwnershipKinds)
+    array.clear(store.physicalContinuationOldCoreSlots)
+    array.clear(store.physicalContinuationCoreIds)
+    array.clear(store.physicalContinuationGenerationIds)
+    array.clear(store.physicalFreshAllocationRanks)
+    int  n  = store.physicalCandidateLogicalCount
+    bool ok = identityMatchCount >= 0 and identityMatchCount == store.physicalIdentityMatchCount and array.size(store.physicalIdentityMatches) == 3 * identityMatchCount and candidateWinnerRootIdLength <= array.size(candidateWinnerRootIds)
+    int k = 0
+    while ok and k < n
+        array.push(store.physicalOwnershipKinds, 1)
+        array.push(store.physicalContinuationOldCoreSlots, -1)
+        array.push(store.physicalContinuationCoreIds, 0)
+        array.push(store.physicalContinuationGenerationIds, 0)
+        array.push(store.physicalFreshAllocationRanks, -1)
+        // every present Side winner must hold a valid Root slice (read by the provenance order)
+        int side = 0
+        while ok and side < 2
+            int w = side == 0 ? array.get(store.physicalCandidateSupportWinnerIndexes, k) : array.get(store.physicalCandidateResistanceWinnerIndexes, k)
+            if w >= 0
+                ok := w < array.size(candidateWinnerStages) and w < array.size(candidateWinnerEffectiveBottomTicks) and w < array.size(candidateWinnerEffectiveTopTicks) and w < array.size(candidateWinnerMinRootIds) and w < array.size(candidateWinnerFvgModes) and w < array.size(candidateWinnerPsychLevelTicks) and w < array.size(candidateWinnerRootIdOffsets) and w < array.size(candidateWinnerRootIdLengths)
+                if ok
+                    ok := array.get(candidateWinnerRootIdOffsets, w) >= 0 and array.get(candidateWinnerRootIdLengths, w) >= 0 and array.get(candidateWinnerRootIdOffsets, w) + array.get(candidateWinnerRootIdLengths, w) <= candidateWinnerRootIdLength
+            side += 1
+        k += 1
+    map<int, bool> usedOld = map.new<int, bool>()
+    k := 0
+    while ok and k < identityMatchCount
+        int p    = array.get(store.physicalIdentityMatches, 3 * k)
+        int slot = array.get(store.physicalIdentityMatches, 3 * k + 1)
+        int id   = array.get(store.physicalIdentityMatches, 3 * k + 2)
+        ok := p >= 0 and p < n and slot >= 0 and slot < array.size(coreLive) and slot < array.size(coreIds) and slot < array.size(coreGenerationIds) and id >= 1 and not map.contains(usedOld, id)
+        if ok
+            ok := array.get(store.physicalOwnershipKinds, p) == 1 and array.get(coreLive, slot) and array.get(coreIds, slot) == id and array.get(coreGenerationIds, slot) >= 1
+        if ok
+            map.put(usedOld, id, true)
+            array.set(store.physicalOwnershipKinds, p, 0)
+            array.set(store.physicalContinuationOldCoreSlots, p, slot)
+            array.set(store.physicalContinuationCoreIds, p, id)
+            array.set(store.physicalContinuationGenerationIds, p, array.get(coreGenerationIds, slot))
+        k += 1
+    // fresh allocation order (insertion into a sorted list)
+    array<int> fresh = array.new_int(0)
+    k := 0
+    while ok and k < n
+        if array.get(store.physicalOwnershipKinds, k) == 1
+            int pos = 0
+            int c   = 1
+            while ok and c > 0 and pos < array.size(fresh)
+                int q = array.get(fresh, pos)
+                c := physicalNewCompareRaw(store, k, q)
+                int side = 0
+                while c == 0 and side < 2
+                    int v = side == 0 ? array.get(store.physicalCandidateSupportWinnerIndexes, k) : array.get(store.physicalCandidateResistanceWinnerIndexes, k)
+                    int w = side == 0 ? array.get(store.physicalCandidateSupportWinnerIndexes, q) : array.get(store.physicalCandidateResistanceWinnerIndexes, q)
+                    c := winnerProvenanceCompareRaw(v, w, candidateWinnerStages, candidateWinnerEffectiveBottomTicks, candidateWinnerEffectiveTopTicks, candidateWinnerMinRootIds, candidateWinnerFvgModes, candidateWinnerPsychLevelTicks, candidateWinnerRootIdOffsets, candidateWinnerRootIdLengths, candidateWinnerRootIds)
+                    side += 1
+                ok := c != 0
+                if c > 0
+                    pos += 1
+            if ok
+                array.insert(fresh, pos, k)
+        k += 1
+    k := 0
+    while ok and k < array.size(fresh)
+        array.set(store.physicalFreshAllocationRanks, array.get(fresh, k), k)
+        k += 1
+    if not ok
+        array.clear(store.physicalOwnershipKinds)
+        array.clear(store.physicalContinuationOldCoreSlots)
+        array.clear(store.physicalContinuationCoreIds)
+        array.clear(store.physicalContinuationGenerationIds)
+        array.clear(store.physicalFreshAllocationRanks)
+    store.physicalFreshAllocationCount := ok ? array.size(fresh) : 0
+    ok ? array.size(fresh) : -1
