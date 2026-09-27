@@ -1,0 +1,458 @@
+//@version=6
+// ============================================================
+// ZoneEngineV2_W08DependencyCarryHarness - W08 B15 W06 dependency carry TradingView probe
+//
+// Scratch fixtures only (no Main library, no production storage, no market logic); every PASS authority is a published
+// export: W08Runtime /4 runShadow / planPass / preflightPass / commitPass (pass.dependencyChangedRootIds),
+// dependencyCarryInject, dependencyCarryMerge, and W06 /19 buildComponents. The harness only builds fixture state and
+// compares outputs. Tests (first bar):
+//   A L7_PARTICIPANT_ZERO_PASS   Core K [100, 120] allocated from winner {1}, its only participation edge detached
+//                                (participant 0, the Main Root-retire detach as fixture), then freed by a real F0 / commit
+//                                (the free set is a fixture input: production derives it from a Merge relation) ->
+//                                carry exactly [1, 2, 5] (old L7 neighborhood [90, 130]); the alloc pass carry too
+//   B L7_BOUNDARY_PASS           PCs at 89 / 90 / 130 / 131 around K [100, 120] (mTick 10): 90 and 130 in, 89 and 131 out,
+//                                for the new range (alloc) and the old range (free)
+//   C MASK0_SEMANTIC_ROOT_PASS   carry [1, 2, 5] into empty seeds: [1, 2, 5] / masks 0, a second inject adds nothing, and
+//                                W06 /19 reports no semantic changed Root for them
+//   D DEPENDENCY_COMPONENT_REBUILD_PASS  W06 baseline C_old {1, 2, 5} (L7 through K), K freed, mask-0 seeds 1 / 2 / 5 ->
+//                                local rebuild {1} + {2, 5} equal to a full W06 rebuild of the same live state; both
+//                                rebuilt components reported as semantic changed current components
+//   E CARRY_MERGE_PASS           [1, 5, 9] + [2, 5, 8] -> [1, 2, 5, 8, 9]
+//   F CARRY_RETRY_PASS           a W06 build failure (capacity below the Root count) keeps the carry; the retry re-injects
+//                                the same seeds and succeeds; only then the clear condition holds
+//   G SEED_MASK_OR_PASS          semantic seed 2 (mask 4) + carry [1, 2, 5]: one row for 2 keeping mask 4; W06 semantic Roots = [2]
+//   H DEPENDENCY_NOOP_PASS       empty merge / inject write nothing; an unchanged continuation pass commits with carry []
+// DEPENDENCY_PROBE_PASS = 1 only when all 8 pass (each result is also plotted, data window).
+// ============================================================
+indicator("ZoneEngineV2_W08DependencyCarryHarness", overlay = false)
+
+import sekine3310/ZoneEngineV2_W06Component_Worker/19 as W06Comp
+import sekine3310/ZoneEngineV2_W08Core_Worker/16 as W08Core
+import sekine3310/ZoneEngineV2_W08Touch_Worker/3 as W08Touch
+import sekine3310/ZoneEngineV2_W08Runtime_Worker/4 as W08Runtime
+
+const int SLOT_INVALID = -1
+const int CAT_SWING    = 1
+const int ROOT_ACTIVE  = 1
+const int KIND_LOCAL   = 1
+const int ROLE_MEMBER  = 1
+
+// ---- W06 fixture: Roots 1 @ 100, 2 @ 120, 5 @ 128 (Swing, ACTIVE), Core K (id 11) live [100.0, 120.0], no participation,
+// no pending ----
+type Fx
+    array<int> rootPriceOrderSlots
+    array<int> categoryFvgRootSlots
+    array<int> rootIds
+    array<bool> rootSlotLiveFlags
+    array<int> rootCategories
+    array<int> rootStates
+    array<int> rootDirections
+    array<int> rootPointTicks
+    array<int> rootNativeBottomTicks
+    array<int> rootNativeTopTicks
+    array<bool> rootIsBroadFvgFlags
+    array<int> rootSubtypes
+    array<int> rootPairKeys
+    array<int> rootOriginKeys
+    map<int, int> rootIdToSlot
+    map<int, int> accumPairUpperRootSlotByKey
+    map<int, int> accumPairLowerRootSlotByKey
+    map<int, int> originKeyBucketHeadRootSlots
+    array<int> rootOriginBucketNextRootSlots
+    array<int> rootOriginBucketExpectedRootIds
+    array<int> rootParticipationHeadEdgeIndexes
+    array<int> rootParticipationCounts
+    array<int> participationEdgeRootSlots
+    array<int> participationEdgeExpectedRootIds
+    array<int> participationEdgeSideSlots
+    array<int> participationEdgeExpectedCoreIds
+    array<int> participationEdgeNextByRootIndexes
+    array<bool> participationEdgeLiveFlags
+    array<int> sidePhases
+    array<int> coreIds
+    array<int> coreGenerationIds
+    array<bool> coreSlotLiveFlags
+    array<int> coreLiveSlots
+    array<float> corePhysicalBottoms
+    array<float> corePhysicalTops
+    array<int> corePendingTopologyChildHeadIndexes
+    array<int> corePendingTopologyChildCounts
+    array<int> pendingTopologyChildNextIndexes
+    array<int> pendingTopologyChildOwnerCoreSlots
+    array<int> pendingTopologyChildExpectedCoreIds
+    array<int> pendingTopologyChildExpectedGenerationIds
+    array<int> pendingTopologyChildRootHeadNodeIndexes
+    array<int> pendingTopologyChildRootCounts
+    array<bool> pendingTopologyChildLiveFlags
+    array<int> pendingTopologyRootNodeRootIds
+    array<int> pendingTopologyRootNodeNextIndexes
+    array<int> pendingTopologyRootNodeOwnerChildIndexes
+    array<int> pendingTopologyRootNodeExpectedCoreIds
+    array<int> pendingTopologyRootNodeExpectedGenerationIds
+    array<bool> pendingTopologyRootNodeLiveFlags
+    array<int> rootIdOrderSlots
+    array<int> rootCandGeometryRevisions
+    array<int> rootCandQualityRevisions
+    array<int> rootCandTieBreakRevisions
+    array<int> rootCandStateRevisions
+
+type CompStore
+    array<int> rootCandComponentIds
+    array<int> rootCandComponentExpectedRootIds
+    array<int> candVisitedEpochByRootSlot
+    array<int> candQueueRootSlots
+    array<int> candComponentIds
+    array<int> candComponentKinds
+    array<int> candComponentMemberOffsets
+    array<int> candComponentMemberLengths
+    array<int> candComponentCfgRevisions
+    array<int> candComponentStageKeys
+    array<int> candComponentUsedEpochKeys
+    array<int> candComponentSupportStatuses
+    array<int> candComponentResistanceStatuses
+    array<int> candComponentSupportRecordOffsets
+    array<int> candComponentSupportRecordLengths
+    array<int> candComponentResistanceRecordOffsets
+    array<int> candComponentResistanceRecordLengths
+    array<int> candComponentSupportSeenOffsets
+    array<int> candComponentSupportSeenLengths
+    array<int> candComponentResistanceSeenOffsets
+    array<int> candComponentResistanceSeenLengths
+    array<int> candMemberRootIds
+    array<int> candMemberRoleFlags
+    array<int> candMemberSideMasks
+    array<int> candMemberGeometryRevisions
+    array<int> candMemberQualityRevisions
+    array<int> candMemberTieBreakRevisions
+    array<int> candMemberStateRevisions
+    array<int> candRecordInts
+    array<float> candRecordReferencePrices
+    array<float> candRecordExactPrices
+    array<int> candRecordRootIds
+    array<int> candSeenBroadRootIds
+    array<int> candAffectedComponentIds
+    array<int> candRemovedComponentIds
+    array<int> candSemanticChangedRootIds
+    array<int> candSemanticChangedCurrentComponentIds
+    array<bool> candChangedScopeFull
+    bool cacheValid       = false
+    int  cacheCfgRevision = 0
+    int  nextComponentId  = 1
+    int  visitEpoch       = 0
+    int  lastCode         = -1
+
+newFx() =>
+    map<int, int> idToSlot = map.new<int, int>()
+    map.put(idToSlot, 1, 0)
+    map.put(idToSlot, 2, 1)
+    map.put(idToSlot, 5, 2)
+    Fx.new(
+         rootPriceOrderSlots = array.from(0, 1, 2),
+         categoryFvgRootSlots = array.new_int(0),
+         rootIds = array.from(1, 2, 5),
+         rootSlotLiveFlags = array.new_bool(3, true),
+         rootCategories = array.new_int(3, CAT_SWING),
+         rootStates = array.new_int(3, ROOT_ACTIVE),
+         rootDirections = array.new_int(3, 0),
+         rootPointTicks = array.from(100, 120, 128),
+         rootNativeBottomTicks = array.new_int(3, int(na)),
+         rootNativeTopTicks = array.new_int(3, int(na)),
+         rootIsBroadFvgFlags = array.new_bool(3, false),
+         rootSubtypes = array.new_int(3, 0),
+         rootPairKeys = array.new_int(3, 0),
+         rootOriginKeys = array.new_int(3, 0),
+         rootIdToSlot = idToSlot,
+         accumPairUpperRootSlotByKey = map.new<int, int>(),
+         accumPairLowerRootSlotByKey = map.new<int, int>(),
+         originKeyBucketHeadRootSlots = map.new<int, int>(),
+         rootOriginBucketNextRootSlots = array.new_int(3, SLOT_INVALID),
+         rootOriginBucketExpectedRootIds = array.new_int(3, 0),
+         rootParticipationHeadEdgeIndexes = array.new_int(3, SLOT_INVALID),
+         rootParticipationCounts = array.new_int(3, 0),
+         participationEdgeRootSlots = array.new_int(0),
+         participationEdgeExpectedRootIds = array.new_int(0),
+         participationEdgeSideSlots = array.new_int(0),
+         participationEdgeExpectedCoreIds = array.new_int(0),
+         participationEdgeNextByRootIndexes = array.new_int(0),
+         participationEdgeLiveFlags = array.new_bool(0),
+         sidePhases = array.from(0, 0),
+         coreIds = array.from(11),
+         coreGenerationIds = array.from(1),
+         coreSlotLiveFlags = array.from(true),
+         coreLiveSlots = array.from(0),
+         corePhysicalBottoms = array.from(100.0),
+         corePhysicalTops = array.from(120.0),
+         corePendingTopologyChildHeadIndexes = array.from(SLOT_INVALID),
+         corePendingTopologyChildCounts = array.from(0),
+         pendingTopologyChildNextIndexes = array.new_int(0),
+         pendingTopologyChildOwnerCoreSlots = array.new_int(0),
+         pendingTopologyChildExpectedCoreIds = array.new_int(0),
+         pendingTopologyChildExpectedGenerationIds = array.new_int(0),
+         pendingTopologyChildRootHeadNodeIndexes = array.new_int(0),
+         pendingTopologyChildRootCounts = array.new_int(0),
+         pendingTopologyChildLiveFlags = array.new_bool(0),
+         pendingTopologyRootNodeRootIds = array.new_int(0),
+         pendingTopologyRootNodeNextIndexes = array.new_int(0),
+         pendingTopologyRootNodeOwnerChildIndexes = array.new_int(0),
+         pendingTopologyRootNodeExpectedCoreIds = array.new_int(0),
+         pendingTopologyRootNodeExpectedGenerationIds = array.new_int(0),
+         pendingTopologyRootNodeLiveFlags = array.new_bool(0),
+         rootIdOrderSlots = array.from(0, 1, 2),
+         rootCandGeometryRevisions = array.new_int(3, 0),
+         rootCandQualityRevisions = array.new_int(3, 0),
+         rootCandTieBreakRevisions = array.new_int(3, 0),
+         rootCandStateRevisions = array.new_int(3, 0))
+
+newComp() =>
+    CompStore.new(rootCandComponentIds = array.new_int(3, 0),
+         rootCandComponentExpectedRootIds = array.from(1, 2, 5),
+         candChangedScopeFull = array.new_bool(1, false),
+         candVisitedEpochByRootSlot = array.new_int(0),
+         candQueueRootSlots = array.new_int(0),
+         candComponentIds = array.new_int(0),
+         candComponentKinds = array.new_int(0),
+         candComponentMemberOffsets = array.new_int(0),
+         candComponentMemberLengths = array.new_int(0),
+         candComponentCfgRevisions = array.new_int(0),
+         candComponentStageKeys = array.new_int(0),
+         candComponentUsedEpochKeys = array.new_int(0),
+         candComponentSupportStatuses = array.new_int(0),
+         candComponentResistanceStatuses = array.new_int(0),
+         candComponentSupportRecordOffsets = array.new_int(0),
+         candComponentSupportRecordLengths = array.new_int(0),
+         candComponentResistanceRecordOffsets = array.new_int(0),
+         candComponentResistanceRecordLengths = array.new_int(0),
+         candComponentSupportSeenOffsets = array.new_int(0),
+         candComponentSupportSeenLengths = array.new_int(0),
+         candComponentResistanceSeenOffsets = array.new_int(0),
+         candComponentResistanceSeenLengths = array.new_int(0),
+         candMemberRootIds = array.new_int(0),
+         candMemberRoleFlags = array.new_int(0),
+         candMemberSideMasks = array.new_int(0),
+         candMemberGeometryRevisions = array.new_int(0),
+         candMemberQualityRevisions = array.new_int(0),
+         candMemberTieBreakRevisions = array.new_int(0),
+         candMemberStateRevisions = array.new_int(0),
+         candRecordInts = array.new_int(0),
+         candRecordReferencePrices = array.new_float(0),
+         candRecordExactPrices = array.new_float(0),
+         candRecordRootIds = array.new_int(0),
+         candSeenBroadRootIds = array.new_int(0),
+         candAffectedComponentIds = array.new_int(0),
+         candRemovedComponentIds = array.new_int(0),
+         candSemanticChangedRootIds = array.new_int(0),
+         candSemanticChangedCurrentComponentIds = array.new_int(0))
+
+w06Build(Fx f, CompStore c, array<int> seedIds, array<int> seedMasks, int seedCount, bool forceFull, int capacity) =>
+    [code, nid, cv, ccfg, ep, aff, rem] = W06Comp.buildComponents(1, c.cacheValid, c.cacheCfgRevision, c.nextComponentId, 10, 3, c.visitEpoch, 1.0, f.rootPriceOrderSlots, f.categoryFvgRootSlots, f.rootIds, f.rootSlotLiveFlags, f.rootCategories, f.rootStates, f.rootDirections, f.rootPointTicks, f.rootNativeBottomTicks, f.rootNativeTopTicks, f.rootIsBroadFvgFlags, f.rootSubtypes, f.rootPairKeys, f.rootOriginKeys, f.rootIdToSlot, f.accumPairUpperRootSlotByKey, f.accumPairLowerRootSlotByKey, f.originKeyBucketHeadRootSlots, f.rootOriginBucketNextRootSlots, f.rootOriginBucketExpectedRootIds, f.rootParticipationHeadEdgeIndexes, f.rootParticipationCounts, f.participationEdgeRootSlots, f.participationEdgeExpectedRootIds, f.participationEdgeSideSlots, f.participationEdgeExpectedCoreIds, f.participationEdgeNextByRootIndexes, f.participationEdgeLiveFlags, f.sidePhases, f.coreIds, f.coreGenerationIds, f.coreSlotLiveFlags, f.coreLiveSlots, f.corePhysicalBottoms, f.corePhysicalTops, f.corePendingTopologyChildHeadIndexes, f.corePendingTopologyChildCounts, f.pendingTopologyChildNextIndexes, f.pendingTopologyChildOwnerCoreSlots, f.pendingTopologyChildExpectedCoreIds, f.pendingTopologyChildExpectedGenerationIds, f.pendingTopologyChildRootHeadNodeIndexes, f.pendingTopologyChildRootCounts, f.pendingTopologyChildLiveFlags, f.pendingTopologyRootNodeRootIds, f.pendingTopologyRootNodeNextIndexes, f.pendingTopologyRootNodeOwnerChildIndexes, f.pendingTopologyRootNodeExpectedCoreIds, f.pendingTopologyRootNodeExpectedGenerationIds, f.pendingTopologyRootNodeLiveFlags, c.candVisitedEpochByRootSlot, c.candQueueRootSlots, seedIds, seedMasks, seedCount, f.rootIdOrderSlots, f.rootCandGeometryRevisions, f.rootCandQualityRevisions, f.rootCandTieBreakRevisions, f.rootCandStateRevisions, c.rootCandComponentIds, c.rootCandComponentExpectedRootIds, c.candComponentIds, c.candComponentKinds, c.candComponentMemberOffsets, c.candComponentMemberLengths, c.candComponentCfgRevisions, c.candComponentStageKeys, c.candComponentUsedEpochKeys, c.candComponentSupportStatuses, c.candComponentResistanceStatuses, c.candComponentSupportRecordOffsets, c.candComponentSupportRecordLengths, c.candComponentResistanceRecordOffsets, c.candComponentResistanceRecordLengths, c.candComponentSupportSeenOffsets, c.candComponentSupportSeenLengths, c.candComponentResistanceSeenOffsets, c.candComponentResistanceSeenLengths, c.candMemberRootIds, c.candMemberRoleFlags, c.candMemberSideMasks, c.candMemberGeometryRevisions, c.candMemberQualityRevisions, c.candMemberTieBreakRevisions, c.candMemberStateRevisions, c.candRecordInts, c.candRecordReferencePrices, c.candRecordExactPrices, c.candRecordRootIds, c.candSeenBroadRootIds, c.candAffectedComponentIds, c.candRemovedComponentIds, c.candSemanticChangedRootIds, c.candSemanticChangedCurrentComponentIds, c.candChangedScopeFull, forceFull, capacity)
+    c.lastCode         := code
+    c.nextComponentId  := nid
+    c.cacheValid       := cv
+    c.cacheCfgRevision := ccfg
+    c.visitEpoch       := ep
+    code
+
+// LOCAL component member sets of a W06 output ("a,b|c,d", rows sorted), read only
+compKey(CompStore c) =>
+    array<string> keys = array.new_string(0)
+    int r = 0
+    while r < array.size(c.candComponentIds)
+        if array.get(c.candComponentKinds, r) == KIND_LOCAL
+            array<string> parts = array.new_string(0)
+            int o = array.get(c.candComponentMemberOffsets, r)
+            int k = 0
+            while k < array.get(c.candComponentMemberLengths, r)
+                if array.get(c.candMemberRoleFlags, o + k) == ROLE_MEMBER
+                    array.push(parts, str.tostring(array.get(c.candMemberRootIds, o + k)))
+                k += 1
+            array.push(keys, array.join(parts, ","))
+        r += 1
+    array.sort(keys, order.ascending)
+    array.join(keys, "|")
+
+// every LOCAL row reported as a semantic changed current component, and nothing else
+semCompsAllLocal(CompStore c) =>
+    int localRows = 0
+    bool ok = true
+    int r = 0
+    while r < array.size(c.candComponentIds)
+        if array.get(c.candComponentKinds, r) == KIND_LOCAL
+            localRows += 1
+            ok := ok and array.includes(c.candSemanticChangedCurrentComponentIds, array.get(c.candComponentIds, r))
+        r += 1
+    ok and array.size(c.candSemanticChangedCurrentComponentIds) == localRows
+
+intsEq(array<int> a, array<int> b) =>
+    bool eq = array.size(a) == array.size(b)
+    int i = 0
+    while eq and i < array.size(a)
+        eq := array.get(a, i) == array.get(b, i)
+        i += 1
+    eq
+
+// W06 case: baseline (full) -> K freed (the committed W08 change) -> semantic seeds + carry [1, 2, 5] injected by W08Runtime
+// -> W06 build (capacity cap1) -> Main clear condition (injected and cache valid) -> on failure one retry with fresh seeds
+// -> full W06 reference of the same live state.
+w06Case(array<int> semIds, array<int> semMasks, int cap1) =>
+    Fx        f = newFx()
+    CompStore c = newComp()
+    int    code0 = w06Build(f, c, array.new_int(0), array.new_int(0), 0, true, 10000)
+    string base  = compKey(c)
+    array.set(f.coreSlotLiveFlags, 0, false)
+    array.clear(f.coreLiveSlots)
+    array<int> carry = array.from(1, 2, 5)
+    array<int> ids1   = array.copy(semIds)
+    array<int> masks1 = array.copy(semMasks)
+    int cnt1  = W08Runtime.dependencyCarryInject(carry, ids1, masks1, array.size(semIds))
+    int code1 = w06Build(f, c, ids1, masks1, cnt1, not c.cacheValid, cap1)
+    bool cv1  = c.cacheValid
+    string semRoots1 = array.join(c.candSemanticChangedRootIds, ",")
+    if array.size(carry) > 0 and c.cacheValid
+        array.clear(carry)
+    int carryAfter1 = array.size(carry)
+    int code2 = -1
+    string ids2Str   = ""
+    string masks2Str = ""
+    if not cv1
+        array<int> ids2   = array.copy(semIds)
+        array<int> masks2 = array.copy(semMasks)
+        int cnt2 = W08Runtime.dependencyCarryInject(carry, ids2, masks2, array.size(semIds))
+        ids2Str   := array.join(array.slice(ids2, 0, cnt2), ",")
+        masks2Str := array.join(array.slice(masks2, 0, cnt2), ",")
+        code2 := w06Build(f, c, ids2, masks2, cnt2, not c.cacheValid, 10000)
+        if array.size(carry) > 0 and c.cacheValid
+            array.clear(carry)
+    CompStore ref = newComp()
+    w06Build(f, ref, array.new_int(0), array.new_int(0), 0, true, 10000)
+    [code0, base, code1, cv1, carryAfter1, code2, ids2Str, masks2Str, array.size(carry), compKey(c), compKey(ref), array.join(c.candSemanticChangedRootIds, ","), semRoots1, semCompsAllLocal(c)]
+
+// ---- W08 fixture: Roots (ids ASC, Swing, ACTIVE) with ticks, one Support winner {1} [100, 120]; mintick 1, mTick 10 ----
+// mode 0: pass 1 alloc (runShadow) -> detach the only participation edge of Root 1 (participant 0) -> pass 2 no winner,
+//         real planPass, the free of K as fixture input, real preflightPass / commitPass
+// mode 1: pass 1 alloc -> pass 2 the same winner (continuation, nothing W06 reads changes)
+w08Scenario(array<int> ids, array<int> ticks, int mode) =>
+    int n = array.size(ids)
+    W08Core.W08Store ws = W08Core.newStore()
+    W08Core.CoreRegistryStore cr = ws.coreRegistry
+    cr.touchMarkCapacityPerCore := 4
+    map<int, int> idToSlot = map.new<int, int>()
+    for i = 0 to n - 1
+        map.put(idToSlot, array.get(ids, i), i)
+    W08Runtime.RootView rv = W08Runtime.RootView.new(rootIds = ids, rootSlotLiveFlags = array.new_bool(n, true), rootIdToSlot = idToSlot, rootCategories = array.new_int(n, CAT_SWING), rootIsBroadFvgFlags = array.new_bool(n, false), rootParticipationHeadEdgeIndexes = array.new_int(n, SLOT_INVALID), rootParticipationCounts = array.new_int(n, 0), rootPriceOrderSlots = array.sort_indices(ticks, order.ascending), rootPointTicks = ticks, rootStates = array.new_int(n, ROOT_ACTIVE), rootDirections = array.new_int(n, 0), rootNativeBottomTicks = array.new_int(n, int(na)), rootNativeTopTicks = array.new_int(n, int(na)))
+    W08Runtime.ParticipationView pv = W08Runtime.ParticipationView.new(array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0))
+    W08Runtime.PhaseSetView hv = W08Runtime.PhaseSetView.new(array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0))
+    W08Runtime.WinnerView wv = W08Runtime.WinnerView.new(1, 1, array.from(1), array.from(1), array.from(100), array.from(120), array.from(1), array.from(0), array.from(0), array.from(100.0, 120.0), array.from(0), array.from(1), array.from(1))
+    W08Runtime.ComponentMetaView mv = W08Runtime.ComponentMetaView.new(array.new_int(n, 0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.from(true))
+    W08Core.PendingTopologyStore ps = W08Core.PendingTopologyStore.new(cr.corePendingTopologyFlags, cr.corePendingTopologyChildHeadIndexes, cr.corePendingTopologyChildTailIndexes, cr.corePendingTopologyChildCounts, array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0))
+    W08Touch.TouchPlan tp = W08Touch.TouchPlan.new(array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_float(0), array.new_float(0), array.new_float(0), array.new_int(0), array.new_bool(0))
+    W08Runtime.ShadowScalars sc = W08Runtime.ShadowScalars.new(1, 1, int(array.max(ids)) + 1, 0, false)
+    W08Runtime.ShadowContext ctx = W08Runtime.ShadowContext.new(ws, rv, pv, hv, wv, mv, ps, ps, tp, W08Touch.newSplitTouchPlan(), sc, 10.0, 1.0, false)
+    // pass 1: fresh K from winner {1}
+    W08Runtime.ShadowPass pr1 = W08Runtime.runShadow(ctx, 1000)
+    bool ok1 = pr1.committed and pr1.freshApplied == 1 and array.size(cr.coreIds) == 1
+    if ok1
+        ok1 := array.get(cr.coreSlotLiveFlags, 0) and array.get(cr.corePhysicalBottoms, 0) == 100.0 and array.get(cr.corePhysicalTops, 0) == 120.0
+    bool partZero = false
+    bool ok2 = false
+    array<int> c2 = array.new_int(0)
+    if ok1 and mode == 0
+        // fixture: the Root-retire participation detach of Main on the only edge of Root 1 (participant 0; Root 1 stays live)
+        int s0 = map.get(idToSlot, 1)
+        int e  = array.get(rv.rootParticipationHeadEdgeIndexes, s0)
+        if array.get(rv.rootParticipationCounts, s0) == 1 and e >= 0
+            array.set(pv.participationEdgeRootSlots,         e, SLOT_INVALID)
+            array.set(pv.participationEdgeExpectedRootIds,   e, 0)
+            array.set(pv.participationEdgeSideSlots,         e, SLOT_INVALID)
+            array.set(pv.participationEdgeExpectedCoreIds,   e, 0)
+            array.set(pv.participationEdgeNextByRootIndexes, e, SLOT_INVALID)
+            array.set(pv.participationEdgeLiveFlags,         e, false)
+            array.push(pv.participationEdgeFreeIndexes, e)
+            array.set(rv.rootParticipationHeadEdgeIndexes, s0, SLOT_INVALID)
+            array.set(rv.rootParticipationCounts, s0, 0)
+            partZero := true
+        // pass 2: no winner; K has no successor; the free of K is the fixture input of the real F0 / commit
+        wv.candidateWinnerLogicalCount := 0
+        wv.candidateWinnerRootIdLength := 0
+        W08Runtime.ShadowPass pr2 = W08Runtime.planPass(ctx)
+        if pr2.planResult >= 0
+            array.push(pr2.freeSlots, 0)
+            array.push(pr2.freeCoreIds, array.get(cr.coreIds, 0))
+            array.push(pr2.freeGenerationIds, array.get(cr.coreGenerationIds, 0))
+            if W08Runtime.preflightPass(ctx, pr2, 2000)
+                W08Runtime.commitPass(ctx, pr2, 2000)
+        ok2 := partZero and pr2.committed and pr2.freed == 1 and not array.get(cr.coreSlotLiveFlags, 0)
+        c2 := pr2.dependencyChangedRootIds
+    if ok1 and mode == 1
+        W08Runtime.ShadowPass pr2 = W08Runtime.runShadow(ctx, 2000)
+        ok2 := pr2.committed and pr2.appliedTargets == 1 and pr2.freshApplied == 0 and array.get(cr.coreSlotLiveFlags, 0)
+        c2 := pr2.dependencyChangedRootIds
+    [ok1, pr1.dependencyChangedRootIds, ok2, c2]
+
+var int probePass = 0
+var int tA = 0
+var int tB = 0
+var int tC = 0
+var int tD = 0
+var int tE = 0
+var int tF = 0
+var int tG = 0
+var int tH = 0
+
+if barstate.isfirst
+    // A: participant 0 + old L7 range
+    [a1, aC1, a2, aC2] = w08Scenario(array.from(1, 2, 5), array.from(100, 120, 128), 0)
+    bool passA = a1 and a2 and intsEq(aC1, array.from(1, 2, 5)) and intsEq(aC2, array.from(1, 2, 5))
+    // B: boundary (Root 6 @ 89, 7 @ 90, 8 @ 130, 9 @ 131)
+    [b1, bC1, b2, bC2] = w08Scenario(array.from(1, 6, 7, 8, 9), array.from(100, 89, 90, 130, 131), 0)
+    bool passB = b1 and b2 and intsEq(bC1, array.from(1, 7, 8)) and intsEq(bC2, array.from(1, 7, 8))
+    // C: mask-0 injection into empty seeds, duplicate-free
+    array<int> cCarry = array.from(1, 2, 5)
+    array<int> cIds   = array.new_int(0)
+    array<int> cMasks = array.new_int(0)
+    int cN1 = W08Runtime.dependencyCarryInject(cCarry, cIds, cMasks, 0)
+    int cN2 = W08Runtime.dependencyCarryInject(cCarry, cIds, cMasks, cN1)
+    bool injOk = cN1 == 3 and cN2 == 3 and intsEq(cIds, array.from(1, 2, 5)) and intsEq(cMasks, array.from(0, 0, 0)) and intsEq(cCarry, array.from(1, 2, 5))
+    [d0, dBase, d1, dCv1, dCarry1, d2, dIds2, dMasks2, dCarryEnd, dKey, dRef, dSemRoots, dSemRoots1, dSemComps] = w06Case(array.new_int(0), array.new_int(0), 10000)
+    bool passC = injOk and d1 == 0 and dSemRoots1 == ""
+    // D: component rebuild through mask-0 seeds equals the full W06 rebuild
+    bool passD = d0 == 0 and dBase == "1,2,5" and d1 == 0 and dCv1 and dKey == "1|2,5" and dKey == dRef and dSemRoots == "" and dSemComps and dCarryEnd == 0
+    // E: carry merge
+    array<int> eCarry = array.from(1, 5, 9)
+    int eN = W08Runtime.dependencyCarryMerge(eCarry, array.from(2, 5, 8))
+    bool passE = eN == 5 and intsEq(eCarry, array.from(1, 2, 5, 8, 9))
+    // F: retry after a W06 build failure (capacity 2 < 3 Roots)
+    [f0, fBase, f1, fCv1, fCarry1, f2, fIds2, fMasks2, fCarryEnd, fKey, fRef, fSemRoots, fSemRoots1, fSemComps] = w06Case(array.new_int(0), array.new_int(0), 2)
+    bool passF = f0 == 0 and f1 != 0 and not fCv1 and fCarry1 == 3 and fIds2 == "1,2,5" and fMasks2 == "0,0,0" and f2 == 0 and fCarryEnd == 0 and fKey == fRef and fKey == "1|2,5" and fSemRoots == ""
+    // G: semantic seed 2 (mask 4) keeps its mask; W06 semantic Roots = [2]
+    array<int> gIds   = array.from(2)
+    array<int> gMasks = array.from(4)
+    int gN = W08Runtime.dependencyCarryInject(array.from(1, 2, 5), gIds, gMasks, 1)
+    [g0, gBase, g1, gCv1, gCarry1, g2, gIds2, gMasks2, gCarryEnd, gKey, gRef, gSemRoots, gSemRoots1, gSemComps] = w06Case(array.from(2), array.from(4), 10000)
+    bool passG = gN == 3 and intsEq(gIds, array.from(2, 1, 5)) and intsEq(gMasks, array.from(4, 0, 0)) and g1 == 0 and gSemRoots1 == "2" and gKey == gRef
+    // H: no-op
+    array<int> hCarry = array.from(1, 5)
+    int hN = W08Runtime.dependencyCarryMerge(hCarry, array.new_int(0))
+    array<int> hIds   = array.from(3)
+    array<int> hMasks = array.from(4)
+    int hS = W08Runtime.dependencyCarryInject(array.new_int(0), hIds, hMasks, 1)
+    [h1, hC1, h2, hC2] = w08Scenario(array.from(1, 2, 5), array.from(100, 120, 128), 1)
+    bool passH = hN == 2 and intsEq(hCarry, array.from(1, 5)) and hS == 1 and intsEq(hIds, array.from(3)) and intsEq(hMasks, array.from(4)) and h1 and h2 and array.size(hC2) == 0
+    tA := passA ? 1 : 0
+    tB := passB ? 1 : 0
+    tC := passC ? 1 : 0
+    tD := passD ? 1 : 0
+    tE := passE ? 1 : 0
+    tF := passF ? 1 : 0
+    tG := passG ? 1 : 0
+    tH := passH ? 1 : 0
+    probePass := tA + tB + tC + tD + tE + tF + tG + tH == 8 ? 1 : 0
+
+plot(probePass, "DEPENDENCY_PROBE_PASS")
+plot(tA, "L7_PARTICIPANT_ZERO_PASS", display = display.data_window)
+plot(tB, "L7_BOUNDARY_PASS", display = display.data_window)
+plot(tC, "MASK0_SEMANTIC_ROOT_PASS", display = display.data_window)
+plot(tD, "DEPENDENCY_COMPONENT_REBUILD_PASS", display = display.data_window)
+plot(tE, "CARRY_MERGE_PASS", display = display.data_window)
+plot(tF, "CARRY_RETRY_PASS", display = display.data_window)
+plot(tG, "SEED_MASK_OR_PASS", display = display.data_window)
+plot(tH, "DEPENDENCY_NOOP_PASS", display = display.data_window)
