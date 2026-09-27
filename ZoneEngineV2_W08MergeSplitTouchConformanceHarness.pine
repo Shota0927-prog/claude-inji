@@ -1,0 +1,488 @@
+//@version=6
+// ============================================================
+// ZoneEngineV2_W08MergeSplitTouchConformanceHarness - W08 B17 Merge / Split / TouchMark / Pending conformance TV probe
+//
+// Short deterministic fixtures. Production authority = published exports only: W08Runtime /4 runShadow (pass 1: the old
+// Cores are allocated by the real materialization), W08Touch /3 markAppend (the old TouchMark rings; ring overflow sets
+// the truncated flag through the real append), W08Runtime /4 planPass / preflightPass / commitPass (pass 2), then the
+// W08Core Merge / Split relations, the W08Touch Merge / Split plans, the planned PendingTopology pool, the apply set, the
+// Default Guard and the post-commit rings are read. Two fixture inputs have no W08 producer and are set directly (read
+// only by the planner): an old Side phase = ActiveTouch (Pending case) and one Merge-deferred field != default (Guard
+// case, sideTouchCounts; the W09 Merge Side state transfer stays OPEN).
+// Reference (fixture only, no Production plan / ring read): per old Core the retained ring = its last `cap` appended
+// marks, a Side truncated when a mark of that Side was lost; Merge: survivor first, then absorbed in old canonical order,
+// each source chronological; a mark is inherited when its exact contact meets the new Side EffectiveRange (inclusive); one
+// mark per (Side, time, contact bottom, contact top) = the first in that source order, payload whole; final order time,
+// baseSeq, Support < Resistance, contact bottom, contact top; above the ring capacity the oldest rows drop and truncate
+// their Side; truncated also = a source flag of that Side (target has the Side). Split: every non-Merge child gets, in
+// source order, the marks whose contact meets its Side EffectiveRange (untouched child allowed), truncated per Side =
+// child has the Side and the source Side flag. Pending: a component with an old Side in ActiveTouch is not applied and
+// every old of it is pending with its latest children (Identity Candidates' Root unions).
+// B17_CONFORMANCE_PASS = 1 only when every case passes.
+// ============================================================
+indicator("ZoneEngineV2_W08MergeSplitTouchConformanceHarness", overlay = false)
+
+import sekine3310/ZoneEngineV2_W08Core_Worker/16 as W08Core
+import sekine3310/ZoneEngineV2_W08Touch_Worker/3 as W08Touch
+import sekine3310/ZoneEngineV2_W08Runtime_Worker/4 as W08Runtime
+
+const int SLOT_INVALID    = -1
+const int CAT_SWING       = 1
+const int ROOT_ACTIVE     = 1
+const int PH_ACTIVE_TOUCH = 2
+const int SIDE_S          = 1
+const int SIDE_R          = -1
+
+type Win
+    array<int>   sides
+    array<int>   bots
+    array<int>   tops
+    array<float> exact
+    array<int>   offs
+    array<int>   lens
+    array<int>   roots
+
+// fixture TouchMarks in append order (owner = old coreId after pass 1)
+type Mk
+    array<int>   owner
+    array<int>   side
+    array<int>   t
+    array<float> b
+    array<float> u
+    array<int>   seq
+    array<float> c
+    array<int>   g
+
+newWin() =>
+    Win.new(array.new_int(0), array.new_int(0), array.new_int(0), array.new_float(0), array.new_int(0), array.new_int(0), array.new_int(0))
+addW(Win w, int side, int bot, int top, array<int> rs) =>
+    array.push(w.sides, side)
+    array.push(w.bots, bot)
+    array.push(w.tops, top)
+    array.push(w.exact, bot * 1.0)
+    array.push(w.exact, top * 1.0)
+    array.push(w.offs, array.size(w.roots))
+    array.push(w.lens, array.size(rs))
+    int i = 0
+    while i < array.size(rs)
+        array.push(w.roots, array.get(rs, i))
+        i += 1
+    w
+newMk() =>
+    Mk.new(array.new_int(0), array.new_int(0), array.new_int(0), array.new_float(0), array.new_float(0), array.new_int(0), array.new_float(0), array.new_int(0))
+addM(Mk m, int owner, int side, int t, float b, float u, int seq, float c, int g) =>
+    array.push(m.owner, owner)
+    array.push(m.side, side)
+    array.push(m.t, t)
+    array.push(m.b, b)
+    array.push(m.u, u)
+    array.push(m.seq, seq)
+    array.push(m.c, c)
+    array.push(m.g, g)
+    m
+
+// ---- Reference (fixture only) ----
+// retained ring of an old Core: its last cap appended marks; [indexes, truncated S, truncated R]
+retained(Mk m, int owner, int cap) =>
+    array<int> all = array.new_int(0)
+    int i = 0
+    while i < array.size(m.owner)
+        if array.get(m.owner, i) == owner
+            array.push(all, i)
+        i += 1
+    int lost = math.max(0, array.size(all) - cap)
+    bool trS = false
+    bool trR = false
+    array<int> keep = array.new_int(0)
+    int k = 0
+    while k < array.size(all)
+        int x = array.get(all, k)
+        if k < lost
+            trS := trS or array.get(m.side, x) == SIDE_S
+            trR := trR or array.get(m.side, x) == SIDE_R
+        else
+            array.push(keep, x)
+        k += 1
+    [keep, trS, trR]
+
+meets(Mk m, int x, float lo, float hi) =>
+    array.get(m.b, x) <= hi and array.get(m.u, x) >= lo
+
+// canonical Merge order key compare (time, baseSeq, Support < Resistance, bottom, top)
+mkCmp(Mk m, int x, int y) =>
+    int c = array.get(m.t, x) - array.get(m.t, y)
+    if c == 0
+        c := array.get(m.seq, x) - array.get(m.seq, y)
+    if c == 0
+        c := (array.get(m.side, x) == SIDE_S ? 0 : 1) - (array.get(m.side, y) == SIDE_S ? 0 : 1)
+    if c == 0
+        c := array.get(m.b, x) < array.get(m.b, y) ? -1 : array.get(m.b, x) > array.get(m.b, y) ? 1 : array.get(m.u, x) < array.get(m.u, y) ? -1 : array.get(m.u, x) > array.get(m.u, y) ? 1 : 0
+    c
+
+// Merge Reference: sources = coreIds in priority order; ranges per Side (has = false: no winner on that Side)
+refMerge(Mk m, array<int> srcIds, bool hasS, float sLo, float sHi, bool hasR, float rLo, float rHi, int cap) =>
+    array<int> kept = array.new_int(0)
+    bool trS = false
+    bool trR = false
+    int sd = 0
+    while sd < 2
+        bool has  = sd == 0 ? hasS : hasR
+        int  side = sd == 0 ? SIDE_S : SIDE_R
+        if has
+            int s = 0
+            while s < array.size(srcIds)
+                [idx, tS, tR] = retained(m, array.get(srcIds, s), cap)
+                if sd == 0
+                    trS := trS or tS
+                else
+                    trR := trR or tR
+                int k = 0
+                while k < array.size(idx)
+                    int x = array.get(idx, k)
+                    if array.get(m.side, x) == side and meets(m, x, sd == 0 ? sLo : rLo, sd == 0 ? sHi : rHi)
+                        bool dup = false
+                        int q = 0
+                        while not dup and q < array.size(kept)
+                            int y = array.get(kept, q)
+                            dup := array.get(m.side, y) == side and array.get(m.t, y) == array.get(m.t, x) and array.get(m.b, y) == array.get(m.b, x) and array.get(m.u, y) == array.get(m.u, x)
+                            q += 1
+                        if not dup
+                            array.push(kept, x)
+                    k += 1
+                s += 1
+        sd += 1
+    // canonical order (insertion sort)
+    int a = 1
+    while a < array.size(kept)
+        int x = array.get(kept, a)
+        int b = a - 1
+        while b >= 0 and mkCmp(m, array.get(kept, b), x) > 0
+            array.set(kept, b + 1, array.get(kept, b))
+            b -= 1
+        array.set(kept, b + 1, x)
+        a += 1
+    int over = math.max(0, array.size(kept) - cap)
+    array<int> rows = array.new_int(0)
+    int k2 = 0
+    while k2 < array.size(kept)
+        int x = array.get(kept, k2)
+        if k2 < over
+            trS := trS or array.get(m.side, x) == SIDE_S
+            trR := trR or array.get(m.side, x) == SIDE_R
+        else
+            array.push(rows, x)
+        k2 += 1
+    [rows, trS, trR]
+
+// Split Reference for one child: source marks (retained, append order) meeting the child's Side EffectiveRange
+refSplit(Mk m, int srcId, bool hasS, float sLo, float sHi, bool hasR, float rLo, float rHi, int cap) =>
+    [idx, tS, tR] = retained(m, srcId, cap)
+    array<int> rows = array.new_int(0)
+    int k = 0
+    while k < array.size(idx)
+        int x = array.get(idx, k)
+        bool isS = array.get(m.side, x) == SIDE_S
+        if isS ? (hasS and meets(m, x, sLo, sHi)) : (hasR and meets(m, x, rLo, rHi))
+            array.push(rows, x)
+        k += 1
+    [rows, hasS and tS, hasR and tR]
+
+// ---- Production (published exports only) ----
+toView(Win w, bool reverseBacking) =>
+    int n = array.size(w.sides)
+    array<int> offs  = array.new_int(n, 0)
+    array<int> roots = array.new_int(0)
+    int k = 0
+    while k < n
+        int i = reverseBacking ? n - 1 - k : k
+        array.set(offs, i, array.size(roots))
+        int j = 0
+        while j < array.get(w.lens, i)
+            array.push(roots, array.get(w.roots, array.get(w.offs, i) + j))
+            j += 1
+        k += 1
+    array<int> mins = array.new_int(0)
+    k := 0
+    while k < n
+        array.push(mins, array.get(w.roots, array.get(w.offs, k)))
+        k += 1
+    W08Runtime.WinnerView.new(n, array.size(roots), array.copy(w.sides), array.new_int(n, 1), array.copy(w.bots), array.copy(w.tops), mins, array.new_int(n, 0), array.new_int(n, int(na)), array.copy(w.exact), offs, array.copy(w.lens), roots)
+
+ringView(W08Core.CoreRegistryStore cr) =>
+    W08Touch.TouchRing.new(cr.touchMarkRingOwnerCoreIds, cr.touchMarkRingHeads, cr.touchMarkRingCounts, cr.touchMarkBaseSeqs, cr.touchMarkTimes, cr.touchMarkSides, cr.touchMarkContactBottoms, cr.touchMarkContactTops, cr.touchMarkCloseAtTouches, cr.touchMarkGenerationIds, cr.touchMarkIsNormalTouchFlags, cr.sideTouchHistoryTruncatedFlags, cr.coreIds, cr.coreSlotLiveFlags, cr.touchMarkCapacityPerCore)
+
+// pass 1 (runShadow w1) -> marks (markAppend) -> fixture phase / deferred input -> pass 2 planPass / preflightPass /
+// commitPass (w2). permute: Root slots and winner backing reversed. Returns [ctx, pass, pass1 committed, preflight].
+runScn(int nRoots, Win w1, Win w2, Mk mk, int cap, int activeId, int activeSide, int nondefaultId, bool permute) =>
+    array<int> ids   = array.new_int(nRoots, 0)
+    array<int> ticks = array.new_int(nRoots, 0)
+    int k = 0
+    while k < nRoots
+        int slot = permute ? nRoots - 1 - k : k
+        array.set(ids, slot, k + 1)
+        array.set(ticks, slot, 100 + k)
+        k += 1
+    map<int, int> idToSlot = map.new<int, int>()
+    k := 0
+    while k < nRoots
+        map.put(idToSlot, array.get(ids, k), k)
+        k += 1
+    W08Core.W08Store ws = W08Core.newStore()
+    W08Core.CoreRegistryStore cr = ws.coreRegistry
+    cr.touchMarkCapacityPerCore := cap
+    W08Runtime.RootView rv = W08Runtime.RootView.new(rootIds = ids, rootSlotLiveFlags = array.new_bool(nRoots, true), rootIdToSlot = idToSlot, rootCategories = array.new_int(nRoots, CAT_SWING), rootIsBroadFvgFlags = array.new_bool(nRoots, false), rootParticipationHeadEdgeIndexes = array.new_int(nRoots, SLOT_INVALID), rootParticipationCounts = array.new_int(nRoots, 0), rootPriceOrderSlots = array.sort_indices(ticks, order.ascending), rootPointTicks = ticks, rootStates = array.new_int(nRoots, ROOT_ACTIVE), rootDirections = array.new_int(nRoots, 0), rootNativeBottomTicks = array.new_int(nRoots, int(na)), rootNativeTopTicks = array.new_int(nRoots, int(na)))
+    W08Runtime.ParticipationView pv = W08Runtime.ParticipationView.new(array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0))
+    W08Runtime.PhaseSetView hv = W08Runtime.PhaseSetView.new(array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0))
+    W08Runtime.ComponentMetaView mv = W08Runtime.ComponentMetaView.new(array.new_int(nRoots, 0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.from(true))
+    W08Core.PendingTopologyStore ps = W08Core.PendingTopologyStore.new(cr.corePendingTopologyFlags, cr.corePendingTopologyChildHeadIndexes, cr.corePendingTopologyChildTailIndexes, cr.corePendingTopologyChildCounts, array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0))
+    W08Touch.TouchPlan tp = W08Touch.TouchPlan.new(array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_float(0), array.new_float(0), array.new_float(0), array.new_int(0), array.new_bool(0))
+    W08Runtime.ShadowScalars sc = W08Runtime.ShadowScalars.new(1, 1, nRoots + 1, 0, false)
+    W08Runtime.ShadowContext ctx = W08Runtime.ShadowContext.new(ws, rv, pv, hv, toView(w1, permute), mv, ps, ps, tp, W08Touch.newSplitTouchPlan(), sc, 5.0, 1.0, false)
+    W08Runtime.ShadowPass pr1 = W08Runtime.runShadow(ctx, 1000)
+    bool ok1 = pr1.committed
+    W08Touch.TouchRing ring = ringView(cr)
+    int i = 0
+    while ok1 and i < array.size(mk.owner)
+        int id = array.get(mk.owner, i)
+        ok1 := map.contains(cr.coreIdToSlot, id)
+        if ok1
+            W08Touch.markAppend(ring, map.get(cr.coreIdToSlot, id), array.get(mk.seq, i), array.get(mk.t, i), array.get(mk.side, i), array.get(mk.b, i), array.get(mk.u, i), array.get(mk.c, i), array.get(mk.g, i), true)
+        i += 1
+    if ok1 and activeId > 0 and map.contains(cr.coreIdToSlot, activeId)
+        array.set(cr.sidePhases, 2 * map.get(cr.coreIdToSlot, activeId) + (activeSide == SIDE_S ? 0 : 1), PH_ACTIVE_TOUCH)
+    if ok1 and nondefaultId > 0 and map.contains(cr.coreIdToSlot, nondefaultId)
+        array.set(cr.sideTouchCounts, 2 * map.get(cr.coreIdToSlot, nondefaultId), 1)
+    ctx.wv := toView(w2, permute)
+    W08Runtime.ShadowPass pr = W08Runtime.planPass(ctx)
+    bool pre = false
+    if pr.planResult >= 0
+        pre := W08Runtime.preflightPass(ctx, pr, 2000)
+        if pre
+            W08Runtime.commitPass(ctx, pr, 2000)
+    [ctx, pr, ok1, pre]
+
+// ---- comparisons (Production read after the pass) ----
+// Merge plan rows of relation j, Side sd (0 S / 1 R), against the Reference rows of that Side (full payload)
+planSideDrift(W08Touch.TouchPlan tp, int j, int sd, Mk m, array<int> rows) =>
+    int side = sd == 0 ? SIDE_S : SIDE_R
+    array<int> exp = array.new_int(0)
+    int k = 0
+    while k < array.size(rows)
+        if array.get(m.side, array.get(rows, k)) == side
+            array.push(exp, array.get(rows, k))
+        k += 1
+    int d = 0
+    if 2 * j + sd >= array.size(tp.mergeTouchPlanOffsets)
+        d := 1
+    else
+        int off = array.get(tp.mergeTouchPlanOffsets, 2 * j + sd)
+        int cnt = array.get(tp.mergeTouchPlanCounts, 2 * j + sd)
+        d += cnt == array.size(exp) ? 0 : 1
+        int q = 0
+        while d == 0 and q < cnt
+            int x = array.get(exp, q)
+            int r = off + q
+            d += array.get(tp.mergeTouchPlanTimes, r) == array.get(m.t, x) and array.get(tp.mergeTouchPlanSides, r) == side and array.get(tp.mergeTouchPlanContactBottoms, r) == array.get(m.b, x) and array.get(tp.mergeTouchPlanContactTops, r) == array.get(m.u, x) and array.get(tp.mergeTouchPlanBaseSeqs, r) == array.get(m.seq, x) and array.get(tp.mergeTouchPlanCloseAtTouches, r) == array.get(m.c, x) and array.get(tp.mergeTouchPlanGenerationIds, r) == array.get(m.g, x) ? 0 : 1
+            q += 1
+    d
+
+// ring of coreId after commit against the expected rows (in order) and truncated flags
+ringDrift(W08Core.CoreRegistryStore cr, int coreId, Mk m, array<int> rows, bool trS, bool trR) =>
+    int d = 0
+    if not map.contains(cr.coreIdToSlot, coreId)
+        d := 1
+    else
+        int slot = map.get(cr.coreIdToSlot, coreId)
+        int cap  = cr.touchMarkCapacityPerCore
+        int head = array.get(cr.touchMarkRingHeads, slot)
+        int cnt  = array.get(cr.touchMarkRingCounts, slot)
+        d += cnt == array.size(rows) ? 0 : 1
+        int q = 0
+        while d == 0 and q < cnt
+            int ph = slot * cap + (head + q) % cap
+            int x  = array.get(rows, q)
+            d += array.get(cr.touchMarkTimes, ph) == array.get(m.t, x) and array.get(cr.touchMarkSides, ph) == array.get(m.side, x) and array.get(cr.touchMarkContactBottoms, ph) == array.get(m.b, x) and array.get(cr.touchMarkContactTops, ph) == array.get(m.u, x) and array.get(cr.touchMarkBaseSeqs, ph) == array.get(m.seq, x) and array.get(cr.touchMarkGenerationIds, ph) == array.get(m.g, x) ? 0 : 1
+            q += 1
+        d += array.get(cr.sideTouchHistoryTruncatedFlags, 2 * slot) == trS and array.get(cr.sideTouchHistoryTruncatedFlags, 2 * slot + 1) == trR ? 0 : 1
+    d
+
+// Split plan row of Candidate p against the Reference rows / flags
+splitRowDrift(W08Touch.SplitTouchPlan sp, int p, int srcId, Mk m, array<int> rows, bool trS, bool trR) =>
+    int k = array.indexof(sp.targetPhysicalIndexes, p)
+    int d = 0
+    if k < 0
+        d := 1
+    else
+        int off = array.get(sp.markOffsets, k)
+        int cnt = array.get(sp.markCounts, k)
+        d += array.get(sp.sourceOldCoreIds, k) == srcId and cnt == array.size(rows) ? 0 : 1
+        int q = 0
+        while d == 0 and q < cnt
+            int x = array.get(rows, q)
+            int r = off + q
+            d += array.get(sp.times, r) == array.get(m.t, x) and array.get(sp.sides, r) == array.get(m.side, x) and array.get(sp.contactBottoms, r) == array.get(m.b, x) and array.get(sp.contactTops, r) == array.get(m.u, x) and array.get(sp.baseSeqs, r) == array.get(m.seq, x) and array.get(sp.generationIds, r) == array.get(m.g, x) ? 0 : 1
+            q += 1
+        d += array.get(sp.truncatedFlags, 2 * k) == trS and array.get(sp.truncatedFlags, 2 * k + 1) == trR ? 0 : 1
+    d
+
+// Merge relation j: Candidate p, survivor id, absorbed ids
+mergeRelDrift(W08Core.W08Store ws, int j, int p, int survivorId, array<int> absorbedIds) =>
+    int d = 0
+    if 5 * j + 4 >= array.size(ws.mergeRelations)
+        d := 1
+    else
+        int off = array.get(ws.mergeRelations, 5 * j + 3)
+        int cnt = array.get(ws.mergeRelations, 5 * j + 4)
+        d += array.get(ws.mergeRelations, 5 * j) == p and array.get(ws.mergeRelations, 5 * j + 2) == survivorId and cnt == array.size(absorbedIds) ? 0 : 1
+        int q = 0
+        while d == 0 and q < cnt
+            d += array.get(ws.mergeAbsorbed, 2 * (off + q) + 1) == array.get(absorbedIds, q) ? 0 : 1
+            q += 1
+    d
+
+// planned pending of coreId: flag and the Root list of its single child
+pendingDrift(W08Core.PendingTopologyStore ps, W08Core.CoreRegistryStore cr, int coreId, bool flag, array<int> childRoots) =>
+    int d = 0
+    if not map.contains(cr.coreIdToSlot, coreId)
+        d := 1
+    else
+        int slot = map.get(cr.coreIdToSlot, coreId)
+        bool f = array.get(ps.corePendingTopologyFlags, slot)
+        d += f == flag ? 0 : 1
+        if d == 0 and flag
+            int ci = array.get(ps.corePendingTopologyChildHeadIndexes, slot)
+            d += array.get(ps.corePendingTopologyChildCounts, slot) == 1 and ci >= 0 ? 0 : 1
+            if d == 0
+                int rn = array.get(ps.pendingTopologyChildRootHeadNodeIndexes, ci)
+                d += array.get(ps.pendingTopologyChildRootCounts, ci) == array.size(childRoots) ? 0 : 1
+                int q = 0
+                while d == 0 and q < array.size(childRoots)
+                    d += array.get(ps.pendingTopologyRootNodeRootIds, rn) == array.get(childRoots, q) ? 0 : 1
+                    rn := array.get(ps.pendingTopologyRootNodeNextIndexes, rn)
+                    q += 1
+    d
+
+// ---- fixtures ----
+// Merge: K1 = S{1} [100, 104], K2 = S{2} [106, 110] (pass 1, coreId 1 / 2) -> S{1, 2} [100, 110]: survivor K1, absorbed K2
+mergeMarks() =>
+    Mk m = newMk()
+    addM(m, 1, SIDE_S, 1000, 101.0, 102.0, 1, 101.5, 5)
+    addM(m, 1, SIDE_S, 1002, 120.0, 121.0, 1, 120.5, 5)
+    addM(m, 2, SIDE_S, 1000, 101.0, 102.0, 2, 101.7, 7)
+    addM(m, 2, SIDE_S, 1001, 110.0, 112.0, 1, 111.0, 7)
+    addM(m, 2, SIDE_R, 1003, 101.0, 102.0, 1, 101.5, 7)
+    m
+mergeW1() =>
+    addW(addW(newWin(), SIDE_S, 100, 104, array.from(1)), SIDE_S, 106, 110, array.from(2))
+mergeW2() =>
+    addW(newWin(), SIDE_S, 100, 110, array.from(1, 2))
+
+// result of one Merge case run: [mergeDrift, touchDrift, pendingDrift]
+mergeCase(Win w2, Mk m, int cap, bool hasR, int activeId, int nondefaultId, bool permute) =>
+    [ctx, pr, ok1, pre] = runScn(2, mergeW1(), w2, m, cap, activeId, SIDE_S, nondefaultId, permute)
+    W08Core.W08Store ws = ctx.ws
+    W08Core.CoreRegistryStore cr = ws.coreRegistry
+    [rows, trS, trR] = refMerge(m, array.from(1, 2), true, 100.0, 110.0, hasR, 100.0, 110.0, cap)
+    int md = (ok1 ? 0 : 1) + mergeRelDrift(ws, 0, 0, 1, array.from(2))
+    int td = planSideDrift(ctx.tp, 0, 0, m, rows) + planSideDrift(ctx.tp, 0, 1, m, rows)
+    td += array.size(ctx.tp.mergeTouchPlanTruncatedFlags) >= 2 and array.get(ctx.tp.mergeTouchPlanTruncatedFlags, 0) == trS and array.get(ctx.tp.mergeTouchPlanTruncatedFlags, 1) == trR ? 0 : 1
+    int pd = 0
+    bool applied = array.size(pr.applyP) >= 1 and array.get(pr.applyP, 0)
+    if activeId > 0
+        // pending: not applied, both olds pending with the latest child S{1, 2}, rings untouched, nothing freed
+        pd += applied ? 1 : 0
+        pd += pendingDrift(ctx.psPlan, cr, 1, true, array.from(1, 2)) + pendingDrift(ctx.psPlan, cr, 2, true, array.from(1, 2))
+        pd += map.contains(cr.coreIdToSlot, 2) ? 0 : 1
+    else if nondefaultId > 0
+        // Default Guard: the absorbed K2 holds a non-default deferred field -> preflight rejects, nothing committed
+        pd += not pre and pr.guardRejected == 1 and not pr.committed and map.contains(cr.coreIdToSlot, 2) ? 0 : 1
+    else
+        pd += applied and pre and pr.committed and pr.freed == 1 and not map.contains(cr.coreIdToSlot, 2) ? 0 : 1
+        pd += pendingDrift(ctx.psPlan, cr, 1, false, array.new_int(0))
+        td += ringDrift(cr, 1, m, rows, trS, trR)
+    [md, td, pd]
+
+var array<float> res = array.new_float(8, na)
+var float mergeTotal = na
+var float splitTotal = na
+var float touchTotal = na
+var float pendTotal  = na
+var float passAll    = na
+var float passed     = na
+
+if barstate.isfirst
+    int mT = 0
+    int sT = 0
+    int tT = 0
+    int pT = 0
+    // C1 MERGE: dedupe (survivor K1 payload), outside-range drop, boundary inherit, no R winner -> R mark not inherited
+    Mk m1 = mergeMarks()
+    [a1, a2, a3] = mergeCase(mergeW2(), m1, 4, false, 0, 0, false)
+    array.set(res, 0, a1 + a2 + a3 == 0 ? 1.0 : 0.0)
+    // C2 MERGE_OVERFLOW: cap 3, S{1, 2} + R{1} paired; 3 S + 1 R rows -> oldest S dropped, Support only truncated
+    Mk m2 = newMk()
+    addM(m2, 1, SIDE_S, 1000, 101.0, 102.0, 1, 101.5, 5)
+    addM(m2, 1, SIDE_S, 1002, 102.0, 103.0, 1, 102.5, 5)
+    addM(m2, 2, SIDE_S, 1001, 107.0, 108.0, 1, 107.5, 7)
+    addM(m2, 2, SIDE_R, 1005, 105.0, 106.0, 1, 105.5, 7)
+    Win w22 = addW(mergeW2(), SIDE_R, 100, 110, array.from(1))
+    [b1, b2, b3] = mergeCase(w22, m2, 3, true, 0, 0, false)
+    array.set(res, 1, b1 + b2 + b3 == 0 ? 1.0 : 0.0)
+    // C3 SPLIT: K1 = S{1, 2} [100, 110], cap 3, 4 marks (the oldest S is overwritten -> source S truncated) ->
+    // P0 S{1} [100, 103] (continuation), P1 S{2} [107, 110] (fresh): contact 102-108 to both, R mark to none, 104-106 to none
+    Mk m3 = newMk()
+    addM(m3, 1, SIDE_S, 1000, 101.0, 102.0, 1, 101.5, 5)
+    addM(m3, 1, SIDE_S, 1001, 102.0, 108.0, 2, 105.0, 5)
+    addM(m3, 1, SIDE_R, 1002, 101.0, 102.0, 3, 101.5, 5)
+    addM(m3, 1, SIDE_S, 1003, 104.0, 106.0, 4, 105.0, 5)
+    Win w31 = addW(newWin(), SIDE_S, 100, 110, array.from(1, 2))
+    Win w32 = addW(addW(newWin(), SIDE_S, 100, 103, array.from(1)), SIDE_S, 107, 110, array.from(2))
+    [ctx3, pr3, ok3, pre3] = runScn(2, w31, w32, m3, 3, 0, SIDE_S, 0, false)
+    W08Core.W08Store ws3 = ctx3.ws
+    int sd3 = (ok3 ? 0 : 1) + (ws3.splitRelationCount == 1 and array.size(ws3.splitRelations) == 5 ? 0 : 1)
+    if sd3 == 0
+        sd3 += array.get(ws3.splitRelations, 1) == 1 and array.get(ws3.splitRelations, 2) == 0 and array.get(ws3.splitRelations, 4) == 2 and array.get(ws3.splitChildren, 0) == 0 and array.get(ws3.splitChildren, 1) == 1 ? 0 : 1
+    [r30, t30s, t30r] = refSplit(m3, 1, true, 100.0, 103.0, false, na, na, 3)
+    [r31, t31s, t31r] = refSplit(m3, 1, true, 107.0, 110.0, false, na, na, 3)
+    int td3 = splitRowDrift(ctx3.sp, 0, 1, m3, r30, t30s, t30r) + splitRowDrift(ctx3.sp, 1, 1, m3, r31, t31s, t31r)
+    // post-commit: K1 (continuation of P0) and the fresh Core of P1 (coreId 2) hold the plan rows
+    td3 += pre3 and pr3.committed ? 0 : 1
+    td3 += ringDrift(ws3.coreRegistry, 1, m3, r30, t30s, t30r) + ringDrift(ws3.coreRegistry, 2, m3, r31, t31s, t31r)
+    array.set(res, 2, sd3 + td3 == 0 ? 1.0 : 0.0)
+    // C4 PENDING: C1 with K2 Support ActiveTouch -> the Merge component is pending (not applied)
+    [c1, c2, c3] = mergeCase(mergeW2(), mergeMarks(), 4, false, 2, 0, false)
+    array.set(res, 3, c1 + c2 + c3 == 0 ? 1.0 : 0.0)
+    // C5 GUARD: C1 with the absorbed K2 holding one non-default Merge-deferred field -> Default Guard reject
+    [d1, d2, d3] = mergeCase(mergeW2(), mergeMarks(), 4, false, 0, 2, false)
+    array.set(res, 4, d1 + d2 + d3 == 0 ? 1.0 : 0.0)
+    // C6 PERMUTATION: C1 with Root slots and winner backing reversed
+    [e1, e2, e3] = mergeCase(mergeW2(), mergeMarks(), 4, false, 0, 0, true)
+    array.set(res, 5, e1 + e2 + e3 == 0 ? 1.0 : 0.0)
+    mT := a1 + b1 + c1 + d1 + e1
+    sT := sd3
+    tT := a2 + b2 + c2 + d2 + e2 + td3
+    pT := a3 + b3 + c3 + d3 + e3
+    mergeTotal := mT
+    splitTotal := sT
+    touchTotal := tT
+    pendTotal  := pT
+    int np = 0
+    int q = 0
+    while q < 6
+        np += array.get(res, q) == 1.0 ? 1 : 0
+        q += 1
+    passed  := np
+    passAll := np == 6 and mT + sT + tT + pT == 0 ? 1.0 : 0.0
+
+plot(passAll, "B17_CONFORMANCE_PASS", display = display.data_window)
+plot(mergeTotal, "MERGE_DRIFT_TOTAL", display = display.data_window)
+plot(splitTotal, "SPLIT_DRIFT_TOTAL", display = display.data_window)
+plot(touchTotal, "TOUCH_DRIFT_TOTAL", display = display.data_window)
+plot(pendTotal, "PENDING_DRIFT_TOTAL", display = display.data_window)
+plot(passed, "CASES_PASSED_OF_6", display = display.data_window)
+plot(array.get(res, 0), "C1_MERGE_DEDUPE_RANGE_BOUNDARY", display = display.data_window)
+plot(array.get(res, 1), "C2_MERGE_OVERFLOW_SUPPORT_TRUNCATED", display = display.data_window)
+plot(array.get(res, 2), "C3_SPLIT_REASSIGN_TRUNCATED", display = display.data_window)
+plot(array.get(res, 3), "C4_PENDING_ACTIVE_TOUCH", display = display.data_window)
+plot(array.get(res, 4), "C5_DEFAULT_GUARD_REJECT", display = display.data_window)
+plot(array.get(res, 5), "C6_STORAGE_PERMUTATION", display = display.data_window)
