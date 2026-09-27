@@ -43,6 +43,17 @@
 | B18 | Final E2E audit / closeout | COMPLETE |
 
 ## 5 Canonical（implemented contract）
+Canonical anchor（正本の節と内容の対応）:
+- I15.1: 物理Core（S / R pair、PATH A / B）
+- I15.2: 新旧Core対応 — Root → 参加Core索引、価格区間索引、Inverse起源索引、canonical order復元、完全なorigin集合 / range /
+  state / tie-breakでIdentity判定
+- I15.3: Merge / Split — changed component限定、TouchMarkを集計値だけで代替しない、Side履歴 / Snapshot / Pending維持、Core
+  range / origin変更時の後続cache失効、stale Pass1値再利用禁止、formerly ineligible pair再評価、map列挙順非依存
+- A10.7: Side Candidate → 物理Core pairing
+- A16: Snapshot / LiveStructure / PendingTopology（A16.1 ActiveTouch中の構造変更、A16.2 PendingTopology適用順）
+- A17.1: Identity、A17.2: Merge、A17.3: Split
+- 全anchorの実装status: IMPLEMENTED（canonical OPEN 0）
+
 - 物理Core: Support × Resistance winnerはtick gap <= Mかつ共有non-FVG Rootでpair。canonical最大matching（S / R rank =
   bottom, top, winner index、辞書順最初）。Root union ASC、minRootId、tick / exact envelope
 - 同一pass内でFVG RootがS / R両方に出る入力はW05上到達不能。gap <= Mのpairで検出したら全体fail-closed（-1）
@@ -85,6 +96,9 @@
 - B16: B16_CONFORMANCE_PASS = 1、PAIR / IDENTITY / FAIL_CLOSED drift 0、CASES 29 / 29
 - B17: B17_CONFORMANCE_PASS = 1、MERGE / SPLIT / TOUCH / PENDING drift 0、CASES 6 / 6（`77333fc`）。
   `7e890c2`初回実行はFAIL報告、Production / PASS式 / fixture不変の`77333fc`でPASS。初回FAILの原因は特定されていない
+- B17初回FAILの扱い: `7e890c2`の初回TV HarnessはFAIL。Production / PASS条件 / fixtureを変更せず、diagnostic
+  instrumentation追加（`77333fc`）後に最終PASS。原因は未特定で、W08 Production defectとは確定していない。W11 / W12の
+  formal conformance / reload / replay時に再確認する。W08未完了扱いにはしない
 - Python: B17_REFERENCE_VALID 50000、mutant M1〜M10全検出、permutation drift 0
 
 ## 9 Carry
