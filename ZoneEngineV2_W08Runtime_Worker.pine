@@ -29,6 +29,14 @@
 // materialization (continuation re-install, fresh allocation, origin / inverse / participation / interval), 3 TouchMark ring
 // replacement (B11 Merge plan / B12 SPLIT_LOCAL rows), 4 (index: in 2), 5 invalidation counts, 6 consumed READY pending
 // clear, 7 absorbed free, 8 range revision.
+//
+// B15-B3 (/4): the committed pass also reports the W06 dependency carry (pass.dependencyChangedRootIds, rootId ASC, unique):
+// the W06 L6 / L7 / L8 inputs of every Core are snapshotted before commit step 1 and after step 8 (live Core IDs, canonical
+// bottom / top ticks, participation (coreId, rootId) pairs, PendingTopology Root node (coreId, rootId) pairs); a Core whose
+// snapshot differs (alloc, free, tick range, participant set, pending Root set) contributes its old and new participation /
+// origin / pending Roots, and (I27-14) the W06 L7 PC neighborhood [bottomTick - mTick, topTick + mTick] of its old range
+// (free, tick change) and new range (alloc, tick change). Touch rows, Side state, revision counters, an exact float range change with equal ticks, a
+// failed F0 (no commit) and a no-op pass give nothing. Nothing persistent is written for the carry here (the caller keeps it).
 // ============================================================
 library("ZoneEngineV2_W08Runtime_Worker", overlay = false)
 
@@ -51,6 +59,12 @@ const int PH_DORMANT      = 5
 const int GR_UNAVAILABLE  = 3
 const int FVG_MASK_NONE   = 0
 const int CAND_MEMBER_ROLE_INCLUDED_BROAD = 2
+const int DEP_TICK_NA = -2147483647
+const int CAT_MA       = 0
+const int CAT_SWING    = 1
+const int CAT_ACCUM    = 2
+const int CAT_TIME_HL  = 3
+const int ROOT_ACTIVE  = 1
 
 export type RootView
     array<int>    rootIds
@@ -60,6 +74,12 @@ export type RootView
     array<bool>   rootIsBroadFvgFlags
     array<int>    rootParticipationHeadEdgeIndexes
     array<int>    rootParticipationCounts
+    array<int>    rootPriceOrderSlots
+    array<int>    rootPointTicks
+    array<int>    rootStates
+    array<int>    rootDirections
+    array<int>    rootNativeBottomTicks
+    array<int>    rootNativeTopTicks
 
 export type ParticipationView
     array<int>  participationEdgeRootSlots
@@ -157,6 +177,7 @@ export type ShadowPass
     array<int>  freeSlots
     array<int>  freeCoreIds
     array<int>  freeGenerationIds
+    array<int>  dependencyChangedRootIds
 
 participationEdgeResetRaw(ShadowContext ctx, int edgeIndex) =>
     array.set(ctx.pv.participationEdgeRootSlots,         edgeIndex, SLOT_INVALID)
@@ -2202,6 +2223,87 @@ coreFreeCommitRaw(ShadowContext ctx, W08Core.PendingTopologyStore ps, int coreSl
     coreResetSlotRaw(ctx, coreSlot)
     array.push(cr.coreFreeSlots, coreSlot)
     true
+// W08 B15-B3: W06 dependency snapshot of the committed Core state: live Core IDs with their canonical bottom / top ticks (na ->
+// DEP_TICK_NA), the live participation (coreId, rootId) pairs and the live PendingTopology Root node (coreId, rootId) pairs.
+// Read-only.
+depSnapshotRaw(ShadowContext ctx, W08Core.PendingTopologyStore ps) =>
+    W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
+    map<int, int> bt = map.new<int, int>()
+    map<int, int> tt = map.new<int, int>()
+    array<int> pc = array.new_int(0)
+    array<int> pr = array.new_int(0)
+    array<int> qc = array.new_int(0)
+    array<int> qr = array.new_int(0)
+    int s = 0
+    while s < array.size(cr.coreIds) and s < array.size(cr.coreSlotLiveFlags) and s < array.size(cr.corePhysicalBottoms) and s < array.size(cr.corePhysicalTops)
+        int id = array.get(cr.coreIds, s)
+        if array.get(cr.coreSlotLiveFlags, s) and id != ID_NONE
+            float b = array.get(cr.corePhysicalBottoms, s)
+            float t = array.get(cr.corePhysicalTops, s)
+            map.put(bt, id, na(b) ? DEP_TICK_NA : int(math.round(b / ctx.mintick)))
+            map.put(tt, id, na(t) ? DEP_TICK_NA : int(math.round(t / ctx.mintick)))
+        s += 1
+    int e = 0
+    while e < array.size(ctx.pv.participationEdgeLiveFlags) and e < array.size(ctx.pv.participationEdgeExpectedCoreIds) and e < array.size(ctx.pv.participationEdgeExpectedRootIds)
+        if array.get(ctx.pv.participationEdgeLiveFlags, e)
+            array.push(pc, array.get(ctx.pv.participationEdgeExpectedCoreIds, e))
+            array.push(pr, array.get(ctx.pv.participationEdgeExpectedRootIds, e))
+        e += 1
+    int rn = 0
+    while rn < array.size(ps.pendingTopologyRootNodeLiveFlags) and rn < array.size(ps.pendingTopologyRootNodeExpectedCoreIds) and rn < array.size(ps.pendingTopologyRootNodeRootIds)
+        if array.get(ps.pendingTopologyRootNodeLiveFlags, rn)
+            array.push(qc, array.get(ps.pendingTopologyRootNodeExpectedCoreIds, rn))
+            array.push(qr, array.get(ps.pendingTopologyRootNodeRootIds, rn))
+        rn += 1
+    [bt, tt, pc, pr, qc, qr]
+// I27-14: the W06 L7 neighborhood of one canonical Core tick range: the W06 /19 compPointRangeScanRaw(bottomTick - mTick,
+// topTick + mTick) walk (rootPriceOrderSlots order, stop at the first tick above the bound, both bounds inclusive) with its
+// capable PC predicate (compSideMaskRaw == 3: slot within the 9 Root arrays, live, rootId != 0, MA / Swing / Accum / TimeHL,
+// ROOT_ACTIVE, pointTick not na). Skipped when a tick is na or bottomTick > topTick (the W06 Core expansion guard). Adds
+// the rootIds to dep; returns the count added.
+depL7ScanRaw(ShadowContext ctx, int bottomTick, int topTick, int mTick, map<int, bool> dep) =>
+    RootView rv = ctx.rv
+    int added = 0
+    if bottomTick != DEP_TICK_NA and topTick != DEP_TICK_NA and bottomTick <= topTick
+        int  lo   = bottomTick - mTick
+        int  hi   = topTick + mTick
+        bool done = false
+        int  p    = 0
+        while not done and p < array.size(rv.rootPriceOrderSlots)
+            int slot = array.get(rv.rootPriceOrderSlots, p)
+            if slot >= 0 and slot < array.size(rv.rootIds) and slot < array.size(rv.rootPointTicks)
+                int tick = array.get(rv.rootPointTicks, slot)
+                if not na(tick)
+                    if tick > hi
+                        done := true
+                    else if tick >= lo and slot < array.size(rv.rootSlotLiveFlags) and slot < array.size(rv.rootCategories) and slot < array.size(rv.rootStates) and slot < array.size(rv.rootDirections) and slot < array.size(rv.rootNativeBottomTicks) and slot < array.size(rv.rootNativeTopTicks)
+                        int category = array.get(rv.rootCategories, slot)
+                        if array.get(rv.rootSlotLiveFlags, slot) and array.get(rv.rootIds, slot) != ID_NONE and (category == CAT_MA or category == CAT_SWING or category == CAT_ACCUM or category == CAT_TIME_HL) and array.get(rv.rootStates, slot) == ROOT_ACTIVE
+                            map.put(dep, array.get(rv.rootIds, slot), true)
+                            added += 1
+            p += 1
+    added
+// Marks changed every Core of a (coreId, rootId) pair of A that B does not hold (pair key coreId * k + rootId).
+depMarkMissingRaw(array<int> ac, array<int> ar, array<int> bc, array<int> br, int k, map<int, bool> changed) =>
+    map<int, bool> inB = map.new<int, bool>()
+    int i = 0
+    while i < array.size(bc)
+        map.put(inB, array.get(bc, i) * k + array.get(br, i), true)
+        i += 1
+    i := 0
+    while i < array.size(ac)
+        if not map.contains(inB, array.get(ac, i) * k + array.get(ar, i))
+            map.put(changed, array.get(ac, i), true)
+        i += 1
+    true
+// Adds the rootId (> 0) of every (coreId, rootId) pair of a changed Core to dep.
+depCollectRaw(array<int> c, array<int> r, map<int, bool> changed, map<int, bool> dep) =>
+    int i = 0
+    while i < array.size(c)
+        if map.contains(changed, array.get(c, i)) and array.get(r, i) > 0
+            map.put(dep, array.get(r, i), true)
+        i += 1
+    true
 sideActiveRaw(W08Core.CoreRegistryStore cr, int coreSlot) =>
     array.get(cr.sidePhases, coreSlot * 2) == PH_ACTIVE_TOUCH or array.get(cr.sidePhases, coreSlot * 2 + 1) == PH_ACTIVE_TOUCH
 // W08 B15-B2: plan of one shadow pass. The global pending pool integrity scan runs once on a scratch copy of the pending
@@ -2230,7 +2332,7 @@ export planPass(ShadowContext ctx) =>
     int  nt = int(array.size(ws.changedTargets) / 5)
     int  no = int(array.size(ws.changedOldCores) / 2)
     bool ok = c >= 0 and n >= 0 and array.size(ws.changedTargets) == 5 * nt and array.size(ws.changedOldCores) == 2 * no
-    ShadowPass pr = ShadowPass.new(applyComp = array.new_bool(ok ? c : 0, true), applyP = array.new_bool(ok ? n : 0, false), mergeOfP = array.new_int(ok ? n : 0, -1), splitOfP = array.new_int(ok ? n : 0, -1), consumedSlots = array.new_int(0), freeSlots = array.new_int(0), freeCoreIds = array.new_int(0), freeGenerationIds = array.new_int(0))
+    ShadowPass pr = ShadowPass.new(applyComp = array.new_bool(ok ? c : 0, true), applyP = array.new_bool(ok ? n : 0, false), mergeOfP = array.new_int(ok ? n : 0, -1), splitOfP = array.new_int(ok ? n : 0, -1), consumedSlots = array.new_int(0), freeSlots = array.new_int(0), freeCoreIds = array.new_int(0), freeGenerationIds = array.new_int(0), dependencyChangedRootIds = array.new_int(0))
     pr.poolScans := 1
     int i = 0
     while ok and i < no
@@ -2386,14 +2488,51 @@ export commitPass(ShadowContext ctx, ShadowPass pr, int materializeBaseCloseTime
     if not pr.preflightOk or pr.committed
         runtime.error("W08 B15-B2: commitPass without a passed preflightPass")
     W08Core.W08Store ws = ctx.ws
+    W08Core.CoreRegistryStore cr = ws.coreRegistry
     int n = ws.physicalCandidateLogicalCount
+    // B15-B3: W06 dependency snapshot before step 1, and the pre-commit origin of every Core the commit can change
+    // (continued, freed, consumed READY, pending in the current or the planned pool)
+    [bt0, tt0, pc0, pr0, qc0, qr0] = depSnapshotRaw(ctx, ctx.ps)
+    array<int> oc0 = array.new_int(0)
+    array<int> or0 = array.new_int(0)
+    array<int> orig = array.new_int(0)
+    array<bool> candSlot = array.new_bool(array.size(cr.coreIds), false)
+    int p = 0
+    while p < n
+        if array.get(pr.applyP, p) and array.get(ws.physicalOwnershipKinds, p) == 0
+            array.set(candSlot, array.get(ws.physicalContinuationOldCoreSlots, p), true)
+        p += 1
+    int i = 0
+    while i < array.size(pr.freeSlots)
+        array.set(candSlot, array.get(pr.freeSlots, i), true)
+        i += 1
+    i := 0
+    while i < array.size(pr.consumedSlots)
+        array.set(candSlot, array.get(pr.consumedSlots, i), true)
+        i += 1
+    int cs = 0
+    while cs < array.size(cr.coreIds)
+        bool cand = array.get(candSlot, cs)
+        if not cand and cs < array.size(ctx.ps.corePendingTopologyFlags)
+            cand := array.get(ctx.ps.corePendingTopologyFlags, cs)
+        if not cand and cs < array.size(ctx.psPlan.corePendingTopologyFlags)
+            cand := array.get(ctx.psPlan.corePendingTopologyFlags, cs)
+        if cand and array.get(cr.coreSlotLiveFlags, cs)
+            int cid = array.get(cr.coreIds, cs)
+            if W08Core.originReadAsc(ws, cs, cid, orig) >= 0
+                int j = 0
+                while j < array.size(orig)
+                    array.push(oc0, cid)
+                    array.push(or0, array.get(orig, j))
+                    j += 1
+        cs += 1
     pendingReplaceRaw(ctx.ps, ctx.psPlan)
     int fa = materializeAppliedRaw(ctx, pr.applyP, materializeBaseCloseTime, true)
     if fa < 0
         runtime.error("W08 B15-B2: materialization broke the pr preflight")
     pr.freshApplied := fa
     W08Touch.TouchRing ring = touchRingViewRaw(ctx)
-    int p = 0
+    p := 0
     while p < n
         int rows = 0
         if array.get(pr.mergeOfP, p) >= 0
@@ -2404,7 +2543,7 @@ export commitPass(ShadowContext ctx, ShadowPass pr, int materializeBaseCloseTime
             runtime.error("W08 B15-B2: TouchMark apply broke the pr preflight")
         pr.touchRowsWritten := pr.touchRowsWritten + rows
         p += 1
-    int i = 0
+    i := 0
     while i < array.size(pr.consumedSlots)
         pendingClearChainRaw(ctx.ps, array.get(pr.consumedSlots, i))
         i += 1
@@ -2416,9 +2555,107 @@ export commitPass(ShadowContext ctx, ShadowPass pr, int materializeBaseCloseTime
     if ctx.sc.rangeChanged
         ctx.sc.coreRangeRevision := ctx.sc.coreRangeRevision + 1
         ctx.sc.rangeChanged := false
+    // B15-B3: W06 dependency carry = the old and new participation / origin / pending Roots of every Core whose L6 / L7 /
+    // L8 snapshot changed
+    [bt1, tt1, pc1, pr1, qc1, qr1] = depSnapshotRaw(ctx, ctx.ps)
+    int k = math.max(ctx.sc.nextRootId, 1) + 1
+    map<int, bool> changed = map.new<int, bool>()
+    array<int> ids0 = map.keys(bt0)
+    i := 0
+    while i < array.size(ids0)
+        int id = array.get(ids0, i)
+        if not map.contains(bt1, id)
+            map.put(changed, id, true)
+        else if map.get(bt1, id) != map.get(bt0, id) or map.get(tt1, id) != map.get(tt0, id)
+            map.put(changed, id, true)
+        i += 1
+    array<int> ids1 = map.keys(bt1)
+    i := 0
+    while i < array.size(ids1)
+        if not map.contains(bt0, array.get(ids1, i))
+            map.put(changed, array.get(ids1, i), true)
+        i += 1
+    depMarkMissingRaw(pc0, pr0, pc1, pr1, k, changed)
+    depMarkMissingRaw(pc1, pr1, pc0, pr0, k, changed)
+    depMarkMissingRaw(qc0, qr0, qc1, qr1, k, changed)
+    depMarkMissingRaw(qc1, qr1, qc0, qr0, k, changed)
+    map<int, bool> dep = map.new<int, bool>()
+    depCollectRaw(pc0, pr0, changed, dep)
+    depCollectRaw(pc1, pr1, changed, dep)
+    depCollectRaw(qc0, qr0, changed, dep)
+    depCollectRaw(qc1, qr1, changed, dep)
+    depCollectRaw(oc0, or0, changed, dep)
+    array<int> chIds = map.keys(changed)
+    i := 0
+    while i < array.size(chIds)
+        int id = array.get(chIds, i)
+        if map.contains(cr.coreIdToSlot, id)
+            if W08Core.originReadAsc(ws, map.get(cr.coreIdToSlot, id), id, orig) >= 0
+                int j = 0
+                while j < array.size(orig)
+                    if array.get(orig, j) > 0
+                        map.put(dep, array.get(orig, j), true)
+                    j += 1
+        i += 1
+    // I27-14 L7: the PC neighborhood of the old range (free, tick change) and of the new range (alloc, tick change)
+    int mTick = int(math.round(ctx.clusterMaxWidth / ctx.mintick))
+    i := 0
+    while i < array.size(chIds)
+        int  id  = array.get(chIds, i)
+        bool in0 = map.contains(bt0, id)
+        bool in1 = map.contains(bt1, id)
+        bool tickChanged = in0 and in1
+        if tickChanged
+            tickChanged := map.get(bt0, id) != map.get(bt1, id) or map.get(tt0, id) != map.get(tt1, id)
+        if (in0 and not in1) or tickChanged
+            depL7ScanRaw(ctx, map.get(bt0, id), map.get(tt0, id), mTick, dep)
+        if (in1 and not in0) or tickChanged
+            depL7ScanRaw(ctx, map.get(bt1, id), map.get(tt1, id), mTick, dep)
+        i += 1
+    array.clear(pr.dependencyChangedRootIds)
+    array.concat(pr.dependencyChangedRootIds, map.keys(dep))
+    array.sort(pr.dependencyChangedRootIds, order.ascending)
     ctx.pendingPoolTrusted := false
     pr.committed := true
     pr
+// W08 B15-B3: W06 dependency carry helpers (the caller's persistent carry and seed arrays, by reference; no W06 import).
+// dependencyCarryMerge: the committed pass's dependencyChangedRootIds joins the unconsumed carry (never overwritten):
+// union, rootId ASC, unique; an empty input writes nothing. Returns the carry size.
+export dependencyCarryMerge(array<int> carry, array<int> add) =>
+    if array.size(add) > 0
+        array.concat(carry, add)
+        array.sort(carry, order.ascending)
+        int i = array.size(carry) - 1
+        while i > 0
+            if array.get(carry, i) == array.get(carry, i - 1)
+                array.remove(carry, i)
+            i -= 1
+    array.size(carry)
+// dependencyCarryInject: every carry Root not already among the seeds 0 .. seedCount - 1 is appended as a dependency-only
+// seed (reason mask 0; set within the physical size, push beyond); an existing seed keeps its mask (mask OR 0). The carry
+// is never cleared here (the caller clears it after a W06 build that used it succeeded). Returns the new seed count.
+export dependencyCarryInject(array<int> carry, array<int> seedRootIds, array<int> seedReasonMasks, int seedCount) =>
+    int n = seedCount
+    int i = 0
+    while i < array.size(carry)
+        int  id    = array.get(carry, i)
+        bool found = false
+        int  j     = 0
+        while not found and j < n
+            found := array.get(seedRootIds, j) == id
+            j += 1
+        if not found
+            if n < array.size(seedRootIds)
+                array.set(seedRootIds, n, id)
+            else
+                array.push(seedRootIds, id)
+            if n < array.size(seedReasonMasks)
+                array.set(seedReasonMasks, n, 0)
+            else
+                array.push(seedReasonMasks, 0)
+            n += 1
+        i += 1
+    n
 // W08 B15-B2: plan -> F0 -> commit (only when the F0 passed). Returns the pass; pass.committed tells whether anything was
 // written.
 export runShadow(ShadowContext ctx, int materializeBaseCloseTime) =>
