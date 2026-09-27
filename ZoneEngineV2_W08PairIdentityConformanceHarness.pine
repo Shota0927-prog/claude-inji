@@ -1,0 +1,722 @@
+//@version=6
+// ============================================================
+// ZoneEngineV2_W08PairIdentityConformanceHarness - W08 B16 Pairing / Identity Reference conformance TradingView probe
+//
+// Scratch fixtures only (no Main library, no production storage). Production authority = the published W08Runtime /4
+// exports: runShadow (pass 1: the old Cores are allocated by the real materialization, never injected) and planPass
+// (pass 2: the physical Candidates, the physical Identity plan and the ownership plan are read from W08Core storage after
+// the real chain). The Reference below is brute force on the logical fixture only (all Support x Resistance pairs, all
+// old Core x new physical Candidate pairs, exhaustive maximum matching enumeration, lexicographically first edge sequence
+// in (row rank, column rank) order); it never calls a pairing / gather / matching helper.
+// Reference rules:
+//   Pairing edge   = Support x Resistance, tick gap max(0, R.bottom - S.top, S.bottom - R.top) <= M and a shared
+//                    non-FVG Root. A shared FVG Root with gap <= M is outside the W05 domain (an FVG Root is eligible
+//                    for one Side only) -> the pass must fail closed (planPass -1, no physical Candidate).
+//   Side rank      = (effective bottom tick, top tick, winner index) ASC. Canonical matching = maximum cardinality, then the
+//                    lexicographically first edge sequence. Physical order = matched pairs (canonical), unmatched Support,
+//                    unmatched Resistance (Side rank). Root union ASC, minRootId = first union ID, tick / exact envelope.
+//   Identity edge  = old Core x physical Candidate: old ticks = round(exact / mintick), gap <= M, and a shared live origin
+//                    Root that is not a Broad FVG. Old rank (createdTime, coreId); new rank (bottom, top, minRootId, Root
+//                    set lexicographic, shorter first). Continuation keeps coreId / generationId; fresh = the rest in new
+//                    rank order (the fixtures have no complete fresh tie). Pass 1 IDs: fresh rank r -> coreId / generationId
+//                    1 + r (empty registry, counters 1).
+// Per case: PAIR_DRIFT (physical count / provenance / ticks / exact / minRootId / union), IDENTITY_DRIFT (edge set, match
+// set, continuation coreId / generationId, fresh set / order), FAIL_CLOSED_DRIFT; PASS = all 0 and the hand expectation.
+// B16_CONFORMANCE_PASS = 1 only when every case passes.
+// ============================================================
+indicator("ZoneEngineV2_W08PairIdentityConformanceHarness", overlay = false)
+
+import sekine3310/ZoneEngineV2_W08Core_Worker/16 as W08Core
+import sekine3310/ZoneEngineV2_W08Touch_Worker/3 as W08Touch
+import sekine3310/ZoneEngineV2_W08Runtime_Worker/4 as W08Runtime
+
+const int SLOT_INVALID = -1
+const int CAT_SWING    = 1
+const int CAT_FVG      = 4
+const int ROOT_ACTIVE  = 1
+
+// ---- fixture ----
+type Fx
+    array<int>  rootIds
+    array<int>  rootCats
+    array<bool> rootBroad
+    array<int>  rootTicks
+    int         mTick = 5
+
+type Win
+    array<int>   sides
+    array<int>   bots
+    array<int>   tops
+    array<float> exact
+    array<int>   offs
+    array<int>   lens
+    array<int>   roots
+
+type Phys
+    array<int>   s
+    array<int>   r
+    array<int>   bt
+    array<int>   tt
+    array<float> bp
+    array<float> tp
+    array<int>   mr
+    array<int>   off
+    array<int>   len
+    array<int>   roots
+    bool         invalid = false
+    int          edges   = 0
+
+newWin() =>
+    Win.new(array.new_int(0), array.new_int(0), array.new_int(0), array.new_float(0), array.new_int(0), array.new_int(0), array.new_int(0))
+
+// one winner (Root slice rootId ASC as written by the fixture)
+addW(Win w, int side, int bot, int top, float bp, float tp, array<int> rs) =>
+    array.push(w.sides, side)
+    array.push(w.bots, bot)
+    array.push(w.tops, top)
+    array.push(w.exact, bp)
+    array.push(w.exact, tp)
+    array.push(w.offs, array.size(w.roots))
+    array.push(w.lens, array.size(rs))
+    int i = 0
+    while i < array.size(rs)
+        array.push(w.roots, array.get(rs, i))
+        i += 1
+    w
+
+newPhys() =>
+    Phys.new(array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_float(0), array.new_float(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0))
+
+rootCat(Fx f, int id) =>
+    int k = array.indexof(f.rootIds, id)
+    k >= 0 ? array.get(f.rootCats, k) : -1
+rootIsBroad(Fx f, int id) =>
+    int k = array.indexof(f.rootIds, id)
+    k >= 0 ? array.get(f.rootBroad, k) : false
+gapT(int b1, int t1, int b2, int t2) =>
+    math.max(0, b2 - t1, b1 - t2)
+
+// ---- Reference (fixture only) ----
+// Side order: winner indexes of one Side by (bottom, top, index) ASC
+sideOrder(Win w, int side) =>
+    array<int> o = array.new_int(0)
+    int i = 0
+    while i < array.size(w.sides)
+        if array.get(w.sides, i) == side
+            int k = 0
+            bool placed = false
+            while not placed and k < array.size(o)
+                int j = array.get(o, k)
+                int bi = array.get(w.bots, i)
+                int bj = array.get(w.bots, j)
+                int ti = array.get(w.tops, i)
+                int tj = array.get(w.tops, j)
+                if bi < bj or (bi == bj and (ti < tj or (ti == tj and i < j)))
+                    placed := true
+                else
+                    k += 1
+            array.insert(o, k, i)
+        i += 1
+    o
+
+// shared Roots of two rootId sets: [shared non-FVG, shared FVG, shared non-Broad]
+shareRaw(Fx f, array<int> ra, int oa, int la, array<int> rb, int ob, int lb) =>
+    bool nonFvg   = false
+    bool fvg      = false
+    bool nonBroad = false
+    int a = 0
+    while a < la
+        int id = array.get(ra, oa + a)
+        int b = 0
+        while b < lb
+            if array.get(rb, ob + b) == id
+                int c = rootCat(f, id)
+                nonFvg   := nonFvg or c != CAT_FVG
+                fvg      := fvg or c == CAT_FVG
+                nonBroad := nonBroad or not (c == CAT_FVG and rootIsBroad(f, id))
+            b += 1
+        a += 1
+    [nonFvg, fvg, nonBroad]
+
+// exhaustive maximum matching: every assignment row -> column or none ((nCol + 1) ^ nRow codes); the valid one of
+// maximum size whose (row, column) sequence (rows ASC) is lexicographically first. Returns the column of each row (-1).
+bruteMatch(int nRow, int nCol, array<bool> e) =>
+    array<int> best = array.new_int(nRow, -1)
+    array<int> cur  = array.new_int(nRow, -1)
+    int bestSize = -1
+    int base  = nCol + 1
+    int total = int(math.round(math.pow(base, nRow)))
+    int code  = 0
+    while code < total
+        int  x     = code
+        bool valid = true
+        int  size  = 0
+        array<bool> usedC = array.new_bool(nCol + 1, false)
+        int r = 0
+        while r < nRow
+            int d = x % base
+            x := int(math.floor(x / base))
+            array.set(cur, r, d < nCol ? d : -1)
+            if d < nCol
+                valid := valid and array.get(e, r * nCol + d) and not array.get(usedC, d)
+                array.set(usedC, d, true)
+                size += 1
+            r += 1
+        if valid
+            bool better = size > bestSize
+            if not better and size == bestSize
+                int a = 0
+                int b = 0
+                int cmp = 0
+                while cmp == 0 and a < nRow and b < nRow
+                    while a < nRow and array.get(cur, a) < 0
+                        a += 1
+                    while b < nRow and array.get(best, b) < 0
+                        b += 1
+                    if a < nRow and b < nRow
+                        cmp := a != b ? a - b : array.get(cur, a) - array.get(best, b)
+                        a += 1
+                        b += 1
+                better := cmp < 0
+            if better
+                bestSize := size
+                int q = 0
+                while q < nRow
+                    array.set(best, q, array.get(cur, q))
+                    q += 1
+        code += 1
+    best
+
+// physical Candidate of Support s and / or Resistance r (-1 absent): Root union ASC, envelopes, minRootId
+physAppend(Phys p, Win w, int s, int r) =>
+    array<int> u = array.new_int(0)
+    int bt = 0
+    int tt = 0
+    float bp = na
+    float tp = na
+    bool first = true
+    int k = 0
+    while k < 2
+        int x = k == 0 ? s : r
+        if x >= 0
+            int o = array.get(w.offs, x)
+            int j = 0
+            while j < array.get(w.lens, x)
+                int id = array.get(w.roots, o + j)
+                if not array.includes(u, id)
+                    array.push(u, id)
+                j += 1
+            bt := first ? array.get(w.bots, x) : math.min(bt, array.get(w.bots, x))
+            tt := first ? array.get(w.tops, x) : math.max(tt, array.get(w.tops, x))
+            bp := first ? array.get(w.exact, 2 * x) : math.min(bp, array.get(w.exact, 2 * x))
+            tp := first ? array.get(w.exact, 2 * x + 1) : math.max(tp, array.get(w.exact, 2 * x + 1))
+            first := false
+        k += 1
+    array.sort(u, order.ascending)
+    array.push(p.s, s)
+    array.push(p.r, r)
+    array.push(p.bt, bt)
+    array.push(p.tt, tt)
+    array.push(p.bp, bp)
+    array.push(p.tp, tp)
+    array.push(p.mr, array.get(u, 0))
+    array.push(p.off, array.size(p.roots))
+    array.push(p.len, array.size(u))
+    int jj = 0
+    while jj < array.size(u)
+        array.push(p.roots, array.get(u, jj))
+        jj += 1
+    p
+
+refPhysical(Fx f, Win w) =>
+    Phys p = newPhys()
+    array<int> so = sideOrder(w, 1)
+    array<int> ro = sideOrder(w, -1)
+    int nS = array.size(so)
+    int nR = array.size(ro)
+    array<bool> e = array.new_bool(nS * nR + 1, false)
+    int a = 0
+    while a < nS
+        int b = 0
+        while b < nR
+            int s = array.get(so, a)
+            int r = array.get(ro, b)
+            int g = gapT(array.get(w.bots, s), array.get(w.tops, s), array.get(w.bots, r), array.get(w.tops, r))
+            [nonFvg, fvg, nonBroad] = shareRaw(f, w.roots, array.get(w.offs, s), array.get(w.lens, s), w.roots, array.get(w.offs, r), array.get(w.lens, r))
+            if fvg and g <= f.mTick
+                p.invalid := true
+            if nonFvg and g <= f.mTick
+                array.set(e, a * nR + b, true)
+                p.edges += 1
+            b += 1
+        a += 1
+    array<int> col = bruteMatch(nS, nR, e)
+    array<bool> usedR = array.new_bool(nR + 1, false)
+    a := 0
+    while a < nS
+        if array.get(col, a) >= 0
+            array.set(usedR, array.get(col, a), true)
+            physAppend(p, w, array.get(so, a), array.get(ro, array.get(col, a)))
+        a += 1
+    a := 0
+    while a < nS
+        if array.get(col, a) < 0
+            physAppend(p, w, array.get(so, a), -1)
+        a += 1
+    int rb = 0
+    while rb < nR
+        if not array.get(usedR, rb)
+            physAppend(p, w, -1, array.get(ro, rb))
+        rb += 1
+    p
+
+// new canonical order of physical Candidates i (of P) and j (of Q): bottom, top, minRootId, Root set (shorter first)
+newCmp(Phys P, int i, Phys Q, int j) =>
+    int c = array.get(P.bt, i) - array.get(Q.bt, j)
+    if c == 0
+        c := array.get(P.tt, i) - array.get(Q.tt, j)
+    if c == 0
+        c := array.get(P.mr, i) - array.get(Q.mr, j)
+    int a = 0
+    int la = array.get(P.len, i)
+    int lb = array.get(Q.len, j)
+    while c == 0 and a < la and a < lb
+        c := array.get(P.roots, array.get(P.off, i) + a) - array.get(Q.roots, array.get(Q.off, j) + a)
+        a += 1
+    if c == 0
+        c := la - lb
+    c > 0 ? 1 : c < 0 ? -1 : 0
+
+// indexes in new canonical order (selected only); tie -> tied = true
+newOrder(Phys P, array<bool> sel) =>
+    array<int> o = array.new_int(0)
+    bool tied = false
+    int i = 0
+    while i < array.size(P.bt)
+        if array.get(sel, i)
+            int k = 0
+            bool placed = false
+            while not placed and k < array.size(o)
+                int c = newCmp(P, i, P, array.get(o, k))
+                tied := tied or c == 0
+                if c < 0
+                    placed := true
+                else
+                    k += 1
+            array.insert(o, k, i)
+        i += 1
+    [o, tied]
+
+// Identity Reference: old Cores = pass 1 physical Candidates O with IDs oldIds (createdTime equal -> old rank = coreId);
+// new = pass 2 physical Candidates N. Returns [edge codes p * 1000 + id sorted, match codes, contId per p, contGen per p,
+// fresh rank per p (-1 continuation), invalid]
+refIdentity(Fx f, Phys O, array<int> oldIds, Phys N) =>
+    int nO = array.size(O.bt)
+    int nN = array.size(N.bt)
+    array<int> edgeCodes = array.new_int(0)
+    array<bool> bearing = array.new_bool(nN, false)
+    // rows: old Cores by coreId ASC
+    array<int> rowOld = array.new_int(0)
+    int i = 0
+    while i < nO
+        int k = 0
+        while k < array.size(rowOld) and array.get(oldIds, array.get(rowOld, k)) < array.get(oldIds, i)
+            k += 1
+        array.insert(rowOld, k, i)
+        i += 1
+    array<bool> em = array.new_bool(nO * nN + 1, false)
+    int r = 0
+    while r < nO
+        int o = array.get(rowOld, r)
+        int ob = int(math.round(array.get(O.bp, o)))
+        int ot = int(math.round(array.get(O.tp, o)))
+        int p = 0
+        while p < nN
+            [nonFvg, fvg, nonBroad] = shareRaw(f, O.roots, array.get(O.off, o), array.get(O.len, o), N.roots, array.get(N.off, p), array.get(N.len, p))
+            if nonBroad and gapT(ob, ot, array.get(N.bt, p), array.get(N.tt, p)) <= f.mTick
+                array.set(em, r * nN + p, true)
+                array.set(bearing, p, true)
+                array.push(edgeCodes, p * 1000 + array.get(oldIds, o))
+            p += 1
+        r += 1
+    array.sort(edgeCodes, order.ascending)
+    [colOrder, tiedB] = newOrder(N, bearing)
+    int nC = array.size(colOrder)
+    array<bool> e = array.new_bool(nO * nC + 1, false)
+    r := 0
+    while r < nO
+        int c = 0
+        while c < nC
+            array.set(e, r * nC + c, array.get(em, r * nN + array.get(colOrder, c)))
+            c += 1
+        r += 1
+    array<int> col = bruteMatch(nO, nC, e)
+    array<int> contId  = array.new_int(nN, 0)
+    array<int> contGen = array.new_int(nN, 0)
+    array<int> matchCodes = array.new_int(0)
+    r := 0
+    while r < nO
+        if array.get(col, r) >= 0
+            int p = array.get(colOrder, array.get(col, r))
+            int o = array.get(rowOld, r)
+            array.set(contId, p, array.get(oldIds, o))
+            array.set(contGen, p, array.get(oldIds, o))
+            array.push(matchCodes, p * 1000 + array.get(oldIds, o))
+        r += 1
+    array.sort(matchCodes, order.ascending)
+    array<bool> freshSel = array.new_bool(nN, false)
+    int pp = 0
+    while pp < nN
+        array.set(freshSel, pp, array.get(contId, pp) == 0)
+        pp += 1
+    [fo, tiedF] = newOrder(N, freshSel)
+    array<int> freshRank = array.new_int(nN, -1)
+    int q = 0
+    while q < array.size(fo)
+        array.set(freshRank, array.get(fo, q), q)
+        q += 1
+    [edgeCodes, matchCodes, contId, contGen, freshRank, tiedB or tiedF]
+
+// ---- Production (published exports only) ----
+toView(Win w, bool reverseBacking) =>
+    int n = array.size(w.sides)
+    array<int> offs  = array.new_int(n, 0)
+    array<int> roots = array.new_int(0)
+    int k = 0
+    while k < n
+        int i = reverseBacking ? n - 1 - k : k
+        array.set(offs, i, array.size(roots))
+        int j = 0
+        while j < array.get(w.lens, i)
+            array.push(roots, array.get(w.roots, array.get(w.offs, i) + j))
+            j += 1
+        k += 1
+    array<int> mins = array.new_int(0)
+    k := 0
+    while k < n
+        array.push(mins, array.get(w.roots, array.get(w.offs, k)))
+        k += 1
+    W08Runtime.WinnerView.new(n, array.size(roots), array.copy(w.sides), array.new_int(n, 1), array.copy(w.bots), array.copy(w.tops), mins, array.new_int(n, 0), array.new_int(n, int(na)), array.copy(w.exact), offs, array.copy(w.lens), roots)
+
+// pass 1 (runShadow, when w1 has winners) then pass 2 planPass. permute: Root slots reversed + winner backing reversed.
+// Returns [pass1 committed, pass 2 planResult, ws, cr]
+runProd(Fx f, Win w1, Win w2, bool permute, bool reverseMapInsert) =>
+    int n = array.size(f.rootIds)
+    array<int>  ids   = array.new_int(n, 0)
+    array<int>  cats  = array.new_int(n, 0)
+    array<bool> broad = array.new_bool(n, false)
+    array<int>  ticks = array.new_int(n, 0)
+    int k = 0
+    while k < n
+        int slot = permute ? n - 1 - k : k
+        array.set(ids, slot, array.get(f.rootIds, k))
+        array.set(cats, slot, array.get(f.rootCats, k))
+        array.set(broad, slot, array.get(f.rootBroad, k))
+        array.set(ticks, slot, array.get(f.rootTicks, k))
+        k += 1
+    map<int, int> idToSlot = map.new<int, int>()
+    k := 0
+    while k < n
+        int slot = reverseMapInsert ? n - 1 - k : k
+        map.put(idToSlot, array.get(ids, slot), slot)
+        k += 1
+    W08Core.W08Store ws = W08Core.newStore()
+    W08Core.CoreRegistryStore cr = ws.coreRegistry
+    cr.touchMarkCapacityPerCore := 4
+    W08Runtime.RootView rv = W08Runtime.RootView.new(rootIds = ids, rootSlotLiveFlags = array.new_bool(n, true), rootIdToSlot = idToSlot, rootCategories = cats, rootIsBroadFvgFlags = broad, rootParticipationHeadEdgeIndexes = array.new_int(n, SLOT_INVALID), rootParticipationCounts = array.new_int(n, 0), rootPriceOrderSlots = array.sort_indices(ticks, order.ascending), rootPointTicks = ticks, rootStates = array.new_int(n, ROOT_ACTIVE), rootDirections = array.new_int(n, 0), rootNativeBottomTicks = array.new_int(n, int(na)), rootNativeTopTicks = array.new_int(n, int(na)))
+    W08Runtime.ParticipationView pv = W08Runtime.ParticipationView.new(array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0))
+    W08Runtime.PhaseSetView hv = W08Runtime.PhaseSetView.new(array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0))
+    W08Runtime.ComponentMetaView mv = W08Runtime.ComponentMetaView.new(array.new_int(n, 0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.from(true))
+    W08Core.PendingTopologyStore ps = W08Core.PendingTopologyStore.new(cr.corePendingTopologyFlags, cr.corePendingTopologyChildHeadIndexes, cr.corePendingTopologyChildTailIndexes, cr.corePendingTopologyChildCounts, array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0))
+    W08Touch.TouchPlan tp = W08Touch.TouchPlan.new(array.new_int(0), array.new_int(0), array.new_bool(0), array.new_int(0), array.new_int(0), array.new_int(0), array.new_float(0), array.new_float(0), array.new_float(0), array.new_int(0), array.new_bool(0))
+    W08Runtime.ShadowScalars sc = W08Runtime.ShadowScalars.new(1, 1, int(array.max(ids)) + 1, 0, false)
+    W08Runtime.ShadowContext ctx = W08Runtime.ShadowContext.new(ws, rv, pv, hv, toView(w1, permute), mv, ps, ps, tp, W08Touch.newSplitTouchPlan(), sc, f.mTick * 1.0, 1.0, false)
+    bool ok1 = true
+    if array.size(w1.sides) > 0
+        W08Runtime.ShadowPass pr1 = W08Runtime.runShadow(ctx, 1000)
+        ok1 := pr1.committed
+    ctx.wv := toView(w2, permute)
+    W08Runtime.ShadowPass pr2 = W08Runtime.planPass(ctx)
+    [ok1, pr2.planResult, ws, cr]
+
+codesOf(array<int> d) =>
+    array<int> c = array.new_int(0)
+    int k = 0
+    while k + 2 < array.size(d)
+        array.push(c, array.get(d, k) * 1000 + array.get(d, k + 2))
+        k += 3
+    array.sort(c, order.ascending)
+    c
+intsEq(array<int> a, array<int> b) =>
+    bool eq = array.size(a) == array.size(b)
+    int i = 0
+    while eq and i < array.size(a)
+        eq := array.get(a, i) == array.get(b, i)
+        i += 1
+    eq
+
+// one case: Reference vs Production. Returns [pairDrift, idDrift, failClosedDrift, physCount, contCount, edgeCount, pass1Ok]
+runCase(Fx f, Win w1, Win w2, bool permute, bool reverseMapInsert) =>
+    Phys O = refPhysical(f, w1)
+    array<bool> allO = array.new_bool(array.size(O.bt), true)
+    [oOrder, oTied] = newOrder(O, allO)
+    array<int> oldIds = array.new_int(array.size(O.bt), 0)
+    int q = 0
+    while q < array.size(oOrder)
+        array.set(oldIds, array.get(oOrder, q), 1 + q)
+        q += 1
+    Phys N = refPhysical(f, w2)
+    [rEdges, rMatches, rContId, rContGen, rFresh, rTied] = refIdentity(f, O, oldIds, N)
+    [ok1, plan2, ws, cr] = runProd(f, w1, w2, permute, reverseMapInsert)
+    // pass 1 registry = the Reference fresh allocation (coreId 1 + rank, exact range of the physical Candidate)
+    bool pass1Ok = ok1 and not O.invalid and not oTied and array.size(cr.coreIds) == array.size(O.bt)
+    q := 0
+    while pass1Ok and q < array.size(O.bt)
+        int id = array.get(oldIds, q)
+        pass1Ok := map.contains(cr.coreIdToSlot, id)
+        if pass1Ok
+            int sl = map.get(cr.coreIdToSlot, id)
+            pass1Ok := array.get(cr.coreSlotLiveFlags, sl) and array.get(cr.coreGenerationIds, sl) == id and array.get(cr.corePhysicalBottoms, sl) == array.get(O.bp, q) and array.get(cr.corePhysicalTops, sl) == array.get(O.tp, q)
+        q += 1
+    int pairDrift  = 0
+    int idDrift    = 0
+    int failClosed = 0
+    int n = ws.physicalCandidateLogicalCount
+    if N.invalid
+        failClosed := plan2 == -1 and n == 0 ? 0 : 1
+    else
+        int nRef = array.size(N.bt)
+        pairDrift += n == nRef ? 0 : 1
+        int p = 0
+        while n == nRef and p < n
+            // Side provenance: Production winner index (the permuted view keeps winner indexes)
+            pairDrift += array.get(ws.physicalCandidateSupportWinnerIndexes, p) == array.get(N.s, p) and array.get(ws.physicalCandidateResistanceWinnerIndexes, p) == array.get(N.r, p) ? 0 : 1
+            pairDrift += array.get(ws.physicalCandidateBottomTicks, p) == array.get(N.bt, p) and array.get(ws.physicalCandidateTopTicks, p) == array.get(N.tt, p) ? 0 : 1
+            pairDrift += array.get(ws.physicalCandidateExactPrices, 2 * p) == array.get(N.bp, p) and array.get(ws.physicalCandidateExactPrices, 2 * p + 1) == array.get(N.tp, p) ? 0 : 1
+            pairDrift += array.get(ws.physicalCandidateMinRootIds, p) == array.get(N.mr, p) ? 0 : 1
+            int lp = array.get(ws.physicalCandidateRootIdLengths, p)
+            bool uEq = lp == array.get(N.len, p)
+            int j = 0
+            while uEq and j < lp
+                uEq := array.get(ws.physicalCandidateRootIds, array.get(ws.physicalCandidateRootIdOffsets, p) + j) == array.get(N.roots, array.get(N.off, p) + j)
+                j += 1
+            pairDrift += uEq ? 0 : 1
+            p += 1
+        idDrift += intsEq(codesOf(ws.physicalIdentityEdges), rEdges) ? 0 : 1
+        idDrift += intsEq(codesOf(ws.physicalIdentityMatches), rMatches) ? 0 : 1
+        idDrift += rTied ? 1 : 0
+        bool ownSized = array.size(ws.physicalOwnershipKinds) == nRef and array.size(ws.physicalFreshAllocationRanks) == nRef and array.size(ws.physicalContinuationCoreIds) == nRef and array.size(ws.physicalContinuationGenerationIds) == nRef
+        idDrift += ownSized ? 0 : 1
+        p := 0
+        while ownSized and p < nRef
+            bool isCont = array.get(ws.physicalOwnershipKinds, p) == 0
+            idDrift += isCont == (array.get(rContId, p) != 0) ? 0 : 1
+            idDrift += array.get(ws.physicalContinuationCoreIds, p) == array.get(rContId, p) ? 0 : 1
+            idDrift += array.get(ws.physicalContinuationGenerationIds, p) == array.get(rContGen, p) ? 0 : 1
+            idDrift += array.get(ws.physicalFreshAllocationRanks, p) == array.get(rFresh, p) ? 0 : 1
+            p += 1
+    int contCount = 0
+    int p2 = 0
+    while p2 < array.size(ws.physicalOwnershipKinds)
+        contCount += array.get(ws.physicalOwnershipKinds, p2) == 0 ? 1 : 0
+        p2 += 1
+    [pairDrift, idDrift, failClosed, n, contCount, int(array.size(ws.physicalIdentityEdges) / 3), pass1Ok]
+
+// ---- fixtures (mintick 1, M 5 unless set) ----
+fxOf(array<int> ids, array<int> cats, array<bool> broad, int m) =>
+    array<int> ticks = array.new_int(0)
+    int i = 0
+    while i < array.size(ids)
+        array.push(ticks, 100 + i)
+        i += 1
+    Fx.new(ids, cats, broad, ticks, m)
+fxSwing(int n, int m) =>
+    array<int> ids = array.new_int(0)
+    int i = 0
+    while i < n
+        array.push(ids, i + 1)
+        i += 1
+    fxOf(ids, array.new_int(n, CAT_SWING), array.new_bool(n, false), m)
+win1(int side, int bot, int top, array<int> rs) =>
+    addW(newWin(), side, bot, top, bot * 1.0, top * 1.0, rs)
+win2(int s1, int b1, int t1, array<int> r1, int s2, int b2, int t2, array<int> r2) =>
+    addW(addW(newWin(), s1, b1, t1, b1 * 1.0, t1 * 1.0, r1), s2, b2, t2, b2 * 1.0, t2 * 1.0, r2)
+
+var int   passAll    = 0
+var int   pairTotal  = 0
+var int   idTotal    = 0
+var int   fcTotal    = 0
+var array<float> res = array.new_float(32, na)
+var array<float> dg  = array.new_float(8, na)
+
+// case result: PASS (drift 0, pass 1 ok, hand expectation) into res[slot]
+record(int slot, int pd, int idd, int fc, bool p1, bool expect) =>
+    array.set(res, slot, pd == 0 and idd == 0 and fc == 0 and p1 and expect ? 1.0 : 0.0)
+    pd * 10000 + idd * 100 + fc
+
+if barstate.isfirst
+    Win none = newWin()
+    Fx sw = fxSwing(4, 5)
+    int pdT = 0
+    int idT = 0
+    int fcT = 0
+    // ---- Pairing ----
+    // P_A: shared Swing Root 1, gap 3 < M -> one physical
+    [a1, a2, a3, aN, aC, aE, aP] = runCase(sw, none, win2(1, 100, 104, array.from(1), -1, 107, 110, array.from(1)), false, false)
+    record(0, a1, a2, a3, aP, aN == 1)
+    // P_B: gap = M -> pair
+    [b1, b2, b3, bN, bC, bE, bP] = runCase(sw, none, win2(1, 100, 104, array.from(1), -1, 109, 112, array.from(1)), false, false)
+    record(1, b1, b2, b3, bP, bN == 1)
+    // P_C: gap = M + 1 -> no pair
+    [c1, c2, c3, cN, cC, cE, cP] = runCase(sw, none, win2(1, 100, 104, array.from(1), -1, 110, 112, array.from(1)), false, false)
+    record(2, c1, c2, c3, cP, cN == 2)
+    // P_D: overlap, no shared Root -> no pair
+    [d1, d2, d3, dN, dC, dE, dP] = runCase(sw, none, win2(1, 100, 110, array.from(1), -1, 105, 112, array.from(2)), false, false)
+    record(3, d1, d2, d3, dP, dN == 2)
+    // P_E: a Broad FVG Root on both Sides (outside the W05 domain) -> fail closed (planPass -1, no physical Candidate)
+    Fx fe = fxOf(array.from(1, 3), array.from(CAT_SWING, CAT_FVG), array.from(false, true), 5)
+    [e1, e2, e3, eN, eC, eE, eP] = runCase(fe, none, win2(1, 100, 104, array.from(3), -1, 103, 106, array.from(3)), false, false)
+    record(4, e1, e2, e3, eP, eN == 0)
+    // P_F: different FVG origins (4 Support, 5 Resistance), overlap -> no pair
+    Fx ff = fxOf(array.from(4, 5), array.from(CAT_FVG, CAT_FVG), array.from(false, false), 5)
+    [f1, f2, f3, fN, fC, fE, fP] = runCase(ff, none, win2(1, 100, 104, array.from(4), -1, 102, 106, array.from(5)), false, false)
+    record(5, f1, f2, f3, fP, fN == 2)
+    // P_G: the same FVG Root 6 on both Sides in one pass (outside the W05 domain) -> fail closed; the cross-pass same
+    // inverse origin is Identity I_F
+    Fx fg = fxOf(array.from(6), array.from(CAT_FVG), array.from(false), 5)
+    [g1, g2, g3, gN, gC, gE, gP] = runCase(fg, none, win2(1, 100, 104, array.from(6), -1, 102, 106, array.from(6)), false, false)
+    record(6, g1, g2, g3, gP, gN == 0)
+    // P_H: two maximum matchings {S0 R0, S1 R1} / {S0 R1, S1 R0} -> canonical {S0 R0, S1 R1} (winners 0 / 1 / 2 / 3)
+    Win wh = addW(addW(win2(1, 100, 102, array.from(1, 3), 1, 103, 104, array.from(2, 4)), -1, 101, 103, 101.0, 103.0, array.from(1, 2)), -1, 102, 105, 102.0, 105.0, array.from(3, 4))
+    [h1, h2, h3, hN, hC, hE, hP] = runCase(sw, none, wh, false, false)
+    record(7, h1, h2, h3, hP, hN == 2)
+    // P_I: P_H with Root slots and winner backing reversed
+    [i1, i2, i3, iN, iC, iE, iP] = runCase(sw, none, wh, true, false)
+    record(8, i1, i2, i3, iP, iN == 2)
+    // P_J: same ticks [100, 100], exact 99.9 / 100.2 and 100.3 / 100.4 -> exact envelope [99.9, 100.4]
+    Win wj = addW(addW(newWin(), 1, 100, 100, 99.9, 100.2, array.from(1)), -1, 100, 100, 100.3, 100.4, array.from(1))
+    [j1, j2, j3, jN, jC, jE, jP] = runCase(sw, none, wj, false, false)
+    record(9, j1, j2, j3, jP, jN == 1)
+    pdT += a1 + b1 + c1 + d1 + e1 + f1 + g1 + h1 + i1 + j1
+    idT += a2 + b2 + c2 + d2 + e2 + f2 + g2 + h2 + i2 + j2
+    fcT += a3 + b3 + c3 + d3 + e3 + f3 + g3 + h3 + i3 + j3
+    // ---- Identity (pass 1 allocates the old Cores, pass 2 plans) ----
+    // I_A: old {1} [100, 104]; new {1} [107, 110] (gap 3) -> continuation
+    [ia1, ia2, ia3, iaN, iaC, iaE, iaP] = runCase(sw, win1(1, 100, 104, array.from(1)), win1(1, 107, 110, array.from(1)), false, false)
+    record(10, ia1, ia2, ia3, iaP, iaC == 1)
+    // I_B: gap = M -> continuation
+    [ib1, ib2, ib3, ibN, ibC, ibE, ibP] = runCase(sw, win1(1, 100, 104, array.from(1)), win1(1, 109, 112, array.from(1)), false, false)
+    record(11, ib1, ib2, ib3, ibP, ibC == 1)
+    // I_C: gap = M + 1 -> fresh
+    [ic1, ic2, ic3, icN, icC, icE, icP] = runCase(sw, win1(1, 100, 104, array.from(1)), win1(1, 110, 112, array.from(1)), false, false)
+    record(12, ic1, ic2, ic3, icP, icC == 0 and icE == 0)
+    // I_E: old origin {1, 3 Broad}; new {2, 3 Broad} overlapping: only the Broad FVG is shared -> no Identity
+    Fx fie = fxOf(array.from(1, 2, 3), array.from(CAT_SWING, CAT_SWING, CAT_FVG), array.from(false, false, true), 5)
+    [ie1, ie2, ie3, ieN, ieC, ieE, ieP] = runCase(fie, win1(1, 100, 104, array.from(1, 3)), win1(1, 100, 104, array.from(2, 3)), false, false)
+    record(13, ie1, ie2, ie3, ieP, ieC == 0 and ieE == 0)
+    // I_F: old from FVG 6 as Support; FVG 6 now in a Resistance winner (Inverse) -> same non-Broad FVG origin -> continuation
+    Fx fif = fxOf(array.from(6), array.from(CAT_FVG), array.from(false), 5)
+    [fi1, fi2, fi3, fiN, fiC, fiE, fiP] = runCase(fif, win1(1, 100, 104, array.from(6)), win1(-1, 101, 105, array.from(6)), false, false)
+    record(14, fi1, fi2, fi3, fiP, fiC == 1)
+    // I_G: same Root 1, range moved by more than M ([120, 125]) -> fresh (new Core)
+    [ig1, ig2, ig3, igN, igC, igE, igP] = runCase(sw, win1(1, 100, 104, array.from(1)), win1(1, 120, 125, array.from(1)), false, false)
+    record(15, ig1, ig2, ig3, igP, igC == 0)
+    // I_H: same ticks, only the exact floats move (100.3 / 103.8) -> continuation
+    Win wih = addW(newWin(), 1, 100, 104, 100.3, 103.8, array.from(1))
+    [ih1, ih2, ih3, ihN, ihC, ihE, ihP] = runCase(sw, win1(1, 100, 104, array.from(1)), wih, false, false)
+    record(16, ih1, ih2, ih3, ihP, ihC == 1)
+    // I_I: old K1 {1, 2} [100, 104] and K2 {2, 3} [111, 115] (gap 7: not paired); new S{1} [100, 103], S{2} [106, 108],
+    // R{3} [112, 114] -> edges K1-P0, K1-P1, K2-P1, K2-P2; canonical K1-P0, K2-P1; P2 fresh
+    Win wiiOld = win2(1, 100, 104, array.from(1, 2), -1, 111, 115, array.from(2, 3))
+    Win wiiNew = addW(win2(1, 100, 103, array.from(1), 1, 106, 108, array.from(2)), -1, 112, 114, 112.0, 114.0, array.from(3))
+    Fx s3 = fxSwing(3, 5)
+    [ii1, ii2, ii3, iiN, iiC, iiE, iiP] = runCase(s3, wiiOld, wiiNew, false, false)
+    record(17, ii1, ii2, ii3, iiP, iiC == 2 and iiE == 4)
+    // I_J: degree-0 new ({2} far away) next to a continuation
+    [ij1, ij2, ij3, ijN, ijC, ijE, ijP] = runCase(sw, win1(1, 100, 104, array.from(1)), win2(1, 100, 104, array.from(1), 1, 200, 204, array.from(2)), false, false)
+    record(18, ij1, ij2, ij3, ijP, ijC == 1 and ijE == 1)
+    // I_K: I_I with Root slots and winner backing reversed
+    [ik1, ik2, ik3, ikN, ikC, ikE, ikP] = runCase(s3, wiiOld, wiiNew, true, false)
+    record(19, ik1, ik2, ik3, ikP, ikC == 2 and ikE == 4)
+    // I_L: I_I with the Root ID map filled in reverse insertion order
+    [il1, il2, il3, ilN, ilC, ilE, ilP] = runCase(s3, wiiOld, wiiNew, false, true)
+    record(20, il1, il2, il3, ilP, ilC == 2 and ilE == 4)
+    pdT += ia1 + ib1 + ic1 + ie1 + fi1 + ig1 + ih1 + ii1 + ij1 + ik1 + il1
+    idT += ia2 + ib2 + ic2 + ie2 + fi2 + ig2 + ih2 + ii2 + ij2 + ik2 + il2
+    fcT += ia3 + ib3 + ic3 + ie3 + fi3 + ig3 + ih3 + ii3 + ij3 + ik3 + il3
+    // ---- boundary (M 3): gap M - 1 / M / M + 1 ----
+    Fx s1m = fxSwing(1, 3)
+    [x1, x2, x3, xN, xC, xE, xP] = runCase(s1m, none, win2(1, 100, 104, array.from(1), -1, 106, 108, array.from(1)), false, false)
+    record(21, x1, x2, x3, xP, xN == 1)
+    [y1, y2, y3, yN, yC, yE, yP] = runCase(s1m, none, win2(1, 100, 104, array.from(1), -1, 107, 108, array.from(1)), false, false)
+    record(22, y1, y2, y3, yP, yN == 1)
+    [z1, z2, z3, zN, zC, zE, zP] = runCase(s1m, none, win2(1, 100, 104, array.from(1), -1, 108, 109, array.from(1)), false, false)
+    record(23, z1, z2, z3, zP, zN == 2)
+    // Identity: old exact top 104.49 (tick 104); new bottom 106 / 107 / 108
+    Win wOld = addW(newWin(), 1, 100, 104, 99.51, 104.49, array.from(1))
+    [u1, u2, u3, uN, uC, uE, uP] = runCase(s1m, wOld, win1(1, 106, 110, array.from(1)), false, false)
+    record(24, u1, u2, u3, uP, uC == 1)
+    [v1, v2, v3, vN, vC, vE, vP] = runCase(s1m, wOld, win1(1, 107, 110, array.from(1)), false, false)
+    record(25, v1, v2, v3, vP, vC == 1)
+    [t1, t2, t3, tN, tC, tE, tP] = runCase(s1m, wOld, win1(1, 108, 110, array.from(1)), false, false)
+    record(26, t1, t2, t3, tP, tC == 0)
+    // half tick: old exact top 103.5 rounds (math.round) to 104 -> gap M at new bottom 107, M + 1 at 108
+    Win wHalf = addW(newWin(), 1, 100, 104, 100.0, 103.5, array.from(1))
+    [hh1, hh2, hh3, hhN, hhC, hhE, hhP] = runCase(s1m, wHalf, win1(1, 107, 110, array.from(1)), false, false)
+    record(27, hh1, hh2, hh3, hhP, hhC == 1)
+    [hj1, hj2, hj3, hjN, hjC, hjE, hjP] = runCase(s1m, wHalf, win1(1, 108, 110, array.from(1)), false, false)
+    record(28, hj1, hj2, hj3, hjP, hjC == 0)
+    pdT += x1 + y1 + z1 + u1 + v1 + t1 + hh1 + hj1
+    idT += x2 + y2 + z2 + u2 + v2 + t2 + hh2 + hj2
+    fcT += x3 + y3 + z3 + u3 + v3 + t3 + hh3 + hj3
+    pairTotal := pdT
+    idTotal   := idT
+    fcTotal   := fcT
+    int passed = 0
+    int s = 0
+    while s < 29
+        passed += array.get(res, s) == 1.0 ? 1 : 0
+        s += 1
+    passAll := passed == 29 ? 1 : 0
+    array.set(dg, 0, passed)
+    array.set(dg, 1, hN * 100 + hE)
+    array.set(dg, 2, iiN * 100 + iiE)
+    array.set(dg, 3, eN * 100 + gN)
+
+plot(passAll, "B16_CONFORMANCE_PASS", display = display.data_window)
+plot(pairTotal, "PAIR_DRIFT_TOTAL", display = display.data_window)
+plot(idTotal, "IDENTITY_DRIFT_TOTAL", display = display.data_window)
+plot(fcTotal, "FAIL_CLOSED_DRIFT_TOTAL", display = display.data_window)
+plot(array.get(dg, 0), "CASES_PASSED_OF_29", display = display.data_window)
+plot(array.get(dg, 1), "P_H_PHYS_X100_PLUS_EDGES", display = display.data_window)
+plot(array.get(dg, 2), "I_I_PHYS_X100_PLUS_EDGES", display = display.data_window)
+plot(array.get(dg, 3), "P_E_PHYS_X100_PLUS_P_G_PHYS", display = display.data_window)
+plot(array.get(res, 0), "P_A_SHARE_GAP_LT_M", display = display.data_window)
+plot(array.get(res, 1), "P_B_GAP_EQ_M", display = display.data_window)
+plot(array.get(res, 2), "P_C_GAP_GT_M", display = display.data_window)
+plot(array.get(res, 3), "P_D_OVERLAP_ONLY", display = display.data_window)
+plot(array.get(res, 4), "P_E_BROAD_BOTH_SIDES_FAIL_CLOSED", display = display.data_window)
+plot(array.get(res, 5), "P_F_DIFFERENT_FVG", display = display.data_window)
+plot(array.get(res, 6), "P_G_SAME_FVG_BOTH_SIDES_FAIL_CLOSED", display = display.data_window)
+plot(array.get(res, 7), "P_H_MULTI_MAX_MATCHING", display = display.data_window)
+plot(array.get(res, 8), "P_I_STORAGE_PERMUTATION", display = display.data_window)
+plot(array.get(res, 9), "P_J_SAME_TICK_EXACT_DIFF", display = display.data_window)
+plot(array.get(res, 10), "I_A_SHARE_GAP_LT_M", display = display.data_window)
+plot(array.get(res, 11), "I_B_GAP_EQ_M", display = display.data_window)
+plot(array.get(res, 12), "I_C_GAP_GT_M", display = display.data_window)
+plot(array.get(res, 13), "I_E_BROAD_ONLY_SHARED", display = display.data_window)
+plot(array.get(res, 14), "I_F_SAME_INVERSE_ORIGIN", display = display.data_window)
+plot(array.get(res, 15), "I_G_RANGE_MOVED_GT_M", display = display.data_window)
+plot(array.get(res, 16), "I_H_EXACT_ONLY_CHANGE", display = display.data_window)
+plot(array.get(res, 17), "I_I_MULTI_OLD_MULTI_NEW", display = display.data_window)
+plot(array.get(res, 18), "I_J_DEGREE0_NEW", display = display.data_window)
+plot(array.get(res, 19), "I_K_STORAGE_PERMUTATION", display = display.data_window)
+plot(array.get(res, 20), "I_L_MAP_INSERTION_PERMUTATION", display = display.data_window)
+plot(array.get(res, 21), "BND_PAIR_GAP_M_MINUS_1", display = display.data_window)
+plot(array.get(res, 22), "BND_PAIR_GAP_M", display = display.data_window)
+plot(array.get(res, 23), "BND_PAIR_GAP_M_PLUS_1", display = display.data_window)
+plot(array.get(res, 24), "BND_ID_GAP_M_MINUS_1", display = display.data_window)
+plot(array.get(res, 25), "BND_ID_GAP_M", display = display.data_window)
+plot(array.get(res, 26), "BND_ID_GAP_M_PLUS_1", display = display.data_window)
+plot(array.get(res, 27), "BND_ID_HALF_TICK_GAP_M", display = display.data_window)
+plot(array.get(res, 28), "BND_ID_HALF_TICK_GAP_M_PLUS_1", display = display.data_window)
