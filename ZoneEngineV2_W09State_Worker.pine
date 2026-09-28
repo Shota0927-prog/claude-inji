@@ -31,6 +31,17 @@
 // range. A side for which armedDistanceMet is true is that side's approach candidate (no High / Low / candle inference).
 // The caller keeps the next-bar rules: a bar that first meets the distance arms from the next seq; a Reset bar or a
 // FlipConfirm / InverseConfirm bar starts no normal Touch on the same bar.
+//
+// W09 B05 (spec 8.1 / 8.2 / 10.2 / 15 / A13.1 / A14.2, I8 Stage D1, I16): Stage D1 target extraction only (no Touch start,
+// no GapBreak commit, no state write, no Event). Geometry = the caller's previous-bar (Stage C) Armed range per Side slot
+// (rangeBottoms / rangeTops) and its two price-order indexes (bottom order keyed by rangeBottoms, top order keyed by
+// rangeTops); ticks = round(price / mintick) (D12). Touch: width Zone bottomTick <= highTick and topTick >= lowTick
+// (bottom index (-inf, highTick] intersected with top index [lowTick, +inf)); one-line Zone (bottomTick == topTick) also
+// linePriceTick in [lowTick - toleranceTick, highTick + toleranceTick] (the tolerance never widens a width Zone). GapBreak:
+// Support bottomTick >= max(highTick + 1, closeTick + breakBufferTick) (bottom index), Resistance topTick <= min(lowTick -
+// 1, closeTick - breakBufferTick) (top index). These are the exact predicates, so the target set is exact (no cap, no
+// nearest-N). d1TargetSlots keeps previous-bar Armed, eligible, currentSeq >= armedFromSeq Sides and returns them unique in
+// the canonical order (canonicalSideSlots).
 // ============================================================
 library("ZoneEngineV2_W09State_Worker", overlay = false)
 
@@ -39,6 +50,7 @@ const int SLOT_INVALID = -1
 const int SIDE_SUPPORT    = 1
 const int SIDE_RESISTANCE = -1
 const int SEQ_UNSET       = -1
+const int PH_ARMED        = 1
 
 const int GR_STRONG      = 0
 const int GR_NEUTRAL     = 1
@@ -277,3 +289,131 @@ export touchResetMet(int side, float baseClose, float snapshotBottom, float snap
 // existing armedFromSeq is read or kept here.
 export nextArmedFromSeq(int currentSeq, bool qualifiesNow) =>
     qualifiesNow and not na(currentSeq) and currentSeq >= 0 ? currentSeq + 1 : SEQ_UNSET
+
+// Index membership of a slot (position back-reference). Used to prove the two range indexes hold the same Sides.
+indexMemberRaw(array<int> orderSlots, array<int> positions, int slot) =>
+    bool member = slot >= 0 and slot < array.size(positions)
+    if member
+        int pos = array.get(positions, slot)
+        member := pos >= 0 and pos < array.size(orderSlots)
+        if member
+            member := array.get(orderSlots, pos) == slot
+    member
+
+// B05 P1: Touch targets of the current bar High / Low against the previous-bar Armed range indexes, appended to out (any
+// order, duplicates possible). Width Zone: bottom index (-inf, highTick] intersected with top index [lowTick, +inf).
+// One-line Zone: bottom index [lowTick - toleranceTick, highTick + toleranceTick] restricted to bottomTick == topTick.
+// Every hit must be in both indexes with non-na keys. Returns the appended count, -1 on invalid input / index (out
+// restored to its size on entry).
+export touchTargetSlots(array<int> bottomOrder, array<int> bottomPositions, array<int> topOrder, array<int> topPositions, array<float> rangeBottoms, array<float> rangeTops, float mintick, float baseHigh, float baseLow, float touchTolerance, array<int> out) =>
+    int  base = array.size(out)
+    bool ok   = mintick > 0 and not na(baseHigh) and not na(baseLow) and not na(touchTolerance)
+    int  highTick = ok ? int(math.round(baseHigh / mintick)) : int(na)
+    int  lowTick  = ok ? int(math.round(baseLow / mintick)) : int(na)
+    int  tolTick  = ok ? int(math.round(touchTolerance / mintick)) : int(na)
+    ok := ok and lowTick <= highTick and tolTick >= 0
+    array<int> byBottom = array.new_int(0)
+    array<int> byTop    = array.new_int(0)
+    array<int> byLine   = array.new_int(0)
+    if ok
+        ok := priceOrderRange(bottomOrder, bottomPositions, rangeBottoms, mintick, int(na), highTick, byBottom) >= 0
+    if ok
+        ok := priceOrderRange(topOrder, topPositions, rangeTops, mintick, lowTick, int(na), byTop) >= 0
+    if ok
+        ok := priceOrderRange(bottomOrder, bottomPositions, rangeBottoms, mintick, lowTick - tolTick, highTick + tolTick, byLine) >= 0
+    map<int, bool> inTop = map.new<int, bool>()
+    int i = 0
+    while ok and i < array.size(byTop)
+        int s = array.get(byTop, i)
+        ok := indexMemberRaw(bottomOrder, bottomPositions, s)
+        if ok
+            map.put(inTop, s, true)
+        i += 1
+    i := 0
+    while ok and i < array.size(byBottom)
+        int s = array.get(byBottom, i)
+        ok := indexMemberRaw(topOrder, topPositions, s) and s < array.size(rangeTops) and not na(array.get(rangeTops, s))
+        if ok and map.contains(inTop, s)
+            array.push(out, s)
+        i += 1
+    i := 0
+    while ok and i < array.size(byLine)
+        int s = array.get(byLine, i)
+        ok := indexMemberRaw(topOrder, topPositions, s) and s < array.size(rangeTops) and not na(array.get(rangeTops, s))
+        if ok and int(math.round(array.get(rangeTops, s) / mintick)) == int(math.round(array.get(rangeBottoms, s) / mintick))
+            array.push(out, s)
+        i += 1
+    if not ok
+        while array.size(out) > base
+            array.pop(out)
+    ok ? array.size(out) - base : -1
+
+// B05 P2: GapBreak targets of the current bar, appended to out. Support Sides (slot % 2 == 0) from the bottom index
+// [max(highTick + 1, closeTick + breakBufferTick), +inf): a strict full gap below the range and a close at or beyond the
+// break level. Resistance Sides (slot % 2 == 1) from the top index (-inf, min(lowTick - 1, closeTick - breakBufferTick)].
+// Every hit must be in both indexes with non-na keys. Returns the appended count, -1 on invalid input / index (out
+// restored).
+export gapBreakTargetSlots(array<int> bottomOrder, array<int> bottomPositions, array<int> topOrder, array<int> topPositions, array<float> rangeBottoms, array<float> rangeTops, float mintick, float baseHigh, float baseLow, float baseClose, float breakBuffer, array<int> out) =>
+    int  base = array.size(out)
+    bool ok   = mintick > 0 and not na(baseHigh) and not na(baseLow) and not na(baseClose) and not na(breakBuffer)
+    int  highTick  = ok ? int(math.round(baseHigh / mintick)) : int(na)
+    int  lowTick   = ok ? int(math.round(baseLow / mintick)) : int(na)
+    int  closeTick = ok ? int(math.round(baseClose / mintick)) : int(na)
+    int  bufTick   = ok ? int(math.round(breakBuffer / mintick)) : int(na)
+    ok := ok and lowTick <= highTick and bufTick >= 0
+    array<int> sup = array.new_int(0)
+    array<int> res = array.new_int(0)
+    if ok
+        ok := priceOrderRange(bottomOrder, bottomPositions, rangeBottoms, mintick, math.max(highTick + 1, closeTick + bufTick), int(na), sup) >= 0
+    if ok
+        ok := priceOrderRange(topOrder, topPositions, rangeTops, mintick, int(na), math.min(lowTick - 1, closeTick - bufTick), res) >= 0
+    int i = 0
+    while ok and i < array.size(sup)
+        int s = array.get(sup, i)
+        ok := indexMemberRaw(topOrder, topPositions, s) and s < array.size(rangeTops) and not na(array.get(rangeTops, s))
+        if ok and s % 2 == 0
+            array.push(out, s)
+        i += 1
+    i := 0
+    while ok and i < array.size(res)
+        int s = array.get(res, i)
+        ok := indexMemberRaw(bottomOrder, bottomPositions, s) and s < array.size(rangeBottoms) and not na(array.get(rangeBottoms, s))
+        if ok and s % 2 == 1
+            array.push(out, s)
+        i += 1
+    if not ok
+        while array.size(out) > base
+            array.pop(out)
+    ok ? array.size(out) - base : -1
+
+// B05 P3: the Stage D1 target Sides = P1 union P2, kept only when the previous-bar Phase is Armed, the Side is eligible and
+// currentSeq >= armedFromSeq (a Side armed on the current bar is not a target), unique and in the canonical order (coreId,
+// generationId, Support, Resistance) through canonicalSideSlots. A dead Core, an Armed Side without armedFromSeq, an invalid
+// slot / seq or any P1 / P2 / canonical failure fails the whole call: false, out empty.
+export d1TargetSlots(array<int> bottomOrder, array<int> bottomPositions, array<int> topOrder, array<int> topPositions, array<float> rangeBottoms, array<float> rangeTops, float mintick, float baseHigh, float baseLow, float baseClose, float touchTolerance, float breakBuffer, array<int> sidePhases, array<bool> sideEligibleFlags, array<int> sideArmedFromSeqs, int currentSeq, array<int> coreIds, array<int> coreGenerationIds, array<bool> coreSlotLiveFlags, map<int, int> coreIdToSlot, array<int> out) =>
+    array.clear(out)
+    array<int> raw  = array.new_int(0)
+    array<int> kept = array.new_int(0)
+    bool ok = not na(currentSeq) and currentSeq >= 0
+    if ok
+        ok := touchTargetSlots(bottomOrder, bottomPositions, topOrder, topPositions, rangeBottoms, rangeTops, mintick, baseHigh, baseLow, touchTolerance, raw) >= 0
+    if ok
+        ok := gapBreakTargetSlots(bottomOrder, bottomPositions, topOrder, topPositions, rangeBottoms, rangeTops, mintick, baseHigh, baseLow, baseClose, breakBuffer, raw) >= 0
+    int i = 0
+    while ok and i < array.size(raw)
+        int s = array.get(raw, i)
+        int c = int(math.floor(s / 2))
+        ok := s < array.size(sidePhases) and s < array.size(sideEligibleFlags) and s < array.size(sideArmedFromSeqs) and c < array.size(coreSlotLiveFlags)
+        if ok
+            ok := array.get(coreSlotLiveFlags, c)
+        if ok and array.get(sidePhases, s) == PH_ARMED
+            int fromSeq = array.get(sideArmedFromSeqs, s)
+            ok := not na(fromSeq) and fromSeq >= 0
+            if ok and array.get(sideEligibleFlags, s) and currentSeq >= fromSeq
+                array.push(kept, s)
+        i += 1
+    if ok
+        ok := canonicalSideSlots(kept, coreIds, coreGenerationIds, coreSlotLiveFlags, coreIdToSlot, out)
+    if not ok
+        array.clear(out)
+    ok
