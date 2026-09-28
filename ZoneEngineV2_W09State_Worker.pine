@@ -1,0 +1,197 @@
+//@version=6
+// ============================================================
+// ZoneEngineV2_W09State_Worker - W09 State set / price index / canonical extraction primitives
+//
+// W09 B02 (I16): the base of the event-driven State pass. The per-bar State stages must not scan every Core / Side; they
+// take the transition-capable Views from state sets (ActiveTouch: the whole set) and from price-key order indexes, then
+// evaluate them in the canonical order. This worker owns no persistent state and never imports the Main library: the
+// caller passes references of its own storage (no copy). Primitives only; no Phase / Touch / Weak / Break / Flip /
+// Reclaim / Inverse writer and no I27-15 Side state transfer here (later W09 batches).
+//
+// P1 membership: stateSetUpdate (unordered set, O(1) push / swap-remove, per-slot position) and priceOrderUpdate (order
+//    index sorted by (key tick ASC, slot ASC), per-slot position; the tick is round(keyPrice / mintick), computed at the
+//    comparison only (D12)). A slot's key must not change while it is indexed (the caller removes, rewrites, re-adds).
+// P2 priceOrderRange: every indexed slot whose key tick lies in [loTick, hiTick] (inclusive; na = unbounded side), in
+//    index order. Exact: the index is totally ordered by key tick, so the result is the contiguous run between the two
+//    lower bounds - no cap, no nearest-N, no distance cutoff (a false negative needs a corrupt index, which fails closed).
+// P3 canonicalSideSlots: Side slot candidates (coreSlot * 2 + 0 Support / + 1 Resistance) of any sources -> unique, in
+//    the canonical order coreId ASC, generationId ASC, Support, Resistance. Index / set / map storage order never leaks
+//    into the evaluation order.
+// Every primitive validates what it touches and fails closed: false / -1 and no partial effect (an update that fails
+// writes nothing; a failed range append or canonical build leaves out as it was / empty).
+// ============================================================
+library("ZoneEngineV2_W09State_Worker", overlay = false)
+
+const int SLOT_INVALID = -1
+
+// P1a: unordered state set. add = true pushes slot (it must not be a member: position == SLOT_INVALID); add = false
+// removes a member by swap-remove (the last member takes its position). Returns true when the update was applied.
+export stateSetUpdate(array<int> members, array<int> positions, int slot, bool add) =>
+    bool ok = slot >= 0 and slot < array.size(positions)
+    if ok
+        int pos = array.get(positions, slot)
+        if add
+            ok := pos == SLOT_INVALID
+            if ok
+                array.set(positions, slot, array.size(members))
+                array.push(members, slot)
+        else
+            ok := pos >= 0 and pos < array.size(members)
+            if ok
+                ok := array.get(members, pos) == slot
+            if ok
+                int lastPos  = array.size(members) - 1
+                int lastSlot = array.get(members, lastPos)
+                if pos != lastPos
+                    array.set(members, pos, lastSlot)
+                    array.set(positions, lastSlot, pos)
+                array.pop(members)
+                array.set(positions, slot, SLOT_INVALID)
+    ok
+
+// Order index search: the first position whose entry (key tick, slot) is >= (tick, slot) in lexicographic order, with the
+// visited entries validated (in range, position back-reference, non-na key). slot = SLOT_INVALID gives the first entry
+// with key tick >= tick. Returns [position, ok].
+priceOrderSearchRaw(array<int> orderSlots, array<int> positions, array<float> keyPrices, float mintick, int tick, int slot) =>
+    bool ok = mintick > 0 and not na(tick)
+    int  lo = 0
+    int  hi = array.size(orderSlots)
+    while ok and lo < hi
+        int mid = int(math.floor((lo + hi) / 2))
+        int s   = array.get(orderSlots, mid)
+        ok := s >= 0 and s < array.size(positions) and s < array.size(keyPrices)
+        if ok
+            ok := array.get(positions, s) == mid and not na(array.get(keyPrices, s))
+        if ok
+            int t = int(math.round(array.get(keyPrices, s) / mintick))
+            if t < tick or (t == tick and s < slot)
+                lo := mid + 1
+            else
+                hi := mid
+    [lo, ok]
+
+// P1b: price-key order index, sorted by (round(keyPrice / mintick) ASC, slot ASC). add = true inserts slot (not indexed,
+// non-na key) at its unique ordered position; add = false removes an indexed slot. Shifts use array.set (no
+// array.insert / array.remove at 0, no unshift) and keep every moved slot's position. Returns true when applied.
+export priceOrderUpdate(array<int> orderSlots, array<int> positions, array<float> keyPrices, float mintick, int slot, bool add) =>
+    bool ok = mintick > 0 and slot >= 0 and slot < array.size(positions) and slot < array.size(keyPrices)
+    int  n  = array.size(orderSlots)
+    if ok and add
+        ok := array.get(positions, slot) == SLOT_INVALID and not na(array.get(keyPrices, slot))
+        int tick = ok ? int(math.round(array.get(keyPrices, slot) / mintick)) : int(na)
+        [insertPos, searchOk] = priceOrderSearchRaw(orderSlots, positions, keyPrices, mintick, tick, slot)
+        ok := ok and searchOk
+        // neighbours: the left entry is strictly smaller, the right entry strictly larger (slot not already present)
+        if ok and insertPos > 0
+            int l = array.get(orderSlots, insertPos - 1)
+            ok := l >= 0 and l < array.size(positions) and l < array.size(keyPrices)
+            if ok
+                ok := l != slot and array.get(positions, l) == insertPos - 1 and not na(array.get(keyPrices, l))
+            if ok
+                int lt = int(math.round(array.get(keyPrices, l) / mintick))
+                ok := lt < tick or (lt == tick and l < slot)
+        if ok and insertPos < n
+            int r = array.get(orderSlots, insertPos)
+            ok := r >= 0 and r < array.size(positions) and r < array.size(keyPrices)
+            if ok
+                ok := r != slot and array.get(positions, r) == insertPos and not na(array.get(keyPrices, r))
+            if ok
+                int rt = int(math.round(array.get(keyPrices, r) / mintick))
+                ok := rt > tick or (rt == tick and r > slot)
+        if ok
+            array.push(orderSlots, slot)
+            int i = n
+            while i > insertPos
+                int moved = array.get(orderSlots, i - 1)
+                array.set(orderSlots, i, moved)
+                array.set(positions, moved, i)
+                i -= 1
+            array.set(orderSlots, insertPos, slot)
+            array.set(positions, slot, insertPos)
+    else if ok
+        int pos = array.get(positions, slot)
+        ok := pos >= 0 and pos < n
+        if ok
+            ok := array.get(orderSlots, pos) == slot
+        if ok
+            int i = pos
+            while i < n - 1
+                int moved = array.get(orderSlots, i + 1)
+                array.set(orderSlots, i, moved)
+                array.set(positions, moved, i)
+                i += 1
+            array.pop(orderSlots)
+            array.set(positions, slot, SLOT_INVALID)
+    ok
+
+// P2: append to out every indexed slot whose key tick is in [loTick, hiTick] (inclusive; na loTick / hiTick = unbounded
+// on that side), in index order. The run is [search(loTick), search(hiTick + 1)); every entry in it is re-validated.
+// Returns the appended count, or -1 (corrupt index / invalid input: out is restored to its size on entry).
+export priceOrderRange(array<int> orderSlots, array<int> positions, array<float> keyPrices, float mintick, int loTick, int hiTick, array<int> out) =>
+    int  base = array.size(out)
+    int  n    = array.size(orderSlots)
+    bool ok   = mintick > 0
+    int  from = 0
+    int  to   = n
+    if ok and not na(loTick)
+        [p, pOk] = priceOrderSearchRaw(orderSlots, positions, keyPrices, mintick, loTick, SLOT_INVALID)
+        ok   := pOk
+        from := p
+    if ok and not na(hiTick)
+        [q, qOk] = priceOrderSearchRaw(orderSlots, positions, keyPrices, mintick, hiTick + 1, SLOT_INVALID)
+        ok := qOk
+        to := q
+    int i = from
+    while ok and i < to
+        int s = array.get(orderSlots, i)
+        ok := s >= 0 and s < array.size(positions) and s < array.size(keyPrices)
+        if ok
+            ok := array.get(positions, s) == i and not na(array.get(keyPrices, s))
+        if ok
+            int t = int(math.round(array.get(keyPrices, s) / mintick))
+            ok := (na(loTick) or t >= loTick) and (na(hiTick) or t <= hiTick)
+        if ok
+            array.push(out, s)
+        i += 1
+    if not ok
+        while array.size(out) > base
+            array.pop(out)
+    ok ? array.size(out) - base : -1
+
+// P3: canonical View order of Side slot candidates gathered from any sets / indexes (duplicates allowed). out = the unique
+// Side slots, coreId ASC, generationId ASC, Support (slot % 2 == 0) before Resistance. Every candidate must be a live
+// Core Side whose coreId maps back to its slot (coreIdToSlot): a live coreId is unique, so (coreId, side) is a total key
+// and the generationId level never has to break a tie. Returns true; false (out empty) on any invalid candidate.
+export canonicalSideSlots(array<int> candidates, array<int> coreIds, array<int> coreGenerationIds, array<bool> coreSlotLiveFlags, map<int, int> coreIdToSlot, array<int> out) =>
+    array.clear(out)
+    int  n    = array.size(candidates)
+    bool ok   = true
+    array<int> keys = array.new_int(n, 0)
+    int i = 0
+    while ok and i < n
+        int s = array.get(candidates, i)
+        int c = s >= 0 ? int(math.floor(s / 2)) : SLOT_INVALID
+        ok := s >= 0 and c < array.size(coreIds) and c < array.size(coreGenerationIds) and c < array.size(coreSlotLiveFlags)
+        if ok
+            int id = array.get(coreIds, c)
+            ok := array.get(coreSlotLiveFlags, c) and id >= 1 and array.get(coreGenerationIds, c) >= 1 and map.contains(coreIdToSlot, id)
+            if ok
+                ok := map.get(coreIdToSlot, id) == c
+            if ok
+                array.set(keys, i, id * 2 + s % 2)
+        i += 1
+    if ok and n > 0
+        array<int> idx = array.sort_indices(keys, order.ascending)
+        int lastKey = 0
+        int k = 0
+        while k < n
+            int j   = array.get(idx, k)
+            int key = array.get(keys, j)
+            // equal keys = the same live (coreId, side) = the same Side slot (coreIdToSlot is one-to-one): dedupe
+            if k == 0 or key != lastKey
+                array.push(out, array.get(candidates, j))
+            lastKey := key
+            k += 1
+    if not ok
+        array.clear(out)
+    ok
