@@ -1062,6 +1062,23 @@ export type PhaseArmedTransferView
     array<int>   armedBottomPositions
     array<int>   armedTopOrderSideSlots
     array<int>   armedTopPositions
+    // B06-B2B3-B (/13) Stage J: post-commit materialized Core slot per p, PhaseSet (positions and the six sets), Touch count
+    // / Upcoming, the Grade inputs and the Grade
+    array<int>   materializedCoreSlots
+    array<int>   sidePhaseSetPositions
+    array<int>   phaseWaitingSideSlots
+    array<int>   phaseArmedSideSlots
+    array<int>   phaseActiveTouchSideSlots
+    array<int>   phaseBrokenSideSlots
+    array<int>   phaseFlipWaitSideSlots
+    array<int>   phaseDormantSideSlots
+    array<int>   sideTouchCounts
+    array<int>   sideUpcomingTouchNos
+    array<bool>  sideWeakByDepthFlags
+    array<bool>  sideWeakByTouchFlags
+    array<bool>  sideBaseStrongFlags
+    array<bool>  sideHasNonPsychRootFlags
+    array<int>   sideGrades
 // Read-only preflight (before the W08 F0 / commit; no persistent write). Every applied p gets exactly one transfer class
 // in outClasses (caller scratch, cleared first; emptied again on failure). Checked on every old Core the transaction
 // reads: the continuation old of each applied p, Merge survivor / absorbed rows, the Split source old, every freed
@@ -1181,3 +1198,76 @@ export phaseArmedIndexRelease(PhaseArmedTransferView view, float mintick) =>
             k += 1
         i += 1
     released
+// W09 B06-B2B3-B (/13): Stage J (I8) of one committed confirmed bar, after the current Root and SideView producers.
+// 1 Transfer baseline (I27-15 §10): every applied fresh / Merge / Split destination Side (classes of this pass's
+//   phaseArmedTransferPreflight) restarts from the reset defaults (Waiting through the PhaseSet, ArmedFromSeq unset,
+//   LastArmedRange na; its old Armed entries were released before commit); a 1:1 continuation keeps its Phase / Armed.
+// 2 Every live Side (retained and pending Cores included): UpcomingTouchNo = SideTouchCount + 1 first. Waiting / Armed only
+//   (ActiveTouch / Broken / FlipWait / Dormant untouched): Grade = gradeExact(target = Upcoming), then qualifies = eligible
+//   and a non-psych Root and armedDistanceMet on the current EffectiveRange and confirmed close (spec 7.4 / A12).
+//   Waiting -> Armed: ArmedFromSeq = currentSeq + 1, LastArmedRange = EffectiveRange. Armed -> Armed: ArmedFromSeq kept,
+//   LastArmedRange = EffectiveRange. Armed -> Waiting (B06-B2B3-PRE option b): ArmedFromSeq / LastArmedRange kept.
+//   Phase changes go through the PhaseSet (detach, write, add); Armed <-> member of both Armed indexes (key change:
+//   remove, write, add). A released Side is Armed and outside the indexes only on a 1:1 continuation destination; any
+//   other broken invariant is a runtime.error (no silent repair).
+export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes, float baseClose, int baseSeq, float mintick, float touchResetDistance, int weakFromTouch, bool weakFromTouchOff, int strongUntilTouch, bool strongUnlimited) =>
+    int  n  = array.size(view.applyP)
+    int  nc = array.size(view.coreIds)
+    int  ns = 2 * nc
+    bool ok = array.size(classes) == n and array.size(view.materializedCoreSlots) >= n and array.size(view.coreSlotLiveFlags) == nc and array.size(view.sidePhases) == ns and array.size(view.sidePhaseSetPositions) == ns and array.size(view.sideTouchCounts) == ns and array.size(view.sideUpcomingTouchNos) == ns and array.size(view.sideWeakByDepthFlags) == ns and array.size(view.sideWeakByTouchFlags) == ns and array.size(view.sideBaseStrongFlags) == ns and array.size(view.sideHasNonPsychRootFlags) == ns and array.size(view.sideGrades) == ns and array.size(view.sideEligibleFlags) == ns and array.size(view.sideEffectiveBottoms) == ns and array.size(view.sideEffectiveTops) == ns and array.size(view.sideArmedFromSeqs) == ns and array.size(view.sideLastArmedRangeBottoms) == ns and array.size(view.sideLastArmedRangeTops) == ns and array.size(view.armedBottomPositions) == ns and array.size(view.armedTopPositions) == ns
+    array<bool> relCore = array.new_bool(ok ? nc : 0, false)
+    int p = 0
+    while ok and p < n
+        int cls = array.get(classes, p) % TX_READY
+        int d   = array.get(view.materializedCoreSlots, p)
+        if cls == TX_CONTINUATION
+            array.set(relCore, d, true)
+        else if cls != TX_NONE
+            int k = 0
+            while ok and k < 2
+                int s = 2 * d + k
+                ok := array.get(view.armedBottomPositions, s) == SLOT_INVALID and array.get(view.armedTopPositions, s) == SLOT_INVALID
+                if ok and array.get(view.sidePhases, s) != PH_WAITING
+                    ok := phaseDetachRaw(view.sidePhases, view.sidePhaseSetPositions, view.phaseWaitingSideSlots, view.phaseArmedSideSlots, view.phaseActiveTouchSideSlots, view.phaseBrokenSideSlots, view.phaseFlipWaitSideSlots, view.phaseDormantSideSlots, s)
+                    array.set(view.sidePhases, s, PH_WAITING)
+                    ok := ok and phaseAddRaw(view.sidePhases, view.sidePhaseSetPositions, view.phaseWaitingSideSlots, view.phaseArmedSideSlots, view.phaseActiveTouchSideSlots, view.phaseBrokenSideSlots, view.phaseFlipWaitSideSlots, view.phaseDormantSideSlots, s)
+                array.set(view.sideArmedFromSeqs, s, SEQ_UNSET)
+                array.set(view.sideLastArmedRangeBottoms, s, float(na))
+                array.set(view.sideLastArmedRangeTops, s, float(na))
+                k += 1
+        p += 1
+    int c = 0
+    while ok and c < nc
+        int k = 0
+        while ok and k < 2 and array.get(view.coreSlotLiveFlags, c)
+            int s  = 2 * c + k
+            int up = array.get(view.sideTouchCounts, s) + 1
+            int ph = array.get(view.sidePhases, s)
+            array.set(view.sideUpcomingTouchNos, s, up)
+            if ph == PH_WAITING or ph == PH_ARMED
+                bool  np = array.get(view.sideHasNonPsychRootFlags, s)
+                float eb = array.get(view.sideEffectiveBottoms, s)
+                float et = array.get(view.sideEffectiveTops, s)
+                array.set(view.sideGrades, s, gradeExact(np, false, array.get(view.sideWeakByDepthFlags, s), array.get(view.sideWeakByTouchFlags, s) or weakByTouchNow(up, weakFromTouch, weakFromTouchOff), array.get(view.sideBaseStrongFlags, s), strongTouchEligible(up, strongUntilTouch, strongUnlimited)))
+                bool q  = array.get(view.sideEligibleFlags, s) and np and eb <= et and armedDistanceMet(k == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE, baseClose, eb, et, touchResetDistance, mintick)
+                bool mb = indexMemberRaw(view.armedBottomOrderSideSlots, view.armedBottomPositions, s)
+                ok := mb == indexMemberRaw(view.armedTopOrderSideSlots, view.armedTopPositions, s) and (ph == PH_ARMED ? mb or array.get(relCore, c) : not mb)
+                if ok and mb and (not q or array.get(view.sideLastArmedRangeBottoms, s) != eb or array.get(view.sideLastArmedRangeTops, s) != et)
+                    ok := priceOrderUpdate(view.armedBottomOrderSideSlots, view.armedBottomPositions, view.sideLastArmedRangeBottoms, mintick, s, false) and priceOrderUpdate(view.armedTopOrderSideSlots, view.armedTopPositions, view.sideLastArmedRangeTops, mintick, s, false)
+                    mb := false
+                if ok and q
+                    if ph == PH_WAITING
+                        array.set(view.sideArmedFromSeqs, s, nextArmedFromSeq(baseSeq, true))
+                    array.set(view.sideLastArmedRangeBottoms, s, eb)
+                    array.set(view.sideLastArmedRangeTops, s, et)
+                    if not mb
+                        ok := priceOrderUpdate(view.armedBottomOrderSideSlots, view.armedBottomPositions, view.sideLastArmedRangeBottoms, mintick, s, true) and priceOrderUpdate(view.armedTopOrderSideSlots, view.armedTopPositions, view.sideLastArmedRangeTops, mintick, s, true)
+                if ok and q != (ph == PH_ARMED)
+                    ok := phaseDetachRaw(view.sidePhases, view.sidePhaseSetPositions, view.phaseWaitingSideSlots, view.phaseArmedSideSlots, view.phaseActiveTouchSideSlots, view.phaseBrokenSideSlots, view.phaseFlipWaitSideSlots, view.phaseDormantSideSlots, s)
+                    array.set(view.sidePhases, s, q ? PH_ARMED : PH_WAITING)
+                    ok := ok and phaseAddRaw(view.sidePhases, view.sidePhaseSetPositions, view.phaseWaitingSideSlots, view.phaseArmedSideSlots, view.phaseActiveTouchSideSlots, view.phaseBrokenSideSlots, view.phaseFlipWaitSideSlots, view.phaseDormantSideSlots, s)
+            k += 1
+        c += 1
+    if not ok
+        runtime.error("W09 B06-B2B3-B: Stage J broke a Phase / Armed index invariant")
+    ok
