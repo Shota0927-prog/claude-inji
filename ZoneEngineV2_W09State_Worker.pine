@@ -1013,3 +1013,171 @@ export sideViewProduce(SideViewMaterializeView view, int denBroadContext) =>
             k += 1
         p += 1
     true
+
+// W09 B06-B2B3-A (/12): Phase / Armed transfer foundation (spec 7.4 / 12 / 12.1 / 14.1, I8 Stage J, I27-15 §10 / §16 / §20,
+// B06-B2B3-PRE decision: 1:1 continuation Armed without the distance -> Waiting, ArmedFromSeq / LastArmedRange kept).
+// Transfer class of one applied physical Candidate p (W08 plan metadata only: ownership kind, pass mergeOfP / splitOfP,
+// Merge relation survivor / absorbed rows, Split plan source old, consumed READY parents); TX_READY is added when one of its
+// source old Cores is a consumed READY pending parent. Non-applied (retained / pending): TX_NONE.
+const int TX_NONE               = -1
+const int TX_FRESH              = 0
+const int TX_CONTINUATION       = 1
+const int TX_MERGE_SURVIVOR     = 2
+const int TX_MERGE_FRESH        = 3
+const int TX_SPLIT_CONTINUATION = 4
+const int TX_SPLIT_FRESH        = 5
+const int TX_READY              = 8
+// PhaseArmedTransferView: flat references of the pass (applyP, mergeOfP, splitOfP, consumedSlots, freeSlots / Core IDs /
+// Generation IDs), the W08 plan (ownership kinds, continuation old Core slot / ID / Generation ID, mergeRelations stride 5,
+// mergeAbsorbed stride 2, Split plan source old Core slot / ID per splitOfP row), the Core tokens, the Side Phase / Armed /
+// structural / BreakSnapshot-valid fields and the two Armed price-order indexes (keys sideLastArmedRangeBottoms / Tops).
+export type PhaseArmedTransferView
+    array<bool>  applyP
+    array<int>   mergeOfP
+    array<int>   splitOfP
+    array<int>   consumedSlots
+    array<int>   freeSlots
+    array<int>   freeCoreIds
+    array<int>   freeGenerationIds
+    array<int>   ownershipKinds
+    array<int>   continuationOldCoreSlots
+    array<int>   continuationCoreIds
+    array<int>   continuationGenerationIds
+    array<int>   mergeRelations
+    array<int>   mergeAbsorbed
+    array<int>   splitSourceOldCoreSlots
+    array<int>   splitSourceOldCoreIds
+    array<int>   coreIds
+    array<int>   coreGenerationIds
+    array<bool>  coreSlotLiveFlags
+    array<int>   sidePhases
+    array<int>   sideArmedFromSeqs
+    array<float> sideLastArmedRangeBottoms
+    array<float> sideLastArmedRangeTops
+    array<float> sideEffectiveBottoms
+    array<float> sideEffectiveTops
+    array<bool>  sideEligibleFlags
+    array<bool>  sideBreakSnapshotValidFlags
+    array<int>   armedBottomOrderSideSlots
+    array<int>   armedBottomPositions
+    array<int>   armedTopOrderSideSlots
+    array<int>   armedTopPositions
+// Read-only preflight (before the W08 F0 / commit; no persistent write). Every applied p gets exactly one transfer class
+// in outClasses (caller scratch, cleared first; emptied again on failure). Checked on every old Core the transaction
+// reads: the continuation old of each applied p, Merge survivor / absorbed rows, the Split source old, every freed
+// Core: slot live with the expected Core ID (and Generation ID where the plan carries one), both Sides' Phase a canonical
+// enum and not ActiveTouch (applied components hold none: W08 PendingTopology), Armed <-> member of both Armed indexes
+// (reverse positions checked), Armed -> ArmedFromSeq set, LastArmedRange valid, eligible with a valid EffectiveRange;
+// non-Armed -> no index position. Merge / Split sources (I27-15 §10 / §12, BreakSnapshot transfer not implemented yet):
+// a Side in Broken / FlipWait or with a valid BreakSnapshot fails the pass (temporary fail-closed).
+export phaseArmedTransferPreflight(PhaseArmedTransferView view, float mintick, array<int> outClasses) =>
+    array.clear(outClasses)
+    int  n  = array.size(view.applyP)
+    int  nc = array.size(view.coreIds)
+    int  ns = 2 * nc
+    bool ok = mintick > 0 and array.size(view.mergeOfP) == n and array.size(view.splitOfP) == n and array.size(view.ownershipKinds) >= n and array.size(view.continuationOldCoreSlots) >= n and array.size(view.continuationCoreIds) >= n and array.size(view.continuationGenerationIds) >= n and array.size(view.freeCoreIds) == array.size(view.freeSlots) and array.size(view.freeGenerationIds) == array.size(view.freeSlots) and array.size(view.splitSourceOldCoreIds) == array.size(view.splitSourceOldCoreSlots) and array.size(view.coreGenerationIds) == nc and array.size(view.coreSlotLiveFlags) == nc and array.size(view.sidePhases) == ns and array.size(view.sideArmedFromSeqs) == ns and array.size(view.sideLastArmedRangeBottoms) == ns and array.size(view.sideLastArmedRangeTops) == ns and array.size(view.sideEffectiveBottoms) == ns and array.size(view.sideEffectiveTops) == ns and array.size(view.sideEligibleFlags) == ns and array.size(view.sideBreakSnapshotValidFlags) == ns and array.size(view.armedBottomPositions) == ns and array.size(view.armedTopPositions) == ns
+    // old Cores to check: stride 4 [slot, expected Core ID, expected Generation ID (ID_NONE: not carried), Merge / Split source]
+    array<int> chk = array.new_int(0)
+    int p = 0
+    while ok and p < n
+        int cls = TX_NONE
+        if array.get(view.applyP, p)
+            int  kind  = array.get(view.ownershipKinds, p)
+            int  j     = array.get(view.mergeOfP, p)
+            int  k     = array.get(view.splitOfP, p)
+            bool cont  = kind == 0
+            int  os    = cont ? array.get(view.continuationOldCoreSlots, p) : SLOT_INVALID
+            bool ready = cont and array.includes(view.consumedSlots, os)
+            ok := (kind == 0 or kind == 1) and (j < 0 or k < 0)
+            if ok and cont
+                array.push(chk, os)
+                array.push(chk, array.get(view.continuationCoreIds, p))
+                array.push(chk, array.get(view.continuationGenerationIds, p))
+                array.push(chk, j >= 0 or k >= 0 ? 1 : 0)
+            if ok and j >= 0
+                ok := 5 * j + 4 < array.size(view.mergeRelations)
+                if ok
+                    int off = array.get(view.mergeRelations, 5 * j + 3)
+                    int cnt = array.get(view.mergeRelations, 5 * j + 4)
+                    ok := array.get(view.mergeRelations, 5 * j) == p and array.get(view.mergeRelations, 5 * j + 1) == os and off >= 0 and cnt >= 1 and 2 * (off + cnt) <= array.size(view.mergeAbsorbed)
+                    int a = 0
+                    while ok and a < cnt
+                        int slot = array.get(view.mergeAbsorbed, 2 * (off + a))
+                        array.push(chk, slot)
+                        array.push(chk, array.get(view.mergeAbsorbed, 2 * (off + a) + 1))
+                        array.push(chk, ID_NONE)
+                        array.push(chk, 1)
+                        ready := ready or array.includes(view.consumedSlots, slot)
+                        a += 1
+                cls := cont ? TX_MERGE_SURVIVOR : TX_MERGE_FRESH
+            else if ok and k >= 0
+                ok := k < array.size(view.splitSourceOldCoreSlots)
+                int ps = ok ? array.get(view.splitSourceOldCoreSlots, k) : SLOT_INVALID
+                ok := ok and (not cont or ps == os)
+                if ok
+                    array.push(chk, ps)
+                    array.push(chk, array.get(view.splitSourceOldCoreIds, k))
+                    array.push(chk, ID_NONE)
+                    array.push(chk, 1)
+                    ready := ready or array.includes(view.consumedSlots, ps)
+                cls := cont ? TX_SPLIT_CONTINUATION : TX_SPLIT_FRESH
+            else if ok
+                cls := cont ? TX_CONTINUATION : TX_FRESH
+            cls += ready ? TX_READY : 0
+        array.push(outClasses, cls)
+        p += 1
+    int i = 0
+    while ok and i < array.size(view.freeSlots)
+        array.push(chk, array.get(view.freeSlots, i))
+        array.push(chk, array.get(view.freeCoreIds, i))
+        array.push(chk, array.get(view.freeGenerationIds, i))
+        array.push(chk, 0)
+        i += 1
+    i := 0
+    while ok and i < array.size(chk)
+        int c   = array.get(chk, i)
+        int gen = array.get(chk, i + 2)
+        ok := c >= 0 and c < nc
+        if ok
+            ok := array.get(view.coreSlotLiveFlags, c) and array.get(view.coreIds, c) == array.get(chk, i + 1) and (gen == ID_NONE or array.get(view.coreGenerationIds, c) == gen)
+        int k = 0
+        while ok and k < 2
+            int  s  = 2 * c + k
+            int  ph = array.get(view.sidePhases, s)
+            bool am = ph == PH_ARMED
+            ok := ph >= PH_WAITING and ph <= PH_DORMANT and ph != PH_ACTIVE_TOUCH
+            if ok and am
+                float lb = array.get(view.sideLastArmedRangeBottoms, s)
+                float lt = array.get(view.sideLastArmedRangeTops, s)
+                ok := indexMemberRaw(view.armedBottomOrderSideSlots, view.armedBottomPositions, s) and indexMemberRaw(view.armedTopOrderSideSlots, view.armedTopPositions, s) and array.get(view.sideArmedFromSeqs, s) >= 0 and lb <= lt and array.get(view.sideEligibleFlags, s) and array.get(view.sideEffectiveBottoms, s) <= array.get(view.sideEffectiveTops, s)
+            else if ok
+                ok := array.get(view.armedBottomPositions, s) == SLOT_INVALID and array.get(view.armedTopPositions, s) == SLOT_INVALID
+            if ok and array.get(chk, i + 3) == 1
+                ok := ph != PH_BROKEN and ph != PH_FLIP_WAIT and not array.get(view.sideBreakSnapshotValidFlags, s)
+            k += 1
+        i += 4
+    if not ok
+        array.clear(outClasses)
+    ok
+// Pre-commit Armed index release (after every preflight passed, before W08Runtime.commitPass): each Armed Side of the
+// continuation old Core of every applied p (1:1 / Merge survivor / Split continuation: its key is replaced or re-evaluated
+// at Stage J) and of every freed Core (Merge absorbed: coreResetSlotRaw clears positions only) leaves both Armed indexes
+// (priceOrderUpdate remove). Index only: Phase, ArmedFromSeq and LastArmedRange are not written; retained / pending (not
+// applied, not freed) are not touched. Until Stage J these Armed Sides are outside the indexes. Returns the released Side
+// count; a failed remove is a broken preflight (runtime.error).
+export phaseArmedIndexRelease(PhaseArmedTransferView view, float mintick) =>
+    int n        = array.size(view.applyP)
+    int released = 0
+    int i = 0
+    while i < n + array.size(view.freeSlots)
+        int c = i < n ? (array.get(view.applyP, i) and array.get(view.ownershipKinds, i) == 0 ? array.get(view.continuationOldCoreSlots, i) : SLOT_INVALID) : array.get(view.freeSlots, i - n)
+        int k = 0
+        while c >= 0 and k < 2
+            int s = 2 * c + k
+            if array.get(view.sidePhases, s) == PH_ARMED
+                if not (priceOrderUpdate(view.armedBottomOrderSideSlots, view.armedBottomPositions, view.sideLastArmedRangeBottoms, mintick, s, false) and priceOrderUpdate(view.armedTopOrderSideSlots, view.armedTopPositions, view.sideLastArmedRangeTops, mintick, s, false))
+                    runtime.error("W09 B06-B2B3-A: Armed index release broke its preflight")
+                released += 1
+            k += 1
+        i += 1
+    released
