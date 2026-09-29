@@ -7,8 +7,9 @@ import sekine3310/ZoneEngineV2_W06Component_Worker/19 as W06Comp
 import sekine3310/ZoneEngineV2_W07Fvg_Worker/10 as W07Fvg
 import sekine3310/ZoneEngineV2_W08Core_Worker/16 as W08Core
 import sekine3310/ZoneEngineV2_W08Touch_Worker/3 as W08Touch
-import sekine3310/ZoneEngineV2_W08Runtime_Worker/4 as W08Runtime
+import sekine3310/ZoneEngineV2_W08Runtime_Worker/5 as W08Runtime
 import sekine3310/ZoneEngineV2_W03EMsa_Worker/7 as W03EMsa
+import sekine3310/ZoneEngineV2_W09State_Worker/10 as W09State
 const int ID_NONE         = 0
 const int SLOT_INVALID    = -1
 const int SEQ_UNSET       = -1
@@ -7300,8 +7301,67 @@ buildChangedTopologyPlanRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed) =>
     [imm, pen, rdy] = buildPendingTopologyPlanRaw(engine, cfg, feed)
     W02AuxStore a = engine.w02Aux
     W08Core.changedPlanBuild(engine.w08CoreStore, pendingStoreViewRaw(engine), imm, cr.coreSlotLiveFlags, cr.coreIds, cr.coreGenerationIds, cr.coreCreatedTimes, cr.corePhysicalBottoms, cr.corePhysicalTops, cr.sidePhases, engine.rootIdToSlot, engine.rootIds, engine.rootSlotLiveFlags, a.rootCandComponentIds, a.candComponentIds, a.candComponentMemberOffsets, a.candComponentMemberLengths, a.candMemberRootIds, a.candMemberRoleFlags, a.candSemanticChangedRootIds, a.candSemanticChangedCurrentComponentIds, array.get(a.candChangedScopeFull, 0), feed.mintick)
+// W09 B06-B1: the Side current Root list (derived: the Root IDs of the Side's current confirmed topology, never history).
+// Preflight (read-only, before the W08 F0): every free Core's two lists and every applied continuation target's two lists
+// are valid for their owner token (W09State validate), and each applied Candidate's Side winner index is SLOT_INVALID or a
+// winner row of that Side. The winner Root slices themselves (offset / length, strict ascending, issued, live) are proven by
+// the W08 F0 (materialization of the applied Candidates).
+w09CurrentRootPreflightRaw(W08Core.W08Store ws, W03SourceRootStore w3, W09State.CurrentRootPoolView v, W08Runtime.ShadowPass pr) =>
+    bool ok = pr.planResult >= 0
+    int i = 0
+    while ok and i < array.size(pr.freeSlots)
+        int s = array.get(pr.freeSlots, i) * 2
+        ok := W09State.currentRootListValidate(v, s, array.get(pr.freeCoreIds, i), array.get(pr.freeGenerationIds, i)) and W09State.currentRootListValidate(v, s + 1, array.get(pr.freeCoreIds, i), array.get(pr.freeGenerationIds, i))
+        i += 1
+    int p = 0
+    while ok and p < array.size(pr.applyP)
+        if array.get(pr.applyP, p)
+            int k = 0
+            while ok and k < 2
+                int w = array.get(k == 0 ? ws.physicalCandidateSupportWinnerIndexes : ws.physicalCandidateResistanceWinnerIndexes, p)
+                ok := w == SLOT_INVALID or (w >= 0 and w < w3.candidateWinnerLogicalCount and array.get(w3.candidateWinnerSides, w) == (k == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE))
+                if ok and array.get(ws.physicalOwnershipKinds, p) == 0
+                    ok := W09State.currentRootListValidate(v, array.get(ws.physicalContinuationOldCoreSlots, p) * 2 + k, array.get(ws.physicalContinuationCoreIds, p), array.get(ws.physicalContinuationGenerationIds, p))
+                k += 1
+        p += 1
+    ok
+// Commit phase, after every preflight passed and before W08Runtime.commitPass: release both lists of every freed Core (nodes
+// back to the free stack, metadata to the empty list). A failure is an invariant break of the preflight (runtime.error).
+w09CurrentRootReleaseRaw(W09State.CurrentRootPoolView v, W08Runtime.ShadowPass pr) =>
+    int i = 0
+    while i < array.size(pr.freeSlots)
+        int s = array.get(pr.freeSlots, i) * 2
+        if not (W09State.currentRootListDetachAll(v, s, array.get(pr.freeCoreIds, i), array.get(pr.freeGenerationIds, i)) and W09State.currentRootListDetachAll(v, s + 1, array.get(pr.freeCoreIds, i), array.get(pr.freeGenerationIds, i)))
+            runtime.error("W09 B06-B1: current Root release broke its preflight")
+        i += 1
+    true
+// After W08Runtime.commitPass: each applied Candidate's two Sides on its materialized Core (slot, Core ID, Generation ID) get
+// the complete replace of their list by the Side winner's Root IDs in the winner's strict ascending order (no winner: empty).
+// Fresh / continuation / Merge survivor / Split child alike; pending and retained Cores are not applied and stay untouched.
+w09CurrentRootProduceRaw(W08Core.W08Store ws, W03SourceRootStore w3, W09State.CurrentRootPoolView v, W08Runtime.ShadowPass pr) =>
+    int p = 0
+    while p < array.size(pr.applyP)
+        if array.get(pr.applyP, p)
+            int id  = array.get(ws.physicalMaterializedCoreIds, p)
+            int gen = array.get(ws.physicalMaterializedGenerationIds, p)
+            int k = 0
+            while k < 2
+                int  s  = array.get(ws.physicalMaterializedCoreSlots, p) * 2 + k
+                int  w  = array.get(k == 0 ? ws.physicalCandidateSupportWinnerIndexes : ws.physicalCandidateResistanceWinnerIndexes, p)
+                bool ok = W09State.currentRootListDetachAll(v, s, id, gen)
+                if ok and w >= 0
+                    int r = 0
+                    while ok and r < array.get(w3.candidateWinnerRootIdLengths, w)
+                        ok := W09State.currentRootListAppend(v, s, id, gen, array.get(w3.candidateWinnerRootIds, array.get(w3.candidateWinnerRootIdOffsets, w) + r))
+                        r += 1
+                if not (ok and W09State.currentRootListValidate(v, s, id, gen))
+                    runtime.error("W09 B06-B1: current Root producer broke its preflight")
+                k += 1
+        p += 1
+    true
 // W08 B15-B3: the production W08 pass of one confirmed 5m bar (after Stage F / G; W06 outputs fixed). Thin: reference
-// views of the Main storage (no copy), one W08Runtime.runShadow (plan -> pass F0 -> commit, one transaction), then the
+// views of the Main storage (no copy), one W08 pass (plan -> pass F0 -> commit, one transaction; W09 B06-B1: split so the
+// Side current Root lists are validated with the F0, released before commit and produced after it), then the
 // committed scalars (nextCoreId / nextGenerationId / coreRangeRevision) written back; nextRootId is read only, and the
 // pass's W06 dependency carry merged. A failed F0 writes nothing (Core, Touch, Pending, indexes, revisions, IDs, carry).
 // Returns whether the pass committed.
@@ -7317,7 +7377,14 @@ w08ProductionRaw(ZoneEngine engine, ZoneCfg cfg, Feed feed) =>
     W08Core.PendingTopologyStore ps = pendingStoreViewRaw(engine)
     W08Runtime.ShadowScalars     sc = W08Runtime.ShadowScalars.new(engine.nextCoreId, engine.nextGenerationId, engine.nextRootId, engine.coreRangeRevision, false)
     W08Runtime.ShadowContext ctx = W08Runtime.ShadowContext.new(engine.w08CoreStore, rv, pv, hv, wv, mv, ps, ps, W08Touch.TouchPlan.new(t.mergeTouchPlanOffsets, t.mergeTouchPlanCounts, t.mergeTouchPlanTruncatedFlags, t.mergeTouchPlanBaseSeqs, t.mergeTouchPlanTimes, t.mergeTouchPlanSides, t.mergeTouchPlanContactBottoms, t.mergeTouchPlanContactTops, t.mergeTouchPlanCloseAtTouches, t.mergeTouchPlanGenerationIds, t.mergeTouchPlanIsNormalFlags), t.splitTouchPlan, sc, cfg.clusterMaxWidth, feed.mintick, false)
-    W08Runtime.ShadowPass pr = W08Runtime.runShadow(ctx, feed.baseCloseTime)
+    W08Core.CoreRegistryStore    cr = engine.w08CoreStore.coreRegistry
+    W09State.CurrentRootPoolView crv = W09State.CurrentRootPoolView.new(cr.sideCurrentRootHeadNodeIndexes, cr.sideCurrentRootTailNodeIndexes, cr.sideCurrentRootCounts, a.sideCurrentRootNodeRootIds, a.sideCurrentRootNodeNextIndexes, a.sideCurrentRootNodeOwnerSideSlots, a.sideCurrentRootNodeExpectedCoreIds, a.sideCurrentRootNodeExpectedGenerationIds, a.sideCurrentRootNodeFreeIndexes, a.sideCurrentRootNodeLiveFlags)
+    // W09 B06-B1: runShadow split (plan -> current Root preflight -> W08 F0 -> release -> commit -> current Root producer)
+    W08Runtime.ShadowPass pr = W08Runtime.planPass(ctx)
+    if w09CurrentRootPreflightRaw(engine.w08CoreStore, w3, crv, pr) and W08Runtime.preflightPass(ctx, pr, feed.baseCloseTime)
+        w09CurrentRootReleaseRaw(crv, pr)
+        W08Runtime.commitPass(ctx, pr, feed.baseCloseTime)
+        w09CurrentRootProduceRaw(engine.w08CoreStore, w3, crv, pr)
     if pr.committed
         engine.nextCoreId        := sc.nextCoreId
         engine.nextGenerationId  := sc.nextGenerationId
