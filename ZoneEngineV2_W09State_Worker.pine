@@ -1079,6 +1079,16 @@ export type PhaseArmedTransferView
     array<bool>  sideBaseStrongFlags
     array<bool>  sideHasNonPsychRootFlags
     array<int>   sideGrades
+    // B06-B2C-B0 (/15) Fresh transfer: Core / Side Fresh, the Side Touch-history truncated flags (the source ring's flag), the
+    // Split TouchMark plan rows (per splitOfP row: mark offset / count; per mark: Side and normal flag) and the plan scratch
+    array<bool>  coreZoneFreshFlags
+    array<bool>  sideFreshFlags
+    array<bool>  sideTouchHistoryTruncatedFlags
+    array<int>   splitMarkOffsets
+    array<int>   splitMarkCounts
+    array<int>   splitMarkSides
+    array<bool>  splitMarkIsNormalFlags
+    array<int>   freshPlan
 // Read-only preflight (before the W08 F0 / commit; no persistent write). Every applied p gets exactly one transfer class
 // in outClasses (caller scratch, cleared first; emptied again on failure). Checked on every old Core the transaction
 // reads: the continuation old of each applied p, Merge survivor / absorbed rows, the Split source old, every freed
@@ -1490,3 +1500,83 @@ export touchStartPlanBuild(TouchStartPlanView view, int currentSeq, int baseClos
         array.clear(view.planFloats)
         array.clear(view.planRootIds)
     ok ? array.size(view.planSideSlots) : -1
+
+// W09 B06-B2C-B0 (/15): Fresh (ZoneFresh / SideFresh) of every applied destination, I27-15 §8 / §15 / §16, spec Fresh:
+// planned before the W08 F0 from the pre-commit sources (the absorbed Cores are still live), written after commit.
+// Per applied p (this pass's transfer class): fresh (a new Zone generation, no topology source) -> all true. 1:1
+// continuation -> untouched (no revival, no reset). Merge (survivor / fresh target) -> ZoneFresh and each SideFresh are
+// the logical AND over every source Core (survivor and absorbed; every live Side carries its own fact because a new
+// generation starts both Sides true, so a Side that never held a winner is true, never a false default). Split child ->
+// each SideFresh rebuilt from the child's normal TouchMarks of that Side in the W08 Split plan: >= 1 -> false; none and the
+// source Side history not truncated -> true; none but truncated -> the source SideFresh (no inferred revival); ZoneFresh =
+// both Sides fresh, AND the source ZoneFresh on a same-generation (continuation) child (only a new generation re-starts
+// it). Non-normal marks (Flip / Inverse) never consume. freshPlan per p: -1 no write, else zone * 4 + support * 2 + resistance.
+export freshTransferPlan(PhaseArmedTransferView view, array<int> classes) =>
+    array.clear(view.freshPlan)
+    int  n  = array.size(view.applyP)
+    int  nc = array.size(view.coreIds)
+    int  nm = array.size(view.splitMarkSides)
+    bool ok = array.size(classes) == n and array.size(view.coreZoneFreshFlags) == nc and array.size(view.sideFreshFlags) == 2 * nc and array.size(view.sideTouchHistoryTruncatedFlags) == 2 * nc and array.size(view.splitMarkCounts) == array.size(view.splitMarkOffsets) and array.size(view.splitMarkIsNormalFlags) == nm
+    int p = 0
+    while ok and p < n
+        int  cls = array.get(classes, p)
+        int  b   = cls < 0 ? TX_NONE : cls % TX_READY
+        bool z   = true
+        bool fs  = true
+        bool fr  = true
+        if b == TX_MERGE_SURVIVOR or b == TX_MERGE_FRESH
+            int j = array.get(view.mergeOfP, p)
+            ok := j >= 0 and 5 * j + 4 < array.size(view.mergeRelations)
+            int off = ok ? array.get(view.mergeRelations, 5 * j + 3) : 0
+            int cnt = ok ? array.get(view.mergeRelations, 5 * j + 4) : 0
+            int a   = b == TX_MERGE_SURVIVOR ? -1 : 0
+            while ok and a < cnt
+                int c = a < 0 ? array.get(view.continuationOldCoreSlots, p) : array.get(view.mergeAbsorbed, 2 * (off + a))
+                ok := c >= 0 and c < nc
+                if ok
+                    z  := z and array.get(view.coreZoneFreshFlags, c)
+                    fs := fs and array.get(view.sideFreshFlags, 2 * c)
+                    fr := fr and array.get(view.sideFreshFlags, 2 * c + 1)
+                a += 1
+        else if b == TX_SPLIT_CONTINUATION or b == TX_SPLIT_FRESH
+            int k = array.get(view.splitOfP, p)
+            ok := k >= 0 and k < array.size(view.splitMarkOffsets) and k < array.size(view.splitSourceOldCoreSlots)
+            int c   = ok ? array.get(view.splitSourceOldCoreSlots, k) : SLOT_INVALID
+            int off = ok ? array.get(view.splitMarkOffsets, k) : 0
+            int cnt = ok ? array.get(view.splitMarkCounts, k) : 0
+            ok := ok and c >= 0 and c < nc and off >= 0 and cnt >= 0 and off + cnt <= nm
+            int ns = 0
+            int nr = 0
+            int m  = off
+            while ok and m < off + cnt
+                int sd = array.get(view.splitMarkSides, m)
+                ok := sd == SIDE_SUPPORT or sd == SIDE_RESISTANCE
+                if ok and array.get(view.splitMarkIsNormalFlags, m)
+                    ns += sd == SIDE_SUPPORT ? 1 : 0
+                    nr += sd == SIDE_RESISTANCE ? 1 : 0
+                m += 1
+            if ok
+                fs := ns == 0 and (not array.get(view.sideTouchHistoryTruncatedFlags, 2 * c) or array.get(view.sideFreshFlags, 2 * c))
+                fr := nr == 0 and (not array.get(view.sideTouchHistoryTruncatedFlags, 2 * c + 1) or array.get(view.sideFreshFlags, 2 * c + 1))
+                z  := fs and fr and (b == TX_SPLIT_FRESH or array.get(view.coreZoneFreshFlags, c))
+        array.push(view.freshPlan, b == TX_NONE or b == TX_CONTINUATION ? -1 : (z ? 4 : 0) + (fs ? 2 : 0) + (fr ? 1 : 0))
+        p += 1
+    if not ok
+        array.clear(view.freshPlan)
+    ok
+// After commitPass: write the planned Fresh of every applied destination (its post-commit materialized Core slot); p with
+// plan -1 (1:1 continuation, not applied) is not written.
+export freshTransferApply(PhaseArmedTransferView view) =>
+    int n = array.size(view.freshPlan)
+    if n != array.size(view.applyP) or array.size(view.materializedCoreSlots) < n
+        runtime.error("W09 B06-B2C-B0: Fresh transfer apply without its plan")
+    int p = 0
+    while p < n
+        int v = array.get(view.freshPlan, p)
+        if v >= 0
+            int d = array.get(view.materializedCoreSlots, p)
+            array.set(view.coreZoneFreshFlags, d, v >= 4)
+            array.set(view.sideFreshFlags, 2 * d, v % 4 >= 2)
+            array.set(view.sideFreshFlags, 2 * d + 1, v % 2 == 1)
+        p += 1
+    true
