@@ -297,3 +297,34 @@ Decision: GT-4C = APPROVED (both levels, 111 parameters + 111 forwarded argument
 GT-4D pre-check (W03EMsa, no detailed audit): `run` -> `w03StageEMaRaw` (51 params), `w03StageESwingRaw` (74),
 `w03StageEAccumRaw` (88): each has exactly one call site (W03EMsa lines 469 / 472 / 475) -> single-call YES for all three.
 Main still holds unreachable same-named legacy definitions (no call site; not Production code paths).
+
+### GT-4C1: inline `compExpandFixedPointRaw` into `buildComponents` (W06 /22, Main W06 /21 -> /22)
+
+Decision before implementation: full two-level GT-4C (nest depth 12 -> 19) deferred; GT-4C1 (this level only) first,
+GT-4C2 (`compExternalLinksRaw`) judged only after a TV PASS of GT-4C1.
+
+- Body (27 code lines) moved verbatim to the single call site (+16 indent) with whole-word code-only substitutions:
+  `visitEpoch` -> `workEpoch` 3 (the audited count), the moved local `failed` -> `xFailed` 4 (the only collision: the job
+  `failed` of `buildComponents`). No other rename. `int fr = ...` / `failed := fr < 1` -> `failed := finalRootCount < 1`.
+- `compExternalLinksRaw` untouched: its 55-parameter signature stays, 1 call at the same position.
+- Static: `compExpandFixedPointRaw` code references 0; calls of `compExternalLinksRaw` 1 -> 1, `compPointRangeScanRaw`
+  3 -> 3, `compFvgLinkRaw` 1 -> 1; `array.new` 44 -> 44; `copy` / `from` / `map.new` 6 -> 6; `var` 0; tuple unpacks 6 -> 6;
+  types 0 -> 0; functions 17 -> 16; the diff is exactly the deleted helper (40 lines) and the replaced call (2 -> 40 lines);
+  the block reversed through the mapping equals the old body; no raw `visitEpoch`, no reference to the caller `failed`, no
+  write to `workEpoch` inside it. Max nest: block 36 spaces (9 levels), file max 48 unchanged.
+- Test `gt4c1_det.py`: the old two lines (with the real old helper) and the new block, extracted from the files, each run in
+  the same `buildComponents` environment (106 parameters + `workEpoch` + `failed`); side mask / point range scan / FVG link /
+  external link are recording oracle stubs that grow the queue and stamp visited epochs. PASS = same (failed, workEpoch), same
+  ordered call trace with deep argument snapshots, same final state of every input. Cases: normal, single Root, multiple
+  Roots, Support-only mask, Resistance-only mask, no expansion, FVG expansion with a Broad FVG not expanded, multi-round chain,
+  no external link, external links over two rounds, already visited, workEpoch != visitEpoch parameter, external failure,
+  visited-size boundary (rootCount - 1 / rootCount), failure after additions with denseTick > mTick: 15/15, 0.1 s. The rest
+  of `buildComponents` is textually identical (static diff). Mutants: raw `visitEpoch` killed, caller `failed` assigned
+  killed, `W` without denseTick killed; `finalRootCount < 0` is an equivalent mutant (the queue always holds the start Root,
+  so the count is never 0).
+- Removed: signature 56 parameters, forwarding 56 arguments. Source proxy (reference only): W06 29,524 -> 29,071 (-453).
+
+| ID | Module | Change | Before | After | Delta | Effect | Semantic change | Test | Status |
+|---|---|---|---|---|---|---|---|---|---|
+| GT-4C1 | W06Comp /21 -> /22 (Main W06 /22) | inline `compExpandFixedPointRaw` into its single call site | <1,000,000 | pending (TV) | UNKNOWN (Before exact unknown) | - | 0 | det 15/15, mutants 3/3 non-equivalent killed, static PASS | IMPLEMENTED, TV pending |
+| GT-4C2 | W06Comp | inline `compExternalLinksRaw` | - | - | - | - | - | audited (GT-4C) | DEFERRED until GT-4C1 PASS |
