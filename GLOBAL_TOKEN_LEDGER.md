@@ -458,22 +458,49 @@ imports) and a foreign type in an exported UDT are treated as HIGH_COST_STRUCTUR
 Open question for later (not acted on; needs a measured Probe and approval): the existing library-to-library imports
 (W08Runtime -> W08Core /18 + W08Touch /5, W06 -> W05 /6, W05 -> W07 /10) may carry the same kind of cost.
 
-### R3-B1 compact architecture (design only; not implemented)
+### R3-B0 status
 
-TOKEN START REVIEW: Main PASS / exact UNKNOWN; status UNKNOWN; added: W08Touch-side projected injection; cross-library new
-import 0; cross-library foreign type 0; huge UDT 0; tuple 0; plan copy 0; ring copy 0; duplicate planning 0; Main business
-logic 0.
+R3-B0 architecture: REJECTED completely (TouchProjectView, W09State -> W08Core / W08Touch import, W09State
+`touchPlanProject`: never reused; /23 never made Production, archived as a failed Probe only). Production baseline:
+W09State /22, W06 /23, Main TradingView PASS (the bytes of `28ebec4`), confirmed on `claude/w09-b07-redesign-v2`.
 
-| Part | Where | Form |
-|---|---|---|
-| Episode overlay | W09State (next unused version, /24) | `episodeOverlayBuild(ei, out)`: ints only, no W08 import |
-| Projected mark delta | W09State /24 | `episodeMarkDeltaBuild(tv, ei, ef, outI, outF)`: one flat row per projected mark in a W08-neutral layout (old Core slot, Core ID, kind NEW / UPDATE, and the TouchMark payload: baseSeq, time, side, contact bottom / top, close, generation, normal, touchNo, weakByDepth, maxDepth) read from the TouchStart plan row (B) or the ring row + Episode values (A); no W08 type |
-| Injection into the W08-built plans | W08Touch (/6; leaf library, imports nothing) | `projectedMarkInject(ring, tp, sp, <primitive relation arrays as mergePlanBuild / splitPlanBuild already take>, dI, dF)`: range intersection, per-Side dedupe, canonical order (the existing private compare), shared cap / truncation, ring eviction, Split append / cap fail, UPDATE patch; rules stay single-sourced in W08Touch |
-| Call site | W08Runtime (/16, same import edges: W08Core /18, W08Touch /6) | inside the existing plan build, right after `splitPlanBuild`; the two delta arrays reach it as two primitive-array fields of ShadowContext set by Main (no new signature on the Main side, no W09 type in W08) |
-| Main | wiring only | build the overlay and the delta (2 W09State calls), pass them in `ShadowContext.new` / the overlay call; nothing else |
-| Apply side (R3-B2) | W09State / Main event rows | `episodeApply` skips ring writes of consumed Cores and clears their TSS; the TouchStart `markAppend` loop skips consumed Cores (moved into W09State if it needs any predicate) |
+### R3-B1 compact architecture v2 (design audit only; not implemented)
 
-Import graph after R3-B1: unchanged edges (Main -> all; W08Runtime -> W08Core, W08Touch; W06 -> W05; W05 -> W07); only
-versions move (W08Touch /6, W08Runtime /16, W09State /24). Publishes: 3 libraries + Main compile.
-Measurement plan (proposal): first compile with the real `projectedMarkInject` wired and Main passing empty delta arrays
-(semantics unchanged; the body cost measured), then enable the delta (R3-B1 proper).
+TOKEN START REVIEW: Main PASS / exact UNKNOWN; headroom UNKNOWN; status UNKNOWN; planned: W08Touch-side projected
+injection; new cross-library import 0; foreign Production type 0; huge UDT 0; `.copy` 0; huge tuple 0; mass array forwarding 0
+(4 primitive arrays); projected copy 0; plan double build 0; Merge / Split rule duplication 0; Main business logic 0.
+
+Dependency graph: unchanged edges (Main -> all; W08Runtime -> W08Core, W08Touch; W06 -> W05; W05 -> W07). W08Touch stays a
+leaf (imports nothing; never W09State). W09State imports nothing (no W08 import, no W08 type).
+
+Authority of the projected data (no second copy): the Episode rows `ei` (stride 10: col 0 Side slot, 1 touchNo, 2 flags,
+3 Core ID, 4 generation, 7 TouchStart plan row or -1, 8 ring row of the existing mark or -1, 9 override) and `ef` (stride 6:
+col 4 Episode max depth), the TouchStart plan rows (`touchStartPlanInts` stride 30: 1 Core slot, 3 generation, 4 side, 6
+touchNo, 16 baseSeq, 17 time, 27 normal; `touchStartPlanFloats` stride 7: 2 contact bottom, 3 contact top, 4 close). The
+projected TouchMark of an Episode row is exactly what F0 writes today: B = `markAppend(plan payload, weakByDepth false, max
+0.0)` then `episodeApply` sets weakByDepth = flags bit 32 and max = ef col 4; A = the ring row col 8 with the same two
+fields replaced (col 8 = -1, truncated absent: no update). W08Touch reads these four primitive arrays through ~15 layout
+constants (a data contract; no rule is copied).
+
+| Item | Design |
+|---|---|
+| W08Touch helpers changed | `mergePlanBuild` and `splitPlanBuild` (existing exports) take the four arrays (`ei`, `ef`, `pI`, `pF`): 10 -> 14 and 16 -> 20 parameters; no new export |
+| W08Touch private helpers added | projected payload accessor by virtual row (negative index -> Episode row), virtual-aware canonical compare over the existing 5 keys, virtual-aware row push (`weakByDepth` / `max` overridden for the Episode's mark), source eviction count |
+| Merge, projected new mark (B) | the source old's extraction gets the projected mark as its newest row of that Side, then the unchanged pipeline: exact winner range intersection, per-Side dedupe (time, bottom, top) in source priority, canonical insertion, shared S/R cap (oldest dropped, truncated per dropped Side) |
+| Merge, existing mark update (A, and B's own mark) | the row pushed from the ring row col 8 (or the virtual row) carries weakByDepth = flags bit 32, max = ef col 4 |
+| Split, projected new mark | appended after the ring rows in the source's logical order (plan order for two marks of one Core), the unchanged per-Side winner intersection, > cap fails |
+| Split, existing mark update | same field override on push |
+| Ring eviction | a source ring with count + appends > cap loses its oldest logical rows (one per append, as `markAppend`): they leave the extraction / logical list and set their Side's truncated flag |
+| Identity | an Episode row applies to a source old only when (slot, Core ID) match (col 0 / 2, col 3) |
+| W08Runtime | new version /16 because the W08Touch export signatures change: ShadowContext + 4 primitive-array fields, the two existing plan-build calls pass them; import W08Touch /6; nothing else |
+| W09State | unchanged in R3-B1 (/22). The Episode overlay (`episodeOverlayBuild(ei, out)`, ints only, R1 signed semantics) belongs to R3-B2 in the next unused W09State version |
+| Main | wiring only: `ei` / `ef` allocated before `ShadowContext.new`, 4 arrays added to it, imports W08Touch /6 and W08Runtime /16 |
+| A / B type | both projected through the same Episode rows; in R3-B1 the overlay is still the TouchStart-only list, so no Episode Core enters a Merge / Split and the injection is inert in Production (behaviour unchanged); it becomes active when R3-B2 switches the overlay |
+| F0 before persistent mutation | 0 (only the W08 plan scratch of this bar is written, as today) |
+| Capacity / truncation / dedupe / range | the existing W08Touch code path, single source |
+
+Publishes: W08Touch /6, W08Runtime /16 (then Main compile). Probe (next step, after approval): the wiring and the new
+parameters with the private helpers stubbed (arrays read, no rule body), foreign type import 0; then the R3-B1 body.
+Deterministic plan for R3-B1 (later): harness of W08Touch plan builds with vs without projected rows equal to the ring after
+the F0 writes (the ring written first, plans rebuilt) for B new mark, A update, eviction, dedupe, cap drop, Split cap fail,
+both Sides, two marks of one Core.

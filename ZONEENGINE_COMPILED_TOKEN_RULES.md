@@ -527,10 +527,12 @@ START GATEで読む。
 
 ## LESSONS / INCIDENT（追記欄。§0〜§18本文は変更しない）
 
-### INC-1: W09 B07-R3B0 compiled-cost Probe（HIGH_COST_STRUCTURE）
+### INC-1: W09 B07-R3B0 compiled-cost Probe（HIGH_COST_STRUCTURE、確定）
 
-- 事象：W09State /22 → /23（W08Core /18・W08Touch /5 をimportし、それらの型を参照する5参照のviewと、Probe関数2本をMainからreachable化。約74行）で、Mainが PASS → 1,113,110（CE10216）。増加は +113,111 以上。
+- R3B0 full：1,113,110（CE10216）。直前baseline（W06 /23・W09State /22）はMain PASS（<1,000,000）。
+- P1（W09State /23 import維持、Probe call 3行削除）：1,112,872（CE10216）。
+- Probe-call cost：238。
+- 増加量：W09State /23だけで +112,873以上。
+- 原因：cross-library foreign-type / import reachability（W09State → W08Core /18・W08Touch /5 のimport、W08型fieldを持つTouchProjectView）。
 - 分類：HIGH_COST_STRUCTURE。
-- 原因（P1で確定、CASE A）：P1（/23 importのまま、Probe呼び出し3行を除去）= 1,112,872。呼び出し経路は238のみで、W09State /23自体（W08Core /18・W08Touch /5 のimportと、W08型fieldを持つexported UDT）が +112,873以上。関数を呼ばなくてもcross-library import / foreign型だけで巨大なcompiled costになる。
-- 再発防止：別Window / libraryの巨大型を小viewに包んでも、compiled costが小さいとは仮定しない。cross-library type dependency（新しいimport、他library型のfield / 引数）は高コスト構造として事前Probe必須。
-
+- 再発防止：「小さいView型でも、他Production libraryの巨大型・plan型を跨いでimportするとcompiled reachabilityが爆発する可能性がある。foreign Production type dependencyはHIGH_COST_STRUCTUREとして扱い、本実装前Probe必須。」
