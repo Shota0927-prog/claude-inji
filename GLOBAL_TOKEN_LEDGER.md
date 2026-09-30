@@ -938,3 +938,38 @@ DEFERRED: GT-5A (APPROVED_DEFERRED), D3, T1-T3, further import search. Token ref
 R3-B1: COMPLETE (semantics verified: det 29/29, reference parity, contract check; Production Main compile PASS with
 W08Touch /7 / W08Runtime /17). R3-B1 semantics FROZEN; never redesigned for token reasons.
 Next: W09 B07 R3-B2.
+
+## W09 B07 R3-B2: resume after the token gate (scope restoration; no code change)
+
+START GATE: branch `claude/w09-b07-redesign-v2`, local = remote = `752d206` (0 / 0), status clean. Production pins = the
+Main PASS configuration: W07Interval /1, W07 /11, W05 /7, W06 /24, W08Core /18, W08Touch /7, W08Runtime /17, W09State /22,
+W03EMsa /9 (+ W03F0 /5, W03Apply /4, W03ETimeFvg /3).
+
+Recorded R3-B2 scope (this ledger, R3-B0 table rows marked R3-B2, and the R3-B1 v2 table):
+1. Overlay switch: `episodeOverlayBuild(ei, out)` in the next unused W09State version (ints only, R1 signed encoding:
+   FORCE_ACTIVE s / FORCE_INACTIVE -(s + 1) from ei col 9); Main passes it to
+   `W08Runtime.planPassWithActiveTouchOverlay` instead of the TouchStart-only `touchStartPlanSideSlots`.
+2. `episodeApply`: rows whose Core was consumed by an applied Merge / Split write no ring row (the W08 plan carries the
+   mark, R3-B1) and clear their TSS.
+3. The Main TouchStart `markAppend` loop skips consumed Cores: moved into W09State (`touchStartMarkApply`); Main keeps the
+   EV_TOUCH_START rows.
+4. Unchanged: C2 transfer plans (read projected values through the R3-A accessor), EV_WEAK_DEPTH / EV_TOUCH_RESET wiring.
+
+Found in the current source, not decided by any recorded plan (needed once item 1 lets an Episode Core into the applied
+topology, i.e. A: previous ActiveTouch -> Reset -> same-bar topology; B: TouchStart -> same-bar Reset -> same-bar topology):
+- Q1 `touchStartPostPlanPreflight` (W09State /22) fails when an Episode Core or a TouchStart target Core is a busy old Core
+  ("R2: an Episode never meets the applied topology"). Which busy relations become allowed (Merge absorbed / survivor,
+  Split source, continuation old, freed / consumed READY) and for which Episodes (Reset only?) is not recorded.
+- Q2 `phaseArmedTransferPreflight` reads the persistent Phase and fails on an ActiveTouch Side ("applied components hold
+  none"). A-type sources are persistent ActiveTouch; their projected Phase after Reset is Waiting with ArmedFromSeq =
+  currentSeq + 1. The R3-A accessor covers 6 values (TouchCount, LastNormalTouchTime, WeakByDepth, MaxDepthPct, SideFresh,
+  ZoneFresh), not Phase / Armed. How the Phase / Armed transfer class and values of an Episode source are projected is
+  not recorded.
+- Q3 `touchStartApply` on a B Episode Core consumed the same bar (Phase / TSS copy / Armed detach / TouchCount on an old
+  slot after commit): skip, or apply before the transfer; not recorded.
+- Q4 TSS clear of a consumed Episode Core: `episodeApply` (item 2) vs the C2 completed-TSS clear in
+  `touchHistoryTransferApply`, which captures valid TSS of freed / continuing sources; ownership of that clear and its
+  order ("TSS cleanup after topology / C2") not recorded.
+- Q5 continuation old (ownership kind 0: the Core continues as the target): is it "consumed" for items 2 / 3 or does the
+  ring row / TSS stay on the continuing Core; not recorded.
+Rule followed: the scope is not uniquely restorable -> no design invented, no code change; STOP for decisions Q1-Q5.
