@@ -33,10 +33,32 @@ source through small helpers returns little. Candidates are ranked by structure,
 
 | ID | Module | Change | Before | After | Known minimum reduction | Effect | Semantic change | Test | Status |
 |---|---|---|---|---|---|---|---|---|---|
-| GT-1 | Main pins | W03Apply /3 -> /4, W03F0 /4 -> /5, W03ETimeFvg /2 -> /3 (published TOKEN_REFACTOR_ONLY versions; sources from `1445b76`) | 1,005,307 | <1,000,000 (exact unknown) | > 5,307 | Bundle HIGH | 0 | existing equivalence PASS reused (W03Apply det 147 + 1k, W03F0 det 28 + 5k, W03ETimeFvg det 13 + 5k); static: export signatures identical | adopted on `claude/global-token-optimization`; Main compile pending |
+| GT-1 | Main pins | W03Apply /3 -> /4, W03F0 /4 -> /5, W03ETimeFvg /2 -> /3 (published TOKEN_REFACTOR_ONLY versions; sources from `1445b76`) | 1,005,307 | <1,000,000 (exact unknown) | > 5,307 | Bundle HIGH | 0 | existing equivalence PASS reused (W03Apply det 147 + 1k, W03F0 det 28 + 5k, W03ETimeFvg det 13 + 5k); static: export signatures identical | ADOPTED; Main PASS (Checkpoint 1) |
 
 Checkpoint rule from here: every semantic Mini-Batch ends with a Main compile; further optimization only when a compile needs it
 (next candidates then: W05 / W06, giant signatures). W05 / W06 / giant-signature refactors are not started now.
+
+## Status after W09 B07-R3A
+
+| Item | Value |
+|---|---|
+| Semantic baseline | `b12adcd` (B07-R3A, W09State /22; backup `backup/w09-b07-r3a-token-gate`) |
+| Main compiled | 1,000,878 (CE10216) |
+| Headroom | -878 |
+| Status | RED |
+| Targets | Checkpoint <= 950,000, preferred <= 925,000 (no semantic risk to chase the number) |
+
+| ID | Probe | Change | Before | After | Delta | Effect | Semantic change | Test | Adopt / Revert |
+|---|---|---|---|---|---|---|---|---|---|
+| M2 | W05Cand unreachable, W06Comp kept (dynamic stubs in a probe copy of W06) | publish `token_probes/M2_W06Component_Worker_M2Probe.pine` as its own library once; Main import line 6 -> it | 1,000,878 | pending | exact if CE10216 shows a number; PASS -> W05 > 878 only | W05 share | probe only | none | never adopted |
+
+M2 probe copy of W06 /19: library renamed `ZoneEngineV2_W06Component_Worker_M2Probe`, the W05 import removed, the three W05 calls
+(`selectComponentBothSides` 33 values, `compareCandidates` int, `selectBothSides` 31 values) replaced by `m2Stub33(bar_index)`,
+`(bar_index % 3 - 1)`, `m2Stub31(bar_index)` (int fields x + k, bool fields x % k == 0); 14 changed lines. Reachability audit
+(baseline `b12adcd` vs Main + probe W06): unreachable W05Cand 27 functions (23,574 source) and W07Fvg `fvgIntervalOrderBuild`
+(623, W05-only dependency); W06Comp 19 of 19 functions still reachable (+ the two stubs); nothing else lost.
+Decision: >= 5,000 -> W05 first; 2,000-4,999 -> W05 candidate; < 2,000 -> W06 first; PASS (exact unknown) -> one W06-only probe
+at most, then decide.
 
 ## Probes (Phase B) (Phase B: compiled cost attribution; publish 0, Main compile only; cumulative)
 
@@ -51,7 +73,6 @@ alone proves a W06 + W05 share > 5,307).
 | G3 | W03ETimeFvg /2 -> /3 | import line 5 | 1,001,007 | <1,000,000 (PASS, exact value not shown) | <= -1,008 (lower bound) | LOW or more | 0 (published, verified) | det 13 + 5k (earlier) | adopt candidate (bundle) |
 | G-bundle | G1 + G2 + G3 | - | 1,005,307 | <1,000,000 | <= -5,308 (lower bound) | HIGH | 0 | existing equivalence PASS reused | ADOPTED (GT-1) |
 | M1 | W06Comp + W05Cand unreachable (dynamic stubs, attribution only), on the baseline alone (W03 /3 /4 /2) | 3 calls -> 2 local stubs of `bar_index` | 1,005,307 | <1,000,000 (PASS, exact value unknown) | W05 + W06 cost > 5,307 | HIGH (lower bound) | probe only | none | never adopted; further attribution DEFERRED |
-| M2 | W05 / W06 internal structure attribution | - | - | - | - | DEFERRED | - | - | - |
 | M1-const | constant-tuple stubs | - | - | - | - | REJECTED_PROBE_DESIGN | - | - | - |
 | S1 | synthetic 100-parameter function | - | - | - | - | DEFERRED | - | - | - |
 
