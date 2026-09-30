@@ -1,5 +1,7 @@
 # GLOBAL TOKEN LEDGER (ZoneEngineV2 Main compiled tokens)
 
+Compiled Token Rule: ZONEENGINE_COMPILED_TOKEN_RULES.md (canonical, all Windows / Batches).
+
 Authority: the TradingView Main compile (CE10216 limit 1,000,000 compiled tokens). The source estimator (`cgest.py` E2 =
 reachable source tokens, each function once) only selects candidates; it never decides PASS / FAIL.
 
@@ -327,7 +329,7 @@ GT-4C2 (`compExternalLinksRaw`) judged only after a TV PASS of GT-4C1.
 | ID | Module | Change | Before | After | Delta | Effect | Semantic change | Test | Status |
 |---|---|---|---|---|---|---|---|---|---|
 | GT-4C1 | W06Comp /21 -> /22 (Main W06 /22) | inline `compExpandFixedPointRaw` into its single call site (56-parameter signature removed, 56 forwarded arguments removed) | <1,000,000 | <1,000,000 (Main PASS) | UNKNOWN | - | UNCHANGED | det 15/15, mutants 3/3 non-equivalent killed, static PASS | ADOPTED |
-| GT-4C2 | W06Comp /22 -> /23 (Main W06 /23) | inline `compExternalLinksRaw` into its single call site (55-parameter signature removed, 55 forwarded arguments removed) | <1,000,000 | pending (TV) | UNKNOWN (Before exact unknown) | - | 0 | det 15/15, mutants 4/4 killed, static PASS | IMPLEMENTED, TV pending (nest 19 levels: compile is the first gate; on a nesting / scope error revert GT-4C2 only, keep GT-4C1) |
+| GT-4C2 | W06Comp /22 -> /23 (Main W06 /23) | inline `compExternalLinksRaw` into its single call site (55-parameter signature removed, 55 forwarded arguments removed) | <1,000,000 | <1,000,000 (Main PASS) | UNKNOWN | - | UNCHANGED | det 15/15, mutants 4/4 killed, static PASS | ADOPTED |
 
 Baseline after GT-4C1: W05Cand /6, W06Comp /22, W03Apply /4, W03F0 /5, W03ETimeFvg /3, W03EMsa /7, W07Fvg /10, W08Core /18,
 W08Touch /5, W08Runtime /15, W09State /22; Main PASS (<1,000,000, exact unknown). R3-A FROZEN, R3-B not started.
@@ -362,3 +364,11 @@ issue.
   with a stale PendingTopology root id: 15/15, 0.35 s. Mutants 4/4 killed (raw `visitEpoch` in the pair check, raw
   `visitEpoch` in the edge-pool stamp, bucket corruption writing the caller `failed`, dropped result `failed`).
 - Removed: signature 55 parameters, forwarding 55 arguments. Source proxy (reference only): W06 29,071 -> 28,619 (-452).
+
+## Checkpoint after GT-4 (W06)
+
+Adopted Production: W03Apply /4, W03F0 /5, W03ETimeFvg /3, W03EMsa /7, W05Cand /6, W06Comp /23, W07Fvg /10, W08Core /18,
+W08Touch /5, W08Runtime /15, W09State /22. W06: GT-4A, GT-4B, GT-4C1, GT-4C2 ADOPTED; removed forwarding 99 + 134 + 56 + 55
+= 344 arguments, semantic change 0. Main: TradingView PASS, exact compiled UNKNOWN (headroom UNKNOWN; status not
+determinable, never assumed GREEN). GT-4D (W03EMsa StageE Ma / Swing / Accum) and later: DEFERRED. Next: W09 B07 R3-B,
+starting with a compiled-cost Probe.
