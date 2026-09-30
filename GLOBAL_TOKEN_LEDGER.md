@@ -583,4 +583,39 @@ ints / floats on the plan path; the Split cap FAIL line kept; one compare body. 
 
 | ID | Module | Change | Before | After | Delta | Status |
 |---|---|---|---|---|---|---|
-| R3B1 | W08Touch /6 -> /7, W08Runtime /16 -> /17, Main imports | projected mark injection | PASS (exact UNKNOWN) | pending (TV) | UNKNOWN | TV pending; PASS -> R3-B1 COMPLETE; CE10216 -> record, no R3-B2, rework the R3-B1 structure |
+| R3B1 | W08Touch /6 -> /7, W08Runtime /16 -> /17, Main imports | projected mark injection | PASS (exact UNKNOWN) | 1,003,009 (CE10216) | UNKNOWN (Before exact unknown) | TV Gate FAIL; semantics KEEP / FROZEN (det 29/29, reference parity PASS); R3-B1 NOT COMPLETE; R3-B2 forbidden |
+
+### R3-B1 TradingView Gate: FAIL (TOKEN_PROBE)
+
+Main 1,003,009 / 1,000,000 (CE10216); headroom -3,009; status RED (> 975,000: no new semantic Batch; compress first).
+R3-B1 semantics FROZEN at `d7b5d9d` (backup `backup/w09-b07-r3b1-token-gate`). Failure class TOKEN_PROBE: the wiring Probe
+measured the 4-array forwarding only, not the injection body (private helpers, Merge / Split projected processing,
+canonical row handling). Next: TOKEN_REFACTOR_ONLY, one structure at a time (refactor -> short equivalence -> publish ->
+Main compile -> compiled value); CE10216 still showing a number means every step is measured exactly.
+
+### Token refactor audit after R3-B1 (no Production change)
+
+W08Touch /7 private helpers (params / call sites / body lines): keyCompareRaw 10 / 2 / 9, rowCompareRaw 7 / 1 / 1 (pure
+pass-through to keyCompareRaw), projIntRaw 4 / 11 / 7, projFloatRaw 4 / 10 / 8, projCompareRaw 5 / 2 / 3, projPlanRowsRaw
+2 / 3 / 3, projAppendsRaw 5 / 2 / 12, projDropRaw 5 / 2 / 3, projLogicalRaw 3 / 1 / 7, projEpisodeRaw 5 / 1 / 30, rowPushRaw
+17 / 2 / 33 (planRowCompareRaw 3 / 2 / 3, existing).
+
+| # | Candidate | Params | Call sites | Forward-only | Body | Semantic risk | Publishes |
+|---|---|---|---|---|---|---|---|
+| T1 | W08Touch `rowCompareRaw` (pure pass-through; planRowCompareRaw calls keyCompareRaw directly) | 7 | 1 | 7 | 1 line | LOW | 2 (W08Touch /8 + W08Runtime /18) |
+| T2 | W08Touch `projEpisodeRaw` inlined into `rowPushRaw` | 5 | 1 | 5 | 30 lines (renames `e`, `o`) | LOW-MEDIUM | 2 |
+| T3 | W08Touch `projLogicalRaw` inlined into the Merge source loop | 3 | 1 | 3 | 7 lines | LOW | 2 |
+| D1 | W03EMsa `run` -> `w03StageEMaRaw` inline | 51 | 1 | 49 (+ 2 journal counters) | 33 lines, 22 locals, 2-value tuple | LOW | 1 (W03EMsa /8) |
+| D2 | W03EMsa `run` -> `w03StageESwingRaw` inline | 74 | 1 | 72 (+ 2) | 60 lines, 29 locals, 4-value tuple | LOW-MEDIUM | 1 |
+| D3 | W03EMsa `run` -> `w03StageEAccumRaw` inline | 88 | 1 | 86 (+ 2) | 98 lines, 50 locals, 17-value tuple | MEDIUM | 1 |
+
+D1-D3 pattern (checked): the callee opens with `journalCountNow = journalCountIn` / `journalInvariantViolationNow =
+journalInvariantViolationIn` (the caller's own `journalCountNow` / `journalInvariantViolationNow`), reads the *In params only
+there, and the caller writes the returned values straight back; inlined, the body updates the caller's two variables
+directly (same values, same order), and the signature, the argument list and the tuple disappear.
+
+RECOMMENDED_NEXT_TOKEN_REFACTOR = D1 (`w03StageEMaRaw` inline, W03EMsa /8, Main pin). Reason: LOW risk (49 identity
+arguments, the two counters are the caller's own variables, no allocation / var / history / break, one tuple removed), one
+publish, 51 parameters + 51 forwarded arguments + a tuple removed, and while Main is still CE10216 the compile shows the
+exact value, so the effect of an inline is measured for the first time. The R3-B1 boundaries T1-T3 are LOW risk but remove
+only 3-7 parameters each and cost two publishes; they are kept as a later bundle (not dropped).

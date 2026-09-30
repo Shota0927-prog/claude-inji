@@ -536,3 +536,11 @@ START GATEで読む。
 - 原因：cross-library foreign-type / import reachability（W09State → W08Core /18・W08Touch /5 のimport、W08型fieldを持つTouchProjectView）。
 - 分類：HIGH_COST_STRUCTURE。
 - 再発防止：「小さいView型でも、他Production libraryの巨大型・plan型を跨いでimportするとcompiled reachabilityが爆発する可能性がある。foreign Production type dependencyはHIGH_COST_STRUCTUREとして扱い、本実装前Probe必須。」
+
+### INC-2: W09 B07-R3B1 本体（TOKEN_PROBE）
+
+- 結果：Main 1,003,009（CE10216）、headroom -3,009、Status RED。R3-B1 semanticはKEEP / FROZEN（deterministic 29/29、reference parity PASS）、TV Gate FAIL、R3-B1 NOT COMPLETE。
+- 原因：R3-B1 Wiring Probeは4 primitive array forwardingとW08Touch / W08Runtime wiringのcompiled costだけを確認し、Projected Mark Injection本体（private helper群、Merge / Split projected processing、canonical row handling）のcompiled costを含まなかった。
+- 分類：TOKEN_PROBE。
+- 再発防止：「配線ProbeがPASSしても、本体側に複数helper / loop / canonical処理追加があるsemantic Batchでは、本体物理構造を含む中間Gateを検討する。」
+
