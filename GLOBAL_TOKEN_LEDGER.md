@@ -742,7 +742,7 @@ worker) without foreign types, the code stays byte-for-byte the same logic, and 
 Probe C (Production files unchanged; separate probe library names, no Production version used):
 - `token_probes/R3B1C_W05Candidate_Worker_NoW07Probe.pine` = W05 /6 with no W07 import; the 4 `W07Fvg.` call sites call
   verbatim copies of the W07 closure `fvgIntervalOrderBuild`, `fvgIntervalQuery`, `fvgIntervalLowerBoundRaw` (export
-  keyword removed) appended at the end; one constant added (`FVG_INTERVAL_BUILD_INVALID_INPUT = 1`, W07's value;
+  keyword removed) placed before their first use (originally appended at the end: see PROBE_BUILD_ERROR below); one constant added (`FVG_INTERVAL_BUILD_INVALID_INPUT = 1`, W07's value;
   `FVG_INTERVAL_BUILD_OK`, `ID_NONE`, `SLOT_INVALID` already equal). Library name `ZoneEngineV2_W05Candidate_Worker_NoW07Probe`.
 - `token_probes/R3B1C_W06Component_Worker_NoW07Probe.pine` = W06 /23 with only the library name and the W05 import changed
   (-> `ZoneEngineV2_W05Candidate_Worker_NoW07Probe/1`).
@@ -790,3 +790,17 @@ no further Probe and not straight back to GT-5A: design audit for removing the W
 zero semantic change and a single semantic authority (owner move, worker split, safe inline, dependency direction);
 a permanent copy of the 3 functions is not adopted automatically (double authority). The duplicated W07 functions
 bias the delta downward; the result is not over-read. GT-5A stays APPROVED_DEFERRED.
+
+PROBE_BUILD_ERROR (not a token result; IP-C stays unmeasured, baseline stays 1,003,009): the first W05 probe publish
+failed with CE10245 ("A library must contain at least one exported function, method, or type").
+- Export audit: W05 /6 has 3 exports (`selectBothSides`, `compareCandidates`, `selectComponentBothSides`, the ones W06
+  calls); the probe had the same 3 with identical signature lines. The export-strip step touched only the 3 W07 copies.
+- Construction defect found: the 3 private copies were appended at the end of the file, after their callers (first use
+  at source line 324); Pine needs a user function declared before its use, so the probe could not compile, and a
+  library that does not compile reports no exported function. Fix: the same 3 bodies moved above the first W05 function
+  (after `type CandidateCtx`), in W07's order (LowerBoundRaw, OrderBuild, Query); nothing else changed.
+- Static gate after the fix: export count 3 = 3, names and signature lines identical, `W07Fvg.` code references 0 (3
+  comment mentions), no import, the 3 copies byte-identical to W07 /10 apart from `export` and private, each declared
+  before its first use, the constants they use (ID_NONE, SLOT_INVALID, FVG_INTERVAL_BUILD_OK / _INVALID_INPUT) declared
+  above them; the diff against W05 /6 is only library name, W07 import, the 4 call sites (`W07Fvg.` prefix only), 1
+  constant and the 189-line block. W06 probe and Main probe unchanged. Probe library /1 is still unused.
