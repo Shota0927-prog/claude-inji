@@ -29,14 +29,26 @@ Historical data points: C1 `207,147` source = 1,000,146 compiled; B07 overflow 1
 Observed compiled / source ratio of refactors: 0.9 (H-3) to 1.7 (H-2), far below the whole-code average (~4.8): shorter
 source through small helpers returns little. Candidates are ranked by structure, then calibrated by probes.
 
-## Pending probes
+## Pending probes (Phase B: compiled cost attribution; publish 0, Main compile only)
 
-| ID | Probe | Main change only | Publish | Measures |
-|---|---|---|---|---|
-| G1 | pins W03Apply /4, W03F0 /5, W03ETimeFvg /3 | 3 import lines | 0 | the three published TOKEN_REFACTOR_ONLY versions together |
-| G2 | pins W03Apply /4, W03F0 /5 (W03ETimeFvg /2) | 2 import lines | 0 | splits G1 (W03ETimeFvg /3 = G1 - G2) |
-| S1 | one reachable 100-parameter scratch function + one 100-argument call | scratch Main | 0 | compiled cost per parameter / argument (decides the forwarding class below) |
-| M1 | the three W06Comp calls stubbed (W06 + W05 unreachable) | scratch Main | 0 | compiled share of W06 + W05 (54.5k source) |
+Every probe starts from the baseline Main (`41e0440`: W03F0 /4, W03Apply /3, W03ETimeFvg /2, W06 /19, W07 /10, W08Core /18,
+W08Touch /5, W08Runtime /15, W03EMsa /7, W09State /21) and changes one thing.
+
+| ID | Probe | Change | Before | After | Delta | Effect | Semantic change | Test | Adopt / Revert |
+|---|---|---|---|---|---|---|---|---|---|
+| G-A | W03Apply /3 -> /4 | import line 4 | 1,005,307 | pending | pending | pending | 0 (published, verified) | det 147 + 1k smoke (earlier) | pending |
+| G-F | W03F0 /4 -> /5 | import line 3 | 1,005,307 | pending | pending | pending | 0 (published, verified) | det 28 + 5k (earlier) | pending |
+| G-E | W03ETimeFvg /2 -> /3 | import line 5 | 1,005,307 | pending | pending | pending | 0 (published, verified) | det 13 + 5k (earlier) | pending |
+| M1 | W06Comp + W05Cand unreachable (scratch, attribution only) | 3 calls -> 2 local stubs | 1,005,307 | pending | pending | module share | probe only | none | never adopted |
+| S1 | synthetic 100-parameter function | - | - | - | - | DEFERRED | - | - | - |
+
+S1 = DEFERRED: a synthetic parameter's compiled cost need not match the Production export signatures, cross-library calls,
+array forwarding or inlining.
+
+M1 reachability audit (cgest reachable graph, probe vs baseline): unreachable W06Comp 19 functions (30,942 source), W05Cand 27
+functions (23,574), W07Fvg `fvgIntervalOrderBuild` 1 function (623; called only by W05Cand, so part of the W05 cost); nothing
+else; W06 / W05 still reachable: none; new: the two stubs. A value shown after the compile is recorded as it is; a PASS without a
+number is recorded as After = <1,000,000 and Delta as the minimum only.
 
 ## Structural candidates (source proxy, unverified in compiled tokens)
 
