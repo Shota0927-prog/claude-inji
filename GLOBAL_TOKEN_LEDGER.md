@@ -504,3 +504,34 @@ parameters with the private helpers stubbed (arrays read, no rule body), foreign
 Deterministic plan for R3-B1 (later): harness of W08Touch plan builds with vs without projected rows equal to the ring after
 the F0 writes (the ring written first, plans rebuilt) for B new mark, A update, eviction, dedupe, cap drop, Split cap fail,
 both Sides, two marks of one Core.
+
+### R3-B1 wiring Probe (W08Touch /6, W08Runtime /16; W09State /22 kept)
+
+Design contract fixed before the Probe:
+- Capacity is three separate things, never mixed: (A) source ring projected append = `markAppend` semantics (a full source
+  ring loses its oldest mark per append, that mark's Side becomes truncated); (B) Merge destination = the W08Touch canonical
+  pipeline on the projected source history (range intersection, dedupe, canonical sort, then the shared cap drops the
+  oldest rows, each dropped Side truncated); (C) Split destination = ring logical order, no dedupe, a child above the cap
+  FAILS (never trimmed; "drop the oldest" is not applied to a Split destination).
+- Scratch-format contract: W08Touch reads `ei` / `ef` / TouchStart plan ints / floats through compile-time constants
+  (EI_*, EF_*, PI_*, PF_*); no contract library, no new import, no foreign type. Static conformance outside Production:
+  `tests/r3b1_scratch_contract_check.py` (W08Touch constants vs W09State PLAN_* / EP_* constants, the episodePlan ei / ef
+  row expressions, the episodeApply mark write, the Main markAppend wiring): PASS; self-test: 6 seeded mismatches (5
+  constants, 1 Main column) all FAIL.
+
+TOKEN START REVIEW: Main PASS / exact UNKNOWN; headroom UNKNOWN; status UNKNOWN; this batch: R3-B1 wiring Probe only;
+W08Touch /6 (mergePlanBuild 10 -> 14, splitPlanBuild 16 -> 20 params), W08Runtime /16 (4 primitive-array references in
+ShadowContext), Main (ei / ef allocation moved before ShadowContext.new, 4 references passed, 2 imports); new cross-library
+import 0 (edges unchanged, versions only); foreign Production type 0; huge UDT 0; `.copy` 0; tuple 0; projected state copy 0;
+plan rebuild 0; Merge / Split rule duplication 0; Main business logic 0; Probe required YES.
+
+Probe body: private `projectedScratchProbeRaw(ei, ef, pI, pF)` in W08Touch reads sizes, strides and the representative
+columns (plan row, mark row, flags bit 32, Episode max, plan touchNo / contact bottom) with bounds checks and na guards,
+writes nothing, returns >= 0; both plan builds AND it into their existing `ok` (always true, so the plans are unchanged).
+No Merge / Split rule change. Check `r3b1p_det.py`: well-formed, empty Episode, empty TouchStart plan, exact stride, short
+ei / ef / plan ints / plan floats, na arrays, non-destructive: 10/10 (0.1 s). The existing plan code is otherwise
+byte-identical (diff: helper + constants + two signatures + two `ok` lines; W08Runtime: import, 4 fields, 2 call sites).
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| R3B1P | W08Touch /5 -> /6, W08Runtime /15 -> /16, Main | 4-array wiring Probe (read-only) | PASS (exact UNKNOWN) | pending (TV) | UNKNOWN | PASS -> R3-B1 body; CE10216 -> record the value, redesign the 4-array forwarding |
