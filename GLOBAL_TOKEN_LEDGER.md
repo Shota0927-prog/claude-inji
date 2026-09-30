@@ -1182,3 +1182,63 @@ destination that also receives an Armed / Waiting source). Without that text the
 guessing -> STOP before implementation. Minor: the Dormant index has no key array and no Dormant writer exists
 (unreachable today): proposal, Dormant opposite -> PhaseSet detach, fail-closed if it holds a Dormant index position;
 Broken / FlipWait index keys = the Side's BS range bottom / top.
+
+### I27-15 BreakSnapshot transfer (restored and fixed by the user; the final I27-15 text is not in the repo)
+
+1. Merge: several valid BS sources -> one source by breakSeq max, then breakTime max, then old Core canonical order; its
+   whole BS row (all scalars + Root copy) is taken (no field-wise mix).
+2. Split: source BS fixed range [bsBottom, bsTop] vs the child Side new EffectiveRange [childBottom, childTop]:
+   inherited only on inclusive intersection (childTop >= bsBottom and childBottom <= bsTop); no containment, no nearest;
+   every intersecting child inherits; 0 intersecting children -> F0 fail-closed (never dropped); several BS into one
+   destination -> the Merge order.
+3. Phase after BS: a destination Side with a valid BS -> Broken when its side = BS.oldSide, else FlipWait (over the
+   Waiting / Armed / Dormant re-evaluation, also when merged with an Armed / Waiting source); CurrentTouchNo 0; Upcoming
+   = resulting TouchCount + 1; Grade Unavailable; TouchCount / Weak / MaxDepth / Fresh = the transfer result. Sides
+   without a valid BS: the normal Stage J (new EffectiveRange, current close).
+4. Transfer order: TouchMark -> Side history -> derived state -> BreakSnapshot -> Phase / Grade / Armed; TSS cleanup
+   after the real topology transfer; persistent mutation 0 until all F0.
+5. Dormant opposite: PhaseSet detach; preflight that every Dormant recovery reverse position is SLOT_INVALID
+   (FlipWait); any real membership -> fail-closed; no new Dormant order algorithm.
+6. Broken / FlipWait price indexes: keys = the BS frozen range (bottom / top) of the Side, ticked only for comparison;
+   no EffectiveRange, no buffer / reset offsets; index order never used as Event order.
+7. W08Runtime /18: only the 14 BreakSnapshot fields leave MERGE_STATE_DEFAULT_GUARD (field by field; nothing else).
+   (Correction: the W08 guard lists 14 BreakSnapshot fields; "15" above was a miscount.)
+8. Token Probe: YES, exactly one, body-inclusive (BS create, BS Root copy, BS Merge / Split transfer, Phase / index,
+   Event path); PASS -> Production with the same design, no further Probe; CE10216 -> record and STOP.
+
+### B08-A body-inclusive Token Probe (one Probe; Production unchanged)
+
+Probe = the full B08-A implementation under a Probe library name (no stub, every body reachable from Main):
+- `token_probes/B08A_W09State_Worker_Probe.pine` = W09State /24 + B08-A, library `ZoneEngineV2_W09State_Worker_B08AProbe`
+  (source diff vs /24: 441 changed lines): PhaseArmedTransferView + 31 BS / pool / index / Dormant refs + 3 scratch;
+  helpers bsIndexRaw, bsClearRaw, bsNodeFreeRaw, bsWriteRaw, bsRootAppendRaw, bsSourceRaw; episodePlan (flag 1 = Local
+  Break, Break > Reset, override); phaseArmedTransferPreflight (source Broken / BS fail-closed lifted);
+  phaseArmedIndexRelease (+ Broken / FlipWait release of Merge / Split / freed sources); touchStartPostPlanPreflight
+  (+ef: Break as an Episode end for busy, D3 opposite rules, BS range, Event room, BS pool growth); episodeApply (+seq /
+  time / mintick: Local Break branch - BS on both Sides from the TSS with its Root copy before the TSS clear, Broken /
+  FlipWait, Armed detach, CurrentTouchNo 0, Grade Unavailable, Broken / FlipWait index attach; a Reset keeps a partner's
+  FlipWait); bsTransferPlan / bsTransferApply (Merge selection, Split inclusive intersection, 0-child fail, release list,
+  whole-row copy); phaseArmedStageJFinalize (a destination with a valid BS -> Broken / FlipWait, Grade Unavailable,
+  index attach).
+- `token_probes/B08A_Rebuild_Main_Probe.pine` = Main + B08-A wiring, only the W09State import pointing at the Probe /1:
+  34 added `pav` arguments, bsTransferPlan in the preflight chain, bsTransferApply after the C2 apply, post-plan +ef,
+  episodeApply + seq / time / mintick, the Episode Event loop k 0..2 (EV_LOCAL_BREAK = flag 1).
+- Not in the Probe: W08Runtime /18 (the 14 BreakSnapshot guard rows move under `if write`: no new code path, cost
+  neutral or lower); it is published with the Production batch.
+
+Sanity (not the Production gate) on the Probe bodies, `b8a_det.py` (W09State + Main slice interpreted, W08 stub with the
+W08 free BS reset): 16/16 - L1 / L2 existing Support / Resistance Break, L3 / L4 same-bar TouchStart -> Break (Events
+TouchStart then LocalBreak), L5 / L6 / L7 Break + Merge survivor / absorbed / Split continuation (BS transfer, Stage J
+Broken / FlipWait), L8 / L9 opposite Armed / Dormant, F1 opposite unresolved ActiveTouch, F2 Split child missing the BS
+range (plan fails), F3 W08 F0 fail (mutation 0), P1 Break over WeakDepth, P2 Weak history kept, M1 persistent BS Merge
+selection (newest whole row), M2 Broken 1:1 continuation unchanged. Two first-run failures were fixture / expectation
+errors (L8 another Core's Stage J Armed Side; F1 opposite range that Resets), no code change.
+
+Implementation choices to confirm (not covered by D1-D7 / I27-15 text): (a) a Core freed outside every relation (no
+Merge / Split, W08 free) releases its persistent BS with the Core (the Core ends; no destination exists); (b) a
+same-bar Local Break on such a Core emits EV_LOCAL_BREAK but no BS is materialized (no destination). Alternatives:
+fail-closed (would block every W08 plan that retires a Broken Core).
+
+TV: publish `ZoneEngineV2_W09State_Worker_B08AProbe` /1 (the Probe file), then compile the Probe Main once.
+Reading: PASS -> B08-A Production with this design (W09State /25, W08Runtime /18, Main), no further Probe;
+CE10216 -> record the number, STOP.

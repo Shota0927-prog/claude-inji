@@ -1,0 +1,2521 @@
+//@version=6
+// ============================================================
+// ZoneEngineV2_W09State_Worker - W09 State set / price index / canonical extraction primitives
+//
+// W09 B02 (I16): the base of the event-driven State pass. The per-bar State stages must not scan every Core / Side; they
+// take the transition-capable Views from state sets (ActiveTouch: the whole set) and from price-key order indexes, then
+// evaluate them in the canonical order. This worker owns no persistent state and never imports the Main library: the
+// caller passes references of its own storage (no copy). Primitives only; no Phase / Touch / Weak / Break / Flip /
+// Reclaim / Inverse writer and no I27-15 Side state transfer here (later W09 batches).
+//
+// P1 membership: stateSetUpdate (unordered set, O(1) push / swap-remove, per-slot position) and priceOrderUpdate (order
+//    index sorted by (key tick ASC, slot ASC), per-slot position; the tick is round(keyPrice / mintick), computed at the
+//    comparison only (D12)). A slot's key must not change while it is indexed (the caller removes, rewrites, re-adds).
+// P2 priceOrderRange: every indexed slot whose key tick lies in [loTick, hiTick] (inclusive; na = unbounded side), in
+//    index order. Exact: the index is totally ordered by key tick, so the result is the contiguous run between the two
+//    lower bounds - no cap, no nearest-N, no distance cutoff (a false negative needs a corrupt index, which fails closed).
+// P3 canonicalSideSlots: Side slot candidates (coreSlot * 2 + 0 Support / + 1 Resistance) of any sources -> unique, in
+//    the canonical order coreId ASC, generationId ASC, Support, Resistance. Index / set / map storage order never leaks
+//    into the evaluation order.
+// Every primitive validates what it touches and fails closed: false / -1 and no partial effect (an update that fails
+// writes nothing; a failed range append or canonical build leaves out as it was / empty).
+//
+// W09 B03 (spec 7.2 / 9.1 / A13.4): pure Grade evaluation, no state read or write (no Phase / Grade / TouchCount / Weak
+// flag / TouchStartSnapshot writer). The caller picks the target Touch number (Waiting / Armed: UpcomingTouchNo =
+// SideTouchCount + 1; ActiveTouch: the Episode's fixed CurrentTouchNo) and the Flip-unconfirmed fact; the cfg values are
+// the validated ones (validateCfg), used as given (no clamp, no reorder, no default substitution).
+//
+// W09 B04 (spec 7.4 / 8.4 / A12 / A13.2): pure Armed distance / Touch Reset distance / next-bar seq, no state read or
+// write. Prices compare in ticks (D12, as W07 Inverse): round(price / mintick) each, resetTick = round(touchResetDistance
+// / mintick); equality included; the confirmed close only. Reset takes the TouchStartSnapshot range, never the live
+// range. A side for which armedDistanceMet is true is that side's approach candidate (no High / Low / candle inference).
+// The caller keeps the next-bar rules: a bar that first meets the distance arms from the next seq; a Reset bar or a
+// FlipConfirm / InverseConfirm bar starts no normal Touch on the same bar.
+//
+// W09 B05 (spec 8.1 / 8.2 / 10.2 / 15 / A13.1 / A14.2, I8 Stage D1, I16): Stage D1 target extraction only (no Touch start,
+// no GapBreak commit, no state write, no Event). Geometry = the caller's previous-bar (Stage C) Armed range per Side slot
+// (rangeBottoms / rangeTops) and its two price-order indexes (bottom order keyed by rangeBottoms, top order keyed by
+// rangeTops); ticks = round(price / mintick) (D12). Touch: width Zone bottomTick <= highTick and topTick >= lowTick
+// (bottom index (-inf, highTick] intersected with top index [lowTick, +inf)); one-line Zone (bottomTick == topTick) also
+// linePriceTick in [lowTick - toleranceTick, highTick + toleranceTick] (the tolerance never widens a width Zone). GapBreak:
+// Support bottomTick >= max(highTick + 1, closeTick + breakBufferTick) (bottom index), Resistance topTick <= min(lowTick -
+// 1, closeTick - breakBufferTick) (top index). These are the exact predicates, so the target set is exact (no cap, no
+// nearest-N). d1TargetSlots keeps previous-bar Armed, eligible, currentSeq >= armedFromSeq Sides and returns them unique in
+// the canonical order (canonicalSideSlots).
+//
+// W09 B06-A (spec 13.1 / 14.1 / 14.2, I27-16): the per-Side Touch / GapBreak predicates of the Stage D1 targets, pure (no
+// state read or write). normalTouchMetExact is the touchTargetSlots geometry for one range; gapBreakMetExclusive is the
+// gapBreakTargetSlots geometry for one Side, false whenever the normal Touch holds (normal Touch > GapBreak).
+// ============================================================
+library("ZoneEngineV2_W09State_Worker_B08AProbe", overlay = false)
+
+const int SLOT_INVALID = -1
+const int ID_NONE      = 0
+
+const int SIDE_SUPPORT    = 1
+const int SIDE_RESISTANCE = -1
+const int SIDE_NONE       = 0
+const int SEQ_UNSET       = -1
+const int PH_WAITING      = 0
+const int PH_ARMED        = 1
+const int PH_ACTIVE_TOUCH = 2
+const int PH_BROKEN       = 3
+const int PH_FLIP_WAIT    = 4
+const int PH_DORMANT      = 5
+
+const int GR_STRONG      = 0
+const int GR_NEUTRAL     = 1
+const int GR_WEAK        = 2
+const int GR_UNAVAILABLE = 3
+
+// W09 H06-B1: bridge View types (array references of the Main storage, no copy; the W08Runtime View pattern). Main builds
+// them with <Type>.new(...) directly; no constructor wrapper. Field order is fixed for the H06-B2..B4 wrappers.
+// CurrentRootPoolView: Side current Root pool = Side metadata (head / tail / count), node payload (Root ID, next, owner Side
+// slot, expected Core / Generation ID, live) and the free stack.
+export type CurrentRootPoolView
+    array<int>  headNodeIndexes
+    array<int>  tailNodeIndexes
+    array<int>  counts
+    array<int>  rootIds
+    array<int>  nextIndexes
+    array<int>  ownerSideSlots
+    array<int>  expectedCoreIds
+    array<int>  expectedGenerationIds
+    array<int>  freeIndexes
+    array<bool> liveFlags
+// TouchSnapshotRootPoolView: TouchStartSnapshot Root pool (W10-owned) = Side metadata, node payload (Root ID, next, owner
+// Side slot, expected Core / Generation ID, expected Touch number, live) and the free stack.
+export type TouchSnapshotRootPoolView
+    array<int>  headNodeIndexes
+    array<int>  tailNodeIndexes
+    array<int>  counts
+    array<int>  rootIds
+    array<int>  nextIndexes
+    array<int>  ownerSideSlots
+    array<int>  expectedCoreIds
+    array<int>  expectedGenerationIds
+    array<int>  expectedTouchNos
+    array<int>  freeIndexes
+    array<bool> liveFlags
+// PhaseSetView: sidePhases, sidePhaseSetPositions and the six Phase sets (Waiting, Armed, ActiveTouch, Broken, FlipWait,
+// Dormant).
+export type PhaseSetView
+    array<int> sidePhases
+    array<int> sidePhaseSetPositions
+    array<int> waitingSideSlots
+    array<int> armedSideSlots
+    array<int> activeTouchSideSlots
+    array<int> brokenSideSlots
+    array<int> flipWaitSideSlots
+    array<int> dormantSideSlots
+
+// P1a: unordered state set. add = true pushes slot (it must not be a member: position == SLOT_INVALID); add = false
+// removes a member by swap-remove (the last member takes its position). Returns true when the update was applied.
+export stateSetUpdate(array<int> members, array<int> positions, int slot, bool add) =>
+    bool ok = slot >= 0 and slot < array.size(positions)
+    if ok
+        int pos = array.get(positions, slot)
+        if add
+            ok := pos == SLOT_INVALID
+            if ok
+                array.set(positions, slot, array.size(members))
+                array.push(members, slot)
+        else
+            ok := pos >= 0 and pos < array.size(members)
+            if ok
+                ok := array.get(members, pos) == slot
+            if ok
+                int lastPos  = array.size(members) - 1
+                int lastSlot = array.get(members, lastPos)
+                if pos != lastPos
+                    array.set(members, pos, lastSlot)
+                    array.set(positions, lastSlot, pos)
+                array.pop(members)
+                array.set(positions, slot, SLOT_INVALID)
+    ok
+
+// Order index search: the first position whose entry (key tick, slot) is >= (tick, slot) in lexicographic order, with the
+// visited entries validated (in range, position back-reference, non-na key). slot = SLOT_INVALID gives the first entry
+// with key tick >= tick. Returns [position, ok].
+priceOrderSearchRaw(array<int> orderSlots, array<int> positions, array<float> keyPrices, float mintick, int tick, int slot) =>
+    bool ok = mintick > 0 and not na(tick)
+    int  lo = 0
+    int  hi = array.size(orderSlots)
+    while ok and lo < hi
+        int mid = int(math.floor((lo + hi) / 2))
+        int s   = array.get(orderSlots, mid)
+        ok := s >= 0 and s < array.size(positions) and s < array.size(keyPrices)
+        if ok
+            ok := array.get(positions, s) == mid and not na(array.get(keyPrices, s))
+        if ok
+            int t = int(math.round(array.get(keyPrices, s) / mintick))
+            if t < tick or (t == tick and s < slot)
+                lo := mid + 1
+            else
+                hi := mid
+    [lo, ok]
+
+// P1b: price-key order index, sorted by (round(keyPrice / mintick) ASC, slot ASC). add = true inserts slot (not indexed,
+// non-na key) at its unique ordered position; add = false removes an indexed slot. Shifts use array.set (no
+// array.insert / array.remove at 0, no unshift) and keep every moved slot's position. Returns true when applied.
+export priceOrderUpdate(array<int> orderSlots, array<int> positions, array<float> keyPrices, float mintick, int slot, bool add) =>
+    bool ok = mintick > 0 and slot >= 0 and slot < array.size(positions) and slot < array.size(keyPrices)
+    int  n  = array.size(orderSlots)
+    if ok and add
+        ok := array.get(positions, slot) == SLOT_INVALID and not na(array.get(keyPrices, slot))
+        int tick = ok ? int(math.round(array.get(keyPrices, slot) / mintick)) : int(na)
+        [insertPos, searchOk] = priceOrderSearchRaw(orderSlots, positions, keyPrices, mintick, tick, slot)
+        ok := ok and searchOk
+        // neighbours: the left entry is strictly smaller, the right entry strictly larger (slot not already present)
+        if ok and insertPos > 0
+            int l = array.get(orderSlots, insertPos - 1)
+            ok := l >= 0 and l < array.size(positions) and l < array.size(keyPrices)
+            if ok
+                ok := l != slot and array.get(positions, l) == insertPos - 1 and not na(array.get(keyPrices, l))
+            if ok
+                int lt = int(math.round(array.get(keyPrices, l) / mintick))
+                ok := lt < tick or (lt == tick and l < slot)
+        if ok and insertPos < n
+            int r = array.get(orderSlots, insertPos)
+            ok := r >= 0 and r < array.size(positions) and r < array.size(keyPrices)
+            if ok
+                ok := r != slot and array.get(positions, r) == insertPos and not na(array.get(keyPrices, r))
+            if ok
+                int rt = int(math.round(array.get(keyPrices, r) / mintick))
+                ok := rt > tick or (rt == tick and r > slot)
+        if ok
+            array.push(orderSlots, slot)
+            int i = n
+            while i > insertPos
+                int moved = array.get(orderSlots, i - 1)
+                array.set(orderSlots, i, moved)
+                array.set(positions, moved, i)
+                i -= 1
+            array.set(orderSlots, insertPos, slot)
+            array.set(positions, slot, insertPos)
+    else if ok
+        int pos = array.get(positions, slot)
+        ok := pos >= 0 and pos < n
+        if ok
+            ok := array.get(orderSlots, pos) == slot
+        if ok
+            int i = pos
+            while i < n - 1
+                int moved = array.get(orderSlots, i + 1)
+                array.set(orderSlots, i, moved)
+                array.set(positions, moved, i)
+                i += 1
+            array.pop(orderSlots)
+            array.set(positions, slot, SLOT_INVALID)
+    ok
+
+// P2: append to out every indexed slot whose key tick is in [loTick, hiTick] (inclusive; na loTick / hiTick = unbounded
+// on that side), in index order. The run is [search(loTick), search(hiTick + 1)); every entry in it is re-validated.
+// Returns the appended count, or -1 (corrupt index / invalid input: out is restored to its size on entry).
+export priceOrderRange(array<int> orderSlots, array<int> positions, array<float> keyPrices, float mintick, int loTick, int hiTick, array<int> out) =>
+    int  base = array.size(out)
+    int  n    = array.size(orderSlots)
+    bool ok   = mintick > 0
+    int  from = 0
+    int  toIdx = n
+    if ok and not na(loTick)
+        [p, pOk] = priceOrderSearchRaw(orderSlots, positions, keyPrices, mintick, loTick, SLOT_INVALID)
+        ok   := pOk
+        from := p
+    if ok and not na(hiTick)
+        [q, qOk] = priceOrderSearchRaw(orderSlots, positions, keyPrices, mintick, hiTick + 1, SLOT_INVALID)
+        ok := qOk
+        toIdx := q
+    int i = from
+    while ok and i < toIdx
+        int s = array.get(orderSlots, i)
+        ok := s >= 0 and s < array.size(positions) and s < array.size(keyPrices)
+        if ok
+            ok := array.get(positions, s) == i and not na(array.get(keyPrices, s))
+        if ok
+            int t = int(math.round(array.get(keyPrices, s) / mintick))
+            ok := (na(loTick) or t >= loTick) and (na(hiTick) or t <= hiTick)
+        if ok
+            array.push(out, s)
+        i += 1
+    if not ok
+        while array.size(out) > base
+            array.pop(out)
+    ok ? array.size(out) - base : -1
+
+// P3: canonical View order of Side slot candidates gathered from any sets / indexes (duplicates allowed). out = the unique
+// Side slots, coreId ASC, generationId ASC, Support (slot % 2 == 0) before Resistance. Every candidate must be a live
+// Core Side whose coreId maps back to its slot (coreIdToSlot): a live coreId is unique, so (coreId, side) is a total key
+// and the generationId level never has to break a tie. Returns true; false (out empty) on any invalid candidate.
+export canonicalSideSlots(array<int> candidates, array<int> coreIds, array<int> coreGenerationIds, array<bool> coreSlotLiveFlags, map<int, int> coreIdToSlot, array<int> out) =>
+    array.clear(out)
+    int  n    = array.size(candidates)
+    bool ok   = true
+    array<int> keys = array.new_int(n, 0)
+    int i = 0
+    while ok and i < n
+        int s = array.get(candidates, i)
+        int c = s >= 0 ? int(math.floor(s / 2)) : SLOT_INVALID
+        ok := s >= 0 and c < array.size(coreIds) and c < array.size(coreGenerationIds) and c < array.size(coreSlotLiveFlags)
+        if ok
+            int id = array.get(coreIds, c)
+            ok := array.get(coreSlotLiveFlags, c) and id >= 1 and array.get(coreGenerationIds, c) >= 1 and map.contains(coreIdToSlot, id)
+            if ok
+                ok := map.get(coreIdToSlot, id) == c
+            if ok
+                array.set(keys, i, id * 2 + s % 2)
+        i += 1
+    if ok and n > 0
+        array<int> idx = array.sort_indices(keys, order.ascending)
+        int lastKey = 0
+        int k = 0
+        while k < n
+            int j   = array.get(idx, k)
+            int key = array.get(keys, j)
+            // equal keys = the same live (coreId, side) = the same Side slot (coreIdToSlot is one-to-one): dedupe
+            if k == 0 or key != lastKey
+                array.push(out, array.get(candidates, j))
+            lastKey := key
+            k += 1
+    if not ok
+        array.clear(out)
+    ok
+
+// B03 P1: the Touch-number Weak condition of the target Touch number. WeakFromTouch OFF: never (WeakByDepth is separate
+// and stays in force); else targetTouchNo >= weakFromTouch (equality included).
+export weakByTouchNow(int targetTouchNo, int weakFromTouch, bool weakFromTouchOff) =>
+    not weakFromTouchOff and targetTouchNo >= weakFromTouch
+
+// B03 P2: the Touch-number Strong window of the target Touch number. StrongUntilTouch Unlimited: always inside (it only
+// removes the Touch-number expiry; the Weak step of the Grade order still comes first); else targetTouchNo <=
+// strongUntilTouch (equality included).
+export strongTouchEligible(int targetTouchNo, int strongUntilTouch, bool strongUnlimited) =>
+    strongUnlimited or targetTouchNo <= strongUntilTouch
+
+// B03 P3: the Side View Grade in the fixed order of spec 7.2 / A13.4 (D03 values):
+// 1 no valid non-psych Root, or the role is Flip-unconfirmed -> Unavailable
+// 2 WeakByDepth, or the target Touch number reached WeakFromTouch -> Weak
+// 3 Base Strong and the target Touch number inside StrongUntilTouch -> Strong
+// 4 otherwise -> Neutral
+// weakByTouch is the caller's Touch-number Weak input (weakByTouchNow of the target Touch number, or the kept WeakByTouch
+// fact); Phase is not an input (Phase and Grade are separate).
+export gradeExact(bool hasNonPsychRoot, bool flipUnconfirmed, bool weakByDepth, bool weakByTouch, bool baseStrong, bool strongEligible) =>
+    int grade = GR_NEUTRAL
+    if not hasNonPsychRoot or flipUnconfirmed
+        grade := GR_UNAVAILABLE
+    else if weakByDepth or weakByTouch
+        grade := GR_WEAK
+    else if baseStrong and strongEligible
+        grade := GR_STRONG
+    grade
+
+// B04 P1: the Armed distance of one Side on the confirmed close. Support: closeTick >= topTick + resetTick; Resistance:
+// closeTick <= bottomTick - resetTick (equality included). Any other side, na input or mintick <= 0: false.
+export armedDistanceMet(int side, float baseClose, float effectiveBottom, float effectiveTop, float touchResetDistance, float mintick) =>
+    bool met = false
+    if mintick > 0 and not na(baseClose) and not na(touchResetDistance)
+        int closeTick = int(math.round(baseClose / mintick))
+        int resetTick = int(math.round(touchResetDistance / mintick))
+        if side == SIDE_SUPPORT and not na(effectiveTop)
+            met := closeTick >= int(math.round(effectiveTop / mintick)) + resetTick
+        else if side == SIDE_RESISTANCE and not na(effectiveBottom)
+            met := closeTick <= int(math.round(effectiveBottom / mintick)) - resetTick
+    met
+
+// W09 B07-R2 (/21, TOKEN_REFACTOR_ONLY): the confirmed close beyond a snapshot level by a tick distance: above ->
+// closeTick >= levelTick + distTick, else closeTick <= levelTick - distTick; false on mintick <= 0 or a na input. The one
+// predicate of the Reset (touchResetMet: Support above the top, Resistance below the bottom, distance touchResetDistance)
+// and the Break-priority guard (breakWouldMet: Support below the bottom, Resistance above the top, distance breakBuffer).
+closeBeyondRaw(float baseClose, float level, float dist, float mintick, bool above) =>
+    int  closeTick = mintick > 0 and not na(baseClose) ? int(math.round(baseClose / mintick)) : int(na)
+    int  levelTick = mintick > 0 and not na(level) ? int(math.round(level / mintick)) : int(na)
+    int  distTick  = mintick > 0 and not na(dist) ? int(math.round(dist / mintick)) : int(na)
+    not na(closeTick) and not na(levelTick) and not na(distTick) and (above ? closeTick >= levelTick + distTick : closeTick <= levelTick - distTick)
+// W09 B07-R2 (/20): Break-priority guard of an ActiveTouch Episode on the confirmed close (spec 14.1), pure (no state,
+// no Event, no BreakSnapshot; B08 reuses it). Support: closeTick <= snapshotBottomTick - breakBufferTick; Resistance:
+// closeTick >= snapshotTopTick + breakBufferTick. Any other side, na input or mintick <= 0: false. true only keeps the bar
+// from measuring a depth (no new WeakDepth on a would-break close).
+export breakWouldMet(int side, float baseClose, float snapshotBottom, float snapshotTop, float breakBuffer, float mintick) =>
+    (side == SIDE_SUPPORT or side == SIDE_RESISTANCE) and closeBeyondRaw(baseClose, side == SIDE_SUPPORT ? snapshotBottom : snapshotTop, breakBuffer, mintick, side == SIDE_RESISTANCE)
+
+// B04 P2: the Touch Episode Reset of one Side on the confirmed close, against the TouchStartSnapshot range fixed at the
+// Touch start. Support: closeTick >= snapshotTopTick + resetTick; Resistance: closeTick <= snapshotBottomTick -
+// resetTick (equality included). Any other side, na input or mintick <= 0: false.
+export touchResetMet(int side, float baseClose, float snapshotBottom, float snapshotTop, float touchResetDistance, float mintick) =>
+    bool met = false
+    if mintick > 0 and not na(baseClose) and not na(touchResetDistance)
+        int closeTick = int(math.round(baseClose / mintick))
+        int resetTick = int(math.round(touchResetDistance / mintick))
+        if side == SIDE_SUPPORT and not na(snapshotTop)
+            met := closeTick >= int(math.round(snapshotTop / mintick)) + resetTick
+        else if side == SIDE_RESISTANCE and not na(snapshotBottom)
+            met := closeTick <= int(math.round(snapshotBottom / mintick)) - resetTick
+    met
+
+// B04 P3: the first seq from which a Side that qualifies on the current confirmed bar may start a Touch: currentSeq + 1
+// (never the current bar); SEQ_UNSET when it does not qualify now (or currentSeq is not a valid baseSeq). Pure: no
+// existing armedFromSeq is read or kept here.
+export nextArmedFromSeq(int currentSeq, bool qualifiesNow) =>
+    qualifiesNow and not na(currentSeq) and currentSeq >= 0 ? currentSeq + 1 : SEQ_UNSET
+
+// Index membership of a slot (position back-reference). Used to prove the two range indexes hold the same Sides.
+indexMemberRaw(array<int> orderSlots, array<int> positions, int slot) =>
+    bool member = slot >= 0 and slot < array.size(positions)
+    if member
+        int pos = array.get(positions, slot)
+        member := pos >= 0 and pos < array.size(orderSlots)
+        if member
+            member := array.get(orderSlots, pos) == slot
+    member
+
+// B05 P1: Touch targets of the current bar High / Low against the previous-bar Armed range indexes, appended to out (any
+// order, duplicates possible). Width Zone: bottom index (-inf, highTick] intersected with top index [lowTick, +inf).
+// One-line Zone: bottom index [lowTick - toleranceTick, highTick + toleranceTick] restricted to bottomTick == topTick.
+// Every hit must be in both indexes with non-na keys. Returns the appended count, -1 on invalid input / index (out
+// restored to its size on entry).
+export touchTargetSlots(array<int> bottomOrder, array<int> bottomPositions, array<int> topOrder, array<int> topPositions, array<float> rangeBottoms, array<float> rangeTops, float mintick, float baseHigh, float baseLow, float touchTolerance, array<int> out) =>
+    int  base = array.size(out)
+    bool ok   = mintick > 0 and not na(baseHigh) and not na(baseLow) and not na(touchTolerance)
+    int  highTick = ok ? int(math.round(baseHigh / mintick)) : int(na)
+    int  lowTick  = ok ? int(math.round(baseLow / mintick)) : int(na)
+    int  tolTick  = ok ? int(math.round(touchTolerance / mintick)) : int(na)
+    ok := ok and lowTick <= highTick and tolTick >= 0
+    array<int> byBottom = array.new_int(0)
+    array<int> byTop    = array.new_int(0)
+    array<int> byLine   = array.new_int(0)
+    if ok
+        ok := priceOrderRange(bottomOrder, bottomPositions, rangeBottoms, mintick, int(na), highTick, byBottom) >= 0
+    if ok
+        ok := priceOrderRange(topOrder, topPositions, rangeTops, mintick, lowTick, int(na), byTop) >= 0
+    if ok
+        ok := priceOrderRange(bottomOrder, bottomPositions, rangeBottoms, mintick, lowTick - tolTick, highTick + tolTick, byLine) >= 0
+    map<int, bool> inTop = map.new<int, bool>()
+    int i = 0
+    while ok and i < array.size(byTop)
+        int s = array.get(byTop, i)
+        ok := indexMemberRaw(bottomOrder, bottomPositions, s)
+        if ok
+            map.put(inTop, s, true)
+        i += 1
+    i := 0
+    while ok and i < array.size(byBottom)
+        int s = array.get(byBottom, i)
+        ok := indexMemberRaw(topOrder, topPositions, s) and s < array.size(rangeTops) and not na(array.get(rangeTops, s))
+        if ok and map.contains(inTop, s)
+            array.push(out, s)
+        i += 1
+    i := 0
+    while ok and i < array.size(byLine)
+        int s = array.get(byLine, i)
+        ok := indexMemberRaw(topOrder, topPositions, s) and s < array.size(rangeTops) and not na(array.get(rangeTops, s))
+        if ok and int(math.round(array.get(rangeTops, s) / mintick)) == int(math.round(array.get(rangeBottoms, s) / mintick))
+            array.push(out, s)
+        i += 1
+    if not ok
+        while array.size(out) > base
+            array.pop(out)
+    ok ? array.size(out) - base : -1
+
+// B05 P2: GapBreak targets of the current bar, appended to out. Support Sides (slot % 2 == 0) from the bottom index
+// [max(highTick + 1, closeTick + breakBufferTick), +inf): a strict full gap below the range and a close at or beyond the
+// break level. Resistance Sides (slot % 2 == 1) from the top index (-inf, min(lowTick - 1, closeTick - breakBufferTick)].
+// Every hit must be in both indexes with non-na keys. Returns the appended count, -1 on invalid input / index (out
+// restored).
+export gapBreakTargetSlots(array<int> bottomOrder, array<int> bottomPositions, array<int> topOrder, array<int> topPositions, array<float> rangeBottoms, array<float> rangeTops, float mintick, float baseHigh, float baseLow, float baseClose, float breakBuffer, array<int> out) =>
+    int  base = array.size(out)
+    bool ok   = mintick > 0 and not na(baseHigh) and not na(baseLow) and not na(baseClose) and not na(breakBuffer)
+    int  highTick  = ok ? int(math.round(baseHigh / mintick)) : int(na)
+    int  lowTick   = ok ? int(math.round(baseLow / mintick)) : int(na)
+    int  closeTick = ok ? int(math.round(baseClose / mintick)) : int(na)
+    int  bufTick   = ok ? int(math.round(breakBuffer / mintick)) : int(na)
+    ok := ok and lowTick <= highTick and bufTick >= 0
+    array<int> sup = array.new_int(0)
+    array<int> res = array.new_int(0)
+    if ok
+        ok := priceOrderRange(bottomOrder, bottomPositions, rangeBottoms, mintick, math.max(highTick + 1, closeTick + bufTick), int(na), sup) >= 0
+    if ok
+        ok := priceOrderRange(topOrder, topPositions, rangeTops, mintick, int(na), math.min(lowTick - 1, closeTick - bufTick), res) >= 0
+    int i = 0
+    while ok and i < array.size(sup)
+        int s = array.get(sup, i)
+        ok := indexMemberRaw(topOrder, topPositions, s) and s < array.size(rangeTops) and not na(array.get(rangeTops, s))
+        if ok and s % 2 == 0
+            array.push(out, s)
+        i += 1
+    i := 0
+    while ok and i < array.size(res)
+        int s = array.get(res, i)
+        ok := indexMemberRaw(bottomOrder, bottomPositions, s) and s < array.size(rangeBottoms) and not na(array.get(rangeBottoms, s))
+        if ok and s % 2 == 1
+            array.push(out, s)
+        i += 1
+    if not ok
+        while array.size(out) > base
+            array.pop(out)
+    ok ? array.size(out) - base : -1
+
+// B05 P3: the Stage D1 target Sides = P1 union P2, kept only when the previous-bar Phase is Armed, the Side is eligible and
+// currentSeq >= armedFromSeq (a Side armed on the current bar is not a target), unique and in the canonical order (coreId,
+// generationId, Support, Resistance) through canonicalSideSlots. A dead Core, an Armed Side without armedFromSeq, an invalid
+// slot / seq or any P1 / P2 / canonical failure fails the whole call: false, out empty.
+export d1TargetSlots(array<int> bottomOrder, array<int> bottomPositions, array<int> topOrder, array<int> topPositions, array<float> rangeBottoms, array<float> rangeTops, float mintick, float baseHigh, float baseLow, float baseClose, float touchTolerance, float breakBuffer, array<int> sidePhases, array<bool> sideEligibleFlags, array<int> sideArmedFromSeqs, int currentSeq, array<int> coreIds, array<int> coreGenerationIds, array<bool> coreSlotLiveFlags, map<int, int> coreIdToSlot, array<int> out) =>
+    array.clear(out)
+    array<int> raw  = array.new_int(0)
+    array<int> kept = array.new_int(0)
+    bool ok = not na(currentSeq) and currentSeq >= 0
+    if ok
+        ok := touchTargetSlots(bottomOrder, bottomPositions, topOrder, topPositions, rangeBottoms, rangeTops, mintick, baseHigh, baseLow, touchTolerance, raw) >= 0
+    if ok
+        ok := gapBreakTargetSlots(bottomOrder, bottomPositions, topOrder, topPositions, rangeBottoms, rangeTops, mintick, baseHigh, baseLow, baseClose, breakBuffer, raw) >= 0
+    int i = 0
+    while ok and i < array.size(raw)
+        int s = array.get(raw, i)
+        int c = int(math.floor(s / 2))
+        ok := s < array.size(sidePhases) and s < array.size(sideEligibleFlags) and s < array.size(sideArmedFromSeqs) and c < array.size(coreSlotLiveFlags)
+        if ok
+            ok := array.get(coreSlotLiveFlags, c)
+        if ok and array.get(sidePhases, s) == PH_ARMED
+            int fromSeq = array.get(sideArmedFromSeqs, s)
+            ok := not na(fromSeq) and fromSeq >= 0
+            if ok and array.get(sideEligibleFlags, s) and currentSeq >= fromSeq
+                array.push(kept, s)
+        i += 1
+    if ok
+        ok := canonicalSideSlots(kept, coreIds, coreGenerationIds, coreSlotLiveFlags, coreIdToSlot, out)
+    if not ok
+        array.clear(out)
+    ok
+
+// B06-A P1 (spec 13.1, D12): whether the current bar High / Low touches one Side's range, as a pure predicate (the same
+// geometry as touchTargetSlots, per Side). Ticks = round(price / mintick). One-line Zone (bottomTick == topTick):
+// lowTick - toleranceTick <= lineTick <= highTick + toleranceTick; width Zone: bottomTick <= highTick and topTick >= lowTick
+// (the tolerance never widens a width Zone). Equality included. mintick <= 0, any na, lowTick > highTick or a negative
+// tolerance: false.
+export normalTouchMetExact(float rangeBottom, float rangeTop, float baseHigh, float baseLow, float touchTolerance, float mintick) =>
+    bool met = false
+    if mintick > 0 and not na(rangeBottom) and not na(rangeTop) and not na(baseHigh) and not na(baseLow) and not na(touchTolerance)
+        int bottomTick = int(math.round(rangeBottom / mintick))
+        int topTick    = int(math.round(rangeTop / mintick))
+        int highTick   = int(math.round(baseHigh / mintick))
+        int lowTick    = int(math.round(baseLow / mintick))
+        int tolTick    = int(math.round(touchTolerance / mintick))
+        if lowTick <= highTick and tolTick >= 0
+            met := bottomTick == topTick ? bottomTick >= lowTick - tolTick and bottomTick <= highTick + tolTick : bottomTick <= highTick and topTick >= lowTick
+    met
+
+// B06-A P2 (spec 14.1 / 14.2, I27-16, D12): GapBreak of one Side against its BreakReferenceRange, exclusive of the normal
+// Touch. Raw: Support highTick < bottomTick (strict full gap) and closeTick <= bottomTick - breakBufferTick; Resistance
+// lowTick > topTick and closeTick >= topTick + breakBufferTick (the break close inclusive). A bar for which
+// normalTouchMetExact holds (a one-line Zone reached through the tolerance) is a Touch, never a GapBreak, so the two are
+// never both true for one Side on one bar. A pure predicate: no TouchCount / WeakDepth / Fresh effect. Any other side,
+// mintick <= 0, any na, lowTick > highTick or a negative tolerance / break buffer: false.
+export gapBreakMetExclusive(int side, float rangeBottom, float rangeTop, float baseHigh, float baseLow, float baseClose, float touchTolerance, float breakBuffer, float mintick) =>
+    bool met = false
+    if mintick > 0 and not na(rangeBottom) and not na(rangeTop) and not na(baseHigh) and not na(baseLow) and not na(baseClose) and not na(touchTolerance) and not na(breakBuffer)
+        int highTick  = int(math.round(baseHigh / mintick))
+        int lowTick   = int(math.round(baseLow / mintick))
+        int closeTick = int(math.round(baseClose / mintick))
+        int tolTick   = int(math.round(touchTolerance / mintick))
+        int bufTick   = int(math.round(breakBuffer / mintick))
+        if lowTick <= highTick and tolTick >= 0 and bufTick >= 0
+            if side == SIDE_SUPPORT
+                int bottomTick = int(math.round(rangeBottom / mintick))
+                met := highTick < bottomTick and closeTick <= bottomTick - bufTick
+            else if side == SIDE_RESISTANCE
+                int topTick = int(math.round(rangeTop / mintick))
+                met := lowTick > topTick and closeTick >= topTick + bufTick
+            met := met and not normalTouchMetExact(rangeBottom, rangeTop, baseHigh, baseLow, touchTolerance, mintick)
+    met
+
+// W09 H01 (B06 size extraction): the Side current Root node raw lifecycle, ported unchanged from the Main
+// sideCurrentRootNodeResetRaw / AllocRaw / FreeRaw (commit 83c3ccf) onto array references of that pool only (payload: Root ID,
+// next, owner Side slot, expected Core / Generation ID, live; free stack). Private: no export, no call site yet.
+// Reset: the row back to the sentinel (ID_NONE, SLOT_INVALID, SLOT_INVALID, ID_NONE, ID_NONE, false) when the six payload arrays
+// have one size and nodeIndex is in range; else false, no write. The free stack is not touched.
+currentRootNodeResetRaw(array<int> rootIds, array<int> nextIndexes, array<int> ownerSideSlots, array<int> expectedCoreIds, array<int> expectedGenerationIds, array<bool> liveFlags, int nodeIndex) =>
+    int  n  = array.size(rootIds)
+    bool ok = array.size(nextIndexes) == n and array.size(ownerSideSlots) == n and array.size(expectedCoreIds) == n and array.size(expectedGenerationIds) == n and array.size(liveFlags) == n and nodeIndex >= 0 and nodeIndex < n
+    if ok
+        array.set(rootIds,               nodeIndex, ID_NONE)
+        array.set(nextIndexes,           nodeIndex, SLOT_INVALID)
+        array.set(ownerSideSlots,        nodeIndex, SLOT_INVALID)
+        array.set(expectedCoreIds,       nodeIndex, ID_NONE)
+        array.set(expectedGenerationIds, nodeIndex, ID_NONE)
+        array.set(liveFlags,             nodeIndex, false)
+    ok
+// Alloc: the free-stack top (peeked and proven an in-range dead sentinel row before the pop; it stays sentinel), else one
+// sentinel row appended to every payload array. The caller writes the payload. SLOT_INVALID with no write on failure.
+currentRootNodeAllocRaw(array<int> rootIds, array<int> nextIndexes, array<int> ownerSideSlots, array<int> expectedCoreIds, array<int> expectedGenerationIds, array<bool> liveFlags, array<int> freeIndexes) =>
+    int  n    = array.size(rootIds)
+    int  nf   = array.size(freeIndexes)
+    int  node = SLOT_INVALID
+    bool ok   = array.size(nextIndexes) == n and array.size(ownerSideSlots) == n and array.size(expectedCoreIds) == n and array.size(expectedGenerationIds) == n and array.size(liveFlags) == n
+    if ok and nf > 0
+        int top = array.get(freeIndexes, nf - 1)
+        ok := top >= 0 and top < n
+        if ok
+            ok := not array.get(liveFlags, top) and array.get(rootIds, top) == ID_NONE and array.get(nextIndexes, top) == SLOT_INVALID and array.get(ownerSideSlots, top) == SLOT_INVALID and array.get(expectedCoreIds, top) == ID_NONE and array.get(expectedGenerationIds, top) == ID_NONE
+        if ok
+            node := array.pop(freeIndexes)
+    else if ok
+        node := n
+        array.push(rootIds,               ID_NONE)
+        array.push(nextIndexes,           SLOT_INVALID)
+        array.push(ownerSideSlots,        SLOT_INVALID)
+        array.push(expectedCoreIds,       ID_NONE)
+        array.push(expectedGenerationIds, ID_NONE)
+        array.push(liveFlags,             false)
+    node
+// Free: a live in-range row not already on the free stack (no double free) -> sentinel reset, then pushed on the free stack.
+// List linkage is the caller's. False with no write on failure.
+currentRootNodeFreeRaw(array<int> rootIds, array<int> nextIndexes, array<int> ownerSideSlots, array<int> expectedCoreIds, array<int> expectedGenerationIds, array<bool> liveFlags, array<int> freeIndexes, int nodeIndex) =>
+    int  n  = array.size(rootIds)
+    bool ok = array.size(nextIndexes) == n and array.size(ownerSideSlots) == n and array.size(expectedCoreIds) == n and array.size(expectedGenerationIds) == n and array.size(liveFlags) == n and nodeIndex >= 0 and nodeIndex < n
+    if ok
+        ok := array.get(liveFlags, nodeIndex)
+    int i = 0
+    while ok and i < array.size(freeIndexes)
+        ok := array.get(freeIndexes, i) != nodeIndex
+        i += 1
+    if ok
+        ok := currentRootNodeResetRaw(rootIds, nextIndexes, ownerSideSlots, expectedCoreIds, expectedGenerationIds, liveFlags, nodeIndex)
+    if ok
+        array.push(freeIndexes, nodeIndex)
+    ok
+
+// W09 H02 (B06 size extraction): the Side current Root list helpers, ported unchanged from the Main
+// sideCurrentRootListValidateRaw / AppendRaw / DetachAllRaw (commit 517f3c1) onto array references: Side metadata (head / tail /
+// count per Side slot), the six node payload arrays and the free stack of that pool only. Validate is read only; Append and
+// DetachAll are F0 then commit (no false after the first write), keep the given order, no sort / dedupe. Node rows go through
+// the H01 currentRootNodeAllocRaw / FreeRaw. Private: no export, no call site yet.
+// (touchSnapshotRootListValidateRaw: defined here, ahead of the current Root list helpers that delegate to it)
+touchSnapshotRootListValidateRaw(array<int> headNodeIndexes, array<int> tailNodeIndexes, array<int> counts, array<int> rootIds, array<int> nextIndexes, array<int> ownerSideSlots, array<int> expectedCoreIds, array<int> expectedGenerationIds, array<int> expectedTouchNos, array<bool> liveFlags, int sideSlot, int expectedCoreId, int expectedGenerationId, int expectedTouchNo) =>
+    int  n  = array.size(rootIds)
+    bool ok = sideSlot >= 0 and sideSlot < array.size(headNodeIndexes) and sideSlot < array.size(tailNodeIndexes) and sideSlot < array.size(counts) and array.size(nextIndexes) == n and array.size(ownerSideSlots) == n and array.size(expectedCoreIds) == n and array.size(expectedGenerationIds) == n and array.size(expectedTouchNos) == n and array.size(liveFlags) == n
+    if ok
+        int head  = array.get(headNodeIndexes, sideSlot)
+        int tail  = array.get(tailNodeIndexes, sideSlot)
+        int count = array.get(counts, sideSlot)
+        if count == 0
+            ok := head == SLOT_INVALID and tail == SLOT_INVALID
+        else
+            ok := count > 0 and count <= n and head >= 0 and head < n and tail >= 0 and tail < n
+            int cur  = head
+            int last = SLOT_INVALID
+            int k    = 0
+            while ok and k < count
+                ok := cur >= 0 and cur < n
+                if ok
+                    ok := array.get(liveFlags, cur) and array.get(ownerSideSlots, cur) == sideSlot and array.get(expectedCoreIds, cur) == expectedCoreId and array.get(expectedGenerationIds, cur) == expectedGenerationId and array.get(expectedTouchNos, cur) == expectedTouchNo and array.get(rootIds, cur) != ID_NONE
+                if ok
+                    last := cur
+                    cur  := array.get(nextIndexes, cur)
+                k += 1
+            ok := ok and last == tail and cur == SLOT_INVALID
+    ok
+currentRootListValidateRaw(array<int> headNodeIndexes, array<int> tailNodeIndexes, array<int> counts, array<int> rootIds, array<int> nextIndexes, array<int> ownerSideSlots, array<int> expectedCoreIds, array<int> expectedGenerationIds, array<bool> liveFlags, int sideSlot, int expectedCoreId, int expectedGenerationId) =>
+    // W09 B06-B2C-C2 (/18, structural): the TSS list validation with the Generation ID rows as the Touch-number rows (that
+    // extra per-node check repeats the Generation check) plus the conditions only this list has (both IDs set, the
+    // metadata arrays of one size): the same result as the former body
+    expectedCoreId != ID_NONE and expectedGenerationId != ID_NONE and array.size(tailNodeIndexes) == array.size(headNodeIndexes) and array.size(counts) == array.size(headNodeIndexes) and touchSnapshotRootListValidateRaw(headNodeIndexes, tailNodeIndexes, counts, rootIds, nextIndexes, ownerSideSlots, expectedCoreIds, expectedGenerationIds, expectedGenerationIds, liveFlags, sideSlot, expectedCoreId, expectedGenerationId, expectedGenerationId)
+currentRootListAppendRaw(array<int> headNodeIndexes, array<int> tailNodeIndexes, array<int> counts, array<int> rootIds, array<int> nextIndexes, array<int> ownerSideSlots, array<int> expectedCoreIds, array<int> expectedGenerationIds, array<bool> liveFlags, array<int> freeIndexes, int sideSlot, int expectedCoreId, int expectedGenerationId, int rootId) =>
+    bool ok = rootId != ID_NONE and currentRootListValidateRaw(headNodeIndexes, tailNodeIndexes, counts, rootIds, nextIndexes, ownerSideSlots, expectedCoreIds, expectedGenerationIds, liveFlags, sideSlot, expectedCoreId, expectedGenerationId)
+    int  nf = array.size(freeIndexes)
+    if ok and nf > 0
+        int top = array.get(freeIndexes, nf - 1)
+        ok := top >= 0 and top < array.size(rootIds)
+        if ok
+            ok := not array.get(liveFlags, top) and array.get(rootIds, top) == ID_NONE and array.get(nextIndexes, top) == SLOT_INVALID and array.get(ownerSideSlots, top) == SLOT_INVALID and array.get(expectedCoreIds, top) == ID_NONE and array.get(expectedGenerationIds, top) == ID_NONE
+    if ok
+        int oldCount = array.get(counts, sideSlot)
+        int oldTail  = array.get(tailNodeIndexes, sideSlot)
+        int node     = currentRootNodeAllocRaw(rootIds, nextIndexes, ownerSideSlots, expectedCoreIds, expectedGenerationIds, liveFlags, freeIndexes)
+        array.set(rootIds,               node, rootId)
+        array.set(nextIndexes,           node, SLOT_INVALID)
+        array.set(ownerSideSlots,        node, sideSlot)
+        array.set(expectedCoreIds,       node, expectedCoreId)
+        array.set(expectedGenerationIds, node, expectedGenerationId)
+        array.set(liveFlags,             node, true)
+        if oldCount == 0
+            array.set(headNodeIndexes, sideSlot, node)
+        else
+            array.set(nextIndexes, oldTail, node)
+        array.set(tailNodeIndexes, sideSlot, node)
+        array.set(counts,          sideSlot, oldCount + 1)
+    ok
+currentRootListDetachAllRaw(array<int> headNodeIndexes, array<int> tailNodeIndexes, array<int> counts, array<int> rootIds, array<int> nextIndexes, array<int> ownerSideSlots, array<int> expectedCoreIds, array<int> expectedGenerationIds, array<bool> liveFlags, array<int> freeIndexes, int sideSlot, int expectedCoreId, int expectedGenerationId) =>
+    bool ok = currentRootListValidateRaw(headNodeIndexes, tailNodeIndexes, counts, rootIds, nextIndexes, ownerSideSlots, expectedCoreIds, expectedGenerationIds, liveFlags, sideSlot, expectedCoreId, expectedGenerationId)
+    if ok and array.get(counts, sideSlot) > 0
+        int count = array.get(counts, sideSlot)
+        map<int, bool> onFree = map.new<int, bool>()
+        int i = 0
+        while i < array.size(freeIndexes)
+            map.put(onFree, array.get(freeIndexes, i), true)
+            i += 1
+        int cur = array.get(headNodeIndexes, sideSlot)
+        int k   = 0
+        while ok and k < count
+            ok  := not map.contains(onFree, cur)
+            cur := array.get(nextIndexes, cur)
+            k += 1
+        if ok
+            cur := array.get(headNodeIndexes, sideSlot)
+            k   := 0
+            while k < count
+                int next = array.get(nextIndexes, cur)
+                currentRootNodeFreeRaw(rootIds, nextIndexes, ownerSideSlots, expectedCoreIds, expectedGenerationIds, liveFlags, freeIndexes, cur)
+                cur := next
+                k += 1
+            array.set(headNodeIndexes, sideSlot, SLOT_INVALID)
+            array.set(tailNodeIndexes, sideSlot, SLOT_INVALID)
+            array.set(counts,          sideSlot, 0)
+    ok
+
+// W09 H03 (B06 size extraction): the TouchStartSnapshot Root node raw lifecycle (W10-owned pool), ported unchanged from the
+// Main touchStartSnapshotRootNodeResetRaw / AllocRaw / FreeRaw (commit c178832) onto array references of that pool only
+// (payload: Root ID, next, owner Side slot, expected Core / Generation ID, expected Touch number, live; free stack). Same
+// contract as Main: Reset writes the sentinel without checks; Alloc pops the free-stack top and resets it, else appends a
+// sentinel row; Free resets a live in-range row and pushes it. Never shared with the Side current Root pool. Private: no
+// export, no call site yet.
+touchSnapshotRootNodeResetRaw(array<int> rootIds, array<int> nextIndexes, array<int> ownerSideSlots, array<int> expectedCoreIds, array<int> expectedGenerationIds, array<int> expectedTouchNos, array<bool> liveFlags, int nodeIndex) =>
+    array.set(rootIds,               nodeIndex, ID_NONE)
+    array.set(nextIndexes,           nodeIndex, SLOT_INVALID)
+    array.set(ownerSideSlots,        nodeIndex, SLOT_INVALID)
+    array.set(expectedCoreIds,       nodeIndex, ID_NONE)
+    array.set(expectedGenerationIds, nodeIndex, ID_NONE)
+    array.set(expectedTouchNos,      nodeIndex, 0)
+    array.set(liveFlags,             nodeIndex, false)
+touchSnapshotRootNodeAllocRaw(array<int> rootIds, array<int> nextIndexes, array<int> ownerSideSlots, array<int> expectedCoreIds, array<int> expectedGenerationIds, array<int> expectedTouchNos, array<bool> liveFlags, array<int> freeIndexes) =>
+    int nodeIndex = SLOT_INVALID
+    if array.size(freeIndexes) > 0
+        nodeIndex := array.pop(freeIndexes)
+        touchSnapshotRootNodeResetRaw(rootIds, nextIndexes, ownerSideSlots, expectedCoreIds, expectedGenerationIds, expectedTouchNos, liveFlags, nodeIndex)
+    else
+        nodeIndex := array.size(rootIds)
+        array.push(rootIds,               ID_NONE)
+        array.push(nextIndexes,           SLOT_INVALID)
+        array.push(ownerSideSlots,        SLOT_INVALID)
+        array.push(expectedCoreIds,       ID_NONE)
+        array.push(expectedGenerationIds, ID_NONE)
+        array.push(expectedTouchNos,      0)
+        array.push(liveFlags,             false)
+    nodeIndex
+touchSnapshotRootNodeFreeRaw(array<int> rootIds, array<int> nextIndexes, array<int> ownerSideSlots, array<int> expectedCoreIds, array<int> expectedGenerationIds, array<int> expectedTouchNos, array<bool> liveFlags, array<int> freeIndexes, int nodeIndex) =>
+    bool freed = false
+    if nodeIndex >= 0 and nodeIndex < array.size(liveFlags)
+        if array.get(liveFlags, nodeIndex)
+            touchSnapshotRootNodeResetRaw(rootIds, nextIndexes, ownerSideSlots, expectedCoreIds, expectedGenerationIds, expectedTouchNos, liveFlags, nodeIndex)
+            array.push(freeIndexes, nodeIndex)
+            freed := true
+    freed
+
+// W09 H04 (B06 size extraction): the TouchStartSnapshot Root list helpers (W10-owned pool), ported unchanged from the Main
+// touchStartSnapshotRootListValidateRaw / AppendRaw / DetachAllRaw (commit 6e79a50, after the W10-PRE atomicity fix) onto array
+// references: TSS Side metadata (head / tail / count per Side slot), the seven node payload arrays and the free stack of that
+// pool only. Owner token = Side slot + Core ID + Generation ID + Touch number. Append / DetachAll are F0 then commit: false only
+// from F0, a broken F0 proof is runtime.error. Node rows go through the H03 touchSnapshotRootNodeAllocRaw / FreeRaw. Private:
+// no export, no call site yet.
+touchSnapshotRootListAppendRaw(array<int> headNodeIndexes, array<int> tailNodeIndexes, array<int> counts, array<int> rootIds, array<int> nextIndexes, array<int> ownerSideSlots, array<int> expectedCoreIds, array<int> expectedGenerationIds, array<int> expectedTouchNos, array<bool> liveFlags, array<int> freeIndexes, int sideSlot, int expectedCoreId, int expectedGenerationId, int expectedTouchNo, int rootId) =>
+    bool ok = expectedCoreId != ID_NONE and expectedGenerationId != ID_NONE and expectedTouchNo > 0 and rootId != ID_NONE and touchSnapshotRootListValidateRaw(headNodeIndexes, tailNodeIndexes, counts, rootIds, nextIndexes, ownerSideSlots, expectedCoreIds, expectedGenerationIds, expectedTouchNos, liveFlags, sideSlot, expectedCoreId, expectedGenerationId, expectedTouchNo)
+    int  nf = array.size(freeIndexes)
+    if ok and nf > 0
+        int top = array.get(freeIndexes, nf - 1)
+        ok := top >= 0 and top < array.size(rootIds)
+        if ok
+            ok := not array.get(liveFlags, top) and array.get(rootIds, top) == ID_NONE and array.get(nextIndexes, top) == SLOT_INVALID and array.get(ownerSideSlots, top) == SLOT_INVALID and array.get(expectedCoreIds, top) == ID_NONE and array.get(expectedGenerationIds, top) == ID_NONE and array.get(expectedTouchNos, top) == 0
+    if ok
+        int oldCount = array.get(counts, sideSlot)
+        int oldTail  = array.get(tailNodeIndexes, sideSlot)
+        int node     = touchSnapshotRootNodeAllocRaw(rootIds, nextIndexes, ownerSideSlots, expectedCoreIds, expectedGenerationIds, expectedTouchNos, liveFlags, freeIndexes)
+        if node < 0 or node >= array.size(liveFlags)
+            runtime.error("W10-PRE: TSS Root node allocation broke its F0 proof")
+        array.set(rootIds,               node, rootId)
+        array.set(nextIndexes,           node, SLOT_INVALID)
+        array.set(ownerSideSlots,        node, sideSlot)
+        array.set(expectedCoreIds,       node, expectedCoreId)
+        array.set(expectedGenerationIds, node, expectedGenerationId)
+        array.set(expectedTouchNos,      node, expectedTouchNo)
+        array.set(liveFlags,             node, true)
+        if oldCount == 0
+            array.set(headNodeIndexes, sideSlot, node)
+        else
+            array.set(nextIndexes, oldTail, node)
+        array.set(tailNodeIndexes, sideSlot, node)
+        array.set(counts,          sideSlot, oldCount + 1)
+    ok
+touchSnapshotRootListDetachAllRaw(array<int> headNodeIndexes, array<int> tailNodeIndexes, array<int> counts, array<int> rootIds, array<int> nextIndexes, array<int> ownerSideSlots, array<int> expectedCoreIds, array<int> expectedGenerationIds, array<int> expectedTouchNos, array<bool> liveFlags, array<int> freeIndexes, int sideSlot, int expectedCoreId, int expectedGenerationId, int expectedTouchNo) =>
+    bool ok = touchSnapshotRootListValidateRaw(headNodeIndexes, tailNodeIndexes, counts, rootIds, nextIndexes, ownerSideSlots, expectedCoreIds, expectedGenerationIds, expectedTouchNos, liveFlags, sideSlot, expectedCoreId, expectedGenerationId, expectedTouchNo)
+    if ok and array.get(counts, sideSlot) > 0
+        int count = array.get(counts, sideSlot)
+        int nf    = array.size(freeIndexes)
+        int cur   = array.get(headNodeIndexes, sideSlot)
+        int k     = 0
+        while ok and k < count
+            int j = 0
+            while ok and j < nf
+                ok := array.get(freeIndexes, j) != cur
+                j += 1
+            cur := array.get(nextIndexes, cur)
+            k += 1
+        if ok
+            cur := array.get(headNodeIndexes, sideSlot)
+            k   := 0
+            while k < count
+                int next = array.get(nextIndexes, cur)
+                if not touchSnapshotRootNodeFreeRaw(rootIds, nextIndexes, ownerSideSlots, expectedCoreIds, expectedGenerationIds, expectedTouchNos, liveFlags, freeIndexes, cur)
+                    runtime.error("W10-PRE: TSS Root node free broke its F0 proof")
+                cur := next
+                k += 1
+            array.set(headNodeIndexes, sideSlot, SLOT_INVALID)
+            array.set(tailNodeIndexes, sideSlot, SLOT_INVALID)
+            array.set(counts,          sideSlot, 0)
+    ok
+
+// W09 H05 (B06 size extraction): the Phase set membership helpers, ported unchanged from the Main phaseSetMembershipValidRaw /
+// phaseSetAddRaw / phaseSetDetachRaw (commit 59e6ec5) onto array references: sidePhases, sidePhaseSetPositions and the six
+// Phase sets (Waiting, Armed, ActiveTouch, Broken, FlipWait, Dormant). Membership is read only; Add pushes a non-member at the
+// tail of its Phase set; Detach swap-pops a valid member (the moved last Side takes its position). Physical set helpers only:
+// no Phase transition here. Private: no export, no call site yet.
+// W09 B06-B2C-C2 (/18, structural): the Phase set of a Phase value (Waiting / Armed / ActiveTouch / Broken / FlipWait /
+// Dormant; any other value: an empty set, so membership is false and nothing is added / detached).
+phaseSetOfRaw(int phase, array<int> w, array<int> a, array<int> t, array<int> b, array<int> f, array<int> d) =>
+    phase == PH_WAITING ? w : phase == PH_ARMED ? a : phase == PH_ACTIVE_TOUCH ? t : phase == PH_BROKEN ? b : phase == PH_FLIP_WAIT ? f : phase == PH_DORMANT ? d : array.new_int(0)
+phaseMembershipValidRaw(array<int> sidePhases, array<int> sidePhaseSetPositions, array<int> phaseWaitingSideSlots, array<int> phaseArmedSideSlots, array<int> phaseActiveTouchSideSlots, array<int> phaseBrokenSideSlots, array<int> phaseFlipWaitSideSlots, array<int> phaseDormantSideSlots, int sideSlot) =>
+    bool valid = false
+    if sideSlot >= 0 and sideSlot < array.size(sidePhases) and sideSlot < array.size(sidePhaseSetPositions)
+        array<int> st  = phaseSetOfRaw(array.get(sidePhases, sideSlot), phaseWaitingSideSlots, phaseArmedSideSlots, phaseActiveTouchSideSlots, phaseBrokenSideSlots, phaseFlipWaitSideSlots, phaseDormantSideSlots)
+        int        pos = array.get(sidePhaseSetPositions, sideSlot)
+        valid := pos >= 0 and pos < array.size(st) and array.get(st, pos) == sideSlot
+    valid
+phaseAddRaw(array<int> sidePhases, array<int> sidePhaseSetPositions, array<int> phaseWaitingSideSlots, array<int> phaseArmedSideSlots, array<int> phaseActiveTouchSideSlots, array<int> phaseBrokenSideSlots, array<int> phaseFlipWaitSideSlots, array<int> phaseDormantSideSlots, int sideSlot) =>
+    bool added = false
+    if sideSlot >= 0 and sideSlot < array.size(sidePhases) and sideSlot < array.size(sidePhaseSetPositions)
+        int phase = array.get(sidePhases, sideSlot)
+        if array.get(sidePhaseSetPositions, sideSlot) == SLOT_INVALID and phase >= PH_WAITING and phase <= PH_DORMANT
+            array<int> st = phaseSetOfRaw(phase, phaseWaitingSideSlots, phaseArmedSideSlots, phaseActiveTouchSideSlots, phaseBrokenSideSlots, phaseFlipWaitSideSlots, phaseDormantSideSlots)
+            array.set(sidePhaseSetPositions, sideSlot, array.size(st))
+            array.push(st, sideSlot)
+            added := true
+    added
+phaseDetachRaw(array<int> sidePhases, array<int> sidePhaseSetPositions, array<int> phaseWaitingSideSlots, array<int> phaseArmedSideSlots, array<int> phaseActiveTouchSideSlots, array<int> phaseBrokenSideSlots, array<int> phaseFlipWaitSideSlots, array<int> phaseDormantSideSlots, int sideSlot) =>
+    bool detached = false
+    if phaseMembershipValidRaw(sidePhases, sidePhaseSetPositions, phaseWaitingSideSlots, phaseArmedSideSlots, phaseActiveTouchSideSlots, phaseBrokenSideSlots, phaseFlipWaitSideSlots, phaseDormantSideSlots, sideSlot)
+        array<int> st           = phaseSetOfRaw(array.get(sidePhases, sideSlot), phaseWaitingSideSlots, phaseArmedSideSlots, phaseActiveTouchSideSlots, phaseBrokenSideSlots, phaseFlipWaitSideSlots, phaseDormantSideSlots)
+        int        pos          = array.get(sidePhaseSetPositions, sideSlot)
+        int        lastPos      = array.size(st) - 1
+        int        lastSideSlot = array.get(st, lastPos)
+        if pos != lastPos
+            array.set(st, pos, lastSideSlot)
+            array.set(sidePhaseSetPositions, lastSideSlot, pos)
+        array.pop(st)
+        array.set(sidePhaseSetPositions, sideSlot, SLOT_INVALID)
+        detached := true
+    detached
+// W09 H06-B2: CurrentRoot bridge exports. Each expands the CurrentRootPoolView fields into the private helper's parameter
+// order (payload ends with liveFlags; freeIndexes follows it where the helper takes the free stack) and returns that helper's
+// result unchanged: one call, no extra check, no extra write. The raw node helpers stay private.
+export currentRootListValidate(CurrentRootPoolView view, int sideSlot, int expectedCoreId, int expectedGenerationId) =>
+    currentRootListValidateRaw(view.headNodeIndexes, view.tailNodeIndexes, view.counts, view.rootIds, view.nextIndexes, view.ownerSideSlots, view.expectedCoreIds, view.expectedGenerationIds, view.liveFlags, sideSlot, expectedCoreId, expectedGenerationId)
+export currentRootListAppend(CurrentRootPoolView view, int sideSlot, int expectedCoreId, int expectedGenerationId, int rootId) =>
+    currentRootListAppendRaw(view.headNodeIndexes, view.tailNodeIndexes, view.counts, view.rootIds, view.nextIndexes, view.ownerSideSlots, view.expectedCoreIds, view.expectedGenerationIds, view.liveFlags, view.freeIndexes, sideSlot, expectedCoreId, expectedGenerationId, rootId)
+export currentRootListDetachAll(CurrentRootPoolView view, int sideSlot, int expectedCoreId, int expectedGenerationId) =>
+    currentRootListDetachAllRaw(view.headNodeIndexes, view.tailNodeIndexes, view.counts, view.rootIds, view.nextIndexes, view.ownerSideSlots, view.expectedCoreIds, view.expectedGenerationIds, view.liveFlags, view.freeIndexes, sideSlot, expectedCoreId, expectedGenerationId)
+
+// W09 H06-B3: TouchStartSnapshot bridge exports. Each expands the TouchSnapshotRootPoolView fields into the private helper's
+// parameter order (payload: ..., expectedTouchNos, liveFlags; freeIndexes follows where the helper takes the free stack) and
+// returns that helper's result unchanged: one call, no extra check, no extra write. The raw node helpers stay private.
+export touchSnapshotRootListValidate(TouchSnapshotRootPoolView view, int sideSlot, int expectedCoreId, int expectedGenerationId, int expectedTouchNo) =>
+    touchSnapshotRootListValidateRaw(view.headNodeIndexes, view.tailNodeIndexes, view.counts, view.rootIds, view.nextIndexes, view.ownerSideSlots, view.expectedCoreIds, view.expectedGenerationIds, view.expectedTouchNos, view.liveFlags, sideSlot, expectedCoreId, expectedGenerationId, expectedTouchNo)
+export touchSnapshotRootListAppend(TouchSnapshotRootPoolView view, int sideSlot, int expectedCoreId, int expectedGenerationId, int expectedTouchNo, int rootId) =>
+    touchSnapshotRootListAppendRaw(view.headNodeIndexes, view.tailNodeIndexes, view.counts, view.rootIds, view.nextIndexes, view.ownerSideSlots, view.expectedCoreIds, view.expectedGenerationIds, view.expectedTouchNos, view.liveFlags, view.freeIndexes, sideSlot, expectedCoreId, expectedGenerationId, expectedTouchNo, rootId)
+export touchSnapshotRootListDetachAll(TouchSnapshotRootPoolView view, int sideSlot, int expectedCoreId, int expectedGenerationId, int expectedTouchNo) =>
+    touchSnapshotRootListDetachAllRaw(view.headNodeIndexes, view.tailNodeIndexes, view.counts, view.rootIds, view.nextIndexes, view.ownerSideSlots, view.expectedCoreIds, view.expectedGenerationIds, view.expectedTouchNos, view.liveFlags, view.freeIndexes, sideSlot, expectedCoreId, expectedGenerationId, expectedTouchNo)
+
+// W09 H06-B4: PhaseSet bridge exports. Each expands the PhaseSetView fields into the private helper's parameter order
+// (sidePhases, positions, then the Waiting / Armed / ActiveTouch / Broken / FlipWait / Dormant sets) and returns that helper's
+// result unchanged: one call, no extra check, no extra write, no Phase transition (sidePhases is never written here).
+export phaseMembershipValid(PhaseSetView view, int sideSlot) =>
+    phaseMembershipValidRaw(view.sidePhases, view.sidePhaseSetPositions, view.waitingSideSlots, view.armedSideSlots, view.activeTouchSideSlots, view.brokenSideSlots, view.flipWaitSideSlots, view.dormantSideSlots, sideSlot)
+export phaseAdd(PhaseSetView view, int sideSlot) =>
+    phaseAddRaw(view.sidePhases, view.sidePhaseSetPositions, view.waitingSideSlots, view.armedSideSlots, view.activeTouchSideSlots, view.brokenSideSlots, view.flipWaitSideSlots, view.dormantSideSlots, sideSlot)
+export phaseDetach(PhaseSetView view, int sideSlot) =>
+    phaseDetachRaw(view.sidePhases, view.sidePhaseSetPositions, view.waitingSideSlots, view.armedSideSlots, view.activeTouchSideSlots, view.brokenSideSlots, view.flipWaitSideSlots, view.dormantSideSlots, sideSlot)
+
+// W09 B06-B2B2 R1 (/11): current structural SideViewState materialization (12 fields) of the applied Candidates' two Sides
+// from the same Side winner as the current Root list, moved out of Main (mechanical port of the B06-B2B2 WIP helpers; same
+// predicates, same writes). SideViewMaterializeView: flat references of the Main storage (winner rows, the W08 physical
+// Candidate winner indexes / materialized Core slots, the pass applyP, the 12 Side destinations); no copy. The W05 constants
+// (category mask bounds, density enum) come in as arguments (no second definition here).
+export type SideViewMaterializeView
+    array<int>   winnerEffectiveBottomTicks
+    array<int>   winnerEffectiveTopTicks
+    array<float> winnerExactPrices
+    array<float> winnerReferencePrices
+    array<int>   winnerCCounts
+    array<int>   winnerHCounts
+    array<int>   winnerDensities
+    array<bool>  winnerBaseStrongFlags
+    array<int>   winnerCategoryMasks
+    array<int>   winnerHighMasks
+    array<int>   winnerRootIdOffsets
+    array<int>   winnerRootIdLengths
+    array<int>   supportWinnerIndexes
+    array<int>   resistanceWinnerIndexes
+    array<int>   materializedCoreSlots
+    array<bool>  applyP
+    array<float> sideEffectiveBottoms
+    array<float> sideEffectiveTops
+    array<float> sideReferencePrices
+    array<int>   sideCCounts
+    array<int>   sideHCounts
+    array<int>   sideDensities
+    array<bool>  sideBaseStrongFlags
+    array<bool>  sideHasNonPsychRootFlags
+    array<bool>  sideIsBroadContextFlags
+    array<bool>  sideEligibleFlags
+    array<int>   sideCategoryMasks
+    array<int>   sideHighMasks
+// Read-only preflight, run after the current Root preflight (which proved each applied winner index SLOT_INVALID or a winner
+// row of that Side, < winnerLogicalCount): every read winner row is complete - effective ticks / exact floats (round(price /
+// mintick) = tick), masks (highMask within categoryMask, C / H their popcounts), density enum, ReferencePrice, a non-empty
+// Root slice. A Side without a winner reads nothing.
+export sideViewPreflight(SideViewMaterializeView view, int winnerLogicalCount, int winnerRootIdLength, float mintick, int catMaskAll, int catMaskPsych, int denHigh, int denNormal, int denBroadContext) =>
+    int  n  = winnerLogicalCount
+    bool ok = mintick > 0 and array.size(view.winnerEffectiveBottomTicks) >= n and array.size(view.winnerEffectiveTopTicks) >= n and array.size(view.winnerExactPrices) >= 2 * n and array.size(view.winnerReferencePrices) >= n and array.size(view.winnerCCounts) >= n and array.size(view.winnerHCounts) >= n and array.size(view.winnerDensities) >= n and array.size(view.winnerBaseStrongFlags) >= n and array.size(view.winnerCategoryMasks) >= n and array.size(view.winnerHighMasks) >= n and array.size(view.winnerRootIdOffsets) >= n and array.size(view.winnerRootIdLengths) >= n
+    int p = 0
+    while ok and p < array.size(view.applyP)
+        int k = 0
+        while ok and k < 2 and array.get(view.applyP, p)
+            int w = array.get(k == 0 ? view.supportWinnerIndexes : view.resistanceWinnerIndexes, p)
+            if w >= 0
+                int   bt = array.get(view.winnerEffectiveBottomTicks, w)
+                int   tt = array.get(view.winnerEffectiveTopTicks, w)
+                float xb = array.get(view.winnerExactPrices, 2 * w)
+                float xt = array.get(view.winnerExactPrices, 2 * w + 1)
+                int   cm = array.get(view.winnerCategoryMasks, w)
+                int   hm = array.get(view.winnerHighMasks, w)
+                int   d  = array.get(view.winnerDensities, w)
+                int   o  = array.get(view.winnerRootIdOffsets, w)
+                int   l  = array.get(view.winnerRootIdLengths, w)
+                ok := not na(bt) and not na(tt) and bt <= tt and not na(xb) and not na(xt) and xb <= xt and int(math.round(xb / mintick)) == bt and int(math.round(xt / mintick)) == tt and not na(array.get(view.winnerReferencePrices, w)) and cm >= 1 and cm <= catMaskAll and hm >= 0 and hm <= catMaskAll and (d == denHigh or d == denNormal or d == denBroadContext) and not na(o) and not na(l) and o >= 0 and l >= 1 and o + l <= winnerRootIdLength
+                int c = 0
+                int h = 0
+                int b = 1
+                while ok and b <= catMaskPsych
+                    bool cb = cm % (2 * b) >= b
+                    bool hb = hm % (2 * b) >= b
+                    ok := cb or not hb
+                    c += cb ? 1 : 0
+                    h += hb ? 1 : 0
+                    b *= 2
+                ok := ok and c == array.get(view.winnerCCounts, w) and h == array.get(view.winnerHCounts, w)
+            k += 1
+        p += 1
+    ok
+// After commitPass and the current Root producer: each applied Candidate's two Sides on its materialized Core get the
+// complete replace of the 12 fields by their Side winner's stored values (no winner: the reset defaults). Copy only, no
+// quality recomputation; pending / retained Cores are not applied and keep their values.
+export sideViewProduce(SideViewMaterializeView view, int denBroadContext) =>
+    int p = 0
+    while p < array.size(view.applyP)
+        int k = 0
+        while k < 2 and array.get(view.applyP, p)
+            int  s = array.get(view.materializedCoreSlots, p) * 2 + k
+            int  w = array.get(k == 0 ? view.supportWinnerIndexes : view.resistanceWinnerIndexes, p)
+            bool v = w >= 0
+            int  d = v ? array.get(view.winnerDensities, w) : int(na)
+            array.set(view.sideEffectiveBottoms, s, v ? array.get(view.winnerExactPrices, 2 * w) : float(na))
+            array.set(view.sideEffectiveTops, s, v ? array.get(view.winnerExactPrices, 2 * w + 1) : float(na))
+            array.set(view.sideReferencePrices, s, v ? array.get(view.winnerReferencePrices, w) : float(na))
+            array.set(view.sideCCounts, s, v ? array.get(view.winnerCCounts, w) : 0)
+            array.set(view.sideHCounts, s, v ? array.get(view.winnerHCounts, w) : 0)
+            array.set(view.sideDensities, s, d)
+            array.set(view.sideBaseStrongFlags, s, v ? array.get(view.winnerBaseStrongFlags, w) : false)
+            array.set(view.sideHasNonPsychRootFlags, s, v ? array.get(view.winnerRootIdLengths, w) > 0 : false)
+            array.set(view.sideIsBroadContextFlags, s, v ? d == denBroadContext : false)
+            array.set(view.sideEligibleFlags, s, v)
+            array.set(view.sideCategoryMasks, s, v ? array.get(view.winnerCategoryMasks, w) : 0)
+            array.set(view.sideHighMasks, s, v ? array.get(view.winnerHighMasks, w) : 0)
+            k += 1
+        p += 1
+    true
+
+// W09 B06-B2B3-A (/12): Phase / Armed transfer foundation (spec 7.4 / 12 / 12.1 / 14.1, I8 Stage J, I27-15 §10 / §16 / §20,
+// B06-B2B3-PRE decision: 1:1 continuation Armed without the distance -> Waiting, ArmedFromSeq / LastArmedRange kept).
+// Transfer class of one applied physical Candidate p (W08 plan metadata only: ownership kind, pass mergeOfP / splitOfP,
+// Merge relation survivor / absorbed rows, Split plan source old, consumed READY parents); TX_READY is added when one of its
+// source old Cores is a consumed READY pending parent. Non-applied (retained / pending): TX_NONE.
+const int TX_NONE               = -1
+const int TX_FRESH              = 0
+const int TX_CONTINUATION       = 1
+const int TX_MERGE_SURVIVOR     = 2
+const int TX_MERGE_FRESH        = 3
+const int TX_SPLIT_CONTINUATION = 4
+const int TX_SPLIT_FRESH        = 5
+const int TX_READY              = 8
+// PhaseArmedTransferView: flat references of the pass (applyP, mergeOfP, splitOfP, consumedSlots, freeSlots / Core IDs /
+// Generation IDs), the W08 plan (ownership kinds, continuation old Core slot / ID / Generation ID, mergeRelations stride 5,
+// mergeAbsorbed stride 2, Split plan source old Core slot / ID per splitOfP row), the Core tokens, the Side Phase / Armed /
+// structural / BreakSnapshot-valid fields and the two Armed price-order indexes (keys sideLastArmedRangeBottoms / Tops).
+export type PhaseArmedTransferView
+    array<bool>  applyP
+    array<int>   mergeOfP
+    array<int>   splitOfP
+    array<int>   consumedSlots
+    array<int>   freeSlots
+    array<int>   freeCoreIds
+    array<int>   freeGenerationIds
+    array<int>   ownershipKinds
+    array<int>   continuationOldCoreSlots
+    array<int>   continuationCoreIds
+    array<int>   continuationGenerationIds
+    array<int>   mergeRelations
+    array<int>   mergeAbsorbed
+    array<int>   splitSourceOldCoreSlots
+    array<int>   splitSourceOldCoreIds
+    array<int>   coreIds
+    array<int>   coreGenerationIds
+    array<bool>  coreSlotLiveFlags
+    array<int>   sidePhases
+    array<int>   sideArmedFromSeqs
+    array<float> sideLastArmedRangeBottoms
+    array<float> sideLastArmedRangeTops
+    array<float> sideEffectiveBottoms
+    array<float> sideEffectiveTops
+    array<bool>  sideEligibleFlags
+    array<bool>  sideBreakSnapshotValidFlags
+    array<int>   armedBottomOrderSideSlots
+    array<int>   armedBottomPositions
+    array<int>   armedTopOrderSideSlots
+    array<int>   armedTopPositions
+    // B06-B2B3-B (/13) Stage J: post-commit materialized Core slot per p, PhaseSet (positions and the six sets), Touch count
+    // / Upcoming, the Grade inputs and the Grade
+    array<int>   materializedCoreSlots
+    array<int>   sidePhaseSetPositions
+    array<int>   phaseWaitingSideSlots
+    array<int>   phaseArmedSideSlots
+    array<int>   phaseActiveTouchSideSlots
+    array<int>   phaseBrokenSideSlots
+    array<int>   phaseFlipWaitSideSlots
+    array<int>   phaseDormantSideSlots
+    array<int>   sideTouchCounts
+    array<int>   sideUpcomingTouchNos
+    array<bool>  sideWeakByDepthFlags
+    array<bool>  sideWeakByTouchFlags
+    array<bool>  sideBaseStrongFlags
+    array<bool>  sideHasNonPsychRootFlags
+    array<int>   sideGrades
+    // B06-B2C-B0 (/15) Fresh transfer: Core / Side Fresh, the Side Touch-history truncated flags (the source ring's flag), the
+    // Split TouchMark plan rows (per splitOfP row: mark offset / count; per mark: Side and normal flag) and the plan scratch
+    array<bool>  coreZoneFreshFlags
+    array<bool>  sideFreshFlags
+    array<bool>  sideTouchHistoryTruncatedFlags
+    array<int>   splitMarkOffsets
+    array<int>   splitMarkCounts
+    array<int>   splitMarkSides
+    array<bool>  splitMarkIsNormalFlags
+    array<int>   freshPlan
+    // B06-B2C-C2 (/18) Touch history transfer: the W08 Merge TouchMark plan (per relation-side offset / count / truncated;
+    // per row Side, time, normal, weakByDepth, maxDepthPct), the Split plan row columns it reads (per target row * 2 +
+    // Side truncated; per mark time, weakByDepth, maxDepthPct), sideMaxDepthPcts and the plan scratch (per p * 2 + Side:
+    // count, last normal time, flags (-1 no write, weakByTouch 1 + weakByDepth 2) / maxDepthPct; the completed TSS to clear:
+    // Side slot, node count, nodes)
+    array<int>   mergeMarkOffsets
+    array<int>   mergeMarkCounts
+    array<bool>  mergeMarkTruncatedFlags
+    array<int>   mergeMarkSides
+    array<int>   mergeMarkTimes
+    array<bool>  mergeMarkIsNormalFlags
+    array<bool>  mergeMarkWeakByDepthFlags
+    array<float> mergeMarkMaxDepthPcts
+    array<bool>  splitMarkTruncatedFlags
+    array<int>   splitMarkTimes
+    array<bool>  splitMarkWeakByDepthFlags
+    array<float> splitMarkMaxDepthPcts
+    array<float> sideMaxDepthPcts
+    array<int>   historyPlan
+    array<float> historyDepthPlan
+    array<int>   tssClearPlan
+    // W09 B08-A (/25): BreakSnapshot per Side slot (valid = sideBreakSnapshotValidFlags above) and its Root node pool, the
+    // Broken / FlipWait price-order indexes (keys = the BS range) with their reverse positions, the Dormant recovery reverse
+    // positions (preflight only) and the BS transfer plan scratch (rows stride BSP_STRIDE per p * 2 + Side, floats stride 2,
+    // Root IDs; the release list after the rows: Side slot, node count, nodes)
+    array<int>   bsCoreIds
+    array<int>   bsGenerationIds
+    array<int>   bsOldSides
+    array<float> bsRangeBottoms
+    array<float> bsRangeTops
+    array<int>   bsBreakSeqs
+    array<int>   bsBreakTimes
+    array<bool>  bsWasGapBreakFlags
+    array<bool>  bsMovedAwayFlags
+    array<bool>  bsRetestSeenFlags
+    array<int>   bsRootHeadNodeIndexes
+    array<int>   bsRootTailNodeIndexes
+    array<int>   bsRootCounts
+    array<int>   bsNodeRootIds
+    array<int>   bsNodeNextIndexes
+    array<int>   bsNodeOwnerSideSlots
+    array<int>   bsNodeExpectedCoreIds
+    array<int>   bsNodeExpectedGenerationIds
+    array<int>   bsNodeExpectedBreakSeqs
+    array<bool>  bsNodeLiveFlags
+    array<int>   bsNodeFreeIndexes
+    array<int>   brokenBottomOrderSideSlots
+    array<int>   brokenBottomPositions
+    array<int>   brokenTopOrderSideSlots
+    array<int>   brokenTopPositions
+    array<int>   flipBottomOrderSideSlots
+    array<int>   flipBottomPositions
+    array<int>   flipTopOrderSideSlots
+    array<int>   flipTopPositions
+    array<int>   dormantBottomPositions
+    array<int>   dormantTopPositions
+    array<int>   bsPlan
+    array<float> bsPlanFloats
+    array<int>   bsRootPlan
+// W09 B08-A (/25): Broken (broken = true) or FlipWait index membership of Side slot s, keys = its BreakSnapshot range
+// (bsRangeBottoms / Tops, ticked by priceOrderUpdate only; no EffectiveRange, no buffer / reset offset). add / remove.
+bsIndexRaw(PhaseArmedTransferView v, int s, bool broken, bool add, float mintick) =>
+    broken ? priceOrderUpdate(v.brokenBottomOrderSideSlots, v.brokenBottomPositions, v.bsRangeBottoms, mintick, s, add) and priceOrderUpdate(v.brokenTopOrderSideSlots, v.brokenTopPositions, v.bsRangeTops, mintick, s, add) : priceOrderUpdate(v.flipBottomOrderSideSlots, v.flipBottomPositions, v.bsRangeBottoms, mintick, s, add) and priceOrderUpdate(v.flipTopOrderSideSlots, v.flipTopPositions, v.bsRangeTops, mintick, s, add)
+// W09 B08-A (/25): the BreakSnapshot of Side slot s back to the defaults (valid false, Root list empty). Its Root nodes
+// are freed by the caller (bsNodeFreeRaw) first.
+bsClearRaw(PhaseArmedTransferView v, int s) =>
+    array.set(v.sideBreakSnapshotValidFlags, s, false)
+    array.set(v.bsCoreIds, s, ID_NONE)
+    array.set(v.bsGenerationIds, s, ID_NONE)
+    array.set(v.bsOldSides, s, SIDE_NONE)
+    array.set(v.bsRangeBottoms, s, float(na))
+    array.set(v.bsRangeTops, s, float(na))
+    array.set(v.bsBreakSeqs, s, SEQ_UNSET)
+    array.set(v.bsBreakTimes, s, int(na))
+    array.set(v.bsWasGapBreakFlags, s, false)
+    array.set(v.bsMovedAwayFlags, s, false)
+    array.set(v.bsRetestSeenFlags, s, false)
+    array.set(v.bsRootHeadNodeIndexes, s, SLOT_INVALID)
+    array.set(v.bsRootTailNodeIndexes, s, SLOT_INVALID)
+    array.set(v.bsRootCounts, s, 0)
+    true
+// W09 B08-A (/25): a live BS Root node owned by Side slot s back to the sentinel, pushed on the free stack; false when it
+// is not a live node of s (a broken proof).
+bsNodeFreeRaw(PhaseArmedTransferView v, int x, int s) =>
+    bool ok = x >= 0 and x < array.size(v.bsNodeLiveFlags) and array.get(v.bsNodeLiveFlags, x) and array.get(v.bsNodeOwnerSideSlots, x) == s
+    if ok
+        array.set(v.bsNodeRootIds, x, ID_NONE)
+        array.set(v.bsNodeNextIndexes, x, SLOT_INVALID)
+        array.set(v.bsNodeOwnerSideSlots, x, SLOT_INVALID)
+        array.set(v.bsNodeExpectedCoreIds, x, ID_NONE)
+        array.set(v.bsNodeExpectedGenerationIds, x, ID_NONE)
+        array.set(v.bsNodeExpectedBreakSeqs, x, SEQ_UNSET)
+        array.set(v.bsNodeLiveFlags, x, false)
+        array.push(v.bsNodeFreeIndexes, x)
+    ok
+// W09 B08-A (/25): Side slot s gets a valid BreakSnapshot (the given logical row, an empty Root list; the old list was
+// released by the caller); then bsRootAppendRaw adds its Root IDs in order.
+bsWriteRaw(PhaseArmedTransferView v, int s, int id, int gn, int oldSide, float b, float t, int seq, int tm, int fl) =>
+    bsClearRaw(v, s)
+    array.set(v.sideBreakSnapshotValidFlags, s, true)
+    array.set(v.bsCoreIds, s, id)
+    array.set(v.bsGenerationIds, s, gn)
+    array.set(v.bsOldSides, s, oldSide)
+    array.set(v.bsRangeBottoms, s, b)
+    array.set(v.bsRangeTops, s, t)
+    array.set(v.bsBreakSeqs, s, seq)
+    array.set(v.bsBreakTimes, s, tm)
+    array.set(v.bsWasGapBreakFlags, s, fl % 2 == 1)
+    array.set(v.bsMovedAwayFlags, s, fl % 4 >= 2)
+    array.set(v.bsRetestSeenFlags, s, fl >= 4)
+    true
+// W09 B08-A (/25): one Root ID appended to the BreakSnapshot Root list of Side slot s (free stack top first, else a new
+// row), owner token (s, BS coreId, generationId, breakSeq).
+bsRootAppendRaw(PhaseArmedTransferView v, int s, int rootId) =>
+    int x = array.size(v.bsNodeFreeIndexes) > 0 ? array.pop(v.bsNodeFreeIndexes) : array.size(v.bsNodeRootIds)
+    if x == array.size(v.bsNodeRootIds)
+        array.push(v.bsNodeRootIds, ID_NONE)
+        array.push(v.bsNodeNextIndexes, SLOT_INVALID)
+        array.push(v.bsNodeOwnerSideSlots, SLOT_INVALID)
+        array.push(v.bsNodeExpectedCoreIds, ID_NONE)
+        array.push(v.bsNodeExpectedGenerationIds, ID_NONE)
+        array.push(v.bsNodeExpectedBreakSeqs, SEQ_UNSET)
+        array.push(v.bsNodeLiveFlags, false)
+    array.set(v.bsNodeRootIds, x, rootId)
+    array.set(v.bsNodeNextIndexes, x, SLOT_INVALID)
+    array.set(v.bsNodeOwnerSideSlots, x, s)
+    array.set(v.bsNodeExpectedCoreIds, x, array.get(v.bsCoreIds, s))
+    array.set(v.bsNodeExpectedGenerationIds, x, array.get(v.bsGenerationIds, s))
+    array.set(v.bsNodeExpectedBreakSeqs, x, array.get(v.bsBreakSeqs, s))
+    array.set(v.bsNodeLiveFlags, x, true)
+    int tl = array.get(v.bsRootTailNodeIndexes, s)
+    if tl >= 0
+        array.set(v.bsNodeNextIndexes, tl, x)
+    else
+        array.set(v.bsRootHeadNodeIndexes, s, x)
+    array.set(v.bsRootTailNodeIndexes, s, x)
+    array.set(v.bsRootCounts, s, array.get(v.bsRootCounts, s) + 1)
+    x
+// Read-only preflight (before the W08 F0 / commit; no persistent write). Every applied p gets exactly one transfer class
+// in outClasses (caller scratch, cleared first; emptied again on failure). Checked on every old Core the transaction
+// reads: the continuation old of each applied p, Merge survivor / absorbed rows, the Split source old, every freed
+// Core: slot live with the expected Core ID (and Generation ID where the plan carries one), both Sides' Phase a canonical
+// enum and not ActiveTouch (applied components hold none: W08 PendingTopology), Armed <-> member of both Armed indexes
+// (reverse positions checked), Armed -> ArmedFromSeq set, LastArmedRange valid, eligible with a valid EffectiveRange;
+// non-Armed -> no index position. Merge / Split sources (I27-15 §10 / §12, BreakSnapshot transfer not implemented yet):
+// a Side in Broken / FlipWait or with a valid BreakSnapshot fails the pass (temporary fail-closed).
+// W09 B08-A (/25): the Merge / Split source fail-closed on Broken / FlipWait / a valid BreakSnapshot is lifted: the BS
+// transfer (bsTransferPlan) owns those sources.
+// W09 B07-R3B2 (/24): + activeOverlay (episodeOverlayBuild): an ActiveTouch Side whose Episode Resets this bar
+// (FORCE_INACTIVE -(s + 1)) is projected Waiting (CurrentTouchNo 0) and passes as a non-Armed Side; Stage J sets its final
+// Phase / Armed from the post-topology EffectiveRange. A no-Reset ActiveTouch Side still fails.
+export phaseArmedTransferPreflight(PhaseArmedTransferView view, float mintick, array<int> outClasses, array<int> activeOverlay) =>
+    array.clear(outClasses)
+    int  n  = array.size(view.applyP)
+    int  nc = array.size(view.coreIds)
+    int  ns = 2 * nc
+    bool ok = mintick > 0 and array.size(view.mergeOfP) == n and array.size(view.splitOfP) == n and array.size(view.ownershipKinds) >= n and array.size(view.continuationOldCoreSlots) >= n and array.size(view.continuationCoreIds) >= n and array.size(view.continuationGenerationIds) >= n and array.size(view.freeCoreIds) == array.size(view.freeSlots) and array.size(view.freeGenerationIds) == array.size(view.freeSlots) and array.size(view.splitSourceOldCoreIds) == array.size(view.splitSourceOldCoreSlots) and array.size(view.coreGenerationIds) == nc and array.size(view.coreSlotLiveFlags) == nc and array.size(view.sidePhases) == ns and array.size(view.sideArmedFromSeqs) == ns and array.size(view.sideLastArmedRangeBottoms) == ns and array.size(view.sideLastArmedRangeTops) == ns and array.size(view.sideEffectiveBottoms) == ns and array.size(view.sideEffectiveTops) == ns and array.size(view.sideEligibleFlags) == ns and array.size(view.sideBreakSnapshotValidFlags) == ns and array.size(view.armedBottomPositions) == ns and array.size(view.armedTopPositions) == ns
+    // old Cores to check: stride 4 [slot, expected Core ID, expected Generation ID (ID_NONE: not carried), Merge / Split source]
+    array<int> chk = array.new_int(0)
+    int p = 0
+    while ok and p < n
+        int cls = TX_NONE
+        if array.get(view.applyP, p)
+            int  kind  = array.get(view.ownershipKinds, p)
+            int  j     = array.get(view.mergeOfP, p)
+            int  k     = array.get(view.splitOfP, p)
+            bool cont  = kind == 0
+            int  os    = cont ? array.get(view.continuationOldCoreSlots, p) : SLOT_INVALID
+            bool ready = cont and array.includes(view.consumedSlots, os)
+            ok := (kind == 0 or kind == 1) and (j < 0 or k < 0)
+            if ok and cont
+                array.push(chk, os)
+                array.push(chk, array.get(view.continuationCoreIds, p))
+                array.push(chk, array.get(view.continuationGenerationIds, p))
+                array.push(chk, j >= 0 or k >= 0 ? 1 : 0)
+            if ok and j >= 0
+                ok := 5 * j + 4 < array.size(view.mergeRelations)
+                if ok
+                    int off = array.get(view.mergeRelations, 5 * j + 3)
+                    int cnt = array.get(view.mergeRelations, 5 * j + 4)
+                    ok := array.get(view.mergeRelations, 5 * j) == p and array.get(view.mergeRelations, 5 * j + 1) == os and off >= 0 and cnt >= 1 and 2 * (off + cnt) <= array.size(view.mergeAbsorbed)
+                    int a = 0
+                    while ok and a < cnt
+                        int slot = array.get(view.mergeAbsorbed, 2 * (off + a))
+                        array.push(chk, slot)
+                        array.push(chk, array.get(view.mergeAbsorbed, 2 * (off + a) + 1))
+                        array.push(chk, ID_NONE)
+                        array.push(chk, 1)
+                        ready := ready or array.includes(view.consumedSlots, slot)
+                        a += 1
+                cls := cont ? TX_MERGE_SURVIVOR : TX_MERGE_FRESH
+            else if ok and k >= 0
+                ok := k < array.size(view.splitSourceOldCoreSlots)
+                int ps = ok ? array.get(view.splitSourceOldCoreSlots, k) : SLOT_INVALID
+                ok := ok and (not cont or ps == os)
+                if ok
+                    array.push(chk, ps)
+                    array.push(chk, array.get(view.splitSourceOldCoreIds, k))
+                    array.push(chk, ID_NONE)
+                    array.push(chk, 1)
+                    ready := ready or array.includes(view.consumedSlots, ps)
+                cls := cont ? TX_SPLIT_CONTINUATION : TX_SPLIT_FRESH
+            else if ok
+                cls := cont ? TX_CONTINUATION : TX_FRESH
+            cls += ready ? TX_READY : 0
+        array.push(outClasses, cls)
+        p += 1
+    int i = 0
+    while ok and i < array.size(view.freeSlots)
+        array.push(chk, array.get(view.freeSlots, i))
+        array.push(chk, array.get(view.freeCoreIds, i))
+        array.push(chk, array.get(view.freeGenerationIds, i))
+        array.push(chk, 0)
+        i += 1
+    i := 0
+    while ok and i < array.size(chk)
+        int c   = array.get(chk, i)
+        int gen = array.get(chk, i + 2)
+        ok := c >= 0 and c < nc
+        if ok
+            ok := array.get(view.coreSlotLiveFlags, c) and array.get(view.coreIds, c) == array.get(chk, i + 1) and (gen == ID_NONE or array.get(view.coreGenerationIds, c) == gen)
+        int k = 0
+        while ok and k < 2
+            int  s  = 2 * c + k
+            int  ph = array.get(view.sidePhases, s)
+            bool am = ph == PH_ARMED
+            ok := ph >= PH_WAITING and ph <= PH_DORMANT and (ph != PH_ACTIVE_TOUCH or array.includes(activeOverlay, -s - 1))
+            if ok and am
+                float lb = array.get(view.sideLastArmedRangeBottoms, s)
+                float lt = array.get(view.sideLastArmedRangeTops, s)
+                ok := indexMemberRaw(view.armedBottomOrderSideSlots, view.armedBottomPositions, s) and indexMemberRaw(view.armedTopOrderSideSlots, view.armedTopPositions, s) and array.get(view.sideArmedFromSeqs, s) >= 0 and lb <= lt and array.get(view.sideEligibleFlags, s) and array.get(view.sideEffectiveBottoms, s) <= array.get(view.sideEffectiveTops, s)
+            else if ok
+                ok := array.get(view.armedBottomPositions, s) == SLOT_INVALID and array.get(view.armedTopPositions, s) == SLOT_INVALID
+            k += 1
+        i += 4
+    if not ok
+        array.clear(outClasses)
+    ok
+// Pre-commit Armed index release (after every preflight passed, before W08Runtime.commitPass): each Armed Side of the
+// continuation old Core of every applied p (1:1 / Merge survivor / Split continuation: its key is replaced or re-evaluated
+// at Stage J) and of every freed Core (Merge absorbed: coreResetSlotRaw clears positions only) leaves both Armed indexes
+// (priceOrderUpdate remove). Index only: Phase, ArmedFromSeq and LastArmedRange are not written; retained / pending (not
+// applied, not freed) are not touched. Until Stage J these Armed Sides are outside the indexes. Returns the released Side
+// count; a failed remove is a broken preflight (runtime.error).
+export phaseArmedIndexRelease(PhaseArmedTransferView view, float mintick) =>
+    int n        = array.size(view.applyP)
+    int released = 0
+    int i = 0
+    while i < n + array.size(view.freeSlots)
+        int  c  = i < n ? (array.get(view.applyP, i) and array.get(view.ownershipKinds, i) == 0 ? array.get(view.continuationOldCoreSlots, i) : SLOT_INVALID) : array.get(view.freeSlots, i - n)
+        bool tr = i >= n or array.get(view.mergeOfP, i) >= 0 or array.get(view.splitOfP, i) >= 0
+        int  k  = 0
+        while c >= 0 and k < 2
+            int s  = 2 * c + k
+            int ph = array.get(view.sidePhases, s)
+            if ph == PH_ARMED
+                if not (priceOrderUpdate(view.armedBottomOrderSideSlots, view.armedBottomPositions, view.sideLastArmedRangeBottoms, mintick, s, false) and priceOrderUpdate(view.armedTopOrderSideSlots, view.armedTopPositions, view.sideLastArmedRangeTops, mintick, s, false))
+                    runtime.error("W09 B06-B2B3-A: Armed index release broke its preflight")
+                released += 1
+            // W09 B08-A (/25): a Merge / Split old Core or a freed Core also leaves the Broken / FlipWait index (Stage J
+            // re-attaches every destination Side from its transferred BS; a 1:1 continuation keeps its fixed keys)
+            else if tr and (ph == PH_BROKEN or ph == PH_FLIP_WAIT)
+                if not bsIndexRaw(view, s, ph == PH_BROKEN, false, mintick)
+                    runtime.error("W09 B08-A: Broken / FlipWait index release broke its preflight")
+                released += 1
+            k += 1
+        i += 1
+    released
+// W09 B07-R2 (/21, TOKEN_REFACTOR_ONLY): one Phase change of Side slot s through the PhaseSet (detach, write, add), the
+// former four inline copies (Stage J x2, TouchStart apply, Episode apply). Its callers treat false as a broken proof
+// (runtime.error).
+phaseMoveRaw(PhaseArmedTransferView v, int s, int ph) =>
+    bool ok = phaseDetachRaw(v.sidePhases, v.sidePhaseSetPositions, v.phaseWaitingSideSlots, v.phaseArmedSideSlots, v.phaseActiveTouchSideSlots, v.phaseBrokenSideSlots, v.phaseFlipWaitSideSlots, v.phaseDormantSideSlots, s)
+    array.set(v.sidePhases, s, ph)
+    ok and phaseAddRaw(v.sidePhases, v.sidePhaseSetPositions, v.phaseWaitingSideSlots, v.phaseArmedSideSlots, v.phaseActiveTouchSideSlots, v.phaseBrokenSideSlots, v.phaseFlipWaitSideSlots, v.phaseDormantSideSlots, s)
+// W09 B06-B2B3-B (/13): Stage J (I8) of one committed confirmed bar, after the current Root and SideView producers.
+// W09 B08-A (/25): a destination Side with a valid (transferred) BreakSnapshot takes Broken (its side = BS oldSide) or
+//   FlipWait instead of the Waiting baseline, Grade Unavailable, Broken / FlipWait index attach on the BS range; step 2
+//   leaves it untouched (Upcoming only).
+// 1 Transfer baseline (I27-15 §10): every applied fresh / Merge / Split destination Side (classes of this pass's
+//   phaseArmedTransferPreflight) restarts from the reset defaults (Waiting through the PhaseSet, ArmedFromSeq unset,
+//   LastArmedRange na; its old Armed entries were released before commit); a 1:1 continuation keeps its Phase / Armed.
+// 2 Every live Side (retained and pending Cores included): UpcomingTouchNo = SideTouchCount + 1 first. Waiting / Armed only
+//   (ActiveTouch / Broken / FlipWait / Dormant untouched): Grade = gradeExact(target = Upcoming), then qualifies = eligible
+//   and a non-psych Root and armedDistanceMet on the current EffectiveRange and confirmed close (spec 7.4 / A12).
+//   Waiting -> Armed: ArmedFromSeq = currentSeq + 1, LastArmedRange = EffectiveRange. Armed -> Armed: ArmedFromSeq kept,
+//   LastArmedRange = EffectiveRange. Armed -> Waiting (B06-B2B3-PRE option b): ArmedFromSeq / LastArmedRange kept.
+//   Phase changes go through the PhaseSet (detach, write, add); Armed <-> member of both Armed indexes (key change:
+//   remove, write, add). A released Side is Armed and outside the indexes only on a 1:1 continuation destination; any
+//   other broken invariant is a runtime.error (no silent repair).
+export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes, float baseClose, int baseSeq, float mintick, float touchResetDistance, int weakFromTouch, bool weakFromTouchOff, int strongUntilTouch, bool strongUnlimited) =>
+    int  n  = array.size(view.applyP)
+    int  nc = array.size(view.coreIds)
+    int  ns = 2 * nc
+    bool ok = array.size(classes) == n and array.size(view.materializedCoreSlots) >= n and array.size(view.coreSlotLiveFlags) == nc and array.size(view.sidePhases) == ns and array.size(view.sidePhaseSetPositions) == ns and array.size(view.sideTouchCounts) == ns and array.size(view.sideUpcomingTouchNos) == ns and array.size(view.sideWeakByDepthFlags) == ns and array.size(view.sideWeakByTouchFlags) == ns and array.size(view.sideBaseStrongFlags) == ns and array.size(view.sideHasNonPsychRootFlags) == ns and array.size(view.sideGrades) == ns and array.size(view.sideEligibleFlags) == ns and array.size(view.sideEffectiveBottoms) == ns and array.size(view.sideEffectiveTops) == ns and array.size(view.sideArmedFromSeqs) == ns and array.size(view.sideLastArmedRangeBottoms) == ns and array.size(view.sideLastArmedRangeTops) == ns and array.size(view.armedBottomPositions) == ns and array.size(view.armedTopPositions) == ns
+    array<bool> relCore = array.new_bool(ok ? nc : 0, false)
+    int p = 0
+    while ok and p < n
+        int cls = array.get(classes, p) % TX_READY
+        int d   = array.get(view.materializedCoreSlots, p)
+        if cls == TX_CONTINUATION
+            array.set(relCore, d, true)
+        else if cls != TX_NONE
+            int k = 0
+            while ok and k < 2
+                int  s  = 2 * d + k
+                bool bs = array.get(view.sideBreakSnapshotValidFlags, s)
+                int  tp = not bs ? PH_WAITING : array.get(view.bsOldSides, s) == (k == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE) ? PH_BROKEN : PH_FLIP_WAIT
+                ok := array.get(view.armedBottomPositions, s) == SLOT_INVALID and array.get(view.armedTopPositions, s) == SLOT_INVALID
+                if ok and array.get(view.sidePhases, s) != tp
+                    ok := phaseMoveRaw(view, s, tp)
+                array.set(view.sideArmedFromSeqs, s, SEQ_UNSET)
+                array.set(view.sideLastArmedRangeBottoms, s, float(na))
+                array.set(view.sideLastArmedRangeTops, s, float(na))
+                if ok and bs
+                    array.set(view.sideGrades, s, GR_UNAVAILABLE)
+                    ok := bsIndexRaw(view, s, tp == PH_BROKEN, true, mintick)
+                k += 1
+        p += 1
+    int c = 0
+    while ok and c < nc
+        int k = 0
+        while ok and k < 2 and array.get(view.coreSlotLiveFlags, c)
+            int s  = 2 * c + k
+            int up = array.get(view.sideTouchCounts, s) + 1
+            int ph = array.get(view.sidePhases, s)
+            array.set(view.sideUpcomingTouchNos, s, up)
+            if ph == PH_WAITING or ph == PH_ARMED
+                bool  np = array.get(view.sideHasNonPsychRootFlags, s)
+                float eb = array.get(view.sideEffectiveBottoms, s)
+                float et = array.get(view.sideEffectiveTops, s)
+                array.set(view.sideGrades, s, gradeExact(np, false, array.get(view.sideWeakByDepthFlags, s), array.get(view.sideWeakByTouchFlags, s) or weakByTouchNow(up, weakFromTouch, weakFromTouchOff), array.get(view.sideBaseStrongFlags, s), strongTouchEligible(up, strongUntilTouch, strongUnlimited)))
+                bool q  = array.get(view.sideEligibleFlags, s) and np and eb <= et and armedDistanceMet(k == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE, baseClose, eb, et, touchResetDistance, mintick)
+                bool mb = indexMemberRaw(view.armedBottomOrderSideSlots, view.armedBottomPositions, s)
+                ok := mb == indexMemberRaw(view.armedTopOrderSideSlots, view.armedTopPositions, s) and (ph == PH_ARMED ? mb or array.get(relCore, c) : not mb)
+                if ok and mb and (not q or array.get(view.sideLastArmedRangeBottoms, s) != eb or array.get(view.sideLastArmedRangeTops, s) != et)
+                    ok := priceOrderUpdate(view.armedBottomOrderSideSlots, view.armedBottomPositions, view.sideLastArmedRangeBottoms, mintick, s, false) and priceOrderUpdate(view.armedTopOrderSideSlots, view.armedTopPositions, view.sideLastArmedRangeTops, mintick, s, false)
+                    mb := false
+                if ok and q
+                    if ph == PH_WAITING
+                        array.set(view.sideArmedFromSeqs, s, nextArmedFromSeq(baseSeq, true))
+                    array.set(view.sideLastArmedRangeBottoms, s, eb)
+                    array.set(view.sideLastArmedRangeTops, s, et)
+                    if not mb
+                        ok := priceOrderUpdate(view.armedBottomOrderSideSlots, view.armedBottomPositions, view.sideLastArmedRangeBottoms, mintick, s, true) and priceOrderUpdate(view.armedTopOrderSideSlots, view.armedTopPositions, view.sideLastArmedRangeTops, mintick, s, true)
+                if ok and q != (ph == PH_ARMED)
+                    ok := phaseMoveRaw(view, s, q ? PH_ARMED : PH_WAITING)
+            k += 1
+        c += 1
+    if not ok
+        runtime.error("W09 B06-B2B3-B: Stage J broke a Phase / Armed index invariant")
+    ok
+
+// W09 B06-B2C-A (/14): TouchStart atomic plan (spec 8.1 / 8.3 / 13.1 / A13, I8 Stage D1, I27-16, I27-17, B01 TSS contract).
+// Read-only on the persistent state: the normal Touch starts of the current bar, taken from the previous-confirmed Side state
+// (Phase Armed, ArmedFromSeq <= currentSeq, eligible, LastArmedRange = the previous-bar Armed range; d1TargetSlots +
+// normalTouchMetExact, a GapBreak-only target is not a Touch), and every payload the atomic apply will write, copied by value
+// into the caller scratch so later source changes of the bar (topology, Stage J) cannot change it. Plan row per target
+// (canonical Side order), int columns PLAN_I_*, float columns PLAN_F_*; the TSS Root IDs are the Side current Root list in
+// its order (planRootIds[rootOffset .. rootOffset + rootCount)).
+const int PLAN_I_SIDE_SLOT        = 0
+const int PLAN_I_CORE_SLOT        = 1
+const int PLAN_I_CORE_ID          = 2
+const int PLAN_I_GENERATION_ID    = 3
+const int PLAN_I_SIDE             = 4
+const int PLAN_I_OLD_TOUCH_COUNT  = 5
+const int PLAN_I_TOUCH_NO         = 6
+const int PLAN_I_NEXT_UPCOMING    = 7
+const int PLAN_I_WEAK_BY_TOUCH    = 8
+const int PLAN_I_CATEGORY_MASK    = 9
+const int PLAN_I_HIGH_MASK        = 10
+const int PLAN_I_C_COUNT          = 11
+const int PLAN_I_H_COUNT          = 12
+const int PLAN_I_DENSITY          = 13
+const int PLAN_I_START_GRADE      = 14
+const int PLAN_I_APPROACH_SIDE    = 15
+const int PLAN_I_START_SEQ        = 16
+const int PLAN_I_START_TIME       = 17
+const int PLAN_I_ROOT_OFFSET      = 18
+const int PLAN_I_ROOT_COUNT       = 19
+const int PLAN_I_SIDE_FRESH_AFTER = 20
+const int PLAN_I_ZONE_FRESH_AFTER = 21
+const int PLAN_I_OLD_PHASE        = 22
+const int PLAN_I_NEXT_PHASE       = 23
+const int PLAN_I_EVENT_TYPE       = 24
+const int PLAN_I_WEAK_REASON      = 25
+const int PLAN_I_EVENT_ROOT_ID    = 26
+const int PLAN_I_MARK_IS_NORMAL   = 27
+const int PLAN_I_ARMED_DETACH     = 28
+const int PLAN_I_TSS_VALID        = 29
+const int PLAN_INT_STRIDE         = 30
+const int PLAN_F_RANGE_BOTTOM     = 0
+const int PLAN_F_RANGE_TOP        = 1
+const int PLAN_F_CONTACT_BOTTOM   = 2
+const int PLAN_F_CONTACT_TOP      = 3
+const int PLAN_F_CLOSE_AT_TOUCH   = 4
+const int PLAN_F_DEEPEST_CLOSE    = 5
+const int PLAN_F_MAX_DEPTH_PCT    = 6
+const int PLAN_FLOAT_STRIDE       = 7
+// W09 B07-R2 (/20): Episode scratch rows (ei / ef, the caller's flat scratch shared by episodePlan, the post-plan preflight and
+// episodeApply), canonical Side order. ei: Side slot, TouchNo, flags, Core ID, Generation ID, WeakDepth Event weak reason,
+// TouchStartGrade, plan row (-1: an ActiveTouch Episode from the previous bar). ef: snapshot bottom, snapshot top, depth (na:
+// not measured), DeepestClose, Episode MaxDepthPct, Side MaxDepthPct. Flags: 1 wouldBreak, 2 measured, 4 depth >= threshold,
+// 8 WeakDepth Event (new Side WeakByDepth), 16 Reset, 32 TouchMark weakByDepth, 64 Side WeakByDepth.
+// B07-R3A (/22): + ei column 8 the A Episode's exact-key TouchMark physical index at plan time (SLOT_INVALID: B, or absent with a
+// truncated history) and column 9 its projected Active override of the bar end (0 NO_OVERRIDE, 1 FORCE_ACTIVE: a B Episode
+// without Reset, 2 FORCE_INACTIVE: an A Episode that Resets). A B Episode's projected Side values and its projected new
+// TouchMark are its TouchStart plan row (ei column 7) plus its ef row: never stored twice.
+const int EP_I_TOUCH_NO      = 1
+const int EP_I_FLAGS         = 2
+const int EP_I_CORE_ID       = 3
+const int EP_I_GENERATION_ID = 4
+const int EP_I_ROW           = 7
+const int EP_I_MARK          = 8
+const int EP_I_OVERRIDE      = 9
+const int EP_INT_STRIDE      = 10
+const int EP_F_DEEPEST       = 3
+const int EP_F_EPISODE_MAX   = 4
+const int EP_F_SIDE_MAX      = 5
+const int EP_FLOAT_STRIDE    = 6
+const int EF_RESET           = 16
+// TouchStartPlanView: flat references of the Core tokens (and the Core ID map d1TargetSlots needs), the previous-confirmed
+// Side Phase / Armed / Touch / Weak / Grade / structural fields, the two Armed indexes, the Side current Root list (metadata
+// and node payload), the TSS valid flags, the TSS Root list (metadata, node payload, free stack) and the four plan outputs.
+export type TouchStartPlanView
+    array<int>   coreIds
+    array<int>   coreGenerationIds
+    array<bool>  coreSlotLiveFlags
+    map<int, int> coreIdToSlot
+    array<int>   sidePhases
+    array<int>   sideArmedFromSeqs
+    array<float> sideLastArmedRangeBottoms
+    array<float> sideLastArmedRangeTops
+    array<int>   sideTouchCounts
+    array<bool>  sideWeakByTouchFlags
+    array<bool>  sideWeakByDepthFlags
+    array<int>   sideGrades
+    array<int>   sideCategoryMasks
+    array<int>   sideHighMasks
+    array<int>   sideCCounts
+    array<int>   sideHCounts
+    array<int>   sideDensities
+    array<bool>  sideEligibleFlags
+    array<int>   armedBottomOrderSideSlots
+    array<int>   armedBottomPositions
+    array<int>   armedTopOrderSideSlots
+    array<int>   armedTopPositions
+    array<int>   currentRootHeadNodeIndexes
+    array<int>   currentRootTailNodeIndexes
+    array<int>   currentRootCounts
+    array<int>   currentRootNodeRootIds
+    array<int>   currentRootNodeNextIndexes
+    array<int>   currentRootNodeOwnerSideSlots
+    array<int>   currentRootNodeExpectedCoreIds
+    array<int>   currentRootNodeExpectedGenerationIds
+    array<bool>  currentRootNodeLiveFlags
+    array<bool>  tssValidFlags
+    array<int>   tssRootHeadNodeIndexes
+    array<int>   tssRootTailNodeIndexes
+    array<int>   tssRootCounts
+    array<int>   tssRootNodeRootIds
+    array<int>   tssRootNodeNextIndexes
+    array<int>   tssRootNodeOwnerSideSlots
+    array<int>   tssRootNodeExpectedCoreIds
+    array<int>   tssRootNodeExpectedGenerationIds
+    array<int>   tssRootNodeExpectedTouchNos
+    array<bool>  tssRootNodeLiveFlags
+    array<int>   tssRootNodeFreeIndexes
+    array<int>   planSideSlots
+    array<int>   planInts
+    array<float> planFloats
+    array<int>   planRootIds
+    // B06-B2C-B (/16) atomic apply: the Side Touch fields it writes, the 17 TSS scalar arrays (valid is tssValidFlags) and
+    // the TouchMark ring (per-Core owner / head / count and the eight payload arrays (+3 Episode rows below); read only, for the append proof)
+    array<int>   sideCurrentTouchNos
+    array<int>   sideLastNormalTouchTimes
+    array<int>   tssCoreIds
+    array<int>   tssGenerationIds
+    array<int>   tssSides
+    array<float> tssRangeBottoms
+    array<float> tssRangeTops
+    array<int>   tssCategoryMasks
+    array<int>   tssHighMasks
+    array<int>   tssCCounts
+    array<int>   tssHCounts
+    array<int>   tssDensities
+    array<int>   tssGrades
+    array<int>   tssCurrentTouchNos
+    array<int>   tssApproachSides
+    array<int>   tssStartSeqs
+    array<int>   tssStartTimes
+    array<float> tssDeepestCloses
+    array<float> tssMaxDepthPcts
+    array<int>   ringOwnerCoreIds
+    array<int>   ringHeads
+    array<int>   ringCounts
+    array<int>   ringBaseSeqs
+    array<int>   ringTimes
+    array<int>   ringSides
+    array<float> ringContactBottoms
+    array<float> ringContactTops
+    array<float> ringCloseAtTouches
+    array<int>   ringGenerationIds
+    array<bool>  ringIsNormalFlags
+    // B06-B2C-C1 (/17): the three TouchMark Episode rows (touchNo / weakByDepth / maxDepthPct; append proof only)
+    array<int>   ringTouchNos
+    array<bool>  ringWeakByDepthFlags
+    array<float> ringMaxDepthPcts
+// W09 B07-R3A (/22): the Episode row offset of Side slot s in ei, SLOT_INVALID when the Side has no Episode this bar.
+episodeRowRaw(array<int> ei, int s) =>
+    int e = SLOT_INVALID
+    int i = 0
+    while e < 0 and i < array.size(ei)
+        e := array.get(ei, i) == s ? i : SLOT_INVALID
+        i += EP_INT_STRIDE
+    e
+// W09 B07-R3B2 (/24): the W08 projected Active overlay of this bar from ei column 9 (R1 signed encoding): FORCE_ACTIVE (a B
+// Episode without Reset) -> s, FORCE_INACTIVE (an A Episode that Resets) -> -(s + 1); NO_OVERRIDE rows add nothing (a no-Reset
+// A stays persistent ActiveTouch, a Reset B stays persistent Armed). out is cleared first; returns its size.
+export episodeOverlayBuild(array<int> ei, array<int> out) =>
+    array.clear(out)
+    int i = 0
+    while i < array.size(ei)
+        int o = array.get(ei, i + EP_I_OVERRIDE)
+        if o > 0
+            array.push(out, o == 1 ? array.get(ei, i) : -array.get(ei, i) - 1)
+        i += EP_INT_STRIDE
+    array.size(out)
+// W09 B07-R3A (/22): the projected value of Side slot s at the end of this bar's Stage D (the only reader the Touch
+// history / Fresh transfer plans use for a topology source), else p (its persistent value, no Episode). k: 0 SideTouchCount,
+// 1 LastNormalTouchTime, 2 WeakByDepth (1 / 0), 3 MaxDepthPct, 4 SideFresh (1 / 0), 5 ZoneFresh of its Core (1 / 0). An Episode
+// sets 2 / 3 (ef / flags); a TouchStart (B) Episode also sets 0 / 1 / 4 / 5 from its plan row (count, start time, Fresh after).
+episodeSideValueRaw(TouchStartPlanView tv, array<int> ei, array<float> ef, int s, int k, float p) =>
+    int   e   = episodeRowRaw(ei, s)
+    int   row = e < 0 ? SLOT_INVALID : array.get(ei, e + EP_I_ROW)
+    float v   = p
+    if e >= 0 and k == 2
+        v := array.get(ei, e + EP_I_FLAGS) >= 64 ? 1 : 0
+    else if e >= 0 and k == 3
+        v := array.get(ef, EP_FLOAT_STRIDE * int(e / EP_INT_STRIDE) + EP_F_SIDE_MAX)
+    else if row >= 0
+        v := array.get(tv.planInts, PLAN_INT_STRIDE * row + (k == 0 ? PLAN_I_TOUCH_NO : k == 1 ? PLAN_I_START_TIME : k == 4 ? PLAN_I_SIDE_FRESH_AFTER : PLAN_I_ZONE_FRESH_AFTER))
+    v
+// Read-only preflight of the current bar's normal Touch starts (nothing written, the plan outputs included). Per target:
+// live Core with its IDs, Phase Armed with ArmedFromSeq <= currentSeq, eligible, a member of both Armed indexes, LastArmedRange
+// valid, TSS invalid with an empty TSS Root list, the current Root list valid for the Core / Generation token with >= 1
+// Root, categoryMask / highMask / C / H / Density canonical (highMask within categoryMask, C / H their popcounts), Grade an
+// enum value, SideTouchCount >= 0; unique targets (canonical order). Pool: the TSS Root node pool can hold every copied
+// Root within the Pine array size limit (100000) after its free stack is used.
+export touchStartPlanPreflight(TouchStartPlanView view, int currentSeq, float baseHigh, float baseLow, float baseClose, float mintick, float touchTolerance, float breakBuffer, int catMaskAll, int catMaskPsych, int denHigh, int denNormal, int denBroadContext) =>
+    array<int> targets = array.new_int(0)
+    bool ok = d1TargetSlots(view.armedBottomOrderSideSlots, view.armedBottomPositions, view.armedTopOrderSideSlots, view.armedTopPositions, view.sideLastArmedRangeBottoms, view.sideLastArmedRangeTops, mintick, baseHigh, baseLow, baseClose, touchTolerance, breakBuffer, view.sidePhases, view.sideEligibleFlags, view.sideArmedFromSeqs, currentSeq, view.coreIds, view.coreGenerationIds, view.coreSlotLiveFlags, view.coreIdToSlot, targets)
+    int need = 0
+    int t = 0
+    while ok and t < array.size(targets)
+        int   s  = array.get(targets, t)
+        int   c  = int(math.floor(s / 2))
+        float lb = array.get(view.sideLastArmedRangeBottoms, s)
+        float lt = array.get(view.sideLastArmedRangeTops, s)
+        if normalTouchMetExact(lb, lt, baseHigh, baseLow, touchTolerance, mintick)
+            int id = array.get(view.coreIds, c)
+            int gn = array.get(view.coreGenerationIds, c)
+            int n0 = array.get(view.sideTouchCounts, s)
+            int cm = array.get(view.sideCategoryMasks, s)
+            int hm = array.get(view.sideHighMasks, s)
+            int d  = array.get(view.sideDensities, s)
+            int g  = array.get(view.sideGrades, s)
+            ok := array.get(view.coreSlotLiveFlags, c) and id != ID_NONE and gn != ID_NONE and array.get(view.sidePhases, s) == PH_ARMED and array.get(view.sideArmedFromSeqs, s) <= currentSeq and array.get(view.sideEligibleFlags, s) and indexMemberRaw(view.armedBottomOrderSideSlots, view.armedBottomPositions, s) and indexMemberRaw(view.armedTopOrderSideSlots, view.armedTopPositions, s) and lb <= lt and not array.get(view.tssValidFlags, s) and array.get(view.tssRootCounts, s) == 0 and n0 >= 0 and cm >= 1 and cm <= catMaskAll and hm >= 0 and hm <= catMaskAll and (d == denHigh or d == denNormal or d == denBroadContext) and g >= GR_STRONG and g <= GR_UNAVAILABLE
+            ok := ok and touchSnapshotRootListValidateRaw(view.tssRootHeadNodeIndexes, view.tssRootTailNodeIndexes, view.tssRootCounts, view.tssRootNodeRootIds, view.tssRootNodeNextIndexes, view.tssRootNodeOwnerSideSlots, view.tssRootNodeExpectedCoreIds, view.tssRootNodeExpectedGenerationIds, view.tssRootNodeExpectedTouchNos, view.tssRootNodeLiveFlags, s, id, gn, n0 + 1)
+            ok := ok and currentRootListValidateRaw(view.currentRootHeadNodeIndexes, view.currentRootTailNodeIndexes, view.currentRootCounts, view.currentRootNodeRootIds, view.currentRootNodeNextIndexes, view.currentRootNodeOwnerSideSlots, view.currentRootNodeExpectedCoreIds, view.currentRootNodeExpectedGenerationIds, view.currentRootNodeLiveFlags, s, id, gn) and array.get(view.currentRootCounts, s) >= 1
+            int cc = 0
+            int hh = 0
+            int b  = 1
+            while ok and b <= catMaskPsych
+                bool cb = cm % (2 * b) >= b
+                bool hb = hm % (2 * b) >= b
+                ok := cb or not hb
+                cc += cb ? 1 : 0
+                hh += hb ? 1 : 0
+                b *= 2
+            ok := ok and cc == array.get(view.sideCCounts, s) and hh == array.get(view.sideHCounts, s)
+            need += ok ? array.get(view.currentRootCounts, s) : 0
+        t += 1
+    ok and array.size(view.tssRootNodeRootIds) - array.size(view.tssRootNodeFreeIndexes) + need <= 100000
+// Plan build (after the preflight passed): the plan outputs are rebuilt (cleared first) and nothing else is written. Per normal
+// Touch start, in canonical Side order: TouchNo = SideTouchCount + 1 (next Upcoming + 1), WeakByTouch after the start (kept
+// flag or weakByTouchNow of the TouchNo), the 18 TSS scalars (valid, Core / Generation ID, Side, previous Armed range,
+// masks / C / H / Density, TouchStartGrade = the previous-confirmed Grade, TouchNo, approach Side = the Armed Side, start
+// seq / time, DeepestClose na, MaxDepthPct 0), the current Root IDs in list order, the TouchMark row (I27-17 contact: width
+// max(low, bottom) .. min(high, top); one-line Zone the line price twice; close at Touch; normal), Fresh after (false),
+// Phase Armed -> ActiveTouch, Armed index detach, EV_TOUCH_START (Weak reason with the TouchNo, rootId none). planSideSlots is
+// also the current-bar ActiveTouch overlay. Returns the plan row count, -1 (outputs empty) when extraction fails.
+export touchStartPlanBuild(TouchStartPlanView view, int currentSeq, int baseCloseTime, float baseHigh, float baseLow, float baseClose, float mintick, float touchTolerance, float breakBuffer, int weakFromTouch, bool weakFromTouchOff, int evTouchStart, int weakNone, int weakByTouch, int weakByDepth, int weakByBoth) =>
+    array.clear(view.planSideSlots)
+    array.clear(view.planInts)
+    array.clear(view.planFloats)
+    array.clear(view.planRootIds)
+    array<int> targets = array.new_int(0)
+    bool ok = d1TargetSlots(view.armedBottomOrderSideSlots, view.armedBottomPositions, view.armedTopOrderSideSlots, view.armedTopPositions, view.sideLastArmedRangeBottoms, view.sideLastArmedRangeTops, mintick, baseHigh, baseLow, baseClose, touchTolerance, breakBuffer, view.sidePhases, view.sideEligibleFlags, view.sideArmedFromSeqs, currentSeq, view.coreIds, view.coreGenerationIds, view.coreSlotLiveFlags, view.coreIdToSlot, targets)
+    int t = 0
+    while ok and t < array.size(targets)
+        int   s  = array.get(targets, t)
+        int   c  = int(math.floor(s / 2))
+        float lb = array.get(view.sideLastArmedRangeBottoms, s)
+        float lt = array.get(view.sideLastArmedRangeTops, s)
+        if normalTouchMetExact(lb, lt, baseHigh, baseLow, touchTolerance, mintick)
+            int  side = s % 2 == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE
+            int  no   = array.get(view.sideTouchCounts, s) + 1
+            bool wt   = array.get(view.sideWeakByTouchFlags, s) or weakByTouchNow(no, weakFromTouch, weakFromTouchOff)
+            bool wd   = array.get(view.sideWeakByDepthFlags, s)
+            bool line = int(math.round(lb / mintick)) == int(math.round(lt / mintick))
+            int  off  = array.size(view.planRootIds)
+            int  cnt  = array.get(view.currentRootCounts, s)
+            int  cur  = array.get(view.currentRootHeadNodeIndexes, s)
+            int  k    = 0
+            while k < cnt
+                array.push(view.planRootIds, array.get(view.currentRootNodeRootIds, cur))
+                cur := array.get(view.currentRootNodeNextIndexes, cur)
+                k += 1
+            array.push(view.planSideSlots, s)
+            array.push(view.planInts, s)
+            array.push(view.planInts, c)
+            array.push(view.planInts, array.get(view.coreIds, c))
+            array.push(view.planInts, array.get(view.coreGenerationIds, c))
+            array.push(view.planInts, side)
+            array.push(view.planInts, no - 1)
+            array.push(view.planInts, no)
+            array.push(view.planInts, no + 1)
+            array.push(view.planInts, wt ? 1 : 0)
+            array.push(view.planInts, array.get(view.sideCategoryMasks, s))
+            array.push(view.planInts, array.get(view.sideHighMasks, s))
+            array.push(view.planInts, array.get(view.sideCCounts, s))
+            array.push(view.planInts, array.get(view.sideHCounts, s))
+            array.push(view.planInts, array.get(view.sideDensities, s))
+            array.push(view.planInts, array.get(view.sideGrades, s))
+            array.push(view.planInts, side)
+            array.push(view.planInts, currentSeq)
+            array.push(view.planInts, baseCloseTime)
+            array.push(view.planInts, off)
+            array.push(view.planInts, cnt)
+            array.push(view.planInts, 0)
+            array.push(view.planInts, 0)
+            array.push(view.planInts, PH_ARMED)
+            array.push(view.planInts, PH_ACTIVE_TOUCH)
+            array.push(view.planInts, evTouchStart)
+            array.push(view.planInts, wt and wd ? weakByBoth : wt ? weakByTouch : wd ? weakByDepth : weakNone)
+            array.push(view.planInts, ID_NONE)
+            array.push(view.planInts, 1)
+            array.push(view.planInts, 1)
+            array.push(view.planInts, 1)
+            array.push(view.planFloats, lb)
+            array.push(view.planFloats, lt)
+            array.push(view.planFloats, line ? lb : math.max(baseLow, lb))
+            array.push(view.planFloats, line ? lb : math.min(baseHigh, lt))
+            array.push(view.planFloats, baseClose)
+            array.push(view.planFloats, float(na))
+            array.push(view.planFloats, 0.0)
+        t += 1
+    if not ok
+        array.clear(view.planSideSlots)
+        array.clear(view.planInts)
+        array.clear(view.planFloats)
+        array.clear(view.planRootIds)
+    ok ? array.size(view.planSideSlots) : -1
+
+// W09 B06-B2C-B0 (/15): Fresh (ZoneFresh / SideFresh) of every applied destination, I27-15 §8 / §15 / §16, spec Fresh:
+// planned before the W08 F0 from the pre-commit sources (the absorbed Cores are still live), written after commit.
+// Per applied p (this pass's transfer class): fresh (a new Zone generation, no topology source) -> all true. 1:1
+// continuation -> untouched (no revival, no reset). Merge (survivor / fresh target) -> ZoneFresh and each SideFresh are
+// the logical AND over every source Core (survivor and absorbed; every live Side carries its own fact because a new
+// generation starts both Sides true, so a Side that never held a winner is true, never a false default). Split child ->
+// each SideFresh rebuilt from the child's normal TouchMarks of that Side in the W08 Split plan: >= 1 -> false; none and the
+// source Side history not truncated -> true; none but truncated -> the source SideFresh (no inferred revival); ZoneFresh =
+// both Sides fresh, AND the source ZoneFresh on a same-generation (continuation) child (only a new generation re-starts
+// it). Non-normal marks (Flip / Inverse) never consume. freshPlan per p: -1 no write, else zone * 4 + support * 2 + resistance.
+// W09 B07-R3A (/22): + tv / ei / ef: the source Fresh values are read through episodeSideValueRaw (projected Stage D).
+export freshTransferPlan(PhaseArmedTransferView view, array<int> classes, TouchStartPlanView tv, array<int> ei, array<float> ef) =>
+    array.clear(view.freshPlan)
+    int  n  = array.size(view.applyP)
+    int  nc = array.size(view.coreIds)
+    int  nm = array.size(view.splitMarkSides)
+    bool ok = array.size(classes) == n and array.size(view.coreZoneFreshFlags) == nc and array.size(view.sideFreshFlags) == 2 * nc and array.size(view.sideTouchHistoryTruncatedFlags) == 2 * nc and array.size(view.splitMarkCounts) == array.size(view.splitMarkOffsets) and array.size(view.splitMarkIsNormalFlags) == nm
+    int p = 0
+    while ok and p < n
+        int  cls = array.get(classes, p)
+        int  b   = cls < 0 ? TX_NONE : cls % TX_READY
+        bool z   = true
+        bool fs  = true
+        bool fr  = true
+        if b == TX_MERGE_SURVIVOR or b == TX_MERGE_FRESH
+            int j = array.get(view.mergeOfP, p)
+            ok := j >= 0 and 5 * j + 4 < array.size(view.mergeRelations)
+            int off = ok ? array.get(view.mergeRelations, 5 * j + 3) : 0
+            int cnt = ok ? array.get(view.mergeRelations, 5 * j + 4) : 0
+            int a   = b == TX_MERGE_SURVIVOR ? -1 : 0
+            while ok and a < cnt
+                int c = a < 0 ? array.get(view.continuationOldCoreSlots, p) : array.get(view.mergeAbsorbed, 2 * (off + a))
+                ok := c >= 0 and c < nc
+                if ok
+                    float zp = array.get(view.coreZoneFreshFlags, c) ? 1 : 0
+                    z  := z and episodeSideValueRaw(tv, ei, ef, 2 * c, 5, zp) == 1 and episodeSideValueRaw(tv, ei, ef, 2 * c + 1, 5, zp) == 1
+                    fs := fs and episodeSideValueRaw(tv, ei, ef, 2 * c, 4, array.get(view.sideFreshFlags, 2 * c) ? 1 : 0) == 1
+                    fr := fr and episodeSideValueRaw(tv, ei, ef, 2 * c + 1, 4, array.get(view.sideFreshFlags, 2 * c + 1) ? 1 : 0) == 1
+                a += 1
+        else if b == TX_SPLIT_CONTINUATION or b == TX_SPLIT_FRESH
+            int k = array.get(view.splitOfP, p)
+            ok := k >= 0 and k < array.size(view.splitMarkOffsets) and k < array.size(view.splitSourceOldCoreSlots)
+            int c   = ok ? array.get(view.splitSourceOldCoreSlots, k) : SLOT_INVALID
+            int off = ok ? array.get(view.splitMarkOffsets, k) : 0
+            int cnt = ok ? array.get(view.splitMarkCounts, k) : 0
+            ok := ok and c >= 0 and c < nc and off >= 0 and cnt >= 0 and off + cnt <= nm
+            int ns = 0
+            int nr = 0
+            int m  = off
+            while ok and m < off + cnt
+                int sd = array.get(view.splitMarkSides, m)
+                ok := sd == SIDE_SUPPORT or sd == SIDE_RESISTANCE
+                if ok and array.get(view.splitMarkIsNormalFlags, m)
+                    ns += sd == SIDE_SUPPORT ? 1 : 0
+                    nr += sd == SIDE_RESISTANCE ? 1 : 0
+                m += 1
+            if ok
+                float zp = array.get(view.coreZoneFreshFlags, c) ? 1 : 0
+                fs := ns == 0 and (not array.get(view.sideTouchHistoryTruncatedFlags, 2 * c) or episodeSideValueRaw(tv, ei, ef, 2 * c, 4, array.get(view.sideFreshFlags, 2 * c) ? 1 : 0) == 1)
+                fr := nr == 0 and (not array.get(view.sideTouchHistoryTruncatedFlags, 2 * c + 1) or episodeSideValueRaw(tv, ei, ef, 2 * c + 1, 4, array.get(view.sideFreshFlags, 2 * c + 1) ? 1 : 0) == 1)
+                z  := fs and fr and (b == TX_SPLIT_FRESH or (episodeSideValueRaw(tv, ei, ef, 2 * c, 5, zp) == 1 and episodeSideValueRaw(tv, ei, ef, 2 * c + 1, 5, zp) == 1))
+        array.push(view.freshPlan, b == TX_NONE or b == TX_CONTINUATION ? -1 : (z ? 4 : 0) + (fs ? 2 : 0) + (fr ? 1 : 0))
+        p += 1
+    if not ok
+        array.clear(view.freshPlan)
+    ok
+// After commitPass: write the planned Fresh of every applied destination (its post-commit materialized Core slot); p with
+// plan -1 (1:1 continuation, not applied) is not written.
+export freshTransferApply(PhaseArmedTransferView view) =>
+    int n = array.size(view.freshPlan)
+    if n != array.size(view.applyP) or array.size(view.materializedCoreSlots) < n
+        runtime.error("W09 B06-B2C-B0: Fresh transfer apply without its plan")
+    int p = 0
+    while p < n
+        int v = array.get(view.freshPlan, p)
+        if v >= 0
+            int d = array.get(view.materializedCoreSlots, p)
+            array.set(view.coreZoneFreshFlags, d, v >= 4)
+            array.set(view.sideFreshFlags, 2 * d, v % 4 >= 2)
+            array.set(view.sideFreshFlags, 2 * d + 1, v % 2 == 1)
+        p += 1
+    true
+
+// W09 B06-B2C-B (/16): TouchStart production, spec 8.1 / 8.3 / 13.1 / 13.2 / 13.4, I27-16 / I27-17, B01 TSS contract. The plan
+// (touchStartPlanPreflight / touchStartPlanBuild, previous-confirmed state) is taken as is; its planSideSlots is the W08
+// ActiveTouch overlay (W08Runtime.planPassWithActiveTouchOverlay), so a component holding a Touch target is pending, never applied.
+// Read-only post-plan preflight (after the W08 plan and the W09 transfer preflights, before the W08 F0; nothing written). Plan
+// shape: planInts / planFloats strides, planSideSlots = column 0, rows strictly canonical (coreId ASC, generationId ASC,
+// Support, Resistance), Root offsets contiguous over planRootIds. Per target: live Core with the planned Core / Generation ID
+// and Side, none of the old Cores an applied W08 row reads or frees (continuation old, Merge absorbed, Split source, freed,
+// consumed READY), Phase still Armed (plan Armed -> ActiveTouch), SideTouchCount = the planned old count and TouchNo = old + 1,
+// PhaseSet membership valid, a member of both Armed indexes, TSS invalid with an empty TSS Root list for the owner token
+// (Side slot, Core ID, Generation ID, TouchNo), the current Root list valid, the plan flags (normal mark, Armed detach, TSS
+// valid, Fresh after false); TouchMark ring: owner = the Core ID, head / count in range, the Core block inside the eleven
+// payload arrays (markAppend cannot fail; a full ring overwrites its oldest mark). Event room >= the target count. TSS Root
+// pool: the free-stack entries the copy pops (top first) are distinct, in range and sentinel rows, and the node growth stays
+// within the Pine array size limit (100000). Returns ok.
+// W09 B07-R2 (/20): + ei (the Episode plan): every Episode Core is none of those busy old Cores (R2: an Episode never meets
+// the applied topology; its component stays pending through the ActiveTouch predicate), and the Event room also covers the
+// WeakDepth / Reset Events.
+// W09 B07-R3B2 (/24): + roles (caller scratch, cleared; nc rows when there is a target or an Episode): the topology role of
+// each old Core, 0 none, 1 the old Core of a 1:1 continuation (slot, ring and history kept), 2 a Merge / Split old Core
+// (survivor, Split continuation, absorbed, Split source) or a freed Core. A busy Core passes only for an Episode that Resets
+// this bar (projected inactive; its TouchStart row included) and has a role; a no-Reset Episode Core stays forbidden.
+// W09 B08-A (/25): + ef (the Break's BS range); a Local Break Episode ends like a Reset for the busy rule; Event room +1 per
+// Break; BS Root pool growth (two copies per Break) within the Pine array size limit.
+export touchStartPostPlanPreflight(TouchStartPlanView view, PhaseArmedTransferView pav, int touchMarkCapacity, int eventRoom, array<int> ei, array<int> roles, array<float> ef) =>
+    int  n   = array.size(view.planSideSlots)
+    int  nc  = array.size(view.coreIds)
+    int  ns  = 2 * nc
+    int  nr  = array.size(view.planRootIds)
+    int  nf  = array.size(view.tssRootNodeFreeIndexes)
+    int  cap = touchMarkCapacity
+    bool ok  = array.size(view.planInts) == PLAN_INT_STRIDE * n and array.size(view.planFloats) == PLAN_FLOAT_STRIDE * n and n <= eventRoom and cap >= 0 and array.size(view.coreGenerationIds) == nc and array.size(view.coreSlotLiveFlags) == nc and array.size(pav.coreZoneFreshFlags) == nc and array.size(view.ringOwnerCoreIds) == nc and array.size(view.ringHeads) == nc and array.size(view.ringCounts) == nc and array.size(pav.sidePhases) == ns and array.size(pav.sidePhaseSetPositions) == ns and array.size(pav.sideFreshFlags) == ns and array.size(pav.sideTouchHistoryTruncatedFlags) == ns and array.size(view.sideTouchCounts) == ns and array.size(view.sideCurrentTouchNos) == ns and array.size(view.sideWeakByTouchFlags) == ns and array.size(view.sideLastNormalTouchTimes) == ns and array.size(view.tssValidFlags) == ns and array.size(view.tssCoreIds) == ns and array.size(view.tssGenerationIds) == ns and array.size(view.tssSides) == ns and array.size(view.tssRangeBottoms) == ns and array.size(view.tssRangeTops) == ns and array.size(view.tssCategoryMasks) == ns and array.size(view.tssHighMasks) == ns and array.size(view.tssCCounts) == ns and array.size(view.tssHCounts) == ns and array.size(view.tssDensities) == ns and array.size(view.tssGrades) == ns and array.size(view.tssCurrentTouchNos) == ns and array.size(view.tssApproachSides) == ns and array.size(view.tssStartSeqs) == ns and array.size(view.tssStartTimes) == ns and array.size(view.tssDeepestCloses) == ns and array.size(view.tssMaxDepthPcts) == ns
+    // old Cores the applied W08 rows read or free: a Touch target is none of them
+    bool        nb   = n + array.size(ei) > 0
+    array<bool> busy = array.new_bool(ok and nb ? nc : 0, false)
+    array.clear(roles)
+    array.concat(roles, array.new_int(ok and nb ? nc : 0, 0))
+    int p = 0
+    while ok and nb and p < array.size(pav.applyP)
+        if array.get(pav.applyP, p)
+            if array.get(pav.ownershipKinds, p) == 0
+                int c0 = array.get(pav.continuationOldCoreSlots, p)
+                ok := c0 >= 0 and c0 < nc
+                if ok
+                    array.set(busy, c0, true)
+                    array.set(roles, c0, math.max(array.get(roles, c0), array.get(pav.mergeOfP, p) >= 0 or array.get(pav.splitOfP, p) >= 0 ? 2 : 1))
+            int j = array.get(pav.mergeOfP, p)
+            if ok and j >= 0
+                ok := 5 * j + 4 < array.size(pav.mergeRelations)
+                int off = ok ? array.get(pav.mergeRelations, 5 * j + 3) : 0
+                int cnt = ok ? array.get(pav.mergeRelations, 5 * j + 4) : 0
+                int a   = 0
+                while ok and a < cnt
+                    int c1 = 2 * (off + a) < array.size(pav.mergeAbsorbed) and off >= 0 ? array.get(pav.mergeAbsorbed, 2 * (off + a)) : SLOT_INVALID
+                    ok := c1 >= 0 and c1 < nc
+                    if ok
+                        array.set(busy, c1, true)
+                        array.set(roles, c1, 2)
+                    a += 1
+            int k = array.get(pav.splitOfP, p)
+            if ok and k >= 0
+                int c2 = k < array.size(pav.splitSourceOldCoreSlots) ? array.get(pav.splitSourceOldCoreSlots, k) : SLOT_INVALID
+                ok := c2 >= 0 and c2 < nc
+                if ok
+                    array.set(busy, c2, true)
+                    array.set(roles, c2, 2)
+        p += 1
+    int q = 0
+    while ok and nb and q < array.size(pav.freeSlots) + array.size(pav.consumedSlots)
+        int c3 = q < array.size(pav.freeSlots) ? array.get(pav.freeSlots, q) : array.get(pav.consumedSlots, q - array.size(pav.freeSlots))
+        ok := c3 >= 0 and c3 < nc
+        if ok
+            array.set(busy, c3, true)
+            if q < array.size(pav.freeSlots)
+                array.set(roles, c3, 2)
+        q += 1
+    int nev = 0
+    int nbs = 0
+    int e   = 0
+    while ok and e < array.size(ei)
+        int  fl  = array.get(ei, e + EP_I_FLAGS)
+        int  se  = array.get(ei, e)
+        int  ce  = int(math.floor(se / 2))
+        bool brk = fl % 2 == 1
+        ok  := ce >= 0 and ce < nc and (not array.get(busy, ce) or ((brk or fl % 32 >= EF_RESET) and array.get(roles, ce) > 0))
+        nev += (fl % 16 >= 8 ? 1 : 0) + (fl % 32 >= EF_RESET ? 1 : 0) + (brk ? 1 : 0)
+        // W09 B08-A (/25): a Local Break needs a Core without a BreakSnapshot, a valid BS range, and an opposite Side
+        // Waiting / Armed (both Armed indexes) / Dormant (no Dormant recovery position) / ActiveTouch whose Episode ends
+        // by Reset this bar; Broken / FlipWait or a still-active opposite fails (D3).
+        if ok and brk
+            int   so = se % 2 == 0 ? se + 1 : se - 1
+            int   po = array.get(pav.sidePhases, so)
+            int   eo = episodeRowRaw(ei, so)
+            float fb = array.get(ef, EP_FLOAT_STRIDE * int(e / EP_INT_STRIDE))
+            float ft = array.get(ef, EP_FLOAT_STRIDE * int(e / EP_INT_STRIDE) + 1)
+            ok := not array.get(pav.sideBreakSnapshotValidFlags, se) and not array.get(pav.sideBreakSnapshotValidFlags, so) and not na(fb) and not na(ft) and fb <= ft
+            ok := ok and (po == PH_WAITING or (po == PH_ARMED and indexMemberRaw(pav.armedBottomOrderSideSlots, pav.armedBottomPositions, so) and indexMemberRaw(pav.armedTopOrderSideSlots, pav.armedTopPositions, so)) or (po == PH_DORMANT and array.get(pav.dormantBottomPositions, so) == SLOT_INVALID and array.get(pav.dormantTopPositions, so) == SLOT_INVALID) or (po == PH_ACTIVE_TOUCH and eo >= 0 and array.get(ei, eo + EP_I_FLAGS) % 32 >= EF_RESET))
+            int rw = array.get(ei, e + EP_I_ROW)
+            nbs += 2 * (rw >= 0 ? array.get(view.planInts, PLAN_INT_STRIDE * rw + PLAN_I_ROOT_COUNT) : array.get(view.tssRootCounts, se))
+        e   += EP_INT_STRIDE
+    ok := ok and n + nev <= eventRoom and array.size(pav.bsNodeRootIds) + nbs <= 100000
+    int need  = 0
+    int prevS = SLOT_INVALID
+    int i     = 0
+    while ok and i < n
+        int r  = PLAN_INT_STRIDE * i
+        int s  = array.get(view.planSideSlots, i)
+        int c  = array.get(view.planInts, r + PLAN_I_CORE_SLOT)
+        int id = array.get(view.planInts, r + PLAN_I_CORE_ID)
+        int gn = array.get(view.planInts, r + PLAN_I_GENERATION_ID)
+        int no = array.get(view.planInts, r + PLAN_I_TOUCH_NO)
+        int er = episodeRowRaw(ei, s)
+        ok := array.get(view.planInts, r + PLAN_I_SIDE_SLOT) == s and s >= 0 and s < ns and c == int(math.floor(s / 2)) and array.get(view.coreSlotLiveFlags, c) and (not array.get(busy, c) or (er >= 0 and (array.get(ei, er + EP_I_FLAGS) % 2 == 1 or array.get(ei, er + EP_I_FLAGS) % 32 >= EF_RESET) and array.get(roles, c) > 0)) and id != ID_NONE and gn != ID_NONE and array.get(view.coreIds, c) == id and array.get(view.coreGenerationIds, c) == gn and array.get(view.planInts, r + PLAN_I_SIDE) == (s % 2 == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE)
+        // canonical row order (a Core's Support right before its Resistance)
+        ok := ok and (prevS == SLOT_INVALID or (prevS == s - 1 and s % 2 == 1) or array.get(view.coreIds, int(math.floor(prevS / 2))) < id or (array.get(view.coreIds, int(math.floor(prevS / 2))) == id and array.get(view.coreGenerationIds, int(math.floor(prevS / 2))) < gn))
+        ok := ok and array.get(pav.sidePhases, s) == PH_ARMED and array.get(view.planInts, r + PLAN_I_OLD_PHASE) == PH_ARMED and array.get(view.planInts, r + PLAN_I_NEXT_PHASE) == PH_ACTIVE_TOUCH and array.get(view.sideTouchCounts, s) == array.get(view.planInts, r + PLAN_I_OLD_TOUCH_COUNT) and no == array.get(view.sideTouchCounts, s) + 1 and array.get(view.planInts, r + PLAN_I_ROOT_OFFSET) == need and array.get(view.planInts, r + PLAN_I_ROOT_COUNT) >= 1 and array.get(view.planInts, r + PLAN_I_MARK_IS_NORMAL) == 1 and array.get(view.planInts, r + PLAN_I_ARMED_DETACH) == 1 and array.get(view.planInts, r + PLAN_I_TSS_VALID) == 1 and array.get(view.planInts, r + PLAN_I_SIDE_FRESH_AFTER) == 0 and array.get(view.planInts, r + PLAN_I_ZONE_FRESH_AFTER) == 0
+        ok := ok and phaseMembershipValidRaw(pav.sidePhases, pav.sidePhaseSetPositions, pav.phaseWaitingSideSlots, pav.phaseArmedSideSlots, pav.phaseActiveTouchSideSlots, pav.phaseBrokenSideSlots, pav.phaseFlipWaitSideSlots, pav.phaseDormantSideSlots, s) and indexMemberRaw(view.armedBottomOrderSideSlots, view.armedBottomPositions, s) and indexMemberRaw(view.armedTopOrderSideSlots, view.armedTopPositions, s)
+        ok := ok and not array.get(view.tssValidFlags, s) and array.get(view.tssRootCounts, s) == 0 and touchSnapshotRootListValidateRaw(view.tssRootHeadNodeIndexes, view.tssRootTailNodeIndexes, view.tssRootCounts, view.tssRootNodeRootIds, view.tssRootNodeNextIndexes, view.tssRootNodeOwnerSideSlots, view.tssRootNodeExpectedCoreIds, view.tssRootNodeExpectedGenerationIds, view.tssRootNodeExpectedTouchNos, view.tssRootNodeLiveFlags, s, id, gn, no)
+        ok := ok and currentRootListValidateRaw(view.currentRootHeadNodeIndexes, view.currentRootTailNodeIndexes, view.currentRootCounts, view.currentRootNodeRootIds, view.currentRootNodeNextIndexes, view.currentRootNodeOwnerSideSlots, view.currentRootNodeExpectedCoreIds, view.currentRootNodeExpectedGenerationIds, view.currentRootNodeLiveFlags, s, id, gn)
+        int h  = ok ? array.get(view.ringHeads, c) : 0
+        int mk = ok ? array.get(view.ringCounts, c) : 0
+        int e  = (c + 1) * cap
+        ok := ok and array.get(view.ringOwnerCoreIds, c) == id and mk >= 0 and mk <= cap and h >= 0 and (h < cap or (cap == 0 and h == 0)) and e <= array.size(view.ringBaseSeqs) and e <= array.size(view.ringTimes) and e <= array.size(view.ringSides) and e <= array.size(view.ringContactBottoms) and e <= array.size(view.ringContactTops) and e <= array.size(view.ringCloseAtTouches) and e <= array.size(view.ringGenerationIds) and e <= array.size(view.ringIsNormalFlags) and e <= array.size(view.ringTouchNos) and e <= array.size(view.ringWeakByDepthFlags) and e <= array.size(view.ringMaxDepthPcts)
+        need  += ok ? array.get(view.planInts, r + PLAN_I_ROOT_COUNT) : 0
+        prevS := s
+        i += 1
+    ok := ok and need == nr and array.size(view.tssRootNodeRootIds) + math.max(0, nr - nf) <= 100000
+    // the free-stack rows the copy pops, top first: distinct sentinel rows
+    map<int, bool> seen = map.new<int, bool>()
+    int t = 0
+    while ok and t < math.min(nr, nf)
+        int x = array.get(view.tssRootNodeFreeIndexes, nf - 1 - t)
+        ok := x >= 0 and x < array.size(view.tssRootNodeRootIds) and not map.contains(seen, x)
+        ok := ok and not array.get(view.tssRootNodeLiveFlags, x) and array.get(view.tssRootNodeRootIds, x) == ID_NONE and array.get(view.tssRootNodeNextIndexes, x) == SLOT_INVALID and array.get(view.tssRootNodeOwnerSideSlots, x) == SLOT_INVALID and array.get(view.tssRootNodeExpectedCoreIds, x) == ID_NONE and array.get(view.tssRootNodeExpectedGenerationIds, x) == ID_NONE and array.get(view.tssRootNodeExpectedTouchNos, x) == 0
+        map.put(seen, x, true)
+        t += 1
+    ok
+// Atomic apply (after the W08 commit, the current Root / SideView producers and the Fresh transfer apply; only after every F0
+// passed): per plan row in canonical order, the plan values written as they are - SideTouchCount = CurrentTouchNo = TouchNo,
+// WeakByTouch = the planned after-start flag, LastNormalTouchTime = StartTime, the target SideFresh and the Core ZoneFresh =
+// the planned false (the opposite Side untouched), the 18 TSS scalars, the TSS Root list = an independent copy of the plan
+// Root IDs in plan order (new pool nodes, owner token Side slot / Core ID / Generation ID / TouchNo), both Armed indexes
+// detached (keys unchanged), Phase Armed -> ActiveTouch through the PhaseSet (detach, write, add). TouchMark / Event rows
+// are the caller's (W08Touch.markAppend / the Main Event writer, plan payload). A failing step broke the post-plan
+// preflight proof: runtime.error.
+// W09 B07-R3B2 (/24): + roles (touchStartPostPlanPreflight) / ringOut (cleared; one flag per plan row: true = the caller
+// appends the plan row's TouchMark to the persistent ring). Role 2 (Merge / Split old Core or freed): the TouchStart stays
+// logical (its projected values are what the Fresh / history transfer plans and the W08 Merge / Split TouchMark plan read;
+// the Event is the caller's) and nothing is written on the old slot, no ring append. Role 1 (1:1 continuation): the normal
+// apply without the Armed index removal (the Side left both indexes in phaseArmedIndexRelease before commit).
+export touchStartApply(TouchStartPlanView view, PhaseArmedTransferView pav, float mintick, array<int> roles, array<bool> ringOut) =>
+    array.clear(ringOut)
+    bool ok = true
+    int  i  = 0
+    while ok and i < array.size(view.planSideSlots)
+        int r  = PLAN_INT_STRIDE * i
+        int f  = PLAN_FLOAT_STRIDE * i
+        int s  = array.get(view.planInts, r + PLAN_I_SIDE_SLOT)
+        int id = array.get(view.planInts, r + PLAN_I_CORE_ID)
+        int gn = array.get(view.planInts, r + PLAN_I_GENERATION_ID)
+        int no = array.get(view.planInts, r + PLAN_I_TOUCH_NO)
+        int c  = array.get(view.planInts, r + PLAN_I_CORE_SLOT)
+        int rl = c >= 0 and c < array.size(roles) ? array.get(roles, c) : 0
+        array.push(ringOut, rl < 2)
+        if rl < 2
+            array.set(view.sideTouchCounts, s, no)
+            array.set(view.sideCurrentTouchNos, s, no)
+            array.set(view.sideWeakByTouchFlags, s, array.get(view.planInts, r + PLAN_I_WEAK_BY_TOUCH) == 1)
+            array.set(view.sideLastNormalTouchTimes, s, array.get(view.planInts, r + PLAN_I_START_TIME))
+            array.set(pav.sideFreshFlags, s, array.get(view.planInts, r + PLAN_I_SIDE_FRESH_AFTER) == 1)
+            array.set(pav.coreZoneFreshFlags, array.get(view.planInts, r + PLAN_I_CORE_SLOT), array.get(view.planInts, r + PLAN_I_ZONE_FRESH_AFTER) == 1)
+            array.set(view.tssValidFlags, s, array.get(view.planInts, r + PLAN_I_TSS_VALID) == 1)
+            array.set(view.tssCoreIds, s, id)
+            array.set(view.tssGenerationIds, s, gn)
+            array.set(view.tssSides, s, array.get(view.planInts, r + PLAN_I_SIDE))
+            array.set(view.tssRangeBottoms, s, array.get(view.planFloats, f + PLAN_F_RANGE_BOTTOM))
+            array.set(view.tssRangeTops, s, array.get(view.planFloats, f + PLAN_F_RANGE_TOP))
+            array.set(view.tssCategoryMasks, s, array.get(view.planInts, r + PLAN_I_CATEGORY_MASK))
+            array.set(view.tssHighMasks, s, array.get(view.planInts, r + PLAN_I_HIGH_MASK))
+            array.set(view.tssCCounts, s, array.get(view.planInts, r + PLAN_I_C_COUNT))
+            array.set(view.tssHCounts, s, array.get(view.planInts, r + PLAN_I_H_COUNT))
+            array.set(view.tssDensities, s, array.get(view.planInts, r + PLAN_I_DENSITY))
+            array.set(view.tssGrades, s, array.get(view.planInts, r + PLAN_I_START_GRADE))
+            array.set(view.tssCurrentTouchNos, s, no)
+            array.set(view.tssApproachSides, s, array.get(view.planInts, r + PLAN_I_APPROACH_SIDE))
+            array.set(view.tssStartSeqs, s, array.get(view.planInts, r + PLAN_I_START_SEQ))
+            array.set(view.tssStartTimes, s, array.get(view.planInts, r + PLAN_I_START_TIME))
+            array.set(view.tssDeepestCloses, s, array.get(view.planFloats, f + PLAN_F_DEEPEST_CLOSE))
+            array.set(view.tssMaxDepthPcts, s, array.get(view.planFloats, f + PLAN_F_MAX_DEPTH_PCT))
+            int off = array.get(view.planInts, r + PLAN_I_ROOT_OFFSET)
+            int k   = 0
+            while ok and k < array.get(view.planInts, r + PLAN_I_ROOT_COUNT)
+                ok := touchSnapshotRootListAppendRaw(view.tssRootHeadNodeIndexes, view.tssRootTailNodeIndexes, view.tssRootCounts, view.tssRootNodeRootIds, view.tssRootNodeNextIndexes, view.tssRootNodeOwnerSideSlots, view.tssRootNodeExpectedCoreIds, view.tssRootNodeExpectedGenerationIds, view.tssRootNodeExpectedTouchNos, view.tssRootNodeLiveFlags, view.tssRootNodeFreeIndexes, s, id, gn, no, array.get(view.planRootIds, off + k))
+                k += 1
+            ok := ok and (rl == 1 or (priceOrderUpdate(view.armedBottomOrderSideSlots, view.armedBottomPositions, view.sideLastArmedRangeBottoms, mintick, s, false) and priceOrderUpdate(view.armedTopOrderSideSlots, view.armedTopPositions, view.sideLastArmedRangeTops, mintick, s, false)))
+            ok := ok and phaseMoveRaw(pav, s, array.get(view.planInts, r + PLAN_I_NEXT_PHASE))
+        i += 1
+    if not ok
+        runtime.error("W09 B06-B2C-B: TouchStart apply broke its post-plan preflight proof")
+    ok
+
+// W09 B06-B2C-C2 (/18): Touch history Merge / Split transfer (I27-15, I27-18), planned before the W08 F0 from the pre-commit
+// sources (absorbed Cores still live) and the finalized W08 TouchMark plans, written after commit. Per applied p of a Merge
+// (survivor / fresh target) or Split (continuation / fresh child) class and per Side: the result marks = the plan rows of
+// that Side (Merge relation-side rows, deduped by W08; Split row marks of that Side), normal marks only: count, latest time,
+// weakByDepth OR, maxDepthPct max (0 marks: 0 / na / false / 0.0). The result Side truncated flag = the W08 plan flag. Not
+// truncated: the mark values. Truncated: count = max(mark count, the relevant sources' same-Side SideTouchCount); last
+// normal time / weakByDepth / maxDepthPct also take the relevant sources whose same Side history is truncated (non-na max,
+// OR, max). Relevant sources: Merge survivor (when the relation has one) and absorbed, Split the source; same Side only.
+// WeakByTouch = weakByTouchNow(count) (the canonical threshold; OFF false), CurrentTouchNo 0 (Upcoming = count + 1 by
+// Stage J). Other classes: no write. Completed TSS: every relevant source Side of a transfer target that is freed (Merge
+// absorbed) or continues as the target Core, with a valid TSS, is captured (Side slot, Root nodes in list order); its TSS
+// must be owned by the Core (Core / Generation ID) and its Root list valid for the owner token (Side slot, Core ID,
+// Generation ID, TouchNo); an invalid TSS must hold no Root node. Read-only; false (scratch empty) on any fault.
+// W09 B07-R3A (/22): + ei / ef: the truncated-source fallbacks are read through episodeSideValueRaw (projected Stage D).
+export touchHistoryTransferPlan(PhaseArmedTransferView view, TouchStartPlanView tv, array<int> classes, int weakFromTouch, bool weakFromTouchOff, array<int> ei, array<float> ef) =>
+    array.clear(view.historyPlan)
+    array.clear(view.historyDepthPlan)
+    array.clear(view.tssClearPlan)
+    int  n  = array.size(view.applyP)
+    int  nc = array.size(view.coreIds)
+    bool ok = array.size(classes) == n and array.size(view.mergeMarkCounts) == array.size(view.mergeMarkOffsets) and array.size(view.mergeMarkTruncatedFlags) == array.size(view.mergeMarkOffsets) and array.size(view.splitMarkTruncatedFlags) == 2 * array.size(view.splitMarkOffsets) and array.size(view.sideTouchCounts) == 2 * nc and array.size(view.sideWeakByDepthFlags) == 2 * nc and array.size(view.sideMaxDepthPcts) == 2 * nc and array.size(view.sideTouchHistoryTruncatedFlags) == 2 * nc and array.size(tv.sideLastNormalTouchTimes) == 2 * nc and array.size(tv.tssValidFlags) == 2 * nc
+    array<int>  src  = array.new_int(0)
+    array<bool> seen = array.new_bool(ok ? 2 * nc : 0, false)
+    int p = 0
+    while ok and p < n
+        int  cls = array.get(classes, p)
+        int  b   = cls < 0 ? TX_NONE : cls % TX_READY
+        bool mg  = b == TX_MERGE_SURVIVOR or b == TX_MERGE_FRESH
+        bool sp  = b == TX_SPLIT_CONTINUATION or b == TX_SPLIT_FRESH
+        int  j   = mg ? array.get(view.mergeOfP, p) : sp ? array.get(view.splitOfP, p) : -1
+        // the plan rows of this p (Merge relation-side rows / Split row marks)
+        array<int>   xs = mg ? view.mergeMarkSides : view.splitMarkSides
+        array<int>   xt = mg ? view.mergeMarkTimes : view.splitMarkTimes
+        array<bool>  xn = mg ? view.mergeMarkIsNormalFlags : view.splitMarkIsNormalFlags
+        array<bool>  xw = mg ? view.mergeMarkWeakByDepthFlags : view.splitMarkWeakByDepthFlags
+        array<float> xm = mg ? view.mergeMarkMaxDepthPcts : view.splitMarkMaxDepthPcts
+        ok := array.size(xt) == array.size(xs) and array.size(xn) == array.size(xs) and array.size(xw) == array.size(xs) and array.size(xm) == array.size(xs)
+        array.clear(src)
+        if ok and mg
+            ok := j >= 0 and 5 * j + 4 < array.size(view.mergeRelations) and 2 * j + 1 < array.size(view.mergeMarkOffsets)
+            int off = ok ? array.get(view.mergeRelations, 5 * j + 3) : 0
+            if ok and array.get(view.mergeRelations, 5 * j + 2) != ID_NONE
+                array.push(src, array.get(view.mergeRelations, 5 * j + 1))
+            int a = 0
+            while ok and a < array.get(view.mergeRelations, 5 * j + 4)
+                ok := off >= 0 and 2 * (off + a) < array.size(view.mergeAbsorbed)
+                if ok
+                    array.push(src, array.get(view.mergeAbsorbed, 2 * (off + a)))
+                a += 1
+        else if ok and sp
+            ok := j >= 0 and j < array.size(view.splitSourceOldCoreSlots) and j < array.size(view.splitMarkOffsets)
+            if ok
+                array.push(src, array.get(view.splitSourceOldCoreSlots, j))
+        int q = 0
+        while ok and q < array.size(src)
+            int c = array.get(src, q)
+            ok := c >= 0 and c < nc and array.get(view.coreSlotLiveFlags, c)
+            q += 1
+        int sd = 0
+        while ok and sd < 2
+            int   cn = 0
+            int   lt = int(na)
+            int   fl = -1
+            float md = 0.0
+            if mg or sp
+                int  r   = mg ? 2 * j + sd : j
+                int  off = mg ? array.get(view.mergeMarkOffsets, r) : array.get(view.splitMarkOffsets, r)
+                int  cnt = mg ? array.get(view.mergeMarkCounts, r) : array.get(view.splitMarkCounts, r)
+                bool tr  = mg ? array.get(view.mergeMarkTruncatedFlags, r) : array.get(view.splitMarkTruncatedFlags, 2 * j + sd)
+                bool wd  = false
+                ok := off >= 0 and cnt >= 0 and off + cnt <= array.size(xs)
+                int x = off
+                while ok and x < off + cnt
+                    int sx = array.get(xs, x)
+                    ok := sx == SIDE_SUPPORT or sx == SIDE_RESISTANCE
+                    if ok and sx == (sd == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE) and array.get(xn, x)
+                        int t = array.get(xt, x)
+                        ok := not na(t)
+                        cn += 1
+                        lt := na(lt) or t > lt ? t : lt
+                        wd := wd or array.get(xw, x)
+                        md := math.max(md, array.get(xm, x))
+                    x += 1
+                q := 0
+                while ok and q < array.size(src)
+                    int c  = array.get(src, q)
+                    int ss = 2 * c + sd
+                    // truncated result: count fallback over the relevant sources, the rest over the truncated ones
+                    if tr
+                        cn := math.max(cn, int(episodeSideValueRaw(tv, ei, ef, ss, 0, array.get(view.sideTouchCounts, ss))))
+                    if tr and array.get(view.sideTouchHistoryTruncatedFlags, ss)
+                        int st = int(episodeSideValueRaw(tv, ei, ef, ss, 1, array.get(tv.sideLastNormalTouchTimes, ss)))
+                        lt := na(st) ? lt : na(lt) or st > lt ? st : lt
+                        wd := wd or episodeSideValueRaw(tv, ei, ef, ss, 2, array.get(view.sideWeakByDepthFlags, ss) ? 1 : 0) == 1
+                        md := math.max(md, episodeSideValueRaw(tv, ei, ef, ss, 3, array.get(view.sideMaxDepthPcts, ss)))
+                    // completed TSS of a source that is freed or continues as this target
+                    if not array.get(seen, ss) and (array.includes(view.freeSlots, c) or (array.get(view.ownershipKinds, p) == 0 and array.get(view.continuationOldCoreSlots, p) == c))
+                        array.set(seen, ss, true)
+                        bool v = array.get(tv.tssValidFlags, ss)
+                        ok := touchSnapshotRootListValidateRaw(tv.tssRootHeadNodeIndexes, tv.tssRootTailNodeIndexes, tv.tssRootCounts, tv.tssRootNodeRootIds, tv.tssRootNodeNextIndexes, tv.tssRootNodeOwnerSideSlots, tv.tssRootNodeExpectedCoreIds, tv.tssRootNodeExpectedGenerationIds, tv.tssRootNodeExpectedTouchNos, tv.tssRootNodeLiveFlags, ss, v ? array.get(view.coreIds, c) : ID_NONE, v ? array.get(view.coreGenerationIds, c) : ID_NONE, v ? array.get(tv.tssCurrentTouchNos, ss) : 0) and (v ? array.get(tv.tssCoreIds, ss) == array.get(view.coreIds, c) and array.get(tv.tssGenerationIds, ss) == array.get(view.coreGenerationIds, c) : array.get(tv.tssRootCounts, ss) == 0)
+                        int m = ok and v ? array.get(tv.tssRootCounts, ss) : -1
+                        if m >= 0
+                            array.push(view.tssClearPlan, ss)
+                            array.push(view.tssClearPlan, m)
+                        int nd = m > 0 ? array.get(tv.tssRootHeadNodeIndexes, ss) : SLOT_INVALID
+                        while m > 0
+                            array.push(view.tssClearPlan, nd)
+                            nd := array.get(tv.tssRootNodeNextIndexes, nd)
+                            m -= 1
+                    q += 1
+                fl := (weakByTouchNow(cn, weakFromTouch, weakFromTouchOff) ? 1 : 0) + (wd ? 2 : 0)
+            array.push(view.historyPlan, cn)
+            array.push(view.historyPlan, lt)
+            array.push(view.historyPlan, fl)
+            array.push(view.historyDepthPlan, md)
+            sd += 1
+        p += 1
+    if not ok
+        array.clear(view.historyPlan)
+        array.clear(view.historyDepthPlan)
+        array.clear(view.tssClearPlan)
+    ok
+// W09 B07-R2 (/20, shared): a completed TSS of Side slot s back to the invalid defaults (Root list head / tail / count, the
+// valid flag, the 17 scalars); its Root nodes are freed by the caller. The former inline block of the C2 completed-TSS clear.
+tssResetRaw(TouchStartPlanView tv, int s) =>
+    array.set(tv.tssRootHeadNodeIndexes, s, SLOT_INVALID)
+    array.set(tv.tssRootTailNodeIndexes, s, SLOT_INVALID)
+    array.set(tv.tssRootCounts, s, 0)
+    array.set(tv.tssValidFlags, s, false)
+    array.set(tv.tssCoreIds, s, ID_NONE)
+    array.set(tv.tssGenerationIds, s, ID_NONE)
+    array.set(tv.tssSides, s, 0)
+    array.set(tv.tssRangeBottoms, s, float(na))
+    array.set(tv.tssRangeTops, s, float(na))
+    array.set(tv.tssCategoryMasks, s, 0)
+    array.set(tv.tssHighMasks, s, 0)
+    array.set(tv.tssCCounts, s, 0)
+    array.set(tv.tssHCounts, s, 0)
+    array.set(tv.tssDensities, s, int(na))
+    array.set(tv.tssGrades, s, GR_UNAVAILABLE)
+    array.set(tv.tssCurrentTouchNos, s, 0)
+    array.set(tv.tssApproachSides, s, 0)
+    array.set(tv.tssStartSeqs, s, SEQ_UNSET)
+    array.set(tv.tssStartTimes, s, int(na))
+    array.set(tv.tssDeepestCloses, s, float(na))
+    array.set(tv.tssMaxDepthPcts, s, 0.0)
+    true
+// W09 B07-R2 (/20): the exact-key TouchMark of an Episode in the ring of Core slot c (C1 / I27-18 key: generationId, side,
+// touchNo, baseSeq, time, normal): its physical index, SLOT_INVALID when absent, -2 when not unique. The ring block is
+// valid (the caller's proof).
+episodeMarkRaw(TouchStartPlanView tv, int c, int cap, int gn, int side, int no, int seq, int t) =>
+    int h   = array.get(tv.ringHeads, c)
+    int mk  = SLOT_INVALID
+    int k   = 0
+    while k < array.get(tv.ringCounts, c)
+        int x = c * cap + (h + k) % cap
+        if array.get(tv.ringGenerationIds, x) == gn and array.get(tv.ringSides, x) == side and array.get(tv.ringTouchNos, x) == no and array.get(tv.ringBaseSeqs, x) == seq and array.get(tv.ringTimes, x) == t and array.get(tv.ringIsNormalFlags, x)
+            mk := mk == SLOT_INVALID ? x : -2
+        k += 1
+    mk
+// W09 B07-R2 (/20): ActiveTouch Episode plan of the confirmed bar (spec 8 / 13.2 / 14.1 / 15, I8 D2 / D3), read-only, before
+// the W08 plan. Episodes: every previous-bar ActiveTouch Side (A) and every TouchStart plan row of this bar (B, the same-bar
+// Episode), each once, canonical order. Authority = the TouchStartSnapshot (A: the TSS; B: the plan row the TouchStart
+// apply writes into it), never the live EffectiveRange. A: Phase ActiveTouch, TSS valid and owned (Core / Generation ID,
+// side), CurrentTouchNo = the TSS TouchNo > 0, snapshot bottom <= top, TSS Root list valid, ring block valid, the exact-key
+// mark unique, or absent with the Side history truncated (never guessed; absent and not truncated fails). B: Phase Armed
+// (the TouchStart post-plan preflight proves the rest). Per Episode: wouldBreak (breakWouldMet); measured = not wouldBreak
+// and topTick > bottomTick (a line Zone has no depth); depth = clamp((Support top - close | Resistance close - bottom) /
+// (top - bottom) * 100, 0, 100); hit = measured and not OFF and depth >= weakDepthPct; DeepestClose (measured: Support min,
+// Resistance max, first = close); Episode max = max(TSS max, depth); Side max = max(Side max, Episode max); Reset =
+// touchResetMet on the snapshot range. Rows into ei / ef (layout EP_*). false (scratch empty) on any fault.
+// W09 B08-A (/25): flag 1 is the Local Break (BreakReferenceRange = the TSS range, never the live range): Break > Reset
+// (no Reset flag with a Break) and the Episode ends -> projected override FORCE_INACTIVE (A) / NO_OVERRIDE (B).
+export episodePlan(TouchStartPlanView tv, array<int> activeSides, array<float> sideMaxDepthPcts, array<bool> truncatedFlags, int cap, float baseClose, float mintick, float breakBuffer, float touchResetDistance, float weakDepthPct, bool weakDepthOff, array<int> ei, array<float> ef) =>
+    array.clear(ei)
+    array.clear(ef)
+    int nc = array.size(tv.coreIds)
+    array<int> cand = array.copy(activeSides)
+    array.concat(cand, tv.planSideSlots)
+    array<int> rows = array.new_int(0)
+    bool ok = mintick > 0 and not na(baseClose) and cap >= 0 and array.size(sideMaxDepthPcts) == 2 * nc and array.size(truncatedFlags) == 2 * nc and canonicalSideSlots(cand, tv.coreIds, tv.coreGenerationIds, tv.coreSlotLiveFlags, tv.coreIdToSlot, rows)
+    ok := ok and array.size(rows) == array.size(cand)
+    int i = 0
+    while ok and i < array.size(rows)
+        int   s    = array.get(rows, i)
+        int   c    = int(math.floor(s / 2))
+        bool  sup  = s % 2 == 0
+        int   side = sup ? SIDE_SUPPORT : SIDE_RESISTANCE
+        int   id   = array.get(tv.coreIds, c)
+        int   gn   = array.get(tv.coreGenerationIds, c)
+        int   row  = array.indexof(tv.planSideSlots, s)
+        int   r    = PLAN_INT_STRIDE * row
+        int   f    = PLAN_FLOAT_STRIDE * row
+        bool  isA  = row < 0
+        float b    = isA ? array.get(tv.tssRangeBottoms, s) : array.get(tv.planFloats, f + PLAN_F_RANGE_BOTTOM)
+        float t    = isA ? array.get(tv.tssRangeTops, s) : array.get(tv.planFloats, f + PLAN_F_RANGE_TOP)
+        int   no   = isA ? array.get(tv.tssCurrentTouchNos, s) : array.get(tv.planInts, r + PLAN_I_TOUCH_NO)
+        float d0   = isA ? array.get(tv.tssDeepestCloses, s) : float(na)
+        float m0   = isA ? array.get(tv.tssMaxDepthPcts, s) : 0.0
+        bool  mw   = false
+        int   mk   = SLOT_INVALID
+        ok := isA ? array.get(tv.sidePhases, s) == PH_ACTIVE_TOUCH and array.get(tv.tssValidFlags, s) and array.get(tv.tssCoreIds, s) == id and array.get(tv.tssGenerationIds, s) == gn and array.get(tv.tssSides, s) == side and no > 0 and array.get(tv.sideCurrentTouchNos, s) == no and b <= t and touchSnapshotRootListValidateRaw(tv.tssRootHeadNodeIndexes, tv.tssRootTailNodeIndexes, tv.tssRootCounts, tv.tssRootNodeRootIds, tv.tssRootNodeNextIndexes, tv.tssRootNodeOwnerSideSlots, tv.tssRootNodeExpectedCoreIds, tv.tssRootNodeExpectedGenerationIds, tv.tssRootNodeExpectedTouchNos, tv.tssRootNodeLiveFlags, s, id, gn, no) : array.get(tv.sidePhases, s) == PH_ARMED
+        if ok and isA
+            int h   = array.get(tv.ringHeads, c)
+            int cnt = array.get(tv.ringCounts, c)
+            ok := array.get(tv.ringOwnerCoreIds, c) == id and cnt >= 0 and cnt <= cap and h >= 0 and (h < cap or (cap == 0 and h == 0)) and (c + 1) * cap <= math.min(array.size(tv.ringBaseSeqs), array.size(tv.ringTimes), array.size(tv.ringSides), array.size(tv.ringGenerationIds), array.size(tv.ringIsNormalFlags), array.size(tv.ringTouchNos), array.size(tv.ringWeakByDepthFlags), array.size(tv.ringMaxDepthPcts))
+            mk := ok ? episodeMarkRaw(tv, c, cap, gn, side, no, array.get(tv.tssStartSeqs, s), array.get(tv.tssStartTimes, s)) : -2
+            ok := mk >= 0 or (mk == SLOT_INVALID and array.get(truncatedFlags, s))
+            mw := ok and mk >= 0 and array.get(tv.ringWeakByDepthFlags, mk)
+        if ok
+            bool  brk  = closeBeyondRaw(baseClose, sup ? b : t, breakBuffer, mintick, not sup)
+            bool  meas = not brk and int(math.round(t / mintick)) > int(math.round(b / mintick))
+            float dp   = meas ? math.max(0.0, math.min(100.0, (sup ? t - baseClose : baseClose - b) / (t - b) * 100.0)) : na
+            float mx   = meas ? math.max(m0, dp) : m0
+            bool  hit  = meas and not weakDepthOff and dp >= weakDepthPct
+            bool  sw0  = array.get(tv.sideWeakByDepthFlags, s)
+            bool  wt   = isA ? array.get(tv.sideWeakByTouchFlags, s) : array.get(tv.planInts, r + PLAN_I_WEAK_BY_TOUCH) == 1
+            bool  rst  = not brk and closeBeyondRaw(baseClose, sup ? t : b, touchResetDistance, mintick, sup)
+            array.concat(ei, array.from(s, no, (brk ? 1 : 0) + (meas ? 2 : 0) + (hit ? 4 : 0) + (hit and not sw0 ? 8 : 0) + (rst ? EF_RESET : 0) + (mw or hit ? 32 : 0) + (sw0 or hit ? 64 : 0), id, gn, (wt ? 1 : 0) + (sw0 or hit ? 2 : 0), isA ? array.get(tv.tssGrades, s) : array.get(tv.planInts, r + PLAN_I_START_GRADE), row, mk, isA ? (rst or brk ? 2 : 0) : (rst or brk ? 0 : 1)))
+            array.concat(ef, array.from(b, t, dp, not meas ? d0 : na(d0) ? baseClose : sup ? math.min(d0, baseClose) : math.max(d0, baseClose), mx, math.max(array.get(sideMaxDepthPcts, s), mx)))
+        i += 1
+    if not ok
+        array.clear(ei)
+        array.clear(ef)
+    ok
+// W09 B07-R2 (/20): Episode apply, once, after every F0 passed and after the TouchStart apply and the caller's TouchMark
+// append (a B Episode's TSS and mark exist by then). Per ei row, canonical order: the exact-key mark (TSS key) takes the
+// Episode weakByDepth / maxDepthPct (absent only when the Side history is truncated: no guess); Side WeakByDepth /
+// MaxDepthPct = the planned values (never cleared by a Reset). No Reset: TSS DeepestClose / MaxDepthPct, current Grade =
+// gradeExact at the fixed CurrentTouchNo (TouchStartGrade untouched). Reset: the TSS Root list freed and the TSS back to
+// the invalid defaults, CurrentTouchNo 0, Phase ActiveTouch -> Waiting through the PhaseSet (TouchCount, Weak flags, Fresh,
+// MaxDepth kept; Stage J re-arms it from currentSeq + 1). A failing step broke the plan proof: runtime.error.
+// W09 B07-R3B2 (/24): + roles (touchStartPostPlanPreflight). A row on a role 2 Core (Merge / Split old Core or freed; only a
+// Reset Episode gets there) writes nothing: its mark is in the W08 plan, its history in the C2 transfer, its Phase in the
+// Stage J baseline or the W08 free; its TSS is the C2 completed-TSS clear's, except a TSS C2 did not capture (a freed Core
+// outside every relation), still valid here, which is cleared here (after commit and transfer; one owner, no double clear).
+// Role 0 / 1 (1:1 continuation: same slot, ring and history): unchanged.
+export episodeApply(TouchStartPlanView tv, PhaseArmedTransferView pav, array<int> ei, array<float> ef, int cap, int weakFromTouch, bool weakFromTouchOff, int strongUntilTouch, bool strongUnlimited, array<int> roles, int baseSeq, int baseCloseTime, float mintick) =>
+    bool ok = true
+    int  i  = 0
+    while ok and i < array.size(ei)
+        int s  = array.get(ei, i)
+        int no = array.get(ei, i + EP_I_TOUCH_NO)
+        int fl = array.get(ei, i + EP_I_FLAGS)
+        int gn = array.get(ei, i + EP_I_GENERATION_ID)
+        int f  = EP_FLOAT_STRIDE * int(i / EP_INT_STRIDE)
+        int c  = int(math.floor(s / 2))
+        bool top = c < array.size(roles) and array.get(roles, c) == 2
+        int mk = top ? SLOT_INVALID : episodeMarkRaw(tv, c, cap, gn, s % 2 == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE, no, array.get(tv.tssStartSeqs, s), array.get(tv.tssStartTimes, s))
+        ok := top or mk >= 0 or (mk == SLOT_INVALID and array.get(pav.sideTouchHistoryTruncatedFlags, s))
+        if ok and mk >= 0
+            array.set(tv.ringWeakByDepthFlags, mk, fl % 64 >= 32)
+            array.set(tv.ringMaxDepthPcts, mk, array.get(ef, f + EP_F_EPISODE_MAX))
+        if not top
+            array.set(pav.sideWeakByDepthFlags, s, fl >= 64)
+            array.set(pav.sideMaxDepthPcts, s, array.get(ef, f + EP_F_SIDE_MAX))
+        bool brk = fl % 2 == 1
+        int  so  = s % 2 == 0 ? s + 1 : s - 1
+        if brk or fl % 32 >= EF_RESET
+            // W09 B08-A (/25): Local Break on a role 0 / 1 Core: the same logical BreakSnapshot on the broken Side and the
+            // opposite Side from the TSS (Core / Generation ID, range, the TSS Root copy in order; oldSide = the broken
+            // Side, breakSeq / breakTime of the bar, wasGapBreak / movedAway / retestSeen false), written before the TSS
+            // clear. Role 2: the BS transfer carried it (bsTransferPlan / Apply).
+            if brk and not top
+                int k = 0
+                while k < 2
+                    int x = k == 0 ? s : so
+                    bsWriteRaw(pav, x, array.get(tv.tssCoreIds, s), array.get(tv.tssGenerationIds, s), s % 2 == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE, array.get(tv.tssRangeBottoms, s), array.get(tv.tssRangeTops, s), baseSeq, baseCloseTime, 0)
+                    int y = array.get(tv.tssRootHeadNodeIndexes, s)
+                    int q = 0
+                    while q < array.get(tv.tssRootCounts, s)
+                        bsRootAppendRaw(pav, x, array.get(tv.tssRootNodeRootIds, y))
+                        y := array.get(tv.tssRootNodeNextIndexes, y)
+                        q += 1
+                    k += 1
+            if not top or array.get(tv.tssValidFlags, s)
+                int nd = array.get(tv.tssRootHeadNodeIndexes, s)
+                int m  = array.get(tv.tssRootCounts, s)
+                while ok and m > 0
+                    int nx = array.get(tv.tssRootNodeNextIndexes, nd)
+                    ok := touchSnapshotRootNodeFreeRaw(tv.tssRootNodeRootIds, tv.tssRootNodeNextIndexes, tv.tssRootNodeOwnerSideSlots, tv.tssRootNodeExpectedCoreIds, tv.tssRootNodeExpectedGenerationIds, tv.tssRootNodeExpectedTouchNos, tv.tssRootNodeLiveFlags, tv.tssRootNodeFreeIndexes, nd)
+                    nd := nx
+                    m  -= 1
+                tssResetRaw(tv, s)
+            if not top
+                array.set(tv.sideCurrentTouchNos, s, 0)
+                if brk
+                    // broken Side -> Broken, opposite -> FlipWait (an Armed opposite leaves both Armed indexes; a Dormant
+                    // one has no index position, preflight), CurrentTouchNo 0 and Grade Unavailable on both, Broken /
+                    // FlipWait index attach on the BS range. An opposite Episode ending by Reset keeps FlipWait.
+                    if array.get(pav.sidePhases, so) == PH_ARMED
+                        ok := ok and priceOrderUpdate(pav.armedBottomOrderSideSlots, pav.armedBottomPositions, pav.sideLastArmedRangeBottoms, mintick, so, false) and priceOrderUpdate(pav.armedTopOrderSideSlots, pav.armedTopPositions, pav.sideLastArmedRangeTops, mintick, so, false)
+                    array.set(tv.sideCurrentTouchNos, so, 0)
+                    array.set(pav.sideGrades, s, GR_UNAVAILABLE)
+                    array.set(pav.sideGrades, so, GR_UNAVAILABLE)
+                    ok := ok and phaseMoveRaw(pav, s, PH_BROKEN) and phaseMoveRaw(pav, so, PH_FLIP_WAIT) and bsIndexRaw(pav, s, true, true, mintick) and bsIndexRaw(pav, so, false, true, mintick)
+                else if array.get(pav.sidePhases, s) == PH_ACTIVE_TOUCH
+                    ok := ok and phaseMoveRaw(pav, s, PH_WAITING)
+        else if top
+            ok := false
+        else
+            array.set(tv.tssDeepestCloses, s, array.get(ef, f + EP_F_DEEPEST))
+            array.set(tv.tssMaxDepthPcts, s, array.get(ef, f + EP_F_EPISODE_MAX))
+            array.set(pav.sideGrades, s, gradeExact(array.get(pav.sideHasNonPsychRootFlags, s), false, fl >= 64, array.get(pav.sideWeakByTouchFlags, s) or weakByTouchNow(no, weakFromTouch, weakFromTouchOff), array.get(pav.sideBaseStrongFlags, s), strongTouchEligible(no, strongUntilTouch, strongUnlimited)))
+        i += EP_INT_STRIDE
+    if not ok
+        runtime.error("W09 B07-R2: Episode apply broke its plan proof")
+    ok
+// After commitPass (after freshTransferApply): the planned history of every transfer target Side (post-commit
+// materialized Core slot): SideTouchCount, WeakByTouch, WeakByDepth, MaxDepthPct, LastNormalTouchTime, CurrentTouchNo 0;
+// then every captured completed TSS: its Root nodes freed, the 18 scalars and the Root list metadata back to the B01
+// defaults. A missing plan or a node that cannot be freed broke the plan proof: runtime.error.
+export touchHistoryTransferApply(PhaseArmedTransferView view, TouchStartPlanView tv) =>
+    int n = array.size(view.applyP)
+    if array.size(view.historyPlan) != 6 * n or array.size(view.historyDepthPlan) != 2 * n or array.size(view.materializedCoreSlots) < n
+        runtime.error("W09 B06-B2C-C2: Touch history apply without its plan")
+    int i = 0
+    while i < 2 * n
+        int fl = array.get(view.historyPlan, 3 * i + 2)
+        if fl >= 0
+            int s = 2 * array.get(view.materializedCoreSlots, int(math.floor(i / 2))) + i % 2
+            array.set(view.sideTouchCounts, s, array.get(view.historyPlan, 3 * i))
+            array.set(tv.sideLastNormalTouchTimes, s, array.get(view.historyPlan, 3 * i + 1))
+            array.set(view.sideWeakByTouchFlags, s, fl % 2 == 1)
+            array.set(view.sideWeakByDepthFlags, s, fl >= 2)
+            array.set(view.sideMaxDepthPcts, s, array.get(view.historyDepthPlan, i))
+            array.set(tv.sideCurrentTouchNos, s, 0)
+        i += 1
+    bool ok = true
+    i := 0
+    while ok and i < array.size(view.tssClearPlan)
+        int s = array.get(view.tssClearPlan, i)
+        int m = array.get(view.tssClearPlan, i + 1)
+        int k = 0
+        while ok and k < m
+            ok := touchSnapshotRootNodeFreeRaw(tv.tssRootNodeRootIds, tv.tssRootNodeNextIndexes, tv.tssRootNodeOwnerSideSlots, tv.tssRootNodeExpectedCoreIds, tv.tssRootNodeExpectedGenerationIds, tv.tssRootNodeExpectedTouchNos, tv.tssRootNodeLiveFlags, tv.tssRootNodeFreeIndexes, array.get(view.tssClearPlan, i + 2 + k))
+            k += 1
+        tssResetRaw(tv, s)
+        i += 2 + m
+    if not ok
+        runtime.error("W09 B06-B2C-C2: TSS clear broke its plan proof")
+    ok
+// W09 B08-A (/25): the BreakSnapshot of Side slot s at the end of this bar's Stage D: the ei row of a Local Break Episode
+// on its Core (either Side; the same logical BS on both Sides) -> that row (>= 0); else a valid persistent BS -> -1;
+// else -2 (none).
+bsSourceRaw(PhaseArmedTransferView v, array<int> ei, int s) =>
+    int c = int(math.floor(s / 2))
+    int e = SLOT_INVALID
+    int k = 0
+    while e < 0 and k < 2
+        int x = episodeRowRaw(ei, 2 * c + k)
+        e := x >= 0 and array.get(ei, x + EP_I_FLAGS) % 2 == 1 ? x : SLOT_INVALID
+        k += 1
+    e >= 0 ? e : array.get(v.sideBreakSnapshotValidFlags, s) ? -1 : -2
+const int BSP_STRIDE = 9
+// W09 B08-A (/25): BreakSnapshot Merge / Split transfer plan (I27-15 as fixed for B08-A), read-only, before the W08 F0,
+// after the Touch history plan. Per applied p and Side (row BSP_STRIDE: kind (-1 no write: 1:1 continuation / fresh /
+// not applied; 0 no BS; 1 BS), coreId, generationId, oldSide, breakSeq, breakTime, flags (1 wasGapBreak, 2 movedAway,
+// 4 retestSeen), Root offset, Root count; floats: range bottom / top; Root IDs in bsRootPlan). Source BS = bsSourceRaw
+// (a same-bar Local Break is the new logical BS: TSS / TouchStart plan range and Roots, breakSeq / breakTime of the bar).
+// Merge: survivor (when the relation has one) and absorbed, same Side; several -> breakSeq max, breakTime max, then the
+// old Core canonical order (coreId, generationId ASC); the whole row is taken. Split: the source's BS goes to every child
+// whose Side winner EffectiveRange ticks intersect the BS range ticks inclusively (childTop >= bsBottom and childBottom <=
+// bsTop); a split source BS reaching no applied child fails (never dropped). Release list after the rows: every Merge /
+// Split source Side and every freed Core Side holding a persistent BS (Side slot, node count, nodes; the list proven:
+// live nodes owned by the Side, count exact). false (scratch empty) on any fault.
+export bsTransferPlan(PhaseArmedTransferView v, TouchStartPlanView tv, SideViewMaterializeView sv, array<int> classes, array<int> ei, array<float> ef, float mintick, int baseSeq, int baseCloseTime) =>
+    array.clear(v.bsPlan)
+    array.clear(v.bsPlanFloats)
+    array.clear(v.bsRootPlan)
+    int  n  = array.size(v.applyP)
+    int  nc = array.size(v.coreIds)
+    int  nk = array.size(v.splitSourceOldCoreSlots)
+    bool ok = mintick > 0 and array.size(classes) == n
+    array<int>  hit = array.new_int(ok ? 2 * nk : 0, -1)
+    array<int>  src = array.new_int(0)
+    array<bool> rel = array.new_bool(ok ? 2 * nc : 0, false)
+    int p = 0
+    while ok and p < 2 * n
+        int  q   = int(math.floor(p / 2))
+        int  sd  = p % 2
+        int  cls = array.get(classes, q)
+        int  b   = cls < 0 ? TX_NONE : cls % TX_READY
+        bool mg  = b == TX_MERGE_SURVIVOR or b == TX_MERGE_FRESH
+        bool sp  = b == TX_SPLIT_CONTINUATION or b == TX_SPLIT_FRESH
+        int  j   = mg ? array.get(v.mergeOfP, q) : sp ? array.get(v.splitOfP, q) : -1
+        array.clear(src)
+        if mg
+            ok := j >= 0 and 5 * j + 4 < array.size(v.mergeRelations)
+            if ok and array.get(v.mergeRelations, 5 * j + 2) != ID_NONE
+                array.push(src, array.get(v.mergeRelations, 5 * j + 1))
+            int a = 0
+            while ok and a < array.get(v.mergeRelations, 5 * j + 4)
+                int off = array.get(v.mergeRelations, 5 * j + 3)
+                ok := off >= 0 and 2 * (off + a) < array.size(v.mergeAbsorbed)
+                if ok
+                    array.push(src, array.get(v.mergeAbsorbed, 2 * (off + a)))
+                a += 1
+        else if sp
+            ok := j >= 0 and j < nk
+            if ok
+                array.push(src, array.get(v.splitSourceOldCoreSlots, j))
+                array.set(hit, 2 * j + sd, math.max(0, array.get(hit, 2 * j + sd)))
+        int   bse = -2
+        int   bss = SLOT_INVALID
+        int   bid = ID_NONE
+        int   bgn = ID_NONE
+        int   bsq = SEQ_UNSET
+        int   btm = int(na)
+        int   x   = 0
+        while ok and x < array.size(src)
+            int c  = array.get(src, x)
+            ok := c >= 0 and c < nc and array.get(v.coreSlotLiveFlags, c)
+            int ss = 2 * c + sd
+            int e  = ok ? bsSourceRaw(v, ei, ss) : -2
+            if e > -2
+                int   f  = EP_FLOAT_STRIDE * int(e / EP_INT_STRIDE)
+                int   id = e >= 0 ? array.get(ei, e + EP_I_CORE_ID) : array.get(v.bsCoreIds, ss)
+                int   gn = e >= 0 ? array.get(ei, e + EP_I_GENERATION_ID) : array.get(v.bsGenerationIds, ss)
+                int   sq = e >= 0 ? baseSeq : array.get(v.bsBreakSeqs, ss)
+                int   tm = e >= 0 ? baseCloseTime : array.get(v.bsBreakTimes, ss)
+                float rb = e >= 0 ? array.get(ef, f) : array.get(v.bsRangeBottoms, ss)
+                float rt = e >= 0 ? array.get(ef, f + 1) : array.get(v.bsRangeTops, ss)
+                ok := not na(rb) and not na(rt) and rb <= rt and not na(sq) and not na(tm)
+                bool take = ok
+                if ok and sp
+                    int w = array.get(sd == 0 ? sv.supportWinnerIndexes : sv.resistanceWinnerIndexes, q)
+                    take := w >= 0 and array.get(sv.winnerEffectiveTopTicks, w) >= int(math.round(rb / mintick)) and array.get(sv.winnerEffectiveBottomTicks, w) <= int(math.round(rt / mintick))
+                    if take
+                        array.set(hit, 2 * j + sd, array.get(hit, 2 * j + sd) + 1)
+                if take and (bse == -2 or sq > bsq or (sq == bsq and (tm > btm or (tm == btm and (id < bid or (id == bid and gn < bgn))))))
+                    bse := e
+                    bss := ss
+                    bid := id
+                    bgn := gn
+                    bsq := sq
+                    btm := tm
+            x += 1
+        // the row: the chosen whole BS (Roots copied by value into bsRootPlan)
+        int ro = array.size(v.bsRootPlan)
+        if ok and bse > -2
+            int f = EP_FLOAT_STRIDE * int(bse / EP_INT_STRIDE)
+            if bse >= 0
+                int rw = array.get(ei, bse + EP_I_ROW)
+                int bs = array.get(ei, bse)
+                if rw >= 0
+                    int o = array.get(tv.planInts, PLAN_INT_STRIDE * rw + PLAN_I_ROOT_OFFSET)
+                    int y = 0
+                    while ok and y < array.get(tv.planInts, PLAN_INT_STRIDE * rw + PLAN_I_ROOT_COUNT)
+                        ok := o + y < array.size(tv.planRootIds)
+                        if ok
+                            array.push(v.bsRootPlan, array.get(tv.planRootIds, o + y))
+                        y += 1
+                else
+                    int nd = array.get(tv.tssRootHeadNodeIndexes, bs)
+                    int y  = 0
+                    while ok and y < array.get(tv.tssRootCounts, bs)
+                        ok := nd >= 0 and nd < array.size(tv.tssRootNodeRootIds) and array.get(tv.tssRootNodeLiveFlags, nd)
+                        if ok
+                            array.push(v.bsRootPlan, array.get(tv.tssRootNodeRootIds, nd))
+                            nd := array.get(tv.tssRootNodeNextIndexes, nd)
+                        y += 1
+                array.concat(v.bsPlan, array.from(1, bid, bgn, bs % 2 == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE, bsq, btm, 0, ro, array.size(v.bsRootPlan) - ro))
+                array.push(v.bsPlanFloats, array.get(ef, f))
+                array.push(v.bsPlanFloats, array.get(ef, f + 1))
+            else
+                int nd = array.get(v.bsRootHeadNodeIndexes, bss)
+                int y  = 0
+                while ok and y < array.get(v.bsRootCounts, bss)
+                    ok := nd >= 0 and nd < array.size(v.bsNodeRootIds) and array.get(v.bsNodeLiveFlags, nd) and array.get(v.bsNodeOwnerSideSlots, nd) == bss
+                    if ok
+                        array.push(v.bsRootPlan, array.get(v.bsNodeRootIds, nd))
+                        nd := array.get(v.bsNodeNextIndexes, nd)
+                    y += 1
+                array.concat(v.bsPlan, array.from(1, bid, bgn, array.get(v.bsOldSides, bss), bsq, btm, (array.get(v.bsWasGapBreakFlags, bss) ? 1 : 0) + (array.get(v.bsMovedAwayFlags, bss) ? 2 : 0) + (array.get(v.bsRetestSeenFlags, bss) ? 4 : 0), ro, array.size(v.bsRootPlan) - ro))
+                array.push(v.bsPlanFloats, array.get(v.bsRangeBottoms, bss))
+                array.push(v.bsPlanFloats, array.get(v.bsRangeTops, bss))
+        else
+            array.concat(v.bsPlan, array.from(mg or sp ? 0 : -1, ID_NONE, ID_NONE, SIDE_NONE, SEQ_UNSET, int(na), 0, ro, 0))
+            array.push(v.bsPlanFloats, float(na))
+            array.push(v.bsPlanFloats, float(na))
+        // release: the persistent BS of every Merge / Split source Side
+        x := 0
+        while ok and x < array.size(src)
+            array.set(rel, 2 * array.get(src, x) + sd, true)
+            x += 1
+        p += 1
+    // a split source BS (persistent or same-bar) must reach at least one applied child
+    int k = 0
+    while ok and k < 2 * nk
+        ok := array.get(hit, k) != 0 or bsSourceRaw(v, ei, 2 * array.get(v.splitSourceOldCoreSlots, int(math.floor(k / 2))) + k % 2) == -2
+        k += 1
+    int i = 0
+    while ok and i < array.size(v.freeSlots)
+        int c = array.get(v.freeSlots, i)
+        ok := c >= 0 and c < nc
+        if ok
+            array.set(rel, 2 * c, true)
+            array.set(rel, 2 * c + 1, true)
+        i += 1
+    int s = 0
+    while ok and s < 2 * nc
+        if array.get(rel, s) and array.get(v.sideBreakSnapshotValidFlags, s)
+            int m  = array.get(v.bsRootCounts, s)
+            int nd = array.get(v.bsRootHeadNodeIndexes, s)
+            array.push(v.bsPlan, s)
+            array.push(v.bsPlan, m)
+            while ok and m > 0
+                ok := nd >= 0 and nd < array.size(v.bsNodeLiveFlags) and array.get(v.bsNodeLiveFlags, nd) and array.get(v.bsNodeOwnerSideSlots, nd) == s
+                if ok
+                    array.push(v.bsPlan, nd)
+                    nd := array.get(v.bsNodeNextIndexes, nd)
+                m -= 1
+            ok := ok and nd == SLOT_INVALID
+        s += 1
+    ok := ok and array.size(v.bsNodeRootIds) + array.size(v.bsRootPlan) <= 100000
+    if not ok
+        array.clear(v.bsPlan)
+        array.clear(v.bsPlanFloats)
+        array.clear(v.bsRootPlan)
+    ok
+// W09 B08-A (/25): after commit and the Touch history apply: every released source BS (nodes freed, the Side back to the
+// defaults), then every Merge / Split destination Side of the plan (its post-commit materialized Core slot): row kind 1 ->
+// the whole BS written with its Root copy, kind 0 -> no BS. Stage J sets the Phase from it. A missing plan or a node
+// that cannot be freed broke the plan proof: runtime.error.
+export bsTransferApply(PhaseArmedTransferView v) =>
+    int  n    = array.size(v.applyP)
+    int  base = BSP_STRIDE * 2 * n
+    bool ok   = array.size(v.bsPlan) >= base and array.size(v.bsPlanFloats) == 4 * n and array.size(v.materializedCoreSlots) >= n
+    int  i    = base
+    while ok and i < array.size(v.bsPlan)
+        int s = array.get(v.bsPlan, i)
+        int m = array.get(v.bsPlan, i + 1)
+        int q = 0
+        while ok and q < m
+            ok := bsNodeFreeRaw(v, array.get(v.bsPlan, i + 2 + q), s)
+            q += 1
+        bsClearRaw(v, s)
+        i += 2 + m
+    int r = 0
+    while ok and r < 2 * n
+        int row = BSP_STRIDE * r
+        int kd  = array.get(v.bsPlan, row)
+        if kd >= 0
+            int x = 2 * array.get(v.materializedCoreSlots, int(math.floor(r / 2))) + r % 2
+            bsClearRaw(v, x)
+            if kd == 1
+                bsWriteRaw(v, x, array.get(v.bsPlan, row + 1), array.get(v.bsPlan, row + 2), array.get(v.bsPlan, row + 3), array.get(v.bsPlanFloats, 2 * r), array.get(v.bsPlanFloats, 2 * r + 1), array.get(v.bsPlan, row + 4), array.get(v.bsPlan, row + 5), array.get(v.bsPlan, row + 6))
+                int q = 0
+                while q < array.get(v.bsPlan, row + 8)
+                    bsRootAppendRaw(v, x, array.get(v.bsRootPlan, array.get(v.bsPlan, row + 7) + q))
+                    q += 1
+        r += 1
+    if not ok
+        runtime.error("W09 B08-A: BreakSnapshot transfer apply broke its plan proof")
+    ok
