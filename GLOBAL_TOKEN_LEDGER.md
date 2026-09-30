@@ -1511,3 +1511,18 @@ A defect found by F13 and fixed before commit: a bar with only Flip rows compute
 flipApply wrote on top of the transfer (count 4) and onto a freed slot; roles are now computed when Flip rows exist.
 random 0, 5k / 50k / 200k 0, > 5 min 0.
 TV: W09State /27 publish -> W08Runtime /19 publish -> Production Main compile. CE10216 -> STOP.
+
+### B10 PRE-TV TEST COMPLETION (R2): Flip TouchMark transfer asserts in F12 / F13 (test only)
+Production semantic change 0, Production source change 0 (W09State /27, W08Runtime /19, W08Touch /7, W08Core, Main as
+in f862f3e). New test case 0: assertions added to the existing F12 / F13 only. The asserts run the real, unchanged
+W08Touch /7 source (interpreted `mergePlanBuild` / `splitPlanBuild` + `mergeApplyPreflight` / `mergeApplyCommit` /
+`splitApplyPreflight` / `splitApplyCommit`) on the pre-bar ring with this bar's TouchStart plan arrays (pI / pF, which
+carry the Flip mark row) and ei / ef, replacing the previous code-reading-only confirmation of that path.
+- F12 Merge (Flip Attempt on the absorbed Core 10 into survivor 11): Merge plan and the committed destination ring hold
+  the Flip TouchMark exactly once with isNormalTouch false, touchNo 0, side Resistance, generationId 3, baseSeq / time of
+  the bar, contact 100..102 (= bar x BS range), close 101; SideTouchCount of the destination unchanged.
+- F13 Split (source Core 10, children 95..108 and 103..109): only the child whose Side EffectiveRange meets the contact
+  range 100..102 receives the mark (same fields); the non-intersecting child receives no copy; the committed child ring
+  holds it; SideTouchCount unchanged.
+Result: F12 / F13 2/2 PASS (only the changed cases re-run; the other B10 cases unchanged). Probe 0, random 0, > 5 min 0.
+TV: W09State /27 publish -> W08Runtime /19 publish -> Production Main compile. CE10216 -> STOP.
