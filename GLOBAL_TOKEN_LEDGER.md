@@ -973,3 +973,80 @@ topology, i.e. A: previous ActiveTouch -> Reset -> same-bar topology; B: TouchSt
 - Q5 continuation old (ownership kind 0: the Core continues as the target): is it "consumed" for items 2 / 3 or does the
   ring row / TSS stay on the continuing Core; not recorded.
 Rule followed: the scope is not uniquely restorable -> no design invented, no code change; STOP for decisions Q1-Q5.
+
+### R3-B2: same-bar topology (Q1-Q5 fixed by the user; design, W09State /24)
+
+TOKEN START REVIEW: Main PASS (Import C A), exact UNKNOWN; headroom UNKNOWN; status UNKNOWN (not inferred from PASS).
+Planned: W09State /24 (next unused: /23 is the rejected R3B0 Probe) + Main wiring (overlay scratch, one role scratch,
+the TouchMark append guard, 3 changed call signatures, W09State pin). High-cost candidates: none (no import, no type,
+no UDT copy, no tuple, no new array forwarding into W08). Probe: NO (small W09State helpers; the TV compile after the
+batch is the gate). Main business logic added: NO (one `if` on a W09State-computed flag). Token policy: no token
+refactor; CE10216 after the batch -> STOP.
+
+Fixed semantics mapped onto the projected architecture (the plans are built before the W08 F0 from the projected Stage D
+values, R3-A / R3-B1; persistent writes run after every F0 in the Main commit block; the fixed logical order 1-8 is the
+projected order, the physical writes keep "persistent mutation 0 until all F0"):
+1. Overlay: `episodeOverlayBuild(ei, out)` from ei col 9 (FORCE_ACTIVE s / FORCE_INACTIVE -(s + 1)); Main passes it to
+   `planPassWithActiveTouchOverlay` instead of the TouchStart-only list. A no-Reset A stays ActiveTouch (persistent), a
+   no-Reset B is FORCE_ACTIVE -> W08 PendingTopology (N1 / N2). A Reset A is FORCE_INACTIVE, a Reset B NO_OVERRIDE (its
+   persistent Phase is Armed) -> its component may apply this bar (A1-A3 / B1-B3).
+2. Busy (Q1): `touchStartPostPlanPreflight` keeps the busy set; an Episode / TouchStart Core in it passes only when its
+   Episode Resets this bar and the Core has a topology role (below); a no-Reset Episode Core in the applied topology
+   still fails (fail-closed guard of W08 Pending). The preflight writes the per-Core role into a caller scratch:
+   0 none, 1 = old Core of a plain 1:1 continuation, 2 = Merge / Split old Core (survivor / Split continuation /
+   absorbed / Split source) or freed.
+3. Phase / Armed (Q2): `phaseArmedTransferPreflight(+ei)` accepts a persistent ActiveTouch Side whose Episode Resets
+   (projected Waiting, CurrentTouchNo 0). The final Phase / Armed stays Stage J's (post-topology EffectiveRange,
+   confirmed close; Waiting -> Armed with ArmedFromSeq = currentSeq + 1); unchanged code.
+4. B TouchStart (Q3): logically applied through its plan row (TouchCount, CurrentTouchNo, TSS, TouchMark, Fresh are the
+   projected values the Fresh / history transfer plans and the W08 Merge / Split TouchMark plans already read);
+   EV_TOUCH_START always. Role 2: `touchStartApply` writes nothing on the old slot and reports "no persistent ring
+   append" for the row (the W08 plan carries the projected mark); Main appends the mark only when flagged. Role 1: normal
+   apply, the Armed index removal is skipped (released before commit by `phaseArmedIndexRelease`).
+5. TSS (Q4): Merge / Split sources: the C2 completed-TSS clear (`touchHistoryTransferApply`, after commit and transfer)
+   is the owner; `episodeApply` never clears them. A freed Episode Core outside every relation (no C2 capture): the TSS
+   still valid after C2 is cleared by `episodeApply` (after commit / transfer; one owner per TSS, no double clear).
+   Role 0 / 1: the existing Reset cleanup path.
+6. Continuation (Q5): role 1 keeps its slot, ring and history (W08 "continuation release in place"): `episodeApply` runs
+   its normal path (mark, Side WeakByDepth / MaxDepth, Reset: TSS clear, CurrentTouchNo 0, Waiting). Role 2 survivor /
+   Split continuation: history = the C2 transfer (projected), ring = the W08 plan (projected marks), Phase = Stage J
+   baseline; `episodeApply` writes nothing there. Merge absorbed: freed by W08.
+Unchanged: C2 transfer semantics, Fresh transfer, W08 / W08Touch / W08Runtime, Break, WeakDepth / Reset Event wiring,
+episodePlan, Stage J.
+
+### R3-B2 implementation (W09State /24, Main wiring; TV compile pending)
+
+W09State /24 (imports 0 -> 0, types 6 -> 6, exports 46 -> 47 (+episodeOverlayBuild), `.copy` 0, no tuple added, no
+use-before-definition):
+- `episodeOverlayBuild(ei, out)` (new export).
+- `phaseArmedTransferPreflight(+activeOverlay)`: ActiveTouch passes only with its FORCE_INACTIVE entry (Reset A).
+  (Placed before the EP_* constants, so it reads the projected state from the overlay, not from ei.)
+- `touchStartPostPlanPreflight(+roles)`: role scratch (0 / 1 / 2), busy relaxed only for a Reset Episode with a role.
+- `touchStartApply(+roles, +ringOut)`: role 2 no write / no ring append; role 1 no Armed index removal.
+- `episodeApply(+roles)`: role 2 no write except a TSS still valid after C2 (freed outside every relation).
+Main: overlay scratch `ov` -> planPassWithActiveTouchOverlay and phaseArmedTransferPreflight; role scratch `tro`;
+ring flag `tsr` guards `W08Touch.markAppend` (the call stays in Main: W09State imports no W08 library, INC-1); the
+three changed calls; W09State pin /22 -> /24. EV_TOUCH_START / WeakDepth / Reset Event loops unchanged.
+
+Deterministic `r3b2_det.py` (Production W09State /24 + the Main commit slice interpreted; W08 = stub: PendingTopology
+predicate on the overlay, hand-written projected Merge / Split TouchMark plan rows, commit = Core free / ring rewrite /
+post-topology EffectiveRange): 15/15 in < 2 s. Compared per case: TouchCount, TouchMark ring rows, Side / Zone Fresh,
+CurrentTouchNo, TSS (valid, Root count, node freed, no orphan), Phase, ArmedFromSeq (LastArmedRange), Core ID,
+Generation ID, liveness, Events.
+- A1 Merge survivor (new range top 112 -> Waiting: the old snapshot range is not used), A2 Merge absorbed (survivor Armed
+  from seq + 1), A3 Split continuation, A4 freed outside every relation (TSS cleared once by episodeApply).
+- B1 Merge survivor, B2 Merge absorbed, B3 Split continuation: TouchStart logical (count / mark / Fresh projected,
+  EV_TOUCH_START + EV_TOUCH_RESET), no persistent ring append, TSS never persisted.
+- K1 / K2 1:1 continuation (A / B): same slot, ring and history, Reset cleanup path, Armed from seq + 1.
+- N1 / N2 no Reset -> W08 Pending (topology not applied, Episode / TouchStart normal); G1 / G2 the same forced into the
+  applied topology -> preflight fails, persistent mutation 0.
+- F1 / F2 W08 F0 failure after every W09 preflight -> persistent mutation 0.
+Mutants (W09State): 8 non-equivalent killed (role-2 writes, role-2 ring append, no FORCE_INACTIVE, busy never relaxed,
+transfer preflight ignoring the overlay, role-1 index removal, continuation as role 2, TSS fallback skipped); 2
+equivalent (plan-row busy relaxation without Reset: the same Side's Episode check fails first; double TSS reset after
+C2: idempotent defaults).
+Regression of the changed functions (harness call signatures adapted only): R2 39/40 unchanged, the 1 change is C31
+(R2 "Reset A + applied topology -> fail closed", now allowed by Q1; its new values are K1); R3A 20/20; B3A Phase
+transfer 13/13 (empty overlay); R3-B1 scratch contract check PASS. random 0, 5k / 50k / 200k 0, R3-B1 29 cases not
+re-run (W08Touch unchanged).
+Publish: W09State /24 -> Main compile (TV Gate). CE10216 -> STOP.
