@@ -195,7 +195,7 @@ evaluation point (the FULL fallback branch after the `keepCache` clearing), the 
 
 | ID | Module | Change | Before | After | Delta | Effect | Semantic change | Test | Status |
 |---|---|---|---|---|---|---|---|---|---|
-| GT-4A | W06Comp /20 -> /21 (Main W06 /21) | fold `fullFallbackRaw` into its single call site | <1,000,000 | - | - | - | 0 (SEMANTIC_EQUIVALENCE = PROVEN, pure pass-through) | in the GT-4A + GT-4B harness | APPROVED_PENDING_BUNDLE (no W06 version of its own; ships with GT-4B) |
+| GT-4A | W06Comp /20 -> /21 (Main W06 /21) | fold `fullFallbackRaw` into its single call site | <1,000,000 | - | - | - | 0 (SEMANTIC_EQUIVALENCE = PROVEN, pure pass-through) | GT-4A + GT-4B harness 15/15 | IMPLEMENTED in W06 /21 (bundle with GT-4B), TV pending |
 
 ### GT-4B audit: inline `runComponentRaw` into `recomputeAndMerge` (APPROVED; not implemented yet)
 
@@ -228,4 +228,28 @@ publish). Harness plan: interpreted old vs new `recomputeAndMerge` with `buildCo
 
 | ID | Module | Change | Before | After | Delta | Effect | Semantic change | Test | Status |
 |---|---|---|---|---|---|---|---|---|---|
-| GT-4B | W06Comp /20 -> /21 (with GT-4A) | inline `runComponentRaw` into its single call site | <1,000,000 | - | - | - | 0 (audited) | planned | APPROVED (audit), not implemented |
+| GT-4B | W06Comp /20 -> /21 (with GT-4A) | inline `runComponentRaw` into its single call site | <1,000,000 | pending (TV) | exact delta not measurable (Before exact unknown) | - | 0 | det 15/15, mutants 5/5 killed, static PASS | IMPLEMENTED in W06 /21, TV pending (Main PASS -> ADOPT_CANDIDATE) |
+
+### GT-4A + GT-4B implementation (W06 /21, Main W06 /20 -> /21)
+
+- GT-4A: the single call site now calls `W05Cand.selectBothSides(...)` with the unchanged 99-argument list (same order,
+  `workSeenEpoch` at the same position, same place in the FULL fallback branch); `fullFallbackRaw` (99-parameter signature,
+  31-value unpack + return) deleted.
+- GT-4B: `runComponentRaw` body (229 lines) moved verbatim into the row loop of `recomputeAndMerge` (+8 indent), whole-word
+  substitutions in code only: `row` -> `r` 22, `inCandidateBroadSeenEpoch` -> `workSeenEpoch` 3, `filteredPriceOrderSlots` ->
+  `filteredPriceScratch` 2, `filteredIdOrderSlots` -> `filteredIdScratch` 2, `capacity` -> `cap` 9 (exactly the audited
+  counts); then `workSeenEpoch := outEpoch`, `localOk := ok`, `r += 1`. No local renamed. `runComponentRaw` (134-parameter
+  signature, `[ok, outEpoch]` return) deleted.
+- Static: `runComponentRaw` / `fullFallbackRaw` code references 0; `W05Cand.selectComponentBothSides` 1 -> 1,
+  `W05Cand.selectBothSides` 1 -> 1, `runFilterOrdersRaw` calls unchanged; `array.new` 44 -> 44, `.copy` 0 -> 0, tuple
+  unpacks 8 -> 6, functions 19 -> 17; the inlined body reversed through the mapping equals the old body line for line; raw
+  `capacity` inside it 0; `r`, `workSeenEpoch`, `cap` and the two scratch arrays are never assigned inside it.
+- Removed: signatures 99 + 134 = 233 parameters; forwarded arguments 99 + 134 = 233 (the W05 fallback call keeps its 99).
+- Test `gt4ab_det.py` (interpreted /20 vs /21 `recomputeAndMerge`; build / merge / side mask / filter / both W05 calls are
+  recording oracle stubs; PASS = same 45-value return or error, same ordered call trace with deep snapshots of every argument,
+  same final state of all 186 inputs): normal, single Support, single Resistance, LOCAL + BROAD_ONLY with seen stamps and
+  merged seen, status fallback (no merge, cache kept, GT-4A path), multi-record merge, DIRTY false, DIRTY mix, epoch fail,
+  pass 1 fail, pass 2 over 3 rows, capacity 64 / 63 / clamped (-1 -> cap 0), rollback (filter fail after an append; W05
+  count mismatch), W05 / merge failure, build FULL_FALLBACK (GT-4A pass-through): 15/15, 0.4 s. Mutants 5/5 killed
+  (raw `capacity`, raw input epoch, raw epoch in the GT-4A call, lost epoch update, fixed row).
+- Source proxy (reference only): W06 31,275 -> 29,524 (-1,751).
