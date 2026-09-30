@@ -1346,3 +1346,45 @@ Undefined (I27 text not in the repo, no canonical source): the EV_GAP_BREAK row'
 - touchNo: no Touch Episode exists (TouchCount unchanged): SideTouchCount, UpcomingTouchNo (TouchCount + 1) or 0?
 - gradeAtStart: no TouchStartGrade exists: the current Side Grade before the break, GR_UNAVAILABLE, or another value?
 STOP for these two fields.
+
+### B09 GapBreak: Event resolution (user) and implementation (W09State /26, Main; W08Runtime /18 kept)
+
+EV_GAP_BREAK (fixed): time / seq of the bar, Core / Generation ID, side = the gap-broken oldSide, range = the
+previous-confirmed LastArmedRange, touchNo 0 (no Touch Episode sentinel; never SideTouchCount / Upcoming), gradeAtStart
+GR_UNAVAILABLE (no TouchStartGrade; never the current Grade), weakReason = the persistent Side Weak reason, rootId ID_NONE.
+
+TOKEN START REVIEW (B09): Main PASS, exact UNKNOWN; no new UDT / import / foreign type / tuple / mass array forwarding;
+B08 BS helpers reused; GapBreak rows in Main-local flat scratch; a few parameters on existing calls -> Probe NO.
+
+Implementation:
+- W09State /26: GB_STRIDE scratch contract (gbi [Side slot, Core ID, Generation ID, Weak reason, Root offset, Root count],
+  gbf [LastArmedRange], gbr [the Side current Root IDs], d1 = the D1 fact order); touchStartPlanBuild (+d1 / gbi / gbf /
+  gbr): a D1 target that is no normal Touch and meets gapBreakMetExclusive becomes a GapBreak row (Root list proven);
+  breakOppositeOkRaw (the B08 D3 rule, shared); breakCommitRaw (the Break commit, shared by the Local Break and the
+  GapBreak); touchStartPostPlanPreflight (+gbi / gbf: Armed in both indexes, no Episode, no BS, valid range, opposite,
+  Event room, BS pool; roles also when only GapBreak rows exist); bsSourceRaw (+gbi: a GapBreak -> -3 - k) and
+  bsTransferPlan (+gbi / gbf / gbr: the projected GapBreak BS, wasGapBreak, Root copy from gbr; the relation-outside
+  invariant covers it); gapBreakApply (role 0 / 1; role 2 through the transfer).
+- Main: W09State /26 pin, the four scratch arrays, the new arguments, gapBreakApply after touchStartApply, the D1 Event
+  loop over d1 (TouchStart row: its TouchMark when flagged + EV_TOUCH_START; GapBreak row: EV_GAP_BREAK) before the
+  Episode Event loop. W08Runtime unchanged (/18).
+
+B08 reuse-audit fixes (inside the shared helpers; B08 semantics as fixed by D3, no new rule):
+- R1: the D3 opposite check read the persistent Phase only, so an opposite with a same-bar TouchStart (projected
+  ActiveTouch, no Reset) passed as Armed and was committed as FlipWait with a valid TSS; now any opposite with a same-bar
+  Episode must end by Reset (fail-closed otherwise). On /25 the case committed (FlipWait + TSS valid); on /26 it fails,
+  mutation 0.
+- R2: a Local Break on a 1:1 continuation (role 1) with an Armed opposite removed the opposite from the Armed indexes a
+  second time (already released before commit) -> runtime.error; now the release is not repeated. On /25 runtime.error;
+  on /26 Broken / FlipWait.
+
+Gates: `b9_det.py` 16/16 (G1 / G13 Support GapBreak + Event row, G2 Resistance, G3 / G4 boundary equality, G5 / G6
+high == bottom / low == top -> normal Touch, G7 no Touch / Weak / MaxDepth / Fresh / TSS / TouchMark change, G8 BS
+(wasGapBreak, LastArmedRange, current Root copy, indexes), G9 Merge survivor transfer, G10 Split continuation transfer,
+G11 opposite Armed, G12 relation-outside free -> F0 false / mutation 0 / no Event, G14 tolerance line-Zone Touch wins,
+G15 D1 canonical order across Cores, R1, R2); B08 regression `b8a_det.py` on /26 16/16; R3-B2 replay 15/15; R3-B1
+scratch contract check PASS (the check now matches the plan-row variable of the D1 loop by regex; strides unchanged);
+static: W09State imports 0 / types 6 / `.copy` 0 / exports 49 -> 50 (gapBreakApply), no use-before-definition, BS
+written only through breakCommitRaw / bsTransferApply. random 0, 5k / 50k / 200k 0, > 5 min 0. Harness fixture errors on
+the first run (R1 opposite range that Resets) and a harness constant gap (GR_) were fixed in the harness only.
+TV: W09State /26 publish -> Production Main compile. CE10216 -> STOP.

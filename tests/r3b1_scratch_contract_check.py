@@ -51,7 +51,7 @@ for k, a in (('PI_CORE_SLOT', 'PLAN_I_CORE_SLOT'), ('PI_CORE_ID', 'PLAN_I_CORE_I
     eq(k, T[k], A[a])
 # Main TouchStart markAppend wiring (the persistent mark the projection must equal)
 m = re.search(r'W08Touch\.markAppend\((.*)\)\s*$', mns, re.M); ma = args(m.group(1))
-eq('Main plan int stride', 'int r = %d * i' % T['PI_STRIDE'] in mns, True); eq('Main plan float stride', 'int f = %d * i' % T['PF_STRIDE'] in mns, True)
+eq('Main plan int stride', re.search(r'int r = %d \* [ix]\b' % T['PI_STRIDE'], mns) is not None, True); eq('Main plan float stride', re.search(r'int f = %d \* [ix]\b' % T['PF_STRIDE'], mns) is not None, True)  # B09: the plan row index is x (D1 order)
 sig = re.search(r'^export markAppend\((.*)\) =>', w8s, re.M).group(1)
 pn = [p.split('=')[0].strip().split()[-1] for p in re.split(r',\s*(?![^<]*>)', sig)]
 want = {'coreSlot': 'array.get(ti, r + %d)' % T['PI_CORE_SLOT'], 'baseSeq': 'array.get(ti, r + %d)' % T['PI_BASE_SEQ'], 'touchTime': 'array.get(ti, r + %d)' % T['PI_TIME'],
