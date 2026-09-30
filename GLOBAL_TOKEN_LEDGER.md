@@ -917,3 +917,24 @@ bad probed slot. Sensitivity: 2 mutants (strictGreater compare, bottom <= top ch
 TV Gate: pending. PASS -> Import C A ADOPT; stop token refactors (GT-5A, D3, T1-T3, further import search DEFERRED);
 return to W09 B07 R3-B2; no extra compression toward 975k / 950k. CE10216 -> record delta = 1,001,847 - After exactly,
 STOP, no automatic GT-5A.
+
+### IMPORT C A: TV Gate PASS -> ADOPT; token detour closed
+
+TOKEN END REVIEW (Import C A): Before 1,001,847 (CE10216); After < 1,000,000 (PASS); Delta > 1,847 (exact UNKNOWN);
+CE10216 RESOLVED; GREEN / YELLOW / RED UNKNOWN (not inferred from a PASS); Production semantic change 0; Main business
+logic 0; authority duplication 0; new foreign UDT 0; TOKEN_REFACTOR_ONLY yes; long test no; > 5 min no; needless retest
+no; rule violations 0.
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| IC-A | W07Interval /1 (new), W07 /11, W05 /7, W06 /24, Main pins | FVG interval helpers single authority in W07Interval; W05 -> W07 edge removed | 1,001,847 (CE10216) | < 1,000,000 (PASS) | > -1,847 (exact UNKNOWN) | ADOPTED |
+
+Production pins (canonical): W03F0 /5, W03Apply /4, W03ETimeFvg /3, W06 /24 (-> W05 /7 -> W07Interval /1), W07 /11
+(-> W07Interval /1), W08Core /18, W08Touch /7, W08Runtime /17 (-> W08Core /18, W08Touch /7), W03EMsa /9, W09State /22.
+
+DEFERRED: GT-5A (APPROVED_DEFERRED), D3, T1-T3, further import search. Token refactor: STOP (no compression toward
+975k / 950k). Only a new CE10216 after a semantic Batch reopens token work.
+
+R3-B1: COMPLETE (semantics verified: det 29/29, reference parity, contract check; Production Main compile PASS with
+W08Touch /7 / W08Runtime /17). R3-B1 semantics FROZEN; never redesigned for token reasons.
+Next: W09 B07 R3-B2.
