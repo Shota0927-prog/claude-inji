@@ -619,3 +619,26 @@ arguments, the two counters are the caller's own variables, no allocation / var 
 publish, 51 parameters + 51 forwarded arguments + a tuple removed, and while Main is still CE10216 the compile shows the
 exact value, so the effect of an inline is measured for the first time. The R3-B1 boundaries T1-T3 are LOW risk but remove
 only 3-7 parameters each and cost two publishes; they are kept as a later bundle (not dropped).
+
+### D1: inline `w03StageEMaRaw` into W03EMsa `run` (W03EMsa /8, Main W03EMsa /7 -> /8; TOKEN_REFACTOR_ONLY)
+
+T1 / T2 / T3 (W08Touch internal boundaries) = DEFERRED_BUNDLE (small single removals, two publishes each; to be done later
+as one W08Touch cleanup). D2 / D3 not started.
+
+- The helper body (30 lines, same indent) moved verbatim to its single call site; its two opening lines
+  (`journalCountNow = journalCountIn`, `journalInvariantViolationNow = journalInvariantViolationIn`), its
+  `[journalCountNow, journalInvariantViolationNow]` return and the caller's two write-backs removed: the body now updates
+  the caller's own two variables (the *In params were read only by those two lines; same values, same order). No rename
+  (the only shared names are exactly those two variables).
+- Static: `w03StageEMaRaw` code references 0; functions 15 -> 14; tuple unpacks 7 -> 6; imports / types / `array.new` /
+  `.copy` 0 -> 0; diff = the deleted helper (37 lines) and the replaced call (3 -> 32 lines); the moved body is identical;
+  removed: signature 51 parameters, forwarding 51 arguments, one 2-value tuple.
+- Test `d1_det.py` (old call + write-backs with the real old helper vs the new block, extracted from the files, same `run`
+  environment; recording stubs: originKeyComputeRaw, maSlopeDirRaw, originLookupUniqueRaw, journalAppendRaw): two new
+  Roots, unchanged Roots, price / slope (na -> value) / open time / close time change, lookup violation stop, incoming
+  violation, pending row, MA disabled, na EMA2000, unusable source / mintick 0: 12/12 (0.06 s); mutants 2/2 killed. R3-B1
+  29 not rerun (unchanged). Source proxy (reference only): W03EMsa 7,038 -> 6,637.
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| D1 | W03EMsa /7 -> /8 (Main pin) | inline `w03StageEMaRaw` | 1,003,009 (CE10216) | pending (TV) | pending | CE10216 with a number -> Delta = 1,003,009 - After (exact); PASS -> After < 1,000,000, Delta > 3,009 (no estimate) |
