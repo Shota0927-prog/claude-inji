@@ -758,9 +758,35 @@ PASS-only information check and the ballast: baseline 1,001,847 is only 1,847 ov
 for any delta above 1,847 and tell nothing more. The probe Main therefore pins W03EMsa /7 instead of /9: measured exactly
 +1,162 with every other pin identical (1,003,009 at D1's Before vs 1,001,847 now; assumed additive, a different library).
 Reading: Probe = 1,003,009 - delta. CE10216 with a number -> delta = 1,003,009 - Probe (exact; LOW if < 3,000). PASS ->
-delta > 3,009 (at least MEDIUM; the exact size stays unknown). A decision is needed on what a PASS leads to (the current
-rule says "PASS -> no further Probe, back to GT-5A").
+delta > 3,009 (at least MEDIUM; the exact size stays unknown).
+
+User decision (Probe C approved): the +1,162 additivity is NOT used. The baseline is the historical exact 1,003,009
+(R3-B1 semantics complete + W03EMsa /7), allowed only if a machine audit proves the probe configuration differs from
+that configuration only by the W05 / W06 probe replacement.
 
 | ID | Probe | Change | Baseline | Probe compiled | Delta | Status |
 |---|---|---|---|---|---|---|
-| IP-C | W05 -> W07 import removed (probe libraries), ballast W03EMsa /7 (+1,162) | 2 probe publishes + 1 Main compile | 1,001,847 (+1,162 ballast = 1,003,009) | pending (TV) | pending | attribution only, never adopted |
+| IP-C | W05 -> W07 import removed (probe libraries), Main pins = the 1,003,009 configuration (W03EMsa /7) | 2 probe publishes + 1 Main compile | 1,003,009 (historical exact, machine-audited, see below) | pending (TV) | pending | attribution only, never adopted |
+
+Baseline match audit (machine, before the TV run): PASS.
+- `git diff d7b5d9d:ZoneEngineV2_Rebuild.pine token_probes/R3B1C_Rebuild_Main_Probe.pine`: exactly 1 changed line
+  (W06Component /23 -> `ZoneEngineV2_W06Component_Worker_NoW07Probe/1`); no other code or pin line differs, so the
+  Main semantic wiring equals the 1,003,009 Main.
+- Probe Main pins: W03F0 /5, W03Apply /4, W03ETimeFvg /3, W06 probe /1 (= W06 /23 equivalent), W07Fvg /10, W08Core /18,
+  W08Touch /7, W08Runtime /17, W03EMsa /7, W09State /22 (the same published versions the 1,003,009 compile used).
+- `git diff d7b5d9d HEAD` on W05 / W06 / W07 / W08Core / W08Touch / W08Runtime / W09State / W03F0 / W03Apply /
+  W03ETimeFvg sources: empty (W03EMsa changed only by D1 / D2 = /8, /9, which the probe does not pin).
+- W06 probe vs W06 /23 source: only the library name and the W05 import line differ.
+- W05 probe vs W05 /6 source: library name, W07 import removed, 4 code call sites `W07Fvg.f` -> `f`, one constant
+  `FVG_INTERVAL_BUILD_INVALID_INPUT = 1` (= W07 value), 3 appended functions byte-identical to W07 /10 apart from
+  `export` (checked by script); the 3 remaining `W07Fvg.` occurrences are comments; ID_NONE / SLOT_INVALID /
+  FVG_INTERVAL_BUILD_OK equal W07's values.
+=> The only difference from the 1,003,009 configuration is the W05 / W06 probe boundary. Baseline 1,003,009 is valid.
+
+Result handling (fixed before the run): CE10216 -> delta = 1,003,009 - Probe; >= 20,000 VERY_HIGH, 10,000-19,999 HIGH,
+3,000-9,999 MEDIUM, < 3,000 LOW. LOW -> import redesign deferred, back to GT-5A. MEDIUM -> compare boundary removal with
+GT-5A. HIGH+ -> import boundary redesign first. PASS -> "< 1,000,000, delta > 3,009, effect >= MEDIUM, exact UNKNOWN";
+no further Probe and not straight back to GT-5A: design audit for removing the W05 -> W07 boundary in Production with
+zero semantic change and a single semantic authority (owner move, worker split, safe inline, dependency direction);
+a permanent copy of the 3 functions is not adopted automatically (double authority). The duplicated W07 functions
+bias the delta downward; the result is not over-read. GT-5A stays APPROVED_DEFERRED.
