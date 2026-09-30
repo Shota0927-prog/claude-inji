@@ -1259,3 +1259,28 @@ Episode Event loop is after the commit gate, so no Event). The release list now 
 Sanity `b8a_det.py` on the Probe sources: 16/16 (P1 + P2 merged into P1; X1 added: an invalid W08 plan freeing a Core
 outside every relation (a) with a persistent BS, (b) with a same-bar Break -> F0 false, mutation 0, no Event); mutant
 "invariant removed" -> X1 fails (killed). Production files unchanged. Probe still one; TV steps unchanged.
+
+### B08-A Token Probe PASS -> Production (W09State /25, W08Runtime /18, Main)
+
+TV: `ZoneEngineV2_W09State_Worker_B08AProbe` /1 + the Probe Main: PASS (exact UNKNOWN). Probe design ADOPTED; further
+Probe 0; token refactor 0.
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| B08AP | Probe libraries (W09State B08AProbe /1 + Probe Main) | B08-A body-inclusive | PASS (exact UNKNOWN) | PASS (exact UNKNOWN) | UNKNOWN | ADOPTED (design) |
+
+Production port (semantics = Probe R2):
+- W09State /25 = the Probe R2 source with only the library name changed (diff: 1 line).
+- Main = the Probe Main with only the pins W09State /25 and W08Runtime /18 (diff: 2 lines).
+- W08Runtime /18: MERGE_STATE_DEFAULT_GUARD 25 -> 11 fields; the removed 14 are exactly the BreakSnapshot fields (valid,
+  coreId, generationId, oldSide, range bottom / top, breakSeq, breakTime, wasGapBreak, movedAway, retestSeen, Root head /
+  tail / count), now reset-only under `if write` (the reset still writes them); no other guard field changed; imports
+  unchanged (W08Core /18, W08Touch /7).
+
+Gates: `b8a_det.py` on the Production sources 16/16; R3-B2 frozen cases replayed on /25 through the new signatures
+15/15 (B07 behaviour unchanged); static: W09State imports 0 / types 6 / `.copy` 0 / exports 47 -> 49 (bsTransferPlan,
+bsTransferApply), no use-before-definition, no foreign UDT, no new import edge; Main pins W09State /25, W08Runtime /18
+(others unchanged); single BS writer = W09State (Main passes references; its legacy `breakSnapshotRootNode*Raw` pool
+helpers stay unreachable); relation-outside free invariant = X1 (F0 false, mutation 0, no Event). random 0, 5k / 50k /
+200k 0, > 5 min 0.
+TV order: W09State /25 publish -> W08Runtime /18 publish -> Production Main compile. CE10216 -> STOP.
