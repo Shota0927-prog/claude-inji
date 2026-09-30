@@ -1284,3 +1284,65 @@ bsTransferApply), no use-before-definition, no foreign UDT, no new import edge; 
 helpers stay unreachable); relation-outside free invariant = X1 (F0 false, mutation 0, no Event). random 0, 5k / 50k /
 200k 0, > 5 min 0.
 TV order: W09State /25 publish -> W08Runtime /18 publish -> Production Main compile. CE10216 -> STOP.
+
+### B08-A TV Gate: PASS -> B08-A COMPLETE; B08 CLOSEOUT
+
+TOKEN END REVIEW (B08-A): Before Production Main PASS; After Production Main PASS (W09State /25, W08Runtime /18
+published); compiled exact UNKNOWN; CE10216 none; Probe 1 (B08-A body-inclusive, PASS), further Probe 0; token refactor
+0; foreign UDT 0; new import edge 0; Main business logic 0 (plumbing only); W08Runtime /18 released only the 14
+BreakSnapshot guard fields (the other deferred fields stay guarded); rule violations 0. No further compression.
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| B08A | W09State /24 -> /25, W08Runtime /17 -> /18, Main | ActiveTouch Local Break + BreakSnapshot transfer | PASS (exact UNKNOWN) | PASS (exact UNKNOWN) | UNKNOWN | COMPLETE; semantics FROZEN (det 16/16, B07 replay 15/15) |
+
+B08: COMPLETE (BreakReferenceRange, ActiveTouch Local Break, same-bar TouchStart -> Break, Break priority,
+BreakSnapshot, BS Root copy, Broken / FlipWait, BS transfer, state / index, Event, atomicity). Open B08 semantics: 0.
+
+## W09 B09: GapBreak - Phase A audit (no code change)
+
+START GATE: `claude/w09-b07-redesign-v2` local = remote = `93506ed` (0 / 0), clean. Pins = the Main PASS configuration:
+W07Interval /1, W07 /11, W05 /7, W06 /24, W08Core /18, W08Touch /7, W08Runtime /18, W03EMsa /9, W09State /25 (+ W03F0 /5,
+W03Apply /4, W03ETimeFvg /3).
+
+Existing structure (source):
+| Item | Where | State |
+|---|---|---|
+| GapBreak geometry | W09State `gapBreakTargetSlots` (index query on the Armed indexes: Support bottomTick >= max(highTick + 1, closeTick + bufTick), Resistance symmetric) and `gapBreakMetExclusive` (per Side: high < bottom strict and close <= bottom - buffer inclusive, Resistance symmetric; false when `normalTouchMetExact` holds) | predicates only; `gapBreakMetExclusive` has no caller |
+| BreakReferenceRange = LastArmedRange | the Armed indexes are keyed by sideLastArmedRangeBottoms / Tops; Stage J writes LastArmedRange = EffectiveRange of the confirmed bar; Stage D runs before this bar's Stage J | = the previous-bar Armed range (canonical) |
+| previous-bar Armed | `d1TargetSlots` = Touch targets U GapBreak targets, kept only when Phase Armed, eligible, armedFromSeq <= currentSeq (a Side armed on this bar excluded), canonical order (coreId, generationId, Support, Resistance) | GapBreak targets are already in the D1 list |
+| normal Touch priority | `touchStartPlanPreflight / Build` take a D1 target only when `normalTouchMetExact`; a GapBreak-only target is dropped | GapBreak has no effect today |
+| B08 authority to reuse | bsWriteRaw / bsRootAppendRaw / bsNodeFreeRaw / bsClearRaw / bsIndexRaw, bsSourceRaw + bsTransferPlan / Apply (Merge selection, Split intersection, release list, relation-outside invariant), Stage J BS priority, post-plan preflight D3 rules, EV loop | available |
+| W08Touch contract | TouchStart plan rows (PI_*) and ei rows (EI_*) are read by W08Touch /7 for projected TouchMarks | GapBreak rows must not enter either (no TouchMark for a GapBreak) |
+
+Derived from the existing canon (not questions):
+- GapBreak targets = D1 targets that are not a normal Touch and satisfy `gapBreakMetExclusive` on LastArmedRange; normal
+  Touch > GapBreak (already exclusive); no TouchCount / WeakDepth / ZoneFresh / SideFresh effect; no TSS / TouchMark.
+- BreakSnapshot (B08 D2 layout, both Sides): coreId / generationId of the Core, oldSide = the gap-broken Side, range =
+  LastArmedRange, breakSeq / breakTime of the bar, wasGapBreak true, movedAway / retestSeen false; Root copy = the Side
+  current Root list (the same previous-confirmed Root source the TouchStart TSS copy uses for this range; there is no TSS
+  on an Armed Side).
+- Phase: gap-broken Side Armed -> Broken (Armed index detach; ArmedFromSeq / LastArmedRange kept, as the B08 Armed
+  opposite), opposite -> FlipWait by the B08 D3 rules (Waiting / Armed detach / Dormant without position / ActiveTouch only
+  when projected ended; Broken / FlipWait or a still-active opposite fail-closed); CurrentTouchNo 0 (already 0 on an Armed
+  Side; opposite 0), Grade Unavailable on both, Upcoming = TouchCount + 1 unchanged; Broken / FlipWait indexes on the BS
+  range.
+- Same-bar topology: the Side is not ActiveTouch (no overlay entry, W08 sees Armed) -> its Core may meet the topology;
+  the projected GapBreak BS enters bsSourceRaw / bsTransferPlan (Merge / Split transfer, Stage J Broken / FlipWait);
+  relation-outside free with a GapBreak -> F0 invariant fail (B08-A rule).
+- Event: EV_GAP_BREAK; D1 is one canonical target list (B05 P3), so EV_TOUCH_START and EV_GAP_BREAK rows are written in
+  that one D1 canonical order, before the Episode Events (WeakDepth / Reset / LocalBreak); range = LastArmedRange;
+  weakReason = the persistent Weak reason (as D7); rootId ID_NONE; time / seq of the bar; coreId / generationId of the Core.
+- Preflight: BS absent on the Core, LastArmedRange valid, opposite D3, Event room +1, BS pool growth (2 x Root count).
+- Flip / Reclaim on the GapBreak bar: not confirmed (Flip / Reclaim = B10 / B11, not implemented; their batch must keep it).
+
+Physical sketch: GapBreak rows in a separate Main-local int scratch (Side slots; not the TouchStart plan / ei, which
+W08Touch reads); W09State: plan in the TouchStart plan pass (targets not touched + gapBreakMetExclusive), preflight in the
+post-plan preflight, bsSourceRaw / bsTransferPlan see the projected GapBreak BS, apply next to the Local Break branch
+(role 0 / 1; role 2 through the transfer); Main: the scratch, EV_GAP_BREAK rows in the D1 Event loop. No new type, import
+or tuple; a few more parameters on existing calls. TOKEN START REVIEW / Probe decision after the design.
+
+Undefined (I27 text not in the repo, no canonical source): the EV_GAP_BREAK row's
+- touchNo: no Touch Episode exists (TouchCount unchanged): SideTouchCount, UpcomingTouchNo (TouchCount + 1) or 0?
+- gradeAtStart: no TouchStartGrade exists: the current Side Grade before the break, GR_UNAVAILABLE, or another value?
+STOP for these two fields.
