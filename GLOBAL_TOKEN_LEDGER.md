@@ -1526,3 +1526,66 @@ carry the Flip mark row) and ei / ef, replacing the previous code-reading-only c
   holds it; SideTouchCount unchanged.
 Result: F12 / F13 2/2 PASS (only the changed cases re-run; the other B10 cases unchanged). Probe 0, random 0, > 5 min 0.
 TV: W09State /27 publish -> W08Runtime /19 publish -> Production Main compile. CE10216 -> STOP.
+
+## W09 B10 AGGRESSIVE TOKEN COMPRESSION: Compression Batch TC-A (TOKEN_REFACTOR_ONLY)
+
+START GATE: branch `claude/w09-b07-redesign-v2`, local = remote = `4357841`, divergence 0 / 0, clean. Backup
+`backup/w09-b10-pre-aggressive-token-cut` (= `4357841`, pushed). Pins before: W03F0 /5, W03Apply /4, W03ETimeFvg /3,
+W06 /24 (-> W05 /7 -> W07Interval /1), W07 /11 (-> W07Interval /1), W08Core /18, W08Touch /7, W08Runtime /19 (-> W08Core /18,
+W08Touch /7), W03EMsa /9, W09State /27.
+
+TOKEN START REVIEW: Main 1,009,747 / 1,000,000 (B10 TV, CE10216); headroom -9,747; RED. Target <= 950,000 (headroom
+>= +50,000), preferred 930,000-950,000. Semantics frozen; physical duplicates only. Probe: NO (the batch removes structure;
+it adds no import / type / signature / forwarding). Main business logic added: NO.
+
+Reachable delta B09 (`0f01df2`) -> B10 (`f862f3e`), cgest E2 (reference only): +3,243 source tokens in total - flipPlan
++1,414, w08ProductionRaw (Main) +495, flipApply +445, bsTransferPlan +437, bsTransferApply +75, touchStartPostPlanPreflight
++74, bsSourceRaw +72, flipBitRaw +71, flipRowRaw +65, touchStartPlanBuild +32, episodePlan +26, Stage J +16, gapBreakApply
++13, episodeApply +10. Call tree: Main w08ProductionRaw -> W09State.flipPlan (-> flipRowRaw, flipBitRaw, breakOppositeOkRaw)
+/ flipApply (-> flipRowRaw, bsClearRaw, bsNodeFreeRaw, bsIndexRaw, phaseMoveRaw) / bsTransferPlan (-> bsSourceRaw) /
+bsTransferApply / touchStartPostPlanPreflight / phaseArmedStageJFinalize; D3 Event loop + markAppend in Main (plumbing).
+Audit A-H over that tree: the whole B10 addition is ~3.2k source tokens, so no rework of the B10 bodies (forwarding, D3
+kernel sharing, BS re-derivation, Event row assembly, S/R bodies, preflight / apply) can reach -60,000; those stay TIER B / C.
+
+Import-edge evidence (measured, not estimated): R3B0 = +113k for one extra library edge to W08Core /18 + W08Touch /5 with no
+W08 function called (types only; the W08 type definitions are ~1.2k source tokens, so the types cannot explain it); Import C
+A (the W05 -> W07 edge replaced, W05 used 3 small W07 helpers) saved far more than those helpers (B08 / B09 then PASSed on top
+of it). Reading: every library that references another library pays a full copy of it. Production today holds that copy twice
+for W08Core /18 and W08Touch /7 (Main -> both, W08Runtime -> both).
+
+| Tier | Candidate | Mechanism | Status |
+|---|---|---|---|
+| A | TC-A: W08Core /18 + W08Touch /7 bodies inside W08Runtime /20; Main imports W08Runtime only | one of the two full W08Core + W08Touch copies removed; W08Core call-0 bodies dropped | IMPLEMENTED |
+| B | W09State call-0 bodies (10 functions, ~1.0k source) | dead library code | DEFERRED (needs W09State /28) |
+| B | W07Interval /1 held by W07 and W05 (1.4k source) | duplicate edge | DEFERRED (W05 / W06 / W07 publishes) |
+| B | W05 `candWindowExitRaw` call-0 (1.2k source) | dead library code | DEFERRED |
+| C | GT-5A (555 params), D3, T1-T3 | forwarding / signatures | DEFERRED (D1 / D2 measured -551 / -611) |
+| C | B10 A-H (forwarding, D3 kernel, Event rows, S/R) | small source share | DEFERRED |
+
+TC-A (W08Runtime /20, Main pins; W08Core /18 and W08Touch /7 stay published, no longer imported by Production):
+- Kept lines are the source lines verbatim (static check: 4,490 code lines identical to the source sequence after the
+  transforms below; the merge is reproducible from `4357841` sources).
+- Transforms: the two imports dropped; `W08Core.` / `W08Touch.` qualifiers dropped in the former W08Runtime code; W08Touch
+  `mergePlanBuild` / `splitPlanBuild` -> `touchMergePlanBuild` / `touchSplitPlanBuild` (W08Core owns the unqualified names);
+  duplicate constants kept once (all 10 duplicates equal in value, asserted); W08Runtime `identityEdgeFollowsRaw` /
+  `physicalNewCompareRaw` removed in favour of the byte-identical W08Core copies.
+- Call-0 bodies dropped (no path from Main through any library): W08Core intervalMove, originRemove, inverseOriginDetach,
+  pendingPoolsOkRaw, pendingChainOkRaw, pendingClearChainRaw, pendingCanClearCore, pendingClearCore, ufFindRaw,
+  pendingNewChildRaw, pendingNewRootRaw, topologyComponentsRaw (the W08Core variant; W08Runtime keeps its own),
+  pendingPlanBuild, changedPlanBuild; W08Touch markPhysicalIndex; W08Runtime planPass, runShadow.
+- Order W08Core -> W08Touch -> W08Runtime (declare-before-use violations 0, duplicate definitions 0, local / global name
+  collisions 0).
+- Main: 3 import lines -> 1 (W08Runtime /20); `W08Core.` / `W08Touch.` -> `W08Runtime.` in code (22 references, all resolve
+  to exports of /20); Main identical otherwise.
+- Static: semantic constants changed 0, comparisons 0, Event / Stage order 0, Root conditions 0; imports Main 10 -> 8,
+  library-to-library edges 4 -> 2 (total edges 15 -> 11); foreign UDT fields 0 new (ShadowContext's W08Core / W08Touch field
+  types are now local); new signatures 0; forwarding added 0; Main business logic added 0.
+- Equivalence (TOKEN_REFACTOR_ONLY, expectations unchanged, TC-A Main + markAppend and the Merge / Split TouchMark plan +
+  commit taken from the merged /20 source): B08 L1 / L5 / L7 / F3, B09 G1 / G9 / G12 / G15, B10 F3 / F4 / F5 / F12 / F13 /
+  F15 / F16: 15/15 PASS (1.6 s); control: the same run against the old W08Touch file fails F12 / F13 (merged source is the one
+  exercised). R3-B1 scratch contract PASS (now read from W08Runtime /20). random 0, 5k / 50k / 200k 0, > 5 min 0.
+- Expectation (not an estimate of the value): the removed copy is the structure R3B0 measured at +113k; exact UNKNOWN until
+  the TV compile.
+
+TV: W08Runtime /20 publish (merged library) -> Production Main compile. W09State /27 unchanged. Record the compiled value
+against 1,009,747. CE10216 or a build error -> STOP.

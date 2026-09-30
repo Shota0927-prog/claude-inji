@@ -6,7 +6,7 @@
 import re, sys, os
 R = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 W9 = sys.argv[1] if len(sys.argv) > 1 else os.path.join(R, 'ZoneEngineV2_W09State_Worker.pine')
-W8 = sys.argv[2] if len(sys.argv) > 2 else os.path.join(R, 'ZoneEngineV2_W08Touch_Worker.pine')
+W8 = sys.argv[2] if len(sys.argv) > 2 else os.path.join(R, 'ZoneEngineV2_W08Runtime_Worker.pine')  # TC-A: W08Touch body lives in W08Runtime /20
 MN = sys.argv[3] if len(sys.argv) > 3 else os.path.join(R, 'ZoneEngineV2_Rebuild.pine')
 def consts(path):
     return {m.group(1): int(m.group(2)) for m in re.finditer(r'^const int ([A-Z0-9_]+)\s*=\s*(-?\d+)', open(path).read(), re.M)}
@@ -50,7 +50,7 @@ for k, a in (('PI_CORE_SLOT', 'PLAN_I_CORE_SLOT'), ('PI_CORE_ID', 'PLAN_I_CORE_I
              ('PF_CONTACT_BOTTOM', 'PLAN_F_CONTACT_BOTTOM'), ('PF_CONTACT_TOP', 'PLAN_F_CONTACT_TOP'), ('PF_CLOSE', 'PLAN_F_CLOSE_AT_TOUCH')):
     eq(k, T[k], A[a])
 # Main TouchStart markAppend wiring (the persistent mark the projection must equal)
-m = re.search(r'W08Touch\.markAppend\((.*)\)\s*$', mns, re.M); ma = args(m.group(1))
+m = re.search(r'W08(?:Touch|Runtime)\.markAppend\((.*)\)\s*$', mns, re.M); ma = args(m.group(1))
 eq('Main plan int stride', re.search(r'int r = %d \* [ix]\b' % T['PI_STRIDE'], mns) is not None, True); eq('Main plan float stride', re.search(r'int f = %d \* [ix]\b' % T['PF_STRIDE'], mns) is not None, True)  # B09: the plan row index is x (D1 order)
 sig = re.search(r'^export markAppend\((.*)\) =>', w8s, re.M).group(1)
 pn = [p.split('=')[0].strip().split()[-1] for p in re.split(r',\s*(?![^<]*>)', sig)]
