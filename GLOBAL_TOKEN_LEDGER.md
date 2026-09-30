@@ -372,3 +372,51 @@ W08Touch /5, W08Runtime /15, W09State /22. W06: GT-4A, GT-4B, GT-4C1, GT-4C2 ADO
 = 344 arguments, semantic change 0. Main: TradingView PASS, exact compiled UNKNOWN (headroom UNKNOWN; status not
 determinable, never assumed GREEN). GT-4D (W03EMsa StageE Ma / Swing / Accum) and later: DEFERRED. Next: W09 B07 R3-B,
 starting with a compiled-cost Probe.
+
+## W09 B07-R3B0: R3-B compiled-cost Probe (rules: ZONEENGINE_COMPILED_TOKEN_RULES.md)
+
+Branch `claude/w09-b07-redesign-v2` fast-forwarded to the global optimization head (`28ebec4`; 0/0, clean, Production bytes
+identical to `claude/global-token-optimization`).
+
+TOKEN START REVIEW: Main compiled PASS / exact UNKNOWN; headroom UNKNOWN; status not determinable (not treated as GREEN);
+R3-B = Merge / Split / State Transfer / atomic transaction -> Probe required YES; Main business logic added NO.
+
+R3-B reachable structure (audit of W09State /22, W08Touch /5, Main `w08ProductionRaw`, C2 transfer path):
+
+| Item | R3-B need | Planned form |
+|---|---|---|
+| New helper | overlay from the Episode rows (FORCE_ACTIVE s / FORCE_INACTIVE -(s+1), ei col 9) replacing the TouchStart-only overlay of `planPassWithActiveTouchOverlay` | W09State `episodeOverlayBuild(ei, out)` (2 params) |
+| New helper | inject the projected marks into the W08-built Merge / Split TouchMark plans (scratch of this bar) | W09State `touchPlanProject(TouchProjectView, tv, ei, ef)` (4 params); `TouchProjectView` = 5 references (W08Store, TouchRing, TouchPlan, SplitTouchPlan, winner exact prices), no copy |
+| Merge path | per relation whose survivor / absorbed old is the Episode Core: winner exact range intersection, per-Side dedupe (time, bottom, top) in source priority, canonical position, shared S/R cap (drop oldest, truncated per dropped Side), A-type weak / max patch of the carried row | inside `touchPlanProject` (R3-B1) |
+| Split path | SPLIT_LOCAL rows of the Episode Core: projected mark appended last (ring logical order), per-Side winner intersection, > cap fails | inside `touchPlanProject` (R3-B1) |
+| Ring eviction | a full source ring loses its oldest row when the projected mark is appended: that row leaves the plans, its Side becomes truncated | inside `touchPlanProject` (R3-B1) |
+| Changed helper | `episodeApply`: rows whose Core was consumed by an applied Merge / Split write no ring row (the plan carries it) and clear their TSS | W09State (R3-B2) |
+| Changed wiring | Main TouchStart `markAppend` loop must skip consumed Cores | move the loop into W09State (`touchStartMarkApply`), Main keeps the event rows only (R3-B2) |
+| C2 transfer | `freshTransferPlan` / `touchHistoryTransferPlan` already read the projected values (R3-A accessor) | unchanged |
+| Added calls in Main | overlay build, projection, one view construction | 3 calls; the ring view hoisted once (R3-B2) |
+| Added scratch | overlay list (<= 2 x Episode rows ints) | Main-local array; plan scratch reused (no new plan arrays) |
+| Event wiring | EV_WEAK_DEPTH / EV_TOUCH_RESET unchanged | unchanged |
+
+High-cost checklist: huge UDT `.copy` NO; huge tuple NO; mass array passing NO (one 5-reference view); huge export signature NO
+(2 / 4 params); mass argument forwarding NO; projected state copy NO (ei / ef / plan rows referenced); duplicate plan build NO
+(the W08 plans are patched, never rebuilt); Support / Resistance duplication NO (Side index); Main business logic NO.
+Merge / Split rule duplication: RISK, decision at R3-B1 -> (A) export the W08Touch compare / rules (W08Touch /6 forces
+W08Runtime /16, same TouchPlan type) or (C) a minimal incremental copy in W09State (compare ~12 lines, dedupe / range / cap
+~15 lines). Not needed for the Probe.
+
+Probe (W09State /23, Main W09State /22 -> /23): the R3-B boundaries reachable at their final call position (after the W08
+plan, before the preflights) with a read-only body: `episodeOverlayBuild` (real overlay encoding, writes only the Main-local
+`ov`, not passed to W08 yet) and `touchPlanProject` (locates, per Episode row, the Merge relations with the Core as survivor
+/ absorbed and a target winner on the Side, the Split rows of the Core, the B plan row / A ring row of the mark; reads the
+plan counts, exact ranges, ring; writes nothing; returns a count). Main: `tsOk := tsOk and overlay >= 0 and project >= 0`
+(both >= 0 by construction, so tsOk and every later step are unchanged). Existing W09State code: 0 lines changed (+74 lines,
+2 imports of the pinned W08Core /18 and W08Touch /5 for types only). Not in the Probe: the injection writes (R3-B1 body).
+
+Probe check `r3b0_det.py` (fixed-seed deterministic fixtures, 0.14 s): well-formed worlds, malformed / stale sizes (relation
+count above the rows, short absorbed / plan / split / planInts / ring / prices, negative offset, short ef), no Episode row,
+overlay encoding: 10/10 (no failure, result >= 0, inputs unchanged, only `out` written). Source proxy (reference only):
+W09State 23,167 -> 24,000, Main 79,570 -> 79,637.
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| R3B0 | W09State /22 -> /23 (Main W09State /23) | R3-B boundary Probe (read-only) | <1,000,000 (exact UNKNOWN) | pending (TV) | UNKNOWN | TV pending; CE10216 -> no R3-B implementation (compact the structure or GT-4D); PASS -> R3-B1 |
