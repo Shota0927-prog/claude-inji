@@ -419,4 +419,31 @@ W09State 23,167 -> 24,000, Main 79,570 -> 79,637.
 
 | ID | Module | Change | Before | After | Delta | Status |
 |---|---|---|---|---|---|---|
-| R3B0 | W09State /22 -> /23 (Main W09State /23) | R3-B boundary Probe (read-only) | <1,000,000 (exact UNKNOWN) | pending (TV) | UNKNOWN | TV pending; CE10216 -> no R3-B implementation (compact the structure or GT-4D); PASS -> R3-B1 |
+| R3B0 | W09State /22 -> /23 (Main W09State /23) | R3-B boundary Probe (read-only) | <1,000,000 (W06 /23 + W09State /22 PASS, exact UNKNOWN) | 1,113,110 (CE10216) | >= +113,111 | REJECTED (HIGH_COST_STRUCTURE); architecture not adopted |
+
+### R3B0 result and attribution
+
+TradingView: Main with W09State /23 + the Probe calls = 1,113,110 / 1,000,000 (CE10216), over by 113,110; the previous
+baseline (W06 /23, W09State /22) PASSed, so the R3B0 increase is >= +113,111. Decision: R3-B0 architecture REJECTED; R3-B
+implementation forbidden; not to be offset by Global Optimization (the structure is rebuilt instead, semantics kept).
+FAIL class: HIGH_COST_STRUCTURE (most likely cross-library import / type reachability: W09State importing W08Core /18 and
+W08Touch /5 and holding their store / ring / plan types in a view; not yet confirmed).
+
+Production restored to the baseline (W09State /22, W06 /23; the bytes of `28ebec4`, Main PASS). W09State /23 is kept as the
+failed Probe version (`token_probes/R3B0_W09State_Worker_v23_REJECTED.pine`, Main `token_probes/R3B0_Rebuild_Main_REJECTED.pine`);
+/23 is never overwritten or reused; the next Production W09State takes the next unused version when a change is needed.
+
+Attribution (one compile, no new version): R3B0_P1 = the baseline Main with the W09State import at /23 (the three Probe
+lines removed; `token_probes/R3B0_P1_Rebuild_Main.pine`). CASE A about 1.11M -> W09State /23 itself (cross-library import /
+type dependency) is the cause; CASE B much lower -> the reachable Probe call path; CASE C PASS -> the W08 dependency becomes
+reachable only when called. Whatever the case, the R3-B0 architecture is not adopted.
+
+Next architecture (design after P1): W09State imports no W08 library and holds no W08 type; it only emits the compact Episode
+delta in the flat scratch (ei / ef). The Merge / Split TouchMark rules (range intersection, dedupe, canonical order,
+capacity, truncation) stay in W08Touch (authority, option A): projected mark injection is a W08Touch helper taking primitive
+scalars / arrays and existing W08-owned objects only (no W09State type, no import of W09State, no view, no plan / ring
+copy). `episodeOverlayBuild` may stay in W09State (ei only, no W08 import).
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| R3B0_P1 | Main only (W09State /23 import kept, Probe calls removed) | attribution compile | 1,113,110 (R3B0) | pending (TV) | - | classification only, never adopted |
