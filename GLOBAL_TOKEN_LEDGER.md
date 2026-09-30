@@ -641,4 +641,20 @@ as one W08Touch cleanup). D2 / D3 not started.
 
 | ID | Module | Change | Before | After | Delta | Status |
 |---|---|---|---|---|---|---|
-| D1 | W03EMsa /7 -> /8 (Main pin) | inline `w03StageEMaRaw` | 1,003,009 (CE10216) | pending (TV) | pending | CE10216 with a number -> Delta = 1,003,009 - After (exact); PASS -> After < 1,000,000, Delta > 3,009 (no estimate) |
+| D1 | W03EMsa /7 -> /8 (Main pin) | inline `w03StageEMaRaw` | 1,003,009 (CE10216) | 1,002,458 (CE10216) | -551 | LOW; ADOPTED (semantic risk LOW, change 0; 51-param signature, 51 forwarded args and one tuple removed) |
+
+Status after D1: Main 1,002,458 / 1,000,000, headroom -2,458, RED (R3-B2 and new semantic Batches forbidden; TOKEN_REFACTOR_ONLY
+continues). First exact measurement of a single-call inline: 51 parameters + 51 arguments + a 2-value tuple = -551 compiled.
+
+### D2 pre-implementation re-audit on W03EMsa /8: CHANGED -> not implemented (STOP)
+
+`w03StageESwingRaw` (74 params, 1 call site, 72 identity arguments + the two journal counters, 29 locals, 4-value return
+`[journalCountNow, journalInvariantViolationNow, out15m, out1h]` -> caller `[swingJournalCount, swingViolation, swing15mOut,
+swing1hOut]`, journal / Stage E order unchanged). New since the /7 audit: two more locals collide at the call site,
+`usable` and `stopped`. D1 put the MA block's top-level locals (`usable`, `stopped`, `k`) into `run`'s top-level scope, and
+the Swing body declares its own top-level `bool usable` / `bool stopped` (Swing: `stopped = not cfgUseSwing`); inlined as is
+they would be re-declared in the same scope. Proposed resolution (needs approval): rename the Swing block's two locals
+(e.g. `swingUsable`, `swingStopped`; declaration points and lifetimes unchanged), and map its outputs by renaming `out15m` /
+`out1h` to the caller's `swing15mOut` / `swing1hOut` (their two declarations become the caller's; the journal pair works as
+in D1). Every other shared name (`lookupViolation`, `newRow`, `originKey`, `pendingRow`, `pointTick`, `rootSlot`, `subtype`)
+lives in sibling nested blocks (no overlap).
