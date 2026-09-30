@@ -1388,3 +1388,73 @@ static: W09State imports 0 / types 6 / `.copy` 0 / exports 49 -> 50 (gapBreakApp
 written only through breakCommitRaw / bsTransferApply. random 0, 5k / 50k / 200k 0, > 5 min 0. Harness fixture errors on
 the first run (R1 opposite range that Resets) and a harness constant gap (GR_) were fixed in the harness only.
 TV: W09State /26 publish -> Production Main compile. CE10216 -> STOP.
+
+### B09 TV Gate: PASS -> B09 COMPLETE; B09 CLOSEOUT
+
+TOKEN END REVIEW (B09): Before Production Main PASS; After Production Main PASS (W09State /26 published); compiled exact
+UNKNOWN; CE10216 none; Probe 0; token refactor 0; new UDT 0; new import 0; foreign type 0; Main business logic 0;
+W09State /25 -> /26; W08Runtime /18 kept; rule violations 0. No further compression.
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| B09 | W09State /25 -> /26, Main | GapBreak (+ B08 reuse-audit fixes R1 / R2) | PASS (exact UNKNOWN) | PASS (exact UNKNOWN) | UNKNOWN | COMPLETE; FROZEN (det 16/16, B08 16/16, R3-B2 15/15, contract PASS) |
+
+B09: COMPLETE, FROZEN. Open B09 semantics: 0.
+
+## W09 B10: Flip / FlipAttempt - Phase A audit (no code change)
+
+START GATE: `claude/w09-b07-redesign-v2` local = remote = `0f01df2` (0 / 0), clean. Pins = the Main PASS configuration
+(W09State /26, W08Runtime /18, W08Core /18, W08Touch /7, W07Interval /1, W07 /11, W05 /7, W06 /24, W03EMsa /9, W03F0 /5,
+W03Apply /4, W03ETimeFvg /3).
+
+Existing structure (source):
+| Item | State |
+|---|---|
+| BreakSnapshot reader / storage | W09State PhaseArmedTransferView (B08-A): valid, coreId, gen, oldSide, range, breakSeq / breakTime, wasGapBreak, movedAway, retestSeen, Root list; B08 / B09 writers |
+| movedAway / retestSeen | written false at a Break (breakCommitRaw); copied whole by the BS transfer; no other writer / reader |
+| sideFlipAttemptCounts / sideLastFlipConfirmSeqs | W08Core storage; no writer; still in the W08 MERGE_STATE_DEFAULT_GUARD (an absorbed Core with a non-default value fails the W08 F0) |
+| Broken / FlipWait PhaseSet and price indexes | maintained by B08 (keys = BS range; Stage J BS priority) |
+| EV_FLIP_ATTEMPT 6 / EV_FLIP_CONFIRM 7 / EV_RECLAIM 8 | Main constants and names only |
+| Reclaim predicate | none in the repo (B11) |
+| Stage order | the repo names Stage C, D1-D3, E, F / G, H (topology), J; no Flip stage and no I8 stage list in the repo |
+
+Derived from the given canon and the source (not questions):
+- Price authority = the BS range only (never EffectiveRange / EMA / re-clustered range); ticks for comparisons.
+- movedAway (Support Break): confirmed close <= bsBottom - touchResetDistance (inclusive); Resistance: close >= bsTop +
+  touchResetDistance.
+- Retest (Support Break, from below): the bar reaches the BS range inclusively (highTick >= bsBottomTick); Resistance
+  symmetric (lowTick <= bsTopTick). A retest counts only on a bar after the movedAway bar (movedAway is a close fact;
+  the intrabar order is never guessed).
+- FlipConfirm (Support Break): on a retest bar, close <= bsBottom -> Resistance FlipConfirm (the retest precedes the
+  close within the bar); Resistance Break symmetric (close >= bsTop -> Support FlipConfirm).
+- Same-bar suppression: only a BS confirmed on an earlier bar is evaluated (breakSeq < currentSeq), so no Flip fact on
+  the GapBreak bar (as fixed) and, since a retest needs a bar after the movedAway close, none on the Local Break bar
+  either (derived from "close-only facts + no intrabar order").
+- FlipAttempt / FlipConfirm are not normal Touches: no TouchCount / Weak / ZoneFresh / SideFresh / Grade effect; the
+  FlipWait Side becomes Waiting at FlipConfirm (not Armed on that bar: "another confirmed bar", so Stage J must not arm a
+  Side flipped on this bar; arming from the next bar through the normal Waiting -> Armed rule); no TouchStart on the
+  FlipConfirm bar (the Side is not Armed).
+- New Side history: the Side slot's own persistent TouchCount / Weak history is kept (a never-used Side has TouchCount 0);
+  no reset at Flip.
+- sideLastFlipConfirmSeqs = currentSeq at FlipConfirm (on the flipped Side).
+- Event rows (EV_FLIP_ATTEMPT / EV_FLIP_CONFIRM): non-Touch facts -> touchNo 0, gradeAtStart GR_UNAVAILABLE (B09
+  rule); range = the BS range; rootId ID_NONE; time / seq of the bar; Core / Generation ID of the Core; side = the new
+  role Side (the FlipWait Side); weakReason = that Side's persistent Weak reason.
+- Reuse: BS storage / Root pool / Merge-Split transfer / Stage J BS priority / Broken-FlipWait indexes (retest
+  candidates from the FlipWait / Broken index on the BS keys) / relation-outside invariant / atomic plan -> preflight ->
+  commit (a projected Flip state enters the BS transfer as B08 / B09 did).
+
+Undefined (the I27 / I8 text is not in the repo; STOP):
+- Q1 Reclaim predicate: a FlipAttempt requires "not a Reclaim"; the Reclaim condition (B11) is not in the repo, so the
+  Attempt / Reclaim boundary on a retest bar cannot be written.
+- Q2 movedAway on the Break bar: may the Break bar's own close set movedAway (close <= bsBottom - resetDistance on the
+  Local / Gap Break bar), or only a later bar?
+- Q3 Repeated retests: after a FlipAttempt, does another Attempt need a new movedAway, or is every later retest bar an
+  Attempt? Meaning and writer of retestSeen (set at the first retest, reset when?).
+- Q4 FlipAttemptCount: which Side slot holds it (FlipWait / Broken / both), reset timing (Break, FlipConfirm), and its
+  Merge / Split transfer (with the selected BS row?); sideLastFlipConfirmSeqs transfer. Both are still W08-guarded: once
+  written, an absorbed Core with a non-default value fails the W08 F0 unless their transfer is defined.
+- Q5 After FlipConfirm: the old (Broken) Side's Phase, and the BreakSnapshot cleanup (both copies cleared at
+  FlipConfirm, or kept for B11 Reclaim; Broken / FlipWait index removal).
+- Q6 Stage position of the Flip facts in the bar and their Event order against the D1 (TouchStart / GapBreak) and
+  Episode (WeakDepth / Reset / LocalBreak) Events.
