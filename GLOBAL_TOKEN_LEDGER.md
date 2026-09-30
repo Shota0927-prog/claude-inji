@@ -1242,3 +1242,20 @@ fail-closed (would block every W08 plan that retires a Broken Core).
 TV: publish `ZoneEngineV2_W09State_Worker_B08AProbe` /1 (the Probe file), then compile the Probe Main once.
 Reading: PASS -> B08-A Production with this design (W09State /25, W08Runtime /18, Main), no further Probe;
 CE10216 -> record the number, STOP.
+
+### B08-A pre-Probe semantic correction (R2 of the Probe source; still the one Probe)
+
+User decision: W08 frees a Core only as an applied Merge relation's explicit absorbed Core (no-successor / degree 0 /
+gap > M keep it retained; a continuation is never freed). A Core freed outside every Merge / Split relation is therefore
+unreachable in B08-A and is NOT a normal cleanup: with a valid BS or a same-bar Local Break it is an INVARIANT FAIL ->
+F0 fail-closed, persistent mutation 0 (no BS drop, no BS Root pool change, no Event, no EV_LOCAL_BREAK without its BS).
+Core-lifecycle cleanup (generation end, storage prune) belongs to W10 and its canonical text. The earlier choices
+(a) "release the BS with the Core" and (b) "Event without BS" are withdrawn.
+Correction confirmed: the W08 guard holds 14 BreakSnapshot fields; W08Runtime /18 releases exactly those 14.
+
+Probe source change (`token_probes/B08A_W09State_Worker_Probe.pine`, bsTransferPlan): a freed Core that is not a Merge /
+Split source and holds a persistent BS or a same-bar Local Break (bsSourceRaw != -2 on either Side) fails the plan (the
+Episode Event loop is after the commit gate, so no Event). The release list now covers Merge / Split sources only.
+Sanity `b8a_det.py` on the Probe sources: 16/16 (P1 + P2 merged into P1; X1 added: an invalid W08 plan freeing a Core
+outside every relation (a) with a persistent BS, (b) with a same-bar Break -> F0 false, mutation 0, no Event); mutant
+"invariant removed" -> X1 fails (killed). Production files unchanged. Probe still one; TV steps unchanged.
