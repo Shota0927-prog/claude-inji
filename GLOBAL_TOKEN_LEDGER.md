@@ -326,5 +326,39 @@ GT-4C2 (`compExternalLinksRaw`) judged only after a TV PASS of GT-4C1.
 
 | ID | Module | Change | Before | After | Delta | Effect | Semantic change | Test | Status |
 |---|---|---|---|---|---|---|---|---|---|
-| GT-4C1 | W06Comp /21 -> /22 (Main W06 /22) | inline `compExpandFixedPointRaw` into its single call site | <1,000,000 | pending (TV) | UNKNOWN (Before exact unknown) | - | 0 | det 15/15, mutants 3/3 non-equivalent killed, static PASS | IMPLEMENTED, TV pending |
-| GT-4C2 | W06Comp | inline `compExternalLinksRaw` | - | - | - | - | - | audited (GT-4C) | DEFERRED until GT-4C1 PASS |
+| GT-4C1 | W06Comp /21 -> /22 (Main W06 /22) | inline `compExpandFixedPointRaw` into its single call site (56-parameter signature removed, 56 forwarded arguments removed) | <1,000,000 | <1,000,000 (Main PASS) | UNKNOWN | - | UNCHANGED | det 15/15, mutants 3/3 non-equivalent killed, static PASS | ADOPTED |
+| GT-4C2 | W06Comp /22 -> /23 (Main W06 /23) | inline `compExternalLinksRaw` into its single call site (55-parameter signature removed, 55 forwarded arguments removed) | <1,000,000 | pending (TV) | UNKNOWN (Before exact unknown) | - | 0 | det 15/15, mutants 4/4 killed, static PASS | IMPLEMENTED, TV pending (nest 19 levels: compile is the first gate; on a nesting / scope error revert GT-4C2 only, keep GT-4C1) |
+
+Baseline after GT-4C1: W05Cand /6, W06Comp /22, W03Apply /4, W03F0 /5, W03ETimeFvg /3, W03EMsa /7, W07Fvg /10, W08Core /18,
+W08Touch /5, W08Runtime /15, W09State /22; Main PASS (<1,000,000, exact unknown). R3-A FROZEN, R3-B not started.
+
+### GT-4C2: inline `compExternalLinksRaw` (W06 /23, Main W06 /22 -> /23)
+
+Pre-implementation re-check on /22: 1 call site (inside the GT-4C1 block of `buildComponents`), no other reference, 55 : 55
+1:1 (53 `buildComponents` parameters + the block local `currentSlot` identity, `visitEpoch` <- `workEpoch`: 9 occurrences,
+hazard: `buildComponents` has its own `visitEpoch` parameter); `currentSlot` / `workEpoch` never written in the body;
+collisions visible at the call site: `failed`, `rootCount`, `currentMask`, `currentIsPc`, `currentIsFc` (as audited);
+non-visible sibling names `c`, `currentCategory`, `t` unchanged; nest after inline 76 spaces = 19 levels (as audited). No new
+issue.
+
+- Body (280 lines) moved verbatim (+24 indent) with whole-word code-only substitutions: `visitEpoch` -> `workEpoch` 9,
+  `failed` -> `eFailed` 17, `rootCount` -> `eRootCount` 6, `currentMask` -> `eCurrentMask` 3, `currentIsPc` ->
+  `eCurrentIsPc` 4, `currentIsFc` -> `eCurrentIsFc` 3 (declaration points / initialisation unchanged). Result:
+  `[extAdded, extFailed] = ...`, `addedTotal += extAdded`, `xFailed := extFailed` -> `addedTotal += addedCount`,
+  `xFailed := eFailed` (same order).
+- Static: `compExternalLinksRaw` code references 0; calls `compSideMaskRaw` 20 -> 20, `compPointRangeScanRaw` 4 -> 4,
+  `compFvgLinkRaw` 2 -> 2; `array.push` 158 -> 158, `array.set` 107 -> 107, `array.new` 44 -> 44, copy / from / map.new
+  6 -> 6, `var` 0, tuple unpacks 6 -> 5, types 0, functions 16 -> 15; diff = the deleted helper (306 lines incl. comment) and
+  the replaced call (3 -> 308 lines); the moved body reversed through the mapping equals the old body (280 lines); inside it
+  no raw `visitEpoch`, no caller `failed` / `xFailed` / `rootCount` / `currentMask` / `currentIsPc` / `currentIsFc`, no write
+  to `workEpoch` / `currentSlot`. File max nest 48 -> 76 spaces (12 -> 19 levels).
+- Test `gt4c2_det.py`: the /22 GT-4C1 block with the real old `compExternalLinksRaw` vs the /23 block, extracted from the
+  files, same `buildComponents` environment; stubs: side mask, point range scan, FVG link (recording). World fixtures with
+  accum pairs (L4), origin buckets (L5), participation chains (L6), live Core ranges (L7), PendingTopology children / Root
+  nodes (L8). Cases: normal, no external link, accum pair, multiple link kinds, Support-only / Resistance-only masks,
+  Resistance-side participation with an FVG member, L7 only, FC start with a Broad member never added, mask 0 / mask
+  differences, already visited, append order across L4 / L5 / L6 / L8, multi-round chain over two Cores and a pair,
+  corruption (bucket / edge count / child count), visitEpoch 4 vs workEpoch 9 on every link kind, failure after additions
+  with a stale PendingTopology root id: 15/15, 0.35 s. Mutants 4/4 killed (raw `visitEpoch` in the pair check, raw
+  `visitEpoch` in the edge-pool stamp, bucket corruption writing the caller `failed`, dropped result `failed`).
+- Removed: signature 55 parameters, forwarding 55 arguments. Source proxy (reference only): W06 29,071 -> 28,619 (-452).
