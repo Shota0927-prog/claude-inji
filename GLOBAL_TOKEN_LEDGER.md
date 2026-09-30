@@ -1120,3 +1120,65 @@ reference (a view or the existing TouchStartPlanView extended), EV_LOCAL_BREAK r
 whether W08Runtime changes. Token: Main status UNKNOWN (PASS only) and B08-A adds a state writer with a new view ->
 TOKEN START REVIEW with Probe YES (the view / pool wiring and the Break body together, INC-2) before the full batch.
 STOP.
+
+### B08 decisions D1-D7 (fixed by the user; B08-A = ActiveTouch Local Break)
+
+- D1 same-bar TouchStart -> Local Break: YES (TouchStart counted: TouchCount +1, CurrentTouchNo, TSS / TouchMark / Fresh,
+  EV_TOUCH_START; then the Break on the same close, EV_LOCAL_BREAK). No WeakDepth Event on a Break bar; Break > Reset.
+- D2 BreakSnapshot: the same logical snapshot stored on both Side slots (Broken old Side, FlipWait opposite Side), two
+  physical copies each owned by its Side: coreId, generationId, oldSide (= the broken Side, never rewritten on the
+  opposite copy), range = TSS range (never the live range), breakSeq, breakTime, wasGapBreak false, movedAway false,
+  retestSeen false, Root list = copy of the TSS Root list (never rebuilt from the current Root list).
+- D3 opposite Side -> FlipWait: from Waiting; Armed (Armed index detach); Dormant (Dormant / index detach); ActiveTouch
+  only when its Episode is projected ended on the same bar (else fail-closed); already Broken / FlipWait: fail-closed
+  (no silent BS overwrite).
+- D4 indexes synchronized in the same transaction: ActiveTouch / Armed / Dormant detach, Broken / FlipWait PhaseSet
+  attach, Broken / FlipWait price-order index membership on the fixed BS thresholds. MovedAway / Retest / FlipAttempt /
+  FlipConfirm / Reclaim predicates: B10 / B11.
+- D5-a the Break Episode ends: overlay FORCE_INACTIVE, same-bar PendingTopology allowed (as the B07 Reset).
+- D5-b no W08 Pending for Broken / FlipWait / BS valid; BreakSnapshot transfer (I27-15): continuation keeps the BS;
+  Merge keeps the unresolved BS, several sources -> newest breakSeq -> breakTime -> canonical Core order; Split -> the
+  child whose Side EffectiveRange relates to the BS fixed range (no copy to unrelated children); Phase / Grade / Armed
+  after the BS transfer; no silent drop.
+- D5 order: BS create -> BS Root copy -> projected Broken / FlipWait -> topology plan -> BS transfer -> Phase / index
+  finalization -> TSS cleanup -> commit; persistent mutation 0 until all F0; no partial commit.
+- D6 broken and opposite Side CurrentTouchNo 0; TouchCount, WeakByTouch, past WeakByDepth, MaxDepth, Fresh kept;
+  Upcoming = TouchCount + 1 (derived, not used for a Touch while Broken / FlipWait); Grade Unavailable for Broken and
+  FlipWait; TouchStartGrade unchanged.
+- D7 EV_LOCAL_BREAK: time / seq of the bar, TSS coreId / generationId, side = old Side, range = BS range, touchNo = the
+  Episode's fixed TouchNo, gradeAtStart = TSS grade, weakReason = the persistent Weak reason before the bar (the
+  suppressed WeakDepth candidate excluded), rootId ID_NONE. Order: existing ActiveTouch -> EV_LOCAL_BREAK only;
+  same-bar TouchStart -> EV_TOUCH_START then EV_LOCAL_BREAK; no WeakDepth / TouchReset Event with a Break; canonical
+  (coreId, generationId, Support, Resistance).
+- BS cleanup: TSS never cleared before the BS copy; with same-bar topology after the BS transfer, else after the BS
+  commit; the BS is kept until Flip / Reclaim (no new clear condition in B08).
+
+### B08-A physical design audit
+
+Placement (no new import, no foreign type; W09State owns the semantics, W08 / Main plumbing only):
+| Step | Where | Form |
+|---|---|---|
+| Break fact | W09State `episodePlan` | flag 1 (breakWouldMet on the TSS / plan range) becomes the Local Break; Break => no Reset flag (Break > Reset), override FORCE_INACTIVE (D5-a) |
+| overlay | W09State `episodeOverlayBuild` | unchanged code (col 9 = 2 for a Break Episode) |
+| opposite / preconditions | W09State post-plan preflight | D3 checks (projected-ended opposite Episode), BS pool growth, Event room (+1 per Break), Broken / Flip index insert proof |
+| BS transfer plan | W09State, next to the C2 history plan | per applied Merge / Split destination Side: selected source BS (D5-b); scratch rows (stride fixed) |
+| index release | W09State, pre-commit (next to phaseArmedIndexRelease) | Broken / FlipWait index removal of every continuation old / freed source Side (W08 reset clears positions only) |
+| W08 guard | W08Runtime | MERGE_STATE_DEFAULT_GUARD must release the 15 BreakSnapshot fields (absorbed BS is transferred, like the C2 Touch history release in /13) -> W08Runtime /18 (edges unchanged, no new type) |
+| BS / Phase apply | W09State, after commit | Local Break apply (BS on both Sides + Root copy into the BS pool, Broken / FlipWait through the PhaseSet, indexes, CurrentTouchNo 0, Grade Unavailable, TSS clear after the copy), BS transfer apply, destination Phase from the transferred BS before Stage J |
+| Event | Main Episode Event loop | EV_LOCAL_BREAK rows from ei (flag), after EV_TOUCH_START |
+| storage refs | Main | the 15 sideBreakSnapshot* arrays, the BS Root pool (8), the Broken / Flip order arrays (4) and positions (4) added to the existing W09State views (TouchStartPlanView 80 refs, PhaseArmedTransferView 69 refs) at their one construction site; no new UDT |
+
+TOKEN START REVIEW (B08-A): Main PASS, exact UNKNOWN, headroom UNKNOWN, status UNKNOWN. Added: Local Break writer, BS
+Root copy, BS transfer plan / apply, Broken / Flip index maintenance, EV_LOCAL_BREAK, W08 guard release. High-cost
+candidates: ~31 more array references into the two existing W09-owned views (one construction site each; no foreign
+type, no import, no tuple, no `.copy`); W08Runtime /18 (guard only). Probe: YES, one body-inclusive Probe (the view
+growth plus the BS copy / transfer bodies reachable), per the rule "large array forwarding -> Probe once". Main business
+logic: NO (Event rows from ei only).
+
+Blocking gap (not in the repo; only "I27-15 §10 / §12" references): the Split rule "child Side EffectiveRange vs BS
+fixed range" (intersection, containment, nearest, tie rule, several related children) and the destination Phase rule
+after a BS transfer (Broken when the Side = BS oldSide, else FlipWait? versus the Stage J Waiting baseline, and a
+destination that also receives an Armed / Waiting source). Without that text the BS transfer cannot be written without
+guessing -> STOP before implementation. Minor: the Dormant index has no key array and no Dormant writer exists
+(unreachable today): proposal, Dormant opposite -> PhaseSet detach, fail-closed if it holds a Dormant index position;
+Broken / FlipWait index keys = the Side's BS range bottom / top.
