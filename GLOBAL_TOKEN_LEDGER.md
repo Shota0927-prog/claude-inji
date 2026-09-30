@@ -32,14 +32,16 @@ source through small helpers returns little. Candidates are ranked by structure,
 ## Pending probes (Phase B: compiled cost attribution; publish 0, Main compile only; cumulative)
 
 Start: the baseline Main (`41e0440`: W03F0 /4, W03Apply /3, W03ETimeFvg /2, W06 /19, W07 /10, W08Core /18, W08Touch /5,
-W08Runtime /15, W03EMsa /7, W09State /21), 1,005,307. Each step keeps the previous step's change.
+W08Runtime /15, W03EMsa /7, W09State /21), 1,005,307. G1 -> G3 are cumulative; M1 is applied to the baseline alone (so a PASS
+alone proves a W06 + W05 share > 5,307).
 
 | ID | Probe | Change (on the previous step) | Before | After | Delta | Effect | Semantic change | Test | Adopt / Revert |
 |---|---|---|---|---|---|---|---|---|---|
-| G1 | W03Apply /3 -> /4 | import line 4 | 1,005,307 | pending | baseline - G1 | pending | 0 (published, verified) | det 147 + 1k smoke (earlier) | pending |
-| G2 | W03F0 /4 -> /5 | import line 3 | G1 | pending | G1 - G2 | pending | 0 (published, verified) | det 28 + 5k (earlier) | pending |
-| G3 | W03ETimeFvg /2 -> /3 | import line 5 | G2 | pending | G2 - G3 | pending | 0 (published, verified) | det 13 + 5k (earlier) | pending |
-| M1 | W06Comp + W05Cand unreachable (dynamic stubs, attribution only) | 3 calls -> 2 local stubs of `bar_index` | G3 | pending | G3 - M1 = W06 + W05 share | module share | probe only | none | never adopted |
+| G1 | W03Apply /3 -> /4 | import line 4 | 1,005,307 | 1,003,537 | -1,770 | LOW | 0 (published, verified) | det 147 + 1k smoke (earlier) | adopt candidate (bundle) |
+| G2 | W03F0 /4 -> /5 | import line 3 | 1,003,537 | 1,001,007 | -2,530 | MEDIUM | 0 (published, verified) | det 28 + 5k (earlier) | adopt candidate (bundle) |
+| G3 | W03ETimeFvg /2 -> /3 | import line 5 | 1,001,007 | <1,000,000 (PASS, exact value not shown) | <= -1,008 (lower bound) | LOW or more | 0 (published, verified) | det 13 + 5k (earlier) | adopt candidate (bundle) |
+| G-bundle | G1 + G2 + G3 | - | 1,005,307 | <1,000,000 | <= -5,308 (lower bound) | HIGH | 0 | - | adopt candidate; integrated after M1 |
+| M1 | W06Comp + W05Cand unreachable (dynamic stubs, attribution only), on the baseline alone (W03 /3 /4 /2) | 3 calls -> 2 local stubs of `bar_index` | 1,005,307 | pending | exact if CE10216 shows a number; PASS -> > 5,307 (HIGH) | module share | probe only | none | never adopted |
 | M1-const | constant-tuple stubs | - | - | - | - | REJECTED_PROBE_DESIGN | - | - | - |
 | S1 | synthetic 100-parameter function | - | - | - | - | DEFERRED | - | - | - |
 
@@ -50,7 +52,7 @@ recorded as it is; once a step PASSes without a number, that step and every late
 invented).
 
 M1 dynamic stubs: `m1Stub3(int x) => [x, x + 1, x % 2]` and `m1Stub38(int x)` (int fields x + k, bool fields x % k == 0), both
-called with `bar_index`. Reachability audit (cgest reachable graph, G3 vs G3 + M1): unreachable W06Comp 19 functions (30,942
+called with `bar_index`. Reachability audit (cgest reachable graph, baseline vs baseline + M1, same result on G3): unreachable W06Comp 19 functions (30,942
 source), W05Cand 27 functions (23,574), W07Fvg `fvgIntervalOrderBuild` 1 function (623; called only by W05Cand); no Main
 function and nothing else lost; W06 / W05 still reachable: none; new: the two stubs.
 
