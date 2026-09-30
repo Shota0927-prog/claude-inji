@@ -1458,3 +1458,56 @@ Undefined (the I27 / I8 text is not in the repo; STOP):
   FlipConfirm, or kept for B11 Reclaim; Broken / FlipWait index removal).
 - Q6 Stage position of the Flip facts in the bar and their Event order against the D1 (TouchStart / GapBreak) and
   Episode (WeakDepth / Reset / LocalBreak) Events.
+
+### B10 Flip / FlipAttempt: Q1-Q6 fixed (user) and implementation (W09State /27, W08Runtime /19, Main)
+
+Fixed (user, no further questions): Q1 wouldReclaim fact only (Support-break: close >= top + breakBuffer; Resistance:
+close <= bottom - breakBuffer; suppresses the Attempt; Reclaim Event / Phase / BS cleanup = B11); Q2 movedAway also on the
+Break bar's own close (Support close <= bottom - resetDistance, Resistance symmetric) but a retest only for a BS already
+movedAway at the bar start; Q3 retestSeen = distinct contact latch (first contact bar: Confirm / Reclaim / else one
+Attempt; no Attempt on continuous contact; a full exit to the break side clears it; no new movedAway needed);
+Q4 flipAttemptCount on the FlipWait Side, per BS transition (new BS 0, Attempt +1, Merge = the selected source row,
+Split = copied to every child taking the BS, Confirm / Reclaim / new generation 0), lastFlipConfirmSeq on the new Side
+(Merge max, Split continuation kept, a fresh child only with this bar's Confirm, new generation -1); W08 guard releases
+exactly these 2 (Inverse stays until B12); FlipAttempt / FlipConfirm append a non-normal 11-field TouchMark (touchNo 0,
+contact = bar / BS range intersection) through the existing W08 transfer; Q5 FlipConfirm ends the transition: both Sides
+Waiting, not armed on that bar, history kept, CurrentTouchNo 0, Grade by Stage J, both BS copies + Roots + indexes
+cleared (after the topology F0 when same-bar), never revived by the Stage J BS priority; Q6 Flip / Reclaim facts in
+Stage D3, priority D4, D1 Events first, then ONE canonical D3 order (coreId, generationId, Support, Resistance) over
+LocalBreak / WeakDepth / Reset / FlipAttempt / FlipConfirm (no per-type pass); Event rows: BS range, side = the new
+(FlipWait) Side, touchNo 0, gradeAtStart GR_UNAVAILABLE, the new Side's persistent Weak reason, rootId ID_NONE.
+
+TOKEN START REVIEW (B10): Main PASS, exact UNKNOWN. No new UDT / import / foreign type / tuple; B08 BS helpers and the
+TouchMark path reused; +9 references on the existing TouchStartPlanView construction, +2 on PhaseArmedTransferView, four
+Main-local scratch arrays, a few parameters on existing calls, W08Runtime /19 (guard only). The Flip TouchMarks reach
+the W08 Merge / Split TouchMark plans with no W08Touch change: W08Touch /7 projects every row of the TouchStart plan
+arrays as an append of its Core (projPlanRowsRaw = rows of pI; projAppendsRaw matches Core slot / ID), so the Flip mark
+rows are appended after the TouchStart rows (verified by reading W08Touch /7; not executed against W08Touch). Probe: NO.
+
+Implementation:
+- W09State /27: GB_STRIDE 7 (+ movedAway at the GapBreak bar), FL_STRIDE rows, Episode flag 128 = movedAway at the Local
+  Break bar (the three `>= 64` flag tests now `% 128 >= 64`), breakCommitRaw callers pass movedAway; TouchStartPlanView
+  + BS / Flip refs; flipPlan (Stage D3 / D4 facts from the Broken PhaseSet, canonical by the FlipWait Side; mark rows
+  appended to the plan arrays; d3 = merged canonical D3 order); flipApply (role 0 / 1: flags on both BS copies, attempt
+  count, Confirm cleanup, noArm; ring flags for the mark rows in plan order); bsSourceRaw (+fli: a BS confirmed this bar
+  is none) and bsTransferPlan / Apply (BSP_STRIDE 12: + attempt count, lastFlipConfirmSeq, noArm; projected movedAway /
+  retestSeen; noArm pushed for affected destinations); post-plan preflight (+fli: plan arrays may hold mark rows, Event
+  room + Flip Events, roles also computed for Flip-only bars); Stage J (+noArm: not armed on the FlipConfirm bar).
+- W08Runtime /19: MERGE_STATE_DEFAULT_GUARD 11 -> 9 fields (sideFlipAttemptCounts, sideLastFlipConfirmSeqs reset-only).
+- Main: pins W09State /27, W08Runtime /19; the new refs / scratch / arguments; flipPlan after episodePlan (before the W08
+  plan); flipApply after gapBreakApply; the D3 Event loop over d3 (Episode row Events or the Flip row's TouchMark when
+  flagged + EV_FLIP_*), replacing the three per-type passes; Stage J + noArm.
+
+Gates: `b10_det.py` 14/14 (F1 / F2 movedAway on the Break bar, F3 no same-bar retest on a newly movedAway BS, F4 + F11
+first retest -> FlipConfirm (Waiting, BS / Roots / indexes cleared, attempt 0, lastFlipConfirmSeq), F10 no Armed on the
+Confirm bar and Armed from seq + 1 on the next, F5 + F14 first retest -> Attempt with the non-normal TouchMark, F6
+wouldReclaim suppresses the Attempt, F7 continuous contact -> one Attempt, F8 full exit clears retestSeen, F9 second
+retest -> count 2, F12 Merge absorbed Flip-state transfer (count 3, freed slot untouched), F13 Split continuation transfer,
+F15 D3 canonical order across Cores (Core 11 FlipAttempt before Core 20 WeakDepth), F16 W08 F0 failure -> mutation 0,
+no Event). Regression: B08 16/16 and B09 16/16 (their expected BS movedAway updated to true where the Break-bar close is
+beyond the reset distance: the Q2 change, no other field), R3-B2 15/15, R3-B1 contract PASS. Static: W09State imports 0 /
+types 6 / `.copy` 0 / exports 50 -> 52 (flipPlan, flipApply), no use-before-definition; W08Touch / W08Core unchanged.
+A defect found by F13 and fixed before commit: a bar with only Flip rows computed no topology roles (role 0), so
+flipApply wrote on top of the transfer (count 4) and onto a freed slot; roles are now computed when Flip rows exist.
+random 0, 5k / 50k / 200k 0, > 5 min 0.
+TV: W09State /27 publish -> W08Runtime /19 publish -> Production Main compile. CE10216 -> STOP.
