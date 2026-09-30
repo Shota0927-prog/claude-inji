@@ -64,9 +64,9 @@ refactor of the known W05 duplication (StageA / StageC) is worth more. The probe
 
 | ID | Module | Change | Before | After | Delta | Effect | Semantic change | Test | Adopt / Revert |
 |---|---|---|---|---|---|---|---|---|---|
-| GT-2 | W05Cand /5 -> /6 (+ W06Comp /19 -> /20 import W05 /6 only; Main W06 /20) | `candEnumerateStageARaw` + `candEnumerateStageCRaw` -> one `candEnumerateStageACRaw(..., stage)` | 1,000,878 | pending (TV) | pending | pending | 0 | det 15/15 + mutants 8/8 killed | pending: HIGH / MEDIUM adopt, LOW adopt if risk small, NONE revert |
+| GT-2 | W05Cand /5 -> /6 (+ W06Comp /19 -> /20 import W05 /6 only; Main W06 /20) | StageA / StageC commonization: `candEnumerateStageARaw` + `candEnumerateStageCRaw` -> one `candEnumerateStageACRaw(..., stage)` | 1,000,878 | <1,000,000 (Main PASS, exact value not shown) | > 878 reduction (lower bound; exact UNKNOWN) | LOW or more (exact class unknown) | UNCHANGED | det 15/15 + mutants 8/8 killed | ADOPTED |
 
-Source proxy: W05 25,478 -> 23,575 (-1,903 source tokens; compiled unknown until TV).
+Source proxy: W05 25,478 -> 23,575 (-1,903 source tokens; reference only, never used as the compiled delta).
 
 Audit (StageA 274 lines vs StageC 302 lines, 201 identical):
 
@@ -120,5 +120,43 @@ function and nothing else lost; W06 / W05 still reachable: none; new: the two st
 |---|---|---|---|
 | 1 | E: giant signatures + argument forwarding (32 functions with >= 40 parameters) | W03Apply 6.2k, W06Comp 5.5k, W03EMsa 3.3k, W03ETimeFvg 2.8k, W03F0 1.7k, W05Cand 1.3k, W07Fvg 1.1k | ~21.9k (signatures 14.1k + call arguments 7.8k) |
 | 2 | A: the same logic in several libraries | originLookupUniqueRaw / originTupleEqualRaw / originKeyComputeRaw / journalAppendRaw (W03EMsa + W03ETimeFvg), root / fvg set membership (Main + W03Apply + W03F0), rootPriceOrderUpperBoundRaw, pendingNewFvgRowRaw, physicalNewCompareRaw (W08Core + W08Runtime) | ~4.5k |
-| 3 | A: near-duplicate functions in one library | W05 candEnumerateStageA / StageC (201 of 274 lines equal), W06 recomputeAndMerge / runComponentRaw | ~2.8k |
+| 3 | A: near-duplicate functions in one library | W05 candEnumerateStageA / StageC (201 of 274 lines equal; done as GT-2); W06 recomputeAndMerge / runComponentRaw (GT-3 audit: signature overlap only, class E) | ~2.8k |
 | 4 | D: S/R, High/Low duplicated blocks inside big functions | W03ETimeFvg w03StageETimeHlRaw 780, W03F0 preflight 500 + virtualPointOrderPreflightRaw 436, W06 buildComponents 200 | ~2.4k |
+
+## Baseline after GT-2
+
+| Item | Value |
+|---|---|
+| Branch | `claude/global-token-optimization` |
+| Production pins | W03F0 /5, W03Apply /4, W03ETimeFvg /3, W05Cand /6 (via W06), W06Comp /20, W07Fvg /10, W08Core /18, W08Touch /5, W08Runtime /15, W03EMsa /7, W09State /22 |
+| Main compiled | <1,000,000 (PASS, exact value unknown) |
+| Semantics | W09 B07-R3A FROZEN; R3-B still forbidden |
+
+From here every later "Before" is <1,000,000 without an exact value, so a later PASS gives no exact delta (recorded as After
+<1,000,000 only; never estimated).
+
+## GT-3 audit: W06 runComponentRaw vs recomputeAndMerge (not implemented)
+
+`runComponentRaw` (255 lines, private, one caller) and `recomputeAndMerge` (333 lines, export) share 10 identical stripped
+lines (`if ok`, `k += 1`, `side += 1` ...) and 967 token 8-shingles. Where the shingles are:
+
+| Shared shingles | runComponentRaw | recomputeAndMerge | Class | Decision |
+|---|---|---|---|---|
+| 633 | signature (672 tokens) | signature (972 tokens) | giant signature (class E) | out of scope (giant signatures not touched now) |
+| 179 | - | the `runComponentRaw(...)` call (argument forwarding) | giant signature (class E) | out of scope |
+| 180 | W05 `selectComponentBothSides` 33-value unpack (`w*`) | `fullFallbackRaw` 31-value unpack (`fb*`) | return payload of two different producers, different consumers | semantic difference: not merged |
+| 134 | winner-buffer size check after the W05 call, first conjunct `recSize >= wWinnerLogicalCount` | pre-commit check at step 5, first conjuncts `nS + nR <= cap and rootsS + rootsR <= cap and rootCount <= cap` | COMMON with semantic difference (different guard, different time: per row after the W05 call vs once before the global commit) | not merged |
+| 32 | `runFilterOrdersRaw(...)` arguments | `mergeSideRaw(...)` x2 arguments | argument forwarding (class E) | out of scope |
+| 9 | - | `compSideMaskRaw(...)` arguments | argument forwarding | out of scope |
+
+RUN_ONLY: row validation, DIRTY Side detection, W05 per-component call and epoch check, pass 1 validation / sizes, per-Side
+capacity (NOT_STORED), pass 2 append, row commit / pool rollback. RECOMPUTE_ONLY: component build, row loop, status /
+NOT_STORED fallback, global Side merges, seen validation, exact range check, LOCAL commit of the winner buffer and seen stamps,
+FULL fallback, the 45-value output. COMMON identical logic: none beyond the trivial lines above. COMMON parameter-only
+logic: only the 17 `array.size(candidateWinner*) == recSize` conjuncts inside the two different checks; sharing them needs a
+new 18-parameter helper and two 18-argument calls (heavier than the ~130 source tokens it removes, a new large signature), so
+it is not done.
+
+Decision: GT-3 = NO_SAFE_DUPLICATE (nothing implemented, W06 /21 not created, no publish). The rank 3 structural candidate
+"W06 recomputeAndMerge / runComponentRaw" was a shingle artefact of the shared parameter list; it belongs to rank 1 (giant
+signatures + argument forwarding).
