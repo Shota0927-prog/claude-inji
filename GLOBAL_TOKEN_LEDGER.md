@@ -157,6 +157,42 @@ logic: only the 17 `array.size(candidateWinner*) == recSize` conjuncts inside th
 new 18-parameter helper and two 18-argument calls (heavier than the ~130 source tokens it removes, a new large signature), so
 it is not done.
 
-Decision: GT-3 = NO_SAFE_DUPLICATE (nothing implemented, W06 /21 not created, no publish). The rank 3 structural candidate
+Decision: GT-3 = NO_CHANGE (reason: no semantic-identical duplicate; CORRECT_STOP; nothing implemented, W06 /21 not created, no publish, no compile). The rank 3 structural candidate
 "W06 recomputeAndMerge / runComponentRaw" was a shingle artefact of the shared parameter list; it belongs to rank 1 (giant
 signatures + argument forwarding).
+
+## GT-4: huge signatures + argument forwarding (audit; GT-4A AUDIT_PENDING)
+
+Audit (`gt4_audit.py`, reachable Production at the GT-2 baseline): 32 functions with >= 40 parameters. Per call site each
+argument is classed FWD (a caller parameter), FIELD (`x.y`), LOCAL (a caller local), CONST or EXPR.
+
+Structural finding: every Main -> library export call (W06 `recomputeAndMerge` 186 args, W03EMsa `run` 131, W03ETimeFvg `run`
+125, W03Apply `applyThroughF4` 107, W03F0 `preflight` 97, W07 `stageEFreshInversePrepare` 67) passes Main engine FIELDs. A
+library cannot receive Main's UDT, so replacing those scalars by one existing authority needs a new exported bundle type
+(forbidden). The same holds for W06 -> W05 (`selectComponentBothSides` 100, `selectBothSides` 99: W05 builds its private
+CandidateCtx from them). What is left is intra-library forwarding: a private callee with one call site whose arguments are
+the caller's own parameters. Removing that callee's signature and forwarding needs no new structure: the callee is folded
+into its single call site (the same values, the same place, evaluated once).
+
+| Rank | Module | Caller -> callee | Callee params | Call sites | Forward-only | Caller-computed | Readable from an existing object | Removable params | New structure | Semantic risk | Publishes |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | W06Comp | `recomputeAndMerge` -> `fullFallbackRaw` -> `W05Cand.selectBothSides` | 99 | 1 | 98 | 1 (`workSeenEpoch` -> `candidateBroadSeenEpoch`) | 0 (not needed) | 99 (signature 471 source tokens, call 198, 31-value pass-through tuple) | none | LOW | 1 (W06 /21, Main pin) |
+| 2 | W06Comp | `recomputeAndMerge` -> `runComponentRaw` | 134 | 1 | 129 | 5 (`r`, `workSeenEpoch`, `filteredPriceScratch`, `filteredIdScratch`, `cap`) | 0 | 134 (signature 672, call 268, `[ok, epoch]` tuple) | none | LOW-MEDIUM (3,259-token body moves into the row loop; local name collisions: `ok`, `side`, `k`, `i`, `g`, `recSize` ...) | 1 |
+| 3 | W06Comp | `buildComponents` -> `compExpandFixedPointRaw` -> `compExternalLinksRaw` | 56 / 55 | 1 / 1 | 55 / 55 | 1 (`workEpoch`) / 0 | 0 | 111 | none | MEDIUM (3,065-token body into a nested loop; `[added, failed]` tuple) | 1 |
+| 4 | W03EMsa | `run` -> `w03StageEMaRaw` / `w03StageESwingRaw` / `w03StageEAccumRaw` | 51 / 74 / 88 | 1 each | 49 / 72 / 86 | 2 each (`journalCountNow`, `journalInvariantViolationNow`) | 0 | 213 | none | MEDIUM (three bodies, journal counter threading, 2-tuples) | 1 (W03EMsa /8) |
+| 5 | W03Apply | `applyThroughF4` -> `maUpdateApplyRaw` (+ 6 sibling apply helpers 67-106 params) | 74 | 1 | 73 | 1 (`row`) | 0 | 74 (per helper) | none | MEDIUM (inside the journal op dispatch) | 1 (W03Apply /5) |
+
+Not ranked: `mergeSideRaw` (2 call sites: folding would duplicate its body), `journalAppendRaw` (W03EMsa 6 / W03ETimeFvg 4
+sites, mixed arguments), W07 `freshFacts` (W07 is imported by W05: publish chain W07 -> W05 -> W06), the Main -> library
+exports and W06 -> W05 above (a new bundle type would be needed).
+
+RECOMMENDED_GT4A = rank 1. `fullFallbackRaw` is a pure pass-through (checked mechanically): its body is exactly
+`[fb... 31] = W05Cand.selectBothSides(p1, ..., p99)` then `[fb... 31]`, the 99 W05 arguments are its 99 parameters in the
+same order, the return is the unpacked tuple unchanged. So its one call site
+`[fb... 31] = fullFallbackRaw(a1, ..., a99)` is exactly `[fb... 31] = W05Cand.selectBothSides(a1, ..., a99)`; the change is
+the callee name at that site and the deletion of the 3-line function. The argument list, its order, `workSeenEpoch`, the
+evaluation point (the FULL fallback branch after the `keepCache` clearing), the bar and the single W05 call are unchanged.
+
+| ID | Module | Change | Before | After | Delta | Effect | Semantic change | Test | Status |
+|---|---|---|---|---|---|---|---|---|---|
+| GT-4A | W06Comp /20 -> /21 (Main W06 /21) | fold `fullFallbackRaw` into its single call site | <1,000,000 | - | - | - | 0 (planned) | planned | AUDIT_PENDING |
