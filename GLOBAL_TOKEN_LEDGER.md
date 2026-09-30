@@ -1050,3 +1050,73 @@ Regression of the changed functions (harness call signatures adapted only): R2 3
 transfer 13/13 (empty overlay); R3-B1 scratch contract check PASS. random 0, 5k / 50k / 200k 0, R3-B1 29 cases not
 re-run (W08Touch unchanged).
 Publish: W09State /24 -> Main compile (TV Gate). CE10216 -> STOP.
+
+### R3-B2 TV Gate: PASS -> R3-B2 COMPLETE; B07 CLOSEOUT
+
+TOKEN END REVIEW (R3-B2 semantic batch): Before Production Main PASS; After Production Main PASS (W09State /24
+published); compiled exact UNKNOWN; CE10216 none; token refactor 0; Main business logic 0 (the markAppend guard is
+plumbing; the semantic authority is W09State); cross-library foreign type 0; Production semantics = R3-B2 as specified;
+long test no; > 5 min no; needless retest no (changed functions only); rule violations 0. No further compression.
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| R3B2 | W09State /22 -> /24, Main | same-bar topology of Reset Episodes | PASS (exact UNKNOWN) | PASS (exact UNKNOWN) | UNKNOWN | COMPLETE; Q1-Q5 FROZEN |
+
+B07: COMPLETE (existing ActiveTouch, same-bar TouchStart, WeakDepth, Reset, wouldBreak WeakDepth suppression, same-bar
+Reset, next Touch from the next bar, projected Episode state, same-bar topology, projected TouchMark transfer, TSS
+cleanup owner, post-topology Phase / Armed, persistent mutation 0 until all F0). Open B07 semantics: 0. B07 closed.
+
+## W09 B08: Local Break / BreakReferenceRange - Phase A audit (no code change)
+
+START GATE: `claude/w09-b07-redesign-v2` local = remote = `7d711b4` (0 / 0), clean. Pins = the Main PASS configuration:
+W07Interval /1, W07 /11, W05 /7, W06 /24, W08Core /18, W08Touch /7, W08Runtime /17, W03EMsa /9, W09State /24 (+ W03F0 /5,
+W03Apply /4, W03ETimeFvg /3).
+
+Existing Break-related structure (source):
+| Item | Where | State |
+|---|---|---|
+| BreakSnapshot storage per Side slot: valid, coreId, generationId, oldSide, range bottom / top, breakSeq, breakTime, wasGapBreak, movedAway, retestSeen, Root list head / tail / count | W08Core CoreRegistryStore (15 arrays) | storage only; no writer |
+| BreakSnapshot Root node pool (rootId, next, owner Side slot, expected coreId / generationId / breakSeq, live, free stack) | Main W02AuxStore; `breakSnapshotRootNodeReset / Alloc / FreeRaw` in Main | raw lifecycle defined, unreachable (no caller) |
+| Broken / FlipWait price-order indexes | Main engine `brokenSnapshot*` / `flipSnapshot*OrderSideSlots`, W08Core `side*SnapshotOrderPositions` | storage only; W08 reset clears positions |
+| Phase enum PH_BROKEN 3 / PH_FLIP_WAIT 4, PhaseSet lists | W08Runtime / W09State (`phaseMoveRaw`) | sets maintained; no writer to Broken / FlipWait |
+| Flip fields sideFlipAttemptCounts / sideLastFlipConfirmSeqs | W08Core | storage only (Flip = later batch) |
+| Events EV_LOCAL_BREAK 4 / EV_GAP_BREAK 5; `eventAppendRaw` (type, time, seq, coreId, gen, side, range b / t, touchNo, gradeAtStart, weakReason, rootId) | Main | names only; no Break Event writer |
+| `breakWouldMet` / `closeBeyondRaw` (Support close <= bottom - buffer, Resistance close >= top + buffer, ticks, inclusive) | W09State | B07 guard: episodePlan flag 1 (wouldBreak) on the TSS range (A) / the plan range = TSS-to-be (B); suppresses depth / WeakDepth (Break priority already holds) |
+| `gapBreakTargetSlots` / `gapBreakMetExclusive` (strict full gap, close beyond the level, exclusive of a normal Touch) | W09State | B09 geometry; a GapBreak-only Armed target is not a Touch; no Break effect |
+| W08 MERGE_STATE_DEFAULT_GUARD | W08Runtime | checks the 15 BreakSnapshot fields (an absorbed Core with a valid BS fails the W08 F0) |
+| `phaseArmedTransferPreflight` | W09State | a Merge / Split source in Broken / FlipWait or with a valid BS fails the whole pass (temporary fail-closed; BS transfer not implemented) |
+| W08 PendingTopology predicate | W08Runtime | ActiveTouch only (persistent or overlay); Broken / FlipWait not pending |
+| Stage J | W09State | Broken / FlipWait / Dormant untouched |
+
+Canonical (given): BreakReferenceRange = TSS range while ActiveTouch (GapBreak: previous-bar Armed EffectiveZoneRange, B09);
+Local Break on the confirmed 5m close, Support close <= refBottom - breakBuffer, Resistance close >= refTop +
+breakBuffer (inclusive) = exactly `breakWouldMet`; Break > WeakDepth on the bar (no WeakDepth Event; history not
+rewound); ActiveTouch Break: Episode ends, old Side Broken, opposite Side FlipWait, BreakSnapshot created, TSS / Episode
+cleanup in the Break commit order; B07 same-bar topology / atomicity kept. GapBreak body = B09.
+
+Not fixed by the canonical text or the source (decisions needed before B08-A):
+- D1 same-bar TouchStart + Local Break (B Episode breaking on its start bar): Break on the same bar (TouchCount +1, TSS ->
+  BreakSnapshot, like the same-bar Reset) or not.
+- D2 BreakSnapshot layout: the Side slot that stores it (the broken Side, the FlipWait Side, or both), the meaning of
+  `oldSide`, and its Root list source (copy of the TSS Root list, or the current Root list).
+- D3 the opposite Side at Break: FlipWait from every Phase? (Armed: index detach; ActiveTouch with its own Episode on the
+  same bar, which may Reset on the same close; Broken / FlipWait / Dormant already).
+- D4 the Broken / FlipWait price-order indexes: maintained from B08 (keys = the BreakSnapshot range) or left to their
+  owner batch (MovedAway / Retest / Flip).
+- D5 topology: (a) the Break bar: the breaking Episode stays PendingTopology (today: A no override = persistent Active,
+  B FORCE_ACTIVE); (b) later bars: a Core with a Broken / FlipWait Side or a valid BS as a Merge / Split source fails the
+  whole W09 pass (and the W08 guard), so a W08 plan that applies it blocks every commit. Options: W08Runtime PendingTopology
+  predicate extended to Broken / FlipWait / BS valid (W08Runtime /18), or BreakSnapshot transfer (I27-15 §10 / §12).
+- D6 after Break: CurrentTouchNo, current Grade, Upcoming (TouchCount / Weak / MaxDepth / Fresh kept).
+- D7 EV_LOCAL_BREAK row: time / seq, range = BreakReferenceRange, touchNo, gradeAtStart = TouchStartGrade, weakReason,
+  rootId; order against the WeakDepth / Reset / TouchStart Events.
+
+Proposed minimal semantic batch B08-A "ActiveTouch Local Break" (after D1-D7): W09State next version (/25): episodePlan's
+flag 1 becomes the Local Break (reference = the TSS range, never the live range; no new geometry); a Break branch in
+the Episode apply after the TouchStart apply (BreakSnapshot write + Root copy into the BS pool, then the TSS clear;
+CurrentTouchNo per D6; Phase ActiveTouch -> Broken and the opposite Side per D3 through the PhaseSet); the post-plan
+preflight extended (BS pool growth, Event room, D3 preconditions); Main: the BS pool / BreakSnapshot arrays passed by
+reference (a view or the existing TouchStartPlanView extended), EV_LOCAL_BREAK rows in the Episode Event loop. D5 decides
+whether W08Runtime changes. Token: Main status UNKNOWN (PASS only) and B08-A adds a state writer with a new view ->
+TOKEN START REVIEW with Probe YES (the view / pool wiring and the Break body together, INC-2) before the full batch.
+STOP.
