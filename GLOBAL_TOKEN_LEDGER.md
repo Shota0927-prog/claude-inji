@@ -766,7 +766,7 @@ that configuration only by the W05 / W06 probe replacement.
 
 | ID | Probe | Change | Baseline | Probe compiled | Delta | Status |
 |---|---|---|---|---|---|---|
-| IP-C | W05 -> W07 import removed (probe libraries), Main pins = the 1,003,009 configuration (W03EMsa /7) | 2 probe publishes + 1 Main compile | 1,003,009 (historical exact, machine-audited, see below) | pending (TV) | pending | attribution only, never adopted |
+| IP-C | W05 -> W07 import removed (probe libraries), Main pins = the 1,003,009 configuration (W03EMsa /7) | 2 probe publishes + 1 Main compile | 1,003,009 (historical exact, machine-audited, see below) | PASS (< 1,000,000; W05 probe /1 PASS, W06 probe /1 PASS) | net > 3,009 (exact UNKNOWN; effect >= MEDIUM) | attribution only, never adopted; Production unchanged (Main 1,001,847 RED) |
 
 Baseline match audit (machine, before the TV run): PASS.
 - `git diff d7b5d9d:ZoneEngineV2_Rebuild.pine token_probes/R3B1C_Rebuild_Main_Probe.pine`: exactly 1 changed line
@@ -804,3 +804,76 @@ failed with CE10245 ("A library must contain at least one exported function, met
   before its first use, the constants they use (ID_NONE, SLOT_INVALID, FVG_INTERVAL_BUILD_OK / _INVALID_INPUT) declared
   above them; the diff against W05 /6 is only library name, W07 import, the 4 call sites (`W07Fvg.` prefix only), 1
   constant and the 189-line block. W06 probe and Main probe unchanged. Probe library /1 is still unused.
+
+### IP-C result (TV): PASS
+- W05 probe /1 PASS (after the PROBE_BUILD_ERROR fix), W06 probe /1 PASS, Main probe PASS (< 1,000,000; no number).
+- Historical exact baseline 1,003,009 -> Import C net delta > 3,009 compiled tokens; effect MEDIUM or more; exact UNKNOWN.
+  The delta is net of the duplicate `fvgIntervalQuery` / `fvgIntervalLowerBoundRaw` the probe held twice; not over-read.
+- Probe result only: the probe libraries are not adopted; Production Main stays 1,001,847 (RED). No further Probe.
+- Clearly larger than D1 (-551) / D2 (-611). GT-5A stays APPROVED_DEFERRED; next = Production design audit below.
+
+### IMPORT C PRODUCTION DESIGN AUDIT (design only; no code change, no Probe)
+
+Facts (source, current Production):
+- Authority today: W07Fvg /10 owns `fvgIntervalLowerBoundRaw` (private), `fvgIntervalOrderBuild` (export),
+  `fvgIntervalQuery` (export). Constants used: ID_NONE, SLOT_INVALID, FVG_INTERVAL_BUILD_OK / _INVALID_INPUT. No UDT.
+- W07-internal use: `fvgIntervalQuery` <- `freshFacts` (Stage E fresh match; reachable from Main through
+  `stageEFreshInversePrepare`); `fvgIntervalLowerBoundRaw` <- `fvgIntervalQuery`. `fvgIntervalOrderBuild` has no W07
+  caller (only W05 and old pinned harnesses).
+- W05 use: 4 call sites in 2 separate functions: `candFvgIndexedMatchesRaw` (OrderBuild + Query) and
+  `candEnumerateStageBRaw` (OrderBuild + Query).
+- Main uses W07 directly (`stageEFreshInversePrepare`, `inverseStageFCommit`, `inverseStageFCommitWithConfirm`,
+  `freshIndexSyncFromJournal` x2); Main never calls the 3 interval functions.
+- W07: 1,112 lines, 14 exports, 0 types. W05: 2,325 lines, 3 exports, 1 private type (CandidateCtx).
+
+Dependency graph (Production now):
+  Main -> W03F0, W03Apply, W03ETimeFvg, W03EMsa, W09State
+  Main -> W06 -> W05 -> W07          (edge under study: W05 -> W07)
+  Main -> W07
+  Main -> W08Core, W08Touch, W08Runtime -> W08Core, W08Touch
+
+| Item | A: new Interval worker (WI) | B: authority to W05, W07 -> W05 | C: W07 inlines, authority W05 | D: W05 physical inline, W07 keeps authority | E: other |
+|---|---|---|---|---|---|
+| graph change | W05 -> W07 removed; W05 -> WI, W07 -> WI added | W05 -> W07 removed; W07 -> W05 added | W07 still needs Query semantics -> needs W05 import (= B) or its own copy | W05 -> W07 removed | see below |
+| cycle | 0 | 0 (W05 no longer imports W07) | 0 / n.a. | 0 | - |
+| Main reachable | same functions; the 3 now in WI (reached via W07 and W05) | W05 reached twice (via W06 and via W07) | - | 3 bodies in W07 + inlined copies in W05 | - |
+| nested import of a library Main already imports | none (WI not imported by Main) | yes: W05 behind W07 and W06 (same shape as the removed edge, larger library, has a type) | - | none | - |
+| foreign type | 0 (arrays / ints only) | CandidateCtx is private, but W07 would sit on a 2,325-line library | - | 0 | - |
+| exports | WI 2-3 new; W07 loses 2 | W05 +2; W07 -2 | - | 0 new | - |
+| signature / forwarding | unchanged (same parameter lists, calls re-prefixed) | unchanged | - | inline removes 2 signatures x 2 call paths | - |
+| duplicated logic | 0 | 0 | yes (REJECT) | yes: OrderBuild + Query bodies into 2 W05 functions (2 copies) and Query / LowerBound also stay in W07 | - |
+| authority count | 1 (WI) | 1 (W05) | 2 | 2 (REJECT, 9. condition) | - |
+| publishes | WI /1, W07 /11, W05 /7, W06 /24 (+ Main pins) | W05 /7, W07 /11, W06 /24 (+ Main) | - | - | - |
+| files changed | 5 (WI new, W07, W05, W06 pin, Main pins) | 4 | - | - | - |
+| semantic risk | LOW (bodies moved verbatim, call prefix only) | LOW (verbatim) | - | - | - |
+| maintenance risk | LOW (FVG interval index has its own owner) | MEDIUM-HIGH (FVG index owned by the Candidate library; W07 depends on W05) | HIGH | HIGH | - |
+| compiled-token risk | UNKNOWN: Probe C removed the edge without adding one; A adds 2 edges to a 3-function type-free library | HIGH: recreates the cross edge with a larger library | - | - | - |
+
+E (other) checked and rejected:
+- E1 pass precomputed orders into W05 from W06 / Main: the order sets are built from W05-local scratch
+  (indexable slots, fvgScratch) mid-selection -> changes W05 signatures / timing; Main business logic risk. REJECT.
+- E2 move `candFvgIndexedMatchesRaw` / `candEnumerateStageBRaw` into W07: they take CandidateCtx (would become a foreign
+  type, INC-1 pattern) and split Candidate authority. REJECT.
+- E3 authority in a library both already import: W05 and W07 share no dependency. n.a.
+- E4 W07 keeps only Query / LowerBound, W05 owns OrderBuild alone: W05 still needs Query -> edge stays or copy. REJECT.
+- D (special check, section 9): W05 has 2 separate call paths, each using OrderBuild and Query, so a single inline
+  point does not exist; and W07 must keep Query / LowerBound for `freshFacts`, so any W05 inline is a second copy of
+  that logic. REJECT (authority 2, duplication > 0).
+
+Condition check (section 8) for A: semantic authority 1, logic duplication 0, cycle 0, Main business logic 0, new
+foreign UDT dependency 0, state / history semantics change 0, FVG interval semantics change 0 -> all satisfied.
+B satisfies authority / duplication / cycle but inverts ownership and re-creates the measured edge shape -> not chosen.
+
+RECOMMENDED_IMPORT_C_PRODUCTION_DESIGN = A (dedicated `ZoneEngineV2_W07Interval_Worker` owning the 3 functions and
+their 2 status constants; W07 and W05 import it; bodies verbatim; only the `W07Fvg.` / local call prefix changes).
+Open risk stated, not estimated: Probe C measured removal of the W05 -> W07 edge with no new edge; A adds two edges to a
+tiny, type-free, 3-function library. Its compiled effect is UNKNOWN until the implementation compile; if Main does
+not improve, the pins roll back (Production versions untouched).
+
+GT-5A comparison (structure, not compiled estimate):
+- GT-5A: one module (W03Apply /5), 7 single-call helpers, 555 params / 555 forwarded args / 1 tuple removed, 13
+  renames (nextRootId hazard), semantic risk LOW-MEDIUM, 1 publish + Main pin, maintenance neutral.
+- Import C (A): library boundary change, 0 renames, verbatim bodies, semantic risk LOW, 4 publishes + Main pins,
+  maintenance improves (FVG interval index gets one owner, W05 no longer depends on the whole W07).
+- The only measured evidence is Probe C (> 3,009 for removing the edge); GT-5A is unmeasured. Order stays: Import C
+  design A first (if approved), GT-5A APPROVED_DEFERRED.
