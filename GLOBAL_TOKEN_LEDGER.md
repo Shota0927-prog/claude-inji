@@ -195,4 +195,37 @@ evaluation point (the FULL fallback branch after the `keepCache` clearing), the 
 
 | ID | Module | Change | Before | After | Delta | Effect | Semantic change | Test | Status |
 |---|---|---|---|---|---|---|---|---|---|
-| GT-4A | W06Comp /20 -> /21 (Main W06 /21) | fold `fullFallbackRaw` into its single call site | <1,000,000 | - | - | - | 0 (planned) | planned | AUDIT_PENDING |
+| GT-4A | W06Comp /20 -> /21 (Main W06 /21) | fold `fullFallbackRaw` into its single call site | <1,000,000 | - | - | - | 0 (SEMANTIC_EQUIVALENCE = PROVEN, pure pass-through) | in the GT-4A + GT-4B harness | APPROVED_PENDING_BUNDLE (no W06 version of its own; ships with GT-4B) |
+
+### GT-4B audit: inline `runComponentRaw` into `recomputeAndMerge` (APPROVED; not implemented yet)
+
+Goal: delete the 134-parameter signature, the 134-argument call and the call boundary (`[ok, outEpoch]` tuple); the body is
+moved verbatim, nothing of its logic is removed. Mechanical audit (`gt4b_audit.py`):
+
+| Check | Result |
+|---|---|
+| A. call sites | 1 (line 2635, in `recomputeAndMerge` step 2 row loop); the only other reference is the definition. Pine has no function references |
+| B. reachability | private, not exported, called from no other helper |
+| Parameter mapping | 134 parameters : 134 arguments, 1:1 in order; 129 identity (each a `recomputeAndMerge` parameter of the same name, same object / value); 5 mapped: `row` <- `r`, `inCandidateBroadSeenEpoch` <- `workSeenEpoch`, `filteredPriceOrderSlots` <- `filteredPriceScratch`, `filteredIdOrderSlots` <- `filteredIdScratch`, `capacity` <- `cap` |
+| Mapped-name substitution | whole-word replacement in the moved body: `row` 22, `inCandidateBroadSeenEpoch` 3, `filteredPriceOrderSlots` 2, `filteredIdOrderSlots` 2, `capacity` 9 -> `cap` (hazard: `recomputeAndMerge` has its own raw `capacity` parameter, so `capacity` must be substituted, never left) |
+| Evaluation timing of the 5 caller values | the body assigns none of its parameters (checked: 0); `r`, `workSeenEpoch`, `cap` and the two scratch arrays are not written between the old call point and the end of the body; `workSeenEpoch := outEpoch` and `localOk := ok` follow the body exactly where `workSeenEpoch := runEpoch` / `localOk := runOk` were |
+| Local collisions (99 callee locals) | with names visible at the call site (186 parameters + enclosing locals): none; `ok`, `outEpoch` unused in `recomputeAndMerge`; same names declared later in sibling / later blocks of `recomputeAndMerge` (`g`, `gId`, `hi`, `i`, `k`, `lo`, `recSize`, `side`): different scopes, no overlap in lifetime (the file already declares `int r = 0` in two sibling blocks) -> no rename needed |
+| Scope / lifetime | every callee local is declared inside the function body, re-initialised on each call; after the move they are declared inside the loop body, re-initialised on each iteration: identical. No `var` / `varip`, no history `[n]`, no `ta.` / `request.`: no call-site-bound state |
+| Control flow | no `break` / `continue`, no early exit (Pine has none); all loops (pass 1 Side 0 -> 1, member binary search, pass 2 append, seen scan, rollback pops) move verbatim: loop order, Side order (Support then Resistance), record order unchanged |
+| W05 call | `W05Cand.selectComponentBothSides` once per DIRTY row, same position; `runFilterOrdersRaw` once, same position |
+| DIRTY / epoch / pass 1 / capacity / pass 2 / commit / rollback / fail-closed | verbatim; every `ok := false` path and the `if not ok` pool rollback unchanged |
+| Mutation parity | persistent: the 10 component row status / offset / length arrays; pools: `candRecordInts`, `candRecordReferencePrices`, `candRecordExactPrices`, `candRecordRootIds`, `candSeenBroadRootIds`; scratch: the two filtered arrays (via `runFilterOrdersRaw`) and the W05 winner buffers: the same objects (identity arguments / mapped aliases), the same writes in the same order |
+| Return parity | `[ok, outEpoch]` -> `localOk := ok`, `workSeenEpoch := outEpoch` (same values, same order of the two caller writes) |
+| C. order | identical |
+| D. new recomputation | 0 |
+| E. new allocation | 0 (no `array.new` / `copy` / `from` / `map.new` in the body; the two scratch arrays stay allocated once before the loop) |
+| F. new high-cost structure | 0 (one tuple removed) |
+| G. semantic risk | LOW (verbatim move + 5 whole-word substitutions, no rename of locals) |
+
+Decision: GT-4B = APPROVED. Next implementation batch: GT-4A + GT-4B as one W06 change (W06 /21, Main W06 /20 -> /21, one
+publish). Harness plan: interpreted old vs new `recomputeAndMerge` with `buildComponents`, `mergeSideRaw`, `compSideMaskRaw`,
+`runFilterOrdersRaw` and the two W05 calls as recording oracle stubs (the real row loop body), <= 15 deterministic cases.
+
+| ID | Module | Change | Before | After | Delta | Effect | Semantic change | Test | Status |
+|---|---|---|---|---|---|---|---|---|---|
+| GT-4B | W06Comp /20 -> /21 (with GT-4A) | inline `runComponentRaw` into its single call site | <1,000,000 | - | - | - | 0 (audited) | planned | APPROVED (audit), not implemented |
