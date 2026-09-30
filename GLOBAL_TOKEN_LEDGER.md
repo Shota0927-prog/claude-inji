@@ -446,4 +446,34 @@ copy). `episodeOverlayBuild` may stay in W09State (ei only, no W08 import).
 
 | ID | Module | Change | Before | After | Delta | Status |
 |---|---|---|---|---|---|---|
-| R3B0_P1 | Main only (W09State /23 import kept, Probe calls removed) | attribution compile | 1,113,110 (R3B0) | pending (TV) | - | classification only, never adopted |
+| R3B0_P1 | Main only (W09State /23 import kept, Probe calls removed) | attribution compile | 1,113,110 (R3B0) | 1,112,872 (CE10216) | -238 | CASE A: W09State /23 itself is the cause (>= +112,873 over the /22 baseline); the Probe call path costs 238; classification only, never adopted |
+
+P1 = 1,112,872 (CE10216) -> CASE A. The two Probe calls and the view construction cost only 238; W09State /23 itself adds
+>= +112,873 without any call of the new functions. /23 differs from /22 only by two imports (W08Core /18, W08Touch /5, types
+only) and one exported UDT with W08 fields (+ two uncalled-from-P1 functions). The cost therefore sits in the cross-library
+import / foreign-type dependency of W09State (the two parts, import vs the exported UDT with foreign fields, are not
+separated by P1). Consequence for every design: a new import edge between libraries (even of a version Main already
+imports) and a foreign type in an exported UDT are treated as HIGH_COST_STRUCTURE until measured otherwise.
+
+Open question for later (not acted on; needs a measured Probe and approval): the existing library-to-library imports
+(W08Runtime -> W08Core /18 + W08Touch /5, W06 -> W05 /6, W05 -> W07 /10) may carry the same kind of cost.
+
+### R3-B1 compact architecture (design only; not implemented)
+
+TOKEN START REVIEW: Main PASS / exact UNKNOWN; status UNKNOWN; added: W08Touch-side projected injection; cross-library new
+import 0; cross-library foreign type 0; huge UDT 0; tuple 0; plan copy 0; ring copy 0; duplicate planning 0; Main business
+logic 0.
+
+| Part | Where | Form |
+|---|---|---|
+| Episode overlay | W09State (next unused version, /24) | `episodeOverlayBuild(ei, out)`: ints only, no W08 import |
+| Projected mark delta | W09State /24 | `episodeMarkDeltaBuild(tv, ei, ef, outI, outF)`: one flat row per projected mark in a W08-neutral layout (old Core slot, Core ID, kind NEW / UPDATE, and the TouchMark payload: baseSeq, time, side, contact bottom / top, close, generation, normal, touchNo, weakByDepth, maxDepth) read from the TouchStart plan row (B) or the ring row + Episode values (A); no W08 type |
+| Injection into the W08-built plans | W08Touch (/6; leaf library, imports nothing) | `projectedMarkInject(ring, tp, sp, <primitive relation arrays as mergePlanBuild / splitPlanBuild already take>, dI, dF)`: range intersection, per-Side dedupe, canonical order (the existing private compare), shared cap / truncation, ring eviction, Split append / cap fail, UPDATE patch; rules stay single-sourced in W08Touch |
+| Call site | W08Runtime (/16, same import edges: W08Core /18, W08Touch /6) | inside the existing plan build, right after `splitPlanBuild`; the two delta arrays reach it as two primitive-array fields of ShadowContext set by Main (no new signature on the Main side, no W09 type in W08) |
+| Main | wiring only | build the overlay and the delta (2 W09State calls), pass them in `ShadowContext.new` / the overlay call; nothing else |
+| Apply side (R3-B2) | W09State / Main event rows | `episodeApply` skips ring writes of consumed Cores and clears their TSS; the TouchStart `markAppend` loop skips consumed Cores (moved into W09State if it needs any predicate) |
+
+Import graph after R3-B1: unchanged edges (Main -> all; W08Runtime -> W08Core, W08Touch; W06 -> W05; W05 -> W07); only
+versions move (W08Touch /6, W08Runtime /16, W09State /24). Publishes: 3 libraries + Main compile.
+Measurement plan (proposal): first compile with the real `projectedMarkInject` wired and Main passing empty delta arrays
+(semantics unchanged; the body cost measured), then enable the delta (R3-B1 proper).

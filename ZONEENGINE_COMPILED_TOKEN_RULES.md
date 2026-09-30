@@ -530,6 +530,7 @@ START GATEで読む。
 ### INC-1: W09 B07-R3B0 compiled-cost Probe（HIGH_COST_STRUCTURE）
 
 - 事象：W09State /22 → /23（W08Core /18・W08Touch /5 をimportし、それらの型を参照する5参照のviewと、Probe関数2本をMainからreachable化。約74行）で、Mainが PASS → 1,113,110（CE10216）。増加は +113,111 以上。
-- 分類：HIGH_COST_STRUCTURE（最有力原因：cross-library type / import reachability。P1で確定させる）。
+- 分類：HIGH_COST_STRUCTURE。
+- 原因（P1で確定、CASE A）：P1（/23 importのまま、Probe呼び出し3行を除去）= 1,112,872。呼び出し経路は238のみで、W09State /23自体（W08Core /18・W08Touch /5 のimportと、W08型fieldを持つexported UDT）が +112,873以上。関数を呼ばなくてもcross-library import / foreign型だけで巨大なcompiled costになる。
 - 再発防止：別Window / libraryの巨大型を小viewに包んでも、compiled costが小さいとは仮定しない。cross-library type dependency（新しいimport、他library型のfield / 引数）は高コスト構造として事前Probe必須。
 
