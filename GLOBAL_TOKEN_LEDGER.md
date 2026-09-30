@@ -658,3 +658,28 @@ they would be re-declared in the same scope. Proposed resolution (needs approval
 `out1h` to the caller's `swing15mOut` / `swing1hOut` (their two declarations become the caller's; the journal pair works as
 in D1). Every other shared name (`lookupViolation`, `newRow`, `originKey`, `pendingRow`, `pointTick`, `rootSlot`, `subtype`)
 lives in sibling nested blocks (no overlap).
+
+### D2: inline `w03StageESwingRaw` into W03EMsa `run` (W03EMsa /9, Main W03EMsa /8 -> /9; TOKEN_REFACTOR_ONLY)
+
+Approved resolution applied: Swing block only, whole-word code-only renames `usable` -> `swingUsable` (2), `stopped` ->
+`swingStopped` (3), `out15m` -> `swing15mOut` (2), `out1h` -> `swing1hOut` (2); the MA block's `usable` / `stopped` / `k`
+untouched. The body (57 lines) sits at the old call site: `swing15mOut` / `swing1hOut` are declared there (where the tuple
+was), with the old initial values and update order; the journal pair is the caller's own (the helper's two copy-in lines,
+its 4-value return and the two write-backs removed).
+
+- Static: `w03StageESwingRaw` code references 0; `out15m` / `out1h` 0; in the Swing block `usable` 0 / `stopped` 0
+  (`swingUsable` 2 / `swingStopped` 3); the MA block identical to /8; functions 14 -> 13; tuple unpacks 6 -> 5; imports / types
+  / `array.new` / `.copy` 0; diff = the deleted helper (63 lines incl. comment) and the replaced call (3 -> 60 lines); the
+  moved body equals the old body after the reverse rename (57 lines); removed: signature 74, forwarding 74, one tuple.
+- Test `d2_det.py` (the /8 segment MA block + Swing call + write-backs with the real old helper vs the /9 segment MA block +
+  inlined Swing block, same `run` environment; recording stubs for the 7 callees; outputs include the MA block's usable /
+  stopped / k): normal, no Swing, 15m / 1h not adoptable, Resistance-only / Support-only swings, TF bit on / off, pending
+  row with predicted slot / id and a journal TF merge row, unusable inputs, Swing lookup violation, violation from the MA
+  block, MA off / MA full then Swing (no interference), mintick 0, mixed journal growth: 15/15 (0.16 s; first run had 4
+  fixture errors: the append stub did not grow the parallel journal arrays, both versions failed identically; fixed).
+  Mutants 2/2 killed (stop flag left as the MA `stopped`; 1h output not updated). R3-B1 29 not rerun. Source proxy: 6,637
+  -> 6,113.
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| D2 | W03EMsa /8 -> /9 (Main pin) | inline `w03StageESwingRaw` | 1,002,458 (CE10216) | pending (TV) | pending | CE10216 with a number -> Delta = 1,002,458 - After; PASS -> After < 1,000,000, Delta > 2,458 (no estimate) |
