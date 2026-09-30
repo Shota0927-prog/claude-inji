@@ -682,4 +682,42 @@ its 4-value return and the two write-backs removed).
 
 | ID | Module | Change | Before | After | Delta | Status |
 |---|---|---|---|---|---|---|
-| D2 | W03EMsa /8 -> /9 (Main pin) | inline `w03StageESwingRaw` | 1,002,458 (CE10216) | pending (TV) | pending | CE10216 with a number -> Delta = 1,002,458 - After; PASS -> After < 1,000,000, Delta > 2,458 (no estimate) |
+| D2 | W03EMsa /8 -> /9 (Main pin) | inline `w03StageESwingRaw` | 1,002,458 (CE10216) | 1,001,847 (CE10216) | -611 | LOW; ADOPTED |
+
+Status after D2: Main 1,001,847 / 1,000,000, headroom -1,847, RED (leaving RED needs >= 26,847; GREEN >= 51,847). Policy
+change: MICRO TOKEN REFACTOR stopped, HIGH-IMPACT STRUCTURAL REFACTOR. D3 = DEFERRED_HIGH_IMPACT_PHASE; T1 / T2 / T3 =
+DEFERRED_BUNDLE (kept, not implemented).
+
+### GT-5A audit: W03Apply `applyThroughF4` single-call helper family (no Production change)
+
+All private helpers called by `applyThroughF4` (each has exactly one call site in the whole file, inside the op dispatch of
+the group / row loop; no var / history / ta / request / break / continue / allocation in any body; no helper assigns its
+parameters; every other argument is the same-named `applyThroughF4` parameter):
+
+| Helper | Params | Forward-only | Mapped (caller value) | Return | Body lines | Locals | Writes | Collisions at the call site (renames) | Inlined max nest | Class |
+|---|---|---|---|---|---|---|---|---|---|---|
+| newRootApplyRaw | 106 | 104 | `nextRootId` <- `nextRootIdLocal` (hazard: `applyThroughF4` has its own `nextRootId` parameter, so every use must be substituted), `journalRow` <- `row` | `[result, nextRootIdOut]` -> `[newSlot, newNextRootId]` | 91 | 30 | root arrays (categories, confirmed times, directions, FVG fresh / Broad / dynamic / range flags, labels, ...), journal target slot / expected ID | ok, category, direction (3) | 32 (8 levels) | SAFE_INLINE |
+| fvgInvalidateApplyRaw | 87 | 86 | `journalRow` <- `row` | `structuralDetached and stateMoved` -> `ok` | 53 | 17 | rootStates (via set helpers) | ok, direction (2) | 28 (7) | SAFE_INLINE |
+| fvgFreshEndApplyRaw | 87 | 86 | `journalRow` <- `row` | `detached` -> `ok` | 51 | 16 | rootFvgFreshFlags | ok, direction (2) | 32 (8) | SAFE_INLINE |
+| maUpdateApplyRaw | 74 | 73 | `journalRow` <- `row` | `ok` -> `ok` | 36 | 10 | confirmed / origin times, last update seqs, price order | ok, rootSlot, subtype (3) | 28 (7) | SAFE_INLINE |
+| swingTfMergeApplyRaw | 67 | 66 | `journalRow` <- `row` | `ok` -> `ok` | 39 | 9 | rootSwingTfMasks | ok (1) | 32 (8) | SAFE_INLINE |
+| timeHlLabelApplyRaw | 67 | 66 | `journalRow` <- `row` | `ok` -> `ok` | 30 | 7 | rootLabelMasks | ok (1) | 24 (6) | SAFE_INLINE |
+| rootRetireApplyRaw | 67 | 66 | `journalRow` <- `row` | `retired` -> `ok` | 44 | 11 | rootStates | ok (1) | 32 (8) | SAFE_INLINE |
+| pendingNewFvgRowRaw | 8 | 7 | `freshRow` <- `row` (its own local `row` collides) | `[matchRow, matchCount]` | 13 | 6 | none | direction, row (2) | 36 (9, above the file max 32) | SAFE_INLINE (excluded: 8 params, raises the max nest) |
+
+NOT_SAFE: none. NOT_SINGLE_CALL: none among the direct helpers (the second-level chain `newRootApplyRaw` -> `rootAllocSlotRaw`
+(46) -> `rootResetSlotRaw` (42) is single-call too; a later GT-5B candidate, not in GT-5A).
+
+RECOMMENDED_GT5A_BUNDLE = the 7 apply helpers (newRoot, fvgInvalidate, fvgFreshEnd, maUpdate, swingTfMerge, timeHlLabel,
+rootRetire), each body moved verbatim into its own dispatch branch (sibling branches; no cross-helper interaction):
+removed parameters 555, removed forwarding 555, removed tuples 1 (newRoot), body lines 344, renames 13 (the colliding callee
+locals only; each result goes back through one `ok :=` / tuple-equivalent assignment at the old position), substitutions
+`journalRow` -> `row` (7 helpers) and `nextRootId` -> `nextRootIdLocal` (newRoot), max nest 32 = the current file max
+(no increase), W03Apply /4 -> /5 (unused) + Main pin: 1 publish, semantic risk LOW-MEDIUM (mechanical, but 344 lines and 21
+name edits). Journal / apply / F-stage order, fail-closed, rollback, masks, slots, IDs, prices, ticks untouched.
+
+Measured context (not an estimate of GT-5A): D1 removed 51 params -> -551, D2 74 params -> -611. At those measured rates the
+555-parameter bundle would not by itself reach the 26,847 needed to leave RED. The one measured large lever so far is the
+cross-library import / foreign-type cost (INC-1: +112,873 for two imports into W09State). The existing library-to-library
+imports (W08Runtime -> W08Core /18 + W08Touch /7, W06 -> W05 /6, W05 -> W07 /10) are therefore candidates for one
+attribution Probe (requires approval).

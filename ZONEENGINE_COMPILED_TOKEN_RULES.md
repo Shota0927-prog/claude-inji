@@ -544,3 +544,9 @@ START GATEで読む。
 - 分類：TOKEN_PROBE。
 - 再発防止：「配線ProbeがPASSしても、本体側に複数helper / loop / canonical処理追加があるsemantic Batchでは、本体物理構造を含む中間Gateを検討する。」
 
+### LESSON-3: RED中の大きな削減（運用ルール）
+
+- RED状態で必要削減量が大きい場合、500token級のmicro-refactorをpublish単位で連続実施しない。
+- 同一module・同一callerのLOW-risk single-call helper群をbundle監査し、意味論不変の範囲で大きい物理境界をまとめて消す。
+- 実測：D1（51 params）-551、D2（74 params）-611。
+
