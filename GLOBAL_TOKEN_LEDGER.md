@@ -721,3 +721,46 @@ Measured context (not an estimate of GT-5A): D1 removed 51 params -> -551, D2 74
 cross-library import / foreign-type cost (INC-1: +112,873 for two imports into W09State). The existing library-to-library
 imports (W08Runtime -> W08Core /18 + W08Touch /7, W06 -> W05 /6, W05 -> W07 /10) are therefore candidates for one
 attribution Probe (requires approval).
+
+### HIGH-IMPACT TOKEN ATTRIBUTION: existing cross-library import cost (one Probe, one compile)
+
+GT-5A (7 apply helpers, 555 params / 555 forwarding / 1 tuple) = APPROVED_DEFERRED (kept; resumed if the attribution does
+not open a larger structural change).
+
+Static comparison of the existing library-to-library edges (Main imports: W03F0, W03Apply, W03ETimeFvg, W06, W07, W08Core,
+W08Touch, W08Runtime, W03EMsa, W09State):
+
+| Edge | Target size (functions / exports / exported types / source) | Used by the importer | Foreign types | Main also imports the target | Probe cost / contamination |
+|---|---|---|---|---|---|
+| A: W08Runtime -> W08Core /18, W08Touch /7 | 49 / 31 / 3 / 23,524 and 27 / 10 / 3 / 8,344 | 22 + 6 functions, 40 call sites | W08Store, CoreRegistryStore, PendingTopologyStore, TouchPlan, SplitTouchPlan, TouchRing; exported ShadowContext has foreign fields (the INC-1 pattern) | yes (both) | no clean Probe: removing the edge means rewriting the W08Runtime plan / commit path and its exported types |
+| B: W06 -> W05 /6 | 27 / 3 / 0 / 23,575 | 3 functions, 3 call sites | none | no | 1 publish (W06 with W05 merged in), but the W05 -> W07 edge would move to W06 |
+| C: W05 -> W07 /10 | 22 / 14 / 0 / 11,148 | 2 functions (closure of 3), 4 call sites | none | yes (duplicate import, as in INC-1) | 2 probe publishes, same code reachable, cleanest attribution |
+
+RECOMMENDED_IMPORT_PROBE = C (W05 -> W07). It is the INC-1 situation (a library Main already imports, imported again by a
+worker) without foreign types, the code stays byte-for-byte the same logic, and no module loses anything else.
+
+Probe C (Production files unchanged; separate probe library names, no Production version used):
+- `token_probes/R3B1C_W05Candidate_Worker_NoW07Probe.pine` = W05 /6 with no W07 import; the 4 `W07Fvg.` call sites call
+  verbatim copies of the W07 closure `fvgIntervalOrderBuild`, `fvgIntervalQuery`, `fvgIntervalLowerBoundRaw` (export
+  keyword removed) appended at the end; one constant added (`FVG_INTERVAL_BUILD_INVALID_INPUT = 1`, W07's value;
+  `FVG_INTERVAL_BUILD_OK`, `ID_NONE`, `SLOT_INVALID` already equal). Library name `ZoneEngineV2_W05Candidate_Worker_NoW07Probe`.
+- `token_probes/R3B1C_W06Component_Worker_NoW07Probe.pine` = W06 /23 with only the library name and the W05 import changed
+  (-> `ZoneEngineV2_W05Candidate_Worker_NoW07Probe/1`).
+- `token_probes/R3B1C_Rebuild_Main_Probe.pine` = Main with only two import lines changed: W06 -> the W06 probe /1, and the
+  ballast W03EMsa /9 -> /7.
+
+Reachability audit: W05 / W06 reachable code unchanged (the same functions, the 3 W07 functions now private in W05); W07
+reachable from Main 22 -> 21 (only `fvgIntervalOrderBuild` leaves W07); `fvgIntervalQuery` and `fvgIntervalLowerBoundRaw`
+stay reachable inside W07 through Main's W07 roots, so the Probe holds them twice (a bias against the saving: the measured
+delta = edge cost - that duplicate); nothing else in any module changes; no stub, no constant folding.
+
+PASS-only information check and the ballast: baseline 1,001,847 is only 1,847 over the limit, so a plain Probe would PASS
+for any delta above 1,847 and tell nothing more. The probe Main therefore pins W03EMsa /7 instead of /9: measured exactly
++1,162 with every other pin identical (1,003,009 at D1's Before vs 1,001,847 now; assumed additive, a different library).
+Reading: Probe = 1,003,009 - delta. CE10216 with a number -> delta = 1,003,009 - Probe (exact; LOW if < 3,000). PASS ->
+delta > 3,009 (at least MEDIUM; the exact size stays unknown). A decision is needed on what a PASS leads to (the current
+rule says "PASS -> no further Probe, back to GT-5A").
+
+| ID | Probe | Change | Baseline | Probe compiled | Delta | Status |
+|---|---|---|---|---|---|---|
+| IP-C | W05 -> W07 import removed (probe libraries), ballast W03EMsa /7 (+1,162) | 2 probe publishes + 1 Main compile | 1,001,847 (+1,162 ballast = 1,003,009) | pending (TV) | pending | attribution only, never adopted |
