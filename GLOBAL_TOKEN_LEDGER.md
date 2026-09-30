@@ -50,15 +50,42 @@ Checkpoint rule from here: every semantic Mini-Batch ends with a Main compile; f
 
 | ID | Probe | Change | Before | After | Delta | Effect | Semantic change | Test | Adopt / Revert |
 |---|---|---|---|---|---|---|---|---|---|
-| M2 | W05Cand unreachable, W06Comp kept (dynamic stubs in a probe copy of W06) | publish `token_probes/M2_W06Component_Worker_M2Probe.pine` as its own library once; Main import line 6 -> it | 1,000,878 | pending | exact if CE10216 shows a number; PASS -> W05 > 878 only | W05 share | probe only | none | never adopted |
+| M2 | W05Cand unreachable, W06Comp kept (dynamic stubs in a probe copy of W06) | not published | 1,000,878 | - | - | - | probe only | none | DEFERRED |
 
 M2 probe copy of W06 /19: library renamed `ZoneEngineV2_W06Component_Worker_M2Probe`, the W05 import removed, the three W05 calls
 (`selectComponentBothSides` 33 values, `compareCandidates` int, `selectBothSides` 31 values) replaced by `m2Stub33(bar_index)`,
 `(bar_index % 3 - 1)`, `m2Stub31(bar_index)` (int fields x + k, bool fields x % k == 0); 14 changed lines. Reachability audit
 (baseline `b12adcd` vs Main + probe W06): unreachable W05Cand 27 functions (23,574 source) and W07Fvg `fvgIntervalOrderBuild`
 (623, W05-only dependency); W06Comp 19 of 19 functions still reachable (+ the two stubs); nothing else lost.
-Decision: >= 5,000 -> W05 first; 2,000-4,999 -> W05 candidate; < 2,000 -> W06 first; PASS (exact unknown) -> one W06-only probe
-at most, then decide.
+M2 = DEFERRED: publishing the probe library costs a publish slot and only attributes cost; a direct TOKEN_REFACTOR_ONLY
+refactor of the known W05 duplication (StageA / StageC) is worth more. The probe file stays in `token_probes/` (unpublished).
+
+### GT-2: W05 StageA / StageC enumeration shared (TOKEN_REFACTOR_ONLY)
+
+| ID | Module | Change | Before | After | Delta | Effect | Semantic change | Test | Adopt / Revert |
+|---|---|---|---|---|---|---|---|---|---|
+| GT-2 | W05Cand /5 -> /6 (+ W06Comp /19 -> /20 import W05 /6 only; Main W06 /20) | `candEnumerateStageARaw` + `candEnumerateStageCRaw` -> one `candEnumerateStageACRaw(..., stage)` | 1,000,878 | pending (TV) | pending | pending | 0 | det 15/15 + mutants 8/8 killed | pending: HIGH / MEDIUM adopt, LOW adopt if risk small, NONE revert |
+
+Source proxy: W05 25,478 -> 23,575 (-1,903 source tokens; compiled unknown until TV).
+
+Audit (StageA 274 lines vs StageC 302 lines, 201 identical):
+
+| Class | Block | Handling |
+|---|---|---|
+| COMMON identical | prologue (side / scratch / FVG scratch checks), branch-and-bound, window reset / enter, Psych variant loop, FVG per-entry checks and INSIDE / PROXIMAL / C1 / C3 / C4 ranges, FVG High, vCreated / vMinId | shared as is |
+| COMMON parameter only | Stage constant (8 calls: QualityFinish x2, Offer x2, BroadLocalization x4) | `stage` argument |
+| COMMON parameter only | window width D: A `denseTick`, C `mTick` (bound advance, base width, Psych bounds, Psych variant width) | `wTick = isA ? denseTick : mTick` |
+| COMMON parameter only | density accepted: A High, C High or Normal (2 places) | `DEN_HIGH or not isA and DEN_NORMAL` |
+| A_ONLY | W07 B14 FVG interval index (state, first-pass pre-scan, LEGACY / replay, indexed loop bound, replay `ok := false`) | kept verbatim; C starts with `fvgIndexReady = not isA`, `fvgLegacy = not isA` -> never builds the index, full scan 0 .. fvgN - 1, no replay (the old C loop exactly) |
+| C_ONLY | FVG-only candidates (standalone / overlap / C2 Broad, Psych variants) after the point loop | kept verbatim, gated `while ok and not isA and fi < fvgN` |
+| Semantic difference merged | none | - |
+
+Callers: the 4 call sites pass `CAND_STAGE_A` / `CAND_STAGE_C`; call order unchanged (A, B, then C; Stage C phase; CONTEXT_SCAN A, B, C).
+Test (`w05ac_det.py`, interpreted before vs after, every callee a recording oracle stub; PASS = same return, same ordered call
+trace with every argument, i.e. every Offer in order, same final ctx): A / C normal, Support / Resistance, tie (constant C / H),
+no candidate, multiple candidates with equal width / createdTime / minRootId, Broad heavy + CONTEXT_SCAN, FVG index LEGACY
+(duplicate rootId) + replay (na confirmedTime), C FVG-only tail, Psych off, fail propagation: 15/15. Mutants (A accepts Normal
+x2, wTick fixed x2, Psych bound, C index on, C legacy off, tail on A) 8/8 killed.
 
 ## Probes (Phase B) (Phase B: compiled cost attribution; publish 0, Main compile only; cumulative)
 
