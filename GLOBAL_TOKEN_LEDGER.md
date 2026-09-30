@@ -195,7 +195,7 @@ evaluation point (the FULL fallback branch after the `keepCache` clearing), the 
 
 | ID | Module | Change | Before | After | Delta | Effect | Semantic change | Test | Status |
 |---|---|---|---|---|---|---|---|---|---|
-| GT-4A | W06Comp /20 -> /21 (Main W06 /21) | fold `fullFallbackRaw` into its single call site | <1,000,000 | - | - | - | 0 (SEMANTIC_EQUIVALENCE = PROVEN, pure pass-through) | GT-4A + GT-4B harness 15/15 | IMPLEMENTED in W06 /21 (bundle with GT-4B), TV pending |
+| GT-4A | W06Comp /20 -> /21 (Main W06 /21) | fold `fullFallbackRaw` into its single call site (99-parameter signature removed, 99 forwarded arguments removed) | <1,000,000 | <1,000,000 (Main PASS) | UNKNOWN | - | UNCHANGED | GT-4A + GT-4B harness 15/15 | ADOPTED |
 
 ### GT-4B audit: inline `runComponentRaw` into `recomputeAndMerge` (APPROVED; not implemented yet)
 
@@ -228,7 +228,7 @@ publish). Harness plan: interpreted old vs new `recomputeAndMerge` with `buildCo
 
 | ID | Module | Change | Before | After | Delta | Effect | Semantic change | Test | Status |
 |---|---|---|---|---|---|---|---|---|---|
-| GT-4B | W06Comp /20 -> /21 (with GT-4A) | inline `runComponentRaw` into its single call site | <1,000,000 | pending (TV) | exact delta not measurable (Before exact unknown) | - | 0 | det 15/15, mutants 5/5 killed, static PASS | IMPLEMENTED in W06 /21, TV pending (Main PASS -> ADOPT_CANDIDATE) |
+| GT-4B | W06Comp /20 -> /21 (with GT-4A) | inline `runComponentRaw` into its single call site (134-parameter signature removed, 134 forwarded arguments removed) | <1,000,000 | <1,000,000 (Main PASS) | UNKNOWN | - | UNCHANGED | det 15/15, mutants 5/5 killed, static PASS | ADOPTED |
 
 ### GT-4A + GT-4B implementation (W06 /21, Main W06 /20 -> /21)
 
@@ -253,3 +253,47 @@ publish). Harness plan: interpreted old vs new `recomputeAndMerge` with `buildCo
   count mismatch), W05 / merge failure, build FULL_FALLBACK (GT-4A pass-through): 15/15, 0.4 s. Mutants 5/5 killed
   (raw `capacity`, raw input epoch, raw epoch in the GT-4A call, lost epoch update, fixed row).
 - Source proxy (reference only): W06 31,275 -> 29,524 (-1,751).
+
+GT-4A + GT-4B result: Main PASS (<1,000,000, exact value not shown). Removed signatures 99 + 134 parameters, removed
+forwarding 233 arguments, compiled delta UNKNOWN, semantics UNCHANGED. Decision: ADOPT.
+
+## Baseline after GT-4A + GT-4B
+
+W05Cand /6, W06Comp /21, W03Apply /4, W03F0 /5, W03ETimeFvg /3, W03EMsa /7, W07Fvg /10, W08Core /18, W08Touch /5,
+W08Runtime /15, W09State /22. Main PASS (<1,000,000, exact unknown). R3-A FROZEN; R3-B not started.
+
+### GT-4C audit: W06 buildComponents -> compExpandFixedPointRaw -> compExternalLinksRaw (APPROVED; not implemented)
+
+Mechanical audit (`gt4_inline_audit.py`, all 12 Production files searched):
+
+| Check | compExpandFixedPointRaw (into buildComponents) | compExternalLinksRaw (into compExpandFixedPointRaw) |
+|---|---|---|
+| Parameters / arguments | 56 : 56, 1:1 in order | 55 : 55, 1:1 in order |
+| Call sites / references | 1 (line 1709) / definition + that call only | 1 (line 790) / definition + that call only |
+| Export / recursion / other paths | private / none / reachable only through that call | private / none / reachable only through that call |
+| Identity arguments | 55 (all `buildComponents` parameters) | 55 (54 `compExpandFixedPointRaw` parameters + the loop local `currentSlot`) |
+| Mapped | `visitEpoch` <- `workEpoch` (caller local; hazard: `buildComponents` has its own `visitEpoch` parameter, so every `visitEpoch` in the moved code must become `workEpoch`: 3 in compExpand + 9 in compExternal after the chain) | none |
+| Params assigned inside | none | none |
+| Return | `finalRootCount` (int) -> `fr` | `[addedCount, failed]` -> `addedTotal += addedCount`, caller `failed := <callee failed>` |
+| Allocation / state | no `array.new` / `copy` / `from` / `map.new`, no `var` / `varip`, no history, no `ta.` / `request.` | same; writes `candQueueRootSlots` (push) and `candVisitedEpochByRootSlot` (set), the same objects |
+| break / continue | none | none |
+| Loops | FIFO fixed-point over `candQueueRootSlots` (`readIndex` until the queue stops growing), verbatim | external-link scans verbatim (Side / Root / queue order unchanged) |
+| Collisions visible at the call site | `failed` (caller's job `failed`) | `failed`, `currentMask`, `currentIsPc`, `currentIsFc` (the caller's own copies); after the chain also `rootCount` (buildComponents) |
+| Same names in non-visible sibling scopes | - | `t`, `currentCategory`, `c` (no overlap) |
+| Resolution | rename the moved local `failed` only | rename the moved locals `failed`, `rootCount`, `currentMask`, `currentIsPc`, `currentIsFc` only |
+| Scope / lifetime | the renamed locals stay declared at the same point of the moved body, re-initialised per call -> per loop iteration: identical | same |
+| Existing duplicate reads | - | compExternal recomputes `currentMask` / `currentIsPc` / `currentIsFc` from `currentSlot` as today (kept verbatim, not merged with the caller's copies) |
+
+Conditions: A single-call YES (both), B order YES, C new recomputation 0, D new allocation 0, E mutation order YES, F return
+YES, G new high-cost structure 0, H rename-only YES (6 locals), I risk MEDIUM (3,065-token body; about 30 renamed occurrences;
+the `visitEpoch` -> `workEpoch` substitution through two levels).
+
+Compile-only risk (not semantic): after both levels the deepest line sits at 76 spaces (19 levels; the file maximum today is
+48 / 12). Pine publishes no nesting limit that the audit can check; only the TV compile decides. Fallback if it fails:
+GT-4C' = compExpandFixedPointRaw into buildComponents only (56 parameters, deepest 36 / 9 levels), compExternalLinksRaw kept.
+
+Decision: GT-4C = APPROVED (both levels, 111 parameters + 111 forwarded arguments; not implemented).
+
+GT-4D pre-check (W03EMsa, no detailed audit): `run` -> `w03StageEMaRaw` (51 params), `w03StageESwingRaw` (74),
+`w03StageEAccumRaw` (88): each has exactly one call site (W03EMsa lines 469 / 472 / 475) -> single-call YES for all three.
+Main still holds unreachable same-named legacy definitions (no call site; not Production code paths).
