@@ -877,3 +877,43 @@ GT-5A comparison (structure, not compiled estimate):
   maintenance improves (FVG interval index gets one owner, W05 no longer depends on the whole W07).
 - The only measured evidence is Probe C (> 3,009 for removing the edge); GT-5A is unmeasured. Order stays: Import C
   design A first (if approved), GT-5A APPROVED_DEFERRED.
+
+### IMPORT C A: Production implementation (TOKEN_REFACTOR_ONLY; TV pending)
+
+TOKEN START REVIEW: Main 1,001,847 / 1,000,000 (CE10216), headroom -1,847, RED. Planned: move the 3 FVG interval
+helpers from W07 /10 to a new `ZoneEngineV2_W07Interval_Worker` /1 (single authority); W05 and W07 import it; W05 no
+longer imports W07. Probe: done (IP-C PASS, > 3,009 for removing the edge); A adds 2 edges to a type-free 3-function
+library (effect UNKNOWN until the compile). Main business logic added: NO.
+
+Consumer check before the change (repo-wide grep of the 3 names): Production consumers = W05 only; Main direct = 0;
+other Production workers = 0. Non-Production only: `ZoneEngineV2_W05Candidate_B19Probe`, the W07 B17 Fresh and B19
+CandidateInterval conformance harnesses, all pinned to W07 /10 (immutable published version, unaffected).
+
+Changes (publish order fixed):
+1. `ZoneEngineV2_W07Interval_Worker.pine` /1 (new): header, the 4 constants (ID_NONE, SLOT_INVALID,
+   FVG_INTERVAL_BUILD_OK / _INVALID_INPUT, W07 /10 values), and the 187-line W07 /10 block moved verbatim
+   (`fvgIntervalLowerBoundRaw` private, `fvgIntervalOrderBuild` / `fvgIntervalQuery` exported as in W07 /10). No import,
+   no type, no state.
+2. W07 /11: block removed (no wrapper), `import ZoneEngineV2_W07Interval_Worker/1 as W07Interval`, the one internal call
+   in `freshFacts` -> `W07Interval.fvgIntervalQuery`, header comment updated. W07 exports 14 -> 12. The now-unused
+   FVG_INTERVAL_BUILD_* constants stay (no logic).
+3. W05 /7: `W07Fvg /10` import -> `W07Interval /1`; the 4 call sites change only the prefix `W07Fvg.` -> `W07Interval.`.
+4. W06 /24: W05 import /6 -> /7 only.
+5. Main: W06 /23 -> /24, W07 /10 -> /11 only (W03EMsa stays /9). Rollback = W06 /23, W07 /10 (published, untouched).
+
+Dependency graph after: Main -> W06 -> W05 -> W07Interval; Main -> W07 -> W07Interval; W08Runtime -> W08Core, W08Touch.
+
+Static gate: PASS. W05 -> W07 = 0, W05 -> W07Interval = 1, W07 -> W07Interval = 1, W07Interval imports = 0; each of the
+3 functions defined once (W07Interval), 0 in W07 / W05 (authority 1, duplicate body 0, wrapper 0); moved block
+byte-identical to W07 /10; cycle 0; types in W07Interval 0 (foreign UDT 0); W07 diff = block + import + 1 call prefix
++ 2 comment lines; W05 diff = import + 4 prefix-only call sites; Main diff = 2 pin lines (business logic 0).
+
+Deterministic (scratchpad `ic_det.py`, W07 /10 snapshot vs W07Interval /1, return + mutated output arrays compared):
+15/15 PASS - OrderBuild empty / single / multi with duplicate prices / invalid len / duplicate slot / slot range /
+rootId 0; Query equal boundary / multi range / none / lo > hi / na / empty index; LowerBoundRaw strict vs non-strict /
+bad probed slot. Sensitivity: 2 mutants (strictGreater compare, bottom <= top check) each fail 1 case. random 0,
+5k / 50k / 200k 0, R3-B1 29 cases not re-run, runtime < 1 s.
+
+TV Gate: pending. PASS -> Import C A ADOPT; stop token refactors (GT-5A, D3, T1-T3, further import search DEFERRED);
+return to W09 B07 R3-B2; no extra compression toward 975k / 950k. CE10216 -> record delta = 1,001,847 - After exactly,
+STOP, no automatic GT-5A.
