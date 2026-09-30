@@ -29,7 +29,16 @@ Historical data points: C1 `207,147` source = 1,000,146 compiled; B07 overflow 1
 Observed compiled / source ratio of refactors: 0.9 (H-3) to 1.7 (H-2), far below the whole-code average (~4.8): shorter
 source through small helpers returns little. Candidates are ranked by structure, then calibrated by probes.
 
-## Pending probes (Phase B: compiled cost attribution; publish 0, Main compile only; cumulative)
+## Adopted
+
+| ID | Module | Change | Before | After | Known minimum reduction | Effect | Semantic change | Test | Status |
+|---|---|---|---|---|---|---|---|---|---|
+| GT-1 | Main pins | W03Apply /3 -> /4, W03F0 /4 -> /5, W03ETimeFvg /2 -> /3 (published TOKEN_REFACTOR_ONLY versions; sources from `1445b76`) | 1,005,307 | <1,000,000 (exact unknown) | > 5,307 | Bundle HIGH | 0 | existing equivalence PASS reused (W03Apply det 147 + 1k, W03F0 det 28 + 5k, W03ETimeFvg det 13 + 5k); static: export signatures identical | adopted on `claude/global-token-optimization`; Main compile pending |
+
+Checkpoint rule from here: every semantic Mini-Batch ends with a Main compile; further optimization only when a compile needs it
+(next candidates then: W05 / W06, giant signatures). W05 / W06 / giant-signature refactors are not started now.
+
+## Probes (Phase B) (Phase B: compiled cost attribution; publish 0, Main compile only; cumulative)
 
 Start: the baseline Main (`41e0440`: W03F0 /4, W03Apply /3, W03ETimeFvg /2, W06 /19, W07 /10, W08Core /18, W08Touch /5,
 W08Runtime /15, W03EMsa /7, W09State /21), 1,005,307. G1 -> G3 are cumulative; M1 is applied to the baseline alone (so a PASS
@@ -40,8 +49,9 @@ alone proves a W06 + W05 share > 5,307).
 | G1 | W03Apply /3 -> /4 | import line 4 | 1,005,307 | 1,003,537 | -1,770 | LOW | 0 (published, verified) | det 147 + 1k smoke (earlier) | adopt candidate (bundle) |
 | G2 | W03F0 /4 -> /5 | import line 3 | 1,003,537 | 1,001,007 | -2,530 | MEDIUM | 0 (published, verified) | det 28 + 5k (earlier) | adopt candidate (bundle) |
 | G3 | W03ETimeFvg /2 -> /3 | import line 5 | 1,001,007 | <1,000,000 (PASS, exact value not shown) | <= -1,008 (lower bound) | LOW or more | 0 (published, verified) | det 13 + 5k (earlier) | adopt candidate (bundle) |
-| G-bundle | G1 + G2 + G3 | - | 1,005,307 | <1,000,000 | <= -5,308 (lower bound) | HIGH | 0 | - | adopt candidate; integrated after M1 |
-| M1 | W06Comp + W05Cand unreachable (dynamic stubs, attribution only), on the baseline alone (W03 /3 /4 /2) | 3 calls -> 2 local stubs of `bar_index` | 1,005,307 | pending | exact if CE10216 shows a number; PASS -> > 5,307 (HIGH) | module share | probe only | none | never adopted |
+| G-bundle | G1 + G2 + G3 | - | 1,005,307 | <1,000,000 | <= -5,308 (lower bound) | HIGH | 0 | existing equivalence PASS reused | ADOPTED (GT-1) |
+| M1 | W06Comp + W05Cand unreachable (dynamic stubs, attribution only), on the baseline alone (W03 /3 /4 /2) | 3 calls -> 2 local stubs of `bar_index` | 1,005,307 | <1,000,000 (PASS, exact value unknown) | W05 + W06 cost > 5,307 | HIGH (lower bound) | probe only | none | never adopted; further attribution DEFERRED |
+| M2 | W05 / W06 internal structure attribution | - | - | - | - | DEFERRED | - | - | - |
 | M1-const | constant-tuple stubs | - | - | - | - | REJECTED_PROBE_DESIGN | - | - | - |
 | S1 | synthetic 100-parameter function | - | - | - | - | DEFERRED | - | - | - |
 
