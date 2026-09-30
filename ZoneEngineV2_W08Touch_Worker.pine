@@ -32,6 +32,11 @@
 // canonical order, cap and truncation are unchanged; a dropped / overwritten row loses its 11 fields together.
 // W09 B06-B2C-C2 (/5, structural only): one row compare body for the ring / Merge plan orders and one 11-field row push
 // helper for the Merge / Split plans; plans, orders, dedupe, cap and truncation unchanged.
+// W09 B07-R3B1 (/7): projected mark injection. The Merge / Split TouchMark plans read each source old as it will be after this
+// bar's F0 writes: this bar's TouchStart new marks appended to the source ring (markAppend: a full ring loses its oldest
+// rows, each loss truncating its Side) and the Episode marks carrying their WeakByDepth / max depth pct (episodeApply).
+// The plan rules are unchanged (Merge: range, dedupe, canonical order, shared cap drop; Split: logical order, no dedupe,
+// child cap FAIL). The persistent ring is never written here.
 // ============================================================
 library("ZoneEngineV2_W08Touch_Worker", overlay = false)
 
@@ -47,7 +52,7 @@ const int SEQ_UNSET       = -1
 // col 0 Side slot (Core slot * 2 + 0 Support / + 1 Resistance), 1 touchNo, 2 flags (bit 32 = the mark is WeakByDepth),
 // 3 Core ID, 4 generation ID, 7 TouchStart plan row (-1 = existing ActiveTouch), 8 ring row of the existing mark (-1 = none),
 // 9 override. Episode floats (ef): stride 6, col 0 / 1 range bottom / top, 4 Episode max depth pct. TouchStart plan ints:
-// stride 30, col 1 Core slot, 3 generation ID, 4 side, 6 touchNo, 16 start seq (mark baseSeq), 17 start time (mark time),
+// stride 30, col 1 Core slot, 2 Core ID, 3 generation ID, 4 side, 6 touchNo, 16 start seq (mark baseSeq), 17 start time (mark time),
 // 27 isNormal (1). TouchStart plan floats: stride 7, col 2 / 3 contact bottom / top, 4 close at touch.
 const int EI_STRIDE          = 10
 const int EI_SIDE_SLOT       = 0
@@ -65,6 +70,7 @@ const int EF_RANGE_TOP       = 1
 const int EF_EPISODE_MAX     = 4
 const int PI_STRIDE          = 30
 const int PI_CORE_SLOT       = 1
+const int PI_CORE_ID         = 2
 const int PI_GENERATION_ID   = 3
 const int PI_SIDE            = 4
 const int PI_TOUCH_NO        = 6
@@ -233,35 +239,126 @@ export historyExtract(TouchRing ring, int coreSlot, int expectedCoreId, int side
 // Resistance 1), contact bottom, contact top ASC. Used only to store / cap a Merge touch plan.
 // B06-B2C-C2 (/5, structural): the canonical order compare on one set of payload arrays (time, baseSeq, Support < Resistance,
 // contact bottom, contact top); the ring and the Merge plan orders below are this compare on their arrays.
-rowCompareRaw(array<int> ts, array<int> qs, array<int> sd, array<float> bs, array<float> us, int a, int b) =>
-    int c = array.get(ts, a) - array.get(ts, b)
+keyCompareRaw(int ta, int tb, int qa, int qb, int sa, int sb, float ba, float bb, float ua, float ub) =>
+    int c = ta - tb
     if c == 0
-        c := array.get(qs, a) - array.get(qs, b)
+        c := qa - qb
     if c == 0
-        c := (array.get(sd, a) == SIDE_SUPPORT ? 0 : 1) - (array.get(sd, b) == SIDE_SUPPORT ? 0 : 1)
+        c := (sa == SIDE_SUPPORT ? 0 : 1) - (sb == SIDE_SUPPORT ? 0 : 1)
     if c == 0
-        float ba = array.get(bs, a)
-        float bb = array.get(bs, b)
-        float ta = array.get(us, a)
-        float tb = array.get(us, b)
-        c := ba < bb ? -1 : ba > bb ? 1 : ta < tb ? -1 : ta > tb ? 1 : 0
+        c := ba < bb ? -1 : ba > bb ? 1 : ua < ub ? -1 : ua > ub ? 1 : 0
     c > 0 ? 1 : c < 0 ? -1 : 0
-mergeRowCompareRaw(TouchRing ring, int a, int b) =>
-    rowCompareRaw(ring.touchMarkTimes, ring.touchMarkBaseSeqs, ring.touchMarkSides, ring.touchMarkContactBottoms, ring.touchMarkContactTops, a, b)
-// B06-B2C-C2 (/5, structural): one ring row (physical x) appended whole (11 fields) to a plan's payload arrays; used by the
-// Merge plan (rows of the relation-side's Side: the Side value is the ring's) and the Split plan (cb / ct = the ring contact).
-rowPushRaw(TouchRing ring, int x, array<int> q, array<int> t, array<int> sd, array<float> b, array<float> u, array<float> c, array<int> g, array<bool> nm, array<int> no, array<bool> wd, array<float> md) =>
-    array.push(q,  array.get(ring.touchMarkBaseSeqs, x))
-    array.push(t,  array.get(ring.touchMarkTimes, x))
-    array.push(sd, array.get(ring.touchMarkSides, x))
-    array.push(b,  array.get(ring.touchMarkContactBottoms, x))
-    array.push(u,  array.get(ring.touchMarkContactTops, x))
-    array.push(c,  array.get(ring.touchMarkCloseAtTouches, x))
-    array.push(g,  array.get(ring.touchMarkGenerationIds, x))
-    array.push(nm, array.get(ring.touchMarkIsNormalTouchFlags, x))
-    array.push(no, array.get(ring.touchMarkTouchNos, x))
-    array.push(wd, array.get(ring.touchMarkWeakByDepthFlags, x))
-    array.push(md, array.get(ring.touchMarkMaxDepthPcts, x))
+rowCompareRaw(array<int> ts, array<int> qs, array<int> sd, array<float> bs, array<float> us, int a, int b) =>
+    keyCompareRaw(array.get(ts, a), array.get(ts, b), array.get(qs, a), array.get(qs, b), array.get(sd, a), array.get(sd, b), array.get(bs, a), array.get(bs, b), array.get(us, a), array.get(us, b))
+// W09 B07-R3B1 (/7): projected source rows. A row index x >= 0 is a ring row (physical); x <= -2 is the projected new mark
+// of TouchStart plan row -x - 2 (the mark Main appends after F0 with markAppend). Field k: 0 time, 1 baseSeq, 2 side,
+// 3 generation, 4 touchNo (ints); 0 contact bottom, 1 contact top, 2 close (floats).
+projIntRaw(TouchRing ring, array<int> pI, int x, int k) =>
+    int v = na
+    if x >= 0
+        v := k == 0 ? array.get(ring.touchMarkTimes, x) : k == 1 ? array.get(ring.touchMarkBaseSeqs, x) : k == 2 ? array.get(ring.touchMarkSides, x) : k == 3 ? array.get(ring.touchMarkGenerationIds, x) : array.get(ring.touchMarkTouchNos, x)
+    else
+        v := array.get(pI, PI_STRIDE * (-x - 2) + (k == 0 ? PI_TIME : k == 1 ? PI_BASE_SEQ : k == 2 ? PI_SIDE : k == 3 ? PI_GENERATION_ID : PI_TOUCH_NO))
+    v
+projFloatRaw(TouchRing ring, array<float> pF, int x, int k) =>
+    float v = na
+    if x >= 0
+        v := k == 0 ? array.get(ring.touchMarkContactBottoms, x) : k == 1 ? array.get(ring.touchMarkContactTops, x) : array.get(ring.touchMarkCloseAtTouches, x)
+    else
+        v := array.get(pF, PF_STRIDE * (-x - 2) + (k == 0 ? PF_CONTACT_BOTTOM : k == 1 ? PF_CONTACT_TOP : PF_CLOSE))
+    v
+// canonical merged order of two projected rows (the B11 compare on the projected keys)
+projCompareRaw(TouchRing ring, array<int> pI, array<float> pF, int a, int b) =>
+    keyCompareRaw(projIntRaw(ring, pI, a, 0), projIntRaw(ring, pI, b, 0), projIntRaw(ring, pI, a, 1), projIntRaw(ring, pI, b, 1), projIntRaw(ring, pI, a, 2), projIntRaw(ring, pI, b, 2), projFloatRaw(ring, pF, a, 0), projFloatRaw(ring, pF, b, 0), projFloatRaw(ring, pF, a, 1), projFloatRaw(ring, pF, b, 1))
+// complete TouchStart plan rows (both the int and the float row present); na arrays read as none
+projPlanRowsRaw(array<int> pI, array<float> pF) =>
+    na(pI) or na(pF) ? 0 : math.min(int(math.floor(array.size(pI) / PI_STRIDE)), int(math.floor(array.size(pF) / PF_STRIDE)))
+// appends of this bar to the source ring (slot, Core ID) among the plan rows before row upTo (all rows when upTo < 0)
+projAppendsRaw(array<int> pI, array<float> pF, int sl, int id, int upTo) =>
+    int nP  = projPlanRowsRaw(pI, pF)
+    int lim = upTo < 0 ? nP : math.min(upTo, nP)
+    int n   = 0
+    int r   = 0
+    while r < lim
+        if array.get(pI, PI_STRIDE * r + PI_CORE_SLOT) == sl and array.get(pI, PI_STRIDE * r + PI_CORE_ID) == id
+            n += 1
+        r += 1
+    n
+// source ring projected append (markAppend semantics): with count + appends above the ring capacity the oldest logical rows
+// of the combined sequence (ring rows, then the appends in plan order) are gone; returns how many
+projDropRaw(TouchRing ring, array<int> pI, array<float> pF, int sl, int id) =>
+    math.max(0, array.get(ring.touchMarkRingCounts, sl) + projAppendsRaw(pI, pF, sl, id, -1) - ring.touchMarkCapacityPerCore)
+// logical position (0 = oldest) of the ring row x of slot sl
+projLogicalRaw(TouchRing ring, int sl, int x) =>
+    int cap = ring.touchMarkCapacityPerCore
+    (x - sl * cap - array.get(ring.touchMarkRingHeads, sl) + cap) % cap
+// Episode row (ei offset) whose mark is the projected row x, -1 none. Canonical key: Side slot (Core slot and Side), Core
+// ID, generation ID, touchNo; A (existing mark): the Episode's ring row (col 8) inside the slot block, the ring owner and
+// the ring row fields; B (new mark): the Episode's TouchStart plan row (col 7) with the plan Core slot / Core ID / side /
+// generation / touchNo (its baseSeq, time and isNormal are that plan row's).
+projEpisodeRaw(TouchRing ring, array<int> ei, array<float> ef, array<int> pI, int x) =>
+    int nE  = na(ei) ? 0 : array.size(ei)
+    int nF  = na(ef) ? 0 : array.size(ef)
+    int cap = ring.touchMarkCapacityPerCore
+    int e   = -1
+    int i   = 0
+    while e < 0 and i + EI_STRIDE <= nE and int(i / EI_STRIDE) * EF_STRIDE + EF_STRIDE <= nF
+        int  s   = array.get(ei, i + EI_SIDE_SLOT)
+        int  sl  = int(math.floor(s / 2))
+        int  sv  = s - 2 * sl == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE
+        int  cid = array.get(ei, i + EI_CORE_ID)
+        bool hit = false
+        if x >= 0
+            hit := array.get(ei, i + EI_MARK_ROW) == x and cap > 0 and int(math.floor(x / cap)) == sl and sl < array.size(ring.touchMarkRingOwnerCoreIds)
+            if hit
+                hit := array.get(ring.touchMarkRingOwnerCoreIds, sl) == cid and array.get(ring.touchMarkSides, x) == sv and array.get(ring.touchMarkGenerationIds, x) == array.get(ei, i + EI_GENERATION_ID) and array.get(ring.touchMarkTouchNos, x) == array.get(ei, i + EI_TOUCH_NO)
+        else
+            int r = -x - 2
+            hit := array.get(ei, i + EI_PLAN_ROW) == r
+            if hit
+                int o = PI_STRIDE * r
+                hit := array.get(pI, o + PI_CORE_SLOT) == sl and array.get(pI, o + PI_CORE_ID) == cid and array.get(pI, o + PI_SIDE) == sv and array.get(pI, o + PI_GENERATION_ID) == array.get(ei, i + EI_GENERATION_ID) and array.get(pI, o + PI_TOUCH_NO) == array.get(ei, i + EI_TOUCH_NO)
+        if hit
+            e := i
+        i += EI_STRIDE
+    e
+// one projected row appended whole (11 fields) to a plan's payload arrays (Merge and Split plans). A ring row keeps its
+// payload; a projected new mark takes the TouchStart plan payload with markAppend's WeakByDepth false / max 0.0; the mark
+// of an Episode row then carries the Episode WeakByDepth (flags bit 32) and max depth pct (ef col 4), the two fields
+// episodeApply writes after F0. Nothing else is changed.
+rowPushRaw(TouchRing ring, array<int> ei, array<float> ef, array<int> pI, array<float> pF, int x, array<int> q, array<int> t, array<int> sd, array<float> b, array<float> u, array<float> c, array<int> g, array<bool> nm, array<int> no, array<bool> wd, array<float> md) =>
+    int   e = projEpisodeRaw(ring, ei, ef, pI, x)
+    bool  w = false
+    float m = 0.0
+    if x >= 0
+        array.push(q,  array.get(ring.touchMarkBaseSeqs, x))
+        array.push(t,  array.get(ring.touchMarkTimes, x))
+        array.push(sd, array.get(ring.touchMarkSides, x))
+        array.push(b,  array.get(ring.touchMarkContactBottoms, x))
+        array.push(u,  array.get(ring.touchMarkContactTops, x))
+        array.push(c,  array.get(ring.touchMarkCloseAtTouches, x))
+        array.push(g,  array.get(ring.touchMarkGenerationIds, x))
+        array.push(nm, array.get(ring.touchMarkIsNormalTouchFlags, x))
+        array.push(no, array.get(ring.touchMarkTouchNos, x))
+        w := array.get(ring.touchMarkWeakByDepthFlags, x)
+        m := array.get(ring.touchMarkMaxDepthPcts, x)
+    else
+        int o = PI_STRIDE * (-x - 2)
+        int f = PF_STRIDE * (-x - 2)
+        array.push(q,  array.get(pI, o + PI_BASE_SEQ))
+        array.push(t,  array.get(pI, o + PI_TIME))
+        array.push(sd, array.get(pI, o + PI_SIDE))
+        array.push(b,  array.get(pF, f + PF_CONTACT_BOTTOM))
+        array.push(u,  array.get(pF, f + PF_CONTACT_TOP))
+        array.push(c,  array.get(pF, f + PF_CLOSE))
+        array.push(g,  array.get(pI, o + PI_GENERATION_ID))
+        array.push(nm, array.get(pI, o + PI_IS_NORMAL) == 1)
+        array.push(no, array.get(pI, o + PI_TOUCH_NO))
+    if e >= 0
+        w := array.get(ei, e + EI_FLAGS) % (2 * EI_FLAG_MARK_WEAK) >= EI_FLAG_MARK_WEAK
+        m := array.get(ef, int(e / EI_STRIDE) * EF_STRIDE + EF_EPISODE_MAX)
+    array.push(wd, w)
+    array.push(md, m)
 planClearRaw(TouchPlan plan) =>
     array.clear(plan.mergeTouchPlanOffsets)
     array.clear(plan.mergeTouchPlanCounts)
@@ -277,41 +374,19 @@ planClearRaw(TouchPlan plan) =>
     array.clear(plan.mergeTouchPlanTouchNos)
     array.clear(plan.mergeTouchPlanWeakByDepthFlags)
     array.clear(plan.mergeTouchPlanMaxDepthPcts)
-// W09 B07-R3B1 wiring Probe (read-only): the four projected-mark scratch arrays of this bar (Episode ints / floats,
-// TouchStart plan ints / floats) are read at their sizes, strides and representative columns; nothing is written and the
-// result is >= 0 always (so the plan builds are unchanged). na arrays (callers without the R3-B1 fields) read as empty.
-projectedScratchProbeRaw(array<int> ei, array<float> ef, array<int> pI, array<float> pF) =>
-    int nE = na(ei) ? 0 : array.size(ei)
-    int nF = na(ef) ? 0 : array.size(ef)
-    int nI = na(pI) ? 0 : array.size(pI)
-    int nP = na(pF) ? 0 : array.size(pF)
-    int n  = 0
-    int i  = 0
-    while i + EI_STRIDE <= nE and int(i / EI_STRIDE) * EF_STRIDE + EF_STRIDE <= nF
-        int   row = array.get(ei, i + EI_PLAN_ROW)
-        int   mk  = array.get(ei, i + EI_MARK_ROW)
-        float mx  = array.get(ef, int(i / EI_STRIDE) * EF_STRIDE + EF_EPISODE_MAX)
-        bool  wd  = array.get(ei, i + EI_FLAGS) % (2 * EI_FLAG_MARK_WEAK) >= EI_FLAG_MARK_WEAK
-        if row >= 0 and PI_STRIDE * row + PI_IS_NORMAL < nI and PF_STRIDE * row + PF_CLOSE < nP
-            n += array.get(pI, PI_STRIDE * row + PI_TOUCH_NO) == array.get(ei, i + EI_TOUCH_NO) and not na(array.get(pF, PF_STRIDE * row + PF_CONTACT_BOTTOM)) ? 0 : 1
-        else if mk >= 0
-            n += wd or na(mx) ? 1 : 0
-        i += EI_STRIDE
-    n
-
 // W08 B11: Merge TouchMark inheritance plan (read-only; no ring is written) of the r B08 Merge relations (r = the Main
 // Merge plan result; -1 fails). Per Merge relation r (B08 order) and Side
 // (plan index r * 2 + 0 Support / + 1 Resistance): when the target Candidate has that Side winner, every source old
 // (survivor first, then mergeAbsorbed in old canonical order) is read with historyExtract; marks whose contact
 // intersects the winner exact EffectiveRange (inclusive, exact floats) are kept and one mark per (time, contact bottom,
 // contact top) survives: the first in source priority, then chronological order (payload kept whole). Both Sides are
-// ordered by mergeRowCompareRaw and capped once at the shared ring capacity (oldest rows dropped, each drop sets its
+// ordered by the canonical compare and capped once at the shared ring capacity (oldest rows dropped, each drop sets its
 // Side's truncated flag); truncated also ORs the same-Side source flags. A Side without a target winner holds 0 rows,
 // not truncated. Only the plan arrays are written. Returns the relation count; -1 with the plan empty on an upstream or
 // structural fault.
 export mergePlanBuild(TouchRing ring, TouchPlan plan, int r, int mergeRelationCount, array<int> mergeRelations, array<int> mergeAbsorbed, int physicalCount, array<int> supportWinnerIndexes, array<int> resistanceWinnerIndexes, array<float> winnerExactPrices, array<int> ei, array<float> ef, array<int> pI, array<float> pF) =>
     planClearRaw(plan)
-    bool ok  = r >= 0 and r == mergeRelationCount and array.size(mergeRelations) == 5 * r and projectedScratchProbeRaw(ei, ef, pI, pF) >= 0
+    bool ok  = r >= 0 and r == mergeRelationCount and array.size(mergeRelations) == 5 * r
     int  cap = ring.touchMarkCapacityPerCore
     array<int>   tT   = array.new_int(0)
     array<float> tB   = array.new_float(0)
@@ -349,26 +424,48 @@ export mergePlanBuild(TouchRing ring, TouchPlan plan, int r, int mergeRelationCo
                         sl := array.get(mergeAbsorbed, 2 * (off + s))
                         id := array.get(mergeAbsorbed, 2 * (off + s) + 1)
                         ok := id != sId
-                    [n, tr] = historyExtract(ring, sl, id, side == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE, tT, tB, tU, tI)
+                    int sv = side == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE
+                    [n, tr] = historyExtract(ring, sl, id, sv, tT, tB, tU, tI)
                     ok := ok and n >= 0
-                    if side == 0
-                        trS := trS or tr
-                    else
-                        trR := trR or tr
+                    // R3-B1 (A, source ring projected append): the projected history of this Side = the ring rows this bar's
+                    // appends do not push out, then this bar's new marks of this Side in plan order; a pushed-out row
+                    // truncates this Side. The rows then go through the unchanged B11 steps (range, dedupe, order, cap).
+                    bool trP = tr
+                    int  dr  = ok ? projDropRaw(ring, pI, pF, sl, id) : 0
+                    int  nV  = ok ? projPlanRowsRaw(pI, pF) : 0
+                    int  c0  = ok ? array.get(ring.touchMarkRingCounts, sl) : 0
                     int k = 0
-                    while ok and k < n
-                        float b = array.get(tB, k)
-                        float u = array.get(tU, k)
-                        if u >= tb and b <= tt
-                            bool dup = false
-                            int  q   = start
-                            while not dup and q < array.size(rows)
-                                int x = array.get(rows, q)
-                                dup := array.get(ring.touchMarkTimes, x) == array.get(tT, k) and array.get(ring.touchMarkContactBottoms, x) == b and array.get(ring.touchMarkContactTops, x) == u
-                                q += 1
-                            if not dup
-                                array.push(rows, array.get(tI, k))
+                    while ok and k < n + nV
+                        int  x   = k < n ? array.get(tI, k) : -(k - n) - 2
+                        bool use = true
+                        if k < n
+                            if projLogicalRaw(ring, sl, x) < dr
+                                use := false
+                                trP := true
+                        else
+                            int o = PI_STRIDE * (k - n)
+                            use := array.get(pI, o + PI_CORE_SLOT) == sl and array.get(pI, o + PI_CORE_ID) == id and array.get(pI, o + PI_SIDE) == sv
+                            if use and c0 + projAppendsRaw(pI, pF, sl, id, k - n) < dr
+                                use := false
+                                trP := true
+                        if use
+                            int   ti = projIntRaw(ring, pI, x, 0)
+                            float b  = projFloatRaw(ring, pF, x, 0)
+                            float u  = projFloatRaw(ring, pF, x, 1)
+                            if u >= tb and b <= tt
+                                bool dup = false
+                                int  q   = start
+                                while not dup and q < array.size(rows)
+                                    int y = array.get(rows, q)
+                                    dup := projIntRaw(ring, pI, y, 0) == ti and projFloatRaw(ring, pF, y, 0) == b and projFloatRaw(ring, pF, y, 1) == u
+                                    q += 1
+                                if not dup
+                                    array.push(rows, x)
                         k += 1
+                    if side == 0
+                        trS := trS or trP
+                    else
+                        trR := trR or trP
                     s += 1
             side += 1
         // canonical order over both Sides (insertion sort; the order is total after the per-Side dedupe)
@@ -376,17 +473,17 @@ export mergePlanBuild(TouchRing ring, TouchPlan plan, int r, int mergeRelationCo
         while ok and a < array.size(rows)
             int x = array.get(rows, a)
             int b = a - 1
-            while b >= 0 and mergeRowCompareRaw(ring, array.get(rows, b), x) > 0
+            while b >= 0 and projCompareRaw(ring, pI, pF, array.get(rows, b), x) > 0
                 array.set(rows, b + 1, array.get(rows, b))
                 b -= 1
             array.set(rows, b + 1, x)
-            ok := b < 0 or mergeRowCompareRaw(ring, array.get(rows, b), x) < 0
+            ok := b < 0 or projCompareRaw(ring, pI, pF, array.get(rows, b), x) < 0
             a += 1
         // shared S/R ring capacity: the oldest rows are dropped, each drop truncates its own Side
         int drop = math.max(0, array.size(rows) - cap)
         int k = 0
         while ok and k < drop
-            if array.get(ring.touchMarkSides, array.get(rows, k)) == SIDE_SUPPORT
+            if projIntRaw(ring, pI, array.get(rows, k), 2) == SIDE_SUPPORT
                 trS := true
             else
                 trR := true
@@ -398,8 +495,8 @@ export mergePlanBuild(TouchRing ring, TouchPlan plan, int r, int mergeRelationCo
             k := drop
             while k < array.size(rows)
                 int x = array.get(rows, k)
-                if array.get(ring.touchMarkSides, x) == sv
-                    rowPushRaw(ring, x, plan.mergeTouchPlanBaseSeqs, plan.mergeTouchPlanTimes, plan.mergeTouchPlanSides, plan.mergeTouchPlanContactBottoms, plan.mergeTouchPlanContactTops, plan.mergeTouchPlanCloseAtTouches, plan.mergeTouchPlanGenerationIds, plan.mergeTouchPlanIsNormalFlags, plan.mergeTouchPlanTouchNos, plan.mergeTouchPlanWeakByDepthFlags, plan.mergeTouchPlanMaxDepthPcts)
+                if projIntRaw(ring, pI, x, 2) == sv
+                    rowPushRaw(ring, ei, ef, pI, pF, x, plan.mergeTouchPlanBaseSeqs, plan.mergeTouchPlanTimes, plan.mergeTouchPlanSides, plan.mergeTouchPlanContactBottoms, plan.mergeTouchPlanContactTops, plan.mergeTouchPlanCloseAtTouches, plan.mergeTouchPlanGenerationIds, plan.mergeTouchPlanIsNormalFlags, plan.mergeTouchPlanTouchNos, plan.mergeTouchPlanWeakByDepthFlags, plan.mergeTouchPlanMaxDepthPcts)
                 k += 1
             array.push(plan.mergeTouchPlanCounts, array.size(plan.mergeTouchPlanTimes) - array.get(plan.mergeTouchPlanOffsets, 2 * j + side))
             array.push(plan.mergeTouchPlanTruncatedFlags, side == 0 ? trS : trR)
@@ -438,7 +535,7 @@ splitPlanClearRaw(SplitTouchPlan plan) =>
 export splitPlanBuild(TouchRing ring, SplitTouchPlan plan, int s, int splitRelationCount, array<int> splitRelations, array<int> splitChildren, int m, int mergeRelationCount, array<int> mergeRelations, array<int> mergePlanOffsets, array<int> mergePlanCounts, array<bool> mergePlanTruncatedFlags, int physicalCount, array<int> supportWinnerIndexes, array<int> resistanceWinnerIndexes, array<float> winnerExactPrices, array<int> ei, array<float> ef, array<int> pI, array<float> pF) =>
     splitPlanClearRaw(plan)
     int  cap = ring.touchMarkCapacityPerCore
-    bool ok  = projectedScratchProbeRaw(ei, ef, pI, pF) >= 0 and s >= 0 and s == splitRelationCount and array.size(splitRelations) == 5 * s and m >= 0 and m == mergeRelationCount and array.size(mergeRelations) == 5 * m and array.size(mergePlanOffsets) == 2 * m and array.size(mergePlanCounts) == 2 * m and array.size(mergePlanTruncatedFlags) == 2 * m and physicalCount >= 0 and physicalCount <= array.size(supportWinnerIndexes) and physicalCount <= array.size(resistanceWinnerIndexes)
+    bool ok  = s >= 0 and s == splitRelationCount and array.size(splitRelations) == 5 * s and m >= 0 and m == mergeRelationCount and array.size(mergeRelations) == 5 * m and array.size(mergePlanOffsets) == 2 * m and array.size(mergePlanCounts) == 2 * m and array.size(mergePlanTruncatedFlags) == 2 * m and physicalCount >= 0 and physicalCount <= array.size(supportWinnerIndexes) and physicalCount <= array.size(resistanceWinnerIndexes)
     array<int>  mergeOf = array.new_int(ok ? physicalCount : 0, -1)
     array<bool> seenLocal = array.new_bool(ok ? physicalCount : 0, false)
     int j = 0
@@ -482,6 +579,36 @@ export splitPlanBuild(TouchRing ring, SplitTouchPlan plan, int s, int splitRelat
                 else
                     array.push(src, array.get(iR, b))
                     b += 1
+        // R3-B1 (A, source ring projected append): the oldest dr logical rows are gone (each truncates its own Side), then this
+        // bar's new marks of the Core are appended in plan order; logical order kept, no dedupe, no re-sort. The child cap
+        // below is unchanged: a child above the capacity FAILS (never trimmed).
+        bool pS = trS
+        bool pR = trR
+        if ok
+            int dr = projDropRaw(ring, pI, pF, sl, id)
+            int c0 = array.get(ring.touchMarkRingCounts, sl)
+            int dq = 0
+            while dq < math.min(dr, c0)
+                if array.get(ring.touchMarkSides, array.remove(src, 0)) == SIDE_SUPPORT
+                    pS := true
+                else
+                    pR := true
+                dq += 1
+            int nV = projPlanRowsRaw(pI, pF)
+            int rk = 0
+            int r0 = 0
+            while r0 < nV
+                int o = PI_STRIDE * r0
+                if array.get(pI, o + PI_CORE_SLOT) == sl and array.get(pI, o + PI_CORE_ID) == id
+                    if c0 + rk < dr
+                        if array.get(pI, o + PI_SIDE) == SIDE_SUPPORT
+                            pS := true
+                        else
+                            pR := true
+                    else
+                        array.push(src, -r0 - 2)
+                    rk += 1
+                r0 += 1
         int k = 0
         while ok and k < cnt
             int p = array.get(splitChildren, off + k)
@@ -516,16 +643,16 @@ export splitPlanBuild(TouchRing ring, SplitTouchPlan plan, int s, int splitRelat
                     int q = 0
                     while q < array.size(src)
                         int   x    = array.get(src, q)
-                        bool  isS  = array.get(ring.touchMarkSides, x) == SIDE_SUPPORT
-                        float cb   = array.get(ring.touchMarkContactBottoms, x)
-                        float ct   = array.get(ring.touchMarkContactTops, x)
+                        bool  isS  = projIntRaw(ring, pI, x, 2) == SIDE_SUPPORT
+                        float cb   = projFloatRaw(ring, pF, x, 0)
+                        float ct   = projFloatRaw(ring, pF, x, 1)
                         bool  take = isS ? (wS >= 0 and ct >= sb and cb <= st) : (wR >= 0 and ct >= rb and cb <= rt)
                         if take
-                            rowPushRaw(ring, x, plan.baseSeqs, plan.times, plan.sides, plan.contactBottoms, plan.contactTops, plan.closeAtTouches, plan.generationIds, plan.isNormalFlags, plan.touchNos, plan.weakByDepthFlags, plan.maxDepthPcts)
+                            rowPushRaw(ring, ei, ef, pI, pF, x, plan.baseSeqs, plan.times, plan.sides, plan.contactBottoms, plan.contactTops, plan.closeAtTouches, plan.generationIds, plan.isNormalFlags, plan.touchNos, plan.weakByDepthFlags, plan.maxDepthPcts)
                         q += 1
                     array.push(plan.markCounts, array.size(plan.times) - start)
-                    array.push(plan.truncatedFlags, wS >= 0 and trS)
-                    array.push(plan.truncatedFlags, wR >= 0 and trR)
+                    array.push(plan.truncatedFlags, wS >= 0 and pS)
+                    array.push(plan.truncatedFlags, wR >= 0 and pR)
                     ok := array.size(plan.times) - start <= cap
             k += 1
         i += 1
@@ -533,7 +660,7 @@ export splitPlanBuild(TouchRing ring, SplitTouchPlan plan, int s, int splitRelat
         splitPlanClearRaw(plan)
     ok ? array.size(plan.targetPhysicalIndexes) : -1
 
-// W08 B15-B2: B11 canonical order of two Merge plan rows (the mergeRowCompareRaw keys on the copied payload).
+// W08 B15-B2: B11 canonical order of two Merge plan rows (the canonical compare keys on the copied payload).
 planRowCompareRaw(TouchPlan plan, int a, int b) =>
     rowCompareRaw(plan.mergeTouchPlanTimes, plan.mergeTouchPlanBaseSeqs, plan.mergeTouchPlanSides, plan.mergeTouchPlanContactBottoms, plan.mergeTouchPlanContactTops, a, b)
 // Target ring block shape shared by both apply preflights: slot rows, truncated flags, payload capacity.

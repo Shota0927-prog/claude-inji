@@ -534,4 +534,53 @@ byte-identical (diff: helper + constants + two signatures + two `ok` lines; W08R
 
 | ID | Module | Change | Before | After | Delta | Status |
 |---|---|---|---|---|---|---|
-| R3B1P | W08Touch /5 -> /6, W08Runtime /15 -> /16, Main | 4-array wiring Probe (read-only) | PASS (exact UNKNOWN) | pending (TV) | UNKNOWN | PASS -> R3-B1 body; CE10216 -> record the value, redesign the 4-array forwarding |
+| R3B1P | W08Touch /5 -> /6, W08Runtime /15 -> /16, Main | 4-array wiring Probe (read-only) | PASS (exact UNKNOWN) | PASS (exact UNKNOWN) | UNKNOWN | APPROVED (R3-B1 wiring architecture) |
+
+### R3-B1 body: projected mark injection (W08Touch /7, W08Runtime /17; W09State /22 kept)
+
+TOKEN START REVIEW: Main PASS / exact UNKNOWN; headroom UNKNOWN; status UNKNOWN; added: the projected mark injection inside
+W08Touch; high-cost candidate: the Merge / Split plan injection; Probe: R3-B1 wiring Probe PASS; new cross-library import 0;
+foreign Production type 0; huge UDT 0; `.copy` 0; huge tuple 0; mass array forwarding 0 (the 4 approved primitive arrays);
+projected state copy 0; plan double build 0; Merge / Split rule duplication 0; Main business logic 0; policy: the smallest
+change inside the existing W08Touch canonical path.
+
+Implementation (W08Touch only; W08Runtime /17 and Main change only the import versions):
+- `keyCompareRaw` = the one canonical compare body (time, baseSeq, Side rank, contact bottom, contact top); `rowCompareRaw`
+  (ring / Merge plan orders) and `projCompareRaw` (projected rows) call it. `mergeRowCompareRaw` and the wiring Probe helper
+  are removed.
+- Projected rows: x >= 0 = ring row, x <= -2 = the new mark of TouchStart plan row -x - 2. Accessors `projIntRaw` /
+  `projFloatRaw`; `rowPushRaw` pushes either kind whole (new mark: plan payload, markAppend WeakByDepth false / max 0.0) and
+  then carries the Episode WeakByDepth (flags bit 32) / max (ef col 4) on the Episode's mark (`projEpisodeRaw`: Side slot,
+  Core ID, generation, touchNo; A = ring row col 8 inside the slot block with the ring owner; B = plan row col 7 with the
+  plan Core slot / Core ID / side / generation / touchNo).
+- (A) source ring projected append: `projDropRaw` = max(0, count + appends of (slot, Core ID) - ring capacity); the oldest
+  logical rows of ring rows + appends (plan order) are gone and each truncates its own Side (markAppend semantics).
+- (B) Merge: per source and Side the projected history (surviving ring rows, then this Side's new marks) runs through the
+  unchanged steps: exact range intersection, per-Side dedupe (time, bottom, top) in source priority, canonical insertion,
+  shared cap drop of the oldest rows (each drop truncates its Side); source truncation (ring flag or eviction) OR-ed.
+- (C) Split: the source logical list loses its pushed-out rows (truncating their Sides), the new marks are appended in plan
+  order; no dedupe, no re-sort; the child cap check is unchanged (a child above the cap FAILS; nothing is trimmed).
+- Contract: one more constant `PI_CORE_ID = 2` (an existing TouchStart plan column; no column / stride change); the
+  conformance check covers it (PASS).
+
+Deterministic `r3b1_det.py` (reference = W08Touch /6 plans on a fixture ring to which this bar's F0 writes were applied
+first: markAppend of every plan row in plan order, then the episodeApply mark write on the Episode's mark when its key still
+matches; optimized = /7 on the untouched ring with ei / ef / plan ints / floats; compared: return values, every plan array
+(row count, order, 11 fields, offsets / counts, truncated S / R), and the /7 input ring unchanged): 29/29 in 0.5 s — source
+(append, not full, full, oldest Support / Resistance dropped, A WeakByDepth, A max, key mismatch), Merge (intersect,
+non-intersect, absorbed A update, dedupe collision, canonical insertion, shared cap drop, dropped Side truncated, source
+truncation inherited), Split (one child, multiple children, no child, logical order, no dedupe, cap exact, two appends at
+cap - 1, source truncation inherited), atomic (Merge + Split, ring unchanged), inert (Episode Core outside every relation =
+/6), plus 27-29 added after mutants M2 / M4 / M5 survived the first 26 (eviction outside the winner range truncates, a new
+Resistance mark inside the Support range stays out of the Support rows, same time -> baseSeq before bottom). Mutants 5/5
+killed (M1 Split without source eviction -> the child goes above the cap and the Split FAILS, never trimmed; M2 Merge without
+eviction; M3 Episode fields not carried; M4 no Side filter; M5 compare without baseSeq). random 0.
+
+Static: imports 0 -> 0 (W08Touch leaf; W08Runtime edges unchanged); exports 10 -> 10 (same names); types 3 -> 3; `.copy` 0;
+tuple unpacks 3 -> 3; `array.new` 30 -> 30; functions 20 -> 27 (private helpers); no write to the ring / ei / ef / plan
+ints / floats on the plan path; the Split cap FAIL line kept; one compare body. Source proxy (reference only): W08Touch
+6,918 -> 8,344.
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| R3B1 | W08Touch /6 -> /7, W08Runtime /16 -> /17, Main imports | projected mark injection | PASS (exact UNKNOWN) | pending (TV) | UNKNOWN | TV pending; PASS -> R3-B1 COMPLETE; CE10216 -> record, no R3-B2, rework the R3-B1 structure |

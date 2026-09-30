@@ -45,7 +45,7 @@ eq('EF_EPISODE_MAX', T['EF_EPISODE_MAX'], A['EP_F_EPISODE_MAX']); eq('EF_EPISODE
 eq('EF_EPISODE_MAX (apply mark write)', 'array.set(tv.ringMaxDepthPcts, mk, array.get(ef, f + EP_F_EPISODE_MAX))' in ap, True)
 # TouchStart plan
 eq('PI_STRIDE', T['PI_STRIDE'], A['PLAN_INT_STRIDE']); eq('PF_STRIDE', T['PF_STRIDE'], A['PLAN_FLOAT_STRIDE'])
-for k, a in (('PI_CORE_SLOT', 'PLAN_I_CORE_SLOT'), ('PI_GENERATION_ID', 'PLAN_I_GENERATION_ID'), ('PI_SIDE', 'PLAN_I_SIDE'), ('PI_TOUCH_NO', 'PLAN_I_TOUCH_NO'),
+for k, a in (('PI_CORE_SLOT', 'PLAN_I_CORE_SLOT'), ('PI_CORE_ID', 'PLAN_I_CORE_ID'), ('PI_GENERATION_ID', 'PLAN_I_GENERATION_ID'), ('PI_SIDE', 'PLAN_I_SIDE'), ('PI_TOUCH_NO', 'PLAN_I_TOUCH_NO'),
              ('PI_BASE_SEQ', 'PLAN_I_START_SEQ'), ('PI_TIME', 'PLAN_I_START_TIME'), ('PI_IS_NORMAL', 'PLAN_I_MARK_IS_NORMAL'),
              ('PF_CONTACT_BOTTOM', 'PLAN_F_CONTACT_BOTTOM'), ('PF_CONTACT_TOP', 'PLAN_F_CONTACT_TOP'), ('PF_CLOSE', 'PLAN_F_CLOSE_AT_TOUCH')):
     eq(k, T[k], A[a])
