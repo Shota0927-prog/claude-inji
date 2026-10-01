@@ -3429,3 +3429,33 @@ RESERVED_IDENTIFIER 0, UNDEFINED_FIELD 0, UNDEFINED_FUNCTION 0, NON_EXPORTED_CAL
 request.* 0, input.* 0; imports W09State /35, W08Touch /7. The 35763c2 single-file diagnostic harness stays in history as a
 TV compile FAIL artifact; it is not a B19 harness authority. Production diff 0. I27 OPEN 0.
 Status: B19 = LOCAL PASS / TV DRIFT DIAG WAITING (Harness B to be run on TV; not COMPLETE).
+
+## W09 B19 TV drift diagnosis: B19_TV_X2_RECLAIM_PIPELINE_DIAG
+
+TV run of Harness B (f685e1c, user): X1_PASS PASS, X2_PASS FAIL, X3_PASS PASS; FIRST_DRIFT X2, bar index 2 (= the second X2
+sub-case X2-1, old Side RESISTANCE; X2-0 SUPPORT passed), golden index 11 / 78, kind EVENT, field EVENT_COUNT, expected 1
+(EV_RECLAIM) actual 0; EVENT_DRIFT_TOTAL 1, STATE_DRIFT_TOTAL 10, RUNTIME_ERROR_COUNT 0 (the transaction committed: golden ok
+= 1 matched). Not classified as a Production defect. Local interpreter (same file): both sub-cases pass.
+Local counter-check (scratch experiments, not committed): forcing "no Reclaim row" (empty bsTargetSlots output, or the flipPlan
+row removed) in X2-1 gives EVENT_DRIFT 1 but STATE_DRIFT 20 (PHASE / GRADE / 8 BS fields on both Sides), not the TV 10; the TV
+outcome is therefore not a plain "Reclaim row missing / nothing applied" and the per-field counters of the TV run are needed.
+Harness B diagnostic added (display / capture only; golden, X1-X3 expectations, predicates, Production slice and scenario
+feeds unchanged): X2 pipeline per sub-case (X2-0 SUPPORT, X2-1 RESISTANCE): bar-start BS state of both Sides (phase, valid,
+bottom, top, oldSide, breakSeq, movedAway, retestSeen, wasGap), BS pair invariant, breakBuffer ticks, H / L / C; Broken /
+FlipWait set counts and membership; B18 Broken / FlipWait BS price-index membership, positions, keys, index size; read-only
+W09State /35 bsTargetSlots (ok, count, old Side / opposite in the targets); raw Reclaim / FlipConfirm / FlipAttempt (flipPlan
+formulas, harness-computed, display only); reclaimResolve (FVG invalidation now, suppressed, effective Reclaim); read-only
+flipPlan probe (ok, input count, row count, Reclaim / Confirm / Attempt row flags); the real transaction's recorded values
+(Stage C / D ok, Flip rows, first row flags, d3 count, rcs count, preflight ok, commit ok, Event append count); after-state (BS
+valid, Phase of both Sides); X2_SUBCASE_PASS; FIRST_PIPELINE_FAILURE = the first failing stage of BS_INDEX / BS_TARGET /
+RAW_RECLAIM / RECLAIM_RESOLVE / FLIP_PLAN (no Reclaim row, or a FlipConfirm flag on it) / PREFLIGHT / COMMIT / EVENT_APPEND /
+NONE. The probe runs before the bar on the bar-start state; its only writes are local scratch and the plan scratch arrays,
+cleared before the transaction (which clears them again).
+Local (Harness B, this file): X1 / X2 / X3 PASS, drift 0, FIRST_DRIFT NONE, FIRST_PIPELINE_FAILURE NONE / NONE, every stage of
+both sub-cases as expected (index member 1, targets {old Side}, raw Reclaim 1 and raw FlipConfirm 1 (the B13 degenerate case),
+effective Reclaim 1, row Reclaim 1 / Confirm 0, flags 19, preflight 1, commit 1, Events 1, BS cleared, both Waiting). Mutants:
+M41 -> X2 FAIL with FIRST_PIPELINE_FAILURE FLIP_PLAN (Confirm flag on the Reclaim row) on both sub-cases; M45 -> X1 FAIL; M48 ->
+X3 FAIL. Static: FORWARD_REFERENCE 0, RESERVED_IDENTIFIER 0, UNDEFINED_FIELD 0, UNDEFINED_FUNCTION 0, NON_EXPORTED_CALL 0,
+ARITY_MISMATCH 0, SHADOWING_ERROR 0; UDT max 69 fields (HWAux 67, HM 24); request.* / input.* 0. Token estimate (local model,
+not TV): ~70k-79k (< 90k). Harness A unchanged (44e41f6). Production diff 0. I27 OPEN 0.
+Status: B19 = LOCAL PASS / TV DRIFT DIAG WAITING.
