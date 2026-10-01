@@ -3539,3 +3539,13 @@ benchmark -> W11, Visual final conformance -> W11 (not W09 incompleteness).
 Recorded: W09_B20_FINAL_AUDIT PASS; W09_WINDOW_STATUS COMPLETE / FROZEN; W09_BATCH 20 / 20 COMPLETE; W09_I27_OPEN 0;
 W09_CANONICAL_OPEN 0 (W09 scope); W09_PRODUCTION_UNCOMMITTED_DIFF 0; HANDOFF_W09 CREATED. W10 carries stay OPEN.
 Next window: W10 Snapshot_Pending_Generation_Fresh_Event_Storage (not started).
+
+## Visual V01 - ZoneEngineV2_Rebuild_VisualHarness.pine (display only, Production diff 0)
+New indicator, 502 lines. Import: ZoneEngineV2_Rebuild only (pinned /26 = Main source at W09 final HEAD 5bedafa; to be
+published by the user, adjust the pin if TradingView assigns another number). Engine: one newEngine + updateConfirmed5m
+per confirmed 5m bar over the full history; Source helpers / five request.security / Cfg / 110 Feed fields byte-identical
+to ZoneEngineV2_Rebuild_W03Harness lines 14-334 (no calc_bars_count, no history window). View: viewCount / viewAt on
+barstate.islast only; visual filters (eligible, side, grade, phase), bounded top-K (<= 30) insertion by distance ASC,
+coreId ASC, generationId ASC, Support first (randomized check vs full sort 0 / 20000 mismatches); fixed pools 30 boxes +
+30 lines created on the first bar, never deleted. debugPerf (default off) = 1 table, 6 cells. Static: forward reference
+0, reserved identifiers 0. Exact compiled tokens UNKNOWN (no colour class); TV compile WAITING (user). random = 0.
