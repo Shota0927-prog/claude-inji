@@ -2895,3 +2895,58 @@ Evidence: R4-0 .. R4-10 and R4-X_FIXED PASS on /34; before the fix R4-1 / R4-2 /
 power confirmed). Mutations 3 / 3 detected (MUT-BS-SIDE, MUT-BS-FRESH, MUT-BS-PAIRCHECK). Regression B08 / B09 / B10 / B11 /
 B12 / B13 / B14 / B15 PASS; R3-B1 contract PASS; static PASS; random 0; 5k / 50k NOT RUN.
 B16 is not redesigned; later Windows / Batches take R4 as a frozen input. Next: B17 Stage C / D / J Production.
+
+## W09 B17 Stage C / D / J Production: START GATE and Phase A audit (no code change)
+
+START GATE: claude/w09-b07-redesign-v2, local = remote = 35e8f8e, 0 / 0, clean; canonical SHA-256 f0ada2d8... / 8f5373a4...;
+HANDOFF_W08, ledger; pins W08Core /19, W08Touch /7, W08Runtime /21, W09State /34; B16 COMPLETE / FROZEN, I27-B16-1 VERIFIED,
+I27 OPEN 0. TOKEN START REVIEW: Main PASS, exact UNKNOWN, no class; audit only (Main direct reachable: one thin W08 / W09
+callsite; no new callsite, tuple, forwarding or duplicate large call needed). TOKEN END REVIEW: delta 0, exact UNKNOWN.
+
+Main call graph (updateConfirmed5m, accepted confirmed bar):
+| Stage | Production path | Callsites | Mutation |
+|---|---|---|---|
+| A | cfg fingerprint / validateCfg, validateFeedMetadata, baseConfirmed, duplicate / past reject | 1 | cfg scalars only; a duplicate stops here |
+| B | engine.eventLogicalCount := 0 (only after the duplicate reject) | 1 | Event pool length |
+| D3 FVG facts | journalResetRaw, w03StageDFvgFactsRaw (W03 structural invalidation -> journal E1 rows) | 1 | journal scratch |
+| E | W03EMsa (MA / Swing / Accum), W03ETimeFvg, W07Fvg.stageEFreshInversePrepare (Fresh, Inverse facts) | 1 each | journal / next-scalars scratch |
+| F | w03StageFApplyAndCommitRaw (E1 apply, W07 inverse commit + confirm list), W06 seedPostApply, dependencyCarryInject | 1 | Root registry (W03 / W07 frozen commit) |
+| G | W06Comp.recomputeAndMerge (W05 winners), cache / revision write-back | 1 | Candidate scratch / caches |
+| C + D1-D4 + H + I + J | w08ProductionRaw: plan loop (touchStartPlanPreflight / Build, episodePlan, reclaimResolve, flipPlan, episodeOverlayBuild, W08Runtime.planPassWithActiveTouchOverlay, inverseCancelPlan; P0 / P1 max two plans) -> preflight chain (w09CurrentRootPreflightRaw, sideViewPreflight, inverseConfirmPreflight, phaseArmedTransferPreflight, freshTransferPlan, touchHistoryTransferPlan, bsTransferPlan, touchStartPostPlanPreflight, W08Runtime.preflightPass) -> commit (w09CurrentRootReleaseRaw, phaseArmedIndexRelease, W08Runtime.commitPass, w09CurrentRootProduceRaw, sideViewProduce, freshTransferApply, touchHistoryTransferApply, bsTransferApply, touchStartApply, gapBreakApply, flipApply, inverseDeferredResolve, inverseConfirmProject, D1 Event / mark loop, episodeApply, D3 Event loop) -> phaseArmedStageJFinalize | 1 | read-only until every F0 passed; then W08 + W09 state, Events |
+| K / L | W08 scalars (nextCoreId / nextGenerationId / coreRangeRevision) and dependency carry on commit; lastBaseSeq / lastBaseCloseTime when Stage F succeeded | 1 | Main scalars |
+W09State /34 exports: every orchestration export has exactly one Main callsite (sideViewPreflight / Produce,
+phaseArmedTransferPreflight, phaseArmedIndexRelease, phaseArmedStageJFinalize, episodeOverlayBuild, touchStartPlanPreflight /
+Build / PostPlanPreflight / Apply, freshTransferPlan / Apply, touchHistoryTransferPlan / Apply, episodePlan / Apply, flipPlan,
+reclaimResolve, flipApply, bsTransferPlan / Apply, gapBreakApply, inverseConfirmPreflight, inverseCancelPlan,
+inverseDeferredResolve, inverseConfirmProject; currentRootList* 1-3 in Main's current Root producer); the 0-callsite exports
+(priceOrderUpdate / Range, canonicalSideSlots, weakByTouchNow, strongTouchEligible, gradeExact, armedDistanceMet,
+nextArmedFromSeq, touchTargetSlots, gapBreakTargetSlots, d1TargetSlots, normalTouchMetExact, gapBreakMetExclusive) are internal
+primitives reached through them. Reachability of B01-B16 semantics: A (Production reachable through w08ProductionRaw) for all;
+C / D (fixture-only / dead): none.
+Stage C authority: no physical snapshot copy; D1 / D2 / D3 read the persistent previous-confirmed W09 state (Phase, Armed index,
+ArmedFromSeq, LastArmedRange, eligibility, SideView, current Root lists, TSS, BS), which Stages E-G never write (they write the
+Root registry, journal and Candidate scratch only; the W09 Side fields change only after the W08 commit). Equivalent to the
+canonical C-before-E order: the D facts that read the Root registry are order-independent by design (reclaimResolve uses the
+journal E1 fact, B11 / B13; Inverse confirm = the W07 confirm list, B12); E1 receives every W03 structural invalidation, and D4
+never suppresses one (FVG invalidation > Reclaim), so raw = D4-confirmed.
+Stage D order: D1 touchStartPlanBuild (TouchStart / GapBreak exclusive), D2 episodePlan (Break > WeakDepth / Reset), D3 / D4
+reclaimResolve -> flipPlan (effective Reclaim > FlipConfirm / Attempt, breakSeq < currentSeq) -> W08 plan; InverseConfirm
+noArm in inverseConfirmProject; P0 / P1 inside the same plan loop (bar-start ActiveTouch never cancelled, Pending destinations
+cancel related D1s). Matches B08-B13 frozen order.
+Transaction: every W09 / W08 writer runs only inside the branch after the full preflight chain passed; an F0 bar writes no
+Core / Touch / Pending / index / ID / revision / W08 scalar / Event / W09 state (the W03 / W07 Stage F Root commit and
+lastBaseSeq of the accepted bar are the frozen W03 / W07 / W08 B15 contract, unchanged). Events: cleared only in Stage B,
+appended only after commit from the final plan (no P0 / suppressed / pre-F0 Event).
+Stage G / H / I: W08 topology frozen; W09 transfers run between commitPass and Stage J. Stage J: phaseArmedStageJFinalize is
+the only final writer of Phase / Grade / Upcoming / Armed / Dormant / coreDormantFlags; nothing after it rewrites them. Old /
+new boundary: D1 reads the Stage C (pre-commit) topology, Stage J the committed topology and the current close. B16 R4: Split
+BS to the continuation only, consumed by the next bar's flipPlan.
+Legacy: Main breakSnapshotRootNode* / touchStartSnapshotRoot* helpers form a closed chain with no external caller (dead
+legacy, never executed); Main has no writer of sidePhases / sideGrades / sideArmedFromSeqs / sideTouchCounts / Weak / BS
+fields. Reachable duplicate execution: none.
+Missing wiring matrix: every Stage C / D / J responsibility is reachable on the Production path; missing 0; files to change
+none; semantic change none; token risk none.
+B17 Phase B proposal: verification only (no Production change expected): integrated-path conformance C1-C3, D1-D10, J1-J5,
+F0-1, Duplicate, new Root / Strong on the existing scratch harness (txn8 mirrors w08ProductionRaw); most cases already exist
+in B07-B16 fixtures and are collected, the rest (C2 same-bar first Armed, C3 same-bar new Root, Duplicate Feed) added.
+I27: none (no reachable result-changing undefined wiring). I27 OPEN 0.
