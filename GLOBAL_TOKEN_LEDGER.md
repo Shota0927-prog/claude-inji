@@ -3601,3 +3601,25 @@ RE10110 -> shortening history alone does not fix runtime; per-bar fixed cost fir
   the helper exhaustive check / equivalent by construction). random 0; 5k / 50k / 200k not run.
 - Estimator (E2, candidate selection only): Main all exports 223,434 -> 223,663; W09State functions 36,508 -> 36,716.
   Exact compiled UNKNOWN. TV: W09State /36 publish -> Main compile; runtime Gate via the TM-1 probe (/2) Windowed Visual.
+
+## Runtime Repair R02-H1: pending pool read-only pass fast path (W08Runtime /22, Main pin; physical only)
+TV (user): R01-B1 gate 3 d still RE10110 -> B1 alone insufficient; 7 d gate not run.
+- Audit: pool writers = W08Runtime only (Main / W08Core / W09State write none): pendingPlanTrustedRaw (+ pendingNewChildRaw /
+  pendingNewRootRaw / pendingClearChainRaw) on the pass pool; commitPass: pendingReplaceRaw (step 1), pendingClearChainRaw
+  (consumed READY), coreFreeCommitRaw, coreAllocSlotRaw / coreResetSlotRaw (per-Core arrays) on the real pool. The planner
+  writes only the parents of components with diff set, and diff is set only for active components (a live old Core with a
+  Side in ActiveTouch in the pass phases). Readers on the pass pool: topologyComponentsRaw, changedPlanTrustedRaw,
+  pendingPoolsOkRaw, pendingChainOkRaw, coreFreePreflightRaw, commitPass candidate scan (all read-only).
+- /22: `pendingPassReadOnlyRaw(ps, coreLive, phases)` = pool shape as the planners expect, no live pending (every Core
+  flag false, no live child, no live Root node) and no live old Core Side in ActiveTouch in the pass phases (the empty-pool
+  part is the requested conservative restriction; the ActiveTouch part alone already excludes every write). planPass:
+  `ctx.pendingPlanShared` = that predicate; psPlan = ps when shared, else pendingCopyRaw(ps) as before. commitPass: step 1
+  pendingReplaceRaw only when not shared. pendingPoolsOkRaw kept on every pass (fail-closed scan; not proven skippable).
+  ShadowContext + trailing field `pendingPlanShared = false` (Main's 18 positional args unchanged). Main: W08Runtime pin
+  /21 -> /22 only; W09State /36 kept.
+- Harness `r02/h1_harness.py` (interpreted /22 source, deterministic 1000 bars, no PRNG; pending created / kept / consumed,
+  planner F0 239 bars, downstream F0 91 bars): OLD vs NEW pool / planner / scan drift 0, writes on a shared pass 0; calls
+  copy 1000 -> 791, replace 685 -> 500, scan 1000 -> 1000, fast hits 209 / 1000 (fixture mix, not a market rate).
+  Mutants: M-H1-1 (always fast) KILLED (drift 953), M-H1-3 (ActiveTouch ignored) KILLED (drift 953), M-H1-2 (pool non-empty
+  ignored) SURVIVES = equivalent by the write proof above (kept as the conservative guard).
+- Regression B08-A ... B19, TV harness A / B: byte-identical (those suites stub the W08 chain). Exact compiled UNKNOWN.
