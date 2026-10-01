@@ -3517,3 +3517,25 @@ OPEN carries (not PASS): W10_CARRY_I17_REUSABLE_SCRATCH_3PATHS; W10_CARRY_W07_IN
 70-73 -> W10; Appendix 75 -> W11 / W12; 365-day benchmark -> W11; Visual final conformance -> W11.
 TOKEN: Production delta 0; exact compiled tokens UNKNOWN (no class). I27 OPEN 0.
 Status: W09_B19_CONFORMANCE COMPLETE / FROZEN. Next: B20 Final / HANDOFF_W09 (not started).
+
+## W09 B20 Final audit / HANDOFF: W09_B20_FINAL_AUDIT PASS, W09 COMPLETE / FROZEN
+
+START GATE: claude/w09-b07-redesign-v2, local = remote = a5ca7a1, 0 / 0, clean, Production uncommitted diff 0, I27 OPEN 0,
+B01-B19 COMPLETE / FROZEN. Canonical: 09_窓09 (SHA-256 8f5373a4...b9ef8) and Zone_definition_spec_v2(5) (f0ada2d8...49cd1)
+present; HANDOFF_W08.md (99ddb63d...ab5be7) present; W10 canonical 10_窓10_Snapshot_Pending_Generation_Fresh_Event_Storage.md
+NOT in the repo (to be received at W10 START). The pre-B01 audit artifact is not current truth.
+TOKEN START REVIEW: Production source delta 0, Main compile PASS, exact UNKNOWN. TOKEN END REVIEW: Production delta 0, version
+delta 0, new high-cost structure 0; B20 is document-only (this ledger + HANDOFF_W09.md).
+Final static: Main imports W03F0 /5, W03Apply /4, W03ETimeFvg /3, W06Component /25, W07Fvg /12, W08Core /19, W08Touch /7,
+W08Runtime /21, W03EMsa /9, W09State /35 (W07Fvg /12 and W09State /35 published); Main TradingView compile PASS, compile error 0,
+runtime error 0, exact compiled tokens UNKNOWN (no class); B19 harness evidence files present (A 2436 lines = 44e41f6,
+B 1764 lines = 2ddf0f7); I27 OPEN 0; W09 canonical OPEN 0 (W09 scope); Production uncommitted diff 0.
+Batch table: B01 (TSS contract, referenced in W09State comments only; no separate ledger heading / commit) .. B19 from the
+ledger / commit names; B20 COMPLETE. I27 in W09: I27-15 (B08, #2 Split part superseded by I27-B16-1), I27-18 (B06), I27-13R
+(applied in B17 F2), I27-B12-1..4, I27-B13-1..2, I27-B14-1..3, I27-B16-1 (R4) - all RESOLVED / CLOSED; OPEN 0.
+Carries: W09_CARRY_MERGE_SIDE_STATE_TRANSFER CLOSED (B15). OPEN to W10: W10_CARRY_I17_REUSABLE_SCRATCH_3PATHS,
+W10_CARRY_W07_INVERSE_INDEX_FREE_RETIRE_CLEANUP; later windows: Appendix B 70-73 -> W10, Appendix B 75 -> W11 / W12, 365-day
+benchmark -> W11, Visual final conformance -> W11 (not W09 incompleteness).
+Recorded: W09_B20_FINAL_AUDIT PASS; W09_WINDOW_STATUS COMPLETE / FROZEN; W09_BATCH 20 / 20 COMPLETE; W09_I27_OPEN 0;
+W09_CANONICAL_OPEN 0 (W09 scope); W09_PRODUCTION_UNCOMMITTED_DIFF 0; HANDOFF_W09 CREATED. W10 carries stay OPEN.
+Next window: W10 Snapshot_Pending_Generation_Fresh_Event_Storage (not started).
