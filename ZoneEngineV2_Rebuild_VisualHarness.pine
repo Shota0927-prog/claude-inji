@@ -397,23 +397,30 @@ visBefore(float d1, int c1, int g1, int s1, float d2, int c2, int g2, int s2) =>
 visTransp(int grade) =>
     grade == V_STRONG ? transpStrong : grade == V_NEUTRAL ? transpNeutral : grade == V_WEAK ? transpWeak : transpUnavail
 
-// fixed object pools, created once on the first bar; never deleted / recreated
-var array<box>  boxPool  = array.new_box(0)
-var array<line> linePool = array.new_line(0)
-if barstate.isfirst
-    for p = 0 to POOL_SIZE - 1
-        array.push(boxPool, box.new(bar_index, close, bar_index, close, border_color = color(na), bgcolor = color(na)))
-        array.push(linePool, line.new(bar_index, close, bar_index, close, color = color(na)))
-var table perfTable = debugPerf ? table.new(position.top_right, 2, 6) : table(na)
+// fixed object pools: 30 boxes + 30 lines, created lazily on the first barstate.islast execution only (none on historical
+// bars), then reused through setters; never deleted / recreated. The debugPerf table follows the same rule.
+var array<box>  boxPool   = array.new_box(0)
+var array<line> linePool  = array.new_line(0)
+var table       perfTable = table(na)
 
 if barstate.islast
-    // bounded top-K nearest selection: one viewCount scan, insertion into <= maxZonesDrawn slots
+    if array.size(boxPool) == 0
+        for p = 0 to POOL_SIZE - 1
+            array.push(boxPool, box.new(bar_index, close, bar_index, close, border_color = color(na), bgcolor = color(na)))
+            array.push(linePool, line.new(bar_index, close, bar_index, close, color = color(na)))
+    if debugPerf and na(perfTable)
+        perfTable := table.new(position.top_right, 2, 6)
+    // bounded top-K nearest selection: one viewCount scan (one viewAt per View), insertion into <= maxZonesDrawn slots
+    // that also keep the drawn fields, so drawing needs no second viewAt
     int n = ZE.viewCount(engine)
-    array<int>   kIdx  = array.new_int(0)
-    array<float> kDist = array.new_float(0)
-    array<int>   kCore = array.new_int(0)
-    array<int>   kGen  = array.new_int(0)
-    array<int>   kSide = array.new_int(0)
+    array<float> kDist  = array.new_float(0)
+    array<int>   kCore  = array.new_int(0)
+    array<int>   kGen   = array.new_int(0)
+    array<int>   kSide  = array.new_int(0)
+    array<float> kBot   = array.new_float(0)
+    array<float> kTop   = array.new_float(0)
+    array<int>   kGrade = array.new_int(0)
+    array<int>   kPhase = array.new_int(0)
     int eligibleCount = 0
     int passCount     = 0
     float px = close
@@ -426,42 +433,49 @@ if barstate.islast
         if visPass(v)
             passCount += 1
             float d = visDist(v.effectiveBottom, v.effectiveTop, px)
-            int sz = array.size(kIdx)
-            int pos = sz
+            int pos = array.size(kDist)
             while pos > 0 and visBefore(d, v.coreId, v.generationId, v.side, array.get(kDist, pos - 1), array.get(kCore, pos - 1), array.get(kGen, pos - 1), array.get(kSide, pos - 1))
                 pos -= 1
             if pos < maxZonesDrawn
-                array.insert(kIdx, pos, i)
                 array.insert(kDist, pos, d)
                 array.insert(kCore, pos, v.coreId)
                 array.insert(kGen, pos, v.generationId)
                 array.insert(kSide, pos, v.side)
-                if array.size(kIdx) > maxZonesDrawn
-                    array.pop(kIdx)
+                array.insert(kBot, pos, v.effectiveBottom)
+                array.insert(kTop, pos, v.effectiveTop)
+                array.insert(kGrade, pos, v.grade)
+                array.insert(kPhase, pos, v.phase)
+                if array.size(kDist) > maxZonesDrawn
                     array.pop(kDist)
                     array.pop(kCore)
                     array.pop(kGen)
                     array.pop(kSide)
+                    array.pop(kBot)
+                    array.pop(kTop)
+                    array.pop(kGrade)
+                    array.pop(kPhase)
     // draw: range -> box, point (bottom == top) -> line; unused pool objects are made transparent
     int x1 = bar_index - drawBarsLeft
     int x2 = bar_index + drawBarsRight
     int boxUsed  = 0
     int lineUsed = 0
-    int kN = array.size(kIdx)
+    int kN = array.size(kDist)
     for j = 0 to kN - 1
         if j >= kN
             break
-        ZE.ZoneView v = ZE.viewAt(engine, array.get(kIdx, j))
-        color baseC  = v.side == V_SUPPORT ? supportColor : resistanceColor
-        int   tr     = visTransp(v.grade)
+        float bot    = array.get(kBot, j)
+        float top    = array.get(kTop, j)
+        int   phase  = array.get(kPhase, j)
+        color baseC  = array.get(kSide, j) == V_SUPPORT ? supportColor : resistanceColor
+        int   tr     = visTransp(array.get(kGrade, j))
         color fillC  = color.new(baseC, tr)
         color edgeC  = color.new(baseC, math.max(tr - 30, 0))
-        string styleV = v.phase == V_ARMED ? line.style_dashed : line.style_solid
-        int   widthV = v.phase == V_ACTIVE ? 2 : 1
-        if v.effectiveBottom < v.effectiveTop
+        string styleV = phase == V_ARMED ? line.style_dashed : line.style_solid
+        int   widthV = phase == V_ACTIVE ? 2 : 1
+        if bot < top
             box b = array.get(boxPool, boxUsed)
-            box.set_lefttop(b, x1, v.effectiveTop)
-            box.set_rightbottom(b, x2, v.effectiveBottom)
+            box.set_lefttop(b, x1, top)
+            box.set_rightbottom(b, x2, bot)
             box.set_bgcolor(b, fillC)
             box.set_border_color(b, edgeC)
             box.set_border_style(b, styleV)
@@ -469,8 +483,8 @@ if barstate.islast
             boxUsed += 1
         else
             line l = array.get(linePool, lineUsed)
-            line.set_xy1(l, x1, v.effectiveBottom)
-            line.set_xy2(l, x2, v.effectiveBottom)
+            line.set_xy1(l, x1, bot)
+            line.set_xy2(l, x2, bot)
             line.set_color(l, edgeC)
             line.set_style(l, styleV)
             line.set_width(l, widthV)

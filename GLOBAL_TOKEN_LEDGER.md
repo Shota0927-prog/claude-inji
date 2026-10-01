@@ -3549,3 +3549,12 @@ barstate.islast only; visual filters (eligible, side, grade, phase), bounded top
 coreId ASC, generationId ASC, Support first (randomized check vs full sort 0 / 20000 mismatches); fixed pools 30 boxes +
 30 lines created on the first bar, never deleted. debugPerf (default off) = 1 table, 6 cells. Static: forward reference
 0, reserved identifiers 0. Exact compiled tokens UNKNOWN (no colour class); TV compile WAITING (user). random = 0.
+
+## Visual V01 lightweight audit (pre TV Gate; Main /26 NOT published)
+Pools (box 30 + line 30) and the debugPerf table are now created lazily on the first barstate.islast execution only (I19.2:
+0 objects on historical bars), then reused through setters. Read path audit (Main source): A viewCount + viewAt = O(1)
+per call (direct slot reads, no scan), O(N) per last bar; B coreViewAt scans every participation edge per Core = O(N x E),
+carries no Side state (side / phase / grade / eligible / effective range), and the facades own a separate hidden engine
+(viewAt unusable on it) -> B cannot reproduce the display; A kept. Top-K now stores the drawn fields, so the second viewAt
+pass is removed: last-bar Public API calls = 1 viewCount + 2N viewAt. Feed section still byte-identical to W03Harness
+14-334; forward reference 0; Production diff 0; 516 lines. Exact tokens UNKNOWN; TV compile WAITING.
