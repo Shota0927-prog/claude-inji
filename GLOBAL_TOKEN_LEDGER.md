@@ -2057,3 +2057,61 @@ only when fvgInverseConfirmCount > 0 and a D1 TouchStart plan row exists, P1 (th
 (native ticks * mintick, contact = bar / NativeRange intersection, side from the direction). No plan body copied, no business
 logic duplicated, no new import / type. TradingView: compile the Probe Main; CE10216 / CE10117 -> STOP; PASS -> Production
 implementation (exact value not needed).
+
+## W09 B12 Inverse FVG: implementation (W09State /30, Main)
+
+Probe `token_probes/B12_Rebuild_Main_TwoPassProbe.pine`: TradingView PASS (no CE10216 / CE10117) -> the two-pass shape
+(P0 -> D1 cancel -> conditional P1, one plan call site) is adopted (a token gate, not a semantic PASS).
+
+Changed: W09State /29 -> /30; Main (pin, W02AuxStore deferred SoA, plan loop, preflight, post-commit wiring, D3 branch).
+Unchanged: W07, W08Core, W08Touch, W08Runtime, W05, W06 (no new export used from them; the existing plan function only).
+
+W09State /30:
+- touchStartPlanBuild + tsExcl: a normal Touch of a Side in tsExcl gets no plan row (never re-read as a GapBreak).
+- inverseConfirmPreflight (pre-commit, every bar): each W07 confirm Root live, INVERSE_ACTIVE, Bullish / Bearish; else F0.
+- inverseCancelPlan (after P0, read-only): per confirm Root (inverse Side: Bullish -> Resistance, Bearish -> Support), every
+  applied P0 Candidate whose inverse-Side winner holds the Root; the TouchStart candidate Sides of that parity on an old Core
+  flowing into it (Merge survivor / absorbed, Split source, 1:1 continuation old) are cancelled. A Root whose destination is
+  Pending or winner-less cancels nothing (no Side receives it on this bar; A16); a bar-start ActiveTouch is never a D1
+  candidate.
+- inverseDeferredResolve (post-commit, rows of earlier bars): Root gone from the registry -> row dropped (I29 slot reuse /
+  retire); Root in a live PendingTopology Root node -> kept; else the original non-normal mark to every live inverse-Side
+  holder (current Root list) whose EffectiveRange meets the original contact, row dropped (no holder -> no mark). No Event.
+- inverseConfirmProject (post-commit, after the resolve): per confirm Root: holders = live inverse-Side current Root lists
+  holding it, pending = a live PendingTopology Root node holds it. Event row: NativeRange, side, rootId, coreId / generationId
+  of the single holder when not pending, else ID_NONE. Not pending and >= 1 holder: one non-normal mark per holder meeting the
+  contact [max(low, NativeBottom), min(high, NativeTop)] (close = bar close, gen = holder's). Pending: defer flag (every mark
+  deferred, none partial). Every holder not ActiveTouch joins noArm (Waiting on the confirm bar; Stage J arms on a later bar
+  from that bar + 1). d3 rewritten as the merged D3 order: existing entries in order, Inverse rows by (coreId, generationId,
+  Support, Resistance, rootId), after the existing entries of an equal (coreId, generationId, Side) key; ID_NONE rows first.
+- sideInverseAttemptCounts / EV_INVERSE_ATTEMPT: no reference (Default Guard unchanged, 0 fields released).
+Main:
+- Plan loop: pass 0 = the usual build + one W08 plan; with an InverseConfirm and a D1 TouchStart candidate, pass 0 only
+  records the candidates, P0 = all new D1 TouchStarts excluded (plan rows, Episodes, overlay, marks), W08 plan, cancel set;
+  all cancelled -> P0 final; else P1 = only the cancelled ones excluded, the same plan call again (final). W08 plan calls per
+  bar: 1 normally, at most 2; one call site each for the plan, the three W09 planners, SideView / transfer views and
+  inverseCancelPlan.
+- Preflight: inverseConfirmPreflight in the existing chain; Event room minus the confirm count.
+- Post-commit (after flipApply): inverseDeferredResolve, inverseConfirmProject, deferred rows pushed to the 10-field SoA (the
+  Probe layout; one row per Root and confirm), the resolution marks appended before the D1 loop, the D3 loop's InverseConfirm
+  branch (immediate marks, then EV_INVERSE_CONFIRM: NativeRange, touchNo 0, GR_UNAVAILABLE, WEAK_NONE, rootId).
+- The 11-field TouchMark contract has no snapBottom / snapTop / deepestClose (TSS fields): not written for the Inverse mark.
+
+Gates: `b12_det.py` 22/22 covering I1-I30 (W07 lifecycle steps I3-I7 on the frozen W07 source: boundary confirm, invalidation
+bar only WAIT_MOVED_AWAY, moved-away bar no retest / confirm, retest only -> RETOUCHED, RETOUCHED -> confirm by the close;
+W09: I1 / I2 Side mapping, I8 history, I9 Event fields, I10 two Roots, I11 / I12 non-normal mark + Native contact, I13 / I27
+destination D1 cancelled and P0 final (one plan), I14 noArm with the reset distance met, I15 next bar armed from + 1, I16 /
+I21 bar-start ActiveTouch: Pending, Episode / TSS kept, Event ID_NONE, mark deferred, I17 Merge survivor, I18 Split child with
+/ without contact overlap, I19 broken confirm list -> F0 mutation 0 Event 0, I20 no sideInverseAttemptCounts reference, I22
+pending applied later with the original payload, I23 multi-bar pending (one row, no repeat), I24 no winner, I25 two holders
+(Event ID_NONE, a mark each), I26 / I28 related D1 cancelled, unrelated kept, P1 (two plans) committed, I29 Root gone ->
+row dropped, I30 pending + holder -> all deferred). Regression: B08 L1 / L5 / L7 / F3, B09 G1 / G9 / G12 / G15, B10 F3 / F4 /
+F5 / F12 / F13 / F15 / F16 (15/15), B11 R1 / R2 / R14 / R15 (4/4). R3-B1 contract PASS (its regex now targets the TouchStart
+markAppend; the Inverse marks read mki). Static: W09State imports 0, types 4, exports 42, use-before-definition 0;
+FVG_BULLISH / FVG_BEARISH / ROOT_INVERSE_ACTIVE equal W07 and Main. random 0, > 5 min 0.
+
+Token structure: plan body copy 0, new import / UDT / foreign type 0, third plan 0. New exports: inverseConfirmPreflight (5
+params), inverseCancelPlan (9), inverseDeferredResolve (17: the 10 SoA arrays + views / pool / outputs), inverseConfirmProject
+(23); touchStartPlanBuild + 1. Risk: medium (two larger signatures, called once per bar). CE10216 -> STOP (no semantic cut;
+GT-5A / D3 / T1-T3).
+TV: W09State /30 publish -> Production Main compile.

@@ -50,7 +50,7 @@ for k, a in (('PI_CORE_SLOT', 'PLAN_I_CORE_SLOT'), ('PI_CORE_ID', 'PLAN_I_CORE_I
              ('PF_CONTACT_BOTTOM', 'PLAN_F_CONTACT_BOTTOM'), ('PF_CONTACT_TOP', 'PLAN_F_CONTACT_TOP'), ('PF_CLOSE', 'PLAN_F_CLOSE_AT_TOUCH')):
     eq(k, T[k], A[a])
 # Main TouchStart markAppend wiring (the persistent mark the projection must equal)
-m = re.search(r'W08Touch\.markAppend\((.*)\)\s*$', mns, re.M); ma = args(m.group(1))
+m = re.search(r'W08Touch\.markAppend\((ring, array\.get\(ti, .*)\)\s*$', mns, re.M); ma = args(m.group(1))  # B12: the TouchStart mark (the Inverse marks read mki)
 eq('Main plan int stride', re.search(r'int r = %d \* [ix]\b' % T['PI_STRIDE'], mns) is not None, True); eq('Main plan float stride', re.search(r'int f = %d \* [ix]\b' % T['PF_STRIDE'], mns) is not None, True)  # B09: the plan row index is x (D1 order)
 sig = re.search(r'^export markAppend\((.*)\) =>', w8s, re.M).group(1)
 pn = [p.split('=')[0].strip().split()[-1] for p in re.split(r',\s*(?![^<]*>)', sig)]
