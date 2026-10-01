@@ -3212,3 +3212,12 @@ fecdcec, code only): W07 0, Main 0; W09State /35 still declares `array<int> to` 
 CE10150 will occur at its TV Gate; not changed here (this rally forbids W09State changes), reported for a decision.
 Local gate: b18_inv P43-P57 + S5 16 / 16 (Inverse metrics all 0), b18_det P1-P42 + S1-S4 43 / 43, M21-M30 10 / 10 detected,
 B12 25 / 25, B13 13 / 13. random 0; 5k / 50k / 200k not run. I27 OPEN 0.
+
+## W09 B18 TV Gate fix: B18_TV_GATE_W09STATE_35_CE10150_IDENTIFIER_FIX
+
+W09State /35 wdIndexRaw: local `to` -> `toOrder` (declaration + 2 references, 2 lines); semantic diff 0; W09State /35
+unchanged (never published), Main pin /35, W07Fvg /12, Main / W07 / W08 unchanged. Static reserved-identifier check over the
+B18 diffs (code only, comments / strings excluded; to / from / Pine v6 keywords and type names): W09State 0, W07 0, Main 0.
+Local gate: P1-P42 + S1-S4 43 / 43, P43-P57 + S5 16 / 16, Reference MISSING / EXTRA / ORDER / RESULT all 0, M1-M30
+(+ M17 Main) 31 / 31 detected (W09 mutants rebuilt on the renamed source), B12 25 / 25, B13 13 / 13, B14 17 / 17 + D19.
+random 0; 5k / 50k / 200k NOT RUN. I27 OPEN 0.
