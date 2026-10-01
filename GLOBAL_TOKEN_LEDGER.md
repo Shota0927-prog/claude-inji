@@ -2142,3 +2142,138 @@ TV: W09State /30 publish -> Production Main compile.
   Core D1 -> cancel 0, P1 commits the D1, Event ID_NONE). Older batches not re-run (the change is inside inverseCancelPlan,
   reached only on a bar with an InverseConfirm and a D1 candidate). R3-B1 contract PASS; static: imports 0,
   use-before-definition 0.
+
+## W09 B12 CLOSEOUT
+
+B12 Inverse FVG: COMPLETE, FROZEN (W09State /30 publish PASS, Production Main PASS, exact UNKNOWN; I27 OPEN 0; not reopened).
+Frozen: two-pass P0 / P1 (at most two W08 plan calls, one call site), Pending destination D1 cancel (R2), EV_INVERSE_CONFIRM
+(one per Root, ID_NONE when not unique / Pending / winner-less), deferred non-normal TouchMark (10-field SoA).
+
+## W09 B13 Same-bar priority: START GATE and Phase A audit (no code change, no fixture re-run)
+
+START GATE: `claude/w09-b07-redesign-v2` at `3707a4d`, clean. Pins: W03F0 /5, W03Apply /4, W03ETimeFvg /3, W06 /25, W07 /11,
+W08Core /19, W08Touch /7, W08Runtime /20, W03EMsa /9, W09State /30. Main PASS (exact UNKNOWN).
+
+Production stage map (Main `w08ProductionRaw`): plan (D1 touchStartPlanBuild -> D2 episodePlan -> D3 flipPlan, Episode / Flip
+facts merged into d3) -> W08 plan (P0 / P1) -> preflight chain (sideView, inverseConfirmPreflight, D4 reclaimResolve,
+transfers, touchStartPostPlanPreflight, W08 preflight) -> commit -> fresh / history / BS transfer apply -> touchStartApply ->
+gapBreakApply -> flipApply -> inverseDeferredResolve / inverseConfirmProject -> D1 Event loop (TouchMark, EV_TOUCH_START /
+EV_GAP_BREAK) -> episodeApply -> D3 Event loop (Episode / Flip / Inverse) -> Stage J (phaseArmedStageJFinalize, noArm).
+
+Explicit priorities (code):
+- A LocalBreak > WeakDepth: episodePlan `meas = not brk`, `hit = meas and ...` (flags 4 / 8 / 32 / 64 need hit): correct.
+- B FVG invalidation > Reclaim: reclaimResolve (D4): I = this bar's journal JOP_FVG_INVALIDATE / JGROUP_E1 rows (fact, not the
+  apply); a Root in I never counts as kept, other Roots count only when live and ROOT_ACTIVE, so the result is independent of
+  the Stage F apply order; no Root write (no revival); another valid Root keeps the Reclaim; else flag 16 and the d3 entry
+  are removed (no transition, no EV_RECLAIM, no mark): correct.
+- C GapBreak bar: flipPlan candidates = the bar-start Broken PhaseSet with `bBreakSeqs(sb) < currentSeq`; the new BS
+  (breakSeq = currentSeq, written in gapBreakApply / episodeApply after the plan) is never a candidate; scope per BS / Core
+  (other Cores' older BS evaluated): correct.
+- D first Armed on this bar: Stage J `nextArmedFromSeq(baseSeq) = currentSeq + 1`; d1TargetSlots reads the bar-start Phase
+  Armed and `currentSeq >= fromSeq`: correct.
+- E Root first confirmed on this bar: D1 uses LastArmedRange (previous Stage J) and the pre-commit current Root list
+  (planRootIds); topology output reaches only the next bar's Stage J; an InverseConfirm Root's destination D1 is cancelled
+  (inverseCancelPlan): correct.
+- F Strong-ization: TSS range / masks / counts / density / grade are written only by touchStartApply (plan row) and cleared by
+  tssResetRaw; no topology / SideView writer: correct.
+
+D2 outcomes (episodePlan, authority B08 D1 user decision "Break > Reset", B07 same-bar Reset): Break -> flag 1 only (rst =
+not brk, meas = not brk: no WeakDepth, no Reset, no weak marks); no Break -> WeakDepth and Reset each by formula; a Reset is
+never committed on a Break bar; D2 runs on the TouchStart bar (B Episodes = the plan rows).
+
+Exclusivity proofs (ticks):
+- D1 TouchStart vs GapBreak: `if nt ... else if not nt and gapBreakMetExclusive` and gapBreakMetExclusive itself ANDs
+  `not normalTouchMetExact`: exclusive.
+- Reset vs WeakDepth: Support rst: close >= top + rd -> depth = clamp((top - close) / (top - bottom)) = 0 (Resistance
+  symmetric) -> hit only when weakDepthPct <= 0 (then B07 per-row independent flags, WeakDepth before Reset).
+- FlipAttempt: `at = ct and not rs0 and not cf and not rc`: exclusive with Confirm and Reclaim (the wouldReclaim fact
+  suppresses the Attempt, B10 Q1; a D4 suppression of the Reclaim does not revive it: the fact stays true).
+- FlipConfirm vs Reclaim (Support break): cf needs cT <= bT, rc needs cT >= tT + bbT; bT <= tT, bbT >= 0 -> both only when
+  bT = tT and bbT = 0 and cT = bT (contact and mv0 hold then). Reachable: a line BS with round(breakBuffer / mintick) = 0
+  (breakBuffer < mintick / 2; default 2.0 with mintick >= 5, or a cfg breakBuffer < mintick / 2; validateCfg does not bound
+  it). See G2 / I27-B13-1.
+- Flip vs Break (Local / Gap): scope C above; a Core holding a BS has both Sides Broken / FlipWait, so no D1 / D2 fact on it.
+
+InverseConfirm conflicts (Root level W07 vs Side level W09): an Inverse Root is INVERSE_WAIT (eligible nowhere) before the
+confirm, so it is in no pre-topology Side fact; holders are post-topology current Root lists. TouchStart: destination D1
+cancelled (PRIORITY IC). Break / Flip / Reclaim / Reset / WeakDepth: independent Events; Phase effect only through noArm (OR).
+Finding G1: inverseConfirmProject skips noArm for a holder whose pav.sidePhases is ActiveTouch, but it runs before
+episodeApply / the Stage J baseline, so a holder whose bar-start Episode ends by Reset on this bar (applied component:
+overlay FORCE_INACTIVE; role 0 / 1 slot, or a role 2 survivor slot still showing the old Phase) is read as ActiveTouch,
+gets no noArm, ends Waiting and Stage J may arm it on the confirm bar (ArmedFromSeq = currentSeq + 1). Canon (I27-B12-3 /
+C1-C3 noArm): a materialized destination Side is Waiting on the confirm bar; the ActiveTouch exemption covers an Episode that
+continues ("keeps its Episode / TSS"). Derivable, no I27. Fix shape: noArm for every holder (Stage J touches only Waiting /
+Armed, so a continuing ActiveTouch is unaffected): the Phase condition removed, no new parameter.
+
+Independent events / global suppression: the only same-bar fact conflict ending in a whole-bar F0 is breakOppositeOkRaw
+(B08 D3 / B09, frozen): a Local / Gap Break whose opposite Side has a continuing Episode (no Reset), its own Break, or its own
+GapBreak fails touchStartPostPlanPreflight -> every Core's update and Event of the bar dropped (state unchanged, the same
+condition can recur next bar). Reachable with crossed Side ranges inside one Core (example, defaults rd 10 / bb 2:
+Resistance [96, 110] ActiveTouch, Support [90, 95] armed at close 106 and touched at 92, then close 87: Support Break, the
+Resistance Episode neither Resets (<= 86) nor Breaks). Conflicts with the B13 rule "an independent event is never globally
+suppressed" -> I27-B13-2. Other F0 guards (inverseConfirmPreflight, busy-Core checks, capacity) are invariant guards, not
+fact priorities (busy + continuing Episode is NOT_REACHABLE: FORCE_ACTIVE makes the component Pending).
+
+Event order: D1 loop (d1 canonical: coreId, generationId, Support, Resistance) then the D3 loop over the one merged d3 list
+(Episode rows: WeakDepth, Reset, LocalBreak per row; Flip rows; Inverse rows by (coreId, generationId, Side, rootId), ID_NONE
+first; Reclaim keyed on the old Side); no per-type pass or sort; priority resolution (reclaimResolve, tsExcl, rst / meas)
+happens before ordering. Correct.
+TouchMark order: Inverse deferred-resolution marks (original payload, B12) -> D1 TouchStart marks (tsr) -> D3 Flip marks
+(tsr[mr]) and immediate Inverse marks in d3 order. Suppressed transitions: cancelled D1 (no plan row), GapBreak, Reclaim
+(suppressed or not) write none; role 2 marks via the W08 plan. Exception G2 (degenerate cf and rc: a Flip mark under an
+EV_RECLAIM).
+
+Phase writers (one final writer per Side per bar):
+| Transition | Fact source (stage) | Priority | Writer | Stage J |
+|---|---|---|---|---|
+| Armed -> ActiveTouch | D1 touchStartPlanBuild | GapBreak exclusive; IC cancel | touchStartApply | not touched |
+| Armed -> Broken, opposite -> FlipWait | D1 GapBreak | B08 D3 opposite rule | gapBreakApply / breakCommitRaw | not touched |
+| ActiveTouch -> Broken, opposite -> FlipWait | D2 Break | Break > Reset / WeakDepth | episodeApply / breakCommitRaw | not touched |
+| ActiveTouch -> Waiting | D2 Reset | no Break | episodeApply | Waiting -> Armed unless noArm |
+| Broken / FlipWait -> Waiting (pair) | D3 FlipConfirm / Reclaim | FVG > Reclaim (D4) | flipApply / bsPairEndRaw | Confirm: noArm; Reclaim: arms |
+| non-continuation destination | W08 topology + BS transfer | - | Stage J baseline (Waiting / Broken / FlipWait) | then arming |
+| Waiting <-> Armed, Armed -> Waiting | Stage J | noArm OR | phaseArmedStageJFinalize | final |
+Apply order touchStart -> gapBreak -> flip -> episode keeps a same-bar TouchStart + Reset / Break and an opposite Reset +
+Break consistent (the later row sees FlipWait and does not move it).
+
+noArm sources (push only, read only by `array.includes` in Stage J: OR-only): flipApply (FlipConfirm: sf, sb), bsTransferApply
+(destination of a same-bar FlipConfirm, bsPlan column 11), inverseConfirmProject (holders not ActiveTouch; see G1). No
+remover.
+
+Priority matrix (same Side; the Flip types per BS pair / Core; A = row wins, B = column wins; FI = Root-level E1 fact, no
+Event producer exists for EV_FVG_INVALIDATE):
+| | WD | RS | LB | GB | FA | FC | RC | FI | IC |
+|---|---|---|---|---|---|---|---|---|---|
+| TS | INDEP (B07 B Episode) | INDEP (B07) | INDEP (B08 D1) | MUT_EXCL (nt) | NOT_REACH (Phase) | NOT_REACH | NOT_REACH | INDEP | PRIORITY_B (inverseCancelPlan) |
+| WD | - | MUT_EXCL (pct > 0) | PRIORITY_B (meas) | NOT_REACH | NOT_REACH | NOT_REACH | NOT_REACH | INDEP | INDEP |
+| RS | | - | PRIORITY_B (rst) | NOT_REACH | NOT_REACH | NOT_REACH | NOT_REACH | INDEP | INDEP (noArm OR; G1) |
+| LB | | | - | NOT_REACH (Phase) | PRIORITY_A (scope) | PRIORITY_A (scope) | PRIORITY_A (scope) | INDEP | INDEP |
+| GB | | | | - | PRIORITY_A (C) | PRIORITY_A (C) | PRIORITY_A (C) | INDEP | INDEP |
+| FA | | | | | - | MUT_EXCL | PRIORITY_B (rc fact) | INDEP | INDEP |
+| FC | | | | | | - | MUT_EXCL (bbT >= 1 or bT < tT; else I27-B13-1) | INDEP | INDEP (noArm OR) |
+| RC | | | | | | | - | PRIORITY_B (reclaimResolve) | INDEP (noArm OR) |
+| FI | | | | | | | | INDEP (per Root) | NOT_REACH same Root (W07) / INDEP |
+Diagonal: one row per Side per type (NOT_REACH twice); IC per Root (INDEP). Opposite Side of one Core: Break (L / G) +
+Waiting / Armed / Dormant -> FlipWait (SAME_TRANSITION); + Reset Episode -> INDEP (Reset Event, then FlipWait); + continuing
+Episode / Break / GapBreak -> whole-bar F0 (I27-B13-2); TouchStart + TouchStart -> INDEP.
+
+Implementation gap list: A-F correct; D2 correct; TouchStart / GapBreak correct; FA / FC / RC partial (G2); Reclaim D4
+correct; InverseConfirm partial (G1); Event order correct; TouchMark order correct except G2; Phase writers correct; noArm
+OR-only correct; wrong global suppression: the B08 D3 path (I27-B13-2); duplicate 0.
+- G1 (derivable): InverseConfirm holder noArm misses a holder whose Episode ends this bar (Reset). Fix: noArm every holder.
+- G2 (needs I27-B13-1): cf and rc both true -> fli flag 24: EV_RECLAIM, but flipApply also applies the Confirm-only noArm /
+  lastFlipConfirmSeq and the FlipConfirm non-normal mark is written. Whatever the rule, one transition must win (one-line
+  guard in flipPlan).
+
+I27 (STOP; not decided by the repo canon):
+- I27-B13-1 FlipConfirm vs Reclaim on the degenerate bar (line BS, breakBuffer = 0 ticks, close on the line, retest contact):
+  which wins? Recommendation: FlipConfirm (the B08 D1 precedent "Break > Reset": in the zero-buffer degenerate case the
+  break-side fact wins; FlipConfirm also carries the movedAway + retest condition).
+- I27-B13-2 B08 D3 / B09 opposite rule (frozen fail-closed) vs B13 "never suppress an independent event globally": keep the
+  whole-bar F0, or a Core-local rule (e.g. the Break of that Core is held while the opposite Episode continues; other Cores
+  commit normally)? Reopens a frozen B08 / B09 decision, so it is the user's.
+I27 OPEN = 2.
+
+Token: no code change. Expected B13 code: G1 = one condition removed (W09State), G2 = one guard in flipPlan; I27-B13-2 depends
+on the decision (a Core-local hold would touch touchStartPostPlanPreflight / episodePlan, no new UDT / import). No priority
+engine.
