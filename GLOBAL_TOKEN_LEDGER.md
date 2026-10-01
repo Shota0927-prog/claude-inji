@@ -3221,3 +3221,19 @@ B18 diffs (code only, comments / strings excluded; to / from / Pine v6 keywords 
 Local gate: P1-P42 + S1-S4 43 / 43, P43-P57 + S5 16 / 16, Reference MISSING / EXTRA / ORDER / RESULT all 0, M1-M30
 (+ M17 Main) 31 / 31 detected (W09 mutants rebuilt on the renamed source), B12 25 / 25, B13 13 / 13, B14 17 / 17 + D19.
 random 0; 5k / 50k / 200k NOT RUN. I27 OPEN 0.
+
+## W09 B18 TV Gate fix: B18_TV_GATE_W09STATE_35_CE10271_HELPER_ORDER_FIX
+
+TV Gate: W09State /35 compile FAIL, line 1261 CE10271 (could not find function 'wdIndexRaw'; "1 of 3 problems"). Cause:
+phaseArmedIndexRelease (B18 Phase B release of Waiting / Dormant Sides) called wdIndexRaw, which was defined after it (with
+orderDropRaw, right before phaseMoveRaw). Fix: the helper block (orderDropRaw, wdIndexRaw and their comments, 27 lines) moved
+unchanged to just before phaseArmedIndexRelease; dependency order now priceOrderUpdate (112) / indexMemberRaw (317) /
+PhaseArmedTransferView (923) -> orderDropRaw -> wdIndexRaw -> phaseArmedIndexRelease -> phaseMoveRaw -> Stage J helpers /
+caller. Pure move: the file's line multiset is identical (semantic diff 0). Static audit over every top-level function / type /
+const in W09State, W07Fvg and Main: FORWARD_REFERENCE 0, UNRESOLVED_FUNCTION_REFERENCE 0 (before the fix: exactly 1, this
+call); shadowing on B18-changed lines 0; reserved identifiers (to / from / keywords / type names) 0. The local interpreter does
+not enforce definition order, so the audit is the static gate for this class. The other two TV problems could not be
+reproduced locally (no further unresolved / forward / reserved / shadow finding); not guessed. W09State /35, W07Fvg /12,
+Main imports unchanged. Local gate: 43 / 43, 16 / 16, Reference metrics 0, M1-M30 (+ M17 Main) 31 / 31 detected (W09
+mutants re-applied on the moved source), B12 25 / 25, B13 13 / 13, B14 17 / 17 + D19. random 0; 5k / 50k / 200k NOT RUN.
+I27 OPEN 0.
