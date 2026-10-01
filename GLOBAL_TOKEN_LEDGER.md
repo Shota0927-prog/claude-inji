@@ -2517,3 +2517,35 @@ three pins). Static: /20 -> /21 differs by exactly the coreDormantFlags guard ro
 W08Core / W08Touch writes coreDormantFlags (0 references), so every harness guard outcome is identical by construction.
 TradingView (W08Runtime /21, W09State /32 publish, Main compile): not performed (STOP on D19).
 B14: NOT COMPLETE.
+
+### B14 D19 correction (W09State /33) and the W08Runtime /21 conformance decision
+
+User: D19 fix ACCEPT; no /21 port of the old B16 / B17 harnesses (they call planPass / runShadow removed in /20 and never
+write coreDormantFlags, so they cannot reach the changed branch). B14_W08_RUNTIME21_CONFORMANCE =
+STATIC_EQUIVALENCE_PLUS_TARGETED_GUARD: (1) function-level diff /20 -> /21 = coreDeferredStateRaw only (the coreDormantFlags
+compare row -> reset-only write; git diff c9623bd: 3 + / 1 -); (2) every other reachable W08Runtime function byte-identical;
+(3) G1-G5 PASS; (4) the remaining guard fields keep the F0 contract (G2); (5) W08 topology semantics change 0. Formal integrated
+W08 conformance carried to W11 / W12. I27 OPEN 0.
+
+TOKEN START REVIEW: pass-local projection inside Stage J from the existing classes / plan mapping (invSourcesRaw, moved before
+Stage J unchanged); no wrapper / tuple / forwarding / UDT copy; no new parameter. Probe NO.
+
+Implementation (W09State /33; W08Runtime /21 kept; Main pins W08Runtime /21, W09State /33):
+- invSourcesRaw moved unchanged before Stage J (B12 Inverse and Stage J share it).
+- Stage J step 1: pass-local `trx` (per Side slot, -1 none / 0 / 1): for every applied non-continuation destination p, a Merge
+  target Side (survivor / fresh) = OR of stageJTransitionRaw over its survivor and absorbed source Sides of the same parity;
+  a Split continuation child = its source Side; a fresh target and a Split fresh child = 0 (no lifecycle inheritance, no
+  broadcast). Step 2: same-bar transition = trx when set, else the direct slot fact (continuation / untouched Cores). The
+  Dormant entry condition is unchanged otherwise (Waiting / Armed, far, not pending, not noArm, not same-bar transition);
+  noArm untouched; nothing persistent, nothing carried to the next bar.
+Gates: D19 (`b14_d19.py`): Merge survivor / Merge absorbed / Split continuation A-G all PASS (absorbed: survivor Resistance
+slot 3 Armed, not Dormant, on the transition bar; next bar Dormant); D19-D Split continuation + fresh child (Stage J unit with
+the post-commit split state): continuation child Resistance not Dormant, fresh child Resistance Dormant (no broadcast); D19-D2 a
+Reset row on the reused fresh slot is not read (projection 0). G (F0) mutation 0. D1-D18 / D18b 17/17. Default Guard G1-G5 PASS
+(/20 pinned at c9623bd for the contrast). B08-B13 target regression (B08 L5 / L8 / F1 / M1, B09 G11 / R1, B10 F4 / F5 / F10, B11
+R1 / R2 / R8 / R12 / R14 / R15, B12 I14 / I30, B13 P1-P12) PASS. R3-B1 contract PASS. Static: W09State imports 0,
+invSourcesRaw / stageJTransitionRaw / dormantFarRaw defined before Stage J, no shadowing (step 1 loop variables m / qi / tr /
+src distinct).
+TOKEN END REVIEW: W09State +~15 lines in Stage J and one function moved (no body copy); signatures unchanged; Main 1 pin.
+Exact tokens UNKNOWN (no colour class). TV next: W08Runtime /21 publish, W09State /33 publish, Production Main compile.
+B14: not COMPLETE until the Main compile PASS.
