@@ -3398,3 +3398,34 @@ Static: FORWARD_REFERENCE 0, RESERVED_IDENTIFIER 0, UNDEFINED_FIELD 0 (HW owners
 ARITY_MISMATCH 0, SHADOWING_ERROR 0; UDT fields HW 5, HWCore 41, HWState 51, HWIndex 27, HWTopo 69, HWAux 66, HF 16, HM 23
 (max 69, CE10116 margin kept); request.* 0, input.* 0, imports unchanged. Production diff 0. I27 OPEN 0.
 Status: B19 = LOCAL PASS / TV DRIFT DIAG WAITING (not COMPLETE).
+
+## W09 B19 TV diagnostics split: B19_TV_DIAGNOSTIC_CE10117_SPLIT
+
+TV Gate (user): the 35763c2 diagnostic harness (one file, 2646 lines) compile FAIL, CE10117 "Compiled code contains too many
+tokens: 104908, limit 100256". Not a Production defect: the diagnostics (+ ~230 lines) pushed the 44e41f6 harness, which already
+compiled close to the limit, over it. Fix by structural split, no token squeezing:
+Harness A = ZoneEngineV2_W09ConformanceHarness_B19.pine restored byte-identical to 44e41f6 (the B19 harness authority; no
+diagnostics added). TV evidence kept: compile PASS; APPENDIX_B_W09 24 / 24 (FAILED 0); I22_STATE_INDEX_PASS PASS; STATE_INDEX
+MISSING / EXTRA / ORDER_DRIFT / RESULT_DRIFT 0; INDEX_CHECKS 1730; RUNTIME_ERROR_COUNT 0; open items EVENT_DRIFT_TOTAL 1,
+STATE_DRIFT_TOTAL 10, EXTRA_X1_X3_FAILED 1 (local 0) -> diagnosed by Harness B.
+Harness B = ZoneEngineV2_W09ConformanceHarness_B19_DriftDiag.pine (new, 1592 lines): X1-X3 drift diagnosis only. Kept
+unchanged from 35763c2: the X1-X3 fixtures / feeds / expectations / comparisons, the HM diagnostics (X1 / X2 / X3 pass, first
+drift scenario / bar / golden index (B index and A index = B + 67) / kind / field / side / expected / actual int and float /
+tags, full first drifting Event, 31 + 4 per-field counters, run counts), the Main-generated views / Stage C / D wrapper / post-
+commit slice, fixture helpers, HW owner split. Golden: the 14 X1-X3 records only (byte-identical to their 35763c2 strings; A
+indexes 67-80). Removed (not reached by X1-X3, no effect on its Production path): Appendix 46-69 scenarios, the 81-record
+golden, the 68 / 69 Merge / Split fixtures and topology golden, the I22 index / target audits (read-only), the W08 topology
+stub commit / producer branches (X1-X3 have no topology; a topology there is a runtime.error, never silent).
+Token estimate (local, NOT a TV value): linear model TV = a * harness tokens + b * reachable library tokens fitted to the TV
+facts (35763c2 = 104908, 44e41f6 < 100256) gives Harness B between ~61.5k and ~73.8k (lexical harness tokens 19351 vs 33000,
+reachable library tokens 34362 vs 39569); target < 90000; exact TV count UNKNOWN until the user compiles it.
+UDT fields (Harness B): HW 5, HWCore 41, HWState 51, HWIndex 27, HWTopo 69, HWAux 66, HF 16, HM 23 (max 69 < 100;
+estimated external elements max 74).
+Local interpreter (Harness B): X1 / X2 / X3 PASS, EVENT_DRIFT 0, STATE_DRIFT 0, RUNTIME 0, FIRST_DRIFT NONE, runs runAll /
+goldInit 1 / 1, X1 / X2 / X3 1 / 1 / 1, comparisons 14, bars 14 / golden 14. Mutations: M45 -> X1 FAIL (first drift X1 bar 9,
+B index 8, STATE PHASE side 0 exp 1 act 5); M41 -> X2 FAIL (LAST_FLIP_CONFIRM_SEQ exp -1 act 50); M48 (F0 class: the Stage C / D
+TouchStart plan writes TouchCount persistently) -> X3 FAIL (and X1). Static (Harness B): FORWARD_REFERENCE 0,
+RESERVED_IDENTIFIER 0, UNDEFINED_FIELD 0, UNDEFINED_FUNCTION 0, NON_EXPORTED_CALL 0, ARITY_MISMATCH 0, SHADOWING_ERROR 0;
+request.* 0, input.* 0; imports W09State /35, W08Touch /7. The 35763c2 single-file diagnostic harness stays in history as a
+TV compile FAIL artifact; it is not a B19 harness authority. Production diff 0. I27 OPEN 0.
+Status: B19 = LOCAL PASS / TV DRIFT DIAG WAITING (Harness B to be run on TV; not COMPLETE).
