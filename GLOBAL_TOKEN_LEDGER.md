@@ -1840,3 +1840,63 @@ Planned physical shape (for the design step, not implemented): flipPlan rc witho
 reason on a Reclaim row + d3 / Event room on flag 16; one shared pair-release helper used by FlipConfirm and Reclaim in
 flipApply; bsSourceRaw consumes on Confirm or Reclaim; Main D3 loop EV_RECLAIM branch (plumbing). No new UDT / import /
 foreign type / tuple / forwarding: Probe expected NO (TOKEN START REVIEW at the design step).
+
+### B11 Phase A corrections (user)
+
+1. Authority: the Reclaim text exists in the W09 canon bundle / Zone_definition_spec_v2 (not in this repo): Flip-unconfirmed
+   only; old Support close >= BS.rangeTop + breakBuffer, old Resistance close <= BS.rangeBottom - breakBuffer, inclusive;
+   after Reclaim: Broken / FlipWait released, old Side history kept, Zone / Side Fresh not revived, Weak not cleared, no new
+   Root / quality evidence, Waiting or Armed from the next bar by the current distance. (The Phase A line "the user's text
+   only" is withdrawn.)
+2. movedAway is not a Reclaim condition (required): eligible = valid BS, Flip unconfirmed, breakSeq < currentSeq, the close
+   condition.
+3. FVG structural invalidation order (the Phase A line "E1 runs before Stage D" is withdrawn as an argument): canon order is
+   D3 facts (Reclaim + FVG structural invalidation) -> D4 priority -> E1 apply of the accepted invalidation. "The Root is
+   removed later anyway" is not a priority implementation: D4 resolves FVG structural invalidation > Reclaim explicitly on
+   the projected invalidation; no remaining valid structure for the old Side -> Reclaim suppressed (no state change, no
+   EV_RECLAIM); another valid Root left -> Reclaim kept, the invalidated Root never restored.
+
+## W09 B11 Reclaim: implementation (W09State /29, Main)
+
+TOKEN START REVIEW: Main PASS, exact UNKNOWN, headroom UNKNOWN. Added: one W09State export (reclaimResolve, D4, 10 params:
+pav / fli / d3 + the journal op / group / Root-ID arrays + count + the Root registry map / states / live flags), one private
+helper (bsPairEndRaw: the FlipConfirm cleanup moved out, now shared), small edits in flipPlan / flipApply / bsSourceRaw /
+touchStartPostPlanPreflight / bsTransferPlan; Main: pin, one call in the existing preflight chain, the D3 Event type / side
+selection. New UDT 0, import 0, foreign type 0, tuple 0, mass forwarding 0 (10 references once per bar). Probe: NO. Main
+business logic: NO (the journal filter and the Root validity test live in W09State). W08Runtime /20 unchanged.
+
+Implementation:
+- D3 fact (flipPlan): the one Reclaim predicate rc = close >= top + breakBuffer (old Support) / close <= bottom - breakBuffer
+  (old Resistance) on ticks, inclusive, without the movedAway factor (the B10 Attempt is unchanged: at => contact =>
+  movedAway); a Flip row is written on rc too; a Reclaim row carries the old Side's persistent Weak reason, no TouchMark
+  row; d3 takes flag 16 (Attempt 4 / Confirm 8 / Reclaim 16). Candidates stay the persistent Broken pairs with breakSeq <
+  currentSeq (a BS of this bar, Local Break or GapBreak, is never one).
+- D4 (reclaimResolve, read-only, after sideViewPreflight and before phaseArmedTransferPreflight / bsTransferPlan / the Event
+  room preflight): I = Root IDs of this bar's journal rows JOP_FVG_INVALIDATE / JGROUP_E1 (the projected invalidation, not
+  the registry after apply); a Reclaim row whose old-Side BS Root list meets I keeps the Reclaim only while another Root of
+  the list is outside I, live and ROOT_ACTIVE; else flag 16 is removed and its d3 entry dropped (no state change, no Event).
+  Confirm / Reclaim stay exclusive by price; the Attempt suppression by the Reclaim fact (B10) is unchanged.
+- Apply (flipApply, role 0 / 1): FlipConfirm and Reclaim both call bsPairEndRaw (Broken / FlipWait index detach, BS Root
+  nodes freed, both copies cleared, CurrentTouchNo 0, attempt count 0, both Sides Waiting); FlipConfirm alone adds noArm and
+  lastFlipConfirmSeq. Reclaim: no noArm, lastFlipConfirmSeq kept; Stage J (unchanged) arms by the current EffectiveRange and
+  close with ArmedFromSeq = currentSeq + 1. TouchCount, Weak, MaxDepth, Side / Zone Fresh, LastNormalTouchTime, Root lists:
+  not written.
+- Topology: bsSourceRaw treats a BS consumed by a FlipConfirm or a Reclaim (flag 8 / 16 after D4) as none, so a same-bar
+  Merge / Split transfers no BS from it (Stage J baseline Waiting unless another source BS wins).
+- Relation-outside free invariant: the bsTransferPlan free check now reads the BS held at the bar start (no Flip rows), so a
+  consumed BS still fails the pass. /27 and /28 let a FlipConfirm-consumed BS pass it (latent B10 gap, found by R13; the
+  invariant is B08's; fixed here for Confirm and Reclaim alike).
+- Event (Main D3 loop, same single canonical order): EV_RECLAIM (fixed BS range, side = old Side, touchNo 0, GR_UNAVAILABLE,
+  old-Side persistent Weak reason, ID_NONE, current time / baseSeq / coreId / generationId); suppressed Reclaims append
+  nothing; Event room counts flag 16.
+
+Gates: `b11_det.py` 14/14 (R1 + R9 Support Reclaim with movedAway false and the full EV_RECLAIM row, R2 Resistance, R3 / R4
+equality + controls, R5 Local Break bar + same-seq persistent BS fail-closed, R6 GapBreak bar, R7 history kept, R8 Stage J
+re-arm from currentSeq + 1, R10 no TouchMark, R11 Merge, R12 Split, R13 relation-outside free (Reclaim and Confirm) F0 /
+mutation 0 / Event 0, R14 FVG invalidation with another valid Root: Reclaim kept, Root 81 not restored, R15 invalidation of
+the only Root (and of one Root when the other is no longer live): suppressed, Core 10 unchanged, no Event, non-E1 rows
+ignored). Regression: B08 L1 / L5 / L7 / F3, B09 G1 / G9 / G12 / G15, B10 F3 / F4 / F5 / F12 / F13 / F15 / F16: 15/15; B10 F6
+re-run with its expectation moved to B11 (the wouldReclaim bar is now a Reclaim: EV_RECLAIM, BS cleared; still no Attempt
+and no TouchMark): PASS. R3-B1 contract PASS. Static: W09State imports 0, types 4, exports 37 -> 38, use-before-definition
+0; JOP_FVG_INVALIDATE / JGROUP_E1 / ROOT_ACTIVE equal Main's. random 0, > 5 min 0.
+TV: W09State /29 publish -> Production Main compile. CE10216 -> STOP (no semantic cut; deferred GT-5A / D3 / T1-T3).
