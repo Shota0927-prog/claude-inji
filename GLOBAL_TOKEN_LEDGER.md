@@ -2342,3 +2342,97 @@ invalidation -> Reclaim, P12 Attempt after a D4-suppressed Reclaim). Sensitivity
 Affected regression only: B10 F4 / F5, B11 R1 / R2 / R14 / R15: 6/6. R3-B1 contract PASS; W09State imports 0. Harness txn8
 mirrors the new Main order. random 0, > 5 min 0.
 TV: W09State /31 publish -> Production Main compile; CE10216 -> STOP.
+
+## W09 B13 CLOSEOUT
+
+B13 Same-bar priority: COMPLETE, FROZEN (W09State /31 publish PASS, Production Main PASS, exact UNKNOWN; I27 OPEN 0; not
+reopened). Frozen: LocalBreak > WeakDepth, Break > Reset, FVG invalidation > Reclaim (D4 before flipPlan), effective Reclaim >
+FlipConfirm, effective Reclaim false -> Flip path (Confirm and Attempt on the effective Reclaim), GapBreak-bar Flip / Reclaim
+exclusion (breakSeq < currentSeq), InverseConfirm holder noArm (every holder), whole-pass F0 kept, semantic priority separate
+from transaction failure.
+
+## W09 B14 Phase / Grade finalization: START GATE and Phase A audit (no code change, no fixture run)
+
+START GATE: `claude/w09-b07-redesign-v2` at `c9623bd`, clean. Pins: W03F0 /5, W03Apply /4, W03ETimeFvg /3, W06 /25, W07 /11,
+W08Core /19, W08Touch /7, W08Runtime /20, W03EMsa /9, W09State /31. Main PASS (exact UNKNOWN).
+
+Stage J = `phaseArmedStageJFinalize` (last W09 call of the committed pass; after it Main only copies the W08 scalars and the
+dependency carry; an F0 bar runs no Stage J). Step 1: every applied fresh / Merge / Split destination Side -> Waiting (or
+Broken / FlipWait from a transferred BS, Grade Unavailable, Broken / FlipWait index attach), ArmedFromSeq unset,
+LastArmedRange na; a 1:1 continuation keeps its Phase. Step 2: every live Side Upcoming = TouchCount + 1; Waiting / Armed only:
+Grade = gradeExact(target Upcoming), q = eligible and non-psych Root and EffectiveRange valid and armedDistanceMet and not
+noArm; Waiting + q -> Armed (ArmedFromSeq = currentSeq + 1, LastArmedRange = EffectiveRange, both Armed indexes); Armed + q ->
+Armed (ArmedFromSeq kept, range re-keyed); Armed + not q -> Waiting (index removed; ArmedFromSeq / LastArmedRange kept: B06
+option b, read only for Phase Armed). ActiveTouch / Broken / FlipWait / Dormant untouched.
+
+Phase table (A current, B fact, C final Phase, D final Grade, E ArmedFromSeq, F history, G writer, H index, I revision):
+| A | B | C | D | E | F | G | H | I |
+|---|---|---|---|---|---|---|---|---|
+| Waiting | distance met, eligible, non-psych, no noArm | Armed | gradeExact(Upcoming) | currentSeq + 1 | kept | Stage J | PhaseSet + Armed indexes | none |
+| Waiting | not met / noArm | Waiting | gradeExact(Upcoming) | unchanged | kept | Stage J | none | none |
+| Armed | normal Touch (D1, prev-bar Armed, fromSeq <= seq) | ActiveTouch | Episode: gradeExact(CurrentTouchNo); TSS grade = plan | unchanged | TouchCount + 1, WeakByTouch OR, TSS | touchStartApply, episodeApply | Armed detach, PhaseSet | none |
+| Armed | complete GapBreak | old Broken / opp FlipWait | Unavailable | unchanged | kept, BS written | gapBreakApply / breakCommitRaw | Armed detach, PhaseSet, Broken / FlipWait | none |
+| Armed | distance lost / noArm | Waiting | gradeExact(Upcoming) | kept (option b) | kept | Stage J | Armed detach, PhaseSet | none |
+| ActiveTouch | continuing Episode | ActiveTouch | gradeExact(CurrentTouchNo, current structure) | unchanged | WeakByDepth / MaxDepth monotone | episodeApply | none | none |
+| ActiveTouch | Snapshot Reset, no Break | Waiting -> Stage J Armed if q (noArm: Waiting) | gradeExact(Upcoming) | currentSeq + 1 if armed | kept, TSS cleared | episodeApply -> Stage J | PhaseSet (+ Armed) | none |
+| ActiveTouch | LocalBreak | old Broken / opp FlipWait | Unavailable | unchanged | kept, BS from TSS | episodeApply / breakCommitRaw | PhaseSet, Broken / FlipWait | none |
+| Broken / FlipWait | none / movedAway / retest / Attempt | unchanged | Unavailable | unchanged | kept | flipApply (flags) | none | none |
+| Broken / FlipWait | effective Reclaim | both Waiting -> Stage J (old Side may arm) | gradeExact(Upcoming) | currentSeq + 1 if armed | kept | flipApply / bsPairEndRaw -> Stage J | Broken / FlipWait detach, PhaseSet | none |
+| Broken / FlipWait | FlipConfirm | both Waiting (noArm) | gradeExact(Upcoming) | unchanged | kept; lastFlipConfirmSeq | flipApply -> Stage J | as above | none |
+| InverseConfirm holder | confirm Root in its current list | Waiting / ActiveTouch kept (noArm) | gradeExact | unchanged | kept | inverseConfirmProject -> Stage J | Armed detach if it was Armed | none |
+| Pending release bar | Episode ended, component applied | destination baseline Waiting -> current close | gradeExact(Upcoming) | currentSeq + 1 if armed | C2 transfer | W08 commit, transfers, Stage J | PhaseSet, Armed | W08 topology / range |
+| Dormant | - | no writer | - | - | - | none | Dormant set / recovery index storage only | - |
+
+Checks: §5 Armed formula (armedDistanceMet, ticks, inclusive) PASS; same-bar Touch forbidden (fromSeq = currentSeq + 1, D1
+reads the bar-start Phase) PASS; FlipConfirm / InverseConfirm bar no Armed (noArm) PASS. §6 noArm sources: flipApply
+(FlipConfirm sf / sb), bsTransferApply (destination of a same-bar FlipConfirm), inverseConfirmProject (every holder); push only,
+read only by `array.includes` in Stage J; no priority / Grade in it: PASS. §7 ActiveTouch: Stage J skips it; a Reset ends the
+Episode first (episodeApply before Stage J), G1 consistent: PASS. §8 Broken / FlipWait: only flipApply (bsPairEndRaw) releases
+it; Stage J skips; baseline restores it from a transferred BS: PASS. §11 gradeExact order Unavailable -> Weak -> Strong ->
+Neutral: PASS (flipUnconfirmed is passed false; Broken / FlipWait carry a direct GR_UNAVAILABLE and are never re-graded until
+a Flip / Reclaim ends the BS: equivalent). §12 target Touch No: Waiting / Armed Upcoming, ActiveTouch CurrentTouchNo (fixed
+TSS no): PASS. §13 TouchStartGrade = tssGrades, written only by touchStartApply: PASS. §14 Weak persistence: WeakByTouch /
+WeakByDepth writers are touchStartApply (OR), episodeApply (OR), touchHistoryTransferApply (I27-15 / 18 Merge / Split transfer
+from the marks, frozen), W08 reset table (new slot / free); no writer in Reset / Reclaim / Flip / Stage J: PASS. §15 Phase and
+Grade separate (gradeExact has no Phase input): PASS. §16 BaseStrong from the post-commit SideView into the next View Grade
+(Stage J) and the current Episode View Grade (episodeApply); TSS untouched: PASS. §17 Stage J writes no history (reads only);
+new-slot reset = W08 coreDeferredStateRaw; Generation creation untouched (W10): PASS. §18 Pending: an ActiveTouch component is
+not applied, Stage J step 1 never runs for it; on the release bar the baseline then the current close: PASS. §20 indexes:
+phaseMoveRaw (PhaseSet detach / write / add), priceOrderUpdate (Armed), bsIndexRaw (Broken / FlipWait), incremental, invariant
+violation = runtime.error: PASS. §21 revision: no Side-state revision exists; Stage J writes none (topologyRevision /
+coreRangeRevision are W08 commit's): PASS (no architecture change).
+
+Writer matrix (persistent):
+| Field | D1 | D2 | D3 / D4 | Topology transfer | Stage J | Generation / slot reset |
+|---|---|---|---|---|---|---|
+| sidePhase | touchStartApply, gapBreakApply (breakCommitRaw) | episodeApply (Reset, breakCommitRaw) | flipApply (bsPairEndRaw) | - | Stage J baseline + step 2 | W08 new slot (Waiting) |
+| sideGrade | breakCommitRaw | episodeApply (no Reset / Break), breakCommitRaw | - | - | Stage J (baseline BS Unavailable, step 2) | W08 reset (Unavailable) |
+| sideArmedFromSeq | - | - | - | - | Stage J | W08 reset (unset) |
+| sideUpcomingTouchNo | - | - | - | - | Stage J | W08 reset (0) |
+| sideCurrentTouchNo | touchStartApply, breakCommitRaw | episodeApply | bsPairEndRaw | touchHistoryTransferApply (0) | - | W08 reset (0) |
+| sideWeakByTouch | touchStartApply | - | - | touchHistoryTransferApply | - | W08 reset |
+| sideWeakByDepth | - | episodeApply | - | touchHistoryTransferApply | - | W08 reset |
+| sideMaxDepthPct | - | episodeApply | - | touchHistoryTransferApply | - | W08 reset |
+| lastFlipConfirmSeq | - | - | flipApply | bsTransferApply | - | W08 reset (unset) |
+No semantic writer after Stage J. No duplicate writer per transition (one Phase writer phaseMoveRaw).
+
+Implementation gap list: Waiting / Armed / ActiveTouch / Broken / FlipWait / Reclaim / FlipConfirm / InverseConfirm destination
+/ Pending release / Grade order / target Touch No / TouchStartGrade / Weak persistence / BaseStrong / Generation boundary /
+indexes / revision / noArm: PASS. Dormant entry, Dormant recovery, Dormant index maintenance, coreDormantFlags: MISSING (no
+writer anywhere: PH_DORMANT is read by the PhaseSet helpers, breakOppositeOkRaw and the transfer preflight only;
+cfg.dormantDistance = 500.0 is only fingerprinted; the Dormant recovery bottom / top orders and the Dormant Core prune heap are
+W02 storage only). DUPLICATE 0, CONFLICT 0, PARTIAL 0. Dormant protection (§9) holds vacuously (nothing enters Dormant).
+
+I27 (STOP; the repo canon does not define these):
+- I27-B14-1 Dormant condition: the distance and its reference (close vs EffectiveRange edge per Side, e.g. Support close >=
+  top + dormantDistance?), inclusive or not, the Phases it applies to (Waiting / Armed only, per the given table) and whether it
+  is per Side (Phase) or per Core (coreDormantFlags; both Sides?).
+- I27-B14-2 monitor range / recovery: the recovery predicate (the same distance strictly inside? the Dormant recovery index keys
+  = which edge), the Phase on recovery (Waiting, then the Stage J Armed test on the same bar from currentSeq + 1, or Waiting
+  only on the recovery bar), and the Armed index / LastArmedRange / ArmedFromSeq on Dormant entry.
+- I27-B14-3 Dormant vs topology: a Dormant Side / Core as a Merge / Split source or 1:1 continuation (baseline Waiting and
+  re-evaluate, or keep Dormant), and the Dormant Core prune heap (B14 or the prune owner batch).
+I27 OPEN = 3.
+
+Token: no code change. Expected B14 code after I27: Dormant entry / recovery inside Stage J step 2 (existing priceOrderUpdate on
+the Dormant recovery orders, phaseMoveRaw), no new UDT / import; Probe decision at the TOKEN START REVIEW.
