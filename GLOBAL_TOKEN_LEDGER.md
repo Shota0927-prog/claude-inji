@@ -3580,3 +3580,24 @@ window, per-request calc_bars_count formulas; source / window / request block id
 identical to V03E 265-383) + backend `ZoneEngineV2_Rebuild_TM1Probe /1` `visualStepAndZoneRows` (provisional probe backend,
 semantic drift 0 vs Production) + the V01 display (filters, bounded top-K, lazy islast-only box / line pools 30 + 30).
 CoreView / physical geometry / delete-new registry removed. Production diff 0. TV compile / runtime: WAITING.
+
+## Runtime Repair R01-B1: I17 reusable scratch 3 paths (W09State /36, Main pin; allocation only)
+TV (user): Windowed Visual 7 d RE10110; 3 d passed once, then RE10110 after a Heavy Script warning; P2R 2016 / 864 bars
+RE10110 -> shortening history alone does not fix runtime; per-bar fixed cost first. Semantics FROZEN (W09).
+- W09State /36: `export type I17Scratch` (histSrc, histSeen, bsSrc, bsHit, bsRel, bsNoFli, postBusy, postSeen) +
+  `newI17Scratch()`; helpers `scratchBoolRaw` / `scratchIntRaw` (exact former length n, all v; grow / shrink only when n
+  changes). touchHistoryTransferPlan (src clear, seen), bsTransferPlan (hit, src clear, rel, nfl clear),
+  touchStartPostPlanPreflight (busy sized only when ok and nb - its only reads are inside loops that cannot run otherwise;
+  roles (caller-owned) exactly the former length of 0s without the temp array; seen map cleared) take `I17Scratch i17`.
+- Main: W09State pin /35 -> /36; ZoneEngine field `w09I17Scratch` (newEngine: W09State.newI17Scratch()); the 3 calls pass
+  `engine.w09I17Scratch`. Main business logic 0. W08Runtime / W08Core / W08Touch / others unchanged. TM-1 not mixed in.
+- Per-bar allocations of the 3 paths: before 9 (2 + 4 + 3: array.new x7 incl. the roles temp, map.new x1, + src) -> after 0
+  (one-time 8 in newEngine; growth only when the Core slot count grows; shrink only on an ok = false bar or a smaller n).
+- Parity (interpreted Production sources, test shim supplies one persistent I17Scratch per interpreter = the Engine field):
+  B08-A / B09 / B10 / B11 / B12 / B13 / B14 / B14 D19 / B15 / B16 R4 / B17 / B18 / B18-INV / B19 (+ TV harness A 24/24,
+  X1-X3, harness B) outputs byte-identical to the /35 baseline. Helper exhaustive 196 / 196. Mutants: no fill (bool),
+  busy not cleared, no postSeen clear -> killed; no fill (int), redundant src / nfl clears -> survive (roles is a fresh
+  caller array, hit reuse not reached by the fixtures, src cleared again before every use, nfl never written: covered by
+  the helper exhaustive check / equivalent by construction). random 0; 5k / 50k / 200k not run.
+- Estimator (E2, candidate selection only): Main all exports 223,434 -> 223,663; W09State functions 36,508 -> 36,716.
+  Exact compiled UNKNOWN. TV: W09State /36 publish -> Main compile; runtime Gate via the TM-1 probe (/2) Windowed Visual.
