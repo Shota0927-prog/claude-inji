@@ -3459,3 +3459,33 @@ X3 FAIL. Static: FORWARD_REFERENCE 0, RESERVED_IDENTIFIER 0, UNDEFINED_FIELD 0, 
 ARITY_MISMATCH 0, SHADOWING_ERROR 0; UDT max 69 fields (HWAux 67, HM 24); request.* / input.* 0. Token estimate (local model,
 not TV): ~70k-79k (< 90k). Harness A unchanged (44e41f6). Production diff 0. I27 OPEN 0.
 Status: B19 = LOCAL PASS / TV DRIFT DIAG WAITING.
+
+## W09 B19 X2 TV drift root cause: B19_X2_TV_DRIFT_ROOT_CAUSE
+
+Classification: HARNESS_FIXTURE_RESISTANCE_PHASE_ORIENTATION. Production defect: NO.
+TV evidence (Harness B 28bbbc9, user): X2-1 (old Side RESISTANCE): BS oldSide -1 on the old slot (correct) but PRE_OLD_PHASE 4
+(FlipWait) and PRE_OPP_PHASE 3 (Broken) - reversed against the B08 / B10 / B13 frozen invariant (BS.oldSide Broken, opposite
+FlipWait); X2_BROKEN_SET_COUNT 0, X2_FLIPWAIT_SET_COUNT 1, old Side not in the Broken set, X2_BS_INDEX_MEMBER_OLD 0, positions
+-1 / -1, BROKEN_INDEX_SLOT_COUNT 0, BS_TARGET_OK 1 with X2_BS_TARGET_COUNT 0. The Reclaim predicate never ran: the old Side was not
+in the Broken set / Broken BS index, so bsTargetSlots returned no target. The X2-0 SUPPORT sub-case was correct.
+Notes: the fixture source (setBS) already wrote Broken / FlipWait relative to the old slot; the TV pre-state was also not a clean
+swap (a local pure-swap fixture mutant gives Broken set 1, STATE 20, RUNTIME 1, vs TV Broken set 0, STATE 10, RUNTIME 0), i.e. the
+TV world of the second sub-case was inconsistent with its source. Both X2 sub-case worlds were built inside one while loop of
+sX2 (the only loop-built fixture in the harness); the local interpreter does not reproduce it.
+Fix (Harness B only): X2 fixture made explicitly oldSide-relative and loop-free: x2Case(oldSide) per sub-case (old slot 0 for
+SUPPORT, 1 for RESISTANCE), straight-line calls x2Case(SUPPORT) then x2Case(RESISTANCE); BS pair / Broken / FlipWait Phases
+via setBS on the old slot, every Phase set and Broken / FlipWait BS price index / position via finishW (the existing fixture
+helpers). Mirror invariant x2Pre at fixture start (both sub-cases): Phase(old) Broken, Phase(opposite) FlipWait, both BS valid,
+BS.oldSide = the old Side on both, old Side in the Broken set and both Broken BS indexes, opposite in the FlipWait set and both
+FlipWait indexes; a failure counts FIXTURE_PRECONDITION_FAIL, is captured as the first drift (kind FIXTURE, X2_PRECONDITION) and
+fails the case. Golden / X2 expectations / predicates / Production slice unchanged (B13 frozen: raw Reclaim and raw FlipConfirm
+true, effective Reclaim true, FlipConfirm false, EV_RECLAIM 1, BS pair cleared).
+Local (Harness B): X2-0 SUPPORT and X2-1 RESISTANCE: old Phase Broken, opposite FlipWait, Broken set 1, old in Broken set 1, old BS
+index member 1, BS target count 1 (old Side), raw Reclaim 1, effective Reclaim 1, row Reclaim 1 / Confirm 0, preflight 1, commit
+1, Event 1, BS cleared, both Waiting; X1 / X2 / X3 PASS; EVENT / STATE drift 0; FIRST_DRIFT NONE; FIRST_PIPELINE_FAILURE NONE;
+FIXTURE_PRECONDITION_FAIL 0. Mutation: M41 -> X2 FAIL (FLIP_PLAN on both sub-cases); harness fixture mutant (RESISTANCE Phase swap
+back to the old wrong state) -> FIXTURE_PRECONDITION_FAIL 1, first drift FIXTURE X2_PRECONDITION (slot 1, expected 3, actual 4),
+FIRST_PIPELINE_FAILURE BS_INDEX, X2 FAIL; M45 -> X1 FAIL; M48 -> X1 / X3 FAIL. Static: FORWARD_REFERENCE 0, RESERVED_IDENTIFIER 0,
+UNDEFINED_FIELD 0, UNDEFINED_FUNCTION 0, NON_EXPORTED_CALL 0, ARITY_MISMATCH 0, SHADOWING_ERROR 0; UDT max 69 (HM 25). Harness A
+unchanged (44e41f6 evidence: Appendix 24 / 24, I22 PASS). Production diff 0. I27 OPEN 0.
+Status: B19 = LOCAL PASS / TV DIAG RECHECK WAITING.
