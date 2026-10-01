@@ -2655,3 +2655,60 @@ I27-15 §8 / §15 / §16 and I27-18 texts are recorded in the frozen Production 
 I27 OPEN = 0. W09_CARRY_MERGE_SIDE_STATE_TRANSFER: satisfied by B06 (history / Fresh), B08 (BS), B10 (Flip state), B14
 (Phase / Dormant); B15 Phase B = verification only (Merge A-D x field conformance fixtures on the existing harness, carry
 closure), no Production change expected.
+
+## W09 B15 Merge Side transfer: Phase B (verification only) and CLOSEOUT
+
+START: 6ce942f, local = remote, 0 / 0, clean; W08Runtime /21, W09State /33; Main compile PASS (B14); I27 OPEN 0.
+TOKEN START REVIEW: Main PASS, exact UNKNOWN. TOKEN END REVIEW: Production delta 0, compiled token delta N/A (UNKNOWN); no
+colour class.
+
+Authority provenance (frozen implementation decisions; git history, not comments alone):
+| Decision | First commit / batch | Rule (current code = introduced rule) | Fixtures at introduction / now | Later changes |
+|---|---|---|---|---|
+| I27-15 §8 / §15 / §16 Fresh transfer | 5e2063c W09 B06-B2C-B0 (W09State /15, W08Runtime /9 Fresh guard release) | new generation all true; 1:1 untouched; Merge = AND over every source Core (ZoneFresh, each SideFresh); Split child from its normal marks (none + complete -> true, truncated -> no inferred revival) | b0_det.py + mutB0_01..12 (scratchpad); now B15 M1 / M5 / M13 | b12adcd B07-R3A: sources read through episodeSideValueRaw (projected same-bar Stage D values); rule lines unchanged |
+| I27-15 / I27-18 Touch history transfer + truncation fallback, LastNormalTouchTime | c0fc087 B06-B2C-C1 (11-field TouchMark, I27-18), da141f3 W09 B06-B2C-C2 (W09State /18, W08Runtime /13 field-by-field guard release) | marks of the target Side in the W08 plan: normal count, latest time, weakByDepth OR, maxDepth max; truncated: count = max(mark count, relevant sources' same-Side count), time / weak / max also from the truncated sources; WeakByTouch = weakByTouchNow(count); CurrentTouchNo 0; completed TSS captured and cleared | c2_det.py / c2_mut.py / c2b_det.py (scratchpad); now B15 M1-M4 / M6 / M12 / M13 | b12adcd B07-R3A (projected source values); cfbe71b / 93506ed / f862f3e / 8bee144 touched the surrounding apply code (TSS clear moved to tssResetRaw, BS / Flip / Reclaim neighbours); history rule lines unchanged (diff da141f3..HEAD of touchHistoryTransferPlan = signature + 4 projected-source reads only) |
+| I27-15 #1-#4 BreakSnapshot transfer and Phase after BS | 9ae99d8 (rules recorded in this ledger, "I27-15 BreakSnapshot transfer"), 93506ed W09 B08-A (W09State /25, W08Runtime /18) | one whole BS row: breakSeq max -> breakTime max -> old Core canonical order (coreId, generationId), Roots copied, no field mix; destination with a BS -> Broken / FlipWait over Waiting / Armed | b8a_det.py L5 / L6 / M1 / M2 (frozen B08); now B15 M7 / M8 / M8b / M10b | 0f01df2 B09 (+ GapBreak source), f862f3e B10 (+ Flip columns), 8bee144 B11 (consumed BS); selection predicate unchanged |
+| B10 Q4 attempt / lastFlipConfirmSeq | f862f3e W09 B10 (W09State /27, W08Runtime /19); ledger "B10 Flip / FlipAttempt: Q1-Q6 fixed (user)" | flipAttemptCount = the selected BS source row (+1 for its Attempt of the bar); lastFlipConfirmSeq Merge = max over the same-Side sources (a Confirm of the bar = baseSeq); W08 guard releases exactly these 2 | b10_det.py F12 / F13 (+ real W08Touch /7 R2); now B15 M9 | none (B11 / B12 / B13 neighbour edits only) |
+All four: introduced in a frozen batch, fixture-covered, current Production equal to the introduced rule -> PASS. No STOP.
+
+sideLastNormalTouchTimes (corrected wording): not a direct public output, but a persistent history helper that feeds the
+I27-18 truncation fallback and so can change a later Merge transfer result; not dead; covered by B15 M1 / M6 / M13.
+
+Transfer-relevant fields (13; writer stage = post-commit apply after freshTransferApply unless noted):
+| # | Field | Writer helper | Source | Destination | Reference rule | Fixtures |
+|---|---|---|---|---|---|---|
+| 1 | sideTouchCounts | touchHistoryTransferPlan (F0) / Apply | W08 Merge TouchMark plan rows of the Side; truncated: + every source count | Merge target Side | spec 12.2, I27-18 | M1 M2 M3 M6 M13 |
+| 2 | sideCurrentTouchNos | touchHistoryTransferApply | - | target Side = 0 | spec 8.3 (no Episode on a Merge target) | M1 |
+| 3 | sideLastNormalTouchTimes | same | latest retained normal mark; truncated: + truncated sources | target Side | I27-18 | M1 M6 M13 |
+| 4 | sideWeakByTouchFlags | same | final count | target Side | spec 13.4 | M4 |
+| 5 | sideWeakByDepthFlags | same | OR of retained marks; truncated: + truncated sources | target Side | spec 9.3 / 12.2, I27-18 | M4 M6 M13 |
+| 6 | sideMaxDepthPcts | same | max of retained marks; truncated: + truncated sources | target Side | I27-18 | M4 M6 |
+| 7 | sideFreshFlags | freshTransferPlan (F0) / Apply | AND over every source Core Side | target Side | spec 16, I27-15 §8 / §16 | M1 M5 M13 |
+| 8 | coreZoneFreshFlags | same | AND over every source Core | target Core | spec 16, I27-15 §8 | M1 M5 |
+| 9 | BreakSnapshot (14 fields + Root list) | bsTransferPlan (F0) / Apply | the selected source row | both target Sides | I27-15 #1 | M7 M8 M8b |
+| 10 | sideFlipAttemptCounts | bsTransferPlan / Apply | the selected BS row (+1 Attempt of the bar) | target FlipWait Side | B10 Q4 | M9 |
+| 11 | sideLastFlipConfirmSeqs | bsTransferPlan / Apply | max over same-Side sources | target Side | B10 Q4 | M9 |
+| 12 | completed TouchStartSnapshot | touchHistoryTransferApply (capture / clear); live TSS never merged (Pending) | source TSS completed on the bar | none (cleared) | spec 11.1 / 11.4, I27-15 #4 | M11 M12 |
+| 13 | coreDormantFlags | phaseArmedStageJFinalize (Stage J derivation, not transferred) | final target Side Phases | target Core | B14 | B14 D15 / G5 |
+Phase / Armed / ArmedFromSeq / LastArmedRange and every SideView field: destination baseline + Stage J / sideViewProduce
+(re-derivation, not transfer): M10 / M10b.
+
+Fixtures (`b15_det.py`, scratchpad; real W08Touch /7 mergePlanBuild interpreted for the TouchMark plan, the harness W08
+stub for the topology, W09State /33 + Main slice interpreted; expected from an independent Python Reference): M1 basic, M2
+duplicate contact (one mark, survivor representative, no double count), M3 out-of-range mark not inherited, M4 Weak OR /
+max / WeakByTouch from the count, M5-1 / M5-2 Fresh kept / no revival (ZoneFresh and SideFresh separately; alloc false not
+read as semantic), M6 truncation fallback (no count / Weak / max drop, LastNormalTouchTime from the truncated source, no
+Fresh revival), M7 single BS whole row, M8 / M8b competing BS (breakSeq, tie -> Core order), M9 attempt = selected row,
+lastFlipConfirmSeq = max, M10 / M10b Phase / Armed (no Phase OR / max; baseline + Stage J; BS -> Broken / FlipWait), M11
+ActiveTouch -> Pending (no transfer, TSS / TouchStartGrade fixed), M12 Reset -> READY Merge (completed TSS cleared, not
+reused), M13 Case A-D: 16/16 PASS (one fixture error fixed before the result: the first M10 bar touched the Armed range).
+Guard 8 fields (coreLastSeenTimes, corePruneRevisions, corePendingGenerationFlags, sideInverseAttemptCounts,
+sideFvgDirectionMasks, sideFvgRootCounts, sideFvgFreshCounts, sideFvgStructuralStateMasks): static over the 13 Production
+sources, NON_DEFAULT_REACHABLE_WRITER_COUNT = 0 (only the alloc push and the coreDeferredStateRaw default row); unchanged,
+kept in the guard.
+Regression: B08-B12 selected (L5 / L8 / F1 / M1, G11 / R1, F4 / F5 / F10, R1 / R2 / R8 / R12 / R14 / R15, I14 / I30), B13
+P1-P12, B14 D1-D18 / D18b, D19 A-D / D2 / G, Default Guard G1-G5: PASS. R3-B1 contract PASS. random 0, 5k / 50k 0.
+Production source delta 0 (Worker versions and Main pins unchanged); the B14 Main compile PASS stands.
+
+W09_CARRY_MERGE_SIDE_STATE_TRANSFER = CLOSED.
+W09_B15_MERGE_SIDE_TRANSFER = COMPLETE / FROZEN. I27 OPEN 0.
