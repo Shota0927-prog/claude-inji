@@ -2712,3 +2712,85 @@ Production source delta 0 (Worker versions and Main pins unchanged); the B14 Mai
 
 W09_CARRY_MERGE_SIDE_STATE_TRANSFER = CLOSED.
 W09_B15_MERGE_SIDE_TRANSFER = COMPLETE / FROZEN. I27 OPEN 0.
+
+## W09 B16 Split / topology transfer: START GATE and Phase A audit (no code change)
+
+START GATE: claude/w09-b07-redesign-v2, local = remote = 1ae698a, 0 / 0, clean; canonical SHA-256 f0ada2d8... (spec v2(5)) /
+8f5373a4... (W09 bundle); HANDOFF_W08, ledger present; pins W08Core /19, W08Touch /7, W08Runtime /21, W09State /33; B15
+COMPLETE / FROZEN, W09_CARRY_MERGE_SIDE_STATE_TRANSFER CLOSED. TOKEN START REVIEW: Main PASS, exact UNKNOWN, no class; audit
+only (no UDT / tuple / forwarding / Main logic / Probe). TOKEN END REVIEW: delta 0, exact UNKNOWN.
+
+Split canon: spec 12.3 (each child inherits only the history that actually contacted its price part; an uncontacted child
+may be untouched; real touch price / time decide the owner; ActiveTouch -> PendingTopology), 11.4 (READY order: Pending
+apply -> recluster -> history by real touch price / time -> new range vs close -> Waiting / Armed), 12.1 (identity: shared
+origin Root and continuity <= M; a discontinuous move is a new generation), 13 (new generation only on its own conditions:
+new independent category, Base Strong, reset distance, re-approach; resets both Sides' history), 16 (Fresh). W08 frozen:
+Split = an old with >= 2 new edges, continuation child (coreId / generationId kept) / fresh child (new IDs); TouchMark Split
+= marks whose contact meets the child Side EffectiveRange (no non-meeting copy, untouched allowed, one mark may go to several
+children), truncated = the child has that Side and the source Side is truncated.
+
+Physical fresh child vs semantic generation: Case 1. The W08 generationId of a fresh child is the identity generation of spec
+12.1; spec 12.3 explicitly gives every child its contacted history, and the 13 reset (both Sides to 0) belongs to the 13
+trigger only. Frozen B06 matches: history from the child's Split marks for continuation and fresh children alike; ZoneFresh
+of a fresh child re-derived from its marks ("new generation re-starts it"), of a continuation child ANDed with the source.
+The 13 trigger has no writer (corePendingGenerationFlags: no writer; W10), so 13-vs-12.3 precedence is not reachable now:
+carried to W10, not a B16 I27.
+
+Split writer inventory (introducing commit / current W09State /33 unless noted):
+| Helper | Commit | Source -> destination | Continuation child | Fresh child | Fields |
+|---|---|---|---|---|---|
+| W08Touch splitPlanBuild / splitApplyPreflight / splitApplyCommit | W08 B12 (W08Touch /7) | source ring -> child ring | marks meeting the child Side range | same | TouchMark rows, child truncated flags |
+| touchHistoryTransferPlan / Apply | da141f3 B06-B2C-C2 | Split marks of the child Side; truncated: + source | rebuilt from its marks | rebuilt from its marks | TouchCount, CurrentTouchNo 0, LastNormalTouchTime, WeakByTouch, WeakByDepth, MaxDepth; completed TSS clear |
+| freshTransferPlan / Apply | 5e2063c B06-B2C-B0 | child marks + source Fresh | SideFresh from marks; ZoneFresh = both Sides AND source ZoneFresh | SideFresh from marks; ZoneFresh = both Sides | sideFreshFlags, coreZoneFreshFlags |
+| bsTransferPlan / Apply | 93506ed B08-A (+0f01df2 B09, f862f3e B10, 8bee144 B11) | source BS -> child Side | per Side: winner range meets BS range | same | 14 BS fields, flipAttemptCount, lastFlipConfirmSeq, noArm |
+| phaseArmedStageJFinalize step 1 / 2 | 1b57251 B06-B2B3-B (+ B08 BS baseline, B14 Dormant / transition) | final topology | baseline Waiting / Broken / FlipWait then Stage J; inherits the source same-bar transition (B14) | same; no transition inherited | Phase, Grade, ArmedFromSeq, LastArmedRange, Upcoming, coreDormantFlags |
+| sideViewProduce / w09CurrentRootProduceRaw | B06 | winners | recomputed | recomputed | SideView derived, current Root lists |
+| episodeApply role 2 / touchHistoryTransferApply TSS capture | 7d711b4 B07-R3B2 | completed TSS | cleared, never reused | not copied | TSS |
+
+Field matrix (Split; persistent unless noted):
+| Field | Continuation child | Fresh child | Untouched child | Mark meeting several children | Source truncated | Authority |
+|---|---|---|---|---|---|---|
+| TouchCount / LastNormalTouchTime / WeakByDepth / MaxDepth | its meeting normal marks (parent 3, 1 meeting, complete -> 1) | same | 0 / na / false / 0 | counted in each child | count = max(marks, source count); time / weak / max also from the source (no revival) | spec 12.3, I27-18 (B06) |
+| WeakByTouch | weakByTouchNow(count) | same | false (count 0, not truncated) | - | from the fallback count | spec 13.4 |
+| CurrentTouchNo / Upcoming | 0 / count + 1 (Stage J) | same | 0 / 1 | - | - | spec 8.3 |
+| SideFresh | >= 1 meeting normal mark -> false; none + complete -> true; none + truncated -> source SideFresh | same | true when complete | false in each child | no inferred revival | spec 12.3 / 16, I27-15 §8 / §16 |
+| ZoneFresh | both Sides fresh AND source ZoneFresh | both Sides fresh | - | - | - | spec 16, B06 |
+| BreakSnapshot | per Side: child Side winner range meets the BS range -> whole row; else none | same | same | every meeting child Side | - | I27-15 #2 (see I27-B16-1) |
+| flipAttemptCount | copied to every child Side taking the BS | same | 0 | - | - | B10 Q4 |
+| lastFlipConfirmSeq | source value kept | baseSeq only for this bar's Confirm on the new Side meeting the BS, else unset | - | - | - | B10 Q4 (read only by bsTransferPlan) |
+| sideInverseAttemptCounts | guarded, never written | same | same | - | - | B12 |
+| Phase / Armed / ArmedFromSeq / LastArmedRange | baseline (Broken / FlipWait from a BS, else Waiting; unset / na) + Stage J; same-bar transition inherited | same; no transition | same | - | - | I27-15 #3, B14 |
+| TSS | live: Pending (never split); completed: cleared | not copied | - | - | - | spec 11.1 / 11.4 |
+| coreDormantFlags | Stage J derivation | same | same | - | - | B14 |
+| coreLastSeenTimes / corePendingGenerationFlags / corePruneRevisions | guarded, no writer | same | same | - | - | Stage K / W10 |
+| Grade / EffectiveRange / ReferencePrice / C / H / Density / BaseStrong / eligibility | recomputed (sideViewProduce, Stage J) | same | same | - | - | spec 4.3 / 6 / 7.2 |
+
+PendingTopology: an ActiveTouch component is not applied (W08 frozen); on READY the plan applies, marks are redistributed,
+Stage J evaluates the new range and the current close (spec 11.4 order kept).
+Merge + Split mixed: W08 sets splitOfP only when mergeOfP == -1 for the same applied target (else the plan fails) and W09
+phaseArmedTransferPreflight requires mergeOfP < 0 or splitOfP < 0 per p, so no destination gets two transfers; a
+many-to-many component is a W08 plan failure (frozen topology, transaction class), never a double transfer.
+Reachability: S1 untouched parent -> children, S2 / S3 contact only in the continuation / fresh child, S4 one mark meeting
+both, S5 marks spread, S6 truncated source with a no-mark child, S7 WeakByDepth parent with the depth mark in one child, S9
+Dormant parent (baseline + Stage J), S10 Split after READY: reachable and decided as above. S8 Broken / FlipWait parent:
+reachable; see I27-B16-1. S11: unreachable as a double transfer (plan failure).
+Guard 8 fields: unchanged (no Split path frees a Core; absorbed-only free).
+
+I27-B16-1 (STOP): Split BreakSnapshot ownership splits a Broken / FlipWait pair.
+1. Reachable case: a Broken Core (Support Broken, Resistance FlipWait, one logical BS on both Sides, B08 D2) splits into a
+   continuation child with only a Support winner (W08Core builds single-sided physical candidates: sIdx or rIdx = -1) whose
+   range meets the BS range, and a fresh child with only a Resistance winner meeting it (or no child Resistance winner at all).
+2. Parent state: valid BS pair on both Sides (Broken / FlipWait), BS range fixed at the break.
+3. Children: per Side, bsTransferPlan gives the BS to a child Side only when that Side's winner range meets the BS range.
+4. Candidate results: R1 (current per-Side rule, I27-15 #2 read literally): child A Support Broken without the Resistance
+   copy, child B Resistance FlipWait without the Support copy (or no child holds the Resistance copy -> that bar F0); from
+   the next bar flipPlan finds a Broken Side whose opposite has no BS and returns false -> whole-pass F0 on every following
+   bar (no state can change while the pass fails). R2 pair per child: a child inherits the BS on both Sides when either of
+   its Sides meets the BS range (pair kept; a Side without a winner still carries Broken / FlipWait). R3 pair per child only
+   when both Sides meet; otherwise none -> the source BS may reach no child -> F0 (I27-15 #2 fail-closed).
+5. Why not unique: I27-15 #2 states the per "child Side" intersection; B08 D2 / B10 require the same BS on both Sides of a
+   Core as one pair; spec 10.1 / 12.3 define no Split rule for a BreakSnapshot; the frozen texts conflict exactly in the
+   single-sided / asymmetric child case and the results differ (permanent F0 vs a Broken / FlipWait child).
+6. Fields: the 14 BreakSnapshot fields of both Sides, flipAttemptCount / lastFlipConfirmSeq / noArm (follow the BS row),
+   Phase (Broken / FlipWait baseline), Broken / FlipWait price indexes.
+I27 OPEN = 1 -> STOP_I27 (B16 Phase B not started).
