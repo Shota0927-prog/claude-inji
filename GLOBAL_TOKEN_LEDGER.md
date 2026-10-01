@@ -3558,3 +3558,16 @@ carries no Side state (side / phase / grade / eligible / effective range), and t
 (viewAt unusable on it) -> B cannot reproduce the display; A kept. Top-K now stores the drawn fields, so the second viewAt
 pass is removed: last-bar Public API calls = 1 viewCount + 2N viewAt. Feed section still byte-identical to W03Harness
 14-334; forward reference 0; Production diff 0; 516 lines. Exact tokens UNKNOWN; TV compile WAITING.
+
+## Visual V01 consumer token path (P0 measured, thin facade added)
+TV (user): old Visual (Main /26 + explicit W08Touch / W08Core imports, consumer `var ZE.ZoneEngine`) 1,108,083 (CE10216);
+P0 (`token_probes/P0_FacadeTokenProbe.pine`, Main /26 only, existing `visualStepAndCoreViews`, no ZoneEngine in the
+consumer) 1,003,501 (CE10216, over 3,501) -> removing the consumer-side Engine type exposure saved 104,582.
+Main (read-only API add, source +31 lines, deletions 0): `export type VisualZoneRow` (8 primitive fields: coreId,
+generationId, side, effectiveBottom, effectiveTop, phase, grade, eligible) and `visualStepAndZoneRows(cfg, feed, doUpdate,
+wantSnapshot) -> [committed, array<VisualZoneRow>]`: own `var` engine, updateConfirmed5m once when doUpdate, rows only when
+wantSnapshot (coreIdOrderSlots order, Support then Resistance, viewAt slot reads, O(1) per row), function-owned `var` row
+array cleared / rebuilt in place (no allocation on historical bars). Existing CoreView facades unchanged. Worker diff 0,
+stage / semantic diff 0. Local parity (`v01_parity.py`, 60 deterministic fixtures, 348 rows) viewAt vs rows ORDER 0 /
+VALUE 0; mutants 6 / 6 killed. Forward reference 0. Estimator (E2, candidate selection only): P0 path 221,767, P1 path
+221,687 (-80 source), Main all exports 223,200 -> 223,434 (+234). P1 TV compile: WAITING (Main /27 publish by the user).
