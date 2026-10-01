@@ -3279,3 +3279,67 @@ I27: OPEN 0, no new I27 in B18. CLOSEOUT Production change 0.
 Status: W09_B18_STATE_PRICE_INDEX_REFERENCE COMPLETE / FROZEN. Frozen inputs from here: the price index semantic, the
 edge-key + query-offset representation, Stage J indexed targeting, BS indexed targeting, W07 Inverse index targeting; only the
 two W10 carries above may reopen them. Next: B19 Conformance (not started).
+
+## W09 B19 Conformance (local): W09_B19_CONFORMANCE_LOCAL PASS / TV HARNESS WAITING
+
+START: claude/w09-b07-redesign-v2, local = remote = c8f4311, 0 / 0, clean; Production W07Fvg /12, W08Core /19, W08Touch /7,
+W08Runtime /21, W09State /35 (Main imports these; Main TV compile PASS at B18); I27 OPEN 0. TOKEN START REVIEW: Production
+compiled exact UNKNOWN (no GREEN / YELLOW / RED class); B19 plans no Production change.
+Scope: Appendix B 46-69 (24 cases) as a final conformance of the frozen B01-B18 W09 semantics; no new Zone logic. Authority =
+canonical + frozen decisions (the old ZoneEngineV2_Rebuild_ConformanceHarness is not used as authority).
+Harness (local, scratch, not committed): 3 layers. (1) independent Reference b19_ref.py: a per-Side state machine (coreId,
+generationId, Side, Phase, Grade, WeakByTouch / WeakByDepth, TouchCount, CurrentTouchNo, Fresh / ZoneFresh, TSS, BreakSnapshot
+incl. movedAway / retestSeen, attempt, lastFlipConfirmSeq, Dormant, EffectiveRange / LastArmedRange, history); it reads the
+fixture once and evolves its own state; no Production helper is called (no index / target / Grade helper). (2) Production
+path: W09State /35 + Main w09StageCDPlanRaw + Main post-commit slice interpreted in the Main stage order (B17), W08 stub.
+(3) comparison per bar: final Side state (17 fields), ZoneFresh, Core Dormant (Stage J target Cores), the Event list (count /
+type / time / seq / coreId / generationId / Side / range / touchNo / gradeAtStart / weakReason / rootId; canonical order
+coreId, generationId, Support, Resistance; suppressed Events 0) + the B18 I22 audits on every bar (index_audit pre / post,
+target_audit: full-scan state sets and price indexes).
+APPENDIX_B_W09 46-69 = 24 / 24 PASS, FAILED 0, NOT_RUN 0 (LOCAL_REFERENCE_PASS; TV not claimed). 81 Reference bars + 6 Merge /
+Split topology runs: STATE_DRIFT 0, EVENT_DRIFT 0, RUNTIME_ERROR 0, unexpected F0 0. Extra Reference scenarios: X1 B14 Stage J
+(Armed -> Dormant, recovery bar touching the zone without a Touch, ArmedFromSeq = seq + 1, a Reset far away is a transition ->
+no Dormant), X2 B13 Reclaim > FlipConfirm (degenerate line BS), X3 F0 fixture (mutation 0, Event 0, index mutation 0): 3 / 3.
+61 (re-flip history restore): Production keeps the per-Side history on its own Side slot; bsPairEndRaw / flipApply never write
+TouchCount / Weak / MaxDepth / Fresh, so a re-flip to the used Side restores it (canonical 10.3 / 15.3) - verified end to end
+(Touch 2 + Break -> Resistance Flip / Touch / Break -> Support FlipConfirm -> Touch 3, WEAK_BY_BOTH). No drift, no I27.
+I22_W09_STATE_INDEX_REFERENCE (local) PASS: TOUCH / GAP / D1 / ACTIVE / BREAK / RESET / FLIP / RECLAIM / INVERSE / DORMANT
+MISSING and EXTRA 0, ORDER_DRIFT 0, RESULT_DRIFT 0, INDEX_STALE / MISSING / ORDER 0 over every B19 bar (I22 10 / 10 not claimed).
+Regression (current HEAD, Production unchanged): B09 16 / 16, B10 14 / 14, B11 14 / 14, B12 25 / 25, B13 13 / 13 (same-bar
+priority), B14 17 / 17 + D19 + guard (Stage J), B15 16 / 16 (Merge transfer fields), B16 13 / 13 (Split / R4 incl. pair-mismatch
+F0), B17 14 / 14 (stage order, F1 / F2), F2 6 / 6 (duplicate Feed: Stage A reject, previous Events kept, lastBase unchanged),
+B18 43 / 43 + B18_INV 16 / 16 (W07 /12 Inverse index), Reference metrics 0.
+Mutations: B19 M31-M47 (W09State 15 + Main 2) 17 / 17 detected; M36 first draft (flipPlan breakSeq < -> <=) was an equivalent
+mutant (a bar-start Broken set never holds a BS of the current bar, B17 stage order) and was replaced by the Reclaim equality
+mutant; M45 (Dormant entry ignoring the bar's transition) needed the X1c scenario (harness coverage, class B). Representative
+B18 mutants re-run: M1 / M5 / M10 / M15 / M20 / M17main (b18_det) and M21 / M25 / M30 (b18_inv) all detected.
+W09_MUTATION_UNDETECTED = 0.
+Static: FORWARD_REFERENCE 0 (W09State, W07Fvg, W08Core, W08Touch, W08Runtime, Main, B19 TV harness); reserved identifier 0;
+per-bar Production full live-Core scan 0 (B18 S1: Stage J target extraction), Broken full scan 0 (S2: BS index targets),
+InverseWait full scan 0 (B18-B4 S5); Main W09 business duplication 0 (no Main function shares a W09State name; Main reads W09
+only through W09State calls). Observation (not a per-bar scan, frozen B12, not changed): invHoldersRaw walks the live Cores once
+per InverseConfirm / deferred-confirm Root on bars that carry such a fact (event-gated).
+Drift classes: A (Reference) 0; B (harness) 5 fixed in the harness only (two-Core fixture over-touch in the first draft, a
+harness helper name shadowing the interpreter, harness J / IV attributes in the F0 state diff, the M36 equivalent mutant, the
+X1c coverage); C (Production) 0; D (canonical ambiguity) 0 -> no STOP_I27.
+Production drift 0; Production diff 0 (W07Fvg /12, W08Core /19, W08Touch /7, W08Runtime /21, W09State /35, Main untouched; no
+version change, no publish).
+TV harness: ZoneEngineV2_W09ConformanceHarness_B19.pine (new, indicator, not Production). Imports W09State /35 and W08Touch /7
+(the only published W09 path it drives). Layer 1 = golden vectors of the independent Python Reference (81 bars: Events + 31
+fields per live Side + ZoneFresh / Core Dormant; 6 Merge / Split mark / history / plan records); layer 2 = the published
+helpers in the Main order (view constructors, Stage C / D wrapper and post-commit slice generated from Main's own source text;
+W08 topology = the local stub); layer 3 = per-bar comparison + I22 full-scan index / target audit. Output table:
+W09_CONFORMANCE_PASS, APPENDIX_B_W09_PASSED / TOTAL / FAILED, I22_STATE_INDEX_PASS, STATE_INDEX_MISSING / EXTRA / ORDER_DRIFT /
+RESULT_DRIFT, EVENT_DRIFT_TOTAL, STATE_DRIFT_TOTAL, RUNTIME_ERROR_COUNT (+ EXTRA_X1_X3_FAILED, BARS / GOLDEN, INDEX_CHECKS).
+Locally executed as Pine (interpreter, published-source W09State /35 / W08Touch /7): PASS, 24 / 24, all drift 0, 87 bars, 81 /
+81 golden, 1730 index checks; the same harness reports FAIL on mutants M31 / M32 / M35 / M37 / M40 / M43 / M44 / M45 and on the
+B18 index mutants M5 / M15 (M10 is outside its scenarios; detected by the local B18 suite). Static on the harness: forward
+reference 0, HW / HF field references all declared, W09State / W08Touch calls all exported, call arity 0 mismatches. TV compile
+/ runtime = NOT RUN (user, next rally).
+OPEN carries unchanged (not B19 blockers, not PASS): W10_CARRY_I17_REUSABLE_SCRATCH_3PATHS = OPEN (touchHistoryTransferPlan
+seen, bsTransferPlan rel + full Side loop, touchStartPostPlanPreflight busy / roles); W10_CARRY_W07_INVERSE_INDEX_FREE_RETIRE_CLEANUP
+= OPEN; Generation 70-73 -> W10; Reproducibility 75 -> W11 / W12.
+TOKEN END REVIEW: Production delta 0 (exact UNKNOWN, no class); harness-only addition (2416 lines, compiled exact UNKNOWN).
+random 0; 5k / 50k / 200k NOT RUN. I27 OPEN 0.
+Status: W09_B19_CONFORMANCE_LOCAL PASS; APPENDIX_B_W09_46_69_LOCAL 24 / 24; I22_W09_STATE_INDEX_LOCAL PASS. B19 = LOCAL PASS /
+TV HARNESS WAITING (not COMPLETE).
