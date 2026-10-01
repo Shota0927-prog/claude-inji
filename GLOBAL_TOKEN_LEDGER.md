@@ -2115,3 +2115,30 @@ params), inverseCancelPlan (9), inverseDeferredResolve (17: the 10 SoA arrays + 
 (23); touchStartPlanBuild + 1. Risk: medium (two larger signatures, called once per bar). CE10216 -> STOP (no semantic cut;
 GT-5A / D3 / T1-T3).
 TV: W09State /30 publish -> Production Main compile.
+
+### B12 R2 (pre-TV correction, W09State /30 still unpublished)
+
+- Pending destination D1 rule corrected (the R1 rule "a Pending destination cancels nothing" is withdrawn): inverseCancelPlan
+  takes every P0 Candidate whose inverse-Side winner holds a confirm Root: applied -> its old Cores (Merge survivor / absorbed,
+  Split source, 1:1 continuation); not applied (Pending) -> every old Core of its changed component (the existing W08 plan
+  scratch changedTargets [p, component, ...] / changedOldCores [slot, component], passed from Main; no new W08 export). New D1
+  TouchStarts of that parity on those Cores are cancelled, materialized or Pending alike (the W07 confirm list is the
+  same-bar normal Touch exclusion authority); winner-less Roots cancel nothing; a bar-start ActiveTouch is never cancelled.
+  After the cancel a component that is still Pending (bar-start ActiveTouch) stays Pending: Event on the bar with ID_NONE,
+  mark deferred; a component no longer Pending is taken from the P0 / P1 final plan (P0 is the counterfactual authority).
+  P1 rule and the two-plan maximum unchanged. inverseCancelPlan: 9 -> 11 params.
+- TouchMark: the W08Touch /7 11-field schema only (isNormalTouch false, not counted); no snapBottom / snapTop / deepestClose
+  (the R1 report already wrote none).
+- Token review correction: the Two-pass Probe measured the two plan calls, the deferred SoA and the import graph only; the
+  W09State /30 export signatures were not in it: inverseDeferredResolve 17 args and inverseConfirmProject 23 args are recorded
+  as HIGH_COST_STRUCTURE / mass-forwarding risk. Audit: every parameter of both (and of inverseCancelPlan, 11) is read by
+  the body and none is derivable from another (the 10 SoA columns are compacted together; confirmCount bounds a list with a
+  physical tail): nothing removed. No new UDT / import / wrapper / body copy / synthetic Probe. Authority: W09State /30
+  publish -> Production Main compile; CE10216 -> STOP (GT-5A / D3 / T1-T3).
+- Gates: b12_det.py 25/25 (I1-I30 as before, re-run in full because the harness stub changed: the stub SideView keeps a
+  Pending Candidate, the stub changed-plan scratch is passed; + I31 bar-start ActiveTouch + Pending confirm + same-component
+  new D1 -> ActiveTouch kept, only the D1 cancelled, P0 final, Pending kept, Event ID_NONE, mark deferred; I32 Pending
+  destination + related / unrelated D1 -> related cancelled, P1, unrelated TouchStart committed; I33 winner-less confirm + other
+  Core D1 -> cancel 0, P1 commits the D1, Event ID_NONE). Older batches not re-run (the change is inside inverseCancelPlan,
+  reached only on a bar with an InverseConfirm and a D1 candidate). R3-B1 contract PASS; static: imports 0,
+  use-before-definition 0.
