@@ -3371,3 +3371,30 @@ UNMAPPED_HW_FIELD 0, DUPLICATE_HW_FIELD_OWNER 0, NON_EXPORTED_CALL 0, ARITY_MISM
 UDT constructors), SHADOWING_ERROR 0. request.* 0, input.* 0, imports unchanged (W09State /35, W08Touch /7).
 Production diff 0 (W07Fvg /12, W08Core /19, W08Touch /7, W08Runtime /21, W09State /35, Main untouched, no re-publish).
 TOKEN: Production delta 0; harness compiled exact UNKNOWN. I27 OPEN 0. B19 = LOCAL PASS / TV HARNESS WAITING (not COMPLETE).
+
+## W09 B19 TV drift diagnostics: B19_TV_HARNESS_DRIFT_DIAG
+
+TV run (user, harness 44e41f6): W09_CONFORMANCE_PASS FAIL; APPENDIX_B_W09 24 / 24 (FAILED 0); I22_STATE_INDEX_PASS PASS
+(MISSING / EXTRA / ORDER / RESULT 0, INDEX_CHECKS 1730); RUNTIME_ERROR_COUNT 0; EVENT_DRIFT_TOTAL 1; STATE_DRIFT_TOTAL 10;
+EXTRA_X1_X3_FAILED 1; BARS / GOLDEN 87 / 81 of 81. The local interpreter run of the same file is all 0, so the drift is a
+local-vs-TV difference located in one of the extra scenarios X1-X3 (case pass = no counter increase during the case; the 24
+Appendix cases all passed). Not classified yet; Production not suspected before the first drift is known; Production frozen.
+Diagnostic harness (counters / first-failure capture / table only; golden vectors, Reference expectations, predicates, Production
+slice, scenario feeds and every comparison unchanged - the only edited comparison lines bind the same vecDiff operands to
+named variables): metric container HM (23 fields: the existing counters + per-field counters + first-failure capture);
+X1_PASS / X2_PASS / X3_PASS; FIRST_DRIFT_SCENARIO / BAR_INDEX / GOLDEN_INDEX / KIND (TAG / RUNTIME / EVENT / STATE / GOLDEN /
+TOPO) / FIELD / SIDE-CORE / EXPECTED / ACTUAL / EXPECTED_TAG / ACTUAL_TAG; Event first drift = count mismatch first, else the
+first differing Event with all 12 fields expected / actual; per-field state counters for the 31 compared Side fields +
+ZONE_FRESH / CORE_DORMANT / STATE_LENGTH / TOPO_MARK_HISTORY; execution counts (runAll, goldInit, goldXInit, each of the 27
+cases, X1 / X2 / X3, comparisons). The first drift is captured once, never overwritten.
+BARS / GOLDEN meaning: 87 = transactions run = 81 golden Reference bars (Appendix 46-67 + X1-X3) + 6 Merge / Split topology
+runs (68-0..2, 69-0..2), which compare against the separate topology golden records; 81 = golden Reference records consumed;
+"of 81" = golden records in the file. Expected values (87 / 81 / 81).
+Local (same file): 24 / 24, X1 / X2 / X3 PASS, state / event drift 0, I22 0, runs runAll / goldInit / goldXInit 1 / 1 / 1,
+every case 1, comparisons 81, FIRST_DRIFT none. Diagnostic self-test on mutants: M45 -> X1 FAIL, first drift X1 bar 9 golden 75
+STATE PHASE side 0 expected 1 actual 5; M41 -> X2 FAIL, LAST_FLIP_CONFIRM_SEQ expected -1 actual 50; M32 -> EVENT
+EVENT_COUNT expected 2 actual 1 with the expected WeakDepth Event fields; M31 -> RUNTIME TXN_OK.
+Static: FORWARD_REFERENCE 0, RESERVED_IDENTIFIER 0, UNDEFINED_FIELD 0 (HW owners, HF, HM), NON_EXPORTED_CALL 0,
+ARITY_MISMATCH 0, SHADOWING_ERROR 0; UDT fields HW 5, HWCore 41, HWState 51, HWIndex 27, HWTopo 69, HWAux 66, HF 16, HM 23
+(max 69, CE10116 margin kept); request.* 0, input.* 0, imports unchanged. Production diff 0. I27 OPEN 0.
+Status: B19 = LOCAL PASS / TV DRIFT DIAG WAITING (not COMPLETE).
