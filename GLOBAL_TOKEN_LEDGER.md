@@ -3151,3 +3151,54 @@ TOKEN END REVIEW: W09State /35 +256 / -25 lines, Main +23 / -? (thin wiring, sto
 Status: B18_F1_STAGEJ_PRICE_EVENT_INDEX IMPLEMENTED_LOCAL; B18_F2_BS_DORMANT_REQUIRED_INDEX IMPLEMENTED_LOCAL;
 W09_B18_STATE_PRICE_INDEX_REFERENCE_LOCAL PASS. B18 not COMPLETE: LOCAL PASS / TV GATE WAITING (W09State /35 publish, Main
 compile by the user). I27 OPEN 0. STOP.
+
+## W09 B18-B4: Inverse threshold index completion (W07 /12) - W09_B18_STATE_PRICE_INDEX_REFERENCE_LOCAL PASS
+
+START GATE: claude/w09-b07-redesign-v2, local = remote = 157e7e7, 0 / 0, clean; W07Fvg Production /11 (repo source = /11,
+Main import /11); Inverse owner W07 (inverseFacts via inverseStageEPrepare <- stageEFreshInversePrepare, Main Stage E callsite
+1; wait entry / pending apply via inverseStageFCommitWithConfirm, Main Stage F callsite 1); InverseWait set
+inverseWaitFvgRootSlots (Main engine, W07-maintained); the W03 FVG NativeRange interval orders fvgNativeBottom /
+TopOrderRootSlots (W03-owned, every live FVG Root; an invalidated Root stays in them; no FVG Root free / retire path - W03
+retires TimeHL only, rootFreeSlots has no writer); progress owner W07 (rootFvgInverseProgresses); W09State /35, Main pin /35.
+B18_INDEX_KEY_REPRESENTATION = EDGE_KEY_PLUS_QUERY_OFFSET_ACCEPTED_EQUIVALENT (Waiting / Armed / Dormant / BS indexes: the
+range edge tick is the key, reset / dormant / buffer offsets are applied in the query; not an I27).
+Frozen W07 predicate (inverseEvalOneRaw, ticks round(price / mintick), reset = round(touchResetDistance / mintick)):
+| Progress | Reads | Fact | Inclusive |
+|---|---|---|---|
+| 1 WAIT_MOVED_AWAY | direction, NativeRange edge, close | Bullish close <= bottom - reset, Bearish close >= top + reset -> 2 | yes |
+| 2 MOVED_AWAY | NativeRange, high / low, close | low <= top and high >= bottom -> 4 when the close confirms (Bullish close <= bottom, Bearish close >= top), else 3 | yes |
+| 3 RETOUCHED | direction, NativeRange edge, close | confirm (as above) -> 4 | yes |
+| 4 ACTIVE | - | InverseActive set, ROOT_INVERSE_ACTIVE, confirm list row (pending order) | - |
+Output: pending rows (slot, rootId, new progress) in ascending wait position, applied in Stage F (progress write / ACTIVE move),
+the Candidate seed STATE | FVG (| BROAD), FVG state / new-Side eligibility dirty, the confirm list (pending order).
+Implementation (W07Fvg /12, Production): invWaitBull (WAIT_MOVED_AWAY Bullish, key bottom), invWaitBear (key top),
+invRetouchBull (RETOUCHED Bullish, key bottom), invRetouchBear (key top), one reverse position array rootInvIdxPositions
+(Main aux storage, W07-maintained; order (key tick, rootId), freshIndexInsertRaw / freshIndexDetachRaw). MOVED_AWAY reuses the
+W03 FVG NativeRange orders (no duplicate interval index) with the InverseWait / MOVED_AWAY filter. inverseFacts candidates:
+Bullish WAIT bottom >= close + reset, Bearish WAIT top <= close - reset, Bullish RETOUCHED bottom >= close, Bearish RETOUCHED
+top <= close, contact bottom <= high and top >= low (W03 orders) - each exactly its predicate; then the frozen wait-set order
+(ascending wait position = the former loop order), the unchanged per-Root checks plus source-index / progress / direction
+agreement, and inverseEvalOneRaw. Maintenance: inverseWaitEnterApply inserts into the WAIT index (dry run first);
+inversePendingApply moves the Root between indexes (1 -> 2 out of WAIT, 2 -> 3 into RETOUCHED, 2 / 3 -> 4 out); a failed move
+is runtime.error W07_INVERSE_APPLY_INVARIANT. Count invariant: the four index sizes never exceed the wait set.
+Main: W02Aux invWaitBull / invWaitBear / invRetouchBull / invRetouchBear RootSlots, rootInvIdxPositions; the two W07 calls
+get the index arrays (Stage E also the W03 FVG NativeRange orders / positions, Stage F also the native ticks); import W07 /12.
+Evidence (scratchpad b18_inv.py: W07 /12 and /11 interpreted on a synthetic FVG Root store, Reference = every InverseWait Root
+in wait order with the predicate written independently; Level 1 = the Roots actually evaluated by Production): P43-P57 + S5
+16 / 16 PASS; INVERSE_MISSING 0, INVERSE_EXTRA 0, INVERSE_ORDER_DRIFT 0, INVERSE_RESULT_DRIFT 0 (/12 vs Reference and vs /11:
+pending rows, confirm list, Root states, progress, wait / active sets, positions, seeds identical), INVERSE_INDEX_STALE 0,
+INVERSE_INDEX_MISSING 0, INVERSE_INDEX_DUPLICATE 0; coverage: 23 moved-away, 12 retouched, 10 confirm facts. P53 / P54: no
+FVG Root free / retire path exists; an InverseActive Root or a slot with another W07 identity cannot (re-)enter and leaves
+no index entry. B18 P1-P42 + S1-S4 43 / 43 PASS (P10 now checks the step parity; extraction in b18_inv). Mutations M21-M30
+10 / 10 detected; M1-M20 (+ M17 Main) re-run 21 / 21 detected; MUTATION_UNDETECTED 0. Static: inverseFacts has no
+InverseWait scan, no array.sort in W07 (sort_indices on the candidate list only). Regression B08-B17 PASS (B10 Flip /
+Reclaim, B12 InverseConfirm, B13 priority / noArm, B14 Stage J + D19, B15 Merge, B16 R4, B17 order), W08Runtime guard PASS.
+random 0; 5k / 50k / 200k not run.
+W10_CARRY_I17_REUSABLE_SCRATCH_3PATHS = OPEN: W09State touchHistoryTransferPlan (seen, 2 x Core count), bsTransferPlan (rel,
+2 x Core count, plus its loop over every Side), touchStartPostPlanPreflight (busy / roles, Core count, when any row exists)
+allocate per-bar scratch sized by the Core count; I17 asks for Engine-owned reusable scratch with logical-length reuse. Not
+changed in B18-B4; must be CLOSED by W10 or the Final Integration and re-audited before the final canonical diff 0 decision.
+W07_I11_INVERSE_THRESHOLD_INDEX_CARRY = CLOSED. B18_INVERSE_THRESHOLD_INDEX = IMPLEMENTED_LOCAL.
+TOKEN END REVIEW: W07Fvg /12 (+ index helpers, extraction), Main +storage / call args; W09State /35 unchanged (no /36);
+exact UNKNOWN, no class. Status: W09_B18_STATE_PRICE_INDEX_REFERENCE_LOCAL PASS; B18 not COMPLETE: LOCAL PASS / TV GATE
+WAITING (W07Fvg /12, W09State /35 publish, Main compile). I27 OPEN 0. STOP.
