@@ -2794,3 +2794,40 @@ I27-B16-1 (STOP): Split BreakSnapshot ownership splits a Broken / FlipWait pair.
 6. Fields: the 14 BreakSnapshot fields of both Sides, flipAttemptCount / lastFlipConfirmSeq / noArm (follow the BS row),
    Phase (Broken / FlipWait baseline), Broken / FlipWait price indexes.
 I27 OPEN = 1 -> STOP_I27 (B16 Phase B not started).
+
+### B16 I27-B16-1 resolution (user) and R4 Reference fixture (Production unchanged)
+
+I27-B16-1 RESOLVED: decision R4 = BREAK_LIFECYCLE_CONTINUATION_OWNERSHIP (R1 / R2 / R3 not adopted). An unresolved
+BreakSnapshot is one paired Break lifecycle of a physical Core (the same row on both Sides; Broken = BS.oldSide, opposite
+FlipWait; movedAway / retestSeen updated together; cleared together on Flip / Reclaim). On Split only the continuation child
+(old coreId / generationId, W08 frozen) inherits it, as the whole pair (every BS field, Roots, wasGapBreak, movedAway,
+retestSeen), with Phase from BS.oldSide even when the continuation has a winner on one Side only; the child Side range vs BS
+range intersection is no ownership condition (spec 10.1: criteria fixed at the Break, not moved by later re-zoning); fresh
+children inherit no BS (14 fields default, no Broken / FlipWait from it), never a duplicate holder. flipAttemptCount and the
+other BS-pair lifecycle fields follow the BS to the continuation; lastFlipConfirmSeq stays Side history (B10 / B15 frozen:
+continuation keeps the source value, fresh child only by the existing same-bar Confirm writer). noArm / same-bar transition:
+B13 / B14 frozen (continuation only inherits the transition). Not an F0 reason: a one-sided continuation, a continuation range
+missing the BS, a fresh child meeting the BS. Still fail-closed: an inconsistent source pair (Support / Resistance rows differ,
+oldSide contradiction) and the existing transaction invariants.
+I27_B16_1_SUPERSEDES_I27_15_2_SPLIT_BS_OWNERSHIP: the Split part of I27-15 #2 (per child-Side intersection) is replaced by the
+continuation atomic pair ownership; the Merge BS selection (I27-15 #1) is unchanged.
+I27 OPEN = 0. B16 not COMPLETE.
+
+R4 Reference fixture (`b16_r4.py`, scratchpad; Split bar = unit of bsTransferPlan -> phaseArmedIndexRelease ->
+bsTransferApply -> Stage J on the post-commit Split state, Main order; next bars = txn8 from the R4 post-Split state; expected
+from an independent R4 Reference), current Production W09State /33:
+| Case | Result on /33 | First failing field |
+|---|---|---|
+| R4-0 control (continuation with both winners meeting the BS, fresh missing it) | PASS | - |
+| R4-1 continuation Support-only / fresh Resistance-only | FAIL (expected) | continuation Resistance BreakSnapshot valid flag (the Resistance copy goes to the fresh child) |
+| R4-2 continuation Resistance-only / fresh Support-only | FAIL (expected) | continuation Support BreakSnapshot valid flag |
+| R4-3 continuation range misses the BS, fresh meets it | FAIL (expected) | continuation BS (both copies go to the fresh child) |
+| R4-4 fresh children meeting the BS | FAIL (expected) | continuation BS (holder = the fresh child) |
+| R4-9 GapBreak BS | FAIL (expected) | continuation Resistance BreakSnapshot valid flag |
+| R4-10 inconsistent source pair (breakSeq 40 / 41) | FAIL (expected): the plan accepts it (no pair consistency check) | plan result true |
+| R4-5 movedAway on the R4 continuation (one-sided) | PASS (pair synchronized) | - |
+| R4-6 FlipAttempt | PASS (one Event, attempt +1, no F0) | - |
+| R4-7 FlipConfirm | PASS (one Event, both copies cleared, nothing on the fresh Core) | - |
+| R4-8 Reclaim | PASS (one Event, both copies cleared) | - |
+| R4-X current-rule consequence (asymmetric result, next bars) | confirms: every later bar F0, mutation 0 | - |
+The fixture detects the defect (R4-1 / R4-2 FAIL on /33). Production fix not started (STOP as instructed).
