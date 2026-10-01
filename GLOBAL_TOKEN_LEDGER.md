@@ -3057,3 +3057,46 @@ UNKNOWN (no GREEN / YELLOW / RED class); Worker change 0, Worker republish not n
 Production diff: B17 changed Main only; W08Core / W08Touch / W08Runtime / W09State /34 unchanged; CLOSEOUT Production change 0.
 I27: B17 OPEN 0 (F1 unique by canonical, F2 consistent with the frozen retry contract; no new I27).
 Status: W09_B17_STAGE_C_D_J_PRODUCTION COMPLETE / FROZEN. Next: B18 state price-index vs Reference (not started).
+
+## W09 B18 Phase A: State Price-Index vs naive full-scan Reference - W09_B18_STATE_PRICE_INDEX_REFERENCE_PHASE_A_PASS
+
+START GATE: claude/w09-b07-redesign-v2, local = remote = beb3260, 0 / 0, clean; pins W08Core /19, W08Touch /7, W08Runtime /21,
+W09State /34; B17 COMPLETE / FROZEN (Main TV compile PASS); I27 OPEN 0. TOKEN START REVIEW: Main compile PASS, exact UNKNOWN;
+Phase A = audit + scratch Reference only. Production diff 0, version / pin change 0, random 0, 5k / 50k / 200k not run.
+
+Production extraction inventory (W09State /34 + Main, repo names):
+| State | Production extraction | Index / set (owner, key, order, bound) | Maintenance |
+|---|---|---|---|
+| Touch / GapBreak (D1) | touchStartPlanPreflight / Build -> d1TargetSlots = touchTargetSlots + gapBreakTargetSlots (priceOrderRange) -> Armed / eligible / armedFromSeq <= seq filter -> canonicalSideSlots | armedBottom/TopOrderSideSlots + positions (W09State, key round(sideLastArmedRange{Bottom,Top} / mintick), ASC, tie slot ASC); Touch: bottom (-inf, high], top [low, +inf), line bottom [low - tol, high + tol] with bottom == top; GapBreak: Support bottom [max(high + 1, close + bb), +inf), Resistance top (-inf, min(low - 1, close - bb)]; all inclusive | insert: Stage J arm (key set before insert); remove: Stage J (not q / key change), phaseArmedIndexRelease (applied continuation / freed Core before commit), TouchStart apply, Break / GapBreak (BS pair) |
+| ActiveTouch / Local Break / Episode Reset | episodePlan: phaseActiveTouchSideSlots + this bar's TouchStart rows -> canonicalSideSlots (no price filter) | Phase set (swap-pop, sidePhaseSetPositions) | phaseMoveRaw (detach + add) |
+| Flip / Reclaim | flipPlan: phaseBrokenSideSlots -> paired FlipWait Side -> canonicalSideSlots (no price filter); predicate on the fixed BS payload; reclaimResolve D4 | Broken / FlipWait Phase sets; broken/flipBottom/TopOrderSideSlots (key round(bsRange / mintick)) maintained by bsIndexRaw, not consumed by any extraction | Stage J BS attach, Break / GapBreak, bsPairEndRaw (FlipConfirm / Reclaim), release of Merge / Split old Cores |
+| Waiting Reset / reArm, Dormant enter / recovery, Grade / Upcoming | phaseArmedStageJFinalize: full scan of every live Core x 2 Sides (Waiting / Armed / Dormant) | none (dormantBottom/TopPositions declared in the view, never written) | - |
+| Inverse | W07 inverseFacts: every Root of inverseWaitFvgRootSlots (no price filter, W07 owner); W09 consumes the confirm list | W07 InverseWait set | W07 (frozen) |
+Canonical order: canonicalSideSlots (coreId ASC, generationId ASC, Support, Resistance; key coreId * 2 + side), used by every
+extraction before evaluation / Events. W10_CARRY: Generation re-approach / PendingGeneration (corePendingGenerationFlags is
+read-only input to Stage J), not B18 scope.
+
+Reference (scratch b18_det.py): every live Core x (Support, Resistance) in canonical order, predicates computed directly from
+Phase, LastArmedRange / EffectiveRange, TSS, BS payload, high / low / close and cfg (no priceOrderRange / target helper /
+Phase set / canonicalSideSlots); index audit = each Phase set and each price index against the full scan (membership,
+duplicates, positions, order by the current key). Level 1 target parity + Level 2 result parity (Events type / Core / Side /
+order, final Phase per Side) on the Production path (txn8, Main w09StageCDPlanRaw interpreted).
+Fixtures P1-P24 + P25 (Armed range change re-key): 25 / 25 PASS. TOUCH / GAP / D1 / ACTIVE / BREAK / RESET / FLIP / RECLAIM /
+INVERSE / DORMANT MISSING 0 and EXTRA 0; ORDER_DRIFT 0; RESULT_DRIFT 0; INDEX_STALE 0, INDEX_MISSING 0, INDEX_ORDER 0.
+Coverage (bars with a non-empty Reference set): Touch 24, GapBreak 11, D1 32, Active 9, Break candidates 32, FlipWait 10,
+Broken 10. Harness-only corrections during the run (class A): Stage B event clear between bars, the SideView current Root
+list of fixture Sides, the Reference BS pair over an opposite same-bar Reset (B08 rule), the P10 static pattern.
+Mutations: M1 bound off-by-one, M2 inclusive -> exclusive, M3 Support reArm comparison reversed, M4 Resistance reversed, M5
+Phase-set remove deleted, M6 Phase-set insert deleted, M7 canonical sort by slot, M8 stale range key (Armed index inserted
+with the pre-change LastArmedRange), M9 Split fresh BS inherit, M10 Dormant equality exclusive: 10 / 10 detected,
+MUTATION_UNDETECTED 0. Note: the first M8 form (drop the Stage J key-change re-key condition) is an equivalent mutant: every
+applied continuation / freed Core leaves the Armed index in phaseArmedIndexRelease before commit and EffectiveRange changes
+only for applied Cores, so a member with a changed key is unreachable at Stage J.
+Findings (no result drift, recorded for the Phase B decision): B18-F1 Stage J evaluates Reset / reArm and Dormant enter /
+recovery by a full live-Core scan every bar (I16 rule 1 / table rows "Reset / 再Armed", "Dormant復帰" ask for state-set +
+price extraction); results are exact (full scan is complete), the gap is the extraction shape / per-bar cost. B18-F2 the
+Broken / FlipWait BS price indexes are maintained but unused (Flip / Reclaim read the whole Broken set, complete), and the
+Dormant price positions are declared but never written. Neither is a predicate / ordering defect; I27 none (I16 is explicit,
+nothing undefined). Production drift: none. I27 OPEN 0.
+TOKEN END REVIEW: Production delta 0; exact UNKNOWN. Status: W09_B18_STATE_PRICE_INDEX_REFERENCE_PHASE_A_PASS (B18 not
+COMPLETE / FROZEN). STOP.
