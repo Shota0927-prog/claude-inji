@@ -283,6 +283,29 @@ closeBeyondRaw(float baseClose, float level, float dist, float mintick, bool abo
     int  distTick  = mintick > 0 and not na(dist) ? int(math.round(dist / mintick)) : int(na)
     not na(closeTick) and not na(levelTick) and not na(distTick) and (above ? closeTick >= levelTick + distTick : closeTick <= levelTick - distTick)
 
+// W09 B14 (/32): the Dormant distance of one Side View: d = the nearest distance of the confirmed close to its EffectiveRange
+// (below: bottom - close, above: close - top, inside: 0); far = d > dormantDistance (strict: d == dormantDistance is inside
+// the monitor range). Ticks through closeBeyondRaw (the distance rounded once, positive): inside = bottomTick - distTick <=
+// closeTick <= topTick + distTick. na / mintick <= 0 / bottom > top: false (never Dormant without a range).
+dormantFarRaw(float baseClose, float effectiveBottom, float effectiveTop, float dormantDistance, float mintick) =>
+    bool ok = mintick > 0 and not na(baseClose) and not na(effectiveBottom) and not na(effectiveTop) and not na(dormantDistance) and effectiveBottom <= effectiveTop
+    float dd = ok ? -math.round(dormantDistance / mintick) * mintick : na
+    ok and not (closeBeyondRaw(baseClose, effectiveTop, dd, mintick, false) and closeBeyondRaw(baseClose, effectiveBottom, dd, mintick, true))
+// W09 B14 (/32): a Side transition of this bar ("transitionなし" of the Dormant rule): an Episode row that Resets or Breaks (ei:
+// stride 10, flags at +2, Reset 16 / Break 1; EP_INT_STRIDE / EF_RESET are declared below) or a BS pair ended by a FlipConfirm /
+// Reclaim (fli: stride 7, sides at +0 / +1, flags at +2, >= 8 mod 32; FL_STRIDE below)
+stageJTransitionRaw(array<int> ei, array<int> fli, int s) =>
+    bool hit = false
+    int  i   = 0
+    while not hit and i < array.size(ei)
+        hit := array.get(ei, i) == s and (array.get(ei, i + 2) % 32 >= 16 or array.get(ei, i + 2) % 2 == 1)
+        i += 10
+    i := 0
+    while not hit and i < array.size(fli)
+        hit := (array.get(fli, i) == s or array.get(fli, i + 1) == s) and array.get(fli, i + 2) % 32 >= 8
+        i += 7
+    hit
+
 
 // B04 P3: the first seq from which a Side that qualifies on the current confirmed bar may start a Touch: currentSeq + 1
 // (never the current bar); SEQ_UNSET when it does not qualify now (or currentSeq is not a valid baseSeq). Pure: no
@@ -1188,14 +1211,14 @@ phaseMoveRaw(PhaseArmedTransferView v, int s, int ph) =>
 //   phaseArmedTransferPreflight) restarts from the reset defaults (Waiting through the PhaseSet, ArmedFromSeq unset,
 //   LastArmedRange na; its old Armed entries were released before commit); a 1:1 continuation keeps its Phase / Armed.
 // 2 Every live Side (retained and pending Cores included): UpcomingTouchNo = SideTouchCount + 1 first. Waiting / Armed only
-//   (ActiveTouch / Broken / FlipWait / Dormant untouched): Grade = gradeExact(target = Upcoming), then qualifies = eligible
+//   (ActiveTouch / Broken / FlipWait untouched; B14: Dormant re-evaluated, see below): Grade = gradeExact(target = Upcoming), then qualifies = eligible
 //   and a non-psych Root and armedDistanceMet on the current EffectiveRange and confirmed close (spec 7.4 / A12).
 //   Waiting -> Armed: ArmedFromSeq = currentSeq + 1, LastArmedRange = EffectiveRange. Armed -> Armed: ArmedFromSeq kept,
 //   LastArmedRange = EffectiveRange. Armed -> Waiting (B06-B2B3-PRE option b): ArmedFromSeq / LastArmedRange kept.
 //   Phase changes go through the PhaseSet (detach, write, add); Armed <-> member of both Armed indexes (key change:
 //   remove, write, add). A released Side is Armed and outside the indexes only on a 1:1 continuation destination; any
 //   other broken invariant is a runtime.error (no silent repair).
-export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes, float baseClose, int baseSeq, float mintick, float touchResetDistance, int weakFromTouch, bool weakFromTouchOff, int strongUntilTouch, bool strongUnlimited, array<int> noArm) =>
+export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes, float baseClose, int baseSeq, float mintick, float touchResetDistance, int weakFromTouch, bool weakFromTouchOff, int strongUntilTouch, bool strongUnlimited, array<int> noArm, array<int> ei, array<int> fli, float dormantDistance, array<bool> corePendingTopologyFlags, array<bool> corePendingGenerationFlags, array<bool> coreDormantFlags) =>
     int  n  = array.size(view.applyP)
     int  nc = array.size(view.coreIds)
     int  ns = 2 * nc
@@ -1232,15 +1255,26 @@ export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes,
             int up = array.get(view.sideTouchCounts, s) + 1
             int ph = array.get(view.sidePhases, s)
             array.set(view.sideUpcomingTouchNos, s, up)
-            if ph == PH_WAITING or ph == PH_ARMED
+            if ph == PH_WAITING or ph == PH_ARMED or ph == PH_DORMANT
                 bool  np = array.get(view.sideHasNonPsychRootFlags, s)
                 float eb = array.get(view.sideEffectiveBottoms, s)
                 float et = array.get(view.sideEffectiveTops, s)
+                // W09 B14 (/32): Phase and Grade are separate: a Dormant Side keeps the exact Grade order (no Dormant reason)
                 array.set(view.sideGrades, s, gradeExact(np, false, array.get(view.sideWeakByDepthFlags, s), array.get(view.sideWeakByTouchFlags, s) or weakByTouchNow(up, weakFromTouch, weakFromTouchOff), array.get(view.sideBaseStrongFlags, s), strongTouchEligible(up, strongUntilTouch, strongUnlimited)))
+                // W09 B14 (/32): Dormant (Side View): a Dormant Side back inside the monitor range (d <= dormantDistance) returns to
+                // Waiting and takes the usual noArm / Reset distance test below (Armed from currentSeq + 1 at the earliest); a
+                // Waiting / Armed Side beyond it (d > dormantDistance) on a Core neither PendingTopology nor PendingGeneration,
+                // with no transition of this bar (Reset / Break Episode, FlipConfirm / Reclaim pair end, noArm: FlipConfirm /
+                // InverseConfirm destination), goes Dormant (Armed index left; history, IDs, ArmedFromSeq / LastArmedRange untouched)
+                bool fd = dormantFarRaw(baseClose, eb, et, dormantDistance, mintick)
+                if ph == PH_DORMANT and not fd
+                    ok := phaseMoveRaw(view, s, PH_WAITING)
+                    ph := PH_WAITING
+                bool dz = ph == PH_DORMANT or (fd and not array.get(corePendingTopologyFlags, c) and not array.get(corePendingGenerationFlags, c) and not array.includes(noArm, s) and not stageJTransitionRaw(ei, fli, s))
                 // W09 B10 (/27): a Side of a FlipConfirm of this bar (noArm) is not armed on this bar
-                bool q  = array.get(view.sideEligibleFlags, s) and np and eb <= et and armedDistanceMet(k == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE, baseClose, eb, et, touchResetDistance, mintick) and not array.includes(noArm, s)
+                bool q  = not dz and array.get(view.sideEligibleFlags, s) and np and eb <= et and armedDistanceMet(k == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE, baseClose, eb, et, touchResetDistance, mintick) and not array.includes(noArm, s)
                 bool mb = indexMemberRaw(view.armedBottomOrderSideSlots, view.armedBottomPositions, s)
-                ok := mb == indexMemberRaw(view.armedTopOrderSideSlots, view.armedTopPositions, s) and (ph == PH_ARMED ? mb or array.get(relCore, c) : not mb)
+                ok := ok and mb == indexMemberRaw(view.armedTopOrderSideSlots, view.armedTopPositions, s) and (ph == PH_ARMED ? mb or array.get(relCore, c) : not mb)
                 if ok and mb and (not q or array.get(view.sideLastArmedRangeBottoms, s) != eb or array.get(view.sideLastArmedRangeTops, s) != et)
                     ok := priceOrderUpdate(view.armedBottomOrderSideSlots, view.armedBottomPositions, view.sideLastArmedRangeBottoms, mintick, s, false) and priceOrderUpdate(view.armedTopOrderSideSlots, view.armedTopPositions, view.sideLastArmedRangeTops, mintick, s, false)
                     mb := false
@@ -1251,9 +1285,20 @@ export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes,
                     array.set(view.sideLastArmedRangeTops, s, et)
                     if not mb
                         ok := priceOrderUpdate(view.armedBottomOrderSideSlots, view.armedBottomPositions, view.sideLastArmedRangeBottoms, mintick, s, true) and priceOrderUpdate(view.armedTopOrderSideSlots, view.armedTopPositions, view.sideLastArmedRangeTops, mintick, s, true)
-                if ok and q != (ph == PH_ARMED)
-                    ok := phaseMoveRaw(view, s, q ? PH_ARMED : PH_WAITING)
+                int nph = dz ? PH_DORMANT : q ? PH_ARMED : PH_WAITING
+                if ok and nph != ph
+                    ok := phaseMoveRaw(view, s, nph)
             k += 1
+        // W09 B14 (/32): coreDormantFlags, derived from the final Side Phases (never read back into a Phase): true only when no
+        // PendingTopology / PendingGeneration and each Side is Dormant or a non-participating (not eligible) Waiting Side
+        if ok and array.get(view.coreSlotLiveFlags, c)
+            bool cd = not array.get(corePendingTopologyFlags, c) and not array.get(corePendingGenerationFlags, c)
+            int  j  = 0
+            while j < 2
+                int x = 2 * c + j
+                cd := cd and (array.get(view.sidePhases, x) == PH_DORMANT or (array.get(view.sidePhases, x) == PH_WAITING and not array.get(view.sideEligibleFlags, x)))
+                j += 1
+            array.set(coreDormantFlags, c, cd)
         c += 1
     if not ok
         runtime.error("W09 B06-B2B3-B: Stage J broke a Phase / Armed index invariant")

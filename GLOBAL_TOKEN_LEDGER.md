@@ -2436,3 +2436,52 @@ I27 OPEN = 3.
 
 Token: no code change. Expected B14 code after I27: Dormant entry / recovery inside Stage J step 2 (existing priceOrderUpdate on
 the Dormant recovery orders, phaseMoveRaw), no new UDT / import; Probe decision at the TOKEN START REVIEW.
+
+### B14 I27 resolution (user) and Phase A correction
+
+Correction: the Phase A statement "the repo canon does not define Dormant" is withdrawn; the W09 canonical bundle holds the
+Dormant semantic contract (given by the user, recorded here). I27-B14-1 / 2 / 3 CLOSED, I27 OPEN = 0. Fixed rules: Dormant is
+per Side View; d = nearest distance of baseClose to the EffectiveZoneRange (below bottom - close, above close - top, inside 0);
+enter when d > dormantDistance (equality = monitor range), recover when d <= dormantDistance; only Waiting / Armed enter
+(never ActiveTouch / Broken / FlipWait / InverseWait / PendingTopology / PendingGeneration); recovery -> Waiting then the usual
+noArm / Reset distance / Grade / Upcoming in the same Stage J (Armed from currentSeq + 1, no Touch on the recovery bar);
+Dormant is no invalidation (IDs, Generation, history kept; ArmedFromSeq / LastArmedRange not cleared, non-authoritative
+outside Armed); Grade by the exact order (Dormant is no Grade reason); coreDormantFlags derived from the Side Phases (never
+read back); no Dormant Merge / Split rule (Stage J re-evaluates after topology); the Dormant recovery price index (B18) and the
+prune heap (Stage K) are out of scope.
+
+### B14 TOKEN START REVIEW
+
+Main PASS, exact UNKNOWN (no colour class). Plan: Stage J (phaseArmedStageJFinalize, single final writer) + 6 parameters
+(ei, fli, dormantDistance, corePendingTopologyFlags, corePendingGenerationFlags, coreDormantFlags), two private helpers
+(dormantFarRaw on closeBeyondRaw, stageJTransitionRaw), Main: one call site + pins. Design-time conflict found and resolved by
+precedent: the W08 MERGE_STATE_DEFAULT_GUARD compares coreDormantFlags with its default false for every freed (absorbed)
+Core, so a W09 writer setting it true would fail the W08 F0 of any later Merge absorbing that Core (whole-pass F0, repeatable).
+Resolution = the B08 (/18 BreakSnapshot) / B10 (/19 Flip fields) precedent: the field becomes reset-only in
+coreDeferredStateRaw (the reset still writes false; nothing else changes; Merge / Split / Pending semantics unchanged) ->
+W08Runtime /21. New UDT / import / export / tuple 0. Probe NO (small Stage J diff, one guard row).
+
+## W09 B14 Phase / Grade finalization: implementation (W09State /32, W08Runtime /21, Main pins)
+
+- W09State /32: dormantFarRaw (far = not (bottom - dd <= close <= top + dd) in ticks via closeBeyondRaw, dd rounded once;
+  na / no range -> false); stageJTransitionRaw (an ei row that Resets / Breaks, or a fli pair end with flag >= 8: the
+  "transition" of the bar). Stage J step 2 now covers Waiting / Armed / Dormant: Grade first (unchanged formula, also for
+  Dormant); Dormant and not far -> Waiting (phaseMoveRaw) and the usual Armed test; Waiting / Armed and far and no pending
+  (corePendingTopologyFlags / corePendingGenerationFlags) and not noArm and no same-bar transition -> Dormant (Armed indexes left
+  through the existing priceOrderUpdate path, ArmedFromSeq / LastArmedRange untouched); final Phase through one phaseMoveRaw.
+  Per live Core after its two Sides: coreDormantFlags = no pending and each Side Dormant or a non-participating (not eligible)
+  Waiting Side. A pending Core blocks entry only (an existing Dormant Side recovers by distance alone).
+- W08Runtime /21: coreDormantFlags reset-only (guard 9 -> 8 fields).
+- Main: Stage J call + ei, fli, cfg.dormantDistance, cr.corePendingTopologyFlags, cr.corePendingGenerationFlags,
+  cr.coreDormantFlags; pins W09State /31 -> /32, W08Runtime /20 -> /21.
+- Writers: Dormant (PH_DORMANT in / out) = Stage J only; coreDormantFlags = Stage J (derivation) + W08 slot reset.
+Gates (scratchpad harness, Production sources interpreted, W08 stub): `b14_det.py` 17/17 (D1-D18 + D18b FlipConfirm bar).
+Regression (selected): B08 L5 / L8 / F1 / M1, B09 G11 / R1, B10 F4 / F5 / F10, B11 R1 / R2 / R8 / R12 / R14 / R15, B12 I14 / I30,
+B13 P1-P12: all PASS. R3-B1 contract PASS. Static: W09State imports 0, helpers defined before Stage J, no shadowing.
+random 0, > 5 min 0.
+
+### B14 TOKEN END REVIEW
+
+Diff: W09State +2 private helpers (~25 lines), Stage J +6 params and ~20 lines; W08Runtime 1 guard row -> reset-only (smaller);
+Main 1 call (+6 args) and 2 pins. No new UDT / import / export / tuple / mass forwarding; no semantic cut. Exact tokens UNKNOWN
+(TradingView only). TV: W08Runtime /21 publish, W09State /32 publish, Production Main compile; CE10216 / CE10117 -> STOP.
