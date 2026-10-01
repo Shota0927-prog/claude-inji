@@ -1589,3 +1589,19 @@ TC-A (W08Runtime /20, Main pins; W08Core /18 and W08Touch /7 stay published, no 
 
 TV: W08Runtime /20 publish (merged library) -> Production Main compile. W09State /27 unchanged. Record the compiled value
 against 1,009,747. CE10216 or a build error -> STOP.
+
+### TC-A result: REJECTED (library limit), Production restored
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| TC-A | W08Runtime /20 (W08Core + W08Touch bodies merged) | monolithic merge | 1,009,747 (Main, CE10216) | W08Runtime /20 publish FAIL: CE10117, 128,207 / 100,256 library limit (+27,951) | Main not compiled | REJECTED |
+
+The failure is the per-library compiled limit (100,256), not the Main limit: one library cannot hold W08Core + W08Touch +
+W08Runtime (128,207 even with the call-0 bodies dropped). Rejected: merging library bodies. Not rejected: removing the
+duplicate import edge. Data point kept: the three bodies together compile to 128,207 as one library. Production Main compile
+for TC-A: not run.
+
+Restore (no history rewrite): W08Runtime and Main sources (and the contract-check default) back to the bytes of
+`backup/w09-b10-pre-aggressive-token-cut` (= `4357841`): Main imports W08Core /18, W08Touch /7, W08Runtime /19; W08Runtime
+/19 imports W08Core /18 + W08Touch /7. W09State /27, W08Core /18, W08Touch /7 untouched. W08Runtime /20 stays a failed
+publish attempt (the version number is not reused).
