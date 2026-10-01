@@ -1,0 +1,542 @@
+//@version=6
+// ============================================================
+// ZoneEngineV2_W09_WindowedVisual_V01 - W09 Windowed Visual V01 (current-zone display, NOT full-history parity)
+//
+// Runtime / display architecture inherited from ZoneEngineV2_CurrentVisualHarness V03E: indicator calc_bars_count 5000,
+// engineWindowDays (1..14, default 7), the last_bar_time anchored historyStartTime / inEngineWindow, Engine updates only on
+// confirmed 5m bars inside the window, and per-request calc_bars_count = window bars + longest lookback + the V03C margins
+// (V03E formulas unchanged). Sources, the five request contexts and the 110 Feed fields are the B29 contract (unchanged).
+// Backend (provisional, not a Production adoption): ZoneEngineV2_Rebuild_TM1Probe /1 (TM-1 import layout probe, semantic
+// drift 0 vs Production) through its thin facade visualStepAndZoneRows (one hidden Engine, one update per confirmed 5m bar
+// in the window, VisualZoneRow snapshot on the last bar only). Zone authority: the rows' effectiveBottom / effectiveTop,
+// side, phase, grade, eligible (Production W09 Side state). No CoreView, no Visual-own Zone / Grade / Touch logic.
+// Display (barstate.islast only): visual filters, bounded top-K nearest, fixed lazy box / line pools (no delete / new).
+// ============================================================
+indicator("ZoneEngineV2 W09 Windowed Visual V01", overlay = true, max_boxes_count = 30, max_lines_count = 30, calc_bars_count = 5000)
+import sekine3310/ZoneEngineV2_Rebuild_TM1Probe/2 as ZE
+
+// ---- Visual inputs (display only; never passed to Cfg / Feed / Engine) ----
+maxZonesDrawn   = input.int(10, "Max zones drawn", minval = 1, maxval = 30, group = "Visual")
+eligibleOnly    = input.bool(true, "Eligible views only", group = "Visual")
+showSupport     = input.bool(true, "Support", group = "Side / Grade")
+showResistance  = input.bool(true, "Resistance", group = "Side / Grade")
+showStrong      = input.bool(true, "Strong", group = "Side / Grade")
+showNeutral     = input.bool(true, "Neutral", group = "Side / Grade")
+showWeak        = input.bool(true, "Weak", group = "Side / Grade")
+showUnavailable = input.bool(false, "Unavailable", group = "Side / Grade")
+showWaiting     = input.bool(true, "Waiting", group = "Phase")
+showArmed       = input.bool(true, "Armed", group = "Phase")
+showActiveTouch = input.bool(true, "ActiveTouch", group = "Phase")
+showBroken      = input.bool(false, "Broken", group = "Phase")
+showFlipWait    = input.bool(false, "FlipWait", group = "Phase")
+showDormant     = input.bool(false, "Dormant", group = "Phase")
+supportColor    = input.color(#26a69a, "Support color", group = "Style")
+resistanceColor = input.color(#ef5350, "Resistance color", group = "Style")
+transpStrong    = input.int(60, "Strong transparency", minval = 0, maxval = 100, group = "Style")
+transpNeutral   = input.int(75, "Neutral transparency", minval = 0, maxval = 100, group = "Style")
+transpWeak      = input.int(88, "Weak transparency", minval = 0, maxval = 100, group = "Style")
+transpUnavail   = input.int(94, "Unavailable transparency", minval = 0, maxval = 100, group = "Style")
+drawBarsLeft    = input.int(60, "Draw bars left", minval = 0, maxval = 2000, group = "Style")
+drawBarsRight   = input.int(20, "Draw bars right", minval = 1, maxval = 500, group = "Style")
+debugPerf       = input.bool(false, "Debug perf table", group = "Debug")
+
+// ---- Runtime window (Visual execution policy only; windowed current-zone display, not full-history parity) ----
+engineWindowDays = input.int(7, "Engine window days", minval = 1, maxval = 14, group = "Runtime")
+
+// ---- Source inputs ----
+emaSlopeLookback = input.int(60, "EMA slope lookback", minval = 1, group = "Source")
+swingLen5m       = input.int(10, "Swing length 5m",    minval = 1, group = "Source")
+swingLen15m      = input.int(8,  "Swing length 15m",   minval = 1, group = "Source")
+swingLen1h       = input.int(6,  "Swing length 1h",    minval = 1, group = "Source")
+
+// ---- Accum inputs (the 1H / 4H / D contexts are fixed in B29) ----
+accumRangeLen        = input.int(10, "Accum range length", minval = 2, group = "Accum")
+accumBaseLen         = input.int(20, "Accum base length", minval = 2, group = "Accum")
+accumAtrLen          = input.int(14, "Accum ATR length", minval = 1, group = "Accum")
+accumMinUpperCloses  = input.int(4, "Accum min upper closes", minval = 0, group = "Accum")
+accumMinLowerCloses  = input.int(4, "Accum min lower closes", minval = 0, group = "Accum")
+accumMaxSameColorRun = input.int(4, "Accum max same-color run", minval = 1, group = "Accum")
+accumAtrMult         = input.float(2.5, "Accum ATR multiplier", minval = 0.1, group = "Accum")
+accumBarRatioMax     = input.float(0.70, "Accum bar ratio max", minval = 0.1, group = "Accum")
+accumDriftMax        = input.float(0.30, "Accum drift max", minval = 0.0, group = "Accum")
+
+// MA Source packet, evaluated in the 1m context (B29 request). EMA 2000 / 3000 of close
+// and their raw deltas over `lookback` bars; native na during warmup.
+// Returns [maSourceOpenTime, maSourceCloseTime, ema2000, ema2000Slope, ema3000, ema3000Slope].
+maPackV2(simple int lookback) =>
+    float ema2000Value = ta.ema(close, 2000)
+    float ema3000Value = ta.ema(close, 3000)
+    float ema2000Slope = ema2000Value - ema2000Value[lookback]
+    float ema3000Slope = ema3000Value - ema3000Value[lookback]
+    [time, time_close, ema2000Value, ema2000Slope, ema3000Value, ema3000Slope]
+
+// Swing Source event packet, evaluated in the 5m / 15m / 1h context. A pivot confirmed
+// on this bar (len bars each side) carries its price, the pivot bar's open / close time
+// and this bar's close time; no pivot -> na (an event, never a carried state).
+// Returns [highPrice, highOriginTime, highOriginEndTime, highConfirmedTime,
+//          lowPrice,  lowOriginTime,  lowOriginEndTime,  lowConfirmedTime].
+pivotPackV2(simple int len) =>
+    float pivotHigh = ta.pivothigh(high, len, len)
+    float pivotLow  = ta.pivotlow(low, len, len)
+    bool  hasHigh   = not na(pivotHigh)
+    bool  hasLow    = not na(pivotLow)
+    float highPrice         = hasHigh ? pivotHigh : na
+    int   highOriginTime    = hasHigh ? time[len] : int(na)
+    int   highOriginEndTime = hasHigh ? time_close[len] : int(na)
+    int   highConfirmedTime = hasHigh ? time_close : int(na)
+    float lowPrice          = hasLow ? pivotLow : na
+    int   lowOriginTime     = hasLow ? time[len] : int(na)
+    int   lowOriginEndTime  = hasLow ? time_close[len] : int(na)
+    int   lowConfirmedTime  = hasLow ? time_close : int(na)
+    [highPrice, highOriginTime, highOriginEndTime, highConfirmedTime, lowPrice, lowOriginTime, lowOriginEndTime, lowConfirmedTime]
+
+// Accum condition on this Source bar. The window is the last rangeLen bodies (open /
+// close ends, never wicks); one rangeMid for the whole window. Native na / history
+// semantics; no fill, no custom warmup. Returns [isAccum, rangeHigh, rangeLow].
+accumCondV2(simple int rangeLen, simple int baseLen, simple int atrLen, simple int minUpper, simple int minLower, simple int maxRun, float atrMult, float barRatioMax, float driftMax) =>
+    float bodyTop   = math.max(open, close)
+    float bodyBot   = math.min(open, close)
+    float rangeHigh = ta.highest(bodyTop, rangeLen)
+    float rangeLow  = ta.lowest(bodyBot, rangeLen)
+    float rangeNow  = rangeHigh - rangeLow
+    float rangeMid  = (rangeHigh + rangeLow) * 0.5
+    float rangeBase = ta.highest(bodyTop, baseLen) - ta.lowest(bodyBot, baseLen)
+    float atrValue  = ta.atr(atrLen)
+    int upperCloses = 0
+    int lowerCloses = 0
+    int bullRun     = 0
+    int bearRun     = 0
+    int maxBullRun  = 0
+    int maxBearRun  = 0
+    for i = 0 to rangeLen - 1
+        if close[i] > rangeMid
+            upperCloses += 1
+        else if close[i] < rangeMid
+            lowerCloses += 1
+        if close[i] > open[i]
+            bullRun += 1
+            bearRun := 0
+        else if close[i] < open[i]
+            bearRun += 1
+            bullRun := 0
+        else
+            bullRun := 0
+            bearRun := 0
+        maxBullRun := math.max(maxBullRun, bullRun)
+        maxBearRun := math.max(maxBearRun, bearRun)
+    float startMid = (open[rangeLen - 1] + close[rangeLen - 1]) * 0.5
+    float endMid   = (open + close) * 0.5
+    float drift    = math.abs(endMid - startMid)
+    bool condAtr      = atrValue > 0 and rangeNow <= atrValue * atrMult
+    bool condBar      = rangeBase > 0 and rangeNow <= rangeBase * barRatioMax
+    bool condBalance  = upperCloses >= minUpper and lowerCloses >= minLower
+    bool condDrift    = rangeNow > 0 and drift / rangeNow <= driftMax
+    bool condColorRun = maxBullRun <= maxRun and maxBearRun <= maxRun
+    bool isAccum = condAtr and condBar and condBalance and condDrift and condColorRun
+    [isAccum, rangeHigh, rangeLow]
+
+// Accum Source packet (1H / 4H / D context, B29). A Candidate state machine local to
+// this helper (not a Root): false -> true starts it on the window's body range, true ->
+// true widens it with the current body, true -> false emits the Candidate once as a
+// Confirmed Box (the ending bar is not part of it) and resets. Event values are this
+// bar only. Returns [newConfirmedBox, boxTop, boxBottom, boxId, candidateStartTime,
+// confirmedTime, candidateActive, candidateTop, candidateBottom].
+accumPackV2(simple int rangeLen, simple int baseLen, simple int atrLen, simple int minUpper, simple int minLower, simple int maxRun, float atrMult, float barRatioMax, float driftMax) =>
+    [isAccum, rangeHigh, rangeLow] = accumCondV2(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
+    var bool  candidateActive    = false
+    var float candidateTop       = na
+    var float candidateBottom    = na
+    var int   candidateStartTime = na
+    bool  newConfirmedBox       = false
+    float boxTop                = na
+    float boxBottom             = na
+    int   boxId                 = 0
+    int   confirmedTime         = na
+    int   candidateStartTimeOut = na
+    if isAccum and not candidateActive
+        candidateActive    := true
+        candidateStartTime := time
+        candidateTop       := rangeHigh
+        candidateBottom    := rangeLow
+        candidateStartTimeOut := candidateStartTime
+    else if isAccum and candidateActive
+        float currentBodyTop    = math.max(open, close)
+        float currentBodyBottom = math.min(open, close)
+        candidateTop    := math.max(candidateTop, currentBodyTop)
+        candidateBottom := math.min(candidateBottom, currentBodyBottom)
+        candidateStartTimeOut := candidateStartTime
+    else if not isAccum and candidateActive
+        newConfirmedBox       := true
+        boxTop                := candidateTop
+        boxBottom             := candidateBottom
+        boxId                 := candidateStartTime
+        confirmedTime         := time_close
+        candidateStartTimeOut := candidateStartTime
+        candidateActive    := false
+        candidateTop       := na
+        candidateBottom    := na
+        candidateStartTime := na
+    [newConfirmedBox, boxTop, boxBottom, boxId, candidateStartTimeOut, confirmedTime, candidateActive, candidateTop, candidateBottom]
+
+// FVG Source fact packet (1H / 4H / D context, B29). This bar is the third bar: Bull
+// low > high[2] (NativeRange high[2] -> low), Bear high < low[2] (NativeRange high ->
+// low[2]), strict; no event -> na ranges. Fresh and structural invalidation belong to
+// the Production. Returns [srcOpenTime, srcCloseTime, bullNew, bullBottom, bullTop,
+// bearNew, bearBottom, bearTop, high, low, close].
+fvgPackV2() =>
+    bool  bullNew    = low > high[2]
+    float bullBottom = bullNew ? high[2] : na
+    float bullTop    = bullNew ? low : na
+    bool  bearNew    = high < low[2]
+    float bearBottom = bearNew ? high : na
+    float bearTop    = bearNew ? low[2] : na
+    [time, time_close, bullNew, bullBottom, bullTop, bearNew, bearBottom, bearTop, high, low, close]
+
+// ---- B29 request wrappers : destructure the helpers above and flatten them in Feed order ----
+// 15m Swing context. Returns [srcOpenTime, srcCloseTime, High x4, Low x4] (10).
+pivotSourcePackV2(simple int len) =>
+    [highPrice, highOriginTime, highOriginEndTime, highConfirmedTime, lowPrice, lowOriginTime, lowOriginEndTime, lowConfirmedTime] = pivotPackV2(len)
+    [time, time_close, highPrice, highOriginTime, highOriginEndTime, highConfirmedTime, lowPrice, lowOriginTime, lowOriginEndTime, lowConfirmedTime]
+
+// 1H context : Swing + Accum + FVG + Source H/L/C (28), Source times and H/L/C from fvgPackV2.
+htf1hPackV2(simple int swingLen, simple int rangeLen, simple int baseLen, simple int atrLen, simple int minUpper, simple int minLower, simple int maxRun, float atrMult, float barRatioMax, float driftMax) =>
+    [swingHighPrice, swingHighOriginTime, swingHighOriginEndTime, swingHighConfirmedTime, swingLowPrice, swingLowOriginTime, swingLowOriginEndTime, swingLowConfirmedTime] = pivotPackV2(swingLen)
+    [accumNewConfirmedBox, accumBoxTop, accumBoxBottom, accumBoxId, accumCandidateStartTime, accumConfirmedTime, accumCandidateActive, accumCandidateTop, accumCandidateBottom] = accumPackV2(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
+    [srcOpenTime, srcCloseTime, fvgBullNew, fvgBullBottom, fvgBullTop, fvgBearNew, fvgBearBottom, fvgBearTop, htfHigh, htfLow, htfClose] = fvgPackV2()
+    [srcOpenTime, srcCloseTime, swingHighPrice, swingHighOriginTime, swingHighOriginEndTime, swingHighConfirmedTime, swingLowPrice, swingLowOriginTime, swingLowOriginEndTime, swingLowConfirmedTime, accumNewConfirmedBox, accumBoxTop, accumBoxBottom, accumBoxId, accumCandidateStartTime, accumConfirmedTime, accumCandidateActive, accumCandidateTop, accumCandidateBottom, fvgBullNew, fvgBullBottom, fvgBullTop, fvgBearNew, fvgBearBottom, fvgBearTop, htfHigh, htfLow, htfClose]
+
+// 4H / D context : Accum + FVG + Source H/L/C (20), Source times and H/L/C from fvgPackV2.
+htfPackV2(simple int rangeLen, simple int baseLen, simple int atrLen, simple int minUpper, simple int minLower, simple int maxRun, float atrMult, float barRatioMax, float driftMax) =>
+    [accumNewConfirmedBox, accumBoxTop, accumBoxBottom, accumBoxId, accumCandidateStartTime, accumConfirmedTime, accumCandidateActive, accumCandidateTop, accumCandidateBottom] = accumPackV2(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
+    [srcOpenTime, srcCloseTime, fvgBullNew, fvgBullBottom, fvgBullTop, fvgBearNew, fvgBearBottom, fvgBearTop, htfHigh, htfLow, htfClose] = fvgPackV2()
+    [srcOpenTime, srcCloseTime, accumNewConfirmedBox, accumBoxTop, accumBoxBottom, accumBoxId, accumCandidateStartTime, accumConfirmedTime, accumCandidateActive, accumCandidateTop, accumCandidateBottom, fvgBullNew, fvgBullBottom, fvgBullTop, fvgBearNew, fvgBearBottom, fvgBearTop, htfHigh, htfLow, htfClose]
+
+// ---- 5m chart context : the 5m Swing packet (B29 puts these eight values into the Feed) ----
+[swing5mHighPrice, swing5mHighOriginTime, swing5mHighOriginEndTime, swing5mHighConfirmedTime, swing5mLowPrice, swing5mLowOriginTime, swing5mLowOriginEndTime, swing5mLowConfirmedTime] = pivotPackV2(swingLen5m)
+
+// ---- V03E runtime window (Visual execution policy only; no Production / Source semantics change) ----
+// The facade Engine is built only from the last engineWindowDays calendar days of confirmed 5m bars (input 1..14).
+// RUNTIME / DISPLAY probe, not full current-zone parity: Roots created before the window (e.g. older 4H / D structure)
+// are not reproduced.
+const int MS_PER_DAY = 86400000
+// Per-request history (bars of the requested timeframe) = window bars at 24/7 density + the longest lookback + the V03C
+// margin (at 14 days and default inputs: 24000 / 1500 / 450 / 130 / 45, the V03C values).
+int accumLookback = math.max(accumBaseLen, accumAtrLen, accumRangeLen, 3)
+int calcBars1m    = engineWindowDays * 1440 + 3000 + emaSlopeLookback + 780
+int calcBars15m   = engineWindowDays * 96 + (2 * swingLen15m + 1) + 139
+int calcBars1h    = engineWindowDays * 24 + math.max(2 * swingLen1h + 1, accumLookback) + 94
+int calcBars4h    = engineWindowDays * 6 + accumLookback + 26
+int calcBarsD     = engineWindowDays + accumLookback + 11
+
+// ---- B29 : the five Source request contexts (chart symbol, gaps off, lookahead off) ----
+[maSourceOpenTime, maSourceCloseTime, ema2000Value, ema2000SlopeValue, ema3000Value, ema3000SlopeValue] = request.security(syminfo.tickerid, "1", maPackV2(emaSlopeLookback), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = calcBars1m)
+[src15mOpenTime, src15mCloseTime, swing15mHighPrice, swing15mHighOriginTime, swing15mHighOriginEndTime, swing15mHighConfirmedTime, swing15mLowPrice, swing15mLowOriginTime, swing15mLowOriginEndTime, swing15mLowConfirmedTime] = request.security(syminfo.tickerid, "15", pivotSourcePackV2(swingLen15m), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = calcBars15m)
+[src1hOpenTime, src1hCloseTime, swing1hHighPrice, swing1hHighOriginTime, swing1hHighOriginEndTime, swing1hHighConfirmedTime, swing1hLowPrice, swing1hLowOriginTime, swing1hLowOriginEndTime, swing1hLowConfirmedTime, accum1hNewConfirmedBox, accum1hBoxTop, accum1hBoxBottom, accum1hBoxId, accum1hCandidateStartTime, accum1hConfirmedTime, accum1hCandidateActive, accum1hCandidateTop, accum1hCandidateBottom, fvg1hBullNew, fvg1hBullBottom, fvg1hBullTop, fvg1hBearNew, fvg1hBearBottom, fvg1hBearTop, htf1hHigh, htf1hLow, htf1hClose] = request.security(syminfo.tickerid, "60", htf1hPackV2(swingLen1h, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses, accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = calcBars1h)
+[src4hOpenTime, src4hCloseTime, accum4hNewConfirmedBox, accum4hBoxTop, accum4hBoxBottom, accum4hBoxId, accum4hCandidateStartTime, accum4hConfirmedTime, accum4hCandidateActive, accum4hCandidateTop, accum4hCandidateBottom, fvg4hBullNew, fvg4hBullBottom, fvg4hBullTop, fvg4hBearNew, fvg4hBearBottom, fvg4hBearTop, htf4hHigh, htf4hLow, htf4hClose] = request.security(syminfo.tickerid, "240", htfPackV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses, accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = calcBars4h)
+[srcDOpenTime, srcDCloseTime, accumDNewConfirmedBox, accumDBoxTop, accumDBoxBottom, accumDBoxId, accumDCandidateStartTime, accumDConfirmedTime, accumDCandidateActive, accumDCandidateTop, accumDCandidateBottom, fvgDBullNew, fvgDBullBottom, fvgDBullTop, fvgDBearNew, fvgDBearBottom, fvgDBearTop, htfDHigh, htfDLow, htfDClose] = request.security(syminfo.tickerid, "D", htfPackV2(accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses, accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = calcBarsD)
+
+// ---- B29 : host metadata, Cfg (set before the facade's first call creates its hidden Engine) and Feed ----
+int  chartTfMinutesNow = int(timeframe.in_seconds(timeframe.period) / 60)
+bool is5m              = timeframe.in_seconds(timeframe.period) == 300
+var ZE.ZoneCfg cfg = ZE.newCfg()
+cfg.chartTfMinutes := chartTfMinutesNow
+cfg.mintick        := syminfo.mintick
+cfg.emaSlopeLookback := emaSlopeLookback
+cfg.swingLen5m := swingLen5m
+cfg.swingLen15m := swingLen15m
+cfg.swingLen1h := swingLen1h
+cfg.accumRangeLen := accumRangeLen
+cfg.accumBaseLen := accumBaseLen
+cfg.accumAtrLen := accumAtrLen
+cfg.accumMinUpperCloses := accumMinUpperCloses
+cfg.accumMinLowerCloses := accumMinLowerCloses
+cfg.accumMaxSameColorRun := accumMaxSameColorRun
+cfg.accumAtrMult := accumAtrMult
+cfg.accumBarRatioMax := accumBarRatioMax
+cfg.accumDriftMax := accumDriftMax
+var ZE.Feed       feed   = ZE.newFeed()
+// deterministic window anchor: the last chart bar's open time (timenow only if unavailable)
+int  historyAnchorTime = na(last_bar_time) ? timenow : last_bar_time
+int  historyStartTime  = historyAnchorTime - engineWindowDays * MS_PER_DAY
+bool inEngineWindow    = is5m and time_close >= historyStartTime
+
+// update: confirmed 5m bars inside the Engine window only (at most one update per bar); row snapshot: the last bar only
+bool doUpdate     = is5m and barstate.isconfirmed and inEngineWindow
+bool wantSnapshot = barstate.islast
+
+// ---- B29 : the 110 Feed fields are set only on update bars (the facade does not read the Feed when doUpdate is false) ----
+if doUpdate
+    // Base 18
+    feed.baseOpen := open
+    feed.baseHigh := high
+    feed.baseLow := low
+    feed.baseClose := close
+    feed.basePrevClose := nz(close[1], close)
+    feed.baseOpenTime := time
+    feed.baseCloseTime := time_close
+    feed.baseSeq := bar_index
+    feed.baseConfirmed := true
+    feed.mintick := syminfo.mintick
+    feed.chartTfMinutes := chartTfMinutesNow
+    feed.tfMa := 1
+    feed.tfBase := 5
+    feed.tfSwing15 := 15
+    feed.tfSwing1h := 60
+    feed.tfHtf1h := 60
+    feed.tfHtf4h := 240
+    feed.tfHtfD := 1440
+    // 1m MA 6
+    feed.maSourceOpenTime := maSourceOpenTime
+    feed.maSourceCloseTime := maSourceCloseTime
+    feed.ema2000 := ema2000Value
+    feed.ema2000Slope := ema2000SlopeValue
+    feed.ema3000 := ema3000Value
+    feed.ema3000Slope := ema3000SlopeValue
+    // 5m Swing 8 (chart context)
+    feed.swing5mHighPrice := swing5mHighPrice
+    feed.swing5mHighOriginTime := swing5mHighOriginTime
+    feed.swing5mHighOriginEndTime := swing5mHighOriginEndTime
+    feed.swing5mHighConfirmedTime := swing5mHighConfirmedTime
+    feed.swing5mLowPrice := swing5mLowPrice
+    feed.swing5mLowOriginTime := swing5mLowOriginTime
+    feed.swing5mLowOriginEndTime := swing5mLowOriginEndTime
+    feed.swing5mLowConfirmedTime := swing5mLowConfirmedTime
+    // 15m 10
+    feed.src15mOpenTime := src15mOpenTime
+    feed.src15mCloseTime := src15mCloseTime
+    feed.swing15mHighPrice := swing15mHighPrice
+    feed.swing15mHighOriginTime := swing15mHighOriginTime
+    feed.swing15mHighOriginEndTime := swing15mHighOriginEndTime
+    feed.swing15mHighConfirmedTime := swing15mHighConfirmedTime
+    feed.swing15mLowPrice := swing15mLowPrice
+    feed.swing15mLowOriginTime := swing15mLowOriginTime
+    feed.swing15mLowOriginEndTime := swing15mLowOriginEndTime
+    feed.swing15mLowConfirmedTime := swing15mLowConfirmedTime
+    // 1H 28
+    feed.src1hOpenTime := src1hOpenTime
+    feed.src1hCloseTime := src1hCloseTime
+    feed.swing1hHighPrice := swing1hHighPrice
+    feed.swing1hHighOriginTime := swing1hHighOriginTime
+    feed.swing1hHighOriginEndTime := swing1hHighOriginEndTime
+    feed.swing1hHighConfirmedTime := swing1hHighConfirmedTime
+    feed.swing1hLowPrice := swing1hLowPrice
+    feed.swing1hLowOriginTime := swing1hLowOriginTime
+    feed.swing1hLowOriginEndTime := swing1hLowOriginEndTime
+    feed.swing1hLowConfirmedTime := swing1hLowConfirmedTime
+    feed.accum1hNewConfirmedBox := accum1hNewConfirmedBox
+    feed.accum1hBoxTop := accum1hBoxTop
+    feed.accum1hBoxBottom := accum1hBoxBottom
+    feed.accum1hBoxId := accum1hBoxId
+    feed.accum1hCandidateStartTime := accum1hCandidateStartTime
+    feed.accum1hConfirmedTime := accum1hConfirmedTime
+    feed.accum1hCandidateActive := accum1hCandidateActive
+    feed.accum1hCandidateTop := accum1hCandidateTop
+    feed.accum1hCandidateBottom := accum1hCandidateBottom
+    feed.fvg1hBullNew := fvg1hBullNew
+    feed.fvg1hBullBottom := fvg1hBullBottom
+    feed.fvg1hBullTop := fvg1hBullTop
+    feed.fvg1hBearNew := fvg1hBearNew
+    feed.fvg1hBearBottom := fvg1hBearBottom
+    feed.fvg1hBearTop := fvg1hBearTop
+    feed.htf1hHigh := htf1hHigh
+    feed.htf1hLow := htf1hLow
+    feed.htf1hClose := htf1hClose
+    // 4H 20
+    feed.src4hOpenTime := src4hOpenTime
+    feed.src4hCloseTime := src4hCloseTime
+    feed.accum4hNewConfirmedBox := accum4hNewConfirmedBox
+    feed.accum4hBoxTop := accum4hBoxTop
+    feed.accum4hBoxBottom := accum4hBoxBottom
+    feed.accum4hBoxId := accum4hBoxId
+    feed.accum4hCandidateStartTime := accum4hCandidateStartTime
+    feed.accum4hConfirmedTime := accum4hConfirmedTime
+    feed.accum4hCandidateActive := accum4hCandidateActive
+    feed.accum4hCandidateTop := accum4hCandidateTop
+    feed.accum4hCandidateBottom := accum4hCandidateBottom
+    feed.fvg4hBullNew := fvg4hBullNew
+    feed.fvg4hBullBottom := fvg4hBullBottom
+    feed.fvg4hBullTop := fvg4hBullTop
+    feed.fvg4hBearNew := fvg4hBearNew
+    feed.fvg4hBearBottom := fvg4hBearBottom
+    feed.fvg4hBearTop := fvg4hBearTop
+    feed.htf4hHigh := htf4hHigh
+    feed.htf4hLow := htf4hLow
+    feed.htf4hClose := htf4hClose
+    // D 20
+    feed.srcDOpenTime := srcDOpenTime
+    feed.srcDCloseTime := srcDCloseTime
+    feed.accumDNewConfirmedBox := accumDNewConfirmedBox
+    feed.accumDBoxTop := accumDBoxTop
+    feed.accumDBoxBottom := accumDBoxBottom
+    feed.accumDBoxId := accumDBoxId
+    feed.accumDCandidateStartTime := accumDCandidateStartTime
+    feed.accumDConfirmedTime := accumDConfirmedTime
+    feed.accumDCandidateActive := accumDCandidateActive
+    feed.accumDCandidateTop := accumDCandidateTop
+    feed.accumDCandidateBottom := accumDCandidateBottom
+    feed.fvgDBullNew := fvgDBullNew
+    feed.fvgDBullBottom := fvgDBullBottom
+    feed.fvgDBullTop := fvgDBullTop
+    feed.fvgDBearNew := fvgDBearNew
+    feed.fvgDBearBottom := fvgDBearBottom
+    feed.fvgDBearTop := fvgDBearTop
+    feed.htfDHigh := htfDHigh
+    feed.htfDLow := htfDLow
+    feed.htfDClose := htfDClose
+
+// ---- the only facade callsite (global scope, every bar): Production update when doUpdate, VisualZoneRow snapshot when
+// wantSnapshot (no row projection on historical bars). rows is the facade-owned array, read on this bar only.
+[committed, rows] = ZE.visualStepAndZoneRows(cfg, feed, doUpdate, wantSnapshot)
+// ============================================================
+// Visual V01 (display only, barstate.islast only). Reads the facade rows; writes nothing back.
+// ============================================================
+// Production code values (Main SIDE_* / PH_* / GR_*), mirrored for display decoding only
+const int V_SUPPORT    = 1
+const int V_RESISTANCE = -1
+const int V_WAITING    = 0
+const int V_ARMED      = 1
+const int V_ACTIVE     = 2
+const int V_BROKEN     = 3
+const int V_FLIP_WAIT  = 4
+const int V_DORMANT    = 5
+const int V_STRONG     = 0
+const int V_NEUTRAL    = 1
+const int V_WEAK       = 2
+const int V_UNAVAIL    = 3
+const int POOL_SIZE    = 30
+
+// visual filter on Production fields only (eligible / side / grade / phase / finite range)
+visPass(ZE.VisualZoneRow v) =>
+    bool sideOk  = v.side == V_SUPPORT ? showSupport : v.side == V_RESISTANCE ? showResistance : false
+    bool gradeOk = v.grade == V_STRONG ? showStrong : v.grade == V_NEUTRAL ? showNeutral : v.grade == V_WEAK ? showWeak : v.grade == V_UNAVAIL ? showUnavailable : false
+    bool phaseOk = v.phase == V_WAITING ? showWaiting : v.phase == V_ARMED ? showArmed : v.phase == V_ACTIVE ? showActiveTouch : v.phase == V_BROKEN ? showBroken : v.phase == V_FLIP_WAIT ? showFlipWait : v.phase == V_DORMANT ? showDormant : false
+    bool rangeOk = not na(v.effectiveBottom) and not na(v.effectiveTop) and v.effectiveBottom <= v.effectiveTop
+    (v.eligible or not eligibleOnly) and sideOk and gradeOk and phaseOk and rangeOk
+
+// distance of the display price to [bottom, top]: 0 inside
+visDist(float bottom, float top, float px) =>
+    px < bottom ? bottom - px : px > top ? px - top : 0.0
+
+// strict order: distance ASC, coreId ASC, generationId ASC, Support before Resistance
+visBefore(float d1, int c1, int g1, int s1, float d2, int c2, int g2, int s2) =>
+    d1 < d2 ? true : d1 > d2 ? false : c1 < c2 ? true : c1 > c2 ? false : g1 < g2 ? true : g1 > g2 ? false : s1 > s2
+
+visTransp(int grade) =>
+    grade == V_STRONG ? transpStrong : grade == V_NEUTRAL ? transpNeutral : grade == V_WEAK ? transpWeak : transpUnavail
+
+// fixed object pools: 30 boxes + 30 lines, created lazily on the first barstate.islast execution only (none on historical
+// bars), then reused through setters; never deleted / recreated. The debugPerf table follows the same rule.
+var array<box>  boxPool   = array.new_box(0)
+var array<line> linePool  = array.new_line(0)
+var table       perfTable = table(na)
+
+if barstate.islast
+    if array.size(boxPool) == 0
+        for p = 0 to POOL_SIZE - 1
+            array.push(boxPool, box.new(bar_index, close, bar_index, close, border_color = color(na), bgcolor = color(na)))
+            array.push(linePool, line.new(bar_index, close, bar_index, close, color = color(na)))
+    if debugPerf and na(perfTable)
+        perfTable := table.new(position.top_right, 2, 6)
+    // bounded top-K nearest selection: one scan of the rows, insertion into <= maxZonesDrawn slots holding the drawn fields
+    int n = array.size(rows)
+    array<float> kDist  = array.new_float(0)
+    array<int>   kCore  = array.new_int(0)
+    array<int>   kGen   = array.new_int(0)
+    array<int>   kSide  = array.new_int(0)
+    array<float> kBot   = array.new_float(0)
+    array<float> kTop   = array.new_float(0)
+    array<int>   kGrade = array.new_int(0)
+    array<int>   kPhase = array.new_int(0)
+    int eligibleCount = 0
+    int passCount     = 0
+    float px = close
+    for i = 0 to n - 1
+        if i >= n
+            break
+        ZE.VisualZoneRow v = array.get(rows, i)
+        if v.eligible
+            eligibleCount += 1
+        if visPass(v)
+            passCount += 1
+            float d = visDist(v.effectiveBottom, v.effectiveTop, px)
+            int pos = array.size(kDist)
+            while pos > 0 and visBefore(d, v.coreId, v.generationId, v.side, array.get(kDist, pos - 1), array.get(kCore, pos - 1), array.get(kGen, pos - 1), array.get(kSide, pos - 1))
+                pos -= 1
+            if pos < maxZonesDrawn
+                array.insert(kDist, pos, d)
+                array.insert(kCore, pos, v.coreId)
+                array.insert(kGen, pos, v.generationId)
+                array.insert(kSide, pos, v.side)
+                array.insert(kBot, pos, v.effectiveBottom)
+                array.insert(kTop, pos, v.effectiveTop)
+                array.insert(kGrade, pos, v.grade)
+                array.insert(kPhase, pos, v.phase)
+                if array.size(kDist) > maxZonesDrawn
+                    array.pop(kDist)
+                    array.pop(kCore)
+                    array.pop(kGen)
+                    array.pop(kSide)
+                    array.pop(kBot)
+                    array.pop(kTop)
+                    array.pop(kGrade)
+                    array.pop(kPhase)
+    // draw: range -> box, point (bottom == top) -> line; unused pool objects are made transparent
+    int x1 = bar_index - drawBarsLeft
+    int x2 = bar_index + drawBarsRight
+    int boxUsed  = 0
+    int lineUsed = 0
+    int kN = array.size(kDist)
+    for j = 0 to kN - 1
+        if j >= kN
+            break
+        float bot    = array.get(kBot, j)
+        float top    = array.get(kTop, j)
+        int   phase  = array.get(kPhase, j)
+        color baseC  = array.get(kSide, j) == V_SUPPORT ? supportColor : resistanceColor
+        int   tr     = visTransp(array.get(kGrade, j))
+        color fillC  = color.new(baseC, tr)
+        color edgeC  = color.new(baseC, math.max(tr - 30, 0))
+        string styleV = phase == V_ARMED ? line.style_dashed : line.style_solid
+        int   widthV = phase == V_ACTIVE ? 2 : 1
+        if bot < top
+            box b = array.get(boxPool, boxUsed)
+            box.set_lefttop(b, x1, top)
+            box.set_rightbottom(b, x2, bot)
+            box.set_bgcolor(b, fillC)
+            box.set_border_color(b, edgeC)
+            box.set_border_style(b, styleV)
+            box.set_border_width(b, widthV)
+            boxUsed += 1
+        else
+            line l = array.get(linePool, lineUsed)
+            line.set_xy1(l, x1, bot)
+            line.set_xy2(l, x2, bot)
+            line.set_color(l, edgeC)
+            line.set_style(l, styleV)
+            line.set_width(l, widthV)
+            lineUsed += 1
+    for j = boxUsed to POOL_SIZE - 1
+        if j >= POOL_SIZE
+            break
+        box b = array.get(boxPool, j)
+        box.set_bgcolor(b, color(na))
+        box.set_border_color(b, color(na))
+    for j = lineUsed to POOL_SIZE - 1
+        if j >= POOL_SIZE
+            break
+        line.set_color(array.get(linePool, j), color(na))
+    if debugPerf
+        table.cell(perfTable, 0, 0, "engineWindowDays")
+        table.cell(perfTable, 1, 0, str.tostring(engineWindowDays))
+        table.cell(perfTable, 0, 1, "row count")
+        table.cell(perfTable, 1, 1, str.tostring(n))
+        table.cell(perfTable, 0, 2, "filtered")
+        table.cell(perfTable, 1, 2, str.tostring(passCount))
+        table.cell(perfTable, 0, 3, "drawn")
+        table.cell(perfTable, 1, 3, str.tostring(kN))
+        table.cell(perfTable, 0, 4, "box used")
+        table.cell(perfTable, 1, 4, str.tostring(boxUsed))
+        table.cell(perfTable, 0, 5, "line used")
+        table.cell(perfTable, 1, 5, str.tostring(lineUsed))
+
+plot(close, title = "Compile anchor", display = display.none)
