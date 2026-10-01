@@ -1605,3 +1605,41 @@ Restore (no history rewrite): W08Runtime and Main sources (and the contract-chec
 `backup/w09-b10-pre-aggressive-token-cut` (= `4357841`): Main imports W08Core /18, W08Touch /7, W08Runtime /19; W08Runtime
 /19 imports W08Core /18 + W08Touch /7. W09State /27, W08Core /18, W08Touch /7 untouched. W08Runtime /20 stays a failed
 publish attempt (the version number is not reused).
+
+## TC-B: import edge elimination (Main -> W08Core / W08Touch), Facade Probe (design + files, not Production)
+
+Goal: Main -> W08Runtime -> (W08Core /18, W08Touch /7) only; no W08Core / W08Touch body copied; W08Runtime keeps both imports.
+
+Main -> W08Core / W08Touch references (28 code lines, 9 symbols; none is class A primitive-only or class D constant-only):
+
+| # | Line(s) | Symbol | Class | Why Main needs it | TC-B handling |
+|---|---|---|---|---|---|
+| 1 | 958 | `W08Core.W08Store` (ZoneEngine field `w08CoreStore`) | C (UDT field type) | persistent W08 store owned by the engine | field becomes `W08Runtime.ShadowContext w08Hold` (existing W08Runtime type; only `ws` / `sp` set); `engine.w08CoreStore` -> `engine.w08Hold.ws` |
+| 2 | 467 | `W08Touch.SplitTouchPlan` (W08TouchStore field `splitTouchPlan`) | C (UDT field type) | persistent Split TouchMark plan | moved to the same holder (`w08Hold.sp`); `t.splitTouchPlan` -> `engine.w08Hold.sp` (both readers have `engine`) |
+| 3 | 1301 | `W08Core.newStore()` | B (returns W08Core UDT) | engine init | `W08Runtime.newHolder()` = `ShadowContext.new(ws = W08Core.newStore(), sp = W08Touch.newSplitTouchPlan())` |
+| 4 | 484 | `W08Touch.newSplitTouchPlan()` | B (returns W08Touch UDT) | W08TouchStore init | folded into `newHolder()` (same object, created on the same first-bar init) |
+| 5-19 | 1665, 1714, 1876, 1906, 1940, 2062, 2092, 2121, 6005, 6012, 6123, 6336, 6339, 6357, 6439 | `W08Core.CoreRegistryStore cr = ...` | C (local annotation) | type annotation only | `cr = ...` (type inference; no wrapper) |
+| 20 | 6117 | `W08Core.PendingTopologyStore ps = ...` | C (local annotation) | annotation only | `ps = ...` |
+| 21 | 6175 | `W08Touch.TouchRing ring = ...` | C (local annotation) | annotation only | `ring = ...` |
+| 22 | 6007 | `W08Core.PendingTopologyStore.new(...)` (20 arrays) | B (constructor of a W08Core UDT) | pending-pool view per bar | `W08Runtime.pendingStoreOf(cr, 16 pool arrays)` (one constructor call inside; argument list proven identical) |
+| 23 | 6013 | `W08Touch.TouchRing.new(...)` (18 cr fields) | B (constructor of a W08Touch UDT) | ring view per bar | `W08Runtime.touchRingOf(cr)` (18 field reads inside; identical) |
+| 24 | 6122 | `W08Touch.TouchPlan.new(...)` (14 arrays) | B (constructor of a W08Touch UDT) | Merge plan view per bar | `W08Runtime.touchPlanOf(14 arrays)` (identical) |
+| 25-26 | 6187, 6214 | `W08Touch.markAppend(ring, ...)` | B (W08Touch UDT parameter) | TouchStart / Flip mark append | `W08Runtime.markAppend(...)` (same 13-parameter signature, one call inside; both call argument lists identical) |
+| 27-28 | 6019, 6051 | `W08Core.W08Store ws` (parameter of the two current-Root functions) | C (parameter type) | reads `ws.physical*` arrays | parameter `W08Runtime.ShadowContext wh` + first line `ws = wh.ws` (body unchanged) |
+
+Foreign-UDT audit: no new type; the holder is the existing exported ShadowContext (already built by Main every bar; its
+W08Core / W08Touch field types already live in W08Runtime). The wrappers take / return W08Core / W08Touch UDTs that W08Runtime
+already imports (no new edge). Signatures: newHolder 0, touchRingOf 1, pendingStoreOf 17, touchPlanOf 14, markAppend 13
+parameters (the largest, 17, replaces a 20-argument constructor call in Main; no tuple). Forwarding: Main argument counts
+equal or smaller (20 -> 17, 18 -> 1, 14 -> 14, 13 -> 13). Main business logic: none (plumbing renames only).
+
+Probe files (not Production, never adopted as is):
+- `token_probes/TCB_W08Runtime_FacadeProbe.pine`: library `ZoneEngineV2_W08Runtime_FacadeProbe` = W08Runtime /19 verbatim
+  (imports W08Core /18 + W08Touch /7 unchanged) + the 5 wrappers above at the end.
+- `token_probes/TCB_Rebuild_Main_Probe.pine`: Production Main with the W08Core / W08Touch imports removed and
+  `ZoneEngineV2_W08Runtime_FacadeProbe/1 as W08Runtime` instead of W08Runtime /19 (alias unchanged), changes 1-28 above;
+  every other line identical.
+
+Probe Gate (one Probe): 1) publish FacadeProbe /1 (must build <= 100,256; CE10117 -> STOP); 2) compile Main Probe; record
+against 1,009,747. <= 950,000 -> Production design (W08Runtime next unused version + Main); 950,001-999,999 -> compile restored,
+Tier B next; > 1,000,000 -> record the exact value, STOP; foreign-UDT blow-up -> STOP.
