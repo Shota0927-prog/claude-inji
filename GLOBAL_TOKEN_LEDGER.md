@@ -3571,3 +3571,12 @@ array cleared / rebuilt in place (no allocation on historical bars). Existing Co
 stage / semantic diff 0. Local parity (`v01_parity.py`, 60 deterministic fixtures, 348 rows) viewAt vs rows ORDER 0 /
 VALUE 0; mutants 6 / 6 killed. Forward reference 0. Estimator (E2, candidate selection only): P0 path 221,767, P1 path
 221,687 (-80 source), Main all exports 223,200 -> 223,434 (+234). P1 TV compile: WAITING (Main /27 publish by the user).
+
+## W09 Windowed Visual V01 (provisional, not full-history parity)
+TV (user): P2 (TM-1 Main probe /1 consumer, no drawing) compile PASS, runtime RE10110 (> 40 s) -> full-history Engine update
+is the runtime blocker. New file `ZoneEngineV2_W09_WindowedVisual_V01.pine` (542 lines; `ZoneEngineV2_Rebuild_VisualHarness.pine`
+kept): V03E runtime architecture (indicator calc_bars_count 5000, engineWindowDays 1..14 default 7, last_bar_time anchored
+window, per-request calc_bars_count formulas; source / window / request block identical to V03E lines 33-248, Feed block
+identical to V03E 265-383) + backend `ZoneEngineV2_Rebuild_TM1Probe /1` `visualStepAndZoneRows` (provisional probe backend,
+semantic drift 0 vs Production) + the V01 display (filters, bounded top-K, lazy islast-only box / line pools 30 + 30).
+CoreView / physical geometry / delete-new registry removed. Production diff 0. TV compile / runtime: WAITING.
