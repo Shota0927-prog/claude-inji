@@ -2004,3 +2004,56 @@ Design-time conflicts found before implementation (existing W08 / W09 contracts,
   either -> F0 by I27-B12-2; to be confirmed as intended.
 
 Status: B12 implementation NOT started (STOP): C1 / C2 need a rule; C3 a confirmation.
+
+### B12 C1 / C2 / C3 resolution (user) and the I27 ledger correction
+
+Withdrawn: "destination owner unresolved -> F0 fail" (I27-B12-2 / B12-3 as recorded above): it conflicts with the A16
+ActiveTouch PendingTopology contract. Corrected rules:
+- C1 Pending component: no F0 failure; the component stays Pending (A16); the W07 Root state (INVERSE_ACTIVE) stands.
+- Event: EV_INVERSE_CONFIRM is always published on the confirm bar (never later, never again): time / baseSeq = the confirm
+  bar, side = Resistance for an original Bullish FVG / Support for Bearish, range = NativeBottom / NativeTop, touchNo 0,
+  GR_UNAVAILABLE, WEAK_NONE, rootId = the Root; coreId / generationId = the one materialized inverse-direction destination
+  after the final topology, else ID_NONE / ID_NONE (Pending, no applied winner, several destinations, any non-unique case),
+  never an F0 failure, never a guess.
+- C3 no winner: normal (no F0); Root stays INVERSE_ACTIVE; Event with ID_NONE core / generation; no TouchMark, no noArm; no
+  later Event / TouchMark when the Root becomes a winner afterwards.
+- Pending TouchMark: a Root-unit deferred mark in flat SoA (no UDT): valid, expectedRootId, confirmBaseSeq, confirmTime,
+  inverseSide, nativeBottom, nativeTop, contactBottom = max(confirm low, NativeBottom), contactTop = min(confirm high, NativeTop),
+  closeAtTouch = confirm close. After each bar's final topology: A a materialized destination Side -> the mark (original
+  payload, non-normal, touchNo 0, weak false, max 0) to every destination Side that holds the Root and whose EffectiveRange
+  meets the original contact inclusively (Broad: every such Side; existing W08 TouchMark dedupe / capacity / truncation), then
+  clear; B still in the PendingTopology Root set -> keep; C neither -> clear (no winner), no mark. No Event in A / B / C.
+- C2 same-bar D1 TouchStart: (a) counterfactual read-only plan P0 -> cancel -> final re-plan P1 only when needed. Only on a bar
+  with an InverseConfirm and a D1 TouchStart candidate: P0 = the existing W08 plan with this bar's new D1 TouchStarts left out
+  of the projected ActiveTouch overlay (bar-start ActiveTouch, same-bar Resets of existing Episodes, Breaks: as before);
+  persistent mutation / Event / TouchMark 0. The new D1 TouchStarts mapped by P0 to an InverseConfirm Root's projected
+  destination Side are cancelled (no TouchCount + 1, CurrentTouchNo, TSS, normal TouchMark, Fresh use, EV_TOUCH_START); other
+  D1s stay. P1 = the same plan call again only when a surviving D1 changes the final projected Active state; P1 alone is the
+  authority for F0 / commit / Events / TouchMarks / Stage J. All D1s cancelled (projected state = P0's) -> P0 is final, no
+  P1. Bars without an InverseConfirm or without a D1 candidate: one plan as today. An ActiveTouch at the bar start is never
+  cancelled: Episode / TSS kept, component Pending, the Event on the bar, the mark deferred.
+- noArm: a same-bar materialized destination Side -> Waiting, noArm on the confirm bar; a later bar meeting the reset distance
+  -> ArmedFromSeq = that bar + 1. Pending: the Episode continues; on the pending-apply bar A16 steps 5 / 6 evaluate the
+  current close on the new range (Armed from that bar + 1); never retroactively.
+I27-B12-1 .. 4: RESOLVED (as corrected). C1 / C2 / C3: RESOLVED. I27 OPEN = 0.
+
+### B12 TOKEN START REVIEW
+
+Main: PASS, exact UNKNOWN, headroom UNKNOWN. Planned additions: W09State (confirm Root -> destination Side / Core mapping, Event
+and TouchMark projection, noArm, D1 cancel set from P0, deferred mark resolve), Main plumbing (the plan loop, the deferred SoA
+in W02AuxStore, Event / mark wiring), W07 / W08 unchanged, sideInverseAttemptCounts untouched (Guard release 0). New UDT 0,
+import 0, foreign type 0, tuple 0. High-cost candidate: the same large W08 plan function reached twice (C2) -> rule §5 /
+§6 HIGH_COST_STRUCTURE candidate -> Probe REQUIRED before Production.
+Verified for the two-pass shape: planPassWithActiveTouchOverlay is a shadow plan (pending pool copied into ctx.psPlan, plan
+scratch in the W08Store / TouchPlan arrays rebuilt per call, the overlay only feeds the Pending predicate); ShadowScalars
+nextCoreId / nextGenerationId move only in materializeAppliedRaw with commit = true. A second call overwrites the first one's
+scratch; no persistent write.
+
+Probe (one file, Main only, Production imports unchanged: W09State /29, W08Runtime /20, W08Core /19, W08Touch /7):
+`token_probes/B12_Rebuild_Main_TwoPassProbe.pine` = Production Main + (1) the 10-field deferred mark SoA in W02AuxStore with its
+init; (2) one plan call site in a loop: P0 with the FORCE_ACTIVE overlay entries (this bar's new D1 TouchStarts) left out, run
+only when fvgInverseConfirmCount > 0 and a D1 TouchStart plan row exists, P1 (the same call) only when such an entry exists
+(stand-in for the W09State cancel decision), the last run final; (3) a stand-in deferred-row writer from the W07 confirm list
+(native ticks * mintick, contact = bar / NativeRange intersection, side from the direction). No plan body copied, no business
+logic duplicated, no new import / type. TradingView: compile the Probe Main; CE10216 / CE10117 -> STOP; PASS -> Production
+implementation (exact value not needed).
