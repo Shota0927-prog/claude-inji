@@ -1643,3 +1643,56 @@ Probe files (not Production, never adopted as is):
 Probe Gate (one Probe): 1) publish FacadeProbe /1 (must build <= 100,256; CE10117 -> STOP); 2) compile Main Probe; record
 against 1,009,747. <= 950,000 -> Production design (W08Runtime next unused version + Main); 950,001-999,999 -> compile restored,
 Tier B next; > 1,000,000 -> record the exact value, STOP; foreign-UDT blow-up -> STOP.
+
+### TC-B result: REJECTED (explicit-import rule)
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| TC-B | W08Runtime_FacadeProbe /1 + Main Probe | Main without direct W08Core / W08Touch imports | 1,009,747 | build error: "Library is not explicitly imported. To use the type, import that library." at `W08Runtime.ShadowContext w08Hold` | Main Probe not compiled | REJECTED |
+
+ShadowContext holds W08Core / W08Touch UDT fields, so Main must import W08Core / W08Touch explicitly to use it; a type is never
+reachable through a transitive import. Consequence: the import graph Main -> {W08Core, W08Touch, W08Runtime},
+W08Runtime -> {W08Core, W08Touch} stays. Production unchanged by TC-B.
+
+## TC-C: per-library Production slimming (TOKEN_REFACTOR_ONLY)
+
+Usage audit (fixed-point call graph from Production Main over functions, types and constants; P0 Main-referenced, P1
+cross-library from reachable W08Runtime code, P2 other reachable, T tests / harness only, D nowhere):
+
+| Library | Symbols | P0 | P1 | P2 | T | D | Source tokens (cgest) | Removable | Remaining |
+|---|---|---|---|---|---|---|---|---|---|
+| W08Core /18 | 56 | 4 | 22 | 14 | 3 | 13 | 22,550 | 7,477 (14 functions) + 2 constants | 15,073 |
+| W08Touch /7 | 63 | 5 | 6 | 48 | 3 (EI_OVERRIDE, EF_RANGE_BOTTOM / TOP: scratch-contract constants, kept) | 1 (markPhysicalIndex, 79) | 7,915 | 79 | 7,836 |
+| W08Runtime /19 | 92 | 13 | 0 | 77 | 2 (planPass, runShadow: old harnesses only, pinned to old versions) | 0 | 24,915 | 53 | 24,862 |
+
+W08Core removed (cgest source tokens / lines; Production callers 0; test callers): changedPlanBuild 2,041 / 168 (T: the
+TC-B probe file's comments only), pendingPlanBuild 1,457 / 143 (same), topologyComponentsRaw 1,040 / 87 (callers: the two
+above only), intervalMove 864 / 47, pendingChainOkRaw 463 / 40, pendingPoolsOkRaw 390 / 26, pendingClearChainRaw 351 / 35,
+originRemove 318 / 31, inverseOriginDetach 165 / 18, pendingNewChildRaw 123 / 15, pendingNewRootRaw 103 / 13,
+pendingCanClearCore 62 / 6, ufFindRaw 62 / 6, pendingClearCore 38 / 5 (T: W08Runtime_ProbeHarness, pinned to an old
+version); dedicated-helper closure: topologyComponentsRaw, pendingChainOkRaw, pendingPoolsOkRaw, pendingClearChainRaw,
+pendingNewChildRaw, pendingNewRootRaw, pendingCanClearCore, ufFindRaw are reachable only from the dead exports; constants
+PH_ACTIVE_TOUCH, CAND_MEMBER_ROLE_INCLUDED_BROAD used only by them. W08Runtime keeps its own copies of the pending / topology
+helpers (unchanged).
+
+Slim versions (kept lines verbatim, order unchanged):
+- W08Core /19 = /18 minus the 14 functions (with their attached comment lines) and the 2 constants: code lines 1,608 equal
+  the /18 sequence without them (static IDENTICAL).
+- W08Runtime /20 = /19 minus planPass / runShadow, import W08Core /18 -> /19: code lines 2,272 IDENTICAL. /20: the TC-A
+  publish failed at compile, so no /20 was created; the next successful publish is expected to become /20 (if TradingView
+  assigns another number, the Main pin follows it).
+- W08Touch: unchanged /7 (79 removable tokens do not justify a publish).
+- Main: pins W08Core /18 -> /19, W08Runtime /19 -> /20 (2 lines); W08Touch /7, W09State /27 unchanged.
+Static: no removed symbol referenced by Main, W08Runtime /20, W08Core /19, W08Touch /7 or W09State /27; semantic constants /
+comparisons / Event / Stage order / Root conditions changed 0; imports unchanged in shape; no new type / signature / forwarding;
+Main business logic 0.
+Equivalence: the 15 representative B08 / B09 / B10 cases (L1, L5, L7, F3, G1, G9, G12, G15, F3, F4, F5, F12, F13, F15, F16)
+on the TC-C Main: 15/15 PASS; R3-B1 scratch contract PASS. random 0, > 5 min 0.
+
+Other libraries, call-0 bodies (cgest source tokens, TOP 10; no change in TC-C, candidates after TC-C): W05
+candWindowExitRaw 1,196; W09State touchSnapshotRootListDetachAllRaw 301, stateSetUpdate 176, touchResetMet 126,
+touchSnapshotRootListAppend 78, touchSnapshotRootListDetachAll 73, touchSnapshotRootListValidate 69, breakWouldMet 52,
+phaseMembershipValid 46, phaseDetach 46 (phaseAdd 46). W06 / W07 / W07Interval: none.
+
+TV order: W08Core /19 publish -> W08Runtime /20 publish (imports W08Core /19) -> Production Main compile; record against
+1,009,747. CE10117 / build error -> STOP.
