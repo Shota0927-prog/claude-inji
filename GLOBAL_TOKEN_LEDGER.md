@@ -2997,3 +2997,27 @@ harnesses (b0 / c2 / c2b order, b7_det, r3b2_det, b3b_stagej) already did not ru
 random 0; 5k / 50k / 200k NOT RUN.
 Status: B17_CANONICAL_STAGE_ORDER_LOCAL PASS. B17 not COMPLETE: LOCAL PASS / TV GATE WAITING (Main compile / publish by the
 user). Next: STOP (no B18).
+
+## W09 B17 F2 focused audit (Stage L lastBaseSeq / lastBaseCloseTime / committed) - B17_F2_AUDIT_PASS
+
+Scope: Stage L only (Stage F Root commit out of scope, never rolled back). HEAD 6e36942, Main ZoneEngineV2_Rebuild.pine.
+Actual code (updateConfirmed5m): Stage A duplicate / past reject (baseSeq <= lastBaseSeq or baseCloseTime <=
+lastBaseCloseTime, first bar exempt) -> B eventLogicalCount 0 -> journal reset -> D FVG facts -> C / D W09 plan -> E -> stageFOk
+= w03StageFApplyAndCommitRaw (true only when W03F0.preflight and W03Apply succeeded; the source cursors / time-HL / accum
+scalars commit inside) -> if stageFOk: W06 seedPostApply, carry inject, W05 / W06 Stage G, then bool w08Committed =
+w08ProductionRaw(...) -> if stageFOk: lastBaseSeq := feed.baseSeq, lastBaseCloseTime := feed.baseCloseTime, committed := true
+-> return committed. w08ProductionRaw returns pr.committed (false when tsOk or any W09 / W08 preflight fails: commitPass not
+called; W08 scalars and carry merge only under pr.committed). w08Committed is not read by the lastBase / committed condition.
+Authority: canonical D07 / D08 (unconfirmed / duplicate / past Feed: no commit, false, previous Events kept; commit -> true),
+HANDOFF_W01 s9 (reject -> false with Event / Base state unchanged, Stage L commit -> true), HANDOFF_W03 (F -> L), HANDOFF_W08
+s7 (W08 callsite after Stage G and before the lastBase commit; duplicate / past Feed never reaches the W08 pass; W06 failure
+keeps the carry for a later bar), W08DependencyCarryHarness F CARRY_RETRY (retry on a later build, not a re-fed bar), I27-13R
+(every W08 pass is a fresh rebuild). Retry semantic = B: the F0 bar is committed through Stage F and lastBase advances; the
+same Feed is a duplicate (no Stage E / F re-run, no Root double apply, no W08 retry of that bar); the next bar's W08 pass
+re-plans from the current Root / Candidate state, so the F0 bar's Root changes are reconciled there; the F0 bar's own W08 /
+W09 facts and Events stay 0 (B13 I27-B13-2 whole-pass F0). Option A (lastBase gated on w08Committed) contradicts D07 / W01
+(false after a Root mutation) and double-applies Stage F on a re-fed bar (counterfactual run: rootLog [10, 10]).
+Evidence (scratchpad f2_det.py, Production updateConfirmed5m interpreted, stubbed callees, real W08Runtime carry helpers):
+F2-A / F2-B / F2-C / F2-D / F2-E / F2-S PASS (F2_FAIL = 0 of 6); counterfactual option A fails F2-B / F2-C / F2-S.
+Judgement: Case 1 (consistent with the frozen retry contract and canonical Stage L); Production change none; I27 none.
+B17 status unchanged: LOCAL PASS (provisional) / TV GATE WAITING. STOP.
