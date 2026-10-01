@@ -2549,3 +2549,45 @@ src distinct).
 TOKEN END REVIEW: W09State +~15 lines in Stage J and one function moved (no body copy); signatures unchanged; Main 1 pin.
 Exact tokens UNKNOWN (no colour class). TV next: W08Runtime /21 publish, W09State /33 publish, Production Main compile.
 B14: not COMPLETE until the Main compile PASS.
+
+## W09 B14 CLOSEOUT: W09_B14_PHASE_GRADE_DORMANT_FINALIZATION = COMPLETE / FROZEN
+
+TradingView: W08Runtime /21 publish PASS, W09State /33 publish PASS, Production Main compile PASS (pins W08Runtime /21,
+W09State /33), compile error 0, runtime error 0, exact compiled tokens UNKNOWN (no GREEN / YELLOW / RED class). Production
+HEAD 15cc56b (this closeout changes the ledger only). I27 OPEN 0.
+
+Frozen:
+1. Dormant is a Side Phase.
+2. Entry: Phase Waiting or Armed AND d > cfg.dormantDistance AND no PendingTopology AND no PendingGeneration AND not noArm
+   AND no same-bar transition.
+3. d: baseClose < effectiveBottom -> effectiveBottom - baseClose; baseClose > effectiveTop -> baseClose - effectiveTop; inside 0.
+4. d == dormantDistance -> not Dormant.
+5. Recovery: d <= dormantDistance -> Waiting -> the usual Armed test in the same Stage J -> Reset met and not noArm -> Armed,
+   armedFromSeq = currentSeq + 1.
+6. No normal Touch on the recovery bar.
+7. Grade on a Dormant Side by the exact order Unavailable -> Weak -> Strong -> Neutral; the Dormant distance is no Weak /
+   Unavailable reason.
+8. Dormant alone clears no Core ID / Generation ID / TouchCount / Weak / Fresh / consumption history / Generation history.
+9. armedFromSeq / lastArmedRangeBottom / lastArmedRangeTop not cleared by Dormant entry; non-authoritative outside Armed.
+10. coreDormantFlags: Core-level lifecycle / optimization flag derived in Stage J from the Side Phases; never a Side Phase
+    authority.
+11. coreDormantFlags outside the W08 Default Guard; false on reset / alloc / slot reuse (W08Runtime /21).
+12. The same-bar transition fact is pass-local, never persistent.
+13. Across topology it is projected with the same source -> destination relation as the Side lifecycle / history transfer.
+14. Merge: target Side = OR of the survivor and absorbed source transitions.
+15. Split: only the continuation child inherits the source transition.
+16. Fresh target and Split fresh child: no transition inherited.
+17. D19-D2: a fresh child never reads a stale source transition left on a reused slot.
+18. noArm projection and transition projection are separate.
+19. phaseArmedStageJFinalize stays the single final writer of Phase / Grade / Armed / Dormant.
+20. W08 topology semantics change 0 (Core ID, Generation ID, Merge survivor, Split continuation, Pending component, TouchMark:
+    W08 frozen contract).
+
+Evidence: D1-D18 / D18b 17/17 PASS; D19 Merge survivor / Merge absorbed / Split continuation / Split continuation + fresh child
+/ D19-D2 slot reuse PASS; F0 persistent mutation 0, Event 0; Default Guard G1-G5 PASS; B08-B13 target regression PASS; R3-B1
+contract PASS; static PASS; TradingView as above.
+B14_W08_RUNTIME21_CONFORMANCE = STATIC_EQUIVALENCE_PLUS_TARGETED_GUARD (/20 -> /21 = the coreDormantFlags guard row of
+coreDeferredStateRaw only; every other reachable W08Runtime function semantically identical); formal integrated W08
+conformance carried to W11 / W12 (not a B14 completion condition).
+Carry to B15: no B14 redesign; Stage J final authority kept; Dormant / transition projection not changed again; B15 Merge
+Side transfer takes the B14 state as its input.
