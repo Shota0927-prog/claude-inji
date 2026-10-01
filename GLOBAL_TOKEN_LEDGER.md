@@ -3202,3 +3202,13 @@ W07_I11_INVERSE_THRESHOLD_INDEX_CARRY = CLOSED. B18_INVERSE_THRESHOLD_INDEX = IM
 TOKEN END REVIEW: W07Fvg /12 (+ index helpers, extraction), Main +storage / call args; W09State /35 unchanged (no /36);
 exact UNKNOWN, no class. Status: W09_B18_STATE_PRICE_INDEX_REFERENCE_LOCAL PASS; B18 not COMPLETE: LOCAL PASS / TV GATE
 WAITING (W07Fvg /12, W09State /35 publish, Main compile). I27 OPEN 0. STOP.
+
+## W09 B18 TV Gate fix: B18_TV_GATE_W07_12_CE10150_IDENTIFIER_FIX
+
+TV Gate: W07Fvg /12 compile FAIL, line 506 CE10150 ("to" cannot be used as a variable or function name). Fix: invIdxMoveRaw
+local `to` -> `toOrder` (declaration + 2 references, 3 lines); semantic diff 0; W07Fvg stays /12 (never published), Main
+import /12, W09State /35. Static reserved-identifier check over the B18 diffs (W07 since 157e7e7, Main / W09State since
+fecdcec, code only): W07 0, Main 0; W09State /35 still declares `array<int> to` in wdIndexRaw (B18 Phase B) - the same
+CE10150 will occur at its TV Gate; not changed here (this rally forbids W09State changes), reported for a decision.
+Local gate: b18_inv P43-P57 + S5 16 / 16 (Inverse metrics all 0), b18_det P1-P42 + S1-S4 43 / 43, M21-M30 10 / 10 detected,
+B12 25 / 25, B13 13 / 13. random 0; 5k / 50k / 200k not run. I27 OPEN 0.
