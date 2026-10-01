@@ -2591,3 +2591,67 @@ coreDeferredStateRaw only; every other reachable W08Runtime function semanticall
 conformance carried to W11 / W12 (not a B14 completion condition).
 Carry to B15: no B14 redesign; Stage J final authority kept; Dormant / transition projection not changed again; B15 Merge
 Side transfer takes the B14 state as its input.
+
+## W09 B15 Merge Side transfer: canonical docs, START GATE and Phase A audit (no code change)
+
+Canonical docs (docs-only commit e713f2f, verbatim): docs/canonical/Zone_definition_spec_v2(5).md SHA-256
+f0ada2d851477850aa3d65463056e0318434b0c362383d475d49f9f6e1049cd1 (= the required value);
+docs/canonical/09_窓09_State_Touch_Break_Flip_Reclaim_Inverse(1).md SHA-256
+8f5373a47543875927ef403abb9b4cd6fe300e8bc981b435c8848b5b274b9ef8.
+START GATE: branch claude/w09-b07-redesign-v2, local = remote = e713f2f, 0 / 0, clean; W08Runtime /21, W09State /33 (Main
+pins); ledger, HANDOFF_W08, both canonical files present. Authority: W09 bundle > spec v2(5) > HANDOFF_W08 > ledger / B01-B14
+closeouts > Production > old B01 audit.
+TOKEN START REVIEW: Main PASS, exact UNKNOWN (no class); audit only; new UDT / tuple / forwarding / Main logic candidates: none
+needed (see below). Probe NO.
+
+Current W08Runtime /21 coreDeferredStateRaw (re-extracted; the old "73" is not used):
+- CURRENT_GUARD_FIELD_COUNT = 8: coreLastSeenTimes, corePruneRevisions, corePendingGenerationFlags [Core];
+  sideInverseAttemptCounts, sideFvgDirectionMasks, sideFvgRootCounts, sideFvgFreshCounts, sideFvgStructuralStateMasks [Side].
+  Writers: alloc / reset only (no Production writer) -> always default -> never fails a Merge; kept (no writer, no rule).
+- CURRENT_RESET_ONLY_FIELD_COUNT = 67: Core coreZoneFreshFlags, coreDormantFlags; Side sideTouchCounts, sideWeakByTouchFlags,
+  sideWeakByDepthFlags, sideMaxDepthPcts, sideFreshFlags, sidePhases, sideGrades, sideCurrentTouchNos, sideUpcomingTouchNos,
+  sideArmedFromSeqs, sideLastArmedRangeBottoms / Tops, sideLastNormalTouchTimes, sideEffectiveBottoms / Tops,
+  sideReferencePrices, sideCCounts, sideHCounts, sideDensities, sideBaseStrongFlags, sideHasNonPsychRootFlags,
+  sideIsBroadContextFlags, sideEligibleFlags, sideCategoryMasks, sideHighMasks, the 21 TouchStartSnapshot fields (valid, coreId,
+  generationId, side, range bottom / top, category / high masks, C, H, density, grade, currentTouchNo, approachSide, startSeq,
+  startTime, deepestClose, maxDepthPct, Root head / tail / count), sideCurrentRoot head / tail / count, sideFlipAttemptCounts,
+  sideLastFlipConfirmSeqs, the 14 BreakSnapshot fields.
+- CURRENT_TRANSFER_RELEVANT_FIELD_COUNT = 13 persistent consumption / lifecycle fields with a Merge writer: sideTouchCounts,
+  sideWeakByTouchFlags, sideWeakByDepthFlags, sideMaxDepthPcts, sideLastNormalTouchTimes, sideCurrentTouchNos, sideFreshFlags,
+  coreZoneFreshFlags, BreakSnapshot (14 fields as one row), sideFlipAttemptCounts, sideLastFlipConfirmSeqs, completed TSS
+  (cleanup only), coreDormantFlags (Stage J derivation); the rest is Stage J / SideView re-derivation or slot reset.
+
+Resolved since the old "UNDEFINED" audit (authority -> Production writer):
+| Field group | Merge rule | Authority | Writer |
+|---|---|---|---|
+| TouchCount / LastNormalTouchTime / CurrentTouchNo | marks of the W08 Merge TouchMark plan for that Side (union -> contact with the new range -> same Side / time / contact dedupe, frozen W08), normal marks: count, latest time; truncated: max with the relevant sources; CurrentTouchNo 0 | spec 12.2 (no zero reset, same contact once, only touches contacting the new range), 11.4 step 3; B06 I27-15 / I27-18 (frozen) | touchHistoryTransferPlan / Apply |
+| WeakByDepth / MaxDepth | OR / max over those marks (truncated: + sources) | spec 9.3 / 12.2; B06 I27-18 | same |
+| WeakByTouch | weakByTouchNow(resulting count) | spec 13.4 (touch-count Weak follows the count) | same |
+| SideFresh / ZoneFresh | AND over every source Core (survivor and absorbed; a Side that never held a winner is true); fresh target all true | spec 16 (Fresh revives only in a new generation); B06 I27-15 §8 / §15 / §16 | freshTransferPlan / Apply |
+| BreakSnapshot (14) | one whole row: breakSeq max -> breakTime max -> old Core canonical order; no field mix | I27-15 #1 (ledger) | bsTransferPlan / Apply |
+| flipAttemptCount | the selected BS source row (+1 for its Attempt of the bar) | B10 Q4 | bsTransferPlan |
+| lastFlipConfirmSeq | max over the same-Side sources (a Confirm of the bar = baseSeq) | B10 Q4 | bsTransferPlan |
+| Phase / Armed / ArmedFromSeq / LastArmedRange | destination baseline Waiting (Broken / FlipWait from a valid BS), unset / na, then Stage J (B14 Dormant included) | I27-15 #3 / #4, spec 11.4 steps 4-5, B14 | phaseArmedStageJFinalize |
+| Grade / Upcoming / EffectiveRange / C / H / Density / BaseStrong / eligibility / masks / reference price / current Root lists | recomputed from the final topology | spec 4.3 / 6 / 7.2 / 8.3 | sideViewProduce, w09CurrentRootProduceRaw, Stage J |
+| TSS | never merged: an ActiveTouch component is PendingTopology (W08 frozen, spec 11.4); a TSS completed this bar (Reset / Break) is captured and cleared after commit | spec 11.1 / 11.4, I27-15 #4 | touchHistoryTransferApply |
+| coreDormantFlags | Stage J derivation, not transferred | B14 | Stage J |
+| same-bar transition / noArm | pass-local, not persistent | B13 / B14 | Stage J / applies |
+sideLastNormalTouchTimes: writers touchStartApply and touchHistoryTransferApply; only reader = touchHistoryTransferPlan's
+truncated fallback for itself; no Event / Grade / Phase / View / Main accessor reads it -> non-authoritative for results (no I27).
+
+Reachability (same Side): A both default (untouched Merge), B survivor touched, C absorbed touched, D both touched / Broken
+sources: all reachable once no ActiveTouch is in the component (the W08 Pending predicate); ActiveTouch-with-ActiveTouch is
+unreachable. Alloc default != semantic initial for Fresh (reset false, new generation true): freshTransferPlan sets fresh
+targets true explicitly; Merge targets take the AND of the source semantic values.
+TouchMark boundary: the W08 Merge TouchMark plan is frozen (union, contact, Side, dedupe key, survivor-first representative,
+no payload mix); the Side history is derived from it only as spec 12.2 / 11.4 state; no TSS / BS / Fresh is rebuilt from marks.
+Source -> target: mergeOfP / mergeRelations [p, survivor slot, survivor id, absorbed offset, count] / mergeAbsorbed, classes
+(TX_MERGE_SURVIVOR / TX_MERGE_FRESH), materializedCoreSlots, invSourcesRaw; W08 topology selection untouched.
+Default Guard: no change (the 8 remaining fields have no writer and no transfer rule; removed only with a writer + rule +
+conformance).
+I27 candidates: none meet all three conditions (reachable, result-changing, not uniquely decided): every reachable
+result-changing Merge field has a frozen B06 / B08 / B10 / B14 rule or a spec 12.2 / 16 rule. Provenance note: the B06
+I27-15 §8 / §15 / §16 and I27-18 texts are recorded in the frozen Production comments, not as ledger text (I27-15 BS part is).
+I27 OPEN = 0. W09_CARRY_MERGE_SIDE_STATE_TRANSFER: satisfied by B06 (history / Fresh), B08 (BS), B10 (Flip state), B14
+(Phase / Dormant); B15 Phase B = verification only (Merge A-D x field conformance fixtures on the existing harness, carry
+closure), no Production change expected.
