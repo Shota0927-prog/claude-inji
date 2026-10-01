@@ -3343,3 +3343,31 @@ TOKEN END REVIEW: Production delta 0 (exact UNKNOWN, no class); harness-only add
 random 0; 5k / 50k / 200k NOT RUN. I27 OPEN 0.
 Status: W09_B19_CONFORMANCE_LOCAL PASS; APPENDIX_B_W09_46_69_LOCAL 24 / 24; I22_W09_STATE_INDEX_LOCAL PASS. B19 = LOCAL PASS /
 TV HARNESS WAITING (not COMPLETE).
+
+## W09 B19 TV Harness fix: B19_TV_HARNESS_CE10116_HW_SPLIT_FIX
+
+TV Harness Gate (user): ZoneEngineV2_W09ConformanceHarness_B19.pine compile FAIL, CE10116 "The HW.new function uses 269
+external elements. The limit is 254." Cause: the harness-only world UDT HW held all 254 storage fields in one type (186 Main
+storage arrays the W09 views read + 68 harness-only fields); its auto constructor exceeded the limit. Not a Production defect.
+Fix (harness / generator only): HW split by semantic owner through one generator ownership table (field -> owner, 1 : 1):
+HWCore 41 (Core identity, range inputs, current Root lists, Root registry / journal, Core flags), HWState 51 (Phase-carrying
+Side state: Touch / Weak / Grade / Fresh / TSS / BreakSnapshot / attempt / history), HWIndex 27 (state sets, set positions,
+Armed / Broken / FlipWait / Waiting / Dormant order slots + positions), HWTopo 69 (W08 stub plan, Merge / Split mark arrays,
+topology spec, SideView winner rows), HWAux 66 (TouchMark ring, TSS / BS Root node pools, plan scratch, Events, Inverse,
+noArm); HW = 5-field wrapper (core / state / idx / topo / aux). Every w.field reference rewritten mechanically to
+w.<owner>.field (no hand edit). Estimated external elements per auto constructor (fields x 269 / 254): HW 6, HWCore 44,
+HWState 55, HWIndex 29, HWTopo 74, HWAux 70, HF 17; maximum 74 (target <= 200 met). Library view constructors unchanged
+(TouchStartPlanView 89 / PhaseArmedTransferView 111 args, the same lists Main compiles with). CE10116 risk 0.
+Aliasing kept: each Main storage array is one field with one owner; every view argument references that field (no copy);
+UNMAPPED_HW_FIELD 0, DUPLICATE_HW_FIELD_OWNER 0, the hwNew initialisation multiset (254 fields) identical to the pre-split
+harness. Harness semantic diff 0: with the owner qualification removed, the type / constructor blocks excluded, the source is
+line-identical to the CE10116 version (golden vectors, expectations, predicates, comparisons, I22 audit, stage order,
+Merge / Split, R4, Dormant, Inverse unchanged).
+Local interpreter (same Pine file): APPENDIX_B_W09 24 / 24, STATE_DRIFT 0, EVENT_DRIFT 0, RUNTIME 0, I22 MISSING / EXTRA /
+ORDER / RESULT 0 (1730 index checks), X1-X3 PASS, 87 bars, 81 / 81 golden. Mutation sensitivity: M31 / M32 / M35 / M37 / M40 /
+M43 / M44 / M45 + B18 M5 / M15 all reported FAIL (undetected 0).
+Static on the regenerated harness: FORWARD_REFERENCE 0, RESERVED_IDENTIFIER 0, UNDEFINED_FIELD 0 (owner-qualified and HF),
+UNMAPPED_HW_FIELD 0, DUPLICATE_HW_FIELD_OWNER 0, NON_EXPORTED_CALL 0, ARITY_MISMATCH 0 (harness functions, library functions,
+UDT constructors), SHADOWING_ERROR 0. request.* 0, input.* 0, imports unchanged (W09State /35, W08Touch /7).
+Production diff 0 (W07Fvg /12, W08Core /19, W08Touch /7, W08Runtime /21, W09State /35, Main untouched, no re-publish).
+TOKEN: Production delta 0; harness compiled exact UNKNOWN. I27 OPEN 0. B19 = LOCAL PASS / TV HARNESS WAITING (not COMPLETE).
