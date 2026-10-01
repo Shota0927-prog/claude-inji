@@ -2316,3 +2316,29 @@ Event 0; P8 P7 + a planned Core 11 D1 -> whole-pass F0, Core 11 not committed. S
 FAIL (5 of 9). Regression (selected only): B08 L8 / F1, B09 G11 / R1, B10 F4 / F10, B11 R1 / R2, B12 I14 / I30: 10/10. R3-B1
 contract PASS. Static: W09State imports 0, rc defined before cf, signatures unchanged. random 0, > 5 min 0, 5k / 50k / 200k 0.
 TV: W09State /31 publish -> Production Main compile. CE10216 -> STOP (GT-5A / D3 / T1-T3).
+
+### B13 R2 (pre-TV correction, W09State /31 still unpublished, kept at /31)
+
+Problem in the first /31: `cf = ... and not rc` used the raw Reclaim price fact, and the D4 (reclaimResolve, FVG structural
+invalidation > Reclaim) ran later, so a D4-suppressed Reclaim still killed the FlipConfirm. Staged priority (user; Reference
+`if reclaim and not fvgInvalidNow -> Reclaim else Flip path`): 1. FVG invalidation > Reclaim; 2. Reclaim > FlipConfirm only for
+a Reclaim that survives D4.
+- reclaimResolve moved before flipPlan (plan loop, one call site, also before the W08 plan that projects the Flip TouchMark
+  rows): read-only over the bar-start Broken Sides, out = the BS Sides whose Reclaim D4 suppresses (same rule: BS Root list
+  meets this bar's journal E1 invalidation and no other Root is outside it, live, ROOT_ACTIVE). Signature: explicit BS Root
+  list arrays instead of PhaseArmedTransferView (that view exists only after the W08 plan) + out; no longer edits fli / d3.
+- flipPlan + rcSup: `rc = rawReclaimPrice and not includes(rcSup, sb)` (one price predicate), `cf = rawConfirm and not rc`,
+  Attempt guard `not cf and not rc` unchanged in form, so a D4-suppressed Reclaim leaves the whole Flip path (Confirm and
+  Attempt; Reference "else Flip path"). Before B13 a D4-suppressed Reclaim also left no Attempt (raw wouldReclaim fact): this
+  Attempt consequence is recorded explicitly (P12).
+- Cases: A raw Reclaim, no invalidation, raw Confirm -> Reclaim only; B + invalidation -> FlipConfirm (Event, mark, noArm,
+  lastFlipConfirmSeq); C + invalidation, no Confirm -> neither; D no raw Reclaim -> FlipConfirm.
+- Main: reclaimResolve call moved from the preflight chain into the plan loop (before flipPlan), scratch `rcs`; pin /31.
+- G1 (holder noArm) and I27-B13-2 (whole-pass F0) unchanged. New UDT / import / export / tuple / Probe 0 (flipPlan +1 param,
+  reclaimResolve 10 -> 13 params).
+Gates: `b13_det.py` 13/13 (P1-P8 kept, P9 degenerate + invalidation + Confirm -> FlipConfirm with mark / noArm /
+lastFlipConfirmSeq, P10 degenerate raw Reclaim + invalidation, no Flip condition -> nothing, P11 degenerate without
+invalidation -> Reclaim, P12 Attempt after a D4-suppressed Reclaim). Sensitivity on the first /31 (old wiring): P9 / P12 FAIL.
+Affected regression only: B10 F4 / F5, B11 R1 / R2 / R14 / R15: 6/6. R3-B1 contract PASS; W09State imports 0. Harness txn8
+mirrors the new Main order. random 0, > 5 min 0.
+TV: W09State /31 publish -> Production Main compile; CE10216 -> STOP.
