@@ -1754,3 +1754,89 @@ random 0, > 5 min 0.
 
 TV order: W05Candidate /8 publish -> W06Component /25 publish (imports W05 /8) -> W09State /28 publish -> Production Main
 compile. Build error -> STOP.
+
+### TC-D result and TOKEN COMPRESSION CLOSEOUT
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| TC-D | W05 /8, W06 /25, W09State /28, Main pins | call-0 bodies (W05 candWindowExitRaw; W09State 10 functions + 2 types) | < 1,000,000 (TC-C, exact UNKNOWN) | < 1,000,000 (Main PASS; W05 /8, W06 /25, W09State /28 publish PASS) | UNKNOWN | ADOPTED, FROZEN |
+
+TOKEN END REVIEW (B10 aggressive compression, TC-A .. TC-D):
+- Before compiled: 1,009,747 (B10 Main, CE10216). After compiled: < 1,000,000 (Main PASS, exact UNKNOWN; CE10216 none).
+- Delta: < -9,747 (exact UNKNOWN). Headroom: > 0 (exact UNKNOWN). Status: not RED-by-overflow; exact class UNKNOWN (GREEN not
+  proven; the 950,000 target is unverified).
+- Changed Production: W08Core /19, W08Runtime /20, W05Candidate /8, W06Component /25, W09State /28, Main pins (W08Touch /7,
+  W03* / W07 / W07Interval unchanged).
+- New reachable heavy structure: none (TC-A / TC-B rejected and never adopted; TC-C / TC-D only remove bodies).
+- TOKEN_REFACTOR_ONLY: yes. Long tests: none. > 5 min: none. Unneeded retests: none (15 representative cases per batch).
+- Rule check: TC-A was implemented without a library-limit check (the per-library 100,256 limit was not in the rules) ->
+  class DESIGN, prevention: "a library body merge must first estimate the merged library against the 100,256 library limit
+  (the merged W08 libraries measured 128,207)". TC-B: a type held in another library's UDT needs an explicit import in the
+  consumer (Pine rule) -> class DESIGN, prevention: "a facade cannot hide a foreign UDT; Main needs the explicit import of
+  every library whose types it touches through a field".
+- Results kept: TC-A REJECTED (CE10117 128,207 / 100,256), TC-B REJECTED (explicit-import rule), TC-C SUCCESS, TC-D SUCCESS.
+- Dead code: essentially removed (left: W08Touch markPhysicalIndex 79 source tokens and layout constants). W08 import
+  graph: no safe structural change left. W07Interval: no meaningful net. GT-5A / D3 / T1-T3: DEFERRED (candidates if CE10216
+  returns). Further token refactors: forbidden until then; back to semantics.
+- Next Batch start: YES. Next Batch token risk: MEDIUM (exact headroom unknown).
+
+## W09 B10 CLOSEOUT
+
+B10 Flip / FlipAttempt: COMPLETE, FROZEN (not reopened). Fixed: movedAway, retestSeen, FlipAttempt, FlipConfirm, the
+wouldReclaim fact, the Flip non-normal TouchMark, FlipAttemptCount, LastFlipConfirmSeq, Merge / Split transfer, FlipConfirm
+cleanup, D3 canonical Event order, same-bar topology, F0 atomicity. Gates: B10 deterministic PASS (14/14 + F12 / F13 R2
+TouchMark asserts), B08 / B09 regression PASS, Production Main PASS (after TC-C / TC-D). Open B10 semantics: 0.
+
+## W09 B11 Reclaim: START GATE and Phase A audit (no code change)
+
+START GATE: branch `claude/w09-b07-redesign-v2` at `9576d1d` (pushed), clean. Pins: W03F0 /5, W03Apply /4, W03ETimeFvg /3,
+W06 /25 (-> W05 /8 -> W07Interval /1), W07 /11 (-> W07Interval /1), W08Core /19, W08Touch /7, W08Runtime /20 (-> W08Core /19,
+W08Touch /7), W03EMsa /9, W09State /28. Main PASS (exact UNKNOWN). Canon: the user's B11 text (sections 5-12); the repo
+holds no other Reclaim text (HANDOFF_W02 #11: Reclaim shares the Broken index; Main EV_RECLAIM = 8 name only).
+
+Existing code (W09State /28, Main):
+- wouldReclaim: flipPlan `rc = mv0 and (sup ? cT >= tT + bbT : cT <= bT - bbT)` (ticks of the BS range, close, breakBuffer;
+  inclusive), stored as fli flag 16, used only to suppress the Attempt (`at` needs contact, contact needs mv0). The canon
+  Reclaim predicate (section 5) has no movedAway condition; the mv0 factor is redundant for the Attempt (at => ct => mv0), so
+  the one predicate can become the Reclaim authority without the mv0 factor and without changing any B10 result (flag 16 is
+  read nowhere else; a row is written only on mv / rs change, Attempt or Confirm). No second Reclaim predicate exists.
+- Candidates: flipPlan already walks every Broken pair (Broken old Side sb, FlipWait sf, same valid BS, breakSeq <
+  currentSeq) = exactly "before Flip is confirmed", price authority = the BS range only (no EffectiveRange / EMA /
+  recluster).
+- Same-bar Break / GapBreak suppression: a BS of this bar (Local Break or GapBreak) has breakSeq = currentSeq and is never
+  a candidate; a Broken / FlipWait Side can be neither Local-broken (not ActiveTouch) nor GapBroken (not Armed) again.
+  Confirm (close <= bottom / >= top) and Reclaim (close >= top + buffer / <= bottom - buffer) exclude each other (bottom
+  <= top, buffer >= 0); Reclaim excludes the Attempt (B10). No intra-bar order is guessed.
+- FVG structural invalidation (W03 journal JGROUP_E1 / JOP_FVG_INVALIDATE) runs in the Root stage before W08 / W09 Stage D;
+  the Side current Root lists are derived from the post-topology state, never from the BS. A Reclaim writes no Root (the BS
+  Root copy is freed, not restored), so an invalidated FVG Root is never revived or turned back to its old direction, and
+  no Root / quality evidence is created.
+- Cleanup: flipApply's FlipConfirm block = Broken / FlipWait index detach (bsIndexRaw), BS Root nodes freed
+  (bsNodeFreeRaw), both BS copies cleared (bsClearRaw), CurrentTouchNo 0, both Sides Waiting (phaseMoveRaw), attempt count
+  0; then the Confirm-only parts (noArm, lastFlipConfirmSeq). Reclaim needs exactly the shared part: one helper for both.
+- Side history: a Break writes BS, Phase, CurrentTouchNo 0 and Grade Unavailable only (breakCommitRaw); TouchCount, Weak
+  flags, MaxDepth, Side / Zone Fresh are never touched by Break / Flip, so a Reclaim keeps them by writing nothing there
+  (no Fresh revival); Grade is recomputed by Stage J for Waiting / Armed.
+- Phase: Stage J (unchanged) arms a Waiting Side when eligible + non-psych Root + armedDistanceMet on the current
+  EffectiveRange and close, with ArmedFromSeq = currentSeq + 1 = "Waiting or Armed from the next bar"; no normal Touch can
+  start on the Reclaim bar (D1 reads the previous-bar Armed state; Broken / FlipWait are not Armed). So Reclaim does not use
+  noArm (that is FlipConfirm-only, B10 Q5); both Sides (old Side and the released FlipWait Side) go to Waiting.
+- Same-bar topology: bsSourceRaw treats a BS consumed by a FlipConfirm of the bar as none; a Reclaim consumes the BS the
+  same way (flag 16 joins the test), so the BS transfer drops it, the Stage J baseline gives Waiting to the destination
+  unless another source BS wins (unchanged Merge / Split rules), attempt count 0 (taken only from a chosen persistent BS),
+  lastFlipConfirmSeq unchanged (Confirm-only), noArm not set; the old Side history reaches the destination through the
+  unchanged C2 transfer. Relation-outside free with a BS: the existing F0 invariant.
+- Event: Main D3 loop already emits EV_FLIP_ATTEMPT / EV_FLIP_CONFIRM from fli (BS range from flf, touchNo 0,
+  GR_UNAVAILABLE, fli column 4 weak reason, ID_NONE); EV_RECLAIM = the same row with side = oldSide and the old Side's
+  persistent Weak reason (fli column 4 holds the FlipWait Side's today: a Reclaim row stores the old Side's). D3 order:
+  one canonical (coreId, generationId, Side) merge; a Core holds at most one Broken pair and then no Episode, so a Reclaim
+  row never ties with another row of its Core.
+- TouchMark: the canon names no Reclaim TouchMark (B10 Q4 covers FlipAttempt / FlipConfirm only): none.
+- F0: flipPlan is read-only before the W08 plan; flipApply runs after every F0 (runtime.error on a broken proof);
+  touchStartPostPlanPreflight counts Flip Events for the Event room (Reclaim joins the count).
+
+Phase A result: every audited item follows from the canon and the frozen B10 rules; I27 0; no question.
+Planned physical shape (for the design step, not implemented): flipPlan rc without mv0 + a row on rc + old-Side weak
+reason on a Reclaim row + d3 / Event room on flag 16; one shared pair-release helper used by FlipConfirm and Reclaim in
+flipApply; bsSourceRaw consumes on Confirm or Reclaim; Main D3 loop EV_RECLAIM branch (plumbing). No new UDT / import /
+foreign type / tuple / forwarding: Probe expected NO (TOKEN START REVIEW at the design step).
