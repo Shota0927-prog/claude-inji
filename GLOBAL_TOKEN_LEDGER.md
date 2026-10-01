@@ -3021,3 +3021,39 @@ Evidence (scratchpad f2_det.py, Production updateConfirmed5m interpreted, stubbe
 F2-A / F2-B / F2-C / F2-D / F2-E / F2-S PASS (F2_FAIL = 0 of 6); counterfactual option A fails F2-B / F2-C / F2-S.
 Judgement: Case 1 (consistent with the frozen retry contract and canonical Stage L); Production change none; I27 none.
 B17 status unchanged: LOCAL PASS (provisional) / TV GATE WAITING. STOP.
+
+## W09 B17 CLOSEOUT: W09_B17_STAGE_C_D_J_PRODUCTION COMPLETE / FROZEN
+
+START: claude/w09-b07-redesign-v2, local = remote = f321860 (B17 Production implementation 6e36942, F2 audit f321860),
+0 / 0, clean; pins W08Core /19, W08Touch /7, W08Runtime /21, W09State /34; I27 OPEN 0. CLOSEOUT changes this ledger only.
+
+Frozen: canonical physical stage order (updateConfirmed5m): A validation / duplicate reject -> B eventLogicalCount 0 -> D
+FVG fact detection (journal reset, w03StageDFvgFactsRaw) -> C / D W09 read-only plan (w09PlanViewRaw, w09StageCDPlanRaw) ->
+E -> F (Root commit) -> G (W06) -> H / I W08 transaction (w08ProductionRaw plan, B12 P0 / P1, preflights, commit) -> W09
+transfer / apply / Event -> J (phaseArmedStageJFinalize) -> K / L. Canonical meaning C/D -> E/F -> G/H/I -> J holds. Later
+Batches take this order as a frozen input.
+Stage C / D contract: persistent mutation 0; the bar-start persistent state (Phase, Armed, ActiveTouch, TSS, BS) is the
+authority for D1 / D2 / D3 / D4, fixed into scratch; a current-bar new Root / range / Grade is never applied retroactively
+to the current Touch, TouchStartSnapshot or TouchStart Grade.
+P0 / P1 (B12 frozen): InverseConfirm + same-bar D1 candidate -> P0 -> related D1 cancel -> P1 when needed, at most two plans;
+the Stage C / D D1 candidate set is the authority; no D1 recompute from the new topology.
+Stage J: phaseArmedStageJFinalize is the only final writer, once per committed bar: Phase, Grade, Upcoming, Armed,
+armedFromSeq, lastArmedRange, Dormant, coreDormantFlags for the next bar; later rewrite 0.
+B17-F1 FINAL: the pre-B17 Production read the post-Stage-F Root states in reclaimResolve (BS Root r1 invalidated by this
+bar's Stage D FVG fact, r2 ACTIVE at bar start and retired in E2-E4 of the same bar: old order suppressed the Reclaim). The
+canonical order evaluates D4 on the bar-start state -> Reclaim -> EV_RECLAIM. A correction of a canonical stage-order
+violation, not an unintended semantic change; unique by canonical I8; I27 none.
+B17-F2 FINAL: the Stage F Root commit is not rolled back by a later W08 F0 (correct). W08 F0: W08 / W09 state mutation 0, W08
+Event 0, no W08 scalar commit, no carry merge; the Stage F Root mutation is already committed. lastBaseSeq /
+lastBaseCloseTime / committed advance on stageFOk (authority); w08Committed is not a lastBase condition. Retry: an F0 bar
+returns true; the same Feed is a duplicate / past reject (false, no Stage F re-run, no Root double apply); the retry is the
+next Base bar's fresh W08 rebuild (I27-13R, B15 dependency retry contract). Mutation stageFOk AND w08Committed: false on an F0
+bar after a Root mutation and a Stage F re-run (Root double apply) on the re-fed bar -> rejected; stageFOk authority kept.
+Local evidence: O1-O14 14 / 14 PASS; order mutations 3 / 3 detected (MUT-ORDER-LATE-D1, MUT-ORDER-NEW-RANGE,
+MUT-ORDER-NEW-GRADE). Regression B08 / B09 / B10 / B11 / B12 / B13 / B14 / B15 / B16 PASS, W08Runtime guard PASS; random 0;
+5k / 50k / 200k NOT RUN. F2 focused audit: F2-A / F2-B / F2-C / F2-D / F2-E / F2-S PASS, F2_FAIL 0 of 6, B17_F2_AUDIT_PASS.
+TradingView Final Gate (user): Production Main compile PASS, compile error 0, runtime error 0, exact compiled token
+UNKNOWN (no GREEN / YELLOW / RED class); Worker change 0, Worker republish not needed.
+Production diff: B17 changed Main only; W08Core / W08Touch / W08Runtime / W09State /34 unchanged; CLOSEOUT Production change 0.
+I27: B17 OPEN 0 (F1 unique by canonical, F2 consistent with the frozen retry contract; no new I27).
+Status: W09_B17_STAGE_C_D_J_PRODUCTION COMPLETE / FROZEN. Next: B18 state price-index vs Reference (not started).
