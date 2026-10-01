@@ -2864,3 +2864,34 @@ TOKEN END REVIEW: Before Main PASS; After TradingView not run; exact UNKNOWN; so
 no high-cost structure; Probe none; no class.
 B16_R4_LOCAL_GATE = PASS. I27-B16-1 = RESOLVED / IMPLEMENTED_LOCAL. B16 not COMPLETE: waiting for W09State /34 publish and the
 Production Main compile.
+
+## W09 B16 CLOSEOUT: W09_B16_SPLIT_TOPOLOGY_TRANSFER = COMPLETE / FROZEN
+
+TradingView: W09State /34 publish PASS, Production Main compile PASS, compile error 0, runtime error 0, exact compiled tokens
+UNKNOWN (no GREEN / YELLOW / RED class). Production HEAD 1d9e2db; this closeout changes the ledger only (Production delta 0).
+Production: W08Core /19, W08Touch /7, W08Runtime /21 (unchanged), W09State /33 -> /34, Main pin W09State /34.
+I27-B16-1: RESOLVED / IMPLEMENTED / VERIFIED, decision R4 = BREAK_LIFECYCLE_CONTINUATION_OWNERSHIP. I27 OPEN 0.
+
+R4 frozen semantic:
+1. An unresolved BreakSnapshot is one paired Break lifecycle of a physical Core, not per-Side state.
+2. Split BS ownership: the continuation child only.
+3. Fresh child: unresolved BS transfer NONE.
+4. The continuation keeps the BS pair with a Support-only, Resistance-only or two-sided winner set.
+5. The child Side EffectiveRange x BS range intersection is not used for BS ownership.
+6. The current range after the Split never rewrites the BS range, Roots, breakSeq, breakTime or any snapshot payload.
+7. BS.oldSide is the authority: oldSide Broken, opposite FlipWait.
+8. The old Break lifecycle is never copied to a fresh child.
+9. One parent unresolved Break is never duplicated to several children.
+10. The continuation child is the only unresolved BS holder.
+Source pair invariant: a Split source's persistent BS pair is both invalid, or both valid with an identical pair payload
+(coreId, generationId, oldSide, rangeBottom, rangeTop, breakSeq, breakTime, wasGapBreak, movedAway, retestSeen, Root list =
+every pair-authoritative BS field of the current store); otherwise F0 false, persistent mutation 0, Event 0.
+I27_B16_1_SUPERSEDES_I27_15_2_SPLIT_BS_OWNERSHIP: only the Split part of I27-15 #2 (distribution by child Side range
+intersection) is superseded; the Merge BS selection rule and every other B08 semantic are unchanged.
+B08 F2: the old fixture verified that superseded Split rule ("child range misses the BS -> F0"); only its expectation was
+updated to R4 (the continuation keeps the pair, no F0). This is the B16 supersession, not a change of B08 as a whole.
+
+Evidence: R4-0 .. R4-10 and R4-X_FIXED PASS on /34; before the fix R4-1 / R4-2 / R4-3 / R4-4 / R4-9 / R4-10 failed (detection
+power confirmed). Mutations 3 / 3 detected (MUT-BS-SIDE, MUT-BS-FRESH, MUT-BS-PAIRCHECK). Regression B08 / B09 / B10 / B11 /
+B12 / B13 / B14 / B15 PASS; R3-B1 contract PASS; static PASS; random 0; 5k / 50k NOT RUN.
+B16 is not redesigned; later Windows / Batches take R4 as a frozen input. Next: B17 Stage C / D / J Production.
