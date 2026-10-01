@@ -2831,3 +2831,36 @@ from an independent R4 Reference), current Production W09State /33:
 | R4-8 Reclaim | PASS (one Event, both copies cleared) | - |
 | R4-X current-rule consequence (asymmetric result, next bars) | confirms: every later bar F0, mutation 0 | - |
 The fixture detects the defect (R4-1 / R4-2 FAIL on /33). Production fix not started (STOP as instructed).
+
+### B16 R4 Production repair (W09State /34, Main pin) - B16_R4_LOCAL_GATE PASS
+
+START GATE: 5c89568, local = remote, 0 / 0, clean; W08Core /19, W08Touch /7, W08Runtime /21, W09State /33; canonical files,
+ledger; B15 FROZEN; I27-B16-1 RESOLVED; I27 OPEN 0. TOKEN START REVIEW: Main PASS, exact UNKNOWN, no class; small predicate /
+transfer change, one small helper, no UDT / tuple / forwarding / Main logic, Probe NO.
+
+Change (W09State /34 only; W08 / Merge BS / Touch history / Fresh / TSS / B10 Flip / B13 / B14 / noArm / transition / lastFlipConfirmSeq unchanged):
+- bsTransferPlan, Split rows: take = (class == TX_SPLIT_CONTINUATION) instead of the per-Side winner range x BS range
+  intersection; the continuation child (W08 ownership class from phaseArmedTransferPreflight) receives the source BS row on
+  both Sides (whole row, Roots, wasGapBreak, movedAway, retestSeen unchanged); TX_SPLIT_FRESH rows get kind 0 (no BS);
+  flipAttemptCount follows the taken row (continuation only, existing writer). The existing check "a split source BS must
+  reach a child" now means its continuation child (no continuation -> fail-closed, never dropped).
+- bsPairOkRaw (new private helper): the persistent source BS of each Split source Core must be both invalid or both valid
+  with an identical row (coreId, generationId, oldSide, range bottom / top ticks, breakSeq, breakTime, wasGapBreak,
+  movedAway, retestSeen, Root list in order); else the plan returns false (pre-commit F0, mutation 0, Event 0).
+- Main: W09State pin /33 -> /34 (W08Core /19, W08Touch /7, W08Runtime /21 unchanged).
+Gates (scratchpad): `b16_r4.py` 13/13 on /34: R4-0 control, R4-1 / R4-2 one-sided continuation keeps the pair (fresh none,
+no F0), R4-3 continuation missing the BS keeps it, R4-4 fresh children meeting it get none, R4-5 movedAway synchronized, R4-6
+Attempt, R4-7 Confirm (one Event, pair cleared, no fresh duplicate), R4-8 Reclaim, R4-9 GapBreak BS, R4-10 inconsistent pair
+-> plan false, mutation 0; R4-X (pre-fix consequence evidence) and R4-X_FIXED (R4-1 Split then Attempt and Confirm bars
+commit, no F0). Mutations: MUT-BS-SIDE (per-Side intersection restored) -> R4-1 / 2 / 3 / 4 / 9 / X_FIXED FAIL;
+MUT-BS-FRESH (fresh copy allowed) -> R4-0 / 1 / 2 / 3 / 4 / 9 FAIL; MUT-BS-PAIRCHECK (check removed) -> R4-10 FAIL: 3 / 3
+detected.
+Regression: B08 L5 / L6 / L7 / F1 / M1 / M2 PASS and F2 updated to R4 (old expectation "continuation range misses the BS ->
+F0" = the superseded I27-15 #2 Split part; now the continuation keeps the pair, no F0); B09 G9 / G10 / G11 / R1; B10 F4 / F5 /
+F10 / F12 / F13; B11 R1 / R2 / R8 / R11 / R12 / R14 / R15; B12 I14 / I17 / I18 / I30; B13 P1-P12; B14 D1-D18 / D18b, D19 A-D /
+D2 / G, G1-G5; B15 M1-M13: PASS. R3-B1 contract PASS. Static: imports 0, bsPairOkRaw defined before bsTransferPlan, no
+shadowing. random 0, 5k / 50k 0.
+TOKEN END REVIEW: Before Main PASS; After TradingView not run; exact UNKNOWN; source delta W09State +~28 / -7 lines and one pin;
+no high-cost structure; Probe none; no class.
+B16_R4_LOCAL_GATE = PASS. I27-B16-1 = RESOLVED / IMPLEMENTED_LOCAL. B16 not COMPLETE: waiting for W09State /34 publish and the
+Production Main compile.
