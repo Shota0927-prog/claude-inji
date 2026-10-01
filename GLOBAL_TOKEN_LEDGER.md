@@ -2485,3 +2485,35 @@ random 0, > 5 min 0.
 Diff: W09State +2 private helpers (~25 lines), Stage J +6 params and ~20 lines; W08Runtime 1 guard row -> reset-only (smaller);
 Main 1 call (+6 args) and 2 pins. No new UDT / import / export / tuple / mass forwarding; no semantic cut. Exact tokens UNKNOWN
 (TradingView only). TV: W08Runtime /21 publish, W09State /32 publish, Production Main compile; CE10216 / CE10117 -> STOP.
+
+### B14 Final Gate: D19, Default Guard, W08 conformance (Production unchanged since 89a52ce)
+
+User ACCEPT: W08Runtime /21 coreDormantFlags reset-only (formal: W09 Stage J is the writer; reset / alloc / slot reuse write
+false; never used by survivor / continuation / identity / pending predicates; no Side Phase from it), same-bar transition
+Sides not entering Dormant. I27 OPEN 0.
+
+D19 (scratch `b14_d19.py`: bar-start ActiveTouch Resistance of Core 10 Resets on the bar -> component READY -> same-bar
+topology; close 60, holder range 100..110, d 40 > dormantDistance 20):
+| Case | A holder not Dormant on the bar | B next bar Dormant | C nothing on freed slot | D other Sides normal | E IDs / survivor / continuation | F no F0 |
+|---|---|---|---|---|---|---|
+| Merge survivor (Core 10 survives) | PASS (slot 1 Armed) | PASS | PASS | PASS | PASS | PASS |
+| Merge absorbed (Core 10 into Core 11) | FAIL: survivor Resistance slot 3 Dormant on the transition bar | PASS | PASS | PASS | PASS | PASS |
+| Split continuation | PASS | PASS | PASS | PASS | PASS | PASS |
+G (W08 F0 variant): persistent mutation 0, Event 0. D1-D18 / D18b: 17/17 (harness nextbar now also clears the W08 stub X
+scratch; Production unchanged).
+Cause: stageJTransitionRaw keys the transition by the pre-topology Side slot (ei / fli rows); when the transitioned Side's
+state flows into a different post-topology slot (Merge absorbed -> survivor, and by the same reading a Split fresh child,
+not built in the stub), the final holder is not recognized. Per the gate rule: D19 FAIL -> STOP, no fix applied.
+
+Default Guard (scratch `b14_guard.py`, coreDeferredStateRaw interpreted from the /21 and /20 sources): G1 absorbed Core with
+coreDormantFlags true and every other field default -> /21 PASS (/20 rejected); G2 one remaining guard field non-default
+(sideFvgRootCounts / corePruneRevisions) -> FAIL (F0); G3 F0 -> persistent mutation 0 (preflightPass is read-only; harness F0
+variant mutation 0 / Event 0); G4 reset write -> coreDormantFlags false (alloc pushes false, unchanged); G5 Merge survivor flag
+re-derived by Stage J from its final Sides (absorbed true not carried: false with one live Side, true with both Dormant).
+
+W08 B16 / B17 conformance: not re-run. The two TradingView harnesses pin W08Runtime /13 (B17) and /4 (B16) with W08Core /18 /
+/16 and call W08Runtime.planPass / runShadow, removed in W08Runtime /20 (TC-C); running them on /21 needs a harness port (API +
+three pins). Static: /20 -> /21 differs by exactly the coreDormantFlags guard row (git diff: 3 + / 1 -), and neither harness nor
+W08Core / W08Touch writes coreDormantFlags (0 references), so every harness guard outcome is identical by construction.
+TradingView (W08Runtime /21, W09State /32 publish, Main compile): not performed (STOP on D19).
+B14: NOT COMPLETE.
