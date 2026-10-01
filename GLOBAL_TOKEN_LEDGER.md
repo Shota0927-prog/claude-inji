@@ -3489,3 +3489,31 @@ FIRST_PIPELINE_FAILURE BS_INDEX, X2 FAIL; M45 -> X1 FAIL; M48 -> X1 / X3 FAIL. S
 UNDEFINED_FIELD 0, UNDEFINED_FUNCTION 0, NON_EXPORTED_CALL 0, ARITY_MISMATCH 0, SHADOWING_ERROR 0; UDT max 69 (HM 25). Harness A
 unchanged (44e41f6 evidence: Appendix 24 / 24, I22 PASS). Production diff 0. I27 OPEN 0.
 Status: B19 = LOCAL PASS / TV DIAG RECHECK WAITING.
+
+## W09 B19 CLOSEOUT: W09_B19_CONFORMANCE COMPLETE / FROZEN
+
+START: claude/w09-b07-redesign-v2, local = remote = 2ddf0f7, 0 / 0, clean. CLOSEOUT changes this ledger only (Production change 0,
+harness semantic change 0, version change 0).
+TradingView Final Gate (user):
+Harness A ZoneEngineV2_W09ConformanceHarness_B19.pine (= 44e41f6): compile PASS; APPENDIX_B_W09 46-69 PASSED 24 / TOTAL 24 /
+FAILED 0; I22_STATE_INDEX_PASS PASS; STATE_INDEX_MISSING 0, EXTRA 0, ORDER_DRIFT 0, RESULT_DRIFT 0; RUNTIME_ERROR_COUNT 0.
+Harness B ZoneEngineV2_W09ConformanceHarness_B19_DriftDiag.pine (= 2ddf0f7): X1_PASS / X2_PASS / X3_PASS PASS; EVENT_DRIFT_TOTAL
+0; STATE_DRIFT_TOTAL 0; RUNTIME_ERROR_COUNT 0; FIXTURE_PRECONDITION_FAIL 0; BARS_RUN 14; GOLDEN 14 / 14; X1 / X2 / X3 execution
+1 / 1 / 1; COMPARISON_COUNT 14; FIRST_DRIFT NONE; every field drift 0. X2 Support / Resistance: old Side Broken, opposite FlipWait,
+BS pair valid, BS.oldSide = old Side, Broken set 1, FlipWait set 1, old Side in Broken set and BS index, BS target 1 (old Side).
+Recorded: APPENDIX_B_W09_46_69_TV 24 / 24 PASS; I22_W09_STATE_INDEX_TV PASS; W09_B19_STATE_DRIFT 0; W09_B19_EVENT_DRIFT 0;
+W09_B19_RUNTIME_ERROR 0.
+X2 root cause final: B19_X2_TV_DRIFT_ROOT_CAUSE = HARNESS_FIXTURE_RESISTANCE_PHASE_ORIENTATION; Production defect NO (the old
+Resistance fixture world had old Side FlipWait / opposite Broken, the old Side outside the Broken set / BS index, bsTargetSlots 0,
+so the Reclaim predicate was never reached; fixed by the oldSide-relative, loop-free X2 fixture with the mirror precondition).
+Local evidence: Appendix 46-69 24 / 24, per-bar state drift 0, Event drift 0, I22 W09 state index PASS; mutations B19 M31-M47
+17 / 17 detected, B18 representative 9 / 9 detected, W09_MUTATION_UNDETECTED 0; regression B09-B18 + F2 PASS.
+Scope: Appendix B closed in B19 = 46-69 only (70-73 Generation -> W10; 75 full reproducibility -> W11 / W12); Appendix 75 / 75
+not claimed. I22 closed in B19 = I22.1-7 (State price index vs all Core / Side scan, I22_W09_STATE_INDEX_REFERENCE PASS); I22
+10 / 10 not claimed (remaining items in later windows).
+Production final: W07Fvg /12, W08Core /19, W08Touch /7, W08Runtime /21, W09State /35; Main compile PASS; B19 Production semantic
+diff 0 (harness changes only).
+OPEN carries (not PASS): W10_CARRY_I17_REUSABLE_SCRATCH_3PATHS; W10_CARRY_W07_INVERSE_INDEX_FREE_RETIRE_CLEANUP; Appendix
+70-73 -> W10; Appendix 75 -> W11 / W12; 365-day benchmark -> W11; Visual final conformance -> W11.
+TOKEN: Production delta 0; exact compiled tokens UNKNOWN (no class). I27 OPEN 0.
+Status: W09_B19_CONFORMANCE COMPLETE / FROZEN. Next: B20 Final / HANDOFF_W09 (not started).
