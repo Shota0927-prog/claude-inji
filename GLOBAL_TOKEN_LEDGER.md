@@ -2950,3 +2950,50 @@ B17 Phase B proposal: verification only (no Production change expected): integra
 F0-1, Duplicate, new Root / Strong on the existing scratch harness (txn8 mirrors w08ProductionRaw); most cases already exist
 in B07-B16 fixtures and are collected, the rest (C2 same-bar first Armed, C3 same-bar new Root, Duplicate Feed) added.
 I27: none (no reachable result-changing undefined wiring). I27 OPEN 0.
+
+## W09 B17 Phase B: canonical stage order (I8) refactor - B17_CANONICAL_STAGE_ORDER_LOCAL PASS
+
+START GATE: claude/w09-b07-redesign-v2 at 1784b6b, clean; pins W08Core /19, W08Touch /7, W08Runtime /21, W09State /34
+(unchanged). Files changed: ZoneEngineV2_Rebuild.pine (Main) only; W09State / W08 Workers unchanged -> no version bump, no
+/35. TOKEN START REVIEW: Main exact UNKNOWN (no class); planned: +2 thin Main functions (w09PlanViewRaw: the existing
+TouchStartPlanView constructor moved, w09StageCDPlanRaw: the 5 existing planner calls moved), 0 new UDT / tuple / Worker
+export, one 16-argument wrapper callsite added (P0 / P1) and 12 reference arguments forwarded once to w08ProductionRaw; every
+W09State planner keeps exactly one callsite. TOKEN END REVIEW: source +48 / -26 lines (+2363 bytes); compiled exact UNKNOWN
+(TradingView compile = the TV gate).
+
+Physical order now (updateConfirmed5m): A validation / duplicate reject -> B eventLogicalCount 0 -> journal reset -> Stage D
+FVG structural facts (w03StageDFvgFactsRaw, E1 rows) -> Stage C / D W09 plan (w09PlanViewRaw, w09StageCDPlanRaw d4 = true:
+D1 touchStartPlanPreflight / Build, D2 episodePlan, D4 reclaimResolve on the bar-start Root states, D3 flipPlan; pass-local
+scratch only) -> E (W03EMsa, W03ETimeFvg, W07 stageEFreshInversePrepare) -> F (w03StageFApplyAndCommitRaw, W06 seed, carry
+inject) -> G (W06Comp.recomputeAndMerge) -> w08ProductionRaw: H / I (W08 plan with the Episode overlay; B12 P0 / P1 rebuild
+through the same wrapper with d4 = false, tsx from the Stage C / D D1 candidate set, rcs kept from Stage D) -> preflights
+(W09 + W08 F0) -> release / commit / producers / transfers / applies / Events -> Stage J (one callsite, last writer) -> K / L.
+P0 / P1 rebuild inputs: the W08 / W09 persistent state read by the planners (core registry Side / TSS / BS / ring / Armed
+index / phase sets) has no writer in Stage E / F / G (grep: W03 / W07 / W05 Workers 0 references, W06 receives sidePhases /
+core arrays read-only, Main Stage E / F helpers 0 writes); journal E1 rows are appended only by w03StageDFvgFactsRaw. So
+the rebuild is a function of the Stage C state + tsx, never of the new topology.
+
+Finding B17-F1 (correction of the Phase A note "D facts order-independent"): reclaimResolve's keep test (another BS Root
+live and ROOT_ACTIVE) read the post-Stage-F Root states in the pre-B17 order. Case: BS Roots {r1 invalidated by this bar's
+Stage D FVG fact, r2 ACTIVE at bar start and retired / made non-active by Stage E2-E4 of the same bar}: pre-B17 suppressed the
+Reclaim (r2 gone), canonical I8 (D4 in Stage D, before E4) keeps it -> EV_RECLAIM. Uniquely decided by I8 + B13 (D4 in Stage
+D), so no I27; the B17 order implements it (fixture O8). Every other fixture: before / after identical.
+
+Finding B17-F2 (reported, not changed): the Stage F Root commit (W03 / W07 frozen) and lastBaseSeq / lastBaseCloseTime are
+committed when stageFOk even if the later W08 / W09 F0 fails; a W08 F0 does not roll the Root commit back (Root changes of
+the bar stay, the bar is not re-processed, W08 / W09 state and Events of the bar stay 0). Making Root + W08 / W09 one
+transaction would be a separate design change (W03 / W07 / W08 B15 contracts), out of B17 scope.
+
+Inverse: InverseConfirm facts are produced by W07 in Stage E / F (frozen W07) and consumed by W09 after Stage G (P0 / P1,
+inverseConfirmPreflight / Project); unchanged.
+
+Evidence (scratchpad harness, Main w09StageCDPlanRaw interpreted from the source, Stage E / F stub between C / D and W08):
+O1 / O2 / O13 static order PASS; O3 Stage C / D no persistent mutation PASS; O4-O12, O14 PASS (B17_FAIL[NEW] = 0 of 14).
+Order mutants 3 / 3 detected: MUT-ORDER-LATE-D1 (O4 / O5 / O6 / O8), MUT-ORDER-NEW-RANGE (O5 / O6), MUT-ORDER-NEW-GRADE (O7);
+source mutant (Stage C / D call moved after Stage G) caught by O1. Before / after (B17OLD mirror vs Production order): diff
+only O8 (B17-F1). Regression on the Production order, each suite identical to the pre-B17 order: B08 16, B09 16, B10 14, B11
+14, B12 25 (P0 / P1), B13 13, B14 17 + D19, B15 16, B16 R4 13 - all PASS; B14 W08Runtime guard PASS. Legacy B06 / B07-era
+harnesses (b0 / c2 / c2b order, b7_det, r3b2_det, b3b_stagej) already did not run on the pre-B17 Main (superseded), not used.
+random 0; 5k / 50k / 200k NOT RUN.
+Status: B17_CANONICAL_STAGE_ORDER_LOCAL PASS. B17 not COMPLETE: LOCAL PASS / TV GATE WAITING (Main compile / publish by the
+user). Next: STOP (no B18).
