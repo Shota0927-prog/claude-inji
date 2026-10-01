@@ -441,6 +441,59 @@ export d1TargetSlots(array<int> bottomOrder, array<int> bottomPositions, array<i
         array.clear(out)
     ok
 
+// W09 B18 (/35, I11 #11 / I16): Flip / Reclaim targets of the current bar from the Broken BreakSnapshot price indexes (keys =
+// the fixed BS range ticks, never the EffectiveRange). A Broken Side sb (Support when sb % 2 == 0) is a target when any
+// flipPlan fact can hold on this bar: movedAway (Support bottomTick >= closeTick + resetTick, Resistance topTick <=
+// closeTick - resetTick), contact (bottomTick <= highTick and topTick >= lowTick), full exit (Support bottomTick >= highTick
+// + 1, Resistance topTick <= lowTick - 1) or Reclaim (Support topTick <= closeTick - breakBufferTick, Resistance bottomTick
+// >= closeTick + breakBufferTick): a superset of every row flipPlan can write (its predicates are unchanged). out = the
+// unique Broken Side slots in index order (flipPlan / reclaimResolve canonicalize); every hit must be in both indexes.
+// Returns true; false (out empty) on an invalid input / index.
+export bsTargetSlots(array<int> bottomOrder, array<int> bottomPositions, array<int> topOrder, array<int> topPositions, array<float> rangeBottoms, array<float> rangeTops, float mintick, float baseHigh, float baseLow, float baseClose, float touchResetDistance, float breakBuffer, array<int> out) =>
+    array.clear(out)
+    bool ok   = mintick > 0 and not na(baseHigh) and not na(baseLow) and not na(baseClose) and not na(touchResetDistance) and not na(breakBuffer)
+    int  hT   = ok ? int(math.round(baseHigh / mintick)) : int(na)
+    int  lT   = ok ? int(math.round(baseLow / mintick)) : int(na)
+    int  cT   = ok ? int(math.round(baseClose / mintick)) : int(na)
+    int  rdT  = ok ? int(math.round(touchResetDistance / mintick)) : int(na)
+    int  bbT  = ok ? int(math.round(breakBuffer / mintick)) : int(na)
+    ok := ok and lT <= hT and rdT >= 0 and bbT >= 0
+    array<int> byB = array.new_int(0)
+    array<int> byT = array.new_int(0)
+    array<int> tb  = array.new_int(0)
+    array<int> tt  = array.new_int(0)
+    if ok
+        ok := priceOrderRange(bottomOrder, bottomPositions, rangeBottoms, mintick, math.min(math.min(cT + rdT, hT + 1), cT + bbT), int(na), byB) >= 0
+    if ok
+        ok := priceOrderRange(topOrder, topPositions, rangeTops, mintick, int(na), math.max(math.max(cT - rdT, lT - 1), cT - bbT), byT) >= 0
+    if ok
+        ok := priceOrderRange(bottomOrder, bottomPositions, rangeBottoms, mintick, int(na), hT, tb) >= 0
+    if ok
+        ok := priceOrderRange(topOrder, topPositions, rangeTops, mintick, lT, int(na), tt) >= 0
+    map<int, bool> seen = map.new<int, bool>()
+    map<int, bool> inTt = map.new<int, bool>()
+    int i = 0
+    while ok and i < array.size(tt)
+        map.put(inTt, array.get(tt, i), true)
+        i += 1
+    i := 0
+    while ok and i < array.size(byB) + array.size(byT) + array.size(tb)
+        int  q  = i < array.size(byB) ? 0 : i < array.size(byB) + array.size(byT) ? 1 : 2
+        int  s  = q == 0 ? array.get(byB, i) : q == 1 ? array.get(byT, i - array.size(byB)) : array.get(tb, i - array.size(byB) - array.size(byT))
+        ok := indexMemberRaw(bottomOrder, bottomPositions, s) and indexMemberRaw(topOrder, topPositions, s) and not na(array.get(rangeBottoms, s)) and not na(array.get(rangeTops, s))
+        if ok
+            int  bT  = int(math.round(array.get(rangeBottoms, s) / mintick))
+            int  tT  = int(math.round(array.get(rangeTops, s) / mintick))
+            bool sup = s % 2 == 0
+            bool hit = q == 2 ? map.contains(inTt, s) : q == 0 ? (sup ? bT >= cT + rdT or bT >= hT + 1 : bT >= cT + bbT) : (sup ? tT <= cT - bbT : tT <= cT - rdT or tT <= lT - 1)
+            if hit and not map.contains(seen, s)
+                map.put(seen, s, true)
+                array.push(out, s)
+        i += 1
+    if not ok
+        array.clear(out)
+    ok
+
 // B06-A P1 (spec 13.1, D12): whether the current bar High / Low touches one Side's range, as a pure predicate (the same
 // geometry as touchTargetSlots, per Side). Ticks = round(price / mintick). One-line Zone (bottomTick == topTick):
 // lowTick - toleranceTick <= lineTick <= highTick + toleranceTick; width Zone: bottomTick <= highTick and topTick >= lowTick
@@ -987,6 +1040,15 @@ export type PhaseArmedTransferView
     // W09 B10 (/27): the Flip state per Side (transferred with the BS)
     array<int>   flipAttemptCounts
     array<int>   lastFlipConfirmSeqs
+    // W09 B18 (/35, I11 #12 / I16): the Dormant recovery price-order indexes (Dormant Sides, keys = the EffectiveRange; the reverse
+    // positions are dormantBottom / TopPositions above) and the Waiting price-order indexes (Waiting Sides, keys = the
+    // EffectiveRange, Main-owned reverse positions grown on demand)
+    array<int>   dormantBottomOrderSideSlots
+    array<int>   dormantTopOrderSideSlots
+    array<int>   waitingBottomOrderSideSlots
+    array<int>   waitingBottomPositions
+    array<int>   waitingTopOrderSideSlots
+    array<int>   waitingTopPositions
 // W09 B08-A (/25): Broken (broken = true) or FlipWait index membership of Side slot s, keys = its BreakSnapshot range
 // (bsRangeBottoms / Tops, ticked by priceOrderUpdate only; no EffectiveRange, no buffer / reset offset). add / remove.
 bsIndexRaw(PhaseArmedTransferView v, int s, bool broken, bool add, float mintick) =>
@@ -1193,14 +1255,49 @@ export phaseArmedIndexRelease(PhaseArmedTransferView view, float mintick) =>
                 if not bsIndexRaw(view, s, ph == PH_BROKEN, false, mintick)
                     runtime.error("W09 B08-A: Broken / FlipWait index release broke its preflight")
                 released += 1
+            // W09 B18 (/35): a Waiting / Dormant Side of every applied old Core or freed Core leaves its price index (its
+            // EffectiveRange may change at the SideView producer; Stage J re-inserts the final Waiting / Dormant destinations)
+            else if ph == PH_WAITING or ph == PH_DORMANT
+                if not wdIndexRaw(view, s, ph == PH_DORMANT, false, mintick)
+                    runtime.error("W09 B18: Waiting / Dormant index release broke its preflight")
             k += 1
         i += 1
     released
 // W09 B07-R2 (/21, TOKEN_REFACTOR_ONLY): one Phase change of Side slot s through the PhaseSet (detach, write, add), the
 // former four inline copies (Stage J x2, TouchStart apply, Episode apply). Its callers treat false as a broken proof
 // (runtime.error).
+// W09 B18 (/35): remove Side slot s from one price-order index if it is a member (positions only, no key read): the later
+// entries shift left keeping their positions; s gets SLOT_INVALID. Returns true (a non-member is left as is).
+orderDropRaw(array<int> order, array<int> positions, int s) =>
+    if indexMemberRaw(order, positions, s)
+        int n = array.size(order)
+        int i = array.get(positions, s)
+        while i < n - 1
+            int moved = array.get(order, i + 1)
+            array.set(order, i, moved)
+            array.set(positions, moved, i)
+            i += 1
+        array.pop(order)
+        array.set(positions, s, SLOT_INVALID)
+    true
+// W09 B18 (/35): Waiting (dormant = false) or Dormant recovery index membership of Side slot s, keys = its EffectiveRange
+// (sideEffectiveBottoms / Tops, ticked by priceOrderUpdate). add: insert into both orders; else drop from both. The Waiting
+// reverse positions are Main-owned and grown to the slot here (the Dormant ones are sized by the W08 Core allocation).
+wdIndexRaw(PhaseArmedTransferView v, int s, bool dormant, bool add, float mintick) =>
+    array<int> bo = dormant ? v.dormantBottomOrderSideSlots : v.waitingBottomOrderSideSlots
+    array<int> bp = dormant ? v.dormantBottomPositions : v.waitingBottomPositions
+    array<int> to = dormant ? v.dormantTopOrderSideSlots : v.waitingTopOrderSideSlots
+    array<int> tp = dormant ? v.dormantTopPositions : v.waitingTopPositions
+    while not dormant and array.size(bp) <= s
+        array.push(bp, SLOT_INVALID)
+    while not dormant and array.size(tp) <= s
+        array.push(tp, SLOT_INVALID)
+    add ? priceOrderUpdate(bo, bp, v.sideEffectiveBottoms, mintick, s, true) and priceOrderUpdate(to, tp, v.sideEffectiveTops, mintick, s, true) : orderDropRaw(bo, bp, s) and orderDropRaw(to, tp, s)
 phaseMoveRaw(PhaseArmedTransferView v, int s, int ph) =>
-    bool ok = phaseDetachRaw(v.sidePhases, v.sidePhaseSetPositions, v.phaseWaitingSideSlots, v.phaseArmedSideSlots, v.phaseActiveTouchSideSlots, v.phaseBrokenSideSlots, v.phaseFlipWaitSideSlots, v.phaseDormantSideSlots, s)
+    // W09 B18 (/35): a Side leaving Waiting / Dormant leaves that price index first (entry: Stage J inserts on the final range)
+    int  ph0 = array.get(v.sidePhases, s)
+    bool ok  = ph0 == ph or (ph0 != PH_WAITING and ph0 != PH_DORMANT) or wdIndexRaw(v, s, ph0 == PH_DORMANT, false, 1.0)
+    ok := ok and phaseDetachRaw(v.sidePhases, v.sidePhaseSetPositions, v.phaseWaitingSideSlots, v.phaseArmedSideSlots, v.phaseActiveTouchSideSlots, v.phaseBrokenSideSlots, v.phaseFlipWaitSideSlots, v.phaseDormantSideSlots, s)
     array.set(v.sidePhases, s, ph)
     ok and phaseAddRaw(v.sidePhases, v.sidePhaseSetPositions, v.phaseWaitingSideSlots, v.phaseArmedSideSlots, v.phaseActiveTouchSideSlots, v.phaseBrokenSideSlots, v.phaseFlipWaitSideSlots, v.phaseDormantSideSlots, s)
 // the old Core slots whose Core flows into applied Candidate p: Merge survivor / absorbed, else the Split source, else the
@@ -1222,6 +1319,103 @@ invSourcesRaw(PhaseArmedTransferView v, int p, array<int> out) =>
     else if p < array.size(v.continuationOldCoreSlots) and array.get(v.continuationOldCoreSlots, p) >= 0
         array.push(out, array.get(v.continuationOldCoreSlots, p))
     true
+// W09 B18 (/35, I16): the price targets of Stage J on the confirmed close (ticks; superset of every Side whose Stage J
+// predicate can change): Waiting index - Support Reset topTick <= closeTick - resetTick, Resistance Reset bottomTick >= closeTick
+// + resetTick, Dormant entry bottomTick >= closeTick + dormantTick + 1 or topTick <= closeTick - dormantTick - 1 (d >
+// dormantDistance, strict); Armed index (keys LastArmedRange = the EffectiveRange of an indexed Armed Side) - Support distance
+// lost topTick >= closeTick - resetTick + 1, Resistance bottomTick <= closeTick + resetTick - 1, Dormant entry as above;
+// Dormant recovery index - bottomTick <= closeTick + dormantTick and topTick >= closeTick - dormantTick (d <= dormantDistance,
+// inclusive). Appended to out (duplicates possible); false on an invalid input / index.
+stageJPriceTargetsRaw(PhaseArmedTransferView v, float baseClose, float mintick, float touchResetDistance, float dormantDistance, array<int> out) =>
+    bool ok  = mintick > 0 and not na(baseClose) and not na(touchResetDistance) and not na(dormantDistance)
+    int  cT  = ok ? int(math.round(baseClose / mintick)) : int(na)
+    int  rdT = ok ? int(math.round(touchResetDistance / mintick)) : int(na)
+    int  ddT = ok ? int(math.round(dormantDistance / mintick)) : int(na)
+    ok := ok and rdT >= 0 and ddT >= 0
+    int g = 0
+    while ok and g < 6
+        // g: 0 Waiting bottom, 1 Waiting top, 2 Armed bottom lost, 3 Armed bottom entry, 4 Armed top lost, 5 Armed top entry
+        bool       bot = g == 0 or g == 2 or g == 3
+        array<int> o   = g < 2 ? (bot ? v.waitingBottomOrderSideSlots : v.waitingTopOrderSideSlots) : (bot ? v.armedBottomOrderSideSlots : v.armedTopOrderSideSlots)
+        array<int> ps  = g < 2 ? (bot ? v.waitingBottomPositions : v.waitingTopPositions) : (bot ? v.armedBottomPositions : v.armedTopPositions)
+        array<float> ky = g < 2 ? (bot ? v.sideEffectiveBottoms : v.sideEffectiveTops) : (bot ? v.sideLastArmedRangeBottoms : v.sideLastArmedRangeTops)
+        int lo = g == 0 ? math.min(cT + rdT, cT + ddT + 1) : g == 2 ? int(na) : g == 3 ? cT + ddT + 1 : g == 4 ? cT - rdT + 1 : g == 1 or g == 5 ? int(na) : int(na)
+        int hi = g == 1 ? math.max(cT - rdT, cT - ddT - 1) : g == 2 ? cT + rdT - 1 : g == 5 ? cT - ddT - 1 : int(na)
+        array<int> r = array.new_int(0)
+        ok := priceOrderRange(o, ps, ky, mintick, lo, hi, r) >= 0
+        int i = 0
+        while ok and i < array.size(r)
+            int  s  = array.get(r, i)
+            int  t  = int(math.round(array.get(ky, s) / mintick))
+            bool hit = g == 0 ? (s % 2 == 1 and t >= cT + rdT) or t >= cT + ddT + 1 : g == 1 ? (s % 2 == 0 and t <= cT - rdT) or t <= cT - ddT - 1 : g == 2 ? s % 2 == 1 : g == 4 ? s % 2 == 0 : true
+            if hit
+                array.push(out, s)
+            i += 1
+        g += 1
+    array<int> rb = array.new_int(0)
+    array<int> rt = array.new_int(0)
+    if ok
+        ok := priceOrderRange(v.dormantBottomOrderSideSlots, v.dormantBottomPositions, v.sideEffectiveBottoms, mintick, int(na), cT + ddT, rb) >= 0 and priceOrderRange(v.dormantTopOrderSideSlots, v.dormantTopPositions, v.sideEffectiveTops, mintick, cT - ddT, int(na), rt) >= 0
+    int j = 0
+    while ok and j < array.size(rb)
+        int s = array.get(rb, j)
+        if array.includes(rt, s)
+            array.push(out, s)
+        j += 1
+    ok
+// W09 B18 (/35, I16): the Stage J target Sides, unique, canonical (coreId ASC, Support, Resistance; a live coreId is unique):
+// A every Side of an applied destination (classes != TX_NONE: fresh / continuation / Merge / Split), B this bar's transition
+// Sides (Episode rows ei, Flip rows fli (both Sides), noArm, TouchStart plan Sides, GapBreak rows gbi), C-E the price targets
+// (stageJPriceTargetsRaw). Dead Core slots are dropped. False on an invalid input / index.
+stageJTargetsRaw(PhaseArmedTransferView v, array<int> classes, array<int> ei, array<int> fli, array<int> noArm, array<int> tsSides, array<int> gbi, float baseClose, float mintick, float touchResetDistance, float dormantDistance, array<int> out) =>
+    array.clear(out)
+    array<int> raw = array.new_int(0)
+    int p = 0
+    while p < array.size(classes)
+        if array.get(classes, p) % TX_READY != TX_NONE
+            int d = array.get(v.materializedCoreSlots, p)
+            array.push(raw, 2 * d)
+            array.push(raw, 2 * d + 1)
+        p += 1
+    int i = 0
+    while i < array.size(ei)
+        array.push(raw, array.get(ei, i))
+        i += 10
+    i := 0
+    while i < array.size(fli)
+        array.push(raw, array.get(fli, i))
+        array.push(raw, array.get(fli, i + 1))
+        i += 7
+    i := 0
+    while i < array.size(gbi)
+        array.push(raw, array.get(gbi, i))
+        i += 7
+    array.concat(raw, noArm)
+    array.concat(raw, tsSides)
+    bool ok = stageJPriceTargetsRaw(v, baseClose, mintick, touchResetDistance, dormantDistance, raw)
+    int nc = array.size(v.coreIds)
+    array<int> keys = array.new_int(0)
+    array<int> sl   = array.new_int(0)
+    i := 0
+    while ok and i < array.size(raw)
+        int s = array.get(raw, i)
+        int c = s >= 0 ? int(s / 2) : SLOT_INVALID
+        ok := c >= 0 and c < nc
+        if ok and array.get(v.coreSlotLiveFlags, c)
+            array.push(keys, array.get(v.coreIds, c) * 2 + s % 2)
+            array.push(sl, s)
+        i += 1
+    if ok and array.size(keys) > 0
+        array<int> ix = array.sort_indices(keys, order.ascending)
+        int k = 0
+        while k < array.size(ix)
+            int j = array.get(ix, k)
+            if k == 0 or array.get(keys, j) != array.get(keys, array.get(ix, k - 1))
+                array.push(out, array.get(sl, j))
+            k += 1
+    if not ok
+        array.clear(out)
+    ok
 // W09 B06-B2B3-B (/13): Stage J (I8) of one committed confirmed bar, after the current Root and SideView producers.
 // W09 B08-A (/25): a destination Side with a valid (transferred) BreakSnapshot takes Broken (its side = BS oldSide) or
 //   FlipWait instead of the Waiting baseline, Grade Unavailable, Broken / FlipWait index attach on the BS range; step 2
@@ -1237,23 +1431,24 @@ invSourcesRaw(PhaseArmedTransferView v, int p, array<int> out) =>
 //   Phase changes go through the PhaseSet (detach, write, add); Armed <-> member of both Armed indexes (key change:
 //   remove, write, add). A released Side is Armed and outside the indexes only on a 1:1 continuation destination; any
 //   other broken invariant is a runtime.error (no silent repair).
-export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes, float baseClose, int baseSeq, float mintick, float touchResetDistance, int weakFromTouch, bool weakFromTouchOff, int strongUntilTouch, bool strongUnlimited, array<int> noArm, array<int> ei, array<int> fli, float dormantDistance, array<bool> corePendingTopologyFlags, array<bool> corePendingGenerationFlags, array<bool> coreDormantFlags) =>
+export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes, float baseClose, int baseSeq, float mintick, float touchResetDistance, int weakFromTouch, bool weakFromTouchOff, int strongUntilTouch, bool strongUnlimited, array<int> noArm, array<int> ei, array<int> fli, array<int> tsSides, array<int> gbi, float dormantDistance, array<bool> corePendingTopologyFlags, array<bool> corePendingGenerationFlags, array<bool> coreDormantFlags) =>
     int  n  = array.size(view.applyP)
     int  nc = array.size(view.coreIds)
     int  ns = 2 * nc
     bool ok = array.size(classes) == n and array.size(view.materializedCoreSlots) >= n and array.size(view.coreSlotLiveFlags) == nc and array.size(view.sidePhases) == ns and array.size(view.sidePhaseSetPositions) == ns and array.size(view.sideTouchCounts) == ns and array.size(view.sideUpcomingTouchNos) == ns and array.size(view.sideWeakByDepthFlags) == ns and array.size(view.sideWeakByTouchFlags) == ns and array.size(view.sideBaseStrongFlags) == ns and array.size(view.sideHasNonPsychRootFlags) == ns and array.size(view.sideGrades) == ns and array.size(view.sideEligibleFlags) == ns and array.size(view.sideEffectiveBottoms) == ns and array.size(view.sideEffectiveTops) == ns and array.size(view.sideArmedFromSeqs) == ns and array.size(view.sideLastArmedRangeBottoms) == ns and array.size(view.sideLastArmedRangeTops) == ns and array.size(view.armedBottomPositions) == ns and array.size(view.armedTopPositions) == ns
-    array<bool> relCore = array.new_bool(ok ? nc : 0, false)
+    // W09 B18 (/35): pass-local maps keyed by Core / Side slot (no per-bar allocation over every Core)
+    map<int, bool> relCore = map.new<int, bool>()
     // W09 B14 (/33): the same-bar transition fact projected onto the topology destinations (pass-local): a Merge target Side =
     // the OR over its survivor / absorbed source Sides of that parity, a Split continuation child = its source Side; a fresh
     // target / Split fresh child inherits none (0). -1 = no projection (the Side keeps its own slot: the direct fact).
-    array<int>  trx     = array.new_int(ok ? ns : 0, -1)
+    map<int, int>  trx     = map.new<int, int>()
     array<int>  src     = array.new_int(0)
     int p = 0
     while ok and p < n
         int cls = array.get(classes, p) % TX_READY
         int d   = array.get(view.materializedCoreSlots, p)
         if cls == TX_CONTINUATION
-            array.set(relCore, d, true)
+            map.put(relCore, d, true)
         else if cls != TX_NONE
             array.clear(src)
             if cls != TX_FRESH and cls != TX_SPLIT_FRESH
@@ -1265,7 +1460,7 @@ export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes,
                 while not tr and qi < array.size(src)
                     tr := stageJTransitionRaw(ei, fli, 2 * array.get(src, qi) + m)
                     qi += 1
-                array.set(trx, 2 * d + m, tr ? 1 : 0)
+                map.put(trx, 2 * d + m, tr ? 1 : 0)
                 m += 1
             int k = 0
             while ok and k < 2
@@ -1283,10 +1478,14 @@ export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes,
                     ok := bsIndexRaw(view, s, tp == PH_BROKEN, true, mintick)
                 k += 1
         p += 1
-    int c = 0
-    while ok and c < nc
-        int k = 0
-        while ok and k < 2 and array.get(view.coreSlotLiveFlags, c)
+    // W09 B18 (/35, I16): only the Stage J target Sides (no live-Core scan); the per-Side finalize below is unchanged
+    array<int> tq = array.new_int(0)
+    ok := ok and stageJTargetsRaw(view, classes, ei, fli, noArm, tsSides, gbi, baseClose, mintick, touchResetDistance, dormantDistance, tq)
+    int t = 0
+    while ok and t < array.size(tq)
+        int c = int(array.get(tq, t) / 2)
+        int k = array.get(tq, t) % 2
+        if ok
             int s  = 2 * c + k
             int up = array.get(view.sideTouchCounts, s) + 1
             int ph = array.get(view.sidePhases, s)
@@ -1306,11 +1505,11 @@ export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes,
                 if ph == PH_DORMANT and not fd
                     ok := phaseMoveRaw(view, s, PH_WAITING)
                     ph := PH_WAITING
-                bool dz = ph == PH_DORMANT or (fd and not array.get(corePendingTopologyFlags, c) and not array.get(corePendingGenerationFlags, c) and not array.includes(noArm, s) and not (array.get(trx, s) >= 0 ? array.get(trx, s) == 1 : stageJTransitionRaw(ei, fli, s)))
+                bool dz = ph == PH_DORMANT or (fd and not array.get(corePendingTopologyFlags, c) and not array.get(corePendingGenerationFlags, c) and not array.includes(noArm, s) and not (map.contains(trx, s) ? map.get(trx, s) == 1 : stageJTransitionRaw(ei, fli, s)))
                 // W09 B10 (/27): a Side of a FlipConfirm of this bar (noArm) is not armed on this bar
                 bool q  = not dz and array.get(view.sideEligibleFlags, s) and np and eb <= et and armedDistanceMet(k == 0 ? SIDE_SUPPORT : SIDE_RESISTANCE, baseClose, eb, et, touchResetDistance, mintick) and not array.includes(noArm, s)
                 bool mb = indexMemberRaw(view.armedBottomOrderSideSlots, view.armedBottomPositions, s)
-                ok := ok and mb == indexMemberRaw(view.armedTopOrderSideSlots, view.armedTopPositions, s) and (ph == PH_ARMED ? mb or array.get(relCore, c) : not mb)
+                ok := ok and mb == indexMemberRaw(view.armedTopOrderSideSlots, view.armedTopPositions, s) and (ph == PH_ARMED ? mb or map.contains(relCore, c) : not mb)
                 if ok and mb and (not q or array.get(view.sideLastArmedRangeBottoms, s) != eb or array.get(view.sideLastArmedRangeTops, s) != et)
                     ok := priceOrderUpdate(view.armedBottomOrderSideSlots, view.armedBottomPositions, view.sideLastArmedRangeBottoms, mintick, s, false) and priceOrderUpdate(view.armedTopOrderSideSlots, view.armedTopPositions, view.sideLastArmedRangeTops, mintick, s, false)
                     mb := false
@@ -1324,10 +1523,26 @@ export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes,
                 int nph = dz ? PH_DORMANT : q ? PH_ARMED : PH_WAITING
                 if ok and nph != ph
                     ok := phaseMoveRaw(view, s, nph)
-            k += 1
-        // W09 B14 (/32): coreDormantFlags, derived from the final Side Phases (never read back into a Phase): true only when no
-        // PendingTopology / PendingGeneration and each Side is Dormant or a non-participating (not eligible) Waiting Side
-        if ok and array.get(view.coreSlotLiveFlags, c)
+            // W09 B18 (/35): Waiting / Dormant price-index membership on the final Phase and EffectiveRange (a member always
+            // carries its current key: ranges change only on applied Cores, released before commit)
+            int  fph = array.get(view.sidePhases, s)
+            bool rg  = not na(array.get(view.sideEffectiveBottoms, s)) and not na(array.get(view.sideEffectiveTops, s))
+            int  w   = 0
+            while ok and w < 2
+                bool dm = w == 1
+                bool mw = indexMemberRaw(dm ? view.dormantBottomOrderSideSlots : view.waitingBottomOrderSideSlots, dm ? view.dormantBottomPositions : view.waitingBottomPositions, s)
+                bool want = rg and fph == (dm ? PH_DORMANT : PH_WAITING)
+                if mw != want
+                    ok := wdIndexRaw(view, s, dm, want, mintick)
+                w += 1
+        t += 1
+    // W09 B14 (/32): coreDormantFlags, derived from the final Side Phases (never read back into a Phase): true only when no
+    // PendingTopology / PendingGeneration and each Side is Dormant or a non-participating (not eligible) Waiting Side; W09
+    // B18 (/35): for every target Core (canonical: both target Sides of a Core are adjacent)
+    t := 0
+    while ok and t < array.size(tq)
+        int c = int(array.get(tq, t) / 2)
+        if (t == 0 or c != int(array.get(tq, t - 1) / 2)) and array.get(view.coreSlotLiveFlags, c)
             bool cd = not array.get(corePendingTopologyFlags, c) and not array.get(corePendingGenerationFlags, c)
             int  j  = 0
             while j < 2
@@ -1335,7 +1550,7 @@ export phaseArmedStageJFinalize(PhaseArmedTransferView view, array<int> classes,
                 cd := cd and (array.get(view.sidePhases, x) == PH_DORMANT or (array.get(view.sidePhases, x) == PH_WAITING and not array.get(view.sideEligibleFlags, x)))
                 j += 1
             array.set(coreDormantFlags, c, cd)
-        c += 1
+        t += 1
     if not ok
         runtime.error("W09 B06-B2B3-B: Stage J broke a Phase / Armed index invariant")
     ok
@@ -1532,8 +1747,9 @@ episodeRowRaw(array<int> ei, int s) =>
     e
 // W09 B09 (/26): the B08 D3 opposite rule, shared by the Local Break and the GapBreak (read-only): the opposite Side so has
 // no BreakSnapshot and is no GapBreak itself; with a same-bar Episode (an ActiveTouch or a same-bar TouchStart) only when
-// that Episode ends by Reset; else Waiting, Armed (a member of both Armed indexes) or Dormant without a Dormant recovery
-// position. (/25 read the persistent Phase only, so a same-bar TouchStart opposite passed as Armed.)
+// that Episode ends by Reset; else Waiting, Armed (a member of both Armed indexes) or Dormant (W09 B18 /35: the same
+// membership in both Dormant recovery indexes; before /35 no Dormant recovery position). (/25 read the persistent Phase only,
+// so a same-bar TouchStart opposite passed as Armed.)
 breakOppositeOkRaw(PhaseArmedTransferView pav, array<int> ei, array<int> gbi, int so) =>
     int  po = array.get(pav.sidePhases, so)
     int  eo = episodeRowRaw(ei, so)
@@ -1542,7 +1758,7 @@ breakOppositeOkRaw(PhaseArmedTransferView pav, array<int> ei, array<int> gbi, in
     while not g and k < array.size(gbi)
         g := array.get(gbi, k) == so
         k += GB_STRIDE
-    not g and not array.get(pav.sideBreakSnapshotValidFlags, so) and (eo >= 0 ? array.get(ei, eo + EP_I_FLAGS) % 32 >= EF_RESET : po == PH_WAITING or (po == PH_ARMED and indexMemberRaw(pav.armedBottomOrderSideSlots, pav.armedBottomPositions, so) and indexMemberRaw(pav.armedTopOrderSideSlots, pav.armedTopPositions, so)) or (po == PH_DORMANT and array.get(pav.dormantBottomPositions, so) == SLOT_INVALID and array.get(pav.dormantTopPositions, so) == SLOT_INVALID))
+    not g and not array.get(pav.sideBreakSnapshotValidFlags, so) and (eo >= 0 ? array.get(ei, eo + EP_I_FLAGS) % 32 >= EF_RESET : po == PH_WAITING or (po == PH_ARMED and indexMemberRaw(pav.armedBottomOrderSideSlots, pav.armedBottomPositions, so) and indexMemberRaw(pav.armedTopOrderSideSlots, pav.armedTopPositions, so)) or (po == PH_DORMANT and indexMemberRaw(pav.dormantBottomOrderSideSlots, pav.dormantBottomPositions, so) == indexMemberRaw(pav.dormantTopOrderSideSlots, pav.dormantTopPositions, so)))
 // W09 B09 (/26): one Break commit on a role 0 / 1 Core, shared by the Local Break (episodeApply) and the GapBreak
 // (gapBreakApply): the same logical BreakSnapshot on the broken Side s and its opposite (fl: 1 wasGapBreak; the Roots are
 // appended by the caller), an Armed Side leaves both Armed indexes unless the pre-commit release already did (released:

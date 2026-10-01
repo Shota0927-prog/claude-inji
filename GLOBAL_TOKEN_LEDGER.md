@@ -3100,3 +3100,54 @@ Dormant price positions are declared but never written. Neither is a predicate /
 nothing undefined). Production drift: none. I27 OPEN 0.
 TOKEN END REVIEW: Production delta 0; exact UNKNOWN. Status: W09_B18_STATE_PRICE_INDEX_REFERENCE_PHASE_A_PASS (B18 not
 COMPLETE / FROZEN). STOP.
+
+## W09 B18 Phase B: I11 / I16 index extraction (B18-F1 / B18-F2) - W09_B18_STATE_PRICE_INDEX_REFERENCE_LOCAL PASS
+
+START GATE: claude/w09-b07-redesign-v2, local = remote = fecdcec, 0 / 0, clean; pins W08Core /19, W08Touch /7, W08Runtime /21,
+W09State /34; B17 COMPLETE / FROZEN; I27 OPEN 0. TOKEN START REVIEW: Main compile PASS, exact UNKNOWN; W09State-centred, Main
+thin wiring only, no new UDT / tuple / approximate index / truncation / per-bar full sort.
+Files: ZoneEngineV2_W09State_Worker.pine (/35), ZoneEngineV2_Rebuild.pine (pin W09State /35; W08Core /19, W08Touch /7,
+W08Runtime /21 unchanged).
+
+B18-B1 (B18_F2_BS_DORMANT_REQUIRED_INDEX, BS part): new export bsTargetSlots - Flip / Reclaim targets from the existing Broken
+BreakSnapshot price indexes (keys = fixed BS range ticks, never the EffectiveRange): Support sb when bottom >= close + reset
+(movedAway) or bottom >= high + 1 (full exit) or top <= close - breakBuffer (Reclaim); Resistance sb when top <= close -
+reset or top <= low - 1 or bottom >= close + breakBuffer; both when bottom <= high and top >= low (contact) - inclusive tick
+bounds, a superset of every flipPlan row. Main w09StageCDPlanRaw calls it once and passes the target list to reclaimResolve
+and flipPlan in place of the Broken set; flipPlan / reclaimResolve bodies (B10 / B11 / B13 predicates, canonicalSideSlots)
+unchanged. Inverse: W07 inverseFacts evaluates the whole InverseWait set, no W07 threshold index exists ->
+W07_I11_INVERSE_THRESHOLD_INDEX_CARRY to the W11 / W12 final conformance (W07 not changed).
+B18-B2 (B18_F1_STAGEJ_PRICE_EVENT_INDEX): Stage J no longer scans every live Core. phaseArmedStageJFinalize iterates the
+canonical target list of stageJTargetsRaw = A every Side of an applied destination (classes != TX_NONE), B the bar's
+transition Sides (Episode rows, Flip rows both Sides, noArm, TouchStart plan Sides, GapBreak rows), C-E the price targets of
+stageJPriceTargetsRaw: Waiting index (keys = EffectiveRange) Support Reset top <= close - reset, Resistance Reset bottom >=
+close + reset, Dormant entry bottom >= close + dormant + 1 or top <= close - dormant - 1 (strict); Armed index (keys =
+LastArmedRange = the EffectiveRange of an indexed Armed Side) Armed distance lost (B06-B2B3 option b: Support top >= close -
+reset + 1, Resistance bottom <= close + reset - 1) and Dormant entry; Dormant recovery index (I11 #12, keys = EffectiveRange,
+Main storage dormantRecovery* now used) bottom <= close + dormant and top >= close - dormant (inclusive). Union -> dedupe ->
+canonical (coreId, Support, Resistance). The per-Side finalize (B14 / B10 / B06 predicates, Grade / Upcoming / Armed /
+Dormant / noArm order) is unchanged; coreDormantFlags for every target Core; relCore / transition projection are pass-local
+maps (no per-bar array over every Core). Key choice: each index keys the range edge tick; the cfg distance (reset / dormant) is
+added in the query, so an integer-tick threshold (edge + distance) is compared exactly and a cfg change needs no re-key.
+Maintenance: phaseMoveRaw drops a Side leaving Waiting / Dormant from that index (every Phase change goes through it);
+phaseArmedIndexRelease drops the Waiting / Dormant Sides of applied old Cores and freed Cores before commit (with Armed / BS);
+Stage J inserts every target on its final Phase and EffectiveRange; breakOppositeOkRaw accepts a Dormant opposite with a
+consistent Dormant index membership (was: no Dormant recovery position). Main: ZoneEngine waiting* order / positions storage,
+the PhaseArmedTransferView gets the 6 index arrays, Stage J gets the TouchStart plan Sides and gbi.
+
+Evidence (scratchpad b18_det.py, Production interpreted, Reference = naive full scan): P1-P42 + S1-S4 static 43 / 43 PASS;
+TOUCH / GAP / D1 / ACTIVE / BREAK / RESET / FLIP / RECLAIM / INVERSE / DORMANT MISSING 0, EXTRA 0; ORDER_DRIFT 0; RESULT_DRIFT
+0; INDEX_STALE 0, INDEX_MISSING 0, INDEX_ORDER 0 (Waiting / Dormant / Armed / Broken / FlipWait indexes and Phase sets).
+No-semantic-change gate: the same fixtures on /34 + the pre-B18 Main vs /35: 106 bars compared, Events, Phase, history,
+BreakSnapshot rows, coreDormantFlags and Phase sets identical (DIFF 0). Mutations M1-M20 (+ M17 Main form, caught by S2):
+21 / 21 detected, MUTATION_UNDETECTED 0. F0 (P24): Phase, every index and positions, Events unchanged. Regression on /35:
+B08 16, B09 16, B10 14, B11 14, B12 25, B13 13, B14 17 + D19, B15 16, B16 R4 13, B17 O1-O14 14 all PASS; W08Runtime guard PASS.
+Static: Stage J O(N) scan / allocation 0; Flip / Reclaim Broken / FlipWait set scan 0; no array.sort in W09State
+(sort_indices only on candidate / target lists). Harness-only corrections (class A): fixture Upcoming = TouchCount + 1, the
+fresh materialization of a reused slot (Stage J insert emulated), the P35 expectation. random 0; 5k / 50k / 200k not run.
+Observation (not changed, outside the B18 state-extraction scope): touchHistoryTransferPlan / bsTransferPlan /
+touchStartPostPlanPreflight still allocate O(Core count) validation scratch per bar.
+TOKEN END REVIEW: W09State /35 +256 / -25 lines, Main +23 / -? (thin wiring, storage); exact UNKNOWN, no class.
+Status: B18_F1_STAGEJ_PRICE_EVENT_INDEX IMPLEMENTED_LOCAL; B18_F2_BS_DORMANT_REQUIRED_INDEX IMPLEMENTED_LOCAL;
+W09_B18_STATE_PRICE_INDEX_REFERENCE_LOCAL PASS. B18 not COMPLETE: LOCAL PASS / TV GATE WAITING (W09State /35 publish, Main
+compile by the user). I27 OPEN 0. STOP.
