@@ -1900,3 +1900,66 @@ re-run with its expectation moved to B11 (the wouldReclaim bar is now a Reclaim:
 and no TouchMark): PASS. R3-B1 contract PASS. Static: W09State imports 0, types 4, exports 37 -> 38, use-before-definition
 0; JOP_FVG_INVALIDATE / JGROUP_E1 / ROOT_ACTIVE equal Main's. random 0, > 5 min 0.
 TV: W09State /29 publish -> Production Main compile. CE10216 -> STOP (no semantic cut; deferred GT-5A / D3 / T1-T3).
+
+## W09 B11 CLOSEOUT
+
+B11 Reclaim: COMPLETE, FROZEN (W09State /29 publish PASS, Production Main PASS; not reopened; open semantics 0).
+Recorded separately: the relation-outside free check in bsTransferPlan reading the bar-start BS (no Flip rows) is a
+"B11-discovered corrective invariant fix to the frozen B08 / B10 path" (the B08 invariant, enforced again for a BS consumed by a
+same-bar FlipConfirm); it is not a B10 semantic change.
+
+## W09 B12 Inverse FVG: START GATE and Phase A audit (no code change)
+
+START GATE: `claude/w09-b07-redesign-v2` at `8bee144`, clean. Pins: W03F0 /5, W03Apply /4, W03ETimeFvg /3, W06 /25 (-> W05
+/8 -> W07Interval /1), W07 /11 (-> W07Interval /1), W08Core /19, W08Touch /7, W08Runtime /20, W03EMsa /9, W09State /29. Main
+PASS (exact UNKNOWN).
+
+Existing Root-level Inverse lifecycle (W03 / W07 contracts, frozen; Main Stage D -> E -> F -> G -> W08 / W09):
+
+| Step | Writer (stage) | State (owner: FVG Root) | Notes |
+|---|---|---|---|
+| structural invalidation fact | W03 Stage D `w03StageDFvgFactsRaw` (1h / 4h / D close beyond NativeRange: Bull close < bottom, Bear close > top) | journal JOP_FVG_INVALIDATE / JGROUP_E1 | fact only |
+| invalidation apply | Main Stage F `fvgInvalidateApplyRaw` (E1) | rootStates ACTIVE -> INVALIDATED, structurallyActive set detach | direction, NativeRange, origin, Fresh flag untouched |
+| InverseWait entry | W07 `inversePostApplyFinalize` -> `inverseWaitEnterApply` (same Stage F, same bar) | INVALIDATED -> INVERSE_WAIT, generic set move, inverseWaitFvgRootSlots, progress WAIT_MOVED_AWAY (1) | "the invalidation bar is never a moved-away bar": the bar's Stage E facts ran before the Root was waiting |
+| movedAway | W07 Stage E `inverseFacts` / `inverseEvalOneRaw`, Stage F `inversePendingApply` | progress 1 -> MOVED_AWAY (2): Bull close <= bottom - reset, Bear close >= top + reset (ticks) | one step per bar |
+| retest | same | 2 -> RETOUCHED (3): bar meets NativeRange inclusively (low <= top and high >= bottom) without the confirm close | later bars only (one step per bar) |
+| InverseConfirm | same | 2 (touch + confirm) or 3 (confirm close) -> ACTIVE (4): Bull close <= bottom, Bear close >= top; INVERSE_WAIT -> INVERSE_ACTIVE, wait set -> inverseActiveFvgRootSlots | rootId, originKey, category / subtype, direction, NativeRange unchanged; no new Root / origin |
+| after Confirm | W07 `inversePostApplyFinalize` | Candidate seed STATE | FVG (| BROAD); eligibility dirty of the new Side (Bull -> Resistance, Bear -> Support) | W04 eligibility: Bull INVERSE_ACTIVE -> Resistance, Bear -> Support; INVALIDATED / INVERSE_WAIT eligible nowhere -> the Root counts on one Side only (no C double count) |
+| confirm list | W07 `inverseConfirmListBuildRaw` -> Main `fvgInverseConfirmRootIds` / `fvgInverseConfirmCount` | rootIds of this bar's Confirms ("same-bar normal Touch suppression marker", W07 B12) | written every bar, read by nothing yet (the W09 consumer is B12's) |
+| topology | W05 / W06 / W08 (unchanged) | the Root joins the new-Side Candidate; W08 identity "inverse same-origin": the same FVG Root S -> R across passes continues the Core (inverse-origin gather + non-Broad origin match) | no new Generation for an Inverse (W08 semantics unchanged) |
+
+Physical owners: Root state (rootStates, rootFvgInverseProgresses 0..4 = none / waitMovedAway / movedAway / retouched / active,
+wait / active FVG sets + positions, generic state sets, NativeRange ticks, direction, origin, Fresh): Root (W03 / W07), never a
+Side, Core or Generation. movedAway / retestSeen equivalents exist (progress 2 / 3); attempt / confirm state: confirm =
+progress 4 + confirm list; no attempt state exists. Merge / Split / new generation never touch the Root registry, so the
+Inverse wait / progress / NativeRange / origin survive every Core topology change without a transfer. The general Flip
+BreakSnapshot is not involved (Inverse prices = NativeRange only). No new Root field / collection is needed for the
+Root-level lifecycle; the W09 part is only the Side / Phase / Event / TouchMark coupling.
+
+Derived (no question): Inverse is not a normal Touch (no SideTouchCount, no WeakDepth, no Side / Zone Fresh use: W07 writes
+none of them); same origin / category, no extra C (single eligibility Side); the invalidation bar only enters InverseWait,
+movedAway / retest / Confirm only on later bars (W07, one progress step per bar); prices = NativeRange; no new Generation
+from Inverse; W08 identity / pairing unchanged.
+
+sideInverseAttemptCounts: W08Core CoreRegistryStore Side field (allocated 0, no writer, no reader), still in the W08Runtime
+MERGE_STATE_DEFAULT_GUARD (an absorbed Side must hold the default). EV_INVERSE_ATTEMPT = 10 and EV_INVERSE_CONFIRM = 11:
+Main enum + names only (no producer, no row contract). No repo text defines an InverseAttempt or the Inverse Event rows.
+Structural fact: during InverseWait the Root is eligible on no Side (INVALIDATED / INVERSE_WAIT), so a Side-unit attempt count
+has no Side membership to attach to while the attempts would happen.
+
+I27 (STOP; not derivable from the repo canon or the frozen W03 / W07 / W08 contracts):
+- I27-B12-1 InverseAttempt: does the canon define it (EV_INVERSE_ATTEMPT exists)? If yes: trigger (W07 progress 2 -> 3 =
+  retouch without the confirm close, once per wait or per retouch), the owner of sideInverseAttemptCounts while the Root is
+  on no Side (the former Side? the future inverse Side? an aggregate?), reset / Merge / Split / new-generation rules, TouchMark.
+  If no: B12 = Confirm only, the field stays default-guarded and unused, EV_INVERSE_ATTEMPT unused.
+- I27-B12-2 EV_INVERSE_CONFIRM row: coreId / generationId (the post-topology Core whose inverse-direction Side current Root list
+  holds the Root? none when it forms no Core?), side (inverse direction), range (NativeRange or the Side range), rootId (the FVG
+  Root?), touchNo / gradeAtStart / weakReason; one Event per Root or per Side.
+- I27-B12-3 Confirm-bar gating: which Sides get "no normal Touch start / not Armed on the confirm bar" (the post-topology Sides
+  holding a confirm Root via the confirm list -> noArm like FlipConfirm? a destination Side that is already Armed or ActiveTouch:
+  forced to Waiting, kept, or its same-bar TouchStart suppressed?), and how the pre-topology D1 TouchStart plan reads the marker.
+- I27-B12-4 TouchMark of InverseConfirm: the repo holds no authority; confirm "none" or give the rule (non-normal row, contact,
+  which ring / Side).
+
+Token: no code change. Root-level state fully reused (W07); expected W09 additions are Side-level only (confirm list ->
+Side mapping, Event rows); no new UDT / import / foreign type expected; Probe decision at the design step.
