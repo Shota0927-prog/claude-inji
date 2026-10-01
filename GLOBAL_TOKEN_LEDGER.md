@@ -1963,3 +1963,44 @@ I27 (STOP; not derivable from the repo canon or the frozen W03 / W07 / W08 contr
 
 Token: no code change. Root-level state fully reused (W07); expected W09 additions are Side-level only (confirm list ->
 Side mapping, Event rows); no new UDT / import / foreign type expected; Probe decision at the design step.
+
+### B12 I27 resolution (user) and design-time conflicts (no code change)
+
+RESOLVED (user):
+- I27-B12-1: no InverseAttempt in B12 (W07 canonical audit: its trigger is not defined in the W07 bundle). EV_INVERSE_ATTEMPT
+  unused; sideInverseAttemptCounts: no writer / reader, stays 0 and in the Default Guard (reserved); progress 2 -> 3 is the
+  RETOUCHED step only (no Event, no TouchMark, no count).
+- I27-B12-2: one EV_INVERSE_CONFIRM per confirmed Root (several Roots on a bar = several Events); side = Resistance for an
+  original Bullish FVG, Support for Bearish; range = the Root NativeBottom / NativeTop; rootId = the Root; touchNo 0;
+  GR_UNAVAILABLE; WEAK_NONE; time / baseSeq = the confirm bar; coreId / generationId = the destination Physical Core whose
+  inverse-direction Side holds the Root after Stage H topology (never the pre-topology owner); unresolvable destination ->
+  F0 fail-closed (mutation 0, Event 0). Order: (coreId, generationId, Support, Resistance), Roots of one Side in the W07 confirm
+  list order; no per-type sort.
+- I27-B12-3: the destination Side gets no normal Touch on the confirm bar: Stage J noArm (Waiting); a later bar meeting the reset
+  distance arms it with ArmedFromSeq = that bar + 1. A same-bar D1 TouchStart plan of that Side / Core is cancelled (no
+  TouchCount, CurrentTouchNo, TSS, normal TouchMark, Fresh use, EV_TOUCH_START), by the W07 confirm marker, no intra-bar
+  order guess. A destination Side already ActiveTouch at the bar start keeps its Episode / TSS; the topology change follows
+  the PendingTopology contract (A16), never a forced Waiting.
+- I27-B12-4: one non-normal TouchMark per confirmed Root (A6.4): baseSeq / time = the confirm bar, side = inverse direction,
+  generationId = the destination Core's, isNormalTouch false, touchNo 0, close = the bar close, weakByDepth false, max 0,
+  contact = [max(low, NativeBottom), min(high, NativeTop)]; Merge / Split by the existing TouchMark contract.
+- W07 state machine unchanged; no new Root field; sideInverseAttemptCounts untouched; Default Guard release 0.
+
+Design-time conflicts found before implementation (existing W08 / W09 contracts, verified in the code):
+- C1 (pending destination): W08 applies only changed components with no old Side in ActiveTouch; a component holding an
+  ActiveTouch Side at the bar start, or a projected ActiveTouch from a same-bar D1 TouchStart without Reset (episodeOverlayBuild
+  FORCE_ACTIVE), is pending: no Core materializes it this bar and w09CurrentRootProduceRaw leaves its Cores untouched. A
+  confirmed Root whose new-Side Candidate lies in such a component has no post-topology destination owner on the confirm bar.
+  By the I27-B12-2 rule that is an F0 failure of the whole W08 / W09 transaction of the bar (every other Core's update and
+  Event of the bar dropped), and the confirm itself is lost (the W07 confirm list is rebuilt every bar). The I27-B12-3 /
+  I16 case ("already ActiveTouch -> Episode / TSS kept -> topology deferred") is exactly this case, so the two rules conflict.
+- C2 (same-bar D1 TouchStart cancel): a same-bar TouchStart without Reset makes its component pending (C1), so a confirmed Root
+  can enter that Side on the confirm bar only when the TouchStart's Episode resets on the same bar. Then the cancel must remove
+  the TouchStart row, its Episode row and their TouchMark rows from the plan arrays that the W08 plan already consumed
+  (W08Touch Merge / Split plans project every plan row before the destination is known): the destination is known only
+  after the W08 plan that read the rows to be cancelled. No rule in the repo orders this (re-plan, pre-topology rule, or
+  fail-closed).
+- C3 (no winner): a confirmed Root that no applied Side winner holds (the W05 selection may leave it out) has no destination
+  either -> F0 by I27-B12-2; to be confirmed as intended.
+
+Status: B12 implementation NOT started (STOP): C1 / C2 need a rule; C3 a confirmation.
