@@ -3237,3 +3237,45 @@ reproduced locally (no further unresolved / forward / reserved / shadow finding)
 Main imports unchanged. Local gate: 43 / 43, 16 / 16, Reference metrics 0, M1-M30 (+ M17 Main) 31 / 31 detected (W09
 mutants re-applied on the moved source), B12 25 / 25, B13 13 / 13, B14 17 / 17 + D19. random 0; 5k / 50k / 200k NOT RUN.
 I27 OPEN 0.
+
+## W09 B18 CLOSEOUT: W09_B18_STATE_PRICE_INDEX_REFERENCE COMPLETE / FROZEN
+
+START: claude/w09-b07-redesign-v2, local = remote = bd220ed, 0 / 0, clean; Production W07Fvg /12, W08Core /19, W08Touch /7,
+W08Runtime /21, W09State /35; Main imports W07Fvg /12, W09State /35; I27 OPEN 0. CLOSEOUT changes this ledger only.
+
+Phase A evidence: naive full-scan Reference vs Production optimized path P1-P25 PASS; MISSING 0, EXTRA 0, ORDER_DRIFT 0,
+RESULT_DRIFT 0; index stale / missing / duplicate 0; Phase A Production drift 0.
+B18-F1 FINAL: the per-bar full live-Core scan of Stage J = REMOVED. Stage J targets = union of state set + price index +
+same-bar transition / topology targets -> dedupe -> canonical order -> phaseArmedStageJFinalize (the one final writer);
+semantic diff 0.
+B18-F2 FINAL: the BS price index is consumed by Production (Flip / Reclaim targets); Waiting Reset / reArm index, Dormant
+entry / recovery index and Armed price index used by Production; the Inverse threshold index is used by Production in W07
+/12. W07_I11_INVERSE_THRESHOLD_INDEX_CARRY = CLOSED.
+B18_INDEX_KEY_REPRESENTATION = EDGE_KEY_PLUS_QUERY_OFFSET_ACCEPTED_EQUIVALENT: the indexes keep the range edge tick as the
+key; rd / dd / break / reset buffer offsets are applied in the query; exactly equivalent to the canonical predicate on integer
+ticks; no needless re-key on a cfg change. Not an I27.
+W07 Inverse index: W07 /11 -> /12, Inverse lifecycle semantic change 0; WAIT_MOVED_AWAY dedicated threshold index,
+MOVED_AWAY reuses the W03 FVG NativeRange order, RETOUCHED dedicated threshold index; InverseWait full predicate scan 0.
+Reference parity MISSING / EXTRA / ORDER / RESULT / INDEX_STALE / INDEX_MISSING / INDEX_DUPLICATE all 0.
+Full deterministic evidence: P1-P57 all PASS; B18 static gates (S1-S5, forward reference, reserved identifier) all PASS;
+Production / Reference MISSING 0, EXTRA 0, ORDER_DRIFT 0, RESULT_DRIFT 0; /34 baseline vs B18 final Production Event /
+Phase / history drift 0. Mutations M1-M30 (incl. the M17 Main variant) all detected, MUTATION_UNDETECTED 0.
+Regression: B08 / B09 / B10 / B11 / B12 / B13 / B14 / B15 / B16 / B17 PASS, W08Runtime guard PASS, W07 /11 vs /12 semantic
+drift 0; random 0; 5k / 50k / 200k NOT RUN.
+TV compile fixes during the B18 TV Gate (semantic-neutral): A W07Fvg /12 reserved identifier `to` -> `toOrder`; B W09State
+/35 reserved identifier `to` -> `toOrder`; C W09State /35 CE10271 helper dependency order (orderDropRaw / wdIndexRaw before
+phaseArmedIndexRelease; physical placement only). Semantic diff 0; W07 /12 and W09State /35 kept.
+TradingView Final Gate (user): W07Fvg /12 publish PASS, W09State /35 publish PASS, Production Main compile PASS, compile
+error 0, runtime error 0, exact compiled token UNKNOWN (no GREEN / YELLOW / RED class).
+OPEN carries (not B18 blockers; must be CLOSED before the final canonical diff 0):
+- W10_CARRY_I17_REUSABLE_SCRATCH_3PATHS = OPEN: touchHistoryTransferPlan (seen), bsTransferPlan (rel + full Side loop),
+  touchStartPostPlanPreflight (busy / roles); I17 authority = Engine-owned reusable scratch + logical length reuse; CLOSE by
+  W10 or the Final Integration.
+- W10_CARRY_W07_INVERSE_INDEX_FREE_RETIRE_CLEANUP = OPEN: no FVG Root free / retire path today; when W10 Storage / Prune
+  makes one reachable, the W07 /12 Inverse WAIT / RETOUCHED index entries, the NativeRange-related membership and the
+  reverse positions must be detached / reset before free / slot reuse. Re-audit in W10.
+Production final versions: W07Fvg /12, W08Core /19, W08Touch /7, W08Runtime /21, W09State /35 (Main imports these).
+I27: OPEN 0, no new I27 in B18. CLOSEOUT Production change 0.
+Status: W09_B18_STATE_PRICE_INDEX_REFERENCE COMPLETE / FROZEN. Frozen inputs from here: the price index semantic, the
+edge-key + query-offset representation, Stage J indexed targeting, BS indexed targeting, W07 Inverse index targeting; only the
+two W10 carries above may reopen them. Next: B19 Conformance (not started).
