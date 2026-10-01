@@ -2277,3 +2277,42 @@ I27 OPEN = 2.
 Token: no code change. Expected B13 code: G1 = one condition removed (W09State), G2 = one guard in flipPlan; I27-B13-2 depends
 on the decision (a Core-local hold would touch touchStartPostPlanPreflight / episodePlan, no new UDT / import). No priority
 engine.
+
+### B13 I27 resolution (user)
+
+- I27-B13-1 RESOLVED: Reclaim > FlipConfirm (authority: Reclaim = "return to the old side before the Flip is confirmed";
+  the Reference evaluates Reclaim before the Flip check). Degenerate bar (line BS, breakBuffer 0 ticks, close on the line):
+  Reclaim only; FlipConfirm noArm / lastFlipConfirmSeq / mark / Event / new-Side transition suppressed; Reclaim transition,
+  EV_RECLAIM, cleanup and old-Side history as frozen B11. Flag 24 Production-unreachable.
+- I27-B13-2 RESOLVED: the B08 D3 / B09 whole-pass F0 stays. The B13 "no global suppression" rule is a semantic rule over valid
+  D4 facts / plans; an F0 invariant failure is transaction validity (whole confirmed-5m pass, persistent mutation 0); no
+  Core-local commit, no Break pending state / deferred Break Event / carried Break fact. Repeated F0 is fixture-tested, not
+  hidden; frequency evidence from W11 / W12 conformance / replay would be a separate architecture-level I27.
+- Matrix correction: FC x RC = RECLAIM_PRIORITY (MUTUALLY_EXCLUSIVE under normal prices, Reclaim wins only on the degenerate
+  bar); opposite-side Break conflict = TRANSACTION_INVARIANT_FAIL (separate class, checked before INDEPENDENT).
+I27 OPEN = 0.
+
+### B13 TOKEN START REVIEW
+
+Main PASS, exact UNKNOWN. Planned: G1 one condition removed (inverseConfirmProject noArm), G2 one guard (flipPlan cf and not
+rc), I27-B13-2 Production change 0. New UDT / import / tuple / mass forwarding / priority engine 0; signatures unchanged.
+Probe NO (small predicate / condition only).
+
+## W09 B13 Same-bar priority: implementation (W09State /31, Main pin)
+
+- flipPlan: rc evaluated first, `cf = ct and (close beyond the BS on the break side) and not rc` (one predicate each, no
+  duplicate). The Attempt guard (not cf and not rc) unchanged. A Reclaim later suppressed by D4 (reclaimResolve) does not
+  revive the FlipConfirm (fact-level priority, like the Attempt).
+- inverseConfirmProject: every holder joins noArm (no pre-Episode Phase condition). Stage J reads noArm only for Waiting /
+  Armed: a holder whose bar-start Episode Resets on the bar ends Waiting (ArmedFromSeq unset); a continuing ActiveTouch keeps
+  Episode / TSS (never forced Waiting).
+- Main: W09State pin /30 -> /31 only.
+Gates (scratchpad harness, Production W09State /31 + Main slice interpreted, W08 stub): `b13_det.py` 9/9 - P1 / P2 degenerate
+Support / Resistance Reclaim only (EV_RECLAIM 1, FlipConfirm Event 0, Flip mark 0, noArm 0, lastFlipConfirmSeq unchanged,
+cleanup, history kept), P3 buffer > 0 FlipConfirm (B10 unchanged), P4 Reclaim with contact (B11 unchanged), P5 bar-start
+ActiveTouch + same-bar Reset + Inverse holder -> Reset done, EV_INVERSE_CONFIRM, noArm, Waiting, ArmedFromSeq unset; P5b next
+bar Armed from that bar + 1; P6 continuing ActiveTouch holder keeps ActiveTouch / TSS; P7 opposite conflict F0, mutation 0,
+Event 0; P8 P7 + a planned Core 11 D1 -> whole-pass F0, Core 11 not committed. Sensitivity: on /30 P1 / P2 / P5 / P5b / P6
+FAIL (5 of 9). Regression (selected only): B08 L8 / F1, B09 G11 / R1, B10 F4 / F10, B11 R1 / R2, B12 I14 / I30: 10/10. R3-B1
+contract PASS. Static: W09State imports 0, rc defined before cf, signatures unchanged. random 0, > 5 min 0, 5k / 50k / 200k 0.
+TV: W09State /31 publish -> Production Main compile. CE10216 -> STOP (GT-5A / D3 / T1-T3).
