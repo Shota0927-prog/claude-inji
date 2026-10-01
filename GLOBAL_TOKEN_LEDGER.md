@@ -1696,3 +1696,61 @@ phaseMembershipValid 46, phaseDetach 46 (phaseAdd 46). W06 / W07 / W07Interval: 
 
 TV order: W08Core /19 publish -> W08Runtime /20 publish (imports W08Core /19) -> Production Main compile; record against
 1,009,747. CE10117 / build error -> STOP.
+
+### TC-C result: Main PASS
+
+| ID | Module | Change | Before | After | Delta | Status |
+|---|---|---|---|---|---|---|
+| TC-C | W08Core /19, W08Runtime /20, Main pins | call-0 bodies removed (W08Core 14 functions + 2 constants, W08Runtime planPass / runShadow) | 1,009,747 (CE10216) | < 1,000,000 (Main PASS; W08Core /19 and W08Runtime /20 publish PASS) | > -9,747 (exact UNKNOWN) | ADOPTED |
+
+New baseline: W08Core /19, W08Touch /7, W08Runtime /20, W09State /27, W06 /24, W05 /7; Main PASS, exact UNKNOWN. Backup
+`backup/w09-b10-post-tcc-pass` (= `2f42b0e`). Semantics frozen.
+
+## TC-D: additional compression (TOKEN_REFACTOR_ONLY)
+
+A. Full dead-code audit (every library reachable from Main, fixed point over functions / types / constants; source tokens
+cgest, reference only):
+
+| Library | Symbols | Reachable | Dead | Source | Dead source |
+|---|---|---|---|---|---|
+| W03Apply | 79 | 79 | 0 | 23,997 | 0 |
+| W03EMsa | 50 | 50 | 0 | 6,105 | 0 |
+| W03ETimeFvg | 58 | 58 | 0 | 8,411 | 0 |
+| W03F0 | 71 | 71 | 0 | 15,972 | 0 |
+| W05Candidate /7 | 86 | 85 | 1 | 23,559 | 1,196 (candWindowExitRaw, 139 lines, no dead helper) |
+| W06Component /24 | 78 | 78 | 0 | 28,603 | 0 |
+| W07Fvg /11 | 47 | 45 | 2 constants | 9,748 | 10 |
+| W07Interval /1 | 7 | 7 | 0 | 1,415 | 0 |
+| W08Core /19 | 40 | 40 | 0 | 16,029 | 0 (re-fixed-point after TC-C: no new dead helper) |
+| W08Runtime /20 | 90 | 90 | 0 | 25,438 | 0 |
+| W08Touch /7 | 63 | 59 | 1 function + 3 constants | 8,336 | 94 (markPhysicalIndex 79) |
+| W09State /27 | 166 | 146 | 12 functions / types + 8 constants | 32,391 | 1,154 |
+
+W09State dead chains: touchSnapshotRootList* (DetachAllRaw 301 <- DetachAll 73; Append 78; Validate 69; type
+TouchSnapshotRootPoolView 58, used only by them) = 579; stateSetUpdate 176; touchResetMet 126; breakWouldMet 52;
+phaseMembershipValid / phaseAdd / phaseDetach 46 each + W09State's own type PhaseSetView 43 (used only by them; Main uses
+W08Runtime.PhaseSetView). Production callers 0, test callers 0 (two probe files match the name PhaseSetView of W08Runtime
+only). Dead W09State constants (PLAN_I_* / PLAN_F_* / EP_I_MARK) and W08Touch / W07 constants: KEPT (scratch-layout
+contract, read by tests/r3b1_scratch_contract_check.py; no body).
+
+B. W07Interval duplicate edge: W05 uses fvgIntervalOrderBuild x2 + fvgIntervalQuery x2; W07 uses fvgIntervalQuery x1 (+ the
+private fvgIntervalLowerBoundRaw). No UDT (primitive arrays only). The whole library is 1,415 source tokens; removing either
+edge means a byte-equivalent copy of query + lowerBound (~1.0k of the 1.4k) or of all three in the importer, so the net is
+about 0.4k source at best, and it reverses the Import C A single-authority design. Library-limit risk: low, gain: negligible.
+Decision: NOT ADOPTED (no TIER A in TC-D).
+
+Tiers: A none; B W05 candWindowExitRaw 1,196 (one chain) + W09State dead set 1,154 (several chains, one module, one
+publish); C W08Touch markPhysicalIndex 79, constants (not done).
+
+TC-D implementation:
+- W05Candidate /8 = /7 minus candWindowExitRaw (code lines 2,107 IDENTICAL to the /7 sequence without it).
+- W06Component /25 = /24 with the W05 pin /7 -> /8 only (2,629 code lines IDENTICAL otherwise).
+- W09State /28 = /27 minus the 10 functions and 2 types above (2,229 code lines IDENTICAL); constants unchanged.
+- Main: pins W06 /24 -> /25, W09State /27 -> /28 (2 lines).
+Static: no removed symbol referenced by any Production file (Main + 12 libraries); semantics / comparisons / order / Root
+conditions 0; imports unchanged in shape; no new type, signature or forwarding.
+Equivalence: 15 representative B08 / B09 / B10 cases on W09State /28 + TC-D Main: 15/15 PASS; R3-B1 scratch contract PASS.
+random 0, > 5 min 0.
+
+TV order: W05Candidate /8 publish -> W06Component /25 publish (imports W05 /8) -> W09State /28 publish -> Production Main
+compile. Build error -> STOP.
