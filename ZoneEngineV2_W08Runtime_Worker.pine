@@ -130,6 +130,9 @@ export type ShadowScalars
     int  nextRootId        = 1
     int  coreRangeRevision = 0
     bool rangeChanged      = false
+    // W08 R03-A (/23): the real pending pool passed pendingPoolsOkRaw and no pool writer ran since (in / out; the caller keeps
+    // it across bars). Every real-pool writer runs inside commitPass, which clears it whenever it may write the pool.
+    bool poolVerified      = false
 
 export type ShadowContext
     W08Core.W08Store             ws
@@ -155,6 +158,15 @@ export type ShadowContext
     // W08 R02-H1 (/22): true while psPlan is the real pool itself (a read-only pass, pendingPassReadOnlyRaw); commit step 1
     // then has nothing to replace. Set by every planPass.
     bool                         pendingPlanShared = false
+    // W08 R03-C (/23): the topologyComponentsRaw result of the B13 planner, reused by the B14 planner of the same read-only
+    // pass (same store / pool / arguments; nothing writes them in between). Valid only while topoCached.
+    bool                         topoCached = false
+    bool                         topoOk     = false
+    array<int>                   topoUf
+    array<int>                   topoRunStart
+    array<int>                   topoRunLen
+    array<int>                   topoOldChildRows
+    array<int>                   topoOldRootRows
 
 // One shadow pass. planResult = the B14 changed component count (-1 plan fault). Per changed component applyComp (not
 // pending); per physical Candidate applyP, mergeOfP (B08 relation of an applied Merge target) and splitOfP (B12
@@ -1711,7 +1723,7 @@ topologyComponentsRaw(W08Core.W08Store store, W08Core.PendingTopologyStore ps, a
 // 100000). Commit (only after F0): every parent of each changed active component is cleared, then rewritten (latest
 // state). Returns [immediate, pending, ready] component counts over live old Cores and physical Candidates; [-1, -1, -1]
 // with nothing written on any fault.
-pendingPlanTrustedRaw(W08Core.W08Store store, W08Core.PendingTopologyStore ps, int upstreamResult, array<bool> coreLive, array<int> coreIds, array<int> coreGenerationIds, array<int> coreCreatedTimes, array<int> sidePhases, map<int, int> rootIdToSlot, array<int> rootIds, array<bool> rootSlotLiveFlags, bool poolTrusted) =>
+pendingPlanTrustedRaw(W08Core.W08Store store, W08Core.PendingTopologyStore ps, int upstreamResult, array<bool> coreLive, array<int> coreIds, array<int> coreGenerationIds, array<int> coreCreatedTimes, array<int> sidePhases, map<int, int> rootIdToSlot, array<int> rootIds, array<bool> rootSlotLiveFlags, bool poolTrusted, ShadowContext ctx) =>
     int  n  = store.physicalCandidateLogicalCount
     int  ne = store.physicalIdentityEdgeCount
     int  nc = array.size(coreLive)
@@ -1722,7 +1734,17 @@ pendingPlanTrustedRaw(W08Core.W08Store store, W08Core.PendingTopologyStore ps, i
     array<int> oldChildRows = array.new_int(0)
     array<int> oldRootRows  = array.new_int(0)
     bool ok = upstreamResult >= 0 and array.size(sidePhases) >= 2 * nc
+    bool topoCalled = ok
     ok := ok and topologyComponentsRaw(store, ps, coreLive, coreIds, coreGenerationIds, coreCreatedTimes, rootIdToSlot, rootIds, rootSlotLiveFlags, uf, runStart, runLen, oldChildRows, oldRootRows, poolTrusted)
+    // R03-C: a read-only pass keeps this result for the B14 planner (ufFindRaw only compresses paths: same roots)
+    if topoCalled and ctx.pendingPlanShared
+        ctx.topoCached       := true
+        ctx.topoOk           := ok
+        ctx.topoUf           := uf
+        ctx.topoRunStart     := runStart
+        ctx.topoRunLen       := runLen
+        ctx.topoOldChildRows := oldChildRows
+        ctx.topoOldRootRows  := oldRootRows
     int k  = 0
     int cs = 0
     // component classification (roots of live old Cores and of Candidates)
@@ -1861,7 +1883,7 @@ pendingPlanTrustedRaw(W08Core.W08Store store, W08Core.PendingTopologyStore ps, i
 // B14 changed-topology planner (see the header). upstreamResult = the Main B13 result (>= 0). Old ranges are the Main
 // corePhysicalBottoms / Tops; Candidate ranges physicalCandidateExactPrices; ticks = round(price / mintick). Returns the
 // changed component count; -1 with the changed storage empty on any fault (nothing else is written).
-changedPlanTrustedRaw(W08Core.W08Store store, W08Core.PendingTopologyStore ps, int upstreamResult, array<bool> coreLive, array<int> coreIds, array<int> coreGenerationIds, array<int> coreCreatedTimes, array<float> corePhysicalBottoms, array<float> corePhysicalTops, array<int> sidePhases, map<int, int> rootIdToSlot, array<int> rootIds, array<bool> rootSlotLiveFlags, array<int> rootCandComponentIds, array<int> candComponentIds, array<int> candComponentMemberOffsets, array<int> candComponentMemberLengths, array<int> candMemberRootIds, array<int> candMemberRoleFlags, array<int> changedRootIds, array<int> changedComponentIds, bool scopeFull, float mintick, bool poolTrusted) =>
+changedPlanTrustedRaw(W08Core.W08Store store, W08Core.PendingTopologyStore ps, int upstreamResult, array<bool> coreLive, array<int> coreIds, array<int> coreGenerationIds, array<int> coreCreatedTimes, array<float> corePhysicalBottoms, array<float> corePhysicalTops, array<int> sidePhases, map<int, int> rootIdToSlot, array<int> rootIds, array<bool> rootSlotLiveFlags, array<int> rootCandComponentIds, array<int> candComponentIds, array<int> candComponentMemberOffsets, array<int> candComponentMemberLengths, array<int> candMemberRootIds, array<int> candMemberRoleFlags, array<int> changedRootIds, array<int> changedComponentIds, bool scopeFull, float mintick, bool poolTrusted, ShadowContext ctx) =>
     array.clear(store.changedOldCores)
     array.clear(store.changedTargets)
     int n  = store.physicalCandidateLogicalCount
@@ -1872,7 +1894,16 @@ changedPlanTrustedRaw(W08Core.W08Store store, W08Core.PendingTopologyStore ps, i
     array<int> oldChildRows = array.new_int(0)
     array<int> oldRootRows  = array.new_int(0)
     bool ok = upstreamResult >= 0 and mintick > 0 and array.size(sidePhases) >= 2 * nc and array.size(corePhysicalBottoms) >= nc and array.size(corePhysicalTops) >= nc and array.size(rootCandComponentIds) >= array.size(rootIds) and array.size(candComponentMemberOffsets) == array.size(candComponentIds) and array.size(candComponentMemberLengths) == array.size(candComponentIds) and array.size(candMemberRoleFlags) == array.size(candMemberRootIds) and array.size(store.physicalOwnershipKinds) == n and array.size(store.physicalContinuationOldCoreSlots) == n and array.size(store.physicalFreshAllocationRanks) == n and array.size(store.physicalCandidateExactPrices) == 2 * n and array.size(store.mergeRelations) == 5 * store.mergeRelationCount and array.size(store.splitChildren) == store.splitChildLogicalCount
-    ok := ok and topologyComponentsRaw(store, ps, coreLive, coreIds, coreGenerationIds, coreCreatedTimes, rootIdToSlot, rootIds, rootSlotLiveFlags, uf, runStart, runLen, oldChildRows, oldRootRows, poolTrusted)
+    // R03-C: on a read-only pass the B13 planner's topologyComponentsRaw result (same inputs) replaces the second call
+    if ok and ctx.pendingPlanShared and ctx.topoCached
+        ok           := ctx.topoOk
+        uf           := ctx.topoUf
+        runStart     := ctx.topoRunStart
+        runLen       := ctx.topoRunLen
+        oldChildRows := ctx.topoOldChildRows
+        oldRootRows  := ctx.topoOldRootRows
+    else
+        ok := ok and topologyComponentsRaw(store, ps, coreLive, coreIds, coreGenerationIds, coreCreatedTimes, rootIdToSlot, rootIds, rootSlotLiveFlags, uf, runStart, runLen, oldChildRows, oldRootRows, poolTrusted)
     // W06 semantic change sets
     map<int, bool> chRoot  = map.new<int, bool>()
     map<int, bool> chComp  = map.new<int, bool>()
@@ -2040,7 +2071,7 @@ changedPlanTrustedRaw(W08Core.W08Store store, W08Core.PendingTopologyStore ps, i
 buildPendingTopologyPlanRaw(ShadowContext ctx, array<int> phases) =>
     W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
     int s = buildSplitTouchPlanRaw(ctx)
-    pendingPlanTrustedRaw(ctx.ws, pendingStoreViewRaw(ctx), s, cr.coreSlotLiveFlags, cr.coreIds, cr.coreGenerationIds, cr.coreCreatedTimes, phases, ctx.rv.rootIdToSlot, ctx.rv.rootIds, ctx.rv.rootSlotLiveFlags, ctx.pendingPoolTrusted)
+    pendingPlanTrustedRaw(ctx.ws, pendingStoreViewRaw(ctx), s, cr.coreSlotLiveFlags, cr.coreIds, cr.coreGenerationIds, cr.coreCreatedTimes, phases, ctx.rv.rootIdToSlot, ctx.rv.rootIds, ctx.rv.rootSlotLiveFlags, ctx.pendingPoolTrusted, ctx)
 // W08 B14: changed topology scope of the current pass: the B13 chain once, then changedPlanTrustedRaw (W08Core.changedPlanBuild on the
 // pass-trusted pool) with the W06
 // /18 semantic change metadata (changed Root IDs, changed current component IDs, scope full) and the W06 component
@@ -2050,7 +2081,7 @@ buildChangedTopologyPlanRaw(ShadowContext ctx, array<int> phases) =>
     W08Core.CoreRegistryStore cr = ctx.ws.coreRegistry
     [imm, pen, rdy] = buildPendingTopologyPlanRaw(ctx, phases)
     ComponentMetaView a = ctx.mv
-    changedPlanTrustedRaw(ctx.ws, pendingStoreViewRaw(ctx), imm, cr.coreSlotLiveFlags, cr.coreIds, cr.coreGenerationIds, cr.coreCreatedTimes, cr.corePhysicalBottoms, cr.corePhysicalTops, phases, ctx.rv.rootIdToSlot, ctx.rv.rootIds, ctx.rv.rootSlotLiveFlags, a.rootCandComponentIds, a.candComponentIds, a.candComponentMemberOffsets, a.candComponentMemberLengths, a.candMemberRootIds, a.candMemberRoleFlags, a.candSemanticChangedRootIds, a.candSemanticChangedCurrentComponentIds, array.get(a.candChangedScopeFull, 0), ctx.mintick, ctx.pendingPoolTrusted)
+    changedPlanTrustedRaw(ctx.ws, pendingStoreViewRaw(ctx), imm, cr.coreSlotLiveFlags, cr.coreIds, cr.coreGenerationIds, cr.coreCreatedTimes, cr.corePhysicalBottoms, cr.corePhysicalTops, phases, ctx.rv.rootIdToSlot, ctx.rv.rootIds, ctx.rv.rootSlotLiveFlags, a.rootCandComponentIds, a.candComponentIds, a.candComponentMemberOffsets, a.candComponentMemberLengths, a.candMemberRootIds, a.candMemberRoleFlags, a.candSemanticChangedRootIds, a.candSemanticChangedCurrentComponentIds, array.get(a.candChangedScopeFull, 0), ctx.mintick, ctx.pendingPoolTrusted, ctx)
 // W08 B15-B2: the pass scratch copy of the pending pool (B13 pendingPlanBuild rewrites the pool while planning; the shadow
 // plan runs on this copy, the real pool changes only in commit step 1).
 pendingCopyRaw(W08Core.PendingTopologyStore ps) =>
@@ -2062,26 +2093,18 @@ boolReplaceRaw(array<bool> dst, array<bool> src) =>
     array.clear(dst)
     array.concat(dst, src)
 // Commit step 1: the real pool (same array objects) takes the planned pool contents.
-// W08 R02-H1 (/22): true only when this pass can never write the pending pool, so the plan may read the real pool without
-// the scratch copy. Writers of the pass pool: only the B13 planner (pendingPlanTrustedRaw), and only the parents of a
-// changed active component (diff is set for active components only; active = a live old Core with a Side in ActiveTouch
-// in the pass phases). The B14 planner, the pool scan, the chain / free preflights and the snapshots only read. Required
-// here (conservative): no live pending at all (every Core flag false, no live child / Root node; nothing READY to
-// consume) and no live old Core Side in ActiveTouch in the pass phases, with the pool shape the planners expect.
+// W08 R02-H1 (/22), R03-A (/23): true only when this pass can never write the pending pool, so the plan reads the real pool
+// without the scratch copy. Writers of the pass pool: only the B13 planner (pendingPlanTrustedRaw), and only the parents of
+// a changed active component (diff is set for active components only; active = a live old Core with a Side in ActiveTouch
+// in the pass phases). The B14 planner, the pool scan, the chain / free preflights and the snapshots only read; READY
+// consumption and frees write the real pool in commitPass. So: the pool shape the planners expect and no live old Core
+// Side in ActiveTouch in the pass phases (existing pending may be live: R02's empty-pool restriction was redundant).
 pendingPassReadOnlyRaw(W08Core.PendingTopologyStore ps, array<bool> coreLive, array<int> phases) =>
     int  nc = array.size(coreLive)
     bool ro = array.size(phases) >= 2 * nc and array.size(ps.corePendingTopologyFlags) == nc
     int  i  = 0
     while ro and i < nc
-        ro := not array.get(ps.corePendingTopologyFlags, i) and not (array.get(coreLive, i) and (array.get(phases, 2 * i) == PH_ACTIVE_TOUCH or array.get(phases, 2 * i + 1) == PH_ACTIVE_TOUCH))
-        i += 1
-    i := 0
-    while ro and i < array.size(ps.pendingTopologyChildLiveFlags)
-        ro := not array.get(ps.pendingTopologyChildLiveFlags, i)
-        i += 1
-    i := 0
-    while ro and i < array.size(ps.pendingTopologyRootNodeLiveFlags)
-        ro := not array.get(ps.pendingTopologyRootNodeLiveFlags, i)
+        ro := not (array.get(coreLive, i) and (array.get(phases, 2 * i) == PH_ACTIVE_TOUCH or array.get(phases, 2 * i + 1) == PH_ACTIVE_TOUCH))
         i += 1
     ro
 pendingReplaceRaw(W08Core.PendingTopologyStore dst, W08Core.PendingTopologyStore src) =>
@@ -2289,7 +2312,10 @@ export planPassWithActiveTouchOverlay(ShadowContext ctx, array<int> activeTouchO
     ctx.sc.rangeChanged := false
     // the pass's only global pending pool integrity scan (free lists included), on the scratch pool before the chain; the
     // B13 / B14 planners of this pass take it as their trusted precondition
-    ctx.pendingPoolTrusted := pendingPoolsOkRaw(ctx.psPlan)
+    // R03-A: the scan is a pure function of the pool contents, identical while sc.poolVerified (scan passed, no writer since)
+    ctx.pendingPoolTrusted := ctx.sc.poolVerified or pendingPoolsOkRaw(ctx.psPlan)
+    ctx.sc.poolVerified := ctx.pendingPoolTrusted
+    ctx.topoCached := false
     int c = -1
     if ctx.pendingPoolTrusted and ovOk
         c := buildChangedTopologyPlanRaw(ctx, phases)
@@ -2446,14 +2472,9 @@ export preflightPass(ShadowContext ctx, ShadowPass pr, int materializeBaseCloseT
         i += 1
     pr.preflightOk := ok
     ok
-// W08 B15-B2: commit of a pass whose preflightPass passed (else runtime.error, nothing written). Order: 1 pending replace
-// (the planned pool), 2 materialization of the applied Candidates, 3 TouchMark ring replacement of every applied Merge
-// target / SPLIT_LOCAL row, 4 (index: in 2), 5 invalidation counts (pass.inv*), 6 consumed READY pending clear, 7 absorbed
-// free, 8 range revision (once). Every step was proven by the F0; a step reporting a fault is an invariant break
-// (runtime.error). Scalar results (nextCoreId / nextGenerationId / coreRangeRevision) stay in ctx.sc for the caller.
-export commitPass(ShadowContext ctx, ShadowPass pr, int materializeBaseCloseTime) =>
-    if not pr.preflightOk or pr.committed
-        runtime.error("W08 B15-B2: commitPass without a passed preflightPass")
+// W08 R03-B (/23): the pre-commit half of the B15-B3 dependency carry (moved verbatim from commitPass): the snapshot before
+// step 1 and the pre-commit origin pairs of every Core the commit can change. Returns [bt0, tt0, pc0, pr0, qc0, qr0, oc0, or0].
+depCarryBeforeRaw(ShadowContext ctx, ShadowPass pr) =>
     W08Core.W08Store ws = ctx.ws
     W08Core.CoreRegistryStore cr = ws.coreRegistry
     int n = ws.physicalCandidateLogicalCount
@@ -2493,36 +2514,14 @@ export commitPass(ShadowContext ctx, ShadowPass pr, int materializeBaseCloseTime
                     array.push(or0, array.get(orig, j))
                     j += 1
         cs += 1
-    if not ctx.pendingPlanShared
-        pendingReplaceRaw(ctx.ps, ctx.psPlan)
-    int fa = materializeAppliedRaw(ctx, pr.applyP, materializeBaseCloseTime, true)
-    if fa < 0
-        runtime.error("W08 B15-B2: materialization broke the pr preflight")
-    pr.freshApplied := fa
-    W08Touch.TouchRing ring = touchRingViewRaw(ctx)
-    p := 0
-    while p < n
-        int rows = 0
-        if array.get(pr.mergeOfP, p) >= 0
-            rows := W08Touch.mergeApplyCommit(ring, ctx.tp, array.get(pr.mergeOfP, p), array.get(ws.physicalMaterializedCoreSlots, p), array.get(ws.physicalMaterializedCoreIds, p))
-        else if array.get(pr.splitOfP, p) >= 0
-            rows := W08Touch.splitApplyCommit(ring, ctx.sp, array.get(pr.splitOfP, p), array.get(ws.physicalMaterializedCoreSlots, p), array.get(ws.physicalMaterializedCoreIds, p))
-        if rows < 0
-            runtime.error("W08 B15-B2: TouchMark apply broke the pr preflight")
-        pr.touchRowsWritten := pr.touchRowsWritten + rows
-        p += 1
-    i := 0
-    while i < array.size(pr.consumedSlots)
-        pendingClearChainRaw(ctx.ps, array.get(pr.consumedSlots, i))
-        i += 1
-    i := 0
-    while i < array.size(pr.freeSlots)
-        coreFreeCommitRaw(ctx, ctx.ps, array.get(pr.freeSlots, i))
-        pr.freed := pr.freed + 1
-        i += 1
-    if ctx.sc.rangeChanged
-        ctx.sc.coreRangeRevision := ctx.sc.coreRangeRevision + 1
-        ctx.sc.rangeChanged := false
+    [bt0, tt0, pc0, pr0, qc0, qr0, oc0, or0]
+// W08 R03-B (/23): the post-commit half (moved verbatim from commitPass): the snapshot after step 8, the diff, the origin /
+// L7 dependency and the sorted pr.dependencyChangedRootIds.
+depCarryAfterRaw(ShadowContext ctx, ShadowPass pr, map<int, int> bt0, map<int, int> tt0, array<int> pc0, array<int> pr0, array<int> qc0, array<int> qr0, array<int> oc0, array<int> or0) =>
+    W08Core.W08Store ws = ctx.ws
+    W08Core.CoreRegistryStore cr = ws.coreRegistry
+    array<int> orig = array.new_int(0)
+    int i = 0
     // B15-B3: W06 dependency carry = the old and new participation / origin / pending Roots of every Core whose L6 / L7 /
     // L8 snapshot changed
     [bt1, tt1, pc1, pr1, qc1, qr1] = depSnapshotRaw(ctx, ctx.ps)
@@ -2583,6 +2582,79 @@ export commitPass(ShadowContext ctx, ShadowPass pr, int materializeBaseCloseTime
     array.clear(pr.dependencyChangedRootIds)
     array.concat(pr.dependencyChangedRootIds, map.keys(dep))
     array.sort(pr.dependencyChangedRootIds, order.ascending)
+    true
+// W08 B15-B2: commit of a pass whose preflightPass passed (else runtime.error, nothing written). Order: 1 pending replace
+// (the planned pool), 2 materialization of the applied Candidates, 3 TouchMark ring replacement of every applied Merge
+// target / SPLIT_LOCAL row, 4 (index: in 2), 5 invalidation counts (pass.inv*), 6 consumed READY pending clear, 7 absorbed
+// free, 8 range revision (once). Every step was proven by the F0; a step reporting a fault is an invariant break
+// (runtime.error). Scalar results (nextCoreId / nextGenerationId / coreRangeRevision) stay in ctx.sc for the caller.
+export commitPass(ShadowContext ctx, ShadowPass pr, int materializeBaseCloseTime) =>
+    if not pr.preflightOk or pr.committed
+        runtime.error("W08 B15-B2: commitPass without a passed preflightPass")
+    W08Core.W08Store ws = ctx.ws
+    W08Core.CoreRegistryStore cr = ws.coreRegistry
+    int n = ws.physicalCandidateLogicalCount
+    // R03-B (/23): depWork = the commit may write a snapshot input (live Cores / ticks, participation, pending Root nodes):
+    // the real pool is replaced (non-shared plan), an applied Candidate (materialization, TouchMark apply, Merge frees), a
+    // consumed READY pending or a free. Without it nothing between the two snapshots writes them, the snapshots are equal
+    // and the carry is empty: both snapshots, the diff, the L7 scan and the sort are skipped (same empty result).
+    bool depWork = not ctx.pendingPlanShared or pr.appliedTargets > 0 or array.size(pr.consumedSlots) > 0 or array.size(pr.freeSlots) > 0
+    map<int, int> bt0 = na
+    map<int, int> tt0 = na
+    array<int> pc0 = na
+    array<int> pr0 = na
+    array<int> qc0 = na
+    array<int> qr0 = na
+    array<int> oc0 = na
+    array<int> or0 = na
+    if depWork
+        [xbt0, xtt0, xpc0, xpr0, xqc0, xqr0, xoc0, xor0] = depCarryBeforeRaw(ctx, pr)
+        bt0 := xbt0
+        tt0 := xtt0
+        pc0 := xpc0
+        pr0 := xpr0
+        qc0 := xqc0
+        qr0 := xqr0
+        oc0 := xoc0
+        or0 := xor0
+        // R03-A: the commit may write the real pool -> the next pass rescans it
+        ctx.sc.poolVerified := false
+    int p = 0
+    int i = 0
+    if not ctx.pendingPlanShared
+        pendingReplaceRaw(ctx.ps, ctx.psPlan)
+    int fa = materializeAppliedRaw(ctx, pr.applyP, materializeBaseCloseTime, true)
+    if fa < 0
+        runtime.error("W08 B15-B2: materialization broke the pr preflight")
+    pr.freshApplied := fa
+    W08Touch.TouchRing ring = touchRingViewRaw(ctx)
+    p := 0
+    while p < n
+        int rows = 0
+        if array.get(pr.mergeOfP, p) >= 0
+            rows := W08Touch.mergeApplyCommit(ring, ctx.tp, array.get(pr.mergeOfP, p), array.get(ws.physicalMaterializedCoreSlots, p), array.get(ws.physicalMaterializedCoreIds, p))
+        else if array.get(pr.splitOfP, p) >= 0
+            rows := W08Touch.splitApplyCommit(ring, ctx.sp, array.get(pr.splitOfP, p), array.get(ws.physicalMaterializedCoreSlots, p), array.get(ws.physicalMaterializedCoreIds, p))
+        if rows < 0
+            runtime.error("W08 B15-B2: TouchMark apply broke the pr preflight")
+        pr.touchRowsWritten := pr.touchRowsWritten + rows
+        p += 1
+    i := 0
+    while i < array.size(pr.consumedSlots)
+        pendingClearChainRaw(ctx.ps, array.get(pr.consumedSlots, i))
+        i += 1
+    i := 0
+    while i < array.size(pr.freeSlots)
+        coreFreeCommitRaw(ctx, ctx.ps, array.get(pr.freeSlots, i))
+        pr.freed := pr.freed + 1
+        i += 1
+    if ctx.sc.rangeChanged
+        ctx.sc.coreRangeRevision := ctx.sc.coreRangeRevision + 1
+        ctx.sc.rangeChanged := false
+    if depWork
+        depCarryAfterRaw(ctx, pr, bt0, tt0, pc0, pr0, qc0, qr0, oc0, or0)
+    else
+        array.clear(pr.dependencyChangedRootIds)
     ctx.pendingPoolTrusted := false
     pr.committed := true
     pr

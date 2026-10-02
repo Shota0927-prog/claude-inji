@@ -3623,3 +3623,34 @@ TV (user): R01-B1 gate 3 d still RE10110 -> B1 alone insufficient; 7 d gate not 
   Mutants: M-H1-1 (always fast) KILLED (drift 953), M-H1-3 (ActiveTouch ignored) KILLED (drift 953), M-H1-2 (pool non-empty
   ignored) SURVIVES = equivalent by the write proof above (kept as the conservative guard).
 - Regression B08-A ... B19, TV harness A / B: byte-identical (those suites stub the W08 chain). Exact compiled UNKNOWN.
+
+## Runtime Repair R03 (macro): W08Runtime /23 + Main pin / plumbing (physical only, semantic diff 0)
+TV (user): R01-B1 and R02-H1 each still RE10110 at 3 d -> one structural batch, one TV gate at the end.
+- R03-A: pendingPassReadOnlyRaw = pool shape + no live old Core Side in ActiveTouch (R02's empty-pool part dropped: the
+  B13 planner writes only diff parents, diff only for active components; M-H1-2 was equivalent). ShadowScalars.poolVerified
+  (Main ZoneEngine.w08PoolVerified, written back on committed bars): the pool scan runs only when not verified; commitPass
+  clears it whenever it may write the real pool (same predicate as depWork: non-shared replace, applied rows, consumed
+  READY, frees = every real-pool writer: pendingReplaceRaw, coreAllocSlotRaw / coreResetSlotRaw, pendingClearChainRaw,
+  coreFreeCommitRaw; Main / W08Core / W09State write none).
+- R03-B: commitPass depWork (same predicate); the B15-B3 carry halves moved verbatim (textual check) into
+  depCarryBeforeRaw / depCarryAfterRaw and run only when depWork; else pr.dependencyChangedRootIds is cleared (the /22
+  result when nothing between the snapshots writes their inputs). Steps 1-8 of commitPass verbatim.
+- R03-C (partial): on a read-only pass the B14 planner reuses the B13 planner's topologyComponentsRaw result (same inputs,
+  no writer in between; ufFindRaw only compresses paths). Skipping the B13 / B14 planners themselves NOT done: their
+  fail-closed validation (topology / pool / edge faults -> plan -1 -> F0) would be skipped too.
+- R03-D (Main): W09PassScratch (23 arrays, W02AuxStore.w09Pass) replaces the per-bar fresh arrays of the Stage C / D plan
+  (10 + tsx0), w09StageCDPlanRaw bsc, w08ProductionRaw noArm / tsx / tsc / ov / txc / tro / tsr / ivi / ivf / mki / mkf;
+  each logically cleared at its former creation point (scrIntRaw / scrFloatRaw / scrBoolRaw); no reference survives a bar.
+- R03-E (W06 recomputeAndMerge gate): NOT implemented (every call advances W06 epochs / cache scalars; skipping the call is
+  not output-identical without a W06 redesign; W06 /25 unchanged).
+- Harnesses (deterministic 1000 bars, no PRNG; interpreted /22 vs /23): real planPassWithActiveTouchOverlay (B12 touch
+  plan stubbed) + emulated commit: plan result / apply set / consumed / free / changed rows / pool / scan drift 0, corruption
+  sub-run drift 0. Carry harness (helpers interpreted): drift 0, 575 / 1000 no-op commits skipped.
+  Calls /21 -> /22 -> /23 (fixture): pendingCopyRaw 1000 -> 791 -> 316, pendingReplaceRaw 685 -> 500 -> 222,
+  pendingPoolsOkRaw 1000 -> 1000 -> 821, topologyComponentsRaw 1761 -> 1761 -> 1249, depSnapshotRaw 2000 -> 2000 -> 850,
+  carry diff 1000 -> 1000 -> 425, sort 1000 -> 425, array.copy 20000 -> 15820 -> 6320; Main glue arrays 23 / bar -> 0.
+- Mutants: M-A2 / M-A3 / M-B1..B5 / M-A1 (emulated) KILLED; M-C1 (reuse on non-shared pass) survives (equivalent on the
+  reachable states, conservative condition kept), M-C3 (B13 ok ignored) EQUIVALENT (B14 upstream needs B13 ok); R03-D clear
+  removals not reached by the suites' Main slices (static proof; poisoned-scratch runs identical).
+- Regression B08-A ... B19, TV harness A / B: byte-identical. Estimator E2: Main all exports 223,878 -> 224,527; W08Runtime
+  25,075 -> 25,450. Exact compiled UNKNOWN (Main headroom unknown).
