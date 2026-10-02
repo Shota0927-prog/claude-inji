@@ -3654,3 +3654,22 @@ TV (user): R01-B1 and R02-H1 each still RE10110 at 3 d -> one structural batch, 
   removals not reached by the suites' Main slices (static proof; poisoned-scratch runs identical).
 - Regression B08-A ... B19, TV harness A / B: byte-identical. Estimator E2: Main all exports 223,878 -> 224,527; W08Runtime
   25,075 -> 25,450. Exact compiled UNKNOWN (Main headroom unknown).
+
+## T01: TM-1 Production Integration (W08Runtime /24 = /23 + W08Touch /7, Main pin; token-only, semantic diff 0)
+TV (user): Main with R03 (W08Runtime /23) = 1,001,384 (CE10216, over 1,384). R03 runtime logic kept as is.
+- Before: Main -> W08Core /19, W08Touch /7, W08Runtime /23; W08Runtime -> W08Core /19, W08Touch /7 (two W08Touch copies).
+  After: Main -> W08Core /19, W08Runtime /24; W08Runtime /24 -> W08Core /19 only. Production imports of W08Touch: 0.
+- /24: regenerated from current W08Runtime /23 + W08Touch /7 (not copied from the old probe): the W08Touch block (types
+  TouchRing / TouchPlan / SplitTouchPlan, exports markAppend / newSplitTouchPlan, 7 functions now library-private:
+  historyExtract, mergePlanBuild, splitPlanBuild, mergeApplyPreflight / Commit, splitApplyPreflight / Commit, 14 private
+  helpers, constants) inserted before the first type, bodies verbatim; 6 duplicate constants (ID_NONE, SEQ_UNSET, SIDE_*,
+  SLOT_INVALID, all int with equal values) kept once; call-0 export markPhysicalIndex (no caller in Main / W08Runtime /
+  W08Touch) not carried; name / type / shadow collisions 0; 13 `W08Touch.` qualifiers dropped inside W08Runtime.
+  Identical to the validated TM-1 probe /3 except library name and header comments.
+- Main: W08Touch import removed, W08Runtime /23 -> /24, 9 code references W08Touch.X -> W08Runtime.X (TouchRing x3 incl.
+  .new, TouchPlan.new, SplitTouchPlan, newSplitTouchPlan, markAppend x4); W08Touch code references in Main 0.
+- Parity (W08 Touch bodies read from the merged /24 file; Main qualifiers mapped for the suites' text anchors, restored,
+  sha checked): B08-A ... B19, B14 D19, B16 R4, B18-INV, TV harness A (24 / 24, X1-X3) / B byte-identical; R03 harnesses
+  (real planPass A / C, dependency carry B, plan segment) PASS.
+- Estimate: E2 reachable 224,527 -> 224,498 (unchanged code); one full W08Touch copy removed = 8,344 source tokens ->
+  expected about -29k .. -36k compiled (P0 calibration 4.29 / source token), i.e. Main about 965k .. 972k. TV authority.
