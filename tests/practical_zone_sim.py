@@ -13,6 +13,11 @@ ZoneEnginePractical.pine (practical) line by line and checks:
   P1      Persist expiry gate == legacy every-bar scan
   K1      Track stale gate == legacy every-bar scan
 
+  TB1-TB2 Break vs Touch same-bar ordering (f_updateTrack -> strength -> touch)
+
+Evidence class: PINE_NOT_VERIFIED. These are Python mirror tests of the Pine
+logic; a PASS here is not a TradingView compile / runtime PASS.
+
 Run:  python3 tests/practical_zone_sim.py
 """
 import math
@@ -209,6 +214,7 @@ class Track:
     def __init__(self, top, bottom):
         self.top, self.bottom = top, bottom
         self.state = ST_ACTIVE
+        self.lastRole, self.breakDir, self.retested = 0, 0, False
         self.touchCount, self.touchArmed, self.touchActive, self.lastTouchBar = 0, True, False, None
 
 
@@ -511,6 +517,91 @@ def fixture_track_gate():
           f"mismatch bars={mismatches}, scans legacy={scans_legacy} gated={scans_gate}")
 
 
+# ---- f_naturalState / f_updateTrack (verbatim port, identical in legacy/practical)
+class BCfg(Cfg):
+    breakBuffer = 5.0
+    flipConfirmDist = 10.0
+    resetOnReclaim = True
+
+
+def natural_state(top, bottom, close):
+    return ST_SUPPORT if close > top else ST_RESIST if close < bottom else ST_ACTIVE
+
+
+def update_track(t, c, evalBar, bc, bh, bl, close, bar):
+    ev = 0
+    prev = t.state
+    handled = False
+    evalState = (ST_SUPPORT if t.lastRole > 0 else ST_RESIST if t.lastRole < 0 else ST_ACTIVE) \
+        if prev == ST_ACTIVE else prev
+    if evalBar:
+        if evalState == ST_RESIST and bc > t.top + c.breakBuffer:
+            t.state, t.breakDir, t.retested, handled, ev = ST_BROKEN, 1, False, True, 1
+        elif evalState == ST_SUPPORT and bc < t.bottom - c.breakBuffer:
+            t.state, t.breakDir, t.retested, handled, ev = ST_BROKEN, -1, False, True, -1
+        elif prev == ST_BROKEN and t.breakDir != 0:
+            handled = True   # (reclaim / retest / flip branches not needed for these fixtures)
+    if not handled and t.state != ST_BROKEN:
+        t.state = natural_state(t.top, t.bottom, close)
+    if t.state == ST_SUPPORT:
+        t.lastRole = 1
+    elif t.state == ST_RESIST:
+        t.lastRole = -1
+    return ev
+
+
+def engine_bar(t, c, strength, top, bottom, o_h_l_c, prev_close, bar):
+    """Practical update() order for one matched track:
+    geometry -> f_updateTrack (Break/Flip/state) -> f_applyStrength -> f_updateTouch."""
+    hi, lo, cl = o_h_l_c
+    t.top, t.bottom = top, bottom
+    # Break TF == chart TF: brClose = close[1], brEval = bar_index > 0
+    ev = update_track(t, c, prev_close is not None, prev_close, None, None, cl, bar)
+    update_touch(t, strength, hi, lo, bar, c)
+    return ev
+
+
+def fixtures_break_touch():
+    c = BCfg()
+    for name, side in (("TB1 Strong RESIST", +1), ("TB2 Strong SUPPORT", -1)):
+        # A) engine-level same bar: the bar on which f_updateTrack sets BROKEN also
+        #    overlaps the zone -> touch must not be counted on that bar.
+        t = Track(4065.0, 4045.0)
+        # bar 0: price beyond the zone on the "role" side -> RESIST (side +1) / SUPPORT (side -1)
+        bar0 = (4040, 4030, 4035) if side > 0 else (4080, 4070, 4075)
+        engine_bar(t, c, SR_STRONG, 4065.0, 4045.0, bar0, None, 0)
+        role_ok = t.state == (ST_RESIST if side > 0 else ST_SUPPORT)
+        armed_before, cnt_before = t.touchArmed, t.touchCount
+        # bar 1: zone geometry moves (members changed) so that the confirmed close[1]
+        #        is now beyond top+buffer / bottom-buffer -> Break fires on bar 1,
+        #        and bar 1's candle overlaps the zone.
+        if side > 0:
+            top, bottom, prev_close, bar1 = 4028.0, 4008.0, 4035.0, (4030, 4020, 4025)
+        else:
+            top, bottom, prev_close, bar1 = 4100.0, 4085.0, 4075.0, (4090, 4080, 4088)
+        ev = engine_bar(t, c, SR_STRONG, top, bottom, bar1, prev_close, 1)
+        ok = role_ok and armed_before and ev == side and t.state == ST_BROKEN and t.touchCount == cnt_before
+        check(f"{name}: Break bar with overlap -> BROKEN, touchCount unchanged", ok,
+              f"ev={ev} state={t.state} touch {cnt_before}->{t.touchCount}")
+
+        # B) literal scenario: the candle overlaps AND its own close is beyond
+        #    top+buffer / bottom-buffer. Reported as observed (legacy Break semantics,
+        #    f_updateTrack unchanged): Break uses the confirmed close of the PREVIOUS bar,
+        #    while the natural state uses the current close.
+        t = Track(4065.0, 4045.0)
+        engine_bar(t, c, SR_STRONG, 4065.0, 4045.0, bar0, None, 0)
+        lit = (4080, 4050, 4075) if side > 0 else (4060, 4030, 4035)
+        ev_b = engine_bar(t, c, SR_STRONG, 4065.0, 4045.0, lit, bar0[2], 1)
+        st_b, cnt_b = t.state, t.touchCount
+        nxt = (4085, 4078, 4080) if side > 0 else (4032, 4025, 4030)
+        ev_n = engine_bar(t, c, SR_STRONG, 4065.0, 4045.0, nxt, lit[2], 2)
+        LITERAL.append(f"{name} literal: breaking bar -> ev={ev_b} state={st_b} touch={cnt_b}; "
+                       f"next bar -> ev={ev_n} state={t.state} touch={t.touchCount}")
+
+
+LITERAL = []
+
+
 if __name__ == "__main__":
     fixtures_geometry()
     fixtures_strength()
@@ -518,10 +609,13 @@ if __name__ == "__main__":
     fixture_cluster_parity()
     fixture_persist_gate()
     fixture_track_gate()
+    fixtures_break_touch()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
         fails += 0 if ok else 1
         print(f"{'PASS' if ok else 'FAIL'}  {name.ljust(width)}  {detail}")
-    print(f"\n{len(RESULTS) - fails}/{len(RESULTS)} passed")
+    for line in LITERAL:
+        print("OBSERVED  " + line)
+    print(f"\n{len(RESULTS) - fails}/{len(RESULTS)} passed  [PINE_NOT_VERIFIED: Python mirror tests]")
     raise SystemExit(1 if fails else 0)
