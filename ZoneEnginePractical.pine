@@ -20,6 +20,14 @@
 //         接触1回 = +1 (同じ接触中は増えない / touchRearmDist 以上離れたら再Arm)。
 //         ZoneTrack に保持し、Zone.touchCount / zoneTouchCount() で読む。
 //
+//  それ以外 (Cluster membership / Base Score / HTF / Break / Flip / Track継承) は
+//  旧版と同じ判定式。軽量化 (結果を変えない最適化) のみ追加:
+//    ・Engine所有 scratch 配列の再利用 (毎バーの array.new を削減)
+//    ・persist → raw の全件コピー / zones → live の全件コピーを廃止
+//    ・Cluster 構築の running aggregate 化 (旧判定と数学的に同値)
+//    ・寿命切れ scan / Track stale scan の event gate 化
+//    ・表示用文字列 (sources / htfSources / sourceSig / srcLabel) を毎バー作らない
+//
 //  セクション構成:
 //    01. Config           (ZoneCfg UDT / newCfg)
 //    02. Types            (定数 / RawZone / Zone / ZoneTrack / ZoneFeed /
@@ -55,8 +63,8 @@
 //
 //  制約3: exported function は全パラメータを本体で使用しなければならない。
 //
-//  使い方 (Main Strategy 側):
-//     import <username>/ZoneEngine/1 as zn
+//  使い方 (Visual / Strategy 側):
+//     import <username>/ZoneEnginePractical/1 as zn
 //     var zn.ZoneEngine eng = zn.newEngine()
 //     zn.ZoneCfg cfg = zn.newCfg()
 //     cfg.zoneHalfWidth := input.float(5.0, "Zone Half Width ($)")
@@ -64,6 +72,7 @@
 //     zn.ZoneFeed feed = zn.ZoneFeed.new(ma1 = ..., ph1 = ..., ...)
 //     zn.update(eng, cfg, feed)
 //     zn.TradePlan plan = zn.buildPlan(eng, cfg, 1, close)
+//     int touches = zn.zoneTouchCount(eng, i)
 // ============================================================================
 
 //@version=5
@@ -95,6 +104,26 @@ string CAT_DHL = "DayHL"
 string CAT_ACC = "Accum"
 
 int MS_PER_DAY = 86400000
+
+// ---- Practical: Source / HTF mask bit (表示用。判定には使わない) ------------
+int SRC_SW1   = 1      // Horizontal Swing · hzTf1
+int SRC_SW2   = 2      // Horizontal Swing · hzTf2
+int SRC_SW3   = 4      // Horizontal Swing · hzTf3
+int SRC_HZX   = 8      // その他 Horizontal (Prev Day H/L 等)
+int SRC_ACC1  = 16     // Accum · accTf1
+int SRC_ACC2  = 32     // Accum · accTf2
+int SRC_ACC3  = 64     // Accum · accTf3
+int SRC_MA1   = 128
+int SRC_MA2   = 256
+int SRC_DHL   = 512    // Day High / Low
+int HTF_SW1H  = 1
+int HTF_ACC1  = 2
+int HTF_ACC2  = 4
+int HTF_ACC3  = 8
+int HTF_SW15  = 16
+int HTF_MA1   = 32
+int HTF_MA2   = 64
+int HTF_DAY   = 128
 
 // ============================================================================
 // 01. CONFIG
@@ -208,7 +237,6 @@ export type RawZone
     string srcId          = ""
     string srcCat         = ""
     string srcTf          = ""
-    string srcLabel       = ""
     float  center         = 0.0
     float  top            = 0.0
     float  bottom         = 0.0
@@ -241,12 +269,14 @@ export type Zone
     int    flipDir       = 0
     int    catCount      = 0
     int    memberCount   = 0
-    string sources       = ""
     int    trackId       = -1
     array<int> memberUids
-    string sourceSig     = ""
     bool   hasHtf        = false
-    string htfSources    = ""
+    //  ★ Practical: 旧 sources / htfSources / sourceSig 文字列は廃止 (毎バー構築しない)。
+    //    表示が必要なら Visual 側で barstate.islast のときだけ
+    //    sourceText() / htfText() でこの mask から文字列化する。
+    int    srcMask       = 0     // SRC_* bit の和
+    int    htfMask       = 0     // HTF_* bit の和 (hasHtf == (htfMask != 0))
     // Strong Touch Count (ZoneTrack の値の写し。Score / Strength には使わない)
     int    touchCount    = 0
 
@@ -264,9 +294,10 @@ export type ZoneTrack
     bool  flipped     = false
     int   flipDir     = 0
     int   lastSeenBar = 0
-    bool  matched     = false
+    //  ★ Practical: 旧 bool matched を「マッチしたバー番号」に置換。
+    //    matched ⇔ matchedBar == bar_index。毎バーの全Track reset scan が不要になる。
+    int   matchedBar  = na
     array<int> memberUids
-    string sourceSig  = ""
     // -- Strong Touch Count (Strengthとは完全に独立) --
     int   touchCount   = 0
     bool  touchArmed   = true
@@ -357,6 +388,21 @@ export type ZoneEngine
     int   ma1Dir = 0
     int   ma2Dir = 0
     float maClusterBonus = 0.0
+    // ---- Practical: Event gate ----------------------------------------------
+    //  nextPersistExpireTime : persist 内の expireTime > 0 の最小値以下の値 (na = 期限付きなし)
+    //  nextTrackExpireBar    : 全Trackの (lastSeenBar + trackStaleBars + 1) の最小値以下の値
+    //  どちらも「その時刻 / バーより前に削除対象は存在しない」ことだけを保証する下限。
+    //  実際の値より小さい (古い) ことはあっても大きいことは無い → 早めに scan するだけで
+    //  削除結果・削除タイミングは旧版の毎バー scan と一致する。
+    int   nextPersistExpireTime = na
+    int   nextTrackExpireBar    = na
+    bool  persistAdded          = false
+    // ---- Practical: Engine-owned scratch (newEngine() で1回だけ確保) --------
+    array<RawZone> sDynPool     // 動的Source用 RawZone 4個 (0:MA1 1:MA2 2:DayHigh 3:DayLow)
+    array<RawZone> sDyn         // このバーで有効な動的Source
+    array<float>   sCenters     // Cluster 並べ替え用 center
+    array<RawZone> sCur         // 構築中 Cluster の member
+    array<int>     sIds         // Accum 世代管理用
 
 // ---- TradePlan : Entry Module / Trade Engine へ返す構造 -------------------
 export type TradePlan
@@ -392,7 +438,12 @@ export newCfg() =>
 // @function       Zone Engineの永続状態を作る。Main Strategyで var 宣言すること。
 // @returns        ZoneEngine
 export newEngine() =>
-    ZoneEngine.new(persist = array.new<RawZone>(), live = array.new<Zone>(), tracks = array.new<ZoneTrack>())
+    array<RawZone> pool = array.new<RawZone>()
+    for i = 0 to 3
+        array.push(pool, RawZone.new(dynamic = true))
+    ZoneEngine.new(persist = array.new<RawZone>(), live = array.new<Zone>(), tracks = array.new<ZoneTrack>(),
+         sDynPool = pool, sDyn = array.new<RawZone>(), sCenters = array.new_float(),
+         sCur = array.new<RawZone>(), sIds = array.new_int())
 
 // ============================================================================
 // 03. SOURCE DETECTION
@@ -430,9 +481,6 @@ f_confluenceBonus(int catCount, ZoneCfg c) =>
 
 f_days2ms(float d) =>
     int(d * MS_PER_DAY)
-
-f_arrow(int dir) =>
-    dir > 0 ? "↑" : dir < 0 ? "↓" : "→"
 
 // ---- 3.2 MA Source ---------------------------------------------------------
 f_ma(float src, simple string maType, simple int len) =>
@@ -596,14 +644,24 @@ f_nextUid(ZoneEngine e) =>
     e.uidSeq := e.uidSeq + 1
     e.uidSeq
 
-f_makeRaw(ZoneCfg c, int uid, string id, string cat, string tf, string lbl, float ctr, float bs, bool dyn) =>
-    RawZone.new(uid = uid, srcId = id, srcCat = cat, srcTf = tf, srcLabel = lbl,
+//  ★ Practical: 旧 srcLabel (表示用文字列) は廃止。毎バーの文字列連結を無くすため。
+f_makeRaw(ZoneCfg c, int uid, string id, string cat, string tf, float ctr, float bs, bool dyn) =>
+    RawZone.new(uid = uid, srcId = id, srcCat = cat, srcTf = tf,
          center = ctr, top = ctr + c.zoneHalfWidth, bottom = ctr - c.zoneHalfWidth,
          baseScore = bs, createdBar = bar_index, createdTime = time, dynamic = dyn)
 
+// persist へ1件追加した時の event gate 更新 (Practical)
+f_onPersistPush(ZoneEngine e, int expireTime) =>
+    e.persistAdded := true
+    if expireTime > 0
+        e.nextPersistExpireTime := na(e.nextPersistExpireTime) ? expireTime : math.min(e.nextPersistExpireTime, expireTime)
+    true
+
 // 同一 srcId・同一TF・±zoneHalfWidth 以内に既存Zoneがあれば新規追加せず寿命だけ更新。
+//  ※ 寿命更新は expireTime を後ろへ動かすだけなので nextPersistExpireTime (下限) は
+//    更新不要 (早めに scan するだけで結果は同じ)。
 f_registerStatic(ZoneEngine e, ZoneCfg c, bool trig, float price, string id, string cat,
-     string tf, string lbl, float bs, float lifeDays) =>
+     string tf, float bs, float lifeDays) =>
     if trig and not na(price)
         int life = f_days2ms(lifeDays)
         bool dup = false
@@ -616,15 +674,16 @@ f_registerStatic(ZoneEngine e, ZoneCfg c, bool trig, float price, string id, str
                         z.expireTime := time + life
                     break
         if not dup
-            RawZone rz = f_makeRaw(c, f_nextUid(e), id, cat, tf, lbl, price, bs, false)
+            RawZone rz = f_makeRaw(c, f_nextUid(e), id, cat, tf, price, bs, false)
             rz.expireTime := life > 0 ? time + life : 0
             array.push(e.persist, rz)
+            f_onPersistPush(e, rz.expireTime)
     true
 
 // 同一Accumインスタンス (検出ID一致) ならUIDを維持したまま位置更新。
 // 新しいAccum (検出IDが変化) のときだけ新UIDのRaw Zoneを発行する。
 f_registerAccumZone(ZoneEngine e, ZoneCfg c, bool trig, float price, int instId,
-     string id, string tf, string lbl, float bs) =>
+     string id, string tf, float bs) =>
     if trig and not na(price) and not na(instId)
         bool found = false
         if array.size(e.persist) > 0
@@ -637,22 +696,21 @@ f_registerAccumZone(ZoneEngine e, ZoneCfg c, bool trig, float price, int instId,
                     z.bottom := price - c.zoneHalfWidth
                     break
         if not found
-            RawZone rz = f_makeRaw(c, f_nextUid(e), id, CAT_ACC, tf, lbl, price, bs, false)
+            RawZone rz = f_makeRaw(c, f_nextUid(e), id, CAT_ACC, tf, price, bs, false)
             rz.instId     := instId
             rz.expireTime := 0
             array.push(e.persist, rz)
+            f_onPersistPush(e, rz.expireTime)
     true
 
 // 時間足ごとに「最新 keepCount 個のAccumインスタンス」だけ残す。
 // High / Low は同じ instId を共有するので必ずセットで削除される。
-//  ★ trig : そのTFで Accum Zone が新規登録され得たバーだけ true。
-//    Accum Zone を push するのは f_registerAccumZone だけであり、それ以外の経路で
-//    インスタンス数が増えることはない (f_prunePersist は削除方向にしか働かない)。
-//    したがって登録が起きていないバーでは、この関数は必ず「何もしない」で終わる。
-//    毎バー persist 全走査 × 3TF していたぶんを丸ごと省ける。
+//  ★ trig : そのTFで Accum Zone が新規登録され得たバーだけ true (旧版の最適化を維持)。
+//  ★ Practical: 作業配列は Engine 所有 scratch (e.sIds) を clear して再利用。
 f_pruneAccumGenerations(ZoneEngine e, bool trig, string tf, int keepCount) =>
     if trig and keepCount >= 1
-        array<int> ids = array.new_int()
+        array<int> ids = e.sIds
+        array.clear(ids)
         if array.size(e.persist) > 0
             for i = 0 to array.size(e.persist) - 1
                 RawZone z = array.get(e.persist, i)
@@ -676,25 +734,40 @@ f_pruneAccumGenerations(ZoneEngine e, bool trig, string tf, int keepCount) =>
     true
 
 // ---- 3.6 寿命切れ / 上限超過の破棄 ----------------------------------------
+//  ★ Practical event gate:
+//    ・寿命切れ scan は time > nextPersistExpireTime のバーだけ実行し、
+//      scan後に残りの最小 expireTime を再計算する。
+//      (Reaction による寿命延長は廃止したので、expireTime が後ろへ動くのは
+//       f_registerStatic の重複リフレッシュだけ = 下限が古くなるだけで安全)
+//    ・maxPersistZones 超過確認は、このバーで persist へ追加があった時だけ。
+//      (persist が増えるのは push だけなので、追加の無いバーで超過は起こらない)
+//    判定式 (time > expireTime / while size > max) と削除順は旧版と同一。
 f_prunePersist(ZoneEngine e, ZoneCfg c) =>
-    if array.size(e.persist) > 0
-        for i = array.size(e.persist) - 1 to 0
-            if i < array.size(e.persist)
-                RawZone z = array.get(e.persist, i)
-                if z.expireTime > 0 and time > z.expireTime
-                    array.remove(e.persist, i)
-    while array.size(e.persist) > c.maxPersistZones
-        RawZone z0 = array.get(e.persist, 0)
-        if z0.srcCat == CAT_ACC
-            string tf0 = z0.srcTf
-            int    id0 = z0.instId
+    if not na(e.nextPersistExpireTime) and time > e.nextPersistExpireTime
+        int nextExp = na
+        if array.size(e.persist) > 0
             for i = array.size(e.persist) - 1 to 0
                 if i < array.size(e.persist)
                     RawZone z = array.get(e.persist, i)
-                    if z.srcCat == CAT_ACC and z.srcTf == tf0 and z.instId == id0
+                    if z.expireTime > 0 and time > z.expireTime
                         array.remove(e.persist, i)
-        else
-            array.shift(e.persist)
+                    else if z.expireTime > 0
+                        nextExp := na(nextExp) ? z.expireTime : math.min(nextExp, z.expireTime)
+        e.nextPersistExpireTime := nextExp
+    if e.persistAdded
+        while array.size(e.persist) > c.maxPersistZones
+            RawZone z0 = array.get(e.persist, 0)
+            if z0.srcCat == CAT_ACC
+                string tf0 = z0.srcTf
+                int    id0 = z0.instId
+                for i = array.size(e.persist) - 1 to 0
+                    if i < array.size(e.persist)
+                        RawZone z = array.get(e.persist, i)
+                        if z.srcCat == CAT_ACC and z.srcTf == tf0 and z.instId == id0
+                            array.remove(e.persist, i)
+            else
+                array.shift(e.persist)
+    e.persistAdded := false
     true
 
 // ============================================================================
@@ -706,12 +779,18 @@ f_prunePersist(ZoneEngine e, ZoneCfg c) =>
 //      Accum            : 同一TF・同一種別 (High/Low) は1回だけ加点
 //      MA / DayHL       : 個別に加算
 
+// Pine には bit 演算子が無いので算術で扱う (b は 2 の冪)
+f_hasBit(int m, int b) =>
+    math.floor(m / b) % 2 == 1
+
+f_setBit(int m, int b) =>
+    f_hasBit(m, b) ? m : m + b
+
 f_weightOf(RawZone z) =>
     math.max(z.baseScore, 0.01)
 
-f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
-    float tw      = 0.0
-    float ts      = 0.0
+//  zBot / zTop : f_buildClusters の running aggregate (min member.bottom / max member.top)
+f_finalizeCluster(array<RawZone> members, ZoneCfg c, float zBot, float zTop) =>
     float baseSum = 0.0
     float slopeB  = 0.0
     float maB     = 0.0
@@ -729,47 +808,39 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
     bool accLo2 = false
     bool accHi3 = false
     bool accLo3 = false
-    bool htfSw1h = false
-    bool htfAc1  = false
-    bool htfAc2  = false
-    bool htfAc3  = false
-    bool htfSw15 = false
-    bool htfM1   = false
-    bool htfM2   = false
-    bool htfDay  = false
+    int  srcM   = 0
+    int  htfM   = 0
 
-    string srcStr = ""
-    array<int>    uids   = array.new_int()
-    array<string> grpKey = array.new_string()
-    array<int>    grpCnt = array.new_int()
+    array<int> uids = array.new_int()
 
     int n = array.size(members)
     for j = 0 to n - 1
         RawZone m = array.get(members, j)
 
-        float w = f_weightOf(m)
-        tw += w
-        ts += m.center * w
-
         bool isSwing = m.srcCat == CAT_HZ and (m.srcId == "SWING_H" or m.srcId == "SWING_L")
         bool isAccHi = m.srcId == "ACC_HI"
         if isSwing
             if m.srcTf == c.hzTf1
+                srcM := f_setBit(srcM, SRC_SW1)
                 if not swHit1
                     swHit1  := true
                     baseSum += c.scoreHz1
             else if m.srcTf == c.hzTf2
+                srcM := f_setBit(srcM, SRC_SW2)
                 if not swHit2
                     swHit2  := true
                     baseSum += c.scoreHz2
             else if m.srcTf == c.hzTf3
+                srcM := f_setBit(srcM, SRC_SW3)
                 if not swHit3
                     swHit3  := true
                     baseSum += c.scoreHz3
             else
+                srcM := f_setBit(srcM, SRC_HZX)
                 baseSum += m.baseScore
         else if m.srcCat == CAT_ACC
             if m.srcTf == c.accTf1
+                srcM := f_setBit(srcM, SRC_ACC1)
                 if isAccHi and not accHi1
                     accHi1  := true
                     baseSum += m.baseScore
@@ -777,6 +848,7 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
                     accLo1  := true
                     baseSum += m.baseScore
             else if m.srcTf == c.accTf2
+                srcM := f_setBit(srcM, SRC_ACC2)
                 if isAccHi and not accHi2
                     accHi2  := true
                     baseSum += m.baseScore
@@ -784,6 +856,7 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
                     accLo2  := true
                     baseSum += m.baseScore
             else if m.srcTf == c.accTf3
+                srcM := f_setBit(srcM, SRC_ACC3)
                 if isAccHi and not accHi3
                     accHi3  := true
                     baseSum += m.baseScore
@@ -794,83 +867,48 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
                 baseSum += m.baseScore
         else
             baseSum += m.baseScore
+            if m.srcCat == CAT_HZ
+                srcM := f_setBit(srcM, SRC_HZX)
+            else if m.srcId == "MA1"
+                srcM := f_setBit(srcM, SRC_MA1)
+            else if m.srcId == "MA2"
+                srcM := f_setBit(srcM, SRC_MA2)
+            else if m.srcCat == CAT_DHL
+                srcM := f_setBit(srcM, SRC_DHL)
 
         slopeB   := c.slopeBonusMax ? math.max(slopeB, m.slopeBonus) : slopeB + m.slopeBonus
         maB      := math.max(maB, m.maClusterBonus)
 
+        // HTF判定 (条件式は旧版と同一。旧 htfSources 文字列の代わりに bit を立てる)
         if isSwing and m.srcTf == c.hzTf3 and c.htfSwing1H
-            htfSw1h := true
+            htfM := f_setBit(htfM, HTF_SW1H)
         if isSwing and m.srcTf == c.hzTf2 and c.htfSwing15M
-            htfSw15 := true
+            htfM := f_setBit(htfM, HTF_SW15)
         if m.srcCat == CAT_ACC and m.srcTf == c.accTf1 and c.htfAccum1H
-            htfAc1 := true
+            htfM := f_setBit(htfM, HTF_ACC1)
         if m.srcCat == CAT_ACC and m.srcTf == c.accTf2 and c.htfAccum4H
-            htfAc2 := true
+            htfM := f_setBit(htfM, HTF_ACC2)
         if m.srcCat == CAT_ACC and m.srcTf == c.accTf3 and c.htfAccumD
-            htfAc3 := true
+            htfM := f_setBit(htfM, HTF_ACC3)
         if m.srcId == "MA1" and c.htfMa1
-            htfM1 := true
+            htfM := f_setBit(htfM, HTF_MA1)
         if m.srcId == "MA2" and c.htfMa2
-            htfM2 := true
+            htfM := f_setBit(htfM, HTF_MA2)
         if m.srcCat == CAT_DHL and c.htfDayHL
-            htfDay := true
+            htfM := f_setBit(htfM, HTF_DAY)
 
-        // ※ 以前ここで sourceSig 用の文字列を毎バー連結していたが、
-        //   sourceSig はどこからも読まれない (判定にも表示にも使わない) ため廃止。
-        //   Zone.sourceSig / ZoneTrack.sourceSig のフィールドは互換のため残し、常に "" とする。
         array.push(uids, m.uid)
         hasMA   := hasMA  or m.srcCat == CAT_MA
         hasHZ   := hasHZ  or m.srcCat == CAT_HZ
         hasDHL  := hasDHL or m.srcCat == CAT_DHL
         hasACC  := hasACC or m.srcCat == CAT_ACC
 
-        string gk = m.srcLabel
-        if isSwing
-            gk := m.srcTf + " Swing"
-        else if m.srcCat == CAT_ACC
-            gk := m.srcTf + " Accum " + (isAccHi ? "High" : "Low")
-        int gi = array.indexof(grpKey, gk)
-        if gi >= 0
-            array.set(grpCnt, gi, array.get(grpCnt, gi) + 1)
-        else
-            array.push(grpKey, gk)
-            array.push(grpCnt, 1)
-
-    string htfStr = ""
-    if htfSw1h
-        htfStr := htfStr + (htfStr == "" ? "" : " / ") + f_tfName(c.hzTf3) + " Swing"
-    if htfAc1
-        htfStr := htfStr + (htfStr == "" ? "" : " / ") + f_tfName(c.accTf1) + " Accum"
-    if htfAc2
-        htfStr := htfStr + (htfStr == "" ? "" : " / ") + f_tfName(c.accTf2) + " Accum"
-    if htfAc3
-        htfStr := htfStr + (htfStr == "" ? "" : " / ") + f_tfName(c.accTf3) + " Accum"
-    if htfSw15
-        htfStr := htfStr + (htfStr == "" ? "" : " / ") + f_tfName(c.hzTf2) + " Swing"
-    if htfM1
-        htfStr := htfStr + (htfStr == "" ? "" : " / ") + str.tostring(c.ma1Len) + "MA"
-    if htfM2
-        htfStr := htfStr + (htfStr == "" ? "" : " / ") + str.tostring(c.ma2Len) + "MA"
-    if htfDay
-        htfStr := htfStr + (htfStr == "" ? "" : " / ") + "Day H/L"
-    bool hasHtfStruct = htfStr != ""
-
-    if array.size(grpKey) > 0
-        for k = 0 to array.size(grpKey) - 1
-            int cn = array.get(grpCnt, k)
-            srcStr := srcStr + (k > 0 ? " / " : "") + array.get(grpKey, k) + (cn > 1 ? " x" + str.tostring(cn) : "")
-
     int   cat = (hasMA ? 1 : 0) + (hasHZ ? 1 : 0) + (hasDHL ? 1 : 0) + (hasACC ? 1 : 0)
     float confB = f_confluenceBonus(cat, c)
 
     // ---- Zone上下限 (Practical: Variable Zone Geometry) --------------------
     //   Cluster内の全RawZoneを包む範囲。最大幅capは入れない。
-    float zBot = na
-    float zTop = na
-    for j = 0 to n - 1
-        RawZone m = array.get(members, j)
-        zBot := na(zBot) ? m.bottom : math.min(zBot, m.bottom)
-        zTop := na(zTop) ? m.top    : math.max(zTop, m.top)
+    //   bottom = min(member.bottom) / top = max(member.top) / center = 中点
     float ctr = (zTop + zBot) / 2
     Zone.new(
          center = ctr, top = zTop, bottom = zBot,
@@ -878,50 +916,81 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
          baseSum = baseSum, slopeBonus = slopeB, maBonus = maB,
          flipBonus = 0.0, confBonus = confB,
          strength = SR_WEAK, state = ST_ACTIVE, flipped = false, flipDir = 0,
-         catCount = cat, memberCount = n, sources = srcStr, trackId = -1,
-         memberUids = uids, sourceSig = "",
-         hasHtf = hasHtfStruct, htfSources = htfStr)
+         catCount = cat, memberCount = n, trackId = -1,
+         memberUids = uids, hasHtf = htfM != 0,
+         srcMask = srcM, htfMask = htfM)
 
-f_buildClusters(array<RawZone> src, ZoneCfg c) =>
-    array<Zone> out = array.new<Zone>()
-    int n = array.size(src)
+// ★ Practical: persist + 動的Source を中間コピーせず直接 Cluster 化し、e.live へ出力する。
+//   ・並べ替え対象の順序は旧版の raw 配列と同一 (persist 全件 → 動的Source) なので、
+//     sort_indices の結果 (同値centerの順序を含む) も旧版と同一。
+//   ・membership 判定は running aggregate で行う。旧版との同値性:
+//       旧: |z.center - newCenter| <= d  かつ  全member m で |m.center - newCenter| <= d
+//       新: |z.center - newCenter| <= d  かつ  |minCenter - newCenter| <= d
+//                                         かつ  |maxCenter - newCenter| <= d
+//     minCenter / maxCenter は実在する member の center そのもの。任意の member m は
+//     minCenter <= m.center <= maxCenter であり、浮動小数の減算 fl(a - b) は a に対して
+//     単調なので |fl(m - nc)| <= max(|fl(minC - nc)|, |fl(maxC - nc)|) が厳密に成り立つ。
+//     よって「全member以内」⇔「両端のmemberが以内」(近似ではなく同値)。
+//   ・newCenter の分子 / 分母は旧版と同じ順序・同じ式で逐次加算した値なので
+//     浮動小数としても旧版のループ再計算とビット単位で一致する。
+f_buildClusters(ZoneEngine e, ZoneCfg c) =>
+    array.clear(e.live)
+    int nP = array.size(e.persist)
+    int nD = array.size(e.sDyn)
+    int n  = nP + nD
     if n > 0
-        array<float> centers = array.new_float()
-        for i = 0 to n - 1
-            array.push(centers, array.get(src, i).center)
+        array<float> centers = e.sCenters
+        array.clear(centers)
+        //  (三項演算子で array.get を両側に書くと範囲外 index を評価し得るので if で分ける)
+        if nP > 0
+            for i = 0 to nP - 1
+                array.push(centers, array.get(e.persist, i).center)
+        if nD > 0
+            for i = 0 to nD - 1
+                array.push(centers, array.get(e.sDyn, i).center)
         array<int> ord = array.sort_indices(centers, order.ascending)
 
-        array<RawZone> cur = array.new<RawZone>()
+        array<RawZone> cur = e.sCur
+        array.clear(cur)
+        float wSum  = 0.0
+        float wcSum = 0.0
+        float minC  = na
+        float maxC  = na
+        float minB  = na
+        float maxT  = na
         for k = 0 to n - 1
-            RawZone z = array.get(src, array.get(ord, k))
-            if array.size(cur) == 0
-                array.push(cur, z)
+            int oi = array.get(ord, k)
+            RawZone z = na
+            if oi < nP
+                z := array.get(e.persist, oi)
             else
-                float tw = 0.0
-                float ts = 0.0
-                for j = 0 to array.size(cur) - 1
-                    RawZone m = array.get(cur, j)
-                    float w = f_weightOf(m)
-                    tw += w
-                    ts += m.center * w
-                float wz = f_weightOf(z)
-                float newCenter = (ts + z.center * wz) / (tw + wz)
-
+                z := array.get(e.sDyn, oi - nP)
+            float wz = f_weightOf(z)
+            if array.size(cur) > 0
+                float newCenter = (wcSum + z.center * wz) / (wSum + wz)
                 bool ok = math.abs(z.center - newCenter) <= c.clusterDist
-                if ok
-                    for j = 0 to array.size(cur) - 1
-                        if math.abs(array.get(cur, j).center - newCenter) > c.clusterDist
-                            ok := false
-                            break
-                if ok
-                    array.push(cur, z)
-                else
-                    array.push(out, f_finalizeCluster(cur, c))
-                    cur := array.new<RawZone>()
-                    array.push(cur, z)
+                     and math.abs(minC - newCenter) <= c.clusterDist
+                     and math.abs(maxC - newCenter) <= c.clusterDist
+                if not ok
+                    array.push(e.live, f_finalizeCluster(cur, c, minB, maxT))
+                    array.clear(cur)
+                    wSum  := 0.0
+                    wcSum := 0.0
+                    minC  := na
+                    maxC  := na
+                    minB  := na
+                    maxT  := na
+            array.push(cur, z)
+            wSum  += wz
+            wcSum += z.center * wz
+            minC  := na(minC) ? z.center : math.min(minC, z.center)
+            maxC  := na(maxC) ? z.center : math.max(maxC, z.center)
+            minB  := na(minB) ? z.bottom : math.min(minB, z.bottom)
+            maxT  := na(maxT) ? z.top    : math.max(maxT, z.top)
         if array.size(cur) > 0
-            array.push(out, f_finalizeCluster(cur, c))
-    out
+            array.push(e.live, f_finalizeCluster(cur, c, minB, maxT))
+            array.clear(cur)
+    array.size(e.live)
 
 f_applyStrength(Zone z, ZoneCfg c) =>
     //  Practical Score = Base Score + Slope Bonus + MA Cluster Bonus
@@ -959,7 +1028,7 @@ f_findTrack(ZoneEngine e, Zone z, ZoneCfg c) =>
     if array.size(e.tracks) > 0
         for i = 0 to array.size(e.tracks) - 1
             ZoneTrack t = array.get(e.tracks, i)
-            if not t.matched
+            if na(t.matchedBar) or t.matchedBar != bar_index
                 float d = math.abs(t.center - z.center)
                 // 距離で弾けるTrackに対しては f_trackContinuous (uid突き合わせ = O(n^2))
                 // を呼ばないようネストする。判定結果は and 連結時と完全に同じ。
@@ -1049,11 +1118,12 @@ f_updateTrack(ZoneTrack t, ZoneCfg c, bool evalBar, float bc, float bh, float bl
 
 // ---- 5.x Strong Touch Count -----------------------------------------------
 //  ★ Strength とは完全に独立。この関数は Zone / Track の Score / Strength を
-//    一切読み書きしない (strength は「数えるか否か」の判定にだけ使う)。
+//    一切書き換えない (strength は「数えるか否か」の判定にだけ読む)。
 //  Touch判定 : strength >= SR_STRONG かつ state が SUPPORT / RESIST かつ Armed
 //              low <= top and high >= bottom で +1 → Disarm
 //  Re-arm    : ローソク全体が top + touchRearmDist 以上 / bottom - touchRearmDist 以下
 //  ・Medium 中 / Broken 中は数えない。touchCount は reset しない (Track保持)。
+//  ・その Track が今バーの Zone にマッチした時だけ呼ばれる。
 f_updateTouch(ZoneTrack t, Zone z, ZoneCfg c) =>
     if t.touchArmed
         bool eligible = z.strength >= SR_STRONG and (t.state == ST_SUPPORT or t.state == ST_RESIST)
@@ -1074,17 +1144,39 @@ f_updateTouch(ZoneTrack t, Zone z, ZoneCfg c) =>
 // 06. LIVE ZONE MAP
 // ----------------------------------------------------------------------------
 //  update() を毎バー1回呼ぶことで Zone Engine 全体が更新される。
-//  分割前 Strategy の Section 3.4〜3.17 と同じ順序で処理する。
+//  処理順は旧版と同一 (Reaction計測だけが無い)。
 // ============================================================================
 
 f_maSlopeBonus(float maVal, int dir, int st, ZoneCfg c) =>
     bool aligned = (dir > 0 and close > maVal) or (dir < 0 and close < maVal)
     aligned ? f_slopeBonusValue(st, c) : 0.0
 
+// 動的Source用の scratch RawZone を今バーの値で上書きして sDyn へ積む。
+//  (旧版の f_makeRaw による毎バー新規生成と同じフィールド値になる)
+f_pushDyn(ZoneEngine e, ZoneCfg c, int slot, int uid, string id, string cat, string tf, float ctr, float bs,
+     int slopeSt, int slopeDr, float slopeB, float maClB) =>
+    RawZone rz = array.get(e.sDynPool, slot)
+    rz.uid            := uid
+    rz.srcId          := id
+    rz.srcCat         := cat
+    rz.srcTf          := tf
+    rz.center         := ctr
+    rz.top            := ctr + c.zoneHalfWidth
+    rz.bottom         := ctr - c.zoneHalfWidth
+    rz.baseScore      := bs
+    rz.slopeState     := slopeSt
+    rz.slopeDir       := slopeDr
+    rz.slopeBonus     := slopeB
+    rz.maClusterBonus := maClB
+    rz.createdBar     := bar_index
+    rz.createdTime    := time
+    array.push(e.sDyn, rz)
+    true
+
 // @function     Zone Engine を1バー分更新する。毎バー必ず1回呼ぶこと。
-// @param e      ZoneEngine (Main Strategy で var 宣言した永続状態)
+// @param e      ZoneEngine (呼び出し側で var 宣言した永続状態)
 // @param c      ZoneCfg
-// @param f      ZoneFeed (Main Strategy が request.security で取得した外部入力)
+// @param f      ZoneFeed (呼び出し側が request.security で取得した外部入力)
 // @returns      Live Zone Map の Zone 数
 export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     // ---- 6.1 取引日 / Day High · Low --------------------------------------
@@ -1140,20 +1232,20 @@ export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
               or (not na(f.acc3Lo) and (na(e.pAcc3Lo) or f.acc3Lo != e.pAcc3Lo))
 
     // ---- 6.4 Swing High / Low 登録 ----------------------------------------
-    f_registerStatic(e, c, c.useHzSource and nPh1, f.ph1, "SWING_H", CAT_HZ, c.hzTf1, c.hzTf1 + " Swing High", c.scoreHz1, c.lifeHz1)
-    f_registerStatic(e, c, c.useHzSource and nPl1, f.pl1, "SWING_L", CAT_HZ, c.hzTf1, c.hzTf1 + " Swing Low",  c.scoreHz1, c.lifeHz1)
-    f_registerStatic(e, c, c.useHzSource and nPh2, f.ph2, "SWING_H", CAT_HZ, c.hzTf2, c.hzTf2 + " Swing High", c.scoreHz2, c.lifeHz2)
-    f_registerStatic(e, c, c.useHzSource and nPl2, f.pl2, "SWING_L", CAT_HZ, c.hzTf2, c.hzTf2 + " Swing Low",  c.scoreHz2, c.lifeHz2)
-    f_registerStatic(e, c, c.useHzSource and nPh3, f.ph3, "SWING_H", CAT_HZ, c.hzTf3, c.hzTf3 + " Swing High", c.scoreHz3, c.lifeHz3)
-    f_registerStatic(e, c, c.useHzSource and nPl3, f.pl3, "SWING_L", CAT_HZ, c.hzTf3, c.hzTf3 + " Swing Low",  c.scoreHz3, c.lifeHz3)
+    f_registerStatic(e, c, c.useHzSource and nPh1, f.ph1, "SWING_H", CAT_HZ, c.hzTf1, c.scoreHz1, c.lifeHz1)
+    f_registerStatic(e, c, c.useHzSource and nPl1, f.pl1, "SWING_L", CAT_HZ, c.hzTf1, c.scoreHz1, c.lifeHz1)
+    f_registerStatic(e, c, c.useHzSource and nPh2, f.ph2, "SWING_H", CAT_HZ, c.hzTf2, c.scoreHz2, c.lifeHz2)
+    f_registerStatic(e, c, c.useHzSource and nPl2, f.pl2, "SWING_L", CAT_HZ, c.hzTf2, c.scoreHz2, c.lifeHz2)
+    f_registerStatic(e, c, c.useHzSource and nPh3, f.ph3, "SWING_H", CAT_HZ, c.hzTf3, c.scoreHz3, c.lifeHz3)
+    f_registerStatic(e, c, c.useHzSource and nPl3, f.pl3, "SWING_L", CAT_HZ, c.hzTf3, c.scoreHz3, c.lifeHz3)
 
     // ---- 6.5 Accumulation Box 上限 / 下限 登録 ----------------------------
-    f_registerAccumZone(e, c, c.useAccSource and nAc1, f.acc1Hi, f.acc1Id, "ACC_HI", c.accTf1, c.accTf1 + " Accum High", c.scoreAcc1)
-    f_registerAccumZone(e, c, c.useAccSource and nAc1, f.acc1Lo, f.acc1Id, "ACC_LO", c.accTf1, c.accTf1 + " Accum Low",  c.scoreAcc1)
-    f_registerAccumZone(e, c, c.useAccSource and nAc2, f.acc2Hi, f.acc2Id, "ACC_HI", c.accTf2, c.accTf2 + " Accum High", c.scoreAcc2)
-    f_registerAccumZone(e, c, c.useAccSource and nAc2, f.acc2Lo, f.acc2Id, "ACC_LO", c.accTf2, c.accTf2 + " Accum Low",  c.scoreAcc2)
-    f_registerAccumZone(e, c, c.useAccSource and nAc3, f.acc3Hi, f.acc3Id, "ACC_HI", c.accTf3, c.accTf3 + " Accum High", c.scoreAcc3)
-    f_registerAccumZone(e, c, c.useAccSource and nAc3, f.acc3Lo, f.acc3Id, "ACC_LO", c.accTf3, c.accTf3 + " Accum Low",  c.scoreAcc3)
+    f_registerAccumZone(e, c, c.useAccSource and nAc1, f.acc1Hi, f.acc1Id, "ACC_HI", c.accTf1, c.scoreAcc1)
+    f_registerAccumZone(e, c, c.useAccSource and nAc1, f.acc1Lo, f.acc1Id, "ACC_LO", c.accTf1, c.scoreAcc1)
+    f_registerAccumZone(e, c, c.useAccSource and nAc2, f.acc2Hi, f.acc2Id, "ACC_HI", c.accTf2, c.scoreAcc2)
+    f_registerAccumZone(e, c, c.useAccSource and nAc2, f.acc2Lo, f.acc2Id, "ACC_LO", c.accTf2, c.scoreAcc2)
+    f_registerAccumZone(e, c, c.useAccSource and nAc3, f.acc3Hi, f.acc3Id, "ACC_HI", c.accTf3, c.scoreAcc3)
+    f_registerAccumZone(e, c, c.useAccSource and nAc3, f.acc3Lo, f.acc3Id, "ACC_LO", c.accTf3, c.scoreAcc3)
 
     // High / Low を登録し終えてから世代管理する (ペアを崩さないため)
     f_pruneAccumGenerations(e, c.useAccSource and nAc1, c.accTf1, c.accKeep1)
@@ -1161,60 +1253,40 @@ export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     f_pruneAccumGenerations(e, c.useAccSource and nAc3, c.accTf3, c.accKeep3)
 
     // ---- 6.6 旧Day High / Low の Horizontal 化 ----------------------------
-    f_registerStatic(e, c, c.useDayHL and c.carryPrevDayHL and isNewDay, e.prevDayHigh, "PDH", CAT_HZ, "PD", "Prev Day High", c.scorePrevDayHL, c.lifePrevDayHL)
-    f_registerStatic(e, c, c.useDayHL and c.carryPrevDayHL and isNewDay, e.prevDayLow,  "PDL", CAT_HZ, "PD", "Prev Day Low",  c.scorePrevDayHL, c.lifePrevDayHL)
+    f_registerStatic(e, c, c.useDayHL and c.carryPrevDayHL and isNewDay, e.prevDayHigh, "PDH", CAT_HZ, "PD", c.scorePrevDayHL, c.lifePrevDayHL)
+    f_registerStatic(e, c, c.useDayHL and c.carryPrevDayHL and isNewDay, e.prevDayLow,  "PDL", CAT_HZ, "PD", c.scorePrevDayHL, c.lifePrevDayHL)
 
-    // ---- 6.7 寿命切れ破棄 (Practical: Reaction計測 / 寿命延長は廃止) -------
+    // ---- 6.7 寿命切れ / 上限超過の破棄 (event gate 付き) -------------------
     f_prunePersist(e, c)
 
-    // ---- 6.8 このバーで評価するRaw Zone一式 -------------------------------
-    array<RawZone> raw = array.new<RawZone>()
-    if array.size(e.persist) > 0
-        for i = 0 to array.size(e.persist) - 1
-            array.push(raw, array.get(e.persist, i))
-
+    // ---- 6.8 このバーの動的Source (persist は raw へコピーしない) ----------
+    //  並べ替え上の順序は旧版の raw 配列と同じ (persist 全件 → MA1 → MA2 → DayH → DayL)。
+    array.clear(e.sDyn)
     if c.useMaSource and not na(f.ma1)
-        RawZone rMa1 = f_makeRaw(c, -1, "MA1", CAT_MA, c.maTfName, str.tostring(c.ma1Len) + "MA" + f_arrow(ma1Dir), f.ma1, c.scoreMa1, true)
-        rMa1.slopeState     := ma1State
-        rMa1.slopeDir       := ma1Dir
-        rMa1.slopeBonus     := ma1SlopeBonus
-        rMa1.maClusterBonus := maClusterBonus
-        array.push(raw, rMa1)
-
+        f_pushDyn(e, c, 0, -1, "MA1", CAT_MA, c.maTfName, f.ma1, c.scoreMa1, ma1State, ma1Dir, ma1SlopeBonus, maClusterBonus)
     if c.useMaSource and not na(f.ma2)
-        RawZone rMa2 = f_makeRaw(c, -2, "MA2", CAT_MA, c.maTfName, str.tostring(c.ma2Len) + "MA" + f_arrow(ma2Dir), f.ma2, c.scoreMa2, true)
-        rMa2.slopeState     := ma2State
-        rMa2.slopeDir       := ma2Dir
-        rMa2.slopeBonus     := ma2SlopeBonus
-        rMa2.maClusterBonus := maClusterBonus
-        array.push(raw, rMa2)
-
+        f_pushDyn(e, c, 1, -2, "MA2", CAT_MA, c.maTfName, f.ma2, c.scoreMa2, ma2State, ma2Dir, ma2SlopeBonus, maClusterBonus)
     if c.useDayHL and not na(e.dayHigh)
-        array.push(raw, f_makeRaw(c, e.dayHighUid, "DAY_HIGH", CAT_DHL, "D", "Day High", e.dayHigh, c.scoreDayHL, true))
+        f_pushDyn(e, c, 2, e.dayHighUid, "DAY_HIGH", CAT_DHL, "D", e.dayHigh, c.scoreDayHL, 0, 0, 0.0, 0.0)
     if c.useDayHL and not na(e.dayLow)
-        array.push(raw, f_makeRaw(c, e.dayLowUid, "DAY_LOW", CAT_DHL, "D", "Day Low", e.dayLow, c.scoreDayHL, true))
-    e.rawCount := array.size(raw)
+        f_pushDyn(e, c, 3, e.dayLowUid, "DAY_LOW", CAT_DHL, "D", e.dayLow, c.scoreDayHL, 0, 0, 0.0, 0.0)
+    e.rawCount := array.size(e.persist) + array.size(e.sDyn)
 
-    // ---- 6.9 Cluster → Strength ------------------------------------------
-    array<Zone> zones = f_buildClusters(raw, c)
-    if array.size(zones) > 0
-        for i = 0 to array.size(zones) - 1
-            f_applyStrength(array.get(zones, i), c)
+    // ---- 6.9 Cluster → Strength (結果は直接 e.live へ) ----------------------
+    int nZ = f_buildClusters(e, c)
+    if nZ > 0
+        for i = 0 to nZ - 1
+            f_applyStrength(array.get(e.live, i), c)
 
-    // ---- 6.10 ZoneTrack 紐付け + Break / Flip -----------------------------
+    // ---- 6.10 ZoneTrack 紐付け + Break / Flip + Strong Touch ----------------
     e.evUpBreak   := false
     e.evDownBreak := false
     e.evFlipSup   := false
     e.evFlipRes   := false
 
-    if array.size(e.tracks) > 0
-        for i = 0 to array.size(e.tracks) - 1
-            ZoneTrack tt = array.get(e.tracks, i)
-            tt.matched := false
-
-    if array.size(zones) > 0
-        for i = 0 to array.size(zones) - 1
-            Zone z = array.get(zones, i)
+    if nZ > 0
+        for i = 0 to nZ - 1
+            Zone z = array.get(e.live, i)
             int ti = f_findTrack(e, z, c)
             ZoneTrack t = na
             if ti >= 0
@@ -1223,15 +1295,18 @@ export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
                 e.trackSeq := e.trackSeq + 1
                 t := ZoneTrack.new(id = e.trackSeq, center = z.center, top = z.top, bottom = z.bottom,
                      state = f_naturalState(z.top, z.bottom), lastSeenBar = bar_index,
-                     memberUids = array.copy(z.memberUids), sourceSig = z.sourceSig)
+                     memberUids = z.memberUids)
                 array.push(e.tracks, t)
-            t.matched     := true
+                int exp = bar_index + c.trackStaleBars + 1
+                e.nextTrackExpireBar := na(e.nextTrackExpireBar) ? exp : math.min(e.nextTrackExpireBar, exp)
+            t.matchedBar  := bar_index
             t.center      := z.center
             t.top         := z.top
             t.bottom      := z.bottom
             t.lastSeenBar := bar_index
-            t.memberUids  := array.copy(z.memberUids)
-            t.sourceSig   := z.sourceSig
+            //  ★ 旧版は array.copy。Zone.memberUids は finalize 後に一切変更されず、
+            //    Zone 自体も毎バー新規生成されるので、参照の共有で結果は同一。
+            t.memberUids  := z.memberUids
 
             int ev = f_updateTrack(t, c, f.brEval, f.brClose, f.brHigh, f.brLow)
             e.evUpBreak   := e.evUpBreak   or ev == 1
@@ -1245,22 +1320,26 @@ export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
             z.flipBonus := t.flipped ? c.flipBonus : 0.0
             z.trackId   := t.id
             f_applyStrength(z, c)
-            f_updateTouch(t, z, c)
-            z.touchCount := t.touchCount
+            // Strong Touch Count : Strength 確定後に「数えるか否か」だけ判定する
+            z.touchCount := f_updateTouch(t, z, c)
 
-    // ---- 6.11 長期間マッチしないTrackを破棄 -------------------------------
-    if array.size(e.tracks) > 0
-        for i = array.size(e.tracks) - 1 to 0
-            if i < array.size(e.tracks)
-                ZoneTrack t = array.get(e.tracks, i)
-                if bar_index - t.lastSeenBar > c.trackStaleBars
-                    array.remove(e.tracks, i)
+    // ---- 6.11 長期間マッチしないTrackを破棄 (event gate 付き) --------------
+    //  判定式 bar_index - lastSeenBar > trackStaleBars と削除順は旧版と同一。
+    //  nextTrackExpireBar に到達したバーだけ scan し、次の下限を再計算する。
+    if not na(e.nextTrackExpireBar) and bar_index >= e.nextTrackExpireBar
+        int nextExp = na
+        if array.size(e.tracks) > 0
+            for i = array.size(e.tracks) - 1 to 0
+                if i < array.size(e.tracks)
+                    ZoneTrack t = array.get(e.tracks, i)
+                    if bar_index - t.lastSeenBar > c.trackStaleBars
+                        array.remove(e.tracks, i)
+                    else
+                        int exp = t.lastSeenBar + c.trackStaleBars + 1
+                        nextExp := na(nextExp) ? exp : math.min(nextExp, exp)
+        e.nextTrackExpireBar := nextExp
 
-    // ---- 6.12 Live Zone Map 更新 ------------------------------------------
-    array.clear(e.live)
-    if array.size(zones) > 0
-        for i = 0 to array.size(zones) - 1
-            array.push(e.live, array.get(zones, i))
+    // ---- 6.12 Live Zone Map : f_buildClusters が直接 e.live を更新済み -------
 
     // ---- 6.13 次バーのエッジ検出用に今バーの値を保存 ----------------------
     e.prevDayId := tradingDayId
@@ -1367,6 +1446,43 @@ export stateName(int st) =>
 // @returns   string
 export stateFull(int st) =>
     st == ST_SUPPORT ? "Support" : st == ST_RESIST ? "Resistance" : st == ST_ACTIVE ? "Active" : "Broken"
+
+f_join(string acc, bool on, string part) =>
+    on ? acc + (acc == "" ? "" : " / ") + part : acc
+
+// @function  Zone.srcMask を表示用文字列にする (表示専用。barstate.islast でだけ呼ぶこと)
+// @param m   Zone.srcMask
+// @param c   ZoneCfg
+// @returns   string
+export sourceText(int m, ZoneCfg c) =>
+    string s = ""
+    s := f_join(s, f_hasBit(m, SRC_SW1), f_tfName(c.hzTf1) + " Swing")
+    s := f_join(s, f_hasBit(m, SRC_SW2), f_tfName(c.hzTf2) + " Swing")
+    s := f_join(s, f_hasBit(m, SRC_SW3), f_tfName(c.hzTf3) + " Swing")
+    s := f_join(s, f_hasBit(m, SRC_HZX), "Horizontal")
+    s := f_join(s, f_hasBit(m, SRC_ACC1), f_tfName(c.accTf1) + " Accum")
+    s := f_join(s, f_hasBit(m, SRC_ACC2), f_tfName(c.accTf2) + " Accum")
+    s := f_join(s, f_hasBit(m, SRC_ACC3), f_tfName(c.accTf3) + " Accum")
+    s := f_join(s, f_hasBit(m, SRC_MA1), str.tostring(c.ma1Len) + "MA")
+    s := f_join(s, f_hasBit(m, SRC_MA2), str.tostring(c.ma2Len) + "MA")
+    s := f_join(s, f_hasBit(m, SRC_DHL), "Day H/L")
+    s
+
+// @function  Zone.htfMask を表示用文字列にする (表示専用。旧 htfSources と同じ並び順)
+// @param m   Zone.htfMask
+// @param c   ZoneCfg
+// @returns   string
+export htfText(int m, ZoneCfg c) =>
+    string s = ""
+    s := f_join(s, f_hasBit(m, HTF_SW1H), f_tfName(c.hzTf3) + " Swing")
+    s := f_join(s, f_hasBit(m, HTF_ACC1), f_tfName(c.accTf1) + " Accum")
+    s := f_join(s, f_hasBit(m, HTF_ACC2), f_tfName(c.accTf2) + " Accum")
+    s := f_join(s, f_hasBit(m, HTF_ACC3), f_tfName(c.accTf3) + " Accum")
+    s := f_join(s, f_hasBit(m, HTF_SW15), f_tfName(c.hzTf2) + " Swing")
+    s := f_join(s, f_hasBit(m, HTF_MA1), str.tostring(c.ma1Len) + "MA")
+    s := f_join(s, f_hasBit(m, HTF_MA2), str.tostring(c.ma2Len) + "MA")
+    s := f_join(s, f_hasBit(m, HTF_DAY), "Day H/L")
+    s
 
 // ============================================================================
 // 07. STRUCTURAL SL / TP API
