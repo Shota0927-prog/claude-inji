@@ -13,7 +13,8 @@ ZoneEnginePractical.pine (practical) line by line and checks:
   P1      Persist expiry gate == legacy every-bar scan
   K1      Track stale gate == legacy every-bar scan
 
-  TB1-TB2 Break vs Touch same-bar ordering (f_updateTrack -> strength -> touch)
+  B1-B6   Practical Break authority (confirmed bar's own close) + Touch ordering
+  H1-H2   Break TF > chart TF feed (evaluate once on the HTF closing bar)
 
 Evidence class: PINE_NOT_VERIFIED. These are Python mirror tests of the Pine
 logic; a PASS here is not a TradingView compile / runtime PASS.
@@ -550,53 +551,100 @@ def update_track(t, c, evalBar, bc, bh, bl, close, bar):
     return ev
 
 
-def engine_bar(t, c, strength, top, bottom, o_h_l_c, prev_close, bar):
-    """Practical update() order for one matched track:
-    geometry -> f_updateTrack (Break/Flip/state) -> f_applyStrength -> f_updateTouch."""
-    hi, lo, cl = o_h_l_c
+def engine_bar(t, c, strength, top, bottom, h_l_c, bar, confirmed=True):
+    """Practical update() order for one matched track, Break TF == chart TF feed:
+    brClose = close / brHigh = high / brLow = low / brEval = barstate.isconfirmed.
+    geometry -> f_updateTrack (Break/Reclaim/Flip/state) -> f_applyStrength -> f_updateTouch."""
+    hi, lo, cl = h_l_c
     t.top, t.bottom = top, bottom
-    # Break TF == chart TF: brClose = close[1], brEval = bar_index > 0
-    ev = update_track(t, c, prev_close is not None, prev_close, None, None, cl, bar)
+    ev = update_track(t, c, confirmed, cl if confirmed else None, hi, lo, cl, bar)
     update_touch(t, strength, hi, lo, bar, c)
     return ev
 
 
+def start_track(state):
+    t = Track(4065.0, 4045.0)
+    t.state = state
+    t.lastRole = 1 if state == ST_SUPPORT else -1 if state == ST_RESIST else 0
+    return t
+
+
 def fixtures_break_touch():
     c = BCfg()
-    for name, side in (("TB1 Strong RESIST", +1), ("TB2 Strong SUPPORT", -1)):
-        # A) engine-level same bar: the bar on which f_updateTrack sets BROKEN also
-        #    overlaps the zone -> touch must not be counted on that bar.
-        t = Track(4065.0, 4045.0)
-        # bar 0: price beyond the zone on the "role" side -> RESIST (side +1) / SUPPORT (side -1)
-        bar0 = (4040, 4030, 4035) if side > 0 else (4080, 4070, 4075)
-        engine_bar(t, c, SR_STRONG, 4065.0, 4045.0, bar0, None, 0)
-        role_ok = t.state == (ST_RESIST if side > 0 else ST_SUPPORT)
-        armed_before, cnt_before = t.touchArmed, t.touchCount
-        # bar 1: zone geometry moves (members changed) so that the confirmed close[1]
-        #        is now beyond top+buffer / bottom-buffer -> Break fires on bar 1,
-        #        and bar 1's candle overlaps the zone.
-        if side > 0:
-            top, bottom, prev_close, bar1 = 4028.0, 4008.0, 4035.0, (4030, 4020, 4025)
-        else:
-            top, bottom, prev_close, bar1 = 4100.0, 4085.0, 4075.0, (4090, 4080, 4088)
-        ev = engine_bar(t, c, SR_STRONG, top, bottom, bar1, prev_close, 1)
-        ok = role_ok and armed_before and ev == side and t.state == ST_BROKEN and t.touchCount == cnt_before
-        check(f"{name}: Break bar with overlap -> BROKEN, touchCount unchanged", ok,
-              f"ev={ev} state={t.state} touch {cnt_before}->{t.touchCount}")
+    Z = (4065.0, 4045.0)
+    cases = [
+        # name, start state, candle (high, low, close), expected ev, expected state, expected touch
+        ("B1 RESIST close 4071 > 4065+5 (overlap)", ST_RESIST, (4075, 4055, 4071), 1, ST_BROKEN, 0),
+        ("B2 SUPPORT close 4039 < 4045-5 (overlap)", ST_SUPPORT, (4055, 4035, 4039), -1, ST_BROKEN, 0),
+        ("B3 RESIST wick only: high 4075, close 4068", ST_RESIST, (4075, 4055, 4068), 0, None, None),
+        ("B3s SUPPORT wick only: low 4035, close 4042", ST_SUPPORT, (4055, 4035, 4042), 0, None, None),
+        ("B4 RESIST close == 4070 (strict >)", ST_RESIST, (4075, 4055, 4070), 0, None, None),
+        ("B4s SUPPORT close == 4040 (strict <)", ST_SUPPORT, (4055, 4035, 4040), 0, None, None),
+    ]
+    for name, st0, candle, ev_x, st_x, touch_x in cases:
+        t = start_track(st0)
+        ev = engine_bar(t, c, SR_STRONG, Z[0], Z[1], candle, 1)
+        ok = ev == ev_x and (st_x is None or t.state == st_x) and t.state != (ST_BROKEN if ev_x == 0 else -99)
+        if touch_x is not None:
+            ok = ok and t.touchCount == touch_x
+        if ev_x != 0:
+            ok = ok and t.breakDir == ev_x
+        check(name, ok, f"ev={ev} state={t.state} breakDir={t.breakDir} touch={t.touchCount}")
+        if ev_x == 0:
+            LITERAL.append(f"{name}: no break -> state={t.state} (natural), touch={t.touchCount} "
+                           f"(normal Practical touch rule applies)")
 
-        # B) literal scenario: the candle overlaps AND its own close is beyond
-        #    top+buffer / bottom-buffer. Reported as observed (legacy Break semantics,
-        #    f_updateTrack unchanged): Break uses the confirmed close of the PREVIOUS bar,
-        #    while the natural state uses the current close.
-        t = Track(4065.0, 4045.0)
-        engine_bar(t, c, SR_STRONG, 4065.0, 4045.0, bar0, None, 0)
-        lit = (4080, 4050, 4075) if side > 0 else (4060, 4030, 4035)
-        ev_b = engine_bar(t, c, SR_STRONG, 4065.0, 4045.0, lit, bar0[2], 1)
-        st_b, cnt_b = t.state, t.touchCount
-        nxt = (4085, 4078, 4080) if side > 0 else (4032, 4025, 4030)
-        ev_n = engine_bar(t, c, SR_STRONG, 4065.0, 4045.0, nxt, lit[2], 2)
-        LITERAL.append(f"{name} literal: breaking bar -> ev={ev_b} state={st_b} touch={cnt_b}; "
-                       f"next bar -> ev={ev_n} state={t.state} touch={t.touchCount}")
+    # B5 realtime: unconfirmed tick beyond top+buffer must not break; confirmed tick does
+    t = start_track(ST_RESIST)
+    ev_tick = engine_bar(t, c, SR_STRONG, Z[0], Z[1], (4075, 4055, 4071), 1, confirmed=False)
+    st_tick = t.state
+    t = start_track(ST_RESIST)   # Pine rollback: confirmed tick starts from previous-bar state
+    ev_conf = engine_bar(t, c, SR_STRONG, Z[0], Z[1], (4075, 4055, 4071), 1, confirmed=True)
+    check("B5 unconfirmed tick: no break / confirmed tick: break", ev_tick == 0 and st_tick != ST_BROKEN
+          and ev_conf == 1 and t.state == ST_BROKEN, f"tick ev={ev_tick} st={st_tick}; confirmed ev={ev_conf}")
+
+    # B6 after break: broken bars never count touch
+    t = start_track(ST_RESIST)
+    engine_bar(t, c, SR_STRONG, Z[0], Z[1], (4075, 4055, 4071), 1)
+    engine_bar(t, c, SR_STRONG, Z[0], Z[1], (4072, 4060, 4068), 2)   # retest inside, still BROKEN
+    check("B6 BROKEN bars after break: touch unchanged", t.state == ST_BROKEN and t.touchCount == 0,
+          f"state={t.state} touch={t.touchCount}")
+
+
+def htf_feed(bars):
+    """Port of ZoneVisualPractical Break feed for Break TF > chart TF.
+    bars: list of dicts (htf_open, closes_htf, close, htf_close_so_far, confirmed)."""
+    evals = []
+    done = None
+    prev_tf = None
+    prev_src = None
+    for i, b in enumerate(bars):
+        new_period = i > 0 and b["tf"] != prev_tf
+        prev_missed = new_period and (done is None or done != prev_tf)
+        if prev_missed:
+            evals.append((i, prev_src, "fallback"))
+            done = prev_tf
+        elif b["confirmed"] and b["closes"]:
+            evals.append((i, b["src"], "primary"))
+            done = b["tf"]
+        prev_tf, prev_src = b["tf"], b["src"]
+    return evals
+
+
+def fixture_htf_feed():
+    # 15m Break TF on 5m chart: periods A (3 bars), B (3 bars), C (2 bars, session cut: no closing bar), D
+    bars = []
+    for tf, closes in (("A", [4050, 4060, 4071]), ("B", [4072, 4068, 4066]), ("C", [4064, 4062]), ("D", [4061])):
+        for k, cl in enumerate(closes):
+            last = k == len(closes) - 1 and tf != "C"
+            bars.append(dict(tf=tf, src=cl, closes=last, confirmed=True))
+    ev = htf_feed(bars)
+    expect = [(2, 4071, "primary"), (5, 4066, "primary"), (8, 4062, "fallback")]
+    check("H1 HTF feed: once per HTF bar on its closing bar with HTF close; fallback only if missed",
+          ev[:3] == expect and len([e for e in ev if e[2] == "fallback"]) == 1, str(ev))
+    # unconfirmed closing bar (realtime mid-bar): no evaluation
+    ev2 = htf_feed([dict(tf="A", src=4071, closes=True, confirmed=False)])
+    check("H2 HTF closing bar not yet confirmed: no evaluation", ev2 == [], str(ev2))
 
 
 LITERAL = []
@@ -610,6 +658,7 @@ if __name__ == "__main__":
     fixture_persist_gate()
     fixture_track_gate()
     fixtures_break_touch()
+    fixture_htf_feed()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:

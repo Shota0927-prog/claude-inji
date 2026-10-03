@@ -13,7 +13,7 @@
 //  軽量化:
 //    ・Zone Source の request.security は Source ON のときだけ (MA / Swing / Accum)
 //    ・Break TF = チャート足 のときは request.security を使わずチャート自身の
-//      確定OHLC (close[1] / high[1] / low[1]) を使う (旧Mainと同じ値・同じ評価バー)
+//      確定足 OHLC を、その確定足自身で評価する (Practical Break authority)
 //    ・Zone box / label は barstate.islast のときだけ更新
 //    ・box / label は persistent pool を setter で再利用 (毎回の全delete / 全new をしない)
 //    ・表示文字列は barstate.islast のときだけ組み立てる
@@ -361,27 +361,72 @@ if useAccSource
     acc3Id := _a3i
 
 // Break判定は breakTf の「確定終値」のみ (ヒゲでは判定しない)
-//  ★ Break TF = チャート足 のときは request.security を使わない。
-//    旧Main は request.security(breakTf = チャート足, [close, high, low]) の値を [1] で
-//    参照していた。同一TFの request.security はチャート自身の close / high / low と
-//    同じ値なので、下の brCloseRaw[1] 等は close[1] / high[1] / low[1] そのもの。
-//    brBarClosed の式も旧Mainのまま (同一TFでは bar_index > 0 の全バーで true)。
-//  ★ Break TF がチャート足と異なる場合だけ request.security を1本使う (旧Mainと同一)。
-bool  brSameTf   = timeframe.in_seconds(breakTf) == timeframe.in_seconds()
-float brCloseRaw = close
-float brHighRaw  = high
-float brLowRaw   = low
+//  ★ Practical Break authority:
+//    Break判定TFの「確定足自身の close」で、その確定イベントのバーに Break を成立させる。
+//    旧版は確定足の値を「次のチャートバー」で [1] 参照していたため、評価前に
+//    f_naturalState (現在 close) が state を上書きしてしまい、確定足自身の close による
+//    Break が成立しなかった (Zoneの幅や位置が動いた時しか Break しない)。
+//
+//  (1) Break TF == チャート足 : request.security を使わない。
+//      brClose = close / brHigh = high / brLow = low / brEval = barstate.isconfirmed
+//      Historical は全バー確定。Realtime はバー確定tickだけ評価 (途中tickでは Break しない)。
+//  (2) Break TF  > チャート足 : request.security を1本 (lookahead_off = 先読みなし)。
+//      上位足を締めるチャートバー (time_close >= time_close(breakTf)) の確定時に、
+//      その上位足の確定 close / high / low で1回だけ評価する。
+//      lookahead_off の上位足値は、その上位足を締めるチャートバーで確定値になる
+//      (Historical / Realtime 確定tick とも)。未確定の上位足 close では評価しない。
+//      保険: セッション途中終了などで締めバーを検出できなかった上位足は、
+//      次の上位足の最初のバーで旧版と同じ [1] 参照で1回だけ評価する。
+//  (3) Break TF  < チャート足 : 旧版の経路のまま (今回の修正対象外)。
+int   brTfSec   = timeframe.in_seconds(breakTf)
+int   chTfSec   = timeframe.in_seconds()
+bool  brSameTf  = brTfSec == chTfSec
+bool  brHtf     = brTfSec > chTfSec
+float brSrcC = close
+float brSrcH = high
+float brSrcL = low
 if not brSameTf
     [_bc, _bh, _bl] = request.security(syminfo.tickerid, breakTf, [close, high, low],
          lookahead = barmerge.lookahead_off)
-    brCloseRaw := _bc
-    brHighRaw  := _bh
-    brLowRaw   := _bl
-bool  brBarClosed = bar_index > 0 and not na(time(breakTf)) and nz(ta.change(time(breakTf)), 0) != 0
-float brClose = brBarClosed ? brCloseRaw[1] : na
-float brHigh  = brBarClosed ? brHighRaw[1]  : na
-float brLow   = brBarClosed ? brLowRaw[1]   : na
-bool  brEval  = brBarClosed and not na(brClose)
+    brSrcC := _bc
+    brSrcH := _bh
+    brSrcL := _bl
+int   brTfTime    = time(breakTf)
+bool  brNewPeriod = bar_index > 0 and not na(brTfTime) and nz(ta.change(brTfTime), 0) != 0
+float brClose = na
+float brHigh  = na
+float brLow   = na
+bool  brEval  = false
+// 上位足ごとに「評価済み」を記録 (上位足の open time)。確定tickでのみ確定する var。
+var int brDoneTfTime = na
+if brSameTf
+    if barstate.isconfirmed
+        brClose := close
+        brHigh  := high
+        brLow   := low
+        brEval  := true
+else if brHtf
+    bool brPrevMissed = brNewPeriod and (na(brDoneTfTime) or brDoneTfTime != brTfTime[1])
+    bool brClosesNow  = not na(time_close(breakTf)) and time_close >= time_close(breakTf)
+    if brPrevMissed
+        // 保険経路 (旧版と同じ [1] 参照)。直前の上位足が締めバーで評価されなかった時だけ。
+        brClose := brSrcC[1]
+        brHigh  := brSrcH[1]
+        brLow   := brSrcL[1]
+        brEval  := not na(brClose)
+        brDoneTfTime := brTfTime[1]
+    else if barstate.isconfirmed and brClosesNow
+        brClose := brSrcC
+        brHigh  := brSrcH
+        brLow   := brSrcL
+        brEval  := not na(brClose)
+        brDoneTfTime := brTfTime
+else
+    // Break TF < チャート足 : 旧版の経路 (変更なし)
+    brClose := brNewPeriod ? brSrcC[1] : na
+    brHigh  := brNewPeriod ? brSrcH[1] : na
+    brLow   := brNewPeriod ? brSrcL[1] : na
+    brEval  := brNewPeriod and not na(brClose)
 
 // 取引日ID (timestamp/hour の timezone は series 不可なので呼び出し側で計算する)
 int _locY = year(time, dayTz)
