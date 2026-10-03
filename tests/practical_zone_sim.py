@@ -13,6 +13,7 @@ ZoneEnginePractical.pine (practical) line by line and checks:
   P1      Persist expiry gate == legacy every-bar scan
   K1      Track stale gate == legacy every-bar scan
 
+  S1-S8   Touch Count per Strong period (reset on entering Strong)
   B1-B6   Practical Break authority (confirmed bar's own close) + Touch ordering
   R1-R3   Break boundary regression (RESIST / SUPPORT)
   F1-F3   Role reversal only via Break -> Retest -> Flip; A1 ACTIVE first role
@@ -214,14 +215,20 @@ def practical_build(persist, dyn, c):
 
 # ---- Strong Touch Count (f_updateTouch) ------------------------------------
 class Track:
-    def __init__(self, top, bottom):
+    def __init__(self, top, bottom, wasStrong=True):
+        # wasStrong=True: fixture starts inside an already running Strong period
         self.top, self.bottom = top, bottom
         self.state = ST_ACTIVE
         self.lastRole, self.breakDir, self.retested = 0, 0, False
         self.touchCount, self.touchArmed, self.touchActive, self.lastTouchBar = 0, True, False, None
+        self.wasStrong = wasStrong
 
 
 def update_touch(t, strength, hi, lo, bar, c):
+    is_strong = strength >= SR_STRONG
+    if is_strong and not t.wasStrong:          # Strong period starts: reset, wait for re-arm
+        t.touchCount, t.touchArmed, t.touchActive, t.lastTouchBar = 0, False, False, None
+    t.wasStrong = is_strong
     if t.touchArmed:
         eligible = strength >= SR_STRONG and t.state in (ST_SUPPORT, ST_RESIST)
         if eligible and lo <= t.top and hi >= t.bottom:
@@ -297,7 +304,7 @@ def fixtures_strength():
         strengths.append((t.touchCount, again["score"], again["strength"]))
     ok = all(s[2] == SR_STRONG and s[1] == base["score"] for s in strengths) and \
         [s[0] for s in strengths] == [0, 1, 5]
-    check("S1 Touch 0 / 1 / 5 -> STRONG / STRONG / STRONG, score unchanged", ok, str(strengths))
+    check("SS1 Touch 0 / 1 / 5 -> STRONG / STRONG / STRONG, score unchanged", ok, str(strengths))
 
     # legacy would have promoted it via reaction bonus: show the removed path differs
     m2 = [Raw(1, "SWING_H", CAT_HZ, "60", 4050.0, 3.0, c, reactionBonus=c.reactionBonus3, reactionCnt=5),
@@ -305,7 +312,7 @@ def fixtures_strength():
           Raw(-1, "MA1", CAT_MA, "1", 4048.0, 2.0, c)]
     lz = legacy_build(m2, c)[0]
     pz = practical_build(m2, [], c)[0]
-    check("S2 reaction-heavy input: legacy score +3 (reaction), practical unchanged",
+    check("SS2 reaction-heavy input: legacy score +3 (reaction), practical unchanged",
           lz["score"] == base["score"] + 3 and pz["score"] == base["score"],
           f"legacy={lz['score']} practical={pz['score']}")
 
@@ -347,16 +354,6 @@ def fixtures_touch():
         update_touch(k, SR_VSTRONG, 4120, 4090, b, c)
     check("T3 Broken: contacts never counted", k.touchCount == 0, f"count={k.touchCount}")
 
-    # T4: Strong -> Medium -> Strong keeps the count and resumes counting
-    s = Track(4065.0, 4045.0); s.state = ST_RESIST
-    update_touch(s, SR_STRONG, 4070, 4050, 0, c)          # 1
-    update_touch(s, SR_STRONG, 4030, 4000, 1, c)          # away below -> rearm
-    update_touch(s, SR_MEDIUM, 4070, 4050, 2, c)          # medium: not counted
-    c1 = s.touchCount
-    update_touch(s, SR_STRONG, 4070, 4050, 3, c)          # strong again: 2
-    check("T4 Strong->Medium->Strong keeps count (1 -> 1 -> 2)", (c1, s.touchCount) == (1, 2),
-          f"{c1},{s.touchCount}")
-
     # T5: Broken -> Flip (same track) keeps count
     f = Track(4065.0, 4045.0); f.state = ST_SUPPORT
     update_touch(f, SR_STRONG, 4070, 4050, 0, c)          # 1
@@ -366,6 +363,85 @@ def fixtures_touch():
     f.state = ST_RESIST                                    # flip confirmed
     update_touch(f, SR_STRONG, 4060, 4050, 3, c)          # counted: 2
     check("T5 Broken -> Flip keeps count (1 -> 2)", f.touchCount == 2, f"count={f.touchCount}")
+
+
+def fixtures_strong_period():
+    c = Cfg()
+    TOP, BOT = 4065.0, 4045.0
+    OUT = (4090, 4080)     # high, low : fully away (low >= top + 10)  -> re-arm
+    INSIDE = (4060, 4050)  # overlap
+    bar = [0]
+
+    def st(t, strength, hl):
+        update_touch(t, strength, hl[0], hl[1], bar[0], c); bar[0] += 1
+        return t.touchCount
+
+    def fresh(state=ST_SUPPORT):
+        t = Track(TOP, BOT, wasStrong=False); t.state = state
+        return t
+
+    def run_strong_touches(t, n, strength=SR_STRONG):
+        for _ in range(n):
+            st(t, strength, OUT); st(t, strength, INSIDE)
+
+    # S1 New Strong outside
+    t = fresh()
+    st(t, SR_MEDIUM, OUT)
+    a = st(t, SR_STRONG, OUT)                  # promotion bar (outside)
+    armed_after_promo = t.touchArmed           # re-armed on the same bar because fully away
+    b = st(t, SR_STRONG, INSIDE)
+    check("S1 Medium -> Strong outside: Touch 0, then re-armed contact -> Touch 1",
+          a == 0 and b == 1, f"promo={a} armedAfter={armed_after_promo} contact={b}")
+
+    # S2 New Strong while inside
+    t = fresh()
+    st(t, SR_MEDIUM, INSIDE)
+    seq = [st(t, SR_STRONG, INSIDE)]           # promotion bar inside
+    seq += [st(t, SR_STRONG, INSIDE) for _ in range(5)]
+    seq.append(st(t, SR_STRONG, OUT))          # re-arm
+    seq.append(st(t, SR_STRONG, INSIDE))       # first real touch
+    check("S2 Medium -> Strong while inside: 0, 5 bars inside 0, away, re-touch 1",
+          seq == [0, 0, 0, 0, 0, 0, 0, 1], str(seq))
+
+    # S3 Strong -> Very Strong keeps count
+    t = fresh(); st(t, SR_STRONG, OUT); run_strong_touches(t, 2)
+    c_before = t.touchCount
+    after = st(t, SR_VSTRONG, OUT)
+    check("S3 Strong Touch 2 -> Very Strong: Touch 2", c_before == 2 and after == 2, f"{c_before}->{after}")
+
+    # S4 Very Strong -> Strong keeps count (and keeps counting)
+    t = fresh(); st(t, SR_VSTRONG, OUT); run_strong_touches(t, 2, SR_VSTRONG)
+    after = st(t, SR_STRONG, OUT)
+    nxt = st(t, SR_STRONG, INSIDE)
+    check("S4 Very Strong Touch 2 -> Strong: Touch 2, next contact 3", after == 2 and nxt == 3, f"{after},{nxt}")
+
+    # S5 Strong -> Medium -> Strong resets
+    t = fresh(); st(t, SR_STRONG, OUT); run_strong_touches(t, 3)
+    c3 = t.touchCount
+    st(t, SR_MEDIUM, OUT); st(t, SR_MEDIUM, INSIDE)          # medium contact: not counted
+    after = st(t, SR_STRONG, INSIDE)
+    check("S5 Strong Touch 3 -> Medium -> Strong: Touch 0", c3 == 3 and after == 0, f"{c3}->{after}")
+
+    # S6 Weak -> Strong
+    t = fresh(); st(t, SR_WEAK, INSIDE)
+    after = st(t, SR_STRONG, INSIDE)
+    check("S6 Weak -> Strong: Touch 0", after == 0 and not t.touchArmed, f"touch={after}")
+
+    # S7 Broken: no increase during BROKEN within a Strong period
+    t = fresh(); st(t, SR_STRONG, OUT); run_strong_touches(t, 1)
+    t.state = ST_BROKEN
+    for _ in range(3):
+        st(t, SR_STRONG, OUT); st(t, SR_STRONG, INSIDE)
+    check("S7 Broken: Touch unchanged (1)", t.touchCount == 1, f"touch={t.touchCount}")
+
+    # S8 Flip within a Strong period keeps the count
+    t = fresh(ST_RESIST); st(t, SR_STRONG, OUT); run_strong_touches(t, 2)
+    t.state = ST_BROKEN; st(t, SR_STRONG, OUT); st(t, SR_STRONG, INSIDE)   # break / retest
+    t.state = ST_SUPPORT                                                    # flip confirmed
+    kept = st(t, SR_STRONG, OUT)
+    nxt = st(t, SR_STRONG, INSIDE)
+    check("S8 RES Strong Touch 2 -> Break -> Flip -> SUP Strong: Touch 2, next contact 3",
+          kept == 2 and nxt == 3, f"{kept},{nxt}")
 
 
 def random_raws(rng, c, n, base=4000.0, span=300.0, ties=True):
@@ -714,6 +790,7 @@ if __name__ == "__main__":
     fixtures_geometry()
     fixtures_strength()
     fixtures_touch()
+    fixtures_strong_period()
     fixture_cluster_parity()
     fixture_persist_gate()
     fixture_track_gate()
