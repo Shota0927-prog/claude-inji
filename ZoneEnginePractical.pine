@@ -2,10 +2,23 @@
 // © shota0927-prog
 //
 // ============================================================================
-//  ZoneEngine  —  Support / Resistance Zone Engine Library
+//  ZoneEnginePractical  —  Practical Zone v1 (Support / Resistance Zone Engine)
 // ============================================================================
-//  FVG_Zone_Strategy から Zone Engine 部分を切り出した共通Library。
-//  ロジックは切り出し前から変更していない (純粋なリファクタリング)。
+//  旧 ZoneEngine (Support / Resistance Zone Engine Library) をベースにした
+//  実用重視の軽量系統。旧版 / v2 とは別ファイル・別Libraryであり、互いに影響しない。
+//
+//  旧版からの意味変更は次の3点だけ:
+//    1. Variable Zone Geometry
+//         最終Zone = Cluster内の全RawZoneを包む範囲
+//         bottom = min(member.bottom) / top = max(member.top) / center = (top + bottom) / 2
+//         (最大幅capなし。Cluster membership 判定は旧 clusterDist ロジックのまま)
+//    2. Reaction Bonus 完全廃止
+//         score = baseSum + slopeBonus + maBonus + flipBonus + confBonus
+//         Touch / Reaction 回数は Score / Strength に一切入らない。
+//    3. Strong Touch Count
+//         strength >= SR_STRONG かつ SUPPORT / RESISTANCE のZoneだけ、
+//         接触1回 = +1 (同じ接触中は増えない / touchRearmDist 以上離れたら再Arm)。
+//         ZoneTrack に保持し、Zone.touchCount / zoneTouchCount() で読む。
 //
 //  セクション構成:
 //    01. Config           (ZoneCfg UDT / newCfg)
@@ -117,13 +130,9 @@ export type ZoneCfg
     float  scoreHz1           = 1.0
     float  scoreHz2           = 2.0
     float  scoreHz3           = 3.0
-    // -- Reaction --
-    float  reactionDist       = 20.0
-    float  reactionBonus1     = 1.0
-    float  reactionBonus2     = 2.0
-    float  reactionBonus3     = 3.0
-    float  reactionRearmDist  = 10.0
-    bool   reactionAllSrc     = false
+    // -- Strong Touch Count (Strengthには一切影響しない) --
+    //    Touch後、ローソク全体がZoneからこの距離以上離れたら再Arm
+    float  touchRearmDist     = 10.0
     // -- Day High / Low --
     bool   useDayHL           = true
     float  scoreDayHL         = 3.0
@@ -171,8 +180,6 @@ export type ZoneCfg
     float  lifeHz1            = 5.0
     float  lifeHz2            = 10.0
     float  lifeHz3            = 30.0
-    bool   lifeExtendOn       = true
-    float  lifeExtendRatio    = 0.5
     int    maxPersistZones    = 200
     // -- Structural SL / TP --
     float  slBuffer           = 5.0
@@ -210,16 +217,11 @@ export type RawZone
     int    slopeDir       = 0
     float  slopeBonus     = 0.0
     float  maClusterBonus = 0.0
-    int    reactionCnt    = 0
-    float  reactionBonus  = 0.0
     bool   flipped        = false
     float  flipBonus      = 0.0
-    int    entrySide      = 0
-    bool   reactionArmed  = true
     int    createdBar     = 0
     int    createdTime    = 0
     int    expireTime     = 0
-    int    lifeMs         = 0
     bool   dynamic        = false
 
 // ---- Zone : Cluster統合後の最終Zone (Live Zone Mapの構成要素) -------------
@@ -231,7 +233,6 @@ export type Zone
     float  baseSum       = 0.0
     float  slopeBonus    = 0.0
     float  maBonus       = 0.0
-    float  reactionBonus = 0.0
     float  flipBonus     = 0.0
     float  confBonus     = 0.0
     int    strength      = 1
@@ -244,9 +245,10 @@ export type Zone
     int    trackId       = -1
     array<int> memberUids
     string sourceSig     = ""
-    int    reactionCnt   = 0
     bool   hasHtf        = false
     string htfSources    = ""
+    // Strong Touch Count (ZoneTrack の値の写し。Score / Strength には使わない)
+    int    touchCount    = 0
 
 // ---- ZoneTrack : Zone State / Break / Flip の永続ステート -----------------
 export type ZoneTrack
@@ -265,6 +267,11 @@ export type ZoneTrack
     bool  matched     = false
     array<int> memberUids
     string sourceSig  = ""
+    // -- Strong Touch Count (Strengthとは完全に独立) --
+    int   touchCount   = 0
+    bool  touchArmed   = true
+    bool  touchActive  = false
+    int   lastTouchBar = na
 
 // ---- ZoneFeed : Main Strategy が request.security で取得した外部入力 ------
 //  ※ Library は request.*() を呼べないため、上位足/下位足の値はここで受け取る。
@@ -417,9 +424,6 @@ f_slopeDir(float delta) =>
 
 f_slopeBonusValue(int st, ZoneCfg c) =>
     st == 2 ? c.slopeBonusStr : st == 1 ? c.slopeBonusMod : c.slopeBonusFlat
-
-f_reactionBonus(int cnt, ZoneCfg c) =>
-    cnt <= 0 ? 0.0 : cnt == 1 ? c.reactionBonus1 : cnt == 2 ? c.reactionBonus2 : c.reactionBonus3
 
 f_confluenceBonus(int catCount, ZoneCfg c) =>
     catCount >= 4 ? c.confBonus4 : catCount == 3 ? c.confBonus3 : catCount == 2 ? c.confBonus2 : 0.0
@@ -598,7 +602,6 @@ f_makeRaw(ZoneCfg c, int uid, string id, string cat, string tf, string lbl, floa
          baseScore = bs, createdBar = bar_index, createdTime = time, dynamic = dyn)
 
 // 同一 srcId・同一TF・±zoneHalfWidth 以内に既存Zoneがあれば新規追加せず寿命だけ更新。
-// reactionCnt / reactionBonus は触らないため、同価格帯でSwingが再発してもReaction履歴は維持。
 f_registerStatic(ZoneEngine e, ZoneCfg c, bool trig, float price, string id, string cat,
      string tf, string lbl, float bs, float lifeDays) =>
     if trig and not na(price)
@@ -614,7 +617,6 @@ f_registerStatic(ZoneEngine e, ZoneCfg c, bool trig, float price, string id, str
                     break
         if not dup
             RawZone rz = f_makeRaw(c, f_nextUid(e), id, cat, tf, lbl, price, bs, false)
-            rz.lifeMs     := life
             rz.expireTime := life > 0 ? time + life : 0
             array.push(e.persist, rz)
     true
@@ -637,7 +639,6 @@ f_registerAccumZone(ZoneEngine e, ZoneCfg c, bool trig, float price, int instId,
         if not found
             RawZone rz = f_makeRaw(c, f_nextUid(e), id, CAT_ACC, tf, lbl, price, bs, false)
             rz.instId     := instId
-            rz.lifeMs     := 0
             rz.expireTime := 0
             array.push(e.persist, rz)
     true
@@ -674,50 +675,7 @@ f_pruneAccumGenerations(ZoneEngine e, bool trig, string tf, int keepCount) =>
                             array.remove(e.persist, i)
     true
 
-// ---- 3.6 Horizontal Reaction 計測 -----------------------------------------
-//  [ARMED] → 接触で [IN PROGRESS] → 来た方向へ reactionDist 以上戻れば +1 → [LOCKED]
-//  [LOCKED] → ローソク全体が reactionRearmDist 以上離れたら [ARMED] へ復帰
-f_updateReactions(ZoneEngine e, ZoneCfg c) =>
-    if array.size(e.persist) > 0
-        for i = 0 to array.size(e.persist) - 1
-            RawZone z = array.get(e.persist, i)
-            bool target = z.srcCat == CAT_HZ or (c.reactionAllSrc and (z.srcCat == CAT_ACC or z.srcCat == CAT_DHL))
-            if target
-                bool touching = low <= z.top and high >= z.bottom
-
-                if not z.reactionArmed
-                    bool awayUp   = low  >= z.top    + c.reactionRearmDist
-                    bool awayDown = high <= z.bottom - c.reactionRearmDist
-                    if awayUp or awayDown
-                        z.reactionArmed := true
-
-                if touching and z.entrySide == 0 and z.reactionArmed
-                    z.entrySide := close[1] > z.top ? 1 : close[1] < z.bottom ? -1 : 0
-
-                if z.entrySide == 1
-                    if high >= z.top + c.reactionDist
-                        z.reactionCnt   := z.reactionCnt + 1
-                        z.entrySide     := 0
-                        z.reactionArmed := false
-                        if c.lifeExtendOn and z.expireTime > 0
-                            z.expireTime := z.expireTime + int(z.lifeMs * c.lifeExtendRatio)
-                    else if close <= z.bottom - c.reactionDist
-                        z.entrySide     := 0
-                        z.reactionArmed := false
-                else if z.entrySide == -1
-                    if low <= z.bottom - c.reactionDist
-                        z.reactionCnt   := z.reactionCnt + 1
-                        z.entrySide     := 0
-                        z.reactionArmed := false
-                        if c.lifeExtendOn and z.expireTime > 0
-                            z.expireTime := z.expireTime + int(z.lifeMs * c.lifeExtendRatio)
-                    else if close >= z.top + c.reactionDist
-                        z.entrySide     := 0
-                        z.reactionArmed := false
-                z.reactionBonus := f_reactionBonus(z.reactionCnt, c)
-    true
-
-// ---- 3.7 寿命切れ / 上限超過の破棄 ----------------------------------------
+// ---- 3.6 寿命切れ / 上限超過の破棄 ----------------------------------------
 f_prunePersist(ZoneEngine e, ZoneCfg c) =>
     if array.size(e.persist) > 0
         for i = array.size(e.persist) - 1 to 0
@@ -757,7 +715,6 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
     float baseSum = 0.0
     float slopeB  = 0.0
     float maB     = 0.0
-    float reactB  = 0.0
     bool  hasMA   = false
     bool  hasHZ   = false
     bool  hasDHL  = false
@@ -766,7 +723,6 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
     bool swHit1 = false
     bool swHit2 = false
     bool swHit3 = false
-    int  reactCnt = 0
     bool accHi1 = false
     bool accLo1 = false
     bool accHi2 = false
@@ -841,8 +797,6 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
 
         slopeB   := c.slopeBonusMax ? math.max(slopeB, m.slopeBonus) : slopeB + m.slopeBonus
         maB      := math.max(maB, m.maClusterBonus)
-        reactB   := math.max(reactB, m.reactionBonus)
-        reactCnt := math.max(reactCnt, m.reactionCnt)
 
         if isSwing and m.srcTf == c.hzTf3 and c.htfSwing1H
             htfSw1h := true
@@ -906,22 +860,26 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c) =>
             int cn = array.get(grpCnt, k)
             srcStr := srcStr + (k > 0 ? " / " : "") + array.get(grpKey, k) + (cn > 1 ? " x" + str.tostring(cn) : "")
 
-    float ctr = tw > 0 ? ts / tw : na
     int   cat = (hasMA ? 1 : 0) + (hasHZ ? 1 : 0) + (hasDHL ? 1 : 0) + (hasACC ? 1 : 0)
     float confB = f_confluenceBonus(cat, c)
 
-    // ---- Zone上下限 ---------------------------------------------------------
-    //   従来どおり center ± zoneHalfWidth (この式は一切変更していない)
-    float zTop = ctr + c.zoneHalfWidth
-    float zBot = ctr - c.zoneHalfWidth
+    // ---- Zone上下限 (Practical: Variable Zone Geometry) --------------------
+    //   Cluster内の全RawZoneを包む範囲。最大幅capは入れない。
+    float zBot = na
+    float zTop = na
+    for j = 0 to n - 1
+        RawZone m = array.get(members, j)
+        zBot := na(zBot) ? m.bottom : math.min(zBot, m.bottom)
+        zTop := na(zTop) ? m.top    : math.max(zTop, m.top)
+    float ctr = (zTop + zBot) / 2
     Zone.new(
          center = ctr, top = zTop, bottom = zBot,
-         score = baseSum + slopeB + maB + reactB + confB,
+         score = baseSum + slopeB + maB + confB,
          baseSum = baseSum, slopeBonus = slopeB, maBonus = maB,
-         reactionBonus = reactB, flipBonus = 0.0, confBonus = confB,
+         flipBonus = 0.0, confBonus = confB,
          strength = SR_WEAK, state = ST_ACTIVE, flipped = false, flipDir = 0,
          catCount = cat, memberCount = n, sources = srcStr, trackId = -1,
-         memberUids = uids, sourceSig = "", reactionCnt = reactCnt,
+         memberUids = uids, sourceSig = "",
          hasHtf = hasHtfStruct, htfSources = htfStr)
 
 f_buildClusters(array<RawZone> src, ZoneCfg c) =>
@@ -966,10 +924,11 @@ f_buildClusters(array<RawZone> src, ZoneCfg c) =>
     out
 
 f_applyStrength(Zone z, ZoneCfg c) =>
-    //  Score = Base Score + Slope Bonus + MA Cluster Bonus
-    //          + Reaction Bonus + Flip Bonus + Confluence Bonus
-    //  ★ 式・加算順序は従来のまま (1文字も変えていない)。
-    z.score := z.baseSum + z.slopeBonus + z.maBonus + z.reactionBonus + z.flipBonus + z.confBonus
+    //  Practical Score = Base Score + Slope Bonus + MA Cluster Bonus
+    //                    + Flip Bonus + Confluence Bonus
+    //  ★ Reaction Bonus は廃止。Touch Count は Score / Strength に一切入れない。
+    //    (旧版の加算順序から reactionBonus 項を抜いただけ)
+    z.score := z.baseSum + z.slopeBonus + z.maBonus + z.flipBonus + z.confBonus
     z.strength := f_strengthOf(z.score, z.hasHtf, c)
     z.strength
 
@@ -1088,6 +1047,29 @@ f_updateTrack(ZoneTrack t, ZoneCfg c, bool evalBar, float bc, float bh, float bl
         t.lastRole := -1
     ev
 
+// ---- 5.x Strong Touch Count -----------------------------------------------
+//  ★ Strength とは完全に独立。この関数は Zone / Track の Score / Strength を
+//    一切読み書きしない (strength は「数えるか否か」の判定にだけ使う)。
+//  Touch判定 : strength >= SR_STRONG かつ state が SUPPORT / RESIST かつ Armed
+//              low <= top and high >= bottom で +1 → Disarm
+//  Re-arm    : ローソク全体が top + touchRearmDist 以上 / bottom - touchRearmDist 以下
+//  ・Medium 中 / Broken 中は数えない。touchCount は reset しない (Track保持)。
+f_updateTouch(ZoneTrack t, Zone z, ZoneCfg c) =>
+    if t.touchArmed
+        bool eligible = z.strength >= SR_STRONG and (t.state == ST_SUPPORT or t.state == ST_RESIST)
+        if eligible and low <= t.top and high >= t.bottom
+            t.touchCount   := t.touchCount + 1
+            t.touchArmed   := false
+            t.touchActive  := true
+            t.lastTouchBar := bar_index
+    else
+        bool awayUp   = low  >= t.top    + c.touchRearmDist
+        bool awayDown = high <= t.bottom - c.touchRearmDist
+        if awayUp or awayDown
+            t.touchArmed  := true
+            t.touchActive := false
+    t.touchCount
+
 // ============================================================================
 // 06. LIVE ZONE MAP
 // ----------------------------------------------------------------------------
@@ -1182,8 +1164,7 @@ export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
     f_registerStatic(e, c, c.useDayHL and c.carryPrevDayHL and isNewDay, e.prevDayHigh, "PDH", CAT_HZ, "PD", "Prev Day High", c.scorePrevDayHL, c.lifePrevDayHL)
     f_registerStatic(e, c, c.useDayHL and c.carryPrevDayHL and isNewDay, e.prevDayLow,  "PDL", CAT_HZ, "PD", "Prev Day Low",  c.scorePrevDayHL, c.lifePrevDayHL)
 
-    // ---- 6.7 Reaction 計測 → 寿命切れ破棄 ---------------------------------
-    f_updateReactions(e, c)
+    // ---- 6.7 寿命切れ破棄 (Practical: Reaction計測 / 寿命延長は廃止) -------
     f_prunePersist(e, c)
 
     // ---- 6.8 このバーで評価するRaw Zone一式 -------------------------------
@@ -1264,6 +1245,8 @@ export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
             z.flipBonus := t.flipped ? c.flipBonus : 0.0
             z.trackId   := t.id
             f_applyStrength(z, c)
+            f_updateTouch(t, z, c)
+            z.touchCount := t.touchCount
 
     // ---- 6.11 長期間マッチしないTrackを破棄 -------------------------------
     if array.size(e.tracks) > 0
@@ -1312,6 +1295,13 @@ export zoneCount(ZoneEngine e) =>
 // @returns   Zone
 export zoneAt(ZoneEngine e, int i) =>
     array.get(e.live, i)
+
+// @function  i 番目の Zone の Strong Touch Count (Strengthとは独立)
+// @param e   ZoneEngine
+// @param i   index
+// @returns   int
+export zoneTouchCount(ZoneEngine e, int i) =>
+    array.get(e.live, i).touchCount
 
 // @function  現在価格に近い順の Zone index 配列 (描画用)
 // @param e   ZoneEngine
