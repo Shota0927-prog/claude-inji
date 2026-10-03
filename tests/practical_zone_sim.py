@@ -14,7 +14,9 @@ ZoneEnginePractical.pine (practical) line by line and checks:
   K1      Track stale gate == legacy every-bar scan
 
   B1-B6   Practical Break authority (confirmed bar's own close) + Touch ordering
-  H1-H2   Break TF > chart TF feed (evaluate once on the HTF closing bar)
+  R1-R3   Break boundary regression (RESIST / SUPPORT)
+  F1-F3   Role reversal only via Break -> Retest -> Flip; A1 ACTIVE first role
+  H1-H2   Break TF > chart TF feed (single path, once on the HTF closing bar)
 
 Evidence class: PINE_NOT_VERIFIED. These are Python mirror tests of the Pine
 logic; a PASS here is not a TradingView compile / runtime PASS.
@@ -530,6 +532,8 @@ def natural_state(top, bottom, close):
 
 
 def update_track(t, c, evalBar, bc, bh, bl, close, bar):
+    """Verbatim port of ZoneEnginePractical f_updateTrack (incl. reclaim / retest / flip).
+    Practical: natural state only for ST_ACTIVE (no natural role reversal)."""
     ev = 0
     prev = t.state
     handled = False
@@ -537,12 +541,32 @@ def update_track(t, c, evalBar, bc, bh, bl, close, bar):
         if prev == ST_ACTIVE else prev
     if evalBar:
         if evalState == ST_RESIST and bc > t.top + c.breakBuffer:
-            t.state, t.breakDir, t.retested, handled, ev = ST_BROKEN, 1, False, True, 1
+            t.state, t.breakDir, t.retested, t.flipped, handled, ev = ST_BROKEN, 1, False, False, True, 1
         elif evalState == ST_SUPPORT and bc < t.bottom - c.breakBuffer:
-            t.state, t.breakDir, t.retested, handled, ev = ST_BROKEN, -1, False, True, -1
-        elif prev == ST_BROKEN and t.breakDir != 0:
-            handled = True   # (reclaim / retest / flip branches not needed for these fixtures)
-    if not handled and t.state != ST_BROKEN:
+            t.state, t.breakDir, t.retested, t.flipped, handled, ev = ST_BROKEN, -1, False, False, True, -1
+        elif prev == ST_BROKEN and t.breakDir == 1:
+            handled = True
+            if bc < t.bottom - c.breakBuffer:
+                t.breakDir, t.retested = 0, False
+                if c.resetOnReclaim:
+                    t.state = natural_state(t.top, t.bottom, close)
+            elif not t.retested:
+                if bl <= t.top and bh >= t.bottom:
+                    t.retested = True
+            elif bc >= t.top + c.flipConfirmDist:
+                t.flipped, t.state, t.breakDir, t.retested, ev = True, ST_SUPPORT, 0, False, 2
+        elif prev == ST_BROKEN and t.breakDir == -1:
+            handled = True
+            if bc > t.top + c.breakBuffer:
+                t.breakDir, t.retested = 0, False
+                if c.resetOnReclaim:
+                    t.state = natural_state(t.top, t.bottom, close)
+            elif not t.retested:
+                if bh >= t.bottom and bl <= t.top:
+                    t.retested = True
+            elif bc <= t.bottom - c.flipConfirmDist:
+                t.flipped, t.state, t.breakDir, t.retested, ev = True, ST_RESIST, 0, False, -2
+    if not handled and t.state == ST_ACTIVE:
         t.state = natural_state(t.top, t.bottom, close)
     if t.state == ST_SUPPORT:
         t.lastRole = 1
@@ -554,7 +578,7 @@ def update_track(t, c, evalBar, bc, bh, bl, close, bar):
 def engine_bar(t, c, strength, top, bottom, h_l_c, bar, confirmed=True):
     """Practical update() order for one matched track, Break TF == chart TF feed:
     brClose = close / brHigh = high / brLow = low / brEval = barstate.isconfirmed.
-    geometry -> f_updateTrack (Break/Reclaim/Flip/state) -> f_applyStrength -> f_updateTouch."""
+    geometry -> f_updateTrack (Break/Reclaim/Flip/state) -> Strength -> f_updateTouch."""
     hi, lo, cl = h_l_c
     t.top, t.bottom = top, bottom
     ev = update_track(t, c, confirmed, cl if confirmed else None, hi, lo, cl, bar)
@@ -565,6 +589,7 @@ def engine_bar(t, c, strength, top, bottom, h_l_c, bar, confirmed=True):
 def start_track(state):
     t = Track(4065.0, 4045.0)
     t.state = state
+    t.flipped = False
     t.lastRole = 1 if state == ST_SUPPORT else -1 if state == ST_RESIST else 0
     return t
 
@@ -572,27 +597,31 @@ def start_track(state):
 def fixtures_break_touch():
     c = BCfg()
     Z = (4065.0, 4045.0)
+    TICK = 0.01
     cases = [
-        # name, start state, candle (high, low, close), expected ev, expected state, expected touch
-        ("B1 RESIST close 4071 > 4065+5 (overlap)", ST_RESIST, (4075, 4055, 4071), 1, ST_BROKEN, 0),
-        ("B2 SUPPORT close 4039 < 4045-5 (overlap)", ST_SUPPORT, (4055, 4035, 4039), -1, ST_BROKEN, 0),
-        ("B3 RESIST wick only: high 4075, close 4068", ST_RESIST, (4075, 4055, 4068), 0, None, None),
-        ("B3s SUPPORT wick only: low 4035, close 4042", ST_SUPPORT, (4055, 4035, 4042), 0, None, None),
-        ("B4 RESIST close == 4070 (strict >)", ST_RESIST, (4075, 4055, 4070), 0, None, None),
-        ("B4s SUPPORT close == 4040 (strict <)", ST_SUPPORT, (4055, 4035, 4040), 0, None, None),
+        # name, start, candle (high, low, close), ev, state, touch
+        ("B1 RESIST close 4071 > 4065+5 (overlap)",          ST_RESIST,  (4075, 4055, 4071), 1,  ST_BROKEN,  0),
+        ("B2 SUPPORT close 4039 < 4045-5 (overlap)",         ST_SUPPORT, (4055, 4035, 4039), -1, ST_BROKEN,  0),
+        ("B3 RESIST wick high 4075, close 4068",             ST_RESIST,  (4075, 4055, 4068), 0,  ST_RESIST,  1),
+        ("B4 RESIST close == 4070 (strict >)",               ST_RESIST,  (4075, 4055, 4070), 0,  ST_RESIST,  1),
+        ("B3s SUPPORT wick low 4035, close 4042",            ST_SUPPORT, (4055, 4035, 4042), 0,  ST_SUPPORT, 1),
+        ("B4s SUPPORT close == 4040 (strict <)",             ST_SUPPORT, (4055, 4035, 4040), 0,  ST_SUPPORT, 1),
+        ("R1 RESIST close top+1 = 4066",                     ST_RESIST,  (4080, 4070, 4066), 0,  ST_RESIST,  None),
+        ("R2 RESIST close top+buffer = 4070",                ST_RESIST,  (4080, 4069, 4070), 0,  ST_RESIST,  None),
+        ("R3 RESIST close top+buffer+tick = 4070.01",        ST_RESIST,  (4080, 4069, 4070 + TICK), 1, ST_BROKEN, None),
+        ("R1s SUPPORT close bottom-1 = 4044",                ST_SUPPORT, (4040, 4030, 4044), 0,  ST_SUPPORT, None),
+        ("R2s SUPPORT close bottom-buffer = 4040",           ST_SUPPORT, (4041, 4030, 4040), 0,  ST_SUPPORT, None),
+        ("R3s SUPPORT close bottom-buffer-tick = 4039.99",   ST_SUPPORT, (4041, 4030, 4040 - TICK), -1, ST_BROKEN, None),
     ]
     for name, st0, candle, ev_x, st_x, touch_x in cases:
         t = start_track(st0)
         ev = engine_bar(t, c, SR_STRONG, Z[0], Z[1], candle, 1)
-        ok = ev == ev_x and (st_x is None or t.state == st_x) and t.state != (ST_BROKEN if ev_x == 0 else -99)
-        if touch_x is not None:
-            ok = ok and t.touchCount == touch_x
+        ok = ev == ev_x and t.state == st_x
         if ev_x != 0:
             ok = ok and t.breakDir == ev_x
+        if touch_x is not None:
+            ok = ok and t.touchCount == touch_x
         check(name, ok, f"ev={ev} state={t.state} breakDir={t.breakDir} touch={t.touchCount}")
-        if ev_x == 0:
-            LITERAL.append(f"{name}: no break -> state={t.state} (natural), touch={t.touchCount} "
-                           f"(normal Practical touch rule applies)")
 
     # B5 realtime: unconfirmed tick beyond top+buffer must not break; confirmed tick does
     t = start_track(ST_RESIST)
@@ -600,49 +629,80 @@ def fixtures_break_touch():
     st_tick = t.state
     t = start_track(ST_RESIST)   # Pine rollback: confirmed tick starts from previous-bar state
     ev_conf = engine_bar(t, c, SR_STRONG, Z[0], Z[1], (4075, 4055, 4071), 1, confirmed=True)
-    check("B5 unconfirmed tick: no break / confirmed tick: break", ev_tick == 0 and st_tick != ST_BROKEN
-          and ev_conf == 1 and t.state == ST_BROKEN, f"tick ev={ev_tick} st={st_tick}; confirmed ev={ev_conf}")
+    check("B5 unconfirmed tick: no break, role kept / confirmed tick: break",
+          ev_tick == 0 and st_tick == ST_RESIST and ev_conf == 1 and t.state == ST_BROKEN,
+          f"tick ev={ev_tick} st={st_tick}; confirmed ev={ev_conf}")
 
     # B6 after break: broken bars never count touch
     t = start_track(ST_RESIST)
     engine_bar(t, c, SR_STRONG, Z[0], Z[1], (4075, 4055, 4071), 1)
-    engine_bar(t, c, SR_STRONG, Z[0], Z[1], (4072, 4060, 4068), 2)   # retest inside, still BROKEN
+    engine_bar(t, c, SR_STRONG, Z[0], Z[1], (4072, 4060, 4068), 2)
     check("B6 BROKEN bars after break: touch unchanged", t.state == ST_BROKEN and t.touchCount == 0,
           f"state={t.state} touch={t.touchCount}")
 
+    # F1 / F1s: role reverses only via Break -> BROKEN -> Retest -> Flip Confirm
+    for name, st0, bars, flip_state in (
+        ("F1 RESIST -> break -> retest -> flip -> SUPPORT", ST_RESIST,
+         [(4075, 4055, 4071), (4072, 4060, 4068), (4085, 4074, 4080)], ST_SUPPORT),
+        ("F1s SUPPORT -> break -> retest -> flip -> RESIST", ST_SUPPORT,
+         [(4055, 4035, 4039), (4050, 4038, 4042), (4036, 4025, 4030)], ST_RESIST)):
+        t = start_track(st0)
+        states = []
+        for k, b in enumerate(bars):
+            engine_bar(t, c, SR_STRONG, Z[0], Z[1], b, k + 1)
+            states.append(t.state)
+        ok = states[0] == ST_BROKEN and states[1] == ST_BROKEN and states[2] == flip_state and t.flipped
+        check(name, ok, f"states={states} flipped={t.flipped}")
+
+    # F2 / F2s: no direct reversal without Break / Flip (closes beyond top but within buffer,
+    #           and wicks far beyond) -> role kept for many bars
+    for name, st0, bar in (("F2 RESIST many closes in (top, top+buffer] + big wicks", ST_RESIST, (4100, 4050, 4069)),
+                           ("F2s SUPPORT many closes in [bottom-buffer, bottom) + big wicks", ST_SUPPORT, (4060, 4010, 4041))):
+        t = start_track(st0)
+        seen = set()
+        for k in range(20):
+            engine_bar(t, c, SR_STRONG, Z[0], Z[1], bar, k + 1)
+            seen.add(t.state)
+        check(name, seen == {st0}, f"states seen={sorted(seen)}")
+
+    # F3 / F3s: break then retest but no flip confirm -> stays BROKEN (never opposite role)
+    t = start_track(ST_RESIST)
+    for k, b in enumerate([(4075, 4055, 4071), (4072, 4060, 4068), (4074, 4066, 4072)]):
+        engine_bar(t, c, SR_STRONG, Z[0], Z[1], b, k + 1)
+    check("F3 RESIST break + retest, close < top+flipConfirmDist -> still BROKEN", t.state == ST_BROKEN,
+          f"state={t.state}")
+
+    # A1: ST_ACTIVE first-role determination unchanged (natural state)
+    t = start_track(ST_ACTIVE)
+    engine_bar(t, c, SR_STRONG, Z[0], Z[1], (4060, 4050, 4055), 1)
+    s_in = t.state
+    engine_bar(t, c, SR_STRONG, Z[0], Z[1], (4072, 4060, 4068), 2)
+    check("A1 ST_ACTIVE (no role) -> natural state decides first role", s_in == ST_ACTIVE and t.state == ST_SUPPORT,
+          f"{s_in} -> {t.state}")
+
+    # OBSERVED: established role is also kept while close is inside the zone
+    t = start_track(ST_RESIST)
+    engine_bar(t, c, SR_STRONG, Z[0], Z[1], (4060, 4050, 4055), 1)
+    LITERAL.append(f"RESIST, close 4055 inside zone -> state={t.state} (legacy would be ACTIVE=0)")
+
 
 def htf_feed(bars):
-    """Port of ZoneVisualPractical Break feed for Break TF > chart TF.
-    bars: list of dicts (htf_open, closes_htf, close, htf_close_so_far, confirmed)."""
+    """Port of ZoneVisualPractical Break feed for Break TF > chart TF (single path)."""
     evals = []
-    done = None
-    prev_tf = None
-    prev_src = None
     for i, b in enumerate(bars):
-        new_period = i > 0 and b["tf"] != prev_tf
-        prev_missed = new_period and (done is None or done != prev_tf)
-        if prev_missed:
-            evals.append((i, prev_src, "fallback"))
-            done = prev_tf
-        elif b["confirmed"] and b["closes"]:
-            evals.append((i, b["src"], "primary"))
-            done = b["tf"]
-        prev_tf, prev_src = b["tf"], b["src"]
+        if b["confirmed"] and b["closes"]:
+            evals.append((i, b["src"]))
     return evals
 
 
 def fixture_htf_feed():
-    # 15m Break TF on 5m chart: periods A (3 bars), B (3 bars), C (2 bars, session cut: no closing bar), D
     bars = []
-    for tf, closes in (("A", [4050, 4060, 4071]), ("B", [4072, 4068, 4066]), ("C", [4064, 4062]), ("D", [4061])):
+    for tf, closes in (("A", [4050, 4060, 4071]), ("B", [4072, 4068, 4066]), ("C", [4064, 4062, 4061])):
         for k, cl in enumerate(closes):
-            last = k == len(closes) - 1 and tf != "C"
-            bars.append(dict(tf=tf, src=cl, closes=last, confirmed=True))
+            bars.append(dict(tf=tf, src=cl, closes=k == len(closes) - 1, confirmed=True))
     ev = htf_feed(bars)
-    expect = [(2, 4071, "primary"), (5, 4066, "primary"), (8, 4062, "fallback")]
-    check("H1 HTF feed: once per HTF bar on its closing bar with HTF close; fallback only if missed",
-          ev[:3] == expect and len([e for e in ev if e[2] == "fallback"]) == 1, str(ev))
-    # unconfirmed closing bar (realtime mid-bar): no evaluation
+    check("H1 HTF feed: exactly once per HTF bar, on its closing bar, with the HTF close",
+          ev == [(2, 4071), (5, 4066), (8, 4061)], str(ev))
     ev2 = htf_feed([dict(tf="A", src=4071, closes=True, confirmed=False)])
     check("H2 HTF closing bar not yet confirmed: no evaluation", ev2 == [], str(ev2))
 
