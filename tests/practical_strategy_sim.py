@@ -3415,9 +3415,8 @@ def fixture_p11_static():
     # ---- direction ----
     disp = code_only(LG[LG.find("// 08. DISPATCH"):LG.find("// 09. BREAK EVEN")])
     calls = re.findall(r"e := f_tryEntry\(activePos, ds, (\w+), ([^,]+), (-?\d+), ([^,]+), globalPositionBlocked, enteredThisBar\)", disp)
-    check("L01 every dispatch call is dir = 1 (strategy.entry Short unreachable; strategy.short only inside the unchanged P10 f_tryEntry)",
-          len(calls) == 8 and all(c_[2] == "1" for c_ in calls) and lcs.count("strategy.short") == 1
-          and "strategy.short" in code_only(func_block(LG, "f_tryEntry")))
+    check("L01 every dispatch call is dir = 1; strategy.short = 0",
+          len(calls) == 8 and all(c_[2] == "1" for c_ in calls) and "strategy.short" not in LG)
     sec10 = code_only(LG[LG.find("// 10. PROVISIONAL ALERT"):])
     check("L02 confirmed alert reachable only via dir = 1 entries (f_tryEntry is the only confirmed alert site)",
           lcs.count("alert(") == 2 and code_only(func_block(LG, "f_tryEntry")).count("alert(") == 1)
@@ -3580,13 +3579,23 @@ def fixture_p11_static():
           and LI["useProvisionalAlert"]["default"] == "false" and LI["useConfirmedAlert"]["default"] == "true"
           and LI["zoneBreakBuffer"]["default"] == "3.0")
     # ---- P10 control parity ----
+    #  LONG-only specialisation (P11 cleanup): the only allowed text differences vs P10.
+    def long_spec(t):
+        t = t.replace("strategy.entry(eid, dir > 0 ? strategy.long : strategy.short, qty = qty)", "strategy.entry(eid, strategy.long, qty = qty)")
+        t = t.replace('alert(f_entryAlertMsg("確定", logicId, dir, p, qty), alert.freq_all)', 'alert(f_entryAlertMsgLong("確定", logicId, p, qty), alert.freq_all)')
+        t = t.replace('alert(f_entryAlertMsg("仮", winLogic, winDir, win.plan, win.qty), alert.freq_once_per_bar)',
+                      'alert(f_entryAlertMsgLong("仮", winLogic, win.plan, win.qty), alert.freq_once_per_bar)')
+        t = t.replace("f_entryAlertMsg(string kind, string logicId, int dir, zn.TradePlan p, float qty) =>",
+                      "f_entryAlertMsgLong(string kind, string logicId, zn.TradePlan p, float qty) =>")
+        t = t.replace('"【" + kind + " " + (dir > 0 ? "LONG" : "SHORT") + "】" +', '"【" + kind + " LONG】" +')
+        return t
     for a, b in (("// 05. TRADE PLAN / RISK / QTY", "// 07. PROBE CANDIDATES"), ("// 09. BREAK EVEN", "// 10. PROVISIONAL ALERT")):
         bb = "// 07. SIGNAL ENGINE" if "PROBE" in b else b
-        check(f"P11 P10 control block '{a[3:]}' identical (code)",
-              code_only(AH[AH.find(a):AH.find(b)]) == code_only(LG[LG.find(a):LG.find(bb)]))
-    for fn in ("f_tryEntry", "f_provEval", "f_insideAnyZone", "f_qty", "f_tpDepthFor", "f_breakEvenTriggerFor", "f_entryAlertMsg", "f_provSlot"):
+        check(f"P11 P10 control block '{a[3:]}' identical (code; LONG-only specialisation only)",
+              long_spec(code_only(AH[AH.find(a):AH.find(b)])) == code_only(LG[LG.find(a):LG.find(bb)]))
+    for fn in ("f_provEval", "f_insideAnyZone", "f_qty", "f_tpDepthFor", "f_breakEvenTriggerFor", "f_provSlot"):
         check(f"P11 {fn} identical to P10", code_only(func_block(LG, fn)) == code_only(func_block(AH, fn)) != "")
-    p10p = code_only(AH[AH.find("varip int gProvLastBar"):AH.find("// ---- Flat 遷移検知用")]).split("\n")
+    p10p = long_spec(code_only(AH[AH.find("varip int gProvLastBar"):AH.find("// ---- Flat 遷移検知用")])).split("\n")
     l11p = code_only(LG[LG.find("varip int gProvLastBar"):LG.find("// ---- Flat 遷移検知用")]).split("\n")
     p10_ = [l for l in p10p if not re.search(r"pfire|f_provDirMode|dm != |cnd|int    li |int    d   |for k = 0 to 15|winDir   := d|f_provOffset|ProvEval ev", l)]
     l11_ = [l for l in l11p if not re.search(r"for li = 0 to 7|winDir   := 1|ProvEval ev", l)]
@@ -3611,6 +3620,54 @@ def fixture_p11_static():
     check("P11 request call sites: Zone 8 + Signal 23 (= P10 Zone block + old Main Section 03 verbatim)",
           len(req) == 31 and code_only(B_ZONE_SECTION(LG)).count("request.") == 8, str(len(req)))
 
+
+    # ---- P11 LONG-only structural cleanup (L30-L33) ----
+    te10 = code_only(func_block(AH, "f_tryEntry")).split("\n")
+    te11 = code_only(func_block(LG, "f_tryEntry")).split("\n")
+    swap = {"strategy.entry(eid, dir > 0 ? strategy.long : strategy.short, qty = qty)": "strategy.entry(eid, strategy.long, qty = qty)",
+            'alert(f_entryAlertMsg("確定", logicId, dir, p, qty), alert.freq_all)': 'alert(f_entryAlertMsgLong("確定", logicId, p, qty), alert.freq_all)'}
+    te10_long = [l.replace(l.strip(), swap[l.strip()]) if l.strip() in swap else l for l in te10]
+    check("L30 strategy.short token = 0 in PracticalZoneStrategy_LONG.pine (code and comments)", "strategy.short" not in LG)
+    check("L31 strategy.entry direction = strategy.long only (1 call site)",
+          re.findall(r"strategy\.entry\(([^)]*)\)", lc) == ["eid, strategy.long, qty = qty"])
+    check("L31 f_tryEntry == P10 f_tryEntry with only the dir > 0 branch kept (entry direction / confirmed alert helper)",
+          te11 == te10_long)
+    am10 = code_only(func_block(AH, "f_entryAlertMsg"))
+    am11 = code_only(func_block(LG, "f_entryAlertMsgLong"))
+    exp_long = am10.replace("f_entryAlertMsg(string kind, string logicId, int dir, zn.TradePlan p, float qty) =>",
+                            "f_entryAlertMsgLong(string kind, string logicId, zn.TradePlan p, float qty) =>") \
+                   .replace('"【" + kind + " " + (dir > 0 ? "LONG" : "SHORT") + "】" +', '"【" + kind + " LONG】" +')
+    check("L31b alert text LONG-only: f_entryAlertMsgLong == P10 f_entryAlertMsg (dir > 0) ; no SHORT literal; only 【仮 LONG】/【確定 LONG】",
+          am11 == exp_long and '"SHORT"' not in lc and "SHORT" not in lcs.replace('""', "") and "f_entryAlertMsg(" not in lc
+          and lc.count("f_entryAlertMsgLong(") == 3)
+    # L32: identical Long behaviour vs cffdbb3 : only the 4 specialised lines differ
+    prev = open(os.path.join(ROOT, "tests", "fixtures_p11_cffdbb3.pine"), encoding="utf-8").read() if os.path.exists(
+        os.path.join(ROOT, "tests", "fixtures_p11_cffdbb3.pine")) else None
+    if prev is None:
+        import subprocess
+        prev = subprocess.run(["git", "-C", ROOT, "show", "cffdbb3:PracticalZoneStrategy_LONG.pine"], capture_output=True, text=True).stdout
+    a_ = code_only(prev).split("\n")
+    b_ = lc.split("\n")
+    ops = [op for op in difflib.SequenceMatcher(None, a_, b_, autojunk=False).get_opcodes() if op[0] != "equal"]
+    chg = [([x.strip() for x in a_[i1:i2]], [x.strip() for x in b_[j1:j2]]) for t, i1, i2, j1, j2 in ops]
+    exp_chg = [(['f_entryAlertMsg(string kind, string logicId, int dir, zn.TradePlan p, float qty) =>',
+                 '"【" + kind + " " + (dir > 0 ? "LONG" : "SHORT") + "】" +'],
+                ['f_entryAlertMsgLong(string kind, string logicId, zn.TradePlan p, float qty) =>', '"【" + kind + " LONG】" +']),
+               (['strategy.entry(eid, dir > 0 ? strategy.long : strategy.short, qty = qty)'], ['strategy.entry(eid, strategy.long, qty = qty)']),
+               (['alert(f_entryAlertMsg("確定", logicId, dir, p, qty), alert.freq_all)'], ['alert(f_entryAlertMsgLong("確定", logicId, p, qty), alert.freq_all)']),
+               (['alert(f_entryAlertMsg("仮", winLogic, winDir, win.plan, win.qty), alert.freq_once_per_bar)'],
+                ['alert(f_entryAlertMsgLong("仮", winLogic, win.plan, win.qty), alert.freq_once_per_bar)'])]
+    check("L32 Long entry result identical to cffdbb3: only the dir>0-branch specialisations differ (dir is always 1)",
+          bool(prev) and chg == exp_chg, str(chg)[:400])
+    # mirror: the two message expressions produce identical text for dir = 1
+    msg10 = lambda kind, d: "【" + kind + " " + ("LONG" if d > 0 else "SHORT") + "】"
+    msg11 = lambda kind: "【" + kind + " LONG】"
+    check("L32b alert header text for dir = 1 unchanged (【仮 LONG】 / 【確定 LONG】)",
+          all(msg10(k, 1) == msg11(k) for k in ("仮", "確定")))
+    sigsec = lambda src: code_only(src[src.find("// 07. SIGNAL ENGINE"):src.find("// 08. DISPATCH")])
+    check("L33 Short shared Signal state kept: Section 07 identical to cffdbb3 (enableShort feed / absEnvShortOk / zone Short env / both sides)",
+          sigsec(prev) == sigsec(LG) and "zoneCmnCfg.enableShort         := enableShort" in lc and "bool absEnvShortOk = sg.fvgAbsEnvShort(" in lc
+          and "allowShort = useFvgLogic and enableShort" in lc and "rbShort = zcRbS" in lc and "zSnapSide,  zsZ.state == ST_SUPPORT ? 1 : -1" in lc)
 
 def B_ZONE_SECTION(src):
     return src[src.find("// 01-2. ZONE ENGINE INPUTS"):src.find("// 01-1. COMMON INPUTS (Signal)")]
