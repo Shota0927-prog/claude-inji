@@ -1832,6 +1832,314 @@ def fixture_p05_consume_preview():
           "no extra preview-only write)", repr(e) == repr(e2) and cf["reboundLong"])
 
 
+# =============================================================================
+# P06 — Zone 4Logic boundary audit (B01-B12) + static compile readiness
+# =============================================================================
+def _one(e, c, snap, tfbars, brk=None, bar=1, t=60, f=None, confirmed=True):
+    return update_zone(e, c, f or zfeed(), None, snap, tfbars, brk, brk is not None, bar, t, confirmed)
+
+
+def _seed_event(e, **kw):
+    q = new_evt(**kw)
+    e["evts"].append(q)
+    return q
+
+
+def fixture_p06_boundaries():
+    SUP_Z, RES_Z = SUP, RES          # 4045-4065, width 20
+    c = ZCfg(useBreak=True)          # breakBuffer 3 -> Support break < 4042, Resistance break > 4068
+
+    # ---- B01 Break boundary (break-TF close, strict) ----------------------
+    for name, snap, eq, beyond, key in (("Support", SUP_Z, 4042.0, 4041.99, "breakShort"),
+                                        ("Resistance", RES_Z, 4068.0, 4068.01, "breakLong")):
+        res = []
+        for px in (eq, beyond):
+            e = zone_engine()
+            side = 1 if name == "Support" else -1
+            _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=side, startBar=0)
+            res.append(_one(e, c, snap, [], brk=px)[key])
+        check(f"B01 {name}: break-TF close == boundary -> no Break; 1 tick beyond -> Break", res == [False, True], str(res))
+
+    # ---- B02 Rebound cancel boundary (1M close, strict) --------------------
+    for name, snap, side, eq, beyond in (("Support", SUP_Z, 1, 4042.0, 4041.99), ("Resistance", RES_Z, -1, 4068.0, 4068.01)):
+        res = []
+        for px in (eq, beyond):
+            e = zone_engine()
+            _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=side, startBar=0)
+            e["prevClose"] = px
+            _one(e, c, snap, [bar1(px)])
+            res.append(e["evts"][0]["rbCancelled"])
+        check(f"B02 {name}: 1M close == bottom-buffer/top+buffer -> no cancel; beyond -> rbCancelled",
+              res == [False, True], str(res))
+
+    # ---- B03 Recovery boundary (>= / <= inclusive) -------------------------
+    cr = ZCfg(useBreak=True, reboundRecoveryRatio=0.5, minMoveAway=1.0)   # base = 4055 -> Long needs >= 4056
+    for name, side, eq, short_of in (("Long", 1, 4056.0, 4055.99), ("Short", -1, 4054.0, 4054.01)):
+        res = []
+        for px in (eq, short_of):
+            e = zone_engine()
+            _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=side, startBar=0)
+            e["prevClose"] = px
+            _one(e, cr, SUP_Z if side > 0 else RES_Z, [bar1(px)])
+            res.append(e["evts"][0]["movedAway"])
+        check(f"B03 Recovery {name}: close == base +/- minMoveAway -> movedAway; 1 tick short -> not", res == [True, False],
+              str(res))
+    e = zone_engine()
+    _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=1, startBar=0)
+    e["prevClose"] = 4050.0
+    _one(e, ZCfg(useBreak=True, reboundRecoveryRatio=1.0, minMoveAway=0.0), SUP_Z, [bar1(4050)])
+    check("B03 ratio >= 1.0 and minMoveAway <= 0 -> movedAway unconditionally (canonical legacy-compat branch)",
+          e["evts"][0]["movedAway"])
+
+    # ---- B04 Retest rearm boundary (<= / >= inclusive) ---------------------
+    #   rd = max(10, 20*0.5) = 10 : Support broken down rearms at close <= 4035; Resistance at >= 4075
+    for name, side, eq, short_of in (("Support", 1, 4035.0, 4035.01), ("Resistance", -1, 4075.0, 4074.99)):
+        res = []
+        for px in (eq, short_of):
+            e = zone_engine()
+            _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=side, startBar=0, phase=1,
+                        breakBar=0, fakeAlive=True)
+            _one(e, c, [], [bar1(px)])
+            res.append(e["evts"][0]["phase"])
+        check(f"B04 {name}: distance == max(retestMinDist, w*mult) -> phase 2; 1 tick short -> phase 1",
+              res == [2, 1], str(res))
+    e = zone_engine()
+    _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=1, startBar=0, phase=1, breakBar=0,
+                fakeAlive=True)
+    _one(ZCfg() and e, ZCfg(useBreak=True, retestMinDist=10.0, retestWidthMult=1.0), [], [bar1(4035.0)])
+    check("B04 width term dominates when w*mult (20) > retestMinDist (10): 4035 does not rearm",
+          e["evts"][0]["phase"] == 1)
+
+    # ---- B05 Reclaim boundary (strict) -------------------------------------
+    for name, side, eq, beyond in (("Support (Fake Long)", 1, 4065.0, 4065.01), ("Resistance (Fake Short)", -1, 4045.0, 4044.99)):
+        res = []
+        for px in (eq, beyond):
+            e = zone_engine()
+            _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=side, startBar=0, phase=1,
+                        breakBar=0, fakeAlive=True)
+            _one(e, c, [], [bar1(px)])
+            res.append(e["evts"][0]["reclaimed"])
+        check(f"B05 Fake reclaim {name}: close == boundary -> not reclaimed; 1 tick beyond -> reclaimed",
+              res == [False, True], str(res))
+    for name, side, eq, beyond in (("Support (Retest Short)", 1, 4065.0, 4065.01), ("Resistance (Retest Long)", -1, 4045.0, 4044.99)):
+        res = []
+        for px in (eq, beyond):
+            e = zone_engine()
+            _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=side, startBar=0, phase=2, rearmBar=0)
+            _one(e, c, [], [bar1(px, h=px, l=px)])
+            res.append(e["evts"][0]["alive"])
+        check(f"B05 Retest invalidation {name}: close == boundary -> alive; 1 tick beyond -> dead",
+              res == [True, False], str(res))
+
+    # ---- B06 same 1M bar ordering ------------------------------------------
+    NEWS = open(os.path.join(ROOT, "SignalEnginePractical.pine"), encoding="utf-8").read()
+    body = code_only(func_block(NEWS, "updateZoneEvents"))
+
+    def pos(pat):
+        m = re.search(pat, body)
+        return m.start() if m else -1
+    order_p2 = [pos(r"bool invalid = "), pos(r"q\.touched  := true"), pos(r"q\.rejected   := true"),
+                pos(r"if not q\.touched and e\.barNo - q\.rearmBar > c\.waitBars"), pos(r"rtS := true")]
+    order_p1 = [pos(r"if el > c\.fakeMaxBars"), pos(r"q\.reclaimed  := true"), pos(r"fkL := true"), pos(r"bool far = ")]
+    order_p0 = [pos(r"bool brk1m = "), pos(r"q\.rbCancelled := true"), pos(r"q\.movedAway := true"),
+                pos(r"q\.bkOnly := true"), pos(r"q\.alive := false"), pos(r"rbL := true")]
+    check("B06 static: phase 2 order invalid -> touch -> rejection -> expiry -> signal",
+          -1 not in order_p2 and order_p2 == sorted(order_p2), str(order_p2))
+    check("B06 static: phase 1 order fake expiry -> reclaim -> fake signal -> rearm check",
+          -1 not in order_p1 and order_p1 == sorted(order_p1), str(order_p1))
+    check("B06 static: phase 0 order cancel -> recovery -> bkOnly -> expiry -> rebound signal",
+          -1 not in order_p0 and order_p0 == sorted(order_p0), str(order_p0))
+    e = zone_engine()
+    _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=1, startBar=0, phase=2, rearmBar=0)
+    r = _one(e, c, [], [(4044.0, 4046.0, 4043.0, False, True)])          # touch + rejection + bear BOS in one 1M bar
+    check("B06 Retest: touch + rejection + BOS in the same 1M bar -> retestShort on that bar (rejectBar == barNo)",
+          r["retestShort"] and e["evts"][0]["touchBar"] == e["evts"][0]["rejectBar"] == e["barNo"])
+    e = zone_engine()
+    _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=1, startBar=0, phase=1, breakBar=0,
+                fakeAlive=True)
+    r = _one(e, c, [], [(4066.0, 4067.0, 4060.0, True, False)])          # reclaim + bull BOS same 1M bar
+    check("B06 Fake: reclaim + BOS in the same 1M bar -> fakeLong (reclaimBar == barNo)", r["fakeLong"])
+    e = zone_engine()
+    _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=1, startBar=0, movedAway=False)
+    cm = ZCfg(useBreak=True, minMoveAway=1.0)
+    r = _one(e, cm, [], [(4041.0, 4070.0, 4040.0, True, False)])         # cancel-level close + BOS
+    check("B06 Rebound: cancel evaluated before recovery/signal -> no rebound even with BOS", not r["reboundLong"]
+          and e["evts"][0]["rbCancelled"])
+
+    # ---- B07 same 5M chart bar, 1M order preserved -------------------------
+    seqA = [bar1(4058, l=4050), bar1(4066), bar1(4068, bull=True)]       # touch -> recovery -> BOS
+    seqB = [bar1(4070, bull=True), bar1(4058, l=4050), bar1(4066)]       # BOS -> touch -> recovery
+    ra, rb = [], []
+    for seq, out in ((seqA, ra), (seqB, rb)):
+        e = zone_engine()
+        _one(e, c, SUP_Z, [bar1(4080)], bar=1, t=60)
+        out.append(_one(e, c, SUP_Z, seq, bar=2, t=120)["reboundLong"])
+    agg = any(b[3] for b in seqB) and max(b[0] for b in seqB) >= 4065       # what a 5M aggregation would conclude
+    check("B07 one 5M bar: [touch, recovery, BOS] -> rebound; [BOS, touch, recovery] -> none (1M order kept, "
+          "not aggregated)", ra == [True] and rb == [False] and agg, f"A={ra} B={rb}")
+
+    # ---- B08 lower-TF transitions + 5M break in the same chart bar ---------
+    e = zone_engine()
+    _one(e, c, SUP_Z, [bar1(4080)], bar=1, t=60)
+    r = _one(e, c, SUP_Z, [bar1(4050, l=4046), bar1(4066), bar1(4040)], brk=4040.0, bar=2, t=120)
+    q = e["evts"][0]
+    check("B08 1M steps (event create, reclaim-level close) run first, then 5M break once: breakShort, phase 1, "
+          "no Fake in the same chart bar", r["breakShort"] and q["phase"] == 1 and not r["fakeLong"]
+          and q["breakBar"] == e["barNo"])
+    r2 = _one(e, c, SUP_Z, [bar1(4066), bar1(4068, bull=True)], bar=3, t=180)
+    check("B08 Fake becomes possible only from the next chart bar's 1M steps", r2["fakeLong"])
+
+    # ---- B09 expiry boundaries (== stays, > expires) -----------------------
+    cw = ZCfg(useBreak=False, waitBars=3, fakeMaxBars=2)
+    def phase0_alive(el):
+        e = zone_engine()
+        _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=1, startBar=0)
+        e["barNo"] = el - 1
+        _one(e, cw, [], [bar1(4070)])
+        return e["evts"][0]["alive"]
+    check("B09 phase 0: elapsed == waitBars alive; waitBars+1 dead", phase0_alive(3) and not phase0_alive(4))
+    cb = ZCfg(useBreak=True, waitBars=3, breakWaitBars=6)
+    e = zone_engine()
+    _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=1, startBar=0)
+    e["barNo"] = 3
+    _one(e, cb, [], [bar1(4070)])
+    bk4 = (e["evts"][0]["bkOnly"], e["evts"][0]["alive"])
+    e["barNo"] = 5
+    _one(e, cb, [], [bar1(4070)])
+    bk6 = (e["evts"][0]["bkOnly"], e["evts"][0]["alive"])
+    _one(e, cb, [], [bar1(4070)])
+    bk7 = e["evts"][0]["alive"] if e["evts"] else False
+    check("B09 phase 0 with Break: elapsed waitBars+1 -> bkOnly but alive; == breakWaitBars alive; +1 dead",
+          bk4 == (True, True) and bk6 == (True, True) and not bk7, f"{bk4} {bk6} {bk7}")
+    def phase1(el):
+        e = zone_engine()
+        _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=1, startBar=0, phase=1, breakBar=0,
+                    fakeAlive=True)
+        e["barNo"] = el - 1
+        _one(e, cw, [], [bar1(4050)])
+        return e["evts"][0]["fakeAlive"], e["evts"][0]["alive"]
+    check("B09 phase 1: fakeAlive kept at el == fakeMaxBars, lost at +1; alive kept at el == max(fake,wait), dead at +1",
+          phase1(2) == (True, True) and phase1(3) == (False, True) and phase1(3)[1] and phase1(4) == (False, False),
+          f"{phase1(2)} {phase1(3)} {phase1(4)}")
+    def phase2(el, touched):
+        e = zone_engine()
+        _seed_event(e, zoneId=7, roleCycle=1, top=4065.0, bottom=4045.0, side=1, startBar=0, phase=2, rearmBar=0,
+                    touched=touched, touchBar=0 if touched else None)
+        e["barNo"] = el - 1
+        _one(e, cw, [], [bar1(4030, h=4031, l=4029)])
+        return e["evts"][0]["alive"]
+    check("B09 phase 2: not touched rearm+waitBars alive / +1 dead; touched touch+waitBars alive / +1 dead",
+          phase2(3, False) and not phase2(4, False) and phase2(3, True) and not phase2(4, True))
+
+    # ---- B10 event FIFO 60 --------------------------------------------------
+    e = zone_engine()
+    for k in range(61):
+        _seed_event(e, zoneId=100 + k, roleCycle=1, top=4065.0, bottom=4045.0, side=1, startBar=0)
+    _one(e, ZCfg(useBreak=False, waitBars=10_000), [], [])
+    check("B10 61 alive events -> oldest (index 0) dropped at the start of the next update; 60 remain",
+          len(e["evts"]) == 60 and e["evts"][0]["zoneId"] == 101)
+    e = zone_engine()
+    for k in range(61):
+        _seed_event(e, zoneId=100 + k, roleCycle=1, top=4065.0, bottom=4045.0, side=1, startBar=0, bkOnly=(k == 30))
+    _one(e, ZCfg(useBreak=True, waitBars=10_000, breakWaitBars=10_000), [], [])
+    check("B10 bkOnly event dropped before older normal events", len(e["evts"]) == 60
+          and 130 not in [q["zoneId"] for q in e["evts"]] and e["evts"][0]["zoneId"] == 100)
+    e = zone_engine()
+    for k in range(3):
+        _seed_event(e, zoneId=100 + k, roleCycle=1, top=4065.0, bottom=4045.0, side=1, startBar=0)
+    e["evts"][0]["alive"] = False
+    e["sigRebound"] = 2
+    idx_ok = e["evts"][2]["zoneId"] == 102            # index valid until the next update (dead not swept yet)
+    _one(e, ZCfg(useBreak=False, waitBars=10_000), [], [])
+    check("B10 dead events are swept only at the start of the next update (consume index stays valid until then)",
+          idx_ok and [q["zoneId"] for q in e["evts"]] == [101, 102])
+
+    # ---- B11 role table cleanup boundary -----------------------------------
+    def role_case(age):
+        e = zone_engine()
+        for k in range(201):
+            e["roleZoneId"].append(k); e["roleSide"].append(1); e["roleCycleNo"].append(3)
+            e["roleSeen"].append(False); e["roleSeenBar"].append(5000 - age if k == 0 else 5000)
+        cleanup = len(e["roleZoneId"]) > 200
+        if cleanup:
+            keep = [i for i in range(len(e["roleZoneId"])) if not (5000 - e["roleSeenBar"][i] > 1000)]
+            for key in ("roleZoneId", "roleSide", "roleCycleNo", "roleSeen", "roleSeenBar"):
+                e[key] = [e[key][i] for i in keep]
+        return 0 in e["roleZoneId"]
+    NEWS_UZ = func_block(NEWS, "updateZoneEvents")
+    check("B11 static: cleanup only when table > 200 rows and rows unseen > 1000 chart bars",
+          "if array.size(e.roleZoneId) > 200" in NEWS_UZ and "bar_index - array.get(e.roleSeenBar, i) > 1000" in NEWS_UZ)
+    check("B11 unseen == 1000 bars kept; 1001 removed", role_case(1000) and not role_case(1001))
+    e = zone_engine()
+    _one(e, c, SUP_Z, [bar1(4080)], bar=1)
+    e["roleCycleNo"][0] = 5                                         # simulate an old zone at cycle 5
+    e["roleZoneId"], e["roleSide"], e["roleCycleNo"], e["roleSeen"], e["roleSeenBar"] = [], [], [], [], []   # cleaned
+    _one(e, c, SUP_Z, [bar1(4080)], bar=2000)
+    check("B11 after cleanup a returning zone restarts at roleCycle 1 (canonical); duplicate check still uses "
+          "zoneId+side+roleCycle", e["roleCycleNo"] == [1])
+
+    # ---- B12 bkOnly does not block a new Rebound registration --------------
+    cb2 = ZCfg(useBreak=True, waitBars=2, breakWaitBars=50)
+    e = zone_engine()
+    _one(e, cb2, SUP_Z, [bar1(4080)], bar=1)
+    _one(e, cb2, SUP_Z, [bar1(4058, l=4050)], bar=2)                                  # event (cycle 1)
+    _one(e, cb2, SUP_Z, [bar1(4070), bar1(4071), bar1(4072)], bar=3)                  # > waitBars -> bkOnly
+    first_bk = e["evts"][0]["bkOnly"] and e["evts"][0]["alive"]
+    _one(e, cb2, SUP_Z, [bar1(4058, l=4050)], bar=4)                                  # same zone/side/cycle again
+    check("B12 bkOnly (break-only, extended) event does not block a new Rebound event of the same zone/side/cycle",
+          first_bk and len(e["evts"]) == 2 and not e["evts"][1]["bkOnly"] and e["evts"][1]["roleCycle"] == 1)
+
+
+# ---- static compile readiness (spec 13) --------------------------------------
+PINE_KEYWORDS = {"if", "else", "for", "while", "switch", "and", "or", "not", "to", "by", "true", "false", "na",
+                 "var", "varip", "export", "type", "import", "return", "continue", "break", "in"}
+PINE_BUILTIN_CALLS = {"na", "nz", "int", "float", "bool", "string", "color", "fixnan", "library", "time",
+                      "max", "min"}
+
+
+def fixture_p06_compile():
+    NEWS = open(os.path.join(ROOT, "SignalEnginePractical.pine"), encoding="utf-8").read()
+    code = code_only(NEWS)
+    code_ns = re.sub(r'"[^"]*"', '""', code)
+    defs = re.findall(r"^(?:export\s+)?(\w+)\(.*?\)\s*=>", code_ns, re.M | re.S)
+    defs_simple = re.findall(r"^(?:export\s+)?(\w+)\(", code_ns, re.M)
+    types = set(re.findall(r"^export type (\w+)", code_ns, re.M))
+    dup = sorted({d for d in defs_simple if defs_simple.count(d) > 1})
+    check("C1 no duplicate function definitions", not dup, str(dup))
+    calls = set(re.findall(r"(?<![\w.])([A-Za-z_]\w*)\(", code_ns))
+    undefined = sorted(c_ for c_ in calls if c_ not in set(defs_simple) and c_ not in PINE_KEYWORDS
+                       and c_ not in PINE_BUILTIN_CALLS)
+    check("C2 every non-namespaced call resolves to a function defined in the file or a Pine builtin",
+          not undefined, str(undefined))
+    tcalls = set(re.findall(r"\b([A-Z]\w*)\.new\(", code_ns))
+    check("C3 every Type.new / type reference is an exported type of this file", tcalls <= types,
+          str(sorted(tcalls - types)))
+    used_types = set(re.findall(r"\b([A-Z][A-Za-z0-9]+)\s+\w+\s*[,)=]", code_ns)) & (set(OT) | types)
+    check("C3 no parameter / variable of a removed type (ZoneBos*)", not (used_types - types), str(used_types - types))
+    kept_fields = {f for t in parse_types(NEWS).values() for f in t}
+    bad_args, bad_dot = [], []
+    for t, fs in REMOVED.items():
+        for blk in re.findall(r"\b" + t + r"\.new\((.*?)\)\s*(?:\n|$)", code_ns, re.S):
+            names = re.findall(r"(\w+)\s*=(?!=)", blk)
+            bad_args += [f"{t}.{x}" for x in names if x in fs]
+        bad_dot += [f"{t}.{x}" for x in fs if x not in kept_fields and re.search(r"\.\s*" + x + r"\b", code_ns)]
+    check("C4 no removed field passed to its Type.new(...) and no .field access to a field no kept type owns",
+          not bad_args and not bad_dot, f"args={bad_args} dot={bad_dot}")
+    order_bad = []
+    defined_at = {}
+    for i, ln in enumerate(code_ns.split("\n")):
+        m = re.match(r"^(?:export\s+)?(\w+)\(", ln)
+        if m:
+            defined_at.setdefault(m.group(1), i)
+    for name, i in defined_at.items():
+        blk = func_block(code_ns, name)
+        for cl in set(re.findall(r"(?<![\w.])([A-Za-z_]\w*)\(", blk)) - {name}:
+            if cl in defined_at and defined_at[cl] > i:
+                order_bad.append(f"{name}->{cl}")
+    check("C5 every local function is defined before it is called (Pine declaration order)", not order_bad,
+          str(order_bad))
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -1852,6 +2160,8 @@ if __name__ == "__main__":
     fixture_p05_rebound_break()
     fixture_p05_fake_retest()
     fixture_p05_consume_preview()
+    fixture_p06_boundaries()
+    fixture_p06_compile()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
