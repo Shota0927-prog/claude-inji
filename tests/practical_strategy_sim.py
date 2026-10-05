@@ -283,6 +283,7 @@ def fixture_removed_dead():
 
 
 def fixture_excluded():
+    NEW = open(os.path.join(ROOT, "SignalEnginePractical.pine"), encoding="utf-8").read()
     gone = ["ZoneBosCfg", "ZoneBosFeed", "ZoneBosEngine", "ZoneBosSignal", "updateZoneBos", "consumeZoneBos",
             "newZoneBosEngine", "newZoneBosCfg", "zoneBosEnvLong", "ZONESR", "efvgBiasText", "efvgReasonText",
             "efvgReboundDebugConfirmed", "efvgAbsDebugConfirmed", "bosBullLowerTf", "newZoneTfEnvCfg",
@@ -291,7 +292,11 @@ def fixture_excluded():
     present = [g for g in gone if g in code]
     check("F9 excluded items absent from code (ZONEBOS / ZONESR / debug / display / future)", not present,
           f"present={present}" if present else f"{len(gone)} checked")
-    check("F9 no dbg* field anywhere", not re.search(r"\bdbg\w+", code))
+    dbg_fields = [f for t in NT.values() for f in t if f.startswith("dbg")]
+    dbg_args = re.findall(r"^\s+(dbg\w+)\s*=", "\n".join(
+        b for b in re.findall(r"\w+\.new\((.*?)\)\n", code, re.S)), re.M)
+    check("F9 no dbg* field in any type nor in any Type.new(...) argument", not dbg_fields and not dbg_args,
+          f"fields={dbg_fields} args={dbg_args}")
 
 
 def fixture_helpers():
@@ -539,6 +544,516 @@ def fixture_p02():
     check("Z8 no array.new / touch scan in harness", "array." not in hco and "touchCount" not in hco)
 
 
+# =============================================================================
+# P03 — FVG / FVG15 port (static differential + behavioural mirror)
+# =============================================================================
+NEW = open(os.path.join(ROOT, "SignalEnginePractical.pine"), encoding="utf-8").read()   # re-read (P03 appended)
+P03_FUNCS = ["calcTriggers", "envTrend", "envTrendConfirmed", "efvgReboundState", "efvgReboundConfirmed",
+             "efvgRebound15Pack", "drDailyTuple", "f_accumNTDetect", "f_accumNT15", "accumNT15Confirmed",
+             "dailyRangeMedian", "f_accZoneExcLong", "f_accZoneExcShort", "updateFvg", "updateFvg15"]
+
+
+def expected_port(orig_block, tname, removed):
+    """Independent re-implementation of the only allowed edit: drop removed named args from Type.new(...)."""
+    out, inside = [], False
+    for ln in orig_block.split("\n"):
+        if re.match(r"^\s+" + tname + r"\.new\($", ln):
+            inside = True
+            out.append(ln)
+            continue
+        if inside:
+            m = re.match(r"^\s+(\w+)\s*=", ln)
+            closing = ln.rstrip().endswith(")")
+            if not (m and m.group(1) in removed):
+                out.append(ln)
+            if closing:
+                inside = False
+                if not out[-1].rstrip().endswith(")"):
+                    out[-1] = out[-1].rstrip().rstrip(",") + ")"
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+
+def state_writes(block):
+    return re.findall(r"\b(e\.\w+)\s*(?::=|\+=)", block)
+
+
+def field_reads(block):
+    return sorted(set(re.findall(r"\b(?:e|c|f|tc|ac|ec)\.(\w+)\b", code_only(block))))
+
+
+def fixture_p03_static():
+    for fn in P03_FUNCS:
+        o, n = func_block(ORIG, fn), func_block(NEW, fn)
+        if fn == "updateFvg":
+            exp = expected_port(o, "FvgSignal", REMOVED["FvgSignal"])
+        elif fn == "updateFvg15":
+            exp = expected_port(o, "Fvg15Signal", REMOVED["Fvg15Signal"])
+        else:
+            exp = o
+        check(f"D1 {fn}: ported verbatim (only removed-field named args dropped)", n != "" and n == exp,
+              f"{len(n.splitlines())} lines")
+    for fn in ("updateFvg", "updateFvg15"):
+        o, n = func_block(ORIG, fn), func_block(NEW, fn)
+        check(f"D2 {fn}: state update order identical", state_writes(o) == state_writes(n),
+              f"{len(state_writes(n))} writes")
+        check(f"D2 {fn}: field reads identical (e/c/f/tc/ac)", field_reads(o) == field_reads(n),
+              f"{len(field_reads(n))} fields")
+        cond = lambda b: [ln.strip() for ln in b.split("\n") if re.match(r"^\s+(if|else if|else)\b", ln)]
+        check(f"D2 {fn}: condition sequence identical", cond(o) == cond(n), f"{len(cond(n))} branches")
+    # re-audit (spec 9): every field read by ported code exists in the kept types
+    kept = {f for t in NT.values() for f in t}
+    for fn in P03_FUNCS:
+        miss = [f for f in field_reads(func_block(NEW, fn)) if f not in kept]
+        check(f"D3 {fn}: every field it reads exists after P01 pruning (no field to restore)", not miss, str(miss))
+    rets = re.findall(r"^\s+(\w+)\s*=", func_block(NEW, "updateFvg").split("FvgSignal.new(")[1], re.M)
+    check("D4 updateFvg returns exactly the kept FvgSignal fields", sorted(rets) == sorted(NT["FvgSignal"]), str(rets))
+    rets = re.findall(r"^\s+(\w+)\s*=", func_block(NEW, "updateFvg15").split("Fvg15Signal.new(")[1], re.M)
+    check("D4 updateFvg15 returns exactly the kept Fvg15Signal fields", sorted(rets) == sorted(NT["Fvg15Signal"]))
+    code = code_only(NEW)
+    check("D5 no array.new outside factories after P03", all(
+        ln.strip().startswith(("FvgEngine.new(", "a15Hi", "ZoneEvtEngine.new(", "roleZoneId", "roleCycleNo",
+                               "roleSeenBar", "array.push(pool")) or "array.new" not in ln for ln in code.split("\n")))
+
+
+# ---- Behavioural mirror of updateFvg (decision core, SignalEngine/21 L1314-1821) ----------------
+# Inputs that Pine computes with ta.* (atr / sma / highest / box detection) are passed in as values.
+class FCfg:
+    def __init__(self, **kw):
+        d = dict(useLowerTFTrigger=True, useTriggerCooldown=False, triggerCooldownBars=3,
+                 useOppositeTriggerNoTrade=True, volMode="OFF", fixedMin=1.0, useMinVol=True, minAtrDollar=1.5,
+                 volModeRel=False, volRatioMin=0.9, fastVolMode="固定値", fastAtrMin=2.2, fastFixedMin=10.0,
+                 bodyAvgMin=0.5, useRangeRatioFilter=True, atrRangeRatioMin=0.06, useVolCooldown=False,
+                 volRecoveryBars=2, useEnvFilter=True, reqTrend4H="上昇", reqTrend1H="上昇", reqTrend15M="上昇",
+                 reqTrend5M="OFF", reqTrend1M="OFF", reqMatchCount=0, useDailyRegimeFilter=True,
+                 dailyRegimeMode="当日進行中ベース", reqDailyDirection="OFF", reqDailyVolatility="低ボラ",
+                 dailyLowVolThreshold=100.0, dailyHighVolThreshold=100.0, dailyDirectionBodyRatio=0.40,
+                 dailyBullCloseLocation=0.65, dailyBearCloseLocation=0.35, dailyInsufficientAsRange=True,
+                 useAccumNoTrade=True, useAccumNT5M=True, useAccumNT15M=True, accumNTKeep=1,
+                 useAccumExitConfirm=False, accumExitConfirmBars=2, useAccumBreakDirection=True,
+                 accumBreakDirectionBars=10, useAccumZoneException=False, useEFVGEnv=True,
+                 efvgCombineMode="TrendAndFVG", useEFVGDaily=False, useEFVG4H=False, useEFVG1H=False,
+                 useEFVG15M=False, useEFVG5M=True, useEFVG1M=False, efvgIntegrationMode="WeightedScore",
+                 efvgReqMatch=3, efvgWeightD=6, efvgWeight4H=5, efvgWeight1H=4, efvgWeight15M=3, efvgWeight5M=2,
+                 efvgWeight1M=1, efvgScoreThresh=1, efvgMode4Allow=False, useFvgBosFilter=True,
+                 enabledTrig=0, triggerMode="Any", minTriggerCount=1)
+        d.update(kw)
+        self.__dict__.update(d)
+
+
+def new_fvg_engine():
+    return dict(lastTrigBar=None, volRecoveryStartBar=None, prevVolLow=False, m15GateBias=0, m15PrevReason=0,
+                m15PrevRem=0, drDayOpen=None, drDayHigh=None, drDayLow=None, a5Hi=[], a5Lo=[], a5St=[],
+                a5BoxHi=None, a5BoxLo=None, a5BoxSt=None, a5Prev=False, a15Hi=[], a15Lo=[], a15St=[],
+                a15LastSt=None, prevBlockedByAccum=False, waitExitConfirm=False, outsideConfirmCount=0,
+                breakDir=0, breakDirStartBar=None, breakDirActive=False, longArmed=True, shortArmed=True)
+
+
+def req_code(s):
+    return {"上昇": 1, "レンジ": 0, "下降": -1}.get(s)
+
+
+def dr_dir_code(c, o, h, l, cl):
+    if None in (o, h, l, cl) or h - l <= 0:
+        return None
+    rng = h - l
+    br = abs(cl - o) / rng
+    loc = (cl - l) / rng
+    bull = cl > o and br >= c.dailyDirectionBodyRatio and loc >= c.dailyBullCloseLocation
+    bear = cl < o and br >= c.dailyDirectionBodyRatio and loc <= c.dailyBearCloseLocation
+    return 1 if bull and not bear else -1 if bear and not bull else 0
+
+
+def dir_text(code):
+    return {1: "上昇", -1: "下降", 0: "レンジ"}.get(code, "-")
+
+
+def vol_text(code):
+    return {1: "高ボラ", -1: "低ボラ", 0: "中ボラ"}.get(code, "-")
+
+
+def update_fvg(e, c, f, bar, confirmed=True):
+    """f: dict of per-bar inputs. Mirrors SignalEngine/21 updateFvg from L1314 onwards."""
+    o, h, l, cl, cl1 = f["open"], f["high"], f["low"], f["close"], f.get("close1", f["close"])
+    # triggers (lower-TF arrays or current-TF combined result)
+    if c.useLowerTFTrigger:
+        bull = any(f.get("bullTrig", []))
+        bear = any(f.get("bearTrig", []))
+    else:
+        bull, bear = f.get("trigBullCur", False), f.get("trigBearCur", False)
+    trigNoTrade = c.useOppositeTriggerNoTrade and (bull and bear)
+    finalBull, finalBear = bull and not trigNoTrade, bear and not trigNoTrade
+    cooldownOk = (not c.useTriggerCooldown) or e["lastTrigBar"] is None or (bar - e["lastTrigBar"]) > c.triggerCooldownBars
+    if (finalBull or finalBear) and cooldownOk:
+        e["lastTrigBar"] = bar
+    # vol
+    baseVolOk = True
+    if c.volMode == "ATR":
+        base, avg = f["baseAtr"], f["atrAvg"]
+        absOk, relOk = base >= c.minAtrDollar, avg > 0 and base >= avg * c.volRatioMin
+        baseVolOk = (not c.useMinVol) or (relOk if c.volModeRel else absOk)
+    elif c.volMode == "固定値":
+        baseVolOk = (h - l) >= c.fixedMin
+    fastPass = True
+    if c.fastVolMode == "ATR":
+        rw = f["rangeWidth"]
+        ratio = f["fastAtr"] / rw if rw > 0 else 0.0
+        fastPass = f["fastAtr"] >= c.fastAtrMin and f["bodyAvg"] >= c.bodyAvgMin and \
+            ((not c.useRangeRatioFilter) or ratio >= c.atrRangeRatioMin)
+    elif c.fastVolMode == "固定値":
+        fastPass = f["fastRange"] >= c.fastFixedMin and f["bodyAvg"] >= c.bodyAvgMin
+    volLow = not (baseVolOk and fastPass)
+    if volLow:
+        e["volRecoveryStartBar"] = None
+    if (not volLow) and e["prevVolLow"]:
+        e["volRecoveryStartBar"] = bar
+    recOk = (not c.useVolCooldown) or e["volRecoveryStartBar"] is None or (bar - e["volRecoveryStartBar"]) >= c.volRecoveryBars
+    volOk = (baseVolOk and fastPass) and recOk
+    # env
+    allowEnv = True
+    if c.useEnvFilter:
+        en = [(c.reqTrend4H, f.get("env4H")), (c.reqTrend1H, f.get("env1H")), (c.reqTrend15M, f.get("env15M")),
+              (c.reqTrend5M, f.get("env5M")), (c.reqTrend1M, f.get("env1M"))]
+        enabled = sum(1 for r, _ in en if r != "OFF")
+        matched = sum(1 for r, v in en if r != "OFF" and v is not None and v == req_code(r))
+        need = enabled if c.reqMatchCount == 0 else c.reqMatchCount
+        allowEnv = enabled == 0 or matched >= need
+    # EFVG with 15M gate
+    mBias = 0
+    if c.useEFVGEnv and c.useEFVG15M:
+        b, r, rem = f.get("mRawBias", 0), f.get("mRawReason", 0), f.get("mRawRem", 0)
+        if r != 0 and (r != e["m15PrevReason"] or rem > e["m15PrevRem"]):
+            aL = (not c.useFvgBosFilter) or f.get("b5Bos", 0) != -1
+            aS = (not c.useFvgBosFilter) or f.get("b5Bos", 0) != 1
+            e["m15GateBias"] = (1 if aL else 0) if r == 1 else (-1 if aS else 0) if r == -1 else 0
+        if b == 0:
+            e["m15GateBias"] = 0
+        if c.useFvgBosFilter:
+            if e["m15GateBias"] == 1 and f.get("b5Bos", 0) == -1:
+                e["m15GateBias"] = 0
+            if e["m15GateBias"] == -1 and f.get("b5Bos", 0) == 1:
+                e["m15GateBias"] = 0
+        e["m15PrevReason"], e["m15PrevRem"] = r, rem
+        mBias = e["m15GateBias"]
+    tfs = [(c.useEFVGDaily, f.get("dBias", 0), c.efvgWeightD), (c.useEFVG4H, f.get("hBias", 0), c.efvgWeight4H),
+           (c.useEFVG1H, f.get("oBias", 0), c.efvgWeight1H), (c.useEFVG15M, mBias, c.efvgWeight15M),
+           (c.useEFVG5M, f.get("b5Bias", 0), c.efvgWeight5M), (c.useEFVG1M, f.get("b1Bias", 0), c.efvgWeight1M)]
+    encnt = sum(1 for u, _, _ in tfs if u)
+    allL = encnt > 0 and all((not u) or bb == 1 for u, bb, _ in tfs)
+    allS = encnt > 0 and all((not u) or bb == -1 for u, bb, _ in tfs)
+    cntL = sum(1 for u, bb, _ in tfs if u and bb == 1) >= c.efvgReqMatch
+    cntS = sum(1 for u, bb, _ in tfs if u and bb == -1) >= c.efvgReqMatch
+    score = sum(w * bb for u, bb, w in tfs if u)
+    scL, scS = score >= c.efvgScoreThresh, score <= -c.efvgScoreThresh
+    htf = sum(w * bb for u, bb, w in tfs[:2] if u)
+    htfDir = 1 if htf > 0 else -1 if htf < 0 else 0
+    loL = any(u and bb == -1 for u, bb, _ in tfs[2:])
+    loS = any(u and bb == 1 for u, bb, _ in tfs[2:])
+    htL = htfDir == 1 and (c.efvgMode4Allow or not loL)
+    htS = htfDir == -1 and (c.efvgMode4Allow or not loS)
+    pick = {"AllAgree": (allL, allS), "MatchCount": (cntL, cntS), "WeightedScore": (scL, scS)}
+    biasL, biasS = pick.get(c.efvgIntegrationMode, (htL, htS))
+    trendOk = (not c.useEnvFilter) or allowEnv
+
+    def comb(bias):
+        if not c.useEFVGEnv:
+            return trendOk
+        return {"TrendOnly": trendOk, "FVGOnly": bias, "TrendAndFVG": trendOk and bias}.get(c.efvgCombineMode,
+                                                                                            trendOk or bias)
+    envL, envS = comb(biasL), comb(biasS)
+    # daily regime
+    drOk = True
+    if c.useDailyRegimeFilter:
+        if f.get("drNewDay") or e["drDayHigh"] is None:
+            e["drDayOpen"], e["drDayHigh"], e["drDayLow"] = o, h, l
+        else:
+            e["drDayHigh"], e["drDayLow"] = max(e["drDayHigh"], h), min(e["drDayLow"], l)
+        if c.dailyRegimeMode == "前日確定ベース":
+            q = f["dr1"]
+        elif c.dailyRegimeMode == "当日進行中ベース":
+            q = (e["drDayOpen"], e["drDayHigh"], e["drDayLow"], cl)
+        else:
+            q = f["dr0"]
+        dcode = dr_dir_code(c, *q)
+        dIns = dcode is None
+        dAdj = (0 if c.dailyInsufficientAsRange else None) if dIns else dcode
+        med = f.get("drMedianRange")
+        vcode = None if med is None else (1 if med >= c.dailyHighVolThreshold else -1 if med < c.dailyLowVolThreshold else 0)
+        vIns = vcode is None
+        vAdj = (0 if c.dailyInsufficientAsRange else None) if vIns else vcode
+        dm = c.reqDailyDirection == "OFF" or dir_text(dAdj) == c.reqDailyDirection
+        vm = c.reqDailyVolatility == "OFF" or vol_text(vAdj) == c.reqDailyVolatility
+        db = c.reqDailyDirection != "OFF" and dIns and not c.dailyInsufficientAsRange
+        vb = c.reqDailyVolatility != "OFF" and vIns and not c.dailyInsufficientAsRange
+        drOk = dm and vm and not db and not vb
+    drL = drS = True
+    if c.dailyRegimeMode in ("前日確定ベース", "当日進行中ベース"):
+        drL = drS = drOk
+    # accum (5M box detection inputs isA5/hi5/lo5 come from f_accumNTDetect)
+    in5 = in15 = False
+    if c.useAccumNoTrade and c.useAccumNT5M:
+        isA5 = f.get("isA5", False)
+        start5 = isA5 and not e["a5Prev"]
+        e["a5Prev"] = isA5
+        if start5:
+            e["a5BoxHi"], e["a5BoxLo"], e["a5BoxSt"] = f["hi5"], f["lo5"], bar
+            e["a5Hi"].append(e["a5BoxHi"]); e["a5Lo"].append(e["a5BoxLo"]); e["a5St"].append(bar)
+            while len(e["a5St"]) > c.accumNTKeep:
+                e["a5Hi"].pop(0); e["a5Lo"].pop(0); e["a5St"].pop(0)
+        if isA5:
+            bt, bb_ = max(o, cl), min(o, cl)
+            e["a5BoxHi"] = max(e["a5BoxHi"] if e["a5BoxHi"] is not None else bt, bt)
+            e["a5BoxLo"] = min(e["a5BoxLo"] if e["a5BoxLo"] is not None else bb_, bb_)
+            if e["a5St"]:
+                e["a5Hi"][-1], e["a5Lo"][-1] = e["a5BoxHi"], e["a5BoxLo"]
+        in5 = any(lo_ <= cl <= hi_ for hi_, lo_ in zip(e["a5Hi"], e["a5Lo"]))
+    if c.useAccumNoTrade and c.useAccumNT15M:
+        if f.get("new15Bar"):
+            st = f.get("acc15St")
+            if st is not None and st != e["a15LastSt"]:
+                e["a15Hi"].append(f["acc15Hi"]); e["a15Lo"].append(f["acc15Lo"]); e["a15St"].append(st)
+                e["a15LastSt"] = st
+                while len(e["a15St"]) > c.accumNTKeep:
+                    e["a15Hi"].pop(0); e["a15Lo"].pop(0); e["a15St"].pop(0)
+            elif e["a15St"] and st is not None and st == e["a15LastSt"]:
+                e["a15Hi"][-1], e["a15Lo"][-1] = f["acc15Hi"], f["acc15Lo"]
+        in15 = any(lo_ <= cl <= hi_ for hi_, lo_ in zip(e["a15Hi"], e["a15Lo"]))
+    blocked = c.useAccumNoTrade and ((c.useAccumNT5M and in5) or (c.useAccumNT15M and in15))
+    blockedL = blockedS = blocked            # useAccumZoneException = false
+    exited = c.useAccumNoTrade and e["prevBlockedByAccum"] and not blocked
+    if (not c.useAccumNoTrade) or (not c.useAccumExitConfirm):
+        e["waitExitConfirm"], e["outsideConfirmCount"] = False, 0
+    else:
+        if blocked:
+            e["waitExitConfirm"], e["outsideConfirmCount"] = False, 0
+        elif exited:
+            e["waitExitConfirm"], e["outsideConfirmCount"] = True, 0
+        elif e["waitExitConfirm"]:
+            e["outsideConfirmCount"] += 1
+        if e["waitExitConfirm"] and e["outsideConfirmCount"] >= c.accumExitConfirmBars:
+            e["waitExitConfirm"] = False
+    exitWait = c.useAccumNoTrade and c.useAccumExitConfirm and e["waitExitConfirm"]
+    if (not c.useAccumNoTrade) or (not c.useAccumBreakDirection):
+        e["breakDir"], e["breakDirStartBar"], e["breakDirActive"] = 0, None, False
+    else:
+        if blocked:
+            e["breakDir"], e["breakDirStartBar"], e["breakDirActive"] = 0, None, False
+        elif exited:
+            up = down = False
+            boxes = (list(zip(e["a5Hi"], e["a5Lo"])) if c.useAccumNT5M else []) + \
+                    (list(zip(e["a15Hi"], e["a15Lo"])) if c.useAccumNT15M else [])
+            for bh, bl in boxes:
+                was = bl <= cl1 <= bh
+                up |= was and cl > bh
+                down |= was and cl < bl
+            if up and not down:
+                e["breakDir"], e["breakDirStartBar"], e["breakDirActive"] = 1, bar, True
+            elif down and not up:
+                e["breakDir"], e["breakDirStartBar"], e["breakDirActive"] = -1, bar, True
+            else:
+                e["breakDir"], e["breakDirStartBar"], e["breakDirActive"] = 0, None, False
+        if e["breakDirActive"] and e["breakDirStartBar"] is not None and bar - e["breakDirStartBar"] > c.accumBreakDirectionBars:
+            e["breakDir"], e["breakDirStartBar"], e["breakDirActive"] = 0, None, False
+    dirL = (not c.useAccumNoTrade) or (not c.useAccumBreakDirection) or (not e["breakDirActive"]) or e["breakDir"] == 1
+    dirS = (not c.useAccumNoTrade) or (not c.useAccumBreakDirection) or (not e["breakDirActive"]) or e["breakDir"] == -1
+    majL = drL and f.get("sessionOk", True) and f.get("newsOk", True) and envL and volOk and not blockedL and not exitWait and dirL
+    majS = drS and f.get("sessionOk", True) and f.get("newsOk", True) and envS and volOk and not blockedS and not exitWait and dirS
+    baseL = confirmed and f["allowLong"] and majL
+    baseS = confirmed and f["allowShort"] and majS
+    noTrig = c.enabledTrig == 0
+    if not majL:
+        e["longArmed"] = True
+    if not majS:
+        e["shortArmed"] = True
+    rawL = (baseL and e["longArmed"]) if noTrig else (baseL and finalBull and cooldownOk)
+    rawS = (baseS and e["shortArmed"]) if noTrig else (baseS and finalBear and cooldownOk)
+    sigL, sigS = rawL, rawS
+    if sigL and sigS:
+        if cl >= o:
+            sigS = False
+        else:
+            sigL = False
+    pvBL, pvBS = f["allowLong"] and majL, f["allowShort"] and majS
+    pvL = (pvBL and e["longArmed"]) if noTrig else (pvBL and finalBull and cooldownOk)
+    pvS = (pvBS and e["shortArmed"]) if noTrig else (pvBS and finalBear and cooldownOk)
+    if pvL and pvS:
+        if cl >= o:
+            pvS = False
+        else:
+            pvL = False
+    e["prevVolLow"], e["prevBlockedByAccum"] = volLow, blocked
+    return dict(longSignal=sigL, shortSignal=sigS, previewLong=pvL, previewShort=pvS, noTriggerMode=noTrig,
+                trendOk=trendOk, volOk=volOk, blockedByAccum=blocked, blockedByExitWait=exitWait,
+                accumLongDirOk=dirL, accumShortDirOk=dirS, cooldownOk=cooldownOk, score=score, mBias=mBias,
+                envL=envL, envS=envS, drOk=drOk)
+
+
+def bar_in(**kw):
+    d = dict(open=4050.0, high=4056.0, low=4049.0, close=4055.0, close1=4050.0, allowLong=True, allowShort=False,
+             env4H=1, env1H=1, env15M=1, b5Bias=1, b5Bos=0, drMedianRange=50.0, fastRange=12.0, bodyAvg=1.0)
+    d.update(kw)
+    return d
+
+
+def fixture_p03_behaviour():
+    # FVG1 Trigger OFF: noTriggerMode, armed edge, preview
+    c, e = FCfg(), new_fvg_engine()
+    r1 = update_fvg(e, c, bar_in(), 1)
+    e["longArmed"] = False                      # Main disarms after a real entry
+    r2 = update_fvg(e, c, bar_in(), 2)          # still majorOk -> no new signal while disarmed
+    r3 = update_fvg(e, c, bar_in(env4H=0), 3)   # majorOk false -> re-arm
+    r4 = update_fvg(e, c, bar_in(), 4)          # rising edge -> signal again
+    check("FVG1 Trigger OFF: noTriggerMode, signal, disarm after entry, re-arm when major condition drops",
+          r1["noTriggerMode"] and r1["longSignal"] and not r2["longSignal"] and not r3["longSignal"] and r4["longSignal"],
+          f"{[r['longSignal'] for r in (r1, r2, r3, r4)]}")
+    rp = update_fvg(new_fvg_engine(), c, bar_in(), 1, confirmed=False)
+    check("FVG1 preview = confirmed condition without barstate.isconfirmed", rp["previewLong"] and not rp["longSignal"])
+
+    # FVG2 Trigger ON: cooldown, opposite trigger block, preview
+    c = FCfg(enabledTrig=1, useTriggerCooldown=True, triggerCooldownBars=3)
+    e = new_fvg_engine()
+    a = update_fvg(e, c, bar_in(bullTrig=[True]), 10)
+    b = update_fvg(e, c, bar_in(bullTrig=[True]), 12)    # within cooldown
+    d = update_fvg(e, c, bar_in(bullTrig=[True]), 14)    # 14-10 = 4 > 3 -> ok
+    check("FVG2 trigger cooldown (shared lastTrigBar)", a["longSignal"] and not b["longSignal"] and d["longSignal"],
+          f"{a['longSignal']},{b['longSignal']},{d['longSignal']}")
+    e = new_fvg_engine()
+    update_fvg(e, c, bar_in(bearTrig=[True]), 20)         # Short trigger only (Short disallowed) still sets lastTrigBar
+    x = update_fvg(e, c, bar_in(bullTrig=[True]), 21)
+    check("FVG2 Short-only trigger blocks Long via shared cooldown (direction coupling kept)", not x["longSignal"])
+    e = new_fvg_engine()
+    y = update_fvg(e, c, bar_in(bullTrig=[True], bearTrig=[True]), 30)
+    check("FVG2 opposite trigger NoTrade (bull and bear in same bar)", not y["longSignal"] and not y["previewLong"])
+    e = new_fvg_engine()
+    z = update_fvg(e, c, bar_in(bullTrig=[True]), 40, confirmed=False)
+    check("FVG2 preview with trigger", z["previewLong"] and not z["longSignal"])
+
+    # FVG3 Vol: pass / low / recovery
+    c = FCfg(useVolCooldown=True, volRecoveryBars=2)
+    e = new_fvg_engine()
+    v1 = update_fvg(e, c, bar_in(fastRange=12.0), 1)
+    v2 = update_fvg(e, c, bar_in(fastRange=5.0), 2)
+    v3 = update_fvg(e, c, bar_in(fastRange=12.0), 3)
+    v4 = update_fvg(e, c, bar_in(fastRange=12.0), 4)
+    v5 = update_fvg(e, c, bar_in(fastRange=12.0), 5)
+    check("FVG3 vol pass / low / recovery wait (2 bars)",
+          [v["volOk"] for v in (v1, v2, v3, v4, v5)] == [True, False, False, False, True],
+          str([v["volOk"] for v in (v1, v2, v3, v4, v5)]))
+
+    # FVG4 Trend combinations
+    combos = [(dict(), True), (dict(env1H=0), False), (dict(env15M=-1), False), (dict(env4H=None), False)]
+    res = [update_fvg(new_fvg_engine(), FCfg(), bar_in(**kw), 1)["trendOk"] == exp for kw, exp in combos]
+    c2 = FCfg(reqTrend5M="上昇", reqTrend1M="下降", reqMatchCount=4)
+    r = update_fvg(new_fvg_engine(), c2, bar_in(env5M=1, env1M=1), 1)["trendOk"]          # 4 of 5 match
+    r_ = update_fvg(new_fvg_engine(), c2, bar_in(env5M=0, env1M=1), 1)["trendOk"]         # 3 of 5
+    check("FVG4 trend 4H/1H/15M/5M/1M match + reqMatchCount", all(res) and r and not r_, f"{res},{r},{r_}")
+
+    # FVG5 Daily regime
+    c = FCfg(reqDailyVolatility="低ボラ", dailyLowVolThreshold=100.0, dailyHighVolThreshold=100.0)
+    lo = update_fvg(new_fvg_engine(), c, bar_in(drMedianRange=50.0), 1)["drOk"]
+    hi = update_fvg(new_fvg_engine(), c, bar_in(drMedianRange=150.0), 1)["drOk"]
+    ins = update_fvg(new_fvg_engine(), c, bar_in(drMedianRange=None), 1)["drOk"]          # insufficient -> 中ボラ
+    c3 = FCfg(reqDailyVolatility="低ボラ", dailyInsufficientAsRange=False)
+    ins2 = update_fvg(new_fvg_engine(), c3, bar_in(drMedianRange=None), 1)["drOk"]
+    c4 = FCfg(reqDailyVolatility="OFF", reqDailyDirection="上昇", dailyRegimeMode="前日確定ベース")
+    d_up = update_fvg(new_fvg_engine(), c4, bar_in(dr1=(4000, 4100, 3990, 4095)), 1)["drOk"]
+    d_dn = update_fvg(new_fvg_engine(), c4, bar_in(dr1=(4100, 4110, 4000, 4005)), 1)["drOk"]
+    check("FVG5 daily volatility (low / high / insufficient as range / insufficient block) + direction",
+          lo and not hi and not ins and not ins2 and d_up and not d_dn, f"{lo},{hi},{ins},{ins2},{d_up},{d_dn}")
+
+    # FVG6 Accum: inside -> blocked, exit wait, break direction
+    c = FCfg(useAccumExitConfirm=True, accumExitConfirmBars=2, useAccumNT15M=False)
+    e = new_fvg_engine()
+    s1 = update_fvg(e, c, bar_in(isA5=True, hi5=4060.0, lo5=4040.0, open=4050, close=4052, close1=4050), 1)
+    s2 = update_fvg(e, c, bar_in(isA5=False, open=4052, close=4070, close1=4052), 2)     # exits upward
+    s3 = update_fvg(e, c, bar_in(isA5=False, open=4070, close=4072, close1=4070), 3)
+    s4 = update_fvg(e, c, bar_in(isA5=False, open=4072, close=4074, close1=4072), 4)
+    check("FVG6 inside accum -> blocked; exit -> exit-wait 2 bars; break direction up -> Long ok / Short blocked",
+          s1["blockedByAccum"] and not s1["longSignal"] and s2["blockedByExitWait"] and s3["blockedByExitWait"]
+          and not s4["blockedByExitWait"] and s2["accumLongDirOk"] and not s2["accumShortDirOk"],
+          f"blk={s1['blockedByAccum']} wait={[s['blockedByExitWait'] for s in (s2, s3, s4)]} dir={s2['accumLongDirOk']},{s2['accumShortDirOk']}")
+
+    # FVG7 EFVG: bias / score / match / 15M BOS gate
+    w = update_fvg(new_fvg_engine(), FCfg(), bar_in(b5Bias=-1), 1)
+    check("FVG7 weighted score (5M bias -1 -> score -2 -> Long env false)", w["score"] == -2 and not w["envL"])
+    cm = FCfg(efvgIntegrationMode="MatchCount", efvgReqMatch=2, useEFVG1H=True)
+    m1 = update_fvg(new_fvg_engine(), cm, bar_in(b5Bias=1, oBias=1), 1)["envL"]
+    m0 = update_fvg(new_fvg_engine(), cm, bar_in(b5Bias=1, oBias=0), 1)["envL"]
+    cg = FCfg(useEFVG15M=True, useEFVG5M=False)
+    e = new_fvg_engine()
+    g1 = update_fvg(e, cg, bar_in(mRawBias=1, mRawReason=1, mRawRem=5, b5Bos=-1), 1)    # new event blocked by bearish 5M BOS
+    g2 = update_fvg(e, cg, bar_in(mRawBias=1, mRawReason=1, mRawRem=6, b5Bos=0), 2)     # new event (rem up) allowed
+    g3 = update_fvg(e, cg, bar_in(mRawBias=1, mRawReason=1, mRawRem=6, b5Bos=-1), 3)    # gate cleared by opposite BOS
+    check("FVG7 match count + 15M gate (new event / BOS filter / clear on opposite BOS)",
+          m1 and not m0 and g1["mBias"] == 0 and g2["mBias"] == 1 and g3["mBias"] == 0,
+          f"{m1},{m0},{g1['mBias']},{g2['mBias']},{g3['mBias']}")
+
+    # FVG8 Armed (Long and Short independent) + tie-break only when both allowed
+    e = new_fvg_engine()
+    r = update_fvg(e, FCfg(), bar_in(allowShort=True, env4H=1, b5Bias=1), 1)
+    check("FVG8 armed flags independent per direction; Short not affecting Long when Short env fails",
+          r["longSignal"] and not r["shortSignal"] and e["longArmed"] and e["shortArmed"])
+    cboth = FCfg(useEFVGEnv=False, useEnvFilter=False)
+    tie = update_fvg(new_fvg_engine(), cboth, bar_in(allowShort=True, open=4055, close=4050), 1)
+    check("FVG8 simultaneous Long+Short tie-break by candle colour (only with both directions allowed)",
+          tie["shortSignal"] and not tie["longSignal"])
+
+
+# ---- updateFvg15 mirror (SignalEngine/21 L1915-1971) -------------------------
+def new_f15():
+    return dict(longRebTime=None, shortRebTime=None, longConsumed=False, shortConsumed=False, prevReason=0,
+                prevRem=0, last5mBullT=None, last5mBearT=None)
+
+
+def update_fvg15(e, baseL, baseS, reason, rem, rebT, useOrder, close, bos5Hi, bos5Lo, t, confirmed=True):
+    newL = reason == 1 and (reason != e["prevReason"] or rem > e["prevRem"])
+    newS = reason == -1 and (reason != e["prevReason"] or rem > e["prevRem"])
+    if newL:
+        e["longRebTime"], e["longConsumed"] = rebT, False
+    if newS:
+        e["shortRebTime"], e["shortConsumed"] = rebT, False
+    e["prevReason"], e["prevRem"] = reason, rem
+    if confirmed:
+        if close > bos5Hi:
+            e["last5mBullT"] = t
+        if close < bos5Lo:
+            e["last5mBearT"] = t
+    okL = e["last5mBullT"] is not None and e["longRebTime"] is not None and e["last5mBullT"] >= e["longRebTime"]
+    gateL = (not useOrder) or (okL and not e["longConsumed"])
+    pvT = t if close > bos5Hi else e["last5mBullT"]
+    pvOk = pvT is not None and e["longRebTime"] is not None and pvT >= e["longRebTime"]
+    pvGateL = (not useOrder) or (pvOk and not e["longConsumed"])
+    return dict(longSignal=baseL and gateL, previewGateLong=pvGateL)
+
+
+def fixture_p03_fvg15():
+    e = new_f15()
+    update_fvg15(e, False, False, 0, 0, None, True, 4050, 4060, 4040, 100)
+    r = update_fvg15(e, False, False, 1, 3, 1000, True, 4050, 4060, 4040, 1100)
+    check("F15-1 rebound event: reason 1 -> longRebTime = rebound 15M bar open, consumed reset",
+          e["longRebTime"] == 1000 and not e["longConsumed"])
+    e = new_f15()
+    update_fvg15(e, True, False, 0, 0, None, True, 4065, 4060, 4040, 900)       # BOS at t=900 (before event)
+    r1 = update_fvg15(e, True, False, 1, 3, 1000, True, 4050, 4060, 4040, 1100)
+    r2 = update_fvg15(e, True, False, 1, 3, 1000, True, 4066, 4060, 4040, 1200)  # BOS after event
+    check("F15-2 BOS before event -> no signal; BOS after event -> signal", not r1["longSignal"] and r2["longSignal"])
+    c_ok = r2["longSignal"]
+    e["longConsumed"] = True                                                       # consumeFvg15(+1) after real entry
+    r3 = update_fvg15(e, True, False, 1, 3, 1000, True, 4067, 4060, 4040, 1300)
+    r4 = update_fvg15(e, True, False, 1, 4, 1250, True, 4068, 4060, 4040, 1400)  # new event (rem up) re-arms
+    e2 = new_f15()
+    update_fvg15(e2, True, False, 1, 3, 1000, True, 4066, 4060, 4040, 1200)       # signal, but TradePlan FAIL -> no consume
+    r5 = update_fvg15(e2, True, False, 1, 3, 1000, True, 4066, 4060, 4040, 1300)
+    check("F15-3 consume only on real entry: consumed blocks; new event re-arms; FAIL (no consume) keeps signal",
+          c_ok and not r3["longSignal"] and r4["longSignal"] and r5["longSignal"])
+    e = new_f15()
+    update_fvg15(e, True, False, 1, 3, 1000, True, 4050, 4060, 4040, 1100)
+    pv = update_fvg15(e, True, False, 1, 3, 1000, True, 4066, 4060, 4040, 1200, confirmed=False)
+    check("F15-4 preview: forming 5M bar counts as BOS without writing state; confirmed gate stays false",
+          pv["previewGateLong"] and not pv["longSignal"] and e["last5mBullT"] is None)
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -549,6 +1064,9 @@ if __name__ == "__main__":
     fixture_helpers()
     fixture_alloc()
     fixture_p02()
+    fixture_p03_static()
+    fixture_p03_behaviour()
+    fixture_p03_fvg15()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
