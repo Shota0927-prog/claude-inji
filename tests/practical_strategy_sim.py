@@ -2746,6 +2746,334 @@ def fixture_p08_behaviour():
           ent and (ds["insideScans"], ds["plans"], ds["qtys"]) == (1, 1, 1))
 
 
+# ============================================================================
+# P09 : Break Even (Scalar 1-Position)
+# ============================================================================
+BH_PATH = os.path.join(ROOT, "PracticalBreakEvenHarness.pine")
+BH = open(BH_PATH, encoding="utf-8").read() if os.path.exists(BH_PATH) else ""
+
+
+def fixture_p09_static():
+    check("P09 harness file exists", bool(BH))
+    if not BH:
+        return
+    bc = code_only(BH)
+    BI, MI = parse_inputs(BH), parse_inputs(MAIN)
+    names = ["useBreakEven", "breakEvenTrigger", "fvg15BreakEvenTrigger", "absBreakEvenTrigger", "zoneBreakEvenTrigger",
+             "breakEvenTriggerMode", "breakLongBreakEvenTrigger", "breakLongRefCompat"]
+    diff = [n for n in names if BI.get(n) != MI.get(n) or BI.get(n) is None]
+    check("PB1 BE inputs == old Main (name / kind / default / title / group / options / step)", not diff,
+          ", ".join(f"{n}={BI[n]['default']}" for n in names if n in BI) if not diff else f"diff={diff}")
+    check("PB2 f_breakEvenTriggerFor code identical to old Main (incl. ZONEBREAK Long compat branch)",
+          code_only(func_block(BH, "f_breakEvenTriggerFor")) == code_only(func_block(MAIN, "f_breakEvenTriggerFor")) != "")
+    m_be = MAIN[MAIN.find("// ---- 8.2 建値移動"):MAIN.find("// ---- 8.3 Dynamic TP")]
+    b_be = BH[BH.find("// 09. BREAK EVEN"):BH.find("// ---- Flat 遷移検知用")]
+    mr = re.findall(r"reach := (.*)", code_only(m_be))
+    br_ = re.findall(r"reach := (.*)", code_only(b_be))
+    norm = [x.replace("activePos.beTrigger", "beTrigger") for x in br_]
+    check("PB3 Long / Short reach (到達瞬間 high/low, 確定足 isconfirmed + close) identical to old Main",
+          len(mr) == 2 and norm == mr, str(norm))
+    check("PB3 Long branch = activePos.dir > 0 (old Main: opentrades.size > 0), Short = else",
+          "if activePos.dir > 0" in b_be and "if isLong" in m_be)
+    ex_m = re.findall(r"strategy\.exit\((.*?)\)\n", " ".join(code_only(m_be).split("\n     ")).replace("\n", "\n") + "\n")
+    ex_b = re.findall(r'strategy\.exit\(activePos\.entryId \+ "X", from_entry = activePos\.entryId, stop = ep, '
+                      r'limit = activePos\.tp,\s+comment_loss = "BE", comment_profit = "TP"\)', code_only(b_be))
+    check("PB4 BE exit: same Exit ID (entryId+X), stop = entry fill price, limit = entry-time TP, BE / TP comments",
+          len(ex_b) == 1 and 'stop = ep, limit = gTradeTP.get(eid)' in m_be and 'comment_loss = "BE", comment_profit = "TP"' in m_be)
+    check("PB4 BE entry price = fill price (old Main opentrades.entry_price -> scalar position_avg_price)",
+          "float ep     = strategy.opentrades.entry_price(i)" in m_be and
+          "float beEntryFill        = strategy.position_size != 0 ? strategy.position_avg_price : na" in bc and
+          "float ep = beEntryFill" in b_be)
+    sets = re.findall(r"(\w+)\.beOn\s*:=\s*(\w+)", bc)
+    te = code_only(func_block(BH, "f_tryEntry"))
+    fr = code_only(BH[BH.find("if flatTransition"):BH.find("// 07. PROBE")])
+    check("PB5 BE irreversible: beOn := true only in the BE section; := false only at new entry / flat transition",
+          sorted(sets) == [("activePos", "false"), ("activePos", "true"), ("ap", "false")] and
+          "ap.beOn            := false" in te and "activePos.beOn           := false" in fr and
+          "activePos.beOn           := true" in b_be and "if not activePos.beOn" in b_be)
+    check("PB5 entry stores beOn = false / beTrigger = f_breakEvenTriggerFor(logicId, dir) (scalar, no Entry ID parse)",
+          "ap.beTrigger       := f_breakEvenTriggerFor(logicId, dir)" in te and "str.startswith" not in bc
+          and "f_logicIdFromEid" not in bc)
+    check("PB6 flat reset clears beOn / beTrigger / beActivatedBar and sits BEFORE the dispatch",
+          all(x in fr for x in ("activePos.beTrigger      := na", "activePos.beActivatedBar := na"))
+          and bc.find("if flatTransition") < bc.find("if barstate.isconfirmed\n    bool fire"))
+    check("PB7 BE section AFTER the dispatch (old Main: Section 06 calls -> Section 08 BE)",
+          bc.find("e := f_tryEntry(activePos, ds, LOGIC_ZONE_BK") < bc.find("if useBreakEven and strategy.position_size != 0")
+          and MAIN.find("string zbkEidShort = f_submitSignal") < MAIN.find("// ---- 8.2 建値移動"))
+    check("PB7 BE requires an open position (old Main: opentrades > 0) -> never on the entry-signal bar",
+          "if useBreakEven and strategy.position_size != 0 and activePos.entryId != \"\"" in b_be and
+          "if useBreakEven and strategy.opentrades > 0" in m_be)
+    decl = BH[BH.find("strategy("):BH.find(")", BH.find("calc_on_every_tick")) + 1]
+    check("PB8 calc_on_every_tick = true added; dispatch still confirmed-bar only",
+          "calc_on_every_tick = true" in decl and "if barstate.isconfirmed\n    bool fire" in bc)
+    # ---- P08 dispatch unchanged: P09 = P08 + insertions (only the header title / calc_on_every_tick line replaced) ----
+    a = [l for l in code_only(DH).split("\n")]
+    b = [l for l in bc.split("\n")]
+    ops = [op for op in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes() if op[0] != "equal"]
+    repl = [(a[i1:i2], b[j1:j2]) for t, i1, i2, j1, j2 in ops if t != "insert"]
+    allowed = [(['     title             = "Practical Entry Dispatch Harness (P08)",', '     shorttitle        = "DISPATCH-P08",'],
+                ['     title             = "Practical Break Even Harness (P09)",', '     shorttitle        = "BE-P09",']),
+               (['     dynamic_requests  = true)'], ['     dynamic_requests  = true,', '     calc_on_every_tick = true)'])]
+    check("PB9 P08 code preserved line-for-line (P09 only inserts; replaced = title / calc_on_every_tick)",
+          repl == allowed, str(repl)[:300])
+    ins = [l for t, i1, i2, j1, j2 in ops if t == "insert" for l in b[j1:j2]]
+    te8 = code_only(func_block(DH, "f_tryEntry")).split("\n")
+    te9 = [l for l in te.split("\n") if not re.search(r"ap\.be\w+\s*:=", l)]
+    check("PB9 f_tryEntry == P08 except the 3 BE-state writes in the entered branch", te8 == te9)
+    bad_ins = [l for l in ins if re.search(r"strategy\.entry|f_tryEntry\(|enteredThisBar|globalPositionBlocked\s*=|"
+                                           r"zn\.|f_insideAnyZone|request\.|for ", l)]
+    check("PB9 inserted lines touch no dispatch / gate / Zone / request / loop", not bad_ins, str(bad_ins))
+    bad = [t for t in ("map.new", "map<", "array.new", "gTradeTP", "gTradeSL", "gTradeBE", "f_isOpenEntry", "alert(",
+                       "alertcondition", "tpManagementMode", "Dynamic", "label.new", "box.new", "table.new", "line.new",
+                       "strategy.close(", "strategy.cancel") if t in bc]
+    check("BE24/BE27 no map / array trade mgmt / gTrade* / f_isOpenEntry / Dynamic TP / alert / drawing", not bad, str(bad))
+    check("BE25/BE26 no opentrades / closedtrades loop or per-trade accessor (scalars only)",
+          not re.search(r"for .*(opentrades|closedtrades)", bc) and not re.search(r"strategy\.(opentrades|closedtrades)\.\w+", bc))
+    check("PB10 cost: BE adds 0 Zone scans / 0 buildPlan / 0 request (counts == P08)",
+          bc.count("f_insideAnyZone(") == code_only(DH).count("f_insideAnyZone(") and
+          bc.count("zn.buildPlanWithTpDepth(") == code_only(DH).count("zn.buildPlanWithTpDepth(") == 1 and
+          bc.count("request.") == code_only(DH).count("request."))
+
+
+# ---- bar-by-bar broker mirror (historical: script runs once at bar close) ----------
+BE_TRIG = dict(breakEvenTrigger=15.0, fvg15BreakEvenTrigger=10.0, absBreakEvenTrigger=10.0, zoneBreakEvenTrigger=20.0,
+               breakLongBreakEvenTrigger=10.0, breakLongRefCompat=True)
+
+
+def be_trigger_for(logicId, d, t=BE_TRIG):
+    r = t["breakEvenTrigger"]
+    if logicId == "FVG15":
+        r = t["fvg15BreakEvenTrigger"]
+    elif logicId in ("FVGABS5", "FVGABS15"):
+        r = t["absBreakEvenTrigger"]
+    elif logicId == "ZONEBREAK" and d > 0 and t["breakLongRefCompat"]:
+        r = t["breakLongBreakEvenTrigger"]
+    elif logicId in ("ZONEREBOUND", "ZONEFAKE", "ZONERETEST", "ZONEBREAK"):
+        r = t["zoneBreakEvenTrigger"]
+    return r
+
+
+def be_reach(d, mode, ep, trig, high, low, close, confirmed=True):
+    if d > 0:
+        return (confirmed and close >= ep + trig) if mode == "確定足" else (high >= ep + trig)
+    return (confirmed and close <= ep - trig) if mode == "確定足" else (low <= ep - trig)
+
+
+def broker_fill_exit(d, o, h, l, c, stop, limit):
+    """TV broker emulator bar path: O -> nearer extreme -> other extreme -> C. Returns (price, kind) or None."""
+    path = [o, h, l, c] if abs(h - o) <= abs(o - l) else [o, l, h, c]
+    prev = o
+    for px in path:
+        lo_, hi_ = min(prev, px), max(prev, px)
+        hits = []
+        if d > 0:
+            if stop is not None and lo_ <= stop:
+                hits.append((stop if prev > stop else prev, "stop", abs(prev - stop)))
+            if limit is not None and hi_ >= limit:
+                hits.append((limit if prev < limit else prev, "limit", abs(prev - limit)))
+        else:
+            if stop is not None and hi_ >= stop:
+                hits.append((stop if prev < stop else prev, "stop", abs(prev - stop)))
+            if limit is not None and lo_ <= limit:
+                hits.append((limit if prev > limit else prev, "limit", abs(prev - limit)))
+        if hits:
+            hits.sort(key=lambda x: x[2])
+            return hits[0][0], hits[0][1]
+        prev = px
+    return None
+
+
+def run_be_sim(bars, signals, model="p09", useBE=True, mode="到達瞬間", trig=BE_TRIG):
+    """bars: [(o,h,l,c)]. signals: {bar: (logicId, dir, risk, rr)} evaluated at that bar's close.
+    model: 'p08' (no BE section), 'p09' (scalar, once), 'main' (Map + opentrades loop + re-issue every bar).
+    Returns (trades, log) ; trades = [(entryBar, fill, exitBar, exitPx, comment)]."""
+    pending = None                       # entry order placed at a confirmed close, fills next open
+    pos = None                           # open trade dict
+    exit_order = None                    # (eid, stop, limit, comment_loss, comment_profit)
+    closed, trades, log, closed_eids = 0, [], [], []
+    ap = dict(entryId="", logicId="", dir=0, sl=None, tp=None, beOn=False, beTrigger=None, beActivatedBar=None)
+    gTP, gBE, seq = {}, {}, 0
+    was_in, last_closed = False, 0
+    for i, (o, h, l, c) in enumerate(bars):
+        # ---- broker: pending entry fills at open, then the active exit order works on the bar path ----
+        if pending is not None:
+            pos = dict(eid=pending["eid"], dir=pending["dir"], fill=o, entryBar=i, logicId=pending["logicId"])
+            pending = None
+        if pos is not None and exit_order is not None and exit_order[0] == pos["eid"]:
+            r = broker_fill_exit(pos["dir"], o, h, l, c, exit_order[1], exit_order[2])
+            if r is not None:
+                px, kind = r
+                trades.append((pos["entryBar"], pos["fill"], i, px, exit_order[3] if kind == "stop" else exit_order[4]))
+                closed_eids.append(pos["eid"])
+                pos, exit_order = None, None
+                closed += 1
+        # ---- script at bar close ----
+        blocked = pos is not None
+        if model != "main":
+            flat = (not blocked) and (was_in or closed > last_closed)
+            if flat and model == "p09":
+                ap.update(beOn=False, beTrigger=None, beActivatedBar=None)
+        act = False
+        if i in signals and not blocked and pending is None:
+            lg, d, risk, rr = signals[i]
+            seq += 1
+            eid = (P08_TAG[lg] + ("_L" if d > 0 else "_S")) if model != "main" else f"{lg}{'_L_' if d > 0 else '_S_'}{seq}"
+            sl, tp = c - d * risk, c + d * risk * rr
+            pending = dict(eid=eid, dir=d, logicId=lg)
+            exit_order = (eid, sl, tp, "SL", "TP")
+            ap.update(entryId=eid, logicId=lg, dir=d, sl=sl, tp=tp, beOn=False, beTrigger=be_trigger_for(lg, d, trig),
+                      beActivatedBar=None)
+            gTP[eid] = tp
+            if useBE:
+                gBE[eid] = False
+        if model == "p09" and useBE and pos is not None and ap["entryId"] != "":
+            ep = pos["fill"]
+            if not ap["beOn"] and be_reach(ap["dir"], mode, ep, ap["beTrigger"], h, l, c):
+                ap.update(beOn=True, beActivatedBar=i)
+                exit_order = (ap["entryId"], ep, ap["tp"], "BE", "TP")
+                act = True
+        elif model == "main":
+            if closed > last_closed:            # 8.1 cleanup: only the entry IDs closed since lastClosedCount, if not open
+                for k in closed_eids[last_closed:closed]:
+                    if pos is None or k != pos["eid"]:
+                        gTP.pop(k, None)
+                        gBE.pop(k, None)
+            if useBE and pos is not None and pos["eid"] in gTP:
+                eid = pos["eid"]
+                ep = pos["fill"]
+                lg = next((x for x in P08_ORDER if eid.startswith(x + "_L_") or eid.startswith(x + "_S_")), "")
+                d = 1 if eid.startswith(lg + "_L_") else -1
+                was_on = gBE.get(eid, False)
+                if was_on or be_reach(pos["dir"], mode, ep, be_trigger_for(lg, d, trig), h, l, c):
+                    gBE[eid] = True
+                    exit_order = (eid, ep, gTP[eid], "BE", "TP")
+                    act = not was_on
+        log.append(dict(bar=i, beAct=act, exit=exit_order, ap=dict(ap), pos=dict(pos) if pos else None))
+        was_in, last_closed = blocked, closed
+    return trades, log
+
+
+def fixture_p09_behaviour():
+    import random
+    # ---- deterministic scenario helpers: entry signal at bar 0 close 4000, fill at bar 1 open ----
+    def scen(lg, d, path, mode="到達瞬間", useBE=True, risk=30.0, rr=3.0, model="p09", trig=BE_TRIG):
+        bars = [(4000.0, 4001.0, 3999.0, 4000.0)] + path
+        return run_be_sim(bars, {0: (lg, d, risk, rr)}, model=model, useBE=useBE, mode=mode, trig=trig)
+
+    flat_bar = lambda px: (px, px + 0.5, px - 0.5, px)
+    # BE02 FVG Long: fill 4001, trigger 15 -> high 4016 reaches
+    tr, lg_ = scen("FVG", 1, [(4001.0, 4016.0, 4000.5, 4010.0), flat_bar(4010.0)])
+    check("BE02 FVG Long: entry + breakEvenTrigger(15) reached -> exit stop = entry fill (4001), TP kept",
+          lg_[1]["beAct"] and lg_[1]["exit"] == ("FVG_L", 4001.0, 4000.0 + 90.0, "BE", "TP"), str(lg_[1]["exit"]))
+    tr, lg_ = scen("FVG", -1, [(3999.0, 3999.5, 3984.0, 3990.0), flat_bar(3990.0)])
+    check("BE03 FVG Short: entry - trigger reached -> stop = entry fill (3999)",
+          lg_[1]["beAct"] and lg_[1]["exit"] == ("FVG_S", 3999.0, 4000.0 - 90.0, "BE", "TP"), str(lg_[1]["exit"]))
+    _, a = scen("FVG", 1, [(4001.0, 4015.5, 4000.5, 4010.0)])
+    _, b = scen("FVG", 1, [(4001.0, 4015.5, 4000.5, 4010.0)], model="main")
+    check("BE-EP BE measured from the fill price (4001 -> 4016), not the plan close (4000 -> 4015): high 4015.5 -> none (== old Main)",
+          not a[1]["beAct"] and not b[1]["beAct"])
+    # BE04-BE10 per-logic trigger (Long): reach exactly fill + trigger, 0.01 short -> none
+    exp = {"FVG15": 10.0, "FVGABS5": 10.0, "FVGABS15": 10.0, "ZONEREBOUND": 20.0, "ZONEFAKE": 20.0,
+           "ZONERETEST": 20.0, "ZONEBREAK": 20.0, "FVG": 15.0}
+    labels = {"FVG15": "BE04", "FVGABS5": "BE05", "FVGABS15": "BE06", "ZONEREBOUND": "BE07", "ZONEFAKE": "BE08",
+              "ZONERETEST": "BE09", "ZONEBREAK": "BE10"}
+    for lg, tg in exp.items():
+        if lg not in labels:
+            continue
+        for d in (1, -1):
+            want = tg if not (lg == "ZONEBREAK" and d > 0) else 10.0   # old Main: ZONEBREAK Long compat -> breakLong trigger
+            fill = 4000.0 + d
+            hit = (fill, fill + want, fill - 0.5, fill) if d > 0 else (fill, fill + 0.5, fill - want, fill)
+            miss = (fill, fill + want - 0.01, fill - 0.5, fill) if d > 0 else (fill, fill + 0.5, fill - want + 0.01, fill)
+            _, a = scen(lg, d, [hit])
+            _, b = scen(lg, d, [miss])
+            check(f"{labels[lg]} {lg} {'Long' if d > 0 else 'Short'} -> trigger {want} (hit exact / 0.01 short none)",
+                  a[1]["ap"]["beTrigger"] == want and a[1]["beAct"] and not b[1]["beAct"])
+    tz = dict(BE_TRIG, breakLongRefCompat=False)
+    _, a = scen("ZONEBREAK", 1, [(4001.0, 4021.0, 4000.5, 4001.0)], trig=tz)
+    check("BE10b ZONEBREAK Long with compat OFF -> zoneBreakEvenTrigger 20 (old Main mapping)",
+          a[1]["ap"]["beTrigger"] == 20.0 and a[1]["beAct"])
+    check("BE04-10 mapping == spec list for every logic except ZONEBREAK Long compat (old Main authority)",
+          all(be_trigger_for(lg, -1) == exp[lg] for lg in exp) and be_trigger_for("ZONEBREAK", 1) == 10.0)
+    # BE11 / BE12 到達瞬間 exact threshold
+    _, a = scen("FVG", 1, [(4001.0, 4016.0, 4000.0, 4002.0)])
+    _, b = scen("FVG", -1, [(3999.0, 4000.0, 3984.0, 3998.0)])
+    check("BE11 到達瞬間 Long high == threshold -> BE", a[1]["beAct"])
+    check("BE12 到達瞬間 Short low == threshold -> BE", b[1]["beAct"])
+    # BE13 / BE14 / BE15 確定足
+    _, a = scen("FVG", 1, [(4001.0, 4030.0, 4000.5, 4015.99)], mode="確定足")
+    _, b = scen("FVG", 1, [(4001.0, 4030.0, 4000.5, 4016.0)], mode="確定足")
+    _, c_ = scen("FVG", -1, [(3999.0, 3999.5, 3970.0, 3984.01)], mode="確定足")
+    _, d_ = scen("FVG", -1, [(3999.0, 3999.5, 3970.0, 3984.0)], mode="確定足")
+    check("BE13 確定足 Long: high reached but close below -> no BE", not a[1]["beAct"])
+    check("BE14 確定足 Long: confirmed close == threshold -> BE", b[1]["beAct"])
+    check("BE15 確定足 Short symmetric (close 0.01 short none / == threshold BE)", not c_[1]["beAct"] and d_[1]["beAct"])
+    check("BE15b 確定足 requires barstate.isconfirmed (unconfirmed tick never reaches)",
+          not be_reach(1, "確定足", 4001.0, 15.0, 4030.0, 4000.0, 4030.0, confirmed=False)
+          and be_reach(1, "到達瞬間", 4001.0, 15.0, 4016.0, 4000.0, 4000.0, confirmed=False))
+    # BE16 reversal after BE -> exits at entry (BE), never original SL; BE21 comment
+    tr, lg_ = scen("FVG", 1, [(4001.0, 4016.0, 4000.5, 4010.0), (4010.0, 4010.5, 3960.0, 3965.0)])
+    check("BE16 price reverses after BE -> exit at entry fill 4001 (not original SL 3970); state stays beOn",
+          tr == [(1, 4001.0, 2, 4001.0, "BE")] and lg_[1]["ap"]["beOn"])
+    check("BE21 BE stop fill -> comment_loss 'BE'", tr and tr[0][4] == "BE")
+    # BE17 TP after BE == entry-time TP
+    tr, lg_ = scen("FVG", 1, [(4001.0, 4016.0, 4000.5, 4010.0), (4010.0, 4095.0, 4009.0, 4090.0)])
+    check("BE17 TP after BE == entry-time TP 4090 (comment TP)", tr == [(1, 4001.0, 2, 4090.0, "TP")] and lg_[1]["exit"][2] == 4090.0)
+    check("BE23 TP fill -> comment_profit 'TP'", tr[0][4] == "TP")
+    # BE18 / BE22 no BE -> original structural SL with 'SL'
+    tr, lg_ = scen("FVG", 1, [(4001.0, 4010.0, 4000.5, 4005.0), (4005.0, 4006.0, 3960.0, 3965.0)])
+    check("BE18 BE not reached -> original structural SL 3970 stays", tr == [(1, 4001.0, 2, 3970.0, "SL")])
+    check("BE22 normal SL -> comment_loss 'SL'", tr[0][4] == "SL")
+    # BE19 / BE20 flat reset & next trade
+    bars = [(4000.0, 4001.0, 3999.0, 4000.0), (4001.0, 4016.0, 4000.5, 4010.0), (4010.0, 4010.5, 3990.0, 3995.0),
+            (3995.0, 3996.0, 3994.0, 3995.0), (3995.5, 4005.0, 3995.0, 4000.0), (4000.0, 4001.0, 3999.0, 4000.0)]
+    tr, lg_ = run_be_sim(bars, {0: ("FVG", 1, 30.0, 3.0), 3: ("FVG15", 1, 30.0, 3.0)})
+    check("BE19 trade closed in bar 2 (BE stop) -> flat transition at bar 2: beOn / beTrigger / beActivatedBar reset",
+          tr[0] == (1, 4001.0, 2, 4001.0, "BE") and lg_[1]["ap"]["beOn"] and lg_[2]["ap"]["beOn"] is False
+          and lg_[2]["ap"]["beTrigger"] is None and lg_[2]["ap"]["beActivatedBar"] is None)
+    check("BE20 next trade does not inherit BE: FVG15 starts beOn=false, own trigger 10; fill 3995.5 -> bar 4 high 4005 < 4005.5 no BE",
+          lg_[3]["ap"]["beOn"] is False and lg_[3]["ap"]["beTrigger"] == 10.0 and not lg_[4]["beAct"]
+          and lg_[4]["exit"] == ("FVG15_L", 3965.0, 4085.0, "SL", "TP"))
+    # ---- same-entry-bar semantics (old Main comparison) ----
+    bars = [(4000.0, 4100.0, 3999.0, 4000.0), (4000.0, 4001.0, 3999.5, 4000.0), (4000.0, 4016.0, 3999.5, 4000.0)]
+    for mdl in ("p09", "main"):
+        _, lg_ = run_be_sim(bars, {0: ("FVG", 1, 30.0, 3.0)}, model=mdl)
+        check(f"SEB [{mdl}] entry-signal bar high already beyond trigger -> no BE (position not filled yet); "
+              f"fill bar below -> none; next bar reach -> BE", [x["beAct"] for x in lg_] == [False, False, True])
+    bars = [(4000.0, 4001.0, 3999.0, 4000.0), (4000.0, 4016.0, 3999.5, 4005.0)]
+    res = [run_be_sim(bars, {0: ("FVG", 1, 30.0, 3.0)}, model=m)[1][1]["beAct"] for m in ("p09", "main")]
+    check("SEB fill bar (first bar in position) high reaches -> BE on that bar in both p09 and old Main", res == [True, True])
+    # ---- randomized parity: p09 (scalar, once) vs old Main (map, loop, re-issue every bar); BE OFF vs P08 ----
+    rnd = random.Random(20261005)
+    n_tr = mism_main = mism_off = 0
+    for trial in range(300):
+        px, bars = 4000.0, []
+        for _ in range(120):
+            o = px + rnd.uniform(-2, 2)
+            h = o + abs(rnd.gauss(0, 6))
+            l = o - abs(rnd.gauss(0, 6))
+            c = rnd.uniform(l, h)
+            bars.append((round(o, 2), round(h, 2), round(l, 2), round(c, 2)))
+            px = c
+        sig = {i: (rnd.choice(P08_ORDER), rnd.choice((1, -1)), rnd.uniform(5, 30), rnd.uniform(1, 3))
+               for i in range(len(bars)) if rnd.random() < 0.15}
+        mode = rnd.choice(("到達瞬間", "確定足"))
+        a, la = run_be_sim(bars, sig, "p09", True, mode)
+        b, lb = run_be_sim(bars, sig, "main", True, mode)
+        n_tr += len(a)
+        mism_main += a != b
+        mism_main += [x["beAct"] for x in la] != [x["beAct"] for x in lb]
+        mism_main += [x["exit"][1:] if x["exit"] else None for x in la] != [x["exit"][1:] if x["exit"] else None for x in lb]
+        c0, _ = run_be_sim(bars, sig, "p08", False, mode)
+        c1, _ = run_be_sim(bars, sig, "p09", False, mode)
+        mism_off += c0 != c1
+    check("BE-PAR p09 scalar (once) == old Main Map/loop (re-issue every bar): trades / BE bars / active exit order "
+          "on 300 random paths", mism_main == 0, f"{n_tr} trades, mismatches={mism_main}")
+    check("BE01 useBreakEven=false -> identical to P08 (300 random paths)", mism_off == 0, f"{n_tr} trades")
+
+
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -2772,6 +3100,8 @@ if __name__ == "__main__":
     fixture_p07_behaviour()
     fixture_p08_static()
     fixture_p08_behaviour()
+    fixture_p09_static()
+    fixture_p09_behaviour()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
