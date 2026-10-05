@@ -2435,6 +2435,317 @@ def fixture_p07_behaviour():
     check("T23c non-Gold symbol never ENTRY_READY", eval_entry([sup, res_far], c, 1, 4050, isGold=False)["reason"] == "NOT_GOLD")
 
 
+# ============================================================================
+# P08 : Global 1-Position Gate / same-bar Gate / Priority / Entry Dispatch
+# ============================================================================
+DH_PATH = os.path.join(ROOT, "PracticalEntryDispatchHarness.pine")
+DH = open(DH_PATH, encoding="utf-8").read() if os.path.exists(DH_PATH) else ""
+P08_ORDER = ["FVG15", "FVG", "FVGABS15", "FVGABS5", "ZONEREBOUND", "ZONEFAKE", "ZONERETEST", "ZONEBREAK"]
+P08_CONST = {"LOGIC_FVG15": "FVG15", "LOGIC_FVG": "FVG", "LOGIC_FVG_ABS15": "FVGABS15", "LOGIC_FVG_ABS5": "FVGABS5",
+             "LOGIC_ZONE_RB": "ZONEREBOUND", "LOGIC_ZONE_FK": "ZONEFAKE", "LOGIC_ZONE_RT": "ZONERETEST",
+             "LOGIC_ZONE_BK": "ZONEBREAK"}
+P08_TAG = {"FVG15": "FVG15", "FVG": "FVG", "FVGABS15": "ABS15", "FVGABS5": "ABS5", "ZONEREBOUND": "ZRB",
+           "ZONEFAKE": "ZFK", "ZONERETEST": "ZRT", "ZONEBREAK": "ZBK"}
+
+
+def fixture_p08_static():
+    check("P08 harness file exists", bool(DH))
+    if not DH:
+        return
+    dc = code_only(DH)
+    # ---- reuse of P07 (Zone / Inside / TradePlan / TP Mode / Risk / Qty / f_tpDepthFor) ----
+    cut = lambda src: src[src.find("import sekine3310/ZoneEnginePractical/3 as zn"):src.find("// ---- Entry 可否の評価結果")
+                                                                                     if "// ---- Entry 可否の評価結果" in src
+                                                                                     else src.find("// 06. ENTRY DISPATCH")]
+    strip = lambda t: [l for l in code_only(t).split("\n") if l.strip()]
+    a, b = strip(cut(TH)), strip(cut(DH))
+    check("PD1 Zone block / inputs / ZoneCfg / Feed / zn.update / Risk / Qty / f_tpDepthFor / Inside Gate == P07 (code identical)",
+          a == b and len(a) > 300, f"{len(b)} lines")
+    for fn in ("f_insideAnyZone", "f_qty", "f_tpDepthFor", "f_baseCapital", "f_riskCapital"):
+        check(f"PD1 {fn} identical to P07", func_block(DH, fn) == func_block(TH, fn) != "")
+    check("PD1 one ZoneEngine / one zn.update / ZoneCfg only in barstate.isfirst",
+          len(re.findall(r"zn\.newEngine\(", dc)) == 1 and len(re.findall(r"\bzn\.update\(", dc)) == 1 and
+          all(re.match(r"^    zoneCfg\.", l) for l in dc.split("\n") if re.search(r"zoneCfg\.\w+\s*:=", l)))
+    te = code_only(func_block(DH, "f_tryEntry"))
+    tpm = lambda src: re.findall(r'if tpMode == "STRUCTURAL_ONLY" and p\.tpType == "FALLBACK_RR".*?p\.reason := "STRUCTURAL_TP_EXISTS"',
+                                 code_only(src), re.S)
+    norm = lambda t: [" ".join(x.split()) for x in t]
+    check("PD2 TP Mode filter identical to old Main f_submitSignal (PASS -> FAIL only)",
+          norm(tpm(te)) == norm(tpm(func_block(MAIN, "f_submitSignal"))) != [])
+    gate = "if cand and dir != 0 and isGold and not positionBlocked and not enteredThisBar"
+    toks = [gate, "f_insideAnyZone(entryPrice)", "zn.buildPlanWithTpDepth(", 'if tpMode == "STRUCTURAL_ONLY"',
+            "if p.valid", "float qty = f_qty(p.risk)", "if qty >= qtyMin and qty > 0", "strategy.entry(",
+            "strategy.exit(", "entered := true"]
+    pos = [te.find(t) for t in toks]
+    check("PD3 gate order: candidate -> dir -> isGold -> position -> enteredThisBar -> Inside -> buildPlan -> TP Mode "
+          "-> valid -> Qty -> qtyMin -> entry -> exit -> entered", -1 not in pos and pos == sorted(pos), str(pos))
+    check("PD3 Inside / buildPlan / Qty only reachable after the cheap gates (all nested under the gate line)",
+          all(l.startswith("        ") for l in te.split("\n")[te[:pos[0]].count("\n") + 1:] if l.strip()
+              and not l.strip().startswith("entered") and l.strip() != "bool entered = false"))
+    check("PD3 isGold / position / same-bar gates evaluated before any Zone scan (Gold以外 / 保有中は走査なし)",
+          te.find("isGold") < te.find("f_insideAnyZone") and te.find("positionBlocked") < te.find("f_insideAnyZone"))
+    # ---- Global gate ----
+    gl = re.findall(r"^bool globalPositionBlocked = (.*)$", dc, re.M)
+    check("PD4 Global Position Gate = strategy.position_size != 0 or strategy.opentrades > 0 (scalar)",
+          gl == ["strategy.position_size != 0 or strategy.opentrades > 0"], str(gl))
+    # ---- dispatch order (execution order, not function order) ----
+    disp = code_only(DH[DH.find("// 08. DISPATCH"):DH.find("// ---- Flat 遷移検知用")])
+    calls = re.findall(r"e := f_tryEntry\(activePos, ds, (\w+), [^,]+, (-?1), [^,]+, globalPositionBlocked, enteredThisBar\)", disp)
+    seq = [(P08_CONST.get(l), d) for l, d in calls]
+    exp = [(l, d) for l in P08_ORDER for d in ("1", "-1")]
+    check("PD5 dispatch execution order FVG15 -> FVG -> ABS15 -> ABS5 -> RB -> FK -> RT -> BK (Long then Short)",
+          seq == exp, str([s_[0] for s_ in seq[::2]]))
+    lines = [l.strip() for l in disp.split("\n") if l.strip()]
+    ci = [i for i, l in enumerate(lines) if l.startswith("e := f_tryEntry(")]
+    check("PD5 every dispatch call is immediately followed by enteredThisBar := enteredThisBar or e",
+          len(ci) == 16 and all(lines[i + 1] == "enteredThisBar := enteredThisBar or e" for i in ci))
+    check("PD5 enteredThisBar is a plain per-bar bool reset to false and the dispatch runs on confirmed bars only",
+          re.search(r"^bool\s+enteredThisBar = false$", dc, re.M) is not None and "if barstate.isconfirmed" in disp
+          and "var bool enteredThisBar" not in dc)
+    # ---- entry / exit branch ----
+    tl = te.split("\n")
+    ei = [i for i, l in enumerate(tl) if "strategy.entry(" in l]
+    xi = [i for i, l in enumerate(tl) if "strategy.exit(" in l]
+    ind = lambda l: len(l) - len(l.lstrip())
+    check("PD6 strategy.entry / strategy.exit: exactly one each, only in f_tryEntry, same branch",
+          dc.count("strategy.entry(") == 1 and dc.count("strategy.exit(") == 1 and len(ei) == len(xi) == 1
+          and ind(tl[ei[0]]) == ind(tl[xi[0]]) and 0 < xi[0] - ei[0] <= 2)
+    check("PD6 SL / TP passed to strategy.exit are the entry-time plan values (stop = p.sl, limit = p.tp)",
+          re.search(r'strategy\.exit\(eid \+ "X", from_entry = eid, stop = p\.sl, limit = p\.tp', te) is not None)
+    tags = re.findall(r'(LOGIC_\w+)\s*\?\s*"(\w+)"', code_only(func_block(DH, "f_entryTag")))
+    tagmap = {P08_CONST[k]: v for k, v in tags}
+    check("PD7 Entry ID unique per Logic x direction (tag + _L / _S, no tag shared)",
+          tagmap == P08_TAG and len(set(tagmap.values())) == 8 and 'f_entryTag(logicId) + (dir > 0 ? "_L" : "_S")' in te,
+          str(tagmap))
+    # ---- active state ----
+    aw = [i for i, l in enumerate(tl) if re.match(r"\s*ap\.\w+\s*:=", l)]
+    check("PD8 ActivePos written only inside the entered branch (after strategy.exit, same indentation)",
+          aw and all(i > xi[0] and ind(tl[i]) == ind(tl[xi[0]]) for i in aw) and
+          "activePos." not in re.sub(r"plot\(.*", "", dc[dc.find("// 08. DISPATCH"):]).replace("activePos, ds", ""))
+    fields = set(re.findall(r"ap\.(\w+)\s*:=", te))
+    check("PD8 entry stores entryId / logicId / dir / entryPrice / SL / TP / Qty",
+          {"entryId", "logicId", "dir", "entryPrice", "sl", "tp", "qty"} <= fields, str(sorted(fields)))
+    check("PD9 originTrackId / entryTouchCount slots exist and stay na (no guess before P11 / P12)",
+          "ap.originTrackId   := na" in te and "ap.entryTouchCount := na" in te)
+    check("PD10 flat transition detector present (scalar only), no BE processing attached",
+          re.search(r"^bool flatTransition = not globalPositionBlocked and", dc, re.M) is not None and
+          "wasInPosition   := globalPositionBlocked" in dc)
+    # ---- prohibited ----
+    bad = [t for t in ("alert(", "alertcondition", "map.new", "map<", "strategy.close(", "strategy.close_all", "strategy.cancel",
+                       "box.new", "label.new", "line.new", "table.new", "tpManagementMode", "Dynamic", "useBreakEven",
+                       "breakEven", "SignalEngine") if t in dc]
+    check("D18/D20 prohibited: map / alerts / drawing / Dynamic TP / BE / Signal / strategy.close", not bad, str(bad))
+    check("D19 no opentrades / closedtrades loop or per-trade accessor (scalars only)",
+          not re.search(r"for .*(opentrades|closedtrades)", dc) and
+          not re.search(r"strategy\.(opentrades|closedtrades)\.\w+", dc))
+    check("P08 no request.* added beyond the P07 Zone block",
+          dc.count("request.") == code_only(TH).count("request."))
+
+
+# ---- Python mirror of the P08 dispatch ---------------------------------------
+class Broker:
+    def __init__(self, position_size=0.0, opentrades=0, closedtrades=0):
+        self.position_size, self.opentrades, self.closedtrades = position_size, opentrades, closedtrades
+        self.orders = []
+
+
+def tp_depth_for(logicId, d, c, compat=True, breakDepth=0.0):
+    return breakDepth if compat and logicId == "ZONEBREAK" and d > 0 else c.structuralTpDepthRatio
+
+
+def try_entry(ap, ds, br, live, c, logicId, cand, d, entry, posBlocked, entered_bar, isGold=True, tpMode="BOTH",
+              qtyMin=0.01, compat=True, breakDepth=0.0, **qkw):
+    if not (cand and d != 0 and isGold and not posBlocked and not entered_bar):
+        return False
+    if ds["insPrice"] is not None and entry == ds["insPrice"]:
+        ins = ds["insBlocked"]
+    else:
+        ins, _, _ = inside_any(live, c, entry)
+        ds["insideScans"] += 1
+        ds["insPrice"], ds["insBlocked"] = entry, ins
+    if ins:
+        return False
+    p = build_plan(live, c, d, entry, tp_depth_for(logicId, d, c, compat, breakDepth))
+    ds["plans"] += 1
+    if tpMode == "STRUCTURAL_ONLY" and p["tpType"] == "FALLBACK_RR":
+        p.update(valid=False, status="FAIL", reason="NO_STRUCTURAL_TP")
+    elif tpMode == "FALLBACK_ONLY" and p["tpType"] == "STRUCTURAL":
+        p.update(valid=False, status="FAIL", reason="STRUCTURAL_TP_EXISTS")
+    if not p["valid"]:
+        return False
+    q = f_qty_(p["risk"], **qkw)
+    ds["qtys"] += 1
+    if not (q >= qtyMin and q > 0):
+        return False
+    eid = P08_TAG[logicId] + ("_L" if d > 0 else "_S")
+    br.orders.append(("entry", eid, d, q))
+    br.orders.append(("exit", eid + "X", eid, p["sl"], p["tp"]))
+    ap.update(entryId=eid, logicId=logicId, dir=d, entryPrice=p["entry"], sl=p["sl"], tp=p["tp"], qty=q,
+              originTrackId=None, entryTouchCount=None)
+    ds["winPriority"] = P08_ORDER.index(logicId) + 1
+    return True
+
+
+def dispatch(cands, live, c, br, ap, **kw):
+    """cands: {logicId: (dirMode 'Long'/'Short'/'Both', price)}  (absent = candidate OFF).
+    kw: isGold / tpMode / qtyMin / qtyStep ... or per-logic override via kw['per'] = {logicId: {...}}."""
+    per = kw.pop("per", {})
+    posBlocked = br.position_size != 0 or br.opentrades > 0
+    ds = dict(winPriority=None, insideScans=0, plans=0, qtys=0, insPrice=None, insBlocked=False)
+    entered = False
+    for lg in P08_ORDER:
+        on = lg in cands
+        mode, px = cands.get(lg, ("Both", None))
+        args = dict(kw, **per.get(lg, {}))
+        e = try_entry(ap, ds, br, live, c, lg, on and mode != "Short", 1, px, posBlocked, entered, **args)
+        entered = entered or e
+        e = try_entry(ap, ds, br, live, c, lg, on and mode != "Long", -1, px, posBlocked, entered, **args)
+        entered = entered or e
+    return entered, ds
+
+
+def fixture_p08_behaviour():
+    c = TCfg()
+    sup = Z(4030, 4040, ST_SUP_, tid=1)
+    res_far = Z(4100, 4110, ST_RES_, tid=4)
+    res = Z(4070, 4080, ST_RES_, tid=3)
+    sup_lo = Z(3980, 3990, ST_SUP_, tid=5)
+    live = [sup, res_far]                  # Long @4050 : SL 4025 (risk 25), TP 4100 + depth -> PASS, qty 2
+    allL = {lg: ("Long", 4050.0) for lg in P08_ORDER}
+    new = lambda: dict(entryId="", logicId="", dir=0, entryPrice=None, sl=None, tp=None, qty=None,
+                       originTrackId=None, entryTouchCount=None)
+    entries = lambda br: [o for o in br.orders if o[0] == "entry"]
+
+    br, ap = Broker(), new()
+    ent, ds = dispatch({"FVG15": ("Long", 4050.0)}, live, c, br, ap)
+    check("D01 Flat + FVG15 PASS -> only FVG15 enters", ent and [o[1] for o in entries(br)] == ["FVG15_L"])
+
+    # D02 : FVG15 price has no SL zone (TradePlan FAIL) -> FVG evaluated and enters
+    br, ap = Broker(), new()
+    ent, ds = dispatch({"FVG15": ("Long", 4035.5 - 100), "FVG": ("Long", 4050.0)}, live, c, br, ap)
+    check("D02 FVG15 signal true but TradePlan FAIL -> FVG evaluated and enters",
+          ent and [o[1] for o in entries(br)] == ["FVG_L"] and ds["plans"] == 2)
+
+    # D03 : FVG15 qty below qtyMin (tiny capital for FVG15 only) -> FVG
+    br, ap = Broker(), new()
+    ent, ds = dispatch({"FVG15": ("Long", 4050.0), "FVG": ("Long", 4050.0)}, live, c, br, ap,
+                       per={"FVG15": dict(capital=1.0)})
+    check("D03 FVG15 qty < qtyMin -> SKIP, FVG enters", ent and [o[1] for o in entries(br)] == ["FVG_L"] and ds["qtys"] == 2)
+
+    # D04 / D05 : all 8 candidates true, FVG15 passes -> the 7 others skip (no scan / plan / qty after success)
+    br, ap = Broker(), new()
+    ent, ds = dispatch(allL, live, c, br, ap)
+    check("D04 FVG15 entered -> FVG..ZONEBREAK all skipped", [o[1] for o in entries(br)] == ["FVG15_L"])
+    check("D05 all 8 signals -> only the top-priority PASS logic enters (1 order)", len(entries(br)) == 1 and ds["winPriority"] == 1)
+    check("C24 after the successful entry: 0 further Inside scans / buildPlan / Qty", (ds["insideScans"], ds["plans"], ds["qtys"]) == (1, 1, 1),
+          str((ds["insideScans"], ds["plans"], ds["qtys"])))
+
+    # D06 : priorities 1-3 FAIL (no SL zone at their price), 4 passes -> ABS5
+    br, ap = Broker(), new()
+    cands = {"FVG15": ("Long", 3000.0), "FVG": ("Long", 3001.0), "FVGABS15": ("Long", 3002.0), "FVGABS5": ("Long", 4050.0),
+             "ZONEREBOUND": ("Long", 4050.0)}
+    ent, ds = dispatch(cands, live, c, br, ap)
+    check("D06 priorities 1-3 FAIL, 4 PASS -> ABS5 enters", [o[1] for o in entries(br)] == ["ABS5_L"] and ds["winPriority"] == 4)
+
+    # D07 : position held -> 0 entries, no scan / plan / qty
+    for pos, ot in ((1.0, 1), (-2.0, 1), (0.0, 1)):
+        br, ap = Broker(position_size=pos, opentrades=ot), new()
+        ent, ds = dispatch(allL, live, c, br, ap)
+        check(f"D07 position held (size {pos}, opentrades {ot}) -> 0 entries, 0 scans / plans / qty",
+              not ent and not br.orders and (ds["insideScans"], ds["plans"], ds["qtys"]) == (0, 0, 0))
+
+    # D08 : not Gold -> 0 entries and no Zone scan / TradePlan
+    br, ap = Broker(), new()
+    ent, ds = dispatch(allL, live, c, br, ap, isGold=False)
+    check("D08 non-Gold -> 0 entries, 0 scans / plans / qty", not ent and not br.orders and (ds["insideScans"], ds["plans"], ds["qtys"]) == (0, 0, 0))
+
+    # D09 : FVG15 entry price inside a Strong zone -> FAIL, FVG (other price) enters
+    br, ap = Broker(), new()
+    ent, ds = dispatch({"FVG15": ("Long", 4035.0), "FVG": ("Long", 4050.0)}, live, c, br, ap)
+    check("D09 Inside Any Zone -> that candidate FAIL, next logic evaluated and enters",
+          [o[1] for o in entries(br)] == ["FVG_L"] and ds["insideScans"] == 2 and ds["plans"] == 1)
+
+    # D10 : same bar -> no 2nd order even though position_size is still 0 (fill not reflected yet)
+    br, ap = Broker(), new()
+    ent, ds = dispatch({lg: ("Both", 4050.0) for lg in P08_ORDER}, live, c, br, ap)
+    check("D10 same bar: enteredThisBar blocks a 2nd order while position_size is still 0",
+          br.position_size == 0 and len(entries(br)) == 1)
+
+    # D11 : next bar while held -> blocked; after close -> entry possible again
+    br.position_size, br.opentrades = 2.0, 1
+    e2, _ = dispatch(allL, live, c, br, ap)
+    n_held = len(entries(br))
+    br.position_size, br.opentrades, br.closedtrades = 0.0, 0, 1
+    e3, _ = dispatch(allL, live, c, br, ap)
+    check("D11 held bar -> no entry; bar after the position closed -> entry possible again",
+          not e2 and n_held == 1 and e3 and len(entries(br)) == 2)
+
+    # D12 / D13 : Long / Short on the same logic
+    # SL-only zones (strength 2 < tpMinStrength 3): Long SL 4030 / fallback TP, Short SL 4070 / fallback TP -> both PASS alone
+    live_ws = [Z(4035, 4040, ST_SUP_, strength=2, tid=12), Z(4060, 4065, ST_RES_, strength=2, tid=13)]
+    br_s, ap_s = Broker(), new()
+    dispatch({"FVG15": ("Short", 4050.0)}, live_ws, c, br_s, ap_s)
+    br, ap = Broker(), new()
+    dispatch({"FVG15": ("Both", 4050.0)}, live_ws, c, br, ap)
+    check("D12 Long and Short both PASS alone; Both -> Long enters, Short not ordered",
+          [o[1] for o in entries(br_s)] == ["FVG15_S"] and [o[1] for o in entries(br)] == ["FVG15_L"])
+    live3 = [Z(4060, 4065, ST_RES_, tid=6), Z(4000, 4005, ST_SUP_, tid=7)]   # Long: SL 3995 risk 55 -> FAIL; Short: SL 4070 risk 20 -> PASS
+    br, ap = Broker(), new()
+    ent, ds = dispatch({"FVG15": ("Both", 4050.0)}, live3, c, br, ap)
+    check("D13 Long FAIL -> Short evaluated and enters (Inside scan shared: same price)",
+          [o[1] for o in entries(br)] == ["FVG15_S"] and ds["insideScans"] == 1 and ds["plans"] == 2)
+
+    # D14 : SL / TP passed to strategy.exit unchanged
+    br, ap = Broker(), new()
+    dispatch({"FVG": ("Long", 4050.0)}, live, c, br, ap)
+    ex = [o for o in br.orders if o[0] == "exit"][0]
+    pl = build_plan(live, c, 1, 4050.0, c.structuralTpDepthRatio)
+    check("D14 strategy.exit gets the entry-time plan SL / TP (from_entry = entry ID)",
+          ex == ("exit", "FVG_LX", "FVG_L", pl["sl"], pl["tp"]) and pl["sl"] == 4025 and pl["tp"] == 4102.5, str(ex))
+
+    # D15 : TP depth per logic (ZONEBREAK Long compat depth 0.0, others common 0.25)
+    tps = {}
+    for lg in P08_ORDER:
+        br, ap = Broker(), new()
+        dispatch({lg: ("Long", 4050.0)}, live, c, br, ap)
+        tps[lg] = ap["tp"]
+    br, ap = Broker(), new()
+    dispatch({"ZONEBREAK": ("Long", 4050.0)}, live, c, br, ap, compat=False)
+    check("D15 TP depth per logic: ZONEBREAK Long (compat) 4100.0, all others 4102.5; compat OFF -> 4102.5",
+          all(tps[lg] == 4102.5 for lg in P08_ORDER if lg != "ZONEBREAK") and tps["ZONEBREAK"] == 4100.0 and ap["tp"] == 4102.5,
+          str(tps))
+
+    # D16 / D17 : scalar active state
+    br, ap = Broker(), new()
+    dispatch({"ZONERETEST": ("Long", 4050.0)}, live, c, br, ap)
+    check("D16 entry stores entryId / logicId / dir / entryPrice / SL / TP / Qty (touch slots na)",
+          ap == dict(entryId="ZRT_L", logicId="ZONERETEST", dir=1, entryPrice=4050.0, sl=4025, tp=4102.5, qty=2.0,
+                     originTrackId=None, entryTouchCount=None), str(ap))
+    before = dict(ap)
+    br2 = Broker()
+    dispatch({"FVG": ("Long", 3000.0), "FVG15": ("Long", 4035.0)}, live, c, br2, ap)         # plan FAIL / inside
+    dispatch(allL, live, c, br2, ap, isGold=False)                                           # gold gate
+    dispatch(allL, live, c, Broker(position_size=1.0, opentrades=1), ap)                     # position gate
+    dispatch(allL, live, c, br2, ap, capital=1.0)                                            # qty
+    check("D17 failed candidates never rewrite the active state", ap == before and not br2.orders)
+
+    # ---- cost audit ----------------------------------------------------------
+    # worst case: 8 logics, Long + Short, every candidate fails at the last gate (qtyMin), distinct prices per logic
+    br, ap = Broker(), new()
+    distinct = {lg: ("Both", 4050.0 + i * 0.5) for i, lg in enumerate(P08_ORDER)}
+    ent, ds = dispatch(distinct, live_ws, c, br, ap, capital=0.001)
+    worst = (ds["insideScans"], ds["plans"], ds["qtys"])
+    check("C24 worst case (16 candidates, all fail at qtyMin, 8 prices): Inside 8 / buildPlan 16 / Qty 16",
+          not ent and worst == (8, 16, 16), str(worst))
+    br, ap = Broker(), new()
+    ent, ds = dispatch({lg: ("Both", 4050.0) for lg in P08_ORDER}, live, c, br, ap, capital=0.001)
+    check("C24 one shared entry price: Inside scan 1 for all 16 candidates", ds["insideScans"] == 1 and ds["plans"] == 16)
+    br, ap = Broker(), new()
+    ent, ds = dispatch(distinct, live, c, br, ap)
+    check("C24 after a success at priority 1 Long: Inside 1 / buildPlan 1 / Qty 1, subsequent 0",
+          ent and (ds["insideScans"], ds["plans"], ds["qtys"]) == (1, 1, 1))
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -2459,6 +2770,8 @@ if __name__ == "__main__":
     fixture_p06_compile()
     fixture_p07_static()
     fixture_p07_behaviour()
+    fixture_p08_static()
+    fixture_p08_behaviour()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
