@@ -3113,7 +3113,7 @@ def fixture_p10_static():
     extra = [l.strip() for l in te10 if l not in te9]
     check("PA2 f_tryEntry == P09 + confirmed alert + re-arm lines only",
           [l for l in te10 if l in te9] == te9 and extra == [
-              "if useConfirmedAlert", 'alert(f_entryAlertMsg("確定", logicId, dir, p, qty), alert.freq_once_per_bar)',
+              "if useConfirmedAlert", 'alert(f_entryAlertMsg("確定", logicId, dir, p, qty), alert.freq_all)',
               "int pslot = f_provSlot(logicId, dir)", "if pslot >= 0", "array.set(gProvSent, pslot, false)"], str(extra))
     te = code_only(func_block(AH, "f_tryEntry"))
     order = [te.find(x) for x in ("strategy.entry(", "strategy.exit(", "ap.entryId", "ap.beActivatedBar",
@@ -3153,8 +3153,10 @@ def fixture_p10_static():
     check("PA7 varip dedupe: one varip bool[16] declared once + varip per-bar guard; no map; no other array.new",
           ac.count("varip array<bool> gProvSent = array.new_bool(16, false)") == 1 and ac.count("array.new") == 1 and
           "varip int gProvLastBar = na" in ac and "map." not in ac and "map<" not in ac)
-    check("PA8 both alerts use alert.freq_once_per_bar (D4: old Main provisional = freq_all)",
-          ac.count("alert.freq_once_per_bar") == 2 and "alert.freq_all" not in ac and
+    check("PA8 provisional = alert.freq_once_per_bar (D4: old Main provisional = freq_all); confirmed = alert.freq_all",
+          ac.count("alert.freq_once_per_bar") == 1 and ac.count("alert.freq_all") == 1 and
+          'alert(f_entryAlertMsg("仮", winLogic, winDir, win.plan, win.qty), alert.freq_once_per_bar)' in sec and
+          'alert(f_entryAlertMsg("確定", logicId, dir, p, qty), alert.freq_all)' in te and
           "alert(f_provAlertMsg(logicId, dir), alert.freq_all)" in code_only(func_block(MAIN, "f_provFire")))
     msg = code_only(func_block(AH, "f_entryAlertMsg"))
     check("PA9 alert text: kind / LONG-SHORT / Logic / Symbol / E / SL / TP / RR / Qty; no rating / BE / debug lines (D2 / D3)",
@@ -3180,7 +3182,20 @@ class AlertState:
     def __init__(self):
         self.sent = [False] * 16          # varip
         self.lastBar = None               # varip per-bar guard
-        self.alerts = []                  # (bar, kind, logic, dir)
+        self.alerts = []                  # (bar, kind, logic, dir)  -> alert() calls
+        self.delivered = []               # alerts that pass the frequency filter
+        self.onceBars = set()             # worst case: freq_once_per_bar quota shared script-wide per bar
+
+    def call(self, bar, kind, logic, d, freq):
+        self.alerts.append((bar, kind, logic, d))
+        if freq == "freq_all":
+            self.delivered.append((bar, kind, logic, d))
+        elif bar not in self.onceBars:
+            self.onceBars.add(bar)
+            self.delivered.append((bar, kind, logic, d))
+
+
+P10_FREQ = {"仮": "freq_once_per_bar", "確定": "freq_all"}
 
 
 def prov_eval(ps, live, c, lg, cand, d, entry, tpMode="BOTH", qtyMin=0.01, **qkw):
@@ -3230,7 +3245,7 @@ def prov_tick(st, bar, cands, live, c, br, useProv=True, confirmed=False, isGold
     if not st.sent[sl] and st.lastBar != bar:
         st.sent[sl] = True
         st.lastBar = bar
-        st.alerts.append((bar, "仮", win[0], win[1]))
+        st.call(bar, "仮", win[0], win[1], P10_FREQ["仮"])
         return True, win, ps
     return False, win, ps
 
@@ -3241,7 +3256,7 @@ def confirmed_bar(st, bar, cands, live, c, br, ap, useConf=True, **kw):
     ent, ds = dispatch(cands, live, c, br, ap, **kw)
     if ent:
         if useConf:
-            st.alerts.append((bar, "確定", ap["logicId"], ap["dir"]))
+            st.call(bar, "確定", ap["logicId"], ap["dir"], P10_FREQ["確定"])
         st.sent[prov_slot(ap["logicId"], ap["dir"])] = False
     return ent, ds, len([o for o in br.orders if o[0] == "entry"]) - n0
 
@@ -3346,6 +3361,33 @@ def fixture_p10_behaviour():
             outs.append((br.orders, ap))
         mism += outs[0] != outs[1]
     check("AL01/P09-parity alerts ON (prov + confirmed) vs OFF -> identical orders / ActivePos on 300 random bars", mism == 0, f"mismatch={mism}")
+    # AL27 provisional fired earlier in the same bar -> confirmed entry alert still delivered (freq_all)
+    st, br, ap = AlertState(), Broker(), new()
+    cand = {"FVG15": ("Long", 4050.0)}
+    fp, _, _ = prov_tick(st, 7, cand, live, c, br)                       # forming tick
+    ent, _, n = confirmed_bar(st, 7, cand, live, c, br, ap)               # closing tick of the same bar
+    worst = [(b, k) for b, k, _, _ in st.delivered]
+    old = AlertState()                                                    # same sequence if confirmed used freq_once_per_bar
+    old.call(7, "仮", "FVG15", 1, "freq_once_per_bar")
+    old.call(7, "確定", "FVG15", 1, "freq_once_per_bar")
+    check("AL27 same bar: provisional fired -> confirmed entry alert still delivered (freq_all), even if the "
+          "once-per-bar quota were script-wide (once_per_bar would drop it)",
+          fp and ent and n == 1 and worst == [(7, "仮"), (7, "確定")] and [k for _, k, _, _ in old.delivered] == ["仮"])
+    # AL28 several confirmed candidates in one bar -> 1 entry, 1 confirmed call
+    st, br, ap = AlertState(), Broker(), new()
+    ent, _, n = confirmed_bar(st, 8, {lg: ("Both", 4050.0) for lg in P08_ORDER}, live, c, br, ap)
+    check("AL28 many confirmed candidates same bar -> strategy.entry 1 / confirmed alert call 1 (freq_all cannot duplicate)",
+          ent and n == 1 and len(conf(st)) == 1 and len(st.delivered) == 1)
+    # AL29 no entry -> 0 confirmed calls even with freq_all
+    zero = True
+    for cands, brx, kw in (({"FVG": ("Long", 3000.0)}, Broker(), {}), ({"FVG": ("Long", 4035.0)}, Broker(), {}),
+                           ({"FVG": ("Long", 4050.0)}, Broker(position_size=1.0, opentrades=1), {}),
+                           ({"FVG": ("Long", 4050.0)}, Broker(), dict(capital=1.0)),
+                           ({"FVG": ("Long", 4050.0)}, Broker(), dict(isGold=False)), ({}, Broker(), {})):
+        st, ap = AlertState(), new()
+        ent, _, n = confirmed_bar(st, 9, cands, live, c, brx, ap, **kw)
+        zero = zero and not ent and n == 0 and not st.alerts and not st.delivered
+    check("AL29 confirmed freq_all: no real entry (Plan FAIL / Inside / held / Qty / non-Gold / no signal) -> 0 alert calls", zero)
     # AL22 BE activation adds no entry alert (BE section has no alert; mirror: run_be_sim emits none)
     check("AL22 BE activation -> no entry alert (static: 0 alert() in Section 09)", "alert(" not in code_only(AH[AH.find("// 09. BREAK EVEN"):AH.find("// 10. PROVISIONAL ALERT")]))
 
