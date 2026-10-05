@@ -24,6 +24,7 @@ Run:  python3 tests/practical_strategy_sim.py
 """
 import os
 import re
+import math
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ORIG = open(os.path.join(ROOT, "SignalEngine.pine"), encoding="utf-8").read()
@@ -2140,6 +2141,300 @@ def fixture_p06_compile():
           str(order_bad))
 
 
+# =============================================================================
+# P07 — TradePlan / Inside Any Zone / TP Mode / Risk / Qty
+# =============================================================================
+TH_PATH = os.path.join(ROOT, "PracticalTradeHarness.pine")
+TH = open(TH_PATH, encoding="utf-8").read() if os.path.exists(TH_PATH) else ""
+LEG_ZE = open(os.path.join(ROOT, "ZoneEngine.pine"), encoding="utf-8").read()
+
+
+def fixture_p07_static():
+    check("P07 harness file exists", bool(TH))
+    if not TH:
+        return
+    HI, MI = parse_inputs(TH), parse_inputs(MAIN)
+    names = ["slBuffer", "tpBuffer", "maxSlDist", "minStructRR", "tpMode", "slMinScore", "slMinStrStr", "tpMinScore",
+             "tpMinStrStr", "obsMinStrStr", "activeNoTradeMinStrStr", "structuralTpDepthRatio", "fallbackRR",
+             "riskPct", "useCompound", "qtyStep", "qtyMin", "breakLongRefCompat", "breakLongTpDepthRatio"]
+    diff = [n for n in names if HI.get(n) != MI.get(n)]
+    check("PS1 TradePlan / TP Mode / Risk / Qty inputs == old Main (name/kind/default/title/group/options/min/max/step)",
+          not diff, f"{len(names)} inputs" if not diff else f"diff={diff}")
+    for fn in ("f_baseCapital", "f_riskCapital", "f_qty", "f_tpDepthFor"):
+        check(f"PS2 {fn} verbatim from old Main", func_block(TH, fn) == func_block(MAIN, fn) and func_block(TH, fn) != "")
+    tpm = lambda src: re.findall(r'if tpMode == "STRUCTURAL_ONLY" and p\.tpType == "FALLBACK_RR".*?p\.reason := "STRUCTURAL_TP_EXISTS"',
+                                 code_only(src), re.S)
+    norm = lambda t: [" ".join(x.split()) for x in t]
+    check("PS3 TP Mode filter identical to old Main f_submitSignal (PASS -> FAIL only)",
+          norm(tpm(func_block(TH, "f_evalEntry"))) == norm(tpm(func_block(MAIN, "f_submitSignal"))) != [])
+    hz = section(HAR, r"^// 01-2\. ZONE ENGINE INPUTS", r"^// zn\.update は上の1回だけ")
+    tz = section(TH, r"^// 01-2\. ZONE ENGINE INPUTS", r"^// =+\n// 04\. TRADE PLAN")
+    strip = lambda t: [l for l in code_only(t).split("\n") if l.strip()]
+    tooltip_fix = lambda ls: [l.replace('     "Dynamic TP にも同じ定義がそのまま使われる。")', '     "")') for l in ls]
+    check("PS4 Zone block (inputs / ZoneCfg first-bar / feed / zn.update) == P02 harness (code identical; "
+          "only a Dynamic-TP tooltip/comment removed)", tooltip_fix(strip(hz)) == strip(tz), f"{len(strip(tz))} lines")
+    tc = code_only(TH)
+    check("PS5 one ZoneEngine, one zn.update, ZoneCfg only written inside barstate.isfirst",
+          len(re.findall(r"zn\.newEngine\(", tc)) == 1 and len(re.findall(r"\bzn\.update\(", tc)) == 1 and
+          all(re.match(r"^    zoneCfg\.", l) for l in tc.split("\n") if re.search(r"zoneCfg\.\w+\s*:=", l)))
+    check("PS5 Structural SL/TP not reimplemented: only zn.buildPlanWithTpDepth is used (1 call site)",
+          len(re.findall(r"zn\.buildPlanWithTpDepth\(", tc)) == 1 and
+          not re.search(r"zn\.(getLong|getShort)Structural|zn\.buildPlan\(", tc))
+    body = code_only(func_block(TH, "f_evalEntry"))
+    order = [body.find(x) for x in ("if dir == 0", "else if insideBlocked", "zn.buildPlanWithTpDepth",
+                                    'if tpMode == "STRUCTURAL_ONLY"', "if not isGold", "else if not p.valid",
+                                    "float qty = f_qty(p.risk)", "if qty < qtyMin or qty <= 0")]
+    check("PS6 gate order: dir -> Inside Any Zone -> buildPlan -> TP Mode -> Gold -> valid -> Qty -> qtyMin",
+          -1 not in order and order == sorted(order), str(order))
+    m_ex = code_only(func_block(MAIN, "f_executeTrade"))
+    check("PS6 old Main reference order: isGold -> valid -> qty -> (logicFull / opposite = P08) -> qtyMin",
+          m_ex.find("if isGold") < m_ex.find("if not p.valid") < m_ex.find("float qty = f_qty(p.risk)") <
+          m_ex.find("else if qty < qtyMin or qty <= 0"))
+    bad = [t for t in ("strategy.entry", "strategy.exit", "strategy.close", "alert(", "alertcondition", "map.new",
+                       "opentrades", "closedtrades", "box.new", "label.new", "table.new", "tpManagementMode",
+                       "Dynamic", "useBreakEven", "SignalEngine") if t in tc]
+    check("PS7 prohibited in harness code: orders / alerts / map / trade scans / drawing / Dynamic TP / BE / Signal",
+          not bad, str(bad))
+    scan = code_only(func_block(TH, "f_insideAnyZone"))
+    check("PS8 Inside Any Zone: one loop over live zones, no state filter, break on first hit, scalar results",
+          scan.count("for ") == 1 and "z.state" not in scan and "break" in scan and
+          "zoneCfg.activeNoTradeMinStrength" in scan and "entryPrice >= z.bottom and entryPrice <= z.top" in scan)
+    probe = code_only(TH[TH.find("// 06. PROBE"):])
+    check("PS8 probe computes the Inside gate once per bar and shares it for Long and Short",
+          probe.count("f_insideAnyZone(") == 1 and probe.count("f_evalEntry(") == 2)
+    for fn in ("getLongStructuralSL", "getShortStructuralSL", "getLongStructuralTpAt", "getShortStructuralTpAt",
+               "getObstacleCount", "isInsideActiveZone", "buildPlanWithTpDepth", "buildPlan"):
+        check(f"PS9 ZoneEnginePractical.{fn} == legacy ZoneEngine (canonical TradePlan API)",
+              func_block(ZEP, fn) == func_block(LEG_ZE, fn) and func_block(ZEP, fn) != "")
+
+
+# ---- Python mirror: ZoneEnginePractical TradePlan API + harness evaluator -----
+class TCfg:
+    def __init__(self, **kw):
+        d = dict(slBuffer=5.0, tpBuffer=0.0, maxSlDist=30.0, minStructRR=1.0, slMinScore=4.0, slMinStrength=2,
+                 tpMinScore=7.0, tpMinStrength=3, obsMinStrength=2, activeNoTradeMinStrength=2,
+                 structuralTpDepthRatio=0.25, fallbackRR=2.0)
+        d.update(kw)
+        self.__dict__.update(d)
+
+
+ST_ACT, ST_SUP_, ST_RES_, ST_BRK = 0, 1, 2, 3
+
+
+def Z(bottom, top, state, strength=3, score=12.0, tid=1):
+    return dict(bottom=bottom, top=top, center=(bottom + top) / 2, state=state, strength=strength, score=score,
+                trackId=tid)
+
+
+def long_sl(live, c, entry):
+    sl, idx, best = None, -1, 1e20
+    for i, z in enumerate(live):
+        if z["top"] < entry and z["strength"] >= c.slMinStrength and z["score"] >= c.slMinScore and z["state"] == ST_SUP_:
+            d = entry - z["top"]
+            if d < best:
+                best, sl, idx = d, z["bottom"] - c.slBuffer, i
+    return sl, idx
+
+
+def short_sl(live, c, entry):
+    sl, idx, best = None, -1, 1e20
+    for i, z in enumerate(live):
+        if z["bottom"] > entry and z["strength"] >= c.slMinStrength and z["score"] >= c.slMinScore and z["state"] == ST_RES_:
+            d = z["bottom"] - entry
+            if d < best:
+                best, sl, idx = d, z["top"] + c.slBuffer, i
+    return sl, idx
+
+
+def long_tp(live, c, entry, depth):
+    r = c.structuralTpDepthRatio if depth is None else depth
+    tp, idx, best = None, -1, 1e20
+    for i, z in enumerate(live):
+        if z["bottom"] > entry and z["strength"] >= c.tpMinStrength and z["score"] >= c.tpMinScore and z["state"] == ST_RES_:
+            d = z["bottom"] - entry
+            if d < best:
+                best, tp, idx = d, z["bottom"] + (z["top"] - z["bottom"]) * r - c.tpBuffer, i
+    return tp, idx
+
+
+def short_tp(live, c, entry, depth):
+    r = c.structuralTpDepthRatio if depth is None else depth
+    tp, idx, best = None, -1, 1e20
+    for i, z in enumerate(live):
+        if z["top"] < entry and z["strength"] >= c.tpMinStrength and z["score"] >= c.tpMinScore and z["state"] == ST_SUP_:
+            d = entry - z["top"]
+            if d < best:
+                best, tp, idx = d, z["top"] - (z["top"] - z["bottom"]) * r + c.tpBuffer, i
+    return tp, idx
+
+
+def obstacles(live, c, entry, tp, d):
+    if entry is None or tp is None:
+        return 0
+    b = tp + c.tpBuffer if d > 0 else tp - c.tpBuffer
+    return sum(1 for z in live if z["strength"] >= c.obsMinStrength and z["state"] == (ST_RES_ if d > 0 else ST_SUP_)
+               and ((z["bottom"] > entry and z["top"] < b) if d > 0 else (z["top"] < entry and z["bottom"] > b)))
+
+
+def inside_active(live, c, entry):
+    return any(z["state"] == ST_ACT and z["bottom"] <= entry <= z["top"] and z["strength"] >= c.activeNoTradeMinStrength
+               for z in live)
+
+
+def build_plan(live, c, d, entry, depth=None):
+    lsl, lsi = long_sl(live, c, entry)
+    ltp, lti = long_tp(live, c, entry, depth)
+    ssl, ssi = short_sl(live, c, entry)
+    stp, sti = short_tp(live, c, entry, depth)
+    sl = lsl if d > 0 else ssl if d < 0 else None
+    si = lsi if d > 0 else ssi if d < 0 else -1
+    tpz = ltp if d > 0 else stp if d < 0 else None
+    ti = lti if d > 0 else sti if d < 0 else -1
+    risk = None if sl is None or entry is None else abs(entry - sl)
+    p = dict(valid=False, status="FAIL", reason="NO_ENTRY", dir=d, entry=entry, sl=sl, risk=risk, tp=0.0, reward=0.0,
+             rr=0.0, tpType="-", usedFallbackTP=False, obstacles=0)
+    if d == 0:
+        p["reason"] = "NO_ENTRY"
+    elif inside_active(live, c, entry):
+        p["reason"] = "INSIDE_ACTIVE_ZONE"
+    elif si < 0 or sl is None:
+        p["reason"] = "NO_SL_ZONE"
+    elif risk is None or risk <= 0:
+        p["reason"] = "INVALID_SL"
+    elif risk > c.maxSlDist:
+        p["reason"] = "SL_TOO_FAR"
+    elif ti >= 0:
+        p.update(tp=tpz, reward=abs(tpz - entry), tpType="STRUCTURAL")
+        p["rr"] = p["reward"] / risk if risk > 0 else None
+        p["obstacles"] = obstacles(live, c, entry, tpz, d)
+        if p["reward"] <= 0:
+            p["reason"] = "TP_WRONG_SIDE"
+        elif p["rr"] is None or p["rr"] < c.minStructRR:
+            p["reason"] = "LOW_STRUCTURAL_RR"
+        else:
+            p.update(valid=True, status="PASS", reason="OK_STRUCTURAL_TP")
+    else:
+        ftp = entry + d * risk * c.fallbackRR
+        p.update(tp=ftp, reward=abs(ftp - entry), rr=c.fallbackRR, usedFallbackTP=True, tpType="FALLBACK_RR",
+                 valid=True, status="PASS", reason="OK_FALLBACK_TP")
+        p["obstacles"] = obstacles(live, c, entry, ftp, d)
+    return p
+
+
+def f_qty_(risk, capital=1000.0, riskPct=5.0, pointvalue=1.0, qtyStep=1.0):
+    raw = capital * riskPct / 100.0 / (risk * pointvalue) if risk > 0 else 0.0
+    q = math.floor(raw / qtyStep) * qtyStep if qtyStep > 0 else raw
+    return round(q, 8)
+
+
+def inside_any(live, c, entry):
+    for z in live:
+        if z["strength"] >= c.activeNoTradeMinStrength and z["bottom"] <= entry <= z["top"]:
+            return True, z["trackId"], z["strength"]
+    return False, None, None
+
+
+def eval_entry(live, c, d, entry, tpMode="BOTH", depth=None, isGold=True, qtyMin=0.01, **qkw):
+    if d == 0:
+        return dict(ready=False, reason="NO_ENTRY", plan=None, qty=None)
+    blocked, _, _ = inside_any(live, c, entry)
+    if blocked:
+        return dict(ready=False, reason="INSIDE_ANY_ZONE", plan=None, qty=None)
+    p = build_plan(live, c, d, entry, depth)
+    if tpMode == "STRUCTURAL_ONLY" and p["tpType"] == "FALLBACK_RR":
+        p.update(valid=False, status="FAIL", reason="NO_STRUCTURAL_TP")
+    elif tpMode == "FALLBACK_ONLY" and p["tpType"] == "STRUCTURAL":
+        p.update(valid=False, status="FAIL", reason="STRUCTURAL_TP_EXISTS")
+    if not isGold:
+        return dict(ready=False, reason="NOT_GOLD", plan=p, qty=None)
+    if not p["valid"]:
+        return dict(ready=False, reason=p["reason"], plan=p, qty=None)
+    q = f_qty_(p["risk"], **qkw)
+    if q < qtyMin or q <= 0:
+        return dict(ready=False, reason="SKIP_NO_QTY", plan=p, qty=q)
+    return dict(ready=True, reason="ENTRY_READY", plan=p, qty=q)
+
+
+def fixture_p07_behaviour():
+    c = TCfg()
+    sup = Z(4030, 4040, ST_SUP_, tid=1)                 # Support below entry 4050
+    sup_far = Z(4000, 4010, ST_SUP_, tid=2)
+    res = Z(4070, 4080, ST_RES_, tid=3)                 # Resistance above
+    res_far = Z(4100, 4110, ST_RES_, tid=4)
+    live = [sup_far, sup, res, res_far]
+    # T01 / T02 SL
+    sl, i = long_sl(live, c, 4050)
+    check("T01 Long SL = nearest valid Support below entry: bottom - slBuffer (4030-5)", sl == 4025 and i == 1)
+    sl, i = short_sl(live, c, 4050)
+    check("T02 Short SL = nearest valid Resistance above entry: top + slBuffer (4080+5)", sl == 4085 and i == 2)
+    # T03 / T04 TP selection
+    tp, i = long_tp(live, c, 4050, 0.0)
+    check("T03 Long TP = nearest Resistance above (bottom 4070 at depth 0)", tp == 4070 and i == 2)
+    tp, i = short_tp(live, c, 4050, 0.0)
+    check("T04 Short TP = nearest Support below (top 4040 at depth 0)", tp == 4040 and i == 1)
+    # T05 TP depth
+    ld = [long_tp(live, c, 4050, d_)[0] for d_ in (0.0, 0.25, 0.5, 1.0)]
+    sd = [short_tp(live, c, 4050, d_)[0] for d_ in (0.0, 0.25, 0.5, 1.0)]
+    check("T05 TP depth 0 / 0.25 / 0.5 / 1.0 (Long 4070..4080, Short 4040..4030)",
+          ld == [4070, 4072.5, 4075, 4080] and sd == [4040, 4037.5, 4035, 4030], f"{ld} {sd}")
+    check("T05 Logic TP depth is an argument (ZoneCfg.structuralTpDepthRatio unchanged)",
+          c.structuralTpDepthRatio == 0.25 and build_plan(live, c, 1, 4050, 0.0)["tp"] == 4070)
+    # T06 / T07
+    check("T06 NO_SL_ZONE", build_plan([res], c, 1, 4050)["reason"] == "NO_SL_ZONE")
+    check("T07 SL_TOO_FAR (risk 4050-(4000-5)=55 > 30)", build_plan([sup_far, res], c, 1, 4050)["reason"] == "SL_TOO_FAR")
+    # T08 Structural RR boundary: risk = 4050-4025 = 25 -> RR == 1 at TP 4075
+    eq = build_plan([sup, Z(4075, 4085, ST_RES_)], c, 1, 4050, 0.0)
+    lo = build_plan([sup, Z(4074.99, 4085, ST_RES_)], c, 1, 4050, 0.0)
+    check("T08 Structural RR == minStructRR -> PASS; below -> LOW_STRUCTURAL_RR", eq["valid"] and eq["rr"] == 1.0
+          and lo["reason"] == "LOW_STRUCTURAL_RR", f"{eq['reason']} {lo['reason']}")
+    # T09 / T10
+    fb = build_plan([sup], c, 1, 4050)
+    check("T09 no Structural TP -> Fallback RR TP (entry + risk*2)", fb["valid"] and fb["tpType"] == "FALLBACK_RR"
+          and fb["tp"] == 4100)
+    check("T10 Structural TP exists but RR short -> FAIL, never escapes to Fallback",
+          lo["tpType"] == "STRUCTURAL" and not lo["valid"] and not lo["usedFallbackTP"])
+    # T11-T13 TP Mode
+    ok_s = eval_entry([sup, res_far], c, 1, 4050)
+    ok_f = eval_entry([sup], c, 1, 4050)
+    check("T11 BOTH: Structural and Fallback both ENTRY_READY", ok_s["ready"] and ok_f["ready"])
+    r1 = eval_entry([sup, res_far], c, 1, 4050, tpMode="STRUCTURAL_ONLY")
+    r2 = eval_entry([sup], c, 1, 4050, tpMode="STRUCTURAL_ONLY")
+    check("T12 STRUCTURAL_ONLY: structural READY; fallback -> NO_STRUCTURAL_TP", r1["ready"] and r2["reason"] == "NO_STRUCTURAL_TP")
+    r3 = eval_entry([sup, res_far], c, 1, 4050, tpMode="FALLBACK_ONLY")
+    r4 = eval_entry([sup], c, 1, 4050, tpMode="FALLBACK_ONLY")
+    r5 = eval_entry([sup, Z(4074.99, 4085, ST_RES_)], c, 1, 4050, tpMode="FALLBACK_ONLY", depth=0.0)
+    check("T13 FALLBACK_ONLY: structural -> STRUCTURAL_TP_EXISTS; fallback READY; LOW_RR plan relabelled (canonical)",
+          r3["reason"] == "STRUCTURAL_TP_EXISTS" and r4["ready"] and r5["reason"] == "STRUCTURAL_TP_EXISTS")
+    # T14-T19 Inside Any Zone
+    for tag, st in (("T14 Support", ST_SUP_), ("T15 Resistance", ST_RES_), ("T16 Active", ST_ACT), ("T17 Broken", ST_BRK)):
+        r = eval_entry([sup, Z(4045, 4055, st, tid=9), res_far], c, 1, 4050)
+        check(f"{tag}: entry inside a Strong zone -> INSIDE_ANY_ZONE (state ignored)", r["reason"] == "INSIDE_ANY_ZONE")
+    weak = eval_entry([sup, Z(4045, 4055, ST_SUP_, strength=1, tid=9), res_far], c, 1, 4050)
+    check("T18 zone strength below activeNoTradeMinStrength -> not blocked by the added gate", weak["ready"])
+    check("T19 entry == top and entry == bottom are inside",
+          inside_any([Z(4045, 4050, ST_SUP_)], c, 4050)[0] and inside_any([Z(4050, 4055, ST_RES_)], c, 4050)[0])
+    check("T19b legacy buildPlan alone would NOT block Support/Resistance/Broken (only ACTIVE) -> gate is the intended diff",
+          build_plan([sup, Z(4045, 4055, ST_SUP_), res_far], c, 1, 4050)["valid"] and
+          build_plan([sup, Z(4045, 4055, ST_ACT), res_far], c, 1, 4050)["reason"] == "INSIDE_ACTIVE_ZONE")
+    # T20-T23 Qty (old Main formula: floor(capital*risk%/(risk*pointvalue)/step)*step)
+    qL = eval_entry([sup, res_far], c, 1, 4050)
+    qS = eval_entry([Z(4060, 4070, ST_RES_), Z(4000, 4010, ST_SUP_)], c, -1, 4050)
+    check("T20 Qty Long: risk 25 -> floor(50/25 / 1)*1 = 2", qL["qty"] == 2.0, str(qL["qty"]))
+    check("T21 Qty Short: risk 25 (SL 4075) -> 2", qS["ready"] and qS["qty"] == 2.0, str(qS["qty"]))
+    check("T21b qtyStep 0.01 keeps decimals: 50/7 -> 7.14", f_qty_(7.0, qtyStep=0.01) == 7.14)
+    big = TCfg(maxSlDist=10_000)
+    # SL = bottom(-10) - slBuffer(5) = -15 -> entry 4985: risk 5000 -> 50/5000 = 0.01; entry 4986: risk 5001 -> 0.00
+    mn = eval_entry([Z(-10, 0, ST_SUP_), Z(20000, 20010, ST_RES_)], big, 1, 4985, qtyMin=0.01, qtyStep=0.01)
+    under = eval_entry([Z(-10, 0, ST_SUP_), Z(20000, 20010, ST_RES_)], big, 1, 4986, qtyMin=0.01, qtyStep=0.01)
+    check("T22 Qty == qtyMin passes (risk 5000 -> 0.01); below qtyMin -> SKIP_NO_QTY",
+          mn["ready"] and mn["qty"] == 0.01 and under["reason"] == "SKIP_NO_QTY", f"{mn['qty']} {under['qty']}")
+    stepped = eval_entry([sup, res_far], TCfg(maxSlDist=100), 1, 4050, qtyMin=0.01, capital=10.0)
+    check("T23 integer qtyStep with tiny risk capital -> qty 0 -> SKIP_NO_QTY (never ENTRY_READY)",
+          stepped["reason"] == "SKIP_NO_QTY" and not stepped["ready"])
+    check("T23b invalid SL (no SL zone) / wrong side never reaches Qty", eval_entry([res], c, 1, 4050)["qty"] is None)
+    check("T23c non-Gold symbol never ENTRY_READY", eval_entry([sup, res_far], c, 1, 4050, isGold=False)["reason"] == "NOT_GOLD")
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -2162,6 +2457,8 @@ if __name__ == "__main__":
     fixture_p05_consume_preview()
     fixture_p06_boundaries()
     fixture_p06_compile()
+    fixture_p07_static()
+    fixture_p07_behaviour()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
