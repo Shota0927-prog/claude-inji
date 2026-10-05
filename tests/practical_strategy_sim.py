@@ -3074,6 +3074,282 @@ def fixture_p09_behaviour():
 
 
 
+# ============================================================================
+# P10 : Provisional + Confirmed Entry Alerts
+# ============================================================================
+AH_PATH = os.path.join(ROOT, "PracticalAlertHarness.pine")
+AH = open(AH_PATH, encoding="utf-8").read() if os.path.exists(AH_PATH) else ""
+
+
+def fixture_p10_static():
+    check("P10 harness file exists", bool(AH))
+    if not AH:
+        return
+    ac = code_only(AH)
+    AI, MI = parse_inputs(AH), parse_inputs(MAIN)
+    ok = all(AI.get(n) == MI.get(n) and AI.get(n) for n in ("useProvisionalAlert", "useConfirmedAlert"))
+    ln = lambda src, n: next((l for l in logical_lines(src) if l.startswith(n + " ")), "")
+    check("PA1 alert inputs == old Main (name / type / default / title / group / tooltip): Provisional false, Confirmed true",
+          ok and AI["useProvisionalAlert"]["default"] == "false" and AI["useConfirmedAlert"]["default"] == "true"
+          and all(ln(AH, n) == ln(MAIN, n) != "" for n in ("useProvisionalAlert", "useConfirmedAlert"))
+          and 'var string G_ALERT = "05 · Alerts"' in AH)
+    check("PA1 f_provSlot (16 slots) identical to old Main", code_only(func_block(AH, "f_provSlot")) == code_only(func_block(MAIN, "f_provSlot")) != "")
+    # ---- P10 = P09 + insertions ----
+    a = code_only(BH).split("\n")
+    b = ac.split("\n")
+    ops = [op for op in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes() if op[0] != "equal"]
+    repl = [(a[i1:i2], b[j1:j2]) for t, i1, i2, j1, j2 in ops if t != "insert"]
+    check("PA2 P09 code preserved line-for-line (P10 only inserts; replaced = title / shorttitle)",
+          repl == [(['     title             = "Practical Break Even Harness (P09)",', '     shorttitle        = "BE-P09",'],
+                    ['     title             = "Practical Alert Harness (P10)",', '     shorttitle        = "ALERT-P10",'])], str(repl)[:300])
+    ins = [l for t, i1, i2, j1, j2 in ops if t == "insert" for l in b[j1:j2]]
+    bad_ins = [l for l in ins if re.search(r"strategy\.(entry|exit|close|cancel)|activePos\.\w+\s*:=|ap\.\w+\s*:=|"
+                                           r"enteredThisBar\s*:=|globalPositionBlocked\s*=|ds\.\w+\s*:=|request\.",
+                                           re.sub(r'"[^"]*"', '""', l))]
+    check("AL01/AL14/AL15 inserted lines: no order / ActivePos / enteredThisBar / dispatch-stat / gate / request write",
+          not bad_ins, str(bad_ins))
+    te9 = code_only(func_block(BH, "f_tryEntry")).split("\n")
+    te10 = code_only(func_block(AH, "f_tryEntry")).split("\n")
+    extra = [l.strip() for l in te10 if l not in te9]
+    check("PA2 f_tryEntry == P09 + confirmed alert + re-arm lines only",
+          [l for l in te10 if l in te9] == te9 and extra == [
+              "if useConfirmedAlert", 'alert(f_entryAlertMsg("確定", logicId, dir, p, qty), alert.freq_once_per_bar)',
+              "int pslot = f_provSlot(logicId, dir)", "if pslot >= 0", "array.set(gProvSent, pslot, false)"], str(extra))
+    te = code_only(func_block(AH, "f_tryEntry"))
+    order = [te.find(x) for x in ("strategy.entry(", "strategy.exit(", "ap.entryId", "ap.beActivatedBar",
+                                  "if useConfirmedAlert", "array.set(gProvSent, pslot, false)", "entered := true")]
+    tl = te.split("\n")
+    ind = lambda l: len(l) - len(l.lstrip())
+    ei = next(i for i, l in enumerate(tl) if "strategy.entry(" in l)
+    ci = next(i for i, l in enumerate(tl) if "if useConfirmedAlert" in l)
+    check("AL17 confirmed alert only inside the strategy.entry branch: entry -> exit -> ActivePos -> Confirmed -> re-arm",
+          -1 not in order and order == sorted(order) and ind(tl[ei]) == ind(tl[ci]))
+    check("AL17 exactly 2 alert() calls in the file (confirmed in f_tryEntry, provisional in Section 10); no alertcondition",
+          ac.count("alert(") == 2 and "alertcondition" not in ac and te.count("alert(") == 1)
+    sec = code_only(AH[AH.find("// 10. PROVISIONAL ALERT"):AH.find("// ---- Flat 遷移検知用")])
+    pe = code_only(func_block(AH, "f_provEval"))
+    check("AL14/AL15/AL16 provisional path: no strategy.* order, no ActivePos / ap / enteredThisBar / ds write, no consume",
+          not re.search(r"strategy\.(entry|exit|close|cancel)|activePos|\bap\.|enteredThisBar|\bds\.|consume", sec))
+    check("PA3 provisional gate: useProvisionalAlert first, not barstate.isconfirmed (old Main), isGold, Global Position Gate",
+          "if useProvisionalAlert and not barstate.isconfirmed and isGold and not globalPositionBlocked" in sec
+          and "not barstate.isconfirmed" in code_only(func_block(MAIN, "f_provWouldEnter")))
+    m_te = code_only(func_block(AH, "f_tryEntry"))
+    seq = lambda body: [body.find(x) for x in ("f_insideAnyZone(entryPrice)", "zn.buildPlanWithTpDepth(", 'if tpMode == "STRUCTURAL_ONLY"',
+                                               "if p.valid", "float qty = f_qty(p.risk)", "if qty >= qtyMin and qty > 0")]
+    tpm = lambda src: [" ".join(x.split()) for x in re.findall(
+        r'if tpMode == "STRUCTURAL_ONLY" and p\.tpType == "FALLBACK_RR".*?p\.reason := "STRUCTURAL_TP_EXISTS"', src, re.S)]
+    check("PA4 f_provEval uses the same gate order / TP Mode / Qty rule as f_tryEntry (Inside -> Plan -> TP Mode -> valid -> Qty -> qtyMin)",
+          -1 not in seq(pe) and seq(pe) == sorted(seq(pe)) and tpm(pe) == tpm(m_te) != [])
+    lg = re.findall(r"(LOGIC_\w+)", code_only(func_block(AH, "f_provLogic")))
+    check("AL19 provisional priority order == entry dispatch order (FVG15 > FVG > ABS15 > ABS5 > RB > FK > RT > BK, Long then Short)",
+          [P08_CONST[x] for x in lg] == P08_ORDER and "int    d   = k % 2 == 0 ? 1 : -1" in sec and "for k = 0 to 15" in sec)
+    loop = sec[sec.find("for k = 0 to 15"):sec.find("if winDir != 0")]
+    check("PA5 winner = first Entry-ready (break); provSent is checked AFTER the loop (no fall-through past a sent winner)",
+          "if ev.ready" in loop and "break" in loop and "gProvSent" not in loop and
+          "if slot >= 0 and not array.get(gProvSent, slot) and (na(gProvLastBar) or gProvLastBar != bar_index)" in sec)
+    check("PA6 slot writes: true only in Section 10 (send), false only in the real-entry branch (re-arm)",
+          ac.count("array.set(gProvSent") == 2 and "array.set(gProvSent, slot, true)" in sec and
+          "array.set(gProvSent, pslot, false)" in te)
+    check("PA7 varip dedupe: one varip bool[16] declared once + varip per-bar guard; no map; no other array.new",
+          ac.count("varip array<bool> gProvSent = array.new_bool(16, false)") == 1 and ac.count("array.new") == 1 and
+          "varip int gProvLastBar = na" in ac and "map." not in ac and "map<" not in ac)
+    check("PA8 both alerts use alert.freq_once_per_bar (D4: old Main provisional = freq_all)",
+          ac.count("alert.freq_once_per_bar") == 2 and "alert.freq_all" not in ac and
+          "alert(f_provAlertMsg(logicId, dir), alert.freq_all)" in code_only(func_block(MAIN, "f_provFire")))
+    msg = code_only(func_block(AH, "f_entryAlertMsg"))
+    check("PA9 alert text: kind / LONG-SHORT / Logic / Symbol / E / SL / TP / RR / Qty; no rating / BE / debug lines (D2 / D3)",
+          all(x in msg for x in ('"【" + kind', '"LONG"', '"SHORT"', "Logic: ", "syminfo.ticker", "E: ", "SL: ", "TP: ", "RR: ", "Qty: "))
+          and not re.search(r"f_ratingBeLines|f_breakEvenDisplayText|bar_index|time", msg)
+          and '"仮"' in sec and '"確定"' in te)
+    check("AL22/AL23 no BE / TP / SL / Exit / Dynamic TP alert (BE section has no alert)",
+          "alert(" not in code_only(AH[AH.find("// 09. BREAK EVEN"):AH.find("// 10. PROVISIONAL ALERT")]) and "Dynamic" not in ac)
+    check("AL25/AL26 no map / trade loop / per-trade accessor",
+          not re.search(r"for .*(opentrades|closedtrades)", ac) and not re.search(r"strategy\.(opentrades|closedtrades)\.\w+", ac))
+    check("PA10 no request.* added (== P09)", ac.count("request.") == code_only(BH).count("request."))
+
+
+# ---- Python mirror of the P10 alert layer ---------------------------------------
+P10_SLOT = {"FVG": 0, "FVG15": 1, "FVGABS5": 2, "FVGABS15": 3, "ZONEREBOUND": 4, "ZONEFAKE": 5, "ZONERETEST": 6, "ZONEBREAK": 7}
+
+
+def prov_slot(lg, d):
+    return P10_SLOT[lg] * 2 + (0 if d > 0 else 1)
+
+
+class AlertState:
+    def __init__(self):
+        self.sent = [False] * 16          # varip
+        self.lastBar = None               # varip per-bar guard
+        self.alerts = []                  # (bar, kind, logic, dir)
+
+
+def prov_eval(ps, live, c, lg, cand, d, entry, tpMode="BOTH", qtyMin=0.01, **qkw):
+    if not (cand and d != 0):
+        return None
+    if ps["insPrice"] is not None and entry == ps["insPrice"]:
+        ins = ps["insBlocked"]
+    else:
+        ins, _, _ = inside_any(live, c, entry)
+        ps["insideScans"] += 1
+        ps["insPrice"], ps["insBlocked"] = entry, ins
+    if ins:
+        return None
+    p = build_plan(live, c, d, entry, tp_depth_for(lg, d, c))
+    ps["plans"] += 1
+    if tpMode == "STRUCTURAL_ONLY" and p["tpType"] == "FALLBACK_RR":
+        p.update(valid=False)
+    elif tpMode == "FALLBACK_ONLY" and p["tpType"] == "STRUCTURAL":
+        p.update(valid=False)
+    if not p["valid"]:
+        return None
+    q = f_qty_(p["risk"], **qkw)
+    ps["qtys"] += 1
+    return (p, q) if q >= qtyMin and q > 0 else None
+
+
+def prov_tick(st, bar, cands, live, c, br, useProv=True, confirmed=False, isGold=True, **kw):
+    """one realtime tick of Section 10. Returns (fired, winner, stats)."""
+    ps = dict(insideScans=0, plans=0, qtys=0, insPrice=None, insBlocked=False)
+    blocked = br.position_size != 0 or br.opentrades > 0
+    if not (useProv and not confirmed and isGold and not blocked):
+        return False, None, ps
+    win = None
+    for lg in P08_ORDER:
+        for d in (1, -1):
+            mode, px = cands.get(lg, ("Both", None))
+            cnd = lg in cands and (mode != "Short" if d > 0 else mode != "Long")
+            r = prov_eval(ps, live, c, lg, cnd, d, px, **kw)
+            if r is not None:
+                win = (lg, d)
+                break
+        if win:
+            break
+    if win is None:
+        return False, None, ps
+    sl = prov_slot(*win)
+    if not st.sent[sl] and st.lastBar != bar:
+        st.sent[sl] = True
+        st.lastBar = bar
+        st.alerts.append((bar, "仮", win[0], win[1]))
+        return True, win, ps
+    return False, win, ps
+
+
+def confirmed_bar(st, bar, cands, live, c, br, ap, useConf=True, **kw):
+    """confirmed-bar dispatch (P08 mirror) + P10 confirmed alert + re-arm in the entry branch."""
+    n0 = len([o for o in br.orders if o[0] == "entry"])
+    ent, ds = dispatch(cands, live, c, br, ap, **kw)
+    if ent:
+        if useConf:
+            st.alerts.append((bar, "確定", ap["logicId"], ap["dir"]))
+        st.sent[prov_slot(ap["logicId"], ap["dir"])] = False
+    return ent, ds, len([o for o in br.orders if o[0] == "entry"]) - n0
+
+
+def fixture_p10_behaviour():
+    c = TCfg()
+    sup = Z(4030, 4040, ST_SUP_, tid=1)
+    res_far = Z(4100, 4110, ST_RES_, tid=4)
+    live = [sup, res_far]
+    new = lambda: dict(entryId="", logicId="", dir=0, entryPrice=None, sl=None, tp=None, qty=None,
+                       originTrackId=None, entryTouchCount=None)
+    conf = lambda st: [a for a in st.alerts if a[1] == "確定"]
+    provs = lambda st: [a for a in st.alerts if a[1] == "仮"]
+
+    # AL02 / AL03 confirmed on / off: same orders, 1 alert vs 0
+    res = []
+    for uc in (True, False):
+        st, br, ap = AlertState(), Broker(), new()
+        confirmed_bar(st, 1, {lg: ("Both", 4050.0) for lg in P08_ORDER}, live, c, br, ap, useConf=uc)
+        res.append((list(br.orders), len(conf(st))))
+    check("AL02 Confirmed OFF -> identical orders, 0 alerts", res[0][0] == res[1][0] and res[1][1] == 0)
+    check("AL03 real entry -> exactly 1 confirmed alert", res[0][1] == 1)
+    check("AL18 same-bar multiple candidates (16) -> 1 entry / 1 confirmed", len([o for o in res[0][0] if o[0] == "entry"]) == 1 and res[0][1] == 1)
+    # AL04-AL07 / AL21 no confirmed when no real entry
+    cases = [("AL04 Signal true / TradePlan FAIL", dict(cands={"FVG": ("Long", 3000.0)}, br=Broker(), kw={})),
+             ("AL05 Qty below qtyMin", dict(cands={"FVG": ("Long", 4050.0)}, br=Broker(), kw=dict(capital=1.0))),
+             ("AL06 Inside Any Zone", dict(cands={"FVG": ("Long", 4035.0)}, br=Broker(), kw={})),
+             ("AL07 Position Blocked", dict(cands={"FVG": ("Long", 4050.0)}, br=Broker(position_size=1.0, opentrades=1), kw={})),
+             ("AL21 non-Gold", dict(cands={"FVG": ("Long", 4050.0)}, br=Broker(), kw=dict(isGold=False)))]
+    for name, cs in cases:
+        st, ap = AlertState(), new()
+        confirmed_bar(st, 1, cs["cands"], live, c, cs["br"], ap, **cs["kw"])
+        pv = AlertState()
+        prov_tick(pv, 1, cs["cands"], live, c, cs["br"], **cs["kw"])
+        check(f"{name} -> confirmed 0 / provisional 0", not st.alerts and not pv.alerts and not cs["br"].orders)
+    # AL08 / AL09 / AL10 provisional once until real entry
+    st, br = AlertState(), Broker()
+    cand = {"FVG": ("Long", 4050.0)}
+    f1, _, _ = prov_tick(st, 1, cand, live, c, br)
+    f2, _, _ = prov_tick(st, 1, cand, live, c, br)                      # same bar later tick
+    f3, _, _ = prov_tick(st, 1, {}, live, c, br)                        # preview disappears
+    f4, _, _ = prov_tick(st, 1, cand, live, c, br)                      # re-appears
+    f5, _, _ = prov_tick(st, 2, cand, live, c, br)                      # next bar, still true
+    check("AL08 Preview PASS -> 1 provisional", f1 and len(provs(st)) == 1)
+    check("AL09 Preview disappears and re-appears -> not re-sent", not f2 and not f3 and not f4)
+    check("AL10 next bar Preview continues -> not re-sent", not f5 and len(provs(st)) == 1)
+    # AL11 re-arm on same logic/dir entry; AL12 other logic entry no re-arm; AL13 Long entry keeps Short slot
+    st.sent[prov_slot("FVG", -1)] = True
+    st.sent[prov_slot("FVG15", 1)] = True
+    ap = new()
+    confirmed_bar(st, 3, {"FVGABS5": ("Long", 4050.0)}, live, c, Broker(), ap)
+    check("AL12 another logic's entry (ABS5 L) -> FVG_L / FVG15_L / FVG_S slots untouched",
+          st.sent[prov_slot("FVG", 1)] and st.sent[prov_slot("FVG15", 1)] and st.sent[prov_slot("FVG", -1)])
+    confirmed_bar(st, 4, {"FVG": ("Long", 4050.0)}, live, c, Broker(), ap)
+    check("AL11 same logic + same dir entry (FVG L) -> FVG_L re-armed", not st.sent[prov_slot("FVG", 1)])
+    check("AL13 Long entry -> Short slot (FVG_S) untouched", st.sent[prov_slot("FVG", -1)] and st.sent[prov_slot("FVG15", 1)])
+    f6, _, _ = prov_tick(st, 5, cand, live, c, Broker())
+    check("AL11b after re-arm the next Preview PASS fires again", f6)
+    # AL19 / AL20 priority winner
+    st = AlertState()
+    f, w, _ = prov_tick(st, 1, {lg: ("Long", 4050.0) for lg in P08_ORDER}, live, c, Broker())
+    check("AL19 several Entry-ready previews -> only the top priority (FVG15 L) is notified", f and w == ("FVG15", 1) and len(st.alerts) == 1)
+    st = AlertState()
+    f, w, _ = prov_tick(st, 1, {"FVG15": ("Long", 3000.0), "FVG": ("Long", 4050.0)}, live, c, Broker())
+    check("AL20 top candidate not Entry-ready (Plan FAIL) -> next priority (FVG L) notified", f and w == ("FVG", 1))
+    st = AlertState()
+    st.sent[prov_slot("FVG15", 1)] = True
+    f, w, _ = prov_tick(st, 1, {"FVG15": ("Long", 4050.0), "FVG": ("Long", 4050.0)}, live, c, Broker())
+    check("PA5b winner FVG15 already sent + FVG Entry-ready -> NO alert (no fall-through to FVG)", not f and w == ("FVG15", 1) and not st.alerts)
+    st = AlertState()
+    f1, w1, _ = prov_tick(st, 1, {"FVG": ("Long", 4050.0)}, live, c, Broker())
+    f2, w2, _ = prov_tick(st, 1, {"FVG15": ("Long", 4050.0), "FVG": ("Long", 4050.0)}, live, c, Broker())
+    f3, w3, _ = prov_tick(st, 2, {"FVG15": ("Long", 4050.0), "FVG": ("Long", 4050.0)}, live, c, Broker())
+    check("PA6b per bar max 1 provisional script-wide: winner changes FVG -> FVG15 in the same bar -> no 2nd; next bar -> FVG15",
+          f1 and not f2 and w2 == ("FVG15", 1) and f3 and [a[2] for a in st.alerts] == ["FVG", "FVG15"])
+    # historical / confirmed tick -> no provisional ; OFF -> 0 evaluation
+    st = AlertState()
+    f, _, ps = prov_tick(st, 1, {"FVG": ("Long", 4050.0)}, live, c, Broker(), confirmed=True)
+    check("PA3b confirmed tick (all historical bars) -> provisional not evaluated (0 scans / plans)", not f and ps["plans"] == 0 and ps["insideScans"] == 0)
+    f, _, ps = prov_tick(st, 1, {lg: ("Both", 4050.0) for lg in P08_ORDER}, live, c, Broker(), useProv=False)
+    check("AL24 useProvisionalAlert=false -> 0 Inside scans / 0 TradePlan / 0 Qty / 0 alert",
+          not f and (ps["insideScans"], ps["plans"], ps["qtys"]) == (0, 0, 0))
+    # AL14 / AL15 / AL16 provisional does not touch orders / ActivePos
+    st, br, ap = AlertState(), Broker(), new()
+    before = (list(br.orders), dict(ap))
+    prov_tick(st, 1, {lg: ("Both", 4050.0) for lg in P08_ORDER}, live, c, br)
+    check("AL14/AL15 provisional tick -> 0 orders, ActivePos unchanged", (list(br.orders), dict(ap)) == before and st.alerts)
+    # AL01 / trade parity with alerts ON vs OFF (dispatch outcome identical)
+    import random
+    rnd = random.Random(1010)
+    mism = 0
+    for _ in range(300):
+        cands = {lg: (rnd.choice(("Long", "Short", "Both")), round(rnd.uniform(4000, 4100), 1)) for lg in P08_ORDER if rnd.random() < 0.5}
+        lv = [Z(b, b + 5, rnd.choice((ST_SUP_, ST_RES_, ST_ACT, ST_BRK)), rnd.choice((1, 2, 3, 4)), tid=k)
+              for k, b in enumerate(sorted(rnd.uniform(3950, 4150) for _ in range(6)))]
+        outs = []
+        for on in (True, False):
+            st, br, ap = AlertState(), Broker(), new()
+            if on:
+                prov_tick(st, 1, cands, lv, c, br)
+            confirmed_bar(st, 1, cands, lv, c, br, ap, useConf=on)
+            outs.append((br.orders, ap))
+        mism += outs[0] != outs[1]
+    check("AL01/P09-parity alerts ON (prov + confirmed) vs OFF -> identical orders / ActivePos on 300 random bars", mism == 0, f"mismatch={mism}")
+    # AL22 BE activation adds no entry alert (BE section has no alert; mirror: run_be_sim emits none)
+    check("AL22 BE activation -> no entry alert (static: 0 alert() in Section 09)", "alert(" not in code_only(AH[AH.find("// 09. BREAK EVEN"):AH.find("// 10. PROVISIONAL ALERT")]))
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -3102,6 +3378,8 @@ if __name__ == "__main__":
     fixture_p08_behaviour()
     fixture_p09_static()
     fixture_p09_behaviour()
+    fixture_p10_static()
+    fixture_p10_behaviour()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
