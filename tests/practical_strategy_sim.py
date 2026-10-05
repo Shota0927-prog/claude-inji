@@ -3726,6 +3726,193 @@ def fixture_p11_behaviour():
           'export strengthIdx(string s) =>\n    s == "Very Strong" ? SR_VSTRONG : s == "Strong" ? SR_STRONG : s == "Medium" ? SR_MEDIUM : SR_WEAK' in ZEP)
 
 
+# ============================================================================
+# P12 : PracticalZoneStrategy_SHORT (production integration)
+# ============================================================================
+SH_PATH = os.path.join(ROOT, "PracticalZoneStrategy_SHORT.pine")
+SH = open(SH_PATH, encoding="utf-8").read() if os.path.exists(SH_PATH) else ""
+
+
+def short_spec_p10(t):
+    t = t.replace("strategy.entry(eid, dir > 0 ? strategy.long : strategy.short, qty = qty)", "strategy.entry(eid, strategy.short, qty = qty)")
+    t = t.replace('alert(f_entryAlertMsg("確定", logicId, dir, p, qty), alert.freq_all)', 'alert(f_entryAlertMsgShort("確定", logicId, p, qty), alert.freq_all)')
+    t = t.replace('alert(f_entryAlertMsg("仮", winLogic, winDir, win.plan, win.qty), alert.freq_once_per_bar)',
+                  'alert(f_entryAlertMsgShort("仮", winLogic, win.plan, win.qty), alert.freq_once_per_bar)')
+    t = t.replace("f_entryAlertMsg(string kind, string logicId, int dir, zn.TradePlan p, float qty) =>",
+                  "f_entryAlertMsgShort(string kind, string logicId, zn.TradePlan p, float qty) =>")
+    t = t.replace('"【" + kind + " " + (dir > 0 ? "LONG" : "SHORT") + "】" +', '"【" + kind + " SHORT】" +')
+    return t
+
+
+def fixture_p12_static():
+    check("P12 SHORT file exists", bool(SH))
+    if not SH:
+        return
+    sc = code_only(SH)
+    scs = "\n".join(_strip_str(l) for l in sc.split("\n"))
+    check("P12 imports: ZoneEnginePractical/3 as zn + SignalEnginePractical/1 as sg (exactly)",
+          re.findall(r"^import .*$", sc, re.M) == ["import sekine3310/ZoneEnginePractical/3 as zn",
+                                                  "import sekine3310/SignalEnginePractical/1 as sg"])
+    check("S01 strategy.long token = 0 (code and comments)", "strategy.long" not in SH)
+    check("S02 strategy.entry = strategy.short only (1 call site)",
+          re.findall(r"strategy\.entry\(([^)]*)\)", sc) == ["eid, strategy.short, qty = qty"])
+    check("S03 LONG alert literal / path = 0 (no \"LONG\" in code, only 【仮 SHORT】 / 【確定 SHORT】 helper)",
+          "LONG" not in sc and '"【" + kind + " SHORT】" +' in sc and "f_entryAlertMsgLong" not in sc
+          and "f_entryAlertMsg(" not in sc and sc.count("f_entryAlertMsgShort(") == 3)
+    check("S03b enableLong / enableShort constants = false / true (old Main Short baseline), not inputs",
+          "bool enableLong  = false" in sc and "bool enableShort = true" in sc and not re.search(r"^enable(Long|Short)\s*=\s*input", sc, re.M))
+    disp = code_only(SH[SH.find("// 08. DISPATCH"):SH.find("// 09. BREAK EVEN")])
+    calls = re.findall(r"e := f_tryEntry\(activePos, ds, (\w+), ([^,]+), (-?\d+), ([^,]+), globalPositionBlocked, enteredThisBar\)", disp)
+    exp = [("LOGIC_FVG15", "fvg15Sig.shortSignal", "fvg15Sig.entryPrice"), ("LOGIC_FVG", "fvgSig.shortSignal", "fvgSig.entryPrice"),
+           ("LOGIC_FVG_ABS15", "absSig.short15", "absSig.entryPrice"), ("LOGIC_FVG_ABS5", "absSig.short5", "absSig.entryPrice"),
+           ("LOGIC_ZONE_RB", "zlSig.reboundShort", "zlSig.entryPrice"), ("LOGIC_ZONE_FK", "zlSig.fakeShort", "zlSig.entryPrice"),
+           ("LOGIC_ZONE_RT", "zlSig.retestShort", "zlSig.entryPrice"), ("LOGIC_ZONE_BK", "zlSig.breakShort", "zlSig.entryPrice")]
+    check("S04 8 Short logics connected, every dispatch call dir = -1", len(calls) == 8 and all(c_[2] == "-1" for c_ in calls))
+    check("S05 dispatch priority FVG15 > FVG > ABS15 > ABS5 > RB > FK > RT > BK", [P08_CONST[c_[0]] for c_ in calls] == P08_ORDER)
+    check("S06 confirmed candidate / entryPrice = SignalEngine Short outputs", [(a, b, d) for a, b, _, d in calls] == exp, str(calls))
+    mcalls = code_only(MAIN[MAIN.find("// ---- 7.1 FVG15 Logic"):MAIN.find("// ---- 7.5 Future Logic")])
+    for lg_, sig_, px_ in exp:
+        check(f"S06 old Main Short call-site uses the same {lg_} field / entryPrice",
+              re.search(r"f_submitSignal\(" + lg_ + r", " + re.escape(sig_) + r"\b[^\n]*,\s+-1, " + re.escape(px_) + r"\)", mcalls) is not None)
+    pv = code_only(func_block(SH, "f_provPreviewShort"))
+    pv_terms = re.findall(r"\? ([\w\.]+)", pv) + re.findall(r": ([\w\.]+)\s*$", pv, re.M)
+    check("S07 Preview = SignalEngine Short preview outputs only, priority order",
+          pv_terms == ["provFvg15ShortRaw", "fvgSig.previewShort", "absSig.previewShort15", "absSig.previewShort5",
+                       "zlSig.pvReboundShort", "zlSig.pvFakeShort", "zlSig.pvRetestShort", "zlSig.pvBreakShort"]
+          and "[provFvg15LongRaw, provFvg15ShortRaw] = sg.fvg15Preview(fvg15Base, fvg15Sig)" in sc, str(pv_terms))
+    mprov = code_only(MAIN[MAIN.find("bool provFvgLongRaw"):MAIN.find("//  ---- Group Gate / 優先順位")])
+    check("S07 old Main Section 10 reads the same Short preview fields",
+          all(x in mprov for x in ("fvgSig.previewShort", "absSig.previewShort5", "absSig.previewShort15", "zlSig.pvReboundShort",
+                                   "zlSig.pvFakeShort", "zlSig.pvRetestShort", "zlSig.pvBreakShort", "provFvg15ShortRaw")))
+    sec10 = code_only(SH[SH.find("// 10. PROVISIONAL ALERT"):])
+    check("S07b provisional loop: Short previews, dir -1, winDir := -1, entry price close; priority list == dispatch",
+          "f_provEval(ps, f_provLogic(li), f_provPreviewShort(li), -1, close)" in sec10 and "winDir   := -1" in sec10
+          and "f_provPreviewLong" not in sc and not re.search(r"previewLong|pv\w+Long\b", sec10)
+          and [P08_CONST[x] for x in re.findall(r"(LOGIC_\w+)", code_only(func_block(SH, "f_provLogic")))] == P08_ORDER)
+    blocks = [code_only(b) for b in re.split(r"\n    // \d ", SH[SH.find("// 08. DISPATCH"):SH.find("// 09. BREAK EVEN")])]
+    def blk(lg_):
+        found = [b for b in blocks if f"f_tryEntry(activePos, ds, {lg_}," in b]
+        assert len(found) == 1, lg_
+        return found[0]
+    cons = {"LOGIC_FVG15": ["sg.consumeFvg15(fvg15Ord, -1)", "fvg15Eng.shortArmed := false"],
+            "LOGIC_FVG": ["fvgEng.shortArmed := false"],
+            "LOGIC_FVG_ABS15": ["sg.consumeFvgAbs(fvgAbsEng, 15)"], "LOGIC_FVG_ABS5": ["sg.consumeFvgAbs(fvgAbsEng, 5)"],
+            "LOGIC_ZONE_RB": ["sg.consumeZoneEvt(zoneEvtEng, 0)"], "LOGIC_ZONE_FK": ["sg.consumeZoneEvt(zoneEvtEng, 1)"],
+            "LOGIC_ZONE_RT": ["sg.consumeZoneEvt(zoneEvtEng, 2)"], "LOGIC_ZONE_BK": ["sg.consumeZoneEvt(zoneEvtEng, 3)"]}
+    labels = dict(zip(cons, ["S08", "S09", "S10", "S11", "S12", "S13", "S14", "S15"]))
+    for lg_, cs in cons.items():
+        b = blk(lg_)
+        under_e = all(re.search(r"\n\s*if e( and fvgSig\.noTriggerMode)?\n(.*\n)*?\s*" + re.escape(x), "\n" + b) for x in cs)
+        check(f"{labels[lg_]} {P08_CONST[lg_]} Short consume only inside `if e` (real entry)",
+              under_e and all(any(l.strip() == x for l in b.split("\n")) for x in cs))
+    mf15 = code_only(MAIN[MAIN.find('if fvg15EidShort != ""'):MAIN.find("// ---- 7.2 FVG Logic")])
+    check("S08 FVG15 Short consume == old Main 7.1 (consumeFvg15(fvg15Ord, -1) then noTriggerMode -> fvg15Eng.shortArmed := false)",
+          "sg.consumeFvg15(fvg15Ord, -1)" in mf15 and "if fvg15Base.noTriggerMode" in mf15 and "fvg15Eng.shortArmed := false" in mf15
+          and "if fvg15Base.noTriggerMode" in blk("LOGIC_FVG15"))
+    check("S09 FVG Short armed reset == old Main 7.2", 'if fvgSig.noTriggerMode and fvgEidShort != ""' in code_only(MAIN)
+          and "if e and fvgSig.noTriggerMode" in blk("LOGIC_FVG"))
+    check("S08-S15 no consume / armed write outside the dispatch; no Long-side consume / armed write",
+          sum(sc.count(x) for x in ("sg.consumeFvg15(", "sg.consumeFvgAbs(", "sg.consumeZoneEvt(", "longArmed :=", "shortArmed :=")) ==
+          sum(disp.count(x) for x in ("sg.consumeFvg15(", "sg.consumeFvgAbs(", "sg.consumeZoneEvt(", "longArmed :=", "shortArmed :=")) == 9
+          and "longArmed :=" not in sc and "consumeFvg15(fvg15Ord, 1)" not in sc)
+    # ---- shared parts identical to P11 ----
+    lc = code_only(LG)
+    def sect(src, a, b):
+        return code_only(src[src.find(a):src.find(b)])
+    check("S16/S17 Signal Engine section (inputs-driven config / feed / calls / Zone snapshot both sides / Min Strength) identical to P11",
+          sect(SH, "// 07. SIGNAL ENGINE", "// 08. DISPATCH") == sect(LG, "// 07. SIGNAL ENGINE", "// 08. DISPATCH")
+          and "if zsZ.strength >= zoneMinStrength and (zsZ.state == ST_SUPPORT or zsZ.state == ST_RESIST)" in sc)
+    SI = parse_inputs(SH)
+    check("S17 all inputs identical to P11 (Zone Signal Min Strength default Strong, alerts Provisional OFF / Confirmed ON)",
+          SI == parse_inputs(LG) and SI["zoneSignalMinStrStr"]["default"] == '"Strong"'
+          and SI["useProvisionalAlert"]["default"] == "false" and SI["useConfirmedAlert"]["default"] == "true")
+    check("S17b Zone block (Practical inputs / ZoneCfg / feed / zn.update) identical to P11",
+          sect(SH, "// 01-2. ZONE ENGINE INPUTS", "// 07. SIGNAL ENGINE").replace("f_entryAlertMsgShort", "X").replace('" SHORT】"', '"D"')
+          .replace("strategy.short", "S") ==
+          sect(LG, "// 01-2. ZONE ENGINE INPUTS", "// 07. SIGNAL ENGINE").replace("f_entryAlertMsgLong", "X").replace('" LONG】"', '"D"')
+          .replace("strategy.long", "S")
+          .replace("//  LONG 専用", "//  SHORT 専用"))
+    ro = code_only(func_block(SH, "f_recordZoneOrigin"))
+    check("S18 originTrackId = Short event zoneId (f_recordZoneOrigin identical to P11, before consume, 4 zone blocks only)",
+          ro == code_only(func_block(LG, "f_recordZoneOrigin")) != "" and sc.count("f_recordZoneOrigin(activePos") == 4
+          and all(blk(lg_).find("f_recordZoneOrigin(activePos, zoneEvtEng." + x + ")") >= 0 and
+                  blk(lg_).find("f_recordZoneOrigin") < blk(lg_).find("sg.consumeZoneEvt") for lg_, x in
+                  (("LOGIC_ZONE_RB", "sigRebound"), ("LOGIC_ZONE_FK", "sigFake"), ("LOGIC_ZONE_RT", "sigRetest"), ("LOGIC_ZONE_BK", "sigBreak"))))
+    check("S19 Touch Count lookup only at zone entry (1 zoneTouchCount site inside f_recordZoneOrigin)",
+          sc.count("zn.zoneTouchCount(") == 1 and "zn.zoneTouchCount(zoneEng, i)" in ro)
+    check("S20 FVG-family entries keep originTrackId / entryTouchCount = na",
+          "ap.originTrackId   := na" in code_only(func_block(SH, "f_tryEntry")) and
+          all("f_recordZoneOrigin" not in blk(lg_) for lg_ in ("LOGIC_FVG15", "LOGIC_FVG", "LOGIC_FVG_ABS15", "LOGIC_FVG_ABS5")))
+    # ---- trade engine / BE / alert parity ----
+    check("S21 Trade Engine (Section 05/06) == P10 with only the dir < 0 specialisation",
+          short_spec_p10(code_only(AH[AH.find("// 05. TRADE PLAN / RISK / QTY"):AH.find("// 07. PROBE CANDIDATES")])) ==
+          sect(SH, "// 05. TRADE PLAN / RISK / QTY", "// 07. SIGNAL ENGINE"))
+    for fn in ("f_tryEntry", "f_provEval", "f_insideAnyZone", "f_qty", "f_tpDepthFor", "f_breakEvenTriggerFor", "f_provSlot", "f_entryTag"):
+        check(f"S21 {fn} == P10 (Short specialisation only)",
+              code_only(func_block(SH, fn)) == short_spec_p10(code_only(func_block(AH, fn))) != "")
+    check("S22 BE section identical to P10 / P11 (Short reach: low <= fill - trigger / confirmed close <= fill - trigger)",
+          sect(SH, "// 09. BREAK EVEN", "// 10. PROVISIONAL ALERT") == sect(LG, "// 09. BREAK EVEN", "// 10. PROVISIONAL ALERT")
+          == code_only(AH[AH.find("// 09. BREAK EVEN"):AH.find("// 10. PROVISIONAL ALERT")])
+          and "(low <= ep - activePos.beTrigger)" in sc and "(barstate.isconfirmed and close <= ep - activePos.beTrigger)" in sc)
+    check("S22 ZONEBREAK Short BE trigger = zoneBreakEvenTrigger (compat branch only for dir > 0)",
+          "else if logicId == LOGIC_ZONE_BK and dir > 0 and breakLongRefCompat" in code_only(func_block(SH, "f_breakEvenTriggerFor"))
+          and be_trigger_for("ZONEBREAK", -1) == BE_TRIG["zoneBreakEvenTrigger"])
+    am = code_only(func_block(SH, "f_entryAlertMsgShort"))
+    check("S23 alert helper == P10 f_entryAlertMsg dir < 0 branch; confirmed freq_all / provisional freq_once_per_bar",
+          am == short_spec_p10(code_only(func_block(AH, "f_entryAlertMsg"))) and
+          'alert(f_entryAlertMsgShort("確定", logicId, p, qty), alert.freq_all)' in sc and
+          'alert(f_entryAlertMsgShort("仮", winLogic, win.plan, win.qty), alert.freq_once_per_bar)' in sc and sc.count("alert(") == 2)
+    p10p = short_spec_p10(code_only(AH[AH.find("varip int gProvLastBar"):AH.find("// ---- Flat 遷移検知用")])).split("\n")
+    s12p = code_only(SH[SH.find("varip int gProvLastBar"):SH.find("// ---- Flat 遷移検知用")]).split("\n")
+    p10_ = [l for l in p10p if not re.search(r"pfire|f_provDirMode|dm != |cnd|int    li |int    d   |for k = 0 to 15|winDir   := d|f_provOffset|ProvEval ev", l)]
+    s12_ = [l for l in s12p if not re.search(r"for li = 0 to 7|winDir   := -1|ProvEval ev", l)]
+    check("S23 provisional winner / provSent (16 slots) / per-bar guard identical to P10 (only candidate source + Short)",
+          p10_ == s12_ and "varip array<bool> gProvSent = array.new_bool(16, false)" in sc)
+    # ---- prohibited ----
+    bad = [t for t in ("tpManagementMode", "Dynamic", "gTradeTP", "gTradeSL", "gTradeBE", "f_isOpenEntry", "map.new", "map<",
+                       "label.new", "box.new", "table.new", "line.new", "plot(", "plotshape", "bgcolor(", "strategy.close(",
+                       "f_openCount", "ZONEBOS", "ZONESR", "DXY") if t in scs]
+    check("S24-S27 no Dynamic TP / trade map / drawing / plots / excluded logics", not bad, str(bad))
+    check("S26 no opentrades / closedtrades loop or per-trade accessor",
+          not re.search(r"for .*(opentrades|closedtrades)", sc) and not re.search(r"strategy\.(opentrades|closedtrades)\.\w+", sc))
+    check("P12 request audit == P11 (same call sites, same guards)",
+          re.findall(r"request\.(?:security_lower_tf|security)\(.*", sc) == re.findall(r"request\.(?:security_lower_tf|security)\(.*", lc))
+    check("P12 zn.update 1 / updateZoneEvents 1 / engine instances == P11",
+          all(sc.count(x) == lc.count(x) for x in ("zn.update(", "sg.updateZoneEvents(", "sg.newFvgEngine()", "sg.newFvg15Engine()",
+                                                    "sg.newFvgAbsEngine()", "sg.newZoneEvtEngine()", "sg.updateFvg(")))
+
+
+def fixture_p12_behaviour():
+    c = TCfg()
+    res = Z(4060, 4065, ST_RES_, strength=2, tid=21)      # Short SL zone (strength 2: SL only)
+    sup_far = Z(3990, 4000, ST_SUP_, tid=22)              # Short TP zone
+    live = [res, sup_far]
+    new = lambda: dict(entryId="", logicId="", dir=0, entryPrice=None, sl=None, tp=None, qty=None,
+                       originTrackId=None, entryTouchCount=None)
+    br, ap = Broker(), new()
+    ent, ds = dispatch({lg: ("Short", 4050.0) for lg in P08_ORDER}, live, c, br, ap)
+    ex = [o for o in br.orders if o[0] == "exit"]
+    check("S-D1 all 8 Short candidates -> FVG15_S only; SL = top + buffer (4070), structural TP below",
+          ent and [o[1] for o in br.orders if o[0] == "entry"] == ["FVG15_S"] and ex[0][3] == 4070.0 and ex[0][4] < 4050.0, str(ex))
+    br, ap = Broker(), new()
+    ent, ds = dispatch({"FVG15": ("Short", 4062.0), "FVG": ("Short", 4050.0)}, live, c, br, ap)
+    check("S-D2 FVG15 Short inside a zone -> FAIL (not consumed), FVG Short enters", [o[1] for o in br.orders if o[0] == "entry"] == ["FVG_S"])
+    e, c_, ap2 = p11_dispatch({lg: (True, 4050.0) for lg in P08_ORDER}, {lg: lg != "FVG15" for lg in P08_ORDER}, Broker(),
+                              dict(logicId="", dir=0, entryPrice=None, originTrackId=None, entryTouchCount=None))
+    check("S08-S15 mirror: consume only the real entry (FVG; FVG15 Plan FAIL not consumed)", e == "FVG" and c_ == ["FVG"])
+    # BE Short: fill 3999, trigger zone 20 -> low 3979 reaches
+    bars = [(4000.0, 4001.0, 3999.0, 4000.0), (3999.0, 3999.5, 3979.0, 3990.0), (3990.0, 3991.0, 3989.0, 3990.0)]
+    tr, lg_ = run_be_sim(bars, {0: ("ZONEBREAK", -1, 30.0, 3.0)})
+    check("S22 BE Short ZONEBREAK: trigger 20 (not breakLong 10), fill - 20 reached -> stop = fill 3999",
+          lg_[1]["ap"]["beTrigger"] == 20.0 and lg_[1]["beAct"] and lg_[1]["exit"] == ("ZBK_S", 3999.0, 4000.0 - 90.0, "BE", "TP"))
+    bars2 = [(4000.0, 4001.0, 3999.0, 4000.0), (3999.0, 3999.5, 3979.01, 3990.0)]
+    tr, lg_ = run_be_sim(bars2, {0: ("ZONEBREAK", -1, 30.0, 3.0)})
+    check("S22b BE Short 0.01 short of the threshold -> no BE", not lg_[1]["beAct"])
+    st = AlertState()
+    f, w, _ = prov_tick(st, 1, {lg: ("Short", 4050.0) for lg in P08_ORDER}, live, c, Broker())
+    check("S23 provisional Short: top-priority Entry-ready Short (FVG15, -1) only; slot = FVG15_S", f and w == ("FVG15", -1) and st.sent[prov_slot("FVG15", -1)])
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -3758,6 +3945,8 @@ if __name__ == "__main__":
     fixture_p10_behaviour()
     fixture_p11_static()
     fixture_p11_behaviour()
+    fixture_p12_static()
+    fixture_p12_behaviour()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
