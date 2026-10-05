@@ -3396,7 +3396,18 @@ def fixture_p10_behaviour():
 # P11 : PracticalZoneStrategy_LONG (production integration)
 # ============================================================================
 LG_PATH = os.path.join(ROOT, "PracticalZoneStrategy_LONG.pine")
-LG = open(LG_PATH, encoding="utf-8").read() if os.path.exists(LG_PATH) else ""
+
+
+def _git_rev_file(rev, path):
+    import subprocess
+    return subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{path}"], capture_output=True, text=True).stdout
+
+
+#  ★ P11 / P12 integration fixtures validate the integration-stage artifact (e3680f5 = P12 HEAD).
+#    The current files are tied to it by the P13A exact-transform fixture (current == p13a_transform(e3680f5)).
+P12_STAGE = "e3680f5"
+LG_CUR = open(LG_PATH, encoding="utf-8").read() if os.path.exists(LG_PATH) else ""
+LG = _git_rev_file(P12_STAGE, "PracticalZoneStrategy_LONG.pine") or LG_CUR
 
 
 def _strip_str(l):
@@ -3730,7 +3741,8 @@ def fixture_p11_behaviour():
 # P12 : PracticalZoneStrategy_SHORT (production integration)
 # ============================================================================
 SH_PATH = os.path.join(ROOT, "PracticalZoneStrategy_SHORT.pine")
-SH = open(SH_PATH, encoding="utf-8").read() if os.path.exists(SH_PATH) else ""
+SH_CUR = open(SH_PATH, encoding="utf-8").read() if os.path.exists(SH_PATH) else ""
+SH = _git_rev_file(P12_STAGE, "PracticalZoneStrategy_SHORT.pine") or SH_CUR   # P12 integration stage (see LG)
 
 
 def short_spec_p10(t):
@@ -3913,6 +3925,150 @@ def fixture_p12_behaviour():
     check("S23 provisional Short: top-priority Entry-ready Short (FVG15, -1) only; slot = FVG15_S", f and w == ("FVG15", -1) and st.sent[prov_slot("FVG15", -1)])
 
 
+# ============================================================================
+# P13A : zero-risk performance cleanup (LONG / SHORT production files)
+# ============================================================================
+P13A_DEAD = ["efvgDReason", "efvgDRem", "efvgDBos", "efvgHReason", "efvgHRem", "efvgHBos", "efvgOReason", "efvgORem",
+             "efvgOBos", "efvg5Reason", "efvg5Rem", "efvg1Reason", "efvg1Rem", "efvg1Bos", "efvgMRawReason", "efvgMRawRem"]
+
+
+def p13a_transform(src):
+    """The complete, documented P13A transformation (applied to the e3680f5 LONG / SHORT sources)."""
+    t = src
+
+    def R(a, b, n=1):
+        nonlocal t
+        assert t.count(a) == n, (a[:70], t.count(a))
+        t = t.replace(a, b)
+    # ---- A1 : input-only request configs -> var (initializer evaluated once, never mutated) ----
+    for ty, nm in (("FvgTrigCfg", "fvgTrigCfg"), ("FvgEnvCfg", "fvgEnvCfg"), ("FvgAccCfg", "fvgAccCfg")):
+        R(f"\nsg.{ty} {nm} = sg.{ty}.new(", f"\n//  ★ P13A: 全 field が input のみ・以後書き換えなし → var (初期化子は初回バーの1回だけ評価)。\nvar sg.{ty} {nm} = sg.{ty}.new(")
+    # ---- A2 : empty placeholders -> one shared read-only empty array ----
+    R("array<bool> fvgBullTrig = array.new_bool()\narray<bool> fvgBearTrig = array.new_bool()\n",
+      "//  ★ P13A: 毎バーの空配列確保をやめ、共有の空配列 (var・読み取り専用) を placeholder にする。\n"
+      "//    SignalEngine はこれらの配列を読むだけ (push / set / clear なし)。request 時は戻り値へ差し替える。\n"
+      "var array<bool> gEmptyBool = array.new_bool()\n"
+      "array<bool> fvgBullTrig = gEmptyBool\narray<bool> fvgBearTrig = gEmptyBool\n")
+    R("array<bool> absBos1m  = array.new_bool()\narray<bool> absBos1mS = array.new_bool()\n",
+      "array<bool> absBos1m  = gEmptyBool\narray<bool> absBos1mS = gEmptyBool\n")
+    # zone TF arrays: placeholder (lower TF = request result) / scratch push buffer (same or higher TF)
+    R("array<float> zbTfC    = array.new_float()\narray<float> zbTfH    = array.new_float()\narray<float> zbTfL    = array.new_float()\n"
+      "array<bool>  zbBullArr = array.new_bool()\narray<bool>  zbBearArr = array.new_bool()\n",
+      "//  ★ P13A: 判定TF < チャート足 → request の戻り値へ差し替える placeholder。\n"
+      "//    判定TF >= チャート足 → そのバーの1本を push する scratch。var バッファを毎バー clear して再利用する\n"
+      "//    (毎バー新規の空配列と同値。SignalEngine は読むだけで参照を保持しない)。\n"
+      "var array<float> zbBufC    = array.new_float()\nvar array<float> zbBufH    = array.new_float()\nvar array<float> zbBufL    = array.new_float()\n"
+      "var array<bool>  zbBufBull = array.new_bool()\nvar array<bool>  zbBufBear = array.new_bool()\n"
+      "array<float> zbTfC    = zbBufC\narray<float> zbTfH    = zbBufH\narray<float> zbTfL    = zbBufL\n"
+      "array<bool>  zbBullArr = zbBufBull\narray<bool>  zbBearArr = zbBufBear\n")
+    R("    else\n        [_zc2, _zh2, _zl2, _zbb, _zbs] = request.security(",
+      "    else\n        array.clear(zbBufC)\n        array.clear(zbBufH)\n        array.clear(zbBufL)\n"
+      "        array.clear(zbBufBull)\n        array.clear(zbBufBear)\n        [_zc2, _zh2, _zl2, _zbb, _zbs] = request.security(")
+    # ---- A3 : provisional slots 16 -> 8 (direction file: one slot per logic) ----
+    R("varip array<bool> gProvSent = array.new_bool(16, false)", "varip array<bool> gProvSent = array.new_bool(8, false)")
+    R("f_provSlot(string logicId, int dir) =>\n    int li = logicId == LOGIC_FVG ? 0 : logicId == LOGIC_FVG15 ? 1 :\n"
+      "         logicId == LOGIC_FVG_ABS5 ? 2 : logicId == LOGIC_FVG_ABS15 ? 3 :\n"
+      "         logicId == LOGIC_ZONE_RB ? 4 : logicId == LOGIC_ZONE_FK ? 5 :\n"
+      "         logicId == LOGIC_ZONE_RT ? 6 : logicId == LOGIC_ZONE_BK ? 7 : -1\n"
+      "    li < 0 ? -1 : li * 2 + (dir > 0 ? 0 : 1)",
+      "//  ★ P13A: 方向別ファイルなので slot は Logic ごとに1つ (8 slot)。旧 16 slot の\n"
+      "//    「この方向の slot」と1対1 (li * 2 + 方向 → li)。\n"
+      "f_provSlot(string logicId) =>\n    logicId == LOGIC_FVG ? 0 : logicId == LOGIC_FVG15 ? 1 :\n"
+      "     logicId == LOGIC_FVG_ABS5 ? 2 : logicId == LOGIC_FVG_ABS15 ? 3 :\n"
+      "     logicId == LOGIC_ZONE_RB ? 4 : logicId == LOGIC_ZONE_FK ? 5 :\n"
+      "     logicId == LOGIC_ZONE_RT ? 6 : logicId == LOGIC_ZONE_BK ? 7 : -1")
+    R("int pslot = f_provSlot(logicId, dir)", "int pslot = f_provSlot(logicId)")
+    R("int slot = f_provSlot(winLogic, winDir)", "int slot = f_provSlot(winLogic)")
+    # ---- A4 : dead scalars ----
+    for v in P13A_DEAD:
+        R(f"int {v} = 0\n", "")
+        t2 = re.sub(r"^    " + v + r" := \w+\n", "", t, count=1, flags=re.M)
+        assert t2 != t, v
+        t = t2
+    R("bool   provFiredNow  = false\nint    provWinPrio   = na\n", "")
+    R("        provWinPrio := f_logicPriority(winLogic)\n", "")
+    R("            provFiredNow := true\n", "")
+    R("float beLevel            = na\n", "")
+    R("    beLevel := activePos.dir > 0 ? ep + activePos.beTrigger : ep - activePos.beTrigger\n", "")
+    return t
+
+
+def _git_show(rev, path):
+    import subprocess
+    return subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{path}"], capture_output=True, text=True).stdout
+
+
+def fixture_p13a():
+    for name, cur in (("LONG", LG_CUR), ("SHORT", SH_CUR)):
+        prev = _git_show("e3680f5", f"PracticalZoneStrategy_{name}.pine")
+        check(f"P13A-{name} A6 file == p13a_transform(e3680f5) exactly (only the documented A1-A4 edits)",
+              bool(prev) and p13a_transform(prev) == cur)
+        pc, cc = code_only(prev), code_only(cur)
+        # A1
+        for nm in ("fvgTrigCfg", "fvgEnvCfg", "fvgAccCfg"):
+            blk = cc[cc.find(f" {nm} = sg."):]
+            blk = blk[blk.find(".new(") + 5:blk.find(")")]
+            args = re.findall(r"(\w+) = (\w+)", blk)
+            ins = parse_inputs(cur)
+            check(f"P13A-{name} A1 {nm}: var, every field = an input of the same name, never re-assigned",
+                  f"var sg." in cc and re.search(r"^var sg\.\w+ " + nm + r" = ", cc, re.M) is not None
+                  and args and all(a == b and b in ins for a, b in args) and not re.search(nm + r"\.\w+\s*:=", cc)
+                  and not re.search(r"\b" + nm + r"\s*:=", cc))
+        # A2
+        check(f"P13A-{name} A2 per-bar array.new removed: 9 -> 0 (shared read-only empty + 5 var zone buffers cleared per bar)",
+              len(re.findall(r"^array<\w+>\s+\w+\s*=\s*array\.new", pc, re.M)) == 9 and
+              len(re.findall(r"^array<\w+>\s+\w+\s*=\s*array\.new", cc, re.M)) == 0 and
+              cc.count("var array<bool> gEmptyBool = array.new_bool()") == 1 and len(re.findall(r"^var array<\w+>\s+zbBuf\w+", cc, re.M)) == 5)
+        check(f"P13A-{name} A2 request-returned arrays untouched (all := from request tuples kept)",
+              all(x in cc for x in ("fvgBullTrig := _bull", "fvgBearTrig := _bear", "absBos1m  := _a1b", "absBos1mS := _a1s",
+                                    "zbTfC     := _zc", "zbBullArr := _lb", "zbBearArr := _ls")))
+        check(f"P13A-{name} A2 shared empty array is never written (no push/set/clear on gEmptyBool)",
+              not re.search(r"array\.\w+\(gEmptyBool|gEmptyBool\.\w+\(", cc))
+        els = cc[cc.find("    else\n        array.clear(zbBufC)"):cc.find("int zoneJudgeTfSec")]
+        check(f"P13A-{name} A2 zone buffers cleared before the conditional push (same as a fresh empty array each bar)",
+              els.find("array.clear(zbBufBear)") < els.find("array.push(zbTfC") and els.count("array.clear(") == 5)
+        # A3
+        check(f"P13A-{name} A3 provisional slots 8, varip, re-arm only in the entry branch, set-true only in Section 10",
+              "varip array<bool> gProvSent = array.new_bool(8, false)" in cc and cc.count("array.set(gProvSent") == 2
+              and "array.set(gProvSent, pslot, false)" in code_only(func_block(cur, "f_tryEntry"))
+              and "array.set(gProvSent, slot, true)" in cc[cc.find("varip int gProvLastBar"):])
+        dsign = -1 if name == "SHORT" else 1
+        old_slot = lambda li: li * 2 + (0 if dsign > 0 else 1)
+        check(f"P13A-{name} A3 slot map is a bijection onto the old {name} slots (li -> li*2+{0 if dsign > 0 else 1})",
+              sorted(old_slot(li) for li in range(8)) == sorted(set(old_slot(li) for li in range(8))) and len({old_slot(li) for li in range(8)}) == 8)
+        # A4 / A5
+        check(f"P13A-{name} A4 dead scalars removed (16 debug efvg* + provFiredNow / provWinPrio / beLevel); used ones kept",
+              all(not re.search(r"\b" + v + r"\b", cc) for v in P13A_DEAD + ["provFiredNow", "provWinPrio", "beLevel"])
+              and all(re.search(r"\b" + v + r"\b", cc) for v in ("efvg5Bos", "efvgMRawBos", "fvg15RawReason", "fvg15RawRem", "fvg15RawBos")))
+        check(f"P13A-{name} A5 request call sites identical to e3680f5 (security 26 / lower_tf 5 sites; default 19 + 2)",
+              re.findall(r"request\.(?:security_lower_tf|security)\(.*", pc) == re.findall(r"request\.(?:security_lower_tf|security)\(.*", cc))
+        check(f"P13A-{name} shared Signal state untouched (Signal calls / snapshot / consume / dispatch identical)",
+              code_only(prev[prev.find("// ---- 7.3 Signal calls"):prev.find("// 09. BREAK EVEN")]) ==
+              code_only(cur[cur.find("// ---- 7.3 Signal calls"):cur.find("// 09. BREAK EVEN")]))
+    # A6 behavioural: 8-slot dedupe sequence == 16-slot (direction slots) on random event streams
+    import random
+    rnd = random.Random(1313)
+    mism = 0
+    for _ in range(500):
+        d = rnd.choice((1, -1))
+        s16, s8 = [False] * 16, [False] * 8
+        for _ in range(60):
+            li = rnd.randrange(8)
+            if rnd.random() < 0.6:          # provisional winner li
+                a = not s16[li * 2 + (0 if d > 0 else 1)]
+                b = not s8[li]
+                if a:
+                    s16[li * 2 + (0 if d > 0 else 1)] = True
+                if b:
+                    s8[li] = True
+                mism += a != b
+            else:                            # real entry of logic li -> re-arm
+                s16[li * 2 + (0 if d > 0 else 1)] = False
+                s8[li] = False
+            mism += [s16[i * 2 + (0 if d > 0 else 1)] for i in range(8)] != s8
+    check("P13A A6 provisional dedupe: 8-slot series == 16-slot direction slots (500 random streams, send / re-arm)", mism == 0)
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -3947,6 +4103,7 @@ if __name__ == "__main__":
     fixture_p11_behaviour()
     fixture_p12_static()
     fixture_p12_behaviour()
+    fixture_p13a()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
