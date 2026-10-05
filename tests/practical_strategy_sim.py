@@ -3392,6 +3392,283 @@ def fixture_p10_behaviour():
     check("AL22 BE activation -> no entry alert (static: 0 alert() in Section 09)", "alert(" not in code_only(AH[AH.find("// 09. BREAK EVEN"):AH.find("// 10. PROVISIONAL ALERT")]))
 
 
+# ============================================================================
+# P11 : PracticalZoneStrategy_LONG (production integration)
+# ============================================================================
+LG_PATH = os.path.join(ROOT, "PracticalZoneStrategy_LONG.pine")
+LG = open(LG_PATH, encoding="utf-8").read() if os.path.exists(LG_PATH) else ""
+
+
+def _strip_str(l):
+    return re.sub(r'"[^"]*"', '""', l)
+
+
+def fixture_p11_static():
+    check("P11 LONG file exists", bool(LG))
+    if not LG:
+        return
+    lc = code_only(LG)
+    lcs = "\n".join(_strip_str(l) for l in lc.split("\n"))
+    check("P11 imports: ZoneEnginePractical/3 as zn + SignalEnginePractical/1 as sg (exactly)",
+          re.findall(r"^import .*$", lc, re.M) == ["import sekine3310/ZoneEnginePractical/3 as zn",
+                                                  "import sekine3310/SignalEnginePractical/1 as sg"])
+    # ---- direction ----
+    disp = code_only(LG[LG.find("// 08. DISPATCH"):LG.find("// 09. BREAK EVEN")])
+    calls = re.findall(r"e := f_tryEntry\(activePos, ds, (\w+), ([^,]+), (-?\d+), ([^,]+), globalPositionBlocked, enteredThisBar\)", disp)
+    check("L01 every dispatch call is dir = 1 (strategy.entry Short unreachable; strategy.short only inside the unchanged P10 f_tryEntry)",
+          len(calls) == 8 and all(c_[2] == "1" for c_ in calls) and lcs.count("strategy.short") == 1
+          and "strategy.short" in code_only(func_block(LG, "f_tryEntry")))
+    sec10 = code_only(LG[LG.find("// 10. PROVISIONAL ALERT"):])
+    check("L02 confirmed alert reachable only via dir = 1 entries (f_tryEntry is the only confirmed alert site)",
+          lcs.count("alert(") == 2 and code_only(func_block(LG, "f_tryEntry")).count("alert(") == 1)
+    check("L03 provisional: Long previews only (winDir := 1, entry dir 1, no Short preview used)",
+          "winDir   := 1" in sec10 and "f_provEval(ps, f_provLogic(li), f_provPreviewLong(li), 1, close)" in sec10
+          and not re.search(r"previewShort|pv\w+Short|provFvg15ShortRaw\b(?!\])", sec10.replace("[provFvg15LongRaw, provFvg15ShortRaw]", "")))
+    check("L03b enableLong / enableShort are constants true / false (old Main defaults), not inputs",
+          "bool enableLong  = true" in lc and "bool enableShort = false" in lc and not re.search(r"^enable(Long|Short)\s*=\s*input", lc, re.M))
+    check("L04 probe inputs / helpers fully removed",
+          not re.search(r"G_PROBE|probeEvery|\bc[1-8](On|Dr|Of)\b|f_provOn|f_provDirMode|f_provOffset", lc))
+    # ---- candidate / preview mapping ----
+    exp = [("LOGIC_FVG15", "fvg15Sig.longSignal", "fvg15Sig.entryPrice"), ("LOGIC_FVG", "fvgSig.longSignal", "fvgSig.entryPrice"),
+           ("LOGIC_FVG_ABS15", "absSig.long15", "absSig.entryPrice"), ("LOGIC_FVG_ABS5", "absSig.long5", "absSig.entryPrice"),
+           ("LOGIC_ZONE_RB", "zlSig.reboundLong", "zlSig.entryPrice"), ("LOGIC_ZONE_FK", "zlSig.fakeLong", "zlSig.entryPrice"),
+           ("LOGIC_ZONE_RT", "zlSig.retestLong", "zlSig.entryPrice"), ("LOGIC_ZONE_BK", "zlSig.breakLong", "zlSig.entryPrice")]
+    check("L05/L08 8 logics connected; confirmed candidate = SignalEngine output, entryPrice = that signal's entryPrice "
+          "(old Main 7.1-7.4 call-sites)", [(a, b, d) for a, b, _, d in calls] == exp, str(calls))
+    check("L06 dispatch priority FVG15 > FVG > ABS15 > ABS5 > RB > FK > RT > BK",
+          [P08_CONST[c_[0]] for c_ in calls] == P08_ORDER)
+    mcalls = code_only(MAIN[MAIN.find("// ---- 7.1 FVG15 Logic"):MAIN.find("// ---- 7.5 Future Logic")])
+    for lg_, sig_, px_ in exp:
+        check(f"L08 old Main uses the same {lg_} Long signal / entryPrice",
+              re.search(r"f_submitSignal\(" + lg_ + r", " + re.escape(sig_) + r"\b[^\n]*,\s+1, " + re.escape(px_) + r"\)", mcalls) is not None)
+    pv = code_only(func_block(LG, "f_provPreviewLong"))
+    pv_terms = re.findall(r"\? ([\w\.]+)", pv) + re.findall(r": ([\w\.]+)\s*$", pv, re.M)
+    check("L07 Preview = SignalEngine Preview outputs only, priority order (fvg15Preview / previewLong / previewLong15 / "
+          "previewLong5 / pvReboundLong / pvFakeLong / pvRetestLong / pvBreakLong)",
+          pv_terms == ["provFvg15LongRaw", "fvgSig.previewLong", "absSig.previewLong15", "absSig.previewLong5",
+                       "zlSig.pvReboundLong", "zlSig.pvFakeLong", "zlSig.pvRetestLong", "zlSig.pvBreakLong"]
+          and "[provFvg15LongRaw, provFvg15ShortRaw] = sg.fvg15Preview(fvg15Base, fvg15Sig)" in lc
+          and "[provFvg15LongRaw, provFvg15ShortRaw] = sg.fvg15Preview(fvg15Base, fvg15Sig)" in code_only(MAIN), str(pv_terms))
+    mprov = code_only(MAIN[MAIN.find("bool provFvgLongRaw"):MAIN.find("//  ---- Group Gate / 優先順位")])
+    check("L07 old Main Section 10 reads the same Preview fields",
+          all(x in mprov for x in ("fvgSig.previewLong", "absSig.previewLong5", "absSig.previewLong15", "zlSig.pvReboundLong",
+                                   "zlSig.pvFakeLong", "zlSig.pvRetestLong", "zlSig.pvBreakLong")))
+    pl = code_only(func_block(LG, "f_provLogic"))
+    check("L07 provisional priority list == dispatch order", [P08_CONST[x] for x in re.findall(r"(LOGIC_\w+)", pl)] == P08_ORDER)
+    check("P11 provisional entry price = close (old Main f_canEnter(logicId, dir, close))",
+          "f_provWouldEnter" in MAIN and "r := f_canEnter(logicId, dir, close)" in code_only(MAIN))
+    # ---- consume ----
+    blocks = [code_only(b) for b in re.split(r"\n    // \d ", LG[LG.find("// 08. DISPATCH"):LG.find("// 09. BREAK EVEN")])]
+    def blk(lg_):
+        found = [b for b in blocks if f"f_tryEntry(activePos, ds, {lg_}," in b]
+        assert len(found) == 1, lg_
+        return found[0]
+    cons = {"LOGIC_FVG15": ["sg.consumeFvg15(fvg15Ord, 1)", "fvg15Eng.longArmed := false"],
+            "LOGIC_FVG": ["fvgEng.longArmed := false"],
+            "LOGIC_FVG_ABS15": ["sg.consumeFvgAbs(fvgAbsEng, 15)"], "LOGIC_FVG_ABS5": ["sg.consumeFvgAbs(fvgAbsEng, 5)"],
+            "LOGIC_ZONE_RB": ["sg.consumeZoneEvt(zoneEvtEng, 0)"], "LOGIC_ZONE_FK": ["sg.consumeZoneEvt(zoneEvtEng, 1)"],
+            "LOGIC_ZONE_RT": ["sg.consumeZoneEvt(zoneEvtEng, 2)"], "LOGIC_ZONE_BK": ["sg.consumeZoneEvt(zoneEvtEng, 3)"]}
+    labels = dict(zip(cons, ["L10", "L09", "L11", "L12", "L13", "L14", "L15", "L16"]))
+    for lg_, cs in cons.items():
+        b = blk(lg_)
+        lines_ = [l for l in b.split("\n") if l.strip()]
+        guard_ok = all(any(l.strip() == x for l in lines_) for x in cs)
+        under_e = all(re.search(r"\n\s*if e( and fvgSig\.noTriggerMode)?\n(.*\n)*?\s*" + re.escape(x), "\n" + b) for x in cs)
+        check(f"{labels[lg_]} {P08_CONST[lg_]} consume only inside `if e` (real entry) right after its f_tryEntry",
+              guard_ok and under_e and all(lc.count(x) == 1 for x in cs if "consume" in x))
+    mf15 = code_only(MAIN[MAIN.find("if fvg15EidLong != \"\""):MAIN.find("if fvg15EidShort != \"\"")])
+    check("L10 FVG15 consume == old Main 7.1 (consumeFvg15(fvg15Ord, 1) then noTriggerMode -> fvg15Eng.longArmed := false)",
+          "sg.consumeFvg15(fvg15Ord, 1)" in mf15 and "if fvg15Base.noTriggerMode" in mf15 and "fvg15Eng.longArmed := false" in mf15
+          and "if fvg15Base.noTriggerMode" in blk("LOGIC_FVG15"))
+    check("L09 FVG armed reset == old Main 7.2 (noTriggerMode and entered -> fvgEng.longArmed := false)",
+          'if fvgSig.noTriggerMode and fvgEidLong != ""' in code_only(MAIN) and "if e and fvgSig.noTriggerMode" in blk("LOGIC_FVG"))
+    check("L09-L16 no consume / armed write anywhere outside the dispatch",
+          sum(lc.count(x) for x in ("sg.consumeFvg15(", "sg.consumeFvgAbs(", "sg.consumeZoneEvt(", "longArmed :=", "shortArmed :=")) ==
+          sum(disp.count(x) for x in ("sg.consumeFvg15(", "sg.consumeFvgAbs(", "sg.consumeZoneEvt(", "longArmed :=", "shortArmed :=")) == 9)
+    # ---- zone snapshot ----
+    snap = code_only(LG[LG.find("int zoneMinStrength = zn.strengthIdx(zoneSignalMinStrStr)"):LG.find("//  各Zone Logicの保有状況。")])
+    check("L17 snapshot: SUPPORT (+1) and RESISTANCE (-1), strength >= Min Strength, zoneId = Practical trackId, 6 fields copied",
+          "if zsZ.strength >= zoneMinStrength and (zsZ.state == ST_SUPPORT or zsZ.state == ST_RESIST)" in snap
+          and "array.push(zSnapSide,  zsZ.state == ST_SUPPORT ? 1 : -1)" in snap and "array.push(zSnapId,    zsZ.trackId)" in snap
+          and all(f"array.push({a}" in snap for a in ("zSnapTop,   zsZ.top", "zSnapBot,   zsZ.bottom", "zSnapStr,   zsZ.strength", "zSnapScore, zsZ.score")))
+    check("L17 snapshot arrays: var + array.clear (6), no per-bar array.new for the snapshot",
+          snap.count("array.clear(") == 6 and len(re.findall(r"^var array<\w+>\s+zSnap\w+\s*=", snap, re.M)) == 6)
+    check("L17 ST_SUPPORT / ST_RESIST == ZoneEnginePractical (1 / 2)",
+          "int ST_SUPPORT = 1" in lc and "int ST_RESIST  = 2" in lc and "int ST_SUPPORT = 1" in ZEP and "int ST_RESIST  = 2" in ZEP)
+    LI = parse_inputs(LG)
+    ms = LI.get("zoneSignalMinStrStr", {})
+    check("L18 Zone Signal Min Strength input: default Strong, title 'Zone Signal · Min Strength'",
+          ms.get("default") == '"Strong"' and ms.get("title") == '"Zone Signal · Min Strength"', str(ms))
+    check("L19/L20 options Weak / Medium / Strong / Very Strong -> zn.strengthIdx (Medium / Very Strong selectable, not fixed)",
+          ms.get("options") == '["Weak", "Medium", "Strong", "Very Strong"]' and "zoneBosMinStrStr" not in lc
+          and 'export strengthIdx(string s) =>' in ZEP)
+    # ---- origin / touch ----
+    ro = code_only(func_block(LG, "f_recordZoneOrigin"))
+    check("L21 originTrackId = SignalEngine event zoneId at the signal index (sigRebound / sigFake / sigRetest / sigBreak)",
+          "origin := array.get(zoneEvtEng.evts, evIdx).zoneId" in ro and
+          all(f"f_recordZoneOrigin(activePos, zoneEvtEng.{x})" in blk(lg_) for lg_, x in
+              (("LOGIC_ZONE_RB", "sigRebound"), ("LOGIC_ZONE_FK", "sigFake"), ("LOGIC_ZONE_RT", "sigRetest"), ("LOGIC_ZONE_BK", "sigBreak"))))
+    check("L21b origin recorded BEFORE consume in each zone block",
+          all(blk(lg_).find("f_recordZoneOrigin") < blk(lg_).find("sg.consumeZoneEvt") for lg_ in
+              ("LOGIC_ZONE_RB", "LOGIC_ZONE_FK", "LOGIC_ZONE_RT", "LOGIC_ZONE_BK")))
+    check("L22 Touch Count lookup only in f_recordZoneOrigin, called only inside the 4 zone `if e` blocks (no per-bar search)",
+          lc.count("zn.zoneTouchCount(") == 1 and "zn.zoneTouchCount(zoneEng, i)" in ro and lc.count("f_recordZoneOrigin(activePos") == 4
+          and all(lc.find(x) > lc.find("// 08. DISPATCH") for x in ("f_recordZoneOrigin(activePos",)))
+    check("L23 FVG-family entries keep originTrackId / entryTouchCount = na (f_tryEntry writes na; no origin call)",
+          "ap.originTrackId   := na" in code_only(func_block(LG, "f_tryEntry")) and
+          all("f_recordZoneOrigin" not in blk(lg_) for lg_ in ("LOGIC_FVG15", "LOGIC_FVG", "LOGIC_FVG_ABS15", "LOGIC_FVG_ABS5")))
+    # ---- engine counts ----
+    check("L24 zn.update = 1 / bar, one ZoneEngine", len(re.findall(r"\bzn\.update\(", lc)) == 1 and len(re.findall(r"zn\.newEngine\(", lc)) == 1)
+    check("L25 updateZoneEvents = 1 call, only under useZoneAny",
+          lc.count("sg.updateZoneEvents(") == 1 and re.search(r"if useZoneAny\n    zlSig := sg\.updateZoneEvents\(", lc) is not None)
+    check("P11 engine instances: FvgEngine x2 (FVG / FVG15 base), Fvg15Engine, FvgAbsEngine, ZoneEvtEngine (all var)",
+          lc.count("sg.newFvgEngine()") == 2 and lc.count("sg.newFvg15Engine()") == 1 and lc.count("sg.newFvgAbsEngine()") == 1
+          and lc.count("sg.newZoneEvtEngine()") == 1 and len(re.findall(r"^var sg\.(FvgEngine|Fvg15Engine|FvgAbsEngine|ZoneEvtEngine)\s", lc, re.M)) == 5)
+    check("P11 updateFvg: base every bar + FVG15 2nd call only under useFvg15Logic (not merged); updateFvg15 / updateFvgAbs gated",
+          lc.count("sg.updateFvg(") == 2 and re.search(r"^sg\.FvgSignal fvgSig = sg\.updateFvg\(", lc, re.M) is not None
+          and re.search(r"if useFvg15Logic\n    fvg15Base := sg\.updateFvg\(", lc) is not None
+          and re.search(r"if absAnyOn\n    absSig := sg\.updateFvgAbs\(", lc) is not None)
+    # ---- verbatim ports of old Main ----
+    def same_block(a, b):
+        return code_only(MAIN[MAIN.find(a):MAIN.find(b)]) == code_only(LG[LG.find(a):LG.find(b)])
+    check("P11 old Main 6.1-6.3 (updateFvg / FVG15 / FVGABS env + update) ported verbatim",
+          same_block("// ---- 6.1 FVG Logic", "// ---- 6.4 Zone 4-Logic"))
+    check("P11 old Main zone vol / ZoneTfEnvCfg x8 block ported verbatim (except var)",
+          code_only(MAIN[MAIN.find("//  ---- Zone系専用 高速ボラ"):MAIN.find("sg.ZoneEnvFeed zoneEnvFeed")]) ==
+          code_only(LG[LG.find("//  ---- Zone系専用 高速ボラ"):LG.find("sg.ZoneEnvFeed zoneEnvFeed")]))
+    mt = code_only(MAIN[MAIN.find("sg.ZoneTfEnvCfg zcRbL"):MAIN.find("sg.ZoneLogicSignal zlSig")])
+    lt = code_only(LG[LG.find("var sg.ZoneTfEnvCfg zcRbL"):LG.find("sg.ZoneLogicSignal zlSig")])
+    check("P11 ZoneTfEnvCfg x8 / ZoneEnvSet identical to old Main (var only)", re.sub(r"^var ", "", lt, flags=re.M) == mt)
+    check("P11 updateZoneEvents call arguments identical to old Main",
+          code_only(MAIN[MAIN.find("sg.ZoneLogicSignal zlSig"):MAIN.find("// ============================================================================\n// 07. ORDER")]).strip() ==
+          code_only(LG[LG.find("sg.ZoneLogicSignal zlSig"):LG.find("// ============================================================================\n// 08. DISPATCH")]).strip())
+    feedm = code_only(MAIN[MAIN.find("// ---- 3.3 Signal Engine Feed (FVG)"):MAIN.find("sg.FvgFeed fvgFeed = sg.FvgFeed.new(")])
+    feedl = code_only(LG[LG.find("// ---- 3.3 Signal Engine Feed (FVG)"):LG.find("sg.FvgFeed fvgFeed = sg.FvgFeed.new(")])
+    check("P11 Signal Feed requests (trigger / ATR / env / FVG env / FVG15 / ABS / 1M BOS / zone TF / break / daily / accum) verbatim",
+          feedm == feedl and feedm.count("request.") == 23)
+    check("P11 Session / News filter + Accum zone-centre collection verbatim",
+          code_only(MAIN[MAIN.find("// ---- 3.1 共通フィルタ"):MAIN.find("// ---- 3.2 Zone Engine Feed")]) ==
+          code_only(LG[LG.find("// ---- 3.1 共通フィルタ"):LG.find("// ---- 3.2b Accum内")]) and
+          code_only(MAIN[MAIN.find("// ---- 3.2b Accum内"):MAIN.find("// ---- 3.3 Signal Engine Feed")]) ==
+          code_only(LG[LG.find("// ---- 3.2b Accum内"):LG.find("// ---- 3.3 Signal Engine Feed")]))
+    E24 = "// ---- 2.4 Signal Engine Config (FVG15 Logic)"
+    m_cfg = {l.strip() for l in code_only(MAIN[MAIN.find("sg.FvgCfg fvgCfg = sg.newFvgCfg()"):MAIN.find(E24)]).split("\n") if l.strip().startswith("fvgCfg.")}
+    l_cfg = {l.strip() for l in code_only(LG[LG.find("var sg.FvgCfg fvgCfg"):LG.find(E24)]).split("\n") if l.strip().startswith("fvgCfg.")}
+    check("P11 FvgCfg assignments == old Main minus minScore* (field removed in P01), set once at barstate.isfirst",
+          l_cfg == {x for x in m_cfg if not x.startswith("fvgCfg.minScore")} and len(l_cfg) == 63)
+    m15 = [l.strip() for l in code_only(MAIN[MAIN.find("sg.FvgCfg fvg15Cfg"):MAIN.find("// 03. EXTERNAL DATA FEED")]).split("\n") if l.strip().startswith("fvg15Cfg.")]
+    l15 = [l.strip() for l in code_only(LG[LG.find("    fvg15Cfg := fvgCfg.copy()"):LG.find("// 03. EXTERNAL DATA FEED")]).split("\n") if l.strip().startswith("fvg15Cfg.")]
+    check("P11 fvg15Cfg = fvgCfg.copy() + same 8 overrides (once)", m15 == l15 and len(l15) == 8)
+    for t in ("FvgTrigCfg fvgTrigCfg", "FvgEnvCfg fvgEnvCfg", "FvgAccCfg fvgAccCfg"):
+        mm = code_only(MAIN[MAIN.find("sg." + t):MAIN.find(")", MAIN.find("sg." + t)) + 1])
+        ll = code_only(LG[LG.find("sg." + t):LG.find(")", LG.find("sg." + t)) + 1])
+        check(f"P11 {t.split()[0]} (passed into request) built per bar exactly as old Main (not via var)", mm == ll and "var sg." + t not in lc)
+    mz = sorted(l.strip() for l in code_only(MAIN[MAIN.find("sg.ZoneCommonCfg zoneCmnCfg"):MAIN.find("//  ---- Zone系専用 高速ボラ")]).split("\n") if l.strip().startswith("zoneCmnCfg."))
+    lz = sorted(l.strip() for l in code_only(LG[LG.find("var sg.ZoneCommonCfg zoneCmnCfg"):LG.find("//  ---- Zone系専用 高速ボラ")]).split("\n") if l.strip().startswith("zoneCmnCfg."))
+    check("P11 ZoneCommonCfg assignments == old Main (incl. Zone Logic breakBuffer = zoneBreakBuffer, separate from Practical breakBuffer)",
+          mz == lz and "zoneCmnCfg.breakBuffer         := zoneBreakBuffer" in lz)
+    # ---- inputs ----
+    MI_ = parse_inputs(MAIN)
+    names = [n for n in parse_inputs(MAIN[MAIN.find("// 01-1. COMMON INPUTS"):MAIN.find("// 01-2. ZONE ENGINE INPUTS")])]
+    names += [n for n in parse_inputs(MAIN[MAIN.find("// 01-3. SIGNAL ENGINE INPUTS"):MAIN.find("// 01-4. TRADE ENGINE INPUTS")])]
+    names = [n for n in names if n not in ("enableLong", "enableShort", "zoneBosMinStrStr")]
+    diff = [n for n in names if LI.get(n) != MI_.get(n)]
+    check("P11 Signal inputs == old Main (name / type / default / title / group / options / min / max / step)",
+          not diff and len(names) > 250, f"{len(names)} inputs" if not diff else str(diff))
+    check("P11 defaults kept: ZONEFAKE OFF / ZONERETEST OFF / Provisional OFF / Confirmed ON / Zone Logic Break Buffer 3",
+          LI["useZoneFake"]["default"] == "false" and LI["useZoneRetest"]["default"] == "false"
+          and LI["useProvisionalAlert"]["default"] == "false" and LI["useConfirmedAlert"]["default"] == "true"
+          and LI["zoneBreakBuffer"]["default"] == "3.0")
+    # ---- P10 control parity ----
+    for a, b in (("// 05. TRADE PLAN / RISK / QTY", "// 07. PROBE CANDIDATES"), ("// 09. BREAK EVEN", "// 10. PROVISIONAL ALERT")):
+        bb = "// 07. SIGNAL ENGINE" if "PROBE" in b else b
+        check(f"P11 P10 control block '{a[3:]}' identical (code)",
+              code_only(AH[AH.find(a):AH.find(b)]) == code_only(LG[LG.find(a):LG.find(bb)]))
+    for fn in ("f_tryEntry", "f_provEval", "f_insideAnyZone", "f_qty", "f_tpDepthFor", "f_breakEvenTriggerFor", "f_entryAlertMsg", "f_provSlot"):
+        check(f"P11 {fn} identical to P10", code_only(func_block(LG, fn)) == code_only(func_block(AH, fn)) != "")
+    p10p = code_only(AH[AH.find("varip int gProvLastBar"):AH.find("// ---- Flat 遷移検知用")]).split("\n")
+    l11p = code_only(LG[LG.find("varip int gProvLastBar"):LG.find("// ---- Flat 遷移検知用")]).split("\n")
+    p10_ = [l for l in p10p if not re.search(r"pfire|f_provDirMode|dm != |cnd|int    li |int    d   |for k = 0 to 15|winDir   := d|f_provOffset|ProvEval ev", l)]
+    l11_ = [l for l in l11p if not re.search(r"for li = 0 to 7|winDir   := 1|ProvEval ev", l)]
+    check("P11 provisional winner / provSent / per-bar guard / alert identical to P10 (only candidate source changed)", p10_ == l11_)
+    check("P11 Zone block (inputs / ZoneCfg / Feed / zn.update) identical to P10",
+          code_only(AH[AH.find("// 01-2. ZONE ENGINE INPUTS"):AH.find("// 04. TRADE PLAN / RISK / QTY INPUTS")]) ==
+          code_only(LG[LG.find("// 01-2. ZONE ENGINE INPUTS"):LG.find("// 01-1. COMMON INPUTS (Signal)")]).rstrip("\n") + "\n" or
+          code_only(AH[AH.find("// 01-2. ZONE ENGINE INPUTS"):AH.find("// 04. TRADE PLAN / RISK / QTY INPUTS")]).strip() ==
+          code_only(LG[LG.find("// 01-2. ZONE ENGINE INPUTS"):LG.find("// 01-1. COMMON INPUTS (Signal)")]).strip().rsplit("\n", 1)[0].strip()
+          or code_only(AH[AH.find("// 01-2. ZONE ENGINE INPUTS"):AH.find("// 04. TRADE PLAN / RISK / QTY INPUTS")]).strip() in code_only(LG))
+    check("P11 16 provisional slots kept (P10 f_provSlot unchanged; 8-slot reduction deferred to P13)",
+          "varip array<bool> gProvSent = array.new_bool(16, false)" in lc)
+    # ---- prohibited ----
+    bad = [t for t in ("tpManagementMode", "Dynamic", "gTradeTP", "gTradeSL", "gTradeBE", "f_isOpenEntry", "map.new", "map<",
+                       "label.new", "box.new", "table.new", "line.new", "plot(", "plotshape", "bgcolor(", "strategy.close(",
+                       "f_openCount", "ZONEBOS", "ZONESR", "DXY") if t in lcs]
+    check("L26-L29 no Dynamic TP / map trade mgmt / drawing / plots / old per-logic open loops / excluded logics", not bad, str(bad))
+    check("L28 no opentrades / closedtrades loop or per-trade accessor",
+          not re.search(r"for .*(opentrades|closedtrades)", lc) and not re.search(r"strategy\.(opentrades|closedtrades)\.\w+", lc))
+    # ---- request audit (default inputs) ----
+    req = re.findall(r"request\.(security_lower_tf|security)\(", lc)
+    check("P11 request call sites: Zone 8 + Signal 23 (= P10 Zone block + old Main Section 03 verbatim)",
+          len(req) == 31 and code_only(B_ZONE_SECTION(LG)).count("request.") == 8, str(len(req)))
+
+
+def B_ZONE_SECTION(src):
+    return src[src.find("// 01-2. ZONE ENGINE INPUTS"):src.find("// 01-1. COMMON INPUTS (Signal)")]
+
+
+# ---- Python mirror : production dispatch + consume + origin / touch -------------
+def p11_dispatch(sigs, live_ok, br, ap, zone_evts=None, zone_sig=None, live_zones=None, **kw):
+    """sigs: {logic: (signal, entryPrice)}; live_ok: {logic: bool} = would pass Inside/Plan/TP/Qty.
+    Returns (entered_logic, consumed list, ap)."""
+    blocked = br.position_size != 0 or br.opentrades > 0
+    entered, consumed = None, []
+    for lg in P08_ORDER:
+        sig, px = sigs.get(lg, (False, None))
+        ok = sig and kw.get("isGold", True) and not blocked and entered is None and live_ok.get(lg, False)
+        if ok:
+            entered = lg
+            ap.update(logicId=lg, dir=1, entryPrice=px, originTrackId=None, entryTouchCount=None)
+            if lg in ("ZONEREBOUND", "ZONEFAKE", "ZONERETEST", "ZONEBREAK"):
+                idx = zone_sig.get(lg, -1)
+                origin = zone_evts[idx]["zoneId"] if 0 <= idx < len(zone_evts) else None
+                touch = next((z["touch"] for z in live_zones if z["trackId"] == origin), None) if origin is not None else None
+                ap.update(originTrackId=origin, entryTouchCount=touch)
+            consumed.append(lg)
+    return entered, consumed, ap
+
+
+def fixture_p11_behaviour():
+    new = lambda: dict(logicId="", dir=0, entryPrice=None, originTrackId=None, entryTouchCount=None)
+    allsig = {lg: (True, 4000.0 + i) for i, lg in enumerate(P08_ORDER)}
+    e, c_, ap = p11_dispatch(allsig, {lg: True for lg in P08_ORDER}, Broker(), new())
+    check("P11-D1 all 8 Long signals + all Entry-ready -> FVG15 only, consume only FVG15", e == "FVG15" and c_ == ["FVG15"])
+    e, c_, ap = p11_dispatch(allsig, {lg: lg not in ("FVG15", "FVG") for lg in P08_ORDER}, Broker(), new())
+    check("P11-D2 FVG15 / FVG signal true but TradePlan FAIL -> ABS15 enters; FVG15 / FVG NOT consumed", e == "FVGABS15" and c_ == ["FVGABS15"])
+    e, c_, ap = p11_dispatch(allsig, {lg: True for lg in P08_ORDER}, Broker(position_size=1.0, opentrades=1), new())
+    check("P11-D3 position held -> 0 entries, 0 consume", e is None and c_ == [])
+    e, c_, ap = p11_dispatch(allsig, {lg: True for lg in P08_ORDER}, Broker(), new(), isGold=False)
+    check("P11-D4 non-Gold -> 0 entries, 0 consume", e is None and c_ == [])
+    evts = [dict(zoneId=11), dict(zoneId=22), dict(zoneId=33)]
+    live = [dict(trackId=22, touch=3), dict(trackId=33, touch=0)]
+    sigs = {"ZONERETEST": (True, 4010.0)}
+    e, c_, ap = p11_dispatch(sigs, {"ZONERETEST": True}, Broker(), new(), evts, {"ZONERETEST": 1}, live)
+    check("L21/L22 zone entry: originTrackId = event zoneId (22), entryTouchCount = current live zone touch (3)",
+          e == "ZONERETEST" and ap["originTrackId"] == 22 and ap["entryTouchCount"] == 3)
+    e, c_, ap = p11_dispatch({"ZONEREBOUND": (True, 4010.0)}, {"ZONEREBOUND": True}, Broker(), new(), evts, {"ZONEREBOUND": 0}, live)
+    check("L22b origin zone no longer live -> originTrackId kept (11), entryTouchCount = na", ap["originTrackId"] == 11 and ap["entryTouchCount"] is None)
+    e, c_, ap = p11_dispatch({"FVG": (True, 4010.0)}, {"FVG": True}, Broker(), new(), evts, {}, live)
+    check("L23 FVG entry -> originTrackId / entryTouchCount = na", e == "FVG" and ap["originTrackId"] is None and ap["entryTouchCount"] is None)
+    # strength filter mirror
+    sidx = {"Weak": 1, "Medium": 2, "Strong": 3, "Very Strong": 4}
+    zs = [dict(trackId=1, strength=2, state=1), dict(trackId=2, strength=3, state=2), dict(trackId=3, strength=4, state=1),
+          dict(trackId=4, strength=4, state=0), dict(trackId=5, strength=4, state=3)]
+    snap = lambda ms: [(z["trackId"], 1 if z["state"] == 1 else -1) for z in zs if z["strength"] >= sidx[ms] and z["state"] in (1, 2)]
+    check("L18/L19/L20 snapshot by Min Strength: Strong -> RES 2 + SUP 3; Medium adds SUP 1; Very Strong -> SUP 3 only; ACTIVE / BROKEN never",
+          snap("Strong") == [(2, -1), (3, 1)] and snap("Medium") == [(1, 1), (2, -1), (3, 1)] and snap("Very Strong") == [(3, 1)])
+    check("L19/L20 ZoneEnginePractical.strengthIdx maps Weak/Medium/Strong/Very Strong to SR_WEAK..SR_VSTRONG",
+          'export strengthIdx(string s) =>\n    s == "Very Strong" ? SR_VSTRONG : s == "Strong" ? SR_STRONG : s == "Medium" ? SR_MEDIUM : SR_WEAK' in ZEP)
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -3422,6 +3699,8 @@ if __name__ == "__main__":
     fixture_p09_behaviour()
     fixture_p10_static()
     fixture_p10_behaviour()
+    fixture_p11_static()
+    fixture_p11_behaviour()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
