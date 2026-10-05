@@ -4069,6 +4069,100 @@ def fixture_p13a():
     check("P13A A6 provisional dedupe: 8-slot series == 16-slot direction slots (500 random streams, send / re-arm)", mism == 0)
 
 
+# ============================================================================
+# P14 : final production audit (current LONG / SHORT files = Reference)
+# ============================================================================
+#  TradingView external gate (recorded, NOT computed or verified by Python):
+#    XAUUSD 5M / Last 365 days / Deep Backtest, after P13A (acd12ac):
+#      LONG  = 46 trades,  SHORT = 59 trades   (confirmed by the user in TradingView)
+TV_REFERENCE = {"LONG": 46, "SHORT": 59, "head": "acd12ac", "evidence": "USER_TRADINGVIEW_EXTERNAL_GATE"}
+
+
+def fixture_p14_final_audit():
+    for name, cur, d in (("LONG", LG_CUR, 1), ("SHORT", SH_CUR, -1)):
+        c = code_only(cur)
+        cs = "\n".join(_strip_str(l) for l in c.split("\n"))
+        own, other = ("strategy.long", "strategy.short") if d > 0 else ("strategy.short", "strategy.long")
+        W, O = ("LONG", "SHORT") if d > 0 else ("SHORT", "LONG")
+        tag = f"P14-{name}"
+        check(f"{tag} 01/02 direction: strategy.entry = {own} only (1 site), {other} = 0, no '{O}' literal in code",
+              re.findall(r"strategy\.entry\(([^)]*)\)", c) == [f"eid, {own}, qty = qty"] and other not in cur and O not in c
+              and f'"【" + kind + " {W}】" +' in c)
+        disp = cur[cur.find("// 08. DISPATCH"):cur.find("// 09. BREAK EVEN")]
+        calls = re.findall(r"e := f_tryEntry\(activePos, ds, (\w+), ([^,]+), (-?\d+), ([^,]+), globalPositionBlocked, enteredThisBar\)", code_only(disp))
+        check(f"{tag} 03/04 8 logics in priority FVG15 > FVG > ABS15 > ABS5 > RB > FK > RT > BK, all dir {d}",
+              [P08_CONST[x[0]] for x in calls] == P08_ORDER and all(int(x[2]) == d for x in calls))
+        sigs = ["fvg15Sig.%sSignal", "fvgSig.%sSignal", "absSig.%s15", "absSig.%s5", "zlSig.rebound%s", "zlSig.fake%s",
+                "zlSig.retest%s", "zlSig.break%s"]
+        lw = "long" if d > 0 else "short"
+        cw = "Long" if d > 0 else "Short"
+        exp_sig = [x % (lw if x.endswith("Signal") or x.startswith("absSig") else cw) for x in sigs]
+        check(f"{tag} 03 confirmed candidates = SignalEnginePractical {cw} outputs", [x[1] for x in calls] == exp_sig, str([x[1] for x in calls]))
+        check(f"{tag} 05 Global 1-position gate (scalar) + enteredThisBar + same-bar chaining",
+              "bool globalPositionBlocked = strategy.position_size != 0 or strategy.opentrades > 0" in c
+              and code_only(disp).count("enteredThisBar := enteredThisBar or e") == 8)
+        te = code_only(func_block(cur, "f_tryEntry"))
+        order = [te.find(x) for x in ("if cand and dir != 0 and isGold and not positionBlocked and not enteredThisBar",
+                                      "f_insideAnyZone(entryPrice)", "zn.buildPlanWithTpDepth(", 'if tpMode == "STRUCTURAL_ONLY"',
+                                      "if p.valid", "float qty = f_qty(p.risk)", "if qty >= qtyMin and qty > 0",
+                                      "strategy.entry(", "strategy.exit(")]
+        check(f"{tag} 06-10 gate order: Gold/position/same-bar -> Inside Any Zone -> Structural SL/TP + Fallback (buildPlanWithTpDepth) "
+              f"-> TP Mode -> valid -> Risk/Qty -> qtyMin -> entry -> exit (SL/TP fixed)",
+              -1 not in order and order == sorted(order) and 'stop = p.sl, limit = p.tp' in te)
+        ins = code_only(func_block(cur, "f_insideAnyZone"))
+        check(f"{tag} 06 Inside Any Zone: strength >= activeNoTradeMinStrength, bottom <= entry <= top, state ignored",
+              "z.strength >= zoneCfg.activeNoTradeMinStrength and entryPrice >= z.bottom and entryPrice <= z.top" in ins and "state" not in ins)
+        be = code_only(cur[cur.find("// 09. BREAK EVEN"):cur.find("// 10. PROVISIONAL ALERT")])
+        check(f"{tag} 11 BE: fill price (position_avg_price), reach high/low or confirmed close, stop = fill, limit = entry TP, irreversible",
+              "strategy.position_avg_price" in c and "if not activePos.beOn" in be and "activePos.beOn           := true" in be
+              and 'stop = ep, limit = activePos.tp,' in be and 'comment_loss = "BE", comment_profit = "TP"' in be)
+        I_ = parse_inputs(cur)
+        check(f"{tag} 12/13/16 defaults: Provisional OFF / Confirmed ON / Zone Signal Min Strength Strong / Fake OFF / Retest OFF",
+              I_["useProvisionalAlert"]["default"] == "false" and I_["useConfirmedAlert"]["default"] == "true"
+              and I_["zoneSignalMinStrStr"]["default"] == '"Strong"' and I_["useZoneFake"]["default"] == "false"
+              and I_["useZoneRetest"]["default"] == "false")
+        check(f"{tag} 12/13 alerts: exactly 2 alert() (confirmed in entry branch freq_all / provisional freq_once_per_bar), 0 alertcondition",
+              c.count("alert(") == 2 and "alertcondition" not in c and te.count("alert(") == 1 and "alert.freq_all" in te
+              and c.count("alert.freq_once_per_bar") == 1)
+        check(f"{tag} 14/15 Dynamic TP = 0; BE / TP / SL / Exit alerts = 0 (BE section has no alert; one strategy.exit re-issue only at BE)",
+              "Dynamic" not in cs and "tpManagementMode" not in c and "alert(" not in be and c.count("strategy.exit(") == 2)
+        snap = code_only(cur[cur.find("int zoneMinStrength = zn.strengthIdx(zoneSignalMinStrStr)"):cur.find("//  各Zone Logicの保有状況。")])
+        check(f"{tag} 17 Zone snapshot: SUPPORT +1 and RESISTANCE -1, strength >= Min Strength, zoneId = trackId",
+              "(zsZ.state == ST_SUPPORT or zsZ.state == ST_RESIST)" in snap and "zsZ.state == ST_SUPPORT ? 1 : -1" in snap
+              and "array.push(zSnapId,    zsZ.trackId)" in snap)
+        ro = code_only(func_block(cur, "f_recordZoneOrigin"))
+        dblocks = [code_only(b) for b in re.split(r"\n    // \d ", disp)]
+        zone_blk = [b for b in dblocks if re.search(r"LOGIC_ZONE_(RB|FK|RT|BK),", b)]
+        fvg_blk = [b for b in dblocks if re.search(r"LOGIC_FVG(15|_ABS15|_ABS5)?,", b)]
+        check(f"{tag} 18/19 originTrackId = event zoneId and entryTouchCount = live Touch Count, only in the 4 zone entry branches (before consume)",
+              "origin := array.get(zoneEvtEng.evts, evIdx).zoneId" in ro and "touch := zn.zoneTouchCount(zoneEng, i)" in ro
+              and len(zone_blk) == 4 and all(b.find("f_recordZoneOrigin") < b.find("sg.consumeZoneEvt") and "if e" in b for b in zone_blk)
+              and c.count("f_recordZoneOrigin(activePos") == 4 and c.count("zn.zoneTouchCount(") == 1)
+        check(f"{tag} 19 Touch Count is not an entry condition (not read by f_tryEntry / dispatch gates / provisional)",
+              "entryTouchCount" not in te.replace("ap.entryTouchCount := na", "")
+              and "entryTouchCount" not in code_only(cur[cur.find("// 10. PROVISIONAL ALERT"):]))
+        check(f"{tag} 20 FVG-family entries: originTrackId / entryTouchCount = na (no origin call)",
+              len(fvg_blk) == 4 and all("f_recordZoneOrigin" not in b for b in fvg_blk)
+              and "ap.originTrackId   := na" in te and "ap.entryTouchCount := na" in te)
+        check(f"{tag} 21 probe / harness code = 0",
+              not re.search(r"G_PROBE|probeEvery|\bc[1-8](On|Dr|Of)\b|f_provOn|f_provDirMode|f_provOffset|Harness", c))
+        check(f"{tag} 22 label / table / box / line / plot drawing = 0",
+              not re.search(r"label\.new|table\.new|box\.new|line\.new|\bplot\(|plotshape|bgcolor\(|fill\(", cs))
+        check(f"{tag} 23/24 no map trade management, no opentrades / closedtrades loop or per-trade accessor",
+              "map." not in cs and "map<" not in cs and not re.search(r"for .*(opentrades|closedtrades)", c)
+              and not re.search(r"strategy\.(opentrades|closedtrades)\.\w+", c))
+        check(f"{tag} 25 imports = ZoneEnginePractical/3 + SignalEnginePractical/1",
+              re.findall(r"^import .*$", c, re.M) == ["import sekine3310/ZoneEnginePractical/3 as zn", "import sekine3310/SignalEnginePractical/1 as sg"])
+        check(f"{tag} request call sites 31 (default issued: security 19 + lower_tf 2), zn.update 1, updateZoneEvents 1",
+              len(re.findall(r"request\.(?:security_lower_tf|security)\(", c)) == 31 and c.count("zn.update(") == 1
+              and c.count("sg.updateZoneEvents(") == 1)
+        check(f"{tag} allocation state: per-bar array.new 0, provisional slots 8 (varip)",
+              len(re.findall(r"^array<\w+>\s+\w+\s*=\s*array\.new", c, re.M)) == 0
+              and "varip array<bool> gProvSent = array.new_bool(8, false)" in c)
+    check("P14 TradingView reference recorded as external gate (LONG 46 / SHORT 59 @ acd12ac; not computed by Python)",
+          TV_REFERENCE == {"LONG": 46, "SHORT": 59, "head": "acd12ac", "evidence": "USER_TRADINGVIEW_EXTERNAL_GATE"})
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -4104,6 +4198,7 @@ if __name__ == "__main__":
     fixture_p12_static()
     fixture_p12_behaviour()
     fixture_p13a()
+    fixture_p14_final_audit()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
