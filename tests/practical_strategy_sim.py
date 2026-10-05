@@ -3999,7 +3999,9 @@ def _git_show(rev, path):
 
 
 def fixture_p13a():
-    for name, cur in (("LONG", LG_CUR), ("SHORT", SH_CUR)):
+    #  P13A validated stage = acd12ac (Reference). Current files are tied to it by the P15 exact-transform fixture.
+    for name, cur in (("LONG", _git_show("acd12ac", "PracticalZoneStrategy_LONG.pine")),
+                      ("SHORT", _git_show("acd12ac", "PracticalZoneStrategy_SHORT.pine"))):
         prev = _git_show("e3680f5", f"PracticalZoneStrategy_{name}.pine")
         check(f"P13A-{name} A6 file == p13a_transform(e3680f5) exactly (only the documented A1-A4 edits)",
               bool(prev) and p13a_transform(prev) == cur)
@@ -4078,13 +4080,16 @@ def fixture_p13a():
 TV_REFERENCE = {"LONG": 46, "SHORT": 59, "head": "acd12ac", "evidence": "USER_TRADINGVIEW_EXTERNAL_GATE"}
 
 
-def fixture_p14_final_audit():
-    for name, cur, d in (("LONG", LG_CUR, 1), ("SHORT", SH_CUR, -1)):
+def fixture_p14_final_audit(files=None, req_sites=31, label="P14"):
+    if files is None:   # P14 audited the Reference stage acd12ac
+        files = (("LONG", _git_show("acd12ac", "PracticalZoneStrategy_LONG.pine"), 1),
+                 ("SHORT", _git_show("acd12ac", "PracticalZoneStrategy_SHORT.pine"), -1))
+    for name, cur, d in files:
         c = code_only(cur)
         cs = "\n".join(_strip_str(l) for l in c.split("\n"))
         own, other = ("strategy.long", "strategy.short") if d > 0 else ("strategy.short", "strategy.long")
         W, O = ("LONG", "SHORT") if d > 0 else ("SHORT", "LONG")
-        tag = f"P14-{name}"
+        tag = f"{label}-{name}"
         check(f"{tag} 01/02 direction: strategy.entry = {own} only (1 site), {other} = 0, no '{O}' literal in code",
               re.findall(r"strategy\.entry\(([^)]*)\)", c) == [f"eid, {own}, qty = qty"] and other not in cur and O not in c
               and f'"【" + kind + " {W}】" +' in c)
@@ -4153,14 +4158,387 @@ def fixture_p14_final_audit():
               and not re.search(r"strategy\.(opentrades|closedtrades)\.\w+", c))
         check(f"{tag} 25 imports = ZoneEnginePractical/3 + SignalEnginePractical/1",
               re.findall(r"^import .*$", c, re.M) == ["import sekine3310/ZoneEnginePractical/3 as zn", "import sekine3310/SignalEnginePractical/1 as sg"])
-        check(f"{tag} request call sites 31 (default issued: security 19 + lower_tf 2), zn.update 1, updateZoneEvents 1",
-              len(re.findall(r"request\.(?:security_lower_tf|security)\(", c)) == 31 and c.count("zn.update(") == 1
+        check(f"{tag} request call sites {req_sites}, zn.update 1, updateZoneEvents 1",
+              len(re.findall(r"request\.(?:security_lower_tf|security)\(", c)) == req_sites and c.count("zn.update(") == 1
               and c.count("sg.updateZoneEvents(") == 1)
         check(f"{tag} allocation state: per-bar array.new 0, provisional slots 8 (varip)",
               len(re.findall(r"^array<\w+>\s+\w+\s*=\s*array\.new", c, re.M)) == 0
               and "varip array<bool> gProvSent = array.new_bool(8, false)" in c)
     check("P14 TradingView reference recorded as external gate (LONG 46 / SHORT 59 @ acd12ac; not computed by Python)",
           TV_REFERENCE == {"LONG": 46, "SHORT": 59, "head": "acd12ac", "evidence": "USER_TRADINGVIEW_EXTERNAL_GATE"})
+
+
+# ============================================================================
+# P15 : one-shot performance optimization (Main side only; Library unchanged)
+# ============================================================================
+P15_REF = "acd12ac"
+SEP_SRC = open(os.path.join(ROOT, "SignalEnginePractical.pine"), encoding="utf-8").read()
+
+
+def p15_transform(src):
+    """Complete documented P15 transformation of the acd12ac (= P13A) LONG / SHORT sources.
+    Every optimization is guarded by an input switch (default ON); switch OFF = the exact Reference code path."""
+    t = src
+
+    def R(a, b, n=1):
+        nonlocal t
+        assert t.count(a) == n, (a[:80], t.count(a))
+        t = t.replace(a, b)
+
+    # ---- switches (inputs) ----
+    R("// ============================================================================\n// 01-2. ZONE ENGINE INPUTS",
+      "// ============================================================================\n"
+      "// 00. P15 PERFORMANCE SWITCHES (既定 ON。OFF = Reference と同一の取得経路)\n"
+      "// ----------------------------------------------------------------------------\n"
+      "//  どれも「同じ値を安く取る」ための切り替えで、Signal / Entry / Exit の判定式は変えない。\n"
+      "//  TradingView で Reference (acd12ac) と差が出た場合に、1つずつ OFF にして原因を切り分ける。\n"
+      "// ============================================================================\n"
+      "var string G_P15 = \"99 · P15 Performance (検証用・既定ON)\"\n"
+      "p15MergeLtf1m   = input.bool(true, \"O1 1M lower_tf 統合 (ABS BOS + Zone 精密TF)\", group = G_P15)\n"
+      "p15LocalChartTf = input.bool(true, \"O2 チャート足と同TFの request をローカル計算\", group = G_P15)\n"
+      "p15SkipOffEnv   = input.bool(true, \"O3 未使用の環境TF request を発行しない\", group = G_P15)\n"
+      "p15PackSameTf   = input.bool(true, \"O4 同TF・同lookahead request の統合 (15M / Zone 60M)\", group = G_P15)\n\n"
+      "// ============================================================================\n// 01-2. ZONE ENGINE INPUTS")
+
+    # ---- O2 : Zone swing TF #1 at chart TF -> local pivotPack ----
+    R("    [_h1, _h1t, _l1, _l1t] = request.security(syminfo.tickerid, hzTf1, zn.pivotPack(pivLen1), lookahead = barmerge.lookahead_off)\n",
+      "    //  ★ P15 O2: TF #1 がチャート足と同じなら、同じ関数をチャート足でそのまま評価する\n"
+      "    //    (同一TF・lookahead_off の request.security はチャート足の系列そのもの)。\n"
+      "    float _h1  = na\n    int   _h1t = na\n    float _l1  = na\n    int   _l1t = na\n"
+      "    if p15LocalChartTf and timeframe.in_seconds(hzTf1) == timeframe.in_seconds()\n"
+      "        [_x1, _x1t, _y1, _y1t] = zn.pivotPack(pivLen1)\n"
+      "        _h1  := _x1\n        _h1t := _x1t\n        _l1  := _y1\n        _l1t := _y1t\n"
+      "    else\n"
+      "        [_x1, _x1t, _y1, _y1t] = request.security(syminfo.tickerid, hzTf1, zn.pivotPack(pivLen1), lookahead = barmerge.lookahead_off)\n"
+      "        _h1  := _x1\n        _h1t := _x1t\n        _l1  := _y1\n        _l1t := _y1t\n")
+    # ---- O4 : Zone swing TF #3 + Accum TF #1 (same TF, both lookahead_off) -> one request ----
+    R("    [_h3, _h3t, _l3, _l3t] = request.security(syminfo.tickerid, hzTf3, zn.pivotPack(pivLen3), lookahead = barmerge.lookahead_off)\n",
+      "    //  ★ P15 O4: Swing #3 と Accum #1 が同TFなら Accum 側で1本にまとめて取得する (下の Accum block)。\n"
+      "    float _h3  = na\n    int   _h3t = na\n    float _l3  = na\n    int   _l3t = na\n"
+      "    if not p15PackHzAcc\n"
+      "        [_x3, _x3t, _y3, _y3t] = request.security(syminfo.tickerid, hzTf3, zn.pivotPack(pivLen3), lookahead = barmerge.lookahead_off)\n"
+      "        _h3  := _x3\n        _h3t := _x3t\n        _l3  := _y3\n        _l3t := _y3t\n")
+    R("float ph3 = na\n", "//  P15 O4 : Swing #3 (hzTf3) と Accum #1 (accTf1) が同TF・両方ON のとき1本の request にまとめる。\n"
+      "bool p15PackHzAcc = p15PackSameTf and useHzSource and useAccSource and hzTf3 == accTf1\nfloat ph3 = na\n")
+    R("if useAccSource\n    [_a1h, _a1l, _a1i] = request.security(syminfo.tickerid, accTf1,\n"
+      "         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,\n"
+      "         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen1, accMult), lookahead = barmerge.lookahead_off)\n",
+      "//  ★ P15 O4: Swing #3 + Accum #1 を同じTFコンテキストで1回に評価する (各関数・引数は元と同一)。\n"
+      "f_p15HzAccPack() =>\n"
+      "    [_ph, _pt, _pl, _lt] = zn.pivotPack(pivLen3)\n"
+      "    [_ah, _al, _ai] = zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,\n"
+      "         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen1, accMult)\n"
+      "    [_ph, _pt, _pl, _lt, _ah, _al, _ai]\n\n"
+      "if useAccSource\n"
+      "    float _a1h = na\n    float _a1l = na\n    int   _a1i = na\n"
+      "    if p15PackHzAcc\n"
+      "        [_q3h, _q3ht, _q3l, _q3lt, _qa1h, _qa1l, _qa1i] = request.security(syminfo.tickerid, accTf1, f_p15HzAccPack(), lookahead = barmerge.lookahead_off)\n"
+      "        ph3  := _q3h\n        ph3T := _q3ht\n        pl3  := _q3l\n        pl3T := _q3lt\n"
+      "        _a1h := _qa1h\n        _a1l := _qa1l\n        _a1i := _qa1i\n"
+      "    else\n"
+      "        [_qa1h, _qa1l, _qa1i] = request.security(syminfo.tickerid, accTf1,\n"
+      "             zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,\n"
+      "             accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen1, accMult), lookahead = barmerge.lookahead_off)\n"
+      "        _a1h := _qa1h\n        _a1l := _qa1l\n        _a1i := _qa1i\n")
+    #  hz block: when packed, ph3.. are assigned in the Accum block; keep them untouched in the Swing block
+    R("    ph3 := _h3\n    ph3T := _h3t\n    pl3 := _l3\n    pl3T := _l3t\n",
+      "    if not p15PackHzAcc\n        ph3 := _h3\n        ph3T := _h3t\n        pl3 := _l3\n        pl3T := _l3t\n")
+
+    # ---- O3 / O4 / O2 : environment requests ----
+    R("bool absAnyOn = useFvgAbs5Logic or useFvgAbs15Logic\n",
+      "bool absAnyOn = useFvgAbs5Logic or useFvgAbs15Logic\n"
+      "//  ★ P15 O3: 結果を読む可能性がある TF だけ request する (input 定数だけで決まる)。\n"
+      "//    updateFvg は env を en = reqTrend != \"OFF\" のときだけ読む。Zone 4Logic は 4H / 1H / 15M のみ読む。\n"
+      "bool needEnv4H  = not p15SkipOffEnv or (useEnvFilter and reqTrend4H  != \"OFF\") or useZoneAny\n"
+      "bool needEnv1H  = not p15SkipOffEnv or (useEnvFilter and reqTrend1H  != \"OFF\") or useZoneAny\n"
+      "bool needEnv15M = not p15SkipOffEnv or (useEnvFilter and reqTrend15M != \"OFF\") or useZoneAny\n"
+      "bool needEnv5M  = not p15SkipOffEnv or (useEnvFilter and reqTrend5M  != \"OFF\")\n"
+      "bool needEnv1M  = not p15SkipOffEnv or (useEnvFilter and reqTrend1M  != \"OFF\")\n"
+      "//  ★ P15 O4: 15M・lookahead_on の4本 (env15M / FVG15 反発 / FVGABS15 / Accum15) を1本にまとめる。\n"
+      "//    4本とも有効・同じTFのときだけ。各関数と引数は元の request と同一。\n"
+      "bool p15Pack15 = p15PackSameTf and (useEnvFilter or useZoneAny) and needEnv15M and useFvg15Logic and useFvgAbs15Logic and\n"
+      "     useAccumNoTrade and useAccumNT15M and tf15M == efvg15MTF and accumNT15Tf == efvg15MTF\n"
+      "f_p15Pack15() =>\n"
+      "    int _e = sg.envTrendConfirmed(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore15M)\n"
+      "    [_b, _r, _rem, _bos, _t] = sg.efvgRebound15Pack(fvg15Hold, efvgMinThick, reboundDepthMax, reboundRecoverRatio, false, fvgBosLookback)\n"
+      "    [_ab, _ae, _at] = sg.efvgAbsConfirmed(efvgHold15M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, useAbsCandleColor, useAbsBodyFilter, useAbsEdgeFilter)\n"
+      "    [_h, _l, _s] = sg.accumNT15Confirmed(fvgAccCfg, accumNTRangeLen, accumNTBaseLen, accumNTAtrLen)\n"
+      "    [_e, _b, _r, _rem, _bos, _t, _ab, _ae, _at, _h, _l, _s]\n"
+      "int   pk15Env = na\nint   pk15B   = 0\nint   pk15R   = 0\nint   pk15Rem = 0\nint   pk15Bos = 0\nint   pk15T   = na\n"
+      "int   pk15Ab  = 0\nint   pk15Ae  = na\nint   pk15At  = na\nfloat pk15Hi  = na\nfloat pk15Lo  = na\nint   pk15St  = na\n"
+      "if p15Pack15\n"
+      "    [_qe, _qb, _qr, _qrem, _qbos, _qt, _qab, _qae, _qat, _qh, _ql, _qs] = request.security(syminfo.tickerid, efvg15MTF, f_p15Pack15(), lookahead = barmerge.lookahead_on)\n"
+      "    pk15Env := _qe\n    pk15B   := _qb\n    pk15R   := _qr\n    pk15Rem := _qrem\n    pk15Bos := _qbos\n    pk15T   := _qt\n"
+      "    pk15Ab  := _qab\n    pk15Ae  := _qae\n    pk15At  := _qat\n    pk15Hi  := _qh\n    pk15Lo  := _ql\n    pk15St  := _qs\n")
+    R("    env4H  := request.security(syminfo.tickerid, tf4H,",
+      "    if needEnv4H\n        env4H  := request.security(syminfo.tickerid, tf4H,")
+    R("    env1H  := request.security(syminfo.tickerid, tf1H,",
+      "    if needEnv1H\n        env1H  := request.security(syminfo.tickerid, tf1H,")
+    R("    env15M := request.security(syminfo.tickerid, tf15M,",
+      "    if p15Pack15\n        env15M := pk15Env\n    else if needEnv15M\n        env15M := request.security(syminfo.tickerid, tf15M,")
+    R("    env5M  := request.security(syminfo.tickerid, tf5M,  sg.envTrend(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore5M),  lookahead = barmerge.lookahead_off)\n",
+      "    if needEnv5M\n"
+      "        if p15LocalChartTf and timeframe.in_seconds(tf5M) == timeframe.in_seconds()\n"
+      "            env5M  := sg.envTrend(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore5M)\n"
+      "        else\n"
+      "            env5M  := request.security(syminfo.tickerid, tf5M,  sg.envTrend(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore5M),  lookahead = barmerge.lookahead_off)\n")
+    R("    env1M  := request.security(syminfo.tickerid, tf1M,",
+      "    if needEnv1M\n        env1M  := request.security(syminfo.tickerid, tf1M,")
+    # ---- O2 : FVG env 5M at chart TF -> local ----
+    R("if need5MState\n    [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg5MTF, sg.efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)\n"
+      "    efvg5Bias := _b\n    efvg5Bos := _bos\n",
+      "if need5MState\n"
+      "    //  ★ P15 O2: 5M = チャート足なら同じ関数をそのまま評価 (lookahead_on + 関数内 [1] = 同一TFでは当該バーの式値)。\n"
+      "    if p15LocalChartTf and timeframe.in_seconds(efvg5MTF) == timeframe.in_seconds()\n"
+      "        [_b, _r, _rem, _bos] = sg.efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback)\n"
+      "        efvg5Bias := _b\n        efvg5Bos := _bos\n"
+      "    else\n"
+      "        [_b, _r, _rem, _bos] = request.security(syminfo.tickerid, efvg5MTF, sg.efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback), lookahead = barmerge.lookahead_on)\n"
+      "        efvg5Bias := _b\n        efvg5Bos := _bos\n")
+    # ---- O4 : FVG15 raw from the 15M pack ----
+    R("if useFvg15Logic\n    [_b, _r, _rem, _bos, _t] = request.security(syminfo.tickerid, efvg15MTF, sg.efvgRebound15Pack(fvg15Hold, efvgMinThick, reboundDepthMax, reboundRecoverRatio, false, fvgBosLookback), lookahead = barmerge.lookahead_on)\n"
+      "    fvg15RawBias   := _b\n    fvg15RawReason := _r\n    fvg15RawRem    := _rem\n    fvg15RawBos    := _bos\n    fvg15RawTime   := _t\n",
+      "if useFvg15Logic\n"
+      "    if p15Pack15\n"
+      "        fvg15RawBias   := pk15B\n        fvg15RawReason := pk15R\n        fvg15RawRem    := pk15Rem\n        fvg15RawBos    := pk15Bos\n        fvg15RawTime   := pk15T\n"
+      "    else\n"
+      "        [_b, _r, _rem, _bos, _t] = request.security(syminfo.tickerid, efvg15MTF, sg.efvgRebound15Pack(fvg15Hold, efvgMinThick, reboundDepthMax, reboundRecoverRatio, false, fvgBosLookback), lookahead = barmerge.lookahead_on)\n"
+      "        fvg15RawBias   := _b\n        fvg15RawReason := _r\n        fvg15RawRem    := _rem\n        fvg15RawBos    := _bos\n        fvg15RawTime   := _t\n")
+    # ---- O2 : ABS 5M at chart TF -> local ; O4 : ABS 15M from the pack ----
+    R("if useFvgAbs5Logic\n    [_ab, _ae, _at] = request.security(syminfo.tickerid, efvg5MTF, sg.efvgAbsConfirmed(absHold5M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, useAbsCandleColor, useAbsBodyFilter, useAbsEdgeFilter), lookahead = barmerge.lookahead_on)\n"
+      "    absBias5      := _ab\n    absEvent5     := _ae\n    absEventTime5 := _at\n",
+      "if useFvgAbs5Logic\n"
+      "    if p15LocalChartTf and timeframe.in_seconds(efvg5MTF) == timeframe.in_seconds()\n"
+      "        [_ab, _ae, _at] = sg.efvgAbsConfirmed(absHold5M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, useAbsCandleColor, useAbsBodyFilter, useAbsEdgeFilter)\n"
+      "        absBias5      := _ab\n        absEvent5     := _ae\n        absEventTime5 := _at\n"
+      "    else\n"
+      "        [_ab, _ae, _at] = request.security(syminfo.tickerid, efvg5MTF, sg.efvgAbsConfirmed(absHold5M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, useAbsCandleColor, useAbsBodyFilter, useAbsEdgeFilter), lookahead = barmerge.lookahead_on)\n"
+      "        absBias5      := _ab\n        absEvent5     := _ae\n        absEventTime5 := _at\n")
+    R("if useFvgAbs15Logic\n    [_ab, _ae, _at] = request.security(syminfo.tickerid, efvg15MTF, sg.efvgAbsConfirmed(efvgHold15M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, useAbsCandleColor, useAbsBodyFilter, useAbsEdgeFilter), lookahead = barmerge.lookahead_on)\n"
+      "    absBias15      := _ab\n    absEvent15     := _ae\n    absEventTime15 := _at\n",
+      "if useFvgAbs15Logic\n"
+      "    if p15Pack15\n"
+      "        absBias15      := pk15Ab\n        absEvent15     := pk15Ae\n        absEventTime15 := pk15At\n"
+      "    else\n"
+      "        [_ab, _ae, _at] = request.security(syminfo.tickerid, efvg15MTF, sg.efvgAbsConfirmed(efvgHold15M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, useAbsCandleColor, useAbsBodyFilter, useAbsEdgeFilter), lookahead = barmerge.lookahead_on)\n"
+      "        absBias15      := _ab\n        absEvent15     := _ae\n        absEventTime15 := _at\n")
+    # ---- O1 : merge the two 1M lower_tf requests ----
+    R("if useFvgAbs5Logic\n    [_a1b, _a1s] = request.security_lower_tf(syminfo.tickerid, triggerTF, sg.bosPack(absBos1mLookback))\n"
+      "    absBos1m  := _a1b\n    absBos1mS := _a1s\n",
+      "//  ★ P15 O1: ABS 1M BOS と Zone 精密TF (下位足) が同じTFなら、1回の security_lower_tf で両方取る。\n"
+      "//    同一シンボル・同一TF・同じ intrabar 列。各関数 (bosPack / zoneTfPack) と引数は元と同一。\n"
+      "bool p15Merge1m = p15MergeLtf1m and useFvgAbs5Logic and useZoneAny and\n"
+      "     timeframe.in_seconds(zoneBosTf) < timeframe.in_seconds() and triggerTF == zoneBosTf\n"
+      "f_p15Ltf1m() =>\n"
+      "    [_ab, _as] = sg.bosPack(absBos1mLookback)\n"
+      "    [_zc, _zh, _zl, _zb, _zs] = sg.zoneTfPack(zoneBosLookback)\n"
+      "    [_ab, _as, _zc, _zh, _zl, _zb, _zs]\n"
+      "array<float> p15ZbC = na\narray<float> p15ZbH = na\narray<float> p15ZbL = na\narray<bool>  p15ZbB = na\narray<bool>  p15ZbS = na\n"
+      "if useFvgAbs5Logic\n"
+      "    if p15Merge1m\n"
+      "        [_m1b, _m1s, _mzc, _mzh, _mzl, _mzb, _mzs] = request.security_lower_tf(syminfo.tickerid, triggerTF, f_p15Ltf1m())\n"
+      "        absBos1m  := _m1b\n        absBos1mS := _m1s\n"
+      "        p15ZbC := _mzc\n        p15ZbH := _mzh\n        p15ZbL := _mzl\n        p15ZbB := _mzb\n        p15ZbS := _mzs\n"
+      "    else\n"
+      "        [_a1b, _a1s] = request.security_lower_tf(syminfo.tickerid, triggerTF, sg.bosPack(absBos1mLookback))\n"
+      "        absBos1m  := _a1b\n        absBos1mS := _a1s\n")
+    R("    if zbLowerTf\n        [_zc, _zh, _zl, _lb, _ls] = request.security_lower_tf(syminfo.tickerid, zoneBosTf, sg.zoneTfPack(zoneBosLookback))\n"
+      "        zbTfC     := _zc\n        zbTfH     := _zh\n        zbTfL     := _zl\n        zbBullArr := _lb\n        zbBearArr := _ls\n",
+      "    if zbLowerTf\n"
+      "        if p15Merge1m\n"
+      "            zbTfC     := p15ZbC\n            zbTfH     := p15ZbH\n            zbTfL     := p15ZbL\n            zbBullArr := p15ZbB\n            zbBearArr := p15ZbS\n"
+      "        else\n"
+      "            [_zc, _zh, _zl, _lb, _ls] = request.security_lower_tf(syminfo.tickerid, zoneBosTf, sg.zoneTfPack(zoneBosLookback))\n"
+      "            zbTfC     := _zc\n            zbTfH     := _zh\n            zbTfL     := _zl\n            zbBullArr := _lb\n            zbBearArr := _ls\n")
+    # ---- O4 : Accum15 from the pack ----
+    R("if useAccumNoTrade and useAccumNT15M\n    [_h15, _l15, _s15] = request.security(syminfo.tickerid, accumNT15Tf, sg.accumNT15Confirmed(fvgAccCfg, accumNTRangeLen, accumNTBaseLen, accumNTAtrLen), lookahead = barmerge.lookahead_on)\n"
+      "    acc15Hi := _h15\n    acc15Lo := _l15\n    acc15St := _s15\n",
+      "if useAccumNoTrade and useAccumNT15M\n"
+      "    if p15Pack15\n"
+      "        acc15Hi := pk15Hi\n        acc15Lo := pk15Lo\n        acc15St := pk15St\n"
+      "    else\n"
+      "        [_h15, _l15, _s15] = request.security(syminfo.tickerid, accumNT15Tf, sg.accumNT15Confirmed(fvgAccCfg, accumNTRangeLen, accumNTBaseLen, accumNTAtrLen), lookahead = barmerge.lookahead_on)\n"
+      "        acc15Hi := _h15\n        acc15Lo := _l15\n        acc15St := _s15\n")
+    # ---- O6 : shared read-only default Signal objects + reused DispatchStat ----
+    R("sg.FvgSignal   fvg15Base = sg.FvgSignal.new()\nsg.Fvg15Signal fvg15Sig  = sg.Fvg15Signal.new()\n",
+      "//  ★ P15 O6: OFF 時の既定 Signal は共有の var オブジェクト (読み取り専用・誰も書き換えない)。\n"
+      "var sg.FvgSignal       gDefFvgSig   = sg.FvgSignal.new()\nvar sg.Fvg15Signal     gDefFvg15Sig = sg.Fvg15Signal.new()\n"
+      "var sg.FvgAbsSignal    gDefAbsSig   = sg.FvgAbsSignal.new()\nvar sg.ZoneLogicSignal gDefZoneSig  = sg.ZoneLogicSignal.new()\n"
+      "sg.FvgSignal   fvg15Base = gDefFvgSig\nsg.Fvg15Signal fvg15Sig  = gDefFvg15Sig\n")
+    R("sg.FvgAbsSignal absSig = sg.FvgAbsSignal.new()\n", "sg.FvgAbsSignal absSig = gDefAbsSig\n")
+    R("sg.ZoneLogicSignal zlSig = sg.ZoneLogicSignal.new()\n", "sg.ZoneLogicSignal zlSig = gDefZoneSig\n")
+    R("DispatchStat ds             = DispatchStat.new()\n",
+      "//  ★ P15 O6: DispatchStat は var で1個を再利用し、毎バー全 field を初期値へ戻す (= 毎バー new と同値)。\n"
+      "var DispatchStat ds        = DispatchStat.new()\n"
+      "ds.winPriority := na\nds.insideScans := 0\nds.plans       := 0\nds.qtys        := 0\nds.insPrice    := na\nds.insBlocked  := false\n")
+    return t
+
+
+def p15_default_requests(src, optimized):
+    """Mirror of the request guards with DEFAULT inputs (chart = 5M). Returns (security, lower_tf) issued per bar."""
+    I = {k: v["default"].strip('"') for k, v in parse_inputs(src).items() if v.get("default")}
+    b = lambda k: I[k] == "true"
+    chart = 300
+    sec = {"1": 60, "5": 300, "15": 900, "60": 3600, "240": 14400, "D": 86400}
+    useZoneAny = b("useZoneRebound") or b("useZoneFake") or b("useZoneRetest") or b("useZoneBreak")
+    absAny = b("useFvgAbs5Logic") or b("useFvgAbs15Logic")
+    on = optimized
+    S = L = 0
+    # Zone block
+    S += b("useMaSource")
+    if b("useHzSource"):
+        S += 0 if (on and sec[I["hzTf1"]] == chart) else 1
+        S += 1
+        packHzAcc = on and b("useAccSource") and I["hzTf3"] == I["accTf1"]
+        S += 0 if packHzAcc else 1
+    else:
+        packHzAcc = False
+    if b("useAccSource"):
+        S += 3
+    S += 0 if sec[I["breakTf"]] == chart else 1
+    # Signal block
+    trig = sum(b(k) for k in ("useEngulfingTrigger", "usePinbarTrigger", "useBOSTrigger", "useEMARejectTrigger",
+                              "useFVGTriggerFormation", "useStrongCandleTrigger"))
+    L += 1 if (b("useLowerTFTrigger") and trig > 0) else 0
+    S += 1 if (I["volMode"] == "ATR" and I["atrTf"] != "") else 0
+    envBlock = b("useEnvFilter") or useZoneAny
+    need = lambda tf: (not on) or (b("useEnvFilter") and I["reqTrend" + tf] != "OFF") or (useZoneAny and tf in ("4H", "1H", "15M"))
+    pack15 = on and envBlock and need("15M") and b("useFvg15Logic") and b("useFvgAbs15Logic") and b("useAccumNoTrade") \
+        and b("useAccumNT15M") and I["tf15M"] == I["efvg15MTF"] and I["accumNT15Tf"] == I["efvg15MTF"]
+    if envBlock:
+        S += need("4H") + need("1H") + (0 if pack15 else need("15M"))
+        S += (0 if (on and sec[I["tf5M"]] == chart) else 1) if need("5M") else 0
+        S += need("1M")
+    if b("useEFVGEnv") and b("useEFVGDaily"): S += 1
+    if b("useEFVGEnv") and b("useEFVG4H"): S += 1
+    if b("useEFVGEnv") and b("useEFVG1H"): S += 1
+    if b("useEFVGEnv") and (b("useEFVG5M") or (b("useEFVG15M") and b("useFvgBosFilter"))):
+        S += 0 if (on and sec[I["efvg5MTF"]] == chart) else 1
+    if b("useEFVGEnv") and b("useEFVG15M"): S += 1
+    if b("useFvg15Logic"): S += 0 if pack15 else 1
+    if b("useEFVGEnv") and b("useEFVG1M"): S += 1
+    if b("useFvgAbs5Logic"): S += 0 if (on and sec[I["efvg5MTF"]] == chart) else 1
+    if b("useFvgAbs15Logic"): S += 0 if pack15 else 1
+    merge1m = on and b("useFvgAbs5Logic") and useZoneAny and sec[I["zoneBosTf"]] < chart and I["triggerTF"] == I["zoneBosTf"]
+    if b("useFvgAbs5Logic"): L += 1
+    if useZoneAny:
+        if sec[I["zoneBosTf"]] < chart:
+            L += 0 if merge1m else 1
+        else:
+            S += 1
+        S += 0 if sec[I["zoneBreakTf"]] <= chart else 1
+    if b("useDailyRegimeFilter"): S += 1
+    if b("useDailyRegimeFilter") or absAny or useZoneAny: S += 1
+    if b("useAccumNoTrade") and b("useAccumNT15M"): S += 0 if pack15 else 1
+    S += pack15
+    return S, L
+
+
+P15_LEDGER = {"O1": "PASS", "O2": "PASS", "O3": "PASS", "O4": "PASS", "O5": "SKIPPED_UNSAFE", "O6": "PASS",
+              "O7": "PASS (Main audit: no further eliminable calculation; library-internal candidates deferred)",
+              "O8": "SKIPPED_UNSAFE"}
+
+
+def fixture_p15():
+    refs = {n: _git_show(P15_REF, f"PracticalZoneStrategy_{n}.pine") for n in ("LONG", "SHORT")}
+    curs = {"LONG": LG_CUR, "SHORT": SH_CUR}
+    for n in ("LONG", "SHORT"):
+        ref, cur = refs[n], curs[n]
+        rc, cc = code_only(ref), code_only(cur)
+        check(f"P15-00-{n} file == p15_transform({P15_REF}) exactly (documented O1/O2/O3/O4/O6 edits only)",
+              bool(ref) and p15_transform(ref) == cur)
+        check(f"P15-00b-{n} Reference SHA matches PRACTICAL_ZONE_STRATEGY_REFERENCE.md",
+              ("8bffaf07bc500487e88f3fe75c28335ac31a18e70ebd72f26011faafa57cdf2d" if n == "LONG" else
+               "faf3b7352a2d6928e3857cf1b4779fa68fafda4bd39fd1170a6d441c79ac5f40") in open(os.path.join(ROOT, "PRACTICAL_ZONE_STRATEGY_REFERENCE.md"), encoding="utf-8").read()
+              and __import__("hashlib").sha256(ref.encode("utf-8")).hexdigest() in open(os.path.join(ROOT, "PRACTICAL_ZONE_STRATEGY_REFERENCE.md"), encoding="utf-8").read())
+        # ---- OFF path = Reference: every Reference request expression is still present verbatim ----
+        ref_req = [" ".join(m.split()) for m in re.findall(r"(request\.security(?:_lower_tf)?\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))", rc)]
+        cur_flat = " ".join(cc.split())
+        miss = [r_ for r_ in ref_req if r_ not in cur_flat]
+        check(f"P15-13-{n} every Reference request expression kept verbatim as the switch-OFF / non-default path",
+              len(ref_req) == 31 and not miss, str(miss)[:300])
+        # ---- O1 ----
+        f1 = code_only(func_block(cur, "f_p15Ltf1m"))
+        check(f"P15-14-{n} O1 merged lower_tf = bosPack(absBos1mLookback) + zoneTfPack(zoneBosLookback) unchanged, same symbol / TF, "
+              "only when both active, zone TF is lower and triggerTF == zoneBosTf; outputs mapped in order",
+              "[_ab, _as] = sg.bosPack(absBos1mLookback)" in f1 and "[_zc, _zh, _zl, _zb, _zs] = sg.zoneTfPack(zoneBosLookback)" in f1
+              and "[_ab, _as, _zc, _zh, _zl, _zb, _zs]" in f1
+              and "request.security_lower_tf(syminfo.tickerid, triggerTF, f_p15Ltf1m())" in cc
+              and "bool p15Merge1m = p15MergeLtf1m and useFvgAbs5Logic and useZoneAny and" in cc
+              and "timeframe.in_seconds(zoneBosTf) < timeframe.in_seconds() and triggerTF == zoneBosTf" in cc
+              and all(x in cc for x in ("absBos1m  := _m1b", "absBos1mS := _m1s", "zbTfC     := p15ZbC", "zbTfH     := p15ZbH",
+                                         "zbTfL     := p15ZbL", "zbBullArr := p15ZbB", "zbBearArr := p15ZbS")))
+        # ---- O2 ----
+        locs = [("zn.pivotPack(pivLen1)", "hzTf1"), ("sg.efvgReboundConfirmed(efvgHold5M, efvgMinThick, reboundDepthMax, reboundRecoverRatio, useFvgBosFilter, fvgBosLookback)", "efvg5MTF"),
+                ("sg.efvgAbsConfirmed(absHold5M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, useAbsCandleColor, useAbsBodyFilter, useAbsEdgeFilter)", "efvg5MTF"),
+                ("sg.envTrend(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore5M)", "tf5M")]
+        for ex, tf in locs:
+            ref_has = re.search(r"request\.security\(syminfo\.tickerid, " + re.escape(tf) + r",\s*" + re.escape(ex) + r",", rc) is not None
+            loc_has = re.search(r"(=|:=)\s*" + re.escape(ex) + r"\s*$", cc, re.M) is not None
+            guard = f"p15LocalChartTf and timeframe.in_seconds({tf}) == timeframe.in_seconds()" in cc
+            check(f"P15-01/13-{n} O2 local {ex.split('(')[0]} ({tf}) = the exact expression the Reference requested on that TF, only when TF == chart",
+                  ref_has and loc_has and guard)
+        # ---- O3 ----
+        check(f"P15-02-{n} O3 env requests issued only when their result can be read (updateFvg: en = reqTrend != OFF; Zone: 4H/1H/15M)",
+              'bool needEnv5M  = not p15SkipOffEnv or (useEnvFilter and reqTrend5M  != "OFF")' in cc
+              and 'bool needEnv1M  = not p15SkipOffEnv or (useEnvFilter and reqTrend1M  != "OFF")' in cc
+              and 'bool needEnv4H  = not p15SkipOffEnv or (useEnvFilter and reqTrend4H  != "OFF") or useZoneAny' in cc
+              and 'm5M  = en5M  and not na(f.env5M)  and f.env5M  == f_reqCode(c.reqTrend5M)' in SEP_SRC
+              and 'en5M  = c.reqTrend5M  != "OFF"' in SEP_SRC and SEP_SRC.count("f.env5M") == 2 and SEP_SRC.count("f.env1M") == 2
+              and "zoneTfEnvOk(t, f.env4H, f.env1H, f.env15M)" in SEP_SRC and "env5M" not in cc[cc.find("sg.ZoneEnvFeed zoneEnvFeed"):cc.find("var sg.ZoneTfEnvCfg zcRbL")])
+        # ---- O4 ----
+        f15 = code_only(func_block(cur, "f_p15Pack15"))
+        inner = ["sg.envTrendConfirmed(fvgEnvCfg, len20, len50, len200, envAtrLen, slopeBars, convDivBars, crossBars, rangeBars, minScore15M)",
+                 "sg.efvgRebound15Pack(fvg15Hold, efvgMinThick, reboundDepthMax, reboundRecoverRatio, false, fvgBosLookback)",
+                 "sg.efvgAbsConfirmed(efvgHold15M, efvgMinThick, efvgAbsBodyMin, efvgAbsEdge, useAbsCandleColor, useAbsBodyFilter, useAbsEdgeFilter)",
+                 "sg.accumNT15Confirmed(fvgAccCfg, accumNTRangeLen, accumNTBaseLen, accumNTAtrLen)"]
+        check(f"P15-13-{n} O4 15M pack = the 4 Reference lookahead_on expressions unchanged, same TF guard, lookahead_on, ordered mapping",
+              all(x in f15 and x in rc for x in inner) and "[_e, _b, _r, _rem, _bos, _t, _ab, _ae, _at, _h, _l, _s]" in f15
+              and "request.security(syminfo.tickerid, efvg15MTF, f_p15Pack15(), lookahead = barmerge.lookahead_on)" in cc
+              and "tf15M == efvg15MTF and accumNT15Tf == efvg15MTF" in cc
+              and all(f"lookahead = barmerge.lookahead_on" in l for l in rc.split("\n") if any(x in l for x in inner) and "request." in l)
+              and all(x in cc for x in ("env15M := pk15Env", "fvg15RawBias   := pk15B", "fvg15RawTime   := pk15T", "absBias15      := pk15Ab",
+                                         "absEventTime15 := pk15At", "acc15Hi := pk15Hi", "acc15St := pk15St")))
+        fz = code_only(func_block(cur, "f_p15HzAccPack"))
+        check(f"P15-13-{n} O4 Zone pack = pivotPack(pivLen3) + accumPack(.., accLen1, ..) unchanged, both lookahead_off, hzTf3 == accTf1",
+              "zn.pivotPack(pivLen3)" in fz and "accLen1, accMult)" in fz and "bool p15PackHzAcc = p15PackSameTf and useHzSource and useAccSource and hzTf3 == accTf1" in cc
+              and "request.security(syminfo.tickerid, accTf1, f_p15HzAccPack(), lookahead = barmerge.lookahead_off)" in cc
+              and "request.security(syminfo.tickerid, hzTf3, zn.pivotPack(pivLen3), lookahead = barmerge.lookahead_off)" in rc)
+        # ---- O6 ----
+        ds_fields = re.findall(r"^\s+\w+\s+(\w+)\s*=", code_only(cur[cur.find("type DispatchStat"):cur.find("// ---- 1候補の評価")]), re.M)
+        resets = re.findall(r"^ds\.(\w+)\s*:=", cc, re.M)
+        check(f"P15-05-{n} O6 DispatchStat reused: every field reset each bar (== fresh object); default Signals shared and never written",
+              sorted(ds_fields) == sorted(resets) and len(resets) == 6 and "var DispatchStat ds        = DispatchStat.new()" in cc
+              and not re.search(r"\b(gDef\w+|fvg15Base|fvg15Sig|absSig|zlSig)\.\w+\s*:=", cc))
+        # ---- unchanged semantics: trade engine / dispatch / BE / provisional ----
+        sec = lambda src, a, b_: code_only(src[src.find(a):src.find(b_)])
+        check(f"P15-03/04/06-12-{n} Trade Engine (05/06), dispatch / consume / origin+touch (08), BE (09), alerts (10) identical to Reference "
+              "(except the DispatchStat allocation line)",
+              sec(cur, "// 05. TRADE PLAN / RISK / QTY", "// 07. SIGNAL ENGINE") == sec(ref, "// 05. TRADE PLAN / RISK / QTY", "// 07. SIGNAL ENGINE")
+              and sec(cur, "// 09. BREAK EVEN", "// ---- Flat 遷移検知用") == sec(ref, "// 09. BREAK EVEN", "// ---- Flat 遷移検知用")
+              and [l for l in sec(cur, "// 08. DISPATCH", "// 09. BREAK EVEN").split("\n") if not l.startswith("ds.") and "var DispatchStat ds" not in l]
+              == [l for l in sec(ref, "// 08. DISPATCH", "// 09. BREAK EVEN").split("\n") if "DispatchStat ds             = DispatchStat.new()" not in l])
+        check(f"P15-05-{n} Signal Engine calls / Zone snapshot / ZoneCommonCfg identical to Reference (default objects aside)",
+              [l for l in sec(cur, "// ---- 7.3 Signal calls", "// ============================================================================\n// 08. DISPATCH").split("\n") if "gDef" not in l]
+              == [l for l in sec(ref, "// ---- 7.3 Signal calls", "// ============================================================================\n// 08. DISPATCH").split("\n")
+                  if not re.search(r"= sg\.(FvgSignal|Fvg15Signal|FvgAbsSignal|ZoneLogicSignal)\.new\(\)", l)]
+              + [])
+        check(f"P15-{n} SignalEngine call count unchanged (updateFvg 2 / updateFvg15 1 / updateFvgAbs 1 / updateZoneEvents 1), zn.update 1",
+              all(cc.count(x) == rc.count(x) for x in ("sg.updateFvg(", "sg.updateFvg15(", "sg.updateFvgAbs(", "sg.updateZoneEvents(", "zn.update(")))
+        check(f"P15-{n} allocation not worse: per-bar array.new 0, input-only configs var, provisional slots 8",
+              len(re.findall(r"^array<\w+>\s+\w+\s*=\s*array\.new", cc, re.M)) == 0
+              and all(re.search(r"^var sg\." + t_ + r" \w+ = ", cc, re.M) for t_ in ("FvgTrigCfg", "FvgEnvCfg", "FvgAccCfg"))
+              and "varip array<bool> gProvSent = array.new_bool(8, false)" in cc)
+        I = parse_inputs(cur)
+        check(f"P15-{n} switches are inputs defaulting to ON (OFF = Reference path)",
+              all(I.get(k, {}).get("default") == "true" for k in ("p15MergeLtf1m", "p15LocalChartTf", "p15SkipOffEnv", "p15PackSameTf")))
+        before, after = p15_default_requests(ref, False), p15_default_requests(cur, True)
+        check(f"P15-{n} default issued requests: before security {before[0]} + lower_tf {before[1]}; after security {after[0]} + lower_tf {after[1]}",
+              before == (19, 2) and after == (10, 1), f"{before} -> {after}")
+    # P15-16/17 direction isolation and full production audit on the optimized files
+    fixture_p14_final_audit(files=(("LONG", LG_CUR, 1), ("SHORT", SH_CUR, -1)), req_sites=34, label="P15-16/17")
+    check("P15 ledger: O1 PASS / O2 PASS / O3 PASS / O4 PASS / O5 SKIPPED_UNSAFE / O6 PASS / O7 PASS / O8 SKIPPED_UNSAFE",
+          [P15_LEDGER[k].split()[0] for k in sorted(P15_LEDGER)] == ["PASS", "PASS", "PASS", "PASS", "SKIPPED_UNSAFE", "PASS", "PASS", "SKIPPED_UNSAFE"])
 
 
 if __name__ == "__main__":
@@ -4199,6 +4577,7 @@ if __name__ == "__main__":
     fixture_p12_behaviour()
     fixture_p13a()
     fixture_p14_final_audit()
+    fixture_p15()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:

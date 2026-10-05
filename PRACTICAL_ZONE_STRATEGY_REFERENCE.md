@@ -92,3 +92,46 @@ Every P15 change must keep the TradingView reference (LONG 46 / SHORT 59) and pa
 - `python3 tests/practical_strategy_sim.py` → 709/709. Covers P01–P14; P11/P12 integration checks are pinned to `e3680f5`, and the current files are tied to it by the P13A exact-transform check.
 - `python3 tests/practical_zone_sim.py` → 44/44.
 - Evidence class: PINE_NOT_VERIFIED (static / mirror checks). The TradingView gate is external.
+
+---
+
+## P15 — Performance optimization (candidate; awaiting the single TradingView gate)
+
+The Reference stays `acd12ac` (LONG 46 / SHORT 59). The P15 files are derived from it
+by `p15_transform()` in `tests/practical_strategy_sim.py`; fixture P15-00 proves
+`current == p15_transform(acd12ac)` exactly. Library sources are unchanged:
+SignalEnginePractical/1 and ZoneEnginePractical/3 are still the imports.
+
+Every optimization has an input switch in group "99 · P15 Performance". All switches
+default to ON. Turning a switch OFF restores the Reference request path for that item.
+If the TradingView trade counts differ, turn the switches OFF one by one to isolate the
+cause.
+
+| # | Result | What |
+|---|---|---|
+| O1 | PASS | ABS 1M BOS (`bosPack`) and Zone precise-TF (`zoneTfPack`) are fetched with one `security_lower_tf` call. Applies only when both are active, the zone TF is lower than the chart and `triggerTF == zoneBosTf`. |
+| O2 | PASS | Requests whose TF equals the chart TF are evaluated locally: Zone swing #1 `pivotPack`, FVG env 5M `efvgReboundConfirmed`, ABS5 `efvgAbsConfirmed`, env5M `envTrend`. Each uses the same expression with the same arguments. |
+| O3 | PASS | An env TF is requested only if its result can be read. updateFvg reads an env TF only when its `reqTrend` is not OFF; Zone reads only 4H / 1H / 15M. With defaults, env5M and env1M are not requested. |
+| O4 | PASS (partial) | One 15M request (lookahead_on) carries env15M + FVG15 rebound + FVGABS15 + Accum15. One 60M request (lookahead_off) carries Zone swing #3 + Accum #1. Daily is not packed: the Zone accum D request runs before the Signal-section Daily request, and `dailyRangeMedian` uses a different lookahead. |
+| O5 | SKIPPED_UNSAFE | De-duplicating the two `updateFvg()` calls means splitting a 628-line library function whose ta history must stay per engine. That is a library change with high risk to the FVG / FVG15 state. |
+| O6 | PASS | The default Signal objects are shared (var, read-only). `DispatchStat` is a var whose 6 fields are reset every bar. The Feed objects stay per bar, because their fields are new series every bar. |
+| O7 | PASS | Main side was audited: dead scalars were already removed in P13A, and no other result is computed and then never read. Library-internal candidates are deferred. |
+| O8 | SKIPPED_UNSAFE | The Zone role lookup (O(Z·R)) is library-internal state (roleCycle / creation / cleanup timing). Equivalence cannot be proven without a library rewrite and republish. |
+
+Default issued requests: `request.security` 19 → 10 and `security_lower_tf` 2 → 1, so the total goes from 21 to 11 (−47.6 %).
+Removed defaults: env 5M, env 1M (a 1M-TF security), FVG env 5M, ABS5 5M, Zone swing 5M,
+one 1M lower_tf, and 3 of the 4 15M requests plus 1 of the 2 60M zone requests (packed).
+
+Per-bar UDT constructions in Main: 9 → 4. The 4 default Signal objects and the DispatchStat are now reused;
+FvgFeed, its copy, ZoneEnvFeed and ZoneFeed remain.
+
+Per-bar `array.new` = 0. The 3 input-only request Cfgs are var, and there are 8 provisional slots (unchanged).
+
+SignalEngine call counts are unchanged: updateFvg 2, updateFvg15 1, updateFvgAbs 1, updateZoneEvents 1, zn.update 1.
+Zone event complexity is unchanged, because O8 was skipped.
+
+**TradingView gate (one time):**
+- XAUUSD 5M, 365 days, Deep Backtest.
+- LONG = 46 and SHORT = 59, with identical entries and exits.
+- No RE10110 and no Calculation Error.
+- Check whether the Heavy Script warning still appears.
