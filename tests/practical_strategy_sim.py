@@ -1301,6 +1301,537 @@ def fixture_p04_behaviour():
           pv["previewLong15"] and not pv["long15"] and e == snap)
 
 
+# =============================================================================
+# P05 — Zone 4Logic core (static differential + behavioural mirror)
+# =============================================================================
+import difflib
+
+P05_VERBATIM = ["zoneTfPack", "zoneTfEnvOk", "zoneDailyVolOk", "zoneBaseEnvOk", "zoneDailyVolOkBreak",
+                "zoneBaseEnvOkBreak", "zoneDailyVolOkBreakLong", "zoneBaseEnvOkBreakLong", "zoneEnvLongBreak",
+                "zoneEnvShortBreak", "zoneEnvLong", "zoneEnvShort", "consumeZoneEvt"]
+
+
+def fixture_p05_static():
+    NEWS = open(os.path.join(ROOT, "SignalEnginePractical.pine"), encoding="utf-8").read()
+    for fn in P05_VERBATIM:
+        o, n = func_block(ORIG, fn), func_block(NEWS, fn)
+        check(f"ZD1 {fn}: verbatim", n != "" and n == o)
+    o = func_block(ORIG, "updateZoneEvents").split("\n")
+    n = func_block(NEWS, "updateZoneEvents").split("\n")
+    ops = difflib.SequenceMatcher(a=o, b=n, autojunk=False).get_opcodes()
+    deleted, bad = [], []
+    for tag, i1, i2, j1, j2 in ops:
+        if tag == "equal":
+            continue
+        if tag == "delete":
+            deleted += o[i1:i2]
+        elif tag == "replace" and i2 - i1 > 1 and j2 - j1 == 1 and \
+                o[i1].rstrip().rstrip(",") + ")" == n[j1].rstrip():
+            deleted += o[i1 + 1:i2]            # last kept arg line re-closed + following debug args dropped
+        else:
+            bad.append((tag, o[i1:i2][:2], n[j1:j2][:2]))
+    check("ZD2 updateZoneEvents: only deletions (+ re-closing the last kept constructor line)", not bad,
+          f"{len(deleted)} lines deleted" if not bad else str(bad)[:300])
+    # every deleted local is never read by any kept line
+    decl = set(re.findall(r"^\s+(?:int|float|bool)\s+(\w+)\s*=", "\n".join(deleted), re.M))
+    kept_code = code_only("\n".join(n))
+    leaked = sorted(v for v in decl if re.search(r"\b" + v + r"\b", kept_code))
+    check("ZD3 deleted debug locals are not read by any kept line (debug-only proven)", decl and not leaked,
+          f"decl={sorted(decl)} leaked={leaked}")
+    del_code = [ln for ln in deleted if ln.strip() and not ln.strip().startswith("//")]
+    writes_in_deleted = [ln.strip() for ln in del_code if re.search(r"\b(q|e|qb|qr)\.\w+\s*:=", ln)]
+    check("ZD3 deleted lines contain no engine / event state write", not writes_in_deleted, str(writes_in_deleted))
+    oc, nc = code_only("\n".join(o)), kept_code
+    sw = lambda b: re.findall(r"\b((?:q|qb|qr|e)\.\w+)\s*(?::=|\+=)", b)
+    check("ZD4 state write order identical (q / qb / qr / e)", sw(oc) == sw(nc), f"{len(sw(nc))} writes")
+    br = lambda b: [ln.strip() for ln in b.split("\n") if re.match(r"^\s+(if|else if|else|for|while)\b", ln)
+                    and not re.search(r"iDbgRb|oRb", ln)]
+    check("ZD4 branch / loop sequence identical (minus debug-only branches)", br(oc) == br(nc), f"{len(br(nc))}")
+    phase = lambda b: re.findall(r"\.phase\s*(?::=|==)\s*\d", b)
+    check("ZD4 phase transitions / tests identical", phase(oc) == phase(nc), " ".join(phase(nc)))
+    newev = lambda b: re.findall(r"ZoneEvt\.new\((.*?)\)\)", b, re.S)
+    check("ZD4 event creation (frozen zoneId/roleCycle/top/bottom/strength/score/side/startBar/tfSec) identical",
+          newev(oc) == newev(nc) and len(newev(nc)) == 1)
+    sig = lambda b: re.findall(r"e\.sig\w+\s*:=\s*\w+", b)
+    check("ZD4 consume index (sig slots) assignment identical", sig(oc) == sig(nc) and len(sig(nc)) == 4)
+    rets = re.findall(r"(\w+)\s*=", func_block(NEWS, "updateZoneEvents").split("ZoneLogicSignal.new(")[1])
+    check("ZD4 return fields == kept ZoneLogicSignal (8 signals + 8 previews + entryPrice)",
+          sorted(rets) == sorted(NT["ZoneLogicSignal"]), str(len(rets)))
+
+
+# ---- Python mirror of updateZoneEvents (SignalEnginePractical, debug removed) --------------------
+class ZCfg:
+    def __init__(self, **kw):
+        d = dict(enableLong=True, enableShort=True, useRebound=True, useFake=True, useRetest=True, useBreak=True,
+                 reqDailyVol="OFF", dailyLowVol=0.0, dailyHighVol=80.0, insufficientAsRange=True, breakBuffer=3.0,
+                 fakeMaxBars=10, retestMinDist=10.0, retestWidthMult=0.5, waitBars=30, minMoveAway=0.0,
+                 reboundRecoveryRatio=1.0, breakWaitBars=30, breakReqDailyVol="OFF", breakDailyLowVol=0.0,
+                 breakDailyHighVol=80.0, breakLongRefCompat=False, breakLongWaitBars=30,
+                 breakLongReqDailyVol="OFF", breakLongDailyLowVol=0.0, breakLongDailyHighVol=80.0,
+                 breakLongUseAccumNoTrade=True, breakLongUseAccumExitWait=True, breakLongUseAccumDirection=True)
+        d.update(kw)
+        self.__dict__.update(d)
+
+
+def zone_engine():
+    return dict(evts=[], barNo=0, prevClose=None, sigRebound=-1, sigFake=-1, sigRetest=-1, sigBreak=-1,
+                roleZoneId=[], roleSide=[], roleCycleNo=[], roleSeen=[], roleSeenBar=[])
+
+
+def new_evt(**kw):
+    d = dict(zoneId=None, roleCycle=0, top=None, bottom=None, strength=0, score=None, side=0, startBar=None,
+             phase=0, breakBar=None, breakDir=0, breakTime=None, rearmBar=None, touchBar=None, reclaimBar=None,
+             rejectBar=None, rejectTime=None, movedAway=False, reclaimed=False, touched=False, rejected=False,
+             fakeAlive=False, bkOnly=False, rbCancelled=False, reboundDone=False, breakDone=False, fakeDone=False,
+             retestDone=False, tfSec=0, brkTfSec=0, alive=True)
+    d.update(kw)
+    return d
+
+
+def tf_env_ok(t, e4, e1, e15):
+    t = dict(dict(up4H=False, rg4H=False, dn4H=False, up1H=False, rg1H=False, dn1H=False, up15M=False,
+                  rg15M=False, dn15M=False, useAnd=False), **(t or {}))
+    en4, en1, en15 = t["up4H"] or t["rg4H"] or t["dn4H"], t["up1H"] or t["rg1H"] or t["dn1H"], \
+        t["up15M"] or t["rg15M"] or t["dn15M"]
+    v4, v1, v15 = e4 or 0, e1 or 0, e15 or 0
+    ok = lambda u, r, d, v: (u and v == 1) or (r and v == 0) or (d and v == -1)
+    ok4, ok1, ok15 = ok(t["up4H"], t["rg4H"], t["dn4H"], v4), ok(t["up1H"], t["rg1H"], t["dn1H"], v1), \
+        ok(t["up15M"], t["rg15M"], t["dn15M"], v15)
+    if en4 or en1 or en15:
+        if t["useAnd"]:
+            return (not en4 or ok4) and (not en1 or ok1) and (not en15 or ok15)
+        return (en4 and ok4) or (en1 and ok1) or (en15 and ok15)
+    return True
+
+
+def daily_vol_ok(req, lo, hi, ins_as_range, med):
+    code = None if med is None else (1 if med >= hi else -1 if med < lo else 0)
+    ins = code is None
+    adj = (0 if ins_as_range else None) if ins else code
+    return (req == "OFF" or vol_text(adj) == req) and not (req != "OFF" and ins and not ins_as_range)
+
+
+def zone_env(c, f, t, long_, brk=False):
+    base = f["sessionOk"] and f["newsOk"] and f["volOk"]
+    if brk and long_:
+        cp = c.breakLongRefCompat
+        req, lo, hi = (c.breakLongReqDailyVol, c.breakLongDailyLowVol, c.breakLongDailyHighVol) if cp else \
+            (c.breakReqDailyVol, c.breakDailyLowVol, c.breakDailyHighVol)
+        wait = False if (cp and not c.breakLongUseAccumExitWait) else f["blockedByExitWait"]
+        blk = False if (cp and not c.breakLongUseAccumNoTrade) else f["blockedByAccumLong"]
+        dok = True if (cp and not c.breakLongUseAccumDirection) else f["accumLongDirOk"]
+        return base and daily_vol_ok(req, lo, hi, c.insufficientAsRange, f["drMedianRange"]) and not wait and \
+            not blk and dok and tf_env_ok(t, f["env4H"], f["env1H"], f["env15M"])
+    if brk:
+        dv = daily_vol_ok(c.breakReqDailyVol, c.breakDailyLowVol, c.breakDailyHighVol, c.insufficientAsRange,
+                          f["drMedianRange"])
+    else:
+        dv = daily_vol_ok(c.reqDailyVol, c.dailyLowVol, c.dailyHighVol, c.insufficientAsRange, f["drMedianRange"])
+    blk = f["blockedByAccumLong"] if long_ else f["blockedByAccumShort"]
+    dok = f["accumLongDirOk"] if long_ else f["accumShortDirOk"]
+    return base and dv and not f["blockedByExitWait"] and not blk and dok and \
+        tf_env_ok(t, f["env4H"], f["env1H"], f["env15M"])
+
+
+def zfeed(**kw):
+    d = dict(sessionOk=True, newsOk=True, volOk=True, blockedByAccumLong=False, blockedByAccumShort=False,
+             blockedByExitWait=False, accumLongDirOk=True, accumShortDirOk=True, env4H=1, env1H=1, env15M=1,
+             drMedianRange=50.0)
+    d.update(kw)
+    return d
+
+
+def update_zone(e, c, f, v, snap, tf, brkClose, brkValid, bar, t, confirmed=True, opens=(False,) * 4):
+    """snap: list of (id, side, top, bot, str, score); tf: list of (c, h, l, bull, bear)."""
+    v = v or {}
+    envRbL, envRbS = zone_env(c, f, v.get("rbL"), True), zone_env(c, f, v.get("rbS"), False)
+    envFkL, envFkS = zone_env(c, f, v.get("fkL"), True), zone_env(c, f, v.get("fkS"), False)
+    envRtL, envRtS = zone_env(c, f, v.get("rtL"), True), zone_env(c, f, v.get("rtS"), False)
+    envBkL, envBkS = zone_env(c, f, v.get("bkL"), True, True), zone_env(c, f, v.get("bkS"), False, True)
+    oRb, oFk, oRt, oBk = opens
+    aRbL, aRbS = c.useRebound and c.enableLong and envRbL and not oRb, c.useRebound and c.enableShort and envRbS and not oRb
+    aFkL, aFkS = c.useFake and c.enableLong and envFkL and not oFk, c.useFake and c.enableShort and envFkS and not oFk
+    aRtL, aRtS = c.useRetest and c.enableLong and envRtL and not oRt, c.useRetest and c.enableShort and envRtS and not oRt
+    aBkL, aBkS = c.useBreak and c.enableLong and envBkL and not oBk, c.useBreak and c.enableShort and envBkS and not oBk
+    effBk = c.breakWaitBars if c.useBreak else c.waitBars
+    effBkL = (c.breakLongWaitBars if c.breakLongRefCompat else c.breakWaitBars) if c.useBreak else c.waitBars
+    e["evts"] = [q for q in e["evts"] if q["alive"]]
+    if len(e["evts"]) > 60:
+        cut, bi = len(e["evts"]) - 60, 0
+        while cut > 0 and bi < len(e["evts"]):
+            if e["evts"][bi]["bkOnly"]:
+                e["evts"].pop(bi); cut -= 1
+            else:
+                bi += 1
+    while len(e["evts"]) > 60:
+        e["evts"].pop(0)
+    e["roleSeen"] = [False] * len(e["roleZoneId"])
+    for (zi, zs, _, _, _, _) in snap:
+        ri = -1
+        for j, z in enumerate(e["roleZoneId"]):
+            if z == zi:
+                ri = j
+        if ri < 0:
+            e["roleZoneId"].append(zi); e["roleSide"].append(zs); e["roleCycleNo"].append(1)
+            e["roleSeen"].append(True); e["roleSeenBar"].append(bar)
+        else:
+            e["roleSeen"][ri], e["roleSeenBar"][ri] = True, bar
+            if e["roleSide"][ri] != zs:
+                e["roleSide"][ri] = zs
+                e["roleCycleNo"][ri] += 1
+    for i in range(len(e["roleZoneId"])):
+        if not e["roleSeen"][i] and e["roleSide"][i] != 0:
+            e["roleSide"][i] = 0
+    rbL = rbS = fkL = fkS = rtL = rtS = bkL = bkS = False
+    iRb = iFk = iRt = iBk = -1
+    for (tc, th, tl, tb, ts) in tf:
+        e["barNo"] += 1
+        if snap and e["prevClose"] is not None:
+            for (zi, zs, zt, zb, zstr, zsc) in snap:
+                hit = tl <= zt and th >= zb
+                sd = 1 if e["prevClose"] > zt else -1 if e["prevClose"] < zb else 0
+                if hit and sd != 0 and sd == zs:
+                    rc = 0
+                    for j, z in enumerate(e["roleZoneId"]):
+                        if z == zi:
+                            rc = e["roleCycleNo"][j]
+                    exists = any(q["alive"] and not q["bkOnly"] and q["zoneId"] == zi and q["side"] == sd and
+                                 q["roleCycle"] == rc for q in e["evts"])
+                    if not exists:
+                        e["evts"].append(new_evt(zoneId=zi, roleCycle=rc, top=zt, bottom=zb, strength=zstr,
+                                                 score=zsc, side=sd, startBar=e["barNo"], phase=0, tfSec=60))
+        for i, q in enumerate(e["evts"]):
+            if not q["alive"]:
+                continue
+            w = q["top"] - q["bottom"]
+            rd = max(c.retestMinDist, w * c.retestWidthMult)
+            if q["phase"] == 0:
+                brk1m = tc < q["bottom"] - c.breakBuffer if q["side"] > 0 else tc > q["top"] + c.breakBuffer
+                if brk1m:
+                    q["rbCancelled"] = True
+                if not q["rbCancelled"]:
+                    rcvL = q["top"] if c.reboundRecoveryRatio >= 1.0 else q["bottom"] + w * c.reboundRecoveryRatio
+                    rcvS = q["bottom"] if c.reboundRecoveryRatio >= 1.0 else q["top"] - w * c.reboundRecoveryRatio
+                    if c.minMoveAway <= 0 and c.reboundRecoveryRatio >= 1.0:
+                        q["movedAway"] = True
+                    elif q["side"] > 0 and tc >= rcvL + c.minMoveAway:
+                        q["movedAway"] = True
+                    elif q["side"] < 0 and tc <= rcvS - c.minMoveAway:
+                        q["movedAway"] = True
+                el0 = e["barNo"] - q["startBar"]
+                if c.useBreak and el0 > c.waitBars:
+                    q["bkOnly"] = True
+                elMax = effBkL if q["side"] < 0 else effBk
+                if el0 > max(c.waitBars, elMax):
+                    q["alive"] = False
+                if q["alive"] and not q["bkOnly"] and not q["rbCancelled"] and not q["reboundDone"] and q["movedAway"] and iRb < 0:
+                    if q["side"] > 0 and tb and aRbL:
+                        rbL, iRb = True, i
+                    elif q["side"] < 0 and ts and aRbS:
+                        rbS, iRb = True, i
+            elif q["phase"] == 1:
+                el = e["barNo"] - q["breakBar"]
+                if el > c.fakeMaxBars:
+                    q["fakeAlive"] = False
+                if q["fakeAlive"]:
+                    if not q["reclaimed"]:
+                        if q["side"] > 0 and tc > q["top"]:
+                            q["reclaimed"], q["reclaimBar"] = True, e["barNo"]
+                        elif q["side"] < 0 and tc < q["bottom"]:
+                            q["reclaimed"], q["reclaimBar"] = True, e["barNo"]
+                    if not q["fakeDone"] and q["reclaimed"] and q["reclaimBar"] is not None and e["barNo"] >= q["reclaimBar"] and iFk < 0:
+                        if q["side"] > 0 and tb and aFkL:
+                            fkL, iFk = True, i
+                        elif q["side"] < 0 and ts and aFkS:
+                            fkS, iFk = True, i
+                far = tc <= q["bottom"] - rd if q["side"] > 0 else tc >= q["top"] + rd
+                if far:
+                    q.update(phase=2, rearmBar=e["barNo"], fakeAlive=False, reclaimed=False, reclaimBar=None,
+                             touched=False, rejected=False)
+                elif el > max(c.fakeMaxBars, c.waitBars):
+                    q["alive"] = False
+            else:
+                invalid = tc > q["top"] if q["side"] > 0 else tc < q["bottom"]
+                if invalid:
+                    q["alive"] = False
+                else:
+                    if not q["touched"] and tl <= q["top"] and th >= q["bottom"]:
+                        q["touched"], q["touchBar"] = True, e["barNo"]
+                    if q["touched"] and not q["rejected"]:
+                        rej = tc < q["bottom"] if q["side"] > 0 else tc > q["top"]
+                        if rej:
+                            q["rejected"], q["rejectBar"], q["rejectTime"] = True, e["barNo"], t
+                    if not q["touched"] and e["barNo"] - q["rearmBar"] > c.waitBars:
+                        q["alive"] = False
+                    if q["touched"] and e["barNo"] - q["touchBar"] > c.waitBars:
+                        q["alive"] = False
+                    if q["alive"] and q["rejected"] and q["rejectBar"] is not None and e["barNo"] >= q["rejectBar"] and not q["retestDone"] and iRt < 0:
+                        if q["side"] > 0 and ts and aRtS:
+                            rtS, iRt = True, i
+                        elif q["side"] < 0 and tb and aRtL:
+                            rtL, iRt = True, i
+        e["prevClose"] = tc
+    if 0 <= iRt < len(e["evts"]) and not e["evts"][iRt]["alive"]:
+        rtL = rtS = False
+        iRt = -1
+    if brkValid and brkClose is not None:
+        for i, qb in enumerate(e["evts"]):
+            if qb["alive"] and qb["phase"] == 0:
+                brk5 = brkClose < qb["bottom"] - c.breakBuffer if qb["side"] > 0 else brkClose > qb["top"] + c.breakBuffer
+                if brk5:
+                    elB = e["barNo"] - qb["startBar"]
+                    okB = c.useBreak and elB <= (effBkL if qb["side"] < 0 else effBk)
+                    if qb["bkOnly"]:
+                        if okB and not qb["breakDone"] and iBk < 0:
+                            if qb["side"] > 0 and aBkS:
+                                bkS, iBk = True, i
+                            elif qb["side"] < 0 and aBkL:
+                                bkL, iBk = True, i
+                        qb["alive"] = False
+                    else:
+                        qb.update(phase=1, breakBar=e["barNo"], breakDir=-qb["side"], breakTime=t, brkTfSec=300,
+                                  fakeAlive=True, reclaimed=False, reclaimBar=None, touched=False, rejected=False,
+                                  rejectBar=None)
+                        if okB and not qb["breakDone"] and iBk < 0:
+                            if qb["side"] > 0 and aBkS:
+                                bkS, iBk = True, i
+                            elif qb["side"] < 0 and aBkL:
+                                bkL, iBk = True, i
+    e["sigRebound"], e["sigFake"], e["sigRetest"], e["sigBreak"] = iRb, iFk, iRt, iBk
+    cf = confirmed
+    return dict(reboundLong=rbL and cf, reboundShort=rbS and cf, fakeLong=fkL and cf, fakeShort=fkS and cf,
+                retestLong=rtL and cf, retestShort=rtS and cf, breakLong=bkL and cf, breakShort=bkS and cf,
+                pvReboundLong=rbL, pvReboundShort=rbS, pvFakeLong=fkL, pvFakeShort=fkS, pvRetestLong=rtL,
+                pvRetestShort=rtS, pvBreakLong=bkL, pvBreakShort=bkS)
+
+
+def consume_zone_(e, kind):
+    idx = [e["sigRebound"], e["sigFake"], e["sigRetest"], e["sigBreak"]][kind]
+    if idx is not None and 0 <= idx < len(e["evts"]):
+        q = e["evts"][idx]
+        if kind == 0:
+            q.update(reboundDone=True, alive=False)
+        elif kind == 1:
+            q.update(fakeDone=True, retestDone=True, alive=False)
+        elif kind == 2:
+            q.update(retestDone=True, alive=False)
+        else:
+            q["breakDone"] = True
+
+
+SUP = [(7, 1, 4065.0, 4045.0, 3, 12.0)]          # Support zone 4045-4065 (trackId 7)
+RES = [(8, -1, 4065.0, 4045.0, 3, 12.0)]         # Resistance zone 4045-4065 (trackId 8)
+
+
+def bar1(c_, h=None, l=None, bull=False, bear=False):
+    return (c_, c_ + 1 if h is None else h, c_ - 1 if l is None else l, bull, bear)
+
+
+def run_bars(e, c, snap, bars, f=None, brk=None, start=1, confirmed=True):
+    out = []
+    for k, tfb in enumerate(bars):
+        bc = None if brk is None else brk[k]
+        out.append(update_zone(e, c, f or zfeed(), None, snap, [tfb], bc, bc is not None, start + k,
+                               (start + k) * 60, confirmed))
+    return out
+
+
+def fixture_p05_events():
+    c = ZCfg()
+    # ZEV1 Support approached from above -> event side +1
+    e = zone_engine()
+    run_bars(e, c, SUP, [bar1(4080), bar1(4062, l=4060)])
+    q = e["evts"][0] if e["evts"] else {}
+    check("ZEV1 Support approached from above -> event (side +1, frozen top/bottom/strength/score/zoneId/roleCycle)",
+          len(e["evts"]) == 1 and q["side"] == 1 and (q["top"], q["bottom"], q["strength"], q["score"], q["zoneId"],
+                                                       q["roleCycle"]) == (4065.0, 4045.0, 3, 12.0, 7, 1))
+    # ZEV2 Support entered from below -> no event
+    e = zone_engine()
+    run_bars(e, c, SUP, [bar1(4030), bar1(4050, h=4052)])
+    check("ZEV2 Support entered from below -> no event", e["evts"] == [])
+    e = zone_engine()
+    run_bars(e, c, SUP, [bar1(4055), bar1(4050)])
+    check("ZEV2b start inside the zone (prevClose inside) -> no event", e["evts"] == [])
+    # ZEV3 Resistance approached from below -> side -1
+    e = zone_engine()
+    run_bars(e, c, RES, [bar1(4030), bar1(4048, h=4050)])
+    check("ZEV3 Resistance approached from below -> event side -1", len(e["evts"]) == 1 and e["evts"][0]["side"] == -1)
+    # ZEV4 Resistance entered from above -> none
+    e = zone_engine()
+    run_bars(e, c, RES, [bar1(4080), bar1(4062, l=4060)])
+    check("ZEV4 Resistance entered from above -> no event", e["evts"] == [])
+    # ZEV5 no duplicate for same zoneId+side+roleCycle
+    e = zone_engine()
+    run_bars(e, c, SUP, [bar1(4080), bar1(4062, l=4060), bar1(4070), bar1(4063, l=4061)])
+    check("ZEV5 same zoneId+side+roleCycle not registered twice", len(e["evts"]) == 1)
+    # ZEV6 role re-established -> roleCycle+1 -> new event allowed even with the old one alive
+    e = zone_engine()
+    run_bars(e, c, SUP, [bar1(4080), bar1(4062, l=4060)])
+    run_bars(e, c, [], [bar1(4080)], start=3)                 # zone leaves snapshot -> role 0
+    run_bars(e, c, SUP, [bar1(4080), bar1(4062, l=4060)], start=4)
+    cyc = sorted(q["roleCycle"] for q in e["evts"])
+    check("ZEV6 role lost then re-established -> roleCycle 2 -> new event while gen-1 still alive",
+          cyc == [1, 2] and all(q["alive"] for q in e["evts"]), str(cyc))
+
+
+def fixture_p05_rebound_break():
+    c = ZCfg(useBreak=True)
+    # ZRB1 touch -> recovery (close >= top) -> bull BOS -> rebound long
+    e = zone_engine()
+    r = run_bars(e, c, SUP, [bar1(4080), bar1(4058, l=4050), bar1(4066), bar1(4068, bull=True)])
+    check("ZRB1 Long: touch -> recovery above top -> BOS -> reboundLong", r[-1]["reboundLong"] and not any(
+        x["reboundLong"] for x in r[:-1]))
+    e = zone_engine()
+    r = run_bars(e, c, RES, [bar1(4030), bar1(4050, h=4058), bar1(4044), bar1(4042, bear=True)])
+    check("ZRB1s Short symmetric: reboundShort", r[-1]["reboundShort"])
+    # ZRB2 BOS before recovery -> no rebound (needs minMoveAway / ratio < 1 for a real recovery gate)
+    c2 = ZCfg(minMoveAway=2.0)
+    e = zone_engine()
+    r = run_bars(e, c2, SUP, [bar1(4080), bar1(4058, l=4050, bull=True), bar1(4066), bar1(4068)])
+    check("ZRB2 BOS before recovery -> no rebound (recovery 4065+2 reached only after the BOS)",
+          not any(x["reboundLong"] for x in r))
+    # ZRB3 1M close through breakBuffer -> rbCancelled, no rebound afterwards
+    e = zone_engine()
+    r = run_bars(e, c, SUP, [bar1(4080), bar1(4050, l=4046), bar1(4040), bar1(4068, bull=True)])
+    check("ZRB3 1M close < bottom - buffer -> rbCancelled; later BOS does not fire rebound",
+          e["evts"][0]["rbCancelled"] and not any(x["reboundLong"] for x in r))
+    # ZRB4 env NG at signal time -> no signal (env evaluated only at signal)
+    e = zone_engine()
+    run_bars(e, c, SUP, [bar1(4080), bar1(4058, l=4050), bar1(4066)])
+    ng = update_zone(e, c, zfeed(sessionOk=False), None, SUP, [bar1(4068, bull=True)], None, False, 4, 240)
+    e = zone_engine()
+    run_bars(e, c, SUP, [bar1(4080), bar1(4058, l=4050)], f=zfeed(sessionOk=False))   # NG at start only
+    ok = run_bars(e, c, SUP, [bar1(4066), bar1(4068, bull=True)], start=3)
+    tfng = update_zone(zone_engine(), c, zfeed(env4H=-1), {"rbL": dict(up4H=True)}, SUP, [bar1(4080)], None, False, 1, 60)
+    check("ZRB4 env NG at signal -> none; NG only at event start -> signal ok (env not frozen)",
+          not ng["reboundLong"] and ok[-1]["reboundLong"])
+    # ZBK1 1M close through only -> no break
+    e = zone_engine()
+    r = run_bars(e, c, SUP, [bar1(4080), bar1(4050, l=4046), bar1(4040)], brk=[None, None, None])
+    check("ZBK1 1M close through without a valid break-TF close -> no Break, phase stays 0",
+          not any(x["breakShort"] for x in r) and e["evts"][0]["phase"] == 0)
+    # ZBK2 brkValid + break-TF close beyond bottom - buffer -> breakShort, phase 1
+    e = zone_engine()
+    r = run_bars(e, c, SUP, [bar1(4080), bar1(4050, l=4046), bar1(4040)], brk=[None, None, 4040.0])
+    check("ZBK2 Support: valid break-TF close < bottom - buffer -> breakShort; event phase 1 frozen",
+          r[-1]["breakShort"] and e["evts"][0]["phase"] == 1 and e["evts"][0]["breakDir"] == -1)
+    e = zone_engine()
+    r = run_bars(e, c, RES, [bar1(4030), bar1(4050, h=4058), bar1(4070)], brk=[None, None, 4070.0])
+    check("ZBK2s Resistance: break-TF close > top + buffer -> breakLong", r[-1]["breakLong"])
+    e = zone_engine()
+    r = run_bars(e, c, SUP, [bar1(4080), bar1(4050, l=4046), bar1(4043)], brk=[None, None, 4042.0])
+    check("ZBK2b strict: close == bottom - buffer (4042) -> no break", not r[-1]["breakShort"])
+    # ZBK3 consume break keeps event alive
+    e = zone_engine()
+    run_bars(e, c, SUP, [bar1(4080), bar1(4050, l=4046), bar1(4040)], brk=[None, None, 4040.0])
+    consume_zone_(e, 3)
+    check("ZBK3 consume Break (kind 3) -> breakDone, event stays alive (Fake / Retest continue)",
+          e["evts"][0]["breakDone"] and e["evts"][0]["alive"])
+
+
+def fixture_p05_fake_retest():
+    c = ZCfg(useBreak=True)
+    pre = [bar1(4080), bar1(4050, l=4046), bar1(4040)]
+    brk = [None, None, 4040.0]
+    # ZFK1 break -> reclaim (close > top) -> bull BOS -> fakeLong (Support broken down, reclaimed up)
+    e = zone_engine()
+    run_bars(e, c, SUP, pre, brk=brk)
+    r = run_bars(e, c, SUP, [bar1(4066), bar1(4068, bull=True)], start=4)
+    check("ZFK1 Break -> full reclaim -> BOS -> fakeLong", r[-1]["fakeLong"])
+    e = zone_engine()
+    run_bars(e, c, RES, [bar1(4030), bar1(4050, h=4058), bar1(4070)], brk=[None, None, 4070.0])
+    r = run_bars(e, c, RES, [bar1(4044), bar1(4042, bear=True)], start=4)
+    check("ZFK1s symmetric fakeShort", r[-1]["fakeShort"])
+    # ZFK2 BOS before reclaim -> no fake
+    e = zone_engine()
+    run_bars(e, c, SUP, pre, brk=brk)
+    r = run_bars(e, c, SUP, [bar1(4050, bull=True), bar1(4066)], start=4)
+    check("ZFK2 BOS before reclaim -> no fake (reclaim bar has no BOS)", not any(x["fakeLong"] for x in r))
+    # ZFK3 fakeMaxBars exceeded -> no fake
+    cf = ZCfg(useBreak=True, fakeMaxBars=2)
+    e = zone_engine()
+    run_bars(e, cf, SUP, pre, brk=brk)
+    r = run_bars(e, cf, SUP, [bar1(4040), bar1(4041), bar1(4042), bar1(4066, bull=True)], start=4)
+    check("ZFK3 reclaim after fakeMaxBars -> fakeAlive false -> no fake", not any(x["fakeLong"] for x in r))
+    # ZRT1 touch right after break (not rearmed) -> no retest
+    e = zone_engine()
+    run_bars(e, c, SUP, pre, brk=brk)
+    r = run_bars(e, c, SUP, [bar1(4044, h=4046), bar1(4040, bear=True)], start=4)
+    check("ZRT1 touch right after break (no rearm) -> no retestShort", not any(x["retestShort"] for x in r)
+          and e["evts"][0]["phase"] == 1)
+    # ZRT2 rearm (far >= max(10, 20*0.5)=10 below bottom) -> touch -> rejection -> BOS -> retestShort
+    e = zone_engine()
+    run_bars(e, c, SUP, pre, brk=brk)
+    r = run_bars(e, c, SUP, [bar1(4034), bar1(4044, h=4047), bar1(4043), bar1(4041, bear=True)], start=4)
+    check("ZRT2 rearm -> touch -> rejection -> BOS -> retestShort", r[-1]["retestShort"]
+          and not any(x["retestShort"] for x in r[:-1]))
+    e = zone_engine()
+    run_bars(e, c, RES, [bar1(4030), bar1(4050, h=4058), bar1(4070)], brk=[None, None, 4070.0])
+    r = run_bars(e, c, RES, [bar1(4076), bar1(4066, l=4063), bar1(4067), bar1(4069, bull=True)], start=4)
+    check("ZRT2s symmetric retestLong", r[-1]["retestLong"])
+    # ZRT3 BOS before rejection -> no retest
+    e = zone_engine()
+    run_bars(e, c, SUP, pre, brk=brk)
+    r = run_bars(e, c, SUP, [bar1(4034), bar1(4046, h=4047, bear=True), bar1(4043)], start=4)
+    check("ZRT3 BOS at touch bar before rejection -> no retest on that bar; rejection bar without BOS -> none",
+          not any(x["retestShort"] for x in r))
+    # ZRT4 reverse full reclaim -> retest event invalid
+    e = zone_engine()
+    run_bars(e, c, SUP, pre, brk=brk)
+    r = run_bars(e, c, SUP, [bar1(4034), bar1(4066), bar1(4041, bear=True)], start=4)
+    check("ZRT4 close > top during retest -> event dead -> no retest",
+          not any(x["retestShort"] for x in r) and (not e["evts"] or not e["evts"][0]["alive"]))
+    # same-chart-bar cancel: retest fires on an early 1M then invalidated later in the same chart bar
+    e = zone_engine()
+    run_bars(e, c, SUP, pre, brk=brk)
+    run_bars(e, c, SUP, [bar1(4034), bar1(4044, h=4047), bar1(4043)], start=4)
+    rr = update_zone(e, c, zfeed(), None, SUP, [bar1(4041, bear=True), bar1(4066)], None, False, 7, 420)
+    check("ZRT4b retest BOS then reverse reclaim within the same chart bar -> signal cancelled",
+          not rr["retestShort"] and e["sigRetest"] == -1)
+
+
+def fixture_p05_consume_preview():
+    c = ZCfg(useBreak=True)
+    e = zone_engine()
+    r = run_bars(e, c, SUP, [bar1(4080), bar1(4058, l=4050), bar1(4066), bar1(4068, bull=True)])
+    idx = e["sigRebound"]
+    consume_zone_(e, 0)
+    check("ZCON1 kind 0 Rebound -> reboundDone, alive=false (index = sigRebound)",
+          r[-1]["reboundLong"] and e["evts"][idx]["reboundDone"] and not e["evts"][idx]["alive"])
+    e = zone_engine()
+    run_bars(e, c, SUP, [bar1(4080), bar1(4050, l=4046), bar1(4040)], brk=[None, None, 4040.0])
+    run_bars(e, c, SUP, [bar1(4066), bar1(4068, bull=True)], start=4)
+    consume_zone_(e, 1)
+    q = e["evts"][0]
+    check("ZCON1 kind 1 Fake -> fakeDone, retestDone, alive=false", q["fakeDone"] and q["retestDone"] and not q["alive"])
+    e = zone_engine()
+    run_bars(e, c, SUP, [bar1(4080), bar1(4050, l=4046), bar1(4040)], brk=[None, None, 4040.0])
+    run_bars(e, c, SUP, [bar1(4034), bar1(4044, h=4047), bar1(4043), bar1(4041, bear=True)], start=4)
+    consume_zone_(e, 2)
+    q = e["evts"][0]
+    check("ZCON1 kind 2 Retest -> retestDone, alive=false", q["retestDone"] and not q["alive"])
+    e = zone_engine()
+    run_bars(e, c, SUP, [bar1(4080), bar1(4058, l=4050), bar1(4066)])
+    consume_zone_(e, 0)
+    check("ZCON1 signal not produced -> sig index -1 -> consume is a no-op", e["evts"][0]["alive"]
+          and not e["evts"][0]["reboundDone"])
+    # ZPV1 preview == raw signal without confirmation, 8 fields
+    e = zone_engine()
+    run_bars(e, c, SUP, [bar1(4080), bar1(4058, l=4050), bar1(4066)])
+    snap_ = repr(e)
+    pv = update_zone(e, c, zfeed(), None, SUP, [bar1(4068, bull=True)], None, False, 4, 240, confirmed=False)
+    keys = ["pvReboundLong", "pvReboundShort", "pvFakeLong", "pvFakeShort", "pvRetestLong", "pvRetestShort",
+            "pvBreakLong", "pvBreakShort"]
+    check("ZPV1 8 preview fields present; preview = same raw flag, confirmed = raw and isconfirmed",
+          all(k in pv for k in keys) and pv["pvReboundLong"] and not pv["reboundLong"])
+    e2 = zone_engine()
+    run_bars(e2, c, SUP, [bar1(4080), bar1(4058, l=4050), bar1(4066)])
+    cf = update_zone(e2, c, zfeed(), None, SUP, [bar1(4068, bull=True)], None, False, 4, 240, confirmed=True)
+    e.pop("_", None)
+    check("ZPV2 preview call mutates state exactly like the confirmed call (Pine rolls back realtime ticks; "
+          "no extra preview-only write)", repr(e) == repr(e2) and cf["reboundLong"])
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -1316,6 +1847,11 @@ if __name__ == "__main__":
     fixture_p03_fvg15()
     fixture_p04_static()
     fixture_p04_behaviour()
+    fixture_p05_static()
+    fixture_p05_events()
+    fixture_p05_rebound_break()
+    fixture_p05_fake_retest()
+    fixture_p05_consume_preview()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
