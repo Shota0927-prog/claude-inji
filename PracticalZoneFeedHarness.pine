@@ -1,0 +1,468 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  Practical Zone Feed Harness (P02)  —  Zone Feed / ZoneCfg / ZoneEngine update 検証用
+// ============================================================================
+//  Practical Zone Strategy (LONG / SHORT) の Zone 経路だけを単独で確定・検証する
+//  ための indicator。最終 Strategy ではない。
+//
+//  ・Zone input / ZoneCfg 代入 / Zone Source Feed / Break Feed / Trading day /
+//    ZoneFeed / zn.update は ZoneVisualPractical と同一の意味論・同一の式。
+//  ・Structural SL / TP の input と ZoneCfg 代入は 旧 FvgZoneStrategy (Main) が正本
+//    (ZoneVisualPractical には存在しないため)。P02 では TradePlan を使わないが、
+//    後で Strategy 側と値が分岐しないよう ZoneCfg に保持する。
+//  ・ZoneEngine は1個だけ。zn.update はチャートバーごとに1回だけ。
+//  ・ZoneCfg は var + barstate.isfirst で1回だけ設定 (Visual は毎バー再生成)。
+//
+//  含めないもの:
+//    strategy.* / SignalEnginePractical / FVG / Entry Logic / Alert / Break Even /
+//    Risk / Qty / box / label / table / drawOrder / source text / HTF text
+// ============================================================================
+
+//@version=5
+indicator(
+     title            = "Practical Zone Feed Harness (P02)",
+     shorttitle       = "ZONE-P02",
+     overlay          = true,
+     dynamic_requests = true)
+
+import sekine3310/ZoneEnginePractical/3 as zn
+
+// ============================================================================
+// 01-2. ZONE ENGINE INPUTS
+// ============================================================================
+// ---- 2.1 Zone Geometry -----------------------------------------------------
+var string G_ZONE = "02 · Zone Geometry"
+zoneHalfWidth = input.float(3.0, "Zone Half Width ($)", minval = 0.1, step = 0.5, group = G_ZONE,
+     tooltip = "各Source (RawZone) = 中心価格 ± この値。\n" +
+     "最終Zoneは Cluster内の全RawZoneを包む範囲 (min bottom ～ max top)。最大幅capなし。")
+
+// ---- 2.2 MA Source (1分足コンテキストで直接計算) ---------------------------
+var string G_MA = "02 · MA Source"
+maTf = input.timeframe("1", "MA Timeframe", group = G_MA,
+     tooltip = "既定 1分足。1分足コンテキスト内でMAを計算し、その結果を5分足へ取得する。")
+maType = input.string("EMA", "MA Type", options = ["SMA", "EMA"], group = G_MA)
+useMaSource = input.bool(true, "Enable MA Source", group = G_MA)
+// ★ ma1Len / ma2Len / 各TF は request.security・zn.maPack へ渡すため
+//   「input変数のまま (simple修飾)」保持する。UDTのフィールド読み出しは series 扱いになり、
+//   request.security の timeframe や ta.ema の length には使えないため。
+ma1Len = input.int(2000, "MA #1 Length", minval = 1, maxval = 4999, group = G_MA)
+ma2Len = input.int(3000, "MA #2 Length", minval = 1, maxval = 4999, group = G_MA)
+slopeLookback = input.int(60, "Slope Lookback (MA TF bars)", minval = 1, group = G_MA)
+scoreMa1 = input.float(2.0, "Base Score · MA #1", step = 0.5, group = G_MA)
+scoreMa2 = input.float(2.0, "Base Score · MA #2", step = 0.5, group = G_MA)
+
+// ---- 2.3 MA Slope ----------------------------------------------------------
+var string G_SLOPE = "02 · MA Slope"
+slopeThrMod = input.float(1.0, "Slope Threshold · Moderate ($/lookback)", step = 0.1, group = G_SLOPE)
+slopeThrStrong = input.float(3.0, "Slope Threshold · Strong ($/lookback)",   step = 0.1, group = G_SLOPE)
+slopeBonusFlat = input.float(0.0, "Slope Bonus · Flat",     step = 0.5, group = G_SLOPE)
+slopeBonusMod = input.float(1.0, "Slope Bonus · Moderate", step = 0.5, group = G_SLOPE)
+slopeBonusStr = input.float(2.0, "Slope Bonus · Strong",   step = 0.5, group = G_SLOPE)
+slopeBonusMode = input.string("Sum (per MA)", "Slope Bonus Aggregation in Cluster",
+     options = ["Sum (per MA)", "Max"], group = G_SLOPE,
+     tooltip = "同一Cluster内に2000MAと3000MAが両方入った場合、Slope Bonusを合算するか最大値のみ採用するか。")
+maClusterDist = input.float(20.0, "MA Cluster Distance ($)", step = 1.0, group = G_SLOPE)
+maClusterBonus = input.float(1.0, "MA Cluster Bonus",              step = 0.5, group = G_SLOPE)
+maClusterDirBonus = input.float(1.0, "MA Cluster Bonus · Same Slope", step = 0.5, group = G_SLOPE)
+
+// ---- 2.4 Horizontal Source -------------------------------------------------
+var string G_HZ = "02 · Horizontal Source (Swing)"
+useHzSource = input.bool(true, "Enable Horizontal Source", group = G_HZ)
+hzTf1 = input.timeframe("5",  "Horizontal TF #1", group = G_HZ)
+hzTf2 = input.timeframe("15", "Horizontal TF #2", group = G_HZ)
+hzTf3 = input.timeframe("60", "Horizontal TF #3", group = G_HZ)
+pivLen1 = input.int(10, "Swing Pivot Length · TF #1", minval = 1, group = G_HZ)
+pivLen2 = input.int(8,  "Swing Pivot Length · TF #2", minval = 1, group = G_HZ)
+pivLen3 = input.int(6,  "Swing Pivot Length · TF #3", minval = 1, group = G_HZ)
+scoreHz1 = input.float(1.0, "Base Score · TF #1 Swing", step = 0.5, group = G_HZ)
+scoreHz2 = input.float(2.0, "Base Score · TF #2 Swing", step = 0.5, group = G_HZ)
+scoreHz3 = input.float(3.0, "Base Score · TF #3 Swing", step = 0.5, group = G_HZ)
+
+// ---- 2.5 Strong Touch Count (Strengthには一切影響しない) ------------------
+var string G_TOUCH = "02 · Strong Touch Count"
+touchRearmDist = input.float(10.0, "Touch Re-arm Distance ($)", minval = 0.0, step = 0.5, group = G_TOUCH,
+     tooltip = "Strong / Very Strong の SUPPORT / RESISTANCE Zone に接触すると Touch +1。\n" +
+     "同じ接触中は増えない。ローソク全体がZoneからこの距離以上離れたら再Armし、\n" +
+     "次の接触で再び +1。Touch Count は Score / Strength に一切加算しない。")
+
+// ---- 2.6 Day High / Low ----------------------------------------------------
+var string G_DHL = "02 · Day High / Low"
+useDayHL = input.bool(true, "Enable Day High / Low Source", group = G_DHL)
+dayTz        = input.string("Asia/Tokyo", "Day Session Timezone", group = G_DHL)
+dayResetHour = input.int(5, "Day Reset Hour (取引日の開始時刻)", minval = 0, maxval = 23, group = G_DHL,
+     tooltip = "既定 5 = 日本時間 05:00 ～ 翌 04:59 を1取引日として扱う。0 にすると暦日基準。")
+scoreDayHL = input.float(3.0, "Base Score · Day High / Low", step = 0.5, group = G_DHL)
+carryPrevDayHL = input.bool(false, "Carry Previous Day H/L as Horizontal Zone", group = G_DHL)
+scorePrevDayHL = input.float(2.0, "Base Score · Carried Prev Day H/L", step = 0.5, group = G_DHL)
+lifePrevDayHL = input.float(5.0, "Lifetime · Carried Prev Day H/L (days)", step = 1.0, group = G_DHL)
+
+// ---- 2.7 Accumulation ------------------------------------------------------
+var string G_ACC = "02 · Accumulation"
+useAccSource = input.bool(true, "Enable Accumulation Source", group = G_ACC)
+accumModule = input.string("Accum Box (ported)", "Accum Detection Module",
+     options = ["Accum Box (ported)", "Provisional ATR (暫定)"], group = G_ACC)
+accTf1 = input.timeframe("60",  "Accum TF #1", group = G_ACC)
+accTf2 = input.timeframe("240", "Accum TF #2", group = G_ACC)
+accTf3 = input.timeframe("D",   "Accum TF #3", group = G_ACC)
+scoreAcc1 = input.float(3.0, "Base Score · TF #1 Accum", step = 0.5, group = G_ACC)
+scoreAcc2 = input.float(4.0, "Base Score · TF #2 Accum", step = 0.5, group = G_ACC)
+scoreAcc3 = input.float(5.0, "Base Score · TF #3 Accum", step = 0.5, group = G_ACC)
+accKeep1 = input.int(3, "Keep Count · TF #1 Accum (instances)", minval = 1, group = G_ACC)
+accKeep2 = input.int(2, "Keep Count · TF #2 Accum (instances)", minval = 1, group = G_ACC)
+accKeep3 = input.int(1, "Keep Count · TF #3 Accum (instances)", minval = 1, group = G_ACC)
+
+var string G_ACCP = "02a · Accum Box (ported) Parameters"
+accumRangeLen        = input.int(10,   "Accum判定レンジ本数",  minval = 6,  group = G_ACCP)
+accumBaseLen         = input.int(20,   "基準平均本数",         minval = 10, group = G_ACCP)
+accumAtrLen          = input.int(14,   "ATR本数",             minval = 1,  group = G_ACCP)
+accumMinUpperCloses  = input.int(4,    "上半分の最低終値本数",  minval = 1,  group = G_ACCP)
+accumMinLowerCloses  = input.int(4,    "下半分の最低終値本数",  minval = 1,  group = G_ACCP)
+accumMaxSameColorRun = input.int(4,    "同色連続の上限",       minval = 1,  group = G_ACCP)
+accumAtrMult         = input.float(2.5,  "Accum レンジ幅 / ATR 上限",    minval = 0.5,  step = 0.1,  group = G_ACCP)
+accumBarRatioMax     = input.float(0.70, "Accum 平均値幅/基準平均 上限", minval = 0.1,  step = 0.01, group = G_ACCP)
+accumDriftMax        = input.float(0.30, "Accum ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = G_ACCP)
+
+var string G_ACCQ = "02b · Provisional ATR Accum (暫定・本番未使用)"
+accLen1 = input.int(20, "[暫定] Accum Lookback · TF #1 (bars)", minval = 3, group = G_ACCQ)
+accLen2 = input.int(20, "[暫定] Accum Lookback · TF #2 (bars)", minval = 3, group = G_ACCQ)
+accLen3 = input.int(15, "[暫定] Accum Lookback · TF #3 (bars)", minval = 3, group = G_ACCQ)
+accMult = input.float(1.2, "[暫定] Accum Max Range / ATR", step = 0.1, minval = 0.1, group = G_ACCQ)
+
+// ---- 2.8 Cluster / Score / HTF --------------------------------------------
+var string G_CLU = "02 · Cluster"
+clusterDist = input.float(5.0, "Cluster Distance ($)", step = 1.0, group = G_CLU)
+
+var string G_SCORE = "02 · Strength Score"
+thrMedium = input.float(5.0,  "Medium Score Threshold",      step = 0.5, group = G_SCORE)
+thrStrong = input.float(10.0, "Strong Score Threshold",      step = 0.5, group = G_SCORE)
+thrVStrong = input.float(15.0, "Very Strong Score Threshold", step = 0.5, group = G_SCORE)
+confBonus2 = input.float(1.0, "Confluence Bonus · 2 categories",  step = 0.5, group = G_SCORE)
+confBonus3 = input.float(2.0, "Confluence Bonus · 3 categories",  step = 0.5, group = G_SCORE)
+confBonus4 = input.float(3.0, "Confluence Bonus · 4+ categories", step = 0.5, group = G_SCORE)
+flipBonus = input.float(2.0, "Flip Bonus", step = 0.5, group = G_SCORE)
+
+var string G_HTF = "02a · Very Strong · Higher TF Structure"
+requireHtfForVStrong = input.bool(true, "Require Higher TF Structure for Very Strong", group = G_HTF)
+htfSwing1H = input.bool(true,  "Count 1H Swing (TF #3) as Higher TF",    group = G_HTF)
+htfAccum1H = input.bool(true,  "Count 1H Accum (TF #1) as Higher TF",    group = G_HTF)
+htfAccum4H = input.bool(true,  "Count 4H Accum (TF #2) as Higher TF",    group = G_HTF)
+htfAccumD = input.bool(true,  "Count Daily Accum (TF #3) as Higher TF", group = G_HTF)
+htfSwing15M = input.bool(false, "Count 15M Swing (TF #2) as Higher TF",   group = G_HTF)
+htfMa1 = input.bool(false, "Count MA #1 (2000) as Higher TF",        group = G_HTF)
+htfMa2 = input.bool(false, "Count MA #2 (3000) as Higher TF",        group = G_HTF)
+htfDayHL = input.bool(false, "Count Day High / Low as Higher TF",      group = G_HTF)
+
+// ---- 2.9 Break / Flip / Lifetime ------------------------------------------
+var string G_BF = "02 · Break / Flip"
+breakTf = input.timeframe("5", "Break Evaluation Timeframe", group = G_BF,
+     tooltip = "Breakはヒゲではなくこの時間足の確定終値で判定する。")
+breakBuffer = input.float(5.0,  "Break Buffer ($)",         step = 0.5, group = G_BF)
+flipConfirmDist = input.float(10.0, "Flip Confirm Distance ($)", step = 0.5, group = G_BF)
+resetOnReclaim = input.bool(true,  "Reset Broken on Reclaim", group = G_BF)
+trackStaleBars = input.int(500, "Zone State Retention (bars without match)", minval = 10, group = G_BF)
+trackContinuity = input.float(0.5, "Zone Track · Min Source Continuity", minval = 0.01, maxval = 1.0, step = 0.05, group = G_BF)
+
+var string G_LIFE = "02 · Zone Lifetime"
+lifeHz1 = input.float(5.0,  "Lifetime · TF #1 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeHz2 = input.float(10.0, "Lifetime · TF #2 Horizontal (days)", step = 0.5, group = G_LIFE)
+lifeHz3 = input.float(30.0, "Lifetime · TF #3 Horizontal (days)", step = 0.5, group = G_LIFE)
+maxPersistZones = input.int(200, "Max Persistent Raw Zones", minval = 20, maxval = 800, group = G_LIFE)
+
+
+// ---- 2.10 Structural SL / TP  (authority: 旧 FvgZoneStrategy Main。Visual には無い) ----
+var string G_SLTP = "02 · Structural SL / TP"
+slBuffer = input.float(5.0,  "SL Buffer ($)", step = 0.5, group = G_SLTP)
+tpBuffer = input.float(0.0,  "TP Buffer ($)", step = 0.5, group = G_SLTP)
+maxSlDist = input.float(30.0, "Max SL Distance ($)", step = 1.0, group = G_SLTP)
+minStructRR = input.float(1,  "Minimum Structural RR", step = 0.1, group = G_SLTP,
+     tooltip = "Structural TPが存在する場合、この値未満のRRならエントリー禁止 (固定RR TPへ逃げない)。")
+tpMode = input.string("BOTH", "TP Mode", options = ["BOTH", "STRUCTURAL_ONLY", "FALLBACK_ONLY"], group = G_SLTP,
+     tooltip = "Structural TP と Fallback RR TP の成績を切り分けて検証するための採用フィルター。\n" +
+     "BOTH            : 現行動作。Structural TPがあればそれを使い、無ければFallback RR TP。\n" +
+     "STRUCTURAL_ONLY : Structural TPが存在するトレードのみ発注。無い場合はFallbackを作らずNoTrade。\n" +
+     "FALLBACK_ONLY   : Structural TPが存在しなかったシグナルのみFallback RR TPで発注。\n" +
+     "                  (Structural TPを無視してRR TPへ差し替えるのではなく、そのシグナル自体を除外する)\n" +
+     "SL判定 (Active Zone / SL Zone / SL距離) は3モードとも完全共通。")
+slMinScore = input.float(4.0,  "SL Zone · Min Score", step = 0.5, group = G_SLTP)
+slMinStrStr  = input.string("Medium", "SL Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+tpMinScore = input.float(7.0,  "TP Zone · Min Score", step = 0.5, group = G_SLTP)
+tpMinStrStr  = input.string("Strong", "TP Zone · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+obsMinStrStr = input.string("Medium", "Obstacle · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP)
+activeNoTradeMinStrStr = input.string("Medium", "Active Zone NoTrade · Min Strength", options = ["Weak", "Medium", "Strong", "Very Strong"], group = G_SLTP,
+     tooltip = "Entry価格がこのStrength以上の ACTIVE Zone (現在価格がZone内部) の中に\n" +
+               "ある場合は NO TRADE にする。Structural SL / TP が存在しても、\n" +
+               "Fallback RR TP も使わずエントリーを見送る。Long / Short 共通。")
+//  ★ Structural TP を「選ばれたTP Zoneのどこに置くか」の比率 (A/Bテスト用) ★
+//    Long TP  : tpBaseLong  = zoneBottom + (zoneTop - zoneBottom) * ratio → TP = tpBaseLong  - tpBuffer
+//    Short TP : tpBaseShort = zoneTop    - (zoneTop - zoneBottom) * ratio → TP = tpBaseShort + tpBuffer
+//    ★ 既定 0.00 = 従来と完全一致 (Long = Zone下端 - tpBuffer / Short = Zone上端 + tpBuffer)。
+//    ★ TP候補Zoneの選定条件 (Resistance / Support判定 / Strength / Score /
+//      Entry価格より利益側 / 最も手前の適格Zone) は一切変更していない。
+//      変わるのは「選ばれたZoneのどこにTPを置くか」だけ。
+//    ★ Dynamic TP も同じ zn.getLongStructuralTP() / zn.getShortStructuralTP() を
+//      再利用しているため、Entry時TPとDynamic TPで価格定義は自動的に統一される。
+structuralTpDepthRatio = input.float(0.25, "Structural TP Zone Depth", minval = 0.0, maxval = 1.0, step = 0.25, group = G_SLTP,
+     tooltip = "Structural TP をTP Zone内のどの位置に置くかをZone幅比率で指定する。\n" +
+     "Long / Short は完全対称 (どちらも Entry から遠ざかる向きへ進める)。\n" +
+     "  Long  (Resistance Zone) : 0.00 = Zone下端 / 0.50 = 中央値 / 1.00 = Zone上端\n" +
+     "  Short (Support Zone)    : 0.00 = Zone上端 / 0.50 = 中央値 / 1.00 = Zone下端\n" +
+     "0.00 = 従来と完全一致 (既定)。TP Buffer はこの基準価格に対して適用される。\n" +
+     "Dynamic TP にも同じ定義がそのまま使われる。")
+fallbackRR = input.float(2.0, "Fallback RR (Structural TPが無い場合のみ使用)", step = 0.1, minval = 0.1, group = G_SLTP,
+     tooltip = "有効なTP Zoneが見つからない場合のみ、Structural SL距離 × この値でTPを作る。")
+
+// ============================================================================
+// ENGINE  (ZoneEngine は1個だけ / ZoneCfg は初回バーで1回だけ設定)
+// ----------------------------------------------------------------------------
+//  ZoneVisualPractical は毎バー zn.newCfg() → 代入しているが、代入元は全て input
+//  (Script 実行中に変化しない値) なので、初回バーで1回代入した var ZoneCfg と
+//  全バーで同じ値になる。series 値は1つも入れない。
+// ============================================================================
+var zn.ZoneEngine zoneEng = zn.newEngine()
+var zn.ZoneCfg    zoneCfg = zn.newCfg()
+if barstate.isfirst
+    zoneCfg.zoneHalfWidth        := zoneHalfWidth
+    zoneCfg.useMaSource          := useMaSource
+    zoneCfg.maTfName             := maTf
+    zoneCfg.ma1Len               := ma1Len
+    zoneCfg.ma2Len               := ma2Len
+    zoneCfg.scoreMa1             := scoreMa1
+    zoneCfg.scoreMa2             := scoreMa2
+    zoneCfg.slopeThrMod          := slopeThrMod
+    zoneCfg.slopeThrStrong       := slopeThrStrong
+    zoneCfg.slopeBonusFlat       := slopeBonusFlat
+    zoneCfg.slopeBonusMod        := slopeBonusMod
+    zoneCfg.slopeBonusStr        := slopeBonusStr
+    zoneCfg.slopeBonusMax        := slopeBonusMode == "Max"
+    zoneCfg.maClusterDist        := maClusterDist
+    zoneCfg.maClusterBonus       := maClusterBonus
+    zoneCfg.maClusterDirBonus    := maClusterDirBonus
+    zoneCfg.useHzSource          := useHzSource
+    zoneCfg.hzTf1                := hzTf1
+    zoneCfg.hzTf2                := hzTf2
+    zoneCfg.hzTf3                := hzTf3
+    zoneCfg.scoreHz1             := scoreHz1
+    zoneCfg.scoreHz2             := scoreHz2
+    zoneCfg.scoreHz3             := scoreHz3
+    zoneCfg.touchRearmDist       := touchRearmDist
+    zoneCfg.useDayHL             := useDayHL
+    zoneCfg.scoreDayHL           := scoreDayHL
+    zoneCfg.carryPrevDayHL       := carryPrevDayHL
+    zoneCfg.scorePrevDayHL       := scorePrevDayHL
+    zoneCfg.lifePrevDayHL        := lifePrevDayHL
+    zoneCfg.useAccSource         := useAccSource
+    zoneCfg.accTf1               := accTf1
+    zoneCfg.accTf2               := accTf2
+    zoneCfg.accTf3               := accTf3
+    zoneCfg.scoreAcc1            := scoreAcc1
+    zoneCfg.scoreAcc2            := scoreAcc2
+    zoneCfg.scoreAcc3            := scoreAcc3
+    zoneCfg.accKeep1             := accKeep1
+    zoneCfg.accKeep2             := accKeep2
+    zoneCfg.accKeep3             := accKeep3
+    zoneCfg.clusterDist          := clusterDist
+    zoneCfg.thrMedium            := thrMedium
+    zoneCfg.thrStrong            := thrStrong
+    zoneCfg.thrVStrong           := thrVStrong
+    zoneCfg.confBonus2           := confBonus2
+    zoneCfg.confBonus3           := confBonus3
+    zoneCfg.confBonus4           := confBonus4
+    zoneCfg.flipBonus            := flipBonus
+    zoneCfg.requireHtfForVStrong := requireHtfForVStrong
+    zoneCfg.htfSwing1H           := htfSwing1H
+    zoneCfg.htfAccum1H           := htfAccum1H
+    zoneCfg.htfAccum4H           := htfAccum4H
+    zoneCfg.htfAccumD            := htfAccumD
+    zoneCfg.htfSwing15M          := htfSwing15M
+    zoneCfg.htfMa1               := htfMa1
+    zoneCfg.htfMa2               := htfMa2
+    zoneCfg.htfDayHL             := htfDayHL
+    zoneCfg.breakBuffer          := breakBuffer
+    zoneCfg.flipConfirmDist      := flipConfirmDist
+    zoneCfg.resetOnReclaim       := resetOnReclaim
+    zoneCfg.trackStaleBars       := trackStaleBars
+    zoneCfg.trackContinuity      := trackContinuity
+    zoneCfg.lifeHz1              := lifeHz1
+    zoneCfg.lifeHz2              := lifeHz2
+    zoneCfg.lifeHz3              := lifeHz3
+    zoneCfg.maxPersistZones      := maxPersistZones
+    // ---- Structural SL / TP (旧Main と同じ代入) ----
+    zoneCfg.slBuffer             := slBuffer
+    zoneCfg.tpBuffer             := tpBuffer
+    zoneCfg.maxSlDist            := maxSlDist
+    zoneCfg.minStructRR          := minStructRR
+    zoneCfg.slMinScore           := slMinScore
+    zoneCfg.slMinStrength        := zn.strengthIdx(slMinStrStr)
+    zoneCfg.tpMinScore           := tpMinScore
+    zoneCfg.tpMinStrength        := zn.strengthIdx(tpMinStrStr)
+    zoneCfg.obsMinStrength       := zn.strengthIdx(obsMinStrStr)
+    zoneCfg.activeNoTradeMinStrength := zn.strengthIdx(activeNoTradeMinStrStr)
+    zoneCfg.structuralTpDepthRatio := structuralTpDepthRatio
+    zoneCfg.fallbackRR           := fallbackRR
+
+// ============================================================================
+// EXTERNAL DATA FEED  (ZoneVisualPractical と同一の意味論・同一の式)
+// ============================================================================
+// ---- 3.2 Zone Engine Feed --------------------------------------------------
+// ★ MA2000 / MA3000 : zn.maPack() を 1分足コンテキストで評価させる。
+//   maPack() の中身は ta.ema(close, 2000) 等であり、この close は1分足のclose。
+//   → 5分足closeからの再計算ではない。
+//  ★ Source が OFF のときは取得自体を行わない (結果不変・下の理由による) ★
+//    Library 側は MA / Swing / Accum のどれも
+//      「c.useXxxSource が true」かつ「値が na でない」
+//    ときにしか Zone を登録しない。OFF のとき取得値は元々一切使われていないため、
+//    na を渡すのと実測値を渡すのは Zone 時系列に対して完全に等価。
+//    エッジ検出 (nPh1 / nAc1 等) も not na(...) を要求するので false のまま。
+float ma1Val   = na
+float ma1Delta = na
+float ma2Val   = na
+float ma2Delta = na
+if useMaSource
+    [_m1, _m1d, _m2, _m2d] = request.security(syminfo.tickerid, maTf,
+         zn.maPack(maType, ma1Len, ma2Len, slopeLookback), lookahead = barmerge.lookahead_off)
+    ma1Val   := _m1
+    ma1Delta := _m1d
+    ma2Val   := _m2
+    ma2Delta := _m2d
+
+float ph1 = na
+int   ph1T = na
+float pl1 = na
+int   pl1T = na
+float ph2 = na
+int   ph2T = na
+float pl2 = na
+int   pl2T = na
+float ph3 = na
+int   ph3T = na
+float pl3 = na
+int   pl3T = na
+if useHzSource
+    [_h1, _h1t, _l1, _l1t] = request.security(syminfo.tickerid, hzTf1, zn.pivotPack(pivLen1), lookahead = barmerge.lookahead_off)
+    [_h2, _h2t, _l2, _l2t] = request.security(syminfo.tickerid, hzTf2, zn.pivotPack(pivLen2), lookahead = barmerge.lookahead_off)
+    [_h3, _h3t, _l3, _l3t] = request.security(syminfo.tickerid, hzTf3, zn.pivotPack(pivLen3), lookahead = barmerge.lookahead_off)
+    ph1 := _h1
+    ph1T := _h1t
+    pl1 := _l1
+    pl1T := _l1t
+    ph2 := _h2
+    ph2T := _h2t
+    pl2 := _l2
+    pl2T := _l2t
+    ph3 := _h3
+    ph3T := _h3t
+    pl3 := _l3
+    pl3T := _l3t
+
+bool usePortedAccum = accumModule == "Accum Box (ported)"
+float acc1Hi = na
+float acc1Lo = na
+int   acc1Id = na
+float acc2Hi = na
+float acc2Lo = na
+int   acc2Id = na
+float acc3Hi = na
+float acc3Lo = na
+int   acc3Id = na
+if useAccSource
+    [_a1h, _a1l, _a1i] = request.security(syminfo.tickerid, accTf1,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen1, accMult), lookahead = barmerge.lookahead_off)
+    [_a2h, _a2l, _a2i] = request.security(syminfo.tickerid, accTf2,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen2, accMult), lookahead = barmerge.lookahead_off)
+    [_a3h, _a3l, _a3i] = request.security(syminfo.tickerid, accTf3,
+         zn.accumPack(usePortedAccum, accumRangeLen, accumBaseLen, accumAtrLen, accumMinUpperCloses, accumMinLowerCloses,
+         accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax, accLen3, accMult), lookahead = barmerge.lookahead_off)
+    acc1Hi := _a1h
+    acc1Lo := _a1l
+    acc1Id := _a1i
+    acc2Hi := _a2h
+    acc2Lo := _a2l
+    acc2Id := _a2i
+    acc3Hi := _a3h
+    acc3Lo := _a3l
+    acc3Id := _a3i
+
+// Break判定は breakTf の「確定終値」のみ (ヒゲでは判定しない)
+//  ★ Practical Break authority:
+//    Break判定TFの「確定足自身の close」で、その確定イベントのバーに Break を成立させる。
+//    旧版は確定足の値を「次のチャートバー」で [1] 参照していたため、評価前に
+//    f_naturalState (現在 close) が state を上書きしてしまい、確定足自身の close による
+//    Break が成立しなかった (Zoneの幅や位置が動いた時しか Break しない)。
+//
+//  (1) Break TF == チャート足 : request.security を使わない。
+//      brClose = close / brHigh = high / brLow = low / brEval = barstate.isconfirmed
+//      Historical は全バー確定。Realtime はバー確定tickだけ評価 (途中tickでは Break しない)。
+//  (2) Break TF  > チャート足 : request.security を1本 (lookahead_off = 先読みなし)。
+//      上位足を締めるチャートバー (time_close >= time_close(breakTf)) の確定時に、
+//      その上位足の確定 close / high / low で1回だけ評価する。
+//      lookahead_off の上位足値は、その上位足を締めるチャートバーで確定値になる
+//      (Historical / Realtime 確定tick とも)。未確定の上位足 close では評価しない。
+//      Break evaluation path はこの1本だけ (別経路での再評価・補完はしない)。
+//  (3) Break TF  < チャート足 : 旧版の経路のまま (今回の修正対象外)。
+int   brTfSec   = timeframe.in_seconds(breakTf)
+int   chTfSec   = timeframe.in_seconds()
+bool  brSameTf  = brTfSec == chTfSec
+bool  brHtf     = brTfSec > chTfSec
+float brSrcC = close
+float brSrcH = high
+float brSrcL = low
+if not brSameTf
+    [_bc, _bh, _bl] = request.security(syminfo.tickerid, breakTf, [close, high, low],
+         lookahead = barmerge.lookahead_off)
+    brSrcC := _bc
+    brSrcH := _bh
+    brSrcL := _bl
+int   brTfTime    = time(breakTf)
+bool  brNewPeriod = bar_index > 0 and not na(brTfTime) and nz(ta.change(brTfTime), 0) != 0
+float brClose = na
+float brHigh  = na
+float brLow   = na
+bool  brEval  = false
+if brSameTf
+    if barstate.isconfirmed
+        brClose := close
+        brHigh  := high
+        brLow   := low
+        brEval  := true
+else if brHtf
+    bool brClosesNow = not na(time_close(breakTf)) and time_close >= time_close(breakTf)
+    if barstate.isconfirmed and brClosesNow
+        brClose := brSrcC
+        brHigh  := brSrcH
+        brLow   := brSrcL
+        brEval  := not na(brClose)
+else
+    // Break TF < チャート足 : 旧版の経路 (変更なし)
+    brClose := brNewPeriod ? brSrcC[1] : na
+    brHigh  := brNewPeriod ? brSrcH[1] : na
+    brLow   := brNewPeriod ? brSrcL[1] : na
+    brEval  := brNewPeriod and not na(brClose)
+
+// 取引日ID (timestamp/hour の timezone は series 不可なので呼び出し側で計算する)
+int _locY = year(time, dayTz)
+int _locM = month(time, dayTz)
+int _locD = dayofmonth(time, dayTz)
+int _locH = hour(time, dayTz)
+int _calDayNo    = int(timestamp(dayTz, _locY, _locM, _locD, 0, 0) / 86400000)
+int tradingDayId = _locH < dayResetHour ? _calDayNo - 1 : _calDayNo
+
+zn.ZoneFeed zoneFeed = zn.ZoneFeed.new(
+     ma1 = ma1Val, ma1d = ma1Delta, ma2 = ma2Val, ma2d = ma2Delta,
+     ph1 = ph1, ph1t = ph1T, pl1 = pl1, pl1t = pl1T,
+     ph2 = ph2, ph2t = ph2T, pl2 = pl2, pl2t = pl2T,
+     ph3 = ph3, ph3t = ph3T, pl3 = pl3, pl3t = pl3T,
+     acc1Hi = acc1Hi, acc1Lo = acc1Lo, acc1Id = acc1Id,
+     acc2Hi = acc2Hi, acc2Lo = acc2Lo, acc2Id = acc2Id,
+     acc3Hi = acc3Hi, acc3Lo = acc3Lo, acc3Id = acc3Id,
+     dayId = tradingDayId,
+     brClose = brClose, brHigh = brHigh, brLow = brLow, brEval = brEval)
+
+int zoneCountNow = zn.update(zoneEng, zoneCfg, zoneFeed)
+
+// zn.update は上の1回だけ (1チャートバーにつき1回)。
+// Pine は出力を1つ以上要求するため、何も描かない plot だけを置く。
+plot(na, "P02 harness (no output)", display = display.none)
