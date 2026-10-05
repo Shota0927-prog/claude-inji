@@ -1054,6 +1054,253 @@ def fixture_p03_fvg15():
           pv["previewGateLong"] and not pv["longSignal"] and e["last5mBullT"] is None)
 
 
+# =============================================================================
+# P04 — FVGABS5 / FVGABS15 port (static differential + behavioural mirror)
+# =============================================================================
+P04_FUNCS = ["efvgAbsState", "efvgAbsConfirmed", "bosPack", "updateFvgAbs", "fvgAbsEnvLong", "fvgAbsEnvShort",
+             "consumeFvgAbs"]
+
+
+def expected_port_multi(orig_block, tname, removed):
+    """Independent re-derivation of the allowed edit for constructors with several args per line."""
+    text = orig_block
+    m = re.search(tname + r"\.new\((.*)\)\s*$", text, re.S)
+    args_src = m.group(1)
+    kept_lines = []
+    for ln in args_src.split("\n"):
+        parts = [a.strip() for a in ln.split(",") if a.strip()]
+        parts = [a for a in parts if a.split("=")[0].strip() not in removed]
+        if parts:
+            kept_lines.append((ln[:len(ln) - len(ln.lstrip())], parts))
+    rebuilt = []
+    for i, (ind, parts) in enumerate(kept_lines):
+        rebuilt.append((ind if i else "") + ", ".join(parts) + ("," if i < len(kept_lines) - 1 else ")"))
+    return text[:m.start()] + tname + ".new(" + "\n".join(rebuilt)
+
+
+def fixture_p04_static():
+    NEWS = open(os.path.join(ROOT, "SignalEnginePractical.pine"), encoding="utf-8").read()
+    for fn in P04_FUNCS:
+        o, n = func_block(ORIG, fn), func_block(NEWS, fn)
+        exp = expected_port_multi(o, "FvgAbsSignal", REMOVED["FvgAbsSignal"]) if fn == "updateFvgAbs" else o
+        check(f"A-D1 {fn}: ported verbatim (only removed-field named args dropped)", n != "" and n == exp,
+              f"{len(n.splitlines())} lines")
+    o, n = func_block(ORIG, "updateFvgAbs"), func_block(NEWS, "updateFvgAbs")
+    check("A-D2 updateFvgAbs: state write order identical", state_writes(o) == state_writes(n),
+          " / ".join(state_writes(n)))
+    check("A-D2 updateFvgAbs: field reads identical", field_reads(o) == field_reads(n), f"{len(field_reads(n))} fields")
+    cond = lambda b: [ln.strip() for ln in code_only(b).split("\n") if re.match(r"^\s+(if|else if|else)\b", ln)]
+    check("A-D2 updateFvgAbs: if-condition sequence identical", cond(o) == cond(n), f"{len(cond(n))} branches")
+    cmp_ = lambda b: re.findall(r"e\.\w+\s*>=\s*e\.\w+|pvBos5mTimeS?\s*>=\s*e\.\w+", b)
+    check("A-D2 updateFvgAbs: event-time comparisons identical (BOS time >= event time)",
+          cmp_(o) == cmp_(n) and len(cmp_(n)) == 6, " | ".join(cmp_(n)))
+    for fn in ("efvgAbsState", "updateFvgAbs"):
+        o2, n2 = func_block(ORIG, fn), func_block(NEWS, fn)
+        vw = lambda b: re.findall(r"^\s+(_\w+)\s*:=", b, re.M)
+        check(f"A-D2 {fn}: var/local state update order identical", vw(o2) == vw(n2))
+    kept = {f for t in NT.values() for f in t}
+    miss = [f for f in field_reads(func_block(NEWS, "updateFvgAbs")) if f not in kept]
+    check("A-D3 re-audit FvgAbsEngine/FvgAbsSignal/FvgFeed/FvgCfg: no removed field is read (nothing to restore)",
+          not miss, str(miss))
+    rets = re.findall(r"(\w+)\s*=\s*[\w.]+", func_block(NEWS, "updateFvgAbs").split("FvgAbsSignal.new(")[1])
+    check("A-D4 updateFvgAbs returns exactly the kept FvgAbsSignal fields", sorted(rets) == sorted(NT["FvgAbsSignal"]),
+          str(rets))
+    for fn in ("efvgAbsDebugConfirmed", "bosBullLowerTf"):
+        check(f"A-D5 excluded {fn} absent", func_block(NEWS, fn) == "")
+
+
+# ---- efvgAbsState mirror (SignalEngine/21 L927-981) ----------------------------
+def abs_state_new():
+    return dict(btop=None, bbot=None, bbar=None, babs=False, rtop=None, rbot=None, rbar=None, rabs=False,
+                bias=0, evbar=None, evtime=None)
+
+
+def abs_state(s, b, hold, minThick, bodyMin, edge, useColor=True, useBody=True, useEdge=True):
+    """b: dict(o,h,l,c,h2,l2,atr,bar,time). Returns (bias, eventId, eventTime)."""
+    o, h, l, c = b["o"], b["h"], b["l"], b["c"]
+    ref = b.get("atr", 1.0)
+    body, rng = abs(c - o), h - l
+    newBull = ref > 0 and l > b["h2"] and (l - b["h2"]) / ref >= minThick
+    newBear = ref > 0 and h < b["l2"] and (b["l2"] - h) / ref >= minThick
+    if newBull:
+        s.update(btop=l, bbot=b["h2"], bbar=b["bar"], babs=False)
+    if newBear:
+        s.update(rtop=b["l2"], rbot=h, rbar=b["bar"], rabs=False)
+    strong = rng > 0 and body / rng >= bodyMin
+    nearHi = rng > 0 and (c - l) / rng >= edge
+    nearLo = rng > 0 and (h - c) / rng >= edge
+    aL = s["rtop"] is not None and not s["rabs"] and b["bar"] > s["rbar"] and c > s["rtop"] and \
+        ((not useColor) or c > o) and ((not useBody) or strong) and ((not useEdge) or nearHi)
+    aS = s["btop"] is not None and not s["babs"] and b["bar"] > s["bbar"] and c < s["bbot"] and \
+        ((not useColor) or c < o) and ((not useBody) or strong) and ((not useEdge) or nearLo)
+    if aL and aS:
+        s.update(bias=0, evbar=None, evtime=None, rabs=True, babs=True)
+    elif aL:
+        s.update(bias=1, evbar=b["bar"], evtime=b["time"], rabs=True)
+    elif aS:
+        s.update(bias=-1, evbar=b["bar"], evtime=b["time"], babs=True)
+    active = s["evbar"] is not None and (b["bar"] - s["evbar"]) < hold
+    return (s["bias"] if active else 0), s["evbar"], s["evtime"]
+
+
+# ---- updateFvgAbs mirror (SignalEngine/21 L2039-2145) -----------------------------
+def abs_engine_new():
+    return dict(ev5Id=None, ev5Time=None, ev5Consumed=None, bos1mTime=None, ev15Id=None, ev15Time=None,
+                ev15Consumed=None, bos5mTime=None, bos1mTimeS=None, bos5mTimeS=None)
+
+
+def update_fvg_abs(e, envL, envS, a5, a15, bull1m, bear1m, use5, use15, close, bos5Hi, bos5Lo, t, confirmed=True):
+    b5, ev5, et5 = a5
+    b15, ev15, et15 = a15
+    if ev5 is not None and (e["ev5Id"] is None or ev5 != e["ev5Id"]):
+        e["ev5Id"], e["ev5Time"] = ev5, et5
+    if ev15 is not None and (e["ev15Id"] is None or ev15 != e["ev15Id"]):
+        e["ev15Id"], e["ev15Time"] = ev15, et15
+    if any(bull1m):
+        e["bos1mTime"] = t
+    if any(bear1m):
+        e["bos1mTimeS"] = t
+    if confirmed and close > bos5Hi:
+        e["bos5mTime"] = t
+    if confirmed and close < bos5Lo:
+        e["bos5mTimeS"] = t
+    ge = lambda a, b_: a is not None and b_ is not None and a >= b_
+    ok5, ok15 = ge(e["bos1mTime"], e["ev5Time"]), ge(e["bos5mTime"], e["ev15Time"])
+    ok5S, ok15S = ge(e["bos1mTimeS"], e["ev5Time"]), ge(e["bos5mTimeS"], e["ev15Time"])
+    un5 = e["ev5Consumed"] is None or e["ev5Consumed"] != e["ev5Id"]
+    un15 = e["ev15Consumed"] is None or e["ev15Consumed"] != e["ev15Id"]
+    l5 = use5 and envL and confirmed and b5 == 1 and e["ev5Id"] is not None and un5 and ok5
+    l15 = use15 and envL and confirmed and b15 == 1 and e["ev15Id"] is not None and un15 and ok15
+    s5 = use5 and envS and confirmed and b5 == -1 and e["ev5Id"] is not None and un5 and ok5S
+    s15 = use15 and envS and confirmed and b15 == -1 and e["ev15Id"] is not None and un15 and ok15S
+    pvT = t if close > bos5Hi else e["bos5mTime"]
+    pvTS = t if close < bos5Lo else e["bos5mTimeS"]
+    pv5 = use5 and envL and b5 == 1 and e["ev5Id"] is not None and un5 and ok5
+    pv15 = use15 and envL and b15 == 1 and e["ev15Id"] is not None and un15 and ge(pvT, e["ev15Time"])
+    pvS5 = use5 and envS and b5 == -1 and e["ev5Id"] is not None and un5 and ok5S
+    pvS15 = use15 and envS and b15 == -1 and e["ev15Id"] is not None and un15 and ge(pvTS, e["ev15Time"])
+    return dict(long5=l5, long15=l15, short5=s5, short15=s15, previewLong5=pv5, previewLong15=pv15,
+                previewShort5=pvS5, previewShort15=pvS15)
+
+
+def consume_abs_(e, which):
+    if which == 5:
+        e["ev5Consumed"] = e["ev5Id"]
+    elif which == 15:
+        e["ev15Consumed"] = e["ev15Id"]
+
+
+def abs_env(allow, trend, sess, news, med, vmin, vmax, vol, blk, wait, dirOk):
+    dv = med is not None and vmin <= med < vmax
+    return allow and trend and dv and sess and news and vol and not blk and not wait and dirOk
+
+
+NOB = (0, None, None)
+
+
+def fixture_p04_behaviour():
+    HI, LO = 4100.0, 4000.0          # 5M BOS levels far away unless needed
+    # ABS1 5M Long: event at t=500, 1M bull BOS before -> false; after -> true
+    e = abs_engine_new()
+    r0 = update_fvg_abs(e, True, True, NOB, NOB, [True], [], True, False, 4050, HI, LO, 400)   # BOS at 400 (no event yet)
+    r1 = update_fvg_abs(e, True, True, (1, 77, 500), NOB, [], [], True, False, 4050, HI, LO, 600)
+    r2 = update_fvg_abs(e, True, True, (1, 77, 500), NOB, [False, True], [], True, False, 4050, HI, LO, 700)
+    check("ABS1 5M Long: event -> 1M Bull BOS before event = false, after event = true",
+          not r0["long5"] and not r1["long5"] and r2["long5"] and e["ev5Time"] == 500)
+    # ABS2 5M Short (symmetric)
+    e = abs_engine_new()
+    update_fvg_abs(e, True, True, NOB, NOB, [], [True], True, False, 4050, HI, LO, 400)
+    s1 = update_fvg_abs(e, True, True, (-1, 78, 500), NOB, [], [], True, False, 4050, HI, LO, 600)
+    s2 = update_fvg_abs(e, True, True, (-1, 78, 500), NOB, [], [True], True, False, 4050, HI, LO, 700)
+    check("ABS2 5M Short symmetric (bear 1M BOS after event)", not s1["short5"] and s2["short5"] and not s2["long5"])
+    # ABS3 15M Long: event -> 5M bull BOS (confirmed chart bar)
+    e = abs_engine_new()
+    a = update_fvg_abs(e, True, True, NOB, (1, 90, 1000), [], [], False, True, 4050, 4060, LO, 1100)
+    b = update_fvg_abs(e, True, True, NOB, (1, 90, 1000), [], [], False, True, 4061, 4060, LO, 1200)
+    check("ABS3 15M Long: 15M absorption event -> later confirmed 5M bull BOS -> long15", not a["long15"] and b["long15"])
+    # ABS4 15M Short
+    e = abs_engine_new()
+    a = update_fvg_abs(e, True, True, NOB, (-1, 91, 1000), [], [], False, True, 4050, HI, 4040, 1100)
+    b = update_fvg_abs(e, True, True, NOB, (-1, 91, 1000), [], [], False, True, 4039, HI, 4040, 1200)
+    check("ABS4 15M Short symmetric", not a["short15"] and b["short15"])
+    # ABS5 BOS before event is not used (same event later, no new BOS)
+    e = abs_engine_new()
+    update_fvg_abs(e, True, True, NOB, NOB, [], [], False, True, 4061, 4060, LO, 900)          # 5M BOS at 900
+    c1 = update_fvg_abs(e, True, True, NOB, (1, 92, 1000), [], [], False, True, 4050, 4060, LO, 1100)
+    same_bar = abs_engine_new()
+    c2 = update_fvg_abs(same_bar, True, True, (1, 93, 1000), NOB, [True], [], True, False, 4050, HI, LO, 1000)
+    check("ABS5 BOS before event ignored; BOS in the event bar itself is valid (>=)",
+          not c1["long15"] and e["bos5mTime"] == 900 and c2["long5"])
+    # ABS6 consume only when called
+    e = abs_engine_new()
+    r = update_fvg_abs(e, True, True, (1, 77, 500), NOB, [True], [], True, False, 4050, HI, LO, 600)
+    r_again = update_fvg_abs(e, True, True, (1, 77, 500), NOB, [], [], True, False, 4050, HI, LO, 700)
+    before = dict(e)
+    consume_abs_(e, 5)
+    r_after = update_fvg_abs(e, True, True, (1, 77, 500), NOB, [], [], True, False, 4050, HI, LO, 800)
+    r_new = update_fvg_abs(e, True, True, (1, 88, 850), NOB, [True], [], True, False, 4050, HI, LO, 900)
+    check("ABS6 signal alone / FAIL do not consume (signal persists); consumeFvgAbs blocks; new eventId re-arms",
+          r["long5"] and r_again["long5"] and before["ev5Consumed"] is None and not r_after["long5"] and r_new["long5"])
+    # ABS7 5M / 15M consumed independent
+    e = abs_engine_new()
+    update_fvg_abs(e, True, True, (1, 77, 500), (1, 90, 500), [True], [], True, True, 4061, 4060, LO, 600)
+    consume_abs_(e, 5)
+    q = update_fvg_abs(e, True, True, (1, 77, 500), (1, 90, 500), [], [], True, True, 4050, 4060, LO, 700)
+    check("ABS7 ev5Consumed does not touch ev15 (15 still signals)", not q["long5"] and q["long15"]
+          and e["ev15Consumed"] is None)
+    # ABS8 env: each single NG -> false
+    base = dict(allow=True, trend=True, sess=True, news=True, med=50.0, vmin=0.0, vmax=100.0, vol=True, blk=False,
+                wait=False, dirOk=True)
+    ng = {"trend": dict(trend=False), "daily vol": dict(med=150.0), "daily vol na": dict(med=None),
+          "session": dict(sess=False), "news": dict(news=False), "vol": dict(vol=False), "accum blocked": dict(blk=True),
+          "exit wait": dict(wait=True), "accum direction": dict(dirOk=False)}
+    okb = abs_env(**base)
+    bad = [k for k, kw in ng.items() if abs_env(**{**base, **kw})]
+    check("ABS8 env: base ok; each of trend/daily vol/session/news/vol/accum/exit wait/direction alone -> false",
+          okb and not bad, f"still-true={bad}")
+    check("ABS8 daily vol band is [min, max): med == max is NG, med == min is OK",
+          not abs_env(**{**base, "med": 100.0}) and abs_env(**{**base, "med": 0.0}))
+    # ABS9 quality boundaries
+    def run(bar, **kw):
+        s_ = abs_state_new()
+        abs_state(s_, dict(o=4000, h=4010, l=4002, c=4008, h2=4000, l2=4020, atr=10.0, bar=1, time=100), 3, 0.0, 0.5, 0.6)
+        return abs_state(s_, bar, kw.pop("hold", 3), kw.pop("thick", 0.0), kw.pop("bodyMin", 0.5), kw.pop("edge", 0.6), **kw)
+    # bearish FVG recorded at bar1: top = low[2]=4020, bot = high=4010. Absorption bar closes above 4020
+    good = dict(o=4012, h=4030, l=4010, c=4028, h2=4000, l2=4000, atr=10.0, bar=2, time=200)   # body 16/20=0.8 edge 0.9
+    check("ABS9 absorption long fires on bearish FVG close-through (bias 1, event bar / time)", run(good) == (1, 2, 200))
+    check("ABS9 colour filter: bearish candle closing above top is rejected",
+          run(dict(good, o=4029, c=4028.5))[0] == 0)
+    edge_bar = dict(good, o=4012, h=4030, l=4010, c=4022)       # body 10/20 = 0.5 (==min OK), edge (4022-4010)/20 = 0.6 (==min OK)
+    check("ABS9 body / edge boundaries inclusive (>=)", run(edge_bar)[0] == 1 and
+          run(dict(edge_bar, o=4012.5))[0] == 0 and run(dict(edge_bar, c=4021.9, o=4011.9))[0] == 0)
+    check("ABS9 colour/body/edge filters can be disabled", run(dict(good, o=4029, c=4028.5), useColor=False,
+                                                                useBody=False, useEdge=False)[0] == 1)
+    s_ = abs_state_new()
+    thick = abs_state(s_, dict(o=4000, h=4010, l=4002, c=4008, h2=4000, l2=4020, atr=10.0, bar=1, time=100), 3, 1.0, 0.5, 0.6)
+    s2_ = abs_state_new()
+    thick_ok = abs_state(s2_, dict(o=4000, h=4010, l=4002, c=4008, h2=4000, l2=4020, atr=10.0, bar=1, time=100), 3, 1.0, 0.5, 0.6)
+    after = abs_state(s2_, good, 3, 1.0, 0.5, 0.6)
+    s3_ = abs_state_new()
+    abs_state(s3_, dict(o=4000, h=4011, l=4002, c=4008, h2=4000, l2=4020, atr=10.0, bar=1, time=100), 3, 1.0, 0.5, 0.6)
+    after_thin = abs_state(s3_, good, 3, 1.0, 0.5, 0.6)
+    check("ABS9 min thickness boundary: (low[2]-high)/atr = 1.0 >= 1.0 forms the FVG; 0.9 does not",
+          after == (1, 2, 200) and after_thin[0] == 0)
+    s_ = abs_state_new()
+    abs_state(s_, dict(o=4000, h=4010, l=4002, c=4008, h2=4000, l2=4020, atr=10.0, bar=1, time=100), 3, 0.0, 0.5, 0.6)
+    seq = [abs_state(s_, good, 3, 0.0, 0.5, 0.6)[0]] + \
+          [abs_state(s_, dict(o=4030, h=4031, l=4029, c=4030, h2=4040, l2=4000, atr=10.0, bar=b_, time=b_ * 100), 3,
+                     0.0, 0.5, 0.6)[0] for b_ in (3, 4, 5)]
+    check("ABS9 hold: bias kept while bar - eventBar < hold (3), then 0; same FVG absorbs only once",
+          seq == [1, 1, 1, 0], str(seq))
+    # ABS10 preview does not change engine state
+    e = abs_engine_new()
+    update_fvg_abs(e, True, True, NOB, (1, 90, 1000), [], [], False, True, 4050, 4060, LO, 1100)
+    snap = dict(e)
+    pv = update_fvg_abs(e, True, True, NOB, (1, 90, 1000), [], [], False, True, 4061, 4060, LO, 1200, confirmed=False)
+    check("ABS10 preview: forming 5M bar BOS counts for previewLong15 without writing bos5mTime; long15 false",
+          pv["previewLong15"] and not pv["long15"] and e == snap)
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -1067,6 +1314,8 @@ if __name__ == "__main__":
     fixture_p03_static()
     fixture_p03_behaviour()
     fixture_p03_fvg15()
+    fixture_p04_static()
+    fixture_p04_behaviour()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
