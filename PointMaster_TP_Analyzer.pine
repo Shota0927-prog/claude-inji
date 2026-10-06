@@ -77,7 +77,7 @@ revTh1             = input.float(5.0,  "Reversal Threshold 1 ($)", group = grpTp
 revTh2             = input.float(10.0, "Reversal Threshold 2 ($)", group = grpTpAna, step = 1.0, minval = 0)
 revTh3             = input.float(15.0, "Reversal Threshold 3 ($)", group = grpTpAna, step = 1.0, minval = 0)
 revTh4             = input.float(20.0, "Reversal Threshold 4 ($)", group = grpTpAna, step = 1.0, minval = 0)
-anaView            = input.string("PHASE LADDER", "表示ビュー", options = ["PHASE LADDER", "TP DETAIL", "TRADE LIFECYCLE", "FULL OPTIMIZER", "FEATURE TOURNAMENT"], group = grpTpAna)
+anaView            = input.string("PHASE LADDER", "表示ビュー", options = ["PHASE LADDER", "TP DETAIL", "TRADE LIFECYCLE", "FULL OPTIMIZER", "FEATURE TOURNAMENT", "CONFIRM TOURNAMENT"], group = grpTpAna)
 ladderSide         = input.string("SHORT", "PHASE LADDER の Side",  options = ["LONG", "SHORT"],          group = grpTpAna)
 
 // --- Active event（未成熟イベントのみ。120m 成熟で削除）---
@@ -714,6 +714,162 @@ if tpAnaRun and anaView == "FEATURE TOURNAMENT" and ftValid
                         array.push(FT_EV_FH,    0)
                         f_optInc(FT_SIG, c * 2 + fSplit)
 
+
+// =====================================================================================
+// V7 MINIMAL REVERSAL CONFIRM TOURNAMENT（PRE ARM → EARLY CONFIRM → REV before EXT）
+// =====================================================================================
+// base FULL（Production 既定値の routeA / routeB）が false → true になった瞬間だけ ARM し（rising edge のみ）、
+// ARM 時の OPPOSITE PRE FEATURE PACK を snapshot。ARM から window（0 / 1 / 3 bar）以内に
+// Production の REVERSAL CONFIRM PACK が Recipe（16 固定）を満たした確定5M足で FULL Signal を出す。
+// 16 Recipe × 3 Route（ANY / A / B）× 3 Window = 144 configs。Signal price は confirm 足の close。
+// Lifecycle（config 別 1 Episode 1 FULL）/ First Hit（REV before EXT）/ TRAIN-TEST は V5/V6 と同一。
+// 処理は CONFIRM TOURNAMENT View 選択中・5M 確定足・6 source valid の時だけ。既存 View とは完全分離。
+grpCt = "⑫ Confirm Tournament"
+ctConfirmPackSource = input.source(close, "CT : REVERSAL CONFIRM PACK", group = grpCt)
+// base FULL 閾値（Production 現行 FULL と同じ固定値）
+float CT_STRONG_DOM   = 0.40
+float CT_COLLAPSE_PRE = 0.15
+float CT_COLLAPSE_CUR = 0.05
+int   CT_BASE_OPP     = 3
+float CT_MIN_PRETOTAL = 2.0
+
+f_ctPackOk(float v) => not na(v) and v >= 0 and v <= 31 and math.abs(v - math.round(v)) < 0.001
+bool ctValid = optValid and f_ftPackOk(ftOppFeaturePackSource) and f_ctPackOk(ctConfirmPackSource)
+
+// Recipe（16 固定）: 必要 bit の和
+//   C1=1 C5W=2 C5=4 S1=8 S5=16 ARM_M15=32 ARM_SAT2=64 ARM_STRUCTURE=128 ARM_F3=256
+var array<int>    CT_RECIPE_REQ   = array.from(0, 1, 2, 4, 3, 5, 8, 16, 9, 17, 35, 67, 131, 259, 33, 97)
+var array<string> CT_RECIPE_LABEL = array.from("NONE (ARM = FULL)", "1M CUR OPP", "5M CUR WEAK", "5M CUR OPP", "1M OPP + 5M WEAK", "1M OPP + 5M OPP", "SAT 1M OPP", "SAT 5M OPP", "1M OPP + SAT 1M OPP", "1M OPP + SAT 5M OPP", "1M OPP + 5M WEAK + ARM M15", "1M OPP + 5M WEAK + ARM SAT2", "1M OPP + 5M WEAK + ARM STRUCTURE", "1M OPP + 5M WEAK + ARM F3", "1M OPP + ARM M15", "1M OPP + ARM SAT2 + ARM M15")
+var array<int>    CT_WINDOW       = array.from(0, 1, 3)
+int CT_N = 144     // config = (recipe * 3 + route) * 3 + window
+
+// ---- ARM（route 別）----
+var array<bool>  CT_PREV_BASE  = array.new_bool(3, false)
+var array<bool>  CT_ARM_ACTIVE = array.new_bool(3, false)
+var array<int>   CT_ARM_START  = array.new_int(3, 0)
+var array<float> CT_ARM_PACK   = array.new_float(3, 0.0)
+// ---- Lifecycle / active event / 集計（index = config * 2 + split）----
+var array<bool>  CT_TAKEN    = array.new_bool(144, false)
+var int  ctEpSide = 0
+var bool ctInit   = false
+var array<int>   CT_EV_CFG   = array.new_int()
+var array<int>   CT_EV_BAR   = array.new_int()
+var array<float> CT_EV_PRICE = array.new_float()
+var array<int>   CT_EV_SPLIT = array.new_int()
+var array<int>   CT_EV_FH    = array.new_int()
+var array<int>   CT_SIG   = array.new_int(288, 0)
+var array<int>   CT_MAT   = array.new_int(288, 0)
+var array<int>   CT_REV   = array.new_int(288, 0)
+var array<int>   CT_EXT   = array.new_int(288, 0)
+var array<int>   CT_AMB   = array.new_int(288, 0)
+var array<int>   CT_UNR   = array.new_int(288, 0)
+var array<int>   CT_DELAY = array.new_int(288, 0)    // signalBar - armStartBar の合計（Signal 時に加算）
+
+if tpAnaRun and anaView == "CONFIRM TOURNAMENT" and ctValid
+    bool ctIsLong = optSel == 1
+    // ---- STEP 1 / 2 : First Hit（次足以降）→ 24bar 成熟 ----
+    int nCt = array.size(CT_EV_CFG)
+    if nCt > 0
+        for i = nCt - 1 to 0
+            int   sBar   = array.get(CT_EV_BAR, i)
+            float sPrice = array.get(CT_EV_PRICE, i)
+            if sBar < bar_index
+                if array.get(CT_EV_FH, i) == 0
+                    bool fhRev = ctIsLong ? low  <= sPrice - optFirstHitRev : high >= sPrice + optFirstHitRev
+                    bool fhExt = ctIsLong ? high >= sPrice + optFirstHitExt : low  <= sPrice - optFirstHitExt
+                    if fhRev and fhExt
+                        array.set(CT_EV_FH, i, 3)
+                    else if fhRev
+                        array.set(CT_EV_FH, i, 1)
+                    else if fhExt
+                        array.set(CT_EV_FH, i, 2)
+                if bar_index - sBar >= 24
+                    int k  = array.get(CT_EV_CFG, i) * 2 + array.get(CT_EV_SPLIT, i)
+                    int fh = array.get(CT_EV_FH, i)
+                    f_optInc(CT_MAT, k)
+                    if fh == 1
+                        f_optInc(CT_REV, k)
+                    else if fh == 2
+                        f_optInc(CT_EXT, k)
+                    else if fh == 3
+                        f_optInc(CT_AMB, k)
+                    else
+                        f_optInc(CT_UNR, k)
+                    array.remove(CT_EV_CFG, i)
+                    array.remove(CT_EV_BAR, i)
+                    array.remove(CT_EV_PRICE, i)
+                    array.remove(CT_EV_SPLIT, i)
+                    array.remove(CT_EV_FH, i)
+
+    // ---- STEP 3 : base FULL（route 別）----
+    int   cSide    = optCurDom > 0 ? 1 : optCurDom < 0 ? -1 : 0
+    float cCurStr  = math.abs(optCurDom)
+    float cOppDom  = cSide == 1 ? -optPreDom : cSide == -1 ? optPreDom : 0.0
+    bool  cRA      = cOppDom >= CT_STRONG_DOM and optOppCnt >= CT_BASE_OPP
+    bool  cRB      = cCurStr <= CT_COLLAPSE_CUR and cOppDom >= CT_COLLAPSE_PRE and optOppCnt >= CT_BASE_OPP
+    bool  cPreOk   = optPreTot >= CT_MIN_PRETOTAL
+    array<bool> cBase = array.from(cPreOk and (cRA or cRB), cPreOk and cRA, cPreOk and cRB)
+    bool  cInRange = not tpAnaUseDateFilter or (time >= tpAnaStart and time <= tpAnaEnd)
+    int   cSplit   = bar_index <= int(math.floor(last_bar_index * optTrainPct / 100.0)) ? 0 : 1
+    // 現在足の Confirm 特徴
+    float cPack = ctConfirmPackSource
+    bool  cC1   = f_ftBit(cPack, 0)
+    bool  cC5W  = f_ftBit(cPack, 1)
+    bool  cC5   = f_ftBit(cPack, 2)
+    bool  cS1   = f_ftBit(cPack, 3)
+    bool  cS5   = f_ftBit(cPack, 4)
+
+    if not ctInit
+        // 初回 valid : baseline のみ（event 0）。継続中の base を新 ARM にしない
+        ctInit   := true
+        ctEpSide := cSide
+        for r = 0 to 2
+            array.set(CT_PREV_BASE, r, array.get(cBase, r))
+    else
+        // ---- Episode（V5/V6 と同じ。NEUTRAL ではリセットしない）----
+        if cSide != 0 and cSide != ctEpSide
+            ctEpSide := cSide
+            if cSide == optSel
+                array.fill(CT_TAKEN, false)
+        if cSide != optSel
+            // 選択 side 以外では ARM を持ち越さない
+            array.fill(CT_ARM_ACTIVE, false)
+        for r = 0 to 2
+            bool bNow = array.get(cBase, r)
+            // ---- ARM（rising edge のみ・選択 side のみ）+ PRE Feature snapshot ----
+            if bNow and not array.get(CT_PREV_BASE, r) and cSide == optSel
+                array.set(CT_ARM_ACTIVE, r, true)
+                array.set(CT_ARM_START,  r, bar_index)
+                array.set(CT_ARM_PACK,   r, ftOppFeaturePackSource)
+            array.set(CT_PREV_BASE, r, bNow)
+            if array.get(CT_ARM_ACTIVE, r) and cSide == optSel
+                int   delay = bar_index - array.get(CT_ARM_START, r)
+                float aPack = array.get(CT_ARM_PACK, r)
+                int   aFam  = (f_ftBit(aPack, 0) ? 1 : 0) + (f_ftBit(aPack, 1) ? 1 : 0) + (f_ftBit(aPack, 2) ? 1 : 0) + (f_ftBit(aPack, 3) ? 1 : 0)
+                array<bool> cf = array.from(cC1, cC5W, cC5, cS1, cS5, f_ftBit(aPack, 6), f_ftBit(aPack, 4), f_ftBit(aPack, 0), aFam >= 3)
+                for rc = 0 to 15
+                    int  req = array.get(CT_RECIPE_REQ, rc)
+                    bool ok  = true
+                    for b = 0 to 8
+                        if math.floor(req / math.pow(2, b)) % 2 == 1 and not array.get(cf, b)
+                            ok := false
+                    if ok
+                        for w = 0 to 2
+                            int c = (rc * 3 + r) * 3 + w
+                            if delay <= array.get(CT_WINDOW, w) and not array.get(CT_TAKEN, c)
+                                array.set(CT_TAKEN, c, true)
+                                if cInRange
+                                    array.push(CT_EV_CFG,   c)
+                                    array.push(CT_EV_BAR,   bar_index)
+                                    array.push(CT_EV_PRICE, close)        // confirm 足の close
+                                    array.push(CT_EV_SPLIT, cSplit)
+                                    array.push(CT_EV_FH,    0)
+                                    f_optInc(CT_SIG, c * 2 + cSplit)
+                                    array.set(CT_DELAY, c * 2 + cSplit, array.get(CT_DELAY, c * 2 + cSplit) + delay)
+                // 最大 window（3 bar）を超えたら ARM 失効
+                if delay >= 3
+                    array.set(CT_ARM_ACTIVE, r, false)
+
 // ---- Result Table（左下。Production の右上メイン / 右下詳細とは別）-------------------------
 f_anaPct(int num, int den) => den > 0 ? str.tostring(num * 100.0 / den, "0.0") + "%" : "-"
 f_anaAvg(float sum, int den) => den > 0 ? str.tostring(sum / den, "0.00") : "-"
@@ -842,7 +998,7 @@ if tpAnaShowTable and barstate.islast
         f_anaRowLiftPt(25,  "Rev >= $" + str.tostring(revTh3) + " Lift vs HOLD", REV_HIT_15, MATURE_120, lc)
         f_anaRowLiftPt(26,  "Rev >= $" + str.tostring(revTh4) + " Lift vs HOLD", REV_HIT_20, MATURE_120, lc)
         f_anaRowLiftUsd(27, "Avg Signed120 Lift vs HOLD", SUM_SIGNED_120, MATURE_120, lc)
-    else if anaView == "FULL OPTIMIZER" or anaView == "FEATURE TOURNAMENT"
+    else if anaView == "FULL OPTIMIZER" or anaView == "FEATURE TOURNAMENT" or anaView == "CONFIRM TOURNAMENT"
         // FULL OPTIMIZER / FEATURE TOURNAMENT は別 table（optTbl / ftTbl）に表示する。anaTbl は空のまま
         table.clear(anaTbl, 0, 0, 4, 31)
     else if anaView == "TRADE LIFECYCLE"
@@ -1272,3 +1428,177 @@ if barstate.islast
         f_ftInfo(49, "BEST COMBO",              f_ftBestText(f_ftBestOf(candCombo)))
         f_ftInfo(50, "BEST ROUTE A",            f_ftBestText(f_ftBestOf(candA)))
         f_ftInfo(51, "BEST ROUTE B",            f_ftBestText(f_ftBestOf(candB)))
+
+// ---- CONFIRM TOURNAMENT Table（CONFIRM TOURNAMENT View 選択時のみ）-------------------------
+f_ctRes(int k)  => array.get(CT_REV, k) + array.get(CT_EXT, k)
+f_ctFh(int k)   => f_ctRes(k) > 0 ? array.get(CT_REV, k) * 100.0 / f_ctRes(k) : na
+f_ctCons(int k) =>
+    int d = f_ctRes(k) + array.get(CT_AMB, k)
+    d > 0 ? array.get(CT_REV, k) * 100.0 / d : na
+f_ctRate(array<int> arr, int k) => array.get(CT_MAT, k) > 0 ? array.get(arr, k) * 100.0 / array.get(CT_MAT, k) : na
+f_ctDly(int k)  => array.get(CT_SIG, k) > 0 ? array.get(CT_DELAY, k) * 5.0 / array.get(CT_SIG, k) : na    // AVG DELAY（分）
+f_ctIsA(int c) =>
+    float fh = f_ctFh(c * 2)
+    f_ctRes(c * 2) >= optMinTrain and not na(fh) and fh >= optTargetPct
+f_ctTestHit(int c) =>
+    float fh = f_ctFh(c * 2 + 1)
+    f_ctRes(c * 2 + 1) >= optMinTest and not na(fh) and fh >= optTargetPct
+// TRAIN だけで比較。GROUP A : resolved → FH → DELAY 短 → CONS / その他 : FH → resolved → DELAY 短 → CONS
+f_ctBetter(int a, int b) =>
+    bool r = false
+    if b < 0
+        r := true
+    else
+        bool  gA = f_ctIsA(a)
+        bool  gB = f_ctIsA(b)
+        int   nA = f_ctRes(a * 2)
+        int   nB = f_ctRes(b * 2)
+        float mA = nz(f_ctFh(a * 2), -1.0)
+        float mB = nz(f_ctFh(b * 2), -1.0)
+        float dA = nz(f_ctDly(a * 2), 1e9)
+        float dB = nz(f_ctDly(b * 2), 1e9)
+        float cA = nz(f_ctCons(a * 2), -1.0)
+        float cB = nz(f_ctCons(b * 2), -1.0)
+        bool  tail = dA < dB or (dA == dB and cA > cB)
+        if gA != gB
+            r := gA
+        else if gA
+            r := nA > nB or (nA == nB and (mA > mB or (mA == mB and tail)))
+        else
+            r := mA > mB or (mA == mB and (nA > nB or (nA == nB and tail)))
+    r
+f_ctRecipe(int c) => int(c / 9)
+f_ctRoute(int c)  => int(c / 3) % 3
+f_ctWin(int c)    => c % 3
+f_ctRouteLabel(int c) => f_ctRoute(c) == 0 ? "ANY" : f_ctRoute(c) == 1 ? "A" : "B"
+f_ctWinLabel(int c)   => f_ctWin(c) == 0 ? "0m" : f_ctWin(c) == 1 ? "5m" : "15m"
+f_ctRecId(int r) => "C" + (r < 10 ? "0" : "") + str.tostring(r)
+f_ctFmtMin(float v) => na(v) ? "-" : str.tostring(v, "0.0")
+
+var ctTbl = table.new(position.bottom_left, 15, 56, border_width = 1)
+
+f_ctCell(int col, int row, string txt) =>
+    table.cell(ctTbl, col, row, txt, text_color = colTxt, bgcolor = colBg, text_size = tblSize)
+    col
+
+f_ctRow(int row, string rankLabel, int c) =>
+    int kTr = c * 2
+    int kTe = c * 2 + 1
+    f_ctCell(0,  row, rankLabel)
+    f_ctCell(1,  row, f_ctRouteLabel(c))
+    f_ctCell(2,  row, f_ctWinLabel(c))
+    f_ctCell(3,  row, f_ctRecId(f_ctRecipe(c)))
+    f_ctCell(4,  row, str.tostring(f_ctRes(kTr)))
+    f_ctCell(5,  row, f_optFmtPct(f_ctFh(kTr)))
+    f_ctCell(6,  row, f_optFmtPct(f_ctCons(kTr)))
+    f_ctCell(7,  row, f_ctFmtMin(f_ctDly(kTr)))
+    f_ctCell(8,  row, str.tostring(f_ctRes(kTe)))
+    f_ctCell(9,  row, f_optFmtPct(f_ctFh(kTe)))
+    f_ctCell(10, row, f_optFmtPct(f_ctCons(kTe)))
+    f_ctCell(11, row, f_ctFmtMin(f_ctDly(kTe)))
+    f_ctCell(12, row, f_optFmtPct(f_ctRate(CT_AMB, kTe)))
+    f_ctCell(13, row, f_optFmtPct(f_ctRate(CT_UNR, kTe)))
+    f_ctCell(14, row, f_ctTestHit(c) ? "YES" : "NO")
+    row
+
+f_ctInfo(int row, string label, string val) =>
+    f_ctCell(0, row, label)
+    f_ctCell(1, row, val)
+    row
+
+f_ctBestOf(array<int> cand) =>
+    int best = -1
+    for i = 0 to array.size(cand) - 1
+        int c = array.get(cand, i)
+        if f_ctBetter(c, best)
+            best := c
+    best
+f_ctBestText(int c) =>
+    c < 0 ? "-" : f_ctRecId(f_ctRecipe(c)) + " " + f_ctRouteLabel(c) + " " + f_ctWinLabel(c) + " = " + array.get(CT_RECIPE_LABEL, f_ctRecipe(c)) + " | TR N " + str.tostring(f_ctRes(c * 2)) + " | TR FH " + f_optFmtPct(f_ctFh(c * 2)) + " | DLY " + f_ctFmtMin(f_ctDly(c * 2))
+
+if barstate.islast
+    table.clear(ctTbl, 0, 0, 14, 55)
+    if tpAnaShowTable and isChart5M and anaView == "CONFIRM TOURNAMENT"
+        f_ctInfo(0, "CT SOURCE",    ctValid ? "CONNECTED" : "INVALID")
+        f_ctInfo(1, "MODE",         "CONFIRMED 5M")
+        f_ctInfo(2, "SIDE",         optSide)
+        f_ctInfo(3, "CONFIGS",      str.tostring(CT_N))
+        f_ctInfo(4, "FIRST HIT",    "REV $" + str.tostring(optFirstHitRev) + " BEFORE EXT $" + str.tostring(optFirstHitExt))
+        f_ctInfo(5, "TRAIN / TEST", str.tostring(optTrainPct) + " / " + str.tostring(100 - optTrainPct))
+        f_ctInfo(6, "TARGET",       str.tostring(optTargetPct, "0.0") + "%")
+        f_ctInfo(7, "MIN TRAIN",    str.tostring(optMinTrain))
+        f_ctInfo(8, "MIN TEST",     str.tostring(optMinTest))
+        array<string> hdr = array.from("RANK", "ROUTE", "WINDOW", "RECIPE", "TR N", "TR FH %", "TR CONS %", "TR DLY", "TE N", "TE FH %", "TE CONS %", "TE DLY", "TE AMB %", "TE UNRES %", "TARGET")
+        for h = 0 to 14
+            f_ctCell(h, 9, array.get(hdr, h))
+        // ---- Top10（TRAIN だけで選択ソート）----
+        array<bool> used = array.new_bool(CT_N, false)
+        array<int>  top  = array.new_int()
+        for r = 0 to 9
+            int best = -1
+            for c = 0 to CT_N - 1
+                if not array.get(used, c) and f_ctBetter(c, best)
+                    best := c
+            if best >= 0
+                array.set(used, best, true)
+                array.push(top, best)
+        int testTargetTop = 0
+        array<int> legendRec = array.new_int()
+        for r = 0 to array.size(top) - 1
+            int c = array.get(top, r)
+            f_ctRow(10 + r, str.tostring(r + 1), c)
+            if f_ctTestHit(c)
+                testTargetTop += 1
+            if not array.includes(legendRec, f_ctRecipe(c))
+                array.push(legendRec, f_ctRecipe(c))
+        // ---- CONTROL（C00 / ANY / Window 0 = 従来 FULL 即 Signal）----
+        f_ctRow(20, "CONTROL", 0)
+        // ---- Legend（Top10 に出た Recipe のみ）----
+        f_ctCell(0, 21, "LEGEND")
+        for i = 0 to array.size(legendRec) - 1
+            int rr = array.get(legendRec, i)
+            f_ctCell(0, 22 + i, f_ctRecId(rr) + " = " + array.get(CT_RECIPE_LABEL, rr))
+        // ---- Single Confirmation（Route ANY / Window 15m 固定・C00〜C15）----
+        array<string> sh = array.from("CONFIRM", "TR N", "TR FH", "TR DLY", "TE N", "TE FH", "TE DLY", "TE CONS")
+        for h = 0 to 7
+            f_ctCell(h, 32, array.get(sh, h))
+        for rc = 0 to 15
+            int c = (rc * 3 + 0) * 3 + 2
+            f_ctCell(0, 33 + rc, f_ctRecId(rc) + " " + array.get(CT_RECIPE_LABEL, rc))
+            f_ctCell(1, 33 + rc, str.tostring(f_ctRes(c * 2)))
+            f_ctCell(2, 33 + rc, f_optFmtPct(f_ctFh(c * 2)))
+            f_ctCell(3, 33 + rc, f_ctFmtMin(f_ctDly(c * 2)))
+            f_ctCell(4, 33 + rc, str.tostring(f_ctRes(c * 2 + 1)))
+            f_ctCell(5, 33 + rc, f_optFmtPct(f_ctFh(c * 2 + 1)))
+            f_ctCell(6, 33 + rc, f_ctFmtMin(f_ctDly(c * 2 + 1)))
+            f_ctCell(7, 33 + rc, f_optFmtPct(f_ctCons(c * 2 + 1)))
+        // ---- Summary（BEST は TRAIN ranking 基準）----
+        //   SINGLE = 確認 Feature 1個だけの Recipe（C01 / C02 / C03 / C06 / C07）、COMBO = それ以外（C00 除く）
+        int trainTargetCnt = 0
+        array<int> cSingle = array.new_int()
+        array<int> cCombo  = array.new_int()
+        array<int> cW0     = array.new_int()
+        array<int> cW1     = array.new_int()
+        array<int> cW3     = array.new_int()
+        for c = 0 to CT_N - 1
+            if f_ctIsA(c)
+                trainTargetCnt += 1
+            int rc = f_ctRecipe(c)
+            if rc == 1 or rc == 2 or rc == 3 or rc == 6 or rc == 7
+                array.push(cSingle, c)
+            else if rc != 0
+                array.push(cCombo, c)
+            int w = f_ctWin(c)
+            if w == 0
+                array.push(cW0, c)
+            else if w == 1
+                array.push(cW1, c)
+            else
+                array.push(cW3, c)
+        f_ctInfo(49, "TRAIN Target Configs",    str.tostring(trainTargetCnt))
+        f_ctInfo(50, "TEST Target among Top10", str.tostring(testTargetTop))
+        f_ctInfo(51, "BEST SINGLE CONFIRM",     f_ctBestText(f_ctBestOf(cSingle)))
+        f_ctInfo(52, "BEST COMBO",              f_ctBestText(f_ctBestOf(cCombo)))
+        f_ctInfo(53, "BEST 0m",                 f_ctBestText(f_ctBestOf(cW0)))
+        f_ctInfo(54, "BEST 5m",                 f_ctBestText(f_ctBestOf(cW1)))
+        f_ctInfo(55, "BEST 15m",                f_ctBestText(f_ctBestOf(cW3)))
