@@ -384,10 +384,14 @@ optOppCountSource   = input.source(close, "OPT : OPPOSITE PRE TF COUNT",   group
 optSide             = input.string("SHORT", "OPT Side", options = ["SHORT", "LONG"], group = grpOpt)
 optMinPreTotal      = input.float(2.0,  "OPT 最低PRE証拠量 (PRE TOTAL)", group = grpOpt, minval = 0.0, step = 0.1)
 optTrainPct         = input.int(70,     "TRAIN %",                       group = grpOpt, minval = 50, maxval = 90, step = 5)
-optMetric           = input.string("Close Rev 120m", "Optimization Metric", options = ["Close Rev 120m", "Rev >= $10 / 120m", "Rev >= $15 / 120m", "Rev >= $20 / 120m"], group = grpOpt)
+optMetric           = input.string("Close Rev 120m", "Optimization Metric", options = ["Close Rev 120m", "Rev >= $10 / 120m", "Rev >= $15 / 120m", "Rev >= $20 / 120m", "REV10 before EXT5"], group = grpOpt)
 optTargetPct        = input.float(70.0, "Target %",                      group = grpOpt, step = 1.0)
 optMinTrain         = input.int(50,     "Min TRAIN matured",             group = grpOpt, minval = 1)
 optMinTest          = input.int(20,     "Min TEST matured",              group = grpOpt, minval = 1)
+// V5 FIRST HIT : FULL TP 後、元方向へ EXT $ 伸びるより先に逆方向へ REV $ 反転したか（Grid には含めない）
+optFirstHitRev      = input.float(10.0, "First Hit REV ($)",             group = grpOpt, minval = 0.1, step = 1.0)
+optFirstHitExt      = input.float(5.0,  "First Hit EXT ($)",             group = grpOpt, minval = 0.1, step = 1.0)
+bool optIsFH        = optMetric == "REV10 before EXT5"
 
 // ---- source validation ----
 float optCurDom  = optCurrentDomSource
@@ -431,6 +435,7 @@ var array<float> OPT_EV_PRICE = array.new_float()
 var array<float> OPT_EV_REV   = array.new_float()
 var array<float> OPT_EV_EXT   = array.new_float()
 var array<int>   OPT_EV_SPLIT = array.new_int()     // 0 = TRAIN / 1 = TEST（Signal 時に固定）
+var array<int>   OPT_EV_FH    = array.new_int()     // V5 First Hit : 0 = 未決着 / 1 = REV_FIRST / 2 = EXT_FIRST / 3 = AMBIGUOUS
 
 // ---- 集計（index = config * 2 + split）----
 var array<int>   OPT_SIG     = array.new_int(280, 0)
@@ -442,6 +447,11 @@ var array<float> OPT_EXTSUM  = array.new_float(280, 0.0)
 var array<int>   OPT_HIT10   = array.new_int(280, 0)
 var array<int>   OPT_HIT15   = array.new_int(280, 0)
 var array<int>   OPT_HIT20   = array.new_int(280, 0)
+// V5 First Hit 集計（index = config * 2 + split。120m 成熟時に確定。合計 = OPT_MAT）
+var array<int>   OPT_FH_REV  = array.new_int(280, 0)    // REV_FIRST
+var array<int>   OPT_FH_EXT  = array.new_int(280, 0)    // EXT_FIRST
+var array<int>   OPT_FH_AMB  = array.new_int(280, 0)    // 同一5M足で両方 hit（順序不明 → 成功扱い禁止）
+var array<int>   OPT_FH_UNR  = array.new_int(280, 0)    // 24bar 以内にどちらも未到達
 
 // candidate FULL（Production Phase C V2 STRONG と同じ構造で閾値だけ config 値）
 f_optCand(int c, float oppDomV, float curStrV, float preTotV, int oppV) =>
@@ -467,6 +477,16 @@ if tpAnaRun and anaView == "FULL OPTIMIZER" and optValid
                 float ext = optIsLong ? high - sPrice : sPrice - low
                 array.set(OPT_EV_REV, i, math.max(array.get(OPT_EV_REV, i), math.max(rev, 0.0)))
                 array.set(OPT_EV_EXT, i, math.max(array.get(OPT_EV_EXT, i), math.max(ext, 0.0)))
+                // V5 First Hit（未決着の間だけ判定。signal bar 自身は sBar < bar_index で除外済み）
+                if array.get(OPT_EV_FH, i) == 0
+                    bool fhRev = optIsLong ? low  <= sPrice - optFirstHitRev : high >= sPrice + optFirstHitRev
+                    bool fhExt = optIsLong ? high >= sPrice + optFirstHitExt : low  <= sPrice - optFirstHitExt
+                    if fhRev and fhExt
+                        array.set(OPT_EV_FH, i, 3)      // AMBIGUOUS（同一足内の順序は OHLC では不明）
+                    else if fhRev
+                        array.set(OPT_EV_FH, i, 1)      // REV_FIRST
+                    else if fhExt
+                        array.set(OPT_EV_FH, i, 2)      // EXT_FIRST
                 if bar_index - sBar >= 24
                     int   k      = array.get(OPT_EV_CFG, i) * 2 + array.get(OPT_EV_SPLIT, i)
                     float signed = optIsLong ? sPrice - close : close - sPrice
@@ -483,12 +503,22 @@ if tpAnaRun and anaView == "FULL OPTIMIZER" and optValid
                         f_optInc(OPT_HIT15, k)
                     if mRev >= 20.0
                         f_optInc(OPT_HIT20, k)
+                    int fh = array.get(OPT_EV_FH, i)
+                    if fh == 1
+                        f_optInc(OPT_FH_REV, k)
+                    else if fh == 2
+                        f_optInc(OPT_FH_EXT, k)
+                    else if fh == 3
+                        f_optInc(OPT_FH_AMB, k)
+                    else
+                        f_optInc(OPT_FH_UNR, k)         // UNRESOLVED_120
                     array.remove(OPT_EV_CFG, i)
                     array.remove(OPT_EV_BAR, i)
                     array.remove(OPT_EV_PRICE, i)
                     array.remove(OPT_EV_REV, i)
                     array.remove(OPT_EV_EXT, i)
                     array.remove(OPT_EV_SPLIT, i)
+                    array.remove(OPT_EV_FH, i)
 
     // ---- STEP 3 : Episode / config 別 FULL（Lifecycle）----
     int   oSide    = optCurDom > 0 ? 1 : optCurDom < 0 ? -1 : 0
@@ -520,6 +550,7 @@ if tpAnaRun and anaView == "FULL OPTIMIZER" and optValid
                         array.push(OPT_EV_REV,   0.0)
                         array.push(OPT_EV_EXT,   0.0)
                         array.push(OPT_EV_SPLIT, oSplit)
+                        array.push(OPT_EV_FH,    0)
                         f_optInc(OPT_SIG, c * 2 + oSplit)
 
 // ---- Result Table（左下。Production の右上メイン / 右下詳細とは別）-------------------------
@@ -735,23 +766,42 @@ if tpAnaShowTable and barstate.islast
 else if barstate.islast
     table.clear(anaTbl, 0, 0, 4, 31)
 
-// ---- FULL OPTIMIZER Table（12列。FULL OPTIMIZER View 選択時のみ）-------------------------
+// ---- FULL OPTIMIZER Table（既存 metric = 12列 / REV10 before EXT5 = 14列。FULL OPTIMIZER View 選択時のみ）-------------------------
 // metric（%）: CS / HIT10 / HIT15 / HIT20 ÷ MAT。MAT 0 は na
+// V5 First Hit 率
+//   FH %   = REV_FIRST / (REV_FIRST + EXT_FIRST)          （AMBIGUOUS は分母から除外）
+//   CONS % = REV_FIRST / (REV_FIRST + EXT_FIRST + AMBIG)  （保守的）
+f_optFhPct(int k) =>
+    int d = array.get(OPT_FH_REV, k) + array.get(OPT_FH_EXT, k)
+    d > 0 ? array.get(OPT_FH_REV, k) * 100.0 / d : na
+f_optConsPct(int k) =>
+    int d = array.get(OPT_FH_REV, k) + array.get(OPT_FH_EXT, k) + array.get(OPT_FH_AMB, k)
+    d > 0 ? array.get(OPT_FH_REV, k) * 100.0 / d : na
+f_optRatePct(array<int> arr, int k) =>
+    int m = array.get(OPT_MAT, k)
+    m > 0 ? array.get(arr, k) * 100.0 / m : na
 f_optMetricPct(int k) =>
-    int   m   = array.get(OPT_MAT, k)
-    int   num = optMetric == "Close Rev 120m" ? array.get(OPT_CS, k) : optMetric == "Rev >= $10 / 120m" ? array.get(OPT_HIT10, k) : optMetric == "Rev >= $15 / 120m" ? array.get(OPT_HIT15, k) : array.get(OPT_HIT20, k)
-    m > 0 ? num * 100.0 / m : na
+    float r = na
+    if optIsFH
+        r := f_optFhPct(k)
+    else
+        int   m   = array.get(OPT_MAT, k)
+        int   num = optMetric == "Close Rev 120m" ? array.get(OPT_CS, k) : optMetric == "Rev >= $10 / 120m" ? array.get(OPT_HIT10, k) : optMetric == "Rev >= $15 / 120m" ? array.get(OPT_HIT15, k) : array.get(OPT_HIT20, k)
+        r := m > 0 ? num * 100.0 / m : na
+    r
+// 件数ゲート / 件数順位に使う N : 既存 metric は matured、REV10 before EXT5 は resolved（REV + EXT）
+f_optN(int k) => optIsFH ? array.get(OPT_FH_REV, k) + array.get(OPT_FH_EXT, k) : array.get(OPT_MAT, k)
 f_optAvg(array<float> sumArr, int k) =>
     int m = array.get(OPT_MAT, k)
     m > 0 ? array.get(sumArr, k) / m : na
 // GROUP A : TRAIN matured >= optMinTrain and TRAIN metric >= target
 f_optIsA(int c) =>
     float mt = f_optMetricPct(c * 2)
-    array.get(OPT_MAT, c * 2) >= optMinTrain and not na(mt) and mt >= optTargetPct
+    f_optN(c * 2) >= optMinTrain and not na(mt) and mt >= optTargetPct
 // TEST TARGET : TEST matured >= optMinTest and TEST metric >= target
 f_optTestHit(int c) =>
     float mt = f_optMetricPct(c * 2 + 1)
-    array.get(OPT_MAT, c * 2 + 1) >= optMinTest and not na(mt) and mt >= optTargetPct
+    f_optN(c * 2 + 1) >= optMinTest and not na(mt) and mt >= optTargetPct
 // a が b より上位か（TRAIN だけで比較。TEST は使わない）
 f_optBetter(int a, int b) =>
     bool r = false
@@ -760,8 +810,8 @@ f_optBetter(int a, int b) =>
     else
         bool  gA = f_optIsA(a)
         bool  gB = f_optIsA(b)
-        int   nA = array.get(OPT_MAT, a * 2)
-        int   nB = array.get(OPT_MAT, b * 2)
+        int   nA = f_optN(a * 2)
+        int   nB = f_optN(b * 2)
         float mA = nz(f_optMetricPct(a * 2), -1.0)
         float mB = nz(f_optMetricPct(b * 2), -1.0)
         float vA = nz(f_optAvg(OPT_SSUM, a * 2), -1e9)
@@ -779,7 +829,7 @@ f_optBetter(int a, int b) =>
 f_optFmtPct(float v) => na(v) ? "-" : str.tostring(v, "0.0") + "%"
 f_optFmtUsd(float v) => na(v) ? "-" : str.tostring(v, "0.00")
 
-var optTbl = table.new(position.bottom_left, 12, 30, border_width = 1)
+var optTbl = table.new(position.bottom_left, 14, 30, border_width = 1)
 
 f_optCell(int col, int row, string txt) =>
     table.cell(optTbl, col, row, txt, text_color = colTxt, bgcolor = colBg, text_size = tblSize)
@@ -807,26 +857,58 @@ f_optRow(int row, string rankLabel, int c) =>
     f_optCell(11, row, f_optTestHit(c) ? "YES" : "NO")
     row
 
+// V5 First Hit 用 1行（14列）
+f_optRowFH(int row, string rankLabel, int c) =>
+    int kTr = c * 2
+    int kTe = c * 2 + 1
+    f_optCell(0,  row, rankLabel)
+    f_optCell(1,  row, str.tostring(array.get(CFG_STR, c),  "0.00"))
+    f_optCell(2,  row, str.tostring(array.get(CFG_CPRE, c), "0.00"))
+    f_optCell(3,  row, str.tostring(array.get(CFG_CDOM, c), "0.00"))
+    f_optCell(4,  row, str.tostring(array.get(CFG_OPP, c)))
+    f_optCell(5,  row, str.tostring(array.get(OPT_MAT, kTr)))
+    f_optCell(6,  row, f_optFmtPct(f_optFhPct(kTr)))
+    f_optCell(7,  row, f_optFmtPct(f_optConsPct(kTr)))
+    f_optCell(8,  row, str.tostring(array.get(OPT_MAT, kTe)))
+    f_optCell(9,  row, f_optFmtPct(f_optFhPct(kTe)))
+    f_optCell(10, row, f_optFmtPct(f_optConsPct(kTe)))
+    f_optCell(11, row, f_optFmtPct(f_optRatePct(OPT_FH_AMB, kTe)))
+    f_optCell(12, row, f_optFmtPct(f_optRatePct(OPT_FH_UNR, kTe)))
+    f_optCell(13, row, f_optTestHit(c) ? "YES" : "NO")
+    row
+
+// V5 Current Production の First Hit 内訳（split = 0 TRAIN / 1 TEST）
+f_optFhDetail(int row, string label, int k) =>
+    f_optCell(0, row, label)
+    f_optCell(1, row, str.tostring(array.get(OPT_MAT, k)))
+    f_optCell(2, row, f_optFmtPct(f_optFhPct(k)))
+    f_optCell(3, row, f_optFmtPct(f_optConsPct(k)))
+    f_optCell(4, row, str.tostring(array.get(OPT_FH_REV, k)))
+    f_optCell(5, row, str.tostring(array.get(OPT_FH_EXT, k)))
+    f_optCell(6, row, str.tostring(array.get(OPT_FH_AMB, k)))
+    f_optCell(7, row, str.tostring(array.get(OPT_FH_UNR, k)))
+    row
+
 f_optInfo(int row, string label, string val) =>
     f_optCell(0, row, label)
     f_optCell(1, row, val)
     row
 
 if barstate.islast
-    table.clear(optTbl, 0, 0, 11, 29)
+    table.clear(optTbl, 0, 0, 13, 29)
     if tpAnaShowTable and isChart5M and anaView == "FULL OPTIMIZER"
         f_optInfo(0, "OPT SOURCE",   optValid ? "CONNECTED" : "INVALID")
         f_optInfo(1, "MODE",         "CONFIRMED 5M")
         f_optInfo(2, "SIDE",         optSide)
         f_optInfo(3, "GRID",         str.tostring(OPT_N))
         f_optInfo(4, "TRAIN / TEST", str.tostring(optTrainPct) + " / " + str.tostring(100 - optTrainPct))
-        f_optInfo(5, "METRIC",       optMetric)
+        f_optInfo(5, "METRIC",       optIsFH ? optMetric + " (REV $" + str.tostring(optFirstHitRev) + " / EXT $" + str.tostring(optFirstHitExt) + ")" : optMetric)
         f_optInfo(6, "TARGET",       str.tostring(optTargetPct, "0.0") + "%")
         f_optInfo(7, "MIN TRAIN",    str.tostring(optMinTrain))
         f_optInfo(8, "MIN TEST",     str.tostring(optMinTest))
         // ---- header ----
-        array<string> hdr = array.from("RANK", "STR", "CPRE", "CDOM", "OPP", "TR N", "TR %", "TE N", "TE %", "TE AVG$", "TE R-E$", "TARGET")
-        for h = 0 to 11
+        array<string> hdr = optIsFH ? array.from("RANK", "STR", "CPRE", "CDOM", "OPP", "TR N", "TR FH %", "TR CONS %", "TE N", "TE FH %", "TE CONS %", "TE AMB %", "TE UNRES %", "TARGET") : array.from("RANK", "STR", "CPRE", "CDOM", "OPP", "TR N", "TR %", "TE N", "TE %", "TE AVG$", "TE R-E$", "TARGET")
+        for h = 0 to array.size(hdr) - 1
             f_optCell(h, 9, array.get(hdr, h))
         // ---- TRAIN だけで Top10 を選ぶ（選択ソート）----
         array<bool> used = array.new_bool(OPT_N, false)
@@ -846,7 +928,10 @@ if barstate.islast
         int testTargetTop = 0
         for r = 0 to array.size(top) - 1
             int c = array.get(top, r)
-            f_optRow(10 + r, str.tostring(r + 1), c)
+            if optIsFH
+                f_optRowFH(10 + r, str.tostring(r + 1), c)
+            else
+                f_optRow(10 + r, str.tostring(r + 1), c)
             if f_optTestHit(c)
                 testTargetTop += 1
         // ---- summary ----
@@ -858,6 +943,15 @@ if barstate.islast
             bestCov := "STR " + str.tostring(array.get(CFG_STR, b0), "0.00") + " / CPRE " + str.tostring(array.get(CFG_CPRE, b0), "0.00") + " / CDOM " + str.tostring(array.get(CFG_CDOM, b0), "0.00") + " / OPP " + str.tostring(array.get(CFG_OPP, b0))
         f_optInfo(23, "BEST TRAIN COVERAGE", bestCov)
         // ---- Production 既定値 config（比較用）----
-        for h = 0 to 11
+        for h = 0 to array.size(hdr) - 1
             f_optCell(h, 25, array.get(hdr, h))
-        f_optRow(26, "CURRENT", OPT_PROD_CFG)
+        if optIsFH
+            f_optRowFH(26, "CURRENT", OPT_PROD_CFG)
+            // Current Production の First Hit 内訳（TRAIN / TEST）
+            array<string> fhHdr = array.from("CURRENT FH", "N", "FH %", "CONS %", "REV_FIRST", "EXT_FIRST", "AMBIG", "UNRESOLVED")
+            for h = 0 to 7
+                f_optCell(h, 27, array.get(fhHdr, h))
+            f_optFhDetail(28, "TRAIN", OPT_PROD_CFG * 2)
+            f_optFhDetail(29, "TEST",  OPT_PROD_CFG * 2 + 1)
+        else
+            f_optRow(26, "CURRENT", OPT_PROD_CFG)
