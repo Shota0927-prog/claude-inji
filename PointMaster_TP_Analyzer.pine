@@ -77,7 +77,7 @@ revTh1             = input.float(5.0,  "Reversal Threshold 1 ($)", group = grpTp
 revTh2             = input.float(10.0, "Reversal Threshold 2 ($)", group = grpTpAna, step = 1.0, minval = 0)
 revTh3             = input.float(15.0, "Reversal Threshold 3 ($)", group = grpTpAna, step = 1.0, minval = 0)
 revTh4             = input.float(20.0, "Reversal Threshold 4 ($)", group = grpTpAna, step = 1.0, minval = 0)
-anaView            = input.string("PHASE LADDER", "表示ビュー", options = ["PHASE LADDER", "TP DETAIL", "TRADE LIFECYCLE"], group = grpTpAna)
+anaView            = input.string("PHASE LADDER", "表示ビュー", options = ["PHASE LADDER", "TP DETAIL", "TRADE LIFECYCLE", "FULL OPTIMIZER"], group = grpTpAna)
 ladderSide         = input.string("SHORT", "PHASE LADDER の Side",  options = ["LONG", "SHORT"],          group = grpTpAna)
 
 // --- Active event（未成熟イベントのみ。120m 成熟で削除）---
@@ -359,6 +359,169 @@ if tpAnaRun
     if phaseValid
         anaPrevPhaseCode := phaseCode
 
+
+// =====================================================================================
+// V4 FULL TP THRESHOLD OPTIMIZER（Lifecycle 方式 / TRAIN-TEST）
+// =====================================================================================
+// Production の Data Window 出力（CURRENT DOMINANCE / PRE DOMINANCE / PRE TOTAL /
+// OPPOSITE PRE TF COUNT）を input.source で受け取り、Phase C V2 の STRONG（FULL TP）構造
+//   routeA = oppDom >= STR and opp >= OPP
+//   routeB = curStrength <= CDOM and oppDom >= CPRE and opp >= OPP
+//   candidateFull = preTotal >= optMinPreTotal and (routeA or routeB)
+// の閾値だけを固定 Grid（7 × 5 × 2 × 2 = 140 configs）で差し替えて比較する。
+// 各 config は選択 side の 1 Episode につき FULL event 最大1回（Episode = CURRENT DOM 符号の連続。
+// NEUTRAL ではリセットせず、反対 side から選択 side へ切り替わった時だけ全 config の taken をリセット）。
+// Signal price / 次足からの tracking / 120m 統計式は既存 Analyzer と同一。
+// TRAIN / TEST は loaded bar_index の optTrainPct% で時系列分割し、Signal 発生バーで区分を固定する。
+// 順位付けは TRAIN だけで行い、TEST は検証表示専用（順位に使わない）。
+// 既存 View（PHASE LADDER / TP DETAIL / TRADE LIFECYCLE）の array・処理とは完全分離。
+// 処理は FULL OPTIMIZER View 選択中・5M 確定足・source valid の時だけ実行する（性能対策）。
+grpOpt = "⑩ FULL Optimizer"
+optCurrentDomSource = input.source(close, "OPT : CURRENT DOMINANCE",       group = grpOpt)
+optPreDomSource     = input.source(close, "OPT : PRE DOMINANCE",           group = grpOpt)
+optPreTotalSource   = input.source(close, "OPT : PRE TOTAL",               group = grpOpt)
+optOppCountSource   = input.source(close, "OPT : OPPOSITE PRE TF COUNT",   group = grpOpt)
+optSide             = input.string("SHORT", "OPT Side", options = ["SHORT", "LONG"], group = grpOpt)
+optMinPreTotal      = input.float(2.0,  "OPT 最低PRE証拠量 (PRE TOTAL)", group = grpOpt, minval = 0.0, step = 0.1)
+optTrainPct         = input.int(70,     "TRAIN %",                       group = grpOpt, minval = 50, maxval = 90, step = 5)
+optMetric           = input.string("Close Rev 120m", "Optimization Metric", options = ["Close Rev 120m", "Rev >= $10 / 120m", "Rev >= $15 / 120m", "Rev >= $20 / 120m"], group = grpOpt)
+optTargetPct        = input.float(70.0, "Target %",                      group = grpOpt, step = 1.0)
+optMinTrain         = input.int(50,     "Min TRAIN matured",             group = grpOpt, minval = 1)
+optMinTest          = input.int(20,     "Min TEST matured",              group = grpOpt, minval = 1)
+
+// ---- source validation ----
+float optCurDom  = optCurrentDomSource
+float optPreDom  = optPreDomSource
+float optPreTot  = optPreTotalSource
+int   optOppCnt  = int(math.round(optOppCountSource))
+bool  optValid   = not na(optCurDom) and optCurDom >= -1.0 and optCurDom <= 1.0 and not na(optPreDom) and optPreDom >= -1.0 and optPreDom <= 1.0 and not na(optPreTot) and optPreTot >= 0 and not na(optOppCnt) and optOppCnt >= 0 and optOppCnt <= 4
+int   optSel     = optSide == "LONG" ? 1 : -1
+
+// ---- 固定 Grid（140 configs）。config index = ((s * 5 + p) * 2 + d) * 2 + o ----
+var array<float> OPT_STR_GRID  = array.from(0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70)
+var array<float> OPT_CPRE_GRID = array.from(0.15, 0.20, 0.25, 0.30, 0.35)
+var array<float> OPT_CDOM_GRID = array.from(0.03, 0.05)
+var array<int>   OPT_OPP_GRID  = array.from(3, 4)
+int OPT_N = 140
+var array<float> CFG_STR  = array.new_float()
+var array<float> CFG_CPRE = array.new_float()
+var array<float> CFG_CDOM = array.new_float()
+var array<int>   CFG_OPP  = array.new_int()
+if array.size(CFG_STR) == 0
+    for si = 0 to 6
+        for pi = 0 to 4
+            for di = 0 to 1
+                for oi = 0 to 1
+                    array.push(CFG_STR,  array.get(OPT_STR_GRID,  si))
+                    array.push(CFG_CPRE, array.get(OPT_CPRE_GRID, pi))
+                    array.push(CFG_CDOM, array.get(OPT_CDOM_GRID, di))
+                    array.push(CFG_OPP,  array.get(OPT_OPP_GRID,  oi))
+// Production 既定値（STR .40 / CPRE .15 / CDOM .05 / OPP 3）の config index
+int OPT_PROD_CFG = ((0 * 5 + 0) * 2 + 1) * 2 + 0
+
+// ---- Lifecycle 状態（config 別 FULL taken）----
+var array<bool> OPT_FULL_TAKEN = array.new_bool(140, false)
+var int  optEpSide = 0
+var bool optInit   = false
+
+// ---- Active event（120m で remove）----
+var array<int>   OPT_EV_CFG   = array.new_int()
+var array<int>   OPT_EV_BAR   = array.new_int()
+var array<float> OPT_EV_PRICE = array.new_float()
+var array<float> OPT_EV_REV   = array.new_float()
+var array<float> OPT_EV_EXT   = array.new_float()
+var array<int>   OPT_EV_SPLIT = array.new_int()     // 0 = TRAIN / 1 = TEST（Signal 時に固定）
+
+// ---- 集計（index = config * 2 + split）----
+var array<int>   OPT_SIG     = array.new_int(280, 0)
+var array<int>   OPT_MAT     = array.new_int(280, 0)
+var array<int>   OPT_CS      = array.new_int(280, 0)
+var array<float> OPT_SSUM    = array.new_float(280, 0.0)
+var array<float> OPT_REVSUM  = array.new_float(280, 0.0)
+var array<float> OPT_EXTSUM  = array.new_float(280, 0.0)
+var array<int>   OPT_HIT10   = array.new_int(280, 0)
+var array<int>   OPT_HIT15   = array.new_int(280, 0)
+var array<int>   OPT_HIT20   = array.new_int(280, 0)
+
+// candidate FULL（Production Phase C V2 STRONG と同じ構造で閾値だけ config 値）
+f_optCand(int c, float oppDomV, float curStrV, float preTotV, int oppV) =>
+    int  o  = array.get(CFG_OPP, c)
+    bool rA = oppDomV >= array.get(CFG_STR, c) and oppV >= o
+    bool rB = curStrV <= array.get(CFG_CDOM, c) and oppDomV >= array.get(CFG_CPRE, c) and oppV >= o
+    preTotV >= optMinPreTotal and (rA or rB)
+
+f_optInc(array<int> arr, int k) =>
+    array.set(arr, k, array.get(arr, k) + 1)
+    k
+
+if tpAnaRun and anaView == "FULL OPTIMIZER" and optValid
+    bool optIsLong = optSel == 1
+    // ---- STEP 1 / 2 : active event 更新（次足以降の high / low）→ 120m 成熟 ----
+    int nOpt = array.size(OPT_EV_CFG)
+    if nOpt > 0
+        for i = nOpt - 1 to 0
+            int   sBar   = array.get(OPT_EV_BAR, i)
+            float sPrice = array.get(OPT_EV_PRICE, i)
+            if sBar < bar_index
+                float rev = optIsLong ? sPrice - low  : high - sPrice
+                float ext = optIsLong ? high - sPrice : sPrice - low
+                array.set(OPT_EV_REV, i, math.max(array.get(OPT_EV_REV, i), math.max(rev, 0.0)))
+                array.set(OPT_EV_EXT, i, math.max(array.get(OPT_EV_EXT, i), math.max(ext, 0.0)))
+                if bar_index - sBar >= 24
+                    int   k      = array.get(OPT_EV_CFG, i) * 2 + array.get(OPT_EV_SPLIT, i)
+                    float signed = optIsLong ? sPrice - close : close - sPrice
+                    float mRev   = array.get(OPT_EV_REV, i)
+                    f_optInc(OPT_MAT, k)
+                    if signed > 0
+                        f_optInc(OPT_CS, k)
+                    array.set(OPT_SSUM,   k, array.get(OPT_SSUM, k)   + signed)
+                    array.set(OPT_REVSUM, k, array.get(OPT_REVSUM, k) + mRev)
+                    array.set(OPT_EXTSUM, k, array.get(OPT_EXTSUM, k) + array.get(OPT_EV_EXT, i))
+                    if mRev >= 10.0
+                        f_optInc(OPT_HIT10, k)
+                    if mRev >= 15.0
+                        f_optInc(OPT_HIT15, k)
+                    if mRev >= 20.0
+                        f_optInc(OPT_HIT20, k)
+                    array.remove(OPT_EV_CFG, i)
+                    array.remove(OPT_EV_BAR, i)
+                    array.remove(OPT_EV_PRICE, i)
+                    array.remove(OPT_EV_REV, i)
+                    array.remove(OPT_EV_EXT, i)
+                    array.remove(OPT_EV_SPLIT, i)
+
+    // ---- STEP 3 : Episode / config 別 FULL（Lifecycle）----
+    int   oSide    = optCurDom > 0 ? 1 : optCurDom < 0 ? -1 : 0
+    float oCurStr  = math.abs(optCurDom)
+    float oOppDom  = oSide == 1 ? -optPreDom : oSide == -1 ? optPreDom : 0.0
+    bool  oInRange = not tpAnaUseDateFilter or (time >= tpAnaStart and time <= tpAnaEnd)
+    int   oSplit   = bar_index <= int(math.floor(last_bar_index * optTrainPct / 100.0)) ? 0 : 1
+    if not optInit
+        // 初回 valid source : baseline のみ（event 0）。選択 side で開始していれば成立済み config を taken に同期
+        optInit   := true
+        optEpSide := oSide
+        if oSide == optSel
+            for c = 0 to OPT_N - 1
+                array.set(OPT_FULL_TAKEN, c, f_optCand(c, oOppDom, oCurStr, optPreTot, optOppCnt))
+    else
+        // 反対 side へ切替（NEUTRAL ではリセットしない）。選択 side に入った時だけ全 config の taken をリセット
+        if oSide != 0 and oSide != optEpSide
+            optEpSide := oSide
+            if oSide == optSel
+                array.fill(OPT_FULL_TAKEN, false)
+        if oSide == optSel
+            for c = 0 to OPT_N - 1
+                if not array.get(OPT_FULL_TAKEN, c) and f_optCand(c, oOppDom, oCurStr, optPreTot, optOppCnt)
+                    array.set(OPT_FULL_TAKEN, c, true)
+                    if oInRange
+                        array.push(OPT_EV_CFG,   c)
+                        array.push(OPT_EV_BAR,   bar_index)
+                        array.push(OPT_EV_PRICE, close)
+                        array.push(OPT_EV_REV,   0.0)
+                        array.push(OPT_EV_EXT,   0.0)
+                        array.push(OPT_EV_SPLIT, oSplit)
+                        f_optInc(OPT_SIG, c * 2 + oSplit)
+
 // ---- Result Table（左下。Production の右上メイン / 右下詳細とは別）-------------------------
 f_anaPct(int num, int den) => den > 0 ? str.tostring(num * 100.0 / den, "0.0") + "%" : "-"
 f_anaAvg(float sum, int den) => den > 0 ? str.tostring(sum / den, "0.00") : "-"
@@ -487,6 +650,9 @@ if tpAnaShowTable and barstate.islast
         f_anaRowLiftPt(25,  "Rev >= $" + str.tostring(revTh3) + " Lift vs HOLD", REV_HIT_15, MATURE_120, lc)
         f_anaRowLiftPt(26,  "Rev >= $" + str.tostring(revTh4) + " Lift vs HOLD", REV_HIT_20, MATURE_120, lc)
         f_anaRowLiftUsd(27, "Avg Signed120 Lift vs HOLD", SUM_SIGNED_120, MATURE_120, lc)
+    else if anaView == "FULL OPTIMIZER"
+        // FULL OPTIMIZER は別 table（optTbl）に表示する。anaTbl は空のまま
+        table.clear(anaTbl, 0, 0, 4, 31)
     else if anaView == "TRADE LIFECYCLE"
         // ===== TRADE LIFECYCLE : 方向 Episode ごとに PARTIAL 最大1回 / FULL 最大1回 =====
         array<int> rc = array.from(2, 3, 6, 7)    // Raw（TP DETAIL）の対応 class
@@ -568,3 +734,130 @@ if tpAnaShowTable and barstate.islast
         f_anaRowPct(24, "Rev >= $" + str.tostring(revTh4) + " / 120m %", REV_HIT_20, MATURE_120, tc)
 else if barstate.islast
     table.clear(anaTbl, 0, 0, 4, 31)
+
+// ---- FULL OPTIMIZER Table（12列。FULL OPTIMIZER View 選択時のみ）-------------------------
+// metric（%）: CS / HIT10 / HIT15 / HIT20 ÷ MAT。MAT 0 は na
+f_optMetricPct(int k) =>
+    int   m   = array.get(OPT_MAT, k)
+    int   num = optMetric == "Close Rev 120m" ? array.get(OPT_CS, k) : optMetric == "Rev >= $10 / 120m" ? array.get(OPT_HIT10, k) : optMetric == "Rev >= $15 / 120m" ? array.get(OPT_HIT15, k) : array.get(OPT_HIT20, k)
+    m > 0 ? num * 100.0 / m : na
+f_optAvg(array<float> sumArr, int k) =>
+    int m = array.get(OPT_MAT, k)
+    m > 0 ? array.get(sumArr, k) / m : na
+// GROUP A : TRAIN matured >= optMinTrain and TRAIN metric >= target
+f_optIsA(int c) =>
+    float mt = f_optMetricPct(c * 2)
+    array.get(OPT_MAT, c * 2) >= optMinTrain and not na(mt) and mt >= optTargetPct
+// TEST TARGET : TEST matured >= optMinTest and TEST metric >= target
+f_optTestHit(int c) =>
+    float mt = f_optMetricPct(c * 2 + 1)
+    array.get(OPT_MAT, c * 2 + 1) >= optMinTest and not na(mt) and mt >= optTargetPct
+// a が b より上位か（TRAIN だけで比較。TEST は使わない）
+f_optBetter(int a, int b) =>
+    bool r = false
+    if b < 0
+        r := true
+    else
+        bool  gA = f_optIsA(a)
+        bool  gB = f_optIsA(b)
+        int   nA = array.get(OPT_MAT, a * 2)
+        int   nB = array.get(OPT_MAT, b * 2)
+        float mA = nz(f_optMetricPct(a * 2), -1.0)
+        float mB = nz(f_optMetricPct(b * 2), -1.0)
+        float vA = nz(f_optAvg(OPT_SSUM, a * 2), -1e9)
+        float vB = nz(f_optAvg(OPT_SSUM, b * 2), -1e9)
+        if gA != gB
+            r := gA
+        else if gA
+            // GROUP A : 件数 → metric → Avg Signed
+            r := nA > nB or (nA == nB and (mA > mB or (mA == mB and vA > vB)))
+        else
+            // GROUP A 以外 : metric → 件数 → Avg Signed
+            r := mA > mB or (mA == mB and (nA > nB or (nA == nB and vA > vB)))
+    r
+
+f_optFmtPct(float v) => na(v) ? "-" : str.tostring(v, "0.0") + "%"
+f_optFmtUsd(float v) => na(v) ? "-" : str.tostring(v, "0.00")
+
+var optTbl = table.new(position.bottom_left, 12, 30, border_width = 1)
+
+f_optCell(int col, int row, string txt) =>
+    table.cell(optTbl, col, row, txt, text_color = colTxt, bgcolor = colBg, text_size = tblSize)
+    col
+
+// config 1行（RANK 列ラベル + 11 指標）
+f_optRow(int row, string rankLabel, int c) =>
+    int   kTe   = c * 2 + 1
+    float teRev = f_optAvg(OPT_REVSUM, kTe)
+    float teExt = f_optAvg(OPT_EXTSUM, kTe)
+    float teRE  = na
+    if not na(teRev) and not na(teExt)
+        teRE := teRev - teExt
+    f_optCell(0,  row, rankLabel)
+    f_optCell(1,  row, str.tostring(array.get(CFG_STR, c),  "0.00"))
+    f_optCell(2,  row, str.tostring(array.get(CFG_CPRE, c), "0.00"))
+    f_optCell(3,  row, str.tostring(array.get(CFG_CDOM, c), "0.00"))
+    f_optCell(4,  row, str.tostring(array.get(CFG_OPP, c)))
+    f_optCell(5,  row, str.tostring(array.get(OPT_MAT, c * 2)))
+    f_optCell(6,  row, f_optFmtPct(f_optMetricPct(c * 2)))
+    f_optCell(7,  row, str.tostring(array.get(OPT_MAT, kTe)))
+    f_optCell(8,  row, f_optFmtPct(f_optMetricPct(kTe)))
+    f_optCell(9,  row, f_optFmtUsd(f_optAvg(OPT_SSUM, kTe)))
+    f_optCell(10, row, f_optFmtUsd(teRE))
+    f_optCell(11, row, f_optTestHit(c) ? "YES" : "NO")
+    row
+
+f_optInfo(int row, string label, string val) =>
+    f_optCell(0, row, label)
+    f_optCell(1, row, val)
+    row
+
+if barstate.islast
+    table.clear(optTbl, 0, 0, 11, 29)
+    if tpAnaShowTable and isChart5M and anaView == "FULL OPTIMIZER"
+        f_optInfo(0, "OPT SOURCE",   optValid ? "CONNECTED" : "INVALID")
+        f_optInfo(1, "MODE",         "CONFIRMED 5M")
+        f_optInfo(2, "SIDE",         optSide)
+        f_optInfo(3, "GRID",         str.tostring(OPT_N))
+        f_optInfo(4, "TRAIN / TEST", str.tostring(optTrainPct) + " / " + str.tostring(100 - optTrainPct))
+        f_optInfo(5, "METRIC",       optMetric)
+        f_optInfo(6, "TARGET",       str.tostring(optTargetPct, "0.0") + "%")
+        f_optInfo(7, "MIN TRAIN",    str.tostring(optMinTrain))
+        f_optInfo(8, "MIN TEST",     str.tostring(optMinTest))
+        // ---- header ----
+        array<string> hdr = array.from("RANK", "STR", "CPRE", "CDOM", "OPP", "TR N", "TR %", "TE N", "TE %", "TE AVG$", "TE R-E$", "TARGET")
+        for h = 0 to 11
+            f_optCell(h, 9, array.get(hdr, h))
+        // ---- TRAIN だけで Top10 を選ぶ（選択ソート）----
+        array<bool> used = array.new_bool(OPT_N, false)
+        array<int>  top  = array.new_int()
+        for r = 0 to 9
+            int best = -1
+            for c = 0 to OPT_N - 1
+                if not array.get(used, c) and f_optBetter(c, best)
+                    best := c
+            if best >= 0
+                array.set(used, best, true)
+                array.push(top, best)
+        int trainTargetCnt = 0
+        for c = 0 to OPT_N - 1
+            if f_optIsA(c)
+                trainTargetCnt += 1
+        int testTargetTop = 0
+        for r = 0 to array.size(top) - 1
+            int c = array.get(top, r)
+            f_optRow(10 + r, str.tostring(r + 1), c)
+            if f_optTestHit(c)
+                testTargetTop += 1
+        // ---- summary ----
+        f_optInfo(21, "TRAIN Target configs",    str.tostring(trainTargetCnt))
+        f_optInfo(22, "TEST Target among Top10", str.tostring(testTargetTop))
+        string bestCov = "-"
+        if trainTargetCnt > 0 and array.size(top) > 0
+            int b0 = array.get(top, 0)
+            bestCov := "STR " + str.tostring(array.get(CFG_STR, b0), "0.00") + " / CPRE " + str.tostring(array.get(CFG_CPRE, b0), "0.00") + " / CDOM " + str.tostring(array.get(CFG_CDOM, b0), "0.00") + " / OPP " + str.tostring(array.get(CFG_OPP, b0))
+        f_optInfo(23, "BEST TRAIN COVERAGE", bestCov)
+        // ---- Production 既定値 config（比較用）----
+        for h = 0 to 11
+            f_optCell(h, 25, array.get(hdr, h))
+        f_optRow(26, "CURRENT", OPT_PROD_CFG)
