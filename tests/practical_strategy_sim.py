@@ -318,7 +318,12 @@ def fixture_alloc():
 # =============================================================================
 # P02 — Practical Zone Feed harness parity (static)
 # =============================================================================
-VIS = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+#  ★ P02-P10 parity fixtures validate against the Visual authority of that stage (b3b69ae).
+#    The current Visual adds only the 5M execution gate; fixture_p16_visual_5m_gate ties it to b3b69ae.
+VIS_PRE_GATE_REV = "b3b69ae"
+VIS_CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+VIS = __import__("subprocess").run(["git", "-C", ROOT, "show", VIS_PRE_GATE_REV + ":ZoneVisualPractical.pine"],
+                                   capture_output=True, text=True).stdout or VIS_CUR
 MAIN = open(os.path.join(ROOT, "FvgZoneStrategy.pine"), encoding="utf-8").read()
 HAR_PATH = os.path.join(ROOT, "PracticalZoneFeedHarness.pine")
 HAR = open(HAR_PATH, encoding="utf-8").read() if os.path.exists(HAR_PATH) else ""
@@ -4541,6 +4546,77 @@ def fixture_p15():
           [P15_LEDGER[k].split()[0] for k in sorted(P15_LEDGER)] == ["PASS", "PASS", "PASS", "PASS", "SKIPPED_UNSAFE", "PASS", "PASS", "SKIPPED_UNSAFE"])
 
 
+# ============================================================================
+# P16 : Zone Visual (Practical) — 5M-only execution gate
+# ============================================================================
+def vis_eval_5m(src):
+    """Partially evaluate the gated Visual with is5mChart = true: remove the flag / gate comments,
+    drop 'is5mChart and ' guards, de-indent the 'if is5mChart' blocks, restore the original declarations."""
+    t = src
+    t = re.sub(r"\n\n// ---- 5分足専用 Execution Gate -+\n(//.*\n)*bool is5mChart = timeframe\.isminutes and timeframe\.multiplier == 5\n", "\n", t)
+    t = re.sub(r"^//  ★ 5分足専用.*\n(//    .*\n)?", "", t, flags=re.M)
+    t = t.replace("is5mChart and ", "").replace(" and is5mChart", "")
+    # trading day
+    t = t.replace("int tradingDayId = na\nif is5mChart\n", "")
+    t = t.replace("    tradingDayId := _locH < dayResetHour ? _calDayNo - 1 : _calDayNo\n",
+                  "int tradingDayId = _locH < dayResetHour ? _calDayNo - 1 : _calDayNo\n")
+    for v in ("_locY", "_locM", "_locD", "_locH", "_calDayNo"):
+        t = re.sub(r"^    int " + v + r"\b", "int " + v, t, flags=re.M)
+    # engine update
+    t = t.replace("int zoneCountNow = 0\n\nif is5mChart\n    zoneCountNow := zn.update(zoneEng, zoneCfg, zoneFeed)\n",
+                  "int zoneCountNow = zn.update(zoneEng, zoneCfg, zoneFeed)\n")
+    # break block: de-indent the 'if is5mChart' body and put the 4 declarations back after brNewPeriod
+    i = t.find("if is5mChart\n    int   brTfSec")
+    if i >= 0:
+        j = t.find("\n\n", i)
+        body = t[i + len("if is5mChart\n"):j + 1]
+        ded = "".join(l[4:] if l.startswith("    ") else l for l in body.splitlines(True))
+        decl = "float brClose = na\nfloat brHigh  = na\nfloat brLow   = na\nbool  brEval  = false\n"
+        ded = ded.replace("bool  brNewPeriod = bar_index > 0 and not na(brTfTime) and nz(ta.change(brTfTime), 0) != 0\n",
+                          "bool  brNewPeriod = bar_index > 0 and not na(brTfTime) and nz(ta.change(brTfTime), 0) != 0\n" + decl)
+        t = t[:i] + ded + t[j + 1:]
+        t = t.replace(decl + "int   brTfSec", "int   brTfSec", 1)
+    return t
+
+
+def fixture_p16_visual_5m_gate():
+    pre, cur = VIS, VIS_CUR
+    cc = code_only(cur)
+    check("P16-01 5M flag = timeframe.isminutes and timeframe.multiplier == 5 (not in_seconds == 300)",
+          "bool is5mChart = timeframe.isminutes and timeframe.multiplier == 5" in cc and "in_seconds() == 300" not in cc)
+    check("P16-02 5M chart: gated Visual partially evaluated with is5mChart = true == pre-gate Visual (b3b69ae) exactly",
+          bool(pre) and vis_eval_5m(cur) == pre)
+    check("P16-03 MA / Swing / Accum source requests only on 5M (if is5mChart and use*Source)",
+          all(f"if is5mChart and {x}\n" in cc for x in ("useMaSource", "useHzSource", "useAccSource"))
+          and not re.search(r"^if use(Ma|Hz|Acc)Source\n", cc, re.M))
+    br = cc[cc.find("float brClose = na"):cc.find("int tradingDayId = na")]
+    check("P16-04 Break: brClose/High/Low = na, brEval = false declared first; all acquisition / evaluation (3 paths, unchanged) inside if is5mChart",
+          br.startswith("float brClose = na\nfloat brHigh  = na\nfloat brLow   = na\nbool  brEval  = false\nif is5mChart\n")
+          and all(l.startswith("    ") or not l.strip() for l in br.split("\n")[5:])
+          and "request.security(syminfo.tickerid, breakTf, [close, high, low]," in br and "// Break TF < チャート足 : 旧版の経路 (変更なし)" in VIS_CUR)
+    check("P16-05 tradingDayId = na, real calculation only inside if is5mChart (same formula / timezone / reset hour)",
+          "int tradingDayId = na\nif is5mChart\n    int _locY = year(time, dayTz)" in cc
+          and "    tradingDayId := _locH < dayResetHour ? _calDayNo - 1 : _calDayNo" in cc)
+    check("P16-06 zn.update is called only inside if is5mChart (never with empty feed on other TFs)",
+          cc.count("zn.update(") == 1 and "int zoneCountNow = 0\n\nif is5mChart\n    zoneCountNow := zn.update(zoneEng, zoneCfg, zoneFeed)" in cc)
+    check("P16-07 Zone box / label drawing, MA lines, Stats table gated by is5mChart",
+          "if barstate.islast and is5mChart\n    int nBox = 0" in cc and "if barstate.islast and is5mChart and showStats" in cc
+          and cc.count("plot(is5mChart and showMaLines and useMaSource ?") == 2 and cc.count("plot(") == 2
+          and len(re.findall(r"\b(box|label|table)\.new\(", cc)) == len(re.findall(r"\b(box|label|table)\.new\(", code_only(pre))))
+    req_pre = re.findall(r"request\.security\(.*", code_only(pre))
+    req_cur = re.findall(r"request\.security\(.*", cc)
+    check("P16-08 request expressions / lookahead / TFs unchanged (only wrapped by the gate)", req_pre == req_cur and len(req_cur) == 8)
+    check("P16-09 inputs / defaults unchanged; library import unchanged (ZoneEnginePractical/1)",
+          parse_inputs(cur) == parse_inputs(pre) and re.findall(r"^import .*$", cc, re.M) == re.findall(r"^import .*$", code_only(pre), re.M))
+    # non-5M mirror: every gated item is skipped
+    gated = {"MA": "if is5mChart and useMaSource", "HZ": "if is5mChart and useHzSource", "ACC": "if is5mChart and useAccSource",
+             "BREAK": "bool  brEval  = false\nif is5mChart", "DAY": "int tradingDayId = na\nif is5mChart",
+             "UPDATE": "if is5mChart\n    zoneCountNow := zn.update", "DRAW": "if barstate.islast and is5mChart\n",
+             "STATS": "if barstate.islast and is5mChart and showStats"}
+    check("P16-10 non-5M (1M / 15M / 1H): Source requests, Break, trading day, zn.update, boxes / labels, MA lines, Stats all skipped",
+          all(v in cc for v in gated.values()))
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -4578,6 +4654,7 @@ if __name__ == "__main__":
     fixture_p13a()
     fixture_p14_final_audit()
     fixture_p15()
+    fixture_p16_visual_5m_gate()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
