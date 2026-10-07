@@ -4619,6 +4619,219 @@ def fixture_p16_visual_5m_gate():
           all(v in cc for v in gated.values()))
 
 
+# ============================================================================
+# L3 : ZoneEnginePractical — Authority Feed version (new library source)
+# ============================================================================
+#  Source of the next ZoneEnginePractical publish. The existing ZoneEnginePractical.pine (source of the
+#  versions imported by the Strategy / Visual today) is NOT modified.
+L3_SRC_PATH = os.path.join(ROOT, "ZoneEnginePracticalAuthority.pine")
+L3_BASE_REV = "b572dc8"     # ZoneEnginePractical.pine at this rev = the base the parity is proven against
+
+
+def l3_transform(src):
+    """built-in -> Authority Feed substitution. Only *which value is read* changes; no expression is altered."""
+    t = src
+
+    def R(a, b, n=1):
+        nonlocal t
+        assert t.count(a) == n, (a[:90], t.count(a))
+        t = t.replace(a, b)
+    # ---- header note ----
+    R("//  ZoneEnginePractical  —  Practical Zone v1 (Support / Resistance Zone Engine)\n",
+      "//  ZoneEnginePractical  —  Practical Zone v1 (Support / Resistance Zone Engine)\n"
+      "//  ★ Authority Feed 版 (Zone Visual MTF 用)。update() 経路はチャート足の high / low / close /\n"
+      "//    time / bar_index を直接読まず、ZoneFeed の barHigh / barLow / barClose / barTime / barIndex\n"
+      "//    (= 今処理している Engine 足 (5分足) 自身の値) を読む。判定式は従来と同一で、\n"
+      "//    呼び出し側が barX = 組み込み値を渡せば結果は従来版と完全一致する。\n"
+      "//    drawOrder / nearestIdx の基準 close も最後に処理した Authority close。\n")
+    # ---- ZoneFeed fields ----
+    R("    float brLow   = na\n    bool  brEval  = false\n",
+      "    float brLow   = na\n    bool  brEval  = false\n"
+      "    // ★ Authority bar (今処理している Engine 足自身の値。必須)\n"
+      "    //   Engine 足のチャートで呼ぶ場合は high / low / close / time / bar_index をそのまま渡す。\n"
+      "    float barHigh  = na\n    float barLow   = na\n    float barClose = na\n    int   barTime  = na\n    int   barIndex = na\n")
+    # ---- ZoneEngine: authority copy of the bar being processed ----
+    R("    array<int>     sIds         // Accum 世代管理用\n",
+      "    array<int>     sIds         // Accum 世代管理用\n"
+      "    // ---- Authority bar (update() 冒頭で ZoneFeed からコピー。helper はこれを読む) ----\n"
+      "    //  aClose は最後に処理した Authority close (drawOrder / nearestIdx の基準)。\n"
+      "    float aHigh  = na\n    float aLow   = na\n    float aClose = na\n    int   aTime  = na\n    int   aIndex = na\n")
+    # ---- f_makeRaw ----
+    R("f_makeRaw(ZoneCfg c, int uid, string id, string cat, string tf, float ctr, float bs, bool dyn) =>",
+      "f_makeRaw(ZoneCfg c, int uid, string id, string cat, string tf, float ctr, float bs, bool dyn, int aIdx, int aTm) =>")
+    R("baseScore = bs, createdBar = bar_index, createdTime = time, dynamic = dyn)",
+      "baseScore = bs, createdBar = aIdx, createdTime = aTm, dynamic = dyn)")
+    R("RawZone rz = f_makeRaw(c, f_nextUid(e), id, cat, tf, price, bs, false)",
+      "RawZone rz = f_makeRaw(c, f_nextUid(e), id, cat, tf, price, bs, false, e.aIndex, e.aTime)")
+    R("RawZone rz = f_makeRaw(c, f_nextUid(e), id, CAT_ACC, tf, price, bs, false)",
+      "RawZone rz = f_makeRaw(c, f_nextUid(e), id, CAT_ACC, tf, price, bs, false, e.aIndex, e.aTime)")
+    # ---- f_registerStatic (lifetime) ----
+    R("                        z.expireTime := time + life\n", "                        z.expireTime := e.aTime + life\n")
+    R("            rz.expireTime := life > 0 ? time + life : 0\n", "            rz.expireTime := life > 0 ? e.aTime + life : 0\n")
+    # ---- f_prunePersist (lifetime) ----
+    R("    if not na(e.nextPersistExpireTime) and time > e.nextPersistExpireTime\n",
+      "    if not na(e.nextPersistExpireTime) and e.aTime > e.nextPersistExpireTime\n")
+    R("                    if z.expireTime > 0 and time > z.expireTime\n", "                    if z.expireTime > 0 and e.aTime > z.expireTime\n")
+    # ---- f_findTrack ----
+    R("            if na(t.matchedBar) or t.matchedBar != bar_index\n", "            if na(t.matchedBar) or t.matchedBar != e.aIndex\n")
+    # ---- f_naturalState ----
+    R("f_naturalState(float top, float bottom) =>\n    close > top ? ST_SUPPORT : close < bottom ? ST_RESIST : ST_ACTIVE\n",
+      "f_naturalState(float top, float bottom, float refClose) =>\n    refClose > top ? ST_SUPPORT : refClose < bottom ? ST_RESIST : ST_ACTIVE\n")
+    # ---- f_updateTrack ----
+    R("f_updateTrack(ZoneTrack t, ZoneCfg c, bool evalBar, float bc, float bh, float bl) =>",
+      "f_updateTrack(ZoneTrack t, ZoneCfg c, bool evalBar, float bc, float bh, float bl, float aClose, int aIdx) =>")
+    R("            t.breakBar := bar_index\n", "            t.breakBar := aIdx\n", 2)
+    R("                    t.state := f_naturalState(t.top, t.bottom)\n", "                    t.state := f_naturalState(t.top, t.bottom, aClose)\n", 2)
+    R("        t.state := f_naturalState(t.top, t.bottom)\n\n    if t.state == ST_SUPPORT",
+      "        t.state := f_naturalState(t.top, t.bottom, aClose)\n\n    if t.state == ST_SUPPORT")
+    # ---- f_updateTouch ----
+    R("f_updateTouch(ZoneTrack t, Zone z, ZoneCfg c) =>", "f_updateTouch(ZoneTrack t, Zone z, ZoneCfg c, float aHigh, float aLow, int aIdx) =>")
+    R("        if eligible and low <= t.top and high >= t.bottom\n", "        if eligible and aLow <= t.top and aHigh >= t.bottom\n")
+    R("            t.lastTouchBar := bar_index\n", "            t.lastTouchBar := aIdx\n")
+    R("        bool awayUp   = low  >= t.top    + c.touchRearmDist\n        bool awayDown = high <= t.bottom - c.touchRearmDist\n",
+      "        bool awayUp   = aLow  >= t.top    + c.touchRearmDist\n        bool awayDown = aHigh <= t.bottom - c.touchRearmDist\n")
+    # ---- f_maSlopeBonus ----
+    R("f_maSlopeBonus(float maVal, int dir, int st, ZoneCfg c) =>\n    bool aligned = (dir > 0 and close > maVal) or (dir < 0 and close < maVal)\n",
+      "f_maSlopeBonus(float maVal, int dir, int st, ZoneCfg c, float aClose) =>\n    bool aligned = (dir > 0 and aClose > maVal) or (dir < 0 and aClose < maVal)\n")
+    # ---- f_pushDyn ----
+    R("    rz.createdBar     := bar_index\n    rz.createdTime    := time\n", "    rz.createdBar     := e.aIndex\n    rz.createdTime    := e.aTime\n")
+    # ---- update ----
+    R("export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>\n",
+      "export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>\n"
+      "    // ---- 6.0 Authority bar : 以降の判定は全てこの値を読む (チャート足の組み込み変数は読まない) ----\n"
+      "    e.aHigh  := f.barHigh\n    e.aLow   := f.barLow\n    e.aClose := f.barClose\n    e.aTime  := f.barTime\n    e.aIndex := f.barIndex\n")
+    R("        e.dayHigh     := high\n        e.dayLow      := low\n", "        e.dayHigh     := f.barHigh\n        e.dayLow      := f.barLow\n")
+    R("        e.dayHigh := na(e.dayHigh) ? high : math.max(e.dayHigh, high)\n        e.dayLow  := na(e.dayLow)  ? low  : math.min(e.dayLow,  low)\n",
+      "        e.dayHigh := na(e.dayHigh) ? f.barHigh : math.max(e.dayHigh, f.barHigh)\n        e.dayLow  := na(e.dayLow)  ? f.barLow  : math.min(e.dayLow,  f.barLow)\n")
+    R("f_maSlopeBonus(f.ma1, ma1Dir, ma1State, c)", "f_maSlopeBonus(f.ma1, ma1Dir, ma1State, c, f.barClose)")
+    R("f_maSlopeBonus(f.ma2, ma2Dir, ma2State, c)", "f_maSlopeBonus(f.ma2, ma2Dir, ma2State, c, f.barClose)")
+    R("                     state = f_naturalState(z.top, z.bottom), lastSeenBar = bar_index,\n",
+      "                     state = f_naturalState(z.top, z.bottom, f.barClose), lastSeenBar = f.barIndex,\n")
+    R("                int expBar = bar_index + c.trackStaleBars + 1\n", "                int expBar = f.barIndex + c.trackStaleBars + 1\n")
+    R("            t.matchedBar  := bar_index\n", "            t.matchedBar  := f.barIndex\n")
+    R("            t.lastSeenBar := bar_index\n", "            t.lastSeenBar := f.barIndex\n")
+    R("            int ev = f_updateTrack(t, c, f.brEval, f.brClose, f.brHigh, f.brLow)\n",
+      "            int ev = f_updateTrack(t, c, f.brEval, f.brClose, f.brHigh, f.brLow, f.barClose, f.barIndex)\n")
+    R("            z.touchCount := f_updateTouch(t, z, c)\n", "            z.touchCount := f_updateTouch(t, z, c, f.barHigh, f.barLow, f.barIndex)\n")
+    R("    if not na(e.nextTrackExpireBar) and bar_index >= e.nextTrackExpireBar\n",
+      "    if not na(e.nextTrackExpireBar) and f.barIndex >= e.nextTrackExpireBar\n")
+    R("                    if bar_index - t.lastSeenBar > c.trackStaleBars\n", "                    if f.barIndex - t.lastSeenBar > c.trackStaleBars\n")
+    # ---- drawOrder / nearestIdx : last processed Authority close ----
+    R("            array.push(d, math.abs(array.get(e.live, i).center - close))\n",
+      "            array.push(d, math.abs(array.get(e.live, i).center - e.aClose))\n")
+    R("            bool ok = wantSupport ? z.top < close : z.bottom > close\n", "            bool ok = wantSupport ? z.top < e.aClose : z.bottom > e.aClose\n")
+    R("array.push(dist, wantSupport ? close - z.top : z.bottom - close)", "array.push(dist, wantSupport ? e.aClose - z.top : z.bottom - e.aClose)")
+    return t
+
+
+L3_BUILTIN = r"\b(high|low|close|open|time|time_close|bar_index|volume|hl2|hlc3|ohlc4)\b|\bta\.\w+|\bbarstate\.\w+|\btimeframe\.\w+"
+
+
+def _pine_functions(src):
+    """top-level function name -> body text (code only)."""
+    out, cur, name = {}, [], None
+    for ln in src.split("\n"):
+        m = re.match(r"^(?:export\s+)?([A-Za-z_]\w*)\(", ln)
+        if m and not ln.startswith(" "):
+            if name:
+                out[name] = "\n".join(cur)
+            name, cur = m.group(1), [ln]
+        elif name is not None:
+            if ln and not ln[0].isspace() and not ln.startswith("//"):
+                out[name] = "\n".join(cur)
+                name, cur = None, []
+            else:
+                cur.append(ln)
+    if name:
+        out[name] = "\n".join(cur)
+    return {k: code_only(v) for k, v in out.items()}
+
+
+def _reachable(funcs, root):
+    seen, todo = set(), [root]
+    while todo:
+        f_ = todo.pop()
+        if f_ in seen or f_ not in funcs:
+            continue
+        seen.add(f_)
+        body = funcs[f_].split("\n", 1)[1] if "\n" in funcs[f_] else ""
+        todo += [c_ for c_ in re.findall(r"(?<![\.\w])([A-Za-z_]\w*)\(", body) if c_ in funcs]
+    return seen
+
+
+def fixture_l3():
+    base = _git_show(L3_BASE_REV, "ZoneEnginePractical.pine")
+    new = open(L3_SRC_PATH, encoding="utf-8").read() if os.path.exists(L3_SRC_PATH) else ""
+    check("L3-00 existing ZoneEnginePractical.pine (published /2 / /3 source) unchanged",
+          open(os.path.join(ROOT, "ZoneEnginePractical.pine"), encoding="utf-8").read() == base)
+    check("L3-00b Authority library source == l3_transform(base) exactly (documented substitutions only)",
+          bool(new) and l3_transform(base) == new)
+    check("L3-00c same library name (publishes as the next ZoneEnginePractical version)",
+          re.findall(r'^library\("(\w+)"', base, re.M) == re.findall(r'^library\("(\w+)"', new, re.M) == ["ZoneEnginePractical"])
+    fb, fn_ = _pine_functions(base), _pine_functions(new)
+    # ---- L3-10 : no chart built-in reachable from update() ----
+    reach = _reachable(fn_, "update")
+    left = {f_: sorted(set(m.group(0) for m in re.finditer(L3_BUILTIN, _strip_str_all(fn_[f_])))) for f_ in reach}
+    left = {k: v for k, v in left.items() if v}
+    check("L3-10 no chart built-in (high/low/close/open/time/bar_index/ta.*/barstate.*/timeframe.*) in any function reachable from update()",
+          not left and len(reach) > 15, f"{len(reach)} reachable; left={left}")
+    check("L3-10b base: the same reachable set DID read built-ins (Day H/L, Touch, State, Slope, Lifetime, Track, Break)",
+          {k for k in _reachable(fb, "update") if re.search(L3_BUILTIN, _strip_str_all(fb[k]))} ==
+          {"update", "f_makeRaw", "f_registerStatic", "f_prunePersist", "f_findTrack", "f_naturalState", "f_updateTrack",
+           "f_updateTouch", "f_maSlopeBonus", "f_pushDyn"})
+    rest = {k: sorted(set(m.group(0) for m in re.finditer(L3_BUILTIN, _strip_str_all(v)))) for k, v in fn_.items() if k not in reach}
+    rest = {k: v for k, v in rest.items() if v}
+    check("L3-10c built-ins outside update(): only Source packs evaluated inside request.* (maPack / pivotPack / accumPack + internals)",
+          set(rest) <= {"maPack", "f_ma", "pivotPack", "accumPack", "f_accumBoxCore", "f_accumBoxState", "f_accumDetectProvisional"}
+          and not ({"drawOrder", "nearestIdx"} & set(rest)), str(rest))
+    # ---- parity on the Engine TF : barX = built-in  =>  every substituted read returns the same value ----
+    upd = fn_["update"]
+    head = upd.split("\n")[1:6]
+    check("L3-01 Authority values copied from the Feed as the FIRST statements of update() (before any helper reads them)",
+          [h.strip() for h in head] == ["e.aHigh  := f.barHigh", "e.aLow   := f.barLow", "e.aClose := f.barClose",
+                                        "e.aTime  := f.barTime", "e.aIndex := f.barIndex"])
+    #  reverse substitution: map every Authority read back to its built-in and drop the added params -> base, exactly
+    rev = new
+    for a, b in (("e.aHigh  := f.barHigh\n", ""), ("e.aLow   := f.barLow\n", ""), ("e.aClose := f.barClose\n", ""),
+                 ("e.aTime  := f.barTime\n", ""), ("e.aIndex := f.barIndex\n", "")):
+        rev = rev.replace("    " + a, b)
+    sub = {"f.barHigh": "high", "f.barLow": "low", "f.barClose": "close", "f.barTime": "time", "f.barIndex": "bar_index",
+           "e.aHigh": "high", "e.aLow": "low", "e.aClose": "close", "e.aTime": "time", "e.aIndex": "bar_index",
+           "aHigh": "high", "aLow": "low", "aClose": "close", "aTm": "time", "aIdx": "bar_index", "refClose": "close"}
+    body_rev = rev
+    for k in sorted(sub, key=len, reverse=True):
+        body_rev = re.sub(r"(?<![\w\.])" + re.escape(k) + r"\b", sub[k], body_rev)
+    for a, b in ((", float close) =>", ") =>"), (", int bar_index, int time) =>", ") =>"), (", float close, int bar_index) =>", ") =>"),
+                 (", float high, float low, int bar_index) =>", ") =>"),
+                 (", false, bar_index, time)", ", false)"), (", c, close)", ", c)"), (", c, high, low, bar_index)", ", c)"),
+                 (", f.brLow, close, bar_index)", ", f.brLow)"), ("(t.top, t.bottom, close)", "(t.top, t.bottom)"),
+                 ("(z.top, z.bottom, close)", "(z.top, z.bottom)")):
+        body_rev = body_rev.replace(a, b)
+    rb = {k: v for k, v in _pine_functions(body_rev).items()}
+    same = [k for k in fb if k in rb and fb[k] == rb[k]]
+    diff = [k for k in fb if fb.get(k) != rb.get(k)]
+    check("L3-01..09 Engine-TF parity: substituting barX = high / low / close / time / bar_index turns every function back into the base "
+          "(Touch / State / Score / Strength / Lifetime / Track / Break / Flip / Day H/L / drawOrder all read identical values)",
+          not diff and len(same) == len(fb), str(diff))
+    for tag, fns in (("L3-02 Touch", ["f_updateTouch"]), ("L3-03 State", ["f_naturalState", "f_updateTrack"]),
+                     ("L3-04 Score / Strength (MA slope bonus)", ["f_maSlopeBonus", "f_finalizeCluster", "f_applyStrength"]),
+                     ("L3-05 Lifetime", ["f_registerStatic", "f_prunePersist", "f_makeRaw", "f_pushDyn"]),
+                     ("L3-06 Track / Continuity", ["f_findTrack", "f_trackContinuous"]), ("L3-07 Break / Flip", ["f_updateTrack"]),
+                     ("L3-08 Day H/L", ["update"]), ("L3-09 drawOrder / nearestIdx", ["drawOrder", "nearestIdx"])):
+        check(f"{tag}: parity on the Engine TF (reverse substitution == base)", all(fb.get(f_) == rb.get(f_) and f_ in fb for f_ in fns))
+    check("L3 ZoneFeed gained exactly barHigh / barLow / barClose / barTime / barIndex; ZoneEngine gained aHigh / aLow / aClose / aTime / aIndex",
+          all(f"    float {x}" in new or f"    int   {x}" in new for x in ("barHigh  = na", "barLow   = na", "barClose = na", "barTime  = na", "barIndex = na"))
+          and all(f"    float {x}" in new or f"    int   {x}" in new for x in ("aHigh  = na", "aLow   = na", "aClose = na", "aTime  = na", "aIndex = na")))
+    check("L3 exported API unchanged (same export list and signatures; packs / TradePlan API untouched)",
+          re.findall(r"^export \w+\(.*", base, re.M) == re.findall(r"^export \w+\(.*", new, re.M)
+          and all(fb[k] == fn_[k] for k in ("maPack", "pivotPack", "accumPack", "buildPlanWithTpDepth", "buildPlan", "getLongStructuralSL",
+                                             "getShortStructuralSL", "isInsideActiveZone", "getObstacleCount")))
+
+
+def _strip_str_all(t):
+    return re.sub(r'"[^"\n]*"', '""', t)
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -4657,6 +4870,7 @@ if __name__ == "__main__":
     fixture_p14_final_audit()
     fixture_p15()
     fixture_p16_visual_5m_gate()
+    fixture_l3()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
