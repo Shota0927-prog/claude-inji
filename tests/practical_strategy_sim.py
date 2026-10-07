@@ -4630,6 +4630,10 @@ def fixture_p16_visual_5m_gate():
 #  Source of the next ZoneEnginePractical publish. The existing ZoneEnginePractical.pine (source of the
 #  versions imported by the Strategy / Visual today) is NOT modified.
 L3_SRC_PATH = os.path.join(ROOT, "ZoneEnginePracticalAuthority.pine")
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import visual_mtf as vm                                     # noqa: E402
+from visual_mtf_build import v4_mtf_transform, v4_mtf_eval_off   # noqa: E402
 L3_BASE_REV = "b572dc8"     # ZoneEnginePractical.pine at this rev = the base the parity is proven against
 
 
@@ -4856,9 +4860,9 @@ def v4_transform(src):
 def fixture_v4_5m_direct():
     cur, gate = VIS_CUR, VIS_GATE
     cc = code_only(cur)
-    check("V4-01 Visual /4 5M direct path parity: current == v4_transform(d240ec0) exactly "
+    check("V4-01 Visual /4 5M direct path parity: MTF Visual with Parity Mode OFF on 5M == v4_transform(d240ec0) exactly "
           "(only import /2 -> /4 and the 5 Authority feed args; Source / Break / dayId / update order unchanged)",
-          bool(gate) and v4_transform(gate) == cur)
+          bool(gate) and v4_mtf_eval_off(cur) == v4_transform(gate))
     check("V4-01b import = ZoneEnginePractical/4 only (single library import)",
           re.findall(r"^import .*$", cc, re.M) == ["import sekine3310/ZoneEnginePractical/4 as zn"])
     feed = cc[cc.find("zn.ZoneFeed zoneFeed = zn.ZoneFeed.new(") + len("zn.ZoneFeed zoneFeed = zn.ZoneFeed.new("):]
@@ -4878,8 +4882,6 @@ def fixture_v4_5m_direct():
           "(L3 reverse-substitution proof holds for the /4 source)",
           all(re.search(r"^    e\." + a + r"\s*:= f\." + b + r"$", lib, re.M) for a, b in (("aHigh", "barHigh"), ("aLow", "barLow"),
               ("aClose", "barClose"), ("aTime", "barTime"), ("aIndex", "barIndex"))))
-    check("V4-GATE 5M gate still in place (MTF paths not implemented: STOP at step 6 history audit)",
-          cc.count("is5mChart") == code_only(gate).count("is5mChart") and cc.count("zn.update(") == 1)
     rc = __import__("subprocess").run(["git", "-C", ROOT, "diff", "--name-only", "03b9f46", "--",
                                        "PracticalZoneStrategy_LONG.pine", "PracticalZoneStrategy_SHORT.pine",
                                        "SignalEnginePractical.pine", "ZoneEnginePractical.pine",
@@ -4888,6 +4890,212 @@ def fixture_v4_5m_direct():
     check("V4-PROD Strategy LONG / SHORT, SignalEngine, ZoneEnginePractical.pine, Authority source unchanged vs 03b9f46; "
           "Strategies still import /3", rc == "" and all("import sekine3310/ZoneEnginePractical/3 as zn" in
           open(os.path.join(ROOT, f), encoding="utf-8").read() for f in ("PracticalZoneStrategy_LONG.pine", "PracticalZoneStrategy_SHORT.pine")), rc)
+
+
+# ============================================================================
+# V4-MTF : ZoneVisualPractical MTF Authority (Engine Start Time)
+# ============================================================================
+V4_DIRECT_REV = "a251a0a"      # 5M /4 direct-path parity commit
+
+TF_SEC = {"15S": 15, "30S": 30, "1": 60, "3": 180, "5": 300, "15": 900, "30": 1800, "60": 3600, "120": 7200,
+          "240": 14400, "360": 21600, "720": 43200, "D": 86400, "W": 604800, "M": 2592000}
+
+
+def _v4_market(n=4000):
+    # 5M bars with session gaps (daily 1h break every 276 bars, a weekend-like 2-day break once)
+    gaps = set()
+    for d in range(0, 40):
+        gaps |= set(range(d * 288 + 276, d * 288 + 288))
+    gaps |= set(range(5 * 288, 7 * 288))
+    t0 = 1_790_000_100 // 86400 * 86400
+    return vm.five_min_bars(t0, n, gaps)
+
+
+def _v4_run(tf, times, chart_start, start_t, **kw):
+    sec = TF_SEC[tf]
+    if sec == 300:
+        g, fed = vm.simulate_direct(times, chart_start, start_t)
+        calls = {}
+        for f in fed:
+            calls[f[1]] = calls.get(f[1], 0) + 1
+        return g, fed, calls
+    if sec < 300:
+        return vm.simulate_lower(times, sec, chart_start, start_t, **kw)
+    return vm.simulate_upper(times, sec, chart_start, start_t, **kw)
+
+
+def fixture_v4_mtf():
+    cur = VIS_CUR
+    cc = code_only(cur)
+    base = _git_show(V4_DIRECT_REV, "ZoneVisualPractical.pine")
+    check("V4-MTF-00 current Visual == v4_mtf_transform(a251a0a) exactly (MTF = marked V4 blocks + 4 gate expressions)",
+          bool(base) and v4_mtf_transform(base) == cur)
+    check("V4-MTF-01 5M Parity kept: Parity Mode OFF partial evaluation == a251a0a exactly",
+          bool(base) and v4_mtf_eval_off(cur) == base)
+    # ---- feed pack ---------------------------------------------------------
+    pk = cur[cur.index("f_authPack(int startT) =>\n"):]
+    pk = pk[:pk.index("\n\n") + 1]
+    check("V4-MTF-PACK f_authPack == mechanical transform of the 5M direct-path Source / Break / dayId code "
+          "(gates dropped, comments dropped, timeframe.in_seconds() -> in_seconds(AUTH_TF); no formula change)",
+          pk == vm.pine_auth_pack(vm.direct_segment(cur)))
+    direct = vm.direct_segment(cur)
+    req_d = re.findall(r"request\.security\(syminfo\.tickerid, (\w+),", direct)
+    req_p = re.findall(r"request\.security\(syminfo\.tickerid, (\w+),", pk)
+    check("V4-MTF-PACK2 pack Source requests == direct path (MA maTf / Swing hzTf1-3 / Accum accTf1-3 / Break breakTf), "
+          "same lookahead_off", req_d == req_p == ["maTf", "hzTf1", "hzTf2", "hzTf3", "accTf1", "accTf2", "accTf3", "breakTf"]
+          and pk.count("lookahead = barmerge.lookahead_off") == direct.count("lookahead = barmerge.lookahead_off") == 8, str(req_p))
+    ret = re.findall(r"^    \[(.*)\]$", pk, re.M)[-1].split(", ")
+    check("V4-MTF-PACK3 pack returns 36 primitives in ZoneFeed order (35 fields with barHigh/Low/Close/Time = 5M-context "
+          "high/low/close/time, barIndex = start-relative 5M index) + startOk; no UDT crosses the request",
+          ret == vm.PACK_RETURN and len(ret) == 36 and "zn.ZoneFeed" not in pk and ".new(" not in pk)
+    prev = cur[cur.index("f_authPackPrev(int startT) =>\n"):]
+    prev = prev[:prev.index("\n\n") + 1]
+    check("V4-MTF-PACK4 f_authPackPrev = every pack element [1] (previous confirmed 5M bar), nothing else",
+          prev == vm.pine_auth_pack_prev())
+    # ---- nested-request static audit ----------------------------------------
+    outer_s = re.findall(r"request\.security\(syminfo\.tickerid, AUTH_TF,\s*f_authPackPrev\(engineStartTime\), lookahead = barmerge\.lookahead_on\)", cur)
+    outer_l = re.findall(r"request\.security_lower_tf\(syminfo\.tickerid, AUTH_TF,\s*f_authPack\(engineStartTime\)\)", cur)
+    check("V4-MTF-NEST static: <5m = 1 request.security(AUTH_TF, f_authPackPrev, lookahead_on); >5m = 1 "
+          "security_lower_tf(AUTH_TF, f_authPack); 8 nested Source requests inside the pack; dynamic_requests = true "
+          "[PINE_COMPILE_REQUIRED: nested request / lower_tf nested request / 36-element tuple]",
+          len(outer_s) == 1 and len(outer_l) == 1 and "dynamic_requests = true" in cur and len(req_p) == 8
+          and 'string AUTH_TF    = "5"' in cur)
+    check("V4-MTF-NEST2 no drawing / plot / alert / table inside the pack (drawing stays in main context)",
+          not re.search(r"\b(box|label|line|table)\.new|plot\(|alert\(|zn\.update", pk + prev))
+    # ---- engine purity / offset invariance (parity follows from identical feed sequences) ----------
+    lib = open(L3_SRC_PATH, encoding="utf-8").read()
+    funcs = _pine_functions(lib)
+    reach = _reachable(funcs, "update")
+    body = "\n".join(funcs[f_] for f_ in reach)
+    check("V4-MTF-PURE zn.update reachable set has no ta.*, no [n] history, no chart built-in -> state is a pure "
+          "fold over the fed 5M sequence (safe to call k times per chart bar in replay order)",
+          not re.search(r"\bta\.", body) and not re.search(r"[\w)]\[[^\]]+\]", re.sub(r"array<\w+>|\[\]", "", body))
+          and not re.search(r"(?<![\.\w])(high|low|close|open|time|bar_index|barstate)\b(?!\s*=)", body), str(sorted(reach))[:80])
+    uses = re.findall(r"[^\n]*\b(createdBar|breakBar|lastSeenBar|matchedBar|lastTouchBar|nextTrackExpireBar)\b[^\n]*", body)
+    check("V4-MTF-PURE2 Authority index consumers are only equality / differences / min (offset-invariant): "
+          "start-relative index (MTF) and 5M bar_index (5M direct) give the same state",
+          all(not re.search(r"\b(createdBar|breakBar|lastSeenBar|lastTouchBar)\b\s*[<>]=?\s*\d", l) for l in uses))
+    # ---- MTF structure ------------------------------------------------------
+    upd = cc[cc.index("if is5mChart and not useEngineStart"):cc.index("bool authDisplayOk")]
+    check("V4-MTF-STRUCT =5m direct (OFF: unchanged / ON: f_authKey + guard), <5m security[1] + guard, "
+          ">5m lower_tf replay i = 0..n-1 (oldest -> newest) + guard; every non-OFF zn.update behind f_authAccept",
+          upd.count("zn.update(") == 4 and upd.count("f_authAccept(") == 3
+          and "for i = 0 to nAuth - 1\n            if i < nAuth - 1 or barstate.isconfirmed\n                if f_authAccept(authG, array.get(l34, i), array.get(l35, i), array.get(l33, i))" in upd
+          and "if f_authAccept(authG, s34, s35, s33)\n        zn.update(" in upd
+          and "if f_authAccept(authG, d5Idx, d5Ok, time)" in upd and cc.count("zn.update(") == 4)
+    feed_s = re.findall(r"(\w+) = (s\d+)", upd)
+    feed_l = re.findall(r"(\w+) = array\.get\((l\d+), i\)", upd)
+    check("V4-15 MTF ZoneFeed: every field from the 5M Authority pack element (barHigh/Low/Close/Time/Index = 5M-context "
+          "high/low/close/time/start-relative index); no chart high/low/close/time/bar_index on <5m / >5m paths",
+          feed_s == [(f, "s%d" % k) for k, f in enumerate(vm.FEED_FIELDS)]
+          and feed_l == [(f, "l%d" % k) for k, f in enumerate(vm.FEED_FIELDS)]
+          and not re.search(r"= (high|low|close|time|bar_index)\b", upd[upd.index("else if useEngineStart and chartTfSec < authTfSec"):]))
+    check("V4-MTF-DRAW drawing / MA lines / Stats gated by authDisplayOk = (ON: guard status OK, OFF: is5mChart); "
+          "drawOrder from /4 (Authority close), box width unchanged",
+          "bool authDisplayOk = useEngineStart ? authG.status == 1 : is5mChart" in cc
+          and "if barstate.islast and authDisplayOk\n    int nBox = 0" in cc
+          and "if barstate.islast and authDisplayOk and showStats" in cc
+          and cc.count("plot(authDisplayOk and showMaLines and useMaSource ?") == 2
+          and "zn.drawOrder(zoneEng, zn.zoneCount(zoneEng))" in cc
+          and "int xL = bar_index - zoneLeftBars" in cc and "int xR = bar_index + zoneRightBars" in cc)
+    check("V4-MTF-INPUT only the 2 MTF inputs added (MTF Parity Mode default OFF, Engine Start Time); every other input / default unchanged",
+          parse_inputs(base) == {k: v for k, v in parse_inputs(cur).items() if k not in ("useEngineStart", "engineStartTime")}
+          and len(parse_inputs(cur)) == len(parse_inputs(base)) + 2 and "useEngineStart = input.bool(false," in cur)
+
+    # ---- mirror: all TFs from the same Engine Start Time -------------------
+    times = _v4_market()
+    start_t = times[1500] - 120                       # first 5M bar >= start = times[1500]
+    chart_start = times[0]
+    ref_g, ref_fed, _ = _v4_run("5", times, chart_start, start_t)
+    ref_state = vm.run_engine(ref_fed)
+    tfs = ["15S", "30S", "1", "3", "5", "15", "30", "60", "120", "240", "360", "720", "D", "W", "M"]
+    res = {tf: _v4_run(tf, times, chart_start, start_t) for tf in tfs}
+    sup = [tf for tf in tfs if res[tf][0].status == vm.ST_OK]
+    check("V4-MTF-START-01 every SUPPORTED TF: firstAuthorityTime == 5M firstAuthorityTime (= first 5M bar >= start), "
+          "firstAuthorityIndex == 0",
+          len(sup) == len(tfs) and all(res[tf][0].firstTime == ref_g.firstTime == times[1500] and res[tf][0].firstIdx == 0 for tf in sup),
+          f"supported={sup}")
+    n_ref = len(times) - 1500
+    check("V4-MTF-START-02 processed 5M bar count identical on every SUPPORTED TF (<5m: through the last completed 5M bar)",
+          all(res[tf][0].count == (n_ref - 1 if TF_SEC[tf] < 300 else n_ref) for tf in sup) and ref_g.count == n_ref,
+          str({tf: res[tf][0].count for tf in sup}))
+    check("V4-MTF-START-03 missing authority bar = 0 on every SUPPORTED TF", all(res[tf][0].missing == 0 for tf in sup))
+    check("V4-MTF-START-04 duplicate zn.update = 0 (each authority index updated exactly once)",
+          all(all(v == 1 for v in res[tf][2].values()) for tf in sup))
+    check("V4-MTF-START-05 authority order identical (strictly +1 sequence, same times as 5M)",
+          all([f[:2] for f in res[tf][1]] == [f[:2] for f in ref_fed[:len(res[tf][1])]] for tf in sup)
+          and all(res[tf][0].inversion == 0 for tf in sup))
+    same_cut = [tf for tf in sup if TF_SEC[tf] >= 300]
+    check("V4-MTF-PARITY Zone state identical (count / top / bottom / score / strength / state / touch / srcMask / "
+          "Break / Flip / Track / Lifetime): Engine = pure fold over identical feed sequences",
+          all(vm.run_engine(res[tf][1]) == ref_state for tf in same_cut)
+          and all(vm.run_engine(res[tf][1]) == vm.run_engine(ref_fed[:-1]) for tf in sup if TF_SEC[tf] < 300))
+    for nid, name in (("V4-07", "Zone count"), ("V4-08", "top / bottom"), ("V4-09", "score / strength"),
+                      ("V4-10", "state / touch"), ("V4-11", "Break / Flip"), ("V4-12", "srcMask"), ("V4-13", "Track / Lifetime")):
+        check(f"{nid} {name} parity (confirmed 5M): follows V4-MTF-PURE + V4-MTF-START-05 + V4-MTF-PARITY",
+              all(vm.run_engine(res[tf][1]) == ref_state for tf in same_cut))
+    g1 = res["1"]
+    check("V4-03 1M chart: each 5M Feed reported 5x but zn.update once (dupSkip > 0, duplicate update 0)",
+          g1[0].dupSkip > 0 and all(v == 1 for v in g1[2].values()))
+    for nid, tf, k in (("V4-04", "15", 3), ("V4-05", "60", 12), ("V4-06", "240", 48)):
+        sec = TF_SEC[tf]
+        bars = {}
+        for f in res[tf][1]:
+            bars.setdefault((f[0] - chart_start) // sec, []).append(f[0])
+        full = [v for v in bars.values() if len(v) == k]
+        check(f"{nid} {tf} chart: full chart bars replay {k} 5M bars oldest -> newest",
+              len(full) > 0 and all(v == sorted(v) and v[-1] - v[0] == (k - 1) * 300 for v in full), f"full bars={len(full)}")
+    check("V4-14 duplicate update = 0 on all TFs", all(all(v == 1 for v in res[tf][2].values()) for tf in tfs))
+
+    # ---- realtime: unconfirmed 5M bar never processed on >5m -----------------
+    gl, fl, _ = vm.simulate_upper(times, 3600, chart_start, start_t, live_last=True)
+    check("V4-MTF-RT >5m realtime chart bar: the last (forming) 5M intrabar is not processed; parity holds through the "
+          "latest confirmed 5M bar", gl.status == vm.ST_OK and fl == ref_fed[:len(fl)] and len(fl) == n_ref - 1)
+
+    # ---- insufficient history: never start mid-way, hide zones -----------------
+    late = times[1600]
+    for tf in ("1", "5"):
+        g, fed, _ = _v4_run(tf, times, late, start_t)
+        check(f"V4-MTF-INSUFF-{tf} chart history starts after Engine Start -> INSUFFICIENT 5M HISTORY, Engine never "
+              "starts (0 updates), zones hidden", g.status == vm.ST_INSUFF and fed == [] and g.count == 0)
+    g, fed, _ = vm.simulate_upper(times, 3600, chart_start, start_t, intrabar_limit=2000)
+    check("V4-MTF-INSUFF-LTF >5m intrabar limit does not reach Engine Start -> INSUFFICIENT, 0 updates (no thinning, "
+          "no late start)", g.status == vm.ST_INSUFF and fed == [])
+    g, fed, _ = _v4_run("15", times, chart_start, start_t, ctx_start=times[1500])
+    check("V4-MTF-INSUFF-EDGE 5M context starts exactly at the start bar (cannot prove it is the first 5M bar >= start) "
+          "-> INSUFFICIENT", g.status == vm.ST_INSUFF and fed == [])
+    g, fed, _ = vm.simulate_upper(times, 3600, chart_start, times[-1] + 600)
+    check("V4-MTF-INSUFF-WAIT Engine Start after the last 5M bar -> status 0 (no authority bar), zones hidden",
+          g.status == vm.ST_WAIT and fed == [])
+    # 3m chart: a 5M bar whose trades all fall in a 3m bar that opened in the previous 5M slot -> its predecessor is
+    # never reported -> AUTHORITY GAP (detected, zones hidden; nothing approximated)
+    tr = {times[1700]: [10, 40]}                      # 5M bar times[1700]: trades only at +10 s / +40 s
+    tr.update({times[1699]: [0, 100, 200]})           # previous 5M bar: no trade after +200 s
+    g, fed, _ = vm.simulate_lower(times, 180, chart_start, start_t, trades=tr)
+    check("V4-MTF-GAP-3M missing 5M report on a sparse 3m chart -> AUTHORITY GAP: processing stops, zones hidden, "
+          "missing counted (never skipped silently)",
+          g.status == vm.ST_BROKEN and g.missing >= 1 and fed == ref_fed[:len(fed)], f"missing={g.missing}")
+    # guard unit cases
+    g = vm.Guard()
+    seq = [(None, False, 1), (0, True, 2), (0, True, 2), (1, True, 3), (3, True, 5)]
+    out = [vm.guard_accept(g, r, ok, t) for r, ok, t in seq]
+    check("V4-MTF-GUARD guard: pre-start skip, start accept, repeat = dupSkip, +1 accept, jump = AUTHORITY GAP (no accept)",
+          out == [False, True, False, True, False] and g.status == vm.ST_BROKEN and g.missing == 1 and g.dupSkip == 1)
+    g = vm.Guard()
+    out = [vm.guard_accept(g, r, ok, t) for r, ok, t in [(0, True, 1), (1, True, 2), (0, True, 1)]]
+    check("V4-MTF-GUARD2 order inversion -> status 3, never re-processed", out == [True, True, False] and g.status == vm.ST_BROKEN and g.inversion == 1)
+    # Pine guard text mirrors guard_accept
+    ga = cur[cur.index("f_authAccept(AuthGuard g"):]
+    ga = ga[:ga.index("\n    acc\n") + 8]
+    check("V4-MTF-GUARD3 Pine f_authAccept branch structure == Python mirror (start: rel == 0 and startOk; repeat skip; "
+          "+1 accept; inversion / jump -> status 3; first non-start -> status 2)",
+          all(x in ga for x in ("if g.status <= 1 and not na(rel) and rel >= 0", "if rel == 0 and startOk",
+                                 "g.status := 2", "else if rel == g.lastIdx\n            g.dupSkip := g.dupSkip + 1",
+                                 "else if rel == g.lastIdx + 1\n            acc := true", "g.inversion := g.inversion + 1",
+                                 "g.missing := g.missing + rel - g.lastIdx - 1")))
+    fk = cur[cur.index("f_authKey(int startT) =>"):]
+    check("V4-MTF-KEY f_authKey: index 0 = first 5M bar with time >= Engine Start; startOk = a 5M bar exists before it",
+          "if na(startIdx) and time >= startT\n        startIdx := bar_index\n        startOk  := bar_index > 0" in fk)
 
 
 if __name__ == "__main__":
@@ -4930,6 +5138,7 @@ if __name__ == "__main__":
     fixture_p16_visual_5m_gate()
     fixture_l3()
     fixture_v4_5m_direct()
+    fixture_v4_mtf()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
