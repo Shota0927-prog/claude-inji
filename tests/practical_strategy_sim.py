@@ -4584,8 +4584,10 @@ def fixture_p16_visual_5m_gate():
     cc = code_only(cur)
     check("P16-01 5M flag = timeframe.isminutes and timeframe.multiplier == 5 (not in_seconds == 300)",
           "bool is5mChart = timeframe.isminutes and timeframe.multiplier == 5" in cc and "in_seconds() == 300" not in cc)
-    check("P16-02 5M chart: gated Visual partially evaluated with is5mChart = true == pre-gate Visual (b3b69ae) exactly",
-          bool(pre) and vis_eval_5m(cur) == pre)
+    imp1, imp2 = "import sekine3310/ZoneEnginePractical/1 as zn\n", "import sekine3310/ZoneEnginePractical/2 as zn\n"
+    check("P16-02 5M chart: gated Visual partially evaluated with is5mChart = true == pre-gate Visual (b3b69ae) exactly "
+          "(only the library import version /1 -> /2 differs)",
+          bool(pre) and imp1 in pre and vis_eval_5m(cur).replace(imp2, imp1) == pre)
     check("P16-03 MA / Swing / Accum source requests only on 5M (if is5mChart and use*Source)",
           all(f"if is5mChart and {x}\n" in cc for x in ("useMaSource", "useHzSource", "useAccSource"))
           and not re.search(r"^if use(Ma|Hz|Acc)Source\n", cc, re.M))
@@ -4606,8 +4608,8 @@ def fixture_p16_visual_5m_gate():
     req_pre = re.findall(r"request\.security\(.*", code_only(pre))
     req_cur = re.findall(r"request\.security\(.*", cc)
     check("P16-08 request expressions / lookahead / TFs unchanged (only wrapped by the gate)", req_pre == req_cur and len(req_cur) == 8)
-    check("P16-09 inputs / defaults unchanged; library import unchanged (ZoneEnginePractical/1)",
-          parse_inputs(cur) == parse_inputs(pre) and re.findall(r"^import .*$", cc, re.M) == re.findall(r"^import .*$", code_only(pre), re.M))
+    check("P16-09 inputs / defaults unchanged; library import = Production ZoneEnginePractical/2 (only import line changed)",
+          parse_inputs(cur) == parse_inputs(pre) and re.findall(r"^import .*$", cc, re.M) == ["import sekine3310/ZoneEnginePractical/2 as zn"])
     # non-5M mirror: every gated item is skipped
     gated = {"MA": "if is5mChart and useMaSource", "HZ": "if is5mChart and useHzSource", "ACC": "if is5mChart and useAccSource",
              "BREAK": "bool  brEval  = false\nif is5mChart", "DAY": "int tradingDayId = na\nif is5mChart",
