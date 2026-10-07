@@ -4579,8 +4579,13 @@ def vis_eval_5m(src):
     return t
 
 
+VIS_GATE_REV = "d240ec0"      # 5M gate + import /2 stage; the /4 Visual is tied to it by fixture_v4_5m_direct
+VIS_GATE = __import__("subprocess").run(["git", "-C", ROOT, "show", VIS_GATE_REV + ":ZoneVisualPractical.pine"],
+                                        capture_output=True, text=True).stdout
+
+
 def fixture_p16_visual_5m_gate():
-    pre, cur = VIS, VIS_CUR
+    pre, cur = VIS, VIS_GATE
     cc = code_only(cur)
     check("P16-01 5M flag = timeframe.isminutes and timeframe.multiplier == 5 (not in_seconds == 300)",
           "bool is5mChart = timeframe.isminutes and timeframe.multiplier == 5" in cc and "in_seconds() == 300" not in cc)
@@ -4832,6 +4837,59 @@ def _strip_str_all(t):
     return re.sub(r'"[^"\n]*"', '""', t)
 
 
+# ============================================================================
+# V4 : ZoneVisualPractical on ZoneEnginePractical/4 — 5M direct path (stage 2-5)
+# ============================================================================
+V4_IMP_OLD = "import sekine3310/ZoneEnginePractical/2 as zn\n"
+V4_IMP_NEW = "import sekine3310/ZoneEnginePractical/4 as zn\n"
+V4_FEED_OLD = "     brClose = brClose, brHigh = brHigh, brLow = brLow, brEval = brEval)\n"
+V4_FEED_NEW = ("     brClose = brClose, brHigh = brHigh, brLow = brLow, brEval = brEval,\n"
+               "     barHigh = high, barLow = low, barClose = close, barTime = time, barIndex = bar_index)\n")
+
+
+def v4_transform(src):
+    """d240ec0 Visual -> /4 Visual: import version + the 5 Authority fields fed from the 5M chart itself."""
+    assert src.count(V4_IMP_OLD) == 1 and src.count(V4_FEED_OLD) == 1
+    return src.replace(V4_IMP_OLD, V4_IMP_NEW).replace(V4_FEED_OLD, V4_FEED_NEW)
+
+
+def fixture_v4_5m_direct():
+    cur, gate = VIS_CUR, VIS_GATE
+    cc = code_only(cur)
+    check("V4-01 Visual /4 5M direct path parity: current == v4_transform(d240ec0) exactly "
+          "(only import /2 -> /4 and the 5 Authority feed args; Source / Break / dayId / update order unchanged)",
+          bool(gate) and v4_transform(gate) == cur)
+    check("V4-01b import = ZoneEnginePractical/4 only (single library import)",
+          re.findall(r"^import .*$", cc, re.M) == ["import sekine3310/ZoneEnginePractical/4 as zn"])
+    feed = cc[cc.find("zn.ZoneFeed zoneFeed = zn.ZoneFeed.new(") + len("zn.ZoneFeed zoneFeed = zn.ZoneFeed.new("):]
+    feed = feed[:feed.find(")\n") + 1]
+    args = dict(re.findall(r"(\w+) = ([\w.]+)", feed))
+    check("V4-02 Authority barHigh/Low/Close/Time/Index = 5M chart high / low / close / time / bar_index (direct path)",
+          all(args.get(k) == v for k, v in (("barHigh", "high"), ("barLow", "low"), ("barClose", "close"),
+                                             ("barTime", "time"), ("barIndex", "bar_index"))))
+    lib = open(L3_SRC_PATH, encoding="utf-8").read()
+    t = lib[lib.find("export type ZoneFeed"):]
+    t = t[:t.find("\n\n")]
+    fields = re.findall(r"^\s+\w+\s+(\w+)\s*=", t, re.M)
+    check("V4-02b every ZoneFeed field of /4 is fed exactly once by the Visual (no field left at na)",
+          sorted(args) == sorted(fields) and len(re.findall(r"\b(\w+) = ", feed)) == len(fields),
+          f"feed={len(args)} lib={len(fields)}")
+    check("V4-02c 5M parity chain: Engine reads aHigh/aLow/aClose/aTime/aIndex == built-ins on 5M "
+          "(L3 reverse-substitution proof holds for the /4 source)",
+          all(re.search(r"^    e\." + a + r"\s*:= f\." + b + r"$", lib, re.M) for a, b in (("aHigh", "barHigh"), ("aLow", "barLow"),
+              ("aClose", "barClose"), ("aTime", "barTime"), ("aIndex", "barIndex"))))
+    check("V4-GATE 5M gate still in place (MTF paths not implemented: STOP at step 6 history audit)",
+          cc.count("is5mChart") == code_only(gate).count("is5mChart") and cc.count("zn.update(") == 1)
+    rc = __import__("subprocess").run(["git", "-C", ROOT, "diff", "--name-only", "03b9f46", "--",
+                                       "PracticalZoneStrategy_LONG.pine", "PracticalZoneStrategy_SHORT.pine",
+                                       "SignalEnginePractical.pine", "ZoneEnginePractical.pine",
+                                       "ZoneEnginePracticalAuthority.pine"],
+                                      capture_output=True, text=True).stdout.strip()
+    check("V4-PROD Strategy LONG / SHORT, SignalEngine, ZoneEnginePractical.pine, Authority source unchanged vs 03b9f46; "
+          "Strategies still import /3", rc == "" and all("import sekine3310/ZoneEnginePractical/3 as zn" in
+          open(os.path.join(ROOT, f), encoding="utf-8").read() for f in ("PracticalZoneStrategy_LONG.pine", "PracticalZoneStrategy_SHORT.pine")), rc)
+
+
 if __name__ == "__main__":
     fixture_types()
     fixture_factories()
@@ -4871,6 +4929,7 @@ if __name__ == "__main__":
     fixture_p15()
     fixture_p16_visual_5m_gate()
     fixture_l3()
+    fixture_v4_5m_direct()
     width = max(len(n) for n, _, _ in RESULTS)
     fails = 0
     for name, ok, detail in RESULTS:
