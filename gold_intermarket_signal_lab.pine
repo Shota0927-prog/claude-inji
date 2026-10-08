@@ -1,0 +1,953 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// ============================================================
+//  Gold Intermarket Signal Lab v1  (検証専用インジケーター)
+// ------------------------------------------------------------
+//  目的 :
+//    gold_intermarket_dashboard.pine の Intermarket データ取得・方向判定・
+//    相関判定を土台に、STRONG / BIAS の定義そのものを 5 案 (V0〜V4) で
+//    並列比較する。各ロジックの LONG / SHORT シグナルが初めて出た後、
+//    Gold がその方向へどの程度・どの確率で巡航したかを直接測る。
+//
+//    売買損益の最適化は目的ではない。Strategy 化 / SL・TP / Zone / FVG /
+//    SATS 統合はこのファイルでは行わない。
+//
+//  既存ファイルは変更していない (完全に独立した新規ファイル) :
+//    gold_intermarket_dashboard.pine / gold_intermarket_strategy.pine
+//
+//  Dashboard から維持 (確定足ロジックそのまま) :
+//    ・Gold / DXY / Yield / Oil / Silver
+//    ・1H / 15M / 5M の EMA20 位置 + 傾き方向判定 (重み 1H:2 / 15M:2 / 5M:1)
+//      Direction Score 範囲 -5〜+5 / 現行しきい値 +3 / -3
+//    ・確定15分足の対数騰落率 Pearson 相関 (Short 20本 / Mid 48本 / th 0.30)
+//    ・期待相関 : DXY / Yield / Oil = 逆相関 / Silver = 正相関
+//    ・lookahead_on + 参照TF内 [1] / 相関配列は確定15分足のみ push /
+//      Gold と対象市場の時刻一致必須 / STALE・DATA不足は評価から除外
+//    ・リアルタイム未確定足モードは持たない
+//
+//  このファイルに無いもの (軽量化) :
+//    strategy.* / 注文処理 / alertcondition / label / plot /
+//    bgcolor / barcolor / 市場別表示テーブル / 色分けロジック一式
+//
+//  request.security は Dashboard と同一の 17 本のみ。
+//  V0〜V4 は同一の取得済みデータを再利用し、request を追加しない。
+//
+//  ※ 統計は XAUUSD 5分足専用 (15分=3本 / 30分=6本 / 60分=12本 / 120分=24本)。
+//     5分足以外では統計更新を停止し、テーブルに "5m chart only" と警告表示する。
+// ============================================================
+
+//@version=5
+indicator(
+     title            = "Gold Intermarket Signal Lab",
+     shorttitle       = "GOLD IM LAB",
+     overlay          = true,
+     dynamic_requests = true,
+     max_bars_back    = 500
+ )
+
+// ============================================================
+//  1. 入力 : シンボル (Dashboard と同一)
+// ============================================================
+grpSym = "シンボル"
+goldSymbol   = input.symbol("TVC:GOLD",   "Gold シンボル",            group = grpSym)
+dxySymbol    = input.symbol("TVC:DXY",    "DXY シンボル",             group = grpSym)
+yieldSymbol  = input.symbol("TVC:US10Y",  "Yield シンボル (米10年債)", group = grpSym)
+oilSymbol    = input.symbol("TVC:USOIL",  "Oil シンボル (WTI)",       group = grpSym)
+silverSymbol = input.symbol("TVC:SILVER", "Silver シンボル",          group = grpSym)
+
+// ============================================================
+//  2. 入力 : 市場別 ON/OFF (Dashboard と同一)
+// ============================================================
+grpUse = "市場 ON/OFF"
+useDxy    = input.bool(true, "DXY を使う",    group = grpUse)
+useYield  = input.bool(true, "Yield を使う",  group = grpUse)
+useOil    = input.bool(true, "Oil を使う",    group = grpUse)
+useSilver = input.bool(true, "Silver を使う", group = grpUse)
+
+// ============================================================
+//  3. 入力 : 方向判定 (Dashboard と同一)
+// ============================================================
+grpDir = "方向判定"
+tf1H  = input.timeframe("60", "1H 時間足",  group = grpDir)
+tf15M = input.timeframe("15", "15M 時間足", group = grpDir)
+tf5M  = input.timeframe("5",  "5M 時間足",  group = grpDir)
+
+emaLen      = input.int(20, "EMA 期間",         minval = 1, group = grpDir)
+emaSlopeLen = input.int(3,  "EMA 傾き参照本数", minval = 1, group = grpDir)
+
+weight1H  = input.int(2, "時間足の重み 1H",  minval = 0, group = grpDir)
+weight15M = input.int(2, "時間足の重み 15M", minval = 0, group = grpDir)
+weight5M  = input.int(1, "時間足の重み 5M",  minval = 0, group = grpDir)
+
+dirUpThreshold = input.int(3,  "方向スコア 上昇しきい値 (以上)", group = grpDir)
+dirDnThreshold = input.int(-3, "方向スコア 下降しきい値 (以下)", group = grpDir)
+
+// ============================================================
+//  4. 入力 : 相関 (Dashboard と同一)
+// ============================================================
+grpCorr = "相関"
+corrTF        = input.timeframe("15", "相関ベース時間足", group = grpCorr)
+corrShortLen  = input.int(20,   "短期相関 本数", minval = 2, group = grpCorr)
+corrMidLen    = input.int(48,   "中期相関 本数", minval = 2, group = grpCorr)
+corrThreshold = input.float(0.30, "相関しきい値 (|corr|)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpCorr)
+
+// ============================================================
+//  5. 入力 : Lab 候補ロジックのしきい値
+// ============================================================
+grpV1 = "V1 Strength Weighted"
+v1StrongTh = input.float(40.0, "V1 STRONG しきい値 (|score|)", minval = 0.0, step = 1.0, group = grpV1)
+v1BiasTh   = input.float(20.0, "V1 BIAS しきい値 (|score|)",   minval = 0.0, step = 1.0, group = grpV1)
+v1MinSup   = input.int(2,      "V1 最低 support 市場数",        minval = 1, group = grpV1)
+
+grpV2 = "V2 Quality Consensus"
+v2QualityTh      = input.float(0.30, "V2 quality しきい値 (q)",        minval = 0.0, maxval = 1.0, step = 0.05, group = grpV2)
+v2Strong3AvgQ    = input.float(0.35, "V2 STRONG : 3市場時の平均q下限",  minval = 0.0, maxval = 1.0, step = 0.05, group = grpV2)
+v2Strong2AvgQ    = input.float(0.60, "V2 STRONG : 2市場時の平均q下限",  minval = 0.0, maxval = 1.0, step = 0.05, group = grpV2)
+v2BiasAvgQ       = input.float(0.30, "V2 BIAS : 平均q下限",             minval = 0.0, maxval = 1.0, step = 0.05, group = grpV2)
+
+grpV3 = "V3 Early Bias"
+v3DirUpTh   = input.int(2,     "V3 Early 方向しきい値 (以上)",      group = grpV3)
+v3DirDnTh   = input.int(-2,    "V3 Early 方向しきい値 (以下)",      group = grpV3)
+v3CorrMinTh = input.float(0.20, "V3 Early 相関 : 弱い側の下限",     minval = 0.0, maxval = 1.0, step = 0.05, group = grpV3)
+v3CorrMaxTh = input.float(0.30, "V3 Early 相関 : 強い側の下限",     minval = 0.0, maxval = 1.0, step = 0.05, group = grpV3)
+
+// ============================================================
+//  6. 入力 : 検証設定
+// ============================================================
+grpLab = "Lab 検証設定"
+lookbackDays  = input.int(365, "Lookback Days (イベント生成対象期間)", minval = 1, group = grpLab)
+cruiseHorizon = input.string("60m", "Cruise Horizon (MFE/MAE 評価時間)",
+     options = ["15m", "30m", "60m", "120m"], group = grpLab)
+cruiseL1 = input.float(10.0, "巡航しきい値 1 ($)", minval = 0.0, step = 1.0, group = grpLab)
+cruiseL2 = input.float(20.0, "巡航しきい値 2 ($)", minval = 0.0, step = 1.0, group = grpLab)
+cruiseL3 = input.float(30.0, "巡航しきい値 3 ($)", minval = 0.0, step = 1.0, group = grpLab)
+cruiseL4 = input.float(40.0, "巡航しきい値 4 ($)", minval = 0.0, step = 1.0, group = grpLab)
+minSample = input.int(30, "Min Sample Warning (N 未満に ⚠)", minval = 1, group = grpLab)
+
+grpDisp = "表示"
+displaySide  = input.string("BOTH", "Display Side", options = ["LONG", "SHORT", "BOTH"], group = grpDisp)
+tableSizeStr = input.string("tiny", "文字サイズ", options = ["tiny", "small", "normal"], group = grpDisp)
+showCurrent  = input.bool(true, "現在の5ロジック状態を表示", group = grpDisp)
+
+// ============================================================
+//  7. request.security 用 関数 (Dashboard と同一・確定足固定)
+// ------------------------------------------------------------
+//  参照TFコンテキスト内で確定1本前 [1] に固定し、lookahead_on と
+//  組み合わせることで未来参照なし・非リペイントになる。
+// ============================================================
+
+// 方向判定 : EMA20 の位置と傾き。
+//   上昇 : 終値 > EMA20 かつ EMA20 > EMA20[傾き参照本数]
+//   下降 : 終値 < EMA20 かつ EMA20 < EMA20[傾き参照本数]
+//   それ以外はレンジ (0)。
+f_dirState(int len, int slopeLen) =>
+    float _ema = ta.ema(close, len)
+    bool  _up  = close > _ema and _ema > _ema[slopeLen]
+    bool  _dn  = close < _ema and _ema < _ema[slopeLen]
+    int   _d   = _up ? 1 : _dn ? -1 : 0
+    _d[1]
+
+// 相関用データ : 確定した参照TF足の「対数騰落率」と、その足の時刻。
+f_corrData() =>
+    float _r = (na(close) or na(close[1]) or close <= 0 or close[1] <= 0) ? na : math.log(close / close[1])
+    [_r[1], time[1]]
+
+// ============================================================
+//  8. 補助関数 : 相関計算 (Dashboard と同一)
+// ------------------------------------------------------------
+//  ・_sameTime : Gold と対象市場の確定足時刻が完全一致した場合だけ追加
+//  ・_fresh    : 追加済みペア時刻と異なる場合だけ追加 (同一足の二重追加防止)
+//  ・配列上限は相関期間 (短期・中期の大きい方)。短期/中期は同一配列の末尾N本。
+// ============================================================
+f_pushReturns(array<float> ga, array<float> ma, bool doPush, float gv, float mv, int gt, int mt, int maxLen) =>
+    var int _lastPairTime = na
+    bool _sameTime = not na(gt) and not na(mt) and gt == mt
+    bool _fresh    = na(_lastPairTime) or gt != _lastPairTime
+    bool _valid =
+         doPush and
+         not na(gv) and
+         not na(mv) and
+         not na(gt) and
+         not na(mt) and
+         _sameTime and
+         _fresh
+    if _valid
+        array.push(ga, gv)
+        array.push(ma, mv)
+        _lastPairTime := gt
+        while array.size(ga) > maxLen
+            array.shift(ga)
+            array.shift(ma)
+
+f_pearson(array<float> ga, array<float> ma, int len) =>
+    int   _n = array.size(ga)
+    float _r = na
+    if _n >= len and len >= 2
+        float _sg = 0.0
+        float _sm = 0.0
+        for i = _n - len to _n - 1
+            _sg += array.get(ga, i)
+            _sm += array.get(ma, i)
+        float _mg = _sg / len
+        float _mm = _sm / len
+        float _cov = 0.0
+        float _vg  = 0.0
+        float _vm  = 0.0
+        for i = _n - len to _n - 1
+            float _dg = array.get(ga, i) - _mg
+            float _dm = array.get(ma, i) - _mm
+            _cov += _dg * _dm
+            _vg  += _dg * _dg
+            _vm  += _dm * _dm
+        float _den = math.sqrt(_vg * _vm)
+        _r := _den > 0 ? _cov / _den : na
+    _r
+
+// ============================================================
+//  9. 補助関数 : 分類 (Dashboard と同一 = V0 Parity の中核)
+// ============================================================
+
+// 方向スコア → 方向コード (1 = 上昇 / -1 = 下降 / 0 = レンジ)
+f_dirCode(int score) =>
+    score >= dirUpThreshold ? 1 : score <= dirDnThreshold ? -1 : 0
+
+// 相関分類コード
+//   0 = DATA不足 / 4 = STALE / 3 = UNSTABLE / 2 = BREAK / 1 = OK
+f_relationCode(float cShort, float cMid, bool expectPositive, float th, bool current) =>
+    int _rel = 0
+    if na(cShort) or na(cMid)
+        _rel := 0
+    else if not current
+        _rel := 4
+    else if expectPositive
+        _rel := (cShort >= th and cMid >= th) ? 1 : (cShort <= -th and cMid <= -th) ? 2 : 3
+    else
+        _rel := (cShort <= -th and cMid <= -th) ? 1 : (cShort >= th and cMid >= th) ? 2 : 3
+    _rel
+
+// Gold への影響コード
+//   1 = LONG要因 / -1 = SHORT要因 / 0 = 中立 (相関OKだが方向レンジ) / 9 = OFF
+f_impactCode(int rel, int dir, bool expectPositive) =>
+    int _imp = 9
+    if rel == 1
+        _imp := dir == 0 ? 0 : (expectPositive ? dir : -dir)
+    _imp
+
+// 総合判定コード (Dashboard の f_judgeCode と完全同一)
+//   1 = STRONG LONG / 2 = STRONG SHORT / 3 = LONG優勢 / 4 = SHORT優勢
+//   5 = CONFLICT    / 6 = NEUTRAL
+f_judgeCode(int lv, int sv, int ev) =>
+    int _j = 6
+    if ev < 2
+        _j := 6
+    else if ev >= 3 and lv >= 3 and sv == 0
+        _j := 1
+    else if ev >= 3 and sv >= 3 and lv == 0
+        _j := 2
+    else if lv >= 2 and (lv - sv) >= 2
+        _j := 3
+    else if sv >= 2 and (sv - lv) >= 2
+        _j := 4
+    else if lv > 0 and sv > 0 and math.abs(lv - sv) < 2
+        _j := 5
+    else
+        _j := 6
+    _j
+
+// ============================================================
+//  10. Lab 共通 state code
+// ------------------------------------------------------------
+//    0 = NONE / NEUTRAL / CONFLICT
+//    1 = STRONG LONG
+//    2 = STRONG SHORT
+//    3 = LONG BIAS
+//    4 = SHORT BIAS
+// ============================================================
+f_judgeToState(int j) =>
+    j == 1 ? 1 : j == 2 ? 2 : j == 3 ? 3 : j == 4 ? 4 : 0
+
+// 市場方向 → Gold 方向 (4.1)
+//   正相関市場 (Silver)        : GoldSign =  sign(DirectionScore)
+//   逆相関市場 (DXY/Yield/Oil) : GoldSign = -sign(DirectionScore)
+f_goldSign(int score, bool expectPositive) =>
+    int _s = score > 0 ? 1 : score < 0 ? -1 : 0
+    expectPositive ? _s : -_s
+
+// 期待方向へ符号を揃えた相関強度 (0〜1 へ clamp・保守的に弱い方を採用)
+f_corrStrength(float cs, float cm, bool expectPositive) =>
+    float _as = expectPositive ? cs : -cs
+    float _am = expectPositive ? cm : -cm
+    float _out = 0.0
+    if not na(_as) and not na(_am)
+        _out := math.max(0.0, math.min(1.0, math.min(_as, _am)))
+    _out
+
+// V3 Early 相関成立条件 : min(aligned) >= minTh かつ max(aligned) >= maxTh
+f_earlyCorrOk(float cs, float cm, bool expectPositive, float minTh, float maxTh) =>
+    float _as = expectPositive ? cs : -cs
+    float _am = expectPositive ? cm : -cm
+    bool _ok = false
+    if not na(_as) and not na(_am)
+        _ok := math.min(_as, _am) >= minTh and math.max(_as, _am) >= maxTh
+    _ok
+
+// ============================================================
+//  11. データ取得 (Dashboard と同一・計 17 本)
+// ------------------------------------------------------------
+//  ・OFF の市場は request.security を呼ばない / 全市場 OFF なら Gold も呼ばない
+//  ・ignore_invalid_symbol = true : シンボル取得失敗でも na で継続
+//  ・V0〜V4 はここで取得したデータのみを再利用し、request を追加しない
+// ============================================================
+bool anyMarketOn = useDxy or useYield or useOil or useSilver
+int  corrMaxLen  = math.max(corrShortLen, corrMidLen)
+
+// --- Gold : 相関用 確定騰落率 (全ペア共通・1本のみ) ---
+float gRet  = na
+int   gTime = na
+if anyMarketOn
+    [_gr, _gt] = request.security(goldSymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    gRet  := _gr
+    gTime := _gt
+
+// --- DXY ---
+int   dxyD1H  = na
+int   dxyD15M = na
+int   dxyD5M  = na
+float dxyRet  = na
+int   dxyTime = na
+if useDxy
+    dxyD1H  := request.security(dxySymbol, tf1H,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    dxyD15M := request.security(dxySymbol, tf15M, f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    dxyD5M  := request.security(dxySymbol, tf5M,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    [_dr, _dt] = request.security(dxySymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    dxyRet  := _dr
+    dxyTime := _dt
+
+// --- Yield ---
+int   yldD1H  = na
+int   yldD15M = na
+int   yldD5M  = na
+float yldRet  = na
+int   yldTime = na
+if useYield
+    yldD1H  := request.security(yieldSymbol, tf1H,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    yldD15M := request.security(yieldSymbol, tf15M, f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    yldD5M  := request.security(yieldSymbol, tf5M,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    [_yr, _yt] = request.security(yieldSymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    yldRet  := _yr
+    yldTime := _yt
+
+// --- Oil ---
+int   oilD1H  = na
+int   oilD15M = na
+int   oilD5M  = na
+float oilRet  = na
+int   oilTime = na
+if useOil
+    oilD1H  := request.security(oilSymbol, tf1H,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    oilD15M := request.security(oilSymbol, tf15M, f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    oilD5M  := request.security(oilSymbol, tf5M,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    [_or_, _ot] = request.security(oilSymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    oilRet  := _or_
+    oilTime := _ot
+
+// --- Silver ---
+int   slvD1H  = na
+int   slvD15M = na
+int   slvD5M  = na
+float slvRet  = na
+int   slvTime = na
+if useSilver
+    slvD1H  := request.security(silverSymbol, tf1H,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    slvD15M := request.security(silverSymbol, tf15M, f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    slvD5M  := request.security(silverSymbol, tf5M,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    [_sr, _st] = request.security(silverSymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    slvRet  := _sr
+    slvTime := _st
+
+// ============================================================
+//  12. 相関計算 (Dashboard と同一)
+// ============================================================
+bool newCorrBar = not na(gTime) and (na(gTime[1]) or gTime != gTime[1])
+
+var array<float> gArrDxy = array.new_float()
+var array<float> mArrDxy = array.new_float()
+var array<float> gArrYld = array.new_float()
+var array<float> mArrYld = array.new_float()
+var array<float> gArrOil = array.new_float()
+var array<float> mArrOil = array.new_float()
+var array<float> gArrSlv = array.new_float()
+var array<float> mArrSlv = array.new_float()
+
+f_pushReturns(gArrDxy, mArrDxy, useDxy    and newCorrBar, gRet, dxyRet, gTime, dxyTime, corrMaxLen)
+f_pushReturns(gArrYld, mArrYld, useYield  and newCorrBar, gRet, yldRet, gTime, yldTime, corrMaxLen)
+f_pushReturns(gArrOil, mArrOil, useOil    and newCorrBar, gRet, oilRet, gTime, oilTime, corrMaxLen)
+f_pushReturns(gArrSlv, mArrSlv, useSilver and newCorrBar, gRet, slvRet, gTime, slvTime, corrMaxLen)
+
+float dxyCorrS = useDxy    ? f_pearson(gArrDxy, mArrDxy, corrShortLen) : na
+float dxyCorrM = useDxy    ? f_pearson(gArrDxy, mArrDxy, corrMidLen)   : na
+float yldCorrS = useYield  ? f_pearson(gArrYld, mArrYld, corrShortLen) : na
+float yldCorrM = useYield  ? f_pearson(gArrYld, mArrYld, corrMidLen)   : na
+float oilCorrS = useOil    ? f_pearson(gArrOil, mArrOil, corrShortLen) : na
+float oilCorrM = useOil    ? f_pearson(gArrOil, mArrOil, corrMidLen)   : na
+float slvCorrS = useSilver ? f_pearson(gArrSlv, mArrSlv, corrShortLen) : na
+float slvCorrM = useSilver ? f_pearson(gArrSlv, mArrSlv, corrMidLen)   : na
+
+// ============================================================
+//  13. 市場別 基礎判定 (Dashboard と同一)
+// ============================================================
+bool dxyCurrent = useDxy    and not na(gTime) and not na(dxyTime) and gTime == dxyTime
+bool yldCurrent = useYield  and not na(gTime) and not na(yldTime) and gTime == yldTime
+bool oilCurrent = useOil    and not na(gTime) and not na(oilTime) and gTime == oilTime
+bool slvCurrent = useSilver and not na(gTime) and not na(slvTime) and gTime == slvTime
+
+bool dxyDataOk = useDxy    and not na(dxyD1H) and not na(dxyD15M) and not na(dxyD5M)
+bool yldDataOk = useYield  and not na(yldD1H) and not na(yldD15M) and not na(yldD5M)
+bool oilDataOk = useOil    and not na(oilD1H) and not na(oilD15M) and not na(oilD5M)
+bool slvDataOk = useSilver and not na(slvD1H) and not na(slvD15M) and not na(slvD5M)
+
+int dxyScore = dxyDataOk ? nz(dxyD1H) * weight1H + nz(dxyD15M) * weight15M + nz(dxyD5M) * weight5M : 0
+int yldScore = yldDataOk ? nz(yldD1H) * weight1H + nz(yldD15M) * weight15M + nz(yldD5M) * weight5M : 0
+int oilScore = oilDataOk ? nz(oilD1H) * weight1H + nz(oilD15M) * weight15M + nz(oilD5M) * weight5M : 0
+int slvScore = slvDataOk ? nz(slvD1H) * weight1H + nz(slvD15M) * weight15M + nz(slvD5M) * weight5M : 0
+
+int dxyDir = dxyDataOk ? f_dirCode(dxyScore) : 0
+int yldDir = yldDataOk ? f_dirCode(yldScore) : 0
+int oilDir = oilDataOk ? f_dirCode(oilScore) : 0
+int slvDir = slvDataOk ? f_dirCode(slvScore) : 0
+
+// 期待相関 : DXY / Yield / Oil = 逆相関 (false) / Silver = 正相関 (true)
+int dxyRel = useDxy    ? f_relationCode(dxyCorrS, dxyCorrM, false, corrThreshold, dxyCurrent) : 0
+int yldRel = useYield  ? f_relationCode(yldCorrS, yldCorrM, false, corrThreshold, yldCurrent) : 0
+int oilRel = useOil    ? f_relationCode(oilCorrS, oilCorrM, false, corrThreshold, oilCurrent) : 0
+int slvRel = useSilver ? f_relationCode(slvCorrS, slvCorrM, true,  corrThreshold, slvCurrent) : 0
+
+int dxyImp = (useDxy    and dxyDataOk and dxyCurrent) ? f_impactCode(dxyRel, dxyDir, false) : 9
+int yldImp = (useYield  and yldDataOk and yldCurrent) ? f_impactCode(yldRel, yldDir, false) : 9
+int oilImp = (useOil    and oilDataOk and oilCurrent) ? f_impactCode(oilRel, oilDir, false) : 9
+int slvImp = (useSilver and slvDataOk and slvCurrent) ? f_impactCode(slvRel, slvDir, true)  : 9
+
+// ============================================================
+//  14. V0 — Current Vote (現行基準 / すべての比較の基準線)
+// ------------------------------------------------------------
+//  Dashboard の longVotes / shortVotes / judgeCode と完全同一の式。
+// ============================================================
+int v0LongVotes =
+     ((useDxy    and dxyImp ==  1) ? 1 : 0) +
+     ((useYield  and yldImp ==  1) ? 1 : 0) +
+     ((useOil    and oilImp ==  1) ? 1 : 0) +
+     ((useSilver and slvImp ==  1) ? 1 : 0)
+
+int v0ShortVotes =
+     ((useDxy    and dxyImp == -1) ? 1 : 0) +
+     ((useYield  and yldImp == -1) ? 1 : 0) +
+     ((useOil    and oilImp == -1) ? 1 : 0) +
+     ((useSilver and slvImp == -1) ? 1 : 0)
+
+int v0EffectiveVotes = v0LongVotes + v0ShortVotes
+int v0JudgeCode      = f_judgeCode(v0LongVotes, v0ShortVotes, v0EffectiveVotes)
+int st0              = f_judgeToState(v0JudgeCode)
+
+// ============================================================
+//  15. V1 — Strength Weighted (票数ではなく質)
+// ------------------------------------------------------------
+//  dirStrength    = abs(DirectionScore) / 5
+//  corrStrength   = clamp01(min(alignedShort, alignedMid))
+//  marketMagnitude     = dirStrength * corrStrength            (0〜1)
+//  marketContribution  = GoldSign * marketMagnitude            (-1〜+1)
+//  V1Score = 100 * sum(marketContribution) / enabledMarketCount
+//    ・OFF市場は denominator から除外
+//    ・ON だが Relation 不成立 / DATA不足 / STALE は contribution = 0
+//      → 「証拠不足」は Strength を下げる
+//  longSupport / shortSupport = Relation OK かつ GoldSign がその方向の市場数
+// ============================================================
+float dxyDirStr = math.abs(dxyScore) / 5.0
+float yldDirStr = math.abs(yldScore) / 5.0
+float oilDirStr = math.abs(oilScore) / 5.0
+float slvDirStr = math.abs(slvScore) / 5.0
+
+float dxyCorrStr = f_corrStrength(dxyCorrS, dxyCorrM, false)
+float yldCorrStr = f_corrStrength(yldCorrS, yldCorrM, false)
+float oilCorrStr = f_corrStrength(oilCorrS, oilCorrM, false)
+float slvCorrStr = f_corrStrength(slvCorrS, slvCorrM, true)
+
+int dxyGs = f_goldSign(dxyScore, false)
+int yldGs = f_goldSign(yldScore, false)
+int oilGs = f_goldSign(oilScore, false)
+int slvGs = f_goldSign(slvScore, true)
+
+float dxyMag = dxyDirStr * dxyCorrStr
+float yldMag = yldDirStr * yldCorrStr
+float oilMag = oilDirStr * oilCorrStr
+float slvMag = slvDirStr * slvCorrStr
+
+int enabledMarketCount =
+     (useDxy ? 1 : 0) + (useYield ? 1 : 0) + (useOil ? 1 : 0) + (useSilver ? 1 : 0)
+
+float v1Sum =
+     ((useDxy    and dxyRel == 1) ? dxyGs * dxyMag : 0.0) +
+     ((useYield  and yldRel == 1) ? yldGs * yldMag : 0.0) +
+     ((useOil    and oilRel == 1) ? oilGs * oilMag : 0.0) +
+     ((useSilver and slvRel == 1) ? slvGs * slvMag : 0.0)
+
+float v1Score = enabledMarketCount > 0 ? 100.0 * v1Sum / enabledMarketCount : 0.0
+
+int v1LongSup =
+     ((useDxy    and dxyRel == 1 and dxyGs ==  1) ? 1 : 0) +
+     ((useYield  and yldRel == 1 and yldGs ==  1) ? 1 : 0) +
+     ((useOil    and oilRel == 1 and oilGs ==  1) ? 1 : 0) +
+     ((useSilver and slvRel == 1 and slvGs ==  1) ? 1 : 0)
+
+int v1ShortSup =
+     ((useDxy    and dxyRel == 1 and dxyGs == -1) ? 1 : 0) +
+     ((useYield  and yldRel == 1 and yldGs == -1) ? 1 : 0) +
+     ((useOil    and oilRel == 1 and oilGs == -1) ? 1 : 0) +
+     ((useSilver and slvRel == 1 and slvGs == -1) ? 1 : 0)
+
+// STRONG を先に判定する
+int st1 = 0
+if v1Score >= v1StrongTh and v1LongSup >= v1MinSup
+    st1 := 1
+else if v1Score <= -v1StrongTh and v1ShortSup >= v1MinSup
+    st1 := 2
+else if v1Score >= v1BiasTh and v1LongSup >= v1MinSup
+    st1 := 3
+else if v1Score <= -v1BiasTh and v1ShortSup >= v1MinSup
+    st1 := 4
+
+// ============================================================
+//  16. V2 — Quality Consensus (質 + 合意率)
+// ------------------------------------------------------------
+//  q = dirStrength * corrStrength (V1 と同じ)。Relation OK の市場のみ。
+//  q >= v2QualityTh の市場だけ Qualified Vote とし、GoldSign 別に数える。
+//  勝ち方向の平均 quality avgWinnerQ も使う。
+// ============================================================
+float dxyQ = (useDxy    and dxyRel == 1) ? dxyMag : 0.0
+float yldQ = (useYield  and yldRel == 1) ? yldMag : 0.0
+float oilQ = (useOil    and oilRel == 1) ? oilMag : 0.0
+float slvQ = (useSilver and slvRel == 1) ? slvMag : 0.0
+
+bool dxyQual = useDxy    and dxyRel == 1 and dxyGs != 0 and dxyQ >= v2QualityTh
+bool yldQual = useYield  and yldRel == 1 and yldGs != 0 and yldQ >= v2QualityTh
+bool oilQual = useOil    and oilRel == 1 and oilGs != 0 and oilQ >= v2QualityTh
+bool slvQual = useSilver and slvRel == 1 and slvGs != 0 and slvQ >= v2QualityTh
+
+int v2LongQual =
+     ((dxyQual and dxyGs ==  1) ? 1 : 0) +
+     ((yldQual and yldGs ==  1) ? 1 : 0) +
+     ((oilQual and oilGs ==  1) ? 1 : 0) +
+     ((slvQual and slvGs ==  1) ? 1 : 0)
+
+int v2ShortQual =
+     ((dxyQual and dxyGs == -1) ? 1 : 0) +
+     ((yldQual and yldGs == -1) ? 1 : 0) +
+     ((oilQual and oilGs == -1) ? 1 : 0) +
+     ((slvQual and slvGs == -1) ? 1 : 0)
+
+float v2LongQSum =
+     ((dxyQual and dxyGs ==  1) ? dxyQ : 0.0) +
+     ((yldQual and yldGs ==  1) ? yldQ : 0.0) +
+     ((oilQual and oilGs ==  1) ? oilQ : 0.0) +
+     ((slvQual and slvGs ==  1) ? slvQ : 0.0)
+
+float v2ShortQSum =
+     ((dxyQual and dxyGs == -1) ? dxyQ : 0.0) +
+     ((yldQual and yldGs == -1) ? yldQ : 0.0) +
+     ((oilQual and oilGs == -1) ? oilQ : 0.0) +
+     ((slvQual and slvGs == -1) ? slvQ : 0.0)
+
+float v2AvgLongQ  = v2LongQual  > 0 ? v2LongQSum  / v2LongQual  : 0.0
+float v2AvgShortQ = v2ShortQual > 0 ? v2ShortQSum / v2ShortQual : 0.0
+
+// STRONG : 3市場が中程度で揃う / 2市場でも非常に質が高く完全一致 の両方を許容
+bool v2StrongLong =
+     (v2LongQual >= 3 and v2ShortQual == 0 and v2AvgLongQ >= v2Strong3AvgQ) or
+     (v2LongQual >= 2 and v2ShortQual == 0 and v2AvgLongQ >= v2Strong2AvgQ)
+bool v2StrongShort =
+     (v2ShortQual >= 3 and v2LongQual == 0 and v2AvgShortQ >= v2Strong3AvgQ) or
+     (v2ShortQual >= 2 and v2LongQual == 0 and v2AvgShortQ >= v2Strong2AvgQ)
+bool v2BiasLong  = v2LongQual  >= 2 and v2LongQual  > v2ShortQual and v2AvgLongQ  >= v2BiasAvgQ
+bool v2BiasShort = v2ShortQual >= 2 and v2ShortQual > v2LongQual  and v2AvgShortQ >= v2BiasAvgQ
+
+int st2 = 0
+if v2StrongLong
+    st2 := 1
+else if v2StrongShort
+    st2 := 2
+else if v2BiasLong
+    st2 := 3
+else if v2BiasShort
+    st2 := 4
+
+// ============================================================
+//  17. V3 — Early Bias (予兆寄り・確定足のみ)
+// ------------------------------------------------------------
+//  Early Direction : DirectionScore >= +2 / <= -2 (現行 ±3 より1段緩い)
+//  Early Relation  : min(aligned) >= 0.20 かつ max(aligned) >= 0.30
+//    → 片方は現行閾値 0.30 到達済み、もう片方も 0.20 以上まで接近
+//  STALE / DATA不足 は除外。未確定足は一切使わない。
+//  成立市場を1票化し GoldSign へ変換 → 最終判定は V0 と同じ vote classifier。
+// ============================================================
+bool dxyEarlyUp = dxyDataOk and dxyScore >= v3DirUpTh
+bool dxyEarlyDn = dxyDataOk and dxyScore <= v3DirDnTh
+bool yldEarlyUp = yldDataOk and yldScore >= v3DirUpTh
+bool yldEarlyDn = yldDataOk and yldScore <= v3DirDnTh
+bool oilEarlyUp = oilDataOk and oilScore >= v3DirUpTh
+bool oilEarlyDn = oilDataOk and oilScore <= v3DirDnTh
+bool slvEarlyUp = slvDataOk and slvScore >= v3DirUpTh
+bool slvEarlyDn = slvDataOk and slvScore <= v3DirDnTh
+
+bool dxyEarlyCorr = useDxy    and dxyCurrent and f_earlyCorrOk(dxyCorrS, dxyCorrM, false, v3CorrMinTh, v3CorrMaxTh)
+bool yldEarlyCorr = useYield  and yldCurrent and f_earlyCorrOk(yldCorrS, yldCorrM, false, v3CorrMinTh, v3CorrMaxTh)
+bool oilEarlyCorr = useOil    and oilCurrent and f_earlyCorrOk(oilCorrS, oilCorrM, false, v3CorrMinTh, v3CorrMaxTh)
+bool slvEarlyCorr = useSilver and slvCurrent and f_earlyCorrOk(slvCorrS, slvCorrM, true,  v3CorrMinTh, v3CorrMaxTh)
+
+bool dxyEarlyVote = dxyEarlyCorr and (dxyEarlyUp or dxyEarlyDn)
+bool yldEarlyVote = yldEarlyCorr and (yldEarlyUp or yldEarlyDn)
+bool oilEarlyVote = oilEarlyCorr and (oilEarlyUp or oilEarlyDn)
+bool slvEarlyVote = slvEarlyCorr and (slvEarlyUp or slvEarlyDn)
+
+// Early Direction の向きを Gold 方向へ変換 (逆相関市場は反転)
+int dxyEarlyGs = dxyEarlyUp ? -1 : dxyEarlyDn ?  1 : 0
+int yldEarlyGs = yldEarlyUp ? -1 : yldEarlyDn ?  1 : 0
+int oilEarlyGs = oilEarlyUp ? -1 : oilEarlyDn ?  1 : 0
+int slvEarlyGs = slvEarlyUp ?  1 : slvEarlyDn ? -1 : 0
+
+int v3LongVotes =
+     ((dxyEarlyVote and dxyEarlyGs ==  1) ? 1 : 0) +
+     ((yldEarlyVote and yldEarlyGs ==  1) ? 1 : 0) +
+     ((oilEarlyVote and oilEarlyGs ==  1) ? 1 : 0) +
+     ((slvEarlyVote and slvEarlyGs ==  1) ? 1 : 0)
+
+int v3ShortVotes =
+     ((dxyEarlyVote and dxyEarlyGs == -1) ? 1 : 0) +
+     ((yldEarlyVote and yldEarlyGs == -1) ? 1 : 0) +
+     ((oilEarlyVote and oilEarlyGs == -1) ? 1 : 0) +
+     ((slvEarlyVote and slvEarlyGs == -1) ? 1 : 0)
+
+int st3 = f_judgeToState(f_judgeCode(v3LongVotes, v3ShortVotes, v3LongVotes + v3ShortVotes))
+
+// ============================================================
+//  18. V4 — Core Confirmation (DXY + Yield をコア扱い)
+// ------------------------------------------------------------
+//  市場ごとの Relation / Direction は現行 V0 と同じ確定条件 (= Gold Impact)。
+//  Core   : DXY と Yield が両方 Relation OK / 方向非RANGE / GoldSign 同方向
+//           揃わなければ state = 0
+//  Confirm: Silver / Oil の有効 impact が Core と同方向 = sameConfirm
+//                                       逆方向         = oppositeConfirm
+//  oppositeConfirm >= 1                      → 0
+//  oppositeConfirm == 0 and sameConfirm >= 1 → STRONG
+//  oppositeConfirm == 0 and sameConfirm == 0 → BIAS
+// ============================================================
+int dxyCoreSign = (useDxy   and (dxyImp ==  1 or dxyImp == -1)) ? dxyImp : 0
+int yldCoreSign = (useYield and (yldImp ==  1 or yldImp == -1)) ? yldImp : 0
+int slvConfSign = (useSilver and (slvImp ==  1 or slvImp == -1)) ? slvImp : 0
+int oilConfSign = (useOil    and (oilImp ==  1 or oilImp == -1)) ? oilImp : 0
+
+int v4CoreDir = (dxyCoreSign != 0 and dxyCoreSign == yldCoreSign) ? dxyCoreSign : 0
+
+int v4SameConfirm =
+     ((v4CoreDir != 0 and slvConfSign == v4CoreDir) ? 1 : 0) +
+     ((v4CoreDir != 0 and oilConfSign == v4CoreDir) ? 1 : 0)
+
+int v4OppConfirm =
+     ((v4CoreDir != 0 and slvConfSign != 0 and slvConfSign == -v4CoreDir) ? 1 : 0) +
+     ((v4CoreDir != 0 and oilConfSign != 0 and oilConfSign == -v4CoreDir) ? 1 : 0)
+
+int st4 = 0
+if v4CoreDir != 0 and v4OppConfirm == 0
+    if v4SameConfirm >= 1
+        st4 := v4CoreDir == 1 ? 1 : 2
+    else
+        st4 := v4CoreDir == 1 ? 3 : 4
+
+// ============================================================
+//  19. シグナルイベント生成 (episode 管理)
+// ------------------------------------------------------------
+//  state が継続している毎バーをサンプルにしない。1 episode につき
+//  BIAS Event / STRONG Event はそれぞれ最大1回。
+//
+//  LONG 側 state = {STRONG LONG(1), LONG BIAS(3)}
+//  SHORT側 state = {STRONG SHORT(2), SHORT BIAS(4)}
+//
+//  ・前バーがその側でなく、現在その側へ入ったら新しい episode。
+//  ・BIAS Event   : episode 開始時の state が BIAS のときだけ1回。
+//                   STRONG LONG → LONG BIAS は新しい BIAS Event にしない
+//                   (同一 episode 内の移動)。
+//  ・STRONG Event : 同一 episode 内で初めて STRONG へ到達した瞬間だけ1回。
+//                   STRONG → BIAS → STRONG でも 2 回目は作らない。
+//  ・一度その側 state から完全に抜けた後、再び episode が始まれば新規イベント可。
+//
+//  var は呼び出し (logic × side) ごとに独立したインスタンスになる。
+// ============================================================
+f_sideEvents(int st, bool longSide) =>
+    int  _strongCode = longSide ? 1 : 2
+    int  _biasCode   = longSide ? 3 : 4
+    bool _inSide     = st == _strongCode or st == _biasCode
+    var bool _prevSide    = false
+    var bool _strongFired = false
+    // episode 開始 = 前バーはその側でなく、当該バーでその側へ入った
+    bool _newEp = _inSide and not _prevSide
+    if _newEp
+        _strongFired := false
+    bool _biasEv   = _newEp and st == _biasCode
+    bool _strongEv = _inSide and st == _strongCode and not _strongFired
+    if _strongEv
+        _strongFired := true
+    _prevSide := _inSide
+    [_biasEv, _strongEv]
+
+[v0BiasL, v0StrongL] = f_sideEvents(st0, true)
+[v0BiasS, v0StrongS] = f_sideEvents(st0, false)
+[v1BiasL, v1StrongL] = f_sideEvents(st1, true)
+[v1BiasS, v1StrongS] = f_sideEvents(st1, false)
+[v2BiasL, v2StrongL] = f_sideEvents(st2, true)
+[v2BiasS, v2StrongS] = f_sideEvents(st2, false)
+[v3BiasL, v3StrongL] = f_sideEvents(st3, true)
+[v3BiasS, v3StrongS] = f_sideEvents(st3, false)
+[v4BiasL, v4StrongL] = f_sideEvents(st4, true)
+[v4BiasS, v4StrongS] = f_sideEvents(st4, false)
+
+// ============================================================
+//  20. Outcome 評価 (5分足固定・history reference 方式)
+// ------------------------------------------------------------
+//  pending array を保持せず、常に「24本前 (= 120分前) のイベント」を評価する。
+//
+//   E = イベント発生バー = 現在バーから 24 本前 (offset 24)
+//   E+k は offset (24 - k)
+//
+//   Dir 15m  : close[21] = E+3
+//   Dir 30m  : close[18] = E+6
+//   Dir 60m  : close[12] = E+12
+//   Dir 120m : close[0]  = E+24
+//
+//   MFE / MAE の評価区間は offset = 24 - H / length = H
+//     15m  : ta.highest(high, 3)[21]  = high[21..23] = E+1 〜 E+3
+//     30m  : ta.highest(high, 6)[18]  = high[18..23] = E+1 〜 E+6
+//     60m  : ta.highest(high,12)[12]  = high[12..23] = E+1 〜 E+12
+//     120m : ta.highest(high,24)      = high[0..23]  = E+1 〜 E+24
+//
+//   → E 自身 (offset 24) の High / Low は含まない。
+//   → E 以前 (offset > 24) も含まない。
+//   → E+25 以降は存在しない (offset < 0 は参照しない)。
+//
+//  signalPrice は E の確定終値 close[24]。評価開始は E+1 (次の5分足) から。
+//  現在から120分以内のイベントは構造上評価されない (未成熟イベントを除外)。
+// ============================================================
+bool isFiveMin = timeframe.isminutes and timeframe.multiplier == 5
+
+float sigPx = close[24]
+float out15  = close[21]
+float out30  = close[18]
+float out60  = close[12]
+float out120 = close
+
+float hi3  = ta.highest(high, 3)[21]
+float lo3  = ta.lowest(low,   3)[21]
+float hi6  = ta.highest(high, 6)[18]
+float lo6  = ta.lowest(low,   6)[18]
+float hi12 = ta.highest(high, 12)[12]
+float lo12 = ta.lowest(low,   12)[12]
+float hi24 = ta.highest(high, 24)
+float lo24 = ta.lowest(low,   24)
+
+bool cr15  = cruiseHorizon == "15m"
+bool cr30  = cruiseHorizon == "30m"
+bool cr60  = cruiseHorizon == "60m"
+float cHi = cr15 ? hi3 : cr30 ? hi6 : cr60 ? hi12 : hi24
+float cLo = cr15 ? lo3 : cr30 ? lo6 : cr60 ? lo12 : lo24
+
+float lookbackMs = lookbackDays * 86400000.0
+bool  inWindow   = not na(time[24]) and (timenow - time[24]) <= lookbackMs
+
+// 成熟判定 : 5分足 / 確定足 / 24本分の履歴あり / 検証期間内 / 価格データ有効
+bool evalOk =
+     isFiveMin and
+     barstate.isconfirmed and
+     bar_index >= 24 and
+     inWindow and
+     not na(sigPx) and
+     not na(out15) and not na(out30) and not na(out60) and not na(out120) and
+     not na(cHi) and not na(cLo)
+
+// ============================================================
+//  21. 集計 (V0〜V4 × 4 Signal class = 最大20カテゴリ)
+// ------------------------------------------------------------
+//  category index = logic * 4 + class
+//    logic : 0=V0 Vote / 1=V1 Strength / 2=V2 Consensus / 3=V3 Early / 4=V4 Core
+//    class : 0=BIAS L / 1=STRONG L / 2=BIAS S / 3=STRONG S
+//  field index (カテゴリ内オフセット・12個)
+//    0=N 1=Dir15 2=Dir30 3=Dir60 4=Dir120
+//    5=Cruise1 6=Cruise2 7=Cruise3 8=Cruise4
+//    9=MFE合計 10=MAE合計 11=MFE>MAE件数
+// ============================================================
+var array<float> stats = array.new_float(20 * 12, 0.0)
+
+f_bump(array<float> a, int cat, int fld, float v) =>
+    int _i = cat * 12 + fld
+    array.set(a, _i, array.get(a, _i) + v)
+
+f_get(array<float> a, int cat, int fld) =>
+    array.get(a, cat * 12 + fld)
+
+// 1イベントを1カテゴリへ記録する。
+//   MFE / MAE は選択 Horizon の E+1〜E+H のみを対象とし、最低0へ clamp。
+//   Close方向一致は完全同値を成功扱いしない (厳密な不等号)。
+f_record(array<float> a, int cat, bool ev, bool isLong, float px, float c15, float c30, float c60, float c120, float hiH, float loH) =>
+    if ev
+        float _mfe = isLong ? math.max(hiH - px, 0.0) : math.max(px - loH, 0.0)
+        float _mae = isLong ? math.max(px - loH, 0.0) : math.max(hiH - px, 0.0)
+        f_bump(a, cat, 0,  1.0)
+        f_bump(a, cat, 1,  (isLong ? c15  > px : c15  < px) ? 1.0 : 0.0)
+        f_bump(a, cat, 2,  (isLong ? c30  > px : c30  < px) ? 1.0 : 0.0)
+        f_bump(a, cat, 3,  (isLong ? c60  > px : c60  < px) ? 1.0 : 0.0)
+        f_bump(a, cat, 4,  (isLong ? c120 > px : c120 < px) ? 1.0 : 0.0)
+        f_bump(a, cat, 5,  _mfe >= cruiseL1 ? 1.0 : 0.0)
+        f_bump(a, cat, 6,  _mfe >= cruiseL2 ? 1.0 : 0.0)
+        f_bump(a, cat, 7,  _mfe >= cruiseL3 ? 1.0 : 0.0)
+        f_bump(a, cat, 8,  _mfe >= cruiseL4 ? 1.0 : 0.0)
+        f_bump(a, cat, 9,  _mfe)
+        f_bump(a, cat, 10, _mae)
+        f_bump(a, cat, 11, _mfe > _mae ? 1.0 : 0.0)
+
+// V0
+f_record(stats, 0,  evalOk and v0BiasL[24],   true,  sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 1,  evalOk and v0StrongL[24], true,  sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 2,  evalOk and v0BiasS[24],   false, sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 3,  evalOk and v0StrongS[24], false, sigPx, out15, out30, out60, out120, cHi, cLo)
+// V1
+f_record(stats, 4,  evalOk and v1BiasL[24],   true,  sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 5,  evalOk and v1StrongL[24], true,  sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 6,  evalOk and v1BiasS[24],   false, sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 7,  evalOk and v1StrongS[24], false, sigPx, out15, out30, out60, out120, cHi, cLo)
+// V2
+f_record(stats, 8,  evalOk and v2BiasL[24],   true,  sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 9,  evalOk and v2StrongL[24], true,  sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 10, evalOk and v2BiasS[24],   false, sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 11, evalOk and v2StrongS[24], false, sigPx, out15, out30, out60, out120, cHi, cLo)
+// V3
+f_record(stats, 12, evalOk and v3BiasL[24],   true,  sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 13, evalOk and v3StrongL[24], true,  sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 14, evalOk and v3BiasS[24],   false, sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 15, evalOk and v3StrongS[24], false, sigPx, out15, out30, out60, out120, cHi, cLo)
+// V4
+f_record(stats, 16, evalOk and v4BiasL[24],   true,  sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 17, evalOk and v4StrongL[24], true,  sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 18, evalOk and v4BiasS[24],   false, sigPx, out15, out30, out60, out120, cHi, cLo)
+f_record(stats, 19, evalOk and v4StrongS[24], false, sigPx, out15, out30, out60, out120, cHi, cLo)
+
+// ============================================================
+//  22. 表示 (table のみ)
+// ============================================================
+colBase = color.new(color.rgb(35, 35, 35), 10)
+colHead = color.new(color.rgb(15, 15, 15), 10)
+
+f_textSize(string s) =>
+    s == "tiny" ? size.tiny : s == "small" ? size.small : size.normal
+
+f_logicLabel(int lg) =>
+    lg == 0 ? "V0 Vote" : lg == 1 ? "V1 Strength" : lg == 2 ? "V2 Consensus" : lg == 3 ? "V3 Early" : "V4 Core"
+
+f_classLabel(int cls) =>
+    cls == 0 ? "BIAS L" : cls == 1 ? "STRONG L" : cls == 2 ? "BIAS S" : "STRONG S"
+
+f_stateText(int s) =>
+    s == 1 ? "STRONG LONG" : s == 2 ? "STRONG SHORT" : s == 3 ? "LONG BIAS" : s == 4 ? "SHORT BIAS" : "NONE"
+
+f_pctText(float num, float den) =>
+    den > 0 ? str.tostring(num / den * 100.0, "0.0") : "-"
+
+f_avgText(float sum, float den) =>
+    den > 0 ? str.tostring(sum / den, "0.00") : "-"
+
+f_cell(table t, int col, int row, string txt, color bg, string sz) =>
+    table.cell(t, col, row, txt, text_color = color.white, bgcolor = bg, text_size = sz)
+
+f_drawStatRow(table t, int row, int lg, int cls, array<float> a, string sz) =>
+    int   _c = lg * 4 + cls
+    float _n = f_get(a, _c, 0)
+    f_cell(t, 0,  row, f_logicLabel(lg), colBase, sz)
+    f_cell(t, 1,  row, f_classLabel(cls), colBase, sz)
+    f_cell(t, 2,  row, str.tostring(_n, "0") + (_n < minSample ? " ⚠" : ""), colBase, sz)
+    f_cell(t, 3,  row, f_pctText(f_get(a, _c, 1),  _n), colBase, sz)
+    f_cell(t, 4,  row, f_pctText(f_get(a, _c, 2),  _n), colBase, sz)
+    f_cell(t, 5,  row, f_pctText(f_get(a, _c, 3),  _n), colBase, sz)
+    f_cell(t, 6,  row, f_pctText(f_get(a, _c, 4),  _n), colBase, sz)
+    f_cell(t, 7,  row, f_pctText(f_get(a, _c, 5),  _n), colBase, sz)
+    f_cell(t, 8,  row, f_pctText(f_get(a, _c, 6),  _n), colBase, sz)
+    f_cell(t, 9,  row, f_pctText(f_get(a, _c, 7),  _n), colBase, sz)
+    f_cell(t, 10, row, f_pctText(f_get(a, _c, 8),  _n), colBase, sz)
+    f_cell(t, 11, row, f_avgText(f_get(a, _c, 9),  _n), colBase, sz)
+    f_cell(t, 12, row, f_avgText(f_get(a, _c, 10), _n), colBase, sz)
+    f_cell(t, 13, row, f_pctText(f_get(a, _c, 11), _n), colBase, sz)
+
+// --- メイン結果テーブル (14列 × 最大22行) ---
+var table labTbl = table.new(position.bottom_right, 14, 22, border_width = 1)
+
+// --- 現在状態ミニテーブル (参考表示・統計とは別) ---
+var table curTbl = table.new(position.top_right, 3, 6, border_width = 1)
+
+if barstate.islast
+    string _sz = f_textSize(tableSizeStr)
+    bool _showL = displaySide == "LONG"  or displaySide == "BOTH"
+    bool _showS = displaySide == "SHORT" or displaySide == "BOTH"
+
+    // ヘッダー
+    f_cell(labTbl, 0,  0, "Logic",   colHead, _sz)
+    f_cell(labTbl, 1,  0, "Signal",  colHead, _sz)
+    f_cell(labTbl, 2,  0, "N",       colHead, _sz)
+    f_cell(labTbl, 3,  0, "Dir15",   colHead, _sz)
+    f_cell(labTbl, 4,  0, "Dir30",   colHead, _sz)
+    f_cell(labTbl, 5,  0, "Dir60",   colHead, _sz)
+    f_cell(labTbl, 6,  0, "Dir120",  colHead, _sz)
+    f_cell(labTbl, 7,  0, "+$" + str.tostring(cruiseL1, "0.#"), colHead, _sz)
+    f_cell(labTbl, 8,  0, "+$" + str.tostring(cruiseL2, "0.#"), colHead, _sz)
+    f_cell(labTbl, 9,  0, "+$" + str.tostring(cruiseL3, "0.#"), colHead, _sz)
+    f_cell(labTbl, 10, 0, "+$" + str.tostring(cruiseL4, "0.#"), colHead, _sz)
+    f_cell(labTbl, 11, 0, "Avg MFE", colHead, _sz)
+    f_cell(labTbl, 12, 0, "Avg MAE", colHead, _sz)
+    f_cell(labTbl, 13, 0, "Fav>Adv", colHead, _sz)
+
+    // 統計行 (LONG : BIAS L / STRONG L → SHORT : BIAS S / STRONG S)
+    int _row = 1
+    for lg = 0 to 4
+        if _showL
+            f_drawStatRow(labTbl, _row, lg, 0, stats, _sz)
+            _row += 1
+            f_drawStatRow(labTbl, _row, lg, 1, stats, _sz)
+            _row += 1
+        if _showS
+            f_drawStatRow(labTbl, _row, lg, 2, stats, _sz)
+            _row += 1
+            f_drawStatRow(labTbl, _row, lg, 3, stats, _sz)
+            _row += 1
+
+    // フッター (チャートTF警告 / 検証条件)
+    f_cell(labTbl, 0, _row, isFiveMin ? "5m OK" : "5m chart only", colHead, _sz)
+    f_cell(labTbl, 1, _row, "Horizon " + cruiseHorizon, colHead, _sz)
+    f_cell(labTbl, 2, _row, "Lookback " + str.tostring(lookbackDays) + "d", colHead, _sz)
+    f_cell(labTbl, 3, _row, isFiveMin ? "eval = bar-24" : "stats paused", colHead, _sz)
+    for c = 4 to 13
+        f_cell(labTbl, c, _row, "", colHead, _sz)
+
+    // 現在状態ミニテーブル
+    if showCurrent
+        f_cell(curTbl, 0, 0, "Logic",  colHead, _sz)
+        f_cell(curTbl, 1, 0, "State",  colHead, _sz)
+        f_cell(curTbl, 2, 0, "Detail", colHead, _sz)
+        f_cell(curTbl, 0, 1, "V0 Vote", colBase, _sz)
+        f_cell(curTbl, 1, 1, f_stateText(st0), colBase, _sz)
+        f_cell(curTbl, 2, 1, "L:" + str.tostring(v0LongVotes) + " S:" + str.tostring(v0ShortVotes) + " J:" + str.tostring(v0JudgeCode), colBase, _sz)
+        f_cell(curTbl, 0, 2, "V1 Strength", colBase, _sz)
+        f_cell(curTbl, 1, 2, f_stateText(st1), colBase, _sz)
+        f_cell(curTbl, 2, 2, "score:" + str.tostring(v1Score, "0.0") + " sup L:" + str.tostring(v1LongSup) + " S:" + str.tostring(v1ShortSup), colBase, _sz)
+        f_cell(curTbl, 0, 3, "V2 Consensus", colBase, _sz)
+        f_cell(curTbl, 1, 3, f_stateText(st2), colBase, _sz)
+        f_cell(curTbl, 2, 3, "qL:" + str.tostring(v2LongQual) + " qS:" + str.tostring(v2ShortQual) + " avgL:" + str.tostring(v2AvgLongQ, "0.00") + " avgS:" + str.tostring(v2AvgShortQ, "0.00"), colBase, _sz)
+        f_cell(curTbl, 0, 4, "V3 Early", colBase, _sz)
+        f_cell(curTbl, 1, 4, f_stateText(st3), colBase, _sz)
+        f_cell(curTbl, 2, 4, "L:" + str.tostring(v3LongVotes) + " S:" + str.tostring(v3ShortVotes), colBase, _sz)
+        f_cell(curTbl, 0, 5, "V4 Core", colBase, _sz)
+        f_cell(curTbl, 1, 5, f_stateText(st4), colBase, _sz)
+        f_cell(curTbl, 2, 5, "core:" + str.tostring(v4CoreDir) + " same:" + str.tostring(v4SameConfirm) + " opp:" + str.tostring(v4OppConfirm), colBase, _sz)
