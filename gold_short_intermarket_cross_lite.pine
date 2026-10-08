@@ -1065,8 +1065,9 @@ imTableSizeStr   = input.string("tiny", "Cross テーブル 文字サイズ",
 //    このinputで切り替わるのは「どちらのテーブルを描くか」だけ。
 //    MODEL を選んでも既存の V1/V2/V3 統計ロジックは一切変わらない。
 imCrossView = input.string("MARKET", "Cross Analysis View",
-     options = ["MARKET", "MODEL"], group = G_IMX,
+     options = ["MARKET", "COMBO", "MODEL"], group = G_IMX,
      tooltip = "MARKET = DXY / US10Y / Oil / Silver を直接評価した表 (既定)。\n" +
+     "COMBO  = YIELD × OIL / SILVER の組み合わせ表 (DXYは使わない)。\n" +
      "MODEL  = 既存の V1 / V2 / V3 クロス表 (従来どおり / 統計ロジック無変更)。")
 //  ★ Market Bus の受け取り口。GOLD IM LAB の非表示plot "IM Market Bus"。
 //    IM Cross Bus (100000番台) を誤って選んでも範囲外になり MARKET BUS NO
@@ -3358,3 +3359,295 @@ if barstate.islast and showImCrossTable and imCrossView == "MARKET"
     f_imxCell(imMktTbl, 7, _row, imMktOk ? ("OIL "  + f_imMktStateName(f_imMktState(imMktOilF))) : "-", _hd, _sz)
     f_imxCell(imMktTbl, 8, _row, imMktOk ?
          ("SLV " + f_imMktStateName(f_imMktState(imMktSlvF)) + " / Sc " + str.tostring(_curScore, "0")) : "-", _hd, _sz)
+
+// ============================================================================
+// 13. YIELD × OIL / SILVER COMBINATION TEST  (統計表示のみ・売買ロジックへ影響しない)
+// ----------------------------------------------------------------------------
+//  ★ Section 11 / 12 と同じ方針。読み取りと自前Mapへの記録とテーブル描画だけで、
+//    strategy.entry / strategy.exit / strategy.close / strategy.cancel /
+//    request.*() を1回も呼ばない。Engine state も書き換えない。
+//  ★ 新しい request.* は0本。市場 state は Section 12 が decode した
+//    IM Market Bus の値 (imMktYldF / imMktOilF / imMktSlvF) をそのまま使い、
+//    Direction / Relation / Gold Impact を再計算しない。
+//  ★ Section 11 (MODEL) / Section 12 (MARKET) の統計コードは1行も変更していない。
+//    両者は決済時に自分の Snapshot を掃除するため、こちらも SL / Regime まで
+//    含めて完全に独立した自前 Map を持つ。
+//  ★ DXY は COMBO の条件に一切使わない (MARKET View には従来どおり残る)。
+// ============================================================================
+
+// ---- 13.1 state → 3分類インデックス --------------------------------------
+//  TAILWIND(3) → 0 / NEUTRAL(1) → 1 / HEADWIND(2) → 2 / INVALID(0) → -1
+//  ★ INVALID のトレードは 9分類へ入れない。件数はフッターへ診断表示する。
+f_imCmbIdx(int st) =>
+    st == 3 ? 0 : st == 1 ? 1 : st == 2 ? 2 : -1
+
+f_imCmbIdxName(int k) =>
+    k == 0 ? "TAIL" : k == 1 ? "NEUT" : k == 2 ? "HEAD" : "-"
+
+// ---- 13.2 Entry時 Snapshot (Entry ID へ紐づけて固定) ----------------------
+//  ★ Section 12 と同じ瞬間・同じ値 (同じ Bus decode 結果) を記録する。
+//    Entry後に市場 state が変化しても分類は変更しない。
+//  ★ DXY は保存しない (COMBO では使わない)。
+var map<string, int>   imCmbSnapY   = map.new<string, int>()
+var map<string, int>   imCmbSnapO   = map.new<string, int>()
+var map<string, int>   imCmbSnapS   = map.new<string, int>()
+var map<string, int>   imCmbSnapReg = map.new<string, int>()
+var map<string, float> imCmbSnapSL  = map.new<string, float>()
+
+f_imCmbSnapshot(string eid) =>
+    if eid != "" and not imCmbSnapSL.contains(eid)
+        imCmbSnapY.put(eid,   f_imMktState(imMktYldF))
+        imCmbSnapO.put(eid,   f_imMktState(imMktOilF))
+        imCmbSnapS.put(eid,   f_imMktState(imMktSlvF))
+        imCmbSnapReg.put(eid, imxRegSlice)
+        imCmbSnapSL.put(eid,  gTradeSL.contains(eid) ? gTradeSL.get(eid) : na)
+    true
+
+//  母集団は Section 11 / 12 と同一。実際に strategy.entry まで到達して
+//  Entry ID が発行された Short のみ (eid == "" は入らない)。
+f_imCmbSnapshot(fvg15EidShort)
+f_imCmbSnapshot(fvgEidShort)
+f_imCmbSnapshot(abs15EidShort)
+f_imCmbSnapshot(abs5EidShort)
+f_imCmbSnapshot(zrbEidShort)
+f_imCmbSnapshot(zfkEidShort)
+f_imCmbSnapshot(zrtEidShort)
+f_imCmbSnapshot(zbkEidShort)
+f_imCmbSnapshot(zsrEidShort)
+
+// ---- 13.3 集計スロット ----------------------------------------------------
+//  slot = regSlice * 27 + cat
+//    cat  0     : BASELINE / ALL SHORT
+//    cat  1〜 9 : YIELD × OIL     (1 + yIdx * 3 + oIdx)
+//    cat 10〜18 : YIELD × SILVER  (10 + yIdx * 3 + sIdx)
+//    cat 19〜26 : YIELD主軸 候補 A〜H
+//       19 A : YIELD TAILWIND
+//       20 B : YIELD TAILWIND + OIL TAILWIND
+//       21 C : YIELD TAILWIND + SILVER != HEADWIND (TAILWIND or NEUTRAL)
+//       22 D : YIELD TAILWIND + OIL TAILWIND + SILVER != HEADWIND
+//       23 E : YIELD HEADWIND
+//       24 F : YIELD HEADWIND + OIL HEADWIND
+//       25 G : YIELD HEADWIND + SILVER HEADWIND
+//       26 H : YIELD HEADWIND + (OIL HEADWIND or SILVER HEADWIND)
+//    regSlice 0 = ALL / 1 = BULL / 2 = BEAR / 3 = RANGE
+//  field 0 = N / 1 = 勝ち件数 / 2 = Gross Positive R /
+//        3 = Gross Negative R (絶対値) / 4 = Sum R / 5 = 負け件数
+//  配列 index = slot * 6 + field  (4 * 27 * 6 = 648 / 使用最大 647)
+//
+//  ★ field定義・index式は Section 11 / 12 と同一なので f_imxBump /
+//    f_imxGet をそのまま再利用する (cat数だけが 20 → 27 で違う)。
+//  ★ C / D の "SILVER != HEADWIND" は TAILWIND または NEUTRAL のみ。
+//    INVALID は含めない。
+var array<float> imCmbStats = array.new_float(4 * 27 * 6, 0.0)
+
+//  R == 0 のトレードは N に数えるが勝ち / 負けどちらにも数えない。
+f_imCmbRecord(array<float> a, int cat, int regSlice, float r) =>
+    float _pos = r > 0 ?  r   : 0.0
+    float _neg = r < 0 ? -r   : 0.0
+    float _win = r > 0 ?  1.0 : 0.0
+    float _los = r < 0 ?  1.0 : 0.0
+    f_imxBump(a, cat, 0, 1.0)
+    f_imxBump(a, cat, 1, _win)
+    f_imxBump(a, cat, 2, _pos)
+    f_imxBump(a, cat, 3, _neg)
+    f_imxBump(a, cat, 4, r)
+    f_imxBump(a, cat, 5, _los)
+    if regSlice >= 1 and regSlice <= 3
+        int _s = regSlice * 27 + cat
+        f_imxBump(a, _s, 0, 1.0)
+        f_imxBump(a, _s, 1, _win)
+        f_imxBump(a, _s, 2, _pos)
+        f_imxBump(a, _s, 3, _neg)
+        f_imxBump(a, _s, 4, r)
+        f_imxBump(a, _s, 5, _los)
+    true
+
+// ---- 13.4 closed trade の集計 --------------------------------------------
+//  ★ Section 11 / 12 とは完全に別のカウンタ / 別のMapで処理する。
+//    自前カウンタ imCmbLastClosed で index 差分だけを見るので、同じ
+//    closed trade を二度集計しない。
+//  ★ R は Short なので
+//        initialRisk = abs(実Entry価格 - Entry時Structural SL)
+//        R           = (実Entry価格 - 実Exit価格) / initialRisk
+//    実際の約定価格 (strategy.closedtrades.entry_price / exit_price) を使う。
+//  ★ initialRisk <= 0 / データ欠損は imCmbExcluded へ診断カウントして除外。
+//  ★ YIELD または OIL が INVALID → YIELD×OIL 9分類から除外し imCmbNaYO へ。
+//    YIELD または SILVER が INVALID → YIELD×SILVER 9分類から除外し imCmbNaYS へ。
+var int   imCmbLastClosed = 0
+var float imCmbExcluded   = 0.0
+var float imCmbNoSnap     = 0.0
+var float imCmbNaYO       = 0.0
+var float imCmbNaYS       = 0.0
+if strategy.closedtrades > imCmbLastClosed
+    for i = imCmbLastClosed to strategy.closedtrades - 1
+        string _eid = strategy.closedtrades.entry_id(i)
+        float  _sz  = strategy.closedtrades.size(i)
+        if _sz < 0 and imCmbSnapSL.contains(_eid)
+            float _ep = strategy.closedtrades.entry_price(i)
+            float _xp = strategy.closedtrades.exit_price(i)
+            float _sl = imCmbSnapSL.get(_eid)
+            float _ir = (na(_ep) or na(_sl)) ? na : math.abs(_ep - _sl)
+            if na(_ep) or na(_xp) or na(_ir) or _ir <= 0
+                imCmbExcluded += 1.0
+            else
+                float _r  = (_ep - _xp) / _ir
+                int   _rs = imCmbSnapReg.contains(_eid) ? imCmbSnapReg.get(_eid) : 0
+                int   _sy = imCmbSnapY.contains(_eid) ? imCmbSnapY.get(_eid) : 0
+                int   _so = imCmbSnapO.contains(_eid) ? imCmbSnapO.get(_eid) : 0
+                int   _ss = imCmbSnapS.contains(_eid) ? imCmbSnapS.get(_eid) : 0
+                int   _ky = f_imCmbIdx(_sy)
+                int   _ko = f_imCmbIdx(_so)
+                int   _ks = f_imCmbIdx(_ss)
+                //  BASELINE (組み合わせ分類なし・現在ONの全Short実Entry)
+                f_imCmbRecord(imCmbStats, 0, _rs, _r)
+                //  YIELD × OIL (両方が有効なときだけ)
+                if _ky >= 0 and _ko >= 0
+                    f_imCmbRecord(imCmbStats, 1 + _ky * 3 + _ko, _rs, _r)
+                else
+                    imCmbNaYO += 1.0
+                //  YIELD × SILVER (両方が有効なときだけ)
+                if _ky >= 0 and _ks >= 0
+                    f_imCmbRecord(imCmbStats, 10 + _ky * 3 + _ks, _rs, _r)
+                else
+                    imCmbNaYS += 1.0
+                //  YIELD主軸 候補 A〜H
+                //    A / E は YIELD だけで決まるので OIL / SILVER の有効性を問わない。
+                bool _yT = _sy == 3
+                bool _yH = _sy == 2
+                bool _oT = _so == 3
+                bool _oH = _so == 2
+                bool _sH = _ss == 2
+                bool _sNotH = _ss == 3 or _ss == 1
+                if _yT
+                    f_imCmbRecord(imCmbStats, 19, _rs, _r)
+                    if _oT
+                        f_imCmbRecord(imCmbStats, 20, _rs, _r)
+                    if _sNotH
+                        f_imCmbRecord(imCmbStats, 21, _rs, _r)
+                    if _oT and _sNotH
+                        f_imCmbRecord(imCmbStats, 22, _rs, _r)
+                if _yH
+                    f_imCmbRecord(imCmbStats, 23, _rs, _r)
+                    if _oH
+                        f_imCmbRecord(imCmbStats, 24, _rs, _r)
+                    if _sH
+                        f_imCmbRecord(imCmbStats, 25, _rs, _r)
+                    if _oH or _sH
+                        f_imCmbRecord(imCmbStats, 26, _rs, _r)
+        else if _sz < 0
+            imCmbNoSnap += 1.0
+        //  完全に決済済みなら Snapshot を掃除する (f_isOpenEntry は Section 08.1)。
+        if not f_isOpenEntry(_eid)
+            if imCmbSnapY.contains(_eid)
+                imCmbSnapY.remove(_eid)
+            if imCmbSnapO.contains(_eid)
+                imCmbSnapO.remove(_eid)
+            if imCmbSnapS.contains(_eid)
+                imCmbSnapS.remove(_eid)
+            if imCmbSnapReg.contains(_eid)
+                imCmbSnapReg.remove(_eid)
+            if imCmbSnapSL.contains(_eid)
+                imCmbSnapSL.remove(_eid)
+    imCmbLastClosed := strategy.closedtrades
+
+// ---- 13.5 表示 ------------------------------------------------------------
+//  ★ Sample Warning は COMBO 専用の2段階。数値自体は N が小さくても必ず出す。
+//      N < 10 → ⚠⚠ / N < 20 → ⚠ / N >= 20 → なし
+f_imCmbWarn(float n) =>
+    n < 10 ? " ⚠⚠" : n < 20 ? " ⚠" : ""
+
+//  8列 : Combination / N / Win % / PF / Avg R / Net R / Avg Win R / Avg Loss R
+f_imCmbRow(table t, int row, string c0, int slot, array<float> a, color bg, string sz) =>
+    float _n   = f_imxGet(a, slot, 0)
+    float _win = f_imxGet(a, slot, 1)
+    float _pos = f_imxGet(a, slot, 2)
+    float _neg = f_imxGet(a, slot, 3)
+    float _sum = f_imxGet(a, slot, 4)
+    float _los = f_imxGet(a, slot, 5)
+    f_imxCell(t, 0, row, c0, bg, sz)
+    f_imxCell(t, 1, row, str.tostring(_n, "0") + f_imCmbWarn(_n), bg, sz)
+    f_imxCell(t, 2, row, f_imxPct(_win, _n), bg, sz)
+    f_imxCell(t, 3, row, f_imxPf(_pos, _neg), bg, sz)
+    f_imxCell(t, 4, row, f_imxAvg(_sum, _n), bg, sz)
+    f_imxCell(t, 5, row, _n > 0 ? str.tostring(_sum, "0.00") : "-", bg, sz)
+    f_imxCell(t, 6, row, f_imxAvg(_pos, _win), bg, sz)
+    f_imxCell(t, 7, row, _los > 0 ? str.tostring(-_neg / _los, "0.00") : "-", bg, sz)
+
+f_imCmbCandName(int k) =>
+    k == 0 ? "A  Y-TAIL" :
+     k == 1 ? "B  Y-TAIL + O-TAIL" :
+     k == 2 ? "C  Y-TAIL + S!=HEAD" :
+     k == 3 ? "D  Y-TAIL + O-TAIL + S!=HEAD" :
+     k == 4 ? "E  Y-HEAD" :
+     k == 5 ? "F  Y-HEAD + O-HEAD" :
+     k == 6 ? "G  Y-HEAD + S-HEAD" : "H  Y-HEAD + (O-HEAD or S-HEAD)"
+
+//  8列 × 32行 (ヘッダー1 + BASELINE 1 + 見出し3 + 9 + 9 + 8 + フッター1)
+//  Section 11 / 12 のテーブルと同じ bottom_left。Cross Analysis View で
+//  どれか1つだけが描画されるので重ならない。
+var table imCmbTbl = table.new(position.bottom_left, 8, 32, border_width = 1)
+
+if barstate.islast and showImCrossTable and imCrossView == "COMBO"
+    string _sz = f_imxTextSize(imTableSizeStr)
+    color  _hd = color.new(color.rgb(15, 15, 15), 10)
+    color  _bs = color.new(color.rgb(35, 35, 35), 10)
+    color  _bl = color.new(color.rgb(20, 50, 80), 10)
+    color  _sc = color.new(color.rgb(55, 45, 20), 10)
+    color  _cd = color.new(color.rgb(25, 60, 45), 10)
+    //  Result Regime → slot オフセット (ALL = 従来と同一スライス)
+    int _off = imResultRegime == "BULL" ? 27 : imResultRegime == "BEAR" ? 54 : imResultRegime == "RANGE" ? 81 : 0
+
+    f_imxCell(imCmbTbl, 0, 0, "Combination", _hd, _sz)
+    f_imxCell(imCmbTbl, 1, 0, "N",           _hd, _sz)
+    f_imxCell(imCmbTbl, 2, 0, "Win %",       _hd, _sz)
+    f_imxCell(imCmbTbl, 3, 0, "PF",          _hd, _sz)
+    f_imxCell(imCmbTbl, 4, 0, "Avg R",       _hd, _sz)
+    f_imxCell(imCmbTbl, 5, 0, "Net R",       _hd, _sz)
+    f_imxCell(imCmbTbl, 6, 0, "Avg Win R",   _hd, _sz)
+    f_imxCell(imCmbTbl, 7, 0, "Avg Loss R",  _hd, _sz)
+
+    //  BASELINE を必ず一番上に。組み合わせの価値は必ずこの行との差で判断する。
+    f_imCmbRow(imCmbTbl, 1, "BASELINE / ALL SHORT", _off + 0, imCmbStats, _bl, _sz)
+
+    //  YIELD × OIL
+    f_imxCell(imCmbTbl, 0, 2, "── YIELD × OIL ──", _sc, _sz)
+    for c = 1 to 7
+        f_imxCell(imCmbTbl, c, 2, "", _sc, _sz)
+    int _row = 3
+    for ky = 0 to 2
+        for ko = 0 to 2
+            f_imCmbRow(imCmbTbl, _row, "Y-" + f_imCmbIdxName(ky) + " + O-" + f_imCmbIdxName(ko),
+                 _off + 1 + ky * 3 + ko, imCmbStats, _bs, _sz)
+            _row += 1
+
+    //  YIELD × SILVER
+    f_imxCell(imCmbTbl, 0, _row, "── YIELD × SILVER ──", _sc, _sz)
+    for c = 1 to 7
+        f_imxCell(imCmbTbl, c, _row, "", _sc, _sz)
+    _row += 1
+    for ky = 0 to 2
+        for ks = 0 to 2
+            f_imCmbRow(imCmbTbl, _row, "Y-" + f_imCmbIdxName(ky) + " + S-" + f_imCmbIdxName(ks),
+                 _off + 10 + ky * 3 + ks, imCmbStats, _bs, _sz)
+            _row += 1
+
+    //  YIELD主軸 候補 A〜H
+    f_imxCell(imCmbTbl, 0, _row, "── YIELD-LED CANDIDATES ──", _sc, _sz)
+    for c = 1 to 7
+        f_imxCell(imCmbTbl, c, _row, "", _sc, _sz)
+    _row += 1
+    for k = 0 to 7
+        f_imCmbRow(imCmbTbl, _row, f_imCmbCandName(k), _off + 19 + k, imCmbStats, _cd, _sz)
+        _row += 1
+
+    //  フッター : Bus状態 / Regimeフィルター / 診断 / 現在の YIELD / OIL / SILVER
+    f_imxCell(imCmbTbl, 0, _row, imMktOk ? "MARKET BUS OK" : "MARKET BUS NO", _hd, _sz)
+    f_imxCell(imCmbTbl, 1, _row, "Reg " + imResultRegime, _hd, _sz)
+    f_imxCell(imCmbTbl, 2, _row, "Excl " + str.tostring(imCmbExcluded, "0"), _hd, _sz)
+    f_imxCell(imCmbTbl, 3, _row, "NoSnap " + str.tostring(imCmbNoSnap, "0"), _hd, _sz)
+    f_imxCell(imCmbTbl, 4, _row, "NA Y×O " + str.tostring(imCmbNaYO, "0"), _hd, _sz)
+    f_imxCell(imCmbTbl, 5, _row, "NA Y×S " + str.tostring(imCmbNaYS, "0"), _hd, _sz)
+    f_imxCell(imCmbTbl, 6, _row, imMktOk ? ("Y " + f_imMktStateName(f_imMktState(imMktYldF))) : "-", _hd, _sz)
+    f_imxCell(imCmbTbl, 7, _row, imMktOk ?
+         ("O " + f_imMktStateName(f_imMktState(imMktOilF)) +
+          " / S " + f_imMktStateName(f_imMktState(imMktSlvF))) : "-", _hd, _sz)
