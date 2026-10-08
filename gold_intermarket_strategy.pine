@@ -1,0 +1,550 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// ============================================================
+//  Gold Intermarket Strategy  (Intermarket判定 単独バックテスト版)
+// ------------------------------------------------------------
+//  Gold Intermarket Dashboard (gold_intermarket_dashboard.pine) の
+//  判定エンジンをそのまま流用した軽量 Strategy 版。
+//  目的は「Intermarket判定だけでどこまで取れるか」の単独検証。
+//  元 Dashboard は一切変更していない (別ファイル・独立スクリプト)。
+//
+//  Dashboard から維持しているもの :
+//    ・DXY / Yield / Oil / Silver の4市場 (市場別 ON/OFF)
+//    ・1H / 15M / 5M の Direction 判定 (EMA20 位置 + 傾き / TF重みスコア)
+//    ・15分足ベースの Short / Mid 相関 (確定足の対数騰落率 Pearson)
+//    ・Relation 判定 (OK / BREAK / UNSTABLE / STALE / DATA不足)
+//    ・Gold Impact (LONG / SHORT / NEUTRAL / OFF)
+//    ・longVotes / shortVotes
+//    ・judgeCode (1=STRONG LONG / 2=STRONG SHORT / 3=LONG優勢 /
+//                 4=SHORT優勢 / 5=CONFLICT / 6=NEUTRAL)
+//    ・確定足ベース・非リペイント仕様 (lookahead_on + TFコンテキスト内 確定1本前[1])
+//
+//  Dashboard から削除したもの (表示専用処理 / バックテスト不要) :
+//    ・table (table.new / table.cell / f_drawRow)
+//    ・色分け一式 (colLong 等の色定義、f_directionColor / f_impactColor /
+//      f_relationColor / f_judgeColor / f_relationTextColor / f_judgeTextColor)
+//    ・表示テキスト変換 (f_dirText / f_scoreText / f_corrText /
+//      f_relationText / f_impactText / f_judgeText)
+//    ・テーブル位置 / 文字サイズ / 背景透明度 の input (f_tablePos / f_textSize)
+//    ・alertcondition (5本すべて) と状態遷移検出 (prevJudge / judgeChanged)
+//    ・集計のうち売買に使わない neutralCount / excludedCount
+//    ・リアルタイム更新モード input (未確定足を混ぜるとバックテストが
+//      リペイントするため削除し、確定足モードに固定)
+//    ・label / plot / bgcolor は一切使用しない
+//
+//  追加していないもの (Intermarket単独性能を見るため) :
+//    ・Zone / FVG / SATS / 時間帯フィルター / ボラフィルター / 指標時間フィルター
+//    ・ピラミッディング (pyramiding = 0)
+//
+//  ※ Gold チャート (例 : TVC:GOLD / OANDA:XAUUSD) の 5分足 または
+//     15分足に適用してください。
+// ============================================================
+
+//@version=5
+strategy(
+     title                   = "Gold Intermarket Strategy",
+     shorttitle              = "GOLD IMS",
+     overlay                 = true,
+     pyramiding              = 0,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     calc_on_every_tick      = false,
+     process_orders_on_close = false,
+     dynamic_requests        = true,
+     max_bars_back           = 500
+ )
+
+// ============================================================
+//  1. 入力 : シンボル
+// ============================================================
+grpSym = "シンボル"
+goldSymbol   = input.symbol("TVC:GOLD",   "Gold シンボル",            group = grpSym)
+dxySymbol    = input.symbol("TVC:DXY",    "DXY シンボル",             group = grpSym)
+yieldSymbol  = input.symbol("TVC:US10Y",  "Yield シンボル (米10年債)", group = grpSym)
+oilSymbol    = input.symbol("TVC:USOIL",  "Oil シンボル (WTI)",       group = grpSym)
+silverSymbol = input.symbol("TVC:SILVER", "Silver シンボル",          group = grpSym)
+
+// ============================================================
+//  2. 入力 : 市場別 ON/OFF
+// ------------------------------------------------------------
+//  OFF の市場は request.security を呼ばず、相関・方向・投票の対象外。
+//  全市場 OFF でもエラーにならない (security を1本も呼ばない)。
+// ============================================================
+grpUse = "市場 ON/OFF"
+useDxy    = input.bool(true, "DXY を使う",    group = grpUse)
+useYield  = input.bool(true, "Yield を使う",  group = grpUse)
+useOil    = input.bool(true, "Oil を使う",    group = grpUse)
+useSilver = input.bool(true, "Silver を使う", group = grpUse)
+
+// ============================================================
+//  3. 入力 : 方向判定 (EMA20 の位置と傾き) ※Dashboard と同一
+// ============================================================
+grpDir = "方向判定"
+tf1H  = input.timeframe("60", "1H 時間足",  group = grpDir)
+tf15M = input.timeframe("15", "15M 時間足", group = grpDir)
+tf5M  = input.timeframe("5",  "5M 時間足",  group = grpDir)
+
+emaLen        = input.int(20, "EMA 期間",         minval = 1, group = grpDir)
+emaSlopeLen   = input.int(3,  "EMA 傾き参照本数", minval = 1, group = grpDir)
+
+weight1H  = input.int(2, "時間足の重み 1H",  minval = 0, group = grpDir)
+weight15M = input.int(2, "時間足の重み 15M", minval = 0, group = grpDir)
+weight5M  = input.int(1, "時間足の重み 5M",  minval = 0, group = grpDir)
+
+dirUpThreshold = input.int(3,  "方向スコア 上昇しきい値 (以上)", group = grpDir)
+dirDnThreshold = input.int(-3, "方向スコア 下降しきい値 (以下)", group = grpDir)
+
+// ============================================================
+//  4. 入力 : 相関 (確定15分足の対数騰落率ベース) ※Dashboard と同一
+// ============================================================
+grpCorr = "相関"
+corrTF        = input.timeframe("15", "相関ベース時間足", group = grpCorr)
+corrShortLen  = input.int(20,   "短期相関 本数", minval = 2, group = grpCorr)
+corrMidLen    = input.int(48,   "中期相関 本数", minval = 2, group = grpCorr)
+corrThreshold = input.float(0.30, "相関しきい値 (|corr|)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpCorr)
+
+// ============================================================
+//  5. 入力 : 売買ルール (Entry Mode / Exit Mode)
+// ------------------------------------------------------------
+//  Strategy Tester で下記6パターンを「設定変更だけ」で比較できる。
+//    Entry A × Exit 1 / Exit 2 / Exit 3
+//    Entry B × Exit 1 / Exit 2 / Exit 3
+// ============================================================
+grpTrade = "売買ルール"
+entryMode = input.string("B : Bias + Strong", "Entry Mode",
+     options = ["A : Strong Only", "B : Bias + Strong"], group = grpTrade)
+exitMode  = input.string("1 : Opposite Signal", "Exit Mode",
+     options = ["1 : Opposite Signal", "2 : Neutral", "3 : Fixed SL/TP"], group = grpTrade)
+fixedSL = input.float(20.0, "固定SL : Gold価格幅 ($) ※Exit 3", minval = 0.0, step = 0.5, group = grpTrade)
+fixedTP = input.float(30.0, "固定TP : Gold価格幅 ($) ※Exit 3", minval = 0.0, step = 0.5, group = grpTrade)
+
+bool entryStrongOnly = entryMode == "A : Strong Only"
+bool exitNeutral     = exitMode  == "2 : Neutral"
+bool exitFixed       = exitMode  == "3 : Fixed SL/TP"
+// Exit 1 (Opposite Signal) は「反対シグナルでのドテン」のみ = 全モード共通の基本動作。
+// そのため専用フラグは持たず、Exit 2 / Exit 3 が追加の決済条件を上乗せする形にする。
+
+// ============================================================
+//  6. request.security 用 関数 (参照TFコンテキスト内で評価)
+// ------------------------------------------------------------
+//  確定足仕様は Dashboard と同一。
+//  参照TFコンテキスト内で確定1本前 [1] に固定し、lookahead_on と
+//  組み合わせることで未来参照なし・非リペイントになる。
+//  Dashboard のリアルタイム更新モード (未確定足) は
+//  バックテストで必ずリペイントするため Strategy 版では持たない。
+// ============================================================
+
+// 方向判定 : EMA20 の位置と傾き。
+//   上昇 : 終値 > EMA20 かつ EMA20 > EMA20[傾き参照本数]
+//   下降 : 終値 < EMA20 かつ EMA20 < EMA20[傾き参照本数]
+//   それ以外はレンジ (0)。
+f_dirState(int len, int slopeLen) =>
+    float _ema = ta.ema(close, len)
+    bool  _up  = close > _ema and _ema > _ema[slopeLen]
+    bool  _dn  = close < _ema and _ema < _ema[slopeLen]
+    int   _d   = _up ? 1 : _dn ? -1 : 0
+    _d[1]
+
+// 相関用データ : 確定した参照TF足の「対数騰落率」と、その足の時刻。
+//   価格の終値ではなく騰落率を返す (相関は騰落率同士で計算する)。
+//   時刻は Gold と対象市場の同期チェック (同じ値の重複 push 防止) に使う。
+f_corrData() =>
+    float _r = (na(close) or na(close[1]) or close <= 0 or close[1] <= 0) ? na : math.log(close / close[1])
+    [_r[1], time[1]]
+
+// ============================================================
+//  7. 補助関数 : 相関計算 (騰落率配列ベース) ※Dashboard と同一
+// ============================================================
+
+// 新しい確定参照TF足が発生したチャート足でのみ、Gold と対象市場の
+// 騰落率を「同じ確定足のペア」として配列へ追加する。
+//   ・_sameTime : Gold と対象市場の確定足時刻が完全に一致した場合だけ追加。
+//     → 片方が休場 / データ欠損で足が進んでいないとき、異なる時刻の騰落率を
+//       無理に組み合わせない (その足は丸ごとスキップ)。
+//   ・_fresh    : 追加済みのペア時刻 _lastPairTime と異なる場合だけ追加。
+//     → 同一確定足を二度追加しない。重複防止は必ずこの1箇所で行う。
+//   ・配列の最大サイズは相関期間 (短期・中期の大きい方) と同じ。
+//     短期相関と中期相関はこの同一配列 (= 同期済みペア列) の末尾 N 本から計算する。
+f_pushReturns(array<float> ga, array<float> ma, bool doPush, float gv, float mv, int gt, int mt, int maxLen) =>
+    var int _lastPairTime = na
+    bool _sameTime = not na(gt) and not na(mt) and gt == mt
+    bool _fresh    = na(_lastPairTime) or gt != _lastPairTime
+    bool _valid =
+         doPush and
+         not na(gv) and
+         not na(mv) and
+         not na(gt) and
+         not na(mt) and
+         _sameTime and
+         _fresh
+    if _valid
+        array.push(ga, gv)
+        array.push(ma, mv)
+        _lastPairTime := gt
+        while array.size(ga) > maxLen
+            array.shift(ga)
+            array.shift(ma)
+
+// 騰落率配列の末尾 len 本で Pearson 相関係数を計算する。
+//   必要本数が揃っていない間は na (= DATA不足) を返す。
+f_pearson(array<float> ga, array<float> ma, int len) =>
+    int   _n = array.size(ga)
+    float _r = na
+    if _n >= len and len >= 2
+        float _sg = 0.0
+        float _sm = 0.0
+        for i = _n - len to _n - 1
+            _sg += array.get(ga, i)
+            _sm += array.get(ma, i)
+        float _mg = _sg / len
+        float _mm = _sm / len
+        float _cov = 0.0
+        float _vg  = 0.0
+        float _vm  = 0.0
+        for i = _n - len to _n - 1
+            float _dg = array.get(ga, i) - _mg
+            float _dm = array.get(ma, i) - _mm
+            _cov += _dg * _dm
+            _vg  += _dg * _dg
+            _vm  += _dm * _dm
+        float _den = math.sqrt(_vg * _vm)
+        _r := _den > 0 ? _cov / _den : na
+    _r
+
+// ============================================================
+//  8. 補助関数 : 分類 / 投票 ※Dashboard と同一
+// ============================================================
+
+// 方向スコア → 方向コード (1 = 上昇 / -1 = 下降 / 0 = レンジ)
+f_dirCode(int score) =>
+    score >= dirUpThreshold ? 1 : score <= dirDnThreshold ? -1 : 0
+
+// 相関分類コード
+//   0 = DATA不足  相関計算に必要な本数がまだない (データ取得不可を含む)
+//   4 = STALE     過去の相関値はあるが、対象市場の最新確定足が Gold と同期していない
+//   3 = UNSTABLE  短期・中期相関が弱い、または短期と中期が不一致
+//   2 = BREAK     期待と反対の相関
+//   1 = OK        期待する相関が成立し、最新足も同期している
+//   expectPositive = true  → Silver (Goldと正相関を期待)
+//   expectPositive = false → DXY / Yield / Oil (Goldと逆相関を期待)
+f_relationCode(float cShort, float cMid, bool expectPositive, float th, bool current) =>
+    int _rel = 0
+    if na(cShort) or na(cMid)
+        _rel := 0
+    else if not current
+        _rel := 4
+    else if expectPositive
+        _rel := (cShort >= th and cMid >= th) ? 1 : (cShort <= -th and cMid <= -th) ? 2 : 3
+    else
+        _rel := (cShort <= -th and cMid <= -th) ? 1 : (cShort >= th and cMid >= th) ? 2 : 3
+    _rel
+
+// Gold への影響コード
+//    1 = Gold LONG要因 / -1 = Gold SHORT要因 / 0 = 中立 (相関OKだが方向レンジ)
+//    9 = OFF (相関 BREAK / UNSTABLE / DATA不足 / STALE → 投票から除外)
+f_impactCode(int rel, int dir, bool expectPositive) =>
+    int _imp = 9
+    if rel == 1
+        _imp := dir == 0 ? 0 : (expectPositive ? dir : -dir)
+    _imp
+
+// 総合判定コード
+//   1 = STRONG LONG / 2 = STRONG SHORT / 3 = LONG優勢 / 4 = SHORT優勢
+//   5 = CONFLICT    / 6 = NEUTRAL
+f_judgeCode(int lv, int sv, int ev) =>
+    int _j = 6
+    if ev < 2
+        _j := 6
+    else if ev >= 3 and lv >= 3 and sv == 0
+        _j := 1
+    else if ev >= 3 and sv >= 3 and lv == 0
+        _j := 2
+    else if lv >= 2 and (lv - sv) >= 2
+        _j := 3
+    else if sv >= 2 and (sv - lv) >= 2
+        _j := 4
+    else if lv > 0 and sv > 0 and math.abs(lv - sv) < 2
+        _j := 5
+    else
+        _j := 6
+    _j
+
+// ============================================================
+//  9. データ取得 ※Dashboard と同一 (lookahead_on 固定)
+// ------------------------------------------------------------
+//  ・OFF の市場は request.security を一切呼ばない。
+//  ・全市場 OFF なら Gold の相関用取得も呼ばない。
+//  ・ignore_invalid_symbol = true : シンボル取得失敗でもエラーにせず na。
+//  ・方向 : 3TF × 有効市場数 / 相関 : Gold 1本 + 有効市場数
+//    → 最大 1 + 4 × 4 = 17本 (上限40本以内)。
+// ============================================================
+bool anyMarketOn = useDxy or useYield or useOil or useSilver
+int  corrMaxLen  = math.max(corrShortLen, corrMidLen)
+
+// --- Gold : 相関用 確定騰落率 (全ペア共通・1本のみ) ---
+float gRet  = na
+int   gTime = na
+if anyMarketOn
+    [_gr, _gt] = request.security(goldSymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    gRet  := _gr
+    gTime := _gt
+
+// --- DXY ---
+int   dxyD1H  = na
+int   dxyD15M = na
+int   dxyD5M  = na
+float dxyRet  = na
+int   dxyTime = na
+if useDxy
+    dxyD1H  := request.security(dxySymbol, tf1H,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    dxyD15M := request.security(dxySymbol, tf15M, f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    dxyD5M  := request.security(dxySymbol, tf5M,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    [_dr, _dt] = request.security(dxySymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    dxyRet  := _dr
+    dxyTime := _dt
+
+// --- Yield ---
+int   yldD1H  = na
+int   yldD15M = na
+int   yldD5M  = na
+float yldRet  = na
+int   yldTime = na
+if useYield
+    yldD1H  := request.security(yieldSymbol, tf1H,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    yldD15M := request.security(yieldSymbol, tf15M, f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    yldD5M  := request.security(yieldSymbol, tf5M,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    [_yr, _yt] = request.security(yieldSymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    yldRet  := _yr
+    yldTime := _yt
+
+// --- Oil ---
+int   oilD1H  = na
+int   oilD15M = na
+int   oilD5M  = na
+float oilRet  = na
+int   oilTime = na
+if useOil
+    oilD1H  := request.security(oilSymbol, tf1H,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    oilD15M := request.security(oilSymbol, tf15M, f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    oilD5M  := request.security(oilSymbol, tf5M,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    [_or_, _ot] = request.security(oilSymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    oilRet  := _or_
+    oilTime := _ot
+
+// --- Silver ---
+int   slvD1H  = na
+int   slvD15M = na
+int   slvD5M  = na
+float slvRet  = na
+int   slvTime = na
+if useSilver
+    slvD1H  := request.security(silverSymbol, tf1H,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    slvD15M := request.security(silverSymbol, tf15M, f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    slvD5M  := request.security(silverSymbol, tf5M,  f_dirState(emaLen, emaSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    [_sr, _st] = request.security(silverSymbol, corrTF, f_corrData(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    slvRet  := _sr
+    slvTime := _st
+
+// ============================================================
+//  10. 相関計算 ※Dashboard と同一
+// ------------------------------------------------------------
+//  新しい確定足の検出は Gold 側で実際に取得できた確定相関足の時刻
+//  gTime の変化を基準にする (チャート時間足・取引時間の影響を受けない)。
+//  最終的な重複防止は f_pushReturns() 内の _lastPairTime で行う。
+// ============================================================
+bool newCorrBar = not na(gTime) and (na(gTime[1]) or gTime != gTime[1])
+
+var array<float> gArrDxy = array.new_float()
+var array<float> mArrDxy = array.new_float()
+var array<float> gArrYld = array.new_float()
+var array<float> mArrYld = array.new_float()
+var array<float> gArrOil = array.new_float()
+var array<float> mArrOil = array.new_float()
+var array<float> gArrSlv = array.new_float()
+var array<float> mArrSlv = array.new_float()
+
+f_pushReturns(gArrDxy, mArrDxy, useDxy    and newCorrBar, gRet, dxyRet, gTime, dxyTime, corrMaxLen)
+f_pushReturns(gArrYld, mArrYld, useYield  and newCorrBar, gRet, yldRet, gTime, yldTime, corrMaxLen)
+f_pushReturns(gArrOil, mArrOil, useOil    and newCorrBar, gRet, oilRet, gTime, oilTime, corrMaxLen)
+f_pushReturns(gArrSlv, mArrSlv, useSilver and newCorrBar, gRet, slvRet, gTime, slvTime, corrMaxLen)
+
+float dxyCorrS = useDxy    ? f_pearson(gArrDxy, mArrDxy, corrShortLen) : na
+float dxyCorrM = useDxy    ? f_pearson(gArrDxy, mArrDxy, corrMidLen)   : na
+float yldCorrS = useYield  ? f_pearson(gArrYld, mArrYld, corrShortLen) : na
+float yldCorrM = useYield  ? f_pearson(gArrYld, mArrYld, corrMidLen)   : na
+float oilCorrS = useOil    ? f_pearson(gArrOil, mArrOil, corrShortLen) : na
+float oilCorrM = useOil    ? f_pearson(gArrOil, mArrOil, corrMidLen)   : na
+float slvCorrS = useSilver ? f_pearson(gArrSlv, mArrSlv, corrShortLen) : na
+float slvCorrM = useSilver ? f_pearson(gArrSlv, mArrSlv, corrMidLen)   : na
+
+// ============================================================
+//  11. 現在データ同期判定 / 方向 / 相関分類 / Gold影響 ※Dashboard と同一
+// ============================================================
+// 現在データ同期判定 : Gold と対象市場の最新確定相関足時刻が一致しているか。
+//   一致していない市場 (休場 / データ停止) は、過去の相関係数や方向スコアが
+//   残っていても現在の情報ではないものとして扱い、投票へ参加させない (STALE)。
+bool dxyCurrent = useDxy    and not na(gTime) and not na(dxyTime) and gTime == dxyTime
+bool yldCurrent = useYield  and not na(gTime) and not na(yldTime) and gTime == yldTime
+bool oilCurrent = useOil    and not na(gTime) and not na(oilTime) and gTime == oilTime
+bool slvCurrent = useSilver and not na(gTime) and not na(slvTime) and gTime == slvTime
+
+// データ取得成否 (シンボル取得失敗・データ不足なら方向を使わない)
+bool dxyDataOk = useDxy    and not na(dxyD1H) and not na(dxyD15M) and not na(dxyD5M)
+bool yldDataOk = useYield  and not na(yldD1H) and not na(yldD15M) and not na(yldD5M)
+bool oilDataOk = useOil    and not na(oilD1H) and not na(oilD15M) and not na(oilD5M)
+bool slvDataOk = useSilver and not na(slvD1H) and not na(slvD15M) and not na(slvD5M)
+
+int dxyScore = dxyDataOk ? nz(dxyD1H) * weight1H + nz(dxyD15M) * weight15M + nz(dxyD5M) * weight5M : 0
+int yldScore = yldDataOk ? nz(yldD1H) * weight1H + nz(yldD15M) * weight15M + nz(yldD5M) * weight5M : 0
+int oilScore = oilDataOk ? nz(oilD1H) * weight1H + nz(oilD15M) * weight15M + nz(oilD5M) * weight5M : 0
+int slvScore = slvDataOk ? nz(slvD1H) * weight1H + nz(slvD15M) * weight15M + nz(slvD5M) * weight5M : 0
+
+int dxyDir = dxyDataOk ? f_dirCode(dxyScore) : 0
+int yldDir = yldDataOk ? f_dirCode(yldScore) : 0
+int oilDir = oilDataOk ? f_dirCode(oilScore) : 0
+int slvDir = slvDataOk ? f_dirCode(slvScore) : 0
+
+// 期待相関 : DXY / Yield / Oil = 逆相関 (false) / Silver = 正相関 (true)
+int dxyRel = useDxy    ? f_relationCode(dxyCorrS, dxyCorrM, false, corrThreshold, dxyCurrent) : 0
+int yldRel = useYield  ? f_relationCode(yldCorrS, yldCorrM, false, corrThreshold, yldCurrent) : 0
+int oilRel = useOil    ? f_relationCode(oilCorrS, oilCorrM, false, corrThreshold, oilCurrent) : 0
+int slvRel = useSilver ? f_relationCode(slvCorrS, slvCorrM, true,  corrThreshold, slvCurrent) : 0
+
+int dxyImp = (useDxy    and dxyDataOk and dxyCurrent) ? f_impactCode(dxyRel, dxyDir, false) : 9
+int yldImp = (useYield  and yldDataOk and yldCurrent) ? f_impactCode(yldRel, yldDir, false) : 9
+int oilImp = (useOil    and oilDataOk and oilCurrent) ? f_impactCode(oilRel, oilDir, false) : 9
+int slvImp = (useSilver and slvDataOk and slvCurrent) ? f_impactCode(slvRel, slvDir, true)  : 9
+
+// ============================================================
+//  12. 集計 / 総合判定 ※Dashboard と同一
+// ============================================================
+int longVotes =
+     ((useDxy    and dxyImp ==  1) ? 1 : 0) +
+     ((useYield  and yldImp ==  1) ? 1 : 0) +
+     ((useOil    and oilImp ==  1) ? 1 : 0) +
+     ((useSilver and slvImp ==  1) ? 1 : 0)
+
+int shortVotes =
+     ((useDxy    and dxyImp == -1) ? 1 : 0) +
+     ((useYield  and yldImp == -1) ? 1 : 0) +
+     ((useOil    and oilImp == -1) ? 1 : 0) +
+     ((useSilver and slvImp == -1) ? 1 : 0)
+
+int effectiveVotes = longVotes + shortVotes
+int judgeCode      = f_judgeCode(longVotes, shortVotes, effectiveVotes)
+
+// ============================================================
+//  13. シグナル定義 (Entry Mode)
+// ------------------------------------------------------------
+//  Mode A = Strong Only
+//    LONG  : judgeCode == 1 (STRONG LONG)
+//    SHORT : judgeCode == 2 (STRONG SHORT)
+//    LONG優勢 / SHORT優勢 では新規エントリーしない。
+//  Mode B = Bias + Strong (既定)
+//    LONG  : judgeCode == 1 または 3 (STRONG LONG / LONG優勢)
+//    SHORT : judgeCode == 2 または 4 (STRONG SHORT / SHORT優勢)
+//
+//  「反対シグナル」の定義も選択中の Entry Mode に従う。
+//    Mode A : LONG中に STRONG SHORT でドテン
+//    Mode B : LONG中に SHORT優勢 または STRONG SHORT でドテン
+// ============================================================
+bool longSignal  = entryStrongOnly ? (judgeCode == 1) : (judgeCode == 1 or judgeCode == 3)
+bool shortSignal = entryStrongOnly ? (judgeCode == 2) : (judgeCode == 2 or judgeCode == 4)
+
+// ============================================================
+//  14. 同一シグナル中の再エントリー禁止 (episode 管理)
+// ------------------------------------------------------------
+//  シグナル集合 (Mode A なら {STRONG LONG} / Mode B なら {STRONG LONG, LONG優勢})
+//  に入っている連続区間を 1つの「episode」として扱う。
+//    ・その episode 中に一度でもその方向のポジションを持ったら
+//      xxxEpisodeUsed = true にして、同じ episode 中は再エントリーしない。
+//      → SL/TP 決済後も、Neutral 決済後も、同じ方向状態が継続している
+//        だけなら再エントリーしない。
+//    ・LONG優勢 → STRONG LONG の変化は同じ集合内の移動なので
+//      episode は切れない (新規シグナル扱いにしない)。
+//      SHORT優勢 → STRONG SHORT も同様。
+//    ・シグナル集合から一度抜けた時点 (judgeCode が 1/3 以外 → Mode B の場合)
+//      で xxxEpisodeUsed = false にリセットし、再び集合へ戻ったら
+//      新しい episode = 新規シグナルとして再エントリー可。
+//    ・保有中に新しい episode が始まった場合も、そのポジションを
+//      「この episode で既に持っている」と見なして used = true にする。
+//      → 保有継続中に SL/TP で切れても、その episode 内では再入しない。
+// ============================================================
+var bool longEpisodeUsed  = false
+var bool shortEpisodeUsed = false
+
+// ============================================================
+//  15. 発注
+// ------------------------------------------------------------
+//  確定足のみで注文判定する (barstate.isconfirmed)。
+//  strategy() は calc_on_every_tick = false / process_orders_on_close = false
+//  のため、確定足の終値で判定 → 次足始値で約定する。未来参照なし。
+//
+//  Exit 1 = Opposite Signal (既定)
+//    保有中は反対方向の有効シグナルが出るまで保持し、
+//    反対シグナルで現在ポジションを決済して反対方向へドテンする。
+//    (反対方向の strategy.entry が決済とドテンを同時に行う)
+//  Exit 2 = Neutral
+//    反対シグナルが出れば Neutral を待たず即ドテン (Exit 1 と同じ)。
+//    反対シグナルが出なければ judgeCode == 6 (NEUTRAL) で決済。
+//    CONFLICT (5) だけでは決済しない。
+//  Exit 3 = Fixed SL/TP
+//    保有中は固定 SL / TP を建値基準で発注する。
+//    LONG  : stop = strategy.position_avg_price - SL
+//            limit = strategy.position_avg_price + TP
+//    SHORT : stop = strategy.position_avg_price + SL
+//            limit = strategy.position_avg_price - TP
+//    SL/TP 到達前に反対シグナルが出た場合は即決済してドテンする
+//    (ドテンを行う足では SL/TP の更新をスキップし、決済注文と
+//     ドテン注文が同一足で競合しないようにする)。
+//    ※ 約定タイミング : 確定足の終値で判定 → 次足始値でエントリー約定
+//      → SL/TP はその次の足から有効。エントリー足の足内では
+//      SL/TP が未発効 (process_orders_on_close = false のため)。
+//      未来参照は発生しないが、保有1本目の足内で SL 幅を超える動きが
+//      あった場合は次足で決済される点に注意。
+// ============================================================
+bool tradeBar = barstate.isconfirmed
+
+bool inLong  = strategy.position_size > 0
+bool inShort = strategy.position_size < 0
+bool isFlat  = strategy.position_size == 0
+
+if tradeBar
+    // --- episode リセット : シグナル集合から抜けたら未使用へ戻す ---
+    if not longSignal
+        longEpisodeUsed := false
+    if not shortSignal
+        shortEpisodeUsed := false
+    // --- 保有中の方向は、その episode で既に使用済みとして扱う ---
+    if inLong and longSignal
+        longEpisodeUsed := true
+    if inShort and shortSignal
+        shortEpisodeUsed := true
+
+    bool canEnterLong  = longSignal  and not longEpisodeUsed
+    bool canEnterShort = shortSignal and not shortEpisodeUsed
+
+    bool revToShort = inLong  and canEnterShort
+    bool revToLong  = inShort and canEnterLong
+    bool openLong   = isFlat  and canEnterLong
+    bool openShort  = isFlat  and canEnterShort and not openLong
+    bool neutralCut = exitNeutral and not isFlat and not revToShort and not revToLong and judgeCode == 6
+
+    if revToShort or openShort
+        strategy.entry("Short", strategy.short, comment = revToShort ? "REV->S" : "S")
+        shortEpisodeUsed := true
+    else if revToLong or openLong
+        strategy.entry("Long", strategy.long, comment = revToLong ? "REV->L" : "L")
+        longEpisodeUsed := true
+    else if neutralCut
+        strategy.close_all(comment = "NEUTRAL")
+    else if exitFixed and not isFlat and not na(strategy.position_avg_price)
+        // Exit 3 : 固定 SL/TP を建値基準で発注・更新
+        //   ドテン / NEUTRAL決済を行わない足でのみ実行する。
+        float _avg = strategy.position_avg_price
+        if strategy.position_size > 0
+            strategy.exit("X-L", from_entry = "Long",  stop = _avg - fixedSL, limit = _avg + fixedTP)
+        else
+            strategy.exit("X-S", from_entry = "Short", stop = _avg + fixedSL, limit = _avg - fixedTP)
