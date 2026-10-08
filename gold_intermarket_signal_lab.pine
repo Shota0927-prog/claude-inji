@@ -30,8 +30,13 @@
 //    strategy.* / 注文処理 / alertcondition / label / plot /
 //    bgcolor / barcolor / 市場別表示テーブル / 色分けロジック一式
 //
-//  request.security は Dashboard と同一の 17 本のみ。
+//  request.security は Intermarket 17 本 + Gold Regime 1 本 = 計 18 本。
 //  V0〜V4 は同一の取得済みデータを再利用し、request を追加しない。
+//
+//  Gold Regime (環境分類) :
+//    確定4H足の EMA50 位置 + 傾きで BULL / BEAR / RANGE を分類し、
+//    既存の 20 カテゴリを「イベント発生時点の環境」で後から仕分ける。
+//    V0〜V4 の式・episode 定義・Outcome 計算・既存 ALL 集計は変更していない。
 //
 //  ※ 統計は XAUUSD 5分足専用 (15分=3本 / 30分=6本 / 60分=12本 / 120分=24本)。
 //     5分足以外では統計更新を停止し、テーブルに "5m chart only" と警告表示する。
@@ -93,6 +98,17 @@ corrMidLen    = input.int(48,   "中期相関 本数", minval = 2, group = grpCo
 corrThreshold = input.float(0.30, "相関しきい値 (|corr|)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpCorr)
 
 // ============================================================
+//  4b. 入力 : Gold Regime (環境分類)
+// ------------------------------------------------------------
+//  Intermarket の goldSymbol ではなく、現在のチャート銘柄
+//  (syminfo.tickerid = XAUUSD) の確定4H環境を使用する。
+// ============================================================
+grpRegime      = "Gold Regime (環境分類)"
+regimeTF       = input.timeframe("240", "Regime TF",        group = grpRegime)
+regimeEmaLen   = input.int(50, "Regime EMA Len",   minval = 1, group = grpRegime)
+regimeSlopeLen = input.int(3,  "Regime Slope Len", minval = 1, group = grpRegime)
+
+// ============================================================
 //  5. 入力 : Lab 候補ロジックのしきい値
 // ============================================================
 grpV1 = "V1 Strength Weighted"
@@ -127,6 +143,7 @@ minSample = input.int(30, "Min Sample Warning (N 未満に ⚠)", minval = 1, gr
 
 grpDisp = "表示"
 displaySide  = input.string("BOTH", "Display Side", options = ["LONG", "SHORT", "BOTH"], group = grpDisp)
+resultRegime = input.string("ALL", "Result Regime", options = ["ALL", "BULL", "BEAR", "RANGE"], group = grpDisp)
 tableSizeStr = input.string("tiny", "文字サイズ", options = ["tiny", "small", "normal"], group = grpDisp)
 showCurrent  = input.bool(true, "現在の5ロジック状態を表示", group = grpDisp)
 
@@ -772,6 +789,43 @@ bool evalOk =
      not na(cHi) and not na(cLo)
 
 // ============================================================
+//  20b. Gold Regime (確定4H足のみ・イベント発生時点で固定)
+// ------------------------------------------------------------
+//  BULL  : 確定4H close > EMA50 かつ EMA50 > EMA50[slope]
+//  BEAR  : 確定4H close < EMA50 かつ EMA50 < EMA50[slope]
+//  RANGE : 上記以外
+//  Regime code : +1 = BULL / 0 = RANGE / -1 = BEAR
+//
+//  非リペイント : 参照TF (4H) コンテキスト内で確定1本前 [1] に固定し、
+//  lookahead_on と組み合わせる。未確定4H足は一切使わない。
+//  Regime code まで 1 本の request 内で計算する (close / EMA / 傾きで
+//  request を分割しない)。これが 18 本目で、V0〜V4 用は増やしていない。
+//
+//  イベント分類は「イベント発生バー時点」の Regime で固定する。
+//  現在バーから 24 本前 (120分前) の成熟イベントを評価しているため
+//  eventRegime = goldRegime[24] を使う。発生後 120 分の途中で Regime が
+//  変化しても、そのイベントは発生時点の環境として集計される。
+//  現在バーの Regime で過去イベントを分類しない。
+// ============================================================
+f_goldRegime(int len, int slopeLen) =>
+    float _e    = ta.ema(close, len)
+    bool  _bull = close > _e and _e > _e[slopeLen]
+    bool  _bear = close < _e and _e < _e[slopeLen]
+    int   _r    = _bull ? 1 : _bear ? -1 : 0
+    _r[1]
+
+int goldRegime = request.security(syminfo.tickerid, regimeTF, f_goldRegime(regimeEmaLen, regimeSlopeLen), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+
+// イベント発生バー時点の Regime (固定)
+int  eventRegime = goldRegime[24]
+bool evRegNa     = na(eventRegime)
+// Regime スライス番号 : 1 = BULL / 2 = BEAR / 3 = RANGE
+//   Regime が na (チャート冒頭の 4H EMA ウォームアップ) の場合は RANGE へ入れる。
+//   → ALL = BULL + BEAR + RANGE を厳密に成立させ、ALL 集計を一切変えないため。
+//   na 件数は診断スロットに別途カウントし、フッターへ表示する。
+int evRegSlot = eventRegime == 1 ? 1 : eventRegime == -1 ? 2 : 3
+
+// ============================================================
 //  21. 集計 (V0〜V4 × 4 Signal class = 最大20カテゴリ)
 // ------------------------------------------------------------
 //  category index = logic * 4 + class
@@ -781,15 +835,33 @@ bool evalOk =
 //    0=N 1=Dir15 2=Dir30 3=Dir60 4=Dir120
 //    5=Cruise1 6=Cruise2 7=Cruise3 8=Cruise4
 //    9=MFE合計 10=MAE合計 11=MFE>MAE件数
+//
+//  slot レイアウト (Regime 別集計)
+//    slot  0〜19 : ALL   (= 従来と完全に同一レイアウト・同一値)
+//    slot 20〜39 : BULL
+//    slot 40〜59 : BEAR
+//    slot 60〜79 : RANGE
+//    slot 80     : 診断用 (field 0 = Regime が na だったイベント件数)
+//  slot = regimeSlice * 20 + category / 配列 index = slot * 12 + field
+//
+//  1 イベントは必ず ALL スライスに 1 回、かつ BULL / BEAR / RANGE の
+//  いずれか 1 スライスだけに 1 回だけ加算される。
+//  → N_ALL = N_BULL + N_BEAR + N_RANGE が構造的に常に成立する。
+//  → ALL スライスへの加算は従来と同一なので ALL 結果は一切変化しない。
 // ============================================================
-var array<float> stats = array.new_float(20 * 12, 0.0)
+var array<float> stats = array.new_float(81 * 12, 0.0)
 
-f_bump(array<float> a, int cat, int fld, float v) =>
-    int _i = cat * 12 + fld
+f_bump(array<float> a, int slot, int fld, float v) =>
+    int _i = slot * 12 + fld
     array.set(a, _i, array.get(a, _i) + v)
 
-f_get(array<float> a, int cat, int fld) =>
-    array.get(a, cat * 12 + fld)
+f_get(array<float> a, int slot, int fld) =>
+    array.get(a, slot * 12 + fld)
+
+// ALL スライスと、イベント発生時点の Regime スライスへ同時に加算する。
+f_bump2(array<float> a, int cat, int fld, float v) =>
+    f_bump(a, cat, fld, v)
+    f_bump(a, evRegSlot * 20 + cat, fld, v)
 
 // 1イベントを1カテゴリへ記録する。
 //   MFE / MAE は選択 Horizon の E+1〜E+H のみを対象とし、最低0へ clamp。
@@ -798,18 +870,21 @@ f_record(array<float> a, int cat, bool ev, bool isLong, float px, float c15, flo
     if ev
         float _mfe = isLong ? math.max(hiH - px, 0.0) : math.max(px - loH, 0.0)
         float _mae = isLong ? math.max(px - loH, 0.0) : math.max(hiH - px, 0.0)
-        f_bump(a, cat, 0,  1.0)
-        f_bump(a, cat, 1,  (isLong ? c15  > px : c15  < px) ? 1.0 : 0.0)
-        f_bump(a, cat, 2,  (isLong ? c30  > px : c30  < px) ? 1.0 : 0.0)
-        f_bump(a, cat, 3,  (isLong ? c60  > px : c60  < px) ? 1.0 : 0.0)
-        f_bump(a, cat, 4,  (isLong ? c120 > px : c120 < px) ? 1.0 : 0.0)
-        f_bump(a, cat, 5,  _mfe >= cruiseL1 ? 1.0 : 0.0)
-        f_bump(a, cat, 6,  _mfe >= cruiseL2 ? 1.0 : 0.0)
-        f_bump(a, cat, 7,  _mfe >= cruiseL3 ? 1.0 : 0.0)
-        f_bump(a, cat, 8,  _mfe >= cruiseL4 ? 1.0 : 0.0)
-        f_bump(a, cat, 9,  _mfe)
-        f_bump(a, cat, 10, _mae)
-        f_bump(a, cat, 11, _mfe > _mae ? 1.0 : 0.0)
+        f_bump2(a, cat, 0,  1.0)
+        f_bump2(a, cat, 1,  (isLong ? c15  > px : c15  < px) ? 1.0 : 0.0)
+        f_bump2(a, cat, 2,  (isLong ? c30  > px : c30  < px) ? 1.0 : 0.0)
+        f_bump2(a, cat, 3,  (isLong ? c60  > px : c60  < px) ? 1.0 : 0.0)
+        f_bump2(a, cat, 4,  (isLong ? c120 > px : c120 < px) ? 1.0 : 0.0)
+        f_bump2(a, cat, 5,  _mfe >= cruiseL1 ? 1.0 : 0.0)
+        f_bump2(a, cat, 6,  _mfe >= cruiseL2 ? 1.0 : 0.0)
+        f_bump2(a, cat, 7,  _mfe >= cruiseL3 ? 1.0 : 0.0)
+        f_bump2(a, cat, 8,  _mfe >= cruiseL4 ? 1.0 : 0.0)
+        f_bump2(a, cat, 9,  _mfe)
+        f_bump2(a, cat, 10, _mae)
+        f_bump2(a, cat, 11, _mfe > _mae ? 1.0 : 0.0)
+        // 診断 : Regime が na だったイベント件数 (RANGE スライスへ入っている分)
+        if evRegNa
+            f_bump(a, 80, 0, 1.0)
 
 // V0
 f_record(stats, 0,  evalOk and v0BiasL[24],   true,  sigPx, out15, out30, out60, out120, cHi, cLo)
@@ -852,6 +927,9 @@ f_logicLabel(int lg) =>
 f_classLabel(int cls) =>
     cls == 0 ? "BIAS L" : cls == 1 ? "STRONG L" : cls == 2 ? "BIAS S" : "STRONG S"
 
+f_regimeText(int r) =>
+    na(r) ? "N/A" : r == 1 ? "BULL" : r == -1 ? "BEAR" : "RANGE"
+
 f_stateText(int s) =>
     s == 1 ? "STRONG LONG" : s == 2 ? "STRONG SHORT" : s == 3 ? "LONG BIAS" : s == 4 ? "SHORT BIAS" : "NONE"
 
@@ -864,8 +942,9 @@ f_avgText(float sum, float den) =>
 f_cell(table t, int col, int row, string txt, color bg, string sz) =>
     table.cell(t, col, row, txt, text_color = color.white, bgcolor = bg, text_size = sz)
 
-f_drawStatRow(table t, int row, int lg, int cls, array<float> a, string sz) =>
-    int   _c = lg * 4 + cls
+// regOff : 0 = ALL / 20 = BULL / 40 = BEAR / 60 = RANGE
+f_drawStatRow(table t, int row, int lg, int cls, int regOff, array<float> a, string sz) =>
+    int   _c = regOff + lg * 4 + cls
     float _n = f_get(a, _c, 0)
     f_cell(t, 0,  row, f_logicLabel(lg), colBase, sz)
     f_cell(t, 1,  row, f_classLabel(cls), colBase, sz)
@@ -886,12 +965,14 @@ f_drawStatRow(table t, int row, int lg, int cls, array<float> a, string sz) =>
 var table labTbl = table.new(position.bottom_right, 14, 22, border_width = 1)
 
 // --- 現在状態ミニテーブル (参考表示・統計とは別) ---
-var table curTbl = table.new(position.top_right, 3, 6, border_width = 1)
+var table curTbl = table.new(position.top_right, 3, 7, border_width = 1)
 
 if barstate.islast
     string _sz = f_textSize(tableSizeStr)
     bool _showL = displaySide == "LONG"  or displaySide == "BOTH"
     bool _showS = displaySide == "SHORT" or displaySide == "BOTH"
+    // Result Regime → slot オフセット (ALL = 従来と同一スライス)
+    int _regOff = resultRegime == "BULL" ? 20 : resultRegime == "BEAR" ? 40 : resultRegime == "RANGE" ? 60 : 0
 
     // ヘッダー
     f_cell(labTbl, 0,  0, "Logic",   colHead, _sz)
@@ -913,22 +994,33 @@ if barstate.islast
     int _row = 1
     for lg = 0 to 4
         if _showL
-            f_drawStatRow(labTbl, _row, lg, 0, stats, _sz)
+            f_drawStatRow(labTbl, _row, lg, 0, _regOff, stats, _sz)
             _row += 1
-            f_drawStatRow(labTbl, _row, lg, 1, stats, _sz)
+            f_drawStatRow(labTbl, _row, lg, 1, _regOff, stats, _sz)
             _row += 1
         if _showS
-            f_drawStatRow(labTbl, _row, lg, 2, stats, _sz)
+            f_drawStatRow(labTbl, _row, lg, 2, _regOff, stats, _sz)
             _row += 1
-            f_drawStatRow(labTbl, _row, lg, 3, stats, _sz)
+            f_drawStatRow(labTbl, _row, lg, 3, _regOff, stats, _sz)
             _row += 1
 
-    // フッター (チャートTF警告 / 検証条件)
+    // Regime partition gate : 20カテゴリすべてで N_ALL == N_BULL + N_BEAR + N_RANGE
+    bool _partitionOk = true
+    for cat = 0 to 19
+        float _nAll = f_get(stats, cat, 0)
+        float _nSum = f_get(stats, 20 + cat, 0) + f_get(stats, 40 + cat, 0) + f_get(stats, 60 + cat, 0)
+        if _nAll != _nSum
+            _partitionOk := false
+
+    // フッター (チャートTF警告 / 検証条件 / Regime / 監査)
     f_cell(labTbl, 0, _row, isFiveMin ? "5m OK" : "5m chart only", colHead, _sz)
     f_cell(labTbl, 1, _row, "Horizon " + cruiseHorizon, colHead, _sz)
     f_cell(labTbl, 2, _row, "Lookback " + str.tostring(lookbackDays) + "d", colHead, _sz)
     f_cell(labTbl, 3, _row, isFiveMin ? "eval = bar-24" : "stats paused", colHead, _sz)
-    for c = 4 to 13
+    f_cell(labTbl, 4, _row, "Regime " + resultRegime, colHead, _sz)
+    f_cell(labTbl, 5, _row, "RegNA " + str.tostring(f_get(stats, 80, 0), "0"), colHead, _sz)
+    f_cell(labTbl, 6, _row, _partitionOk ? "PARTITION OK" : "PARTITION FAIL", colHead, _sz)
+    for c = 7 to 13
         f_cell(labTbl, c, _row, "", colHead, _sz)
 
     // 現在状態ミニテーブル
@@ -951,3 +1043,7 @@ if barstate.islast
         f_cell(curTbl, 0, 5, "V4 Core", colBase, _sz)
         f_cell(curTbl, 1, 5, f_stateText(st4), colBase, _sz)
         f_cell(curTbl, 2, 5, "core:" + str.tostring(v4CoreDir) + " same:" + str.tostring(v4SameConfirm) + " opp:" + str.tostring(v4OppConfirm), colBase, _sz)
+        // 現在の Gold Regime (参考表示のみ・過去イベント分類には使用しない)
+        f_cell(curTbl, 0, 6, "Gold Regime", colHead, _sz)
+        f_cell(curTbl, 1, 6, f_regimeText(goldRegime), colHead, _sz)
+        f_cell(curTbl, 2, 6, regimeTF + " EMA" + str.tostring(regimeEmaLen) + " slope" + str.tostring(regimeSlopeLen), colHead, _sz)
