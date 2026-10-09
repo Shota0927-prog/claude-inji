@@ -597,3 +597,111 @@ if barstate.islast and is5mChart and showStats
     table.cell(gStats, 1, 3, str.tostring(array.size(zoneEng.tracks)), text_color = color.white, bgcolor = color.new(color.gray, 85), text_size = size.small)
     table.cell(gStats, 0, 4, "Boxes",   text_color = color.white, bgcolor = color.new(color.gray, 70), text_size = size.small)
     table.cell(gStats, 1, 4, str.tostring(array.size(gBoxes)), text_color = color.white, bgcolor = color.new(color.gray, 85), text_size = size.small)
+
+// ==== FVG Batch A (begin) =====================================================
+//  FVG (15M / 1H / 4H) の取得・保存・無効化だけ (FVG実装仕様書 v1.0 + A01 + A02 / Batch A)。
+//  ・Zone Engine (zn.*) とは一切接続しない。既存 Zone の Source / Score / Track / Touch / 描画は不変。
+//  ・HTF 値は request 内で各フィールドを [1] にし lookahead_on で取得 = 直前の確定HTF足だけ。
+//    request 内で barstate.isconfirmed は使わない。未確定HTF値は読まない。
+//  ・保存状態は確定5M足でだけ更新する (未確定 tick では何も変えない = ロールバックに依存しない)。
+//  ・Batch A では表示しない (Box / Label / 相互加点は後続 Batch)。
+string FVG_TF15         = "15"
+string FVG_TF60         = "60"
+string FVG_TF240        = "240"
+float  FVG_MIN_WIDTH    = 3.0
+int    FVG_SLOTS_PER_TF = 5
+int    FVG_HOUR_MS      = 3600000
+
+// HTF context で評価。各フィールドの1本前 (= 確定済みの HTF 足) を返す。
+//   dir : +1 上昇FVG / -1 下降FVG / 0 なし
+//   上昇 : low > high[2]  top = low     bottom = high[2]
+//   下降 : high < low[2]  top = low[2]  bottom = high
+//   幅は math.round_to_mintick で最小値幅に正規化して minWidth 以上
+//   戻り値 : [形成足の開始時刻 (イベントキー), 形成足の確定時刻, 確定終値, dir, top, bottom]
+f_fvgConfirmed(float minWidth) =>
+    bool  _bull = low > high[2]
+    bool  _bear = high < low[2]
+    float _top  = _bull ? low : _bear ? low[2] : na
+    float _bot  = _bull ? high[2] : _bear ? high : na
+    int   _dir  = (_bull or _bear) and math.round_to_mintick(_top - _bot) >= minWidth ? (_bull ? 1 : -1) : 0
+    [time[1], time_close[1], close[1], _dir[1], _top[1], _bot[1]]
+
+// 保存: TF ごとに固定 5 スロット (15M = 0-4 / 1H = 5-9 / 4H = 10-14)。var で1回だけ確保。
+var array<float> gFvgTop     = array.new_float(15, na)
+var array<float> gFvgBot     = array.new_float(15, na)
+var array<int>   gFvgDir     = array.new_int(15, 0)
+var array<int>   gFvgOpenT   = array.new_int(15, na)     // 形成足の開始時刻 (= HTF イベントキー)
+var array<int>   gFvgCloseT  = array.new_int(15, na)     // 形成足の確定時刻 (寿命の起点)
+var array<int>   gFvgExpire  = array.new_int(15, na)
+var array<bool>  gFvgAlive   = array.new_bool(15, false)
+var array<int>   gFvgLastKey = array.new_int(3, na)      // TF 別: 処理済みの直近 HTF イベントキー
+var int          gFvgNextExpire = na                     // 生存 FVG の最小 expire 以下の下限 (na = なし)
+
+// 期限切れ: 確定5M足の終了時刻 >= expire で削除。戻り値 = 残りの最小 expire。
+f_fvgExpire(int nowClose) =>
+    int nextExp = na
+    for s = 0 to 3 * FVG_SLOTS_PER_TF - 1
+        if array.get(gFvgAlive, s)
+            int ex = array.get(gFvgExpire, s)
+            if nowClose >= ex
+                array.set(gFvgAlive, s, false)
+            else
+                nextExp := na(nextExp) ? ex : math.min(nextExp, ex)
+    nextExp
+
+// 1 TF 分の HTF 確定イベント処理。新しいイベントキーのときだけ:
+//   完全埋め (この確定足の終値。形成足自身は対象外) -> 新規登録 -> 上限 (空きが無ければ最古を置換)
+//   戻り値 = 新規登録した FVG の expire (登録なしは na)
+f_fvgOnEvent(int tfIdx, int key, int closeT, float htfClose, int dir, float top, float bot, int lifeMs, int nowClose) =>
+    int regExpire = na
+    int lastKey = array.get(gFvgLastKey, tfIdx)
+    if not na(key) and (na(lastKey) or key != lastKey)
+        int base = tfIdx * FVG_SLOTS_PER_TF
+        for k = 0 to FVG_SLOTS_PER_TF - 1
+            int s = base + k
+            if array.get(gFvgAlive, s) and array.get(gFvgOpenT, s) < key
+                int d = array.get(gFvgDir, s)
+                if (d == 1 and htfClose < array.get(gFvgBot, s)) or (d == -1 and htfClose > array.get(gFvgTop, s))
+                    array.set(gFvgAlive, s, false)
+        if dir != 0 and not na(closeT) and nowClose < closeT + lifeMs
+            int slot = -1
+            int oldest = -1
+            for k = 0 to FVG_SLOTS_PER_TF - 1
+                int s = base + k
+                if not array.get(gFvgAlive, s)
+                    if slot < 0
+                        slot := s
+                else if oldest < 0 or array.get(gFvgOpenT, s) < array.get(gFvgOpenT, oldest)
+                    oldest := s
+            if slot < 0
+                slot := oldest
+            array.set(gFvgTop, slot, top)
+            array.set(gFvgBot, slot, bot)
+            array.set(gFvgDir, slot, dir)
+            array.set(gFvgOpenT, slot, key)
+            array.set(gFvgCloseT, slot, closeT)
+            array.set(gFvgExpire, slot, closeT + lifeMs)
+            array.set(gFvgAlive, slot, true)
+            regExpire := closeT + lifeMs
+        array.set(gFvgLastKey, tfIdx, key)
+    regExpire
+
+f_fvgMinExp(int a, int b) =>
+    na(b) ? a : na(a) ? b : math.min(a, b)
+
+if is5mChart
+    [q15T, q15Tc, q15C, q15D, q15Top, q15Bot] = request.security(syminfo.tickerid, FVG_TF15,
+         f_fvgConfirmed(FVG_MIN_WIDTH), lookahead = barmerge.lookahead_on)
+    [q60T, q60Tc, q60C, q60D, q60Top, q60Bot] = request.security(syminfo.tickerid, FVG_TF60,
+         f_fvgConfirmed(FVG_MIN_WIDTH), lookahead = barmerge.lookahead_on)
+    [q240T, q240Tc, q240C, q240D, q240Top, q240Bot] = request.security(syminfo.tickerid, FVG_TF240,
+         f_fvgConfirmed(FVG_MIN_WIDTH), lookahead = barmerge.lookahead_on)
+    // 保存状態の更新は確定5M足だけ。順序: 期限切れ -> 15M -> 1H -> 4H (各: 完全埋め -> 登録 -> 上限)
+    if barstate.isconfirmed
+        int nowClose = time_close
+        if not na(gFvgNextExpire) and nowClose >= gFvgNextExpire
+            gFvgNextExpire := f_fvgExpire(nowClose)
+        gFvgNextExpire := f_fvgMinExp(gFvgNextExpire, f_fvgOnEvent(0, q15T, q15Tc, q15C, q15D, q15Top, q15Bot, 72 * FVG_HOUR_MS, nowClose))
+        gFvgNextExpire := f_fvgMinExp(gFvgNextExpire, f_fvgOnEvent(1, q60T, q60Tc, q60C, q60D, q60Top, q60Bot, 168 * FVG_HOUR_MS, nowClose))
+        gFvgNextExpire := f_fvgMinExp(gFvgNextExpire, f_fvgOnEvent(2, q240T, q240Tc, q240C, q240D, q240Top, q240Bot, 336 * FVG_HOUR_MS, nowClose))
+// ==== FVG Batch A (end) =======================================================

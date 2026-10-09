@@ -4584,15 +4584,42 @@ VIS_GATE = __import__("subprocess").run(["git", "-C", ROOT, "show", VIS_GATE_REV
                                         capture_output=True, text=True).stdout
 
 
+FVG_A_BEGIN = "// ==== FVG Batch A (begin) "
+FVG_A_END = "// ==== FVG Batch A (end) "
+
+
+def vis_split_fvg_a(src):
+    """Split the Visual into (production part, FVG Batch A block, ok, why).
+    Exactly one begin and one end marker, each at the start of a line, begin before end, the block preceded by
+    one blank line. The production part is the file with that single block (and its one separating blank line)
+    removed; everything else must be untouched. Any marker problem -> ok = False (callers FAIL)."""
+    nb = len(re.findall(r"(?m)^" + re.escape(FVG_A_BEGIN), src))
+    ne = len(re.findall(r"(?m)^" + re.escape(FVG_A_END), src))
+    if nb != 1 or ne != 1 or src.count(FVG_A_BEGIN) != 1 or src.count(FVG_A_END) != 1:
+        return src, "", False, f"markers begin={nb} end={ne}"
+    i = src.index(FVG_A_BEGIN)
+    j = src.index(FVG_A_END)
+    if not j > i:
+        return src, "", False, "end marker before begin marker"
+    if src[i - 2:i] != "\n\n":
+        return src, "", False, "begin marker not preceded by a blank line"
+    k = src.find("\n", j)
+    k = len(src) if k < 0 else k + 1
+    return src[:i - 1] + src[k:], src[i:k], True, ""
+
+
+VIS_PROD, VIS_FVG_A, VIS_FVG_A_OK, VIS_FVG_A_WHY = vis_split_fvg_a(VIS_CUR)
+
+
 def fixture_p16_visual_5m_gate():
     pre, cur = VIS, VIS_CUR
     cc = code_only(cur)
     check("P16-01 5M flag = timeframe.isminutes and timeframe.multiplier == 5 (not in_seconds == 300)",
           "bool is5mChart = timeframe.isminutes and timeframe.multiplier == 5" in cc and "in_seconds() == 300" not in cc)
     imp1, imp2 = "import sekine3310/ZoneEnginePractical/1 as zn\n", "import sekine3310/ZoneEnginePractical/2 as zn\n"
-    check("P16-02 5M chart: gated Visual partially evaluated with is5mChart = true == pre-gate Visual (b3b69ae) exactly "
-          "(only the library import version /1 -> /2 differs)",
-          bool(pre) and imp1 in pre and vis_eval_5m(cur).replace(imp2, imp1) == pre)
+    check("P16-02 5M chart: gated Visual (production part = file minus the single FVG Batch A block) partially evaluated "
+          "with is5mChart = true == pre-gate Visual (b3b69ae) exactly (only the library import version /1 -> /2 differs)",
+          VIS_FVG_A_OK and bool(pre) and imp1 in pre and vis_eval_5m(VIS_PROD).replace(imp2, imp1) == pre, VIS_FVG_A_WHY)
     check("P16-03 MA / Swing / Accum source requests only on 5M (if is5mChart and use*Source)",
           all(f"if is5mChart and {x}\n" in cc for x in ("useMaSource", "useHzSource", "useAccSource"))
           and not re.search(r"^if use(Ma|Hz|Acc)Source\n", cc, re.M))
@@ -4611,8 +4638,21 @@ def fixture_p16_visual_5m_gate():
           and cc.count("plot(is5mChart and showMaLines and useMaSource ?") == 2 and cc.count("plot(") == 2
           and len(re.findall(r"\b(box|label|table)\.new\(", cc)) == len(re.findall(r"\b(box|label|table)\.new\(", code_only(pre))))
     req_pre = re.findall(r"request\.security\(.*", code_only(pre))
-    req_cur = re.findall(r"request\.security\(.*", cc)
-    check("P16-08 request expressions / lookahead / TFs unchanged (only wrapped by the gate)", req_pre == req_cur and len(req_cur) == 8)
+    req_prod = re.findall(r"request\.security\(.*", code_only(VIS_PROD))
+    fc = code_only(VIS_FVG_A)
+    fvg_tf = dict(re.findall(r'^string (FVG_TF\w+)\s*=\s*"(\w+)"$', fc, re.M))
+    req_fvg = re.findall(r"request\.security\(syminfo\.tickerid, (\w+),\s*f_fvgConfirmed\(FVG_MIN_WIDTH\), "
+                         r"lookahead = barmerge\.(lookahead_\w+)\)", fc)
+    req_all = re.findall(r"request\.\w+\(", cc)
+    check("P16-08 requests: production part = the 8 existing expressions / lookahead / TFs unchanged (only wrapped by the gate); "
+          "FVG Batch A block = exactly 3 request.security (15 / 60 / 240, f_fvgConfirmed, lookahead_on) and no other request.*; "
+          "whole file = 8 + 3",
+          VIS_FVG_A_OK and req_pre == req_prod and len(req_prod) == 8
+          and len(re.findall(r"request\.\w+\(", fc)) == 3 and len(req_fvg) == 3
+          and [fvg_tf.get(t) for t, _ in req_fvg] == ["15", "60", "240"]
+          and all(la == "lookahead_on" for _, la in req_fvg)
+          and len(req_all) == len(re.findall(r"request\.\w+\(", code_only(VIS_PROD))) + 3 == 11,
+          VIS_FVG_A_WHY or str(req_fvg))
     check("P16-09 inputs / defaults unchanged; library import = Production ZoneEnginePractical/2 (only import line changed)",
           parse_inputs(cur) == parse_inputs(pre) and re.findall(r"^import .*$", cc, re.M) == ["import sekine3310/ZoneEnginePractical/2 as zn"])
     # non-5M mirror: every gated item is skipped
@@ -4842,9 +4882,10 @@ def _strip_str_all(t):
 # ============================================================================
 def fixture_vis_5m_production():
     cc = code_only(VIS_CUR)
-    check("VIS-5M-01 ZoneVisualPractical.pine == d240ec0 byte-for-byte (5M Zone count / top / bottom / score / strength / "
-          "state / touch / srcMask / Break / Flip / Track / Lifetime / Day H/L / drawOrder unchanged)",
-          bool(VIS_GATE) and VIS_CUR == VIS_GATE)
+    check("VIS-5M-01 ZoneVisualPractical.pine production part (file minus the single FVG Batch A block) == d240ec0 "
+          "byte-for-byte (5M Zone count / top / bottom / score / strength / state / touch / srcMask / Break / Flip / Track / "
+          "Lifetime / Day H/L / drawOrder unchanged); markers missing / duplicated / out of order -> FAIL",
+          VIS_FVG_A_OK and bool(VIS_GATE) and VIS_PROD == VIS_GATE, VIS_FVG_A_WHY)
     check("VIS-5M-02 import = sekine3310/ZoneEnginePractical/2 only (/4 not used by the Visual)",
           re.findall(r"^import .*$", cc, re.M) == ["import sekine3310/ZoneEnginePractical/2 as zn"])
     check("VIS-5M-03 no MTF code: no Engine Start Time / Parity Mode / AUTH_TF / AuthGuard / f_auth* / security_lower_tf / Authority fields",
