@@ -20,6 +20,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nr_s1_build as nb              # noqa: E402
 import fvg_re10045_sim as fr          # noqa: E402
+import nr_a1_build as na              # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
@@ -47,10 +48,11 @@ BC = code_only(BLK)
 # S : static
 # ============================================================================
 def gate_static():
-    check("S-01 current Visual == nrs_transform(5758a61) exactly (one NR-S1 block + the 2 Swing #2 / #3 request lines)",
-          bool(BASE) and nb.nrs_transform(BASE) == CUR)
-    rest = nb.cut_block(CUR, nb.NRS_BEGIN, nb.NRS_END)
-    check("S-02 removing the NR-S1 block and reverting the 2 edits gives 5758a61 byte-for-byte (nothing else changed: Swing #1, "
+    check("S-01 current Visual == nra_transform(nrs_transform(5758a61)) exactly (one NR-S1 block + the 2 Swing #2 / #3 "
+          "request lines; then the NR-A1 Accum transform)",
+          bool(BASE) and na.nra_transform(nb.nrs_transform(BASE)) == CUR)
+    rest = nb.cut_block(na.strip_nra(CUR), nb.NRS_BEGIN, nb.NRS_END)
+    check("S-02 removing the NR-A1 and NR-S1 blocks and reverting their edits gives 5758a61 byte-for-byte (nothing else changed: Swing #1, "
           "Accum, MA, Break, ZoneFeed, zn.update, FVG A / B / C, drawing)",
           rest is not None and nb.revert_nrs_edits(rest) == BASE)
     check("S-03 NR-S1 block placed immediately before the Swing source declarations",
@@ -71,8 +73,11 @@ def gate_static():
           and "    [_h1, _h1t, _l1, _l1t] = request.security(syminfo.tickerid, hzTf1, zn.pivotPack(pivLen1), lookahead = barmerge.lookahead_off)" in cc)
     check("S-07 no barstate in the NR-S1 block (nothing depends on barstate.isconfirmed inside a request)", "barstate" not in BC)
     check("S-08 RE10045 lint clean for the NR-S1 block; no array access", fr.lint_eager_guards(BC) == [] and "array." not in BC)
-    check("S-09 request call sites unchanged in number (2 Swing lines moved into the block: 11 total)",
-          len(re.findall(r"request\.\w+\(", cc)) == len(re.findall(r"request\.\w+\(", code_only(BASE))) == 11)
+    check("S-09 request call sites: 2 Swing lines moved into the NR-S1 block (11 at 5758a61); NR-A1 then turns the 3 Accum "
+          "requests into 2 call sites in its block (10 total)",
+          len(re.findall(r"request\.\w+\(", code_only(BASE))) == 11
+          and len(re.findall(r"request\.\w+\(", code_only(na.strip_nra(CUR) or ""))) == 11
+          and len(re.findall(r"request\.\w+\(", cc)) == 10)
     check("S-10 inputs / defaults unchanged (no input added / modified)",
           re.findall(r"^\w+\s*=\s*input\..*$", CUR, re.M) == re.findall(r"^\w+\s*=\s*input\..*$", BASE, re.M))
     eng = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", nb.NRS_BASE_REV, "--",

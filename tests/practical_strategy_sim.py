@@ -4594,6 +4594,7 @@ import sys as _sys                                                         # noq
 _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fvg_batch_c_build as fvg_c                                          # noqa: E402
 import nr_s1_build as nrs                                                  # noqa: E402
+import nr_a1_build as nra                                                  # noqa: E402
 
 
 def _fvg_cut(src, begin, end):
@@ -4619,16 +4620,17 @@ def vis_split_fvg(src):
     """Split the Visual into (production part, Batch A block, Batch B block, Batch C block, ok, why).
     Exactly one block each of A, C, B, in the order A < C < B (A end before C begin, C end before B begin).
     The production part is the file with exactly those three blocks removed; any marker problem -> ok = False."""
-    marks = [nrs.NRS_BEGIN, nrs.NRS_END, FVG_A_BEGIN, FVG_A_END, FVG_C_BEGIN, FVG_C_END, FVG_B_BEGIN, FVG_B_END]
+    marks = [nrs.NRS_BEGIN, nrs.NRS_END, nra.NRA_BEGIN, nra.NRA_END, FVG_A_BEGIN, FVG_A_END, FVG_C_BEGIN, FVG_C_END,
+             FVG_B_BEGIN, FVG_B_END]
     counts = [src.count(m_) for m_ in marks]
-    if counts != [1] * 8:
-        return src, "", "", "", False, "NR-S1 / FVG markers NRS/A/C/B begin/end counts = " + str(counts)
+    if counts != [1] * 10:
+        return src, "", "", "", False, "NR-S1 / NR-A1 / FVG markers NRS/NRA/A/C/B begin/end counts = " + str(counts)
     pos = [src.index(m_) for m_ in marks]
     if pos != sorted(pos):
-        return src, "", "", "", False, "markers out of order (expected NRS < A < C < B, each begin < end)"
-    src_ = nrs.cut_block(src, nrs.NRS_BEGIN, nrs.NRS_END)
+        return src, "", "", "", False, "markers out of order (expected NRS < NRA < A < C < B, each begin < end)"
+    src_ = nrs.cut_block(nra.cut_block(src, nra.NRA_BEGIN, nra.NRA_END), nrs.NRS_BEGIN, nrs.NRS_END)
     if src_ is None:
-        return src, "", "", "", False, "NR-S1 block not removable (begin marker not preceded by a blank line)"
+        return src, "", "", "", False, "NR-S1 / NR-A1 block not removable (begin marker not preceded by a blank line)"
     rest, blk_b, ok_b, why_b = _fvg_cut(src_, FVG_B_BEGIN, FVG_B_END)
     if not ok_b:
         return src, "", "", "", False, why_b
@@ -4645,7 +4647,7 @@ def vis_prod_reverted(prod):
     """production part with the Batch C draw-loop edits and the NR-S1 Swing #2 / #3 edits reverted (each must be
     present exactly once), else None."""
     try:
-        return nrs.revert_nrs_edits(fvg_c.revert_prod_edits(prod))
+        return nra.revert_nra_edits(nrs.revert_nrs_edits(fvg_c.revert_prod_edits(prod)))
     except AssertionError:
         return None
 
@@ -4654,6 +4656,8 @@ VIS_PROD, VIS_FVG_A, VIS_FVG_B, VIS_FVG_C, VIS_FVG_A_OK, VIS_FVG_A_WHY = vis_spl
 VIS_PROD_BASE = vis_prod_reverted(VIS_PROD) if VIS_FVG_A_OK else None
 VIS_NRS = VIS_CUR[VIS_CUR.index(nrs.NRS_BEGIN):VIS_CUR.index("\n", VIS_CUR.index(nrs.NRS_END)) + 1] \
     if VIS_CUR.count(nrs.NRS_BEGIN) == 1 and VIS_CUR.count(nrs.NRS_END) == 1 else ""
+VIS_NRA = VIS_CUR[VIS_CUR.index(nra.NRA_BEGIN):VIS_CUR.index("\n", VIS_CUR.index(nra.NRA_END)) + 1] \
+    if VIS_CUR.count(nra.NRA_BEGIN) == 1 and VIS_CUR.count(nra.NRA_END) == 1 else ""
 
 
 def fixture_p16_visual_5m_gate():
@@ -4662,7 +4666,7 @@ def fixture_p16_visual_5m_gate():
     check("P16-01 5M flag = timeframe.isminutes and timeframe.multiplier == 5 (not in_seconds == 300)",
           "bool is5mChart = timeframe.isminutes and timeframe.multiplier == 5" in cc and "in_seconds() == 300" not in cc)
     imp1, imp2 = "import sekine3310/ZoneEnginePractical/1 as zn\n", "import sekine3310/ZoneEnginePractical/2 as zn\n"
-    check("P16-02 5M chart: gated Visual (production part = file minus the NR-S1 / FVG A / C / B blocks, NR-S1 + Batch C edits reverted) partially evaluated "
+    check("P16-02 5M chart: gated Visual (production part = file minus the NR-S1 / NR-A1 / FVG A / C / B blocks, NR-S1 + NR-A1 + Batch C edits reverted) partially evaluated "
           "with is5mChart = true == pre-gate Visual (b3b69ae) exactly (only the library import version /1 -> /2 differs)",
           VIS_FVG_A_OK and VIS_PROD_BASE is not None and bool(pre) and imp1 in pre
           and vis_eval_5m(VIS_PROD_BASE).replace(imp2, imp1) == pre, VIS_FVG_A_WHY)
@@ -4700,18 +4704,23 @@ def fixture_p16_visual_5m_gate():
     req_all = re.findall(r"request\.\w+\(", cc)
     check("P16-08 requests: production part (NR-S1 Swing #2 / #3 edits reverted) = the 8 existing expressions / lookahead / "
           "TFs unchanged; NR-S1 block = exactly 2 (HTF: f_nrsPivotConfirmed + lookahead_on / same-or-lower TF: the original "
-          "zn.pivotPack + lookahead_off), called only for Swing #2 / #3; FVG Batch A block = exactly 3 request.security "
-          "(15 / 60 / 240, f_fvgConfirmed, lookahead_on) and no other request.*; whole file = 6 + 2 + 3",
+          "zn.pivotPack + lookahead_off), called only for Swing #2 / #3; NR-A1 block = exactly 2 (HTF: f_nraAccumConfirmed + lookahead_on / "
+          "same-or-lower TF: the original zn.accumPack + lookahead_off), called only for Accum #1-3; FVG Batch A block = exactly 3 request.security "
+          "(15 / 60 / 240, f_fvgConfirmed, lookahead_on) and no other request.*; whole file = 3 + 2 + 2 + 3",
           VIS_FVG_A_OK and req_pre == req_prod and len(req_prod) == 8
           and req_nrs == ["request.security(syminfo.tickerid, tf, f_nrsPivotConfirmed(len), lookahead = barmerge.lookahead_on)",
                           "request.security(syminfo.tickerid, tf, zn.pivotPack(len), lookahead = barmerge.lookahead_off)"]
           and code_only(VIS_PROD).count("f_nrsSwing(") == 2 and "= f_nrsSwing(hzTf2, pivLen2)" in code_only(VIS_PROD)
           and "= f_nrsSwing(hzTf3, pivLen3)" in code_only(VIS_PROD)
           and "request.security(syminfo.tickerid, hzTf1, zn.pivotPack(pivLen1), lookahead = barmerge.lookahead_off)" in code_only(VIS_PROD)
+          and len(re.findall(r"request\.security\(", code_only(VIS_NRA))) == 2
+          and "f_nraAccumConfirmed(usePorted, rangeLen, baseLen, atrLen,\n             minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax, provLen, provMult), lookahead = barmerge.lookahead_on)" in VIS_NRA
+          and "zn.accumPack(usePorted, rangeLen, baseLen, atrLen,\n             minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax, provLen, provMult), lookahead = barmerge.lookahead_off)" in VIS_NRA
+          and [code_only(VIS_PROD).count(f"= f_nraAccum(accTf{n},") for n in (1, 2, 3)] == [1, 1, 1]
           and len(re.findall(r"request\.\w+\(", fc)) == 3 and len(req_fvg) == 3
           and [fvg_tf.get(t) for t, _ in req_fvg] == ["15", "60", "240"]
           and all(la == "lookahead_on" for _, la in req_fvg)
-          and len(req_all) == len(re.findall(r"request\.\w+\(", code_only(VIS_PROD))) + 2 + 3 == 11,
+          and len(req_all) == len(re.findall(r"request\.\w+\(", code_only(VIS_PROD))) + 2 + 2 + 3 == 10,
           VIS_FVG_A_WHY or str(req_fvg))
     check("P16-09 inputs / defaults unchanged; library import = Production ZoneEnginePractical/2 (only import line changed)",
           parse_inputs(cur) == parse_inputs(pre) and re.findall(r"^import .*$", cc, re.M) == ["import sekine3310/ZoneEnginePractical/2 as zn"])
@@ -4942,10 +4951,10 @@ def _strip_str_all(t):
 # ============================================================================
 def fixture_vis_5m_production():
     cc = code_only(VIS_CUR)
-    check("VIS-5M-01 ZoneVisualPractical.pine production part (file minus the NR-S1 / FVG A / C / B blocks) == d240ec0 with exactly the "
-          "NR-S1 Swing #2 / #3 edits + Batch C draw-loop edits (display Strength / Score; Engine calls, sources, state untouched) byte-for-byte; "
+    check("VIS-5M-01 ZoneVisualPractical.pine production part (file minus the NR-S1 / NR-A1 / FVG A / C / B blocks) == d240ec0 with exactly the "
+          "NR-S1 Swing #2 / #3 edits + NR-A1 Accum #1-3 edits + Batch C draw-loop edits (display Strength / Score; Engine calls, sources, state untouched) byte-for-byte; "
           "markers missing / duplicated / out of order -> FAIL",
-          VIS_FVG_A_OK and bool(VIS_GATE) and VIS_PROD == nrs.apply_nrs_edits(fvg_c.apply_prod_edits(VIS_GATE))
+          VIS_FVG_A_OK and bool(VIS_GATE) and VIS_PROD == nra.apply_nra_edits(nrs.apply_nrs_edits(fvg_c.apply_prod_edits(VIS_GATE)))
           and VIS_PROD_BASE == VIS_GATE,
           VIS_FVG_A_WHY)
     check("VIS-5M-02 import = sekine3310/ZoneEnginePractical/2 only (/4 not used by the Visual)",

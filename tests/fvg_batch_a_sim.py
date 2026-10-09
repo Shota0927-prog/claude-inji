@@ -70,6 +70,8 @@ def _strict_cut(src, begin, end):
 
 REST = CUR
 import nr_s1_build as _nb                                                  # noqa: E402
+import nr_a1_build as _na                                                  # noqa: E402
+REST = _na.strip_nra(REST)
 for _b2, _e2 in ((_cb.B_BEGIN, _cb.B_END), (_cb.C_BEGIN, _cb.C_END), (_cb.A_BEGIN, _cb.A_END), (_nb.NRS_BEGIN, _nb.NRS_END)):
     REST = _strict_cut(REST, _b2, _e2) if REST is not None else None
 try:
@@ -83,7 +85,7 @@ BC = code_only(BLOCK)
 # A1 / A4 : static
 # ============================================================================
 def gate_static():
-    check("A1-01 Visual outside the NR-S1 / FVG A / B / C blocks (NR-S1 + Batch C edits reverted) == d240ec0 byte-for-byte (MA / Swing / Accum / Break / ZoneFeed / "
+    check("A1-01 Visual outside the NR-A1 / NR-S1 / FVG A / B / C blocks (their edits reverted) == d240ec0 byte-for-byte (MA / Swing / Accum / Break / ZoneFeed / "
           "zn.update / drawing / Stats / inputs unchanged)", bool(BASE) and bool(BLOCK) and REST == BASE)
     check("A1-02 FVG Batch A is a single block placed immediately before the DISPLAY section banner (moved there by Batch C; "
           "content checked by A1-01 / B1-01)",
@@ -98,7 +100,7 @@ def gate_static():
     check("A1-03 Engine / SignalEngine / Strategies / Harness unchanged vs 31416a1; Visual import still /2",
           eng == "" and eh == "" and re.findall(r"^import .*$", code_only(CUR), re.M) == ["import sekine3310/ZoneEnginePractical/2 as zn"],
           eng + eh)
-    req_cur = re.findall(r"request\.security(?:_lower_tf)?\(", code_only(CUR))
+    req_cur = re.findall(r"request\.security(?:_lower_tf)?\(", code_only(_na.strip_nra(CUR) or ""))   # NR-A1 counted in nr_a1_sim
     req_base = re.findall(r"request\.security(?:_lower_tf)?\(", code_only(BASE))
     req_blk = re.findall(r"request\.security\(syminfo\.tickerid, (FVG_TF\w+),\s*f_fvgConfirmed\(FVG_MIN_WIDTH\), "
                          r"lookahead = barmerge\.lookahead_on\)", BC)

@@ -23,6 +23,7 @@ import fvg_batch_b_sim as fb          # noqa: E402
 import fvg_batch_c_build as cb        # noqa: E402
 import fvg_re10045_sim as fr          # noqa: E402
 import nr_s1_build as nb              # noqa: E402
+import nr_a1_build as na              # noqa: E402
 
 ROOT = fa.ROOT
 CUR = fa.CUR
@@ -56,8 +57,8 @@ CC = code_only(CBLK)
 # ============================================================================
 def gate_static():
     check("C0-01 current Visual == nrs_transform(c_transform(90f29a7)) exactly (A moved unchanged, C inserted, 4 draw-loop "
-          "edits, 7 Batch B edits; then NR-S1 block + 2 Swing edits)",
-          bool(BASE_C) and nb.nrs_transform(cb.c_transform(BASE_C)) == CUR)
+          "edits, 7 Batch B edits; then NR-S1 block + 2 Swing edits; then NR-A1 block + 3 Accum edits)",
+          bool(BASE_C) and na.nra_transform(nb.nrs_transform(cb.c_transform(BASE_C))) == CUR)
     check("C0-02 Batch A block content byte-identical to 90f29a7 (only its position changed: before the DISPLAY banner)",
           blk(CUR, cb.A_BEGIN, cb.A_END) == blk(BASE_C, cb.A_BEGIN, cb.A_END) != ""
           and (blk(CUR, cb.A_BEGIN, cb.A_END) + "\n" + cb.DISPLAY_BANNER) in CUR)
@@ -66,8 +67,8 @@ def gate_static():
           [CUR.count(m) for m in marks] == [1] * 6 and [CUR.index(m) for m in marks] == sorted(CUR.index(m) for m in marks)
           and (CBLK + "\n" + cb.DRAW_ANCHOR) in CUR)
     prod, _, _, ok = fb.split(CUR)
-    prod = nb.cut_block(prod, nb.NRS_BEGIN, nb.NRS_END) if ok else None
-    check("C0-04 production part (NR-S1 / A / C / B removed) == d240ec0 + exactly the 4 draw-loop edits + 2 NR-S1 Swing edits; "
+    prod = nb.cut_block(na.strip_nra(prod), nb.NRS_BEGIN, nb.NRS_END) if ok else None
+    check("C0-04 production part (NR-A1 / NR-S1 / A / C / B removed, NR-A1 edits reverted) == d240ec0 + exactly the 4 draw-loop edits + 2 NR-S1 Swing edits; "
           "reverting them gives d240ec0",
           prod is not None and prod == nb.apply_nrs_edits(cb.apply_prod_edits(fa.BASE))
           and cb.revert_prod_edits(nb.revert_nrs_edits(prod)) == fa.BASE)
@@ -119,8 +120,8 @@ def gate_static():
                                     "string bs = z.state == ST_BROKEN ? line.style_dashed : line.style_solid",
                                     "box.set_lefttop(b, xL, z.top)", "box.set_rightbottom(b, xR, z.bottom)")))
     allc = code_only(CUR)
-    check("C4-01 no new request (same request.* count as 90f29a7) and none in the C block",
-          len(re.findall(r"request\.\w+\(", allc)) == len(re.findall(r"request\.\w+\(", code_only(BASE_C)))
+    check("C4-01 Batch C adds no request (count without the NR-A1 changes == 90f29a7) and none in the C block",
+          len(re.findall(r"request\.\w+\(", code_only(na.strip_nra(CUR) or ""))) == len(re.findall(r"request\.\w+\(", code_only(BASE_C)))
           and not re.search(r"request\.\w+\(", CC))
     check("C4-02 no allocation / sort / loop over history in C (no array.new / sort / copy, no [n] history)",
           not re.search(r"array\.(new|sort|copy)|sort_indices", CC) and not re.search(r"\w\[\d+\]", CC))

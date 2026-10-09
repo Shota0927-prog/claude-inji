@@ -99,8 +99,9 @@ def gate_static():
     check("B3-01 strict markers: one Batch A block, one Batch B block, A before B, each preceded by a blank line",
           SPLIT_OK and CUR.index(A_END) < CUR.index(B_BEGIN))
     import nr_s1_build as nb
-    prod_n = nb.cut_block(PROD, nb.NRS_BEGIN, nb.NRS_END)
-    check("B3-02 production part (file minus the NR-S1 / A / C / B blocks) == d240ec0 with exactly the NR-S1 Swing #2 / #3 "
+    import nr_a1_build as na
+    prod_n = nb.cut_block(na.strip_nra(PROD), nb.NRS_BEGIN, nb.NRS_END)
+    check("B3-02 production part (file minus the NR-A1 / NR-S1 / A / C / B blocks, NR-A1 edits reverted) == d240ec0 with exactly the NR-S1 Swing #2 / #3 "
           "edits + Batch C draw-loop edits",
           SPLIT_OK and prod_n is not None and prod_n == nb.apply_nrs_edits(cb.apply_prod_edits(BASE)))
     _, a_e390, ok_e = split_a_only(A_AT_E390_FIXED)
