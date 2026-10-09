@@ -69,10 +69,11 @@ def _strict_cut(src, begin, end):
 
 
 REST = CUR
-for _b2, _e2 in ((_cb.B_BEGIN, _cb.B_END), (_cb.C_BEGIN, _cb.C_END), (_cb.A_BEGIN, _cb.A_END)):
+import nr_s1_build as _nb                                                  # noqa: E402
+for _b2, _e2 in ((_cb.B_BEGIN, _cb.B_END), (_cb.C_BEGIN, _cb.C_END), (_cb.A_BEGIN, _cb.A_END), (_nb.NRS_BEGIN, _nb.NRS_END)):
     REST = _strict_cut(REST, _b2, _e2) if REST is not None else None
 try:
-    REST = _cb.revert_prod_edits(REST) if REST is not None else ""
+    REST = _nb.revert_nrs_edits(_cb.revert_prod_edits(REST)) if REST is not None else ""
 except AssertionError:
     REST = ""
 BC = code_only(BLOCK)
@@ -82,7 +83,7 @@ BC = code_only(BLOCK)
 # A1 / A4 : static
 # ============================================================================
 def gate_static():
-    check("A1-01 Visual outside the FVG A / B / C blocks (Batch C draw-loop edits reverted) == d240ec0 byte-for-byte (MA / Swing / Accum / Break / ZoneFeed / "
+    check("A1-01 Visual outside the NR-S1 / FVG A / B / C blocks (NR-S1 + Batch C edits reverted) == d240ec0 byte-for-byte (MA / Swing / Accum / Break / ZoneFeed / "
           "zn.update / drawing / Stats / inputs unchanged)", bool(BASE) and bool(BLOCK) and REST == BASE)
     check("A1-02 FVG Batch A is a single block placed immediately before the DISPLAY section banner (moved there by Batch C; "
           "content checked by A1-01 / B1-01)",

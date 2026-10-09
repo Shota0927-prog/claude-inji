@@ -22,6 +22,7 @@ import fvg_batch_a_sim as fa          # noqa: E402
 import fvg_batch_b_sim as fb          # noqa: E402
 import fvg_batch_c_build as cb        # noqa: E402
 import fvg_re10045_sim as fr          # noqa: E402
+import nr_s1_build as nb              # noqa: E402
 
 ROOT = fa.ROOT
 CUR = fa.CUR
@@ -54,8 +55,9 @@ CC = code_only(CBLK)
 # C0 / C4 : static
 # ============================================================================
 def gate_static():
-    check("C0-01 current Visual == c_transform(90f29a7) exactly (A moved unchanged, C inserted, 4 draw-loop edits, 7 Batch B edits)",
-          bool(BASE_C) and cb.c_transform(BASE_C) == CUR)
+    check("C0-01 current Visual == nrs_transform(c_transform(90f29a7)) exactly (A moved unchanged, C inserted, 4 draw-loop "
+          "edits, 7 Batch B edits; then NR-S1 block + 2 Swing edits)",
+          bool(BASE_C) and nb.nrs_transform(cb.c_transform(BASE_C)) == CUR)
     check("C0-02 Batch A block content byte-identical to 90f29a7 (only its position changed: before the DISPLAY banner)",
           blk(CUR, cb.A_BEGIN, cb.A_END) == blk(BASE_C, cb.A_BEGIN, cb.A_END) != ""
           and (blk(CUR, cb.A_BEGIN, cb.A_END) + "\n" + cb.DISPLAY_BANNER) in CUR)
@@ -64,8 +66,11 @@ def gate_static():
           [CUR.count(m) for m in marks] == [1] * 6 and [CUR.index(m) for m in marks] == sorted(CUR.index(m) for m in marks)
           and (CBLK + "\n" + cb.DRAW_ANCHOR) in CUR)
     prod, _, _, ok = fb.split(CUR)
-    check("C0-04 production part (A / C / B removed) == d240ec0 + exactly the 4 draw-loop edits; reverting them gives d240ec0",
-          ok and prod == cb.apply_prod_edits(fa.BASE) and cb.revert_prod_edits(prod) == fa.BASE)
+    prod = nb.cut_block(prod, nb.NRS_BEGIN, nb.NRS_END) if ok else None
+    check("C0-04 production part (NR-S1 / A / C / B removed) == d240ec0 + exactly the 4 draw-loop edits + 2 NR-S1 Swing edits; "
+          "reverting them gives d240ec0",
+          prod is not None and prod == nb.apply_nrs_edits(cb.apply_prod_edits(fa.BASE))
+          and cb.revert_prod_edits(nb.revert_nrs_edits(prod)) == fa.BASE)
     eng = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", cb.C_BASE_REV, "--",
                           "ZoneEnginePractical.pine", "ZoneEnginePracticalAuthority.pine", "SignalEnginePractical.pine",
                           "PracticalZoneStrategy_LONG.pine", "PracticalZoneStrategy_SHORT.pine"]

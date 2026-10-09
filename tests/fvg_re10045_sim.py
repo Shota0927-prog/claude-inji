@@ -34,9 +34,10 @@ def check(name, ok, detail=""):
 
 
 def fvg_blocks(src):
-    """Batch A + Batch B + Batch C block text (code only)."""
+    """Batch A + Batch B + Batch C + NR-S1 block text (code only)."""
     out = []
-    for b, e in ((fb.A_BEGIN, fb.A_END), (fb.B_BEGIN, fb.B_END), (fb.C_BEGIN, fb.C_END)):
+    for b, e in ((fb.A_BEGIN, fb.A_END), (fb.B_BEGIN, fb.B_END), (fb.C_BEGIN, fb.C_END),
+                 ("// ==== NR-S1 Swing (begin) ", "// ==== NR-S1 Swing (end) ")):
         if src.count(b) == 1 and src.count(e) == 1:
             out.append(src[src.index(b):src.index(e)])
     return fa.code_only("\n".join(out))
