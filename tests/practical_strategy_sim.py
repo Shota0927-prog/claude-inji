@@ -4588,6 +4588,11 @@ FVG_A_BEGIN = "// ==== FVG Batch A (begin) "
 FVG_A_END = "// ==== FVG Batch A (end) "
 FVG_B_BEGIN = "// ==== FVG Batch B (begin) "
 FVG_B_END = "// ==== FVG Batch B (end) "
+FVG_C_BEGIN = "// ==== FVG Batch C (begin) "
+FVG_C_END = "// ==== FVG Batch C (end) "
+import sys as _sys                                                         # noqa: E402
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fvg_batch_c_build as fvg_c                                          # noqa: E402
 
 
 def _fvg_cut(src, begin, end):
@@ -4610,25 +4615,38 @@ def _fvg_cut(src, begin, end):
 
 
 def vis_split_fvg(src):
-    """Split the Visual into (production part, Batch A block, Batch B block, ok, why).
-    Exactly one Batch A block and one Batch B block, in the order A then B (A end before B begin). The production
-    part is the file with exactly those two blocks removed; any marker problem -> ok = False (callers FAIL)."""
-    marks = [FVG_A_BEGIN, FVG_A_END, FVG_B_BEGIN, FVG_B_END]
+    """Split the Visual into (production part, Batch A block, Batch B block, Batch C block, ok, why).
+    Exactly one block each of A, C, B, in the order A < C < B (A end before C begin, C end before B begin).
+    The production part is the file with exactly those three blocks removed; any marker problem -> ok = False."""
+    marks = [FVG_A_BEGIN, FVG_A_END, FVG_C_BEGIN, FVG_C_END, FVG_B_BEGIN, FVG_B_END]
     counts = [src.count(m_) for m_ in marks]
-    if counts != [1, 1, 1, 1]:
-        return src, "", "", False, "FVG markers A/B begin/end counts = " + str(counts)
-    if not src.index(FVG_A_BEGIN) < src.index(FVG_A_END) < src.index(FVG_B_BEGIN) < src.index(FVG_B_END):
-        return src, "", "", False, "FVG markers out of order (expected A begin < A end < B begin < B end)"
+    if counts != [1, 1, 1, 1, 1, 1]:
+        return src, "", "", "", False, "FVG markers A/C/B begin/end counts = " + str(counts)
+    pos = [src.index(m_) for m_ in marks]
+    if pos != sorted(pos):
+        return src, "", "", "", False, "FVG markers out of order (expected A begin < A end < C begin < C end < B begin < B end)"
     rest, blk_b, ok_b, why_b = _fvg_cut(src, FVG_B_BEGIN, FVG_B_END)
     if not ok_b:
-        return src, "", "", False, why_b
+        return src, "", "", "", False, why_b
+    rest, blk_c, ok_c, why_c = _fvg_cut(rest, FVG_C_BEGIN, FVG_C_END)
+    if not ok_c:
+        return src, "", "", "", False, why_c
     prod, blk_a, ok_a, why_a = _fvg_cut(rest, FVG_A_BEGIN, FVG_A_END)
     if not ok_a:
-        return src, "", "", False, why_a
-    return prod, blk_a, blk_b, True, ""
+        return src, "", "", "", False, why_a
+    return prod, blk_a, blk_b, blk_c, True, ""
 
 
-VIS_PROD, VIS_FVG_A, VIS_FVG_B, VIS_FVG_A_OK, VIS_FVG_A_WHY = vis_split_fvg(VIS_CUR)
+def vis_prod_reverted(prod):
+    """production part with the Batch C draw-loop edits reverted (each must be present exactly once), else None."""
+    try:
+        return fvg_c.revert_prod_edits(prod)
+    except AssertionError:
+        return None
+
+
+VIS_PROD, VIS_FVG_A, VIS_FVG_B, VIS_FVG_C, VIS_FVG_A_OK, VIS_FVG_A_WHY = vis_split_fvg(VIS_CUR)
+VIS_PROD_BASE = vis_prod_reverted(VIS_PROD) if VIS_FVG_A_OK else None
 
 
 def fixture_p16_visual_5m_gate():
@@ -4637,9 +4655,10 @@ def fixture_p16_visual_5m_gate():
     check("P16-01 5M flag = timeframe.isminutes and timeframe.multiplier == 5 (not in_seconds == 300)",
           "bool is5mChart = timeframe.isminutes and timeframe.multiplier == 5" in cc and "in_seconds() == 300" not in cc)
     imp1, imp2 = "import sekine3310/ZoneEnginePractical/1 as zn\n", "import sekine3310/ZoneEnginePractical/2 as zn\n"
-    check("P16-02 5M chart: gated Visual (production part = file minus the single FVG Batch A and Batch B blocks) partially evaluated "
+    check("P16-02 5M chart: gated Visual (production part = file minus the FVG A / C / B blocks, Batch C draw-loop edits reverted) partially evaluated "
           "with is5mChart = true == pre-gate Visual (b3b69ae) exactly (only the library import version /1 -> /2 differs)",
-          VIS_FVG_A_OK and bool(pre) and imp1 in pre and vis_eval_5m(VIS_PROD).replace(imp2, imp1) == pre, VIS_FVG_A_WHY)
+          VIS_FVG_A_OK and VIS_PROD_BASE is not None and bool(pre) and imp1 in pre
+          and vis_eval_5m(VIS_PROD_BASE).replace(imp2, imp1) == pre, VIS_FVG_A_WHY)
     check("P16-03 MA / Swing / Accum source requests only on 5M (if is5mChart and use*Source)",
           all(f"if is5mChart and {x}\n" in cc for x in ("useMaSource", "useHzSource", "useAccSource"))
           and not re.search(r"^if use(Ma|Hz|Acc)Source\n", cc, re.M))
@@ -4659,6 +4678,7 @@ def fixture_p16_visual_5m_gate():
           and VIS_FVG_A_OK
           and len(re.findall(r"\b(box|label|table)\.new\(", code_only(VIS_PROD))) == len(re.findall(r"\b(box|label|table)\.new\(", code_only(pre)))
           and re.findall(r"\b(box|label|table|line)\.new\(", code_only(VIS_FVG_A)) == []
+          and re.findall(r"\b(box|label|table|line)\.new\(", code_only(VIS_FVG_C)) == []
           and re.findall(r"\b(box|label|table|line)\.new\(", code_only(VIS_FVG_B)) == ["box", "label"]
           and len(re.findall(r"\b(box|label|table)\.new\(", cc)) == len(re.findall(r"\b(box|label|table)\.new\(", code_only(pre))) + 2,
           VIS_FVG_A_WHY)
@@ -4907,10 +4927,11 @@ def _strip_str_all(t):
 # ============================================================================
 def fixture_vis_5m_production():
     cc = code_only(VIS_CUR)
-    check("VIS-5M-01 ZoneVisualPractical.pine production part (file minus the single FVG Batch A and Batch B blocks) == d240ec0 "
-          "byte-for-byte (5M Zone count / top / bottom / score / strength / state / touch / srcMask / Break / Flip / Track / "
-          "Lifetime / Day H/L / drawOrder unchanged); markers missing / duplicated / out of order -> FAIL",
-          VIS_FVG_A_OK and bool(VIS_GATE) and VIS_PROD == VIS_GATE, VIS_FVG_A_WHY)
+    check("VIS-5M-01 ZoneVisualPractical.pine production part (file minus the FVG A / C / B blocks) == d240ec0 with exactly the "
+          "Batch C draw-loop edits (display Strength / Score; Engine calls, sources, state untouched) byte-for-byte; "
+          "markers missing / duplicated / out of order -> FAIL",
+          VIS_FVG_A_OK and bool(VIS_GATE) and VIS_PROD == fvg_c.apply_prod_edits(VIS_GATE) and VIS_PROD_BASE == VIS_GATE,
+          VIS_FVG_A_WHY)
     check("VIS-5M-02 import = sekine3310/ZoneEnginePractical/2 only (/4 not used by the Visual)",
           re.findall(r"^import .*$", cc, re.M) == ["import sekine3310/ZoneEnginePractical/2 as zn"])
     check("VIS-5M-03 no MTF code: no Engine Start Time / Parity Mode / AUTH_TF / AuthGuard / f_auth* / security_lower_tf / Authority fields",

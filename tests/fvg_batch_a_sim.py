@@ -50,11 +50,31 @@ def split_block(src):
 
 
 REST, BLOCK = split_block(CUR)
-# Batch B (display) block follows the Batch A block; A1-01 compares the production part without it.
-B2 = "\n// ==== FVG Batch B (begin) "
-E2 = "// ==== FVG Batch B (end) "
-if REST.count(B2) == 1 and REST.count(E2) == 1 and REST.index(B2) < REST.index(E2):
-    REST = REST[:REST.index(B2) + 1] + REST[REST.index("\n", REST.index(E2)) + 1:]
+# Batch B (display) and Batch C (mutual bonus) blocks are removed and the Batch C draw-loop edits reverted before
+# A1-01 compares the production part with d240ec0.
+import sys as _sys                                                         # noqa: E402
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fvg_batch_c_build as _cb                                            # noqa: E402
+
+
+def _strict_cut(src, begin, end):
+    """remove one marked block and its single separating blank line (begin preceded by a blank line)."""
+    if src.count(begin) != 1 or src.count(end) != 1 or not src.index(begin) < src.index(end):
+        return None
+    i = src.index(begin)
+    if src[i - 2:i] != "\n\n":
+        return None
+    k = src.index("\n", src.index(end)) + 1
+    return src[:i - 1] + src[k:]
+
+
+REST = CUR
+for _b2, _e2 in ((_cb.B_BEGIN, _cb.B_END), (_cb.C_BEGIN, _cb.C_END), (_cb.A_BEGIN, _cb.A_END)):
+    REST = _strict_cut(REST, _b2, _e2) if REST is not None else None
+try:
+    REST = _cb.revert_prod_edits(REST) if REST is not None else ""
+except AssertionError:
+    REST = ""
 BC = code_only(BLOCK)
 
 
@@ -62,10 +82,11 @@ BC = code_only(BLOCK)
 # A1 / A4 : static
 # ============================================================================
 def gate_static():
-    check("A1-01 Visual outside the FVG Batch A and Batch B blocks == d240ec0 byte-for-byte (MA / Swing / Accum / Break / ZoneFeed / "
-          "zn.update / drawing / Stats / inputs unchanged)", bool(BASE) and bool(BLOCK) and REST.rstrip("\n") + "\n" == BASE)
-    check("A1-02 FVG block is a single appended block (begins after the last existing line)",
-          CUR.startswith(BASE.rstrip("\n")) and CUR.count(B) == 1 and CUR.count(E) == 1)
+    check("A1-01 Visual outside the FVG A / B / C blocks (Batch C draw-loop edits reverted) == d240ec0 byte-for-byte (MA / Swing / Accum / Break / ZoneFeed / "
+          "zn.update / drawing / Stats / inputs unchanged)", bool(BASE) and bool(BLOCK) and REST == BASE)
+    check("A1-02 FVG Batch A is a single block placed immediately before the DISPLAY section banner (moved there by Batch C; "
+          "content checked by A1-01 / B1-01)",
+          CUR.count(B) == 1 and CUR.count(E) == 1 and (BLOCK + "\n" + _cb.DISPLAY_BANNER) in CUR)
     eng = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", START_REV, "--",
                           "ZoneEnginePractical.pine", "ZoneEnginePracticalAuthority.pine", "SignalEnginePractical.pine",
                           "PracticalZoneStrategy_LONG.pine", "PracticalZoneStrategy_SHORT.pine"],

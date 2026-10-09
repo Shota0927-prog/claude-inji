@@ -49,15 +49,22 @@ def cut(src, begin, end):
     return src[:i - 1] + src[k:], src[i:k], True
 
 
+import fvg_batch_c_build as cb          # noqa: E402
+C_BEGIN, C_END = cb.C_BEGIN, cb.C_END
+
+
 def split(src):
-    marks = [A_BEGIN, A_END, B_BEGIN, B_END]
-    if [src.count(m) for m in marks] != [1, 1, 1, 1]:
+    """(production part, A block, B block, ok): exactly one A, C and B block in the order A < C < B."""
+    marks = [A_BEGIN, A_END, C_BEGIN, C_END, B_BEGIN, B_END]
+    if [src.count(m) for m in marks] != [1] * 6:
         return src, "", "", False
-    if not src.index(A_BEGIN) < src.index(A_END) < src.index(B_BEGIN) < src.index(B_END):
+    pos = [src.index(m) for m in marks]
+    if pos != sorted(pos):
         return src, "", "", False
     rest, blk_b, ok_b = cut(src, B_BEGIN, B_END)
-    prod, blk_a, ok_a = cut(rest, A_BEGIN, A_END) if ok_b else (src, "", False)
-    return prod, blk_a, blk_b, ok_a and ok_b
+    rest, _, ok_c = cut(rest, C_BEGIN, C_END) if ok_b else (src, "", False)
+    prod, blk_a, ok_a = cut(rest, A_BEGIN, A_END) if ok_c else (src, "", False)
+    return prod, blk_a, blk_b, ok_a and ok_b and ok_c
 
 
 PROD, BLK_A, BLK_B, SPLIT_OK = split(CUR)
@@ -91,14 +98,15 @@ A_AT_E390_FIXED = A_AT_E390.replace(RE10045_A_OLD, RE10045_A_NEW) if A_AT_E390.c
 def gate_static():
     check("B3-01 strict markers: one Batch A block, one Batch B block, A before B, each preceded by a blank line",
           SPLIT_OK and CUR.index(A_END) < CUR.index(B_BEGIN))
-    check("B3-02 production part (file minus the A and B blocks) == d240ec0 byte-for-byte", SPLIT_OK and PROD == BASE)
+    check("B3-02 production part (file minus the A / C / B blocks) == d240ec0 with exactly the Batch C draw-loop edits",
+          SPLIT_OK and PROD == cb.apply_prod_edits(BASE))
     _, a_e390, ok_e = split_a_only(A_AT_E390_FIXED)
     if not SPLIT_OK:
         raise ValueError("FVG markers invalid")
     check("B1-01 Batch A block byte-identical to e390afc + the RE10045 fix only (lifecycle semantics unchanged)",
           bool(A_AT_E390_FIXED) and ok_e and SPLIT_OK and BLK_A == a_e390)
-    check("B3-03 Batch B block is appended after the Batch A block at the end of the file",
-          SPLIT_OK and bool(A_AT_E390_FIXED) and CUR.endswith(BLK_B) and CUR.startswith(A_AT_E390_FIXED.rstrip("\n")))
+    check("B3-03 Batch B block is the last block of the file (after A and C)",
+          SPLIT_OK and CUR.endswith(BLK_B))
     eng = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BATCH_A_REV, "--",
                           "ZoneEnginePractical.pine", "ZoneEnginePracticalAuthority.pine", "SignalEnginePractical.pine",
                           "PracticalZoneStrategy_LONG.pine", "PracticalZoneStrategy_SHORT.pine"]
@@ -133,10 +141,12 @@ def gate_static():
     eng_src = open(os.path.join(ROOT, "ZoneEnginePractical.pine"), encoding="utf-8").read()
     ef = eng_src[eng_src.index("f_strengthOf(float score, bool hasHtf, ZoneCfg c) =>"):]
     ef = ef[:ef.index("\n\n")].split("\n", 1)[1].replace("c.", "")
-    bf = BC[BC.index("f_fvgStrengthOf(float score, bool hasHtf) =>"):]
+    cc_ = code_only(CUR[CUR.index(C_BEGIN):CUR.index(C_END)])
+    bf = cc_[cc_.index("f_fvcStrengthOf(float score, bool hasHtf) =>"):]
     bf = bf[:bf.index("\n\n")].split("\n", 1)[1]
-    check("B2-00 f_fvgStrengthOf body == Engine f_strengthOf body (thresholds / HTF requirement / downgrade), "
-          "cfg fields -> the same Visual inputs", ef == bf, f"\n{ef}\n{bf}")
+    check("B2-00 FVG strength (Batch C f_fvcStrengthOf) body == Engine f_strengthOf body (thresholds / HTF requirement / "
+          "downgrade), cfg fields -> the same Visual inputs; no second copy left in Batch B",
+          ef == bf and "f_fvgStrengthOf" not in BC, f"\n{ef}\n{bf}")
     check("B2-00b FVG box / label styling uses the existing helpers and formulas (f_zoneColor Support / Resistance, f_zoneTransp, "
           "border = tr - 30, width 2 for >= STRONG, label colour bc + 20, white text, label_left, small)",
           all(x in BC for x in ("color bc = f_zoneColor(dir > 0 ? ST_SUPPORT : ST_RESIST)", "int   tr = f_zoneTransp(fs)",
@@ -266,7 +276,8 @@ def gate_mirror():
           all(("Bullish" in t and " · formed " in t and " - " in t and " · base " in t) for *_, t in dd)
           and all(x in BC for x in ('(dir > 0 ? "Bullish" : "Bearish")', '" · formed " + str.format_time(closeT',
                                      'str.tostring(top, format.mintick) + " - " + str.tostring(bot, format.mintick)',
-                                     '" · base " + f_num(score, "#.#")')))
+                                     '" · base " + f_num(tfIdx + 1.0, "#.#")', '" · zone " + (na(zoneBase) ? "-" : f_num(zoneBase, "#.#"))',
+                                     '" · conf " + f_num(conf, "#.#")')))
     # hidden after fill / expiry / cap
     h15 = fa.mk_bars(fa.TF_MS[0], fa.T0, [(2000, 1995, 1998), (2010, 1999, 2008), (2012, 2005, 2010), (2010, 1990, 1990)] + fa.flat(20, 2010))
     hs = [h15, fa.mk_bars(fa.TF_MS[1], fa.T0, fa.flat(10)), fa.mk_bars(fa.TF_MS[2], fa.T0, fa.flat(5))]
@@ -301,7 +312,8 @@ def gate_mirror():
           "if na(prevT) or ot < prevT\n                            if pick < 0\n                                pick := s\n"
           "                            else if ot > array.get(gFvgOpenT, pick)\n                                pick := s" in BC
           and "bool showIt = f_fvgShowByStrength(fs) and (dir > 0 ? showSupport : showResistance)" in BC
-          and "float fvgScore = tf + 1.0" in BC and "int   fs = f_fvgStrengthOf(fvgScore, false)" in BC
+          and "[fvgScore, fs, fZoneBase, fConf] = f_fvcFvgDisplay(pick)" in BC
+          and BC.index("int dir = array.get(gFvgDir, pick)") < BC.index("f_fvcFvgDisplay(pick)") < BC.index("bool showIt")
           and "for tf = 0 to 2" in BC and "if showZones" in BC)
     check("B2-19 surplus pool objects are hidden (transparent box / empty transparent label), never deleted",
           all(x in BC for x in ("box.set_bgcolor(b, C_HIDDEN)", "box.set_border_color(b, C_HIDDEN)",
