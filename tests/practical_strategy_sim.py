@@ -4586,29 +4586,49 @@ VIS_GATE = __import__("subprocess").run(["git", "-C", ROOT, "show", VIS_GATE_REV
 
 FVG_A_BEGIN = "// ==== FVG Batch A (begin) "
 FVG_A_END = "// ==== FVG Batch A (end) "
+FVG_B_BEGIN = "// ==== FVG Batch B (begin) "
+FVG_B_END = "// ==== FVG Batch B (end) "
 
 
-def vis_split_fvg_a(src):
-    """Split the Visual into (production part, FVG Batch A block, ok, why).
-    Exactly one begin and one end marker, each at the start of a line, begin before end, the block preceded by
-    one blank line. The production part is the file with that single block (and its one separating blank line)
-    removed; everything else must be untouched. Any marker problem -> ok = False (callers FAIL)."""
-    nb = len(re.findall(r"(?m)^" + re.escape(FVG_A_BEGIN), src))
-    ne = len(re.findall(r"(?m)^" + re.escape(FVG_A_END), src))
-    if nb != 1 or ne != 1 or src.count(FVG_A_BEGIN) != 1 or src.count(FVG_A_END) != 1:
-        return src, "", False, f"markers begin={nb} end={ne}"
-    i = src.index(FVG_A_BEGIN)
-    j = src.index(FVG_A_END)
+def _fvg_cut(src, begin, end):
+    """Remove one marked block. Exactly one begin and one end marker, each at the start of a line, begin before
+    end, the block preceded by one blank line. Returns (src without the block and its separating blank line,
+    block, ok, why)."""
+    nb = len(re.findall(r"(?m)^" + re.escape(begin), src))
+    ne = len(re.findall(r"(?m)^" + re.escape(end), src))
+    if nb != 1 or ne != 1 or src.count(begin) != 1 or src.count(end) != 1:
+        return src, "", False, f"{begin.strip()} markers begin={nb} end={ne}"
+    i = src.index(begin)
+    j = src.index(end)
     if not j > i:
-        return src, "", False, "end marker before begin marker"
+        return src, "", False, f"{begin.strip()}: end marker before begin marker"
     if src[i - 2:i] != "\n\n":
-        return src, "", False, "begin marker not preceded by a blank line"
+        return src, "", False, f"{begin.strip()}: begin marker not preceded by a blank line"
     k = src.find("\n", j)
     k = len(src) if k < 0 else k + 1
     return src[:i - 1] + src[k:], src[i:k], True, ""
 
 
-VIS_PROD, VIS_FVG_A, VIS_FVG_A_OK, VIS_FVG_A_WHY = vis_split_fvg_a(VIS_CUR)
+def vis_split_fvg(src):
+    """Split the Visual into (production part, Batch A block, Batch B block, ok, why).
+    Exactly one Batch A block and one Batch B block, in the order A then B (A end before B begin). The production
+    part is the file with exactly those two blocks removed; any marker problem -> ok = False (callers FAIL)."""
+    marks = [FVG_A_BEGIN, FVG_A_END, FVG_B_BEGIN, FVG_B_END]
+    counts = [src.count(m_) for m_ in marks]
+    if counts != [1, 1, 1, 1]:
+        return src, "", "", False, "FVG markers A/B begin/end counts = " + str(counts)
+    if not src.index(FVG_A_BEGIN) < src.index(FVG_A_END) < src.index(FVG_B_BEGIN) < src.index(FVG_B_END):
+        return src, "", "", False, "FVG markers out of order (expected A begin < A end < B begin < B end)"
+    rest, blk_b, ok_b, why_b = _fvg_cut(src, FVG_B_BEGIN, FVG_B_END)
+    if not ok_b:
+        return src, "", "", False, why_b
+    prod, blk_a, ok_a, why_a = _fvg_cut(rest, FVG_A_BEGIN, FVG_A_END)
+    if not ok_a:
+        return src, "", "", False, why_a
+    return prod, blk_a, blk_b, True, ""
+
+
+VIS_PROD, VIS_FVG_A, VIS_FVG_B, VIS_FVG_A_OK, VIS_FVG_A_WHY = vis_split_fvg(VIS_CUR)
 
 
 def fixture_p16_visual_5m_gate():
@@ -4617,7 +4637,7 @@ def fixture_p16_visual_5m_gate():
     check("P16-01 5M flag = timeframe.isminutes and timeframe.multiplier == 5 (not in_seconds == 300)",
           "bool is5mChart = timeframe.isminutes and timeframe.multiplier == 5" in cc and "in_seconds() == 300" not in cc)
     imp1, imp2 = "import sekine3310/ZoneEnginePractical/1 as zn\n", "import sekine3310/ZoneEnginePractical/2 as zn\n"
-    check("P16-02 5M chart: gated Visual (production part = file minus the single FVG Batch A block) partially evaluated "
+    check("P16-02 5M chart: gated Visual (production part = file minus the single FVG Batch A and Batch B blocks) partially evaluated "
           "with is5mChart = true == pre-gate Visual (b3b69ae) exactly (only the library import version /1 -> /2 differs)",
           VIS_FVG_A_OK and bool(pre) and imp1 in pre and vis_eval_5m(VIS_PROD).replace(imp2, imp1) == pre, VIS_FVG_A_WHY)
     check("P16-03 MA / Swing / Accum source requests only on 5M (if is5mChart and use*Source)",
@@ -4636,7 +4656,12 @@ def fixture_p16_visual_5m_gate():
     check("P16-07 Zone box / label drawing, MA lines, Stats table gated by is5mChart",
           "if barstate.islast and is5mChart\n    int nBox = 0" in cc and "if barstate.islast and is5mChart and showStats" in cc
           and cc.count("plot(is5mChart and showMaLines and useMaSource ?") == 2 and cc.count("plot(") == 2
-          and len(re.findall(r"\b(box|label|table)\.new\(", cc)) == len(re.findall(r"\b(box|label|table)\.new\(", code_only(pre))))
+          and VIS_FVG_A_OK
+          and len(re.findall(r"\b(box|label|table)\.new\(", code_only(VIS_PROD))) == len(re.findall(r"\b(box|label|table)\.new\(", code_only(pre)))
+          and re.findall(r"\b(box|label|table|line)\.new\(", code_only(VIS_FVG_A)) == []
+          and re.findall(r"\b(box|label|table|line)\.new\(", code_only(VIS_FVG_B)) == ["box", "label"]
+          and len(re.findall(r"\b(box|label|table)\.new\(", cc)) == len(re.findall(r"\b(box|label|table)\.new\(", code_only(pre))) + 2,
+          VIS_FVG_A_WHY)
     req_pre = re.findall(r"request\.security\(.*", code_only(pre))
     req_prod = re.findall(r"request\.security\(.*", code_only(VIS_PROD))
     fc = code_only(VIS_FVG_A)
@@ -4882,7 +4907,7 @@ def _strip_str_all(t):
 # ============================================================================
 def fixture_vis_5m_production():
     cc = code_only(VIS_CUR)
-    check("VIS-5M-01 ZoneVisualPractical.pine production part (file minus the single FVG Batch A block) == d240ec0 "
+    check("VIS-5M-01 ZoneVisualPractical.pine production part (file minus the single FVG Batch A and Batch B blocks) == d240ec0 "
           "byte-for-byte (5M Zone count / top / bottom / score / strength / state / touch / srcMask / Break / Flip / Track / "
           "Lifetime / Day H/L / drawOrder unchanged); markers missing / duplicated / out of order -> FAIL",
           VIS_FVG_A_OK and bool(VIS_GATE) and VIS_PROD == VIS_GATE, VIS_FVG_A_WHY)

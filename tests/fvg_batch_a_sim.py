@@ -50,6 +50,11 @@ def split_block(src):
 
 
 REST, BLOCK = split_block(CUR)
+# Batch B (display) block follows the Batch A block; A1-01 compares the production part without it.
+B2 = "\n// ==== FVG Batch B (begin) "
+E2 = "// ==== FVG Batch B (end) "
+if REST.count(B2) == 1 and REST.count(E2) == 1 and REST.index(B2) < REST.index(E2):
+    REST = REST[:REST.index(B2) + 1] + REST[REST.index("\n", REST.index(E2)) + 1:]
 BC = code_only(BLOCK)
 
 
@@ -57,7 +62,7 @@ BC = code_only(BLOCK)
 # A1 / A4 : static
 # ============================================================================
 def gate_static():
-    check("A1-01 Visual outside the FVG block == d240ec0 byte-for-byte (MA / Swing / Accum / Break / ZoneFeed / "
+    check("A1-01 Visual outside the FVG Batch A and Batch B blocks == d240ec0 byte-for-byte (MA / Swing / Accum / Break / ZoneFeed / "
           "zn.update / drawing / Stats / inputs unchanged)", bool(BASE) and bool(BLOCK) and REST.rstrip("\n") + "\n" == BASE)
     check("A1-02 FVG block is a single appended block (begins after the last existing line)",
           CUR.startswith(BASE.rstrip("\n")) and CUR.count(B) == 1 and CUR.count(E) == 1)
