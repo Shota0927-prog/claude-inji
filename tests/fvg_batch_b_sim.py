@@ -65,6 +65,25 @@ BC = code_only(BLK_B)
 A_AT_E390 = subprocess.run(["git", "-C", ROOT, "show", f"{BATCH_A_REV}:ZoneVisualPractical.pine"],
                            capture_output=True, text=True).stdout
 
+# RE10045 fix (the only permitted change to the Batch A block since e390afc): Pine v5 evaluates both operands of
+# `or`, so the -1 sentinel test and the array.get on that index must sit in separate branches. Same slot choice.
+RE10045_A_OLD = """                if not array.get(gFvgAlive, s)
+                    if slot < 0
+                        slot := s
+                else if oldest < 0 or array.get(gFvgOpenT, s) < array.get(gFvgOpenT, oldest)
+                    oldest := s
+"""
+RE10045_A_NEW = """                // Pine v5 は and / or の両辺を評価するため、-1 判定と array.get を同じ式に書かない
+                if not array.get(gFvgAlive, s)
+                    if slot < 0
+                        slot := s
+                else if oldest < 0
+                    oldest := s
+                else if array.get(gFvgOpenT, s) < array.get(gFvgOpenT, oldest)
+                    oldest := s
+"""
+A_AT_E390_FIXED = A_AT_E390.replace(RE10045_A_OLD, RE10045_A_NEW) if A_AT_E390.count(RE10045_A_OLD) == 1 else ""
+
 
 # ============================================================================
 # B1 / B3 / B4 : static
@@ -73,12 +92,13 @@ def gate_static():
     check("B3-01 strict markers: one Batch A block, one Batch B block, A before B, each preceded by a blank line",
           SPLIT_OK and CUR.index(A_END) < CUR.index(B_BEGIN))
     check("B3-02 production part (file minus the A and B blocks) == d240ec0 byte-for-byte", SPLIT_OK and PROD == BASE)
-    _, a_e390, ok_e = split_a_only(A_AT_E390)
+    _, a_e390, ok_e = split_a_only(A_AT_E390_FIXED)
     if not SPLIT_OK:
         raise ValueError("FVG markers invalid")
-    check("B1-01 Batch A block byte-identical to e390afc (lifecycle semantics unchanged)", ok_e and SPLIT_OK and BLK_A == a_e390)
+    check("B1-01 Batch A block byte-identical to e390afc + the RE10045 fix only (lifecycle semantics unchanged)",
+          bool(A_AT_E390_FIXED) and ok_e and SPLIT_OK and BLK_A == a_e390)
     check("B3-03 Batch B block is appended after the Batch A block at the end of the file",
-          SPLIT_OK and CUR.endswith(BLK_B) and CUR.startswith(A_AT_E390.rstrip("\n")))
+          SPLIT_OK and bool(A_AT_E390_FIXED) and CUR.endswith(BLK_B) and CUR.startswith(A_AT_E390_FIXED.rstrip("\n")))
     eng = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BATCH_A_REV, "--",
                           "ZoneEnginePractical.pine", "ZoneEnginePracticalAuthority.pine", "SignalEnginePractical.pine",
                           "PracticalZoneStrategy_LONG.pine", "PracticalZoneStrategy_SHORT.pine"]
@@ -278,7 +298,8 @@ def gate_mirror():
     check("B2-17 drawing never changes the Batch A store (filters do not affect storage / fill / expiry)",
           snap == (list(sm.alive), list(sm.top), list(sm.openT), sm.nextExpire, list(sm.lastKey)))
     check("B2-18 Pine draw pass mirrors the selection loop (alive, open time strictly older than the previous pick, newest first)",
-          "if (na(prevT) or ot < prevT) and (pick < 0 or ot > array.get(gFvgOpenT, pick))" in BC
+          "if na(prevT) or ot < prevT\n                            if pick < 0\n                                pick := s\n"
+          "                            else if ot > array.get(gFvgOpenT, pick)\n                                pick := s" in BC
           and "bool showIt = f_fvgShowByStrength(fs) and (dir > 0 ? showSupport : showResistance)" in BC
           and "float fvgScore = tf + 1.0" in BC and "int   fs = f_fvgStrengthOf(fvgScore, false)" in BC
           and "for tf = 0 to 2" in BC and "if showZones" in BC)
