@@ -23,6 +23,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fvg_batch_a_sim as fa          # noqa: E402
 import fvg_batch_b_sim as fb          # noqa: E402
+import zp_overlap_build as zp         # noqa: E402
 
 ROOT = fa.ROOT
 PRE_FIX_REV = "7956626"
@@ -212,6 +213,7 @@ def htf_set(n15=0, n60=0, n240=0, bear15=False):
 
 def main():
     cur = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+    cur = zp.strip_zpo(cur) or cur  # ZONE-P overlap display stripped -> 11b2b4e text (delta pinned by zp_overlap_sim)
     pre = subprocess.run(["git", "-C", ROOT, "show", f"{PRE_FIX_REV}:ZoneVisualPractical.pine"], capture_output=True, text=True).stdout
     bad_pre, bad_cur = lint_eager_guards(fvg_blocks(pre)), lint_eager_guards(fvg_blocks(cur))
     check("R1-01 lint detects the RE10045 pattern in the pre-fix revision 7956626 (registration + draw selection)",

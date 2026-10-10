@@ -21,9 +21,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nr_s1_build as nb              # noqa: E402
 import fvg_re10045_sim as fr          # noqa: E402
 import nr_a1_build as na              # noqa: E402
+import zp_overlap_build as zp         # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+CUR = zp.strip_zpo(CUR) or CUR  # ZONE-P overlap display stripped -> 11b2b4e text (delta pinned by zp_overlap_sim)
 RESULTS = []
 
 

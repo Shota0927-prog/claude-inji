@@ -36,7 +36,8 @@ def code_only(src):
     return "\n".join(l for l in src.split("\n") if not l.lstrip().startswith("//"))
 
 
-CUR = open(VIS_PATH, encoding="utf-8").read()
+import zp_overlap_build as _zp                                            # noqa: E402
+CUR = _zp.strip_zpo(open(VIS_PATH, encoding="utf-8").read()) or open(VIS_PATH, encoding="utf-8").read()  # ZONE-P overlap display stripped -> 11b2b4e text (delta pinned by zp_overlap_sim)
 BASE = git_show(BASE_REV, "ZoneVisualPractical.pine")
 
 
