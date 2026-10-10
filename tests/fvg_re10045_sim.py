@@ -213,6 +213,7 @@ def htf_set(n15=0, n60=0, n240=0, bear15=False):
 
 def main():
     cur = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+    cur = __import__("rnv_build").strip_rnv(cur) or cur  # RN-1 V1 stripped -> 6e554b2 text (delta pinned by rnv_sim)
     cur = zp.strip_zpo(cur) or cur  # ZONE-P overlap display stripped -> 11b2b4e text (delta pinned by zp_overlap_sim)
     pre = subprocess.run(["git", "-C", ROOT, "show", f"{PRE_FIX_REV}:ZoneVisualPractical.pine"], capture_output=True, text=True).stdout
     bad_pre, bad_cur = lint_eager_guards(fvg_blocks(pre)), lint_eager_guards(fvg_blocks(cur))

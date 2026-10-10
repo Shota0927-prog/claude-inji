@@ -49,14 +49,17 @@ def gate_static():
     check("RS-01 ZoneEnginePracticalRN.pine == rn_transform(ZoneEnginePractical.pine @ f4b881b) exactly (8 RN edits)",
           bool(RN_TXT) and rb.rn_transform(BASE_OLD) == RN_TXT)
     check("RS-02 strip_rn(RN file) == old Engine byte-for-byte (nothing else differs)", rb.strip_rn(RN_TXT) == BASE_OLD)
-    prod = ["ZoneEnginePractical.pine", "ZoneVisualPractical.pine", "ZoneEnginePracticalAuthority.pine", "ZoneEngine.pine",
+    prod = ["ZoneEnginePractical.pine", "ZoneEnginePracticalAuthority.pine", "ZoneEngine.pine",
             "SignalEnginePractical.pine", "SignalEngine.pine", "PracticalZoneStrategy_LONG.pine",
             "PracticalZoneStrategy_SHORT.pine", "FvgZoneStrategy.pine", "PracticalZoneFeedHarness.pine",
             "PracticalAlertHarness.pine", "PracticalTradeHarness.pine", "PracticalBreakEvenHarness.pine",
             "PracticalEntryDispatchHarness.pine"]
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", rb.RN_BASE_REV, "--"] + prod, capture_output=True, text=True).stdout
-    check("RS-03 old Engine (/2 reference), Visual, Strategy, SignalEngine, Harness unchanged vs f4b881b",
-          d.strip() == "" and OLD_TXT == BASE_OLD, d)
+    vis = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+    vis_ok = __import__("rnv_build").strip_rnv(vis) == rb.git_show(rb.RN_BASE_REV, "ZoneVisualPractical.pine")
+    check("RS-03 old Engine (/2 reference), Strategy, SignalEngine, Harness unchanged vs f4b881b; Visual == f4b881b "
+          "except exactly the RN-1 V1 edits (import /5, Enable Round Number, useRnSource; pinned by rnv_sim)",
+          d.strip() == "" and OLD_TXT == BASE_OLD and vis_ok, d)
     lib = re.findall(r'^library\("([^"]+)"', RN_TXT, re.M)
     check("RS-04 same library name (new version of ZoneEnginePractical, not a new library)", lib == ["ZoneEnginePractical"], str(lib))
     src_bits = dict((n, int(v)) for n, v in re.findall(r"^int (SRC_\w+)\s*=\s*(\d+)", RN_TXT, re.M))

@@ -25,6 +25,7 @@ import zp_overlap_build as zp         # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+CUR = __import__("rnv_build").strip_rnv(CUR) or CUR  # RN-1 V1 stripped -> 6e554b2 text (delta pinned by rnv_sim)
 CUR = zp.strip_zpo(CUR) or CUR  # ZONE-P overlap display stripped -> 11b2b4e text (delta pinned by zp_overlap_sim)
 RESULTS = []
 

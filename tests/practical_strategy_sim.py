@@ -322,6 +322,7 @@ def fixture_alloc():
 #    The current Visual adds only the 5M execution gate; fixture_p16_visual_5m_gate ties it to b3b69ae.
 VIS_PRE_GATE_REV = "b3b69ae"
 VIS_CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+VIS_CUR = __import__("rnv_build").strip_rnv(VIS_CUR) or VIS_CUR  # RN-1 V1 stripped -> 6e554b2 text (delta pinned by rnv_sim)
 VIS_CUR = __import__("zp_overlap_build").strip_zpo(VIS_CUR) or VIS_CUR  # ZONE-P overlap display stripped -> 11b2b4e text (delta pinned by zp_overlap_sim)
 VIS = __import__("subprocess").run(["git", "-C", ROOT, "show", VIS_PRE_GATE_REV + ":ZoneVisualPractical.pine"],
                                    capture_output=True, text=True).stdout or VIS_CUR

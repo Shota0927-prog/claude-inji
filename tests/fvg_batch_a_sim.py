@@ -37,7 +37,9 @@ def code_only(src):
 
 
 import zp_overlap_build as _zp                                            # noqa: E402
-CUR = _zp.strip_zpo(open(VIS_PATH, encoding="utf-8").read()) or open(VIS_PATH, encoding="utf-8").read()  # ZONE-P overlap display stripped -> 11b2b4e text (delta pinned by zp_overlap_sim)
+_RAW = open(VIS_PATH, encoding="utf-8").read()
+_RAW = __import__("rnv_build").strip_rnv(_RAW) or _RAW  # RN-1 V1 stripped -> 6e554b2 text (delta pinned by rnv_sim)
+CUR = _zp.strip_zpo(_RAW) or _RAW  # ZONE-P overlap display stripped -> 11b2b4e text (delta pinned by zp_overlap_sim)
 BASE = git_show(BASE_REV, "ZoneVisualPractical.pine")
 
 
