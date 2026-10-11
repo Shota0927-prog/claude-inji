@@ -23,6 +23,7 @@ import zp_overlap_build as zp         # noqa: E402
 
 ROOT = vb.ROOT
 CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+CUR = __import__("fvl_build").strip_fvl(CUR) or CUR  # FVG label info stripped -> 67f8fd2 text (delta pinned by fvl_sim)
 CUR = __import__("swv_build").strip_swv(CUR) or CUR  # SW-V1 import /6 stripped -> 110e5b0 text (delta pinned by swv_sim)
 BASE = vb.git_show(vb.RNV_BASE_REV)
 LIB_NEW = open(os.path.join(ROOT, rb.RN_PATH), encoding="utf-8").read()       # = published /5 (L3 accepted by the user)

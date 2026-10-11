@@ -33,6 +33,7 @@ import fvg_re10045_sim as fr          # noqa: E402
 
 ROOT = na.ROOT
 CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+CUR = __import__("fvl_build").strip_fvl(CUR) or CUR  # FVG label info stripped -> 67f8fd2 text (delta pinned by fvl_sim)
 CUR = __import__("swv_build").strip_swv(CUR) or CUR  # SW-V1 import /6 stripped -> 110e5b0 text (delta pinned by swv_sim)
 CUR = __import__("rnv_build").strip_rnv(CUR) or CUR  # RN-1 V1 stripped -> 6e554b2 text (delta pinned by rnv_sim)
 CUR = __import__("zp_overlap_build").strip_zpo(CUR) or CUR  # ZONE-P overlap display stripped -> 11b2b4e text (delta pinned by zp_overlap_sim)
