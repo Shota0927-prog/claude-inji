@@ -18,10 +18,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import st1_build as tb      # noqa: E402
 import st2_build as s2      # noqa: E402
+import st3_build as s3      # noqa: E402
 import fvg_re10045_sim as fr  # noqa: E402
 
 ROOT = tb.ROOT
-ST = open(os.path.join(ROOT, s2.ST_PATH), encoding="utf-8").read()
+ST = s3.strip_st3(open(os.path.join(ROOT, s2.ST_PATH), encoding="utf-8").read())
 RESULTS = []
 SUP, RES, ACT, BRK = 1, 2, 0, 3
 
