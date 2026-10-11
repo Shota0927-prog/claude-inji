@@ -51,13 +51,16 @@ def gate_static():
     check("WS-01 ZoneEnginePracticalSwingMax.pine == sw_transform(ZoneEnginePracticalRN.pine @ 3c29718) exactly (6 edits)",
           bool(SW_TXT) and sb.sw_transform(BASE5) == SW_TXT)
     check("WS-02 strip_sw(SwingMax) == the /5 source byte-for-byte", sb.strip_sw(SW_TXT) == BASE5)
-    names = ["ZoneEnginePractical.pine", "ZoneEnginePracticalRN.pine", "ZoneVisualPractical.pine", "ZoneEnginePracticalAuthority.pine",
+    names = ["ZoneEnginePractical.pine", "ZoneEnginePracticalRN.pine", "ZoneEnginePracticalAuthority.pine",
              "ZoneEngine.pine", "SignalEnginePractical.pine", "SignalEngine.pine", "PracticalZoneStrategy_LONG.pine",
              "PracticalZoneStrategy_SHORT.pine", "FvgZoneStrategy.pine", "PracticalZoneFeedHarness.pine",
              "PracticalAlertHarness.pine", "PracticalTradeHarness.pine", "PracticalBreakEvenHarness.pine",
              "PracticalEntryDispatchHarness.pine"]
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", sb.SW_BASE_REV, "--"] + names, capture_output=True, text=True).stdout
-    check("WS-03 /2 and /5 Engine sources, Visual, Strategy, SignalEngine, Harness unchanged vs 3c29718", d.strip() == "", d)
+    vis = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+    vis_ok = __import__("swv_build").strip_swv(vis) == sb.git_show(sb.SW_BASE_REV, "ZoneVisualPractical.pine")
+    check("WS-03 /2 and /5 Engine sources, Strategy, SignalEngine, Harness unchanged vs 3c29718; Visual == 3c29718 except "
+          "exactly the SW-V1 import line (pinned by swv_sim)", d.strip() == "" and vis_ok, d)
     check("WS-04 same library name (next version of ZoneEnginePractical)",
           re.findall(r'^library\("([^"]+)"', SW_TXT, re.M) == ["ZoneEnginePractical"])
     h5, hs = heads(BASE5), heads(SW_TXT)
