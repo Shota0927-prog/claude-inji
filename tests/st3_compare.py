@@ -44,7 +44,7 @@ def zone_series(seed):
             bars.append((ch["o"], ch["h"], ch["l"], ch["c"]))
             zones.append(zl)
             tmins.append(((ch["c_t"] // 60000) + 9 * 60) % 1440)
-            m1s.append([(x[2], x[3], x[4]) for x in ch["subs"]])
+            m1s.append([(x[0], x[2], x[3], x[4]) for x in ch["subs"]])
         return bars, zones, tmins, m1s
     finally:
         C.maClusterBonus, C.maClusterDirBonus, C.flipBonus = keep

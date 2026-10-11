@@ -17,7 +17,7 @@ Shows only how each step changes the order flow on identical zones. Use the Trad
 | C | + Session | 23 | 34.8 | 0.80 | -0.130 | -3.00 | 0 | 0 |
 | C | + Session + Zone TP | 16 | 25.0 | 0.54 | -0.395 | -6.32 | 22 | 0 |
 | C | + Session + Zone TP + BE | 16 | 25.0 | 0.63 | -0.270 | -4.32 | 22 | 0 |
-| D | Base (A/B/C = ST-2) | 27 | 40.7 | 0.99 | 0.019 | 0.50 | 0 | 0 |
-| D | + Session | 26 | 42.3 | 1.05 | 0.058 | 1.50 | 0 | 0 |
-| D | + Session + Zone TP | 16 | 31.2 | 0.61 | -0.255 | -4.08 | 24 | 0 |
-| D | + Session + Zone TP + BE | 17 | 35.3 | 1.55 | 0.166 | 2.82 | 28 | 0 |
+| D | Base (A/B/C = ST-2) | 28 | 32.1 | 0.69 | -0.196 | -5.50 | 0 | 0 |
+| D | + Session | 28 | 35.7 | 0.83 | -0.107 | -3.00 | 0 | 0 |
+| D | + Session + Zone TP | 19 | 26.3 | 0.56 | -0.361 | -6.85 | 43 | 0 |
+| D | + Session + Zone TP + BE | 19 | 31.6 | 1.11 | -0.018 | -0.35 | 46 | 0 |

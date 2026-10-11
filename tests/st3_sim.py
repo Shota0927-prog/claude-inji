@@ -39,11 +39,14 @@ code_only = t2.code_only
 # =============================================================================
 PINS = [
     "if stModeD and is5mChart",
-    '[rh, rl, rc] = request.security_lower_tf(syminfo.tickerid, "1", [high, low, close])',
-    "if l <= top and h >= bot and (side == 1 ? pc > top : pc < bot)",
-    "else if side == 1 ? cl > lvl : cl < lvl",
-    "if ok and stModeD",
-    "ok := f_stBos(c.side, c.top, c.bot, close[1], m1h, m1l, m1c)",
+    '[rt, rh, rl, rc] = request.security_lower_tf(syminfo.tickerid, "1", [time, high, low, close])',
+    "if na(m1LastT) or tj > m1LastT",
+    "if x.c.side == 1 ? cl > x.lvl : cl < x.lvl",
+    "if x.cnt >= stDWait",
+    "if dirOK and not map.contains(stUsed, c.track) and l <= c.top and h >= c.bot and (c.side == 1 ? m1PrevC > c.top : m1PrevC < c.bot)",
+    "if cc.track == x.c.track and cc.side == x.c.side",
+    "if (x.c.side == 1 ? close > x.c.top : close < x.c.bot) and not map.contains(stUsed, x.c.track)",
+    "array<StCand> src = stModeA ? cur : stModeD ? dSrc : stPrev",
     "s == e ? true : s < e ? (mins >= s and mins < e) : (mins >= s or mins < e)",
     "bool stSessOK = not stUseSess or f_stInSession(time_close)",
     "if oState == 1 and (not pendOK or not stSessOK)",
@@ -78,8 +81,8 @@ def gate_static():
     check("TS-03 request sites = ST-2 / ZONE-P 10 + one request.security_lower_tf (1M, high / low / close), only "
           "executed in Entry Mode D",
           len(req(st2)) == 10 and len(req(ST)) == 11 and len(extra) == 1 and "security_lower_tf" in extra[0]
-          and "    [rh, rl, rc] = request.security_lower_tf(" in ST
-          and ST.index("if stModeD and is5mChart\n") + len("if stModeD and is5mChart\n") == ST.index("    [rh, rl, rc]"), str(extra))
+          and "    [rt, rh, rl, rc] = request.security_lower_tf(" in ST
+          and ST.index("if stModeD and is5mChart\n") + len("if stModeD and is5mChart\n") == ST.index("    [rt, rh, rl, rc]"), str(extra))
     co = code_only(ST)
     blk = code_only(s3.LOOP_NEW)
     check("TS-04 one zone loop per confirmed bar (zn.zoneAt / f_stZoneEval once); TP edges collected in the same loop",
@@ -99,7 +102,7 @@ def gate_static():
             "stSessTz": 'input.string("Asia/Tokyo",', "stSessStartH": "input.int(9,", "stSessStartM": "input.int(0,",
             "stSessEndH": "input.int(3,", "stSessEndM": "input.int(0,", "stTpZone": "input.bool(true,",
             "stTpMinRR": "input.float(1.0,", "stTpMaxRR": "input.float(3.0,", "stBE": "input.bool(true,",
-            "stBEDist": "input.float(10.0,"}
+            "stBEDist": "input.float(10.0,", "stDWait": "input.int(30,"}
     check("TS-07 defaults: Buffer 3, fixed RR 1.5, session JST 09:00-03:00 ON, zone TP ON (RR 1.0 / 3.0), breakeven ON "
           "at 10$; Entry Mode offers A / B / C / D",
           all(ins.get(k, "").startswith(v) for k, v in want.items())
@@ -115,15 +118,16 @@ def gate_static():
 
 
 # =============================================================================
-# Mirror of the ST-3 block. bar extras: tmin (minutes of day in the session timezone of time_close), m1 = [(h, l, c)]
+# Mirror of the ST-3 block. bar extras: tmin (minutes of day in the session timezone of time_close), m1 = [(t, h, l, c)]
 # =============================================================================
 class Script3(t2.Script):
     def __init__(self, mode="B", dir="Both", buffer=3.0, rr=1.5, pin=2.0, mut=(), sess=True, s=9 * 60, e=3 * 60,
-                 tpzone=True, minrr=1.0, maxrr=3.0, be=True, bedist=10.0):
+                 tpzone=True, minrr=1.0, maxrr=3.0, be=True, bedist=10.0, dwait=30):
         super().__init__(mode, dir, buffer, rr, pin, mut)
         self.sess, self.s, self.e = sess, s, e
         self.tpzone, self.minrr, self.maxrr, self.be, self.bedist = tpzone, minrr, maxrr, be, bedist
         self.oFill, self.oStop, self.oBE = None, None, False
+        self.dwait, self.waits, self.m1LastT, self.m1PrevC = dwait, [], None, None
 
     def in_sess(self, mins):
         s, e = self.s, self.e
@@ -131,28 +135,61 @@ class Script3(t2.Script):
             return s <= mins <= e if s < e else (mins >= s or mins <= e)
         return True if s == e else (s <= mins < e if s < e else (mins >= s or mins < e))
 
-    def bos(self, side, top, bot, prevC, m1):
-        bos, tch, ext, run, lvl, pc, ph = False, False, None, None, None, prevC, None
-        for (h, l, cl) in m1:
-            if not bos:
-                if not tch:
-                    frm = True if "d_anydir" in self.mut else (pc > top if side == 1 else pc < bot)
-                    if l <= top and h >= bot and frm:
-                        tch, ext = True, (l if side == 1 else h)
-                        run = lvl = (h if side == 1 else l)
-                        if "d_same_bar" in self.mut and ph is not None and (cl > ph if side == 1 else cl < ph):
-                            bos = True
-                elif (cl > lvl) if side == 1 else (cl < lvl):
-                    bos = True
-                else:
-                    run = max(run, h) if side == 1 else min(run, l)
-                    if (l < ext) if side == 1 else (h > ext):
-                        ext = l if side == 1 else h
-                        lvl = run
-            if "d_prebos" in self.mut and not tch and (cl > top + 3 if side == 1 else cl < bot - 3):
-                bos = True
-            pc, ph = cl, (h if side == 1 else l)
-        return bos
+    def d_process(self, m1, cur, c):
+        """(2d): confirmed 1M bars of this 5M bar, each once; then release / collect against the post-update list."""
+        mu = self.mut
+        for (tj, h, l, cl) in m1:
+            if not (self.m1LastT is None or tj > self.m1LastT or "d_dup" in mu):
+                continue
+            self.m1LastT = tj
+            for x in reversed(list(self.waits)):
+                if not x["bos"]:
+                    x["cnt"] += 1
+                    s_ = x["c"]["side"]
+                    if (cl > x["lvl"]) if s_ == 1 else (cl < x["lvl"]):
+                        x["bos"] = True
+                    else:
+                        x["run"] = max(x["run"], h) if s_ == 1 else min(x["run"], l)
+                        if (l < x["ext"]) if s_ == 1 else (h > x["ext"]):
+                            x["ext"] = l if s_ == 1 else h
+                            x["lvl"] = x["run"]
+                        lim = self.dwait + (1 if "d_expire_late" in mu else 0)
+                        if x["cnt"] >= lim and "d_noexpire" not in mu:
+                            self.waits.remove(x)
+            pc = self.m1PrevC
+            for cd in self.prev:
+                dirOK = self.longOK if cd["side"] == 1 else self.shortOK
+                frm = True if "d_anydir" in mu else (pc is not None and (pc > cd["top"] if cd["side"] == 1 else pc < cd["bot"]))
+                pre = "d_prebos" in mu and (cl > cd["top"] + 3 if cd["side"] == 1 else cl < cd["bot"] - 3)
+                if dirOK and cd["track"] not in self.used and ((l <= cd["top"] and h >= cd["bot"] and frm) or pre):
+                    if any(w["c"]["track"] == cd["track"] for w in self.waits):
+                        continue
+                    aS, aSc = self.adopt(cd, max(l, cd["bot"]), min(h, cd["top"]))
+                    if aS >= 3 or pre:
+                        e0, r0 = (l, h) if cd["side"] == 1 else (h, l)
+                        w = dict(c=cd, ext=e0, run=r0, lvl=r0, cnt=0, bos=pre, aS=aS, aSc=aSc)
+                        if "d_same_bar" in mu and self.m1PrevC is not None:
+                            w["lvl"] = self.m1PrevC
+                            if (cl > w["lvl"]) if cd["side"] == 1 else (cl < w["lvl"]):
+                                w["bos"] = True
+                        self.waits.append(w)
+            self.m1PrevC = cl
+        if "d_carry_off" in mu:
+            for x in list(self.waits):
+                if not x["bos"]:
+                    self.waits.remove(x)
+        dSrc = []
+        for x in reversed(list(self.waits)):
+            valid = any(cc["track"] == x["c"]["track"] and cc["side"] == x["c"]["side"] for cc in cur)
+            if not valid and "d_no_invalid" not in mu:
+                self.waits.remove(x)
+            elif x["bos"]:
+                cd = x["c"]
+                closeOK = True if "d_noclose" in mu else (c > cd["top"] if cd["side"] == 1 else c < cd["bot"])
+                if closeOK and cd["track"] not in self.used:
+                    dSrc.append((cd, x["aS"], x["aSc"]))
+                self.waits.remove(x)
+        return dSrc
 
     @staticmethod
     def nearest(edges, side, ref):
@@ -258,6 +295,8 @@ class Script3(t2.Script):
                 else:
                     B.exit(self.oXid, self.oEid, stop=self.oStop, limit=self.oTP)
                 ev["be"] = True
+        # (2d)
+        dSrc = self.d_process(m1, cur, c) if modeD else []
         # (3)
         cancelBar = False
         sessCancel = sessOK or "sess_no_cancel" in self.mut
@@ -268,7 +307,7 @@ class Script3(t2.Script):
             ev["cancel"] = self.oEid
         # (4)
         if self.oState == 0 and not cancelBar and (sessOK or "sess_off_entry" in self.mut):
-            src = cur if modeA else self.prev
+            src = cur if modeA else [x[0] for x in dSrc] if modeD else self.prev
             best = {1: None, -1: None}
             for k, cd in enumerate(src):
                 dirOK = self.longOK if cd["side"] == 1 else self.shortOK
@@ -280,16 +319,17 @@ class Script3(t2.Script):
                     aS, aSc = self.adopt(cd, px, px)
                     d = abs(c - px)
                     ok = (c > cd["top"] if cd["side"] == 1 else c < cd["bot"]) and aS >= 3
+                elif modeD:
+                    aS, aSc = dSrc[k][1], dSrc[k][2]
+                    d = abs(c - (cd["top"] if cd["side"] == 1 else cd["bot"]))
+                    ok = True
                 else:
                     aS, aSc = self.adopt(cd, max(l, cd["bot"]), min(h, cd["top"]))
                     d = abs(c - (cd["top"] if cd["side"] == 1 else cd["bot"]))
                     st = dict(curTrk).get(cd["track"])
                     trkOK = st == (SUP if cd["side"] == 1 else RES)
-                    closeOK = True if (modeD and "d_noclose" in self.mut) else (c > cd["top"] if cd["side"] == 1 else c < cd["bot"])
-                    ok = l <= cd["top"] and h >= cd["bot"] and closeOK and aS >= 3 and trkOK \
-                        and (not modeC or self.pat(cd["side"], bar, prev))
-                    if ok and modeD:
-                        ok = self.bos(cd["side"], cd["top"], cd["bot"], prev[3], m1)
+                    ok = l <= cd["top"] and h >= cd["bot"] and (c > cd["top"] if cd["side"] == 1 else c < cd["bot"]) \
+                        and aS >= 3 and trkOK and (not modeC or self.pat(cd["side"], bar, prev))
                 if ok:
                     key = (aS, aSc, d, cd["track"])
                     b = best[cd["side"]]
@@ -353,39 +393,92 @@ def fixtures(mut=()):
 
     m = dict(mut=mut)
     # --- D -----------------------------------------------------------------------------------------------------------
-    # 5M bar t = (103, 103.5, 99.0, 101.5); 1M: from above (prev 5M close 105) -> touch 99.0 -> BOS close 102.6 > 102.5
+    def M(*bars_m1, t0=0):
+        """1M arrays with unique increasing times (5 per 5M bar); bar 0 defaults to one 1M bar closing at 105."""
+        out = []
+        for b, lst in enumerate(bars_m1):
+            lst = lst if (lst or b) else [(106.0, 104.0, 105.0)]
+            out.append([(t0 + b * 5 + j, h, l, c) for j, (h, l, c) in enumerate(lst)])
+        return out
+
+    D = dict(mode="D", **OFF, **m)
+    # bar 1: from above (prev 1M close 105) -> touch 99.0 -> BOS close 102.6 > 102.5 (high from touch to the low)
     bt = (103.0, 103.5, 99.0, 101.5)
     good = [(103.5, 102.0, 102.2), (102.5, 99.0, 100.0), (101.0, 99.5, 100.8), (102.7, 100.5, 102.6), (102.8, 101.3, 101.5)]
     nxt = (101.6, 102.0, 101.0, 101.8)
-    S, B = run3([FLAT, bt, nxt], [[ZL]] * 3, m1s=[(), good, ()], mode="D", **OFF, **m)
-    ok("TD-01 D: touch from above (prev close 105 > top) -> rebound -> confirmed 1M BOS (close 102.6 > 102.5 = high from "
-       "touch to the low) -> order at the 5M close, filled at the next 5M open 101.6 (not at the 1M BOS)",
+    S, B = run3([FLAT, bt, nxt], [[ZL]] * 3, m1s=M([], good, []), **D)
+    ok("TD-01 D: touch from above -> rebound -> confirmed 1M BOS inside the same 5M bar -> order at that 5M close, filled at "
+       "the next 5M open 101.6 (not at the 1M BOS)",
        [x for _, x in orders(S)] == [dict(id="L1", side=1, track=1, L=None, SL=91.0)] and orders(S)[0][0] == 1
        and B.fills and B.fills[0]["price"] == 101.6 and B.fills[0]["bar"] == 2, str((orders(S), B.fills)))
+    t1 = [(103.5, 102.0, 102.2), (102.5, 99.0, 100.0), (101.0, 99.5, 100.8), (101.5, 100.2, 101.0), (101.2, 100.4, 100.9)]
+    t2_ = [(101.3, 100.6, 101.1), (102.4, 100.9, 102.3), (102.7, 101.9, 102.6), (102.8, 102.0, 102.5), (102.9, 102.2, 102.7)]
+    S, B = run3([FLAT, (103.0, 103.5, 99.0, 100.9), (101.0, 102.9, 100.6, 102.7), nxt], [[ZL]] * 4, m1s=M([], t1, t2_, []), **D)
+    ok("TD-02 D carries the wait to the next 5M bar: touch in bar 1 (no BOS there), BOS by the 1M close 102.6 in bar 2 -> "
+       "order at the bar-2 close only (none at bar 1), filled at the bar-3 open",
+       [t for t, _ in orders(S)] == [2] and B.fills and B.fills[0]["bar"] == 3, str((S.log, B.fills)))
     pre = [(103.5, 102.0, 103.4), (103.4, 101.0, 101.2), (101.3, 99.0, 99.5), (100.2, 99.2, 100.0), (101.25, 99.9, 101.2)]
-    S, _ = run3([FLAT, (103.0, 103.5, 99.0, 101.2)], [[ZL]] * 2, m1s=[(), pre], mode="D", **OFF, **m)
-    ok("TD-02 D: a break of structure before the touch is not counted (closes above the later level only before the touch; "
-       "after the touch no 1M close beyond the touch-to-low high 101.3) -> no entry", orders(S) == [], str(S.log))
+    S, _ = run3([FLAT, (103.0, 103.5, 99.0, 101.2), FLAT], [[ZL]] * 3, m1s=M([], pre, [(101.3, 101.0, 101.2)] * 5), **D)
+    ok("TD-03 a break of structure before the touch is not counted (1M closes 103.4 before the touch; after the touch no "
+       "close beyond the touch-to-low high 101.3) -> no entry", orders(S) == [], str(S.log))
     below = [(99.5, 98.5, 99.4), (100.0, 99.0, 99.8), (101.0, 99.5, 100.8), (102.7, 100.5, 102.6), (102.8, 101.3, 101.5)]
-    S, _ = run3([(99.0, 99.6, 98.0, 99.2), bt], [[ZL]] * 2, m1s=[(), below], mode="D", **OFF, **m)
-    ok("TD-03 D: approach from inside / below the zone (prev close 99.2, not above top) is not a valid touch -> no entry",
+    S, _ = run3([(99.0, 99.6, 98.0, 99.2), bt], [[ZL]] * 2, m1s=M([(99.6, 98.0, 99.2)], below), **D)
+    ok("TD-04 approach from inside / below the zone (previous 1M close 99.2) is not a valid touch -> no entry",
        orders(S) == [], str(S.log))
     same = [(103.5, 102.0, 102.2), (103.9, 99.0, 103.8), (103.9, 103.0, 103.2), (103.5, 102.9, 103.0), (103.2, 101.3, 101.5)]
-    S, _ = run3([FLAT, (103.0, 103.9, 99.0, 101.5)], [[ZL]] * 2, m1s=[(), same], mode="D", **OFF, **m)
-    ok("TD-04 D: the touch 1M bar itself cannot be the BOS (close 103.8 in the touch bar); BOS needs a later 1M close above "
-       "the touch-to-low high (103.9) -> no entry", orders(S) == [], str(S.log))
-    S1, _ = run3([FLAT, (103.0, 103.5, 99.0, 99.8)], [[ZL]] * 2, m1s=[(), good[:4] + [(102.8, 99.5, 99.8)]], mode="D", **OFF, **m)
-    S2, _ = run3([FLAT, bt], [[], [ZL]], m1s=[(), good], mode="D", **OFF, **m)
-    S3, _ = run3([FLAT, bt], [[ZL], [dict(ZL, state=BRK)]], m1s=[(), good], mode="D", **OFF, **m)
-    ok("TD-05 D keeps the B conditions: 5M close back inside the zone after the BOS -> none; zone only after the update of "
-       "t -> none; Track BROKEN at t -> none", orders(S1) == orders(S2) == orders(S3) == [], str((S1.log, S2.log, S3.log)))
-    base = [FLAT, bt, nxt, (101.8, 103.0, 101.5, 102.5)]
-    S1, B1 = run3(base, [[ZL]] * 4, m1s=[(), good, (), ()], mode="D", **OFF, **m)
-    alt = [FLAT, bt, (95.0, 96.0, 80.0, 81.0), (81.0, 82.0, 70.0, 71.0)]
-    S2, B2 = run3(alt, [[ZL]] * 2 + [[]] * 2, m1s=[(), good, (), ()], mode="D", **OFF, **m)
-    ok("TD-06 non-repaint: the D decision at t uses only the t-1 candidates and the 1M bars inside t (later bars changed "
-       "-> same order at t); nothing is decided on unconfirmed data",
-       orders(S1)[:1] == orders(S2)[:1] and len(orders(S1)) == 1 and S1.log[1] == S2.log[1], str((S1.log[1], S2.log[1])))
+    S, _ = run3([FLAT, (103.0, 103.9, 99.0, 101.5)], [[ZL]] * 2, m1s=M([], same), **D)
+    ok("TD-05 the touch 1M bar itself cannot be the BOS (close 103.8 there); later closes stay below the level 103.9 -> no "
+       "entry", orders(S) == [], str(S.log))
+    # expiry: touch = 1M #0 of 5M bar 1; drift bars never close above the level 102.5; BOS on the k-th 1M bar after the touch
+    touch = (102.5, 99.0, 100.0)
+    drift = (101.5, 100.3, 100.8)            # stays above the zone (no re-touch) and below the level
+    bosb = (103.0, 100.6, 102.8)
+
+    def expiry_case(k, wait=30):
+        seq = [touch] + [drift] * (k - 1) + [bosb] + [drift] * 6
+        chunks = [seq[x:x + 5] for x in range(0, len(seq), 5)]
+        nbar = len(chunks) + 1
+        bars = [FLAT] + [(101.0, 103.0, 99.0, 102.8 if bosb in ch else 100.5) for ch in chunks]
+        S, B = run3(bars + [nxt], [[ZL]] * (nbar + 1), m1s=M([], *chunks, []), dwait=wait, **D)
+        return [t for t, _ in orders(S)], 1 + (k // 5)
+
+    e30, e31 = expiry_case(30), expiry_case(31)
+    e5 = expiry_case(5, wait=5)
+    e6 = expiry_case(6, wait=5)
+    ok("TD-06 wait limit counts confirmed 1M bars after the touch: BOS on the 30th -> order at that 5M close; on the 31st "
+       "-> released, no order (input 5: 5th yes, 6th no)",
+       e30[0] == [e30[1]] and e31[0] == [] and e5[0] == [e5[1]] and e6[0] == [],
+       str((e30, e31, e5, e6)))
+    S, _ = run3([FLAT, (103.0, 103.5, 99.0, 100.9), (101.0, 102.9, 100.6, 102.7), nxt],
+                [[ZL], [ZL], [dict(ZL, state=ACT)], [ZL]], m1s=M([], t1, t2_, []), **D)
+    S2, _ = run3([FLAT, (103.0, 103.5, 99.0, 100.9), (101.0, 102.9, 100.6, 101.0), (101.0, 102.9, 100.6, 102.7)],
+                 [[ZL], [dict(ZL, sZ=2)], [ZL], [ZL]], m1s=M([], t1, [(101.2, 100.6, 101.0)] * 5, t2_), **D)
+    ok("TD-07 the wait is released when the zone stops being a valid candidate (State ACTIVE at the BOS bar; Strength "
+       "Medium for one bar before the BOS) -> no entry, even when the zone is valid again later",
+       orders(S) == [] and orders(S2) == [], str((S.log, S2.log)))
+    dup1 = [(103.5, 102.0, 103.4), (103.4, 101.6, 101.8), (101.9, 99.0, 100.0), (101.0, 99.5, 100.5), (101.0, 100.2, 100.8)]
+    m1s = M([], dup1, [(101.0, 100.4, 100.8)] * 5, [])
+    m1s[2] = m1s[1][:2] + m1s[2]                   # bar 2 repeats two already-processed 1M bars (old times)
+    S, _ = run3([FLAT, (103.0, 103.5, 99.0, 100.8), (101.0, 101.0, 100.4, 100.8), nxt], [[ZL]] * 4, m1s=m1s, **D)
+    ok("TD-08 each 1M bar is processed once: 1M bars whose time is not after the last processed one are skipped (a repeated "
+       "close 103.4 would otherwise count as a BOS)", orders(S) == [], str(S.log))
+    S1, _ = run3([FLAT, (103.0, 103.5, 99.0, 99.8)], [[ZL]] * 2, m1s=M([], good[:4] + [(102.8, 99.5, 99.8)]), **D)
+    S2, _ = run3([FLAT, bt], [[], [ZL]], m1s=M([], good), **D)
+    S3, _ = run3([FLAT, bt], [[ZL], [dict(ZL, state=BRK)]], m1s=M([], good), **D)
+    ok("TD-09 the BOS bar's 5M close back inside the zone -> none; a zone that only exists after the update of t is not "
+       "touched in t (touches use the t-1 candidates) -> none; Track BROKEN at t -> none",
+       orders(S1) == orders(S2) == orders(S3) == [], str((S1.log, S2.log, S3.log)))
+    base = [FLAT, (103.0, 103.5, 99.0, 100.9), (101.0, 102.9, 100.6, 102.7), nxt, (101.8, 103.0, 101.5, 102.5)]
+    S1, B1 = run3(base, [[ZL]] * 5, m1s=M([], t1, t2_, [], []), **D)
+    alt = base[:3] + [(95.0, 96.0, 80.0, 81.0), (81.0, 82.0, 70.0, 71.0)]
+    S2, B2 = run3(alt, [[ZL]] * 3 + [[]] * 2, m1s=M([], t1, t2_, [(96.0, 80.0, 81.0)], []), **D)
+    ok("TD-10 non-repaint: decisions up to t depend only on confirmed 1M / 5M data up to t (later bars changed -> same "
+       "log up to t and the same order at t)", S1.log[:3] == S2.log[:3] and len(orders(S1)) == 1 and orders(S1) == orders(S2),
+       str((S1.log[:3], S2.log[:3])))
+    S, B = run3([FLAT, bt, nxt, (101.8, 102.0, 101.5, 101.9)], [[ZL, Z(2, SUP, 100.5, 96.0)]] * 4,
+                m1s=M([], good, [(102.0, 101.0, 101.8)] * 5, []), **D)
+    ok("TD-11 one order at a time: the second zone's touch / BOS while the first order is open is consumed without an "
+       "order", len(orders(S)) == 1, str(orders(S)))
     # --- Session -----------------------------------------------------------------------------------------------------
     hits = []
     for tm, exp in ((8 * 60 + 55, 0), (9 * 60, 1), (23 * 60 + 55, 1), (0, 1), (2 * 60 + 55, 1), (3 * 60, 0), (5 * 60, 0)):
@@ -534,7 +627,8 @@ def gate_equiv():
           "all modes and directions)", bad == [] and n_orders > 50, f"bad={bad[:10]} orders={n_orders}")
 
 
-MUTS = ["d_anydir", "d_same_bar", "d_prebos", "d_noclose", "sess_closed_end", "sess_no_cancel", "sess_off_entry",
+MUTS = ["d_anydir", "d_same_bar", "d_prebos", "d_noclose", "d_dup", "d_expire_late", "d_noexpire", "d_no_invalid",
+        "d_carry_off", "sess_closed_end", "sess_no_cancel", "sess_off_entry",
         "rr_min_le", "rr_max_le", "rr_far_fixed", "tp_weak", "tp_boost_full", "tp_far", "tp_any_state",
         "tp_from_ref", "no_precheck", "be_fill_hl", "be_strict", "be_retro"]
 

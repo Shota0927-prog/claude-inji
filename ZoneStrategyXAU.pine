@@ -823,10 +823,12 @@ f_stZoneEval(zn.Zone z) =>
 //  ・A: 足 t の更新後の候補で、終値が Zone の外にあるとき指値 L を置く (元 Strong = Zone 端、昇格範囲だけ Strong =
 //       昇格範囲の端)。期限・差し替えなし。未約定の間は毎確定足で「同じ Track が live、State 有効、L が Zone 内で
 //       L での Strength (元 / 昇格) >= Strong、時間帯内」を確認し、外れたら取り消す (足の途中の約定は取り消せない)。
-//  ・B / C / D: 足 t−1 の確定時に保存した候補に足 t の高値安値が接触し、終値が Zone の外で確定 (Long は > top)。
-//       C はさらに包み足またはピンバー。D はさらに、足 t の 1分足で「Zone の外から接触 → 反発 → 確定 1分足の BOS」
-//       がこの順に起きたこと。足 t の更新後も Track が live で同じ State のときだけ、足 t の確定時に次足成行で発注する
-//       (1分足の BOS 時点では約定させない)。
+//  ・B / C: 足 t−1 の確定時に保存した候補に足 t の高値安値が接触し、終値が Zone の外で確定 (Long は > top)。
+//       C はさらに包み足またはピンバー。足 t の更新後も Track が live で同じ State のときだけ次足成行。
+//  ・D: 確定 1分足が、その 5分足の 1 本前の確定時の候補 Zone に外から接触したら待機を始め、接触から最安値
+//       (Short は最高値) までの高値の最大 (Short は安値の最小) を確定 1分足の終値が越えたら BOS。待機は 5分足を
+//       またいで持ち越し、接触後の確定 1分足が期限本数に達するか、候補 Zone でなくなったら解除する。BOS が出た
+//       5分足の確定時に、Zone が有効で終値が Zone の外なら次足成行で発注する (1分足の BOS 時点では約定させない)。
 //  ・新規 Entry (発注と保留中の指値) は時間帯の中だけ。保有中の SL / TP / 建値管理は時間外も続ける。
 //  ・SL = 元 Zone の反対端 ∓ Buffer。Entry と同時に発注し、建値移動以外では動かさない。
 //  ・TP: 約定を確認した足の確定時に、実約定価格から決める (約定した足の中では TP は無い)。
@@ -842,6 +844,7 @@ stMode = input.string("B: Confirmed Rejection", "Entry Mode",
 stDir = input.string("Both", "Direction", options = ["Long Only", "Short Only", "Both"], group = G_ST)
 stBuffer = input.float(3.0, "SL Buffer ($)", minval = 0.0, step = 0.5, group = G_ST)
 stPinRatio = input.float(2.0, "C · Pin Bar Wick / Body", minval = 0.5, step = 0.5, group = G_ST)
+stDWait = input.int(30, "D · BOS Wait (confirmed 1M bars)", minval = 1, group = G_ST)
 var string G_STS = "03 · Strategy Session (新規 Entry のみ)"
 stUseSess = input.bool(true, "Limit New Entries to Session", group = G_STS)
 stSessTz = input.string("Asia/Tokyo", "Session Timezone", group = G_STS)
@@ -871,11 +874,13 @@ bool  stPatL   = (close > open and close[1] < open[1] and open <= close[1] and c
 bool  stPatS   = (close < open and close[1] > open[1] and open >= close[1] and close <= open[1]) or (stWickHi > 0 and stWickHi >= stPinRatio * stBody and stWickHi > stWickLo)
 
 // D の 1分足 (下位足データ: 足 t の中の確定 1分足の配列)。D のときだけ取得する
+array<int>   m1t = na
 array<float> m1h = na
 array<float> m1l = na
 array<float> m1c = na
 if stModeD and is5mChart
-    [rh, rl, rc] = request.security_lower_tf(syminfo.tickerid, "1", [high, low, close])
+    [rt, rh, rl, rc] = request.security_lower_tf(syminfo.tickerid, "1", [time, high, low, close])
+    m1t := rt
     m1h := rh
     m1l := rl
     m1c := rc
@@ -910,39 +915,16 @@ f_stAdopt(StCand c, float lo, float hi) =>
 f_stBetter(bool distFirst, int aS, float aSc, float aD, int aT, int bS, float bSc, float bD, int bT) =>
     distFirst and aD != bD ? aD < bD : aS != bS ? aS > bS : aSc != bSc ? aSc > bSc : aD != bD ? aD < bD : aT < bT
 
-// D: 足 t の 1分足で「Zone の外 (Long は上) から接触 → 反発 → 確定 1分足の BOS」がこの順に起きたか。
-//    接触 = 直前の終値が Zone の外で、その 1分足が Zone に触れた。BOS 水準 = 接触から最安値 (Short は最高値) までの
-//    1分足の高値の最大 (Short は安値の最小)。接触した 1分足より後の 1分足の終値がその水準を越えたら BOS。
-//    接触より前の BOS は数えない。直前の終値は、最初の 1分足では前の 5分足の終値。
-f_stBos(int side, float top, float bot, float prevC, array<float> hh, array<float> hl, array<float> hc) =>
-    int   nb  = na(hh) ? 0 : array.size(hh)
-    bool  bos = false
-    bool  tch = false
-    float ext = na
-    float run = na
-    float lvl = na
-    float pc  = prevC
-    if nb > 0
-        for j = 0 to nb - 1
-            float h  = array.get(hh, j)
-            float l  = array.get(hl, j)
-            float cl = array.get(hc, j)
-            if not bos
-                if not tch
-                    if l <= top and h >= bot and (side == 1 ? pc > top : pc < bot)
-                        tch := true
-                        ext := side == 1 ? l : h
-                        run := side == 1 ? h : l
-                        lvl := run
-                else if side == 1 ? cl > lvl : cl < lvl
-                    bos := true
-                else
-                    run := side == 1 ? math.max(run, h) : math.min(run, l)
-                    if side == 1 ? l < ext : h > ext
-                        ext := side == 1 ? l : h
-                        lvl := run
-            pc := cl
-    bos
+// D の待機: 接触した候補 Zone (接触時の値)、BOS 水準の追跡、接触後に処理した確定 1分足の本数
+type StWait
+    StCand c
+    float  ext
+    float  run
+    float  lvl
+    int    cnt
+    bool   bos
+    int    aS
+    float  aSc
 
 // TP 価格の候補: 利益方向で最も手前の反対側 Zone 端 (Long は ref より上で最も低い、Short は ref より下で最も高い)
 f_stNearest(array<float> edges, int side, float ref) =>
@@ -971,6 +953,9 @@ f_stTp(int side, float fillPx, float sl, float edge) =>
 
 var array<StCand>  stPrev = array.new<StCand>()
 var map<int, bool> stUsed = map.new<int, bool>()
+var array<StWait>  stWaits = array.new<StWait>()
+var int            m1LastT = na
+var float          m1PrevC = na
 var int    oState  = 0       // 0 = なし / 1 = Entry 発注済み (未約定) / 2 = 保有中 / 3 = 成行決済を発注済み
 var int    oSeq    = 0
 var string oEid    = ""
@@ -1076,6 +1061,78 @@ if is5mChart and barstate.isconfirmed
             oStop := oFill
             strategy.exit(oXid, oEid, stop = oStop, limit = oTP)
 
+    // (2d) D: 足 t の確定 1分足を古い順に 1 回ずつ処理する (処理済みの時刻以前は飛ばす)。
+    //      1分足ごとに、待機中の BOS / 期限を先に判定し、その後で新しい接触を待機に加える (接触した 1分足では BOS にしない)
+    array<StCand> dSrc = array.new<StCand>()
+    array<int>    dAS  = array.new_int()
+    array<float>  dASc = array.new_float()
+    if stModeD
+        int nb = na(m1t) ? 0 : array.size(m1t)
+        if nb > 0
+            for j = 0 to nb - 1
+                int tj = array.get(m1t, j)
+                if na(m1LastT) or tj > m1LastT
+                    m1LastT := tj
+                    float h  = array.get(m1h, j)
+                    float l  = array.get(m1l, j)
+                    float cl = array.get(m1c, j)
+                    int nw = array.size(stWaits)
+                    if nw > 0
+                        for w = nw - 1 to 0
+                            StWait x = array.get(stWaits, w)
+                            if not x.bos
+                                x.cnt := x.cnt + 1
+                                if x.c.side == 1 ? cl > x.lvl : cl < x.lvl
+                                    x.bos := true
+                                else
+                                    x.run := x.c.side == 1 ? math.max(x.run, h) : math.min(x.run, l)
+                                    if x.c.side == 1 ? l < x.ext : h > x.ext
+                                        x.ext := x.c.side == 1 ? l : h
+                                        x.lvl := x.run
+                                    if x.cnt >= stDWait
+                                        array.remove(stWaits, w)
+                    int nc = array.size(stPrev)
+                    if nc > 0
+                        for k = 0 to nc - 1
+                            StCand c = array.get(stPrev, k)
+                            bool dirOK = c.side == 1 ? stLongOK : stShortOK
+                            if dirOK and not map.contains(stUsed, c.track) and l <= c.top and h >= c.bot and (c.side == 1 ? m1PrevC > c.top : m1PrevC < c.bot)
+                                bool waiting = false
+                                int nw2 = array.size(stWaits)
+                                if nw2 > 0
+                                    for w = 0 to nw2 - 1
+                                        StWait y = array.get(stWaits, w)
+                                        if y.c.track == c.track
+                                            waiting := true
+                                if not waiting
+                                    [wS, wSc] = f_stAdopt(c, math.max(l, c.bot), math.min(h, c.top))
+                                    if wS >= SR_STRONG
+                                        float e0 = c.side == 1 ? l : h
+                                        float r0 = c.side == 1 ? h : l
+                                        array.push(stWaits, StWait.new(c, e0, r0, r0, 0, false, wS, wSc))
+                    m1PrevC := cl
+        // 足 t の更新後に候補 Zone (同じ Track、同じ向き、Strong 資格) でなくなった待機は解除。BOS が出た待機は
+        // この確定足で Entry 候補にして解除する (終値が Zone の外のときだけ候補)
+        int nw3 = array.size(stWaits)
+        if nw3 > 0
+            for w = nw3 - 1 to 0
+                StWait x = array.get(stWaits, w)
+                bool valid = false
+                int nc3 = array.size(cur)
+                if nc3 > 0
+                    for k = 0 to nc3 - 1
+                        StCand cc = array.get(cur, k)
+                        if cc.track == x.c.track and cc.side == x.c.side
+                            valid := true
+                if not valid
+                    array.remove(stWaits, w)
+                else if x.bos
+                    if (x.c.side == 1 ? close > x.c.top : close < x.c.bot) and not map.contains(stUsed, x.c.track)
+                        array.push(dSrc, x.c)
+                        array.push(dAS, x.aS)
+                        array.push(dASc, x.aSc)
+                    array.remove(stWaits, w)
+
     // (3) 保留中の指値 (A) の取消: Track 消失 / State 無効 / L で Strong 以上の資格を失った / 時間帯の外
     bool cancelBar = false
     if oState == 1 and (not pendOK or not stSessOK)
@@ -1086,7 +1143,7 @@ if is5mChart and barstate.isconfirmed
 
     // (4) 新規 Entry (注文が無く、取消をした足でなく、時間帯の中のときだけ)
     if oState == 0 and not cancelBar and stSessOK
-        array<StCand> src = stModeA ? cur : stPrev
+        array<StCand> src = stModeA ? cur : stModeD ? dSrc : stPrev
         int   bkL = -1
         int   bkS = -1
         float bpL = na
@@ -1117,6 +1174,11 @@ if is5mChart and barstate.isconfirmed
                         aSc := sc1
                         d   := math.abs(close - px)
                         ok  := (c.side == 1 ? close > c.top : close < c.bot) and aS >= SR_STRONG
+                    else if stModeD
+                        aS  := array.get(dAS, k)
+                        aSc := array.get(dASc, k)
+                        d   := math.abs(close - (c.side == 1 ? c.top : c.bot))
+                        ok  := true
                     else
                         [s2, sc2] = f_stAdopt(c, math.max(low, c.bot), math.min(high, c.top))
                         aS  := s2
@@ -1127,8 +1189,6 @@ if is5mChart and barstate.isconfirmed
                         if idx >= 0
                             trkOK := array.get(curSt, idx) == (c.side == 1 ? ST_SUPPORT : ST_RESIST)
                         ok := low <= c.top and high >= c.bot and (c.side == 1 ? close > c.top : close < c.bot) and aS >= SR_STRONG and trkOK and (not stModeC or (c.side == 1 ? stPatL : stPatS))
-                        if ok and stModeD
-                            ok := f_stBos(c.side, c.top, c.bot, close[1], m1h, m1l, m1c)
                     if ok and c.side == 1
                         bool take = bkL < 0
                         if not take
