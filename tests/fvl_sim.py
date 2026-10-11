@@ -24,6 +24,7 @@ import zp_overlap_sim as zs           # noqa: E402
 
 ROOT = lb.ROOT
 CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+CUR = __import__("bon_build").strip_bon(CUR) or CUR  # bonus defaults stripped -> 9270c50 text (delta pinned by bon_sim)
 BASE = lb.git_show(lb.FVL_BASE_REV)
 RESULTS = []
 

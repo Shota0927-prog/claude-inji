@@ -23,6 +23,7 @@ import zp_overlap_build as zp         # noqa: E402
 
 ROOT = wb.ROOT
 CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+CUR = __import__("bon_build").strip_bon(CUR) or CUR  # bonus defaults stripped -> 9270c50 text (delta pinned by bon_sim)
 CUR = __import__("fvl_build").strip_fvl(CUR) or CUR  # FVG label info stripped -> 67f8fd2 text (delta pinned by fvl_sim)
 BASE = wb.git_show(wb.SWV_BASE_REV)
 LIB6 = open(os.path.join(ROOT, sb.SW_PATH), encoding="utf-8").read()       # = published /6 (confirmed by the user)

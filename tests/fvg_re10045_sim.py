@@ -213,6 +213,7 @@ def htf_set(n15=0, n60=0, n240=0, bear15=False):
 
 def main():
     cur = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+    cur = __import__("bon_build").strip_bon(cur) or cur  # bonus defaults stripped -> 9270c50 text (delta pinned by bon_sim)
     cur = __import__("fvl_build").strip_fvl(cur) or cur  # FVG label info stripped -> 67f8fd2 text (delta pinned by fvl_sim)
     cur = __import__("swv_build").strip_swv(cur) or cur  # SW-V1 import /6 stripped -> 110e5b0 text (delta pinned by swv_sim)
     cur = __import__("rnv_build").strip_rnv(cur) or cur  # RN-1 V1 stripped -> 6e554b2 text (delta pinned by rnv_sim)

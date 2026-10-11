@@ -38,6 +38,7 @@ def code_only(src):
 
 import zp_overlap_build as _zp                                            # noqa: E402
 _RAW = open(VIS_PATH, encoding="utf-8").read()
+_RAW = __import__("bon_build").strip_bon(_RAW) or _RAW  # bonus defaults stripped -> 9270c50 text (delta pinned by bon_sim)
 _RAW = __import__("fvl_build").strip_fvl(_RAW) or _RAW  # FVG label info stripped -> 67f8fd2 text (delta pinned by fvl_sim)
 _RAW = __import__("swv_build").strip_swv(_RAW) or _RAW  # SW-V1 import /6 stripped -> 110e5b0 text (delta pinned by swv_sim)
 _RAW = __import__("rnv_build").strip_rnv(_RAW) or _RAW  # RN-1 V1 stripped -> 6e554b2 text (delta pinned by rnv_sim)

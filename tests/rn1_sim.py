@@ -56,6 +56,7 @@ def gate_static():
             "PracticalEntryDispatchHarness.pine"]
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", rb.RN_BASE_REV, "--"] + prod, capture_output=True, text=True).stdout
     vis = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+    vis = __import__("bon_build").strip_bon(vis) or vis  # bonus defaults stripped -> 9270c50 text (delta pinned by bon_sim)
     vis = __import__("fvl_build").strip_fvl(vis) or vis  # FVG label info stripped -> 67f8fd2 text (delta pinned by fvl_sim)
     vis = __import__("swv_build").strip_swv(vis) or vis  # SW-V1 import /6 stripped -> 110e5b0 text (delta pinned by swv_sim)
     vis_ok = __import__("rnv_build").strip_rnv(vis) == rb.git_show(rb.RN_BASE_REV, "ZoneVisualPractical.pine")

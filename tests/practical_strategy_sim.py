@@ -322,6 +322,7 @@ def fixture_alloc():
 #    The current Visual adds only the 5M execution gate; fixture_p16_visual_5m_gate ties it to b3b69ae.
 VIS_PRE_GATE_REV = "b3b69ae"
 VIS_CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+VIS_CUR = __import__("bon_build").strip_bon(VIS_CUR) or VIS_CUR  # bonus defaults stripped -> 9270c50 text (delta pinned by bon_sim)
 VIS_CUR = __import__("fvl_build").strip_fvl(VIS_CUR) or VIS_CUR  # FVG label info stripped -> 67f8fd2 text (delta pinned by fvl_sim)
 VIS_CUR = __import__("swv_build").strip_swv(VIS_CUR) or VIS_CUR  # SW-V1 import /6 stripped -> 110e5b0 text (delta pinned by swv_sim)
 VIS_CUR = __import__("rnv_build").strip_rnv(VIS_CUR) or VIS_CUR  # RN-1 V1 stripped -> 6e554b2 text (delta pinned by rnv_sim)
