@@ -382,6 +382,14 @@ class Engine:
         allr = {r.uid: r for r in self.persist + dyn}
         for z in cl:
             z["catCount"] = len({allr[u].srcCat for u in z["uids"]})
+            if getattr(self, "swing_max", False):          # SW-1 (ZoneEnginePracticalSwingMax): max Swing TF score only
+                tf_sc = {C.hzTf1: C.scoreHz1, C.hzTf2: C.scoreHz2, C.hzTf3: C.scoreHz3}
+                hits = {allr[u].srcTf for u in z["uids"] if allr[u].srcCat == pz.CAT_HZ
+                        and allr[u].srcId in ("SWING_H", "SWING_L") and allr[u].srcTf in tf_sc}
+                if len(hits) > 1:
+                    z["baseSum"] += max(tf_sc[h] for h in hits) - sum(tf_sc[h] for h in hits)
+                    z["score"] = z["baseSum"] + z["slopeB"] + z["maB"] + z["confB"]
+                z["swingTfs"] = len(hits)
             z["rnLevel"], z["rnBase"], z["rnScoreDelta"], z["rnBaseSumExRn"] = None, 0.0, 0.0, z["baseSum"]
             if getattr(self, "rn_attach", False):          # RN-1 (ZoneEnginePracticalRN f_finalizeCluster)
                 lv, b = rn_pick(z["bottom"], z["top"])
