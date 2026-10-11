@@ -16,6 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import st1_build as tb                # noqa: E402
+import st2_build as s2                # noqa: E402
 import nr_s1_build as nb              # noqa: E402
 import nr_a1_build as na              # noqa: E402
 import fvg_batch_c_build as cb        # noqa: E402
@@ -24,7 +25,7 @@ import rnv_build as vb                # noqa: E402
 import fvg_re10045_sim as fr          # noqa: E402
 
 ROOT = tb.ROOT
-ST = open(os.path.join(ROOT, tb.ST_PATH), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, tb.ST_PATH)) else ""
+ST = s2.strip_st2(open(os.path.join(ROOT, tb.ST_PATH), encoding="utf-8").read()) if os.path.exists(os.path.join(ROOT, tb.ST_PATH)) else ""
 VIS = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
 BASE = tb.git_show(tb.ST_BASE_REV)
 RESULTS = []
