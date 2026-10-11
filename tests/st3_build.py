@@ -46,7 +46,7 @@ LOOP_NEW = """// ---- ST-3 · 反発 Entry (A / B / C / D)、時間帯、反対�
 //  ・建値移動: 確定足の高値 (Long) / 安値 (Short) が約定価格 ± Trigger に届いたら、stop を約定価格へ移す。
 //       移した stop は次の足から有効。足の途中で約定した指値の約定足は終値だけで判定する。
 var string G_ST = "03 · Strategy Entry"
-stMode = input.string("B: Confirmed Rejection", "Entry Mode",
+stMode = input.string("D: 1M BOS Rebound", "Entry Mode",
      options = ["A: Touch Limit", "B: Confirmed Rejection", "C: Candle Pattern", "D: 1M BOS Rebound"], group = G_ST)
 stDir = input.string("Both", "Direction", options = ["Long Only", "Short Only", "Both"], group = G_ST)
 stBuffer = input.float(3.0, "SL Buffer ($)", minval = 0.0, step = 0.5, group = G_ST)
@@ -57,14 +57,14 @@ stUseSess = input.bool(true, "Limit New Entries to Session", group = G_STS)
 stSessTz = input.string("Asia/Tokyo", "Session Timezone", group = G_STS)
 stSessStartH = input.int(9, "Session Start Hour", minval = 0, maxval = 23, group = G_STS)
 stSessStartM = input.int(0, "Session Start Minute", minval = 0, maxval = 59, group = G_STS)
-stSessEndH = input.int(3, "Session End Hour", minval = 0, maxval = 23, group = G_STS)
+stSessEndH = input.int(2, "Session End Hour", minval = 0, maxval = 23, group = G_STS)
 stSessEndM = input.int(0, "Session End Minute", minval = 0, maxval = 59, group = G_STS)
 var string G_STT = "03 · Strategy TP / Breakeven"
 stTpZone = input.bool(true, "TP · Nearest Opposite Zone (Medium+)", group = G_STT)
 stTpMinRR = input.float(1.0, "TP Zone · Min RR (未満は見送り)", minval = 0.0, step = 0.1, group = G_STT)
 stTpMaxRR = input.float(3.0, "TP Zone · Max RR (以上は固定 RR)", minval = 0.1, step = 0.1, group = G_STT)
 stRR = input.float(1.5, "TP Fixed RR", minval = 0.1, step = 0.1, group = G_STT)
-stBE = input.bool(true, "Breakeven Stop", group = G_STT)
+stBE = input.bool(false, "Breakeven Stop", group = G_STT)
 stBEDist = input.float(10.0, "Breakeven Trigger ($)", minval = 0.0, step = 0.5, group = G_STT)
 
 bool stModeA   = stMode == "A: Touch Limit"

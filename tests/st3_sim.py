@@ -100,12 +100,16 @@ def gate_static():
     ins = dict(re.findall(r"^(st\w+) = (input\.\w+\(.*)$", s3.LOOP_NEW, re.M))
     want = {"stBuffer": "input.float(3.0,", "stRR": "input.float(1.5,", "stUseSess": "input.bool(true,",
             "stSessTz": 'input.string("Asia/Tokyo",', "stSessStartH": "input.int(9,", "stSessStartM": "input.int(0,",
-            "stSessEndH": "input.int(3,", "stSessEndM": "input.int(0,", "stTpZone": "input.bool(true,",
-            "stTpMinRR": "input.float(1.0,", "stTpMaxRR": "input.float(3.0,", "stBE": "input.bool(true,",
-            "stBEDist": "input.float(10.0,", "stDWait": "input.int(30,"}
-    check("TS-07 defaults: Buffer 3, fixed RR 1.5, session JST 09:00-03:00 ON, zone TP ON (RR 1.0 / 3.0), breakeven ON "
-          "at 10$; Entry Mode offers A / B / C / D",
-          all(ins.get(k, "").startswith(v) for k, v in want.items())
+            "stSessEndH": "input.int(2,", "stSessEndM": "input.int(0,", "stTpZone": "input.bool(true,",
+            "stTpMinRR": "input.float(1.0,", "stTpMaxRR": "input.float(3.0,", "stBE": "input.bool(false,",
+            "stBEDist": "input.float(10.0,", "stDWait": "input.int(30,", "stMode": 'input.string("D: 1M BOS Rebound",',
+            "stDir": 'input.string("Both",', "stPinRatio": "input.float(2.0,"}
+    zin = dict(re.findall(r"^(zoneHalfWidth|clusterDist|maClusterDist) = (input\.float\([0-9.]+),", ST, re.M))
+    check("TS-07 defaults (TradingView reference setting): Entry Mode D, Direction Both, session ON JST 09:00-02:00, zone "
+          "TP ON (RR 1.0 / 3.0, fixed 1.5R), breakeven OFF (trigger 10$ kept), Buffer 3, D wait 30; Zone Half Width 3 / "
+          "Cluster Distance 5 / MA Cluster Distance 20 unchanged; Entry Mode still offers A / B / C / D",
+          all(ins.get(k, "").startswith(v) for k, v in want.items()) and len(ins) == len(want)
+          and zin == {"zoneHalfWidth": "input.float(3.0", "clusterDist": "input.float(5.0", "maClusterDist": "input.float(20.0"}
           and 'options = ["A: Touch Limit", "B: Confirmed Rejection", "C: Candle Pattern", "D: 1M BOS Rebound"]' in s3.LOOP_NEW,
           str({k: ins.get(k) for k in want}))
     miss = [p for p in PINS if blk.count(p) != 1]
@@ -498,6 +502,21 @@ def fixtures(mut=()):
        S.log[3].get("be") and B.closed and B.closed[0]["exit"] == 117.25 and B.closed[0]["exit_bar"] == 4, str((S.log, B.closed)))
     S, _ = run3([FLAT, (103.0, 103.5, 99.0, 101.0)], [[ZL]] * 2, tmins=[5 * 60] * 2, mode="B", s=9 * 60, e=9 * 60, tpzone=False, **m)
     ok("TT-04 start == end means all day", len(orders(S)) == 1)
+    dv = {k: int(v) for k, v in re.findall(r"^(stSess(?:Start|End)[HM]) = input\.int\((\d+),", s3.LOOP_NEW, re.M)}
+    sd, ed = dv["stSessStartH"] * 60 + dv["stSessStartM"], dv["stSessEndH"] * 60 + dv["stSessEndM"]
+    hits = []
+    for tm, exp in ((8 * 60 + 55, 0), (9 * 60, 1), (23 * 60 + 55, 1), (0, 1), (60 + 55, 1), (2 * 60, 0), (2 * 60 + 30, 0),
+                    (2 * 60 + 55, 0), (3 * 60, 0)):
+        S, B = run3([FLAT, (103.0, 103.5, 99.0, 101.0), FLAT], [[ZL]] * 3, tmins=[tm] * 3, mode="B", s=sd, e=ed,
+                    tpzone=False, be=False, **m)
+        hits.append((tm, len(orders(S)), exp))
+    S, B = run3([FLAT, (104.0, 104.5, 101.0, 104.0), (104.0, 104.5, 101.0, 104.0), (103.0, 103.5, 99.0, 100.5)], [[ZL]] * 4,
+                tmins=[60 + 50, 60 + 55, 2 * 60, 2 * 60 + 5], mode="A", s=sd, e=ed, tpzone=False, be=False, **m)
+    ok("TT-05 Pine default session (parsed from the source) = JST 09:00-02:00 across midnight: decision-bar close 08:55 no, "
+       "09:00 / 23:55 / 00:00 / 01:55 yes, 02:00 / 02:30 / 02:55 / 03:00 no (last entry fills at the 01:55 open); an A "
+       "limit placed at 01:50 is cancelled at the 02:00 close and does not fill in the 02:00-02:05 bar",
+       (sd, ed) == (9 * 60, 2 * 60) and all(n == e for _, n, e in hits)
+       and [t for t, _ in orders(S)] == [0] and "cancel" in S.log[2] and not B.fills, str((sd, ed, hits, S.log)))
     # --- TP: nearest opposite zone, RR 1.0 / 3.0 ----------------------------------------------------------------------
     # B long: fill at next open 101.5, SL 91, risk 10.5. RR(edge) = (edge - 101.5) / 10.5
     bars = [FLAT, (103.0, 103.5, 99.0, 101.0), (101.5, 102.0, 101.0, 101.8), (101.8, 140.0, 101.7, 139.0)]
