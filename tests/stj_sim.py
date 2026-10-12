@@ -42,6 +42,15 @@ def code_only(src):
 GEOM = next(a for a, b in sj.EDITS if b == "")
 
 
+def zone_edited(comp):
+    """the USDJPY edits that fall inside the Zone computation part (Half Width default, zn.update gating)."""
+    out = comp
+    for a, b in sj.EDITS:
+        if b and out.count(a) == 1:
+            out = out.replace(a, b)
+    return out
+
+
 def gate_static():
     pipe = sj.pipeline()
     check("SJ-01 ZoneStrategyUSDJPY.pine == stj_build.build(); strip_stj gives the ZONE-JPY -> ST-3 pipeline text back, "
@@ -54,7 +63,9 @@ def gate_static():
     st_comp = STJ[STJ.index(tb.IMPORT_LINE):STJ.index(tb.ST_BEGIN)]
     check("SJ-02 Zone computation part byte-identical to ZONE-JPY (inputs, Engine config, MA / Swing / Accum / Break feeds, "
           "trading day, zn.update, NR-S1, NR-A1, FVG Batch A with the yen FVG Min Width); only the display inputs and "
-          "the display-only label helper are left out", st_comp == comp.replace(GEOM, "") and comp.count(GEOM) == 1)
+          "the display-only label helper are left out; USDJPY edits only: Half Width default 0.03 and zn.update on "
+          "confirmed bars", st_comp == zone_edited(comp.replace(GEOM, "")) and comp.count(GEOM) == 1
+          and zone_edited(comp) != comp)
     ev = STJ[STJ.index(tb.ST_BEGIN):]
     copies = [h for h in tb.COPIED_FUNCS if ev.count(tb.func(JPYV, h)) != 1]
     fe_x, fe_j = tb.func(XST, "f_stZoneEval("), tb.func(STJ, "f_stZoneEval(")
@@ -62,31 +73,35 @@ def gate_static():
           "strength, range = [max bottom, min top]) identical to ZONE-ST", copies == [] and fe_x == fe_j, str(copies))
     xo = XST[XST.index(s3.LOOP_NEW[:60]):]
     jo = STJ[STJ.index(s3.LOOP_NEW[:60]):]
-    for a, b in sj.EDITS[3:]:
-        jo = jo.replace(b, a)
+    for a, b in reversed(sj.EDITS):
+        if b and jo.count(b) == 1:
+            jo = jo.replace(b, a)
     check("SJ-04 order block (A / B / C / D, session, opposite-zone TP, breakeven, fill-price TP model, cancel, one "
-          "order / Track once) identical to ZONE-ST except the yen SL Buffer and Breakeven Trigger inputs", xo == jo)
+          "order / Track once) identical to ZONE-ST apart from the USDJPY edits (yen Buffer / BE Trigger, defaults, alert "
+          "inputs / functions / confirmed alert / provisional block, saved TP edges): reverting them gives ZONE-ST", xo == jo)
     req = lambda s: re.findall(r"request\.\w+\(.*$", code_only(s), re.M)
     check("SJ-05 requests = ZONE-ST's structure: the 10 Zone / FVG requests of ZONE-JPY + one request.security_lower_tf "
           "(1M, only in mode D); nothing else", req(STJ) == req(XST) and len(req(STJ)) == 11
           and [r for r in req(STJ) if "lower_tf" not in r] == req(JPYV))
     inp = lambda n: (re.search(r"^" + n + r"\s*=\s*input\.\w+\((.*)$", STJ, re.M) or [None, ""])[1]
-    want = {"stMode": '"D: 1M BOS Rebound",', "stDir": '"Both",', "zoneHalfWidth": "0.05,", "clusterDist": "0.08,",
+    want = {"stMode": '"D: 1M BOS Rebound",', "stDir": '"Long Only",', "zoneHalfWidth": "0.03,", "clusterDist": "0.08,",
             "fvgMinWidth": "0.05,", "enableRn": "false,", "stUseSess": "true,", "stSessTz": '"Asia/Tokyo",',
-            "stSessStartH": "9,", "stSessStartM": "0,", "stSessEndH": "2,", "stSessEndM": "0,", "stTpZone": "true,",
-            "stTpMinRR": "1.0,", "stTpMaxRR": "3.0,", "stRR": "1.5,", "stBE": "false,", "stBEDist": "0.15,",
-            "stBuffer": "0.05,", "stDWait": "30,"}
+            "stSessStartH": "9,", "stSessStartM": "0,", "stSessEndH": "2,", "stSessEndM": "0,", "stTpZone": "false,",
+            "stTpMinRR": "1.0,", "stTpMaxRR": "3.0,", "stRR": "1.3,", "stBE": "false,", "stBEDist": "0.15,",
+            "stBuffer": "0.05,", "stDWait": "30,", "stAlertProv": "true,", "stAlertConf": "true,"}
     bad = {k: inp(k) for k, v in want.items() if not inp(k).startswith(v)}
     zin_j = [x for x in re.findall(r"^(\w+)\s*=\s*(input\..*)$", JPYV, re.M)]
     zin_s = dict(re.findall(r"^(\w+)\s*=\s*(input\..*)$", STJ, re.M))
-    zdiff = [n for n, a in zin_j if n in zin_s and zin_s[n] != a]
+    zdiff = [n for n, a in zin_j if n in zin_s and zin_s[n] != a and n != "zoneHalfWidth"]
     decl = STJ[STJ.index("strategy(\n"):STJ.index(")\n", STJ.index("strategy(\n")) + 2]
     decl_x = XST[XST.index("strategy(\n"):XST.index(")\n", XST.index("strategy(\n")) + 2]
-    check("SJ-06 defaults: Entry Mode D, Both, Half Width 0.05 / Cluster 0.08 / FVG 0.05 yen, Round Number OFF, session ON "
-          "JST 09:00-02:00, zone TP ON (RR 1.0 / 3.0, fixed 1.5R), breakeven OFF (trigger 0.15), SL Buffer 0.05, D wait "
-          "30; every Zone input identical to ZONE-JPY; strategy() = ZONE-ST (fixed qty 1, pyramiding 0, no tick / close "
-          "/ fill recalculation, no Bar Magnifier) apart from the title",
-          bad == {} and zdiff == [] and decl.replace("USDJPY", "XAU").replace("ZONE-ST-JPY", "ZONE-ST") == decl_x
+    check("SJ-06 defaults (USDJPY validation setting): Entry Mode D, Long Only, Half Width 0.03 / Cluster 0.08 / FVG 0.05, "
+          "SL Buffer 0.05, fixed RR 1.3, session ON JST 09:00-02:00, zone TP OFF (RR 1.0 / 3.0 kept), breakeven OFF "
+          "(0.15), D wait 30, Round Number OFF, provisional / confirmed alerts ON; every other Zone input identical to "
+          "ZONE-JPY; strategy() = ZONE-ST apart from the title and calc_on_every_tick = true (fixed qty 1, pyramiding 0, "
+          "no close / fill recalculation, no Bar Magnifier)",
+          bad == {} and zdiff == [] and decl.replace("USDJPY", "XAU").replace("ZONE-ST-JPY", "ZONE-ST").replace(
+              "calc_on_every_tick     = true", "calc_on_every_tick     = false") == decl_x
           and "default_qty_value      = 1)" in decl and "use_bar_magnifier" not in STJ, str((bad, zdiff)))
     yen = {}
     for n in ("zoneHalfWidth", "clusterDist", "fvgMinWidth", "stBuffer", "stBEDist", "breakBuffer", "flipConfirmDist",
@@ -241,9 +256,242 @@ def gate_orders_yen():
     check("SM-06 one order at a time / Track once at yen scale: two zones touched with the same BOS -> one order",
           len(t3.orders(S)) == 1 and len(B.fills) == 1, str(t3.orders(S)))
 
+# =============================================================================
+# SA : provisional / confirmed alerts
+# =============================================================================
+def gate_alert_static():
+    co = code_only(STJ)
+    fn = tb.func(STJ, "f_stProvEval(")
+    fnc = code_only(fn)
+    glob_vars = ["stPrev", "stUsed", "stWaits", "m1LastT", "m1PrevC", "oState", "oSeq", "oEid", "oXid", "oLimit",
+                 "oSide", "oTrack", "oL", "oSL", "oTP", "oFill", "oStop", "oBE", "oClosed", "stTpUpPrev", "stTpDnPrev",
+                 "stProvBar", "zoneEng", "gFvgTop", "gFvgBot", "gFvgAlive"]
+    writes = [v for v in glob_vars if re.search(r"\b" + v + r"\s*(:=|\+=)", fnc)]
+    muts = re.findall(r"\b(array\.(?:push|set|remove|clear|insert|shift|pop|unshift)|map\.(?:put|remove|clear)|"
+                      r"strategy\.\w+|zn\.\w+|f_stZoneEval|f_fvc\w+|f_zpoBestFvg|request\.\w+|alert)\(", fnc)
+    xmut = re.findall(r"\bx\.\w+\s*:=", fnc)
+    check("SA-01 provisional evaluation f_stProvEval is read-only: no assignment to any global / var state (candidates, "
+          "Track use, BOS waits, processed 1M time, order state, Engine, FVG), no array / map mutation, no order / Engine / "
+          "Zone scan / FVG scan / request / alert call; wait values are copied to locals",
+          writes == [] and muts == [] and xmut == [] and "ext   := x.ext" in fn, str((writes, muts, xmut)))
+    pb = STJ[STJ.index("varip int stProvBar = na"):STJ.index("// ==== ZONE Strategy · Zone evaluation (end)")]
+    check("SA-02 provisional block: only when the provisional alert is ON, on the 5M chart, on an unconfirmed tick, with no "
+          "pending order / position (oState == 0) and inside the session; at most once per 5M bar via its own varip "
+          "(stProvBar); message built only when sending; alert.freq_once_per_bar",
+          "if stAlertProv and is5mChart and not barstate.isconfirmed and oState == 0 and stSessOK\n" in pb
+          and "    if na(stProvBar) or stProvBar != bar_index\n" in pb and "stProvBar := bar_index" in pb
+          and 'alert(f_stAlertMsg("仮", pSide, pPx, pSL), alert.freq_once_per_bar)' in pb
+          and co.count("stProvBar") == 4)
+    conf = '                if stAlertConf\n                    alert(f_stAlertMsg("確定", side, stModeA ? oL : close, oSL), alert.freq_all)\n'
+    i = STJ.index(conf) if STJ.count(conf) == 1 else -1
+    gi = STJ.index("if is5mChart and barstate.isconfirmed\n    // (1)")
+    check("SA-03 confirmed alert: inside the confirmed-bar order branch right after strategy.entry / strategy.exit (the "
+          "order event, not the fill), alert.freq_all, independent of the provisional state (no stProvBar there)",
+          i > gi and STJ[STJ.rindex("strategy.exit(oXid, oEid, stop = oSL)\n", 0, i):i].count("\n") == 1
+          and "stProvBar" not in code_only(STJ[gi:STJ.index("varip int stProvBar")])
+          and len(re.findall(r"\balert\(f_stAlertMsg", co)) == 2)
+    msg = tb.func(STJ, "f_stAlertMsg(")
+    check("SA-04 message: kind (仮 / 確定), direction, symbol (syminfo.tickerid), Entry Mode, reference price and SL; the "
+          "provisional one states it may not be confirmed; built only inside the two alert() calls; no string literal "
+          "spans a line (\\n escapes only)",
+          all(k in msg for k in ('"【" + kind', '"LONG" : "SHORT"', "syminfo.tickerid", '"\\nMode: " + stMode', '"\\nSL: "',
+                                 "不成立になる場合あり"))
+          and len(re.findall(r"f_stAlertMsg\(", co)) == 3
+          and [l for l in co.split("\n") if l.count('"') % 2 == 1] == [])
+    lines = STJ.split("\n")
+    gstart = next(k for k in range(len(lines) - 1)
+                  if lines[k] == "if is5mChart and barstate.isconfirmed" and lines[k + 1].startswith("    // (1)"))
+    gend = next(k for k in range(gstart + 1, len(lines)) if lines[k] and not lines[k].startswith(" "))
+    state_w = [k for k, l in enumerate(lines) if re.match(r"\s*(oState|oSeq|oEid|oL|oSL|oTP|oFill|oStop|oBE|oTrack|"
+                                                          r"stPrev|m1LastT|m1PrevC|stTpUpPrev|stTpDnPrev)\s*(:=|\+=)", l)]
+    upd = STJ.count("if is5mChart and barstate.isconfirmed\n    zoneCountNow := zn.update(zoneEng, zoneCfg, zoneFeed)\n")
+    check("SA-05 calc_on_every_tick = true only for the provisional alert: zn.update runs on confirmed bars only, every "
+          "order / candidate / BOS-wait / processed-1M state write sits inside the confirmed-5M block, the zone loop "
+          "(zn.zoneAt) and FVG storage updates stay confirmed-only (no Engine update / Zone scan / FVG scan per tick)",
+          "calc_on_every_tick     = true," in STJ and upd == 1 and code_only(STJ).count("zn.update(") == 1
+          and all(gstart < k < gend for k in state_w) and len(state_w) > 15
+          and "    if barstate.isconfirmed\n        int nowClose = time_close" in STJ, str(state_w[:3]))
+    req = lambda t: re.findall(r"request\.\w+\(", code_only(t))
+    check("SA-06 request increase for the alerts = 0 (11 = ZONE-ST; the provisional D check reuses the existing 1M "
+          "lower-TF arrays)", len(req(STJ)) == len(req(XST)) == 11)
+
+
+def prov_eval(S, bar, m1_now, prevC=None):
+    """mirror of f_stProvEval (read-only). m1_now = 1M bars of the forming 5M bar incl. the developing last one."""
+    o, h, l, c = bar
+    modeA, modeC, modeD = S.mode == "A", S.mode == "C", S.mode == "D"
+    closed = list(m1_now[:-1]) if m1_now else []
+    best = {1: None, -1: None}
+    for k, cd in enumerate(S.prev):
+        dirOK = S.longOK if cd["side"] == 1 else S.shortOK
+        if not dirOK or cd["track"] in S.used:
+            continue
+        px, aS, aSc = None, 0, None
+        if modeA:
+            px = (cd["top"] if cd["sZ"] >= 3 else cd["bTop"]) if cd["side"] == 1 else (cd["bot"] if cd["sZ"] >= 3 else cd["bBot"])
+            aS, aSc = S.adopt(cd, px, px)
+            d = abs(c - px)
+            ok = (c > cd["top"] if cd["side"] == 1 else c < cd["bot"]) and aS >= 3
+        elif modeD:
+            w = next((x for x in S.waits if x["c"]["track"] == cd["track"]), None)
+            armed = w is not None
+            ext, run, lvl, cnt = (w["ext"], w["run"], w["lvl"], w["cnt"]) if w else (None, None, None, 0)
+            if w:
+                aS, aSc = w["aS"], w["aSc"]
+            bos, pc, s_ = False, S.m1PrevC, cd["side"]
+            for (tj, hh, ll, cl) in closed:
+                if bos or not (S.m1LastT is None or tj > S.m1LastT):
+                    continue
+                if armed:
+                    cnt += 1
+                    if (cl > lvl) if s_ == 1 else (cl < lvl):
+                        bos = True
+                    else:
+                        run = max(run, hh) if s_ == 1 else min(run, ll)
+                        if (ll < ext) if s_ == 1 else (hh > ext):
+                            ext, lvl = (ll if s_ == 1 else hh), run
+                        if cnt >= S.dwait:
+                            armed = False
+                frm = pc is not None and (pc > cd["top"] if s_ == 1 else pc < cd["bot"])
+                if not armed and not bos and ll <= cd["top"] and hh >= cd["bot"] and frm:
+                    wS, wSc = S.adopt(cd, max(ll, cd["bot"]), min(hh, cd["top"]))
+                    if wS >= 3:
+                        armed, cnt, aS, aSc = True, 0, wS, wSc
+                        ext, run = (ll, hh) if s_ == 1 else (hh, ll)
+                        lvl = run
+                pc = cl
+            d = abs(c - (cd["top"] if s_ == 1 else cd["bot"]))
+            ok = bos and (c > cd["top"] if s_ == 1 else c < cd["bot"])
+        else:
+            aS, aSc = S.adopt(cd, max(l, cd["bot"]), min(h, cd["top"]))
+            d = abs(c - (cd["top"] if cd["side"] == 1 else cd["bot"]))
+            ok = l <= cd["top"] and h >= cd["bot"] and (c > cd["top"] if cd["side"] == 1 else c < cd["bot"]) and aS >= 3 \
+                and (not modeC or S.pat(cd["side"], bar, prevC or bar))
+        if ok:
+            key = (aS, aSc, d, cd["track"])
+            b = best[cd["side"]]
+            if b is None or S.better(modeA, key, b[1]):
+                best[cd["side"]] = (k, key, px)
+    side = 0
+    if best[1] and best[-1]:
+        if modeA and best[1][1][2] != best[-1][1][2]:
+            side = 1 if best[1][1][2] < best[-1][1][2] else -1
+    elif best[1]:
+        side = 1
+    elif best[-1]:
+        side = -1
+    if side == 0:
+        return 0, None, None
+    cd = S.prev[best[side][0]]
+    ePx = best[side][2] if modeA else c
+    sl = cd["bot"] - S.buffer if side == 1 else cd["top"] + S.buffer
+    edges = getattr(S, "tpUpPrev" if side == 1 else "tpDnPrev", [])
+    if S.tp(side, ePx, sl, S.nearest(edges, side, ePx))[0]:
+        return 0, None, None
+    return side, ePx, sl
+
+
+def run_ticks(bars, zones, m1s, ticks, tmins=None, prov=True, conf=True, **kw):
+    """bars / zones / m1s as run3; ticks[t] = list of (partial OHLC, 1M bars so far incl. the developing one) evaluated
+    before the confirmed step of bar t. Returns (S, B, alerts, mutated)."""
+    import copy
+    import st3_sim as t3
+    S, B = t3.Script3(**kw), t3.Broker()
+    alerts, provBar, mutated = [], None, False
+    for t in range(len(bars)):
+        if t > 0:
+            B.process(t, bars[t])
+        tm = tmins[t] if tmins else 12 * 60
+        for (pbar, pm1) in (ticks[t] if t < len(ticks) else []):
+            snap = copy.deepcopy((S.prev, S.waits, S.used, S.m1LastT, S.m1PrevC, S.oState, S.oSL, S.oL, S.log))
+            sessOK = (not S.sess) or S.in_sess(tm)
+            if prov and S.oState == 0 and sessOK and provBar != t:
+                side, px, sl = prov_eval(S, pbar, pm1, bars[t - 1] if t else pbar)
+                if side != 0:
+                    provBar = t
+                    alerts.append(("仮", t, side))
+            mutated |= copy.deepcopy((S.prev, S.waits, S.used, S.m1LastT, S.m1PrevC, S.oState, S.oSL, S.oL, S.log)) != snap
+        S.step(t, bars[t], bars[t - 1] if t > 0 else bars[t], zones[t], B, tmin=tm, m1=(m1s[t] if m1s else ()))
+        if conf and "order" in S.log[-1]:
+            alerts.append(("確定", t, S.log[-1]["order"]["side"]))
+    return S, B, alerts, mutated
+
+
+def gate_alert_model():
+    import st3_sim as t3
+    Z, SUP, RES = t3.Z, t3.SUP, t3.RES
+    J = dict(mode="D", dir="Long", buffer=0.05, rr=1.3, tpzone=False, be=False, e=2 * 60)
+    zl = Z(1, SUP, 150.100, 150.000)
+    flat = (150.300, 150.320, 150.280, 150.300)
+    m1b = [(5, 150.26, 150.20, 150.22), (6, 150.21, 150.05, 150.08), (7, 150.12, 150.06, 150.11),
+           (8, 150.24, 150.10, 150.23), (9, 150.24, 150.13, 150.15)]
+    m1s = [[(0, 150.32, 150.28, 150.30)], m1b, [], []]
+    bt = (150.250, 150.260, 150.050, 150.150)
+    nxt = (150.150, 150.160, 150.120, 150.150)
+    # ticks inside bar 1: after each 1M bar closes (the next one is developing)
+    tk = [[], [((150.25, 150.26, 150.05, 150.08), m1b[:2] + [(7, 150.10, 150.06, 150.09)]),
+               ((150.25, 150.26, 150.05, 150.11), m1b[:3] + [(8, 150.12, 150.10, 150.11)]),
+               ((150.25, 150.26, 150.05, 150.23), m1b[:4] + [(9, 150.24, 150.20, 150.23)]),
+               ((150.25, 150.26, 150.05, 150.20), m1b[:4] + [(9, 150.24, 150.18, 150.20)]),
+               ((150.25, 150.26, 150.05, 150.16), m1b[:4] + [(9, 150.24, 150.13, 150.16)])]]
+    bars = [flat, bt, nxt, nxt]
+    S0, B0 = t3.run3(bars, [[zl]] * 4, m1s=m1s, **J)
+    S1, B1, al1, mut1 = run_ticks(bars, [[zl]] * 4, m1s, tk, **J)
+    S2, B2, al2, mut2 = run_ticks(bars, [[zl]] * 4, m1s, tk, prov=False, conf=False, **J)
+    check("SA-07 alerts ON / OFF do not change the orders: same orders, fills and exits as the strategy run without "
+          "ticks (provisional evaluation on 5 ticks of the signal bar)",
+          t3.orders(S0) == t3.orders(S1) == t3.orders(S2) and B0.fills == B1.fills == B2.fills and B0.closed == B1.closed)
+    check("SA-08 provisional evaluation never changes Zone candidates, Track use, BOS waits, processed 1M time / close or "
+          "the order state (deep snapshot before / after every tick)", not mut1 and not mut2)
+    check("SA-09 D: the BOS on the closed 1M bar (close 150.23 > 150.21) gives one provisional LONG on the forming bar "
+          "(5 ticks -> sent once), then the confirmed LONG at that 5M close (the provisional did not suppress it)",
+          al1 == [("仮", 1, 1), ("確定", 1, 1)], str(al1))
+    tk_dev = [[], [((150.25, 150.26, 150.05, 150.23), m1b[:3] + [(8, 150.24, 150.10, 150.23)])]]
+    _, _, al3, _ = run_ticks(bars, [[zl]] * 4, m1s, tk_dev, **J)
+    check("SA-10 the developing 1M bar is not used: a BOS seen only on the still-forming 1M close gives no provisional "
+          "(the confirmed alert still comes at the 5M close once that 1M bar has closed)",
+          al3 == [("確定", 1, 1)], str(al3))
+    bt_fail = (150.250, 150.260, 150.050, 150.090)
+    m1f = m1b[:4] + [(9, 150.24, 150.08, 150.09)]
+    _, _, al4, _ = run_ticks([flat, bt_fail, nxt, nxt], [[zl]] * 4, [m1s[0], m1f, [], []], tk, **J)
+    check("SA-11 provisional only: the provisional LONG was sent, but the 5M bar closes back inside the zone (150.09 < "
+          "top 150.10) -> no order and no confirmed alert", al4 == [("仮", 1, 1)], str(al4))
+    blocked = {}
+    _, _, a_, _ = run_ticks(bars, [[zl]] * 4, m1s, tk, tmins=[2 * 60, 2 * 60, 2 * 60, 2 * 60], **J)
+    blocked["out of session (02:00)"] = a_
+    zs = Z(5, RES, 150.300, 150.200)
+    m1s_s = [[(0, 150.12, 150.08, 150.10)], [(5, 150.15, 150.10, 150.12), (6, 150.30, 150.21, 150.28),
+                                              (7, 150.27, 150.22, 150.24), (8, 150.20, 150.16, 150.17), (9, 150.19, 150.14, 150.15)], [], []]
+    tks = [[], [((150.12, 150.30, 150.10, 150.17), m1s_s[1][:4] + [(9, 150.19, 150.16, 150.17)])]]
+    _, _, a_, _ = run_ticks([(150.10, 150.12, 150.08, 150.10), (150.12, 150.30, 150.10, 150.15), nxt, nxt], [[zs]] * 4,
+                            m1s_s, tks, **J)
+    blocked["Short setup with Long Only"] = a_
+    _, _, a_short, _ = run_ticks([(150.10, 150.12, 150.08, 150.10), (150.12, 150.30, 150.10, 150.15), nxt, nxt], [[zs]] * 4,
+                                 m1s_s, tks, **dict(J, dir="Both"))
+    zl2 = Z(2, SUP, 150.110, 150.020)
+    tk_hold = [[], [], [], [((150.15, 150.16, 150.05, 150.12), m1b[:4] + [(9, 150.24, 150.13, 150.15)])]]
+    _, _, a_, _ = run_ticks([flat, bt, nxt, (150.15, 150.16, 150.05, 150.12)], [[zl, zl2]] * 4, [m1s[0], m1b, [], []],
+                            tk_hold, **J)
+    blocked["position held"] = [x for x in a_ if x[1] == 3]
+    check("SA-12 provisional follows the entry limits: none outside the session (decision close 02:00), none for a Short "
+          "setup under Long Only (the same setup with Both gives provisional + confirmed SHORT), none while a position "
+          "is held", all(v == [] for v in blocked.values()) and a_short == [("仮", 1, -1), ("確定", 1, -1)],
+          str((blocked, a_short)))
+    # consistency: with all 1M bars of the bar closed, the provisional decision equals the confirmed one (B and D)
+    bad = []
+    for mode in ("B", "D"):
+        S, B = t3.run3(bars[:1], [[zl]], m1s=m1s[:1], **dict(J, mode=mode))
+        side, _, _ = prov_eval(S, bt, m1b + [(10, 150.15, 150.15, 150.15)], flat)
+        S2, _ = t3.run3(bars[:2], [[zl]] * 2, m1s=m1s[:2], **dict(J, mode=mode))
+        conf_side = t3.orders(S2)[0][1]["side"] if t3.orders(S2) else 0
+        if side != conf_side or side == 0:
+            bad.append((mode, side, conf_side))
+    check("SA-13 consistency: when every 1M bar of the 5M bar has closed and the zone is unchanged by the update, the "
+          "provisional decision equals the confirmed decision (B, D)", bad == [], str(bad))
+
 
 def main():
-    for g in (gate_static, gate_zone_parity, gate_orders_yen):
+    for g in (gate_static, gate_zone_parity, gate_orders_yen, gate_alert_static, gate_alert_model):
         try:
             r = g()
             if g is gate_zone_parity:

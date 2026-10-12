@@ -367,6 +367,7 @@ class Script3(t2.Script):
                     B.exit(self.oXid, self.oEid, stop=self.oSL)
                     ev["order"] = dict(id=self.oEid, side=side, track=cd["track"], L=self.oL, SL=self.oSL)
         self.prev = cur
+        self.tpUpPrev, self.tpDnPrev = tpUp, tpDn          # saved TP edges (read by the USDJPY provisional mirror)
         self.log.append(ev)
 
 
