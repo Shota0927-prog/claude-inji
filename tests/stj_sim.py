@@ -316,11 +316,16 @@ def gate_alert_static():
           "lower-TF arrays)", len(req(STJ)) == len(req(XST)) == 11)
 
 
-def prov_eval(S, bar, m1_now, prevC=None):
+def prov_eval(S, bar, m1_now, prevC=None, now=None):
     """mirror of f_stProvEval (read-only). m1_now = 1M bars of the forming 5M bar incl. the developing last one."""
     o, h, l, c = bar
     modeA, modeC, modeD = S.mode == "A", S.mode == "C", S.mode == "D"
-    closed = list(m1_now[:-1]) if m1_now else []
+    # closed 1M bars: every element followed by a newer one, and the last one only when its minute has ended
+    # (time + 1 <= now, times in minutes here; Pine: time + 60000 <= timenow). now=None -> the last one is forming.
+    m1_now = list(m1_now or [])
+    if now is None:
+        now = m1_now[-1][0] + 0.5 if m1_now else 0
+    closed = [x for j, x in enumerate(m1_now) if j < len(m1_now) - 1 or x[0] + 1 <= now]
     best = {1: None, -1: None}
     for k, cd in enumerate(S.prev):
         dirOK = S.longOK if cd["side"] == 1 else S.shortOK
@@ -402,11 +407,12 @@ def run_ticks(bars, zones, m1s, ticks, tmins=None, prov=True, conf=True, **kw):
         if t > 0:
             B.process(t, bars[t])
         tm = tmins[t] if tmins else 12 * 60
-        for (pbar, pm1) in (ticks[t] if t < len(ticks) else []):
+        for tick in (ticks[t] if t < len(ticks) else []):
+            pbar, pm1, pnow = tick if len(tick) == 3 else (tick[0], tick[1], None)
             snap = copy.deepcopy((S.prev, S.waits, S.used, S.m1LastT, S.m1PrevC, S.oState, S.oSL, S.oL, S.log))
             sessOK = (not S.sess) or S.in_sess(tm)
             if prov and S.oState == 0 and sessOK and provBar != t:
-                side, px, sl = prov_eval(S, pbar, pm1, bars[t - 1] if t else pbar)
+                side, px, sl = prov_eval(S, pbar, pm1, bars[t - 1] if t else pbar, pnow)
                 if side != 0:
                     provBar = t
                     alerts.append(("仮", t, side))
@@ -448,9 +454,22 @@ def gate_alert_model():
           al1 == [("仮", 1, 1), ("確定", 1, 1)], str(al1))
     tk_dev = [[], [((150.25, 150.26, 150.05, 150.23), m1b[:3] + [(8, 150.24, 150.10, 150.23)])]]
     _, _, al3, _ = run_ticks(bars, [[zl]] * 4, m1s, tk_dev, **J)
-    check("SA-10 the developing 1M bar is not used: a BOS seen only on the still-forming 1M close gives no provisional "
-          "(the confirmed alert still comes at the 5M close once that 1M bar has closed)",
+    check("SA-10 the forming 1M bar is not used: a BOS seen only on the last 1M element whose minute has not ended "
+          "(time + 1 min > now) gives no provisional (the confirmed alert still comes at the 5M close)",
           al3 == [("確定", 1, 1)], str(al3))
+    # same last element, but its minute has ended (no newer 1M bar yet) -> it is closed and counts
+    tk_end = [[], [((150.25, 150.26, 150.05, 150.23), m1b[:3] + [(8, 150.24, 150.10, 150.23)], 9.0)]]
+    _, _, al3b, _ = run_ticks(bars, [[zl]] * 4, m1s, tk_end, **J)
+    # array without a forming element (all returned bars closed) -> the last one counts
+    tk_all = [[], [((150.25, 150.26, 150.05, 150.23), m1b[:4], 9.2)]]
+    _, _, al3c, _ = run_ticks(bars, [[zl]] * 4, m1s, tk_all, **J)
+    tk_all_early = [[], [((150.25, 150.26, 150.05, 150.23), m1b[:4], 8.99)]]
+    _, _, al3d, _ = run_ticks(bars, [[zl]] * 4, m1s, tk_all_early, **J)
+    check("SA-10b closedness by time, not by position: the last 1M element counts when its minute has ended (now >= time "
+          "+ 1 min) even without a newer element (two variants: element equal to a forming one, and an array of only "
+          "closed bars); one tick before its minute ends (now = time + 0.99 min) the same element is still excluded",
+          al3b == [("仮", 1, 1), ("確定", 1, 1)] and al3d == [("確定", 1, 1)]
+          and al3c == [("仮", 1, 1), ("確定", 1, 1)], str((al3b, al3c, al3d)))
     bt_fail = (150.250, 150.260, 150.050, 150.090)
     m1f = m1b[:4] + [(9, 150.24, 150.08, 150.09)]
     _, _, al4, _ = run_ticks([flat, bt_fail, nxt, nxt], [[zl]] * 4, [m1s[0], m1f, [], []], tk, **J)
@@ -481,17 +500,138 @@ def gate_alert_model():
     bad = []
     for mode in ("B", "D"):
         S, B = t3.run3(bars[:1], [[zl]], m1s=m1s[:1], **dict(J, mode=mode))
-        side, _, _ = prov_eval(S, bt, m1b + [(10, 150.15, 150.15, 150.15)], flat)
+        side, _, _ = prov_eval(S, bt, m1b, flat, now=10.0)
         S2, _ = t3.run3(bars[:2], [[zl]] * 2, m1s=m1s[:2], **dict(J, mode=mode))
         conf_side = t3.orders(S2)[0][1]["side"] if t3.orders(S2) else 0
         if side != conf_side or side == 0:
             bad.append((mode, side, conf_side))
     check("SA-13 consistency: when every 1M bar of the 5M bar has closed and the zone is unchanged by the update, the "
           "provisional decision equals the confirmed decision (B, D)", bad == [], str(bad))
+    # ---- D wait carried over from an earlier 5M bar ------------------------------------------------------------------
+    t1 = [(150.26, 150.20, 150.22), (150.21, 150.05, 150.08), (150.12, 150.06, 150.11), (150.14, 150.07, 150.12),
+          (150.15, 150.08, 150.12)]
+    t2 = [(150.16, 150.10, 150.15), (150.18, 150.12, 150.16), (150.24, 150.15, 150.23), (150.25, 150.20, 150.24),
+          (150.26, 150.21, 150.25)]
+    mk = lambda b0, lst: [(b0 * 5 + j, h, l, c) for j, (h, l, c) in enumerate(lst)]
+    m1c = [m1s[0], mk(1, t1), mk(2, t2), []]
+    barsC = [flat, (150.25, 150.26, 150.05, 150.12), (150.15, 150.26, 150.10, 150.25), nxt]
+    tkC = [[], [], [((150.15, 150.18, 150.10, 150.17), mk(2, t2[:2]) + [(12, 150.18, 150.15, 150.17)]),
+                    ((150.15, 150.24, 150.10, 150.23), mk(2, t2[:3]) + [(13, 150.24, 150.21, 150.23)]),
+                    ((150.15, 150.25, 150.10, 150.24), mk(2, t2[:4]) + [(14, 150.25, 150.22, 150.24)])]]
+    import copy
+    S0, _ = t3.run3(barsC[:2], [[zl]] * 2, m1s=m1c[:2], **J)
+    waits_before = copy.deepcopy(S0.waits)
+    Sx, Bx, alC, mutC = run_ticks(barsC, [[zl]] * 4, m1c, tkC, **J)
+    Sn, Bn = t3.run3(barsC, [[zl]] * 4, m1s=m1c, **J)
+    check("SA-14 D wait carried over: touch in bar 1 (no BOS there, the wait is saved at the bar-1 close: level 150.21, "
+          "count 3); in bar 2 the closed 1M close 150.23 is the BOS -> one provisional on the forming bar 2, then the "
+          "confirmed LONG at the bar-2 close; the saved wait is never modified by the provisional ticks and the orders "
+          "equal the run without ticks",
+          len(waits_before) == 1 and waits_before[0]["lvl"] == 150.21 and waits_before[0]["cnt"] == 3
+          and alC == [("仮", 2, 1), ("確定", 2, 1)] and not mutC and t3.orders(Sx) == t3.orders(Sn)
+          and Bx.fills == Bn.fills, str((waits_before, alC, mutC)))
+    res = []
+    for wait in (6, 5):
+        Jw = dict(J, dwait=wait)
+        _, _, alW, mutW = run_ticks(barsC, [[zl]] * 4, m1c, tkC, **Jw)
+        res.append((wait, alW, mutW))
+    check("SA-15 carried wait at the expiry limit: the BOS is the 6th confirmed 1M bar after the touch -> with D wait 6 the "
+          "provisional and the confirmed alert come; with D wait 5 the wait expires first -> neither (provisional and "
+          "confirmed agree); no state change by the provisional evaluation",
+          res[0][1] == [("仮", 2, 1), ("確定", 2, 1)] and res[1][1] == [] and not res[0][2] and not res[1][2], str(res))
+
+
+def state_writes(src):
+    """top-level blocks that write persistent state (var / varip := / +=, var array / map mutation, UDT field :=) or
+    send orders. Returns {header: (writes, mutated, field_writes, orders)} and the var / varip names."""
+    lines = src.split("\n")
+    code = [l if not l.lstrip().startswith("//") else "" for l in lines]
+    allc = "\n".join(code)
+    vars_ = set(re.findall(r"^\s*var(?:ip)?\s+(?:[\w.]+(?:<[^>]*>)?\s+)?(\w+)\s*=", allc, re.M))
+    varip = set(re.findall(r"^\s*varip\s+(?:[\w.]+(?:<[^>]*>)?\s+)?(\w+)\s*=", allc, re.M))
+    blocks, cur = [], None
+    for l in code:
+        if l and not l.startswith(" "):
+            cur = [l, []]
+            blocks.append(cur)
+        elif cur:
+            cur[1].append(l)
+    out = {}
+    for h, body in blocks:
+        txt = "\n".join(body)
+        w = set(re.findall(r"\b(\w+)\s*(?::=|\+=)", txt)) & vars_
+        mv = set(re.findall(r"(?:array\.(?:set|push|remove|clear|insert|shift|pop|unshift)|map\.put)\(\s*(\w+)", txt)) & vars_
+        fw = len(re.findall(r"\b\w+\.\w+\s*:=", txt))
+        o = len(re.findall(r"strategy\.(?:entry|exit|close|cancel|order)\(", txt))
+        if w or mv or fw or o:
+            out[h] = (w, mv, fw, o, txt)
+    return out, vars_, varip
+
+
+def gate_tick_separation():
+    sw, vars_, varip = state_writes(STJ)
+    heads = sorted(h[:40] for h in sw)
+    exp = sorted(["f_nraAccumBoxState(simple int rangeLen, ", "f_nraAccumPack(simple bool usePorted, si",
+                  "f_fvgExpire(int nowClose) =>", "f_fvgOnEvent(int tfIdx, int key, int clo", "if is5mChart",
+                  "if is5mChart and barstate.isconfirmed", "if stAlertProv and is5mChart and not bar"])
+    co = code_only(STJ)
+    # NR-A1: f_nraAccumBoxState <- f_nraAccumPack <- f_nraAccumConfirmed <- only inside request.security (HTF context)
+    cl = co.split("\n")
+    calls = lambda f: [l.strip() for l in cl if re.search(r"\b" + f + r"\(", l) and not l.startswith(f + "(")]
+    nra_ok = calls("f_nraAccumBoxState") == ["[pSid, pTop, pBot] = f_nraAccumBoxState(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)"] \
+        and len(calls("f_nraAccumPack")) == 1 and calls("f_nraAccumPack")[0].startswith("[_u, _l, _i] = f_nraAccumPack(") \
+        and all("request.security(" in l for l in calls("f_nraAccumConfirmed"))
+    nra_calls = calls("f_nraAccumConfirmed")
+    fvg_calls = [l for l in co.split("\n") if re.search(r"\bf_fvg(?:Expire|OnEvent)\(", l) and "=>" not in l]
+    fvg_blk = sw.get("if is5mChart", (set(), set(), 0, 0, ""))[4]
+    fvg_writes_ok = all(l.startswith("        ") for l in fvg_blk.split("\n") if re.search(r"gFvgNextExpire\s*:=", l)) \
+        and "    if barstate.isconfirmed\n        int nowClose = time_close" in fvg_blk
+    prov = next((v for h, v in sw.items() if h.startswith("if stAlertProv")), None)
+    main = sw.get("if is5mChart and barstate.isconfirmed")
+    check("SA-16 tick separation in code: every top-level block that writes persistent state or sends orders is (a) the "
+          "confirmed-5M order block (all orders, candidates, BOS waits, processed 1M time, Track use), (b) the FVG block "
+          "whose writes sit under `if barstate.isconfirmed`, (c) FVG storage functions called only there, (d) NR-A1 "
+          "Accum functions evaluated inside request.security (own HTF context), or (e) the provisional block, which writes "
+          "only the varip stProvBar; zn.update (Engine state) runs only under `is5mChart and barstate.isconfirmed`; "
+          "the only varip is stProvBar",
+          heads == exp and varip == {"stProvBar"} and prov is not None and prov[0] == {"stProvBar"} and prov[1] == set()
+          and prov[2] == 0 and prov[3] == 0 and main is not None and main[3] == 11 and fvg_writes_ok
+          and nra_ok and len(nra_calls) >= 1
+          and len(fvg_calls) == 4 and all(l.startswith("            gFvgNextExpire :=") or l.startswith("        gFvgNextExpire :=")
+                                          for l in fvg_calls)
+          and co.count("if is5mChart and barstate.isconfirmed\n    zoneCountNow := zn.update(") == 1,
+          str((heads, varip, nra_calls)))
+    # exact difference to the version before the alerts (feb64b7)
+    old = subprocess.run(["git", "-C", ROOT, "show", "feb64b7:" + sj.STJ_PATH], capture_output=True, text=True).stdout
+    v1 = sj.EDITS[:5]
+    o = old
+    for a, b in reversed(v1):
+        if b:
+            o = o.replace(b, a)
+        else:
+            anchor = 'f_num(float v, string fmt) =>\n    na(v) ? "-" : str.tostring(v, fmt)\n'
+            o = o.replace(anchor, anchor + a)
+    alert_names = ["stAlertProv", "stAlertConf", "stProvBar", "stTpUpPrev", "stTpDnPrev", "f_stProvEval", "f_stAlertMsg"]
+    mtxt = main[4] if main else ""
+    refs = [l.strip() for l in mtxt.split("\n") if any(re.search(r"\b" + n + r"\b", l) for n in alert_names)]
+    check("SA-17 against the version before the alerts (feb64b7): stripping the old STJ-1 edits and the current edits gives "
+          "the same ZONE-JPY -> ST-3 pipeline text, so the only changes are the STJ-2 edits (header, calc_on_every_tick, "
+          "zn.update gate, defaults, alert inputs / functions / confirmed alert / saved TP edges / provisional block); "
+          "inside the confirmed order block the alert names appear only on the alert call and the TP-edge save lines "
+          "(no order condition reads them)",
+          bool(old) and o == sj.pipeline() and sj.strip_stj(STJ) == sj.pipeline()
+          and refs == ["if stAlertConf", 'alert(f_stAlertMsg("確定", side, stModeA ? oL : close, oSL), alert.freq_all)',
+                       "stTpUpPrev := tpUp", "stTpDnPrev := tpDn"], str(refs))
+    fn = tb.func(STJ, "f_stProvEval(")
+    check("SA-18 provisional 1M closedness in Pine: an element is used when a newer one follows or its minute has ended "
+          "(time + 60000 <= timenow); the existing time array is reused (no new request)",
+          "            if array.get(m1t, sz - 1) + 60000 > timenow\n                nb := sz - 1\n" in fn
+          and "nb := sz\n" in fn and "array.size(m1t) - 1" not in fn
+          and STJ.count('request.security_lower_tf(syminfo.tickerid, "1", [time, high, low, close])') == 1)
 
 
 def main():
-    for g in (gate_static, gate_zone_parity, gate_orders_yen, gate_alert_static, gate_alert_model):
+    for g in (gate_static, gate_zone_parity, gate_orders_yen, gate_alert_static, gate_alert_model, gate_tick_separation):
         try:
             r = g()
             if g is gate_zone_parity:
