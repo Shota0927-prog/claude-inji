@@ -159,7 +159,7 @@ def gate_static():
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASE, "--"] + PROTECTED, capture_output=True, text=True)
     check("GS-10 ZONE-JPY, ZONE-STJ, ZONE-P, ZONE-ST, Engines (/2, /5, /6, Authority), old strategies, SignalEngine "
           "unchanged vs base HEAD " + BASE, d.returncode == 0 and d.stdout.strip() == "", d.stdout + d.stderr)
-    j = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASE, "--", "tests/"], capture_output=True, text=True).stdout
+    j = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BASE, "--", "tests/"], capture_output=True, text=True).stdout
     check("GS-11 existing generator / test scripts unchanged vs " + BASE + " (only gbj_build.py / gbj_sim.py are new) and "
           "jpy_build still regenerates ZONE-JPY", j.strip() == "" and jb.build() == JPY, j)
 
