@@ -31,7 +31,8 @@ ROOT = ge.ROOT
 PREV = "60cc26f"
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
 show = lambda p, rev=PREV: subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{p}"], capture_output=True, text=True).stdout
-ENG6, GBE, GBE1 = rd(ge.SRC_PATH), rd(ge.GBE_PATH), show(ge.GBE_PATH)
+ENG6, GBE1 = rd(ge.SRC_PATH), show(ge.GBE_PATH)
+GBE = ge.strip_gbe3(rd(ge.GBE_PATH)) or ""     # GBE-2 (Library v2) checks; GBE-3 (Day/Swing Overlap) is pinned in gbd_sim
 GBV, GBS = rd(gb.GBJ_PATH), rd(gs.GBS_PATH)
 GBV0, GBS0 = show(gb.GBJ_PATH), show(gs.GBS_PATH)
 RESULTS = []
@@ -45,9 +46,18 @@ def code_only(src):
     return "\n".join(l for l in src.split("\n") if not l.lstrip().startswith("//"))
 
 
+def revert6(text):
+    """GBJ-6 (Day/Swing Overlap, pinned in gbd_sim) reverted in the Strategy (its header edit is Visual-only)."""
+    out = text
+    for kind, a, b in reversed(gb.EDITS6):
+        if kind != "header":
+            out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
+    return out
+
+
 def revert5(text, skip_header=True):
     out = text
-    for kind, a, b in reversed(gb.EDITS5):
+    for kind, a, b in list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)):
         if kind == "header" and skip_header:
             continue
         out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
@@ -63,7 +73,7 @@ PROTECTED = ["ZoneEnginePracticalSwingMax.pine", "ZoneEnginePractical.pine", "Zo
 def gate_static():
     check("GF-01 Library = gbe_build.build() (rebuild identical); reverting GBE-2 gives the Library version 1 source ("
           + PREV + ") byte for byte, reverting GBE-2 + GBE-1 the shared ZoneEnginePractical/6",
-          bool(GBE) and ge.build() == GBE and ge.strip_gbe2(GBE) == GBE1 and bool(GBE1) and ge.strip_gbe(GBE) == ENG6)
+          bool(GBE) and ge.strip_gbe3(ge.build()) == GBE and ge.strip_gbe2(GBE) == GBE1 and bool(GBE1) and ge.strip_gbe(GBE) == ENG6)
     fc = lambda s: tb.func(s, "f_finalizeCluster(")
     edge = [f"float e{h}{n} = c.accEdgeOnce and acc{o}{n} ? 0.0 : m.baseScore"
             for n in (1, 2, 3) for h, o in (("H", "Lo"), ("L", "Hi"))]
@@ -95,7 +105,8 @@ def gate_static():
     cnt = lambda s, p: len(re.findall(p, code_only(s)))
     check("GF-04 FVG boost reads the Engine baseSum in both files; requests (10 / 11), zone loops, drawing, str.*, plot "
           "and loops unchanged in the scripts and the Library (aggregation inside the existing member loop); lint clean",
-          GBV.count(dline) == 1 and GBS.count(dline) == 1 and req(GBV) == req(GBV0) and req(GBS) == req(GBS0)
+          GBV.count(dline) == 1 and GBS.count(dline) == 1 and req(gb.strip_gbj6(GBV) or "") == req(GBV0)
+          and req(revert6(GBS) or "") == req(GBS0)
           and all(cnt(n, p) == cnt(o, p) for n, o in ((GBV, GBV0), (GBS, GBS0), (GBE, GBE1))
                   for p in (r"zn\.zoneAt\(", r"\b(box|label|table|line)\.new\(", r"\bstr\.\w+\(", r"\bplot\w*\(",
                             r"\bfor\b", r"\bwhile\b", r"request\."))

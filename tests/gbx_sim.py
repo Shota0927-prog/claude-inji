@@ -63,7 +63,7 @@ GBS3_PREV = [   # the GBS-2 (65b1fb3) texts the GBJ-3 base setting replaced in t
 
 def revert_in_strategy(text):
     out = text
-    for kind, a, b in list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GBJ-4 (Accum Score Mode, GBPJPY Engine import): pinned in gbe_sim
+    for kind, a, b in list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GBJ-4 (Accum Score Mode, GBPJPY Engine import): pinned in gbe_sim
         if kind != "header":
             out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
     for b, a in GBS3_PREV:
@@ -89,7 +89,7 @@ def gate_static():
           gb.build() == GBV and gs.build() == GBS and gb.strip_gbj2(GBV) == GBV0 and bool(GBV0)
           and revert_in_strategy(GBS) == GBS0 and bool(GBS0))
     gbj3 = {"scoreDayHL", "slopeThrMod", "slopeThrStrong", "thrStrong", "zoneHalfWidth",   # GBJ-3 (gbs_sim GB-06 / GB-10)
-            "accScoreMode", "accEdgeMode"}                                                   # GBJ-4 / GBJ-5 (gbe_sim / gbf_sim)
+            "accScoreMode", "accEdgeMode", "dsMode"}                                                   # GBJ-4 / GBJ-5 (gbe_sim / gbf_sim)
     vv = {k: v for k, v in inputs(GBV).items() if k not in gbj3}
     vs = {k: v for k, v in inputs(GBS).items() if k not in gbj3}
     v0 = {k: v for k, v in inputs(GBV0).items() if k not in gbj3}
@@ -144,7 +144,8 @@ def gate_static():
     check("GX-06 lightweight: requests unchanged (Visual 10, Strategy 11), zone loops (zn.zoneAt) unchanged, FVG slots "
           "unchanged, no new box / label / table / line, str.* or plot calls; the RN check is arithmetic only (no loop / "
           "request); RE10045 lint clean",
-          req(GBV) == req(GBV0) and req(GBS) == req(GBS0) and len(req(GBV)) == 10 and len(req(GBS)) == 11
+          req(gb.strip_gbj6(GBV) or "") == req(GBV0) and req(revert_in_strategy(GBS) or "") == req(GBS0)
+          and len(req(GBV)) == 10 and len(req(GBS)) == 11
           and all(cnt(n, p) == cnt(o, p) for n, o in ((GBV, GBV0), (GBS, GBS0))
                   for p in (r"zn\.zoneAt\(", r"\b(box|label|table|line)\.new\(", r"\bstr\.\w+\(", r"\bplot\w*\(",
                             r"\bfor\b", r"\bwhile\b"))

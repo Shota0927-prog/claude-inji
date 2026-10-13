@@ -216,7 +216,7 @@ EDITS5 = [
      "//  の合算方式だけ、生成: tests/gbe_build.py)。TradingView で Library を publish してから使う。\n",
      "//  の合算方式だけ、生成: tests/gbe_build.py)。TradingView で Library を publish してから使う。\n"
      "//  GBJ-5: Accum Edge Mode (Separate = 従来 / Once per TF = 同じ時間足の上限・下限を合わせて 1 回)。Library v2 が必要。\n"),
-    ("import", _ge.IMPORT_GBE1, _ge.IMPORT_GBE),
+    ("import", _ge.IMPORT_GBE1, _ge.IMPORT_GBE2),
     ("accedge",
      '     "Engine の Score / Strength / Touch / FVG 加点後 Score / Entry 資格すべてに反映 (表示だけの差し替えではない)。")\n',
      '     "Engine の Score / Strength / Touch / FVG 加点後 Score / Entry 資格すべてに反映 (表示だけの差し替えではない)。")\n'
@@ -228,6 +228,86 @@ EDITS5 = [
      'zoneCfg.accScoreMax          := accScoreMode == "Max"\n',
      'zoneCfg.accScoreMax          := accScoreMode == "Max"\n'
      'zoneCfg.accEdgeOnce          := accEdgeMode == "Once per TF"\n'),
+]
+
+
+# ---- GBJ-6: Day/Swing Overlap Mode (Separate = current / Deduplicate), Engine derivative GBE-3 (Library version 3) ----
+#  The existing Swing requests also return the pivot bar's open time (time[len] in the requested timeframe, distinct from
+#  the confirmation time); the Engine gets it through new ZoneFeed fields. No request is added. strip_gbj6() -> GBJ-5.
+NRS_OLD = ("f_nrsPivotConfirmed(simple int len) =>\n"
+           "    [_ph, _pt, _pl, _lt] = zn.pivotPack(len)\n"
+           "    [_ph[1], _pt[1], _pl[1], _lt[1]]\n")
+NRS_NEW = ("f_nrsPivotConfirmed(simple int len) =>\n"
+           "    [_ph, _pt, _pl, _lt] = zn.pivotPack(len)\n"
+           "    // GBJ-6: pivot 元の足の開始時刻 = time[len] (確認した足の時刻 _pt / _lt とは別)。確定 HTF 足の値 ([1]) だけ\n"
+           "    int _po = na(_ph) ? int(na) : time[len]\n"
+           "    int _lo = na(_pl) ? int(na) : time[len]\n"
+           "    [_ph[1], _pt[1], _pl[1], _lt[1], _po[1], _lo[1]]\n\n"
+           "// GBJ-6: チャート足と同じ / 下位の Swing TF 用 (zn.pivotPack の値はそのまま + pivot 元の足の開始時刻)\n"
+           "f_swPack(simple int len) =>\n"
+           "    [_ph, _pt, _pl, _lt] = zn.pivotPack(len)\n"
+           "    int _po = na(_ph) ? int(na) : time[len]\n"
+           "    int _lo = na(_pl) ? int(na) : time[len]\n"
+           "    [_ph, _pt, _pl, _lt, _po, _lo]\n")
+SWG_OLD = ("f_nrsSwing(simple string tf, simple int len) =>\n"
+           "    float h  = na\n    int   ht = na\n    float l  = na\n    int   lt = na\n"
+           "    if timeframe.in_seconds(tf) > timeframe.in_seconds()\n"
+           "        [_a, _at, _b, _bt] = request.security(syminfo.tickerid, tf, f_nrsPivotConfirmed(len), lookahead = barmerge.lookahead_on)\n"
+           "        h  := _a\n        ht := _at\n        l  := _b\n        lt := _bt\n"
+           "    else\n"
+           "        [_a, _at, _b, _bt] = request.security(syminfo.tickerid, tf, zn.pivotPack(len), lookahead = barmerge.lookahead_off)\n"
+           "        h  := _a\n        ht := _at\n        l  := _b\n        lt := _bt\n"
+           "    [h, ht, l, lt]\n")
+SWG_NEW = ("f_nrsSwing(simple string tf, simple int len) =>\n"
+           "    float h  = na\n    int   ht = na\n    float l  = na\n    int   lt = na\n"
+           "    int   ho = na\n    int   lo = na\n"
+           "    if timeframe.in_seconds(tf) > timeframe.in_seconds()\n"
+           "        [_a, _at, _b, _bt, _ao, _bo] = request.security(syminfo.tickerid, tf, f_nrsPivotConfirmed(len), lookahead = barmerge.lookahead_on)\n"
+           "        h  := _a\n        ht := _at\n        l  := _b\n        lt := _bt\n        ho := _ao\n        lo := _bo\n"
+           "    else\n"
+           "        [_a, _at, _b, _bt, _ao, _bo] = request.security(syminfo.tickerid, tf, f_swPack(len), lookahead = barmerge.lookahead_off)\n"
+           "        h  := _a\n        ht := _at\n        l  := _b\n        lt := _bt\n        ho := _ao\n        lo := _bo\n"
+           "    [h, ht, l, lt, ho, lo]\n")
+FEED_OLD = ("int   pl3T = na\nif is5mChart and useHzSource\n"
+            "    [_h1, _h1t, _l1, _l1t] = request.security(syminfo.tickerid, hzTf1, zn.pivotPack(pivLen1), lookahead = barmerge.lookahead_off)\n"
+            "    [_h2, _h2t, _l2, _l2t] = f_nrsSwing(hzTf2, pivLen2)\n"
+            "    [_h3, _h3t, _l3, _l3t] = f_nrsSwing(hzTf3, pivLen3)\n")
+FEED_NEW = ("int   pl3T = na\n"
+            "int   ph1O = na     // GBJ-6: pivot 元の足の開始時刻 (TF #1 / #2 / #3)\n"
+            "int   pl1O = na\nint   ph2O = na\nint   pl2O = na\nint   ph3O = na\nint   pl3O = na\n"
+            "if is5mChart and useHzSource\n"
+            "    [_h1, _h1t, _l1, _l1t, _h1o, _l1o] = request.security(syminfo.tickerid, hzTf1, f_swPack(pivLen1), lookahead = barmerge.lookahead_off)\n"
+            "    [_h2, _h2t, _l2, _l2t, _h2o, _l2o] = f_nrsSwing(hzTf2, pivLen2)\n"
+            "    [_h3, _h3t, _l3, _l3t, _h3o, _l3o] = f_nrsSwing(hzTf3, pivLen3)\n"
+            "    ph1O := _h1o\n    pl1O := _l1o\n    ph2O := _h2o\n    pl2O := _l2o\n    ph3O := _h3o\n    pl3O := _l3o\n")
+
+EDITS6 = [
+    ("header",
+     "//  GBJ-5: Accum Edge Mode (Separate = 従来 / Once per TF = 同じ時間足の上限・下限を合わせて 1 回)。Library v2 が必要。\n",
+     "//  GBJ-5: Accum Edge Mode (Separate = 従来 / Once per TF = 同じ時間足の上限・下限を合わせて 1 回)。Library v2 が必要。\n"
+     "//  GBJ-6: Day/Swing Overlap Mode (Separate = 従来 / Deduplicate = 当日高安と同じ元の確定 Swing を 1 つの根拠に)。Library v3。\n"),
+    ("import", _ge.IMPORT_GBE2, _ge.IMPORT_GBE),
+    ("dsmode",
+     'lifePrevDayHL = input.float(5.0, "Lifetime · Carried Prev Day H/L (days)", step = 1.0, group = G_DHL)\n',
+     'lifePrevDayHL = input.float(5.0, "Lifetime · Carried Prev Day H/L (days)", step = 1.0, group = G_DHL)\n'
+     'dsMode = input.string("Separate", "Day/Swing Overlap Mode", options = ["Separate", "Deduplicate"], group = G_DHL,\n'
+     '     tooltip = "Separate: 従来どおり Day H/L と Swing を別々に採点。\\n" +\n'
+     '     "Deduplicate: 当日高値 / 安値と、それを元にした確定 Swing (同じ元の足・同じ価格・同じ高安) を 1 つの根拠として、\\n" +\n'
+     '     "高い方の点数・1 カテゴリで数える。同価格の別の足・近い価格・別日の Swing は別根拠のまま。")\n'),
+    ("dsmode",
+     'zoneCfg.accEdgeOnce          := accEdgeMode == "Once per TF"\n',
+     'zoneCfg.accEdgeOnce          := accEdgeMode == "Once per TF"\n'
+     'zoneCfg.dsDedup              := dsMode == "Deduplicate"\n'
+     'zoneCfg.hzMs1                := timeframe.in_seconds(hzTf1) * 1000\n'
+     'zoneCfg.hzMs2                := timeframe.in_seconds(hzTf2) * 1000\n'
+     'zoneCfg.hzMs3                := timeframe.in_seconds(hzTf3) * 1000\n'),
+    ("origin", NRS_OLD, NRS_NEW),
+    ("origin", SWG_OLD, SWG_NEW),
+    ("origin", FEED_OLD, FEED_NEW),
+    ("origin",
+     "     ph3 = ph3, ph3t = ph3T, pl3 = pl3, pl3t = pl3T,\n",
+     "     ph3 = ph3, ph3t = ph3T, pl3 = pl3, pl3t = pl3T,\n"
+     "     ph1o = ph1O, pl1o = pl1O, ph2o = ph2O, pl2o = pl2O, ph3o = ph3O, pl3o = pl3O,\n"),
 ]
 
 
@@ -258,12 +338,17 @@ def gbj1_transform(src):
 
 
 def gbj_transform(src):
-    return _apply(_apply(_apply(_apply(gbj1_transform(src), EDITS2), EDITS3), EDITS4), EDITS5)
+    return _apply(_apply(_apply(_apply(_apply(gbj1_transform(src), EDITS2), EDITS3), EDITS4), EDITS5), EDITS6)
+
+
+def strip_gbj6(gbj):
+    """reverse only the GBJ-6 Day/Swing Overlap edits (-> the GBJ-5 file byte for byte)."""
+    return _revert(gbj, EDITS6)
 
 
 def strip_gbj5(gbj):
-    """reverse only the GBJ-5 Accum Edge Mode edits (-> the GBJ-4 file byte for byte)."""
-    return _revert(gbj, EDITS5)
+    """reverse the GBJ-6 and GBJ-5 edits (-> the GBJ-4 file byte for byte)."""
+    return _revert(strip_gbj6(gbj), EDITS5)
 
 
 def strip_gbj4(gbj):

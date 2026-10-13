@@ -43,7 +43,7 @@ STJ = rd(sj.STJ_PATH)
 def strip_gbj2_in_strategy(text):
     """revert the GBJ-2 edits that reach the Strategy (all but the Visual header and the Visual-only FVG box display)."""
     out = text
-    for kind, a, b in list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GBJ-4 Accum Score Mode / GBPJPY Engine import (pinned in gbe_sim)
+    for kind, a, b in list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GBJ-4 Accum Score Mode / GBPJPY Engine import (pinned in gbe_sim)
         if kind != "header":
             out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
     for kind, a, b in reversed(gb.EDITS2):
@@ -125,7 +125,8 @@ def gate_static():
           bool(GBS1) and tail(GBS1) == tail(STJ))
     req = lambda s: re.findall(r"request\.\w+\(.*$", code_only(s), re.M)
     check("GB-05 requests: the 10 Zone / FVG requests of ZONE-GBPJPY + one request.security_lower_tf (1M, D) = 11, the "
-          "same call sites as ZONE-ST-JPY", req(GBS) == req(STJ) and len(req(GBS)) == 11
+          "same call sites as ZONE-ST-JPY (GBJ-6 Swing tuples reverted; their request count is pinned in gbd_sim)",
+          req(GBS1) == req(STJ) and len(req(GBS)) == 11
           and [r for r in req(GBS) if "lower_tf" not in r] == req(GBV)
           and len([r for r in req(GBS) if "lower_tf" in r]) == 1)
     want = {"stMode": '"D: 1M BOS Rebound"', "stDir": '"Long Only"', "zoneHalfWidth": "0.05", "clusterDist": "0.08",
@@ -187,7 +188,7 @@ def gate_static():
            "thrStrong": ("10.0", "9.0")}
     res = []
     gbs3 = GBS
-    for kind, a, b in list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GB-10 pins GBJ-3; GBJ-4 is checked in gbe_sim
+    for kind, a, b in list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GB-10 pins GBJ-3; GBJ-4 is checked in gbe_sim
         if kind != "header":
             gbs3 = gbs3.replace(b, a) if gbs3 is not None and gbs3.count(b) == 1 else None
     for path, cur, extra in ((gs.GBS_PATH, gbs3 or "", {}),

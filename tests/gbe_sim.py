@@ -32,7 +32,7 @@ PREV = "91036ec"
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
 show = lambda p, rev=PREV: subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{p}"], capture_output=True, text=True).stdout
 ENG6 = rd(ge.SRC_PATH)
-GBE = ge.strip_gbe2(rd(ge.GBE_PATH)) or ""     # GBE-1 (Library v1) checks; GBE-2 (Edge Mode) is pinned in gbf_sim
+GBE = ge.strip_gbe2(ge.strip_gbe3(rd(ge.GBE_PATH))) or ""     # GBE-1 (Library v1) checks; GBE-2 (Edge Mode) is pinned in gbf_sim
 GBV, GBS = rd(gb.GBJ_PATH), rd(gs.GBS_PATH)
 GBV0, GBS0 = show(gb.GBJ_PATH), show(gs.GBS_PATH)
 RESULTS = []
@@ -48,7 +48,7 @@ def code_only(src):
 
 def revert4(text, skip_header=True):
     out = text
-    for kind, a, b in list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):
+    for kind, a, b in list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):
         if kind == "header" and skip_header:
             continue
         out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
@@ -64,7 +64,7 @@ PROTECTED = ["ZoneEnginePracticalSwingMax.pine", "ZoneEnginePractical.pine", "Zo
 def gate_static():
     check("GE-01 ZoneEnginePracticalGBPJPY.pine == gbe_build.build() (rebuild identical); strip_gbe gives the shared "
           "ZoneEnginePractical/6 source back byte for byte; library name ZoneEnginePracticalGBPJPY",
-          bool(GBE) and ge.strip_gbe2(ge.build()) == GBE and ge.build() == ge.build() and ge.strip_gbe(GBE) == ENG6
+          bool(GBE) and ge.strip_gbe2(ge.strip_gbe3(ge.build())) == GBE and ge.build() == ge.build() and ge.strip_gbe(GBE) == ENG6
           and 'library("ZoneEnginePracticalGBPJPY", overlay = true)' in GBE)
     fc = lambda s: tb.func(s, "f_finalizeCluster(")
     rest = lambda s: s.replace(fc(s), "")
@@ -101,7 +101,7 @@ def gate_static():
     cnt = lambda s, p: len(re.findall(p, code_only(s)))
     check("GE-05 lightweight: requests (10 / 11), zone loops, box / label / line / table, str.*, plot and for-loops "
           "unchanged in both scripts; the Engine gains no loop (aggregation inside the existing member loop); RE10045 "
-          "lint clean", req(GBV) == req(GBV0) and req(GBS) == req(GBS0)
+          "lint clean", req(gb.strip_gbj6(GBV) or "") == req(GBV0) and req(revert4(GBS) or "") == req(GBS0)
           and all(cnt(n, p) == cnt(o, p) for n, o in ((GBV, GBV0), (GBS, GBS0), (GBE, ENG6))
                   for p in (r"zn\.zoneAt\(", r"\b(box|label|table|line)\.new\(", r"\bstr\.\w+\(", r"\bplot\w*\(",
                             r"\bfor\b", r"\bwhile\b", r"request\."))
