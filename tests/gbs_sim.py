@@ -92,15 +92,11 @@ def gate_static():
         v[v.index(tb.DISP_INPUT_LAST) + len(tb.DISP_INPUT_LAST) + 1:v.index(tb.DISPLAY_HEAD)]
     st_comp = GBS[GBS.index(tb.IMPORT_LINE):GBS.index(tb.ST_BEGIN)]
     upd = next((a, b) for a, b in gs.EDITS if a.startswith("if is5mChart\n    zoneCountNow"))
-    hw = [e for e in gs.BASE_EDITS if e[0].startswith("zoneHalfWidth") or "初期 0.03 = ドル円検証値" in e[0]]
     zone_exp = comp.replace(gs.GEOM_GBS, "").replace(upd[0], upd[1])
-    for a, b in hw:
-        zone_exp = zone_exp.replace(a, b) if zone_exp is not None and zone_exp.count(a) == 1 else None
-    check("GB-02 Zone computation part byte-identical to ZONE-GBPJPY (inputs incl. Cluster 0.08 / FVG 0.05, "
-          "Engine config, MA / Swing / Accum / Break feeds, zn.update, NR-S1, NR-A1, FVG Batch A); only the display "
-          "inputs and the display-only label helper are left out; edits: zn.update on confirmed bars, and the Half "
-          "Width default 0.05 (GBPJPY base setting; the Visual keeps 0.03) with its tooltip",
-          comp.count(gs.GEOM_GBS) == 1 and len(hw) == 2 and st_comp == zone_exp)
+    check("GB-02 Zone computation part byte-identical to ZONE-GBPJPY (all Zone inputs incl. Half Width 0.05 / Cluster "
+          "0.08 / FVG 0.05 and the GBJ-3 scoring defaults, Engine config, MA / Swing / Accum / Break feeds, zn.update, "
+          "NR-S1, NR-A1, FVG Batch A); only the display inputs and the display-only label helper are left out; the one "
+          "edit: zn.update on confirmed bars", comp.count(gs.GEOM_GBS) == 1 and st_comp == zone_exp)
     bad = []
     for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, code_only(STJ).split("\n"), code_only(GBS1).split("\n"),
                                                       autojunk=False).get_opcodes():
@@ -110,9 +106,12 @@ def gate_static():
     vdiff = {n: (vj.get(n), vg.get(n)) for n in set(vj) | set(vg) if vj.get(n) != vg.get(n)}
     check("GB-03 against ZONE-ST-JPY every differing code line is the title or an input declaration / tooltip; same input "
           "set; input values differ only in the GBPJPY base-setting defaults: Half Width 0.03 -> 0.05, SL Buffer 0.05 -> "
-          "0.08, RR 1.3 -> 1.2 (Direction Long Only as ZONE-ST-JPY)",
+          "0.08, RR 1.3 -> 1.2, Day H/L Score 3 -> 2, Slope Threshold 0.02 / 0.05 -> 0.01 / 0.02, Strong Threshold "
+          "10 -> 9 (Direction Long Only as ZONE-ST-JPY)",
           bad == [] and set(vj) == set(vg) and vdiff == {"zoneHalfWidth": ("0.03", "0.05"), "stBuffer": ("0.05", "0.08"),
-                                                         "stRR": ("1.3", "1.2")}, str((bad[:5], vdiff)))
+                                                         "stRR": ("1.3", "1.2"), "scoreDayHL": ("3.0", "2.0"),
+                                                         "slopeThrMod": ("0.02", "0.01"), "slopeThrStrong": ("0.05", "0.02"),
+                                                         "thrStrong": ("10.0", "9.0")}, str((bad[:5], vdiff)))
     tail = lambda s: code_only(s[s.index(tb.ST_BEGIN):]).replace(
         'stBuffer = input.float(0.08,', 'stBuffer = input.float(0.05,').replace(
         'stRR = input.float(1.2,', 'stRR = input.float(1.3,')
@@ -129,15 +128,25 @@ def gate_static():
             "fvgMinWidth": "0.05", "stBuffer": "0.08", "stRR": "1.2", "stUseSess": "true", "stSessTz": '"Asia/Tokyo"',
             "stSessStartH": "9", "stSessStartM": "0", "stSessEndH": "2", "stSessEndM": "0", "stTpZone": "false",
             "stBE": "false", "stBEDist": "0.15", "stDWait": "30", "stAlertProv": "true", "stAlertConf": "true",
-            "enableRn": "false"}
+            "enableRn": "false", "fvgDirMatch": "false",
+            # scoring (GBJ-3 changed: scoreDayHL / slopeThrMod / slopeThrStrong / thrStrong; the rest kept)
+            "scoreDayHL": "2.0", "slopeThrMod": "0.01", "slopeThrStrong": "0.02", "thrStrong": "9.0",
+            "thrMedium": "5.0", "thrVStrong": "15.0", "scoreMa1": "2.0", "scoreMa2": "2.0", "slopeBonusFlat": "0.0",
+            "slopeBonusMod": "1.0", "slopeBonusStr": "2.0", "slopeBonusMode": '"Sum (per MA)"', "scoreHz1": "1.0",
+            "scoreHz2": "2.0", "scoreHz3": "3.0", "scoreAcc1": "3.0", "scoreAcc2": "4.0", "scoreAcc3": "5.0",
+            "confBonus2": "1.0", "confBonus3": "2.0", "confBonus4": "3.0", "useMaSource": "true", "useHzSource": "true",
+            "useAccSource": "true", "useDayHL": "true", "carryPrevDayHL": "false"}
+    vg = inputs(GBS)
     got = {k: vg.get(k) for k in want}
     opts = 'options = ["Long Only", "Short Only", "Both"]' in inp(GBS, "stDir")
     check("GB-06 GBPJPY base-setting defaults: D (1M BOS Rebound), Long Only (Short Only / Both selectable), HW 0.05 / "
           "Cluster 0.08 / FVG 0.05 円, SL Buffer 0.08 円, RR 1.2, session ON Asia/Tokyo 09:00-02:00, zone TP OFF, "
-          "breakeven OFF (trigger 0.15 円), D wait 30, provisional / confirmed alerts ON, RN OFF; every other Zone input "
-          "identical to ZONE-GBPJPY (whose Half Width stays 0.03)",
-          got == want and opts and inputs(GBV).get("zoneHalfWidth") == "0.03"
-          and all(vg.get(n) == x for n, x in inputs(GBV).items() if n in vg and n != "zoneHalfWidth")
+          "breakeven OFF (trigger 0.15 円), D wait 30, provisional / confirmed alerts ON, RN / FVG Direction Match OFF; "
+          "scoring: Day H/L 2, Slope Threshold 0.01 / 0.02, Strong 9 (Medium 5 / Very Strong 15, MA 2 / 2, Slope Bonus "
+          "0 / 1 / 2 Sum, Swing 1 / 2 / 3, Accum 3 / 4 / 5, Confluence 1 / 2 / 3, sources ON, prev-day H/L OFF kept); every "
+          "Zone input identical to ZONE-GBPJPY (Half Width 0.05 in both)",
+          got == want and opts and inputs(GBV).get("zoneHalfWidth") == "0.05"
+          and all(vg.get(n) == x for n, x in inputs(GBV).items() if n in vg)
           and "円" in inp(GBS, "stBuffer") and "円" in inp(GBS, "stBEDist"), str(got))
     co = code_only(GBS)
     decl = GBS[GBS.index("strategy(\n"):GBS.index(")\n", GBS.index("strategy(\n")) + 2]
@@ -169,6 +178,24 @@ def gate_static():
           "evaluation, provisional block gating, confirmed alert in the order branch, message, Engine on confirmed bars, "
           "no extra request, every state write / order in the confirmed blocks, 1M closedness expression",
           len(mine) >= 8 and all(ok for _, ok in mine), str(mine))
+    prev = "80d6a96"
+    chg = {"scoreDayHL": ("3.0", "2.0"), "slopeThrMod": ("0.02", "0.01"), "slopeThrStrong": ("0.05", "0.02"),
+           "thrStrong": ("10.0", "9.0")}
+    res = []
+    for path, cur, extra in ((gs.GBS_PATH, GBS, {}), (gb.GBJ_PATH, GBV, {"zoneHalfWidth": ("0.03", "0.05")})):
+        old = subprocess.run(["git", "-C", ROOT, "show", f"{prev}:{path}"], capture_output=True, text=True).stdout
+        lines = []
+        for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, code_only(old).split("\n"), code_only(cur).split("\n"),
+                                                          autojunk=False).get_opcodes():
+            if op != "equal":
+                lines += code_only(old).split("\n")[i1:i2] + code_only(cur).split("\n")[j1:j2]
+        vo, vc = inputs(old), inputs(cur)
+        vd = {n: (vo.get(n), vc.get(n)) for n in set(vo) | set(vc) if vo.get(n) != vc.get(n)}
+        res.append((path, bool(old) and all(allowed_line(l) for l in lines) and vd == dict(chg, **extra), vd))
+    check("GB-10 against the previous version " + prev + ": every differing code line (Visual and Strategy) is an input "
+          "declaration or tooltip; input values changed exactly: Day H/L Score 3 -> 2, Slope Threshold 0.02 / 0.05 -> "
+          "0.01 / 0.02, Strong Threshold 10 -> 9, and the Visual Half Width 0.03 -> 0.05 (Strategy already 0.05)",
+          all(ok for _, ok, _ in res), str(res))
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASE, "--"] + PROTECTED, capture_output=True, text=True)
     t = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BASE, "--", "tests/"],
                        capture_output=True, text=True).stdout
@@ -193,7 +220,8 @@ def gate_mirrors():
     import stj_sim as tj
     keep = dict(tj.YEN)
     try:
-        tj.YEN["zoneHalfWidth"] = 0.05       # GBPJPY base setting (Cluster 0.08 / FVG 0.05 equal as well)
+        tj.YEN.update(zoneHalfWidth=0.05, slopeThrMod=0.01, slopeThrStrong=0.02, scoreDayHL=2.0, thrStrong=9.0)
+        # GBPJPY base setting (GBJ-3); Cluster 0.08 / FVG 0.05 equal as well
         r = rerun(tj.gate_zone_parity, ("SM-01",))
     finally:
         tj.YEN.clear()
@@ -203,7 +231,8 @@ def gate_mirrors():
                  r"[0-9.]+ min ([0-9.]+)$", r[0][2] if r else "")
     ok01 = m is not None and int(m.group(5)) == 0 and min(int(m.group(i)) for i in (2, 3, 4)) > 0 \
         and float(m.group(6)) >= 2 * 0.05 - 1e-9
-    check("GM-01 Zone parity with the GBPJPY yen parameters (HW 0.05, Cluster 0.08, FVG 0.05): on the same yen OHLC the "
+    check("GM-01 Zone parity with the GBPJPY base setting (HW 0.05, Cluster 0.08, FVG 0.05, Slope 0.01 / 0.02, Day H/L 2, "
+          "Strong 9): on the same yen OHLC the "
           "Strategy zone evaluation (top / bottom / Score / Strength / FVG boost) equals the Visual display mirror on "
           "every sampled bar (0 mismatches; zones, FVGs and boosts occur; min width >= 2 x 0.05)",
           ok01, str(r))

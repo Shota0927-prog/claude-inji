@@ -152,6 +152,37 @@ EDITS2 = [
 ]
 
 
+# ---- GBJ-3: GBPJPY base-setting defaults (defaults / descriptions only; applied after EDITS2) -----------------------
+#  Day H/L Score 3 -> 2, Slope Threshold Moderate 0.02 -> 0.01 円 / Strong 0.05 -> 0.02 円, Strong Threshold 10 -> 9,
+#  Zone Half Width 0.03 -> 0.05 円 (= the Strategy default: display and trading zones share the default setting).
+#  strip_gbj3() reverses only these -> the GBJ-2 file (80d6a96) byte for byte.
+EDITS3 = [
+    ("header",
+     "//  だけを加点候補にする) と GBPJPY Round Number (大刻み 1.00 円 +3 / 小刻み 0.50 円 +2、Engine の既存 RN 加点)。\n",
+     "//  だけを加点候補にする) と GBPJPY Round Number (大刻み 1.00 円 +3 / 小刻み 0.50 円 +2、Engine の既存 RN 加点)。\n"
+     "//  GBJ-3 (GBPJPY 基準設定、初期値だけ): Half Width 0.05 円 (Strategy と共通)、Day H/L Score 2、Slope Threshold\n"
+     "//  Moderate 0.01 / Strong 0.02 円、Strong Threshold 9。ある比較期間の TradingView 結果から決めた値 (最適値・別期間は未確認)。\n"),
+    ("default",
+     'zoneHalfWidth = input.float(0.03, "[暫定] Zone Half Width (円)",',
+     'zoneHalfWidth = input.float(0.05, "[暫定] Zone Half Width (円)",'),
+    ("default",
+     "(= 3 / 5 / 8 pips)。初期 0.03 = ドル円検証値。\")\n",
+     "(= 3 / 5 / 8 pips)。初期 0.05 = GBPJPY 基準設定 (Visual / Strategy 共通)。\")\n"),
+    ("default",
+     'slopeThrMod = input.float(0.02, "[暫定] Slope Threshold · Moderate (円/lookback)",',
+     'slopeThrMod = input.float(0.01, "[暫定] Slope Threshold · Moderate (円/lookback)",'),
+    ("default",
+     'slopeThrStrong = input.float(0.05, "[暫定] Slope Threshold · Strong (円/lookback)",',
+     'slopeThrStrong = input.float(0.02, "[暫定] Slope Threshold · Strong (円/lookback)",'),
+    ("default",
+     'scoreDayHL = input.float(3.0, "Base Score · Day High / Low",',
+     'scoreDayHL = input.float(2.0, "Base Score · Day High / Low",'),
+    ("default",
+     'thrStrong = input.float(10.0, "Strong Score Threshold",',
+     'thrStrong = input.float(9.0, "Strong Score Threshold", '),
+]
+
+
 def git_show(rev, path=SRC_PATH):
     return subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{path}"], capture_output=True, text=True).stdout
 
@@ -179,12 +210,17 @@ def gbj1_transform(src):
 
 
 def gbj_transform(src):
-    return _apply(gbj1_transform(src), EDITS2)
+    return _apply(_apply(gbj1_transform(src), EDITS2), EDITS3)
+
+
+def strip_gbj3(gbj):
+    """reverse only the GBJ-3 default edits (-> the GBJ-2 file byte for byte)."""
+    return _revert(gbj, EDITS3)
 
 
 def strip_gbj2(gbj):
-    """reverse only the GBJ-2 edits (-> the GBJ-1 file byte for byte)."""
-    return _revert(gbj, EDITS2)
+    """reverse the GBJ-3 and GBJ-2 edits (-> the GBJ-1 file byte for byte)."""
+    return _revert(strip_gbj3(gbj), EDITS2)
 
 
 def strip_gbj(gbj):

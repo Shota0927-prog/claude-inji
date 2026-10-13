@@ -49,8 +49,22 @@ def inputs(src):
     return dict(re.findall(r"^(\w+)\s*=\s*input\.\w+\(([^,]+),", src, re.M))
 
 
+GBS3_PREV = [   # the GBS-2 (65b1fb3) texts the GBJ-3 base setting replaced in the Strategy
+    (gs.HEADER_GBS,
+     "//  Zone Strategy GBPJPY  —  ZONE-GBPJPY (ZoneVisualGBPJPY) の Zone 判定をそのまま使う OANDA:GBPJPY 5分足 Strategy\n"
+     "//  (生成: tests/gbs_build.py。Zone 計算は ZONE-GBPJPY、注文処理・仮 / 確定アラートは ZONE-ST-JPY\n"
+     "//   (ZoneStrategyUSDJPY) と同じ式。価格差は円。初期値は GBPJPY 基準設定 (ある比較期間の TradingView 結果から\n"
+     "//   決めたもの。最適値・別期間での有効性は未確認)。Zone Half Width は 0.05 (表示用 ZONE-GBPJPY の初期 0.03\n"
+     "//   とは異なる: 表示と照合するときは Visual 側を 0.05 に合わせる)\n"),
+    ("(= 3 / 5 / 8 pips)。初期 0.05 = GBPJPY 基準設定 (Visual / Strategy 共通)。\")\n",
+     "(= 3 / 5 / 8 pips)。Strategy 初期 0.05 = GBPJPY 基準設定 (表示用 ZONE-GBPJPY は 0.03)。\")\n"),
+] + [(b, a) for k, a, b in gb.EDITS3 if k == "default" and not a.startswith("zoneHalfWidth") and "初期 0.03" not in a]
+
+
 def revert_in_strategy(text):
     out = text
+    for b, a in GBS3_PREV:
+        out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
     for kind, a, b in reversed(gb.EDITS2):
         if kind != "header" and "fd   = array.get(gFvgDir, slot)" not in b:
             out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
@@ -68,15 +82,21 @@ PROTECTED = ["ZoneVisualUSDJPY.pine", "ZoneStrategyUSDJPY.pine", "ZoneVisualPrac
 def gate_static():
     check("GX-01 Visual == gbj_build.build(), Strategy == gbs_build.build() (rebuilds identical); reverting the GBJ-2 edits "
           "gives the previous Visual and Strategy (" + BASE + ") byte for byte: with both features OFF only the listed "
-          "edits differ", gb.build() == GBV and gs.build() == GBS and gb.strip_gbj2(GBV) == GBV0 and bool(GBV0)
+          "edits differ (GBJ-3 base-setting defaults reverted as well: they are pinned by gbs_sim GB-06 / GB-10)",
+          gb.build() == GBV and gs.build() == GBS and gb.strip_gbj2(GBV) == GBV0 and bool(GBV0)
           and revert_in_strategy(GBS) == GBS0 and bool(GBS0))
-    vv, vs = inputs(GBV), inputs(GBS)
+    gbj3 = {"scoreDayHL", "slopeThrMod", "slopeThrStrong", "thrStrong", "zoneHalfWidth"}   # GBJ-3 (gbs_sim GB-06 / GB-10)
+    vv = {k: v for k, v in inputs(GBV).items() if k not in gbj3}
+    vs = {k: v for k, v in inputs(GBS).items() if k not in gbj3}
+    v0 = {k: v for k, v in inputs(GBV0).items() if k not in gbj3}
+    s0 = {k: v for k, v in inputs(GBS0).items() if k not in gbj3}
     check("GX-02 new inputs and defaults, same in Visual and Strategy: FVG Direction Match OFF, RN OFF, major 1.00 円 / +3, "
-          "minor 0.50 円 / +2 (all changeable inputs); every other input value unchanged from " + BASE,
+          "minor 0.50 円 / +2 (all changeable inputs); every other input value unchanged from " + BASE + " (GBJ-3 "
+          "base-setting defaults aside)",
           all(vv.get(k) == v and vs.get(k) == v for k, v in NEW_INPUTS.items())
-          and {k: v for k, v in vv.items() if k not in NEW_INPUTS or k == "enableRn"} == inputs(GBV0)
-          and {k: v for k, v in vs.items() if k not in NEW_INPUTS or k == "enableRn"} == inputs(GBS0),
-          str((set(vv) ^ set(inputs(GBV0)), vs.get("enableRn"))))
+          and {k: v for k, v in vv.items() if k not in NEW_INPUTS or k == "enableRn"} == v0
+          and {k: v for k, v in vs.items() if k not in NEW_INPUTS or k == "enableRn"} == s0,
+          str((set(vv) ^ set(v0), vs.get("enableRn"))))
     sel = gb.SEL_NEW
     fz = lambda s: tb.func(s, "f_fvcZoneDisplay(").rstrip()      # trailing blank lines differ by layout only
     fb = lambda s: tb.func(s, "f_zpoBestFvg(").rstrip()
