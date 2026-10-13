@@ -22,8 +22,10 @@ IMPORT_6 = "import sekine3310/ZoneEnginePractical/6 as zn\n"
 # (python3 tests/gbj_build.py && python3 tests/gbs_build.py).
 IMPORT_GBE1 = "import sekine3310/ZoneEnginePracticalGBPJPY/1 as zn\n"
 IMPORT_GBE2 = "import sekine3310/ZoneEnginePracticalGBPJPY/2 as zn\n"
-# GBE-3 (+ Day/Swing Overlap Mode) is expected to become version 3.
-IMPORT_GBE = "import sekine3310/ZoneEnginePracticalGBPJPY/3 as zn\n"
+# Version 3 = the time-based Day/Swing Deduplicate of 23fd5e0 (superseded, its origin-time data removed). The
+# price-based Day/Swing Merge Nearby below is expected to become version 4.
+IMPORT_GBE3 = "import sekine3310/ZoneEnginePracticalGBPJPY/3 as zn\n"
+IMPORT_GBE = "import sekine3310/ZoneEnginePracticalGBPJPY/4 as zn\n"
 
 ACC_OLD = """        else if m.srcCat == CAT_ACC
             if m.srcTf == c.accTf1
@@ -134,118 +136,75 @@ EDITS2 = [
 ]
 
 
-# ---- GBE-3: Day/Swing Overlap Mode (Separate = current / Deduplicate), applied after EDITS2 -------------------------
-#  Origin data (state / fields only; Separate never reads them, so its scores are unchanged):
-#    Day High / Low: the 5M bar that first reached the day's extreme (later equal highs do not move it) and the time of
-#    the trading day's first 5M bar. Swing: the pivot bar's open time and the pivot timeframe length (from the script's
-#    existing Swing requests: time[len], not the confirmation time), and the pivot price.
-#  Deduplicate (f_finalizeCluster): a Swing High and the Day High (Low and Low) have the same origin when the price is
-#    identical, the pivot bar lies in the trading day (open >= the day's first 5M bar) and the Day bar is inside the pivot
-#    bar (open <= dayT < open + length). If every Swing timeframe that earns the Swing max (ties included) is such a
-#    matched Swing, that evidence counts max(Day, Swing max) (= Separate - min(Day, Swing max)); an independent Swing at
-#    the top score blocks it. HZ + DHL count as one category only when exactly one matched evidence and no independent
-#    Horizontal / Day H/L source is in the cluster. strip_gbe3() -> the GBE-2 source (Library version 2).
+# ---- GBE-4 (replaces the time-based GBE-3): Day/Swing Overlap Mode = Separate / Merge Nearby, applied after EDITS2 ---
+#  Price data (state only; Separate never reads it): every static Raw Zone keeps the actual registered price (px0) and the
+#  price of the latest event merged into it (px1; for a Swing raw these are its pivot prices); the Day High / Low raws
+#  carry the actual day extreme (px0). No time / origin information is kept.
+#  Merge Nearby (f_finalizeCluster): within a cluster, a Swing High is merged with the Day High (Low with Low) when
+#  round(|day - pivot| / mintick) <= round(dsDist / mintick) for its first or latest pivot price (0 = identical price).
+#  If every Swing timeframe that earns the Swing max (ties included) has only merged Swings, the pair counts
+#  max(Day, Swing max) (= Separate - min(Day, Swing max)); an independent Swing at the top score blocks it. HZ + DHL count
+#  as one category only when exactly one merged Day side and no independent Horizontal / Day H/L source is in the
+#  cluster. Flags are ORs and min / max are symmetric, so member order does not matter. strip_gbe3() -> version 2.
 EDITS3 = [
     ("//    true = Once per TF = 同じ時間足は上限・下限を合わせて最大 1 回)。時間足ごとの寄与を出してから Sum / Max。\n",
      "//    true = Once per TF = 同じ時間足は上限・下限を合わせて最大 1 回)。時間足ごとの寄与を出してから Sum / Max。\n"
-     "//  ★ GBE-3: Day/Swing Overlap Mode (ZoneCfg.dsDedup: false = Separate (GBE-2 と同一) / true = Deduplicate)。\n"
-     "//    当日高値・安値とそれを元にした確定 Swing (同じ元の足・同じ価格) を 1 つの根拠として数える。\n"),
+     "//  ★ GBE-4: Day/Swing Overlap Mode (ZoneCfg.dsMerge: false = Separate (GBE-2 と同一) / true = Merge Nearby)。\n"
+     "//    同じ Cluster 内で、価格が dsDist 以内の Day High と Swing High (Low と Low) を 1 つの根拠として数える。\n"),
     ("    bool   accEdgeOnce        = false   // GBE-2: Accum 同じ時間足 false = Separate (上限 / 下限を別々) / true = Once per TF\n",
      "    bool   accEdgeOnce        = false   // GBE-2: Accum 同じ時間足 false = Separate (上限 / 下限を別々) / true = Once per TF\n"
-     "    bool   dsDedup            = false   // GBE-3: Day/Swing Overlap false = Separate / true = Deduplicate (同じ元の高安)\n"
-     "    int    hzMs1              = 300000  // GBE-3: Swing TF #1 / #2 / #3 の足の長さ (ms)。pivot 元の足の期間に使う\n"
-     "    int    hzMs2              = 900000\n"
-     "    int    hzMs3              = 3600000\n"),
+     "    bool   dsMerge            = false   // GBE-4: Day/Swing Overlap false = Separate / true = Merge Nearby\n"
+     "    float  dsDist             = 0.05    // GBE-4: Merge Distance (価格差、0 = 同じ価格だけ)\n"),
     ("    bool   dynamic        = false\n",
      "    bool   dynamic        = false\n"
-     "    int    oT             = na      // GBE-3: 元の高安の足の開始時刻 (Swing: pivot 元の足 / Day H/L: 高安を最初に付けた 5分足)\n"
-     "    int    oMs            = na      // GBE-3: Swing の pivot 元の足の長さ (ms)\n"
-     "    float  oPx            = na      // GBE-3: 元の高安の価格\n"
-     "    int    oDay0          = na      // GBE-3: Day H/L の取引日の最初の 5分足の時刻\n"),
-    ("    int   pl3t    = na\n",
-     "    int   pl3t    = na\n"
-     "    // GBE-3: pivot 元の足の開始時刻 (= 要求した時間足の time[len]。pivot を確認した足の時刻 phXt / plXt とは別)\n"
-     "    int   ph1o    = na\n    int   pl1o    = na\n    int   ph2o    = na\n    int   pl2o    = na\n"
-     "    int   ph3o    = na\n    int   pl3o    = na\n"),
-    ("    int   prevDayId   = na\n",
-     "    int   prevDayId   = na\n"
-     "    int   dayStartT   = na    // GBE-3: 取引日の最初の 5分足の時刻\n"
-     "    int   dayHighT    = na    // GBE-3: 当日高値を最初に付けた 5分足の時刻 (同値の後の足では動かさない)\n"
-     "    int   dayLowT     = na    // GBE-3: 当日安値を最初に付けた 5分足の時刻\n"),
-    ("f_registerStatic(ZoneEngine e, ZoneCfg c, bool trig, float price, string id, string cat,\n"
-     "     string tf, float bs, float lifeDays) =>\n",
-     "f_registerStatic(ZoneEngine e, ZoneCfg c, bool trig, float price, string id, string cat,\n"
-     "     string tf, float bs, float lifeDays, int oT = na, int oMs = na) =>\n"),
+     "    float  px0            = na      // GBE-4: 登録時の実際の価格 (Swing: pivot 価格 / Day H/L: その日の高安)\n"
+     "    float  px1            = na      // GBE-4: この Raw Zone に統合された最新のイベントの価格 (Swing: 最新の pivot 価格)\n"),
     ("                    dup := true\n                    if life > 0\n",
      "                    dup := true\n"
-     "                    if not na(oT)    // GBE-3: 同じ Raw Zone に統合された最新の pivot の元の足 / 価格\n"
-     "                        z.oT  := oT\n"
-     "                        z.oMs := oMs\n"
-     "                        z.oPx := price\n"
+     "                    z.px1 := price     // GBE-4: 統合された最新のイベント (pivot) の実際の価格\n"
      "                    if life > 0\n"),
     ("            rz.expireTime := life > 0 ? time + life : 0\n            array.push(e.persist, rz)\n",
      "            rz.expireTime := life > 0 ? time + life : 0\n"
-     "            rz.oT  := oT\n"
-     "            rz.oMs := oMs\n"
-     "            rz.oPx := na(oT) ? na : price\n"
+     "            rz.px0 := price\n"
+     "            rz.px1 := price\n"
      "            array.push(e.persist, rz)\n"),
-    ("        e.dayLow      := low\n    else\n",
-     "        e.dayLow      := low\n"
-     "        e.dayStartT   := time\n"
-     "        e.dayHighT    := time\n"
-     "        e.dayLowT     := time\n"
-     "    else\n"
-     "        if na(e.dayHigh) or high > e.dayHigh     // GBE-3: 高値を更新した足だけ (同値は最初の足のまま)\n"
-     "            e.dayHighT := time\n"
-     "        if na(e.dayLow) or low < e.dayLow\n"
-     "            e.dayLowT := time\n"),
-]
-for k, h, l in ((1, "ph1", "pl1"), (2, "ph2", "pl2"), (3, "ph3", "pl3")):
-    for side, f in (("SWING_H", h), ("SWING_L", l)):
-        n = "Ph" if side == "SWING_H" else "Pl"
-        a = (f'    f_registerStatic(e, c, c.useHzSource and n{n}{k}, f.{f}, "{side}", CAT_HZ, c.hzTf{k}, c.scoreHz{k}, c.lifeHz{k})\n')
-        EDITS3.append((a, a[:-2] + f", f.{f}o, c.hzMs{k})\n"))
-EDITS3 += [
     ('        f_pushDyn(e, c, 2, e.dayHighUid, "DAY_HIGH", CAT_DHL, "D", e.dayHigh, c.scoreDayHL, 0, 0, 0.0, 0.0)\n',
      '        f_pushDyn(e, c, 2, e.dayHighUid, "DAY_HIGH", CAT_DHL, "D", e.dayHigh, c.scoreDayHL, 0, 0, 0.0, 0.0)\n'
-     '        RawZone dhz = array.get(e.sDynPool, 2)     // GBE-3: Day High の元の足\n'
-     '        dhz.oT    := e.dayHighT\n'
-     '        dhz.oPx   := e.dayHigh\n'
-     '        dhz.oDay0 := e.dayStartT\n'),
+     '        RawZone dhz = array.get(e.sDynPool, 2)     // GBE-4: 実際の当日高値\n'
+     '        dhz.px0 := e.dayHigh\n'),
     ('        f_pushDyn(e, c, 3, e.dayLowUid, "DAY_LOW", CAT_DHL, "D", e.dayLow, c.scoreDayHL, 0, 0, 0.0, 0.0)\n',
      '        f_pushDyn(e, c, 3, e.dayLowUid, "DAY_LOW", CAT_DHL, "D", e.dayLow, c.scoreDayHL, 0, 0, 0.0, 0.0)\n'
-     '        RawZone dlz = array.get(e.sDynPool, 3)     // GBE-3: Day Low の元の足\n'
-     '        dlz.oT    := e.dayLowT\n'
-     '        dlz.oPx   := e.dayLow\n'
-     '        dlz.oDay0 := e.dayStartT\n'),
+     '        RawZone dlz = array.get(e.sDynPool, 3)     // GBE-4: 実際の当日安値\n'
+     '        dlz.px0 := e.dayLow\n'),
     ("    float accA3 = 0.0\n",
      "    float accA3 = 0.0\n"
-     "    // GBE-3: Day/Swing Overlap (Deduplicate のときだけ使う)\n"
-     "    bool  dsOn   = c.dsDedup\n"
-     "    float dHpx   = na\n    int   dHt    = na\n    int   dH0    = na\n"
-     "    float dLpx   = na\n    int   dLt    = na\n    int   dL0    = na\n"
-     "    bool  dHm    = false   // Day High と同じ元の Swing High がある\n"
-     "    bool  dLm    = false   // Day Low と同じ元の Swing Low がある\n"
+     "    // GBE-4: Day/Swing Merge Nearby (dsMerge のときだけ使う)\n"
+     "    bool  dsOn   = c.dsMerge\n"
+     "    int   dsTk   = dsOn ? math.round(c.dsDist / syminfo.mintick) : 0   // 距離を最小価格刻みの整数で比べる (境界の浮動小数誤差を避ける)\n"
+     "    float dHpx   = na\n"
+     "    float dLpx   = na\n"
+     "    bool  dHm    = false   // Day High とまとまる Swing High がある\n"
+     "    bool  dLm    = false   // Day Low とまとまる Swing Low がある\n"
      "    bool  hasDH  = false\n    bool  hasDL  = false\n"
-     "    bool  hzInd  = false   // 同じ元でない Horizontal (Swing / 前日高安など) がある\n"
-     "    bool  swInd1 = false   // 時間足ごと: 同じ元でない Swing がある\n"
+     "    bool  hzInd  = false   // まとまらない Horizontal (Swing / 前日高安など) がある\n"
+     "    bool  swInd1 = false   // 時間足ごと: まとまらない Swing がある\n"
      "    bool  swInd2 = false\n    bool  swInd3 = false\n"),
     ("    int n = array.size(members)\n    for j = 0 to n - 1\n",
      "    int n = array.size(members)\n"
-     "    // GBE-3: Deduplicate のときだけ、この Cluster の Day High / Low の元の足を先に読む (Cluster のメンバーだけ)\n"
+     "    // GBE-4: Merge Nearby のときだけ、この Cluster の Day High / Low の実際の価格を先に読む (Cluster のメンバーだけ)\n"
      "    if dsOn\n"
      "        for j = 0 to n - 1\n"
      "            RawZone q = array.get(members, j)\n"
      "            if q.srcId == \"DAY_HIGH\"\n"
-     "                dHpx := q.oPx\n                dHt  := q.oT\n                dH0  := q.oDay0\n"
+     "                dHpx := q.px0\n"
      "            else if q.srcId == \"DAY_LOW\"\n"
-     "                dLpx := q.oPx\n                dLt  := q.oT\n                dL0  := q.oDay0\n"
+     "                dLpx := q.px0\n"
      "    for j = 0 to n - 1\n"),
     ("        if isSwing\n            if m.srcTf == c.hzTf1\n",
      "        if isSwing\n"
-     "            // GBE-3: 同じ元の高安 = 高安の別と価格が一致し、pivot 元の足が取引日内で、その足の期間に Day H/L の足が入る\n"
-     "            bool mH = dsOn and m.srcId == \"SWING_H\" and not na(dHt) and not na(m.oT) and not na(m.oMs) and m.oPx == dHpx and m.oT >= dH0 and m.oT <= dHt and dHt < m.oT + m.oMs\n"
-     "            bool mL = dsOn and m.srcId == \"SWING_L\" and not na(dLt) and not na(m.oT) and not na(m.oMs) and m.oPx == dLpx and m.oT >= dL0 and m.oT <= dLt and dLt < m.oT + m.oMs\n"
+     "            // GBE-4: Day High と Swing High / Day Low と Swing Low だけを比べる。pivot 価格 (最初 / 最新) のどちらかが距離以内\n"
+     "            bool mH = dsOn and m.srcId == \"SWING_H\" and not na(dHpx) and (math.round(math.abs(dHpx - m.px0) / syminfo.mintick) <= dsTk or math.round(math.abs(dHpx - m.px1) / syminfo.mintick) <= dsTk)\n"
+     "            bool mL = dsOn and m.srcId == \"SWING_L\" and not na(dLpx) and (math.round(math.abs(dLpx - m.px0) / syminfo.mintick) <= dsTk or math.round(math.abs(dLpx - m.px1) / syminfo.mintick) <= dsTk)\n"
      "            int  sl = m.srcTf == c.hzTf1 ? 1 : m.srcTf == c.hzTf2 ? 2 : m.srcTf == c.hzTf3 ? 3 : 0\n"
      "            dHm := dHm or mH\n"
      "            dLm := dLm or mL\n"
@@ -263,9 +222,9 @@ EDITS3 += [
      "                hasDL := hasDL or m.srcId == \"DAY_LOW\"\n"),
     ("        baseSum += math.max(accA1, math.max(accA2, accA3))\n\n",
      "        baseSum += math.max(accA1, math.max(accA2, accA3))\n\n"
-     "    // GBE-3: Deduplicate — 同じ元の高安の Day H/L と Swing を 1 つの根拠にする\n"
-     "    //   Swing 最大点 (swMax) を得ている時間足 (同点を含む) の Swing がすべて同じ元なら、その根拠は max(Day 点, swMax)。\n"
-     "    //   同じ点数の時間足に同じ元でない Swing があれば調整しない (独立した Swing が最大点を得ている)。\n"
+     "    // GBE-4: Merge Nearby — 近い価格の Day H/L と Swing を 1 つの根拠にする\n"
+     "    //   Swing 最大点 (swMax) を得ている時間足 (同点を含む) の Swing がすべて Day とまとまるなら、その根拠は max(Day 点, swMax)。\n"
+     "    //   同じ点数の時間足にまとまらない Swing があれば調整しない (独立した Swing が最大点を得ている)。\n"
      "    int dsCatAdj = 0\n"
      "    if dsOn and (dHm or dLm)\n"
      "        bool top1 = swHit1 and c.scoreHz1 == swMax\n"
@@ -275,7 +234,7 @@ EDITS3 += [
      "        if not blocked and (top1 or top2 or top3)\n"
      "            baseSum -= math.min(c.scoreDayHL, swMax)\n"
      "        bool dhlInd = (hasDH and not dHm) or (hasDL and not dLm)\n"
-     "        // カテゴリ: 同じ元の根拠が 1 つだけで、独立した Horizontal / Day H/L が無いときだけ HZ + DHL を 1 つにする\n"
+     "        // カテゴリ: まとまった Day 側が 1 つだけで、独立した Horizontal / Day H/L が無いときだけ HZ + DHL を 1 つにする\n"
      "        if not hzInd and not dhlInd and not (dHm and dLm)\n"
      "            dsCatAdj := 1\n\n"),
     ("    int   cat = (hasMA ? 1 : 0) + (hasHZ ? 1 : 0) + (hasDHL ? 1 : 0) + (hasACC ? 1 : 0) + (hasRN ? 1 : 0)\n",
@@ -292,8 +251,8 @@ def gbe_transform(src):
 
 
 def strip_gbe(text):
-    """GBE-3 + GBE-2 + GBE-1 reverted -> ZoneEnginePractical/6 source."""
-    out = strip_gbe3(text) if text is not None and "dsDedup" in text else text
+    """GBE-4 + GBE-2 + GBE-1 reverted -> ZoneEnginePractical/6 source."""
+    out = strip_gbe3(text) if text is not None and "dsMerge" in text else text
     out = strip_gbe2(out) if out is not None and "accEdgeOnce" in out else out
     if out is None:
         return None
@@ -320,7 +279,7 @@ def strip_gbe2(text):
 
 
 def strip_gbe3(text):
-    """reverse only the GBE-3 edits (-> the GBE-2 source, Library version 2, byte for byte)."""
+    """reverse only the GBE-4 edits (EDITS3) (-> the GBE-2 source, Library version 2, byte for byte)."""
     out = text
     for a, b in reversed(EDITS3):
         if out is None or out.count(b) != 1:

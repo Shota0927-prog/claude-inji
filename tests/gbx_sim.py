@@ -89,7 +89,7 @@ def gate_static():
           gb.build() == GBV and gs.build() == GBS and gb.strip_gbj2(GBV) == GBV0 and bool(GBV0)
           and revert_in_strategy(GBS) == GBS0 and bool(GBS0))
     gbj3 = {"scoreDayHL", "slopeThrMod", "slopeThrStrong", "thrStrong", "zoneHalfWidth",   # GBJ-3 (gbs_sim GB-06 / GB-10)
-            "accScoreMode", "accEdgeMode", "dsMode"}                                                   # GBJ-4 / GBJ-5 (gbe_sim / gbf_sim)
+            "accScoreMode", "accEdgeMode", "dsMode", "dsDist"}                                                   # GBJ-4 / GBJ-5 (gbe_sim / gbf_sim)
     vv = {k: v for k, v in inputs(GBV).items() if k not in gbj3}
     vs = {k: v for k, v in inputs(GBS).items() if k not in gbj3}
     v0 = {k: v for k, v in inputs(GBV0).items() if k not in gbj3}

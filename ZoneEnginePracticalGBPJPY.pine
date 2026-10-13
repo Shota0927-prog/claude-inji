@@ -8,8 +8,8 @@
 //    同じ時間足の上限 / 下限の数え方、カテゴリ、HTF、他 Source、Confluence、Strength 閾値は /6 のまま。
 //  ★ GBE-2: Accum Edge Mode (ZoneCfg.accEdgeOnce: false = Separate = 上限 / 下限をそれぞれ 1 回 (GBE-1 と同一) /
 //    true = Once per TF = 同じ時間足は上限・下限を合わせて最大 1 回)。時間足ごとの寄与を出してから Sum / Max。
-//  ★ GBE-3: Day/Swing Overlap Mode (ZoneCfg.dsDedup: false = Separate (GBE-2 と同一) / true = Deduplicate)。
-//    当日高値・安値とそれを元にした確定 Swing (同じ元の足・同じ価格) を 1 つの根拠として数える。
+//  ★ GBE-4: Day/Swing Overlap Mode (ZoneCfg.dsMerge: false = Separate (GBE-2 と同一) / true = Merge Nearby)。
+//    同じ Cluster 内で、価格が dsDist 以内の Day High と Swing High (Low と Low) を 1 つの根拠として数える。
 // ============================================================================
 //  ★ SW-1 版 (Swing 最大点方式)。同一 Cluster 内の Swing (hzTf1 / hzTf2 / hzTf3) は、含まれる時間足の
 //    設定点 (scoreHz1 / 2 / 3) の最大値だけを baseSum に加える (旧: 時間足ごとに合算)。Swing の検知 / 登録 /
@@ -198,10 +198,8 @@ export type ZoneCfg
     int    accKeep3           = 1
     bool   accScoreMax        = false   // GBE-1: Accum 時間足間 false = Sum (各時間足の寄与の合計) / true = Max (最大)
     bool   accEdgeOnce        = false   // GBE-2: Accum 同じ時間足 false = Separate (上限 / 下限を別々) / true = Once per TF
-    bool   dsDedup            = false   // GBE-3: Day/Swing Overlap false = Separate / true = Deduplicate (同じ元の高安)
-    int    hzMs1              = 300000  // GBE-3: Swing TF #1 / #2 / #3 の足の長さ (ms)。pivot 元の足の期間に使う
-    int    hzMs2              = 900000
-    int    hzMs3              = 3600000
+    bool   dsMerge            = false   // GBE-4: Day/Swing Overlap false = Separate / true = Merge Nearby
+    float  dsDist             = 0.05    // GBE-4: Merge Distance (価格差、0 = 同じ価格だけ)
     // -- Cluster --
     float  clusterDist        = 5.0
     // -- Strength Score --
@@ -280,10 +278,8 @@ export type RawZone
     int    createdTime    = 0
     int    expireTime     = 0
     bool   dynamic        = false
-    int    oT             = na      // GBE-3: 元の高安の足の開始時刻 (Swing: pivot 元の足 / Day H/L: 高安を最初に付けた 5分足)
-    int    oMs            = na      // GBE-3: Swing の pivot 元の足の長さ (ms)
-    float  oPx            = na      // GBE-3: 元の高安の価格
-    int    oDay0          = na      // GBE-3: Day H/L の取引日の最初の 5分足の時刻
+    float  px0            = na      // GBE-4: 登録時の実際の価格 (Swing: pivot 価格 / Day H/L: その日の高安)
+    float  px1            = na      // GBE-4: この Raw Zone に統合された最新のイベントの価格 (Swing: 最新の pivot 価格)
 
 // ---- Zone : Cluster統合後の最終Zone (Live Zone Mapの構成要素) -------------
 export type Zone
@@ -365,13 +361,6 @@ export type ZoneFeed
     int   ph3t    = na
     float pl3     = na
     int   pl3t    = na
-    // GBE-3: pivot 元の足の開始時刻 (= 要求した時間足の time[len]。pivot を確認した足の時刻 phXt / plXt とは別)
-    int   ph1o    = na
-    int   pl1o    = na
-    int   ph2o    = na
-    int   pl2o    = na
-    int   ph3o    = na
-    int   pl3o    = na
     // Accumulation (accumPack の戻り値 x3TF)
     float acc1Hi  = na
     float acc1Lo  = na
@@ -413,9 +402,6 @@ export type ZoneEngine
     float prevDayHigh = na
     float prevDayLow  = na
     int   prevDayId   = na
-    int   dayStartT   = na    // GBE-3: 取引日の最初の 5分足の時刻
-    int   dayHighT    = na    // GBE-3: 当日高値を最初に付けた 5分足の時刻 (同値の後の足では動かさない)
-    int   dayLowT     = na    // GBE-3: 当日安値を最初に付けた 5分足の時刻
     // 新規確定エッジ検出用の前バー値 (分割前の [1] 参照と等価)
     int   pPh1t = na
     int   pPl1t = na
@@ -715,7 +701,7 @@ f_onPersistPush(ZoneEngine e, int expireTime) =>
 //    寿命の異なる Source が同じZoneを更新した場合)。そのため更新時も
 //    nextPersistExpireTime を min で下げる (下限であることを常に保証する)。
 f_registerStatic(ZoneEngine e, ZoneCfg c, bool trig, float price, string id, string cat,
-     string tf, float bs, float lifeDays, int oT = na, int oMs = na) =>
+     string tf, float bs, float lifeDays) =>
     if trig and not na(price)
         int life = f_days2ms(lifeDays)
         bool dup = false
@@ -724,10 +710,7 @@ f_registerStatic(ZoneEngine e, ZoneCfg c, bool trig, float price, string id, str
                 RawZone z = array.get(e.persist, i)
                 if z.srcId == id and z.srcTf == tf and math.abs(z.center - price) <= c.zoneHalfWidth
                     dup := true
-                    if not na(oT)    // GBE-3: 同じ Raw Zone に統合された最新の pivot の元の足 / 価格
-                        z.oT  := oT
-                        z.oMs := oMs
-                        z.oPx := price
+                    z.px1 := price     // GBE-4: 統合された最新のイベント (pivot) の実際の価格
                     if life > 0
                         z.expireTime := time + life
                         e.nextPersistExpireTime := na(e.nextPersistExpireTime) ? z.expireTime : math.min(e.nextPersistExpireTime, z.expireTime)
@@ -735,9 +718,8 @@ f_registerStatic(ZoneEngine e, ZoneCfg c, bool trig, float price, string id, str
         if not dup
             RawZone rz = f_makeRaw(c, f_nextUid(e), id, cat, tf, price, bs, false)
             rz.expireTime := life > 0 ? time + life : 0
-            rz.oT  := oT
-            rz.oMs := oMs
-            rz.oPx := na(oT) ? na : price
+            rz.px0 := price
+            rz.px1 := price
             array.push(e.persist, rz)
             f_onPersistPush(e, rz.expireTime)
     true
@@ -896,20 +878,17 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c, float zBot, float zTop) =>
     float accA1 = 0.0    // GBE-1: 時間足ごとの Accum 寄与 (accTf1 / accTf2 / accTf3)
     float accA2 = 0.0
     float accA3 = 0.0
-    // GBE-3: Day/Swing Overlap (Deduplicate のときだけ使う)
-    bool  dsOn   = c.dsDedup
+    // GBE-4: Day/Swing Merge Nearby (dsMerge のときだけ使う)
+    bool  dsOn   = c.dsMerge
+    int   dsTk   = dsOn ? math.round(c.dsDist / syminfo.mintick) : 0   // 距離を最小価格刻みの整数で比べる (境界の浮動小数誤差を避ける)
     float dHpx   = na
-    int   dHt    = na
-    int   dH0    = na
     float dLpx   = na
-    int   dLt    = na
-    int   dL0    = na
-    bool  dHm    = false   // Day High と同じ元の Swing High がある
-    bool  dLm    = false   // Day Low と同じ元の Swing Low がある
+    bool  dHm    = false   // Day High とまとまる Swing High がある
+    bool  dLm    = false   // Day Low とまとまる Swing Low がある
     bool  hasDH  = false
     bool  hasDL  = false
-    bool  hzInd  = false   // 同じ元でない Horizontal (Swing / 前日高安など) がある
-    bool  swInd1 = false   // 時間足ごと: 同じ元でない Swing がある
+    bool  hzInd  = false   // まとまらない Horizontal (Swing / 前日高安など) がある
+    bool  swInd1 = false   // 時間足ごと: まとまらない Swing がある
     bool  swInd2 = false
     bool  swInd3 = false
     int  srcM   = 0
@@ -918,27 +897,23 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c, float zBot, float zTop) =>
     array<int> uids = array.new_int()
 
     int n = array.size(members)
-    // GBE-3: Deduplicate のときだけ、この Cluster の Day High / Low の元の足を先に読む (Cluster のメンバーだけ)
+    // GBE-4: Merge Nearby のときだけ、この Cluster の Day High / Low の実際の価格を先に読む (Cluster のメンバーだけ)
     if dsOn
         for j = 0 to n - 1
             RawZone q = array.get(members, j)
             if q.srcId == "DAY_HIGH"
-                dHpx := q.oPx
-                dHt  := q.oT
-                dH0  := q.oDay0
+                dHpx := q.px0
             else if q.srcId == "DAY_LOW"
-                dLpx := q.oPx
-                dLt  := q.oT
-                dL0  := q.oDay0
+                dLpx := q.px0
     for j = 0 to n - 1
         RawZone m = array.get(members, j)
 
         bool isSwing = m.srcCat == CAT_HZ and (m.srcId == "SWING_H" or m.srcId == "SWING_L")
         bool isAccHi = m.srcId == "ACC_HI"
         if isSwing
-            // GBE-3: 同じ元の高安 = 高安の別と価格が一致し、pivot 元の足が取引日内で、その足の期間に Day H/L の足が入る
-            bool mH = dsOn and m.srcId == "SWING_H" and not na(dHt) and not na(m.oT) and not na(m.oMs) and m.oPx == dHpx and m.oT >= dH0 and m.oT <= dHt and dHt < m.oT + m.oMs
-            bool mL = dsOn and m.srcId == "SWING_L" and not na(dLt) and not na(m.oT) and not na(m.oMs) and m.oPx == dLpx and m.oT >= dL0 and m.oT <= dLt and dLt < m.oT + m.oMs
+            // GBE-4: Day High と Swing High / Day Low と Swing Low だけを比べる。pivot 価格 (最初 / 最新) のどちらかが距離以内
+            bool mH = dsOn and m.srcId == "SWING_H" and not na(dHpx) and (math.round(math.abs(dHpx - m.px0) / syminfo.mintick) <= dsTk or math.round(math.abs(dHpx - m.px1) / syminfo.mintick) <= dsTk)
+            bool mL = dsOn and m.srcId == "SWING_L" and not na(dLpx) and (math.round(math.abs(dLpx - m.px0) / syminfo.mintick) <= dsTk or math.round(math.abs(dLpx - m.px1) / syminfo.mintick) <= dsTk)
             int  sl = m.srcTf == c.hzTf1 ? 1 : m.srcTf == c.hzTf2 ? 2 : m.srcTf == c.hzTf3 ? 3 : 0
             dHm := dHm or mH
             dLm := dLm or mL
@@ -1057,9 +1032,9 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c, float zBot, float zTop) =>
     if c.accScoreMax
         baseSum += math.max(accA1, math.max(accA2, accA3))
 
-    // GBE-3: Deduplicate — 同じ元の高安の Day H/L と Swing を 1 つの根拠にする
-    //   Swing 最大点 (swMax) を得ている時間足 (同点を含む) の Swing がすべて同じ元なら、その根拠は max(Day 点, swMax)。
-    //   同じ点数の時間足に同じ元でない Swing があれば調整しない (独立した Swing が最大点を得ている)。
+    // GBE-4: Merge Nearby — 近い価格の Day H/L と Swing を 1 つの根拠にする
+    //   Swing 最大点 (swMax) を得ている時間足 (同点を含む) の Swing がすべて Day とまとまるなら、その根拠は max(Day 点, swMax)。
+    //   同じ点数の時間足にまとまらない Swing があれば調整しない (独立した Swing が最大点を得ている)。
     int dsCatAdj = 0
     if dsOn and (dHm or dLm)
         bool top1 = swHit1 and c.scoreHz1 == swMax
@@ -1069,7 +1044,7 @@ f_finalizeCluster(array<RawZone> members, ZoneCfg c, float zBot, float zTop) =>
         if not blocked and (top1 or top2 or top3)
             baseSum -= math.min(c.scoreDayHL, swMax)
         bool dhlInd = (hasDH and not dHm) or (hasDL and not dLm)
-        // カテゴリ: 同じ元の根拠が 1 つだけで、独立した Horizontal / Day H/L が無いときだけ HZ + DHL を 1 つにする
+        // カテゴリ: まとまった Day 側が 1 つだけで、独立した Horizontal / Day H/L が無いときだけ HZ + DHL を 1 つにする
         if not hzInd and not dhlInd and not (dHm and dLm)
             dsCatAdj := 1
 
@@ -1404,14 +1379,7 @@ export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
         e.prevDayLow  := e.dayLow
         e.dayHigh     := high
         e.dayLow      := low
-        e.dayStartT   := time
-        e.dayHighT    := time
-        e.dayLowT     := time
     else
-        if na(e.dayHigh) or high > e.dayHigh     // GBE-3: 高値を更新した足だけ (同値は最初の足のまま)
-            e.dayHighT := time
-        if na(e.dayLow) or low < e.dayLow
-            e.dayLowT := time
         e.dayHigh := na(e.dayHigh) ? high : math.max(e.dayHigh, high)
         e.dayLow  := na(e.dayLow)  ? low  : math.min(e.dayLow,  low)
 
@@ -1455,12 +1423,12 @@ export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
               or (not na(f.acc3Lo) and (na(e.pAcc3Lo) or f.acc3Lo != e.pAcc3Lo))
 
     // ---- 6.4 Swing High / Low 登録 ----------------------------------------
-    f_registerStatic(e, c, c.useHzSource and nPh1, f.ph1, "SWING_H", CAT_HZ, c.hzTf1, c.scoreHz1, c.lifeHz1, f.ph1o, c.hzMs1)
-    f_registerStatic(e, c, c.useHzSource and nPl1, f.pl1, "SWING_L", CAT_HZ, c.hzTf1, c.scoreHz1, c.lifeHz1, f.pl1o, c.hzMs1)
-    f_registerStatic(e, c, c.useHzSource and nPh2, f.ph2, "SWING_H", CAT_HZ, c.hzTf2, c.scoreHz2, c.lifeHz2, f.ph2o, c.hzMs2)
-    f_registerStatic(e, c, c.useHzSource and nPl2, f.pl2, "SWING_L", CAT_HZ, c.hzTf2, c.scoreHz2, c.lifeHz2, f.pl2o, c.hzMs2)
-    f_registerStatic(e, c, c.useHzSource and nPh3, f.ph3, "SWING_H", CAT_HZ, c.hzTf3, c.scoreHz3, c.lifeHz3, f.ph3o, c.hzMs3)
-    f_registerStatic(e, c, c.useHzSource and nPl3, f.pl3, "SWING_L", CAT_HZ, c.hzTf3, c.scoreHz3, c.lifeHz3, f.pl3o, c.hzMs3)
+    f_registerStatic(e, c, c.useHzSource and nPh1, f.ph1, "SWING_H", CAT_HZ, c.hzTf1, c.scoreHz1, c.lifeHz1)
+    f_registerStatic(e, c, c.useHzSource and nPl1, f.pl1, "SWING_L", CAT_HZ, c.hzTf1, c.scoreHz1, c.lifeHz1)
+    f_registerStatic(e, c, c.useHzSource and nPh2, f.ph2, "SWING_H", CAT_HZ, c.hzTf2, c.scoreHz2, c.lifeHz2)
+    f_registerStatic(e, c, c.useHzSource and nPl2, f.pl2, "SWING_L", CAT_HZ, c.hzTf2, c.scoreHz2, c.lifeHz2)
+    f_registerStatic(e, c, c.useHzSource and nPh3, f.ph3, "SWING_H", CAT_HZ, c.hzTf3, c.scoreHz3, c.lifeHz3)
+    f_registerStatic(e, c, c.useHzSource and nPl3, f.pl3, "SWING_L", CAT_HZ, c.hzTf3, c.scoreHz3, c.lifeHz3)
 
     // ---- 6.5 Accumulation Box 上限 / 下限 登録 ----------------------------
     f_registerAccumZone(e, c, c.useAccSource and nAc1, f.acc1Hi, f.acc1Id, "ACC_HI", c.accTf1, c.scoreAcc1)
@@ -1491,16 +1459,12 @@ export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>
         f_pushDyn(e, c, 1, -2, "MA2", CAT_MA, c.maTfName, f.ma2, c.scoreMa2, ma2State, ma2Dir, ma2SlopeBonus, maClusterBonus)
     if c.useDayHL and not na(e.dayHigh)
         f_pushDyn(e, c, 2, e.dayHighUid, "DAY_HIGH", CAT_DHL, "D", e.dayHigh, c.scoreDayHL, 0, 0, 0.0, 0.0)
-        RawZone dhz = array.get(e.sDynPool, 2)     // GBE-3: Day High の元の足
-        dhz.oT    := e.dayHighT
-        dhz.oPx   := e.dayHigh
-        dhz.oDay0 := e.dayStartT
+        RawZone dhz = array.get(e.sDynPool, 2)     // GBE-4: 実際の当日高値
+        dhz.px0 := e.dayHigh
     if c.useDayHL and not na(e.dayLow)
         f_pushDyn(e, c, 3, e.dayLowUid, "DAY_LOW", CAT_DHL, "D", e.dayLow, c.scoreDayHL, 0, 0, 0.0, 0.0)
-        RawZone dlz = array.get(e.sDynPool, 3)     // GBE-3: Day Low の元の足
-        dlz.oT    := e.dayLowT
-        dlz.oPx   := e.dayLow
-        dlz.oDay0 := e.dayStartT
+        RawZone dlz = array.get(e.sDynPool, 3)     // GBE-4: 実際の当日安値
+        dlz.px0 := e.dayLow
     e.rawCount := array.size(e.persist) + array.size(e.sDyn)
 
     // ---- 6.9 Cluster → Strength (結果は直接 e.live へ) ----------------------
