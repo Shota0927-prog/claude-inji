@@ -194,7 +194,7 @@ EDITS4 = [
      "//  Moderate 0.01 / Strong 0.02 円、Strong Threshold 9。ある比較期間の TradingView 結果から決めた値 (最適値・別期間は未確認)。\n"
      "//  GBJ-4: Accum Score Mode (Sum = 従来 / Max)。Engine は GBPJPY 派生 ZoneEnginePracticalGBPJPY (/6 + Accum 時間足間\n"
      "//  の合算方式だけ、生成: tests/gbe_build.py)。TradingView で Library を publish してから使う。\n"),
-    ("import", _ge.IMPORT_6, _ge.IMPORT_GBE),
+    ("import", _ge.IMPORT_6, _ge.IMPORT_GBE1),
     ("accmode",
      'accKeep3 = input.int(1, "Keep Count · TF #3 Accum (instances)", minval = 1, group = G_ACC)\n',
      'accKeep3 = input.int(1, "Keep Count · TF #3 Accum (instances)", minval = 1, group = G_ACC)\n'
@@ -206,6 +206,28 @@ EDITS4 = [
      "zoneCfg.accKeep3             := accKeep3\n",
      "zoneCfg.accKeep3             := accKeep3\n"
      "zoneCfg.accScoreMax          := accScoreMode == \"Max\"\n"),
+]
+
+
+# ---- GBJ-5: Accum Edge Mode (Separate = current / Once per TF), Engine derivative GBE-2 (Library version 2) ----------
+#  strip_gbj5() reverses only these -> the GBJ-4 file (60cc26f) byte for byte.
+EDITS5 = [
+    ("header",
+     "//  の合算方式だけ、生成: tests/gbe_build.py)。TradingView で Library を publish してから使う。\n",
+     "//  の合算方式だけ、生成: tests/gbe_build.py)。TradingView で Library を publish してから使う。\n"
+     "//  GBJ-5: Accum Edge Mode (Separate = 従来 / Once per TF = 同じ時間足の上限・下限を合わせて 1 回)。Library v2 が必要。\n"),
+    ("import", _ge.IMPORT_GBE1, _ge.IMPORT_GBE),
+    ("accedge",
+     '     "Engine の Score / Strength / Touch / FVG 加点後 Score / Entry 資格すべてに反映 (表示だけの差し替えではない)。")\n',
+     '     "Engine の Score / Strength / Touch / FVG 加点後 Score / Entry 資格すべてに反映 (表示だけの差し替えではない)。")\n'
+     'accEdgeMode = input.string("Separate", "Accum Edge Mode", options = ["Separate", "Once per TF"], group = G_ACC,\n'
+     '     tooltip = "同じ時間足の Accum 上限・下限の数え方。Separate: 上限・下限をそれぞれ 1 回 (従来)。\\n" +\n'
+     '     "Once per TF: その時間足の境界が Zone に 1 つ以上あれば、時間足の点数を 1 回だけ (同じ箱・別の箱を問わない)。\\n" +\n'
+     '     "時間足ごとの寄与を出してから Accum Score Mode (Sum / Max) を適用。例 1H 上下限 + 4H 片側: Separate 10 / 6、Once 7 / 4。")\n'),
+    ("accedge",
+     'zoneCfg.accScoreMax          := accScoreMode == "Max"\n',
+     'zoneCfg.accScoreMax          := accScoreMode == "Max"\n'
+     'zoneCfg.accEdgeOnce          := accEdgeMode == "Once per TF"\n'),
 ]
 
 
@@ -236,12 +258,17 @@ def gbj1_transform(src):
 
 
 def gbj_transform(src):
-    return _apply(_apply(_apply(gbj1_transform(src), EDITS2), EDITS3), EDITS4)
+    return _apply(_apply(_apply(_apply(gbj1_transform(src), EDITS2), EDITS3), EDITS4), EDITS5)
+
+
+def strip_gbj5(gbj):
+    """reverse only the GBJ-5 Accum Edge Mode edits (-> the GBJ-4 file byte for byte)."""
+    return _revert(gbj, EDITS5)
 
 
 def strip_gbj4(gbj):
-    """reverse only the GBJ-4 Accum Score Mode edits (-> the GBJ-3 file byte for byte)."""
-    return _revert(gbj, EDITS4)
+    """reverse the GBJ-5 and GBJ-4 edits (-> the GBJ-3 file byte for byte)."""
+    return _revert(strip_gbj5(gbj), EDITS4)
 
 
 def strip_gbj3(gbj):

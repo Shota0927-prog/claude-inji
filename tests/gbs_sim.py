@@ -43,7 +43,7 @@ STJ = rd(sj.STJ_PATH)
 def strip_gbj2_in_strategy(text):
     """revert the GBJ-2 edits that reach the Strategy (all but the Visual header and the Visual-only FVG box display)."""
     out = text
-    for kind, a, b in reversed(gb.EDITS4):     # GBJ-4 Accum Score Mode / GBPJPY Engine import (pinned in gbe_sim)
+    for kind, a, b in list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GBJ-4 Accum Score Mode / GBPJPY Engine import (pinned in gbe_sim)
         if kind != "header":
             out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
     for kind, a, b in reversed(gb.EDITS2):
@@ -187,7 +187,7 @@ def gate_static():
            "thrStrong": ("10.0", "9.0")}
     res = []
     gbs3 = GBS
-    for kind, a, b in reversed(gb.EDITS4):     # GB-10 pins GBJ-3; GBJ-4 is checked in gbe_sim
+    for kind, a, b in list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GB-10 pins GBJ-3; GBJ-4 is checked in gbe_sim
         if kind != "header":
             gbs3 = gbs3.replace(b, a) if gbs3 is not None and gbs3.count(b) == 1 else None
     for path, cur, extra in ((gs.GBS_PATH, gbs3 or "", {}),

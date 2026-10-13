@@ -31,7 +31,8 @@ ROOT = ge.ROOT
 PREV = "91036ec"
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
 show = lambda p, rev=PREV: subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{p}"], capture_output=True, text=True).stdout
-ENG6, GBE = rd(ge.SRC_PATH), rd(ge.GBE_PATH)
+ENG6 = rd(ge.SRC_PATH)
+GBE = ge.strip_gbe2(rd(ge.GBE_PATH)) or ""     # GBE-1 (Library v1) checks; GBE-2 (Edge Mode) is pinned in gbf_sim
 GBV, GBS = rd(gb.GBJ_PATH), rd(gs.GBS_PATH)
 GBV0, GBS0 = show(gb.GBJ_PATH), show(gs.GBS_PATH)
 RESULTS = []
@@ -47,7 +48,7 @@ def code_only(src):
 
 def revert4(text, skip_header=True):
     out = text
-    for kind, a, b in reversed(gb.EDITS4):
+    for kind, a, b in list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):
         if kind == "header" and skip_header:
             continue
         out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
@@ -63,7 +64,7 @@ PROTECTED = ["ZoneEnginePracticalSwingMax.pine", "ZoneEnginePractical.pine", "Zo
 def gate_static():
     check("GE-01 ZoneEnginePracticalGBPJPY.pine == gbe_build.build() (rebuild identical); strip_gbe gives the shared "
           "ZoneEnginePractical/6 source back byte for byte; library name ZoneEnginePracticalGBPJPY",
-          bool(GBE) and ge.build() == GBE and ge.build() == ge.build() and ge.strip_gbe(GBE) == ENG6
+          bool(GBE) and ge.strip_gbe2(ge.build()) == GBE and ge.build() == ge.build() and ge.strip_gbe(GBE) == ENG6
           and 'library("ZoneEnginePracticalGBPJPY", overlay = true)' in GBE)
     fc = lambda s: tb.func(s, "f_finalizeCluster(")
     rest = lambda s: s.replace(fc(s), "")
@@ -84,7 +85,7 @@ def gate_static():
     check("GE-03 Visual and Strategy import ZoneEnginePracticalGBPJPY (one import, no /6), same input Accum Score Mode "
           "(default Sum, options Sum / Max) and the same config line; without the GBJ-4 edits both files are the "
           + PREV + " files byte for byte (Sum = the previous code paths)",
-          all(re.findall(r"^import .*$", s, re.M) == [ge.IMPORT_GBE.strip()] for s in (GBV, GBS))
+          all(re.findall(r"^import .*$", s, re.M) == [ge.IMPORT_GBE.strip()] for s in (GBV, GBS))   # current version
           and inp(GBV) and inp(GBS) and inp(GBV).group(1) == inp(GBS).group(1)
           and inp(GBV).group(1).startswith('"Sum", "Accum Score Mode", options = ["Sum", "Max"]')
           and GBV.count(cfgl) == 1 and GBS.count(cfgl) == 1

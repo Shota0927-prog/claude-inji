@@ -63,7 +63,7 @@ GBS3_PREV = [   # the GBS-2 (65b1fb3) texts the GBJ-3 base setting replaced in t
 
 def revert_in_strategy(text):
     out = text
-    for kind, a, b in reversed(gb.EDITS4):     # GBJ-4 (Accum Score Mode, GBPJPY Engine import): pinned in gbe_sim
+    for kind, a, b in list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GBJ-4 (Accum Score Mode, GBPJPY Engine import): pinned in gbe_sim
         if kind != "header":
             out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
     for b, a in GBS3_PREV:
@@ -89,7 +89,7 @@ def gate_static():
           gb.build() == GBV and gs.build() == GBS and gb.strip_gbj2(GBV) == GBV0 and bool(GBV0)
           and revert_in_strategy(GBS) == GBS0 and bool(GBS0))
     gbj3 = {"scoreDayHL", "slopeThrMod", "slopeThrStrong", "thrStrong", "zoneHalfWidth",   # GBJ-3 (gbs_sim GB-06 / GB-10)
-            "accScoreMode"}                                                                  # GBJ-4 (gbe_sim)
+            "accScoreMode", "accEdgeMode"}                                                   # GBJ-4 / GBJ-5 (gbe_sim / gbf_sim)
     vv = {k: v for k, v in inputs(GBV).items() if k not in gbj3}
     vs = {k: v for k, v in inputs(GBS).items() if k not in gbj3}
     v0 = {k: v for k, v in inputs(GBV0).items() if k not in gbj3}
