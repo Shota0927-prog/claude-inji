@@ -8,6 +8,7 @@ Deterministic build, the same pipeline as ZoneStrategyUSDJPY (stj_build) but sta
     -> EDITS                    (= stj_build.EDITS, the USDJPY order / alert edits, with only these differences:
                                  identity / header / comments name GBPJPY, the display-only label helper removed is the
                                  GBPJPY one)
+    -> import                   (GBJ-4: ZoneEnginePracticalGBPJPY, as the Visual; ST-1 runs on the /6 import line)
     -> BASE_EDITS               (GBPJPY base-setting strategy defaults: SL Buffer 0.08, RR 1.2; the Zone defaults incl.
                                  Half Width 0.05 come from ZONE-GBPJPY since GBJ-3)
 strip_gbs() reverses EDITS exactly (fixture gbs_sim). Zone calculation = ZONE-GBPJPY, order / alert logic = ZONE-ST-JPY.
@@ -24,6 +25,7 @@ import st1_build as tb     # noqa: E402
 import st2_build as s2     # noqa: E402
 import st3_build as s3     # noqa: E402
 import stj_build as sj     # noqa: E402
+import gbe_build as ge     # noqa: E402
 
 ROOT = gb.ROOT
 GBS_PATH = "ZoneStrategyGBPJPY.pine"
@@ -63,15 +65,23 @@ def _gbs_edits():
             out.append((a, TITLE_GBS))
         else:                                         # USDJPY only appears in comments of these edits
             out.append((a, b.replace("USDJPY", "GBPJPY")))
-    return out + BASE_EDITS
+    return out + BASE_EDITS + [(ge.IMPORT_6, ge.IMPORT_GBE)]   # GBJ-4: same Engine as ZONE-GBPJPY
 
 
 EDITS = _gbs_edits()
 
 
+def visual_for_pipeline():
+    """ZONE-GBPJPY with the /6 import line the shared ST-1 transform anchors on (GBJ-4 imports the GBPJPY derivative;
+    the import is switched back on the Strategy by the last EDIT)."""
+    v = gb.build()
+    assert v.count(ge.IMPORT_GBE) == 1 and v.count(ge.IMPORT_6) == 0
+    return v.replace(ge.IMPORT_GBE, ge.IMPORT_6)
+
+
 def pipeline():
     """ZONE-GBPJPY -> ST-1 -> ST-2 -> ST-3 (before the strategy edits)."""
-    return s3.st3_transform(s2.st2_transform(tb.st_transform(gb.build())))
+    return s3.st3_transform(s2.st2_transform(tb.st_transform(visual_for_pipeline())))
 
 
 def gbs_transform(st3_text):

@@ -24,6 +24,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gbs_build as gs          # noqa: E402
+import gbe_build as ge          # noqa: E402
 import gbj_build as gb          # noqa: E402
 import stj_build as sj          # noqa: E402
 import st1_build as tb          # noqa: E402
@@ -42,6 +43,9 @@ STJ = rd(sj.STJ_PATH)
 def strip_gbj2_in_strategy(text):
     """revert the GBJ-2 edits that reach the Strategy (all but the Visual header and the Visual-only FVG box display)."""
     out = text
+    for kind, a, b in reversed(gb.EDITS4):     # GBJ-4 Accum Score Mode / GBPJPY Engine import (pinned in gbe_sim)
+        if kind != "header":
+            out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
     for kind, a, b in reversed(gb.EDITS2):
         if kind != "header" and "fd   = array.get(gFvgDir, slot)" not in b:
             out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
@@ -86,11 +90,11 @@ def gate_static():
     check("GB-01 ZoneStrategyGBPJPY.pine == gbs_build.build() (rebuild gives the same bytes); strip_gbs gives the "
           "ZONE-GBPJPY -> ST-3 pipeline text back, and strip_st3 / strip_st2 lead to st_transform(ZONE-GBPJPY)",
           bool(GBS) and gs.build() == GBS and gs.build() == gs.build() and gs.strip_gbs(GBS) == pipe
-          and s2.strip_st2(s3.strip_st3(pipe)) == tb.st_transform(GBV))
+          and s2.strip_st2(s3.strip_st3(pipe)) == tb.st_transform(gs.visual_for_pipeline()))
     v = GBV
-    comp = v[v.index(tb.IMPORT_LINE):v.index(tb.DISP_INPUT_HEAD)] + \
+    comp = v[v.index(ge.IMPORT_GBE):v.index(tb.DISP_INPUT_HEAD)] + \
         v[v.index(tb.DISP_INPUT_LAST) + len(tb.DISP_INPUT_LAST) + 1:v.index(tb.DISPLAY_HEAD)]
-    st_comp = GBS[GBS.index(tb.IMPORT_LINE):GBS.index(tb.ST_BEGIN)]
+    st_comp = GBS[GBS.index(ge.IMPORT_GBE):GBS.index(tb.ST_BEGIN)]
     upd = next((a, b) for a, b in gs.EDITS if a.startswith("if is5mChart\n    zoneCountNow"))
     zone_exp = comp.replace(gs.GEOM_GBS, "").replace(upd[0], upd[1])
     check("GB-02 Zone computation part byte-identical to ZONE-GBPJPY (all Zone inputs incl. Half Width 0.05 / Cluster "
@@ -182,7 +186,12 @@ def gate_static():
     chg = {"scoreDayHL": ("3.0", "2.0"), "slopeThrMod": ("0.02", "0.01"), "slopeThrStrong": ("0.05", "0.02"),
            "thrStrong": ("10.0", "9.0")}
     res = []
-    for path, cur, extra in ((gs.GBS_PATH, GBS, {}), (gb.GBJ_PATH, GBV, {"zoneHalfWidth": ("0.03", "0.05")})):
+    gbs3 = GBS
+    for kind, a, b in reversed(gb.EDITS4):     # GB-10 pins GBJ-3; GBJ-4 is checked in gbe_sim
+        if kind != "header":
+            gbs3 = gbs3.replace(b, a) if gbs3 is not None and gbs3.count(b) == 1 else None
+    for path, cur, extra in ((gs.GBS_PATH, gbs3 or "", {}),
+                             (gb.GBJ_PATH, gb.strip_gbj4(GBV) or "", {"zoneHalfWidth": ("0.03", "0.05")})):
         old = subprocess.run(["git", "-C", ROOT, "show", f"{prev}:{path}"], capture_output=True, text=True).stdout
         lines = []
         for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, code_only(old).split("\n"), code_only(cur).split("\n"),

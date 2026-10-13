@@ -183,6 +183,32 @@ EDITS3 = [
 ]
 
 
+# ---- GBJ-4: Accum Score Mode (Sum / Max across timeframes), via the GBPJPY Engine derivative (tests/gbe_build.py) -----
+#  Sum (default) = the current scoring. The import switches to ZoneEnginePracticalGBPJPY (must be published on
+#  TradingView first; until then the GBPJPY scripts do not compile). strip_gbj4() reverses only these -> GBJ-3 file.
+import gbe_build as _ge   # noqa: E402
+
+EDITS4 = [
+    ("header",
+     "//  Moderate 0.01 / Strong 0.02 円、Strong Threshold 9。ある比較期間の TradingView 結果から決めた値 (最適値・別期間は未確認)。\n",
+     "//  Moderate 0.01 / Strong 0.02 円、Strong Threshold 9。ある比較期間の TradingView 結果から決めた値 (最適値・別期間は未確認)。\n"
+     "//  GBJ-4: Accum Score Mode (Sum = 従来 / Max)。Engine は GBPJPY 派生 ZoneEnginePracticalGBPJPY (/6 + Accum 時間足間\n"
+     "//  の合算方式だけ、生成: tests/gbe_build.py)。TradingView で Library を publish してから使う。\n"),
+    ("import", _ge.IMPORT_6, _ge.IMPORT_GBE),
+    ("accmode",
+     'accKeep3 = input.int(1, "Keep Count · TF #3 Accum (instances)", minval = 1, group = G_ACC)\n',
+     'accKeep3 = input.int(1, "Keep Count · TF #3 Accum (instances)", minval = 1, group = G_ACC)\n'
+     'accScoreMode = input.string("Sum", "Accum Score Mode", options = ["Sum", "Max"], group = G_ACC,\n'
+     '     tooltip = "時間足 (TF #1 / #2 / #3) ごとの Accum 寄与 (上限・下限はそれぞれ Zone 内 1 回のまま) をどう合わせるか。\\n" +\n'
+     '     "Sum: 合計 (従来)。Max: 最大の 1 つだけ。例: 3 / 4 / 5 → Sum 12・Max 5、6 / 4 / 0 → Sum 10・Max 6。\\n" +\n'
+     '     "Engine の Score / Strength / Touch / FVG 加点後 Score / Entry 資格すべてに反映 (表示だけの差し替えではない)。")\n'),
+    ("accmode",
+     "zoneCfg.accKeep3             := accKeep3\n",
+     "zoneCfg.accKeep3             := accKeep3\n"
+     "zoneCfg.accScoreMax          := accScoreMode == \"Max\"\n"),
+]
+
+
 def git_show(rev, path=SRC_PATH):
     return subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{path}"], capture_output=True, text=True).stdout
 
@@ -210,12 +236,17 @@ def gbj1_transform(src):
 
 
 def gbj_transform(src):
-    return _apply(_apply(gbj1_transform(src), EDITS2), EDITS3)
+    return _apply(_apply(_apply(gbj1_transform(src), EDITS2), EDITS3), EDITS4)
+
+
+def strip_gbj4(gbj):
+    """reverse only the GBJ-4 Accum Score Mode edits (-> the GBJ-3 file byte for byte)."""
+    return _revert(gbj, EDITS4)
 
 
 def strip_gbj3(gbj):
-    """reverse only the GBJ-3 default edits (-> the GBJ-2 file byte for byte)."""
-    return _revert(gbj, EDITS3)
+    """reverse the GBJ-4 and GBJ-3 edits (-> the GBJ-2 file byte for byte)."""
+    return _revert(strip_gbj4(gbj), EDITS3)
 
 
 def strip_gbj2(gbj):
