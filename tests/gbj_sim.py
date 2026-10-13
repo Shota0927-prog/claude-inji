@@ -1,5 +1,6 @@
 """GBJ-1 fixtures — ZoneVisualGBPJPY.pine (OANDA:GBPJPY 5M Zone comparison, no entries / alerts).
 
+  (GBJ-2 edits are reverted first: these fixtures pin GBJ-1; FVG Direction Match / GBPJPY RN are in gbx_sim)
   GS : static — deterministic, idempotent build from ZONE-JPY; strip_gbj(file) == ZONE-JPY byte for byte; every EDIT
        only touches comments, the indicator title, input defaults / labels / tooltips / groups, or the label width unit;
        price-difference inputs in yen ([暫定], defaults 0.03 / 0.08 / 0.05 + inherited); input values differ from
@@ -32,7 +33,10 @@ import practical_zone_sim as pz  # noqa: E402
 ROOT = gb.ROOT
 BASE = "9596357"
 JPY = open(os.path.join(ROOT, gb.SRC_PATH), encoding="utf-8").read()
-GBJ = open(os.path.join(ROOT, gb.GBJ_PATH), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, gb.GBJ_PATH)) else ""
+GBJ_FULL = open(os.path.join(ROOT, gb.GBJ_PATH), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, gb.GBJ_PATH)) else ""
+# GBJ-1 checks below run on the file with the GBJ-2 edits (FVG Direction Match / GBPJPY RN) reverted; GBJ-2 is
+# verified in gbx_sim. strip_gbj2 must give the GBJ-1 text exactly (GS-01).
+GBJ = gb.strip_gbj2(GBJ_FULL) or ""
 RESULTS = []
 
 
@@ -92,8 +96,8 @@ def allowed_code_line(line):
 def gate_static():
     check("GS-01 ZoneVisualGBPJPY.pine == gbj_transform(ZoneVisualUSDJPY.pine); rebuilding gives the same bytes; strip_gbj "
           "gives ZONE-JPY back byte for byte (the file differs from ZONE-JPY only by the listed edits)",
-          bool(GBJ) and gb.build() == GBJ and gb.build() == gb.build() and gb.strip_gbj(GBJ) == JPY
-          and gb.gbj_transform(gb.strip_gbj(GBJ)) == GBJ)
+          bool(GBJ) and gb.build() == GBJ_FULL and gb.build() == gb.build() and gb.strip_gbj(GBJ_FULL) == JPY
+          and gb.gbj_transform(gb.strip_gbj(GBJ_FULL)) == GBJ_FULL and gb.gbj1_transform(JPY) == GBJ)
     bad = []
     for kind, a, b in gb.EDITS:
         if kind not in ("header", "title", "input", "display"):

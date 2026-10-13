@@ -37,6 +37,18 @@ rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.e
 GBS = rd(gs.GBS_PATH)
 GBV = rd(gb.GBJ_PATH)
 STJ = rd(sj.STJ_PATH)
+
+
+def strip_gbj2_in_strategy(text):
+    """revert the GBJ-2 edits that reach the Strategy (all but the Visual header and the Visual-only FVG box display)."""
+    out = text
+    for kind, a, b in reversed(gb.EDITS2):
+        if kind != "header" and "fd   = array.get(gFvgDir, slot)" not in b:
+            out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
+    return out
+
+
+GBS1 = strip_gbj2_in_strategy(GBS) or ""     # GBS-2 text: GB-03 / GB-04 pin the order / alert code against ZONE-ST-JPY
 RESULTS = []
 
 
@@ -63,7 +75,7 @@ def allowed_line(s):
             or re.match(r'^(title|shorttitle)\s*=\s*"[^"]*",$', s) is not None)
 
 
-PROTECTED = ["ZoneVisualGBPJPY.pine", "ZoneVisualUSDJPY.pine", "ZoneStrategyUSDJPY.pine", "ZoneVisualPractical.pine",
+PROTECTED = ["ZoneVisualUSDJPY.pine", "ZoneStrategyUSDJPY.pine", "ZoneVisualPractical.pine",
              "ZoneStrategyXAU.pine", "ZoneEnginePractical.pine", "ZoneEnginePracticalRN.pine",
              "ZoneEnginePracticalSwingMax.pine", "ZoneEnginePracticalAuthority.pine", "PracticalZoneStrategy_LONG.pine",
              "PracticalZoneStrategy_SHORT.pine", "SignalEnginePractical.pine"]
@@ -90,11 +102,11 @@ def gate_static():
           "Width default 0.05 (GBPJPY base setting; the Visual keeps 0.03) with its tooltip",
           comp.count(gs.GEOM_GBS) == 1 and len(hw) == 2 and st_comp == zone_exp)
     bad = []
-    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, code_only(STJ).split("\n"), code_only(GBS).split("\n"),
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, code_only(STJ).split("\n"), code_only(GBS1).split("\n"),
                                                       autojunk=False).get_opcodes():
         if op != "equal":
-            bad += [l for l in code_only(STJ).split("\n")[i1:i2] + code_only(GBS).split("\n")[j1:j2] if not allowed_line(l)]
-    vj, vg = inputs(STJ), inputs(GBS)
+            bad += [l for l in code_only(STJ).split("\n")[i1:i2] + code_only(GBS1).split("\n")[j1:j2] if not allowed_line(l)]
+    vj, vg = inputs(STJ), inputs(GBS1)
     vdiff = {n: (vj.get(n), vg.get(n)) for n in set(vj) | set(vg) if vj.get(n) != vg.get(n)}
     check("GB-03 against ZONE-ST-JPY every differing code line is the title or an input declaration / tooltip; same input "
           "set; input values differ only in the GBPJPY base-setting defaults: Half Width 0.03 -> 0.05, SL Buffer 0.05 -> "
@@ -106,7 +118,8 @@ def gate_static():
         'stRR = input.float(1.2,', 'stRR = input.float(1.3,')
     check("GB-04 strategy part (A / B / C / D, session, SL / TP / breakeven, fill-price TP, cancel, one order / Track once, "
           "D 1M BOS with carried waits, provisional evaluation, provisional / confirmed alerts) code-identical to "
-          "ZONE-ST-JPY apart from the SL Buffer / RR defaults", tail(GBS) == tail(STJ))
+          "ZONE-ST-JPY apart from the SL Buffer / RR defaults (GBJ-2 FVG / RN edits reverted; they are pinned in gbx_sim)",
+          bool(GBS1) and tail(GBS1) == tail(STJ))
     req = lambda s: re.findall(r"request\.\w+\(.*$", code_only(s), re.M)
     check("GB-05 requests: the 10 Zone / FVG requests of ZONE-GBPJPY + one request.security_lower_tf (1M, D) = 11, the "
           "same call sites as ZONE-ST-JPY", req(GBS) == req(STJ) and len(req(GBS)) == 11
@@ -159,9 +172,11 @@ def gate_static():
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASE, "--"] + PROTECTED, capture_output=True, text=True)
     t = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BASE, "--", "tests/"],
                        capture_output=True, text=True).stdout
-    check("GB-09 ZONE-GBPJPY, ZONE-JPY, ZONE-ST-JPY, ZONE-P, ZONE-ST (XAU), Engines and old strategies unchanged vs "
-          + BASE + "; no existing test / generator script modified or removed except the GS-11 fix in gbj_sim.py",
-          d.returncode == 0 and d.stdout.strip() == "" and t.split() in ([], ["tests/gbj_sim.py"]), d.stdout + t)
+    check("GB-09 ZONE-JPY, ZONE-ST-JPY, ZONE-P, ZONE-ST (XAU), Engines and old strategies unchanged vs "
+          + BASE + "; no existing test / generator script modified or removed except the GBPJPY ones (ZONE-GBPJPY is pinned by "
+          "its build in gbj_sim GS-01 / gbx_sim)",
+          d.returncode == 0 and d.stdout.strip() == ""
+          and all(re.match(r"^tests/gb[jsx]_\w+\.py$", f) for f in t.split()), d.stdout + t)
 
 
 # ---- models -----------------------------------------------------------------------------------------------------------
