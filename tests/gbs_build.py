@@ -7,10 +7,12 @@ Deterministic build, the same pipeline as ZoneStrategyUSDJPY (stj_build) but sta
     -> st3_build.st3_transform  (D 1M BOS, session, opposite-zone TP, breakeven)
     -> EDITS                    (= stj_build.EDITS, the USDJPY order / alert edits, with only these differences:
                                  identity / header / comments name GBPJPY, the display-only label helper removed is the
-                                 GBPJPY one, Direction keeps Both, Zone Half Width already 0.03 in the GBPJPY Visual)
+                                 GBPJPY one)
+    -> BASE_EDITS               (GBPJPY base-setting defaults: Half Width 0.05, SL Buffer 0.08, RR 1.2)
 strip_gbs() reverses EDITS exactly (fixture gbs_sim). Zone calculation = ZONE-GBPJPY, order / alert logic = ZONE-ST-JPY.
-Comparison defaults (not optimised for GBPJPY): D, Both, HW 0.03 / Cluster 0.08 / FVG 0.05, SL Buffer 0.05, RR 1.3,
-session JST 09:00-02:00, zone TP OFF, breakeven OFF (0.15), D wait 30, provisional / confirmed alerts ON.
+GBPJPY base setting (GBS-2, from one comparison period; not proven optimal): D, Long Only, HW 0.05 (Visual: 0.03) /
+Cluster 0.08 / FVG 0.05, SL Buffer 0.08, RR 1.2, session JST 09:00-02:00, zone TP OFF, breakeven OFF (0.15), D wait 30,
+provisional / confirmed alerts ON, RN OFF.
 """
 import os
 import sys
@@ -28,14 +30,27 @@ GBS_PATH = "ZoneStrategyGBPJPY.pine"
 HEADER_JPY = sj.EDITS[0][1]
 HEADER_GBS = ("//  Zone Strategy GBPJPY  —  ZONE-GBPJPY (ZoneVisualGBPJPY) の Zone 判定をそのまま使う OANDA:GBPJPY 5分足 Strategy\n"
               "//  (生成: tests/gbs_build.py。Zone 計算は ZONE-GBPJPY、注文処理・仮 / 確定アラートは ZONE-ST-JPY\n"
-              "//   (ZoneStrategyUSDJPY) と同じ式。価格差は円。初期値は比較開始用で、GBPJPY の最適値ではない)\n")
+              "//   (ZoneStrategyUSDJPY) と同じ式。価格差は円。初期値は GBPJPY 基準設定 (ある比較期間の TradingView 結果から\n"
+              "//   決めたもの。最適値・別期間での有効性は未確認)。Zone Half Width は 0.05 (表示用 ZONE-GBPJPY の初期 0.03\n"
+              "//   とは異なる: 表示と照合するときは Visual 側を 0.05 に合わせる)\n")
 TITLE_JPY = sj.EDITS[1][1]
 TITLE_GBS = '     title                  = "Zone Strategy GBPJPY",\n     shorttitle             = "ZONE-ST-GBPJPY",\n'
 GEOM_GBS = ('\n// Zone の上下限と最終的な幅 (円、小数 3 桁 = OANDA:GBPJPY の最小刻み 0.001。pips ではない)\n'
             'f_jpyGeom(zn.Zone z) =>\n'
             '    f_num(z.top, "#.000") + " - " + f_num(z.bottom, "#.000") + " | W " + f_num(z.top - z.bottom, "0.000") + "円"\n')
-# USDJPY edits not needed here: Half Width is already 0.03 in ZONE-GBPJPY; Direction keeps the ZONE-ST default Both.
-SKIP_PREFIX = ('zoneHalfWidth = input.float(0.05,', 'stDir = input.string("Both"')
+# USDJPY edit not needed here: the Half Width default comes from BASE_EDITS below (ZONE-GBPJPY has 0.03).
+SKIP_PREFIX = ('zoneHalfWidth = input.float(0.05,',)
+# GBPJPY base setting (GBS-2): defaults only, applied after the USDJPY strategy edits (Direction Long Only comes from
+# those edits). Values not listed here (Entry Mode D, Cluster 0.08, FVG 0.05, session JST 09:00-02:00, zone TP OFF,
+# breakeven OFF / 0.15, D wait 30, both alerts ON, RN OFF) are already the base setting.
+BASE_EDITS = [
+    ('zoneHalfWidth = input.float(0.03, "[暫定] Zone Half Width (円)",',
+     'zoneHalfWidth = input.float(0.05, "[暫定] Zone Half Width (円)",'),
+    ('(= 3 / 5 / 8 pips)。初期 0.03 = ドル円検証値。")\n',
+     '(= 3 / 5 / 8 pips)。Strategy 初期 0.05 = GBPJPY 基準設定 (表示用 ZONE-GBPJPY は 0.03)。")\n'),
+    ('stBuffer = input.float(0.05, "[暫定] SL Buffer (円)",', 'stBuffer = input.float(0.08, "[暫定] SL Buffer (円)",'),
+    ('stRR = input.float(1.3, "TP Fixed RR",', 'stRR = input.float(1.2, "TP Fixed RR",'),
+]
 
 
 def _gbs_edits():
@@ -51,7 +66,7 @@ def _gbs_edits():
             out.append((a, TITLE_GBS))
         else:                                         # USDJPY only appears in comments of these edits
             out.append((a, b.replace("USDJPY", "GBPJPY")))
-    return out
+    return out + BASE_EDITS
 
 
 EDITS = _gbs_edits()

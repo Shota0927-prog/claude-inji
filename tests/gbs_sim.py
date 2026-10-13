@@ -3,8 +3,9 @@ alerts; Zone calculation of ZONE-GBPJPY, order / alert logic of ZONE-ST-JPY).
 
   GB : static — deterministic, idempotent build (ZONE-GBPJPY -> ST-1 -> ST-2 -> ST-3 -> USDJPY strategy edits) and
        exact inverse; Zone computation part byte-identical to ZONE-GBPJPY; against ZONE-ST-JPY the only code differences
-       are the title and input texts / defaults, the input values differ only in Direction (Both); order / alert code
-       after the strategy marker identical to ZONE-ST-JPY; requests 10 + 1 (1M, D); comparison defaults; lightweight
+       are the title and input texts / defaults, the input values differ only in the GBPJPY base-setting defaults
+       (Half Width 0.05, SL Buffer 0.08, RR 1.2); order / alert code after the strategy marker identical to
+       ZONE-ST-JPY; requests 10 + 1 (1M, D); GBPJPY base-setting defaults (GBS-2); lightweight
        (no drawing, Engine / zone loop on confirmed bars, message strings only inside alert()); the ZONE-ST-JPY alert /
        tick-separation static checks re-run on this file; protected files unchanged vs 140a6c9
   GM : models — Zone parity mirror with the GBPJPY yen parameters; the ZONE-ST-JPY order / alert mirrors re-run (same
@@ -79,10 +80,15 @@ def gate_static():
         v[v.index(tb.DISP_INPUT_LAST) + len(tb.DISP_INPUT_LAST) + 1:v.index(tb.DISPLAY_HEAD)]
     st_comp = GBS[GBS.index(tb.IMPORT_LINE):GBS.index(tb.ST_BEGIN)]
     upd = next((a, b) for a, b in gs.EDITS if a.startswith("if is5mChart\n    zoneCountNow"))
-    check("GB-02 Zone computation part byte-identical to ZONE-GBPJPY (inputs incl. HW 0.03 / Cluster 0.08 / FVG 0.05, "
+    hw = [e for e in gs.BASE_EDITS if e[0].startswith("zoneHalfWidth") or "初期 0.03 = ドル円検証値" in e[0]]
+    zone_exp = comp.replace(gs.GEOM_GBS, "").replace(upd[0], upd[1])
+    for a, b in hw:
+        zone_exp = zone_exp.replace(a, b) if zone_exp is not None and zone_exp.count(a) == 1 else None
+    check("GB-02 Zone computation part byte-identical to ZONE-GBPJPY (inputs incl. Cluster 0.08 / FVG 0.05, "
           "Engine config, MA / Swing / Accum / Break feeds, zn.update, NR-S1, NR-A1, FVG Batch A); only the display "
-          "inputs and the display-only label helper are left out; the one edit: zn.update on confirmed bars",
-          comp.count(gs.GEOM_GBS) == 1 and st_comp == comp.replace(gs.GEOM_GBS, "").replace(upd[0], upd[1]))
+          "inputs and the display-only label helper are left out; edits: zn.update on confirmed bars, and the Half "
+          "Width default 0.05 (GBPJPY base setting; the Visual keeps 0.03) with its tooltip",
+          comp.count(gs.GEOM_GBS) == 1 and len(hw) == 2 and st_comp == zone_exp)
     bad = []
     for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, code_only(STJ).split("\n"), code_only(GBS).split("\n"),
                                                       autojunk=False).get_opcodes():
@@ -91,28 +97,34 @@ def gate_static():
     vj, vg = inputs(STJ), inputs(GBS)
     vdiff = {n: (vj.get(n), vg.get(n)) for n in set(vj) | set(vg) if vj.get(n) != vg.get(n)}
     check("GB-03 against ZONE-ST-JPY every differing code line is the title or an input declaration / tooltip; same input "
-          "set; input values differ only in Direction (Long Only -> Both)",
-          bad == [] and set(vj) == set(vg) and vdiff == {"stDir": ('"Long Only"', '"Both"')}, str((bad[:5], vdiff)))
-    tail = lambda s: code_only(s[s.index(tb.ST_BEGIN):]).replace('stDir = input.string("Both",', 'stDir = input.string("Long Only",')
+          "set; input values differ only in the GBPJPY base-setting defaults: Half Width 0.03 -> 0.05, SL Buffer 0.05 -> "
+          "0.08, RR 1.3 -> 1.2 (Direction Long Only as ZONE-ST-JPY)",
+          bad == [] and set(vj) == set(vg) and vdiff == {"zoneHalfWidth": ("0.03", "0.05"), "stBuffer": ("0.05", "0.08"),
+                                                         "stRR": ("1.3", "1.2")}, str((bad[:5], vdiff)))
+    tail = lambda s: code_only(s[s.index(tb.ST_BEGIN):]).replace(
+        'stBuffer = input.float(0.08,', 'stBuffer = input.float(0.05,').replace(
+        'stRR = input.float(1.2,', 'stRR = input.float(1.3,')
     check("GB-04 strategy part (A / B / C / D, session, SL / TP / breakeven, fill-price TP, cancel, one order / Track once, "
           "D 1M BOS with carried waits, provisional evaluation, provisional / confirmed alerts) code-identical to "
-          "ZONE-ST-JPY apart from the Direction default", tail(GBS) == tail(STJ))
+          "ZONE-ST-JPY apart from the SL Buffer / RR defaults", tail(GBS) == tail(STJ))
     req = lambda s: re.findall(r"request\.\w+\(.*$", code_only(s), re.M)
     check("GB-05 requests: the 10 Zone / FVG requests of ZONE-GBPJPY + one request.security_lower_tf (1M, D) = 11, the "
           "same call sites as ZONE-ST-JPY", req(GBS) == req(STJ) and len(req(GBS)) == 11
           and [r for r in req(GBS) if "lower_tf" not in r] == req(GBV)
           and len([r for r in req(GBS) if "lower_tf" in r]) == 1)
-    want = {"stMode": '"D: 1M BOS Rebound"', "stDir": '"Both"', "zoneHalfWidth": "0.03", "clusterDist": "0.08",
-            "fvgMinWidth": "0.05", "stBuffer": "0.05", "stRR": "1.3", "stUseSess": "true", "stSessTz": '"Asia/Tokyo"',
+    want = {"stMode": '"D: 1M BOS Rebound"', "stDir": '"Long Only"', "zoneHalfWidth": "0.05", "clusterDist": "0.08",
+            "fvgMinWidth": "0.05", "stBuffer": "0.08", "stRR": "1.2", "stUseSess": "true", "stSessTz": '"Asia/Tokyo"',
             "stSessStartH": "9", "stSessStartM": "0", "stSessEndH": "2", "stSessEndM": "0", "stTpZone": "false",
             "stBE": "false", "stBEDist": "0.15", "stDWait": "30", "stAlertProv": "true", "stAlertConf": "true",
             "enableRn": "false"}
     got = {k: vg.get(k) for k in want}
     opts = 'options = ["Long Only", "Short Only", "Both"]' in inp(GBS, "stDir")
-    check("GB-06 comparison defaults: D, Both (Long Only / Short Only selectable), HW 0.03 / Cluster 0.08 / FVG 0.05 円, "
-          "SL Buffer 0.05 円, RR 1.3, session ON JST 09:00-02:00, zone TP OFF, breakeven OFF (trigger 0.15 円), D wait 30, "
-          "provisional / confirmed alerts ON, RN OFF; every Zone input identical to ZONE-GBPJPY",
-          got == want and opts and all(vg.get(n) == x for n, x in inputs(GBV).items() if n in vg)
+    check("GB-06 GBPJPY base-setting defaults: D (1M BOS Rebound), Long Only (Short Only / Both selectable), HW 0.05 / "
+          "Cluster 0.08 / FVG 0.05 円, SL Buffer 0.08 円, RR 1.2, session ON Asia/Tokyo 09:00-02:00, zone TP OFF, "
+          "breakeven OFF (trigger 0.15 円), D wait 30, provisional / confirmed alerts ON, RN OFF; every other Zone input "
+          "identical to ZONE-GBPJPY (whose Half Width stays 0.03)",
+          got == want and opts and inputs(GBV).get("zoneHalfWidth") == "0.03"
+          and all(vg.get(n) == x for n, x in inputs(GBV).items() if n in vg and n != "zoneHalfWidth")
           and "円" in inp(GBS, "stBuffer") and "円" in inp(GBS, "stBEDist"), str(got))
     co = code_only(GBS)
     decl = GBS[GBS.index("strategy(\n"):GBS.index(")\n", GBS.index("strategy(\n")) + 2]
@@ -166,18 +178,19 @@ def gate_mirrors():
     import stj_sim as tj
     keep = dict(tj.YEN)
     try:
-        tj.YEN["zoneHalfWidth"] = 0.03       # the GBPJPY comparison default (Cluster 0.08 / FVG 0.05 already equal)
+        tj.YEN["zoneHalfWidth"] = 0.05       # GBPJPY base setting (Cluster 0.08 / FVG 0.05 equal as well)
         r = rerun(tj.gate_zone_parity, ("SM-01",))
     finally:
         tj.YEN.clear()
         tj.YEN.update(keep)
-    # SM-01's own width floor is written for HW 0.05 (2 x 0.05); here the floor is 2 x 0.03, so read its report instead
+    # read SM-01's report and check its width floor against the Half Width used here
     m = re.match(r"\{'snaps': (\d+), 'zones': (\d+), 'fvg': (\d+), 'boosted': (\d+), 'bad': (\d+)\} median width "
                  r"[0-9.]+ min ([0-9.]+)$", r[0][2] if r else "")
     ok01 = m is not None and int(m.group(5)) == 0 and min(int(m.group(i)) for i in (2, 3, 4)) > 0 \
-        and float(m.group(6)) >= 2 * 0.03 - 1e-9
-    check("GM-01 Zone parity with the GBPJPY yen parameters (HW 0.03, Cluster 0.08, FVG 0.05): on the same yen OHLC the "
-          "Strategy zone evaluation (top / bottom / Score / Strength / FVG boost) equals the Visual display mirror",
+        and float(m.group(6)) >= 2 * 0.05 - 1e-9
+    check("GM-01 Zone parity with the GBPJPY yen parameters (HW 0.05, Cluster 0.08, FVG 0.05): on the same yen OHLC the "
+          "Strategy zone evaluation (top / bottom / Score / Strength / FVG boost) equals the Visual display mirror on "
+          "every sampled bar (0 mismatches; zones, FVGs and boosts occur; min width >= 2 x 0.05)",
           ok01, str(r))
     r = rerun(tj.gate_orders_yen, ("SM-",)) + rerun(tj.gate_alert_model, ("SA-",))
     check("GM-02 the ZONE-ST-JPY order / alert mirrors (same code, GB-04) pass: D timing, SL, fill-price TP, opposite-zone "
@@ -214,41 +227,43 @@ def short_of(zl, bars, m1s):
 def gate_gbpjpy():
     import stj_sim as tj
     t3, zl, flat, bt, nxt, m1b = scenario()
-    J = dict(mode="D", buffer=0.05, rr=1.3, tpzone=False, be=False, e=2 * 60)   # GBPJPY comparison defaults
+    J = dict(mode="D", dir="Long", buffer=0.08, rr=1.2, tpzone=False, be=False, e=2 * 60)   # GBPJPY base setting
+    Jnd = {k: v for k, v in J.items() if k != "dir"}
     bars = [flat, bt, nxt, nxt]
     m1s = [m1([(0, 150.32, 150.28, 150.30)]), m1b, [], []]
     zs, bars_s, m1s_s = short_of(zl, bars, m1s)
     res = {}
     for d in ("Long", "Short", "Both"):
-        SL_, _ = t3.run3(bars, [[zl]] * 4, m1s=m1s, dir=d, **J)
-        SS_, _ = t3.run3(bars_s, [[zs]] * 4, m1s=m1s_s, dir=d, **J)
+        SL_, _ = t3.run3(bars, [[zl]] * 4, m1s=m1s, dir=d, **Jnd)
+        SS_, _ = t3.run3(bars_s, [[zs]] * 4, m1s=m1s_s, dir=d, **Jnd)
         res[d] = ([o["side"] for _, o in t3.orders(SL_)], [o["side"] for _, o in t3.orders(SS_)])
     check("GM-03 Direction at GBPJPY scale (~190 円): the Long setup orders only under Long Only / Both, its mirrored Short "
           "setup only under Short Only / Both", res == {"Long": ([1], []), "Short": ([], [-1]), "Both": ([1], [-1])}, str(res))
-    S, B = t3.run3(bars, [[zl]] * 4, m1s=m1s, dir="Both", **J)
+    S, B = t3.run3(bars, [[zl]] * 4, m1s=m1s, **J)
     o = t3.orders(S)[0][1]
     fill = B.fills[0]["price"]
     tp = S.log[2].get("tp")
-    check("GM-04 Long at GBPJPY scale: SL = zone bottom 190.000 - 0.05 = 189.950 set with the entry; filled at the next "
-          "open 190.150; TP = fill + 1.3 x (fill - SL) = 190.410 (from the actual fill, set at the fill-bar close)",
-          abs(o["SL"] - 189.950) < 1e-9 and fill == 190.150 and tp is not None and abs(tp - (190.150 + 1.3 * 0.200)) < 1e-9,
+    check("GM-04 Long at GBPJPY scale (Long Only default): SL = zone bottom 190.000 - 0.08 = 189.920 set with the entry; "
+          "filled at the next open 190.150; TP = fill + 1.2 x (fill - SL) = 190.426 (from the actual fill, set at the "
+          "fill-bar close)",
+          abs(o["SL"] - 189.920) < 1e-9 and fill == 190.150 and tp is not None and abs(tp - 190.426) < 1e-9,
           str((o, fill, tp)))
     gap = bar((150.170, 150.180, 150.140, 150.150))
-    S2, B2 = t3.run3([flat, bt, gap, nxt], [[zl]] * 4, m1s=m1s, dir="Both", **J)
+    S2, B2 = t3.run3([flat, bt, gap, nxt], [[zl]] * 4, m1s=m1s, **J)
     tp2 = S2.log[2].get("tp")
-    check("GM-05 TP follows the actual fill price, SL does not: fill 190.170 (gap) -> TP 190.170 + 1.3 x 0.220 = 190.456; "
-          "SL stays 189.950", B2.fills[0]["price"] == 190.170 and abs(tp2 - (190.170 + 1.3 * 0.220)) < 1e-9
-          and abs(t3.orders(S2)[0][1]["SL"] - 189.950) < 1e-9, str((B2.fills, tp2)))
+    check("GM-05 TP follows the actual fill price, SL does not: fill 190.170 (gap) -> TP 190.170 + 1.2 x 0.250 = 190.470; "
+          "SL stays 189.920", B2.fills[0]["price"] == 190.170 and abs(tp2 - 190.470) < 1e-9
+          and abs(t3.orders(S2)[0][1]["SL"] - 189.920) < 1e-9, str((B2.fills, tp2)))
     down = [flat, bt, nxt, bar((150.150, 150.160, 150.040, 150.060)), bar((150.060, 150.070, 149.900, 149.920))]
-    S3, B3 = t3.run3(down, [[zl]] * 5, m1s=m1s + [[]], dir="Both", **J)
-    check("GM-06 SL fixed at entry (breakeven OFF): the price falls through the zone and the trade exits at 189.950 "
-          "(the stop set with the entry, not moved)", B3.closed and abs(B3.closed[0]["exit"] - 189.950) < 1e-9,
+    S3, B3 = t3.run3(down, [[zl]] * 5, m1s=m1s + [[]], **J)
+    check("GM-06 SL fixed at entry (breakeven OFF): the price falls through the zone and the trade exits at 189.920 "
+          "(the stop set with the entry, not moved)", B3.closed and abs(B3.closed[0]["exit"] - 189.920) < 1e-9,
           str(B3.closed))
-    S4, B4 = t3.run3(bars, [[zl, t3.Z(2, t3.SUP, P(150.110), P(150.020))]] * 4, m1s=m1s, dir="Both", **J)
+    S4, B4 = t3.run3(bars, [[zl, t3.Z(2, t3.SUP, P(150.110), P(150.020))]] * 4, m1s=m1s, **J)
     again = [flat, bt, nxt, bar((150.150, 150.700, 150.140, 150.650)), bar((150.300, 150.320, 150.280, 150.300)), bt,
              nxt, nxt]
     m1a = m1s[:3] + [[], m1([(20, 150.32, 150.28, 150.30)]), [(t + 20, h, l, c) for t, h, l, c in m1b], [], []]
-    S5, B5 = t3.run3(again, [[zl]] * 8, m1s=m1a, dir="Both", **J)
+    S5, B5 = t3.run3(again, [[zl]] * 8, m1s=m1a, **J)
     check("GM-07 one order at a time / same Track once: two zones touched with the same BOS -> one order; after the TP "
           "exit, the same Track touched again with a BOS -> no second order",
           len(t3.orders(S4)) == 1 and len(B4.fills) == 1 and len(B5.closed) == 1 and len(t3.orders(S5)) == 1,
@@ -256,10 +271,10 @@ def gate_gbpjpy():
     tk = [[], [(bar((150.25, 150.26, 150.05, 150.08)), m1b[:2] + [(7, P(150.10), P(150.06), P(150.09))]),
                (bar((150.25, 150.26, 150.05, 150.23)), m1b[:4] + [(9, P(150.24), P(150.20), P(150.23))]),
                (bar((150.25, 150.26, 150.05, 150.16)), m1b[:4] + [(9, P(150.24), P(150.13), P(150.16))])]]
-    S0, B0 = t3.run3(bars, [[zl]] * 4, m1s=m1s, dir="Both", **J)
+    S0, B0 = t3.run3(bars, [[zl]] * 4, m1s=m1s, **J)
     out = {}
     for prov, conf in ((True, True), (True, False), (False, True), (False, False)):
-        S_, B_, al, mut = tj.run_ticks(bars, [[zl]] * 4, m1s, tk, prov=prov, conf=conf, dir="Both", **J)
+        S_, B_, al, mut = tj.run_ticks(bars, [[zl]] * 4, m1s, tk, prov=prov, conf=conf, **J)
         out[(prov, conf)] = (t3.orders(S_) == t3.orders(S0) and B_.fills == B0.fills and B_.closed == B0.closed, al, mut)
     check("GM-08 alerts ON / OFF (4 combinations) give the same orders / fills / exits as the run without ticks; the "
           "provisional evaluation changes no state", all(v[0] and not v[2] for v in out.values()), str(out))
@@ -267,7 +282,7 @@ def gate_gbpjpy():
           "-> once) and the confirmed LONG at that 5M close", out[(True, True)][1] == [("仮", 1, 1), ("確定", 1, 1)],
           str(out[(True, True)][1]))
     tk_dev = [[], [(bar((150.25, 150.26, 150.05, 150.23)), m1b[:3] + [(8, P(150.24), P(150.10), P(150.23))])]]
-    _, _, al_dev, _ = tj.run_ticks(bars, [[zl]] * 4, m1s, tk_dev, dir="Both", **J)
+    _, _, al_dev, _ = tj.run_ticks(bars, [[zl]] * 4, m1s, tk_dev, **J)
     check("GM-10 forming 1M bar excluded: a BOS only on the last 1M element whose minute has not ended gives no "
           "provisional; the confirmed alert still comes", al_dev == [("確定", 1, 1)], str(al_dev))
     t1 = [(150.26, 150.20, 150.22), (150.21, 150.05, 150.08), (150.12, 150.06, 150.11), (150.14, 150.07, 150.12),
@@ -279,23 +294,24 @@ def gate_gbpjpy():
     barsC = [flat, bar((150.25, 150.26, 150.05, 150.12)), bar((150.15, 150.26, 150.10, 150.25)), nxt]
     tkC = [[], [], [(bar((150.15, 150.18, 150.10, 150.17)), mk(2, t2[:2]) + [(12, P(150.18), P(150.15), P(150.17))]),
                     (bar((150.15, 150.24, 150.10, 150.23)), mk(2, t2[:3]) + [(13, P(150.24), P(150.21), P(150.23))])]]
-    Sw, _ = t3.run3(barsC[:2], [[zl]] * 2, m1s=m1c[:2], dir="Both", **J)
+    Sw, _ = t3.run3(barsC[:2], [[zl]] * 2, m1s=m1c[:2], **J)
     w = copy.deepcopy(Sw.waits)
-    Sx, Bx, alC, mutC = tj.run_ticks(barsC, [[zl]] * 4, m1c, tkC, dir="Both", **J)
-    Sn, Bn = t3.run3(barsC, [[zl]] * 4, m1s=m1c, dir="Both", **J)
-    resw = [tj.run_ticks(barsC, [[zl]] * 4, m1c, tkC, dir="Both", **dict(J, dwait=k))[2] for k in (6, 5)]
+    Sx, Bx, alC, mutC = tj.run_ticks(barsC, [[zl]] * 4, m1c, tkC, **J)
+    Sn, Bn = t3.run3(barsC, [[zl]] * 4, m1s=m1c, **J)
+    resw = [tj.run_ticks(barsC, [[zl]] * 4, m1c, tkC, **dict(J, dwait=k))[2] for k in (6, 5)]
     check("GM-11 D wait carried over a 5M bar at GBPJPY scale: touch in bar 1 without BOS (wait saved: level 190.210); "
           "the closed 1M close 190.230 in bar 2 is the BOS -> provisional then confirmed LONG at the bar-2 close; the "
           "saved wait is not modified by ticks; D wait 6 vs 5 at the expiry limit: alerts / orders agree (6 -> both, "
           "5 -> neither)", len(w) == 1 and abs(w[0]["lvl"] - 190.21) < 1e-9 and alC == [("仮", 2, 1), ("確定", 2, 1)]
           and not mutC and t3.orders(Sx) == t3.orders(Sn) and Bx.fills == Bn.fills
           and resw == [[("仮", 2, 1), ("確定", 2, 1)], []], str((w, alC, mutC, resw)))
-    Ssh, Bsh = t3.run3(bars_s, [[zs]] * 4, m1s=m1s_s, dir="Both", **J)
+    Ssh, Bsh = t3.run3(bars_s, [[zs]] * 4, m1s=m1s_s, dir="Short", **Jnd)
     os_ = t3.orders(Ssh)[0][1]
     fs = Bsh.fills[0]["price"]
     tps = Ssh.log[2].get("tp")
-    check("GM-12 Short at GBPJPY scale (mirror): SL = zone top + 0.05, TP = fill - 1.3 x (SL - fill) from the actual fill",
-          abs(os_["SL"] - (zs["top"] + 0.05)) < 1e-9 and tps is not None and abs(tps - (fs - 1.3 * (os_["SL"] - fs))) < 1e-9,
+    check("GM-12 Short at GBPJPY scale (mirror, Short Only selected): SL = zone top + 0.08, TP = fill - 1.2 x (SL - fill) "
+          "from the actual fill", abs(os_["SL"] - (zs["top"] + 0.08)) < 1e-9 and tps is not None
+          and abs(tps - (fs - 1.2 * (os_["SL"] - fs))) < 1e-9,
           str((os_, fs, tps, zs)))
 
 
