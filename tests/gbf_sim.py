@@ -49,7 +49,7 @@ def code_only(src):
 def revert6(text):
     """GBJ-6 (Day/Swing Overlap, pinned in gbd_sim) reverted in the Strategy (its header edit is Visual-only)."""
     out = text
-    for kind, a, b in reversed(gb.EDITS6):
+    for kind, a, b in list(reversed(gb.EDITS7)) + list(reversed(gb.EDITS6)):
         if kind != "header":
             out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
     return out
@@ -57,7 +57,7 @@ def revert6(text):
 
 def revert5(text, skip_header=True):
     out = text
-    for kind, a, b in list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)):
+    for kind, a, b in list(reversed(gb.EDITS7)) + list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)):
         if kind == "header" and skip_header:
             continue
         out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
@@ -97,7 +97,7 @@ def gate_static():
           all(re.findall(r"^import .*$", s, re.M) == [ge.IMPORT_GBE.strip()] for s in (GBV, GBS))
           and inp(GBV) and inp(GBS) and inp(GBV).group(1) == inp(GBS).group(1)
           and inp(GBV).group(1).startswith('"Separate", "Accum Edge Mode", options = ["Separate", "Once per TF"]')
-          and all(re.search(r'^accScoreMode = input\.string\("Sum",', s, re.M) for s in (GBV, GBS))
+          and all(re.search(r'^accScoreMode = input\.string\("(Sum|Max)",', s, re.M) for s in (GBV, GBS))   # Max since GBJ-8
           and GBV.count(cfgl) == 1 and GBS.count(cfgl) == 1
           and revert5(GBV, skip_header=False) == GBV0 and bool(GBV0) and revert5(GBS) == GBS0 and bool(GBS0))
     dline = "        dScore := z.baseSum + f_fvcBase(best) + z.slopeBonus + z.maBonus + z.flipBonus + f_fvcConf(z.catCount + 1)\n"

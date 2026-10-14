@@ -63,7 +63,7 @@ GBS3_PREV = [   # the GBS-2 (65b1fb3) texts the GBJ-3 base setting replaced in t
 
 def revert_in_strategy(text):
     out = text
-    for kind, a, b in list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GBJ-4 (Accum Score Mode, GBPJPY Engine import): pinned in gbe_sim
+    for kind, a, b in list(reversed(gb.EDITS7)) + list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GBJ-4 (Accum Score Mode, GBPJPY Engine import): pinned in gbe_sim
         if kind != "header":
             out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
     for b, a in GBS3_PREV:

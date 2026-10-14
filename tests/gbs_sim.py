@@ -43,7 +43,7 @@ STJ = rd(sj.STJ_PATH)
 def strip_gbj2_in_strategy(text):
     """revert the GBJ-2 edits that reach the Strategy (all but the Visual header and the Visual-only FVG box display)."""
     out = text
-    for kind, a, b in list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GBJ-4 Accum Score Mode / GBPJPY Engine import (pinned in gbe_sim)
+    for kind, a, b in list(reversed(gb.EDITS7)) + list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GBJ-4 Accum Score Mode / GBPJPY Engine import (pinned in gbe_sim)
         if kind != "header":
             out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
     for kind, a, b in reversed(gb.EDITS2):
@@ -140,7 +140,10 @@ def gate_static():
             "slopeBonusMod": "1.0", "slopeBonusStr": "2.0", "slopeBonusMode": '"Sum (per MA)"', "scoreHz1": "1.0",
             "scoreHz2": "2.0", "scoreHz3": "3.0", "scoreAcc1": "3.0", "scoreAcc2": "4.0", "scoreAcc3": "5.0",
             "confBonus2": "1.0", "confBonus3": "2.0", "confBonus4": "3.0", "useMaSource": "true", "useHzSource": "true",
-            "useAccSource": "true", "useDayHL": "true", "carryPrevDayHL": "false"}
+            "useAccSource": "true", "useDayHL": "true", "carryPrevDayHL": "false",
+            # adopted setting (GBJ-8): Accum Max + Separate, Day/Swing Separate (Merge Distance 0.05 kept, unused)
+            "accScoreMode": '"Max"', "accEdgeMode": '"Separate"', "dsMode": '"Separate"', "dsDist": "0.05",
+            "rnMajorStep": "1.0", "rnMinorStep": "0.5"}
     vg = inputs(GBS)
     got = {k: vg.get(k) for k in want}
     opts = 'options = ["Long Only", "Short Only", "Both"]' in inp(GBS, "stDir")
@@ -188,7 +191,7 @@ def gate_static():
            "thrStrong": ("10.0", "9.0")}
     res = []
     gbs3 = GBS
-    for kind, a, b in list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GB-10 pins GBJ-3; GBJ-4 is checked in gbe_sim
+    for kind, a, b in list(reversed(gb.EDITS7)) + list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):     # GB-10 pins GBJ-3; GBJ-4 is checked in gbe_sim
         if kind != "header":
             gbs3 = gbs3.replace(b, a) if gbs3 is not None and gbs3.count(b) == 1 else None
     for path, cur, extra in ((gs.GBS_PATH, gbs3 or "", {}),
@@ -206,6 +209,23 @@ def gate_static():
           "declaration or tooltip; input values changed exactly: Day H/L Score 3 -> 2, Slope Threshold 0.02 / 0.05 -> "
           "0.01 / 0.02, Strong Threshold 10 -> 9, and the Visual Half Width 0.03 -> 0.05 (Strategy already 0.05)",
           all(ok for _, ok, _ in res), str(res))
+    prev8 = "8e94720"
+    res8 = []
+    for path, cur in ((gs.GBS_PATH, GBS), (gb.GBJ_PATH, GBV)):
+        old = subprocess.run(["git", "-C", ROOT, "show", f"{prev8}:{path}"], capture_output=True, text=True).stdout
+        diff = [(op, code_only(old).split("\n")[i1:i2], code_only(cur).split("\n")[j1:j2]) for op, i1, i2, j1, j2 in
+                difflib.SequenceMatcher(None, code_only(old).split("\n"), code_only(cur).split("\n"),
+                                        autojunk=False).get_opcodes() if op != "equal"]
+        vo, vc = inputs(old), inputs(cur)
+        vd = {n: (vo.get(n), vc.get(n)) for n in set(vo) | set(vc) if vo.get(n) != vc.get(n)}
+        res8.append((path, bool(old) and vd == {"accScoreMode": ('"Sum"', '"Max"')} and len(diff) == 1
+                     and diff[0][1] == [gb.EDITS7[1][1].rstrip("\n")] and diff[0][2] == [gb.EDITS7[1][2].rstrip("\n")],
+                     vd))
+    check("GB-11 against " + prev8 + ": in both Visual and Strategy the only code change is the Accum Score Mode default "
+          "Sum -> Max (Edge Mode Separate, Day/Swing Separate, Merge Distance 0.05 unchanged); Library unchanged",
+          all(ok for _, ok, _ in res8) and subprocess.run(["git", "-C", ROOT, "diff", "--name-only", prev8, "--",
+                                                          "ZoneEnginePracticalGBPJPY.pine"], capture_output=True,
+                                                         text=True).stdout.strip() == "", str(res8))
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASE, "--"] + PROTECTED, capture_output=True, text=True)
     t = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BASE, "--", "tests/"],
                        capture_output=True, text=True).stdout

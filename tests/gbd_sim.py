@@ -51,7 +51,7 @@ def code_only(src):
 
 def revert7(text, skip_header=True):
     out = text
-    for kind, a, b in reversed(gb.EDITS6):
+    for kind, a, b in list(reversed(gb.EDITS7)) + list(reversed(gb.EDITS6)):
         if kind == "header" and skip_header:
             continue
         out = out.replace(b, a) if out is not None and out.count(b) == 1 else None

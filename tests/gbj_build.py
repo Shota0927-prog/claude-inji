@@ -257,6 +257,19 @@ EDITS6 = [
 ]
 
 
+# ---- GBJ-8: adopted default Accum Score Mode = Max (defaults only; Edge Separate, Day/Swing Separate, 0.05 円 kept) ----
+#  strip_gbj7() reverses only these -> the GBJ-7 file (8e94720) byte for byte.
+EDITS7 = [
+    ("header",
+     "//  GBJ-7: Day/Swing Overlap Mode (Separate = 従来 / Merge Nearby = 価格が近い Day H/L と Swing を 1 つの根拠に)。Library v3。\n",
+     "//  GBJ-7: Day/Swing Overlap Mode (Separate = 従来 / Merge Nearby = 価格が近い Day H/L と Swing を 1 つの根拠に)。Library v3。\n"
+     "//  GBJ-8: 採用設定の初期値 Accum Score Mode = Max (Edge Mode Separate / Day/Swing Separate / Merge Distance 0.05 円は維持)。\n"),
+    ("default",
+     'accScoreMode = input.string("Sum", "Accum Score Mode", options = ["Sum", "Max"], group = G_ACC,\n',
+     'accScoreMode = input.string("Max", "Accum Score Mode", options = ["Sum", "Max"], group = G_ACC,\n'),
+]
+
+
 def git_show(rev, path=SRC_PATH):
     return subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{path}"], capture_output=True, text=True).stdout
 
@@ -284,12 +297,17 @@ def gbj1_transform(src):
 
 
 def gbj_transform(src):
-    return _apply(_apply(_apply(_apply(_apply(gbj1_transform(src), EDITS2), EDITS3), EDITS4), EDITS5), EDITS6)
+    return _apply(_apply(_apply(_apply(_apply(_apply(gbj1_transform(src), EDITS2), EDITS3), EDITS4), EDITS5), EDITS6), EDITS7)
+
+
+def strip_gbj7(gbj):
+    """reverse only the GBJ-8 default edit (EDITS7) (-> the GBJ-7 file byte for byte)."""
+    return _revert(gbj, EDITS7)
 
 
 def strip_gbj6(gbj):
-    """reverse only the GBJ-7 Day/Swing Merge Nearby edits (EDITS6) (-> the GBJ-5 file byte for byte)."""
-    return _revert(gbj, EDITS6)
+    """reverse the GBJ-8 default and the GBJ-7 Day/Swing Merge Nearby edits (EDITS7, EDITS6) (-> the GBJ-5 file)."""
+    return _revert(strip_gbj7(gbj), EDITS6)
 
 
 def strip_gbj5(gbj):

@@ -48,7 +48,7 @@ def code_only(src):
 
 def revert4(text, skip_header=True):
     out = text
-    for kind, a, b in list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):
+    for kind, a, b in list(reversed(gb.EDITS7)) + list(reversed(gb.EDITS6)) + list(reversed(gb.EDITS5)) + list(reversed(gb.EDITS4)):
         if kind == "header" and skip_header:
             continue
         out = out.replace(b, a) if out is not None and out.count(b) == 1 else None
@@ -80,7 +80,7 @@ def gate_static():
           and fc(GBE).index("math.max(accA1") > fc(GBE).index("hasACC  := hasACC or")
           and fc(GBE).index("math.max(accA1") < fc(GBE).index("if c.useRnSource")
           and "    bool   accScoreMax        = false" in GBE, str(adds6))
-    inp = lambda s: re.search(r"^accScoreMode = input\.string\((.*)$", s, re.M)
+    inp = lambda s: re.search(r"^accScoreMode = input\.string\((.*)$", s.replace(gb.EDITS7[1][2], gb.EDITS7[1][1]), re.M)   # GBJ-4 default (Sum); GBJ-8 sets Max
     cfgl = 'zoneCfg.accScoreMax          := accScoreMode == "Max"\n'
     check("GE-03 Visual and Strategy import ZoneEnginePracticalGBPJPY (one import, no /6), same input Accum Score Mode "
           "(default Sum, options Sum / Max) and the same config line; without the GBJ-4 edits both files are the "
