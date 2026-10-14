@@ -31,7 +31,7 @@ ROOT = gb.ROOT
 BASE = "65b1fb3"
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
 show = lambda p, rev=BASE: subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{p}"], capture_output=True, text=True).stdout
-GBV, GBS = rd(gb.GBJ_PATH), rd(gs.GBS_PATH)
+GBV, GBS = rd(gb.GBJ_PATH), gs.strip_qty(rd(gs.GBS_PATH)) or ""   # GBS-4 position size reverted (pinned in gbq_sim)
 GBV0, GBS0 = show(gb.GBJ_PATH), show(gs.GBS_PATH)
 ENGINE = rd("ZoneEnginePracticalSwingMax.pine")
 RESULTS = []
@@ -86,7 +86,7 @@ def gate_static():
     check("GX-01 Visual == gbj_build.build(), Strategy == gbs_build.build() (rebuilds identical); reverting the GBJ-2 edits "
           "gives the previous Visual and Strategy (" + BASE + ") byte for byte: with both features OFF only the listed "
           "edits differ (GBJ-3 base-setting defaults reverted as well: they are pinned by gbs_sim GB-06 / GB-10)",
-          gb.build() == GBV and gs.build() == GBS and gb.strip_gbj2(GBV) == GBV0 and bool(GBV0)
+          gb.build() == GBV and gs.strip_qty(gs.build()) == GBS and gb.strip_gbj2(GBV) == GBV0 and bool(GBV0)
           and revert_in_strategy(GBS) == GBS0 and bool(GBS0))
     gbj3 = {"scoreDayHL", "slopeThrMod", "slopeThrStrong", "thrStrong", "zoneHalfWidth",   # GBJ-3 (gbs_sim GB-06 / GB-10)
             "accScoreMode", "accEdgeMode", "dsMode", "dsDist"}                                                   # GBJ-4 / GBJ-5 (gbe_sim / gbf_sim)

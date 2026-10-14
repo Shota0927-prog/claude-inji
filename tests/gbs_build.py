@@ -52,6 +52,80 @@ BASE_EDITS = [
 ]
 
 
+# ---- GBS-4: position size from a fixed (simple-interest) loss budget and the fixed SL (Strategy only) ----------------
+#  qty unit = units of the base currency (GBP). syminfo.pointvalue (OANDA:GBPJPY = 1) converts a 1.0 price move of one
+#  unit into JPY, so loss = qty * distance * pointvalue; lots are only a display (qty / units per lot).
+#  budget = capital base * loss % (never equity: losses / profits do not change it). qty = floor(budget / (distance *
+#  pointvalue * step units) + 1e-9) * step units (the 1e-9 only absorbs float noise); below one step / invalid
+#  distance -> no order. The reference price is the one already used for the pre-order RR check (A: the limit, B / C / D:
+#  the confirmed 5M close); the actual fill is not looked ahead and the quantity is never changed after the fill.
+#  strip_qty() reverses these -> the GBS-3 Strategy (dedfbbc) byte for byte.
+QTY_INPUTS = (
+    'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
+    'stCapBase = input.float(300000.0, "元金基準額 (円)", minval = 0.0, step = 10000.0, group = G_STQ,\n'
+    '     tooltip = "単利: 損失予算はこの基準額 × 損失率で固定 (損益で増減しない)。strategy の初期資金とは別の入力。")\n'
+    'stRiskPct = input.float(3.0, "損失予算 (%)", minval = 0.0, step = 0.1, group = G_STQ)\n'
+    'stLotUnits = input.float(100000.0, "1 lot の通貨数", minval = 1.0, step = 1000.0, group = G_STQ)\n'
+    'stLotStep = input.float(0.01, "最小 lot / lot 刻み", minval = 0.0001, step = 0.01, group = G_STQ,\n'
+    '     tooltip = "数量はこの刻みで切り捨て。最小 lot 未満なら発注しない (切り上げない)。")\n'
+    'float stBudget = stCapBase * stRiskPct / 100.0     // 損失予算 (円、固定)\n'
+    '\n'
+    '// 数量 (通貨数、GBP): 参照価格 ref と固定 SL の距離から、損失予算を超えない最大の lot 刻みの倍数。\n'
+    '//  損失 (円) = qty × 距離 × syminfo.pointvalue (OANDA:GBPJPY は 1)。無効 / 最小 lot 未満は na (発注しない)\n'
+    'f_stQty(int side, float ref, float sl) =>\n'
+    '    float dist  = side == 1 ? ref - sl : sl - ref\n'
+    '    float stepU = stLotUnits * stLotStep\n'
+    '    float q     = na\n'
+    '    if not na(dist) and dist > 0 and syminfo.pointvalue > 0 and stepU > 0 and stBudget > 0\n'
+    '        float n = math.floor(stBudget / (dist * syminfo.pointvalue * stepU) + 1e-9)     // 1e-9: 浮動小数の誤差だけ吸収 (切り上げない)\n'
+    '        if n >= 1\n'
+    '            q := n * stepU\n'
+    '    q\n'
+    '\n')
+QTY_EDITS = [
+    ("     initial_capital        = 10000,\n",
+     "     initial_capital        = 300000,\n     currency               = currency.JPY,\n"),
+    ('var string G_STA = "03 · Strategy Alerts"\n', QTY_INPUTS + 'var string G_STA = "03 · Strategy Alerts"\n'),
+    ("f_stAlertMsg(string kind, int side, float ePx, float sl) =>\n",
+     "f_stAlertMsg(string kind, int side, float ePx, float sl, float qty) =>\n"),
+    ('     "\\nSL: " + f_num(sl, "#.000") +\n',
+     '     "\\nSL: " + f_num(sl, "#.000") +\n'
+     '     "\\nLot: " + f_num(qty / stLotUnits, "0.00") + " (" + f_num(qty, "#") + " 通貨)" +\n'
+     '     (kind == "仮" ? " 参考値・確定時の終値で再計算" : "") +\n'),
+    ("            [skipRef, tpRef] = f_stTp(side, ref, pSL, f_stNearest(side == 1 ? tpUp : tpDn, side, ref))\n"
+     "            if not skipRef\n",
+     "            [skipRef, tpRef] = f_stTp(side, ref, pSL, f_stNearest(side == 1 ? tpUp : tpDn, side, ref))\n"
+     "            // 数量: 同じ参照価格 (A: 指値 / B, C, D: この確定足の終値) と固定 SL から。無効 / 最小 lot 未満は発注しない\n"
+     "            float  pQty = f_stQty(side, ref, pSL)\n"
+     "            if not skipRef and not na(pQty)\n"),
+    ("                    strategy.entry(oEid, side == 1 ? strategy.long : strategy.short, limit = oL)\n",
+     "                    strategy.entry(oEid, side == 1 ? strategy.long : strategy.short, qty = pQty, limit = oL)\n"),
+    ("                    strategy.entry(oEid, side == 1 ? strategy.long : strategy.short)\n",
+     "                    strategy.entry(oEid, side == 1 ? strategy.long : strategy.short, qty = pQty)\n"),
+    ('                    alert(f_stAlertMsg("確定", side, stModeA ? oL : close, oSL), alert.freq_all)\n',
+     '                    alert(f_stAlertMsg("確定", side, stModeA ? oL : close, oSL, pQty), alert.freq_all)\n'),
+    ("        [pSide, pPx, pSL] = f_stProvEval()\n"
+     "        if pSide != 0\n"
+     "            stProvBar := bar_index\n"
+     "            alert(f_stAlertMsg(\"仮\", pSide, pPx, pSL), alert.freq_once_per_bar)\n",
+     "        [pSide, pPx, pSL] = f_stProvEval()\n"
+     "        float pvQty = pSide != 0 ? f_stQty(pSide, pPx, pSL) : na     // 参考値 (確定時の終値で再計算される)\n"
+     "        if pSide != 0 and not na(pvQty)\n"
+     "            stProvBar := bar_index\n"
+     "            alert(f_stAlertMsg(\"仮\", pSide, pPx, pSL, pvQty), alert.freq_once_per_bar)\n"),
+]
+
+
+def strip_qty(text):
+    """reverse the GBS-4 position-size edits (-> the GBS-3 Strategy text)."""
+    out = text
+    for a, b in reversed(QTY_EDITS):
+        if out is None or out.count(b) != 1:
+            return None
+        out = out.replace(b, a)
+    return out
+
+
 def _gbs_edits():
     out = []
     for a, b in sj.EDITS:
@@ -65,7 +139,7 @@ def _gbs_edits():
             out.append((a, TITLE_GBS))
         else:                                         # USDJPY only appears in comments of these edits
             out.append((a, b.replace("USDJPY", "GBPJPY")))
-    return out + BASE_EDITS + [(ge.IMPORT_6, ge.IMPORT_GBE)]   # GBJ-4: same Engine as ZONE-GBPJPY
+    return out + BASE_EDITS + [(ge.IMPORT_6, ge.IMPORT_GBE)] + QTY_EDITS   # GBJ-4: same Engine; GBS-4: position size
 
 
 EDITS = _gbs_edits()

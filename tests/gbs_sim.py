@@ -35,7 +35,8 @@ import fvg_re10045_sim as fr    # noqa: E402
 ROOT = gs.ROOT
 BASE = "140a6c9"
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
-GBS = rd(gs.GBS_PATH)
+GBS_FULL = rd(gs.GBS_PATH)
+GBS = gs.strip_qty(GBS_FULL) or ""     # GBS-4 position size reverted: these checks pin GBS-3 (gbq_sim pins GBS-4)
 GBV = rd(gb.GBJ_PATH)
 STJ = rd(sj.STJ_PATH)
 
@@ -89,7 +90,7 @@ def gate_static():
     pipe = gs.pipeline()
     check("GB-01 ZoneStrategyGBPJPY.pine == gbs_build.build() (rebuild gives the same bytes); strip_gbs gives the "
           "ZONE-GBPJPY -> ST-3 pipeline text back, and strip_st3 / strip_st2 lead to st_transform(ZONE-GBPJPY)",
-          bool(GBS) and gs.build() == GBS and gs.build() == gs.build() and gs.strip_gbs(GBS) == pipe
+          bool(GBS) and gs.build() == GBS_FULL and gs.build() == gs.build() and gs.strip_gbs(GBS_FULL) == pipe
           and s2.strip_st2(s3.strip_st3(pipe)) == tb.st_transform(gs.visual_for_pipeline()))
     v = GBV
     comp = v[v.index(ge.IMPORT_GBE):v.index(tb.DISP_INPUT_HEAD)] + \

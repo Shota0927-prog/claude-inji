@@ -33,7 +33,7 @@ rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.e
 show = lambda p, rev=PREV: subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{p}"], capture_output=True, text=True).stdout
 ENG6, GBE1 = rd(ge.SRC_PATH), show(ge.GBE_PATH)
 GBE = ge.strip_gbe3(rd(ge.GBE_PATH)) or ""     # GBE-2 (Library v2) checks; GBE-3 (Day/Swing Overlap) is pinned in gbd_sim
-GBV, GBS = rd(gb.GBJ_PATH), rd(gs.GBS_PATH)
+GBV, GBS = rd(gb.GBJ_PATH), gs.strip_qty(rd(gs.GBS_PATH)) or ""   # GBS-4 position size reverted (pinned in gbq_sim)
 GBV0, GBS0 = show(gb.GBJ_PATH), show(gs.GBS_PATH)
 RESULTS = []
 
