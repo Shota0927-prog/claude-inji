@@ -57,56 +57,57 @@ def gate_static():
           + " Strategy byte for byte: signals, order prices, SL / TP, session, Track limits and alert conditions are "
           "unchanged apart from the size", bool(GBS) and gs.build() == GBS and gs.build() == gs.build()
           and gs.strip_qty(GBS) == GBS0 and bool(GBS0))
-    decl = GBS[GBS.index("strategy(\n"):GBS.index(")\n", GBS.index("strategy(\n")) + 2]
+    G4 = gs.strip_msg(GBS) or ""     # GBS-5 / GBS-6 (alert text, labels) reverted: these checks pin GBS-4 (gbn_sim pins 5 / 6)
+    decl = G4[G4.index("strategy(\n"):G4.index(")\n", G4.index("strategy(\n")) + 2]
     decl0 = GBS0[GBS0.index("strategy(\n"):GBS0.index(")\n", GBS0.index("strategy(\n")) + 2]
     check("GQ-02 strategy(): initial capital 300,000, currency JPY; calc_on_every_tick / process_orders_on_close / "
           "pyramiding / default qty unchanged; no margin_long / margin_short added (margin left at the Pine v5 default)",
           "initial_capital        = 300000," in decl and "currency               = currency.JPY," in decl
           and decl.replace("     initial_capital        = 300000,\n     currency               = currency.JPY,\n",
                            "     initial_capital        = 10000,\n") == decl0
-          and "margin" not in code_only(GBS), decl)
-    inp = lambda n: (re.search(r"^" + n + r"\s*=\s*input\.\w+\(([^,]+),", GBS, re.M) or [None, None])[1]
-    q = func(GBS, "f_stQty(")
+          and "margin" not in code_only(G4), decl)
+    inp = lambda n: (re.search(r"^" + n + r"\s*=\s*input\.\w+\(([^,]+),", G4, re.M) or [None, None])[1]
+    q = func(G4, "f_stQty(")
     check("GQ-03 inputs (changeable) 元金基準額 300,000 / 損失予算 3 % / 1 lot 100,000 通貨 / lot 刻み 0.01; budget = base x "
           "% / 100 fixed (f_stQty and the budget never read equity, net profit or position: simple interest); "
           "qty = floor(budget / (distance x pointvalue x step units) + 1e-9) x step units (1e-9 absorbs float noise only), na "
           "below one step or for an "
           "invalid distance", [inp(n) for n in ("stCapBase", "stRiskPct", "stLotUnits", "stLotStep")]
           == ["300000.0", "3.0", "100000.0", "0.01"]
-          and "float stBudget = stCapBase * stRiskPct / 100.0" in GBS
+          and "float stBudget = stCapBase * stRiskPct / 100.0" in G4
           and "    float dist  = side == 1 ? ref - sl : sl - ref\n" in q
           and "    float stepU = stLotUnits * stLotStep\n" in q
           and "if not na(dist) and dist > 0 and syminfo.pointvalue > 0 and stepU > 0 and stBudget > 0" in q
           and "math.floor(stBudget / (dist * syminfo.pointvalue * stepU) + 1e-9)" in q
           and "        if n >= 1\n            q := n * stepU\n" in q
           and not re.search(r"strategy\.(equity|netprofit|initial_capital|position_size|openprofit)", q + "stBudget"))
-    ob = GBS[GBS.index("            float  pQty = f_stQty(side, ref, pSL)"):GBS.index("    stPrev := cur\n")]
+    ob = G4[G4.index("            float  pQty = f_stQty(side, ref, pSL)"):G4.index("    stPrev := cur\n")]
     check("GQ-04 orders: pQty from the same reference price as the RR pre-check (ref = A limit / B, C, D confirmed 5M "
           "close) and the fixed SL; no order when it is na; both strategy.entry calls pass qty = pQty (units, not lots); "
           "strategy.exit unchanged (whole position); qty is never set again after the fill",
-          "            float  ref = stModeA ? pL : close\n" in GBS and "if not skipRef and not na(pQty)\n" in ob
+          "            float  ref = stModeA ? pL : close\n" in G4 and "if not skipRef and not na(pQty)\n" in ob
           and ob.count("qty = pQty") == 2 and "strategy.exit(oXid, oEid, stop = oSL)\n" in ob
-          and len(re.findall(r"\bqty\s*=", code_only(GBS))) == 2 and "strategy.order(" not in GBS
-          and "pQty * stLotUnits" not in GBS and "stLotUnits * pQty" not in GBS)
-    pv = GBS[GBS.index("        [pSide, pPx, pSL] = f_stProvEval()\n"):]
+          and len(re.findall(r"\bqty\s*=", code_only(G4))) == 2 and "strategy.order(" not in G4
+          and "pQty * stLotUnits" not in G4 and "stLotUnits * pQty" not in G4)
+    pv = G4[G4.index("        [pSide, pPx, pSL] = f_stProvEval()\n"):]
     check("GQ-05 alerts: the confirmed alert carries the order's pQty (lot = qty / units per lot) in the order branch; the "
           "provisional alert computes a reference size with the same function (labelled 参考値), is sent only when that "
           "size is valid like the order, and keeps its once-per-bar state; message strings only inside alert()",
           'alert(f_stAlertMsg("確定", side, stModeA ? oL : close, oSL, pQty), alert.freq_all)' in ob
           and "float pvQty = pSide != 0 ? f_stQty(pSide, pPx, pSL) : na" in pv
           and "if pSide != 0 and not na(pvQty)\n            stProvBar := bar_index\n" in pv
-          and '"\\nLot: " + f_num(qty / stLotUnits, "0.00")' in GBS and "参考値" in GBS
-          and code_only(GBS).count("f_stAlertMsg(") == 3)
+          and '"\\nLot: " + f_num(qty / stLotUnits, "0.00")' in G4 and "参考値" in G4
+          and code_only(G4).count("f_stAlertMsg(") == 3)
     req = lambda s: re.findall(r"request\.\w+\(.*$", code_only(s), re.M)
     cnt = lambda s, p: len(re.findall(p, code_only(s)))
     check("GQ-06 lightweight: requests (11), zone loops, for-loops, drawing and plots unchanged (the size is two "
           "multiplications and a floor in the existing order branch); RE10045 lint clean",
-          req(GBS) == req(GBS0) and all(cnt(GBS, p) == cnt(GBS0, p) for p in (r"zn\.zoneAt\(", r"\bfor\b", r"\bwhile\b",
+          req(G4) == req(GBS0) and all(cnt(G4, p) == cnt(GBS0, p) for p in (r"zn\.zoneAt\(", r"\bfor\b", r"\bwhile\b",
                                                                           r"\b(box|label|line|table)\.new\(", r"\bplot\("))
-          and fr.lint_eager_guards(code_only(GBS)) == [])
+          and fr.lint_eager_guards(code_only(G4)) == [])
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", PREV, "--"] + PROTECTED, capture_output=True, text=True)
     check("GQ-07 Visual, Library (/3 source), shared /6, Gold and USDJPY unchanged vs " + PREV + "; import stays /3",
-          d.returncode == 0 and d.stdout.strip() == "" and re.findall(r"^import .*$", GBS, re.M) == [ge.IMPORT_GBE.strip()],
+          d.returncode == 0 and d.stdout.strip() == "" and re.findall(r"^import .*$", G4, re.M) == [ge.IMPORT_GBE.strip()],
           d.stdout)
 
 
