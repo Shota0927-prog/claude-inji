@@ -1,4 +1,4 @@
-"""BTC-1 / BTC-2 — ZoneVisualBTCUSD.pine: BINANCE:BTCUSD 5M Zone display indicator (no entries, no alerts).
+"""BTC-1 / BTC-2 / BTC-3 — ZoneVisualBTCUSD.pine: CRYPTO:BTCUSD 5M Zone display indicator (no entries, no alerts).
 
 Deterministic transform of ZoneVisualGBPJPY.pine (ZONE-GBPJPY) by exact, unique text replacements:
   EDITS  (BTC-1)  name / USD price inputs / RN symbol gate / Zone geometry text
@@ -6,8 +6,13 @@ Deterministic transform of ZoneVisualGBPJPY.pine (ZONE-GBPJPY) by exact, unique 
                   the Engine state (zn.update) changes only on a confirmed 5M bar (is5mChart and barstate.isconfirmed);
                   while a bar forms, the display reads the last confirmed state (Stats zone count via zn.zoneCount,
                   draw order by distance to the last confirmed close instead of the forming close)
-strip_btc2() reverses EDITS2 only (-> the BTC-1 file, commit f326724, byte for byte); strip_btc() reverses both and must
-give ZONE-GBPJPY back byte for byte (fixture btc_sim). Requests, Source / FVG / Break feeds, the FVG store (already
+  EDITS3 (BTC-3)  verification symbol in the header comment: CRYPTO:BTCUSD 5M (comments only; every request reads
+                  syminfo.tickerid, no exchange is hard-coded; prices / Zone logic / update timing unchanged)
+The BTC-1 header text inside EDITS is kept as committed in f326724 (it named the earlier verification symbol) so that the
+layers stay byte-exact; EDITS3 replaces it in the generated file.
+strip_btc3() reverses EDITS3 only (-> the BTC-2 file, commit a36c3e8, byte for byte); strip_btc2() reverses EDITS3 and
+EDITS2 (-> the BTC-1 file, commit f326724); strip_btc() reverses all three and must give ZONE-GBPJPY back byte for byte
+(fixture btc_sim). Requests, Source / FVG / Break feeds, the FVG store (already
 confirmed-only), Zone generation / scoring and the Engine import (ZoneEnginePracticalGBPJPY/3) are ZONE-GBPJPY's.
 Kinds (each EDIT is tagged and btc_sim checks the code lines it touches):
   header    comment header / comments
@@ -227,6 +232,16 @@ EDITS2 = [
 ]
 
 
+# ---- BTC-3: verification symbol CRYPTO:BTCUSD 5M (comments only; applied after EDITS2) ---------------------------------
+EDITS3 = [
+    ("header",
+     "//  Zone Visual BTCUSD (Compare)  —  BINANCE:BTCUSD 5分足用 Zone 表示 Indicator (Entry / Alert なし)\n",
+     "//  Zone Visual BTCUSD (Compare)  —  CRYPTO:BTCUSD 5分足用 Zone 表示 Indicator (Entry / Alert なし)\n"
+     "//  検証対象: CRYPTO:BTCUSD・5分足。実データはすべて syminfo.tickerid (チャートの銘柄) から取得し、取引所・銘柄の\n"
+     "//  固定参照は持たない (request.security はすべて syminfo.tickerid)。\n"),
+]
+
+
 def _apply(src, edits):
     out = src
     for _, a, b in edits:
@@ -249,17 +264,27 @@ def btc1_transform(src):
     return _apply(src, EDITS)
 
 
-def btc_transform(src):
+def btc2_transform(src):
+    """BTC-1 + BTC-2 (commit a36c3e8)."""
     return _apply(btc1_transform(src), EDITS2)
 
 
+def btc_transform(src):
+    return _apply(btc2_transform(src), EDITS3)
+
+
+def strip_btc3(btc):
+    """reverse only the BTC-3 symbol comment (-> the BTC-2 file byte for byte)."""
+    return _revert(btc, EDITS3)
+
+
 def strip_btc2(btc):
-    """reverse only the BTC-2 timing edits (-> the BTC-1 file byte for byte)."""
-    return _revert(btc, EDITS2)
+    """reverse the BTC-3 and BTC-2 edits (-> the BTC-1 file byte for byte)."""
+    return _revert(strip_btc3(btc), EDITS2)
 
 
 def strip_btc(btc):
-    """reverse the BTC-2 and BTC-1 edits (-> ZoneVisualGBPJPY.pine byte for byte)."""
+    """reverse the BTC-3, BTC-2 and BTC-1 edits (-> ZoneVisualGBPJPY.pine byte for byte)."""
     return _revert(strip_btc2(btc), EDITS)
 
 

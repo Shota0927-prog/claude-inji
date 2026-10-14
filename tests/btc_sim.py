@@ -1,8 +1,10 @@
-"""BTC-1 / BTC-2 fixtures — ZoneVisualBTCUSD.pine (BINANCE:BTCUSD 5M Zone display, no entries / alerts).
+"""BTC-1 / BTC-2 / BTC-3 fixtures — ZoneVisualBTCUSD.pine (CRYPTO:BTCUSD 5M Zone display, no entries / alerts).
 
   The file differs from ZONE-GBPJPY in two layers: BTC-1 (name / USD inputs / RN symbol gate / geometry text) and BTC-2
   (update timing: Engine state only on confirmed 5M bars, forming bars display the last confirmed state). BTC-1 checks
   run on BTC1 = strip_btc2(file) (== commit f326724); BTC-2 checks (BT) pin the timing delta on top of it.
+  BTC-3 changes only the verification symbol in the header comment to CRYPTO:BTCUSD 5M (BC); strip_btc3(file) ==
+  commit a36c3e8. Data always comes from syminfo.tickerid (no exchange / symbol hard-coded).
   BS : static — deterministic, idempotent build from ZONE-GBPJPY; strip_btc(file) == ZONE-GBPJPY byte for byte; every
        BTC-1 changed code line is a price input (USD), the title, the RN symbol gate / error text or the geometry text;
        USD defaults / minval / step as specified; dimensionless inputs identical; no yen / pips / 3-decimal leftovers;
@@ -46,7 +48,9 @@ GBJ = rd(bb.SRC_PATH)
 BTC = rd(bb.BTC_PATH)
 ENG = rd(ENGINE_PATH)
 BTC1_COMMIT = "f326724"
-BTC1 = bb.strip_btc2(BTC) or ""          # the BTC-1 file (BTC-2 timing edits reverted)
+BTC1 = bb.strip_btc2(BTC) or ""          # the BTC-1 file (BTC-3 and BTC-2 edits reverted)
+BTC2_COMMIT = "a36c3e8"
+BTC2 = bb.strip_btc3(BTC) or ""          # the BTC-2 file (BTC-3 symbol comment reverted)
 RESULTS = []
 
 
@@ -128,17 +132,22 @@ def engine_type_fields(src, name):
 
 def gate_static():
     check("BS-01 ZoneVisualBTCUSD.pine == btc_transform(ZoneVisualGBPJPY.pine); rebuilding gives the same bytes; strip_btc "
-          "gives ZONE-GBPJPY back byte for byte; strip_btc2 gives the BTC-1 file of commit f326724 byte for byte",
+          "gives ZONE-GBPJPY back byte for byte; strip_btc2 / strip_btc3 give the BTC-1 (f326724) / BTC-2 (a36c3e8) files",
           bool(BTC) and bb.build() == BTC and bb.build() == bb.build() and bb.strip_btc(BTC) == GBJ
           and bb.btc_transform(bb.strip_btc(BTC)) == BTC and bb.btc1_transform(GBJ) == BTC1
+          and bb.btc2_transform(GBJ) == BTC2
+          and BTC2 == subprocess.run(["git", "-C", ROOT, "show", BTC2_COMMIT + ":" + bb.BTC_PATH],
+                                     capture_output=True, text=True).stdout
           and BTC1 == subprocess.run(["git", "-C", ROOT, "show", BTC1_COMMIT + ":" + bb.BTC_PATH],
                                      capture_output=True, text=True).stdout)
-    check("BS-02 every BTC-1 EDIT is tagged header / title / input / rn / display, every BTC-2 EDIT header / timing; each "
+    check("BS-02 every BTC-1 EDIT is tagged header / title / input / rn / display, every BTC-2 EDIT header / timing, every BTC-3 EDIT header; each "
           "replaces a text that occurs exactly once",
           all(k in ("header", "title", "input", "rn", "display") for k, _, _ in bb.EDITS)
           and all(GBJ.count(a) == 1 and BTC1.count(b) == 1 for _, a, b in bb.EDITS)
           and all(k in ("header", "timing") for k, _, _ in bb.EDITS2)
-          and all(BTC1.count(a) == 1 and BTC.count(b) == 1 for _, a, b in bb.EDITS2))
+          and all(BTC1.count(a) == 1 and BTC2.count(b) == 1 for _, a, b in bb.EDITS2)
+          and all(k == "header" for k, _, _ in bb.EDITS3)
+          and all(BTC2.count(a) == 1 and BTC.count(b) == 1 for _, a, b in bb.EDITS3))
     ga, ba = code_only(GBJ).split("\n"), code_only(BTC1).split("\n")
     changed = []
     for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ga, ba, autojunk=False).get_opcodes():
@@ -232,14 +241,16 @@ def gate_static():
     out = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASE, "--"], capture_output=True, text=True).stdout.split()
     tracked = subprocess.run(["git", "-C", ROOT, "ls-files"], capture_output=True, text=True).stdout.split()
     new_ok = {bb.BTC_PATH, "tests/btc_build.py", "tests/btc_sim.py"}
+    out2 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BTC2_COMMIT, "--"], capture_output=True,
+                          text=True).stdout.split()
     out1 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BTC1_COMMIT, "--"], capture_output=True,
                           text=True).stdout.split()
     check(f"BS-15 existing files unchanged vs base HEAD {BASE} (GBPJPY / USDJPY / Gold Visuals, Strategies, Engines, "
-          "tests) and vs f326724 (BTC-2 touches only the BTC Visual / build / sim); ZoneVisualGBPJPY.pine and "
+          "tests) and vs f326724 / a36c3e8 (BTC-2 / BTC-3 touch only the BTC Visual / build / sim); ZoneVisualGBPJPY.pine and "
           "ZoneEnginePracticalGBPJPY.pine untouched", subprocess.run(["git", "-C", ROOT, "cat-file", "-e", BASE]).returncode == 0
           and not [f for f in out if f not in new_ok] and all(f in tracked or f in new_ok for f in new_ok | set(out))
-          and not [f for f in out1 if f not in new_ok],
-          str((out, out1)))
+          and not [f for f in out1 if f not in new_ok] and not [f for f in out2 if f not in new_ok],
+          str((out, out1, out2)))
     # mutations: the checks must catch a reverted gate / a leftover yen input / an extra request
     m1 = BTC.replace('syminfo.ticker == "BTCUSD"', 'syminfo.ticker == "GBPJPY"')
     m2 = BTC.replace('zoneHalfWidth = input.float(50.0, "[未検証] Zone Half Width (USD)"', 'zoneHalfWidth = input.float(0.05, "[未検証] Zone Half Width (USD)"')
@@ -339,6 +350,36 @@ def engine_fn_update_returns_live():
     body = ENG[i:j].rstrip().split("\n")
     tail = [l for l in body if l.strip() and not l.strip().startswith("//")]
     return tail[-1] == "    array.size(e.live)" and not re.search(r"\[\d+\]|\bta\.", code_only(ENG[i:j]))
+
+
+# ---- BTC-3: verification symbol CRYPTO:BTCUSD 5M, no hard-coded exchange --------------------------------------------------
+def gate_symbol():
+    X = "BIN" + "ANCE"
+    co = code_only(BTC)
+    reqs = re.findall(r"request\.(\w+)\(([^,]+),", co)
+    check("BC-01 every request.* (10) reads syminfo.tickerid (the chart symbol); no exchange-prefixed symbol literal "
+          "(\"XXX:YYY\"), ticker.new / syminfo.prefix or other fixed symbol reference in code",
+          len(reqs) == 10 and all(f == "security" and a.strip() == "syminfo.tickerid" for f, a in reqs)
+          and not re.search(r'"[A-Z0-9_]+:[A-Z0-9_.!]+"', co) and not re.search(r"ticker\.\w+\(|syminfo\.prefix", co),
+          str(reqs[:3]))
+    check("BC-02 the Pine file names the verification target CRYPTO:BTCUSD 5分足 and states that data comes from "
+          "syminfo.tickerid; no " + X + " text anywhere in ZoneVisualBTCUSD.pine",
+          X not in BTC and X.lower() not in BTC.lower()
+          and "//  Zone Visual BTCUSD (Compare)  —  CRYPTO:BTCUSD 5分足用 Zone 表示 Indicator (Entry / Alert なし)\n" in BTC
+          and "//  検証対象: CRYPTO:BTCUSD・5分足。実データはすべて syminfo.tickerid" in BTC)
+    check("BC-03 BTC-3 is comment-only: code identical to BTC-2 (a36c3e8) — price inputs, Zone logic, RN gate (ticker "
+          "BTCUSD) and the confirmed-bar update are unchanged", bool(BTC2) and code_only(BTC) == code_only(BTC2)
+          and 'syminfo.ticker == "BTCUSD"' in co and "if is5mChart and barstate.isconfirmed\n    zoneCountNow := zn.update(" in co)
+    src_b = open(os.path.join(ROOT, "tests", "btc_build.py"), encoding="utf-8").read()
+    src_s = open(os.path.join(ROOT, "tests", "btc_sim.py"), encoding="utf-8").read()
+    hist = [bb.EDITS[0][2], bb.EDITS3[0][1]]                   # BTC-1 committed header text (reverted by EDITS3)
+    occ_b = [l for l in src_b.split("\n") if X in l]
+    check("BC-04 build / sim docstrings name CRYPTO:BTCUSD; " + X + " remains only in the historical BTC-1 header text that "
+          "EDITS / EDITS3 must match to reproduce f326724 (not a data reference); none in btc_sim",
+          "CRYPTO:BTCUSD 5M" in src_b.split("\n")[0] and "CRYPTO:BTCUSD 5M" in src_s.split("\n")[0]
+          and all(X + ":BTCUSD" in h for h in hist) and len(occ_b) == 2
+          and all("Zone Visual BTCUSD (Compare)  —  " + X + ":BTCUSD 5分足用" in l for l in occ_b) and X not in src_s,
+          str(occ_b))
 
 
 # ---- models -------------------------------------------------------------------------------------------------------------
@@ -665,7 +706,7 @@ def gate_rollback():
 
 
 def main():
-    for g in (gate_static, gate_timing, gate_model, gate_rollback):
+    for g in (gate_static, gate_timing, gate_symbol, gate_model, gate_rollback):
         try:
             g()
         except Exception:
