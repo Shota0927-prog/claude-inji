@@ -1,15 +1,21 @@
-"""BTC-1 — ZoneVisualBTCUSD.pine: BINANCE:BTCUSD 5M Zone display indicator (no entries, no alerts).
+"""BTC-1 / BTC-2 — ZoneVisualBTCUSD.pine: BINANCE:BTCUSD 5M Zone display indicator (no entries, no alerts).
 
-Deterministic transform of ZoneVisualGBPJPY.pine (ZONE-GBPJPY) by exact, unique text replacements (EDITS);
-strip_btc() applies them in reverse and must give ZONE-GBPJPY back byte for byte (fixture btc_sim), so the Engine
-import (ZoneEnginePracticalGBPJPY/3, symbol independent), Zone generation / scoring, FVG, update order, requests,
-5M gate and non-repaint blocks are provably ZONE-GBPJPY's.
-Only these kinds of change are allowed (each EDIT is tagged and btc_sim checks the code lines it touches):
+Deterministic transform of ZoneVisualGBPJPY.pine (ZONE-GBPJPY) by exact, unique text replacements:
+  EDITS  (BTC-1)  name / USD price inputs / RN symbol gate / Zone geometry text
+  EDITS2 (BTC-2)  update timing (explicit, approved behaviour change vs ZONE-GBPJPY):
+                  the Engine state (zn.update) changes only on a confirmed 5M bar (is5mChart and barstate.isconfirmed);
+                  while a bar forms, the display reads the last confirmed state (Stats zone count via zn.zoneCount,
+                  draw order by distance to the last confirmed close instead of the forming close)
+strip_btc2() reverses EDITS2 only (-> the BTC-1 file, commit f326724, byte for byte); strip_btc() reverses both and must
+give ZONE-GBPJPY back byte for byte (fixture btc_sim). Requests, Source / FVG / Break feeds, the FVG store (already
+confirmed-only), Zone generation / scoring and the Engine import (ZoneEnginePracticalGBPJPY/3) are ZONE-GBPJPY's.
+Kinds (each EDIT is tagged and btc_sim checks the code lines it touches):
   header    comment header / comments
   title     indicator title / shorttitle
   input     price-difference input default / label / minval / step / tooltip / group text (USD)
   rn        Round Number symbol gate (ticker BTCUSD) and its error text
   display   Zone top / bottom / width text (format.mintick, USD)
+  timing    BTC-2 update timing / confirmed-state display reference
 Price-difference defaults are unverified starting values for display checks (not adopted / optimised values, not a
 scaled copy of the GBPJPY values). Dimensionless inputs (scores, ATR multiples, lengths, bars) are not changed.
 ZONE-GBPJPY, the other Visuals / Strategies and the Engines are not modified.
@@ -166,6 +172,61 @@ EDITS = [
 ]
 
 
+# ---- BTC-2: update on confirmed 5M bars only; forming bars display the last confirmed state (applied after EDITS) ------
+EDITS2 = [
+    ("header",
+     "//  FVG・更新順・5分足 Gate・非リペイント条件で、表示名・価格差入力 (USD)・Round Number の銘柄判定・Zone 上下限 / 幅の\n"
+     "//  表示書式だけを変えた派生版 (生成: tests/btc_build.py、ZONE-GBPJPY との差分は fixture btc_sim が固定)。\n",
+     "//  FVG・更新順・5分足 Gate・非リペイント条件で、表示名・価格差入力 (USD)・Round Number の銘柄判定・Zone 上下限 / 幅の\n"
+     "//  表示書式、および Engine の更新タイミング (BTC-2) を変えた派生版 (生成: tests/btc_build.py、ZONE-GBPJPY との差分は\n"
+     "//  fixture btc_sim が固定)。\n"
+     "//  BTC-2 (ZONE-GBPJPY からの明示的な変更): Engine の状態 (zn.update) は確定 5分足でだけ更新し、形成中の足は直前の\n"
+     "//  確定状態を表示する (Zone 範囲・Strength・Touch・Break / Flip・FVG 昇格・描画順が形成中の tick で変わらない)。\n"
+     "//  request の取得・Source / FVG / Break の系列計算・FVG 保存 (元から確定足だけ) は ZONE-GBPJPY のまま毎 tick 同じ位置で行う。\n"),
+    ("timing",
+     "//  ★ 5分足専用: 5分足以外では zn.update を呼ばない (空データを入れるのではなく状態遷移自体を行わない)。\n"
+     "int zoneCountNow = 0\n"
+     "\n"
+     "if is5mChart\n"
+     "    zoneCountNow := zn.update(zoneEng, zoneCfg, zoneFeed)\n",
+     "//  ★ 5分足専用: 5分足以外では zn.update を呼ばない (空データを入れるのではなく状態遷移自体を行わない)。\n"
+     "//  ★ BTC-2: Engine の状態更新は確定 5分足だけ (Historical は全足確定なので従来と同じ足で同じ入力)。形成中の tick では\n"
+     "//    更新せず、Engine は直前の確定足の状態のまま (Feed は上で毎 tick 計算済み。Engine の新規イベント検出は\n"
+     "//    Engine 内の前回キー比較なので、確定足ごとの 1 回の呼び出しで同じイベントを同じ足で拾う)。\n"
+     "int zoneCountNow = 0\n"
+     "\n"
+     "if is5mChart and barstate.isconfirmed\n"
+     "    zoneCountNow := zn.update(zoneEng, zoneCfg, zoneFeed)\n"
+     "else if is5mChart\n"
+     "    zoneCountNow := zn.zoneCount(zoneEng)    // 読み取りだけ (update の戻り値と同じ array.size(live))\n"),
+    ("timing",
+     "if barstate.islast and is5mChart\n"
+     "    int nBox  = 0\n",
+     "// BTC-2: 描画順の基準価格は直前の確定足の終値 (確定 tick では今の足の終値 = 確定値)。zn.drawOrder と同じ並べ方\n"
+     "//  (Zone 中心との距離の昇順、array.sort_indices、Engine の live 順) で、基準価格だけを形成中の close から確定終値に替える。\n"
+     "//  形成中の tick で Max Zones Drawn に入る Zone の顔ぶれが変わらない。読み取りだけ (Engine に書き込まない)。\n"
+     "float btcDrawRef = barstate.isconfirmed ? close : close[1]\n"
+     "f_btcDrawOrder(int maxN, float ref) =>\n"
+     "    array<int> out = array.new_int()\n"
+     "    int n = zn.zoneCount(zoneEng)\n"
+     "    if n > 0\n"
+     "        array<float> d = array.new_float()\n"
+     "        for i = 0 to n - 1\n"
+     "            array.push(d, math.abs(zn.zoneAt(zoneEng, i).center - ref))\n"
+     "        array<int> ord = array.sort_indices(d, order.ascending)\n"
+     "        int lim = int(math.min(n, maxN))\n"
+     "        for k = 0 to lim - 1\n"
+     "            array.push(out, array.get(ord, k))\n"
+     "    out\n"
+     "\n"
+     "if barstate.islast and is5mChart\n"
+     "    int nBox  = 0\n"),
+    ("timing",
+     "        array<int> ord = zn.drawOrder(zoneEng, zn.zoneCount(zoneEng))\n",
+     "        array<int> ord = f_btcDrawOrder(zn.zoneCount(zoneEng), btcDrawRef)\n"),
+]
+
+
 def _apply(src, edits):
     out = src
     for _, a, b in edits:
@@ -183,13 +244,23 @@ def _revert(text, edits):
     return out
 
 
-def btc_transform(src):
+def btc1_transform(src):
+    """BTC-1 only (commit f326724)."""
     return _apply(src, EDITS)
 
 
+def btc_transform(src):
+    return _apply(btc1_transform(src), EDITS2)
+
+
+def strip_btc2(btc):
+    """reverse only the BTC-2 timing edits (-> the BTC-1 file byte for byte)."""
+    return _revert(btc, EDITS2)
+
+
 def strip_btc(btc):
-    """reverse every BTC-1 edit (-> ZoneVisualGBPJPY.pine byte for byte)."""
-    return _revert(btc, EDITS)
+    """reverse the BTC-2 and BTC-1 edits (-> ZoneVisualGBPJPY.pine byte for byte)."""
+    return _revert(strip_btc2(btc), EDITS)
 
 
 def build():
