@@ -22,10 +22,9 @@ IMPORT_6 = "import sekine3310/ZoneEnginePractical/6 as zn\n"
 # (python3 tests/gbj_build.py && python3 tests/gbs_build.py).
 IMPORT_GBE1 = "import sekine3310/ZoneEnginePracticalGBPJPY/1 as zn\n"
 IMPORT_GBE2 = "import sekine3310/ZoneEnginePracticalGBPJPY/2 as zn\n"
-# Version 3 = the time-based Day/Swing Deduplicate of 23fd5e0 (superseded, its origin-time data removed). The
-# price-based Day/Swing Merge Nearby below is expected to become version 4.
-IMPORT_GBE3 = "import sekine3310/ZoneEnginePracticalGBPJPY/3 as zn\n"
-IMPORT_GBE = "import sekine3310/ZoneEnginePracticalGBPJPY/4 as zn\n"
+# The time-based Day/Swing Deduplicate of 23fd5e0 was never published (superseded, its origin-time data removed). The
+# price-based Day/Swing Merge Nearby below was published as version 3 (confirmed on TradingView).
+IMPORT_GBE = "import sekine3310/ZoneEnginePracticalGBPJPY/3 as zn\n"
 
 ACC_OLD = """        else if m.srcCat == CAT_ACC
             if m.srcTf == c.accTf1

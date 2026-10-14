@@ -238,7 +238,7 @@ EDITS6 = [
     ("header",
      "//  GBJ-5: Accum Edge Mode (Separate = 従来 / Once per TF = 同じ時間足の上限・下限を合わせて 1 回)。Library v2 が必要。\n",
      "//  GBJ-5: Accum Edge Mode (Separate = 従来 / Once per TF = 同じ時間足の上限・下限を合わせて 1 回)。Library v2 が必要。\n"
-     "//  GBJ-7: Day/Swing Overlap Mode (Separate = 従来 / Merge Nearby = 価格が近い Day H/L と Swing を 1 つの根拠に)。Library v4。\n"),
+     "//  GBJ-7: Day/Swing Overlap Mode (Separate = 従来 / Merge Nearby = 価格が近い Day H/L と Swing を 1 つの根拠に)。Library v3。\n"),
     ("import", _ge.IMPORT_GBE2, _ge.IMPORT_GBE),
     ("dsmode",
      'lifePrevDayHL = input.float(5.0, "Lifetime · Carried Prev Day H/L (days)", step = 1.0, group = G_DHL)\n',

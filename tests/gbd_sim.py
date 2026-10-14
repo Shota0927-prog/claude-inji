@@ -5,7 +5,7 @@
        shared /6; no origin-time field / request change remains; price data (actual pivot / day prices) is state only;
        every scoring change is gated by dsMerge; the predicate (High with High, Low with Low, tick-rounded |day - pivot|
        <= distance, first or latest pivot price, no time) and the adjustment are pinned; Visual / Strategy import
-       version 4, carry the same inputs (Separate, 0.05 円 / min 0 / step 0.001) and revert byte for byte to 3205d03
+       version 3, carry the same inputs (Separate, 0.05 円 / min 0 / step 0.001) and revert byte for byte to 3205d03
        without GBJ-7; requests / loops / drawing unchanged; FVG reads the Engine baseSum / catCount; Gold, USDJPY and
        shared /6 unchanged
   GM : models — Pine ports of the predicate and of the scoring part of f_finalizeCluster (Swing max, Day H/L, Merge
@@ -15,7 +15,7 @@
   GU : mutations — High / Low crossed, strict boundary, naive float compare, raw centre / first price only, Confluence
        still double, Day subtracted uniformly, independent top Swing not blocking, previous-day H/L merged
 
-Evidence class: PINE_NOT_VERIFIED. TradingView compile, Library version 4 publish, Strategy Tester external.
+Evidence class: PINE_NOT_VERIFIED. TradingView compile, Library version 3 publish, Strategy Tester external.
 """
 import itertools
 import os
@@ -89,7 +89,7 @@ def gate_static():
           and "bool   dsMerge            = false" in GBE and "float  dsDist             = 0.05" in GBE)
     inp = lambda s, n: re.search(r"^" + n + r" = input\.\w+\((.*)$", s, re.M)
     cfg = ['zoneCfg.dsMerge              := dsMode == "Merge Nearby"\n', "zoneCfg.dsDist               := dsDist\n"]
-    check("GD-03 Visual and Strategy import Library version 4, same inputs Day/Swing Overlap Mode (default Separate, "
+    check("GD-03 Visual and Strategy import Library version 3, same inputs Day/Swing Overlap Mode (default Separate, "
           "Separate / Merge Nearby) and Merge Distance (0.05 円, minval 0, step 0.001, separate from Cluster Distance), "
           "same config lines; without the GBJ-7 edits both files are the " + PREV + " files byte for byte (no Swing "
           "request / tuple change, no pivot-time data)",
