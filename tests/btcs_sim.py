@@ -116,6 +116,18 @@ def allowed_code_line(line):
             or (s and s in [x.strip() for x in size_block.split("\n")]))
 
 
+BTC_SIM_OLD = '    new_ok = {bb.BTC_PATH, "tests/btc_build.py", "tests/btc_sim.py"}\n'
+BTC_SIM_NEW = ('    new_ok = {bb.BTC_PATH, "tests/btc_build.py", "tests/btc_sim.py",\n'
+               '              "ZoneStrategyBTCUSD.pine", "tests/btcs_build.py", "tests/btcs_sim.py"}   '
+               '# BTC Strategy (BTS-1 / BTS-2, own fixture btcs_sim)\n')
+
+
+def btc_sim_only_allowlist():
+    """tests/btc_sim.py may differ from f9d9440 only by its BS-15 allow-list admitting the BTC Strategy files."""
+    old = subprocess.run(["git", "-C", ROOT, "show", BASE + ":tests/btc_sim.py"], capture_output=True, text=True).stdout
+    return old.count(BTC_SIM_OLD) == 1 and rd("tests/btc_sim.py") == old.replace(BTC_SIM_OLD, BTC_SIM_NEW)
+
+
 def gate_static():
     check("SB-01 ZoneStrategyBTCUSD.pine == bts_transform(ZoneStrategyGBPJPY.pine); rebuild identical; strip_bts gives "
           "ZONE-ST-GBPJPY back byte for byte; strip_bts2 gives the BTS-1 file of commit 88488dc byte for byte",
@@ -244,8 +256,10 @@ def gate_static():
     out2 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BTS1_COMMIT, "--"], capture_output=True,
                           text=True).stdout.split()
     check(f"SB-17 existing files unchanged vs {BASE} (GBPJPY / USDJPY / Gold, Engines, BTC Visual and its build / sim, tests); "
-          "only the BTC Strategy files differ (also vs 88488dc for BTS-2)", subprocess.run(["git", "-C", ROOT, "cat-file", "-e", BASE]).returncode == 0
-          and not [f for f in out if f not in new_ok] and not [f for f in out2 if f not in new_ok], str((out, out2)))
+          "only the BTC Strategy files differ (also vs 88488dc for BTS-2); tests/btc_sim.py differs only by its BS-15 allow-list "
+          "line admitting the BTC Strategy files", subprocess.run(["git", "-C", ROOT, "cat-file", "-e", BASE]).returncode == 0
+          and not [f for f in out if f not in new_ok | {"tests/btc_sim.py"}]
+          and not [f for f in out2 if f not in new_ok | {"tests/btc_sim.py"}] and btc_sim_only_allowlist(), str((out, out2)))
     m1 = BTS.replace("if n * stQtyStep * lossU > budSym", "if false")
     m2 = BTS.replace('stDir = input.string("Long Only"', 'stDir = input.string("Both"')
     m3 = BTS.replace("zoneHalfWidth = input.float(50.0", "zoneHalfWidth = input.float(0.05")
