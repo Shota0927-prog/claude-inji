@@ -240,7 +240,8 @@ def gate_static():
           not re.search(r"dayofweek|session\.|input\.session", co) and not re.search(r"dayofweek|input\.session", code_only(GBJ)))
     out = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASE, "--"], capture_output=True, text=True).stdout.split()
     tracked = subprocess.run(["git", "-C", ROOT, "ls-files"], capture_output=True, text=True).stdout.split()
-    new_ok = {bb.BTC_PATH, "tests/btc_build.py", "tests/btc_sim.py"}
+    new_ok = {bb.BTC_PATH, "tests/btc_build.py", "tests/btc_sim.py",
+              "ZoneStrategyBTCUSD.pine", "tests/btcs_build.py", "tests/btcs_sim.py"}   # BTC Strategy (BTS-1 / BTS-2, own fixture btcs_sim)
     out2 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BTC2_COMMIT, "--"], capture_output=True,
                           text=True).stdout.split()
     out1 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BTC1_COMMIT, "--"], capture_output=True,

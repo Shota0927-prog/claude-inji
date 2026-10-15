@@ -1,4 +1,4 @@
-"""BTS-1 fixtures — ZoneStrategyBTCUSD.pine (CRYPTO:BTCUSD 5M Strategy, provisional / confirmed alerts and labels).
+"""BTS-1 / BTS-2 fixtures — ZoneStrategyBTCUSD.pine (CRYPTO:BTCUSD 5M Strategy, provisional / confirmed alerts and labels).
 
   SB : static — exact, idempotent build from ZONE-ST-GBPJPY; strip_bts(file) == ZONE-ST-GBPJPY byte for byte; every
        changed code line is a Zone input / RN line (the BTC Visual's own edits), SL Buffer / Breakeven inputs, the
@@ -11,6 +11,12 @@
   SM : models (Pine ports, not TradingView runs) — position size (JPY -> USD, floor, re-check, minimum, invalid), session
        boundaries 09:00 / 02:00 JST incl. weekends, alert / label text (USD), provisional / confirmed alert and label
        paths (provisional -> confirmed, provisional only, confirmed without provisional)
+  (SB / SM checks pin BTS-1 on BTS = strip_bts2(file) == commit 88488dc.)
+  SW : BTS-2 weekend exclusion — static delta (independent input default ON, session start day via hour / minute /
+       dayofweek on time_close, folded into stSessOK so new entries, provisional / confirmed alerts and labels and the
+       limit cancellation follow it; SL / TP / breakeven and Zone / FVG / BOS updates not gated; no request) and a model
+       over whole weeks: the specified examples, Fri -> Sat and Sun -> Mon boundaries, session limit x weekend ON / OFF,
+       changed session inputs (wrapping, non-wrapping, 24 h)
 
 The A / B / C / D logic, Long / Short / Both, previous-confirmed candidate reference and the confirmed-1M-only D
 processing are byte-identical to ZONE-ST-GBPJPY (SB-07); their models live in the existing st2 / st3 / stj / gbs / gbq /
@@ -37,7 +43,9 @@ ROOT = sb.ROOT
 BASE = "f9d9440"
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
 GBS = rd(sb.SRC_PATH)
-BTS = rd(sb.BTS_PATH)
+FULL = rd(sb.BTS_PATH)
+BTS1_COMMIT = "88488dc"
+BTS = sb.strip_bts2(FULL) or ""          # the BTS-1 file (BTS-2 weekend edits reverted)
 VIS = rd(bb.BTC_PATH)
 RESULTS = []
 
@@ -110,9 +118,11 @@ def allowed_code_line(line):
 
 def gate_static():
     check("SB-01 ZoneStrategyBTCUSD.pine == bts_transform(ZoneStrategyGBPJPY.pine); rebuild identical; strip_bts gives "
-          "ZONE-ST-GBPJPY back byte for byte",
-          bool(BTS) and sb.build() == BTS and sb.build() == sb.build() and sb.strip_bts(BTS) == GBS
-          and sb.bts_transform(sb.strip_bts(BTS)) == BTS)
+          "ZONE-ST-GBPJPY back byte for byte; strip_bts2 gives the BTS-1 file of commit 88488dc byte for byte",
+          bool(BTS) and sb.build() == FULL and sb.build() == sb.build() and sb.strip_bts(FULL) == GBS
+          and sb.bts_transform(sb.strip_bts(FULL)) == FULL and sb.bts1_transform(GBS) == BTS
+          and BTS == subprocess.run(["git", "-C", ROOT, "show", BTS1_COMMIT + ":" + sb.BTS_PATH],
+                                    capture_output=True, text=True).stdout)
     check("SB-02 edits tagged header / title / input / rn / entry / size / alert, each unique; the Zone edits are the BTC "
           "Visual's own btc_build.EDITS objects (kinds input / rn, all of them, same order)",
           all(k in ("header", "title", "input", "rn", "entry", "size", "alert") for k, _, _ in sb.EDITS)
@@ -231,9 +241,11 @@ def gate_static():
           and not re.search(r'"[A-Z0-9_]+:[A-Z0-9_.!]+"', co) and X not in BTS and "CRYPTO:BTCUSD" in BTS)
     out = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASE, "--"], capture_output=True, text=True).stdout.split()
     new_ok = {sb.BTS_PATH, "tests/btcs_build.py", "tests/btcs_sim.py"}
+    out2 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BTS1_COMMIT, "--"], capture_output=True,
+                          text=True).stdout.split()
     check(f"SB-17 existing files unchanged vs {BASE} (GBPJPY / USDJPY / Gold, Engines, BTC Visual and its build / sim, tests); "
-          "only the new BTC Strategy files are added", subprocess.run(["git", "-C", ROOT, "cat-file", "-e", BASE]).returncode == 0
-          and not [f for f in out if f not in new_ok], str(out))
+          "only the BTC Strategy files differ (also vs 88488dc for BTS-2)", subprocess.run(["git", "-C", ROOT, "cat-file", "-e", BASE]).returncode == 0
+          and not [f for f in out if f not in new_ok] and not [f for f in out2 if f not in new_ok], str((out, out2)))
     m1 = BTS.replace("if n * stQtyStep * lossU > budSym", "if false")
     m2 = BTS.replace('stDir = input.string("Long Only"', 'stDir = input.string("Both"')
     m3 = BTS.replace("zoneHalfWidth = input.float(50.0", "zoneHalfWidth = input.float(0.05")
@@ -378,8 +390,119 @@ def gate_model():
           "provisional label", sp0 == [] and fr0 == fr_ and sc0 == sc and sp1 == sp and all(f == "" for _, f in fr1))
 
 
+# ---- BTS-2: weekend exclusion -------------------------------------------------------------------------------------------
+def gate_weekend():
+    ga, ba = code_only(BTS).split("\n"), code_only(FULL).split("\n")
+    rem, add = [], []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ga, ba, autojunk=False).get_opcodes():
+        if op != "equal":
+            rem += [l.strip() for l in ga[i1:i2]]
+            add += [l.strip() for l in ba[j1:j2]]
+    exp_add = ['stNoWkend = input.bool(true, "Exclude Weekend New Entries (セッション開始日が土日)", group = G_STS,',
+               "f_stSessDow(int t) =>", "int mins = hour(t, stSessTz) * 60 + minute(t, stSessTz)",
+               "int s    = stSessStartH * 60 + stSessStartM", "int e    = stSessEndH * 60 + stSessEndM",
+               "dayofweek(s >= e and mins < e ? t - 86400000 : t, stSessTz)", "int  stSessDow = f_stSessDow(time_close)",
+               "bool stWkdOK   = not stNoWkend or (stSessDow != dayofweek.saturday and stSessDow != dayofweek.sunday)",
+               "bool stSessOK  = (not stUseSess or f_stInSession(time_close)) and stWkdOK"]
+    tips = [l for l in add if l.startswith(("tooltip = ", '"'))]
+    check("SW-01 BTS-2 code delta vs BTS-1 (88488dc): the weekend input (+ tooltip), f_stSessDow, stSessDow / stWkdOK and "
+          "stSessOK now AND-ed with stWkdOK; the old stSessOK line is the only removed line; f_stInSession unchanged",
+          rem == ["bool stSessOK = not stUseSess or f_stInSession(time_close)"]
+          and sorted(l for l in add if l not in tips) == sorted(exp_add) and len(tips) == 3
+          and func(FULL, "f_stInSession(int t) =>") == func(BTS, "f_stInSession(int t) =>"), str((rem, add)))
+    co, co1 = code_only(FULL), code_only(BTS)
+    uses = lambda t: re.findall(r"^.*\bstSessOK\b.*$", t, re.M)
+    check("SW-02 scope: stSessOK is used exactly where it was (limit cancellation `not pendOK or not stSessOK`, new-entry "
+          "gate (4) whose order branch sends the confirmed alert / label, provisional gate stPvGate, data-window plot), so "
+          "the weekend rule reaches all of them; SL / TP / breakeven ((1) fill check, (2b), (2c)) and the Zone / FVG / D 1M "
+          "processing do not read stSessOK / stWkdOK",
+          uses(co)[1:] == uses(co1)[1:] and len(uses(co)) == 5
+          and "    if oState == 1 and (not pendOK or not stSessOK)" in co and "    if oState == 0 and not cancelBar and stSessOK" in co
+          and "bool  stPvGate = is5mChart and not barstate.isconfirmed and oState == 0 and stSessOK" in co
+          and co.count("stWkdOK") == 2 and co.count("stNoWkend") == 2
+          and not re.search(r"stSessOK|stWkdOK", code_only(seg(FULL, "    // (1) 発注済み Entry", "    // (2d) D:")))
+          and not re.search(r"stSessOK|stWkdOK", code_only(seg(FULL, "    // (2d) D:", "    // (3) 保留中の指値")))
+          and "strategy.exit(oXid, oEid, stop = oStop, limit = oTP)" in seg(FULL, "    // (1) 発注済み Entry", "    // (2d) D:"))
+    v = input_values(FULL)
+    req = lambda t: re.findall(r"request\.\w+\(", code_only(t))
+    check("SW-03 independent input, default ON (not derived from Limit New Entries to Session); date logic uses only "
+          "time_close with hour / minute / dayofweek in the session timezone (Asia/Tokyo) — no request added, no timenow",
+          v["stNoWkend"] == "true" and v["stUseSess"] == "true" and req(FULL) == req(BTS) and len(req(FULL)) == 11
+          and "stNoWkend" not in func(FULL, "f_stInSession(int t) =>") and "timenow" not in func(FULL, "f_stSessDow(int t) =>"))
+    m = FULL.replace("bool stSessOK  = (not stUseSess or f_stInSession(time_close)) and stWkdOK",
+                     "bool stSessOK  = not stUseSess or (f_stInSession(time_close) and stWkdOK)")
+    check("SW-04 mutation: tying the weekend rule to the session limit (OFF would silently drop it) is detected",
+          "bool stSessOK  = (not stUseSess or f_stInSession(time_close)) and stWkdOK" not in m and sb.strip_bts2(m) is None)
+
+
+def sess_dow(t, sh=9, sm=0, eh=2, em=0, tz="Asia/Tokyo"):
+    """port of f_stSessDow: ISO weekday (Mon = 1 ... Sun = 7) of the session start day."""
+    lt = t.astimezone(ZoneInfo(tz))
+    mins, s, e = lt.hour * 60 + lt.minute, sh * 60 + sm, eh * 60 + em
+    return (lt - dt.timedelta(days=1)).isoweekday() if (s >= e and mins < e) else lt.isoweekday()
+
+
+def sess_ok(t, use_sess=True, no_wkend=True, **kw):
+    """port of stSessOK (BTS-2)."""
+    return (not use_sess or in_session(t, **kw)) and (not no_wkend or sess_dow(t, **kw) not in (6, 7))
+
+
+def expected_by_starts(t, sh, sm, eh, em, tz="Asia/Tokyo"):
+    """independent reference for limit ON + weekend ON: enumerate the session windows by their start day D
+    ([D + start, D + start + length), length = (end - start) mod 24 h, 24 h if equal) and allow t when it lies in the
+    window of a Mon-Fri start day."""
+    lt = t.astimezone(ZoneInfo(tz))
+    length = ((eh * 60 + em) - (sh * 60 + sm)) % 1440 or 1440
+    for back in (0, 1):
+        d = (lt - dt.timedelta(days=back)).date()
+        st = dt.datetime(d.year, d.month, d.day, sh, sm, tzinfo=ZoneInfo(tz))
+        if st <= lt < st + dt.timedelta(minutes=length):
+            return d.isoweekday() <= 5
+    return False
+
+
+def gate_weekend_model():
+    J = ZoneInfo("Asia/Tokyo")
+    t = lambda d, h, mi: dt.datetime(2026, 10, d, h, mi, tzinfo=J)      # 2026-10-09 = Friday, 10 Sat, 11 Sun, 12 Mon
+    spec = {"Fri 09:00": (t(9, 9, 0), True), "Sat 01:55": (t(10, 1, 55), True), "Sat 02:00": (t(10, 2, 0), False),
+            "Sat 09:00": (t(10, 9, 0), False), "Mon 01:55": (t(12, 1, 55), False), "Mon 09:00": (t(12, 9, 0), True)}
+    got = {k: sess_ok(v[0]) for k, v in spec.items()}
+    sun = all(not sess_ok(t(11, h, mi)) for h in range(24) for mi in range(0, 60, 5))
+    check("SW-05 [model] the specified examples (defaults, bar close time JST): Fri 09:00 allowed, Sat 01:55 allowed (Friday "
+          "session), Sat 02:00 / Sat 09:00 blocked, Sunday blocked all day (every 5 min), Mon 01:55 blocked (Sunday "
+          "session), Mon 09:00 allowed", all(got[k] == v[1] for k, v in spec.items()) and sun,
+          str({k: v for k, v in got.items() if v != spec[k][1]}))
+    edges = {"Fri 08:55": (t(9, 8, 55), False), "Fri 23:55": (t(9, 23, 55), True), "Sat 00:00": (t(10, 0, 0), True),
+             "Sat 01:59": (t(10, 1, 59), True), "Sun 00:00": (t(11, 0, 0), False), "Sun 23:55": (t(11, 23, 55), False),
+             "Mon 00:00": (t(12, 0, 0), False), "Mon 02:00": (t(12, 2, 0), False), "Mon 08:55": (t(12, 8, 55), False),
+             "Tue 01:55": (t(13, 1, 55), True), "Thu 01:55": (t(15, 1, 55), True)}
+    g2 = {k: sess_ok(v[0]) for k, v in edges.items()}
+    check("SW-06 [model] boundaries Fri -> Sat and Sun -> Mon: Fri 08:55 out, Fri 23:55 / Sat 00:00 / Sat 01:59 in, Sun 00:00 "
+          "- 23:55 out, Mon 00:00 / 02:00 / 08:55 out, Tue 01:55 (Monday session) in, Thu 01:55 in",
+          all(g2[k] == v[1] for k, v in edges.items()), str({k: v for k, v in g2.items() if v != edges[k][1]}))
+    week = [dt.datetime(2026, 10, 5, 0, 0, tzinfo=J) + dt.timedelta(minutes=5 * i) for i in range(7 * 288 + 288)]
+    on_on = all(sess_ok(x) == expected_by_starts(x, 9, 0, 2, 0) for x in week)
+    on_off = all(sess_ok(x, no_wkend=False) == in_session(x) for x in week)
+    rule = lambda x: (x.isoweekday() <= 5 and not (x.isoweekday() == 1 and x.hour < 2)) or (x.isoweekday() == 6 and x.hour < 2)
+    off_on = all(sess_ok(x, use_sess=False) == rule(x) for x in week)
+    off_off = all(sess_ok(x, use_sess=False, no_wkend=False) for x in week)
+    check("SW-07 [model] combinations over 8 days at 5-min steps: limit ON + weekend ON == the independent window "
+          "enumeration (Mon-Fri start days only); limit ON + weekend OFF == the previous session rule unchanged; limit "
+          "OFF + weekend ON still excludes the weekend (Sat 00:00-01:59 belongs to Friday, Sat 02:00 - Mon 01:59 blocked); "
+          "both OFF -> always allowed", on_on and on_off and off_on and off_off, str((on_on, on_off, off_on, off_off)))
+    alt = []
+    for (sh, sm, eh, em) in ((22, 0, 6, 0), (9, 0, 17, 0), (9, 0, 9, 0), (0, 0, 0, 0), (20, 30, 0, 30), (8, 15, 1, 45)):
+        alt.append(((sh, sm, eh, em), all(sess_ok(x, sh=sh, sm=sm, eh=eh, em=em) == expected_by_starts(x, sh, sm, eh, em)
+                                          for x in week)))
+    s22 = [sess_ok(t(10, 5, 55), sh=22, eh=6), sess_ok(t(10, 6, 0), sh=22, eh=6), sess_ok(t(12, 5, 55), sh=22, eh=6),
+           sess_ok(t(12, 22, 0), sh=22, eh=6)]
+    check("SW-08 [model] changed session inputs keep the start-day rule (== window enumeration): 22:00-06:00 (Sat 05:55 in as "
+          "Friday's, Sat 06:00 out, Mon 05:55 out as Sunday's, Mon 22:00 in), 09:00-17:00 (no wrap), 24 h 09:00-09:00, "
+          "00:00-00:00, 20:30-00:30, 08:15-01:45", all(ok for _, ok in alt) and s22 == [True, False, False, True], str((alt, s22)))
+
+
 def main():
-    for g in (gate_static, gate_model):
+    for g in (gate_static, gate_model, gate_weekend, gate_weekend_model):
         try:
             g()
         except Exception:

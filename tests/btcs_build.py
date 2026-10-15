@@ -1,4 +1,4 @@
-"""BTS-1 — ZoneStrategyBTCUSD.pine: CRYPTO:BTCUSD 5M Strategy with provisional / confirmed alerts and labels.
+"""BTS-1 / BTS-2 — ZoneStrategyBTCUSD.pine: CRYPTO:BTCUSD 5M Strategy with provisional / confirmed alerts and labels.
 
 Deterministic transform of ZoneStrategyGBPJPY.pine (ZONE-ST-GBPJPY) by exact, unique text replacements (EDITS);
 strip_bts() applies them in reverse and must give ZONE-ST-GBPJPY back byte for byte (fixture btcs_sim), so the Entry
@@ -14,6 +14,13 @@ confirmed alert gating and the labels are provably ZONE-ST-GBPJPY's.
             loss per unit = SL distance x syminfo.pointvalue, quantity step / minimum inputs (0.01 = unverified assumption,
             not the broker's lot spec), floor, re-check loss <= budget, invalid -> no order
   alert     SL distance shown as a USD price difference (format.mintick) instead of pips
+EDITS2 (BTS-2, applied after EDITS; strip_bts2() reverses it -> the BTS-1 file of commit 88488dc byte for byte):
+  weekend   independent input (default ON) excluding new entries whose session start day (Asia/Tokyo, session
+            timezone) is Saturday / Sunday. With start > end (or start == end) the part from 00:00 to the end time
+            (end exclusive) belongs to the previous day's session. Folded into stSessOK, so it applies to new entries,
+            the provisional / confirmed alerts and labels (the confirmed ones stay in the order branch) and the
+            cancellation of an unfilled limit; open positions (SL / TP / breakeven) and the Zone / FVG / BOS updates are
+            not gated. Uses the bar's time_close and hour / minute / dayofweek only (no request).
 ZONE-ST-GBPJPY, the BTC Visual, the other Visuals / Strategies and the Engines are not modified.
 """
 import os
@@ -122,6 +129,34 @@ EDITS = [
 ]
 
 
+# ---- BTS-2: weekend exclusion for new entries (session start day Sat / Sun), applied after EDITS -------------------------
+EDITS2 = [
+    ("header",
+     "//   実データはすべて syminfo.tickerid (取引所・銘柄の固定参照なし)。土日も通常どおり処理する。\n",
+     "//   実データはすべて syminfo.tickerid (取引所・銘柄の固定参照なし)。土日も Zone / FVG / BOS の更新と保有中の\n"
+     "//   SL / TP / 建値管理は続ける。新規 Entry は週末除外 (BTS-2、初期 ON) でセッション開始日が土日の分を制限する。\n"),
+    ("weekend",
+     'stSessEndM = input.int(0, "Session End Minute", minval = 0, maxval = 59, group = G_STS)\n',
+     'stSessEndM = input.int(0, "Session End Minute", minval = 0, maxval = 59, group = G_STS)\n'
+     'stNoWkend = input.bool(true, "Exclude Weekend New Entries (セッション開始日が土日)", group = G_STS,\n'
+     '     tooltip = "セッション開始日 (Session Timezone) が土曜・日曜の新規 Entry / 仮・確定アラート / ラベルを出さず、未約定の指値は取り消す。\\n" +\n'
+     '     "日付またぎのセッションでは 0 時から終了時刻まで (終了は含まない) を前日のセッションとする (初期値: 土曜 00:00〜01:59 は金曜分として許可)。\\n" +\n'
+     '     "時間制限 (Limit New Entries to Session) とは独立。保有中の SL / TP / 建値管理と Zone / FVG / BOS の更新は止めない。")\n'),
+    ("weekend",
+     "bool stSessOK = not stUseSess or f_stInSession(time_close)\n",
+     "// 週末除外: セッション開始日の曜日。開始 > 終了 (日付またぎ) と 開始 == 終了 (終日) では、0 時から終了時刻まで\n"
+     "//  (終了を含まない) は前日のセッションに属する (1 日前の同時刻の曜日)。時刻は判定足の終了時刻 (time_close)。request なし\n"
+     "f_stSessDow(int t) =>\n"
+     "    int mins = hour(t, stSessTz) * 60 + minute(t, stSessTz)\n"
+     "    int s    = stSessStartH * 60 + stSessStartM\n"
+     "    int e    = stSessEndH * 60 + stSessEndM\n"
+     "    dayofweek(s >= e and mins < e ? t - 86400000 : t, stSessTz)\n"
+     "int  stSessDow = f_stSessDow(time_close)\n"
+     "bool stWkdOK   = not stNoWkend or (stSessDow != dayofweek.saturday and stSessDow != dayofweek.sunday)\n"
+     "bool stSessOK  = (not stUseSess or f_stInSession(time_close)) and stWkdOK\n"),
+]
+
+
 def _apply(src, edits):
     out = src
     for _, a, b in edits:
@@ -139,13 +174,23 @@ def _revert(text, edits):
     return out
 
 
-def bts_transform(src):
+def bts1_transform(src):
+    """BTS-1 only (commit 88488dc)."""
     return _apply(src, EDITS)
 
 
+def bts_transform(src):
+    return _apply(bts1_transform(src), EDITS2)
+
+
+def strip_bts2(bts):
+    """reverse only the BTS-2 weekend edits (-> the BTS-1 file byte for byte)."""
+    return _revert(bts, EDITS2)
+
+
 def strip_bts(bts):
-    """reverse every BTS-1 edit (-> ZoneStrategyGBPJPY.pine byte for byte)."""
-    return _revert(bts, EDITS)
+    """reverse the BTS-2 and BTS-1 edits (-> ZoneStrategyGBPJPY.pine byte for byte)."""
+    return _revert(strip_bts2(bts), EDITS)
 
 
 def build():
