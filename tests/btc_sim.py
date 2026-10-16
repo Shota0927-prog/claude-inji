@@ -238,13 +238,13 @@ def gate_static():
           and "showGeom   = input.bool(true,  \"Label: Zone 上下限 / 幅 (USD) を表示\"" in BTC)
     check("BS-14 no weekday exclusion added (dayofweek / session filters absent, as in ZONE-GBPJPY)",
           not re.search(r"dayofweek|session\.|input\.session", co) and not re.search(r"dayofweek|input\.session", code_only(GBJ)))
-    out = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASE, "--"], capture_output=True, text=True).stdout.split()
+    out = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BASE, "--"], capture_output=True, text=True).stdout.split()
     tracked = subprocess.run(["git", "-C", ROOT, "ls-files"], capture_output=True, text=True).stdout.split()
     new_ok = {bb.BTC_PATH, "tests/btc_build.py", "tests/btc_sim.py",
               "ZoneStrategyBTCUSD.pine", "tests/btcs_build.py", "tests/btcs_sim.py"}   # BTC Strategy (BTS-1 / BTS-2, own fixture btcs_sim)
-    out2 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BTC2_COMMIT, "--"], capture_output=True,
+    out2 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BTC2_COMMIT, "--"], capture_output=True,
                           text=True).stdout.split()
-    out1 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BTC1_COMMIT, "--"], capture_output=True,
+    out1 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BTC1_COMMIT, "--"], capture_output=True,
                           text=True).stdout.split()
     check(f"BS-15 existing files unchanged vs base HEAD {BASE} (GBPJPY / USDJPY / Gold Visuals, Strategies, Engines, "
           "tests) and vs f326724 / a36c3e8 (BTC-2 / BTC-3 touch only the BTC Visual / build / sim); ZoneVisualGBPJPY.pine and "

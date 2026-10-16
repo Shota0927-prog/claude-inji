@@ -123,9 +123,16 @@ BTC_SIM_NEW = ('    new_ok = {bb.BTC_PATH, "tests/btc_build.py", "tests/btc_sim.
 
 
 def btc_sim_only_allowlist():
-    """tests/btc_sim.py may differ from f9d9440 only by its BS-15 allow-list admitting the BTC Strategy files."""
+    """tests/btc_sim.py may differ from f9d9440 only by its BS-15 allow-list admitting the BTC Strategy files and the
+    --diff-filter=MDR on its git-diff checks."""
     old = subprocess.run(["git", "-C", ROOT, "show", BASE + ":tests/btc_sim.py"], capture_output=True, text=True).stdout
-    return old.count(BTC_SIM_OLD) == 1 and rd("tests/btc_sim.py") == old.replace(BTC_SIM_OLD, BTC_SIM_NEW)
+    # EU-1: its git-diff checks also gained --diff-filter=MDR (new files elsewhere are allowed; modified / deleted
+    # existing files still fail), as in the other fixtures
+    exp = old.replace(BTC_SIM_OLD, BTC_SIM_NEW)
+    for c in ("BASE", "BTC2_COMMIT", "BTC1_COMMIT"):
+        exp = exp.replace(f'["git", "-C", ROOT, "diff", "--name-only", {c}, "--"]',
+                          f'["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", {c}, "--"]')
+    return old.count(BTC_SIM_OLD) == 1 and rd("tests/btc_sim.py") == exp
 
 
 def gate_static():
@@ -251,9 +258,9 @@ def gate_static():
     check("SB-16 data only from syminfo.tickerid (11 requests), no exchange-prefixed literal, no " + X + " text",
           len(reqs) == 11 and all(a.strip() == "syminfo.tickerid" for _, a in reqs)
           and not re.search(r'"[A-Z0-9_]+:[A-Z0-9_.!]+"', co) and X not in BTS and "CRYPTO:BTCUSD" in BTS)
-    out = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASE, "--"], capture_output=True, text=True).stdout.split()
+    out = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BASE, "--"], capture_output=True, text=True).stdout.split()
     new_ok = {sb.BTS_PATH, "tests/btcs_build.py", "tests/btcs_sim.py"}
-    out2 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BTS1_COMMIT, "--"], capture_output=True,
+    out2 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BTS1_COMMIT, "--"], capture_output=True,
                           text=True).stdout.split()
     check(f"SB-17 existing files unchanged vs {BASE} (GBPJPY / USDJPY / Gold, Engines, BTC Visual and its build / sim, tests); "
           "only the BTC Strategy files differ (also vs 88488dc for BTS-2); tests/btc_sim.py differs only by its BS-15 allow-list "
