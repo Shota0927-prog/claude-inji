@@ -1,4 +1,4 @@
-"""EU-1 — EURUSD port of the GBPJPY trio (OANDA:EURUSD 5M): Engine library, Zone Visual, Strategy.
+"""EU-1 / EU-2 — EURUSD port of the GBPJPY trio (OANDA:EURUSD 5M): Engine library, Zone Visual, Strategy.
 
 Deterministic transforms by exact, unique text replacements; each strip_*() applies its edits in reverse and must give
 the GBPJPY source back byte for byte (fixture eu_sim):
@@ -17,6 +17,11 @@ Kinds (eu_sim checks the code lines each kind touches):
 Price-difference defaults are verification starting values set from a daily-volatility comparison (not validated with
 5M ATR, not optimised). Scores, ratios, days, bar counts, lengths and timeframes are unchanged. The GBPJPY files and
 every other file are not modified.
+EU-2 (applied after EU-1; strip_*2() reverses only EU-2 -> the EU-1 files of commit d3b68b7 byte for byte): adopted
+defaults after the user's EURUSD verification. Zone (Visual and Strategy, ZONE_DEFAULT_EDITS): Break Buffer 0.00050,
+Slope 0.00002 / 0.00004, Slope aggregation Max, Day H/L score 1, Accum scores 2 / 3 / 4, adopted labels for HW /
+Cluster / Break / Flip / Slope / FVG. Strategy (STRATEGY_DEFAULT_EDITS): Entry B, Short Only, RR 1.5, SL Buffer label.
+Defaults only: no logic, Engine, import, Accum detection, Zone width definition or other symbol is changed.
 """
 import os
 
@@ -283,6 +288,90 @@ STRATEGY_EDITS = [
 ]
 
 
+# ---- EU-2: adopted defaults (applied after EU-1) --------------------------------------------------------------------
+ADOPT = "EURUSD 検証後の採用初期値 (最適値・将来の有効性を保証するものではない)"
+ZONE_DEFAULT_EDITS = [
+    ("default",
+     'zoneHalfWidth = input.float(0.00020, "[検証開始値] Zone Half Width (USD)", minval = 0.00001, step = 0.00005, group = G_ZONE,\n',
+     'zoneHalfWidth = input.float(0.00020, "[採用初期値] Zone Half Width (USD)", minval = 0.00001, step = 0.00005, group = G_ZONE,\n'),
+    ("default",
+     '     "EURUSD: 1 pip = 0.0001。初期 0.00020 = 2 pips (Visual / Strategy 共通)。日次ボラの比較から決めた検証開始値で、5分足 ATR で検証した値・最適値ではない。")\n',
+     '     "EURUSD: 1 pip = 0.0001。初期 0.00020 = 各 RawZone の半幅 2 pips (Visual / Strategy 共通)。' + ADOPT + '。")\n'),
+    ("default",
+     'slopeThrMod = input.float(0.00004, "[検証開始値] Slope Threshold · Moderate (USD/lookback)", minval = 0.0, step = 0.00001, group = G_SLOPE,\n'
+     '     tooltip = "Slope Lookback 本数の間の MA の価格差。初期 0.00004 = 0.4 pips (検証開始値)。lookback 本数・計算式は変えない。")\n'
+     'slopeThrStrong = input.float(0.00008, "[検証開始値] Slope Threshold · Strong (USD/lookback)",   minval = 0.0, step = 0.00001, group = G_SLOPE,\n'
+     '     tooltip = "Slope Lookback 本数の間の MA の価格差。初期 0.00008 = 0.8 pips (検証開始値)。")\n',
+     'slopeThrMod = input.float(0.00002, "[採用初期値] Slope Threshold · Moderate (USD/lookback)", minval = 0.0, step = 0.00001, group = G_SLOPE,\n'
+     '     tooltip = "Slope Lookback 本数の間の MA の価格差。初期 0.00002 = 0.2 pips (' + ADOPT + ')。lookback 本数・計算式は変えない。")\n'
+     'slopeThrStrong = input.float(0.00004, "[採用初期値] Slope Threshold · Strong (USD/lookback)",   minval = 0.0, step = 0.00001, group = G_SLOPE,\n'
+     '     tooltip = "Slope Lookback 本数の間の MA の価格差。初期 0.00004 = 0.4 pips (' + ADOPT + ')。")\n'),
+    ("default",
+     'slopeBonusMode = input.string("Sum (per MA)", "Slope Bonus Aggregation in Cluster",\n',
+     'slopeBonusMode = input.string("Max", "Slope Bonus Aggregation in Cluster",\n'),
+    ("default",
+     'scoreDayHL = input.float(2.0, "Base Score · Day High / Low", step = 0.5, group = G_DHL)\n',
+     'scoreDayHL = input.float(1.0, "Base Score · Day High / Low", step = 0.5, group = G_DHL)\n'),
+    ("default",
+     'scoreAcc1 = input.float(3.0, "Base Score · TF #1 Accum", step = 0.5, group = G_ACC)\n'
+     'scoreAcc2 = input.float(4.0, "Base Score · TF #2 Accum", step = 0.5, group = G_ACC)\n'
+     'scoreAcc3 = input.float(5.0, "Base Score · TF #3 Accum", step = 0.5, group = G_ACC)\n',
+     'scoreAcc1 = input.float(2.0, "Base Score · TF #1 Accum", step = 0.5, group = G_ACC)\n'
+     'scoreAcc2 = input.float(3.0, "Base Score · TF #2 Accum", step = 0.5, group = G_ACC)\n'
+     'scoreAcc3 = input.float(4.0, "Base Score · TF #3 Accum", step = 0.5, group = G_ACC)\n'),
+    ("default",
+     'clusterDist = input.float(0.00030, "[検証開始値] Cluster Distance (USD)", minval = 0.0, step = 0.00005, group = G_CLU,\n'
+     '     tooltip = "EURUSD: 初期 0.00030 = 3 pips (日次ボラ比較からの検証開始値、最適値ではない)。")\n',
+     'clusterDist = input.float(0.00030, "[採用初期値] Cluster Distance (USD)", minval = 0.0, step = 0.00005, group = G_CLU,\n'
+     '     tooltip = "EURUSD: 初期 0.00030 = 3 pips (' + ADOPT + ')。")\n'),
+    ("default",
+     'breakBuffer = input.float(0.00030,  "[検証開始値] Break Buffer (USD・初期 3 pips)",         minval = 0.0, step = 0.00005, group = G_BF)\n'
+     'flipConfirmDist = input.float(0.00060, "[検証開始値] Flip Confirm Distance (USD・初期 6 pips)", minval = 0.0, step = 0.0001, group = G_BF)\n',
+     'breakBuffer = input.float(0.00050,  "[採用初期値] Break Buffer (USD・初期 5 pips)",         minval = 0.0, step = 0.00005, group = G_BF)\n'
+     'flipConfirmDist = input.float(0.00060, "[採用初期値] Flip Confirm Distance (USD・初期 6 pips)", minval = 0.0, step = 0.0001, group = G_BF)\n'),
+    ("default",
+     'fvgMinWidth = input.float(0.00020, "[検証開始値] FVG Min Width (USD)", minval = 0.0, step = 0.00005, group = "02 · FVG (EURUSD)",\n'
+     '     tooltip = "15M / 1H / 4H FVG の最小幅 (mintick 正規化後に以上)。\\n" +\n'
+     '     "EURUSD: 初期 0.00020 = 2 pips (日次ボラ比較からの検証開始値、最適値ではない)。")\n',
+     'fvgMinWidth = input.float(0.00020, "[採用初期値] FVG Min Width (USD)", minval = 0.0, step = 0.00005, group = "02 · FVG (EURUSD)",\n'
+     '     tooltip = "15M / 1H / 4H FVG の最小幅 (mintick 正規化後に以上)。\\n" +\n'
+     '     "EURUSD: 初期 0.00020 = 2 pips (' + ADOPT + ')。")\n'),
+]
+
+VISUAL_EDITS2 = [
+    ("header",
+     "//  Day/Swing Merge 2 / MA Cluster 12 / Slope 0.4・0.8 pips。点数・比率・日数・本数・時間足は ZONE-GBPJPY と同じ。\n",
+     "//  Day/Swing Merge 2 / MA Cluster 12 / Slope 0.4・0.8 pips。点数・比率・日数・本数・時間足は ZONE-GBPJPY と同じ。\n"
+     "//  EU-2 (EURUSD 検証後の採用初期値、Strategy と共通。最適値・将来の有効性を保証するものではない): Break Buffer 5 pips、\n"
+     "//  Slope 0.2・0.4 pips、Slope Bonus Aggregation Max、Day H/L Score 1、Accum Score 2 / 3 / 4 (他は上記のまま)。\n"),
+] + ZONE_DEFAULT_EDITS
+
+STRATEGY_EDITS2 = [
+    ("header",
+     "//  (固定 USDJPY なし)。次足成行・ギャップ・スリッページがあるため、実損失が必ず予算内とは限らない。\n",
+     "//  (固定 USDJPY なし)。次足成行・ギャップ・スリッページがあるため、実損失が必ず予算内とは限らない。\n"
+     "//  EU-2 (EURUSD 検証後の採用初期値。最適値・将来の有効性を保証するものではない): Entry B: Confirmed Rejection、\n"
+     "//  Short Only (Long Only / Both・A〜D は選択可)、固定 RR 1.5、SL Buffer 3 pips。Zone の初期値は ZONE-EURUSD と共通\n"
+     "//  (Break Buffer 5 pips、Slope 0.2・0.4 pips、Slope Bonus Max、Day H/L Score 1、Accum Score 2 / 3 / 4)。\n"),
+] + ZONE_DEFAULT_EDITS + [
+    ("default",
+     'stMode = input.string("D: 1M BOS Rebound", "Entry Mode",\n',
+     'stMode = input.string("B: Confirmed Rejection", "Entry Mode",\n'),
+    ("default",
+     'stDir = input.string("Long Only", "Direction", options = ["Long Only", "Short Only", "Both"], group = G_ST)\n',
+     'stDir = input.string("Short Only", "Direction", options = ["Long Only", "Short Only", "Both"], group = G_ST)\n'),
+    ("default",
+     'stBuffer = input.float(0.00030, "[検証開始値] SL Buffer (USD)", minval = 0.0, step = 0.00005, group = G_ST,\n',
+     'stBuffer = input.float(0.00030, "[採用初期値] SL Buffer (USD)", minval = 0.0, step = 0.00005, group = G_ST,\n'),
+    ("default",
+     '     "初期 0.00030 = 3 pips (日次ボラ比較からの検証開始値)。")\n',
+     '     "初期 0.00030 = 3 pips (' + ADOPT + ')。")\n'),
+    ("default",
+     'stRR = input.float(1.2, "TP Fixed RR", minval = 0.1, step = 0.1, group = G_STT)\n',
+     'stRR = input.float(1.5, "TP Fixed RR", minval = 0.1, step = 0.1, group = G_STT)\n'),
+]
+
+
 def _apply(src, edits):
     out = src
     for _, a, b in edits:
@@ -308,11 +397,31 @@ def build_engine():
 
 
 def build_visual():
-    return _apply(_rd(VIS_SRC), VISUAL_EDITS)
+    return _apply(_apply(_rd(VIS_SRC), VISUAL_EDITS), VISUAL_EDITS2)
 
 
 def build_strategy():
+    return _apply(_apply(_rd(STR_SRC), STRATEGY_EDITS), STRATEGY_EDITS2)
+
+
+def build_visual1():
+    """EU-1 only (commit d3b68b7)."""
+    return _apply(_rd(VIS_SRC), VISUAL_EDITS)
+
+
+def build_strategy1():
+    """EU-1 only (commit d3b68b7)."""
     return _apply(_rd(STR_SRC), STRATEGY_EDITS)
+
+
+def strip_visual2(t):
+    """reverse only the EU-2 defaults (-> the EU-1 Visual byte for byte)."""
+    return _revert(t, VISUAL_EDITS2)
+
+
+def strip_strategy2(t):
+    """reverse only the EU-2 defaults (-> the EU-1 Strategy byte for byte)."""
+    return _revert(t, STRATEGY_EDITS2)
 
 
 def strip_engine(t):
@@ -320,11 +429,11 @@ def strip_engine(t):
 
 
 def strip_visual(t):
-    return _revert(t, VISUAL_EDITS)
+    return _revert(strip_visual2(t), VISUAL_EDITS)
 
 
 def strip_strategy(t):
-    return _revert(t, STRATEGY_EDITS)
+    return _revert(strip_strategy2(t), STRATEGY_EDITS)
 
 
 if __name__ == "__main__":

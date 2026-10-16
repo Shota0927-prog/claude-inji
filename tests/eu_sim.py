@@ -1,4 +1,4 @@
-"""EU-1 fixtures — EURUSD port (ZoneEnginePracticalEURUSD / ZoneVisualEURUSD / ZoneStrategyEURUSD, OANDA:EURUSD 5M).
+"""EU-1 / EU-2 fixtures — EURUSD port (ZoneEnginePracticalEURUSD / ZoneVisualEURUSD / ZoneStrategyEURUSD, OANDA:EURUSD 5M).
 
   ES : static — each file == its eu_build transform of the GBPJPY source and strips back byte for byte; every changed code
        line is a name / import, a USD price input, an RN line, the Zone geometry text, the position-size block or the pip
@@ -12,6 +12,12 @@
        USDJPY 150 / 10 pips -> 0.60 lot example), invalid / below-minimum, RN tick-integer search vs exact decimals at
        0.0100 / 0.0050 boundaries (and the old float search missing them), major-first, out of range, OFF, step validation,
        alert and label text
+
+  (ES / EM pin EU-1 on the files with the EU-2 defaults reverted, == commit d3b68b7.)
+  ED : EU-2 adopted defaults — strip_*2 gives d3b68b7 back; the only code delta is the specified default literals and
+       their labels / tooltips; Visual and Strategy Zone defaults identical; the specified table values; every other
+       input (MA / Swing / Accum detection and keep, Touch, Day/Swing distance, MA cluster, TP-zone RR, lots ...)
+       unchanged; Engine / import / logic unchanged; only the EURUSD Visual / Strategy and their build / test changed
 
 Evidence class: PINE_NOT_VERIFIED (library publish, TradingView compile / backtest / alerts / labels external).
 """
@@ -33,7 +39,9 @@ BASE = "4c53b87"
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
 show = lambda p, rev=BASE: subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{p}"], capture_output=True, text=True).stdout
 GE, GV, GS = rd(eb.ENG_SRC), rd(eb.VIS_SRC), rd(eb.STR_SRC)
-EE, EV, ES = rd(eb.ENG_PATH), rd(eb.VIS_PATH), rd(eb.STR_PATH)
+EE, FV, FS = rd(eb.ENG_PATH), rd(eb.VIS_PATH), rd(eb.STR_PATH)
+EU1 = "d3b68b7"
+EV, ES = eb.strip_visual2(FV) or "", eb.strip_strategy2(FS) or ""     # EU-1 layer (EU-2 defaults reverted)
 RESULTS = []
 
 
@@ -131,8 +139,9 @@ def allowed_zone_line(s):
 def gate_static():
     check("ES-01 the three EURUSD files == eu_build transforms of the GBPJPY sources (rebuild identical) and strip back to "
           "ZoneEnginePracticalGBPJPY / ZoneVisualGBPJPY / ZoneStrategyGBPJPY byte for byte",
-          all([EE, EV, ES]) and eb.build_engine() == EE and eb.build_visual() == EV and eb.build_strategy() == ES
-          and eb.strip_engine(EE) == GE and eb.strip_visual(EV) == GV and eb.strip_strategy(ES) == GS)
+          all([EE, EV, ES]) and eb.build_engine() == EE and eb.build_visual() == FV and eb.build_strategy() == FS
+          and eb.build_visual1() == EV and eb.build_strategy1() == ES
+          and eb.strip_engine(EE) == GE and eb.strip_visual(FV) == GV and eb.strip_strategy(FS) == GS)
     kinds = ("header", "name", "input", "rn", "display", "size", "alert")
     check("ES-02 every edit is tagged (header / name / input / rn / display / size / alert) and unique; the Zone edits are the "
           "same objects in the Visual and the Strategy lists",
@@ -273,6 +282,78 @@ def gate_static():
           "fixtures, whose only change is --diff-filter=MDR on their git-diff checks (new files no longer fail them)",
           set(mod) <= {"tests/btc_sim.py", "tests/btcs_sim.py"} and rd("tests/btc_sim.py") == exp_btc
           and rd("tests/btcs_sim.py") == exp_bts and exp_bts != show("tests/btcs_sim.py"), str(mod))
+
+
+# ---- EU-2: adopted defaults -------------------------------------------------------------------------------------------
+EU2_ZONE = {"zoneHalfWidth": "0.00020", "clusterDist": "0.00030", "breakBuffer": "0.00050", "flipConfirmDist": "0.00060",
+            "slopeThrMod": "0.00002", "slopeThrStrong": "0.00004", "slopeBonusMode": '"Max"', "scoreMa1": "2.0",
+            "scoreMa2": "2.0", "scoreHz1": "1.0", "scoreHz2": "2.0", "scoreHz3": "3.0", "scoreDayHL": "1.0",
+            "scoreAcc1": "2.0", "scoreAcc2": "3.0", "scoreAcc3": "4.0", "accScoreMode": '"Max"', "accEdgeMode": '"Separate"',
+            "dsMode": '"Separate"', "thrMedium": "5.0", "thrStrong": "9.0", "thrVStrong": "15.0", "fvgMinWidth": "0.00020",
+            "fvgDirMatch": "false", "enableRn": "false"}
+EU2_ST = {"stMode": '"B: Confirmed Rejection"', "stDir": '"Short Only"', "stRR": "1.5", "stBuffer": "0.00030",
+          "stTpZone": "false", "stBE": "false", "stBEDist": "0.00060", "stUseSess": "true", "stSessTz": '"Asia/Tokyo"',
+          "stSessStartH": "9", "stSessStartM": "0", "stSessEndH": "2", "stSessEndM": "0", "stCapBase": "300000.0",
+          "stRiskPct": "3.0", "stLotUnits": "100000.0", "stLotStep": "0.01"}
+EU2_CHANGED = {"breakBuffer", "slopeThrMod", "slopeThrStrong", "slopeBonusMode", "scoreDayHL", "scoreAcc1", "scoreAcc2",
+               "scoreAcc3", "stMode", "stDir", "stRR"}
+EU2_RELABEL = {"zoneHalfWidth", "clusterDist", "flipConfirmDist", "fvgMinWidth", "stBuffer"}
+
+
+def gate_defaults():
+    check("ED-01 EU-2: strip_visual2 / strip_strategy2 give the EU-1 files of commit d3b68b7 byte for byte; the Engine is "
+          "byte-identical to d3b68b7; rebuilding gives the submitted files",
+          EV == show(eb.VIS_PATH, EU1) and ES == show(eb.STR_PATH, EU1) and EE == show(eb.ENG_PATH, EU1)
+          and eb.build_visual() == FV and eb.build_strategy() == FS
+          and all(k in ("header", "default") for k, _, _ in eb.VISUAL_EDITS2 + eb.STRATEGY_EDITS2)
+          and all(any(x is e for x in eb.VISUAL_EDITS2) and any(x is e for x in eb.STRATEGY_EDITS2) for e in eb.ZONE_DEFAULT_EDITS))
+    bad = []
+    for old, new, names in ((EV, FV, EU2_CHANGED | EU2_RELABEL), (ES, FS, EU2_CHANGED | EU2_RELABEL)):
+        for l in changed_code(old, new):
+            if not (re.match(r"^(" + "|".join(sorted(names)) + r")\s*=\s*input\.\w+\(", l)
+                    or re.match(r'^(tooltip = )?".*"\)?( \+)?$', l)):
+                bad.append(l)
+    check("ED-02 the only code delta EU-1 -> EU-2 is the specified input declarations (default literal / label) and their "
+          "tooltips; no logic, order, size, alert, label, Engine call, request or import change", not bad, str(bad[:4]))
+    vv, vs = input_values(FV), input_values(FS)
+    zb = [n for n, v in EU2_ZONE.items() if vv.get(n) != v or vs.get(n) != v]
+    sb = [n for n, v in EU2_ST.items() if vs.get(n) != v]
+    check("ED-03 table values in both files: HW 0.00020, Cluster 0.00030, Break 0.00050, Flip 0.00060, Slope 0.00002 / 0.00004, "
+          "Slope aggregation Max, MA 2 / 2, Swing 1 / 2 / 3, Day H/L 1, Accum 2 / 3 / 4, Accum Max / Separate, Day/Swing "
+          "Separate, 5 / 9 / 15, FVG 0.00020, FVG direction OFF, RN OFF; Strategy B, Short Only, RR 1.5, SL Buffer 0.00030, "
+          "Zone TP OFF, BE OFF (0.00060), session ON Asia/Tokyo 09:00-02:00, 300,000 JPY / 3 % / 100,000 / 0.01",
+          not zb and not sb and "initial_capital        = 300000," in FS and "currency               = currency.JPY," in FS,
+          str((zb, sb)))
+    vd, sd = input_decls(FV), input_decls(FS)
+    zone_names = set(input_decls(FS[:FS.index("// ==== ZONE Strategy · Zone evaluation (begin)")]))
+    check("ED-04 Visual / Strategy share every Zone input declaration (default, label, tooltip) after EU-2",
+          zone_names == set(vd) - DISPLAY_INPUTS and all(vd[n] == sd[n] for n in zone_names))
+    e1v, e1s = input_decls(EV), input_decls(ES)
+    same = [n for n in set(e1v) | set(e1s) if n not in EU2_CHANGED | EU2_RELABEL
+            and (e1v.get(n) != vd.get(n) or e1s.get(n) != sd.get(n))]
+    keep_rel = [n for n in EU2_RELABEL if input_values(EV if n in e1v else ES).get(n) != (vv.get(n) if n in vv else vs.get(n))]
+    opts = ['options = ["A: Touch Limit", "B: Confirmed Rejection", "C: Candle Pattern", "D: 1M BOS Rebound"]',
+            'options = ["Long Only", "Short Only", "Both"]', 'options = ["Sum (per MA)", "Max"]']
+    check("ED-05 everything else unchanged: MA TF / type / lengths / lookback / slope bonuses, Swing TFs / pivots, Accum "
+          "TFs / keep counts / detection inputs, Touch / Day-Swing / MA-cluster distances, TP-zone Min / Max RR, BE trigger, "
+          "lots ...; relabelled inputs keep their values; the Entry Mode / Direction / aggregation option lists are kept",
+          not same and not keep_rel and all(o in FS for o in opts) and opts[2] in FV
+          and vs["stTpMinRR"] == input_values(ES)["stTpMinRR"] and vs["stTpMaxRR"] == input_values(ES)["stTpMaxRR"],
+          str((same, keep_rel)))
+    co = code_only(FV) + code_only(FS)
+    check("ED-06 tooltips / labels follow the values: Break 'USD・初期 5 pips', Slope '0.2 pips' / '0.4 pips', no stale "
+          "'初期 3 pips' on Break or '0.8 pips'; adopted wording without an optimality claim",
+          co.count("Break Buffer (USD・初期 5 pips)") == 2 and "Break Buffer (USD・初期 3 pips)" not in co
+          and co.count("初期 0.00002 = 0.2 pips") == 2 and co.count("初期 0.00004 = 0.4 pips") == 2 and "0.8 pips" not in co
+          and "最適値・将来の有効性を保証するものではない" in co and not re.search(r"最適値で|最適化済み|保証する。", co))
+    mod = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", EU1, "--"], capture_output=True,
+                         text=True).stdout.split()
+    check("ED-07 vs d3b68b7 only the EURUSD Visual / Strategy and their build / test change (Engine, import, GBPJPY / BTC / "
+          "USDJPY / Gold files untouched)", set(mod) <= {eb.VIS_PATH, eb.STR_PATH, "tests/eu_build.py", "tests/eu_sim.py"}
+          and re.findall(r"^import .*$", FV + FS, re.M) == [eb.IMPORT_EU.strip()] * 2, str(mod))
+    m = FS.replace('breakBuffer = input.float(0.00050', 'breakBuffer = input.float(0.00030')
+    check("ED-08 mutation: a Strategy Break Buffer that no longer matches the Visual is detected",
+          input_decls(m)["breakBuffer"] != vd["breakBuffer"] and eb.strip_strategy2(m) is None)
 
 
 # ---- models -------------------------------------------------------------------------------------------------------------
@@ -428,7 +509,7 @@ def gate_model():
 
 
 def main():
-    for g in (gate_static, gate_model):
+    for g in (gate_static, gate_model, gate_defaults):
         try:
             g()
         except Exception:
