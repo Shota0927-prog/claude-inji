@@ -1,4 +1,4 @@
-"""UJ-1 fixtures — USDJPY dedicated Engine (ZoneEnginePracticalUSDJPY) and GBPJPY position sizing in ZoneStrategyUSDJPY.
+"""UJ-1 / UJ-2 fixtures — USDJPY dedicated Engine (ZoneEnginePracticalUSDJPY) and GBPJPY position sizing in ZoneStrategyUSDJPY.
 
   US : static — the Engine == ZoneEnginePracticalSwingMax.pine (the published ZoneEnginePractical/6 source) except the
        library name, same exports; Visual / Strategy rebuild from their pre-UJ-1 text (3568c05) and strip back byte for
@@ -9,6 +9,11 @@
        RN stays OFF; only the USDJPY files and the exactly-adapted older fixtures change vs 3568c05
   UM : model (Python port, not a TradingView run) — quantity: 9,000 JPY budget, pointvalue 1: 0.10 -> 90,000 (0.90 lot),
        0.13 -> 69,000 (0.69 lot, planned loss 8,970); Long / Short, floor, invalid, below one lot step
+
+  (US checks pin UJ-1 on the files with the UJ-2 defaults reverted, == commit a6a275c.)
+  UD : UJ-2 adopted defaults — strip_*2 gives a6a275c back; the code delta is only the specified input defaults (and the
+       Cluster tooltip); the specified table in both files, Visual / Strategy Zone inputs identical; every other input,
+       the sizing, the Engine and the logic unchanged; header wording (Long comparison, per-year / Short not done)
 
 Evidence class: PINE_NOT_VERIFIED (library publish, TradingView compile / backtest external).
 """
@@ -30,7 +35,9 @@ git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=Tr
 code_only, input_decls, input_values, func, seg = es.code_only, es.input_decls, es.input_values, es.func, es.seg
 E6, EU = rd(ub.ENG_SRC), rd(ub.ENG_PATH)
 V0, S0 = ub.base(ub.VIS_PATH), ub.base(ub.STR_PATH)
-V, S = rd(ub.VIS_PATH), rd(ub.STR_PATH)
+FV, FS = rd(ub.VIS_PATH), rd(ub.STR_PATH)
+UJ1 = "a6a275c"
+V, S = ub.strip_visual2(FV) or "", ub.strip_strategy2(FS) or ""     # UJ-1 layer (UJ-2 defaults reverted)
 GBS = rd("ZoneStrategyGBPJPY.pine")
 RESULTS = []
 
@@ -56,7 +63,8 @@ def gate_static():
           and code_only(EU).replace('library("ZoneEnginePracticalUSDJPY", overlay = true)', 'library("ZoneEnginePractical", overlay = true)') == code_only(E6)
           and exports(EU) == exports(E6) and len(exports(EU)) > 30)
     check("US-03 Visual / Strategy rebuild from their pre-UJ-1 text (3568c05) and strip back byte for byte",
-          ub.build_visual() == V and ub.build_strategy() == S and ub.strip_visual(V) == V0 and ub.strip_strategy(S) == S0
+          ub.build_visual1() == V and ub.build_strategy1() == S and ub.build_visual() == FV and ub.build_strategy() == FS
+          and ub.strip_visual(FV) == V0 and ub.strip_strategy(FS) == S0
           and all(k in ("header", "name", "import", "default", "size") for k, _, _ in ub.ENGINE_EDITS + ub.VISUAL_EDITS + ub.STRATEGY_EDITS))
     cv = es.changed_code(V0, V)
     check("US-04 Visual code delta = the import and the Zone Half Width default 0.05 -> 0.03 (user decision)",
@@ -132,6 +140,61 @@ def gate_static():
           and ub.strip_strategy(m) is None)
 
 
+# ---- UJ-2: adopted defaults ---------------------------------------------------------------------------------------------
+UJ2_ZONE = {"zoneHalfWidth": "0.03", "clusterDist": "0.12", "breakBuffer": "0.12", "flipConfirmDist": "0.10",
+            "thrMedium": "5.0", "thrStrong": "8.0", "thrVStrong": "15.0", "scoreMa1": "1.0", "scoreMa2": "1.0",
+            "slopeThrMod": "0.01", "slopeThrStrong": "0.02", "slopeBonusFlat": "0.0", "slopeBonusMod": "0.5",
+            "slopeBonusStr": "1.0", "slopeBonusMode": '"Sum (per MA)"', "scoreHz1": "1.0", "scoreHz2": "2.0",
+            "scoreHz3": "3.0", "scoreDayHL": "1.0", "scoreAcc1": "4.0", "scoreAcc2": "5.0", "scoreAcc3": "6.0",
+            "confBonus2": "0.5", "confBonus3": "1.0", "confBonus4": "1.5", "fvgMinWidth": "0.05"}
+UJ2_ST = {"stMode": '"D: 1M BOS Rebound"', "stDir": '"Long Only"', "stBuffer": "0.05", "stRR": "1.5", "stTpZone": "false",
+          "stBE": "false"}
+UJ2_CHANGED = {"clusterDist", "breakBuffer", "flipConfirmDist", "thrStrong", "scoreMa1", "scoreMa2", "slopeThrMod",
+               "slopeThrStrong", "slopeBonusMod", "slopeBonusStr", "scoreDayHL", "scoreAcc1", "scoreAcc2", "scoreAcc3",
+               "confBonus2", "confBonus3", "confBonus4", "stRR"}
+
+
+def gate_defaults():
+    check("UD-01 UJ-2: strip_visual2 / strip_strategy2 give the UJ-1 files of a6a275c byte for byte; Engine byte-identical to "
+          "a6a275c; rebuilding gives the submitted files",
+          V == git("show", f"{UJ1}:{ub.VIS_PATH}") and S == git("show", f"{UJ1}:{ub.STR_PATH}")
+          and EU == git("show", f"{UJ1}:{ub.ENG_PATH}") and ub.build_visual() == FV and ub.build_strategy() == FS
+          and all(k in ("header", "default") for k, _, _ in ub.VISUAL_EDITS2 + ub.STRATEGY_EDITS2)
+          and all(any(x is e for x in ub.VISUAL_EDITS2) and any(x is e for x in ub.STRATEGY_EDITS2) for e in ub.ZONE_DEFAULT_EDITS))
+    bad = [l for old, new in ((V, FV), (S, FS)) for l in es.changed_code(old, new)
+           if not (re.match(r"^(" + "|".join(sorted(UJ2_CHANGED)) + r")\s*=\s*input\.\w+\(", l) or re.match(r'^tooltip = ".*"\)$', l))]
+    check("UD-02 the code delta UJ-1 -> UJ-2 is only the specified input defaults (+ the Cluster Distance tooltip); no logic, "
+          "Engine call, sizing, order, alert or label change", not bad, str(bad[:4]))
+    vv, vs = input_values(FV), input_values(FS)
+    zb = [n for n, x in UJ2_ZONE.items() if vv.get(n) != x or vs.get(n) != x]
+    sb = [n for n, x in UJ2_ST.items() if vs.get(n) != x]
+    check("UD-03 adopted values in both files: HW 0.03, Cluster 0.12, Break 0.12, Flip 0.10, 5 / 8 / 15, MA 1 / 1, Slope 0.01 / "
+          "0.02, bonus 0 / 0.5 / 1 Sum (per MA), Swing 1 / 2 / 3, Day H/L 1, Accum 4 / 5 / 6, Confluence 0.5 / 1 / 1.5, FVG "
+          "0.05; Strategy D, Long Only, SL Buffer 0.05, RR 1.5, Zone TP OFF, BE OFF", not zb and not sb, str((zb, sb)))
+    vd, sd = input_decls(FV), input_decls(FS)
+    zone_names = set(input_decls(FS[:FS.index("// ==== ZONE Strategy · Zone evaluation (begin)")]))
+    check("UD-04 Visual / Strategy share every Zone input declaration and ZoneCfg assignment after UJ-2",
+          zone_names == set(vd) - es.DISPLAY_INPUTS and all(vd[n] == sd[n] for n in zone_names)
+          and re.findall(r"^zoneCfg\.\w+\s*:=.*$", FV, re.M) == re.findall(r"^zoneCfg\.\w+\s*:=.*$", FS, re.M))
+    e1v, e1s = input_decls(V), input_decls(S)
+    same = [n for n in set(e1v) | set(e1s) if n not in UJ2_CHANGED and (e1v.get(n) != vd.get(n) or e1s.get(n) != sd.get(n))]
+    check("UD-05 everything else unchanged: MA 1-minute EMA 2000 / 3000, lookback 60, MA cluster distance and bonuses, Swing / "
+          "Accum detection / TFs / keep counts, FVG, session, Touch, lifetimes, Track, HTF, RN, BE trigger 0.15, TP-zone Min / "
+          "Max RR 1.0 / 3.0, sizing (300,000 / 3 % / 100,000 / 0.01, f_stQty), Entry / Direction option lists",
+          not same and (vs["maTf"], vs["maType"], vs["ma1Len"], vs["ma2Len"], vs["slopeLookback"]) == ('"1"', '"EMA"', "2000", "3000", "60")
+          and (vs["stBEDist"], vs["stTpMinRR"], vs["stTpMaxRR"]) == ("0.15", "1.0", "3.0")
+          and (vs["stCapBase"], vs["stRiskPct"], vs["stLotUnits"], vs["stLotStep"]) == ("300000.0", "3.0", "100000.0", "0.01")
+          and func(FS, "f_stQty(int side, float ref, float sl) =>") == func(S, "f_stQty(int side, float ref, float sl) =>")
+          and 'options = ["Long Only", "Short Only", "Both"]' in FS and '"D: 1M BOS Rebound"], group = G_ST)' in FS, str(same))
+    hdr = FV[:FV.index("//@version=5")] + FS[:FS.index("//@version=5")]
+    check("UD-06 header: 'USDJPY Long の比較から採用した初期値。年別確認・Short での検証は未完了' in both files; no 最適値 / 検証完了 / "
+          "将来も有効 claim", hdr.count(ub.UJ2_NOTE) == 2 and "最適値・検証完了ではない" in hdr
+          and not re.search(r"最適値です|最適値で|検証完了済|検証完了。|将来も有効", hdr))
+    mod = git("diff", "--name-only", "--diff-filter=MDR", UJ1, "--").split()
+    check("UD-07 vs a6a275c only the USDJPY Visual / Strategy and their build / test change (Engine, other symbols, shared "
+          "Engines untouched)", set(mod) <= {ub.VIS_PATH, ub.STR_PATH, "tests/uj_build.py", "tests/uj_sim.py"}, str(mod))
+
+
 def qty(side, ref, sl, budget=9000.0, pv=1.0, units=100000.0, step=0.01):
     """port of f_stQty (GBPJPY = USDJPY)."""
     dist = (ref - sl) if side == 1 else (sl - ref)
@@ -166,7 +229,7 @@ def gate_model():
 
 
 def main():
-    for g in (gate_static, gate_model):
+    for g in (gate_static, gate_model, gate_defaults):
         try:
             g()
         except Exception:

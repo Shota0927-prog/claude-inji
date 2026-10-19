@@ -11,6 +11,10 @@
   (and no order / Track state) when the quantity is invalid or below one step). The GBPJPY alert-text edits of GBS-4 are
   not taken (alerts / labels are out of scope).
 Each strip_*() reverses its edits and must give the source back byte for byte (fixture uj_sim).
+UJ-2 (applied after UJ-1; strip_*2() reverses only UJ-2 -> the UJ-1 files of commit a6a275c byte for byte): defaults
+adopted from the user's USDJPY Long comparison (shared Zone inputs in Visual and Strategy, Strategy RR 1.5). Defaults
+and the matching comments only: no logic, Engine, sizing, timing, alert or other-symbol change. Not optimal values; the
+per-year check and the Short verification are not done.
 """
 import os
 import sys
@@ -86,6 +90,79 @@ STRATEGY_EDITS = [
 ]
 
 
+# ---- UJ-2: adopted defaults from the USDJPY Long comparison (applied after UJ-1) ---------------------------------------
+UJ2_NOTE = "USDJPY Long の比較から採用した初期値。年別確認・Short での検証は未完了"
+ZONE_DEFAULT_EDITS = [
+    ("default",
+     'scoreMa1 = input.float(2.0, "Base Score · MA #1", step = 0.5, group = G_MA)\n'
+     'scoreMa2 = input.float(2.0, "Base Score · MA #2", step = 0.5, group = G_MA)\n',
+     'scoreMa1 = input.float(1.0, "Base Score · MA #1", step = 0.5, group = G_MA)\n'
+     'scoreMa2 = input.float(1.0, "Base Score · MA #2", step = 0.5, group = G_MA)\n'),
+    ("default",
+     'slopeThrMod = input.float(0.02, "[暫定] Slope Threshold · Moderate (円/lookback)", minval = 0.0, step = 0.005, group = G_SLOPE)\n'
+     'slopeThrStrong = input.float(0.05, "[暫定] Slope Threshold · Strong (円/lookback)",   minval = 0.0, step = 0.005, group = G_SLOPE)\n',
+     'slopeThrMod = input.float(0.01, "[暫定] Slope Threshold · Moderate (円/lookback)", minval = 0.0, step = 0.005, group = G_SLOPE)\n'
+     'slopeThrStrong = input.float(0.02, "[暫定] Slope Threshold · Strong (円/lookback)",   minval = 0.0, step = 0.005, group = G_SLOPE)\n'),
+    ("default",
+     'slopeBonusMod = input.float(1.0, "Slope Bonus · Moderate", step = 0.5, group = G_SLOPE)\n'
+     'slopeBonusStr = input.float(2.0, "Slope Bonus · Strong",   step = 0.5, group = G_SLOPE)\n',
+     'slopeBonusMod = input.float(0.5, "Slope Bonus · Moderate", step = 0.5, group = G_SLOPE)\n'
+     'slopeBonusStr = input.float(1.0, "Slope Bonus · Strong",   step = 0.5, group = G_SLOPE)\n'),
+    ("default",
+     'scoreDayHL = input.float(3.0, "Base Score · Day High / Low", step = 0.5, group = G_DHL)\n',
+     'scoreDayHL = input.float(1.0, "Base Score · Day High / Low", step = 0.5, group = G_DHL)\n'),
+    ("default",
+     'scoreAcc1 = input.float(3.0, "Base Score · TF #1 Accum", step = 0.5, group = G_ACC)\n'
+     'scoreAcc2 = input.float(4.0, "Base Score · TF #2 Accum", step = 0.5, group = G_ACC)\n'
+     'scoreAcc3 = input.float(5.0, "Base Score · TF #3 Accum", step = 0.5, group = G_ACC)\n',
+     'scoreAcc1 = input.float(4.0, "Base Score · TF #1 Accum", step = 0.5, group = G_ACC)\n'
+     'scoreAcc2 = input.float(5.0, "Base Score · TF #2 Accum", step = 0.5, group = G_ACC)\n'
+     'scoreAcc3 = input.float(6.0, "Base Score · TF #3 Accum", step = 0.5, group = G_ACC)\n'),
+    ("default",
+     'clusterDist = input.float(0.08, "Cluster Distance (円)", minval = 0.0, step = 0.005, group = G_CLU,\n'
+     '     tooltip = "USDJPY 比較候補: 0.05 / 0.08 / 0.12 円。")\n',
+     'clusterDist = input.float(0.12, "Cluster Distance (円)", minval = 0.0, step = 0.005, group = G_CLU,\n'
+     '     tooltip = "USDJPY 比較候補: 0.05 / 0.08 / 0.12 円。初期 0.12 円 (12 pips) = ' + UJ2_NOTE + '。")\n'),
+    ("default",
+     'thrStrong = input.float(10.0, "Strong Score Threshold",      step = 0.5, group = G_SCORE)\n',
+     'thrStrong = input.float(8.0, "Strong Score Threshold",      step = 0.5, group = G_SCORE)\n'),
+    ("default",
+     'confBonus2 = input.float(1.0, "Confluence Bonus · 2 categories",  step = 0.5, group = G_SCORE)\n'
+     'confBonus3 = input.float(2.0, "Confluence Bonus · 3 categories",  step = 0.5, group = G_SCORE)\n'
+     'confBonus4 = input.float(3.0, "Confluence Bonus · 4+ categories", step = 0.5, group = G_SCORE)\n',
+     'confBonus2 = input.float(0.5, "Confluence Bonus · 2 categories",  step = 0.5, group = G_SCORE)\n'
+     'confBonus3 = input.float(1.0, "Confluence Bonus · 3 categories",  step = 0.5, group = G_SCORE)\n'
+     'confBonus4 = input.float(1.5, "Confluence Bonus · 4+ categories", step = 0.5, group = G_SCORE)\n'),
+    ("default",
+     'breakBuffer = input.float(0.08,  "[暫定] Break Buffer (円)",         minval = 0.0, step = 0.005, group = G_BF)\n'
+     'flipConfirmDist = input.float(0.15, "[暫定] Flip Confirm Distance (円)", minval = 0.0, step = 0.01, group = G_BF)\n',
+     'breakBuffer = input.float(0.12,  "[暫定] Break Buffer (円)",         minval = 0.0, step = 0.005, group = G_BF)\n'
+     'flipConfirmDist = input.float(0.10, "[暫定] Flip Confirm Distance (円)", minval = 0.0, step = 0.01, group = G_BF)\n'),
+]
+UJ2_HDR = (
+    "//  UJ-2: " + UJ2_NOTE + " (最適値・検証完了ではない): Half Width 0.03 / Cluster 0.12 / Break 0.12 /\n"
+    "//  Flip 0.10 円、Medium / Strong / Very Strong 5 / 8 / 15、MA 1 / 1、Slope 閾値 0.01 / 0.02 円・加点 0 / 0.5 / 1 (Sum)、\n"
+    "//  Swing 1 / 2 / 3、Day H/L 1、Accum 4 / 5 / 6、Confluence 0.5 / 1 / 1.5、FVG Min Width 0.05 円 (Visual / Strategy 共通)。\n")
+VISUAL_EDITS2 = [
+    ("header",
+     "//  UJ-1: Zone Half Width の初期値を Strategy と同じ 0.03 円に統一 (ユーザー指定。上の「初期 0.05」は UJ-1 前の値)。\n",
+     "//  UJ-1: Zone Half Width の初期値を Strategy と同じ 0.03 円に統一 (ユーザー指定。上の「初期 0.05」は UJ-1 前の値)。\n"
+     + UJ2_HDR),
+] + ZONE_DEFAULT_EDITS
+STRATEGY_EDITS2 = [
+    ("header",
+     "//  1 lot = 100,000 通貨、0.01 lot で切り捨て、指値・成行とも qty を明示)。売買設定・判定・注文タイミングは変えない。\n",
+     "//  1 lot = 100,000 通貨、0.01 lot で切り捨て、指値・成行とも qty を明示)。売買設定・判定・注文タイミングは変えない。\n"
+     + UJ2_HDR +
+     "//  Strategy: Entry D: 1M BOS Rebound、Long Only (Short Only / Both・A〜D は選択可)、SL Buffer 0.05 円、固定 RR 1.5、\n"
+     "//  反対 Zone TP OFF、建値移動 OFF (Trigger 値は OFF 時のまま)。\n"),
+] + ZONE_DEFAULT_EDITS + [
+    ("default",
+     'stRR = input.float(1.3, "TP Fixed RR", minval = 0.1, step = 0.1, group = G_STT)\n',
+     'stRR = input.float(1.5, "TP Fixed RR", minval = 0.1, step = 0.1, group = G_STT)\n'),
+]
+
+
 def _apply(src, edits):
     out = src
     for _, a, b in edits:
@@ -116,24 +193,46 @@ def build_engine():
     return _apply(_rd(ENG_SRC), ENGINE_EDITS)
 
 
-def build_visual():
+def build_visual1():
+    """UJ-1 only (commit a6a275c)."""
     return _apply(base(VIS_PATH), VISUAL_EDITS)
 
 
-def build_strategy():
+def build_strategy1():
+    """UJ-1 only (commit a6a275c)."""
     return _apply(base(STR_PATH), STRATEGY_EDITS)
+
+
+def build_visual():
+    return _apply(build_visual1(), VISUAL_EDITS2)
+
+
+def build_strategy():
+    return _apply(build_strategy1(), STRATEGY_EDITS2)
 
 
 def strip_engine(t):
     return _revert(t, ENGINE_EDITS)
 
 
+def strip_visual2(t):
+    """reverse only the UJ-2 defaults (-> the UJ-1 Visual byte for byte)."""
+    return _revert(t, VISUAL_EDITS2)
+
+
+def strip_strategy2(t):
+    """reverse only the UJ-2 defaults (-> the UJ-1 Strategy byte for byte)."""
+    return _revert(t, STRATEGY_EDITS2)
+
+
 def strip_visual(t):
-    return _revert(t, VISUAL_EDITS)
+    """reverse UJ-2 and UJ-1 (-> the pre-UJ Visual of 3568c05)."""
+    return _revert(strip_visual2(t), VISUAL_EDITS)
 
 
 def strip_strategy(t):
-    return _revert(t, STRATEGY_EDITS)
+    """reverse UJ-2 and UJ-1 (-> the pre-UJ Strategy of 3568c05)."""
+    return _revert(strip_strategy2(t), STRATEGY_EDITS)
 
 
 if __name__ == "__main__":
