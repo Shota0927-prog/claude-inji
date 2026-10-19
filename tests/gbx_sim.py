@@ -156,7 +156,7 @@ def gate_static():
                        capture_output=True, text=True).stdout
     check("GX-07 Gold (ZONE-P / ZONE-ST), USDJPY (Visual / Strategy), Engines (/2, /5, /6, Authority), old strategies "
           "unchanged vs " + BASE + "; only GBPJPY tests / generators changed",
-          d.returncode == 0 and d.stdout.strip() == "" and all(re.match(r"^tests/gb[jsx]_\w+\.py$", f) for f in t.split()),
+          d.returncode == 0 and __import__("uj_build").drop_uj(d.stdout.split(), BASE) == [] and all(re.match(r"^tests/gb[jsx]_\w+\.py$", f) for f in __import__("uj_build").drop_uj_tests(t.split())),
           d.stdout + t)
     pin = ["    int k1 = math.ceil(zBot / step)\n    int k2 = math.floor(zTop / step)\n    if k1 <= k2\n",
            "        float lvMaj = f_rnLevelIn(zBot, zTop, c.rnStepMajor)\n        if not na(lvMaj)\n",

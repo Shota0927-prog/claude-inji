@@ -246,6 +246,8 @@ def gate_static():
                           text=True).stdout.split()
     out1 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BTC1_COMMIT, "--"], capture_output=True,
                           text=True).stdout.split()
+    out, out1, out2 = (__import__("uj_build").drop_uj_tests(__import__("uj_build").drop_uj(out, BASE)), __import__("uj_build").drop_uj_tests(__import__("uj_build").drop_uj(out1, BTC1_COMMIT)),
+                       __import__("uj_build").drop_uj_tests(__import__("uj_build").drop_uj(out2, BTC2_COMMIT)))     # UJ-1: USDJPY Visual / Strategy may differ only by the USDJPY Engine split + sizing (exact, see uj_build)
     check(f"BS-15 existing files unchanged vs base HEAD {BASE} (GBPJPY / USDJPY / Gold Visuals, Strategies, Engines, "
           "tests) and vs f326724 / a36c3e8 (BTC-2 / BTC-3 touch only the BTC Visual / build / sim); ZoneVisualGBPJPY.pine and "
           "ZoneEnginePracticalGBPJPY.pine untouched", subprocess.run(["git", "-C", ROOT, "cat-file", "-e", BASE]).returncode == 0

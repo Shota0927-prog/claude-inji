@@ -38,7 +38,7 @@ rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.e
 GBS_FULL = rd(gs.GBS_PATH)
 GBS = gs.strip_qty(GBS_FULL) or ""     # GBS-4 position size reverted: these checks pin GBS-3 (gbq_sim pins GBS-4)
 GBV = rd(gb.GBJ_PATH)
-STJ = rd(sj.STJ_PATH)
+STJ = __import__("uj_build").pre_uj(sj.STJ_PATH)     # UJ-1: USDJPY Visual / Strategy may differ only by the USDJPY Engine split + sizing (exact, see uj_build)
 
 
 def strip_gbj2_in_strategy(text):
@@ -233,8 +233,8 @@ def gate_static():
     check("GB-09 ZONE-JPY, ZONE-ST-JPY, ZONE-P, ZONE-ST (XAU), Engines and old strategies unchanged vs "
           + BASE + "; no existing test / generator script modified or removed except the GBPJPY ones (ZONE-GBPJPY is pinned by "
           "its build in gbj_sim GS-01 / gbx_sim)",
-          d.returncode == 0 and d.stdout.strip() == ""
-          and all(re.match(r"^tests/gb[jsx]_\w+\.py$", f) for f in t.split()), d.stdout + t)
+          d.returncode == 0 and __import__("uj_build").drop_uj(d.stdout.split(), BASE) == []
+          and all(re.match(r"^tests/gb[jsx]_\w+\.py$", f) for f in __import__("uj_build").drop_uj_tests(t.split())), d.stdout + t)
 
 
 # ---- models -----------------------------------------------------------------------------------------------------------

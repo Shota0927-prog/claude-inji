@@ -132,7 +132,7 @@ def btc_sim_only_allowlist():
     for c in ("BASE", "BTC2_COMMIT", "BTC1_COMMIT"):
         exp = exp.replace(f'["git", "-C", ROOT, "diff", "--name-only", {c}, "--"]',
                           f'["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", {c}, "--"]')
-    return old.count(BTC_SIM_OLD) == 1 and rd("tests/btc_sim.py") == exp
+    return old.count(BTC_SIM_OLD) == 1 and __import__("uj_build").unadapt("tests/btc_sim.py", rd("tests/btc_sim.py")) == exp
 
 
 def gate_static():
@@ -262,6 +262,7 @@ def gate_static():
     new_ok = {sb.BTS_PATH, "tests/btcs_build.py", "tests/btcs_sim.py"}
     out2 = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BTS1_COMMIT, "--"], capture_output=True,
                           text=True).stdout.split()
+    out, out2 = __import__("uj_build").drop_uj_tests(__import__("uj_build").drop_uj(out, BASE)), __import__("uj_build").drop_uj_tests(__import__("uj_build").drop_uj(out2, BTS1_COMMIT))     # UJ-1: USDJPY Visual / Strategy may differ only by the USDJPY Engine split + sizing (exact, see uj_build)
     check(f"SB-17 existing files unchanged vs {BASE} (GBPJPY / USDJPY / Gold, Engines, BTC Visual and its build / sim, tests); "
           "only the BTC Strategy files differ (also vs 88488dc for BTS-2); tests/btc_sim.py differs only by its BS-15 allow-list "
           "line admitting the BTC Strategy files", subprocess.run(["git", "-C", ROOT, "cat-file", "-e", BASE]).returncode == 0

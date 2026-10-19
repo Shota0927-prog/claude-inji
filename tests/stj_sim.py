@@ -25,8 +25,8 @@ import st3_build as s3          # noqa: E402
 import fvg_re10045_sim as fr    # noqa: E402
 
 ROOT = sj.ROOT
-STJ = open(os.path.join(ROOT, sj.STJ_PATH), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, sj.STJ_PATH)) else ""
-JPYV = open(os.path.join(ROOT, jb.JPY_PATH), encoding="utf-8").read()
+STJ = __import__("uj_build").pre_uj(sj.STJ_PATH) if os.path.exists(os.path.join(ROOT, sj.STJ_PATH)) else ""     # UJ-1: USDJPY Visual / Strategy may differ only by the USDJPY Engine split + sizing (exact, see uj_build)
+JPYV = __import__("uj_build").pre_uj(jb.JPY_PATH)
 XST = open(os.path.join(ROOT, "ZoneStrategyXAU.pine"), encoding="utf-8").read()
 RESULTS = []
 
@@ -125,7 +125,7 @@ def gate_static():
              "PracticalZoneStrategy_SHORT.pine", "SignalEnginePractical.pine"]
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "5e2459b", "--"] + names, capture_output=True, text=True).stdout
     check("SJ-09 ZONE-P, ZONE-JPY, ZONE-ST (XAU), Engines (/2, /5, /6) and the old strategies unchanged vs 5e2459b",
-          d.strip() == "", d)
+          __import__("uj_build").drop_uj(d.split(), "5e2459b") == [], d)
 
 
 # =============================================================================

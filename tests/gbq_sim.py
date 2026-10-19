@@ -107,7 +107,7 @@ def gate_static():
           and fr.lint_eager_guards(code_only(G4)) == [])
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", PREV, "--"] + PROTECTED, capture_output=True, text=True)
     check("GQ-07 Visual, Library (/3 source), shared /6, Gold and USDJPY unchanged vs " + PREV + "; import stays /3",
-          d.returncode == 0 and d.stdout.strip() == "" and re.findall(r"^import .*$", G4, re.M) == [ge.IMPORT_GBE.strip()],
+          d.returncode == 0 and __import__("uj_build").drop_uj(d.stdout.split(), PREV) == [] and re.findall(r"^import .*$", G4, re.M) == [ge.IMPORT_GBE.strip()],
           d.stdout)
 
 

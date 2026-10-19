@@ -23,7 +23,7 @@ import fvg_re10045_sim as fr    # noqa: E402
 
 ROOT = jb.ROOT
 VIS = open(os.path.join(ROOT, jb.SRC_PATH), encoding="utf-8").read()
-JPY = open(os.path.join(ROOT, jb.JPY_PATH), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, jb.JPY_PATH)) else ""
+JPY = __import__("uj_build").pre_uj(jb.JPY_PATH) if os.path.exists(os.path.join(ROOT, jb.JPY_PATH)) else ""     # UJ-1: USDJPY Visual / Strategy may differ only by the USDJPY Engine split + sizing (exact, see uj_build)
 RESULTS = []
 
 

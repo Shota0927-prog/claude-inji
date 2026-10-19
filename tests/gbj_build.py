@@ -335,7 +335,7 @@ def strip_gbj(gbj):
 
 
 def build():
-    return gbj_transform(open(os.path.join(ROOT, SRC_PATH), encoding="utf-8").read())
+    return gbj_transform(__import__("uj_build").pre_uj(SRC_PATH))     # UJ-1: USDJPY Visual / Strategy may differ only by the USDJPY Engine split + sizing (exact, see uj_build)
 
 
 if __name__ == "__main__":

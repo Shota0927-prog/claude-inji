@@ -61,7 +61,7 @@ def gate_static():
           and gs.strip_msg(GBS) == GBS0 and bool(GBS0) and gs.strip_lbl(GBS) is not None)
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", PREV, "--"] + PROTECTED, capture_output=True, text=True)
     check("GN-02 Visual, Library (/3 source), shared /6, Gold and USDJPY unchanged vs " + PREV + "; import stays /3",
-          d.returncode == 0 and d.stdout.strip() == "" and re.findall(r"^import .*$", GBS, re.M) == [ge.IMPORT_GBE.strip()],
+          d.returncode == 0 and __import__("uj_build").drop_uj(d.stdout.split(), PREV) == [] and re.findall(r"^import .*$", GBS, re.M) == [ge.IMPORT_GBE.strip()],
           d.stdout)
     fn = func(GBS, "f_stAlertMsg(")
     check("GN-03 text: 【kind】ticker｜LONG/SHORT, Entry / SL / TP with format.mintick, SL距離 = risk / 0.01 in pips (0.0), "

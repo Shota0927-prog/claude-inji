@@ -124,7 +124,7 @@ def gate_static():
     mod = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BASE, "--"], capture_output=True,
                          text=True).stdout.split()
     check(f"GS-08 no existing file modified vs {BASE} (EURUSD / GBPJPY / BTC / USDJPY / Gold Pine files, Engines, tests); only "
-          "new GBPUSD files are added", mod == [], str(mod))
+          "new GBPUSD files are added", __import__("uj_build").drop_uj_tests(__import__("uj_build").drop_uj(mod, BASE)) == [], str(mod))
     m = GS.replace('stDir = input.string("Both"', 'stDir = input.string("Long Only"')
     check("GS-09 mutation: a different Direction default and a mismatching Zone input are detected",
           input_values(m)["stDir"] != '"Both"' and gb.strip_strategy(m) is None

@@ -32,7 +32,7 @@ import practical_zone_sim as pz  # noqa: E402
 
 ROOT = gb.ROOT
 BASE = "9596357"
-JPY = open(os.path.join(ROOT, gb.SRC_PATH), encoding="utf-8").read()
+JPY = __import__("uj_build").pre_uj(gb.SRC_PATH)     # UJ-1: USDJPY Visual / Strategy may differ only by the USDJPY Engine split + sizing (exact, see uj_build)
 GBJ_FULL = open(os.path.join(ROOT, gb.GBJ_PATH), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, gb.GBJ_PATH)) else ""
 # GBJ-1 checks below run on the file with the GBJ-2 edits (FVG Direction Match / GBPJPY RN) reverted; GBJ-2 is
 # verified in gbx_sim. strip_gbj2 must give the GBJ-1 text exactly (GS-01).
@@ -162,10 +162,10 @@ def gate_static():
           and cnt(GBJ, r"\balert\w*\(") == 0 and cnt(GBJ, r"\bstrategy\.") == 0 and "strategy(" not in code_only(GBJ))
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASE, "--"] + PROTECTED, capture_output=True, text=True)
     check("GS-10 ZONE-JPY, ZONE-STJ, ZONE-P, ZONE-ST, Engines (/2, /5, /6, Authority), old strategies, SignalEngine "
-          "unchanged vs base HEAD " + BASE, d.returncode == 0 and d.stdout.strip() == "", d.stdout + d.stderr)
+          "unchanged vs base HEAD " + BASE, d.returncode == 0 and __import__("uj_build").drop_uj(d.stdout.split(), BASE) == [], d.stdout + d.stderr)
     j = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", BASE, "--", "tests/"], capture_output=True, text=True).stdout
     check("GS-11 existing generator / test scripts unchanged vs " + BASE + " (only gbj_build.py / gbj_sim.py are new) and "
-          "jpy_build still regenerates ZONE-JPY", j.strip() == "" and jb.build() == JPY, j)
+          "jpy_build still regenerates ZONE-JPY", __import__("uj_build").drop_uj_tests(j.split()) == [] and jb.build() == JPY, j)
 
 
 # ---- model ------------------------------------------------------------------------------------------------------------

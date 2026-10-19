@@ -120,7 +120,7 @@ def gate_static():
                        capture_output=True, text=True).stdout
     check("GD-05 shared Engine /6 (and /2, /5, Authority), Gold, USDJPY and old strategies unchanged vs " + PREV
           + "; only GBPJPY tests / generators changed",
-          d.returncode == 0 and d.stdout.strip() == "" and all(re.match(r"^tests/gb[defjsx]_\w+\.py$", f) for f in t.split()),
+          d.returncode == 0 and __import__("uj_build").drop_uj(d.stdout.split(), PREV) == [] and all(re.match(r"^tests/gb[defjsx]_\w+\.py$", f) for f in __import__("uj_build").drop_uj_tests(t.split())),
           d.stdout + t)
 
 

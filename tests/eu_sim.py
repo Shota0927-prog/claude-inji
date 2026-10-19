@@ -280,8 +280,9 @@ def gate_static():
     exp_bts = exp_bts.replace(BTS_HELPER_OLD, BTS_HELPER_NEW).replace(BTS_DOC_OLD, BTS_DOC_NEW)
     check(f"ES-14 existing files unchanged vs {BASE} (GBPJPY trio, BTC / USDJPY / Gold files, Engines, tests) except the two BTC "
           "fixtures, whose only change is --diff-filter=MDR on their git-diff checks (new files no longer fail them)",
-          set(mod) <= {"tests/btc_sim.py", "tests/btcs_sim.py"} and rd("tests/btc_sim.py") == exp_btc
-          and rd("tests/btcs_sim.py") == exp_bts and exp_bts != show("tests/btcs_sim.py"), str(mod))
+          set(__import__("uj_build").drop_uj_tests(__import__("uj_build").drop_uj(mod, BASE))) <= {"tests/btc_sim.py", "tests/btcs_sim.py"}
+          and __import__("uj_build").unadapt("tests/btc_sim.py", rd("tests/btc_sim.py")) == exp_btc
+          and __import__("uj_build").unadapt("tests/btcs_sim.py", rd("tests/btcs_sim.py")) == exp_bts and exp_bts != show("tests/btcs_sim.py"), str(mod))
 
 
 # ---- EU-2: adopted defaults -------------------------------------------------------------------------------------------
@@ -349,7 +350,7 @@ def gate_defaults():
     mod = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=MDR", EU1, "--"], capture_output=True,
                          text=True).stdout.split()
     check("ED-07 vs d3b68b7 only the EURUSD Visual / Strategy and their build / test change (Engine, import, GBPJPY / BTC / "
-          "USDJPY / Gold files untouched)", set(mod) <= {eb.VIS_PATH, eb.STR_PATH, "tests/eu_build.py", "tests/eu_sim.py"}
+          "USDJPY / Gold files untouched)", set(__import__("uj_build").drop_uj_tests(__import__("uj_build").drop_uj(mod, EU1))) <= {eb.VIS_PATH, eb.STR_PATH, "tests/eu_build.py", "tests/eu_sim.py"}
           and re.findall(r"^import .*$", FV + FS, re.M) == [eb.IMPORT_EU.strip()] * 2, str(mod))
     m = FS.replace('breakBuffer = input.float(0.00050', 'breakBuffer = input.float(0.00030')
     check("ED-08 mutation: a Strategy Break Buffer that no longer matches the Visual is detected",
