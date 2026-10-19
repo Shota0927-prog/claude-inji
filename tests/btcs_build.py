@@ -1,4 +1,4 @@
-"""BTS-1 / BTS-2 — ZoneStrategyBTCUSD.pine: CRYPTO:BTCUSD 5M Strategy with provisional / confirmed alerts and labels.
+"""BTS-1 / BTS-2 / BTS-3 — ZoneStrategyBTCUSD.pine: CRYPTO:BTCUSD 5M Strategy with provisional / confirmed alerts and labels.
 
 Deterministic transform of ZoneStrategyGBPJPY.pine (ZONE-ST-GBPJPY) by exact, unique text replacements (EDITS);
 strip_bts() applies them in reverse and must give ZONE-ST-GBPJPY back byte for byte (fixture btcs_sim), so the Entry
@@ -21,6 +21,9 @@ EDITS2 (BTS-2, applied after EDITS; strip_bts2() reverses it -> the BTS-1 file o
             the provisional / confirmed alerts and labels (the confirmed ones stay in the order branch) and the
             cancellation of an unfilled limit; open positions (SL / TP / breakeven) and the Zone / FVG / BOS updates are
             not gated. Uses the bar's time_close and hour / minute / dayofweek only (no request).
+EDITS3 (BTS-3, applied after EDITS2; strip_bts3() reverses it -> the BTS-2 file of commit e1c3cea byte for byte):
+  engine    import ZoneEnginePracticalBTCUSD/1 (dedicated BTCUSD library, same source as ZoneEnginePracticalGBPJPY/3,
+            tests/bte_build.py) instead of ZoneEnginePracticalGBPJPY/3, plus the comments naming the current engine.
 ZONE-ST-GBPJPY, the BTC Visual, the other Visuals / Strategies and the Engines are not modified.
 """
 import os
@@ -157,6 +160,20 @@ EDITS2 = [
 ]
 
 
+# ---- BTS-3: dedicated BTCUSD Engine library (import + comments naming the current engine; applied after EDITS2) ---------
+EDITS3 = [
+    ("header",
+     "//  Zone Strategy BTCUSD  —  ZONE-BTCUSD (ZoneVisualBTCUSD) の Zone 判定を使う CRYPTO:BTCUSD 5分足 Strategy\n",
+     "//  Zone Strategy BTCUSD  —  ZONE-BTCUSD (ZoneVisualBTCUSD) の Zone 判定を使う CRYPTO:BTCUSD 5分足 Strategy\n"
+     "//  BTS-3: Engine を BTCUSD 専用 Library ZoneEnginePracticalBTCUSD/1 に分離 (ZoneEnginePracticalGBPJPY/3 と同じソース・\n"
+     "//  同じ処理、Library 名だけ異なる。生成: tests/bte_build.py)。以下の「GBPJPY/3」「ZONE-ST-GBPJPY」は履歴の説明。\n"),
+    ("rn",
+     "//  Engine (ZoneEnginePracticalGBPJPY/3) の既存 Round Number 加点を USD の刻みで使う (Engine は変更しない)。\n",
+     "//  Engine (ZoneEnginePracticalBTCUSD/1、ZoneEnginePracticalGBPJPY/3 と同じ処理) の既存 Round Number 加点を USD の刻みで使う (Engine は変更しない)。\n"),
+    ("engine", bb.IMPORT_GBE, bb.IMPORT_BTE),
+]
+
+
 def _apply(src, edits):
     out = src
     for _, a, b in edits:
@@ -179,17 +196,27 @@ def bts1_transform(src):
     return _apply(src, EDITS)
 
 
-def bts_transform(src):
+def bts2_transform(src):
+    """BTS-1 + BTS-2 (commit e1c3cea)."""
     return _apply(bts1_transform(src), EDITS2)
 
 
+def bts_transform(src):
+    return _apply(bts2_transform(src), EDITS3)
+
+
+def strip_bts3(bts):
+    """reverse only the BTS-3 engine split (-> the BTS-2 file byte for byte)."""
+    return _revert(bts, EDITS3)
+
+
 def strip_bts2(bts):
-    """reverse only the BTS-2 weekend edits (-> the BTS-1 file byte for byte)."""
-    return _revert(bts, EDITS2)
+    """reverse the BTS-3 and BTS-2 edits (-> the BTS-1 file byte for byte)."""
+    return _revert(strip_bts3(bts), EDITS2)
 
 
 def strip_bts(bts):
-    """reverse the BTS-2 and BTS-1 edits (-> ZoneStrategyGBPJPY.pine byte for byte)."""
+    """reverse the BTS-3, BTS-2 and BTS-1 edits (-> ZoneStrategyGBPJPY.pine byte for byte)."""
     return _revert(strip_bts2(bts), EDITS)
 
 

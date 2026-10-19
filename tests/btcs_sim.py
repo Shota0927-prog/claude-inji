@@ -46,7 +46,8 @@ GBS = rd(sb.SRC_PATH)
 FULL = rd(sb.BTS_PATH)
 BTS1_COMMIT = "88488dc"
 BTS = sb.strip_bts2(FULL) or ""          # the BTS-1 file (BTS-2 weekend edits reverted)
-VIS = rd(bb.BTC_PATH)
+FULL2 = sb.strip_bts3(FULL) or ""        # BTE-1: the BTS-2 file (e1c3cea); BTS-3 (engine split) is pinned in bte_sim
+VIS = bb.strip_btc4(rd(bb.BTC_PATH)) or ""   # BTE-1: the BTC-3 Visual (same engine import as the BTS-2 layer)
 RESULTS = []
 
 
@@ -414,7 +415,7 @@ def gate_model():
 
 # ---- BTS-2: weekend exclusion -------------------------------------------------------------------------------------------
 def gate_weekend():
-    ga, ba = code_only(BTS).split("\n"), code_only(FULL).split("\n")
+    ga, ba = code_only(BTS).split("\n"), code_only(FULL2).split("\n")
     rem, add = [], []
     for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ga, ba, autojunk=False).get_opcodes():
         if op != "equal":
@@ -431,8 +432,8 @@ def gate_weekend():
           "stSessOK now AND-ed with stWkdOK; the old stSessOK line is the only removed line; f_stInSession unchanged",
           rem == ["bool stSessOK = not stUseSess or f_stInSession(time_close)"]
           and sorted(l for l in add if l not in tips) == sorted(exp_add) and len(tips) == 3
-          and func(FULL, "f_stInSession(int t) =>") == func(BTS, "f_stInSession(int t) =>"), str((rem, add)))
-    co, co1 = code_only(FULL), code_only(BTS)
+          and func(FULL2, "f_stInSession(int t) =>") == func(BTS, "f_stInSession(int t) =>"), str((rem, add)))
+    co, co1 = code_only(FULL2), code_only(BTS)
     uses = lambda t: re.findall(r"^.*\bstSessOK\b.*$", t, re.M)
     check("SW-02 scope: stSessOK is used exactly where it was (limit cancellation `not pendOK or not stSessOK`, new-entry "
           "gate (4) whose order branch sends the confirmed alert / label, provisional gate stPvGate, data-window plot), so "
@@ -442,16 +443,16 @@ def gate_weekend():
           and "    if oState == 1 and (not pendOK or not stSessOK)" in co and "    if oState == 0 and not cancelBar and stSessOK" in co
           and "bool  stPvGate = is5mChart and not barstate.isconfirmed and oState == 0 and stSessOK" in co
           and co.count("stWkdOK") == 2 and co.count("stNoWkend") == 2
-          and not re.search(r"stSessOK|stWkdOK", code_only(seg(FULL, "    // (1) 発注済み Entry", "    // (2d) D:")))
-          and not re.search(r"stSessOK|stWkdOK", code_only(seg(FULL, "    // (2d) D:", "    // (3) 保留中の指値")))
-          and "strategy.exit(oXid, oEid, stop = oStop, limit = oTP)" in seg(FULL, "    // (1) 発注済み Entry", "    // (2d) D:"))
-    v = input_values(FULL)
+          and not re.search(r"stSessOK|stWkdOK", code_only(seg(FULL2, "    // (1) 発注済み Entry", "    // (2d) D:")))
+          and not re.search(r"stSessOK|stWkdOK", code_only(seg(FULL2, "    // (2d) D:", "    // (3) 保留中の指値")))
+          and "strategy.exit(oXid, oEid, stop = oStop, limit = oTP)" in seg(FULL2, "    // (1) 発注済み Entry", "    // (2d) D:"))
+    v = input_values(FULL2)
     req = lambda t: re.findall(r"request\.\w+\(", code_only(t))
     check("SW-03 independent input, default ON (not derived from Limit New Entries to Session); date logic uses only "
           "time_close with hour / minute / dayofweek in the session timezone (Asia/Tokyo) — no request added, no timenow",
-          v["stNoWkend"] == "true" and v["stUseSess"] == "true" and req(FULL) == req(BTS) and len(req(FULL)) == 11
-          and "stNoWkend" not in func(FULL, "f_stInSession(int t) =>") and "timenow" not in func(FULL, "f_stSessDow(int t) =>"))
-    m = FULL.replace("bool stSessOK  = (not stUseSess or f_stInSession(time_close)) and stWkdOK",
+          v["stNoWkend"] == "true" and v["stUseSess"] == "true" and req(FULL2) == req(BTS) and len(req(FULL2)) == 11
+          and "stNoWkend" not in func(FULL2, "f_stInSession(int t) =>") and "timenow" not in func(FULL2, "f_stSessDow(int t) =>"))
+    m = FULL2.replace("bool stSessOK  = (not stUseSess or f_stInSession(time_close)) and stWkdOK",
                      "bool stSessOK  = not stUseSess or (f_stInSession(time_close) and stWkdOK)")
     check("SW-04 mutation: tying the weekend rule to the session limit (OFF would silently drop it) is detected",
           "bool stSessOK  = (not stUseSess or f_stInSession(time_close)) and stWkdOK" not in m and sb.strip_bts2(m) is None)

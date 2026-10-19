@@ -128,6 +128,7 @@ def gate_static():
     check("US-11 no extra request / loop; RE10045 lint clean", req(V) == req(V0) and req(S) == req(S0)
           and all(fr.lint_eager_guards(code_only(t)) == [] for t in (EU, V, S)))
     mod = git("diff", "--name-only", "--diff-filter=MDR", ub.BASE_REV, "--").split()
+    mod = [m for m in mod if not __import__("bte_build").bte_pine_ok(m, ub.BASE_REV)]     # BTE-1 BTC split: exact
     rest = [m for m in mod if m not in ub.UJ_FILES and not ub.test_ok(m)]
     check("US-12 vs 3568c05: only the USDJPY Visual / Strategy change among existing Pine files (exactly by UJ-1); every "
           "modified older fixture differs only by its recorded TEST_ADAPT edits; GBPJPY / EURUSD / GBPUSD / BTC / Gold "
@@ -191,6 +192,7 @@ def gate_defaults():
           "将来も有効 claim", hdr.count(ub.UJ2_NOTE) == 2 and "最適値・検証完了ではない" in hdr
           and not re.search(r"最適値です|最適値で|検証完了済|検証完了。|将来も有効", hdr))
     mod = git("diff", "--name-only", "--diff-filter=MDR", UJ1, "--").split()
+    mod = [m for m in mod if not (__import__("bte_build").bte_pine_ok(m, UJ1) or __import__("bte_build").test_ok(m))]   # BTE-1: exact
     check("UD-07 vs a6a275c only the USDJPY Visual / Strategy and their build / test change (Engine, other symbols, shared "
           "Engines untouched)", set(mod) <= {ub.VIS_PATH, ub.STR_PATH, "tests/uj_build.py", "tests/uj_sim.py"}, str(mod))
 

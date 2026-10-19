@@ -45,12 +45,13 @@ BASE = "5957053"
 ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
 GBJ = rd(bb.SRC_PATH)
-BTC = rd(bb.BTC_PATH)
+BTC_FULL = rd(bb.BTC_PATH)
+BTC = bb.strip_btc4(BTC_FULL) or ""      # BTE-1: the BTC-3 file (e1c3cea); BTC-4 (engine split) is pinned in bte_sim
 ENG = rd(ENGINE_PATH)
 BTC1_COMMIT = "f326724"
-BTC1 = bb.strip_btc2(BTC) or ""          # the BTC-1 file (BTC-3 and BTC-2 edits reverted)
+BTC1 = bb.strip_btc2(BTC_FULL) or ""          # the BTC-1 file (BTC-3 and BTC-2 edits reverted)
 BTC2_COMMIT = "a36c3e8"
-BTC2 = bb.strip_btc3(BTC) or ""          # the BTC-2 file (BTC-3 symbol comment reverted)
+BTC2 = bb.strip_btc3(BTC_FULL) or ""          # the BTC-2 file (BTC-3 symbol comment reverted)
 RESULTS = []
 
 
@@ -133,8 +134,8 @@ def engine_type_fields(src, name):
 def gate_static():
     check("BS-01 ZoneVisualBTCUSD.pine == btc_transform(ZoneVisualGBPJPY.pine); rebuilding gives the same bytes; strip_btc "
           "gives ZONE-GBPJPY back byte for byte; strip_btc2 / strip_btc3 give the BTC-1 (f326724) / BTC-2 (a36c3e8) files",
-          bool(BTC) and bb.build() == BTC and bb.build() == bb.build() and bb.strip_btc(BTC) == GBJ
-          and bb.btc_transform(bb.strip_btc(BTC)) == BTC and bb.btc1_transform(GBJ) == BTC1
+          bool(BTC) and bb.build() == BTC_FULL and bb.build() == bb.build() and bb.strip_btc(BTC_FULL) == GBJ
+          and bb.btc_transform(bb.strip_btc(BTC_FULL)) == BTC_FULL and bb.btc3_transform(GBJ) == BTC and bb.btc1_transform(GBJ) == BTC1
           and bb.btc2_transform(GBJ) == BTC2
           and BTC2 == subprocess.run(["git", "-C", ROOT, "show", BTC2_COMMIT + ":" + bb.BTC_PATH],
                                      capture_output=True, text=True).stdout

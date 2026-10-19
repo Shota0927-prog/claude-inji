@@ -263,7 +263,8 @@ def uj_ok(path, rev):
 
 def drop_uj(names, rev):
     """remove the USDJPY files from a list of changed paths only when they differ from `rev` exactly by UJ-1."""
-    return [n for n in names if not (n in UJ_FILES and uj_ok(n, rev))]
+    # BTE-1 (later split of the BTC Engine): the BTC Visual / Strategy may also differ, exactly by that layer
+    return [n for n in names if not ((n in UJ_FILES and uj_ok(n, rev)) or __import__("bte_build").bte_pine_ok(n, rev))]
 
 
 # ---- exact adaptations of the older fixtures to UJ-1 (each must occur once; unadapt() reverses them) ---------------
@@ -374,8 +375,10 @@ TEST_ADAPT = {'tests/btc_sim.py': [('    check(f"BS-15 existing files unchanged 
 
 def unadapt(path, text):
     """a test file with its UJ-1 adaptation reverted (unchanged for files not in TEST_ADAPT)."""
-    out = text
+    out = __import__("bte_build").unadapt(path, text)     # BTE-1 adaptations (later) are reverted first
     for a, b in reversed(TEST_ADAPT.get(path, [])):
+        if out is None:
+            return None
         if out.count(b) != 1:
             return None
         out = out.replace(b, a)
@@ -384,7 +387,7 @@ def unadapt(path, text):
 
 def test_ok(path):
     """True when the test file differs from BASE_REV only by its exact UJ-1 adaptation."""
-    return path in TEST_ADAPT and unadapt(path, _rd(path)) == base(path)
+    return (path in TEST_ADAPT or path in __import__("bte_build").TEST_ADAPT) and unadapt(path, _rd(path)) == base(path)
 
 
 def drop_uj_tests(names):
