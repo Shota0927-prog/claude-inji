@@ -22,7 +22,7 @@ import fvg_batch_c_build as cb        # noqa: E402
 import zp_overlap_build as zp         # noqa: E402
 
 ROOT = vb.ROOT
-CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+CUR = __import__("xa_build").pre_xa("ZoneVisualPractical.pine", open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read())  # XA-1 Gold defaults stripped -> f253890 text (delta pinned by xa_sim)
 CUR = __import__("bon_build").strip_bon(CUR) or CUR  # bonus defaults stripped -> 9270c50 text (delta pinned by bon_sim)
 CUR = __import__("fvl_build").strip_fvl(CUR) or CUR  # FVG label info stripped -> 67f8fd2 text (delta pinned by fvl_sim)
 CUR = __import__("swv_build").strip_swv(CUR) or CUR  # SW-V1 import /6 stripped -> 110e5b0 text (delta pinned by swv_sim)

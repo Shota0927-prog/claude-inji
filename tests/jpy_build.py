@@ -99,7 +99,7 @@ def strip_jpy(jpy):
 
 
 def build():
-    return jpy_transform(open(os.path.join(ROOT, SRC_PATH), encoding="utf-8").read())
+    return jpy_transform(__import__("xa_build").pre_xa(SRC_PATH, open(os.path.join(ROOT, SRC_PATH), encoding="utf-8").read()))  # XA-1 Gold defaults stripped -> f253890 text (delta pinned by xa_sim)
 
 
 if __name__ == "__main__":

@@ -78,7 +78,7 @@ def bte_pine_ok(path, rev):
 
 def unadapt(path, text):
     """a test / generator file with its BTE-1 edits reverted (unchanged for files not in TEST_ADAPT)."""
-    out = text
+    out = __import__("xa_build").unadapt(path, text)     # XA-1 edits (later) are reverted first
     for a, b in reversed(TEST_ADAPT.get(path, [])):
         if out is None or out.count(b) != 1:
             return None
@@ -88,7 +88,7 @@ def unadapt(path, text):
 
 def test_ok(path):
     """True when the file differs from BASE_REV only by its exact BTE-1 edits."""
-    return path in TEST_ADAPT and unadapt(path, _rd(path)) == _show(BASE_REV, path)
+    return (path in TEST_ADAPT or path in __import__("xa_build").TEST_ADAPT) and unadapt(path, _rd(path)) == _show(BASE_REV, path)
 
 
 # ---- exact BTE-1 edits of existing test / generator files vs e1c3cea (generated from the diff; unadapt() reverses them) ---

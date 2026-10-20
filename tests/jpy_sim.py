@@ -22,7 +22,7 @@ import zp_overlap_build as zp   # noqa: E402
 import fvg_re10045_sim as fr    # noqa: E402
 
 ROOT = jb.ROOT
-VIS = open(os.path.join(ROOT, jb.SRC_PATH), encoding="utf-8").read()
+VIS = __import__("xa_build").pre_xa(jb.SRC_PATH, open(os.path.join(ROOT, jb.SRC_PATH), encoding="utf-8").read())  # XA-1 Gold defaults stripped -> f253890 text (delta pinned by xa_sim)
 JPY = __import__("uj_build").pre_uj(jb.JPY_PATH) if os.path.exists(os.path.join(ROOT, jb.JPY_PATH)) else ""     # UJ-1: USDJPY Visual / Strategy may differ only by the USDJPY Engine split + sizing (exact, see uj_build)
 RESULTS = []
 
@@ -119,7 +119,7 @@ def gate_static():
              "SignalEnginePractical.pine"]
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "25af623", "--"] + names, capture_output=True, text=True).stdout
     check("JS-10 XAUUSD Visual (ZONE-P), Strategy (ZONE-ST), Engines (/2, /5, /6) and the old strategies unchanged vs 25af623",
-          d.strip() == "", d)
+          __import__("xa_build").drop_xa(d.split(), "25af623") == [], d)
 
 
 def gate_model():

@@ -22,7 +22,7 @@ import st3_build as s3      # noqa: E402
 import fvg_re10045_sim as fr  # noqa: E402
 
 ROOT = tb.ROOT
-ST = s3.strip_st3(open(os.path.join(ROOT, s2.ST_PATH), encoding="utf-8").read())
+ST = s3.strip_st3(__import__("xa_build").pre_xa("ZoneStrategyXAU.pine", open(os.path.join(ROOT, s2.ST_PATH), encoding="utf-8").read()))  # XA-1 Gold defaults stripped -> f253890 text (delta pinned by xa_sim)
 RESULTS = []
 SUP, RES, ACT, BRK = 1, 2, 0, 3
 
@@ -120,7 +120,7 @@ def gate_static():
              "ZoneEnginePracticalSwingMax.pine", "PracticalZoneStrategy_LONG.pine", "PracticalZoneStrategy_SHORT.pine",
              "SignalEnginePractical.pine"]
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "f1d54bf", "--"] + names, capture_output=True, text=True).stdout
-    check("TS-11 ZONE-P, Engines (/2, /5, /6), Strategy LONG / SHORT, SignalEngine unchanged vs f1d54bf", d.strip() == "", d)
+    check("TS-11 ZONE-P, Engines (/2, /5, /6), Strategy LONG / SHORT, SignalEngine unchanged vs f1d54bf", __import__("xa_build").drop_xa(d.split(), "f1d54bf") == [], d)
 
 
 # =============================================================================

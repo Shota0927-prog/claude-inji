@@ -23,7 +23,7 @@ import fvg_re10045_sim as fr          # noqa: E402
 import zp_overlap_sim as zs           # noqa: E402
 
 ROOT = lb.ROOT
-CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+CUR = __import__("xa_build").pre_xa("ZoneVisualPractical.pine", open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read())  # XA-1 Gold defaults stripped -> f253890 text (delta pinned by xa_sim)
 CUR = __import__("bon_build").strip_bon(CUR) or CUR  # bonus defaults stripped -> 9270c50 text (delta pinned by bon_sim)
 BASE = lb.git_show(lb.FVL_BASE_REV)
 RESULTS = []

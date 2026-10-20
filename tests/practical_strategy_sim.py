@@ -321,7 +321,7 @@ def fixture_alloc():
 #  ★ P02-P10 parity fixtures validate against the Visual authority of that stage (b3b69ae).
 #    The current Visual adds only the 5M execution gate; fixture_p16_visual_5m_gate ties it to b3b69ae.
 VIS_PRE_GATE_REV = "b3b69ae"
-VIS_CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+VIS_CUR = __import__("xa_build").pre_xa("ZoneVisualPractical.pine", open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read())  # XA-1 Gold defaults stripped -> f253890 text (delta pinned by xa_sim)
 VIS_CUR = __import__("bon_build").strip_bon(VIS_CUR) or VIS_CUR  # bonus defaults stripped -> 9270c50 text (delta pinned by bon_sim)
 VIS_CUR = __import__("fvl_build").strip_fvl(VIS_CUR) or VIS_CUR  # FVG label info stripped -> 67f8fd2 text (delta pinned by fvl_sim)
 VIS_CUR = __import__("swv_build").strip_swv(VIS_CUR) or VIS_CUR  # SW-V1 import /6 stripped -> 110e5b0 text (delta pinned by swv_sim)

@@ -26,8 +26,8 @@ import rnv_build as vb                # noqa: E402
 import fvg_re10045_sim as fr          # noqa: E402
 
 ROOT = tb.ROOT
-ST = s2.strip_st2(s3.strip_st3(open(os.path.join(ROOT, tb.ST_PATH), encoding="utf-8").read())) if os.path.exists(os.path.join(ROOT, tb.ST_PATH)) else ""
-VIS = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+ST = s2.strip_st2(s3.strip_st3(__import__("xa_build").pre_xa("ZoneStrategyXAU.pine", open(os.path.join(ROOT, tb.ST_PATH), encoding="utf-8").read()))) if os.path.exists(os.path.join(ROOT, tb.ST_PATH)) else ""
+VIS = __import__("xa_build").pre_xa("ZoneVisualPractical.pine", open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read())  # XA-1 Gold defaults stripped -> f253890 text (delta pinned by xa_sim)
 BASE = tb.git_show(tb.ST_BASE_REV)
 RESULTS = []
 
@@ -112,7 +112,7 @@ def gate_static():
              "ZoneEnginePracticalSwingMax.pine", "PracticalZoneStrategy_LONG.pine", "PracticalZoneStrategy_SHORT.pine",
              "SignalEnginePractical.pine"]
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", tb.ST_BASE_REV, "--"] + names, capture_output=True, text=True).stdout
-    check("TS-12 ZONE-P, Engines (/2, /5, /6), Strategy LONG / SHORT, SignalEngine unchanged vs beca989", d.strip() == "", d)
+    check("TS-12 ZONE-P, Engines (/2, /5, /6), Strategy LONG / SHORT, SignalEngine unchanged vs beca989", __import__("xa_build").drop_xa(d.split(), tb.ST_BASE_REV) == [], d)
 
 
 # =============================================================================

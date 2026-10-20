@@ -27,7 +27,7 @@ import fvg_re10045_sim as fr    # noqa: E402
 ROOT = sj.ROOT
 STJ = __import__("uj_build").pre_uj(sj.STJ_PATH) if os.path.exists(os.path.join(ROOT, sj.STJ_PATH)) else ""     # UJ-1: USDJPY Visual / Strategy may differ only by the USDJPY Engine split + sizing (exact, see uj_build)
 JPYV = __import__("uj_build").pre_uj(jb.JPY_PATH)
-XST = open(os.path.join(ROOT, "ZoneStrategyXAU.pine"), encoding="utf-8").read()
+XST = __import__("xa_build").pre_xa("ZoneStrategyXAU.pine", open(os.path.join(ROOT, "ZoneStrategyXAU.pine"), encoding="utf-8").read())  # XA-1 Gold defaults stripped -> f253890 text (delta pinned by xa_sim)
 RESULTS = []
 
 

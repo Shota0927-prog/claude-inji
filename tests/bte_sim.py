@@ -78,11 +78,12 @@ def gate_static():
           and req(V) == req(V0) and len(req(V)) == 10 and req(S) == req(S0) and len(req(S)) == 11
           and all(fr.lint_eager_guards(code_only(t)) == [] for t in (BE, V, S)))
     mod = git("diff", "--name-only", "--diff-filter=MDR", be.BASE_REV, "--").split()
-    rest = [m for m in mod if not (be.bte_pine_ok(m, be.BASE_REV) or be.test_ok(m))]
+    rest = [m for m in mod if not (be.bte_pine_ok(m, be.BASE_REV) or be.test_ok(m) or __import__("xa_build").xa_ok(m, be.BASE_REV))]   # XA-1: exact
     check("BE-07 vs e1c3cea: the BTC Visual / Strategy differ exactly by the new layer, every other changed file is a test / "
           "generator whose edits are recorded exactly in bte_build.TEST_ADAPT; GBPJPY Engine, shared Engines and other "
           "symbols' Pine files untouched", set(mod) >= {bb.BTC_PATH, sb.BTS_PATH} and not rest
-          and not [m for m in mod if m.endswith(".pine") and m not in (bb.BTC_PATH, sb.BTS_PATH)], str(rest))
+          and not [m for m in mod if m.endswith(".pine") and m not in (bb.BTC_PATH, sb.BTS_PATH)
+                   and not __import__("xa_build").xa_ok(m, be.BASE_REV)], str(rest))
     m = S.replace("import sekine3310/ZoneEnginePracticalBTCUSD/1 as zn", "import sekine3310/ZoneEnginePracticalGBPJPY/3 as zn")
     check("BE-08 mutation: a Strategy still importing GBPJPY/3 (Visual / Strategy mismatch) is detected",
           re.findall(r"^import .*$", V + m, re.M) != ["import sekine3310/ZoneEnginePracticalBTCUSD/1 as zn"] * 2

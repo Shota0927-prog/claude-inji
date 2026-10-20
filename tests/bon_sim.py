@@ -23,7 +23,7 @@ import zp_overlap_build as zp         # noqa: E402
 import practical_zone_sim as pz       # noqa: E402
 
 ROOT = bb.ROOT
-CUR = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+CUR = __import__("xa_build").pre_xa("ZoneVisualPractical.pine", open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read())  # XA-1 Gold defaults stripped -> f253890 text (delta pinned by xa_sim)
 BASE = bb.git_show(bb.BON_BASE_REV)
 LIB6 = open(os.path.join(ROOT, "ZoneEnginePracticalSwingMax.pine"), encoding="utf-8").read()
 RESULTS = []

@@ -212,7 +212,7 @@ def htf_set(n15=0, n60=0, n240=0, bear15=False):
 
 
 def main():
-    cur = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+    cur = __import__("xa_build").pre_xa("ZoneVisualPractical.pine", open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read())  # XA-1 Gold defaults stripped -> f253890 text (delta pinned by xa_sim)
     cur = __import__("bon_build").strip_bon(cur) or cur  # bonus defaults stripped -> 9270c50 text (delta pinned by bon_sim)
     cur = __import__("fvl_build").strip_fvl(cur) or cur  # FVG label info stripped -> 67f8fd2 text (delta pinned by fvl_sim)
     cur = __import__("swv_build").strip_swv(cur) or cur  # SW-V1 import /6 stripped -> 110e5b0 text (delta pinned by swv_sim)

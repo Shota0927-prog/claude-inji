@@ -57,7 +57,7 @@ def gate_static():
              "PracticalAlertHarness.pine", "PracticalTradeHarness.pine", "PracticalBreakEvenHarness.pine",
              "PracticalEntryDispatchHarness.pine"]
     d = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", sb.SW_BASE_REV, "--"] + names, capture_output=True, text=True).stdout
-    vis = open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read()
+    vis = __import__("xa_build").pre_xa("ZoneVisualPractical.pine", open(os.path.join(ROOT, "ZoneVisualPractical.pine"), encoding="utf-8").read())  # XA-1 Gold defaults stripped -> f253890 text (delta pinned by xa_sim)
     vis = __import__("bon_build").strip_bon(vis) or vis  # bonus defaults stripped -> 9270c50 text (delta pinned by bon_sim)
     vis = __import__("fvl_build").strip_fvl(vis) or vis  # FVG label info stripped -> 67f8fd2 text (delta pinned by fvl_sim)
     vis_ok = __import__("swv_build").strip_swv(vis) == sb.git_show(sb.SW_BASE_REV, "ZoneVisualPractical.pine")
