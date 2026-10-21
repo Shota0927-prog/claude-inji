@@ -32,7 +32,9 @@ PREV = "7363ef1"
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True).stdout
 code_only, input_decls, input_values, func = es.code_only, es.input_decls, es.input_values, es.func
-S, S0 = rd(ub.STR_PATH), git("show", f"{UJ2}:{ub.STR_PATH}")
+S4 = rd(ub.STR_PATH)
+S = ub.strip_strategy4(S4) or ""     # UJ-3 layer (UJ-4 TP / RR reverted exactly; pinned in ujt_sim)
+S0 = git("show", f"{UJ2}:{ub.STR_PATH}")
 GBS = rd("ZoneStrategyGBPJPY.pine")
 RESULTS = []
 
@@ -58,8 +60,8 @@ def readonly(fn):
 def gate_static():
     check("UL-01 Strategy == uj_build.build_strategy() (UJ-1 + UJ-2 + UJ-3); strip_strategy3 gives the UJ-2 Strategy of "
           "e1c3cea byte for byte; the full chain strips to 3568c05; edit kinds header / label / msg only",
-          ub.build_strategy() == S and ub.strip_strategy3(S) == S0 and ub.build_strategy2() == S0
-          and ub.strip_strategy(S) == ub.base(ub.STR_PATH)
+          ub.build_strategy3() == S and ub.strip_strategy3(S) == S0 and ub.build_strategy2() == S0
+          and ub.strip_strategy(S4) == ub.base(ub.STR_PATH) and ub.strip_strategy3(S4) == S0
           and {k for k, _, _ in ub.STRATEGY_EDITS3} == {"header", "label", "msg"})
     removed = sorted(["default_qty_value      = 1)", "if stAlertProv and is5mChart and not barstate.isconfirmed and oState == 0 and stSessOK",
                       "if na(stProvBar) or stProvBar != bar_index", "[pSide, pPx, pSL] = f_stProvEval()", "if pSide != 0",
@@ -132,7 +134,7 @@ def gate_static():
     mod = set(git("diff", "--name-only", PREV, "--").split()) | {l[3:] for l in git("status", "--porcelain").split("\n") if l.startswith("??")}
     mod -= {"tests/__pycache__/"}
     allowed = {ub.STR_PATH, "tests/uj_build.py", "tests/uj_sim.py", "tests/ujl_sim.py", "tests/uj3_adapt.py", "tests/bte_sim.py",
-               "tests/xa_sim.py", "tests/xae_sim.py", "tests/xa_build.py"}
+               "tests/xa_sim.py", "tests/xae_sim.py", "tests/xa_build.py", "tests/ujt_sim.py"}
     others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != ub.STR_PATH]
     check("UL-07 vs 7363ef1 only the USDJPY Strategy and the USDJPY generator / fixtures (+ the exact adaptation of four older "
           "fixtures) change; the USDJPY Visual / Engine and every other Pine file byte-identical",

@@ -1,16 +1,18 @@
-"""UJ-3 adaptation record — the exact edits UJ-3 (USDJPY Strategy labels / SL distance) made to older generators / fixtures.
+"""UJ-3 / UJ-4 adaptation record — the exact edits UJ-3 (USDJPY labels / SL distance) and UJ-4 (TP / RR display) made to
+older generators / fixtures.
 
 ADAPT maps each file to the (before, after) text pairs of its UJ-3 edit, generated from the diff against 7363ef1 (the commit
 before UJ-3). unadapt() reverses them all-or-nothing (a text without any UJ-3 edit is returned unchanged); xa_build.unadapt()
 - the innermost link of the older fixtures' adaptation chain (uj -> bte -> xa) - calls it first, so the older "unchanged
 since <rev>" checks accept these files only when they differ by exactly these edits. pine_ok() accepts the USDJPY Strategy
-only when stripping UJ-3 gives the file of the given revision byte for byte. This file and tests/ujl_sim.py are new in UJ-3.
+only when stripping UJ-4 / UJ-3 gives the file of the given revision byte for byte. This file and tests/ujl_sim.py are new
+in UJ-3, tests/ujt_sim.py in UJ-4.
 """
 import os
 import subprocess
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NEW_FILES = ("tests/uj3_adapt.py", "tests/ujl_sim.py")
+NEW_FILES = ("tests/uj3_adapt.py", "tests/ujl_sim.py", "tests/ujt_sim.py")
 _rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 
 
@@ -35,7 +37,7 @@ def unadapt(path, text):
 
 
 def pine_ok(path, rev):
-    """True for the USDJPY Strategy when it differs from `rev` exactly by the UJ-3 layer."""
+    """True for the USDJPY Strategy when it differs from `rev` exactly by the UJ-3 (+ UJ-4) layer."""
     import uj_build as ub
     if path != ub.STR_PATH:
         return False
@@ -89,6 +91,10 @@ ADAPT = {'tests/bte_sim.py': [('    mod = git("diff", "--name-only", "--diff-fil
                         'e1c3cea): display / notification only -\n'
                         'provisional / confirmed Entry labels ported from the GBPJPY Strategy (GBS-6) and the SL '
                         'distance (pips) in both alert texts.\n'
+                        'UJ-4 (Strategy only, applied after UJ-3; strip_strategy4() -> the UJ-3 Strategy of '
+                        'ab9820f): TP / RR in the provisional /\n'
+                        'confirmed labels and alert texts, the GBPJPY method (the existing pre-order f_stTp result), '
+                        'display / notification only.\n'
                         'UJ-2 (applied after UJ-1; strip_*2() reverses only UJ-2 -> the UJ-1 files of commit a6a275c '
                         'byte for byte): defaults\n'),
                        ('\ndef _apply(src, edits):\n',
@@ -208,6 +214,84 @@ ADAPT = {'tests/bte_sim.py': [('    mod = git("diff", "--name-only", "--diff-fil
                         ']\n'
                         '\n'
                         '\n'
+                        '# ---- UJ-4: TP / RR in the labels and alert texts (Strategy only; after UJ-3) '
+                        '---------------------------------------------\n'
+                        '#  Display / notification only, the GBPJPY method (gbs_build MSG_EDITS / GBS-5): TP = the '
+                        'result of the existing pre-order\n'
+                        '#  f_stTp call for the same reference price (fixed RR / opposite-zone TP / its fallback) - '
+                        'the confirmed text reuses tpRef of\n'
+                        '#  the order branch, the provisional text the tp f_stProvEval already computes (returned as '
+                        'a 4th value); RR = profit-side\n'
+                        '#  TP distance / |Entry - SL| ("1:x", up to 2 decimals); invalid risk / TP -> "-". The '
+                        'USDJPY lines (Mode, E, SL, SL距離)\n'
+                        '#  stay; TP / RR follow SL距離 in the GBPJPY order. The confirmed TP is the planned value at '
+                        'the order reference (the TP\n'
+                        '#  order is still set from the actual fill after the fill), so the confirmed line keeps the '
+                        'former "約定確認後に設定" meaning.\n'
+                        '#  No order / alert / label condition changes. strip_strategy4() reverses only these -> the '
+                        'UJ-3 Strategy (ab9820f).\n'
+                        'MSG4_OLD = (\n'
+                        "    'f_stAlertMsg(string kind, int side, float ePx, float sl) =>\\n'\n"
+                        "    '    float slPips = na(ePx) or na(sl) ? na : math.abs(ePx - sl) / ST_PIP\\n')\n"
+                        'MSG4_NEW = (\n'
+                        "    '//  UJ-4: TP は発注前の RR 判定 (f_stTp) と同じ結果を受け取る (通知用の値。実際の TP 注文は約定確認後に実約定価格から決める)。\\n'\n"
+                        '    \'//  RR = 利益方向の TP 距離 ÷ Entry から SL までの距離 (1:x、小数 2 桁まで)。risk <= 0 / TP na は "-"\\n\'\n'
+                        "    'f_stAlertMsg(string kind, int side, float ePx, float sl, float tp) =>\\n'\n"
+                        "    '    float slPips = na(ePx) or na(sl) ? na : math.abs(ePx - sl) / ST_PIP\\n'\n"
+                        "    '    float risk   = side == 1 ? ePx - sl : sl - ePx\\n'\n"
+                        "    '    bool  okR    = not na(risk) and risk > 0\\n'\n"
+                        "    '    float rr     = okR and not na(tp) ? (side == 1 ? tp - ePx : ePx - tp) / risk : "
+                        "na\\n')\n"
+                        'TAIL4_OLD = \'     (kind == "仮" ? "\\\\n※未確定: 5分足の確定時に不成立になる場合あり" : "\\\\nTP: '
+                        '約定確認後に設定")\\n\'\n'
+                        'TAIL4_NEW = (\n'
+                        '    \'     "\\\\nTP: " + (okR ? f_num(tp, "#.000") : "-") + (kind == "仮" ? "" : " '
+                        '(発注時の予定値。最終 TP は約定確認後に実約定価格から設定)") +\\n\'\n'
+                        '    \'     "\\\\nRR: " + (na(rr) ? "-" : "1:" + str.tostring(rr, "0.##")) +\\n\'\n'
+                        '    \'     (kind == "仮" ? "\\\\n※未確定: 5分足の確定時に不成立になる場合あり" : "")\\n\')\n'
+                        'STRATEGY_EDITS4 = [\n'
+                        '    ("header",\n'
+                        '     "//  アラートの発火条件・頻度、Entry / SL / TP / 数量 / 注文・約定の処理は変えない。\\n",\n'
+                        '     "//  アラートの発火条件・頻度、Entry / SL / TP / 数量 / 注文・約定の処理は変えない。\\n"\n'
+                        '     "//  UJ-4 (表示・通知のみ): ラベル / アラートに TP・RR (GBPJPY 版と同じ方式: 発注前の f_stTp の結果、RR 1:x)。確定の TP '
+                        'は\\n"\n'
+                        '     "//  発注時の予定値 (最終 TP は約定確認後に実約定価格から設定)。売買・発注・アラート / ラベルの条件は変えない。\\n"),\n'
+                        '    ("msg", MSG4_OLD, MSG4_NEW),\n'
+                        '    ("msg", TAIL4_OLD, TAIL4_NEW),\n'
+                        '    ("prov",\n'
+                        '     "    float ePx = na\\n    float sl  = na\\n    if side != 0\\n",\n'
+                        '     "    float ePx = na\\n    float sl  = na\\n    float tpP = na     // 通知 TP: 下の RR '
+                        '事前判定と同じ f_stTp の結果\\n    if side != 0\\n"),\n'
+                        '    ("prov",\n'
+                        '     "        if skipRef\\n            side := 0\\n    [side, ePx, sl]\\n",\n'
+                        '     "        tpP := tpRef\\n        if skipRef\\n            side := 0\\n    [side, ePx, '
+                        'sl, tpP]\\n"),\n'
+                        '    ("conf",\n'
+                        '     \'                    alert(f_stAlertMsg("確定", side, stModeA ? oL : close, oSL), '
+                        "alert.freq_all)\\n',\n"
+                        '     \'                    alert(f_stAlertMsg("確定", side, stModeA ? oL : close, oSL, '
+                        "tpRef), alert.freq_all)\\n'),\n"
+                        '    ("conf",\n'
+                        "     '                    array.push(stConfLbls, label.new(bar_index, side == 1 ? low : "
+                        'high, f_stAlertMsg("確定", side, stModeA ? oL : close, oSL),\\n\',\n'
+                        "     '                    array.push(stConfLbls, label.new(bar_index, side == 1 ? low : "
+                        'high, f_stAlertMsg("確定", side, stModeA ? oL : close, oSL, tpRef),\\n\'),\n'
+                        '    ("prov", "float pSL      = na\\n", "float pSL      = na\\nfloat pTP      = na\\n"),\n'
+                        '    ("prov", "    [s0, e0, l0] = f_stProvEval()\\n", "    [s0, e0, l0, t0] = '
+                        'f_stProvEval()\\n"),\n'
+                        '    ("prov", "    pSL   := l0\\n", "    pSL   := l0\\n    pTP   := t0\\n"),\n'
+                        '    ("prov",\n'
+                        '     \'    alert(f_stAlertMsg("仮", pSide, pPx, pSL), alert.freq_once_per_bar)\\n\',\n'
+                        '     \'    alert(f_stAlertMsg("仮", pSide, pPx, pSL, pTP), alert.freq_once_per_bar)\\n\'),\n'
+                        '    ("prov",\n'
+                        '     \'        label.set_text(stProvLbl, f_stAlertMsg("仮", pSide, pPx, pSL))\\n\',\n'
+                        '     \'        label.set_text(stProvLbl, f_stAlertMsg("仮", pSide, pPx, pSL, pTP))\\n\'),\n'
+                        '    ("label",\n'
+                        '     "成立中は Entry / SL / SL距離を更新し",\n'
+                        '     "成立中は Entry / SL / SL距離 / TP / RR を更新し"),\n'
+                        ']\n'
+                        '\n'
+                        '\n'
                         'def _apply(src, edits):\n'),
                        ('\ndef build_strategy():\n',
                         '\n'
@@ -216,13 +300,29 @@ ADAPT = {'tests/bte_sim.py': [('    mod = git("diff", "--name-only", "--diff-fil
                         '    return _apply(build_strategy1(), STRATEGY_EDITS2)\n'
                         '\n'
                         '\n'
+                        'def build_strategy3():\n'
+                        '    """UJ-1 + UJ-2 + UJ-3 (commit ab9820f)."""\n'
+                        '    return _apply(build_strategy2(), STRATEGY_EDITS3)\n'
+                        '\n'
+                        '\n'
                         'def build_strategy():\n'),
                        ('def build_strategy():\n    return _apply(build_strategy1(), STRATEGY_EDITS2)\n\n',
-                        'def build_strategy():\n    return _apply(build_strategy2(), STRATEGY_EDITS3)\n\n'),
+                        'def build_strategy():\n    return _apply(build_strategy3(), STRATEGY_EDITS4)\n\n'),
                        ('\ndef strip_strategy(t):\n',
                         '\n'
+                        'def strip_strategy4(t):\n'
+                        '    """reverse only the UJ-4 TP / RR display (-> the UJ-3 Strategy of ab9820f byte for '
+                        'byte)."""\n'
+                        '    return _revert(t, STRATEGY_EDITS4)\n'
+                        '\n'
+                        '\n'
                         'def strip_strategy3(t):\n'
-                        '    """reverse only the UJ-3 labels / SL distance (-> the UJ-2 Strategy byte for byte)."""\n'
+                        '    """reverse the UJ-4 TP / RR display when present (all or nothing) and the UJ-3 labels / '
+                        'SL distance (-> the UJ-2\n'
+                        '    Strategy byte for byte). A text with only part of the UJ-4 edits gives None."""\n'
+                        '    if t is not None and STRATEGY_EDITS4[0][2] in t:     # UJ-4 header present -> the whole '
+                        'UJ-4 layer must revert\n'
+                        '        t = strip_strategy4(t)\n'
                         '    return _revert(t, STRATEGY_EDITS3)\n'
                         '\n'
                         '\n'
@@ -232,7 +332,7 @@ ADAPT = {'tests/bte_sim.py': [('    mod = git("diff", "--name-only", "--diff-fil
                         '    return _revert(strip_strategy2(t), STRATEGY_EDITS)\n'
                         '\n',
                         'def strip_strategy(t):\n'
-                        '    """reverse UJ-3, UJ-2 and UJ-1 (-> the pre-UJ Strategy of 3568c05)."""\n'
+                        '    """reverse UJ-4, UJ-3, UJ-2 and UJ-1 (-> the pre-UJ Strategy of 3568c05)."""\n'
                         '    return _revert(strip_strategy2(strip_strategy3(t)), STRATEGY_EDITS)\n'
                         '\n')],
  'tests/uj_sim.py': [('V0, S0 = ub.base(ub.VIS_PATH), ub.base(ub.STR_PATH)\n'
