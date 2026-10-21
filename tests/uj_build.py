@@ -11,6 +11,8 @@
   (and no order / Track state) when the quantity is invalid or below one step). The GBPJPY alert-text edits of GBS-4 are
   not taken (alerts / labels are out of scope).
 Each strip_*() reverses its edits and must give the source back byte for byte (fixture uj_sim).
+UJ-3 (Strategy only, applied after UJ-2; strip_strategy3() -> the UJ-2 Strategy of e1c3cea): display / notification only -
+provisional / confirmed Entry labels ported from the GBPJPY Strategy (GBS-6) and the SL distance (pips) in both alert texts.
 UJ-2 (applied after UJ-1; strip_*2() reverses only UJ-2 -> the UJ-1 files of commit a6a275c byte for byte): defaults
 adopted from the user's USDJPY Long comparison (shared Zone inputs in Visual and Strategy, Strategy RR 1.5). Defaults
 and the matching comments only: no logic, Engine, sizing, timing, alert or other-symbol change. Not optimal values; the
@@ -163,6 +165,99 @@ STRATEGY_EDITS2 = [
 ]
 
 
+# ---- UJ-3: Entry labels (provisional / confirmed) + SL distance in the alert text (Strategy only; after UJ-2) ------------
+#  Display / notification only. The label layer is the GBPJPY one (gbs_build LBL_EDITS / GBS-6: same inputs, colours,
+#  positions, one provisional label re-set per realtime tick, confirmed labels made in the order branch with the keep
+#  limit, max_labels_count 500), adapted to the USDJPY text (4 arguments, no TP) and to the USDJPY provisional validity
+#  (pSide != 0: the provisional alert condition is unchanged). The alert text gets one line, SL距離 = |Entry - SL| / 0.01
+#  (pips, 0.0); the provisional text uses the reference Entry of the forming bar, the confirmed text the existing order
+#  reference (A limit / B, C, D close). Alert conditions / frequencies, orders, SL / TP, sizing unchanged.
+#  strip_strategy3() reverses only these -> the UJ-2 Strategy (e1c3cea) byte for byte.
+MSG3_OLD = (
+    'f_stAlertMsg(string kind, int side, float ePx, float sl) =>\n'
+    '    "【" + kind + " " + (side == 1 ? "LONG" : "SHORT") + "】" +\n'
+    '     "\\n" + syminfo.tickerid +\n'
+    '     "\\nMode: " + stMode +\n'
+    '     "\\nE: " + f_num(ePx, "#.000") + (stModeA ? " (指値)" : " (参考。次足始値で成行)") +\n'
+    '     "\\nSL: " + f_num(sl, "#.000") +\n')
+MSG3_NEW = (
+    '//  UJ-3: SL距離 (pips) = |Entry - SL| ÷ 0.01 (USDJPY: 0.01 円 = 1 pip、小数 1 桁)。仮は形成中の足の参考 Entry、\n'
+    '//  確定は発注時の参照価格 (A: 指値 / B, C, D: 確定足の終値) から。Entry / SL が na なら "-"\n'
+    'float ST_PIP = 0.01\n'
+    'f_stAlertMsg(string kind, int side, float ePx, float sl) =>\n'
+    '    float slPips = na(ePx) or na(sl) ? na : math.abs(ePx - sl) / ST_PIP\n'
+    '    "【" + kind + " " + (side == 1 ? "LONG" : "SHORT") + "】" +\n'
+    '     "\\n" + syminfo.tickerid +\n'
+    '     "\\nMode: " + stMode +\n'
+    '     "\\nE: " + f_num(ePx, "#.000") + (stModeA ? " (指値)" : " (参考。次足始値で成行)") +\n'
+    '     "\\nSL: " + f_num(sl, "#.000") +\n'
+    '     "\\nSL距離: " + (na(slPips) ? "-" : str.tostring(slPips, "0.0") + " pips") +\n')
+PROV3_OLD = (
+    "varip int stProvBar = na\n"
+    "if stAlertProv and is5mChart and not barstate.isconfirmed and oState == 0 and stSessOK\n"
+    "    if na(stProvBar) or stProvBar != bar_index\n"
+    "        [pSide, pPx, pSL] = f_stProvEval()\n"
+    "        if pSide != 0\n"
+    "            stProvBar := bar_index\n"
+    "            alert(f_stAlertMsg(\"仮\", pSide, pPx, pSL), alert.freq_once_per_bar)\n")
+PROV3_NEW = (
+    "varip int stProvBar = na\n"
+    "//  UJ-3: 仮評価は仮アラート (未送信の足だけ) か仮ラベルが要るときに 1 回。アラートの条件・頻度・重複防止は従来どおり\n"
+    "bool  stPvGate = is5mChart and not barstate.isconfirmed and oState == 0 and stSessOK\n"
+    "bool  stPvA    = stAlertProv and stPvGate and (na(stProvBar) or stProvBar != bar_index)\n"
+    "bool  stPvL    = stLblProv and stPvGate\n"
+    "int   pSide    = 0\n"
+    "float pPx      = na\n"
+    "float pSL      = na\n"
+    "if stPvA or stPvL\n"
+    "    [s0, e0, l0] = f_stProvEval()\n"
+    "    pSide := s0\n"
+    "    pPx   := e0\n"
+    "    pSL   := l0\n"
+    "bool  stPvOK   = pSide != 0\n"
+    "if stPvA and stPvOK\n"
+    "    stProvBar := bar_index\n"
+    "    alert(f_stAlertMsg(\"仮\", pSide, pPx, pSL), alert.freq_once_per_bar)\n"
+    "// 仮ラベル: リアルタイムだけ。1 個のラベルを毎 tick 設定し直す (rollback でも重複・消失しない)。仮通知の送信済み状態は使わない。\n"
+    "//  不成立 / 確定 tick / 表示 OFF は非表示。履歴足では何もしない\n"
+    "if barstate.isrealtime\n"
+    "    if stPvL and stPvOK\n"
+    "        label.set_xy(stProvLbl, bar_index, pSide == 1 ? low : high)\n"
+    "        label.set_yloc(stProvLbl, pSide == 1 ? yloc.belowbar : yloc.abovebar)\n"
+    "        label.set_style(stProvLbl, pSide == 1 ? label.style_label_up : label.style_label_down)\n"
+    "        label.set_color(stProvLbl, ST_LBL_PROV)\n"
+    "        label.set_textcolor(stProvLbl, color.black)\n"
+    "        label.set_text(stProvLbl, f_stAlertMsg(\"仮\", pSide, pPx, pSL))\n"
+    "    else\n"
+    "        label.set_text(stProvLbl, \"\")\n"
+    "        label.set_style(stProvLbl, label.style_none)\n"
+    "        label.set_color(stProvLbl, color(na))\n")
+LBL_INPUTS_UJ = gs.LBL_INPUTS.replace("成立中は Entry / SL / TP / RR を更新し", "成立中は Entry / SL / SL距離を更新し")
+CONF3_OLD = '                    alert(f_stAlertMsg("確定", side, stModeA ? oL : close, oSL), alert.freq_all)\n'
+CONF3_NEW = (
+    CONF3_OLD +
+    '                if stLblConf     // 確定ラベル: 発注した分岐で 1 回 (約定ではない)。確定アラートと同じ値\n'
+    '                    array.push(stConfLbls, label.new(bar_index, side == 1 ? low : high, f_stAlertMsg("確定", side, stModeA ? oL : close, oSL),\n'
+    '                         yloc = side == 1 ? yloc.belowbar : yloc.abovebar, color = side == 1 ? ST_LBL_LONG : ST_LBL_SHORT,\n'
+    '                         textcolor = color.white, style = side == 1 ? label.style_label_up : label.style_label_down, size = size.small))\n'
+    '                    if array.size(stConfLbls) > stLblKeep\n'
+    '                        label.delete(array.shift(stConfLbls))\n')
+STRATEGY_EDITS3 = [
+    ("header",
+     "//  反対 Zone TP OFF、建値移動 OFF (Trigger 値は OFF 時のまま)。\n",
+     "//  反対 Zone TP OFF、建値移動 OFF (Trigger 値は OFF 時のまま)。\n"
+     "//  UJ-3 (表示・通知のみ): 仮 / 確定 Entry ラベル (GBPJPY 版と同じ仕様) と、仮 / 確定アラートの SL距離 (pips = |Entry - SL| ÷ 0.01)。\n"
+     "//  アラートの発火条件・頻度、Entry / SL / TP / 数量 / 注文・約定の処理は変えない。\n"),
+    ("label", "     default_qty_value      = 1)\n", "     default_qty_value      = 1,\n     max_labels_count       = 500)\n"),
+    ("label",
+     '     tooltip = "5分足の確定時に strategy.entry を出したときだけ (約定通知ではない)。")\n',
+     '     tooltip = "5分足の確定時に strategy.entry を出したときだけ (約定通知ではない)。")\n' + LBL_INPUTS_UJ),
+    ("msg", MSG3_OLD, MSG3_NEW),
+    ("label", CONF3_OLD, CONF3_NEW),
+    ("label", PROV3_OLD, PROV3_NEW),
+]
+
+
 def _apply(src, edits):
     out = src
     for _, a, b in edits:
@@ -207,8 +302,13 @@ def build_visual():
     return _apply(build_visual1(), VISUAL_EDITS2)
 
 
-def build_strategy():
+def build_strategy2():
+    """UJ-1 + UJ-2 (commit e1c3cea)."""
     return _apply(build_strategy1(), STRATEGY_EDITS2)
+
+
+def build_strategy():
+    return _apply(build_strategy2(), STRATEGY_EDITS3)
 
 
 def strip_engine(t):
@@ -230,9 +330,14 @@ def strip_visual(t):
     return _revert(strip_visual2(t), VISUAL_EDITS)
 
 
+def strip_strategy3(t):
+    """reverse only the UJ-3 labels / SL distance (-> the UJ-2 Strategy byte for byte)."""
+    return _revert(t, STRATEGY_EDITS3)
+
+
 def strip_strategy(t):
-    """reverse UJ-2 and UJ-1 (-> the pre-UJ Strategy of 3568c05)."""
-    return _revert(strip_strategy2(t), STRATEGY_EDITS)
+    """reverse UJ-3, UJ-2 and UJ-1 (-> the pre-UJ Strategy of 3568c05)."""
+    return _revert(strip_strategy2(strip_strategy3(t)), STRATEGY_EDITS)
 
 
 if __name__ == "__main__":

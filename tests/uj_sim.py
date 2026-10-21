@@ -35,7 +35,8 @@ git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=Tr
 code_only, input_decls, input_values, func, seg = es.code_only, es.input_decls, es.input_values, es.func, es.seg
 E6, EU = rd(ub.ENG_SRC), rd(ub.ENG_PATH)
 V0, S0 = ub.base(ub.VIS_PATH), ub.base(ub.STR_PATH)
-FV, FS = rd(ub.VIS_PATH), rd(ub.STR_PATH)
+FV, FS3 = rd(ub.VIS_PATH), rd(ub.STR_PATH)
+FS = ub.strip_strategy3(FS3) or ""     # UJ-3: labels / SL distance reverted exactly (pinned in ujl_sim)
 UJ1 = "a6a275c"
 V, S = ub.strip_visual2(FV) or "", ub.strip_strategy2(FS) or ""     # UJ-1 layer (UJ-2 defaults reverted)
 GBS = rd("ZoneStrategyGBPJPY.pine")
@@ -63,8 +64,8 @@ def gate_static():
           and code_only(EU).replace('library("ZoneEnginePracticalUSDJPY", overlay = true)', 'library("ZoneEnginePractical", overlay = true)') == code_only(E6)
           and exports(EU) == exports(E6) and len(exports(EU)) > 30)
     check("US-03 Visual / Strategy rebuild from their pre-UJ-1 text (3568c05) and strip back byte for byte",
-          ub.build_visual1() == V and ub.build_strategy1() == S and ub.build_visual() == FV and ub.build_strategy() == FS
-          and ub.strip_visual(FV) == V0 and ub.strip_strategy(FS) == S0
+          ub.build_visual1() == V and ub.build_strategy1() == S and ub.build_visual() == FV and ub.build_strategy2() == FS
+          and ub.strip_visual(FV) == V0 and ub.strip_strategy(FS3) == S0
           and all(k in ("header", "name", "import", "default", "size") for k, _, _ in ub.ENGINE_EDITS + ub.VISUAL_EDITS + ub.STRATEGY_EDITS))
     cv = es.changed_code(V0, V)
     check("US-04 Visual code delta = the import and the Zone Half Width default 0.05 -> 0.03 (user decision)",
@@ -159,7 +160,7 @@ def gate_defaults():
     check("UD-01 UJ-2: strip_visual2 / strip_strategy2 give the UJ-1 files of a6a275c byte for byte; Engine byte-identical to "
           "a6a275c; rebuilding gives the submitted files",
           V == git("show", f"{UJ1}:{ub.VIS_PATH}") and S == git("show", f"{UJ1}:{ub.STR_PATH}")
-          and EU == git("show", f"{UJ1}:{ub.ENG_PATH}") and ub.build_visual() == FV and ub.build_strategy() == FS
+          and EU == git("show", f"{UJ1}:{ub.ENG_PATH}") and ub.build_visual() == FV and ub.build_strategy2() == FS
           and all(k in ("header", "default") for k, _, _ in ub.VISUAL_EDITS2 + ub.STRATEGY_EDITS2)
           and all(any(x is e for x in ub.VISUAL_EDITS2) and any(x is e for x in ub.STRATEGY_EDITS2) for e in ub.ZONE_DEFAULT_EDITS))
     bad = [l for old, new in ((V, FV), (S, FS)) for l in es.changed_code(old, new)
