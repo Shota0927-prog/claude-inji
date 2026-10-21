@@ -15,6 +15,8 @@ UJ-3 (Strategy only, applied after UJ-2; strip_strategy3() -> the UJ-2 Strategy 
 provisional / confirmed Entry labels ported from the GBPJPY Strategy (GBS-6) and the SL distance (pips) in both alert texts.
 UJ-4 (Strategy only, applied after UJ-3; strip_strategy4() -> the UJ-3 Strategy of ab9820f): TP / RR in the provisional /
 confirmed labels and alert texts, the GBPJPY method (the existing pre-order f_stTp result), display / notification only.
+UJ-5 (Strategy only, applied after UJ-4; strip_strategy5() -> the UJ-4 Strategy of 89bc82b): the confirmed alert at most once
+per 5M bar (varip bar key), notification only.
 UJ-2 (applied after UJ-1; strip_*2() reverses only UJ-2 -> the UJ-1 files of commit a6a275c byte for byte): defaults
 adopted from the user's USDJPY Long comparison (shared Zone inputs in Visual and Strategy, Strategy RR 1.5). Defaults
 and the matching comments only: no logic, Engine, sizing, timing, alert or other-symbol change. Not optimal values; the
@@ -319,6 +321,34 @@ STRATEGY_EDITS4 = [
 ]
 
 
+# ---- UJ-5: confirmed alert at most once per 5M bar (Strategy only; after UJ-4) ------------------------------------------
+#  Notification only. The confirmed alert() sits in the order branch of the confirmed-bar block (one call per execution). If
+#  TradingView executes the same bar's confirmed update again in realtime, var state (oState, oSeq ...) is rolled back to the
+#  previous bar's committed values, so the order branch runs again and alert() - a side effect that is never rolled back -
+#  is sent a second time with the same text. A varip bar key (time of the 5M bar) survives the rollback: the confirmed alert
+#  is sent only when it was not yet sent for this bar. Its own state (independent of the provisional stProvBar); a new entry
+#  on another bar has another time and is not suppressed. The order, the label (rolled back / re-made with the execution)
+#  and alert.freq_all are unchanged (freq_once_per_bar is not used: it would also count the provisional alert of the same
+#  bar). strip_strategy5() reverses only these -> the UJ-4 Strategy (89bc82b).
+STRATEGY_EDITS5 = [
+    ("header",
+     "//  発注時の予定値 (最終 TP は約定確認後に実約定価格から設定)。売買・発注・アラート / ラベルの条件は変えない。\n",
+     "//  発注時の予定値 (最終 TP は約定確認後に実約定価格から設定)。売買・発注・アラート / ラベルの条件は変えない。\n"
+     "//  UJ-5 (通知のみ): 確定アラートは同じ 5分足で最大 1 回 (varip の足キー stConfBar。同じ足の確定更新が再計算されても\n"
+     "//  再送しない)。別の足の新規 Entry は抑制しない。仮アラートの stProvBar とは独立。発注・ラベル・freq_all は変えない。\n"),
+    ("dedup",
+     "var int    oClosed = 0\n",
+     "var int    oClosed = 0\n"
+     "varip int  stConfBar = na     // UJ-5: 確定アラートを送った 5分足の time。varip = 同じ足の再計算 (rollback) でも残る\n"),
+    ("dedup",
+     "                if stAlertConf\n"
+     "                    alert(f_stAlertMsg(\"確定\", side, stModeA ? oL : close, oSL, tpRef), alert.freq_all)\n",
+     "                if stAlertConf and (na(stConfBar) or stConfBar != time)     // UJ-5: 同じ 5分足では最大 1 回\n"
+     "                    stConfBar := time\n"
+     "                    alert(f_stAlertMsg(\"確定\", side, stModeA ? oL : close, oSL, tpRef), alert.freq_all)\n"),
+]
+
+
 def _apply(src, edits):
     out = src
     for _, a, b in edits:
@@ -373,8 +403,13 @@ def build_strategy3():
     return _apply(build_strategy2(), STRATEGY_EDITS3)
 
 
-def build_strategy():
+def build_strategy4():
+    """UJ-1 .. UJ-4 (commit 89bc82b)."""
     return _apply(build_strategy3(), STRATEGY_EDITS4)
+
+
+def build_strategy():
+    return _apply(build_strategy4(), STRATEGY_EDITS5)
 
 
 def strip_engine(t):
@@ -396,8 +431,16 @@ def strip_visual(t):
     return _revert(strip_visual2(t), VISUAL_EDITS)
 
 
+def strip_strategy5(t):
+    """reverse only the UJ-5 confirmed-alert dedup (-> the UJ-4 Strategy of 89bc82b byte for byte)."""
+    return _revert(t, STRATEGY_EDITS5)
+
+
 def strip_strategy4(t):
-    """reverse only the UJ-4 TP / RR display (-> the UJ-3 Strategy of ab9820f byte for byte)."""
+    """reverse the UJ-5 dedup when present (all or nothing) and the UJ-4 TP / RR display (-> the UJ-3 Strategy of ab9820f
+    byte for byte)."""
+    if t is not None and STRATEGY_EDITS5[0][2] in t:     # UJ-5 header present -> the whole UJ-5 layer must revert
+        t = strip_strategy5(t)
     return _revert(t, STRATEGY_EDITS4)
 
 
@@ -410,7 +453,7 @@ def strip_strategy3(t):
 
 
 def strip_strategy(t):
-    """reverse UJ-4, UJ-3, UJ-2 and UJ-1 (-> the pre-UJ Strategy of 3568c05)."""
+    """reverse UJ-5, UJ-4, UJ-3, UJ-2 and UJ-1 (-> the pre-UJ Strategy of 3568c05)."""
     return _revert(strip_strategy2(strip_strategy3(t)), STRATEGY_EDITS)
 
 

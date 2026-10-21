@@ -9,6 +9,12 @@
   UM : models — a port of f_stTp + the text: LONG / SHORT, fixed RR 1.5, opposite-zone TP (zone / fixed above Max / skip
        below Min / no zone), Entry A (limit) and B / C / D (close) references, RR formatting, invalid values
   UU : mutations — mirror and source mutations are caught
+  UC : UJ-5 — the confirmed alert at most once per 5M bar: Strategy == build_strategy(); strip_strategy5 gives 89bc82b
+       byte for byte; delta only the varip bar key and the alert guard; order / label / freq_all / provisional unchanged;
+       a model of realtime execution (var rollback, varip kept, alert side effects kept): a repeated confirmed update of
+       the same bar sent 2 alerts before and 1 now, entries on different bars all alert, the provisional alert of the
+       same bar does not suppress it, history sends nothing
+  (UT / UM / UU run on the UJ-4 layer: the working-tree file with exactly the UJ-5 edits reverted == 89bc82b)
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile, realtime alerts and label rendering are external).
 """
@@ -27,7 +33,10 @@ UJ3 = "ab9820f"
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True).stdout
 code_only, func = es.code_only, es.func
-S, S3 = rd(ub.STR_PATH), git("show", f"{UJ3}:{ub.STR_PATH}")
+S5 = rd(ub.STR_PATH)                                  # working-tree file (UJ-5 dedup pinned by the UC checks below)
+S = ub.strip_strategy5(S5) or ""                      # UJ-4 layer (UJ-5 reverted exactly) == 89bc82b
+S3 = git("show", f"{UJ3}:{ub.STR_PATH}")
+UJ4 = "89bc82b"
 GBS = rd("ZoneStrategyGBPJPY.pine")
 MSG = "f_stAlertMsg(string kind, int side, float ePx, float sl, float tp) =>"
 RESULTS = []
@@ -115,8 +124,9 @@ UJ4_TEST_EDITS = {'tests/uj3_adapt.py (code before ADAPT)': [('"""UJ-3 adaptatio
 def gate_static():
     check("UT-01 Strategy == uj_build.build_strategy() (UJ-1 .. UJ-4); strip_strategy4 gives the UJ-3 Strategy of ab9820f byte "
           "for byte; strip_strategy3 still gives e1c3cea; edit kinds header / msg / prov / conf / label",
-          ub.build_strategy() == S and ub.strip_strategy4(S) == S3 and ub.build_strategy3() == S3
-          and ub.strip_strategy3(S) == git("show", f"e1c3cea:{ub.STR_PATH}") and ub.strip_strategy(S) == ub.base(ub.STR_PATH)
+          ub.build_strategy4() == S and ub.strip_strategy4(S) == S3 and ub.build_strategy3() == S3
+          and ub.strip_strategy3(S) == git("show", f"e1c3cea:{ub.STR_PATH}") and ub.strip_strategy(S5) == ub.base(ub.STR_PATH)
+          and ub.strip_strategy4(S5) == S3
           and {k for k, _, _ in ub.STRATEGY_EDITS4} == {"header", "msg", "prov", "conf", "label"})
     removed = sorted(["f_stAlertMsg(string kind, int side, float ePx, float sl) =>",
                       '(kind == "仮" ? "\\n※未確定: 5分足の確定時に不成立になる場合あり" : "\\nTP: 約定確認後に設定")',
@@ -282,8 +292,86 @@ def gate_mutation():
           "recomputed instead of reusing tpRef, RR format changed", all(x != S and ub.strip_strategy4(x) is None for x in muts))
 
 
+def run_bar(state, bar_time, conf_ok, confirmed, varip_key, guarded, realtime=True):
+    """one execution of the confirmed-bar block. state = committed var state (rolled back per execution); varip_key is
+    kept across executions. Returns (new var state, new varip key, alerts sent in this execution)."""
+    st = dict(state)                       # rollback: every execution starts from the committed var values
+    sent = 0
+    if confirmed and st["oState"] == 0 and conf_ok:
+        st["oState"], st["oSeq"] = 1, st["oSeq"] + 1          # order branch (strategy.entry / exit)
+        if not guarded or varip_key != bar_time:
+            if guarded:
+                varip_key = bar_time
+            sent = 1 if realtime else 0                      # alert(): side effect, never rolled back (no alert on history)
+    return st, varip_key, sent
+
+
+def replay(execs, guarded):
+    """execs = list of (bar_time, conf_ok, confirmed, commit[, realtime]). commit=True: the execution's var state is
+    committed (last update of the bar); commit=False: a repeated update of the same bar (its var changes rolled back)."""
+    committed = dict(oState=0, oSeq=0)
+    key, total = None, 0
+    for bt, ok, cf, commit, *rt in execs:
+        st, key, s = run_bar(committed, bt, ok, cf, key, guarded, rt[0] if rt else True)
+        total += s
+        if commit:
+            committed = st
+            if cf and st["oState"] == 1:
+                committed = dict(st, oState=0)               # next bar: the market order filled and closed (state free)
+    return total
+
+
+def gate_dedup():
+    ch = es.changed_code(S, S5)
+    exp = sorted(["if stAlertConf", "if stAlertConf and (na(stConfBar) or stConfBar != time)     // UJ-5: 同じ 5分足では最大 1 回",
+                  "stConfBar := time", "varip int  stConfBar = na     // UJ-5: 確定アラートを送った 5分足の time。varip = 同じ足の再計算 (rollback) でも残る"])
+    check("UC-01 Strategy == uj_build.build_strategy() (UJ-1 .. UJ-5); strip_strategy5 gives the UJ-4 Strategy of 89bc82b byte "
+          "for byte; the code delta is only the varip bar key and the guard of the confirmed alert",
+          ub.build_strategy() == S5 and ub.strip_strategy5(S5) == git("show", f"{UJ4}:{ub.STR_PATH}")
+          and sorted(l for l in ch if l) == exp and {k for k, _, _ in ub.STRATEGY_EDITS5} == {"header", "dedup"}, str(ch))
+    br = block(S5, "            if not skipRef and not na(pQty)\n", "    stPrev := cur")
+    al = re.findall(r"^\s*alert\(.*$", S5, re.M)
+    guard = ("                if stAlertConf and (na(stConfBar) or stConfBar != time)     // UJ-5: 同じ 5分足では最大 1 回\n"
+             "                    stConfBar := time\n"
+             "                    alert(f_stAlertMsg(\"確定\", side, stModeA ? oL : close, oSL, tpRef), alert.freq_all)\n")
+    check("UC-02 the guard: the confirmed alert keeps alert.freq_all and its text; it is sent only when stConfBar (varip, its "
+          "own state, never read by the provisional block) is not this bar's time, and stConfBar is set right before sending; "
+          "strategy.entry / exit and the confirmed label stay outside the guard (unchanged); the provisional block still uses "
+          "only stProvBar",
+          "varip int  stConfBar = na" in S5 and code_only(S5).count("stConfBar") == 4 and guard in br
+          and br.index("strategy.exit(oXid, oEid, stop = oSL)") < br.index("stConfBar") < br.index("if stLblConf")
+          and "stConfBar" not in S5[S5.index("varip int stProvBar = na"):] and len(al) == 2
+          and [l.strip() for l in al] == [l.strip() for l in re.findall(r"^\s*alert\(.*$", S, re.M)])
+    strat = lambda t: sorted(re.findall(r"strategy\.(?:entry|exit|close|cancel)\(.*$", code_only(t), re.M))
+    check("UC-03 trading / display unchanged by UJ-5: every strategy.* call, f_stTp / f_stQty / f_stProvEval, the labels, "
+          "the provisional alert and the strategy() options identical to 89bc82b (the guard only gates alert(), so the "
+          "Strategy Tester result cannot change)",
+          strat(S5) == strat(S) and all(func(S5, h) == func(S, h) for h in ("f_stTp(", "f_stQty(int side, float ref, float sl) =>", "f_stProvEval() =>"))
+          and S5[S5.index("varip int stProvBar = na"):] == S[S.index("varip int stProvBar = na"):]
+          and S5[S5.index("strategy("):S5.index("import ")] == S[S.index("strategy("):S.index("import ")])
+    rep_ = [(1000, True, True, False), (1000, True, True, True)]          # the confirmed update of bar 1000 runs twice
+    check("UC-04 model: the same bar's confirmed update executed twice (the first one rolled back): before UJ-5 2 identical "
+          "confirmed alerts (var oState rolled back to 0 -> the order branch runs again), with the varip key 1",
+          replay(rep_, False) == 2 and replay(rep_, True) == 1)
+    legit = [(1000, True, True, True), (1300, True, True, True), (1600, True, True, True)]
+    rep3 = [e for b in legit for e in ((b[0], True, True, False), b)]
+    check("UC-05 model: entries on different bars (1000 / 1300 / 1600) each send their confirmed alert (3); with a repeat on "
+          "every bar still 3 with the key (6 without)", replay(legit, True) == 3 and replay(legit, False) == 3
+          and replay(rep3, True) == 3 and replay(rep3, False) == 6)
+    prov = [(1000, True, False, False), (1000, True, False, False), (1000, True, True, True)]
+    check("UC-06 model: provisional ticks of the same bar (unconfirmed, stProvBar) do not touch stConfBar -> the confirmed "
+          "alert of that bar is still sent; historical bars send nothing and the key does not block the first realtime bar",
+          replay(prov, True) == 1 and replay([(10, True, True, True, False), (20, True, True, True, False)], True) == 0
+          and replay([(10, True, True, True, False), (1000, True, True, True)], True) == 1)
+    m = S5.replace("(na(stConfBar) or stConfBar != time)", "(na(stConfBar) or stConfBar != bar_index)")
+    m2 = S5.replace("varip int  stConfBar = na", "var int    stConfBar = na")
+    check("UC-07 mutations: a var (rolled back) key or a bar_index key are rejected by the exact strip; the model without "
+          "the guard shows the duplicate", m != S5 and m2 != S5 and ub.strip_strategy5(m) is None
+          and ub.strip_strategy5(m2) is None and replay(rep_, False) == 2)
+
+
 def main():
-    for g in (gate_static, gate_model, gate_mutation):
+    for g in (gate_static, gate_model, gate_mutation, gate_dedup):
         try:
             g()
         except Exception:
