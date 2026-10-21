@@ -36,7 +36,7 @@ import fvg_re10045_sim as fr     # noqa: E402
 
 ROOT = eb.ROOT
 BASE = "4c53b87"
-rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
+rd = lambda p: __import__("cad_build").pre_cad(p, open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else "")   # CAD-1 reverted (pinned in cad_sim)
 show = lambda p, rev=BASE: subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{p}"], capture_output=True, text=True).stdout
 GE, GV, GS = rd(eb.ENG_SRC), rd(eb.VIS_SRC), rd(eb.STR_SRC)
 EE, FV, FS = rd(eb.ENG_PATH), rd(eb.VIS_PATH), rd(eb.STR_PATH)

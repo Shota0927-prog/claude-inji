@@ -133,12 +133,13 @@ def gate_static():
           and all(fr.lint_eager_guards(code_only(t)) == [] for t in (S,)))
     mod = set(git("diff", "--name-only", PREV, "--").split()) | {l[3:] for l in git("status", "--porcelain").split("\n") if l.startswith("??")}
     mod -= {"tests/__pycache__/"}
+    mod = {m for m in mod if not __import__("cad_adapt").ok(m, PREV)}     # CAD-1 (confirmed-alert dedup): exact
     allowed = {ub.STR_PATH, "tests/uj_build.py", "tests/uj_sim.py", "tests/ujl_sim.py", "tests/uj3_adapt.py", "tests/bte_sim.py",
                "tests/xa_sim.py", "tests/xae_sim.py", "tests/xa_build.py", "tests/ujt_sim.py"}
     others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != ub.STR_PATH]
     check("UL-07 vs 7363ef1 only the USDJPY Strategy and the USDJPY generator / fixtures (+ the exact adaptation of four older "
           "fixtures) change; the USDJPY Visual / Engine and every other Pine file byte-identical",
-          mod <= allowed and ub.STR_PATH in mod and not [p for p in others if rd(p) != git("show", f"{PREV}:{p}")],
+          mod <= allowed and ub.STR_PATH in mod and not [p for p in others if rd(p) != git("show", f"{PREV}:{p}") and not __import__("cad_adapt").ok(p, PREV)],
           str(sorted(mod - allowed)))
     hdr = S[:S.index("//@version=5")]
     check("UL-08 header names UJ-3 as display / notification only (no logic change claim beyond that)",

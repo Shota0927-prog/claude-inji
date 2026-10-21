@@ -185,13 +185,13 @@ def gate_static():
     st = git("status", "--porcelain").split("\n")
     mod = set(git("diff", "--name-only", PREV, "--").split()) | {l[3:] for l in st if l.startswith("??")}
     mod -= {"tests/__pycache__/"}
-    mod = {m for m in mod if not __import__("uj3_adapt").ok(m, PREV)}     # UJ-3 (USDJPY labels): exact
+    mod = {m for m in mod if not __import__("uj3_adapt").ok(m, PREV) and not __import__("cad_adapt").ok(m, PREV)}     # UJ-3 / CAD-1: exact
     allowed = {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", "tests/xa_sim.py", "tests/xae_sim.py"}
     others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH)]
     check("XE-10 vs 17d1ca2 only the Gold Visual / Strategy, the new XAUUSD Engine and xa_build / xa_sim / xae_sim change; "
           "every other Pine file (shared /6, GBPJPY / EURUSD / BTC / USDJPY / GBPUSD Engines, other symbols) byte-identical",
           mod <= allowed and {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH} <= mod
-          and not [p for p in others if rd(p) != xb.show(PREV, p) and not __import__("uj3_adapt").pine_ok(p, PREV)], str(sorted(mod - allowed)))
+          and not [p for p in others if rd(p) != xb.show(PREV, p) and not __import__("uj3_adapt").pine_ok(p, PREV) and not __import__("cad_adapt").ok(p, PREV)], str(sorted(mod - allowed)))
     hdr = V[:V.index("//@version=5")] + S[:S.index("//@version=5")]
     check("XE-11 header: XA-4 described as settings parity (initial values give the current Gold computation, not a new "
           "adopted value) in both files; Merge Distance 0 inert; no optimisation / completion claim",

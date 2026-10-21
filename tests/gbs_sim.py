@@ -34,7 +34,7 @@ import fvg_re10045_sim as fr    # noqa: E402
 
 ROOT = gs.ROOT
 BASE = "140a6c9"
-rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
+rd = lambda p: __import__("cad_build").pre_cad(p, open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else "")   # CAD-1 reverted (pinned in cad_sim)
 GBS_FULL = rd(gs.GBS_PATH)
 GBS = gs.strip_qty(GBS_FULL) or ""     # GBS-4 position size reverted: these checks pin GBS-3 (gbq_sim pins GBS-4)
 GBV = rd(gb.GBJ_PATH)

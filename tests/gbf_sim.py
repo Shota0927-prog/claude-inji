@@ -29,7 +29,7 @@ import fvg_re10045_sim as fr    # noqa: E402
 
 ROOT = ge.ROOT
 PREV = "60cc26f"
-rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
+rd = lambda p: __import__("cad_build").pre_cad(p, open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else "")   # CAD-1 reverted (pinned in cad_sim)
 show = lambda p, rev=PREV: subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{p}"], capture_output=True, text=True).stdout
 ENG6, GBE1 = rd(ge.SRC_PATH), show(ge.GBE_PATH)
 GBE = ge.strip_gbe3(rd(ge.GBE_PATH)) or ""     # GBE-2 (Library v2) checks; GBE-3 (Day/Swing Overlap) is pinned in gbd_sim

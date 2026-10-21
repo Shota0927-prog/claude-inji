@@ -330,5 +330,5 @@ def build():
 
 
 if __name__ == "__main__":
-    open(os.path.join(ROOT, GBS_PATH), "w", encoding="utf-8").write(build())
+    open(os.path.join(ROOT, GBS_PATH), "w", encoding="utf-8").write(__import__("cad_build").apply(build()))   # CAD-1: last layer
     print("written", GBS_PATH)

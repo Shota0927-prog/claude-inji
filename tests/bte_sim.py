@@ -22,7 +22,7 @@ import eu_sim as es              # noqa: E402
 import fvg_re10045_sim as fr     # noqa: E402
 
 ROOT = be.ROOT
-rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
+rd = lambda p: __import__("cad_build").pre_cad(p, open(os.path.join(ROOT, p), encoding="utf-8").read())   # CAD-1 reverted (pinned in cad_sim)
 git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True).stdout
 code_only, input_decls, input_values, func, seg = es.code_only, es.input_decls, es.input_values, es.func, es.seg
 GE, BE = rd(be.ENG_SRC), rd(be.ENG_PATH)
@@ -79,12 +79,12 @@ def gate_static():
           and all(fr.lint_eager_guards(code_only(t)) == [] for t in (BE, V, S)))
     mod = git("diff", "--name-only", "--diff-filter=MDR", be.BASE_REV, "--").split()
     rest = [m for m in mod if not (be.bte_pine_ok(m, be.BASE_REV) or be.test_ok(m) or __import__("xa_build").xa_ok(m, be.BASE_REV)
-                                   or __import__("uj3_adapt").pine_ok(m, be.BASE_REV))]   # XA-1 / UJ-3: exact
+                                   or __import__("uj3_adapt").pine_ok(m, be.BASE_REV) or __import__("cad_adapt").ok(m, be.BASE_REV))]   # XA-1 / UJ-3 / CAD-1: exact
     check("BE-07 vs e1c3cea: the BTC Visual / Strategy differ exactly by the new layer, every other changed file is a test / "
           "generator whose edits are recorded exactly in bte_build.TEST_ADAPT; GBPJPY Engine, shared Engines and other "
           "symbols' Pine files untouched", set(mod) >= {bb.BTC_PATH, sb.BTS_PATH} and not rest
           and not [m for m in mod if m.endswith(".pine") and m not in (bb.BTC_PATH, sb.BTS_PATH)
-                   and not __import__("xa_build").xa_ok(m, be.BASE_REV) and not __import__("uj3_adapt").pine_ok(m, be.BASE_REV)], str(rest))
+                   and not __import__("xa_build").xa_ok(m, be.BASE_REV) and not __import__("uj3_adapt").pine_ok(m, be.BASE_REV) and not __import__("cad_adapt").ok(m, be.BASE_REV)], str(rest))
     m = S.replace("import sekine3310/ZoneEnginePracticalBTCUSD/1 as zn", "import sekine3310/ZoneEnginePracticalGBPJPY/3 as zn")
     check("BE-08 mutation: a Strategy still importing GBPJPY/3 (Visual / Strategy mismatch) is detected",
           re.findall(r"^import .*$", V + m, re.M) != ["import sekine3310/ZoneEnginePracticalBTCUSD/1 as zn"] * 2

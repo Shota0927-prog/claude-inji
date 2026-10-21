@@ -41,7 +41,7 @@ import fvg_re10045_sim as fr     # noqa: E402
 
 ROOT = sb.ROOT
 BASE = "f9d9440"
-rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
+rd = lambda p: __import__("cad_build").pre_cad(p, open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else "")   # CAD-1 reverted (pinned in cad_sim)
 GBS = rd(sb.SRC_PATH)
 FULL = rd(sb.BTS_PATH)
 BTS1_COMMIT = "88488dc"

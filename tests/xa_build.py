@@ -462,7 +462,7 @@ def drop_xa(names, rev):
 
 def unadapt(path, text):
     """a test / generator file with its XA-1 edits reverted (unchanged for files not in TEST_ADAPT)."""
-    out = __import__("uj3_adapt").unadapt(path, text)     # UJ-3 edits (later) are reverted first
+    out = __import__("uj3_adapt").unadapt(path, __import__("cad_adapt").unadapt(path, text))     # CAD-1, then UJ-3 edits (later) are reverted first
     for a, b in reversed(TEST_ADAPT.get(path, [])):
         if out is None or out.count(b) != 1:
             return None

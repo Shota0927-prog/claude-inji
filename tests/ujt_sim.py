@@ -192,10 +192,11 @@ def gate_static():
           and all(fr.lint_eager_guards(code_only(t)) == [] for t in (S,)))
     mod = set(git("diff", "--name-only", UJ3, "--").split()) | {l[3:] for l in git("status", "--porcelain").split("\n") if l.startswith("??")}
     mod -= {"tests/__pycache__/"}
+    mod = {m for m in mod if not __import__("cad_adapt").ok(m, UJ3)}     # CAD-1 (confirmed-alert dedup): exact
     recs_ok = []
     for key, pairs in UJ4_TEST_EDITS.items():
         path = key.split(" ")[0]
-        old, new = git("show", f"{UJ3}:{path}"), rd(path)
+        old, new = git("show", f"{UJ3}:{path}"), __import__("cad_adapt").unadapt(path, rd(path))   # CAD-1 edits reverted first
         if "(code before ADAPT)" in key:
             old, new = old[:old.index("\nADAPT = ")], new[:new.index("\nADAPT = ")]
         s = old
@@ -208,7 +209,7 @@ def gate_static():
     check("UT-05 vs ab9820f only the USDJPY Strategy, uj_build, uj3_adapt (record regenerated; code part by exactly the recorded "
           "edits), ujl_sim (exactly the recorded edits: runs on the UJ-3 layer) and this new fixture change; every other Pine "
           "file byte-identical", mod <= {ub.STR_PATH, "tests/uj_build.py", "tests/uj3_adapt.py", "tests/ujl_sim.py", "tests/ujt_sim.py"}
-          and ub.STR_PATH in mod and all(recs_ok) and not [p for p in others if rd(p) != git("show", f"{UJ3}:{p}")],
+          and ub.STR_PATH in mod and all(recs_ok) and not [p for p in others if rd(p) != git("show", f"{UJ3}:{p}") and not __import__("cad_adapt").ok(p, UJ3)],
           str((sorted(mod), recs_ok)))
     hdr = S[:S.index("//@version=5")]
     check("UT-06 header names UJ-4 as display / notification only and the confirmed TP as the planned value",

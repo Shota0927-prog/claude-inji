@@ -123,7 +123,7 @@ STRATEGY_FIXED = [
 ]
 
 
-_rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
+_rd = lambda p: __import__("cad_build").pre_cad(p, open(os.path.join(ROOT, p), encoding="utf-8").read())   # CAD-1 reverted (re-applied on write)
 
 
 def _edits(src_path, fixed):
@@ -186,5 +186,5 @@ def strip_strategy(t):
 
 if __name__ == "__main__":
     for path, fn in ((ENG_PATH, build_engine), (VIS_PATH, build_visual), (STR_PATH, build_strategy)):
-        open(os.path.join(ROOT, path), "w", encoding="utf-8").write(fn())
+        open(os.path.join(ROOT, path), "w", encoding="utf-8").write(__import__("cad_build").apply(fn()) if path == STR_PATH else fn())
         print("written", path)

@@ -221,9 +221,9 @@ def strip_bts(bts):
 
 
 def build():
-    return bts_transform(open(os.path.join(ROOT, SRC_PATH), encoding="utf-8").read())
+    return bts_transform(__import__("cad_build").pre_cad(SRC_PATH, open(os.path.join(ROOT, SRC_PATH), encoding="utf-8").read()))   # CAD-1 reverted
 
 
 if __name__ == "__main__":
-    open(os.path.join(ROOT, BTS_PATH), "w", encoding="utf-8").write(build())
+    open(os.path.join(ROOT, BTS_PATH), "w", encoding="utf-8").write(__import__("cad_build").apply(build()))   # CAD-1: last layer
     print("written", BTS_PATH)

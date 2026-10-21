@@ -487,8 +487,9 @@ def drop_uj(names, rev):
     """remove the USDJPY files from a list of changed paths only when they differ from `rev` exactly by UJ-1."""
     # BTE-1 (later split of the BTC Engine): the BTC Visual / Strategy may also differ, exactly by that layer
     # XA-1 (Gold defaults): ZONE-P / ZONE-ST may also differ, exactly by that layer
+    # CAD-1 (confirmed-alert dedup): the four GBPJPY-lineage Strategies / adapted fixtures may also differ, exactly by it
     return [n for n in names if not ((n in UJ_FILES and uj_ok(n, rev)) or __import__("bte_build").bte_pine_ok(n, rev)
-                                     or __import__("xa_build").xa_ok(n, rev))]
+                                     or __import__("xa_build").xa_ok(n, rev) or __import__("cad_adapt").ok(n, rev))]
 
 
 # ---- exact adaptations of the older fixtures to UJ-1 (each must occur once; unadapt() reverses them) ---------------
