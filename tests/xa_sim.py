@@ -14,6 +14,8 @@ and the XA-2 position size (300,000 JPY base x 3 % = fixed 9,000 JPY planned-los
        model of f_stQty (USDJPY 150 test assumption -> 60 USD): SL 20 -> 0.03 lot qty 3 loss 60, SL 25 -> 0.02 lot qty 2
        loss 50, SL > 60 -> no order, pointvalue 10 -> qty 0.3, Long / Short, na, invalid values, step boundaries, random
        property (planned loss <= budget, one more step would exceed it)  (XQ runs on the XA-1 + XA-2 layer == 69e6f0c)
+  (XS / XQ / XT run on the XA-3 layer: the working-tree files with exactly the XA-4 edits reverted == 17d1ca2;
+   XA-4 itself is pinned by tests/xae_sim.py)
   XT : XA-3 — the Gold Short adopted defaults (検証継続中の初期値): both files == the 69e6f0c files + the XA-3 edits and strip back
        to them byte for byte; the code delta is only Flip 10 -> 5, MA base 2 -> 3, Slope aggregation Sum -> Max (both) and
        SL Buffer 3 -> 1.5 (Strategy); every table value; Visual / Strategy Zone parity; no Strategy trading input in the
@@ -35,7 +37,8 @@ ROOT = xb.ROOT
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True).stdout
 code_only, input_decls, input_values, func, seg = es.code_only, es.input_decls, es.input_values, es.func, es.seg
-VF, SF = rd(xb.VIS_PATH), rd(xb.STR_PATH)
+VF4, SF4 = rd(xb.VIS_PATH), rd(xb.STR_PATH)            # working-tree files (XA-4 pinned in xae_sim)
+VF, SF = xb.strip_visual4(VF4) or "", xb.strip_strategy4(SF4) or ""   # XA-3 layer (XA-4 reverted exactly) == 17d1ca2
 V = xb.strip_visual3(VF) or ""                         # XA-1 layer (XA-3 reverted exactly)
 S2 = xb.strip_strategy3(SF) or ""                      # XA-1 + XA-2 layer (XA-3 reverted exactly) == 69e6f0c
 S = xb.strip_strategy2(S2) or ""                       # XA-1 layer (XA-2 reverted exactly) == 2732772
@@ -59,7 +62,7 @@ CHANGED_S = CHANGED_V | {"stMode", "stDir", "stTpZone"}
 
 def gate_static():
     check("XS-01 both files == f253890 + the XA-1 edits (rebuild identical) and strip back byte for byte",
-          xb.build_visual1() == V and xb.build_strategy1() == S and xb.strip_visual(VF) == V0 and xb.strip_strategy(SF) == S0
+          xb.build_visual1() == V and xb.build_strategy1() == S and xb.strip_visual(VF4) == V0 and xb.strip_strategy(SF4) == S0
           and xb._revert(V, xb.VISUAL_EDITS) == V0
           and xb._revert(S, xb.STRATEGY_EDITS) == S0
           and all(k in ("header", "default") for k, _, _ in xb.VISUAL_EDITS + xb.STRATEGY_EDITS))
@@ -185,7 +188,7 @@ def gate_qty():
     mod = git("diff", "--name-only", XA1_REV, "--").split()
     check("XQ-07 vs 2732772: only ZoneStrategyXAU.pine, ZoneVisualPractical.pine (exactly XA-3) and tests/xa_build.py / "
           "tests/xa_sim.py change (no other Pine / Engine)",
-          set(mod) <= {xb.STR_PATH, xb.VIS_PATH, "tests/xa_build.py", "tests/xa_sim.py"} and xb.STR_PATH in mod
+          set(mod) <= {xb.STR_PATH, xb.VIS_PATH, "tests/xa_build.py", "tests/xa_sim.py"} | {xb.ENG_PATH, "tests/xae_sim.py"} and xb.STR_PATH in mod
           and (xb.VIS_PATH not in mod or V == xb.show(XA1_REV, xb.VIS_PATH)), str(mod))
     hdr = S2[:S2.index("//@version=5")]
     check("XQ-08 comments: 9,000 JPY described as the planned loss at the reference price, not an actual-loss cap",
@@ -256,8 +259,9 @@ XA3_S = XA3_V | {"stBuffer"}
 def gate_xa3():
     V2 = xb.show(XA2_REV, xb.VIS_PATH)
     check("XT-01 both files == the 69e6f0c files + the XA-3 edits (rebuild identical) and strip back to 69e6f0c byte for byte; "
-          "the full chain strips to f253890", xb.build_visual() == VF and xb.build_strategy() == SF and V2 and S2
-          and V == V2 and S2 == xb.show(XA2_REV, xb.STR_PATH) and xb.strip_visual(VF) == V0 and xb.strip_strategy(SF) == S0
+          "the full chain strips to f253890", xb.build_visual3() == VF and xb.build_strategy3() == SF and V2 and S2
+          and V == V2 and S2 == xb.show(XA2_REV, xb.STR_PATH) and xb.strip_visual(VF4) == V0 and xb.strip_strategy(SF4) == S0
+          and VF == xb.show("17d1ca2", xb.VIS_PATH) and SF == xb.show("17d1ca2", xb.STR_PATH)
           and all(k in ("header", "default") for k, _, _ in xb.VISUAL_EDITS3 + xb.STRATEGY_EDITS3))
     bad = [l for old, new, names in ((V2, VF, XA3_V), (S2, SF, XA3_S)) for l in es.changed_code(old, new)
            if not re.match(r"^(" + "|".join(sorted(names)) + r")\s*=\s*input\.\w+\(", l)]
@@ -301,7 +305,8 @@ def gate_xa3():
           and "Flip 5 USD" in hdr and "SL Buffer 1.5" in SF[:SF.index("//@version=5")])
     mod = git("diff", "--name-only", XA2_REV, "--").split()
     check("XT-07 vs 69e6f0c: only the two Gold Pine files (exactly XA-3) and tests/xa_build.py / xa_sim.py change; other "
-          "symbols' Pine files and Engines untouched", set(mod) <= {xb.VIS_PATH, xb.STR_PATH, "tests/xa_build.py", "tests/xa_sim.py"}
+          "symbols' Pine files and Engines untouched (XA-4 adds only the new XAUUSD Engine and xae_sim)",
+          set(mod) <= {xb.VIS_PATH, xb.STR_PATH, "tests/xa_build.py", "tests/xa_sim.py"} | {xb.ENG_PATH, "tests/xae_sim.py"}
           and set(xb.XA_FILES) <= set(mod), str(mod))
     m = SF.replace('flipConfirmDist = input.float(5.0', 'flipConfirmDist = input.float(10.0')
     m2 = VF.replace('slopeBonusMode = input.string("Max"', 'slopeBonusMode = input.string("Sum (per MA)"')
