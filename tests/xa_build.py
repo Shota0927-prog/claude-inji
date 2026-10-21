@@ -11,6 +11,11 @@ symbol currency (USD) with strategy.convert_to_symbol; lot = USD budget / (SL di
 step (1 lot = 100 oz, min / step 0.01), one step less if the floored loss exceeds the budget; qty = lot x ounces per lot /
 syminfo.pointvalue (so SL distance x qty x pointvalue = the planned USD loss); invalid / below the minimum -> no order (and
 no order / Track state written). qty is passed on both the limit (A) and the market (B / C / D) entry.
+XA-3 (applied after XA-1 on ZONE-P and after XA-2 on ZONE-ST; strip_visual3() / strip_strategy3() reverse only XA-3 ->
+the files of 69e6f0c): the Gold Short adopted defaults (検証継続中の初期値). Shared Zone inputs in both files: Flip Confirm
+Distance 10 -> 5, Base Score MA #1 / #2 2 -> 3, Slope Bonus Aggregation Sum (per MA) -> Max (every other table value already
+matches). Strategy only: SL Buffer 3 -> 1.5. The header comments that described the XA-1 values are rewritten to the current
+values. Sizing (XA-2), Engine / import, logic, alerts, breakeven trigger and every other input unchanged.
 Each strip_*() reverses the edits and must give the files of BASE_REV back byte for byte (fixture xa_sim). The older
 fixtures that pin ZONE-P / ZONE-ST read them through pre_xa() (the XA-1 edits reverted) and accept them in their "unchanged"
 checks only when they differ exactly by XA-1.
@@ -55,6 +60,45 @@ STRATEGY_EDITS = [
     ("default",
      'stTpZone = input.bool(true, "TP · Nearest Opposite Zone (Medium+)", group = G_STT)\n',
      'stTpZone = input.bool(false, "TP · Nearest Opposite Zone (Medium+)", group = G_STT)\n'),
+]
+
+
+# ---- XA-3: Gold Short adopted defaults (ZONE-P after XA-1, ZONE-ST after XA-2) ---------------------------------------
+NOTE3 = "Gold Short の比較から採用した、検証継続中の初期値 (最適化完了・Long での検証・将来の有効性確認済みではない)"
+VALUES3 = ("Zone Half Width 6 / Cluster 5 / Break Buffer 10 / Flip 5 USD、Score 閾値 5 / 10 / 15、MA Base 3 / 3、\n"
+           "//  Slope 閾値 1 / 3・Bonus 0 / 1 / 2・集計 Max、Day H/L 3、Accum 3 / 4 / 5、Swing 1 / 2 / 3、Confluence 1 / 2 / 3、RN ON")
+ZONE_EDITS3 = [
+    ("default",
+     'scoreMa1 = input.float(2.0, "Base Score · MA #1", step = 0.5, group = G_MA)\n',
+     'scoreMa1 = input.float(3.0, "Base Score · MA #1", step = 0.5, group = G_MA)\n'),
+    ("default",
+     'scoreMa2 = input.float(2.0, "Base Score · MA #2", step = 0.5, group = G_MA)\n',
+     'scoreMa2 = input.float(3.0, "Base Score · MA #2", step = 0.5, group = G_MA)\n'),
+    ("default",
+     'slopeBonusMode = input.string("Sum (per MA)", "Slope Bonus Aggregation in Cluster",\n',
+     'slopeBonusMode = input.string("Max", "Slope Bonus Aggregation in Cluster",\n'),
+    ("default",
+     'flipConfirmDist = input.float(10.0, "Flip Confirm Distance ($)", step = 0.5, group = G_BF)\n',
+     'flipConfirmDist = input.float(5.0, "Flip Confirm Distance ($)", step = 0.5, group = G_BF)\n'),
+]
+VISUAL_EDITS3 = [
+    ("header",
+     "//  XA-1: Zone Half Width 6 / Break Buffer 10 USD (Cluster 5 / Flip 10 は従来どおり) = 比較継続中の初期値 (ユーザーの XAUUSD 5分足比較設定。最適化完了・将来の有効性確認済みではない)。\n",
+     "//  XA-3: " + NOTE3 + ":\n//  " + VALUES3 + "\n"
+     "//  (Strategy の Zone 入力と共通。売買設定は Strategy 側のみ。XA-1 からの変更: Flip 10→5、MA Base 2→3、Slope 集計 Sum→Max)。\n"),
+] + ZONE_EDITS3
+STRATEGY_EDITS3 = [
+    ("header",
+     "//  XA-1: 比較継続中の初期値 (ユーザーの XAUUSD 5分足比較設定。最適化完了・将来の有効性確認済みではない): Zone Half Width 6 / Cluster 5 / Break Buffer 10 /\n"
+     "//  Flip 10 USD (Zone は ZONE-P と共通)、Entry C: Candle Pattern、Short Only、SL Buffer 3、固定 RR 1.5、反対側 Zone TP OFF、\n"
+     "//  建値移動 OFF。初期資金 10,000・数量 1 固定は従来どおり (資金管理は未追加)。\n",
+     "//  XA-3: " + NOTE3 + ":\n//  " + VALUES3 + " (Zone は ZONE-P と共通)、\n"
+     "//  Entry C: Candle Pattern、Short Only、SL Buffer 1.5、固定 RR 1.5、反対側 Zone TP OFF、建値移動 OFF (Trigger は現行値のまま)。\n"
+     "//  (XA-1 からの変更: Flip 10→5、MA Base 2→3、Slope 集計 Sum→Max、SL Buffer 3→1.5)\n"),
+] + ZONE_EDITS3 + [
+    ("default",
+     'stBuffer = input.float(3.0, "SL Buffer ($)", minval = 0.0, step = 0.5, group = G_ST)\n',
+     'stBuffer = input.float(1.5, "SL Buffer ($)", minval = 0.0, step = 0.5, group = G_ST)\n'),
 ]
 
 
@@ -140,8 +184,13 @@ def show(rev, path):
     return subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{path}"], capture_output=True, text=True).stdout
 
 
-def build_visual():
+def build_visual1():
+    """XA-1 only (commits 2732772 / 69e6f0c)."""
     return _apply(show(BASE_REV, VIS_PATH), VISUAL_EDITS)
+
+
+def build_visual():
+    return _apply(build_visual1(), VISUAL_EDITS3)
 
 
 def build_strategy1():
@@ -149,12 +198,28 @@ def build_strategy1():
     return _apply(show(BASE_REV, STR_PATH), STRATEGY_EDITS)
 
 
-def build_strategy():
+def build_strategy2():
+    """XA-1 + XA-2 (commit 69e6f0c)."""
     return _apply(build_strategy1(), STRATEGY_EDITS2)
 
 
+def build_strategy():
+    return _apply(build_strategy2(), STRATEGY_EDITS3)
+
+
+def strip_visual3(t):
+    """reverse only XA-3 (-> the Visual of 69e6f0c byte for byte)."""
+    return _revert(t, VISUAL_EDITS3)
+
+
 def strip_visual(t):
-    return _revert(t, VISUAL_EDITS)
+    """reverse XA-3 and XA-1 (-> the Visual of BASE_REV byte for byte)."""
+    return _revert(strip_visual3(t), VISUAL_EDITS)
+
+
+def strip_strategy3(t):
+    """reverse only XA-3 (-> the Strategy of 69e6f0c byte for byte)."""
+    return _revert(t, STRATEGY_EDITS3)
 
 
 def strip_strategy2(t):
@@ -163,13 +228,13 @@ def strip_strategy2(t):
 
 
 def strip_strategy(t):
-    """reverse XA-2 and XA-1 (-> the Strategy of BASE_REV byte for byte)."""
-    return _revert(strip_strategy2(t), STRATEGY_EDITS)
+    """reverse XA-3, XA-2 and XA-1 (-> the Strategy of BASE_REV byte for byte)."""
+    return _revert(strip_strategy2(strip_strategy3(t)), STRATEGY_EDITS)
 
 
 # ---- helpers for the older fixtures ------------------------------------------------------------------------------------
 def pre_xa(path, text=None):
-    """ZONE-P / ZONE-ST text with the XA-1 (and on ZONE-ST XA-2) edits reverted (unchanged if they are not present)."""
+    """ZONE-P / ZONE-ST text with the XA-1 / XA-3 (and on ZONE-ST XA-2) edits reverted (unchanged if they are not present)."""
     if text is None:
         text = _rd(path)
     s = (strip_visual if path == VIS_PATH else strip_strategy)(text)
@@ -177,7 +242,7 @@ def pre_xa(path, text=None):
 
 
 def xa_ok(path, rev):
-    """True when the working-tree file differs from `rev` only by the XA-1 (+ XA-2) edits (exact, byte for byte)."""
+    """True when the working-tree file differs from `rev` only by the XA-1 (+ XA-2) + XA-3 edits (exact, byte for byte)."""
     if path not in XA_FILES:
         return False
     s = (strip_visual if path == VIS_PATH else strip_strategy)(_rd(path))

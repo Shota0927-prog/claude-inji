@@ -1,4 +1,4 @@
-"""XA-1 / XA-2 fixtures — Gold comparison defaults in ZoneStrategyXAU.pine (ZONE-ST) and ZoneVisualPractical.pine (ZONE-P),
+"""XA-1 / XA-2 / XA-3 fixtures — Gold comparison defaults in ZoneStrategyXAU.pine (ZONE-ST) and ZoneVisualPractical.pine (ZONE-P),
 and the XA-2 position size (300,000 JPY base x 3 % = fixed 9,000 JPY planned-loss budget, simple interest) in ZONE-ST.
 
   XS : static — both files rebuild from f253890 + the XA-1 edits and strip back byte for byte; the code delta is only the
@@ -13,7 +13,11 @@ and the XA-2 position size (300,000 JPY base x 3 % = fixed 9,000 JPY planned-los
        every order-state change; Track use stays fill-only; Visual / other inputs / fees / requests unchanged; a Python
        model of f_stQty (USDJPY 150 test assumption -> 60 USD): SL 20 -> 0.03 lot qty 3 loss 60, SL 25 -> 0.02 lot qty 2
        loss 50, SL > 60 -> no order, pointvalue 10 -> qty 0.3, Long / Short, na, invalid values, step boundaries, random
-       property (planned loss <= budget, one more step would exceed it)
+       property (planned loss <= budget, one more step would exceed it)  (XQ runs on the XA-1 + XA-2 layer == 69e6f0c)
+  XT : XA-3 — the Gold Short adopted defaults (検証継続中の初期値): both files == the 69e6f0c files + the XA-3 edits and strip back
+       to them byte for byte; the code delta is only Flip 10 -> 5, MA base 2 -> 3, Slope aggregation Sum -> Max (both) and
+       SL Buffer 3 -> 1.5 (Strategy); every table value; Visual / Strategy Zone parity; no Strategy trading input in the
+       Visual; sizing (XA-2) / logic / other inputs / breakeven trigger / requests / Engine import unchanged; header wording
 
 Evidence class: PINE_NOT_VERIFIED (TradingView backtest not reproduced locally).
 """
@@ -31,8 +35,11 @@ ROOT = xb.ROOT
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True).stdout
 code_only, input_decls, input_values, func, seg = es.code_only, es.input_decls, es.input_values, es.func, es.seg
-V, SF = rd(xb.VIS_PATH), rd(xb.STR_PATH)
-S = xb.strip_strategy2(SF) or ""                       # XA-1 layer (XA-2 reverted exactly)
+VF, SF = rd(xb.VIS_PATH), rd(xb.STR_PATH)
+V = xb.strip_visual3(VF) or ""                         # XA-1 layer (XA-3 reverted exactly)
+S2 = xb.strip_strategy3(SF) or ""                      # XA-1 + XA-2 layer (XA-3 reverted exactly) == 69e6f0c
+S = xb.strip_strategy2(S2) or ""                       # XA-1 layer (XA-2 reverted exactly) == 2732772
+XA2_REV = "69e6f0c"
 V0, S0 = xb.show(xb.BASE_REV, xb.VIS_PATH), xb.show(xb.BASE_REV, xb.STR_PATH)
 XA1_REV = "2732772"
 S1 = xb.show(XA1_REV, xb.STR_PATH)
@@ -52,7 +59,8 @@ CHANGED_S = CHANGED_V | {"stMode", "stDir", "stTpZone"}
 
 def gate_static():
     check("XS-01 both files == f253890 + the XA-1 edits (rebuild identical) and strip back byte for byte",
-          xb.build_visual() == V and xb.build_strategy1() == S and xb.strip_visual(V) == V0 and xb.strip_strategy(SF) == S0
+          xb.build_visual1() == V and xb.build_strategy1() == S and xb.strip_visual(VF) == V0 and xb.strip_strategy(SF) == S0
+          and xb._revert(V, xb.VISUAL_EDITS) == V0
           and xb._revert(S, xb.STRATEGY_EDITS) == S0
           and all(k in ("header", "default") for k, _, _ in xb.VISUAL_EDITS + xb.STRATEGY_EDITS))
     bad = [l for old, new, names in ((V0, V, CHANGED_V), (S0, S, CHANGED_S)) for l in es.changed_code(old, new)
@@ -116,7 +124,7 @@ def st_qty(side, ref, sl, bud_jpy=9000.0, usdjpy=150.0, pv=1.0, lot_oz=100.0, lo
 
 def gate_qty():
     check("XQ-01 Strategy == the XA-1 file (2732772) + the XA-2 edits (rebuild identical), strips back to 2732772 byte for "
-          "byte; Visual unchanged since 2732772", xb.build_strategy() == SF and S == S1 and S1
+          "byte; Visual unchanged since 2732772 (XA-1 layer)", xb.build_strategy2() == S2 and S2 == xb.show(XA2_REV, xb.STR_PATH) and S == S1 and S1
           and V == xb.show(XA1_REV, xb.VIS_PATH) and all(k in ("header", "size") for k, _, _ in xb.STRATEGY_EDITS2))
     allowed = (r"^(stCapBase|stRiskPct|stLotOz|stLotMin|stLotStep)\s*=\s*input\.float\(|^var string G_STQ = |^float stBudget = "
                r"|^f_stQty\(int side, float ref, float sl\) =>$|^float  pQty = f_stQty\(side, ref, pSL\)$"
@@ -125,27 +133,27 @@ def gate_qty():
     removed = ["initial_capital        = 10000,", "if not skipRef",
                "strategy.entry(oEid, side == 1 ? strategy.long : strategy.short, limit = oL)",
                "strategy.entry(oEid, side == 1 ? strategy.long : strategy.short)"]
-    ch = es.changed_code(S1, SF)                          # removed + added lines (symmetric)
+    ch = es.changed_code(S1, S2)                          # removed + added lines (symmetric)
     old = [l for l in removed if l in ch]
     added = list(ch)
     for l in removed:
         if l in added:
             added.remove(l)
-    body = [b.strip() for b in code_only(func(SF, "f_stQty(int side, float ref, float sl) =>")).strip().splitlines()[1:]]
+    body = [b.strip() for b in code_only(func(S2, "f_stQty(int side, float ref, float sl) =>")).strip().splitlines()[1:]]
     bad = [l for l in added if l and not re.search(allowed, l) and l not in body and not l.startswith("tooltip = ")]
     check("XQ-02 code delta vs 2732772 is only: initial capital 300000 + currency JPY, the five sizing inputs, the budget, "
           "f_stQty, the pQty gate and qty on both entries (no Entry / exit / Track / alert / label / Engine change)",
           not bad and old == removed and len(added) == len(ch) - 4 and len([l for l in added if l]) == 27, str((bad[:4], old, len(added))))
-    sv = input_values(SF)
+    sv = input_values(S2)
     exp = {"stCapBase": "300000.0", "stRiskPct": "3.0", "stLotOz": "100.0", "stLotMin": "0.01", "stLotStep": "0.01"}
-    hd = seg(SF, "strategy(", "import ")
+    hd = seg(S2, "strategy(", "import ")
     check("XQ-03 strategy(): initial_capital 300000, currency.JPY; inputs base 300,000 JPY, 3.0 %, 1 lot = 100 oz, minimum "
           "0.01, step 0.01; budget = base x rate / 100 (a constant, no strategy.equity / netprofit / balance link)",
           all(sv.get(k) == v for k, v in exp.items()) and "initial_capital        = 300000," in hd
-          and "currency               = currency.JPY," in hd and "float stBudget = stCapBase * stRiskPct / 100.0" in SF
-          and not re.search(r"strategy\.(equity|netprofit|openprofit|initial_capital)", re.sub(r'"[^"\n]*"', '""', code_only(SF)))
+          and "currency               = currency.JPY," in hd and "float stBudget = stCapBase * stRiskPct / 100.0" in S2
+          and not re.search(r"strategy\.(equity|netprofit|openprofit|initial_capital)", re.sub(r'"[^"\n]*"', '""', code_only(S2)))
           and 300000.0 * 3.0 / 100.0 == 9000.0, str({k: sv.get(k) for k in exp}))
-    f = code_only(func(SF, "f_stQty(int side, float ref, float sl) =>"))
+    f = code_only(func(S2, "f_stQty(int side, float ref, float sl) =>"))
     check("XQ-04 f_stQty: JPY budget -> symbol currency via strategy.convert_to_symbol (no fixed USDJPY / 150 / request), "
           "syminfo.pointvalue, distance by side, floor to the step, re-check after floor (one step down), minimum lot, "
           "qty = lot x oz / pointvalue; na guards for distance / pointvalue / inputs / conversion",
@@ -153,34 +161,36 @@ def gate_qty():
           and "math.floor(budSym / (dist * stLotOz * stLotStep) + 1e-9)" in f and "if n * stLotStep * stLotOz * dist > budSym" in f
           and "n >= 1 and n * stLotStep >= stLotMin * (1 - 1e-9)" in f and "q := n * stLotStep * stLotOz / pv" in f
           and "not na(budSym) and budSym > 0" in f and "dist > 0" in f and "pv > 0" in f
-          and not re.search(r"USDJPY|150|request\.|100000", f) and "math.ceil" not in f and SF.count("f_stQty(") == 2)
-    blk = SF[SF.index("float  pQty = f_stQty(side, ref, pSL)"):SF.index("    stPrev := cur")]
+          and not re.search(r"USDJPY|150|request\.|100000", f) and "math.ceil" not in f and S2.count("f_stQty(") == 2)
+    blk = S2[S2.index("float  pQty = f_stQty(side, ref, pSL)"):S2.index("    stPrev := cur")]
     gate = "            if not skipRef and not na(pQty)\n"
-    pre = SF[SF.index("[skipRef, tpRef] = f_stTp(side, ref, pSL"):SF.index(gate)]
+    pre = S2[S2.index("[skipRef, tpRef] = f_stTp(side, ref, pSL"):S2.index(gate)]
     check("XQ-05 one shared quantity function; the gate (not skipRef and not na(pQty)) precedes every order-state change "
           "(oSeq / oEid / oState / entry / exit); qty = pQty on the limit (A) and market (B / C / D) entry; no other "
           "strategy.entry; Track use (stUsed) is still written only on fill / close handling, not at order time",
           blk.startswith("float  pQty = f_stQty(side, ref, pSL)\n" + gate) and not re.search(r"oSeq|oState|strategy\.", pre)
-          and SF.count("strategy.entry(") == 2 and SF.count("qty = pQty") == 2
+          and S2.count("strategy.entry(") == 2 and S2.count("qty = pQty") == 2
           and "qty = pQty, limit = oL)" in blk and "map.put(stUsed" not in blk
-          and SF.count("map.put(stUsed") == S1.count("map.put(stUsed") == 2 and "calc_on_every_tick     = false," in SF
-          and "alert(" not in code_only(SF))
+          and S2.count("map.put(stUsed") == S1.count("map.put(stUsed") == 2 and "calc_on_every_tick     = false," in S2
+          and "alert(" not in code_only(S2))
     req = lambda t: re.findall(r"request\.\w+\(", code_only(t))
-    sd, s1d = input_decls(SF), input_decls(S1)
+    sd, s1d = input_decls(S2), input_decls(S1)
     check("XQ-06 everything else kept: every XA-1 input (Half Width 6, Cluster 5, Break 10, Flip 10, C, Short Only, SL Buffer 3, "
           "RR 1.5, Zone TP OFF, BE OFF) and all other inputs identical; no commission / slippage / margin; Engine import /6; "
           "request list unchanged",
           all(sd[n] == s1d[n] for n in s1d) and set(sd) - set(s1d) == set(exp)
-          and all(input_values(SF).get(n) == x for n, x in {**ZONE, **ST}.items())
-          and not re.search(r"commission|slippage|margin_", hd) and req(SF) == req(S1)
-          and re.findall(r"^import .*$", SF, re.M) == ["import sekine3310/ZoneEnginePractical/6 as zn"])
+          and all(input_values(S2).get(n) == x for n, x in {**ZONE, **ST}.items())
+          and not re.search(r"commission|slippage|margin_", hd) and req(S2) == req(S1)
+          and re.findall(r"^import .*$", S2, re.M) == ["import sekine3310/ZoneEnginePractical/6 as zn"])
     mod = git("diff", "--name-only", XA1_REV, "--").split()
-    check("XQ-07 vs 2732772: only ZoneStrategyXAU.pine and tests/xa_build.py / tests/xa_sim.py change (no other Pine / Engine)",
-          set(mod) <= {xb.STR_PATH, "tests/xa_build.py", "tests/xa_sim.py"} and xb.STR_PATH in mod, str(mod))
-    hdr = SF[:SF.index("//@version=5")]
+    check("XQ-07 vs 2732772: only ZoneStrategyXAU.pine, ZoneVisualPractical.pine (exactly XA-3) and tests/xa_build.py / "
+          "tests/xa_sim.py change (no other Pine / Engine)",
+          set(mod) <= {xb.STR_PATH, xb.VIS_PATH, "tests/xa_build.py", "tests/xa_sim.py"} and xb.STR_PATH in mod
+          and (xb.VIS_PATH not in mod or V == xb.show(XA1_REV, xb.VIS_PATH)), str(mod))
+    hdr = S2[:S2.index("//@version=5")]
     check("XQ-08 comments: 9,000 JPY described as the planned loss at the reference price, not an actual-loss cap",
-          "毎回 9,000 円の予定損失予算・単利" in hdr and "約定ずれ・スプレッド・手数料を含む実損失の上限ではない" in SF
-          and not re.search(r"最大損失は 9,000|損失上限 9,000|実損失.{0,6}9,000", SF))
+          "毎回 9,000 円の予定損失予算・単利" in hdr and "約定ずれ・スプレッド・手数料を含む実損失の上限ではない" in S2
+          and not re.search(r"最大損失は 9,000|損失上限 9,000|実損失.{0,6}9,000", S2))
 
     # ---- model (USDJPY 150 is a test assumption only -> 9,000 JPY = 60 USD) ----
     def eq(r, q, lot, loss):
@@ -225,16 +235,85 @@ def gate_qty():
     check("XQ-15 random property (20,000 cases, USDJPY 100-170, pointvalue 0.5 / 1 / 10 / 100): planned loss <= budget, "
           "one more 0.01 step would exceed it, lot on the 0.01 grid >= 0.01, qty x pointvalue = lot x 100 oz; no order only "
           "when 0.01 lot exceeds the budget", not bad, str(bad[:3]))
-    m = SF.replace("qty = pQty)", ")")
+    m = S2.replace("qty = pQty)", ")")
     check("XQ-16 mutation: a market entry without qty, or a fixed 150 rate, is detected by the exact strip",
           xb.strip_strategy2(m) is None
-          and xb.strip_strategy2(SF.replace("strategy.convert_to_symbol(stBudget)", "stBudget / 150.0")) is None)
+          and xb.strip_strategy2(S2.replace("strategy.convert_to_symbol(stBudget)", "stBudget / 150.0")) is None)
+
+
+XA3_ZONE = {"zoneHalfWidth": "6.0", "clusterDist": "5.0", "breakBuffer": "10.0", "flipConfirmDist": "5.0",
+            "thrMedium": "5.0", "thrStrong": "10.0", "thrVStrong": "15.0", "scoreMa1": "3.0", "scoreMa2": "3.0",
+            "slopeThrMod": "1.0", "slopeThrStrong": "3.0", "slopeBonusFlat": "0.0", "slopeBonusMod": "1.0",
+            "slopeBonusStr": "2.0", "slopeBonusMode": '"Max"', "scoreDayHL": "3.0", "scoreAcc1": "3.0", "scoreAcc2": "4.0",
+            "scoreAcc3": "5.0", "scoreHz1": "1.0", "scoreHz2": "2.0", "scoreHz3": "3.0", "confBonus2": "1.0",
+            "confBonus3": "2.0", "confBonus4": "3.0", "enableRn": "true"}
+XA3_ST = {"stMode": '"C: Candle Pattern"', "stDir": '"Short Only"', "stBuffer": "1.5", "stRR": "1.5", "stTpZone": "false",
+          "stBE": "false"}
+XA3_V = {"flipConfirmDist", "scoreMa1", "scoreMa2", "slopeBonusMode"}
+XA3_S = XA3_V | {"stBuffer"}
+
+
+def gate_xa3():
+    V2 = xb.show(XA2_REV, xb.VIS_PATH)
+    check("XT-01 both files == the 69e6f0c files + the XA-3 edits (rebuild identical) and strip back to 69e6f0c byte for byte; "
+          "the full chain strips to f253890", xb.build_visual() == VF and xb.build_strategy() == SF and V2 and S2
+          and V == V2 and S2 == xb.show(XA2_REV, xb.STR_PATH) and xb.strip_visual(VF) == V0 and xb.strip_strategy(SF) == S0
+          and all(k in ("header", "default") for k, _, _ in xb.VISUAL_EDITS3 + xb.STRATEGY_EDITS3))
+    bad = [l for old, new, names in ((V2, VF, XA3_V), (S2, SF, XA3_S)) for l in es.changed_code(old, new)
+           if not re.match(r"^(" + "|".join(sorted(names)) + r")\s*=\s*input\.\w+\(", l)]
+    cv, cs = es.changed_code(V2, VF), es.changed_code(S2, SF)
+    check("XT-02 the code delta is only the changed defaults (Visual: Flip, MA #1 / #2 base, Slope aggregation; Strategy: those "
+          "+ SL Buffer); options / ranges / labels / tooltips unchanged", not bad and len(cv) == 8 and len(cs) == 10
+          and all(input_decls(VF)[n].replace(input_values(VF)[n], "X", 1) == input_decls(V2)[n].replace(input_values(V2)[n], "X", 1)
+                  for n in XA3_V), str(bad[:4]))
+    vv, vs = input_values(VF), input_values(SF)
+    zb = [n for n, x in XA3_ZONE.items() if vv.get(n) != x or vs.get(n) != x]
+    sb = [n for n, x in XA3_ST.items() if vs.get(n) != x]
+    check("XT-03 every table value: Half Width 6, Cluster 5, Break 10, Flip 5, thresholds 5 / 10 / 15, MA base 3 / 3, Slope "
+          "threshold 1 / 3, bonus 0 / 1 / 2, aggregation Max, Day H/L 3, Accum 3 / 4 / 5, Swing 1 / 2 / 3, Confluence 1 / 2 / 3, RN "
+          "ON (both files); Strategy C, Short Only, SL Buffer 1.5, RR 1.5, Zone TP OFF, BE OFF", not zb and not sb, str((zb, sb)))
+    zone_names = set(input_decls(SF[:SF.index("// ==== ZONE Strategy · Zone evaluation (begin)")]))
+    vd, sd = input_decls(VF), input_decls(SF)
+    check("XT-04 Visual / Strategy share every Zone input declaration and ZoneCfg assignment; the Visual has no Strategy "
+          "trading input (no st* input, no strategy())",
+          zone_names and all(vd.get(n) == sd[n] for n in zone_names) and set(vd) == set(input_decls(V2))
+          and not [n for n in vd if n.startswith("st")] and "strategy(" not in code_only(VF)
+          and re.findall(r"^zoneCfg\.\w+\s*:=.*$", VF, re.M) == re.findall(r"^zoneCfg\.\w+\s*:=.*$", SF, re.M),
+          str([n for n in zone_names if vd.get(n) != sd.get(n)]))
+    s2d, v2d = input_decls(S2), input_decls(V2)
+    req = lambda x: re.findall(r"request\.\w+\(", code_only(x))
+    q = "f_stQty(int side, float ref, float sl) =>"
+    check("XT-05 everything else unchanged: all other inputs (incl. Breakeven Trigger 10 while BE is OFF, Accum detection, "
+          "Swing TF / pivot, MA TF / type / length / slope lookback, FVG, RN step / score), sizing (300,000 JPY / JPY, "
+          "base 300,000 x 3 %, 100 oz, 0.01 / 0.01, f_stQty, qty on both entries), strategy(), Engine import /6, request lists",
+          not [n for n in s2d if n not in XA3_S and s2d[n] != sd.get(n)] and set(s2d) == set(sd)
+          and not [n for n in v2d if n not in XA3_V and v2d[n] != vd.get(n)]
+          and vs.get("stBEDist") == "10.0" and es.func(SF, q) == es.func(S2, q) and SF.count("qty = pQty") == 2
+          and seg(SF, "strategy(", "import ") == seg(S2, "strategy(", "import ")
+          and code_only(SF[SF.index("var string G_STS ="):]) == code_only(S2[S2.index("var string G_STS ="):])
+          and req(SF) == req(S2) and req(VF) == req(V2)
+          and re.findall(r"^import .*$", VF + SF, re.M) == ["import sekine3310/ZoneEnginePractical/6 as zn"] * 2)
+    hdr = VF[:VF.index("//@version=5")] + SF[:SF.index("//@version=5")]
+    check("XT-06 header: 'Gold Short の比較から採用した、検証継続中の初期値' in both files; no optimisation / Long / future claim; "
+          "no old Flip 10 / SL Buffer 3 default left in the header",
+          hdr.count(xb.NOTE3) == 2 and not re.search(r"最適値です|最適化済み|検証完了|将来も有効|Long でも検証済み", hdr.replace(xb.NOTE3, ""))
+          and "Flip 10 USD" not in hdr and "SL Buffer 3、" not in hdr and "Cluster 5 / Flip 10 は従来どおり" not in hdr
+          and "Flip 5 USD" in hdr and "SL Buffer 1.5" in SF[:SF.index("//@version=5")])
+    mod = git("diff", "--name-only", XA2_REV, "--").split()
+    check("XT-07 vs 69e6f0c: only the two Gold Pine files (exactly XA-3) and tests/xa_build.py / xa_sim.py change; other "
+          "symbols' Pine files and Engines untouched", set(mod) <= {xb.VIS_PATH, xb.STR_PATH, "tests/xa_build.py", "tests/xa_sim.py"}
+          and set(xb.XA_FILES) <= set(mod), str(mod))
+    m = SF.replace('flipConfirmDist = input.float(5.0', 'flipConfirmDist = input.float(10.0')
+    m2 = VF.replace('slopeBonusMode = input.string("Max"', 'slopeBonusMode = input.string("Sum (per MA)"')
+    check("XT-08 mutation: a Strategy with Flip still 10 / a Visual with Sum aggregation is detected",
+          xb.strip_strategy3(m) is None and xb.strip_visual3(m2) is None and input_values(m)["flipConfirmDist"] != vv["flipConfirmDist"])
 
 
 def main():
     try:
         gate_static()
         gate_qty()
+        gate_xa3()
     except Exception:
         import traceback
         check("gate_static completed without error", False, traceback.format_exc()[-900:])
