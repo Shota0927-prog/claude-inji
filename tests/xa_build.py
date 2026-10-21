@@ -5,6 +5,12 @@ not confirmed). Shared Zone inputs in both files: Zone Half Width 3 -> 6, Break 
 Confirm Distance 10 already match). Strategy only: Entry Mode D -> C: Candle Pattern, Direction Both -> Short Only, opposite-
 zone TP ON -> OFF (SL Buffer 3, fixed RR 1.5, breakeven OFF already match). Capital 10,000, currency, fixed qty 1, Engine /
 import, logic, alerts and every other input are unchanged.
+XA-2 (Strategy only, applied after XA-1; strip_strategy2() reverses only XA-2 -> the XA-1 Strategy of 2732772): position
+size. Initial capital 300,000 JPY in JPY; fixed (simple) loss budget 元金基準額 300,000 x 3 % = 9,000 JPY, converted to the
+symbol currency (USD) with strategy.convert_to_symbol; lot = USD budget / (SL distance x ounces per lot) floored to the lot
+step (1 lot = 100 oz, min / step 0.01), one step less if the floored loss exceeds the budget; qty = lot x ounces per lot /
+syminfo.pointvalue (so SL distance x qty x pointvalue = the planned USD loss); invalid / below the minimum -> no order (and
+no order / Track state written). qty is passed on both the limit (A) and the market (B / C / D) entry.
 Each strip_*() reverses the edits and must give the files of BASE_REV back byte for byte (fixture xa_sim). The older
 fixtures that pin ZONE-P / ZONE-ST read them through pre_xa() (the XA-1 edits reverted) and accept them in their "unchanged"
 checks only when they differ exactly by XA-1.
@@ -52,6 +58,64 @@ STRATEGY_EDITS = [
 ]
 
 
+# ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
+QTY_BLOCK = (
+    'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
+    'stCapBase = input.float(300000.0, "元金基準額 (円)", minval = 0.0, step = 10000.0, group = G_STQ,\n'
+    '     tooltip = "単利: 予定損失予算はこの基準額 × 損失率で固定 (strategy.equity・残高に連動しない)。strategy の初期資金とは別の入力。")\n'
+    'stRiskPct = input.float(3.0, "損失率 (%)", minval = 0.0, step = 0.1, group = G_STQ)\n'
+    'stLotOz = input.float(100.0, "1 lot のオンス数", minval = 0.0001, step = 1.0, group = G_STQ)\n'
+    'stLotMin = input.float(0.01, "最小 lot", minval = 0.0001, step = 0.01, group = G_STQ)\n'
+    'stLotStep = input.float(0.01, "lot 刻み", minval = 0.0001, step = 0.01, group = G_STQ,\n'
+    '     tooltip = "lot はこの刻みで切り捨て。最小 lot 未満なら発注しない (切り上げない)。")\n'
+    'float stBudget = stCapBase * stRiskPct / 100.0     // 予定損失予算 (円、毎回固定)\n'
+    '\n'
+    '// 数量: 円の予算を strategy.convert_to_symbol で銘柄通貨 (USD) へ換算 (固定 USDJPY なし)。\n'
+    '//  lot = 予算 USD ÷ (SL 距離 × 1 lot のオンス数) を lot 刻みで切り捨て、切り捨て後の予定損失が予算を超えれば 1 刻み下げる。\n'
+    '//  qty (TradingView の数量) = lot × 1 lot のオンス数 ÷ syminfo.pointvalue → SL 距離 × qty × pointvalue = 予定損失 USD\n'
+    '//  (pointvalue = 1 なら 0.03 lot = 3 oz = qty 3)。換算 na / 無効な入力・価格・pointvalue / SL の向き不正 / 距離 0 /\n'
+    '//  最小 lot 未満は na (発注しない)。参照価格 (A: 指値 / B, C, D: 確定足の終値) に対する予定損失であり、\n'
+    '//  約定ずれ・スプレッド・手数料を含む実損失の上限ではない。\n'
+    'f_stQty(int side, float ref, float sl) =>\n'
+    '    float dist   = side == 1 ? ref - sl : sl - ref\n'
+    '    float budSym = stBudget > 0 ? strategy.convert_to_symbol(stBudget) : na     // 予定損失予算 (USD)\n'
+    '    float pv     = syminfo.pointvalue\n'
+    '    float q      = na\n'
+    '    if not na(dist) and dist > 0 and not na(pv) and pv > 0 and stLotOz > 0 and stLotStep > 0 and stLotMin > 0 and not na(budSym) and budSym > 0\n'
+    '        float n = math.floor(budSym / (dist * stLotOz * stLotStep) + 1e-9)     // lot 刻みの個数 (1e-9: 浮動小数の誤差だけ吸収)\n'
+    '        if n * stLotStep * stLotOz * dist > budSym                              // 再確認: 予算超過なら 1 刻み下げる\n'
+    '            n := n - 1\n'
+    '        if n >= 1 and n * stLotStep >= stLotMin * (1 - 1e-9)\n'
+    '            q := n * stLotStep * stLotOz / pv\n'
+    '    q\n')
+STRATEGY_EDITS2 = [
+    ("header",
+     "//  建値移動 OFF。初期資金 10,000・数量 1 固定は従来どおり (資金管理は未追加)。\n",
+     "//  建値移動 OFF。初期資金 10,000・数量 1 固定は従来どおり (資金管理は未追加)。\n"
+     "//  XA-2: 資金管理 (初期資金 300,000 円・JPY、元金基準額 300,000 円 × 3 % = 毎回 9,000 円の予定損失予算・単利、\n"
+     "//  1 lot = 100 oz、最小 / 刻み 0.01 lot で切り捨て、qty = lot × 100 ÷ pointvalue)。数量以外の設定・処理は XA-1 のまま。\n"),
+    ("size",
+     "     initial_capital        = 10000,\n",
+     "     initial_capital        = 300000,\n     currency               = currency.JPY,\n"),
+    ("size",
+     'stBEDist = input.float(10.0, "Breakeven Trigger ($)", minval = 0.0, step = 0.5, group = G_STT)\n',
+     'stBEDist = input.float(10.0, "Breakeven Trigger ($)", minval = 0.0, step = 0.5, group = G_STT)\n' + QTY_BLOCK),
+    ("size",
+     "            [skipRef, tpRef] = f_stTp(side, ref, pSL, f_stNearest(side == 1 ? tpUp : tpDn, side, ref))\n"
+     "            if not skipRef\n",
+     "            [skipRef, tpRef] = f_stTp(side, ref, pSL, f_stNearest(side == 1 ? tpUp : tpDn, side, ref))\n"
+     "            // 数量: 同じ参照価格 (A: 指値 / B, C, D: この確定足の終値) と固定 SL から。無効 / 最小 lot 未満は発注しない\n"
+     "            float  pQty = f_stQty(side, ref, pSL)\n"
+     "            if not skipRef and not na(pQty)\n"),
+    ("size",
+     "                    strategy.entry(oEid, side == 1 ? strategy.long : strategy.short, limit = oL)\n",
+     "                    strategy.entry(oEid, side == 1 ? strategy.long : strategy.short, qty = pQty, limit = oL)\n"),
+    ("size",
+     "                    strategy.entry(oEid, side == 1 ? strategy.long : strategy.short)\n",
+     "                    strategy.entry(oEid, side == 1 ? strategy.long : strategy.short, qty = pQty)\n"),
+]
+
+
 def _apply(src, edits):
     out = src
     for _, a, b in edits:
@@ -80,21 +144,32 @@ def build_visual():
     return _apply(show(BASE_REV, VIS_PATH), VISUAL_EDITS)
 
 
-def build_strategy():
+def build_strategy1():
+    """XA-1 only (commit 2732772)."""
     return _apply(show(BASE_REV, STR_PATH), STRATEGY_EDITS)
+
+
+def build_strategy():
+    return _apply(build_strategy1(), STRATEGY_EDITS2)
 
 
 def strip_visual(t):
     return _revert(t, VISUAL_EDITS)
 
 
+def strip_strategy2(t):
+    """reverse only XA-2 (-> the XA-1 Strategy of 2732772 byte for byte)."""
+    return _revert(t, STRATEGY_EDITS2)
+
+
 def strip_strategy(t):
-    return _revert(t, STRATEGY_EDITS)
+    """reverse XA-2 and XA-1 (-> the Strategy of BASE_REV byte for byte)."""
+    return _revert(strip_strategy2(t), STRATEGY_EDITS)
 
 
 # ---- helpers for the older fixtures ------------------------------------------------------------------------------------
 def pre_xa(path, text=None):
-    """ZONE-P / ZONE-ST text with the XA-1 edits reverted (unchanged if they are not present)."""
+    """ZONE-P / ZONE-ST text with the XA-1 (and on ZONE-ST XA-2) edits reverted (unchanged if they are not present)."""
     if text is None:
         text = _rd(path)
     s = (strip_visual if path == VIS_PATH else strip_strategy)(text)
@@ -102,7 +177,7 @@ def pre_xa(path, text=None):
 
 
 def xa_ok(path, rev):
-    """True when the working-tree file differs from `rev` only by the XA-1 edits (exact, byte for byte)."""
+    """True when the working-tree file differs from `rev` only by the XA-1 (+ XA-2) edits (exact, byte for byte)."""
     if path not in XA_FILES:
         return False
     s = (strip_visual if path == VIS_PATH else strip_strategy)(_rd(path))
