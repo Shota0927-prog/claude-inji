@@ -316,6 +316,112 @@ STRATEGY_EDITS5 = [
 ]
 
 
+# ---- XA-6: Role Reversal Mode (Engine library version 2; Visual / Strategy after XA-5) ----------------------------------
+#  Separates "role change" from "retest reversal confirmation". ZoneCfg.roleOnBreak (Engine default false = the previous
+#  Retest Confirmed behaviour; the previous f_updateTrack branch stays byte-identical under `else if evalBar`).
+#  Confirmed Break (roleOnBreak = true, the scripts' new default): on a confirmed Break-feed bar, RESIST with close > top +
+#  breakBuffer becomes SUPPORT (SUPPORT with close < bottom - breakBuffer becomes RESIST) at once (strict compare, no BROKEN
+#  wait); breakDir / retested keep the reversal confirmation pending separately (flipped stays false). The Break bar is not a
+#  retest; a later confirmed bar overlapping the zone records the retest; a still later bar beyond flipConfirmDist confirms
+#  (flipped, Flip event, Flip Bonus) once. An opposite clear Break while pending discards the pending confirmation and starts
+#  the new direction (resetOnReclaim is not used in this mode). No natural role reversal, no Track re-creation.
+#  strip_engine6 / strip_*6 reverse only these.
+IMPORT_XAE2 = "import sekine3310/ZoneEnginePracticalXAUUSD/2 as zn\n"
+# Library version 2 of ZoneEnginePracticalXAUUSD (/1 stays published). If TradingView assigns another number, change
+# IMPORT_XAE2 and rebuild (python3 tests/xa_build.py).
+ROLE_NEW = (
+    "    //  XA-6 Confirmed Break (c.roleOnBreak): 明確な Break (確定 Break 評価足の終値、strict) のその足で新しい役割にする\n"
+    "    //    (BROKEN では待たせない)。Retest → Flip Confirm の反転確認は breakDir / retested で別に保持し、flipped は確認成立まで\n"
+    "    //    false。Break 足自身は Retest にせず、Retest を記録した足では確認しない。確認待ち中に反対方向の明確な Break が\n"
+    "    //    成立したら前の確認待ちを破棄して新しい方向へ切り替える (resetOnReclaim はこの方式では使わない)。\n"
+    "    if evalBar and c.roleOnBreak\n"
+    "        if evalState == ST_RESIST and bc > t.top + c.breakBuffer\n"
+    "            t.state    := ST_SUPPORT\n"
+    "            t.breakDir := 1\n"
+    "            t.breakBar := bar_index\n"
+    "            t.retested := false\n"
+    "            t.flipped  := false\n"
+    "            t.flipDir  := 0\n"
+    "            handled    := true\n"
+    "            ev := 1\n"
+    "        else if evalState == ST_SUPPORT and bc < t.bottom - c.breakBuffer\n"
+    "            t.state    := ST_RESIST\n"
+    "            t.breakDir := -1\n"
+    "            t.breakBar := bar_index\n"
+    "            t.retested := false\n"
+    "            t.flipped  := false\n"
+    "            t.flipDir  := 0\n"
+    "            handled    := true\n"
+    "            ev := -1\n"
+    "        else if t.breakDir == 1\n"
+    "            handled := true\n"
+    "            if not t.retested\n"
+    "                if bl <= t.top and bh >= t.bottom\n"
+    "                    t.retested := true\n"
+    "            else if bc >= t.top + c.flipConfirmDist\n"
+    "                t.flipped  := true\n"
+    "                t.flipDir  := 1\n"
+    "                t.breakDir := 0\n"
+    "                t.retested := false\n"
+    "                ev := 2\n"
+    "        else if t.breakDir == -1\n"
+    "            handled := true\n"
+    "            if not t.retested\n"
+    "                if bh >= t.bottom and bl <= t.top\n"
+    "                    t.retested := true\n"
+    "            else if bc <= t.bottom - c.flipConfirmDist\n"
+    "                t.flipped  := true\n"
+    "                t.flipDir  := -1\n"
+    "                t.breakDir := 0\n"
+    "                t.retested := false\n"
+    "                ev := -2\n"
+    "    else if evalBar\n")
+ENGINE_EDITS6 = [
+    ("header",
+     "//    以下の「GBPJPY 派生」等は移植元の説明 (履歴)。\n",
+     "//  ★ XA-6 (Library version 2): Role Reversal Mode (ZoneCfg.roleOnBreak)。false (既定) = Retest Confirmed = version 1 と\n"
+     "//    同じ処理 (Break → BROKEN → Retest → Flip Confirm で新しい役割)。true = Confirmed Break = 明確な Break の足で新しい役割にし、\n"
+     "//    Retest → Flip Confirm の反転確認 (flipped / Flip イベント / Flip Bonus) は別に継続する。\n"
+     "//    以下の「GBPJPY 派生」等は移植元の説明 (履歴)。\n"),
+    ("cfg",
+     "    bool   resetOnReclaim     = true\n",
+     "    bool   resetOnReclaim     = true\n"
+     "    bool   roleOnBreak        = false   // XA-6: false = Retest Confirmed (version 1 と同じ) / true = Confirmed Break\n"),
+    ("role",
+     "    if evalBar\n        if evalState == ST_RESIST and bc > t.top + c.breakBuffer\n",
+     ROLE_NEW + "        if evalState == ST_RESIST and bc > t.top + c.breakBuffer\n"),
+]
+HDR6 = ("//  XA-6: Role Reversal Mode (初期 Confirmed Break。Engine ZoneEnginePracticalXAUUSD version 2): 確定した Break 評価足の終値が\n"
+        "//  top + Break Buffer より上 / bottom - Break Buffer より下でその足から Support / Resistance 候補 (BROKEN で待たない)。\n"
+        "//  Retest → Flip Confirm の反転確認 (Flip イベント・Flip Bonus) は別に継続。Retest Confirmed = 変更前の方式 (比較・切り戻し用)。\n"
+        "//  成績への影響は未確認。数値・Zone 生成 / 採点・上位足取得・Break feed は変えない。\n")
+ZONE_EDITS6 = [
+    ("import", IMPORT_XAE, IMPORT_XAE2),
+    ("input",
+     'resetOnReclaim = input.bool(true,  "Reset Broken on Reclaim", group = G_BF)\n',
+     'resetOnReclaim = input.bool(true,  "Reset Broken on Reclaim", group = G_BF,\n'
+     '     tooltip = "Role Reversal Mode = Retest Confirmed のときだけ使う (BROKEN 中に反対側へ明確に戻ったら役割を初期判定に戻す)。\\n" +\n'
+     '     "Confirmed Break では使わない (反対方向の明確な Break がそのまま役割を切り替え、確認待ちを破棄する)。")\n'
+     'roleMode = input.string("Confirmed Break", "Role Reversal Mode", options = ["Retest Confirmed", "Confirmed Break"], group = G_BF,\n'
+     '     tooltip = "Confirmed Break (初期): Break 評価足の確定終値が top + Break Buffer より上なら Support 候補、bottom - Break Buffer\\n" +\n'
+     '     "より下なら Resistance 候補にその足で切り替える (等値は不成立。BROKEN で待たない)。Retest → Flip Confirm の反転確認は別に継続し、\\n" +\n'
+     '     "Flip イベント・Flip Bonus は確認成立時だけ。Retest Confirmed: 変更前の方式 (Break → BROKEN → Retest → Flip Confirm)。比較・切り戻し用。")\n'),
+    ("cfg",
+     "zoneCfg.resetOnReclaim       := resetOnReclaim\n",
+     "zoneCfg.resetOnReclaim       := resetOnReclaim\n"
+     "zoneCfg.roleOnBreak          := roleMode == \"Confirmed Break\"\n"),
+]
+VISUAL_EDITS6 = [
+    ("header", "//  1 つの根拠として数える)。\n", "//  1 つの根拠として数える)。\n" + HDR6),
+] + ZONE_EDITS6
+STRATEGY_EDITS6 = [
+    ("header",
+     "//  建値移動 ON・Trigger 15 USD。Zone 生成・採点・統合条件・Entry・数量・注文 / 取消 / TP / 建値の判定と処理順は変えない。\n",
+     "//  建値移動 ON・Trigger 15 USD。Zone 生成・採点・統合条件・Entry・数量・注文 / 取消 / TP / 建値の判定と処理順は変えない。\n"
+     + HDR6 + "//  Strategy: 新しい役割の Zone を Retest 前から候補評価できる (発注は従来どおり Entry A〜D の条件が必要)。\n"),
+] + ZONE_EDITS6
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -413,17 +519,34 @@ def build_visual4():
     return _apply(build_visual3(), VISUAL_EDITS4)
 
 
-def build_visual():
+def build_visual5():
+    """XA-1 .. XA-5 (commit cbb996d)."""
     return _apply(build_visual4(), VISUAL_EDITS5)
 
 
-def build_engine():
-    """ZoneEnginePracticalXAUUSD = gbe_build.build() (/6 + GBE-1 / GBE-2 / GBE-4) with the XA-4 engine edits."""
+def build_visual():
+    return _apply(build_visual5(), VISUAL_EDITS6)
+
+
+def build_engine1():
+    """ZoneEnginePracticalXAUUSD version 1 = gbe_build.build() (/6 + GBE-1 / GBE-2 / GBE-4) with the XA-4 engine edits."""
     return _apply(_ge.build(), ENGINE_EDITS)
 
 
+def build_engine():
+    """version 2 = version 1 + the XA-6 Role Reversal Mode."""
+    return _apply(build_engine1(), ENGINE_EDITS6)
+
+
+def strip_engine6(t):
+    """reverse only XA-6 (-> the version 1 source of 7363ef1 byte for byte)."""
+    return _revert(t, ENGINE_EDITS6)
+
+
 def strip_engine(t):
-    """reverse the XA-4 engine edits (-> the ZoneEnginePracticalGBPJPY source byte for byte)."""
+    """reverse XA-6 when present (all or nothing) and the XA-4 engine edits (-> the ZoneEnginePracticalGBPJPY source)."""
+    if t is not None and ENGINE_EDITS6[0][2] in t:
+        t = strip_engine6(t)
     return _revert(t, ENGINE_EDITS)
 
 
@@ -447,8 +570,13 @@ def build_strategy4():
     return _apply(build_strategy3(), STRATEGY_EDITS4)
 
 
-def build_strategy():
+def build_strategy5():
+    """XA-1 .. XA-5 (commit cbb996d)."""
     return _apply(build_strategy4(), STRATEGY_EDITS5)
+
+
+def build_strategy():
+    return _apply(build_strategy5(), STRATEGY_EDITS6)
 
 
 def strip_visual3(t):
@@ -456,13 +584,27 @@ def strip_visual3(t):
     return _revert(t, VISUAL_EDITS3)
 
 
+def strip_visual6(t):
+    """reverse only XA-6 (-> the Visual of cbb996d byte for byte)."""
+    return _revert(t, VISUAL_EDITS6)
+
+
+def strip_strategy6(t):
+    """reverse only XA-6 (-> the Strategy of cbb996d byte for byte)."""
+    return _revert(t, STRATEGY_EDITS6)
+
+
 def strip_visual5(t):
-    """reverse only XA-5 (-> the Visual of 7363ef1 / a33d2b0 byte for byte)."""
+    """reverse XA-6 when present (all or nothing) and XA-5 (-> the Visual of 7363ef1 / a33d2b0 byte for byte)."""
+    if t is not None and VISUAL_EDITS6[0][2] in t:
+        t = strip_visual6(t)
     return _revert(t, VISUAL_EDITS5)
 
 
 def strip_strategy5(t):
-    """reverse only XA-5 (-> the Strategy of 7363ef1 / a33d2b0 byte for byte)."""
+    """reverse XA-6 when present (all or nothing) and XA-5 (-> the Strategy of 7363ef1 / a33d2b0 byte for byte)."""
+    if t is not None and STRATEGY_EDITS6[0][2] in t:
+        t = strip_strategy6(t)
     return _revert(t, STRATEGY_EDITS5)
 
 

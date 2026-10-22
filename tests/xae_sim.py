@@ -14,7 +14,11 @@
        and OFF equals the old selection; RN defaults, boundary, major priority, once per zone; RN step check; width
   XU : mutations — mirror and source mutations are caught
   XF : XA-5 — Gold Short adopted defaults (Day/Swing Merge Nearby, Merge Distance 0; Strategy breakeven ON / Trigger 15) on
-       the delivered files; XE / XM / XU run on the XA-4 layer (the files with exactly the XA-5 edits reverted == 7363ef1)
+       the XA-5 layer; XE / XM / XU run on the XA-4 layer (the files with exactly the XA-5 / XA-6 edits reverted == 7363ef1)
+  XR : XA-6 — Role Reversal Mode (Engine version 2, Visual / Strategy default Confirmed Break) on the delivered files: exact
+       build / strip, the previous branch byte-identical under roleOnBreak = false, script delta, unchanged requests / Break
+       feed / orders / values, and a port of f_updateTrack in both modes (symmetric change, wick / buffer / boundary / no
+       evaluation, retest and confirmation timing, opposite Break, no natural reversal, Track / Touch, old transitions)
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile, Library publish, display and Strategy Tester are external; the
 user's TradingView reference result is not reproduced locally).
@@ -38,7 +42,7 @@ PREV = "17d1ca2"
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True).stdout
 code_only, input_decls, input_values, func, seg = es.code_only, es.input_decls, es.input_values, es.func, es.seg
-E, GBE, SW6 = rd(xb.ENG_PATH), rd(ge.GBE_PATH), rd(ge.SRC_PATH)
+E, GBE, SW6 = xb.strip_engine6(rd(xb.ENG_PATH)) or "", rd(ge.GBE_PATH), rd(ge.SRC_PATH)   # Engine version 1 (XA-6 reverted exactly; pinned by XR)
 V, S = xb.strip_visual5(rd(xb.VIS_PATH)) or "", xb.strip_strategy5(rd(xb.STR_PATH)) or ""   # XA-4 layer (XA-5 reverted exactly; pinned by XF)
 V0, S0 = xb.show(PREV, xb.VIS_PATH), xb.show(PREV, xb.STR_PATH)
 RESULTS = []
@@ -82,7 +86,7 @@ def gate_static():
     check("XE-02 Engine == xa_build.build_engine() = gbe_build.build() + the XA-4 edits; strip -> ZoneEnginePracticalGBPJPY.pine "
           "-> (strip_gbe) the /6 source byte for byte; code identical to the GBPJPY Engine except the library name; same "
           "exports / types; ZoneCfg defaults of the three modes = off (Sum / Separate / Separate)",
-          xb.build_engine() == E and xb.strip_engine(E) == GBE and ge.build() == GBE and ge.strip_gbe(xb.strip_engine(E)) == SW6
+          xb.build_engine1() == E and xb.strip_engine(E) == GBE and ge.build() == GBE and ge.strip_gbe(xb.strip_engine(E)) == SW6
           and code_only(E).replace('library("ZoneEnginePracticalXAUUSD"', 'library("ZoneEnginePracticalGBPJPY"') == code_only(GBE)
           and exports(E) == exports(GBE) and len(exports(E)) > 30
           and [k for k, _, _ in xb.ENGINE_EDITS] == ["header", "name"]
@@ -515,12 +519,12 @@ def gate_model():
 
 
 def gate_xa5():
-    V5, S5 = rd(xb.VIS_PATH), rd(xb.STR_PATH)
+    V5, S5 = xb.strip_visual6(rd(xb.VIS_PATH)) or "", xb.strip_strategy6(rd(xb.STR_PATH)) or ""   # XA-5 layer (XA-6 reverted exactly)
     A = "a33d2b0"
     VA, SA = xb.show(A, xb.VIS_PATH), xb.show(A, xb.STR_PATH)
     check("XF-01 XA-5: Visual / Strategy == the a33d2b0 files (= 7363ef1) + the XA-5 edits (rebuild identical) and strip back "
           "byte for byte; edit kinds header / text / default only",
-          xb.build_visual() == V5 and xb.build_strategy() == S5 and xb.strip_visual5(V5) == VA and xb.strip_strategy5(S5) == SA
+          xb.build_visual5() == V5 and xb.build_strategy5() == S5 and xb.strip_visual5(V5) == VA and xb.strip_strategy5(S5) == SA
           and VA == xb.show("7363ef1", xb.VIS_PATH) and SA == xb.show("7363ef1", xb.STR_PATH)
           and {k for k, _, _ in xb.VISUAL_EDITS5 + xb.STRATEGY_EDITS5} <= {"header", "text", "default"})
     cv = sorted(l for l in es.changed_code(VA, V5) if l)
@@ -559,7 +563,7 @@ def gate_xa5():
           "ZoneEnginePracticalXAUUSD/1, f_stQty and both qty = pQty entries, strategy() options, the Zone / FVG / Entry / order "
           "/ cancel / TP / breakeven code (code identical apart from the three default lines and the tooltip), requests",
           not [n for n in vda if n not in chg and vda[n] != vd.get(n)] and not [n for n in sda if n not in chg and sda[n] != sd.get(n)]
-          and set(vda) == set(vd) and set(sda) == set(sd) and rd(xb.ENG_PATH) == xb.show(A, xb.ENG_PATH)
+          and set(vda) == set(vd) and set(sda) == set(sd) and E == xb.show(A, xb.ENG_PATH)
           and re.findall(r"^import .*$", V5 + S5, re.M) == [xb.IMPORT_XAE.strip()] * 2
           and func(S5, QTY_FN) == func(SA, QTY_FN) and S5.count("qty = pQty") == 2
           and seg(S5, "strategy(", "import ") == seg(SA, "strategy(", "import ")
@@ -586,14 +590,224 @@ def gate_xa5():
     others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, xb.STR_PATH)]
     check("XF-07 vs a33d2b0 only the Gold Visual / Strategy, xa_build, xae_sim, cad_sim and cad_adapt change; every other Pine "
           "file (Engines incl. ZoneEnginePracticalXAUUSD, other symbols) byte-identical",
-          mod <= {xb.VIS_PATH, xb.STR_PATH, "tests/xa_build.py", "tests/xae_sim.py", "tests/cad_sim.py", "tests/cad_adapt.py"}
-          and {xb.VIS_PATH, xb.STR_PATH} <= mod and not [p for p in others if rd(p) != git("show", f"{A}:{p}")], str(sorted(mod)))
+          mod <= {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", "tests/xae_sim.py", "tests/cad_sim.py", "tests/cad_adapt.py"}
+          and {xb.VIS_PATH, xb.STR_PATH} <= mod and not [p for p in others if rd(p) != git("show", f"{A}:{p}")
+                                                         and not (p == xb.ENG_PATH and E == git("show", f"{A}:{p}"))], str(sorted(mod)))   # XA-6: Engine exact
     muts = [V5.replace(ds_new, ds_old), S5.replace(be[1], be[0]), S5.replace(be[3], be[2]),
             V5.replace('dsDist = input.float(0.0,', 'dsDist = input.float(0.5,')]
     check("XF-08 mutations do not strip back to a33d2b0: Day/Swing back to Separate, Breakeven OFF, Trigger 10, Merge Distance 0.5",
           all(m != t and f(m) != base for m, t, f, base in zip(muts, [V5, S5, S5, V5],
                                                                  [xb.strip_visual5, xb.strip_strategy5, xb.strip_strategy5, xb.strip_visual5],
                                                                  [VA, SA, SA, VA])))
+
+
+# ---- XA-6: Role Reversal Mode ---------------------------------------------------------------------------------------------
+ST_A, ST_S, ST_R, ST_B = 0, 1, 2, 3
+
+
+def upd(t, role_on_break, eval_bar, bc, bh, bl, buf=10.0, fcd=5.0, reset=True, close=None, variant=None):
+    """port of f_updateTrack (both modes); t = dict(top, bottom, state, lastRole, breakDir, retested, flipped, flipDir)."""
+    ev, prev, handled = 0, t["state"], False
+    ev_state = (ST_S if t["lastRole"] > 0 else ST_R if t["lastRole"] < 0 else ST_A) if prev == ST_A else prev
+    nat = lambda: ST_S if close > t["top"] else ST_R if close < t["bottom"] else ST_A
+    if eval_bar and role_on_break:
+        if ev_state == ST_R and (bc >= t["top"] + buf if variant == "non_strict" else bc > t["top"] + buf):
+            t.update(state=ST_S, breakDir=1, retested=variant == "retest_on_break" and bl <= t["top"], flipped=False, flipDir=0)
+            handled, ev = True, 1
+        elif ev_state == ST_S and bc < t["bottom"] - buf:
+            t.update(state=ST_R, breakDir=-1, retested=t["retested"] if variant == "keep_retest" else False, flipped=False, flipDir=0)
+            handled, ev = True, -1
+        elif t["breakDir"] == 1:
+            handled = True
+            if not t["retested"]:
+                if bl <= t["top"] and bh >= t["bottom"]:
+                    t["retested"] = True
+                    if variant == "flip_on_retest_bar" and bc >= t["top"] + fcd:
+                        t.update(flipped=True, flipDir=1, breakDir=0, retested=False)
+                        ev = 2
+            elif bc >= t["top"] + fcd:
+                t.update(flipped=True, flipDir=1, breakDir=0, retested=False)
+                ev = 2
+        elif t["breakDir"] == -1:
+            handled = True
+            if not t["retested"]:
+                if bh >= t["bottom"] and bl <= t["top"]:
+                    t["retested"] = True
+            elif bc <= t["bottom"] - fcd:
+                t.update(flipped=True, flipDir=-1, breakDir=0, retested=False)
+                ev = -2
+        if variant == "natural" and ev == 0:
+            t["state"] = ST_S if bc > t["top"] else ST_R if bc < t["bottom"] else t["state"]
+    elif eval_bar:
+        if ev_state == ST_R and bc > t["top"] + buf:
+            t.update(state=ST_B, breakDir=1, retested=False, flipped=False, flipDir=0)
+            handled, ev = True, 1
+        elif ev_state == ST_S and bc < t["bottom"] - buf:
+            t.update(state=ST_B, breakDir=-1, retested=False, flipped=False, flipDir=0)
+            handled, ev = True, -1
+        elif prev == ST_B and t["breakDir"] == 1:
+            handled = True
+            if bc < t["bottom"] - buf:
+                t.update(breakDir=0, retested=False)
+                if reset:
+                    t["state"] = nat()
+            elif not t["retested"]:
+                if bl <= t["top"] and bh >= t["bottom"]:
+                    t["retested"] = True
+            elif bc >= t["top"] + fcd:
+                t.update(flipped=True, flipDir=1, state=ST_S, breakDir=0, retested=False)
+                ev = 2
+        elif prev == ST_B and t["breakDir"] == -1:
+            handled = True
+            if bc > t["top"] + buf:
+                t.update(breakDir=0, retested=False)
+                if reset:
+                    t["state"] = nat()
+            elif not t["retested"]:
+                if bh >= t["bottom"] and bl <= t["top"]:
+                    t["retested"] = True
+            elif bc <= t["bottom"] - fcd:
+                t.update(flipped=True, flipDir=-1, state=ST_R, breakDir=0, retested=False)
+                ev = -2
+    if not handled and t["state"] == ST_A:
+        t["state"] = nat()
+    if t["state"] == ST_S:
+        t["lastRole"] = 1
+    elif t["state"] == ST_R:
+        t["lastRole"] = -1
+    return ev
+
+
+def track(state, top=2712.0, bottom=2700.0):
+    return dict(top=top, bottom=bottom, state=state, lastRole=1 if state == ST_S else -1 if state == ST_R else 0, breakDir=0,
+                retested=False, flipped=False, flipDir=0, id=7)
+
+
+def run(t, bars, mode=True, **kw):
+    """bars: (eval, close, high, low). Returns list of (ev, state, flipped, retested, flipBonus)."""
+    out = []
+    for e, c, h, l in bars:
+        ev = upd(t, mode, e, c, h, l, close=c, **kw)
+        out.append((ev, t["state"], t["flipped"], t["retested"], 1.0 if t["flipped"] else 0.0))
+    return out
+
+
+def gate_xa6():
+    E6, V6, S6 = rd(xb.ENG_PATH), rd(xb.VIS_PATH), rd(xb.STR_PATH)
+    B = "cbb996d"
+    E1, VB, SB = xb.show(B, xb.ENG_PATH), xb.show(B, xb.VIS_PATH), xb.show(B, xb.STR_PATH)
+    check("XR-01 XA-6: Engine == xa_build.build_engine() (version 1 + XA-6), Visual / Strategy == build_*(); strip_*6 give the "
+          "cbb996d files byte for byte (Engine version 1 unchanged and still published as /1)",
+          xb.build_engine() == E6 and xb.build_visual() == V6 and xb.build_strategy() == S6 and xb.strip_engine6(E6) == E1
+          and xb.strip_visual6(V6) == VB and xb.strip_strategy6(S6) == SB and xb.build_engine1() == E1)
+    old_block = E1[E1.index("    if evalBar\n        if evalState == ST_RESIST"):E1.index("    //  ★ Practical: natural role reversal 禁止。")]
+    new_block = E6[E6.index("    else if evalBar\n        if evalState == ST_RESIST"):E6.index("    //  ★ Practical: natural role reversal 禁止。")]
+    ch = [l for l in es.changed_code(E1, E6) if l]
+    role_lines = {l.strip() for l in xb.ROLE_NEW.split("\n") if l.strip() and not l.strip().startswith("//")}
+    check("XR-02 Engine delta: the roleOnBreak ZoneCfg field (default false) and the new branch `if evalBar and c.roleOnBreak`; "
+          "the previous branch is byte-identical under `else if evalBar` (roleOnBreak = false -> the version 1 transitions, "
+          "events, flipped / Flip Bonus and Touch exactly); no other Engine line (Zone generation / merge / width / sources / "
+          "scoring / lifetime / RN / Track matching / Touch) changes",
+          new_block[len("    else "):] == old_block[len("    "):]
+          and set(ch) <= role_lines | {"if evalBar", "bool   roleOnBreak        = false   // XA-6: false = Retest Confirmed (version 1 と同じ) / true = Confirmed Break"}
+          and "    bool   roleOnBreak        = false" in E6 and func(E6, "f_updateTouch(ZoneTrack t, Zone z, ZoneCfg c) =>") == func(E1, "f_updateTouch(ZoneTrack t, Zone z, ZoneCfg c) =>"),
+          str([l for l in ch if l not in role_lines][:4]))
+    vd, sd, vdb, sdb = input_decls(V6), input_decls(S6), input_decls(VB), input_decls(SB)
+    cv = sorted(l for l in es.changed_code(VB, V6) if l)
+    cs = sorted(l for l in es.changed_code(SB, S6) if l)
+    check("XR-03 scripts delta (both identical): import ZoneEnginePracticalXAUUSD/1 -> /2, the Role Reversal Mode input (default "
+          "Confirmed Break, options Retest Confirmed / Confirmed Break), the resetOnReclaim tooltip (used only by Retest Confirmed), "
+          "zoneCfg.roleOnBreak := roleMode == \"Confirmed Break\"; Visual / Strategy pass the same Engine setting",
+          cv == cs and vd["roleMode"] == sd["roleMode"] and vd["resetOnReclaim"] == sd["resetOnReclaim"]
+          and input_values(V6)["roleMode"] == '"Confirmed Break"' and 'options = ["Retest Confirmed", "Confirmed Break"]' in vd["roleMode"]
+          and "Retest Confirmed のときだけ使う" in vd["resetOnReclaim"] and input_values(V6)["resetOnReclaim"] == "true"
+          and re.findall(r"^import .*$", V6 + S6, re.M) == [xb.IMPORT_XAE2.strip()] * 2
+          and re.findall(r"^zoneCfg\.\w+\s*:=.*$", V6, re.M) == re.findall(r"^zoneCfg\.\w+\s*:=.*$", S6, re.M)
+          and 'zoneCfg.roleOnBreak          := roleMode == "Confirmed Break"' in V6
+          and set(vd) - set(vdb) == {"roleMode"} and set(sd) - set(sdb) == {"roleMode"}
+          and not [n for n in vdb if n != "resetOnReclaim" and vdb[n] != vd[n]] and not [n for n in sdb if n != "resetOnReclaim" and sdb[n] != sd[n]],
+          str((cv[:3], cs[:3])))
+    req = lambda t: re.findall(r"^.*request\.\w+\(.*$", t, re.M)
+    feed = lambda t: re.findall(r"^.*\b(?:brClose|brHigh|brLow|brEval)\b.*$", code_only(t), re.M)
+    check("XR-04 unchanged: every request line (Swing / Accum HTF [1] + lookahead_on, Break feed), the Break feed (brClose / "
+          "brHigh / brLow / brEval lines), the Strategy code from the Entry inputs on (A-D, orders, cancel, TP, breakeven, session), "
+          "f_stQty and strategy(), every XA-5 value (HW 6, Cluster 5, Break 10, Flip 5, C, Short Only, SL 1.5, RR 1.5, BE ON 15)",
+          req(V6) == req(VB) and req(S6) == req(SB) and feed(V6) == feed(VB) and feed(S6) == feed(SB) and feed(V6)
+          and code_only(S6[S6.index("var string G_ST ="):]) == code_only(SB[SB.index("var string G_ST ="):])
+          and func(S6, QTY_FN) == func(SB, QTY_FN) and seg(S6, "strategy(", "import ") == seg(SB, "strategy(", "import ")
+          and all(input_values(S6).get(n) == x for n, x in dict(zoneHalfWidth="6.0", clusterDist="5.0", breakBuffer="10.0",
+                  flipConfirmDist="5.0", stMode='"C: Candle Pattern"', stDir='"Short Only"', stBuffer="1.5", stRR="1.5",
+                  stBE="true", stBEDist="15.0").items()))
+    hdr = V6[:V6.index("//@version=5")] + S6[:S6.index("//@version=5")]
+    check("XR-05 descriptions: Role Reversal Mode explained in both headers (Retest Confirmed = previous method for comparison / "
+          "rollback), effect on results not confirmed; no improvement claim",
+          hdr.count("XA-6: Role Reversal Mode") == 2 and hdr.count("成績への影響は未確認") == 2
+          and not re.search(r"改善しました|成績が向上|最適化済み|検証完了", hdr))
+    # models: zone [2700, 2712], Break Buffer 10, Flip Confirm 5 -> up break > 2722, down break < 2690, confirm >= 2717 / <= 2695
+    up = run(track(ST_R), [(True, 2722.01, 2723, 2710)])
+    dn = run(track(ST_S), [(True, 2689.99, 2701, 2688)])
+    check("XR-06 symmetric role change on the confirmed Break-feed close: RESIST + close 2722.01 > top + 10 -> SUPPORT (Break +1, "
+          "flipped false); SUPPORT + close 2689.99 < bottom - 10 -> RESIST (Break -1, flipped false); no BROKEN wait",
+          up == [(1, ST_S, False, False, 0.0)] and dn == [(-1, ST_R, False, False, 0.0)])
+    nochg = [run(track(ST_R), [(True, 2715.0, 2730.0, 2705.0)]), run(track(ST_R), [(True, 2721.0, 2722, 2711)]),
+             run(track(ST_R), [(True, 2722.0, 2723, 2711)]), run(track(ST_R), [(False, 2740.0, 2741, 2735)]),
+             run(track(ST_S), [(True, 2690.0, 2701, 2689)])]
+    check("XR-07 no change for a wick only (high 2730, close 2715), a close short of the buffer (2721), a close exactly at the "
+          "boundary (2722.000 / 2690.000, strict), or an unconfirmed / non-evaluation bar (close 2740)",
+          all(r[0][0] == 0 and r[0][1] in (ST_R, ST_S) for r in nochg) and nochg[0][0][1] == ST_R and nochg[4][0][1] == ST_S)
+    seq = run(track(ST_R), [(True, 2723.0, 2724, 2705), (True, 2718.0, 2719, 2711), (True, 2716.0, 2717, 2713),
+                            (True, 2717.0, 2718, 2714), (True, 2720.0, 2721, 2716)])
+    check("XR-08 Break bar overlapping the zone is not a retest (retested false); the next overlapping bar records the retest and "
+          "does not confirm even with close 2718 >= 2717; a later bar below 2717 does not confirm; close 2717 confirms once "
+          "(Flip +2, flipped, Flip Bonus from that bar); no second Flip afterwards",
+          [x[0] for x in seq] == [1, 0, 0, 2, 0] and [x[3] for x in seq] == [False, True, True, False, False]
+          and [x[2] for x in seq] == [False, False, False, True, True] and [x[4] for x in seq] == [0.0, 0.0, 0.0, 1.0, 1.0]
+          and all(x[1] == ST_S for x in seq))
+    opp = run(track(ST_R), [(True, 2723.0, 2724, 2716), (True, 2714.0, 2715, 2708), (True, 2688.0, 2709, 2687),
+                            (True, 2690.0, 2694, 2689), (True, 2694.0, 2701, 2690), (True, 2695.0, 2698, 2694)])
+    check("XR-09 opposite clear Break while pending: up break, retest recorded, then close 2688 < 2690 -> RESIST, Break -1, the "
+          "old retest discarded (no immediate confirmation at 2690 <= 2695 without a new retest); new retest at 2701 overlap, "
+          "confirm at 2695 (Flip -2) once",
+          [x[0] for x in opp] == [1, 0, -1, 0, 0, -2] and [x[3] for x in opp][:4] == [False, True, False, False]
+          and opp[2][1] == ST_R and opp[-1][2] is True and opp[-1][1] == ST_R)
+    back = run(track(ST_R), [(True, 2723.0, 2724, 2716), (True, 2705.0, 2713, 2704), (True, 2695.0, 2706, 2694), (True, 2691.0, 2700, 2690)])
+    check("XR-10 after the up break, closes back inside the zone (2705) or below it but short of the buffer (2695 / 2691) keep "
+          "SUPPORT (no natural reversal; the Track keeps its id)", all(x[1] == ST_S for x in back) and [x[0] for x in back] == [1, 0, 0, 0])
+    o = run(track(ST_R), [(True, 2723.0, 2724, 2716), (True, 2714.0, 2715, 2708), (True, 2718.0, 2719, 2715)], mode=False)
+    r = run(track(ST_R), [(True, 2723.0, 2724, 2716), (True, 2680.0, 2690, 2679)], mode=False)
+    check("XR-11 Retest Confirmed (roleOnBreak false) keeps the previous transitions: up break -> BROKEN, retest, confirm -> "
+          "SUPPORT + flipped (Flip +2); reclaim below bottom - buffer with resetOnReclaim -> role from the close (RESIST), no Flip",
+          [x[:3] for x in o] == [(1, ST_B, False), (0, ST_B, False), (2, ST_S, True)] and [x[:3] for x in r] == [(1, ST_B, False), (0, ST_R, False)])
+    t1 = track(ST_R)
+    run(t1, [(True, 2723.0, 2724, 2716)])
+    check("XR-12 Track continuity / used records: the role change edits only state / breakDir / retested / flipped of the same "
+          "Track (id kept, no new Track, Strategy stUsed untouched: the Strategy order code is unchanged); Touch formula unchanged "
+          "(f_updateTouch identical) - the only Touch difference is that the pending zone is SUPPORT / RESIST (countable) instead "
+          "of BROKEN (not counted)",
+          t1["id"] == 7 and t1["state"] == ST_S and "map.put(stUsed" in S6 and code_only(S6).count("map.put(stUsed") == code_only(SB).count("map.put(stUsed")
+          and func(E6, "f_updateTouch(ZoneTrack t, Zone z, ZoneCfg c) =>") == func(E1, "f_updateTouch(ZoneTrack t, Zone z, ZoneCfg c) =>")
+          and "bool eligible = z.strength >= SR_STRONG and (t.state == ST_SUPPORT or t.state == ST_RESIST)" in E6)
+    bad = []
+    for v, bars, st0, want in (("non_strict", [(True, 2722.0, 2723, 2711)], ST_R, [(0, ST_R, False, False, 0.0)]),
+                               ("retest_on_break", [(True, 2723.0, 2724, 2705), (True, 2718.0, 2719, 2716)], ST_R, None),
+                               ("flip_on_retest_bar", [(True, 2723.0, 2724, 2716), (True, 2718.0, 2719, 2711)], ST_R, None),
+                               ("keep_retest", None, ST_R, None), ("natural", [(True, 2723.0, 2724, 2716), (True, 2695.0, 2706, 2694)], ST_R, None)):
+        if v == "keep_retest":
+            got = run(track(ST_R), [(True, 2723.0, 2724, 2716), (True, 2714.0, 2715, 2708), (True, 2688.0, 2709, 2687), (True, 2690.0, 2694, 2689)], variant=v)
+            bad.append([x[0] for x in got] != [1, 0, -1, 0])
+        elif v == "non_strict":
+            bad.append(run(track(st0), bars, variant=v) != want)
+        elif v == "retest_on_break":
+            bad.append([x[0] for x in run(track(st0), bars, variant=v)] != [1, 0])
+        elif v == "flip_on_retest_bar":
+            bad.append([x[0] for x in run(track(st0), bars, variant=v)] != [1, 0])
+        else:
+            bad.append([x[1] for x in run(track(st0), bars, variant=v)] != [ST_S, ST_S])
+    m = E6.replace("        if evalState == ST_RESIST and bc > t.top + c.breakBuffer\n            t.state    := ST_SUPPORT\n",
+                   "        if evalState == ST_RESIST and bc >= t.top + c.breakBuffer\n            t.state    := ST_SUPPORT\n")
+    check("XR-13 mutations caught: non-strict boundary, retest on the Break bar, confirmation on the retest bar, retest kept "
+          "across an opposite Break, natural reversal inside the zone (mirror); Engine source mutation rejected by the exact strip",
+          all(bad) and m != E6 and xb.strip_engine6(m) is None, str(bad))
 
 
 def gate_mutation():
@@ -623,7 +837,7 @@ def gate_mutation():
 
 
 def main():
-    for g in (gate_static, gate_model, gate_mutation, gate_xa5):
+    for g in (gate_static, gate_model, gate_mutation, gate_xa5, gate_xa6):
         try:
             g()
         except Exception:
