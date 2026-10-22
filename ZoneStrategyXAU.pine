@@ -27,6 +27,8 @@
 //  XA-7: Entry Timing (初期 Current = 変更前の発注方式)。SATS Pullback = Entry C の発注条件で待機を準備し、次の 5分足以降に
 //  SATS 線 (LINE1 / LINE2 / STB、足 t-1 の確定値) への接触と終値での戻りで成行発注。SL0 / TP0 は準備時に固定。成績への影響は未確認。
 //  XA-8: SATS の実 RR を約定足内で SL 決済まで終わった約定でも記録 (closed trade の実約定価格 + SL0 / TP0。注文は出さない)。
+//  XA-9: SATS Pullback の準備後は元 Zone の Strong 資格・Track を再審査しない (取消は期限と SL0 到達だけ)。SATS 線への接触を記録し、
+//  接触足で戻る場合 (A) と、接触後の別の足で前足終値 → 当足終値が同じ線 L を越えて戻る場合 (B) を反発とする。成績への影響は未確認。
 // ============================================================================
 //  ・Zone 判定は ZONE-P と同一: ZoneEnginePracticalXAUUSD/1 (= /6 の Swing 最大点 + XA-4 の比較用モード) / 入力 / Source 取得 / NR-S1 / NR-A1 /
 //    RN / Break / zn.update / FVG Batch A (検知・保存・完全埋め・期限) は ZONE-P の本文をそのまま使う
@@ -1257,8 +1259,12 @@ var float pwRRFill = na
 var int   pwNPrep  = 0
 var int   pwNOrder = 0
 var int   pwNExp   = 0
-var int   pwNTrk   = 0
-var int   pwNZone  = 0
+var bool  pwTouched  = false   // XA-9: 接触済み (反発待ち)
+var int   pwTouchK   = 0       // XA-9: 接触した線の種類 (1 LINE1 / 2 LINE2 / 3 STB)
+var int   pwTouchBar = na      // XA-9: 接触した足
+var int   pwNTouchPrep = 0     // XA-9: 接触を経験した準備の件数 (同じ準備で何度触れても 1 件)
+var int   pwNOrdSame   = 0     // XA-9: 同じ足の接触・反発 (A) で発注した件数
+var int   pwNOrdLater  = 0     // XA-9: 接触後の別の足の戻り (B) で発注した件数
 var int   pwNSL    = 0
 var int   pwNBad   = 0
 var int   pwRRWhy  = na      // XA-8: 実 RR の理由 (0 計算可 / 1 risk <= 0 / 2 reward <= 0 / 3 na)
@@ -1462,25 +1468,18 @@ if is5mChart and barstate.isconfirmed
         oState    := 0
         cancelBar := true
 
-    // (3b) XA-7 SATS Pullback の待機判定 (準備足の次の足から)。取消を反発より優先する
-    //   取消: 期限 (準備足の終了時刻からの実時間) / Track 消失 / 同方向の候補 (Strong 資格) でない / SL0 到達。使用済み Track にはしない
-    //   判定: 足 t-1 の確定線から選んだ L に足 t が接触し (low <= L <= high)、終値が戻る (Long: close > L、SL0 < close < P0)
+    // (3b) XA-7 / XA-9 SATS Pullback の待機判定 (準備足の次の足から)。取消を反発より優先する
+    //   取消 (XA-9): 期限 (準備足の終了時刻からの実時間) / 固定 SL0 到達 だけ。元 Zone の Strong 資格・Track の存続 / 一致・候補一覧
+    //   からの脱落では取り消さない (保存した方向 / P0 / SL0 / TP0 を使い続ける)。取消だけでは使用済み Track にしない
+    //   接触前: 毎足、足 t-1 の確定線と前足終値から最寄りの適格線を選び直す。low <= L <= high で接触 → 線の種類を記録
+    //   接触後: 記録した種類の線の足 t-1 確定値を毎足使う (別の線へ選び替えない。前足終値との位置関係は再要求しない)。
+    //           na / SL0〜P0 の範囲外の足は発注しないが、接触記録は消さない
+    //   反発: A = その足で接触して終値が戻る / B = 接触済みで、前足終値 <= L (Short は >=) かつ当足終値 > L (Short は <)
     bool  pwCancelBar = false
     if stSats and pwState == 1 and bar_index > pwBar
-        bool zOK = false
-        int  nc  = array.size(cur)
-        if nc > 0
-            for k = 0 to nc - 1
-                StCand x = array.get(cur, k)
-                if x.track == pwTrack and x.side == pwSide
-                    zOK := true
         int why = 0
         if time_close - pwEndT >= stSatsWait * 60000
             why := -1
-        else if array.indexof(curTrk, pwTrack) < 0
-            why := -2
-        else if not zOK
-            why := -3
         else if pwSide == 1 ? low <= pwSL0 : high >= pwSL0
             why := -4
         if why != 0
@@ -1488,15 +1487,33 @@ if is5mChart and barstate.isconfirmed
             pwCancelBar := true
             pwEv        := why
             pwNExp  += why == -1 ? 1 : 0
-            pwNTrk  += why == -2 ? 1 : 0
-            pwNZone += why == -3 ? 1 : 0
             pwNSL   += why == -4 ? 1 : 0
+            pwTouched  := false
+            pwTouchK   := 0
+            pwTouchBar := na
         else
-            [lk, lp] = f_satPick(pwSide, pwP0, pwSL0, close[1], satL1[1], satL2[1], satStb[1])
+            int   lk = 0
+            float lp = na
+            if not pwTouched
+                [k0, v0] = f_satPick(pwSide, pwP0, pwSL0, close[1], satL1[1], satL2[1], satStb[1])
+                lk := k0
+                lp := v0
+            else
+                lk := pwTouchK
+                lp := pwTouchK == 1 ? satL1[1] : pwTouchK == 2 ? satL2[1] : satStb[1]
             pwLineK := lk
             pwLineP := lp
-            bool hit = lk != 0 and low <= lp and lp <= high and (pwSide == 1 ? (close > lp and close > pwSL0 and close < pwP0) : (close < lp and close < pwSL0 and close > pwP0))
-            if hit and stSessOK and oState == 0
+            bool inRange  = lk != 0 and not na(lp) and (pwSide == 1 ? (lp > pwSL0 and lp < pwP0) : (lp < pwSL0 and lp > pwP0))
+            bool touchNow = inRange and low <= lp and lp <= high
+            bool rebA     = touchNow and (pwSide == 1 ? close > lp : close < lp)
+            bool rebB     = pwTouched and inRange and (pwSide == 1 ? (close[1] <= lp and close > lp) : (close[1] >= lp and close < lp))
+            if touchNow and not pwTouched
+                pwTouched    := true
+                pwTouchK     := lk
+                pwTouchBar   := bar_index
+                pwNTouchPrep += 1
+            bool priceOK = pwSide == 1 ? (close > pwSL0 and close < pwP0) : (close < pwSL0 and close > pwP0)
+            if (rebA or rebB) and priceOK and stSessOK and oState == 0
                 float q = f_stQty(pwSide, close, pwSL0)
                 if not na(q)
                     oSeq    += 1
@@ -1522,6 +1539,11 @@ if is5mChart and barstate.isconfirmed
                     pwState  := 0
                     pwEv     := 2
                     pwNOrder += 1
+                    pwNOrdSame  += rebA ? 1 : 0
+                    pwNOrdLater += rebA ? 0 : 1
+                    pwTouched  := false
+                    pwTouchK   := 0
+                    pwTouchBar := na
 
     // (4) 新規 Entry (注文が無く、取消をした足でなく、時間帯の中のときだけ)
     if oState == 0 and not cancelBar and stSessOK
@@ -1625,6 +1647,9 @@ if is5mChart and barstate.isconfirmed
                     pwRRPrep := side * (tpRef - ref) / (side * (ref - pSL))
                     pwEv     := 1
                     pwNPrep  += 1
+                    pwTouched  := false     // XA-9: 新しい準備は接触待ちから
+                    pwTouchK   := 0
+                    pwTouchBar := na
             else if not skipRef and not na(pQty)
                 oSeq    += 1
                 oEid    := (side == 1 ? "L" : "S") + str.tostring(oSeq)
@@ -1674,7 +1699,11 @@ plot(stSats ? pwFillPath : na,             "SATS · 記録経路 (1 保有中 / 
 plot(stSats ? pwNPrep : na,                "SATS · 準備件数",          display = display.data_window)
 plot(stSats ? pwNOrder : na,               "SATS · 発注件数",          display = display.data_window)
 plot(stSats ? pwNExp : na,                 "SATS · 期限切れ件数",      display = display.data_window)
-plot(stSats ? pwNTrk + pwNZone : na,       "SATS · Track / 資格の取消件数", display = display.data_window)
+plot(stSats ? (pwTouched ? 1 : 0) : na,    "SATS · 接触 (0 接触待ち / 1 接触済み・反発待ち)", display = display.data_window)
+plot(stSats ? pwTouchK : na,               "SATS · 保持している線 (1 L1 / 2 L2 / 3 STB / 0 未接触)", display = display.data_window)
+plot(stSats ? pwNTouchPrep : na,           "SATS · 接触を経験した準備件数", display = display.data_window)
+plot(stSats ? pwNOrdSame : na,             "SATS · 発注 (同じ足の接触・反発)", display = display.data_window)
+plot(stSats ? pwNOrdLater : na,            "SATS · 発注 (接触後の別の足の戻り)", display = display.data_window)
 plot(stSats ? pwNSL : na,                  "SATS · SL0 到達の取消件数", display = display.data_window)
 plot(stSats ? pwNBad : na,                 "SATS · 不適切な約定の決済件数", display = display.data_window)
 plotshape(stSats and pwEv == 1, "SATS · 準備", style = shape.circle, location = location.abovebar, color = color.gray, size = size.tiny)

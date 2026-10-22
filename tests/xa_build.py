@@ -693,6 +693,124 @@ STRATEGY_EDITS8 = [
 ]
 
 
+# ---- XA-9: SATS Pullback — no zone re-check after the prep; touch recorded, rebound on the touch bar or later (after XA-8) ---
+#  SATS Pullback only (Current unchanged). Cancels: the wall-clock limit and SL0 only (before any rebound); the Track /
+#  Strong-candidate re-checks of XA-7 are removed. Before the touch the line is re-picked every bar (t-1 lines, previous close,
+#  SL0 < L < P0 and beyond the previous close, ties L1 -> L2 -> STB); a touch (low <= L <= high, L in range) records the line
+#  kind. After the touch that kind is kept (its t-1 value every bar, no "beyond the previous close" requirement; na / out of
+#  range -> no order but the record stays). Rebound A: touch and close back on the bar; B: touched before, previous close at or
+#  beyond L and close back beyond L (both against the same L). Plus SL0 < close < P0 (mirrored), session, no order, valid qty.
+#  The touch state is reset on prep / cancel / order. strip_strategy9() -> the Strategy of a32bd85.
+SATS_WAIT8 = SATS_WAIT.replace("                    pwRRFill := na\n", "                    pwRRFill := na\n                    pwRRWhy  := na\n")
+SATS_WAIT9 = (
+    "    // (3b) XA-7 / XA-9 SATS Pullback の待機判定 (準備足の次の足から)。取消を反発より優先する\n"
+    "    //   取消 (XA-9): 期限 (準備足の終了時刻からの実時間) / 固定 SL0 到達 だけ。元 Zone の Strong 資格・Track の存続 / 一致・候補一覧\n"
+    "    //   からの脱落では取り消さない (保存した方向 / P0 / SL0 / TP0 を使い続ける)。取消だけでは使用済み Track にしない\n"
+    "    //   接触前: 毎足、足 t-1 の確定線と前足終値から最寄りの適格線を選び直す。low <= L <= high で接触 → 線の種類を記録\n"
+    "    //   接触後: 記録した種類の線の足 t-1 確定値を毎足使う (別の線へ選び替えない。前足終値との位置関係は再要求しない)。\n"
+    "    //           na / SL0〜P0 の範囲外の足は発注しないが、接触記録は消さない\n"
+    "    //   反発: A = その足で接触して終値が戻る / B = 接触済みで、前足終値 <= L (Short は >=) かつ当足終値 > L (Short は <)\n"
+    "    bool  pwCancelBar = false\n"
+    "    if stSats and pwState == 1 and bar_index > pwBar\n"
+    "        int why = 0\n"
+    "        if time_close - pwEndT >= stSatsWait * 60000\n"
+    "            why := -1\n"
+    "        else if pwSide == 1 ? low <= pwSL0 : high >= pwSL0\n"
+    "            why := -4\n"
+    "        if why != 0\n"
+    "            pwState     := 0\n"
+    "            pwCancelBar := true\n"
+    "            pwEv        := why\n"
+    "            pwNExp  += why == -1 ? 1 : 0\n"
+    "            pwNSL   += why == -4 ? 1 : 0\n"
+    "            pwTouched  := false\n"
+    "            pwTouchK   := 0\n"
+    "            pwTouchBar := na\n"
+    "        else\n"
+    "            int   lk = 0\n"
+    "            float lp = na\n"
+    "            if not pwTouched\n"
+    "                [k0, v0] = f_satPick(pwSide, pwP0, pwSL0, close[1], satL1[1], satL2[1], satStb[1])\n"
+    "                lk := k0\n"
+    "                lp := v0\n"
+    "            else\n"
+    "                lk := pwTouchK\n"
+    "                lp := pwTouchK == 1 ? satL1[1] : pwTouchK == 2 ? satL2[1] : satStb[1]\n"
+    "            pwLineK := lk\n"
+    "            pwLineP := lp\n"
+    "            bool inRange  = lk != 0 and not na(lp) and (pwSide == 1 ? (lp > pwSL0 and lp < pwP0) : (lp < pwSL0 and lp > pwP0))\n"
+    "            bool touchNow = inRange and low <= lp and lp <= high\n"
+    "            bool rebA     = touchNow and (pwSide == 1 ? close > lp : close < lp)\n"
+    "            bool rebB     = pwTouched and inRange and (pwSide == 1 ? (close[1] <= lp and close > lp) : (close[1] >= lp and close < lp))\n"
+    "            if touchNow and not pwTouched\n"
+    "                pwTouched    := true\n"
+    "                pwTouchK     := lk\n"
+    "                pwTouchBar   := bar_index\n"
+    "                pwNTouchPrep += 1\n"
+    "            bool priceOK = pwSide == 1 ? (close > pwSL0 and close < pwP0) : (close < pwSL0 and close > pwP0)\n"
+    "            if (rebA or rebB) and priceOK and stSessOK and oState == 0\n"
+    "                float q = f_stQty(pwSide, close, pwSL0)\n"
+    "                if not na(q)\n"
+    "                    oSeq    += 1\n"
+    "                    oEid    := (pwSide == 1 ? \"L\" : \"S\") + str.tostring(oSeq)\n"
+    "                    oXid    := oEid + \" SL/TP\"\n"
+    "                    oSide   := pwSide\n"
+    "                    oTrack  := pwTrack\n"
+    "                    oLimit  := false\n"
+    "                    oL      := na\n"
+    "                    oSL     := pwSL0\n"
+    "                    oStop   := pwSL0\n"
+    "                    oTP     := na\n"
+    "                    oTP0    := pwTP0\n"
+    "                    oFill   := na\n"
+    "                    oBE     := false\n"
+    "                    oClosed := strategy.closedtrades\n"
+    "                    oState  := 1\n"
+    "                    strategy.entry(oEid, pwSide == 1 ? strategy.long : strategy.short, qty = q)\n"
+    "                    strategy.exit(oXid, oEid, stop = oSL)\n"
+    "                    pwRRPlan := pwSide * (pwTP0 - close) / (pwSide * (close - pwSL0))\n"
+    "                    pwRRFill := na\n"
+    "                    pwRRWhy  := na\n"
+    "                    pwState  := 0\n"
+    "                    pwEv     := 2\n"
+    "                    pwNOrder += 1\n"
+    "                    pwNOrdSame  += rebA ? 1 : 0\n"
+    "                    pwNOrdLater += rebA ? 0 : 1\n"
+    "                    pwTouched  := false\n"
+    "                    pwTouchK   := 0\n"
+    "                    pwTouchBar := na\n"
+    "\n")
+STRATEGY_EDITS9 = [
+    ("header",
+     "//  XA-8: SATS の実 RR を約定足内で SL 決済まで終わった約定でも記録 (closed trade の実約定価格 + SL0 / TP0。注文は出さない)。\n",
+     "//  XA-8: SATS の実 RR を約定足内で SL 決済まで終わった約定でも記録 (closed trade の実約定価格 + SL0 / TP0。注文は出さない)。\n"
+     "//  XA-9: SATS Pullback の準備後は元 Zone の Strong 資格・Track を再審査しない (取消は期限と SL0 到達だけ)。SATS 線への接触を記録し、\n"
+     "//  接触足で戻る場合 (A) と、接触後の別の足で前足終値 → 当足終値が同じ線 L を越えて戻る場合 (B) を反発とする。成績への影響は未確認。\n"),
+    ("touch",
+     "var int   pwNTrk   = 0\nvar int   pwNZone  = 0\n",
+     "var bool  pwTouched  = false   // XA-9: 接触済み (反発待ち)\n"
+     "var int   pwTouchK   = 0       // XA-9: 接触した線の種類 (1 LINE1 / 2 LINE2 / 3 STB)\n"
+     "var int   pwTouchBar = na      // XA-9: 接触した足\n"
+     "var int   pwNTouchPrep = 0     // XA-9: 接触を経験した準備の件数 (同じ準備で何度触れても 1 件)\n"
+     "var int   pwNOrdSame   = 0     // XA-9: 同じ足の接触・反発 (A) で発注した件数\n"
+     "var int   pwNOrdLater  = 0     // XA-9: 接触後の別の足の戻り (B) で発注した件数\n"),
+    ("touch", SATS_WAIT8, SATS_WAIT9),
+    ("touch",
+     "                    pwNPrep  += 1\n",
+     "                    pwNPrep  += 1\n"
+     "                    pwTouched  := false     // XA-9: 新しい準備は接触待ちから\n"
+     "                    pwTouchK   := 0\n"
+     "                    pwTouchBar := na\n"),
+    ("touch",
+     'plot(stSats ? pwNTrk + pwNZone : na,       "SATS · Track / 資格の取消件数", display = display.data_window)\n',
+     'plot(stSats ? (pwTouched ? 1 : 0) : na,    "SATS · 接触 (0 接触待ち / 1 接触済み・反発待ち)", display = display.data_window)\n'
+     'plot(stSats ? pwTouchK : na,               "SATS · 保持している線 (1 L1 / 2 L2 / 3 STB / 0 未接触)", display = display.data_window)\n'
+     'plot(stSats ? pwNTouchPrep : na,           "SATS · 接触を経験した準備件数", display = display.data_window)\n'
+     'plot(stSats ? pwNOrdSame : na,             "SATS · 発注 (同じ足の接触・反発)", display = display.data_window)\n'
+     'plot(stSats ? pwNOrdLater : na,            "SATS · 発注 (接触後の別の足の戻り)", display = display.data_window)\n'),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -856,8 +974,13 @@ def build_strategy7():
     return _apply(build_strategy6(), STRATEGY_EDITS7)
 
 
-def build_strategy():
+def build_strategy8():
+    """XA-1 .. XA-8 (commit a32bd85)."""
     return _apply(build_strategy7(), STRATEGY_EDITS8)
+
+
+def build_strategy():
+    return _apply(build_strategy8(), STRATEGY_EDITS9)
 
 
 def strip_visual3(t):
@@ -870,8 +993,15 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy9(t):
+    """reverse only XA-9 (-> the Strategy of a32bd85 byte for byte)."""
+    return _revert(t, STRATEGY_EDITS9)
+
+
 def strip_strategy8(t):
-    """reverse only XA-8 (-> the Strategy of 6b9458d byte for byte)."""
+    """reverse XA-9 when present (all or nothing) and XA-8 (-> the Strategy of 6b9458d byte for byte)."""
+    if t is not None and STRATEGY_EDITS9[0][2] in t:
+        t = strip_strategy9(t)
     return _revert(t, STRATEGY_EDITS8)
 
 

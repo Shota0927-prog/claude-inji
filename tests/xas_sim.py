@@ -15,7 +15,9 @@
   XQ : mutations of the mirror and of the source
   XV : XA-8 on the delivered Strategy — the actual RR is also recorded for a SATS fill closed in its fill bar (closed trade's
        entry price, stored SL0 / TP0, no order), reasons for invalid distances, one record per fill on either path
-  (XW / XP / XQ run on the XA-7 layer: the Strategy with exactly the XA-8 edits reverted == 6b9458d)
+  XN : XA-9 on the delivered Strategy — no zone re-check after the prep (cancel = limit / SL0 only), touch recorded with the
+       line kind, rebound A (touch bar) or B (later bar: previous close and close across the same t-1 line value)
+  (XW / XP / XQ run on the XA-7 layer, XV on the XA-8 layer: the Strategy with exactly the later edits reverted)
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile, SATS line values vs the source indicator, Strategy Tester external).
 """
@@ -411,9 +413,9 @@ def confirm(sats, filled_open, filled_closed, fill_px, sl0, tp0, side, rec):
 
 
 def gate_xa8():
-    S8, S7 = rd(xb.STR_PATH), xb.show("6b9458d", xb.STR_PATH)
+    S8, S7 = xb.strip_strategy9(rd(xb.STR_PATH)) or "", xb.show("6b9458d", xb.STR_PATH)   # XA-8 layer (XA-9 reverted exactly)
     check("XV-01 XA-8: Strategy == xa_build.build_strategy() (XA-1 .. XA-8); strip_strategy8 gives 6b9458d byte for byte; edit "
-          "kinds header / rr", xb.build_strategy() == S8 and xb.strip_strategy8(S8) == S7 and xb.build_strategy7() == S7
+          "kinds header / rr", xb.build_strategy8() == S8 and xb.strip_strategy8(S8) == S7 and xb.build_strategy7() == S7
           and {k for k, _, _ in xb.STRATEGY_EDITS8} == {"header", "rr"})
     ch = [l for l in es.changed_code(S7, S8) if l]
     stray = [l for l in ch if re.search(r"strategy\.(entry|exit|close|cancel)\(|map\.put|oState\s*:=|oTP\s*:=|oStop\s*:=", l)]
@@ -455,8 +457,194 @@ def gate_xa8():
           m != S8 and m2 != S8 and xb.strip_strategy8(m) is None and xb.strip_strategy8(m2) is None)
 
 
+# ---- XA-9: no zone re-check, touch recorded, rebound on the touch bar or a later bar ----------------------------------------
+class Wait9:
+    """port of the XA-9 waiting step. bars feed (bar, t_close, high, low, close, prev_close, lines_t1 (L1, L2, STB))."""
+
+    def __init__(self, side, p0, sl0, tp0, prep_bar=10, t_end=T0 + 10 * M5, limit=240, variant=None):
+        self.state, self.side, self.p0, self.sl0, self.tp0 = 1, side, p0, sl0, tp0
+        self.bar, self.t_end, self.limit, self.variant = prep_bar, t_end, limit, variant
+        self.touched, self.tk, self.tbar = False, 0, None
+        self.n_touch_prep = self.n_same = self.n_later = self.n_exp = self.n_sl = 0
+        self.orders, self.log = [], []
+
+    def step(self, bar, t_close, h, l, c, pc, lines, sess=True, qty_ok=True, o_state=0, cands=None, tracks=None):
+        if self.state != 1 or bar <= self.bar:
+            return None
+        why = 0
+        if t_close - self.t_end >= self.limit * 60000:
+            why = -1
+        elif (l <= self.sl0) if self.side == 1 else (h >= self.sl0):
+            why = -4
+        elif self.variant == "zone_recheck" and cands is not None and (7, self.side) not in cands:
+            why = -3
+        if why:
+            self.state = 0
+            self.n_exp += why == -1
+            self.n_sl += why == -4
+            self.touched, self.tk, self.tbar = False, 0, None
+            return why
+        if not self.touched or self.variant == "repick_after_touch":
+            k, L = pick(self.side, self.p0, self.sl0, pc, lines)
+        else:
+            k, L = self.tk, lines[self.tk - 1]
+        in_range = k != 0 and L is not None and ((self.sl0 < L < self.p0) if self.side == 1 else (self.p0 < L < self.sl0))
+        touch = in_range and l <= L <= h
+        reb_a = touch and ((c > L) if self.side == 1 else (c < L))
+        if self.variant == "line_moved":
+            reb_b = self.touched and in_range and ((c > L) if self.side == 1 else (c < L))
+        else:
+            reb_b = self.touched and in_range and ((pc <= L and c > L) if self.side == 1 else (pc >= L and c < L))
+        if touch and not self.touched:
+            self.touched, self.tk, self.tbar = True, k, bar
+            self.n_touch_prep += 1
+        price_ok = (self.sl0 < c < self.p0) if self.side == 1 else (self.p0 < c < self.sl0)
+        if (reb_a or reb_b) and price_ok and sess and o_state == 0 and qty_ok:
+            self.state = 0
+            self.orders.append(dict(bar=bar, ref=c, kind="A" if reb_a else "B", line=k, L=L))
+            self.n_same += reb_a
+            self.n_later += not reb_a
+            self.touched, self.tk, self.tbar = False, 0, None
+            return 2
+        return 0
+
+
+def tb(i):
+    return T0 + (10 + i) * M5
+
+
+def gate_xa9():
+    S9, S8 = rd(xb.STR_PATH), xb.show("a32bd85", xb.STR_PATH)
+    check("XN-01 XA-9: Strategy == xa_build.build_strategy() (XA-1 .. XA-9); strip_strategy9 gives a32bd85 byte for byte; kinds "
+          "header / touch; Engine / Visual / SATS formula (f_satBand == the source record) unchanged",
+          xb.build_strategy() == S9 and xb.strip_strategy9(S9) == S8 and xb.build_strategy8() == S8
+          and {k for k, _, _ in xb.STRATEGY_EDITS9} == {"header", "touch"} and func(S9, "f_satBand() =>").rstrip("\n") + "\n" == SRC
+          and rd(xb.ENG_PATH) == xb.show(B, xb.ENG_PATH) and rd(xb.VIS_PATH) == xb.show(B, xb.VIS_PATH))
+    w = block(S9, "    // (3b) XA-7 / XA-9 SATS Pullback", "    // (4) 新規 Entry")
+    ord_old = block(S8, "            else if not skipRef and not na(pQty)\n", "    stPrev := cur")
+    ord_new = block(S9, "            else if not skipRef and not na(pQty)\n", "    stPrev := cur")
+    fill8 = block(S8, "    if fillNow and stSats\n", "    // (2c)")
+    fill9 = block(S9, "    if fillNow and stSats\n", "    // (2c)")
+    cl8 = block(S8, "        else if filledClosed\n", "        else if not oLimit\n")
+    cl9 = block(S9, "        else if filledClosed\n", "        else if not oLimit\n")
+    prep = block(S9, "            if stSats\n                // XA-7", "            else if not skipRef and not na(pQty)\n")
+    check("XN-02 Current and the fill / RR paths unchanged: the Entry order block, the fill-confirmation blocks (SATS TP0 and "
+          "Current), the closed-in-fill-bar record (XA-8) byte-identical to a32bd85; the prep keeps the Entry C order "
+          "conditions and stored values and now also resets the touch state",
+          ord_new == ord_old and fill9 == fill8 and cl9 == cl8 and "pwState == 0 and not pwCancelBar" in prep
+          and "pwTouched  := false     // XA-9" in prep and "pwP0     := ref" in prep and "pwTP0    := tpRef" in prep)
+    check("XN-03 cancels are only the wall-clock limit and SL0 (no Track / Strong-candidate re-check: no curTrk / cur / zOK in the "
+          "waiting code), decided before the rebound; the Track / qualification counters are removed",
+          "time_close - pwEndT >= stSatsWait * 60000" in w and "pwSide == 1 ? low <= pwSL0 : high >= pwSL0" in w
+          and not re.search(r"curTrk|\bcur\b|zOK|pwNTrk|pwNZone", w) and "pwNTrk" not in S9 and "pwNZone" not in S9
+          and w.index("why := -4") < w.index("bool rebA"))
+    check("XN-04 line handling: before the touch f_satPick(side, P0, SL0, close[1], LINE1[1], LINE2[1], STB[1]); after the touch the "
+          "recorded kind's t-1 value (no re-pick, no previous-close side rule); in range = SL0 < L < P0 (mirrored); touch = in "
+          "range and low <= L <= high; A = touch and close back; B = touched and previous close <= L < close (Short >= / >) with "
+          "the same L; order needs A or B, SL0 < close < P0, session, no order, valid qty; touch state reset on cancel / order",
+          "lp := pwTouchK == 1 ? satL1[1] : pwTouchK == 2 ? satL2[1] : satStb[1]" in w
+          and "(close[1] <= lp and close > lp)" in w and "(close[1] >= lp and close < lp)" in w
+          and "bool rebB     = pwTouched and inRange" in w and "if (rebA or rebB) and priceOK and stSessOK and oState == 0" in w
+          and w.count("pwTouched  := false") == 2 and "f_stQty(pwSide, close, pwSL0)" in w)
+    # models: Short P0 2600, SL0 2620, TP0 2570; Long mirror P0 2600, SL0 2580, TP0 2630
+    s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    r1 = s.step(11, tb(1), 2611, 2600, 2606, 2601.0, (2610.0, None, None), cands=set(), tracks=set())
+    check("XN-05 no zone re-check: the Track gone and no Strong candidate do not cancel; A on the touch bar orders (Short: touch "
+          "2610, close 2606 < 2610, P0 < close < SL0)", r1 == 2 and s.orders[0]["kind"] == "A" and s.n_same == 1)
+    s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    a = s.step(11, tb(1), 2612, 2604, 2611, 2603.0, (2610.0, None, None))
+    tk_after_touch = s.tk
+    b = s.step(12, tb(2), 2610, 2605, 2606, 2611.0, (2611.0, 2606.0, None))
+    check("XN-06 touch then the next bar: bar 11 touches LINE1 2610 and closes 2611 above it (no A, touch recorded, kind LINE1); bar "
+          "12 (gap, high 2610) uses LINE1's t-1 value 2611 (LINE2 2606 nearer is not used): prev close 2611 >= 2611 and close 2606 "
+          "< 2611 -> B order",
+          a == 0 and tk_after_touch == 1 and b == 2 and s.orders[0]["kind"] == "B" and s.orders[0]["line"] == 1 and s.n_later == 1
+          and s.n_touch_prep == 1)
+    s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    seq = [s.step(11, tb(1), 2612, 2604, 2611, 2603.0, (2610.0, None, None)),
+           s.step(12, tb(2), 2614, 2609, 2613, 2611.0, (2610.5, None, None)),
+           s.step(13, tb(3), 2615, 2610, 2612, 2613.0, (2610.4, None, None)),
+           s.step(14, tb(4), 2609.5, 2607, 2608, 2612.0, (2610.2, None, None))]
+    check("XN-07 later bar: touched at bar 11, two bars above the line (no rebound, record kept, touched once = 1 prep), bar 14 "
+          "prev close 2612 >= 2610.2 and close 2608 < 2610.2 -> B order",
+          seq == [0, 0, 0, 2] and s.n_touch_prep == 1 and s.orders[0]["kind"] == "B")
+    s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    x1 = s.step(11, tb(1), 2609, 2601, 2604, 2611.0, (2610.0, None, None))
+    check("XN-08 crossing without a touch is not an order: prev close 2611 above LINE1 2610, the bar never reaches it (high 2609) "
+          "and closes 2604 below -> no touch, no order (B needs a recorded touch)", x1 == 0 and not s.touched)
+    s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    s.step(11, tb(1), 2612, 2604, 2611, 2603.0, (2610.0, None, None))
+    mv = s.step(12, tb(2), 2611.5, 2606, 2609, 2611.0, (2612.0, None, None))
+    check("XN-09 a line move alone is not a later rebound: touched LINE1, next bar LINE1 moves up to 2612 above both the previous "
+          "close 2611 and the close 2609 (no touch) -> no order (a mirror that only requires the close beyond L would order)",
+          mv == 0 and Wait9_variant_moves() == 2)
+    s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    s.step(11, tb(1), 2612, 2604, 2611, 2603.0, (2610.0, None, None))
+    na_ = s.step(12, tb(2), 2612, 2605, 2606, 2611.0, (None, None, None))
+    out = s.step(13, tb(3), 2625 - 6, 2605, 2606, 2611.0, (2621.0, None, None))
+    back = s.step(14, tb(4), 2612, 2605, 2606, 2611.0, (2610.0, None, None))
+    check("XN-10 after the touch: LINE1 na -> no decision, record kept; LINE1 2621 outside SL0 2620 -> no order, record kept; back in "
+          "range (2610) -> B order on the same line", na_ == 0 and out == 0 and back == 2 and s.orders[0]["line"] == 1)
+    s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    s.step(11, tb(1), 2612, 2604, 2611, 2603.0, (2610.0, None, None))
+    side = s.step(12, tb(2), 2611, 2603, 2604, 2605.0, (2610.0, None, None))
+    check("XN-11 after the touch the previous-close side rule is not required: the held LINE1 2610 is above the previous close 2605 "
+          "(before the touch it would not be eligible); the bar re-touches it from below and closes 2604 < 2610 -> A order on LINE1",
+          side == 2 and s.orders[0]["line"] == 1 and s.orders[0]["kind"] == "A")
+    res = []
+    for kw, why in ((dict(sess=False), 0), (dict(qty_ok=False), 0), (dict(o_state=1), 0)):
+        s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+        res.append(s.step(11, tb(1), 2611, 2600, 2606, 2601.0, (2610.0, None, None), **kw) == why and s.touched)
+    s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    s.step(11, tb(1), 2611, 2600, 2606, 2601.0, (2610.0, None, None), sess=False)
+    noauto = s.step(12, tb(2), 2607, 2603, 2605, 2606.0, (2610.0, None, None))
+    worse = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    w1 = worse.step(11, tb(1), 2611, 2598, 2599, 2601.0, (2610.0, None, None))
+    check("XN-12 outside the session / no qty / an order present -> no order, the touch record kept; the next bar with only prices "
+          "in range but no new rebound does not order (no stored rebound); close 2599 not better than P0 2600 -> no order",
+          all(res) and noauto == 0 and w1 == 0)
+    pri = []
+    s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    s.step(11, tb(1), 2612, 2604, 2611, 2603.0, (2610.0, None, None))
+    pri.append(s.step(12, tb(2), 2621, 2605, 2606, 2611.0, (2610.0, None, None)) == -4 and not s.touched and s.n_sl == 1)
+    s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    pri.append(s.step(58, T0 + 10 * M5 + 240 * 60000, 2611, 2600, 2606, 2601.0, (2610.0, None, None)) == -1 and s.n_exp == 1)
+    s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    pri.append(s.step(57, T0 + 10 * M5 + 239 * 60000, 2611, 2600, 2606, 2601.0, (2610.0, None, None)) == 2)
+    check("XN-13 cancels keep priority and reset the touch: SL0 reached on a rebound bar -> cancel (no order, touch cleared); 240 "
+          "minutes -> expired; 239 minutes -> rebound still orders", all(pri), str(pri))
+    l = Wait9(1, 2600.0, 2580.0, 2630.0)
+    la = l.step(11, tb(1), 2595, 2588, 2589, 2597.0, (2590.0, None, None))
+    lb = l.step(12, tb(2), 2593, 2591, 2592, 2589.0, (2590.5, None, None))
+    check("XN-14 Long mirror: touch LINE1 2590 closing 2589 below (record), next bar prev close 2589 <= 2590.5 and close 2592 > 2590.5 "
+          "with SL0 < close < P0 -> B order", la == 0 and lb == 2 and l.orders[0]["kind"] == "B")
+    s = Wait9(-1, 2600.0, 2620.0, 2570.0)
+    s.step(11, tb(1), 2611, 2600, 2606, 2601.0, (2610.0, None, None))
+    again = s.step(12, tb(2), 2611, 2600, 2606, 2601.0, (2610.0, None, None))
+    check("XN-15 no double order: after the order the wait is cleared (state 0, touch reset), later bars do nothing; a new prep "
+          "starts untouched", again is None and s.state == 0 and not s.touched and s.tk == 0
+          and Wait9(-1, 2600.0, 2620.0, 2570.0).touched is False)
+    bad = []
+    v = Wait9(-1, 2600.0, 2620.0, 2570.0, variant="zone_recheck")
+    bad.append(v.step(11, tb(1), 2611, 2600, 2606, 2601.0, (2610.0, None, None), cands=set()) == -3)
+    v = Wait9(-1, 2600.0, 2620.0, 2570.0, variant="repick_after_touch")
+    v.step(11, tb(1), 2612, 2604, 2611, 2603.0, (2610.0, None, None))
+    bad.append(v.step(12, tb(2), 2610, 2605, 2606, 2611.0, (2611.0, 2606.0, None)) != 2 or v.orders == [] or v.orders[0]["line"] != 1)
+    m = S9.replace("(close[1] >= lp and close < lp)", "(close < lp)")
+    m2 = S9.replace("        else if pwSide == 1 ? low <= pwSL0 : high >= pwSL0\n            why := -4\n", "")
+    check("XN-16 mutations caught: zone re-check cancelling, re-picking another line after the touch; source mutations (B without "
+          "the previous close, SL0 cancel removed) rejected by the exact strip",
+          bad[0] and bad[1] and m != S9 and m2 != S9 and xb.strip_strategy9(m) is None and xb.strip_strategy9(m2) is None, str(bad))
+
+
+def Wait9_variant_moves():
+    v = Wait9(-1, 2600.0, 2620.0, 2570.0, variant="line_moved")
+    v.step(11, tb(1), 2612, 2604, 2611, 2603.0, (2610.0, None, None))
+    return v.step(12, tb(2), 2611.5, 2606, 2609, 2611.0, (2612.0, None, None))
+
+
 def main():
-    for g in (gate_static, gate_model, gate_mutation, gate_xa8):
+    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9):
         try:
             g()
         except Exception:
