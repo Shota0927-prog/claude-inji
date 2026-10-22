@@ -13,6 +13,8 @@
        High / Low, independent Swing, categories, order invariance; FVG Direction Match filters before the best-of choice
        and OFF equals the old selection; RN defaults, boundary, major priority, once per zone; RN step check; width
   XU : mutations — mirror and source mutations are caught
+  XF : XA-5 — Gold Short adopted defaults (Day/Swing Merge Nearby, Merge Distance 0; Strategy breakeven ON / Trigger 15) on
+       the delivered files; XE / XM / XU run on the XA-4 layer (the files with exactly the XA-5 edits reverted == 7363ef1)
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile, Library publish, display and Strategy Tester are external; the
 user's TradingView reference result is not reproduced locally).
@@ -37,7 +39,7 @@ rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True).stdout
 code_only, input_decls, input_values, func, seg = es.code_only, es.input_decls, es.input_values, es.func, es.seg
 E, GBE, SW6 = rd(xb.ENG_PATH), rd(ge.GBE_PATH), rd(ge.SRC_PATH)
-V, S = rd(xb.VIS_PATH), rd(xb.STR_PATH)
+V, S = xb.strip_visual5(rd(xb.VIS_PATH)) or "", xb.strip_strategy5(rd(xb.STR_PATH)) or ""   # XA-4 layer (XA-5 reverted exactly; pinned by XF)
 V0, S0 = xb.show(PREV, xb.VIS_PATH), xb.show(PREV, xb.STR_PATH)
 RESULTS = []
 
@@ -98,9 +100,9 @@ def gate_static():
                                                                   "f_swingMaxStep(float swMax, float s) =>"))
           and all(seg(E, a, b) == seg(SW6, a, b) for a, b in (("export update(", "\nexport "),)), str(stray[:4]))
     check("XE-04 Visual / Strategy == 17d1ca2 + the XA-4 edits (rebuild identical) and strip back to 17d1ca2 byte for byte; "
-          "the full chain strips to f253890", xb.build_visual() == V and xb.build_strategy() == S
+          "the full chain strips to f253890", xb.build_visual4() == V and xb.build_strategy4() == S
           and xb.strip_visual4(V) == V0 and xb.strip_strategy4(S) == S0
-          and xb.strip_visual(V) == xb.show(xb.BASE_REV, xb.VIS_PATH) and xb.strip_strategy(S) == xb.show(xb.BASE_REV, xb.STR_PATH)
+          and xb.strip_visual(rd(xb.VIS_PATH)) == xb.show(xb.BASE_REV, xb.VIS_PATH) and xb.strip_strategy(rd(xb.STR_PATH)) == xb.show(xb.BASE_REV, xb.STR_PATH)
           and {k for k, _, _ in xb.VISUAL_EDITS4} == {"header", "import", "dsmode", "accmode", "rn", "fvg", "fvgdir", "display"}
           and {k for k, _, _ in xb.STRATEGY_EDITS4} == {"header", "import", "dsmode", "accmode", "rn", "fvg", "fvgdir"})
     removed_v = sorted([xb.IMPORT_6.strip(), 'zoneCfg.useRnSource          := enableRn and syminfo.ticker == "XAUUSD"',
@@ -512,6 +514,88 @@ def gate_model():
           and (finalize(mem, merge=True, dist=0.5)["score"], finalize(mem, merge=True, dist=0.5)["cat"]) == (14.0, 2))
 
 
+def gate_xa5():
+    V5, S5 = rd(xb.VIS_PATH), rd(xb.STR_PATH)
+    A = "a33d2b0"
+    VA, SA = xb.show(A, xb.VIS_PATH), xb.show(A, xb.STR_PATH)
+    check("XF-01 XA-5: Visual / Strategy == the a33d2b0 files (= 7363ef1) + the XA-5 edits (rebuild identical) and strip back "
+          "byte for byte; edit kinds header / text / default only",
+          xb.build_visual() == V5 and xb.build_strategy() == S5 and xb.strip_visual5(V5) == VA and xb.strip_strategy5(S5) == SA
+          and VA == xb.show("7363ef1", xb.VIS_PATH) and SA == xb.show("7363ef1", xb.STR_PATH)
+          and {k for k, _, _ in xb.VISUAL_EDITS5 + xb.STRATEGY_EDITS5} <= {"header", "text", "default"})
+    cv = sorted(l for l in es.changed_code(VA, V5) if l)
+    cs = sorted(l for l in es.changed_code(SA, S5) if l)
+    ds_old = 'dsMode = input.string("Separate", "Day/Swing Overlap Mode", options = ["Separate", "Merge Nearby"], group = G_DHL,'
+    ds_new = 'dsMode = input.string("Merge Nearby", "Day/Swing Overlap Mode", options = ["Separate", "Merge Nearby"], group = G_DHL,'
+    tip = ['"初期 0 は Merge Nearby の採用値ではない: 初期の Separate では使われず、結果に作用しない。")',
+           '"初期 0 (Gold Short の比較から採用した初期値・検証継続中): 初期の Merge Nearby で、同じ価格の当日高値と Swing High\\n" +',
+           '"(安値と Swing Low) だけを 1 つの根拠にする。")']
+    be = ['stBE = input.bool(false, "Breakeven Stop", group = G_STT)', 'stBE = input.bool(true, "Breakeven Stop", group = G_STT)',
+          'stBEDist = input.float(10.0, "Breakeven Trigger ($)", minval = 0.0, step = 0.5, group = G_STT)',
+          'stBEDist = input.float(15.0, "Breakeven Trigger ($)", minval = 0.0, step = 0.5, group = G_STT)']
+    check("XF-02 code delta vs a33d2b0 exactly: Day/Swing Overlap Mode default (both files) + the Merge Distance tooltip text "
+          "(both); Strategy Breakeven Stop false -> true and Trigger 10 -> 15; nothing else",
+          cv == sorted([ds_old, ds_new] + tip) and cs == sorted([ds_old, ds_new] + tip + be), str((cv, cs)))
+    vv, vs = input_values(V5), input_values(S5)
+    zone_exp = dict(XA3, **dict(NEW_ZONE, dsMode='"Merge Nearby"', dsDist="0.0"))
+    st_exp = dict(XA3_ST, stBE="true", stBEDist="15.0")
+    zb = [n for n, x in zone_exp.items() if vv.get(n) != x or vs.get(n) != x]
+    sb = [n for n, x in st_exp.items() if vs.get(n) != x]
+    vd, sd = input_decls(V5), input_decls(S5)
+    zone_names = set(input_decls(S5[:S5.index("// ==== ZONE Strategy · Zone evaluation (begin)")])) | {"fvgMinWidth", "fvgDirMatch"}
+    check("XF-03 adopted defaults: Day/Swing Merge Nearby, Merge Distance 0 (both); Breakeven ON, Trigger 15 (Strategy); every "
+          "kept value (HW 6, Cluster 5, Break 10, Flip 5, 5 / 10 / 15, MA 3 / 3, Slope 1 / 3, 0 / 1 / 2, Max, Day H/L 3, Accum "
+          "3 / 4 / 5 Sum Separate, Swing 1 / 2 / 3, Confluence 1 / 2 / 3, FVG 3.0 / OFF, RN ON 100 +3 / 50 +2, C, Short Only, SL "
+          "Buffer 1.5, RR 1.5, Zone TP OFF, sizing 300,000 / 3 % / 100 oz / 0.01 / 0.01); Visual / Strategy Zone inputs and "
+          "ZoneCfg identical; the Visual has no Strategy input",
+          not zb and not sb and all(vd.get(n) == sd.get(n) for n in zone_names)
+          and re.findall(r"^zoneCfg\.\w+\s*:=.*$", V5, re.M) == re.findall(r"^zoneCfg\.\w+\s*:=.*$", S5, re.M)
+          and not [n for n in vd if n.startswith("st")], str((zb, sb)))
+    vda, sda = input_decls(VA), input_decls(SA)
+    chg = {"dsMode", "dsDist", "stBE", "stBEDist"}
+    req = lambda t: re.findall(r"request\.\w+\(", code_only(t))
+    norm = lambda t: code_only(t).replace(ds_new, ds_old).replace(be[1], be[0]).replace(be[3], be[2])
+    check("XF-04 everything else unchanged vs a33d2b0: every other input declaration, the Engine file and import "
+          "ZoneEnginePracticalXAUUSD/1, f_stQty and both qty = pQty entries, strategy() options, the Zone / FVG / Entry / order "
+          "/ cancel / TP / breakeven code (code identical apart from the three default lines and the tooltip), requests",
+          not [n for n in vda if n not in chg and vda[n] != vd.get(n)] and not [n for n in sda if n not in chg and sda[n] != sd.get(n)]
+          and set(vda) == set(vd) and set(sda) == set(sd) and rd(xb.ENG_PATH) == xb.show(A, xb.ENG_PATH)
+          and re.findall(r"^import .*$", V5 + S5, re.M) == [xb.IMPORT_XAE.strip()] * 2
+          and func(S5, QTY_FN) == func(SA, QTY_FN) and S5.count("qty = pQty") == 2
+          and seg(S5, "strategy(", "import ") == seg(SA, "strategy(", "import ")
+          and [l for l in norm(S5).split("\n") if not l.lstrip().startswith('"')] == [l for l in code_only(SA).split("\n") if not l.lstrip().startswith('"')]
+          and [l for l in norm(V5).split("\n") if not l.lstrip().startswith('"')] == [l for l in code_only(VA).split("\n") if not l.lstrip().startswith('"')]
+          and req(V5) == req(VA) and req(S5) == req(SA))
+    hdr = V5[:V5.index("//@version=5")] + S5[:S5.index("//@version=5")]
+    tipv = vd["dsDist"] + sd["dsDist"]
+    check("XF-05 descriptions: 'Gold Short の比較から採用した初期値・検証継続中' (year-by-year / Long / future validity not "
+          "confirmed) in both headers; the Merge Distance tooltip no longer says it is inert / not adopted; no 'Day/Swing "
+          "Separate' / 'Merge Distance 0 は Separate では作用しない' / '建値移動 OFF' left; no optimisation / completion claim",
+          hdr.count(xb.NOTE5) == 2 and "作用しない" not in tipv and "採用値ではない" not in tipv and "初期の Merge Nearby" in vd["dsDist"]
+          and "Merge Distance 0 は Separate では作用しない" not in hdr and "Day/Swing Separate" not in hdr
+          and "建値移動 OFF" not in hdr and "建値移動 ON・Trigger 15 USD" in hdr
+          and not re.search(r"最適値です|最適化済み|検証完了|将来も有効|年別確認済み|Long でも検証済み", hdr))
+    m0 = finalize([DH(2700.0), SWH("60", 2700.0)], merge=True, dist=0.0)
+    m1 = finalize([DH(2700.0), SWH("60", 2700.001)], merge=True, dist=0.0)
+    check("XF-06 Merge Nearby with distance 0 (model of the unchanged Engine condition): Day High 2700.000 + 1H Swing High "
+          "2700.000 -> one evidence (3 points, 1 category); 0.001 apart -> both counted (6 + 1, 2 categories)",
+          (m0["score"], m0["cat"]) == (3.0, 1) and (m1["score"], m1["cat"]) == (7.0, 2))
+    st = git("status", "--porcelain").split("\n")
+    mod = set(git("diff", "--name-only", A, "--").split()) | {l[3:] for l in st if l.startswith("??")}
+    mod -= {"tests/__pycache__/"}
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, xb.STR_PATH)]
+    check("XF-07 vs a33d2b0 only the Gold Visual / Strategy, xa_build, xae_sim, cad_sim and cad_adapt change; every other Pine "
+          "file (Engines incl. ZoneEnginePracticalXAUUSD, other symbols) byte-identical",
+          mod <= {xb.VIS_PATH, xb.STR_PATH, "tests/xa_build.py", "tests/xae_sim.py", "tests/cad_sim.py", "tests/cad_adapt.py"}
+          and {xb.VIS_PATH, xb.STR_PATH} <= mod and not [p for p in others if rd(p) != git("show", f"{A}:{p}")], str(sorted(mod)))
+    muts = [V5.replace(ds_new, ds_old), S5.replace(be[1], be[0]), S5.replace(be[3], be[2]),
+            V5.replace('dsDist = input.float(0.0,', 'dsDist = input.float(0.5,')]
+    check("XF-08 mutations do not strip back to a33d2b0: Day/Swing back to Separate, Breakeven OFF, Trigger 10, Merge Distance 0.5",
+          all(m != t and f(m) != base for m, t, f, base in zip(muts, [V5, S5, S5, V5],
+                                                                 [xb.strip_visual5, xb.strip_strategy5, xb.strip_strategy5, xb.strip_visual5],
+                                                                 [VA, SA, SA, VA])))
+
+
 def gate_mutation():
     caught = []
     for v in ("once_ignored", "max_sum_swapped"):
@@ -539,7 +623,7 @@ def gate_mutation():
 
 
 def main():
-    for g in (gate_static, gate_model, gate_mutation):
+    for g in (gate_static, gate_model, gate_mutation, gate_xa5):
         try:
             g()
         except Exception:

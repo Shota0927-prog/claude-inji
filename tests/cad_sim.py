@@ -97,7 +97,7 @@ def gate_static():
           "867ff7e", all(c == ujg for c in cdg) and len(ujg) == 3 and UJ == git("show", f"{PREV}:ZoneStrategyUSDJPY.pine"),
           str((ujg, cdg[0])))
     others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in cb.FILES]
-    changed = [p for p in others if rd(p) != git("show", f"{PREV}:{p}")]
+    changed = [p for p in others if rd(p) != git("show", f"{PREV}:{p}") and not __import__("cad_adapt").later_pine_ok(p, PREV)]   # later layers: exact
     cls = {"ZoneStrategyXAU.pine": "alert(" not in code_only(rd("ZoneStrategyXAU.pine")),
            "us_trend_strategy.pine": "alert.freq_all" not in rd("us_trend_strategy.pine"),
            "PointMasterFvgAbsRebound.pine": "varip int lastRealtimePhaseCode = na" in rd("PointMasterFvgAbsRebound.pine")}
@@ -110,7 +110,7 @@ def gate_static():
     rec = __import__("cad_adapt")
     check("CD-07 vs 867ff7e the changed Pine files are exactly the four Strategies; every changed test / generator is either new "
           "in CAD-1 or carries exactly its recorded CAD-1 edits (cad_adapt: reverting them gives the 867ff7e text)",
-          pine == set(cb.FILES) and all(m in rec.NEW_FILES or rec.unadapt(m, rd(m)) == git("show", f"{PREV}:{m}") for m in mod - pine),
+          pine - {m for m in pine if __import__("cad_adapt").later_pine_ok(m, PREV)} == set(cb.FILES) and all(m in rec.NEW_FILES or rec.unadapt(m, rd(m)) == git("show", f"{PREV}:{m}") for m in mod - pine),
           str(sorted(m for m in mod - pine if not (m in rec.NEW_FILES or rec.unadapt(m, rd(m)) == git("show", f"{PREV}:{m}")))))
 
 

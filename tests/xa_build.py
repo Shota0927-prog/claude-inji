@@ -272,6 +272,50 @@ STRATEGY_EDITS4 = [
 ]
 
 
+# ---- XA-5: Gold Short adopted defaults (Day/Swing Merge Nearby, breakeven ON / 15; after XA-4) ---------------------------
+#  Defaults and the matching descriptions only: Day/Swing Overlap Mode Separate -> Merge Nearby (both files; Merge Distance
+#  stays 0 = only an identical day high / low and Swing price merge, by the existing Engine condition); Strategy Breakeven
+#  Stop OFF -> ON, Trigger 10 -> 15 USD. The dsDist tooltip and the header lines that described the old defaults are updated.
+#  Engine / import, logic, sizing, every other input unchanged. strip_*5() -> the a33d2b0 (= 7363ef1) files byte for byte.
+NOTE5 = "Gold Short の比較から採用した初期値・検証継続中 (年別確認・Long での検証・将来の有効性は未確認)"
+HDR5 = ("//  XA-5: " + NOTE5 + ":\n"
+        "//  Day/Swing Overlap Mode Merge Nearby・Merge Distance 0 USD (同じ価格の当日高値 / 安値と Swing High / Low を、既存の統合条件で\n"
+        "//  1 つの根拠として数える)")
+ZONE_EDITS5 = [
+    ("default",
+     'dsMode = input.string("Separate", "Day/Swing Overlap Mode", options = ["Separate", "Merge Nearby"], group = G_DHL,\n',
+     'dsMode = input.string("Merge Nearby", "Day/Swing Overlap Mode", options = ["Separate", "Merge Nearby"], group = G_DHL,\n'),
+    ("text",
+     '     "初期 0 は Merge Nearby の採用値ではない: 初期の Separate では使われず、結果に作用しない。")\n',
+     '     "初期 0 (Gold Short の比較から採用した初期値・検証継続中): 初期の Merge Nearby で、同じ価格の当日高値と Swing High\\n" +\n'
+     '     "(安値と Swing Low) だけを 1 つの根拠にする。")\n'),
+    ("text",
+     "//  追加入力: Accum Score Sum・Accum Edge Separate・Day/Swing Separate (Merge Distance 0 は Separate では作用しない)・\n",
+     "//  追加入力: Accum Score Sum・Accum Edge Separate・Day/Swing (XA-5 で Merge Nearby・Merge Distance 0 に変更)・\n"),
+]
+VISUAL_EDITS5 = [
+    ("header",
+     "//  Visual のみ: Label に統合後 Zone の上下限 / 幅 (USD) を表示 (初期 ON、表示だけ)。\n",
+     "//  Visual のみ: Label に統合後 Zone の上下限 / 幅 (USD) を表示 (初期 ON、表示だけ)。\n" + HDR5 + "。\n"),
+] + ZONE_EDITS5
+STRATEGY_EDITS5 = [
+    ("header",
+     "//  資金管理 (XA-2)・売買 / 取消 / TP / 建値の処理とタイミング・XA-3 の採用初期値は変更なし。\n",
+     "//  資金管理 (XA-2)・売買 / 取消 / TP / 建値の処理とタイミング・XA-3 の採用初期値は変更なし。\n" + HDR5 + "、\n"
+     "//  建値移動 ON・Trigger 15 USD。Zone 生成・採点・統合条件・Entry・数量・注文 / 取消 / TP / 建値の判定と処理順は変えない。\n"),
+    ("text",
+     "//  Entry C: Candle Pattern、Short Only、SL Buffer 1.5、固定 RR 1.5、反対側 Zone TP OFF、建値移動 OFF (Trigger は現行値のまま)。\n",
+     "//  Entry C: Candle Pattern、Short Only、SL Buffer 1.5、固定 RR 1.5、反対側 Zone TP OFF、建値移動 (XA-5 で ON・Trigger 15 に変更)。\n"),
+] + ZONE_EDITS5 + [
+    ("default",
+     'stBE = input.bool(false, "Breakeven Stop", group = G_STT)\n',
+     'stBE = input.bool(true, "Breakeven Stop", group = G_STT)\n'),
+    ("default",
+     'stBEDist = input.float(10.0, "Breakeven Trigger ($)", minval = 0.0, step = 0.5, group = G_STT)\n',
+     'stBEDist = input.float(15.0, "Breakeven Trigger ($)", minval = 0.0, step = 0.5, group = G_STT)\n'),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -364,8 +408,13 @@ def build_visual3():
     return _apply(build_visual1(), VISUAL_EDITS3)
 
 
-def build_visual():
+def build_visual4():
+    """XA-1 + XA-3 + XA-4 (commit 7363ef1)."""
     return _apply(build_visual3(), VISUAL_EDITS4)
+
+
+def build_visual():
+    return _apply(build_visual4(), VISUAL_EDITS5)
 
 
 def build_engine():
@@ -393,8 +442,13 @@ def build_strategy3():
     return _apply(build_strategy2(), STRATEGY_EDITS3)
 
 
-def build_strategy():
+def build_strategy4():
+    """XA-1 .. XA-4 (commit 7363ef1)."""
     return _apply(build_strategy3(), STRATEGY_EDITS4)
+
+
+def build_strategy():
+    return _apply(build_strategy4(), STRATEGY_EDITS5)
 
 
 def strip_visual3(t):
@@ -402,13 +456,27 @@ def strip_visual3(t):
     return _revert(t, VISUAL_EDITS3)
 
 
+def strip_visual5(t):
+    """reverse only XA-5 (-> the Visual of 7363ef1 / a33d2b0 byte for byte)."""
+    return _revert(t, VISUAL_EDITS5)
+
+
+def strip_strategy5(t):
+    """reverse only XA-5 (-> the Strategy of 7363ef1 / a33d2b0 byte for byte)."""
+    return _revert(t, STRATEGY_EDITS5)
+
+
 def strip_visual4(t):
-    """reverse only XA-4 (-> the Visual of 17d1ca2 byte for byte)."""
+    """reverse XA-5 when present (all or nothing) and XA-4 (-> the Visual of 17d1ca2 byte for byte)."""
+    if t is not None and VISUAL_EDITS5[0][2] in t:
+        t = strip_visual5(t)
     return _revert(t, VISUAL_EDITS4)
 
 
 def strip_strategy4(t):
-    """reverse only XA-4 (-> the Strategy of 17d1ca2 byte for byte)."""
+    """reverse XA-5 when present (all or nothing) and XA-4 (-> the Strategy of 17d1ca2 byte for byte)."""
+    if t is not None and STRATEGY_EDITS5[0][2] in t:
+        t = strip_strategy5(t)
     return _revert(t, STRATEGY_EDITS4)
 
 
