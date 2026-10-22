@@ -590,7 +590,8 @@ def gate_xa5():
     others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, xb.STR_PATH)]
     check("XF-07 vs a33d2b0 only the Gold Visual / Strategy, xa_build, xae_sim, cad_sim and cad_adapt change; every other Pine "
           "file (Engines incl. ZoneEnginePracticalXAUUSD, other symbols) byte-identical",
-          mod <= {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", "tests/xae_sim.py", "tests/cad_sim.py", "tests/cad_adapt.py"}
+          mod <= {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", "tests/xae_sim.py", "tests/cad_sim.py", "tests/cad_adapt.py",
+                  "tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src/README.txt"}   # XA-7 (pinned in xas_sim)
           and {xb.VIS_PATH, xb.STR_PATH} <= mod and not [p for p in others if rd(p) != git("show", f"{A}:{p}")
                                                          and not (p == xb.ENG_PATH and E == git("show", f"{A}:{p}"))], str(sorted(mod)))   # XA-6: Engine exact
     muts = [V5.replace(ds_new, ds_old), S5.replace(be[1], be[0]), S5.replace(be[3], be[2]),
@@ -693,12 +694,12 @@ def run(t, bars, mode=True, **kw):
 
 
 def gate_xa6():
-    E6, V6, S6 = rd(xb.ENG_PATH), rd(xb.VIS_PATH), rd(xb.STR_PATH)
+    E6, V6, S6 = rd(xb.ENG_PATH), rd(xb.VIS_PATH), xb.strip_strategy7(rd(xb.STR_PATH)) or ""   # Strategy: XA-6 layer (XA-7 reverted exactly; pinned in xas_sim)
     B = "cbb996d"
     E1, VB, SB = xb.show(B, xb.ENG_PATH), xb.show(B, xb.VIS_PATH), xb.show(B, xb.STR_PATH)
     check("XR-01 XA-6: Engine == xa_build.build_engine() (version 1 + XA-6), Visual / Strategy == build_*(); strip_*6 give the "
           "cbb996d files byte for byte (Engine version 1 unchanged and still published as /1)",
-          xb.build_engine() == E6 and xb.build_visual() == V6 and xb.build_strategy() == S6 and xb.strip_engine6(E6) == E1
+          xb.build_engine() == E6 and xb.build_visual() == V6 and xb.build_strategy6() == S6 and xb.strip_engine6(E6) == E1
           and xb.strip_visual6(V6) == VB and xb.strip_strategy6(S6) == SB and xb.build_engine1() == E1)
     old_block = E1[E1.index("    if evalBar\n        if evalState == ST_RESIST"):E1.index("    //  ★ Practical: natural role reversal 禁止。")]
     new_block = E6[E6.index("    else if evalBar\n        if evalState == ST_RESIST"):E6.index("    //  ★ Practical: natural role reversal 禁止。")]

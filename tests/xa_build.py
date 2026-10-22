@@ -422,6 +422,217 @@ STRATEGY_EDITS6 = [
 ] + ZONE_EDITS6
 
 
+# ---- XA-7: Entry Timing = SATS Pullback (Strategy only; after XA-6) ---------------------------------------------------
+#  Current (default) keeps the previous order path byte for byte (the new branches are `if stSats ... else if <old>`).
+#  SATS Pullback (Entry C only; other Entry Modes stop with runtime.error): when Entry C would place its market order, a single
+#  wait is prepared instead (Track, side, prep bar / bar end time, P0 = that close, SL0 = the existing SL, TP0 = the existing
+#  f_stTp result at P0). From the next confirmed 5M bar: cancel first (wait >= limit minutes of wall clock from the prep bar's
+#  end / Track gone / no longer a same-side candidate with Strong eligibility / SL0 reached), then the SATS line nearest to the
+#  previous close among LINE1 / LINE2 / STB of the previous bar (Long: SL0 < L < P0 and L < prev close; Short mirrored; ties
+#  LINE1 -> LINE2 -> STB), touched (low <= L <= high) and closed back (Long close > L, SL0 < close < P0; Short mirrored) on that
+#  bar -> market order, qty = f_stQty(side, close, SL0). On the fill TP = TP0 (fixed; set at the existing fill-confirmation
+#  time); a fill on the wrong side of SL0 / TP0 is closed at market (no TP), never treated as a normal entry.
+#  f_satBand() is the SATS source function byte for byte (tests/sats_src/f_satBand.txt), computed on every bar at global scope.
+SATS_FN = open(os.path.join(ROOT, "tests", "sats_src", "f_satBand.txt"), encoding="utf-8").read()
+SATS_INPUTS = (
+    'var string G_STW = "03 · Strategy Entry Timing (SATS)"\n'
+    'stTiming = input.string("Current", "Entry Timing", options = ["Current", "SATS Pullback"], group = G_STW,\n'
+    '     tooltip = "Current (初期): 変更前の発注方式。\\n" +\n'
+    '     "SATS Pullback: Entry C が発注する条件を満たした足で発注せず待機を始め、次の 5分足以降に SATS 線 (LINE1 / LINE2 / STB) への\\n" +\n'
+    '     "接触と終値での戻りを確認してから成行で発注する。SL0 / TP0 は準備時に固定 (約定後に TP を作り直さない)。\\n" +\n'
+    '     "Entry C 専用: 他の Entry Mode と組み合わせると停止して表示する (黙って別動作にしない)。")\n'
+    'stSatsWait = input.int(240, "SATS · 待機期限 (分)", minval = 1, group = G_STW,\n'
+    '     tooltip = "準備した 5分足の終了時刻からの実時間。この分数以上になった確定評価時点で取消 (週末・欠損・時間帯外も時計は止めない)。")\n'
+    'stSatsShow = input.bool(true, "SATS · 線を表示", group = G_STW)\n')
+SATS_GLOBAL = (
+    "\n// ---- XA-7 · SATS (SAT BAND LINE1 / LINE2 / STB) ---------------------------------------------------------------------\n"
+    "//  f_satBand() は SATS 移植元 (SAT BAND Reconstruction Test) の関数を一字一句そのまま使う (tests/sats_src/f_satBand.txt)。\n"
+    "//  待機の有無にかかわらず毎バー グローバルで計算する。色・バンド状態は Entry 判定に使わない。\n"
+    "bool stSats = stTiming == \"SATS Pullback\"\n"
+    "if stSats and not stModeC\n"
+    "    runtime.error(\"Entry Timing = SATS Pullback は Entry Mode C: Candle Pattern 専用です (他の Entry Mode は対象外)。\")\n"
+    "\n" + SATS_FN + "\n"
+    "[satL1, satL2, satStb, satD1, satD2, satSD, satBand, satBasis, satCommon, satAtr, satA1, satA2] = f_satBand()\n"
+    "\n"
+    "// 足 t の判定に使う線: 足 t-1 で確定した 3 本の値と前足終値だけで選ぶ (足 t の値は使わない)。\n"
+    "//  Long: SL0 < L < P0 かつ L < 前足終値 / Short: SL0 > L > P0 かつ L > 前足終値。前足終値に最も近い線、同距離は LINE1 -> LINE2 -> STB。\n"
+    "//  戻り値 [線の種類 (1 / 2 / 3、無ければ 0), 線の価格 (無ければ na)]。na の線は候補にしない。\n"
+    "f_satPick(int side, float p0, float sl0, float pc, float l1, float l2, float l3) =>\n"
+    "    int   bk = 0\n"
+    "    float bp = na\n"
+    "    float bd = na\n"
+    "    for k = 1 to 3\n"
+    "        float v = k == 1 ? l1 : k == 2 ? l2 : l3\n"
+    "        bool ok = not na(v) and not na(pc) and (side == 1 ? (v > sl0 and v < p0 and v < pc) : (v < sl0 and v > p0 and v > pc))\n"
+    "        if ok\n"
+    "            float d = math.abs(pc - v)\n"
+    "            if bk == 0 or d < bd\n"
+    "                bk := k\n"
+    "                bp := v\n"
+    "                bd := d\n"
+    "    [bk, bp]\n")
+SATS_VARS = (
+    "// XA-7 SATS Pullback の待機 (全体で 1 件) と確認用の記録\n"
+    "var int   pwState  = 0       // 0 = 待機なし / 1 = 待機中\n"
+    "var int   pwSide   = 0\n"
+    "var int   pwTrack  = -1\n"
+    "var int   pwBar    = na\n"
+    "var int   pwEndT   = na      // 準備した 5分足の終了時刻 (期限の起点)\n"
+    "var float pwP0     = na\n"
+    "var float pwSL0    = na\n"
+    "var float pwTP0    = na\n"
+    "var float oTP0     = na      // SATS で発注した注文の TP0 (約定確認時の TP)\n"
+    "var float pwRRPrep = na\n"
+    "var float pwRRPlan = na\n"
+    "var float pwRRFill = na\n"
+    "var int   pwNPrep  = 0\n"
+    "var int   pwNOrder = 0\n"
+    "var int   pwNExp   = 0\n"
+    "var int   pwNTrk   = 0\n"
+    "var int   pwNZone  = 0\n"
+    "var int   pwNSL    = 0\n"
+    "var int   pwNBad   = 0\n"
+    "int   pwEv    = 0          // この足のイベント: 1 = 準備 / 2 = 発注 / -1 期限 / -2 Track 消失 / -3 候補・Strong 資格なし / -4 SL0 到達\n"
+    "int   pwLineK = 0          // この足の判定に使った線 (1 = LINE1 / 2 = LINE2 / 3 = STB / 0 = なし)\n"
+    "float pwLineP = na         // その線の価格 (足 t-1 の確定値)\n")
+SATS_FILL = (
+    "    // (2b') XA-7 SATS Pullback: TP は準備時の TP0 のまま (実約定価格から作り直さない)。設定は既存どおり約定確認時。\n"
+    "    //   実約定が SL0 / TP0 の不適切な側 (risk <= 0 または TP0 までの距離 <= 0) なら TP を置かず成行決済 (正常約定として扱わない)\n"
+    "    if fillNow and stSats\n"
+    "        float riskS = oSide * (oFill - oSL)\n"
+    "        float rewS  = oSide * (oTP0 - oFill)\n"
+    "        pwRRFill := riskS > 0 ? rewS / riskS : na\n"
+    "        if riskS > 0 and rewS > 0\n"
+    "            oTP   := oTP0\n"
+    "            oStop := oSL\n"
+    "            strategy.exit(oXid, oEid, stop = oStop, limit = oTP)\n"
+    "        else\n"
+    "            strategy.close(oEid)\n"
+    "            oState := 3\n"
+    "            pwNBad += 1\n"
+    "    else if fillNow\n")
+SATS_WAIT = (
+    "    // (3b) XA-7 SATS Pullback の待機判定 (準備足の次の足から)。取消を反発より優先する\n"
+    "    //   取消: 期限 (準備足の終了時刻からの実時間) / Track 消失 / 同方向の候補 (Strong 資格) でない / SL0 到達。使用済み Track にはしない\n"
+    "    //   判定: 足 t-1 の確定線から選んだ L に足 t が接触し (low <= L <= high)、終値が戻る (Long: close > L、SL0 < close < P0)\n"
+    "    bool  pwCancelBar = false\n"
+    "    if stSats and pwState == 1 and bar_index > pwBar\n"
+    "        bool zOK = false\n"
+    "        int  nc  = array.size(cur)\n"
+    "        if nc > 0\n"
+    "            for k = 0 to nc - 1\n"
+    "                StCand x = array.get(cur, k)\n"
+    "                if x.track == pwTrack and x.side == pwSide\n"
+    "                    zOK := true\n"
+    "        int why = 0\n"
+    "        if time_close - pwEndT >= stSatsWait * 60000\n"
+    "            why := -1\n"
+    "        else if array.indexof(curTrk, pwTrack) < 0\n"
+    "            why := -2\n"
+    "        else if not zOK\n"
+    "            why := -3\n"
+    "        else if pwSide == 1 ? low <= pwSL0 : high >= pwSL0\n"
+    "            why := -4\n"
+    "        if why != 0\n"
+    "            pwState     := 0\n"
+    "            pwCancelBar := true\n"
+    "            pwEv        := why\n"
+    "            pwNExp  += why == -1 ? 1 : 0\n"
+    "            pwNTrk  += why == -2 ? 1 : 0\n"
+    "            pwNZone += why == -3 ? 1 : 0\n"
+    "            pwNSL   += why == -4 ? 1 : 0\n"
+    "        else\n"
+    "            [lk, lp] = f_satPick(pwSide, pwP0, pwSL0, close[1], satL1[1], satL2[1], satStb[1])\n"
+    "            pwLineK := lk\n"
+    "            pwLineP := lp\n"
+    "            bool hit = lk != 0 and low <= lp and lp <= high and (pwSide == 1 ? (close > lp and close > pwSL0 and close < pwP0) : (close < lp and close < pwSL0 and close > pwP0))\n"
+    "            if hit and stSessOK and oState == 0\n"
+    "                float q = f_stQty(pwSide, close, pwSL0)\n"
+    "                if not na(q)\n"
+    "                    oSeq    += 1\n"
+    "                    oEid    := (pwSide == 1 ? \"L\" : \"S\") + str.tostring(oSeq)\n"
+    "                    oXid    := oEid + \" SL/TP\"\n"
+    "                    oSide   := pwSide\n"
+    "                    oTrack  := pwTrack\n"
+    "                    oLimit  := false\n"
+    "                    oL      := na\n"
+    "                    oSL     := pwSL0\n"
+    "                    oStop   := pwSL0\n"
+    "                    oTP     := na\n"
+    "                    oTP0    := pwTP0\n"
+    "                    oFill   := na\n"
+    "                    oBE     := false\n"
+    "                    oClosed := strategy.closedtrades\n"
+    "                    oState  := 1\n"
+    "                    strategy.entry(oEid, pwSide == 1 ? strategy.long : strategy.short, qty = q)\n"
+    "                    strategy.exit(oXid, oEid, stop = oSL)\n"
+    "                    pwRRPlan := pwSide * (pwTP0 - close) / (pwSide * (close - pwSL0))\n"
+    "                    pwRRFill := na\n"
+    "                    pwState  := 0\n"
+    "                    pwEv     := 2\n"
+    "                    pwNOrder += 1\n"
+    "\n")
+SATS_PREP = (
+    "            if stSats\n"
+    "                // XA-7: Entry C が発注する条件を満たした → 発注せず待機を準備する (待機中・取消した足では何もしない)\n"
+    "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar\n"
+    "                    pwState  := 1\n"
+    "                    pwSide   := side\n"
+    "                    pwTrack  := c.track\n"
+    "                    pwBar    := bar_index\n"
+    "                    pwEndT   := time_close\n"
+    "                    pwP0     := ref\n"
+    "                    pwSL0    := pSL\n"
+    "                    pwTP0    := tpRef\n"
+    "                    pwRRPrep := side * (tpRef - ref) / (side * (ref - pSL))\n"
+    "                    pwEv     := 1\n"
+    "                    pwNPrep  += 1\n"
+    "            else if not skipRef and not na(pQty)\n")
+SATS_PLOTS = (
+    "// XA-7 SATS Pullback の確認表示 (データウィンドウ + 小さな印。永続ラベル・独自アラートは追加しない)\n"
+    "plot(stSats and stSatsShow ? satL1 : na,  \"SATS · LINE1\", color = color.new(color.teal, 0))\n"
+    "plot(stSats and stSatsShow ? satL2 : na,  \"SATS · LINE2\", color = color.new(color.orange, 0))\n"
+    "plot(stSats and stSatsShow ? satStb : na, \"SATS · STB\",   color = color.new(color.purple, 0))\n"
+    "plot(stSats ? pwState : na,                \"SATS · 待機中\",          display = display.data_window)\n"
+    "plot(stSats ? pwEv : na,                   \"SATS · イベント (1 準備 / 2 発注 / -1 期限 / -2 Track / -3 資格 / -4 SL0)\", display = display.data_window)\n"
+    "plot(stSats ? pwLineK : na,                \"SATS · 対象線 (1 L1 / 2 L2 / 3 STB)\", display = display.data_window)\n"
+    "plot(stSats ? pwLineP : na,                \"SATS · 対象線の価格 (足 t-1 確定値)\", display = display.data_window)\n"
+    "plot(stSats ? pwP0 : na,                   \"SATS · P0\",              display = display.data_window)\n"
+    "plot(stSats ? pwSL0 : na,                  \"SATS · SL0\",             display = display.data_window)\n"
+    "plot(stSats ? pwTP0 : na,                  \"SATS · TP0\",             display = display.data_window)\n"
+    "plot(stSats ? pwRRPrep : na,               \"SATS · 準備 RR\",          display = display.data_window)\n"
+    "plot(stSats ? pwRRPlan : na,               \"SATS · 発注時の予定 RR\",   display = display.data_window)\n"
+    "plot(stSats ? pwRRFill : na,               \"SATS · 実 RR (実約定価格)\", display = display.data_window)\n"
+    "plot(stSats ? pwNPrep : na,                \"SATS · 準備件数\",          display = display.data_window)\n"
+    "plot(stSats ? pwNOrder : na,               \"SATS · 発注件数\",          display = display.data_window)\n"
+    "plot(stSats ? pwNExp : na,                 \"SATS · 期限切れ件数\",      display = display.data_window)\n"
+    "plot(stSats ? pwNTrk + pwNZone : na,       \"SATS · Track / 資格の取消件数\", display = display.data_window)\n"
+    "plot(stSats ? pwNSL : na,                  \"SATS · SL0 到達の取消件数\", display = display.data_window)\n"
+    "plot(stSats ? pwNBad : na,                 \"SATS · 不適切な約定の決済件数\", display = display.data_window)\n"
+    "plotshape(stSats and pwEv == 1, \"SATS · 準備\", style = shape.circle, location = location.abovebar, color = color.gray, size = size.tiny)\n"
+    "plotshape(stSats and pwEv == 2, \"SATS · 発注\", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny)\n"
+    "plotshape(stSats and pwEv < 0,  \"SATS · 取消\", style = shape.xcross, location = location.abovebar, color = color.silver, size = size.tiny)\n")
+STRATEGY_EDITS7 = [
+    ("header",
+     "//  Strategy: 新しい役割の Zone を Retest 前から候補評価できる (発注は従来どおり Entry A〜D の条件が必要)。\n",
+     "//  Strategy: 新しい役割の Zone を Retest 前から候補評価できる (発注は従来どおり Entry A〜D の条件が必要)。\n"
+     "//  XA-7: Entry Timing (初期 Current = 変更前の発注方式)。SATS Pullback = Entry C の発注条件で待機を準備し、次の 5分足以降に\n"
+     "//  SATS 線 (LINE1 / LINE2 / STB、足 t-1 の確定値) への接触と終値での戻りで成行発注。SL0 / TP0 は準備時に固定。成績への影響は未確認。\n"),
+    ("input",
+     'stDWait = input.int(30, "D · BOS Wait (confirmed 1M bars)", minval = 1, group = G_ST)\n',
+     'stDWait = input.int(30, "D · BOS Wait (confirmed 1M bars)", minval = 1, group = G_ST)\n' + SATS_INPUTS),
+    ("sats", 'bool stShortOK = stDir != "Long Only"\n', 'bool stShortOK = stDir != "Long Only"\n' + SATS_GLOBAL),
+    ("sats", "var int    oClosed = 0\n", "var int    oClosed = 0\n" + SATS_VARS),
+    ("sats", "    if fillNow\n", SATS_FILL),
+    ("sats", "    // (4) 新規 Entry (注文が無く、取消をした足でなく、時間帯の中のときだけ)\n",
+     SATS_WAIT + "    // (4) 新規 Entry (注文が無く、取消をした足でなく、時間帯の中のときだけ)\n"),
+    ("sats", "            if not skipRef and not na(pQty)\n", SATS_PREP),
+    ("sats",
+     'plot(stSessOK ? 1 : 0,                 "ST · Entry Session",     display = display.data_window)\n',
+     'plot(stSessOK ? 1 : 0,                 "ST · Entry Session",     display = display.data_window)\n' + SATS_PLOTS),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -575,8 +786,13 @@ def build_strategy5():
     return _apply(build_strategy4(), STRATEGY_EDITS5)
 
 
-def build_strategy():
+def build_strategy6():
+    """XA-1 .. XA-6 (commit 0c6cd71)."""
     return _apply(build_strategy5(), STRATEGY_EDITS6)
+
+
+def build_strategy():
+    return _apply(build_strategy6(), STRATEGY_EDITS7)
 
 
 def strip_visual3(t):
@@ -589,8 +805,15 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy7(t):
+    """reverse only XA-7 (-> the Strategy of 0c6cd71 byte for byte)."""
+    return _revert(t, STRATEGY_EDITS7)
+
+
 def strip_strategy6(t):
-    """reverse only XA-6 (-> the Strategy of cbb996d byte for byte)."""
+    """reverse XA-7 when present (all or nothing) and XA-6 (-> the Strategy of cbb996d byte for byte)."""
+    if t is not None and STRATEGY_EDITS7[0][2] in t:
+        t = strip_strategy7(t)
     return _revert(t, STRATEGY_EDITS6)
 
 
