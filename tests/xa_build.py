@@ -633,6 +633,66 @@ STRATEGY_EDITS7 = [
 ]
 
 
+# ---- XA-8: SATS actual RR also for a fill closed within its fill bar (Strategy only; after XA-7) -------------------------
+#  Record only. f_satRR(side, fill, SL0, TP0) -> [RR, reason] (0 = ok, 1 = risk <= 0: fill at / beyond SL0, 2 = TP0 not beyond
+#  the fill, 3 = a price is na; RR na unless 0). Holding path (2b'): same order handling, the record comes from f_satRR.
+#  Closed-in-fill-bar path (filledClosed): SATS Pullback only, the entry price of that closed trade with the stored SL0 / TP0;
+#  no TP / close order (the trade is already closed). One record per fill (the two paths are exclusive branches of (1)):
+#  pwNFill counts it, pwFillPath shows the path (1 = holding / 2 = closed in the fill bar). Current is unchanged.
+SATS_RR_FN = (
+    "\n// XA-8: 実 RR = side × (TP0 − 実約定) ÷ side × (実約定 − SL0)。戻り値 [RR, 理由] (0 = 計算可 / 1 = 約定が SL0 以遠 (risk <= 0) /\n"
+    "//  2 = TP0 が約定価格の先にない (reward <= 0) / 3 = 価格が na)。理由 0 以外の RR は na\n"
+    "f_satRR(int side, float fillPx, float sl0, float tp0) =>\n"
+    "    float rr  = na\n"
+    "    int   why = 0\n"
+    "    if na(fillPx) or na(sl0) or na(tp0)\n"
+    "        why := 3\n"
+    "    else\n"
+    "        float risk = side * (fillPx - sl0)\n"
+    "        float rew  = side * (tp0 - fillPx)\n"
+    "        if risk <= 0\n"
+    "            why := 1\n"
+    "        else if rew <= 0\n"
+    "            why := 2\n"
+    "        else\n"
+    "            rr := rew / risk\n"
+    "    [rr, why]\n")
+STRATEGY_EDITS8 = [
+    ("header",
+     "//  SATS 線 (LINE1 / LINE2 / STB、足 t-1 の確定値) への接触と終値での戻りで成行発注。SL0 / TP0 は準備時に固定。成績への影響は未確認。\n",
+     "//  SATS 線 (LINE1 / LINE2 / STB、足 t-1 の確定値) への接触と終値での戻りで成行発注。SL0 / TP0 は準備時に固定。成績への影響は未確認。\n"
+     "//  XA-8: SATS の実 RR を約定足内で SL 決済まで終わった約定でも記録 (closed trade の実約定価格 + SL0 / TP0。注文は出さない)。\n"),
+    ("rr", "    [bk, bp]\n", "    [bk, bp]\n" + SATS_RR_FN),
+    ("rr", "var int   pwNBad   = 0\n",
+     "var int   pwNBad   = 0\n"
+     "var int   pwRRWhy  = na      // XA-8: 実 RR の理由 (0 計算可 / 1 risk <= 0 / 2 reward <= 0 / 3 na)\n"
+     "var int   pwNFill  = 0       // XA-8: 実 RR を記録した SATS 約定の件数 (1 約定 1 回)\n"
+     "var int   pwFillPath = 0     // XA-8: 直近の記録経路 (1 = 約定後も保有中 / 2 = 約定足内で決済済み)\n"),
+    ("rr",
+     "            // 約定した足の中で SL まで成立した\n            map.put(stUsed, oTrack, true)\n            oState := 0\n",
+     "            // 約定した足の中で SL まで成立した\n            map.put(stUsed, oTrack, true)\n            oState := 0\n"
+     "            if stSats     // XA-8: 決済済みの SATS 約定も実 RR を記録する (TP / 決済の注文は出さない)\n"
+     "                [rrC, whyC] = f_satRR(oSide, strategy.closedtrades.entry_price(ct - 1), oSL, oTP0)\n"
+     "                pwRRFill   := rrC\n"
+     "                pwRRWhy    := whyC\n"
+     "                pwNFill    += 1\n"
+     "                pwFillPath := 2\n"),
+    ("rr", "        pwRRFill := riskS > 0 ? rewS / riskS : na\n",
+     "        [rrH, whyH] = f_satRR(oSide, oFill, oSL, oTP0)     // XA-8: 記録だけ (下の注文処理は従来どおり)\n"
+     "        pwRRFill   := rrH\n"
+     "        pwRRWhy    := whyH\n"
+     "        pwNFill    += 1\n"
+     "        pwFillPath := 1\n"),
+    ("rr", "                    pwRRFill := na\n", "                    pwRRFill := na\n                    pwRRWhy  := na\n"),
+    ("rr",
+     'plot(stSats ? pwRRFill : na,               "SATS · 実 RR (実約定価格)", display = display.data_window)\n',
+     'plot(stSats ? pwRRFill : na,               "SATS · 実 RR (実約定価格)", display = display.data_window)\n'
+     'plot(stSats ? pwRRWhy : na,                "SATS · 実 RR の理由 (0 可 / 1 risk<=0 / 2 reward<=0 / 3 na)", display = display.data_window)\n'
+     'plot(stSats ? pwNFill : na,                "SATS · 実 RR 記録件数", display = display.data_window)\n'
+     'plot(stSats ? pwFillPath : na,             "SATS · 記録経路 (1 保有中 / 2 約定足内で決済済み)", display = display.data_window)\n'),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -791,8 +851,13 @@ def build_strategy6():
     return _apply(build_strategy5(), STRATEGY_EDITS6)
 
 
-def build_strategy():
+def build_strategy7():
+    """XA-1 .. XA-7 (commit 6b9458d)."""
     return _apply(build_strategy6(), STRATEGY_EDITS7)
+
+
+def build_strategy():
+    return _apply(build_strategy7(), STRATEGY_EDITS8)
 
 
 def strip_visual3(t):
@@ -805,8 +870,15 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy8(t):
+    """reverse only XA-8 (-> the Strategy of 6b9458d byte for byte)."""
+    return _revert(t, STRATEGY_EDITS8)
+
+
 def strip_strategy7(t):
-    """reverse only XA-7 (-> the Strategy of 0c6cd71 byte for byte)."""
+    """reverse XA-8 when present (all or nothing) and XA-7 (-> the Strategy of 0c6cd71 byte for byte)."""
+    if t is not None and STRATEGY_EDITS8[0][2] in t:
+        t = strip_strategy8(t)
     return _revert(t, STRATEGY_EDITS7)
 
 

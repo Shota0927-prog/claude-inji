@@ -13,6 +13,9 @@
        (SL0 / Track / eligibility / expiry); 240-minute boundary by wall clock across gaps; duplicate signals do not extend;
        fixed SL0 / TP0; actual RR on a gap; used Track only on the fill; session; single wait / no double order
   XQ : mutations of the mirror and of the source
+  XV : XA-8 on the delivered Strategy — the actual RR is also recorded for a SATS fill closed in its fill bar (closed trade's
+       entry price, stored SL0 / TP0, no order), reasons for invalid distances, one record per fill on either path
+  (XW / XP / XQ run on the XA-7 layer: the Strategy with exactly the XA-8 edits reverted == 6b9458d)
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile, SATS line values vs the source indicator, Strategy Tester external).
 """
@@ -32,7 +35,7 @@ B = "0c6cd71"
 rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True).stdout
 code_only, input_decls, input_values, func, seg = es.code_only, es.input_decls, es.input_values, es.func, es.seg
-S, S0 = rd(xb.STR_PATH), xb.show(B, xb.STR_PATH)
+S, S0 = xb.strip_strategy8(rd(xb.STR_PATH)) or "", xb.show(B, xb.STR_PATH)   # XA-7 layer (XA-8 reverted exactly; pinned by XV)
 SRC = rd("tests/sats_src/f_satBand.txt")
 RESULTS = []
 
@@ -49,7 +52,7 @@ def block(t, start, end):
 def gate_static():
     check("XW-01 Strategy == xa_build.build_strategy() (XA-1 .. XA-7); strip_strategy7 gives 0c6cd71 byte for byte; the Engine and "
           "the Visual are byte-identical to 0c6cd71 (no Library re-publish)",
-          xb.build_strategy() == S and xb.strip_strategy7(S) == S0 and xb.build_strategy6() == S0
+          xb.build_strategy7() == S and xb.strip_strategy7(S) == S0 and xb.build_strategy6() == S0
           and rd(xb.ENG_PATH) == xb.show(B, xb.ENG_PATH) and rd(xb.VIS_PATH) == xb.show(B, xb.VIS_PATH)
           and {k for k, _, _ in xb.STRATEGY_EDITS7} == {"header", "input", "sats"})
     fill_old = block(S0, "    if fillNow\n", "    // (2c)")
@@ -376,8 +379,84 @@ def gate_mutation():
           "expiry, ATR without [1]", all(m != S and xb.strip_strategy7(m) is None for m in muts))
 
 
+# ---- XA-8: actual RR for a SATS fill closed in its fill bar -------------------------------------------------------------
+def sat_rr(side, fill_px, sl0, tp0):
+    """port of f_satRR: (rr, reason)."""
+    if fill_px is None or sl0 is None or tp0 is None:
+        return None, 3
+    risk, rew = side * (fill_px - sl0), side * (tp0 - fill_px)
+    if risk <= 0:
+        return None, 1
+    if rew <= 0:
+        return None, 2
+    return rew / risk, 0
+
+
+def confirm(sats, filled_open, filled_closed, fill_px, sl0, tp0, side, rec):
+    """port of step (1) + (2b') for one order: exclusive branches; returns the orders placed on this confirmation."""
+    orders = []
+    if filled_open:
+        if sats:
+            rr, why = sat_rr(side, fill_px, sl0, tp0)
+            rec.append(("hold", rr, why))
+            risk, rew = side * (fill_px - sl0), side * (tp0 - fill_px)
+            orders.append("exit" if risk > 0 and rew > 0 else "close")
+        else:
+            orders.append("exit")
+    elif filled_closed:
+        if sats:
+            rr, why = sat_rr(side, fill_px, sl0, tp0)
+            rec.append(("closed", rr, why))
+    return orders
+
+
+def gate_xa8():
+    S8, S7 = rd(xb.STR_PATH), xb.show("6b9458d", xb.STR_PATH)
+    check("XV-01 XA-8: Strategy == xa_build.build_strategy() (XA-1 .. XA-8); strip_strategy8 gives 6b9458d byte for byte; edit "
+          "kinds header / rr", xb.build_strategy() == S8 and xb.strip_strategy8(S8) == S7 and xb.build_strategy7() == S7
+          and {k for k, _, _ in xb.STRATEGY_EDITS8} == {"header", "rr"})
+    ch = [l for l in es.changed_code(S7, S8) if l]
+    stray = [l for l in ch if re.search(r"strategy\.(entry|exit|close|cancel)\(|map\.put|oState\s*:=|oTP\s*:=|oStop\s*:=", l)]
+    cl = block(S8, "        else if filledClosed\n", "        else if not oLimit\n")
+    hold = block(S8, "    if fillNow and stSats\n", "    else if fillNow\n")
+    hold7 = block(S7, "    if fillNow and stSats\n", "    else if fillNow\n")
+    norm = lambda t: [l for l in t.split("\n") if "pwRR" not in l and "pwNFill" not in l and "pwFillPath" not in l and "f_satRR" not in l]
+    check("XV-02 record only: no added order / state / TP / stop / stUsed line; the closed-in-fill-bar branch keeps stUsed and "
+          "oState := 0 and adds the record only under `if stSats` (no TP / close order); the holding path's order handling "
+          "(riskS / rewS, exit or market close, bad-fill count) is unchanged apart from the record lines; Current unchanged",
+          not stray and "map.put(stUsed, oTrack, true)\n            oState := 0\n            if stSats     // XA-8" in cl
+          and not re.search(r"strategy\.(entry|exit|close|cancel)\(", cl.split("if stSats")[1]) and norm(hold) == norm(hold7)
+          and "strategy.closedtrades.entry_price(ct - 1), oSL, oTP0)" in cl and "f_satRR(oSide, oFill, oSL, oTP0)" in hold,
+          str(stray[:3]))
+    check("XV-03 f_satRR: RR = side x (TP0 - fill) / side x (fill - SL0); reason 1 when the fill is at / beyond SL0, 2 when TP0 "
+          "is not beyond the fill, 3 when a price is na; RR na unless reason 0; both paths set pwNFill += 1 once and the path "
+          "code (1 holding / 2 closed in the fill bar); the order resets RR and reason",
+          "float risk = side * (fillPx - sl0)" in S8 and "float rew  = side * (tp0 - fillPx)" in S8
+          and code_only(S8).count("pwNFill    += 1") == 2 and "pwFillPath := 1" in hold and "pwFillPath := 2" in cl
+          and "                    pwRRFill := na\n                    pwRRWhy  := na\n" in S8)
+    rec = []
+    o1 = confirm(True, True, False, 2602.0, 2620.0, 2570.0, -1, rec)
+    o2 = confirm(True, False, True, 2603.0, 2620.0, 2570.0, -1, rec)
+    o3 = confirm(False, False, True, 2603.0, 2620.0, 2570.0, -1, rec)
+    check("XV-04 model: SATS fill still holding -> RR 32 / 18 = 1.778 recorded once with an exit order; SATS fill closed in its "
+          "fill bar at SL -> RR 33 / 17 = 1.941 recorded once, no order; Current closed fill -> no record; 2 fills -> 2 records "
+          "(the branches are exclusive, no double count)",
+          o1 == ["exit"] and o2 == [] and o3 == [] and len(rec) == 2 and rec[0][0] == "hold" and abs(rec[0][1] - 32 / 18) < 1e-12
+          and rec[1][0] == "closed" and abs(rec[1][1] - 33 / 17) < 1e-12 and rec[1][2] == 0)
+    check("XV-05 invalid distances -> na with distinct reasons: Short fill 2621 at / beyond SL0 2620 -> (na, 1); fill 2569 beyond "
+          "TP0 2570 -> (na, 2); fill na -> (na, 3); Long mirror (fill 2579 below SL0 2580 -> 1, fill 2631 above TP0 2630 -> 2)",
+          sat_rr(-1, 2621.0, 2620.0, 2570.0) == (None, 1) and sat_rr(-1, 2569.0, 2620.0, 2570.0) == (None, 2)
+          and sat_rr(-1, None, 2620.0, 2570.0) == (None, 3) and sat_rr(-1, 2620.0, 2620.0, 2570.0) == (None, 1)
+          and sat_rr(1, 2579.0, 2580.0, 2630.0) == (None, 1) and sat_rr(1, 2631.0, 2580.0, 2630.0) == (None, 2)
+          and abs(sat_rr(1, 2590.0, 2580.0, 2630.0)[0] - 4.0) < 1e-12)
+    m = S8.replace("                pwNFill    += 1\n                pwFillPath := 2\n", "                pwFillPath := 2\n")
+    m2 = S8.replace("            if stSats     // XA-8", "            if true     // XA-8")
+    check("XV-06 source mutations rejected by the exact strip: closed path not counted, record for Current too",
+          m != S8 and m2 != S8 and xb.strip_strategy8(m) is None and xb.strip_strategy8(m2) is None)
+
+
 def main():
-    for g in (gate_static, gate_model, gate_mutation):
+    for g in (gate_static, gate_model, gate_mutation, gate_xa8):
         try:
             g()
         except Exception:
