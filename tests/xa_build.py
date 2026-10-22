@@ -811,6 +811,35 @@ STRATEGY_EDITS9 = [
 ]
 
 
+# ---- XA-10: SATS Pullback with Entry Mode A / B / C / D (Strategy only; after XA-9) -------------------------------------
+#  The prep already sits in the shared order block (4) of every mode: it runs exactly where Current places the order, with
+#  that mode's ref (A: the limit price pL / B, C, D: the confirmed close), pSL, tpRef and pQty; D reaches it only through dSrc
+#  (after its 1M BOS). XA-10 removes the "Entry C only" runtime.error and updates the tooltip / header / comment. No logic
+#  line changes (SATS + C is the same code path). strip_strategy10() -> the Strategy of 3ca1837.
+STRATEGY_EDITS10 = [
+    ("header",
+     "//  接触足で戻る場合 (A) と、接触後の別の足で前足終値 → 当足終値が同じ線 L を越えて戻る場合 (B) を反発とする。成績への影響は未確認。\n",
+     "//  接触足で戻る場合 (A) と、接触後の別の足で前足終値 → 当足終値が同じ線 L を越えて戻る場合 (B) を反発とする。成績への影響は未確認。\n"
+     "//  XA-10: SATS Pullback を Entry Mode A〜D すべてで使える (各モードの既存の発注条件が成立した足で、注文の代わりに待機を準備。\n"
+     "//  P0 = A は元の指値価格 pL (指値注文は出さない) / B・C・D はその確定足の終値。D は既存の 1分足 BOS 確認後)。待機・反発・取消は共通。\n"),
+    ("text",
+     '     "SATS Pullback: Entry C が発注する条件を満たした足で発注せず待機を始め、次の 5分足以降に SATS 線 (LINE1 / LINE2 / STB) への\\n" +\n',
+     '     "SATS Pullback: 選択した Entry Mode (A〜D) が発注する条件を満たした足で発注せず待機を始め、次の 5分足以降に SATS 線\\n" +\n'
+     '     "(LINE1 / LINE2 / STB) への\\n" +\n'),
+    ("text",
+     '     "Entry C 専用: 他の Entry Mode と組み合わせると停止して表示する (黙って別動作にしない)。")\n',
+     '     "P0: A は元の指値価格 (指値注文は出さない) / B・C・D はその確定足の終値。D は既存の 1分足 BOS 確認後に待機を始める。")\n'),
+    ("gate",
+     'if stSats and not stModeC\n'
+     '    runtime.error("Entry Timing = SATS Pullback は Entry Mode C: Candle Pattern 専用です (他の Entry Mode は対象外)。")\n',
+     '//  XA-10: SATS Pullback は Entry Mode A〜D すべてで使える (C 専用の停止は廃止)。\n'),
+    ("text",
+     "                // XA-7: Entry C が発注する条件を満たした → 発注せず待機を準備する (待機中・取消した足では何もしない)\n",
+     "                // XA-7 / XA-10: 選択した Entry Mode (A〜D) が発注する条件を満たした → 発注せず待機を準備する\n"
+     "                //   (P0 = ref: A は指値価格 pL / B・C・D は確定足の終値。待機中・取消した足では何もしない)\n"),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -979,8 +1008,13 @@ def build_strategy8():
     return _apply(build_strategy7(), STRATEGY_EDITS8)
 
 
-def build_strategy():
+def build_strategy9():
+    """XA-1 .. XA-9 (commit 3ca1837)."""
     return _apply(build_strategy8(), STRATEGY_EDITS9)
+
+
+def build_strategy():
+    return _apply(build_strategy9(), STRATEGY_EDITS10)
 
 
 def strip_visual3(t):
@@ -993,8 +1027,15 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy10(t):
+    """reverse only XA-10 (-> the Strategy of 3ca1837 byte for byte)."""
+    return _revert(t, STRATEGY_EDITS10)
+
+
 def strip_strategy9(t):
-    """reverse only XA-9 (-> the Strategy of a32bd85 byte for byte)."""
+    """reverse XA-10 when present (all or nothing) and XA-9 (-> the Strategy of a32bd85 byte for byte)."""
+    if t is not None and STRATEGY_EDITS10[0][2] in t:
+        t = strip_strategy10(t)
     return _revert(t, STRATEGY_EDITS9)
 
 

@@ -17,7 +17,9 @@
        entry price, stored SL0 / TP0, no order), reasons for invalid distances, one record per fill on either path
   XN : XA-9 on the delivered Strategy — no zone re-check after the prep (cancel = limit / SL0 only), touch recorded with the
        line kind, rebound A (touch bar) or B (later bar: previous close and close across the same t-1 line value)
-  (XW / XP / XQ run on the XA-7 layer, XV on the XA-8 layer: the Strategy with exactly the later edits reverted)
+  XZ : XA-10 on the delivered Strategy — SATS Pullback with Entry Mode A / B / C / D (C-only stop removed; one shared prep in
+       the order block with each mode's ref: A the limit price, B / C / D the close; D after its BOS)
+  (XW / XP / XQ run on the XA-7 layer, XV on XA-8, XN on XA-9: the Strategy with exactly the later edits reverted)
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile, SATS line values vs the source indicator, Strategy Tester external).
 """
@@ -514,10 +516,10 @@ def tb(i):
 
 
 def gate_xa9():
-    S9, S8 = rd(xb.STR_PATH), xb.show("a32bd85", xb.STR_PATH)
+    S9, S8 = xb.strip_strategy10(rd(xb.STR_PATH)) or "", xb.show("a32bd85", xb.STR_PATH)   # XA-9 layer (XA-10 reverted exactly)
     check("XN-01 XA-9: Strategy == xa_build.build_strategy() (XA-1 .. XA-9); strip_strategy9 gives a32bd85 byte for byte; kinds "
           "header / touch; Engine / Visual / SATS formula (f_satBand == the source record) unchanged",
-          xb.build_strategy() == S9 and xb.strip_strategy9(S9) == S8 and xb.build_strategy8() == S8
+          xb.build_strategy9() == S9 and xb.strip_strategy9(S9) == S8 and xb.build_strategy8() == S8
           and {k for k, _, _ in xb.STRATEGY_EDITS9} == {"header", "touch"} and func(S9, "f_satBand() =>").rstrip("\n") + "\n" == SRC
           and rd(xb.ENG_PATH) == xb.show(B, xb.ENG_PATH) and rd(xb.VIS_PATH) == xb.show(B, xb.VIS_PATH))
     w = block(S9, "    // (3b) XA-7 / XA-9 SATS Pullback", "    // (4) 新規 Entry")
@@ -643,8 +645,80 @@ def Wait9_variant_moves():
     return v.step(12, tb(2), 2611.5, 2606, 2609, 2611.0, (2612.0, None, None))
 
 
+# ---- XA-10: SATS Pullback with Entry Mode A / B / C / D ------------------------------------------------------------------
+def prep_model(mode, side, close_px, limit_px, zone_top, zone_bot, buf=1.5, rr=1.5, pattern_ok=True, bos_done=True, sess=True):
+    """port of the shared order block (4) for one selected candidate: Current -> order kind, SATS -> prep values."""
+    if mode == "C" and not pattern_ok:
+        return None
+    if mode == "D" and not bos_done:          # D candidates exist only in dSrc after the 1M BOS
+        return None
+    if not sess:
+        return None
+    ref = limit_px if mode == "A" else close_px
+    sl = zone_bot - buf if side == 1 else zone_top + buf
+    risk = side * (ref - sl)
+    tp = ref + side * rr * risk
+    return dict(ref=ref, sl0=sl, tp0=tp, current_order="limit" if mode == "A" else "market")
+
+
+def gate_xa10():
+    S10, S9 = rd(xb.STR_PATH), xb.show("3ca1837", xb.STR_PATH)
+    ch = sorted(l for l in es.changed_code(S9, S10) if l)
+    code_rm = [l for l in ch if not l.startswith('"') and not l.startswith("tooltip")]
+    check("XZ-01 XA-10: Strategy == xa_build.build_strategy() (XA-1 .. XA-10); strip_strategy10 gives 3ca1837 byte for byte; the "
+          "only code change is the removal of the C-only runtime.error (2 lines), the rest are tooltip strings / comments; "
+          "Entry Mode default C, Entry Timing default Current, Role Reversal default unchanged",
+          xb.build_strategy() == S10 and xb.strip_strategy10(S10) == S9 and xb.build_strategy9() == S9
+          and code_rm == sorted(["if stSats and not stModeC",
+                                 'runtime.error("Entry Timing = SATS Pullback は Entry Mode C: Candle Pattern 専用です (他の Entry Mode は対象外)。")'])
+          and input_values(S10)["stMode"] == '"C: Candle Pattern"' and input_values(S10)["stTiming"] == '"Current"'
+          and input_values(S10)["roleMode"] == '"Confirmed Break"' and "C: Candle Pattern 専用" not in S10, str(code_rm))
+    blk4 = block(S10, "    if oState == 0 and not cancelBar and stSessOK\n", "    stPrev := cur")
+    prep = block(S10, "            if stSats\n                // XA-7", "            else if not skipRef and not na(pQty)\n")
+    cur_ord = block(S10, "            else if not skipRef and not na(pQty)\n", "    stPrev := cur")
+    check("XZ-02 one shared prep for every mode: block (4) takes each mode's own source (A: cur / D: dSrc / B, C: stPrev), scoring, "
+          "priority, used-Track and Both handling; ref = stModeA ? pL : close; skipRef / tpRef / pQty are computed from that ref "
+          "before the branch; the SATS prep stores P0 = ref, SL0 = pSL, TP0 = tpRef and places no order (the A limit order exists "
+          "only in the Current branch); no stModeC / mode test in the SATS prep or waiting code",
+          "array<StCand> src = stModeA ? cur : stModeD ? dSrc : stPrev" in blk4 and "float  ref = stModeA ? pL : close" in blk4
+          and "[skipRef, tpRef] = f_stTp(side, ref, pSL" in blk4 and "float  pQty = f_stQty(side, ref, pSL)" in blk4
+          and blk4.index("float  pQty") < blk4.index("            if stSats\n") and "strategy." not in prep
+          and "pwP0     := ref" in prep and "limit = oL" in cur_ord and not re.search(r"stMode[ABCD]", prep)
+          and not re.search(r"stMode[ABCD]", block(S10, "    // (3b) XA-7 / XA-9 SATS Pullback", "    // (4) 新規 Entry")))
+    d = block(S10, "    // (2d) D:", "    // (3) 保留中の指値")
+    check("XZ-03 D: dSrc (the D candidates of block (4)) is filled only by the existing 1M BOS step (2d), so the SATS prep for D "
+          "happens only after the BOS; B: the candle pattern term applies only to C ((not stModeC or pattern)), so B gets no C "
+          "condition; Current A-D code unchanged (strip exact)",
+          "array.push(dSrc, x.c)" in d and S10.count("array.push(dSrc,") == 1
+          and "(not stModeC or (c.side == 1 ? stPatL : stPatS))" in blk4)
+    a_s = prep_model("A", -1, 2604.0, 2600.0, 2600.0, 2590.0)
+    a_l = prep_model("A", 1, 2611.0, 2610.0, 2610.0, 2600.0)
+    b_s = prep_model("B", -1, 2588.0, None, 2600.0, 2590.0, pattern_ok=False)
+    c_s = prep_model("C", -1, 2588.0, None, 2600.0, 2590.0, pattern_ok=False)
+    d_s0 = prep_model("D", -1, 2588.0, None, 2600.0, 2590.0, bos_done=False)
+    d_s1 = prep_model("D", 1, 2612.0, None, 2610.0, 2600.0, bos_done=True)
+    check("XZ-04 model: A prepares with P0 = the limit price (Short 2600, Long 2610; Current would place a limit, SATS places none); "
+          "B prepares without a candle pattern (C would not); D prepares only after the BOS; SL0 = zone far edge +/- 1.5, TP0 = "
+          "P0 +/- 1.5 x risk; Long and Short",
+          a_s["ref"] == 2600.0 and a_s["sl0"] == 2601.5 and abs(a_s["tp0"] - (2600.0 - 1.5 * 1.5)) < 1e-9 and a_s["current_order"] == "limit"
+          and a_l["ref"] == 2610.0 and a_l["sl0"] == 2598.5 and b_s is not None and b_s["ref"] == 2588.0 and c_s is None
+          and d_s0 is None and d_s1["ref"] == 2612.0)
+    seqs = []
+    for p in (a_s, b_s, d_s1):
+        side = -1 if p["sl0"] > p["ref"] else 1
+        w = Wait9(side, p["ref"], p["sl0"], p["tp0"])
+        seqs.append(type(w).__name__ == "Wait9" and w.state == 1 and w.touched is False)
+    check("XZ-05 every mode hands the same waiting machine (XA-9: single wait, limit / SL0 cancels only, touch / rebound A or B, "
+          "t-1 lines, no order on the prep bar, P0 / SL0 / TP0 fixed) its P0 / SL0 / TP0; one waiting / rebound / cancel / RR code "
+          "path (no per-mode copy)", all(seqs) and S10.count("    if stSats and pwState == 1 and bar_index > pwBar\n") == 1
+          and S10.count("pwState  := 1") == 1 and S10.count("f_satRR(") == 3)
+    m = S10.replace("                    pwP0     := ref\n", "                    pwP0     := close\n")
+    check("XZ-06 mutation: P0 = close for every mode (A losing its limit price) does not strip back to 3ca1837",
+          m != S10 and xb.strip_strategy10(m) != S9)
+
+
 def main():
-    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9):
+    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10):
         try:
             g()
         except Exception:
