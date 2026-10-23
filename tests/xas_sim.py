@@ -24,8 +24,11 @@
        the close-back keeps the original L; both OFF = the XA-10 path
   XK : XA-12 on the delivered Strategy / Visual — Gold adopted defaults (Entry Timing SATS Pullback, Role Reversal Retest
        Confirmed in both files, SATS body ON, near ON, near distance 1.0) and the tooltips / comments naming them; nothing else
-  (XW / XP / XQ run on the XA-7 layer, XV on XA-8, XN on XA-9, XZ on XA-10, XY on XA-11: the Strategy with exactly the later
-  edits reverted; the Visual through strip_visual7)
+  XH : XA-13 on the delivered Strategy — SATS all-selected-timeframes opposite-band filter (D / 4H / 1H / 15m / 5m, default OFF):
+       AND over the selected timeframes only, each timeframe on its own history (last confirmed HTF bar), applied at the final
+       SATS order test only, a skip changes nothing
+  (XW / XP / XQ run on the XA-7 layer, XV on XA-8, XN on XA-9, XZ on XA-10, XY on XA-11, XK on XA-12: the Strategy with exactly
+  the later edits reverted; the Visual through strip_visual7)
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile, SATS line values vs the source indicator, Strategy Tester external).
 """
@@ -966,11 +969,11 @@ def gate_xa11():
 # ---- XA-12: Gold adopted defaults ------------------------------------------------------------------------------------------
 def gate_xa12():
     P = "d64258b"
-    S12, V12 = rd(xb.STR_PATH), rd(xb.VIS_PATH)
+    S12, V12 = xb.strip_strategy13(rd(xb.STR_PATH)) or "", rd(xb.VIS_PATH)   # Strategy: XA-12 layer (XA-13 reverted exactly)
     S11, V11 = xb.show(P, xb.STR_PATH), xb.show(P, xb.VIS_PATH)
     check("XK-01 XA-12: Strategy / Visual == xa_build.build_strategy() / build_visual(); strip_strategy12 / strip_visual7 give the "
           "d64258b files byte for byte; the Engine (and its import) unchanged",
-          xb.build_strategy() == S12 and xb.build_visual() == V12 and xb.strip_strategy12(S12) == S11
+          xb.build_strategy12() == S12 and xb.build_visual() == V12 and xb.strip_strategy12(S12) == S11
           and xb.strip_visual7(V12) == V11 and xb.build_strategy11() == S11 and xb.build_visual6() == V11
           and rd(xb.ENG_PATH) == xb.show(P, xb.ENG_PATH)
           and "import sekine3310/ZoneEnginePracticalXAUUSD/2 as zn" in S12 and "import sekine3310/ZoneEnginePracticalXAUUSD/2 as zn" in V12)
@@ -1014,8 +1017,258 @@ def gate_xa12():
           and "Retest Confirmed (初期)" in S12 and "Retest Confirmed (初期)" in V12)
 
 
+# ---- XA-13: SATS all-selected-timeframes opposite-band filter ------------------------------------------------------------
+TFS13 = ("D", "4", "1", "15", "5")
+
+
+def skip13(sel, states, want):
+    """port of f_satAllAgainst: sel / states keyed by TFS13; states 1 / -1 / 0 / None (na)."""
+    any_sel, all_hit = False, True
+    for k in TFS13:
+        if sel.get(k):
+            any_sel = True
+            all_hit = all_hit and states.get(k) is not None and states[k] == want
+    return any_sel and all_hit
+
+
+def spec13(sel, states, side):
+    """the request: skip only when >= 1 timeframe is selected and every selected one shows the opposite band."""
+    chosen = [k for k in TFS13 if sel.get(k)]
+    opp = 1 if side == -1 else -1
+    return bool(chosen) and all(states.get(k) == opp for k in chosen)
+
+
+def sat_state(bars):
+    """f_satBand stateV per bar (None = a line not computed), from the sat_series port."""
+    out = []
+    for (o, h, l, c, v), (l1, l2, sb, *_r) in zip(bars, sat_series(bars)):
+        if l1 is None or l2 is None or sb is None:
+            out.append(None)
+        else:
+            out.append(1 if (c > l1 and c > l2 and c > sb) else -1 if (c < l1 and c < l2 and c < sb) else 0)
+    return out
+
+
+def agg(bars, n):
+    return [(g[0][0], max(x[1] for x in g), min(x[2] for x in g), g[-1][3], sum(x[4] for x in g))
+            for g in (bars[i:i + n] for i in range(0, len(bars) - len(bars) % n, n))]
+
+
+class Wait13(Wait11):
+    """XA-11 waiting step plus the XA-13 skip: skip = this bar's all-selected opposite-band flag for the wait's side, ANDed
+    (negated) into the final order condition only; everything before it (cancel, line, touch record) is the XA-11 step."""
+
+    def step(self, bar, t_close, h, l, c, pc, lines, o=None, sess=True, qty_ok=True, o_state=0, skip=False):
+        if self.state != 1 or bar <= self.bar:
+            return None
+        why = 0
+        if t_close - self.t_end >= self.limit * 60000:
+            why = -1
+        elif (l <= self.sl0) if self.side == 1 else (h >= self.sl0):
+            why = -4
+        if why:
+            self.state = 0
+            self.n_exp += why == -1
+            self.n_sl += why == -4
+            self.touched, self.tk, self.tbar = False, 0, None
+            return why
+        if not self.touched:
+            k, L = pick(self.side, self.p0, self.sl0, pc, lines)
+        else:
+            k, L = self.tk, lines[self.tk - 1]
+        in_range = k != 0 and L is not None and ((self.sl0 < L < self.p0) if self.side == 1 else (self.p0 < L < self.sl0))
+        hit = in_range and l <= L <= h
+        near = self.near and in_range and ((l > L and l - L <= self.dist) if self.side == 1 else (h < L and L - h <= self.dist))
+        touch = hit or near
+        reb_a = touch and ((c > L) if self.side == 1 else (c < L))
+        reb_b = self.touched and in_range and ((pc <= L and c > L) if self.side == 1 else (pc >= L and c < L))
+        body_ok = (not self.body) or ((c > o) if self.side == 1 else (c < o))
+        if touch and not self.touched:
+            self.touched, self.tk, self.tbar = True, k, bar
+            self.n_touch_prep += 1
+        price_ok = (self.sl0 < c < self.p0) if self.side == 1 else (self.p0 < c < self.sl0)
+        if (reb_a or reb_b) and body_ok and not skip and price_ok and sess and o_state == 0 and qty_ok:
+            self.state = 0
+            self.orders.append(dict(bar=bar, ref=c, kind="A" if reb_a else "B", line=k, L=L))
+            self.n_same += reb_a
+            self.n_later += not reb_a
+            self.touched, self.tk, self.tbar = False, 0, None
+            return 2
+        return 0
+
+
+def gate_xa13():
+    S13, S12 = rd(xb.STR_PATH), xb.show("f9fa0f9", xb.STR_PATH)
+    i13, i12 = input_values(S13), input_values(S12)
+    new = {k: v for k, v in i13.items() if k not in i12}
+    cs = sorted(l for l in es.changed_code(S12, S13) if l and not l.startswith('"') and not l.startswith("tooltip"))
+    check("XH-01 XA-13: Strategy == xa_build.build_strategy() (XA-1 .. XA-13); strip_strategy13 gives f9fa0f9 byte for byte; five "
+          "new inputs (D / 4H / 1H / 15m / 5m) all default OFF; every older input default unchanged (adopted defaults kept); "
+          "the only changed old line is the SATS order condition (+ mtfOK); Engine / Visual / other files unchanged",
+          xb.build_strategy() == S13 and xb.strip_strategy13(S13) == S12 and xb.build_strategy12() == S12
+          and new == {"stSatsFD": "false", "stSatsF4": "false", "stSatsF1": "false", "stSatsF15": "false", "stSatsF5": "false"}
+          and all(i13[k] == v for k, v in i12.items())
+          and [l for l in cs if l in code_only(S12).split("\n") or l.strip() in [x.strip() for x in code_only(S12).split("\n")]]
+              == ["if (rebA or rebB) and bodyOK and priceOK and stSessOK and oState == 0"]
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and rd(p) != xb.show("f9fa0f9", p)],
+          "\n".join(cs))
+    reqs = re.findall(r'^int (satTf\w+)\s*= request\.security\(syminfo\.tickerid, "(\w+)",\s*f_satTfState\(\), lookahead = barmerge\.lookahead_on\)$',
+                      S13, re.M)
+    fts = func(S13, "f_satTfState() =>")
+    fa = func(S13, "f_satAllAgainst(int want) =>")
+    wb = block(S13, "    // (3b) XA-7 / XA-9 SATS Pullback", "    // (4) 新規 Entry")
+    rec = block(S13, "            if touchNow and not pwTouched\n", "            bool priceOK")
+    outside = S13.replace(wb, "")
+    check("XH-02 static: D / 240 / 60 / 15 each request f_satTfState() (f_satBand stateV of that timeframe's own history, na when "
+          "LINE1 / LINE2 / STB is na, value [1] + lookahead_on = the last confirmed bar) unconditionally at global scope (4 new "
+          "requests, no duplicate); 5m = the existing satBand of the bar (lines na -> na); no line direction (dir1 / dir2 / "
+          "stbDir) or colour used; f_satAllAgainst = AND over the selected timeframes only; satSkipS = all blue (1), satSkipL = "
+          "all red (-1); mtfOK appears only in the SATS order condition (not in the prep / touch record / Current / cancel)",
+          reqs == [("satTfD", "D"), ("satTf4", "240"), ("satTf1", "60"), ("satTf15", "15")]
+          and S13.count("request.security(") == S12.count("request.security(") + 4 and S13.count("f_satTfState()") == 5
+          and "[l1, l2, sb, d1, d2, sd, st, b, cm, at, a1, a2] = f_satBand()" in fts
+          and "int s = (na(l1) or na(l2) or na(sb)) ? na : st" in fts and fts.rstrip().endswith("s[1]")
+          and "int satTf5  = (na(satL1) or na(satL2) or na(satStb)) ? na : satBand\n" in S13
+          and not re.search(r"\b(d1|d2|sd|satD1|satD2|satSD|color)\b", fa)
+          and fa.count("anySel := true") == 5 and fa.count("allHit := allHit and not na(") == 5 and fa.rstrip().endswith("anySel and allHit")
+          and "bool satSkipS = f_satAllAgainst(1)" in S13 and "bool satSkipL = f_satAllAgainst(-1)" in S13
+          and S13.count("mtfOK") == 2 and wb.count("mtfOK") == 2 and "satSkip" not in rec and "mtfOK" not in outside
+          and "if (rebA or rebB) and bodyOK and mtfOK and priceOK and stSessOK and oState == 0" in wb
+          and not re.search(r"\bvar\b|varip", wb + fa) and code_only(S13).count("pwState  := 1") == 1)
+
+    import itertools
+    vals = (1, -1, 0, None)
+    ok = True
+    n = 0
+    for sel_bits in itertools.product((False, True), repeat=5):
+        sel = dict(zip(TFS13, sel_bits))
+        for st in itertools.product(vals, repeat=5):
+            states = dict(zip(TFS13, st))
+            for side in (1, -1):
+                want = -1 if side == 1 else 1
+                ok &= skip13(sel, states, want) == spec13(sel, states, side)
+                n += 1
+    S, L = -1, 1
+    cases = {
+        "D+4H both blue -> Short skip": skip13({"D": 1, "4": 1}, {"D": 1, "4": 1, "1": -1, "15": -1, "5": -1}, 1),
+        "D+4H one red": not skip13({"D": 1, "4": 1}, {"D": 1, "4": -1}, 1),
+        "D+4H one unlit": not skip13({"D": 1, "4": 1}, {"D": 1, "4": 0}, 1),
+        "D+4H one na": not skip13({"D": 1, "4": 1}, {"D": None, "4": 1}, 1),
+        "all 5 blue": skip13(dict.fromkeys(TFS13, 1), dict.fromkeys(TFS13, 1), 1),
+        "all 5, one red": not skip13(dict.fromkeys(TFS13, 1), {**dict.fromkeys(TFS13, 1), "15": -1}, 1),
+        "1H alone": skip13({"1": 1}, {"D": -1, "4": 0, "1": 1, "15": None, "5": -1}, 1),
+        "none selected": not skip13({}, dict.fromkeys(TFS13, 1), 1) and not skip13({}, dict.fromkeys(TFS13, -1), -1),
+        "Long all red": skip13({"D": 1, "4": 1}, {"D": -1, "4": -1}, -1) and not skip13({"D": 1, "4": 1}, {"D": -1, "4": -1}, 1),
+        "Long blue does not skip Long": not skip13({"D": 1, "4": 1}, {"D": 1, "4": 1}, -1),
+    }
+    check("XH-03 model: AND over the selected timeframes only, exhaustively (32 selections x 4^5 states x Long / Short = %d cases) "
+          "equal to the request; D+4H both opposite / one mismatch / unlit / na, all five / one off, 1H alone, nothing selected, "
+          "Long / Short symmetric" % n, ok and all(cases.values()), str([k for k, v in cases.items() if not v]))
+
+    random.seed(1301)
+    bars5, px = [], 2600.0
+    for _ in range(3 * 400):
+        o = px
+        c = round(o + random.gauss(0, 2.0), 2)
+        h, l = max(o, c) + abs(random.gauss(0, 1.0)), min(o, c) - abs(random.gauss(0, 1.0))
+        bars5.append((o, h, l, c, random.randint(50, 150)))
+        px = c
+    s15 = sat_state(agg(bars5, 3))
+    seen = [s15[i // 3 - 1] if i // 3 >= 1 else None for i in range(len(bars5))]     # [1] + lookahead_on on the 5m chart
+    stable, changed = True, 0
+    for k in (300, 350, 380):
+        alt = list(bars5)
+        for j in range(3 * k, 3 * k + 3):          # rewrite the forming 15m bar k
+            o, h, l, c, v = alt[j]
+            alt[j] = (o, h + 30, l - 30, c + (25 if j % 2 else -25), v)
+        s15b = sat_state(agg(alt, 3))
+        seen_b = [s15b[i // 3 - 1] if i // 3 >= 1 else None for i in range(len(alt))]
+        stable &= all(seen_b[j] == seen[j] for j in range(0, 3 * k + 3))     # nothing seen up to the end of the forming bar changes
+        changed += s15b[k] != s15[k] or s15b[k + 1:k + 4] != s15[k + 1:k + 4]   # the rewrite does change the 15m states themselves
+    s5 = sat_state(bars5)
+    sampled = [s5[3 * k + 2] for k in range(len(s15))]
+    check("XH-04 model: a higher timeframe's state comes from SATS on its own bars (15m built from 5m bars differs from sampling "
+          "the 5m state on %d of %d bars) and the 5m bars inside a forming 15m bar see only the previous confirmed 15m state "
+          "([1] + lookahead_on): rewriting the forming bar changes nothing up to its end" % (sum(a != b for a, b in zip(sampled, s15)), len(s15)),
+          stable and changed >= 1 and sum(a != b for a, b in zip(sampled[60:], s15[60:])) > 0 and s15.count(None) < 60, str(changed))
+
+    def short13():
+        return Wait13(-1, 2600.0, 2620.0, 2570.0, body=True, near=True, dist=1.0)
+    w = short13()
+    a1 = w.step(11, tb(1), 2611, 2607, 2605, 2606.0, (2610.0, None, None), o=2607, skip=True)    # A + bearish, but skipped
+    snap = (w.state, w.touched, w.tk, w.p0, w.sl0, w.tp0, w.t_end, len(w.orders), w.n_same, w.n_later, w.n_touch_prep)
+    a2 = w.step(12, tb(2), 2606, 2603, 2604, 2605.0, (2610.0, None, None), o=2605, skip=False)   # released, no new A / B
+    a3 = w.step(13, tb(3), 2612, 2606, 2611, 2604.0, (2610.0, None, None), o=2608, skip=False)   # above L
+    a4 = w.step(14, tb(4), 2608.5, 2605, 2606, 2611.0, (2610.0, None, None), o=2608, skip=False)   # gap, 1.5 $ under L: B + bearish -> order
+    e = short13()
+    e.step(11, tb(1), 2611, 2607, 2605, 2606.0, (2610.0, None, None), o=2607, skip=True)
+    ev, i = [], 2
+    while e.state == 1 and i < 200:
+        ev.append(e.step(10 + i, tb(i), 2611, 2607, 2605, 2611.0 if i % 2 else 2605.0, (2610.0, None, None), o=2607, skip=True))
+        i += 1
+    ref = Wait11(-1, 2600.0, 2620.0, 2570.0, body=True, near=True, dist=1.0)
+    ref.step(11, tb(1), 2611, 2607, 2605, 2606.0, (2610.0, None, None), o=2604)
+    rv, j = [], 2
+    while ref.state == 1 and j < 200:
+        rv.append(ref.step(10 + j, tb(j), 2606, 2603, 2604, 2605.0, (2610.0, None, None), o=2605))
+        j += 1
+    c = short13()
+    c.step(11, tb(1), 2611, 2607, 2605, 2606.0, (2610.0, None, None), o=2607, skip=True)
+    cv = c.step(12, tb(2), 2620, 2604, 2605, 2605.0, (2610.0, None, None), o=2607, skip=True)    # SL0 reached -> cancel first
+    lw = Wait13(1, 2600.0, 2580.0, 2630.0, body=True, near=True, dist=1.0)
+    lv1 = lw.step(11, tb(1), 2593, 2589, 2592, 2594.0, (2590.0, None, None), o=2591, skip=True)
+    lt1 = (lw.state, lw.touched, lw.tk)
+    lv2 = lw.step(12, tb(2), 2593, 2591.5, 2592.5, 2592.0, (2590.0, None, None), o=2591.6, skip=False)   # 1.5 $ away, no new A / B
+    lv3 = lw.step(13, tb(3), 2592, 2589, 2591.5, 2592.5, (2590.0, None, None), o=2590.5, skip=False)
+    check("XH-05 model: a skipped bar (rebound A + body + price + session + qty all true) places no order and keeps the wait, the "
+          "touch record and line kind, P0 / SL0 / TP0, the prep time and every counter; release alone does not order, a new "
+          "rebound (B) does; skipping every bar expires on the same bar as the unfiltered wait (no extension); SL0 cancel "
+          "comes first; Long symmetric; one order per wait",
+          a1 == 0 and snap == (1, True, 1, 2600.0, 2620.0, 2570.0, T0 + 10 * M5, 0, 0, 0, 1) and a2 == 0 and a3 == 0 and a4 == 2
+          and w.orders[0]["kind"] == "B" and len(w.orders) == 1 and ev[-1] == -1 and rv[-1] == -1 and len(ev) == len(rv)
+          and not e.orders and cv == -4 and not c.orders and lv1 == 0 and lt1 == (1, True, 1) and lv2 == 0 and lv3 == 2,
+          str((a1, snap, a2, a3, a4, len(ev), len(rv), ev[-1:], rv[-1:], cv, lv1, lv2, lv3)))
+
+    random.seed(1302)
+    same = True
+    for side in (1, -1):
+        for _ in range(300):
+            p0, sl0 = (2600.0, 2580.0) if side == 1 else (2600.0, 2620.0)
+            a, b = Wait11(side, p0, sl0, 0.0, body=True, near=True, dist=1.0), Wait13(side, p0, sl0, 0.0, body=True, near=True, dist=1.0)
+            pc = p0
+            for i in range(1, 40):
+                cc = round(pc + random.uniform(-4, 4), 1)
+                h, l = cc + round(random.uniform(0, 3), 1), cc - round(random.uniform(0, 3), 1)
+                lines = tuple(None if random.random() < 0.1 else round(cc + random.uniform(-6, 6), 1) for _ in range(3))
+                o = round(cc + random.uniform(-2, 2), 1)
+                states = {k: random.choice((1, -1, 0, None)) for k in TFS13}
+                sk = skip13({}, states, 1 if side == -1 else -1)
+                ra = a.step(10 + i, tb(i), h, l, cc, pc, lines, o=o)
+                rb = b.step(10 + i, tb(i), h, l, cc, pc, lines, o=o, skip=sk)
+                same &= ra == rb and a.touched == b.touched and a.tk == b.tk
+                pc = cc
+            same &= a.orders == b.orders
+    check("XH-06 model: all five OFF = no skip on 600 random Long / Short paths (bar for bar identical to the XA-12 wait, random "
+          "timeframe states)", same)
+
+    muts = [S13.replace("    anySel and allHit\n", "    anySel and (allHit or true)\n"),
+            S13.replace("allHit := allHit and not na(satTf4) and satTf4 == want", "allHit := allHit or satTf4 == want"),
+            S13.replace("allHit := allHit and not na(satTfD) and satTfD == want", "allHit := allHit and (na(satTfD) or satTfD == want)"),
+            S13.replace('int satTf15 = request.security(syminfo.tickerid, "15",  f_satTfState(), lookahead = barmerge.lookahead_on)',
+                        'int satTf15 = request.security(syminfo.tickerid, "15",  f_satTfState()[0], lookahead = barmerge.lookahead_on)'),
+            S13.replace("    s[1]\n", "    s\n"),
+            S13.replace("int s = (na(l1) or na(l2) or na(sb)) ? na : st", "int s = (na(l1) or na(l2) or na(sb)) ? na : d1"),
+            S13.replace("bool satSkipS = f_satAllAgainst(1)", "bool satSkipS = f_satAllAgainst(-1)"),
+            S13.replace("            if (rebA or rebB) and bodyOK and mtfOK and priceOK", "            if (rebA or rebB) and bodyOK and priceOK")]
+    or_model = lambda sel, st, want: any(sel.get(k) and st.get(k) == want for k in TFS13)
+    check("XH-07 mutations: OR / majority-style, a na counted as a match, the forming HTF bar (no [1]), a line direction instead "
+          "of the band, swapped sides, filter dropped do not strip back to f9fa0f9; the OR model disagrees with the request",
+          all(m != S13 and xb.strip_strategy13(m) is None for m in muts)
+          and or_model({"D": 1, "4": 1}, {"D": 1, "4": -1}, 1) != spec13({"D": 1, "4": 1}, {"D": 1, "4": -1}, -1))
+
+
 def main():
-    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12):
+    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12, gate_xa13):
         try:
             g()
         except Exception:

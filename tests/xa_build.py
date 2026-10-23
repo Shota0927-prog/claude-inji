@@ -956,6 +956,95 @@ STRATEGY_EDITS12 = [
 ]
 
 
+# ---- XA-13: SATS all-selected-timeframes opposite-band filter (Strategy only; after XA-12) ------------------------------
+#  Five independent inputs (D / 4H / 1H / 15m / 5m, all default OFF = no filter = the XA-12 path). At the final SATS order
+#  test (after rebound A / B, body, price window, session, qty) the order is skipped only when at least one timeframe is
+#  selected and every selected one shows the opposite band (Short: all blue = 1 / Long: all red = -1); 0, the own colour or
+#  na (not computed yet) on any selected timeframe -> no skip. Bands = f_satBand's stateV (close vs LINE1 / LINE2 / STB),
+#  computed on each timeframe's own history (D / 240 / 60 / 15: f_satTfState()[1]-style value of the last confirmed bar via
+#  request.security + lookahead_on, called unconditionally at global scope); 5m = the existing satBand of the order bar.
+#  A skip changes nothing (wait, touch record, line kind, P0 / SL0 / TP0, prep time, counters, order state). Current A-D
+#  untouched. strip_strategy13() -> the Strategy of f9fa0f9.
+STRATEGY_EDITS13 = [
+    ("header",
+     "//  (Current / Confirmed Break / 各 OFF は比較・切り戻し用に残す)。\n",
+     "//  (Current / Confirmed Break / 各 OFF は比較・切り戻し用に残す)。\n"
+     "//  XA-13: SATS 全選択時間足の逆方向一致フィルター (比較用・日足 / 4H / 1H / 15分 / 5分 は独立・全て初期 OFF = フィルターなし)。\n"
+     "//  SATS 反発後の最終発注判定で、選択した時間足がすべて逆方向のバンド (Short は全て青 / Long は全て赤) のときだけ見送る。\n"
+     "//  見送っても待機・接触記録・P0 / SL0 / TP0・期限は変えない。成績への影響は未確認。\n"),
+    ("input",
+     '     "初期 1.0 (Gold Short の比較から採用した初期値。検証継続中で、最適値・将来の有効性は未確認)。")\n',
+     '     "初期 1.0 (Gold Short の比較から採用した初期値。検証継続中で、最適値・将来の有効性は未確認)。")\n'
+     'stSatsFD  = input.bool(false, "SATS 逆方向一致 · 日足を判定に使用", group = G_STW,\n'
+     '     tooltip = "XA-13 比較用 (5 項目とも初期 OFF。全て OFF = フィルターなし)。SATS 反発後の最終発注判定で、ON にした時間足が\\n" +\n'
+     '     "すべて逆方向のバンド (Short: 全て青 / Long: 全て赤) のときだけ見送る。無点灯・反対色・計算未成立が 1 つでもあれば見送らない。\\n" +\n'
+     '     "バンド = その時間足の終値が LINE1 / LINE2 / STB の 3 本すべてより上 (青) / 下 (赤)。上位足は直近の確定足の状態だけを使う。")\n'
+     'stSatsF4  = input.bool(false, "SATS 逆方向一致 · 4時間足を判定に使用", group = G_STW)\n'
+     'stSatsF1  = input.bool(false, "SATS 逆方向一致 · 1時間足を判定に使用", group = G_STW)\n'
+     'stSatsF15 = input.bool(false, "SATS 逆方向一致 · 15分足を判定に使用", group = G_STW)\n'
+     'stSatsF5  = input.bool(false, "SATS 逆方向一致 · 5分足を判定に使用", group = G_STW,\n'
+     '     tooltip = "5分足は発注を判断するその 5分足の確定時点の SATS バンド (この Strategy の SATS 計算をそのまま使う)。")\n'),
+    ("state",
+     "[satL1, satL2, satStb, satD1, satD2, satSD, satBand, satBasis, satCommon, satAtr, satA1, satA2] = f_satBand()\n",
+     "[satL1, satL2, satStb, satD1, satD2, satSD, satBand, satBasis, satCommon, satAtr, satA1, satA2] = f_satBand()\n"
+     "\n"
+     "// XA-13: 時間足ごとの SATS バンド状態 (1 青 / -1 赤 / 0 無点灯 / na 計算未成立 = LINE1 / LINE2 / STB のどれかが na)。\n"
+     "//  日足 / 4H / 1H / 15分 は各時間足の履歴上で f_satBand 全体を計算し、request 内で [1] + lookahead_on = 直近の確定足の状態だけ\n"
+     "//  (形成途中の上位足・未来の値は使わない)。毎足・無条件に取得する (待機中だけの計算にしない)。5分足は既存の satBand (この足の確定値)。\n"
+     "f_satTfState() =>\n"
+     "    [l1, l2, sb, d1, d2, sd, st, b, cm, at, a1, a2] = f_satBand()\n"
+     "    int s = (na(l1) or na(l2) or na(sb)) ? na : st\n"
+     "    s[1]\n"
+     'int satTfD  = request.security(syminfo.tickerid, "D",   f_satTfState(), lookahead = barmerge.lookahead_on)\n'
+     'int satTf4  = request.security(syminfo.tickerid, "240", f_satTfState(), lookahead = barmerge.lookahead_on)\n'
+     'int satTf1  = request.security(syminfo.tickerid, "60",  f_satTfState(), lookahead = barmerge.lookahead_on)\n'
+     'int satTf15 = request.security(syminfo.tickerid, "15",  f_satTfState(), lookahead = barmerge.lookahead_on)\n'
+     "int satTf5  = (na(satL1) or na(satL2) or na(satStb)) ? na : satBand\n"
+     "\n"
+     "// 選択した時間足 (1 つ以上) がすべて want の状態なら true。未選択は影響しない。選択した足に 0 / 反対色 / na が 1 つでもあれば false\n"
+     "f_satAllAgainst(int want) =>\n"
+     "    bool anySel = false\n"
+     "    bool allHit = true\n"
+     "    if stSatsFD\n"
+     "        anySel := true\n"
+     "        allHit := allHit and not na(satTfD) and satTfD == want\n"
+     "    if stSatsF4\n"
+     "        anySel := true\n"
+     "        allHit := allHit and not na(satTf4) and satTf4 == want\n"
+     "    if stSatsF1\n"
+     "        anySel := true\n"
+     "        allHit := allHit and not na(satTf1) and satTf1 == want\n"
+     "    if stSatsF15\n"
+     "        anySel := true\n"
+     "        allHit := allHit and not na(satTf15) and satTf15 == want\n"
+     "    if stSatsF5\n"
+     "        anySel := true\n"
+     "        allHit := allHit and not na(satTf5) and satTf5 == want\n"
+     "    anySel and allHit\n"
+     "bool satSkipS = f_satAllAgainst(1)      // Short を見送る: 選択した時間足がすべて青\n"
+     "bool satSkipL = f_satAllAgainst(-1)     // Long を見送る: 選択した時間足がすべて赤\n"),
+    ("text",
+     "    //           不成立でも待機・接触記録は残す (接触の記録自体は制限しない)\n",
+     "    //           不成立でも待機・接触記録は残す (接触の記録自体は制限しない)\n"
+     "    //   XA-13 (逆方向一致フィルター): 他の発注条件が全て成立した足でも、選択した時間足がすべて逆方向なら発注しない。\n"
+     "    //           何も変えない (待機・接触記録・線の種類・P0 / SL0 / TP0・期限・件数・注文状態はそのまま。反発は保存しない)\n"),
+    ("filter",
+     "            if (rebA or rebB) and bodyOK and priceOK and stSessOK and oState == 0\n",
+     "            bool mtfOK   = not (pwSide == 1 ? satSkipL : satSkipS)\n"
+     "            if (rebA or rebB) and bodyOK and mtfOK and priceOK and stSessOK and oState == 0\n"),
+    ("plot",
+     'plot(stSats ? pwNBad : na,                 "SATS · 不適切な約定の決済件数", display = display.data_window)\n',
+     'plot(stSats ? pwNBad : na,                 "SATS · 不適切な約定の決済件数", display = display.data_window)\n'
+     'plot(satTfD,                               "SATS 逆方向一致 · 日足 (1 青 / -1 赤 / 0 無点灯 / n/a 未成立)", display = display.data_window)\n'
+     'plot(satTf4,                               "SATS 逆方向一致 · 4H (1 青 / -1 赤 / 0 無点灯 / n/a 未成立)", display = display.data_window)\n'
+     'plot(satTf1,                               "SATS 逆方向一致 · 1H (1 青 / -1 赤 / 0 無点灯 / n/a 未成立)", display = display.data_window)\n'
+     'plot(satTf15,                              "SATS 逆方向一致 · 15分 (1 青 / -1 赤 / 0 無点灯 / n/a 未成立)", display = display.data_window)\n'
+     'plot(satTf5,                               "SATS 逆方向一致 · 5分 (1 青 / -1 赤 / 0 無点灯 / n/a 未成立)", display = display.data_window)\n'
+     'plot(satSkipL ? 1 : 0,                     "SATS 逆方向一致 · Long 見送り判定 (1 見送り / 0 なし)", display = display.data_window)\n'
+     'plot(satSkipS ? 1 : 0,                     "SATS 逆方向一致 · Short 見送り判定 (1 見送り / 0 なし)", display = display.data_window)\n'),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -1144,8 +1233,13 @@ def build_strategy11():
     return _apply(build_strategy10(), STRATEGY_EDITS11)
 
 
-def build_strategy():
+def build_strategy12():
+    """XA-1 .. XA-12 (commit f9fa0f9)."""
     return _apply(build_strategy11(), STRATEGY_EDITS12)
+
+
+def build_strategy():
+    return _apply(build_strategy12(), STRATEGY_EDITS13)
 
 
 def strip_visual3(t):
@@ -1165,8 +1259,15 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy13(t):
+    """reverse only XA-13 (-> the Strategy of f9fa0f9 byte for byte)."""
+    return _revert(t, STRATEGY_EDITS13)
+
+
 def strip_strategy12(t):
-    """reverse only XA-12 (-> the Strategy of d64258b byte for byte)."""
+    """reverse XA-13 when present (all or nothing) and XA-12 (-> the Strategy of d64258b byte for byte)."""
+    if t is not None and STRATEGY_EDITS13[0][2] in t:
+        t = strip_strategy13(t)
     return _revert(t, STRATEGY_EDITS12)
 
 
