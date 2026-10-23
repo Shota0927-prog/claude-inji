@@ -27,8 +27,10 @@
   XH : XA-13 on the delivered Strategy — SATS all-selected-timeframes opposite-band filter (D / 4H / 1H / 15m / 5m, default OFF):
        AND over the selected timeframes only, each timeframe on its own history (last confirmed HTF bar), applied at the final
        SATS order test only, a skip changes nothing
-  (XW / XP / XQ run on the XA-7 layer, XV on XA-8, XN on XA-9, XZ on XA-10, XY on XA-11, XK on XA-12: the Strategy with exactly
-  the later edits reverted; the Visual through strip_visual7)
+  XJ : XA-14 on the delivered Strategy — adopted defaults of the XA-13 filter (4H / 1H ON, D / 15m / 5m OFF) and the text naming
+       them; nothing else
+  (XW / XP / XQ run on the XA-7 layer, XV on XA-8, XN on XA-9, XZ on XA-10, XY on XA-11, XK on XA-12, XH on XA-13: the Strategy
+  with exactly the later edits reverted; the Visual through strip_visual7)
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile, SATS line values vs the source indicator, Strategy Tester external).
 """
@@ -1098,14 +1100,14 @@ class Wait13(Wait11):
 
 
 def gate_xa13():
-    S13, S12 = rd(xb.STR_PATH), xb.show("f9fa0f9", xb.STR_PATH)
+    S13, S12 = xb.strip_strategy14(rd(xb.STR_PATH)) or "", xb.show("f9fa0f9", xb.STR_PATH)   # XA-13 layer (XA-14 reverted exactly)
     i13, i12 = input_values(S13), input_values(S12)
     new = {k: v for k, v in i13.items() if k not in i12}
     cs = sorted(l for l in es.changed_code(S12, S13) if l and not l.startswith('"') and not l.startswith("tooltip"))
     check("XH-01 XA-13: Strategy == xa_build.build_strategy() (XA-1 .. XA-13); strip_strategy13 gives f9fa0f9 byte for byte; five "
           "new inputs (D / 4H / 1H / 15m / 5m) all default OFF; every older input default unchanged (adopted defaults kept); "
           "the only changed old line is the SATS order condition (+ mtfOK); Engine / Visual / other files unchanged",
-          xb.build_strategy() == S13 and xb.strip_strategy13(S13) == S12 and xb.build_strategy12() == S12
+          xb.build_strategy13() == S13 and xb.strip_strategy13(S13) == S12 and xb.build_strategy12() == S12
           and new == {"stSatsFD": "false", "stSatsF4": "false", "stSatsF1": "false", "stSatsF15": "false", "stSatsF5": "false"}
           and all(i13[k] == v for k, v in i12.items())
           and [l for l in cs if l in code_only(S12).split("\n") or l.strip() in [x.strip() for x in code_only(S12).split("\n")]]
@@ -1267,8 +1269,49 @@ def gate_xa13():
           and or_model({"D": 1, "4": 1}, {"D": 1, "4": -1}, 1) != spec13({"D": 1, "4": 1}, {"D": 1, "4": -1}, -1))
 
 
+# ---- XA-14: adopted defaults of the XA-13 filter ----------------------------------------------------------------------------
+def gate_xa14():
+    S14, S13 = rd(xb.STR_PATH), xb.show("e5bba44", xb.STR_PATH)
+    i14, i13 = input_values(S14), input_values(S13)
+    d = {k: (i13.get(k), i14.get(k)) for k in set(i13) | set(i14) if i13.get(k) != i14.get(k)}
+    cs = sorted(l for l in es.changed_code(S13, S14) if l and not l.startswith('"') and not l.startswith("tooltip"))
+    check("XJ-01 XA-14: Strategy == xa_build.build_strategy() (XA-1 .. XA-14); strip_strategy14 gives e5bba44 byte for byte "
+          "(strip_strategy13 gives f9fa0f9); Engine / Visual / other Pine files unchanged",
+          xb.build_strategy() == S14 and xb.strip_strategy14(S14) == S13 and xb.build_strategy13() == S13
+          and xb.strip_strategy13(S14) == xb.show("f9fa0f9", xb.STR_PATH)
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and rd(p) != xb.show("e5bba44", p)])
+    check("XJ-02 defaults: exactly 4H false -> true and 1H false -> true (D / 15m / 5m stay false, still inputs); every other "
+          "default unchanged (SATS Pullback, Retest Confirmed, Entry C, Short Only, 240, body ON, near ON / 1.0, SL Buffer 1.5, "
+          "opposite TP OFF, RR 1.5, BE ON / 15, 300,000 x 3 %)",
+          d == {"stSatsF4": ("false", "true"), "stSatsF1": ("false", "true")}
+          and (i14["stSatsFD"], i14["stSatsF15"], i14["stSatsF5"]) == ("false", "false", "false")
+          and all(i14[k] == v for k, v in {"stTiming": '"SATS Pullback"', "roleMode": '"Retest Confirmed"', "stMode": '"C: Candle Pattern"',
+                                            "stDir": '"Short Only"', "stSatsWait": "240", "stSatsBody": "true", "stSatsNear": "true",
+                                            "stSatsNearD": "1.0", "stBuffer": "1.5", "stTpZone": "false", "stRR": "1.5", "stBE": "true",
+                                            "stBEDist": "15.0", "stCapBase": "300000.0", "stRiskPct": "3.0"}.items())
+          and "initial_capital        = 300000," in S14 and "currency.JPY" in S14, str(d))
+    check("XJ-03 only defaults and text: the changed code lines are the two input declarations (the rest are the tooltip and "
+          "comments); the AND logic, requests, f_satTfState, mtfOK placement and every calculation / order line are identical; "
+          "the text says 'Gold Short の比較から採用した初期値・検証継続中' and no longer calls all five OFF the default",
+          cs == sorted(['stSatsF4  = input.bool(false, "SATS 逆方向一致 · 4時間足を判定に使用", group = G_STW)',
+                        'stSatsF4  = input.bool(true, "SATS 逆方向一致 · 4時間足を判定に使用", group = G_STW)',
+                        'stSatsF1  = input.bool(false, "SATS 逆方向一致 · 1時間足を判定に使用", group = G_STW)',
+                        'stSatsF1  = input.bool(true, "SATS 逆方向一致 · 1時間足を判定に使用", group = G_STW)'])
+          and {k for k, _, _ in xb.STRATEGY_EDITS14} == {"header", "text", "default"}
+          and func(S14, "f_satAllAgainst(int want) =>") == func(S13, "f_satAllAgainst(int want) =>")
+          and func(S14, "f_satTfState() =>") == func(S13, "f_satTfState() =>")
+          and S14.count("Gold Short の比較から採用した初期値・検証継続中") - S13.count("Gold Short の比較から採用した初期値・検証継続中") == 2 and "5 項目とも初期 OFF" not in S14
+          and "全て初期 OFF = フィルターなし" not in S14, "\n".join(cs))
+    sel = {"D": False, "4": True, "1": True, "15": False, "5": False}
+    check("XJ-04 model at the new defaults: Short skipped only when 4H and 1H are both blue (D / 15m / 5m ignored), Long only "
+          "when both red; one unlit / na / opposite -> no skip",
+          skip13(sel, {"D": -1, "4": 1, "1": 1, "15": -1, "5": -1}, 1) and skip13(sel, {"D": 1, "4": -1, "1": -1, "15": 1, "5": 1}, -1)
+          and not skip13(sel, {"4": 1, "1": 0}, 1) and not skip13(sel, {"4": None, "1": 1}, 1) and not skip13(sel, {"4": 1, "1": -1}, 1)
+          and not skip13(sel, {"4": 1, "1": 1}, -1))
+
+
 def main():
-    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12, gate_xa13):
+    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12, gate_xa13, gate_xa14):
         try:
             g()
         except Exception:

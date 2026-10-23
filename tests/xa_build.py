@@ -1045,6 +1045,34 @@ STRATEGY_EDITS13 = [
 ]
 
 
+# ---- XA-14: adopted defaults of the XA-13 filter (Strategy only; after XA-13) -------------------------------------------
+#  Defaults and the text that named the old defaults only: SATS opposite-band filter 4H OFF -> ON, 1H OFF -> ON (D / 15m /
+#  5m stay OFF). The AND logic, the per-timeframe SATS / request, the final-order position and every other input unchanged.
+#  strip_strategy14() -> the Strategy of e5bba44.
+NOTE14 = "Gold Short の比較から採用した初期値・検証継続中"
+STRATEGY_EDITS14 = [
+    ("header",
+     "//  見送っても待機・接触記録・P0 / SL0 / TP0・期限は変えない。成績への影響は未確認。\n",
+     "//  見送っても待機・接触記録・P0 / SL0 / TP0・期限は変えない。成績への影響は未確認。\n"
+     "//  XA-14: 逆方向一致フィルターの初期値 = 4H・1H ON / 日足・15分・5分 OFF (" + NOTE14 + "。最適値・将来の有効性・\n"
+     "//  年別の検証は未確認)。初期状態では Short は 4H・1H が両方青、Long は両方赤のときだけ見送る。判定・計算・他の設定は変えない。\n"),
+    ("text",
+     "//  XA-13: SATS 全選択時間足の逆方向一致フィルター (比較用・日足 / 4H / 1H / 15分 / 5分 は独立・全て初期 OFF = フィルターなし)。\n",
+     "//  XA-13: SATS 全選択時間足の逆方向一致フィルター (日足 / 4H / 1H / 15分 / 5分 は独立。XA-13 時点は全て初期 OFF、XA-14 から\n"
+     "//  4H・1H が初期 ON。全て OFF = フィルターなし)。\n"),
+    ("text",
+     '     tooltip = "XA-13 比較用 (5 項目とも初期 OFF。全て OFF = フィルターなし)。SATS 反発後の最終発注判定で、ON にした時間足が\\n" +\n',
+     '     tooltip = "XA-13 (初期: 4H・1H ON / 日足・15分・5分 OFF = ' + NOTE14 + '。全て OFF = フィルターなし)。\\n" +\n'
+     '     "SATS 反発後の最終発注判定で、ON にした時間足が\\n" +\n'),
+    ("default",
+     'stSatsF4  = input.bool(false, "SATS 逆方向一致 · 4時間足を判定に使用", group = G_STW)\n',
+     'stSatsF4  = input.bool(true, "SATS 逆方向一致 · 4時間足を判定に使用", group = G_STW)\n'),
+    ("default",
+     'stSatsF1  = input.bool(false, "SATS 逆方向一致 · 1時間足を判定に使用", group = G_STW)\n',
+     'stSatsF1  = input.bool(true, "SATS 逆方向一致 · 1時間足を判定に使用", group = G_STW)\n'),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -1238,8 +1266,13 @@ def build_strategy12():
     return _apply(build_strategy11(), STRATEGY_EDITS12)
 
 
-def build_strategy():
+def build_strategy13():
+    """XA-1 .. XA-13 (commit e5bba44)."""
     return _apply(build_strategy12(), STRATEGY_EDITS13)
+
+
+def build_strategy():
+    return _apply(build_strategy13(), STRATEGY_EDITS14)
 
 
 def strip_visual3(t):
@@ -1259,14 +1292,21 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy14(t):
+    """reverse only XA-14 (-> the Strategy of e5bba44 byte for byte)."""
+    return _revert(t, STRATEGY_EDITS14)
+
+
 def strip_strategy13(t):
-    """reverse only XA-13 (-> the Strategy of f9fa0f9 byte for byte)."""
+    """reverse XA-14 when present (all or nothing) and XA-13 (-> the Strategy of f9fa0f9 byte for byte)."""
+    if t is not None and STRATEGY_EDITS14[0][2] in t:
+        t = strip_strategy14(t)
     return _revert(t, STRATEGY_EDITS13)
 
 
 def strip_strategy12(t):
     """reverse XA-13 when present (all or nothing) and XA-12 (-> the Strategy of d64258b byte for byte)."""
-    if t is not None and STRATEGY_EDITS13[0][2] in t:
+    if t is not None and (STRATEGY_EDITS13[0][2] in t or STRATEGY_EDITS14[0][2] in t):   # XA-14 rewrites the XA-13 header line
         t = strip_strategy13(t)
     return _revert(t, STRATEGY_EDITS12)
 
