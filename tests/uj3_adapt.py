@@ -13,7 +13,7 @@ import subprocess
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NEW_FILES = ("tests/uj3_adapt.py", "tests/ujl_sim.py", "tests/ujt_sim.py")
-_rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
+_rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)
 
 
 def _show(rev, path):

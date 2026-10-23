@@ -43,7 +43,7 @@ def _revert(text, edits):
     return out
 
 
-_rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
+_rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)
 
 
 def build_engine():

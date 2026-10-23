@@ -29,7 +29,7 @@ import eu_sim as es              # noqa: E402
 
 ROOT = cb.ROOT
 PREV = "867ff7e"
-rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
+rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)
 git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True).stdout
 code_only, func = es.code_only, es.func
 GEN = {"ZoneStrategyGBPJPY.pine": gs.build, "ZoneStrategyEURUSD.pine": eb.build_strategy,

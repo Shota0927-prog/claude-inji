@@ -43,7 +43,7 @@ import practical_zone_sim as pz  # noqa: E402
 ROOT = bb.ROOT
 BASE = "5957053"
 ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"
-rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, p)) else ""
+rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read()) if os.path.exists(os.path.join(ROOT, p)) else ""   # SX-1 reverted (pinned in sxs_sim)
 GBJ = rd(bb.SRC_PATH)
 BTC_FULL = rd(bb.BTC_PATH)
 BTC = bb.strip_btc4(BTC_FULL) or ""      # BTE-1: the BTC-3 file (e1c3cea); BTC-4 (engine split) is pinned in bte_sim

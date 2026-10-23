@@ -49,6 +49,7 @@ def pre_cad(path, text=None):
     generators / fixtures read these files through it, so they keep pinning the pre-CAD content exactly."""
     if text is None:
         text = _rd(path)
+    text = __import__("sx_build").unapply(path, text)     # SX-1 (later layer on the five Strategies) reverted first
     return unapply(text) if path in FILES else text
 
 

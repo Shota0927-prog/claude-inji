@@ -39,7 +39,7 @@ import fvg_re10045_sim as fr     # noqa: E402
 
 ROOT = xb.ROOT
 PREV = "17d1ca2"
-rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
+rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)
 git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True).stdout
 code_only, input_decls, input_values, func, seg = es.code_only, es.input_decls, es.input_values, es.func, es.seg
 E, GBE, SW6 = xb.strip_engine6(rd(xb.ENG_PATH)) or "", rd(ge.GBE_PATH), rd(ge.SRC_PATH)   # Engine version 1 (XA-6 reverted exactly; pinned by XR)
@@ -590,7 +590,8 @@ def gate_xa5():
     others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, xb.STR_PATH)]
     check("XF-07 vs a33d2b0 only the Gold Visual / Strategy, xa_build, xae_sim, cad_sim and cad_adapt change; every other Pine "
           "file (Engines incl. ZoneEnginePracticalXAUUSD, other symbols) byte-identical",
-          mod <= {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", "tests/xae_sim.py", "tests/cad_sim.py", "tests/cad_adapt.py",
+          {m for m in mod if not (m in __import__("sx_build").TOUCHED and __import__("cad_adapt").later_ok(m, A))}   # SX-1: exact only
+          <= {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", "tests/xae_sim.py", "tests/cad_sim.py", "tests/cad_adapt.py",
                   "tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src/README.txt"}   # XA-7 (pinned in xas_sim)
           and {xb.VIS_PATH, xb.STR_PATH} <= mod and not [p for p in others if rd(p) != git("show", f"{A}:{p}")
                                                          and not (p == xb.ENG_PATH and E == git("show", f"{A}:{p}"))], str(sorted(mod)))   # XA-6: Engine exact

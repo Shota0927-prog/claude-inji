@@ -29,7 +29,7 @@ import fvg_re10045_sim as fr     # noqa: E402
 ROOT = ub.ROOT
 UJ2 = "e1c3cea"
 PREV = "7363ef1"
-rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
+rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)
 git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True).stdout
 code_only, input_decls, input_values, func = es.code_only, es.input_decls, es.input_values, es.func
 S4 = rd(ub.STR_PATH)

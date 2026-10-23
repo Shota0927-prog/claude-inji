@@ -30,7 +30,7 @@ import fvg_re10045_sim as fr     # noqa: E402
 
 ROOT = ub.ROOT
 UJ3 = "ab9820f"
-rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
+rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)
 git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, text=True).stdout
 code_only, func = es.code_only, es.func
 S5 = rd(ub.STR_PATH)                                  # working-tree file (UJ-5 dedup pinned by the UC checks below)

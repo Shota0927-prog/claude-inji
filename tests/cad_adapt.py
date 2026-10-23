@@ -17,7 +17,8 @@ import os
 import subprocess
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src/README.txt")   # new in the later Gold layer XA-7
+LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src/README.txt",   # new in the later Gold layer XA-7
+             "tests/sx_build.py", "tests/sxs_sim.py")                                        # new in the later layer SX-1
 NEW_FILES = ("tests/cad_build.py", "tests/cad_adapt.py", "tests/cad_sim.py") + LATER_NEW
 _rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 
@@ -43,11 +44,28 @@ def later_pine_ok(path, rev):
     """True for the Gold Visual / Strategy / Engine when they differ from `rev` exactly by the later Gold layers (XA-5 + XA-6:
     xa_build.strip_*5 revert XA-6 first; the Engine by XA-6: strip_engine6)."""
     import xa_build as xb
+    import sx_build as sx
+    if path in sx.FILES and os.path.exists(os.path.join(ROOT, path)):     # SX-1: the five Strategies differ exactly by SX-1
+        cur = _rd(path)
+        s = sx.unapply(path, cur)
+        return s is not None and s != cur and s == _show(rev, path)
     strip = {xb.VIS_PATH: xb.strip_visual5, xb.STR_PATH: xb.strip_strategy5, xb.ENG_PATH: xb.strip_engine6}.get(path)
     if strip is None:
         return False
     s = strip(_rd(path))
     return s is not None and s == _show(rev, path)
+
+
+def later_ok(path, rev):
+    """the later layers alone account for this path vs `rev` exactly: a file new in them (LATER_NEW), a Pine file that
+    later_pine_ok accepts, or a recorded file whose LATER edits revert to `rev` byte for byte."""
+    if path in LATER_NEW or later_pine_ok(path, rev):
+        return True
+    if path in LATER and os.path.exists(os.path.join(ROOT, path)):
+        cur = _rd(path)
+        u = later_unadapt(path, cur)
+        return u is not None and u != cur and u == _show(rev, path)
+    return False
 
 
 def unadapt(path, text):
@@ -72,7 +90,7 @@ def pine_ok(path, rev):
     import cad_build as cb
     if path not in cb.FILES or not os.path.exists(os.path.join(ROOT, path)):
         return False
-    s = cb.strip(_rd(path))
+    s = cb.strip(__import__("sx_build").unapply(path, _rd(path)))     # SX-1 (later) reverted first
     if s is None:
         return False
     old = _show(rev, path)
@@ -452,7 +470,35 @@ ADAPT = {'tests/btcs_build.py': [('def build():\n'
                        'str(sorted(mod - allowed)))\n'
                        '    hdr = V[:V.index("//@version=5")] + S[:S.index("//@version=5")]\n')]}
 
-LATER = {'tests/cad_sim.py': [('    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in cb.FILES]\n'
+LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n'
+                       'rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read() if '
+                       'os.path.exists(os.path.join(ROOT, p)) else ""\n'
+                       'GBJ = rd(bb.SRC_PATH)\n',
+                       'ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n'
+                       'rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
+                       'encoding="utf-8").read()) if os.path.exists(os.path.join(ROOT, p)) else ""   # SX-1 reverted '
+                       '(pinned in sxs_sim)\n'
+                       'GBJ = rd(bb.SRC_PATH)\n')],
+ 'tests/bte_build.py': [('\n_rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()\n\n',
+                         '\n'
+                         '_rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
+                         'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
+                         '\n')],
+ 'tests/cad_build.py': [('        text = _rd(path)\n    return unapply(text) if path in FILES else text\n',
+                         '        text = _rd(path)\n'
+                         '    text = __import__("sx_build").unapply(path, text)     # SX-1 (later layer on the five '
+                         'Strategies) reverted first\n'
+                         '    return unapply(text) if path in FILES else text\n')],
+ 'tests/cad_sim.py': [('PREV = "867ff7e"\n'
+                       'rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()\n'
+                       'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
+                       'text=True).stdout\n',
+                       'PREV = "867ff7e"\n'
+                       'rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
+                       'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
+                       'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
+                       'text=True).stdout\n'),
+                      ('    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in cb.FILES]\n'
                        '    changed = [p for p in others if rd(p) != git("show", f"{PREV}:{p}")]\n'
                        '    cls = {"ZoneStrategyXAU.pine": "alert(" not in code_only(rd("ZoneStrategyXAU.pine")),\n',
                        '    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in cb.FILES]\n'
@@ -472,6 +518,45 @@ LATER = {'tests/cad_sim.py': [('    others = [p for p in os.listdir(ROOT) if p.e
                        'f"{PREV}:{m}") for m in mod - pine),\n'
                        '          str(sorted(m for m in mod - pine if not (m in rec.NEW_FILES or rec.unadapt(m, '
                        'rd(m)) == git("show", f"{PREV}:{m}")))))\n')],
+ 'tests/uj3_adapt.py': [('NEW_FILES = ("tests/uj3_adapt.py", "tests/ujl_sim.py", "tests/ujt_sim.py")\n'
+                         '_rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()\n'
+                         '\n',
+                         'NEW_FILES = ("tests/uj3_adapt.py", "tests/ujl_sim.py", "tests/ujt_sim.py")\n'
+                         '_rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
+                         'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
+                         '\n')],
+ 'tests/uj_build.py': [('\n_rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()\n\n',
+                        '\n'
+                        '_rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
+                        'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
+                        '\n')],
+ 'tests/uj_sim.py': [('ROOT = ub.ROOT\n'
+                      'rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()\n'
+                      'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
+                      'text=True).stdout\n',
+                      'ROOT = ub.ROOT\n'
+                      'rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
+                      'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
+                      'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
+                      'text=True).stdout\n')],
+ 'tests/ujl_sim.py': [('PREV = "7363ef1"\n'
+                       'rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()\n'
+                       'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
+                       'text=True).stdout\n',
+                       'PREV = "7363ef1"\n'
+                       'rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
+                       'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
+                       'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
+                       'text=True).stdout\n')],
+ 'tests/ujt_sim.py': [('UJ3 = "ab9820f"\n'
+                       'rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()\n'
+                       'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
+                       'text=True).stdout\n',
+                       'UJ3 = "ab9820f"\n'
+                       'rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
+                       'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
+                       'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
+                       'text=True).stdout\n')],
  'tests/xa_build.py': [('\n'
                         '# ---- XA-2: position size (Strategy only; applied after XA-1) '
                         '-----------------------------------------------------------\n',
@@ -1849,6 +1934,15 @@ LATER = {'tests/cad_sim.py': [('    others = [p for p in os.listdir(ROOT) if p.e
                         '    if t is not None and STRATEGY_EDITS5[0][2] in t:\n'
                         '        t = strip_strategy5(t)\n'
                         '    return _revert(t, STRATEGY_EDITS4)\n')],
+ 'tests/xa_sim.py': [('ROOT = xb.ROOT\n'
+                      'rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()\n'
+                      'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
+                      'text=True).stdout\n',
+                      'ROOT = xb.ROOT\n'
+                      'rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
+                      'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
+                      'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
+                      'text=True).stdout\n')],
  'tests/xae_sim.py': [('  XU : mutations — mirror and source mutations are caught\n\n',
                        '  XU : mutations — mirror and source mutations are caught\n'
                        '  XF : XA-5 — Gold Short adopted defaults (Day/Swing Merge Nearby, Merge Distance 0; '
@@ -1864,6 +1958,15 @@ LATER = {'tests/cad_sim.py': [('    others = [p for p in os.listdir(ROOT) if p.e
                        '       evaluation, retest and confirmation timing, opposite Break, no natural reversal, '
                        'Track / Touch, old transitions)\n'
                        '\n'),
+                      ('PREV = "17d1ca2"\n'
+                       'rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()\n'
+                       'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
+                       'text=True).stdout\n',
+                       'PREV = "17d1ca2"\n'
+                       'rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
+                       'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
+                       'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
+                       'text=True).stdout\n'),
                       ('code_only, input_decls, input_values, func, seg = es.code_only, es.input_decls, '
                        'es.input_values, es.func, es.seg\n'
                        'E, GBE, SW6 = rd(xb.ENG_PATH), rd(ge.GBE_PATH), rd(ge.SRC_PATH)\n'
@@ -2019,7 +2122,9 @@ LATER = {'tests/cad_sim.py': [('    others = [p for p in os.listdir(ROOT) if p.e
                        '    check("XF-07 vs a33d2b0 only the Gold Visual / Strategy, xa_build, xae_sim, cad_sim and '
                        'cad_adapt change; every other Pine "\n'
                        '          "file (Engines incl. ZoneEnginePracticalXAUUSD, other symbols) byte-identical",\n'
-                       '          mod <= {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", '
+                       '          {m for m in mod if not (m in __import__("sx_build").TOUCHED and '
+                       '__import__("cad_adapt").later_ok(m, A))}   # SX-1: exact only\n'
+                       '          <= {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", '
                        '"tests/xae_sim.py", "tests/cad_sim.py", "tests/cad_adapt.py",\n'
                        '                  "tests/xas_sim.py", "tests/sats_src/f_satBand.txt", '
                        '"tests/sats_src/README.txt"}   # XA-7 (pinned in xas_sim)\n'
