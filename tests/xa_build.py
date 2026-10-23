@@ -1126,6 +1126,155 @@ STRATEGY_EDITS15 = [
 ]
 
 
+# ---- XA-16: SATS immediate entry on a recent SATS rebound (Strategy only; after XA-15) ---------------------------------
+#  Two inputs (default OFF / 1). An independent rebound history (never the wait's pw* state): every bar, per side and per
+#  line (LINE1 / LINE2 / STB), with that line's bar e-1 value L: touch = low <= L <= high or (near ON) the near approach;
+#  A = touch with the previous close on the trade side and the close back on the trade side; B = an earlier touch of the
+#  same line (record) and close[1] / close across the same L; a valid rebound also needs the body (when ON) on bar e and
+#  consumes the record. Latest rebound bar per side, same-bar priority LINE1 -> LINE2 -> STB. At the SATS prep point
+#  (stSats, prep conditions, no wait, not a cancel bar): ON + 0 <= t - e <= N + this bar's filter / qty f_stQty(side,
+#  close, SL0) / SL-TP side -> market order (path 2, TP0 / RR / fill handled by the SATS path); otherwise the usual prep.
+#  strip_strategy16() -> the Strategy of b59d621 (= e2cf617 + XA-15).
+STRATEGY_EDITS16 = [
+    ("header",
+     "//  距離 × R / TP Progress = 実約定価格から実際の TP までの距離 × 比率。判断・注文更新は従来の確定 5分足の建値処理のまま。\n",
+     "//  距離 × R / TP Progress = 実約定価格から実際の TP までの距離 × 比率。判断・注文更新は従来の確定 5分足の建値処理のまま。\n"
+     "//  XA-16: SATS 直近反発の即時エントリー (比較用・初期 OFF / 有効本数 1)。各 Entry Mode の待機準備地点で、同方向の SATS 反発が\n"
+     "//  0 <= t − e <= N 本以内に成立済みなら引きつけずにその確定足で成行 (P0 / SL0 / TP0 は準備時と同じ)。なければ従来どおり待機。\n"),
+    ("input",
+     '     tooltip = "5分足は発注を判断するその 5分足の確定時点の SATS バンド (この Strategy の SATS 計算をそのまま使う)。")\n',
+     '     tooltip = "5分足は発注を判断するその 5分足の確定時点の SATS バンド (この Strategy の SATS 計算をそのまま使う)。")\n'
+     'stSatsNow = input.bool(false, "SATS · 直近の反発で即時エントリー", group = G_STW,\n'
+     '     tooltip = "XA-16 比較用 (初期 OFF)。SATS Pullback の待機を準備する足 t で、同方向の SATS 反発 (A / B と同じ価格条件、近接 /\\n" +\n'
+     '     "陽線陰線の設定を共用) が 0 <= t − e <= 有効本数 の足 e で成立済みなら、引きつけずにその足で成行 (Entry A でも成行)。\\n" +\n'
+     '     "この足の時間帯・逆方向一致・注文なし・数量 (終値と SL0)・SL / TP の向きが必要。成立しなければ従来どおり待機を始める。")\n'
+     'stSatsNowN = input.int(1, "SATS · 直近反発の有効本数（5分足）", minval = 0, step = 1, group = G_STW,\n'
+     '     tooltip = "0 = シグナル確定足の反発だけ / 1 = その足と直前 1 本 / 3 = 直前 3 本まで (境界を含む。実時間ではなく 5分足の本数。\\n" +\n'
+     '     "B は接触足ではなく反発が成立した足から数える)。")\n'),
+    ("hist",
+     "bool satSkipL = f_satAllAgainst(-1)     // Long を見送る: 選択した時間足がすべて赤\n",
+     "bool satSkipL = f_satAllAgainst(-1)     // Long を見送る: 選択した時間足がすべて赤\n"
+     "\n"
+     "// XA-16: 準備前の SATS 反発の履歴 (待機 pw* とは独立。毎足・無条件に更新)。足 e の判定には足 e-1 で確定した線 L だけを使う。\n"
+     "//  方向 side × 線 (LINE1 / LINE2 / STB) ごとに: 接触 = low <= L <= high、近接 ON なら Long low > L かつ low − L <= 許容距離 /\n"
+     "//  Short high < L かつ L − high <= 許容距離。A = 接触 + 前足終値が取引方向側 (Long close[1] > L / Short close[1] < L) + 終値が\n"
+     "//  取引方向側 (Long close > L / Short close < L)。B = 同じ線への先行接触の記録 + close[1] <= L < close (Short は close[1] >= L > close)。\n"
+     "//  陽線陰線 ON なら反発足 e 自身が Long close > open / Short close < open。有効な反発はその線の接触記録を消費する\n"
+     "//  (反発しなかった接触は記録を残す)。戻り値 [反発成立, 次の記録]。SATS の青 / 赤、P0 / SL0、Zone 資格は使わない\n"
+     "f_satHist(int side, float L, bool rec) =>\n"
+     "    bool ok    = not na(L) and not na(close[1])\n"
+     "    bool hit   = ok and low <= L and L <= high\n"
+     "    bool near  = ok and stSatsNear and (side == 1 ? (low > L and low - L <= stSatsNearD) : (high < L and L - high <= stSatsNearD))\n"
+     "    bool fresh = ok and (side == 1 ? close[1] > L : close[1] < L)\n"
+     "    bool rA    = (hit or near) and fresh and (side == 1 ? close > L : close < L)\n"
+     "    bool rB    = rec and ok and (side == 1 ? (close[1] <= L and close > L) : (close[1] >= L and close < L))\n"
+     "    bool body  = not stSatsBody or (side == 1 ? close > open : close < open)\n"
+     "    bool reb   = (rA or rB) and body\n"
+     "    [reb, reb ? false : (rec or ((hit or near) and fresh))]\n"
+     "var bool hRecL1 = false\n"
+     "var bool hRecL2 = false\n"
+     "var bool hRecL3 = false\n"
+     "var bool hRecS1 = false\n"
+     "var bool hRecS2 = false\n"
+     "var bool hRecS3 = false\n"
+     "[hL1, nL1] = f_satHist(1, satL1[1], hRecL1)\n"
+     "[hL2, nL2] = f_satHist(1, satL2[1], hRecL2)\n"
+     "[hL3, nL3] = f_satHist(1, satStb[1], hRecL3)\n"
+     "[hS1, nS1] = f_satHist(-1, satL1[1], hRecS1)\n"
+     "[hS2, nS2] = f_satHist(-1, satL2[1], hRecS2)\n"
+     "[hS3, nS3] = f_satHist(-1, satStb[1], hRecS3)\n"
+     "hRecL1 := nL1\n"
+     "hRecL2 := nL2\n"
+     "hRecL3 := nL3\n"
+     "hRecS1 := nS1\n"
+     "hRecS2 := nS2\n"
+     "hRecS3 := nS3\n"
+     "var int hRebBarL = na      // Long の最新の反発成立足 (bar_index) と線の種類 (同じ足は LINE1 -> LINE2 -> STB)\n"
+     "var int hRebKL   = 0\n"
+     "var int hRebBarS = na\n"
+     "var int hRebKS   = 0\n"
+     "if hL1 or hL2 or hL3\n"
+     "    hRebBarL := bar_index\n"
+     "    hRebKL   := hL1 ? 1 : hL2 ? 2 : 3\n"
+     "if hS1 or hS2 or hS3\n"
+     "    hRebBarS := bar_index\n"
+     "    hRebKS   := hS1 ? 1 : hS2 ? 2 : 3\n"),
+    ("state",
+     "var float oTP0     = na      // SATS で発注した注文の TP0 (約定確認時の TP)\n",
+     "var float oTP0     = na      // SATS で発注した注文の TP0 (約定確認時の TP)\n"
+     "var int   oPath    = 0       // XA-16: 直近の SATS 発注の経路 (1 = 引きつけ / 2 = 即時)\n"
+     "var int   pwNNow   = 0       // XA-16: 即時エントリーの発注件数\n"
+     "var int   pwNowK   = 0       // XA-16: 即時エントリーで採用した反発の線 (1 LINE1 / 2 LINE2 / 3 STB)\n"
+     "var int   pwNowAge = na      // XA-16: その反発からの経過本数 (t − e)\n"),
+    ("path",
+     "                    oTP0    := pwTP0\n",
+     "                    oTP0    := pwTP0\n"
+     "                    oPath   := 1\n"),
+    ("now",
+     "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar\n",
+     "                // XA-16: 直近の反発で即時エントリー (ON のときだけ。待機中・取消した足では判定しない = 割り込みなし)\n"
+     "                //   有効 = 0 <= t − e <= N (e = 同方向の最新の反発成立足)。この足の逆方向一致・数量 f_stQty(side, close, SL0)・\n"
+     "                //   SL / TP の向き (SL0 と TP0 の間に終値) が必要。過去の反発線の SL0〜P0 範囲・P0 より有利な終値・\n"
+     "                //   この足の再接触 / 実体は要求しない。成立しなければ下の従来の準備 (接触待ちから) へ進む\n"
+     "                bool nowGo = false\n"
+     "                if stSatsNow and not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar\n"
+     "                    int   hBar = side == 1 ? hRebBarL : hRebBarS\n"
+     "                    int   hAge = na(hBar) ? na : bar_index - hBar\n"
+     "                    float nQty = f_stQty(side, close, pSL)\n"
+     "                    bool  nMtf = not (side == 1 ? satSkipL : satSkipS)\n"
+     "                    bool  nDir = side * (close - pSL) > 0 and side * (tpRef - close) > 0\n"
+     "                    if not na(hAge) and hAge >= 0 and hAge <= stSatsNowN and nMtf and nDir and not na(nQty)\n"
+     "                        oSeq    += 1\n"
+     "                        oEid    := (side == 1 ? \"L\" : \"S\") + str.tostring(oSeq)\n"
+     "                        oXid    := oEid + \" SL/TP\"\n"
+     "                        oSide   := side\n"
+     "                        oTrack  := c.track\n"
+     "                        oLimit  := false\n"
+     "                        oL      := na\n"
+     "                        oSL     := pSL\n"
+     "                        oStop   := pSL\n"
+     "                        oTP     := na\n"
+     "                        oTP0    := tpRef\n"
+     "                        oFill   := na\n"
+     "                        oBE     := false\n"
+     "                        oClosed := strategy.closedtrades\n"
+     "                        oState  := 1\n"
+     "                        oPath   := 2\n"
+     "                        strategy.entry(oEid, side == 1 ? strategy.long : strategy.short, qty = nQty)\n"
+     "                        strategy.exit(oXid, oEid, stop = oSL)\n"
+     "                        pwP0     := ref\n"
+     "                        pwSL0    := pSL\n"
+     "                        pwTP0    := tpRef\n"
+     "                        pwRRPrep := side * (tpRef - ref) / (side * (ref - pSL))\n"
+     "                        pwRRPlan := side * (tpRef - close) / (side * (close - pSL))\n"
+     "                        pwRRFill := na\n"
+     "                        pwRRWhy  := na\n"
+     "                        pwEv     := 3\n"
+     "                        pwNNow   += 1\n"
+     "                        pwNowK   := side == 1 ? hRebKL : hRebKS\n"
+     "                        pwNowAge := hAge\n"
+     "                        nowGo    := true\n"
+     "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar and not nowGo\n"),
+    ("plot",
+     'plot(stSats ? pwNBad : na,                 "SATS · 不適切な約定の決済件数", display = display.data_window)\n',
+     'plot(stSats ? pwNBad : na,                 "SATS · 不適切な約定の決済件数", display = display.data_window)\n'
+     'plot(stSats ? oPath : na,                  "SATS · 直近発注の経路 (1 引きつけ / 2 即時)", display = display.data_window)\n'
+     'plot(stSats ? pwNNow : na,                 "SATS · 即時エントリーの発注件数 (引きつけは「発注件数」)", display = display.data_window)\n'
+     'plot(stSats ? pwNowK : na,                 "SATS · 即時で採用した反発の線 (1 L1 / 2 L2 / 3 STB)", display = display.data_window)\n'
+     'plot(stSats ? pwNowAge : na,               "SATS · 即時で採用した反発からの本数 (t − e)", display = display.data_window)\n'
+     'plot(stSats and oPath == 1 ? pwRRPlan : na, "SATS · 引きつけ 予定 RR", display = display.data_window)\n'
+     'plot(stSats and oPath == 1 ? pwRRFill : na, "SATS · 引きつけ 実 RR", display = display.data_window)\n'
+     'plot(stSats and oPath == 2 ? pwRRPlan : na, "SATS · 即時 予定 RR", display = display.data_window)\n'
+     'plot(stSats and oPath == 2 ? pwRRFill : na, "SATS · 即時 実 RR", display = display.data_window)\n'
+     'plot(na(hRebBarL) ? na : bar_index - hRebBarL, "SATS · Long 最新反発からの本数", display = display.data_window)\n'
+     'plot(na(hRebBarS) ? na : bar_index - hRebBarS, "SATS · Short 最新反発からの本数", display = display.data_window)\n'),
+    ("plot",
+     'plotshape(stSats and pwEv == 2, "SATS · 発注", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny)\n',
+     'plotshape(stSats and pwEv == 2, "SATS · 発注", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny)\n'
+     'plotshape(stSats and pwEv == 3, "SATS · 即時発注", style = shape.diamond, location = location.abovebar, color = color.blue, size = size.tiny)\n'),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -1329,8 +1478,13 @@ def build_strategy14():
     return _apply(build_strategy13(), STRATEGY_EDITS14)
 
 
-def build_strategy():
+def build_strategy15():
+    """XA-1 .. XA-15 (commit 443c139 / b59d621)."""
     return _apply(build_strategy14(), STRATEGY_EDITS15)
+
+
+def build_strategy():
+    return _apply(build_strategy15(), STRATEGY_EDITS16)
 
 
 def strip_visual3(t):
@@ -1350,8 +1504,15 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy16(t):
+    """reverse only XA-16 (-> the Strategy of b59d621 byte for byte)."""
+    return _revert(t, STRATEGY_EDITS16)
+
+
 def strip_strategy15(t):
-    """reverse only XA-15 (-> the Strategy of e2cf617 byte for byte)."""
+    """reverse XA-16 when present (all or nothing) and XA-15 (-> the Strategy of e2cf617 byte for byte)."""
+    if t is not None and STRATEGY_EDITS16[0][2] in t:
+        t = strip_strategy16(t)
     return _revert(t, STRATEGY_EDITS15)
 
 

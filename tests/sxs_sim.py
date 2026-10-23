@@ -34,7 +34,7 @@ raw = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 code_only, input_values, input_decls, func = es.code_only, es.input_values, es.input_decls, es.func
 CUR = {k: raw(v["path"]) for k, v in sx.CUR.items()}
 BASE = {k: sx.show(B, v["path"]) for k, v in sx.CUR.items()}
-GOLD = raw(xb.STR_PATH)
+GOLD = xb.strip_strategy16(raw(xb.STR_PATH)) or ""     # Gold XA-15 layer (the later Gold-only XA-16 reverted exactly)
 RESULTS = []
 
 
@@ -64,7 +64,8 @@ def gate_static():
           "= true) and the import line unchanged",
           all(CUR[k] == sx.build(v["path"]) and sx.strip(v["path"], CUR[k]) == BASE[k] and sx.unapply(v["path"], CUR[k]) == BASE[k]
               and sx.unapply(v["path"], BASE[k]) == BASE[k] for k, v in sx.CUR.items())
-          and not [p for p in others if raw(p) != sx.show(B, p)]
+          and not [p for p in others if raw(p) != sx.show(B, p)
+                   and not (p == xb.STR_PATH and xb.strip_strategy16(raw(p)) == sx.show(B, p))]     # Gold: later XA-16 exactly
           and all(es.seg(CUR[k], "strategy(", "import ") == es.seg(BASE[k], "strategy(", "import ")
                   and "calc_on_every_tick     = true," in CUR[k]
                   and re.findall(r"^import .*$", CUR[k], re.M) == re.findall(r"^import .*$", BASE[k], re.M) for k in CUR))

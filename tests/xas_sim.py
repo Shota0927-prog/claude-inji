@@ -1344,7 +1344,7 @@ def be_run(side, fill, sl, tp, bars, mode="Fixed Distance", on=True, limit_fill_
 
 
 def gate_xa15():
-    S15, S14 = rd(xb.STR_PATH), xb.show("e2cf617", xb.STR_PATH)
+    S15, S14 = xb.strip_strategy16(rd(xb.STR_PATH)) or "", xb.show("e2cf617", xb.STR_PATH)   # XA-15 layer (XA-16 reverted exactly)
     i15, i14 = input_values(S15), input_values(S14)
     new = {k: v for k, v in i15.items() if k not in i14}
     decl = input_decls(S15)
@@ -1354,7 +1354,7 @@ def gate_xa15():
           "(min 0.1, step 0.1), TP Ratio 0.5 (min 0.05, max 1.0, step 0.05); every older default unchanged (BE ON / 15, filter "
           "4H / 1H, SATS / Retest / C / Short Only / 240 / body / near 1.0 / SL 1.5 / opposite TP OFF / RR 1.5 / 300,000 x 3 %); "
           "Engine / Visual / other Pine files unchanged",
-          xb.build_strategy() == S15 and xb.strip_strategy15(S15) == S14 and xb.build_strategy14() == S14
+          xb.build_strategy15() == S15 and xb.strip_strategy15(S15) == S14 and xb.build_strategy14() == S14
           and new == {"stBEMode": '"Fixed Distance"', "stBER": "1.0", "stBETp": "0.5"}
           and 'options = ["Fixed Distance", "Risk Multiple", "TP Progress"]' in decl["stBEMode"]
           and es.kw(decl["stBER"], "minval") == "0.1" and es.kw(decl["stBER"], "step") == "0.1"
@@ -1449,8 +1449,156 @@ def gate_xa15():
           and all(m != S15 and xb.strip_strategy15(m) is None for m in muts))
 
 
+# ---- XA-16: SATS immediate entry on a recent SATS rebound --------------------------------------------------------------------
+def hist16(side, bars, lines, near=False, dist=0.0, body=False):
+    """port of f_satHist for one line over bars (o, h, l, c); lines[i] = the line value of bar i (bar i uses lines[i - 1]).
+    Returns the per-bar rebound flags."""
+    rec, out = False, []
+    for i, (o, h, l, c) in enumerate(bars):
+        L = lines[i - 1] if i >= 1 else None
+        pc = bars[i - 1][3] if i >= 1 else None
+        ok = L is not None and pc is not None
+        hit = ok and l <= L <= h
+        nr = ok and near and ((l > L and l - L <= dist) if side == 1 else (h < L and L - h <= dist))
+        fresh = ok and ((pc > L) if side == 1 else (pc < L))
+        ra = (hit or nr) and fresh and ((c > L) if side == 1 else (c < L))
+        rb = rec and ok and ((pc <= L and c > L) if side == 1 else (pc >= L and c < L))
+        bd = (not body) or ((c > o) if side == 1 else (c < o))
+        reb = (ra or rb) and bd
+        out.append(reb)
+        rec = False if reb else (rec or ((hit or nr) and fresh))
+    return out
+
+
+def latest16(flags_by_line):
+    """latest rebound bar and line kind (same bar: LINE1 -> LINE2 -> STB)."""
+    bar, kind = None, 0
+    n = len(flags_by_line[0])
+    for i in range(n):
+        for k in (0, 1, 2):
+            if flags_by_line[k][i]:
+                bar, kind = i, k + 1
+                break
+    return bar, kind
+
+
+def decide16(on, n_max, reb_bar, t_bar, mtf_ok=True, qty_ok=True, dir_ok=True, prep_ok=True, waiting=False, cancel=False):
+    """port of the XA-16 branch at the SATS prep point: 'now' (market order), 'wait' (the usual prep) or None."""
+    if not prep_ok or waiting or cancel:
+        return None
+    age = None if reb_bar is None else t_bar - reb_bar
+    if on and age is not None and 0 <= age <= n_max and mtf_ok and dir_ok and qty_ok:
+        return "now"
+    return "wait"
+
+
+def gate_xa16():
+    S16, S15 = rd(xb.STR_PATH), xb.show("b59d621", xb.STR_PATH)
+    i16, i15 = input_values(S16), input_values(S15)
+    decl = input_decls(S16)
+    new = {k: v for k, v in i16.items() if k not in i15}
+    check("XL-01 XA-16: Strategy == xa_build.build_strategy() (XA-1 .. XA-16); strip_strategy16 gives b59d621 byte for byte; new "
+          "inputs 'SATS · 直近の反発で即時エントリー' OFF and '有効本数' 1 (min 0, step 1); every older default unchanged; Engine / "
+          "Visual / other Pine files unchanged; the only removed old line is the SATS prep gate (+ and not nowGo)",
+          xb.build_strategy() == S16 and xb.strip_strategy16(S16) == S15 and xb.build_strategy15() == S15
+          and new == {"stSatsNow": "false", "stSatsNowN": "1"} and es.kw(decl["stSatsNowN"], "minval") == "0"
+          and es.kw(decl["stSatsNowN"], "step") == "1" and all(i16[k] == v for k, v in i15.items())
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH
+                   and open(os.path.join(ROOT, p), encoding="utf-8").read() != xb.show("b59d621", p)]     # raw files (SX-1 included)
+          and [l for l in es.changed_code(S15, S16) if l and l in [x.strip() for x in code_only(S15).split("\n")]
+               and l not in [x.strip() for x in code_only(S16).split("\n")]]
+              == ["if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar"])
+    fh = func(S16, "f_satHist(int side, float L, bool rec) =>")
+    nb = block(S16, "                bool nowGo = false\n", "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar and not nowGo\n")
+    cond = re.search(r"if not na\(hAge\) and (.*)\n", nb).group(0)
+    check("XL-02 static: the rebound history is independent of the wait (f_satHist uses no pw* / P0 / SL0 / zone / band colour) and "
+          "runs every bar at global scope for Long / Short x LINE1 / LINE2 / STB with the bar e-1 lines (satL1[1] / satL2[1] / "
+          "satStb[1]); A / B / near / body as the wait's price rules; same-bar priority LINE1 -> LINE2 -> STB, latest bar kept; the "
+          "immediate test sits only at the SATS prep point (stSatsNow, the prep conditions, no wait, not a cancel bar) with exactly "
+          "0 <= t - e <= N + this bar's filter + SL / TP side + f_stQty(side, close, SL0) — no old-line range, no P0 improvement, no "
+          "re-touch, no body on bar t; a market order (no limit) with TP0 = tpRef, path 2; otherwise the unchanged prep",
+          not re.search(r"pw\w+|pwP0|pSL|satBand|satD|zn\.", fh)
+          and all(("[h%s%d, n%s%d] = f_satHist(%s, %s[1], hRec%s%d)" % (s, k, s, k, sd, ln, s, k)) in S16
+                  for s, sd in (("L", "1"), ("S", "-1")) for k, ln in ((1, "satL1"), (2, "satL2"), (3, "satStb")))
+          and "hRebKL   := hL1 ? 1 : hL2 ? 2 : 3" in S16 and "hRebKS   := hS1 ? 1 : hS2 ? 2 : 3" in S16
+          and "if stSatsNow and not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar" in nb
+          and cond.strip() == "if not na(hAge) and hAge >= 0 and hAge <= stSatsNowN and nMtf and nDir and not na(nQty)"
+          and "float nQty = f_stQty(side, close, pSL)" in nb and "bool  nDir = side * (close - pSL) > 0 and side * (tpRef - close) > 0" in nb
+          and "bool  nMtf = not (side == 1 ? satSkipL : satSkipS)" in nb and not re.search(r"stSatsBody|pwP0 *[<>]|lp|touch|priceOK|limit =", nb)
+          and "oTP0    := tpRef" in nb and "oPath   := 2" in nb and "oLimit  := false" in nb and "map.put(stUsed" not in nb
+          and S16.count("oPath   := 1") == 1 and len(re.findall(r"\bstSatsNow\b", S16)) == 2 and code_only(S16).count("f_satRR(") == code_only(S15).count("f_satRR("))
+    # models: detector
+    up = [(2610, 2612, 2606, 2611), (2611, 2612, 2604.5, 2609), (2609, 2610, 2603, 2606), (2606, 2607, 2604, 2606.5)]
+    lines_l = [2605.0, 2605.0, 2605.0, 2605.0]
+    a_l = hist16(1, up, lines_l)                                                      # bar 1: low 2604.5 <= 2605, close 2609 > L -> A
+    b_bars = [(2610, 2612, 2606, 2611), (2611, 2611, 2604.0, 2604.5), (2604.5, 2604.8, 2603, 2604), (2604, 2607, 2603.5, 2606)]
+    b_l = hist16(1, b_bars, lines_l)                                                  # touch bar 1 closes below, bar 3 crosses back -> B at 3
+    cross_only = hist16(1, [(2600, 2601, 2599, 2600), (2600, 2601, 2599, 2604), (2604, 2607, 2603.5, 2606)], [2605.0, 2605.0, 2605.0])
+    other_line = (hist16(1, b_bars[:2] + [(2604.5, 2604.8, 2603, 2604)], [2605.0, 2605.0, 2605.0])[1:],
+                  hist16(1, [(2610, 2612, 2608, 2609), (2609, 2610, 2608.5, 2609.5), (2609.5, 2611, 2609, 2610.5)], [2609.0, 2611.0, 2611.0]))
+    moved = hist16(1, [(2610, 2612, 2606, 2611), (2611, 2611, 2604.0, 2604.5), (2604.5, 2605, 2603.6, 2604.7)], [2605.0, 2605.0, 2603.5])
+    near_off = hist16(1, [(2610, 2612, 2607, 2611), (2611, 2612, 2605.8, 2609)], [2605.0, 2605.0])
+    near_on = hist16(1, [(2610, 2612, 2607, 2611), (2611, 2612, 2605.8, 2609)], [2605.0, 2605.0], near=True, dist=1.0)
+    body_bad = hist16(1, [(2610, 2612, 2606, 2611), (2610, 2612, 2604.5, 2609)], [2605.0, 2605.0], body=True)
+    body_ok = hist16(1, [(2610, 2612, 2606, 2611), (2607, 2612, 2604.5, 2609)], [2605.0, 2605.0], body=True)
+    mir = lambda bs: [(5200 - o, 5200 - l, 5200 - h, 5200 - c) for o, h, l, c in bs]
+    s_a = hist16(-1, mir(up), [5200 - x for x in lines_l])
+    s_b = hist16(-1, mir(b_bars), [5200 - x for x in lines_l])
+    lt = latest16([[False, True, False, True], [False, False, False, True], [True, False, False, False]])
+    check("XL-03 model detector: A on the touch bar (Long / Short mirror), B on the bar that crosses back after an earlier touch of the "
+          "same line (counted from the rebound bar, not the touch), no B for a plain cross without a touch, a touch of another line "
+          "or a line that only moved, near OFF / ON (1.0 within), body ON rejects a bearish Long rebound bar and accepts a bullish "
+          "one; the latest rebound wins and the same bar prefers LINE1 -> LINE2 -> STB",
+          a_l == [False, True, True, True] and b_l == [False, False, False, True] and not any(cross_only)
+          and not any(other_line[0]) and not any(other_line[1]) and not any(moved) and not any(near_off) and near_on == [False, True]
+          and body_bad == [False, False] and body_ok == [False, True] and s_a == a_l and s_b == b_l and lt == (3, 1),
+          str((a_l, b_l, cross_only, other_line, moved, near_on, body_bad, body_ok, s_a, s_b, lt)))
+    d = {"N0 same bar": decide16(True, 0, 10, 10), "N0 one back": decide16(True, 0, 9, 10), "N1 one back": decide16(True, 1, 9, 10),
+         "N1 two back": decide16(True, 1, 8, 10), "N3 three back": decide16(True, 3, 7, 10), "N3 four back": decide16(True, 3, 6, 10),
+         "none": decide16(True, 3, None, 10), "OFF": decide16(False, 3, 10, 10), "filter": decide16(True, 3, 10, 10, mtf_ok=False),
+         "qty": decide16(True, 3, 10, 10, qty_ok=False), "dir": decide16(True, 3, 10, 10, dir_ok=False),
+         "waiting": decide16(True, 3, 10, 10, waiting=True), "cancel bar": decide16(True, 3, 10, 10, cancel=True)}
+    check("XL-04 model branch: N 0 -> only t; N 1 -> t, t-1 (not t-2); N 3 -> t-3 (not t-4) (boundaries included); no rebound / OFF -> "
+          "the usual wait; this bar's filter / qty / SL-TP side failing -> the usual wait; while waiting or on a cancel bar nothing "
+          "(no interruption, no second order)",
+          d == {"N0 same bar": "now", "N0 one back": "wait", "N1 one back": "now", "N1 two back": "wait", "N3 three back": "now",
+                "N3 four back": "wait", "none": "wait", "OFF": "wait", "filter": "wait", "qty": "wait", "dir": "wait",
+                "waiting": None, "cancel bar": None}, str(d))
+    prep = block(S16, "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar and not nowGo\n", "            else if not skipRef")
+    prep15 = block(S15, "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar\n", "            else if not skipRef")
+    check("XL-05 OFF / fallback: stSatsNow false -> nowGo stays false and the prep is the XA-15 prep byte for byte (touch record reset, "
+          "P0 / SL0 / TP0, prep time); the immediate path never writes the wait (pwState / pwTouched / pwBar / pwEndT) and the "
+          "wait's touch record is never seeded from the history; Current untouched (all inside 'if stSats')",
+          prep.split("\n", 1)[1] == prep15.split("\n", 1)[1] and not re.search(r"\b(pwState|pwTouched|pwBar|pwEndT|pwTouchK)\s*:=", nb)
+          and not re.search(r"hRec|hReb", block(S16, "    bool  pwCancelBar = false\n", "    // (4) 新規 Entry"))
+          and block(S16, "            if stSats\n", "            else if not skipRef").count("bool nowGo = false") == 1)
+    sats_fill = block(S16, "    if fillNow and stSats\n", "    else if fillNow\n")
+    check("XL-06 both paths share the SATS fill handling: the immediate order sets oTP0 = TP0 (tpRef of the prep calculation), oSL = "
+          "SL0, so the fill bar sets TP = TP0 (not rebuilt from the fill), closes a wrong-side gap fill and records the actual RR "
+          "(also when closed in the fill bar); the used Track is still written only at the fill; per-path display (path, counts, "
+          "line, age, planned / actual RR per path); plots + shapes %d <= 64; no new alert" % len(re.findall(r"^plot(?:shape)?\(", S16, re.M)),
+          "oTP   := oTP0" in sats_fill and "f_satRR(oSide, oFill, oSL, oTP0)" in sats_fill and "oSL     := pSL" in nb
+          and len(re.findall(r"^plot(?:shape)?\(", S16, re.M)) <= 64 and S16.count("alert(") == S15.count("alert(")
+          and code_only(S16).count("map.put(stUsed") == code_only(S15).count("map.put(stUsed"))
+    muts = [S16.replace("hAge >= 0 and hAge <= stSatsNowN", "hAge >= 0 and hAge < stSatsNowN"),
+            S16.replace("[hL1, nL1] = f_satHist(1, satL1[1], hRecL1)", "[hL1, nL1] = f_satHist(1, satL1, hRecL1)"),
+            S16.replace("and nMtf and nDir and not na(nQty)", "and nMtf and nDir and not na(nQty) and close < pwP0"),
+            S16.replace("and nMtf and nDir and not na(nQty)", "and nDir and not na(nQty)"),
+            S16.replace("    bool rB    = rec and ok and", "    bool rB    = ok and"),
+            S16.replace("    bool body  = not stSatsBody or", "    bool body  = true or not stSatsBody or"),
+            S16.replace("                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar and not nowGo\n",
+                        "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar\n"),
+            S16.replace("                if stSatsNow and not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar\n",
+                        "                if stSatsNow and not skipRef and not na(pQty)\n")]
+    check("XL-07 mutations (strict < N, current lines instead of the e-1 lines, a P0 improvement on the immediate side, the filter "
+          "dropped, B without the touch record, the body rule dropped, a prep after an immediate order (double), an immediate order "
+          "during a wait) do not strip back to b59d621",
+          all(m != S16 and xb.strip_strategy16(m) is None for m in muts))
+
+
 def main():
-    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12, gate_xa13, gate_xa14, gate_xa15):
+    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12, gate_xa13, gate_xa14, gate_xa15,
+              gate_xa16):
         try:
             g()
         except Exception:
