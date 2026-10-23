@@ -840,6 +840,54 @@ STRATEGY_EDITS10 = [
 ]
 
 
+# ---- XA-11: SATS comparison switches (Strategy only; after XA-10) -------------------------------------------------------
+#  Two independent inputs, both default OFF (both OFF = the XA-10 code path): (1) the bar that places the SATS order must
+#  itself be bullish (Long close > open) / bearish (Short close < open), on top of rebound A or B of that same bar (no stored
+#  rebound; the wait and the touch record stay when it fails); (2) a near approach to the t-1 line L counts as a touch
+#  (Short: high < L and L - high <= D / Long: low > L and low - L <= D, D in USD, default 3.0, 0 = real touch only); the
+#  close-back test keeps the original L and the SL0..P0 window is kept. strip_strategy11() -> the Strategy of ae2c2e8.
+STRATEGY_EDITS11 = [
+    ("header",
+     "//  P0 = A は元の指値価格 pL (指値注文は出さない) / B・C・D はその確定足の終値。D は既存の 1分足 BOS 確認後)。待機・反発・取消は共通。\n",
+     "//  P0 = A は元の指値価格 pL (指値注文は出さない) / B・C・D はその確定足の終値。D は既存の 1分足 BOS 確認後)。待機・反発・取消は共通。\n"
+     "//  XA-11: SATS の比較用設定 2 つ (独立・初期 OFF、両方 OFF は XA-10 と同じ)。① 発注する足自身の陽線 / 陰線を反発 A・B に追加で要求。\n"
+     "//  ② 線 L の手前 (許容距離 $ 以内) までの接近も接触扱い (終値の戻りは元の L で判定)。成績への影響は未確認。\n"),
+    ("input",
+     'stSatsShow = input.bool(true, "SATS · 線を表示", group = G_STW)\n',
+     'stSatsShow = input.bool(true, "SATS · 線を表示", group = G_STW)\n'
+     'stSatsBody = input.bool(false, "SATS · 反発確認足の陽線／陰線を要求", group = G_STW,\n'
+     '     tooltip = "XA-11 比較用 (初期 OFF)。ON: 発注を判断する 5分足自身が Long は close > open / Short は close < open (同値足は不成立)。\\n" +\n'
+     '     "その足で既存の反発 A または B と同時に成立したときだけ発注する。不成立でも待機と接触記録は残す (過去の反発は保存しない)。")\n'
+     'stSatsNear = input.bool(false, "SATS · 近接を接触扱い", group = G_STW,\n'
+     '     tooltip = "XA-11 比較用 (初期 OFF)。ON: 実接触 (low <= L <= high) に加え、線 L (足 t-1 の確定値) の手前までの接近も接触とする。\\n" +\n'
+     '     "Short: high < L かつ L − high <= 許容距離 / Long: low > L かつ low − L <= 許容距離。終値の戻りは元の線 L で判定する。")\n'
+     'stSatsNearD = input.float(3.0, "SATS · 近接許容距離 ($)", minval = 0.0, step = 0.5, group = G_STW,\n'
+     '     tooltip = "XAUUSD の価格差 (ドル)。ATR・pips・終値と線の距離ではない。0 なら実接触だけと同じ。")\n'),
+    ("text",
+     "var int   pwNOrdSame   = 0     // XA-9: 同じ足の接触・反発 (A) で発注した件数\n",
+     "var int   pwNOrdSame   = 0     // XA-9: 同じ足の接触・反発 (A) で発注した件数 (XA-11: 近接 ON では近接を接触扱いにした同一足反発を含む)\n"),
+    ("text",
+     "    //   反発: A = その足で接触して終値が戻る / B = 接触済みで、前足終値 <= L (Short は >=) かつ当足終値 > L (Short は <)\n",
+     "    //   反発: A = その足で接触して終値が戻る / B = 接触済みで、前足終値 <= L (Short は >=) かつ当足終値 > L (Short は <)\n"
+     "    //   XA-11 ② (近接 ON): 接触 = 実接触 または 線の手前までの接近 (Long low > L かつ low − L <= 許容距離 / Short high < L かつ\n"
+     "    //           L − high <= 許容距離)。接触記録・線の固定・反発 A / B は同じ処理を共用し、終値の基準は元の L のまま\n"
+     "    //   XA-11 ① (陽線 / 陰線 ON): 発注する足自身が Long close > open / Short close < open。同じ足の A または B と同時に必要。\n"
+     "    //           不成立でも待機・接触記録は残す (接触の記録自体は制限しない)\n"),
+    ("near",
+     "            bool touchNow = inRange and low <= lp and lp <= high\n",
+     "            bool touchHit  = inRange and low <= lp and lp <= high\n"
+     "            bool touchNear = stSatsNear and inRange and (pwSide == 1 ? (low > lp and low - lp <= stSatsNearD) : (high < lp and lp - high <= stSatsNearD))\n"
+     "            bool touchNow  = touchHit or touchNear\n"),
+    ("body",
+     "            if (rebA or rebB) and priceOK and stSessOK and oState == 0\n",
+     "            bool bodyOK  = not stSatsBody or (pwSide == 1 ? close > open : close < open)\n"
+     "            if (rebA or rebB) and bodyOK and priceOK and stSessOK and oState == 0\n"),
+    ("text",
+     'plot(stSats ? pwNOrdSame : na,             "SATS · 発注 (同じ足の接触・反発)", display = display.data_window)\n',
+     'plot(stSats ? pwNOrdSame : na,             "SATS · 発注 (同じ足の接触・反発。近接 ON は近接の同一足反発を含む)", display = display.data_window)\n'),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -1013,8 +1061,13 @@ def build_strategy9():
     return _apply(build_strategy8(), STRATEGY_EDITS9)
 
 
-def build_strategy():
+def build_strategy10():
+    """XA-1 .. XA-10 (commit ae2c2e8)."""
     return _apply(build_strategy9(), STRATEGY_EDITS10)
+
+
+def build_strategy():
+    return _apply(build_strategy10(), STRATEGY_EDITS11)
 
 
 def strip_visual3(t):
@@ -1027,8 +1080,15 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy11(t):
+    """reverse only XA-11 (-> the Strategy of ae2c2e8 byte for byte)."""
+    return _revert(t, STRATEGY_EDITS11)
+
+
 def strip_strategy10(t):
-    """reverse only XA-10 (-> the Strategy of 3ca1837 byte for byte)."""
+    """reverse XA-11 when present (all or nothing) and XA-10 (-> the Strategy of 3ca1837 byte for byte)."""
+    if t is not None and STRATEGY_EDITS11[0][2] in t:
+        t = strip_strategy11(t)
     return _revert(t, STRATEGY_EDITS10)
 
 

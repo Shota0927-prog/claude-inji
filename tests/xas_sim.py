@@ -19,7 +19,10 @@
        line kind, rebound A (touch bar) or B (later bar: previous close and close across the same t-1 line value)
   XZ : XA-10 on the delivered Strategy — SATS Pullback with Entry Mode A / B / C / D (C-only stop removed; one shared prep in
        the order block with each mode's ref: A the limit price, B / C / D the close; D after its BOS)
-  (XW / XP / XQ run on the XA-7 layer, XV on XA-8, XN on XA-9: the Strategy with exactly the later edits reverted)
+  XY : XA-11 on the delivered Strategy — two independent comparison inputs (default OFF): (1) the order bar itself bullish /
+       bearish together with rebound A or B of that bar; (2) a near approach (USD distance, t-1 line L) counts as the touch,
+       the close-back keeps the original L; both OFF = the XA-10 path
+  (XW / XP / XQ run on the XA-7 layer, XV on XA-8, XN on XA-9, XZ on XA-10: the Strategy with exactly the later edits reverted)
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile, SATS line values vs the source indicator, Strategy Tester external).
 """
@@ -662,13 +665,13 @@ def prep_model(mode, side, close_px, limit_px, zone_top, zone_bot, buf=1.5, rr=1
 
 
 def gate_xa10():
-    S10, S9 = rd(xb.STR_PATH), xb.show("3ca1837", xb.STR_PATH)
+    S10, S9 = xb.strip_strategy11(rd(xb.STR_PATH)) or "", xb.show("3ca1837", xb.STR_PATH)   # XA-10 layer (XA-11 reverted exactly)
     ch = sorted(l for l in es.changed_code(S9, S10) if l)
     code_rm = [l for l in ch if not l.startswith('"') and not l.startswith("tooltip")]
     check("XZ-01 XA-10: Strategy == xa_build.build_strategy() (XA-1 .. XA-10); strip_strategy10 gives 3ca1837 byte for byte; the "
           "only code change is the removal of the C-only runtime.error (2 lines), the rest are tooltip strings / comments; "
           "Entry Mode default C, Entry Timing default Current, Role Reversal default unchanged",
-          xb.build_strategy() == S10 and xb.strip_strategy10(S10) == S9 and xb.build_strategy9() == S9
+          xb.build_strategy10() == S10 and xb.strip_strategy10(S10) == S9 and xb.build_strategy9() == S9
           and code_rm == sorted(["if stSats and not stModeC",
                                  'runtime.error("Entry Timing = SATS Pullback は Entry Mode C: Candle Pattern 専用です (他の Entry Mode は対象外)。")'])
           and input_values(S10)["stMode"] == '"C: Candle Pattern"' and input_values(S10)["stTiming"] == '"Current"'
@@ -717,8 +720,248 @@ def gate_xa10():
           m != S10 and xb.strip_strategy10(m) != S9)
 
 
+# ---- XA-11: SATS comparison switches (order-bar body / near approach as the touch) --------------------------------------
+class Wait11(Wait9):
+    """port of the XA-11 waiting step: XA-9 plus body (1) and near (2). o = the bar's open. variants mirror wrong builds."""
+
+    def __init__(self, side, p0, sl0, tp0, body=False, near=False, dist=3.0, **kw):
+        super().__init__(side, p0, sl0, tp0, **kw)
+        self.body, self.near, self.dist = body, near, dist
+
+    def step(self, bar, t_close, h, l, c, pc, lines, o=None, sess=True, qty_ok=True, o_state=0):
+        if self.state != 1 or bar <= self.bar:
+            return None
+        why = 0
+        if t_close - self.t_end >= self.limit * 60000:
+            why = -1
+        elif (l <= self.sl0) if self.side == 1 else (h >= self.sl0):
+            why = -4
+        if why:
+            self.state = 0
+            self.n_exp += why == -1
+            self.n_sl += why == -4
+            self.touched, self.tk, self.tbar = False, 0, None
+            return why
+        if not self.touched:
+            k, L = pick(self.side, self.p0, self.sl0, pc, lines)
+        else:
+            k, L = self.tk, lines[self.tk - 1]
+        in_range = k != 0 and L is not None and ((self.sl0 < L < self.p0) if self.side == 1 else (self.p0 < L < self.sl0))
+        hit = in_range and l <= L <= h
+        d = self.dist
+        if self.variant == "near_strict":
+            near = self.near and in_range and ((l > L and l - L < d) if self.side == 1 else (h < L and L - h < d))
+        elif self.variant == "near_close":
+            near = self.near and in_range and ((c > L and c - L <= d) if self.side == 1 else (c < L and L - c <= d))
+        else:
+            near = self.near and in_range and ((l > L and l - L <= d) if self.side == 1 else (h < L and L - h <= d))
+        touch = hit or near
+        Lc = L
+        if self.variant == "shift_close" and self.near and in_range:
+            Lc = L + d if self.side == 1 else L - d
+        reb_a = touch and ((c > Lc) if self.side == 1 else (c < Lc))
+        reb_b = self.touched and in_range and ((pc <= Lc and c > Lc) if self.side == 1 else (pc >= Lc and c < Lc))
+        body_ok = (not self.body) or ((c > o) if self.side == 1 else (c < o))
+        if self.variant == "body_on_touch" and not body_ok:
+            touch = False
+        if touch and not self.touched:
+            self.touched, self.tk, self.tbar = True, k, bar
+            self.n_touch_prep += 1
+        if self.variant == "stored_rebound":
+            self.seen_reb = getattr(self, "seen_reb", False) or reb_a or reb_b
+            reb_a, reb_b = reb_a or self.seen_reb, reb_b
+        price_ok = (self.sl0 < c < self.p0) if self.side == 1 else (self.p0 < c < self.sl0)
+        if (reb_a or reb_b) and body_ok and price_ok and sess and o_state == 0 and qty_ok:
+            self.state = 0
+            self.orders.append(dict(bar=bar, ref=c, kind="A" if reb_a else "B", line=k, L=L))
+            self.n_same += reb_a
+            self.n_later += not reb_a
+            self.touched, self.tk, self.tbar = False, 0, None
+            return 2
+        return 0
+
+
+def gate_xa11():
+    S11, S10 = rd(xb.STR_PATH), xb.show("ae2c2e8", xb.STR_PATH)
+    ch = es.changed_code(S10, S11)
+    code = sorted(l for l in ch if l and not l.startswith('"') and not l.startswith("tooltip"))
+    iv = input_values(S11)
+    check("XY-01 XA-11: Strategy == xa_build.build_strategy() (XA-1 .. XA-11); strip_strategy11 gives ae2c2e8 byte for byte "
+          "(strip_strategy10 gives 3ca1837); code changes = 3 inputs, touchNow -> touchHit or touchNear, bodyOK in the order "
+          "condition, the A-counter plot title; new inputs default OFF / OFF / 3.0 (min 0, step 0.5); every older default kept",
+          xb.build_strategy() == S11 and xb.strip_strategy11(S11) == S10 and xb.build_strategy10() == S10
+          and xb.strip_strategy10(S11) == xb.show("3ca1837", xb.STR_PATH)
+          and code == sorted([
+              "bool touchNow = inRange and low <= lp and lp <= high",
+              "bool touchHit  = inRange and low <= lp and lp <= high",
+              "bool touchNear = stSatsNear and inRange and (pwSide == 1 ? (low > lp and low - lp <= stSatsNearD) : (high < lp and lp - high <= stSatsNearD))",
+              "bool touchNow  = touchHit or touchNear",
+              "if (rebA or rebB) and priceOK and stSessOK and oState == 0",
+              "bool bodyOK  = not stSatsBody or (pwSide == 1 ? close > open : close < open)",
+              "if (rebA or rebB) and bodyOK and priceOK and stSessOK and oState == 0",
+              'stSatsBody = input.bool(false, "SATS · 反発確認足の陽線／陰線を要求", group = G_STW,',
+              'stSatsNear = input.bool(false, "SATS · 近接を接触扱い", group = G_STW,',
+              'stSatsNearD = input.float(3.0, "SATS · 近接許容距離 ($)", minval = 0.0, step = 0.5, group = G_STW,',
+              'plot(stSats ? pwNOrdSame : na,             "SATS · 発注 (同じ足の接触・反発)", display = display.data_window)',
+              'plot(stSats ? pwNOrdSame : na,             "SATS · 発注 (同じ足の接触・反発。近接 ON は近接の同一足反発を含む)", display = display.data_window)',
+              "var int   pwNOrdSame   = 0     // XA-9: 同じ足の接触・反発 (A) で発注した件数",
+              "var int   pwNOrdSame   = 0     // XA-9: 同じ足の接触・反発 (A) で発注した件数 (XA-11: 近接 ON では近接を接触扱いにした同一足反発を含む)"])
+          and iv["stSatsBody"] == "false" and iv["stSatsNear"] == "false" and iv["stSatsNearD"] == "3.0"
+          and all(iv[k] == v for k, v in input_values(S10).items()), "\n".join(code))
+    wb = block(S11, "    // (3b) XA-7 / XA-9 SATS Pullback", "    // (4) 新規 Entry")
+    outside = S11.replace(wb, "")
+    rec = block(S11, "            if touchNow and not pwTouched\n", "            bool priceOK")
+    check("XY-02 scope: stSatsBody / stSatsNear / stSatsNearD are read only inside the SATS waiting block (3b) (Current A-D, the "
+          "shared prep (4), fills, TP / BE untouched); both OFF: touchNear needs stSatsNear, bodyOK = not stSatsBody or ... -> the "
+          "XA-10 conditions; one touch flag (touchNow) feeds rebound A and the single touch record; bodyOK is not in the touch "
+          "record and is ANDed in the same if as this bar's rebA / rebB (no var / stored rebound); no mode test in the block; "
+          "the A counter comment states that it includes the near same-bar rebound",
+          all(outside.count(k) == 1 for k in ("stSatsBody =", "stSatsNear =", "stSatsNearD ="))
+          and "stSatsBody" not in outside.replace("stSatsBody =", "") and "stSatsNear" not in outside.replace("stSatsNear =", "").replace("stSatsNearD =", "")
+          and wb.count("stSatsBody") == 1 and wb.count("stSatsNear ") == 1 and wb.count("stSatsNearD") == 2
+          and "bool rebA     = touchNow and" in wb and "bodyOK" not in rec and "touchNear" not in rec
+          and "if touchNow and not pwTouched" in wb and not re.search(r"\bvar\b|varip", wb) and not re.search(r"stMode[ABCD]", wb)
+          and "if (rebA or rebB) and bodyOK and priceOK and stSessOK and oState == 0" in wb
+          and "近接 ON では近接を接触扱いにした同一足反発を含む" in S11)
+
+    # both OFF == XA-9 / XA-10 machine on random paths (Long and Short)
+    random.seed(1101)
+    same = True
+    for side in (1, -1):
+        for _ in range(300):
+            p0, sl0 = (2600.0, 2580.0) if side == 1 else (2600.0, 2620.0)
+            a, b = Wait9(side, p0, sl0, 0.0), Wait11(side, p0, sl0, 0.0)
+            pc = p0
+            for i in range(1, 40):
+                c = round(pc + random.uniform(-4, 4), 1)
+                h, l = c + round(random.uniform(0, 3), 1), c - round(random.uniform(0, 3), 1)
+                lines = tuple(None if random.random() < 0.1 else round(c + random.uniform(-6, 6), 1) for _ in range(3))
+                ra = a.step(10 + i, tb(i), h, l, c, pc, lines)
+                rb = b.step(10 + i, tb(i), h, l, c, pc, lines, o=round(c + random.uniform(-2, 2), 1))
+                same &= ra == rb and a.touched == b.touched and a.tk == b.tk
+                pc = c
+            same &= a.orders == b.orders and (a.n_same, a.n_later, a.n_touch_prep) == (b.n_same, b.n_later, b.n_touch_prep)
+    check("XY-03 model: both OFF gives the XA-9 / XA-10 waiting result bar for bar (events, touch record, orders, A / B counters) "
+          "on 600 random Long / Short paths", same)
+
+    # (1) body: Short (P0 2600, SL0 2620, line 2610)
+    w = Wait11(-1, 2600.0, 2620.0, 2570.0, body=True)
+    r1 = w.step(11, tb(1), 2611, 2607, 2605, 2606.0, (2610.0, None, None), o=2604)     # touch + close back, bullish -> no
+    t1 = (w.state, w.touched, w.tk)
+    r2 = w.step(12, tb(2), 2609, 2604, 2605, 2605.0, (2610.0, None, None), o=2605)     # doji, no new A / B -> no
+    r3 = w.step(13, tb(3), 2608, 2603, 2604, 2605.0, (2610.0, None, None), o=2607)     # bearish, but no new A / B -> no
+    r4 = w.step(14, tb(4), 2612, 2606, 2609, 2604.0, (2610.0, None, None), o=2608)     # touch + close back (A), bullish -> no
+    r5 = w.step(15, tb(5), 2612, 2606, 2609, 2609.0, (2610.0, None, None), o=2611)     # A again with a bearish bar -> order
+    wd = Wait11(-1, 2600.0, 2620.0, 2570.0, body=True)
+    d1 = wd.step(11, tb(1), 2611, 2607, 2605, 2606.0, (2610.0, None, None), o=2605)    # doji on rebound A -> no
+    dt = wd.touched
+    d2 = wd.step(12, tb(2), 2611, 2606, 2611, 2605.0, (2610.0, None, None), o=2606)    # back above
+    d3 = wd.step(13, tb(3), 2609.8, 2607, 2608, 2611.0, (2610.0, None, None), o=2609.5)  # gap: B (2611 >= L, 2608 < L) + bearish -> order
+    wl = Wait11(1, 2600.0, 2580.0, 2630.0, body=True)
+    l1 = wl.step(11, tb(1), 2593, 2589, 2591, 2594.0, (2590.0, None, None), o=2592)    # Long touch + close back, bearish -> no
+    lt = wl.touched
+    l2 = wl.step(12, tb(2), 2593, 2591, 2591, 2591.0, (2590.0, None, None), o=2590.5)  # bullish but no new A / B -> no
+    l3 = wl.step(13, tb(3), 2592, 2588, 2592, 2591.0, (2590.0, None, None), o=2591)    # touch + close back + bullish -> order
+    check("XY-04 model (1) ON: rebound A with an opposite or doji bar places no order, the wait and the touch record stay; later "
+          "bars that only have the right body colour (no new A / B) do not order; a later bar with A or B and the right body "
+          "orders (Short A, Short B, Long A); the touch record itself is not limited by the body",
+          r1 == 0 and t1 == (1, True, 1) and r2 == 0 and r3 == 0 and r4 == 0 and r5 == 2 and w.orders[0]["kind"] == "A"
+          and d1 == 0 and dt and d2 == 0 and d3 == 2 and wd.orders[0]["kind"] == "B"
+          and l1 == 0 and lt and l2 == 0 and l3 == 2, str((r1, t1, r2, r3, r4, r5, d1, d2, d3, l1, l2, l3)))
+
+    # (2) near: Short line 2610, high 2607 -> L - high = 3.0
+    def near_case(h, l, c, near=True, dist=3.0, side=-1, L=2610.0):
+        if side == -1:
+            x = Wait11(-1, 2600.0, 2620.0, 2570.0, near=near, dist=dist)
+        else:
+            x = Wait11(1, 2600.0, 2580.0, 2630.0, near=near, dist=dist)
+        r = x.step(11, tb(1), h, l, c, 2605.0 if side == -1 else 2595.0, (L, None, None))
+        return r, x.touched
+    s_in, s_eq, s_out = near_case(2608.0, 2604, 2605), near_case(2607.0, 2604, 2605), near_case(2606.5, 2604, 2605)
+    s_hit, s_d0, s_off = near_case(2611.0, 2604, 2605), near_case(2607.0, 2604, 2605, dist=0.0), near_case(2608.0, 2604, 2605, near=False)
+    s_d0hit = near_case(2610.0, 2604, 2605, dist=0.0)
+    l_in = near_case(2596, 2592.0, 2595, side=1, L=2590.0)
+    l_eq = near_case(2596, 2593.0, 2595, side=1, L=2590.0)
+    l_out = near_case(2596, 2593.5, 2595, side=1, L=2590.0)
+    l_off = near_case(2596, 2592.0, 2595, side=1, L=2590.0, near=False)
+    check("XY-05 model (2): Short / Long within the distance, at the boundary (== 3.0) touch and rebound on the same bar; beyond "
+          "it no touch; a real touch still counts; distance 0 = real touch only (high == L still a real touch); OFF: a near "
+          "approach alone is not a touch",
+          s_in == (2, False) and s_eq == (2, False) and s_out == (0, False) and s_hit == (2, False) and s_d0 == (0, False)
+          and s_d0hit == (2, False) and s_off == (0, False) and l_in == (2, False) and l_eq == (2, False) and l_out == (0, False)
+          and l_off == (0, False), str((s_in, s_eq, s_out, s_hit, s_d0, s_d0hit, l_in, l_eq, l_out, l_off)))
+
+    # near touch with price window failing (close <= P0), then a later bar B; the line kind is fixed and follows
+    v = Wait11(-1, 2600.0, 2620.0, 2570.0, near=True)
+    v1 = v.step(11, tb(1), 2608.0, 2598, 2599, 2605.0, (2610.0, 2604.0, None))        # near on L1? nearest is L2 2604 (hit) -> real
+    v = Wait11(-1, 2600.0, 2620.0, 2570.0, near=True)
+    n1 = v.step(11, tb(1), 2608.0, 2598, 2599, 2605.0, (2610.0, None, None))          # near L1, close 2599 <= P0 -> no order
+    k1 = (v.touched, v.tk)
+    n2 = v.step(12, tb(2), 2614, 2601, 2613, 2599.0, (2612.0, 2605.0, None))          # back above; keeps L1 (now 2612)
+    n3 = v.step(13, tb(3), 2608.8, 2606, 2607, 2613.0, (2612.0, 2606.0, None))        # gap, 3.2 $ under L: B (2613 >= 2612, 2607 < 2612)
+    lm = Wait11(-1, 2600.0, 2620.0, 2570.0, near=True)
+    lm.step(11, tb(1), 2608.0, 2598, 2599, 2605.0, (2610.0, None, None))
+    m2 = lm.step(12, tb(2), 2612, 2611, 2611.5, 2599.0, (2610.0, None, None))         # gap above L: no touch, no rebound
+    m3 = lm.step(13, tb(3), 2612.5, 2610.5, 2611, 2611.5, (2616.5, None, None))       # line moved above both closes (4 $ away): not B
+    na_ = Wait11(-1, 2600.0, 2620.0, 2570.0, near=True)
+    na_.step(11, tb(1), 2608.0, 2598, 2599, 2605.0, (2610.0, None, None))
+    q1 = na_.step(12, tb(2), 2611, 2602, 2611, 2599.0, (None, None, None))            # L1 na -> no order, touch kept
+    q2 = na_.step(13, tb(3), 2611, 2602, 2605, 2611.0, (2621.0, None, None))          # out of range -> no order, touch kept
+    qt = na_.touched
+    q3 = na_.step(14, tb(4), 2611, 2602, 2605, 2611.0, (2610.0, None, None))          # B -> order
+    c1 = Wait11(-1, 2600.0, 2620.0, 2570.0, near=True)
+    cc = c1.step(11, tb(1), 2620.0, 2604, 2605, 2605.0, (2618.0, None, None))         # SL0 reached on a near / touch bar -> cancel
+    check("XY-06 model (2): a near approach on the same bar with the close back orders (A, counted in the A counter); a near "
+          "touch that cannot order yet is recorded (kind fixed), a later bar orders only by B (previous close and close across "
+          "the same followed t-1 line), not by the line moving; na / out-of-range bars keep the touch; SL0 cancel before the "
+          "rebound; one order and one touch count per wait",
+          s_in[0] == 2 and n1 == 0 and k1 == (True, 1) and n2 == 0 and n3 == 2 and v.orders[0]["kind"] == "B"
+          and v.orders[0]["L"] == 2612.0 and v.n_touch_prep == 1 and v.n_later == 1 and v.state == 0
+          and m2 == 0 and m3 == 0 and lm.state == 1 and q1 == 0 and q2 == 0 and qt and q3 == 2
+          and cc == -4 and not c1.orders and v1 == 0, str((v1, n1, k1, n2, n3, m2, m3, q1, q2, q3, cc)))
+
+    bo = Wait11(-1, 2600.0, 2620.0, 2570.0, body=True, near=True)
+    b1 = bo.step(11, tb(1), 2608.0, 2604, 2605, 2605.0, (2610.0, None, None), o=2604)   # near + close back, bullish -> no
+    b2 = bo.step(12, tb(2), 2608.0, 2604, 2599.5, 2605.0, (2610.0, None, None), o=2606) # bearish, close <= P0 -> no
+    b3 = bo.step(13, tb(3), 2606.5, 2601, 2602, 2599.5, (2610.0, None, None), o=2603)   # touched already, no B (pc < L) -> no
+    b4 = bo.step(14, tb(4), 2612, 2604, 2611, 2602.0, (2610.0, None, None), o=2605)     # above L
+    b5 = bo.step(15, tb(5), 2612, 2604, 2606, 2611.0, (2610.0, None, None), o=2606)     # B, doji -> no
+    b6 = bo.step(16, tb(6), 2607.5, 2603, 2604, 2606.0, (2610.0, None, None), o=2606)   # near + A + bearish -> order
+    check("XY-07 model (1) + (2) both ON: every condition is still needed (near touch, close back to the original L, the body, "
+          "P0 window); the touch recorded on a failing bar does not order later without a new A / B of the order bar",
+          (b1, b2, b3, b4, b5, b6) == (0, 0, 0, 0, 0, 2) and bo.orders[0]["kind"] == "A", str((b1, b2, b3, b4, b5, b6)))
+
+    def scen(var):
+        res = []
+        x = Wait11(-1, 2600.0, 2620.0, 2570.0, near=True, variant=var)
+        res.append(x.step(11, tb(1), 2607.0, 2604, 2605, 2605.0, (2610.0, None, None)))   # boundary
+        x = Wait11(-1, 2600.0, 2620.0, 2570.0, near=True, variant=var)
+        res.append(x.step(11, tb(1), 2605.5, 2601, 2608.5, 2605.0, (2610.0, None, None)))  # far high, close near L
+        x = Wait11(-1, 2600.0, 2620.0, 2570.0, near=True, body=True, variant=var)
+        res.append(x.step(11, tb(1), 2611, 2607, 2605, 2606.0, (2610.0, None, None), o=2604))
+        res.append(x.touched)
+        res.append(x.step(12, tb(2), 2606, 2604, 2605, 2605.0, (2610.0, None, None), o=2606))   # right body, no new A / B
+        x = Wait11(-1, 2600.0, 2620.0, 2570.0, near=True, variant=var)
+        res.append(x.step(11, tb(1), 2612, 2606, 2608, 2605.0, (2610.0, None, None)))      # real touch, close 2608 < L
+        return res
+    base = scen(None)
+    vs = {v_: scen(v_) for v_ in ("near_strict", "near_close", "shift_close", "body_on_touch", "stored_rebound")}
+    pm = [S11.replace("low - lp <= stSatsNearD", "low - lp < stSatsNearD"),
+          S11.replace("lp - high <= stSatsNearD", "lp - close <= stSatsNearD"),
+          S11.replace("bool touchNow  = touchHit or touchNear", "bool touchNow  = touchHit or touchNear and bodyOK"),
+          S11.replace("            bool bodyOK  = not stSatsBody or (pwSide == 1 ? close > open : close < open)\n", "")
+                .replace("if (rebA or rebB) and bodyOK and", "if (rebA or rebB) and"),
+          S11.replace("bool touchNear = stSatsNear and inRange and", "bool touchNear = inRange and"),
+          S11.replace("close > open : close < open", "close >= open : close <= open")]
+    check("XY-08 mutations: strict boundary, near measured from the close, rebound level shifted by the distance, the body "
+          "limiting the touch record, a stored rebound are each caught by the model scenarios; the matching Pine edits (and "
+          "near without its switch, a doji allowed, body removed) do not strip back to ae2c2e8",
+          all(vs[k] != base for k in vs) and all(m != S11 and xb.strip_strategy11(m) is None for m in pm),
+          str((base, vs)))
+
+
 def main():
-    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10):
+    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11):
         try:
             g()
         except Exception:
