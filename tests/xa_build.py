@@ -1073,6 +1073,59 @@ STRATEGY_EDITS14 = [
 ]
 
 
+# ---- XA-15: Breakeven Trigger Mode (Strategy only; after XA-14) ---------------------------------------------------------
+#  Only the profit distance that triggers the existing breakeven move changes: Fixed Distance (default = stBEDist, the old
+#  test, no new distance check) / Risk Multiple (side x (oFill - oSL) x R) / TP Progress (side x (oTP - oFill) x ratio),
+#  from the fill-confirmed oFill / initial oSL / the TP actually set (oTP); na or a base distance <= 0 -> no move for the new
+#  modes. Timing, high / low (fav := close on the limit-fill bar), >=, next-bar stop, move to oFill, once per trade, TP /
+#  qty / order order unchanged. Data window: 1R, fill -> TP, trigger distance and price. strip_strategy15() -> e2cf617.
+STRATEGY_EDITS15 = [
+    ("header",
+     "//  年別の検証は未確認)。初期状態では Short は 4H・1H が両方青、Long は両方赤のときだけ見送る。判定・計算・他の設定は変えない。\n",
+     "//  年別の検証は未確認)。初期状態では Short は 4H・1H が両方青、Long は両方赤のときだけ見送る。判定・計算・他の設定は変えない。\n"
+     "//  XA-15: 建値移動の Trigger 方式 (比較用。初期 Fixed Distance 15 USD = 従来どおり)。Risk Multiple = 実約定価格から初期 SL までの\n"
+     "//  距離 × R / TP Progress = 実約定価格から実際の TP までの距離 × 比率。判断・注文更新は従来の確定 5分足の建値処理のまま。\n"),
+    ("input",
+     'stBEDist = input.float(15.0, "Breakeven Trigger ($)", minval = 0.0, step = 0.5, group = G_STT)\n',
+     'stBEDist = input.float(15.0, "Breakeven Trigger ($)", minval = 0.0, step = 0.5, group = G_STT)\n'
+     'stBEMode = input.string("Fixed Distance", "Breakeven Trigger Mode", options = ["Fixed Distance", "Risk Multiple", "TP Progress"], group = G_STT,\n'
+     '     tooltip = "XA-15 比較用 (初期 Fixed Distance = 従来の固定幅 Breakeven Trigger ($))。選択した方式の入力だけを使う。\\n" +\n'
+     '     "Risk Multiple: 1R = 実約定価格から初期 SL までの距離。含み益が 1R × 倍率に届いたら建値へ。\\n" +\n'
+     '     "TP Progress: 実約定価格から実際に設定した TP までの距離 × 比率 (0.5TP = TP までの半分進んだ)。TP 価格や TP Fixed RR に掛けない。\\n" +\n'
+     '     "RR 方式 / TP 比率方式でも判断・注文更新は従来の確定 5分足処理 (Long は high / Short は low、等値で成立、次の足から有効)。")\n'
+     'stBER = input.float(1.0, "Breakeven Trigger (R)", minval = 0.1, step = 0.1, group = G_STT)\n'
+     'stBETp = input.float(0.5, "Breakeven Trigger (TP Ratio)", minval = 0.05, maxval = 1.0, step = 0.05, group = G_STT)\n'),
+    ("trigger",
+     "    [skip, tp]\n\nvar array<StCand>  stPrev = array.new<StCand>()\n",
+     "    [skip, tp]\n"
+     "\n"
+     "// XA-15: 建値移動に必要な含み益幅。Fixed Distance = stBEDist (従来どおり、距離検査を追加しない) / Risk Multiple = 初期リスク距離\n"
+     "//  side × (実約定価格 − 初期 SL) × R / TP Progress = side × (TP − 実約定価格) × 比率。新方式は基準距離が na / 0 以下なら na (移動しない)\n"
+     "f_beTrig(int side, float fillPx, float sl, float tp) =>\n"
+     "    float r  = side * (fillPx - sl)\n"
+     "    float tg = side * (tp - fillPx)\n"
+     '    stBEMode == "Risk Multiple" ? (not na(r) and r > 0 ? r * stBER : na) :\n'
+     '     stBEMode == "TP Progress" ? (not na(tg) and tg > 0 ? tg * stBETp : na) : stBEDist\n'
+     "\n"
+     "var array<StCand>  stPrev = array.new<StCand>()\n"),
+    ("trigger",
+     "    // (2c) 建値移動: この確定足で含み益が Trigger に届いたら stop を約定価格へ (次の足から有効)\n",
+     "    // (2c) 建値移動: この確定足で含み益が Trigger に届いたら stop を約定価格へ (次の足から有効)\n"
+     "    //   XA-15: Trigger 幅は選択した方式 (約定確認時の oFill / 初期 oSL / 設定した oTP から。oStop は使わない)。na なら移動しない\n"),
+    ("trigger",
+     "        if oSide * (fav - oFill) >= stBEDist\n",
+     "        float beTrig = f_beTrig(oSide, oFill, oSL, oTP)\n"
+     "        if not na(beTrig) and oSide * (fav - oFill) >= beTrig\n"),
+    ("plot",
+     'plot(oState == 2 ? oTP : na,           "ST · TP",                display = display.data_window)\n',
+     'plot(oState == 2 ? oTP : na,           "ST · TP",                display = display.data_window)\n'
+     'plot(oState == 2 ? oSide * (oFill - oSL) : na, "ST · BE 1R (実約定価格〜初期 SL)", display = display.data_window)\n'
+     'plot(oState == 2 ? oSide * (oTP - oFill) : na, "ST · BE 実約定価格〜TP の距離", display = display.data_window)\n'
+     'plot(oState == 2 ? f_beTrig(oSide, oFill, oSL, oTP) : na, "ST · BE Trigger 幅 (選択方式)", display = display.data_window)\n'
+     'plot(oState == 2 ? oFill + oSide * f_beTrig(oSide, oFill, oSL, oTP) : na, "ST · BE Trigger 価格", display = display.data_window)\n'),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -1271,8 +1324,13 @@ def build_strategy13():
     return _apply(build_strategy12(), STRATEGY_EDITS13)
 
 
-def build_strategy():
+def build_strategy14():
+    """XA-1 .. XA-14 (commit e2cf617)."""
     return _apply(build_strategy13(), STRATEGY_EDITS14)
+
+
+def build_strategy():
+    return _apply(build_strategy14(), STRATEGY_EDITS15)
 
 
 def strip_visual3(t):
@@ -1292,8 +1350,15 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy15(t):
+    """reverse only XA-15 (-> the Strategy of e2cf617 byte for byte)."""
+    return _revert(t, STRATEGY_EDITS15)
+
+
 def strip_strategy14(t):
-    """reverse only XA-14 (-> the Strategy of e5bba44 byte for byte)."""
+    """reverse XA-15 when present (all or nothing) and XA-14 (-> the Strategy of e5bba44 byte for byte)."""
+    if t is not None and STRATEGY_EDITS15[0][2] in t:
+        t = strip_strategy15(t)
     return _revert(t, STRATEGY_EDITS14)
 
 

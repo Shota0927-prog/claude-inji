@@ -29,8 +29,10 @@
        SATS order test only, a skip changes nothing
   XJ : XA-14 on the delivered Strategy — adopted defaults of the XA-13 filter (4H / 1H ON, D / 15m / 5m OFF) and the text naming
        them; nothing else
-  (XW / XP / XQ run on the XA-7 layer, XV on XA-8, XN on XA-9, XZ on XA-10, XY on XA-11, XK on XA-12, XH on XA-13: the Strategy
-  with exactly the later edits reverted; the Visual through strip_visual7)
+  XB : XA-15 on the delivered Strategy — Breakeven Trigger Mode (Fixed Distance default = the old test / Risk Multiple from the
+       fill and the initial SL / TP Progress from the fill and the TP actually set); only the trigger distance changes
+  (XW / XP / XQ run on the XA-7 layer, XV on XA-8, XN on XA-9, XZ on XA-10, XY on XA-11, XK on XA-12, XH on XA-13, XJ on XA-14:
+  the Strategy with exactly the later edits reverted; the Visual through strip_visual7)
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile, SATS line values vs the source indicator, Strategy Tester external).
 """
@@ -1271,13 +1273,13 @@ def gate_xa13():
 
 # ---- XA-14: adopted defaults of the XA-13 filter ----------------------------------------------------------------------------
 def gate_xa14():
-    S14, S13 = rd(xb.STR_PATH), xb.show("e5bba44", xb.STR_PATH)
+    S14, S13 = xb.strip_strategy15(rd(xb.STR_PATH)) or "", xb.show("e5bba44", xb.STR_PATH)   # XA-14 layer (XA-15 reverted exactly)
     i14, i13 = input_values(S14), input_values(S13)
     d = {k: (i13.get(k), i14.get(k)) for k in set(i13) | set(i14) if i13.get(k) != i14.get(k)}
     cs = sorted(l for l in es.changed_code(S13, S14) if l and not l.startswith('"') and not l.startswith("tooltip"))
     check("XJ-01 XA-14: Strategy == xa_build.build_strategy() (XA-1 .. XA-14); strip_strategy14 gives e5bba44 byte for byte "
           "(strip_strategy13 gives f9fa0f9); Engine / Visual / other Pine files unchanged",
-          xb.build_strategy() == S14 and xb.strip_strategy14(S14) == S13 and xb.build_strategy13() == S13
+          xb.build_strategy14() == S14 and xb.strip_strategy14(S14) == S13 and xb.build_strategy13() == S13
           and xb.strip_strategy13(S14) == xb.show("f9fa0f9", xb.STR_PATH)
           and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and rd(p) != xb.show("e5bba44", p)])
     check("XJ-02 defaults: exactly 4H false -> true and 1H false -> true (D / 15m / 5m stay false, still inputs); every other "
@@ -1310,8 +1312,145 @@ def gate_xa14():
           and not skip13(sel, {"4": 1, "1": 1}, -1))
 
 
+# ---- XA-15: Breakeven Trigger Mode ----------------------------------------------------------------------------------------
+def be_trig(mode, side, fill, sl, tp, dist=15.0, r_mult=1.0, tp_ratio=0.5):
+    """port of f_beTrig (None = na)."""
+    r = side * (fill - sl) if fill is not None and sl is not None else None
+    g = side * (tp - fill) if fill is not None and tp is not None else None
+    if mode == "Risk Multiple":
+        return r * r_mult if r is not None and r > 0 else None
+    if mode == "TP Progress":
+        return g * tp_ratio if g is not None and g > 0 else None
+    return dist
+
+
+def be_run(side, fill, sl, tp, bars, mode="Fixed Distance", on=True, limit_fill_bar=False, old=False, **kw):
+    """port of block (2c) over the fill bar and later confirmed bars (o, h, l, c); returns (bar index of the move, stop)."""
+    stop, moved = sl, None
+    for i, (o, h, l, c) in enumerate(bars):
+        if not on or moved is not None:
+            continue
+        fav = h if side == 1 else l
+        if i == 0 and limit_fill_bar and fill != o:
+            fav = c
+        if old:
+            hit = side * (fav - fill) >= kw.get("dist", 15.0)
+        else:
+            tg = be_trig(mode, side, fill, sl, tp, **kw)
+            hit = tg is not None and side * (fav - fill) >= tg
+        if hit:
+            moved, stop = i, fill
+    return moved, stop
+
+
+def gate_xa15():
+    S15, S14 = rd(xb.STR_PATH), xb.show("e2cf617", xb.STR_PATH)
+    i15, i14 = input_values(S15), input_values(S14)
+    new = {k: v for k, v in i15.items() if k not in i14}
+    decl = input_decls(S15)
+    cs = sorted(l for l in es.changed_code(S14, S15) if l and not l.startswith('"') and not l.startswith("tooltip"))
+    check("XB-01 XA-15: Strategy == xa_build.build_strategy() (XA-1 .. XA-15); strip_strategy15 gives e2cf617 byte for byte; new "
+          "inputs Breakeven Trigger Mode (Fixed Distance default; options Fixed Distance / Risk Multiple / TP Progress), R 1.0 "
+          "(min 0.1, step 0.1), TP Ratio 0.5 (min 0.05, max 1.0, step 0.05); every older default unchanged (BE ON / 15, filter "
+          "4H / 1H, SATS / Retest / C / Short Only / 240 / body / near 1.0 / SL 1.5 / opposite TP OFF / RR 1.5 / 300,000 x 3 %); "
+          "Engine / Visual / other Pine files unchanged",
+          xb.build_strategy() == S15 and xb.strip_strategy15(S15) == S14 and xb.build_strategy14() == S14
+          and new == {"stBEMode": '"Fixed Distance"', "stBER": "1.0", "stBETp": "0.5"}
+          and 'options = ["Fixed Distance", "Risk Multiple", "TP Progress"]' in decl["stBEMode"]
+          and es.kw(decl["stBER"], "minval") == "0.1" and es.kw(decl["stBER"], "step") == "0.1"
+          and es.kw(decl["stBETp"], "minval") == "0.05" and es.kw(decl["stBETp"], "maxval") == "1.0" and es.kw(decl["stBETp"], "step") == "0.05"
+          and all(i15[k] == v for k, v in i14.items()) and i15["stBE"] == "true" and i15["stBEDist"] == "15.0"
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and rd(p) != xb.show("e2cf617", p)])
+    be14 = block(S14, "    if stBE and oState == 2 and not oBE\n", "    // (2d)")
+    be15 = block(S15, "    if stBE and oState == 2 and not oBE\n", "    // (2d)")
+    fb = func(S15, "f_beTrig(int side, float fillPx, float sl, float tp) =>")
+    old_lines = [l for l in cs if l in [x.strip() for x in code_only(S14).split("\n")]]
+    check("XB-02 static: the only changed old line is the trigger test (>= stBEDist -> not na(beTrig) and >= beTrig with beTrig = "
+          "f_beTrig(oSide, oFill, oSL, oTP)); the breakeven block is otherwise identical (fav high / low, fav := close on the "
+          "limit-fill bar, oBE once, stop := oFill, the same exit); f_beTrig: Fixed -> stBEDist (no distance check), Risk Multiple "
+          "-> side x (fill - SL) x R only when > 0, TP Progress -> side x (TP - fill) x ratio only when > 0 (no stRR / TP price "
+          "multiplication, no oStop / P0 / close); no new strategy.* call and no new oSL / oTP / oFill / qty assignment",
+          old_lines == ["if oSide * (fav - oFill) >= stBEDist"]
+          and be15.replace("        float beTrig = f_beTrig(oSide, oFill, oSL, oTP)\n        if not na(beTrig) and oSide * (fav - oFill) >= beTrig\n",
+                           "        if oSide * (fav - oFill) >= stBEDist\n") == be14
+          and "    float r  = side * (fillPx - sl)" in fb and "    float tg = side * (tp - fillPx)" in fb
+          and '"Risk Multiple" ? (not na(r) and r > 0 ? r * stBER : na)' in fb and '"TP Progress" ? (not na(tg) and tg > 0 ? tg * stBETp : na) : stBEDist' in fb
+          and not re.search(r"stRR|oStop|pwP0|close", fb) and fb.count("stBEDist") == 1 and fb.count("stBER") == 1 and fb.count("stBETp") == 1
+          and len(re.findall(r"strategy\.(entry|exit|close|cancel)\(", code_only(S15))) == len(re.findall(r"strategy\.(entry|exit|close|cancel)\(", code_only(S14)))
+          and all(code_only(S15).count(x) == code_only(S14).count(x) for x in ("oSL     :=", "oTP   :=", "oFill   :=", "oStop :=", "qty = "))
+          and S15.count("f_beTrig(") == 4, "\n".join(cs))
+    ex = {
+        "Short 1R -> 2600": 2610 + -1 * be_trig("Risk Multiple", -1, 2610, 2620, 2570) == 2600,
+        "Short 0.5TP -> 2590": 2610 + -1 * be_trig("TP Progress", -1, 2610, 2620, 2570) == 2590,
+        "Short fixed 15 -> 2595": 2610 + -1 * be_trig("Fixed Distance", -1, 2610, 2620, 2570) == 2595,
+        "Long 1R -> 2610": 2600 + be_trig("Risk Multiple", 1, 2600, 2590, 2630) == 2610,
+        "Long 0.5TP -> 2615": 2600 + be_trig("TP Progress", 1, 2600, 2590, 2630) == 2615,
+        "Long 1.5R -> 2615": 2600 + be_trig("Risk Multiple", 1, 2600, 2590, 2630, r_mult=1.5) == 2615,
+        "Long 0.25TP -> 2607.5": 2600 + be_trig("TP Progress", 1, 2600, 2590, 2630, tp_ratio=0.25) == 2607.5,
+        "gap fill (P0 2600, fill 2604 Short): 1R from the fill": be_trig("Risk Multiple", -1, 2604, 2620, 2570) == 16 and be_trig("TP Progress", -1, 2604, 2620, 2570) == 17,
+        "na / 0 / negative -> na (new modes)": all(be_trig(m, -1, f, s, tp) is None for m, f, s, tp in
+                                                   (("Risk Multiple", None, 2620, 2570), ("Risk Multiple", 2620, 2620, 2570), ("Risk Multiple", 2625, 2620, 2570),
+                                                    ("TP Progress", 2610, 2620, None), ("TP Progress", 2570, 2620, 2570), ("TP Progress", 2560, 2620, 2570))),
+        "fixed keeps 15 whatever the distances": be_trig("Fixed Distance", -1, 2625, 2620, 2630) == 15.0,
+    }
+    s_bars = [(2610, 2612, 2604, 2606), (2606, 2607, 2600.5, 2601), (2601, 2602, 2600, 2601), (2601, 2601, 2590, 2592)]
+    eq = (be_run(-1, 2610, 2620, 2570, s_bars, "Risk Multiple"), be_run(-1, 2610, 2620, 2570, s_bars[:2], "Risk Multiple"),
+          be_run(-1, 2610, 2620, 2570, s_bars, "TP Progress"), be_run(-1, 2610, 2620, 2570, s_bars, "Fixed Distance"))
+    check("XB-03 model: the request examples (Short fill 2610 / SL 2620 / TP 2570: 1R 2600, 0.5TP 2590, fixed 2595; Long fill 2600 / "
+          "SL 2590 / TP 2630: 1R 2610, 0.5TP 2615), 1.5R, 0.25TP, a gap fill (from the fill, not P0), na / 0 / negative base -> no "
+          "move (fixed unchanged); the move happens on the bar that reaches the trigger exactly (low 2600 -> 1R), not before "
+          "(2600.5); 0.5TP (2590) and fixed 15 (2595) move on the bar with low 2590; the stop becomes the fill",
+          all(ex.values()) and eq[0] == (2, 2610) and eq[1] == (None, 2620) and eq[2] == (3, 2610) and eq[3] == (3, 2610),
+          str(([k for k, v in ex.items() if not v], eq)))
+    random.seed(1501)
+    same_fixed = off_none = unsel = True
+    for _ in range(2000):
+        side = random.choice((1, -1))
+        fill = round(2600 + random.uniform(-5, 5), 1)
+        sl = fill - side * round(random.uniform(-2, 20), 1)
+        tp = fill + side * round(random.uniform(-5, 50), 1)
+        bars, px = [], fill
+        for _ in range(12):
+            o = px
+            c = round(o + random.uniform(-6, 6), 1)
+            bars.append((o, max(o, c) + round(random.uniform(0, 4), 1), min(o, c) - round(random.uniform(0, 4), 1), c))
+            px = c
+        lf = random.random() < 0.3
+        dist = random.choice((5.0, 15.0, 0.0))
+        same_fixed &= be_run(side, fill, sl, tp, bars, "Fixed Distance", limit_fill_bar=lf, dist=dist) == \
+            be_run(side, fill, sl, tp, bars, old=True, limit_fill_bar=lf, dist=dist)
+        off_none &= all(be_run(side, fill, sl, tp, bars, m, on=False) == (None, sl) for m in ("Fixed Distance", "Risk Multiple", "TP Progress"))
+        unsel &= be_run(side, fill, sl, tp, bars, "Fixed Distance", r_mult=0.1, tp_ratio=0.05) == be_run(side, fill, sl, tp, bars, "Fixed Distance", r_mult=5, tp_ratio=1.0) \
+            and be_run(side, fill, sl, tp, bars, "Risk Multiple", dist=0.0, tp_ratio=0.05) == be_run(side, fill, sl, tp, bars, "Risk Multiple", dist=99.0, tp_ratio=1.0) \
+            and be_run(side, fill, sl, tp, bars, "TP Progress", dist=0.0, r_mult=0.1) == be_run(side, fill, sl, tp, bars, "TP Progress", dist=99.0, r_mult=5)
+    mirror = all(be_run(1, 2600, 2590, 2630, [(o, h, l, c) for o, h, l, c in b], m) ==
+                 be_run(-1, 2600, 2610, 2570, [(5200 - o, 5200 - l, 5200 - h, 5200 - c) for o, h, l, c in b], m)[0:1] + (2600,) and True
+                 for m in ("Risk Multiple", "TP Progress", "Fixed Distance")
+                 for b in ([(2600, 2605, 2598, 2604), (2604, 2610, 2603, 2609), (2609, 2616, 2608, 2615)],))
+    check("XB-04 model: Fixed Distance == the previous rule on 2,000 random trades (Long / Short, limit-fill bar fav := close, "
+          "distance 0 / 5 / 15, negative or odd base distances); BE OFF -> no mode moves; the inputs of the unselected modes do not "
+          "change anything; Long / Short mirror",
+          same_fixed and off_none and unsel and mirror, str((same_fixed, off_none, unsel, mirror)))
+    zone_tp, rr_tp = 2585.0, 2610 - 1.5 * 10
+    muts = [S15.replace("        float beTrig = f_beTrig(oSide, oFill, oSL, oTP)\n", "        float beTrig = f_beTrig(oSide, oFill, oStop, oTP)\n"),
+            S15.replace("    float tg = side * (tp - fillPx)\n", "    float tg = side * (fillPx + side * stRR * (side * (fillPx - sl)) - fillPx)\n"),
+            S15.replace("(not na(tg) and tg > 0 ? tg * stBETp : na)", "(not na(tp) ? tp * stBETp : na)"),
+            S15.replace("if not na(beTrig) and oSide * (fav - oFill) >= beTrig", "if not na(beTrig) and oSide * (fav - oFill) > beTrig"),
+            S15.replace("if not na(beTrig) and oSide * (fav - oFill) >= beTrig", "if not na(beTrig) and oSide * (close - oFill) >= beTrig"),
+            S15.replace("        float beTrig = f_beTrig(oSide, oFill, oSL, oTP)\n", "        float beTrig = f_beTrig(oSide, pwP0, oSL, oTP)\n"),
+            S15.replace('     stBEMode == "TP Progress" ? (not na(tg) and tg > 0 ? tg * stBETp : na) : stBEDist\n',
+                        '     stBEMode == "TP Progress" ? (not na(tg) and tg > 0 ? tg * stBETp : na) : (r > 0 ? stBEDist : na)\n')]
+    check("XB-05 TP Progress uses the TP actually set (a zone TP 2585 gives 12.5, the fixed-RR TP %.1f would give 7.5 — they differ), "
+          "and the initial SL survives the move (after oStop = fill the 1R would be 0); mutations (oStop as the base, TP from stRR, "
+          "TP price x ratio, strict >, close instead of high / low, P0 instead of the fill, a distance check on Fixed) do not strip "
+          "back to e2cf617" % rr_tp,
+          be_trig("TP Progress", -1, 2610, 2620, zone_tp) == 12.5 and be_trig("TP Progress", -1, 2610, 2620, rr_tp) == 7.5
+          and be_trig("Risk Multiple", -1, 2610, 2610, 2570) is None and be_trig("Risk Multiple", -1, 2610, 2620, 2570) == 10
+          and all(m != S15 and xb.strip_strategy15(m) is None for m in muts))
+
+
 def main():
-    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12, gate_xa13, gate_xa14):
+    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12, gate_xa13, gate_xa14, gate_xa15):
         try:
             g()
         except Exception:
