@@ -22,7 +22,10 @@
   XY : XA-11 on the delivered Strategy — two independent comparison inputs (default OFF): (1) the order bar itself bullish /
        bearish together with rebound A or B of that bar; (2) a near approach (USD distance, t-1 line L) counts as the touch,
        the close-back keeps the original L; both OFF = the XA-10 path
-  (XW / XP / XQ run on the XA-7 layer, XV on XA-8, XN on XA-9, XZ on XA-10: the Strategy with exactly the later edits reverted)
+  XK : XA-12 on the delivered Strategy / Visual — Gold adopted defaults (Entry Timing SATS Pullback, Role Reversal Retest
+       Confirmed in both files, SATS body ON, near ON, near distance 1.0) and the tooltips / comments naming them; nothing else
+  (XW / XP / XQ run on the XA-7 layer, XV on XA-8, XN on XA-9, XZ on XA-10, XY on XA-11: the Strategy with exactly the later
+  edits reverted; the Visual through strip_visual7)
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile, SATS line values vs the source indicator, Strategy Tester external).
 """
@@ -60,7 +63,7 @@ def gate_static():
     check("XW-01 Strategy == xa_build.build_strategy() (XA-1 .. XA-7); strip_strategy7 gives 0c6cd71 byte for byte; the Engine and "
           "the Visual are byte-identical to 0c6cd71 (no Library re-publish)",
           xb.build_strategy7() == S and xb.strip_strategy7(S) == S0 and xb.build_strategy6() == S0
-          and rd(xb.ENG_PATH) == xb.show(B, xb.ENG_PATH) and rd(xb.VIS_PATH) == xb.show(B, xb.VIS_PATH)
+          and rd(xb.ENG_PATH) == xb.show(B, xb.ENG_PATH) and xb.strip_visual7(rd(xb.VIS_PATH)) == xb.show(B, xb.VIS_PATH)
           and {k for k, _, _ in xb.STRATEGY_EDITS7} == {"header", "input", "sats"})
     fill_old = block(S0, "    if fillNow\n", "    // (2c)")
     fill_new = block(S, "    else if fillNow\n", "    // (2c)")
@@ -121,7 +124,7 @@ def gate_static():
           "feed code before the Strategy part, every other Pine file (Engine, Visual, other symbols)",
           all(func(S, h) == func(S0, h) for h in keep) and seg(S, "strategy(", "import ") == seg(S0, "strategy(", "import ")
           and S[S.index("import "):S.index("var string G_ST =")] == S0[S0.index("import "):S0.index("var string G_ST =")]
-          and not [p for p in others if rd(p) != xb.show(B, p)])
+          and not [p for p in others if (xb.strip_visual7(rd(p)) if p == xb.VIS_PATH else rd(p)) != xb.show(B, p)])
 
 
 # ---- models ------------------------------------------------------------------------------------------------------------
@@ -524,7 +527,7 @@ def gate_xa9():
           "header / touch; Engine / Visual / SATS formula (f_satBand == the source record) unchanged",
           xb.build_strategy9() == S9 and xb.strip_strategy9(S9) == S8 and xb.build_strategy8() == S8
           and {k for k, _, _ in xb.STRATEGY_EDITS9} == {"header", "touch"} and func(S9, "f_satBand() =>").rstrip("\n") + "\n" == SRC
-          and rd(xb.ENG_PATH) == xb.show(B, xb.ENG_PATH) and rd(xb.VIS_PATH) == xb.show(B, xb.VIS_PATH))
+          and rd(xb.ENG_PATH) == xb.show(B, xb.ENG_PATH) and xb.strip_visual7(rd(xb.VIS_PATH)) == xb.show(B, xb.VIS_PATH))
     w = block(S9, "    // (3b) XA-7 / XA-9 SATS Pullback", "    // (4) 新規 Entry")
     ord_old = block(S8, "            else if not skipRef and not na(pQty)\n", "    stPrev := cur")
     ord_new = block(S9, "            else if not skipRef and not na(pQty)\n", "    stPrev := cur")
@@ -782,14 +785,14 @@ class Wait11(Wait9):
 
 
 def gate_xa11():
-    S11, S10 = rd(xb.STR_PATH), xb.show("ae2c2e8", xb.STR_PATH)
+    S11, S10 = xb.strip_strategy12(rd(xb.STR_PATH)) or "", xb.show("ae2c2e8", xb.STR_PATH)   # XA-11 layer (XA-12 reverted exactly)
     ch = es.changed_code(S10, S11)
     code = sorted(l for l in ch if l and not l.startswith('"') and not l.startswith("tooltip"))
     iv = input_values(S11)
     check("XY-01 XA-11: Strategy == xa_build.build_strategy() (XA-1 .. XA-11); strip_strategy11 gives ae2c2e8 byte for byte "
           "(strip_strategy10 gives 3ca1837); code changes = 3 inputs, touchNow -> touchHit or touchNear, bodyOK in the order "
           "condition, the A-counter plot title; new inputs default OFF / OFF / 3.0 (min 0, step 0.5); every older default kept",
-          xb.build_strategy() == S11 and xb.strip_strategy11(S11) == S10 and xb.build_strategy10() == S10
+          xb.build_strategy11() == S11 and xb.strip_strategy11(S11) == S10 and xb.build_strategy10() == S10
           and xb.strip_strategy10(S11) == xb.show("3ca1837", xb.STR_PATH)
           and code == sorted([
               "bool touchNow = inRange and low <= lp and lp <= high",
@@ -960,8 +963,59 @@ def gate_xa11():
           str((base, vs)))
 
 
+# ---- XA-12: Gold adopted defaults ------------------------------------------------------------------------------------------
+def gate_xa12():
+    P = "d64258b"
+    S12, V12 = rd(xb.STR_PATH), rd(xb.VIS_PATH)
+    S11, V11 = xb.show(P, xb.STR_PATH), xb.show(P, xb.VIS_PATH)
+    check("XK-01 XA-12: Strategy / Visual == xa_build.build_strategy() / build_visual(); strip_strategy12 / strip_visual7 give the "
+          "d64258b files byte for byte; the Engine (and its import) unchanged",
+          xb.build_strategy() == S12 and xb.build_visual() == V12 and xb.strip_strategy12(S12) == S11
+          and xb.strip_visual7(V12) == V11 and xb.build_strategy11() == S11 and xb.build_visual6() == V11
+          and rd(xb.ENG_PATH) == xb.show(P, xb.ENG_PATH)
+          and "import sekine3310/ZoneEnginePracticalXAUUSD/2 as zn" in S12 and "import sekine3310/ZoneEnginePracticalXAUUSD/2 as zn" in V12)
+    s12, s11, v12, v11 = input_values(S12), input_values(S11), input_values(V12), input_values(V11)
+    ds = {k: (s11.get(k), s12.get(k)) for k in set(s11) | set(s12) if s11.get(k) != s12.get(k)}
+    dv = {k: (v11.get(k), v12.get(k)) for k in set(v11) | set(v12) if v11.get(k) != v12.get(k)}
+    check("XK-02 defaults: Strategy changes exactly Entry Timing Current -> SATS Pullback, Role Reversal Confirmed Break -> "
+          "Retest Confirmed, SATS body false -> true, SATS near false -> true, near distance 3.0 -> 1.0; Visual exactly Role "
+          "Reversal (no SATS input added to the Visual); every shared Zone input equal in both files",
+          ds == {"stTiming": ('"Current"', '"SATS Pullback"'), "roleMode": ('"Confirmed Break"', '"Retest Confirmed"'),
+                 "stSatsBody": ("false", "true"), "stSatsNear": ("false", "true"), "stSatsNearD": ("3.0", "1.0")}
+          and dv == {"roleMode": ('"Confirmed Break"', '"Retest Confirmed"')} and not any(k.startswith("stSats") for k in v12)
+          and all(s12[k] == v12[k] for k in s12 if k in v12) and len([k for k in s12 if k in v12]) > 50, str((ds, dv)))
+    cs = sorted(l for l in es.changed_code(S11, S12) if l and not l.startswith('"') and not l.startswith("tooltip"))
+    cv = sorted(l for l in es.changed_code(V11, V12) if l and not l.startswith('"') and not l.startswith("tooltip"))
+    role = ['roleMode = input.string("Confirmed Break", "Role Reversal Mode", options = ["Retest Confirmed", "Confirmed Break"], group = G_BF,',
+            'roleMode = input.string("Retest Confirmed", "Role Reversal Mode", options = ["Retest Confirmed", "Confirmed Break"], group = G_BF,']
+    check("XK-03 only defaults and text: the changed code lines are the five input declarations' first lines (the rest are "
+          "tooltip strings / comments); no calculation, order path, SATS formula, quantity, TP / BE or alert line changes; every "
+          "option kept (Current / Confirmed Break / OFF selectable)",
+          cs == sorted(role + [
+              'stTiming = input.string("Current", "Entry Timing", options = ["Current", "SATS Pullback"], group = G_STW,',
+              'stTiming = input.string("SATS Pullback", "Entry Timing", options = ["Current", "SATS Pullback"], group = G_STW,',
+              'stSatsBody = input.bool(false, "SATS · 反発確認足の陽線／陰線を要求", group = G_STW,',
+              'stSatsBody = input.bool(true, "SATS · 反発確認足の陽線／陰線を要求", group = G_STW,',
+              'stSatsNear = input.bool(false, "SATS · 近接を接触扱い", group = G_STW,',
+              'stSatsNear = input.bool(true, "SATS · 近接を接触扱い", group = G_STW,',
+              'stSatsNearD = input.float(3.0, "SATS · 近接許容距離 ($)", minval = 0.0, step = 0.5, group = G_STW,',
+              'stSatsNearD = input.float(1.0, "SATS · 近接許容距離 ($)", minval = 0.0, step = 0.5, group = G_STW,'])
+          and cv == sorted(role) and {k for k, _, _ in xb.STRATEGY_EDITS12} == {"header", "text", "default"}
+          and {k for k, _, _ in xb.VISUAL_EDITS7} == {"header", "text", "default"}, "\n".join(cs + ["--"] + cv))
+    keep = {"stMode": '"C: Candle Pattern"', "stDir": '"Short Only"', "stSatsWait": "240", "stBuffer": "1.5", "stTpZone": "false",
+            "stRR": "1.5", "stBE": "true", "stBEDist": "15.0", "stCapBase": "300000.0", "stRiskPct": "3.0"}
+    check("XK-04 kept: Entry C, Short Only, SATS wait 240, SL Buffer 1.5, opposite-zone TP OFF, RR 1.5, BE ON / 15, 300,000 JPY "
+          "capital / 300,000 x 3 % budget; the tooltips no longer call Current / Confirmed Break / OFF / 3 the default and say "
+          "'Gold Short の比較から採用した初期値。検証継続中'",
+          all(s12[k] == v for k, v in keep.items()) and "initial_capital        = 300000," in S12 and "currency.JPY" in S12
+          and all(x not in S12 + V12 for x in ("Current (初期)", "Confirmed Break (初期)", "比較用 (初期 OFF)", "(初期 Confirmed Break。",
+                                               "(初期 Current ="))
+          and S12.count("Gold Short の比較から採用した初期値。検証継続中") == 6 and V12.count("Gold Short の比較から採用した初期値。検証継続中") == 2
+          and "Retest Confirmed (初期)" in S12 and "Retest Confirmed (初期)" in V12)
+
+
 def main():
-    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11):
+    for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12):
         try:
             g()
         except Exception:

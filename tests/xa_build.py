@@ -888,6 +888,74 @@ STRATEGY_EDITS11 = [
 ]
 
 
+# ---- XA-12: Gold adopted defaults (Strategy after XA-11, Visual after XA-6) ---------------------------------------------
+#  Defaults and the tooltips / comments that named the old defaults only: Role Reversal Mode Confirmed Break -> Retest
+#  Confirmed (Zone setting, Strategy and Visual); Strategy only: Entry Timing Current -> SATS Pullback, SATS order-bar body
+#  OFF -> ON, SATS near touch OFF -> ON, near distance 3.0 -> 1.0. Every option / code path is kept for comparison and roll
+#  back. strip_visual7() -> the Visual of d64258b, strip_strategy12() -> the Strategy of d64258b.
+NOTE12 = "Gold Short の比較から採用した初期値。検証継続中で、最適値・将来の有効性は未確認"
+ZONE_EDITS12 = [
+    ("text",
+     "//  XA-6: Role Reversal Mode (初期 Confirmed Break。Engine ZoneEnginePracticalXAUUSD version 2): 確定した Break 評価足の終値が\n",
+     "//  XA-6: Role Reversal Mode (XA-6 時点の初期 Confirmed Break、XA-12 から初期 Retest Confirmed。Engine ZoneEnginePracticalXAUUSD\n"
+     "//  version 2): Confirmed Break は確定した Break 評価足の終値が\n"),
+    ("text",
+     "Retest Confirmed = 変更前の方式 (比較・切り戻し用)。\n",
+     "Retest Confirmed = 変更前の方式 (XA-12 から初期)。\n"),
+    ("default",
+     'roleMode = input.string("Confirmed Break", "Role Reversal Mode", options = ["Retest Confirmed", "Confirmed Break"], group = G_BF,\n'
+     '     tooltip = "Confirmed Break (初期): ',
+     'roleMode = input.string("Retest Confirmed", "Role Reversal Mode", options = ["Retest Confirmed", "Confirmed Break"], group = G_BF,\n'
+     '     tooltip = "Confirmed Break (比較・切り戻し用): '),
+    ("text",
+     '"Flip イベント・Flip Bonus は確認成立時だけ。Retest Confirmed: 変更前の方式 (Break → BROKEN → Retest → Flip Confirm)。比較・切り戻し用。")\n',
+     '"Flip イベント・Flip Bonus は確認成立時だけ。Retest Confirmed (初期): 変更前の方式 (Break → BROKEN → Retest → Flip Confirm)。\\n" +\n'
+     '     "' + NOTE12 + '。")\n'),
+]
+VISUAL_EDITS7 = [
+    ("header",
+     "//  成績への影響は未確認。数値・Zone 生成 / 採点・上位足取得・Break feed は変えない。\n",
+     "//  成績への影響は未確認。数値・Zone 生成 / 採点・上位足取得・Break feed は変えない。\n"
+     "//  XA-12: " + NOTE12 + ": Role Reversal Mode Retest Confirmed (Strategy と共通の Zone 設定)。\n"),
+] + ZONE_EDITS12
+STRATEGY_EDITS12 = [
+    ("header",
+     "//  ② 線 L の手前 (許容距離 $ 以内) までの接近も接触扱い (終値の戻りは元の L で判定)。成績への影響は未確認。\n",
+     "//  ② 線 L の手前 (許容距離 $ 以内) までの接近も接触扱い (終値の戻りは元の L で判定)。成績への影響は未確認。\n"
+     "//  XA-12: " + NOTE12 + ": Entry Timing SATS Pullback、Role Reversal Mode Retest Confirmed\n"
+     "//  (Visual と共通)、SATS 陽線 / 陰線要求 ON、SATS 近接を接触扱い ON・許容距離 1.0 USD。他の設定・処理は変えない\n"
+     "//  (Current / Confirmed Break / 各 OFF は比較・切り戻し用に残す)。\n"),
+] + ZONE_EDITS12 + [
+    ("text",
+     "//  XA-7: Entry Timing (初期 Current = 変更前の発注方式)。",
+     "//  XA-7: Entry Timing (Current = 変更前の発注方式。XA-12 から初期 SATS Pullback)。"),
+    ("text",
+     "//  XA-11: SATS の比較用設定 2 つ (独立・初期 OFF、両方 OFF は XA-10 と同じ)。",
+     "//  XA-11: SATS の比較用設定 2 つ (独立。XA-11 時点は初期 OFF、XA-12 から初期 ON。両方 OFF は XA-10 と同じ)。"),
+    ("default",
+     'stTiming = input.string("Current", "Entry Timing", options = ["Current", "SATS Pullback"], group = G_STW,\n'
+     '     tooltip = "Current (初期): 変更前の発注方式。\\n" +\n',
+     'stTiming = input.string("SATS Pullback", "Entry Timing", options = ["Current", "SATS Pullback"], group = G_STW,\n'
+     '     tooltip = "Current: 変更前の発注方式 (比較・切り戻し用)。SATS Pullback が初期 (' + NOTE12 + ')。\\n" +\n'),
+    ("default",
+     'stSatsBody = input.bool(false, "SATS · 反発確認足の陽線／陰線を要求", group = G_STW,\n'
+     '     tooltip = "XA-11 比較用 (初期 OFF)。',
+     'stSatsBody = input.bool(true, "SATS · 反発確認足の陽線／陰線を要求", group = G_STW,\n'
+     '     tooltip = "XA-11 (初期 ON = ' + NOTE12 + '。OFF は比較・切り戻し用)。'),
+    ("default",
+     'stSatsNear = input.bool(false, "SATS · 近接を接触扱い", group = G_STW,\n'
+     '     tooltip = "XA-11 比較用 (初期 OFF)。',
+     'stSatsNear = input.bool(true, "SATS · 近接を接触扱い", group = G_STW,\n'
+     '     tooltip = "XA-11 (初期 ON = ' + NOTE12 + '。OFF は比較・切り戻し用)。'),
+    ("default",
+     'stSatsNearD = input.float(3.0, "SATS · 近接許容距離 ($)", minval = 0.0, step = 0.5, group = G_STW,\n'
+     '     tooltip = "XAUUSD の価格差 (ドル)。ATR・pips・終値と線の距離ではない。0 なら実接触だけと同じ。")\n',
+     'stSatsNearD = input.float(1.0, "SATS · 近接許容距離 ($)", minval = 0.0, step = 0.5, group = G_STW,\n'
+     '     tooltip = "XAUUSD の価格差 (ドル)。ATR・pips・終値と線の距離ではない。0 なら実接触だけと同じ。\\n" +\n'
+     '     "初期 1.0 (' + NOTE12 + ')。")\n'),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -990,8 +1058,13 @@ def build_visual5():
     return _apply(build_visual4(), VISUAL_EDITS5)
 
 
-def build_visual():
+def build_visual6():
+    """XA-1 .. XA-6 (commit 0c6cd71 .. d64258b)."""
     return _apply(build_visual5(), VISUAL_EDITS6)
+
+
+def build_visual():
+    return _apply(build_visual6(), VISUAL_EDITS7)
 
 
 def build_engine1():
@@ -1066,8 +1139,13 @@ def build_strategy10():
     return _apply(build_strategy9(), STRATEGY_EDITS10)
 
 
-def build_strategy():
+def build_strategy11():
+    """XA-1 .. XA-11 (commit d64258b)."""
     return _apply(build_strategy10(), STRATEGY_EDITS11)
+
+
+def build_strategy():
+    return _apply(build_strategy11(), STRATEGY_EDITS12)
 
 
 def strip_visual3(t):
@@ -1075,19 +1153,33 @@ def strip_visual3(t):
     return _revert(t, VISUAL_EDITS3)
 
 
+def strip_visual7(t):
+    """reverse only XA-12 on the Visual (-> the Visual of d64258b byte for byte)."""
+    return _revert(t, VISUAL_EDITS7)
+
+
 def strip_visual6(t):
-    """reverse only XA-6 (-> the Visual of cbb996d byte for byte)."""
+    """reverse XA-12 when present (all or nothing) and XA-6 (-> the Visual of cbb996d byte for byte)."""
+    if t is not None and VISUAL_EDITS7[0][2] in t:
+        t = strip_visual7(t)
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy12(t):
+    """reverse only XA-12 (-> the Strategy of d64258b byte for byte)."""
+    return _revert(t, STRATEGY_EDITS12)
+
+
 def strip_strategy11(t):
-    """reverse only XA-11 (-> the Strategy of ae2c2e8 byte for byte)."""
+    """reverse XA-12 when present (all or nothing) and XA-11 (-> the Strategy of ae2c2e8 byte for byte)."""
+    if t is not None and STRATEGY_EDITS12[0][2] in t:
+        t = strip_strategy12(t)
     return _revert(t, STRATEGY_EDITS11)
 
 
 def strip_strategy10(t):
     """reverse XA-11 when present (all or nothing) and XA-10 (-> the Strategy of 3ca1837 byte for byte)."""
-    if t is not None and STRATEGY_EDITS11[0][2] in t:
+    if t is not None and (STRATEGY_EDITS11[0][2] in t or STRATEGY_EDITS12[0][2] in t):   # XA-12 rewrites the XA-11 header line
         t = strip_strategy11(t)
     return _revert(t, STRATEGY_EDITS10)
 
@@ -1115,21 +1207,21 @@ def strip_strategy7(t):
 
 def strip_strategy6(t):
     """reverse XA-7 when present (all or nothing) and XA-6 (-> the Strategy of cbb996d byte for byte)."""
-    if t is not None and STRATEGY_EDITS7[0][2] in t:
+    if t is not None and (STRATEGY_EDITS7[0][2] in t or STRATEGY_EDITS12[0][2] in t):    # XA-12 rewrites the XA-7 header line
         t = strip_strategy7(t)
     return _revert(t, STRATEGY_EDITS6)
 
 
 def strip_visual5(t):
     """reverse XA-6 when present (all or nothing) and XA-5 (-> the Visual of 7363ef1 / a33d2b0 byte for byte)."""
-    if t is not None and VISUAL_EDITS6[0][2] in t:
+    if t is not None and (VISUAL_EDITS6[0][2] in t or VISUAL_EDITS7[0][2] in t):          # XA-12 rewrites the XA-6 header line
         t = strip_visual6(t)
     return _revert(t, VISUAL_EDITS5)
 
 
 def strip_strategy5(t):
     """reverse XA-6 when present (all or nothing) and XA-5 (-> the Strategy of 7363ef1 / a33d2b0 byte for byte)."""
-    if t is not None and STRATEGY_EDITS6[0][2] in t:
+    if t is not None and (STRATEGY_EDITS6[0][2] in t or STRATEGY_EDITS12[0][2] in t):    # XA-12 rewrites the XA-6 header line
         t = strip_strategy6(t)
     return _revert(t, STRATEGY_EDITS5)
 
