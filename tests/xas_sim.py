@@ -1858,14 +1858,14 @@ def cands19(side, bars, lines, nc, k=1, **kw):
 
 
 def gate_xa19():
-    S19, S18 = rd(xb.STR_PATH), xb.show("b7f0036", xb.STR_PATH)
+    S19, S18 = xb.strip_strategy20(rd(xb.STR_PATH)) or "", xb.show("b7f0036", xb.STR_PATH)   # XA-19 layer (XA-20 reverted exactly)
     i19, i18 = input_values(S19), input_values(S18)
     d19 = input_decls(S19)
     new = {k: v for k, v in i19.items() if k not in i18}
     check("XC-01 XA-19: Strategy == xa_build.build_strategy() (XA-1 .. XA-19); strip_strategy19 gives b7f0036 byte for byte; inputs: new "
           "'SATS · 即時側：接触→反発の有効本数' 1 (min 0, step 1), '即時側：反発→Zoneの有効本数' (the former immediate count, 1), "
           "'引きつけ側：接触→反発の有効本数' (renamed, 1); every default unchanged (immediate OFF, pull expiry OFF); other Pine files unchanged",
-          xb.build_strategy() == S19 and xb.strip_strategy19(S19) == S18 and xb.build_strategy18() == S18
+          xb.build_strategy19() == S19 and xb.strip_strategy19(S19) == S18 and xb.build_strategy18() == S18
           and new == {"stSatsNowC": "1"} and all(i19[k] == v for k, v in i18.items())
           and '"SATS · 即時側：接触→反発の有効本数"' in d19["stSatsNowC"] and '"SATS · 即時側：反発→Zoneの有効本数"' in d19["stSatsNowN"]
           and '"SATS · 引きつけ側：接触→反発の有効本数"' in d19["stSatsTqN"]
@@ -1946,9 +1946,45 @@ def gate_xa19():
           all(m != S19 and xb.strip_strategy19(m) != S18 for m in muts))     # never strips back to b7f0036 exactly
 
 
+# ---- XA-20: Gold Short adopted default (immediate entry ON) ----------------------------------------------------------------
+ADOPT20 = {"stSatsWait": "240", "stSatsShow": "true", "stSatsBody": "true", "stSatsNear": "true", "stSatsNearD": "1.0",
+           "stSatsFD": "false", "stSatsF4": "true", "stSatsF1": "true", "stSatsF15": "false", "stSatsF5": "false",
+           "stSatsNow": "true", "stSatsNowC": "1", "stSatsNowN": "1", "stSatsTq": "false", "stSatsTqN": "1"}
+
+
+def gate_xa20():
+    S20, S19 = rd(xb.STR_PATH), xb.show("5f2c8a5", xb.STR_PATH)
+    i20, i19 = input_values(S20), input_values(S19)
+    d = {k: (i19.get(k), i20.get(k)) for k in set(i19) | set(i20) if i19.get(k) != i20.get(k)}
+    cs = sorted(l for l in es.changed_code(S19, S20) if l and not l.startswith('"') and not l.startswith("tooltip"))
+    keep = {"stMode": '"C: Candle Pattern"', "stDir": '"Short Only"', "stTiming": '"SATS Pullback"', "roleMode": '"Retest Confirmed"',
+            "stBuffer": "1.5", "stRR": "1.5", "stBE": "true", "stBEMode": '"Fixed Distance"', "stBEDist": "15.0", "stTpZone": "false",
+            "stCapBase": "300000.0", "stRiskPct": "3.0"}
+    check("XD-01 XA-20: the delivered Strategy == xa_build.build_strategy() (XA-1 .. XA-20); strip_strategy20 gives 5f2c8a5 byte for byte "
+          "(strip_strategy19 gives b7f0036); Engine / Visual / other symbols unchanged",
+          xb.build_strategy() == S20 and xb.strip_strategy20(S20) == S19 and xb.build_strategy19() == S19
+          and xb.strip_strategy19(S20) == xb.show("b7f0036", xb.STR_PATH)
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH
+                   and open(os.path.join(ROOT, p), encoding="utf-8").read() != xb.show("5f2c8a5", p)])
+    check("XD-02 adopted Gold Short table on the delivered file (wait 240, line ON, body ON, near ON / 1.0, filter D OFF / 4H ON / 1H ON / "
+          "15m OFF / 5m OFF, immediate ON, Nc 1, Nz 1, pull expiry OFF / 1); the only changed default is stSatsNow false -> true; every "
+          "unlisted default kept (Entry C, Short Only, SATS Pullback, Retest Confirmed, SL Buffer 1.5, RR 1.5, BE ON / Fixed 15, opposite "
+          "TP OFF, 300,000 JPY x 3 %, capital / currency)",
+          all(i20[k] == v for k, v in ADOPT20.items()) and d == {"stSatsNow": ("false", "true")}
+          and all(i20[k] == v for k, v in keep.items()) and "initial_capital        = 300000," in S20 and "currency.JPY" in S20, str(d))
+    check("XD-03 only the default and its text: the changed code line is the stSatsNow declaration (the rest are its tooltip and header "
+          "comments, which now say 'Gold Short の比較から採用した初期値。Long・将来の有効性は未確認' and no longer call it 初期 OFF); every "
+          "calculation / order line identical; the comparison options (immediate OFF, pull expiry ON) are still selectable",
+          cs == sorted(['stSatsNow = input.bool(false, "SATS · 直近の反発で即時エントリー", group = G_STW,',
+                        'stSatsNow = input.bool(true, "SATS · 直近の反発で即時エントリー", group = G_STW,'])
+          and {k for k, _, _ in xb.STRATEGY_EDITS20} == {"header", "text", "default"}
+          and S20.count("Gold Short の比較から採用した初期値。Long・将来の有効性は未確認") == 2 and "XA-16 比較用 (初期 OFF)" not in S20
+          and "(比較用・初期 OFF / 有効本数 1)" not in S20 and code_only(S20).count("stSatsNow") == code_only(S19).count("stSatsNow"), "\n".join(cs))
+
+
 def main():
     for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12, gate_xa13, gate_xa14, gate_xa15,
-              gate_xa16, gate_xa17, gate_xa18, gate_xa19):
+              gate_xa16, gate_xa17, gate_xa18, gate_xa19, gate_xa20):
         try:
             g()
         except Exception:

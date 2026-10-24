@@ -1468,6 +1468,28 @@ STRATEGY_EDITS19 = [
 ]
 
 
+# ---- XA-20: Gold Short adopted default — immediate entry ON (Strategy only; after XA-19) ----------------------------------
+#  The Gold Short comparison table (wait 240, line ON, body ON, near ON / 1.0, filter 4H + 1H, immediate ON, Nc 1, Nz 1, pull
+#  expiry OFF / 1) differs from XA-19 only in stSatsNow (false -> true); the text that called it "初期 OFF" is updated. Logic
+#  unchanged. strip_strategy20() -> the Strategy of 5f2c8a5 (= 32cc570).
+NOTE20 = "Gold Short の比較から採用した初期値。Long・将来の有効性は未確認"
+STRATEGY_EDITS20 = [
+    ("header",
+     "//  反発→Zone 0 <= t − e <= Nz (成立済み反発候補の寿命)。引きつけ側は 接触→反発 (発注判断足) の専用 N のまま。\n",
+     "//  反発→Zone 0 <= t − e <= Nz (成立済み反発候補の寿命)。引きつけ側は 接触→反発 (発注判断足) の専用 N のまま。\n"
+     "//  XA-20: " + NOTE20 + ": 直近の反発で即時エントリー ON (Nc 1 / Nz 1、引きつけ側の接触期限 OFF、待機 240分、SATS 線表示 /\n"
+     "//  陽線陰線 / 近接 1.0 USD / 逆方向一致 4H・1H は従来の初期値のまま)。即時 OFF・接触期限 ON などは比較・切り戻し用に残す。\n"),
+    ("text",
+     "//  XA-16: SATS 直近反発の即時エントリー (比較用・初期 OFF / 有効本数 1)。",
+     "//  XA-16: SATS 直近反発の即時エントリー (XA-16 時点は初期 OFF、XA-20 から初期 ON / 有効本数 1)。"),
+    ("default",
+     'stSatsNow = input.bool(false, "SATS · 直近の反発で即時エントリー", group = G_STW,\n'
+     '     tooltip = "XA-16 比較用 (初期 OFF)。',
+     'stSatsNow = input.bool(true, "SATS · 直近の反発で即時エントリー", group = G_STW,\n'
+     '     tooltip = "XA-16 (初期 ON = ' + NOTE20 + '。OFF は比較・切り戻し用)。'),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -1691,8 +1713,13 @@ def build_strategy18():
     return _apply(build_strategy17(), STRATEGY_EDITS18)
 
 
-def build_strategy():
+def build_strategy19():
+    """XA-1 .. XA-19 (commit 32cc570 / 5f2c8a5)."""
     return _apply(build_strategy18(), STRATEGY_EDITS19)
+
+
+def build_strategy():
+    return _apply(build_strategy19(), STRATEGY_EDITS20)
 
 
 def strip_visual3(t):
@@ -1712,8 +1739,15 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy20(t):
+    """reverse only XA-20 (-> the Strategy of 5f2c8a5 byte for byte)."""
+    return _revert(t, STRATEGY_EDITS20)
+
+
 def strip_strategy19(t):
-    """reverse only XA-19 (-> the Strategy of b7f0036 byte for byte)."""
+    """reverse XA-20 when present (all or nothing) and XA-19 (-> the Strategy of b7f0036 byte for byte)."""
+    if t is not None and STRATEGY_EDITS20[0][2] in t:
+        t = strip_strategy20(t)
     return _revert(t, STRATEGY_EDITS19)
 
 
@@ -1740,7 +1774,7 @@ def strip_strategy16(t):
 
 def strip_strategy15(t):
     """reverse XA-16 when present (all or nothing) and XA-15 (-> the Strategy of e2cf617 byte for byte)."""
-    if t is not None and STRATEGY_EDITS16[0][2] in t:
+    if t is not None and (STRATEGY_EDITS16[0][2] in t or STRATEGY_EDITS20[0][2] in t):   # XA-20 rewrites the XA-16 header line
         t = strip_strategy16(t)
     return _revert(t, STRATEGY_EDITS15)
 
