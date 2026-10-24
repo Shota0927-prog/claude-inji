@@ -1798,11 +1798,11 @@ def hist18(side, bars, lines, n, near=False, dist=0.0, body=False):
 
 
 def gate_xa18():
-    S18, S17 = rd(xb.STR_PATH), xb.show("9bf191c", xb.STR_PATH)
+    S18, S17 = xb.strip_strategy19(rd(xb.STR_PATH)) or "", xb.show("9bf191c", xb.STR_PATH)   # XA-18 layer (XA-19 reverted exactly)
     fh = func(S18, "f_satHist(int side, float L, int q) =>")
     check("XG-01 XA-18: Strategy == xa_build.build_strategy() (XA-1 .. XA-18); strip_strategy18 gives 9bf191c byte for byte; the only "
           "code change is qUse = live ? q : bar_index (comments aside); inputs / defaults and every other Pine file unchanged",
-          xb.build_strategy() == S18 and xb.strip_strategy18(S18) == S17 and xb.build_strategy17() == S17
+          xb.build_strategy18() == S18 and xb.strip_strategy18(S18) == S17 and xb.build_strategy17() == S17
           and sorted(l for l in es.changed_code(S17, S18) if l) == sorted(["int  qUse  = rA ? bar_index : q",
                                                                           "int  qUse  = live ? q : bar_index     // XA-18: 保持中の q を優先 (A の再接触でも延長しない)"])
           and "    int  qUse  = live ? q : bar_index" in fh and input_values(S18) == input_values(S17)
@@ -1842,9 +1842,113 @@ def gate_xa18():
           m != S18 and m2 != S18 and xb.strip_strategy18(m) is None and xb.strip_strategy18(m2) is None)
 
 
+# ---- XA-19: immediate side = contact -> rebound (Nc) and rebound -> Zone (Nz) ------------------------------------------------
+def pick19(cands, t, nz, nc):
+    """cands (q, e, k): the latest e with 0 <= t - e <= nz and 0 <= e - q <= nc (same e -> smaller k). Returns (q, e, k) or None."""
+    best = None
+    for q, e, k in cands:
+        if 0 <= t - e <= nz and 0 <= e - q <= nc and (best is None or e > best[1] or (e == best[1] and k < best[2])):
+            best = (q, e, k)
+    return best
+
+
+def cands19(side, bars, lines, nc, k=1, **kw):
+    """XA-19 history (record life = nc; XA-18 origin) -> rebound candidates (q, e, k)."""
+    return [(q, e, k) for e, (r, q) in enumerate(hist18(side, bars, lines, nc, **kw)) if r]
+
+
+def gate_xa19():
+    S19, S18 = rd(xb.STR_PATH), xb.show("b7f0036", xb.STR_PATH)
+    i19, i18 = input_values(S19), input_values(S18)
+    d19 = input_decls(S19)
+    new = {k: v for k, v in i19.items() if k not in i18}
+    check("XC-01 XA-19: Strategy == xa_build.build_strategy() (XA-1 .. XA-19); strip_strategy19 gives b7f0036 byte for byte; inputs: new "
+          "'SATS · 即時側：接触→反発の有効本数' 1 (min 0, step 1), '即時側：反発→Zoneの有効本数' (the former immediate count, 1), "
+          "'引きつけ側：接触→反発の有効本数' (renamed, 1); every default unchanged (immediate OFF, pull expiry OFF); other Pine files unchanged",
+          xb.build_strategy() == S19 and xb.strip_strategy19(S19) == S18 and xb.build_strategy18() == S18
+          and new == {"stSatsNowC": "1"} and all(i19[k] == v for k, v in i18.items())
+          and '"SATS · 即時側：接触→反発の有効本数"' in d19["stSatsNowC"] and '"SATS · 即時側：反発→Zoneの有効本数"' in d19["stSatsNowN"]
+          and '"SATS · 引きつけ側：接触→反発の有効本数"' in d19["stSatsTqN"]
+          and all(es.kw(d19[k], "minval") == "0" and es.kw(d19[k], "step") == "1" for k in ("stSatsNowC", "stSatsNowN", "stSatsTqN"))
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH
+                   and open(os.path.join(ROOT, p), encoding="utf-8").read() != xb.show("b7f0036", p)])
+    nb = block(S19, "                bool nowGo = false\n", "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar and not nowGo\n")
+    wb19 = code_only(block(S19, "    bool  pwCancelBar = false\n", "    // (4) 新規 Entry"))
+    wb18 = code_only(block(S18, "    bool  pwCancelBar = false\n", "    // (4) 新規 Entry"))
+    check("XC-02 static: contact records live by Nc (live = t - q <= stSatsNowC, XA-18 origin kept); rebound candidates are pruned by t - e > "
+          "Nz (not by the contact age) and picked with 0 <= t - e <= Nz and 0 <= e - q <= Nc; the prep point tests t - e (hBar = e) <= "
+          "Nz only — no total t - q test is left; Nc / Nz / pull N are read only by their own tests; the pull-side wait code is the "
+          "XA-18 code (comments aside)",
+          "    bool live  = not na(q) and bar_index - q <= stSatsNowC" in S19 and "    int  qUse  = live ? q : bar_index" in S19
+          and "if bar_index - array.get(es, i) > stSatsNowN" in S19
+          and "if bar_index - e >= 0 and bar_index - e <= stSatsNowN and e - q >= 0 and e - q <= stSatsNowC and" in S19
+          and "int   hBar = side == 1 ? hEL : hES" in nb and "hAge >= 0 and hAge <= stSatsNowN" in nb
+          and not re.search(r"bar_index - q (?:>=|<=|>) ?\d*\s*(?:and )?bar_index - q <= stSatsNow|bar_index - q <= stSatsNowN|array.get\(qs, i\) > stSatsNow", S19)
+          and len(re.findall(r"\bstSatsNowC\b", S19)) == 3 and len(re.findall(r"\bstSatsNowN\b", S19)) == 4
+          and len(re.findall(r"\bstSatsTqN\b", S19)) == 2
+          and re.sub(r"\s+//.*", "", wb19) == re.sub(r"\s+//.*", "", wb18))
+    L = [2605.0] * 6
+    base = [(2612, 2613, 2608, 2610)]
+    c_b = cands19(1, base + [(2610, 2610.5, 2604.0, 2604.5), (2604.5, 2607, 2603.8, 2606)], L, 1)          # touch 1, B at 2
+    c_a = cands19(1, base + [(2610, 2611, 2604.5, 2608)], L, 1)                                            # touch + A at 1
+    c_late = cands19(1, base + [(2610, 2610.5, 2604.0, 2604.5), (2604.5, 2604.9, 2603.5, 2604), (2604, 2607, 2603.9, 2606)], L, 1)
+    ex = {"q10 e11 t12": pick19(c_b, 3, 1, 1), "q10=e10 t11": pick19(c_a, 2, 1, 1), "q10 e12 (Nc 1)": c_late,
+          "q10 e11 t13": pick19(c_b, 4, 1, 1)}
+    check("XC-03 model, the request examples with Nc = Nz = 1 (bar 1 = 10): touch 10 / rebound 11 / Zone 12 -> valid (the old total "
+          "t - q = 2 would have refused it); touch + rebound 10 / Zone 11 -> valid; touch 10 / cross back 12 without a new touch -> no "
+          "rebound (Nc exceeded); touch 10 / rebound 11 / Zone 13 -> invalid (Nz exceeded); the rebound of 11 is kept at 12 although "
+          "its contact (10) is older than Nc",
+          ex == {"q10 e11 t12": (1, 2, 1), "q10=e10 t11": (1, 1, 1), "q10 e12 (Nc 1)": [], "q10 e11 t13": None}, str(ex))
+    c3 = cands19(1, base + [(2610, 2610.5, 2604.0, 2604.5)] + [(2604.5, 2604.9, 2603.5, 2604)] * 2 + [(2604, 2607, 2603.9, 2606)], L, 3)
+    c2 = cands19(1, base + [(2610, 2610.5, 2604.0, 2604.5)] + [(2604.5, 2604.9, 2603.5, 2604)] * 2 + [(2604, 2607, 2603.9, 2606)], L, 2)
+    bnd = {"Nc0 same bar": pick19([(5, 5, 1)], 5, 0, 0), "Nc0 next": pick19([(5, 6, 1)], 6, 0, 0), "Nc1 next": pick19([(5, 6, 1)], 6, 0, 1),
+           "Nc3 +3 hist": c3, "Nc2 +3 hist": c2, "Nz0 same": pick19([(5, 6, 1)], 6, 0, 3), "Nz0 next": pick19([(5, 6, 1)], 7, 0, 3),
+           "Nz3 +3": pick19([(5, 6, 1)], 9, 3, 3), "Nz3 +4": pick19([(5, 6, 1)], 10, 3, 3),
+           "Nc only over": pick19([(5, 8, 1)], 8, 3, 2), "Nz only over": pick19([(5, 6, 1)], 9, 2, 3)}
+    check("XC-04 model boundaries and independence: Nc 0 -> only a rebound on the touch bar, Nc 1 -> the next bar, Nc 3 -> a B 3 bars after "
+          "the touch (Nc 2 -> none); Nz 0 -> only a Zone on the rebound bar, Nz 3 -> 3 bars (not 4); exceeding only Nc or only Nz is "
+          "refused on its own while the other is inside",
+          bnd == {"Nc0 same bar": (5, 5, 1), "Nc0 next": None, "Nc1 next": (5, 6, 1), "Nc3 +3 hist": [(1, 4, 1)], "Nc2 +3 hist": [],
+                  "Nz0 same": (5, 6, 1), "Nz0 next": None, "Nz3 +3": (5, 6, 1), "Nz3 +4": None, "Nc only over": None, "Nz only over": None}, str(bnd))
+    rt = base + [(2610, 2611, 2604.5, 2606), (2606, 2611, 2604.6, 2605.5), (2605.5, 2609, 2604.8, 2608.5), (2608.5, 2609, 2604.9, 2609)]
+    k2 = hist18(1, rt, L, 2, body=True)          # touches 1, 2 (bearish) do not move q; A at 3 keeps q = 1
+    k2s = hist18(-1, [(5200 - o, 5200 - l, 5200 - h, 5200 - c) for o, h, l, c in rt], [5200 - x for x in L], 2, body=True)
+    xa17 = [(q, e) for e, (r, q) in enumerate(hist17(1, rt, L, 2, body=True)) if r]
+    new_t = hist18(1, base + [(2610, 2611, 2604.5, 2606), (2606, 2609, 2606, 2608), (2608, 2609, 2604.9, 2608.5)], L, 1, body=True)
+    check("XC-05 model: the XA-17 re-touch extension does not come back (Nc 2, body ON: touches at 1 and 2 with the wrong body, A at 3 -> "
+          "q stays 1, e - q = 2; XA-17 would have used q = 3), Long and Short; after the record expires a new touch is a new origin "
+          "(touch 1, record gone at 3, touch + A at 3 -> q = 3)",
+          k2[3] == (True, 1) and k2s[3] == (True, 1) and xa17[0] == (3, 3) and new_t[3] == (True, 3), str((k2, k2s, xa17, new_t)))
+    mir = lambda bs: [(5200 - o, 5200 - l, 5200 - h, 5200 - c) for o, h, l, c in bs]
+    bb = base + [(2610, 2610.5, 2604.0, 2604.5), (2604.5, 2607, 2603.8, 2606)]
+    sym = (cands19(-1, mir(bb), [5200 - x for x in L], 1) == cands19(1, bb, L, 1)
+           and cands19(-1, mir(base + [(2610, 2611, 2604.5, 2608)]), [5200 - x for x in L], 1) == c_a)
+    near = (cands19(1, base + [(2610, 2612, 2605.8, 2609)], L, 1), cands19(1, base + [(2610, 2612, 2605.8, 2609)], L, 1, near=True, dist=1.0))
+    body = (cands19(1, base + [(2610, 2612, 2604.5, 2609)], L, 1, body=True), cands19(1, base + [(2607, 2612, 2604.5, 2609)], L, 1, body=True))
+    check("XC-06 model: Long / Short mirror for A and B; near OFF / ON (0.8 above the line: only with near); body ON rejects a bearish Long "
+          "rebound bar and accepts a bullish one (applied to the rebound bar e)",
+          sym and near == ([], [(1, 1, 1)]) and body == ([], [(1, 1, 1)]), str((sym, near, body)))
+    prep = block(S19, "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar and not nowGo\n", "            else if not skipRef")
+    prep18 = block(S18, "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar and not nowGo\n", "            else if not skipRef")
+    check("XC-07 OFF paths: with the immediate entry OFF and the pull expiry OFF the order / prep / wait code is the XA-18 code (only the "
+          "immediate test and the history differ, both gated: nowGo needs stSatsNow, the pull expiry needs stSatsTq); TP0 / RR / fill / "
+          "qty unchanged",
+          prep == prep18 and "if stSatsNow and not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar" in nb
+          and code_only(S19).count("f_satRR(") == code_only(S18).count("f_satRR(") and code_only(S19).count("strategy.entry(") == code_only(S18).count("strategy.entry("))
+    muts = [S19.replace("hAge >= 0 and hAge <= stSatsNowN and nMtf", "hAge >= 0 and hAge <= stSatsNowN and bar_index - (side == 1 ? hQL : hQS) <= stSatsNowN and nMtf"),
+            S19.replace("if bar_index - array.get(es, i) > stSatsNowN", "if bar_index - array.get(qs, i) > stSatsNowN"),
+            S19.replace("    bool live  = not na(q) and bar_index - q <= stSatsNowC", "    bool live  = not na(q) and bar_index - q <= stSatsNowN"),
+            S19.replace(" and e - q >= 0 and e - q <= stSatsNowC and", " and"),
+            S19.replace("int   hBar = side == 1 ? hEL : hES", "int   hBar = side == 1 ? hQL : hQS"),
+            S19.replace("    int  qUse  = live ? q : bar_index", "    int  qUse  = rA ? bar_index : q")]
+    check("XC-08 mutations (the total t - q test added back, pruning by the contact age, records living by Nz, no e - q check at the pick, "
+          "the prep reading q instead of e, the XA-17 origin rule) do not strip back to b7f0036",
+          all(m != S19 and xb.strip_strategy19(m) != S18 for m in muts))     # never strips back to b7f0036 exactly
+
+
 def main():
     for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12, gate_xa13, gate_xa14, gate_xa15,
-              gate_xa16, gate_xa17, gate_xa18):
+              gate_xa16, gate_xa17, gate_xa18, gate_xa19):
         try:
             g()
         except Exception:
