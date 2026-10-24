@@ -1493,14 +1493,14 @@ def decide16(on, n_max, reb_bar, t_bar, mtf_ok=True, qty_ok=True, dir_ok=True, p
 
 
 def gate_xa16():
-    S16, S15 = rd(xb.STR_PATH), xb.show("b59d621", xb.STR_PATH)
+    S16, S15 = xb.strip_strategy17(rd(xb.STR_PATH)) or "", xb.show("b59d621", xb.STR_PATH)   # XA-16 layer (XA-17 reverted exactly)
     i16, i15 = input_values(S16), input_values(S15)
     decl = input_decls(S16)
     new = {k: v for k, v in i16.items() if k not in i15}
     check("XL-01 XA-16: Strategy == xa_build.build_strategy() (XA-1 .. XA-16); strip_strategy16 gives b59d621 byte for byte; new "
           "inputs 'SATS · 直近の反発で即時エントリー' OFF and '有効本数' 1 (min 0, step 1); every older default unchanged; Engine / "
           "Visual / other Pine files unchanged; the only removed old line is the SATS prep gate (+ and not nowGo)",
-          xb.build_strategy() == S16 and xb.strip_strategy16(S16) == S15 and xb.build_strategy15() == S15
+          xb.build_strategy16() == S16 and xb.strip_strategy16(S16) == S15 and xb.build_strategy15() == S15
           and new == {"stSatsNow": "false", "stSatsNowN": "1"} and es.kw(decl["stSatsNowN"], "minval") == "0"
           and es.kw(decl["stSatsNowN"], "step") == "1" and all(i16[k] == v for k, v in i15.items())
           and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH
@@ -1596,9 +1596,187 @@ def gate_xa16():
           all(m != S16 and xb.strip_strategy16(m) is None for m in muts))
 
 
+# ---- XA-17: contact-based valid bars (immediate / pull) ----------------------------------------------------------------------
+def hist17(side, bars, lines, n, near=False, dist=0.0, body=False):
+    """port of the XA-17 f_satHist for one line; returns per-bar (rebound, q of the rebound)."""
+    rec, out = None, []
+    for i, (o, h, l, c) in enumerate(bars):
+        L = lines[i - 1] if i >= 1 else None
+        pc = bars[i - 1][3] if i >= 1 else None
+        ok = L is not None and pc is not None
+        hit = ok and l <= L <= h
+        nr = ok and near and ((l > L and l - L <= dist) if side == 1 else (h < L and L - h <= dist))
+        fresh = ok and ((pc > L) if side == 1 else (pc < L))
+        live = rec is not None and i - rec <= n
+        tch = (hit or nr) and fresh
+        ra = tch and ((c > L) if side == 1 else (c < L))
+        rb = live and ok and ((pc <= L and c > L) if side == 1 else (pc >= L and c < L))
+        bd = (not body) or ((c > o) if side == 1 else (c < o))
+        reb = (ra or rb) and bd
+        q = i if ra else rec
+        out.append((reb, q if reb else None))
+        rec = None if reb else (rec if live else (i if tch else None))
+    return out
+
+
+def pick17(cands, t, n):
+    """cands: (q, e, k); the latest e among 0 <= t - q <= n (and e <= t), same e -> smaller k. Returns (q, k) or (None, 0)."""
+    best = None
+    for q, e, k in cands:
+        if e <= t and 0 <= t - q <= n and (best is None or e > best[1] or (e == best[1] and k < best[2])):
+            best = (q, e, k)
+    return (best[0], best[2]) if best else (None, 0)
+
+
+class Wait17(Wait13):
+    """the XA-13 waiting step plus the XA-17 pull-side contact expiry (tq / tqn); counts expiries."""
+
+    def __init__(self, *a, tq=False, tqn=1, **kw):
+        super().__init__(*a, **kw)
+        self.tq, self.tqn, self.n_tq = tq, tqn, 0
+
+    def step(self, bar, t_close, h, l, c, pc, lines, o=None, sess=True, qty_ok=True, o_state=0, skip=False):
+        if self.state == 1 and bar > self.bar and self.tq and self.touched:
+            cancel = t_close - self.t_end >= self.limit * 60000 or ((l <= self.sl0) if self.side == 1 else (h >= self.sl0))
+            if not cancel and bar - self.tbar > self.tqn:
+                self.touched, self.tk, self.tbar = False, 0, None
+                self.n_tq += 1
+        return super().step(bar, t_close, h, l, c, pc, lines, o=o, sess=sess, qty_ok=qty_ok, o_state=o_state, skip=skip)
+
+
+def gate_xa17():
+    S17, S16 = rd(xb.STR_PATH), xb.show("4c56095", xb.STR_PATH)
+    i17, i16 = input_values(S17), input_values(S16)
+    d17 = input_decls(S17)
+    new = {k: v for k, v in i17.items() if k not in i16}
+    check("XT-01 XA-17: Strategy == xa_build.build_strategy() (XA-1 .. XA-17); strip_strategy17 gives 4c56095 byte for byte; inputs: "
+          "'SATS · 即時側：接触からの有効本数' (the renamed XA-16 count, 1, min 0, step 1), new '引きつけ側：接触期限を使う' OFF and "
+          "'引きつけ側：接触からの有効本数' 1 (min 0, step 1); every other default unchanged; other Pine files unchanged",
+          xb.build_strategy() == S17 and xb.strip_strategy17(S17) == S16 and xb.build_strategy16() == S16
+          and new == {"stSatsTq": "false", "stSatsTqN": "1"} and i17["stSatsNowN"] == "1" and '"SATS · 即時側：接触からの有効本数"' in d17["stSatsNowN"]
+          and es.kw(d17["stSatsTqN"], "minval") == "0" and es.kw(d17["stSatsTqN"], "step") == "1"
+          and all(i17[k] == v for k, v in i16.items())
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH
+                   and open(os.path.join(ROOT, p), encoding="utf-8").read() != xb.show("4c56095", p)])
+    fh = func(S17, "f_satHist(int side, float L, int q) =>")
+    wb = block(S17, "    bool  pwCancelBar = false\n", "    // (4) 新規 Entry")
+    expb = block(wb, "            if stSatsTq and pwTouched and bar_index - pwTouchBar > stSatsTqN\n", "            int   lk = 0\n")
+    nb = block(S17, "                bool nowGo = false\n", "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar and not nowGo\n")
+    check("XT-02 static: the XA-16 rebound-bar state (hRebBar / hRebK / hRec, t - e) is gone; f_satHist keeps the contact bar q "
+          "(live = t - q <= N before the test, A -> q = this bar, B -> the recorded q, no re-touch extension); rebound candidates "
+          "(q, e, line) pruned when t - q > N and picked as the latest e within 0 <= t - q <= N (LINE1 -> LINE2 -> STB); the prep "
+          "point uses that q (hAge = t - q <= stSatsNowN); the pull-side expiry sits after the cancel test and before the line choice, "
+          "only clears the touch record / held line and counts it (no pwState / pwEndT / pwBar / used Track change); stSatsTqN is read "
+          "only there and stSatsNowN only by the history / immediate test",
+          not re.search(r"hRebBar|hRebK|hRec", S17) and "    bool live  = not na(q) and bar_index - q <= stSatsNowN" in fh
+          and "    int  qUse  = rA ? bar_index : q" in fh and "    int  qNext = reb ? na : live ? q : tch ? bar_index : na" in fh
+          and "if bar_index - array.get(qs, i) > stSatsNowN" in S17
+          and "if bar_index - q >= 0 and bar_index - q <= stSatsNowN and (na(be) or e > be or (e == be and k < bk))" in S17
+          and "int   hBar = side == 1 ? hQL : hQS" in nb and "hAge >= 0 and hAge <= stSatsNowN" in nb
+          and wb.index("if why != 0") < wb.index("if stSatsTq and pwTouched") < wb.index("if not pwTouched\n")
+          and set(re.findall(r"^\s*(\w+)\s*(?::=|\+=)", expb, re.M)) == {"pwTouched", "pwTouchK", "pwTouchBar", "pwNTqExp"}
+          and len(re.findall(r"\bstSatsTqN\b", S17)) == 2 and len(re.findall(r"\bstSatsTq\b", S17)) == 2
+          and len(re.findall(r"\bstSatsNowN\b", S17)) == 5)
+    # immediate model: the request examples (N = 1)
+    def run(bars, lines, n, side=1):
+        h = hist17(side, bars, lines, n)
+        return [(q, e, 1) for e, (r, q) in enumerate(h) if r]
+    base = [(2612, 2613, 2608, 2610)]
+    ex1 = run(base + [(2610, 2611, 2604.5, 2608), (2608, 2609, 2606, 2607)], [2605.0] * 3, 1)           # bar 1: touch + A (q = e = 1)
+    v1 = pick17(ex1, 2, 1)                                                                              # Zone at bar 2 -> t - q = 1
+    ex2 = run(base + [(2610, 2610.5, 2604.0, 2604.5), (2604.5, 2607, 2603.8, 2606)], [2605.0] * 3, 1)   # touch 1, B at 2 (q = 1)
+    v2 = pick17(ex2, 2, 1)
+    v3 = pick17(ex2, 3, 1)                                                                              # Zone at 3 -> t - q = 2 > 1
+    old_touch = run(base + [(2610, 2610.5, 2604.0, 2604.5), (2604.5, 2604.9, 2603.5, 2604), (2604, 2604.9, 2603.5, 2604.2),
+                            (2604.2, 2607, 2603.9, 2606)], [2605.0] * 5, 3)                             # touch 1, B at 4 (q = 1)
+    vt = (pick17(old_touch, 4, 3), pick17(old_touch, 4, 2), pick17(old_touch, 5, 3))
+    long_n1 = hist17(1, base + [(2610, 2610.5, 2604.0, 2604.5), (2604.5, 2604.9, 2603.5, 2604), (2604, 2607, 2603.9, 2606)], [2605.0] * 4, 1)
+    renew = hist17(1, base + [(2610, 2610.5, 2604.0, 2604.5), (2604.5, 2604.9, 2603.5, 2604), (2606, 2608, 2606, 2607),
+                              (2607, 2607.5, 2604.8, 2606.5)], [2605.0] * 5, 1)     # expired record: the gap cross at 3 is no B; touch + A at 4
+    hide = pick17([(5, 10, 1), (9, 9, 2)], 10, 2)                                                       # newer e with an old q vs an older valid one
+    n0 = (pick17([(4, 4, 1)], 4, 0), pick17([(4, 4, 1)], 5, 0))
+    n3 = (pick17([(4, 6, 1)], 7, 3), pick17([(4, 6, 1)], 8, 3))
+    mir = lambda bs: [(5200 - o, 5200 - l, 5200 - h, 5200 - c) for o, h, l, c in bs]
+    sh = hist17(-1, mir(base + [(2610, 2610.5, 2604.0, 2604.5), (2604.5, 2607, 2603.8, 2606)]), [5200 - 2605.0] * 3, 1)
+    check("XT-03 model immediate (N = 1 unless stated): touch + rebound at 10, Zone at 11 -> valid; touch 10, rebound + Zone at 11 -> "
+          "valid; touch 10, rebound 11, Zone 12 -> invalid; B keeps its touch bar (a recent rebound with a touch 3 bars back is valid "
+          "only for N >= 3); a record older than N gives no B (N 1: touch, two bars below, cross back -> nothing) and a fresh touch "
+          "after it starts a new record; an older rebound inside the window is not hidden by a newer one with an old touch; N 0 / 3 "
+          "boundaries; Short mirror",
+          ex1 == [(1, 1, 1)] and v1 == (1, 1) and ex2 == [(1, 2, 1)] and v2 == (1, 1) and v3 == (None, 0)
+          and vt == ((1, 1), (None, 0), (None, 0)) and not any(r for r, _ in long_n1) and renew[3] == (False, None) and renew[4] == (True, 4)
+          and hide == (9, 2) and n0 == ((4, 1), (None, 0)) and n3 == ((4, 1), (None, 0)) and sh == hist17(1, base + [(2610, 2610.5, 2604.0, 2604.5), (2604.5, 2607, 2603.8, 2606)], [2605.0] * 3, 1),
+          str((ex1, v1, ex2, v2, v3, vt, long_n1, renew, hide, n0, n3, sh)))
+
+    def pull(tq, tqn, seq, side=-1, limit=240):
+        p0, sl0 = (2600.0, 2620.0) if side == -1 else (2600.0, 2580.0)
+        w = Wait17(side, p0, sl0, 2570.0 if side == -1 else 2630.0, tq=tq, tqn=tqn, limit=limit)
+        res = []
+        for i, (h, l, c, pc, L, o) in enumerate(seq, start=1):
+            res.append(w.step(10 + i, tb(i), h, l, c, pc, (L, None, None), o=o))
+        return w, res
+    # Short, line 2610: touch at 1 (close above -> no A), stays above, cross back below later
+    seq = [(2611, 2606, 2611, 2605.0, 2610.0, 2607), (2613, 2611, 2612, 2611.0, 2610.0, 2611.5), (2613, 2611, 2612, 2612.0, 2610.0, 2612.5),
+           (2612.5, 2608, 2608.5, 2612.0, 2610.0, 2612)]
+    w_off, r_off = pull(False, 1, seq)
+    w_on, r_on = pull(True, 1, seq)
+    w_on3, r_on3 = pull(True, 3, seq)
+    retouch = [(2611, 2606, 2611, 2605.0, 2610.0, 2607), (2611, 2609.5, 2610.5, 2611.0, 2610.0, 2610.8),
+               (2612, 2609.8, 2611, 2610.5, 2610.0, 2611.5), (2611.5, 2608, 2608.5, 2611.0, 2610.0, 2611)]
+    w_rt, r_rt = pull(True, 1, retouch)
+    newt = [(2611, 2606, 2611, 2605.0, 2610.0, 2607), (2613, 2611, 2612, 2611.0, 2610.0, 2611.5), (2613, 2611, 2612, 2612.0, 2610.0, 2612.5),
+            (2609, 2606, 2607, 2612.0, 2610.0, 2608), (2610.5, 2606.5, 2608, 2607.0, 2610.0, 2607)]     # gap below (old-record cross), then touch + A
+    w_nt, r_nt = pull(True, 1, newt)
+    w_nt0, r_nt0 = pull(False, 1, newt)
+    w_lim, r_lim = pull(True, 1, [(2611, 2606, 2611, 2605.0, 2610.0, 2607)] + [(2613, 2611, 2612, 2612.0, 2610.0, 2612.5)] * 60, limit=240)
+    w_sl, r_sl = pull(True, 0, [(2611, 2606, 2611, 2605.0, 2610.0, 2607), (2620, 2608, 2609, 2611.0, 2610.0, 2612)])
+    check("XT-04 model pull side: OFF keeps the old record (B two bars later orders); ON N 1: the touch expires (counted, wait kept, P0 / "
+          "SL0 / TP0 / prep time unchanged) and the cross with the old record does not order; ON N 3: still inside -> B orders; a "
+          "re-touch while holding does not move q (expires at q + 2); after an expiry a new touch on a later bar records anew and "
+          "can rebound; the overall wait expiry still comes at 240 min (not extended by contact expiries); SL0 cancel comes first",
+          r_off[-1] == 2 and r_on[-1] == 0 and w_on.state == 1 and w_on.n_tq == 1 and (w_on.p0, w_on.sl0, w_on.tp0, w_on.t_end) == (2600.0, 2620.0, 2570.0, T0 + 10 * M5)
+          and r_on3[-1] == 2 and r_rt[-1] == 0 and w_rt.n_tq == 1 and r_nt == [0, 0, 0, 0, 2] and w_nt.orders[-1]["kind"] == "A" and w_nt.n_tq == 1
+          and r_nt0[3] == 2
+          and -1 in r_lim and r_lim.index(-1) == 47 and r_sl[-1] == -4,
+          str((r_off, r_on, w_on.n_tq, r_on3, r_rt, w_rt.n_tq, r_nt, w_nt.n_tq, r_lim.index(-1) if -1 in r_lim else None, r_sl)))
+    random.seed(1701)
+    same = True
+    for side in (1, -1):
+        for _ in range(300):
+            p0, sl0 = (2600.0, 2580.0) if side == 1 else (2600.0, 2620.0)
+            a, b = Wait13(side, p0, sl0, 0.0, body=True, near=True, dist=1.0), Wait17(side, p0, sl0, 0.0, body=True, near=True, dist=1.0, tq=False, tqn=0)
+            pc = p0
+            for i in range(1, 40):
+                cc = round(pc + random.uniform(-4, 4), 1)
+                hh, ll = cc + round(random.uniform(0, 3), 1), cc - round(random.uniform(0, 3), 1)
+                lines = tuple(None if random.random() < 0.1 else round(cc + random.uniform(-6, 6), 1) for _ in range(3))
+                o = round(cc + random.uniform(-2, 2), 1)
+                sk = random.random() < 0.2
+                same &= a.step(10 + i, tb(i), hh, ll, cc, pc, lines, o=o, skip=sk) == b.step(10 + i, tb(i), hh, ll, cc, pc, lines, o=o, skip=sk)
+                pc = cc
+            same &= a.orders == b.orders
+    prep = block(S17, "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar and not nowGo\n", "            else if not skipRef")
+    check("XT-05 OFF and independence: the pull-side expiry OFF equals the XA-16 wait bar for bar on 600 random Long / Short paths "
+          "(any pull N); the immediate N is read only by the history / immediate test and the pull N only by the expiry (changing one "
+          "cannot move the other); the prep is the XA-16 prep plus the per-prep touch flag reset; Current untouched (all new order "
+          "logic under stSats)",
+          same and "                    pwTouchSeen := false\n" in prep and S17.count("pwTouchSeen") == 4)
+    muts = [S17.replace("    bool live  = not na(q) and bar_index - q <= stSatsNowN", "    bool live  = not na(q)"),
+            S17.replace("    int  qUse  = rA ? bar_index : q", "    int  qUse  = bar_index"),
+            S17.replace("    int  qNext = reb ? na : live ? q : tch ? bar_index : na", "    int  qNext = reb ? na : tch ? bar_index : live ? q : na"),
+            S17.replace("if stSatsTq and pwTouched and bar_index - pwTouchBar > stSatsTqN", "if stSatsTq and pwTouched and bar_index - pwTouchBar > stSatsNowN"),
+            S17.replace("if stSatsTq and pwTouched and bar_index - pwTouchBar > stSatsTqN", "if stSatsTq and pwTouched and bar_index - pwTouchBar >= stSatsTqN"),
+            S17.replace("                pwNTqExp   += 1\n", "                pwNTqExp   += 1\n                pwEndT     := time_close\n"),
+            S17.replace("int   hBar = side == 1 ? hQL : hQS", "int   hBar = side == 1 ? hQL : hQL")]
+    check("XT-06 mutations (no record expiry on the immediate side, q moved to the rebound bar, re-touch extending q, the pull side "
+          "reading the immediate N, a strict boundary, a contact expiry restarting the wait clock, the wrong side's candidate) do not "
+          "strip back to 4c56095",
+          all(m != S17 and xb.strip_strategy17(m) is None for m in muts))
+
+
 def main():
     for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12, gate_xa13, gate_xa14, gate_xa15,
-              gate_xa16):
+              gate_xa16, gate_xa17):
         try:
             g()
         except Exception:

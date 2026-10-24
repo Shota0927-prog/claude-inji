@@ -47,6 +47,8 @@
 //  距離 × R / TP Progress = 実約定価格から実際の TP までの距離 × 比率。判断・注文更新は従来の確定 5分足の建値処理のまま。
 //  XA-16: SATS 直近反発の即時エントリー (比較用・初期 OFF / 有効本数 1)。各 Entry Mode の待機準備地点で、同方向の SATS 反発が
 //  0 <= t − e <= N 本以内に成立済みなら引きつけずにその確定足で成行 (P0 / SL0 / TP0 は準備時と同じ)。なければ従来どおり待機。
+//  XA-17: 有効本数は両経路とも「接触足 q から発注判断足 t まで」0 <= t − q <= N (XA-16 の t − e 判定は廃止)。即時側 N と引きつけ側
+//  (接触期限 ON のとき、初期 OFF) の N は別入力。接触期限切れは接触記録と保持線だけを解除し、待機と待機期限は変えない。
 // ============================================================================
 //  ・Zone 判定は ZONE-P と同一: ZoneEnginePracticalXAUUSD/1 (= /6 の Swing 最大点 + XA-4 の比較用モード) / 入力 / Source 取得 / NR-S1 / NR-A1 /
 //    RN / Break / zn.update / FVG Batch A (検知・保存・完全埋め・期限) は ZONE-P の本文をそのまま使う
@@ -982,11 +984,16 @@ stSatsF5  = input.bool(false, "SATS 逆方向一致 · 5分足を判定に使用
      tooltip = "5分足は発注を判断するその 5分足の確定時点の SATS バンド (この Strategy の SATS 計算をそのまま使う)。")
 stSatsNow = input.bool(false, "SATS · 直近の反発で即時エントリー", group = G_STW,
      tooltip = "XA-16 比較用 (初期 OFF)。SATS Pullback の待機を準備する足 t で、同方向の SATS 反発 (A / B と同じ価格条件、近接 /\n" +
-     "陽線陰線の設定を共用) が 0 <= t − e <= 有効本数 の足 e で成立済みなら、引きつけずにその足で成行 (Entry A でも成行)。\n" +
+     "陽線陰線の設定を共用) が成立済みで、その接触足 q が 0 <= t − q <= 即時側の有効本数 なら、引きつけずにその足で成行 (A でも成行)。\n" +
      "この足の時間帯・逆方向一致・注文なし・数量 (終値と SL0)・SL / TP の向きが必要。成立しなければ従来どおり待機を始める。")
-stSatsNowN = input.int(1, "SATS · 直近反発の有効本数（5分足）", minval = 0, step = 1, group = G_STW,
-     tooltip = "0 = シグナル確定足の反発だけ / 1 = その足と直前 1 本 / 3 = 直前 3 本まで (境界を含む。実時間ではなく 5分足の本数。\n" +
-     "B は接触足ではなく反発が成立した足から数える)。")
+stSatsNowN = input.int(1, "SATS · 即時側：接触からの有効本数", minval = 0, step = 1, group = G_STW,
+     tooltip = "接触足 q から Zone 条件成立足 t まで 0 <= t − q <= N (境界を含む、5分足の本数)。0 = 接触した足だけ / 1 = その次の足まで。\n" +
+     "A はその接触足、B は反発前に記録した接触足から数える (反発時刻へ置き換えない)。引きつけ側の本数とは独立。")
+stSatsTq = input.bool(false, "SATS · 引きつけ側：接触期限を使う", group = G_STW,
+     tooltip = "XA-17 比較用 (初期 OFF = 従来の引きつけ待機)。ON: 待機中の最初の適格な接触から t − q > 有効本数 になったら接触記録と\n" +
+     "保持線を解除して接触待ちへ戻る (待機自体・待機開始時刻・SATS 待機期限は変えない。再接触で起点を延長しない)。")
+stSatsTqN = input.int(1, "SATS · 引きつけ側：接触からの有効本数", minval = 0, step = 1, group = G_STW,
+     tooltip = "接触足 q から発注判断足 t まで 0 <= t − q <= N (境界を含む、5分足の本数)。接触期限 ON のときだけ。即時側とは独立。")
 var string G_STS = "03 · Strategy Session (新規 Entry のみ)"
 stUseSess = input.bool(true, "Limit New Entries to Session", group = G_STS)
 stSessTz = input.string("Asia/Tokyo", "Session Timezone", group = G_STS)
@@ -1191,50 +1198,106 @@ f_satAllAgainst(int want) =>
 bool satSkipS = f_satAllAgainst(1)      // Short を見送る: 選択した時間足がすべて青
 bool satSkipL = f_satAllAgainst(-1)     // Long を見送る: 選択した時間足がすべて赤
 
-// XA-16: 準備前の SATS 反発の履歴 (待機 pw* とは独立。毎足・無条件に更新)。足 e の判定には足 e-1 で確定した線 L だけを使う。
+// XA-16 / XA-17: 準備前の SATS 反発の履歴 (待機 pw* とは独立。毎足・無条件に更新)。足 e の判定には足 e-1 で確定した線 L だけを使う。
 //  方向 side × 線 (LINE1 / LINE2 / STB) ごとに: 接触 = low <= L <= high、近接 ON なら Long low > L かつ low − L <= 許容距離 /
 //  Short high < L かつ L − high <= 許容距離。A = 接触 + 前足終値が取引方向側 (Long close[1] > L / Short close[1] < L) + 終値が
 //  取引方向側 (Long close > L / Short close < L)。B = 同じ線への先行接触の記録 + close[1] <= L < close (Short は close[1] >= L > close)。
-//  陽線陰線 ON なら反発足 e 自身が Long close > open / Short close < open。有効な反発はその線の接触記録を消費する
-//  (反発しなかった接触は記録を残す)。戻り値 [反発成立, 次の記録]。SATS の青 / 赤、P0 / SL0、Zone 資格は使わない
-f_satHist(int side, float L, bool rec) =>
+//  陽線陰線 ON なら反発足 e 自身が Long close > open / Short close < open。SATS の青 / 赤、P0 / SL0、Zone 資格は使わない。
+//  XA-17: 接触記録は接触足 q (bar_index) で持ち、t − q > 即時側の有効本数 になった記録は判定前に捨てる (同じ足の新しい接触で
+//  記録し直せる。保持中の再接触で q を更新しない)。反発の起点 q: A = その足 / B = 記録した q (反発時刻へ置き換えない)。有効な
+//  反発は記録を消費する。戻り値 [反発成立, 起点 q, 次の記録 q]
+f_satHist(int side, float L, int q) =>
     bool ok    = not na(L) and not na(close[1])
     bool hit   = ok and low <= L and L <= high
     bool near  = ok and stSatsNear and (side == 1 ? (low > L and low - L <= stSatsNearD) : (high < L and L - high <= stSatsNearD))
     bool fresh = ok and (side == 1 ? close[1] > L : close[1] < L)
-    bool rA    = (hit or near) and fresh and (side == 1 ? close > L : close < L)
-    bool rB    = rec and ok and (side == 1 ? (close[1] <= L and close > L) : (close[1] >= L and close < L))
+    bool live  = not na(q) and bar_index - q <= stSatsNowN
+    bool tch   = (hit or near) and fresh
+    bool rA    = tch and (side == 1 ? close > L : close < L)
+    bool rB    = live and ok and (side == 1 ? (close[1] <= L and close > L) : (close[1] >= L and close < L))
     bool body  = not stSatsBody or (side == 1 ? close > open : close < open)
     bool reb   = (rA or rB) and body
-    [reb, reb ? false : (rec or ((hit or near) and fresh))]
-var bool hRecL1 = false
-var bool hRecL2 = false
-var bool hRecL3 = false
-var bool hRecS1 = false
-var bool hRecS2 = false
-var bool hRecS3 = false
-[hL1, nL1] = f_satHist(1, satL1[1], hRecL1)
-[hL2, nL2] = f_satHist(1, satL2[1], hRecL2)
-[hL3, nL3] = f_satHist(1, satStb[1], hRecL3)
-[hS1, nS1] = f_satHist(-1, satL1[1], hRecS1)
-[hS2, nS2] = f_satHist(-1, satL2[1], hRecS2)
-[hS3, nS3] = f_satHist(-1, satStb[1], hRecS3)
-hRecL1 := nL1
-hRecL2 := nL2
-hRecL3 := nL3
-hRecS1 := nS1
-hRecS2 := nS2
-hRecS3 := nS3
-var int hRebBarL = na      // Long の最新の反発成立足 (bar_index) と線の種類 (同じ足は LINE1 -> LINE2 -> STB)
-var int hRebKL   = 0
-var int hRebBarS = na
-var int hRebKS   = 0
-if hL1 or hL2 or hL3
-    hRebBarL := bar_index
-    hRebKL   := hL1 ? 1 : hL2 ? 2 : 3
-if hS1 or hS2 or hS3
-    hRebBarS := bar_index
-    hRebKS   := hS1 ? 1 : hS2 ? 2 : 3
+    int  qUse  = rA ? bar_index : q
+    int  qNext = reb ? na : live ? q : tch ? bar_index : na
+    [reb, qUse, qNext]
+var int hTqL1 = na
+var int hTqL2 = na
+var int hTqL3 = na
+var int hTqS1 = na
+var int hTqS2 = na
+var int hTqS3 = na
+[hL1, qL1, nL1] = f_satHist(1, satL1[1], hTqL1)
+[hL2, qL2, nL2] = f_satHist(1, satL2[1], hTqL2)
+[hL3, qL3, nL3] = f_satHist(1, satStb[1], hTqL3)
+[hS1, qS1, nS1] = f_satHist(-1, satL1[1], hTqS1)
+[hS2, qS2, nS2] = f_satHist(-1, satL2[1], hTqS2)
+[hS3, qS3, nS3] = f_satHist(-1, satStb[1], hTqS3)
+hTqL1 := nL1
+hTqL2 := nL2
+hTqL3 := nL3
+hTqS1 := nS1
+hTqS2 := nS2
+hTqS3 := nS3
+// 反発の候補 (方向ごと): 起点 q / 成立足 e / 線の種類。t − q > N になった候補は消す (以後も有効にならない)。採用は期限内の
+// 候補から最新の e、同じ e は LINE1 -> LINE2 -> STB (期限外の新しい候補が期限内の候補を隠さない)
+var array<int> hQsL = array.new_int()
+var array<int> hEsL = array.new_int()
+var array<int> hKsL = array.new_int()
+var array<int> hQsS = array.new_int()
+var array<int> hEsS = array.new_int()
+var array<int> hKsS = array.new_int()
+f_hPrune(array<int> qs, array<int> es, array<int> ks) =>
+    int n = array.size(qs)
+    if n > 0
+        for i = n - 1 to 0
+            if bar_index - array.get(qs, i) > stSatsNowN
+                array.remove(qs, i)
+                array.remove(es, i)
+                array.remove(ks, i)
+    array.size(qs)
+f_hPick(array<int> qs, array<int> es, array<int> ks) =>
+    int bq = na
+    int be = na
+    int bk = 0
+    int n  = array.size(qs)
+    if n > 0
+        for i = 0 to n - 1
+            int q = array.get(qs, i)
+            int e = array.get(es, i)
+            int k = array.get(ks, i)
+            if bar_index - q >= 0 and bar_index - q <= stSatsNowN and (na(be) or e > be or (e == be and k < bk))
+                bq := q
+                be := e
+                bk := k
+    [bq, bk]
+int hNL = f_hPrune(hQsL, hEsL, hKsL)
+int hNS = f_hPrune(hQsS, hEsS, hKsS)
+if hL1
+    array.push(hQsL, qL1)
+    array.push(hEsL, bar_index)
+    array.push(hKsL, 1)
+if hL2
+    array.push(hQsL, qL2)
+    array.push(hEsL, bar_index)
+    array.push(hKsL, 2)
+if hL3
+    array.push(hQsL, qL3)
+    array.push(hEsL, bar_index)
+    array.push(hKsL, 3)
+if hS1
+    array.push(hQsS, qS1)
+    array.push(hEsS, bar_index)
+    array.push(hKsS, 1)
+if hS2
+    array.push(hQsS, qS2)
+    array.push(hEsS, bar_index)
+    array.push(hKsS, 2)
+if hS3
+    array.push(hQsS, qS3)
+    array.push(hEsS, bar_index)
+    array.push(hKsS, 3)
+[hQL, hKL] = f_hPick(hQsL, hEsL, hKsL)     // 即時側で使える Long の反発: 起点 q と線 (無ければ na / 0)
+[hQS, hKS] = f_hPick(hQsS, hEsS, hKsS)
 
 // 足 t の判定に使う線: 足 t-1 で確定した 3 本の値と前足終値だけで選ぶ (足 t の値は使わない)。
 //  Long: SL0 < L < P0 かつ L < 前足終値 / Short: SL0 > L > P0 かつ L > 前足終値。前足終値に最も近い線、同距離は LINE1 -> LINE2 -> STB。
@@ -1397,7 +1460,9 @@ var float oTP0     = na      // SATS で発注した注文の TP0 (約定確認�
 var int   oPath    = 0       // XA-16: 直近の SATS 発注の経路 (1 = 引きつけ / 2 = 即時)
 var int   pwNNow   = 0       // XA-16: 即時エントリーの発注件数
 var int   pwNowK   = 0       // XA-16: 即時エントリーで採用した反発の線 (1 LINE1 / 2 LINE2 / 3 STB)
-var int   pwNowAge = na      // XA-16: その反発からの経過本数 (t − e)
+var int   pwNowAge = na      // XA-16 / XA-17: その反発の接触からの経過本数 (t − q)
+var int   pwNTqExp = 0       // XA-17: 引きつけ側の接触期限切れ件数 (待機は続く。期限切れ・SL0 取消とは別)
+var bool  pwTouchSeen = false   // XA-17: この準備で接触を経験したか (接触期限切れ後の再接触を二重に数えない)
 var float pwRRPrep = na
 var float pwRRPlan = na
 var float pwRRFill = na
@@ -1645,6 +1710,13 @@ if is5mChart and barstate.isconfirmed
             pwTouchK   := 0
             pwTouchBar := na
         else
+            // XA-17: 引きつけ側の接触期限 (ON のとき)。保持中の接触から t − q > N なら記録と保持線を解除 (待機・開始時刻・期限は不変)。
+            //   この後の線の選択はやり直しになり、この足の新しい接触は新しい接触として記録できる (古い接触の B にはならない)
+            if stSatsTq and pwTouched and bar_index - pwTouchBar > stSatsTqN
+                pwTouched  := false
+                pwTouchK   := 0
+                pwTouchBar := na
+                pwNTqExp   += 1
             int   lk = 0
             float lp = na
             if not pwTouched
@@ -1666,7 +1738,8 @@ if is5mChart and barstate.isconfirmed
                 pwTouched    := true
                 pwTouchK     := lk
                 pwTouchBar   := bar_index
-                pwNTouchPrep += 1
+                pwNTouchPrep += pwTouchSeen ? 0 : 1
+                pwTouchSeen  := true
             bool priceOK = pwSide == 1 ? (close > pwSL0 and close < pwP0) : (close < pwSL0 and close > pwP0)
             bool bodyOK  = not stSatsBody or (pwSide == 1 ? close > open : close < open)
             bool mtfOK   = not (pwSide == 1 ? satSkipL : satSkipS)
@@ -1795,12 +1868,12 @@ if is5mChart and barstate.isconfirmed
                 // XA-7 / XA-10: 選択した Entry Mode (A〜D) が発注する条件を満たした → 発注せず待機を準備する
                 //   (P0 = ref: A は指値価格 pL / B・C・D は確定足の終値。待機中・取消した足では何もしない)
                 // XA-16: 直近の反発で即時エントリー (ON のときだけ。待機中・取消した足では判定しない = 割り込みなし)
-                //   有効 = 0 <= t − e <= N (e = 同方向の最新の反発成立足)。この足の逆方向一致・数量 f_stQty(side, close, SL0)・
+                //   有効 (XA-17) = 0 <= t − q <= N (q = 期限内で最新の同方向の反発の接触足)。この足の逆方向一致・数量 f_stQty(side, close, SL0)・
                 //   SL / TP の向き (SL0 と TP0 の間に終値) が必要。過去の反発線の SL0〜P0 範囲・P0 より有利な終値・
                 //   この足の再接触 / 実体は要求しない。成立しなければ下の従来の準備 (接触待ちから) へ進む
                 bool nowGo = false
                 if stSatsNow and not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar
-                    int   hBar = side == 1 ? hRebBarL : hRebBarS
+                    int   hBar = side == 1 ? hQL : hQS     // XA-17: 採用する反発の接触足 q
                     int   hAge = na(hBar) ? na : bar_index - hBar
                     float nQty = f_stQty(side, close, pSL)
                     bool  nMtf = not (side == 1 ? satSkipL : satSkipS)
@@ -1833,7 +1906,7 @@ if is5mChart and barstate.isconfirmed
                         pwRRWhy  := na
                         pwEv     := 3
                         pwNNow   += 1
-                        pwNowK   := side == 1 ? hRebKL : hRebKS
+                        pwNowK   := side == 1 ? hKL : hKS
                         pwNowAge := hAge
                         nowGo    := true
                 if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar and not nowGo
@@ -1849,6 +1922,7 @@ if is5mChart and barstate.isconfirmed
                     pwEv     := 1
                     pwNPrep  += 1
                     pwTouched  := false     // XA-9: 新しい準備は接触待ちから
+                    pwTouchSeen := false
                     pwTouchK   := 0
                     pwTouchBar := na
             else if not skipRef and not na(pQty)
@@ -1914,13 +1988,15 @@ plot(stSats ? pwNBad : na,                 "SATS · 不適切な約定の決済�
 plot(stSats ? oPath : na,                  "SATS · 直近発注の経路 (1 引きつけ / 2 即時)", display = display.data_window)
 plot(stSats ? pwNNow : na,                 "SATS · 即時エントリーの発注件数 (引きつけは「発注件数」)", display = display.data_window)
 plot(stSats ? pwNowK : na,                 "SATS · 即時で採用した反発の線 (1 L1 / 2 L2 / 3 STB)", display = display.data_window)
-plot(stSats ? pwNowAge : na,               "SATS · 即時で採用した反発からの本数 (t − e)", display = display.data_window)
+plot(stSats ? pwNowAge : na,               "SATS · 即時で採用した反発の接触からの本数 (t − q)", display = display.data_window)
 plot(stSats and oPath == 1 ? pwRRPlan : na, "SATS · 引きつけ 予定 RR", display = display.data_window)
 plot(stSats and oPath == 1 ? pwRRFill : na, "SATS · 引きつけ 実 RR", display = display.data_window)
 plot(stSats and oPath == 2 ? pwRRPlan : na, "SATS · 即時 予定 RR", display = display.data_window)
 plot(stSats and oPath == 2 ? pwRRFill : na, "SATS · 即時 実 RR", display = display.data_window)
-plot(na(hRebBarL) ? na : bar_index - hRebBarL, "SATS · Long 最新反発からの本数", display = display.data_window)
-plot(na(hRebBarS) ? na : bar_index - hRebBarS, "SATS · Short 最新反発からの本数", display = display.data_window)
+plot(na(hQL) ? na : bar_index - hQL,      "SATS · Long 即時候補 (期限内で最新の反発) の接触からの本数", display = display.data_window)
+plot(na(hQS) ? na : bar_index - hQS,      "SATS · Short 即時候補 (期限内で最新の反発) の接触からの本数", display = display.data_window)
+plot(stSats and pwTouched ? bar_index - pwTouchBar : na, "SATS · 引きつけ側 接触からの本数 (t − q)", display = display.data_window)
+plot(stSats ? pwNTqExp : na,               "SATS · 引きつけ側 接触期限切れ件数 (待機は継続)", display = display.data_window)
 plot(satTfD,                               "SATS 逆方向一致 · 日足 (1 青 / -1 赤 / 0 無点灯 / n/a 未成立)", display = display.data_window)
 plot(satTf4,                               "SATS 逆方向一致 · 4H (1 青 / -1 赤 / 0 無点灯 / n/a 未成立)", display = display.data_window)
 plot(satTf1,                               "SATS 逆方向一致 · 1H (1 青 / -1 赤 / 0 無点灯 / n/a 未成立)", display = display.data_window)
