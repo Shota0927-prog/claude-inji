@@ -32,7 +32,8 @@ BY_PATH = {v["path"]: k for k, v in CUR.items()}
 # reads now revert SX-1 first (their edits are recorded exactly in cad_adapt.LATER; cad_adapt.ok accepts them only then)
 TOUCHED = FILES + ("tests/sx_build.py", "tests/sxs_sim.py", "tests/cad_build.py", "tests/cad_adapt.py", "tests/uj_build.py",
                    "tests/uj_sim.py", "tests/ujl_sim.py", "tests/ujt_sim.py", "tests/bte_build.py", "tests/xa_sim.py",
-                   "tests/xae_sim.py", "tests/xas_sim.py", "tests/cad_sim.py", "tests/uj3_adapt.py", "tests/btc_sim.py")
+                   "tests/xae_sim.py", "tests/xas_sim.py", "tests/cad_sim.py", "tests/uj3_adapt.py", "tests/btc_sim.py",
+                   "tests/sx2_build.py", "tests/sx2s_sim.py")     # + the later SX-2 layer (new files)
 SATS_FN = open(os.path.join(ROOT, "tests", "sats_src", "f_satBand.txt"), encoding="utf-8").read()
 
 
@@ -545,7 +546,9 @@ def strip(path, text):
 
 
 def unapply(path, text):
-    """reverse SX-1 when present (all or nothing): unchanged without it (or for other paths), None with only part of it."""
+    """reverse SX-1 when present (all or nothing): unchanged without it (or for other paths), None with only part of it.
+    The later SX-2 layer (sx2_build) is reverted first, exactly."""
+    text = __import__("sx2_build").unapply(path, text)
     if text is None or path not in BY_PATH:
         return text
     if edits(BY_PATH[path])[0][2] not in text and "bool stSats =" not in text:

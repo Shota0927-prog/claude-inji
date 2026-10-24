@@ -1504,7 +1504,7 @@ def gate_xa16():
           and new == {"stSatsNow": "false", "stSatsNowN": "1"} and es.kw(decl["stSatsNowN"], "minval") == "0"
           and es.kw(decl["stSatsNowN"], "step") == "1" and all(i16[k] == v for k, v in i15.items())
           and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH
-                   and open(os.path.join(ROOT, p), encoding="utf-8").read() != xb.show("b59d621", p)]     # raw files (SX-1 included)
+                   and __import__("sx2_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read()) != xb.show("b59d621", p)]     # raw files (SX-1 included)
           and [l for l in es.changed_code(S15, S16) if l and l in [x.strip() for x in code_only(S15).split("\n")]
                and l not in [x.strip() for x in code_only(S16).split("\n")]]
               == ["if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar"])
@@ -1657,7 +1657,7 @@ def gate_xa17():
           and es.kw(d17["stSatsTqN"], "minval") == "0" and es.kw(d17["stSatsTqN"], "step") == "1"
           and all(i17[k] == v for k, v in i16.items())
           and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH
-                   and open(os.path.join(ROOT, p), encoding="utf-8").read() != xb.show("4c56095", p)])
+                   and __import__("sx2_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read()) != xb.show("4c56095", p)])
     fh = func(S17, "f_satHist(int side, float L, int q) =>")
     wb = block(S17, "    bool  pwCancelBar = false\n", "    // (4) 新規 Entry")
     expb = block(wb, "            if stSatsTq and pwTouched and bar_index - pwTouchBar > stSatsTqN\n", "            int   lk = 0\n")
@@ -1807,7 +1807,7 @@ def gate_xa18():
                                                                           "int  qUse  = live ? q : bar_index     // XA-18: 保持中の q を優先 (A の再接触でも延長しない)"])
           and "    int  qUse  = live ? q : bar_index" in fh and input_values(S18) == input_values(S17)
           and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH
-                   and open(os.path.join(ROOT, p), encoding="utf-8").read() != xb.show("9bf191c", p)])
+                   and __import__("sx2_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read()) != xb.show("9bf191c", p)])
     # request scenario (N = 1, body ON): bar 1 (= 10) touch with the wrong body, bar 2 (= 11) re-touch + A, Zone at bar 3 (= 12)
     L = [2605.0] * 4
     base = [(2612, 2613, 2608, 2610)]
@@ -1871,7 +1871,7 @@ def gate_xa19():
           and '"SATS · 引きつけ側：接触→反発の有効本数"' in d19["stSatsTqN"]
           and all(es.kw(d19[k], "minval") == "0" and es.kw(d19[k], "step") == "1" for k in ("stSatsNowC", "stSatsNowN", "stSatsTqN"))
           and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH
-                   and open(os.path.join(ROOT, p), encoding="utf-8").read() != xb.show("b7f0036", p)])
+                   and __import__("sx2_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read()) != xb.show("b7f0036", p)])
     nb = block(S19, "                bool nowGo = false\n", "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar and not nowGo\n")
     wb19 = code_only(block(S19, "    bool  pwCancelBar = false\n", "    // (4) 新規 Entry"))
     wb18 = code_only(block(S18, "    bool  pwCancelBar = false\n", "    // (4) 新規 Entry"))

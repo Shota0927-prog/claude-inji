@@ -18,7 +18,8 @@ import subprocess
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src/README.txt",   # new in the later Gold layer XA-7
-             "tests/sx_build.py", "tests/sxs_sim.py")                                        # new in the later layer SX-1
+             "tests/sx_build.py", "tests/sxs_sim.py",                                        # new in the later layer SX-1
+             "tests/sx2_build.py", "tests/sx2s_sim.py")                                      # new in the later layer SX-2
 NEW_FILES = ("tests/cad_build.py", "tests/cad_adapt.py", "tests/cad_sim.py") + LATER_NEW
 _rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 

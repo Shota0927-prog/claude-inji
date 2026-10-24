@@ -32,7 +32,7 @@ ROOT = sx.ROOT
 B = sx.BASE_REV
 raw = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 code_only, input_values, input_decls, func = es.code_only, es.input_values, es.input_decls, es.func
-CUR = {k: raw(v["path"]) for k, v in sx.CUR.items()}
+CUR = {k: __import__("sx2_build").unapply(v["path"], raw(v["path"])) for k, v in sx.CUR.items()}   # SX-1 layer (the later SX-2 reverted exactly)
 BASE = {k: sx.show(B, v["path"]) for k, v in sx.CUR.items()}
 GOLD = xb.strip_strategy16(raw(xb.STR_PATH)) or ""     # Gold XA-15 layer (the later Gold-only XA-16 reverted exactly)
 RESULTS = []
