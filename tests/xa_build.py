@@ -1357,6 +1357,26 @@ STRATEGY_EDITS17 = [
 ]
 
 
+# ---- XA-18: immediate-side contact origin fix (Strategy only; after XA-17) ---------------------------------------------
+#  While a live contact record q is held, both rebound A and B keep that first q (a re-touch rebound A no longer moves the
+#  origin to the current bar); only without a record (or after the expiry dropped it) does a new touch start at the
+#  current bar. Everything else unchanged. strip_strategy18() -> the Strategy of 9bf191c.
+STRATEGY_EDITS18 = [
+    ("header",
+     "//  (接触期限 ON のとき、初期 OFF) の N は別入力。接触期限切れは接触記録と保持線だけを解除し、待機と待機期限は変えない。\n",
+     "//  (接触期限 ON のとき、初期 OFF) の N は別入力。接触期限切れは接触記録と保持線だけを解除し、待機と待機期限は変えない。\n"
+     "//  XA-18: 即時側の接触起点の修正。期限内の接触記録 q を保持中は反発 A・B とも最初の q を起点にする (再接触の A で当足へ\n"
+     "//  置き換えない)。記録が無い、または期限切れで解除された後の新しい接触だけ当足を起点にする。\n"),
+    ("text",
+     "//  記録し直せる。保持中の再接触で q を更新しない)。反発の起点 q: A = その足 / B = 記録した q (反発時刻へ置き換えない)。有効な\n",
+     "//  記録し直せる。保持中の再接触で q を更新しない)。反発の起点 q (XA-18): 期限内の記録があれば A・B ともその q / 無ければ (期限切れで\n"
+     "//  解除後を含む) その足の接触 (反発時刻へ置き換えない)。有効な\n"),
+    ("fix",
+     "    int  qUse  = rA ? bar_index : q\n",
+     "    int  qUse  = live ? q : bar_index     // XA-18: 保持中の q を優先 (A の再接触でも延長しない)\n"),
+]
+
+
 # ---- XA-2: position size (Strategy only; applied after XA-1) -----------------------------------------------------------
 QTY_BLOCK = (
     'var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"\n'
@@ -1570,8 +1590,13 @@ def build_strategy16():
     return _apply(build_strategy15(), STRATEGY_EDITS16)
 
 
-def build_strategy():
+def build_strategy17():
+    """XA-1 .. XA-17 (commit 9bf191c)."""
     return _apply(build_strategy16(), STRATEGY_EDITS17)
+
+
+def build_strategy():
+    return _apply(build_strategy17(), STRATEGY_EDITS18)
 
 
 def strip_visual3(t):
@@ -1591,8 +1616,15 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy18(t):
+    """reverse only XA-18 (-> the Strategy of 9bf191c byte for byte)."""
+    return _revert(t, STRATEGY_EDITS18)
+
+
 def strip_strategy17(t):
-    """reverse only XA-17 (-> the Strategy of 4c56095 byte for byte)."""
+    """reverse XA-18 when present (all or nothing) and XA-17 (-> the Strategy of 4c56095 byte for byte)."""
+    if t is not None and STRATEGY_EDITS18[0][2] in t:
+        t = strip_strategy18(t)
     return _revert(t, STRATEGY_EDITS17)
 
 

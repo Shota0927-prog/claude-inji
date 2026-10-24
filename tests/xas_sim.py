@@ -1645,14 +1645,14 @@ class Wait17(Wait13):
 
 
 def gate_xa17():
-    S17, S16 = rd(xb.STR_PATH), xb.show("4c56095", xb.STR_PATH)
+    S17, S16 = xb.strip_strategy18(rd(xb.STR_PATH)) or "", xb.show("4c56095", xb.STR_PATH)   # XA-17 layer (XA-18 reverted exactly)
     i17, i16 = input_values(S17), input_values(S16)
     d17 = input_decls(S17)
     new = {k: v for k, v in i17.items() if k not in i16}
     check("XT-01 XA-17: Strategy == xa_build.build_strategy() (XA-1 .. XA-17); strip_strategy17 gives 4c56095 byte for byte; inputs: "
           "'SATS · 即時側：接触からの有効本数' (the renamed XA-16 count, 1, min 0, step 1), new '引きつけ側：接触期限を使う' OFF and "
           "'引きつけ側：接触からの有効本数' 1 (min 0, step 1); every other default unchanged; other Pine files unchanged",
-          xb.build_strategy() == S17 and xb.strip_strategy17(S17) == S16 and xb.build_strategy16() == S16
+          xb.build_strategy17() == S17 and xb.strip_strategy17(S17) == S16 and xb.build_strategy16() == S16
           and new == {"stSatsTq": "false", "stSatsTqN": "1"} and i17["stSatsNowN"] == "1" and '"SATS · 即時側：接触からの有効本数"' in d17["stSatsNowN"]
           and es.kw(d17["stSatsTqN"], "minval") == "0" and es.kw(d17["stSatsTqN"], "step") == "1"
           and all(i17[k] == v for k, v in i16.items())
@@ -1774,9 +1774,77 @@ def gate_xa17():
           all(m != S17 and xb.strip_strategy17(m) is None for m in muts))
 
 
+# ---- XA-18: immediate-side contact origin (a live record keeps its first q for A and B) --------------------------------------
+def hist18(side, bars, lines, n, near=False, dist=0.0, body=False):
+    """port of the XA-18 f_satHist for one line (qUse = live ? q : this bar); returns per-bar (rebound, q of the rebound)."""
+    rec, out = None, []
+    for i, (o, h, l, c) in enumerate(bars):
+        L = lines[i - 1] if i >= 1 else None
+        pc = bars[i - 1][3] if i >= 1 else None
+        ok = L is not None and pc is not None
+        hit = ok and l <= L <= h
+        nr = ok and near and ((l > L and l - L <= dist) if side == 1 else (h < L and L - h <= dist))
+        fresh = ok and ((pc > L) if side == 1 else (pc < L))
+        live = rec is not None and i - rec <= n
+        tch = (hit or nr) and fresh
+        ra = tch and ((c > L) if side == 1 else (c < L))
+        rb = live and ok and ((pc <= L and c > L) if side == 1 else (pc >= L and c < L))
+        bd = (not body) or ((c > o) if side == 1 else (c < o))
+        reb = (ra or rb) and bd
+        q = rec if live else i
+        out.append((reb, q if reb else None))
+        rec = None if reb else (rec if live else (i if tch else None))
+    return out
+
+
+def gate_xa18():
+    S18, S17 = rd(xb.STR_PATH), xb.show("9bf191c", xb.STR_PATH)
+    fh = func(S18, "f_satHist(int side, float L, int q) =>")
+    check("XG-01 XA-18: Strategy == xa_build.build_strategy() (XA-1 .. XA-18); strip_strategy18 gives 9bf191c byte for byte; the only "
+          "code change is qUse = live ? q : bar_index (comments aside); inputs / defaults and every other Pine file unchanged",
+          xb.build_strategy() == S18 and xb.strip_strategy18(S18) == S17 and xb.build_strategy17() == S17
+          and sorted(l for l in es.changed_code(S17, S18) if l) == sorted(["int  qUse  = rA ? bar_index : q",
+                                                                          "int  qUse  = live ? q : bar_index     // XA-18: 保持中の q を優先 (A の再接触でも延長しない)"])
+          and "    int  qUse  = live ? q : bar_index" in fh and input_values(S18) == input_values(S17)
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH
+                   and open(os.path.join(ROOT, p), encoding="utf-8").read() != xb.show("9bf191c", p)])
+    # request scenario (N = 1, body ON): bar 1 (= 10) touch with the wrong body, bar 2 (= 11) re-touch + A, Zone at bar 3 (= 12)
+    L = [2605.0] * 4
+    base = [(2612, 2613, 2608, 2610)]
+    long_bars = base + [(2610, 2611, 2604.5, 2606), (2606, 2609, 2604.8, 2608.5)]
+    lh = hist18(1, long_bars, L, 1, body=True)
+    mir = lambda bs: [(5200 - o, 5200 - l, 5200 - h, 5200 - c) for o, h, l, c in bs]
+    sh = hist18(-1, mir(long_bars), [5200 - x for x in L], 1, body=True)
+    lc = [(q, e, 1) for e, (r, q) in enumerate(lh) if r]
+    sc = [(q, e, 1) for e, (r, q) in enumerate(sh) if r]
+    old17 = [(q, e, 1) for e, (r, q) in enumerate(hist17(1, long_bars, L, 1, body=True)) if r]
+    # after an expiry a new touch starts at its own bar: touch 1 (wrong body), above at 2, record dropped at 3, touch + A at 3
+    exp_bars = base + [(2610, 2611, 2604.5, 2606), (2606, 2609, 2606, 2608), (2608, 2609, 2604.9, 2608.5)]
+    ex = hist18(1, exp_bars, [2605.0] * 4, 1, body=True)
+    exs = hist18(-1, mir(exp_bars), [5200 - 2605.0] * 4, 1, body=True)
+    exc = [(q, e, 1) for e, (r, q) in enumerate(ex) if r]
+    excs = [(q, e, 1) for e, (r, q) in enumerate(exs) if r]
+    # a B keeps the first touch too; a held record and a same-line touch + A without the wrong body
+    b_bars = base + [(2610, 2610.5, 2604.0, 2604.5), (2604.5, 2607, 2603.8, 2606)]
+    bh = hist18(1, b_bars, [2605.0] * 3, 1)
+    check("XG-02 model (N = 1, body ON), Long and Short: touch at 10 with the wrong body (no rebound, record q = 10), re-touch + A at 11 "
+          "-> the rebound keeps q = 10, so the Zone at 12 (t - q = 2) gives no immediate order (the Zone at 11 still would); XA-17 "
+          "moved q to 11 (would have ordered at 12); after the record expires a new touch + A starts at its own bar and is usable "
+          "(Zone the same / next bar); B keeps the recorded touch",
+          lh == [(False, None), (False, None), (True, 1)] and sc == lc == [(1, 2, 1)]
+          and pick17(lc, 3, 1) == (None, 0) and pick17(sc, 3, 1) == (None, 0) and pick17(lc, 2, 1) == (1, 1)
+          and old17 == [(2, 2, 1)] and pick17(old17, 3, 1) == (2, 1)
+          and exc == excs == [(3, 3, 1)] and pick17(exc, 3, 1) == (3, 1) and pick17(exc, 4, 1) == (3, 1) and pick17(exc, 5, 1) == (None, 0)
+          and bh[2] == (True, 1), str((lh, sc, old17, exc, excs, bh)))
+    m = S18.replace("    int  qUse  = live ? q : bar_index", "    int  qUse  = rA ? bar_index : q")
+    m2 = S18.replace("    int  qUse  = live ? q : bar_index", "    int  qUse  = bar_index")
+    check("XG-03 mutations (the XA-17 rule A -> this bar, always this bar) do not strip back to 9bf191c",
+          m != S18 and m2 != S18 and xb.strip_strategy18(m) is None and xb.strip_strategy18(m2) is None)
+
+
 def main():
     for g in (gate_static, gate_model, gate_mutation, gate_xa8, gate_xa9, gate_xa10, gate_xa11, gate_xa12, gate_xa13, gate_xa14, gate_xa15,
-              gate_xa16, gate_xa17):
+              gate_xa16, gate_xa17, gate_xa18):
         try:
             g()
         except Exception:
