@@ -189,7 +189,7 @@ def gate_qty():
           and not re.search(r"commission|slippage|margin_", hd) and req(S2) == req(S1)
           and re.findall(r"^import .*$", S2, re.M) == ["import sekine3310/ZoneEnginePractical/6 as zn"])
     mod = [m for m in git("diff", "--name-only", XA1_REV, "--").split() if not __import__("uj3_adapt").ok(m, XA1_REV)
-           and not __import__("cad_adapt").ok(m, XA1_REV)]   # UJ-3 / CAD-1: exact
+           and not __import__("cad_adapt").ok(m, XA1_REV) and not __import__("xal_build").ok(m)]   # UJ-3 / CAD-1 / XL-1: exact
     check("XQ-07 vs 2732772: only ZoneStrategyXAU.pine, ZoneVisualPractical.pine (exactly XA-3) and tests/xa_build.py / "
           "tests/xa_sim.py change (no other Pine / Engine)",
           set(mod) <= {xb.STR_PATH, xb.VIS_PATH, "tests/xa_build.py", "tests/xa_sim.py"} | {xb.ENG_PATH, "tests/xae_sim.py"} and xb.STR_PATH in mod
@@ -308,7 +308,7 @@ def gate_xa3():
           and "Flip 10 USD" not in hdr and "SL Buffer 3、" not in hdr and "Cluster 5 / Flip 10 は従来どおり" not in hdr
           and "Flip 5 USD" in hdr and "SL Buffer 1.5" in SF[:SF.index("//@version=5")])
     mod = [m for m in git("diff", "--name-only", XA2_REV, "--").split() if not __import__("uj3_adapt").ok(m, XA2_REV)
-           and not __import__("cad_adapt").ok(m, XA2_REV)]   # UJ-3 / CAD-1: exact
+           and not __import__("cad_adapt").ok(m, XA2_REV) and not __import__("xal_build").ok(m)]   # UJ-3 / CAD-1 / XL-1: exact
     check("XT-07 vs 69e6f0c: only the two Gold Pine files (exactly XA-3) and tests/xa_build.py / xa_sim.py change; other "
           "symbols' Pine files and Engines untouched (XA-4 adds only the new XAUUSD Engine and xae_sim)",
           set(mod) <= {xb.VIS_PATH, xb.STR_PATH, "tests/xa_build.py", "tests/xa_sim.py"} | {xb.ENG_PATH, "tests/xae_sim.py"}

@@ -2624,7 +2624,29 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                       'rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
                       'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
                       'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
-                      'text=True).stdout\n')],
+                      'text=True).stdout\n'),
+                     ('    mod = [m for m in git("diff", "--name-only", XA1_REV, "--").split() if not '
+                      '__import__("uj3_adapt").ok(m, XA1_REV)\n'
+                      '           and not __import__("cad_adapt").ok(m, XA1_REV)]   # UJ-3 / CAD-1: exact\n'
+                      '    check("XQ-07 vs 2732772: only ZoneStrategyXAU.pine, ZoneVisualPractical.pine (exactly '
+                      'XA-3) and tests/xa_build.py / "\n',
+                      '    mod = [m for m in git("diff", "--name-only", XA1_REV, "--").split() if not '
+                      '__import__("uj3_adapt").ok(m, XA1_REV)\n'
+                      '           and not __import__("cad_adapt").ok(m, XA1_REV) and not '
+                      '__import__("xal_build").ok(m)]   # UJ-3 / CAD-1 / XL-1: exact\n'
+                      '    check("XQ-07 vs 2732772: only ZoneStrategyXAU.pine, ZoneVisualPractical.pine (exactly '
+                      'XA-3) and tests/xa_build.py / "\n'),
+                     ('    mod = [m for m in git("diff", "--name-only", XA2_REV, "--").split() if not '
+                      '__import__("uj3_adapt").ok(m, XA2_REV)\n'
+                      '           and not __import__("cad_adapt").ok(m, XA2_REV)]   # UJ-3 / CAD-1: exact\n'
+                      '    check("XT-07 vs 69e6f0c: only the two Gold Pine files (exactly XA-3) and '
+                      'tests/xa_build.py / xa_sim.py change; other "\n',
+                      '    mod = [m for m in git("diff", "--name-only", XA2_REV, "--").split() if not '
+                      '__import__("uj3_adapt").ok(m, XA2_REV)\n'
+                      '           and not __import__("cad_adapt").ok(m, XA2_REV) and not '
+                      '__import__("xal_build").ok(m)]   # UJ-3 / CAD-1 / XL-1: exact\n'
+                      '    check("XT-07 vs 69e6f0c: only the two Gold Pine files (exactly XA-3) and '
+                      'tests/xa_build.py / xa_sim.py change; other "\n')],
  'tests/xae_sim.py': [('  XU : mutations — mirror and source mutations are caught\n\n',
                        '  XU : mutations — mirror and source mutations are caught\n'
                        '  XF : XA-5 — Gold Short adopted defaults (Day/Swing Merge Nearby, Merge Distance 0; '
