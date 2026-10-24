@@ -191,9 +191,9 @@ def gate_static():
     st = git("status", "--porcelain").split("\n")
     mod = set(git("diff", "--name-only", PREV, "--").split()) | {l[3:] for l in st if l.startswith("??")}
     mod -= {"tests/__pycache__/"}
-    mod = {m for m in mod if not __import__("uj3_adapt").ok(m, PREV) and not __import__("cad_adapt").ok(m, PREV)}     # UJ-3 / CAD-1: exact
+    mod = {m for m in mod if not __import__("uj3_adapt").ok(m, PREV) and not __import__("cad_adapt").ok(m, PREV) and not __import__("xal_build").ok(m)}     # UJ-3 / CAD-1 / XL-1: exact
     allowed = {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", "tests/xa_sim.py", "tests/xae_sim.py"}
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH)]
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH) and not __import__("xal_build").ok(p)]
     check("XE-10 vs 17d1ca2 only the Gold Visual / Strategy, the new XAUUSD Engine and xa_build / xa_sim / xae_sim change; "
           "every other Pine file (shared /6, GBPJPY / EURUSD / BTC / USDJPY / GBPUSD Engines, other symbols) byte-identical",
           mod <= allowed and {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH} <= mod
@@ -587,7 +587,8 @@ def gate_xa5():
     st = git("status", "--porcelain").split("\n")
     mod = set(git("diff", "--name-only", A, "--").split()) | {l[3:] for l in st if l.startswith("??")}
     mod -= {"tests/__pycache__/"}
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, xb.STR_PATH)]
+    mod = {m for m in mod if not __import__("xal_build").ok(m)}     # XL-1 (Gold Long, new): exact
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, xb.STR_PATH) and not __import__("xal_build").ok(p)]
     check("XF-07 vs a33d2b0 only the Gold Visual / Strategy, xa_build, xae_sim, cad_sim and cad_adapt change; every other Pine "
           "file (Engines incl. ZoneEnginePracticalXAUUSD, other symbols) byte-identical",
           {m for m in mod if not (m in __import__("sx_build").TOUCHED and __import__("cad_adapt").later_ok(m, A))}   # SX-1: exact only

@@ -58,7 +58,7 @@ UJ_OLD = ['"\\nMode: " + stMode +', '"\\nE: " + f_num(ePx, "#.000") + (stModeA ?
 
 
 def gate_static():
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in sx.FILES]
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in sx.FILES and not __import__("xal_build").ok(p)]
     check("SX-01 the five Strategies == sx_build.build() and strip back to the 443c139 files byte for byte (unapply too); Engines, "
           "Visuals, Gold and every other Pine file byte-identical to 443c139 (no Library re-publish); strategy() (calc_on_every_tick "
           "= true) and the import line unchanged",

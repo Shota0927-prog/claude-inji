@@ -19,7 +19,8 @@ import subprocess
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src/README.txt",   # new in the later Gold layer XA-7
              "tests/sx_build.py", "tests/sxs_sim.py",                                        # new in the later layer SX-1
-             "tests/sx2_build.py", "tests/sx2s_sim.py")                                      # new in the later layer SX-2
+             "tests/sx2_build.py", "tests/sx2s_sim.py",                                      # new in the later layer SX-2
+             "tests/xal_build.py", "tests/xal_sim.py")                                       # new in the later layer XL-1 (Gold Long)
 NEW_FILES = ("tests/cad_build.py", "tests/cad_adapt.py", "tests/cad_sim.py") + LATER_NEW
 _rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 
@@ -499,13 +500,21 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                        'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
                        'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
                        'text=True).stdout\n'),
-                      ('    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in cb.FILES]\n'
+                      ('          str((ujg, cdg[0])))\n'
+                       '    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in cb.FILES]\n'
                        '    changed = [p for p in others if rd(p) != git("show", f"{PREV}:{p}")]\n'
                        '    cls = {"ZoneStrategyXAU.pine": "alert(" not in code_only(rd("ZoneStrategyXAU.pine")),\n',
-                       '    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in cb.FILES]\n'
+                       '          str((ujg, cdg[0])))\n'
+                       '    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in cb.FILES and '
+                       'not __import__("xal_build").ok(p)]   # XL-1 Long: exact\n'
                        '    changed = [p for p in others if rd(p) != git("show", f"{PREV}:{p}") and not '
                        '__import__("cad_adapt").later_pine_ok(p, PREV)]   # later layers: exact\n'
                        '    cls = {"ZoneStrategyXAU.pine": "alert(" not in code_only(rd("ZoneStrategyXAU.pine")),\n'),
+                      ('    mod -= {"tests/__pycache__/"}\n    pine = {m for m in mod if m.endswith(".pine")}\n',
+                       '    mod -= {"tests/__pycache__/"}\n'
+                       '    mod = {m for m in mod if not __import__("xal_build").ok(m)}     # XL-1 (Gold Long, new): '
+                       'exact\n'
+                       '    pine = {m for m in mod if m.endswith(".pine")}\n'),
                       ('          "in CAD-1 or carries exactly its recorded CAD-1 edits (cad_adapt: reverting them '
                        'gives the 867ff7e text)",\n'
                        '          pine == set(cb.FILES) and all(m in rec.NEW_FILES or rec.unadapt(m, rd(m)) == '
@@ -548,7 +557,28 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                        'rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
                        'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
                        'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
-                       'text=True).stdout\n')],
+                       'text=True).stdout\n'),
+                      ('    mod -= {"tests/__pycache__/"}\n'
+                       '    mod = {m for m in mod if not __import__("cad_adapt").ok(m, PREV)}     # CAD-1 '
+                       '(confirmed-alert dedup): exact\n'
+                       '    allowed = {ub.STR_PATH, "tests/uj_build.py", "tests/uj_sim.py", "tests/ujl_sim.py", '
+                       '"tests/uj3_adapt.py", "tests/bte_sim.py",\n',
+                       '    mod -= {"tests/__pycache__/"}\n'
+                       '    mod = {m for m in mod if not __import__("cad_adapt").ok(m, PREV) and not '
+                       '__import__("xal_build").ok(m)}     # CAD-1 / XL-1: exact\n'
+                       '    allowed = {ub.STR_PATH, "tests/uj_build.py", "tests/uj_sim.py", "tests/ujl_sim.py", '
+                       '"tests/uj3_adapt.py", "tests/bte_sim.py",\n'),
+                      ('               "tests/xa_sim.py", "tests/xae_sim.py", "tests/xa_build.py", '
+                       '"tests/ujt_sim.py"}\n'
+                       '    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != ub.STR_PATH]\n'
+                       '    check("UL-07 vs 7363ef1 only the USDJPY Strategy and the USDJPY generator / fixtures (+ '
+                       'the exact adaptation of four older "\n',
+                       '               "tests/xa_sim.py", "tests/xae_sim.py", "tests/xa_build.py", '
+                       '"tests/ujt_sim.py"}\n'
+                       '    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != ub.STR_PATH and '
+                       'not __import__("xal_build").ok(p)]\n'
+                       '    check("UL-07 vs 7363ef1 only the USDJPY Strategy and the USDJPY generator / fixtures (+ '
+                       'the exact adaptation of four older "\n')],
  'tests/ujt_sim.py': [('UJ3 = "ab9820f"\n'
                        'rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()\n'
                        'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
@@ -557,7 +587,24 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                        'rd = lambda p: __import__("sx_build").unapply(p, open(os.path.join(ROOT, p), '
                        'encoding="utf-8").read())   # SX-1 reverted (pinned in sxs_sim)\n'
                        'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
-                       'text=True).stdout\n')],
+                       'text=True).stdout\n'),
+                      ('    mod -= {"tests/__pycache__/"}\n'
+                       '    mod = {m for m in mod if not __import__("cad_adapt").ok(m, UJ3)}     # CAD-1 '
+                       '(confirmed-alert dedup): exact\n'
+                       '    recs_ok = []\n',
+                       '    mod -= {"tests/__pycache__/"}\n'
+                       '    mod = {m for m in mod if not __import__("cad_adapt").ok(m, UJ3) and not '
+                       '__import__("xal_build").ok(m)}     # CAD-1 / XL-1: exact\n'
+                       '    recs_ok = []\n'),
+                      ('        recs_ok.append(s == new)\n'
+                       '    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != ub.STR_PATH]\n'
+                       '    check("UT-05 vs ab9820f only the USDJPY Strategy, uj_build, uj3_adapt (record '
+                       'regenerated; code part by exactly the recorded "\n',
+                       '        recs_ok.append(s == new)\n'
+                       '    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != ub.STR_PATH and '
+                       'not __import__("xal_build").ok(p)]\n'
+                       '    check("UT-05 vs ab9820f only the USDJPY Strategy, uj_build, uj3_adapt (record '
+                       'regenerated; code part by exactly the recorded "\n')],
  'tests/xa_build.py': [('\n'
                         '# ---- XA-2: position size (Strategy only; applied after XA-1) '
                         '-----------------------------------------------------------\n',
@@ -2646,6 +2693,29 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                        'xb.strip_strategy(rd(xb.STR_PATH)) == xb.show(xb.BASE_REV, xb.STR_PATH)\n'
                        '          and {k for k, _, _ in xb.VISUAL_EDITS4} == {"header", "import", "dsmode", '
                        '"accmode", "rn", "fvg", "fvgdir", "display"}\n'),
+                      ('    mod -= {"tests/__pycache__/"}\n'
+                       '    mod = {m for m in mod if not __import__("uj3_adapt").ok(m, PREV) and not '
+                       '__import__("cad_adapt").ok(m, PREV)}     # UJ-3 / CAD-1: exact\n'
+                       '    allowed = {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", '
+                       '"tests/xa_sim.py", "tests/xae_sim.py"}\n',
+                       '    mod -= {"tests/__pycache__/"}\n'
+                       '    mod = {m for m in mod if not __import__("uj3_adapt").ok(m, PREV) and not '
+                       '__import__("cad_adapt").ok(m, PREV) and not __import__("xal_build").ok(m)}     # UJ-3 / '
+                       'CAD-1 / XL-1: exact\n'
+                       '    allowed = {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", '
+                       '"tests/xa_sim.py", "tests/xae_sim.py"}\n'),
+                      ('    allowed = {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", '
+                       '"tests/xa_sim.py", "tests/xae_sim.py"}\n'
+                       '    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, '
+                       'xb.STR_PATH, xb.ENG_PATH)]\n'
+                       '    check("XE-10 vs 17d1ca2 only the Gold Visual / Strategy, the new XAUUSD Engine and '
+                       'xa_build / xa_sim / xae_sim change; "\n',
+                       '    allowed = {xb.VIS_PATH, xb.STR_PATH, xb.ENG_PATH, "tests/xa_build.py", '
+                       '"tests/xa_sim.py", "tests/xae_sim.py"}\n'
+                       '    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, '
+                       'xb.STR_PATH, xb.ENG_PATH) and not __import__("xal_build").ok(p)]\n'
+                       '    check("XE-10 vs 17d1ca2 only the Gold Visual / Strategy, the new XAUUSD Engine and '
+                       'xa_build / xa_sim / xae_sim change; "\n'),
                       ('\ndef gate_mutation():\n',
                        '\n'
                        'def gate_xa5():\n'
@@ -2752,8 +2822,10 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                        '    mod = set(git("diff", "--name-only", A, "--").split()) | {l[3:] for l in st if '
                        'l.startswith("??")}\n'
                        '    mod -= {"tests/__pycache__/"}\n'
+                       '    mod = {m for m in mod if not __import__("xal_build").ok(m)}     # XL-1 (Gold Long, new): '
+                       'exact\n'
                        '    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, '
-                       'xb.STR_PATH)]\n'
+                       'xb.STR_PATH) and not __import__("xal_build").ok(p)]\n'
                        '    check("XF-07 vs a33d2b0 only the Gold Visual / Strategy, xa_build, xae_sim, cad_sim and '
                        'cad_adapt change; every other Pine "\n'
                        '          "file (Engines incl. ZoneEnginePracticalXAUUSD, other symbols) byte-identical",\n'

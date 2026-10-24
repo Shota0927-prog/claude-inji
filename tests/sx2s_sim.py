@@ -52,7 +52,7 @@ HOOKS = sorted(["bool rebB      = pwTouched and inRange and (pwSide == 1 ? (pc <
 
 
 def gate_static():
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in s2.FILES]
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in s2.FILES and not __import__("xal_build").ok(p)]
     check("SY-01 the five Strategies == sx2_build.build() and strip back to the 32cc570 files (= the SX-1 files of b59d621) byte for "
           "byte; Gold, Engines, Visuals and every other Pine file byte-identical to 32cc570; strategy() (calc_on_every_tick = true), "
           "the import line and the request count unchanged",
