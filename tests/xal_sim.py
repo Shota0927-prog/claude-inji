@@ -1,7 +1,7 @@
 """XL-1 fixtures — Gold Long Strategy ZoneStrategyXAULong.pine (tests/xal_build.py).
 
-  XLL : static on the delivered Long file — == xal_build.build(); strip gives the Short Strategy (ZoneStrategyXAU.pine of
-        2550d27, which is also the current Short file) byte for byte; the Short file, Engines, Visuals and other symbols are
+  XLL : static on the delivered Long file — == xal_build.build() (XL-1 + the XA-21 alert layer); strip gives the Short
+        Strategy (ZoneStrategyXAU.pine of 2550d27 = the current Short file with XA-21 reverted exactly) byte for byte; the Short file, Engines, Visuals and other symbols are
         unchanged; every adopted Long default of the request table; every other input default equal to the Short file; the
         only changed code lines are the title / shorttitle and the default declarations (no trading / size / order code
         change); strategy() calculation / fill settings, the shared Engine import, the size function and capital kept; the
@@ -40,9 +40,11 @@ def main_checks():
     S0 = xl.show(xl.SRC_REV, xl.SRC_PATH)
     others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xl.LONG_PATH,)]
     check("XLL-01 the delivered ZoneStrategyXAULong.pine == xal_build.build() and strips back to the Short Strategy of 2550d27 byte for "
-          "byte; the Short file ZoneStrategyXAU.pine is that same file (unchanged); Engines, Visuals and every other Pine file unchanged",
-          L == xl.build() and xl.strip(L) == S0 and S == S0
-          and not [p for p in others if raw(p) != xl.show(xl.SRC_REV, p)])
+          "byte (XA-21 reverted: the XL-1 Long file of d67941f); the Short file ZoneStrategyXAU.pine is that same file plus exactly XA-21; "
+          "Engines, Visuals and every other Pine file unchanged",
+          L == xl.build() and xl.strip(L) == S0 and xl.strip21(L) == xl.show("d67941f", xl.LONG_PATH) == xl.build1()
+          and __import__("xa_build").strip_strategy21(S) == S0
+          and not [p for p in others if raw(p) != xl.show(xl.SRC_REV, p) and p != xl.SRC_PATH])
     iv, isrc = input_values(L), input_values(S)
     bad = {k: (iv.get(k), v) for k, v in TABLE.items() if iv.get(k) != v}
     diff = {k for k in isrc if isrc[k] != iv[k]}
@@ -64,11 +66,11 @@ def main_checks():
           and code_only(L).count("\n") == code_only(S).count("\n"), str([l for l in gone + new if not allowed(l)]))
     st = lambda t: re.sub(r'\s+title\s+= "[^"]*",\n\s+shorttitle\s+= "[^"]*",\n', "", es.seg(t, "strategy(", "import "))
     check("XLL-04 strategy(): title 'Zone Strategy XAU Long' / shorttitle 'ZONE-ST-L' (Short: 'Zone Strategy XAU' / 'ZONE-ST'); every "
-          "calculation / fill / capital setting identical (initial capital 300,000 JPY, calc_on_every_tick false, process_orders_on_close "
+          "calculation / fill / capital setting identical (initial capital 300,000 JPY, calc_on_every_tick true (XA-21), process_orders_on_close "
           "false, pyramiding 0); the shared Engine import ZoneEnginePracticalXAUUSD/2; f_stQty / f_stTp / f_satBand / f_satHist / f_beTrig "
           "identical; budget 300,000 x 3 %",
           '     title                  = "Zone Strategy XAU Long",\n' in L and '     shorttitle             = "ZONE-ST-L",\n' in L
-          and st(L) == st(S) and "initial_capital        = 300000," in L and "currency.JPY" in L and "calc_on_every_tick     = false," in L
+          and st(L) == st(S) and "initial_capital        = 300000," in L and "currency.JPY" in L and "calc_on_every_tick     = true," in L
           and "import sekine3310/ZoneEnginePracticalXAUUSD/2 as zn" in L
           and all(func(L, h) == func(S, h) for h in ("f_stQty(int side, float ref, float sl) =>", "f_stTp(", "f_satBand() =>",
                                                     "f_satHist(int side, float L, int q) =>", "f_beTrig(", "f_hPick(", "f_satPick("))

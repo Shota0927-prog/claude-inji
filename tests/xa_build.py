@@ -1572,6 +1572,204 @@ def show(rev, path):
     return subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{path}"], capture_output=True, text=True).stdout
 
 
+# ---- XA-21: provisional / confirmed alerts (Strategy only; applied after XA-20) ---------------------------------------------
+#  Ported from the currency Strategies (GBPJPY of PROV_REV: f_stProvEval verbatim, the SATS provisional evaluation with the
+#  Gold near distance stSatsNearD; the history-state gate of SX-2). Gold-specific (requested): message format (Entry kind,
+#  SL / TP widths in USD, RR from the shown prices, JST time), varip array guards (-1 = none sent) and the provisional
+#  real-time session check. No labels (not requested).
+PROV_REV = "4eb7b0d"
+PROV_PATH = "ZoneStrategyGBPJPY.pine"
+
+
+def _seg(text, start, end_incl):
+    i = text.index(start)
+    j = text.index(end_incl, i) + len(end_incl)
+    return text[i:j]
+
+
+def _prov_fns():
+    g = show(PROV_REV, PROV_PATH)
+    st = _seg(g, "// 仮評価 (読み取り専用)。確定時の新規 Entry 判定 (4) から", "    [side, ePx, sl, tpP]\n")
+    sa = _seg(g, "// SX-1 SATS 仮評価 (読み取り専用)。", "    [side, ePx, sl, tp]\n")
+    for a, b in (("// SX-1 SATS 仮評価 (読み取り専用)。", "// SATS 仮評価 (読み取り専用)。"),
+                 ("            // SX-2: 引きつけ側の接触期限", "            // 引きつけ側の接触期限"),
+                 ("        // SX-2: 待機前で即時エントリー ON", "        // 待機前で即時エントリー ON")):
+        assert sa.count(a) == 1, a
+        sa = sa.replace(a, b)
+    assert sa.count("stSatsNearPx") == 2 and "SX-" not in sa and "SX-" not in st and "GBPJPY" not in st + sa
+    return st + "\n" + sa.replace("stSatsNearPx", "stSatsNearD")
+
+
+XA21_HDR = (
+    "//  XA-21: 仮 / 確定アラート (他通貨 Strategy と同じ意味。各 ON / OFF・初期 ON)。仮アラートのため calc_on_every_tick = true。未確定 tick\n"
+    "//  では zn.update / 反発履歴の状態 / Zone 走査 / 注文を行わず、確定時の状態を読むだけ (ヒストリカル = 全足確定なので注文・約定・\n"
+    "//  損益は変わらない)。確定 = 確定足で strategy.entry を出した分岐 (SATS 引きつけ / SATS 即時 / Current) で 1 回 (約定通知ではない)。\n"
+    "//  仮 = 形成中の 5分足がこのまま確定したら発注になる条件の予告 (待機の準備だけでは出さない。注文・状態は変えない)。通知は 5分足\n"
+    "//  1 本につき仮・確定それぞれ最大 1 回 (varip)。新規発注と通知は既存の時間帯 (初期 9:00〜翌 2:00 JST) の中だけ (決済管理は時間外も継続)。\n")
+
+HIST21_OLD = (
+    "int hNL = f_hPrune(hQsL, hEsL, hKsL)\nint hNS = f_hPrune(hQsS, hEsS, hKsS)\n"
+    "if hL1\n    array.push(hQsL, qL1)\n    array.push(hEsL, bar_index)\n    array.push(hKsL, 1)\n"
+    "if hL2\n    array.push(hQsL, qL2)\n    array.push(hEsL, bar_index)\n    array.push(hKsL, 2)\n"
+    "if hL3\n    array.push(hQsL, qL3)\n    array.push(hEsL, bar_index)\n    array.push(hKsL, 3)\n"
+    "if hS1\n    array.push(hQsS, qS1)\n    array.push(hEsS, bar_index)\n    array.push(hKsS, 1)\n"
+    "if hS2\n    array.push(hQsS, qS2)\n    array.push(hEsS, bar_index)\n    array.push(hKsS, 2)\n"
+    "if hS3\n    array.push(hQsS, qS3)\n    array.push(hEsS, bar_index)\n    array.push(hKsS, 3)\n"
+    "[hQL, hEL, hKL] = f_hPick(hQsL, hEsL, hKsL)     // 即時側で使える Long の反発: 起点 q / 成立足 e / 線 (無ければ na / na / 0)\n"
+    "[hQS, hES, hKS] = f_hPick(hQsS, hEsS, hKsS)\n")
+HIST21_NEW = (
+    "// XA-21: 履歴の状態 (接触記録・反発候補) は確定足でだけ書き換える (calc_on_every_tick = true の形成中 tick は読むだけ。SX-2 と同じ)。\n"
+    "//  採用は、この足の反発 (e = 現在足。t − e = 0、e − q <= Nc は記録の寿命で保証) を先に、無ければ確定済み候補から最新の e\n"
+    "//  (XA-20 までの「この足の候補を追加してから選ぶ」と確定足で同じ結果。形成中 tick では仮評価用の読取値)\n"
+    "if barstate.isconfirmed\n"
+    "    hTqL1 := nL1\n    hTqL2 := nL2\n    hTqL3 := nL3\n    hTqS1 := nS1\n    hTqS2 := nS2\n    hTqS3 := nS3\n"
+    + "".join("    " + l + "\n" for l in HIST21_OLD.split("\n")[:26]) +
+    "[pQL, pEL, pKL] = f_hPick(hQsL, hEsL, hKsL)\n"
+    "[pQS, pES, pKS] = f_hPick(hQsS, hEsS, hKsS)\n"
+    "bool hNowL = hL1 or hL2 or hL3\n"
+    "bool hNowS = hS1 or hS2 or hS3\n"
+    "int  hQL = hNowL ? (hL1 ? qL1 : hL2 ? qL2 : qL3) : pQL     // 即時側で使える Long の反発: 起点 q / 成立足 e / 線 (無ければ na / na / 0)\n"
+    "int  hEL = hNowL ? bar_index : pEL\n"
+    "int  hKL = hNowL ? (hL1 ? 1 : hL2 ? 2 : 3) : pKL\n"
+    "int  hQS = hNowS ? (hS1 ? qS1 : hS2 ? qS2 : qS3) : pQS\n"
+    "int  hES = hNowS ? bar_index : pES\n"
+    "int  hKS = hNowS ? (hS1 ? 1 : hS2 ? 2 : 3) : pKS\n")
+
+ALERT21_INPUTS = (
+    'var string G_STA = "03 · Strategy Alerts"\n'
+    'stAlertProv = input.bool(true, "仮アラート (形成中の5分足・未確定)", group = G_STA,\n'
+    '     tooltip = "XA-21: 形成中の 5分足がこのまま確定したら発注になる条件 (SATS 引きつけ / SATS 即時 / Current) の予告。注文・状態は変えない。\\n" +\n'
+    '     "確定時に不成立になる場合あり (そのときは確定アラートなし)。待機の準備だけでは出さない。1 本の 5分足につき最大 1 回。\\n" +\n'
+    '     "新規 Entry の時間帯の中だけ (判定足の終了時刻と送信時の実時刻の両方)。TradingView の Alert は「alert() function calls only」で作成。")\n'
+    'stAlertConf = input.bool(true, "確定アラート (5分足確定時の発注成立)", group = G_STA,\n'
+    '     tooltip = "XA-21: 5分足の確定時に strategy.entry を出した分岐 (SATS 引きつけ / SATS 即時 / Current) で 1 回。約定通知ではない。\\n" +\n'
+    '     "1 本の 5分足につき最大 1 回 (仮アラートの有無・ON / OFF とは独立)。通知の重複防止は発注を止めない。")\n')
+
+
+def _alert_state():
+    return (
+        "var array<float> stTpUpPrev = array.new_float()     // XA-21: 直前の確定時の TP 用 Zone 端 (仮評価の RR 事前判定用)\n"
+        "var array<float> stTpDnPrev = array.new_float()\n"
+        "varip array<int> gProvAlertBar      = array.new_int(1, -1)     // XA-21: 仮アラートを送った 5分足の time (-1 = 未送信)。varip = tick・巻き戻しでも残る\n"
+        "varip array<int> gConfirmedAlertBar = array.new_int(1, -1)     // XA-21: 確定アラートを送った 5分足の time (-1 = 未送信。仮とは別の状態)\n"
+        "\n"
+        "// ---- XA-21 仮 / 確定アラート (XAUUSD) -------------------------------------------------------------------------\n"
+        "//  ・確定: 確定足で実際に strategy.entry を出した分岐 (SATS 引きつけ / SATS 即時 / Current) で 1 回。約定・建玉増加は使わない。\n"
+        "//          alert.freq_all + 送信済み time の明示確認 (同じ 5分足では最大 1 回)。送信済みでも発注は止めない\n"
+        "//  ・仮  : 形成中の 5分足 (未確定 tick) だけで、このまま確定したら発注になるかを読取専用で評価。1 本の 5分足につき最大 1 回。\n"
+        "//          仮の送信済み状態と確定の送信済み状態は互いに参照しない (仮なしでも確定は出る / 仮の後に不成立なら確定は出ない)\n"
+        "//  ・本文: Entry (成行は参考価格 = 判断足 / 形成中の終値、Current A は指値価格)、SL、TP (SATS は固定 TP0、Current は発注判断時の\n"
+        "//          予定 TP。最終 TP は約定確認後に実約定価格から決める)、SL 幅 / TP 幅 (表示した Entry との差、USD)、RR (TP 幅 ÷ SL 幅)、\n"
+        "//          日時 (日本時間。確定 = 判断足の終了時刻 / 仮 = 送信時刻)。価格は最小価格刻みの桁。計算できない値は \"-\"\n"
+        "f_stPx(float v) =>\n"
+        "    na(v) ? \"-\" : str.tostring(v, format.mintick)\n"
+        "\n"
+        "f_stAlertMsg(string kind, int side, float ePx, float sl, float tp, bool isLim, bool isSats) =>\n"
+        "    float slW = side * (ePx - sl)\n"
+        "    float tpW = side * (tp - ePx)\n"
+        "    float rr  = not na(slW) and slW > 0 and not na(tpW) ? tpW / slW : na\n"
+        "    int   tAt = kind == \"仮\" ? timenow : time_close\n"
+        "    \"【\" + kind + \"】\" + syminfo.ticker + \" \" + (side == 1 ? \"LONG\" : \"SHORT\") +\n"
+        "     \"\\nEntry：\" + f_stPx(ePx) + (isLim ? \"（指値価格）\" : \"（成行参考価格）\") +\n"
+        "     \"\\nSL：\" + f_stPx(sl) +\n"
+        "     \"\\nTP：\" + f_stPx(tp) + (isSats ? \"（固定TP0）\" : \"（発注判断時の予定TP。最終TPは約定確認後に決定）\") +\n"
+        "     \"\\nSL幅：\" + (na(slW) ? \"-\" : f_stPx(slW) + \"ドル\") +\n"
+        "     \"\\nTP幅：\" + (na(tpW) ? \"-\" : f_stPx(tpW) + \"ドル\") +\n"
+        "     \"\\nRR：\" + (na(rr) ? \"-\" : \"1:\" + str.tostring(rr, \"0.00\")) +\n"
+        "     \"\\n日時：\" + str.format_time(tAt, \"yyyy-MM-dd HH:mm:ss\", \"Asia/Tokyo\") + \"（日本時間）\" +\n"
+        "     (kind == \"仮\" ? \"\\n※未確定：5分足確定時に不成立になる場合あり\" : \"\")\n"
+        "\n"
+        "// 確定アラート: 発注した分岐から呼ぶ (通知だけ。戻り値 = 送信したか)\n"
+        "f_stConfAlert(int side, float ePx, float sl, float tp, bool isLim, bool isSats) =>\n"
+        "    bool send = stAlertConf and array.get(gConfirmedAlertBar, 0) != time\n"
+        "    if send\n"
+        "        array.set(gConfirmedAlertBar, 0, time)\n"
+        "        alert(f_stAlertMsg(\"確定\", side, ePx, sl, tp, isLim, isSats), alert.freq_all)\n"
+        "    send\n"
+        "\n"
+        + _prov_fns())
+
+
+PROV21_BLOCK = (
+    "\n"
+    "// ---- XA-21 仮アラート: 形成中の 5分足 (未確定 tick) だけ。Engine / Zone / FVG / 反発履歴 / 待機 / 注文 / 使用済み Track は変えない ----\n"
+    "//  ・新規 Entry と同じ制限: 注文・保有なし (直前の確定時の状態)、Direction、同一 Track 1 回、Zone 資格、数量。時間帯は判定足の\n"
+    "//    終了時刻 (確定時と同じ基準) に加えて送信する実時刻 (timenow) も時間帯の中 (例: 8:55〜9:00 の足は 9:00 前に出さない)\n"
+    "//  ・SATS: 待機中の引きつけ発注 / 即時エントリー ON の即時発注だけ (待機の準備だけでは出さない)。Current: 選択した Entry Mode の発注\n"
+    "//  ・1 本の 5分足につき最大 1 回 (varip gProvAlertBar。確定アラートとは別の状態)。送信後は同じ足で評価・再送しない\n"
+    "bool  stPvSess = stSessOK and (not stUseSess or f_stInSession(timenow))\n"
+    "bool  stPvA    = stAlertProv and is5mChart and not barstate.isconfirmed and oState == 0 and stPvSess and array.get(gProvAlertBar, 0) != time\n"
+    "int   pSide    = 0\n"
+    "float pPx      = na\n"
+    "float pSL      = na\n"
+    "float pTP      = na\n"
+    "if stPvA and stSats\n"
+    "    [sS, eS, lS, tS] = f_satProvEval(close[1], satL1[1], satL2[1], satStb[1])\n"
+    "    pSide := sS\n"
+    "    pPx   := eS\n"
+    "    pSL   := lS\n"
+    "    pTP   := tS\n"
+    "if stPvA and not stSats\n"
+    "    [s0, e0, l0, t0] = f_stProvEval()\n"
+    "    pSide := s0\n"
+    "    pPx   := e0\n"
+    "    pSL   := l0\n"
+    "    pTP   := t0\n"
+    "float pvQty = pSide != 0 ? f_stQty(pSide, pPx, pSL) : na     // 参考値 (確定時は判断足の終値で計算し直す)\n"
+    "if stPvA and pSide != 0 and not na(pvQty)\n"
+    "    array.set(gProvAlertBar, 0, time)\n"
+    "    alert(f_stAlertMsg(\"仮\", pSide, pPx, pSL, pTP, not stSats and stModeA, stSats), alert.freq_once_per_bar)\n")
+
+STRATEGY_EDITS21 = [
+    ("header",
+     "//  陽線陰線 / 近接 1.0 USD / 逆方向一致 4H・1H は従来の初期値のまま)。即時 OFF・接触期限 ON などは比較・切り戻し用に残す。\n",
+     "//  陽線陰線 / 近接 1.0 USD / 逆方向一致 4H・1H は従来の初期値のまま)。即時 OFF・接触期限 ON などは比較・切り戻し用に残す。\n"
+     + XA21_HDR),
+    ("calc", "     calc_on_every_tick     = false,\n", "     calc_on_every_tick     = true,\n"),
+    ("engine", "if is5mChart\n    zoneCountNow := zn.update(zoneEng, zoneCfg, zoneFeed)\n",
+     "//  ★ XA-21: calc_on_every_tick = true でも Engine 更新は確定足だけ (GBPJPY 等と同じ。未確定 tick の更新は巻き戻されるだけで、\n"
+     "//    確定時の結果は同じ)。毎 tick の Engine 更新・Zone 走査をしない。\n"
+     "if is5mChart and barstate.isconfirmed\n    zoneCountNow := zn.update(zoneEng, zoneCfg, zoneFeed)\n"),
+    ("input", 'stSessEndM = input.int(0, "Session End Minute", minval = 0, maxval = 59, group = G_STS)\n',
+     'stSessEndM = input.int(0, "Session End Minute", minval = 0, maxval = 59, group = G_STS)\n' + ALERT21_INPUTS),
+    ("hist", "[hS3, qS3, nS3] = f_satHist(-1, satStb[1], hTqS3)\n"
+     "hTqL1 := nL1\nhTqL2 := nL2\nhTqL3 := nL3\nhTqS1 := nS1\nhTqS2 := nS2\nhTqS3 := nS3\n",
+     "[hS3, qS3, nS3] = f_satHist(-1, satStb[1], hTqS3)\n"),
+    ("hist", HIST21_OLD, HIST21_NEW),
+    ("state", "float pwLineP = na         // その線の価格 (足 t-1 の確定値)\n",
+     "float pwLineP = na         // その線の価格 (足 t-1 の確定値)\n" + "@@ALERT_STATE@@"),
+    ("alert",
+     "                    strategy.exit(oXid, oEid, stop = oSL)\n"
+     "                    pwRRPlan := pwSide * (pwTP0 - close) / (pwSide * (close - pwSL0))\n",
+     "                    strategy.exit(oXid, oEid, stop = oSL)\n"
+     "                    f_stConfAlert(pwSide, close, pwSL0, pwTP0, false, true)     // XA-21 確定: 引きつけの発注 (Entry は判断足の終値、SL0 / TP0 は準備時の固定値)\n"
+     "                    pwRRPlan := pwSide * (pwTP0 - close) / (pwSide * (close - pwSL0))\n"),
+    ("alert",
+     "                        strategy.exit(oXid, oEid, stop = oSL)\n"
+     "                        pwP0     := ref\n",
+     "                        strategy.exit(oXid, oEid, stop = oSL)\n"
+     "                        f_stConfAlert(side, close, pSL, tpRef, false, true)     // XA-21 確定: 即時の発注 (Entry は判断足の終値、SL0 / TP0 は準備地点の値)\n"
+     "                        pwP0     := ref\n"),
+    ("alert",
+     "                    strategy.entry(oEid, side == 1 ? strategy.long : strategy.short, qty = pQty)\n"
+     "                strategy.exit(oXid, oEid, stop = oSL)\n"
+     "    stPrev := cur\n",
+     "                    strategy.entry(oEid, side == 1 ? strategy.long : strategy.short, qty = pQty)\n"
+     "                strategy.exit(oXid, oEid, stop = oSL)\n"
+     "                f_stConfAlert(side, stModeA ? oL : close, pSL, tpRef, stModeA, false)     // XA-21 確定: Current の発注 (A は指値価格、TP は発注判断時の予定)\n"
+     "    stPrev := cur\n"
+     "    stTpUpPrev := tpUp\n"
+     "    stTpDnPrev := tpDn\n"),
+    ("text", "// XA-7 SATS Pullback の確認表示 (データウィンドウ + 小さな印。永続ラベル・独自アラートは追加しない)\n",
+     "// XA-7 SATS Pullback の確認表示 (データウィンドウ + 小さな印。永続ラベルは追加しない。仮 / 確定アラートは XA-21)\n"),
+    ("prov",
+     'plotshape(stSats and pwEv < 0,  "SATS · 取消", style = shape.xcross, location = location.abovebar, color = color.silver, size = size.tiny)\n',
+     'plotshape(stSats and pwEv < 0,  "SATS · 取消", style = shape.xcross, location = location.abovebar, color = color.silver, size = size.tiny)\n'
+     + PROV21_BLOCK),
+]
+STRATEGY_EDITS21 = [(k, a, b.replace("@@ALERT_STATE@@", _alert_state())) for k, a, b in STRATEGY_EDITS21]
+
+
 def build_visual1():
     """XA-1 only (commits 2732772 / 69e6f0c)."""
     return _apply(show(BASE_REV, VIS_PATH), VISUAL_EDITS)
@@ -1718,8 +1916,13 @@ def build_strategy19():
     return _apply(build_strategy18(), STRATEGY_EDITS19)
 
 
-def build_strategy():
+def build_strategy20():
+    """XA-1 .. XA-20 (commit 2550d27)."""
     return _apply(build_strategy19(), STRATEGY_EDITS20)
+
+
+def build_strategy():
+    return _apply(build_strategy20(), STRATEGY_EDITS21)
 
 
 def strip_visual3(t):
@@ -1739,8 +1942,15 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy21(t):
+    """reverse only XA-21 (-> the Strategy of 2550d27 byte for byte)."""
+    return _revert(t, STRATEGY_EDITS21)
+
+
 def strip_strategy20(t):
-    """reverse only XA-20 (-> the Strategy of 5f2c8a5 byte for byte)."""
+    """reverse XA-21 when present (all or nothing) and XA-20 (-> the Strategy of 5f2c8a5 byte for byte)."""
+    if t is not None and STRATEGY_EDITS21[0][2] in t:
+        t = strip_strategy21(t)
     return _revert(t, STRATEGY_EDITS20)
 
 

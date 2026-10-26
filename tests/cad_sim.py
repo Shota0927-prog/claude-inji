@@ -98,7 +98,7 @@ def gate_static():
           str((ujg, cdg[0])))
     others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in cb.FILES and not __import__("xal_build").ok(p)]   # XL-1 Long: exact
     changed = [p for p in others if rd(p) != git("show", f"{PREV}:{p}") and not __import__("cad_adapt").later_pine_ok(p, PREV)]   # later layers: exact
-    cls = {"ZoneStrategyXAU.pine": "alert(" not in code_only(rd("ZoneStrategyXAU.pine")),
+    cls = {"ZoneStrategyXAU.pine": "alert(" not in code_only(__import__("xa_build").strip_strategy21(rd("ZoneStrategyXAU.pine")) or "alert("),   # later XA-21 alerts reverted exactly
            "us_trend_strategy.pine": "alert.freq_all" not in rd("us_trend_strategy.pine"),
            "PointMasterFvgAbsRebound.pine": "varip int lastRealtimePhaseCode = na" in rd("PointMasterFvgAbsRebound.pine")}
     check("CD-06 every other Pine file byte-identical to 867ff7e (USDJPY, XAU, Practical LONG / SHORT, FVG strategies, harnesses, "

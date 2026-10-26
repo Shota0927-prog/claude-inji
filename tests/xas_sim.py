@@ -1953,16 +1953,16 @@ ADOPT20 = {"stSatsWait": "240", "stSatsShow": "true", "stSatsBody": "true", "stS
 
 
 def gate_xa20():
-    S20, S19 = rd(xb.STR_PATH), xb.show("5f2c8a5", xb.STR_PATH)
+    S20, S19 = xb.strip_strategy21(rd(xb.STR_PATH)) or "", xb.show("5f2c8a5", xb.STR_PATH)   # XA-20 layer (XA-21 reverted exactly)
     i20, i19 = input_values(S20), input_values(S19)
     d = {k: (i19.get(k), i20.get(k)) for k in set(i19) | set(i20) if i19.get(k) != i20.get(k)}
     cs = sorted(l for l in es.changed_code(S19, S20) if l and not l.startswith('"') and not l.startswith("tooltip"))
     keep = {"stMode": '"C: Candle Pattern"', "stDir": '"Short Only"', "stTiming": '"SATS Pullback"', "roleMode": '"Retest Confirmed"',
             "stBuffer": "1.5", "stRR": "1.5", "stBE": "true", "stBEMode": '"Fixed Distance"', "stBEDist": "15.0", "stTpZone": "false",
             "stCapBase": "300000.0", "stRiskPct": "3.0"}
-    check("XD-01 XA-20: the delivered Strategy == xa_build.build_strategy() (XA-1 .. XA-20); strip_strategy20 gives 5f2c8a5 byte for byte "
+    check("XD-01 XA-20: the delivered Strategy with XA-21 reverted exactly == xa_build.build_strategy20() (XA-1 .. XA-20); strip_strategy20 gives 5f2c8a5 byte for byte "
           "(strip_strategy19 gives b7f0036); Engine / Visual / other symbols unchanged",
-          xb.build_strategy() == S20 and xb.strip_strategy20(S20) == S19 and xb.build_strategy19() == S19
+          xb.build_strategy20() == S20 and xb.strip_strategy20(S20) == S19 and xb.build_strategy19() == S19
           and xb.strip_strategy19(S20) == xb.show("b7f0036", xb.STR_PATH)
           and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and not __import__("xal_build").ok(p)
                    and open(os.path.join(ROOT, p), encoding="utf-8").read() != xb.show("5f2c8a5", p)])

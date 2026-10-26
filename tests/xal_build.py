@@ -4,6 +4,9 @@ ZoneStrategyXAULong.pine == the ZoneStrategyXAU.pine of SRC_REV + EDITS (exact r
 shorttitle), the Gold Long adopted defaults (from the user's Gold Long comparison over the last 365 days) and the text that
 names those defaults. Trading code, Zone / SATS / size / order / breakeven logic, strategy() calculation settings and the shared
 Engine import (ZoneEnginePracticalXAUUSD/2) are byte-identical to the Short Strategy. strip() reverses the edits exactly.
+XA-21 (alerts): the Long Strategy == build1() (= XL-1) + xa_build.STRATEGY_EDITS21 (the same exact alert layer as the Short
+Strategy), so the Long file stays the Short file of SRC_REV + XL-1 + XA-21; strip21() reverses only XA-21 (-> the XL-1 Long file
+of d67941f), strip() reverses both (-> the Short Strategy of SRC_REV).
 """
 import os
 import subprocess
@@ -90,12 +93,12 @@ def _revert(text, eds):
     return out
 
 
-NEW_TESTS = ("tests/xal_build.py", "tests/xal_sim.py")
+NEW_TESTS = ("tests/xal_build.py", "tests/xal_sim.py", "tests/xaa_sim.py")     # XL-1 / XA-21 (alerts on both Gold Strategies)
 
 
 def ok(path):
-    """XL-1 accounts for this path exactly: the Long Strategy equal to build(), or one of its new test files. The older
-    fixtures' 'other files unchanged' checks accept the new Long file only through this."""
+    """XL-1 / XA-21 account for this path exactly: the Long Strategy equal to build(), or one of their new test files. The older
+    fixtures' 'other files unchanged' checks accept the new Long file (and these new tests) only through this."""
     if path in NEW_TESTS:
         return True
     if path != LONG_PATH or not os.path.exists(os.path.join(ROOT, LONG_PATH)):
@@ -103,13 +106,27 @@ def ok(path):
     return open(os.path.join(ROOT, LONG_PATH), encoding="utf-8").read() == build()
 
 
-def build():
+def _xa21():
+    return __import__("xa_build").STRATEGY_EDITS21
+
+
+def build1():
+    """XL-1 only (the Long Strategy of d67941f)."""
     return _apply(show(SRC_REV, SRC_PATH), EDITS)
 
 
+def build():
+    return _apply(build1(), _xa21())
+
+
+def strip21(text):
+    """reverse only XA-21 (-> the XL-1 Long Strategy of d67941f); None when not exact."""
+    return _revert(text, _xa21())
+
+
 def strip(text):
-    """reverse XL-1 exactly (-> the Short Strategy of SRC_REV); None when not exact."""
-    return _revert(text, EDITS)
+    """reverse XA-21 and XL-1 exactly (-> the Short Strategy of SRC_REV); None when not exact."""
+    return _revert(strip21(text), EDITS)
 
 
 if __name__ == "__main__":
