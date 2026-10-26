@@ -1770,6 +1770,146 @@ STRATEGY_EDITS21 = [
 STRATEGY_EDITS21 = [(k, a, b.replace("@@ALERT_STATE@@", _alert_state())) for k, a, b in STRATEGY_EDITS21]
 
 
+# ---- XA-22: provisional alert once per candidate / wait (Strategy only; applied after XA-21) -------------------------------
+#  The XA-21 per-5m-bar key stays; a second varip key list (candidate keys) suppresses re-sending the same candidate on later
+#  bars. Key = "Track|path|side|wait": path 1 = SATS pull (wait = pwBar, the prep bar fixed at the wait start), 2 = SATS
+#  immediate, 3 = Current (wait = -1). Recorded only when the provisional alert() is called; released (all keys of a Track)
+#  when a formal order is placed on that Track or a formal SATS wait is prepared on it; at most PV_KEEP keys (oldest dropped).
+PV_KEEP = 200
+XA22_HDR = (
+    "//  XA-22: 仮アラートの再通知防止。従来の「5分足 1 本につき最大 1 回」に加え、同じ候補・同じ待機には仮を最大 1 回 (足をまたいでも、\n"
+    "//  条件の往復・再接触・再反発・別候補を挟んで戻っても再送しない)。識別キー = Track ID・経路 (SATS 引きつけ / SATS 即時 / Current)・\n"
+    "//  方向・待機開始足 (引きつけのみ pwBar)。仮の alert() を呼んだときだけ varip に記録し、その Track で正式な発注または正式な待機準備が\n"
+    "//  行われたら解除 (以後の再成立・新しい待機は初回として通知)。確定通知・注文・待機・売買条件・通知文・時間制限は変えない。\n")
+
+PVKEY_FNS = (
+    "\n"
+    "// XA-22: 仮アラートの候補キー (同じ候補・同じ待機は足をまたいでも 1 回)。\n"
+    "//  キー = \"Track|経路|方向|待機\": 経路 1 = SATS 引きつけ (待機 = 待機開始時に固定された pwBar)、2 = SATS 即時、3 = Current (待機 = -1)。\n"
+    "//  現在足の time / bar_index や Entry / SL / TP は使わない。仮の alert() を呼んだときだけ gProvKeys に追加する\n"
+    "f_stPvKey(int trk, int path, int side, int wbar) =>\n"
+    "    str.tostring(trk) + \"|\" + str.tostring(path) + \"|\" + str.tostring(side) + \"|\" + str.tostring(wbar)\n"
+    "\n"
+    "// XA-22: その Track の候補キーを解除する (確定足で、その Track に正式な発注 / 正式な SATS 待機準備をしたとき)。通知の記録だけを\n"
+    "//  消し、注文・待機・Track の状態は変えない。戻り値 = 解除した件数\n"
+    "f_stPvRelease(int trk) =>\n"
+    "    int    n   = array.size(gProvKeys)\n"
+    "    int    cnt = 0\n"
+    "    string pre = str.tostring(trk) + \"|\"\n"
+    "    if n > 0\n"
+    "        for i = n - 1 to 0\n"
+    "            if str.startswith(array.get(gProvKeys, i), pre)\n"
+    "                array.remove(gProvKeys, i)\n"
+    "                cnt += 1\n"
+    "    cnt\n")
+
+PROV22_OLD = (
+    "//  ・1 本の 5分足につき最大 1 回 (varip gProvAlertBar。確定アラートとは別の状態)。送信後は同じ足で評価・再送しない\n"
+    "bool  stPvSess = stSessOK and (not stUseSess or f_stInSession(timenow))\n"
+    "bool  stPvA    = stAlertProv and is5mChart and not barstate.isconfirmed and oState == 0 and stPvSess and array.get(gProvAlertBar, 0) != time\n"
+    "int   pSide    = 0\n"
+    "float pPx      = na\n"
+    "float pSL      = na\n"
+    "float pTP      = na\n"
+    "if stPvA and stSats\n"
+    "    [sS, eS, lS, tS] = f_satProvEval(close[1], satL1[1], satL2[1], satStb[1])\n"
+    "    pSide := sS\n"
+    "    pPx   := eS\n"
+    "    pSL   := lS\n"
+    "    pTP   := tS\n"
+    "if stPvA and not stSats\n"
+    "    [s0, e0, l0, t0] = f_stProvEval()\n"
+    "    pSide := s0\n"
+    "    pPx   := e0\n"
+    "    pSL   := l0\n"
+    "    pTP   := t0\n"
+    "float pvQty = pSide != 0 ? f_stQty(pSide, pPx, pSL) : na     // 参考値 (確定時は判断足の終値で計算し直す)\n"
+    "if stPvA and pSide != 0 and not na(pvQty)\n"
+    "    array.set(gProvAlertBar, 0, time)\n"
+    "    alert(f_stAlertMsg(\"仮\", pSide, pPx, pSL, pTP, not stSats and stModeA, stSats), alert.freq_once_per_bar)\n")
+PROV22_NEW = (
+    "//  ・1 本の 5分足につき最大 1 回 (varip gProvAlertBar。確定アラートとは別の状態)。送信後は同じ足で評価・再送しない\n"
+    "//  ・XA-22: 同じ候補・同じ待機は足をまたいでも最大 1 回 (varip gProvKeys に候補キー。送信したときだけ記録。解除は f_stPvRelease)\n"
+    "bool  stPvSess = stSessOK and (not stUseSess or f_stInSession(timenow))\n"
+    "bool  stPvA    = stAlertProv and is5mChart and not barstate.isconfirmed and oState == 0 and stPvSess and array.get(gProvAlertBar, 0) != time\n"
+    "int   pSide    = 0\n"
+    "float pPx      = na\n"
+    "float pSL      = na\n"
+    "float pTP      = na\n"
+    "int   pPath    = 0      // XA-22: 1 = SATS 引きつけ / 2 = SATS 即時 / 3 = Current\n"
+    "int   pTrk     = -1     // XA-22: 候補の Track ID\n"
+    "if stPvA and stSats\n"
+    "    [sS, eS, lS, tS, aPv, kPv] = f_satProvEval(close[1], satL1[1], satL2[1], satStb[1])\n"
+    "    pSide := sS\n"
+    "    pPx   := eS\n"
+    "    pSL   := lS\n"
+    "    pTP   := tS\n"
+    "    pPath := aPv\n"
+    "    pTrk  := kPv\n"
+    "if stPvA and not stSats\n"
+    "    [s0, e0, l0, t0, r0] = f_stProvEval()\n"
+    "    pSide := s0\n"
+    "    pPx   := e0\n"
+    "    pSL   := l0\n"
+    "    pTP   := t0\n"
+    "    pPath := 3\n"
+    "    pTrk  := r0\n"
+    "float  pvQty = pSide != 0 ? f_stQty(pSide, pPx, pSL) : na     // 参考値 (確定時は判断足の終値で計算し直す)\n"
+    "string pvKey = pSide != 0 ? f_stPvKey(pTrk, pPath, pSide, pPath == 1 ? pwBar : -1) : \"\"\n"
+    "if stPvA and pSide != 0 and not na(pvQty) and not array.includes(gProvKeys, pvKey)\n"
+    "    array.set(gProvAlertBar, 0, time)\n"
+    "    array.push(gProvKeys, pvKey)\n"
+    "    if array.size(gProvKeys) > " + str(PV_KEEP) + "\n"
+    "        array.shift(gProvKeys)\n"
+    "    alert(f_stAlertMsg(\"仮\", pSide, pPx, pSL, pTP, not stSats and stModeA, stSats), alert.freq_once_per_bar)\n")
+
+STRATEGY_EDITS22 = [
+    ("header",
+     "//  1 本につき仮・確定それぞれ最大 1 回 (varip)。新規発注と通知は既存の時間帯 (初期 9:00〜翌 2:00 JST) の中だけ (決済管理は時間外も継続)。\n",
+     "//  1 本につき仮・確定それぞれ最大 1 回 (varip)。新規発注と通知は既存の時間帯 (初期 9:00〜翌 2:00 JST) の中だけ (決済管理は時間外も継続)。\n"
+     + XA22_HDR),
+    ("state",
+     "varip array<int> gConfirmedAlertBar = array.new_int(1, -1)     // XA-21: 確定アラートを送った 5分足の time (-1 = 未送信。仮とは別の状態)\n",
+     "varip array<int> gConfirmedAlertBar = array.new_int(1, -1)     // XA-21: 確定アラートを送った 5分足の time (-1 = 未送信。仮とは別の状態)\n"
+     "varip array<string> gProvKeys = array.new_string()     // XA-22: 仮アラートを送った候補キー (Track|経路|方向|待機)。最大 " + str(PV_KEEP) + " 件 (古い順に削除)\n"),
+    ("fns",
+     "        alert(f_stAlertMsg(\"確定\", side, ePx, sl, tp, isLim, isSats), alert.freq_all)\n    send\n",
+     "        alert(f_stAlertMsg(\"確定\", side, ePx, sl, tp, isLim, isSats), alert.freq_all)\n    send\n" + PVKEY_FNS),
+    ("prov", "//  戻り値: [方向 (0 = なし), 参照価格, SL]\nf_stProvEval() =>\n",
+     "//  戻り値: [方向 (0 = なし), 参照価格, SL, TP, 候補の Track ID (XA-22: 仮通知の識別用。無ければ -1)]\nf_stProvEval() =>\n"),
+    ("prov", "    float tpP = na     // 通知 TP: 下の RR 事前判定と同じ f_stTp の結果\n",
+     "    float tpP = na     // 通知 TP: 下の RR 事前判定と同じ f_stTp の結果\n    int   trk = -1     // XA-22: 選んだ候補の Track ID\n"),
+    ("prov", "        tpP := tpRef\n        if skipRef\n            side := 0\n    [side, ePx, sl, tpP]\n",
+     "        tpP := tpRef\n        trk := c.track\n        if skipRef\n            side := 0\n    [side, ePx, sl, tpP, trk]\n"),
+    ("prov", "//  戻り値: [方向 (0 = なし), 参照価格 (形成中の終値), SL0, TP0]\nf_satProvEval(float pc, float l1p, float l2p, float stbp) =>\n"
+             "    int   side = 0\n    float ePx  = na\n    float sl   = na\n    float tp   = na\n",
+     "//  戻り値: [方向 (0 = なし), 参照価格 (形成中の終値), SL0, TP0, 経路 (XA-22: 1 引きつけ / 2 即時), 候補の Track ID]\n"
+     "f_satProvEval(float pc, float l1p, float l2p, float stbp) =>\n"
+     "    int   side = 0\n    float ePx  = na\n    float sl   = na\n    float tp   = na\n    int   path = 0\n    int   trk  = -1\n"),
+    ("prov", "                tp   := pwTP0\n    else if stSats and stSatsNow and pwState == 0\n",
+     "                tp   := pwTP0\n                path := 1\n                trk  := pwTrack\n    else if stSats and stSatsNow and pwState == 0\n"),
+    ("prov", "        [s0, e0, l0, t0] = f_stProvEval()\n        if s0 != 0\n",
+     "        [s0, e0, l0, t0, r0] = f_stProvEval()\n        if s0 != 0\n"),
+    ("prov", "                tp   := t0\n    [side, ePx, sl, tp]\n",
+     "                tp   := t0\n                path := 2\n                trk  := r0\n    [side, ePx, sl, tp, path, trk]\n"),
+    ("release",
+     "                    f_stConfAlert(pwSide, close, pwSL0, pwTP0, false, true)     // XA-21 確定: 引きつけの発注 (Entry は判断足の終値、SL0 / TP0 は準備時の固定値)\n",
+     "                    f_stConfAlert(pwSide, close, pwSL0, pwTP0, false, true)     // XA-21 確定: 引きつけの発注 (Entry は判断足の終値、SL0 / TP0 は準備時の固定値)\n"
+     "                    f_stPvRelease(pwTrack)     // XA-22: 正式な発注 -> この Track の仮通知キーを解除 (通知の記録だけ)\n"),
+    ("release",
+     "                        f_stConfAlert(side, close, pSL, tpRef, false, true)     // XA-21 確定: 即時の発注 (Entry は判断足の終値、SL0 / TP0 は準備地点の値)\n",
+     "                        f_stConfAlert(side, close, pSL, tpRef, false, true)     // XA-21 確定: 即時の発注 (Entry は判断足の終値、SL0 / TP0 は準備地点の値)\n"
+     "                        f_stPvRelease(c.track)     // XA-22: 正式な発注 -> この Track の仮通知キーを解除\n"),
+    ("release", "                    pwNPrep  += 1\n",
+     "                    pwNPrep  += 1\n                    f_stPvRelease(c.track)     // XA-22: 正式な待機準備 -> この Track の仮通知キーを解除 (新しい待機は初回を通知)\n"),
+    ("release",
+     "                f_stConfAlert(side, stModeA ? oL : close, pSL, tpRef, stModeA, false)     // XA-21 確定: Current の発注 (A は指値価格、TP は発注判断時の予定)\n",
+     "                f_stConfAlert(side, stModeA ? oL : close, pSL, tpRef, stModeA, false)     // XA-21 確定: Current の発注 (A は指値価格、TP は発注判断時の予定)\n"
+     "                f_stPvRelease(c.track)     // XA-22: 正式な発注 -> この Track の仮通知キーを解除\n"),
+    ("prov", PROV22_OLD, PROV22_NEW),
+]
+
+
 def build_visual1():
     """XA-1 only (commits 2732772 / 69e6f0c)."""
     return _apply(show(BASE_REV, VIS_PATH), VISUAL_EDITS)
@@ -1921,8 +2061,13 @@ def build_strategy20():
     return _apply(build_strategy19(), STRATEGY_EDITS20)
 
 
-def build_strategy():
+def build_strategy21():
+    """XA-1 .. XA-21 (commit 61c48fb)."""
     return _apply(build_strategy20(), STRATEGY_EDITS21)
+
+
+def build_strategy():
+    return _apply(build_strategy21(), STRATEGY_EDITS22)
 
 
 def strip_visual3(t):
@@ -1942,8 +2087,15 @@ def strip_visual6(t):
     return _revert(t, VISUAL_EDITS6)
 
 
+def strip_strategy22(t):
+    """reverse only XA-22 (-> the Strategy of 61c48fb byte for byte)."""
+    return _revert(t, STRATEGY_EDITS22)
+
+
 def strip_strategy21(t):
-    """reverse only XA-21 (-> the Strategy of 2550d27 byte for byte)."""
+    """reverse XA-22 when present (all or nothing) and XA-21 (-> the Strategy of 2550d27 byte for byte)."""
+    if t is not None and STRATEGY_EDITS22[0][2] in t:
+        t = strip_strategy22(t)
     return _revert(t, STRATEGY_EDITS21)
 
 

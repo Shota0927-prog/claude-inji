@@ -60,6 +60,10 @@
 //  損益は変わらない)。確定 = 確定足で strategy.entry を出した分岐 (SATS 引きつけ / SATS 即時 / Current) で 1 回 (約定通知ではない)。
 //  仮 = 形成中の 5分足がこのまま確定したら発注になる条件の予告 (待機の準備だけでは出さない。注文・状態は変えない)。通知は 5分足
 //  1 本につき仮・確定それぞれ最大 1 回 (varip)。新規発注と通知は既存の時間帯 (初期 9:00〜翌 2:00 JST) の中だけ (決済管理は時間外も継続)。
+//  XA-22: 仮アラートの再通知防止。従来の「5分足 1 本につき最大 1 回」に加え、同じ候補・同じ待機には仮を最大 1 回 (足をまたいでも、
+//  条件の往復・再接触・再反発・別候補を挟んで戻っても再送しない)。識別キー = Track ID・経路 (SATS 引きつけ / SATS 即時 / Current)・
+//  方向・待機開始足 (引きつけのみ pwBar)。仮の alert() を呼んだときだけ varip に記録し、その Track で正式な発注または正式な待機準備が
+//  行われたら解除 (以後の再成立・新しい待機は初回として通知)。確定通知・注文・待機・売買条件・通知文・時間制限は変えない。
 // ============================================================================
 //  ・Zone 判定は ZONE-P と同一: ZoneEnginePracticalXAUUSD/1 (= /6 の Swing 最大点 + XA-4 の比較用モード) / 入力 / Source 取得 / NR-S1 / NR-A1 /
 //    RN / Break / zn.update / FVG Batch A (検知・保存・完全埋め・期限) は ZONE-P の本文をそのまま使う
@@ -1526,6 +1530,7 @@ var array<float> stTpUpPrev = array.new_float()     // XA-21: 直前の確定時
 var array<float> stTpDnPrev = array.new_float()
 varip array<int> gProvAlertBar      = array.new_int(1, -1)     // XA-21: 仮アラートを送った 5分足の time (-1 = 未送信)。varip = tick・巻き戻しでも残る
 varip array<int> gConfirmedAlertBar = array.new_int(1, -1)     // XA-21: 確定アラートを送った 5分足の time (-1 = 未送信。仮とは別の状態)
+varip array<string> gProvKeys = array.new_string()     // XA-22: 仮アラートを送った候補キー (Track|経路|方向|待機)。最大 200 件 (古い順に削除)
 
 // ---- XA-21 仮 / 確定アラート (XAUUSD) -------------------------------------------------------------------------
 //  ・確定: 確定足で実際に strategy.entry を出した分岐 (SATS 引きつけ / SATS 即時 / Current) で 1 回。約定・建玉増加は使わない。
@@ -1561,13 +1566,32 @@ f_stConfAlert(int side, float ePx, float sl, float tp, bool isLim, bool isSats) 
         alert(f_stAlertMsg("確定", side, ePx, sl, tp, isLim, isSats), alert.freq_all)
     send
 
+// XA-22: 仮アラートの候補キー (同じ候補・同じ待機は足をまたいでも 1 回)。
+//  キー = "Track|経路|方向|待機": 経路 1 = SATS 引きつけ (待機 = 待機開始時に固定された pwBar)、2 = SATS 即時、3 = Current (待機 = -1)。
+//  現在足の time / bar_index や Entry / SL / TP は使わない。仮の alert() を呼んだときだけ gProvKeys に追加する
+f_stPvKey(int trk, int path, int side, int wbar) =>
+    str.tostring(trk) + "|" + str.tostring(path) + "|" + str.tostring(side) + "|" + str.tostring(wbar)
+
+// XA-22: その Track の候補キーを解除する (確定足で、その Track に正式な発注 / 正式な SATS 待機準備をしたとき)。通知の記録だけを
+//  消し、注文・待機・Track の状態は変えない。戻り値 = 解除した件数
+f_stPvRelease(int trk) =>
+    int    n   = array.size(gProvKeys)
+    int    cnt = 0
+    string pre = str.tostring(trk) + "|"
+    if n > 0
+        for i = n - 1 to 0
+            if str.startswith(array.get(gProvKeys, i), pre)
+                array.remove(gProvKeys, i)
+                cnt += 1
+    cnt
+
 // 仮評価 (読み取り専用)。確定時の新規 Entry 判定 (4) から「確定足であること」だけを外したもの。
 //  ・候補 Zone: 直前の確定時の一覧 (stPrev)。足 t の更新後の Zone / Track は未確定なので使わない
 //  ・終値 / 高値 / 安値: 形成中の現在値。C のパターンも形成中の足で判定
 //  ・D: 待機 (stWaits) の値をローカルに写し、この 5分足の未処理の確定 1分足 (期間が終わっていない最後の 1分足は除く) で
 //       接触 / BOS を試算する。待機・候補・注文状態・処理済み時刻は一切書き換えない
 //  ・RR 事前判定: 直前の確定時の TP 用 Zone 端と、参照価格 (A: 指値 / B, C, D: 現在値)
-//  戻り値: [方向 (0 = なし), 参照価格, SL]
+//  戻り値: [方向 (0 = なし), 参照価格, SL, TP, 候補の Track ID (XA-22: 仮通知の識別用。無ければ -1)]
 f_stProvEval() =>
     int   bkL = -1
     int   bkS = -1
@@ -1698,26 +1722,30 @@ f_stProvEval() =>
     float ePx = na
     float sl  = na
     float tpP = na     // 通知 TP: 下の RR 事前判定と同じ f_stTp の結果
+    int   trk = -1     // XA-22: 選んだ候補の Track ID
     if side != 0
         StCand c = array.get(stPrev, side == 1 ? bkL : bkS)
         ePx := stModeA ? (side == 1 ? bpL : bpS) : close
         sl  := side == 1 ? c.bot - stBuffer : c.top + stBuffer
         [skipRef, tpRef] = f_stTp(side, ePx, sl, f_stNearest(side == 1 ? stTpUpPrev : stTpDnPrev, side, ePx))
         tpP := tpRef
+        trk := c.track
         if skipRef
             side := 0
-    [side, ePx, sl, tpP]
+    [side, ePx, sl, tpP, trk]
 
 // SATS 仮評価 (読み取り専用)。待機中 (直前の確定時の状態) の SATS について、形成中の 5分足がこのまま確定したら発注するかを
 //  確定時の (3b) と同じ式で試算する: 期限 / SL0 到達 (取消) → 線の選択 (接触前は足 t-1 の線と前足終値で選び直し、接触後は
 //  記録した種類) → 接触 / 近接 (この足の値はローカルだけで、接触記録は書かない) → 反発 A / B → 陽線陰線 / 逆方向一致 (上位足は
 //  確定値) / 価格範囲 / 数量。待機・接触記録・件数・Track・注文状態は一切書き換えない。形成中の条件は確定までに消えることがある。
-//  戻り値: [方向 (0 = なし), 参照価格 (形成中の終値), SL0, TP0]
+//  戻り値: [方向 (0 = なし), 参照価格 (形成中の終値), SL0, TP0, 経路 (XA-22: 1 引きつけ / 2 即時), 候補の Track ID]
 f_satProvEval(float pc, float l1p, float l2p, float stbp) =>
     int   side = 0
     float ePx  = na
     float sl   = na
     float tp   = na
+    int   path = 0
+    int   trk  = -1
     if stSats and pwState == 1 and bar_index > pwBar
         bool cancel = time_close - pwEndT >= stSatsWait * 60000 or (pwSide == 1 ? low <= pwSL0 : high >= pwSL0)
         if not cancel
@@ -1746,11 +1774,13 @@ f_satProvEval(float pc, float l1p, float l2p, float stbp) =>
                 ePx  := close
                 sl   := pwSL0
                 tp   := pwTP0
+                path := 1
+                trk  := pwTrack
     else if stSats and stSatsNow and pwState == 0
         // 待機前で即時エントリー ON: 形成中の足の Zone シグナル (Current の仮評価と同じ読取専用の判定) が、このまま確定したら
         //   即時発注になるか (有効な反発 t − e <= Nz・e − q <= Nc、逆方向一致、SL / TP の向き、P0 と終値の両方の数量)。
         //   通常の待機準備になるだけのときは何も返さない (エントリーの仮通知・仮ラベルを出さない)
-        [s0, e0, l0, t0] = f_stProvEval()
+        [s0, e0, l0, t0, r0] = f_stProvEval()
         if s0 != 0
             int  hBar = s0 == 1 ? hEL : hES
             bool nMtf = not (s0 == 1 ? satSkipL : satSkipS)
@@ -1761,7 +1791,9 @@ f_satProvEval(float pc, float l1p, float l2p, float stbp) =>
                 ePx  := close
                 sl   := l0
                 tp   := t0
-    [side, ePx, sl, tp]
+                path := 2
+                trk  := r0
+    [side, ePx, sl, tp, path, trk]
 
 int stZones   = 0
 int stFvgZone = 0
@@ -2044,6 +2076,7 @@ if is5mChart and barstate.isconfirmed
                     strategy.entry(oEid, pwSide == 1 ? strategy.long : strategy.short, qty = q)
                     strategy.exit(oXid, oEid, stop = oSL)
                     f_stConfAlert(pwSide, close, pwSL0, pwTP0, false, true)     // XA-21 確定: 引きつけの発注 (Entry は判断足の終値、SL0 / TP0 は準備時の固定値)
+                    f_stPvRelease(pwTrack)     // XA-22: 正式な発注 -> この Track の仮通知キーを解除 (通知の記録だけ)
                     pwRRPlan := pwSide * (pwTP0 - close) / (pwSide * (close - pwSL0))
                     pwRRFill := na
                     pwRRWhy  := na
@@ -2178,6 +2211,7 @@ if is5mChart and barstate.isconfirmed
                         strategy.entry(oEid, side == 1 ? strategy.long : strategy.short, qty = nQty)
                         strategy.exit(oXid, oEid, stop = oSL)
                         f_stConfAlert(side, close, pSL, tpRef, false, true)     // XA-21 確定: 即時の発注 (Entry は判断足の終値、SL0 / TP0 は準備地点の値)
+                        f_stPvRelease(c.track)     // XA-22: 正式な発注 -> この Track の仮通知キーを解除
                         pwP0     := ref
                         pwSL0    := pSL
                         pwTP0    := tpRef
@@ -2203,6 +2237,7 @@ if is5mChart and barstate.isconfirmed
                     pwRRPrep := side * (tpRef - ref) / (side * (ref - pSL))
                     pwEv     := 1
                     pwNPrep  += 1
+                    f_stPvRelease(c.track)     // XA-22: 正式な待機準備 -> この Track の仮通知キーを解除 (新しい待機は初回を通知)
                     pwTouched  := false     // XA-9: 新しい準備は接触待ちから
                     pwTouchSeen := false
                     pwTouchK   := 0
@@ -2228,6 +2263,7 @@ if is5mChart and barstate.isconfirmed
                     strategy.entry(oEid, side == 1 ? strategy.long : strategy.short, qty = pQty)
                 strategy.exit(oXid, oEid, stop = oSL)
                 f_stConfAlert(side, stModeA ? oL : close, pSL, tpRef, stModeA, false)     // XA-21 確定: Current の発注 (A は指値価格、TP は発注判断時の予定)
+                f_stPvRelease(c.track)     // XA-22: 正式な発注 -> この Track の仮通知キーを解除
     stPrev := cur
     stTpUpPrev := tpUp
     stTpDnPrev := tpDn
@@ -2300,26 +2336,37 @@ plotshape(stSats and pwEv < 0,  "SATS · 取消", style = shape.xcross, location
 //    終了時刻 (確定時と同じ基準) に加えて送信する実時刻 (timenow) も時間帯の中 (例: 8:55〜9:00 の足は 9:00 前に出さない)
 //  ・SATS: 待機中の引きつけ発注 / 即時エントリー ON の即時発注だけ (待機の準備だけでは出さない)。Current: 選択した Entry Mode の発注
 //  ・1 本の 5分足につき最大 1 回 (varip gProvAlertBar。確定アラートとは別の状態)。送信後は同じ足で評価・再送しない
+//  ・XA-22: 同じ候補・同じ待機は足をまたいでも最大 1 回 (varip gProvKeys に候補キー。送信したときだけ記録。解除は f_stPvRelease)
 bool  stPvSess = stSessOK and (not stUseSess or f_stInSession(timenow))
 bool  stPvA    = stAlertProv and is5mChart and not barstate.isconfirmed and oState == 0 and stPvSess and array.get(gProvAlertBar, 0) != time
 int   pSide    = 0
 float pPx      = na
 float pSL      = na
 float pTP      = na
+int   pPath    = 0      // XA-22: 1 = SATS 引きつけ / 2 = SATS 即時 / 3 = Current
+int   pTrk     = -1     // XA-22: 候補の Track ID
 if stPvA and stSats
-    [sS, eS, lS, tS] = f_satProvEval(close[1], satL1[1], satL2[1], satStb[1])
+    [sS, eS, lS, tS, aPv, kPv] = f_satProvEval(close[1], satL1[1], satL2[1], satStb[1])
     pSide := sS
     pPx   := eS
     pSL   := lS
     pTP   := tS
+    pPath := aPv
+    pTrk  := kPv
 if stPvA and not stSats
-    [s0, e0, l0, t0] = f_stProvEval()
+    [s0, e0, l0, t0, r0] = f_stProvEval()
     pSide := s0
     pPx   := e0
     pSL   := l0
     pTP   := t0
-float pvQty = pSide != 0 ? f_stQty(pSide, pPx, pSL) : na     // 参考値 (確定時は判断足の終値で計算し直す)
-if stPvA and pSide != 0 and not na(pvQty)
+    pPath := 3
+    pTrk  := r0
+float  pvQty = pSide != 0 ? f_stQty(pSide, pPx, pSL) : na     // 参考値 (確定時は判断足の終値で計算し直す)
+string pvKey = pSide != 0 ? f_stPvKey(pTrk, pPath, pSide, pPath == 1 ? pwBar : -1) : ""
+if stPvA and pSide != 0 and not na(pvQty) and not array.includes(gProvKeys, pvKey)
     array.set(gProvAlertBar, 0, time)
+    array.push(gProvKeys, pvKey)
+    if array.size(gProvKeys) > 200
+        array.shift(gProvKeys)
     alert(f_stAlertMsg("仮", pSide, pPx, pSL, pTP, not stSats and stModeA, stSats), alert.freq_once_per_bar)
 // ==== ZONE Strategy · Zone evaluation (end) ===========================================

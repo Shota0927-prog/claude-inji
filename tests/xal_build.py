@@ -7,6 +7,8 @@ Engine import (ZoneEnginePracticalXAUUSD/2) are byte-identical to the Short Stra
 XA-21 (alerts): the Long Strategy == build1() (= XL-1) + xa_build.STRATEGY_EDITS21 (the same exact alert layer as the Short
 Strategy), so the Long file stays the Short file of SRC_REV + XL-1 + XA-21; strip21() reverses only XA-21 (-> the XL-1 Long file
 of d67941f), strip() reverses both (-> the Short Strategy of SRC_REV).
+XA-22 (provisional once per candidate / wait): build() = build21() (XL-1 + XA-21, the Long file of 61c48fb) +
+xa_build.STRATEGY_EDITS22; strip22() reverses only XA-22, strip21() reverses XA-22 and XA-21 (-> d67941f).
 """
 import os
 import subprocess
@@ -93,7 +95,7 @@ def _revert(text, eds):
     return out
 
 
-NEW_TESTS = ("tests/xal_build.py", "tests/xal_sim.py", "tests/xaa_sim.py")     # XL-1 / XA-21 (alerts on both Gold Strategies)
+NEW_TESTS = ("tests/xal_build.py", "tests/xal_sim.py", "tests/xaa_sim.py", "tests/xab_sim.py")     # XL-1 / XA-21 / XA-22 (alerts on both Gold Strategies)
 
 
 def ok(path):
@@ -115,13 +117,27 @@ def build1():
     return _apply(show(SRC_REV, SRC_PATH), EDITS)
 
 
-def build():
+def _xa22():
+    return __import__("xa_build").STRATEGY_EDITS22
+
+
+def build21():
+    """XL-1 + XA-21 (the Long Strategy of 61c48fb)."""
     return _apply(build1(), _xa21())
 
 
+def build():
+    return _apply(build21(), _xa22())
+
+
+def strip22(text):
+    """reverse only XA-22 (-> the Long Strategy of 61c48fb); None when not exact."""
+    return _revert(text, _xa22())
+
+
 def strip21(text):
-    """reverse only XA-21 (-> the XL-1 Long Strategy of d67941f); None when not exact."""
-    return _revert(text, _xa21())
+    """reverse XA-22 and XA-21 (-> the XL-1 Long Strategy of d67941f); None when not exact."""
+    return _revert(strip22(text), _xa21())
 
 
 def strip(text):

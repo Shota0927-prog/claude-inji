@@ -1,5 +1,6 @@
 """XA-21 fixtures — provisional / confirmed alerts on the Gold Strategies ZoneStrategyXAU.pine (Short) and
 ZoneStrategyXAULong.pine (Long) (tests/xa_build.py STRATEGY_EDITS21; the Long file = XL-1 + the same layer, tests/xal_build.py).
+Runs on the XA-21 layer of the delivered files (the later XA-22 layer reverted exactly; XA-22 is pinned in tests/xab_sim.py).
 
   AS : static on both delivered files — exact build / strip (Short -> 2550d27, Long -> d67941f), other Pine files unchanged; the
        two new inputs (default ON) and every other default kept; calc_on_every_tick = true with the Engine update, the rebound
@@ -33,7 +34,7 @@ ROOT = xb.ROOT
 PREV = "4eb7b0d"                 # the last commit before XA-21 (Short = 2550d27 file, Long = d67941f file)
 raw = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 code_only, input_values, input_decls, func = es.code_only, es.input_values, es.input_decls, es.func
-S, L = raw(xb.STR_PATH), raw(xl.LONG_PATH)
+S, L = xb.strip_strategy22(raw(xb.STR_PATH)) or "", xl.strip22(raw(xl.LONG_PATH)) or ""   # the XA-21 layer (XA-22 reverted exactly; tests/xab_sim.py)
 S0, L0 = xb.show("2550d27", xb.STR_PATH), xb.show("d67941f", xl.LONG_PATH)
 FILES = {"Short": (S, S0), "Long": (L, L0)}
 G = xb.show(xb.PROV_REV, xb.PROV_PATH)     # GBPJPY Strategy (currency reference)
@@ -80,7 +81,8 @@ def gate_static():
     check("AS-01 Short == xa_build.build_strategy() (XA-1 .. XA-21) and strip_strategy21 gives 2550d27 byte for byte; Long == "
           "xal_build.build() (XL-1 + XA-21) and strip21 gives the XL-1 Long of d67941f byte for byte (strip -> the Short of 2550d27); "
           "both carry the identical alert layer; Engines, Visuals, the currency Strategies and every other Pine file unchanged since %s" % PREV,
-          S == xb.build_strategy() and xb.strip_strategy21(S) == S0 and L == xl.build() and xl.strip21(L) == L0 and xl.strip(L) == S0
+          S == xb.build_strategy21() and xb.strip_strategy21(S) == S0 and L == xl.build21() and xl.strip21(xl.build()) == L0
+          and xl._revert(L, xl._xa21()) == L0 and xl._revert(xl._revert(L, xl._xa21()), xl.EDITS) == S0
           and xb.build_strategy20() == S0 and xl.build1() == L0 and not [p for p in others if raw(p) != xb.show(PREV, p)])
     bad = {}
     for k, (t, t0) in FILES.items():
