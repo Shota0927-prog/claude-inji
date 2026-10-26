@@ -6,6 +6,8 @@ TradingView → Windows の受信処理 → (後段) XS の MT5、のうち **�
 AU-2 は AU-1 のレビュー指摘 (到着順・管理イベントの順序逆転・異常値・設定 ID の網羅性・建値管理用データ・Windows スクリプト)
 への修正版です。AU-3 は AU-2 の再レビュー指摘 (TP_SET による SL の巻き戻り、claim 時点の期限再確認) への受信処理だけの修正で、
 Pine の自動化コピーと通知仕様 (`xau-auto/2`、sid `…|AU-2`) は AU-2 のままです。
+AU-4 は AU-3 の実ファイルレビューの指摘 (正常な TP_SET の TP 反映、ロック待機をまたぐ期限判定、データ入り AU-2 DB の移行) への
+受信処理だけの修正です (Pine・通知仕様は変更なし)。
 
 ## 1. 構成
 
@@ -85,6 +87,7 @@ TradingView の 1 アラート = 1 JSON。フィールド (この順、追加・
    - ENTRY 前に届いた終了・取消 (TV_CLOSED / TV_FLAT / CANCEL) と WAIT_END も事実として残ります。
    - **管理イベントの整合 (AU-3)**:
      - TP_SET は 1 取引に 1 回だけ、TV_FILL と同じ足、SL は ENTRY の初期 SL のときだけ適用します。
+       **適用で変わるのは TP だけ** で SL は変えません (AU-4。例: 初期 TP 2592.5 → 約定確認後 TP 2593.5)。BE_MOVE は SL だけを変えます。
        違えば `CONFLICT` (`tp_set_not_on_fill_bar` / `duplicate_tp_set` / `tp_set_stop_not_initial`)。
      - SL を緩める状態更新はしません (`stop_would_loosen`)。BE_MOVE は改善方向だけです。
      - 例: 建値移動 (SL 2600.4) の後の足に TP_SET (SL 2605) が届いても `CONFLICT` で、SL は 2600.4 のままです。
@@ -111,11 +114,20 @@ TradingView の 1 アラート = 1 JSON。フィールド (この順、追加・
      - CLOSE_REQ は MT5 の約定価格で理由を再計算、TV_* は確認のみ
    - `claim(key)` は 1 キーにつき 1 回だけ成功する原子的な操作です (後段で同じイベントを二重実行しないため)。**第2段階では呼びません。**
      - 検査と取得は同じ書き込みトランザクション (`BEGIN IMMEDIATE`) で行います。別プロセスからでも、評価と取得の間に状態が変わりません。
+     - **(AU-4)** 期限判定に使う現在時刻は、プロセス内ロックと SQLite の書き込みトランザクションを取得した **後に** 読み直します。
+       ロック待ちの間に期限を過ぎた候補は取得できません。試行開始時刻 (`claim_log.attempt_ms`) と判定時刻 (`claim_log.decided_ms`) を分けて記録します。
+       `claim()` は時刻を引数で受け取りません。時計は受信処理の内部時計 (試験時だけ差し替え可能) です。
      - **(AU-3)** `policy.max_age_sec` を設定した場合、ENTRY は取得時の現在時刻でも期限を再確認します。
        期限切れは `revoked:expired_at_claim` (以後も取得不可、再起動後も同じ)。未取得のまま期限を過ぎたものは再評価時にも取り消します。
      - 時刻は受信 (`received_ms`)・初回判断 (`first_decided_ms`)・最終判断 (`decided_ms`)・取得 (`claimed_ms`)・最終取得試行 (`last_claim_ms`) を分けて保存し、
        全取得試行を `claim_log` に残します。
-     - AU-2 で作ったデータベースは起動時にこれらの列を追加して移行します (db_version 3)。
+     - AU-2 / AU-3 で作ったデータベースは、起動時に列を追加して移行します (db_version 4)。
+     - **(AU-4)** 判定ルールの版 (`meta.rules_version`) がコードと違うデータベースは、開いた時点で保存済みの全事実から状態と候補を再評価します。
+       - 未取得の候補は新しいルールで取り消し・再判断します。
+       - 取得済みの候補は `claimed_ms` を保持し、再取得できません。
+       - 受信記録・事実・取得履歴は消しません。
+       - 再評価中 (`meta.reeval_pending`) と、ルールの版が違う間は `claim()` が `reevaluation_pending` で拒否します。
+       - 中断した場合は、次に開いたときに再評価をやり直します。
    - `use` の例:
      - BE_MOVE: `RECOMPUTE_BE_FROM_MT5_FILL`。TradingView の停止値をそのまま XS に適用しない
      - TV_FLAT: `REVIEW_TV_EXIT`。MT5 だけ保有が残る可能性

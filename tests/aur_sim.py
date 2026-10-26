@@ -15,6 +15,9 @@
   RG-07..09 : regressions reported on AU-2 — a TP_SET loosening the stop after a breakeven (and late / duplicate / non-initial
        TP_SET, intent scope / stale / superseded); the deadline re-checked at claim() (also after a restart; separate times, claim
        log); claim / evaluation races; upgrade of an AU-2 database
+  RG-10..12 : regressions reported on AU-3 — a normal TP_SET updates the TP only (initial vs final TP); the claim deadline is decided
+       after the in-process lock and the SQLite write lock (attempt vs decision time); real AU-2 / AU-3 databases with data are
+       fully re-evaluated on open (claims refused while pending, history kept, claimed intents never claimable again)
 Evidence class: local Python only (no TradingView / Windows / MT5 run; PowerShell scripts not executed here).
 """
 import hashlib
@@ -46,12 +49,12 @@ def check(name, ok, detail=""):
     RESULTS.append((name, bool(ok), detail))
 
 
-def rcv(d, **over):
+def rcv(d, clock=None, **over):
     cfg = xr.load_config(None)
     cfg["data_dir"] = d
     for k, v in over.items():
         cfg[k].update(v) if isinstance(v, dict) else cfg.__setitem__(k, v)
-    return xr.Receiver(cfg, log=QUIET)
+    return xr.Receiver(cfg, log=QUIET, clock=clock)
 
 
 def body(m):
@@ -407,29 +410,38 @@ def gate_au3():
           and out["dup"][2]["scope"].startswith("tp only") and out["dup"][2]["eligible"] == 1
           and out["initial"] == ("CONFLICT", "tp_set_stop_not_initial"), str(out))
     # 2. deadline re-checked at claim()
+    clk = {}
+    clock = lambda: clk["t"]
     with tempfile.TemporaryDirectory() as d:
-        r = rcv(d, policy={"max_age_sec": 60})
         ent = E(50)
         bc = ent["bar_close"]
-        r.process(body(ent), now_ms=bc + 1000)
+        clk["t"] = bc + 1000
+        r = rcv(d, clock=clock, policy={"max_age_sec": 60})
+        r.process(body(ent))
         before = dict(intent(r, ent["key"]))
         r.store.db.close()
-        r2 = rcv(d, policy={"max_age_sec": 60})                     # restart, next day
-        c_next_day = r2.claim(ent["key"], now_ms=bc + 86_400_000)
+        clk["t"] = bc + 86_400_000
+        r2 = rcv(d, clock=clock, policy={"max_age_sec": 60})        # restart, next day
+        c_next_day = r2.claim(ent["key"])
         after = dict(intent(r2, ent["key"]))
-        c_again = r2.claim(ent["key"], now_ms=bc + 2000)
+        clk["t"] = bc + 2000
+        c_again = r2.claim(ent["key"])
         log = [dict(x) for x in r2.store.all("SELECT ok, reason, attempt_ms FROM claim_log WHERE key=?", (ent["key"],))]
     with tempfile.TemporaryDirectory() as d:
-        r = rcv(d, policy={"max_age_sec": 60})
         ent2 = E(52)
-        r.process(body(ent2), now_ms=ent2["bar_close"] + 1000)
-        c_in_time = r.claim(ent2["key"], now_ms=ent2["bar_close"] + 30_000)
+        clk["t"] = ent2["bar_close"] + 1000
+        r = rcv(d, clock=clock, policy={"max_age_sec": 60})
+        r.process(body(ent2))
+        clk["t"] = ent2["bar_close"] + 30_000
+        c_in_time = r.claim(ent2["key"])
         row = dict(intent(r, ent2["key"]))
     with tempfile.TemporaryDirectory() as d:
-        r = rcv(d)
         ent3 = E(54)
-        r.process(body(ent3), now_ms=ent3["bar_close"] + 1000)
-        c_no_policy = r.claim(ent3["key"], now_ms=ent3["bar_close"] + 86_400_000)
+        clk["t"] = ent3["bar_close"] + 1000
+        r = rcv(d, clock=clock)
+        r.process(body(ent3))
+        clk["t"] = ent3["bar_close"] + 86_400_000
+        c_no_policy = r.claim(ent3["key"])
     check("RG-08 reported: max_age_sec 60, ENTRY received 1 s after the bar close (eligible), restart, claim() the next day -> False; the "
           "intent becomes eligible 0 'revoked:expired_at_claim' and stays unclaimable (also with an earlier clock); within the deadline "
           "claim() succeeds once; without a deadline (default) the time is not limited; received / first decided / decided / claimed / "
@@ -464,13 +476,144 @@ def gate_au3():
         ver = r.store.one("SELECT v FROM meta WHERE k='db_version'")["v"]
     check("RG-09 claim() racing with other claims (two connections, 12 threads) and with an event evaluation: at most one success, every "
           "attempt logged; a database created by AU-2 is upgraded in place (intents get bar_close / received_ms / first_decided_ms / scope / "
-          "last_claim_ms, db_version 3)",
-          n_ok <= 1 and logn == 12 and {"bar_close", "received_ms", "first_decided_ms", "scope", "last_claim_ms"} <= cols and ver == "3",
+          "last_claim_ms, db_version %s)" % xr.DB_VERSION,
+          n_ok <= 1 and logn == 12 and {"bar_close", "received_ms", "first_decided_ms", "scope", "last_claim_ms"} <= cols and ver == xr.DB_VERSION,
           str((n_ok, logn, ver)))
 
 
+def _old_receiver(rev, name):
+    """the receiver module exactly as committed at `rev` (AU-2 = 070c1ed, AU-3 = 287d371), to create real old databases."""
+    import importlib.util
+    import subprocess
+    src = subprocess.run(["git", "-C", ROOT, "show", f"{rev}:automation/xau_short/receiver/xau_receiver.py"], capture_output=True,
+                         text=True).stdout
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, f"{name}.py")
+    open(p, "w", encoding="utf-8").write(src)
+    spec = importlib.util.spec_from_file_location(name, p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def gate_au4():
+    # 1. a normal TP_SET updates the TP only
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d)
+        ent = E(3, info="CURRENT")
+        tid = ent["tid"]
+        tp = ms.ev("TP_SET", 4, tid=tid, px=2600.4, sl=2605.0, tp=2593.5, info="fill_rr")
+        for m in (ent, ms.ev("TV_FILL", 4, tid=tid, px=2600.4, sl=2605.0, info="virtual_fill"), tp):
+            r.process(body(m))
+        a = dict(r.store.one("SELECT * FROM tv_trades WHERE tid=?", (tid,)))
+        r.process(body(ms.ev("BE_MOVE", 9, tid=tid, px=2600.4, sl=2600.4, tp=2593.5, info="breakeven_tv_fill_based")))
+        b = dict(r.store.one("SELECT * FROM tv_trades WHERE tid=?", (tid,)))
+        it = dict(intent(r, tp["key"]))
+    check("RG-10 reported: Current ENTRY 2600 / SL 2605 / TP 2592.5 -> TV_FILL 2600.4 -> same-bar TP_SET TP 2593.5 (fill_rr): APPLIED and "
+          "the trade's TP becomes 2593.5 (initial TP 2592.5 kept in entry_tp), SL stays 2605; a later BE_MOVE moves only the stop "
+          "(2600.4) and keeps TP 2593.5; the TP_SET intent is eligible with use RECOMPUTE_TP_FROM_MT5_FILL / scope tp only",
+          ev_status(r, tp["key"]) == ("APPLIED", "") and a["tp"] == 2593.5 and a["entry_tp"] == 2592.5 and a["sl"] == 2605.0
+          and b["sl"] == 2600.4 and b["tp"] == 2593.5 and it["eligible"] == 1 and it["use"] == "RECOMPUTE_TP_FROM_MT5_FILL"
+          and it["scope"].startswith("tp only"), str((a["tp"], a["sl"], b["tp"], b["sl"], it["eligible"])))
+    # 2. the deadline decided after the lock / write-transaction waits
+    import sqlite3
+    import time as _t
+    res = {}
+    for mode in ("lock", "sqlite", "control"):
+        with tempfile.TemporaryDirectory() as d:
+            ent = E(70)
+            bc = ent["bar_close"]
+            clk = {"t": bc + 1000}
+            r = rcv(d, clock=lambda: clk["t"], policy={"max_age_sec": 60})
+            r.process(body(ent))
+            clk["t"] = bc + 59_000
+            out = []
+            other = None
+            if mode == "lock":
+                r.store.lock.acquire()
+            elif mode == "sqlite":
+                other = sqlite3.connect(r.store.path, isolation_level=None, timeout=30)
+                other.execute("BEGIN IMMEDIATE")
+            th = threading.Thread(target=lambda: out.append(r.claim(ent["key"])))
+            th.start()
+            _t.sleep(0.4)
+            alive = th.is_alive()
+            if mode != "control":
+                clk["t"] = bc + 61_000          # the clock passes the deadline while claim() waits
+            if mode == "lock":
+                r.store.lock.release()
+            elif mode == "sqlite":
+                other.execute("COMMIT")
+                other.close()
+            th.join(10)
+            lg = dict(r.store.one("SELECT * FROM claim_log WHERE key=?", (ent["key"],)))
+            res[mode] = (alive, out, lg["attempt_ms"] - bc, lg["decided_ms"] - bc, lg["reason"], intent(r, ent["key"])["eligible"])
+    check("RG-11 reported: deadline 60 s, claim() called at 59 s while (a) the in-process lock or (b) the SQLite write lock (another "
+          "connection's BEGIN IMMEDIATE) is held, the clock passes 61 s during the wait -> False, 'expired_at_claim', the intent revoked; "
+          "claim_log keeps the attempt time (59 s) and the decision time (61 s) apart; control without the clock change -> True at 59 s",
+          res["lock"][:2] == (True, [False]) and res["lock"][2:5] == (59_000, 61_000, "expired_at_claim") and res["lock"][5] == 0
+          and res["sqlite"][:2] == (True, [False]) and res["sqlite"][2:5] == (59_000, 61_000, "expired_at_claim")
+          and res["control"][1] == [True] and res["control"][2:5] == (59_000, 59_000, "claimed"), str(res))
+    # 3. real AU-2 / AU-3 databases with data
+    mig = {}
+    for rev, name in (("070c1ed", "xr_au2"), ("287d371", "xr_au3")):
+        old = _old_receiver(rev, name)
+        with tempfile.TemporaryDirectory() as d:
+            ocfg = old.load_config(None)
+            ocfg["data_dir"] = d
+            o = old.Receiver(ocfg, log=QUIET)
+            ent = E(3)
+            tid = ent["tid"]
+            fill = ms.ev("TV_FILL", 4, tid=tid, px=2600.4, sl=2605.0, info="virtual_fill")
+            be = ms.ev("BE_MOVE", 9, tid=tid, px=2600.4, sl=2600.4, tp=2592.5, info="breakeven_tv_fill_based")
+            bad_tp = ms.ev("TP_SET", 12, tid=tid, px=2600.4, sl=2605.0, tp=2592.5, info="sats_tp0")
+            o.process(body(ent))
+            claimed_entry = o.claim(ent["key"])
+            for m in (fill, be, bad_tp, "not json", ent):
+                o.process(body(m))
+            old_bad = dict(o.store.one("SELECT eligible, claimed_ms FROM intents WHERE key=?", (bad_tp["key"],)))
+            old_sl = o.store.one("SELECT sl FROM tv_trades WHERE tid=?", (tid,))["sl"]
+            n_rec = o.store.one("SELECT COUNT(*) n FROM receipts")["n"]
+            ent_claim_ms = o.store.one("SELECT claimed_ms FROM intents WHERE key=?", (ent["key"],))["claimed_ms"]
+            o.store.db.close()
+            r = rcv(d)                                                     # open with the current code
+            new_bad = dict(intent(r, bad_tp["key"]))
+            new = dict(r.store.one("SELECT * FROM tv_trades WHERE tid=?", (tid,)))
+            mig[name] = dict(
+                old_bad_eligible=old_bad["eligible"], old_sl=old_sl, claimed_entry=claimed_entry,
+                bad_status=ev_status(r, bad_tp["key"]), bad_eligible=new_bad["eligible"], bad_claim=r.claim(bad_tp["key"]),
+                sl=new["sl"], tp=new["tp"], receipts_kept=r.store.one("SELECT COUNT(*) n FROM receipts")["n"] == n_rec,
+                entry_claim_kept=intent(r, ent["key"])["claimed_ms"] == ent_claim_ms, entry_reclaim=r.claim(ent["key"]),
+                be_claim=r.claim(be["key"]), rules=r._meta("rules_version"), pending=r._meta("reeval_pending"),
+                cols_filled=intent(r, be["key"])["bar_close"] == be["bar_close"] and intent(r, be["key"])["received_ms"] is not None)
+            other = sqlite3.connect(r.store.path, isolation_level=None)
+            other.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('reeval_pending', '1')")
+            other.close()
+            r.process(body(ms.ev("TV_FLAT", 15, tid=tid, px=2600.4, sl=2600.4, tp=2592.5, info="virtual_position_closed")))
+            ent2 = E(30)                                                   # trade A is closed: a new, eligible ENTRY
+            r.process(body(ent2))
+            mig[name]["claim_while_pending"] = r.claim(ent2["key"])
+            mig[name]["pending_reason"] = r.store.one("SELECT reason FROM claim_log ORDER BY id DESC LIMIT 1")["reason"]
+            r.store.db.close()
+            r3 = rcv(d)                                                    # the next open finishes the pending re-evaluation
+            mig[name]["claim_after"] = r3.claim(ent2["key"])
+    a2, a3 = mig["xr_au2"], mig["xr_au3"]
+    ok = (a2["old_bad_eligible"] == 1 and a2["old_sl"] == 2605.0 and a3["old_bad_eligible"] == 0
+          and all(m["claimed_entry"] and m["bad_status"][0] == "CONFLICT" and m["bad_eligible"] == 0 and m["bad_claim"] is False
+                  and m["sl"] == 2600.4 and m["tp"] == 2592.5 and m["receipts_kept"] and m["entry_claim_kept"] and m["entry_reclaim"] is False
+                  and m["be_claim"] is True and m["rules"] == xr.RULES_VERSION and m["pending"] is None and m["cols_filled"]
+                  and m["claim_while_pending"] is False and m["pending_reason"] == "reevaluation_pending" and m["claim_after"] is True
+                  for m in mig.values()))
+    check("RG-12 reported: databases written by the real AU-2 (070c1ed) and AU-3 (287d371) receivers with a claimed ENTRY, TV_FILL, BE_MOVE, "
+          "the invalid later-bar TP_SET (AU-2: applied, SL back to 2605, eligible 1), a rejected receipt and a duplicate: opening with the "
+          "current code re-evaluates every stored fact (rules version %s) -> the TP_SET is CONFLICT / eligible 0 / not claimable, the "
+          "trade is SL 2600.4 / TP 2592.5, receipts and the claimed ENTRY (claimed_ms) are kept and it cannot be claimed again, the valid "
+          "BE intent stays claimable, the new intent columns are back-filled; while a re-evaluation is pending claim() refuses "
+          "(reevaluation_pending) and the next open completes it" % xr.RULES_VERSION, ok, str(mig))
+
+
 def main():
-    for g in (gate_basic, gate_regressions, gate_au3):
+    for g in (gate_basic, gate_regressions, gate_au3, gate_au4):
         try:
             g()
         except Exception:

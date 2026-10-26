@@ -40,7 +40,8 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SCHEMA = "xau-auto/2"
-DB_VERSION = "3"
+DB_VERSION = "4"
+RULES_VERSION = "4"     # replay / eligibility rules; a stored DB with other rules is fully re-evaluated on open
 HERE = os.path.dirname(os.path.abspath(__file__))
 BAR_MS = 300_000
 # format / storage sanity bounds (not trading thresholds)
@@ -179,7 +180,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS intents (key TEXT PRIMARY KEY, tid TEXT, ev TEXT, eligible INTEGER NOT NULL, use TEXT,
             reason TEXT, decided_ms INTEGER, claimed_ms INTEGER, claim_note TEXT);
         CREATE TABLE IF NOT EXISTS claim_log (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, attempt_ms INTEGER NOT NULL,
-            ok INTEGER NOT NULL, reason TEXT);
+            ok INTEGER NOT NULL, reason TEXT, decided_ms INTEGER);
         CREATE TABLE IF NOT EXISTS mt5_positions (tid TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'NOT_CONNECTED',
             ticket TEXT, volume REAL, open_price REAL, sl REAL, tp REAL, updated_utc TEXT);
         """)
@@ -188,6 +189,8 @@ class Store:
                       ("last_claim_ms", "INTEGER")):
             if c not in cols:
                 self.db.execute(f"ALTER TABLE intents ADD COLUMN {c} {ty}")
+        if "decided_ms" not in {r[1] for r in self.db.execute("PRAGMA table_info(claim_log)")}:     # AU-3 claim_log upgraded
+            self.db.execute("ALTER TABLE claim_log ADD COLUMN decided_ms INTEGER")
         self.db.execute("INSERT OR IGNORE INTO meta(k, v) VALUES ('db_version', ?)", (DB_VERSION,))
         self.db.execute("UPDATE meta SET v=? WHERE k='db_version'", (DB_VERSION,))
 
@@ -355,14 +358,54 @@ def validate(msg, exp, policy, now_ms):
 
 
 class Receiver:
-    def __init__(self, cfg, log=None):
+    def __init__(self, cfg, log=None, clock=None):
         self.cfg = cfg
         self.store = Store(cfg["data_dir"])
         self.log = log or logging.getLogger("xau_receiver")
+        self.clock = clock or (lambda: int(time.time() * 1000))     # injectable for tests; production = wall clock
+        self.reevaluate_all_if_needed()
+
+    def _meta(self, k):
+        r = self.store.one("SELECT v FROM meta WHERE k=?", (k,))
+        return r["v"] if r else None
+
+    def reevaluate_all_if_needed(self):
+        """AU-4: when the stored facts were evaluated with other rules (an AU-2 / AU-3 database, or an interrupted run), replay
+        every stored fact with the current rules: waits, trades, then every intent (unclaimed ones may be revoked / re-decided;
+        claimed ones keep claimed_ms and only get a note). Receipts, facts and claim history are kept. A 'reeval_pending' flag is
+        committed first and cleared in the same transaction as the result, so claim() refuses everything until it is done."""
+        if self._meta("rules_version") == RULES_VERSION and self._meta("reeval_pending") is None:
+            return
+        with self.store.lock:
+            db = self.store.db
+            db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('reeval_pending', ?)", (str(self.clock()),))
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                now = self.clock()
+                db.execute("UPDATE intents SET bar_close=(SELECT e.bar_close FROM events e WHERE e.key=intents.key) WHERE bar_close IS NULL")
+                db.execute("UPDATE intents SET received_ms=(SELECT r.received_ms FROM events e JOIN receipts r ON r.id=e.receipt_id"
+                           " WHERE e.key=intents.key) WHERE received_ms IS NULL")
+                for ev_, sc in SCOPE.items():
+                    db.execute("UPDATE intents SET scope=? WHERE ev=? AND scope IS NULL", (sc, ev_))
+                for r in db.execute("SELECT DISTINCT wid FROM events WHERE wid IS NOT NULL").fetchall():
+                    self._derive_wait(r["wid"])
+                tids = [r["tid"] for r in db.execute("SELECT tid, MIN(bar_close) b FROM events WHERE tid LIKE 'T%' GROUP BY tid ORDER BY b")]
+                for tid in tids:
+                    self._derive_trade(tid)
+                for tid in tids:
+                    self._decide_intents(tid, now)
+                db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('rules_version', ?)", (RULES_VERSION,))
+                db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('reevaluated_ms', ?)", (str(now),))
+                db.execute("DELETE FROM meta WHERE k='reeval_pending'")
+                db.execute("COMMIT")
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
+        self.log.info("re-evaluated %d trades with rules %s", len(tids), RULES_VERSION)
 
     # -- the whole pipeline for one body; always records a receipt, never raises -------------------------------------
     def process(self, body, source="local", now_ms=None):
-        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        now_ms = self.clock() if now_ms is None else now_ms
         raw = body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) else str(body)
         try:
             msg, perr = parse_body(body)
@@ -528,11 +571,11 @@ class Receiver:
                     continue
                 if e["ev"] == "TV_FILL":
                     d["fill"], d["fill_bar"] = e["px"], e["bar_close"]
-                if e["ev"] == "TP_SET":
+                elif e["ev"] == "TP_SET":          # AU-4: the TP only (its stop equals the initial stop, checked above)
                     d["tp_set"] = e["key"]
-                elif e["ev"] in ("TP_SET", "BE_MOVE"):
+                    d["tp"] = e["tp"]
+                elif e["ev"] == "BE_MOVE":         # the stop only (never loosening, checked above); the TP stays
                     d["sl"] = e["sl"]
-                    d["tp"] = e["tp"] if e["tp"] is not None else d["tp"]
                 elif e["ev"] in ("TV_CLOSED", "TV_FLAT"):
                     d["exit"] = e["px"]
                 state, d["last"] = nxt, e
@@ -649,21 +692,27 @@ class Receiver:
             elif not ok:
                 db.execute("UPDATE intents SET claim_note=? WHERE key=?", (f"post_claim:{why}", e["key"]))
 
-    def claim(self, key, now_ms=None):
+    def claim(self, key):
         """for a LATER stage: atomically claim one eligible, unclaimed intent (True at most once per key). Stage 2 never calls it.
-        Check and claim happen in ONE write transaction (BEGIN IMMEDIATE, also across processes), so an evaluation cannot change
-        the intent between them. With policy.max_age_sec set, an ENTRY is re-checked against the claim time: an expired candidate
-        is revoked (eligible 0, 'revoked:expired_at_claim') and cannot be claimed, also after a restart (the DB + config decide).
-        Every attempt is written to claim_log (attempt time, result, reason)."""
-        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        attempt_ms is read when called; the decision time decided_ms is read again AFTER the in-process lock and the SQLite write
+        transaction (BEGIN IMMEDIATE, also across processes) are held, so waiting for either never lets an expired candidate
+        through. With policy.max_age_sec an ENTRY older than the deadline at decided_ms is revoked ('revoked:expired_at_claim')
+        and never claimable again (also after a restart: the DB + config decide). Refused while a re-evaluation is pending.
+        Every attempt is written to claim_log (attempt time, decision time, result, reason)."""
+        attempt_ms = self.clock()
         with self.store.lock:
             db = self.store.db
             db.execute("BEGIN IMMEDIATE")
             try:
+                now_ms = self.clock()                      # the decision time: after both waits
                 row = db.execute("SELECT i.*, e.bar_close AS ev_bar_close FROM intents i LEFT JOIN events e ON e.key=i.key WHERE i.key=?",
                                  (key,)).fetchone()
+                pending = db.execute("SELECT v FROM meta WHERE k='reeval_pending'").fetchone()
+                rules = db.execute("SELECT v FROM meta WHERE k='rules_version'").fetchone()
                 reason = None
-                if row is None:
+                if pending is not None or rules is None or rules["v"] != RULES_VERSION:
+                    reason = "reevaluation_pending"
+                elif row is None:
                     reason = "not_found"
                 elif row["claimed_ms"] is not None:
                     reason = "already_claimed"
@@ -682,7 +731,8 @@ class Receiver:
                     reason = "claimed" if ok else "race_lost"
                 elif row is not None:
                     db.execute("UPDATE intents SET last_claim_ms=? WHERE key=?", (now_ms, key))
-                db.execute("INSERT INTO claim_log(key, attempt_ms, ok, reason) VALUES (?,?,?,?)", (safe_text(key, 200), now_ms, int(ok), reason))
+                db.execute("INSERT INTO claim_log(key, attempt_ms, decided_ms, ok, reason) VALUES (?,?,?,?,?)",
+                           (safe_text(key, 200), attempt_ms, now_ms, int(ok), reason))
                 db.execute("COMMIT")
             except Exception:
                 db.execute("ROLLBACK")
