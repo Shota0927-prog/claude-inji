@@ -9,6 +9,8 @@ Strategy), so the Long file stays the Short file of SRC_REV + XL-1 + XA-21; stri
 of d67941f), strip() reverses both (-> the Short Strategy of SRC_REV).
 XA-22 (provisional once per candidate / wait): build() = build21() (XL-1 + XA-21, the Long file of 61c48fb) +
 xa_build.STRATEGY_EDITS22; strip22() reverses only XA-22, strip21() reverses XA-22 and XA-21 (-> d67941f).
+XA-23 (confirmed labels): build() = build22() (the Long file of d05f8c9) + xa_build.STRATEGY_EDITS23; strip23() reverses only
+XA-23; strip22() / strip21() / strip() also reverse XA-23 first when present.
 """
 import os
 import subprocess
@@ -95,7 +97,7 @@ def _revert(text, eds):
     return out
 
 
-NEW_TESTS = ("tests/xal_build.py", "tests/xal_sim.py", "tests/xaa_sim.py", "tests/xab_sim.py")     # XL-1 / XA-21 / XA-22 (alerts on both Gold Strategies)
+NEW_TESTS = ("tests/xal_build.py", "tests/xal_sim.py", "tests/xaa_sim.py", "tests/xab_sim.py", "tests/xac_sim.py")     # XL-1 / XA-21 .. XA-23 (alerts / labels)
 
 
 def ok(path):
@@ -126,12 +128,28 @@ def build21():
     return _apply(build1(), _xa21())
 
 
-def build():
+def _xa23():
+    return __import__("xa_build").STRATEGY_EDITS23
+
+
+def build22():
+    """XL-1 + XA-21 + XA-22 (the Long Strategy of d05f8c9)."""
     return _apply(build21(), _xa22())
 
 
+def build():
+    return _apply(build22(), _xa23())
+
+
+def strip23(text):
+    """reverse only XA-23 (-> the Long Strategy of d05f8c9); None when not exact."""
+    return _revert(text, _xa23())
+
+
 def strip22(text):
-    """reverse only XA-22 (-> the Long Strategy of 61c48fb); None when not exact."""
+    """reverse XA-23 when present (all or nothing) and XA-22 (-> the Long Strategy of 61c48fb); None when not exact."""
+    if text is not None and _xa23()[0][2] in text:
+        text = strip23(text)
     return _revert(text, _xa22())
 
 

@@ -11,6 +11,7 @@ and ZoneStrategyXAULong.pine (Long) (tests/xa_build.py STRATEGY_EDITS22, the sam
        flips, the next bar, a wait over several bars with re-touches / re-rebounds, A -> B -> A, a different candidate, a formal
        new wait, release after a formal order, the per-bar limit, the confirmed alert / orders never suppressed
   BU : mutations — model mutations caught; source mutations do not strip back to 61c48fb
+Runs on the XA-22 layer of the delivered files (the later XA-23 labels reverted exactly; tests/xac_sim.py).
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile and realtime alert delivery are not verified here).
 """
@@ -27,7 +28,7 @@ ROOT = xb.ROOT
 PREV = "61c48fb"                 # XA-21
 raw = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 code_only, input_values, func = es.code_only, es.input_values, es.func
-S, L = raw(xb.STR_PATH), raw(xl.LONG_PATH)
+S, L = xb.strip_strategy23(raw(xb.STR_PATH)) or "", xl.strip23(raw(xl.LONG_PATH)) or ""   # the XA-22 layer (XA-23 reverted exactly; tests/xac_sim.py)
 S0, L0 = xb.show(PREV, xb.STR_PATH), xb.show(PREV, xl.LONG_PATH)
 FILES = {"Short": (S, S0), "Long": (L, L0)}
 RESULTS = []
@@ -70,8 +71,8 @@ def gate_static():
     others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.STR_PATH, xl.LONG_PATH)]
     check("BS-01 Short == xa_build.build_strategy() (XA-1 .. XA-22) and strip_strategy22 gives the XA-21 Short of %s byte for byte; Long == "
           "xal_build.build() and strip22 gives the XA-21 Long of %s; the same XA-22 layer on both; every other Pine file unchanged" % (PREV, PREV),
-          S == xb.build_strategy() and xb.strip_strategy22(S) == S0 and xb.build_strategy21() == S0
-          and L == xl.build() and xl.strip22(L) == L0 and xl.build21() == L0 and not [p for p in others if raw(p) != xb.show(PREV, p)])
+          S == xb.build_strategy22() and xb.strip_strategy22(S) == S0 and xb.build_strategy21() == S0
+          and L == xl.build22() and xl.strip22(L) == L0 and xl.build21() == L0 and not [p for p in others if raw(p) != xb.show(PREV, p)])
     keep = {}
     for k, (t, t0) in FILES.items():
         keep[k] = (input_values(t) == input_values(t0) and es.seg(t, "strategy(", "import ") == es.seg(t0, "strategy(", "import ")
