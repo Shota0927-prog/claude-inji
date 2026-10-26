@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SCHEMA = "xau-auto/2"
-DB_VERSION = "2"
+DB_VERSION = "3"
 HERE = os.path.dirname(os.path.abspath(__file__))
 BAR_MS = 300_000
 # format / storage sanity bounds (not trading thresholds)
@@ -93,6 +93,12 @@ USE = {"ENTRY": "ORDER_INTENT", "CANCEL": "CANCEL_PENDING_ENTRY_IF_ANY", "CLOSE_
        "BE_MOVE": "RECOMPUTE_BE_FROM_MT5_FILL (never apply the TradingView stop price)", "TV_CLOSED": "REVIEW_TV_EXIT",
        "TV_FLAT": "REVIEW_TV_EXIT (MT5 may still hold a position)"}
 ACTIONABLE = {"ENTRY", "CANCEL", "TP_SET", "BE_MOVE", "CLOSE_REQ", "TV_CLOSED", "TV_FLAT"}
+# what a later stage may take from an intent (AU-3). Nothing else of the event is to be applied.
+SCOPE = {"ENTRY": "entry: side / order type / reference price / SL / TP (Current TP = planned, final TP after the MT5 fill)",
+         "TP_SET": "tp only (the stop is never taken from TP_SET)",
+         "BE_MOVE": "trigger only (recompute the stop from the MT5 fill; never use px / sl of this event)",
+         "CLOSE_REQ": "close request (recompute the reason from the MT5 fill)", "CANCEL": "cancel the pending entry",
+         "TV_CLOSED": "review only", "TV_FLAT": "review only"}
 STAGE2_MT5_ACTION = "NONE (stage 2: no MT5 connection, no orders)"
 
 
@@ -172,10 +178,18 @@ class Store:
             tv_side TEXT, tv_stop REAL, tv_tp REAL, info TEXT, event_key TEXT);
         CREATE TABLE IF NOT EXISTS intents (key TEXT PRIMARY KEY, tid TEXT, ev TEXT, eligible INTEGER NOT NULL, use TEXT,
             reason TEXT, decided_ms INTEGER, claimed_ms INTEGER, claim_note TEXT);
+        CREATE TABLE IF NOT EXISTS claim_log (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, attempt_ms INTEGER NOT NULL,
+            ok INTEGER NOT NULL, reason TEXT);
         CREATE TABLE IF NOT EXISTS mt5_positions (tid TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'NOT_CONNECTED',
             ticket TEXT, volume REAL, open_price REAL, sl REAL, tp REAL, updated_utc TEXT);
         """)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(intents)")}     # AU-3 columns (a DB created by AU-2 is upgraded)
+        for c, ty in (("bar_close", "INTEGER"), ("received_ms", "INTEGER"), ("first_decided_ms", "INTEGER"), ("scope", "TEXT"),
+                      ("last_claim_ms", "INTEGER")):
+            if c not in cols:
+                self.db.execute(f"ALTER TABLE intents ADD COLUMN {c} {ty}")
         self.db.execute("INSERT OR IGNORE INTO meta(k, v) VALUES ('db_version', ?)", (DB_VERSION,))
+        self.db.execute("UPDATE meta SET v=? WHERE k='db_version'", (DB_VERSION,))
 
     def one(self, sql, args=()):
         return self.db.execute(sql, args).fetchone()
@@ -494,11 +508,28 @@ class Receiver:
                 if e["ev"] in ("TP_SET", "BE_MOVE", "CLOSE_REQ") and d["fill"] is not None and abs(e["px"] - d["fill"]) > 1e-6:
                     st[e["key"]] = ("CONFLICT", "tv_fill_mismatch")
                     continue
+                # AU-3: management integrity (the Strategy sets the TP once, on the fill bar, with the initial stop; the stop only
+                # ever moves in the trade's favour). A TP_SET that would put the stop back after a breakeven is a CONFLICT.
+                if e["ev"] == "TP_SET":
+                    if d.get("tp_set"):
+                        st[e["key"]] = ("CONFLICT", "duplicate_tp_set")
+                        continue
+                    if e["bar_close"] != d.get("fill_bar"):
+                        st[e["key"]] = ("CONFLICT", "tp_set_not_on_fill_bar")
+                        continue
+                    if abs(e["sl"] - d["entry_sl"]) > 1e-6:
+                        st[e["key"]] = ("CONFLICT", "tp_set_stop_not_initial")
+                        continue
+                if e["ev"] in ("TP_SET", "BE_MOVE") and d["sl"] is not None and s * (e["sl"] - d["sl"]) < 0:
+                    st[e["key"]] = ("CONFLICT", "stop_would_loosen")
+                    continue
                 if e["ev"] == "BE_MOVE" and d["sl"] is not None and s * (e["sl"] - d["sl"]) <= 0:
                     st[e["key"]] = ("CONFLICT", "stop_not_improving")
                     continue
                 if e["ev"] == "TV_FILL":
-                    d["fill"] = e["px"]
+                    d["fill"], d["fill_bar"] = e["px"], e["bar_close"]
+                if e["ev"] == "TP_SET":
+                    d["tp_set"] = e["key"]
                 elif e["ev"] in ("TP_SET", "BE_MOVE"):
                     d["sl"] = e["sl"]
                     d["tp"] = e["tp"] if e["tp"] is not None else d["tp"]
@@ -575,8 +606,12 @@ class Receiver:
                 e_ok, e_why = False, pe["reason"]          # once refused, an ENTRY never becomes a candidate again
             else:
                 blk = self._entry_block(tid, entry, first=False)
+                mx = self.cfg["policy"].get("max_age_sec")
+                if blk is None and mx is not None and now_ms - entry["bar_close"] > mx * 1000:
+                    blk = "expired"                          # deadline passed while unclaimed (also re-checked at claim())
                 e_ok, e_why = blk is None, ("revoked:" + blk) if blk else pe["reason"]
             entry_ok = e_ok
+        order = {e["key"]: i for i, e in enumerate(evs)}
         for e in evs:
             if e["ev"] not in ACTIONABLE:
                 continue
@@ -592,11 +627,22 @@ class Receiver:
                 elif e["apply_status"] != "APPLIED":
                     ok, why = False, f"{e['apply_status'].lower()}:{e['apply_note']}"
                 else:
-                    ok, why = True, "ok"
+                    later = evs[order[e["key"]] + 1:]
+                    early = [x for x in later if x["receipt_id"] < e["receipt_id"]]
+                    ended = [x for x in later if x["ev"] in TERMINAL_EVENTS and x["apply_status"] == "APPLIED"]
+                    if early:      # a newer fact of this trade was already known when this one arrived: never a candidate
+                        ok, why = False, f"stale:arrived_after_newer_event:{early[0]['ev']}"
+                    elif ended and e["ev"] not in TERMINAL_EVENTS:
+                        ok, why = False, f"superseded:trade_ended_by:{ended[0]['ev']}"
+                    else:
+                        ok, why = True, "ok"
             prev = db.execute("SELECT * FROM intents WHERE key=?", (e["key"],)).fetchone()
             if prev is None:
-                db.execute("INSERT INTO intents(key, tid, ev, eligible, use, reason, decided_ms) VALUES (?,?,?,?,?,?,?)",
-                           (e["key"], tid, e["ev"], int(ok), use, why, now_ms))
+                rec = db.execute("SELECT received_ms FROM receipts WHERE id=?", (e["receipt_id"],)).fetchone()
+                db.execute("INSERT INTO intents(key, tid, ev, eligible, use, reason, decided_ms, bar_close, received_ms, first_decided_ms,"
+                           " scope) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                           (e["key"], tid, e["ev"], int(ok), use, why, now_ms, e["bar_close"], rec["received_ms"] if rec else None, now_ms,
+                            SCOPE.get(e["ev"])))
             elif prev["claimed_ms"] is None:
                 if (prev["eligible"], prev["reason"]) != (int(ok), why):
                     db.execute("UPDATE intents SET eligible=?, reason=?, decided_ms=? WHERE key=?", (int(ok), why, now_ms, e["key"]))
@@ -604,11 +650,44 @@ class Receiver:
                 db.execute("UPDATE intents SET claim_note=? WHERE key=?", (f"post_claim:{why}", e["key"]))
 
     def claim(self, key, now_ms=None):
-        """for a LATER stage: atomically claim one eligible, unclaimed intent (True once per key). Stage 2 never calls it."""
+        """for a LATER stage: atomically claim one eligible, unclaimed intent (True at most once per key). Stage 2 never calls it.
+        Check and claim happen in ONE write transaction (BEGIN IMMEDIATE, also across processes), so an evaluation cannot change
+        the intent between them. With policy.max_age_sec set, an ENTRY is re-checked against the claim time: an expired candidate
+        is revoked (eligible 0, 'revoked:expired_at_claim') and cannot be claimed, also after a restart (the DB + config decide).
+        Every attempt is written to claim_log (attempt time, result, reason)."""
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
         with self.store.lock:
-            cur = self.store.db.execute("UPDATE intents SET claimed_ms=? WHERE key=? AND eligible=1 AND claimed_ms IS NULL",
-                                        (int(time.time() * 1000) if now_ms is None else now_ms, key))
-            return cur.rowcount == 1
+            db = self.store.db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                row = db.execute("SELECT i.*, e.bar_close AS ev_bar_close FROM intents i LEFT JOIN events e ON e.key=i.key WHERE i.key=?",
+                                 (key,)).fetchone()
+                reason = None
+                if row is None:
+                    reason = "not_found"
+                elif row["claimed_ms"] is not None:
+                    reason = "already_claimed"
+                elif not row["eligible"]:
+                    reason = f"not_eligible:{row['reason']}"
+                else:
+                    mx = self.cfg["policy"].get("max_age_sec")
+                    bc = row["ev_bar_close"] if row["ev_bar_close"] is not None else row["bar_close"]
+                    if mx is not None and row["ev"] == "ENTRY" and (bc is None or now_ms - bc > mx * 1000):
+                        reason = "expired_at_claim"
+                        db.execute("UPDATE intents SET eligible=0, reason='revoked:expired_at_claim', decided_ms=? WHERE key=?", (now_ms, key))
+                ok = False
+                if reason is None:
+                    ok = db.execute("UPDATE intents SET claimed_ms=?, last_claim_ms=? WHERE key=? AND eligible=1 AND claimed_ms IS NULL",
+                                    (now_ms, now_ms, key)).rowcount == 1
+                    reason = "claimed" if ok else "race_lost"
+                elif row is not None:
+                    db.execute("UPDATE intents SET last_claim_ms=? WHERE key=?", (now_ms, key))
+                db.execute("INSERT INTO claim_log(key, attempt_ms, ok, reason) VALUES (?,?,?,?)", (safe_text(key, 200), now_ms, int(ok), reason))
+                db.execute("COMMIT")
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
+            return ok
 
 
 # ---- HTTP -----------------------------------------------------------------------------------------------------------

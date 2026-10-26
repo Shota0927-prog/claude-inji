@@ -4,7 +4,8 @@ TradingView → Windows の受信処理 → (後段) XS の MT5、のうち **�
 **実注文・MT5 接続・注文 API は一切ありません。** ローカルテストの成功は、TradingView / Windows / MT5 での動作確認ではありません。
 
 AU-2 は AU-1 のレビュー指摘 (到着順・管理イベントの順序逆転・異常値・設定 ID の網羅性・建値管理用データ・Windows スクリプト)
-への修正版です。
+への修正版です。AU-3 は AU-2 の再レビュー指摘 (TP_SET による SL の巻き戻り、claim 時点の期限再確認) への受信処理だけの修正で、
+Pine の自動化コピーと通知仕様 (`xau-auto/2`、sid `…|AU-2`) は AU-2 のままです。
 
 ## 1. 構成
 
@@ -82,6 +83,11 @@ TradingView の 1 アラート = 1 JSON。フィールド (この順、追加・
      - `ORPHAN`: ENTRY 未着
      - `INFO` / `FACT`
    - ENTRY 前に届いた終了・取消 (TV_CLOSED / TV_FLAT / CANCEL) と WAIT_END も事実として残ります。
+   - **管理イベントの整合 (AU-3)**:
+     - TP_SET は 1 取引に 1 回だけ、TV_FILL と同じ足、SL は ENTRY の初期 SL のときだけ適用します。
+       違えば `CONFLICT` (`tp_set_not_on_fill_bar` / `duplicate_tp_set` / `tp_set_stop_not_initial`)。
+     - SL を緩める状態更新はしません (`stop_would_loosen`)。BE_MOVE は改善方向だけです。
+     - 例: 建値移動 (SL 2600.4) の後の足に TP_SET (SL 2605) が届いても `CONFLICT` で、SL は 2600.4 のままです。
    - 疑似約定価格 (`tv_fill_px`) は注文判断時の参考価格 (`ref_px`) と別に保存します。
 3. **後段実行可否 (`intents`)**
    - 対象: ENTRY / CANCEL / TP_SET / BE_MOVE / CLOSE_REQ / TV_CLOSED / TV_FLAT。
@@ -94,8 +100,22 @@ TradingView の 1 アラート = 1 JSON。フィールド (この順、追加・
      - 通知期限を超えた (設定時のみ)
    - 「より新しい取引」「建玉あり」の判定は最初の判断時だけ行います (保有中に見送ったシグナルは後で復活しない)。
    - 後から終了・取消を知った場合は取り消し (`revoked:`) だけを行い、復活はさせません。
-   - 管理イベントは、ENTRY が実行候補で、かつ適用状態が `APPLIED` のときだけ可です。`PENDING` は再評価で可になり得ます。
+   - 管理イベントが可になる条件 (`PENDING` は再評価で可になり得ます):
+     - ENTRY が実行候補で、かつ適用状態が `APPLIED` であること
+     - **(AU-3) 届いた時点で同じ取引のより新しい事実を既に受け取っていない**こと。
+       遅れて届いた古い通知は `stale:arrived_after_newer_event` で、状態の再生には使っても実行候補にはしません。
+     - その後に取引の終了が確定していないこと (`superseded:trade_ended_by:…`)
+   - **適用範囲 (`scope`、AU-3)**: 後段がその通知から取ってよい値だけを明記します。
+     - TP_SET は「TP だけ」(SL は TP_SET から取らない)
+     - BE_MOVE は「発動の合図だけ」(SL は MT5 の約定価格から再計算し、通知の px / sl は使わない)
+     - CLOSE_REQ は MT5 の約定価格で理由を再計算、TV_* は確認のみ
    - `claim(key)` は 1 キーにつき 1 回だけ成功する原子的な操作です (後段で同じイベントを二重実行しないため)。**第2段階では呼びません。**
+     - 検査と取得は同じ書き込みトランザクション (`BEGIN IMMEDIATE`) で行います。別プロセスからでも、評価と取得の間に状態が変わりません。
+     - **(AU-3)** `policy.max_age_sec` を設定した場合、ENTRY は取得時の現在時刻でも期限を再確認します。
+       期限切れは `revoked:expired_at_claim` (以後も取得不可、再起動後も同じ)。未取得のまま期限を過ぎたものは再評価時にも取り消します。
+     - 時刻は受信 (`received_ms`)・初回判断 (`first_decided_ms`)・最終判断 (`decided_ms`)・取得 (`claimed_ms`)・最終取得試行 (`last_claim_ms`) を分けて保存し、
+       全取得試行を `claim_log` に残します。
+     - AU-2 で作ったデータベースは起動時にこれらの列を追加して移行します (db_version 3)。
    - `use` の例:
      - BE_MOVE: `RECOMPUTE_BE_FROM_MT5_FILL`。TradingView の停止値をそのまま XS に適用しない
      - TV_FLAT: `REVIEW_TV_EXIT`。MT5 だけ保有が残る可能性
@@ -228,7 +248,8 @@ MT5 の実建玉は `mt5_positions` (第2段階では一切書き込まない、
 
 | 項目 | 現状 | 提案 (承認待ち) |
 |---|---|---|
-| 通知期限 `policy.max_age_sec` | 無効 (経過時間を記録) | ENTRY は判断足終了から 60〜90 秒 |
+| 通知期限 `policy.max_age_sec` | 無効 (経過時間を記録)。設定時は受信時・再評価時・取得時に ENTRY を確認 | ENTRY は判断足終了から 60〜90 秒 |
+| 管理イベントの期限 | なし (TP_SET / BE_MOVE / CLOSE_REQ は時刻で失効しない) | 後段の設計時に決める (例: BE は次の足の確定前まで) |
 | 未来時刻の許容 `policy.max_future_skew_sec` | 無効 (差を記録) | 5〜10 秒 (Windows の時刻同期を前提) |
 | 価格ずれ | 未実装 | 参考価格からの乖離が SL 幅の 20〜30 % 超で見送り |
 | スプレッド上限 | 未実装 | XS の実測分布を見て決める (例 0.50 USD) |

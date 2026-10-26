@@ -12,6 +12,9 @@
          unaligned bars, duplicate fields, unknown fields, non-UTF-8 — recorded with reasons, no unhandled exception
        5 BAR events (OHLC + TradingView virtual state) recorded separately; the TradingView BE stop is marked recompute-only
        6 PowerShell: quoted arguments, PID ownership check, sample test in a separate data folder (static checks)
+  RG-07..09 : regressions reported on AU-2 — a TP_SET loosening the stop after a breakeven (and late / duplicate / non-initial
+       TP_SET, intent scope / stale / superseded); the deadline re-checked at claim() (also after a restart; separate times, claim
+       log); claim / evaluation races; upgrade of an AU-2 database
 Evidence class: local Python only (no TradingView / Windows / MT5 run; PowerShell scripts not executed here).
 """
 import hashlib
@@ -347,8 +350,127 @@ def gate_regressions():
           and 'encoding="utf-8-sig"' in rd("xau_receiver.py"))
 
 
+def gate_au3():
+    # 1. TP_SET must not loosen the stop after a breakeven (reported sequence), late / duplicate TP_SET handling
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d)
+        ent = E(3)
+        tid = ent["tid"]
+        seq = [ent, ms.ev("TV_FILL", 4, tid=tid, px=2600.4, sl=2605.0, info="virtual_fill"),
+               ms.ev("BE_MOVE", 9, tid=tid, px=2600.4, sl=2600.4, tp=2592.5, info="breakeven_tv_fill_based"),
+               ms.ev("TP_SET", 12, tid=tid, px=2600.4, sl=2605.0, tp=2592.5, info="sats_tp0")]
+        res = [r.process(body(m)) for m in seq]
+        tr = r.store.one("SELECT * FROM tv_trades WHERE tid=?", (tid,))
+        it = intent(r, seq[3]["key"])
+        claim_bad = r.claim(seq[3]["key"])
+    check("RG-07 reported: ENTRY 2600 / SL 2605 / TP 2592.5 -> TV_FILL 2600.4 -> BE_MOVE SL 2600.4 -> a later-bar TP_SET (SL 2605, sats_tp0): "
+          "the TP_SET is accepted as a fact but CONFLICT (tp_set_not_on_fill_bar; it would also loosen the stop) and not applied; the "
+          "trade keeps SL 2600.4; its intent eligible 0 and claim() refuses it",
+          [x["status"] for x in res] == ["ACCEPTED"] * 4 and ev_status(r, seq[3]["key"]) == ("CONFLICT", "tp_set_not_on_fill_bar")
+          and tr["sl"] == 2600.4 and it["eligible"] == 0 and not claim_bad, str((ev_status(r, seq[3]["key"]), tr["sl"], dict(it))))
+    out = {}
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d)
+        ent = E(3)
+        tid = ent["tid"]
+        fill = ms.ev("TV_FILL", 4, tid=tid, px=2600.4, sl=2605.0, info="virtual_fill")
+        be = ms.ev("BE_MOVE", 9, tid=tid, px=2600.4, sl=2600.4, tp=2592.5, info="breakeven_tv_fill_based")
+        late_tp = ms.ev("TP_SET", 4, tid=tid, px=2600.4, sl=2605.0, tp=2592.5, info="sats_tp0")      # same bar as the fill, arrives last
+        for m in (ent, fill, be, late_tp):
+            r.process(body(m))
+        out["late"] = (ev_status(r, late_tp["key"]), dict(intent(r, late_tp["key"])), r.store.one("SELECT sl FROM tv_trades")["sl"],
+                       r.claim(late_tp["key"]), dict(intent(r, be["key"])))
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d)
+        ent = E(3)
+        tid = ent["tid"]
+        tp_ok = ms.ev("TP_SET", 4, tid=tid, px=2600.4, sl=2605.0, tp=2592.5, info="sats_tp0")
+        tp_bad = ms.ev("TP_SET", 5, tid=tid, px=2600.4, sl=2604.0, tp=2592.5, info="sats_tp0")
+        for m in (ent, ms.ev("TV_FILL", 4, tid=tid, px=2600.4, sl=2605.0, info="virtual_fill"), tp_ok, tp_bad):
+            r.process(body(m))
+        out["dup"] = (ev_status(r, tp_ok["key"]), ev_status(r, tp_bad["key"]), dict(intent(r, tp_ok["key"])))
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d)
+        ent = E(30)
+        tid = ent["tid"]
+        wrong = ms.ev("TP_SET", 31, tid=tid, px=2600.4, sl=2604.0, tp=2592.5, info="sats_tp0")
+        for m in (ent, ms.ev("TV_FILL", 31, tid=tid, px=2600.4, sl=2605.0, info="virtual_fill"), wrong):
+            r.process(body(m))
+        out["initial"] = ev_status(r, wrong["key"])
+    L = out["late"]
+    check("RG-07b a same-bar TP_SET arriving after the newer BE_MOVE: replayed in bar order (APPLIED, the state keeps SL 2600.4) but it is "
+          "never an execution candidate (stale:arrived_after_newer_event) and claim() refuses it; the BE intent is scope 'trigger only' "
+          "(recompute from the MT5 fill); a second TP_SET is CONFLICT duplicate_tp_set; a TP_SET whose stop is not the initial SL is "
+          "CONFLICT; the TP_SET intent scope is 'tp only (the stop is never taken from TP_SET)'",
+          L[0] == ("APPLIED", "") and L[1]["eligible"] == 0 and L[1]["reason"].startswith("stale:arrived_after_newer_event") and L[2] == 2600.4
+          and L[3] is False and L[4]["scope"].startswith("trigger only") and out["dup"][1] == ("CONFLICT", "duplicate_tp_set")
+          and out["dup"][2]["scope"].startswith("tp only") and out["dup"][2]["eligible"] == 1
+          and out["initial"] == ("CONFLICT", "tp_set_stop_not_initial"), str(out))
+    # 2. deadline re-checked at claim()
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d, policy={"max_age_sec": 60})
+        ent = E(50)
+        bc = ent["bar_close"]
+        r.process(body(ent), now_ms=bc + 1000)
+        before = dict(intent(r, ent["key"]))
+        r.store.db.close()
+        r2 = rcv(d, policy={"max_age_sec": 60})                     # restart, next day
+        c_next_day = r2.claim(ent["key"], now_ms=bc + 86_400_000)
+        after = dict(intent(r2, ent["key"]))
+        c_again = r2.claim(ent["key"], now_ms=bc + 2000)
+        log = [dict(x) for x in r2.store.all("SELECT ok, reason, attempt_ms FROM claim_log WHERE key=?", (ent["key"],))]
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d, policy={"max_age_sec": 60})
+        ent2 = E(52)
+        r.process(body(ent2), now_ms=ent2["bar_close"] + 1000)
+        c_in_time = r.claim(ent2["key"], now_ms=ent2["bar_close"] + 30_000)
+        row = dict(intent(r, ent2["key"]))
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d)
+        ent3 = E(54)
+        r.process(body(ent3), now_ms=ent3["bar_close"] + 1000)
+        c_no_policy = r.claim(ent3["key"], now_ms=ent3["bar_close"] + 86_400_000)
+    check("RG-08 reported: max_age_sec 60, ENTRY received 1 s after the bar close (eligible), restart, claim() the next day -> False; the "
+          "intent becomes eligible 0 'revoked:expired_at_claim' and stays unclaimable (also with an earlier clock); within the deadline "
+          "claim() succeeds once; without a deadline (default) the time is not limited; received / first decided / decided / claimed / "
+          "last claim times are separate columns and every attempt is in claim_log",
+          before["eligible"] == 1 and before["received_ms"] == bc + 1000 and before["first_decided_ms"] == bc + 1000 and before["bar_close"] == bc
+          and c_next_day is False and after["eligible"] == 0 and after["reason"] == "revoked:expired_at_claim" and after["claimed_ms"] is None
+          and after["last_claim_ms"] == bc + 86_400_000 and c_again is False and [x["reason"] for x in log][0] == "expired_at_claim"
+          and c_in_time is True and row["claimed_ms"] == ent2["bar_close"] + 30_000 and c_no_policy is True, str((before, after, log, row)))
+    # 3. claim vs evaluation race, AU-2 database upgrade
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d)
+        ent = E(60)
+        r.process(body(ent))
+        res = []
+        r_other = rcv(d)                                             # a second connection (as a separate later-stage process would be)
+        ths = [threading.Thread(target=lambda rr=rr: res.append(rr.claim(ent["key"]))) for rr in [r, r_other] * 6]
+        ths.append(threading.Thread(target=lambda: r.process(body(ms.ev("CANCEL", 61, tid=ent["tid"], otype="MARKET", sl=2605.0, info="x")))))
+        [x.start() for x in ths]
+        [x.join() for x in ths]
+        n_ok = sum(1 for x in res if x)
+        logn = r.store.one("SELECT COUNT(*) n FROM claim_log")["n"]
+    import sqlite3
+    with tempfile.TemporaryDirectory() as d:
+        db = sqlite3.connect(os.path.join(d, "xau_receiver.sqlite3"))
+        db.executescript("CREATE TABLE intents (key TEXT PRIMARY KEY, tid TEXT, ev TEXT, eligible INTEGER NOT NULL, use TEXT, reason TEXT,"
+                         " decided_ms INTEGER, claimed_ms INTEGER, claim_note TEXT);"
+                         "CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT); INSERT INTO meta VALUES ('db_version','2');")
+        db.commit()
+        db.close()
+        r = rcv(d)
+        cols = {x[1] for x in r.store.db.execute("PRAGMA table_info(intents)")}
+        ver = r.store.one("SELECT v FROM meta WHERE k='db_version'")["v"]
+    check("RG-09 claim() racing with other claims (two connections, 12 threads) and with an event evaluation: at most one success, every "
+          "attempt logged; a database created by AU-2 is upgraded in place (intents get bar_close / received_ms / first_decided_ms / scope / "
+          "last_claim_ms, db_version 3)",
+          n_ok <= 1 and logn == 12 and {"bar_close", "received_ms", "first_decided_ms", "scope", "last_claim_ms"} <= cols and ver == "3",
+          str((n_ok, logn, ver)))
+
+
 def main():
-    for g in (gate_basic, gate_regressions):
+    for g in (gate_basic, gate_regressions, gate_au3):
         try:
             g()
         except Exception:
