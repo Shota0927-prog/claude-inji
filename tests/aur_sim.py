@@ -1,11 +1,20 @@
-"""AU-1 receiver fixtures — automation/xau_short/receiver/xau_receiver.py (stage 2: receive / record only, no orders).
+"""AU receiver fixtures — automation/xau_short/receiver/xau_receiver.py (stage 2: receive / record only, no orders).
 
-  RR : the local sample notifications (normal flow, bad cases) give the expected statuses / reasons and states; true order
-       inversion; restart persistence (duplicates still detected, states kept); HTTP (token path, unknown token / size refused,
-       nothing secret in the log); concurrent re-sends -> exactly one accepted; cfg pinning; the notification deadline policy
-       off by default; TradingView virtual state and the MT5 state kept apart (MT5 never written); no order / MT5 code
-Evidence class: local Python only (no TradingView / Windows / MT5 run).
+  RR : basics — sample flow, bad / edge cases, restart persistence, HTTP (token path, refusals, nothing secret in the log),
+       concurrent re-sends, cfg pinning, deadline policy off by default, TradingView virtual state vs MT5 state, no order code,
+       samples / config files in sync
+  RG : regressions reported on AU-1 (ChatGPT review) —
+       1 terminal / cancel / wait-end facts arriving BEFORE the ENTRY: kept for good, the late ENTRY is stored but never an
+         execution candidate (records / state / eligibility separate)
+       2 management events out of order (ENTRY -> TP_SET -> TV_FILL): kept PENDING and re-evaluated; a terminal trade never
+         reopens; an older stop never overwrites a newer one; one claim per event (no double execution)
+       3 abnormal values: Infinity / NaN / 1e400, negative prices, LONG + negative stop BE on a SHORT trade, bar_close 10**40,
+         unaligned bars, duplicate fields, unknown fields, non-UTF-8 — recorded with reasons, no unhandled exception
+       5 BAR events (OHLC + TradingView virtual state) recorded separately; the TradingView BE stop is marked recompute-only
+       6 PowerShell: quoted arguments, PID ownership check, sample test in a separate data folder (static checks)
+Evidence class: local Python only (no TradingView / Windows / MT5 run; PowerShell scripts not executed here).
 """
+import hashlib
 import json
 import logging
 import os
@@ -46,58 +55,70 @@ def body(m):
     return m if isinstance(m, str) else json.dumps(m, separators=(",", ":"))
 
 
-def gate_receiver():
+def intent(r, key):
+    return r.store.one("SELECT * FROM intents WHERE key=?", (key,))
+
+
+def ev_status(r, key):
+    row = r.store.one("SELECT apply_status, apply_note FROM events WHERE key=?", (key,))
+    return (row["apply_status"], row["apply_note"]) if row else None
+
+
+E = lambda i, **k: ms.ev("ENTRY", i, otype="MARKET", px=k.pop("px", 2600.0), sl=k.pop("sl", 2605.0), tp=k.pop("tp", 2592.5),
+                         info=k.pop("info", "SATS_NOW"), **k)
+
+
+def gate_basic():
     with tempfile.TemporaryDirectory() as d:
         r = rcv(d)
         st = [r.process(body(m))["status"] for m in ms.normal_flow()]
-        trade = r.store.one("SELECT * FROM tv_trades")
+        trade = r.store.one("SELECT * FROM tv_trades WHERE tid=?", (ms.normal_flow()[3]["tid"],))
         wait = r.store.one("SELECT * FROM tv_waits")
-        check("RR-01 normal flow (WAIT_START, PROV, ENTRY SATS pull, TV_FILL, TP_SET, BE_MOVE, TV_FLAT) all ACCEPTED; virtual trade CLOSED with the "
-              "breakeven stop / TP0, its wait CONSUMED by the entry; every receipt stores received time, decision bar times, sid, cfg hash, "
-              "tid, event, rank, order type, prices, reasons",
-              st == ["ACCEPTED"] * 7 and trade["state"] == "CLOSED" and trade["sl"] == 2651.9 and trade["tp"] == 2640.5 and wait["state"] == "CONSUMED"
-              and all(x["received_ms"] and x["bar_close"] and x["sid"] and x["cfg_sha256"] and x["tid"] and x["rank"] is not None
+        bars = r.store.one("SELECT COUNT(*) n FROM tv_bars")["n"]
+        check("RR-01 normal flow (WAIT_START, BAR, PROV, ENTRY SATS pull, BAR, TV_FILL, TP_SET, BAR, BE_MOVE, TV_FLAT) all ACCEPTED; trade CLOSED "
+              "with the reference price 2651.8 and the TradingView virtual fill 2651.9 stored separately, breakeven stop / TP0; wait CONSUMED; "
+              "3 BAR rows; every receipt keeps received / bar / sent times, sid, cfg hash, tid, event, rank, prices, OHLC, reasons",
+              st == ["ACCEPTED"] * 10 and trade["state"] == "CLOSED" and trade["ref_px"] == 2651.8 and trade["tv_fill_px"] == 2651.9
+              and trade["sl"] == 2651.9 and trade["tp"] == 2640.5 and wait["state"] == "CONSUMED" and bars == 3
+              and all(x["received_ms"] and x["bar_close"] and x["sid"] and x["cfg_sha256"] and x["tid"] and x["rank"] is not None and x["o"]
                       for x in r.store.all("SELECT * FROM receipts")), str(st))
         exp = {"not_json": ("REJECTED", "format:not_json"), "missing_field": ("REJECTED", "format:missing:sl"),
-               "duplicate_resend": ("DUPLICATE", "dup:same_key_already_accepted"), "out_of_order_after_close": ("REJECTED", "state:trade_closed"),
-               "unknown_trade_manage": ("REJECTED", "state:unknown_trade"), "wait_start": ("ACCEPTED", None), "wait_end": ("ACCEPTED", None),
-               "late_entry_for_ended_wait": ("REJECTED", "late:wait_already_ended"), "wrong_side": ("REJECTED", "intent:side_not_allowed"),
-               "bad_geometry": ("REJECTED", "intent:price_geometry"), "sid_mismatch": ("REJECTED", "identity:sid_mismatch"),
-               "entry_ok": ("ACCEPTED", None), "entry_while_virtual_active": ("REJECTED", "state:virtual_position_active"),
-               "older_entry_after_newer": ("REJECTED", "late:older_than_newer_trade")}
+               "sl_infinity": ("REJECTED", "format:nonstandard_constant:Infinity"), "bar_close_10e40": ("REJECTED", "time:out_of_range:bar_close"),
+               "negative_price": ("REJECTED", "value:price_range:px"), "duplicate_resend": ("DUPLICATE", "dup:same_key_already_accepted"),
+               "late_manage_after_close": ("REJECTED", "value:be_geometry"), "long_side_be_on_short": ("REJECTED", "value:side_not_allowed"),
+               "unknown_trade_manage": ("ACCEPTED", None), "wait_start": ("ACCEPTED", None), "wait_end": ("ACCEPTED", None),
+               "late_entry_for_ended_wait": ("ACCEPTED", None), "wrong_side": ("REJECTED", "value:side_not_allowed"),
+               "bad_geometry": ("REJECTED", "value:price_geometry"), "sid_mismatch": ("REJECTED", "identity:sid_mismatch"),
+               "entry_ok": ("ACCEPTED", None), "entry_while_virtual_active": ("ACCEPTED", None), "older_entry_after_newer": ("ACCEPTED", None)}
         got = {}
         for name, m in ms.bad_cases():
             res = r.process(body(m))
-            got[name] = (res["status"], next((x for x in res["reasons"] if exp[name][1] and x.startswith(exp[name][1])), None))
-        ok = all(got[k][0] == v[0] and (v[1] is None or got[k][1] is not None) for k, v in exp.items())
-        n_rec = r.store.one("SELECT COUNT(*) n FROM receipts")["n"]
-        check("RR-02 bad / edge cases: not JSON, missing field, re-send (DUPLICATE), late event to a closed trade, management for an unknown trade, "
-              "ENTRY for an already ended wait, LONG intent (Short only), SL / TP on the wrong side, sid mismatch, ENTRY while the virtual "
-              "position is open, an older ENTRY after a newer trade — each recorded (raw kept) with its reason; nothing changes state",
-              ok and n_rec == 7 + 14, str(got))
-        before = r.store.one("SELECT COUNT(*) n FROM events")["n"]
+            got[name] = (res["status"], [x for x in res["reasons"] if not x.startswith("warn:")])
+        ok = all(got[k][0] == v[0] and (v[1] is None or v[1] in got[k][1]) for k, v in exp.items())
+        bc = {n: m for n, m in ms.bad_cases()}
+        elig = {n: (intent(r, bc[n]["key"])["eligible"], intent(r, bc[n]["key"])["reason"]) for n in
+                ("late_entry_for_ended_wait", "entry_ok", "entry_while_virtual_active", "older_entry_after_newer")}
+        orphan = ev_status(r, bc["unknown_trade_manage"]["key"])
+        check("RR-02 bad / edge cases recorded with their reason (raw kept): not JSON, missing field, sl Infinity, bar_close 10**40, negative "
+              "prices, re-send (DUPLICATE), a BE stop that is not the fill, LONG BE on the SHORT trade, LONG intent, wrong SL / TP side, sid "
+              "mismatch; valid facts in a doubtful order are ACCEPTED as facts but are not execution candidates: management for an unseen "
+              "trade (ORPHAN), ENTRY for an ended wait, ENTRY while a candidate position is open, an older ENTRY after a newer one; the "
+              "valid ENTRY stays the only candidate",
+              ok and orphan[0] == "ORPHAN" and elig["entry_ok"] == (1, "ok") and elig["late_entry_for_ended_wait"][0] == 0
+              and "late:wait_already_ended" in elig["late_entry_for_ended_wait"][1] and elig["entry_while_virtual_active"][0] == 0
+              and "state:virtual_position_active" in elig["entry_while_virtual_active"][1] and elig["older_entry_after_newer"][0] == 0
+              and "late:older_than_newer_trade" in elig["older_entry_after_newer"][1], str((got, elig, orphan)))
     with tempfile.TemporaryDirectory() as d:
         r = rcv(d)
-        t = ms.ev("ENTRY", 3, otype="MARKET", px=2651.8, sl=2656.75, tp=2640.5, info="SATS_NOW")
-        tid = t["tid"]
-        seq = [t, ms.ev("TV_FILL", 4, tid=tid, px=2651.9, sl=2656.75), ms.ev("TP_SET", 4, tid=tid, px=2651.9, sl=2656.75, tp=2640.5),
-               ms.ev("BE_MOVE", 9, tid=tid, px=2651.9, sl=2651.9, tp=2640.5),
-               ms.ev("TP_SET", 6, tid=tid, px=2651.9, sl=2656.75, tp=2641.0),          # delayed, older than the BE_MOVE already applied
-               ms.ev("TV_FILL", 10, tid=tid, px=2651.9, sl=2656.75)]                   # a second fill: invalid in TV_OPEN
-        res = [r.process(body(m)) for m in seq]
-        tr = r.store.one("SELECT * FROM tv_trades")
-        check("RR-03 order inversion: a delayed TP_SET (bar 6) after the BE_MOVE (bar 9) is REJECTED out_of_order and does not undo the stop; "
-              "an event not allowed in the state (second TV_FILL) is REJECTED invalid_transition",
-              [x["status"] for x in res] == ["ACCEPTED"] * 4 + ["REJECTED"] * 2 and "order:out_of_order" in res[4]["reasons"]
-              and any(x.startswith("state:invalid_transition") for x in res[5]["reasons"]) and tr["sl"] == 2651.9 and tr["tp"] == 2640.5,
-              str([x["reasons"] for x in res]))
+        t = E(3)
+        r.process(body(t))
         r.store.db.close()
         r2 = rcv(d)
         again = r2.process(body(t))
-        n = r2.store.one("SELECT COUNT(*) n FROM receipts")["n"]
-        check("RR-04 restart: a new receiver on the same data directory still has every receipt and state; the same ENTRY re-sent after "
-              "the restart is DUPLICATE (the key is the bar-time key, not an in-memory counter)",
-              again["status"] == "DUPLICATE" and n == 7 and r2.store.one("SELECT state FROM tv_trades")["state"] == "TV_OPEN", str(again))
+        check("RR-03 restart: a new receiver on the same data directory keeps receipts / facts / states; the same ENTRY re-sent after the "
+              "restart is DUPLICATE (bar-time key, no in-memory counter)",
+              again["status"] == "DUPLICATE" and r2.store.one("SELECT COUNT(*) n FROM receipts")["n"] == 2
+              and r2.store.one("SELECT state FROM tv_trades")["state"] == "INTENT", str(again))
     with tempfile.TemporaryDirectory() as d:
         token = "test-token-" + os.urandom(8).hex()
         cfg = xr.load_config(None)
@@ -118,46 +139,50 @@ def gate_receiver():
                     return resp.status, json.loads(resp.read())
             except urllib.error.HTTPError as e:
                 return e.code, None
-        e1 = ms.ev("ENTRY", 80, otype="MARKET", px=2600.0, sl=2605.0, tp=2592.5, info="CURRENT")
-        ok = post(f"/webhook/{token}", body(e1).encode())
-        bad = post("/webhook/wrong", body(e1).encode())
+        ok = post(f"/webhook/{token}", body(E(80, info="CURRENT")).encode())
+        bad = post("/webhook/wrong", body(E(81)).encode())
         big = post(f"/webhook/{token}", b"{" + b" " * 20000 + b"}")
+        huge = post(f"/webhook/{token}", body(ms.bad_cases()[3][1]).encode())
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as resp:
             health = json.loads(resp.read())
         results = []
-
-        def resend():
-            results.append(post(f"/webhook/{token}", body(ms.ev("ENTRY", 90, otype="MARKET", px=2590.0, sl=2595.0, tp=2582.5, info="CURRENT")).encode()))
-        r = rcv(d)
-        r.process(body(ms.ev("CANCEL", 81, tid=e1["tid"], otype="MARKET", sl=2605.0, info="market_entry_not_filled")))
-        ths = [threading.Thread(target=resend) for _ in range(12)]
+        ths = [threading.Thread(target=lambda: results.append(post(f"/webhook/{token}", body(E(90, info="CURRENT")).encode()))) for _ in range(12)]
         [x.start() for x in ths]
         [x.join() for x in ths]
+        pid = json.load(open(os.path.join(d, "receiver.pid"), encoding="utf-8"))
         holder["s"].shutdown()
         log = open(os.path.join(d, "receiver.log"), encoding="utf-8").read()
         sts = sorted(x[1]["status"] for x in results)
-        n_unauth = r.store.one("SELECT COUNT(*) n FROM receipts WHERE source LIKE 'http:%' AND raw LIKE '%2600.0%'")["n"]
-        check("RR-05 HTTP: POST /webhook/<token> -> 200 ACCEPTED; a wrong token -> 404 (not recorded); a body over the limit -> 413; GET "
-              "/health says orders disabled; 12 concurrent re-sends of one ENTRY -> exactly 1 ACCEPTED + 11 DUPLICATE; the token never "
-              "appears in the log",
-              ok[0] == 200 and ok[1]["status"] == "ACCEPTED" and bad[0] == 404 and big[0] == 413 and health.get("orders") == "disabled"
-              and sts == ["ACCEPTED"] + ["DUPLICATE"] * 11 and token not in log and n_unauth == 1, str((ok, bad, big, sts)))
+        check("RR-04 HTTP: POST /webhook/<token> -> 200 ACCEPTED; wrong token -> 404 (not recorded); body over the limit -> 413; bar_close "
+              "10**40 -> 200 REJECTED (no crash); /health says orders disabled; 12 concurrent re-sends -> 1 ACCEPTED + 11 DUPLICATE; the token "
+              "never appears in the log; the PID file records pid / start time / script / data dir / marker for the stop script",
+              ok[0] == 200 and ok[1]["status"] == "ACCEPTED" and bad[0] == 404 and big[0] == 413 and huge[0] == 200
+              and huge[1]["status"] == "REJECTED" and health.get("orders") == "disabled" and sts == ["ACCEPTED"] + ["DUPLICATE"] * 11
+              and token not in log and {"pid", "started_utc", "script", "data_dir", "marker"} <= set(pid), str((ok, bad, big, huge, sts)))
+    m = ms.normal_flow()[3]
+    sha = hashlib.sha256(m["cfg"].encode()).hexdigest()
     with tempfile.TemporaryDirectory() as d:
-        m = ms.normal_flow()[2]
-        import hashlib
-        sha = hashlib.sha256(m["cfg"].encode()).hexdigest()
         a = rcv(d, expected={"cfg_sha256": sha}).process(body(m))
     with tempfile.TemporaryDirectory() as d:
         b = rcv(d, expected={"cfg_sha256": "0" * 64}).process(body(m))
     with tempfile.TemporaryDirectory() as d:
         c = rcv(d).process(body(m), now_ms=m["bar_close"] + 3600_000)
-        e = rcv(d + "x" if False else d, policy={"max_age_sec": 60}).process(body(ms.ev("ENTRY", 100, otype="MARKET", px=2600.0, sl=2605.0,
-                                                                                         tp=2592.5, info="CURRENT")), now_ms=ms.bar(101) + 120_000)
-    check("RR-06 settings ID: with the cfg hash pinned the matching cfg is accepted without the warning and a different cfg is REJECTED "
-          "cfg_mismatch; the notification deadline is off by default (a 1 h old ENTRY is accepted, its age recorded) and, only when "
-          "configured (here 60 s), an older ENTRY is REJECTED late",
+        cs = rcv(d).store.one("SELECT age_ms FROM receipts")["age_ms"]
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d, policy={"max_age_sec": 60})
+        e = r.process(body(E(100, info="CURRENT")), now_ms=ms.bar(101) + 120_000)
+        e_int = intent(r, E(100, info="CURRENT")["key"])
+    with tempfile.TemporaryDirectory() as d:
+        f_none = rcv(d).process(body(E(110, sent_delay=-7200_000 + 300_000 + 1500)), now_ms=ms.bar(110) - 3600_000)
+    with tempfile.TemporaryDirectory() as d:
+        f_set = rcv(d, policy={"max_future_skew_sec": 5}).process(body(E(110)), now_ms=ms.bar(110) - 3600_000)
+    check("RR-05 settings ID pinned: the matching cfg is accepted without the warning, a different cfg REJECTED cfg_mismatch; the deadline "
+          "and the future-skew tolerance are off by default (a 1 h old ENTRY / a bar 1 h in the future accepted, age recorded) and work only "
+          "when configured (old ENTRY: fact accepted, not a candidate 'late:older_than_max_age'; future: REJECTED time:in_future)",
           a["status"] == "ACCEPTED" and "warn:cfg_unpinned" not in a["reasons"] and "identity:cfg_mismatch" in b["reasons"]
-          and c["status"] == "ACCEPTED" and e["status"] == "REJECTED" and "late:older_than_max_age" in e["reasons"], str((a, b, c, e)))
+          and c["status"] == "ACCEPTED" and cs == 3600_000 and e["status"] == "ACCEPTED" and e_int["eligible"] == 0
+          and e_int["reason"] == "late:older_than_max_age" and f_none["status"] == "ACCEPTED" and "time:in_future" in f_set["reasons"],
+          str((a, b, c, e, dict(e_int), f_none, f_set)))
     src = open(os.path.join(RDIR, "xau_receiver.py"), encoding="utf-8").read()
     with tempfile.TemporaryDirectory() as d:
         r = rcv(d)
@@ -165,30 +190,175 @@ def gate_receiver():
             r.process(body(mm))
         mt5 = r.store.one("SELECT COUNT(*) n FROM mt5_positions")["n"]
         acts = {x["mt5_action"] for x in r.store.all("SELECT mt5_action FROM receipts")}
-    check("RR-07 the TradingView virtual trades (tv_trades / tv_waits) and the MT5 actual positions (mt5_positions) are separate tables; "
-          "stage 2 never writes MT5 state (0 rows) and every receipt says no MT5 action; the receiver has no MetaTrader5 / order / socket "
-          "client code", mt5 == 0 and acts == {xr.STAGE2_MT5_ACTION}
+        claimed = r.store.one("SELECT COUNT(*) n FROM intents WHERE claimed_ms IS NOT NULL")["n"]
+    check("RR-06 TradingView virtual state (tv_trades / tv_waits / tv_bars) and MT5 actual positions (mt5_positions) are separate; stage 2 "
+          "never writes MT5 state, never claims an intent, every receipt says no MT5 action; no MetaTrader5 / order / socket client code",
+          mt5 == 0 and claimed == 0 and acts == {xr.STAGE2_MT5_ACTION}
           and not re.search(r"MetaTrader5|order_send|order_check|positions_get|socket\.connect|urlopen|requests\.", src), str((mt5, acts)))
     with tempfile.TemporaryDirectory() as d:
         ms.write(d)
         same = all(open(os.path.join(d, f), encoding="utf-8").read() == open(os.path.join(RDIR, "samples", f), encoding="utf-8").read()
                    for f in ("normal_flow.jsonl", "bad_cases.jsonl"))
     cfg_file = json.load(open(os.path.join(RDIR, "config.example.json"), encoding="utf-8"))
-    check("RR-08 the committed sample files equal make_samples.py output; config.example.json == the built-in defaults (no token, no "
-          "credentials; deadline / cfg pin unset)", same and cfg_file == xr.DEFAULT_CONFIG and "token" not in json.dumps(cfg_file).replace("token_env", ""))
+    check("RR-07 the committed samples equal make_samples.py output; config.example.json == the built-in defaults (no token, no credentials; "
+          "deadline / future skew / cfg pin unset)", same and cfg_file == xr.DEFAULT_CONFIG)
+
+
+def gate_regressions():
+    # 1. terminal / cancel facts before the ENTRY
+    res1 = {}
+    for term in ("TV_CLOSED", "TV_FLAT", "CANCEL"):
+        with tempfile.TemporaryDirectory() as d:
+            r = rcv(d)
+            ent = E(3)
+            tid = ent["tid"]
+            t = ms.ev(term, 5, tid=tid, px=None if term == "CANCEL" else 2601.0, sl=2605.0, otype="MARKET" if term == "CANCEL" else "",
+                      info="x")
+            a = r.process(body(t))
+            b = r.process(body(ent))
+            r.store.db.close()
+            r2 = rcv(d)                                 # restart between the two: the terminal fact must persist
+            again = r2.process(body(E(3)))
+            it = intent(r2, ent["key"])
+            res1[term] = (a["status"], ev_status(r2, t["key"]), b["status"], it["eligible"], it["reason"], again["status"],
+                          r2.store.one("SELECT state FROM tv_trades WHERE tid=?", (tid,))["state"])
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d)
+        wid = f"W{ms.bar(0) + ms.BAR}"
+        we = ms.ev("WAIT_END", 2, tid=wid, px=2650.25, sl=2656.75, tp=2640.5, info="expired")
+        ent = E(3, info=f"SATS_PULL;wid={wid}")
+        r.process(body(we))
+        r.process(body(ent))
+        it_w = intent(r, ent["key"])
+        wst = r.store.one("SELECT state FROM tv_waits WHERE wid=?", (wid,))["state"]
+    check("RG-01 a terminal / cancel fact (TV_CLOSED / TV_FLAT / CANCEL) arriving BEFORE its ENTRY is ACCEPTED and kept (ORPHAN fact, "
+          "survives a restart); the later ENTRY is stored as a fact but is NOT an execution candidate (eligible 0, "
+          "late:trade_already_terminated) and the trade stays terminal; a WAIT_END arriving first makes the related SATS pull ENTRY "
+          "ineligible (late:wait_already_ended), not just a warning",
+          all(v[0] == "ACCEPTED" and v[2] == "ACCEPTED" and v[3] == 0 and v[4] == "late:trade_already_terminated" and v[5] == "DUPLICATE"
+              for v in res1.values()) and res1["TV_FLAT"][6] in ("INTENT", "CLOSED", "TERMINAL_ENTRY_UNSEEN")
+          and it_w["eligible"] == 0 and it_w["reason"].startswith("late:wait_already_ended") and wst == "ENDED_START_UNSEEN",
+          str((res1, dict(it_w), wst)))
+    # 2. management out of order
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d)
+        ent = E(3)
+        tid = ent["tid"]
+        tp = ms.ev("TP_SET", 4, tid=tid, px=2600.4, sl=2605.0, tp=2592.5, info="sats_tp0")
+        fill = ms.ev("TV_FILL", 4, tid=tid, px=2600.4, sl=2605.0, info="virtual_fill")
+        be = ms.ev("BE_MOVE", 9, tid=tid, px=2600.4, sl=2600.4, tp=2592.5, info="breakeven_tv_fill_based")
+        flat = ms.ev("TV_FLAT", 12, tid=tid, px=2600.4, sl=2600.4, tp=2592.5, info="virtual_position_closed")
+        late_be = ms.ev("BE_MOVE", 14, tid=tid, px=2600.4, sl=2600.4, tp=2592.5, info="breakeven_tv_fill_based")
+        r.process(body(ent))
+        r.process(body(tp))
+        s_tp_before = ev_status(r, tp["key"])
+        i_tp_before = intent(r, tp["key"])["eligible"]
+        r.process(body(be))                              # BE before the fill too: pending
+        r.process(body(fill))
+        s_tp_after, s_be = ev_status(r, tp["key"]), ev_status(r, be["key"])
+        tr = r.store.one("SELECT * FROM tv_trades WHERE tid=?", (tid,))
+        sl_after_be = tr["sl"]
+        claim1 = r.claim(tp["key"])
+        claim2 = r.claim(tp["key"])
+        r.process(body(flat))
+        r.process(body(late_be))
+        tr2 = r.store.one("SELECT * FROM tv_trades WHERE tid=?", (tid,))
+        s_late = ev_status(r, late_be["key"])
+        old_tp = ms.ev("TP_SET", 4, tid=tid, px=2600.4, sl=2605.0, tp=2592.5, info="sats_tp0")
+        dup_old = r.process(body(old_tp))
+    check("RG-02 ENTRY -> TP_SET -> BE_MOVE -> TV_FILL arrival: TP_SET / BE_MOVE are PENDING (not eligible) until the fill arrives, then "
+          "replayed in bar / rank order and APPLIED (TP 2592.5, stop moved to the virtual fill 2600.4 by the newer BE, never back to the "
+          "older 2605); after TV_FLAT a later valid BE (bar 14) is AFTER_TERMINAL and the trade stays CLOSED with the BE stop; an intent "
+          "can be claimed once only (second claim False); re-sending the old TP_SET is DUPLICATE",
+          s_tp_before == ("PENDING", "waiting_for_tv_fill") and i_tp_before == 0 and s_tp_after == ("APPLIED", "") and s_be == ("APPLIED", "")
+          and sl_after_be == 2600.4 and tr["tp"] == 2592.5 and claim1 and not claim2 and tr2["state"] == "CLOSED" and tr2["sl"] == 2600.4
+          and s_late == ("AFTER_TERMINAL", "trade_closed") and dup_old["status"] == "DUPLICATE",
+          str((s_tp_before, s_tp_after, s_be, sl_after_be, claim1, claim2, tr2["state"], s_late)))
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d)
+        ent = E(3)
+        tid = ent["tid"]
+        r.process(body(ent))
+        r.process(body(ms.ev("TV_FILL", 4, tid=tid, px=2600.4, sl=2605.0, info="virtual_fill")))
+        r.process(body(ms.ev("BE_MOVE", 9, tid=tid, px=2600.4, sl=2600.4, tp=2592.5, info="breakeven_tv_fill_based")))
+        older = ms.ev("TP_SET", 4, tid=tid, px=2600.4, sl=2605.0, tp=2592.5, info="sats_tp0")
+        r.process(body(older))                          # same-bar TP_SET arriving after the newer BE: replayed before it
+        tr = r.store.one("SELECT * FROM tv_trades WHERE tid=?", (tid,))
+        mism = ms.ev("BE_MOVE", 11, tid=tid, px=2601.0, sl=2601.0, tp=2592.5, info="breakeven_tv_fill_based")
+        r.process(body(mism))
+    check("RG-03 a delayed same-bar TP_SET arriving after the newer BE_MOVE is replayed in bar order (APPLIED) and the stop stays at the newer "
+          "BE value 2600.4 (not overwritten by the older 2605); a BE whose fill price differs from the recorded virtual fill is CONFLICT",
+          tr["sl"] == 2600.4 and tr["tp"] == 2592.5 and ev_status(r, older["key"]) == ("APPLIED", "")
+          and ev_status(r, mism["key"])[0] == "CONFLICT", str((dict(tr), ev_status(r, mism["key"]))))
+    # 3. abnormal values
+    base = json.dumps(E(20), separators=(",", ":"))
+    cases = {"NaN": base.replace('"sl":2605.0', '"sl":NaN'), "-Infinity": base.replace('"tp":2592.5', '"tp":-Infinity'),
+             "1e400": base.replace('"sl":2605.0', '"sl":1e400'), "neg": body(E(21, px=-2600.0, sl=-2595.0, tp=-2607.5)),
+             "zero": body(E(22, px=0.0)), "bool_px": base.replace('"px":2600.0', '"px":true'),
+             "huge_int_px": base.replace('"px":2600.0', '"px":' + str(10 ** 400)),
+             "bar_close_10e40": base.replace(f'"bar_close":{ms.bar(20) + ms.BAR}', '"bar_close":' + str(10 ** 40)),
+             "unaligned": body(E(23, bar_open=ms.bar(23) + 60000)), "not_5m": body(E(24, bar_close=ms.bar(24) + 600000)),
+             "dup_field": base[:-1] + ',"sl":2606.0}', "unknown_field": base[:-1] + ',"extra":1}', "non_utf8": b'{"ev":"\xff"}',
+             "be_long_neg": body(ms.ev("BE_MOVE", 25, tid=f"T{ms.bar(24) + ms.BAR}", side="LONG", px=2600.0, sl=-999.0, tp=2590.0)),
+             "deep": "[" * 5000 + "]" * 5000, "string_body_null": "null", "array": "[1,2]",
+             "tid_before_bar": body(ms.ev("TV_FILL", 26, tid=f"T{ms.bar(27) + ms.BAR}", px=2600.0, sl=2605.0)),
+             "ohlc_bad": body(E(27, ohlc=(2600.0, 2599.0, 2601.0, 2600.0)))}
+    got = {}
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d)
+        for k, v in cases.items():
+            res = r.process(v.encode() if isinstance(v, str) else v)
+            got[k] = (res["status"], res["reasons"][:2])
+        n = r.store.one("SELECT COUNT(*) n FROM receipts")["n"]
+        ints_ok = all(x["bar_close"] is None or abs(x["bar_close"]) < 2 ** 63 for x in r.store.all("SELECT bar_close FROM receipts"))
+    check("RG-04 abnormal input never raises and is always recorded (one receipt each, %d): NaN / -Infinity (non-standard constants), 1e400 "
+          "and 10**400 (non-finite / out of range), negative / zero / boolean prices, bar_close 10**40, an unaligned or non-5m bar, a "
+          "duplicate or unknown field, non-UTF-8, a LONG BE with stop -999 on the SHORT strategy, deeply nested JSON, null / array bodies, an "
+          "event before its entry bar, inconsistent OHLC -> REJECTED with a reason; stored integers stay within SQLite's range" % len(cases),
+          all(v[0] == "REJECTED" for v in got.values()) and n == len(cases) and ints_ok
+          and "format:nonstandard_constant:NaN" in got["NaN"][1] and got["1e400"][1][0].startswith("value:not_finite")
+          and "time:out_of_range:bar_close" in got["bar_close_10e40"][1] and "time:bar_not_aligned" in got["unaligned"][1]
+          and "format:duplicate_field" in got["dup_field"][1] and "format:not_utf8" in got["non_utf8"][1], str(got))
+    # 5. BAR data + BE stop marked recompute-only
+    with tempfile.TemporaryDirectory() as d:
+        r = rcv(d)
+        for mm in ms.normal_flow():
+            r.process(body(mm))
+        bars = r.store.all("SELECT * FROM tv_bars ORDER BY bar_close")
+        be_key = ms.normal_flow()[8]["key"]
+        be_use = r.store.one("SELECT use FROM intents WHERE key=?", (be_key,))["use"]
+        flat_use = r.store.one("SELECT use FROM intents WHERE key=?", (ms.normal_flow()[9]["key"],))["use"]
+    check("RG-05 BAR events (bar open / close times, OHLC, TradingView virtual side / stop / TP, tv_state / tv_fill in info) are stored in "
+          "tv_bars independently of the trade facts; the BE_MOVE intent says RECOMPUTE_BE_FROM_MT5_FILL (the TradingView stop is never to be "
+          "applied to XS) and TV_FLAT says REVIEW_TV_EXIT (MT5 may still hold a position)",
+          len(bars) == 3 and all(b["o"] and b["h"] and b["l"] and b["c"] and b["bar_open"] for b in bars)
+          and json.loads(bars[2]["info"]).get("tv_fill") == "2651.9" and be_use.startswith("RECOMPUTE_BE_FROM_MT5_FILL")
+          and flat_use.startswith("REVIEW_TV_EXIT"), str((len(bars), be_use, flat_use)))
+    # 6. PowerShell scripts (static: not executed here)
+    rd = lambda f: open(os.path.join(RDIR, f), encoding="utf-8").read()
+    s, p, t = rd("start_receiver.ps1"), rd("stop_receiver.ps1"), rd("test_samples.ps1")
+    check("RG-06 PowerShell (static): start quotes every argument with the Windows rules (Format-WinArg, Resolve-Path -LiteralPath, one "
+          "argument line, PYTHONUTF8) so spaces / Japanese paths work; stop reads the JSON PID file and stops only when the command line has "
+          "xau_receiver.py + serve AND the process start time matches (re-used PID safe); the sample test writes a new data folder under "
+          "%TEMP% and never deletes the real one; the config loader accepts UTF-8 with BOM",
+          "function Format-WinArg" in s and "Resolve-Path -LiteralPath $Config" in s and "-ArgumentList $argLine" in s and "PYTHONUTF8" in s
+          and "Win32_Process" in p and 'Contains("xau_receiver.py")' in p and 'Contains("serve")' in p and "CreationDate" in p
+          and "started_utc" in p and "GetTempPath()" in t and "Remove-Item" not in t.split("Write-Host")[0]
+          and 'encoding="utf-8-sig"' in rd("xau_receiver.py"))
 
 
 def main():
-    try:
-        gate_receiver()
-    except Exception:
-        import traceback
-        check("gate_receiver completed without error", False, traceback.format_exc()[-1200:])
+    for g in (gate_basic, gate_regressions):
+        try:
+            g()
+        except Exception:
+            import traceback
+            check(f"{g.__name__} completed without error", False, traceback.format_exc()[-1500:])
     fails = 0
     for nm, ok, d in RESULTS:
         fails += 0 if ok else 1
         print(f"{'PASS' if ok else 'FAIL'}  {nm[:150].ljust(150)}  {'' if ok else d}")
-    print(f"\n{len(RESULTS) - fails}/{len(RESULTS)} passed  [local Python: receiver / storage / HTTP; no TradingView / MT5]")
+    print(f"\n{len(RESULTS) - fails}/{len(RESULTS)} passed  [local Python: receiver / storage / HTTP; no TradingView / Windows / MT5]")
     raise SystemExit(1 if fails else 0)
 
 
