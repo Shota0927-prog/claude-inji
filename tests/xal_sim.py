@@ -44,7 +44,7 @@ def main_checks():
           "Engines, Visuals and every other Pine file unchanged",
           L == xl.build() and xl.strip(L) == S0 and xl.strip21(L) == xl.show("d67941f", xl.LONG_PATH) == xl.build1()
           and __import__("xa_build").strip_strategy21(S) == S0
-          and not [p for p in others if raw(p) != xl.show(xl.SRC_REV, p) and p != xl.SRC_PATH])
+          and not [p for p in others if __import__("btl_build").unapply(p, raw(p)) != xl.show(xl.SRC_REV, p) and p != xl.SRC_PATH])   # later BTL-1 reverted exactly
     iv, isrc = input_values(L), input_values(S)
     bad = {k: (iv.get(k), v) for k, v in TABLE.items() if iv.get(k) != v}
     diff = {k for k in isrc if isrc[k] != iv[k]}

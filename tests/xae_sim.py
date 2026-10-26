@@ -587,7 +587,7 @@ def gate_xa5():
     st = git("status", "--porcelain").split("\n")
     mod = set(git("diff", "--name-only", A, "--").split()) | {l[3:] for l in st if l.startswith("??")}
     mod -= {"tests/__pycache__/"}
-    mod = {m for m in mod if not __import__("xal_build").ok(m)}     # XL-1 (Gold Long, new): exact
+    mod = {m for m in mod if not __import__("xal_build").ok(m) and m not in __import__("btl_build").NEW_TESTS}     # XL-1 (Gold Long, new) / BTL-1 new tests: exact
     others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, xb.STR_PATH) and not __import__("xal_build").ok(p)]
     check("XF-07 vs a33d2b0 only the Gold Visual / Strategy, xa_build, xae_sim, cad_sim and cad_adapt change; every other Pine "
           "file (Engines incl. ZoneEnginePracticalXAUUSD, other symbols) byte-identical",

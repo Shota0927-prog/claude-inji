@@ -83,7 +83,7 @@ def gate_static():
           "both carry the identical alert layer; Engines, Visuals, the currency Strategies and every other Pine file unchanged since %s" % PREV,
           S == xb.build_strategy21() and xb.strip_strategy21(S) == S0 and L == xl.build21() and xl.strip21(xl.build()) == L0
           and xl._revert(L, xl._xa21()) == L0 and xl._revert(xl._revert(L, xl._xa21()), xl.EDITS) == S0
-          and xb.build_strategy20() == S0 and xl.build1() == L0 and not [p for p in others if raw(p) != xb.show(PREV, p)])
+          and xb.build_strategy20() == S0 and xl.build1() == L0 and not [p for p in others if __import__("btl_build").unapply(p, raw(p)) != xb.show(PREV, p)])   # later BTL-1 (BTCUSD defaults) reverted exactly
     bad = {}
     for k, (t, t0) in FILES.items():
         iv, i0 = input_values(t), input_values(t0)

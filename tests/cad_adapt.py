@@ -23,7 +23,8 @@ LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src
              "tests/xal_build.py", "tests/xal_sim.py",                                       # new in the later layer XL-1 (Gold Long)
              "tests/xaa_sim.py",                                                             # new in the later layer XA-21 (Gold alerts)
              "tests/xab_sim.py",                                                             # new in the later layer XA-22 (provisional once per candidate)
-             "tests/xac_sim.py")                                                             # new in the later layer XA-23 (Gold confirmed labels)
+             "tests/xac_sim.py",                                                             # new in the later layer XA-23 (Gold confirmed labels)
+             "tests/btl_build.py", "tests/btl_sim.py")                                       # new in the later layer BTL-1 (BTCUSD Long defaults)
 NEW_FILES = ("tests/cad_build.py", "tests/cad_adapt.py", "tests/cad_sim.py") + LATER_NEW
 _rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 
@@ -3446,8 +3447,8 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                        '    mod = set(git("diff", "--name-only", A, "--").split()) | {l[3:] for l in st if '
                        'l.startswith("??")}\n'
                        '    mod -= {"tests/__pycache__/"}\n'
-                       '    mod = {m for m in mod if not __import__("xal_build").ok(m)}     # XL-1 (Gold Long, new): '
-                       'exact\n'
+                       '    mod = {m for m in mod if not __import__("xal_build").ok(m) and m not in '
+                       '__import__("btl_build").NEW_TESTS}     # XL-1 (Gold Long, new) / BTL-1 new tests: exact\n'
                        '    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.VIS_PATH, '
                        'xb.STR_PATH) and not __import__("xal_build").ok(p)]\n'
                        '    check("XF-07 vs a33d2b0 only the Gold Visual / Strategy, xa_build, xae_sim, cad_sim and '

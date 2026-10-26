@@ -30,7 +30,7 @@ ROOT = s2.ROOT
 B = s2.BASE_REV
 raw = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 code_only, input_values, input_decls, func = es.code_only, es.input_values, es.input_decls, es.func
-CUR = {k: raw(p) for k, p in s2.PATHS.items()}
+CUR = {k: __import__("btl_build").unapply(p, raw(p)) for k, p in s2.PATHS.items()}     # later BTL-1 (BTCUSD defaults) reverted exactly
 BASE = {k: s2.show(B, p) for k, p in s2.PATHS.items()}
 GOLD = s2.gold()
 RESULTS = []

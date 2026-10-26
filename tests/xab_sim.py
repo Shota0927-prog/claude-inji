@@ -72,7 +72,7 @@ def gate_static():
     check("BS-01 Short == xa_build.build_strategy() (XA-1 .. XA-22) and strip_strategy22 gives the XA-21 Short of %s byte for byte; Long == "
           "xal_build.build() and strip22 gives the XA-21 Long of %s; the same XA-22 layer on both; every other Pine file unchanged" % (PREV, PREV),
           S == xb.build_strategy22() and xb.strip_strategy22(S) == S0 and xb.build_strategy21() == S0
-          and L == xl.build22() and xl.strip22(L) == L0 and xl.build21() == L0 and not [p for p in others if raw(p) != xb.show(PREV, p)])
+          and L == xl.build22() and xl.strip22(L) == L0 and xl.build21() == L0 and not [p for p in others if __import__("btl_build").unapply(p, raw(p)) != xb.show(PREV, p)])   # later BTL-1 reverted exactly
     keep = {}
     for k, (t, t0) in FILES.items():
         keep[k] = (input_values(t) == input_values(t0) and es.seg(t, "strategy(", "import ") == es.seg(t0, "strategy(", "import ")

@@ -1965,7 +1965,7 @@ def gate_xa20():
           xb.build_strategy20() == S20 and xb.strip_strategy20(S20) == S19 and xb.build_strategy19() == S19
           and xb.strip_strategy19(S20) == xb.show("b7f0036", xb.STR_PATH)
           and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and not __import__("xal_build").ok(p)
-                   and open(os.path.join(ROOT, p), encoding="utf-8").read() != xb.show("5f2c8a5", p)])
+                   and __import__("btl_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read()) != xb.show("5f2c8a5", p)])   # later BTL-1 reverted exactly
     check("XD-02 adopted Gold Short table on the delivered file (wait 240, line ON, body ON, near ON / 1.0, filter D OFF / 4H ON / 1H ON / "
           "15m OFF / 5m OFF, immediate ON, Nc 1, Nz 1, pull expiry OFF / 1); the only changed default is stSatsNow false -> true; every "
           "unlisted default kept (Entry C, Short Only, SATS Pullback, Retest Confirmed, SL Buffer 1.5, RR 1.5, BE ON / Fixed 15, opposite "

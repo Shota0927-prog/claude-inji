@@ -229,7 +229,9 @@ def strip(path, text):
 
 
 def unapply(path, text):
-    """reverse SX-2 when present (all or nothing): unchanged without it (or for other paths), None with only part of it."""
+    """reverse SX-2 when present (all or nothing): unchanged without it (or for other paths), None with only part of it.
+    The later BTL-1 layer (btl_build: BTCUSD Long adopted defaults) is reverted first, exactly."""
+    text = __import__("btl_build").unapply(path, text)
     if text is None or path not in BY_PATH:
         return text
     if _hdr() not in text and "stSatsNowC" not in text:
