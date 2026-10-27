@@ -54,15 +54,15 @@ def gate_static():
     m, m0 = block(A, MAIN_START, MAIN_END), block(N, MAIN_START, MAIN_END)
     pick = lambda t: [l.strip() for l in code_only(t).split("\n")
                       if re.search(r"\bstrategy\.(entry|exit|close|cancel)\(|^\s*\w+\s*(:=|\+=)|^\s*(if|else|for)\b", l) and "auTid :=" not in l
-                      and "f_auEmit(" not in l and not l.strip().startswith("if auBar")]
+                      and "f_auEmit(" not in l and not l.strip().startswith(("if auBar", "if auLive"))]
     added = [l.strip() for l in code_only(m).split("\n") if l.strip() and l.strip() not in [x.strip() for x in code_only(m0).split("\n")]]
     check("AP-02 trading identical: in the confirmed 5m block every strategy.entry / exit / close / cancel call, every state assignment and "
           "every if / else line is the same, in the same order; the only added lines are f_auEmit calls (18 in the file, incl. the BAR "
           "emit under `if auBar`) and the auTid assignments (3); strategy() settings apart from the name identical (calc_on_every_tick true, process_orders_on_close false)",
-          pick(m) == pick(m0) and all(l.startswith(("f_auEmit(", "auTid :=", '"tv_state=')) or l.startswith("if auBar") for l in added)
+          pick(m) == pick(m0) and all(l.startswith(("f_auEmit(", "auTid :=", '"tv_state=')) or l.startswith(("if auBar", "if auLive")) for l in added)
           and code_only(A).count("f_auEmit(") == 19 and code_only(m).count("auTid :=") == 3
           and es.seg(A, "strategy(", "import ").replace("Zone Strategy XAU Auto", "Zone Strategy XAU").replace("ZONE-ST-AU", "ZONE-ST")
-          == es.seg(N, "strategy(", "import "), str([l for l in added if not (l.startswith(("f_auEmit(", "auTid :=", '"tv_state=')) or l.startswith("if auBar"))]))
+          == es.seg(N, "strategy(", "import "), str([l for l in added if not (l.startswith(("f_auEmit(", "auTid :=", '"tv_state=')) or l.startswith(("if auBar", "if auLive")))]))
     after = {   # decision line -> the event emitted right after it (same block)
         "strategy.exit(oXid, oEid, stop = oSL)\n                    f_stConfAlert(pwSide": "ENTRY", "fillNow := true": "TV_FILL",
         "cancelBar := true": "CANCEL", "pwNBad += 1": "CLOSE_REQ", "pwEv        := why": "WAIT_END",
@@ -82,12 +82,12 @@ def gate_static():
     check("AP-04 idempotency: key = SID|ev|tid|bar_close (time_close of the event bar, no counter); tid = \"T\" + the ENTRY decision bar's "
           "close time (later events of the trade reuse auTid, a var set only in the ENTRY branches), \"W\" + the SATS prep bar close (pwEndT), "
           "\"P\" + the provisional bar open; varip key list, appended only in the branch that calls alert(), at most %d" % ab.KEEP,
-          '    string key  = AU_SID + "|" + ev + "|" + tid + "|" + str.tostring(time_close)\n' in fe
-          and "    bool   send = auJson and not array.includes(auSent, key)\n" in fe
-          and fe.index("array.push(auSent, key)") > fe.index("    if send\n") and fe.index("array.push(auSent, key)") < fe.index("alert(f_auJson(")
+          '        string key = AU_SID + "|" + ev + "|" + tid + "|" + str.tostring(time_close)\n' in fe
+          and "        if not array.includes(auSent, key)\n" in fe
+          and fe.index("array.push(auSent, key)") > fe.index("        if not array.includes") and fe.index("array.push(auSent, key)") < fe.index("alert(f_auJson(")
           and "varip array<string> auSent = array.new_string()" in A and 'var string auTid = ""' in A
           and A.count('auTid := "T" + str.tostring(time_close)') == 3 and '"W" + str.tostring(pwEndT)' in A and '"W" + str.tostring(time_close)' in A
-          and '"P" + str.tostring(time)' in A and "        if array.size(auSent) > %d\n" % ab.KEEP in fe)
+          and '"P" + str.tostring(time)' in A and "            if array.size(auSent) > %d\n" % ab.KEEP in fe)
     check("AP-05 human-text alerts of the copy only when JSON output is OFF (confirmed: inside f_stConfAlert; provisional: the same gate / "
           "dedup, JSON PROV or text); input '自動化 JSON 出力' default ON; labels and every other input unchanged",
           '        if not auJson     // AU:' in A and "    if auJson     // AU:" in A and len(re.findall(r"^\s*alert\(", code_only(A), re.M)) == 3
@@ -139,7 +139,7 @@ def gate_cfg():
     fields = ab.cfg_fields()
     names = list(es.input_decls(N))
     inc = [f["name"] for f in fields if f["included"]]
-    cfg_lines = re.findall(r"^string auCfg\d+ = (.*)$", A, re.M)
+    cfg_lines = re.findall(r"^(?:var )?string auCfg\d+ = (.*)$", A, re.M)
     refs = [x for line in cfg_lines for x in re.findall(r"\b([a-zA-Z_]\w*)\b", line) if x in names]
     disp_ok = {}
     for nm in ab.EXCLUDED:
@@ -176,19 +176,114 @@ def gate_cfg():
           raw.replace("\\", "\\\\").replace('"', '\\"') == mks.predicted_cfg() and raw.count("|") == len(inc), raw[:200])
 
 
+def gate_au5():
+    """AU-5 (RE10110): the notification-only work never runs on historical bars or with the JSON output OFF."""
+    code = code_only(A)
+    lines = code.split("\n")
+    calls = [i for i, l in enumerate(lines) if l.lstrip().startswith("f_auEmit(") and "=>" not in l]
+    cs = lambda s: s.split("//")[0].strip()
+    bad = []
+    for i in calls:
+        l = lines[i]
+        ind = len(l) - len(l.lstrip())
+        prev = lines[i - 1]
+        pind = len(prev) - len(prev.lstrip())
+        if 'f_auEmit("PROV"' in l:
+            ok = cs(prev) == "if auJson" and pind == ind - 4      # forming realtime ticks only (stPvA), guarded again inside
+        elif 'f_auEmit("BAR"' in l:
+            ok = cs(prev) == "if auBar and auLive" and pind == ind - 4
+        else:
+            ok = cs(prev) == "if auLive" and pind == ind - 4
+        if not ok:
+            bad.append(l.strip()[:60])
+    fe = func(A, "f_auEmit(string ev, string tid, int rank, int side, string ot, float px, float sl, float tp, string info) =>")
+    fl = [l for l in code_only(fe).split("\n") if l.strip()]
+    gate_i = next(i for i, l in enumerate(fl) if l.strip() == "if auJson and barstate.isrealtime")
+    heavy = [l for l in fl if re.search(r"string key|array\.(includes|push|shift|size)|alert\(|f_auJson", l)]
+    m = block(A, MAIN_START, MAIN_END)
+    notif_strings = [l for l in code_only(m).split("\n") if re.search(r'"W" \+ str\.tostring|"tv_state="|"SATS_PULL;wid=W"', l)]
+    guarded_strings = bool(notif_strings) and all(cs(lines[lines.index(l) - 1]).startswith(("if auLive", "if auBar and auLive")) or l.lstrip().startswith('"tv_state=')
+                          for l in notif_strings)
+    tid_lines = [l for l in lines if l.lstrip().startswith("auTid :=")]
+    tid_ok = all(cs(lines[lines.index(l) - 1]) != "if auLive" for l in tid_lines) and len(tid_lines) == 3
+    cfg_decl = re.findall(r"^(var )?string (auCfg\w*)\s*=", A, re.M)
+    check("AU5-01 every emit call (18) sits alone under an explicit guard: 16 under `if auLive` (= auJson and barstate.isrealtime), BAR under "
+          "`if auBar and auLive`, PROV under `if auJson` (it only runs on realtime forming ticks); so on historical bars / with the output "
+          "OFF no argument string (wait ids, BAR info, tv_state ...) is built and f_auEmit is not even called",
+          not bad and len(calls) == 18 and guarded_strings, str((bad, len(calls), notif_strings)))
+    check("AU5-02 inside f_auEmit the key, the duplicate search (array.includes), the sent-key array updates, the JSON build and alert() are "
+          "nested under the explicit `if auJson and barstate.isrealtime` (no `and not array.includes` relying on short-circuiting)",
+          heavy and all(fl.index(l) > gate_i and (len(l) - len(l.lstrip())) >= 8 for l in heavy) and "and not array.includes" not in fe,
+          "\n".join(fl))
+    check("AU5-03 the trade state is still computed on every bar: the three `auTid := \"T\" + str.tostring(time_close)` assignments stay outside "
+          "the notification guards (historical trades keep their ids for later realtime events); the cfg strings auCfg0..11 / auCfgRaw / "
+          "auCfg are `var` (built once per run; an input change re-runs the script from the first bar and rebuilds them)",
+          tid_ok and len(cfg_decl) == 14 and all(v == "var " for v, _ in cfg_decl), str((tid_lines, cfg_decl)))
+    sys.path.insert(0, os.path.join(ROOT, "automation", "xau_short", "receiver", "samples"))
+    import make_samples as mks
+    import hashlib
+    sha = hashlib.sha256(mks.predicted_cfg().encode()).hexdigest()
+    check("AU5-04 the default cfg (141 values, order / separators / number format unchanged; AC-02 evaluates the Pine expressions) has the "
+          "SHA-256 72fa9868a3e196ebcd02e37a12f82416d1149e5bd0567d8bf426e2c49f4695ee", sha == "72fa9868a3e196ebcd02e37a12f82416d1149e5bd0567d8bf426e2c49f4695ee", sha)
+
+    # dedup semantics model of the guarded emit (Pine: var rolled back per execution, varip kept, alerts never fire on history)
+    class Run:
+        def __init__(self, json_on=True):
+            self.sent_keys, self.alerts, self.ops, self.json_on = [], [], 0, json_on
+
+        def emit(self, ev, tid, bc, realtime):
+            live = self.json_on and realtime                                # auLive (call-site guard)
+            if not live:
+                return False
+            key = f"{ab.SID}|{ev}|{tid}|{bc}"                               # only built inside the guard
+            self.ops += 1
+            if key in self.sent_keys:
+                return False
+            self.sent_keys.append(key)
+            if len(self.sent_keys) > ab.KEEP:
+                self.sent_keys.pop(0)
+            self.alerts.append(key)
+            return True
+    r = Run()
+    for b in range(20000):                                                  # history: nothing at all
+        r.emit("BAR", f"B{b}", b, False)
+    hist = (r.ops, len(r.sent_keys), len(r.alerts))
+    same_bar = ["ENTRY", "BAR"]
+    for ev in same_bar:
+        r.emit(ev, "T1", 1, True)
+    for ev in ("TV_FILL", "TP_SET", "BE_MOVE", "BAR"):                       # several events on one confirmed bar
+        r.emit(ev, "T1" if ev != "BAR" else "B2", 2, True)
+    for ev in ("TV_FILL", "TP_SET", "BE_MOVE", "BAR"):                       # the same confirmed bar executed again
+        r.emit(ev, "T1" if ev != "BAR" else "B2", 2, True)
+    for _ in range(5):                                                      # forming ticks (rollback of var, varip kept)
+        r.emit("PROV", "P3", 3, True)
+    off = Run(json_on=False)
+    for ev in ("ENTRY", "BAR"):
+        off.emit(ev, "T9", 9, True)
+    check("AU5-05 model of the guarded emit: 20,000 historical bars -> no key / search / array / alert work; on realtime bars ENTRY + BAR, "
+          "then TV_FILL + TP_SET + BE_MOVE + BAR on one confirmed bar are all sent (different keys), the confirmed bar executed again sends "
+          "nothing twice, 5 forming-tick PROV evaluations send once (varip keys survive the rollback); JSON output OFF -> nothing",
+          hist == (0, 0, 0) and len(r.alerts) == 7 and r.alerts.count(f"{ab.SID}|PROV|P3|3") == 1 and off.alerts == [] and off.ops == 0,
+          str((hist, r.alerts)))
+
+
 def gate_mutation():
     muts = [A.replace("                    strategy.entry(oEid, pwSide == 1 ? strategy.long : strategy.short, qty = q)\n",
                       "                    strategy.entry(oEid, pwSide == 1 ? strategy.long : strategy.short, qty = q * 2)\n"),
-            A.replace('    string key  = AU_SID + "|" + ev + "|" + tid + "|" + str.tostring(time_close)\n',
-                      '    string key  = AU_SID + "|" + ev + "|" + str.tostring(bar_index)\n'),
+            A.replace('        string key = AU_SID + "|" + ev + "|" + tid + "|" + str.tostring(time_close)\n',
+                      '        string key = AU_SID + "|" + ev + "|" + str.tostring(bar_index)\n'),
+            A.replace("    if auJson and barstate.isrealtime\n", "    if auJson\n"),
+            A.replace("bool auLive = auJson and barstate.isrealtime\n", "bool auLive = auJson\n"),
+            A.replace("var string auCfg0 = ", "string auCfg0 = "),
             A.replace("varip array<string> auSent", "var array<string> auSent"),
             A.replace("        if not auJson     // AU:", "        if true     // AU:")]
-    check("AM-01 mutations (a trading line, a bar_index key, a var key list, human alerts always on) do not strip back to the normal Short",
+    check("AM-01 mutations (a trading line, a bar_index key, a var key list, human alerts always on, the realtime guard dropped from f_auEmit "
+          "or from auLive, the cfg not cached) do not strip back to the normal Short",
           all(x != A and ab.strip(x) != N for x in muts))
 
 
 def main():
-    for g in (gate_static, gate_json, gate_cfg, gate_mutation):
+    for g in (gate_static, gate_json, gate_cfg, gate_au5, gate_mutation):
         try:
             g()
         except Exception:

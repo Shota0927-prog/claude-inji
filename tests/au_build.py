@@ -23,6 +23,11 @@ mintick); every string value JSON-escaped (f_auEsc); cfg = every input that can 
 management / signal suppression / provisional output, generated from the source declarations (cfg_fields(); display-only
 inputs excluded with the reason in EXCLUDED), so the receiver's settings ID (SHA-256 of cfg) covers them.
 Idempotency key = SID|ev|tid|bar_close (deterministic from bar times, not a counter), varip-dedup in Pine.
+AU-5 (TradingView RE10110 load): the notification-only work (key, duplicate search, JSON, the sent-key array, the argument
+strings of the emit calls) runs only on realtime bars with the JSON output ON, inside explicit if blocks (`if auLive` at every
+call site, `if auJson and barstate.isrealtime` inside f_auEmit; no reliance on and / or short-circuiting); historical bars skip
+it entirely. The trade state (auTid) is still computed on every bar. The cfg strings are `var` (built once per run). The JSON
+content, keys, cfg and event meanings are unchanged.
 strip() reverses the edits exactly (-> the normal Short Strategy).
 """
 import json
@@ -51,6 +56,8 @@ HDR_NEW = (
     "//  WAIT_START / WAIT_END / BAR。TP_SET・BE_MOVE は通常版どおり確定5分足で出る (約定直後・ティック到達直後ではない)。TV_* と BE_MOVE の\n"
     "//  価格は TradingView 内の疑似建玉 (疑似約定価格) 基準で、MT5 の実建玉とは別。BAR は確定5分足ごとの OHLC と疑似建玉の状態。\n"
     "//  「自動化 JSON 出力」ON (初期) ではこのコピーの人間向け文章アラートは出さない。\n"
+    "//  AU-5 (負荷対策): 通知だけの処理 (キー・重複検索・JSON・送信済み配列・通知用の引数文字列) はリアルタイムの送信時だけ。過去足では\n"
+    "//  行わない (売買・取引 ID などの状態は従来どおり全足で計算)。cfg 文字列は var で 1 回だけ構築。通知の内容・キー・cfg は AU-2 と同じ。\n"
     + HDR_OLD)
 
 AU_INPUTS = (
@@ -102,9 +109,9 @@ def _cfg_pine(src):
         chunk = inc[i:i + 12]
         nm = f"auCfg{i // 12}"
         parts.append(nm)
-        lines.append(f"string {nm} = " + ' + "|" + '.join(_cfg_term(f) for f in chunk) + "\n")
-    lines.append(f'string auCfgRaw = "{CFG_VERSION}|" + ' + ' + "|" + '.join(parts) + "\n")
-    lines.append("string auCfg    = f_auEsc(auCfgRaw)     // JSON 用にエスケープ済み (受信側は SHA-256 を設定 ID にする)\n")
+        lines.append(f"var string {nm} = " + ' + "|" + '.join(_cfg_term(f) for f in chunk) + "\n")
+    lines.append(f'var string auCfgRaw = "{CFG_VERSION}|" + ' + ' + "|" + '.join(parts) + "\n")
+    lines.append("var string auCfg    = f_auEsc(auCfgRaw)     // JSON 用にエスケープ済み (受信側は SHA-256 を設定 ID にする)\n")
     return "".join(lines)
 
 
@@ -137,15 +144,22 @@ def _au_fns(src):
         '     ",\\"h\\":" + f_auNum(high) + ",\\"l\\":" + f_auNum(low) + ",\\"c\\":" + f_auNum(close) + ",\\"info\\":\\"" + f_auEsc(info) + "\\"}"\n'
         "\n"
         "// JSON イベントを 1 回だけ送る (自動化出力 ON のとき)。表示・売買・状態には触れない。戻り値 = 送信したか\n"
+        "//  AU-5: キー生成・重複検索・JSON 生成・配列更新は、明示的な if の内側 (リアルタイムかつ出力 ON) だけで行う (and の短絡評価に頼らない)。\n"
+        "//  過去足では何もしない (外部通知は過去足では発火しないため。売買・取引 ID の状態計算は呼び出し側で従来どおり行う)\n"
         "f_auEmit(string ev, string tid, int rank, int side, string ot, float px, float sl, float tp, string info) =>\n"
-        '    string key  = AU_SID + "|" + ev + "|" + tid + "|" + str.tostring(time_close)\n'
-        "    bool   send = auJson and not array.includes(auSent, key)\n"
-        "    if send\n"
-        "        array.push(auSent, key)\n"
-        f"        if array.size(auSent) > {KEEP}\n"
-        "            array.shift(auSent)\n"
-        "        alert(f_auJson(ev, tid, rank, side, ot, px, sl, tp, info, key), alert.freq_all)\n"
-        "    send\n")
+        "    bool sent = false\n"
+        "    if auJson and barstate.isrealtime\n"
+        '        string key = AU_SID + "|" + ev + "|" + tid + "|" + str.tostring(time_close)\n'
+        "        if not array.includes(auSent, key)\n"
+        "            array.push(auSent, key)\n"
+        f"            if array.size(auSent) > {KEEP}\n"
+        "                array.shift(auSent)\n"
+        "            alert(f_auJson(ev, tid, rank, side, ot, px, sl, tp, info, key), alert.freq_all)\n"
+        "            sent := true\n"
+        "    sent\n"
+        "\n"
+        "// AU-5: 通知だけに必要な処理 (呼び出し引数の文字列生成を含む) を行う足か。過去足・出力 OFF では false (毎足の真偽値 1 個だけ)\n"
+        "bool auLive = auJson and barstate.isrealtime\n")
 
 
 _EDITS = None
@@ -225,11 +239,30 @@ def edits():
          + I16 + 'f_auEmit("ENTRY", auTid, 10, side, stModeA ? "LIMIT" : "MARKET", stModeA ? oL : close, pSL, tpRef, "CURRENT")     // AU\n'),
         ("event", "    stTpUpPrev := tpUp\n    stTpDnPrev := tpDn\n",
          "    stTpUpPrev := tpUp\n    stTpDnPrev := tpDn\n"
-         "    if auBar     // AU-2: 確定5分足ごとの OHLC と、この足の処理後の疑似建玉 (状態 / 停止値 / TP)。売買は変えない\n"
+         "    if auBar and auLive     // AU-2: 確定5分足ごとの OHLC と、この足の処理後の疑似建玉 (状態 / 停止値 / TP)。売買は変えない (AU-5: リアルタイムだけ)\n"
          '        f_auEmit("BAR", "B" + str.tostring(time_close), 98, oState >= 1 ? oSide : 0, "", close, oState >= 1 ? oStop : na, oState == 2 ? oTP : na,\n'
          '             "tv_state=" + str.tostring(oState) + ";tv_tid=" + auTid + ";tv_be=" + (oBE ? "1" : "0") + ";tv_fill=" + f_auNum(oState >= 2 ? oFill : na))\n'),
     ]
+    _EDITS = [(k, a, _guard_calls(b) if k == "event" else b) for k, a, b in _EDITS]
     return _EDITS
+
+
+GUARD = "if auLive     // AU-5: 通知だけの処理 (引数の文字列生成を含む) はリアルタイムで送るときだけ\n"
+
+
+def _guard_calls(text):
+    """AU-5: put every single-line event emit of an inserted block under `if auLive` (the arguments are built only there);
+    the auTid assignments (trade state) stay outside, unchanged."""
+    out = []
+    for line in text.splitlines(keepends=True):
+        body = line.lstrip(" ")
+        if body.startswith("f_auEmit(") and line.rstrip("\n").endswith("// AU"):
+            ind = line[:len(line) - len(body)]
+            out.append(ind + GUARD)
+            out.append(ind + "    " + body)
+        else:
+            out.append(line)
+    return "".join(out)
 
 
 # every file AU-1 / AU-2 add (the older fixtures' "other files unchanged" checks accept exactly these through ok())
