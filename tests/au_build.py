@@ -1,7 +1,7 @@
 """AU-1 / AU-2 — automation output copy of the Gold Short Strategy (stage 2: notification receive / record only, no orders).
 
-automation/xau_short/pine/ZoneStrategyXAU_Auto.pine == ZoneStrategyXAU.pine (the XA-23 Gold Short Strategy, = the file of
-SRC_REV = xa_build.build_strategy()) + edits() (exact replacements, each old once). The normal Strategy, the Gold Long, the Engines
+automation/xau_short/pine/ZoneStrategyXAU_Auto.pine == ZoneStrategyXAU.pine (the XA-24 Gold Short Strategy = xa_build.build_strategy()
+= the XA-23 file of SRC_REV + the XA-24 run-time reduction (Engine /3, single FVG selection; same trading)) + edits() (exact replacements, each old once). The normal Strategy, the Gold Long, the Engines
 and the existing generators are not touched. The copy only ADDS machine-readable JSON alert() calls at the points where the
 Strategy already decides something (no trading / order / state line is changed):
   PROV        provisional (forming 5m bar; the XA-22 dedup, same spot as the human provisional alert)
@@ -28,6 +28,8 @@ strings of the emit calls) runs only on realtime bars with the JSON output ON, i
 call site, `if auJson and barstate.isrealtime` inside f_auEmit; no reliance on and / or short-circuiting); historical bars skip
 it entirely. The trade state (auTid) is still computed on every bar. The cfg strings are `var` (built once per run). The JSON
 content, keys, cfg and event meanings are unchanged.
+XA-24: the copy follows the normal Short Strategy (Engine import ZoneEnginePracticalXAUUSD/3, f_stZoneEval with one FVG
+selection; the AU edits, JSON, cfg, keys and the SID are unchanged: the trading and the notifications are the same).
 strip() reverses the edits exactly (-> the normal Short Strategy).
 """
 import json
@@ -50,7 +52,7 @@ EXCLUDED = {"stSatsShow": "SATS 線の表示 (plot) だけに使われる",
 
 HDR_OLD = "//  Zone Strategy XAU  —  ZONE-P (ZoneVisualPractical) の Zone 判定をそのまま使う XAUUSD 5分足 Strategy\n"
 HDR_NEW = (
-    "//  Zone Strategy XAU Auto (AU-2)  —  ゴールドショート (ZoneStrategyXAU.pine XA-23) の自動化用コピー (生成: tests/au_build.py)。\n"
+    "//  Zone Strategy XAU Auto (AU-2)  —  ゴールドショート (ZoneStrategyXAU.pine XA-24) の自動化用コピー (生成: tests/au_build.py)。\n"
     "//  売買判定・注文処理・状態は通常版と同一。追加は機械可読 JSON の alert() だけ (第2段階: 受信・記録のみ。実注文はしない)。\n"
     "//  イベント: PROV / ENTRY (確定した注文意図。約定通知ではない) / CANCEL / TV_FILL / TP_SET / BE_MOVE / CLOSE_REQ / TV_CLOSED / TV_FLAT /\n"
     "//  WAIT_START / WAIT_END / BAR。TP_SET・BE_MOVE は通常版どおり確定5分足で出る (約定直後・ティック到達直後ではない)。TV_* と BE_MOVE の\n"
@@ -77,7 +79,7 @@ def show(rev, path):
 
 
 def source():
-    """the normal Gold Short Strategy this copy is built from (XA-23, = the committed file of SRC_REV)."""
+    """the normal Gold Short Strategy this copy is built from (XA-24 = the committed XA-23 file of SRC_REV + xa_build.STRATEGY_EDITS24)."""
     return __import__("xa_build").build_strategy()
 
 
@@ -275,7 +277,9 @@ NEW_FILES = ("tests/au_build.py", "tests/au_sim.py", "tests/aur_sim.py", AUTO_PA
              # stage 3 (demo EA): bridge, EA, design note and their fixtures
              "automation/xau_short/STAGE3_ja.md", "automation/xau_short/bridge/.gitignore", "automation/xau_short/bridge/ea_bridge.py",
              "automation/xau_short/bridge/bridge_config.example.json", "automation/xau_short/bridge/make_test_entry.py",
-             "automation/xau_short/ea/XauShortDemoEA.mq5", "tests/ea_model.py", "tests/eab_sim.py", "tests/eam_sim.py")
+             "automation/xau_short/ea/XauShortDemoEA.mq5", "tests/ea_model.py", "tests/eab_sim.py", "tests/eam_sim.py",
+             # later layer XA-24 (Gold run-time reduction): its new port / fixture (the Pine files are accepted through xa_build.unapply24)
+             "tests/pf_model.py", "tests/pf_sim.py", "XAU_PERF_XA24_ja.md")
 
 
 def ok(path):

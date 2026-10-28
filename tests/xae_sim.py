@@ -696,12 +696,12 @@ def run(t, bars, mode=True, **kw):
 
 
 def gate_xa6():
-    E6, V6, S6 = rd(xb.ENG_PATH), xb.strip_visual7(rd(xb.VIS_PATH)) or "", xb.strip_strategy7(rd(xb.STR_PATH)) or ""   # XA-6 layer (later edits reverted exactly; pinned in xas_sim)
+    E6, V6, S6 = xb.unapply24(xb.ENG_PATH, rd(xb.ENG_PATH)), xb.strip_visual7(rd(xb.VIS_PATH)) or "", xb.strip_strategy7(rd(xb.STR_PATH)) or ""   # XA-6 layer (later edits reverted exactly; pinned in xas_sim)
     B = "cbb996d"
     E1, VB, SB = xb.show(B, xb.ENG_PATH), xb.show(B, xb.VIS_PATH), xb.show(B, xb.STR_PATH)
-    check("XR-01 XA-6: Engine == xa_build.build_engine() (version 1 + XA-6), Visual / Strategy == build_*(); strip_*6 give the "
+    check("XR-01 XA-6: Engine (XA-24 reverted exactly) == xa_build.build_engine2() (version 1 + XA-6), Visual / Strategy == build_*(); strip_*6 give the "
           "cbb996d files byte for byte (Engine version 1 unchanged and still published as /1)",
-          xb.build_engine() == E6 and xb.build_visual6() == V6 and xb.build_strategy6() == S6 and xb.strip_engine6(E6) == E1
+          xb.build_engine2() == E6 and xb.build_visual6() == V6 and xb.build_strategy6() == S6 and xb.strip_engine6(E6) == E1
           and xb.strip_visual6(V6) == VB and xb.strip_strategy6(S6) == SB and xb.build_engine1() == E1)
     old_block = E1[E1.index("    if evalBar\n        if evalState == ST_RESIST"):E1.index("    //  ★ Practical: natural role reversal 禁止。")]
     new_block = E6[E6.index("    else if evalBar\n        if evalState == ST_RESIST"):E6.index("    //  ★ Practical: natural role reversal 禁止。")]

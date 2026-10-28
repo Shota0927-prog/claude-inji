@@ -26,7 +26,8 @@ LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src
              "tests/xac_sim.py",                                                             # new in the later layer XA-23 (Gold confirmed labels)
              "tests/btl_build.py", "tests/btl_sim.py",                                       # new in the later layer BTL-1 (BTCUSD Long defaults)
              "tests/au_build.py", "tests/au_sim.py", "tests/aur_sim.py",                     # new in the later layer AU-1 (Gold Short automation)
-             "tests/ea_model.py", "tests/eab_sim.py", "tests/eam_sim.py")                    # new in the later layer ST3-1 (Gold Short demo EA)
+             "tests/ea_model.py", "tests/eab_sim.py", "tests/eam_sim.py",                    # new in the later layer ST3-1 (Gold Short demo EA)
+             "tests/pf_model.py", "tests/pf_sim.py", "XAU_PERF_XA24_ja.md")                  # new in the later layer XA-24 (Gold run-time reduction)
 NEW_FILES = ("tests/cad_build.py", "tests/cad_adapt.py", "tests/cad_sim.py") + LATER_NEW
 _rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 
@@ -2870,6 +2871,608 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                         ']\n'
                         '\n'
                         '\n'
+                        '# ---- XA-24: run-time reduction (Engine version 3 + Strategy, same results; applied after '
+                        'XA-23 / XA-6) ----------------------\n'
+                        '#  TradingView RE10110 (ZONE-ST, 40 s) / RE10022 (ZONE-ST-L, loop > 500 ms in '
+                        'f_finalizeCluster) on the Gold Strategies.\n'
+                        '#  Engine (ZoneEnginePracticalXAUUSD library version 3 = version 2 + ENGINE_EDITS7; /2 '
+                        'stays published):\n'
+                        '#  - Raw Zone source codes (kCat / kId / eqH1..3 / eqA1..3 set by f_kind when a Raw Zone is '
+                        'made or a dynamic slot filled;\n'
+                        '#    recomputed for every Raw Zone on a bar whose configured timeframes differ from those '
+                        'the codes were made with);\n'
+                        '#    f_finalizeCluster branches on the codes (no string compares), sums the Source / HTF '
+                        'mask bits once after the loop (each bit\n'
+                        "#    at most once = the f_setBit result) and gets the cluster's Day High / Low price from "
+                        'f_buildClusters (no pre-scan);\n'
+                        '#  - Track matching: the Track centers are sorted once per bar before the Zone loop; each '
+                        'Zone binary-searches the run with\n'
+                        '#    |center difference| <= clusterDist (fl(a - b) is monotone in a) and keeps the smallest '
+                        '(distance, Track index) among the\n'
+                        '#    unmatched continuous Tracks = the old index-order scan (strict d < bestD keeps the '
+                        'lowest index of a tie);\n'
+                        '#  - Track memberUids copied only when the contents differ.\n'
+                        '#  Strategy (both Gold Strategies): import /2 -> /3; f_stZoneEval selects the FVG once '
+                        '(f_zpoBestFvg) and computes dScore /\n'
+                        '#  dStr with the f_fvcZoneDisplay expression (same candidates and comparisons -> the same '
+                        'FVG); f_fvcZoneDisplay /\n'
+                        '#  f_zpoBestFvg themselves stay byte copies of ZONE-P. Trading, inputs, alerts, labels '
+                        'unchanged.\n'
+                        '#  strip_engine7 / strip_strategy24 reverse only these. Equality of results: '
+                        'tests/pf_model.py (version 2 / 3 ports) + pf_sim.\n'
+                        'IMPORT_XAE3 = "import sekine3310/ZoneEnginePracticalXAUUSD/3 as zn\\n"\n'
+                        '# Library version 3 of ZoneEnginePracticalXAUUSD (/1 and /2 stay published). If TradingView '
+                        'assigns another number, change\n'
+                        '# IMPORT_XAE3 and rebuild (python3 tests/xa_build.py; python3 tests/xal_build.py; python3 '
+                        'tests/au_build.py).\n'
+                        "ENGINE_EDITS7 = [('header',\n"
+                        "  '//    Retest → Flip Confirm の反転確認 (flipped / Flip イベント / Flip Bonus) は別に継続する。\\n',\n"
+                        "  '//    Retest → Flip Confirm の反転確認 (flipped / Flip イベント / Flip Bonus) は別に継続する。\\n'\n"
+                        "  '//  ★ XA-24 (Library version 3): 処理量の削減だけ。同じ入力に対して version 2 と同じ Zone / Track / Score / "
+                        "State / イベントを返す\\n'\n"
+                        "  '//    (Source の処理順・同点の優先・浮動小数の加算順・Zone 上下限・Track ID・状態遷移は変えない。毎バーの更新も省略しない)。\\n'\n"
+                        "  '//    ・Raw Zone に srcCat / srcId / srcTf (設定の 6 時間足との一致) を番号で持たせ "
+                        "(f_kind)、f_finalizeCluster は文字列を比べない。\\n'\n"
+                        "  '//      Source / HTF mask は bit ごとの有無を持ってループ後に 1 回足す (f_setBit の結果と同じ値)。Day High / Low "
+                        "の価格は\\n'\n"
+                        "  '//      f_buildClusters が member を加えるときに拾う (Cluster ごとの事前走査なし)。\\n'\n"
+                        "  '//    ・Track 照合: 照合前に Track center の昇順 index を 1 回作り、各 Zone は |center 差| <= clusterDist "
+                        "の範囲だけを二分探索で見る\\n'\n"
+                        "  '//      (選ばれる Track は version 2 の全件走査と同じ = 未照合・継続性あり・距離最小、同距離は index の小さい方)。\\n'\n"
+                        "  '//    ・Track の memberUids は内容が変わったときだけ写す (Track は自分の array を持ち、Zone と共有しない)。\\n'),\n"
+                        " ('rawzone',\n"
+                        "  '    float  px1            = na      // GBE-4: この Raw Zone に統合された最新のイベントの価格 (Swing: 最新の "
+                        "pivot 価格)\\n',\n"
+                        "  '    float  px1            = na      // GBE-4: この Raw Zone に統合された最新のイベントの価格 (Swing: 最新の "
+                        "pivot 価格)\\n'\n"
+                        "  '    // XA-24: Source の番号 (f_kind が設定する。srcCat / srcId / srcTf は作成後に変わらない)\\n'\n"
+                        "  '    int    kCat           = 0       // srcCat: 1 MA / 2 Horizontal / 3 DayHL / 4 Accum / "
+                        "0 その他\\n'\n"
+                        "  '    int    kId            = 0       // srcId : 1 SWING_H / 2 SWING_L / 3 ACC_HI / 4 MA1 "
+                        "/ 5 MA2 / 6 DAY_HIGH / 7 DAY_LOW / 0 '\n"
+                        "  'その他\\n'\n"
+                        "  '    bool   eqH1           = false   // srcTf == hzTf1 (eqH2 / eqH3 = hzTf2 / "
+                        "hzTf3、eqA1..3 = accTf1..3)\\n'\n"
+                        "  '    bool   eqH2           = false\\n'\n"
+                        "  '    bool   eqH3           = false\\n'\n"
+                        "  '    bool   eqA1           = false\\n'\n"
+                        "  '    bool   eqA2           = false\\n'\n"
+                        "  '    bool   eqA3           = false\\n'),\n"
+                        " ('engine',\n"
+                        "  '    array<int>     sIds         // Accum 世代管理用\\n',\n"
+                        "  '    array<int>     sIds         // Accum 世代管理用\\n'\n"
+                        "  '    array<float>   sTrkC        // XA-24: Track 照合用の center (このバーの照合前の値)\\n'\n"
+                        "  '    // XA-24: Source 番号を作ったときの時間足設定 (違うバーでは update() の最初に全 Raw Zone の番号を作り直す)\\n'\n"
+                        "  '    bool   kInit = false\\n'\n"
+                        '  \'    string kHz1  = ""\\n\'\n'
+                        '  \'    string kHz2  = ""\\n\'\n'
+                        '  \'    string kHz3  = ""\\n\'\n'
+                        '  \'    string kAcc1 = ""\\n\'\n'
+                        '  \'    string kAcc2 = ""\\n\'\n'
+                        '  \'    string kAcc3 = ""\\n\'),\n'
+                        " ('factory',\n"
+                        "  '         sCur = array.new<RawZone>(), sIds = array.new_int())\\n',\n"
+                        "  '         sCur = array.new<RawZone>(), sIds = array.new_int(), sTrkC = "
+                        "array.new_float())\\n'),\n"
+                        " ('kind',\n"
+                        "  'f_makeRaw(ZoneCfg c, int uid, string id, string cat, string tf, float ctr, float bs, "
+                        "bool dyn) =>\\n'\n"
+                        "  '    RawZone.new(uid = uid, srcId = id, srcCat = cat, srcTf = tf,\\n'\n"
+                        "  '         center = ctr, top = ctr + c.zoneHalfWidth, bottom = ctr - c.zoneHalfWidth,\\n'\n"
+                        "  '         baseScore = bs, createdBar = bar_index, createdTime = time, dynamic = "
+                        "dyn)\\n',\n"
+                        "  '// XA-24: srcCat / srcId / srcTf と設定の時間足の比較結果を番号で持つ (f_finalizeCluster "
+                        "の文字列比較の代わり。判定は同じ)\\n'\n"
+                        "  'f_kind(RawZone z, ZoneCfg c) =>\\n'\n"
+                        "  '    z.kCat := z.srcCat == CAT_MA ? 1 : z.srcCat == CAT_HZ ? 2 : z.srcCat == CAT_DHL ? 3 "
+                        ": z.srcCat == CAT_ACC ? 4 : 0\\n'\n"
+                        '  \'    z.kId  := z.srcId == "SWING_H" ? 1 : z.srcId == "SWING_L" ? 2 : z.srcId == "ACC_HI" '
+                        '? 3 : z.srcId == "MA1" ? 4 : z.srcId \'\n'
+                        '  \'== "MA2" ? 5 : z.srcId == "DAY_HIGH" ? 6 : z.srcId == "DAY_LOW" ? 7 : 0\\n\'\n'
+                        "  '    z.eqH1 := z.srcTf == c.hzTf1\\n'\n"
+                        "  '    z.eqH2 := z.srcTf == c.hzTf2\\n'\n"
+                        "  '    z.eqH3 := z.srcTf == c.hzTf3\\n'\n"
+                        "  '    z.eqA1 := z.srcTf == c.accTf1\\n'\n"
+                        "  '    z.eqA2 := z.srcTf == c.accTf2\\n'\n"
+                        "  '    z.eqA3 := z.srcTf == c.accTf3\\n'\n"
+                        "  '    true\\n'\n"
+                        "  '\\n'\n"
+                        "  'f_makeRaw(ZoneCfg c, int uid, string id, string cat, string tf, float ctr, float bs, "
+                        "bool dyn) =>\\n'\n"
+                        "  '    RawZone rz = RawZone.new(uid = uid, srcId = id, srcCat = cat, srcTf = tf,\\n'\n"
+                        "  '         center = ctr, top = ctr + c.zoneHalfWidth, bottom = ctr - c.zoneHalfWidth,\\n'\n"
+                        "  '         baseScore = bs, createdBar = bar_index, createdTime = time, dynamic = dyn)\\n'\n"
+                        "  '    f_kind(rz, c)\\n'\n"
+                        "  '    rz\\n'),\n"
+                        " ('finalize',\n"
+                        "  '//  zBot / zTop : f_buildClusters の running aggregate (min member.bottom / max "
+                        "member.top)\\n'\n"
+                        "  'f_finalizeCluster(array<RawZone> members, ZoneCfg c, float zBot, float zTop) =>\\n',\n"
+                        "  '//  zBot / zTop : f_buildClusters の running aggregate (min member.bottom / max "
+                        "member.top)\\n'\n"
+                        "  '//  dH0 / dL0   : XA-24 この Cluster の DAY_HIGH / DAY_LOW member の px0 (f_buildClusters が "
+                        "member を加えるときに拾う。無ければ na)\\n'\n"
+                        "  'f_finalizeCluster(array<RawZone> members, ZoneCfg c, float zBot, float zTop, float dH0, "
+                        "float dL0) =>\\n'),\n"
+                        " ('finalize',\n"
+                        "  '    float dHpx   = na\\n    float dLpx   = na\\n',\n"
+                        "  '    float dHpx   = dsOn ? dH0 : na     // XA-24: version 2 の事前走査 (Merge Nearby のときだけ "
+                        "DAY_HIGH / DAY_LOW の px0) と同じ値\\n'\n"
+                        "  '    float dLpx   = dsOn ? dL0 : na\\n'),\n"
+                        " ('finalize',\n"
+                        "  '    int  srcM   = 0\\n    int  htfM   = 0\\n',\n"
+                        "  '    // XA-24: Source / HTF mask の bit ごとの有無 (ループ後に 1 回だけ足す = 各 member で f_setBit "
+                        "した結果と同じ値)\\n'\n"
+                        "  '    bool bSw1 = false\\n'\n"
+                        "  '    bool bSw2 = false\\n'\n"
+                        "  '    bool bSw3 = false\\n'\n"
+                        "  '    bool bHzx = false\\n'\n"
+                        "  '    bool bAc1 = false\\n'\n"
+                        "  '    bool bAc2 = false\\n'\n"
+                        "  '    bool bAc3 = false\\n'\n"
+                        "  '    bool bMa1 = false\\n'\n"
+                        "  '    bool bMa2 = false\\n'\n"
+                        "  '    bool bDhl = false\\n'\n"
+                        "  '    bool hSw1 = false\\n'\n"
+                        "  '    bool hS15 = false\\n'\n"
+                        "  '    bool hAc1 = false\\n'\n"
+                        "  '    bool hAc2 = false\\n'\n"
+                        "  '    bool hAc3 = false\\n'\n"
+                        "  '    bool hMa1 = false\\n'\n"
+                        "  '    bool hMa2 = false\\n'\n"
+                        "  '    bool hDay = false\\n'),\n"
+                        " ('finalize',\n"
+                        "  '    int n = array.size(members)\\n'\n"
+                        "  '    // GBE-4: Merge Nearby のときだけ、この Cluster の Day High / Low の実際の価格を先に読む (Cluster "
+                        "のメンバーだけ)\\n'\n"
+                        "  '    if dsOn\\n'\n"
+                        "  '        for j = 0 to n - 1\\n'\n"
+                        "  '            RawZone q = array.get(members, j)\\n'\n"
+                        '  \'            if q.srcId == "DAY_HIGH"\\n\'\n'
+                        "  '                dHpx := q.px0\\n'\n"
+                        '  \'            else if q.srcId == "DAY_LOW"\\n\'\n'
+                        "  '                dLpx := q.px0\\n'\n"
+                        "  '    for j = 0 to n - 1\\n'\n"
+                        "  '        RawZone m = array.get(members, j)\\n'\n"
+                        "  '\\n'\n"
+                        '  \'        bool isSwing = m.srcCat == CAT_HZ and (m.srcId == "SWING_H" or m.srcId == '
+                        '"SWING_L")\\n\'\n'
+                        '  \'        bool isAccHi = m.srcId == "ACC_HI"\\n\'\n'
+                        "  '        if isSwing\\n'\n"
+                        "  '            // GBE-4: Day High と Swing High / Day Low と Swing Low だけを比べる。pivot 価格 (最初 / "
+                        "最新) のどちらかが距離以内\\n'\n"
+                        '  \'            bool mH = dsOn and m.srcId == "SWING_H" and not na(dHpx) and '
+                        "(math.round(math.abs(dHpx - m.px0) / '\n"
+                        "  'syminfo.mintick) <= dsTk or math.round(math.abs(dHpx - m.px1) / syminfo.mintick) <= "
+                        "dsTk)\\n'\n"
+                        '  \'            bool mL = dsOn and m.srcId == "SWING_L" and not na(dLpx) and '
+                        "(math.round(math.abs(dLpx - m.px0) / '\n"
+                        "  'syminfo.mintick) <= dsTk or math.round(math.abs(dLpx - m.px1) / syminfo.mintick) <= "
+                        "dsTk)\\n'\n"
+                        "  '            int  sl = m.srcTf == c.hzTf1 ? 1 : m.srcTf == c.hzTf2 ? 2 : m.srcTf == "
+                        "c.hzTf3 ? 3 : 0\\n'\n"
+                        "  '            dHm := dHm or mH\\n'\n"
+                        "  '            dLm := dLm or mL\\n'\n"
+                        "  '            if not mH and not mL\\n'\n"
+                        "  '                hzInd  := true\\n'\n"
+                        "  '                swInd1 := swInd1 or sl == 1\\n'\n"
+                        "  '                swInd2 := swInd2 or sl == 2\\n'\n"
+                        "  '                swInd3 := swInd3 or sl == 3\\n'\n"
+                        "  '            if m.srcTf == c.hzTf1\\n'\n"
+                        "  '                srcM := f_setBit(srcM, SRC_SW1)\\n'\n"
+                        "  '                if not swHit1\\n'\n"
+                        "  '                    swHit1  := true\\n'\n"
+                        "  '                    [_sa1, _sm1] = f_swingMaxStep(swMax, c.scoreHz1)\\n'\n"
+                        "  '                    baseSum += _sa1\\n'\n"
+                        "  '                    swMax   := _sm1\\n'\n"
+                        "  '            else if m.srcTf == c.hzTf2\\n'\n"
+                        "  '                srcM := f_setBit(srcM, SRC_SW2)\\n'\n"
+                        "  '                if not swHit2\\n'\n"
+                        "  '                    swHit2  := true\\n'\n"
+                        "  '                    [_sa2, _sm2] = f_swingMaxStep(swMax, c.scoreHz2)\\n'\n"
+                        "  '                    baseSum += _sa2\\n'\n"
+                        "  '                    swMax   := _sm2\\n'\n"
+                        "  '            else if m.srcTf == c.hzTf3\\n'\n"
+                        "  '                srcM := f_setBit(srcM, SRC_SW3)\\n'\n"
+                        "  '                if not swHit3\\n'\n"
+                        "  '                    swHit3  := true\\n'\n"
+                        "  '                    [_sa3, _sm3] = f_swingMaxStep(swMax, c.scoreHz3)\\n'\n"
+                        "  '                    baseSum += _sa3\\n'\n"
+                        "  '                    swMax   := _sm3\\n'\n"
+                        "  '            else\\n'\n"
+                        "  '                srcM := f_setBit(srcM, SRC_HZX)\\n'\n"
+                        "  '                baseSum += m.baseScore\\n'\n"
+                        "  '        else if m.srcCat == CAT_ACC\\n'\n"
+                        "  '            // GBE-1: 時間足ごとの寄与 (上限 / 下限はそれぞれ Cluster 内 1 回のまま) を accA1 / accA2 / accA3 "
+                        "に集計。\\n'\n"
+                        "  '            //   Sum (既定) は /6 と同じ加算を同じ順序で baseSum へ行う (Max のときだけ 0 を足す = baseSum "
+                        "不変)。\\n'\n"
+                        "  '            if m.srcTf == c.accTf1\\n'\n"
+                        "  '                srcM := f_setBit(srcM, SRC_ACC1)\\n'\n"
+                        "  '                if isAccHi and not accHi1\\n'\n"
+                        "  '                    float eH1 = c.accEdgeOnce and accLo1 ? 0.0 : m.baseScore\\n'\n"
+                        "  '                    accHi1  := true\\n'\n"
+                        "  '                    accA1   += eH1\\n'\n"
+                        "  '                    baseSum += c.accScoreMax ? 0.0 : eH1\\n'\n"
+                        "  '                else if not isAccHi and not accLo1\\n'\n"
+                        "  '                    float eL1 = c.accEdgeOnce and accHi1 ? 0.0 : m.baseScore\\n'\n"
+                        "  '                    accLo1  := true\\n'\n"
+                        "  '                    accA1   += eL1\\n'\n"
+                        "  '                    baseSum += c.accScoreMax ? 0.0 : eL1\\n'\n"
+                        "  '            else if m.srcTf == c.accTf2\\n'\n"
+                        "  '                srcM := f_setBit(srcM, SRC_ACC2)\\n'\n"
+                        "  '                if isAccHi and not accHi2\\n'\n"
+                        "  '                    float eH2 = c.accEdgeOnce and accLo2 ? 0.0 : m.baseScore\\n'\n"
+                        "  '                    accHi2  := true\\n'\n"
+                        "  '                    accA2   += eH2\\n'\n"
+                        "  '                    baseSum += c.accScoreMax ? 0.0 : eH2\\n'\n"
+                        "  '                else if not isAccHi and not accLo2\\n'\n"
+                        "  '                    float eL2 = c.accEdgeOnce and accHi2 ? 0.0 : m.baseScore\\n'\n"
+                        "  '                    accLo2  := true\\n'\n"
+                        "  '                    accA2   += eL2\\n'\n"
+                        "  '                    baseSum += c.accScoreMax ? 0.0 : eL2\\n'\n"
+                        "  '            else if m.srcTf == c.accTf3\\n'\n"
+                        "  '                srcM := f_setBit(srcM, SRC_ACC3)\\n'\n"
+                        "  '                if isAccHi and not accHi3\\n'\n"
+                        "  '                    float eH3 = c.accEdgeOnce and accLo3 ? 0.0 : m.baseScore\\n'\n"
+                        "  '                    accHi3  := true\\n'\n"
+                        "  '                    accA3   += eH3\\n'\n"
+                        "  '                    baseSum += c.accScoreMax ? 0.0 : eH3\\n'\n"
+                        "  '                else if not isAccHi and not accLo3\\n'\n"
+                        "  '                    float eL3 = c.accEdgeOnce and accHi3 ? 0.0 : m.baseScore\\n'\n"
+                        "  '                    accLo3  := true\\n'\n"
+                        "  '                    accA3   += eL3\\n'\n"
+                        "  '                    baseSum += c.accScoreMax ? 0.0 : eL3\\n'\n"
+                        "  '            else\\n'\n"
+                        "  '                baseSum += m.baseScore\\n'\n"
+                        "  '        else\\n'\n"
+                        "  '            baseSum += m.baseScore\\n'\n"
+                        "  '            if m.srcCat == CAT_HZ\\n'\n"
+                        "  '                srcM := f_setBit(srcM, SRC_HZX)\\n'\n"
+                        "  '                hzInd := true\\n'\n"
+                        '  \'            else if m.srcId == "MA1"\\n\'\n'
+                        "  '                srcM := f_setBit(srcM, SRC_MA1)\\n'\n"
+                        '  \'            else if m.srcId == "MA2"\\n\'\n'
+                        "  '                srcM := f_setBit(srcM, SRC_MA2)\\n'\n"
+                        "  '            else if m.srcCat == CAT_DHL\\n'\n"
+                        "  '                srcM := f_setBit(srcM, SRC_DHL)\\n'\n"
+                        '  \'                hasDH := hasDH or m.srcId == "DAY_HIGH"\\n\'\n'
+                        '  \'                hasDL := hasDL or m.srcId == "DAY_LOW"\\n\'\n'
+                        "  '\\n'\n"
+                        "  '        slopeB   := c.slopeBonusMax ? math.max(slopeB, m.slopeBonus) : slopeB + "
+                        "m.slopeBonus\\n'\n"
+                        "  '        maB      := math.max(maB, m.maClusterBonus)\\n'\n"
+                        "  '\\n'\n"
+                        "  '        // HTF判定 (条件式は旧版と同一。旧 htfSources 文字列の代わりに bit を立てる)\\n'\n"
+                        "  '        if isSwing and m.srcTf == c.hzTf3 and c.htfSwing1H\\n'\n"
+                        "  '            htfM := f_setBit(htfM, HTF_SW1H)\\n'\n"
+                        "  '        if isSwing and m.srcTf == c.hzTf2 and c.htfSwing15M\\n'\n"
+                        "  '            htfM := f_setBit(htfM, HTF_SW15)\\n'\n"
+                        "  '        if m.srcCat == CAT_ACC and m.srcTf == c.accTf1 and c.htfAccum1H\\n'\n"
+                        "  '            htfM := f_setBit(htfM, HTF_ACC1)\\n'\n"
+                        "  '        if m.srcCat == CAT_ACC and m.srcTf == c.accTf2 and c.htfAccum4H\\n'\n"
+                        "  '            htfM := f_setBit(htfM, HTF_ACC2)\\n'\n"
+                        "  '        if m.srcCat == CAT_ACC and m.srcTf == c.accTf3 and c.htfAccumD\\n'\n"
+                        "  '            htfM := f_setBit(htfM, HTF_ACC3)\\n'\n"
+                        '  \'        if m.srcId == "MA1" and c.htfMa1\\n\'\n'
+                        "  '            htfM := f_setBit(htfM, HTF_MA1)\\n'\n"
+                        '  \'        if m.srcId == "MA2" and c.htfMa2\\n\'\n'
+                        "  '            htfM := f_setBit(htfM, HTF_MA2)\\n'\n"
+                        "  '        if m.srcCat == CAT_DHL and c.htfDayHL\\n'\n"
+                        "  '            htfM := f_setBit(htfM, HTF_DAY)\\n'\n"
+                        "  '\\n'\n"
+                        "  '        array.push(uids, m.uid)\\n'\n"
+                        "  '        hasMA   := hasMA  or m.srcCat == CAT_MA\\n'\n"
+                        "  '        hasHZ   := hasHZ  or m.srcCat == CAT_HZ\\n'\n"
+                        "  '        hasDHL  := hasDHL or m.srcCat == CAT_DHL\\n'\n"
+                        "  '        hasACC  := hasACC or m.srcCat == CAT_ACC\\n',\n"
+                        "  '    int n = array.size(members)\\n'\n"
+                        "  '    // XA-24: Day High / Low の価格は dH0 / dL0 (f_buildClusters が拾う)。番号 (kCat / kId / eqH* "
+                        "/ eqA*) で version 2 と同じ分岐をする\\n'\n"
+                        "  '    for j = 0 to n - 1\\n'\n"
+                        "  '        RawZone m = array.get(members, j)\\n'\n"
+                        "  '        int  kc = m.kCat\\n'\n"
+                        "  '        int  ki = m.kId\\n'\n"
+                        "  '\\n'\n"
+                        "  '        bool isSwing = kc == 2 and (ki == 1 or ki == 2)\\n'\n"
+                        "  '        bool isAccHi = ki == 3\\n'\n"
+                        "  '        if isSwing\\n'\n"
+                        "  '            // GBE-4: Day High と Swing High / Day Low と Swing Low だけを比べる。pivot 価格 (最初 / "
+                        "最新) のどちらかが距離以内\\n'\n"
+                        "  '            bool mH = dsOn and ki == 1 and not na(dHpx) and (math.round(math.abs(dHpx - "
+                        "m.px0) / syminfo.mintick) <= dsTk or '\n"
+                        "  'math.round(math.abs(dHpx - m.px1) / syminfo.mintick) <= dsTk)\\n'\n"
+                        "  '            bool mL = dsOn and ki == 2 and not na(dLpx) and (math.round(math.abs(dLpx - "
+                        "m.px0) / syminfo.mintick) <= dsTk or '\n"
+                        "  'math.round(math.abs(dLpx - m.px1) / syminfo.mintick) <= dsTk)\\n'\n"
+                        "  '            int  sl = m.eqH1 ? 1 : m.eqH2 ? 2 : m.eqH3 ? 3 : 0\\n'\n"
+                        "  '            dHm := dHm or mH\\n'\n"
+                        "  '            dLm := dLm or mL\\n'\n"
+                        "  '            if not mH and not mL\\n'\n"
+                        "  '                hzInd  := true\\n'\n"
+                        "  '                swInd1 := swInd1 or sl == 1\\n'\n"
+                        "  '                swInd2 := swInd2 or sl == 2\\n'\n"
+                        "  '                swInd3 := swInd3 or sl == 3\\n'\n"
+                        "  '            if m.eqH1\\n'\n"
+                        "  '                bSw1 := true\\n'\n"
+                        "  '                if not swHit1\\n'\n"
+                        "  '                    swHit1  := true\\n'\n"
+                        "  '                    [_sa1, _sm1] = f_swingMaxStep(swMax, c.scoreHz1)\\n'\n"
+                        "  '                    baseSum += _sa1\\n'\n"
+                        "  '                    swMax   := _sm1\\n'\n"
+                        "  '            else if m.eqH2\\n'\n"
+                        "  '                bSw2 := true\\n'\n"
+                        "  '                if not swHit2\\n'\n"
+                        "  '                    swHit2  := true\\n'\n"
+                        "  '                    [_sa2, _sm2] = f_swingMaxStep(swMax, c.scoreHz2)\\n'\n"
+                        "  '                    baseSum += _sa2\\n'\n"
+                        "  '                    swMax   := _sm2\\n'\n"
+                        "  '            else if m.eqH3\\n'\n"
+                        "  '                bSw3 := true\\n'\n"
+                        "  '                if not swHit3\\n'\n"
+                        "  '                    swHit3  := true\\n'\n"
+                        "  '                    [_sa3, _sm3] = f_swingMaxStep(swMax, c.scoreHz3)\\n'\n"
+                        "  '                    baseSum += _sa3\\n'\n"
+                        "  '                    swMax   := _sm3\\n'\n"
+                        "  '            else\\n'\n"
+                        "  '                bHzx := true\\n'\n"
+                        "  '                baseSum += m.baseScore\\n'\n"
+                        "  '        else if kc == 4\\n'\n"
+                        "  '            // GBE-1: 時間足ごとの寄与 (上限 / 下限はそれぞれ Cluster 内 1 回のまま) を accA1 / accA2 / accA3 "
+                        "に集計。\\n'\n"
+                        "  '            //   Sum (既定) は /6 と同じ加算を同じ順序で baseSum へ行う (Max のときだけ 0 を足す = baseSum "
+                        "不変)。\\n'\n"
+                        "  '            if m.eqA1\\n'\n"
+                        "  '                bAc1 := true\\n'\n"
+                        "  '                if isAccHi and not accHi1\\n'\n"
+                        "  '                    float eH1 = c.accEdgeOnce and accLo1 ? 0.0 : m.baseScore\\n'\n"
+                        "  '                    accHi1  := true\\n'\n"
+                        "  '                    accA1   += eH1\\n'\n"
+                        "  '                    baseSum += c.accScoreMax ? 0.0 : eH1\\n'\n"
+                        "  '                else if not isAccHi and not accLo1\\n'\n"
+                        "  '                    float eL1 = c.accEdgeOnce and accHi1 ? 0.0 : m.baseScore\\n'\n"
+                        "  '                    accLo1  := true\\n'\n"
+                        "  '                    accA1   += eL1\\n'\n"
+                        "  '                    baseSum += c.accScoreMax ? 0.0 : eL1\\n'\n"
+                        "  '            else if m.eqA2\\n'\n"
+                        "  '                bAc2 := true\\n'\n"
+                        "  '                if isAccHi and not accHi2\\n'\n"
+                        "  '                    float eH2 = c.accEdgeOnce and accLo2 ? 0.0 : m.baseScore\\n'\n"
+                        "  '                    accHi2  := true\\n'\n"
+                        "  '                    accA2   += eH2\\n'\n"
+                        "  '                    baseSum += c.accScoreMax ? 0.0 : eH2\\n'\n"
+                        "  '                else if not isAccHi and not accLo2\\n'\n"
+                        "  '                    float eL2 = c.accEdgeOnce and accHi2 ? 0.0 : m.baseScore\\n'\n"
+                        "  '                    accLo2  := true\\n'\n"
+                        "  '                    accA2   += eL2\\n'\n"
+                        "  '                    baseSum += c.accScoreMax ? 0.0 : eL2\\n'\n"
+                        "  '            else if m.eqA3\\n'\n"
+                        "  '                bAc3 := true\\n'\n"
+                        "  '                if isAccHi and not accHi3\\n'\n"
+                        "  '                    float eH3 = c.accEdgeOnce and accLo3 ? 0.0 : m.baseScore\\n'\n"
+                        "  '                    accHi3  := true\\n'\n"
+                        "  '                    accA3   += eH3\\n'\n"
+                        "  '                    baseSum += c.accScoreMax ? 0.0 : eH3\\n'\n"
+                        "  '                else if not isAccHi and not accLo3\\n'\n"
+                        "  '                    float eL3 = c.accEdgeOnce and accHi3 ? 0.0 : m.baseScore\\n'\n"
+                        "  '                    accLo3  := true\\n'\n"
+                        "  '                    accA3   += eL3\\n'\n"
+                        "  '                    baseSum += c.accScoreMax ? 0.0 : eL3\\n'\n"
+                        "  '            else\\n'\n"
+                        "  '                baseSum += m.baseScore\\n'\n"
+                        "  '        else\\n'\n"
+                        "  '            baseSum += m.baseScore\\n'\n"
+                        "  '            if kc == 2\\n'\n"
+                        "  '                bHzx  := true\\n'\n"
+                        "  '                hzInd := true\\n'\n"
+                        "  '            else if ki == 4\\n'\n"
+                        "  '                bMa1 := true\\n'\n"
+                        "  '            else if ki == 5\\n'\n"
+                        "  '                bMa2 := true\\n'\n"
+                        "  '            else if kc == 3\\n'\n"
+                        "  '                bDhl  := true\\n'\n"
+                        "  '                hasDH := hasDH or ki == 6\\n'\n"
+                        "  '                hasDL := hasDL or ki == 7\\n'\n"
+                        "  '\\n'\n"
+                        "  '        slopeB   := c.slopeBonusMax ? math.max(slopeB, m.slopeBonus) : slopeB + "
+                        "m.slopeBonus\\n'\n"
+                        "  '        maB      := math.max(maB, m.maClusterBonus)\\n'\n"
+                        "  '\\n'\n"
+                        "  '        // HTF判定 (条件式は version 2 と同一。文字列比較の代わりに番号)\\n'\n"
+                        "  '        hSw1 := hSw1 or (isSwing and m.eqH3 and c.htfSwing1H)\\n'\n"
+                        "  '        hS15 := hS15 or (isSwing and m.eqH2 and c.htfSwing15M)\\n'\n"
+                        "  '        hAc1 := hAc1 or (kc == 4 and m.eqA1 and c.htfAccum1H)\\n'\n"
+                        "  '        hAc2 := hAc2 or (kc == 4 and m.eqA2 and c.htfAccum4H)\\n'\n"
+                        "  '        hAc3 := hAc3 or (kc == 4 and m.eqA3 and c.htfAccumD)\\n'\n"
+                        "  '        hMa1 := hMa1 or (ki == 4 and c.htfMa1)\\n'\n"
+                        "  '        hMa2 := hMa2 or (ki == 5 and c.htfMa2)\\n'\n"
+                        "  '        hDay := hDay or (kc == 3 and c.htfDayHL)\\n'\n"
+                        "  '\\n'\n"
+                        "  '        array.push(uids, m.uid)\\n'\n"
+                        "  '        hasMA   := hasMA  or kc == 1\\n'\n"
+                        "  '        hasHZ   := hasHZ  or kc == 2\\n'\n"
+                        "  '        hasDHL  := hasDHL or kc == 3\\n'\n"
+                        "  '        hasACC  := hasACC or kc == 4\\n'\n"
+                        "  '    int srcM = (bSw1 ? SRC_SW1 : 0) + (bSw2 ? SRC_SW2 : 0) + (bSw3 ? SRC_SW3 : 0) + "
+                        "(bHzx ? SRC_HZX : 0) + (bAc1 ? SRC_ACC1 : '\n"
+                        "  '0) + (bAc2 ? SRC_ACC2 : 0) + (bAc3 ? SRC_ACC3 : 0) + (bMa1 ? SRC_MA1 : 0) + (bMa2 ? "
+                        "SRC_MA2 : 0) + (bDhl ? SRC_DHL : 0)\\n'\n"
+                        "  '    int htfM = (hSw1 ? HTF_SW1H : 0) + (hAc1 ? HTF_ACC1 : 0) + (hAc2 ? HTF_ACC2 : 0) + "
+                        "(hAc3 ? HTF_ACC3 : 0) + (hS15 ? '\n"
+                        "  'HTF_SW15 : 0) + (hMa1 ? HTF_MA1 : 0) + (hMa2 ? HTF_MA2 : 0) + (hDay ? HTF_DAY : "
+                        "0)\\n'),\n"
+                        " ('clusters',\n"
+                        "  '        float maxT  = na\\n        for k = 0 to n - 1\\n',\n"
+                        "  '        float maxT  = na\\n'\n"
+                        "  '        float cDH   = na     // XA-24: この Cluster の DAY_HIGH / DAY_LOW の px0 (最後の member "
+                        "の値 = version 2 の事前走査と同じ)\\n'\n"
+                        "  '        float cDL   = na\\n'\n"
+                        "  '        for k = 0 to n - 1\\n'),\n"
+                        " ('clusters',\n"
+                        "  '                if not ok\\n                    array.push(e.live, "
+                        "f_finalizeCluster(cur, c, minB, maxT))\\n',\n"
+                        "  '                if not ok\\n                    array.push(e.live, "
+                        "f_finalizeCluster(cur, c, minB, maxT, cDH, cDL))\\n'),\n"
+                        " ('clusters',\n"
+                        "  '                    maxT  := na\\n',\n"
+                        "  '                    maxT  := na\\n                    cDH   := na\\n                    "
+                        "cDL   := na\\n'),\n"
+                        " ('clusters',\n"
+                        "  '            maxT  := na(maxT) ? z.top    : math.max(maxT, z.top)\\n',\n"
+                        "  '            maxT  := na(maxT) ? z.top    : math.max(maxT, z.top)\\n'\n"
+                        "  '            if z.kId == 6\\n'\n"
+                        "  '                cDH := z.px0\\n'\n"
+                        "  '            else if z.kId == 7\\n'\n"
+                        "  '                cDL := z.px0\\n'),\n"
+                        " ('clusters',\n"
+                        "  '        if array.size(cur) > 0\\n            array.push(e.live, f_finalizeCluster(cur, "
+                        "c, minB, maxT))\\n',\n"
+                        "  '        if array.size(cur) > 0\\n            array.push(e.live, f_finalizeCluster(cur, "
+                        "c, minB, maxT, cDH, cDL))\\n'),\n"
+                        " ('track',\n"
+                        "  'f_findTrack(ZoneEngine e, Zone z, ZoneCfg c) =>\\n'\n"
+                        "  '    int best = -1\\n'\n"
+                        "  '    float bestD = 1e20\\n'\n"
+                        "  '    if array.size(e.tracks) > 0\\n'\n"
+                        "  '        for i = 0 to array.size(e.tracks) - 1\\n'\n"
+                        "  '            ZoneTrack t = array.get(e.tracks, i)\\n'\n"
+                        "  '            if na(t.matchedBar) or t.matchedBar != bar_index\\n'\n"
+                        "  '                float d = math.abs(t.center - z.center)\\n'\n"
+                        "  '                // 距離で弾けるTrackに対しては f_trackContinuous (uid突き合わせ = O(n^2))\\n'\n"
+                        "  '                // を呼ばないようネストする。判定結果は and 連結時と完全に同じ。\\n'\n"
+                        "  '                if d <= c.clusterDist and d < bestD\\n'\n"
+                        "  '                    if f_trackContinuous(t, z, c)\\n'\n"
+                        "  '                        bestD := d\\n'\n"
+                        "  '                        best  := i\\n'\n"
+                        "  '    best\\n',\n"
+                        "  '//  XA-24: tc = 照合前の Track center (index は e.tracks と同じ)、ord = tc の昇順 index、nT = 照合前の "
+                        "Track 数。\\n'\n"
+                        "  '//    fl(tc - z.center) は tc について単調なので |差| <= clusterDist の Track は ord の連続した範囲 "
+                        "(二分探索で先頭を探す)。\\n'\n"
+                        "  '//    その範囲で「このバー未照合・継続性あり」の中から距離最小、同距離は index の小さい方 = version 2 の index 順全件走査の結果。\\n'\n"
+                        "  '//    照合済みの Track は center が動いていても対象外、このバーで作った Track は ord に入らない (version 2 "
+                        "でも照合済みで対象外)。\\n'\n"
+                        "  'f_findTrack(ZoneEngine e, Zone z, ZoneCfg c, array<float> tc, array<int> ord, int nT) "
+                        "=>\\n'\n"
+                        "  '    int best = -1\\n'\n"
+                        "  '    float bestD = 1e20\\n'\n"
+                        "  '    float dist = c.clusterDist\\n'\n"
+                        "  '    int lo = 0\\n'\n"
+                        "  '    int hi = nT\\n'\n"
+                        "  '    while lo < hi\\n'\n"
+                        "  '        int mid = math.floor((lo + hi) / 2)\\n'\n"
+                        "  '        if array.get(tc, array.get(ord, mid)) - z.center < -dist\\n'\n"
+                        "  '            lo := mid + 1\\n'\n"
+                        "  '        else\\n'\n"
+                        "  '            hi := mid\\n'\n"
+                        "  '    int k = lo\\n'\n"
+                        "  '    while k < nT\\n'\n"
+                        "  '        int i = array.get(ord, k)\\n'\n"
+                        "  '        if array.get(tc, i) - z.center > dist\\n'\n"
+                        "  '            break\\n'\n"
+                        "  '        ZoneTrack t = array.get(e.tracks, i)\\n'\n"
+                        "  '        if na(t.matchedBar) or t.matchedBar != bar_index\\n'\n"
+                        "  '            float d = math.abs(t.center - z.center)\\n'\n"
+                        "  '            if d <= dist and (d < bestD or (d == bestD and i < best))\\n'\n"
+                        "  '                if f_trackContinuous(t, z, c)\\n'\n"
+                        "  '                    bestD := d\\n'\n"
+                        "  '                    best  := i\\n'\n"
+                        "  '        k += 1\\n'\n"
+                        "  '    best\\n'\n"
+                        "  '\\n'\n"
+                        "  '// XA-24: 2 つの uid 配列が同じ値を同じ順序で持つか (Track の memberUids を写す必要があるか)\\n'\n"
+                        "  'f_sameUids(array<int> a, array<int> b) =>\\n'\n"
+                        "  '    bool same = false\\n'\n"
+                        "  '    if not na(a) and not na(b)\\n'\n"
+                        "  '        if array.size(a) == array.size(b)\\n'\n"
+                        "  '            same := true\\n'\n"
+                        "  '            if array.size(a) > 0\\n'\n"
+                        "  '                for i = 0 to array.size(a) - 1\\n'\n"
+                        "  '                    if array.get(a, i) != array.get(b, i)\\n'\n"
+                        "  '                        same := false\\n'\n"
+                        "  '                        break\\n'\n"
+                        "  '    same\\n'),\n"
+                        " ('dyn',\n"
+                        "  '    rz.createdTime    := time\\n    array.push(e.sDyn, rz)\\n',\n"
+                        "  '    rz.createdTime    := time\\n    f_kind(rz, c)     // XA-24\\n    array.push(e.sDyn, "
+                        "rz)\\n'),\n"
+                        " ('update',\n"
+                        "  'export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>\\n',\n"
+                        "  'export update(ZoneEngine e, ZoneCfg c, ZoneFeed f) =>\\n'\n"
+                        "  '    // ---- 6.0 XA-24: Source 番号の時間足設定 (input 由来なので通常は最初のバーだけ。違えば全 Raw Zone "
+                        "の番号を作り直す)\\n'\n"
+                        "  '    if not e.kInit or e.kHz1 != c.hzTf1 or e.kHz2 != c.hzTf2 or e.kHz3 != c.hzTf3 or "
+                        "e.kAcc1 != c.accTf1 or e.kAcc2 != '\n"
+                        "  'c.accTf2 or e.kAcc3 != c.accTf3\\n'\n"
+                        "  '        if array.size(e.persist) > 0\\n'\n"
+                        "  '            for i = 0 to array.size(e.persist) - 1\\n'\n"
+                        "  '                f_kind(array.get(e.persist, i), c)\\n'\n"
+                        "  '        e.kInit := true\\n'\n"
+                        "  '        e.kHz1  := c.hzTf1\\n'\n"
+                        "  '        e.kHz2  := c.hzTf2\\n'\n"
+                        "  '        e.kHz3  := c.hzTf3\\n'\n"
+                        "  '        e.kAcc1 := c.accTf1\\n'\n"
+                        "  '        e.kAcc2 := c.accTf2\\n'\n"
+                        "  '        e.kAcc3 := c.accTf3\\n'\n"
+                        "  '\\n'),\n"
+                        " ('track',\n"
+                        "  '    if nZ > 0\\n'\n"
+                        "  '        for i = 0 to nZ - 1\\n'\n"
+                        "  '            Zone z = array.get(e.live, i)\\n'\n"
+                        "  '            int ti = f_findTrack(e, z, c)\\n',\n"
+                        "  '    // XA-24: 照合前の Track center と昇順 index (このバー 1 回。f_findTrack の二分探索用)\\n'\n"
+                        "  '    array<float> trkC = e.sTrkC\\n'\n"
+                        "  '    array.clear(trkC)\\n'\n"
+                        "  '    int nT0 = array.size(e.tracks)\\n'\n"
+                        "  '    array<int> trkOrd = array.new_int()\\n'\n"
+                        "  '    if nZ > 0 and nT0 > 0\\n'\n"
+                        "  '        for i = 0 to nT0 - 1\\n'\n"
+                        "  '            array.push(trkC, array.get(e.tracks, i).center)\\n'\n"
+                        "  '        trkOrd := array.sort_indices(trkC, order.ascending)\\n'\n"
+                        "  '    if nZ > 0\\n'\n"
+                        "  '        for i = 0 to nZ - 1\\n'\n"
+                        "  '            Zone z = array.get(e.live, i)\\n'\n"
+                        "  '            int ti = f_findTrack(e, z, c, trkC, trkOrd, array.size(trkOrd))\\n'),\n"
+                        " ('track',\n"
+                        "  '            //    allocation 削減より semantic safety を優先して参照共有はしない。\\n            "
+                        "t.memberUids  := array.copy(z.memberUids)\\n',\n"
+                        "  '            //    allocation 削減より semantic safety を優先して参照共有はしない。\\n'\n"
+                        "  '            //  XA-24: 内容が同じなら写さない (Track は自分の array を持ち続ける。中身は array.copy と同じ)\\n'\n"
+                        "  '            if not f_sameUids(t.memberUids, z.memberUids)\\n'\n"
+                        "  '                t.memberUids := array.copy(z.memberUids)\\n')]\n"
+                        'XA24_HDR = (\n'
+                        '    "//  XA-24: 実行時間の削減 (売買結果・判定・入力は変えない)。Engine を ZoneEnginePracticalXAUUSD version 3 '
+                        '(version 2 と同じ結果を\\n"\n'
+                        '    "//  少ない処理で返す版: Source 番号での Cluster 集計・Track 照合の二分探索・Track uid の不要な複製をしない) に更新し、Zone '
+                        'ごとの\\n"\n'
+                        '    "//  FVG 選択を 1 回にした (FVG 加点・昇格範囲・候補・注文・アラート・ラベルは同じ)。\\n")\n'
+                        'STRATEGY_EDITS24 = [\n'
+                        '    ("header",\n'
+                        '     "//  同じ注文 (注文 ID) には 1 個、最新 " + str(LBL_KEEP) + " '
+                        '個を保持。仮ラベルは無し。売買・アラート・仮の再送防止・時間制限は変えない。\\n",\n'
+                        '     "//  同じ注文 (注文 ID) には 1 個、最新 " + str(LBL_KEEP) + " '
+                        '個を保持。仮ラベルは無し。売買・アラート・仮の再送防止・時間制限は変えない。\\n" + XA24_HDR),\n'
+                        '    ("import", IMPORT_XAE2, IMPORT_XAE3),\n'
+                        '    ("fvg",\n'
+                        '     "//  ・Pine v5 は and / or の両辺を評価するため、-1 判定と array.get を同じ式に書かない。\\n"\n'
+                        '     "f_stZoneEval(zn.Zone z) =>\\n"\n'
+                        '     "    [dScore, dStr] = f_fvcZoneDisplay(z)\\n"\n'
+                        '     "    int  best    = f_zpoBestFvg(z)\\n",\n'
+                        '     "//  ・Pine v5 は and / or の両辺を評価するため、-1 判定と array.get を同じ式に書かない。\\n"\n'
+                        '     "//  ・XA-24: 採用 FVG は f_zpoBestFvg で 1 回だけ選ぶ (f_fvcZoneDisplay と同じ候補・同じ比較なので同じ '
+                        'FVG)。dScore / dStr は\\n"\n'
+                        '     "//    f_fvcZoneDisplay と同じ式でその FVG から計算する (FVG 枠の走査を Zone ごとに 2 回 → 1 回)。\\n"\n'
+                        '     "f_stZoneEval(zn.Zone z) =>\\n"\n'
+                        '     "    int   best   = f_zpoBestFvg(z)\\n"\n'
+                        '     "    float dScore = z.score\\n"\n'
+                        '     "    int   dStr   = z.strength\\n"\n'
+                        '     "    if best >= 0\\n"\n'
+                        '     "        dScore := z.baseSum + f_fvcBase(best) + z.slopeBonus + z.maBonus + '
+                        'z.flipBonus + f_fvcConf(z.catCount + 1)\\n"\n'
+                        '     "        dStr   := f_fvcStrengthOf(dScore, z.hasHtf)\\n"),\n'
+                        ']\n'
+                        '\n'
+                        '\n'
                         'def build_visual1():\n'),
                        ('\ndef build_visual():\n    return _apply(build_visual3(), VISUAL_EDITS4)\n',
                         '\n'
@@ -2902,13 +3505,26 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                         '    return _apply(_ge.build(), ENGINE_EDITS)\n'),
                        ('\ndef strip_engine(t):\n',
                         '\n'
-                        'def build_engine():\n'
-                        '    """version 2 = version 1 + the XA-6 Role Reversal Mode."""\n'
+                        'def build_engine2():\n'
+                        '    """version 2 = version 1 + the XA-6 Role Reversal Mode (the Engine of 0c6cd71)."""\n'
                         '    return _apply(build_engine1(), ENGINE_EDITS6)\n'
                         '\n'
                         '\n'
+                        'def build_engine():\n'
+                        '    """version 3 = version 2 + the XA-24 run-time reduction (same results)."""\n'
+                        '    return _apply(build_engine2(), ENGINE_EDITS7)\n'
+                        '\n'
+                        '\n'
+                        'def strip_engine7(t):\n'
+                        '    """reverse only XA-24 (-> the version 2 source of 0c6cd71 byte for byte)."""\n'
+                        '    return _revert(t, ENGINE_EDITS7)\n'
+                        '\n'
+                        '\n'
                         'def strip_engine6(t):\n'
-                        '    """reverse only XA-6 (-> the version 1 source of 7363ef1 byte for byte)."""\n'
+                        '    """reverse XA-24 when present (all or nothing) and XA-6 (-> the version 1 source of '
+                        '7363ef1 byte for byte)."""\n'
+                        '    if t is not None and ENGINE_EDITS7[0][2] in t:\n'
+                        '        t = strip_engine7(t)\n'
                         '    return _revert(t, ENGINE_EDITS6)\n'
                         '\n'
                         '\n'
@@ -3020,9 +3636,14 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                         '    return _apply(build_strategy21(), STRATEGY_EDITS22)\n'
                         '\n'
                         '\n'
+                        'def build_strategy23():\n'
+                        '    """XA-1 .. XA-23 (commit 7705907)."""\n'
+                        '    return _apply(build_strategy22(), STRATEGY_EDITS23)\n'
+                        '\n'
+                        '\n'
                         'def build_strategy():\n'),
                        ('def build_strategy():\n    return _apply(build_strategy3(), STRATEGY_EDITS4)\n\n',
-                        'def build_strategy():\n    return _apply(build_strategy22(), STRATEGY_EDITS23)\n\n'),
+                        'def build_strategy():\n    return _apply(build_strategy23(), STRATEGY_EDITS24)\n\n'),
                        ('\ndef strip_visual4(t):\n',
                         '\n'
                         'def strip_visual7(t):\n'
@@ -3038,8 +3659,16 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                         '    return _revert(t, VISUAL_EDITS6)\n'
                         '\n'
                         '\n'
+                        'def strip_strategy24(t):\n'
+                        '    """reverse only XA-24 (-> the Strategy of 7705907 byte for byte)."""\n'
+                        '    return _revert(t, STRATEGY_EDITS24)\n'
+                        '\n'
+                        '\n'
                         'def strip_strategy23(t):\n'
-                        '    """reverse only XA-23 (-> the Strategy of d05f8c9 byte for byte)."""\n'
+                        '    """reverse XA-24 when present (all or nothing) and XA-23 (-> the Strategy of d05f8c9 '
+                        'byte for byte)."""\n'
+                        '    if t is not None and STRATEGY_EDITS24[0][2] in t:\n'
+                        '        t = strip_strategy24(t)\n'
                         '    return _revert(t, STRATEGY_EDITS23)\n'
                         '\n'
                         '\n'
@@ -3220,7 +3849,28 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                         'for byte)."""\n'
                         '    if t is not None and STRATEGY_EDITS5[0][2] in t:\n'
                         '        t = strip_strategy5(t)\n'
-                        '    return _revert(t, STRATEGY_EDITS4)\n')],
+                        '    return _revert(t, STRATEGY_EDITS4)\n'),
+                       ('    return text if s is None else s\n\n',
+                        '    return text if s is None else s\n'
+                        '\n'
+                        '\n'
+                        'XA24_PATHS = (STR_PATH, "ZoneStrategyXAULong.pine", '
+                        '"automation/xau_short/pine/ZoneStrategyXAU_Auto.pine")\n'
+                        '\n'
+                        '\n'
+                        'def unapply24(path, text):\n'
+                        '    """reverse XA-24 when present (all or nothing) on the Engine (ENGINE_EDITS7) and the '
+                        'Gold Short / Long / automation copy\n'
+                        '    (STRATEGY_EDITS24); unchanged without it or for other paths, None with only part of it. '
+                        'btl_build.unapply (the innermost link\n'
+                        "    of the older fixtures' layer chain) calls it first, so the older checks keep pinning "
+                        'their own layers."""\n'
+                        '    eds = ENGINE_EDITS7 if path == ENG_PATH else STRATEGY_EDITS24 if path in XA24_PATHS '
+                        'else None\n'
+                        '    if text is None or eds is None or eds[0][2] not in text:\n'
+                        '        return text\n'
+                        '    return _revert(text, eds)\n'
+                        '\n')],
  'tests/xa_sim.py': [('ROOT = xb.ROOT\n'
                       'rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()\n'
                       'git = lambda *a: subprocess.run(["git", "-C", ROOT] + list(a), capture_output=True, '
@@ -3580,16 +4230,16 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                        '\n'
                        '\n'
                        'def gate_xa6():\n'
-                       '    E6, V6, S6 = rd(xb.ENG_PATH), xb.strip_visual7(rd(xb.VIS_PATH)) or "", '
-                       'xb.strip_strategy7(rd(xb.STR_PATH)) or ""   # XA-6 layer (later edits reverted exactly; '
-                       'pinned in xas_sim)\n'
+                       '    E6, V6, S6 = xb.unapply24(xb.ENG_PATH, rd(xb.ENG_PATH)), '
+                       'xb.strip_visual7(rd(xb.VIS_PATH)) or "", xb.strip_strategy7(rd(xb.STR_PATH)) or ""   # XA-6 '
+                       'layer (later edits reverted exactly; pinned in xas_sim)\n'
                        '    B = "cbb996d"\n'
                        '    E1, VB, SB = xb.show(B, xb.ENG_PATH), xb.show(B, xb.VIS_PATH), xb.show(B, xb.STR_PATH)\n'
-                       '    check("XR-01 XA-6: Engine == xa_build.build_engine() (version 1 + XA-6), Visual / '
-                       'Strategy == build_*(); strip_*6 give the "\n'
+                       '    check("XR-01 XA-6: Engine (XA-24 reverted exactly) == xa_build.build_engine2() (version '
+                       '1 + XA-6), Visual / Strategy == build_*(); strip_*6 give the "\n'
                        '          "cbb996d files byte for byte (Engine version 1 unchanged and still published as '
                        '/1)",\n'
-                       '          xb.build_engine() == E6 and xb.build_visual6() == V6 and xb.build_strategy6() == '
+                       '          xb.build_engine2() == E6 and xb.build_visual6() == V6 and xb.build_strategy6() == '
                        'S6 and xb.strip_engine6(E6) == E1\n'
                        '          and xb.strip_visual6(V6) == VB and xb.strip_strategy6(S6) == SB and '
                        'xb.build_engine1() == E1)\n'

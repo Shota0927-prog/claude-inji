@@ -48,9 +48,9 @@ def block(t, start, end):
 def gate_static():
     others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != ab.SRC_PATH]
     check("AP-01 the copy == au_build.build() and strip gives the normal Gold Short byte for byte; the normal Short == xa_build.build_strategy() "
-          "== the committed XA-23 file (7705907) unchanged; the Long, Engines and every other Pine file unchanged by AU-1",
-          A == ab.build() and ab.strip(A) == N and N == xb.build_strategy() and N == ab.show(ab.SRC_REV, ab.SRC_PATH)
-          and not [p for p in others if __import__("btl_build").unapply(p, raw(p)) != ab.show(ab.SRC_REV, p)])
+          "== the committed XA-23 file (7705907) + exactly XA-24; the Long, Engines and every other Pine file unchanged by AU-1",
+          A == ab.build() and ab.strip(A) == N and N == xb.build_strategy() and xb.unapply24(ab.SRC_PATH, N) == ab.show(ab.SRC_REV, ab.SRC_PATH)
+          and not [p for p in others if __import__("btl_build").unapply(p, raw(p)) != ab.show(ab.SRC_REV, p)])     # XA-24 (later) reverted exactly
     m, m0 = block(A, MAIN_START, MAIN_END), block(N, MAIN_START, MAIN_END)
     pick = lambda t: [l.strip() for l in code_only(t).split("\n")
                       if re.search(r"\bstrategy\.(entry|exit|close|cancel)\(|^\s*\w+\s*(:=|\+=)|^\s*(if|else|for)\b", l) and "auTid :=" not in l

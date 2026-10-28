@@ -71,7 +71,7 @@ def main_checks():
           "identical; budget 300,000 x 3 %",
           '     title                  = "Zone Strategy XAU Long",\n' in L and '     shorttitle             = "ZONE-ST-L",\n' in L
           and st(L) == st(S) and "initial_capital        = 300000," in L and "currency.JPY" in L and "calc_on_every_tick     = true," in L
-          and "import sekine3310/ZoneEnginePracticalXAUUSD/2 as zn" in L
+          and "import sekine3310/ZoneEnginePracticalXAUUSD/2 as zn" in __import__("xal_build").strip24(L)     # /3 from XA-24 (pinned in pf_sim)
           and all(func(L, h) == func(S, h) for h in ("f_stQty(int side, float ref, float sl) =>", "f_stTp(", "f_satBand() =>",
                                                     "f_satHist(int side, float L, int q) =>", "f_beTrig(", "f_hPick(", "f_satPick("))
           and iv["stCapBase"] == "300000.0" and iv["stRiskPct"] == "3.0")

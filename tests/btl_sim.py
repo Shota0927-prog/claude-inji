@@ -55,7 +55,7 @@ def gate_static():
     check("BL-01 ZoneStrategyBTCUSD.pine == btl_build.build() and strips back to the 7705907 file byte for byte (unapply too); the BTC "
           "Visual / Engine, the shared Engines, the other symbols' and Gold files unchanged (no Library re-publish)",
           T == bl.build() and bl.strip(T) == T0 and bl.unapply(bl.PATH, T) == T0 and bl.unapply(bl.PATH, T0) == T0
-          and not [p for p in others if raw(p) != bl.show(bl.BASE_REV, p)])
+          and not [p for p in others if __import__("xa_build").unapply24(p, raw(p)) != bl.show(bl.BASE_REV, p)])     # XA-24 (later) reverted exactly
     iv, i0 = input_values(T), input_values(T0)
     bad = {k: (iv.get(k), v) for k, v in TABLE.items() if iv.get(k) != v}
     diff = {k: (i0[k], iv[k]) for k in i0 if i0[k] != iv.get(k)}

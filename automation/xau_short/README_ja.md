@@ -334,3 +334,19 @@ AU-4 では過去足 1 本ごとに、送信されないのに次の処理を実
    2. アラート一覧で旧版のアラートを削除します。
    3. 新しいアラートを作成します: 条件 = `Zone Strategy XAU Auto`、「alert() function calls only」、Webhook URL = 受信処理の URL (トークン入り)。
    4. 作成後、受信側で次のリアルタイム確定足の BAR が `ACCEPTED` になることを確認します。
+
+## 14. XA-24: Engine version 3 への更新 (通常版と同じ変更)
+
+通常版 Short の実行時間対策 (XA-24) を、自動化コピーにもそのまま反映しています。詳細は `XAU_PERF_XA24_ja.md` を参照してください。
+- 変更点:
+  - import は `ZoneEnginePracticalXAUUSD/3` です。
+  - `f_stZoneEval` の FVG 選択は 1 回だけです。
+- 変わらないもの:
+  - 売買・通知の内容・キー・cfg・SID (`XAU-SHORT|XA-23|AU-2`) は変わりません。
+  - 受信側・ブリッジ・EA の設定変更は不要です。
+- TradingView での手順:
+  1. Library version 3 を公開します。
+  2. このコピーを貼り替えて保存します。
+  3. 13 章 6 の手順でアラートを作り直します。
+
+  TradingView での実行と結果の一致は未確認です。

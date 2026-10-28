@@ -3,7 +3,7 @@
 ZoneStrategyXAULong.pine == the ZoneStrategyXAU.pine of SRC_REV + EDITS (exact replacements, each old once): the name (title /
 shorttitle), the Gold Long adopted defaults (from the user's Gold Long comparison over the last 365 days) and the text that
 names those defaults. Trading code, Zone / SATS / size / order / breakeven logic, strategy() calculation settings and the shared
-Engine import (ZoneEnginePracticalXAUUSD/2) are byte-identical to the Short Strategy. strip() reverses the edits exactly.
+Engine import (ZoneEnginePracticalXAUUSD/2; /3 from XA-24) are byte-identical to the Short Strategy. strip() reverses the edits exactly.
 XA-21 (alerts): the Long Strategy == build1() (= XL-1) + xa_build.STRATEGY_EDITS21 (the same exact alert layer as the Short
 Strategy), so the Long file stays the Short file of SRC_REV + XL-1 + XA-21; strip21() reverses only XA-21 (-> the XL-1 Long file
 of d67941f), strip() reverses both (-> the Short Strategy of SRC_REV).
@@ -11,6 +11,9 @@ XA-22 (provisional once per candidate / wait): build() = build21() (XL-1 + XA-21
 xa_build.STRATEGY_EDITS22; strip22() reverses only XA-22, strip21() reverses XA-22 and XA-21 (-> d67941f).
 XA-23 (confirmed labels): build() = build22() (the Long file of d05f8c9) + xa_build.STRATEGY_EDITS23; strip23() reverses only
 XA-23; strip22() / strip21() / strip() also reverse XA-23 first when present.
+XA-24 (run-time reduction: Engine import ZoneEnginePracticalXAUUSD/3, single FVG selection in f_stZoneEval): build() = build23()
+(the Long file of 7705907) + xa_build.STRATEGY_EDITS24; strip24() reverses only XA-24; strip23() and the others also reverse
+XA-24 first when present.
 """
 import os
 import subprocess
@@ -137,12 +140,28 @@ def build22():
     return _apply(build21(), _xa22())
 
 
-def build():
+def _xa24():
+    return __import__("xa_build").STRATEGY_EDITS24
+
+
+def build23():
+    """XL-1 + XA-21 + XA-22 + XA-23 (the Long Strategy of 7705907)."""
     return _apply(build22(), _xa23())
 
 
+def build():
+    return _apply(build23(), _xa24())
+
+
+def strip24(text):
+    """reverse only XA-24 (-> the Long Strategy of 7705907); None when not exact."""
+    return _revert(text, _xa24())
+
+
 def strip23(text):
-    """reverse only XA-23 (-> the Long Strategy of d05f8c9); None when not exact."""
+    """reverse XA-24 when present (all or nothing) and XA-23 (-> the Long Strategy of d05f8c9); None when not exact."""
+    if text is not None and _xa24()[0][2] in text:
+        text = strip24(text)
     return _revert(text, _xa23())
 
 

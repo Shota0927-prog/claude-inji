@@ -58,7 +58,7 @@ def gate_static():
           "the import line and the request count unchanged",
           all(CUR[k] == s2.build(p) and s2.strip(p, CUR[k]) == BASE[k] and s2.unapply(p, CUR[k]) == BASE[k] and BASE[k] == s2.show("b59d621", p)
               for k, p in s2.PATHS.items())
-          and not [p for p in others if raw(p) != s2.show(B, p)
+          and not [p for p in others if __import__("xa_build").unapply24(p, raw(p)) != s2.show(B, p)     # XA-24 (later): exact
                    and not (p == s2.GOLD_PATH and __import__("xa_build").strip_strategy20(raw(p)) == s2.show(B, p))]   # Gold: later XA-20 exactly
           and all(es.seg(CUR[k], "strategy(", "import ") == es.seg(BASE[k], "strategy(", "import ") and "calc_on_every_tick     = true," in CUR[k]
                   and re.findall(r"^import .*$", CUR[k], re.M) == re.findall(r"^import .*$", BASE[k], re.M)

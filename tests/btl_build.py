@@ -92,7 +92,9 @@ def strip(text):
 
 
 def unapply(path, text):
-    """reverse BTL-1 when present (all or nothing): unchanged without it (or for other paths), None with only part of it."""
+    """reverse BTL-1 when present (all or nothing): unchanged without it (or for other paths), None with only part of it.
+    The later XA-24 layer (xa_build.unapply24: Gold Engine version 3 / Gold Strategies) is reverted first, exactly."""
+    text = __import__("xa_build").unapply24(path, text)
     if text is None or path != PATH or HDR_NEW.split("\n")[1] not in text:
         return text
     return strip(text)
