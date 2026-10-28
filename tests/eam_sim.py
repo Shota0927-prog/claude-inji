@@ -15,7 +15,9 @@ automation/xau_short/ea/XauShortDemoEA.mq5 (the model and the source must keep t
                ticket, approvals / heartbeats
   EAR-09..12 : regressions of the ST3-2 re-review (items 1-4): the last checks after the slow final PrepareOrder, FILL_SIDE_BAD close
                results + persisted close obligation, later deals of the same order (volume / average), breakeven pending across restarts
-  EAS-01..15 : the MQL5 source (static): inputs, constants, approvals, the only OrderSend sites and their gates / order, journal
+  EAR-13..15 : regressions of the ST3-3 re-review: the clock checked after FinalGate's file reads, the fill state / last IN deal from
+               the history (adoption with several IN deals, history arriving late, restart), breakeven basis voided by a later IN deal
+  EAS-01..16 : the MQL5 source (static): inputs, constants, approvals, the only OrderSend sites and their gates / order, journal
                states, refusal reasons, definite-reject list, ownership by identifier, unknown handling, fill-bar ticks, bridge map
 Evidence class: local Python only. The MQL5 EA itself is NOT compiled or run here (no MetaEditor / MT5 in this environment).
 """
@@ -1166,6 +1168,160 @@ def gate_rereview():
           and u1 == (False, True, None, 1) and u2 == ("2584.20", True), str((before, pend_after, still, after, u1, u2)))
 
 
+def gate_rereview2():
+    """regressions of the ST3-3 re-review (items 1-2)."""
+    # 1. a slow file read inside FinalGate
+    res = {}
+    for nm, start, delay in (("deadline", 58000, 4000), ("go_validity", 52000, 4000), ("no_expiry", 30000, 1000)):
+        b = Box()
+        b.t.gmt_ms = BC + start
+        orig = b.ea.bridge_hb_age_ms
+        done = [False]
+
+        def slow(b=b, orig=orig, done=done, delay=delay):
+            age = orig()
+            if b.ea.inflightKey and not done[0]:       # the heartbeat file read inside FinalGate (after the PRE_SEND record)
+                done[0] = True
+                b.t.advance(delay)
+            return age
+        b.ea.bridge_hb_age_ms = slow
+        kh = b.cmd()
+        b.timer()
+        res[nm] = (len(b.sends()), (b.ea.last(kh, "SEND_ABORTED") or {}).get("reason"), done[0])
+        b.close()
+    check("EAR-13 (ST3-3 re-review 1) a 4 s delay in FinalGate's own file read (hb_bridge.txt, the heartbeat itself still fresh): started at "
+          "58 s -> SEND_ABORTED expired; started at 52 s with a 3 s GO -> SEND_ABORTED go_expired; zero sends. The deadline and the GO "
+          "validity are checked after every read; a 1 s delay with nothing expired still sends once",
+          res == {"deadline": (0, "expired", True), "go_validity": (0, "go_expired", True), "no_expiry": (1, None, True)}, str(res))
+
+    def add_in(b, p, at_msc, price, vol, to_history=True):
+        tot = round(p["volume"] + vol, 2)
+        p["price_open"] = round((p["price_open"] * p["volume"] + price * vol) / tot, 5)
+        p["volume"] = tot
+        d = b.t._ticket()
+        deal = dict(order=0, position=p["identifier"], price=price, time=at_msc // 1000, time_msc=at_msc, entry="IN", volume=vol,
+                    symbol="XAUUSDs", magic=p["magic"], comment=p["comment"], reason="EXPERT", profit=0.0, commission=0.0, swap=0.0)
+        if to_history:
+            b.t.deals[d] = deal
+        return d, deal
+
+    def lost_reply_two_parts(ticks):
+        """an order filled in two parts (0.20 @ 2600.20, 20 s later 0.20 @ 2601.00) whose reply was lost; adopted afterwards."""
+        b = Box()
+        b.t.send_mode = "fill_lost_reply"
+        kh = fill(b)
+        tk = max(b.t.positions)
+        p = b.t.positions[tk]
+        p["volume"] = 0.20
+        for v_ in b.t.deals.values():
+            if v_["position"] == p["identifier"]:
+                v_["volume"] = 0.20
+        F = p["time_msc"]
+        b.t.ticks = [(F + dt, bid) for dt, bid in ticks]
+        add_in(b, p, F + 20000, 2601.0, 0.20)
+        b.t.advance(30000)
+        b.touch("resolve_unknown", f"key_hash={kh}\nconfirm=open\n")
+        b.timer()
+        return b, kh, p, F
+
+    # 2A. several IN deals before the adoption
+    b, kh, p, F = lost_reply_two_parts([(5000, 2584.2), (25000, 2600.0)])
+    fo = p["time"] - p["time"] % 300
+    f_ = b.ea.last(kh, "FILLED")
+    b.at_srv(fo + 300)
+    b.timer()
+    a1 = (f_["in_deals"], int(f_["last_in_msc"]) - F, f_["fill_sync"], b.ea.last(kh, "BE_SET"), p["sl"])
+    b.close()
+    b, kh, p, F = lost_reply_two_parts([(5000, 2584.2), (25000, 2585.5)])   # 15.10 from the average AFTER the second part
+    fo = p["time"] - p["time"] % 300
+    b.at_srv(fo + 300)
+    b.timer()
+    a2 = ((b.ea.last(kh, "BE_SET") or {}).get("fav"), p["sl"])
+    b.close()
+    # 2B. the live position changes first, the IN deal reaches the history later
+    b = Box()
+    b.t.send_mode = "partial"
+    kh = fill(b)
+    p = b.own()
+    F = p["time_msc"]
+    fo = p["time"] - p["time"] % 300
+    b.t.ticks = [(F + 5000, 2584.2), (F + 25000, 2600.0)]
+    d, deal = add_in(b, p, F + 20000, 2601.0, 0.20, to_history=False)
+    b.t.advance(25000)
+    b.timer()
+    pend = (b.ea.pos.fillSyncPending, b.ea.last(kh, "FILL_HISTORY_PENDING") is not None, b.ea.pos.lastInMsc == F)
+    b.at_srv(fo + 300)
+    b.timer()                                       # the fill bar closes while the history still lags: no decision
+    during = (b.ea.last(kh, "BE_SET"), b.ea.last(kh, "TP_SET"), b.ea.pos.fillBarDone)
+    b.restart()                                     # a restart while it lags keeps waiting
+    after_restart = b.ea.pos.fillSyncPending
+    b.t.deals[d] = deal                             # the history arrives
+    b.at_srv(fo + 305)
+    b.timer()
+    upd = b.ea.last(kh, "POSITION_UPDATED")
+    b2 = (b.ea.pos.fillSyncPending, upd and upd["cause"], b.ea.pos.lastInMsc - F, b.ea.last(kh, "BE_SET"), p["sl"],
+          b.ea.last(kh, "TP_SET") is not None)
+    b.close()
+    check("EAR-14 (ST3-3 re-review 2A/2B) the last IN deal comes from the history: adopted with 2 IN deals -> FILLED in_deals=2, "
+          "last_in_msc = the second part (+20 s), the 16 USD before it is not used (no BE; SL stays 2605) while 15.10 after it is (BE at "
+          "the average 2600.60); when the live position changes before its deal reaches the history -> FILL_HISTORY_PENDING, no "
+          "breakeven / TP decision while it lags (also across a restart), then POSITION_UPDATED (cause=add: 0.20 -> 0.40) with the new last IN and still "
+          "no BE from the earlier move; TP0 is set once the state is explained",
+          a1 == ("2", 20000, "ok", None, 2605.0) and a2 == ("2585.50", 2600.6) and pend == (True, True, True)
+          and during == (None, None, False) and after_restart is True and b2 == (False, "add", 20000, None, 2605.0, True),
+          str((a1, a2, pend, during, after_restart, b2)))
+    # 2C. a breakeven condition met before a later IN deal
+    def pending_then_later_in(next_bar_low, restart=False):
+        b = Box()
+        b.t.send_mode = "partial"
+        kh = fill(b)
+        p = b.own()
+        F = p["time_msc"]
+        fo = p["time"] - p["time"] % 300
+        b.t.ticks = [(F + 1000, 2584.2)]
+        b.t.modify_mode = "reject"
+        b.at_srv(fo + 300)
+        b.timer()                                   # BE_TRIGGERED, refused, pending
+        pend = b.ea.pos.bePending
+        add_in(b, p, (fo + 330) * 1000, 2599.4, 0.20)   # 0.40 @ 2599.80, 30 s into the next bar
+        b.t.modify_mode = "ok"
+        if restart:
+            b.restart()
+        b.t.rates = [(fo + 300, 2580.0), (fo + 600, next_bar_low)]
+        b.at_srv(fo + 900 + 5)
+        b.timer()
+        return b, kh, p, pend
+    b, kh, p, pend = pending_then_later_in(2598.0)
+    c1 = (pend, b.ea.last(kh, "BE_TRIGGER_VOID") is not None, b.ea.last(kh, "BE_SET"), p["sl"], b.ea.pos.bePending)
+    b.close()
+    b, kh, p, pend = pending_then_later_in(2584.7)              # 15.10 from the new average in the bar AFTER the later deal's bar
+    c2 = ((b.ea.last(kh, "BE_SET") or {}).get("fav"), p["sl"], [x[2] for x in b.ea.journal_lines() if x[1] == kh].count("BE_TRIGGERED"))
+    b.close()
+    b, kh, p, pend = pending_then_later_in(2598.0, restart=True)
+    c3 = (b.ea.pos.bePending, b.ea.last(kh, "BE_SET"), p["sl"], b.ea.last(kh, "BE_TRIGGER_VOID") is not None)
+    b.close()
+    b = Box()
+    b.t.send_mode = "partial"
+    kh = fill(b)
+    p = b.own()
+    fo = p["time"] - p["time"] % 300
+    b.t.ticks = [(p["time_msc"] + 1000, 2584.2)]
+    b.at_srv(fo + 300)
+    b.timer()                                       # BE done at 2600.20
+    n_before = len(b.t.writes)
+    add_in(b, p, (fo + 330) * 1000, 2598.0, 0.20)   # a later part BELOW: average 2599.10
+    b.at_srv(fo + 600 + 5)
+    b.timer()
+    c4 = (p["sl"], b.ea.pos.fill, len(b.sends()), [w for w in b.t.writes[n_before:] if w[0] == "sltp" and w[1]["sl"] > 2600.2])
+    b.close()
+    check("EAR-15 (ST3-3 re-review 2C) a breakeven condition met before a later IN deal is void (BE_TRIGGER_VOID): with the change allowed "
+          "again and only ~1.8 USD after the later deal there is no BE (SL stays 2605, nothing pending); a 15.10 move after it (bar after "
+          "the later deal's bar) gives a NEW BE_TRIGGERED / BE_SET at the new average; the void survives a restart; a BE already set is "
+          "never loosened by a later part (SL kept 2600.20) and nothing is topped up (one send)",
+          c1 == (True, True, None, 2605.0, False) and c2 == ("2584.70", 2599.8, 2) and c3 == (False, None, 2605.0, True)
+          and c4 == (2600.2, 2599.1, 1, []), str((c1, c2, c3, c4)))
+
+
 # ---- static checks of the MQL5 source ------------------------------------------------------------------------------------
 def _func(src, name):
     m = re.search(r"\n[a-zA-Z_ ]+\b" + name + r"\([^)]*\)\s*\n  \{", src)
@@ -1300,19 +1456,28 @@ def gate_static():
           and "SetCritical(" in pco and "HaltNew(" in pco and len(re.findall(r"\bClosePosition\(", code)) == 2
           and "ClosePosition(" in pco and bsrc.count('upd["mt5_open"] = 0') == 1
           and 'if state == "CLOSED":\n                    upd["mt5_open"] = 0' in bsrc, "")
-    rc, so_, tb = _func(code, "Reconcile"), _func(code, "SelectOwn"), _func(code, "TryBreakeven")
-    check("EAS-15 (re-review 2/3/4) persisted and restored: CLOSE_REQUIRED (closeReason), POSITION_UPDATED (volume / average fill / last IN "
-          "deal; SelectOwn calls SyncFill whenever the live volume or open price differs), BE_TRIGGERED journaled BEFORE the SL change and "
-          "restored as bePending (RetryBreakeven runs before the fill-bar evaluation)",
-          all(x in rc for x in ('"CLOSE_REQUIRED"', '"POSITION_UPDATED"', '"BE_TRIGGERED"', "g_pos.closeReason = closeReq;",
-                                "g_pos.bePending = beTrig && !beSet;"))
-          and "SyncFill(v, po);" in so_ and "POSITION_PRICE_OPEN" in so_ and tb.index('"BE_TRIGGERED"') < tb.index("ApplyBreakeven();")
-          and mo_.index("RetryBreakeven(now);") < mo_.index("FillBarLow(") and "ModifyOwn(\"breakeven\"" in _func(code, "ApplyBreakeven"), "")
-
+    rc, tb, rf = _func(code, "Reconcile"), _func(code, "TryBreakeven"), _func(code, "RefreshFill")
+    check("EAS-15 (re-review 2/3/4, ST3-3 re-review 2) persisted and restored: CLOSE_REQUIRED, POSITION_UPDATED (volume / average / last IN "
+          "deal / IN count), BE_TRIGGERED (with its basis last_in_msc) journaled BEFORE the SL change and restored only on the same basis, "
+          "BE_TRIGGER_VOID; RefreshFill runs every timer and at restart, takes the state as synced only when IN - OUT = the live volume "
+          "(otherwise FILL_HISTORY_PENDING) and voids the breakeven basis on a new IN deal; ManageOwn waits while it is pending",
+          all(x in rc for x in ('"CLOSE_REQUIRED"', '"POSITION_UPDATED"', '"BE_TRIGGERED"', '"BE_TRIGGER_VOID"', "g_pos.closeReason = closeReq;",
+                                "g_pos.bePending = beTrig && !beSet;", "beBasis != lastIn", "RefreshFill();"))
+          and all(x in rf for x in ("FillStats(g_pos.posId", "MathAbs(vin - vout - v) <= 1e-6", '"FILL_HISTORY_PENDING"', "VoidBreakevenBasis();"))
+          and "SyncFill" not in code and tb.index('"BE_TRIGGERED"') < tb.index("ApplyBreakeven();") and "last_in_msc=" in tb
+          and mo_.index("bool fillOk = RefreshFill();") < mo_.index("if(!fillOk || SelectOwn() != 1)") < mo_.index("RetryBreakeven(now);")
+          and mo_.index("RetryBreakeven(now);") < mo_.index("FillBarLow(") and "FillStats(posId" in _func(code, "AdoptOwn")
+          and 'ModifyOwn("breakeven"' in _func(code, "ApplyBreakeven"), "")
+    fg2 = _func(code, "FinalGate")
+    check("EAS-16 (ST3-3 re-review 1) FinalGate reads first and checks the clock last: NewEntriesAllowed (halt file, bridge heartbeat file, "
+          "...), PositionsTotal, OrdersTotal, THEN CheckDeadline and the GO validity, then return; nothing between FinalGate and OrderSend",
+          fg2.index("NewEntriesAllowed(gate, id)") < fg2.index("PositionsTotal() > 0") < fg2.index("OrdersTotal() > 0")
+          < fg2.index("CheckDeadline(c)") < fg2.index("NowMsLate() > goUntil") and fg2.count("CheckDeadline(") == 1
+          and "ReadLines" not in fg2[fg2.index("CheckDeadline(c)"):] and "File" not in fg2[fg2.index("CheckDeadline(c)"):], "")
 
 def main():
     for g in (gate_env, gate_deadline, gate_price_lot, gate_slot, gate_unknown, gate_protect, gate_be, gate_restart_misc, gate_dry_mgmt,
-              gate_review, gate_rereview, gate_static):
+              gate_review, gate_rereview, gate_rereview2, gate_static):
         try:
             g()
         except Exception:

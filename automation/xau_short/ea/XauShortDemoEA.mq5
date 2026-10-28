@@ -15,8 +15,8 @@
 //| NOT compiled / NOT run by the author: see STAGE3_ja.md.            |
 //+------------------------------------------------------------------+
 #property copyright "shota0927-prog"
-#property version   "0.32"
-#property description "XAU Short demo EA (stage 3, ST3-3). DRY_RUN by default. Demo accounts only."
+#property version   "0.33"
+#property description "XAU Short demo EA (stage 3, ST3-4). DRY_RUN by default. Demo accounts only."
 
 //--- approved rules (constants on purpose: not changeable from the inputs)
 const double RISK_FRACTION = 0.03;   // loss budget = balance right before the decision x 3 %
@@ -80,10 +80,12 @@ struct OwnedPos
    double   fill;          // actual XS fill price = live POSITION_PRICE_OPEN (average when the order filled in parts)
    double   sl0;           // initial SL sent with the order
    double   tp0;           // TP0 of the ENTRY (SATS: fixed at the wait prep)
-   double   volume;        // live POSITION_VOLUME (kept in step by SyncFill)
+   double   volume;        // live POSITION_VOLUME (kept in step by RefreshFill)
    datetime fillTimeSrv;   // first fill time (server time): the fill bar
    long     fillTimeMsc;   // first fill time (server time, ms)
    long     lastInMsc;     // time of the last IN deal of the position (server ms): no price before it is used for breakeven
+   int      inDeals;       // number of IN deals the fill state was built from
+   bool     fillSyncPending; // live volume / average not (yet) explained by the history: breakeven / fill checks wait
    bool     tpSet;
    bool     beDone;
    bool     bePending;     // breakeven condition met (BE_TRIGGERED, persisted), the SL change has not succeeded yet
@@ -108,6 +110,7 @@ void ResetPos()
   {
    g_pos.key = ""; g_pos.posId = 0; g_pos.posTicket = 0; g_pos.orderTicket = 0; g_pos.dealTicket = 0;
    g_pos.fill = 0; g_pos.sl0 = 0; g_pos.tp0 = 0; g_pos.volume = 0; g_pos.fillTimeSrv = 0; g_pos.fillTimeMsc = 0; g_pos.lastInMsc = 0;
+   g_pos.inDeals = 0; g_pos.fillSyncPending = false;
    g_pos.tpSet = false; g_pos.beDone = false; g_pos.bePending = false; g_pos.beFav = 0; g_pos.beBar = 0; g_pos.lastBeTry = 0;
    g_pos.fillBarDone = false; g_pos.fillBarUnavailNoted = false;
    g_pos.lastBarDone = 0; g_pos.lastTpTry = 0; g_pos.closeReason = ""; g_pos.lastCloseTry = 0;
@@ -631,18 +634,19 @@ string SendCheck(const Cmd &c, const string id, const long goUntil, const MqlTra
    return(FinalGate(c, id, goUntil));
   }
 
-//--- the last checks, immediately before OrderSend (only reads of the clock, two small files and the terminal's lists):
-//--- deadline, GO validity, every new-entry gate (halt file / halt / critical / unknown / heartbeat / in-flight), account-wide
-//--- positions and pending orders. Anything that changed during the slow part above stops the send here.
+//--- the last checks, immediately before OrderSend. First everything that reads files or the terminal (every new-entry gate:
+//--- halt file / halt / critical / unknown / bridge heartbeat file / in-flight; account-wide positions and pending orders), and
+//--- ONLY THEN the deadline and the GO validity, which read nothing but the clock: a slow file read can never let an expired
+//--- ENTRY or GO through. Nothing runs between this function and OrderSend.
 string FinalGate(const Cmd &c, const string id, const long goUntil)
   {
-   string why = CheckDeadline(c);
-   if(why != "")                              return(why);
-   if(NowMsLate() > goUntil)                  return("go_expired");
    string gate;
    if(!NewEntriesAllowed(gate, id))           return(gate);
    if(PositionsTotal() > 0)                   return("max1_position_exists");
    if(OrdersTotal() > 0)                      return("max1_pending_order_exists");
+   string why = CheckDeadline(c);             // clock only, after every read
+   if(why != "")                              return(why);
+   if(NowMsLate() > goUntil)                  return("go_expired");
    return("");
   }
 
@@ -671,38 +675,92 @@ int SelectOwn()
          g_pos.posTicket = t;
          PositionSelectByTicket(t);
         }
-      double v = PositionGetDouble(POSITION_VOLUME), po = PositionGetDouble(POSITION_PRICE_OPEN);
-      if(MathAbs(v - g_pos.volume) > 1e-9 || MathAbs(po - g_pos.fill) > 1e-9)
-         SyncFill(v, po);
       return(1);
      }
    return(0);
   }
 
-//--- the live position is the reference for volume and average fill price: a later deal of the same order (filled in parts)
-//--- raises the volume and moves POSITION_PRICE_OPEN; a partial close lowers the volume. Recorded (POSITION_UPDATED, restored
-//--- after a restart) with the time of the last IN deal, before which no price is used for breakeven. Never tops up.
-void SyncFill(const double v, const double po)
+//--- IN / OUT statistics of the position's history (identifier): false when the history cannot be read
+bool FillStats(const long posId, double &vin, double &vout, int &nIn, long &lastIn)
   {
-   long lastIn = g_pos.lastInMsc;
-   int nIn = 0;
-   if(HistorySelectByPosition(g_pos.posId))
-      for(int i = 0; i < HistoryDealsTotal(); i++)
+   vin = 0; vout = 0; nIn = 0; lastIn = 0;
+   if(!HistorySelectByPosition(posId))
+      return(false);
+   for(int i = 0; i < HistoryDealsTotal(); i++)
+     {
+      ulong d = HistoryDealGetTicket(i);
+      long e = HistoryDealGetInteger(d, DEAL_ENTRY);
+      if(e == DEAL_ENTRY_IN)
         {
-         ulong d = HistoryDealGetTicket(i);
-         if(HistoryDealGetInteger(d, DEAL_ENTRY) == DEAL_ENTRY_IN)
-           {
-            nIn++;
-            lastIn = MaxL(lastIn, HistoryDealGetInteger(d, DEAL_TIME_MSC));
-           }
+         vin += HistoryDealGetDouble(d, DEAL_VOLUME);
+         nIn++;
+         lastIn = MaxL(lastIn, HistoryDealGetInteger(d, DEAL_TIME_MSC));
         }
-   string cause = v > g_pos.volume + 1e-9 ? "add" : v < g_pos.volume - 1e-9 ? "reduce" : "price";
+      else if(e == DEAL_ENTRY_OUT || e == DEAL_ENTRY_OUT_BY)
+         vout += HistoryDealGetDouble(d, DEAL_VOLUME);
+     }
+   return(true);
+  }
+
+//--- the fill state (volume, average fill = POSITION_PRICE_OPEN, number / time of the IN deals) must be explained by the history:
+//--- IN volume - OUT volume = the live volume. Until it is (the deal reaches the history after the position changed, or the history
+//--- cannot be read) the state is NOT taken as synced: FILL_HISTORY_PENDING, and breakeven / fill-side checks wait. A new IN deal
+//--- (fill in parts) moves the basis of the breakeven (VoidBreakevenBasis). Needs the own position selected. Never tops up.
+bool RefreshFill()
+  {
+   double v = PositionGetDouble(POSITION_VOLUME), po = PositionGetDouble(POSITION_PRICE_OPEN);
+   double vin, vout;
+   int nIn;
+   long lastIn;
+   bool ok = FillStats(g_pos.posId, vin, vout, nIn, lastIn) && nIn > 0 && MathAbs(vin - vout - v) <= 1e-6;
+   PositionSelectByTicket(g_pos.posTicket);
+   if(!ok)
+     {
+      if(!g_pos.fillSyncPending)
+        {
+         g_pos.fillSyncPending = true;
+         Journal(g_pos.key, "FILL_HISTORY_PENDING", "live_volume=" + DoubleToString(v, 2) + ";hist_in=" + DoubleToString(vin, 2) +
+                 ";hist_out=" + DoubleToString(vout, 2) + ";in_deals=" + IntegerToString(nIn) + ";note=breakeven_and_fill_checks_wait");
+        }
+      return(false);
+     }
+   lastIn = MaxL(lastIn, g_pos.fillTimeMsc);
+   bool newIn = nIn != g_pos.inDeals || lastIn != g_pos.lastInMsc;
+   bool changed = newIn || MathAbs(v - g_pos.volume) > 1e-9 || MathAbs(po - g_pos.fill) > 1e-9 || g_pos.fillSyncPending;
+   bool wasPending = g_pos.fillSyncPending;
+   g_pos.fillSyncPending = false;
+   if(!changed)
+      return(true);
+   string cause = v > g_pos.volume + 1e-9 ? "add" : v < g_pos.volume - 1e-9 ? "reduce" : newIn || wasPending ? "history" : "price";
    g_pos.volume = v;
    g_pos.fill = po;
+   g_pos.inDeals = nIn;
    g_pos.lastInMsc = lastIn;
    Journal(g_pos.key, "POSITION_UPDATED", "cause=" + cause + ";volume=" + DoubleToString(v, 2) + ";fill_price=" + DoubleToString(po, 5) +
            ";last_in_msc=" + IntegerToString(lastIn) + ";in_deals=" + IntegerToString(nIn) + ";position_id=" + IntegerToString(g_pos.posId));
-   PositionSelectByTicket(g_pos.posTicket);
+   if(newIn && !g_pos.beDone)
+      VoidBreakevenBasis();
+   return(true);
+  }
+
+//--- PROPOSAL (APPROVED_FILLBAR_METHOD / APPROVED_BE_PRICE_SOURCE, not approved): only prices after the LAST IN deal count. After
+//--- a new IN deal a breakeven condition met before it is void (BE_TRIGGER_VOID), and the fill-bar ticks / closed bars after it are
+//--- evaluated again against the new average. An SL already set is never loosened (a done breakeven is kept).
+void VoidBreakevenBasis()
+  {
+   if(g_pos.bePending)
+     {
+      Journal(g_pos.key, "BE_TRIGGER_VOID", "reason=later_in_deal;fav=" + DoubleToString(g_pos.beFav, 5) + ";bar_open=" +
+              IntegerToString((long)g_pos.beBar) + ";last_in_msc=" + IntegerToString(g_pos.lastInMsc) + ";fill=" + DoubleToString(g_pos.fill, 5));
+      g_pos.bePending = false;
+      g_pos.beFav = 0;
+      g_pos.beBar = 0;
+     }
+   datetime fillBarOpen = BarOpenOf(g_pos.fillTimeSrv);
+   datetime lastInBar = BarOpenOf((datetime)(g_pos.lastInMsc / 1000));
+   g_pos.fillBarDone = false;
+   g_pos.fillBarUnavailNoted = false;
+   g_pos.lastBarDone = lastInBar > fillBarOpen ? lastInBar : fillBarOpen;
   }
 
 //--- an own record that does not match the live position: not managed, nothing written to it, new entries stop
@@ -780,14 +838,25 @@ void AdoptOwn(const string key, const long posId, const ulong ticket, const ulon
    g_pos.sl0 = sl0; g_pos.tp0 = tp0;
    g_pos.fillTimeSrv = (datetime)PositionGetInteger(POSITION_TIME);
    g_pos.fillTimeMsc = PositionGetInteger(POSITION_TIME_MSC);
-   g_pos.lastInMsc = g_pos.fillTimeMsc;
-   g_pos.lastBarDone = BarOpenOf(g_pos.fillTimeSrv);
+   // the position may already hold several IN deals (fill in parts before the adoption): the last IN deal comes from the history
+   double vin, vout;
+   int nIn;
+   long lastIn;
+   bool ok = FillStats(posId, vin, vout, nIn, lastIn) && nIn > 0 && MathAbs(vin - vout - g_pos.volume) <= 1e-6;
+   PositionSelectByTicket(ticket);
+   g_pos.inDeals = ok ? nIn : 0;
+   g_pos.lastInMsc = ok ? MaxL(lastIn, g_pos.fillTimeMsc) : g_pos.fillTimeMsc;
+   g_pos.fillSyncPending = !ok;
+   datetime fillBarOpen = BarOpenOf(g_pos.fillTimeSrv), lastInBar = BarOpenOf((datetime)(g_pos.lastInMsc / 1000));
+   g_pos.lastBarDone = lastInBar > fillBarOpen ? lastInBar : fillBarOpen;
    g_hasPos = true;
    Journal(key, "FILLED", "order=" + IntegerToString((long)orderTicket) + ";deal=" + IntegerToString((long)dealTicket) +
            ";position_id=" + IntegerToString(posId) + ";position=" + IntegerToString((long)ticket) +
            ";fill_price=" + DoubleToString(g_pos.fill, 5) + ";volume=" + DoubleToString(g_pos.volume, 2) +
            ";sl0=" + DoubleToString(sl0, 5) + ";tp0=" + DoubleToString(tp0, 5) +
-           ";fill_time=" + IntegerToString((long)g_pos.fillTimeSrv) + ";fill_time_msc=" + IntegerToString(g_pos.fillTimeMsc) + ";via=" + via);
+           ";fill_time=" + IntegerToString((long)g_pos.fillTimeSrv) + ";fill_time_msc=" + IntegerToString(g_pos.fillTimeMsc) +
+           ";in_deals=" + IntegerToString(g_pos.inDeals) + ";last_in_msc=" + IntegerToString(g_pos.lastInMsc) +
+           ";fill_sync=" + (ok ? "ok" : "pending") + ";via=" + via);
   }
 
 //--- confirm a fill from the deal -> DEAL_POSITION_ID (= POSITION_IDENTIFIER) -> the live position, never from OrderSend's bool
@@ -1131,6 +1200,7 @@ void ManageOwn()
       CheckClosedFromHistory();
       return;
      }
+   bool fillOk = RefreshFill();                      // every timer: a deal that reaches the history late is still taken in
    if(!TradeWritesAllowed())
      {
       // DRY_RUN / environment lost: no SL-TP change of any kind (the SL already on the position stays)
@@ -1150,6 +1220,8 @@ void ManageOwn()
       ProcessCloseObligation();                      // a required close comes before any TP / breakeven change
       return;
      }
+   if(!fillOk || SelectOwn() != 1)
+      return;                                        // fill state not explained by the history yet: no fill-side / breakeven decision
    double tick = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
    double slNow = PositionGetDouble(POSITION_SL);
    if(!(slNow > 0 && slNow <= g_pos.sl0 + tick * 0.5 + 1e-9))
@@ -1242,7 +1314,8 @@ void TryBreakeven(double favLow, datetime barOpen)
       g_pos.beBar = barOpen;
       int digits = (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS);
       Journal(g_pos.key, "BE_TRIGGERED", "fav=" + DoubleToString(favLow, digits) + ";bar_open=" + IntegerToString((long)barOpen) +
-              ";fill=" + DoubleToString(g_pos.fill, digits) + ";dist=" + DoubleToString(g_pos.fill - favLow, digits));
+              ";fill=" + DoubleToString(g_pos.fill, digits) + ";dist=" + DoubleToString(g_pos.fill - favLow, digits) +
+              ";last_in_msc=" + IntegerToString(g_pos.lastInMsc) + ";in_deals=" + IntegerToString(g_pos.inDeals));
       ApplyBreakeven();
      }
   }
@@ -1411,7 +1484,8 @@ void Reconcile()
    long   posId = 0, fillMsc = 0, fillTime = 0;
    ulong  posTicket = 0;
    double sl0 = 0, tp0 = 0, fill = 0, vol = 0, beFav = 0;
-   long   lastIn = 0, beBar = 0;
+   long   lastIn = 0, beBar = 0, beBasis = 0;
+   int    inDeals = 0;
    string closeReq = "";
    bool   closed = false, quarantined = false, bindSeen = false, beSet = false, beTrig = false;
    string l[];
@@ -1453,7 +1527,8 @@ void Reconcile()
          posId = StringToInteger(KvGet(kv, "position_id")); posTicket = (ulong)StringToInteger(KvGet(kv, "position"));
          sl0 = StringToDouble(KvGet(kv, "sl0")); tp0 = StringToDouble(KvGet(kv, "tp0")); fill = StringToDouble(KvGet(kv, "fill_price"));
          fillTime = StringToInteger(KvGet(kv, "fill_time")); fillMsc = StringToInteger(KvGet(kv, "fill_time_msc"));
-         vol = StringToDouble(KvGet(kv, "volume")); lastIn = fillMsc;
+         vol = StringToDouble(KvGet(kv, "volume"));
+         lastIn = MaxL(fillMsc, StringToInteger(KvGet(kv, "last_in_msc"))); inDeals = (int)StringToInteger(KvGet(kv, "in_deals"));
          closeReq = ""; beSet = false; beTrig = false;
         }
       if(key != posKey || posKey == "")
@@ -1461,10 +1536,15 @@ void Reconcile()
       if(st == "POSITION_UPDATED")
         {
          fill = StringToDouble(KvGet(kv, "fill_price")); vol = StringToDouble(KvGet(kv, "volume"));
-         lastIn = MaxL(lastIn, StringToInteger(KvGet(kv, "last_in_msc")));
+         lastIn = MaxL(lastIn, StringToInteger(KvGet(kv, "last_in_msc"))); inDeals = (int)StringToInteger(KvGet(kv, "in_deals"));
         }
       if(st == "CLOSE_REQUIRED") closeReq = KvGet(kv, "reason");
-      if(st == "BE_TRIGGERED") { beTrig = true; beFav = StringToDouble(KvGet(kv, "fav")); beBar = StringToInteger(KvGet(kv, "bar_open")); }
+      if(st == "BE_TRIGGERED")
+        {
+         beTrig = true; beFav = StringToDouble(KvGet(kv, "fav")); beBar = StringToInteger(KvGet(kv, "bar_open"));
+         beBasis = StringToInteger(KvGet(kv, "last_in_msc"));
+        }
+      if(st == "BE_TRIGGER_VOID") beTrig = false;
       if(st == "BE_SET") beSet = true;
       if(st == "CLOSED") closed = true;
       if(st == "QUARANTINE") quarantined = true;
@@ -1497,16 +1577,21 @@ void Reconcile()
       ResetPos();
       g_pos.key = posKey; g_pos.posId = posId; g_pos.posTicket = posTicket; g_pos.sl0 = sl0; g_pos.tp0 = tp0; g_pos.fill = fill;
       g_pos.volume = vol; g_pos.fillTimeSrv = (datetime)fillTime; g_pos.fillTimeMsc = fillMsc; g_pos.lastInMsc = lastIn;
-      g_pos.lastBarDone = BarOpenOf(g_pos.fillTimeSrv);
+      g_pos.inDeals = inDeals;
+      datetime fbo = BarOpenOf(g_pos.fillTimeSrv), lib = BarOpenOf((datetime)(lastIn / 1000));
+      g_pos.lastBarDone = lib > fbo ? lib : fbo;
+      if(beTrig && beBasis != lastIn)
+         beTrig = false;                             // a condition met on another basis (before a later IN deal) is not restored
       g_pos.closeReason = closeReq;                  // a required close survives the restart
       g_pos.beDone = beSet;
       g_pos.bePending = beTrig && !beSet;            // a met breakeven condition survives the restart (no re-reading needed)
       g_pos.beFav = beFav; g_pos.beBar = (datetime)beBar;
       g_pos.fillBarDone = beTrig || beSet;
       g_hasPos = true;
-      int sel = SelectOwn();                         // also records a volume / average change that happened while off
+      int sel = SelectOwn();
       if(sel == 1)
         {
+         RefreshFill();                              // a deal / volume change that happened while the EA was off
          double tick = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
          g_pos.tpSet = PositionGetDouble(POSITION_TP) > 0;
          g_pos.beDone = g_pos.beDone || MathAbs(PositionGetDouble(POSITION_SL) - g_pos.fill) <= tick * 0.5 + 1e-9;

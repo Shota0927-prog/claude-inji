@@ -221,7 +221,8 @@ class Pos:
         self.key = ""
         self.posId = self.posTicket = self.orderTicket = self.dealTicket = 0
         self.fill = self.sl0 = self.tp0 = self.volume = 0.0
-        self.fillTimeSrv = self.fillTimeMsc = self.lastInMsc = 0
+        self.fillTimeSrv = self.fillTimeMsc = self.lastInMsc = self.inDeals = 0
+        self.fillSyncPending = False
         self.tpSet = self.beDone = self.bePending = self.fillBarDone = self.fillBarUnavailNoted = False
         self.beFav, self.beBar, self.lastBeTry = 0.0, 0, 0
         self.lastBarDone = self.lastTpTry = self.lastCloseTry = 0
@@ -585,18 +586,18 @@ class EA:
         return (why, None) if why else ("", out)
 
     def final_gate(self, c, id_, go_until):
-        why = self.check_deadline(c)
-        if why:
-            return why
-        if self.now_ms_late() > go_until:
-            return "go_expired"
-        gate = self.new_entries_allowed(id_)
+        gate = self.new_entries_allowed(id_)              # every read (files, terminal lists) first
         if gate:
             return gate
         if self.t.positions:
             return "max1_position_exists"
         if self.t.orders:
             return "max1_pending_order_exists"
+        why = self.check_deadline(c)                      # clock only, after every read
+        if why:
+            return why
+        if self.now_ms_late() > go_until:
+            return "go_expired"
         return ""
 
     # -- ownership ------------------------------------------------------------------------------------------------
@@ -611,20 +612,57 @@ class EA:
             if tk != self.pos.posTicket:
                 self.journal(self.pos.key, "TICKET_CHANGED", f"position_id={self.pos.posId};old={self.pos.posTicket};new={tk}")
                 self.pos.posTicket = tk
-            if abs(p["volume"] - self.pos.volume) > 1e-9 or abs(p["price_open"] - self.pos.fill) > 1e-9:
-                self.sync_fill(p["volume"], p["price_open"])
             return 1
         return 0
 
-    def sync_fill(self, v, po):
-        """the live position is the reference for volume / average fill (fill in parts: later IN deals; partial close)."""
+    def fill_stats(self, ident):
+        vin = vout = 0.0
+        n_in = last_in = 0
+        for _, x in self.t.history_by_position(ident):
+            if x["entry"] == "IN":
+                vin, n_in, last_in = vin + x["volume"], n_in + 1, max(last_in, x["time_msc"])
+            elif x["entry"] == "OUT":
+                vout += x["volume"]
+        return vin, vout, n_in, last_in
+
+    def refresh_fill(self):
+        """the fill state must be explained by the history (IN - OUT = live volume); otherwise FILL_HISTORY_PENDING and wait."""
         P = self.pos
-        ins = [x for _, x in self.t.history_by_position(P.posId) if x["entry"] == "IN"]
-        last_in = max([P.lastInMsc] + [x["time_msc"] for x in ins])
-        cause = "add" if v > P.volume + 1e-9 else "reduce" if v < P.volume - 1e-9 else "price"
-        P.volume, P.fill, P.lastInMsc = v, po, last_in
+        p = self.own()
+        v, po = p["volume"], p["price_open"]
+        vin, vout, n_in, last_in = self.fill_stats(P.posId)
+        if not (n_in > 0 and abs(vin - vout - v) <= 1e-6):
+            if not P.fillSyncPending:
+                P.fillSyncPending = True
+                self.journal(P.key, "FILL_HISTORY_PENDING", f"live_volume={v:.2f};hist_in={vin:.2f};hist_out={vout:.2f};in_deals={n_in};"
+                                                            "note=breakeven_and_fill_checks_wait")
+            return False
+        last_in = max(last_in, P.fillTimeMsc)
+        new_in = n_in != P.inDeals or last_in != P.lastInMsc
+        was_pending = P.fillSyncPending
+        changed = new_in or abs(v - P.volume) > 1e-9 or abs(po - P.fill) > 1e-9 or was_pending
+        P.fillSyncPending = False
+        if not changed:
+            return True
+        cause = "add" if v > P.volume + 1e-9 else "reduce" if v < P.volume - 1e-9 else "history" if (new_in or was_pending) else "price"
+        P.volume, P.fill, P.inDeals, P.lastInMsc = v, po, n_in, last_in
         self.journal(P.key, "POSITION_UPDATED", f"cause={cause};volume={v:.2f};fill_price={po:.5f};last_in_msc={last_in};"
-                                                f"in_deals={len(ins)};position_id={P.posId}")
+                                                f"in_deals={n_in};position_id={P.posId}")
+        if new_in and not P.beDone:
+            self.void_breakeven_basis()
+        return True
+
+    def void_breakeven_basis(self):
+        P = self.pos
+        if P.bePending:
+            self.journal(P.key, "BE_TRIGGER_VOID", f"reason=later_in_deal;fav={P.beFav:.5f};bar_open={P.beBar};last_in_msc={P.lastInMsc};"
+                                                   f"fill={P.fill:.5f}")
+            P.bePending, P.beFav, P.beBar = False, 0.0, 0
+        fbo = P.fillTimeSrv - P.fillTimeSrv % BAR_SEC
+        li = P.lastInMsc // 1000
+        lib = li - li % BAR_SEC
+        P.fillBarDone = P.fillBarUnavailNoted = False
+        P.lastBarDone = max(lib, fbo)
 
     def own(self):
         return self.t.positions[self.pos.posTicket]
@@ -658,11 +696,18 @@ class EA:
         P = self.pos = Pos()
         P.key, P.posId, P.posTicket, P.orderTicket, P.dealTicket = key, pos_id, ticket, order, deal
         P.fill, P.volume, P.sl0, P.tp0, P.fillTimeSrv, P.fillTimeMsc = p["price_open"], p["volume"], sl0, tp0, p["time"], p["time_msc"]
-        P.lastInMsc = P.fillTimeMsc
-        P.lastBarDone = P.fillTimeSrv - P.fillTimeSrv % BAR_SEC
+        vin, vout, n_in, last_in = self.fill_stats(pos_id)
+        ok = n_in > 0 and abs(vin - vout - P.volume) <= 1e-6
+        P.inDeals = n_in if ok else 0
+        P.lastInMsc = max(last_in, P.fillTimeMsc) if ok else P.fillTimeMsc
+        P.fillSyncPending = not ok
+        fbo = P.fillTimeSrv - P.fillTimeSrv % BAR_SEC
+        li = P.lastInMsc // 1000
+        P.lastBarDone = max(li - li % BAR_SEC, fbo)
         self.hasPos = True
         self.journal(key, "FILLED", f"order={order};deal={deal};position_id={pos_id};position={ticket};fill_price={P.fill:.5f};"
-                                    f"volume={P.volume:.2f};sl0={sl0:.5f};tp0={tp0:.5f};fill_time={P.fillTimeSrv};fill_time_msc={P.fillTimeMsc};via={via}")
+                                    f"volume={P.volume:.2f};sl0={sl0:.5f};tp0={tp0:.5f};fill_time={P.fillTimeSrv};fill_time_msc={P.fillTimeMsc};"
+                                    f"in_deals={P.inDeals};last_in_msc={P.lastInMsc};fill_sync={'ok' if ok else 'pending'};via={via}")
 
     def confirm_fill(self, key, order, deal, sl0, tp0):
         pos_id = self.t.deals[deal]["position"] if deal and deal in self.t.deals else 0
@@ -875,6 +920,7 @@ class EA:
         if own == 0:
             self.check_closed_from_history()
             return
+        fill_ok = self.refresh_fill()
         if not self.trade_writes_allowed():
             if not self.mgmtNoted:
                 self.mgmtNoted = True
@@ -886,6 +932,8 @@ class EA:
             return
         if self.pos.closeReason:
             self.process_close_obligation()
+            return
+        if not fill_ok or self.select_own() != 1:
             return
         P, t = self.pos, self.t
         sl_now = self.own()["sl"]
@@ -949,7 +997,7 @@ class EA:
             P.bePending, P.beFav, P.beBar = True, fav_low, bar_open
             digits = self.t.sym["digits"]
             self.journal(P.key, "BE_TRIGGERED", f"fav={fav_low:.{digits}f};bar_open={bar_open};fill={P.fill:.{digits}f};"
-                                                f"dist={P.fill - fav_low:.{digits}f}")
+                                                f"dist={P.fill - fav_low:.{digits}f};last_in_msc={P.lastInMsc};in_deals={P.inDeals}")
             self.apply_breakeven()
 
     def apply_breakeven(self):
@@ -1037,7 +1085,7 @@ class EA:
         pre_ms, pre_sl, pre_tp = 0, 0.0, 0.0
         pos_id = fill_msc = fill_time = pos_ticket = 0
         sl0 = tp0 = fill = vol = be_fav = 0.0
-        last_in = be_bar = 0
+        last_in = be_bar = be_basis = in_deals = 0
         close_req = ""
         closed = quarantined = bind_seen = be_set = be_trig = False
         a = self.t.account
@@ -1075,17 +1123,21 @@ class EA:
                 pos_id, pos_ticket = to_int(kv_get(kv, "position_id")), to_int(kv_get(kv, "position"))
                 sl0, tp0, fill = to_float(kv_get(kv, "sl0")), to_float(kv_get(kv, "tp0")), to_float(kv_get(kv, "fill_price"))
                 fill_time, fill_msc = to_int(kv_get(kv, "fill_time")), to_int(kv_get(kv, "fill_time_msc"))
-                vol, last_in = to_float(kv_get(kv, "volume")), fill_msc
+                vol = to_float(kv_get(kv, "volume"))
+                last_in, in_deals = max(fill_msc, to_int(kv_get(kv, "last_in_msc"))), to_int(kv_get(kv, "in_deals"))
                 close_req, be_set, be_trig = "", False, False
             if not pos_key or key != pos_key:
                 continue
             if st == "POSITION_UPDATED":
                 fill, vol = to_float(kv_get(kv, "fill_price")), to_float(kv_get(kv, "volume"))
-                last_in = max(last_in, to_int(kv_get(kv, "last_in_msc")))
+                last_in, in_deals = max(last_in, to_int(kv_get(kv, "last_in_msc"))), to_int(kv_get(kv, "in_deals"))
             if st == "CLOSE_REQUIRED":
                 close_req = kv_get(kv, "reason")
             if st == "BE_TRIGGERED":
                 be_trig, be_fav, be_bar = True, to_float(kv_get(kv, "fav")), to_int(kv_get(kv, "bar_open"))
+                be_basis = to_int(kv_get(kv, "last_in_msc"))
+            if st == "BE_TRIGGER_VOID":
+                be_trig = False
             if st == "BE_SET":
                 be_set = True
             if st == "CLOSED":
@@ -1109,14 +1161,18 @@ class EA:
         if pos_key and not closed and not quarantined and pos_id > 0:
             P = self.pos = Pos()
             P.key, P.posId, P.posTicket, P.sl0, P.tp0, P.fill = pos_key, pos_id, pos_ticket, sl0, tp0, fill
-            P.volume, P.fillTimeSrv, P.fillTimeMsc, P.lastInMsc = vol, fill_time, fill_msc, last_in
-            P.lastBarDone = fill_time - fill_time % BAR_SEC
+            P.volume, P.fillTimeSrv, P.fillTimeMsc, P.lastInMsc, P.inDeals = vol, fill_time, fill_msc, last_in, in_deals
+            li = last_in // 1000
+            P.lastBarDone = max(li - li % BAR_SEC, fill_time - fill_time % BAR_SEC)
+            if be_trig and be_basis != last_in:
+                be_trig = False
             P.closeReason = close_req
             P.beDone, P.bePending, P.beFav, P.beBar = be_set, be_trig and not be_set, be_fav, be_bar
             P.fillBarDone = be_trig or be_set
             self.hasPos = True
             sel = self.select_own()
             if sel == 1:
+                self.refresh_fill()
                 p = self.own()
                 P.tpSet = p["tp"] > 0
                 P.beDone = P.beDone or abs(p["sl"] - P.fill) <= self.t.sym["tick"] * 0.5 + 1e-9
