@@ -25,7 +25,8 @@ LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src
              "tests/xab_sim.py",                                                             # new in the later layer XA-22 (provisional once per candidate)
              "tests/xac_sim.py",                                                             # new in the later layer XA-23 (Gold confirmed labels)
              "tests/btl_build.py", "tests/btl_sim.py",                                       # new in the later layer BTL-1 (BTCUSD Long defaults)
-             "tests/au_build.py", "tests/au_sim.py", "tests/aur_sim.py")                     # new in the later layer AU-1 (Gold Short automation)
+             "tests/au_build.py", "tests/au_sim.py", "tests/aur_sim.py",                     # new in the later layer AU-1 (Gold Short automation)
+             "tests/ea_model.py", "tests/eab_sim.py", "tests/eam_sim.py")                    # new in the later layer ST3-1 (Gold Short demo EA)
 NEW_FILES = ("tests/cad_build.py", "tests/cad_adapt.py", "tests/cad_sim.py") + LATER_NEW
 _rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 

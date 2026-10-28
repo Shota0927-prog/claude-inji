@@ -271,17 +271,21 @@ NEW_FILES = ("tests/au_build.py", "tests/au_sim.py", "tests/aur_sim.py", AUTO_PA
              "automation/xau_short/receiver/samples/bad_cases.jsonl", "automation/xau_short/receiver/samples/make_samples.py",
              "automation/xau_short/receiver/samples/normal_flow.jsonl", "automation/xau_short/receiver/show_log.ps1",
              "automation/xau_short/receiver/start_receiver.ps1", "automation/xau_short/receiver/stop_receiver.ps1",
-             "automation/xau_short/receiver/test_samples.ps1", "automation/xau_short/receiver/xau_receiver.py")
+             "automation/xau_short/receiver/test_samples.ps1", "automation/xau_short/receiver/xau_receiver.py",
+             # stage 3 (demo EA): bridge, EA, design note and their fixtures
+             "automation/xau_short/STAGE3_ja.md", "automation/xau_short/bridge/.gitignore", "automation/xau_short/bridge/ea_bridge.py",
+             "automation/xau_short/bridge/bridge_config.example.json", "automation/xau_short/bridge/make_test_entry.py",
+             "automation/xau_short/ea/XauShortDemoEA.mq5", "tests/ea_model.py", "tests/eab_sim.py", "tests/eam_sim.py")
 
 
 def ok(path):
-    """AU accounts for this path exactly: one of its new files, or the untracked directory entry 'automation/' while every file in
-    it is one of them (git status lists a new directory as one entry before it is committed)."""
+    """AU accounts for this path exactly: one of its new files, or an untracked directory entry 'automation/' or 'automation/.../'
+    while every file in it is one of them (git status lists a new directory as one entry before it is committed)."""
     if path in NEW_FILES:
         return True
-    if path == "automation/":
+    if path == "automation/" or (path.startswith("automation/") and path.endswith("/")):
         found = []
-        for d, dirs, files in os.walk(os.path.join(ROOT, "automation")):
+        for d, dirs, files in os.walk(os.path.join(ROOT, path.rstrip("/"))):
             dirs[:] = [x for x in dirs if x not in ("__pycache__", "data")]
             found += [os.path.relpath(os.path.join(d, f), ROOT).replace(os.sep, "/") for f in files]
         return bool(found) and all(f in NEW_FILES for f in found)
