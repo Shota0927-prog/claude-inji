@@ -63,11 +63,13 @@ EA_STATE_TIME = {"SEEN": "ea_seen_ms", "DECIDED": "ea_decided_ms", "SKIPPED": "e
                  "FILLED": "ea_filled_ms", "PROTECTED": "ea_protected_ms", "SL_MISSING": "ea_protected_ms",
                  "EMERGENCY_CLOSE": "ea_protected_ms", "EMERGENCY_CLOSE_PARTIAL": "ea_protected_ms",
                  "TP_SET": "ea_managed_ms", "BE_SET": "ea_managed_ms", "MODIFY_FAILED": "ea_managed_ms", "OWNED_AT_STARTUP": "ea_managed_ms",
+                 "POSITION_UPDATED": "ea_managed_ms", "BE_TRIGGERED": "ea_managed_ms", "CLOSE_REQUIRED": "ea_managed_ms",
                  "CLOSED": "ea_closed_ms", "UNKNOWN": "ea_unknown_ms", "UNKNOWN_RESOLVED": "ea_unknown_ms", "QUARANTINE": "ea_unknown_ms",
                  "OWN_POSITION_MISSING": "ea_unknown_ms", "CRITICAL": "ea_unknown_ms"}
 # informational EA lines (DUPLICATE, TX_DEAL, PARTIAL_FILL, CLOSE_*, MODIFY_REFUSED, MANAGEMENT_BLOCKED, UNKNOWN_CHECK, TICKET_CHANGED ...)
 # are kept in ea_reports only and do not overwrite the lifecycle state. mt5_open is set by FILLED / OWNED_AT_STARTUP and cleared ONLY by
-# CLOSED (the EA writes CLOSED after the position's history covers its volume; an emergency close request is not a close).
+# CLOSED (the EA writes CLOSED after the position's history covers its volume; a close request / confirmation is not a close).
+# POSITION_UPDATED carries the live volume / average fill price when the order filled in parts (or a part was closed).
 
 
 def now_ms():

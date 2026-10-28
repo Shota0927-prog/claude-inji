@@ -15,8 +15,8 @@
 //| NOT compiled / NOT run by the author: see STAGE3_ja.md.            |
 //+------------------------------------------------------------------+
 #property copyright "shota0927-prog"
-#property version   "0.31"
-#property description "XAU Short demo EA (stage 3, ST3-2). DRY_RUN by default. Demo accounts only."
+#property version   "0.32"
+#property description "XAU Short demo EA (stage 3, ST3-3). DRY_RUN by default. Demo accounts only."
 
 //--- approved rules (constants on purpose: not changeable from the inputs)
 const double RISK_FRACTION = 0.03;   // loss budget = balance right before the decision x 3 %
@@ -39,7 +39,7 @@ const bool   APPROVED_MONITORING      = false;  // ASK_WAIT_MS / bridge GO valid
 //--- proposal values (used as they are only after the approvals above)
 const int    ASK_WAIT_MS            = 5000;     // how long the EA waits for the bridge's final go / no-go
 const int    BRIDGE_HB_MAX_MS       = 5000;     // bridge heartbeat older than this -> no new entry
-const int    EMERGENCY_RETRY_SEC    = 5;        // unprotected own position: next close attempt after this many seconds
+const int    EMERGENCY_RETRY_SEC    = 5;        // a required close (emergency / fill side) not completed: next attempt after this many seconds
 const int    CLOSE_DEVIATION_POINTS = 1000;     // allowed deviation of a market close
 
 #define CLOSE_NOT_ALLOWED 0
@@ -77,19 +77,25 @@ struct OwnedPos
    ulong    posTicket;     // current POSITION_TICKET (refreshed by SelectOwn; may differ from posId)
    ulong    orderTicket;
    ulong    dealTicket;
-   double   fill;          // actual XS fill price (position open price)
+   double   fill;          // actual XS fill price = live POSITION_PRICE_OPEN (average when the order filled in parts)
    double   sl0;           // initial SL sent with the order
    double   tp0;           // TP0 of the ENTRY (SATS: fixed at the wait prep)
-   double   volume;
-   datetime fillTimeSrv;   // fill time (server time)
-   long     fillTimeMsc;   // fill time (server time, ms)
+   double   volume;        // live POSITION_VOLUME (kept in step by SyncFill)
+   datetime fillTimeSrv;   // first fill time (server time): the fill bar
+   long     fillTimeMsc;   // first fill time (server time, ms)
+   long     lastInMsc;     // time of the last IN deal of the position (server ms): no price before it is used for breakeven
    bool     tpSet;
    bool     beDone;
-   bool     bePending;     // breakeven triggered, the SL change has not succeeded yet (retried once per closed bar)
-   bool     fillBarDone;   // the fill bar was evaluated for breakeven
+   bool     bePending;     // breakeven condition met (BE_TRIGGERED, persisted), the SL change has not succeeded yet
+   double   beFav;         // the favourable price that met the condition
+   datetime beBar;         // open time of the bar that met it
+   datetime lastBeTry;     // server time of the last breakeven attempt (retried once per M5 bar)
+   bool     fillBarDone;   // the fill bar was evaluated for breakeven (tick history read, or not needed)
+   bool     fillBarUnavailNoted;
    datetime lastBarDone;   // open time of the last M5 bar evaluated for breakeven
    datetime lastTpTry;     // server time of the last TP0 attempt
-   long     lastEmergencyTry;
+   string   closeReason;   // a close is required (CLOSE_REQUIRED, persisted) until the history shows the position closed
+   long     lastCloseTry;  // GMT seconds of the last close attempt
    bool     protectedNoted;
    bool     slMissingNoted;
    bool     missingNoted;
@@ -101,9 +107,10 @@ OwnedPos g_pos;
 void ResetPos()
   {
    g_pos.key = ""; g_pos.posId = 0; g_pos.posTicket = 0; g_pos.orderTicket = 0; g_pos.dealTicket = 0;
-   g_pos.fill = 0; g_pos.sl0 = 0; g_pos.tp0 = 0; g_pos.volume = 0; g_pos.fillTimeSrv = 0; g_pos.fillTimeMsc = 0;
-   g_pos.tpSet = false; g_pos.beDone = false; g_pos.bePending = false; g_pos.fillBarDone = false;
-   g_pos.lastBarDone = 0; g_pos.lastTpTry = 0; g_pos.lastEmergencyTry = 0;
+   g_pos.fill = 0; g_pos.sl0 = 0; g_pos.tp0 = 0; g_pos.volume = 0; g_pos.fillTimeSrv = 0; g_pos.fillTimeMsc = 0; g_pos.lastInMsc = 0;
+   g_pos.tpSet = false; g_pos.beDone = false; g_pos.bePending = false; g_pos.beFav = 0; g_pos.beBar = 0; g_pos.lastBeTry = 0;
+   g_pos.fillBarDone = false; g_pos.fillBarUnavailNoted = false;
+   g_pos.lastBarDone = 0; g_pos.lastTpTry = 0; g_pos.closeReason = ""; g_pos.lastCloseTry = 0;
    g_pos.protectedNoted = false; g_pos.slMissingNoted = false; g_pos.missingNoted = false;
   }
 bool     g_hasPos       = false;
@@ -133,6 +140,10 @@ bool     g_mgmtNoted    = false;   // management blocked (DRY_RUN / environment)
 //--- EARLIEST possible now (a future bar is never "in time")
 long NowMs() { return (long)TimeGMT() * 1000; }
 long NowMsLate() { return (long)TimeGMT() * 1000 + 999; }
+
+//--- integer max / min (MathMax / MathMin work on double)
+long MaxL(const long a, const long b) { return(a > b ? a : b); }
+long MinL(const long a, const long b) { return(a < b ? a : b); }
 
 //--- open time of the M5 bar that contains t (integer arithmetic, no operator on datetime)
 datetime BarOpenOf(const datetime t) { return((datetime)((long)t - (long)t % BAR_SEC)); }
@@ -597,7 +608,7 @@ string AskBridge(const Cmd &c, const bool dry, long &goUntil)
          if(KvGet(l, "decision") != "GO")
             return("nogo:" + KvGet(l, "reason"));
          long until = StringToInteger(KvGet(l, "valid_until_ms"));
-         until = MathMin(until, c.barCloseMs + (long)MAX_AGE_SEC * 1000);
+         until = MinL(until, c.barCloseMs + (long)MAX_AGE_SEC * 1000);
          if(NowMsLate() > until)
             return("nogo:go_expired_on_arrival");
          goUntil = until;
@@ -608,20 +619,30 @@ string AskBridge(const Cmd &c, const bool dry, long &goUntil)
    return("nogo:no_answer");
   }
 
-//--- the checks right before OrderSend, AFTER the PRE_SEND record (the record itself may take time): deadline, GO validity,
-//--- every new-entry gate, account-wide positions / pending orders, and the request rebuilt from the current price / spread /
-//--- balance. The rebuilt request must keep the recorded volume and SL, otherwise the old request is not used.
+//--- the checks AFTER the PRE_SEND record (the record itself may take time): first the slow part — the request rebuilt from
+//--- the current price / spread / balance (PrepareOrder incl. OrderCheck), which must keep the recorded volume and SL — and
+//--- only then FinalGate, so nothing slow runs between the last check and OrderSend.
 string SendCheck(const Cmd &c, const string id, const long goUntil, const MqlTradeRequest &base, MqlTradeRequest &out)
+  {
+   string detail;
+   string why = PrepareOrder(c, out, detail);
+   if(why != "")                              return(why);
+   if(MathAbs(out.volume - base.volume) > 1e-9 || MathAbs(out.sl - base.sl) > 1e-9) return("request_changed");
+   return(FinalGate(c, id, goUntil));
+  }
+
+//--- the last checks, immediately before OrderSend (only reads of the clock, two small files and the terminal's lists):
+//--- deadline, GO validity, every new-entry gate (halt file / halt / critical / unknown / heartbeat / in-flight), account-wide
+//--- positions and pending orders. Anything that changed during the slow part above stops the send here.
+string FinalGate(const Cmd &c, const string id, const long goUntil)
   {
    string why = CheckDeadline(c);
    if(why != "")                              return(why);
    if(NowMsLate() > goUntil)                  return("go_expired");
    string gate;
    if(!NewEntriesAllowed(gate, id))           return(gate);
-   string detail;
-   why = PrepareOrder(c, out, detail);
-   if(why != "")                              return(why);
-   if(MathAbs(out.volume - base.volume) > 1e-9 || MathAbs(out.sl - base.sl) > 1e-9) return("request_changed");
+   if(PositionsTotal() > 0)                   return("max1_position_exists");
+   if(OrdersTotal() > 0)                      return("max1_pending_order_exists");
    return("");
   }
 
@@ -650,9 +671,38 @@ int SelectOwn()
          g_pos.posTicket = t;
          PositionSelectByTicket(t);
         }
+      double v = PositionGetDouble(POSITION_VOLUME), po = PositionGetDouble(POSITION_PRICE_OPEN);
+      if(MathAbs(v - g_pos.volume) > 1e-9 || MathAbs(po - g_pos.fill) > 1e-9)
+         SyncFill(v, po);
       return(1);
      }
    return(0);
+  }
+
+//--- the live position is the reference for volume and average fill price: a later deal of the same order (filled in parts)
+//--- raises the volume and moves POSITION_PRICE_OPEN; a partial close lowers the volume. Recorded (POSITION_UPDATED, restored
+//--- after a restart) with the time of the last IN deal, before which no price is used for breakeven. Never tops up.
+void SyncFill(const double v, const double po)
+  {
+   long lastIn = g_pos.lastInMsc;
+   int nIn = 0;
+   if(HistorySelectByPosition(g_pos.posId))
+      for(int i = 0; i < HistoryDealsTotal(); i++)
+        {
+         ulong d = HistoryDealGetTicket(i);
+         if(HistoryDealGetInteger(d, DEAL_ENTRY) == DEAL_ENTRY_IN)
+           {
+            nIn++;
+            lastIn = MaxL(lastIn, HistoryDealGetInteger(d, DEAL_TIME_MSC));
+           }
+        }
+   string cause = v > g_pos.volume + 1e-9 ? "add" : v < g_pos.volume - 1e-9 ? "reduce" : "price";
+   g_pos.volume = v;
+   g_pos.fill = po;
+   g_pos.lastInMsc = lastIn;
+   Journal(g_pos.key, "POSITION_UPDATED", "cause=" + cause + ";volume=" + DoubleToString(v, 2) + ";fill_price=" + DoubleToString(po, 5) +
+           ";last_in_msc=" + IntegerToString(lastIn) + ";in_deals=" + IntegerToString(nIn) + ";position_id=" + IntegerToString(g_pos.posId));
+   PositionSelectByTicket(g_pos.posTicket);
   }
 
 //--- an own record that does not match the live position: not managed, nothing written to it, new entries stop
@@ -730,6 +780,8 @@ void AdoptOwn(const string key, const long posId, const ulong ticket, const ulon
    g_pos.sl0 = sl0; g_pos.tp0 = tp0;
    g_pos.fillTimeSrv = (datetime)PositionGetInteger(POSITION_TIME);
    g_pos.fillTimeMsc = PositionGetInteger(POSITION_TIME_MSC);
+   g_pos.lastInMsc = g_pos.fillTimeMsc;
+   g_pos.lastBarDone = BarOpenOf(g_pos.fillTimeSrv);
    g_hasPos = true;
    Journal(key, "FILLED", "order=" + IntegerToString((long)orderTicket) + ";deal=" + IntegerToString((long)dealTicket) +
            ";position_id=" + IntegerToString(posId) + ";position=" + IntegerToString((long)ticket) +
@@ -881,7 +933,7 @@ void ProcessEntry(const Cmd &c, const string id)
       return;
      }
    MqlTradeRequest fin;
-   why = SendCheck(c, id, goUntil, req, fin);        // everything again AFTER the record, with the current market
+   why = SendCheck(c, id, goUntil, req, fin);        // everything again AFTER the record; FinalGate is its last step
    if(why != "")
      {
       if(Journal(id, "SEND_ABORTED", "reason=" + why))
@@ -930,9 +982,57 @@ void MarkUnknown(const string id, const double sl, const double tp, const string
    HaltNew("unknown_result:" + id);
   }
 
-//--- the own position must carry an SL that is not looser than the initial SL. Otherwise: new entries stop and the OWN
-//--- position (ownership re-checked) is closed at market; a partial / failed / unknown close is CRITICAL and is retried every
-//--- EMERGENCY_RETRY_SEC while the remainder is still ours. Checked after the fill, after a restart and on every timer.
+//--- a close of the OWN position is required (emergency: initial SL missing; bad_fill_side_mt5). Journaled once (CLOSE_REQUIRED,
+//--- restored after a restart) and worked off by ProcessCloseObligation until the position's history shows it closed.
+void RequireClose(const string reason)
+  {
+   if(g_pos.closeReason != "")
+      return;
+   g_pos.closeReason = reason;
+   Journal(g_pos.key, "CLOSE_REQUIRED", "reason=" + reason + ";position_id=" + IntegerToString(g_pos.posId));
+  }
+
+//--- one close attempt per EMERGENCY_RETRY_SEC (proposal, not approved) while the obligation exists and the position is ours.
+//--- CLOSE_FULL: confirmed (CLOSED follows from the history); partial / failed / unknown: new entries stop + CRITICAL, the
+//--- remainder stays owned and is retried. The result of every attempt is handled here, whatever the reason of the close.
+void ProcessCloseObligation()
+  {
+   if(!g_hasPos || g_pos.closeReason == "" || !TradeWritesAllowed() || SelectOwn() != 1)
+      return;
+   long nowS = (long)TimeGMT();
+   if(g_pos.lastCloseTry > 0 && nowS - g_pos.lastCloseTry < EMERGENCY_RETRY_SEC)
+      return;
+   g_pos.lastCloseTry = nowS;
+   string reason = g_pos.closeReason;
+   bool emergency = reason == "emergency_initial_sl_missing";
+   double remaining = -1;
+   int r = ClosePosition(g_pos.key, reason, remaining);
+   if(r == CLOSE_NOT_ALLOWED)
+      return;
+   if(r == CLOSE_FULL)
+     {
+      if(emergency)
+         Journal(g_pos.key, "EMERGENCY_CLOSE", "result=closed_confirmed");
+      else
+         Journal(g_pos.key, "CLOSE_CONFIRMED", "result=closed_confirmed;reason=" + reason);
+      return;
+     }
+   string kind = r == CLOSE_PARTIAL ? "partial" : r == CLOSE_FAILED ? "failed" : "unknown";
+   if(r == CLOSE_PARTIAL)
+     {
+      if(emergency)
+         Journal(g_pos.key, "EMERGENCY_CLOSE_PARTIAL", "remaining=" + DoubleToString(remaining, 2) + ";note=unprotected_remainder_retried");
+      else
+         Journal(g_pos.key, "CLOSE_INCOMPLETE", "remaining=" + DoubleToString(remaining, 2) + ";reason=" + reason + ";note=remainder_retried");
+     }
+   HaltNew("close_incomplete:" + reason);
+   string cr = emergency ? "emergency_close_" + kind : "close_" + kind + ":" + reason;
+   if(!g_critical || g_critReason != cr)
+      SetCritical(g_pos.key, cr);
+  }
+
+//--- the own position must carry an SL that is not looser than the initial SL. Otherwise: new entries stop and a close of the
+//--- OWN position is required (ProcessCloseObligation). Checked after the fill, after a restart and on every timer.
 void CheckProtection()
   {
    if(!g_hasPos || SelectOwn() != 1)
@@ -955,22 +1055,8 @@ void CheckProtection()
       g_pos.slMissingNoted = true;
       Journal(g_pos.key, "SL_MISSING", "sl_on_position=" + DoubleToString(sl, 5) + ";sl0=" + DoubleToString(g_pos.sl0, 5));
      }
-   if(!TradeWritesAllowed())
-      return;
-   long nowS = (long)TimeGMT();
-   if(g_pos.lastEmergencyTry > 0 && nowS - g_pos.lastEmergencyTry < EMERGENCY_RETRY_SEC)
-      return;
-   g_pos.lastEmergencyTry = nowS;
-   double remaining = -1;
-   int r = ClosePosition(g_pos.key, "emergency_initial_sl_missing", remaining);
-   if(r == CLOSE_FULL)
-     {
-      Journal(g_pos.key, "EMERGENCY_CLOSE", "result=closed_confirmed");
-      return;
-     }
-   if(r == CLOSE_PARTIAL)
-      Journal(g_pos.key, "EMERGENCY_CLOSE_PARTIAL", "remaining=" + DoubleToString(remaining, 2) + ";note=unprotected_remainder_retried");
-   SetCritical(g_pos.key, r == CLOSE_PARTIAL ? "emergency_close_partial" : r == CLOSE_FAILED ? "emergency_close_failed" : "emergency_close_unknown");
+   RequireClose("emergency_initial_sl_missing");
+   ProcessCloseObligation();
   }
 
 //+------------------------------------------------------------------+
@@ -1009,13 +1095,13 @@ void CheckClosedFromHistory()
      }
   }
 
-//--- lowest Bid of the tick history strictly after the fill and before the fill-bar close (server ms).
-//--- >0 = number of ticks, 0 = none, -1 = history not available yet
+//--- lowest Bid of the tick history strictly after the fill (the LAST IN deal when the order filled in parts) and before the
+//--- fill-bar close (server ms). >0 = number of ticks, 0 = none, -1 = history not available (NOT "condition not met")
 int FillBarLow(const datetime fillBarOpen, double &lo)
   {
    lo = 0;
    MqlTick ticks[];
-   ulong from = (ulong)g_pos.fillTimeMsc + 1;
+   ulong from = (ulong)MaxL(g_pos.fillTimeMsc, g_pos.lastInMsc) + 1;
    ulong to = (ulong)((long)fillBarOpen + BAR_SEC) * 1000 - 1;
    if(to < from)
       return(0);
@@ -1059,6 +1145,11 @@ void ManageOwn()
    CheckProtection();
    if(!g_hasPos || SelectOwn() != 1)
       return;
+   if(g_pos.closeReason != "")
+     {
+      ProcessCloseObligation();                      // a required close comes before any TP / breakeven change
+      return;
+     }
    double tick = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
    double slNow = PositionGetDouble(POSITION_SL);
    if(!(slNow > 0 && slNow <= g_pos.sl0 + tick * 0.5 + 1e-9))
@@ -1077,8 +1168,8 @@ void ManageOwn()
         {
          // CLOSE_REQ equivalent, re-checked with the XS fill: a fill beyond SL0 / TP0 is closed at market
          Journal(g_pos.key, "FILL_SIDE_BAD", "fill=" + DoubleToString(g_pos.fill, digits));
-         double rem;
-         ClosePosition(g_pos.key, "bad_fill_side_mt5", rem);
+         RequireClose("bad_fill_side_mt5");
+         ProcessCloseObligation();                   // the result (done / partial / failed / unknown) is handled there
          return;
         }
       if(SelectOwn() != 1)
@@ -1090,57 +1181,98 @@ void ManageOwn()
          Journal(g_pos.key, "TP_SET", "tp=" + DoubleToString(g_pos.tp0, digits) + ";sl_kept=" + DoubleToString(curSl, digits));
         }
      }
+   RetryBreakeven(now);                              // a condition already met (also before a restart) is applied first
    if(!g_pos.fillBarDone)
      {
-      // breakeven on the fill bar: only ticks strictly after the fill and before the fill-bar close (never the next bar)
-      if(!g_pos.beDone && InpFillBarBe == FILLBAR_TICKS_SINCE_FILL)
+      // breakeven on the fill bar: only ticks strictly after the (last) fill and before the fill-bar close (never the next bar)
+      if(g_pos.beDone || g_pos.bePending || InpFillBarBe != FILLBAR_TICKS_SINCE_FILL)
+         g_pos.fillBarDone = true;
+      else
         {
          double lo;
          int n = FillBarLow(fillBarOpen, lo);
-         if(n < 0 && now < fillBarOpen + 2 * BAR_SEC)
-            return;                                  // tick history not ready: retried on the next timer (within the next bar)
-         if(n > 0)
-            TryBreakeven(lo, fillBarOpen);
+         if(n < 0)
+           {
+            // history not available: NOT the same as "condition not met" -> read again on the next timers (later bars go on)
+            if(!g_pos.fillBarUnavailNoted)
+              {
+               g_pos.fillBarUnavailNoted = true;
+               Journal(g_pos.key, "FILLBAR_TICKS_UNAVAILABLE", "fill_bar_open=" + IntegerToString((long)fillBarOpen) + ";note=retried");
+              }
+           }
          else
-            Journal(g_pos.key, "FILLBAR_NO_TICKS", "n=" + IntegerToString(n));
+           {
+            if(n > 0)
+               TryBreakeven(lo, fillBarOpen);
+            else
+               Journal(g_pos.key, "FILLBAR_NO_TICKS", "n=0");
+            g_pos.fillBarDone = true;
+           }
         }
-      g_pos.fillBarDone = true;
-      g_pos.lastBarDone = fillBarOpen;
      }
-   if(g_pos.beDone)
+   if(g_pos.beDone || g_pos.bePending)
       return;
+   if(g_pos.lastBarDone < fillBarOpen)
+      g_pos.lastBarDone = fillBarOpen;
+   // closed bars after the fill bar; a bar holding a later IN deal (fill in parts) is not used (its low may precede that deal)
+   datetime lastInBar = BarOpenOf((datetime)(MaxL(g_pos.fillTimeMsc, g_pos.lastInMsc) / 1000));
    MqlRates rates[];
-   datetime from = g_pos.lastBarDone + BAR_SEC;      // closed bars after the fill bar; a pending breakeven retries on each
+   datetime from = g_pos.lastBarDone + BAR_SEC;
    int n = CopyRates(InpSymbol, PERIOD_M5, from, now, rates);
-   for(int i = 0; i < n && !g_pos.beDone; i++)
+   for(int i = 0; i < n && !g_pos.beDone && !g_pos.bePending; i++)
      {
       if(rates[i].time < from || rates[i].time + BAR_SEC > now)
          continue;                                   // only closed bars after the fill bar
-      TryBreakeven(rates[i].low, rates[i].time);
+      if(rates[i].time > lastInBar)
+         TryBreakeven(rates[i].low, rates[i].time);
       g_pos.lastBarDone = rates[i].time;
      }
   }
 
+//--- the breakeven condition (Fixed Distance from the XS fill = the live average) on a confirmed price. Once met it is final:
+//--- BE_TRIGGERED is journaled BEFORE the SL change, restored after a restart, and retried until the change succeeds.
 void TryBreakeven(double favLow, datetime barOpen)
   {
-   if(g_pos.beDone || (favLow <= 0 && !g_pos.bePending))
-      return;
-   if(g_pos.bePending || g_pos.fill - favLow >= BE_DIST - 1e-9)
+   if(g_pos.beDone || g_pos.bePending || favLow <= 0)
+      return;                                        // a pending breakeven is retried by RetryBreakeven
+   if(g_pos.fill - favLow >= BE_DIST - 1e-9)
      {
       g_pos.bePending = true;
+      g_pos.beFav = favLow;
+      g_pos.beBar = barOpen;
       int digits = (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS);
-      double newSl = NormalizeDouble(g_pos.fill, digits);   // the XS fill price (not TradingView's BE_MOVE price)
-      if(SelectOwn() != 1)                                   // fresh snapshot: the TP may have just been set
-         return;
-      double curTp = PositionGetDouble(POSITION_TP);
-      if(ModifyOwn("breakeven", newSl, curTp))
-        {
-         g_pos.beDone = true;
-         g_pos.bePending = false;
-         Journal(g_pos.key, "BE_SET", "sl=" + DoubleToString(newSl, digits) + ";bar_open=" + IntegerToString((long)barOpen) +
-                 ";fav=" + DoubleToString(favLow, digits));
-        }
+      Journal(g_pos.key, "BE_TRIGGERED", "fav=" + DoubleToString(favLow, digits) + ";bar_open=" + IntegerToString((long)barOpen) +
+              ";fill=" + DoubleToString(g_pos.fill, digits) + ";dist=" + DoubleToString(g_pos.fill - favLow, digits));
+      ApplyBreakeven();
      }
+  }
+
+//--- SL -> the XS fill (the live average; not TradingView's BE_MOVE price). ModifyOwn never loosens / removes the SL.
+void ApplyBreakeven()
+  {
+   g_pos.lastBeTry = TimeTradeServer();
+   int digits = (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS);
+   if(SelectOwn() != 1)                              // fresh snapshot: the TP may have just been set
+      return;
+   double newSl = NormalizeDouble(g_pos.fill, digits);
+   double curTp = PositionGetDouble(POSITION_TP);
+   if(ModifyOwn("breakeven", newSl, curTp))
+     {
+      g_pos.beDone = true;
+      g_pos.bePending = false;
+      Journal(g_pos.key, "BE_SET", "sl=" + DoubleToString(newSl, digits) + ";bar_open=" + IntegerToString((long)g_pos.beBar) +
+              ";fav=" + DoubleToString(g_pos.beFav, digits));
+     }
+  }
+
+//--- a met condition whose SL change failed: once per M5 bar (retry interval: proposal, not approved); right away after a restart
+void RetryBreakeven(const datetime now)
+  {
+   if(!g_pos.bePending || g_pos.beDone)
+      return;
+   if(g_pos.lastBeTry > 0 && BarOpenOf(now) <= BarOpenOf(g_pos.lastBeTry))
+      return;
+   ApplyBreakeven();
   }
 
 //+------------------------------------------------------------------+
@@ -1278,8 +1410,10 @@ void Reconcile()
    double preSl = 0, preTp = 0;
    long   posId = 0, fillMsc = 0, fillTime = 0;
    ulong  posTicket = 0;
-   double sl0 = 0, tp0 = 0, fill = 0;
-   bool   closed = false, quarantined = false, bindSeen = false;
+   double sl0 = 0, tp0 = 0, fill = 0, vol = 0, beFav = 0;
+   long   lastIn = 0, beBar = 0;
+   string closeReq = "";
+   bool   closed = false, quarantined = false, bindSeen = false, beSet = false, beTrig = false;
    string l[];
    ReadLines(g_journalPath, l);
    for(int li = 0; li < ArraySize(l); li++)
@@ -1300,7 +1434,7 @@ void Reconcile()
         }
       if(st == "HALT_NEW") { g_haltNew = true; g_haltReason = f; }
       if(st == "RESUME_NEW") { g_haltNew = false; g_haltReason = ""; }
-      if(st == "CRITICAL") { g_critical = true; g_critReason = f; }
+      if(st == "CRITICAL") { g_critical = true; g_critReason = KvGet(kv, "reason"); }
       if(st == "CRITICAL_CLEARED") { g_critical = false; g_critReason = ""; }
       if(st == "PRE_SEND")
         {
@@ -1319,9 +1453,21 @@ void Reconcile()
          posId = StringToInteger(KvGet(kv, "position_id")); posTicket = (ulong)StringToInteger(KvGet(kv, "position"));
          sl0 = StringToDouble(KvGet(kv, "sl0")); tp0 = StringToDouble(KvGet(kv, "tp0")); fill = StringToDouble(KvGet(kv, "fill_price"));
          fillTime = StringToInteger(KvGet(kv, "fill_time")); fillMsc = StringToInteger(KvGet(kv, "fill_time_msc"));
+         vol = StringToDouble(KvGet(kv, "volume")); lastIn = fillMsc;
+         closeReq = ""; beSet = false; beTrig = false;
         }
-      if(st == "CLOSED" && key == posKey) closed = true;
-      if(st == "QUARANTINE" && key == posKey) quarantined = true;
+      if(key != posKey || posKey == "")
+         continue;
+      if(st == "POSITION_UPDATED")
+        {
+         fill = StringToDouble(KvGet(kv, "fill_price")); vol = StringToDouble(KvGet(kv, "volume"));
+         lastIn = MaxL(lastIn, StringToInteger(KvGet(kv, "last_in_msc")));
+        }
+      if(st == "CLOSE_REQUIRED") closeReq = KvGet(kv, "reason");
+      if(st == "BE_TRIGGERED") { beTrig = true; beFav = StringToDouble(KvGet(kv, "fav")); beBar = StringToInteger(KvGet(kv, "bar_open")); }
+      if(st == "BE_SET") beSet = true;
+      if(st == "CLOSED") closed = true;
+      if(st == "QUARANTINE") quarantined = true;
      }
    if(!bindSeen)
      {
@@ -1350,15 +1496,22 @@ void Reconcile()
      {
       ResetPos();
       g_pos.key = posKey; g_pos.posId = posId; g_pos.posTicket = posTicket; g_pos.sl0 = sl0; g_pos.tp0 = tp0; g_pos.fill = fill;
-      g_pos.fillTimeSrv = (datetime)fillTime; g_pos.fillTimeMsc = fillMsc;
+      g_pos.volume = vol; g_pos.fillTimeSrv = (datetime)fillTime; g_pos.fillTimeMsc = fillMsc; g_pos.lastInMsc = lastIn;
+      g_pos.lastBarDone = BarOpenOf(g_pos.fillTimeSrv);
+      g_pos.closeReason = closeReq;                  // a required close survives the restart
+      g_pos.beDone = beSet;
+      g_pos.bePending = beTrig && !beSet;            // a met breakeven condition survives the restart (no re-reading needed)
+      g_pos.beFav = beFav; g_pos.beBar = (datetime)beBar;
+      g_pos.fillBarDone = beTrig || beSet;
       g_hasPos = true;
-      int sel = SelectOwn();
+      int sel = SelectOwn();                         // also records a volume / average change that happened while off
       if(sel == 1)
         {
          double tick = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
-         g_pos.volume = PositionGetDouble(POSITION_VOLUME);
          g_pos.tpSet = PositionGetDouble(POSITION_TP) > 0;
-         g_pos.beDone = MathAbs(PositionGetDouble(POSITION_SL) - fill) <= tick * 0.5 + 1e-9;
+         g_pos.beDone = g_pos.beDone || MathAbs(PositionGetDouble(POSITION_SL) - g_pos.fill) <= tick * 0.5 + 1e-9;
+         if(g_pos.beDone)
+            g_pos.bePending = false;
          Journal(posKey, "OWNED_AT_STARTUP", "position_id=" + IntegerToString(posId) + ";position=" + IntegerToString((long)g_pos.posTicket));
         }
       else if(sel == 0)
@@ -1482,7 +1635,7 @@ int OnInit()
    Reconcile();
    g_envOk = VerifyEnvironment(why);                 // the journal binding is known now
    g_ready = true;
-   EventSetMillisecondTimer(MathMax(100, InpTimerMs));
+   EventSetMillisecondTimer((int)MathMax(100, InpTimerMs));
    return(INIT_SUCCEEDED);
   }
 

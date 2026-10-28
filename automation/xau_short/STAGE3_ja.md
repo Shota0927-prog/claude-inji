@@ -1,11 +1,11 @@
-# ゴールドショート自動化 — 第3段階「デモEA」(ST3-2: ST3-1 レビュー指摘の修正)
+# ゴールドショート自動化 — 第3段階「デモEA」(ST3-3: ST3-2 再レビュー指摘の修正)
 
 **位置づけ**
 - 今回もコード・設計・ローカル試験までです。発注は OFF のままです。
 - **MQL5 のコンパイル: 未実施** (この環境に MetaEditor / MT5 がありません)。
 - **MT5 デモ実地: 未実施**。
 - 「発注動作確認済み」「EA完成」ではありません。
-- デモ発注 ON や手動注文の案内は、再レビュー後に行います (この文書には書いていません)。
+- デモ発注 ON や手動注文の案内、未承認 7 項目の承認手続きは、まだ行いません (この文書には書いていません)。
 
 **変えていないもの**
 - 通常版 `ZoneStrategyXAU.pine`、ロング版、Engine、売買条件、input 初期値
@@ -13,8 +13,8 @@
 
 | 区分 | 内容 | 状態 |
 |---|---|---|
-| Python 試験 | bridge 実コード (`tests/eab_sim.py` 28 件)、EA 規則の Python 参照モデル (`tests/ea_model.py`) と MQL5 ソースの静的照合 (`tests/eam_sim.py` 55 件) | 実施 |
-| ST3-1 指摘の再現 | 修正前 (fcffd71) と修正後で同じシナリオを実行 (参照モデル。**MQL5 実行ではない**) | 実施 (レビュー zip の `repro_before_fcffd71.txt` / `repro_after_st3-2.txt`) |
+| Python 試験 | bridge 実コード (`tests/eab_sim.py` 29 件)、EA 規則の Python 参照モデル (`tests/ea_model.py`) と MQL5 ソースの静的照合 (`tests/eam_sim.py` 61 件) | 実施 |
+| ST3-2 再レビュー指摘の再現 | 修正前 (5ac972a) と修正後で同じシナリオを実行 (参照モデル。**MQL5 実行ではない**) | 実施 (レビュー zip の `repro_before_5ac972a.txt` / `repro_after_st3-3.txt`) |
 | MQL5 コンパイル | `ea/XauShortDemoEA.mq5` | **未実施** |
 | MT5 デモ実地 | 発注・取消・SL・TP・建値・再起動・異常系 | **未実施** (第4段階) |
 
@@ -67,6 +67,23 @@ MT5 の共通フォルダでのファイル交換です (ST3-1 と同じ)。
 
 ---
 
+## 2b. ST3-2 再レビュー指摘への対応 (ST3-3)
+
+| # | 指摘 | 修正 | 回帰試験 |
+|---|---|---|---|
+| 1 | 最終 PrepareOrder の処理中に期限切れ・待機注文の追加・halt_new が起きても送信される | `SendCheck` の順序を入れ替えました。<br>• 先に遅い処理 (PrepareOrder・OrderCheck、要求の作り直しと比較) を行います。<br>• その後、最後の手順として `FinalGate` を実行します (期限・GO 有効期限・すべての新規停止条件・口座全体の建玉と待機注文)。<br>• `FinalGate` と `OrderSend` の間には `ZeroMemory` しかありません (静的試験 EAS-10 で確認)。 | EAR-09, EAS-10 |
+| 2 | FILL_SIDE_BAD の決済結果を呼び出し元が無視する | EA が必要とする決済 (初期 SL 欠落 / bad_fill_side_mt5) を、すべて 1 つの仕組みにまとめました。<br>• `RequireClose` が `CLOSE_REQUIRED` を記録します。再起動後も復元します。<br>• `ProcessCloseObligation` が結果を処理します。<br>&nbsp;&nbsp;- 全決済確認: `EMERGENCY_CLOSE` / `CLOSE_CONFIRMED`。その後、履歴から `CLOSED`。<br>&nbsp;&nbsp;- 部分 / 拒否 / 不明: 新規停止 + CRITICAL `close_<partial\|failed\|unknown>:<理由>`。残建玉は所有権を保ったまま、EMERGENCY_RETRY_SEC (5 秒、未承認) ごとに再試行します。<br>• 決済が必要な建玉には TP0・建値の変更をしません。<br>• `ClosePosition` を呼ぶのは `ProcessCloseObligation` だけです。 | EAR-10, EAR-10b, EAS-14 |
+| 3 | 後続の分割約定で実建玉の平均価格・数量が変わっても EA の基準が更新されない | `SelectOwn` は、実建玉の `POSITION_VOLUME` / `POSITION_PRICE_OPEN` が EA の値と違えば `SyncFill` を呼び、`POSITION_UPDATED` を記録します (cause=add / reduce、最後の IN 約定時刻、IN 約定数)。<br>• 再起動時は journal から復元し、停止中の変化も起動時に記録します。<br>• 建値の基準は実平均価格で、建値の SL も実平均価格です。<br>• 不足分を追加発注で補うことはしません。 | EAR-11, EAB-29, EAS-15 |
+| 4 | 建値移動の再試行待ちが再起動で消える | 条件成立を `BE_TRIGGERED` (fav・足・基準価格) として、**SL 変更の前に**記録します。<br>• 再起動後は `bePending` として復元します。ティック履歴の再取得は不要です。<br>• `RetryBreakeven` が M5 足 1 本に 1 回、再起動直後は即時に再試行します。<br>• ティック履歴を取得できない場合は `FILLBAR_TICKS_UNAVAILABLE` (1 回記録) とし、約定足は未評価のまま次のタイマーで読み直します。「条件不成立」とは扱いません。<br>• SL を緩める変更は ModifyOwn が拒否します (従来どおり)。 | EAR-12, EAS-13, EAS-15 |
+
+**約定足の扱い (承認済み部分と未承認部分の区別)**
+
+- 承認済み: 建値は確定 5 分足で Fixed Distance 15 USD 判定、SL は XS の実約定価格、約定前の安値は使わない。
+- **未承認 (`APPROVED_FILLBAR_METHOD`):** 約定足をどう使うか。推奨案の実装は次のとおりです。
+  - 約定足は、**最後の IN 約定より後**から足の終了前までの Bid ティックだけを使います。分割約定のときは、後続約定の前の値動きを除くためです。`FILLBAR_SKIP` を選べば約定足は使いません。
+  - 後続約定が次の足以降に入った場合、その足の安値は後続約定より前の値動きを含み得るので、建値判定に使いません。その次の確定足から使います。
+- **未承認 (`APPROVED_BE_PRICE_SOURCE`):** 価格源を XS の M5 Bid とすること。
+
 ## 3. 最終実行許可 (claim と GO の分離)
 
 1. receiver の `claim()` は「通知を一度取得した」印です。**発注許可ではありません。**
@@ -96,14 +113,16 @@ MT5 の共通フォルダでのファイル交換です (ST3-1 と同じ)。
 ```
 SEEN (記録必須) → CheckCmd / 期限 / ゲート / PrepareOrder → AskBridge (GO)
   → DECIDED (記録必須) → PRE_SEND (記録必須。失敗なら送らず HALT_NEW + CRITICAL)
-  → SendCheck: 期限 (遅い側) / GO 有効期限 / 新規停止の全条件 (halt_new ファイル・HALT・CRITICAL・結果不明・心拍)
-               / PrepareOrder をやり直し (建玉・待機注文・価格・スプレッド・残高・証拠金) / 数量と SL が同じこと
+  → SendCheck: ① PrepareOrder をやり直し (建玉・待機注文・価格・スプレッド・残高・証拠金・OrderCheck) / 数量と SL が同じこと
+               ② FinalGate (最後): 期限 (遅い側) / GO 有効期限 / 新規停止の全条件 (halt_new ファイル・HALT・CRITICAL・結果不明・心拍)
+                  / 口座全体の建玉・待機注文
   → 不合格: SEND_ABORTED (PRE_SEND の最終結果。何も送らない)
   → 合格: その時点の Bid で作り直した要求を OrderSend → SEND_RETURNED → 約定確認 / REJECTED / UNKNOWN
 ```
 
 - `Journal()` が失敗した行は、エキスパートログ (Print) と `journal_fallback.txt` に残します。
-- SendCheck と OrderSend の間はマイクロ秒単位の連続処理で、外部の待ちはありません。
+- FinalGate は時計・小さなファイル 2 つ・端末の一覧を読むだけです。FinalGate と OrderSend の間に処理はありません。
+- **残る限界:** FinalGate の後、OrderSend がサーバーに届くまでに起きた変化 (他の注文、価格変化、取消通知) は止められません。価格は許容ずれ (残りの 20 % 枠) で、取消は §3 の限界のとおりです。
 
 ---
 
@@ -176,10 +195,10 @@ EA ソースの定数で、すべて `false` です。input では変えられ�
 | 定数 | 推奨案 (実装済み・未承認) |
 |---|---|
 | `APPROVED_BE_PRICE_SOURCE` | 建値判定は XS の M5 Bid 足 (OANDA の BAR は記録・比較のみ) |
-| `APPROVED_FILLBAR_METHOD` | 約定足は約定後〜足終了前の Bid ティック履歴 (`InpFillBarBe = FILLBAR_TICKS_SINCE_FILL`)、または約定足を使わない (`FILLBAR_SKIP`) |
+| `APPROVED_FILLBAR_METHOD` | 約定足は最後の IN 約定より後〜足終了前の Bid ティック履歴 (`InpFillBarBe = FILLBAR_TICKS_SINCE_FILL`)、または約定足を使わない (`FILLBAR_SKIP`)。後続約定を含む足は使わない。履歴が取れない間は未評価のまま読み直す |
 | `APPROVED_TP_TIMING` | TP0 は MT5 の約定足の確定時に設定 |
 | `APPROVED_TP_BEYOND` | その時点で価格が TP0 を越えていたら: 現在は変更拒否 → SL 維持・新規停止・次の足で再試行。代案は成行決済 (Pine の指値 TP 即約定と同等) |
-| `APPROVED_RETRY_INTERVAL` | TP / 建値の変更失敗は M5 足 1 本に 1 回、緊急決済の再試行は 5 秒ごと |
+| `APPROVED_RETRY_INTERVAL` | TP / 建値の変更失敗は M5 足 1 本に 1 回 (建値は再起動直後に 1 回)、必要な決済 (緊急・FILL_SIDE_BAD) の再試行は 5 秒ごと |
 | `APPROVED_CLOSE_DEVIATION` | 成行決済の許容ずれ 1000 points |
 | `APPROVED_MONITORING` | §7 の閾値 (心拍 5 秒・GO 3 秒・待ち 5 秒) |
 
@@ -212,10 +231,14 @@ CHECKED → SKIPPED_BY_BRIDGE (… / skip:ea_heartbeat_stale)
   - `UNKNOWN`, `UNKNOWN_CHECK`, `OWNED_AT_STARTUP`, `CLOSED`, `OWN_POSITION_MISSING`, `QUARANTINE`, `HALT_NEW` …
 - **新規:** `SEEN` → `SKIPPED` | `DRY_RUN_NOT_SENT` | `DECIDED` → `PRE_SEND` → `SEND_ABORTED` | `SEND_RETURNED`
   → `FILLED` (+`PARTIAL_FILL`) → `PROTECTED` | `SL_MISSING`
-  → `CLOSE_PRE_SEND` → `CLOSE_DONE` / `CLOSE_PARTIAL` / `CLOSE_FAILED` / `CLOSE_UNKNOWN`
-  → `EMERGENCY_CLOSE` / `EMERGENCY_CLOSE_PARTIAL` / `CRITICAL`
+  → `CLOSE_REQUIRED` (emergency_initial_sl_missing / bad_fill_side_mt5) → `CLOSE_PRE_SEND` → `CLOSE_DONE` / `CLOSE_PARTIAL` / `CLOSE_FAILED` / `CLOSE_UNKNOWN`
+  → `EMERGENCY_CLOSE` / `CLOSE_CONFIRMED` (全決済確認) | `EMERGENCY_CLOSE_PARTIAL` / `CLOSE_INCOMPLETE` + `CRITICAL` (再試行)
   - 送信結果が確定しなければ `REJECTED` | `UNKNOWN`
-- **管理:** `TP_SET` / `BE_SET` / `MODIFY_FAILED` / `MODIFY_REFUSED` / `FILL_SIDE_BAD` / `FILLBAR_NO_TICKS` / `TICKET_CHANGED` / `MANAGEMENT_BLOCKED` / `CLOSED`
+- **管理:**
+  - `TP_SET` / `BE_TRIGGERED` → `BE_SET` / `MODIFY_FAILED` / `MODIFY_REFUSED` / `FILL_SIDE_BAD`
+  - `FILLBAR_NO_TICKS` (履歴あり・ティック 0) / `FILLBAR_TICKS_UNAVAILABLE` (履歴なし・再読込)
+  - `POSITION_UPDATED` / `TICKET_CHANGED` / `MANAGEMENT_BLOCKED` / `CLOSED`
+- **再起動で復元するもの:** 自分の建玉 (FILLED + POSITION_UPDATED)、必要な決済 (CLOSE_REQUIRED)、成立済みの建値 (BE_TRIGGERED / BE_SET)、結果不明、HALT / CRITICAL
 - **結果不明:** `UNKNOWN` → `UNKNOWN_CHECK` → `UNKNOWN_RESOLVE_REFUSED` | `UNKNOWN_RESOLVED`
 - **運用:**
   - `HALT_NEW` / `RESUME_NEW` / `RESUME_REFUSED`
@@ -250,7 +273,11 @@ CHECKED → SKIPPED_BY_BRIDGE (… / skip:ea_heartbeat_stale)
 
 ## 11. 完全な排他の限界
 
-- **口座全体の最大 1 は、送信直前 (PRE_SEND 記録後) の確認です。** 確認から約定までの間に手動・他 EA が注文すると、両方が建つことはあり得ます。
+- **今回の修正で競合が無くなったわけではありません。**
+  - GO 発行後 (最大 3 秒) に到着した取消は止められません (§3)。
+  - FinalGate から約定までの間の変化も止められません (§4)。
+- **口座全体の最大 1 は、送信直前 (FinalGate) の確認です。** 確認から約定までの間に手動・他 EA が注文すると、両方が建つことはあり得ます。
+- **分割約定の後続分は、ブローカーが同じ識別子に約定させたものだけを追跡します。** 別の注文・別の識別子になった建玉は自分の建玉として扱いません (口座全体の最大 1 で新規は止まります)。
 - **magic・コメントは他 EA でも同じ値にできます。**
   - 管理対象は journal の FILLED 記録の識別子で決めます。
   - コメントは結果不明の照合の手掛かりにだけ使い、自動採用はしません (運用者の confirm が必要)。

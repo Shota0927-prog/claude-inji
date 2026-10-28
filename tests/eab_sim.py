@@ -10,6 +10,7 @@
   EAB-21     : make_test_entry.py writes only into a TEST receiver folder
   EAB-22..28 : regressions of the ST3-1 review: post-claim revocation before / while the EA asks / after a bridge restart, GO once per
                key within the deadline, an emergency close request is not a close, EA / bridge heartbeats, DB upgrade
+  EAB-29     : ST3-2 re-review: POSITION_UPDATED (fill in parts) and CLOSE_REQUIRED in the lifecycle
 Evidence class: local Python only. No TradingView / Windows / MT5 run; the EA side is the Python reference model, not the MQL5 EA.
 """
 import hashlib
@@ -739,6 +740,28 @@ def gate_review():
         kept = life(b, "k1")["state"]
     finally:
         env.close()
+    env = Env()
+    try:
+        env.receiver()
+        m = E(3)
+        bc = m["bar_close"]
+        env.send(m, bc + 1000)
+        b = env.bridge(Clock(bc + 2000))
+        b.once()
+        kh = eb.key_hash(m["key"])
+        write_rpt(env, f"{bc + 3000:013d}_00000001_0000000000.rpt", t_ms=bc + 3000, key_hash=kh, state="FILLED", position="5001",
+                  fill_price="2600.20000", volume="0.20")
+        write_rpt(env, f"{bc + 4000:013d}_00000002_0000000000.rpt", t_ms=bc + 4000, key_hash=kh, state="POSITION_UPDATED", cause="add",
+                  volume="0.40", fill_price="2600.60000")
+        write_rpt(env, f"{bc + 5000:013d}_00000003_0000000000.rpt", t_ms=bc + 5000, key_hash=kh, state="CLOSE_REQUIRED", reason="bad_fill_side_mt5")
+        b.once()
+        L29 = life(b, m["key"])
+        r29 = (L29["volume"], L29["fill_price"], L29["mt5_open"], L29["state"])
+    finally:
+        env.close()
+    check("EAB-29 (re-review 2/3) the EA's POSITION_UPDATED (a later deal of the same order) updates the lifecycle's volume / fill price; "
+          "CLOSE_REQUIRED is recorded but is not a close (mt5_open stays 1 until CLOSED)",
+          r29 == (0.4, 2600.6, 1, "EA_CLOSE_REQUIRED"), str(r29))
     check("EAB-28 a bridge database written by ST3-1 is upgraded in place (go_ms / go_until_ms / nogo_reason / revoked_ms added), rows kept",
           {"go_ms", "go_until_ms", "nogo_reason", "revoked_ms"} <= cols and kept == "CMD_WRITTEN", str(cols))
 

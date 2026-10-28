@@ -13,7 +13,9 @@ automation/xau_short/ea/XauShortDemoEA.mq5 (the model and the source must keep t
   EAR-01..08 : regressions of the ST3-1 review (items 1-8): final go / no-go, required records + checks after PRE_SEND, ownership
                quarantine, unknown-result resolution, fill-bar ticks bounded by the bar, partial emergency close, position identifier vs
                ticket, approvals / heartbeats
-  EAS-01..14 : the MQL5 source (static): inputs, constants, approvals, the only OrderSend sites and their gates / order, journal
+  EAR-09..12 : regressions of the ST3-2 re-review (items 1-4): the last checks after the slow final PrepareOrder, FILL_SIDE_BAD close
+               results + persisted close obligation, later deals of the same order (volume / average), breakeven pending across restarts
+  EAS-01..15 : the MQL5 source (static): inputs, constants, approvals, the only OrderSend sites and their gates / order, journal
                states, refusal reasons, definite-reject list, ownership by identifier, unknown handling, fill-bar ticks, bridge map
 Evidence class: local Python only. The MQL5 EA itself is NOT compiled or run here (no MetaEditor / MT5 in this environment).
 """
@@ -986,6 +988,184 @@ def gate_review():
           and a4 == ("bridge_heartbeat_stale", []) and a5[0] and a5[1] and a5[2] == "max1_own_position", str((a1, a2, a3, a4, a5)))
 
 
+def gate_rereview():
+    """regressions of the ST3-2 re-review (items 1-4)."""
+    # 1. the final PrepareOrder itself takes time / something changes during it
+    res = {}
+    for nm in ("delay_4s", "pending_order", "halt_new", "nothing_changes"):
+        b = Box()
+        b.t.gmt_ms = BC + 58000
+        orig = b.ea.prepare_order
+        calls = [0]
+
+        def slow(c, b=b, nm=nm, orig=orig, calls=calls):
+            r = orig(c)
+            calls[0] += 1
+            if calls[0] == 2:                       # the PrepareOrder of the final check, after the PRE_SEND record
+                if nm == "delay_4s":
+                    b.t.advance(4000)
+                elif nm == "pending_order":
+                    b.t.orders[99] = dict(symbol="XAUUSDs", comment="")
+                elif nm == "halt_new":
+                    b.touch("halt_new")
+            return r
+        b.ea.prepare_order = slow
+        kh = b.cmd()
+        b.timer()
+        res[nm] = (len(b.sends()), (b.ea.last(kh, "SEND_ABORTED") or {}).get("reason"), b.ea.inflightKey)
+        b.close()
+    check("EAR-09 (re-review 1) the slow final PrepareOrder (OrderCheck) runs BEFORE the last checks: a 4 s delay inside it (ENTRY + 62 s, "
+          "past the GO validity) -> SEND_ABORTED expired; a pending order or halt_new appearing during it -> aborted; zero sends; without "
+          "a change the order is still sent once",
+          res == {"delay_4s": (0, "expired", ""), "pending_order": (0, "max1_pending_order_exists", ""), "halt_new": (0, "halt_file", ""),
+                  "nothing_changes": (1, None, "")}, str(res))
+    # 2. FILL_SIDE_BAD: every close result handled, the obligation persists
+    res = {}
+    for mode in ("partial", "reject", "timeout_no_change", "ok"):
+        b = Box()
+        b.t.bid, b.t.ask = 2592.45, 2592.75
+        kh = fill(b, px=2593.0, sl=2598.0, tp=2592.5)
+        tk = b.ea.pos.posTicket
+        b.t.close_mode = mode
+        fo = fill_bar(b)
+        b.at_srv(fo + 300)
+        b.timer()
+        n1 = [w[0] for w in b.t.writes].count("close")
+        b.t.advance(1000)
+        b.timer()
+        n2 = [w[0] for w in b.t.writes].count("close")
+        b.t.advance(5000)
+        b.timer()
+        n3 = [w[0] for w in b.t.writes].count("close")
+        res[mode] = ((b.ea.last(kh, "CRITICAL") or {}).get("reason"), b.ea.haltNew, (n1, n2, n3), tk in b.t.positions,
+                     b.ea.last(kh, "CLOSE_REQUIRED"), "CLOSED" in b.ea.states(kh))
+        b.close()
+    check("EAR-10 (re-review 2) FILL_SIDE_BAD requires a close (CLOSE_REQUIRED reason=bad_fill_side_mt5) whose result is handled: partial / "
+          "rejected / unknown -> halt + CRITICAL close_<partial|failed|unknown>:bad_fill_side_mt5, the remainder is retried after "
+          "EMERGENCY_RETRY_SEC (not 1 s later, not only at the next bar); a full close -> no CRITICAL, CLOSED from the history",
+          res["partial"][:3] == ("close_partial:bad_fill_side_mt5", True, (1, 1, 2)) and res["partial"][3]
+          and res["reject"][:4] == ("close_failed:bad_fill_side_mt5", True, (1, 1, 2), True)
+          and res["timeout_no_change"][:4] == ("close_unknown:bad_fill_side_mt5", True, (1, 1, 2), True)
+          and res["ok"][0] is None and res["ok"][2][0] == 1 and res["ok"][3] is False and res["ok"][5]
+          and all(v[4] == {"reason": "bad_fill_side_mt5", "position_id": v[4]["position_id"]} for v in res.values()), str(res))
+    b = Box()
+    b.t.bid, b.t.ask = 2592.45, 2592.75
+    kh = fill(b, px=2593.0, sl=2598.0, tp=2592.5)
+    tk = b.ea.pos.posTicket
+    b.t.close_mode = "reject"
+    fo = fill_bar(b)
+    b.at_srv(fo + 300)
+    b.timer()
+    b.restart()                                    # the close obligation survives the restart
+    restored = b.ea.pos.closeReason
+    b.t.close_mode = "ok"
+    b.timer()
+    b.timer()
+    after = (tk in b.t.positions, b.ea.last(kh, "CLOSE_CONFIRMED"), "CLOSED" in b.ea.states(kh), b.t.positions.get(tk, {}).get("tp"))
+    b.close()
+    check("EAR-10b (re-review 2) a required close that was rejected is restored after an EA restart (closeReason from CLOSE_REQUIRED) and "
+          "retried at once; no TP0 is set on a position that must be closed; after the full close CLOSE_CONFIRMED then CLOSED",
+          restored == "bad_fill_side_mt5" and after == (False, {"result": "closed_confirmed", "reason": "bad_fill_side_mt5"}, True, None),
+          str((restored, after)))
+    # 3. a later deal of the same order changes the live volume / average price
+    def later_deal(b, p, dt_ms, price, add):
+        tot = round(p["volume"] + add, 2)
+        p["price_open"] = round((p["price_open"] * p["volume"] + price * add) / tot, 5)
+        p["volume"] = tot
+        d = b.t._ticket()
+        b.t.deals[d] = dict(order=b.ea.pos.orderTicket, position=p["identifier"], price=price, time=p["time"] + dt_ms // 1000,
+                            time_msc=p["time_msc"] + dt_ms, entry="IN", volume=add, symbol="XAUUSDs", magic=p["magic"],
+                            comment=p["comment"], reason="EXPERT", profit=0.0, commission=0.0, swap=0.0)
+    b = Box()
+    b.t.send_mode = "partial"
+    kh = fill(b)
+    p = b.own()
+    later_deal(b, p, 20000, 2601.0, 0.20)          # 0.20 @ 2600.20 + 0.20 @ 2601.00 = 0.40 @ 2600.60
+    fo = fill_bar(b)
+    b.t.rates = [(fo + 300, 2585.50)]
+    b.at_srv(fo + 600 + 5)
+    b.timer()
+    u = b.ea.last(kh, "POSITION_UPDATED")
+    r1 = (b.ea.pos.volume, b.ea.pos.fill, (b.ea.last(kh, "BE_SET") or {}).get("sl"), p["sl"])
+    b.restart()
+    r2 = (b.ea.pos.volume, b.ea.pos.fill, b.ea.pos.lastInMsc == p["time_msc"] + 20000, b.ea.states(kh).count("POSITION_UPDATED"))
+    b.close()
+    b = Box()
+    b.t.send_mode = "partial"
+    kh = fill(b)
+    p = b.own()
+    b.ea.on_deinit()
+    later_deal(b, p, 20000, 2601.0, 0.20)          # while the EA is off
+    b.ea = b._wire(em.EA(b.t, b.x, **b.kw))
+    b.ea.on_init()
+    r3 = (b.ea.pos.volume, b.ea.pos.fill, (b.ea.last(kh, "POSITION_UPDATED") or {}).get("cause"))
+    b.close()
+    b = Box()
+    b.t.send_mode = "partial"
+    kh = fill(b)
+    p = b.own()
+    fo = fill_bar(b)
+    later_deal(b, p, (fo + 300) * 1000 + 60000 - p["time_msc"], 2601.0, 0.20)   # the second part fills one minute into the NEXT bar
+    b.t.ticks = [(p["time_msc"] + 1000, 2584.0)]   # a 16 USD move in the fill bar, BEFORE the second part filled
+    b.t.rates = [(fo + 300, 2585.0), (fo + 600, 2590.0)]   # the next bar's low may precede the second part
+    b.at_srv(fo + 900 + 5)
+    b.timer()
+    r4 = (b.ea.last(kh, "BE_SET"), b.ea.last(kh, "FILLBAR_NO_TICKS"))
+    b.close()
+    check("EAR-11 (re-review 3) a later deal of the same order (same identifier) is followed: POSITION_UPDATED cause=add, the EA's volume / "
+          "fill become the live 0.40 @ 2600.60, the bar low 2585.50 (15.10 from the average) moves the SL to 2600.60; the update is restored "
+          "from the journal after a restart (no second POSITION_UPDATED when nothing changed) (and one that happened while the EA was off is recorded at start); no price before the last IN deal is used: "
+          "neither the fill-bar ticks nor the bar holding the later deal -> no breakeven from them; no top-up order",
+          u is not None and u["cause"] == "add" and u["volume"] == "0.40" and u["fill_price"] == "2600.60000"
+          and r1 == (0.4, 2600.6, "2600.60", 2600.6) and r2 == (0.4, 2600.6, True, 1) and r3 == (0.4, 2600.6, "add")
+          and r4 == (None, {"n": "0"}), str((u, r1, r2, r3, r4)))
+    # 4. a met breakeven condition survives a restart; tick history not available is not "not met"
+    b = Box()
+    kh = fill(b)
+    p = b.own()
+    fo = fill_bar(b)
+    b.t.ticks = [(p["time_msc"] + 1000, 2584.2)]   # 16 USD in the fill bar after the fill
+    b.t.modify_mode = "reject"
+    b.at_srv(fo + 300)
+    b.timer()
+    before = (b.ea.pos.bePending, b.ea.last(kh, "BE_TRIGGERED") is not None, p["sl"])
+    b.restart()
+    pend_after = b.ea.pos.bePending
+    b.t.ticks_unavailable = True
+    b.t.rates = [(fo + 300, 2599.2)]               # the next bar moves only 1 USD
+    b.at_srv(fo + 600 + 5)
+    b.timer()                                      # still refused: stays pending, SL kept
+    still = (b.ea.pos.bePending, p["sl"], b.ea.last(kh, "FILLBAR_NO_TICKS"))
+    b.t.modify_mode = "ok"
+    b.at_srv(fo + 900 + 5)
+    b.timer()
+    after = ((b.ea.last(kh, "BE_SET") or {}).get("sl"), p["sl"], b.ea.pos.bePending)
+    b.close()
+    b = Box()
+    kh = fill(b)
+    p = b.own()
+    fo = fill_bar(b)
+    b.t.ticks = [(p["time_msc"] + 1000, 2584.2)]
+    b.t.ticks_unavailable = True
+    b.at_srv(fo + 300)
+    b.timer()
+    b.at_srv(fo + 900 + 5)                         # two more bars later, still unavailable
+    b.timer()
+    u1 = (b.ea.pos.fillBarDone, b.ea.last(kh, "FILLBAR_TICKS_UNAVAILABLE") is not None, b.ea.last(kh, "FILLBAR_NO_TICKS"),
+          b.ea.states(kh).count("FILLBAR_TICKS_UNAVAILABLE"))
+    b.t.ticks_unavailable = False
+    b.at_srv(fo + 905)
+    b.timer()
+    u2 = ((b.ea.last(kh, "BE_SET") or {}).get("fav"), b.ea.pos.fillBarDone)
+    b.close()
+    check("EAR-12 (re-review 4) a met breakeven condition (BE_TRIGGERED, journaled before the SL change) whose change was refused stays "
+          "pending across a restart (no tick re-reading needed), is retried once per bar (refused again: SL kept 2605, no FILLBAR_NO_TICKS) "
+          "and applied when allowed although the later bars moved only 1 USD; tick history that cannot be read is FILLBAR_TICKS_UNAVAILABLE "
+          "(once), never 'not met': the fill bar stays open and is evaluated when the history comes back",
+          before == (True, True, 2605.0) and pend_after is True and still == (True, 2605.0, None) and after == ("2600.20", 2600.2, False)
+          and u1 == (False, True, None, 1) and u2 == ("2584.20", True), str((before, pend_after, still, after, u1, u2)))
+
+
 # ---- static checks of the MQL5 source ------------------------------------------------------------------------------------
 def _func(src, name):
     m = re.search(r"\n[a-zA-Z_ ]+\b" + name + r"\([^)]*\)\s*\n  \{", src)
@@ -1074,13 +1254,19 @@ def gate_static():
           and not re.search(r"input[^\n]*APPROVED", code), str((appr, names)))
     i_go, i_dec, i_pre = pe.index("AskBridge("), pe.index('"DECIDED"'), pe.index('if(!Journal(id, "PRE_SEND"')
     i_chk, i_send = pe.index("SendCheck("), pe.index("OrderSend(")
-    sc = _func(code, "SendCheck")
-    check("EAS-10 (review 1/2) ProcessEntry order: SEEN record required -> checks -> AskBridge (final GO) -> DECIDED record required -> "
-          "PRE_SEND record required (its failure returns before any send) -> SendCheck (deadline, GO validity, every gate, request rebuilt "
-          "and compared) -> OrderSend; Journal() verifies open / write length / flush and returns false otherwise",
+    sc, fg = _func(code, "SendCheck"), _func(code, "FinalGate")
+    between = pe[pe.index("MqlTradeResult res;"):i_send]
+    check("EAS-10 (review 1/2, re-review 1) ProcessEntry order: SEEN record required -> checks -> AskBridge (final GO) -> DECIDED record "
+          "required -> PRE_SEND record required -> SendCheck: the slow PrepareOrder (OrderCheck) and the request comparison FIRST, then "
+          "FinalGate (deadline, GO validity, every gate, positions, pending orders) as its LAST step -> nothing but ZeroMemory before "
+          "OrderSend; Journal() verifies open / write length / flush",
           'if(!Journal(id, "SEEN"' in pe and i_go < i_dec < i_pre < i_chk < i_send and 'if(!Journal(id, "DECIDED"' in pe
-          and all(x in sc for x in ("CheckDeadline(c)", "goUntil", "NewEntriesAllowed(gate, id)", "PrepareOrder(c, out, detail)", '"request_changed"'))
-          and re.search(r"uint w = FileWriteString\(h, line \+ \"\\n\"\);\s*FileFlush\(h\);\s*ok = w >= ", _func(code, "Journal")) is not None, "")
+          and sc.index("PrepareOrder(c, out, detail)") < sc.index('"request_changed"') < sc.index("return(FinalGate(c, id, goUntil));")
+          and all(x in fg for x in ("CheckDeadline(c)", "NowMsLate() > goUntil", "NewEntriesAllowed(gate, id)", "PositionsTotal() > 0",
+                                    "OrdersTotal() > 0"))
+          and "PrepareOrder" not in fg and "OrderCheck" not in fg and re.sub(r"\s+", " ", between).strip() == "MqlTradeResult res; ZeroMemory(res); bool ok ="
+          and re.search(r"uint w = FileWriteString\(h, line \+ \"\\n\"\);\s*FileFlush\(h\);\s*ok = w >= ", _func(code, "Journal")) is not None,
+          repr(between))
     so, cf = _func(code, "SelectOwn"), _func(code, "ConfirmFill")
     check("EAS-11 (review 3/7) ownership by POSITION_IDENTIFIER: SelectOwn compares the identifier, quarantines a symbol / magic / type "
           "mismatch and refreshes the ticket; ConfirmFill maps DEAL_POSITION_ID to the live ticket via TicketOfIdentifier (never "
@@ -1095,22 +1281,38 @@ def gate_static():
           and 'g_unknownKey = "";' in _func(code, "CheckResolveUnknown") and "DetectUnknown(g_unknownKey" in _func(code, "CheckResolveUnknown")
           and "confirm != detected" in _func(code, "CheckResolveUnknown"), "")
     fbl = _func(code, "FillBarLow")
-    check("EAS-13 (review 5) the fill-bar low comes from CopyTicksRange strictly after the fill (fillTimeMsc + 1) and strictly before the "
-          "fill-bar close (close ms - 1); OnTick keeps no running minimum",
-          "CopyTicksRange(InpSymbol, ticks, COPY_TICKS_INFO, from, to)" in fbl and "g_pos.fillTimeMsc + 1" in fbl and "* 1000 - 1" in fbl
-          and "minBid" not in code, "")
+    mo_ = _func(code, "ManageOwn")
+    check("EAS-13 (review 5, re-review 3/4) the fill-bar low comes from CopyTicksRange strictly after the LAST IN deal (max(fillTimeMsc, "
+          "lastInMsc) + 1) and strictly before the fill-bar close; history not available (-1) is FILLBAR_TICKS_UNAVAILABLE and retried, "
+          "never 'not met'; a bar holding a later IN deal is not used; OnTick keeps no running minimum",
+          "CopyTicksRange(InpSymbol, ticks, COPY_TICKS_INFO, from, to)" in fbl and "MaxL(g_pos.fillTimeMsc, g_pos.lastInMsc) + 1" in fbl
+          and "* 1000 - 1" in fbl and "minBid" not in code and '"FILLBAR_TICKS_UNAVAILABLE"' in mo_
+          and re.search(r"if\(n < 0\)\s*\{[^}]*\{[^}]*\}\s*\}\s*else", mo_) is not None and "rates[i].time > lastInBar" in mo_, "")
     bsrc = open(os.path.join(ROOT, "automation", "xau_short", "bridge", "ea_bridge.py"), encoding="utf-8").read()
-    cpr = _func(code, "CheckProtection")
-    check("EAS-14 (review 6) ClosePosition verifies the result on the live position / history (CLOSE_DONE / PARTIAL / FAILED / UNKNOWN); "
-          "CheckProtection writes EMERGENCY_CLOSE only for CLOSE_FULL and CRITICAL otherwise; the bridge clears mt5_open only on CLOSED",
+    cpr, pco = _func(code, "CheckProtection"), _func(code, "ProcessCloseObligation")
+    check("EAS-14 (review 6, re-review 2) ClosePosition verifies the result on the live position / history (CLOSE_DONE / PARTIAL / FAILED / "
+          "UNKNOWN); every close the EA requires (initial SL missing AND bad_fill_side_mt5) goes through RequireClose + "
+          "ProcessCloseObligation, which handles every result (EMERGENCY_CLOSE / CLOSE_CONFIRMED only for CLOSE_FULL, otherwise halt + "
+          "CRITICAL) and is the only caller of ClosePosition; the bridge clears mt5_open only on CLOSED",
           all(x in cp for x in ('"CLOSE_DONE"', '"CLOSE_PARTIAL"', '"CLOSE_FAILED"', '"CLOSE_UNKNOWN"', "HistoryVolumes(g_pos.posId"))
-          and re.search(r"if\(r == CLOSE_FULL\)\s*\{\s*Journal\(g_pos.key, \"EMERGENCY_CLOSE\"", cpr) is not None and "SetCritical(" in cpr
-          and bsrc.count('upd["mt5_open"] = 0') == 1 and 'if state == "CLOSED":\n                    upd["mt5_open"] = 0' in bsrc, "")
+          and 'RequireClose("emergency_initial_sl_missing");' in cpr and "ProcessCloseObligation();" in cpr
+          and 'RequireClose("bad_fill_side_mt5");' in mo_ and re.search(r"if\(r == CLOSE_FULL\)\s*\{", pco) is not None
+          and "SetCritical(" in pco and "HaltNew(" in pco and len(re.findall(r"\bClosePosition\(", code)) == 2
+          and "ClosePosition(" in pco and bsrc.count('upd["mt5_open"] = 0') == 1
+          and 'if state == "CLOSED":\n                    upd["mt5_open"] = 0' in bsrc, "")
+    rc, so_, tb = _func(code, "Reconcile"), _func(code, "SelectOwn"), _func(code, "TryBreakeven")
+    check("EAS-15 (re-review 2/3/4) persisted and restored: CLOSE_REQUIRED (closeReason), POSITION_UPDATED (volume / average fill / last IN "
+          "deal; SelectOwn calls SyncFill whenever the live volume or open price differs), BE_TRIGGERED journaled BEFORE the SL change and "
+          "restored as bePending (RetryBreakeven runs before the fill-bar evaluation)",
+          all(x in rc for x in ('"CLOSE_REQUIRED"', '"POSITION_UPDATED"', '"BE_TRIGGERED"', "g_pos.closeReason = closeReq;",
+                                "g_pos.bePending = beTrig && !beSet;"))
+          and "SyncFill(v, po);" in so_ and "POSITION_PRICE_OPEN" in so_ and tb.index('"BE_TRIGGERED"') < tb.index("ApplyBreakeven();")
+          and mo_.index("RetryBreakeven(now);") < mo_.index("FillBarLow(") and "ModifyOwn(\"breakeven\"" in _func(code, "ApplyBreakeven"), "")
 
 
 def main():
     for g in (gate_env, gate_deadline, gate_price_lot, gate_slot, gate_unknown, gate_protect, gate_be, gate_restart_misc, gate_dry_mgmt,
-              gate_review, gate_static):
+              gate_review, gate_rereview, gate_static):
         try:
             g()
         except Exception:

@@ -221,9 +221,11 @@ class Pos:
         self.key = ""
         self.posId = self.posTicket = self.orderTicket = self.dealTicket = 0
         self.fill = self.sl0 = self.tp0 = self.volume = 0.0
-        self.fillTimeSrv = self.fillTimeMsc = 0
-        self.tpSet = self.beDone = self.bePending = self.fillBarDone = False
-        self.lastBarDone = self.lastTpTry = self.lastEmergencyTry = 0
+        self.fillTimeSrv = self.fillTimeMsc = self.lastInMsc = 0
+        self.tpSet = self.beDone = self.bePending = self.fillBarDone = self.fillBarUnavailNoted = False
+        self.beFav, self.beBar, self.lastBeTry = 0.0, 0, 0
+        self.lastBarDone = self.lastTpTry = self.lastCloseTry = 0
+        self.closeReason = ""
         self.protectedNoted = self.slMissingNoted = self.missingNoted = False
 
 
@@ -574,20 +576,28 @@ class EA:
         return "nogo:no_answer", 0
 
     def send_check(self, c, id_, go_until, base):
-        why = self.check_deadline(c)
-        if why:
-            return why, None
-        if self.now_ms_late() > go_until:
-            return "go_expired", None
-        gate = self.new_entries_allowed(id_)
-        if gate:
-            return gate, None
-        why, out, _ = self.prepare_order(c)
+        why, out, _ = self.prepare_order(c)                # the slow part first (terminal / OrderCheck)
         if why:
             return why, None
         if abs(out["volume"] - base["volume"]) > 1e-9 or abs(out["sl"] - base["sl"]) > 1e-9:
             return "request_changed", None
-        return "", out
+        why = self.final_gate(c, id_, go_until)            # the cheap checks last, right before OrderSend
+        return (why, None) if why else ("", out)
+
+    def final_gate(self, c, id_, go_until):
+        why = self.check_deadline(c)
+        if why:
+            return why
+        if self.now_ms_late() > go_until:
+            return "go_expired"
+        gate = self.new_entries_allowed(id_)
+        if gate:
+            return gate
+        if self.t.positions:
+            return "max1_position_exists"
+        if self.t.orders:
+            return "max1_pending_order_exists"
+        return ""
 
     # -- ownership ------------------------------------------------------------------------------------------------
     def select_own(self):
@@ -601,8 +611,20 @@ class EA:
             if tk != self.pos.posTicket:
                 self.journal(self.pos.key, "TICKET_CHANGED", f"position_id={self.pos.posId};old={self.pos.posTicket};new={tk}")
                 self.pos.posTicket = tk
+            if abs(p["volume"] - self.pos.volume) > 1e-9 or abs(p["price_open"] - self.pos.fill) > 1e-9:
+                self.sync_fill(p["volume"], p["price_open"])
             return 1
         return 0
+
+    def sync_fill(self, v, po):
+        """the live position is the reference for volume / average fill (fill in parts: later IN deals; partial close)."""
+        P = self.pos
+        ins = [x for _, x in self.t.history_by_position(P.posId) if x["entry"] == "IN"]
+        last_in = max([P.lastInMsc] + [x["time_msc"] for x in ins])
+        cause = "add" if v > P.volume + 1e-9 else "reduce" if v < P.volume - 1e-9 else "price"
+        P.volume, P.fill, P.lastInMsc = v, po, last_in
+        self.journal(P.key, "POSITION_UPDATED", f"cause={cause};volume={v:.2f};fill_price={po:.5f};last_in_msc={last_in};"
+                                                f"in_deals={len(ins)};position_id={P.posId}")
 
     def own(self):
         return self.t.positions[self.pos.posTicket]
@@ -636,6 +658,8 @@ class EA:
         P = self.pos = Pos()
         P.key, P.posId, P.posTicket, P.orderTicket, P.dealTicket = key, pos_id, ticket, order, deal
         P.fill, P.volume, P.sl0, P.tp0, P.fillTimeSrv, P.fillTimeMsc = p["price_open"], p["volume"], sl0, tp0, p["time"], p["time_msc"]
+        P.lastInMsc = P.fillTimeMsc
+        P.lastBarDone = P.fillTimeSrv - P.fillTimeSrv % BAR_SEC
         self.hasPos = True
         self.journal(key, "FILLED", f"order={order};deal={deal};position_id={pos_id};position={ticket};fill_price={P.fill:.5f};"
                                     f"volume={P.volume:.2f};sl0={sl0:.5f};tp0={tp0:.5f};fill_time={P.fillTimeSrv};fill_time_msc={P.fillTimeMsc};via={via}")
@@ -760,6 +784,42 @@ class EA:
         self.journal(id_, "UNKNOWN", "reason=" + reason)
         self.halt_new("unknown_result:" + id_)
 
+    def require_close(self, reason):
+        if self.pos.closeReason:
+            return
+        self.pos.closeReason = reason
+        self.journal(self.pos.key, "CLOSE_REQUIRED", f"reason={reason};position_id={self.pos.posId}")
+
+    def process_close_obligation(self):
+        P = self.pos
+        if not self.hasPos or not P.closeReason or not self.trade_writes_allowed() or self.select_own() != 1:
+            return
+        now_s = self.t.time_gmt()
+        if P.lastCloseTry > 0 and now_s - P.lastCloseTry < EMERGENCY_RETRY_SEC:
+            return
+        P.lastCloseTry = now_s
+        reason = P.closeReason
+        emergency = reason == "emergency_initial_sl_missing"
+        r, remaining = self.close_position(P.key, reason)
+        if r == CLOSE_NOT_ALLOWED:
+            return
+        if r == CLOSE_FULL:
+            if emergency:
+                self.journal(P.key, "EMERGENCY_CLOSE", "result=closed_confirmed")
+            else:
+                self.journal(P.key, "CLOSE_CONFIRMED", f"result=closed_confirmed;reason={reason}")
+            return
+        kind = {CLOSE_PARTIAL: "partial", CLOSE_FAILED: "failed"}.get(r, "unknown")
+        if r == CLOSE_PARTIAL:
+            if emergency:
+                self.journal(P.key, "EMERGENCY_CLOSE_PARTIAL", f"remaining={remaining:.2f};note=unprotected_remainder_retried")
+            else:
+                self.journal(P.key, "CLOSE_INCOMPLETE", f"remaining={remaining:.2f};reason={reason};note=remainder_retried")
+        self.halt_new("close_incomplete:" + reason)
+        cr = "emergency_close_" + kind if emergency else f"close_{kind}:{reason}"
+        if not self.critical or self.critReason != cr:
+            self.set_critical(P.key, cr)
+
     def check_protection(self):
         if not self.hasPos or self.select_own() != 1:
             return
@@ -775,19 +835,8 @@ class EA:
         if not P.slMissingNoted:
             P.slMissingNoted = True
             self.journal(P.key, "SL_MISSING", f"sl_on_position={sl:.5f};sl0={P.sl0:.5f}")
-        if not self.trade_writes_allowed():
-            return
-        now_s = self.t.time_gmt()
-        if P.lastEmergencyTry > 0 and now_s - P.lastEmergencyTry < EMERGENCY_RETRY_SEC:
-            return
-        P.lastEmergencyTry = now_s
-        r, remaining = self.close_position(P.key, "emergency_initial_sl_missing")
-        if r == CLOSE_FULL:
-            self.journal(P.key, "EMERGENCY_CLOSE", "result=closed_confirmed")
-            return
-        if r == CLOSE_PARTIAL:
-            self.journal(P.key, "EMERGENCY_CLOSE_PARTIAL", f"remaining={remaining:.2f};note=unprotected_remainder_retried")
-        self.set_critical(P.key, {CLOSE_PARTIAL: "emergency_close_partial", CLOSE_FAILED: "emergency_close_failed"}.get(r, "emergency_close_unknown"))
+        self.require_close("emergency_initial_sl_missing")
+        self.process_close_obligation()
 
     # -- management -------------------------------------------------------------------------------------------------
     def check_closed_from_history(self):
@@ -807,7 +856,7 @@ class EA:
             self.halt_new("own_position_missing")
 
     def fill_bar_low(self, fill_bar_open):
-        frm = self.pos.fillTimeMsc + 1
+        frm = max(self.pos.fillTimeMsc, self.pos.lastInMsc) + 1
         to = (fill_bar_open + BAR_SEC) * 1000 - 1
         if to < frm:
             return 0, 0.0
@@ -835,6 +884,9 @@ class EA:
         self.check_protection()
         if not self.hasPos or self.select_own() != 1:
             return
+        if self.pos.closeReason:
+            self.process_close_obligation()
+            return
         P, t = self.pos, self.t
         sl_now = self.own()["sl"]
         if not (sl_now > 0 and sl_now <= P.sl0 + t.sym["tick"] * 0.5 + 1e-9):
@@ -848,7 +900,8 @@ class EA:
             P.lastTpTry = now
             if not (P.sl0 - P.fill > 0 and P.fill - P.tp0 > 0):
                 self.journal(P.key, "FILL_SIDE_BAD", f"fill={P.fill:.{digits}f}")
-                self.close_position(P.key, "bad_fill_side_mt5")
+                self.require_close("bad_fill_side_mt5")
+                self.process_close_obligation()
                 return
             if self.select_own() != 1:
                 return
@@ -856,42 +909,68 @@ class EA:
             if self.modify_own("tp0", cur_sl, round(P.tp0, digits)):
                 P.tpSet = True
                 self.journal(P.key, "TP_SET", f"tp={P.tp0:.{digits}f};sl_kept={cur_sl:.{digits}f}")
+        self.retry_breakeven(now)
         if not P.fillBarDone:
-            if not P.beDone and self.FillBarBe == "TICKS_SINCE_FILL":
+            if P.beDone or P.bePending or self.FillBarBe != "TICKS_SINCE_FILL":
+                P.fillBarDone = True
+            else:
                 n, lo = self.fill_bar_low(fill_bar_open)
-                if n < 0 and now < fill_bar_open + 2 * BAR_SEC:
-                    return
-                if n > 0:
-                    self.try_breakeven(lo, fill_bar_open)
+                if n < 0:
+                    if not P.fillBarUnavailNoted:
+                        P.fillBarUnavailNoted = True
+                        self.journal(P.key, "FILLBAR_TICKS_UNAVAILABLE", f"fill_bar_open={fill_bar_open};note=retried")
                 else:
-                    self.journal(P.key, "FILLBAR_NO_TICKS", f"n={n}")
-            P.fillBarDone = True
-            P.lastBarDone = fill_bar_open
-        if P.beDone:
+                    if n > 0:
+                        self.try_breakeven(lo, fill_bar_open)
+                    else:
+                        self.journal(P.key, "FILLBAR_NO_TICKS", "n=0")
+                    P.fillBarDone = True
+        if P.beDone or P.bePending:
             return
+        if P.lastBarDone < fill_bar_open:
+            P.lastBarDone = fill_bar_open
+        last_in_s = max(P.fillTimeMsc, P.lastInMsc) // 1000
+        last_in_bar = last_in_s - last_in_s % BAR_SEC
         frm = P.lastBarDone + BAR_SEC
         for (bt, low) in sorted(t.rates):
-            if P.beDone:
+            if P.beDone or P.bePending:
                 break
             if bt < frm or bt > now or bt + BAR_SEC > now:
                 continue
-            self.try_breakeven(low, bt)
+            if bt > last_in_bar:
+                self.try_breakeven(low, bt)
             P.lastBarDone = bt
 
     def try_breakeven(self, fav_low, bar_open):
         P = self.pos
-        if P.beDone or (fav_low <= 0 and not P.bePending):
+        if P.beDone or P.bePending or fav_low <= 0:
             return
-        if P.bePending or P.fill - fav_low >= BE_DIST - 1e-9:
-            P.bePending = True
+        if P.fill - fav_low >= BE_DIST - 1e-9:
+            P.bePending, P.beFav, P.beBar = True, fav_low, bar_open
             digits = self.t.sym["digits"]
-            new_sl = round(P.fill, digits)
-            if self.select_own() != 1:
-                return
-            cur_tp = self.own()["tp"]
-            if self.modify_own("breakeven", new_sl, cur_tp):
-                P.beDone, P.bePending = True, False
-                self.journal(P.key, "BE_SET", f"sl={new_sl:.{digits}f};bar_open={bar_open};fav={fav_low:.{digits}f}")
+            self.journal(P.key, "BE_TRIGGERED", f"fav={fav_low:.{digits}f};bar_open={bar_open};fill={P.fill:.{digits}f};"
+                                                f"dist={P.fill - fav_low:.{digits}f}")
+            self.apply_breakeven()
+
+    def apply_breakeven(self):
+        P = self.pos
+        P.lastBeTry = self.t.time_server()
+        digits = self.t.sym["digits"]
+        if self.select_own() != 1:
+            return
+        new_sl = round(P.fill, digits)
+        cur_tp = self.own()["tp"]
+        if self.modify_own("breakeven", new_sl, cur_tp):
+            P.beDone, P.bePending = True, False
+            self.journal(P.key, "BE_SET", f"sl={new_sl:.{digits}f};bar_open={P.beBar};fav={P.beFav:.{digits}f}")
+
+    def retry_breakeven(self, now):
+        P = self.pos
+        if not P.bePending or P.beDone:
+            return
+        if P.lastBeTry > 0 and now - now % BAR_SEC <= P.lastBeTry - P.lastBeTry % BAR_SEC:
+            return
+        self.apply_breakeven()
 
     # -- result unknown -------------------------------------------------------------------------------------------------
     def detect_unknown(self, kh, pre_ms):
@@ -957,8 +1036,10 @@ class EA:
         last_pre = unknown = pos_key = ""
         pre_ms, pre_sl, pre_tp = 0, 0.0, 0.0
         pos_id = fill_msc = fill_time = pos_ticket = 0
-        sl0 = tp0 = fill = 0.0
-        closed = quarantined = bind_seen = False
+        sl0 = tp0 = fill = vol = be_fav = 0.0
+        last_in = be_bar = 0
+        close_req = ""
+        closed = quarantined = bind_seen = be_set = be_trig = False
         a = self.t.account
         for parts in self.journal_lines():
             if len(parts) < 4:
@@ -977,7 +1058,7 @@ class EA:
             if st == "RESUME_NEW":
                 self.haltNew, self.haltReason = False, ""
             if st == "CRITICAL":
-                self.critical, self.critReason = True, f
+                self.critical, self.critReason = True, kv_get(kv, "reason")
             if st == "CRITICAL_CLEARED":
                 self.critical, self.critReason = False, ""
             if st == "PRE_SEND":
@@ -994,9 +1075,22 @@ class EA:
                 pos_id, pos_ticket = to_int(kv_get(kv, "position_id")), to_int(kv_get(kv, "position"))
                 sl0, tp0, fill = to_float(kv_get(kv, "sl0")), to_float(kv_get(kv, "tp0")), to_float(kv_get(kv, "fill_price"))
                 fill_time, fill_msc = to_int(kv_get(kv, "fill_time")), to_int(kv_get(kv, "fill_time_msc"))
-            if st == "CLOSED" and key == pos_key:
+                vol, last_in = to_float(kv_get(kv, "volume")), fill_msc
+                close_req, be_set, be_trig = "", False, False
+            if not pos_key or key != pos_key:
+                continue
+            if st == "POSITION_UPDATED":
+                fill, vol = to_float(kv_get(kv, "fill_price")), to_float(kv_get(kv, "volume"))
+                last_in = max(last_in, to_int(kv_get(kv, "last_in_msc")))
+            if st == "CLOSE_REQUIRED":
+                close_req = kv_get(kv, "reason")
+            if st == "BE_TRIGGERED":
+                be_trig, be_fav, be_bar = True, to_float(kv_get(kv, "fav")), to_int(kv_get(kv, "bar_open"))
+            if st == "BE_SET":
+                be_set = True
+            if st == "CLOSED":
                 closed = True
-            if st == "QUARANTINE" and key == pos_key:
+            if st == "QUARANTINE":
                 quarantined = True
         if not bind_seen:
             self.bindOk = True
@@ -1015,14 +1109,19 @@ class EA:
         if pos_key and not closed and not quarantined and pos_id > 0:
             P = self.pos = Pos()
             P.key, P.posId, P.posTicket, P.sl0, P.tp0, P.fill = pos_key, pos_id, pos_ticket, sl0, tp0, fill
-            P.fillTimeSrv, P.fillTimeMsc = fill_time, fill_msc
+            P.volume, P.fillTimeSrv, P.fillTimeMsc, P.lastInMsc = vol, fill_time, fill_msc, last_in
+            P.lastBarDone = fill_time - fill_time % BAR_SEC
+            P.closeReason = close_req
+            P.beDone, P.bePending, P.beFav, P.beBar = be_set, be_trig and not be_set, be_fav, be_bar
+            P.fillBarDone = be_trig or be_set
             self.hasPos = True
             sel = self.select_own()
             if sel == 1:
                 p = self.own()
-                P.volume = p["volume"]
                 P.tpSet = p["tp"] > 0
-                P.beDone = abs(p["sl"] - fill) <= self.t.sym["tick"] * 0.5 + 1e-9
+                P.beDone = P.beDone or abs(p["sl"] - P.fill) <= self.t.sym["tick"] * 0.5 + 1e-9
+                if P.beDone:
+                    P.bePending = False
                 self.journal(pos_key, "OWNED_AT_STARTUP", f"position_id={pos_id};position={P.posTicket}")
             elif sel == 0:
                 self.check_closed_from_history()
