@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import logging
+import logging.handlers
 import os
 import sqlite3
 import sys
@@ -100,13 +101,27 @@ def read_kv(path):
         return dict(l.rstrip("\r\n").split("=", 1) for l in f if "=" in l)
 
 
-def write_atomic(path, body):
+def write_atomic(path, body, *, retry_sharing=False):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="ascii", newline="\n") as f:
         f.write(body)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    # Only heartbeat callers opt in. GO answers retain their original timing.
+    deadline = time.monotonic() + 0.250 if retry_sharing else 0.0
+    while True:
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:
+            # Windows may deny replacement while the EA has the destination open.
+            # Never bypass permissions or swallow a persistent failure.
+            if not retry_sharing or getattr(exc, "winerror", None) not in (5, 32, 33):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(0.025, remaining))
 
 
 def load_config(path):
@@ -298,7 +313,8 @@ class Bridge:
         return None
 
     def _write_cmd(self, c, claimed_ms):
-        """one command file per key, written as .tmp and renamed (the EA only reads *.cmd)."""
+        """one command file per key, written as .tmp and renamed (the EA only reads *.entry.txt: ST3-6, MQL5 refused *.cmd with error
+        5002 on the Windows check)."""
         kh = key_hash(c["key"])
         lines = {"v": CMD_VERSION, "key": c["key"], "key_hash": kh, "tid": c["tid"], "ev": "ENTRY", "side": c["side"], "otype": c["otype"],
                  "path": (c["info"] or "").split(";")[0], "px": repr(float(c["px"])), "sl": repr(float(c["sl"])), "tp": repr(float(c["tp"])),
@@ -312,12 +328,12 @@ class Bridge:
             f.write(body)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, os.path.join(d, f"{c['bar_close']}_{kh}.cmd"))
+        os.replace(tmp, os.path.join(d, f"{c['bar_close']}_{kh}.entry.txt"))
 
     def _revoke(self, row, why, now, state="REVOKED_BEFORE_GO"):
         """no GO will ever be given for this key; its command file (if the EA has not taken it yet) is moved to revoked/."""
         self._set(row["key"], nogo_reason=why, revoked_ms=now, **({"state": state} if row["state"] in ("CLAIMED", "CMD_WRITTEN") else {}))
-        name = f"{row['bar_close']}_{row['key_hash']}.cmd"
+        name = f"{row['bar_close']}_{row['key_hash']}.entry.txt"
         try:
             os.replace(self._x("cmd", name), self._x("revoked", name))
         except OSError:
@@ -362,10 +378,19 @@ class Bridge:
         self.write_heartbeat()
         return n_cmd
 
+    def legacy_cmds(self):
+        """ST3-6: command files of the old name (*.cmd) left in cmd/ — the EA never reads them any more. Reported only (not moved, not
+        deleted): such a command is past its 60 s deadline anyway, and its key ends by the usual revocation / expiry."""
+        return legacy_cmd_files(self.cfg["exchange_dir"])
+
     def recover(self):
         """after a bridge restart: a key claimed (by this bridge) but whose command was not written is written only if it is still
         valid (still_valid: not revoked / terminated / wait ended, within the deadline); otherwise it is closed without a command. A key
         left in CLAIMING is resolved from the receiver's intent (claimed_ms) — never claimed twice."""
+        old = self.legacy_cmds()
+        if old and old != getattr(self, "_legacy_noted", None):       # once per change of the set (recover runs every pass)
+            self.log.warning("legacy command files (*.cmd, not read by the EA since ST3-6) left in cmd/: %s", ", ".join(old))
+        self._legacy_noted = old
         for row in self.db.execute("SELECT * FROM lifecycle WHERE state IN ('CLAIMING', 'CLAIMED')").fetchall():
             it = self.rcv.store.one("SELECT claimed_ms FROM intents WHERE key=?", (row["key"],))
             if row["state"] == "CLAIMING" and (it is None or it["claimed_ms"] is None):
@@ -434,7 +459,7 @@ class Bridge:
 
     def write_heartbeat(self):
         last = self.rcv.store.one("SELECT MAX(received_ms) m FROM receipts")
-        write_atomic(self._x("hb_bridge.txt"), f"t_ms={self.clock()}\nlast_receipt_ms={(last and last['m']) or 0}\n")
+        write_atomic(self._x("hb_bridge.txt"), f"t_ms={self.clock()}\nlast_receipt_ms={(last and last['m']) or 0}\n", retry_sharing=True)
 
     def ingest_reports(self):
         d = self._x("rpt")
@@ -504,7 +529,6 @@ def setup_log(cfg):
     log = logging.getLogger("ea_bridge")
     log.setLevel(logging.INFO)
     if not log.handlers:
-        import logging.handlers
         fh = logging.handlers.RotatingFileHandler(os.path.join(cfg["bridge_data_dir"], "bridge.log"), maxBytes=5_000_000, backupCount=5,
                                                   encoding="utf-8")
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -513,6 +537,13 @@ def setup_log(cfg):
         sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         log.addHandler(sh)
     return log
+
+
+def legacy_cmd_files(exchange_dir):
+    try:
+        return sorted(n for n in os.listdir(os.path.join(exchange_dir, "cmd")) if n.endswith(".cmd"))
+    except OSError:
+        return []
 
 
 def main(argv=None):
@@ -532,6 +563,8 @@ def main(argv=None):
                 print(f"{nm}: age {(now - int(kv.get('t_ms', '0'))) / 1000:.1f} s  " + " ".join(f"{k}={v}" for k, v in kv.items() if k != "t_ms"))
             except (OSError, ValueError):
                 print(f"{nm}: missing")
+        old = legacy_cmd_files(cfg["exchange_dir"])
+        print(f"legacy *.cmd in cmd/ (not read by the EA since ST3-6): {len(old)}" + (f"  {', '.join(old)}" if old else ""))
         for r in db.execute("SELECT * FROM lifecycle ORDER BY bar_close DESC LIMIT ?", (a.last,)):
             print(f'{r["tid"]} {r["state"]:<28} reason={r["reason"]} go={iso(r["go_ms"])} nogo={r["nogo_reason"]} retcode={r["ea_retcode"]}'
                   f' pos={r["ea_position"]} fill={r["fill_price"]} vol={r["volume"]} claimed={iso(r["claimed_ms"])} cmd={iso(r["cmd_written_ms"])}')

@@ -19,6 +19,9 @@ automation/xau_short/ea/XauShortDemoEA.mq5 (the model and the source must keep t
                the history (adoption with several IN deals, history arriving late, restart), breakeven basis voided by a later IN deal
   EAR-16..17 : regressions of the ST3-4 re-review: a change during the history read (pass, adoption, right before the SL change),
                a same-ms IN deal with / without a crash between POSITION_UPDATED and BE_TRIGGER_VOID, restart
+  EAP-01..05 : ST3-6: the breakeven basis / average fill journaled exactly (bit field) and compared at the precision recorded:
+               restart with a full-precision or a 5-decimal live average, an old 5-decimal record, a real average change, a damaged
+               bit field; MQL5 static mirror. Whether the real MT5 average has more than 5 decimals is NOT known here
   EAS-01..17 : the MQL5 source (static): inputs, constants, approvals, the only OrderSend sites and their gates / order, journal
                states, refusal reasons, definite-reject list, ownership by identifier, unknown handling, fill-bar ticks, bridge map
 Evidence class: local Python only. The MQL5 EA itself is NOT compiled or run here (no MetaEditor / MT5 in this environment).
@@ -118,7 +121,7 @@ class Box:
         f.update(over)
         self.n += 1
         os.makedirs(os.path.join(self.x, "cmd"), exist_ok=True)
-        name = f"{bc}_{kh or 'nohash'}_{self.n:03d}.cmd"
+        name = f"{bc}_{kh or 'nohash'}_{self.n:03d}.entry.txt"
         with open(os.path.join(self.x, "cmd", name), "w", encoding="ascii", newline="\n") as fh:
             fh.write("".join(f"{k}={v}\n" for k, v in f.items()))
         return kh
@@ -617,7 +620,7 @@ def gate_restart_misc():
           b.ea.states(kh).count("SEEN") == 1 and dup == 1 and "BAD_CMD" in b.ea.states("") and rs(kl) == "limit_not_supported"
           and rs(kn) == "price_not_finite" and rs(ka) == "bar_time" and rs(kc) == "path_not_initial_settings" and rs(kg) == "price_geometry"
           and rs(ks) == "cfg_mismatch" and rs(kv1) == "cmd_version" and os.listdir(os.path.join(b.x, "cmd")) == []
-          and len([n for n in os.listdir(os.path.join(b.x, "done")) if n.endswith(".cmd")]) == 10 and b.t.writes == [],
+          and len([n for n in os.listdir(os.path.join(b.x, "done")) if n.endswith(".entry.txt")]) == 10 and b.t.writes == [],
           str([rs(k) for k in (kl, kn, ka, kc, kg, ks, kv1)]))
     b.close()
     b = Box()
@@ -1621,12 +1624,12 @@ def gate_static():
           "(FillStats), then re-reads the position (PositionUnchanged: ticket / identifier / volume / average) and refuses a pair taken "
           "while it changed; the IN deal set identity (sorted IN tickets, hashed) is the basis together with the average; ApplyBreakeven "
           "refreshes the state and compares the basis immediately before ModifyOwn; Reconcile restores a condition only on the same IN set "
-          "and average and never decides by reading BE_TRIGGER_VOID",
+          "and average (ST3-6: BasisMatch at the recorded precision) and never decides by reading BE_TRIGGER_VOID",
           rf.index("FillStats(g_pos.posId") < rf.index("PositionUnchanged(g_pos.posTicket") and "bool ok = read && stable" in rf
           and "ArraySort(ins);" in fs and "Sha16(j)" in fs and "inSet != g_pos.inSet" in rf
           and ab.index("RefreshFill()") < ab.index("g_pos.beInSet != g_pos.inSet") < ab.index('ModifyOwn("breakeven"')
-          and "MathAbs(g_pos.beFillBasis - g_pos.fill) > 1e-6" in ab and 'st == "BE_TRIGGER_VOID"' not in rc
-          and "MathAbs(beFillBasis - fill) > 1e-6" in rc and "PositionUnchanged(ticket, posId" in _func(code, "AdoptOwn"), "")
+          and "!BasisMatch(g_pos.beFillBasis, g_pos.beBasisExact, g_pos.fill)" in ab and 'st == "BE_TRIGGER_VOID"' not in rc
+          and "!BasisMatch(beFillBasis, beExact && fillExact, fill)" in rc and "PositionUnchanged(ticket, posId" in _func(code, "AdoptOwn"), "")
     fg2 = _func(code, "FinalGate")
     check("EAS-16 (ST3-3 re-review 1) FinalGate reads first and checks the clock last: NewEntriesAllowed (halt file, bridge heartbeat file, "
           "...), PositionsTotal, OrdersTotal, THEN CheckDeadline and the GO validity, then return; nothing between FinalGate and OrderSend",
@@ -1634,9 +1637,89 @@ def gate_static():
           < fg2.index("CheckDeadline(c)") < fg2.index("NowMsLate() > goUntil") and fg2.count("CheckDeadline(") == 1
           and "ReadLines" not in fg2[fg2.index("CheckDeadline(c)"):] and "File" not in fg2[fg2.index("CheckDeadline(c)"):], "")
 
+def precision_case(api_round, legacy=False, change=0.0, damage=False, restart=True):
+    """a position averaged from 0.01 @ 2600.20 + 0.40 @ 2600.21 (average 2600.209756097561...), breakeven condition met while the SL
+    change is refused, then (optionally) a crash + restart. api_round: the terminal returns the average rounded to 5 decimals
+    (control) instead of full precision (an assumption: the real MT5 precision is not known here). legacy: the journal records
+    without the ST3-6 bit fields (an EA journal written before ST3-6). change: the live average moved by this much while the EA was
+    off (same IN deals). damage: the BE_TRIGGERED bit field replaced by another value's bits."""
+    b = Box()
+    try:
+        kh = fill(b)
+        p = b.own()
+        first = next(d for d in b.t.deals.values() if d["position"] == p["identifier"])
+        first.update(volume=0.01, price=2600.20)
+        d = dict(first)
+        d.update(volume=0.40, price=2600.21, time_msc=first["time_msc"] + 20000, time=(first["time_msc"] + 20000) // 1000)
+        b.t.deals[b.t._ticket()] = d
+        avg = (0.01 * 2600.20 + 0.40 * 2600.21) / 0.41
+        p.update(volume=0.41, price_open=round(avg, 5) if api_round else avg)
+        b.ea.refresh_fill()
+        b.t.modify_mode = "reject"
+        b.ea.try_breakeven(p["price_open"] - 16.0, p["time"] - p["time"] % 300)
+        trig = b.ea.last(kh, "BE_TRIGGERED") or {}
+        if restart:
+            b.ea.on_deinit()
+            jp = b.ea.journalPath
+            txt = open(jp, encoding="ascii").read()
+            if legacy:
+                txt = re.sub(r";fill_bits=-?\d+", "", txt)
+            if damage:                              # only the BE_TRIGGERED record (FILLED / POSITION_UPDATED keep theirs)
+                txt = "".join(re.sub(r";fill_bits=-?\d+", ";fill_bits=" + em.dbl_bits(2601.0), ln) if "|BE_TRIGGERED|" in ln else ln
+                              for ln in txt.splitlines(keepends=True))
+            open(jp, "w", encoding="ascii", newline="").write(txt)
+            if change:
+                p["price_open"] = p["price_open"] + change
+            b.t.ticks_unavailable = True
+            b.restart(crash=True)
+        elif change:
+            p["price_open"] = p["price_open"] + change
+        restored = b.ea.pos.bePending
+        b.ea.apply_breakeven()
+        return dict(trig_bits="fill_bits" in trig, restored=restored, pending=b.ea.pos.bePending,
+                    void=b.ea.last(kh, "BE_TRIGGER_VOID") is not None, fill=b.ea.pos.fill, live=p["price_open"],
+                    exact=b.ea.pos.beBasisExact if b.ea.pos.bePending else None,
+                    filled_bits="fill_bits" in (b.ea.last(kh, "FILLED") or {}), upd_bits="fill_bits" in (b.ea.last(kh, "POSITION_UPDATED") or {}))
+    finally:
+        b.close()
+
+
+def gate_precision():
+    full, rnd = precision_case(False), precision_case(True)
+    check("EAP-01 (ST3-6) the breakeven condition met on a full-precision average survives a restart (restored, still pending, no "
+          "BE_TRIGGER_VOID) - before ST3-6 the 5-decimal record differed from the re-read average by 2.4e-6 > 1e-6 and voided it; the "
+          "5-decimal API average (control) behaves the same; FILLED / POSITION_UPDATED / BE_TRIGGERED carry fill_bits",
+          all(c["restored"] and c["pending"] and not c["void"] and c["exact"] and c["trig_bits"] and c["filled_bits"] and c["upd_bits"]
+              for c in (full, rnd)) and full["fill"] == full["live"], str((full, rnd)))
+    leg = precision_case(False, legacy=True)
+    check("EAP-02 (ST3-6) an EA journal written before ST3-6 (no bit fields) with a full-precision live average: the basis is known only "
+          "to 5 decimals and is compared at 5 decimals -> kept (pending, no void, basis marked not exact)",
+          leg["restored"] and leg["pending"] and not leg["void"] and leg["exact"] is False, str(leg))
+    ch_r, ch_l, ch_n = precision_case(False, change=0.01), precision_case(False, legacy=True, change=0.01), precision_case(False, change=0.01, restart=False)
+    small = precision_case(False, change=2e-6)
+    check("EAP-03 (ST3-6) a real change of the average with the same IN deals is still detected: +0.01 while the EA was off -> voided "
+          "(exact basis and old 5-decimal basis alike); +0.01 without a restart -> voided; +2e-6 (> 1e-6) with an exact basis -> voided "
+          "(the tolerance was not widened)",
+          all(c["void"] and not c["pending"] for c in (ch_r, ch_l, ch_n, small)), str((ch_r, ch_l, ch_n, small)))
+    dmg = precision_case(False, damage=True)
+    dmg_r = precision_case(True, damage=True)
+    check("EAP-04 (ST3-6) a damaged / foreign bit field (it does not round to its 5-decimal field) is not trusted: the 5-decimal value is "
+          "used at 5-decimal precision (full-precision live average: kept, basis not exact; 5-decimal live average: kept)",
+          dmg["pending"] and not dmg["void"] and dmg["exact"] is False and dmg_r["pending"] and not dmg_r["void"], str((dmg, dmg_r)))
+    mq = open(MQ5, encoding="utf-8").read()
+    rec = lambda st: re.search(r'Journal\([^;]*"' + st + r'",(?:[^;]|;[^\n])*?\);\n', mq)
+    check("EAP-05 (ST3-6, MQL5 static mirror) union DblLong / DblBits / PxExact / BasisMatch present; FILLED, POSITION_UPDATED and "
+          "BE_TRIGGERED write fill_bits; Reconcile reads fill / basis through PxExact (3 sites) and compares through BasisMatch (restart "
+          "and right before the SL change); no 1e-6 basis comparison left outside BasisMatch; version 0.35",
+          "union DblLong" in mq and mq.count("DblBits(") >= 4 and mq.count("PxExact(kv, ") == 3 and mq.count("!BasisMatch(") == 2
+          and all(rec(st) and "fill_bits=" in rec(st).group(0) for st in ("FILLED", "POSITION_UPDATED", "BE_TRIGGERED"))
+          and "MathAbs(beFillBasis - fill) > 1e-6" not in mq and "MathAbs(g_pos.beFillBasis - g_pos.fill) > 1e-6" not in mq
+          and '#property version   "0.35"' in mq)
+
+
 def main():
     for g in (gate_env, gate_deadline, gate_price_lot, gate_slot, gate_unknown, gate_protect, gate_be, gate_restart_misc, gate_dry_mgmt,
-              gate_review, gate_rereview, gate_rereview2, gate_rereview3, gate_static):
+              gate_review, gate_rereview, gate_rereview2, gate_rereview3, gate_static, gate_precision):
         try:
             g()
         except Exception:

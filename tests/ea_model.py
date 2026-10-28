@@ -11,6 +11,7 @@ import hashlib
 import math
 import os
 import re
+import struct
 
 RISK_FRACTION = 0.03
 MAX_AGE_SEC = 60
@@ -73,6 +74,34 @@ def to_float(s):
         return float(s)
     except (TypeError, ValueError):
         return 0.0
+
+
+def dbl_bits(x):
+    """ST3-6: the exact IEEE-754 bit pattern of a price as a decimal integer (MQL5: union of double / long)."""
+    return str(struct.unpack("<q", struct.pack("<d", float(x)))[0])
+
+
+def px_exact(kv, bits_key, dec_key):
+    """ST3-6: [value, exact] of a journaled price. The bit field gives the exact value the EA held; it is used only when it is
+    finite, positive and rounds to the 5-decimal field next to it (a damaged / foreign bit field falls back to the 5-decimal
+    value, which is then compared only at its recorded precision). Records written before ST3-6 have no bit field."""
+    dec = to_float(kv_get(kv, dec_key))
+    b = kv_get(kv, bits_key)
+    try:
+        x = struct.unpack("<d", struct.pack("<q", int(b)))[0]
+    except (TypeError, ValueError, struct.error, OverflowError):
+        return dec, False
+    if math.isfinite(x) and x > 0 and f"{x:.5f}" == f"{dec:.5f}":
+        return x, True
+    return dec, False
+
+
+def basis_match(basis, exact, live):
+    """ST3-6: the breakeven basis still describes the live average: exact basis -> the existing tolerance (1e-6); a basis known
+    only to 5 decimals (an old journal record) -> equal at those 5 decimals (never a wider tolerance)."""
+    if exact:
+        return abs(basis - live) <= 1e-6
+    return f"{live:.5f}" == f"{basis:.5f}"
 
 
 class FakeTerminal:
@@ -224,6 +253,7 @@ class Pos:
         self.fillTimeSrv = self.fillTimeMsc = self.lastInMsc = self.inDeals = 0
         self.inSet = self.beInSet = ""
         self.beFillBasis = 0.0
+        self.beBasisExact = True    # ST3-6: false only for a basis restored from a 5-decimal record (before ST3-6)
         self.fillSyncPending = False
         self.tpSet = self.beDone = self.bePending = self.fillBarDone = self.fillBarUnavailNoted = False
         self.beFav, self.beBar, self.lastBeTry = 0.0, 0, 0
@@ -660,7 +690,7 @@ class EA:
         cause = "add" if v > P.volume + 1e-9 else "reduce" if v < P.volume - 1e-9 else "history" if (new_in or was_pending) else "price"
         P.volume, P.fill, P.inDeals, P.inSet, P.lastInMsc = v, po, n_in, in_set, last_in
         self.journal(P.key, "POSITION_UPDATED", f"cause={cause};volume={v:.2f};fill_price={po:.5f};last_in_msc={last_in};"
-                                                f"in_deals={n_in};in_set={in_set};position_id={P.posId}")
+                                                f"in_deals={n_in};in_set={in_set};position_id={P.posId};fill_bits={dbl_bits(po)}")
         if new_in and not P.beDone:
             self.void_breakeven_basis()
         return True
@@ -670,7 +700,7 @@ class EA:
         if P.bePending:
             self.journal(P.key, "BE_TRIGGER_VOID", f"reason=later_in_deal;fav={P.beFav:.5f};bar_open={P.beBar};last_in_msc={P.lastInMsc};"
                                                    f"fill={P.fill:.5f}")
-            P.bePending, P.beFav, P.beBar, P.beInSet, P.beFillBasis = False, 0.0, 0, "", 0.0
+            P.bePending, P.beFav, P.beBar, P.beInSet, P.beFillBasis, P.beBasisExact = False, 0.0, 0, "", 0.0, True
         fbo = P.fillTimeSrv - P.fillTimeSrv % BAR_SEC
         li = P.lastInMsc // 1000
         lib = li - li % BAR_SEC
@@ -721,7 +751,8 @@ class EA:
         self.hasPos = True
         self.journal(key, "FILLED", f"order={order};deal={deal};position_id={pos_id};position={ticket};fill_price={P.fill:.5f};"
                                     f"volume={P.volume:.2f};sl0={sl0:.5f};tp0={tp0:.5f};fill_time={P.fillTimeSrv};fill_time_msc={P.fillTimeMsc};"
-                                    f"in_deals={P.inDeals};last_in_msc={P.lastInMsc};in_set={P.inSet};fill_sync={'ok' if ok else 'pending'};via={via}")
+                                    f"in_deals={P.inDeals};last_in_msc={P.lastInMsc};in_set={P.inSet};fill_sync={'ok' if ok else 'pending'};via={via};"
+                                    f"fill_bits={dbl_bits(P.fill)}")
 
     def confirm_fill(self, key, order, deal, sl0, tp0):
         pos_id = self.t.deals[deal]["position"] if deal and deal in self.t.deals else 0
@@ -1009,9 +1040,11 @@ class EA:
             return
         if P.fill - fav_low >= BE_DIST - 1e-9:
             P.bePending, P.beFav, P.beBar, P.beInSet, P.beFillBasis = True, fav_low, bar_open, P.inSet, P.fill
+            P.beBasisExact = True
             digits = self.t.sym["digits"]
             self.journal(P.key, "BE_TRIGGERED", f"fav={fav_low:.{digits}f};bar_open={bar_open};fill={P.fill:.5f};"
-                                                f"dist={P.fill - fav_low:.{digits}f};last_in_msc={P.lastInMsc};in_deals={P.inDeals};in_set={P.inSet}")
+                                                f"dist={P.fill - fav_low:.{digits}f};last_in_msc={P.lastInMsc};in_deals={P.inDeals};in_set={P.inSet};"
+                                                f"fill_bits={dbl_bits(P.fill)}")
             self.apply_breakeven()
 
     def apply_breakeven(self):
@@ -1022,7 +1055,7 @@ class EA:
             return
         if not P.bePending:
             return
-        if P.beInSet != P.inSet or abs(P.beFillBasis - P.fill) > 1e-6:
+        if P.beInSet != P.inSet or not basis_match(P.beFillBasis, P.beBasisExact, P.fill):
             self.void_breakeven_basis()
             return
         if self.select_own() != 1:
@@ -1109,6 +1142,7 @@ class EA:
         last_in = be_bar = in_deals = 0
         in_set = be_in_set = ""
         be_fill_basis = 0.0
+        fill_exact = be_exact = True
         close_req = ""
         closed = quarantined = bind_seen = be_set = be_trig = False
         a = self.t.account
@@ -1144,7 +1178,8 @@ class EA:
             if st == "FILLED":
                 pos_key, closed, quarantined = key, False, False
                 pos_id, pos_ticket = to_int(kv_get(kv, "position_id")), to_int(kv_get(kv, "position"))
-                sl0, tp0, fill = to_float(kv_get(kv, "sl0")), to_float(kv_get(kv, "tp0")), to_float(kv_get(kv, "fill_price"))
+                sl0, tp0 = to_float(kv_get(kv, "sl0")), to_float(kv_get(kv, "tp0"))
+                fill, fill_exact = px_exact(kv, "fill_bits", "fill_price")
                 fill_time, fill_msc = to_int(kv_get(kv, "fill_time")), to_int(kv_get(kv, "fill_time_msc"))
                 vol = to_float(kv_get(kv, "volume"))
                 last_in, in_deals = max(fill_msc, to_int(kv_get(kv, "last_in_msc"))), to_int(kv_get(kv, "in_deals"))
@@ -1153,14 +1188,16 @@ class EA:
             if not pos_key or key != pos_key:
                 continue
             if st == "POSITION_UPDATED":
-                fill, vol = to_float(kv_get(kv, "fill_price")), to_float(kv_get(kv, "volume"))
+                fill, fill_exact = px_exact(kv, "fill_bits", "fill_price")
+                vol = to_float(kv_get(kv, "volume"))
                 last_in, in_deals = max(last_in, to_int(kv_get(kv, "last_in_msc"))), to_int(kv_get(kv, "in_deals"))
                 in_set = kv_get(kv, "in_set")
             if st == "CLOSE_REQUIRED":
                 close_req = kv_get(kv, "reason")
             if st == "BE_TRIGGERED":
                 be_trig, be_fav, be_bar = True, to_float(kv_get(kv, "fav")), to_int(kv_get(kv, "bar_open"))
-                be_in_set, be_fill_basis = kv_get(kv, "in_set"), to_float(kv_get(kv, "fill"))
+                be_in_set = kv_get(kv, "in_set")
+                be_fill_basis, be_exact = px_exact(kv, "fill_bits", "fill")
             # BE_TRIGGER_VOID is informational: whether a condition is restored is decided by its basis below
             if st == "BE_SET":
                 be_set = True
@@ -1188,11 +1225,12 @@ class EA:
             P.volume, P.fillTimeSrv, P.fillTimeMsc, P.lastInMsc, P.inDeals, P.inSet = vol, fill_time, fill_msc, last_in, in_deals, in_set
             li = last_in // 1000
             P.lastBarDone = max(li - li % BAR_SEC, fill_time - fill_time % BAR_SEC)
-            if be_trig and (not be_in_set or be_in_set != in_set or abs(be_fill_basis - fill) > 1e-6):
+            if be_trig and (not be_in_set or be_in_set != in_set or not basis_match(be_fill_basis, be_exact and fill_exact, fill)):
                 be_trig = False
             P.closeReason = close_req
             P.beDone, P.bePending, P.beFav, P.beBar = be_set, be_trig and not be_set, be_fav, be_bar
             P.beInSet, P.beFillBasis = (be_in_set, be_fill_basis) if be_trig else ("", 0.0)
+            P.beBasisExact = be_exact if be_trig else True
             P.fillBarDone = be_trig or be_set
             self.hasPos = True
             sel = self.select_own()
@@ -1230,7 +1268,7 @@ class EA:
 
     def poll_commands(self):
         d = self.path("cmd")
-        for name in sorted(n for n in os.listdir(d) if n.endswith(".cmd")):
+        for name in sorted(n for n in os.listdir(d) if n.endswith(".entry.txt")):
             src = os.path.join(d, name)
             c = self.read_cmd(src)
             if c is None:

@@ -15,8 +15,8 @@
 //| NOT compiled / NOT run by the author: see STAGE3_ja.md.            |
 //+------------------------------------------------------------------+
 #property copyright "shota0927-prog"
-#property version   "0.34"
-#property description "XAU Short demo EA (stage 3, ST3-5). DRY_RUN by default. Demo accounts only."
+#property version   "0.35"
+#property description "XAU Short demo EA (stage 3, ST3-6). DRY_RUN by default. Demo accounts only."
 
 //--- approved rules (constants on purpose: not changeable from the inputs)
 const double RISK_FRACTION = 0.03;   // loss budget = balance right before the decision x 3 %
@@ -93,6 +93,7 @@ struct OwnedPos
    double   beFav;         // the favourable price that met the condition
    string   beInSet;       // the basis of that condition: the IN deal set ...
    double   beFillBasis;   // ... and the average fill it was measured from
+   bool     beBasisExact;  // ST3-6: false only for a basis restored from a 5-decimal record (before ST3-6)
    datetime beBar;         // open time of the bar that met it
    datetime lastBeTry;     // server time of the last breakeven attempt (retried once per M5 bar)
    bool     fillBarDone;   // the fill bar was evaluated for breakeven (tick history read, or not needed)
@@ -113,7 +114,7 @@ void ResetPos()
   {
    g_pos.key = ""; g_pos.posId = 0; g_pos.posTicket = 0; g_pos.orderTicket = 0; g_pos.dealTicket = 0;
    g_pos.fill = 0; g_pos.sl0 = 0; g_pos.tp0 = 0; g_pos.volume = 0; g_pos.fillTimeSrv = 0; g_pos.fillTimeMsc = 0; g_pos.lastInMsc = 0;
-   g_pos.inDeals = 0; g_pos.inSet = ""; g_pos.fillSyncPending = false; g_pos.beInSet = ""; g_pos.beFillBasis = 0;
+   g_pos.inDeals = 0; g_pos.inSet = ""; g_pos.fillSyncPending = false; g_pos.beInSet = ""; g_pos.beFillBasis = 0; g_pos.beBasisExact = true;
    g_pos.tpSet = false; g_pos.beDone = false; g_pos.bePending = false; g_pos.beFav = 0; g_pos.beBar = 0; g_pos.lastBeTry = 0;
    g_pos.fillBarDone = false; g_pos.fillBarUnavailNoted = false;
    g_pos.lastBarDone = 0; g_pos.lastTpTry = 0; g_pos.closeReason = ""; g_pos.lastCloseTry = 0;
@@ -216,6 +217,50 @@ string KvGet(const string &lines[], const string k)
       if(StringFind(lines[i], k + "=") == 0)
          return(StringSubstr(lines[i], StringLen(k) + 1));
    return("");
+  }
+
+//--- ST3-6: exact journal record of a price. The 5-decimal text alone loses precision when the live average has more digits, so a
+//--- restored breakeven basis would differ from the re-read average by > 1e-6 and be voided. The bit pattern (union double / long)
+//--- restores exactly the value the EA held; it is used only when finite, positive and equal to the 5-decimal field at 5 decimals
+//--- (a damaged / foreign field falls back to the 5-decimal value). Records written before ST3-6 have no bit field.
+union DblLong
+  {
+   double d;
+   long   l;
+  };
+
+string DblBits(double x)
+  {
+   DblLong u;
+   u.d = x;
+   return(IntegerToString(u.l));
+  }
+
+//--- [value, exact] of a journaled price (bit field + the 5-decimal field next to it)
+double PxExact(const string &kv[], const string bitsKey, const string decKey, bool &exact)
+  {
+   double dec = StringToDouble(KvGet(kv, decKey));
+   string b = KvGet(kv, bitsKey);
+   exact = false;
+   if(b == "")
+      return(dec);
+   DblLong u;
+   u.l = StringToInteger(b);
+   if(MathIsValidNumber(u.d) && u.d > 0 && DoubleToString(u.d, 5) == DoubleToString(dec, 5))
+     {
+      exact = true;
+      return(u.d);
+     }
+   return(dec);
+  }
+
+//--- the breakeven basis still describes the live average: exact basis -> the existing tolerance 1e-6; a basis known only to
+//--- 5 decimals (an old record) -> equal at those 5 decimals (never a wider tolerance)
+bool BasisMatch(double basis, bool exact, double live)
+  {
+   if(exact)
+      return(MathAbs(basis - live) <= 1e-6);
+   return(DoubleToString(live, 5) == DoubleToString(basis, 5));
   }
 
 bool ReadLines(const string path, string &lines[])
@@ -768,7 +813,7 @@ bool RefreshFill()
    // compares the basis), so a crash between this line and BE_TRIGGER_VOID cannot bring the old condition back
    Journal(g_pos.key, "POSITION_UPDATED", "cause=" + cause + ";volume=" + DoubleToString(v, 2) + ";fill_price=" + DoubleToString(po, 5) +
            ";last_in_msc=" + IntegerToString(lastIn) + ";in_deals=" + IntegerToString(nIn) + ";in_set=" + inSet +
-           ";position_id=" + IntegerToString(g_pos.posId));
+           ";position_id=" + IntegerToString(g_pos.posId) + ";fill_bits=" + DblBits(po));
    if(newIn && !g_pos.beDone)
       VoidBreakevenBasis();
    return(true);
@@ -789,6 +834,7 @@ void VoidBreakevenBasis()
       g_pos.beBar = 0;
       g_pos.beInSet = "";
       g_pos.beFillBasis = 0;
+      g_pos.beBasisExact = true;
      }
    datetime fillBarOpen = BarOpenOf(g_pos.fillTimeSrv);
    datetime lastInBar = BarOpenOf((datetime)(g_pos.lastInMsc / 1000));
@@ -893,7 +939,7 @@ void AdoptOwn(const string key, const long posId, const ulong ticket, const ulon
            ";sl0=" + DoubleToString(sl0, 5) + ";tp0=" + DoubleToString(tp0, 5) +
            ";fill_time=" + IntegerToString((long)g_pos.fillTimeSrv) + ";fill_time_msc=" + IntegerToString(g_pos.fillTimeMsc) +
            ";in_deals=" + IntegerToString(g_pos.inDeals) + ";last_in_msc=" + IntegerToString(g_pos.lastInMsc) + ";in_set=" + g_pos.inSet +
-           ";fill_sync=" + (ok ? "ok" : "pending") + ";via=" + via);
+           ";fill_sync=" + (ok ? "ok" : "pending") + ";via=" + via + ";fill_bits=" + DblBits(g_pos.fill));
   }
 
 //--- confirm a fill from the deal -> DEAL_POSITION_ID (= POSITION_IDENTIFIER) -> the live position, never from OrderSend's bool
@@ -1351,10 +1397,12 @@ void TryBreakeven(double favLow, datetime barOpen)
       g_pos.beBar = barOpen;
       g_pos.beInSet = g_pos.inSet;
       g_pos.beFillBasis = g_pos.fill;
+      g_pos.beBasisExact = true;
       int digits = (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS);
       Journal(g_pos.key, "BE_TRIGGERED", "fav=" + DoubleToString(favLow, digits) + ";bar_open=" + IntegerToString((long)barOpen) +
               ";fill=" + DoubleToString(g_pos.fill, 5) + ";dist=" + DoubleToString(g_pos.fill - favLow, digits) +
-              ";last_in_msc=" + IntegerToString(g_pos.lastInMsc) + ";in_deals=" + IntegerToString(g_pos.inDeals) + ";in_set=" + g_pos.inSet);
+              ";last_in_msc=" + IntegerToString(g_pos.lastInMsc) + ";in_deals=" + IntegerToString(g_pos.inDeals) + ";in_set=" + g_pos.inSet +
+              ";fill_bits=" + DblBits(g_pos.fill));
       ApplyBreakeven();
      }
   }
@@ -1369,7 +1417,7 @@ void ApplyBreakeven()
       return;
    if(!g_pos.bePending)
       return;                                        // voided by a new IN deal in RefreshFill
-   if(g_pos.beInSet != g_pos.inSet || MathAbs(g_pos.beFillBasis - g_pos.fill) > 1e-6)
+   if(g_pos.beInSet != g_pos.inSet || !BasisMatch(g_pos.beFillBasis, g_pos.beBasisExact, g_pos.fill))
      {
       VoidBreakevenBasis();                          // the basis is not the current fill state
       return;
@@ -1537,6 +1585,7 @@ void Reconcile()
    int    inDeals = 0;
    string inSet = "", beInSet = "";
    double beFillBasis = 0;
+   bool   fillExact = true, beExact = true;
    string closeReq = "";
    bool   closed = false, quarantined = false, bindSeen = false, beSet = false, beTrig = false;
    string l[];
@@ -1576,7 +1625,7 @@ void Reconcile()
         {
          posKey = key; closed = false; quarantined = false;
          posId = StringToInteger(KvGet(kv, "position_id")); posTicket = (ulong)StringToInteger(KvGet(kv, "position"));
-         sl0 = StringToDouble(KvGet(kv, "sl0")); tp0 = StringToDouble(KvGet(kv, "tp0")); fill = StringToDouble(KvGet(kv, "fill_price"));
+         sl0 = StringToDouble(KvGet(kv, "sl0")); tp0 = StringToDouble(KvGet(kv, "tp0")); fill = PxExact(kv, "fill_bits", "fill_price", fillExact);
          fillTime = StringToInteger(KvGet(kv, "fill_time")); fillMsc = StringToInteger(KvGet(kv, "fill_time_msc"));
          vol = StringToDouble(KvGet(kv, "volume"));
          lastIn = MaxL(fillMsc, StringToInteger(KvGet(kv, "last_in_msc"))); inDeals = (int)StringToInteger(KvGet(kv, "in_deals"));
@@ -1587,7 +1636,7 @@ void Reconcile()
          continue;
       if(st == "POSITION_UPDATED")
         {
-         fill = StringToDouble(KvGet(kv, "fill_price")); vol = StringToDouble(KvGet(kv, "volume"));
+         fill = PxExact(kv, "fill_bits", "fill_price", fillExact); vol = StringToDouble(KvGet(kv, "volume"));
          lastIn = MaxL(lastIn, StringToInteger(KvGet(kv, "last_in_msc"))); inDeals = (int)StringToInteger(KvGet(kv, "in_deals"));
          inSet = KvGet(kv, "in_set");
         }
@@ -1595,7 +1644,7 @@ void Reconcile()
       if(st == "BE_TRIGGERED")
         {
          beTrig = true; beFav = StringToDouble(KvGet(kv, "fav")); beBar = StringToInteger(KvGet(kv, "bar_open"));
-         beInSet = KvGet(kv, "in_set"); beFillBasis = StringToDouble(KvGet(kv, "fill"));
+         beInSet = KvGet(kv, "in_set"); beFillBasis = PxExact(kv, "fill_bits", "fill", beExact);
         }
       // BE_TRIGGER_VOID is informational: whether a condition is restored is decided by its basis below
       if(st == "BE_SET") beSet = true;
@@ -1634,13 +1683,13 @@ void Reconcile()
       g_pos.inSet = inSet;
       datetime fbo = BarOpenOf(g_pos.fillTimeSrv), lib = BarOpenOf((datetime)(lastIn / 1000));
       g_pos.lastBarDone = lib > fbo ? lib : fbo;
-      if(beTrig && (beInSet == "" || beInSet != inSet || MathAbs(beFillBasis - fill) > 1e-6))
+      if(beTrig && (beInSet == "" || beInSet != inSet || !BasisMatch(beFillBasis, beExact && fillExact, fill)))
          beTrig = false;                             // a condition met on another basis (another IN deal set / average) is not restored
       g_pos.closeReason = closeReq;                  // a required close survives the restart
       g_pos.beDone = beSet;
       g_pos.bePending = beTrig && !beSet;            // a met breakeven condition survives the restart (no re-reading needed)
       g_pos.beFav = beFav; g_pos.beBar = (datetime)beBar;
-      g_pos.beInSet = beTrig ? beInSet : ""; g_pos.beFillBasis = beTrig ? beFillBasis : 0;
+      g_pos.beInSet = beTrig ? beInSet : ""; g_pos.beFillBasis = beTrig ? beFillBasis : 0; g_pos.beBasisExact = beTrig ? beExact : true;
       g_pos.fillBarDone = beTrig || beSet;
       g_hasPos = true;
       int sel = SelectOwn();
@@ -1699,7 +1748,7 @@ void CheckResume()
 void PollCommands()
   {
    string name;
-   long sh = FileFindFirst(Dir("cmd") + "\\*.cmd", name, FILE_COMMON);
+   long sh = FileFindFirst(Dir("cmd") + "\\*.entry.txt", name, FILE_COMMON);
    if(sh == INVALID_HANDLE)
       return;
    string files[];

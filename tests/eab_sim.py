@@ -11,6 +11,10 @@
   EAB-22..28 : regressions of the ST3-1 review: post-claim revocation before / while the EA asks / after a bridge restart, GO once per
                key within the deadline, an emergency close request is not a close, EA / bridge heartbeats, DB upgrade
   EAB-29     : ST3-2 re-review: POSITION_UPDATED (fill in parts) and CLOSE_REQUIRED in the lifecycle
+  EAB-30..32 : ST3-6 (fixes found on the user's Windows PC): the real CLI (main -> setup_log -> once / status / run -> heartbeat) in a
+               subprocess; the heartbeat replacement retried only for known sharing errors within 250 ms (GO answers never); command
+               files named *.entry.txt (MQL5 refused *.cmd with error 5002 on Windows — a Linux file system cannot show that limit, so
+               the MQL5 / Windows behaviour stays a separate check on the PC), old *.cmd reported, not moved
 Evidence class: local Python only. No TradingView / Windows / MT5 run; the EA side is the Python reference model, not the MQL5 EA.
 """
 import hashlib
@@ -128,9 +132,9 @@ def gate_claim():
         L = life(b, m["key"])
         kh = hashlib.sha256(m["key"].encode()).hexdigest()[:16]
         check("EAB-01 an eligible SHORT MARKET SATS_NOW ENTRY 2 s after its bar close: claimed once in the receiver DB (claimed_ms, claim_log ok), "
-              "ONE command file <bar_close>_<sha256(key)[:16]>.cmd (no .tmp left) with the key, key hash, prices, bar close, sid, cfg hash, "
+              "ONE command file <bar_close>_<sha256(key)[:16]>.entry.txt (ST3-6; no .tmp left) with the key, key hash, prices, bar close, sid, cfg hash, "
               "TradingView symbol; bridge lifecycle CMD_WRITTEN with separate received / checked / claim start / claimed / written times",
-              n == 1 and files == [f"{bc}_{kh}.cmd"] and c.get("key") == m["key"] and c.get("key_hash") == kh and c.get("ev") == "ENTRY"
+              n == 1 and files == [f"{bc}_{kh}.entry.txt"] and c.get("key") == m["key"] and c.get("key_hash") == kh and c.get("ev") == "ENTRY"
               and c.get("side") == "SHORT" and c.get("otype") == "MARKET" and c.get("path") == "SATS_NOW" and float(c["px"]) == 2600.0
               and float(c["sl"]) == 2605.0 and float(c["tp"]) == 2592.5 and c.get("bar_close_ms") == str(bc) and c.get("v") == "2"
               and c.get("sid") == m["sid"] and c.get("cfg_sha256") == eb.DEFAULT_CONFIG["expected"]["cfg_sha256"] and c.get("sym") == "OANDA:XAUUSD"
@@ -521,7 +525,7 @@ def gate_e2e():
             b.once()
             L = life(b, m["key"])
             out[nm] = (L["state"], L["reason"], L["ea_pre_send_ms"] is not None, len(term.writes), L["volume"], L["mt5_open"],
-                       env.cmds(), len([n for n in env.cmds("done") if n.endswith(".cmd")]), L["go_ms"] is not None, first)
+                       env.cmds(), len([n for n in env.cmds("done") if n.endswith(".entry.txt")]), L["go_ms"] is not None, first)
             ea.on_deinit()
         finally:
             env.close()
@@ -788,8 +792,131 @@ def gate_test_entry():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def gate_st36():
+    import signal
+    import subprocess
+    import time
+    from unittest import mock
+    script = os.path.join(BDIR, "ea_bridge.py")
+    # 1. the real entry point: main -> load_config -> setup_log (module-level logging.handlers) -> once / status / run
+    tmp = tempfile.mkdtemp(prefix="eab_cli_")
+    out = {}
+    try:
+        cfgp = os.path.join(tmp, "bridge_config.json")
+        json.dump({"receiver_data_dir": os.path.join(tmp, "receiver_test"), "bridge_data_dir": os.path.join(tmp, "bridge_test"),
+                   "exchange_dir": os.path.join(tmp, "exchange_test")}, open(cfgp, "w"))
+        cmd = lambda mode: [sys.executable, script, mode, "--config", cfgp]
+        hb = os.path.join(tmp, "exchange_test", "hb_bridge.txt")
+        r1 = subprocess.run(cmd("once"), capture_output=True, text=True, timeout=30)
+        out["once"] = (r1.returncode, (r1.stdout.strip().splitlines() or [""])[-1], os.path.isfile(os.path.join(tmp, "bridge_test", "bridge.log")),
+                       os.path.isfile(hb), "Traceback" in r1.stdout + r1.stderr)
+        os.makedirs(os.path.join(tmp, "exchange_test", "cmd"), exist_ok=True)
+        open(os.path.join(tmp, "exchange_test", "cmd", "1_old.cmd"), "w").write("v=2\n")
+        r2 = subprocess.run(cmd("status"), capture_output=True, text=True, timeout=30)
+        out["status"] = (r2.returncode, "hb_bridge.txt: age" in r2.stdout, "legacy *.cmd in cmd/ (not read by the EA since ST3-6): 1  1_old.cmd" in r2.stdout)
+        os.remove(hb)
+        pr = subprocess.Popen(cmd("run"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            dl = time.monotonic() + 15
+            while not os.path.exists(hb) and pr.poll() is None and time.monotonic() < dl:
+                time.sleep(0.05)
+            first = os.stat(hb).st_mtime_ns if os.path.exists(hb) else None
+            dl = time.monotonic() + 5
+            while first is not None and os.stat(hb).st_mtime_ns == first and time.monotonic() < dl:
+                time.sleep(0.05)
+            out["run"] = (first is not None, first is not None and os.stat(hb).st_mtime_ns != first, pr.poll() is None)
+        finally:
+            if pr.poll() is None:
+                pr.send_signal(signal.SIGINT)
+            so, se = pr.communicate(timeout=15)
+        out["run"] += (pr.returncode, "Traceback" in so + se, "legacy command files" in so + se,
+                       os.path.exists(os.path.join(tmp, "exchange_test", "cmd", "1_old.cmd")))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    check("EAB-30 (ST3-6, found on Windows: UnboundLocalError from the local `import logging.handlers` in setup_log) the real CLI in a "
+          "subprocess with TEST folders: once -> exit 0, {\"commands_written\": 0}, bridge.log and hb_bridge.txt written, no traceback; status "
+          "reads the database / heartbeat and reports an old *.cmd; run starts, writes and keeps updating its heartbeat, stops on SIGINT "
+          "with exit 0; the old *.cmd is warned about and left in place",
+          out.get("once") == (0, '{"commands_written": 0}', True, True, False) and out.get("status") == (0, True, True)
+          and out.get("run") == (True, True, True, 0, False, True, True), str(out))
+    # 2. heartbeat replacement: bounded retry for known Windows sharing errors only, GO answers unchanged
+    def denied(code):
+        e = PermissionError("simulated Windows sharing violation")
+        e.winerror = code
+        return e
+    res = {}
+    tmp = tempfile.mkdtemp(prefix="eab_hb_")
+    try:
+        target = os.path.join(tmp, "hb_bridge.txt")
+        real = os.replace
+        for code in (5, 32, 33):
+            open(target, "w").write("old")
+            calls, seen_old = [], []
+            def rep(src, dst, calls=calls, seen_old=seen_old, code=code):
+                calls.append(1)
+                if len(calls) < 3:
+                    seen_old.append(open(dst).read())
+                    raise denied(code)
+                real(src, dst)
+            with mock.patch.object(eb.os, "replace", rep), mock.patch.object(eb.time, "sleep"):
+                eb.write_atomic(target, "new", retry_sharing=True)
+            res[code] = (len(calls), seen_old, open(target).read())
+        for nm, enabled, code in (("answer path", False, 32), ("other winerror", True, 999), ("no winerror", True, None)):
+            with mock.patch.object(eb.os, "replace", side_effect=denied(code)) as rp, mock.patch.object(eb.time, "sleep") as sl:
+                try:
+                    eb.write_atomic(target, "new", retry_sharing=enabled)
+                    raised = False
+                except PermissionError:
+                    raised = True
+            res[nm] = (raised, rp.call_count, sl.call_count)
+        now = [0.0]
+        with mock.patch.object(eb.os, "replace", side_effect=denied(5)), mock.patch.object(eb.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(eb.time, "sleep", side_effect=lambda d: now.__setitem__(0, now[0] + d)):
+            try:
+                eb.write_atomic(target, "new", retry_sharing=True)
+                res["persistent"] = (False, now[0])
+            except PermissionError:
+                res["persistent"] = (True, round(now[0], 4))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    src = open(os.path.join(BDIR, "ea_bridge.py"), encoding="utf-8").read()
+    calls = re.findall(r"write_atomic\(([^\n]*)\)\n", src)
+    check("EAB-31 (ST3-6, found on Windows: WinError 5 / 32 replacing hb_bridge.txt) heartbeat only: WinError 5 / 32 / 33 retried until the "
+          "atomic replace succeeds, the old file intact meanwhile; a persistent denial raised after the 250 ms window (never swallowed); "
+          "no retry without the opt-in (the GO / NOGO answers keep their timing) nor for another error; the only opt-in is write_heartbeat "
+          "(the answer write has none). The root cause of the sharing errors is not solved by this",
+          all(res[c] == (3, ["old", "old"], "new") for c in (5, 32, 33)) and res["answer path"] == (True, 1, 0)
+          and res["other winerror"] == (True, 1, 0) and res["no winerror"] == (True, 1, 0) and res["persistent"][0]
+          and 0.25 <= res["persistent"][1] <= 0.251 and src.count("retry_sharing=True") == 1
+          and [c for c in calls if "retry_sharing" in c] == ['self._x("hb_bridge.txt"), f"t_ms={self.clock()}\\nlast_receipt_ms={(last and last[\'m\']) or 0}\\n", retry_sharing=True']
+          and any(c.startswith('self._x("ans", kh + ".ans"), body') and "retry_sharing" not in c for c in calls), str((res, calls)))
+    # 3. command file name
+    mq = open(os.path.join(ROOT, "automation", "xau_short", "ea", "XauShortDemoEA.mq5"), encoding="utf-8").read()
+    env = Env()
+    try:
+        env.receiver()
+        m = E(5)
+        bc = m["bar_close"]
+        env.send(m, bc + 1500)
+        b = env.bridge(Clock(bc + 2000))
+        b.once()
+        names = env.cmds()
+        b._revoke(b._row(m["key"]), "test", bc + 2500)
+        moved = env.cmds("revoked")
+    finally:
+        env.close()
+    check("EAB-32 (ST3-6, found on Windows: MQL5 FileFindFirst / FileIsExist on *.cmd -> error 5002) the bridge writes and revokes "
+          "<bar_close>_<key hash>.entry.txt and the EA reads only \\*.entry.txt; no .cmd name left in the bridge / EA code; the ask / ans / "
+          "rpt / tmp names were exercised by the user's synthetic ENTRY on Windows. Linux cannot reproduce the MQL5 restriction: the EA side "
+          "is a separate check on the PC",
+          len(names) == 1 and names[0].endswith(".entry.txt") and moved == names
+          and mq.count('FileFindFirst(Dir("cmd") + "\\\\*.entry.txt"') == 1 and ".cmd\"" not in mq and "*.cmd" not in mq
+          and '.cmd"' not in src.replace('n.endswith(".cmd")', ""), str((names, moved)))
+
+
 def main():
-    for g in (gate_claim, gate_filter, gate_deadline, gate_restart, gate_reports, gate_real_data, gate_e2e, gate_review, gate_test_entry):
+    for g in (gate_claim, gate_filter, gate_deadline, gate_restart, gate_reports, gate_real_data, gate_e2e, gate_review, gate_test_entry,
+              gate_st36):
         try:
             g()
         except Exception:
