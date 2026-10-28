@@ -222,6 +222,8 @@ class Pos:
         self.posId = self.posTicket = self.orderTicket = self.dealTicket = 0
         self.fill = self.sl0 = self.tp0 = self.volume = 0.0
         self.fillTimeSrv = self.fillTimeMsc = self.lastInMsc = self.inDeals = 0
+        self.inSet = self.beInSet = ""
+        self.beFillBasis = 0.0
         self.fillSyncPending = False
         self.tpSet = self.beDone = self.bePending = self.fillBarDone = self.fillBarUnavailNoted = False
         self.beFav, self.beBar, self.lastBeTry = 0.0, 0, 0
@@ -616,38 +618,49 @@ class EA:
         return 0
 
     def fill_stats(self, ident):
+        """IN / OUT totals, IN count, last IN time and the IN deal set identity (sha16 of the sorted IN deal tickets)."""
         vin = vout = 0.0
         n_in = last_in = 0
-        for _, x in self.t.history_by_position(ident):
+        ins = []
+        for d, x in self.t.history_by_position(ident):
             if x["entry"] == "IN":
                 vin, n_in, last_in = vin + x["volume"], n_in + 1, max(last_in, x["time_msc"])
+                ins.append(d)
             elif x["entry"] == "OUT":
                 vout += x["volume"]
-        return vin, vout, n_in, last_in
+        return vin, vout, n_in, last_in, sha16("".join(f"{d}," for d in sorted(ins)))
+
+    def position_unchanged(self, ticket, ident, v, po):
+        p = self.t.positions.get(ticket)
+        return p is not None and p["identifier"] == ident and abs(p["volume"] - v) <= 1e-9 and abs(p["price_open"] - po) <= 1e-9
 
     def refresh_fill(self):
         """the fill state must be explained by the history (IN - OUT = live volume); otherwise FILL_HISTORY_PENDING and wait."""
         P = self.pos
-        p = self.own()
+        p = self.t.positions.get(P.posTicket)
+        if p is None:
+            return False
         v, po = p["volume"], p["price_open"]
-        vin, vout, n_in, last_in = self.fill_stats(P.posId)
-        if not (n_in > 0 and abs(vin - vout - v) <= 1e-6):
+        vin, vout, n_in, last_in, in_set = self.fill_stats(P.posId)
+        stable = self.position_unchanged(P.posTicket, P.posId, v, po)      # re-read AFTER the history
+        if not (stable and n_in > 0 and abs(vin - vout - v) <= 1e-6):
             if not P.fillSyncPending:
                 P.fillSyncPending = True
-                self.journal(P.key, "FILL_HISTORY_PENDING", f"live_volume={v:.2f};hist_in={vin:.2f};hist_out={vout:.2f};in_deals={n_in};"
-                                                            "note=breakeven_and_fill_checks_wait")
+                why = "position_changed_during_read" if not stable else "history_does_not_explain_volume"
+                self.journal(P.key, "FILL_HISTORY_PENDING", f"reason={why};live_volume={v:.2f};hist_in={vin:.2f};hist_out={vout:.2f};"
+                                                            f"in_deals={n_in};note=breakeven_and_fill_checks_wait")
             return False
         last_in = max(last_in, P.fillTimeMsc)
-        new_in = n_in != P.inDeals or last_in != P.lastInMsc
+        new_in = in_set != P.inSet or n_in != P.inDeals or last_in != P.lastInMsc
         was_pending = P.fillSyncPending
         changed = new_in or abs(v - P.volume) > 1e-9 or abs(po - P.fill) > 1e-9 or was_pending
         P.fillSyncPending = False
         if not changed:
             return True
         cause = "add" if v > P.volume + 1e-9 else "reduce" if v < P.volume - 1e-9 else "history" if (new_in or was_pending) else "price"
-        P.volume, P.fill, P.inDeals, P.lastInMsc = v, po, n_in, last_in
+        P.volume, P.fill, P.inDeals, P.inSet, P.lastInMsc = v, po, n_in, in_set, last_in
         self.journal(P.key, "POSITION_UPDATED", f"cause={cause};volume={v:.2f};fill_price={po:.5f};last_in_msc={last_in};"
-                                                f"in_deals={n_in};position_id={P.posId}")
+                                                f"in_deals={n_in};in_set={in_set};position_id={P.posId}")
         if new_in and not P.beDone:
             self.void_breakeven_basis()
         return True
@@ -657,7 +670,7 @@ class EA:
         if P.bePending:
             self.journal(P.key, "BE_TRIGGER_VOID", f"reason=later_in_deal;fav={P.beFav:.5f};bar_open={P.beBar};last_in_msc={P.lastInMsc};"
                                                    f"fill={P.fill:.5f}")
-            P.bePending, P.beFav, P.beBar = False, 0.0, 0
+            P.bePending, P.beFav, P.beBar, P.beInSet, P.beFillBasis = False, 0.0, 0, "", 0.0
         fbo = P.fillTimeSrv - P.fillTimeSrv % BAR_SEC
         li = P.lastInMsc // 1000
         lib = li - li % BAR_SEC
@@ -696,9 +709,10 @@ class EA:
         P = self.pos = Pos()
         P.key, P.posId, P.posTicket, P.orderTicket, P.dealTicket = key, pos_id, ticket, order, deal
         P.fill, P.volume, P.sl0, P.tp0, P.fillTimeSrv, P.fillTimeMsc = p["price_open"], p["volume"], sl0, tp0, p["time"], p["time_msc"]
-        vin, vout, n_in, last_in = self.fill_stats(pos_id)
-        ok = n_in > 0 and abs(vin - vout - P.volume) <= 1e-6
+        vin, vout, n_in, last_in, in_set = self.fill_stats(pos_id)
+        ok = self.position_unchanged(ticket, pos_id, P.volume, P.fill) and n_in > 0 and abs(vin - vout - P.volume) <= 1e-6
         P.inDeals = n_in if ok else 0
+        P.inSet = in_set if ok else ""
         P.lastInMsc = max(last_in, P.fillTimeMsc) if ok else P.fillTimeMsc
         P.fillSyncPending = not ok
         fbo = P.fillTimeSrv - P.fillTimeSrv % BAR_SEC
@@ -707,7 +721,7 @@ class EA:
         self.hasPos = True
         self.journal(key, "FILLED", f"order={order};deal={deal};position_id={pos_id};position={ticket};fill_price={P.fill:.5f};"
                                     f"volume={P.volume:.2f};sl0={sl0:.5f};tp0={tp0:.5f};fill_time={P.fillTimeSrv};fill_time_msc={P.fillTimeMsc};"
-                                    f"in_deals={P.inDeals};last_in_msc={P.lastInMsc};fill_sync={'ok' if ok else 'pending'};via={via}")
+                                    f"in_deals={P.inDeals};last_in_msc={P.lastInMsc};in_set={P.inSet};fill_sync={'ok' if ok else 'pending'};via={via}")
 
     def confirm_fill(self, key, order, deal, sl0, tp0):
         pos_id = self.t.deals[deal]["position"] if deal and deal in self.t.deals else 0
@@ -994,16 +1008,23 @@ class EA:
         if P.beDone or P.bePending or fav_low <= 0:
             return
         if P.fill - fav_low >= BE_DIST - 1e-9:
-            P.bePending, P.beFav, P.beBar = True, fav_low, bar_open
+            P.bePending, P.beFav, P.beBar, P.beInSet, P.beFillBasis = True, fav_low, bar_open, P.inSet, P.fill
             digits = self.t.sym["digits"]
-            self.journal(P.key, "BE_TRIGGERED", f"fav={fav_low:.{digits}f};bar_open={bar_open};fill={P.fill:.{digits}f};"
-                                                f"dist={P.fill - fav_low:.{digits}f};last_in_msc={P.lastInMsc};in_deals={P.inDeals}")
+            self.journal(P.key, "BE_TRIGGERED", f"fav={fav_low:.{digits}f};bar_open={bar_open};fill={P.fill:.5f};"
+                                                f"dist={P.fill - fav_low:.{digits}f};last_in_msc={P.lastInMsc};in_deals={P.inDeals};in_set={P.inSet}")
             self.apply_breakeven()
 
     def apply_breakeven(self):
         P = self.pos
         P.lastBeTry = self.t.time_server()
         digits = self.t.sym["digits"]
+        if self.select_own() != 1 or not self.refresh_fill():
+            return
+        if not P.bePending:
+            return
+        if P.beInSet != P.inSet or abs(P.beFillBasis - P.fill) > 1e-6:
+            self.void_breakeven_basis()
+            return
         if self.select_own() != 1:
             return
         new_sl = round(P.fill, digits)
@@ -1085,7 +1106,9 @@ class EA:
         pre_ms, pre_sl, pre_tp = 0, 0.0, 0.0
         pos_id = fill_msc = fill_time = pos_ticket = 0
         sl0 = tp0 = fill = vol = be_fav = 0.0
-        last_in = be_bar = be_basis = in_deals = 0
+        last_in = be_bar = in_deals = 0
+        in_set = be_in_set = ""
+        be_fill_basis = 0.0
         close_req = ""
         closed = quarantined = bind_seen = be_set = be_trig = False
         a = self.t.account
@@ -1125,19 +1148,20 @@ class EA:
                 fill_time, fill_msc = to_int(kv_get(kv, "fill_time")), to_int(kv_get(kv, "fill_time_msc"))
                 vol = to_float(kv_get(kv, "volume"))
                 last_in, in_deals = max(fill_msc, to_int(kv_get(kv, "last_in_msc"))), to_int(kv_get(kv, "in_deals"))
+                in_set = kv_get(kv, "in_set")
                 close_req, be_set, be_trig = "", False, False
             if not pos_key or key != pos_key:
                 continue
             if st == "POSITION_UPDATED":
                 fill, vol = to_float(kv_get(kv, "fill_price")), to_float(kv_get(kv, "volume"))
                 last_in, in_deals = max(last_in, to_int(kv_get(kv, "last_in_msc"))), to_int(kv_get(kv, "in_deals"))
+                in_set = kv_get(kv, "in_set")
             if st == "CLOSE_REQUIRED":
                 close_req = kv_get(kv, "reason")
             if st == "BE_TRIGGERED":
                 be_trig, be_fav, be_bar = True, to_float(kv_get(kv, "fav")), to_int(kv_get(kv, "bar_open"))
-                be_basis = to_int(kv_get(kv, "last_in_msc"))
-            if st == "BE_TRIGGER_VOID":
-                be_trig = False
+                be_in_set, be_fill_basis = kv_get(kv, "in_set"), to_float(kv_get(kv, "fill"))
+            # BE_TRIGGER_VOID is informational: whether a condition is restored is decided by its basis below
             if st == "BE_SET":
                 be_set = True
             if st == "CLOSED":
@@ -1161,13 +1185,14 @@ class EA:
         if pos_key and not closed and not quarantined and pos_id > 0:
             P = self.pos = Pos()
             P.key, P.posId, P.posTicket, P.sl0, P.tp0, P.fill = pos_key, pos_id, pos_ticket, sl0, tp0, fill
-            P.volume, P.fillTimeSrv, P.fillTimeMsc, P.lastInMsc, P.inDeals = vol, fill_time, fill_msc, last_in, in_deals
+            P.volume, P.fillTimeSrv, P.fillTimeMsc, P.lastInMsc, P.inDeals, P.inSet = vol, fill_time, fill_msc, last_in, in_deals, in_set
             li = last_in // 1000
             P.lastBarDone = max(li - li % BAR_SEC, fill_time - fill_time % BAR_SEC)
-            if be_trig and be_basis != last_in:
+            if be_trig and (not be_in_set or be_in_set != in_set or abs(be_fill_basis - fill) > 1e-6):
                 be_trig = False
             P.closeReason = close_req
             P.beDone, P.bePending, P.beFav, P.beBar = be_set, be_trig and not be_set, be_fav, be_bar
+            P.beInSet, P.beFillBasis = (be_in_set, be_fill_basis) if be_trig else ("", 0.0)
             P.fillBarDone = be_trig or be_set
             self.hasPos = True
             sel = self.select_own()

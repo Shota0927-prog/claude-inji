@@ -1,4 +1,4 @@
-# ゴールドショート自動化 — 第3段階「デモEA」(ST3-4: ST3-3 再レビュー指摘の修正)
+# ゴールドショート自動化 — 第3段階「デモEA」(ST3-5: ST3-4 再レビュー指摘の修正)
 
 **位置づけ**
 - 今回もコード・設計・ローカル試験までです。発注は OFF のままです。
@@ -13,8 +13,8 @@
 
 | 区分 | 内容 | 状態 |
 |---|---|---|
-| Python 試験 | bridge 実コード (`tests/eab_sim.py` 29 件)、EA 規則の Python 参照モデル (`tests/ea_model.py`) と MQL5 ソースの静的照合 (`tests/eam_sim.py` 65 件) | 実施 |
-| ST3-3 再レビュー指摘の再現 | 修正前 (4baed40) と修正後で同じシナリオを実行 (参照モデル。**MQL5 実行ではない**) | 実施 (レビュー zip の `repro_before_4baed40.txt` / `repro_after_st3-4.txt`) |
+| Python 試験 | bridge 実コード (`tests/eab_sim.py` 29 件)、EA 規則の Python 参照モデル (`tests/ea_model.py`) と MQL5 ソースの静的照合 (`tests/eam_sim.py` 68 件) | 実施 |
+| ST3-4 再レビュー指摘の再現 | 修正前 (72faec1) と修正後で同じシナリオを実行 (参照モデル。**MQL5 実行ではない**) | 実施 (レビュー zip の `repro_before_72faec1.txt` / `repro_after_st3-5.txt` / `void_redundancy_72faec1.txt`) |
 | MQL5 コンパイル | `ea/XauShortDemoEA.mq5` | **未実施** |
 | MT5 デモ実地 | 発注・取消・SL・TP・建値・再起動・異常系 | **未実施** (第4段階) |
 
@@ -103,6 +103,20 @@ MT5 の共通フォルダでのファイル交換です (ST3-1 と同じ)。
   - 建値設定後に平均価格の下がる後続約定があっても、SL はそのままです。
   - 新しい平均価格への自動の再設定もしません (提案外)。
 - 不足数量の追加発注はしません。
+
+## 2d. ST3-4 再レビュー指摘への対応 (ST3-5)
+
+| # | 指摘 | 修正 | 回帰試験 |
+|---|---|---|---|
+| 1 | 履歴読み込み中に建玉が変わると、古い状態を同期済みにしてしまう | `RefreshFill` を「建玉を読む → 履歴を読む (`FillStats`) → **建玉を読み直す** (`PositionUnchanged`)」の順にしました。<br>• 読み直しで、チケット・識別子・数量・平均価格が前と一致することを確認します。<br>• 一致しなければ、その組を採用しません (`FILL_HISTORY_PENDING reason=position_changed_during_read`、次のタイマーで再照合)。`AdoptOwn` も同じ確認をします。<br>• `ApplyBreakeven` は SL 変更の直前に `RefreshFill` をやり直し、判定根拠が現在の約定状態と一致する場合だけ SL を変更します。<br>• 保留中も初期 SL 確認と必要な決済は続けます (従来どおり)。 | EAR-16, EAS-17 |
+| 2 | 同じミリ秒の別 IN 約定では、再起動時の根拠照合が不足する | 判定根拠を「IN 約定集合の識別子 (`in_set` = IN 約定チケットを並べて SHA-256 した値)」+「判定時の平均価格」にしました。<br>• FILLED・POSITION_UPDATED・BE_TRIGGERED に `in_set` を記録します。<br>• 再起動時は、BE_TRIGGERED の `in_set` と平均価格が、最新の約定状態と一致するときだけ再試行待ちを復元します。<br>• `BE_TRIGGER_VOID` は参考記録で、復元の判断には使いません。POSITION_UPDATED と BE_TRIGGER_VOID の間で停止しても、古い判定は復活しません。 | EAR-17, EAS-17 |
+
+**前回 (ST3-4) の判断の訂正**
+- 前回は「再起動時に BE_TRIGGER_VOID を読む処理を削除しても結果は変わらない (冗長)」と報告しましたが、**誤りでした**。
+- 同じミリ秒の別 IN 約定では `last_in_msc` が変わらないため、72faec1 ではその読み取りだけが古い判定の復活を防いでいました。削除すると SL 2598.20 の建値設定が起きることを確認しています (`void_redundancy_72faec1.txt`)。
+- ST3-5 では根拠の照合 (IN 約定集合 + 平均価格) を唯一の判断材料にし、冗長な経路を残していません。改変試験で次のことを確認しました。
+  - 照合の各要素 (IN 約定集合・平均価格) を外すと、試験が失敗する。
+  - 平均価格だけが変わるケース (約定なしの価格変更) も試験に含めている。
 
 ## 3. 最終実行許可 (claim と GO の分離)
 
@@ -257,12 +271,12 @@ CHECKED → SKIPPED_BY_BRIDGE (… / skip:ea_heartbeat_stale)
 - **管理:**
   - `TP_SET` / `BE_TRIGGERED` → `BE_SET` / `MODIFY_FAILED` / `MODIFY_REFUSED` / `FILL_SIDE_BAD`
   - `FILLBAR_NO_TICKS` (履歴あり・ティック 0) / `FILLBAR_TICKS_UNAVAILABLE` (履歴なし・再読込)
-  - `FILL_HISTORY_PENDING` (約定履歴が実建玉を説明しない間は判定保留) / `BE_TRIGGER_VOID` (後続 IN 約定で旧判定を無効化)
+  - `FILL_HISTORY_PENDING` (約定履歴が実建玉を説明しない間・読み込み中に建玉が変わった場合は判定保留) / `BE_TRIGGER_VOID` (後続 IN 約定で旧判定を無効化。参考記録)
   - `POSITION_UPDATED` / `TICKET_CHANGED` / `MANAGEMENT_BLOCKED` / `CLOSED`
 - **再起動で復元するもの:**
   - 自分の建玉 (FILLED + POSITION_UPDATED: 数量・平均・最後の IN・IN 数)
   - 必要な決済 (CLOSE_REQUIRED)
-  - 成立済みの建値 (BE_TRIGGERED は根拠が同じときだけ / BE_SET)
+  - 成立済みの建値 (BE_TRIGGERED は根拠 = IN 約定集合 `in_set` + 平均価格 が同じときだけ / BE_SET)
   - 結果不明、HALT / CRITICAL
   - 起動後に約定履歴と再照合します (RefreshFill)。
 - **結果不明:** `UNKNOWN` → `UNKNOWN_CHECK` → `UNKNOWN_RESOLVE_REFUSED` | `UNKNOWN_RESOLVED`
@@ -299,7 +313,8 @@ CHECKED → SKIPPED_BY_BRIDGE (… / skip:ea_heartbeat_stale)
 
 ## 11. 完全な排他の限界
 
-- **今回 (ST3-4) を含め、修正で競合が無くなったわけではありません。**
+- **今回 (ST3-5) を含め、修正で競合が無くなったわけではありません。**
+  - 履歴と建玉の読み直しで一致を確かめた後から、SL 変更がサーバーに届くまでに別の約定が入る可能性は残ります。この場合も、次のタイマーで新しい約定を確認して判定し直します。SL を緩める変更はしません。
   - GO 発行後 (最大 3 秒) に到着した取消は止められません (§3)。
   - FinalGate から約定までの間の変化も止められません (§4)。
 - **口座全体の最大 1 は、送信直前 (FinalGate) の確認です。** 確認から約定までの間に手動・他 EA が注文すると、両方が建つことはあり得ます。

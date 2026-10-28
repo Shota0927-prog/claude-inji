@@ -17,7 +17,9 @@ automation/xau_short/ea/XauShortDemoEA.mq5 (the model and the source must keep t
                results + persisted close obligation, later deals of the same order (volume / average), breakeven pending across restarts
   EAR-13..15 : regressions of the ST3-3 re-review: the clock checked after FinalGate's file reads, the fill state / last IN deal from
                the history (adoption with several IN deals, history arriving late, restart), breakeven basis voided by a later IN deal
-  EAS-01..16 : the MQL5 source (static): inputs, constants, approvals, the only OrderSend sites and their gates / order, journal
+  EAR-16..17 : regressions of the ST3-4 re-review: a change during the history read (pass, adoption, right before the SL change),
+               a same-ms IN deal with / without a crash between POSITION_UPDATED and BE_TRIGGER_VOID, restart
+  EAS-01..17 : the MQL5 source (static): inputs, constants, approvals, the only OrderSend sites and their gates / order, journal
                states, refusal reasons, definite-reject list, ownership by identifier, unknown handling, fill-bar ticks, bridge map
 Evidence class: local Python only. The MQL5 EA itself is NOT compiled or run here (no MetaEditor / MT5 in this environment).
 """
@@ -1322,6 +1324,152 @@ def gate_rereview2():
           and c4 == (2600.2, 2599.1, 1, []), str((c1, c2, c3, c4)))
 
 
+def gate_rereview3():
+    """regressions of the ST3-4 re-review (items 1-2)."""
+    def later_in(b, p, at_msc, price, vol):
+        tot = round(p["volume"] + vol, 2)
+        p["price_open"] = round((p["price_open"] * p["volume"] + price * vol) / tot, 5)
+        p["volume"] = tot
+        d = b.t._ticket()
+        b.t.deals[d] = dict(order=0, position=p["identifier"], price=price, time=at_msc // 1000, time_msc=at_msc, entry="IN", volume=vol,
+                            symbol="XAUUSDs", magic=p["magic"], comment=p["comment"], reason="EXPERT", profit=0.0, commission=0.0, swap=0.0)
+
+    def change_during_read(after_ticks):
+        b = Box()
+        b.t.send_mode = "partial"
+        kh = fill(b)
+        p = b.own()
+        F = p["time_msc"]
+        fo = p["time"] - p["time"] % 300
+        b.t.ticks = [(F + 5000, 2584.2), (F + 25000, after_ticks)]
+        orig = b.ea.fill_stats
+        armed = [False]
+
+        def stats_then_change(*a, **k):
+            r = orig(*a, **k)
+            if armed[0]:
+                armed[0] = False
+                later_in(b, p, F + 20000, 2601.0, 0.20)
+            return r
+        b.ea.fill_stats = stats_then_change
+        b.at_srv(fo + 300)
+        armed[0] = True
+        b.timer()
+        first = ((b.ea.last(kh, "FILL_HISTORY_PENDING") or {}).get("reason"), b.ea.pos.volume, b.ea.last(kh, "BE_SET"), p["sl"])
+        b.at_srv(fo + 301)
+        b.timer()
+        upd = b.ea.last(kh, "POSITION_UPDATED")
+        second = (upd and (upd["volume"], int(upd["last_in_msc"]) - F, upd["in_deals"]), (b.ea.last(kh, "BE_SET") or {}).get("sl"), p["sl"])
+        b.close()
+        return first, second
+    r1 = change_during_read(2600.0)
+    r2 = change_during_read(2585.5)                 # 15.10 from the new average after the second part
+    b = Box()
+    b.t.send_mode = "fill_lost_reply"
+    kh = fill(b)
+    tk = max(b.t.positions)
+    p = b.t.positions[tk]
+    orig = b.ea.fill_stats
+    armed = [True]
+    later_ok = []
+
+    def adopt_hook(*a, **k):
+        r = orig(*a, **k)
+        if armed[0]:
+            armed[0] = False
+            later_in(b, p, p["time_msc"] + 20000, 2601.0, 0.20)
+            later_ok.append(1)
+        return r
+    b.t.advance(30000)
+    b.touch("resolve_unknown", f"key_hash={kh}\nconfirm=open\n")
+    b.ea.fill_stats = adopt_hook                  # the change lands while AdoptOwn reads the history
+    b.timer()
+    f_ = b.ea.last(kh, "FILLED")
+    r3 = (f_ and f_["fill_sync"], f_ and f_["in_set"], bool(later_ok))
+    b.close()
+    b = Box()
+    b.t.send_mode = "partial"
+    kh = fill(b)
+    p = b.own()
+    F = p["time_msc"]
+    fo = p["time"] - p["time"] % 300
+    b.t.ticks = [(F + 1000, 2584.2)]
+    b.t.modify_mode = "reject"
+    b.at_srv(fo + 300)
+    b.timer()                                       # BE_TRIGGERED, refused, pending
+    b.t.modify_mode = "ok"
+    orig_retry = b.ea.retry_breakeven
+    landed = []
+
+    def deal_lands_then_retry(now):
+        if b.ea.pos.bePending and not landed:
+            landed.append(1)
+            later_in(b, p, (fo + 330) * 1000, 2599.4, 0.20)   # lands after ManageOwn's refresh, before the SL change
+        return orig_retry(now)
+    b.ea.retry_breakeven = deal_lands_then_retry
+    b.at_srv(fo + 600 + 5)
+    b.timer()
+    r4 = (b.ea.last(kh, "BE_SET"), p["sl"], b.ea.last(kh, "BE_TRIGGER_VOID") is not None, b.ea.pos.bePending, b.ea.pos.fill)
+    b.close()
+    check("EAR-16 (ST3-4 re-review 1) a later deal landing WHILE the history is read: the pair is refused (FILL_HISTORY_PENDING "
+          "position_changed_during_read), the EA keeps 0.20 and decides nothing in that pass (no BE from the 2584.20 before the second part); "
+          "the next pass takes 0.40 / last IN +20 s / 2 IN deals and still no BE, while 15.10 after the second part gives BE at 2600.60; at "
+          "adoption the same race gives FILLED fill_sync=pending; a deal landing after ManageOwn's refresh but before the SL change is caught "
+          "by ApplyBreakeven's own refresh (BE_TRIGGER_VOID, no BE, SL stays 2605)",
+          r1[0] == ("position_changed_during_read", 0.2, None, 2605.0) and r1[1] == (("0.40", 20000, "2"), None, 2605.0)
+          and r2[1] == (("0.40", 20000, "2"), "2600.60", 2600.6) and r3 == ("pending", "", True)
+          and r4 == (None, 2605.0, True, False, 2599.8), str((r1, r2, r3, r4)))
+
+    def same_ms(crash, price_only=False):
+        b = Box()
+        b.t.send_mode = "partial"
+        kh = fill(b)
+        p = b.own()
+        F = p["time_msc"]
+        fo = p["time"] - p["time"] % 300
+        b.t.ticks = [(F + 1000, 2584.2)]
+        b.t.modify_mode = "reject"
+        b.at_srv(fo + 300)
+        b.timer()
+        pend = b.ea.pos.bePending
+        if price_only:
+            p["price_open"] = 2599.0                # the average changes WITHOUT a new deal (e.g. a broker adjustment)
+        else:
+            later_in(b, p, F, 2596.2, 0.20)         # same time_msc as the first IN: 0.40 @ 2598.20
+        b.t.modify_mode = "ok"
+        if crash:
+            orig_j = b.ea.journal
+
+            def crash_after_update(key, state, fields):
+                r = orig_j(key, state, fields)
+                if state == "POSITION_UPDATED":
+                    raise SystemExit("crash between POSITION_UPDATED and BE_TRIGGER_VOID")
+                return r
+            b.ea.journal = crash_after_update
+        b.at_srv(fo + 301)
+        try:
+            b.timer()
+        except SystemExit:
+            pass
+        void = b.ea.last(kh, "BE_TRIGGER_VOID") is not None
+        b.restart(crash=crash)
+        restored = b.ea.pos.bePending
+        b.at_srv(fo + 600 + 5)
+        b.timer()
+        upd = b.ea.last(kh, "POSITION_UPDATED")
+        out = (pend, void, restored, b.ea.last(kh, "BE_SET"), p["sl"], upd and upd["in_deals"], upd and int(upd["last_in_msc"]) - F)
+        b.close()
+        return out
+    c1, c2, c3 = same_ms(True), same_ms(False), same_ms(True, price_only=True)
+    check("EAR-17 (ST3-4 re-review 2) a second IN deal with the SAME time_msc changes the IN deal set (in_set) although last_in_msc stays: "
+          "crash between POSITION_UPDATED and BE_TRIGGER_VOID -> the restart does not restore the old condition (basis = IN set + average, "
+          "not the VOID record), no BE from the old 2584.20 (14.00 from the new average 2598.20), SL stays 2605; without the crash the VOID "
+          "is written and the result is the same; with the SAME IN set but another average (price-only change) the condition is not "
+          "restored either (the basis includes the average): no BE at 2599.00 from the old 2584.20 (14.80 now)",
+          c1 == (True, False, False, None, 2605.0, "2", 0) and c2 == (True, True, False, None, 2605.0, "2", 0)
+          and c3[:5] == (True, False, False, None, 2605.0), str((c1, c2, c3)))
+
+
 # ---- static checks of the MQL5 source ------------------------------------------------------------------------------------
 def _func(src, name):
     m = re.search(r"\n[a-zA-Z_ ]+\b" + name + r"\([^)]*\)\s*\n  \{", src)
@@ -1461,13 +1609,24 @@ def gate_static():
           "deal / IN count), BE_TRIGGERED (with its basis last_in_msc) journaled BEFORE the SL change and restored only on the same basis, "
           "BE_TRIGGER_VOID; RefreshFill runs every timer and at restart, takes the state as synced only when IN - OUT = the live volume "
           "(otherwise FILL_HISTORY_PENDING) and voids the breakeven basis on a new IN deal; ManageOwn waits while it is pending",
-          all(x in rc for x in ('"CLOSE_REQUIRED"', '"POSITION_UPDATED"', '"BE_TRIGGERED"', '"BE_TRIGGER_VOID"', "g_pos.closeReason = closeReq;",
-                                "g_pos.bePending = beTrig && !beSet;", "beBasis != lastIn", "RefreshFill();"))
+          all(x in rc for x in ('"CLOSE_REQUIRED"', '"POSITION_UPDATED"', '"BE_TRIGGERED"', "g_pos.closeReason = closeReq;",
+                                "g_pos.bePending = beTrig && !beSet;", "beInSet != inSet", "RefreshFill();"))
           and all(x in rf for x in ("FillStats(g_pos.posId", "MathAbs(vin - vout - v) <= 1e-6", '"FILL_HISTORY_PENDING"', "VoidBreakevenBasis();"))
-          and "SyncFill" not in code and tb.index('"BE_TRIGGERED"') < tb.index("ApplyBreakeven();") and "last_in_msc=" in tb
+          and "SyncFill" not in code and tb.index('"BE_TRIGGERED"') < tb.index("ApplyBreakeven();") and "in_set=" in tb
           and mo_.index("bool fillOk = RefreshFill();") < mo_.index("if(!fillOk || SelectOwn() != 1)") < mo_.index("RetryBreakeven(now);")
           and mo_.index("RetryBreakeven(now);") < mo_.index("FillBarLow(") and "FillStats(posId" in _func(code, "AdoptOwn")
           and 'ModifyOwn("breakeven"' in _func(code, "ApplyBreakeven"), "")
+    ab, fs = _func(code, "ApplyBreakeven"), _func(code, "FillStats")
+    check("EAS-17 (ST3-4 re-review 1/2) the fill state is taken only from a stable read: RefreshFill reads the position, then the history "
+          "(FillStats), then re-reads the position (PositionUnchanged: ticket / identifier / volume / average) and refuses a pair taken "
+          "while it changed; the IN deal set identity (sorted IN tickets, hashed) is the basis together with the average; ApplyBreakeven "
+          "refreshes the state and compares the basis immediately before ModifyOwn; Reconcile restores a condition only on the same IN set "
+          "and average and never decides by reading BE_TRIGGER_VOID",
+          rf.index("FillStats(g_pos.posId") < rf.index("PositionUnchanged(g_pos.posTicket") and "bool ok = read && stable" in rf
+          and "ArraySort(ins);" in fs and "Sha16(j)" in fs and "inSet != g_pos.inSet" in rf
+          and ab.index("RefreshFill()") < ab.index("g_pos.beInSet != g_pos.inSet") < ab.index('ModifyOwn("breakeven"')
+          and "MathAbs(g_pos.beFillBasis - g_pos.fill) > 1e-6" in ab and 'st == "BE_TRIGGER_VOID"' not in rc
+          and "MathAbs(beFillBasis - fill) > 1e-6" in rc and "PositionUnchanged(ticket, posId" in _func(code, "AdoptOwn"), "")
     fg2 = _func(code, "FinalGate")
     check("EAS-16 (ST3-3 re-review 1) FinalGate reads first and checks the clock last: NewEntriesAllowed (halt file, bridge heartbeat file, "
           "...), PositionsTotal, OrdersTotal, THEN CheckDeadline and the GO validity, then return; nothing between FinalGate and OrderSend",
@@ -1477,7 +1636,7 @@ def gate_static():
 
 def main():
     for g in (gate_env, gate_deadline, gate_price_lot, gate_slot, gate_unknown, gate_protect, gate_be, gate_restart_misc, gate_dry_mgmt,
-              gate_review, gate_rereview, gate_rereview2, gate_static):
+              gate_review, gate_rereview, gate_rereview2, gate_rereview3, gate_static):
         try:
             g()
         except Exception:
