@@ -1,14 +1,16 @@
-"""Python reference model of automation/xau_short/ea/XauShortDemoEA.mq5 (stage 3) + a fake MT5 terminal / broker.
+"""Python reference model of automation/xau_short/ea/XauShortDemoEA.mq5 (stage 3, ST3-2) + a fake MT5 terminal / broker.
 
-This is NOT the EA: it is a line-by-line port of its decision functions (CheckCmd, CheckDeadline, PrepareOrder, ProcessEntry,
-CheckProtection, ManageOwn, TryBreakeven, Reconcile, ReconcileUnknown, CheckResume, PollCommands, OnInit / OnTimer) so that the
-rules can be exercised locally against the same file protocol as the bridge (cmd / rpt / done / journal.txt). eam_sim.py checks
-that the MQL5 source keeps the same constants, journal states, refusal reasons and gates (static), so a drift between the two is
-visible. Passing here proves the RULES, not the MQL5 code: the MQL5 compile and the MT5 demo run are separate evidence.
+This is NOT the EA: it is a function-by-function port of its decisions (CheckCmd, CheckDeadline, PrepareOrder, AskBridge, SendCheck,
+ProcessEntry, SelectOwn, Quarantine, ClosePosition, ModifyOwn, CheckProtection, ManageOwn, FillBarLow, TryBreakeven, DetectUnknown,
+CheckResolveUnknown, Reconcile, CheckResume, PollCommands, OnInit / OnTimer) so that the rules can be exercised locally against the
+same file protocol as the bridge (cmd / ask / ans / rpt / done / journal_*.txt / hb_*.txt). eam_sim.py checks that the MQL5 source
+keeps the same constants, approvals, journal states, refusal reasons and gates (static), so a drift between the two is visible.
+Passing here proves the RULES, not the MQL5 code: the MQL5 compile and the MT5 demo run are separate evidence.
 """
 import hashlib
 import math
 import os
+import re
 
 RISK_FRACTION = 0.03
 MAX_AGE_SEC = 60
@@ -16,7 +18,13 @@ MAX_DEV_FRAC = 0.20
 MAX_SPREAD = 0.50
 BE_DIST = 15.0
 BAR_SEC = 300
-CMD_VERSION = "1"
+CMD_VERSION = "2"
+APPROVALS = ("be_price_source", "fillbar_method", "tp_timing", "tp_beyond", "retry_interval", "close_deviation", "monitoring")
+ASK_WAIT_MS = 5000
+BRIDGE_HB_MAX_MS = 5000
+EMERGENCY_RETRY_SEC = 5
+CLOSE_DEVIATION_POINTS = 1000
+CLOSE_NOT_ALLOWED, CLOSE_FULL, CLOSE_PARTIAL, CLOSE_FAILED, CLOSE_UNKNOWN = 0, 1, 2, 3, 4
 
 DONE, DONE_PARTIAL, PLACED, ERROR, TIMEOUT, CONNECTION = 10009, 10010, 10008, 10011, 10012, 10031
 DEFINITE_REJECT = {   # TRADE_RETCODE_* listed in IsDefiniteReject()
@@ -30,9 +38,9 @@ _TICK = [0]
 
 
 def _tick():
-    """GetTickCount(): milliseconds since the PC started (moves on between two EA instances)."""
+    """GetTickCount64(): milliseconds since the PC started (monotonic, also between two EA instances)."""
     _TICK[0] += 1
-    return _TICK[0] % 10**10
+    return _TICK[0]
 
 
 _HELD_LOCKS = set()     # FileOpen(ea.lock, FILE_WRITE) without FILE_SHARE_*: exclusive while the handle is open
@@ -42,8 +50,34 @@ def sha16(s):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
+def kv_lines(text):
+    return [l.rstrip("\r") for l in text.split("\n")]
+
+
+def kv_get(lines, k):
+    for l in lines:
+        if l.startswith(k + "="):
+            return l[len(k) + 1:]
+    return ""
+
+
+def to_int(s):
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        return 0
+
+
+def to_float(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class FakeTerminal:
-    """the parts of the MT5 terminal / XS demo server the EA reads or writes; every trade write is logged in `writes`."""
+    """the parts of the MT5 terminal / XS demo server the EA reads or writes; every trade write is logged in `writes`.
+    Positions are keyed by their current TICKET and carry a separate IDENTIFIER (POSITION_IDENTIFIER = DEAL_POSITION_ID)."""
 
     def __init__(self, gmt_ms, server_offset_sec=7200):
         self.gmt_ms = gmt_ms
@@ -56,14 +90,18 @@ class FakeTerminal:
         self.usdjpy = 150.0
         self.leverage = 100.0
         self.bid, self.ask = 2600.0, 2600.3
-        self.positions = {}          # ticket -> dict
-        self.orders = {}             # pending orders (manual / other EA)
+        self.positions = {}          # ticket -> dict (identifier, symbol, magic, comment, type, volume, price_open, sl, tp, time, time_msc)
+        self.orders = {}             # pending orders (manual / other EA): ticket -> dict(symbol, comment)
+        self.history_orders = []     # dict(ticket, symbol, magic, comment, time_setup_msc)
         self.deals = {}              # deal ticket -> dict
         self.rates = []              # M5 bars (server time open, low)
+        self.ticks = []              # tick history (server time ms, bid)
+        self.ticks_unavailable = False
         self.writes = []             # every trade API write: (kind, request)
         self.send_mode = "fill"      # fill | partial | reject:<code> | timeout | fill_lost_reply | fill_no_sl | placed
+        self.ticket_offset = 0       # >0: the live position ticket differs from its identifier by this amount
         self.modify_mode = "ok"      # ok | reject
-        self.close_mode = "ok"       # ok | reject
+        self.close_mode = "ok"       # ok | reject | partial | timeout_no_change
         self.check_ok = True
         self.calc_profit_ok = True
         self.calc_margin_ok = True
@@ -75,6 +113,9 @@ class FakeTerminal:
 
     def time_server(self):
         return self.gmt_ms // 1000 + self.server_offset
+
+    def time_server_ms(self):
+        return self.gmt_ms + self.server_offset * 1000
 
     def advance(self, ms):
         self.gmt_ms += ms
@@ -94,6 +135,17 @@ class FakeTerminal:
         self.next_ticket += 1
         return self.next_ticket
 
+    def copy_ticks_range(self, frm, to):
+        if self.ticks_unavailable:
+            return None
+        return [(t, b) for t, b in sorted(self.ticks) if frm <= t <= to]
+
+    def by_identifier(self, ident):
+        for tk, p in self.positions.items():
+            if p["identifier"] == ident:
+                return tk, p
+        return 0, None
+
     # trade API
     def order_send(self, req):
         self.writes.append(("send", dict(req)))
@@ -102,17 +154,24 @@ class FakeTerminal:
             return False, dict(retcode=int(mode.split(":")[1]), order=0, deal=0, price=0.0, volume=0.0)
         if mode == "timeout":
             return False, dict(retcode=TIMEOUT, order=0, deal=0, price=0.0, volume=0.0)
+        order = self._ticket()
+        self.history_orders.append(dict(ticket=order, symbol=req["symbol"], magic=req["magic"], comment=req["comment"],
+                                        time_setup_msc=self.time_server_ms()))
         if mode == "placed":
-            return True, dict(retcode=PLACED, order=self._ticket(), deal=0, price=0.0, volume=0.0)
+            self.orders[order] = dict(symbol=req["symbol"], comment=req["comment"])
+            return True, dict(retcode=PLACED, order=order, deal=0, price=0.0, volume=0.0)
         vol = req["volume"] / 2 if mode == "partial" else req["volume"]
         vol = round(math.floor(vol / self.sym["vstep"] + 1e-9) * self.sym["vstep"], 8)
-        order, deal = self._ticket(), self._ticket()
+        deal = self._ticket()
+        ident = order
+        ticket = ident + self.ticket_offset
         price = self.bid
-        pos = dict(ticket=order, symbol=req["symbol"], magic=req["magic"], comment=req["comment"], type="SELL", volume=vol,
-                   price_open=price, sl=0.0 if mode == "fill_no_sl" else req["sl"], tp=req["tp"], time=self.time_server(),
-                   time_msc=self.gmt_ms + self.server_offset * 1000)
-        self.positions[order] = pos
-        self.deals[deal] = dict(position=order, price=price, time=self.time_server(), entry="IN")
+        self.positions[ticket] = dict(ticket=ticket, identifier=ident, symbol=req["symbol"], magic=req["magic"], comment=req["comment"],
+                                      type="SELL", volume=vol, price_open=price, sl=0.0 if mode == "fill_no_sl" else req["sl"],
+                                      tp=req["tp"], time=self.time_server(), time_msc=self.time_server_ms())
+        self.deals[deal] = dict(order=order, position=ident, price=price, time=self.time_server(), time_msc=self.time_server_ms(),
+                                entry="IN", volume=vol, symbol=req["symbol"], magic=req["magic"], comment=req["comment"], reason="EXPERT",
+                                profit=0.0, commission=0.0, swap=0.0)
         if mode == "fill_lost_reply":
             return False, dict(retcode=CONNECTION, order=0, deal=0, price=0.0, volume=0.0)
         return True, dict(retcode=DONE_PARTIAL if mode == "partial" else DONE, order=order, deal=deal, price=price, volume=vol)
@@ -127,57 +186,76 @@ class FakeTerminal:
 
     def order_send_close(self, req):
         self.writes.append(("close", dict(req)))
-        if self.close_mode != "ok":
+        if self.close_mode == "reject":
             return False, dict(retcode=DEFINITE_REJECT["REJECT"])
-        self.close_position(req["position"], self.ask, "EXPERT")
+        if self.close_mode == "timeout_no_change":
+            return False, dict(retcode=TIMEOUT)
+        p = self.positions[req["position"]]
+        if self.close_mode == "partial":
+            part = round(p["volume"] / 2, 2)
+            self.close_volume(req["position"], part, self.ask, "EXPERT")
+            return True, dict(retcode=DONE_PARTIAL)
+        self.close_volume(req["position"], p["volume"], self.ask, "EXPERT")
         return True, dict(retcode=DONE)
 
-    def close_position(self, ticket, price, reason):
-        p = self.positions.pop(ticket)
+    def close_volume(self, ticket, vol, price, reason):
+        p = self.positions[ticket]
         d = self._ticket()
-        self.deals[d] = dict(position=ticket, price=price, time=self.time_server(), entry="OUT", reason=reason,
-                             profit=(p["price_open"] - price) * p["volume"] * self.sym["contract"] * self.usdjpy, commission=0.0, swap=0.0)
+        self.deals[d] = dict(order=self._ticket(), position=p["identifier"], price=price, time=self.time_server(),
+                             time_msc=self.time_server_ms(), entry="OUT", volume=vol, symbol=p["symbol"], magic=p["magic"], comment="",
+                             reason=reason, profit=(p["price_open"] - price) * vol * self.sym["contract"] * self.usdjpy, commission=0.0,
+                             swap=0.0)
+        p["volume"] = round(p["volume"] - vol, 8)
+        if p["volume"] <= 1e-9:
+            del self.positions[ticket]
 
-    def history_out_deal(self, ticket):
-        for d, v in sorted(self.deals.items(), reverse=True):
-            if v["position"] == ticket and v["entry"] == "OUT":
-                return d, v
-        return None, None
+    def close_position(self, ticket, price, reason):
+        self.close_volume(ticket, self.positions[ticket]["volume"], price, reason)
+
+    def history_by_position(self, ident):
+        return [(d, v) for d, v in sorted(self.deals.items()) if v["position"] == ident]
 
 
 class Pos:
     def __init__(self):
-        self.key = self.khash = ""
-        self.posTicket = self.orderTicket = self.dealTicket = 0
+        self.key = ""
+        self.posId = self.posTicket = self.orderTicket = self.dealTicket = 0
         self.fill = self.sl0 = self.tp0 = self.volume = 0.0
-        self.fillTimeSrv = 0
-        self.tpSet = self.beDone = self.tracked = self.bePending = False
-        self.minBid = 0.0
-        self.lastBarDone = 0
-        self.lastTpTry = 0
+        self.fillTimeSrv = self.fillTimeMsc = 0
+        self.tpSet = self.beDone = self.bePending = self.fillBarDone = False
+        self.lastBarDone = self.lastTpTry = self.lastEmergencyTry = 0
+        self.protectedNoted = self.slMissingNoted = self.missingNoted = False
 
 
 class EA:
-    """inputs as keyword arguments (same names as the MQL5 inputs without the Inp prefix)."""
+    """inputs as keyword arguments (same names as the MQL5 inputs without the Inp prefix). `approvals` stands for the APPROVED_*
+    source constants (all False in the MQL5 source); tests that exercise the send path pass them explicitly."""
 
     def __init__(self, term, exchange_root, DryRun=True, AllowNewEntries=False, ExpectedLogin=0, ExpectedServer="XSFintech-DEMO",
                  Symbol="XAUUSDs", ExpectedCurrency="JPY", ExpectedSid="XAU-SHORT|XA-23|AU-2",
                  ExpectedCfgSha="72fa9868a3e196ebcd02e37a12f82416d1149e5bd0567d8bf426e2c49f4695ee", ExpectedTvSym="OANDA:XAUUSD",
-                 Magic=26102801, FillBarBe="TICKS_SINCE_FILL"):
+                 Magic=26102801, FillBarBe="TICKS_SINCE_FILL", approvals=()):
         self.t = term
         self.root = exchange_root
         self.DryRun, self.AllowNewEntries, self.ExpectedLogin = DryRun, AllowNewEntries, ExpectedLogin
         self.ExpectedServer, self.Symbol, self.ExpectedCurrency = ExpectedServer, Symbol, ExpectedCurrency
         self.ExpectedSid, self.ExpectedCfgSha, self.ExpectedTvSym, self.Magic = ExpectedSid, ExpectedCfgSha, ExpectedTvSym, Magic
         self.FillBarBe = FillBarBe
+        self.approved = set(approvals)
         self.pos = Pos()
-        self.hasPos = self.envOk = self.ready = self.haltNew = self.critical = self.dryMgmtNoted = False
-        self.haltReason = self.inflightKey = ""
+        self.hasPos = self.envOk = self.ready = self.haltNew = self.critical = self.mgmtNoted = False
+        self.bindOk = True
+        self.journalOk = True
+        self.haltReason = self.critReason = self.inflightKey = self.unknownKey = ""
+        self.unknownPreMs, self.unknownSl, self.unknownTp = 0, 0.0, 0.0
+        self.journalPath = ""
         self.lock = None
         self.rptSeq = 0
         self.seen = set()
-        self.journal_fail = False      # test hook: the journal file cannot be written
-        self.started = False
+        self.journal_fail_states = set()   # test hook: these journal states cannot be written ("*" = every state)
+        self.journal_delay = {}            # test hook: state -> ms the write takes
+        self.wait_hook = None              # test hook: runs while the EA waits for the bridge (the bridge "process")
+        self.before_send_hook = None       # test hook: runs between PrepareOrder and the final checks / the send
 
     # -- files ------------------------------------------------------------------------------------------------------
     def path(self, *p):
@@ -189,41 +267,68 @@ class EA:
     def now_ms_late(self):
         return self.t.time_gmt() * 1000 + 999
 
+    def sleep(self, ms):
+        self.t.advance(ms)
+        if self.wait_hook:
+            self.wait_hook()
+
     @staticmethod
     def sanitize(s):
         return s.replace("\n", " ").replace("\r", " ").replace("|", "/")
 
-    def report(self, key, state, fields):
-        lines = [f"t_ms={self.now_ms()}", f"key_hash={self.sanitize(key)}", f"state={state}"]
-        lines += [self.sanitize(p) for p in fields.split(";") if p.find("=") > 0]
-        for _ in range(5):                         # FileMove without FILE_REWRITE: an existing name is never overwritten
-            self.rptSeq += 1
-            base = f"{self.now_ms():013d}_{self.rptSeq:08d}_{_tick():010d}"
-            tmp = self.path("rpt", base + ".tmp")
-            with open(tmp, "w", encoding="ascii", errors="replace", newline="\r\n") as f:
-                f.write("\n".join(lines) + "\n")
-            dst = self.path("rpt", base + ".rpt")
-            if not os.path.exists(dst) and not os.path.exists(self.path("rpt_done", base + ".rpt")):
-                os.replace(tmp, dst)
-                return
+    def read_lines(self, p):
+        try:
+            with open(p, encoding="ascii", errors="replace") as f:
+                return kv_lines(f.read())
+        except OSError:
+            return None
+
+    def write_atomic(self, d, name, body, rewrite):
+        os.makedirs(d, exist_ok=True)
+        tmp, dst = os.path.join(d, name + ".tmp"), os.path.join(d, name)
+        with open(tmp, "w", encoding="ascii", errors="replace", newline="\r\n") as f:
+            f.write(body)
+        if os.path.exists(dst) and not rewrite:
             os.remove(tmp)
+            return False
+        os.replace(tmp, dst)
+        return True
+
+    def report(self, key, state, fields):
+        body = f"t_ms={self.now_ms()}\nkey_hash={self.sanitize(key)}\nstate={state}\n"
+        body += "".join(self.sanitize(p) + "\n" for p in fields.split(";") if p.find("=") > 0)
+        for _ in range(5):                         # an existing report is never overwritten
+            self.rptSeq += 1
+            base = f"{self.now_ms():013d}_{_tick():020d}_{self.rptSeq:08d}"
+            if os.path.exists(self.path("rpt_done", base + ".rpt")):
+                continue
+            if self.write_atomic(self.path("rpt"), base + ".rpt", body, False):
+                return
 
     def journal(self, key, state, fields):
         line = f"{self.now_ms()}|{self.sanitize(key)}|{state}|{self.sanitize(fields)}"
-        if self.journal_fail:
-            self.critical = True
-            return
-        with open(self.path("journal.txt"), "a", encoding="ascii", errors="replace", newline="\r\n") as f:
-            f.write(line + "\n")
+        ok = not (state in self.journal_fail_states or "*" in self.journal_fail_states)
+        if ok:
+            with open(self.journalPath, "a", encoding="ascii", errors="replace", newline="\r\n") as f:
+                f.write(line + "\n")
+        if state in self.journal_delay:
+            self.t.advance(self.journal_delay[state])
+        self.journalOk = ok
+        if not ok:
+            self.critical, self.critReason = True, "journal_write_failed"
+            with open(self.path("journal_fallback.txt"), "a", encoding="ascii", errors="replace") as f:
+                f.write(line + "\n")
+            return False
         if key:
             self.seen.add(key)
         self.report(key, state, fields)
+        return True
 
     def journal_lines(self):
         try:
-            with open(self.path("journal.txt"), encoding="ascii") as f:
+            with open(self.journalPath, encoding="ascii") as f:
                 return [l.rstrip("\r\n").split("|", 3) for l in f if l.strip()]
-        except FileNotFoundError:
+        except (FileNotFoundError, TypeError):
             return []
 
     def halt_new(self, reason):
@@ -232,8 +337,25 @@ class EA:
             self.haltReason = reason
             self.journal("", "HALT_NEW", "reason=" + reason)
 
+    def set_critical(self, key, reason):
+        self.critical, self.critReason = True, reason
+        self.journal(key, "CRITICAL", "reason=" + reason)
+
     def halt_file_exists(self):
         return os.path.exists(self.path("halt_new"))
+
+    def unapproved(self):
+        for a in APPROVALS:
+            if a not in self.approved:
+                return a
+        return ""
+
+    def bridge_hb_age_ms(self):
+        l = self.read_lines(self.path("hb_bridge.txt"))
+        if l is None:
+            return -1
+        t = to_int(kv_get(l, "t_ms"))
+        return -1 if t <= 0 else self.now_ms_late() - t
 
     # -- environment ------------------------------------------------------------------------------------------------
     def is_demo(self):
@@ -255,57 +377,59 @@ class EA:
             return "not_hedging_account"
         if not (self.t.sym["selectable"] and self.t.sym["name"] == self.Symbol):
             return "symbol_not_available"
+        if not self.bindOk:
+            return "journal_binding_mismatch"
         return ""
 
     def trade_writes_allowed(self):
-        if self.DryRun or not self.envOk or not self.ready or not self.is_demo():
+        if self.DryRun or not self.envOk or not self.bindOk or not self.ready or not self.is_demo():
             return False
         return self.t.account["login"] == self.ExpectedLogin and self.t.account["server"] == self.ExpectedServer
 
-    def new_entries_allowed(self):
+    def new_entries_allowed(self, self_key=""):
+        ua = self.unapproved()
+        hb = self.bridge_hb_age_ms()
         if self.DryRun:
             return "dry_run"
         if not self.AllowNewEntries:
             return "new_entries_off"
+        if ua:
+            return "unapproved:" + ua
         if not self.trade_writes_allowed():
             return "trade_writes_not_allowed"
+        if not self.journalOk:
+            return "journal_write_failed"
         if self.critical:
-            return "critical"
+            return "critical:" + self.critReason
+        if self.unknownKey:
+            return "unknown_unresolved:" + self.unknownKey
         if self.haltNew:
             return "halt_new:" + self.haltReason
         if self.halt_file_exists():
             return "halt_file"
-        if self.inflightKey:
+        if self.inflightKey and self.inflightKey != self_key:
             return "in_flight:" + self.inflightKey
+        if self.hasPos:
+            return "max1_own_position"
+        if hb < 0 or hb > BRIDGE_HB_MAX_MS:
+            return "bridge_heartbeat_stale"
         return ""
 
     # -- command ----------------------------------------------------------------------------------------------------
-    @staticmethod
-    def read_cmd(path):
-        c = dict(v="", key="", khash="", tid="", ev="", side="", otype="", path="", cfg="", sid="", sym="", px=0.0, sl=0.0, tp=0.0,
-                 barCloseMs=0)
-        names = {"key_hash": "khash", "cfg_sha256": "cfg", "bar_close_ms": "barCloseMs"}
-        with open(path, encoding="ascii", errors="replace") as f:
-            for line in f:
-                line = line.rstrip("\r\n")
-                p = line.find("=")
-                if p <= 0:
-                    continue
-                k, v = line[:p], line[p + 1:]
-                k = names.get(k, k)
-                if k in ("px", "sl", "tp"):
-                    try:
-                        c[k] = float(v)          # StringToDouble: "nan" / "inf" stay non-finite and are refused by CheckCmd
-                    except ValueError:
-                        c[k] = 0.0
-                elif k == "barCloseMs":
-                    try:
-                        c[k] = int(v)
-                    except ValueError:
-                        c[k] = 0
-                elif k in c:
-                    c[k] = v
-        return c
+    def read_cmd(self, path):
+        l = self.read_lines(path)
+        if l is None:
+            return None
+        g = lambda k: kv_get(l, k)
+
+        def num(v):
+            try:
+                return float(v)          # StringToDouble: "nan" / "inf" stay non-finite and are refused by CheckCmd
+            except ValueError:
+                return 0.0
+        return dict(v=g("v"), key=g("key"), khash=g("key_hash"), tid=g("tid"), ev=g("ev"), side=g("side"), otype=g("otype"),
+                    path=g("path"), cfg=g("cfg_sha256"), sid=g("sid"), sym=g("sym"), px=num(g("px")), sl=num(g("sl")), tp=num(g("tp")),
+                    barCloseMs=to_int(g("bar_close_ms")))
 
     def check_cmd(self, c):
         if c["v"] != CMD_VERSION:
@@ -424,47 +548,138 @@ class EA:
                   "note=actual loss can exceed 3% (fill slippage / SL slippage / conversion / commission / swap not in the budget)")
         return "", req, detail
 
-    # -- trade wrappers ---------------------------------------------------------------------------------------------
-    def find_tagged_position(self, khash):
+    # -- final permission from the bridge -----------------------------------------------------------------------------
+    def ask_bridge(self, c, dry):
+        ans = self.path("ans", c["khash"] + ".ans")
+        if os.path.exists(ans):
+            os.replace(ans, self.path("done", c["khash"] + ".stale.ans"))
+        body = f"key_hash={c['khash']}\nt_ms={self.now_ms()}\ndry_run={'1' if dry else '0'}\n"
+        if not self.write_atomic(self.path("ask"), c["khash"] + ".ask", body, True):
+            return "nogo:ask_write_failed", 0
+        waited = 0
+        while waited < ASK_WAIT_MS:
+            if os.path.exists(ans):
+                l = self.read_lines(ans)
+                os.replace(ans, self.path("done", c["khash"] + ".ans"))
+                if l is None or kv_get(l, "key_hash") != c["khash"]:
+                    return "nogo:answer_unreadable", 0
+                if kv_get(l, "decision") != "GO":
+                    return "nogo:" + kv_get(l, "reason"), 0
+                until = min(to_int(kv_get(l, "valid_until_ms")), c["barCloseMs"] + MAX_AGE_SEC * 1000)
+                if self.now_ms_late() > until:
+                    return "nogo:go_expired_on_arrival", 0
+                return "", until
+            self.sleep(50)
+            waited += 50
+        return "nogo:no_answer", 0
+
+    def send_check(self, c, id_, go_until, base):
+        why = self.check_deadline(c)
+        if why:
+            return why, None
+        if self.now_ms_late() > go_until:
+            return "go_expired", None
+        gate = self.new_entries_allowed(id_)
+        if gate:
+            return gate, None
+        why, out, _ = self.prepare_order(c)
+        if why:
+            return why, None
+        if abs(out["volume"] - base["volume"]) > 1e-9 or abs(out["sl"] - base["sl"]) > 1e-9:
+            return "request_changed", None
+        return "", out
+
+    # -- ownership ------------------------------------------------------------------------------------------------
+    def select_own(self):
+        """1 = own position open (posTicket refreshed), 0 = identifier not open, -1 = identifier open but not ours -> quarantine."""
         for tk, p in sorted(self.t.positions.items(), reverse=True):
-            if p["symbol"] == self.Symbol and p["magic"] == self.Magic and p["comment"] == "XSD:" + khash:
+            if p["identifier"] != self.pos.posId:
+                continue
+            if p["symbol"] != self.Symbol or p["magic"] != self.Magic or p["type"] != "SELL":
+                self.quarantine("ownership_mismatch", tk)
+                return -1
+            if tk != self.pos.posTicket:
+                self.journal(self.pos.key, "TICKET_CHANGED", f"position_id={self.pos.posId};old={self.pos.posTicket};new={tk}")
+                self.pos.posTicket = tk
+            return 1
+        return 0
+
+    def own(self):
+        return self.t.positions[self.pos.posTicket]
+
+    def quarantine(self, reason, ticket):
+        self.journal(self.pos.key, "QUARANTINE", f"reason={reason};position_id={self.pos.posId};ticket={ticket};note=no_write_to_this_position")
+        self.hasPos = False
+        self.halt_new("quarantine:" + reason)
+        self.set_critical(self.pos.key, "quarantine:" + reason)
+
+    def history_volumes(self, ident):
+        vin = vout = 0.0
+        last_out = None
+        for d, v in self.t.history_by_position(ident):
+            if v["entry"] == "IN":
+                vin += v["volume"]
+            elif v["entry"] == "OUT":
+                vout += v["volume"]
+                last_out = (d, v)
+        return vin, vout, last_out
+
+    # -- trade wrappers -----------------------------------------------------------------------------------------------
+    def ticket_of_identifier(self, ident):
+        for tk, p in sorted(self.t.positions.items(), reverse=True):
+            if p["identifier"] == ident and p["symbol"] == self.Symbol and p["magic"] == self.Magic and p["type"] == "SELL":
                 return tk
         return 0
 
-    def confirm_fill(self, key, khash, order, deal, sl0, tp0):
-        pos_id = 0
-        if deal and deal in self.t.deals:
-            pos_id = self.t.deals[deal]["position"]
-        if not pos_id:
-            pos_id = self.find_tagged_position(khash)
-        p = self.t.positions.get(pos_id)
-        if not p or p["symbol"] != self.Symbol or p["magic"] != self.Magic or p["type"] != "SELL":
-            return False
+    def adopt_own(self, key, pos_id, ticket, order, deal, sl0, tp0, via):
+        p = self.t.positions[ticket]
         P = self.pos = Pos()
-        P.key, P.khash, P.posTicket, P.orderTicket, P.dealTicket = key, khash, pos_id, order, deal
-        P.fill, P.volume, P.sl0, P.tp0, P.fillTimeSrv = p["price_open"], p["volume"], sl0, tp0, p["time"]
-        P.tracked, P.minBid = True, P.fill
+        P.key, P.posId, P.posTicket, P.orderTicket, P.dealTicket = key, pos_id, ticket, order, deal
+        P.fill, P.volume, P.sl0, P.tp0, P.fillTimeSrv, P.fillTimeMsc = p["price_open"], p["volume"], sl0, tp0, p["time"], p["time_msc"]
         self.hasPos = True
-        self.journal(key, "FILLED", f"order={order};deal={deal};position={pos_id};fill_price={P.fill:.5f};volume={P.volume:.2f};"
-                                    f"sl0={sl0:.5f};tp0={tp0:.5f};fill_time={P.fillTimeSrv}")
+        self.journal(key, "FILLED", f"order={order};deal={deal};position_id={pos_id};position={ticket};fill_price={P.fill:.5f};"
+                                    f"volume={P.volume:.2f};sl0={sl0:.5f};tp0={tp0:.5f};fill_time={P.fillTimeSrv};fill_time_msc={P.fillTimeMsc};via={via}")
+
+    def confirm_fill(self, key, order, deal, sl0, tp0):
+        pos_id = self.t.deals[deal]["position"] if deal and deal in self.t.deals else 0
+        if not pos_id:
+            return False
+        tk = self.ticket_of_identifier(pos_id)
+        if not tk:
+            return False
+        self.adopt_own(key, pos_id, tk, order, deal, sl0, tp0, "send")
         return True
 
     def close_position(self, key, reason):
-        if not self.trade_writes_allowed() or not self.hasPos or self.pos.posTicket not in self.t.positions:
-            return False
-        p = self.t.positions[self.pos.posTicket]
-        req = dict(action="DEAL", symbol=self.Symbol, type="BUY", position=self.pos.posTicket, volume=p["volume"], price=self.t.ask,
-                   magic=self.Magic, comment="XSD:" + self.pos.khash + ":C")
-        self.journal(key, "CLOSE_PRE_SEND", f"reason={reason};position={self.pos.posTicket}")
+        if not self.trade_writes_allowed() or not self.hasPos or self.select_own() != 1:
+            return CLOSE_NOT_ALLOWED, -1
+        p = self.own()
+        vol = p["volume"]
+        req = dict(action="DEAL", symbol=self.Symbol, type="BUY", position=self.pos.posTicket, volume=vol, price=self.t.ask,
+                   magic=self.Magic, comment="XSD:" + self.pos.key + ":C", deviation=CLOSE_DEVIATION_POINTS)
+        self.journal(key, "CLOSE_PRE_SEND", f"reason={reason};position_id={self.pos.posId};volume={vol:.2f}")
         ok, res = self.t.order_send_close(req)
-        good = ok and res["retcode"] in (DONE, DONE_PARTIAL)
-        self.journal(key, "CLOSE_SENT" if good else "CLOSE_FAILED", f"reason={reason};retcode={res['retcode']}")
-        return good
+        result, remaining = CLOSE_UNKNOWN, -1
+        sel = self.select_own()
+        if sel == 1:
+            remaining = self.own()["volume"]
+            if remaining < vol - 1e-9:
+                result = CLOSE_PARTIAL
+            elif not ok and res["retcode"] in DEFINITE_REJECT.values():
+                result = CLOSE_FAILED
+        elif sel == 0:
+            remaining = 0
+            vin, vout, _ = self.history_volumes(self.pos.posId)
+            if vin > 0 and vout >= vin - 1e-9:
+                result = CLOSE_FULL
+        st = {CLOSE_FULL: "CLOSE_DONE", CLOSE_PARTIAL: "CLOSE_PARTIAL", CLOSE_FAILED: "CLOSE_FAILED"}.get(result, "CLOSE_UNKNOWN")
+        self.journal(key, st, f"reason={reason};retcode={res['retcode']};remaining={remaining:.2f}")
+        return result, remaining
 
     def modify_own(self, what, new_sl, new_tp):
-        if not self.trade_writes_allowed() or not self.hasPos or self.pos.posTicket not in self.t.positions:
+        if not self.trade_writes_allowed() or not self.hasPos or self.select_own() != 1:
             return False
-        cur_sl = self.t.positions[self.pos.posTicket]["sl"]
+        cur_sl = self.own()["sl"]
         if new_sl <= 0 or (cur_sl > 0 and new_sl > cur_sl + 1e-9):
             self.journal(self.pos.key, "MODIFY_REFUSED", f"what={what};reason=would_loosen_or_remove_sl")
             return False
@@ -477,14 +692,17 @@ class EA:
         return True
 
     def process_entry(self, c, id_):
-        self.journal(id_, "SEEN", f"tid={c['tid']};bar_close_ms={c['barCloseMs']}")
+        if not self.journal(id_, "SEEN", f"tid={c['tid']};bar_close_ms={c['barCloseMs']}"):
+            return
         why = self.check_cmd(c)
         if not why:
             why = self.check_deadline(c)
-        gate = ""
+        gate, dry = "", False
         if not why:
             gate = self.new_entries_allowed()
-            if gate and gate not in ("dry_run", "new_entries_off"):
+            if gate in ("dry_run", "new_entries_off"):
+                dry = True
+            elif gate:
                 why = gate
         detail, req = "", None
         if not why:
@@ -492,82 +710,135 @@ class EA:
         if why:
             self.journal(id_, "SKIPPED", "reason=" + why)
             return
-        if gate in ("dry_run", "new_entries_off"):
-            self.journal(id_, "DRY_RUN_NOT_SENT", f"gate={gate};{detail}")
+        go, go_until = self.ask_bridge(c, dry)
+        if dry:
+            ua = self.unapproved()
+            self.journal(id_, "DRY_RUN_NOT_SENT", f"gate={gate};go={go or 'granted'};unapproved={ua or 'none'};{detail}")
             return
-        self.journal(id_, "DECIDED", detail)
-        if self.before_send_hook:
-            self.before_send_hook()
-        why = self.check_deadline(c)
-        if not why and not self.trade_writes_allowed():
-            why = "trade_writes_not_allowed"
-        if why:
-            self.journal(id_, "SKIPPED", f"reason={why};stage=right_before_send")
+        if go:
+            self.journal(id_, "SKIPPED", "reason=" + go)
+            return
+        if not self.journal(id_, "DECIDED", detail):
             return
         self.inflightKey = id_
-        self.journal(id_, "PRE_SEND", f"volume={req['volume']:.2f};sl={req['sl']:.5f};price={req['price']:.5f}")
-        if self.crash_after_pre_send:
-            raise SystemExit("simulated crash after PRE_SEND")
-        ok, res = self.t.order_send(req)
+        if not self.journal(id_, "PRE_SEND", f"volume={req['volume']:.2f};sl={req['sl']:.5f};price={req['price']:.5f};"
+                                             f"tp0={c['tp']:.5f};go_until_ms={go_until}"):
+            self.inflightKey = ""
+            self.halt_new("journal_write_failed")
+            return
+        if self.before_send_hook:
+            self.before_send_hook()
+        why, fin = self.send_check(c, id_, go_until, req)
+        if why:
+            if self.journal(id_, "SEND_ABORTED", "reason=" + why):
+                self.inflightKey = ""
+            else:
+                self.inflightKey = ""
+                self.unknownKey, self.unknownPreMs, self.unknownSl, self.unknownTp = id_, self.now_ms(), req["sl"], c["tp"]
+            return
+        ok, res = self.t.order_send(fin)
         self.journal(id_, "SEND_RETURNED", f"ok={int(ok)};retcode={res['retcode']};order={res['order']};deal={res['deal']};"
-                                           f"fill_price={res['price']:.5f};volume={res['volume']:.2f}")
+                                           f"fill_price={res['price']:.5f};volume={res['volume']:.2f};price_sent={fin['price']:.5f}")
         if res["retcode"] in (DONE, DONE_PARTIAL):
-            if self.confirm_fill(id_, c["khash"], res["order"], res["deal"], req["sl"], c["tp"]):
+            if self.confirm_fill(id_, res["order"], res["deal"], fin["sl"], c["tp"]):
                 self.inflightKey = ""
                 if res["retcode"] == DONE_PARTIAL:
-                    self.journal(id_, "PARTIAL_FILL", f"volume={self.pos.volume:.2f};requested={req['volume']:.2f}")
+                    self.journal(id_, "PARTIAL_FILL", f"volume={self.pos.volume:.2f};requested={fin['volume']:.2f}")
                 self.check_protection()
                 return
-            self.journal(id_, "UNKNOWN", "reason=done_but_fill_not_confirmed")
-            self.halt_new("unknown_result:" + c["khash"])
+            self.mark_unknown(id_, fin["sl"], c["tp"], "done_but_fill_not_confirmed")
             return
         if not ok and res["retcode"] in DEFINITE_REJECT.values():
             self.inflightKey = ""
             self.journal(id_, "REJECTED", f"retcode={res['retcode']}")
             return
-        self.journal(id_, "UNKNOWN", f"retcode={res['retcode']}")
-        self.halt_new("unknown_result:" + c["khash"])
+        self.mark_unknown(id_, fin["sl"], c["tp"], f"retcode_{res['retcode']}")
 
-    before_send_hook = None
-    crash_after_pre_send = False
+    def mark_unknown(self, id_, sl, tp, reason):
+        self.inflightKey = ""
+        self.unknownKey, self.unknownPreMs, self.unknownSl, self.unknownTp = id_, self.now_ms() - 1000, sl, tp
+        self.journal(id_, "UNKNOWN", "reason=" + reason)
+        self.halt_new("unknown_result:" + id_)
 
     def check_protection(self):
-        if not self.hasPos or self.pos.posTicket not in self.t.positions:
+        if not self.hasPos or self.select_own() != 1:
             return
-        sl = self.t.positions[self.pos.posTicket]["sl"]
-        if sl > 0 and abs(sl - self.pos.sl0) <= self.t.sym["tick"] * 0.5 + 1e-9:
-            self.journal(self.pos.key, "PROTECTED", f"sl={sl:.5f}")
+        P = self.pos
+        sl = self.own()["sl"]
+        if sl > 0 and sl <= P.sl0 + self.t.sym["tick"] * 0.5 + 1e-9:
+            if not P.protectedNoted:
+                P.protectedNoted = True
+                self.journal(P.key, "PROTECTED", f"sl={sl:.5f}")
             return
+        P.protectedNoted = False
         self.halt_new("initial_sl_missing")
-        self.journal(self.pos.key, "SL_MISSING", f"sl_on_position={sl:.5f}")
-        if self.close_position(self.pos.key, "emergency_initial_sl_missing"):
-            self.journal(self.pos.key, "EMERGENCY_CLOSE", "result=sent")
-        else:
-            self.critical = True
-            self.journal(self.pos.key, "CRITICAL", "reason=emergency_close_failed")
+        if not P.slMissingNoted:
+            P.slMissingNoted = True
+            self.journal(P.key, "SL_MISSING", f"sl_on_position={sl:.5f};sl0={P.sl0:.5f}")
+        if not self.trade_writes_allowed():
+            return
+        now_s = self.t.time_gmt()
+        if P.lastEmergencyTry > 0 and now_s - P.lastEmergencyTry < EMERGENCY_RETRY_SEC:
+            return
+        P.lastEmergencyTry = now_s
+        r, remaining = self.close_position(P.key, "emergency_initial_sl_missing")
+        if r == CLOSE_FULL:
+            self.journal(P.key, "EMERGENCY_CLOSE", "result=closed_confirmed")
+            return
+        if r == CLOSE_PARTIAL:
+            self.journal(P.key, "EMERGENCY_CLOSE_PARTIAL", f"remaining={remaining:.2f};note=unprotected_remainder_retried")
+        self.set_critical(P.key, {CLOSE_PARTIAL: "emergency_close_partial", CLOSE_FAILED: "emergency_close_failed"}.get(r, "emergency_close_unknown"))
 
     # -- management -------------------------------------------------------------------------------------------------
+    def check_closed_from_history(self):
+        P = self.pos
+        vin, vout, last = self.history_volumes(P.posId)
+        if vin > 0 and vout >= vin - 1e-9:
+            d, v = last
+            hist = self.t.history_by_position(P.posId)
+            self.journal(P.key, "CLOSED", f"reason={v['reason'].lower()};deal={d};price={v['price']:.5f};"
+                                          f"profit={sum(x['profit'] for _, x in hist):.0f};commission={sum(x['commission'] for _, x in hist):.0f};"
+                                          f"swap={sum(x['swap'] for _, x in hist):.0f};position_id={P.posId}")
+            self.hasPos = False
+            return
+        if not P.missingNoted:
+            P.missingNoted = True
+            self.journal(P.key, "OWN_POSITION_MISSING", f"position_id={P.posId};in={vin:.2f};out={vout:.2f};note=not_treated_as_closed")
+            self.halt_new("own_position_missing")
+
+    def fill_bar_low(self, fill_bar_open):
+        frm = self.pos.fillTimeMsc + 1
+        to = (fill_bar_open + BAR_SEC) * 1000 - 1
+        if to < frm:
+            return 0, 0.0
+        ticks = self.t.copy_ticks_range(frm, to)
+        if ticks is None:
+            return -1, 0.0
+        bids = [b for tm, b in ticks if b > 0 and frm <= tm <= to]
+        return len(bids), (min(bids) if bids else 0.0)
+
     def manage_own(self):
         if not self.hasPos:
             return
-        P, t = self.pos, self.t
-        if P.posTicket not in t.positions:
-            d, v = t.history_out_deal(P.posTicket)
-            if d:
-                self.journal(P.key, "CLOSED", f"reason={v['reason'].lower()};deal={d};price={v['price']:.5f};profit={v['profit']:.0f};"
-                                              f"commission={v['commission']:.0f};swap={v['swap']:.0f}")
-            else:
-                self.journal(P.key, "CLOSED", "reason=not_found_in_history")
-            self.hasPos = False
+        own = self.select_own()
+        if own < 0:
             return
-        if P.tracked and t.bid > 0:
-            P.minBid = min(P.minBid, t.bid)
+        if own == 0:
+            self.check_closed_from_history()
+            return
         if not self.trade_writes_allowed():
-            if not self.dryMgmtNoted:
-                self.dryMgmtNoted = True
-                self.journal(P.key, "MANAGEMENT_BLOCKED", "reason=trade_writes_not_allowed;note=the_server_side_sl_stays")
+            if not self.mgmtNoted:
+                self.mgmtNoted = True
+                self.journal(self.pos.key, "MANAGEMENT_BLOCKED", "reason=trade_writes_not_allowed;note=the_server_side_sl_stays")
             return
-        self.dryMgmtNoted = False
+        self.mgmtNoted = False
+        self.check_protection()
+        if not self.hasPos or self.select_own() != 1:
+            return
+        P, t = self.pos, self.t
+        sl_now = self.own()["sl"]
+        if not (sl_now > 0 and sl_now <= P.sl0 + t.sym["tick"] * 0.5 + 1e-9):
+            return
         now = t.time_server()
         fill_bar_open = P.fillTimeSrv - P.fillTimeSrv % BAR_SEC
         if now < fill_bar_open + BAR_SEC:
@@ -579,13 +850,22 @@ class EA:
                 self.journal(P.key, "FILL_SIDE_BAD", f"fill={P.fill:.{digits}f}")
                 self.close_position(P.key, "bad_fill_side_mt5")
                 return
-            cur_sl = t.positions[P.posTicket]["sl"]
+            if self.select_own() != 1:
+                return
+            cur_sl = self.own()["sl"]
             if self.modify_own("tp0", cur_sl, round(P.tp0, digits)):
                 P.tpSet = True
                 self.journal(P.key, "TP_SET", f"tp={P.tp0:.{digits}f};sl_kept={cur_sl:.{digits}f}")
-        if P.lastBarDone == 0:
-            if not P.beDone and self.FillBarBe == "TICKS_SINCE_FILL" and P.tracked:
-                self.try_breakeven(P.minBid, fill_bar_open)
+        if not P.fillBarDone:
+            if not P.beDone and self.FillBarBe == "TICKS_SINCE_FILL":
+                n, lo = self.fill_bar_low(fill_bar_open)
+                if n < 0 and now < fill_bar_open + 2 * BAR_SEC:
+                    return
+                if n > 0:
+                    self.try_breakeven(lo, fill_bar_open)
+                else:
+                    self.journal(P.key, "FILLBAR_NO_TICKS", f"n={n}")
+            P.fillBarDone = True
             P.lastBarDone = fill_bar_open
         if P.beDone:
             return
@@ -606,75 +886,153 @@ class EA:
             P.bePending = True
             digits = self.t.sym["digits"]
             new_sl = round(P.fill, digits)
-            cur_tp = self.t.positions[P.posTicket]["tp"]
+            if self.select_own() != 1:
+                return
+            cur_tp = self.own()["tp"]
             if self.modify_own("breakeven", new_sl, cur_tp):
                 P.beDone, P.bePending = True, False
                 self.journal(P.key, "BE_SET", f"sl={new_sl:.{digits}f};bar_open={bar_open};fav={fav_low:.{digits}f}")
 
+    # -- result unknown -------------------------------------------------------------------------------------------------
+    def detect_unknown(self, kh, pre_ms):
+        tag = "XSD:" + kh
+        t = self.t
+        frm_srv_ms = (pre_ms // 1000 + t.server_offset - 120) * 1000
+        orders = [o["ticket"] for o in t.history_orders if o["symbol"] == self.Symbol and o["magic"] == self.Magic and o["comment"] == tag
+                  and o["time_setup_msc"] >= frm_srv_ms]
+        pids = []
+        for d, v in sorted(t.deals.items()):
+            if v["symbol"] != self.Symbol or v["magic"] != self.Magic or v["entry"] != "IN" or v["time_msc"] < frm_srv_ms:
+                continue
+            if v["comment"] == tag or v["order"] in orders:
+                if not pids or pids[-1] != v["position"]:
+                    pids.append(v["position"])
+        pending = sum(1 for o in t.orders.values() if o.get("comment") == tag)
+        tagpos = sum(1 for p in t.positions.values() if p["comment"] == tag)
+        if pending:
+            return "ambiguous:pending_order", 0, 0
+        if len(pids) > 1:
+            return "ambiguous:several_positions", 0, 0
+        if not pids:
+            return ("none" if not orders and not tagpos else "ambiguous:order_or_position_without_deal"), 0, 0
+        pid = pids[0]
+        tk = self.ticket_of_identifier(pid)
+        if tk:
+            return "open", pid, tk
+        if t.by_identifier(pid)[1] is not None:
+            return "ambiguous:position_not_own", 0, 0
+        vin, vout, _ = self.history_volumes(pid)
+        if vin > 0 and vout >= vin - 1e-9:
+            return "closed", pid, 0
+        return "ambiguous:history_incomplete", 0, 0
+
+    def check_resolve_unknown(self):
+        f = self.path("resolve_unknown")
+        if not os.path.exists(f):
+            return
+        l = self.read_lines(f) or []
+        os.remove(f)
+        kh, confirm = kv_get(l, "key_hash"), kv_get(l, "confirm")
+        if not self.unknownKey or kh != self.unknownKey:
+            self.journal("", "UNKNOWN_RESOLVE_REFUSED", f"reason=not_the_unknown_key;given={kh};unknown={self.unknownKey}")
+            return
+        detected, pid, tk = self.detect_unknown(self.unknownKey, self.unknownPreMs)
+        if detected.startswith("ambiguous") or confirm != detected:
+            self.journal(self.unknownKey, "UNKNOWN_RESOLVE_REFUSED", f"reason=confirm_mismatch;confirm={confirm};detected={detected}")
+            return
+        key = self.unknownKey
+        if detected == "open":
+            if tk not in self.t.positions:
+                self.journal(key, "UNKNOWN_RESOLVE_REFUSED", "reason=position_vanished")
+                return
+            self.adopt_own(key, pid, tk, 0, 0, self.unknownSl, self.unknownTp, "unknown_resolution")
+        if not self.journal(key, "UNKNOWN_RESOLVED", f"result={detected};position_id={pid};note=new_entries_stay_halted_until_resume_new"):
+            return
+        self.unknownKey = ""
+        if detected == "open":
+            self.check_protection()
+
     # -- startup reconciliation -------------------------------------------------------------------------------------
     def reconcile(self):
-        last_pre_send, pre_send_ms = "", 0
-        pos_ticket, pos_key, sl0, tp0, fill, fill_time, closed = 0, "", 0.0, 0.0, 0.0, 0, False
+        last_pre = unknown = pos_key = ""
+        pre_ms, pre_sl, pre_tp = 0, 0.0, 0.0
+        pos_id = fill_msc = fill_time = pos_ticket = 0
+        sl0 = tp0 = fill = 0.0
+        closed = quarantined = bind_seen = False
+        a = self.t.account
         for parts in self.journal_lines():
             if len(parts) < 4:
                 continue
             key, st, f = parts[1], parts[2], parts[3]
+            kv = f.split(";")
             if key:
                 self.seen.add(key)
+            if st == "BIND" and not bind_seen:
+                bind_seen = True
+                self.bindOk = (kv_get(kv, "login") == str(a["login"]) and kv_get(kv, "server") == a["server"]
+                               and kv_get(kv, "magic") == str(self.Magic) and kv_get(kv, "sid") == self.sanitize(self.ExpectedSid)
+                               and kv_get(kv, "cfg") == self.ExpectedCfgSha and kv_get(kv, "symbol") == self.Symbol)
             if st == "HALT_NEW":
                 self.haltNew, self.haltReason = True, f
             if st == "RESUME_NEW":
-                self.haltNew, self.haltReason, last_pre_send = False, "", ""
+                self.haltNew, self.haltReason = False, ""
+            if st == "CRITICAL":
+                self.critical, self.critReason = True, f
             if st == "CRITICAL_CLEARED":
-                self.critical = False
+                self.critical, self.critReason = False, ""
             if st == "PRE_SEND":
-                last_pre_send, pre_send_ms = key, int(parts[0])
-            if st in ("REJECTED", "FILLED") and key == last_pre_send:
-                last_pre_send = ""
+                last_pre, pre_ms = key, int(parts[0])
+                pre_sl, pre_tp = to_float(kv_get(kv, "sl")), to_float(kv_get(kv, "tp0"))
+            if st in ("REJECTED", "FILLED", "SEND_ABORTED", "UNKNOWN_RESOLVED") and key == last_pre:
+                last_pre = ""
+            if st == "UNKNOWN":
+                unknown = key
+            if st == "UNKNOWN_RESOLVED" and key == unknown:
+                unknown = ""
             if st == "FILLED":
-                pos_key, closed = key, False
-                kv = dict(x.split("=", 1) for x in f.split(";") if x.find("=") > 0)
-                pos_ticket = int(kv.get("position", 0))
-                sl0, tp0, fill = float(kv.get("sl0", 0)), float(kv.get("tp0", 0)), float(kv.get("fill_price", 0))
-                fill_time = int(kv.get("fill_time", 0))
+                pos_key, closed, quarantined = key, False, False
+                pos_id, pos_ticket = to_int(kv_get(kv, "position_id")), to_int(kv_get(kv, "position"))
+                sl0, tp0, fill = to_float(kv_get(kv, "sl0")), to_float(kv_get(kv, "tp0")), to_float(kv_get(kv, "fill_price"))
+                fill_time, fill_msc = to_int(kv_get(kv, "fill_time")), to_int(kv_get(kv, "fill_time_msc"))
             if st == "CLOSED" and key == pos_key:
                 closed = True
-            if st == "CRITICAL":
-                self.critical = True
-        if last_pre_send:
-            self.inflightKey = last_pre_send
+            if st == "QUARANTINE" and key == pos_key:
+                quarantined = True
+        if not bind_seen:
+            self.bindOk = True
+            self.journal("", "BIND", f"login={a['login']};server={a['server']};magic={self.Magic};sid={self.ExpectedSid};"
+                                     f"cfg={self.ExpectedCfgSha};symbol={self.Symbol}")
+        elif not self.bindOk:
+            self.journal("", "BIND_MISMATCH", "note=journal_of_another_account_or_strategy;all_trade_writes_refused")
+        if last_pre and not unknown:
+            unknown = last_pre
+            self.journal(unknown, "UNKNOWN", "reason=pre_send_without_result_at_startup")
+        if unknown:
+            self.unknownKey, self.unknownPreMs, self.unknownSl, self.unknownTp = unknown, pre_ms, pre_sl, pre_tp
             self.halt_new("unknown_result_after_restart")
-            self.journal(last_pre_send, "UNKNOWN", "reason=pre_send_without_result_at_startup")
-        if pos_key and not closed and pos_ticket > 0:
-            p = self.t.positions.get(pos_ticket)
+            det = self.detect_unknown(unknown, pre_ms)[0]
+            self.journal(unknown, "UNKNOWN_CHECK", f"detected={det};note=resolve_unknown_file_needed")
+        if pos_key and not closed and not quarantined and pos_id > 0:
             P = self.pos = Pos()
-            P.key = P.khash = pos_key
-            P.posTicket = pos_ticket
+            P.key, P.posId, P.posTicket, P.sl0, P.tp0, P.fill = pos_key, pos_id, pos_ticket, sl0, tp0, fill
+            P.fillTimeSrv, P.fillTimeMsc = fill_time, fill_msc
             self.hasPos = True
-            if p and p["symbol"] == self.Symbol and p["magic"] == self.Magic:
-                P.sl0, P.tp0, P.fill, P.fillTimeSrv, P.volume = sl0, tp0, fill, fill_time, p["volume"]
+            sel = self.select_own()
+            if sel == 1:
+                p = self.own()
+                P.volume = p["volume"]
                 P.tpSet = p["tp"] > 0
                 P.beDone = abs(p["sl"] - fill) <= self.t.sym["tick"] * 0.5 + 1e-9
-                P.tracked, P.minBid = False, fill
-                self.journal(pos_key, "OWNED_AT_STARTUP", f"position={pos_ticket}")
-        if self.inflightKey:
-            self.reconcile_unknown(self.inflightKey, pre_send_ms)
-
-    def reconcile_unknown(self, key, pre_send_ms):
-        for tk, p in self.t.positions.items():
-            if p["magic"] == self.Magic and p["symbol"] == self.Symbol and p["comment"] == "XSD:" + key \
-                    and p["time_msc"] - (self.t.time_server() - self.t.time_gmt()) * 1000 >= pre_send_ms - 60000:
-                self.journal(key, "RECONCILED", f"position={tk};note=found_open_after_unknown;comment={p['comment']};"
-                                                "new_entries=still_halted_until_resume")
-                return
-        self.journal(key, "UNKNOWN_NOT_FOUND", "note=no_open_position_with_magic_and_tag;new_entries=still_halted_until_resume")
+                self.journal(pos_key, "OWNED_AT_STARTUP", f"position_id={pos_id};position={P.posTicket}")
+            elif sel == 0:
+                self.check_closed_from_history()
 
     def check_resume(self):
         fc = self.path("clear_critical")
         if os.path.exists(fc):
             os.remove(fc)
             if self.critical:
-                self.critical = False
+                self.critical, self.critReason = False, ""
                 self.journal("", "CRITICAL_CLEARED", "by=operator_file;note=new_entries_stay_halted_until_resume_new")
                 self.halt_new("after_critical")
         f = self.path("resume_new")
@@ -684,7 +1042,9 @@ class EA:
         if self.critical:
             self.journal("", "RESUME_REFUSED", "reason=critical")
             return
-        self.inflightKey = ""
+        if self.unknownKey:
+            self.journal("", "RESUME_REFUSED", f"reason=unknown_unresolved;key_hash={self.unknownKey};note=use_resolve_unknown")
+            return
         self.haltNew, self.haltReason = False, ""
         self.journal("", "RESUME_NEW", "by=operator_file")
 
@@ -692,10 +1052,7 @@ class EA:
         d = self.path("cmd")
         for name in sorted(n for n in os.listdir(d) if n.endswith(".cmd")):
             src = os.path.join(d, name)
-            try:
-                c = self.read_cmd(src)
-            except OSError:
-                c = None
+            c = self.read_cmd(src)
             if c is None:
                 self.journal("", "BAD_CMD", f"file={name};reason=unreadable")
             elif not c["khash"] or sha16(c["key"]) != c["khash"]:
@@ -704,26 +1061,35 @@ class EA:
                 self.report(c["khash"], "DUPLICATE", "file=" + name)
             else:
                 self.process_entry(c, c["khash"])
-            os.replace(src, self.path("done", name))
+            if os.path.exists(src):
+                os.replace(src, self.path("done", name))
+
+    def write_heartbeat(self):
+        gate = self.new_entries_allowed()
+        self.write_atomic(self.path(), "hb_ea.txt", f"t_ms={self.now_ms()}\ndry_run={int(self.DryRun)}\nnew_gate={gate or 'open'}\n"
+                                                    f"own_position_id={self.pos.posId if self.hasPos else 0}\ncritical={int(self.critical)}\n"
+                                                    f"unknown={self.unknownKey}\n", True)
 
     # -- events -----------------------------------------------------------------------------------------------------
     def on_init(self):
         if not self.is_demo():
             return "INIT_FAILED:not_demo"
-        for sub in ("", "cmd", "rpt", "done"):
+        for sub in ("", "cmd", "rpt", "done", "ask", "ans"):
             os.makedirs(self.path(sub), exist_ok=True)
         lk = os.path.abspath(self.path("ea.lock"))
         if lk in _HELD_LOCKS:
             return "INIT_FAILED:lock"
         _HELD_LOCKS.add(lk)
         self.lock = lk
+        a = self.t.account
+        self.journalPath = self.path(f"journal_{a['login']}_{re.sub(r'[^0-9A-Za-z-]', '_', a['server'])}_{self.Magic}.txt")
         why = self.verify_environment()
         self.envOk = why == ""
         self.journal("", "START", f"dry_run={int(self.DryRun)};new_entries={int(self.AllowNewEntries)};env={'ok' if self.envOk else why};"
-                                  f"server={self.t.account['server']};symbol={self.Symbol}")
+                                  f"server={a['server']};symbol={self.Symbol};unapproved={self.unapproved()}")
         self.reconcile()
+        self.envOk = self.verify_environment() == ""
         self.ready = True
-        self.started = True
         return "INIT_SUCCEEDED"
 
     def on_deinit(self, crash=False):
@@ -740,17 +1106,15 @@ class EA:
             self.envOk = env
             self.journal("", "ENV_OK" if env else "ENV_LOST", "reason=" + why)
         self.check_resume()
+        self.check_resolve_unknown()
         self.manage_own()
         self.poll_commands()
+        self.write_heartbeat()
 
     def on_trade_transaction(self, deal, order, position, price, volume):
         """recorded only (the deal / position check stays the source of truth)."""
         self.journal(self.inflightKey or (self.pos.key if self.hasPos else ""), "TX_DEAL",
                      f"deal={deal};order={order};position={position};price={price:.5f};volume={volume:.2f}")
-
-    def on_tick(self):
-        if self.hasPos and self.pos.tracked and self.t.bid > 0:
-            self.pos.minBid = min(self.pos.minBid, self.t.bid)
 
     # -- test helpers -----------------------------------------------------------------------------------------------
     def states(self, key=None):

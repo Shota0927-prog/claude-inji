@@ -8,6 +8,8 @@
   EAB-17..19 : the receiver's real data is not rewritten (receipts / facts / config), files carry no secrets, single instance
   EAB-20     : end-to-end with the EA reference model (tests/ea_model.py) over the same cmd / rpt files: DRY_RUN, demo send, restart
   EAB-21     : make_test_entry.py writes only into a TEST receiver folder
+  EAB-22..28 : regressions of the ST3-1 review: post-claim revocation before / while the EA asks / after a bridge restart, GO once per
+               key within the deadline, an emergency close request is not a close, EA / bridge heartbeats, DB upgrade
 Evidence class: local Python only. No TradingView / Windows / MT5 run; the EA side is the Python reference model, not the MQL5 EA.
 """
 import hashlib
@@ -77,8 +79,9 @@ class Env:
         return self.rcv.process(json.dumps(m, separators=(",", ":")), now_ms=at)["status"]
 
     def bridge(self, clock, bdata=None, lock=True, **over):
+        """require_ea_heartbeat_ms is off unless a fixture sets it (the claim / command fixtures have no EA running)."""
         cfg = eb.load_config(None)
-        cfg.update(receiver_data_dir=self.rdata, bridge_data_dir=bdata or self.bdata, exchange_dir=self.xdir)
+        cfg.update(receiver_data_dir=self.rdata, bridge_data_dir=bdata or self.bdata, exchange_dir=self.xdir, require_ea_heartbeat_ms=None)
         cfg.update(over)
         b = eb.Bridge(cfg, clock=clock, log=QUIET, lock=lock)
         self.bridges.append(b)
@@ -128,7 +131,7 @@ def gate_claim():
               "TradingView symbol; bridge lifecycle CMD_WRITTEN with separate received / checked / claim start / claimed / written times",
               n == 1 and files == [f"{bc}_{kh}.cmd"] and c.get("key") == m["key"] and c.get("key_hash") == kh and c.get("ev") == "ENTRY"
               and c.get("side") == "SHORT" and c.get("otype") == "MARKET" and c.get("path") == "SATS_NOW" and float(c["px"]) == 2600.0
-              and float(c["sl"]) == 2605.0 and float(c["tp"]) == 2592.5 and c.get("bar_close_ms") == str(bc) and c.get("v") == "1"
+              and float(c["sl"]) == 2605.0 and float(c["tp"]) == 2592.5 and c.get("bar_close_ms") == str(bc) and c.get("v") == "2"
               and c.get("sid") == m["sid"] and c.get("cfg_sha256") == eb.DEFAULT_CONFIG["expected"]["cfg_sha256"] and c.get("sym") == "OANDA:XAUUSD"
               and it["claimed_ms"] == bc + 2000 and len(lg) == 1 and lg[0]["ok"] == 1 and L["state"] == "CMD_WRITTEN"
               and all(L[t] is not None for t in ("received_ms", "checked_ms", "claim_start_ms", "claimed_ms", "cmd_written_ms")), str((files, c, L)))
@@ -341,7 +344,7 @@ def gate_restart():
           "bridge_restart_before_claim, never claimed later); if it did, the command is written once from that claim (no second claim)",
           out["before_claim"][:3] == ("CLAIM_REFUSED", "bridge_restart_before_claim", 0) and out["before_claim"][3] == 0
           and out["after_claim"][0] == "CMD_WRITTEN" and out["after_claim"][2:] == (1, 1), str(out))
-    # EA offline: the command stays, nothing is re-written, the bridge keeps waiting
+    # EA offline: the command stays until the deadline, then it is revoked (never executed late); no second claim
     env = Env()
     try:
         env.receiver()
@@ -350,14 +353,20 @@ def gate_restart():
         env.send(m, bc + 1000)
         b = env.bridge(Clock(bc + 2000))
         b.once()
-        before = os.path.getmtime(os.path.join(env.xdir, "cmd", env.cmds()[0]))
-        for k in range(5):
-            b.clock = Clock(bc + 10000 + k * 60000)
+        name = env.cmds()[0]
+        before = os.path.getmtime(os.path.join(env.xdir, "cmd", name))
+        for k in range(3):
+            b.clock = Clock(bc + 10000 + k * 20000)
             b.once()
-        check("EAB-13 EA offline / no reports: the single command file stays in cmd/ untouched (the EA's own deadline check will skip it "
-              "when it comes back), the lifecycle stays CMD_WRITTEN, no second claim or command",
-              len(env.cmds()) == 1 and os.path.getmtime(os.path.join(env.xdir, "cmd", env.cmds()[0])) == before
-              and life(b, m["key"])["state"] == "CMD_WRITTEN" and env.rcv.store.one("SELECT COUNT(*) n FROM claim_log")["n"] == 1)
+        within = (env.cmds() == [name], os.path.getmtime(os.path.join(env.xdir, "cmd", name)) == before, life(b, m["key"])["state"])
+        b.clock = Clock(bc + 61000)
+        b.once()
+        L = life(b, m["key"])
+        check("EAB-13 EA offline / no reports: within the 60 s the single command stays in cmd/ untouched and CMD_WRITTEN; after the deadline "
+              "it is revoked (REVOKED_BEFORE_GO expired, moved to revoked/) so a returning EA never sees it; no second claim or command",
+              within == (True, True, "CMD_WRITTEN") and L["state"] == "REVOKED_BEFORE_GO" and L["nogo_reason"] == "expired"
+              and env.cmds() == [] and os.listdir(os.path.join(env.xdir, "revoked")) == [name]
+              and env.rcv.store.one("SELECT COUNT(*) n FROM claim_log")["n"] == 1, str((within, dict(L))))
     finally:
         env.close()
 
@@ -465,8 +474,14 @@ def gate_real_data():
           "*.sqlite3*, *.log)", all(x in gi for x in ("bridge_config.json", "data_bridge*/", "*.sqlite3*", "*.log")), str(gi))
 
 
+def _ea(term, xdir, live, **kw):
+    ea = em.EA(term, xdir, DryRun=not live, AllowNewEntries=live, ExpectedLogin=1234567, approvals=em.APPROVALS if live else (), **kw)
+    assert ea.on_init() == "INIT_SUCCEEDED"
+    return ea
+
+
 def gate_e2e():
-    """bridge -> cmd file -> EA model -> rpt files -> bridge, on the same exchange folder."""
+    """bridge -> cmd file -> EA model -> ask / final GO -> rpt files -> bridge, on the same exchange folder and one clock."""
     out = {}
     for nm in ("dry_run", "demo_on", "demo_late_ea", "restart_unknown"):
         env = Env()
@@ -475,40 +490,257 @@ def gate_e2e():
             m = E(3)
             bc = m["bar_close"]
             env.send(m, bc + 1000)
-            term = em.FakeTerminal(gmt_ms=bc + 2500)
+            term = em.FakeTerminal(gmt_ms=bc + 1500)
             term.bid, term.ask = 2600.2, 2600.5
-            on = nm != "dry_run"
-            ea = em.EA(term, env.xdir, DryRun=not on, AllowNewEntries=on, ExpectedLogin=1234567)
-            assert ea.on_init() == "INIT_SUCCEEDED"
-            b = env.bridge(Clock(bc + 2000))
+            live = nm != "dry_run"
+            b = env.bridge(lambda: term.gmt_ms, require_ea_heartbeat_ms=5000)
+            ea = _ea(term, env.xdir, live)
+            ea.wait_hook = b.once                  # the bridge process runs while the EA waits for its answer
+            b.once()                               # no EA heartbeat yet -> not claimed
+            first = life(b, m["key"])["state"]
+            env.rcv.store.db.execute("UPDATE intents SET eligible=1 WHERE key=?", (m["key"],))
+            b.db.execute("DELETE FROM lifecycle")
+            ea.on_timer()                          # EA heartbeat
+            term.advance(500)
             b.once()
             if nm == "demo_late_ea":
                 term.advance(70000)            # the EA (or the terminal) was busy / offline: the command is too old
             if nm == "restart_unknown":
-                ea.crash_after_pre_send = True
+                def crash():
+                    raise SystemExit("crash after PRE_SEND")
+                ea.before_send_hook = crash
                 try:
                     ea.on_timer()
                 except SystemExit:
                     pass
                 ea.on_deinit(crash=True)
-                ea = em.EA(term, env.xdir, DryRun=False, AllowNewEntries=True, ExpectedLogin=1234567)
-                ea.on_init()
+                ea = _ea(term, env.xdir, True)
+                ea.wait_hook = b.once
             ea.on_timer()
             b.once()
             L = life(b, m["key"])
             out[nm] = (L["state"], L["reason"], L["ea_pre_send_ms"] is not None, len(term.writes), L["volume"], L["mt5_open"],
-                       env.cmds(), len(env.cmds("done")))
+                       env.cmds(), len([n for n in env.cmds("done") if n.endswith(".cmd")]), L["go_ms"] is not None, first)
             ea.on_deinit()
         finally:
             env.close()
-    check("EAB-20 end-to-end over the files with the EA reference model: DRY_RUN -> EA_DRY_RUN_NOT_SENT, zero trade writes; demo ON -> one "
-          "send, EA_PROTECTED with the volume and mt5_open=1; the EA reading the command 70 s late -> EA_SKIPPED expired, zero writes; a crash "
-          "after PRE_SEND and a restart -> EA_UNKNOWN_NOT_FOUND (no re-send); the command file is moved to done/ every time",
-          out["dry_run"][0] == "EA_DRY_RUN_NOT_SENT" and out["dry_run"][3] == 0
+    check("EAB-20 end-to-end over the files with the EA reference model and the bridge answering the EA's final ask: no EA heartbeat -> "
+          "skip:ea_heartbeat_stale (not claimed); DRY_RUN -> GO recorded, EA_DRY_RUN_NOT_SENT, zero trade writes; demo ON (all approvals) "
+          "-> one send, EA_PROTECTED with the volume and mt5_open=1; the EA reading the command 70 s late -> EA_SKIPPED expired, zero "
+          "writes; a crash after PRE_SEND and a restart -> EA_UNKNOWN (no re-send); the command file is moved to done/ every time",
+          out["dry_run"][0] == "EA_DRY_RUN_NOT_SENT" and out["dry_run"][3] == 0 and out["dry_run"][8]
           and out["demo_on"][0] == "EA_PROTECTED" and out["demo_on"][3] == 1 and out["demo_on"][4] > 0 and out["demo_on"][5] == 1
           and out["demo_late_ea"][0] == "EA_SKIPPED" and out["demo_late_ea"][1] == "expired" and out["demo_late_ea"][3] == 0
-          and out["restart_unknown"][0] == "EA_UNKNOWN_NOT_FOUND" and out["restart_unknown"][3] == 0 and out["restart_unknown"][2]
-          and all(v[6] == [] and v[7] == 1 for v in out.values()), str(out))
+          and out["restart_unknown"][0] == "EA_UNKNOWN" and out["restart_unknown"][3] == 0 and out["restart_unknown"][2]
+          and all(v[6] == [] and v[7] == 1 and v[9] == "SKIPPED_BY_BRIDGE" for v in out.values()), str(out))
+
+
+def _pull_env(clock):
+    """a SATS_PULL ENTRY from wait W (WAIT_START at bar 0), claimed and commanded."""
+    env = Env()
+    env.receiver()
+    w = f"W{ms.bar(0) + ms.BAR}"
+    ws = ms.ev("WAIT_START", 0, px=2600.0, sl=2605.0, tp=2592.5, info="sats_wait")
+    env.send(ws, ws["bar_close"] + 500)
+    m = E(3, info=f"SATS_PULL;wid={w}")
+    env.send(m, m["bar_close"] + 1000)
+    return env, m, w
+
+
+def gate_review():
+    """regressions of the ST3-1 review on the bridge side (item 1: a claim is not a permission; items 6 / 8: reports, heartbeats)."""
+    out = {}
+    for nm in ("before_ea_reads", "while_ea_waits"):
+        env, m, w = _pull_env(None)
+        try:
+            bc = m["bar_close"]
+            term = em.FakeTerminal(gmt_ms=bc + 1500)
+            term.bid, term.ask = 2600.2, 2600.5
+            b = env.bridge(lambda: term.gmt_ms)
+            b.once()
+            we = ms.ev("WAIT_END", 3, tid=w, px=2600.0, sl=2605.0, tp=2592.5, info="expired")
+            ea = _ea(term, env.xdir, True)
+            if nm == "before_ea_reads":
+                env.send(we, bc + 2000)
+                term.advance(500)
+                b.once()
+                ea.wait_hook = b.once
+            else:
+                sent = []
+
+                def hook():
+                    if not sent:
+                        sent.append(env.send(we, term.gmt_ms))
+                    b.once()
+                ea.wait_hook = hook
+            ea.on_timer()
+            b.once()
+            L = life(b, m["key"])
+            note = env.rcv.store.one("SELECT claim_note FROM intents WHERE key=?", (m["key"],))["claim_note"]
+            kh = eb.key_hash(m["key"])
+            out[nm] = (L["state"], L["nogo_reason"], L["go_ms"], len([x for x in term.writes if x[0] == "send"]), note,
+                       os.listdir(os.path.join(env.xdir, "revoked")), (ea.last(kh, "SKIPPED") or {}).get("reason"))
+            ea.on_deinit()
+        finally:
+            env.close()
+    a, c = out["before_ea_reads"], out["while_ea_waits"]
+    check("EAB-22 (review 1) SATS_PULL ENTRY claimed and commanded, then the WAIT_END of its wait arrives (receiver: post_claim:late): before "
+          "the EA read the command -> REVOKED_BEFORE_GO, the command moved to revoked/, the EA never sees it; while the EA waits for its "
+          "final answer -> NOGO revoked_after_claim:late:wait_already_ended, EA SKIPPED nogo:...; zero sends in both cases",
+          a[0] == "REVOKED_BEFORE_GO" and a[1].startswith("revoked_after_claim:late:wait_already_ended") and a[2] is None and a[3] == 0
+          and str(a[4]).startswith("post_claim:late") and len(a[5]) == 1
+          and c[1].startswith("revoked_after_claim:late:wait_already_ended") and c[2] is None and c[3] == 0
+          and str(c[6]).startswith("nogo:revoked_after_claim:late:wait_already_ended"), str(out))
+    res = {}
+    for term_ev in ("CANCEL", "TV_FLAT", "TV_CLOSED", "CLOSE_REQ"):
+        env = Env()
+        try:
+            env.receiver()
+            m = E(3)
+            bc = m["bar_close"]
+            env.send(m, bc + 1000)
+            b = env.bridge(Clock(bc + 2000))
+            b.once()
+            t = ms.ev(term_ev, 4, tid=m["tid"], px=None if term_ev == "CANCEL" else 2601.0, sl=2605.0,
+                      otype="MARKET" if term_ev == "CANCEL" else "", info="x")
+            st = env.send(t, bc + 3000)
+            b.clock = Clock(bc + 3500)
+            b.once()
+            res[term_ev] = (st, life(b, m["key"])["state"], life(b, m["key"])["nogo_reason"], env.cmds())
+        finally:
+            env.close()
+    check("EAB-23 (review 1) CANCEL / TV_FLAT / TV_CLOSED / CLOSE_REQ of the trade learnt after the claim and before any GO -> the command is "
+          "revoked (no GO will ever be given)",
+          all(v[0] == "ACCEPTED" and v[1] == "REVOKED_BEFORE_GO" and v[2] and v[3] == [] for v in res.values()), str(res))
+    env, m, w = _pull_env(None)
+    try:
+        bc = m["bar_close"]
+        b = env.bridge(Clock(bc + 2000))
+        orig = b._write_cmd
+
+        def boom(*a_, **k_):
+            raise OSError("exchange folder unavailable")
+        b._write_cmd = boom
+        try:
+            b.once()
+        except OSError:
+            pass
+        b._write_cmd = orig
+        b.close()
+        env.bridges.remove(b)
+        we = ms.ev("WAIT_END", 3, tid=w, px=2600.0, sl=2605.0, tp=2592.5, info="expired")
+        env.send(we, bc + 3000)
+        b2 = env.bridge(Clock(bc + 4000))
+        b2.once()
+        L = life(b2, m["key"])
+        r23 = (L["state"], L["nogo_reason"], env.cmds())
+    finally:
+        env.close()
+    check("EAB-24 (review 1) the same after a bridge restart: claimed, crash before the command, WAIT_END arrives, restart -> recover writes "
+          "NO command (REVOKED_AFTER_BRIDGE_RESTART, the post-claim revocation is the reason)",
+          r23[0] == "REVOKED_AFTER_BRIDGE_RESTART" and r23[1].startswith("revoked_after_claim:late:wait_already_ended") and r23[2] == [],
+          str(r23))
+    env = Env()
+    try:
+        env.receiver()
+        m = E(3)
+        bc = m["bar_close"]
+        env.send(m, bc + 1000)
+        clk = [bc + 2000]
+        b = env.bridge(lambda: clk[0], go_ttl_ms=3000)
+        b.once()
+        kh = eb.key_hash(m["key"])
+
+        def ask(k):
+            with open(os.path.join(env.xdir, "ask", k + ".ask"), "w") as f:
+                f.write(f"key_hash={k}\nt_ms={clk[0]}\ndry_run=0\n")
+            b.answer_asks()
+            return eb.read_kv(os.path.join(env.xdir, "ans", k + ".ans"))
+        g1 = ask(kh)
+        g2 = ask(kh)
+        g3 = ask("0123456789abcdef")
+        clk[0] = bc + 58500
+        b.db.execute("UPDATE lifecycle SET go_ms=NULL, nogo_reason=NULL WHERE key=?", (m["key"],))
+        g4 = ask(kh)
+        clk[0] = bc + 61000
+        b.db.execute("UPDATE lifecycle SET go_ms=NULL, nogo_reason=NULL WHERE key=?", (m["key"],))
+        g5 = ask(kh)
+        n_answers = b.db.execute("SELECT COUNT(*) n FROM answers").fetchone()["n"]
+    finally:
+        env.close()
+    check("EAB-25 (review 1) GO at most once per key: the first ask -> GO valid 3 s (go_ttl_ms, a proposal), a second ask -> NOGO "
+          "already_granted, an unknown key -> NOGO unknown_key; the validity never passes the 60 s deadline (asked at 58.5 s -> valid until "
+          "60.0 s); after the deadline -> NOGO expired; every answer is stored before its file",
+          g1["decision"] == "GO" and int(g1["valid_until_ms"]) == bc + 5000 and (g2["decision"], g2["reason"]) == ("NOGO", "already_granted")
+          and (g3["decision"], g3["reason"]) == ("NOGO", "unknown_key") and g4["decision"] == "GO" and int(g4["valid_until_ms"]) == bc + 60000
+          and (g5["decision"], g5["reason"]) == ("NOGO", "expired") and n_answers == 5, str((g1, g2, g3, g4, g5)))
+    env = Env()
+    try:
+        env.receiver()
+        m = E(3)
+        bc = m["bar_close"]
+        env.send(m, bc + 1000)
+        b = env.bridge(Clock(bc + 2000))
+        b.once()
+        kh = eb.key_hash(m["key"])
+        seq = [("FILLED", {"position": "5001", "fill_price": "2600.2", "volume": "0.41"}), ("SL_MISSING", {}),
+               ("EMERGENCY_CLOSE_PARTIAL", {"remaining": "0.21"}), ("CRITICAL", {"reason": "emergency_close_partial"})]
+        for i, (st, f) in enumerate(seq):
+            write_rpt(env, f"{bc + 3000 + i:013d}_{i:08d}_0000000000.rpt", t_ms=bc + 3000 + i, key_hash=kh, state=st, **f)
+        b.once()
+        o1 = life(b, m["key"])["mt5_open"]
+        write_rpt(env, f"{bc + 4000:013d}_00000010_0000000000.rpt", t_ms=bc + 4000, key_hash=kh, state="EMERGENCY_CLOSE", result="closed_confirmed")
+        b.once()
+        o2 = life(b, m["key"])["mt5_open"]
+        write_rpt(env, f"{bc + 5000:013d}_00000011_0000000000.rpt", t_ms=bc + 5000, key_hash=kh, state="CLOSED", reason="expert")
+        b.once()
+        o3 = life(b, m["key"])["mt5_open"]
+    finally:
+        env.close()
+    check("EAB-26 (review 6) the bridge never treats an emergency close request as a close: after FILLED, EMERGENCY_CLOSE_PARTIAL (remainder "
+          "0.21) and even EMERGENCY_CLOSE keep mt5_open=1; only the EA's CLOSED (written after the history covers the volume) clears it",
+          (o1, o2, o3) == (1, 1, 0), str((o1, o2, o3)))
+    env = Env()
+    try:
+        env.receiver()
+        m = E(3)
+        bc = m["bar_close"]
+        env.send(m, bc + 1000)
+        b = env.bridge(Clock(bc + 2000), require_ea_heartbeat_ms=5000)
+        with open(os.path.join(env.xdir, "hb_ea.txt"), "w") as f:
+            f.write(f"t_ms={bc - 9000}\n")           # the EA's last heartbeat is 11 s old
+        b.once()
+        s1 = (life(b, m["key"])["state"], life(b, m["key"])["reason"], env.cmds())
+        hb = eb.read_kv(os.path.join(env.xdir, "hb_bridge.txt"))
+    finally:
+        env.close()
+    check("EAB-27 (review 8) monitoring: with the EA heartbeat older than require_ea_heartbeat_ms (5 s, a proposal) a new ENTRY is not "
+          "claimed (skip:ea_heartbeat_stale, no command); the bridge writes hb_bridge.txt every pass with the last receipt time (the EA "
+          "refuses new entries when it is stale)",
+          s1 == ("SKIPPED_BY_BRIDGE", "skip:ea_heartbeat_stale", []) and int(hb["t_ms"]) == bc + 2000 and int(hb["last_receipt_ms"]) == bc + 1000,
+          str((s1, hb)))
+    env = Env()
+    try:
+        os.makedirs(env.bdata)
+        import sqlite3
+        old = sqlite3.connect(os.path.join(env.bdata, "bridge.sqlite3"))
+        old.executescript("CREATE TABLE lifecycle (key TEXT PRIMARY KEY, key_hash TEXT, tid TEXT, bar_close INTEGER, state TEXT, reason TEXT,"
+                          " px REAL, sl REAL, tp REAL, path TEXT, otype TEXT, ea_retcode INTEGER, ea_order INTEGER, ea_deal INTEGER,"
+                          " ea_position INTEGER, fill_price REAL, volume REAL, mt5_open INTEGER DEFAULT 0, received_ms INTEGER, checked_ms INTEGER,"
+                          " claim_start_ms INTEGER, claimed_ms INTEGER, cmd_written_ms INTEGER, ea_seen_ms INTEGER, ea_decided_ms INTEGER,"
+                          " ea_pre_send_ms INTEGER, ea_send_ms INTEGER, ea_result_ms INTEGER, ea_filled_ms INTEGER, ea_protected_ms INTEGER,"
+                          " ea_managed_ms INTEGER, ea_closed_ms INTEGER, ea_unknown_ms INTEGER);"
+                          " INSERT INTO lifecycle(key, key_hash, state) VALUES ('k1', 'h1', 'CMD_WRITTEN');")
+        old.commit()
+        old.close()
+        env.receiver()
+        b = env.bridge(Clock(ms.bar(3)))
+        cols = {r[1] for r in b.db.execute("PRAGMA table_info(lifecycle)")}
+        kept = life(b, "k1")["state"]
+    finally:
+        env.close()
+    check("EAB-28 a bridge database written by ST3-1 is upgraded in place (go_ms / go_until_ms / nogo_reason / revoked_ms added), rows kept",
+          {"go_ms", "go_until_ms", "nogo_reason", "revoked_ms"} <= cols and kept == "CMD_WRITTEN", str(cols))
 
 
 def gate_test_entry():
@@ -534,7 +766,7 @@ def gate_test_entry():
 
 
 def main():
-    for g in (gate_claim, gate_filter, gate_deadline, gate_restart, gate_reports, gate_real_data, gate_e2e, gate_test_entry):
+    for g in (gate_claim, gate_filter, gate_deadline, gate_restart, gate_reports, gate_real_data, gate_e2e, gate_review, gate_test_entry):
         try:
             g()
         except Exception:

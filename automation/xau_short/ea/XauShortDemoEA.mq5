@@ -3,37 +3,60 @@
 //|                                                                    |
 //| TradingView (ZoneStrategyXAU_Auto, signal source) -> Windows       |
 //| receiver (records) -> ea_bridge.py (claims ENTRY, writes command   |
-//| files) -> THIS EA (checks with live XS prices, sends the demo      |
-//| order with its initial SL, manages its own position: TP0 at the    |
-//| fill-bar close, breakeven 15 USD on closed M5 bars, reports).      |
+//| files, gives the FINAL go / no-go) -> THIS EA (checks with live XS |
+//| prices, asks the bridge for the final go, records PRE_SEND, checks |
+//| everything again, sends the demo order with its initial SL,        |
+//| manages its own position, reports).                               |
 //|                                                                    |
-//| Defaults: DRY_RUN = true (no trade API write of any kind),         |
-//| new entries OFF. Real / contest accounts are refused in code       |
-//| (no input can allow them). NOT compiled / NOT run by the author:   |
-//| see STAGE3_ja.md before any use.                                   |
+//| Defaults: DRY_RUN = true (no trade API write of any kind), new     |
+//| entries OFF. Real / contest accounts are refused in code. New      |
+//| orders also stay refused until every APPROVED_* constant below is  |
+//| set by an explicit decision (edit + recompile).                    |
+//| NOT compiled / NOT run by the author: see STAGE3_ja.md.            |
 //+------------------------------------------------------------------+
 #property copyright "shota0927-prog"
-#property version   "0.30"
-#property description "XAU Short demo EA (stage 3). DRY_RUN by default. Demo accounts only."
+#property version   "0.31"
+#property description "XAU Short demo EA (stage 3, ST3-2). DRY_RUN by default. Demo accounts only."
 
 //--- approved rules (constants on purpose: not changeable from the inputs)
 const double RISK_FRACTION = 0.03;   // loss budget = balance right before the decision x 3 %
-const int    MAX_AGE_SEC   = 60;     // ENTRY bar close -> 60 s (received / claimed / right before OrderSend)
+const int    MAX_AGE_SEC   = 60;     // ENTRY bar close -> 60 s (read / claim / final go / after the PRE_SEND record)
 const double MAX_DEV_FRAC  = 0.20;   // |Bid - ENTRY.px| <= 20 % of (ENTRY.sl - ENTRY.px)
 const double MAX_SPREAD    = 0.50;   // Ask - Bid <= 0.50 USD (price units, not points / pips)
 const double BE_DIST       = 15.0;   // breakeven trigger, Fixed Distance 15 USD (cfg stBEDist)
 const int    BAR_SEC       = 300;    // M5
-const string CMD_VERSION   = "1";
+const string CMD_VERSION   = "2";
+
+//--- NOT approved yet (proposals). While any of these is false, new orders are refused (DRY_RUN still runs everything).
+//--- Setting one to true is a decision of the user (edit the source, recompile); no input can do it.
+const bool   APPROVED_BE_PRICE_SOURCE = false;  // breakeven judged on XS M5 Bid bars (not the OANDA BAR notifications)
+const bool   APPROVED_FILLBAR_METHOD  = false;  // fill bar: Bid ticks after the fill (InpFillBarBe) or not used
+const bool   APPROVED_TP_TIMING       = false;  // TP0 set at the close of the MT5 fill bar
+const bool   APPROVED_TP_BEYOND       = false;  // TP0 already passed at that moment: change refused, SL kept, retried per bar
+const bool   APPROVED_RETRY_INTERVAL  = false;  // TP / breakeven retry once per M5 bar, emergency close retry EMERGENCY_RETRY_SEC
+const bool   APPROVED_CLOSE_DEVIATION = false;  // market close deviation CLOSE_DEVIATION_POINTS
+const bool   APPROVED_MONITORING      = false;  // ASK_WAIT_MS / bridge GO validity / heartbeat limits below
+//--- proposal values (used as they are only after the approvals above)
+const int    ASK_WAIT_MS            = 5000;     // how long the EA waits for the bridge's final go / no-go
+const int    BRIDGE_HB_MAX_MS       = 5000;     // bridge heartbeat older than this -> no new entry
+const int    EMERGENCY_RETRY_SEC    = 5;        // unprotected own position: next close attempt after this many seconds
+const int    CLOSE_DEVIATION_POINTS = 1000;     // allowed deviation of a market close
+
+#define CLOSE_NOT_ALLOWED 0
+#define CLOSE_FULL        1
+#define CLOSE_PARTIAL     2
+#define CLOSE_FAILED      3
+#define CLOSE_UNKNOWN     4
 
 enum ENUM_FILLBAR_BE
   {
-   FILLBAR_TICKS_SINCE_FILL = 0,     // fill bar: lowest Bid seen by this EA after the fill (skipped after a restart)
+   FILLBAR_TICKS_SINCE_FILL = 0,     // fill bar: lowest Bid of the tick history strictly after the fill, before the fill-bar close
    FILLBAR_SKIP             = 1      // fill bar: not used for breakeven
   };
 
 //--- inputs (set on the PC; never a password here)
 input bool   InpDryRun          = true;              // DRY_RUN: true = no trade API write at all (orders / closes / SL-TP changes)
-input bool   InpAllowNewEntries = false;             // new entries (also needs DryRun = false); protection of own positions is separate
+input bool   InpAllowNewEntries = false;             // new entries (also needs DryRun = false and the approvals); protection is separate
 input long   InpExpectedLogin   = 0;                 // demo account login (must be set; 0 = trade writes stay disabled)
 input string InpExpectedServer  = "XSFintech-DEMO";  // trade server
 input string InpSymbol          = "XAUUSDs";         // XS symbol
@@ -41,45 +64,67 @@ input string InpExpectedCurrency= "JPY";             // account currency
 input string InpExpectedSid     = "XAU-SHORT|XA-23|AU-2";
 input string InpExpectedCfgSha  = "72fa9868a3e196ebcd02e37a12f82416d1149e5bd0567d8bf426e2c49f4695ee";
 input string InpExpectedTvSym   = "OANDA:XAUUSD";
-input long   InpMagic           = 26102801;          // identification aid only (ownership = journal + live ticket)
+input long   InpMagic           = 26102801;          // identification aid only (ownership = journal + POSITION_IDENTIFIER)
 input string InpExchangeDir     = "XauShortDemo";    // under Terminal\Common\Files
 input int    InpTimerMs         = 500;
-input ENUM_FILLBAR_BE InpFillBarBe = FILLBAR_TICKS_SINCE_FILL;   // PROPOSAL (undecided item): fill-bar breakeven source
+input ENUM_FILLBAR_BE InpFillBarBe = FILLBAR_TICKS_SINCE_FILL;   // PROPOSAL (not approved): fill-bar breakeven source
 
 //--- state
 struct OwnedPos
   {
-   string   key;
-   string   khash;
-   ulong    posTicket;
+   string   key;           // key hash of the ENTRY
+   long     posId;         // POSITION_IDENTIFIER (stable; = DEAL_POSITION_ID)
+   ulong    posTicket;     // current POSITION_TICKET (refreshed by SelectOwn; may differ from posId)
    ulong    orderTicket;
    ulong    dealTicket;
-   double   fill;        // actual XS fill price (deal price)
-   double   sl0;         // initial SL sent with the order
-   double   tp0;         // TP0 of the ENTRY (SATS: fixed at the wait prep)
+   double   fill;          // actual XS fill price (position open price)
+   double   sl0;           // initial SL sent with the order
+   double   tp0;           // TP0 of the ENTRY (SATS: fixed at the wait prep)
    double   volume;
-   datetime fillTimeSrv; // deal time (server time)
+   datetime fillTimeSrv;   // fill time (server time)
+   long     fillTimeMsc;   // fill time (server time, ms)
    bool     tpSet;
    bool     beDone;
-   bool     tracked;     // the EA saw every tick since the fill (fill-bar extreme valid)
-   double   minBid;      // lowest Bid since the fill (short: favourable side)
-   datetime lastBarDone; // open time of the last M5 bar evaluated for breakeven
-   bool     bePending;   // breakeven triggered but the SL change has not succeeded yet (retried once per closed bar)
-   datetime lastTpTry;   // server time of the last TP0 attempt (a failed change is retried once per M5 bar, not every timer)
+   bool     bePending;     // breakeven triggered, the SL change has not succeeded yet (retried once per closed bar)
+   bool     fillBarDone;   // the fill bar was evaluated for breakeven
+   datetime lastBarDone;   // open time of the last M5 bar evaluated for breakeven
+   datetime lastTpTry;     // server time of the last TP0 attempt
+   long     lastEmergencyTry;
+   bool     protectedNoted;
+   bool     slMissingNoted;
+   bool     missingNoted;
   };
 
 OwnedPos g_pos;
-bool     g_hasPos     = false;
-bool     g_envOk      = false;   // demo / login / server / currency / hedging / symbol verified
-bool     g_ready      = false;   // startup reconciliation finished
-bool     g_haltNew    = false;   // new entries stopped (persisted in the journal); protection continues
-string   g_haltReason = "";
-bool     g_critical   = false;   // critical error: no new entries, operator action needed
-string   g_inflightKey= "";      // PRE_SEND written, final result not known yet -> occupies the single slot
-int      g_lock       = INVALID_HANDLE;
-int      g_rptSeq     = 0;
-string   g_seenKeys[];           // key hashes that already have a journal record (duplicate guard)
-bool     g_dryMgmtNoted = false; // DRY_RUN with an own position: noted once in the journal
+
+//--- every field set explicitly (no ZeroMemory on a structure holding strings)
+void ResetPos()
+  {
+   g_pos.key = ""; g_pos.posId = 0; g_pos.posTicket = 0; g_pos.orderTicket = 0; g_pos.dealTicket = 0;
+   g_pos.fill = 0; g_pos.sl0 = 0; g_pos.tp0 = 0; g_pos.volume = 0; g_pos.fillTimeSrv = 0; g_pos.fillTimeMsc = 0;
+   g_pos.tpSet = false; g_pos.beDone = false; g_pos.bePending = false; g_pos.fillBarDone = false;
+   g_pos.lastBarDone = 0; g_pos.lastTpTry = 0; g_pos.lastEmergencyTry = 0;
+   g_pos.protectedNoted = false; g_pos.slMissingNoted = false; g_pos.missingNoted = false;
+  }
+bool     g_hasPos       = false;
+bool     g_envOk        = false;   // demo / login / server / currency / hedging / symbol verified
+bool     g_bindOk       = true;    // the journal belongs to this account / server / magic / Strategy
+bool     g_ready        = false;   // startup reconciliation finished
+bool     g_haltNew      = false;   // new entries stopped (persisted in the journal); protection continues
+string   g_haltReason   = "";
+bool     g_critical     = false;   // critical error: no new entries, operator action needed
+string   g_critReason   = "";
+bool     g_journalOk    = true;    // the last required journal write succeeded
+string   g_inflightKey  = "";      // PRE_SEND written, send in progress
+string   g_unknownKey   = "";      // a send whose result is unknown (cleared only by resolve_unknown after the history check)
+long     g_unknownPreMs = 0;       // PRE_SEND time (GMT ms) of the unknown key
+double   g_unknownSl    = 0;
+double   g_unknownTp    = 0;
+string   g_journalPath  = "";
+int      g_lock         = INVALID_HANDLE;
+int      g_rptSeq       = 0;
+string   g_seenKeys[];             // key hashes that already have a journal record (duplicate guard)
+bool     g_mgmtNoted    = false;   // management blocked (DRY_RUN / environment) noted once
 
 //+------------------------------------------------------------------+
 //| small helpers                                                     |
@@ -88,6 +133,14 @@ bool     g_dryMgmtNoted = false; // DRY_RUN with an own position: noted once in 
 //--- EARLIEST possible now (a future bar is never "in time")
 long NowMs() { return (long)TimeGMT() * 1000; }
 long NowMsLate() { return (long)TimeGMT() * 1000 + 999; }
+
+//--- open time of the M5 bar that contains t (integer arithmetic, no operator on datetime)
+datetime BarOpenOf(const datetime t) { return((datetime)((long)t - (long)t % BAR_SEC)); }
+
+//--- server time minus GMT in seconds (POSITION_TIME_MSC / tick times are server time, the journal is GMT)
+long ServerOffsetSec() { return((long)TimeTradeServer() - (long)TimeGMT()); }
+
+string Dir(const string sub) { return(sub == "" ? InpExchangeDir : InpExchangeDir + "\\" + sub); }
 
 //--- first 16 hex chars of SHA-256(key) — the same identity the bridge writes (key_hash) and puts in the file name
 string Sha16(const string s)
@@ -102,13 +155,17 @@ string Sha16(const string s)
    return(h);
   }
 
-//--- open time of the M5 bar that contains t (integer arithmetic, no operator on datetime)
-datetime BarOpenOf(const datetime t) { return((datetime)((long)t - (long)t % BAR_SEC)); }
-
-//--- server time minus GMT in seconds (POSITION_TIME_MSC is server time, the journal is GMT)
-long ServerOffsetSec() { return((long)TimeTradeServer() - (long)TimeGMT()); }
-
-string Dir(const string sub) { return(sub == "" ? InpExchangeDir : InpExchangeDir + "\\" + sub); }
+string NameSafe(string s)
+  {
+   string o = "";
+   for(int i = 0; i < StringLen(s); i++)
+     {
+      ushort ch = StringGetCharacter(s, i);
+      bool ok = (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '-';
+      o += ok ? ShortToString(ch) : "_";
+     }
+   return(o);
+  }
 
 bool SeenKey(const string key)
   {
@@ -135,57 +192,117 @@ string Sanitize(string s)
    return(s);
   }
 
-//--- report file for the bridge (tmp + move = atomic for the reader; an existing report is never overwritten)
+//--- value of k in a "k=v" line list ("" = missing)
+string KvGet(const string &lines[], const string k)
+  {
+   for(int i = 0; i < ArraySize(lines); i++)
+      if(StringFind(lines[i], k + "=") == 0)
+         return(StringSubstr(lines[i], StringLen(k) + 1));
+   return("");
+  }
+
+bool ReadLines(const string path, string &lines[])
+  {
+   ArrayResize(lines, 0);
+   int h = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(h == INVALID_HANDLE)
+      return(false);
+   while(!FileIsEnding(h))
+     {
+      string l = FileReadString(h);
+      int n = ArraySize(lines);
+      ArrayResize(lines, n + 1);
+      lines[n] = l;
+     }
+   FileClose(h);
+   return(true);
+  }
+
+//--- small file via tmp + move (atomic for the reader); true only when every step succeeded
+bool WriteFileAtomic(const string dir, const string name, const string body, const bool rewrite)
+  {
+   string tmp = dir + "\\" + name + ".tmp", dst = dir + "\\" + name;
+   ResetLastError();
+   int h = FileOpen(tmp, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   if(h == INVALID_HANDLE)
+      return(false);
+   uint w = FileWriteString(h, body);
+   FileFlush(h);
+   FileClose(h);
+   if(w < (uint)StringLen(body) || GetLastError() != 0)
+     {
+      FileDelete(tmp, FILE_COMMON);
+      return(false);
+     }
+   if(!FileMove(tmp, FILE_COMMON, dst, FILE_COMMON | (rewrite ? FILE_REWRITE : 0)))
+     {
+      FileDelete(tmp, FILE_COMMON);
+      return(false);
+     }
+   return(true);
+  }
+
+//--- report file for the bridge (an existing report is never overwritten)
 void Report(const string key, const string state, const string fields)
   {
+   string body = "t_ms=" + IntegerToString(NowMs()) + "\nkey_hash=" + Sanitize(key) + "\nstate=" + state + "\n";
+   string parts[];
+   int n = StringSplit(fields, ';', parts);
+   for(int i = 0; i < n; i++)
+      if(StringFind(parts[i], "=") > 0)
+         body += Sanitize(parts[i]) + "\n";
    for(int attempt = 0; attempt < 5; attempt++)
      {
       g_rptSeq++;
-      string base = IntegerToString(NowMs(), 13, '0') + "_" + IntegerToString(g_rptSeq, 8, '0') + "_" +
-                    IntegerToString((long)GetTickCount(), 10, '0');
-      string tmp  = Dir("rpt") + "\\" + base + ".tmp";
-      string dst  = Dir("rpt") + "\\" + base + ".rpt";
-      int h = FileOpen(tmp, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
-      if(h == INVALID_HANDLE)
-        {
-         Print("report write failed ", GetLastError());
+      // name order = write order, also across EA restarts within the same second: GMT ms, then the PC's monotonic tick
+      // count (GetTickCount64 does not restart with the EA), then the sequence of this instance
+      string base = IntegerToString(NowMs(), 13, '0') + "_" + IntegerToString((long)GetTickCount64(), 20, '0') + "_" +
+                    IntegerToString(g_rptSeq, 8, '0');
+      if(WriteFileAtomic(Dir("rpt"), base + ".rpt", body, false))
          return;
-        }
-      FileWriteString(h, "t_ms=" + IntegerToString(NowMs()) + "\n");
-      FileWriteString(h, "key_hash=" + Sanitize(key) + "\n");
-      FileWriteString(h, "state=" + state + "\n");
-      string parts[];
-      int n = StringSplit(fields, ';', parts);
-      for(int i = 0; i < n; i++)
-         if(StringFind(parts[i], "=") > 0)
-            FileWriteString(h, Sanitize(parts[i]) + "\n");
-      FileClose(h);
-      if(FileMove(tmp, FILE_COMMON, dst, FILE_COMMON))
-         return;
-      FileDelete(tmp, FILE_COMMON);              // the name exists (same ms / sequence after a restart): next sequence
      }
-   Print("report move failed ", GetLastError());
+   Print("report write failed ", GetLastError());
   }
 
-//--- append-only journal (flushed before any trade API call) + report. `key` is the 16-hex key hash ("" = EA-level line).
-void Journal(const string key, const string state, const string fields)
+//--- append-only journal. true only when the line is on disk (open, write length, flush, close all checked).
+//--- `key` is the 16-hex key hash ("" = EA-level line). A failed write is printed to the Experts log and to journal_fallback.txt.
+bool Journal(const string key, const string state, const string fields)
   {
    string line = IntegerToString(NowMs()) + "|" + Sanitize(key) + "|" + state + "|" + Sanitize(fields);
-   int h = FileOpen(Dir("") + "\\journal.txt", FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON | FILE_SHARE_READ);
-   if(h == INVALID_HANDLE)
+   bool ok = false;
+   ResetLastError();
+   int h = FileOpen(g_journalPath, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON | FILE_SHARE_READ);
+   if(h != INVALID_HANDLE)
      {
-      // a journal that cannot be written makes every later decision unsafe
-      g_critical = true;
-      Print("CRITICAL: journal write failed ", GetLastError(), " ", line);
-      return;
+      if(FileSeek(h, 0, SEEK_END))
+        {
+         uint w = FileWriteString(h, line + "\n");
+         FileFlush(h);
+         ok = w >= (uint)StringLen(line) + 1 && GetLastError() == 0;
+        }
+      FileClose(h);
      }
-   FileSeek(h, 0, SEEK_END);
-   FileWriteString(h, line + "\n");
-   FileFlush(h);
-   FileClose(h);
+   g_journalOk = ok;
+   if(!ok)
+     {
+      // a journal that cannot be written makes every new decision unsafe: no new entry until an operator checks it.
+      // Protection of an own position (emergency close) is NOT blocked by this (see ClosePosition).
+      g_critical = true;
+      g_critReason = "journal_write_failed";
+      Print("CRITICAL: journal write failed ", GetLastError(), " ", line);
+      int f = FileOpen(Dir("") + "\\journal_fallback.txt", FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON | FILE_SHARE_READ);
+      if(f != INVALID_HANDLE)
+        {
+         FileSeek(f, 0, SEEK_END);
+         FileWriteString(f, line + "\n");
+         FileClose(f);
+        }
+      return(false);
+     }
    AddSeen(key);
    Report(key, state, fields);
    Print(line);
+   return(true);
   }
 
 void HaltNew(const string reason)
@@ -198,7 +315,39 @@ void HaltNew(const string reason)
      }
   }
 
+void SetCritical(const string key, const string reason)
+  {
+   g_critical = true;
+   g_critReason = reason;
+   Journal(key, "CRITICAL", "reason=" + reason);
+  }
+
 bool HaltFileExists() { return(FileIsExist(Dir("") + "\\halt_new", FILE_COMMON)); }
+
+//--- approvals: the first missing one ("" = all approved) and the full list for the records
+string Unapproved()
+  {
+   if(!APPROVED_BE_PRICE_SOURCE) return("be_price_source");
+   if(!APPROVED_FILLBAR_METHOD)  return("fillbar_method");
+   if(!APPROVED_TP_TIMING)       return("tp_timing");
+   if(!APPROVED_TP_BEYOND)       return("tp_beyond");
+   if(!APPROVED_RETRY_INTERVAL)  return("retry_interval");
+   if(!APPROVED_CLOSE_DEVIATION) return("close_deviation");
+   if(!APPROVED_MONITORING)      return("monitoring");
+   return("");
+  }
+
+//--- age of the bridge heartbeat in ms (-1 = none / unreadable)
+long BridgeHeartbeatAgeMs()
+  {
+   string l[];
+   if(!ReadLines(Dir("") + "\\hb_bridge.txt", l))
+      return(-1);
+   long t = StringToInteger(KvGet(l, "t_ms"));
+   if(t <= 0)
+      return(-1);
+   return(NowMsLate() - t);
+  }
 
 //+------------------------------------------------------------------+
 //| environment: demo only                                            |
@@ -222,29 +371,40 @@ bool VerifyEnvironment(string &why)
       why = "not_hedging_account";
    else if(!SymbolSelect(InpSymbol, true))
       why = "symbol_not_available";
+   else if(!g_bindOk)
+      why = "journal_binding_mismatch";
    return(why == "");
   }
 
-//--- every trade API write goes through this gate (DRY_RUN blocks all of them)
+//--- every trade API write goes through this gate (DRY_RUN blocks all of them). A journal failure does NOT block it, so the
+//--- protection of an own position stays possible; new entries are blocked separately (NewEntriesAllowed).
 bool TradeWritesAllowed()
   {
-   if(InpDryRun || !g_envOk || !g_ready || !IsDemoAccount())
+   if(InpDryRun || !g_envOk || !g_bindOk || !g_ready || !IsDemoAccount())
       return(false);
    if(AccountInfoInteger(ACCOUNT_LOGIN) != InpExpectedLogin || AccountInfoString(ACCOUNT_SERVER) != InpExpectedServer)
       return(false);
    return(true);
   }
 
-bool NewEntriesAllowed(string &why)
+//--- `self` = the key being sent right now (its own in-flight mark does not block it)
+bool NewEntriesAllowed(string &why, const string self = "")
   {
    why = "";
-   if(InpDryRun)                 why = "dry_run";
-   else if(!InpAllowNewEntries)  why = "new_entries_off";
-   else if(!TradeWritesAllowed()) why = "trade_writes_not_allowed";
-   else if(g_critical)           why = "critical";
-   else if(g_haltNew)            why = "halt_new:" + g_haltReason;
-   else if(HaltFileExists())     why = "halt_file";
-   else if(g_inflightKey != "")  why = "in_flight:" + g_inflightKey;
+   string ua = Unapproved();
+   long hb = BridgeHeartbeatAgeMs();
+   if(InpDryRun)                   why = "dry_run";
+   else if(!InpAllowNewEntries)    why = "new_entries_off";
+   else if(ua != "")               why = "unapproved:" + ua;
+   else if(!TradeWritesAllowed())  why = "trade_writes_not_allowed";
+   else if(!g_journalOk)           why = "journal_write_failed";
+   else if(g_critical)             why = "critical:" + g_critReason;
+   else if(g_unknownKey != "")     why = "unknown_unresolved:" + g_unknownKey;
+   else if(g_haltNew)              why = "halt_new:" + g_haltReason;
+   else if(HaltFileExists())       why = "halt_file";
+   else if(g_inflightKey != "" && g_inflightKey != self) why = "in_flight:" + g_inflightKey;
+   else if(g_hasPos)               why = "max1_own_position";
+   else if(hb < 0 || hb > BRIDGE_HB_MAX_MS) why = "bridge_heartbeat_stale";
    return(why == "");
   }
 
@@ -260,35 +420,14 @@ struct Cmd
 
 bool ReadCmd(const string file, Cmd &c)
   {
-   int h = FileOpen(file, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON | FILE_SHARE_READ);
-   if(h == INVALID_HANDLE)
+   string l[];
+   if(!ReadLines(file, l))
       return(false);
-   c.v = ""; c.key = ""; c.khash = ""; c.tid = ""; c.ev = ""; c.side = ""; c.otype = ""; c.path = ""; c.cfg = ""; c.sid = ""; c.sym = "";
-   c.px = 0; c.sl = 0; c.tp = 0; c.barCloseMs = 0;
-   while(!FileIsEnding(h))
-     {
-      string line = FileReadString(h);
-      int p = StringFind(line, "=");
-      if(p <= 0)
-         continue;
-      string k = StringSubstr(line, 0, p), val = StringSubstr(line, p + 1);
-      if(k == "v") c.v = val;
-      else if(k == "key") c.key = val;
-      else if(k == "key_hash") c.khash = val;
-      else if(k == "tid") c.tid = val;
-      else if(k == "ev") c.ev = val;
-      else if(k == "side") c.side = val;
-      else if(k == "otype") c.otype = val;
-      else if(k == "path") c.path = val;
-      else if(k == "cfg_sha256") c.cfg = val;
-      else if(k == "sid") c.sid = val;
-      else if(k == "sym") c.sym = val;
-      else if(k == "px") c.px = StringToDouble(val);
-      else if(k == "sl") c.sl = StringToDouble(val);
-      else if(k == "tp") c.tp = StringToDouble(val);
-      else if(k == "bar_close_ms") c.barCloseMs = StringToInteger(val);
-     }
-   FileClose(h);
+   c.v = KvGet(l, "v"); c.key = KvGet(l, "key"); c.khash = KvGet(l, "key_hash"); c.tid = KvGet(l, "tid"); c.ev = KvGet(l, "ev");
+   c.side = KvGet(l, "side"); c.otype = KvGet(l, "otype"); c.path = KvGet(l, "path"); c.cfg = KvGet(l, "cfg_sha256");
+   c.sid = KvGet(l, "sid"); c.sym = KvGet(l, "sym");
+   c.px = StringToDouble(KvGet(l, "px")); c.sl = StringToDouble(KvGet(l, "sl")); c.tp = StringToDouble(KvGet(l, "tp"));
+   c.barCloseMs = StringToInteger(KvGet(l, "bar_close_ms"));
    return(true);
   }
 
@@ -433,6 +572,121 @@ string PrepareOrder(const Cmd &c, MqlTradeRequest &req, string &detail)
   }
 
 //+------------------------------------------------------------------+
+//| final permission from the bridge (file handshake, also in DRY_RUN) |
+//+------------------------------------------------------------------+
+//--- "" = GO (goUntil = the GO validity, GMT ms); otherwise "nogo:<reason>". No answer within ASK_WAIT_MS = no go.
+string AskBridge(const Cmd &c, const bool dry, long &goUntil)
+  {
+   goUntil = 0;
+   string ans = Dir("ans") + "\\" + c.khash + ".ans";
+   if(FileIsExist(ans, FILE_COMMON))
+      FileMove(ans, FILE_COMMON, Dir("done") + "\\" + c.khash + ".stale.ans", FILE_COMMON | FILE_REWRITE);   // never used
+   string body = "key_hash=" + c.khash + "\nt_ms=" + IntegerToString(NowMs()) + "\ndry_run=" + (dry ? "1" : "0") + "\n";
+   if(!WriteFileAtomic(Dir("ask"), c.khash + ".ask", body, true))
+      return("nogo:ask_write_failed");
+   uint t0 = GetTickCount();
+   while(GetTickCount() - t0 < (uint)ASK_WAIT_MS && !IsStopped())
+     {
+      if(FileIsExist(ans, FILE_COMMON))
+        {
+         string l[];
+         bool rd = ReadLines(ans, l);
+         FileMove(ans, FILE_COMMON, Dir("done") + "\\" + c.khash + ".ans", FILE_COMMON | FILE_REWRITE);
+         if(!rd || KvGet(l, "key_hash") != c.khash)
+            return("nogo:answer_unreadable");
+         if(KvGet(l, "decision") != "GO")
+            return("nogo:" + KvGet(l, "reason"));
+         long until = StringToInteger(KvGet(l, "valid_until_ms"));
+         until = MathMin(until, c.barCloseMs + (long)MAX_AGE_SEC * 1000);
+         if(NowMsLate() > until)
+            return("nogo:go_expired_on_arrival");
+         goUntil = until;
+         return("");
+        }
+      Sleep(50);
+     }
+   return("nogo:no_answer");
+  }
+
+//--- the checks right before OrderSend, AFTER the PRE_SEND record (the record itself may take time): deadline, GO validity,
+//--- every new-entry gate, account-wide positions / pending orders, and the request rebuilt from the current price / spread /
+//--- balance. The rebuilt request must keep the recorded volume and SL, otherwise the old request is not used.
+string SendCheck(const Cmd &c, const string id, const long goUntil, const MqlTradeRequest &base, MqlTradeRequest &out)
+  {
+   string why = CheckDeadline(c);
+   if(why != "")                              return(why);
+   if(NowMsLate() > goUntil)                  return("go_expired");
+   string gate;
+   if(!NewEntriesAllowed(gate, id))           return(gate);
+   string detail;
+   why = PrepareOrder(c, out, detail);
+   if(why != "")                              return(why);
+   if(MathAbs(out.volume - base.volume) > 1e-9 || MathAbs(out.sl - base.sl) > 1e-9) return("request_changed");
+   return("");
+  }
+
+//+------------------------------------------------------------------+
+//| ownership: journal record + POSITION_IDENTIFIER + symbol + magic  |
+//+------------------------------------------------------------------+
+//--- 1 = the own position is selected (posTicket refreshed); 0 = no open position with that identifier;
+//--- -1 = the identifier is open but symbol / magic / type do not match -> quarantined, never written to
+int SelectOwn()
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong t = PositionGetTicket(i);
+      if(t == 0 || PositionGetInteger(POSITION_IDENTIFIER) != g_pos.posId)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != InpSymbol || PositionGetInteger(POSITION_MAGIC) != InpMagic ||
+         PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_SELL)
+        {
+         Quarantine("ownership_mismatch", t);
+         return(-1);
+        }
+      if(t != g_pos.posTicket)
+        {
+         Journal(g_pos.key, "TICKET_CHANGED", "position_id=" + IntegerToString(g_pos.posId) + ";old=" + IntegerToString((long)g_pos.posTicket) +
+                 ";new=" + IntegerToString((long)t));
+         g_pos.posTicket = t;
+         PositionSelectByTicket(t);
+        }
+      return(1);
+     }
+   return(0);
+  }
+
+//--- an own record that does not match the live position: not managed, nothing written to it, new entries stop
+void Quarantine(const string reason, const ulong ticket)
+  {
+   Journal(g_pos.key, "QUARANTINE", "reason=" + reason + ";position_id=" + IntegerToString(g_pos.posId) + ";ticket=" +
+           IntegerToString((long)ticket) + ";note=no_write_to_this_position");
+   g_hasPos = false;
+   HaltNew("quarantine:" + reason);
+   SetCritical(g_pos.key, "quarantine:" + reason);
+  }
+
+//--- volumes of the position's history (identifier): in / out
+bool HistoryVolumes(const long posId, double &vin, double &vout, ulong &lastOut)
+  {
+   vin = 0; vout = 0; lastOut = 0;
+   if(!HistorySelectByPosition(posId))
+      return(false);
+   for(int i = 0; i < HistoryDealsTotal(); i++)
+     {
+      ulong d = HistoryDealGetTicket(i);
+      long e = HistoryDealGetInteger(d, DEAL_ENTRY);
+      if(e == DEAL_ENTRY_IN)
+         vin += HistoryDealGetDouble(d, DEAL_VOLUME);
+      else if(e == DEAL_ENTRY_OUT || e == DEAL_ENTRY_OUT_BY)
+        {
+         vout += HistoryDealGetDouble(d, DEAL_VOLUME);
+         lastOut = d;
+        }
+     }
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
 //| trade API wrappers (the only OrderSend calls)                     |
 //+------------------------------------------------------------------+
 bool IsDefiniteReject(uint rc)
@@ -452,77 +706,109 @@ bool IsDefiniteReject(uint rc)
    return(false);
   }
 
-//--- confirm a fill from the deal / position, never from OrderSend's bool alone
-//--- an open position of this symbol + magic whose comment is exactly the tag of this key hash (0 = none)
-ulong FindTaggedPosition(const string khash)
+//--- an open position of this symbol + magic + SELL whose identifier is posId (0 = none)
+ulong TicketOfIdentifier(const long posId)
   {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong t = PositionGetTicket(i);
-      if(t > 0 && PositionSelectByTicket(t) && PositionGetString(POSITION_SYMBOL) == InpSymbol &&
-         PositionGetInteger(POSITION_MAGIC) == InpMagic && PositionGetString(POSITION_COMMENT) == "XSD:" + khash)
+      if(t > 0 && PositionGetInteger(POSITION_IDENTIFIER) == posId && PositionGetString(POSITION_SYMBOL) == InpSymbol &&
+         PositionGetInteger(POSITION_MAGIC) == InpMagic && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
          return(t);
      }
    return(0);
   }
 
-bool ConfirmFill(const string key, const string khash, ulong orderTicket, ulong dealTicket, double sl0, double tp0)
+//--- adopt an own position (selected) into management and record it as FILLED (the restart adopts it from this record)
+void AdoptOwn(const string key, const long posId, const ulong ticket, const ulong orderTicket, const ulong dealTicket,
+              const double sl0, const double tp0, const string via)
   {
-   ulong posId = 0;
-   for(int i = 0; i < 20 && posId == 0; i++)        // the deal can reach the history a little after OrderSend returns
-     {
-      if(dealTicket > 0 && HistoryDealSelect(dealTicket))
-         posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-      if(posId == 0)
-         Sleep(100);
-     }
-   if(posId == 0)
-      posId = FindTaggedPosition(khash);
-   if(posId == 0 || !PositionSelectByTicket(posId))
-      return(false);
-   if(PositionGetString(POSITION_SYMBOL) != InpSymbol || PositionGetInteger(POSITION_MAGIC) != InpMagic ||
-      PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_SELL)
-      return(false);
-   g_pos.key = key; g_pos.khash = khash; g_pos.posTicket = posId; g_pos.orderTicket = orderTicket; g_pos.dealTicket = dealTicket;
+   ResetPos();
+   g_pos.key = key; g_pos.posId = posId; g_pos.posTicket = ticket; g_pos.orderTicket = orderTicket; g_pos.dealTicket = dealTicket;
    g_pos.fill = PositionGetDouble(POSITION_PRICE_OPEN);  // actual XS fill (average price if the fill came in parts)
    g_pos.volume = PositionGetDouble(POSITION_VOLUME);
    g_pos.sl0 = sl0; g_pos.tp0 = tp0;
    g_pos.fillTimeSrv = (datetime)PositionGetInteger(POSITION_TIME);
-   g_pos.tpSet = false; g_pos.beDone = false; g_pos.tracked = true; g_pos.minBid = g_pos.fill; g_pos.lastBarDone = 0;
-   g_pos.bePending = false; g_pos.lastTpTry = 0;
+   g_pos.fillTimeMsc = PositionGetInteger(POSITION_TIME_MSC);
    g_hasPos = true;
    Journal(key, "FILLED", "order=" + IntegerToString((long)orderTicket) + ";deal=" + IntegerToString((long)dealTicket) +
-           ";position=" + IntegerToString((long)posId) + ";fill_price=" + DoubleToString(g_pos.fill, 5) +
-           ";volume=" + DoubleToString(g_pos.volume, 2) + ";sl0=" + DoubleToString(sl0, 5) + ";tp0=" + DoubleToString(tp0, 5) +
-           ";fill_time=" + IntegerToString((long)g_pos.fillTimeSrv));
+           ";position_id=" + IntegerToString(posId) + ";position=" + IntegerToString((long)ticket) +
+           ";fill_price=" + DoubleToString(g_pos.fill, 5) + ";volume=" + DoubleToString(g_pos.volume, 2) +
+           ";sl0=" + DoubleToString(sl0, 5) + ";tp0=" + DoubleToString(tp0, 5) +
+           ";fill_time=" + IntegerToString((long)g_pos.fillTimeSrv) + ";fill_time_msc=" + IntegerToString(g_pos.fillTimeMsc) + ";via=" + via);
+  }
+
+//--- confirm a fill from the deal -> DEAL_POSITION_ID (= POSITION_IDENTIFIER) -> the live position, never from OrderSend's bool
+bool ConfirmFill(const string key, ulong orderTicket, ulong dealTicket, double sl0, double tp0)
+  {
+   long posId = 0;
+   for(int i = 0; i < 20 && posId == 0; i++)        // the deal can reach the history a little after OrderSend returns
+     {
+      if(dealTicket > 0 && HistoryDealSelect(dealTicket))
+         posId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      if(posId == 0)
+         Sleep(100);
+     }
+   if(posId == 0)
+      return(false);
+   ulong t = TicketOfIdentifier(posId);
+   if(t == 0 || !PositionSelectByTicket(t))
+      return(false);
+   AdoptOwn(key, posId, t, orderTicket, dealTicket, sl0, tp0, "send");
    return(true);
   }
 
-bool ClosePosition(const string key, const string reason)
+//--- market close of the OWN position. The result is verified on the live position and its history:
+//--- CLOSE_FULL (gone and the history covers the volume), CLOSE_PARTIAL (still open with less volume), CLOSE_FAILED (unchanged),
+//--- CLOSE_UNKNOWN (cannot be told). A journal failure does not stop an emergency close (the Experts log keeps a trace).
+int ClosePosition(const string key, const string reason, double &remaining)
   {
-   if(!TradeWritesAllowed() || !g_hasPos || !PositionSelectByTicket(g_pos.posTicket))
-      return(false);
+   remaining = -1;
+   if(!TradeWritesAllowed() || !g_hasPos || SelectOwn() != 1)
+      return(CLOSE_NOT_ALLOWED);
    MqlTick tk;
    if(!SymbolInfoTick(InpSymbol, tk))
-      return(false);
+      return(CLOSE_FAILED);
+   double vol = PositionGetDouble(POSITION_VOLUME);
    MqlTradeRequest r;
    MqlTradeResult res;
    ZeroMemory(r);
    ZeroMemory(res);
    r.action = TRADE_ACTION_DEAL; r.symbol = InpSymbol; r.type = ORDER_TYPE_BUY; r.position = g_pos.posTicket;
-   r.volume = PositionGetDouble(POSITION_VOLUME); r.price = tk.ask; r.magic = (ulong)InpMagic; r.comment = "XSD:" + g_pos.khash + ":C";
-   r.type_filling = FillingMode(); r.deviation = 1000;
-   Journal(key, "CLOSE_PRE_SEND", "reason=" + reason + ";position=" + IntegerToString((long)g_pos.posTicket));
+   r.volume = vol; r.price = tk.ask; r.magic = (ulong)InpMagic; r.comment = "XSD:" + g_pos.key + ":C";
+   r.type_filling = FillingMode(); r.deviation = (ulong)CLOSE_DEVIATION_POINTS;
+   Journal(key, "CLOSE_PRE_SEND", "reason=" + reason + ";position_id=" + IntegerToString(g_pos.posId) + ";volume=" + DoubleToString(vol, 2));
    bool ok = OrderSend(r, res);
-   Journal(key, ok && (res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_DONE_PARTIAL) ? "CLOSE_SENT" : "CLOSE_FAILED",
-           "reason=" + reason + ";retcode=" + IntegerToString((int)res.retcode));
-   return(ok && (res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_DONE_PARTIAL));
+   int result = CLOSE_UNKNOWN;
+   for(int i = 0; i < 20; i++)
+     {
+      int sel = SelectOwn();
+      if(sel == 1)
+        {
+         remaining = PositionGetDouble(POSITION_VOLUME);
+         if(remaining < vol - 1e-9) { result = CLOSE_PARTIAL; break; }
+         if(!ok && IsDefiniteReject(res.retcode)) { result = CLOSE_FAILED; break; }
+        }
+      else if(sel == 0)
+        {
+         double vin, vout;
+         ulong lo;
+         remaining = 0;
+         if(HistoryVolumes(g_pos.posId, vin, vout, lo) && vin > 0 && vout >= vin - 1e-9) { result = CLOSE_FULL; break; }
+        }
+      else
+         break;
+      Sleep(100);
+     }
+   string st = result == CLOSE_FULL ? "CLOSE_DONE" : result == CLOSE_PARTIAL ? "CLOSE_PARTIAL" : result == CLOSE_FAILED ? "CLOSE_FAILED" : "CLOSE_UNKNOWN";
+   Journal(key, st, "reason=" + reason + ";retcode=" + IntegerToString((int)res.retcode) + ";remaining=" + DoubleToString(remaining, 2));
+   return(result);
   }
 
-//--- SL / TP change of the OWN position; never loosens a short's SL, never removes it
+//--- SL / TP change of the OWN position (ownership re-checked); never loosens a short's SL, never removes it
 bool ModifyOwn(const string what, double newSl, double newTp)
   {
-   if(!TradeWritesAllowed() || !g_hasPos || !PositionSelectByTicket(g_pos.posTicket))
+   if(!TradeWritesAllowed() || !g_hasPos || SelectOwn() != 1)
       return(false);
    double curSl = PositionGetDouble(POSITION_SL);
    if(newSl <= 0 || (curSl > 0 && newSl > curSl + 1e-9))
@@ -546,15 +832,22 @@ bool ModifyOwn(const string what, double newSl, double newTp)
    return(true);
   }
 
-//--- the single entry path: deadline + checks right before OrderSend, journal before / after, result classified
+//--- the single entry path
 void ProcessEntry(const Cmd &c, const string id)
   {
-   Journal(id, "SEEN", "tid=" + c.tid + ";bar_close_ms=" + IntegerToString(c.barCloseMs));
+   if(!Journal(id, "SEEN", "tid=" + c.tid + ";bar_close_ms=" + IntegerToString(c.barCloseMs)))
+      return;                                        // nothing is decided without a record
    string why = CheckCmd(c);
    if(why == "") why = CheckDeadline(c);
    string gate = "";
-   if(why == "" && !NewEntriesAllowed(gate) && gate != "dry_run" && gate != "new_entries_off")
-      why = gate;                                    // skipped now, never re-tried later (a skipped signal stays skipped)
+   bool dry = false;
+   if(why == "" && !NewEntriesAllowed(gate))
+     {
+      if(gate == "dry_run" || gate == "new_entries_off")
+         dry = true;
+      else
+         why = gate;                                 // skipped now, never re-tried later (a skipped signal stays skipped)
+     }
    MqlTradeRequest req;
    string detail = "";
    if(why == "") why = PrepareOrder(c, req, detail);
@@ -563,40 +856,61 @@ void ProcessEntry(const Cmd &c, const string id)
       Journal(id, "SKIPPED", "reason=" + why);
       return;
      }
-   if(gate == "dry_run" || gate == "new_entries_off")
+   // final go / no-go from the bridge (a claim is not a permanent permission): also asked in DRY_RUN so the path can be checked
+   long goUntil = 0;
+   string go = AskBridge(c, dry, goUntil);
+   if(dry)
      {
-      Journal(id, "DRY_RUN_NOT_SENT", "gate=" + gate + ";" + detail);
+      string ua = Unapproved();
+      Journal(id, "DRY_RUN_NOT_SENT", "gate=" + gate + ";go=" + (go == "" ? "granted" : go) + ";unapproved=" + (ua == "" ? "none" : ua) + ";" + detail);
       return;
      }
-   Journal(id, "DECIDED", detail);
-   why = CheckDeadline(c);                           // re-checked immediately before the send (journal writes take time)
-   if(why == "" && !TradeWritesAllowed()) why = "trade_writes_not_allowed";
+   if(go != "")
+     {
+      Journal(id, "SKIPPED", "reason=" + go);
+      return;
+     }
+   if(!Journal(id, "DECIDED", detail))
+      return;
+   g_inflightKey = id;
+   if(!Journal(id, "PRE_SEND", "volume=" + DoubleToString(req.volume, 2) + ";sl=" + DoubleToString(req.sl, 5) + ";price=" +
+               DoubleToString(req.price, 5) + ";tp0=" + DoubleToString(c.tp, 5) + ";go_until_ms=" + IntegerToString(goUntil)))
+     {
+      g_inflightKey = "";                            // nothing was sent: no order without the PRE_SEND record
+      HaltNew("journal_write_failed");
+      return;
+     }
+   MqlTradeRequest fin;
+   why = SendCheck(c, id, goUntil, req, fin);        // everything again AFTER the record, with the current market
    if(why != "")
      {
-      Journal(id, "SKIPPED", "reason=" + why + ";stage=right_before_send");
+      if(Journal(id, "SEND_ABORTED", "reason=" + why))
+         g_inflightKey = "";
+      else
+        {
+         g_inflightKey = "";                         // the record of the abort failed: keep the key unknown until resolved
+         g_unknownKey = id; g_unknownPreMs = NowMs(); g_unknownSl = req.sl; g_unknownTp = c.tp;
+        }
       return;
      }
-   g_inflightKey = id;
-   Journal(id, "PRE_SEND", "volume=" + DoubleToString(req.volume, 2) + ";sl=" + DoubleToString(req.sl, 5) + ";price=" + DoubleToString(req.price, 5));
    MqlTradeResult res;
    ZeroMemory(res);
-   bool ok = OrderSend(req, res);
+   bool ok = OrderSend(fin, res);
    Journal(id, "SEND_RETURNED", "ok=" + (ok ? "1" : "0") + ";retcode=" + IntegerToString((int)res.retcode) + ";order=" +
            IntegerToString((long)res.order) + ";deal=" + IntegerToString((long)res.deal) + ";fill_price=" + DoubleToString(res.price, 5) +
-           ";volume=" + DoubleToString(res.volume, 2));
+           ";volume=" + DoubleToString(res.volume, 2) + ";price_sent=" + DoubleToString(fin.price, 5));
    if(res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_DONE_PARTIAL)
      {
-      if(ConfirmFill(id, c.khash, res.order, res.deal, req.sl, c.tp))
+      if(ConfirmFill(id, res.order, res.deal, fin.sl, c.tp))
         {
          g_inflightKey = "";
          if(res.retcode == TRADE_RETCODE_DONE_PARTIAL)
-            Journal(id, "PARTIAL_FILL", "volume=" + DoubleToString(g_pos.volume, 2) + ";requested=" + DoubleToString(req.volume, 2));
+            Journal(id, "PARTIAL_FILL", "volume=" + DoubleToString(g_pos.volume, 2) + ";requested=" + DoubleToString(fin.volume, 2));
          CheckProtection();
          return;
         }
-      Journal(id, "UNKNOWN", "reason=done_but_fill_not_confirmed");
-      HaltNew("unknown_result:" + c.khash);
-      return;                                        // the in-flight slot stays occupied until reconciled
+      MarkUnknown(id, fin.sl, c.tp, "done_but_fill_not_confirmed");
+      return;
      }
    if(!ok && IsDefiniteReject(res.retcode))
      {
@@ -604,83 +918,154 @@ void ProcessEntry(const Cmd &c, const string id)
       Journal(id, "REJECTED", "retcode=" + IntegerToString((int)res.retcode));
       return;
      }
-   Journal(id, "UNKNOWN", "retcode=" + IntegerToString((int)res.retcode));
-   HaltNew("unknown_result:" + c.khash);
+   MarkUnknown(id, fin.sl, c.tp, "retcode_" + IntegerToString((int)res.retcode));
   }
 
-//--- after a fill: the initial SL must be on the position; otherwise emergency close of the OWN position + stop new entries
+//--- a send whose result is not known: the slot stays occupied, new entries stop, nothing is re-sent
+void MarkUnknown(const string id, const double sl, const double tp, const string reason)
+  {
+   g_inflightKey = "";
+   g_unknownKey = id; g_unknownPreMs = NowMs() - 1000; g_unknownSl = sl; g_unknownTp = tp;
+   Journal(id, "UNKNOWN", "reason=" + reason);
+   HaltNew("unknown_result:" + id);
+  }
+
+//--- the own position must carry an SL that is not looser than the initial SL. Otherwise: new entries stop and the OWN
+//--- position (ownership re-checked) is closed at market; a partial / failed / unknown close is CRITICAL and is retried every
+//--- EMERGENCY_RETRY_SEC while the remainder is still ours. Checked after the fill, after a restart and on every timer.
 void CheckProtection()
   {
-   if(!g_hasPos || !PositionSelectByTicket(g_pos.posTicket))
+   if(!g_hasPos || SelectOwn() != 1)
       return;
    double sl = PositionGetDouble(POSITION_SL);
    double tick = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
-   if(sl > 0 && MathAbs(sl - g_pos.sl0) <= tick * 0.5 + 1e-9)
+   if(sl > 0 && sl <= g_pos.sl0 + tick * 0.5 + 1e-9)
      {
-      Journal(g_pos.key, "PROTECTED", "sl=" + DoubleToString(sl, 5));
+      if(!g_pos.protectedNoted)
+        {
+         g_pos.protectedNoted = true;
+         Journal(g_pos.key, "PROTECTED", "sl=" + DoubleToString(sl, 5));
+        }
       return;
      }
+   g_pos.protectedNoted = false;
    HaltNew("initial_sl_missing");
-   Journal(g_pos.key, "SL_MISSING", "sl_on_position=" + DoubleToString(sl, 5));
-   if(ClosePosition(g_pos.key, "emergency_initial_sl_missing"))
-      Journal(g_pos.key, "EMERGENCY_CLOSE", "result=sent");
-   else
+   if(!g_pos.slMissingNoted)
      {
-      g_critical = true;
-      Journal(g_pos.key, "CRITICAL", "reason=emergency_close_failed");
+      g_pos.slMissingNoted = true;
+      Journal(g_pos.key, "SL_MISSING", "sl_on_position=" + DoubleToString(sl, 5) + ";sl0=" + DoubleToString(g_pos.sl0, 5));
      }
+   if(!TradeWritesAllowed())
+      return;
+   long nowS = (long)TimeGMT();
+   if(g_pos.lastEmergencyTry > 0 && nowS - g_pos.lastEmergencyTry < EMERGENCY_RETRY_SEC)
+      return;
+   g_pos.lastEmergencyTry = nowS;
+   double remaining = -1;
+   int r = ClosePosition(g_pos.key, "emergency_initial_sl_missing", remaining);
+   if(r == CLOSE_FULL)
+     {
+      Journal(g_pos.key, "EMERGENCY_CLOSE", "result=closed_confirmed");
+      return;
+     }
+   if(r == CLOSE_PARTIAL)
+      Journal(g_pos.key, "EMERGENCY_CLOSE_PARTIAL", "remaining=" + DoubleToString(remaining, 2) + ";note=unprotected_remainder_retried");
+   SetCritical(g_pos.key, r == CLOSE_PARTIAL ? "emergency_close_partial" : r == CLOSE_FAILED ? "emergency_close_failed" : "emergency_close_unknown");
   }
 
 //+------------------------------------------------------------------+
 //| management of the OWN position (closed M5 bars, server time)      |
 //+------------------------------------------------------------------+
+//--- the own position is not open: closed only when its history covers the volume; otherwise it is missing (not "closed")
+void CheckClosedFromHistory()
+  {
+   double vin, vout;
+   ulong lo;
+   if(HistoryVolumes(g_pos.posId, vin, vout, lo) && vin > 0 && vout >= vin - 1e-9)
+     {
+      long dr = HistoryDealGetInteger(lo, DEAL_REASON);
+      string reason = dr == DEAL_REASON_SL ? "sl" : dr == DEAL_REASON_TP ? "tp" : dr == DEAL_REASON_EXPERT ? "expert" :
+                      dr == DEAL_REASON_CLIENT ? "manual" : "other";
+      double profit = 0, comm = 0, swap = 0;
+      for(int i = 0; i < HistoryDealsTotal(); i++)
+        {
+         ulong d = HistoryDealGetTicket(i);
+         profit += HistoryDealGetDouble(d, DEAL_PROFIT);
+         comm += HistoryDealGetDouble(d, DEAL_COMMISSION);
+         swap += HistoryDealGetDouble(d, DEAL_SWAP);
+        }
+      Journal(g_pos.key, "CLOSED", "reason=" + reason + ";deal=" + IntegerToString((long)lo) + ";price=" +
+              DoubleToString(HistoryDealGetDouble(lo, DEAL_PRICE), 5) + ";profit=" + DoubleToString(profit, 0) +
+              ";commission=" + DoubleToString(comm, 0) + ";swap=" + DoubleToString(swap, 0) + ";position_id=" + IntegerToString(g_pos.posId));
+      g_hasPos = false;
+      return;
+     }
+   if(!g_pos.missingNoted)
+     {
+      g_pos.missingNoted = true;
+      Journal(g_pos.key, "OWN_POSITION_MISSING", "position_id=" + IntegerToString(g_pos.posId) + ";in=" + DoubleToString(vin, 2) +
+              ";out=" + DoubleToString(vout, 2) + ";note=not_treated_as_closed");
+      HaltNew("own_position_missing");
+     }
+  }
+
+//--- lowest Bid of the tick history strictly after the fill and before the fill-bar close (server ms).
+//--- >0 = number of ticks, 0 = none, -1 = history not available yet
+int FillBarLow(const datetime fillBarOpen, double &lo)
+  {
+   lo = 0;
+   MqlTick ticks[];
+   ulong from = (ulong)g_pos.fillTimeMsc + 1;
+   ulong to = (ulong)((long)fillBarOpen + BAR_SEC) * 1000 - 1;
+   if(to < from)
+      return(0);
+   int n = CopyTicksRange(InpSymbol, ticks, COPY_TICKS_INFO, from, to);
+   if(n < 0)
+      return(-1);
+   int used = 0;
+   for(int i = 0; i < n; i++)
+     {
+      if(ticks[i].bid <= 0 || ticks[i].time_msc < (long)from || ticks[i].time_msc > (long)to)
+         continue;
+      lo = used == 0 ? ticks[i].bid : MathMin(lo, ticks[i].bid);
+      used++;
+     }
+   return(used);
+  }
+
 void ManageOwn()
   {
    if(!g_hasPos)
       return;
-   if(!PositionSelectByTicket(g_pos.posTicket))
+   int own = SelectOwn();
+   if(own < 0)
+      return;                                        // quarantined
+   if(own == 0)
      {
-      string reason = "unknown";
-      if(HistorySelectByPosition(g_pos.posTicket))
-        {
-         for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
-           {
-            ulong d = HistoryDealGetTicket(i);
-            if(HistoryDealGetInteger(d, DEAL_ENTRY) == DEAL_ENTRY_OUT)
-              {
-               long dr = HistoryDealGetInteger(d, DEAL_REASON);
-               reason = dr == DEAL_REASON_SL ? "sl" : dr == DEAL_REASON_TP ? "tp" : dr == DEAL_REASON_EXPERT ? "expert" :
-                        dr == DEAL_REASON_CLIENT ? "manual" : "other";
-               Journal(g_pos.key, "CLOSED", "reason=" + reason + ";deal=" + IntegerToString((long)d) + ";price=" +
-                       DoubleToString(HistoryDealGetDouble(d, DEAL_PRICE), 5) + ";profit=" + DoubleToString(HistoryDealGetDouble(d, DEAL_PROFIT), 0) +
-                       ";commission=" + DoubleToString(HistoryDealGetDouble(d, DEAL_COMMISSION), 0) + ";swap=" + DoubleToString(HistoryDealGetDouble(d, DEAL_SWAP), 0));
-               break;
-              }
-           }
-        }
-      if(reason == "unknown")
-         Journal(g_pos.key, "CLOSED", "reason=not_found_in_history");
-      g_hasPos = false;
+      CheckClosedFromHistory();
       return;
      }
-   MqlTick tk;
-   if(SymbolInfoTick(InpSymbol, tk) && g_pos.tracked && tk.bid > 0)
-      g_pos.minBid = MathMin(g_pos.minBid, tk.bid);
    if(!TradeWritesAllowed())
      {
       // DRY_RUN / environment lost: no SL-TP change of any kind (the SL already on the position stays)
-      if(!g_dryMgmtNoted)
+      if(!g_mgmtNoted)
         {
-         g_dryMgmtNoted = true;
+         g_mgmtNoted = true;
          Journal(g_pos.key, "MANAGEMENT_BLOCKED", "reason=trade_writes_not_allowed;note=the_server_side_sl_stays");
         }
       return;
      }
-   g_dryMgmtNoted = false;
+   g_mgmtNoted = false;
+   CheckProtection();
+   if(!g_hasPos || SelectOwn() != 1)
+      return;
+   double tick = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
+   double slNow = PositionGetDouble(POSITION_SL);
+   if(!(slNow > 0 && slNow <= g_pos.sl0 + tick * 0.5 + 1e-9))
+      return;                                        // unprotected: only the emergency handling above
    datetime now = TimeTradeServer();
    datetime fillBarOpen = BarOpenOf(g_pos.fillTimeSrv);
-   datetime fillBarClose = fillBarOpen + BAR_SEC;
-   if(now < fillBarClose)
+   if(now < fillBarOpen + BAR_SEC)
       return;
    int digits = (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS);
    // the Strategy's fill confirmation (SATS) at the fill-bar close: TP stays TP0. A failed TP0 change is retried once per
@@ -692,10 +1077,11 @@ void ManageOwn()
         {
          // CLOSE_REQ equivalent, re-checked with the XS fill: a fill beyond SL0 / TP0 is closed at market
          Journal(g_pos.key, "FILL_SIDE_BAD", "fill=" + DoubleToString(g_pos.fill, digits));
-         ClosePosition(g_pos.key, "bad_fill_side_mt5");
+         double rem;
+         ClosePosition(g_pos.key, "bad_fill_side_mt5", rem);
          return;
         }
-      if(!PositionSelectByTicket(g_pos.posTicket))
+      if(SelectOwn() != 1)
          return;
       double curSl = PositionGetDouble(POSITION_SL);
       if(ModifyOwn("tp0", curSl, NormalizeDouble(g_pos.tp0, digits)))
@@ -704,11 +1090,21 @@ void ManageOwn()
          Journal(g_pos.key, "TP_SET", "tp=" + DoubleToString(g_pos.tp0, digits) + ";sl_kept=" + DoubleToString(curSl, digits));
         }
      }
-   if(g_pos.lastBarDone == 0)
+   if(!g_pos.fillBarDone)
      {
-      // breakeven on the fill bar: only the price seen after the fill (no pre-fill low); not after a restart
-      if(!g_pos.beDone && InpFillBarBe == FILLBAR_TICKS_SINCE_FILL && g_pos.tracked)
-         TryBreakeven(g_pos.minBid, fillBarOpen);
+      // breakeven on the fill bar: only ticks strictly after the fill and before the fill-bar close (never the next bar)
+      if(!g_pos.beDone && InpFillBarBe == FILLBAR_TICKS_SINCE_FILL)
+        {
+         double lo;
+         int n = FillBarLow(fillBarOpen, lo);
+         if(n < 0 && now < fillBarOpen + 2 * BAR_SEC)
+            return;                                  // tick history not ready: retried on the next timer (within the next bar)
+         if(n > 0)
+            TryBreakeven(lo, fillBarOpen);
+         else
+            Journal(g_pos.key, "FILLBAR_NO_TICKS", "n=" + IntegerToString(n));
+        }
+      g_pos.fillBarDone = true;
       g_pos.lastBarDone = fillBarOpen;
      }
    if(g_pos.beDone)
@@ -734,7 +1130,7 @@ void TryBreakeven(double favLow, datetime barOpen)
       g_pos.bePending = true;
       int digits = (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS);
       double newSl = NormalizeDouble(g_pos.fill, digits);   // the XS fill price (not TradingView's BE_MOVE price)
-      if(!PositionSelectByTicket(g_pos.posTicket))          // fresh snapshot: the TP may have just been set
+      if(SelectOwn() != 1)                                   // fresh snapshot: the TP may have just been set
          return;
       double curTp = PositionGetDouble(POSITION_TP);
       if(ModifyOwn("breakeven", newSl, curTp))
@@ -748,111 +1144,229 @@ void TryBreakeven(double favLow, datetime barOpen)
   }
 
 //+------------------------------------------------------------------+
-//| startup reconciliation from the journal + live orders / history   |
+//| result unknown: history check + operator confirmation             |
 //+------------------------------------------------------------------+
-void Reconcile()
+//--- what the account says about an unknown send: "none" (no order / deal / position with the key's tag), "open" (exactly one
+//--- own position, posId / ticket set), "closed" (its history covers the volume) or "ambiguous:<why>"
+string DetectUnknown(const string kh, const long preSendMs, long &posId, ulong &posTicket)
   {
-   string lastKey = "", lastPreSend = "", lastFinal = "";
-   long   preSendMs = 0;
-   ulong  posTicket = 0;
-   string posKey = "";
-   double sl0 = 0, tp0 = 0, fill = 0;
-   long   fillTime = 0;
-   bool   closed = false;
-   int h = FileOpen(Dir("") + "\\journal.txt", FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE);
-   if(h != INVALID_HANDLE)
+   posId = 0; posTicket = 0;
+   string tag = "XSD:" + kh;
+   long fromSrv = preSendMs / 1000 + ServerOffsetSec() - 120;
+   if(!HistorySelect((datetime)fromSrv, TimeTradeServer() + 60))
+      return("ambiguous:history_unavailable");
+   ulong orders[];
+   for(int i = 0; i < HistoryOrdersTotal(); i++)
      {
-      while(!FileIsEnding(h))
+      ulong o = HistoryOrderGetTicket(i);
+      if(HistoryOrderGetString(o, ORDER_SYMBOL) == InpSymbol && HistoryOrderGetInteger(o, ORDER_MAGIC) == InpMagic &&
+         HistoryOrderGetString(o, ORDER_COMMENT) == tag)
         {
-         string parts[];
-         string line = FileReadString(h);
-         if(StringSplit(line, '|', parts) < 4)
-            continue;
-         string key = parts[1], st = parts[2], f = parts[3];
-         AddSeen(key);
-         if(st == "HALT_NEW") { g_haltNew = true; g_haltReason = f; }
-         if(st == "RESUME_NEW") { g_haltNew = false; g_haltReason = ""; lastPreSend = ""; }
-         if(st == "CRITICAL_CLEARED") g_critical = false;
-         if(st == "PRE_SEND") { lastPreSend = key; preSendMs = StringToInteger(parts[0]); }
-         if(st == "REJECTED" || st == "FILLED") { if(key == lastPreSend) lastPreSend = ""; }
-         if(st == "FILLED")                          // only a confirmed fill of this EA is adopted (never a RECONCILED / unknown one)
-           {
-            posKey = key; closed = false;
-            string kv[];
-            int n = StringSplit(f, ';', kv);
-            for(int i = 0; i < n; i++)
-              {
-               int p = StringFind(kv[i], "=");
-               if(p <= 0) continue;
-               string k = StringSubstr(kv[i], 0, p), v = StringSubstr(kv[i], p + 1);
-               if(k == "position") posTicket = (ulong)StringToInteger(v);
-               if(k == "sl0") sl0 = StringToDouble(v);
-               if(k == "tp0") tp0 = StringToDouble(v);
-               if(k == "fill_price") fill = StringToDouble(v);
-               if(k == "fill_time") fillTime = StringToInteger(v);
-              }
-           }
-         if(st == "CLOSED" && key == posKey) closed = true;
-         if(st == "CRITICAL") g_critical = true;
-        }
-      FileClose(h);
-     }
-   // a send whose result was never recorded: UNKNOWN -> no re-order, look for it in the live positions / history
-   if(lastPreSend != "")
-     {
-      g_inflightKey = lastPreSend;
-      HaltNew("unknown_result_after_restart");
-      Journal(lastPreSend, "UNKNOWN", "reason=pre_send_without_result_at_startup");
-     }
-   if(posKey != "" && !closed && posTicket > 0)
-     {
-      if(PositionSelectByTicket(posTicket) && PositionGetString(POSITION_SYMBOL) == InpSymbol && PositionGetInteger(POSITION_MAGIC) == InpMagic)
-        {
-         g_pos.key = posKey; g_pos.posTicket = posTicket; g_pos.sl0 = sl0; g_pos.tp0 = tp0; g_pos.fill = fill;
-         g_pos.fillTimeSrv = (datetime)fillTime; g_pos.volume = PositionGetDouble(POSITION_VOLUME);
-         g_pos.khash = posKey;
-         double tick = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
-         g_pos.tpSet = PositionGetDouble(POSITION_TP) > 0;
-         g_pos.beDone = MathAbs(PositionGetDouble(POSITION_SL) - fill) <= tick * 0.5 + 1e-9;
-         g_pos.tracked = false;                       // ticks since the fill were not seen: the fill bar is not used for breakeven
-         g_pos.minBid = fill;
-         g_pos.lastBarDone = 0;
-         g_pos.bePending = false;
-         g_pos.lastTpTry = 0;
-         g_hasPos = true;
-         Journal(posKey, "OWNED_AT_STARTUP", "position=" + IntegerToString((long)posTicket));
-        }
-      else
-        {
-         g_hasPos = true;                              // let ManageOwn read the closing deal from the history
-         g_pos.key = posKey; g_pos.khash = posKey; g_pos.posTicket = posTicket;
+         int n = ArraySize(orders);
+         ArrayResize(orders, n + 1);
+         orders[n] = o;
         }
      }
-   if(g_inflightKey != "")
-      ReconcileUnknown(g_inflightKey, preSendMs);
-  }
-
-//--- look for the order of an unknown send: positions / deals with our magic AND the key hash in the comment AND after PRE_SEND
-void ReconcileUnknown(const string key, long preSendMs)
-  {
-   // the journal id and the order comment both carry the key hash: symbol + magic + exact comment + opened after PRE_SEND
+   long pid = 0;
+   int nPid = 0;
+   for(int i = 0; i < HistoryDealsTotal(); i++)
+     {
+      ulong d = HistoryDealGetTicket(i);
+      if(HistoryDealGetString(d, DEAL_SYMBOL) != InpSymbol || HistoryDealGetInteger(d, DEAL_MAGIC) != InpMagic ||
+         HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_IN)
+         continue;
+      bool mine = HistoryDealGetString(d, DEAL_COMMENT) == tag;
+      for(int k = 0; k < ArraySize(orders) && !mine; k++)
+         mine = (ulong)HistoryDealGetInteger(d, DEAL_ORDER) == orders[k];
+      if(!mine)
+         continue;
+      long p = HistoryDealGetInteger(d, DEAL_POSITION_ID);
+      if(p != pid)
+        {
+         nPid++;
+         pid = p;
+        }
+     }
+   int nPending = 0;
+   for(int i = 0; i < OrdersTotal(); i++)
+     {
+      ulong o = OrderGetTicket(i);
+      if(o > 0 && OrderGetString(ORDER_COMMENT) == tag)
+         nPending++;
+     }
+   int nTagPos = 0;
    for(int i = 0; i < PositionsTotal(); i++)
      {
       ulong t = PositionGetTicket(i);
-      if(PositionSelectByTicket(t) && PositionGetInteger(POSITION_MAGIC) == InpMagic && PositionGetString(POSITION_SYMBOL) == InpSymbol &&
-         PositionGetString(POSITION_COMMENT) == "XSD:" + key &&
-         PositionGetInteger(POSITION_TIME_MSC) - ServerOffsetSec() * 1000 >= preSendMs - 60000)
-        {
-         Journal(key, "RECONCILED", "position=" + IntegerToString((long)t) + ";note=found_open_after_unknown;comment=" +
-                 PositionGetString(POSITION_COMMENT) + ";new_entries=still_halted_until_resume");
-         // protection continues only after the operator confirms (RESUME file); until then it is not adopted automatically
-         return;
-        }
+      if(t > 0 && PositionGetString(POSITION_COMMENT) == tag)
+         nTagPos++;
      }
-   Journal(key, "UNKNOWN_NOT_FOUND", "note=no_open_position_with_magic_and_tag;new_entries=still_halted_until_resume");
+   if(nPending > 0)  return("ambiguous:pending_order");
+   if(nPid > 1)      return("ambiguous:several_positions");
+   if(nPid == 0)     return(ArraySize(orders) == 0 && nTagPos == 0 ? "none" : "ambiguous:order_or_position_without_deal");
+   ulong t = TicketOfIdentifier(pid);
+   if(t > 0)
+     {
+      posId = pid; posTicket = t;
+      return("open");
+     }
+   for(int i = 0; i < PositionsTotal(); i++)
+     {
+      ulong x = PositionGetTicket(i);
+      if(x > 0 && PositionGetInteger(POSITION_IDENTIFIER) == pid)
+         return("ambiguous:position_not_own");        // the identifier is open but symbol / magic / type differ
+     }
+   double vin, vout;
+   ulong lo;
+   if(HistoryVolumes(pid, vin, vout, lo) && vin > 0 && vout >= vin - 1e-9)
+     {
+      posId = pid;
+      return("closed");
+     }
+   return("ambiguous:history_incomplete");
   }
 
-//--- operator file resume_new: clears the new-entry halt only when nothing is unknown / critical
+//--- operator file resolve_unknown ("key_hash=<16 hex>" and "confirm=none|open|closed"): accepted only when it names the
+//--- unknown key AND equals what the history check finds now. "open" adopts the position (ownership + SL checked).
+void CheckResolveUnknown()
+  {
+   string f = Dir("") + "\\resolve_unknown";
+   if(!FileIsExist(f, FILE_COMMON))
+      return;
+   string l[];
+   ReadLines(f, l);
+   FileDelete(f, FILE_COMMON);
+   string kh = KvGet(l, "key_hash"), confirm = KvGet(l, "confirm");
+   if(g_unknownKey == "" || kh != g_unknownKey)
+     {
+      Journal("", "UNKNOWN_RESOLVE_REFUSED", "reason=not_the_unknown_key;given=" + kh + ";unknown=" + g_unknownKey);
+      return;
+     }
+   long posId;
+   ulong ticket;
+   string detected = DetectUnknown(g_unknownKey, g_unknownPreMs, posId, ticket);
+   if(StringFind(detected, "ambiguous") == 0 || confirm != detected)
+     {
+      Journal(g_unknownKey, "UNKNOWN_RESOLVE_REFUSED", "reason=confirm_mismatch;confirm=" + confirm + ";detected=" + detected);
+      return;
+     }
+   string key = g_unknownKey;
+   if(detected == "open")
+     {
+      if(!PositionSelectByTicket(ticket))
+        {
+         Journal(key, "UNKNOWN_RESOLVE_REFUSED", "reason=position_vanished");
+         return;
+        }
+      AdoptOwn(key, posId, ticket, 0, 0, g_unknownSl, g_unknownTp, "unknown_resolution");
+     }
+   if(!Journal(key, "UNKNOWN_RESOLVED", "result=" + detected + ";position_id=" + IntegerToString(posId) +
+               ";note=new_entries_stay_halted_until_resume_new"))
+      return;
+   g_unknownKey = "";
+   if(detected == "open")
+      CheckProtection();                             // SL missing -> emergency close of the now-owned position
+  }
+
+//+------------------------------------------------------------------+
+//| startup reconciliation from the journal + live positions / history |
+//+------------------------------------------------------------------+
+void Reconcile()
+  {
+   string lastPre = "", unknown = "", posKey = "";
+   long   preMs = 0;
+   double preSl = 0, preTp = 0;
+   long   posId = 0, fillMsc = 0, fillTime = 0;
+   ulong  posTicket = 0;
+   double sl0 = 0, tp0 = 0, fill = 0;
+   bool   closed = false, quarantined = false, bindSeen = false;
+   string l[];
+   ReadLines(g_journalPath, l);
+   for(int li = 0; li < ArraySize(l); li++)
+     {
+      string parts[];
+      if(StringSplit(l[li], '|', parts) < 4)
+         continue;
+      string key = parts[1], st = parts[2], f = parts[3];
+      string kv[];
+      StringSplit(f, ';', kv);
+      AddSeen(key);
+      if(st == "BIND" && !bindSeen)
+        {
+         bindSeen = true;                            // journal fields are sanitized ('|' -> '/'), so the sid is compared sanitized
+         g_bindOk = KvGet(kv, "login") == IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) &&
+                    KvGet(kv, "server") == AccountInfoString(ACCOUNT_SERVER) && KvGet(kv, "magic") == IntegerToString(InpMagic) &&
+                    KvGet(kv, "sid") == Sanitize(InpExpectedSid) && KvGet(kv, "cfg") == InpExpectedCfgSha && KvGet(kv, "symbol") == InpSymbol;
+        }
+      if(st == "HALT_NEW") { g_haltNew = true; g_haltReason = f; }
+      if(st == "RESUME_NEW") { g_haltNew = false; g_haltReason = ""; }
+      if(st == "CRITICAL") { g_critical = true; g_critReason = f; }
+      if(st == "CRITICAL_CLEARED") { g_critical = false; g_critReason = ""; }
+      if(st == "PRE_SEND")
+        {
+         lastPre = key; preMs = StringToInteger(parts[0]);
+         preSl = StringToDouble(KvGet(kv, "sl")); preTp = StringToDouble(KvGet(kv, "tp0"));
+        }
+      if((st == "REJECTED" || st == "FILLED" || st == "SEND_ABORTED" || st == "UNKNOWN_RESOLVED") && key == lastPre)
+         lastPre = "";
+      if(st == "UNKNOWN")
+         unknown = key;
+      if(st == "UNKNOWN_RESOLVED" && key == unknown)
+         unknown = "";
+      if(st == "FILLED")
+        {
+         posKey = key; closed = false; quarantined = false;
+         posId = StringToInteger(KvGet(kv, "position_id")); posTicket = (ulong)StringToInteger(KvGet(kv, "position"));
+         sl0 = StringToDouble(KvGet(kv, "sl0")); tp0 = StringToDouble(KvGet(kv, "tp0")); fill = StringToDouble(KvGet(kv, "fill_price"));
+         fillTime = StringToInteger(KvGet(kv, "fill_time")); fillMsc = StringToInteger(KvGet(kv, "fill_time_msc"));
+        }
+      if(st == "CLOSED" && key == posKey) closed = true;
+      if(st == "QUARANTINE" && key == posKey) quarantined = true;
+     }
+   if(!bindSeen)
+     {
+      g_bindOk = true;
+      Journal("", "BIND", "login=" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ";server=" + AccountInfoString(ACCOUNT_SERVER) +
+              ";magic=" + IntegerToString(InpMagic) + ";sid=" + InpExpectedSid + ";cfg=" + InpExpectedCfgSha + ";symbol=" + InpSymbol);
+     }
+   else if(!g_bindOk)
+      Journal("", "BIND_MISMATCH", "note=journal_of_another_account_or_strategy;all_trade_writes_refused");
+   // a send whose result was never recorded / never resolved: UNKNOWN -> no re-order, history check, operator confirmation
+   if(lastPre != "" && unknown == "")
+     {
+      unknown = lastPre;
+      Journal(unknown, "UNKNOWN", "reason=pre_send_without_result_at_startup");
+     }
+   if(unknown != "")
+     {
+      g_unknownKey = unknown;
+      g_unknownPreMs = preMs; g_unknownSl = preSl; g_unknownTp = preTp;
+      HaltNew("unknown_result_after_restart");
+      long pid;
+      ulong tk;
+      Journal(unknown, "UNKNOWN_CHECK", "detected=" + DetectUnknown(unknown, preMs, pid, tk) + ";note=resolve_unknown_file_needed");
+     }
+   if(posKey != "" && !closed && !quarantined && posId > 0)
+     {
+      ResetPos();
+      g_pos.key = posKey; g_pos.posId = posId; g_pos.posTicket = posTicket; g_pos.sl0 = sl0; g_pos.tp0 = tp0; g_pos.fill = fill;
+      g_pos.fillTimeSrv = (datetime)fillTime; g_pos.fillTimeMsc = fillMsc;
+      g_hasPos = true;
+      int sel = SelectOwn();
+      if(sel == 1)
+        {
+         double tick = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
+         g_pos.volume = PositionGetDouble(POSITION_VOLUME);
+         g_pos.tpSet = PositionGetDouble(POSITION_TP) > 0;
+         g_pos.beDone = MathAbs(PositionGetDouble(POSITION_SL) - fill) <= tick * 0.5 + 1e-9;
+         Journal(posKey, "OWNED_AT_STARTUP", "position_id=" + IntegerToString(posId) + ";position=" + IntegerToString((long)g_pos.posTicket));
+        }
+      else if(sel == 0)
+         CheckClosedFromHistory();                   // closed while the EA was off, or missing (never "closed" without history)
+     }
+  }
+
+//--- operator files: clear_critical (after a manual check), resume_new (ordinary halts only; never an unknown result)
 void CheckResume()
   {
    string fc = Dir("") + "\\clear_critical";
@@ -862,6 +1376,7 @@ void CheckResume()
       if(g_critical)
         {
          g_critical = false;
+         g_critReason = "";
          Journal("", "CRITICAL_CLEARED", "by=operator_file;note=new_entries_stay_halted_until_resume_new");
          HaltNew("after_critical");
         }
@@ -875,7 +1390,11 @@ void CheckResume()
       Journal("", "RESUME_REFUSED", "reason=critical");
       return;
      }
-   g_inflightKey = "";
+   if(g_unknownKey != "")
+     {
+      Journal("", "RESUME_REFUSED", "reason=unknown_unresolved;key_hash=" + g_unknownKey + ";note=use_resolve_unknown");
+      return;
+     }
    g_haltNew = false;
    g_haltReason = "";
    Journal("", "RESUME_NEW", "by=operator_file");
@@ -926,6 +1445,15 @@ void PollCommands()
      }
   }
 
+void WriteHeartbeat()
+  {
+   string gate;
+   NewEntriesAllowed(gate);
+   WriteFileAtomic(Dir(""), "hb_ea.txt", "t_ms=" + IntegerToString(NowMs()) + "\ndry_run=" + (InpDryRun ? "1" : "0") + "\nnew_gate=" +
+                   (gate == "" ? "open" : gate) + "\nown_position_id=" + (g_hasPos ? IntegerToString(g_pos.posId) : "0") +
+                   "\ncritical=" + (g_critical ? "1" : "0") + "\nunknown=" + g_unknownKey + "\n", true);
+  }
+
 //+------------------------------------------------------------------+
 int OnInit()
   {
@@ -934,10 +1462,9 @@ int OnInit()
       Print("XauShortDemoEA: refused (not a demo account). No input can change this.");
       return(INIT_FAILED);
      }
-   FolderCreate(Dir(""), FILE_COMMON);
-   FolderCreate(Dir("cmd"), FILE_COMMON);
-   FolderCreate(Dir("rpt"), FILE_COMMON);
-   FolderCreate(Dir("done"), FILE_COMMON);
+   string subs[] = {"", "cmd", "rpt", "done", "ask", "ans"};
+   for(int i = 0; i < ArraySize(subs); i++)
+      FolderCreate(Dir(subs[i]), FILE_COMMON);
    // one instance: an exclusive handle on the lock file (released by the terminal when the EA stops / crashes)
    g_lock = FileOpen(Dir("") + "\\ea.lock", FILE_WRITE | FILE_BIN | FILE_COMMON);
    if(g_lock == INVALID_HANDLE)
@@ -945,11 +1472,15 @@ int OnInit()
       Print("XauShortDemoEA: another instance holds the lock (", GetLastError(), ")");
       return(INIT_FAILED);
      }
+   // the journal belongs to one account / server / magic (file name) and one Strategy (BIND line, checked in Reconcile)
+   g_journalPath = Dir("") + "\\journal_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
+                   NameSafe(AccountInfoString(ACCOUNT_SERVER)) + "_" + IntegerToString(InpMagic) + ".txt";
    string why;
    g_envOk = VerifyEnvironment(why);
    Journal("", "START", "dry_run=" + (InpDryRun ? "1" : "0") + ";new_entries=" + (InpAllowNewEntries ? "1" : "0") + ";env=" +
-           (g_envOk ? "ok" : why) + ";server=" + AccountInfoString(ACCOUNT_SERVER) + ";symbol=" + InpSymbol);
+           (g_envOk ? "ok" : why) + ";server=" + AccountInfoString(ACCOUNT_SERVER) + ";symbol=" + InpSymbol + ";unapproved=" + Unapproved());
    Reconcile();
+   g_envOk = VerifyEnvironment(why);                 // the journal binding is known now
    g_ready = true;
    EventSetMillisecondTimer(MathMax(100, InpTimerMs));
    return(INIT_SUCCEEDED);
@@ -976,22 +1507,20 @@ void OnTimer()
       Journal("", env ? "ENV_OK" : "ENV_LOST", "reason=" + why);
      }
    CheckResume();
+   CheckResolveUnknown();
    ManageOwn();
    PollCommands();
+   WriteHeartbeat();
    string gate;
    NewEntriesAllowed(gate);
    Comment("XauShortDemoEA  DRY_RUN=", InpDryRun, "  new=", (gate == "" ? "ON" : "OFF(" + gate + ")"), "  env=", (g_envOk ? "ok" : why),
-           "  own_position=", (g_hasPos ? IntegerToString((long)g_pos.posTicket) : "none"), "  critical=", g_critical);
+           "  own_position_id=", (g_hasPos ? IntegerToString(g_pos.posId) : "none"), "  critical=", g_critical,
+           "  unknown=", (g_unknownKey == "" ? "none" : g_unknownKey));
   }
 
 void OnTick()
   {
-   if(g_hasPos && g_pos.tracked)
-     {
-      MqlTick tk;
-      if(SymbolInfoTick(InpSymbol, tk) && tk.bid > 0)
-         g_pos.minBid = MathMin(g_pos.minBid, tk.bid);
-     }
+   // nothing: management runs on the timer; the fill-bar low comes from the tick history (CopyTicksRange)
   }
 
 //--- trade transactions are only recorded (the deal / position check stays the source of truth)

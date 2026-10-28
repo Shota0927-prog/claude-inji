@@ -3,17 +3,23 @@
 
 Responsibilities (the receiver keeps recording exactly as before; this is a separate process):
   * read the receiver database, pick ENTRY intents the receiver marked eligible, check them again (SHORT / MARKET / SATS path /
-    sid / cfg SHA-256 / symbol / 60 s deadline / clock) and CLAIM them with the receiver's atomic claim() (= "the notification
-    was taken once"; it is NOT an order record);
+    sid / cfg SHA-256 / symbol / 60 s deadline / clock / EA heartbeat) and CLAIM them with the receiver's atomic claim() (= "the
+    notification was taken once"; it is NOT an order record and NOT a permanent permission);
   * write one command file per claimed ENTRY into the MT5 common-files exchange folder (atomic rename) for the EA;
+  * give the EA the FINAL go / no-go: right before its send the EA writes ask/<key_hash>.ask and waits; the bridge re-checks the
+    claim against everything the receiver learnt since (post-claim revocation, CANCEL / TV_CLOSED / TV_FLAT / CLOSE_REQ, the wait's
+    WAIT_END, the deadline) and answers ans/<key_hash>.ans with GO (once per key, short validity) or NOGO. Without a GO the EA
+    never sends. A command that becomes invalid before its GO is revoked (also after a bridge restart);
   * read the EA's report files and keep the order lifecycle in its own database (bridge.sqlite3), separate from the receiver DB;
-  * log divergences (e.g. TradingView closed its virtual trade while the MT5 position is open) without acting on them.
+  * write its heartbeat (hb_bridge.txt) and read the EA's (hb_ea.txt);
+  * log divergences (e.g. TradingView closed its virtual trade while the MT5 position is open) without acting on them: a FILLED
+    MT5 position is never closed because of a TradingView exit.
 It never forwards PROV / WAIT_* / BAR / TV_* / TP_SET / BE_MOVE / CLOSE_REQ / CANCEL: the EA manages its own position.
 It never deletes or rewrites the receiver's config, receipts or facts; its only write to the receiver DB is claim().
 
   python ea_bridge.py run    --config bridge_config.json      loop (Ctrl+C to stop)
   python ea_bridge.py once   --config bridge_config.json      one pass (tests / manual)
-  python ea_bridge.py status --config bridge_config.json      lifecycle of the recent keys
+  python ea_bridge.py status --config bridge_config.json      lifecycle of the recent keys + heartbeats
 
 Standard library only.
 """
@@ -29,10 +35,12 @@ from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECEIVER_DIR = os.path.join(os.path.dirname(HERE), "receiver")
-DB_VERSION = "1"
+DB_VERSION = "2"
 MAX_AGE_SEC = 60                       # approved: ENTRY bar close -> 60 s (also re-checked by the EA right before OrderSend)
-CMD_VERSION = "1"
+CMD_VERSION = "2"
 ALLOWED_PATHS = ("SATS_PULL", "SATS_NOW")   # the initial settings (Entry Timing SATS Pullback); CURRENT / LIMIT are recorded, not sent
+TERMINAL_FOR_ENTRY = ("CANCEL", "TV_CLOSED", "TV_FLAT", "CLOSE_REQ")
+SUBDIRS = ("cmd", "rpt", "done", "rpt_done", "ask", "ask_done", "ans", "revoked")
 
 DEFAULT_CONFIG = {
     "receiver_data_dir": None,         # REQUIRED: the receiver's data folder (the bridge only claims there)
@@ -41,20 +49,25 @@ DEFAULT_CONFIG = {
     "exchange_dir": None,              # REQUIRED: <MT5 Common\\Files>\\XauShortDemo (the EA's InpExchangeDir under Common\\Files)
     "expected": {"sid": "XAU-SHORT|XA-23|AU-2", "symbol": "OANDA:XAUUSD",      # the bridge's own pins (the EA pins them again)
                  "cfg_sha256": "72fa9868a3e196ebcd02e37a12f82416d1149e5bd0567d8bf426e2c49f4695ee"},
-    "poll_ms": 500,
+    "poll_ms": 200,
+    "go_ttl_ms": 3000,                 # PROPOSAL (not approved): validity of a GO answer
+    "require_ea_heartbeat_ms": 5000,   # PROPOSAL (not approved): no new claim while the EA heartbeat is older (null = not required)
 }
 
 # lifecycle columns (each a separate time; NULL = not reached)
-TIMES = ("received_ms", "checked_ms", "claim_start_ms", "claimed_ms", "cmd_written_ms", "ea_seen_ms", "ea_decided_ms",
-         "ea_pre_send_ms", "ea_send_ms", "ea_result_ms", "ea_filled_ms", "ea_protected_ms", "ea_managed_ms", "ea_closed_ms",
-         "ea_unknown_ms")
+TIMES = ("received_ms", "checked_ms", "claim_start_ms", "claimed_ms", "cmd_written_ms", "go_ms", "revoked_ms", "ea_seen_ms",
+         "ea_decided_ms", "ea_pre_send_ms", "ea_send_ms", "ea_result_ms", "ea_filled_ms", "ea_protected_ms", "ea_managed_ms",
+         "ea_closed_ms", "ea_unknown_ms")
 EA_STATE_TIME = {"SEEN": "ea_seen_ms", "DECIDED": "ea_decided_ms", "SKIPPED": "ea_decided_ms", "DRY_RUN_NOT_SENT": "ea_decided_ms",
-                 "PRE_SEND": "ea_pre_send_ms", "SEND_RETURNED": "ea_send_ms", "REJECTED": "ea_result_ms", "FILLED": "ea_filled_ms",
-                 "PROTECTED": "ea_protected_ms", "TP_SET": "ea_managed_ms", "BE_SET": "ea_managed_ms", "MODIFY_FAILED": "ea_managed_ms",
-                 "CLOSED": "ea_closed_ms", "UNKNOWN": "ea_unknown_ms", "RECONCILED": "ea_unknown_ms", "UNKNOWN_NOT_FOUND": "ea_unknown_ms",
-                 "EMERGENCY_CLOSE": "ea_closed_ms", "SL_MISSING": "ea_protected_ms", "CRITICAL": "ea_unknown_ms", "OWNED_AT_STARTUP": "ea_managed_ms"}
-# informational EA lines (DUPLICATE, TX_DEAL, PARTIAL_FILL, CLOSE_*, MODIFY_REFUSED, MANAGEMENT_BLOCKED ...) are kept in ea_reports only and
-# do not overwrite the lifecycle state
+                 "PRE_SEND": "ea_pre_send_ms", "SEND_ABORTED": "ea_result_ms", "SEND_RETURNED": "ea_send_ms", "REJECTED": "ea_result_ms",
+                 "FILLED": "ea_filled_ms", "PROTECTED": "ea_protected_ms", "SL_MISSING": "ea_protected_ms",
+                 "EMERGENCY_CLOSE": "ea_protected_ms", "EMERGENCY_CLOSE_PARTIAL": "ea_protected_ms",
+                 "TP_SET": "ea_managed_ms", "BE_SET": "ea_managed_ms", "MODIFY_FAILED": "ea_managed_ms", "OWNED_AT_STARTUP": "ea_managed_ms",
+                 "CLOSED": "ea_closed_ms", "UNKNOWN": "ea_unknown_ms", "UNKNOWN_RESOLVED": "ea_unknown_ms", "QUARANTINE": "ea_unknown_ms",
+                 "OWN_POSITION_MISSING": "ea_unknown_ms", "CRITICAL": "ea_unknown_ms"}
+# informational EA lines (DUPLICATE, TX_DEAL, PARTIAL_FILL, CLOSE_*, MODIFY_REFUSED, MANAGEMENT_BLOCKED, UNKNOWN_CHECK, TICKET_CHANGED ...)
+# are kept in ea_reports only and do not overwrite the lifecycle state. mt5_open is set by FILLED / OWNED_AT_STARTUP and cleared ONLY by
+# CLOSED (the EA writes CLOSED after the position's history covers its volume; an emergency close request is not a close).
 
 
 def now_ms():
@@ -80,6 +93,20 @@ def _num(v, ty):
     return ty(x)
 
 
+def read_kv(path):
+    with open(path, encoding="ascii", errors="replace") as f:
+        return dict(l.rstrip("\r\n").split("=", 1) for l in f if "=" in l)
+
+
+def write_atomic(path, body):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="ascii", newline="\n") as f:
+        f.write(body)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def load_config(path):
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     base = HERE
@@ -94,7 +121,7 @@ def load_config(path):
         base = os.path.dirname(os.path.abspath(path))
     for k in ("receiver_data_dir", "bridge_data_dir", "exchange_dir", "receiver_config"):
         if cfg.get(k):
-            cfg[k] = os.path.expandvars(cfg[k])           # e.g. %APPDATA%\MetaQuotes\Terminal\Common\Files\XauShortDemo
+            cfg[k] = os.path.expandvars(cfg[k])           # e.g. %APPDATA%\\MetaQuotes\\Terminal\\Common\\Files\\XauShortDemo
         if cfg.get(k) and not os.path.isabs(cfg[k]):
             cfg[k] = os.path.join(base, cfg[k])
     return cfg
@@ -133,7 +160,7 @@ class Bridge:
         self.log = log or logging.getLogger("ea_bridge")
         os.makedirs(cfg["bridge_data_dir"], exist_ok=True)
         self.lock = SingleInstance(os.path.join(cfg["bridge_data_dir"], "bridge.lock")) if lock else None
-        for sub in ("cmd", "rpt", "done", "rpt_done"):
+        for sub in SUBDIRS:
             os.makedirs(os.path.join(cfg["exchange_dir"], sub), exist_ok=True)
         sys.path.insert(0, RECEIVER_DIR)
         import xau_receiver as xr
@@ -155,8 +182,15 @@ class Bridge:
             fields TEXT, ingested_ms INTEGER);
         CREATE TABLE IF NOT EXISTS divergences (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, tid TEXT, kind TEXT, detail TEXT,
             t_ms INTEGER, UNIQUE(key, kind, detail));
+        CREATE TABLE IF NOT EXISTS answers (id INTEGER PRIMARY KEY AUTOINCREMENT, key_hash TEXT, ask_t_ms INTEGER, decision TEXT,
+            reason TEXT, valid_until_ms INTEGER, dry_run TEXT, t_ms INTEGER);
         """)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(lifecycle)")}      # a ST3-1 database is upgraded in place
+        for c, ty in (("go_ms", "INTEGER"), ("go_until_ms", "INTEGER"), ("nogo_reason", "TEXT"), ("revoked_ms", "INTEGER")):
+            if c not in cols:
+                self.db.execute(f"ALTER TABLE lifecycle ADD COLUMN {c} {ty}")
         self.db.execute("INSERT OR IGNORE INTO meta(k, v) VALUES ('db_version', ?)", (DB_VERSION,))
+        self.db.execute("UPDATE meta SET v=? WHERE k='db_version'", (DB_VERSION,))
 
     def close(self):
         self.db.close()
@@ -165,6 +199,9 @@ class Bridge:
             self.lock.release()
 
     # -- helpers ----------------------------------------------------------------------------------------------------------
+    def _x(self, *p):
+        return os.path.join(self.cfg["exchange_dir"], *p)
+
     def _row(self, key):
         return self.db.execute("SELECT * FROM lifecycle WHERE key=?", (key,)).fetchone()
 
@@ -179,6 +216,13 @@ class Bridge:
             "SELECT i.key, i.tid, i.eligible, i.claimed_ms, e.bar_close, e.side, e.otype, e.px, e.sl, e.tp, e.info, r.sid, r.cfg_sha256,"
             " r.raw, r.received_ms FROM intents i JOIN events e ON e.key=i.key JOIN receipts r ON r.id=e.receipt_id"
             " WHERE i.ev='ENTRY' AND i.eligible=1 AND i.claimed_ms IS NULL ORDER BY e.bar_close").fetchall()
+
+    def ea_heartbeat_age(self, now):
+        try:
+            t = _num(read_kv(self._x("hb_ea.txt")).get("t_ms"), int)
+        except OSError:
+            return None
+        return None if not t else now - t
 
     def _check(self, c, now):
         """bridge-side checks before the claim (the EA checks again with live prices right before OrderSend)."""
@@ -207,6 +251,48 @@ class Bridge:
             return "skip:clock_or_future_bar"          # a negative age is never 'within the deadline'
         if age > MAX_AGE_SEC * 1000:
             return "skip:expired_before_claim"
+        lim = self.cfg.get("require_ea_heartbeat_ms")
+        if lim is not None:
+            hb = self.ea_heartbeat_age(now)
+            if hb is None or hb > lim or hb < -lim:
+                return "skip:ea_heartbeat_stale"       # the EA is offline: the signal could not be executed in time anyway
+        return None
+
+    def still_valid(self, key, now):
+        """None while the claimed ENTRY may still be executed; otherwise why not. Everything the receiver learnt AFTER the claim
+        counts: its own post-claim re-decision (claim_note post_claim:*), a terminal / cancel / close-request fact of the trade, the
+        end of the SATS wait the ENTRY came from, a pending re-evaluation, and the 60 s deadline."""
+        st = self.rcv.store
+        if st.one("SELECT v FROM meta WHERE k='reeval_pending'") is not None:
+            return "receiver_reevaluation_pending"
+        it = st.one("SELECT * FROM intents WHERE key=?", (key,))
+        if it is None:
+            return "intent_missing"
+        if it["claimed_ms"] is None:
+            return "not_claimed"
+        note = it["claim_note"] or ""
+        if note.startswith("post_claim:"):
+            return "revoked_after_claim:" + note[len("post_claim:"):]
+        ev = st.one("SELECT tid, bar_close, info FROM events WHERE key=?", (key,))
+        if ev is None:
+            return "entry_fact_missing"
+        tr = st.one("SELECT terminal_seen FROM tv_trades WHERE tid=?", (ev["tid"],))
+        if tr is not None and tr["terminal_seen"]:
+            return "trade_terminated"
+        x = st.one("SELECT ev FROM events WHERE tid=? AND ev IN (%s) ORDER BY bar_close LIMIT 1" % ",".join("?" * len(TERMINAL_FOR_ENTRY)),
+                   (ev["tid"], *TERMINAL_FOR_ENTRY))
+        if x is not None:
+            return "tv_" + x["ev"].lower() + "_seen"
+        wid = next((p[4:] for p in (ev["info"] or "").split(";") if p.startswith("wid=")), "")
+        if wid:
+            w = st.one("SELECT state FROM tv_waits WHERE wid=?", (wid,))
+            if w is not None and (w["state"] or "").startswith("ENDED"):
+                return "wait_ended:" + wid
+        age = now - ev["bar_close"]
+        if age < 0:
+            return "clock_or_future_bar"
+        if age > MAX_AGE_SEC * 1000:
+            return "expired"
         return None
 
     def _write_cmd(self, c, claimed_ms):
@@ -218,7 +304,7 @@ class Bridge:
                  "received_ms": str(c["received_ms"]), "claimed_ms": str(claimed_ms)}
         body = "".join(f"{k}={v}\n" for k, v in lines.items())
         assert all("\n" not in str(v) and "=" not in k for k, v in lines.items())
-        d = os.path.join(self.cfg["exchange_dir"], "cmd")
+        d = self._x("cmd")
         tmp = os.path.join(d, f"{c['bar_close']}_{kh}.tmp")
         with open(tmp, "w", encoding="ascii", newline="\n") as f:
             f.write(body)
@@ -226,10 +312,22 @@ class Bridge:
             os.fsync(f.fileno())
         os.replace(tmp, os.path.join(d, f"{c['bar_close']}_{kh}.cmd"))
 
+    def _revoke(self, row, why, now, state="REVOKED_BEFORE_GO"):
+        """no GO will ever be given for this key; its command file (if the EA has not taken it yet) is moved to revoked/."""
+        self._set(row["key"], nogo_reason=why, revoked_ms=now, **({"state": state} if row["state"] in ("CLAIMED", "CMD_WRITTEN") else {}))
+        name = f"{row['bar_close']}_{row['key_hash']}.cmd"
+        try:
+            os.replace(self._x("cmd", name), self._x("revoked", name))
+        except OSError:
+            pass                                       # already taken by the EA: its ask will get NOGO
+        self.log.info("revoked %s before GO: %s", row["tid"], why)
+
     # -- one pass -------------------------------------------------------------------------------------------------------
     def once(self):
         self.ingest_reports()
         self.recover()
+        self.answer_asks()
+        self.revoke_invalid()
         n_cmd = 0
         for c in self._candidates():
             now = self.clock()
@@ -257,20 +355,28 @@ class Bridge:
             self._write_cmd(c, claimed)
             self._set(c["key"], state="CMD_WRITTEN", cmd_written_ms=self.clock())
             n_cmd += 1
+        self.answer_asks()
         self.check_divergence()
+        self.write_heartbeat()
         return n_cmd
 
     def recover(self):
-        """after a bridge restart: a key claimed (by this bridge) but whose command was not written is written only if still within
-        the deadline (the EA re-checks anyway); otherwise it is closed as expired. A key left in CLAIMING is resolved from the
-        receiver's intent (claimed_ms) — never claimed twice."""
+        """after a bridge restart: a key claimed (by this bridge) but whose command was not written is written only if it is still
+        valid (still_valid: not revoked / terminated / wait ended, within the deadline); otherwise it is closed without a command. A key
+        left in CLAIMING is resolved from the receiver's intent (claimed_ms) — never claimed twice."""
         for row in self.db.execute("SELECT * FROM lifecycle WHERE state IN ('CLAIMING', 'CLAIMED')").fetchall():
             it = self.rcv.store.one("SELECT claimed_ms FROM intents WHERE key=?", (row["key"],))
             if row["state"] == "CLAIMING" and (it is None or it["claimed_ms"] is None):
                 self._set(row["key"], state="CLAIM_REFUSED", reason="bridge_restart_before_claim")
                 continue
-            if self.clock() - row["bar_close"] > MAX_AGE_SEC * 1000:
-                self._set(row["key"], state="EXPIRED_AFTER_BRIDGE_RESTART", claimed_ms=it["claimed_ms"])
+            now = self.clock()
+            why = self.still_valid(row["key"], now)
+            if why == "expired":
+                self._set(row["key"], state="EXPIRED_AFTER_BRIDGE_RESTART", claimed_ms=it["claimed_ms"], nogo_reason=why, revoked_ms=now)
+                continue
+            if why:
+                self._set(row["key"], claimed_ms=it["claimed_ms"])
+                self._revoke(self._row(row["key"]), why, now, state="REVOKED_AFTER_BRIDGE_RESTART")
                 continue
             c = self.rcv.store.one(
                 "SELECT i.key, i.tid, e.bar_close, e.side, e.otype, e.px, e.sl, e.tp, e.info, r.sid, r.cfg_sha256, r.received_ms"
@@ -278,15 +384,64 @@ class Bridge:
             self._write_cmd(c, it["claimed_ms"])
             self._set(row["key"], state="CMD_WRITTEN", claimed_ms=it["claimed_ms"], cmd_written_ms=self.clock())
 
+    def revoke_invalid(self):
+        """commands not yet given a GO (the EA may not even have read them) whose ENTRY is no longer valid are revoked."""
+        for row in self.db.execute("SELECT * FROM lifecycle WHERE cmd_written_ms IS NOT NULL AND go_ms IS NULL AND nogo_reason IS NULL"
+                                   " AND state IN ('CMD_WRITTEN', 'EA_SEEN')").fetchall():
+            now = self.clock()
+            why = self.still_valid(row["key"], now)
+            if why:
+                self._revoke(row, why, now)
+
+    def answer_asks(self):
+        """the EA's final ask: GO at most once per key and only while still_valid(); the decision is stored before the answer file."""
+        d = self._x("ask")
+        for name in sorted(os.listdir(d)):
+            if not name.endswith(".ask"):
+                continue
+            p = os.path.join(d, name)
+            try:
+                f = read_kv(p)
+            except OSError:
+                continue
+            kh = f.get("key_hash", "")
+            now = self.clock()
+            row = self.db.execute("SELECT * FROM lifecycle WHERE key_hash=?", (kh,)).fetchone() if kh else None
+            until = None
+            if row is None:
+                why = "unknown_key"
+            elif row["go_ms"] is not None:
+                why = "already_granted"
+            elif row["nogo_reason"]:
+                why = row["nogo_reason"]
+            elif row["claimed_ms"] is None or row["cmd_written_ms"] is None:
+                why = "not_commanded"
+            else:
+                why = self.still_valid(row["key"], now)
+            if why is None:
+                until = min(now + int(self.cfg.get("go_ttl_ms") or 3000), row["bar_close"] + MAX_AGE_SEC * 1000)
+                self._set(row["key"], go_ms=now, go_until_ms=until)
+            elif row is not None and row["go_ms"] is None and not row["nogo_reason"]:
+                self._revoke(row, why, now)
+            self.db.execute("INSERT INTO answers(key_hash, ask_t_ms, decision, reason, valid_until_ms, dry_run, t_ms) VALUES (?,?,?,?,?,?,?)",
+                            (kh, _num(f.get("t_ms"), int), "GO" if why is None else "NOGO", why, until, f.get("dry_run"), now))
+            body = f"key_hash={kh}\ndecision={'GO' if why is None else 'NOGO'}\nreason={why or 'ok'}\nvalid_until_ms={until or 0}\nt_ms={now}\n"
+            if kh and all(ch in "0123456789abcdef" for ch in kh) and len(kh) == 16:
+                write_atomic(self._x("ans", kh + ".ans"), body)
+            os.replace(p, self._x("ask_done", f"{name}.{now}"))
+
+    def write_heartbeat(self):
+        last = self.rcv.store.one("SELECT MAX(received_ms) m FROM receipts")
+        write_atomic(self._x("hb_bridge.txt"), f"t_ms={self.clock()}\nlast_receipt_ms={(last and last['m']) or 0}\n")
+
     def ingest_reports(self):
-        d = os.path.join(self.cfg["exchange_dir"], "rpt")
+        d = self._x("rpt")
         for name in sorted(os.listdir(d)):
             if not name.endswith(".rpt"):
                 continue
             p = os.path.join(d, name)
             try:
-                with open(p, encoding="ascii", errors="replace") as f:
-                    fields = dict(l.rstrip("\r\n").split("=", 1) for l in f if "=" in l)
+                fields = read_kv(p)
             except OSError:
                 continue
             kh, state = fields.get("key_hash", ""), fields.get("state", "")
@@ -312,10 +467,10 @@ class Bridge:
                     upd["reason"] = fields["reason"][:300]
                 if state in ("FILLED", "OWNED_AT_STARTUP") and fields.get("position"):
                     upd["mt5_open"] = 1
-                if state in ("CLOSED", "EMERGENCY_CLOSE"):
+                if state == "CLOSED":
                     upd["mt5_open"] = 0
                 self._set(key, **upd)
-            os.replace(p, os.path.join(self.cfg["exchange_dir"], "rpt_done", name))
+            os.replace(p, self._x("rpt_done", name))
 
     def check_divergence(self):
         """TradingView closed its virtual trade while the MT5 position (per EA reports) is open: record only, never act."""
@@ -368,9 +523,16 @@ def main(argv=None):
     if a.cmd == "status":
         db = sqlite3.connect(os.path.join(cfg["bridge_data_dir"], "bridge.sqlite3"))
         db.row_factory = sqlite3.Row
+        now = now_ms()
+        for nm in ("hb_ea.txt", "hb_bridge.txt"):
+            try:
+                kv = read_kv(os.path.join(cfg["exchange_dir"], nm))
+                print(f"{nm}: age {(now - int(kv.get('t_ms', '0'))) / 1000:.1f} s  " + " ".join(f"{k}={v}" for k, v in kv.items() if k != "t_ms"))
+            except (OSError, ValueError):
+                print(f"{nm}: missing")
         for r in db.execute("SELECT * FROM lifecycle ORDER BY bar_close DESC LIMIT ?", (a.last,)):
-            print(f'{r["tid"]} {r["state"]:<28} reason={r["reason"]} retcode={r["ea_retcode"]} pos={r["ea_position"]} fill={r["fill_price"]}'
-                  f' vol={r["volume"]} claimed={iso(r["claimed_ms"])} cmd={iso(r["cmd_written_ms"])}')
+            print(f'{r["tid"]} {r["state"]:<28} reason={r["reason"]} go={iso(r["go_ms"])} nogo={r["nogo_reason"]} retcode={r["ea_retcode"]}'
+                  f' pos={r["ea_position"]} fill={r["fill_price"]} vol={r["volume"]} claimed={iso(r["claimed_ms"])} cmd={iso(r["cmd_written_ms"])}')
         for r in db.execute("SELECT * FROM divergences ORDER BY id DESC LIMIT 10"):
             print(f'DIVERGENCE {r["tid"]} {r["kind"]} {r["detail"]}')
         return 0
