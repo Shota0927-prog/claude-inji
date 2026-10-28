@@ -15,8 +15,8 @@
 //| NOT compiled / NOT run by the author: see STAGE3_ja.md.            |
 //+------------------------------------------------------------------+
 #property copyright "shota0927-prog"
-#property version   "0.35"
-#property description "XAU Short demo EA (stage 3, ST3-6). DRY_RUN by default. Demo accounts only."
+#property version   "0.36"
+#property description "XAU Short demo EA (stage 3, ST3-7). DRY_RUN by default. Demo accounts only."
 
 //--- approved rules (constants on purpose: not changeable from the inputs)
 const double RISK_FRACTION = 0.03;   // loss budget = balance right before the decision x 3 %
@@ -93,7 +93,6 @@ struct OwnedPos
    double   beFav;         // the favourable price that met the condition
    string   beInSet;       // the basis of that condition: the IN deal set ...
    double   beFillBasis;   // ... and the average fill it was measured from
-   bool     beBasisExact;  // ST3-6: false only for a basis restored from a 5-decimal record (before ST3-6)
    datetime beBar;         // open time of the bar that met it
    datetime lastBeTry;     // server time of the last breakeven attempt (retried once per M5 bar)
    bool     fillBarDone;   // the fill bar was evaluated for breakeven (tick history read, or not needed)
@@ -114,7 +113,7 @@ void ResetPos()
   {
    g_pos.key = ""; g_pos.posId = 0; g_pos.posTicket = 0; g_pos.orderTicket = 0; g_pos.dealTicket = 0;
    g_pos.fill = 0; g_pos.sl0 = 0; g_pos.tp0 = 0; g_pos.volume = 0; g_pos.fillTimeSrv = 0; g_pos.fillTimeMsc = 0; g_pos.lastInMsc = 0;
-   g_pos.inDeals = 0; g_pos.inSet = ""; g_pos.fillSyncPending = false; g_pos.beInSet = ""; g_pos.beFillBasis = 0; g_pos.beBasisExact = true;
+   g_pos.inDeals = 0; g_pos.inSet = ""; g_pos.fillSyncPending = false; g_pos.beInSet = ""; g_pos.beFillBasis = 0;
    g_pos.tpSet = false; g_pos.beDone = false; g_pos.bePending = false; g_pos.beFav = 0; g_pos.beBar = 0; g_pos.lastBeTry = 0;
    g_pos.fillBarDone = false; g_pos.fillBarUnavailNoted = false;
    g_pos.lastBarDone = 0; g_pos.lastTpTry = 0; g_pos.closeReason = ""; g_pos.lastCloseTry = 0;
@@ -236,31 +235,44 @@ string DblBits(double x)
    return(IntegerToString(u.l));
   }
 
-//--- [value, exact] of a journaled price (bit field + the 5-decimal field next to it)
-double PxExact(const string &kv[], const string bitsKey, const string decKey, bool &exact)
+#define PX_EXACT   0
+#define PX_LEGACY  1
+#define PX_DAMAGED 2
+
+//--- ST3-7: [value, state] of a journaled price.
+//---   PX_EXACT  : bit field present, finite, positive, equal to its 5-decimal field at 5 decimals -> the exact value held
+//---   PX_LEGACY : no bit field (written before ST3-6) -> only the 5-decimal value; the full-precision price CANNOT be recovered
+//---   PX_DAMAGED: bit field present but unusable -> not trusted at all (never treated as legacy): new entries stop, not reused
+double PxRead(const string &kv[], const string bitsKey, const string decKey, int &state)
   {
    double dec = StringToDouble(KvGet(kv, decKey));
    string b = KvGet(kv, bitsKey);
-   exact = false;
    if(b == "")
+     {
+      state = PX_LEGACY;
       return(dec);
+     }
+   state = PX_DAMAGED;
+   if(StringLen(b) > 20 || (StringSubstr(b, 0, 1) != "-" && (StringGetCharacter(b, 0) < '0' || StringGetCharacter(b, 0) > '9')))
+      return(dec);
+   for(int i = 1; i < StringLen(b); i++)
+      if(StringGetCharacter(b, i) < '0' || StringGetCharacter(b, i) > '9')
+         return(dec);
    DblLong u;
    u.l = StringToInteger(b);
    if(MathIsValidNumber(u.d) && u.d > 0 && DoubleToString(u.d, 5) == DoubleToString(dec, 5))
      {
-      exact = true;
+      state = PX_EXACT;
       return(u.d);
      }
    return(dec);
   }
 
-//--- the breakeven basis still describes the live average: exact basis -> the existing tolerance 1e-6; a basis known only to
-//--- 5 decimals (an old record) -> equal at those 5 decimals (never a wider tolerance)
-bool BasisMatch(double basis, bool exact, double live)
+//--- the breakeven basis still describes the live average (both exact values): the existing tolerance 1e-6. ST3-7: no comparison at
+//--- 5 decimals any more — a basis that is not exact is never reused (Reconcile voids it and the condition is re-evaluated).
+bool BasisMatch(double basis, double live)
   {
-   if(exact)
-      return(MathAbs(basis - live) <= 1e-6);
-   return(DoubleToString(live, 5) == DoubleToString(basis, 5));
+   return(MathAbs(basis - live) <= 1e-6);
   }
 
 bool ReadLines(const string path, string &lines[])
@@ -834,7 +846,6 @@ void VoidBreakevenBasis()
       g_pos.beBar = 0;
       g_pos.beInSet = "";
       g_pos.beFillBasis = 0;
-      g_pos.beBasisExact = true;
      }
    datetime fillBarOpen = BarOpenOf(g_pos.fillTimeSrv);
    datetime lastInBar = BarOpenOf((datetime)(g_pos.lastInMsc / 1000));
@@ -1397,7 +1408,6 @@ void TryBreakeven(double favLow, datetime barOpen)
       g_pos.beBar = barOpen;
       g_pos.beInSet = g_pos.inSet;
       g_pos.beFillBasis = g_pos.fill;
-      g_pos.beBasisExact = true;
       int digits = (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS);
       Journal(g_pos.key, "BE_TRIGGERED", "fav=" + DoubleToString(favLow, digits) + ";bar_open=" + IntegerToString((long)barOpen) +
               ";fill=" + DoubleToString(g_pos.fill, 5) + ";dist=" + DoubleToString(g_pos.fill - favLow, digits) +
@@ -1417,7 +1427,7 @@ void ApplyBreakeven()
       return;
    if(!g_pos.bePending)
       return;                                        // voided by a new IN deal in RefreshFill
-   if(g_pos.beInSet != g_pos.inSet || !BasisMatch(g_pos.beFillBasis, g_pos.beBasisExact, g_pos.fill))
+   if(g_pos.beInSet != g_pos.inSet || !BasisMatch(g_pos.beFillBasis, g_pos.fill))
      {
       VoidBreakevenBasis();                          // the basis is not the current fill state
       return;
@@ -1585,7 +1595,8 @@ void Reconcile()
    int    inDeals = 0;
    string inSet = "", beInSet = "";
    double beFillBasis = 0;
-   bool   fillExact = true, beExact = true;
+   int    fillState = PX_EXACT, beState = PX_EXACT;
+   string damaged = "";                              // ST3-7: records of the current own position with an unusable bit field
    string closeReq = "";
    bool   closed = false, quarantined = false, bindSeen = false, beSet = false, beTrig = false;
    string l[];
@@ -1625,7 +1636,8 @@ void Reconcile()
         {
          posKey = key; closed = false; quarantined = false;
          posId = StringToInteger(KvGet(kv, "position_id")); posTicket = (ulong)StringToInteger(KvGet(kv, "position"));
-         sl0 = StringToDouble(KvGet(kv, "sl0")); tp0 = StringToDouble(KvGet(kv, "tp0")); fill = PxExact(kv, "fill_bits", "fill_price", fillExact);
+         sl0 = StringToDouble(KvGet(kv, "sl0")); tp0 = StringToDouble(KvGet(kv, "tp0")); fill = PxRead(kv, "fill_bits", "fill_price", fillState);
+         damaged = fillState == PX_DAMAGED ? "FILLED" : "";
          fillTime = StringToInteger(KvGet(kv, "fill_time")); fillMsc = StringToInteger(KvGet(kv, "fill_time_msc"));
          vol = StringToDouble(KvGet(kv, "volume"));
          lastIn = MaxL(fillMsc, StringToInteger(KvGet(kv, "last_in_msc"))); inDeals = (int)StringToInteger(KvGet(kv, "in_deals"));
@@ -1636,7 +1648,8 @@ void Reconcile()
          continue;
       if(st == "POSITION_UPDATED")
         {
-         fill = PxExact(kv, "fill_bits", "fill_price", fillExact); vol = StringToDouble(KvGet(kv, "volume"));
+         fill = PxRead(kv, "fill_bits", "fill_price", fillState); vol = StringToDouble(KvGet(kv, "volume"));
+         if(fillState == PX_DAMAGED) damaged += (damaged == "" ? "" : ",") + "POSITION_UPDATED";
          lastIn = MaxL(lastIn, StringToInteger(KvGet(kv, "last_in_msc"))); inDeals = (int)StringToInteger(KvGet(kv, "in_deals"));
          inSet = KvGet(kv, "in_set");
         }
@@ -1644,7 +1657,8 @@ void Reconcile()
       if(st == "BE_TRIGGERED")
         {
          beTrig = true; beFav = StringToDouble(KvGet(kv, "fav")); beBar = StringToInteger(KvGet(kv, "bar_open"));
-         beInSet = KvGet(kv, "in_set"); beFillBasis = PxExact(kv, "fill_bits", "fill", beExact);
+         beInSet = KvGet(kv, "in_set"); beFillBasis = PxRead(kv, "fill_bits", "fill", beState);
+         if(beState == PX_DAMAGED) damaged += (damaged == "" ? "" : ",") + "BE_TRIGGERED";
         }
       // BE_TRIGGER_VOID is informational: whether a condition is restored is decided by its basis below
       if(st == "BE_SET") beSet = true;
@@ -1674,6 +1688,12 @@ void Reconcile()
       ulong tk;
       Journal(unknown, "UNKNOWN_CHECK", "detected=" + DetectUnknown(unknown, preMs, pid, tk) + ";note=resolve_unknown_file_needed");
      }
+   if(damaged != "" && posKey != "" && !closed && !quarantined)
+     {
+      // ST3-7: a damaged bit field is an anomaly (not a legacy record): new entries stop; the position is still protected
+      Journal(posKey, "JOURNAL_DAMAGED", "records=" + damaged + ";field=fill_bits;note=not_reused");
+      HaltNew("journal_price_damaged");
+     }
    if(posKey != "" && !closed && !quarantined && posId > 0)
      {
       ResetPos();
@@ -1683,15 +1703,28 @@ void Reconcile()
       g_pos.inSet = inSet;
       datetime fbo = BarOpenOf(g_pos.fillTimeSrv), lib = BarOpenOf((datetime)(lastIn / 1000));
       g_pos.lastBarDone = lib > fbo ? lib : fbo;
-      if(beTrig && (beInSet == "" || beInSet != inSet || !BasisMatch(beFillBasis, beExact && fillExact, fill)))
+      // ST3-7: a met condition is restored only from an EXACT basis on the same IN deal set. Its average is compared with the journaled
+      // average here only when that one is exact too; otherwise against the live average right before the SL change (ApplyBreakeven,
+      // 1e-6). A legacy (5-decimal) or damaged basis is not reused: voided and re-evaluated from the price history against the live
+      // average (fill-bar ticks after the last IN deal, then the closed bars). No tolerance wider than 1e-6 is used anywhere.
+      string voidWhy = "";
+      if(beTrig && !beSet && beState != PX_EXACT)
+        {
+         voidWhy = beState == PX_LEGACY ? "basis_precision_unknown" : "basis_record_damaged";
+         beTrig = false;
+        }
+      if(beTrig && (beInSet == "" || beInSet != inSet || (fillState == PX_EXACT && !BasisMatch(beFillBasis, fill))))
          beTrig = false;                             // a condition met on another basis (another IN deal set / average) is not restored
       g_pos.closeReason = closeReq;                  // a required close survives the restart
       g_pos.beDone = beSet;
       g_pos.bePending = beTrig && !beSet;            // a met breakeven condition survives the restart (no re-reading needed)
       g_pos.beFav = beFav; g_pos.beBar = (datetime)beBar;
-      g_pos.beInSet = beTrig ? beInSet : ""; g_pos.beFillBasis = beTrig ? beFillBasis : 0; g_pos.beBasisExact = beTrig ? beExact : true;
+      g_pos.beInSet = beTrig ? beInSet : ""; g_pos.beFillBasis = beTrig ? beFillBasis : 0;
       g_pos.fillBarDone = beTrig || beSet;
       g_hasPos = true;
+      if(voidWhy != "")
+         Journal(posKey, "BE_TRIGGER_VOID", "reason=" + voidWhy + ";fav=" + DoubleToString(beFav, 5) + ";bar_open=" + IntegerToString(beBar) +
+                 ";fill=" + DoubleToString(beFillBasis, 5) + ";note=re_evaluated_from_price_history");
       int sel = SelectOwn();
       if(sel == 1)
         {
