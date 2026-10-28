@@ -84,17 +84,23 @@ def dbl_bits(x):
 PX_EXACT, PX_LEGACY, PX_DAMAGED = "exact", "legacy", "damaged"
 
 
+def kv_has(kv, k):
+    """ST3-8: the field `k=` is present (with any value, empty included)."""
+    return any(x.startswith(k + "=") for x in kv)
+
+
 def px_read(kv, bits_key, dec_key):
     """ST3-6 / ST3-7: [value, state] of a journaled price.
       exact   : the bit field is present, finite, positive and rounds to the 5-decimal field next to it -> the exact value held.
-      legacy  : no bit field (a record written before ST3-6) -> only the 5-decimal value; the full-precision price CANNOT be
-                recovered from it.
-      damaged : a bit field is present but unusable (not a number / not finite / not positive / does not round to its 5-decimal
-                field) -> not trusted at all (not treated as a legacy record): the caller stops new entries and does not reuse it."""
+      legacy  : the bit field is ABSENT (a record written before ST3-6) -> only the 5-decimal value; the full-precision price
+                CANNOT be recovered from it.
+      damaged : the bit field is present but unusable (EMPTY (ST3-8: e.g. a line cut after "fill_bits="), not a number, not finite,
+                not positive, does not round to its 5-decimal field) -> not trusted at all (not treated as a legacy record): the
+                caller stops new entries and does not reuse it."""
     dec = to_float(kv_get(kv, dec_key))
-    b = kv_get(kv, bits_key)
-    if b == "":
+    if not kv_has(kv, bits_key):                    # ST3-8: presence first; an empty value is damaged, not legacy
         return dec, PX_LEGACY
+    b = kv_get(kv, bits_key)
     try:
         x = struct.unpack("<d", struct.pack("<q", int(b)))[0]
     except (TypeError, ValueError, struct.error, OverflowError):

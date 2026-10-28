@@ -15,8 +15,8 @@
 //| NOT compiled / NOT run by the author: see STAGE3_ja.md.            |
 //+------------------------------------------------------------------+
 #property copyright "shota0927-prog"
-#property version   "0.36"
-#property description "XAU Short demo EA (stage 3, ST3-7). DRY_RUN by default. Demo accounts only."
+#property version   "0.37"
+#property description "XAU Short demo EA (stage 3, ST3-8). DRY_RUN by default. Demo accounts only."
 
 //--- approved rules (constants on purpose: not changeable from the inputs)
 const double RISK_FRACTION = 0.03;   // loss budget = balance right before the decision x 3 %
@@ -210,6 +210,15 @@ string Sanitize(string s)
   }
 
 //--- value of k in a "k=v" line list ("" = missing)
+//--- ST3-8: the field `k=` is present (with any value, empty included)
+bool KvHas(const string &lines[], const string k)
+  {
+   for(int i = 0; i < ArraySize(lines); i++)
+      if(StringFind(lines[i], k + "=") == 0)
+         return(true);
+   return(false);
+  }
+
 string KvGet(const string &lines[], const string k)
   {
    for(int i = 0; i < ArraySize(lines); i++)
@@ -241,18 +250,21 @@ string DblBits(double x)
 
 //--- ST3-7: [value, state] of a journaled price.
 //---   PX_EXACT  : bit field present, finite, positive, equal to its 5-decimal field at 5 decimals -> the exact value held
-//---   PX_LEGACY : no bit field (written before ST3-6) -> only the 5-decimal value; the full-precision price CANNOT be recovered
-//---   PX_DAMAGED: bit field present but unusable -> not trusted at all (never treated as legacy): new entries stop, not reused
+//---   PX_LEGACY : bit field ABSENT (written before ST3-6) -> only the 5-decimal value; the full-precision price CANNOT be recovered
+//---   PX_DAMAGED: bit field present but unusable (EMPTY — ST3-8, e.g. a line cut after "fill_bits=" — not a number, not finite, not
+//---               positive, not equal to its 5-decimal field) -> not trusted at all (never treated as legacy): new entries stop
 double PxRead(const string &kv[], const string bitsKey, const string decKey, int &state)
   {
    double dec = StringToDouble(KvGet(kv, decKey));
-   string b = KvGet(kv, bitsKey);
-   if(b == "")
+   if(!KvHas(kv, bitsKey))                           // ST3-8: presence first; an empty value is damaged, not legacy
      {
       state = PX_LEGACY;
       return(dec);
      }
+   string b = KvGet(kv, bitsKey);
    state = PX_DAMAGED;
+   if(b == "")
+      return(dec);
    if(StringLen(b) > 20 || (StringSubstr(b, 0, 1) != "-" && (StringGetCharacter(b, 0) < '0' || StringGetCharacter(b, 0) > '9')))
       return(dec);
    for(int i = 1; i < StringLen(b); i++)

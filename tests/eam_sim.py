@@ -19,6 +19,8 @@ automation/xau_short/ea/XauShortDemoEA.mq5 (the model and the source must keep t
                the history (adoption with several IN deals, history arriving late, restart), breakeven basis voided by a later IN deal
   EAR-16..17 : regressions of the ST3-4 re-review: a change during the history read (pass, adoption, right before the SL change),
                a same-ms IN deal with / without a crash between POSITION_UPDATED and BE_TRIGGER_VOID, restart
+  EAP-08..10 : ST3-8: bit field presence first (absent = legacy; empty / non-numeric / zero / other bits = damaged) on the three
+               records, protection with a damaged record, MQL5 mirror
   EAP-01..07 : ST3-6 / ST3-7: the breakeven basis / average fill journaled exactly (bit field); a pending condition is restored
                only from an exact basis (1e-6); a legacy (5-decimal) or damaged basis is voided and re-evaluated from the price history
                (ticks / closed bars / none), a damaged field stops new entries; small real changes (+2e-6) detected; protection and
@@ -1774,18 +1776,92 @@ def gate_precision():
     check("EAP-07 (ST3-7, MQL5 static mirror) PX_EXACT / PX_LEGACY / PX_DAMAGED and PxRead (3 sites in Reconcile); BasisMatch(basis, live) "
           "is only |basis - live| <= 1e-6 (no 5-decimal comparison left); a non-exact basis is voided (basis_precision_unknown / "
           "basis_record_damaged, re-evaluated) and a damaged field journals JOURNAL_DAMAGED + HaltNew(journal_price_damaged); the "
-          "journaled average is compared only when exact; FILLED / POSITION_UPDATED / BE_TRIGGERED write fill_bits; version 0.36",
+          "journaled average is compared only when exact; FILLED / POSITION_UPDATED / BE_TRIGGERED write fill_bits",
           "#define PX_DAMAGED 2" in mq and rc.count("PxRead(kv, ") == 3 and "return(MathAbs(basis - live) <= 1e-6);" in mq
           and "DoubleToString(live, 5) == DoubleToString(basis, 5)" not in mq and mq.count("BasisMatch(") == 3
           and 'voidWhy = beState == PX_LEGACY ? "basis_precision_unknown" : "basis_record_damaged";' in rc
           and 'HaltNew("journal_price_damaged");' in rc and "(fillState == PX_EXACT && !BasisMatch(beFillBasis, fill))" in rc
           and all(rec(st) and "fill_bits=" in rec(st).group(0) for st in ("FILLED", "POSITION_UPDATED", "BE_TRIGGERED"))
-          and '#property version   "0.36"' in mq and "beBasisExact" not in mq)
+          and "beBasisExact" not in mq)
+
+
+def bits_case(record, payload, sl_lost=False):
+    """ST3-8: one own position with FILLED, POSITION_UPDATED (a second IN deal) and BE_TRIGGERED (exact, journaled while the SL change
+    is not attempted) records and no earlier halt; the fill_bits field of `record` is rewritten to `payload` (absent / empty /
+    nonnumeric / normal / zero (bits of 0.0) / other (bits of another price)), then a crash + restart with no price history."""
+    b = Box()
+    try:
+        kh = fill(b)
+        p = b.own()
+        first = next(d for d in b.t.deals.values() if d["position"] == p["identifier"])
+        d = dict(first)
+        d.update(volume=first["volume"], price=first["price"] + 0.04, time_msc=first["time_msc"] + 20000,
+                 time=(first["time_msc"] + 20000) // 1000)
+        b.t.deals[b.t._ticket()] = d
+        p.update(volume=round(first["volume"] * 2, 2), price_open=first["price"] + 0.02)
+        b.ea.refresh_fill()
+        P = b.ea.pos
+        b.ea.journal(kh, "BE_TRIGGERED", f"fav={P.fill - 16:.2f};bar_open={P.fillTimeSrv - P.fillTimeSrv % 300};fill={P.fill:.5f};"
+                                         f"dist=16.00;last_in_msc={P.lastInMsc};in_deals={P.inDeals};in_set={P.inSet};fill_bits={em.dbl_bits(P.fill)}")
+        b.ea.on_deinit()
+        jp = b.ea.journalPath
+        val = {"empty": "", "nonnumeric": "broken", "zero": em.dbl_bits(0.0), "other": em.dbl_bits(2601.0)}
+        out = []
+        for ln in open(jp, encoding="ascii").read().splitlines(keepends=True):
+            if f"|{record}|" in ln and payload != "normal":
+                ln = re.sub(r";fill_bits=-?\d+", "" if payload == "absent" else ";fill_bits=" + val[payload], ln)
+            out.append(ln)
+        open(jp, "w", encoding="ascii", newline="").write("".join(out))
+        b.t.ticks_unavailable = True
+        b.restart(crash=True)
+        res = dict(pending=b.ea.pos.bePending, damaged=(b.ea.last(kh, "JOURNAL_DAMAGED") or {}).get("records"), halt=b.ea.haltReason,
+                   void=(b.ea.last(kh, "BE_TRIGGER_VOID") or {}).get("reason"), sl=p["sl"])
+        if sl_lost:
+            p["sl"] = 0.0
+            b.timer()
+            res["closed"] = p["ticket"] not in b.t.positions
+        return res
+    finally:
+        b.close()
+
+
+def gate_bits_matrix():
+    res = {(rec, pl): bits_case(rec, pl) for rec in ("FILLED", "POSITION_UPDATED", "BE_TRIGGERED")
+           for pl in ("absent", "empty", "nonnumeric", "normal", "zero", "other")}
+    bad = []
+    for (rec, pl), c in res.items():
+        dmg = pl in ("empty", "nonnumeric", "zero", "other")
+        want_damaged = rec if dmg else None
+        want_halt = "journal_price_damaged" if dmg else ""
+        if rec == "BE_TRIGGERED":
+            want_void = None if pl == "normal" else ("basis_precision_unknown" if pl == "absent" else "basis_record_damaged")
+            want_pending = pl == "normal"
+        else:                                       # the basis stays exact: restored (its average compared with the live one later)
+            want_void, want_pending = None, True
+        if (c["damaged"], c["halt"], c["void"], c["pending"], c["sl"]) != (want_damaged, want_halt, want_void, want_pending, 2605.0):
+            bad.append(((rec, pl), c))
+    check("EAP-08 (ST3-8) bit field presence is decided first, on FILLED / POSITION_UPDATED / BE_TRIGGERED alike: ABSENT -> legacy (no "
+          "JOURNAL_DAMAGED, no halt; a legacy BE basis is voided basis_precision_unknown and re-evaluated); EMPTY (a line cut after "
+          "\"fill_bits=\"), non-numeric, zero, another price's bits -> damaged (JOURNAL_DAMAGED records=<that record>, new entries stop "
+          "journal_price_damaged, a damaged BE basis voided basis_record_damaged); correct bits -> exact (pending restored); no "
+          "earlier halt in these runs; the SL stays 2605 (no history)", not bad, str(bad))
+    prot = {rec: bits_case(rec, "empty", sl_lost=True) for rec in ("FILLED", "POSITION_UPDATED", "BE_TRIGGERED")}
+    check("EAP-09 (ST3-8) with an EMPTY bit field on any of the three records the initial-SL check and the required close continue (SL "
+          "removed -> emergency close, the position gone) while new entries stay stopped",
+          all(c["closed"] and c["halt"] == "journal_price_damaged" for c in prot.values()), str(prot))
+    mq = open(MQ5, encoding="utf-8").read()
+    px = mq[mq.index("double PxRead("):mq.index("bool BasisMatch(")]
+    check("EAP-10 (ST3-8, MQL5 static mirror) KvHas (presence of `k=`) exists; PxRead decides PX_LEGACY only when !KvHas(kv, bitsKey), "
+          "sets PX_DAMAGED before reading the value and returns it for an empty value; version 0.37",
+          "bool KvHas(const string &lines[], const string k)" in mq and "if(!KvHas(kv, bitsKey))" in px
+          and px.index("if(!KvHas(kv, bitsKey))") < px.index("state = PX_LEGACY;") < px.index("state = PX_DAMAGED;")
+          < px.index('if(b == "")') and 'if(b == "")\n     {\n      state = PX_LEGACY' not in px
+          and '#property version   "0.37"' in mq)
 
 
 def main():
     for g in (gate_env, gate_deadline, gate_price_lot, gate_slot, gate_unknown, gate_protect, gate_be, gate_restart_misc, gate_dry_mgmt,
-              gate_review, gate_rereview, gate_rereview2, gate_rereview3, gate_static, gate_precision):
+              gate_review, gate_rereview, gate_rereview2, gate_rereview3, gate_static, gate_precision, gate_bits_matrix):
         try:
             g()
         except Exception:
