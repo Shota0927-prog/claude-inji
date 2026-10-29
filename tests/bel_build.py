@@ -14,6 +14,9 @@ Each Strategy == its file at BASE_REV + EDITS (exact replacements, each old once
     at the TP or better; a gapped stop fill is still short of the TP). Profit / loss size is not used. Original SL = oSL (the
     breakeven move changes oStop only), original TP = oTP (set once at the fill check), copied into the lock state. The start bar
     itself is blocked and is never used for the release;
+  - D waits (BEL-2, end of (2d)): on every blocked confirmed bar (the start bar through the release bar) the 1M BOS waits
+    (stWaits) are cleared, so a wait armed before the lock start or while locked never becomes an entry after the release (the
+    first entry after it needs a 1M touch after the release bar). The waits' arming / BOS / expiry code is unchanged; OFF never runs it;
   - gates: (4) new entries (Current orders, SATS immediate orders and SATS wait preparation: no wait / pending limit is created
     while locked), the SATS pull-side order (no wait can exist while a position is open, so none exists at the lock start), and
     the provisional gate (provisional alert / label; the Gold / automation provisional alert incl. its PROV JSON).
@@ -79,11 +82,22 @@ START = (
     "                stLkBlk  := true\n")
 
 
+DWAIT_OLD = "                    array.remove(stWaits, w)\n\n    // (3) 保留中の指値 (A) の取消: Track 消失 / State 無効 / L で Strong 以上の資格を失った / 時間帯の外\n"
+DWAIT = (
+    "    // BEL-2: ロックで禁止の確定足 (開始足〜解除足) では D の 1分足 BOS 待機を残さない。ロック前・ロック中に始まった待機が解除後の\n"
+    "    //   新規 Entry にならない (解除後は解除の次の足以降の接触から)。この足の BOS 候補 (dSrc) は (4) で使われない。待機の作り方・\n"
+    "    //   BOS 判定・期限は変えない。OFF では stLkBlk が常に false なので何もしない\n"
+    "    if stLkBlk\n"
+    "        array.clear(stWaits)\n"
+    "\n")
+
+
 def edits(path):
     eds = [
         ("input", _BETP, _BETP + INPUT),
         ("release", _HEAD, "if is5mChart and barstate.isconfirmed\n" + RELEASE + "    // (1) 発注済み Entry の約定 / 決済を確認する\n"),
         ("start", _FLAT, "    else if oState >= 2 and strategy.opentrades == 0\n" + START + "        oState := 0\n"),
+        ("dwait", DWAIT_OLD, DWAIT_OLD.replace("\n\n    // (3)", "\n\n" + DWAIT + "    // (3)")),
         ("pull", _PULL, _PULL[:-1] + " and not stLkBlk     // BEL-1\n"),
         ("new", _NEW, _NEW[:-1] + " and not stLkBlk     // BEL-1\n"),
     ]

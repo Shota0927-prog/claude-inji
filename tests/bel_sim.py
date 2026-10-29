@@ -75,7 +75,7 @@ def enclosing_ifs(lines, i):
 
 
 def gate_static():
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in bb.FILES]
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in bb.FILES and p != "ZoneStrategyUSDJPY_Diagnostic.pine"]   # untracked, not ours
     others += [os.path.join("automation/xau_short/pine", p) for p in os.listdir(os.path.join(ROOT, "automation/xau_short/pine"))
                if os.path.join("automation/xau_short/pine", p) not in bb.FILES]
     check("BS-01 the eight Strategies == bel_build.build() and strip back to the 7f74b04 files byte for byte (unapply too, idempotent "
@@ -105,7 +105,7 @@ def gate_static():
     shape = {}
     for p in bb.FILES:
         rem, add = changed_lines(OLD[p], CUR[p])
-        blk = set((bb.INPUT + bb.RELEASE + bb.START).split("\n"))
+        blk = set((bb.INPUT + bb.RELEASE + bb.START + bb.DWAIT).split("\n"))
         add_g = [l for l in add if l not in blk]
         ok = len(rem) == 3 and len(add_g) == 3 and all(
             n in (o + " and not stLkBlk     // BEL-1", o + " and not stLkOn     // BEL-1") for o, n in zip(rem, add_g))
@@ -205,6 +205,20 @@ def gate_static():
     lint = {p: (fr.lint_eager_guards(code_only(CUR[p])), fr.lint_eager_guards(code_only(OLD[p]))) for p in bb.FILES}
     check("BS-11 eager-evaluation lint (RE10045 guard / index pattern): no new finding (the closed-trade index lkC is read only "
           "under strategy.closedtrades > oClosed >= 0)", all(x == y for x, y in lint.values()), str(lint)[:300])
+    dw = {}
+    for p in bb.FILES:
+        c, o = CUR[p], OLD[p]
+        i2d, i3, i4 = c.index("    // (2d) D:"), c.index("    // (3) 保留中の指値 (A) の取消"), c.index("    // (4) 新規 Entry")
+        cl = c.index(bb.DWAIT)
+        code = code_only(bb.DWAIT)
+        stw = lambda t: [l.strip() for l in code_only(t).split("\n") if "stWaits" in l]
+        if not (i2d < cl < i3 < i4 and c.count(bb.DWAIT) == 1 and [l.strip() for l in code.split("\n") if l.strip()] == ["if stLkBlk", "array.clear(stWaits)"]
+                and [x for x in stw(c) if x != "array.clear(stWaits)"] == stw(o)
+                and es.func(c, "f_stProvEval() =>") == es.func(o, "f_stProvEval() =>")):
+            dw[p] = False
+    check("BS-12 BEL-2 D waits: one block `if stLkBlk / array.clear(stWaits)` after (2d) (waits updated, this bar's BOS candidates "
+          "taken) and before (3) / (4); every other stWaits line (arming, BOS, expiry, validity, provisional read in f_stProvEval) "
+          "unchanged; under OFF stLkBlk is always false (BS-05), so the D logic is untouched", not dw, str(dw))
 
 
 # ---- model --------------------------------------------------------------------------------------------------------------
@@ -448,6 +462,121 @@ def gate_model():
     check("BM-09 provisional (forming ticks read the last confirmed state): blocked while the position is open, on the bar after the "
           "BE exit and on the forming release bar; allowed from the bar after the release",
           prov == [True, False, False, False, False, False, True], str(prov))
+    gate_dwait()
+
+
+# ---- Mode D 1M BOS waits across a lock (port of (2d) + the D part of (4); the lock state is given per bar) -----------------------
+def d_run(m1, blocked, clear, cands, closes, dwait=30, used=(), prev0=None):
+    """m1: per 5m bar a list of confirmed 1M bars (h, l, c); blocked: per bar stLkBlk; clear: the BEL-2 block present; cands: the
+    Strong candidates (side, track, top, bot) of stPrev / cur (constant here); closes: the 5m close. Returns the bars with an order
+    (side, track) and, per bar, the waits alive after (2d) / the BEL-2 block."""
+    waits, prev_c, orders, alive = [], prev0, [], []     # prev0: the previous 1M close (a price, m1PrevC)
+    for t, bars in enumerate(m1):
+        for (h, l, cl) in bars:
+            for w in list(reversed(waits)):                      # waiting BOS / expiry first (not on the arming 1M bar)
+                if not w["bos"]:
+                    w["cnt"] += 1
+                    if (cl > w["lvl"]) if w["side"] == 1 else (cl < w["lvl"]):
+                        w["bos"] = True
+                    else:
+                        w["run"] = max(w["run"], h) if w["side"] == 1 else min(w["run"], l)
+                        if (l < w["ext"]) if w["side"] == 1 else (h > w["ext"]):
+                            w["ext"] = l if w["side"] == 1 else h
+                            w["lvl"] = w["run"]
+                        if w["cnt"] >= dwait:
+                            waits.remove(w)
+            for (side, trk, top, bot) in cands:                   # then new touches
+                if trk not in used and prev_c is not None and l <= top and h >= bot and (prev_c > top if side == 1 else prev_c < bot) \
+                        and not any(w["trk"] == trk for w in waits):
+                    e0, r0 = (l, h) if side == 1 else (h, l)
+                    waits.append({"side": side, "trk": trk, "top": top, "bot": bot, "ext": e0, "run": r0, "lvl": r0, "cnt": 0, "bos": False})
+            prev_c = cl
+        d_src = []
+        for w in list(reversed(waits)):
+            if not any(c[1] == w["trk"] and c[0] == w["side"] for c in cands):
+                waits.remove(w)
+            elif w["bos"]:
+                if (closes[t] > w["top"]) if w["side"] == 1 else (closes[t] < w["bot"]):
+                    d_src.append((w["side"], w["trk"]))
+                waits.remove(w)
+        if clear and blocked[t]:                                  # BEL-2
+            waits.clear()
+        alive.append(len(waits))
+        if not blocked[t] and d_src:                              # (4): oState 0 assumed, first candidate
+            orders.append((t,) + d_src[0])
+    return orders, alive
+
+
+def gate_dwait():
+    cand = [(1, 7, 100.10, 100.00)]                        # Long Strong zone 100.00 - 100.10
+    flat = [(100.30, 100.25, 100.28)] * 5
+    touch = [(100.30, 100.20, 100.25), (100.22, 100.05, 100.08), (100.11, 100.06, 100.09)] + [(100.11, 100.07, 100.09)] * 2  # arm, lvl 100.22? -> run
+    bos = [(100.20, 100.10, 100.19), (100.30, 100.18, 100.29)] + [(100.30, 100.25, 100.28)] * 3
+    # bar 0 free, bars 1..3 blocked (lock start 1, release 3), bar 4 first free bar after the release
+    m1 = [flat, touch, flat[:1] * 5, flat[:1] * 5, bos, flat]
+    m1[2] = [(100.12, 100.07, 100.10)] * 5                     # stays below the BOS level, above the zone bottom
+    m1[3] = [(100.12, 100.07, 100.10)] * 5
+    closes = [100.28, 100.09, 100.10, 100.10, 100.28, 100.28]
+    blocked = [False, True, True, True, False, False]
+    o_old, a_old = d_run(m1, blocked, False, cand, closes)
+    o_new, a_new = d_run(m1, blocked, True, cand, closes)
+    o_off, a_off = d_run(m1, [False] * 6, True, cand, closes)
+    o_base, _ = d_run(m1, [False] * 6, False, cand, closes)
+    check("BM-10 reproduction (076ec8c = BEL-1 without the D clear): a 1M BOS wait armed on a locked bar survives the release bar "
+          "and its BOS on the first free bar becomes an order (bar 4); with BEL-2 the wait is gone on every blocked bar and bar 4 "
+          "sends nothing; lock OFF: the same wait orders exactly as the code without BEL",
+          o_old == [(4, 1, 7)] and a_old[3] == 1 and o_new == [] and a_new[1:4] == [0, 0, 0] and o_off == o_base and o_base != [],
+          str((o_old, a_old, o_new, a_new, o_off, o_base)))
+    # a wait armed before the lock (while the position is open) and one armed on the release bar: both cleared
+    m1b = [touch, [(100.12, 100.07, 100.10)] * 5, [(100.12, 100.07, 100.10)] * 5, bos, flat]
+    closes_b = [100.09, 100.10, 100.10, 100.28, 100.28]
+    pre_old, _ = d_run(m1b, [False, True, True, False, False], False, cand, closes_b)
+    pre_new, _ = d_run(m1b, [False, True, True, False, False], True, cand, closes_b)
+    m1c = [flat, flat, touch, bos, flat]
+    closes_c = [100.28, 100.28, 100.09, 100.28, 100.28]
+    rel_old, _ = d_run(m1c, [False, True, True, False, False], False, cand, closes_c)
+    rel_new, _ = d_run(m1c, [False, True, True, False, False], True, cand, closes_c)
+    check("BM-11 a wait armed before the lock start (bar 0, position still open) or on the release bar itself: without BEL-2 each "
+          "orders on the first free bar; with BEL-2 neither does",
+          pre_old == [(3, 1, 7)] and pre_new == [] and rel_old == [(3, 1, 7)] and rel_new == [], str((pre_old, pre_new, rel_old, rel_new)))
+    # after the release a fresh touch + BOS orders normally
+    m1d = [flat, touch, [(100.12, 100.07, 100.10)] * 5, flat, touch, bos, flat]
+    closes_d = [100.28, 100.09, 100.10, 100.28, 100.09, 100.28, 100.28]
+    fr_new, _ = d_run(m1d, [False, True, True, False, False, False, False], True, cand, closes_d)
+    check("BM-12 after the release a new 1M touch (bar 4) and its BOS (bar 5) order normally with BEL-2 (the D logic itself unchanged)",
+          fr_new == [(5, 1, 7)], str(fr_new))
+    rnd = random.Random(7)
+    bad = 0
+    for _ in range(300):
+        m1r, cl_r = [], []
+        px = 100.2
+        for t in range(40):
+            bars = []
+            for k in range(5):
+                h, l = px + rnd.uniform(0, 0.08), px - rnd.uniform(0, 0.08)
+                c = rnd.uniform(l, h)
+                bars.append((round(h, 3), round(l, 3), round(c, 3)))
+                px = c
+            m1r.append(bars)
+            cl_r.append(bars[-1][2])
+        cands = [(1, 1, 100.15, 100.05), (-1, 2, 100.35, 100.25)]
+        dw = rnd.randint(3, 30)
+        a, _ = d_run(m1r, [False] * 40, True, cands, cl_r, dwait=dw)
+        b, _ = d_run(m1r, [False] * 40, False, cands, cl_r, dwait=dw)
+        bad += a != b
+        lo = rnd.randint(1, 30)
+        hi = rnd.randint(lo, 39)
+        blk = [lo <= t <= hi for t in range(40)]
+        on, alive = d_run(m1r, blk, True, cands, cl_r, dwait=dw)
+        bad += any(lo <= t <= hi for t, *_ in on) + any(alive[t] for t in range(lo, hi + 1))
+        first = [t for t, *_ in on if t > hi]
+        if first:                                                # the first order after the release comes from a touch after it
+            t0 = first[0]
+            pre, _ = d_run(m1r[hi + 1:t0 + 1], [False] * (t0 - hi), False, cands, cl_r[hi + 1:t0 + 1], dwait=dw, prev0=m1r[hi][-1][2])
+            bad += (pre[:1] and pre[0][0] + hi + 1 != t0) or not pre
+    check("BM-13 random 1M series (300, Long + Short zones, D wait 3..30): lock OFF == no BEL (orders identical); ON: no order and no "
+          "wait alive on any blocked bar; the first order after the release equals what a run started after the release produces "
+          "(it depends on no state from the locked bars)", bad == 0, str(bad))
 
 
 def gate_mutation():
