@@ -51,8 +51,9 @@ def gate_static():
     st = git("status", "--porcelain").split("\n")
     mod = (set(git("diff", "--name-only", B, "--").split()) | {l[3:] for l in st if l.startswith("??")}) - UNTRACKED
     bad = sorted(m for m in mod if m != gb.PATH and m not in gb.NEW_TESTS and m not in __import__("uja_build").NEW_TESTS
+                 and m not in __import__("eua_build").NEW_TESTS
                  and not (m in gb.TEST_EDITS and gb.unadapt(m, raw(m)) == gb.show(B, m) and gb.unadapt(m, raw(m)) != raw(m))
-                 and not (m == __import__("uja_build").PATH and __import__("uja_build").unapply(m, raw(m)) == gb.show(B, m)))     # later UJA-1: exact
+                 and not (m in (__import__("uja_build").PATH, __import__("eua_build").PATH) and __import__("uja_build").unapply(m, raw(m)) == gb.show(B, m)))     # later UJA-1 / EUA-1: exact
     check("GA-02 vs 7667a88 only the GBPJPY Strategy, gja_build / gja_sim and the four test files of gja_build.TEST_EDITS change, each "
           "exactly (bel_build: GJA-1 reverted first; bel_sim: reads GBPJPY with GJA-1 reverted; cad_adapt / au_build: new-file lists)",
           not bad and gb.PATH in mod, str(bad))

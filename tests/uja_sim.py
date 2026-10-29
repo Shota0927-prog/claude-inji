@@ -47,11 +47,12 @@ def gate_static():
     check("UA-01 ZoneStrategyUSDJPY.pine == uja_build.build() and strips back to the 6b15093 file byte for byte (unapply too, "
           "idempotent); every other Pine file (the other seven Strategies incl. GBPJPY GJA-1, Visuals, Engines, harnesses) unchanged vs 6b15093",
           T == gb.build() and gb.strip(T) == T0 and gb.unapply(gb.PATH, T) == T0 and gb.unapply(gb.PATH, T0) == T0
-          and not [p for p in others if raw(p) != gb.show(B, p)])
+          and not [p for p in others if __import__("eua_build").unapply(p, raw(p)) != gb.show(B, p)])     # later EUA-1 reverted exactly
     st = git("status", "--porcelain").split("\n")
     mod = (set(git("diff", "--name-only", B, "--").split()) | {l[3:] for l in st if l.startswith("??")}) - UNTRACKED
-    bad = sorted(m for m in mod if m != gb.PATH and m not in gb.NEW_TESTS
-                 and not (m in gb.TEST_EDITS and gb.unadapt(m, raw(m)) == gb.show(B, m) and gb.unadapt(m, raw(m)) != raw(m)))
+    bad = sorted(m for m in mod if m != gb.PATH and m not in gb.NEW_TESTS and m not in __import__("eua_build").NEW_TESTS
+                 and not (m in gb.TEST_EDITS and gb.unadapt(m, raw(m)) == gb.show(B, m) and gb.unadapt(m, raw(m)) != raw(m))
+                 and not (m == __import__("eua_build").PATH and __import__("eua_build").unapply(m, raw(m)) == gb.show(B, m)))     # later EUA-1: exact
     check("UA-02 vs 6b15093 only the USDJPY Strategy, uja_build / uja_sim and the six test files of uja_build.TEST_EDITS change, each "
           "exactly (gja_build: UJA-1 reverted first; gja_sim: other files read with UJA-1 reverted; bel_sim / msl_sim / cad_adapt / au_build: "
           "new-file lists); "

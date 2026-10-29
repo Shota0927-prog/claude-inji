@@ -287,7 +287,9 @@ NEW_FILES = ("tests/au_build.py", "tests/au_sim.py", "tests/aur_sim.py", AUTO_PA
              # later layer GJA-1 (GBPJPY adopted defaults): its generator / fixture (the Pine file through gja_build.unapply)
              "tests/gja_build.py", "tests/gja_sim.py",
              # later layer UJA-1 (USDJPY adopted defaults): its generator / fixture (the Pine file through uja_build.unapply)
-             "tests/uja_build.py", "tests/uja_sim.py")
+             "tests/uja_build.py", "tests/uja_sim.py",
+             # later layer EUA-1 (EURUSD adopted defaults): its generator / fixture (the Pine file through eua_build.unapply)
+             "tests/eua_build.py", "tests/eua_sim.py")
 
 
 def ok(path):
