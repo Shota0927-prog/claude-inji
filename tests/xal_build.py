@@ -110,7 +110,7 @@ def ok(path):
         return True
     if path != LONG_PATH or not os.path.exists(os.path.join(ROOT, LONG_PATH)):
         return False
-    return open(os.path.join(ROOT, LONG_PATH), encoding="utf-8").read() == build()
+    return __import__("msl_build").unapply(LONG_PATH, open(os.path.join(ROOT, LONG_PATH), encoding="utf-8").read()) == build()   # later MSL-1: exact
 
 
 def _xa21():
@@ -159,7 +159,9 @@ def strip24(text):
 
 
 def strip23(text):
-    """reverse XA-24 when present (all or nothing) and XA-23 (-> the Long Strategy of d05f8c9); None when not exact."""
+    """reverse XA-24 when present (all or nothing) and XA-23 (-> the Long Strategy of d05f8c9); None when not exact.
+    The later MSL-1 layer (msl_build) is reverted first when present, exactly."""
+    text = __import__("msl_build").unapply(LONG_PATH, text)
     if text is not None and _xa24()[0][2] in text:
         text = strip24(text)
     return _revert(text, _xa23())

@@ -32,7 +32,7 @@ ROOT = xb.ROOT
 PREV = "7705907"                 # XA-23 (Strategies); the Engine of 0c6cd71 (version 2) is unchanged since
 ENG_PREV = "0c6cd71"
 AU_PREV = "dcbb1a2"              # the automation copy before XA-24 (AU-5; it did not exist at 7705907)
-raw = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
+raw = lambda p: __import__("msl_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read())   # later MSL-1 reverted exactly (pinned in msl_sim)
 E, S, L, A = raw(xb.ENG_PATH), raw(xb.STR_PATH), raw(xl.LONG_PATH), raw(ab.AUTO_PATH)
 E0 = xb.show(ENG_PREV, xb.ENG_PATH)
 S0, L0, A0 = xb.show(PREV, xb.STR_PATH), xb.show(PREV, xl.LONG_PATH), xb.show(AU_PREV, ab.AUTO_PATH)

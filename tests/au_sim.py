@@ -29,7 +29,7 @@ ROOT = ab.ROOT
 sys.path.insert(0, os.path.join(ROOT, "automation", "xau_short", "receiver"))
 import xau_receiver as xr        # noqa: E402
 
-raw = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
+raw = lambda p: __import__("msl_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read())   # later MSL-1 reverted exactly (pinned in msl_sim)
 code_only, func = es.code_only, es.func
 A, N = raw(ab.AUTO_PATH), raw(ab.SRC_PATH)
 RESULTS = []

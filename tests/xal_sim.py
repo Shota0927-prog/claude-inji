@@ -18,7 +18,7 @@ import xal_build as xl           # noqa: E402
 import eu_sim as es              # noqa: E402
 
 ROOT = xl.ROOT
-raw = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
+raw = lambda p: __import__("msl_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read())   # later MSL-1 reverted exactly (pinned in msl_sim)
 code_only, input_values, input_decls, func = es.code_only, es.input_values, es.input_decls, es.func
 RESULTS = []
 

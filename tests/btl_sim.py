@@ -19,7 +19,7 @@ import btl_build as bl           # noqa: E402
 import eu_sim as es              # noqa: E402
 
 ROOT = bl.ROOT
-raw = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
+raw = lambda p: __import__("msl_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read())   # later MSL-1 reverted exactly (pinned in msl_sim)
 code_only, input_values, input_decls = es.code_only, es.input_values, es.input_decls
 RESULTS = []
 

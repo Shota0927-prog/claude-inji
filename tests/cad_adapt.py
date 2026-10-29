@@ -27,7 +27,8 @@ LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src
              "tests/btl_build.py", "tests/btl_sim.py",                                       # new in the later layer BTL-1 (BTCUSD Long defaults)
              "tests/au_build.py", "tests/au_sim.py", "tests/aur_sim.py",                     # new in the later layer AU-1 (Gold Short automation)
              "tests/ea_model.py", "tests/eab_sim.py", "tests/eam_sim.py",                    # new in the later layer ST3-1 (Gold Short demo EA)
-             "tests/pf_model.py", "tests/pf_sim.py", "XAU_PERF_XA24_ja.md")                  # new in the later layer XA-24 (Gold run-time reduction)
+             "tests/pf_model.py", "tests/pf_sim.py", "XAU_PERF_XA24_ja.md",                  # new in the later layer XA-24 (Gold run-time reduction)
+             "tests/msl_build.py", "tests/msl_sim.py")                                       # new in the later layer MSL-1 (Max SL Distance filter)
 NEW_FILES = ("tests/cad_build.py", "tests/cad_adapt.py", "tests/cad_sim.py") + LATER_NEW
 _rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 
@@ -4426,3 +4427,4 @@ LATER = {'tests/btc_sim.py': [('ENGINE_PATH = "ZoneEnginePracticalGBPJPY.pine"\n
                        'def main():\n'
                        '    for g in (gate_static, gate_model, gate_mutation, gate_xa5, gate_xa6):\n'
                        '        try:\n')]}
+LATER["tests/xa_build.py"] = LATER["tests/xa_build.py"] + [__import__("msl_build").XA_HOOK]     # later layer MSL-1: its exact xa_build edit

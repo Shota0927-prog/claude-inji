@@ -279,7 +279,9 @@ NEW_FILES = ("tests/au_build.py", "tests/au_sim.py", "tests/aur_sim.py", AUTO_PA
              "automation/xau_short/bridge/bridge_config.example.json", "automation/xau_short/bridge/make_test_entry.py",
              "automation/xau_short/ea/XauShortDemoEA.mq5", "tests/ea_model.py", "tests/eab_sim.py", "tests/eam_sim.py",
              # later layer XA-24 (Gold run-time reduction): its new port / fixture (the Pine files are accepted through xa_build.unapply24)
-             "tests/pf_model.py", "tests/pf_sim.py", "XAU_PERF_XA24_ja.md")
+             "tests/pf_model.py", "tests/pf_sim.py", "XAU_PERF_XA24_ja.md",
+             # later layer MSL-1 (Max SL Distance filter): its generator / fixture (the Pine files are accepted through msl_build.unapply)
+             "tests/msl_build.py", "tests/msl_sim.py")
 
 
 def ok(path):

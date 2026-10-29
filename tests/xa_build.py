@@ -3237,3 +3237,18 @@ TEST_ADAPT = {'tests/bon_sim.py': [('ROOT = bb.ROOT\n'
                               'XA-1 Gold defaults stripped -> f253890 text (delta pinned by xa_sim)\n'
                               'CUR = __import__("bon_build").strip_bon(CUR) or CUR  # bonus defaults stripped -> '
                               '9270c50 text (delta pinned by bon_sim)\n')]}
+
+
+# ---- MSL-1 (later layer, tests/msl_build.py: Max SL Distance filter on every Strategy) ----------------------------------------
+#  the older fixtures' revert points also revert MSL-1 first (exactly; a text without it is unchanged): unapply24 (the innermost
+#  link of their layer chain) and strip_strategy23 (the head of the Gold Strategy strip chain; the MSL-1 edits are the same on
+#  the Gold Short / Long / automation copy). The functions above are unchanged.
+_unapply24_xa, _strip_strategy23_xa = unapply24, strip_strategy23
+
+
+def unapply24(path, text):
+    return _unapply24_xa(path, __import__("msl_build").unapply(path, text))
+
+
+def strip_strategy23(t):
+    return _strip_strategy23_xa(__import__("msl_build").unapply(STR_PATH, t))
