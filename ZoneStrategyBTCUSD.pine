@@ -1006,6 +1006,19 @@ stBEMode = input.string("Fixed Distance", "Breakeven Trigger Mode", options = ["
      "RR 方式 / TP 比率方式でも判断・注文更新は従来の確定 5分足処理 (Long は high / Short は low、等値で成立、次の足から有効)。")
 stBER = input.float(0.5, "Breakeven Trigger (R)", minval = 0.1, step = 0.1, group = G_STT)
 stBETp = input.float(0.5, "Breakeven Trigger (TP Ratio)", minval = 0.05, maxval = 1.0, step = 0.05, group = G_STT)
+// ---- BEL-1 建値決済後の新規 Entry ロック (初期 OFF = 従来どおり。生成: tests/bel_build.py) ----
+//  ON: 建値ストップで決済されたら、元のトレードの元 TP / 元 SL のどちらかに価格が届くまで新規 Entry (発注・待機準備・指値・
+//  仮 / 確定アラート / ラベル・Auto の ENTRY / PROV) を出さない。仮想ポジションは注文を出さず、保有中の管理には関与しない
+stBeLock = input.bool(false, "Lock New Entries After BE Until Original TP/SL", group = G_STT,
+     tooltip = "ON: 建値移動後のストップで決済されたとき、その元トレードの元 TP または元 SL に価格が届くまで新規 Entry を禁止する。\n" +
+     "建値移動前の決済・通常の TP / SL 決済ではロックしない。Breakeven Stop が OFF なら建値決済がないためロックしない。\n" +
+     "解除の判定は建値決済を確認した次の確定 5分足から (Long: 高値 >= 元 TP / 安値 <= 元 SL、Short: 安値 <= 元 TP / 高値 >= 元 SL)。\n" +
+     "解除した足はまだ禁止、その次の足から許可。日・週をまたいでも届くまで継続。OFF: 従来どおり。")
+var bool  stLkOn   = false     // BEL-1 ロック中 (ポジションがなくても維持)
+var int   stLkSide = 0         // 建値決済した元トレードの方向
+var float stLkSL   = na        // 元 SL (建値移動前の oSL。建値移動では変わらない値をコピー)
+var float stLkTP   = na        // 元 TP (約定確認時に確定した oTP)
+var int   stLkBar  = na        // 建値決済を確認した確定足 (この足の高値・安値は解除に使わない)
 var string G_STQ = "03 · Strategy Position Size (単利・損失予算)"
 stCapBase = input.float(300000.0, "元金基準額 (円)", minval = 0.0, step = 10000.0, group = G_STQ,
      tooltip = "単利: 損失予算はこの基準額 × 損失率で固定 (損益で増減しない)。strategy の初期資金とは別の入力。")
@@ -1762,6 +1775,11 @@ int stZones   = 0
 int stFvgZone = 0
 int stBoosted = 0
 if is5mChart and barstate.isconfirmed
+    // BEL-1: 前の確定足までに始まったロックは、この足の高値・安値が元 TP / 元 SL に届いたら解除 (同じ足で両方でも解除のみ。
+    //   到達順は推測しない)。解除した足はまだ禁止 (stLkBlk)、次の足から新規 Entry 可。OFF では stLkOn が true にならない
+    bool stLkBlk = stLkOn
+    if stLkOn and bar_index > stLkBar and (stLkSide == 1 ? (high >= stLkTP or low <= stLkSL) : (low <= stLkTP or high >= stLkSL))
+        stLkOn := false
     // (1) 発注済み Entry の約定 / 決済を確認する
     bool fillNow = false
     if oState == 1
@@ -1793,6 +1811,18 @@ if is5mChart and barstate.isconfirmed
             strategy.cancel(oXid)
             oState := 0
     else if oState >= 2 and strategy.opentrades == 0
+        // BEL-1: 建値ストップによる決済だけロックを始める (この足から禁止)。建値移動済み (oBE) の保有が、この Entry の SL/TP 注文
+        //   (exit_id = oXid。strategy.close ではない) で、TP の手前 (= stop 側。TP の指値は TP 以上でしか約定しない) で決済されたこと
+        //   で識別する (損益の大きさでは判定しない)。元 SL / 元 TP が不明なら監視できないためロックしない
+        if stBeLock and oBE and oState == 2 and not na(oSL) and not na(oTP) and strategy.closedtrades > oClosed
+            int lkC = strategy.closedtrades - 1
+            if strategy.closedtrades.entry_id(lkC) == oEid and strategy.closedtrades.exit_id(lkC) == oXid and oSide * (strategy.closedtrades.exit_price(lkC) - oTP) < 0
+                stLkOn   := true
+                stLkSide := oSide
+                stLkSL   := oSL
+                stLkTP   := oTP
+                stLkBar  := bar_index
+                stLkBlk  := true
         oState := 0
 
     // (2) Zone の走査 (1 回): 候補一覧、Track の State、保留中の指値の有効性、TP 用の反対側 Zone 端
@@ -2011,7 +2041,7 @@ if is5mChart and barstate.isconfirmed
             bool priceOK = pwSide == 1 ? (close > pwSL0 and close < pwP0) : (close < pwSL0 and close > pwP0)
             bool bodyOK  = not stSatsBody or (pwSide == 1 ? close > open : close < open)
             bool mtfOK   = not (pwSide == 1 ? satSkipL : satSkipS)
-            if (rebA or rebB) and bodyOK and mtfOK and priceOK and stSessOK and oState == 0
+            if (rebA or rebB) and bodyOK and mtfOK and priceOK and stSessOK and oState == 0 and not stLkBlk     // BEL-1
                 float q = f_stQty(pwSide, close, pwSL0)
                 if not na(q) and f_stSlOK(close, pwSL0)     // MSL-1
                     oSeq    += 1
@@ -2054,7 +2084,7 @@ if is5mChart and barstate.isconfirmed
                     pwTouchBar := na
 
     // (4) 新規 Entry (注文が無く、取消をした足でなく、時間帯の中のときだけ)
-    if oState == 0 and not cancelBar and stSessOK
+    if oState == 0 and not cancelBar and stSessOK and not stLkBlk     // BEL-1
         array<StCand> src = stModeA ? cur : stModeD ? dSrc : stPrev
         int   bkL = -1
         int   bkS = -1
@@ -2313,7 +2343,7 @@ plotshape(stSats and pwEv < 0,  "SATS · 取消", style = shape.xcross, location
 //  ・1 本の 5分足につき最大 1 回 (varip stProvBar。確定アラートとは別の状態)。送信後は同じ足で再評価しない
 varip int stProvBar = na
 //  仮評価は仮アラート (未送信の足だけ) か仮ラベルが要るときに 1 回。アラートの条件・頻度・重複防止は従来どおり
-bool  stPvGate = is5mChart and not barstate.isconfirmed and oState == 0 and stSessOK
+bool  stPvGate = is5mChart and not barstate.isconfirmed and oState == 0 and stSessOK and not stLkOn     // BEL-1
 bool  stPvA    = stAlertProv and stPvGate and (na(stProvBar) or stProvBar != bar_index)
 bool  stPvL    = stLblProv and stPvGate
 int   pSide    = 0

@@ -143,6 +143,7 @@ def strip(path, text):
 
 def unapply(path, text):
     """reverse MSL-1 when present (all or nothing): unchanged without it (or for other paths), None with only part of it."""
+    text = __import__("bel_build").unapply(path, text)     # the later BEL-1 layer is reverted first, exactly
     if text is None or path not in CFG or (MARK not in text and "f_stSlOK(" not in text):
         return text
     return strip(path, text)

@@ -31,7 +31,7 @@ ROOT = mb.ROOT
 B = mb.BASE_REV
 raw = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 code_only, input_decls, input_values = es.code_only, es.input_decls, es.input_values
-CUR = {p: raw(p) for p in mb.FILES}
+CUR = {p: __import__("bel_build").unapply(p, raw(p)) for p in mb.FILES}     # the later BEL-1 layer reverted exactly (pinned in bel_sim)
 OLD = {p: mb.show(B, p) for p in mb.FILES}
 RESULTS = []
 NEW_INPUTS = ("stMaxSlOn", "stMaxSl")
@@ -140,8 +140,8 @@ def gate_static():
     st = git("status", "--porcelain").split("\n")
     mod = set(git("diff", "--name-only", B, "--").split()) | {l[3:] for l in st if l.startswith("??")}
     mod -= {"tests/__pycache__/"}
-    bad = sorted(m for m in mod if m not in mb.FILES and m not in mb.NEW_TESTS
-                 and not (m in TEST_EDITS and revert(raw(m), TEST_EDITS[m]) == mb.show(B, m)))
+    bad = sorted(m for m in mod if m not in mb.FILES and m not in mb.NEW_TESTS and m not in __import__("bel_build").NEW_TESTS
+                 and not (m in TEST_EDITS and revert(__import__("bel_build").unadapt(m, raw(m)), TEST_EDITS[m]) == mb.show(B, m)))
     check("MS-02 vs a31e934 only the eight Strategies, the new msl_build / msl_sim and the listed test files change; each test file by "
           "exactly its recorded edit (xa_build: the appended MSL-1 hook, = cad_adapt LATER; cad_adapt / au_build: the new-file lists; "
           "xal_build / au / btl / pf / xac / xal sims: the later-layer revert)",
