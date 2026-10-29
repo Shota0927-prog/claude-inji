@@ -141,6 +141,7 @@ def gate_static():
     mod = set(git("diff", "--name-only", B, "--").split()) | {l[3:] for l in st if l.startswith("??")}
     mod -= {"tests/__pycache__/"}
     bad = sorted(m for m in mod if m not in mb.FILES and m not in mb.NEW_TESTS and m not in __import__("bel_build").NEW_TESTS
+                 and m not in __import__("gja_build").NEW_TESTS
                  and not (m in TEST_EDITS and revert(__import__("bel_build").unadapt(m, raw(m)), TEST_EDITS[m]) == mb.show(B, m)))
     check("MS-02 vs a31e934 only the eight Strategies, the new msl_build / msl_sim and the listed test files change; each test file by "
           "exactly its recorded edit (xa_build: the appended MSL-1 hook, = cad_adapt LATER; cad_adapt / au_build: the new-file lists; "

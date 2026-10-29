@@ -138,6 +138,7 @@ def strip(path, text):
 
 def unapply(path, text):
     """reverse BEL-1 when present (all or nothing): unchanged without it (or for other paths), None with only part of it."""
+    text = __import__("gja_build").unapply(path, text)     # the later GJA-1 layer (GBPJPY adopted defaults) is reverted first, exactly
     if text is None or path not in FILES or (MARK not in text and "stLkBlk" not in text):
         return text
     return strip(path, text)
@@ -170,6 +171,7 @@ TEST_EDITS = {
 
 def unadapt(path, text):
     """a test file with its BEL-1 edits reverted (all or nothing; unchanged without them)."""
+    text = __import__("gja_build").unadapt(path, text)     # the later GJA-1 test edits are reverted first, exactly
     pairs = TEST_EDITS.get(path, [])
     if text is None or not pairs or all(text.count(b) == 0 for _, b in pairs):
         return text

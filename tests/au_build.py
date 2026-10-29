@@ -283,7 +283,9 @@ NEW_FILES = ("tests/au_build.py", "tests/au_sim.py", "tests/aur_sim.py", AUTO_PA
              # later layer MSL-1 (Max SL Distance filter): its generator / fixture (the Pine files are accepted through msl_build.unapply)
              "tests/msl_build.py", "tests/msl_sim.py",
              # later layer BEL-1 (breakeven exit lock): its generator / fixture (the Pine files through bel_build.unapply)
-             "tests/bel_build.py", "tests/bel_sim.py")
+             "tests/bel_build.py", "tests/bel_sim.py",
+             # later layer GJA-1 (GBPJPY adopted defaults): its generator / fixture (the Pine file through gja_build.unapply)
+             "tests/gja_build.py", "tests/gja_sim.py")
 
 
 def ok(path):
