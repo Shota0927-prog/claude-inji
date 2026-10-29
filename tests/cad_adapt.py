@@ -30,7 +30,8 @@ LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src
              "tests/pf_model.py", "tests/pf_sim.py", "XAU_PERF_XA24_ja.md",                  # new in the later layer XA-24 (Gold run-time reduction)
              "tests/msl_build.py", "tests/msl_sim.py",                                       # new in the later layer MSL-1 (Max SL Distance filter)
              "tests/bel_build.py", "tests/bel_sim.py",                                       # new in the later layer BEL-1 (breakeven exit lock)
-             "tests/gja_build.py", "tests/gja_sim.py")                                       # new in the later layer GJA-1 (GBPJPY adopted defaults)
+             "tests/gja_build.py", "tests/gja_sim.py",                                       # new in the later layer GJA-1 (GBPJPY adopted defaults)
+             "tests/uja_build.py", "tests/uja_sim.py")                                       # new in the later layer UJA-1 (USDJPY adopted defaults)
 NEW_FILES = ("tests/cad_build.py", "tests/cad_adapt.py", "tests/cad_sim.py") + LATER_NEW
 _rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 

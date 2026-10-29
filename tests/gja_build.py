@@ -78,6 +78,7 @@ def strip(text):
 
 def unapply(path, text):
     """reverse GJA-1 when present (all or nothing): unchanged without it (or for other paths), None with only part of it."""
+    text = __import__("uja_build").unapply(path, text)     # the later UJA-1 layer (USDJPY adopted defaults) is reverted first, exactly
     if text is None or path != PATH or HDR_NEW.split("\n")[1] not in text:
         return text
     return strip(text)
@@ -117,6 +118,7 @@ TEST_EDITS = {
 
 def unadapt(path, text):
     """a test file with its GJA-1 edits reverted (all or nothing; unchanged without them)."""
+    text = __import__("uja_build").unadapt(path, text)     # the later UJA-1 test edits are reverted first, exactly
     pairs = TEST_EDITS.get(path, [])
     if text is None or not pairs or all(text.count(b) == 0 for _, b in pairs):
         return text

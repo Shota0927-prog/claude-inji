@@ -87,6 +87,7 @@ def gate_static():
     mod = set(git("diff", "--name-only", B, "--").split()) | {l[3:] for l in st if l.startswith("??")}
     mod -= {"tests/__pycache__/", "ZoneStrategyUSDJPY_Diagnostic.pine", "tests/stjd_build.py", "tests/stjd_sim.py"}   # untracked, not ours
     bad = sorted(m for m in mod if m not in bb.FILES and m not in bb.NEW_TESTS and m not in __import__("gja_build").NEW_TESTS
+                 and m not in __import__("uja_build").NEW_TESTS
                  and not (m in bb.TEST_EDITS and bb.unadapt(m, raw(m)) == bb.show(B, m) and bb.unadapt(m, raw(m)) != raw(m)))
     check("BS-02 vs 7f74b04 only the eight Strategies, bel_build / bel_sim and the four test files of bel_build.TEST_EDITS change "
           "(msl_build: BEL-1 reverted first; msl_sim: reads with BEL-1 reverted; cad_adapt / au_build: new-file lists), each exactly",

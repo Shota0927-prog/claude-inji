@@ -285,7 +285,9 @@ NEW_FILES = ("tests/au_build.py", "tests/au_sim.py", "tests/aur_sim.py", AUTO_PA
              # later layer BEL-1 (breakeven exit lock): its generator / fixture (the Pine files through bel_build.unapply)
              "tests/bel_build.py", "tests/bel_sim.py",
              # later layer GJA-1 (GBPJPY adopted defaults): its generator / fixture (the Pine file through gja_build.unapply)
-             "tests/gja_build.py", "tests/gja_sim.py")
+             "tests/gja_build.py", "tests/gja_sim.py",
+             # later layer UJA-1 (USDJPY adopted defaults): its generator / fixture (the Pine file through uja_build.unapply)
+             "tests/uja_build.py", "tests/uja_sim.py")
 
 
 def ok(path):
