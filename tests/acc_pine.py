@@ -26,7 +26,7 @@ PINE = os.path.join(ROOT, "AccumStrategyXAU.pine")
 LOGIC_BEGIN, LOGIC_END = "// ==== ACC Logic (begin) ", "// ==== ACC Logic (end) "
 
 NAMESPACES = {"strategy", "array", "math", "str", "label", "line", "color", "barstate", "syminfo", "timeframe",
-              "xloc", "size", "plot", "display", "barmerge", "ta", "request", "input"}
+              "xloc", "size", "plot", "display", "barmerge", "ta", "request", "input", "runtime"}
 TYPE_WORDS = {"float", "int", "bool", "string", "color", "line", "label", "box"}
 
 
@@ -336,7 +336,7 @@ class Translator:
                     raise SyntaxError("var outside the global scope is outside the subset: " + s)
                 self.emit(plvl, "if __first__:")
                 self.emit(plvl + 1, f"{name} = {expr(e)}")
-                self.emit(plvl, f"_VARS.add({name!r})")
+                self.emit(plvl, f"{'_VARIPS' if var == 'varip' else '_VARS'}.add({name!r})")
             else:
                 self.emit(plvl, f"{name} = {expr(e)}")
             if last_in_func:
@@ -406,6 +406,14 @@ def inputs(src=None):
 # ============================================================================
 class PineRuntimeError(Exception):
     pass
+
+
+class PineScriptStopped(Exception):
+    """runtime.error() called by the script."""
+
+
+def _runtime_error(msg):
+    raise PineScriptStopped(msg)
 
 
 class _UDT:
@@ -569,7 +577,7 @@ def make_env(broker, draw_log):
         color__new=lambda c, t=0: (c, t), color__teal="teal", color__orange="orange", color__fuchsia="fuchsia",
         color__gray="gray", color__green="green", color__red="red", color__white="white",
         xloc__bar_time="bar_time", size__small="small",
-        strategy__long=1, strategy__short=-1,
+        strategy__long=1, strategy__short=-1, runtime__error=_runtime_error,
         strategy__entry=broker.entry, strategy__exit=broker.exit, strategy__close=broker.close,
         strategy__cancel=broker.cancel, strategy__convert_to_symbol=broker.convert_to_symbol,
         strategy__opentrades__entry_id=broker.ot_entry_id, strategy__opentrades__entry_price=broker.ot_entry_price,
@@ -592,7 +600,8 @@ class Broker:
         inside a segment at its own price
       * historical bar path: open -> high -> low -> close when the high is nearer the open, else open -> low -> high
         -> close; ticks: the given tick prices in order
-      * at one price point: pending market orders first, then exits"""
+      * at one price point: pending market orders first, then exits; an exit changed by an execution at the previous point
+        and already passed there fills at that point's price"""
 
     def __init__(self, usdjpy=150.0, pointvalue=1.0):
         self.usdjpy, self.pointvalue = usdjpy, pointvalue
@@ -709,15 +718,21 @@ class Broker:
                     self._close_trade(tr, hit, xid)
                     break
 
+    def point(self, p, prev=None):
+        """one price point: pending market orders fill here, then exits (prev None = gap check at the point, else the segment
+        prev -> p). Returns the number of fills at this point."""
+        n0 = sum(1 for e in self.log if e[0] in ("fill_entry", "fill_exit"))
+        self._market(p)
+        if prev is not None:
+            self._exits_at(prev)          # orders changed by an execution at the previous point: already through -> fill there
+        self._exits_at(p, prev)
+        return sum(1 for e in self.log if e[0] in ("fill_entry", "fill_exit")) - n0
+
     def run_points(self, points):
-        """points: price points of one bar / tick group; the first one also executes pending market orders."""
+        """points: price points of one bar / tick group."""
         prev = None
-        for k, p in enumerate(points):
-            if k == 0:
-                self._market(p)
-                self._exits_at(p)
-            else:
-                self._exits_at(p, prev)
+        for p in points:
+            self.point(p, prev)
             prev = p
 
     @staticmethod
@@ -735,7 +750,12 @@ class Runner:
     """bars: dicts with t (open time ms), o, h, l, c, feed = {1: (u, l, id, acc), 2: ..., 3: ...} (missing = na),
     optional ticks = [prices] (realtime mode for that bar; the last tick must equal c)."""
 
-    def __init__(self, overrides=None, usdjpy=150.0, src=None):
+    def __init__(self, overrides=None, usdjpy=150.0, src=None, recalc_fills=False, recalc_confirmed=True, varip_rollback=False):
+        """recalc_fills: emulate the Properties setting "Recalculate: After order is filled" (calc_on_order_fills = true): one
+        extra execution after every price point with a fill. On historical bars it sees the bar's FINAL values (the documented
+        lookahead) with barstate.isconfirmed = recalc_confirmed (not documented; True = worst case); on ticks the tick's values.
+        var state is rolled back before every execution of a bar; varip too only when varip_rollback (not documented)."""
+        self.recalc_fills, self.recalc_confirmed, self.varip_rollback = recalc_fills, recalc_confirmed, varip_rollback
         self.src = src if src is not None else read_source()
         self.code = compile(transpile(self.src), "<AccumStrategyXAU logic>", "exec")
         self.inp = inputs(self.src)
@@ -748,14 +768,17 @@ class Runner:
         self.env = make_env(self.broker, self.draws)
         self.env.update(self.inp)
         self.env["_VARS"] = set()
+        self.env["_VARIPS"] = set()
+        self.varip_bar_start = None
         self.env["__first__"] = True
         self.bar_index = -1
         self.prev_close = None
         self.committed = None
         self.trace = []
 
-    def _set_series(self, b, o, h, l, c, confirmed):
+    def _set_series(self, b, o, h, l, c, confirmed, history=True):
         e = self.env
+        e["barstate__ishistory"] = history
         e.update(open=o, high=h, low=l, close=c, time=b["t"], time_close=b["t"] + M5, bar_index=self.bar_index,
                  barstate__isconfirmed=confirmed, is5mChart=True, acPrevClose=self.prev_close,
                  syminfo__pointvalue=self.broker.pointvalue,
@@ -773,24 +796,44 @@ class Runner:
     def _snapshot(self):
         return {k: copy.deepcopy(self.env[k]) for k in self.env["_VARS"]}
 
+    def _rollback(self):
+        if self.committed is not None:
+            for k, v in self.committed.items():
+                self.env[k] = copy.deepcopy(v)
+        if self.varip_rollback and self.varip_bar_start is not None:
+            for k, v in self.varip_bar_start.items():
+                self.env[k] = copy.deepcopy(v)
+
     def step(self, b):
         self.bar_index += 1
         self.broker.bar = self.bar_index
+        self.varip_bar_start = {k: copy.deepcopy(self.env[k]) for k in self.env["_VARIPS"]}
         ticks = b.get("ticks")
         if ticks is None:
-            self.broker.run_points(Broker.bar_path(b["o"], b["h"], b["l"], b["c"]))
+            prev = None
+            for p in Broker.bar_path(b["o"], b["h"], b["l"], b["c"]):
+                n = self.broker.point(p, prev)
+                prev = p
+                if n and self.recalc_fills:
+                    self._rollback()
+                    self._set_series(b, b["o"], b["h"], b["l"], b["c"], self.recalc_confirmed)
+                    self._exec()
+            self._rollback()
             self._set_series(b, b["o"], b["h"], b["l"], b["c"], True)
             self._exec()
         else:
             assert ticks[0] == b["o"] and ticks[-1] == b["c"] and max(ticks) == b["h"] and min(ticks) == b["l"]
             hi = lo = ticks[0]
             for n, p in enumerate(ticks):
-                if self.committed is not None:
-                    for k, v in self.committed.items():
-                        self.env[k] = copy.deepcopy(v)
-                self.broker.run_points([p] if n == 0 else [p])   # each tick: market orders then exits at the tick price
+                nf = self.broker.point(p)                         # each tick: market orders then exits at the tick price
                 hi, lo = max(hi, p), min(lo, p)
-                self._set_series(b, ticks[0], hi, lo, p, n == len(ticks) - 1)
+                last = n == len(ticks) - 1
+                if nf and self.recalc_fills and not last:
+                    self._rollback()
+                    self._set_series(b, ticks[0], hi, lo, p, False, history=False)
+                    self._exec()
+                self._rollback()
+                self._set_series(b, ticks[0], hi, lo, p, last, history=False)
                 self._exec()
         self.committed = self._snapshot()
         self.prev_close = b["c"]

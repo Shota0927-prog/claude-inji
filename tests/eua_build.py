@@ -131,6 +131,7 @@ TEST_EDITS = {
 
 def unadapt(path, text):
     """a test file with its EUA-1 edits reverted (all or nothing; unchanged without them)."""
+    text = __import__("acc_build").unadapt(path, text)     # the later ACC-1 test edits are reverted first, exactly
     pairs = TEST_EDITS.get(path, [])
     if text is None or not pairs or all(text.count(b) == 0 for _, b in pairs):
         return text

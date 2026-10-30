@@ -75,7 +75,7 @@ def enclosing_ifs(lines, i):
 
 
 def gate_static():
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in bb.FILES and p != "ZoneStrategyUSDJPY_Diagnostic.pine"]   # untracked, not ours
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p not in bb.FILES and p != "ZoneStrategyUSDJPY_Diagnostic.pine"]   # untracked, not ours
     others += [os.path.join("automation/xau_short/pine", p) for p in os.listdir(os.path.join(ROOT, "automation/xau_short/pine"))
                if os.path.join("automation/xau_short/pine", p) not in bb.FILES]
     check("BS-01 the eight Strategies == bel_build.build() and strip back to the 7f74b04 files byte for byte (unapply too, idempotent "
@@ -88,7 +88,9 @@ def gate_static():
     mod -= {"tests/__pycache__/", "ZoneStrategyUSDJPY_Diagnostic.pine", "tests/stjd_build.py", "tests/stjd_sim.py"}   # untracked, not ours
     bad = sorted(m for m in mod if m not in bb.FILES and m not in bb.NEW_TESTS and m not in __import__("gja_build").NEW_TESTS
                  and m not in __import__("uja_build").NEW_TESTS and m not in __import__("eua_build").NEW_TESTS
-                 and not (m in bb.TEST_EDITS and bb.unadapt(m, raw(m)) == bb.show(B, m) and bb.unadapt(m, raw(m)) != raw(m)))
+                 and m not in __import__("acc_build").NEW_FILES     # ACC-1 new files
+                 and not (m in bb.TEST_EDITS and bb.unadapt(m, raw(m)) == bb.show(B, m) and bb.unadapt(m, raw(m)) != raw(m))
+                 and not (m in __import__("acc_build").TEST_EDITS and __import__("acc_build").unadapt(m, raw(m)) == bb.show(B, m) and __import__("acc_build").unadapt(m, raw(m)) != raw(m)))     # ACC-1 test edits: exact
     check("BS-02 vs 7f74b04 only the eight Strategies, bel_build / bel_sim and the four test files of bel_build.TEST_EDITS change "
           "(msl_build: BEL-1 reverted first; msl_sim: reads with BEL-1 reverted; cad_adapt / au_build: new-file lists), each exactly",
           not bad and set(bb.FILES) <= mod, str(bad))

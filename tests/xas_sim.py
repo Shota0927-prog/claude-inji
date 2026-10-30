@@ -126,7 +126,7 @@ def gate_static():
           and "pwEndT   := time_close" in p and "f_stTp" not in f and "oTP   := oTP0" in f and "strategy.close(oEid)" in f
           and "riskS > 0 and rewS > 0" in f and code_only(S).count("map.put(stUsed") == code_only(S0).count("map.put(stUsed"))
     keep = ("f_stQty(int side, float ref, float sl) =>", "f_stTp(", "f_stZoneEval(zn.Zone z) =>", "f_stAdopt(")
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and not __import__("xal_build").ok(p)]
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p != xb.STR_PATH and not __import__("xal_build").ok(p)]
     check("XW-08 unchanged: f_stQty / f_stTp / zone evaluation / adoption functions, strategy() options, the Zone / FVG / Break "
           "feed code before the Strategy part, every other Pine file (Engine, Visual, other symbols)",
           all(func(S, h) == func(S0, h) for h in keep) and seg(S, "strategy(", "import ") == seg(S0, "strategy(", "import ")
@@ -1114,7 +1114,7 @@ def gate_xa13():
           and all(i13[k] == v for k, v in i12.items())
           and [l for l in cs if l in code_only(S12).split("\n") or l.strip() in [x.strip() for x in code_only(S12).split("\n")]]
               == ["if (rebA or rebB) and bodyOK and priceOK and stSessOK and oState == 0"]
-          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and not __import__("xal_build").ok(p) and rd(p) != xb.show("f9fa0f9", p)],
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p != xb.STR_PATH and not __import__("xal_build").ok(p) and rd(p) != xb.show("f9fa0f9", p)],
           "\n".join(cs))
     reqs = re.findall(r'^int (satTf\w+)\s*= request\.security\(syminfo\.tickerid, "(\w+)",\s*f_satTfState\(\), lookahead = barmerge\.lookahead_on\)$',
                       S13, re.M)
@@ -1281,7 +1281,7 @@ def gate_xa14():
           "(strip_strategy13 gives f9fa0f9); Engine / Visual / other Pine files unchanged",
           xb.build_strategy14() == S14 and xb.strip_strategy14(S14) == S13 and xb.build_strategy13() == S13
           and xb.strip_strategy13(S14) == xb.show("f9fa0f9", xb.STR_PATH)
-          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and not __import__("xal_build").ok(p) and rd(p) != xb.show("e5bba44", p)])
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p != xb.STR_PATH and not __import__("xal_build").ok(p) and rd(p) != xb.show("e5bba44", p)])
     check("XJ-02 defaults: exactly 4H false -> true and 1H false -> true (D / 15m / 5m stay false, still inputs); every other "
           "default unchanged (SATS Pullback, Retest Confirmed, Entry C, Short Only, 240, body ON, near ON / 1.0, SL Buffer 1.5, "
           "opposite TP OFF, RR 1.5, BE ON / 15, 300,000 x 3 %)",
@@ -1360,7 +1360,7 @@ def gate_xa15():
           and es.kw(decl["stBER"], "minval") == "0.1" and es.kw(decl["stBER"], "step") == "0.1"
           and es.kw(decl["stBETp"], "minval") == "0.05" and es.kw(decl["stBETp"], "maxval") == "1.0" and es.kw(decl["stBETp"], "step") == "0.05"
           and all(i15[k] == v for k, v in i14.items()) and i15["stBE"] == "true" and i15["stBEDist"] == "15.0"
-          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and not __import__("xal_build").ok(p) and rd(p) != xb.show("e2cf617", p)])
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p != xb.STR_PATH and not __import__("xal_build").ok(p) and rd(p) != xb.show("e2cf617", p)])
     be14 = block(S14, "    if stBE and oState == 2 and not oBE\n", "    // (2d)")
     be15 = block(S15, "    if stBE and oState == 2 and not oBE\n", "    // (2d)")
     fb = func(S15, "f_beTrig(int side, float fillPx, float sl, float tp) =>")
@@ -1503,7 +1503,7 @@ def gate_xa16():
           xb.build_strategy16() == S16 and xb.strip_strategy16(S16) == S15 and xb.build_strategy15() == S15
           and new == {"stSatsNow": "false", "stSatsNowN": "1"} and es.kw(decl["stSatsNowN"], "minval") == "0"
           and es.kw(decl["stSatsNowN"], "step") == "1" and all(i16[k] == v for k, v in i15.items())
-          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and not __import__("xal_build").ok(p)
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p != xb.STR_PATH and not __import__("xal_build").ok(p)
                    and __import__("sx2_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read()) != xb.show("b59d621", p)]     # raw files (SX-1 included)
           and [l for l in es.changed_code(S15, S16) if l and l in [x.strip() for x in code_only(S15).split("\n")]
                and l not in [x.strip() for x in code_only(S16).split("\n")]]
@@ -1656,7 +1656,7 @@ def gate_xa17():
           and new == {"stSatsTq": "false", "stSatsTqN": "1"} and i17["stSatsNowN"] == "1" and '"SATS · 即時側：接触からの有効本数"' in d17["stSatsNowN"]
           and es.kw(d17["stSatsTqN"], "minval") == "0" and es.kw(d17["stSatsTqN"], "step") == "1"
           and all(i17[k] == v for k, v in i16.items())
-          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and not __import__("xal_build").ok(p)
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p != xb.STR_PATH and not __import__("xal_build").ok(p)
                    and __import__("sx2_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read()) != xb.show("4c56095", p)])
     fh = func(S17, "f_satHist(int side, float L, int q) =>")
     wb = block(S17, "    bool  pwCancelBar = false\n", "    // (4) 新規 Entry")
@@ -1806,7 +1806,7 @@ def gate_xa18():
           and sorted(l for l in es.changed_code(S17, S18) if l) == sorted(["int  qUse  = rA ? bar_index : q",
                                                                           "int  qUse  = live ? q : bar_index     // XA-18: 保持中の q を優先 (A の再接触でも延長しない)"])
           and "    int  qUse  = live ? q : bar_index" in fh and input_values(S18) == input_values(S17)
-          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and not __import__("xal_build").ok(p)
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p != xb.STR_PATH and not __import__("xal_build").ok(p)
                    and __import__("sx2_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read()) != xb.show("9bf191c", p)])
     # request scenario (N = 1, body ON): bar 1 (= 10) touch with the wrong body, bar 2 (= 11) re-touch + A, Zone at bar 3 (= 12)
     L = [2605.0] * 4
@@ -1870,7 +1870,7 @@ def gate_xa19():
           and '"SATS · 即時側：接触→反発の有効本数"' in d19["stSatsNowC"] and '"SATS · 即時側：反発→Zoneの有効本数"' in d19["stSatsNowN"]
           and '"SATS · 引きつけ側：接触→反発の有効本数"' in d19["stSatsTqN"]
           and all(es.kw(d19[k], "minval") == "0" and es.kw(d19[k], "step") == "1" for k in ("stSatsNowC", "stSatsNowN", "stSatsTqN"))
-          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and not __import__("xal_build").ok(p)
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p != xb.STR_PATH and not __import__("xal_build").ok(p)
                    and __import__("sx2_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read()) != xb.show("b7f0036", p)])
     nb = block(S19, "                bool nowGo = false\n", "                if not skipRef and not na(pQty) and pwState == 0 and not pwCancelBar and not nowGo\n")
     wb19 = code_only(block(S19, "    bool  pwCancelBar = false\n", "    // (4) 新規 Entry"))
@@ -1964,7 +1964,7 @@ def gate_xa20():
           "(strip_strategy19 gives b7f0036); Engine / Visual / other symbols unchanged",
           xb.build_strategy20() == S20 and xb.strip_strategy20(S20) == S19 and xb.build_strategy19() == S19
           and xb.strip_strategy19(S20) == xb.show("b7f0036", xb.STR_PATH)
-          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != xb.STR_PATH and not __import__("xal_build").ok(p)
+          and not [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p != xb.STR_PATH and not __import__("xal_build").ok(p)
                    and __import__("btl_build").unapply(p, open(os.path.join(ROOT, p), encoding="utf-8").read()) != xb.show("5f2c8a5", p)])   # later BTL-1 reverted exactly
     check("XD-02 adopted Gold Short table on the delivered file (wait 240, line ON, body ON, near ON / 1.0, filter D OFF / 4H ON / 1H ON / "
           "15m OFF / 5m OFF, immediate ON, Nc 1, Nz 1, pull expiry OFF / 1); the only changed default is stSatsNow false -> true; every "

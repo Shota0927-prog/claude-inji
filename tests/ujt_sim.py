@@ -192,7 +192,7 @@ def gate_static():
           and all(fr.lint_eager_guards(code_only(t)) == [] for t in (S,)))
     mod = set(git("diff", "--name-only", UJ3, "--").split()) | {l[3:] for l in git("status", "--porcelain").split("\n") if l.startswith("??")}
     mod -= {"tests/__pycache__/"}
-    mod = {m for m in mod if not __import__("cad_adapt").ok(m, UJ3) and not __import__("xal_build").ok(m)}     # CAD-1 / XL-1: exact
+    mod = {m for m in mod if not __import__("cad_adapt").ok(m, UJ3) and not __import__("xal_build").ok(m) and not __import__("acc_build").ok(m)}     # CAD-1 / XL-1: exact
     recs_ok = []
     for key, pairs in UJ4_TEST_EDITS.items():
         path = key.split(" ")[0]
@@ -205,7 +205,7 @@ def gate_static():
             if s is None:
                 break
         recs_ok.append(s == new)
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != ub.STR_PATH and not __import__("xal_build").ok(p)]
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p != ub.STR_PATH and not __import__("xal_build").ok(p)]
     check("UT-05 vs ab9820f only the USDJPY Strategy, uj_build, uj3_adapt (record regenerated; code part by exactly the recorded "
           "edits), ujl_sim (exactly the recorded edits: runs on the UJ-3 layer) and this new fixture change; every other Pine "
           "file byte-identical", mod <= {ub.STR_PATH, "tests/uj_build.py", "tests/uj3_adapt.py", "tests/ujl_sim.py", "tests/ujt_sim.py"}

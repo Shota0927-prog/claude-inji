@@ -69,7 +69,7 @@ def gate_static():
           S == xb.build_strategy() and L == xl.build() and A == ab.build() and xb.strip_strategy24(S) == S0
           and xl.strip24(L) == L0 and ab.strip(A) == S and title(xb.unapply24(ab.AUTO_PATH, A)) == A0)
     others = [p for p in os.popen(f"git -C {ROOT} ls-files '*.pine'").read().split()
-              if p not in (xb.ENG_PATH, xb.STR_PATH, xl.LONG_PATH, ab.AUTO_PATH)]
+              if p not in (xb.ENG_PATH, xb.STR_PATH, xl.LONG_PATH, ab.AUTO_PATH) and not __import__("acc_build").ok(p)]     # ACC-1 new files: exact
     changed = [p for p in others if __import__("btl_build").unapply(p, raw(p)) != xb.show(PREV, p)]
     check("PS-03 every other Pine file (Visual, other Engines / Strategies) unchanged vs %s (BTL-1 reverted exactly)" % PREV,
           not changed, str(changed))

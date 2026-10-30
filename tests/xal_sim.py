@@ -38,7 +38,7 @@ CHANGED = {"thrStrong", "stMode", "stDir", "stBuffer", "stSatsWait", "stSatsNear
 def main_checks():
     L, S = raw(xl.LONG_PATH), raw(xl.SRC_PATH)
     S0 = xl.show(xl.SRC_REV, xl.SRC_PATH)
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xl.LONG_PATH,)]
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p not in (xl.LONG_PATH,)]     # ACC-1 new files: exact
     check("XLL-01 the delivered ZoneStrategyXAULong.pine == xal_build.build() and strips back to the Short Strategy of 2550d27 byte for "
           "byte (XA-21 reverted: the XL-1 Long file of d67941f); the Short file ZoneStrategyXAU.pine is that same file plus exactly XA-21; "
           "Engines, Visuals and every other Pine file unchanged",

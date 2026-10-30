@@ -59,7 +59,7 @@ def args(line, fn):
 
 # ---- static ------------------------------------------------------------------------------------------------------------
 def gate_static():
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.STR_PATH, xl.LONG_PATH)]
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p not in (xb.STR_PATH, xl.LONG_PATH)]     # ACC-1 new files: exact
     check("CS-01 Short == xa_build.build_strategy() (XA-1 .. XA-23), strip_strategy23 gives the XA-22 Short of %s byte for byte; Long == "
           "xal_build.build(), strip23 gives the XA-22 Long of %s; the same XA-23 layer on both; every other Pine file unchanged" % (PREV, PREV),
           S == xb.build_strategy() and xb.strip_strategy23(S) == S0 and xb.build_strategy22() == S0

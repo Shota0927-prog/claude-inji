@@ -51,7 +51,7 @@ WIRED = ["zoneCfg.clusterDist          := clusterDist", "zoneCfg.thrStrong      
 
 def gate_static():
     T, T0 = raw(bl.PATH), bl.show(bl.BASE_REV, bl.PATH)
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p != bl.PATH]
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p != bl.PATH]     # ACC-1 new files: exact
     check("BL-01 ZoneStrategyBTCUSD.pine == btl_build.build() and strips back to the 7705907 file byte for byte (unapply too); the BTC "
           "Visual / Engine, the shared Engines, the other symbols' and Gold files unchanged (no Library re-publish)",
           T == bl.build() and bl.strip(T) == T0 and bl.unapply(bl.PATH, T) == T0 and bl.unapply(bl.PATH, T0) == T0

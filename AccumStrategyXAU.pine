@@ -51,6 +51,16 @@
 //    ・固定 RR の TP は、約定するまでの間 (約定した足の中) は判断足の終値から計算した仮の TP。約定を確認した実行
 //      (リアルタイム = 約定後の次の tick / ヒストリカル = 約定した足の確定時) で実約定価格からの TP に置き換える。
 //    ・calc_on_order_fills は false (true の場合の履歴足の再計算タイミングを確認できていないため)。
+//
+//  ACC-2:
+//    ・Accum 終了と同時の突破: 初期値を Start at Fix に変更 (終了を受け取った 5分足の終値が境界の外側なら、その足を突破足 = 0 本目)。
+//      使うのは確定した上位足から届いた固定値とその 5分足の終値だけ。Wait for Cross (内側へ戻ってからの突破) は比較用。
+//    ・建値移動・約定直後の TP: Pine の注文は「+1R に届いたら stop を移す」条件付き注文を持たず、ヒストリカルの約定後再計算
+//      (calc_on_order_fills) は足の最終 OHLC を見る (先読み) ため、ヒストリカルの即時建値・約定直後の固定 RR TP は正確に再現できない。
+//      注文の動作は変えず、結果がリアルタイムと異なり得た足を Data Window に数える (ヒストリカルだけ・売買には使わない):
+//      「建値 同じ足で建値まで戻り」「建値 同じ足で初期 SL 決済」「仮 TP で結果が変わり得た約定足」。
+//    ・再計算設定の保護: ヒストリカルの同じ足でスクリプトが 2 回以上実行された (After order is filled などをプロパティで ON) ことを
+//      検出したら runtime.error で停止する。さらに発注直前に同じ注文 ID の約定が既にあれば停止する (足の途中の発注・二重発注の防止)。
 // ============================================================================
 
 //@version=5
@@ -113,10 +123,10 @@ enDev  = input.float(5.0, "サポレジ転換 · 最低乖離 ($)", minval = 0.0
      tooltip = "上限突破後、終値 >= 上限 + この値 (下限は 終値 <= 下限 − この値) で乖離成立。突破足を含む。ダマシには使わない。")
 enNear = input.float(3.0, "リテスト近接許容距離 ($)", minval = 0.0, step = 0.5, group = G_EN,
      tooltip = "乖離成立の後の足で、安値 <= 上限 + この値 (下限は 高値 >= 下限 − この値) かつ終値が境界の外側 (等値は不可) で反発成立。")
-enFixMode = input.string("Wait for Cross", "Accum 確定時に終値が既に境界の外側", options = ["Wait for Cross", "Start at Fix"], group = G_EN,
+enFixMode = input.string("Start at Fix", "Accum 確定時に終値が既に境界の外側", options = ["Start at Fix", "Wait for Cross"], group = G_EN,
      tooltip = "突破 = 前の 5分足終値 <= 上限 < 今の終値 (下限は 前 >= 下限 > 今)。Accum 終了の確定と同じ 5分足の突破も有効。\n" +
-     "Wait for Cross: 確定した時点で前の終値から既に外側なら、いったん内側 (等値を含む) へ戻ってからの突破を待つ。\n" +
-     "Start at Fix: 確定した 5分足の終値が外側なら、その足を突破足 (0 本目) として突破イベントを始める (比較用)。")
+     "Start at Fix (初期・採用仕様): 終了を受け取った 5分足の終値が既に外側なら、その足を突破足 (0 本目) として突破イベントを始める。\n" +
+     "Wait for Cross (比較用): 確定した時点で既に外側なら、いったん内側 (等値を含む) へ戻ってからの突破を待つ。")
 
 var string G_RK = "04 · SL / TP"
 rkBuf   = input.float(1.5,  "SL Buffer ($)", minval = 0.0, step = 0.1, group = G_RK)
@@ -372,6 +382,14 @@ var int nDoten    = 0
 var int nBE       = 0
 var int nBadExit  = 0     // 約定ずれで SL / TP の価格関係が不正 → 出口注文を出さず成行決済
 var int nQtyAnom  = 0     // 約定後の建玉数量が発注数量と違う
+// ACC-2 診断 (ヒストリカルの確定足だけ。売買には使わない): リアルタイムの即時建値 / 約定直後の TP と結果が異なり得た件数
+var int nBeRevisit  = 0   // +1R に届いた足で建値 (実約定価格) まで戻る値幅もあった (リアルタイムなら建値決済の可能性)
+var int nBeSlConf   = 0   // +1R に届いた足で初期 SL 決済になった (リアルタイムで +1R が先なら建値決済)
+var int nTpProvDiff = 0   // 約定足の値幅が仮 TP と実約定価格からの TP の一方だけに届いた (固定 RR)
+
+// ACC-2 再計算設定の保護: ヒストリカルの同じ足での実行回数 (varip = 足の途中の再計算でも巻き戻らない)
+varip int acExecBar = -1
+varip int acExecN   = 0
 
 f_tfName(int k) =>
     k == 0 ? "1H" : k == 1 ? "4H" : "D"
@@ -494,6 +512,38 @@ f_cand(int side, int pat, int tf, int aseq, float lvl, float sl, bool sessOK) =>
     c
 
 // a が b より優先なら true: 時間足 (D > 4H > 1H) → 判断足の終値に近い境界 → 古い Accum
+// ACC-2: 同じ注文 ID の約定が既にある (再計算で巻き戻った通し番号の再利用 = 足の途中で発注・約定した) なら true
+f_idUsed(string id) =>
+    bool r = false
+    int ot = strategy.opentrades
+    if ot > 0
+        for i = 0 to ot - 1
+            if strategy.opentrades.entry_id(i) == id
+                r := true
+    int ct = strategy.closedtrades
+    if ct > 0
+        for i = ct - 1 to math.max(0, ct - 5)
+            if strategy.closedtrades.entry_id(i) == id
+                r := true
+    r
+
+// ACC-2 診断: この足で +1R に届いていたのに、直前に決済された取引が損失 (初期 SL) で終わった
+f_beSlConflict(int side, float fill, float sl) =>
+    bool r = false
+    int ct = strategy.closedtrades
+    if beOn and ct > 0 and not na(fill) and not na(sl)
+        float r1   = side * (fill - sl)
+        float trig = fill + side * beR * r1
+        float xp   = strategy.closedtrades.exit_price(ct - 1)
+        r := r1 > 0 and (side == 1 ? high >= trig : low <= trig) and side * (xp - fill) < 0
+    r
+
+// ACC-2 診断: 固定 RR の仮 TP (判断足の終値から) と実約定価格からの TP のどちらか一方だけに約定足の値幅が届いた
+f_tpProvDiff(int side, float tpProv, float tpExact) =>
+    bool hp = side == 1 ? high >= tpProv : low <= tpProv
+    bool he = side == 1 ? high >= tpExact : low <= tpExact
+    hp != he
+
 f_better(AcCand a, AcCand b) =>
     a.tf != b.tf ? a.tf > b.tf : a.dist != b.dist ? a.dist < b.dist : a.aseq < b.aseq
 
@@ -507,6 +557,16 @@ bool acRun  = is5mChart
 bool sessOK = not seUse or f_inSession(time_close)
 
 if acRun
+    // ---- ACC-2 再計算設定の保護: ヒストリカルの足は確定時の 1 回だけ実行される前提 (2 回目を検出したら停止)
+    if barstate.ishistory
+        if acExecBar == bar_index
+            acExecN += 1
+        else
+            acExecBar := bar_index
+            acExecN   := 1
+        if acExecN > 1
+            runtime.error("ACC: ヒストリカルの同じ足でスクリプトが 2 回以上実行されました。プロパティの「再計算: 注文約定後」などを OFF にしてください (足の途中の再計算は足の最終値を見るため先読み・二重発注になる)。")
+
     // ---- (A) 毎実行 (形成中 tick を含む): 約定確認 → TP 確定 → 建値移動 --------------------------------
     //  リアルタイムの形成中 tick で変えた var は次の tick で巻き戻るが、判定は strategy の約定事実と確定済みの状態から
     //  毎回同じ結果を出す (exit 注文の更新は同じ ID・同じ価格で冪等)。
@@ -526,6 +586,8 @@ if acRun
                 nQtyAnom += 1
             float risk = oSide * (oFill - oSL)
             if oTpMode == 0 and risk > 0
+                if barstate.ishistory and barstate.isconfirmed and f_tpProvDiff(oSide, oTP, oFill + oSide * rkRR * risk)
+                    nTpProvDiff += 1
                 oTP := oFill + oSide * rkRR * risk
             if risk > 0 and oSide * (oTP - oFill) > 0
                 oStop   := oSL
@@ -550,6 +612,11 @@ if acRun
             // 約定ずれで初期 SL / 境界 TP が約定価格の反対側だった (ギャップ約定の直後に exit が成立した場合も数える)
             if risk <= 0 or (oTpMode == 1 and oSide * (oTP - oFill) <= 0)
                 nBadExit += 1
+            if barstate.ishistory and barstate.isconfirmed
+                if f_beSlConflict(oSide, oFill, oSL)
+                    nBeSlConf += 1
+                if oTpMode == 0 and risk > 0 and f_tpProvDiff(oSide, oTP, oFill + oSide * rkRR * risk)
+                    nTpProvDiff += 1
             if not na(oLbl)
                 label.set_text(oLbl, oTxt + "\n約定 " + str.tostring(oFill, "#.##") + "  (約定足で決済)")
         else if barstate.isconfirmed and bar_index > oBar
@@ -557,9 +624,18 @@ if acRun
             strategy.cancel(oXid)
             oState := 0
     else if oState >= 2 and strategy.position_size == 0
+        if barstate.ishistory and barstate.isconfirmed and oState == 2 and not oBE and f_beSlConflict(oSide, oFill, oSL)
+            nBeSlConf += 1
         oState := 0
 
-    if beOn and oState == 2 and not oBE and strategy.position_size != 0
+    // ACC-2: 管理中の注文 ID 以外の建玉があれば停止 (足の途中の再計算で発注・約定し、状態が巻き戻った場合など)
+    if strategy.opentrades > 0
+        string otId = strategy.opentrades.entry_id(strategy.opentrades - 1)
+        if otId != oId
+            runtime.error("ACC: 管理外の建玉 " + otId + " を検出しました (管理中 " + oId + ")。足の途中の再計算で発注・約定した可能性があります。プロパティの再計算設定を確認してください。")
+
+    //  ヒストリカルは確定時の実行だけで判定する (足の途中の再計算は足の最終の高値 / 安値を見るため使わない)
+    if beOn and oState == 2 and not oBE and strategy.position_size != 0 and (not barstate.ishistory or barstate.isconfirmed)
         float r1   = oSide * (oFill - oSL)
         float trig = oFill + oSide * beR * r1
         if (oSide == 1 and high >= trig) or (oSide == -1 and low <= trig)
@@ -567,6 +643,8 @@ if acRun
             oStop := oFill
             nBE   += 1
             strategy.exit(oXid, oId, stop = oStop, limit = oTP)
+            if barstate.ishistory and barstate.isconfirmed and (oSide == 1 ? low <= oFill : high >= oFill)
+                nBeRevisit += 1
 
     // ---- (B) 確定足だけ ----------------------------------------------------------------------------
     if barstate.isconfirmed
@@ -725,6 +803,9 @@ if acRun
             bool  flat = oState == 0 and pos == 0
             bool  rev  = dtOn and oState == 2 and pos != 0 and (pos > 0 ? 1 : -1) != pick.side
             if flat or rev
+                string nid = (pick.side == 1 ? "L" : "S") + str.tostring(oN + 1)
+                if f_idUsed(nid)
+                    runtime.error("ACC: 注文 ID " + nid + " の約定が既にあります (足の途中の再計算で発注・約定した可能性)。プロパティの再計算設定を確認してください。")
                 if rev
                     // 旧ポジの SL / TP を取り消す (次足始値の逆方向 entry 1 注文で決済 + 新規。数量の二重化を防ぐ)
                     strategy.cancel(oXid)
@@ -833,4 +914,7 @@ plot(nDoten,    "ACC · ドテン",         display = display.data_window)
 plot(nBE,       "ACC · 建値移動",       display = display.data_window)
 plot(nBadExit,  "ACC · 不正な出口 (成行決済)", display = display.data_window)
 plot(nQtyAnom,  "ACC · 数量の不一致",   display = display.data_window)
+plot(nBeRevisit,  "ACC · 診断 建値 同じ足で建値まで戻り (ヒストリカル)", display = display.data_window)
+plot(nBeSlConf,   "ACC · 診断 建値 同じ足で初期 SL 決済 (ヒストリカル)", display = display.data_window)
+plot(nTpProvDiff, "ACC · 診断 仮 TP で結果が変わり得た約定足 (ヒストリカル)", display = display.data_window)
 plot(array.size(acEvs), "ACC · 有効な突破イベント", display = display.data_window)

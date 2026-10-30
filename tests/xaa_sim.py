@@ -77,7 +77,7 @@ MSG = ('f_stAlertMsg(string kind, int side, float ePx, float sl, float tp, bool 
 
 # ---- static ------------------------------------------------------------------------------------------------------------
 def gate_static():
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.STR_PATH, xl.LONG_PATH)]
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p not in (xb.STR_PATH, xl.LONG_PATH)]     # ACC-1 new files: exact
     check("AS-01 Short == xa_build.build_strategy() (XA-1 .. XA-21) and strip_strategy21 gives 2550d27 byte for byte; Long == "
           "xal_build.build() (XL-1 + XA-21) and strip21 gives the XL-1 Long of d67941f byte for byte (strip -> the Short of 2550d27); "
           "both carry the identical alert layer; Engines, Visuals, the currency Strategies and every other Pine file unchanged since %s" % PREV,

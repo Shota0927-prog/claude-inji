@@ -68,7 +68,7 @@ REL_AFTER = {   # each release call follows exactly this line (formal order / fo
 
 # ---- static ------------------------------------------------------------------------------------------------------------
 def gate_static():
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in (xb.STR_PATH, xl.LONG_PATH)]
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p not in (xb.STR_PATH, xl.LONG_PATH)]     # ACC-1 new files: exact
     check("BS-01 Short == xa_build.build_strategy() (XA-1 .. XA-22) and strip_strategy22 gives the XA-21 Short of %s byte for byte; Long == "
           "xal_build.build() and strip22 gives the XA-21 Long of %s; the same XA-22 layer on both; every other Pine file unchanged" % (PREV, PREV),
           S == xb.build_strategy22() and xb.strip_strategy22(S) == S0 and xb.build_strategy21() == S0

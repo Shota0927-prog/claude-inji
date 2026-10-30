@@ -96,7 +96,7 @@ def gate_static():
     check("CD-05 the guard equals USDJPY UJ-5 (same declaration, condition and assignment); USDJPY Strategy unchanged since "
           "867ff7e", all(c == ujg for c in cdg) and len(ujg) == 3 and UJ == git("show", f"{PREV}:ZoneStrategyUSDJPY.pine"),
           str((ujg, cdg[0])))
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in cb.FILES and not __import__("xal_build").ok(p)]   # XL-1 Long: exact
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p not in cb.FILES and not __import__("xal_build").ok(p)]   # XL-1 Long: exact
     changed = [p for p in others if rd(p) != git("show", f"{PREV}:{p}") and not __import__("cad_adapt").later_pine_ok(p, PREV)]   # later layers: exact
     cls = {"ZoneStrategyXAU.pine": "alert(" not in code_only(__import__("xa_build").strip_strategy21(rd("ZoneStrategyXAU.pine")) or "alert("),   # later XA-21 alerts reverted exactly
            "us_trend_strategy.pine": "alert.freq_all" not in rd("us_trend_strategy.pine"),
@@ -106,13 +106,13 @@ def gate_static():
           "PointMaster an indicator with its own varip guard", not changed and all(cls.values()), str((changed, cls)))
     mod = set(git("diff", "--name-only", PREV, "--").split()) | {l[3:] for l in git("status", "--porcelain").split("\n") if l.startswith("??")}
     mod -= {"tests/__pycache__/"}
-    mod = {m for m in mod if not __import__("xal_build").ok(m) and not __import__("au_build").ok(m)}     # XL-1 (Gold Long, new) / AU-1 new files: exact
+    mod = {m for m in mod if not __import__("xal_build").ok(m) and not __import__("au_build").ok(m) and not __import__("acc_build").ok(m)}     # XL-1 (Gold Long, new) / AU-1 new files: exact
     pine = {m for m in mod if m.endswith(".pine")}
     rec = __import__("cad_adapt")
     check("CD-07 vs 867ff7e the changed Pine files are exactly the four Strategies; every changed test / generator is either new "
           "in CAD-1 or carries exactly its recorded CAD-1 edits (cad_adapt: reverting them gives the 867ff7e text)",
-          pine - {m for m in pine if __import__("cad_adapt").later_pine_ok(m, PREV)} == set(cb.FILES) and all(m in rec.NEW_FILES or rec.unadapt(m, rd(m)) == git("show", f"{PREV}:{m}") for m in mod - pine),
-          str(sorted(m for m in mod - pine if not (m in rec.NEW_FILES or rec.unadapt(m, rd(m)) == git("show", f"{PREV}:{m}")))))
+          pine - {m for m in pine if __import__("cad_adapt").later_pine_ok(m, PREV)} == set(cb.FILES) and all(m in rec.NEW_FILES or rec.unadapt(m, __import__("acc_build").unadapt(m, rd(m))) == git("show", f"{PREV}:{m}") for m in mod - pine),
+          str(sorted(m for m in mod - pine if not (m in rec.NEW_FILES or rec.unadapt(m, __import__("acc_build").unadapt(m, rd(m))) == git("show", f"{PREV}:{m}")))))
 
 
 # ---- model of the guarded branch ----------------------------------------------------------------------------------------

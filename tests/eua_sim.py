@@ -43,15 +43,16 @@ def git(*a):
 
 
 def gate_static():
-    others = [p for p in git("ls-files", "*.pine").split() if p != gb.PATH]
+    others = [p for p in git("ls-files", "*.pine").split() if p != gb.PATH and not __import__("acc_build").ok(p)]     # ACC-1 new files: exact
     check("EA-01 ZoneStrategyEURUSD.pine == eua_build.build() and strips back to the 68568e9 file byte for byte (unapply too, "
           "idempotent); every other Pine file (the other seven Strategies incl. GBPJPY GJA-1 / USDJPY UJA-1, Visuals, Engines, harnesses) unchanged vs 68568e9",
           T == gb.build() and gb.strip(T) == T0 and gb.unapply(gb.PATH, T) == T0 and gb.unapply(gb.PATH, T0) == T0
           and not [p for p in others if raw(p) != gb.show(B, p)])
     st = git("status", "--porcelain").split("\n")
     mod = (set(git("diff", "--name-only", B, "--").split()) | {l[3:] for l in st if l.startswith("??")}) - UNTRACKED
-    bad = sorted(m for m in mod if m != gb.PATH and m not in gb.NEW_TESTS
-                 and not (m in gb.TEST_EDITS and gb.unadapt(m, raw(m)) == gb.show(B, m) and gb.unadapt(m, raw(m)) != raw(m)))
+    bad = sorted(m for m in mod if m != gb.PATH and m not in gb.NEW_TESTS and m not in __import__("acc_build").NEW_FILES     # ACC-1 new files
+                 and not (m in gb.TEST_EDITS and gb.unadapt(m, raw(m)) == gb.show(B, m) and gb.unadapt(m, raw(m)) != raw(m))
+                 and not (m in __import__("acc_build").TEST_EDITS and __import__("acc_build").unadapt(m, raw(m)) == gb.show(B, m) and __import__("acc_build").unadapt(m, raw(m)) != raw(m)))     # ACC-1 test edits: exact
     check("EA-02 vs 68568e9 only the EURUSD Strategy, eua_build / eua_sim and the seven test files of eua_build.TEST_EDITS change, each "
           "exactly (uja_build: EUA-1 reverted first; uja_sim / gja_sim: other files read with EUA-1 reverted; bel_sim / msl_sim / cad_adapt / au_build: "
           "new-file lists); "

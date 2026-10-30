@@ -129,7 +129,7 @@ def port(text):
 
 
 def gate_static():
-    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and p not in mb.FILES]
+    others = [p for p in os.listdir(ROOT) if p.endswith(".pine") and not __import__("acc_build").ok(p) and p not in mb.FILES]     # ACC-1 new files: exact
     others += [os.path.join("automation/xau_short/pine", p) for p in os.listdir(os.path.join(ROOT, "automation/xau_short/pine"))
                if os.path.join("automation/xau_short/pine", p) not in mb.FILES]
     check("MS-01 the eight Strategies == msl_build.build() and strip back to the a31e934 files byte for byte (unapply too, idempotent "
@@ -142,8 +142,9 @@ def gate_static():
     mod -= {"tests/__pycache__/"}
     bad = sorted(m for m in mod if m not in mb.FILES and m not in mb.NEW_TESTS and m not in __import__("bel_build").NEW_TESTS
                  and m not in __import__("gja_build").NEW_TESTS and m not in __import__("uja_build").NEW_TESTS
-                 and m not in __import__("eua_build").NEW_TESTS
-                 and not (m in TEST_EDITS and revert(__import__("bel_build").unadapt(m, raw(m)), TEST_EDITS[m]) == mb.show(B, m)))
+                 and m not in __import__("eua_build").NEW_TESTS and m not in __import__("acc_build").NEW_FILES     # ACC-1 new files
+                 and not (m in TEST_EDITS and revert(__import__("bel_build").unadapt(m, raw(m)), TEST_EDITS[m]) == mb.show(B, m))
+                 and not (m in __import__("acc_build").TEST_EDITS and __import__("acc_build").unadapt(m, raw(m)) == mb.show(B, m) and __import__("acc_build").unadapt(m, raw(m)) != raw(m)))     # ACC-1 test edits: exact
     check("MS-02 vs a31e934 only the eight Strategies, the new msl_build / msl_sim and the listed test files change; each test file by "
           "exactly its recorded edit (xa_build: the appended MSL-1 hook, = cad_adapt LATER; cad_adapt / au_build: the new-file lists; "
           "xal_build / au / btl / pf / xac / xal sims: the later-layer revert)",
