@@ -37,6 +37,19 @@ BASE_REV = "890498e"          # repository state before ACC-1
 SRC = ap.read_source()
 RESULTS = []
 SRC_OVERRIDE = None           # AU: mutated Pine text for the scenario gates
+ACC3_REV = "525756f"          # ACC-3 (before P5 / P6)
+# ACC-4 changed the defaults (P1..P4 OFF, P5 / P6 ON, doten OFF). The ACC-1..3 gates below test the break patterns, so they run
+# with the ACC-3 behaviour switched on; AV pins that this equals the ACC-3 file itself.
+ACC3_OV = dict(enP1=True, enP2=True, enP3=True, enP4=True, enP5=False, enP6=False, dtOn=True)
+
+
+class R(ap.Runner):
+    """the Runner with the ACC-3 behaviour (ACC3_OV) under the given overrides."""
+
+    def __init__(self, overrides=None, *a, **kw):
+        ov = dict(ACC3_OV)
+        ov.update(overrides or {})
+        super().__init__(ov, *a, **kw)
 M5 = 300_000
 H1 = 3_600_000
 D1 = 86_400_000
@@ -102,13 +115,16 @@ def gate_static():
     want = dict(acUse1=True, acUse2=True, acUse3=True, acKeep1=3, acKeep2=2, acKeep3=1, acLife1=3.0, acLife2=7.0, acLife3=30.0,
                 accumRangeLen=10, accumBaseLen=20, accumAtrLen=14, accumMinUpperCloses=4, accumMinLowerCloses=4,
                 accumMaxSameColorRun=4, accumAtrMult=2.5, accumBarRatioMax=0.70, accumDriftMax=0.30,
-                enP1=True, enP2=True, enP3=True, enP4=True, enRetestBars=24, enDev=5.0, enNear=3.0,
-                rkBuf=1.5, rkMinSl=5.0, rkMaxSl=30.0, rkRR=1.5, rkTpAcc=True, beOn=True, beR=1.0, dtOn=True,
+                enP1=False, enP2=False, enP3=False, enP4=False, enP5=True, enP6=True,     # ACC-4 defaults
+                rgNear=3.0, rgWait=12, rgMinSl=2.0, rgRR=1.5,
+                enRetestBars=24, enDev=5.0, enNear=3.0,
+                rkBuf=1.5, rkMinSl=5.0, rkMaxSl=30.0, rkRR=1.5, rkTpAcc=True, beOn=True, beR=1.0, dtOn=False,
                 seUse=True, seTz="Asia/Tokyo", seStartH=9, seStartM=0, seEndH=2, seEndM=0,
                 mmCapBase=300000.0, mmRiskPct=3.0, mmLotOz=100.0, mmLotMin=0.01, mmLotStep=0.01,
                 enFixMode="Start at Fix")
     diff = {k: (inp.get(k), v) for k, v in want.items() if inp.get(k) != v}
-    check("AS-07 input defaults as specified (TF / Keep / expiry / detection / entry / SL / TP / BE / doten / session / money)",
+    check("AS-07 input defaults as specified (TF / Keep / expiry / detection / entry incl. ACC-4 P1..P4 OFF / P5 P6 ON / SL / TP / "
+          "BE / doten OFF (ACC-4) / session / money)",
           not diff, str(diff))
     xau = raw("ZoneStrategyXAU.pine")
     same = all(re.search(rf"^{k}\s+= input\.\w+\({re.escape(str(v) if not isinstance(v, float) else '')}", xau, re.M) for k, v in [])
@@ -178,7 +194,7 @@ def bars_of(seq, feed=FEED_1H, t0=T0, times=None):
 
 
 def run(seq, feed=FEED_1H, overrides=None, t0=T0, times=None, usdjpy=150.0):
-    return ap.Runner(overrides, usdjpy=usdjpy, src=SRC_OVERRIDE).run(bars_of(seq, feed, t0, times))
+    return R(overrides, usdjpy=usdjpy, src=SRC_OVERRIDE).run(bars_of(seq, feed, t0, times))
 
 
 def orders(r):
@@ -216,7 +232,7 @@ def gate_accum():
             return {1: (4300.0 + i, 4280.0, AID1, 1)}
         return {1: (4302.0, 4280.0, AID1, 0)}
     seq = [IN, B(4290, 4306, 4290, 4305), IN, IN, IN]
-    r = ap.Runner().run(bars_of(seq, feed)[:2])
+    r = R().run(bars_of(seq, feed)[:2])
     boxes = r["acBoxes"]
     check("AD-01 forming: the box follows the feed (up 4301 on bar 1), is not fixed, and a close above it starts no event",
           len(boxes) == 1 and boxes[0].up == 4301.0 and not boxes[0].fixed and r["acEvs"] == [] and orders(r) == [])
@@ -260,7 +276,7 @@ def gate_accum():
         b5 = nas.market(seed, 30)
         feeds = feeds_from_5m(nas, b5)
         bars = [dict(t=t, o=o, h=h, l=l, c=c, feed=feeds[i]) for i, (t, o, h, l, c) in enumerate(b5)]
-        r = ap.Runner(dict(seUse=False))
+        r = R(dict(seUse=False))
         seen = {}
         for i, b in enumerate(bars):
             r.step(b)
@@ -281,7 +297,7 @@ def gate_accum():
         # non-repainting: a run on a prefix makes the same orders on that prefix
         full = [(o[0], o[1], o[2], round(o[3], 6)) for o in orders(r)]
         cut = len(bars) * 2 // 3
-        rp = ap.Runner(dict(seUse=False)).run(bars[:cut])
+        rp = R(dict(seUse=False)).run(bars[:cut])
         part = [(o[0], o[1], o[2], round(o[3], 6)) for o in orders(rp)]
         if part != [x for x in full if x[0] < cut]:
             prefix_ok = False
@@ -668,7 +684,7 @@ def gate_fuzz():
         b5 = nas.market(seed, 30)
         feeds = feeds_from_5m(nas, b5)
         bars = [dict(t=t, o=o, h=h, l=l, c=c, feed=feeds[i]) for i, (t, o, h, l, c) in enumerate(b5)]
-        r = ap.Runner(ov).run(bars)
+        r = R(ov).run(bars)
         n_orders += len(orders(r))
         for k in range(4):
             n_pat[k] += r[f"nEnt{k + 1}"]
@@ -721,7 +737,7 @@ def gate_acc2():
     def fd3(i):
         return {1: (U, L, AID1, 1 if i < 2 else 0)}
     a, b = run(seq, fd3), run(seq, fd3, overrides=dict(enFixMode="Wait for Cross"))
-    ra = ap.Runner(src=SRC_OVERRIDE).run(bars_of(seq, fd3)[:4])
+    ra = R(src=SRC_OVERRIDE).run(bars_of(seq, fd3)[:4])
     check("AN-03 fix bar inside (close 4295), next bar closes 4302 -> break on that next bar (bar 3) in both modes",
           [e.bBar for e in ra["acEvs"]] == [3] and a["nSig1"] == 1 and b["nSig1"] == 1)
     # --- 2. BE on history vs realtime ------------------------------------------------------------------------------
@@ -783,7 +799,7 @@ def gate_acc2():
     # --- 5. recalculation settings ------------------------------------------------------------------------------------
     seq = PRE_L + [B(4304.5, 4305, 4304, 4304.8), B(4304.8, 4305, 4297, 4299), IN, IN]
     def stopped(**kw):
-        r = ap.Runner(None, src=SRC_OVERRIDE, **kw)
+        r = R(None, src=SRC_OVERRIDE, **kw)
         try:
             r.run(bars_of(seq))
         except ap.PineScriptStopped as ex:
@@ -802,14 +818,14 @@ def gate_acc2():
     check("AN-17 recalcs marked unconfirmed: no order and no BE from a recalc (BE on history only at the close) -> same "
           "orders / exits as the normal run", msg is None and orders(r) == orders(base) and exits(r) == exits(base))
     beseq = PRE_L + [B(4304.5, 4311, 4304, 4305), B(4305, 4306, 4304.8, 4305.5)]
-    r = ap.Runner(None, src=SRC_OVERRIDE, recalc_fills=True, recalc_confirmed=False, varip_rollback=True).run(bars_of(beseq))
+    r = R(None, src=SRC_OVERRIDE, recalc_fills=True, recalc_confirmed=False, varip_rollback=True).run(bars_of(beseq))
     n = run(beseq)
     check("AN-19 history recalc after the open fill sees the bar's final high 4311 (>= trigger): the BE is NOT taken from "
           "it (history BE only at the close) -> no exit inside the fill bar, same exits as the normal run",
           exits(r) == exits(n) and not [x for x in exits(r) if x[0] == 3], f"{exits(r)} {exits(n)}")
     rtseq = PRE_L + [B(4304.5, 4311, 4304, 4305, [4304.5, 4311, 4304, 4305]), B(4305, 4306, 4304.8, 4305.5, [4305, 4306, 4304.8, 4305.5])]
-    a = ap.Runner(src=SRC_OVERRIDE).run(bars_of(rtseq))
-    b = ap.Runner(src=SRC_OVERRIDE, recalc_fills=True).run(bars_of(rtseq))
+    a = R(src=SRC_OVERRIDE).run(bars_of(rtseq))
+    b = R(src=SRC_OVERRIDE, recalc_fills=True).run(bars_of(rtseq))
     check("AN-18 realtime ticks with 'After order is filled' ON: allowed (no stop), same orders / exits, one entry per bar",
           orders(a) == orders(b) and exits(a) == exits(b) and len(orders(b)) == 1)
 
@@ -826,7 +842,7 @@ NO_GUARD1 = ("        if acExecN > 1\n            runtime.error(", "        if f
 def gate_acc3():
     seq = [IN + ([4290.0, 4291.0, 4289.0, 4290.0],), B(4295, 4307, 4294, 4306, [4295, 4294, 4307, 4306]),
            B(4306, 4306.5, 4299, 4299, [4306, 4302.5, 4304, 4306.5, 4299]), B(4299, 4300, 4297, 4298, [4299, 4300, 4297, 4298])]
-    r = ap.Runner(src=SRC_OVERRIDE, history_ticks="all_confirmed")
+    r = R(src=SRC_OVERRIDE, history_ticks="all_confirmed")
     try:
         r.run(bars_of(seq))
         msg = None
@@ -838,13 +854,13 @@ def gate_acc3():
     if SRC_OVERRIDE is not None:
         return
     src = SRC.replace(*NO_GUARD1)
-    r = ap.Runner(src=src, history_ticks="all_confirmed")
+    r = R(src=src, history_ticks="all_confirmed")
     try:
         r.run(bars_of(seq))
         msg = None
     except ap.PineScriptStopped as ex:
         msg = str(ex)
-    n = ap.Runner().run(bars_of([x[:4] for x in seq]))
+    n = R().run(bars_of([x[:4] for x in seq]))
     check("AT-02 why the guard stays (guard 1 removed in memory only): the tick 4304 after the 4302.5 wick (not the bar's "
           "close) is taken as a confirmed retest -> P2 LONG sent and filled INSIDE that bar at 4306.5; the 5M close (4299) "
           "decides P1 SHORT at the next open in the normal run; the unmanaged-position guard then stops the script",
@@ -855,8 +871,8 @@ def gate_acc3():
             B(4299, 4303, 4279.5, 4285, [4299, 4303, 4279.5, 4280, 4285]), IN + ([4290.0, 4291.0, 4289.0, 4290.0],)]
     def feed(i):
         return {1: (U, L, AID1, 1 if i < 1 else 0)}
-    a = ap.Runner(src=src, history_ticks="all_confirmed")
-    b = ap.Runner()
+    a = R(src=src, history_ticks="all_confirmed")
+    b = R()
     same = True
     for x, y in zip(bars_of(seq2, feed), bars_of([z[:4] for z in seq2], feed)):
         a.step(x)
@@ -866,12 +882,12 @@ def gate_acc3():
     check("AT-03 accum and break-event state under history ticks (guard 1 removed, var rolled back before every tick): equal to "
           "the normal run at every bar end although intermediate ticks cross the boundaries -> the state is not broken; the "
           "orders are (AT-02)", same and orders(a) == [] and orders(b) == [])
-    cur = SRC
-    old = subprocess.run(["git", "-C", ROOT, "show", f"{ACC2_REV}:AccumStrategyXAU.pine"], capture_output=True, text=True).stdout
+    show = lambda rev, path: subprocess.run(["git", "-C", ROOT, "show", f"{rev}:{path}"], capture_output=True, text=True).stdout
     probe = raw("AccHistTickProbe.pine")
-    check("AT-04 ACC-3 keeps the ACC-2 Strategy byte for byte (code, defaults, orders); the probe is a separate file with no "
-          "trading by default (prOrders false) and no link to the Strategy",
-          cur == old and 'prOrders = input.bool(false,' in probe and "import " not in code_only(probe)
+    check("AT-04 ACC-3 kept the ACC-2 Strategy byte for byte (525756f == 936d27f; ACC-4 changes are pinned by AV); the probe is "
+          "unchanged since ACC-3, a separate file with no trading by default (prOrders false) and no link to the Strategy",
+          show(ACC3_REV, "AccumStrategyXAU.pine") == show(ACC2_REV, "AccumStrategyXAU.pine") and probe == show(ACC3_REV, "AccHistTickProbe.pine")
+          and 'prOrders = input.bool(false,' in probe and "import " not in code_only(probe)
           and "AccumStrategyXAU" not in code_only(probe) and "strategy.entry(" in probe)
 
 
@@ -893,7 +909,7 @@ def gate_acc2_series():
                 if sid is not None and acc == 0 and (k_tf, sid) not in exp and (k == 0 or com[k - 1][2] != sid or com[k - 1][3] == 1):
                     nxt = htf[k + 1]
                     exp[(k_tf, sid)] = (htf[k]["C"], nxt["T"] + nxt["slots"][0] * M5)
-        rr = ap.Runner(dict(seUse=False))
+        rr = R(dict(seUse=False))
         fixes, idx = {}, {}
         for i, bb in enumerate(bars):
             rr.step(bb)
@@ -921,7 +937,7 @@ def gate_acc2_series():
     for seed in (31, 32):
         b5 = nas2.market(seed, 20)
         feeds = feeds_from_5m(nas2, b5)
-        rr = ap.Runner(dict(seUse=False))
+        rr = R(dict(seUse=False))
         for i, (t, o, h, l, c) in enumerate(b5):
             rr.step(dict(t=t, o=o, h=h, l=l, c=c, feed=feeds[i]))
             for tr_ in rr.broker.open_trades:
@@ -929,6 +945,178 @@ def gate_acc2_series():
                     gaps_ok = False
     check("AN-12 random series: every open trade has its stop order at every bar end (SL never interrupted by TP updates)", gaps_ok)
 
+
+
+# ============================================================================
+# AQ : ACC-4 — P5 upper range rebound SHORT / P6 lower range rebound LONG (ACC-4 defaults: P1..P4 OFF, P5 P6 ON, doten OFF)
+# ============================================================================
+FR = {1: (4300.0, 4250.0, AID1, 0)}          # 1H accum 4300 / 4250, fixed on bar 0
+M = B(4275, 4276, 4274, 4275)                 # middle of the range
+BU = B(4280, 4283, 4279, 4282)                # bullish bar in the middle (no P5, no contact)
+BD = B(4270, 4271, 4266, 4267)                # bearish bar in the middle (no P6, no contact)
+
+
+def run4(seq, feed=FR, overrides=None, times=None, t0=T0):
+    return ap.Runner(overrides, src=SRC_OVERRIDE).run(bars_of(seq, feed, t0, times))
+
+
+def pats(r):
+    return [(o[0], o[1][0], r.trace[o[0]]["oPat"]) for o in orders(r)]
+
+
+def gate_acc4():
+    r = run4([M, B(4296, 4298, 4291, 4292), M])
+    check("AQ-01 contact bar (high 4298 >= 4297, close 4292 inside) closes bearish -> P5 on that bar (0本目): SHORT, SL = "
+          "4300 + 1.5, TP = the same accum's lower 4250 (RR 42 / 9.5), next-open order",
+          pats(r) == [(1, "S", 5)] and exit_order(r, "X1")[4:] == (4301.5, 4250.0) and r["nTouch5"] == 1 and r["nSig5"] == 1
+          and r["nEnt5"] == 1 and fills(r)[0][0] == 2, f"{pats(r)} {exit_order(r, 'X1')}")
+    r = run4([M, B(4292, 4298, 4291, 4296), BU, BU, BU, B(4288, 4289, 4284, 4285), M])
+    check("AQ-02 contact bar bullish -> wait; the price moves away (bars at 4280: wait kept, no distance cancel); bearish close "
+          "4285 on bar 5 -> P5", pats(r) == [(5, "S", 5)] and r["nTouch5"] == 1, str(pats(r)))
+    r = run4([M, B(4254, 4259, 4252, 4257), M])
+    check("AQ-03 contact bar (low 4252 <= 4253) closes bullish -> P6: LONG, SL = 4250 - 1.5, TP = the same accum's upper 4300",
+          pats(r) == [(1, "L", 6)] and exit_order(r, "X1")[4:] == (4248.5, 4300.0) and r["nTouch6"] == 1, str(pats(r)))
+    r = run4([M, B(4256, 4258, 4252, 4254), BD, BD, BD, B(4262, 4266, 4261, 4265), M])
+    check("AQ-04 contact bar bearish -> wait; later bullish close 4265 -> P6", pats(r) == [(5, "L", 6)], str(pats(r)))
+    a = run4([M, B(4298, 4303, 4294, 4295), M])
+    b = run4([M, B(4252, 4256, 4247, 4255), M])
+    check("AQ-05 wick through the boundary with the close inside is valid: high 4303 / close 4295 bearish -> P5; low 4247 / "
+          "close 4255 bullish -> P6", pats(a) == [(1, "S", 5)] and pats(b) == [(1, "L", 6)])
+    a = run4([M, B(4302, 4303, 4299, 4300), B(4299, 4299.5, 4294, 4295), M], overrides=dict(rkBuf=3.0))
+    b = run4([M, B(4248, 4253, 4247, 4250), B(4251, 4256, 4250.5, 4255), M], overrides=dict(rkBuf=3.0))
+    check("AQ-06 close exactly on the boundary (4300 bearish / 4250 bullish; SL Buffer 3 so the SL width 3 would pass): no "
+          "signal on that bar (not inside, not a break: the contact starts) -> the next inside rebound bar gives P5 / P6", pats(a) == [(2, "S", 5)] and pats(b) == [(2, "L", 6)]
+          and a["nRgBrk"] == 0)
+    t12 = run4([M, B(4292, 4298, 4291, 4296)] + [BU] * 11 + [B(4288, 4289, 4284, 4285), M])
+    t13 = run4([M, B(4292, 4298, 4291, 4296)] + [BU] * 12 + [B(4288, 4289, 4284, 4285), M])
+    check("AQ-07 bearish rebound on bar 12 after the contact -> P5 (bar 13 order); on bar 13 -> expired (no order, one expiry)",
+          pats(t12) == [(13, "S", 5)] and pats(t13) == [] and t13["nRgExp"] == 1 and t12["nRgExp"] == 0, f"{pats(t12)} {pats(t13)}")
+    near = B(4292, 4298, 4291, 4296)
+    r = run4([M, near, BU, BU, BU, BU, near] + [BU] * 7 + [B(4288, 4289, 4284, 4285), M])
+    check("AQ-08 a 2nd touch on bar 6 does not restart or extend the wait: the rebound on bar 14 (13 after the 1st contact) "
+          "-> expired", pats(r) == [] and r["nTouch5"] == 1 and r["nRgExp"] == 1, str(pats(r)))
+    r = run4([M, B(4296, 4298, 4291, 4292), B(4292, 4302, 4291, 4295), B(4296, 4298, 4290, 4291), B(4291, 4296, 4288, 4290),
+              B(4294, 4298, 4290, 4291), M])
+    check("AQ-09 after an order the contact is used: SL hit on bar 2 (flat), bar 3 touches again bearish -> nothing (not "
+          "re-armed); bar 4 high 4296 < 4297 re-arms (no contact on that bar); bar 5 touches bearish -> new contact -> P5",
+          pats(r) == [(1, "S", 5), (5, "S", 5)] and r["nTouch5"] == 2 and exits(r)[0][1:4] == ("S1", "X1", 4301.5), str(pats(r)))
+    zone_bull = B(4296, 4298, 4295, 4297.5)
+    r = run4([M, B(4292, 4298, 4291, 4296)] + [zone_bull] * 13 + [B(4298, 4298.5, 4294, 4295), B(4295, 4296, 4293, 4295.5),
+                                                                    B(4296, 4298, 4292, 4293), M])
+    check("AQ-10 expiry with the price still in the zone: no new contact (bar 15 bearish -> nothing); a bar with high < 4297 "
+          "re-arms; the next touch (bar 17) -> P5", pats(r) == [(17, "S", 5)] and r["nTouch5"] == 2 and r["nRgExp"] == 1, str(pats(r)))
+    r = run4([M, B(4292, 4298, 4291, 4296), B(4297, 4303, 4296, 4302), B(4301, 4302, 4294, 4295), M])
+    check("AQ-11 close above the upper (4302) cancels the wait; the bearish return bar (4295, high 4302) gives no P5",
+          pats(r) == [] and r["nRgBrk"] == 1, str(pats(r)))
+    r = run4([M, B(4292, 4298, 4291, 4296), B(4280, 4281, 4245, 4248), B(4262, 4263, 4255, 4258), M])
+    check("AQ-12 close below the lower (4248) cancels the P5 wait of the same accum too", pats(r) == [] and r["nRgBrk"] == 1, str(pats(r)))
+    r = run4([M, B(4296, 4306, 4295, 4305), B(4305, 4306, 4294, 4295), B(4294, 4296, 4290, 4292), B(4293, 4298, 4289, 4290), M])
+    check("AQ-13 break (close 4305) then return inside (4295, bearish): no P5 on the return bar; high 4296 re-arms; the next "
+          "touch (high 4298, bearish) -> P5 - with P1..P4 OFF", pats(r) == [(4, "S", 5)] and r["nTouch5"] == 1, str(pats(r)))
+    exp_t = T0 + 3 * D1
+    r = run4([M, B(4296, 4298, 4291, 4292), M], times=[T0, exp_t + M5, exp_t + 2 * M5])
+    check("AQ-14 expired accum (fixed T0, touch at T0 + 3 days + 5 min): no new contact", pats(r) == [] and r["nTouch5"] == 0)
+    r = run4([M, B(4292, 4298, 4291, 4296), BU, BU, B(4288, 4289, 4284, 4285), M],
+             times=[T0, exp_t - 10 * 60000, exp_t - 5 * 60000, exp_t, exp_t + M5, exp_t + 2 * M5])
+    check("AQ-15 a wait started before the expiry continues after it: rebound at T0 + 3 days + 5 min -> P5 with the saved lower "
+          "4250 as TP (the accum is gone from the registry)", pats(r) == [(4, "S", 5)] and exit_order(r, "X1")[5] == 4250.0
+          and r["acBoxes"] == [], str(pats(r)))
+    def fk(i):
+        return {1: (4300.0, 4250.0, AID1, 0)} if i < 3 else {1: (4400.0, 4350.0, AID1 + H1, 0)}
+    r = run4([M, B(4292, 4298, 4291, 4296), BU, BU, B(4288, 4289, 4284, 4285), M], fk, overrides=dict(acKeep1=1))
+    check("AQ-16 Keep Count (1H keep 1): a newer 1H accum on bar 3 pushes the touched one out; its wait continues -> P5 on bar 4 "
+          "with the saved SL 4301.5 / TP 4250", pats(r) == [(4, "S", 5)] and exit_order(r, "X1")[4:] == (4301.5, 4250.0), str(pats(r)))
+    r = run4([M, BU, BU, BU, B(4296, 4298, 4291, 4292), M], fk, overrides=dict(acKeep1=1))
+    check("AQ-17 after the Keep Count exclusion no new contact on the excluded accum", pats(r) == [] and r["nTouch5"] == 0)
+    r = run4([B(4296, 4298, 4291, 4292), M, B(4296, 4298, 4291, 4292), M])
+    check("AQ-18 no contact on the bar that fixes the accum (bar 0, bearish touch); from the next bar (bar 2) -> P5",
+          pats(r) == [(2, "S", 5)] and r["nTouch5"] == 1, str(pats(r)))
+    r = run4([M, B(4292, 4298, 4291, 4296), B(4299.9, 4299.95, 4299.5, 4299.6), B(4297, 4297.5, 4292, 4293), M])
+    check("AQ-19 SL width 1.9 (< 2, P5 / P6 minimum) -> skipped without consuming the contact; the next rebound -> P5",
+          pats(r) == [(3, "S", 5)] and r["nSkipSl56"] == 1 and r["nSkipSl"] == 0, str(pats(r)))
+    r = run4([M, B(4292, 4298, 4291, 4296), B(4274, 4275, 4270, 4271), M])
+    check("AQ-20 SL width 30.5 (> 30) -> skipped", pats(r) == [] and r["nSkipSl56"] == 1)
+    r = run4([M, B(4297, 4298, 4295, 4296), M], {1: (4300.0, 4290.0, AID1, 0)})
+    check("AQ-21 RR 6 / 5.5 = 1.09 (< 1.5, TP = the same accum's lower 4290, no other boundary used) -> skipped",
+          pats(r) == [] and r["nSkipRR56"] == 1 and r["nSkipRR"] == 0)
+    r = run4([M, B(4254, 4259, 4252, 4257), B(4257, 4270, 4256, 4268), B(4268, 4290, 4267, 4289), B(4289, 4298, 4288, 4296),
+              B(4296, 4298.5, 4292, 4293), B(4293, 4300.5, 4292, 4299), B(4299, 4299.5, 4294, 4295), M])
+    check("AQ-22 while a P6 LONG is held (doten OFF), the P5 contact (bar 4) and its bearish rebound (bar 5) are recorded but not "
+          "used; the LONG reaches its TP 4300 on bar 6; the bearish bar 7 (same wait, age 3) -> P5 SHORT; one position at a time",
+          pats(r) == [(1, "L", 6), (7, "S", 5)] and exits(r)[0][1:4] == ("L1", "X1", 4300.0) and r["nSig5"] == 2
+          and r.broker.max_abs_pos <= 12.0 and r["nDoten"] == 0, f"{pats(r)} {exits(r)}")
+    seq = [M, B(4276, 4296, 4275, 4295.5), B(4297, 4298, 4292.5, 4294), B(4294, 4295, 4287, 4288), M]
+    r = run4(seq, {1: (4300.0, 4250.0, AID1, 0), 2: (4290.0, 4200.0, AID1, 0)}, overrides=dict(enP2=True, rkTpAcc=False))
+    check("AQ-23 P5 SHORT (1H) and P2 LONG (4H retest) valid on the same bar -> both skipped, the P5 contact is kept; the next "
+          "bearish bar -> P5", [x[:2] for x in pats(r)] == [(3, "S")] and pats(r)[0][2] == 5 and r["nConflict"] == 1, str(pats(r)))
+    hist = run4([M, B(4292, 4298, 4291, 4296), BU, B(4288, 4289, 4284, 4285), M])
+    rt = run4([M + ([4275.0, 4276.0, 4274.0, 4275.0],), B(4292, 4298, 4291, 4296, [4292, 4291, 4298, 4296]),
+               B(4280, 4283, 4279, 4282, [4280, 4279, 4283, 4282]), B(4288, 4289, 4284, 4285, [4288, 4289, 4284, 4285]),
+               M + ([4275.0, 4276.0, 4274.0, 4275.0],)])
+    rt2 = run4([M, B(4292, 4298, 4291.5, 4296, [4292, 4298, 4291.5, 4296]), B(4288, 4289, 4284, 4285, [4288, 4284, 4289, 4285]), M])
+    check("AQ-24 realtime ticks vs history: same contact / wait / order (the state changes only on the confirmed tick); a "
+          "bearish moment inside the touching bar (tick 4291.5 < open 4292, bar closes bullish 4296) sends nothing", pats(rt) == pats(hist) == [(3, "S", 5)] and rt["nTouch5"] == 1
+          and pats(rt2) == [(2, "S", 5)] and orders(rt2)[0][0] == 2, f"{pats(rt)} {pats(hist)} {pats(rt2)}")
+    r = run4([M, B(4299, 4299.5, 4297, 4298.5), M])
+    check("AQ-26 SL width 3 (between the P5 / P6 minimum 2 and the P1..P4 minimum 5) -> taken (P5 / P6 use their own minimum)",
+          pats(r) == [(1, "S", 5)] and exit_order(r, "X1")[4] == 4301.5, str(pats(r)))
+    r = run4([M, B(4296, 4298, 4291, 4292), M], overrides=dict(enP5=False))
+    check("AQ-25 P5 OFF: the contact is still recorded, no order", pats(r) == [] and r["nTouch5"] == 1 and r["nSig5"] == 0)
+
+
+
+# ============================================================================
+# AV : ACC-4 — the ACC-3 file vs ACC-4 with P5 / P6 OFF (the P1..P4 / doten / BE / money behaviour unchanged); random series
+# ============================================================================
+AV_COUNTERS = ("nSig1", "nSig2", "nSig3", "nSig4", "nEnt1", "nEnt2", "nEnt3", "nEnt4", "nSkipSl", "nSkipRR", "nSkipSess",
+               "nSkipQty", "nConflict", "nDoten", "nBE", "nBadExit", "nQtyAnom", "nBeRevisit", "nBeSlConf", "nTpProvDiff")
+
+
+def gate_acc4_series():
+    import nr_a1_sim as nas
+    old_src = subprocess.run(["git", "-C", ROOT, "show", f"{ACC3_REV}:AccumStrategyXAU.pine"], capture_output=True, text=True).stdout
+    settings = [dict(), dict(dtOn=False), dict(enP2=False, enP3=False, enP4=False), dict(enP1=False, enP3=False, enP4=False),
+                dict(enP1=False, enP2=False, enP4=False), dict(enP1=False, enP2=False, enP3=False)]
+    same, n_ord, det = True, 0, ""
+    for seed in (41, 42):
+        b5 = nas.market(seed, 20)
+        feeds = feeds_from_5m(nas, b5)
+        bars = [dict(t=t, o=o, h=h, l=l, c=c, feed=feeds[i]) for i, (t, o, h, l, c) in enumerate(b5)]
+        for ov in (settings if seed == 41 else settings[:2]):
+            a = ap.Runner(dict(ov, seUse=False), src=old_src).run(bars)
+            b = ap.Runner(dict(ACC3_OV, **ov, seUse=False)).run(bars)
+            n_ord += len(orders(a))
+            if a.broker.log != b.broker.log or any(a[k] != b[k] for k in AV_COUNTERS):
+                same, det = False, f"seed {seed} {ov}"
+    check("AV-01 P1..P4 unchanged: the ACC-3 file (525756f) and ACC-4 with P5 / P6 OFF give the identical broker log (orders, "
+          "exits, cancels, fills) and counters on random series - all of P1..P4, doten OFF, and each of P1 / P2 / P3 / P4 alone",
+          same and n_ord > 0, f"{det} orders={n_ord}")
+    inv, n56, det = True, 0, ""
+    for seed, ov in ((43, {}), (44, dict(enP1=True, enP2=True, enP3=True, enP4=True, dtOn=True)), (45, dict(enP5=False)),
+                     (46, dict(enP6=False))):
+        b5 = nas.market(seed, 20)
+        feeds = feeds_from_5m(nas, b5)
+        bars = [dict(t=t, o=o, h=h, l=l, c=c, feed=feeds[i]) for i, (t, o, h, l, c) in enumerate(b5)]
+        try:
+            r = ap.Runner(ov).run(bars)
+        except ap.PineScriptStopped as ex:
+            inv, det = False, f"seed {seed}: stopped {ex}"
+            continue
+        n56 += r["nEnt5"] + r["nEnt6"]
+        per = {}
+        for o in orders(r):
+            per[o[0]] = per.get(o[0], 0) + 1
+        maxq = max([o[3] for o in orders(r)] or [0])
+        xs = {e[3] for e in r.broker.log if e[0] == "order_exit"}
+        ids = [o[1] for o in orders(r)]
+        if (r.broker.max_abs_pos > maxq + 1e-9 or any(v > 1 for v in per.values()) or any(f[1] not in xs for f in fills(r))
+                or len(ids) != len(set(ids)) or r["nQtyAnom"] != 0):
+            inv, det = False, f"seed {seed} {ov}"
+        if ov.get("enP5") is False and r["nEnt5"] != 0 or ov.get("enP6") is False and r["nEnt6"] != 0:
+            inv, det = False, f"seed {seed}: disabled pattern ordered"
+    check("AV-02 random series with P5 / P6 ON (ACC-4 defaults; all six + doten ON; P5 only; P6 only): one position, one order per "
+          "bar, every fill protected from the signal bar, unique order IDs, no unmanaged position / stop, a disabled pattern never "
+          "orders", inv and n56 > 0, f"{det} P5+P6 orders={n56}")
 
 
 # ============================================================================
@@ -964,6 +1152,14 @@ MUTATIONS = [
     ("ACC-2 history multi-execution guard removed", "        if acExecN > 1\n            runtime.error(", "        if false\n            runtime.error("),
     ("ACC-2 unmanaged position guard removed", "        if otId != oId\n", "        if false\n"),
     ("ACC-2 BE from history recalcs", "and (not barstate.ishistory or barstate.isconfirmed)", "and true"),
+    ("ACC-4 P5 on an equal close", "                else if close < w.up and close > w.lo\n", "                else if close <= w.up and close >= w.lo\n"),
+    ("ACC-4 P5 without the bearish close", "if w.side == -1 and close < open and enP5", "if w.side == -1 and enP5"),
+    ("ACC-4 wait 13 bars (off by one)", "if rage > rgWait", "if rage > rgWait + 1"),
+    ("ACC-4 contact not consumed by the order", "                            if wj.id == pick.rtId\n", "                            if false\n"),
+    ("ACC-4 no re-arm needed", "                            if b.armU and high >= b.up - rgNear - EPS", "                            if high >= b.up - rgNear - EPS"),
+    ("ACC-4 contact on the fix bar", "if f_valid(b) and time > b.fixTime and close <= b.up", "if f_valid(b) and close <= b.up"),
+    ("ACC-4 break does not cancel the wait", "                if close > w.up or close < w.lo\n", "                if false\n"),
+    ("ACC-4 P5 / P6 minimum SL = P1..P4 minimum", "    if slw < rgMinSl - EPS or slw > rkMaxSl + EPS", "    if slw < rkMinSl - EPS or slw > rkMaxSl + EPS"),
 ]
 
 
@@ -978,7 +1174,7 @@ def gate_mutation():
                 continue
             SRC_OVERRIDE = SRC.replace(old, new)
             RESULTS = []
-            for g in (gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3):
+            for g in (gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3, gate_acc4):
                 try:
                     g()
                 except Exception:      # noqa: BLE001
@@ -995,7 +1191,7 @@ def gate_mutation():
 
 
 def main():
-    for g in (gate_static, gate_accum, gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3, gate_acc2_series, gate_fuzz, gate_mutation):
+    for g in (gate_static, gate_accum, gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3, gate_acc4, gate_acc2_series, gate_acc4_series, gate_fuzz, gate_mutation):
         try:
             g()
         except Exception:      # noqa: BLE001

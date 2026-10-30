@@ -43,7 +43,7 @@ def agg5(m1):
 def run(bars5, mode):
     b5 = [x[:5] for x in bars5]
     feeds = t.feeds_from_5m(nas, b5)
-    r = ap.Runner(dict(seUse=False), tick_segments=(mode != "A"))
+    r = ap.Runner(dict(t.ACC3_OV, seUse=False), tick_segments=(mode != "A"))     # ACC-4: the ACC-3 settings (same results)
     for i, (tt, o, h, l, c, subs) in enumerate(bars5):
         b = dict(t=tt, o=o, h=h, l=l, c=c, feed=feeds[i])
         if mode == "B":
