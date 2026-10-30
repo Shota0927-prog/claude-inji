@@ -26,7 +26,7 @@ PINE = os.path.join(ROOT, "AccumStrategyXAU.pine")
 LOGIC_BEGIN, LOGIC_END = "// ==== ACC Logic (begin) ", "// ==== ACC Logic (end) "
 
 NAMESPACES = {"strategy", "array", "math", "str", "label", "line", "color", "barstate", "syminfo", "timeframe",
-              "xloc", "size", "plot", "display", "barmerge", "ta", "request", "input", "runtime"}
+              "xloc", "size", "plot", "display", "barmerge", "ta", "request", "input", "runtime", "box"}
 TYPE_WORDS = {"float", "int", "bool", "string", "color", "line", "label", "box"}
 
 
@@ -514,6 +514,11 @@ def make_env(broker, draw_log):
         draw_log.append(d)
         return d
 
+    def box_new(*a, **k):
+        d = Drawing("box", a, k)
+        draw_log.append(d)
+        return d
+
     def _set(attr):
         def f(obj, v):
             if obj is None:
@@ -572,6 +577,8 @@ def make_env(broker, draw_log):
         label__new=label_new, label__set_text=_set("text"), label__get_text=_get_text, label__delete=_delete,
         label__set_textcolor=_set("textcolor"), label__set_color=_set("color"),
         line__new=line_new, line__set_color=_set("color"), line__set_style=_set("style"), line__delete=_delete,
+        box__new=box_new, box__set_right=_set("right"), box__delete=_delete,
+        color__maroon="maroon", color__navy="navy", size__tiny="tiny",
         label__style_label_up="up", label__style_label_down="down", label__style_label_lower_left="ll",
         label__style_label_upper_left="ul", line__style_dotted="dotted",
         color__new=lambda c, t=0: (c, t), color__teal="teal", color__orange="orange", color__fuchsia="fuchsia",
@@ -782,6 +789,7 @@ class Runner:
         self.env["__first__"] = True
         self.bar_index = -1
         self.prev_close = None
+        self.bars_done = []           # (o, h, l, c) of the completed bars (history references)
         self.committed = None
         self.trace = []
 
@@ -790,6 +798,10 @@ class Runner:
         e["barstate__ishistory"] = history
         e.update(open=o, high=h, low=l, close=c, time=b["t"], time_close=b["t"] + M5, bar_index=self.bar_index,
                  barstate__isconfirmed=confirmed, is5mChart=True, acPrevClose=self.prev_close,
+                 acH2=self.bars_done[-2][1] if len(self.bars_done) >= 2 else None,      # ACC-5A: high[2] / low[2] / open[1] / close[1]
+                 acL2=self.bars_done[-2][2] if len(self.bars_done) >= 2 else None,
+                 acO1=self.bars_done[-1][0] if self.bars_done else None,
+                 acC1=self.bars_done[-1][3] if self.bars_done else None,
                  syminfo__pointvalue=self.broker.pointvalue,
                  strategy__position_size=self.broker.pos, strategy__opentrades=self.broker.opentrades,
                  strategy__closedtrades=self.broker.closedtrades)
@@ -850,6 +862,7 @@ class Runner:
                 self._exec()
         self.committed = self._snapshot()
         self.prev_close = b["c"]
+        self.bars_done.append((b["o"], b["h"], b["l"], b["c"]))
         self.trace.append(dict(bar=self.bar_index, t=b["t"], **{k: copy.deepcopy(self.env[k]) for k in
                                                                  ("oState", "oSide", "oId", "oSL", "oTP", "oStop", "oBE", "oFill", "oPat", "oTf", "oQty", "oRRPlan", "oRRReal")},
                                pos=self.broker.pos))

@@ -74,6 +74,16 @@
 //      その前に始まった待機は、接触時に保存した上下限・ID・時間足で最後まで判定する。
 //    ・状態 (接触・待機・再アーム) は P5 / P6 の ON / OFF にかかわらず更新し、発注候補にするのは ON のパターンだけ。
 //    ・初期値: P1〜P4 OFF / P5・P6 ON、ドテン OFF (P5・P6 を OFF、P1〜P4 とドテンを ON にすると ACC-3 と同じ動作)。
+//
+//  ACC-5A: 5分足 FVG 吸収を P5 / P6 待機ごとの「根拠」として検出・保存・表示する (注文条件・P1〜P6・SL / TP / BE / lot・ドテンは変更しない)。
+//    ・FVG (確定 5分足の 3 本): 上昇 FVG = low > high[2] かつ中央足が陽線 (下限 high[2] / 上限 low、SHORT 用)。
+//      下降 FVG = high < low[2] かつ中央足が陰線 (下限 high / 上限 low[2]、LONG 用)。幅 >= 最小幅 (初期 1.0 USD)。
+//    ・方向ごとに最新の未吸収 FVG を 1 つだけ監視 (新しい同方向 FVG で置き換え)。形成足 = 0 本目、10 本目まで吸収可能 (初期)。
+//    ・吸収: 上昇 FVG を陰線の終値 <= 下限で確定 (SHORT 吸収) / 下降 FVG を陽線の終値 >= 上限で確定 (LONG 吸収)。吸収した FVG は
+//      監視から外す (同じ FVG で 2 回吸収しない)。複数の足で埋めてもよい (判定は吸収足の終値だけ)。
+//    ・根拠: 吸収の時点で有効な P5 (SHORT 吸収) / P6 (LONG 吸収) 待機それぞれに、FVG の ID・形成足・上下限・吸収足を保存する
+//      (接触と同じ足の吸収も含む・接触前の吸収は使わない)。吸収足 = 0 本目、5 本目まで有効 (初期)。待機が終われば根拠も消える
+//      (12 本の待機期限・突破・消費が優先)。新しい接触は新しい待機として根拠を持つ。
 // ============================================================================
 
 //@version=5
@@ -90,7 +100,8 @@ strategy(
      default_qty_type        = strategy.fixed,
      default_qty_value       = 1,
      max_lines_count         = 500,
-     max_labels_count        = 500)
+     max_labels_count        = 500,
+     max_boxes_count         = 500)
 
 // ---- 5分足専用 ----------------------------------------------------------------
 bool is5mChart = timeframe.isminutes and timeframe.multiplier == 5
@@ -199,6 +210,18 @@ dsAcc    = input.bool(true, "Accum 上下限を表示", group = G_DS)
 dsAccMax = input.int(30, "表示する Accum の最大数", minval = 1, maxval = 100, group = G_DS)
 dsEnt    = input.bool(true, "エントリーラベルを表示", group = G_DS)
 dsEntMax = input.int(50, "エントリーラベルの最大数", minval = 1, maxval = 200, group = G_DS)
+dsFvg    = input.bool(true, "FVG と FVG 吸収を表示 (ACC-5A)", group = G_DS)
+dsFvgMax = input.int(30, "表示する FVG / 吸収ラベルの最大数", minval = 1, maxval = 200, group = G_DS)
+
+var string G_FV = "10 · FVG 吸収 (ACC-5A: 根拠の検出だけ。注文条件には使わない)"
+fvUse     = input.bool(true, "FVG 吸収の検出", group = G_FV,
+     tooltip = "OFF: FVG の検出・吸収・根拠の保存をしない (売買は ON / OFF で変わらない)。")
+fvMinW    = input.float(1.0, "FVG 最小幅 ($)", minval = 0.0, step = 0.1, group = G_FV,
+     tooltip = "上昇 FVG: low − high[2]、下降 FVG: low[2] − high がこの値以上 (ちょうどを含む) の FVG だけを検出する。")
+fvLife    = input.int(10, "FVG 形成後の有効期限 (本)", minval = 0, group = G_FV,
+     tooltip = "形成足 = 0 本目。この本数目まで吸収可能、次の足で監視から外す。実際の 5分足の本数で数える。")
+fvAbsLife = input.int(5, "吸収後の根拠の有効期限 (本)", minval = 0, group = G_FV,
+     tooltip = "吸収足 = 0 本目。この本数目まで根拠が有効。ただし P5 / P6 の待機 (12 本・突破・消費) が終われば根拠も無効。")
 
 // ============================================================================
 // 02. ACCUM FEED (NR-A1 と同じ取得方式)
@@ -306,6 +329,11 @@ f_acConfirmed(simple int rangeLen, simple int baseLen, simple int atrLen,
      lookahead = barmerge.lookahead_on)
 
 float acPrevClose = close[1]     // 突破判定用: 前の 5分足の終値
+// ACC-5A FVG 用: 確定した 1 本前 / 2 本前の 5分足 (現在の足は確定足の分岐の中で使う)
+float acH2 = high[2]
+float acL2 = low[2]
+float acO1 = open[1]
+float acC1 = close[1]
 
 // ============================================================================
 // 03. LOGIC
@@ -375,6 +403,23 @@ type AcRt
     float up
     float lo
     int   tBar                // 接触足の bar_index (0 本目)
+    // ACC-5A: この待機の FVG 吸収根拠 (接触足以後の吸収だけ。待機が終われば一緒に消える)
+    int   evFvgId  = -1       // 吸収した FVG の ID (-1 = 根拠なし)
+    int   evFvgBar            // FVG の形成足
+    float evFvgLo
+    float evFvgHi
+    int   evAbsBar            // 吸収足 (0 本目)
+    int   evExpBar            // 根拠の最後の有効足 (吸収足 + 有効期限)
+    bool  evOn     = false    // この確定足の時点で根拠が有効
+
+// ACC-5A: 監視中の FVG (方向ごとに最新の未吸収 1 個)
+type AcFvg
+    int   id
+    int   dir                 // 1 = 上昇 FVG (SHORT 吸収用) / -1 = 下降 FVG (LONG 吸収用)
+    int   fBar                // 形成足 (3 本目) の bar_index
+    float lo
+    float hi
+    box   bx
 
 var array<AcBox> acBoxes = array.new<AcBox>()     // 登録中の Accum (無効になったら外す)
 var array<AcBox> acDrawn = array.new<AcBox>()     // 描画中の Accum (表示だけ)
@@ -384,6 +429,11 @@ var int acSeq = 0
 var array<int>   acLastId = array.new_int(3, na)   // 時間足ごとに前回届いた Accum ID
 var array<AcRt>  acRts    = array.new<AcRt>()     // ACC-4: P5 / P6 の接触待機
 var int acRtSeq = 0
+var AcFvg acFvUp = na                              // ACC-5A: 監視中の上昇 FVG
+var AcFvg acFvDn = na                              // ACC-5A: 監視中の下降 FVG
+var int   acFvSeq = 0
+var array<box>   acFvBoxes = array.new<box>()      // ACC-5A 表示
+var array<label> acFvLbls  = array.new<label>()
 
 // 注文 / ポジション (1 つだけ)
 var int    oState  = 0       // 0 なし / 1 entry 発注済み (約定待ち) / 2 保有中 / 3 不正な出口のため決済中
@@ -437,6 +487,14 @@ var int nRgExp   = 0     // 待機の期限切れ
 var int nRgBrk   = 0     // 終値の突破で解除した待機
 var int nSkipSl56 = 0
 var int nSkipRR56 = 0
+// ACC-5A FVG (形成 / 吸収 / 待機の根拠は別々に数える。売買の集計には含めない)
+var int nFvUp     = 0     // 上昇 FVG の検出
+var int nFvDn     = 0     // 下降 FVG の検出
+var int nFvUpAbs  = 0     // 上昇 FVG の吸収 (SHORT 吸収)
+var int nFvDnAbs  = 0     // 下降 FVG の吸収 (LONG 吸収)
+var int nFvEv5    = 0     // P5 待機に紐づいた吸収 (待機 1 個 × 吸収 1 回 = 1)
+var int nFvEv6    = 0     // P6 待機に紐づいた吸収
+var int nFvEvExp  = 0     // 待機中に吸収後の有効期限を過ぎた根拠
 // ACC-2 診断 (ヒストリカルの確定足だけ。売買には使わない): リアルタイムの即時建値 / 約定直後の TP と結果が異なり得た件数
 var int nBeRevisit  = 0   // +1R に届いた足で建値 (実約定価格) まで戻る値幅もあった (リアルタイムなら建値決済の可能性)
 var int nBeSlConf   = 0   // +1R に届いた足で初期 SL 決済になった (リアルタイムで +1R が先なら建値決済)
@@ -906,6 +964,78 @@ if acRun
                     if w.side == 1 and close > open and enP6
                         array.push(cands, f_candRg(1, 6, w.tf, w.aseq, w.lo, w.lo - rkBuf, w.up, sessOK, w.id))
 
+        // (B3c) ACC-5A FVG 吸収: 期限 → 吸収 (監視中の FVG・この足の終値) → 待機への根拠付け → 新しい FVG → 根拠の有効状態
+        //  根拠の検出・保存・表示だけ。候補 (cands)・注文・P1〜P6 の状態には触れない。
+        if fvUse
+            if not na(acFvUp) and bar_index - acFvUp.fBar > fvLife
+                acFvUp := na
+            if not na(acFvDn) and bar_index - acFvDn.fBar > fvLife
+                acFvDn := na
+            for d = 0 to 1
+                AcFvg fv = d == 0 ? acFvUp : acFvDn
+                if not na(fv)
+                    bool absd = fv.dir == 1 ? (close < open and close <= fv.lo) : (close > open and close >= fv.hi)
+                    if absd
+                        int wside = fv.dir == 1 ? -1 : 1
+                        int nrv = array.size(acRts)
+                        if nrv > 0
+                            for i = 0 to nrv - 1
+                                AcRt w = array.get(acRts, i)
+                                if w.side == wside and w.tBar <= bar_index
+                                    w.evFvgId  := fv.id
+                                    w.evFvgBar := fv.fBar
+                                    w.evFvgLo  := fv.lo
+                                    w.evFvgHi  := fv.hi
+                                    w.evAbsBar := bar_index
+                                    w.evExpBar := bar_index + fvAbsLife
+                                    w.evOn     := true
+                                    nFvEv5 += wside == -1 ? 1 : 0
+                                    nFvEv6 += wside == 1 ? 1 : 0
+                        nFvUpAbs += fv.dir == 1 ? 1 : 0
+                        nFvDnAbs += fv.dir == -1 ? 1 : 0
+                        if dsFvg
+                            if not na(fv.bx)
+                                box.set_right(fv.bx, bar_index)
+                            label lf = label.new(bar_index, fv.dir == 1 ? high : low, (fv.dir == 1 ? "FVG吸収 SHORT #" : "FVG吸収 LONG #") + str.tostring(fv.id),
+                                 style = fv.dir == 1 ? label.style_label_down : label.style_label_up,
+                                 color = fv.dir == 1 ? color.new(color.maroon, 30) : color.new(color.navy, 30), textcolor = color.white, size = size.tiny)
+                            array.push(acFvLbls, lf)
+                            if array.size(acFvLbls) > dsFvgMax
+                                label.delete(array.shift(acFvLbls))
+                        if d == 0
+                            acFvUp := na
+                        else
+                            acFvDn := na
+            bool upF = not na(acH2) and not na(acC1) and not na(acO1) and low > acH2 and acC1 > acO1 and low - acH2 >= fvMinW - EPS
+            bool dnF = not na(acL2) and not na(acC1) and not na(acO1) and high < acL2 and acC1 < acO1 and acL2 - high >= fvMinW - EPS
+            for d = 0 to 1
+                bool fm = d == 0 ? upF : dnF
+                if fm
+                    acFvSeq += 1
+                    AcFvg nf = d == 0 ? AcFvg.new(acFvSeq, 1, bar_index, acH2, low) : AcFvg.new(acFvSeq, -1, bar_index, high, acL2)
+                    nFvUp += d == 0 ? 1 : 0
+                    nFvDn += d == 1 ? 1 : 0
+                    if dsFvg
+                        nf.bx := box.new(bar_index - 2, nf.hi, bar_index + fvLife, nf.lo,
+                             border_color = d == 0 ? color.new(color.green, 40) : color.new(color.red, 40),
+                             bgcolor = d == 0 ? color.new(color.green, 85) : color.new(color.red, 85))
+                        array.push(acFvBoxes, nf.bx)
+                        if array.size(acFvBoxes) > dsFvgMax
+                            box.delete(array.shift(acFvBoxes))
+                    if d == 0
+                        acFvUp := nf
+                    else
+                        acFvDn := nf
+            int nre = array.size(acRts)
+            if nre > 0
+                for i = 0 to nre - 1
+                    AcRt w = array.get(acRts, i)
+                    if w.evFvgId >= 0
+                        bool on = bar_index <= w.evExpBar
+                        if w.evOn and not on
+                            nFvEvExp += 1
+                        w.evOn := on
+
         // (B4) 候補の選定: 有効な候補だけ → 時間足優先 → 近い境界 → 古い Accum。LONG と SHORT が両方あれば見送り
         AcCand bestL = na
         AcCand bestS = na
@@ -1086,4 +1216,23 @@ plot(nRgExp,    "ACC · P5・P6 待機の期限切れ", display = display.data_w
 plot(nRgBrk,    "ACC · P5・P6 突破による待機解除", display = display.data_window)
 plot(nSkipSl56, "ACC · 見送り SL 幅 (P5・P6)", display = display.data_window)
 plot(nSkipRR56, "ACC · 見送り RR (P5・P6)", display = display.data_window)
+plot(nFvUp,    "ACC · FVG 上昇 FVG 検出", display = display.data_window)
+plot(nFvDn,    "ACC · FVG 下降 FVG 検出", display = display.data_window)
+plot(nFvUpAbs, "ACC · FVG 上昇 FVG 吸収 (SHORT)", display = display.data_window)
+plot(nFvDnAbs, "ACC · FVG 下降 FVG 吸収 (LONG)", display = display.data_window)
+plot(nFvEv5,   "ACC · FVG P5 待機中の吸収成立", display = display.data_window)
+plot(nFvEv6,   "ACC · FVG P6 待機中の吸収成立", display = display.data_window)
+plot(nFvEvExp, "ACC · FVG 吸収後の有効期限切れ (待機中)", display = display.data_window)
+f_evCount(int side) =>
+    int r = 0
+    int n = array.size(acRts)
+    if n > 0
+        for i = 0 to n - 1
+            AcRt w = array.get(acRts, i)
+            r += w.side == side and w.evOn ? 1 : 0
+    r
+plot(f_evCount(-1), "ACC · FVG 根拠が有効な P5 待機 (現在)", display = display.data_window)
+plot(f_evCount(1),  "ACC · FVG 根拠が有効な P6 待機 (現在)", display = display.data_window)
+plot(na(acFvUp) ? na : acFvUp.lo, "ACC · FVG 監視中の上昇 FVG 下限", display = display.data_window)
+plot(na(acFvDn) ? na : acFvDn.hi, "ACC · FVG 監視中の下降 FVG 上限", display = display.data_window)
 plot(array.size(acEvs), "ACC · 有効な突破イベント", display = display.data_window)

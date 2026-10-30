@@ -108,9 +108,12 @@ def gate_static():
           "[1] the same way) -> same delivery bar, the flag arrives with the values",
           "    [_u[1], _l[1], _i[1], _a[1]]" in conf and "    [_u[1], _l[1], _i[1]]" in nconf
           and "[_i, _u, _l, _a] = f_acAccumBoxState(" in conf)
-    bad = [w for w in ("import ", "zn.", "SATS", "satBand", "FVG", "fvg", "ta.ema", "ta.sma", "ta.vwma", "Zone", "trend")
-           if w in cc]
-    check("AS-06 independent: no import / Engine / SATS / FVG / MA / Zone / trend code", not bad, str(bad))
+    bad = [w for w in ("import ", "zn.", "SATS", "satBand", "FVG Batch", "f_fvg", "f_stZoneEval", "ta.ema", "ta.sma", "ta.vwma",
+                       "Zone", "trend") if w in cc]
+    fv_own = [l for l in cc.split("\n") if re.search(r"\bfvg\b|FVG|Fvg|acFv|nFv|fvUse|fvMinW|fvLife|fvAbsLife|dsFvg", l)]
+    check("AS-06 independent: no import / Engine / SATS / MA / Zone / trend code and none of the Zone Strategies' FVG code "
+          "(FVG Batch / f_fvg* / f_stZoneEval); the only FVG code is this file's own ACC-5A module (evidence only)",
+          not bad and fv_own and all("ACC-5A" in SRC[:SRC.index("//@version=5")] for _ in [0]), str(bad))
     inp = ap.inputs()
     want = dict(acUse1=True, acUse2=True, acUse3=True, acKeep1=3, acKeep2=2, acKeep3=1, acLife1=3.0, acLife2=7.0, acLife3=30.0,
                 accumRangeLen=10, accumBaseLen=20, accumAtrLen=14, accumMinUpperCloses=4, accumMinLowerCloses=4,
@@ -1120,6 +1123,154 @@ def gate_acc4_series():
 
 
 # ============================================================================
+# AW : ACC-5A — 5M FVG absorption as P5 / P6 evidence (detection / storage only; orders unchanged)
+#      the scenarios run with P5 / P6 OFF (contacts and waits are still tracked) so no order consumes a wait unless asked
+# ============================================================================
+FA1 = B(4283, 4285, 4279, 4280)               # bearish: high 4285 = the up FVG's lower edge
+FA2 = B(4284, 4292, 4283, 4291)               # bullish middle candle
+FA3 = B(4291, 4295, 4287, 4294)               # low 4287 > 4285 -> up FVG 4285 / 4287 (gap 2) formed on this bar
+FT = B(4294, 4298, 4291, 4297)                # P5 contact (high 4298 >= 4297), bullish
+FP = B(4297, 4297.5, 4286, 4288)              # bearish, fills into the FVG, close 4288 > 4285 (not absorbed)
+FX = B(4288, 4291.5, 4283, 4284.5)            # bearish close 4284.5 <= 4285 -> absorbed
+FN = B(4284, 4286, 4283, 4285.5)              # neutral bullish bar
+FBASE = [M, FA1, FA2, FA3, FT, FP, FX]        # FVG bar 3, contact bar 4, partial bar 5, absorption bar 6
+
+
+def run5(seq, feed=FR, overrides=None, **kw):
+    ov = dict(enP5=False, enP6=False)
+    ov.update(overrides or {})
+    return ap.Runner(ov, src=SRC_OVERRIDE, **kw).run(bars_of(seq, feed))
+
+
+def evs(r, side=-1):
+    return [(w.tBar, w.evFvgId, w.evFvgBar, w.evFvgLo, w.evFvgHi, w.evAbsBar, w.evExpBar, w.evOn) for w in r["acRts"] if w.side == side]
+
+
+def fcnt(r):
+    return tuple(r[k] for k in ("nFvUp", "nFvDn", "nFvUpAbs", "nFvDnAbs", "nFvEv5", "nFvEv6", "nFvEvExp"))
+
+
+def mirror(b):
+    return tuple([8550 - b[0], 8550 - b[2], 8550 - b[1], 8550 - b[3]])
+
+
+def gate_acc5a():
+    r = run5(FBASE)
+    check("AW-01 3-bar up FVG (low 4287 > high[2] 4285, middle bullish) formed on bar 3 before the contact (bar 4); bar 5 fills "
+          "part of it (bearish close 4288 > 4285: no absorption); bar 6 bearish close 4284.5 <= 4285 -> absorbed (multi-bar fill), "
+          "linked to the P5 wait as evidence (FVG id 1, formed bar 3, 4285 / 4287, absorbed bar 6, valid to bar 11)",
+          evs(r) == [(4, 1, 3, 4285.0, 4287.0, 6, 11, True)] and fcnt(r) == (1, 0, 1, 0, 1, 0, 0) and r["acFvUp"] is None,
+          f"{evs(r)} {fcnt(r)}")
+    r = run5([M, FA1, B(4291, 4292, 4283, 4284), FA3])
+    check("AW-02 middle candle bearish -> no up FVG", r["nFvUp"] == 0 and r["acFvUp"] is None)
+    a = run5([M, FA1, FA2, B(4291, 4295, 4286, 4294)])
+    b = run5([M, FA1, FA2, B(4291, 4295, 4285.99, 4294)])
+    check("AW-03 minimum width 1.0: gap 1.00 detected, gap 0.99 not", a["nFvUp"] == 1 and b["nFvUp"] == 0)
+    r = run5([M, FT] + [FN] * 4 + [FA1, FA2, FA3, FN, FN, FX, FN, FN, FN])
+    check("AW-04 newest FVG only: the up FVG of bar 2 (4276 / 4283) is replaced by the one of bar 8 (4285 / 4287); the absorption "
+          "(bar 11) uses the newest", evs(r) == [] and r["nFvUp"] == 2 and r.trace[11]["bar"] == 11
+          and r["nFvUpAbs"] == 1, f"{fcnt(r)}")
+    r2 = run5([M, FT] + [FN] * 4 + [FA1, FA2, FA3, FN, FN, FX, FN, FN])
+    check("AW-05 12-bar wait first: contact bar 1, absorption bar 11 (age 10) -> evidence valid on bar 13 (wait age 12); on bar "
+          "14 the wait expires and its evidence goes with it (no evidence expiry counted)",
+          evs(r2) == [(1, 2, 8, 4285.0, 4287.0, 11, 16, True)] and evs(r) == [] and r["nFvEvExp"] == 0, f"{evs(r2)} {evs(r)}")
+    E1, E2, E3 = B(4294, 4295, 4291, 4292), B(4292, 4292.5, 4286, 4287), B(4287, 4289, 4283, 4288)
+    seq = [M, FA1, FA2, FA3, E1, E2, E3, B(4288, 4292, 4287.5, 4291.5), B(4291, 4291.5, 4283, 4284)]
+    ra = ap.Runner(dict(enP5=False, enP6=False), src=SRC_OVERRIDE).run(bars_of(seq[:8], FR))
+    r = run5(seq)
+    check("AW-06 up / down FVGs independent: a down FVG (4289 / 4291, bar 6) is absorbed by a bullish close 4291.5 (bar 7) while "
+          "the up FVG (bar 3) stays monitored; bar 8 bearish 4284 absorbs the up FVG",
+          ra["acFvUp"] is not None and ra["acFvUp"].id == 1 and ra["acFvDn"] is None and fcnt(r)[:4] == (1, 1, 1, 1), f"{fcnt(r)}")
+    a = run5([M, FA1, FA2, FA3, FT] + [FN] * 8 + [FX, FN])
+    b = run5([M, FA1, FA2, FA3, FT] + [FN] * 9 + [FX, FN])
+    check("AW-07 FVG life: absorption on bar 13 (10 after the formation) counts; on bar 14 (11) the FVG has expired",
+          a["nFvUpAbs"] == 1 and evs(a)[0][5] == 13 and b["nFvUpAbs"] == 0 and b["acFvUp"] is None and evs(b)[0][1] == -1,
+          f"{fcnt(a)} {fcnt(b)}")
+    r = run5([M, FA1, FA2, FA3, FT, FP, B(4288, 4291.5, 4283, 4285.5), FN])
+    check("AW-08 wick through the whole FVG (low 4283) with a bearish close 4285.5 > 4285 -> not absorbed", r["nFvUpAbs"] == 0
+          and evs(r)[0][1] == -1)
+    r2 = run5([M, FA1, FA2, FA3, FT, FP, B(4288, 4291.5, 4282, 4284), FN])
+    r3 = run5([M, FA1, FA2, FA3, FT, FP, B(4280, 4291.5, 4279, 4284), FN])
+    check("AW-09 close 4284 below the FVG: bearish bar (open 4288) absorbs, bullish bar (open 4280) does not", r2["nFvUpAbs"] == 1
+          and r3["nFvUpAbs"] == 0 and evs(r3)[0][1] == -1)
+    seq = [M, B(4290, 4292, 4288, 4289), B(4289, 4295, 4288.5, 4294.5), B(4294.5, 4296, 4293.5, 4295.5), B(4295.5, 4298, 4290, 4291), FN]
+    r = run5(seq)
+    check("AW-10 contact and absorption on the same bar (bar 4: high 4298, bearish close 4291 <= 4292) -> evidence on that wait",
+          [e[:2] + (e[5],) for e in evs(r)] == [(4, 1, 4)], str(evs(r)))
+    r = run5([M, FA1, FA2, FA3, B(4294, 4295, 4286, 4288), FX, FT, FN])
+    check("AW-11 absorption before the contact (bar 5, contact bar 6) is not used as evidence", evs(r) == [(6, -1, None, None, None, None, None, False)]
+          and r["nFvUpAbs"] == 1 and r["nFvEv5"] == 0, str(evs(r)))
+    a = run5(FBASE + [FN] * 5)
+    b = run5(FBASE + [FN] * 6)
+    check("AW-12 evidence valid through the 5th bar after the absorption (bar 11) and invalid on the 6th (bar 12), counted once",
+          evs(a)[0][7] is True and evs(b)[0][7] is False and b["nFvEvExp"] == 1 and evs(b)[0][5] == 6)
+    r = run5(FBASE + [B(4285, 4285.5, 4282, 4283), B(4283, 4284, 4281, 4282), FN])
+    check("AW-13 further bearish closes below the absorbed FVG do not re-absorb or extend (absorption bar stays 6)",
+          evs(r)[0][5:7] == (6, 11) and r["nFvUpAbs"] == 1 and r["nFvEv5"] == 1)
+    r = run5(FBASE + [B(4285, 4286, 4283, 4284), B(4284, 4290, 4283.5, 4289), B(4289, 4292, 4287, 4291), FN])
+    check("AW-14 a new up FVG formed after the absorption (bar 9) does not touch the stored evidence (still valid, same FVG id)",
+          r["nFvUp"] == 2 and r["acFvUp"].id == 2 and evs(r)[0][1:] == (1, 3, 4285.0, 4287.0, 6, 11, True), str(evs(r)))
+    r = run5(FBASE + [B(4285, 4303, 4284, 4302), FN])
+    rc = run5([M, FA1, FA2, FA3, FT, B(4290, 4297.5, 4286, 4292), FX, FN], overrides=dict(enP5=True))
+    check("AW-15 the wait ends -> its evidence is unusable: a close above the upper (4302) cancels the wait with its evidence; the "
+          "P5 order on the absorption bar consumes the wait (evidence linked first, then gone)",
+          evs(r) == [] and r["nFvEv5"] == 1 and evs(rc) == [] and rc["nFvEv5"] == 1 and rc["nEnt5"] == 1, f"{evs(r)} {evs(rc)}")
+    r = run5(FBASE + [B(4285, 4303, 4284, 4302), B(4301, 4302, 4294, 4295), FN, FT, FN])
+    check("AW-16 a new contact after the cancel (re-armed by bar 9, contact bar 10) starts without evidence (old absorption not reused)",
+          evs(r) == [(10, -1, None, None, None, None, None, False)], str(evs(r)))
+    fd3 = {1: (4300.0, 4250.0, AID1, 0), 2: (4310.0, 4240.0, AID1, 0), 3: (4320.0, 4200.0, AID1, 0)}
+    r = run5([M, FA1, FA2, FA3, FT, B(4297, 4308, 4296, 4299), FX, B(4285, 4318, 4284, 4290)], fd3)
+    check("AW-17 several waits: 1H contact bar 4 and 4H contact bar 5 both take the bar-6 absorption (each keeps its own contact "
+          "bar); the D contact on bar 7 (after the absorption) has none",
+          sorted((e[0], e[1], e[5]) for e in evs(r)) == [(4, 2, 6), (5, 2, 6), (7, -1, None)] and r["nFvEv5"] == 2, str(evs(r)))
+    r = run5([mirror(x) for x in FBASE] + [mirror(FN)] * 2)
+    check("AW-18 mirror for P6: down FVG 4263 / 4265 (high < low[2], middle bearish), contact at the lower, bullish close 4265.5 "
+          ">= 4265 -> LONG absorption on the P6 wait", evs(r, 1) == [(4, 1, 3, 4263.0, 4265.0, 6, 11, True)]
+          and fcnt(r) == (0, 1, 0, 1, 0, 1, 0), f"{evs(r, 1)} {fcnt(r)}")
+    tk = lambda b: b + (ap.Broker.bar_path(*b),)
+    rt = run5([tk(x) for x in FBASE + [FN] * 6])
+    hs = run5(FBASE + [FN] * 6)
+    check("AW-19 realtime ticks: the same FVG / evidence state as on history (decided on the confirmed tick only)",
+          evs(rt) == evs(hs) and fcnt(rt) == fcnt(hs))
+    a = run5(FBASE, overrides=dict(fvUse=False))
+    check("AW-20 FVG module OFF: no FVG, no evidence", fcnt(a) == (0,) * 7 and evs(a)[0][1] == -1)
+    many = []
+    for k in range(40):
+        many += [FA1, FA2, FA3, FN] if k % 2 == 0 else [FN, FN]
+    r = run5([M] + many, overrides=dict(dsFvgMax=5))
+    r0 = run5([M] + many, overrides=dict(dsFvg=False))
+    nbox = len([d for d in r.draws if d.kind == "box"])
+    check("AW-21 display: the script keeps at most 5 FVG boxes / absorption labels (older ones deleted) of %d drawn; display OFF "
+          "draws nothing and changes no FVG state" % nbox, len(r["acFvBoxes"]) == 5 and len(r["acFvLbls"]) == 5 and nbox > 5
+          and not [d for d in r0.draws if d.kind == "box"] and fcnt(r0) == fcnt(r))
+
+
+ACC4_REV = "b6a1736"
+AX_COUNTERS = AV_COUNTERS + ("nSig5", "nSig6", "nEnt5", "nEnt6", "nTouch5", "nTouch6", "nRgExp", "nRgBrk", "nSkipSl56", "nSkipRR56")
+
+
+def gate_acc5a_series():
+    import nr_a1_sim as nas
+    old_src = subprocess.run(["git", "-C", ROOT, "show", f"{ACC4_REV}:AccumStrategyXAU.pine"], capture_output=True, text=True).stdout
+    same, n_ord, n_abs, det = True, 0, 0, ""
+    for seed in (51, 52):
+        b5 = nas.market(seed, 20)
+        feeds = feeds_from_5m(nas, b5)
+        bars = [dict(t=t, o=o, h=h, l=l, c=c, feed=feeds[i]) for i, (t, o, h, l, c) in enumerate(b5)]
+        for ov in (dict(), ACC3_OV, dict(enP5=False), dict(enP6=False)):
+            a = ap.Runner(dict(ov), src=old_src).run(bars)
+            for fv in (True, False):
+                b = ap.Runner(dict(ov, fvUse=fv)).run(bars)
+                n_ord += len(orders(b))
+                n_abs += b["nFvUpAbs"] + b["nFvDnAbs"]
+                if a.broker.log != b.broker.log or any(a[k] != b[k] for k in AX_COUNTERS):
+                    same, det = False, f"seed {seed} {ov} fvUse={fv}"
+    check("AX-01 orders / fills / exits / P&L unchanged: the ACC-4 file (b6a1736) and ACC-5A give the identical broker log and "
+          "trading counters on random series (ACC-4 defaults, ACC-3 settings, P5 only, P6 only), with the FVG module ON and OFF",
+          same and n_ord > 0 and n_abs > 0, f"{det} orders={n_ord} absorptions={n_abs}")
+
+
+# ============================================================================
 # AU : mutations of the Pine text are caught by the scenario gates
 # ============================================================================
 MUTATIONS = [
@@ -1160,6 +1311,16 @@ MUTATIONS = [
     ("ACC-4 contact on the fix bar", "if f_valid(b) and time > b.fixTime and close <= b.up", "if f_valid(b) and close <= b.up"),
     ("ACC-4 break does not cancel the wait", "                if close > w.up or close < w.lo\n", "                if false\n"),
     ("ACC-4 P5 / P6 minimum SL = P1..P4 minimum", "    if slw < rgMinSl - EPS or slw > rkMaxSl + EPS", "    if slw < rkMinSl - EPS or slw > rkMaxSl + EPS"),
+    ("ACC-5A FVG middle candle ignored", "low > acH2 and acC1 > acO1 and", "low > acH2 and"),
+    ("ACC-5A FVG minimum width strict", "low - acH2 >= fvMinW - EPS", "low - acH2 > fvMinW + EPS"),
+    ("ACC-5A FVG life off by one", "if not na(acFvUp) and bar_index - acFvUp.fBar > fvLife", "if not na(acFvUp) and bar_index - acFvUp.fBar >= fvLife"),
+    ("ACC-5A absorption without the bearish close", "bool absd = fv.dir == 1 ? (close < open and close <= fv.lo)", "bool absd = fv.dir == 1 ? (close <= fv.lo)"),
+    ("ACC-5A absorption by the wick", "(close < open and close <= fv.lo)", "(close < open and low <= fv.lo)"),
+    ("ACC-5A evidence life off by one", "                        bool on = bar_index <= w.evExpBar", "                        bool on = bar_index < w.evExpBar"),
+    ("ACC-5A absorbed FVG kept monitored", "                        if d == 0\n                            acFvUp := na", "                        if false\n                            acFvUp := na"),
+    # (removing `w.tBar <= bar_index` is an equivalent mutant: a wait exists only from its contact bar, so an absorption before the
+    #  contact has no wait to attach to - AW-11 pins that behaviour)
+    ("ACC-5A evidence on the opposite side's waits", "                        int wside = fv.dir == 1 ? -1 : 1", "                        int wside = fv.dir == 1 ? 1 : -1"),
 ]
 
 
@@ -1174,7 +1335,7 @@ def gate_mutation():
                 continue
             SRC_OVERRIDE = SRC.replace(old, new)
             RESULTS = []
-            for g in (gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3, gate_acc4):
+            for g in (gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3, gate_acc4, gate_acc5a):
                 try:
                     g()
                 except Exception:      # noqa: BLE001
@@ -1191,7 +1352,7 @@ def gate_mutation():
 
 
 def main():
-    for g in (gate_static, gate_accum, gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3, gate_acc4, gate_acc2_series, gate_acc4_series, gate_fuzz, gate_mutation):
+    for g in (gate_static, gate_accum, gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3, gate_acc4, gate_acc5a, gate_acc2_series, gate_acc4_series, gate_acc5a_series, gate_fuzz, gate_mutation):
         try:
             g()
         except Exception:      # noqa: BLE001
