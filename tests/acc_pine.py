@@ -750,12 +750,21 @@ class Runner:
     """bars: dicts with t (open time ms), o, h, l, c, feed = {1: (u, l, id, acc), 2: ..., 3: ...} (missing = na),
     optional ticks = [prices] (realtime mode for that bar; the last tick must equal c)."""
 
-    def __init__(self, overrides=None, usdjpy=150.0, src=None, recalc_fills=False, recalc_confirmed=True, varip_rollback=False):
+    def __init__(self, overrides=None, usdjpy=150.0, src=None, recalc_fills=False, recalc_confirmed=True, varip_rollback=False,
+                 history_ticks=None, tick_segments=False):
         """recalc_fills: emulate the Properties setting "Recalculate: After order is filled" (calc_on_order_fills = true): one
         extra execution after every price point with a fill. On historical bars it sees the bar's FINAL values (the documented
         lookahead) with barstate.isconfirmed = recalc_confirmed (not documented; True = worst case); on ticks the tick's values.
         var state is rolled back before every execution of a bar; varip too only when varip_rollback (not documented)."""
         self.recalc_fills, self.recalc_confirmed, self.varip_rollback = recalc_fills, recalc_confirmed, varip_rollback
+        # ACC-3: bars given with ticks run as HISTORICAL bars ("On history bar tick" / calc_on_every_history_tick):
+        #   None            -> ticks are realtime (barstate.ishistory false, isconfirmed on the last tick only)
+        #   "all_confirmed" -> barstate.ishistory true and barstate.isconfirmed true on EVERY tick (the behaviour cited for the
+        #                      setting; not verified here)
+        #   "last_confirmed"-> barstate.ishistory true, isconfirmed on the last tick only (hypothetical oracle: what the setting
+        #                      would give if the final tick were identifiable)
+        # tick_segments: exits between two ticks fill at their own price (a path, not a gap at every tick)
+        self.history_ticks, self.tick_segments = history_ticks, tick_segments
         self.src = src if src is not None else read_source()
         self.code = compile(transpile(self.src), "<AccumStrategyXAU logic>", "exec")
         self.inp = inputs(self.src)
@@ -824,16 +833,20 @@ class Runner:
         else:
             assert ticks[0] == b["o"] and ticks[-1] == b["c"] and max(ticks) == b["h"] and min(ticks) == b["l"]
             hi = lo = ticks[0]
+            hist = self.history_ticks is not None
+            prev = None
             for n, p in enumerate(ticks):
-                nf = self.broker.point(p)                         # each tick: market orders then exits at the tick price
+                nf = self.broker.point(p, prev if self.tick_segments else None)   # market orders, then exits
+                prev = p
                 hi, lo = max(hi, p), min(lo, p)
                 last = n == len(ticks) - 1
+                conf = True if self.history_ticks == "all_confirmed" else last
                 if nf and self.recalc_fills and not last:
                     self._rollback()
-                    self._set_series(b, ticks[0], hi, lo, p, False, history=False)
+                    self._set_series(b, ticks[0], hi, lo, p, False, history=hist)
                     self._exec()
                 self._rollback()
-                self._set_series(b, ticks[0], hi, lo, p, last, history=False)
+                self._set_series(b, ticks[0], hi, lo, p, conf, history=hist)
                 self._exec()
         self.committed = self._snapshot()
         self.prev_close = b["c"]

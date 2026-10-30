@@ -1,8 +1,9 @@
 """ACC-1 / ACC-2 — the new Accum Strategy XAU files and their exact registration in the older fixtures.
 
-ACC-1 / ACC-2 add files only (no existing Strategy / Engine / Visual / harness changes):
+ACC-1 / ACC-2 / ACC-3 add files only (no existing Strategy / Engine / Visual / harness changes):
   AccumStrategyXAU.pine, ACCUM_STRATEGY_XAU_ja.md, tests/acc_pine.py, tests/acc_sim.py, tests/acc_build.py (this file) and
-  tests/.gitignore (`__pycache__/`, same rule as automation/xau_short/receiver/.gitignore and bridge/.gitignore).
+  tests/.gitignore (`__pycache__/`, same rule as automation/xau_short/receiver/.gitignore and bridge/.gitignore) and the
+  ACC-3 TradingView probe AccHistTickProbe.pine (no trading by default, not used by the Strategy).
 The older fixtures' "every other file unchanged" checks accept these files only through ok() / NEW_FILES (TEST_EDITS below:
 one clause per check, nothing else). The heads of the older unadapt() chains (eua_build.unadapt, cad_adapt.later_unadapt) revert these
 edits first, exactly, so every older "test file changed by exactly its recorded edit" check still compares the old text.
@@ -12,7 +13,7 @@ import os
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PINE_PATH = "AccumStrategyXAU.pine"
 NEW_FILES = ("AccumStrategyXAU.pine", "ACCUM_STRATEGY_XAU_ja.md", "tests/acc_pine.py", "tests/acc_sim.py", "tests/acc_build.py",
-             "tests/.gitignore")
+             "tests/.gitignore", "AccHistTickProbe.pine", "tests/acc3_exp.py")     # ACC-3: TradingView probe (no trading by default) / experiment
 NEW_TESTS = NEW_FILES
 
 
@@ -132,7 +133,8 @@ TEST_EDITS = {
         ('             "tests/eua_build.py", "tests/eua_sim.py")                                       # new in the later layer EUA-1 (EURUSD adopted defaults)\n',
          '             "tests/eua_build.py", "tests/eua_sim.py",                                       # new in the later layer EUA-1 (EURUSD adopted defaults)\n'
          '             "AccumStrategyXAU.pine", "ACCUM_STRATEGY_XAU_ja.md", "tests/acc_pine.py",       # new in the later layers ACC-1 / ACC-2 (Accum Strategy XAU)\n'
-         '             "tests/acc_sim.py", "tests/acc_build.py", "tests/.gitignore")\n', 1),
+         '             "tests/acc_sim.py", "tests/acc_build.py", "tests/.gitignore",                   # new in the later layers ACC-1 / ACC-2\n'
+         '             "AccHistTickProbe.pine", "tests/acc3_exp.py")                                   # new in the later layer ACC-3 (probe / experiment)\n', 1),
         ('    """the text with the edits of the layers after CAD-1 (LATER: XA-5) reverted, all or nothing per file."""\n',
          '    """the text with the edits of the layers after CAD-1 (LATER: XA-5) reverted, all or nothing per file."""\n'
          f'    text = {A}.unadapt(path, text)     # the later ACC-1 test edits are reverted first, exactly\n', 1)],

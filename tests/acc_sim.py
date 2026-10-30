@@ -128,10 +128,11 @@ def gate_static():
     base = lambda m: subprocess.run(["git", "-C", ROOT, "show", f"{BASE_REV}:{m}"], capture_output=True, text=True).stdout
     bad = sorted(m for m in mod if not ab.ok(m)
                  and not (m in ab.TEST_EDITS and ab.unadapt(m, raw(m)) == base(m) and ab.unadapt(m, raw(m)) != raw(m)))
-    pine = sorted(m for m in mod if m.endswith(".pine"))
+    pine = sorted(m for m in mod if m.endswith(".pine"))     # ACC-3: + the TradingView probe
     check("AS-10 vs 890498e only the ACC files (acc_build.NEW_FILES) are new and only the older fixtures listed in "
-          "acc_build.TEST_EDITS change, each by exactly its recorded edit; the only Pine change is the new AccumStrategyXAU.pine "
-          "(existing Strategies / Engines / Visuals untouched)", not bad and pine == ["AccumStrategyXAU.pine"]
+          "acc_build.TEST_EDITS change, each by exactly its recorded edit; the only Pine changes are the new AccumStrategyXAU.pine "
+          "and the ACC-3 probe AccHistTickProbe.pine "
+          "(existing Strategies / Engines / Visuals untouched)", not bad and pine == ["AccHistTickProbe.pine", "AccumStrategyXAU.pine"]
           and set(ab.TEST_EDITS) <= mod, str(bad))
     try:
         ap.transpile()
@@ -813,6 +814,67 @@ def gate_acc2():
           orders(a) == orders(b) and exits(a) == exits(b) and len(orders(b)) == 1)
 
 
+# ============================================================================
+# AT : ACC-3 — "On history bar tick" (calc_on_every_history_tick) against the ACC-2 Strategy
+#      emulated as: historical bars replayed tick by tick, barstate.isconfirmed TRUE on every tick (the behaviour cited for the
+#      setting, not verified here), var rolled back before every tick, varip kept
+# ============================================================================
+ACC2_REV = "936d27f"
+NO_GUARD1 = ("        if acExecN > 1\n            runtime.error(", "        if false\n            runtime.error(")
+
+
+def gate_acc3():
+    seq = [IN + ([4290.0, 4291.0, 4289.0, 4290.0],), B(4295, 4307, 4294, 4306, [4295, 4294, 4307, 4306]),
+           B(4306, 4306.5, 4299, 4299, [4306, 4302.5, 4304, 4306.5, 4299]), B(4299, 4300, 4297, 4298, [4299, 4300, 4297, 4298])]
+    r = ap.Runner(src=SRC_OVERRIDE, history_ticks="all_confirmed")
+    try:
+        r.run(bars_of(seq))
+        msg = None
+    except ap.PineScriptStopped as ex:
+        msg = str(ex)
+    check("AT-01 ACC-2 under history ticks (isconfirmed on every tick): stopped by runtime.error on the first historical bar "
+          "with a 2nd execution, before any order", msg is not None and "2 回以上" in msg and r.bar_index == 0 and orders(r) == [],
+          str(msg))
+    if SRC_OVERRIDE is not None:
+        return
+    src = SRC.replace(*NO_GUARD1)
+    r = ap.Runner(src=src, history_ticks="all_confirmed")
+    try:
+        r.run(bars_of(seq))
+        msg = None
+    except ap.PineScriptStopped as ex:
+        msg = str(ex)
+    n = ap.Runner().run(bars_of([x[:4] for x in seq]))
+    check("AT-02 why the guard stays (guard 1 removed in memory only): the tick 4304 after the 4302.5 wick (not the bar's "
+          "close) is taken as a confirmed retest -> P2 LONG sent and filled INSIDE that bar at 4306.5; the 5M close (4299) "
+          "decides P1 SHORT at the next open in the normal run; the unmanaged-position guard then stops the script",
+          orders(r) == [(2, "L1", 1, 10.0)] and fills(r) == [(2, "L1", 1, 10.0, 4306.5)] and msg is not None and "管理外" in msg
+          and orders(n) == [(2, "S1", -1, 6.0)] and fills(n)[0][0] == 3, f"{orders(r)} {fills(r)} {msg} / {orders(n)}")
+    # accum / break state alone: rolled back before every tick -> equal to the normal run at every bar end (no orders here)
+    seq2 = [IN + ([4290.0, 4291.0, 4289.0, 4290.0],), B(4295, 4307, 4294, 4299, [4295, 4307, 4306, 4294, 4299]),
+            B(4299, 4303, 4279.5, 4285, [4299, 4303, 4279.5, 4280, 4285]), IN + ([4290.0, 4291.0, 4289.0, 4290.0],)]
+    def feed(i):
+        return {1: (U, L, AID1, 1 if i < 1 else 0)}
+    a = ap.Runner(src=src, history_ticks="all_confirmed")
+    b = ap.Runner()
+    same = True
+    for x, y in zip(bars_of(seq2, feed), bars_of([z[:4] for z in seq2], feed)):
+        a.step(x)
+        b.step(y)
+        if repr(a["acBoxes"]) != repr(b["acBoxes"]) or repr(a["acEvs"]) != repr(b["acEvs"]) or a["acSeq"] != b["acSeq"]:
+            same = False
+    check("AT-03 accum and break-event state under history ticks (guard 1 removed, var rolled back before every tick): equal to "
+          "the normal run at every bar end although intermediate ticks cross the boundaries -> the state is not broken; the "
+          "orders are (AT-02)", same and orders(a) == [] and orders(b) == [])
+    cur = SRC
+    old = subprocess.run(["git", "-C", ROOT, "show", f"{ACC2_REV}:AccumStrategyXAU.pine"], capture_output=True, text=True).stdout
+    probe = raw("AccHistTickProbe.pine")
+    check("AT-04 ACC-3 keeps the ACC-2 Strategy byte for byte (code, defaults, orders); the probe is a separate file with no "
+          "trading by default (prOrders false) and no link to the Strategy",
+          cur == old and 'prOrders = input.bool(false,' in probe and "import " not in code_only(probe)
+          and "AccumStrategyXAU" not in code_only(probe) and "strategy.entry(" in probe)
+
+
 def gate_acc2_series():
     """ACC-2 checks over random series (kept out of the mutation loop for run time)."""
     # no unconfirmed HTF information: real formula, fix bar = first 5M bar after the close of the HTF bar that ended the accum
@@ -916,7 +978,7 @@ def gate_mutation():
                 continue
             SRC_OVERRIDE = SRC.replace(old, new)
             RESULTS = []
-            for g in (gate_entry, gate_risk, gate_orders, gate_acc2):
+            for g in (gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3):
                 try:
                     g()
                 except Exception:      # noqa: BLE001
@@ -933,7 +995,7 @@ def gate_mutation():
 
 
 def main():
-    for g in (gate_static, gate_accum, gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc2_series, gate_fuzz, gate_mutation):
+    for g in (gate_static, gate_accum, gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3, gate_acc2_series, gate_fuzz, gate_mutation):
         try:
             g()
         except Exception:      # noqa: BLE001

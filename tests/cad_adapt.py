@@ -34,7 +34,8 @@ LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src
              "tests/uja_build.py", "tests/uja_sim.py",                                       # new in the later layer UJA-1 (USDJPY adopted defaults)
              "tests/eua_build.py", "tests/eua_sim.py",                                       # new in the later layer EUA-1 (EURUSD adopted defaults)
              "AccumStrategyXAU.pine", "ACCUM_STRATEGY_XAU_ja.md", "tests/acc_pine.py",       # new in the later layers ACC-1 / ACC-2 (Accum Strategy XAU)
-             "tests/acc_sim.py", "tests/acc_build.py", "tests/.gitignore")
+             "tests/acc_sim.py", "tests/acc_build.py", "tests/.gitignore",                   # new in the later layers ACC-1 / ACC-2
+             "AccHistTickProbe.pine", "tests/acc3_exp.py")                                   # new in the later layer ACC-3 (probe / experiment)
 NEW_FILES = ("tests/cad_build.py", "tests/cad_adapt.py", "tests/cad_sim.py") + LATER_NEW
 _rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 
