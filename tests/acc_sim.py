@@ -100,8 +100,11 @@ def gate_static():
           and lstate.rstrip("\n") == state.rstrip("\n").replace("    [_sid, _top, _bot, _isAccum ? 1 : 0]", "    [_sid, _top, _bot]"))
     cc = code_only(SRC)
     reqs = re.findall(r'request\.security\(syminfo\.tickerid, "(\w+)", f_acConfirmed\([^)]*\),\s*lookahead = barmerge\.lookahead_on\)', cc)
-    check("AS-04 exactly 3 request calls: 60 / 240 / D, each f_acConfirmed with lookahead_on (NR-A1 HTF branch); no other "
-          "request / lookahead", reqs == ["60", "240", "D"] and cc.count("request.") == 3 and cc.count("lookahead =") == 3, str(reqs))
+    dvreq = re.findall(r'request\.security\(syminfo\.tickerid, "(\w+)",\s+\[high\[1\], low\[1\], time\[1\]\], lookahead = barmerge\.lookahead_on\)', cc)
+    check("AS-04 request calls: 3 accum calls (60 / 240 / D, f_acConfirmed, lookahead_on = NR-A1 HTF branch) + ACC-5B 4 calls "
+          "(15 / 60 / 240 / D, the confirmed bar's [high[1], low[1], time[1]], lookahead_on); no other request / lookahead",
+          reqs == ["60", "240", "D"] and dvreq == ["15", "60", "240", "D"] and cc.count("request.") == 7
+          and cc.count("lookahead =") == 7, f"{reqs} {dvreq}")
     conf = span(SRC, "f_acConfirmed(simple int", "\n\n")
     nconf = span(raw("ZoneStrategyXAU.pine"), "f_nraAccumConfirmed(simple bool", "\n\n")
     check("AS-05 f_acConfirmed takes the 4 outputs at [1] inside the HTF context (NR-A1 f_nraAccumConfirmed takes its 3 at "
@@ -1271,6 +1274,174 @@ def gate_acc5a_series():
 
 
 # ============================================================================
+# AZ : ACC-5B — early double / triple top / bottom detection as P5 / P6 evidence (detection / storage only; orders unchanged)
+# ============================================================================
+ZB = [M, B(4276, 4285, 4275, 4284), B(4284, 4290, 4283, 4289), B(4289, 4296, 4288, 4290), B(4290, 4291, 4286, 4287),
+      B(4287, 4289, 4284, 4285)]          # 5M peak H = 4296 on bar 3, confirmed on bar 5 (right lows 4286 / 4284: 12 >= 6 away)
+ZUP = B(4285, 4295, 4284, 4294)            # approach (high 4295 >= 4294), bullish
+ZDN = B(4294, 4294.5, 4290, 4291)          # bearish (low 4290 = H - 6: distance met again)
+ZBU = B(4287, 4289, 4286.5, 4288.5)        # bullish, outside the band (low 4286.5: 9.5 below H = distance met)
+ZBN = B(4291, 4293, 4290.5, 4292.5)        # bullish, outside the band, low 4290.5 > H - 6 (distance not met)
+H1 = 3_600_000
+
+
+def dets(r):
+    return [(d.args[0], d.args[2].split(" #")[0]) for d in r.draws if d.kind == "label" and str(d.args[2])[:2] in ("DT", "TT", "DB", "TB")]
+
+
+def zbases(r):
+    return [(g.id, g.tf, g.side, g.lvl, g.cnt, g.away, g.waiting) for g in r["dvBases"]]
+
+
+def runz(seq, feed=FR, overrides=None, dv=None, **kw):
+    ov = dict(enP5=False, enP6=False)
+    ov.update(overrides or {})
+    bars = bars_of(seq, feed)
+    for i, b in enumerate(bars):
+        if dv and i in dv:
+            b["dv"] = dv[i]
+    return ap.Runner(ov, src=SRC_OVERRIDE, **kw).run(bars)
+
+
+def zmirror(seq):
+    return [tuple([8550 - b[0], 8550 - b[2], 8550 - b[1], 8550 - b[3]]) for b in seq]
+
+
+def gate_acc5b():
+    r = runz(ZB + [ZUP, ZDN, B(4291, 4292, 4287, 4288), B(4288, 4289, 4286, 4287)])
+    check("AZ-01 5M peak H 4296 (bar 3) is a base only once its 2 right bars are confirmed (bar 5; the right-side decline 12 >= 6 "
+          "counts at once); bar 6 reaches H - 2 (bullish) = 2nd approach, bar 7 closes bearish -> double top detected on bar 7 "
+          "(later bar, not the approach bar)", dets(r) == [(7, "DT 5M 4296")] and (r["nDvApp"], r["nDvDetLat"], r["nDvDetApp"],
+          r["nDvDetT2"]) == (1, 1, 0, 1), f"{dets(r)}")
+    check("AZ-02 the later smaller peak (4295 on bar 6) becomes a 2nd base without overwriting the first (both kept)",
+          [g[:4] for g in zbases(r)] == [(1, 0, -1, 4296.0), (2, 0, -1, 4295.0)], str(zbases(r)))
+    r = runz(ZB + [B(4293, 4295, 4288, 4289), M])
+    check("AZ-03 the approach bar itself closes bearish -> detected on the approach bar", dets(r) == [(6, "DT 5M 4296")]
+          and r["nDvDetApp"] == 1 and r["nDvDetLat"] == 0)
+    r = runz(ZB + [ZUP, ZBN, ZBN, ZBN, B(4291, 4292, 4290.5, 4291.5)])
+    check("AZ-04 no bearish close on the approach bar and the next 3 bars -> the wait expires on bar 9 (skip); the bearish bar 10 "
+          "is not a detection", dets(r) == [] and r["nDvExp"] == 1 and r["nDvApp"] == 1 and zbases(r)[0][4] == 2, str(zbases(r)))
+    a = runz(ZB + [B(4289, 4299, 4288, 4297), M])
+    b = runz(ZB + [B(4289, 4299, 4288, 4298), M])
+    c = runz(ZB + [B(4299, 4300, 4288, 4298.5), M])
+    check("AZ-05 invalidation by the close only: wick 4299 > H + B with close 4297 keeps the base; close = 4298 (= H + B) keeps it; "
+          "close 4298.5 invalidates it - even on a bearish bar that reached the band (invalidation before the reversal)",
+          [x[0] for x in zbases(a)].count(1) == 1 and [x[0] for x in zbases(b)].count(1) == 1 and not [x for x in zbases(c) if x[0] == 1]
+          and c["nDvInv"] >= 1 and dets(c) == [], f"{zbases(a)} {zbases(b)} {zbases(c)}")
+    stay = B(4294.5, 4297, 4294, 4296)
+    r = runz(ZB + [ZUP, stay, stay, stay, stay, stay, ZDN])
+    check("AZ-06 staying in the band after the approach (bars 7..11, no return to H - 6) is one approach: no 3rd approach, the "
+          "skip and no extra count", r["nDvApp"] == 1 and r["nDvExp"] == 1 and dets(r) == [], f"{r['nDvApp']} {dets(r)}")
+    r = runz(ZB + [ZUP, ZBN, ZBN, ZBN, ZDN, B(4291, 4295, 4290.5, 4294.5), ZDN, M])
+    check("AZ-07 skipped 2nd approach (expired on bar 9; the wait bars stay above H - 6) still counts: distance met on bar 10 (low "
+          "4290; its touch of the band is not an approach yet), 3rd approach bar 11, bearish bar 12 -> triple top; the base ends", ("12", "TT 5M 4296") in [(str(x), y) for x, y in dets(r)] and r["nDvDetT3"] == 1
+          and not [x for x in zbases(r) if x[0] == 1], f"{dets(r)} {zbases(r)}")
+    r = runz(ZB + [ZUP, ZDN, B(4291, 4292, 4287, 4289.5), B(4289, 4295, 4288.5, 4294.5), ZDN, M])
+    check("AZ-08 detection on the 2nd approach, distance met again (bar 7 low 4290), 3rd approach bar 9 + bearish bar 10 -> triple "
+          "top; each approach detects once; base finished", [y for _, y in dets(r) if y.endswith("4296")] == ["DT 5M 4296", "TT 5M 4296"]
+          and not [x for x in zbases(r) if x[0] == 1], f"{dets(r)}")
+    r = runz(zmirror(ZB + [ZUP, ZDN, B(4291, 4292, 4287, 4288), B(4288, 4289, 4286, 4287)]))
+    r2 = runz(zmirror(ZB + [ZUP, ZBN, ZBN, ZBN, ZDN, B(4291, 4295, 4290.5, 4294.5), ZDN, M]))
+    check("AZ-09 bottoms mirror tops exactly (L 4254, bullish reversal, same bars / counters)", dets(r) == [(7, "DB 5M 4254")]
+          and ("12", "TB 5M 4254") in [(str(x), y) for x, y in dets(r2)] and (r2["nDvDetB3"], r2["nDvExp"]) == (1, 1), f"{dets(r)} {dets(r2)}")
+    hb = [(4280, 4270), (4285, 4275), (4296, 4284), (4290, 4280), (4285, 4278)]
+    dv = {i + 1: {2: (hb[i][0], hb[i][1], T0 - (10 - i) * H1)} for i in range(5)}
+    r = runz([M] * 6 + [B(4285, 4292, 4284, 4291), B(4291, 4292, 4288, 4289), M], dv=dv)
+    check("AZ-10 1H peak (delivered confirmed 1H bars): the decline 4296 -> 4278 inside its 2 right bars (18 >= 15) makes it ready "
+          "on delivery (bar 5); approach on bar 6 (high 4292 >= 4291), bearish bar 7 -> double top 1H", dets(r) == [(7, "DT 1H 4296")]
+          and zbases(r)[0][:4] == (1, 2, -1, 4296), str(dets(r)))
+    hb2 = [(4280, 4270), (4285, 4275), (4296, 4290), (4292, 4286), (4290, 4285)]
+    dv2 = {i + 1: {2: (hb2[i][0], hb2[i][1], T0 - (10 - i) * H1)} for i in range(5)}
+    flat = B(4288, 4289, 4287, 4288)
+    r = runz([flat] * 6 + [B(4288, 4292, 4287, 4291.5), B(4291, 4291.5, 4280, 4281), B(4281, 4292, 4280.5, 4291),
+                           B(4291, 4291.5, 4286, 4287)], dv=dv2)
+    check("AZ-11 1H peak with only 11 decline in its right bars: not ready; the right bar that touched the band (4292) before "
+          "delivery is not counted (no back-dated approach); bar 6 touch ignored; 5M low 4280 (bar 7) meets 15 -> approach bar 8, "
+          "bearish bar 9 -> double top", [d for d in dets(r) if "1H" in d[1]] == [(9, "DT 1H 4296")] and r["nDvApp"] >= 1, str(dets(r)))
+    # evidence on P5 waits (accum 4300 / 4250: the band 4294..4298 reaches the P5 contact zone 4297)
+    r = runz(ZB + [B(4285, 4297.5, 4284, 4296), ZDN, B(4291, 4292, 4287, 4289), ZBU, ZBU, ZBU])
+    w = [x for x in r["acRts"] if x.side == -1]
+    check("AZ-12 approach + P5 contact on bar 6, bearish bar 7 -> the double top is stored on that P5 wait (base id 1, 5M, H 4296, "
+          "count 2, approach bar 6, detected bar 7, valid to bar 12)", len(w) == 1 and (w[0].tBar, w[0].dvId, w[0].dvTf, w[0].dvLvl,
+          w[0].dvCnt, w[0].dvAppBar, w[0].dvDetBar, w[0].dvExpBar, w[0].dvOn) == (6, 1, 0, 4296.0, 2, 6, 7, 12, True)
+          and r["nDvEv5"] == 1, str(w))
+    r = runz(ZB + [B(4285, 4297.5, 4284, 4296), ZDN] + [B(4291, 4292, 4287, 4289), ZBU, ZBU, ZBU, ZBU, ZBU])
+    w = [x for x in r["acRts"] if x.side == -1]
+    check("AZ-13 the evidence is valid through the 5th bar after the detection and invalid on the 6th (counted once); the wait "
+          "is still active (12 bars)", len(w) == 1 and w[0].dvOn is False and r["nDvEvExp"] == 1, str(w))
+    r = runz(ZB + [ZUP, ZDN, B(4291, 4292, 4287, 4289), B(4289, 4297.5, 4288, 4296), ZBU])
+    w = [x for x in r["acRts"] if x.side == -1]
+    check("AZ-14 a detection before the P5 contact (bar 7; contact bar 9) is not used as evidence", len(w) == 1 and w[0].dvId == -1
+          and r["nDvEv5"] == 0, str(w))
+    a = runz(ZB + [ZUP, ZDN], overrides=dict(dvUse=False))
+    check("AZ-15 module OFF: no base, no detection", zbases(a) == [] and dets(a) == [] and a["nDvTop"] == 0)
+    tk = lambda b: b + (ap.Broker.bar_path(*b),)
+    rt = runz([tk(x) for x in ZB + [ZUP, ZDN, ZBU, ZBU]])
+    hs = runz(ZB + [ZUP, ZDN, ZBU, ZBU])
+    check("AZ-16 realtime ticks: the same bases / detections as on history (decided on the confirmed tick only)",
+          dets(rt) == dets(hs) and zbases(rt) == zbases(hs))
+    r = runz(ZB + [ZUP] + [B(4294, 4294.5, 4290, 4291)] * 0 + [ZBU], overrides=dict(dvWait=0))
+    check("AZ-17 reversal wait 0: only the approach bar can detect (bullish approach -> skipped at once)", r["nDvExp"] == 1
+          and dets(r) == [])
+
+
+ACC5A_REV = "3800392"
+AZ_COUNTERS = AX_COUNTERS + ("nFvUp", "nFvDn", "nFvUpAbs", "nFvDnAbs", "nFvEv5", "nFvEv6", "nFvEvExp")
+
+
+def dv_feeds(nas, b5):
+    """15m / 1H / 4H / D: on the 5M bars inside HTF bar k, the (high, low, time) of HTF bar k-1 (NR-A1 delivery)."""
+    out = [dict() for _ in b5]
+    idx = {t: i for i, (t, *_r) in enumerate(b5)}
+    for k, (tf, day) in enumerate(((15 * 60_000, False), (H1, False), (4 * H1, False), (None, True)), start=1):
+        htf = nas.htf_from_5m(b5, tf, day)
+        for j, hb in enumerate(htf):
+            if j == 0:
+                continue
+            pv = htf[j - 1]
+            val = (max(x[1] for x in pv["subs"]), min(x[2] for x in pv["subs"]), pv["T"])
+            for sl in hb["slots"]:
+                out[idx[hb["T"] + sl * M5]][k] = val
+    return out
+
+
+def gate_acc5b_series():
+    import time as _time
+    import nr_a1_sim as nas
+    old_src = subprocess.run(["git", "-C", ROOT, "show", f"{ACC5A_REV}:AccumStrategyXAU.pine"], capture_output=True, text=True).stdout
+    same, n_ord, n_det, det = True, 0, 0, ""
+    loads = []
+    for seed in (61, 62):
+        b5 = nas.market(seed, 20)
+        feeds, dvf = feeds_from_5m(nas, b5), dv_feeds(nas, b5)
+        bars = [dict(t=t, o=o, h=h, l=l, c=c, feed=feeds[i], dv=dvf[i]) for i, (t, o, h, l, c) in enumerate(b5)]
+        for ov in (dict(), ACC3_OV, dict(enP5=False)):
+            a = ap.Runner(dict(ov), src=old_src).run(bars)
+            for use in (True, False):
+                t0 = _time.time()
+                b = ap.Runner(dict(ov, dvUse=use)).run(bars)
+                if ov == {}:
+                    loads.append((seed, use, round((_time.time() - t0) / len(bars) * 1000, 2), b["nDvMaxAct"]))
+                n_ord += len(orders(b))
+                n_det += b["nDvDetT2"] + b["nDvDetT3"] + b["nDvDetB2"] + b["nDvDetB3"]
+                if a.broker.log != b.broker.log or any(a[k] != b[k] for k in AZ_COUNTERS):
+                    same, det = False, f"seed {seed} {ov} dvUse={use}"
+    check("AZ-S1 orders / fills / exits / P&L unchanged: the ACC-5A file (3800392) and ACC-5B give the identical broker log and "
+          "trading / FVG counters on random series (ACC-4 defaults, ACC-3 settings, P5 off), detection module ON and OFF",
+          same and n_ord > 0 and n_det > 0, f"{det} orders={n_ord} detections={n_det}")
+    print("  [AZ-S load] (seed, dvUse, ms per 5M bar in the Python model, max active bases):", loads)
+    b5 = nas.market(63, 20)
+    feeds, dvf = feeds_from_5m(nas, b5), dv_feeds(nas, b5)
+    bars = [dict(t=t, o=o, h=h, l=l, c=c, feed=feeds[i], dv=dvf[i]) for i, (t, o, h, l, c) in enumerate(b5)]
+    full = ap.Runner(dict(enP5=False, enP6=False)).run(bars)
+    cut = len(bars) * 2 // 3
+    part = ap.Runner(dict(enP5=False, enP6=False)).run(bars[:cut])
+    check("AZ-S2 no lookahead / no repaint: the detections of a run on the first 2/3 equal the full run's detections on those bars "
+          "(HTF bases from delivered confirmed bars only)", dets(part) == [d for d in dets(full) if d[0] < cut] and dets(full),
+          f"{len(dets(part))} / {len(dets(full))}")
+
+
+# ============================================================================
 # AU : mutations of the Pine text are caught by the scenario gates
 # ============================================================================
 MUTATIONS = [
@@ -1321,6 +1492,14 @@ MUTATIONS = [
     # (removing `w.tBar <= bar_index` is an equivalent mutant: a wait exists only from its contact bar, so an absorption before the
     #  contact has no wait to attach to - AW-11 pins that behaviour)
     ("ACC-5A evidence on the opposite side's waits", "                        int wside = fv.dir == 1 ? -1 : 1", "                        int wside = fv.dir == 1 ? 1 : -1"),
+    ("ACC-5B pivot not strict", "                                isH := isH and mh > array.get(tw.hs, j)", "                                isH := isH and mh >= array.get(tw.hs, j)"),
+    ("ACC-5B right-side history ignored", "array.push(dvBases, DvBase.new(dvSeq, k, -1, mh, nt, bar_index, mh - rMin >= dD - EPS))", "array.push(dvBases, DvBase.new(dvSeq, k, -1, mh, nt, bar_index, false))"),
+    ("ACC-5B invalidation by the wick", "if top ? close > g.lvl + bB + EPS : close < g.lvl - bB - EPS", "if top ? high > g.lvl + bB + EPS : low < g.lvl - bB - EPS"),
+    ("ACC-5B equal close invalidates", "if top ? close > g.lvl + bB + EPS : close < g.lvl - bB - EPS", "if top ? close >= g.lvl + bB - EPS : close <= g.lvl - bB + EPS"),
+    ("ACC-5B wait one bar longer", "                                else if bar_index >= g.waitEnd", "                                else if bar_index > g.waitEnd"),
+    ("ACC-5B no distance needed between approaches", "                                g.away   := false\n", "                                g.away   := true\n"),
+    ("ACC-5B skip not counted", "                                g.cnt    += 1\n", "                                g.cnt    += rev ? 1 : 0\n"),
+    ("ACC-5B back-dated approach on the delivery bar", "                    if g.aBar < bar_index\n", "                    if g.aBar <= bar_index\n"),
 ]
 
 
@@ -1335,7 +1514,7 @@ def gate_mutation():
                 continue
             SRC_OVERRIDE = SRC.replace(old, new)
             RESULTS = []
-            for g in (gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3, gate_acc4, gate_acc5a):
+            for g in (gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3, gate_acc4, gate_acc5a, gate_acc5b):
                 try:
                     g()
                 except Exception:      # noqa: BLE001
@@ -1352,7 +1531,7 @@ def gate_mutation():
 
 
 def main():
-    for g in (gate_static, gate_accum, gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3, gate_acc4, gate_acc5a, gate_acc2_series, gate_acc4_series, gate_acc5a_series, gate_fuzz, gate_mutation):
+    for g in (gate_static, gate_accum, gate_entry, gate_risk, gate_orders, gate_acc2, gate_acc3, gate_acc4, gate_acc5a, gate_acc5b, gate_acc2_series, gate_acc4_series, gate_acc5a_series, gate_acc5b_series, gate_fuzz, gate_mutation):
         try:
             g()
         except Exception:      # noqa: BLE001

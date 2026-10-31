@@ -578,7 +578,7 @@ def make_env(broker, draw_log):
         label__set_textcolor=_set("textcolor"), label__set_color=_set("color"),
         line__new=line_new, line__set_color=_set("color"), line__set_style=_set("style"), line__delete=_delete,
         box__new=box_new, box__set_right=_set("right"), box__delete=_delete,
-        color__maroon="maroon", color__navy="navy", size__tiny="tiny",
+        color__maroon="maroon", color__navy="navy", color__purple="purple", size__tiny="tiny",
         label__style_label_up="up", label__style_label_down="down", label__style_label_lower_left="ll",
         label__style_label_upper_left="ul", line__style_dotted="dotted",
         color__new=lambda c, t=0: (c, t), color__teal="teal", color__orange="orange", color__fuchsia="fuchsia",
@@ -802,6 +802,7 @@ class Runner:
                  acL2=self.bars_done[-2][2] if len(self.bars_done) >= 2 else None,
                  acO1=self.bars_done[-1][0] if self.bars_done else None,
                  acC1=self.bars_done[-1][3] if self.bars_done else None,
+                 **{f"dv{x}{k}": (b.get("dv", {}).get(k, (None, None, None))["hlt".index(x)]) for k in (1, 2, 3, 4) for x in "hlt"},
                  syminfo__pointvalue=self.broker.pointvalue,
                  strategy__position_size=self.broker.pos, strategy__opentrades=self.broker.opentrades,
                  strategy__closedtrades=self.broker.closedtrades)
