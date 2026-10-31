@@ -1380,6 +1380,11 @@ def gate_acc5b():
     hs = runz(ZB + [ZUP, ZDN, ZBU, ZBU])
     check("AZ-16 realtime ticks: the same bases / detections as on history (decided on the confirmed tick only)",
           dets(rt) == dets(hs) and zbases(rt) == zbases(hs))
+    zb2 = ZB[:5] + [B(4294.8, 4295, 4284, 4285)]
+    r = runz(zb2 + [ZUP, ZDN, M])
+    check("AZ-18 the bar that confirms a 5M peak (bar 5: high 4295 in the band, bearish) is part of the peak's history: no approach "
+          "or detection on it; the first approach is bar 6 (bearish bar 7 -> double top)", (5, "DT 5M 4296") not in dets(r)
+          and (7, "DT 5M 4296") in dets(r), str(dets(r)))
     r = runz(ZB + [ZUP] + [B(4294, 4294.5, 4290, 4291)] * 0 + [ZBU], overrides=dict(dvWait=0))
     check("AZ-17 reversal wait 0: only the approach bar can detect (bullish approach -> skipped at once)", r["nDvExp"] == 1
           and dets(r) == [])
