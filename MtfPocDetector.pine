@@ -1,0 +1,438 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// ============================================================
+//  MTF POC Detector (検知専用)  —  ENG5 の f_poc を切り出した indicator
+// ------------------------------------------------------------
+//  ・元の strategy「5min Engulfing Strategy / ENG5」は変更しない。
+//  ・今回の範囲 = 検知・表示・価格出力のみ。
+//      Zone 接続 / Zone 生成 / 配点 / エントリー条件への組み込みは行わない。
+//  ・対象: 5分 / 15分 / 1時間 / 4時間 / 日足 / 週足 の 6 種類。
+//      各時間足につき POC を 1 つ検知し、POC ± ATR(14)×0.25 の判定帯を作る。
+//  ・計算は ENG5 の f_poc を基本とする近似方式
+//      (ローソク足の出来高を 高値〜安値 と各区画の重なり幅に比例配分)。
+//      TradingView 標準 VPVR と同一の計算ではない。
+//
+//  【確定値・更新タイミング】
+//   ・チャート足と同じ時間足 (5分足チャートなら 5m) …
+//       チャート足の確定時 (barstate.isconfirmed) にのみ再計算し、その足に反映。
+//       未確定のリアルタイム足では前回の確定値を保持する。追加の遅延なし。
+//   ・チャート足より上位の時間足 …
+//       request.security(…, lookahead_on) の中で「1本前 (= 確定済み) の上位足まで」
+//       のデータだけで計算する。上位足が確定し次の上位足が始まった最初の
+//       チャート足から新しい値になり、次の確定までは固定。
+//       未確定の上位足データや未来データは使わないため、過去表示と
+//       リアルタイムで値の利用開始位置が一致する (非リペイント)。
+//   ・チャート足より下位の時間足 … 非対応 (出力 na・表で警告)。
+//
+//  【未計算値】
+//   ・元の f_poc は計算できない時に close を返すが、本インジでは na を返す。
+//     履歴不足 / 価格レンジ 0 / 集計窓内の高値・安値・出来高の欠損 /
+//     出来高合計 0 / ATR 未確定 のいずれかなら POC・上限・下限すべて na。
+//   ・検知 OFF の時間足は出力 na・表示なし。集計ループ自体を実行しない。
+//
+//  ※ 5分足チャートに適用してください。
+// ============================================================
+
+//@version=6
+indicator(
+     title            = "MTF POC Detector",
+     shorttitle       = "MTFPOC",
+     overlay          = true,
+     max_bars_back    = 1100,
+     max_labels_count = 50
+ )
+
+// ============================================================
+//  1. 入力 : 時間足ごとの 検知 ON/OFF・集計本数・表示 ON/OFF・色
+// ------------------------------------------------------------
+//  ・集計本数 = その対象時間足の本数 (5分足 120 本を上位足に流用しない)
+//  ・表示 ON/OFF は検知 ON/OFF と独立。表示だけ OFF でも計算・価格出力は維持。
+// ============================================================
+grpTF = "時間足 (検知 / 集計本数 / 表示 / 色)"
+en5   = input.bool(true, "5m 検知",   group = grpTF, inline = "t5")
+len5  = input.int(120, "本数", minval = 10, maxval = 1000, group = grpTF, inline = "t5")
+sh5   = input.bool(true, "表示",     group = grpTF, inline = "t5")
+col5  = input.color(color.new(#9E9E9E, 0), "", group = grpTF, inline = "t5")
+
+en15  = input.bool(true, "15m 検知",  group = grpTF, inline = "t15")
+len15 = input.int(120, "本数", minval = 10, maxval = 1000, group = grpTF, inline = "t15")
+sh15  = input.bool(true, "表示",     group = grpTF, inline = "t15")
+col15 = input.color(color.new(#00BCD4, 0), "", group = grpTF, inline = "t15")
+
+en60  = input.bool(true, "1H 検知",   group = grpTF, inline = "t60")
+len60 = input.int(120, "本数", minval = 10, maxval = 1000, group = grpTF, inline = "t60")
+sh60  = input.bool(true, "表示",     group = grpTF, inline = "t60")
+col60 = input.color(color.new(#4CAF50, 0), "", group = grpTF, inline = "t60")
+
+en240  = input.bool(true, "4H 検知",  group = grpTF, inline = "t240")
+len240 = input.int(120, "本数", minval = 10, maxval = 1000, group = grpTF, inline = "t240")
+sh240  = input.bool(true, "表示",    group = grpTF, inline = "t240")
+col240 = input.color(color.new(#FF9800, 0), "", group = grpTF, inline = "t240")
+
+enD   = input.bool(true, "日足 検知",  group = grpTF, inline = "tD")
+lenD  = input.int(120, "本数", minval = 10, maxval = 1000, group = grpTF, inline = "tD")
+shD   = input.bool(true, "表示",     group = grpTF, inline = "tD")
+colD  = input.color(color.new(#E91E63, 0), "", group = grpTF, inline = "tD")
+
+enW   = input.bool(true, "週足 検知",  group = grpTF, inline = "tW")
+lenW  = input.int(120, "本数", minval = 10, maxval = 1000, group = grpTF, inline = "tW")
+shW   = input.bool(true, "表示",     group = grpTF, inline = "tW")
+colW  = input.color(color.new(#9C27B0, 0), "", group = grpTF, inline = "tW")
+
+// ============================================================
+//  2. 入力 : POC 計算 / POC 周辺の判定帯 (ENG5 の設定を引き継ぎ)
+// ------------------------------------------------------------
+//  上限 = POC + 片側幅 / 下限 = POC − 片側幅
+//    ATR 連動 ON  … 片側幅 = その時間足の ATR(期間) × 倍率
+//    ATR 連動 OFF … 片側幅 = 固定幅 (価格)。帯の全幅は固定幅の 2 倍。
+//  ※ この帯は出来高の山の範囲ではなく、POC 周辺に設ける判定帯。
+// ============================================================
+grpVP = "POC 計算 / 判定帯"
+vpBins         = input.int(20, "VP ビン数 (分割数)", minval = 4, maxval = 100, group = grpVP)
+useAtrBand     = input.bool(true, "POCゾーン幅をATR連動にする", group = grpVP)
+bandAtrLen     = input.int(14, "出来高ATR期間", minval = 1, group = grpVP)
+bandAtrMult    = input.float(0.25, "POCゾーン幅 (ATR倍率・片側)", minval = 0.0, step = 0.05, group = grpVP)
+bandFixedWidth = input.float(0.0, "POCゾーン幅 (固定/価格・片側)", minval = 0.0, step = 0.1, group = grpVP)
+
+// ============================================================
+//  3. 入力 : 表示 / 検証
+// ============================================================
+grpDisp = "表示 / 検証"
+bandTransp    = input.int(85, "帯の透明度", minval = 0, maxval = 100, group = grpDisp)
+labelOffset   = input.int(3, "右端ラベル 位置 (本)", minval = 0, maxval = 50, group = grpDisp)
+showDebugTbl  = input.bool(true, "デバッグ表を表示", group = grpDisp)
+useOrigCompare = input.bool(false, "検証: 元 f_poc (チャート足) と比較", group = grpDisp, tooltip = "チャート足と同じ時間足スロットの値を、ENG5 の f_poc (原文のまま) と比較し Data Window に出力します。比較用に元計算を追加実行するため、検証時以外は OFF。")
+
+// ============================================================
+//  4. POC 計算コア (ENG5 f_poc を基本に、無効値を na で返す版)
+// ------------------------------------------------------------
+//  off       : 集計窓の開始オフセット (0 = 現在足を含む / 1 = 1本前から)
+//  lookback  : 集計本数
+//  bins      : 分割数
+//  集計窓 = オフセット off 〜 off + lookback − 1 の lookback 本。
+//  off = 0 の時、有効な集計窓では元 f_poc と同じ値になる:
+//    ・最高値/最安値 = 窓内の high/low の最大/最小 (= ta.highest / ta.lowest)
+//    ・高安幅 0 の足は 1 区画に全量加算 (区画位置の算出も元と同じ)
+//    ・それ以外は重なり幅に比例配分
+//    ・最大区画が同値複数なら下側 (先に見つかった方) を採用
+//  元との違い (無効値処理の改善分):
+//    ・元は計算不能時に close を返す → ここでは na
+//    ・元は高安/出来高 na の足を読み飛ばす → ここでは窓内に 1 本でもあれば na
+//    ・元は出来高合計 0 でも最下段の区画を POC にする → ここでは na
+// ============================================================
+f_pocCore(bool enabled, int off, int lookback, int bins) =>
+    float poc = na
+    if enabled and lookback > 0 and bins > 0 and bar_index - off >= lookback
+        float hi = na
+        float lo = na
+        bool  ok = true
+        for k = off to off + lookback - 1
+            float h = high[k]
+            float l = low[k]
+            float v = volume[k]
+            if na(h) or na(l) or na(v)
+                ok := false
+                break
+            hi := na(hi) ? h : math.max(hi, h)
+            lo := na(lo) ? l : math.min(lo, l)
+        float rangeAll = ok ? hi - lo : na
+        if ok and rangeAll > 0
+            array<float> bv = array.new_float(bins, 0.0)
+            float bs = rangeAll / bins
+            float total = 0.0
+            for k = off to off + lookback - 1
+                float ch = high[k]
+                float cl = low[k]
+                float cv = volume[k]
+                total += cv
+                float crange = ch - cl
+                if crange <= 0
+                    int bidx = math.max(0, math.min(bins - 1, int((cl - lo) / bs)))
+                    array.set(bv, bidx, array.get(bv, bidx) + cv)
+                else
+                    for bi = 0 to bins - 1
+                        float binBot = lo + bi * bs
+                        float binTop = binBot + bs
+                        float ov = math.min(binTop, ch) - math.max(binBot, cl)
+                        if ov > 0
+                            array.set(bv, bi, array.get(bv, bi) + cv * ov / crange)
+            if total > 0
+                float best  = -1.0
+                int   bestI = 0
+                for bi = 0 to bins - 1
+                    float bvv = array.get(bv, bi)
+                    if bvv > best
+                        best  := bvv
+                        bestI := bi
+                poc := lo + (bestI + 0.5) * bs
+    poc
+
+// 判定帯 : POC と片側幅から [中心, 上限, 下限]。どれか作れなければ全て na。
+f_band(float poc, float atrv) =>
+    float w  = useAtrBand ? atrv * bandAtrMult : bandFixedWidth
+    bool  ok = not na(poc) and not na(w)
+    [ok ? poc : na, ok ? poc + w : na, ok ? poc - w : na]
+
+// 上位足コンテキスト用 (request.security の中で実行される)
+//   1本前 (確定済みの上位足) までのデータで計算 → lookahead_on と組み合わせて非リペイント。
+//   cnt = この上位足コンテキストで集計ループを実行した回数 (確定足ベース)。
+f_htfCalc(bool enabled, int lookback, int bins) =>
+    float a   = ta.atr(bandAtrLen)        // 一貫性のため毎バー呼ぶ (軽量)
+    float raw = f_pocCore(enabled, 1, lookback, bins)
+    [pc, up, lo] = f_band(raw, a[1])
+    var int cnt = 0
+    if enabled and bar_index - 1 >= lookback
+        cnt += 1
+    [pc, up, lo, cnt]
+
+// ============================================================
+//  5. スロット計算 (1 時間足 = 1 呼び出し)
+// ------------------------------------------------------------
+//  mode : 0 = 検知OFF / 1 = チャート足と同じ (ローカル確定足計算)
+//         2 = 上位足 (request.security) / 3 = チャート足より下位 (非対応)
+//  戻り値 : [POC, 上限, 下限, 集計ループ実行回数, mode]
+//  ・mode 0 / 3 では request.security も集計ループも実行しない。
+//  ・さらに検知 OFF は f_pocCore に enabled=false として渡るため、
+//    上位足コンテキスト側でもループは走らない (二重のガード)。
+//    (mode 1 の時も enabled and mode == 2 = false が渡るため、
+//     万一 request の文脈が評価されても重いループは重複実行されない)
+// ============================================================
+f_slot(string tf, bool enabled, int lookback) =>
+    float atrC  = ta.atr(bandAtrLen)      // チャート足 ATR (mode 1 用・毎バー呼ぶ)
+    int   tfSec = timeframe.in_seconds(tf)
+    int   chSec = timeframe.in_seconds(timeframe.period)
+    int   mode  = not enabled ? 0 : tfSec == chSec ? 1 : tfSec > chSec ? 2 : 3
+    var float p   = na
+    var float u   = na
+    var float l   = na
+    var int   cnt = 0
+    if mode == 1
+        // チャート足の確定時のみ再計算 (未確定のリアルタイム足では前回の確定値を保持)
+        if barstate.isconfirmed
+            float raw = f_pocCore(enabled, 0, lookback, vpBins)
+            [pp, uu, ll] = f_band(raw, atrC)
+            p := pp
+            u := uu
+            l := ll
+            if bar_index >= lookback
+                cnt += 1
+    else if mode == 2
+        [pp, uu, ll, cc] = request.security(syminfo.tickerid, tf, f_htfCalc(enabled and mode == 2, lookback, vpBins), lookahead = barmerge.lookahead_on)
+        p   := pp
+        u   := uu
+        l   := ll
+        cnt := nz(cc)
+    else
+        p := na
+        u := na
+        l := na
+    [p, u, l, cnt, mode]
+
+[poc5,   up5,   lo5,   cnt5,   mode5  ] = f_slot("5",   en5,   len5)
+[poc15,  up15,  lo15,  cnt15,  mode15 ] = f_slot("15",  en15,  len15)
+[poc60,  up60,  lo60,  cnt60,  mode60 ] = f_slot("60",  en60,  len60)
+[poc240, up240, lo240, cnt240, mode240] = f_slot("240", en240, len240)
+[pocD,   upD,   loD,   cntD,   modeD  ] = f_slot("1D",  enD,   lenD)
+[pocW,   upW,   loW,   cntW,   modeW  ] = f_slot("1W",  enW,   lenW)
+
+// ============================================================
+//  6. 価格出力 (18 本・数値 plot)
+// ------------------------------------------------------------
+//  名前 = 「POC <時間足> <中心|上限|下限>」。検知 OFF / 未計算は na。
+//  表示 ON/OFF の影響を受けない (Data Window と外部ソース用)。
+//  ※ 受信側 (Zone 側) の接続方法は今回確定しない。
+// ============================================================
+plot(poc5,   "POC 5m 中心",   display = display.data_window)
+plot(up5,    "POC 5m 上限",   display = display.data_window)
+plot(lo5,    "POC 5m 下限",   display = display.data_window)
+plot(poc15,  "POC 15m 中心",  display = display.data_window)
+plot(up15,   "POC 15m 上限",  display = display.data_window)
+plot(lo15,   "POC 15m 下限",  display = display.data_window)
+plot(poc60,  "POC 1H 中心",   display = display.data_window)
+plot(up60,   "POC 1H 上限",   display = display.data_window)
+plot(lo60,   "POC 1H 下限",   display = display.data_window)
+plot(poc240, "POC 4H 中心",   display = display.data_window)
+plot(up240,  "POC 4H 上限",   display = display.data_window)
+plot(lo240,  "POC 4H 下限",   display = display.data_window)
+plot(pocD,   "POC 日足 中心", display = display.data_window)
+plot(upD,    "POC 日足 上限", display = display.data_window)
+plot(loD,    "POC 日足 下限", display = display.data_window)
+plot(pocW,   "POC 週足 中心", display = display.data_window)
+plot(upW,    "POC 週足 上限", display = display.data_window)
+plot(loW,    "POC 週足 下限", display = display.data_window)
+
+// ============================================================
+//  7. デバッグ表示 (チャート上の中心線・帯・右端ラベル)
+// ------------------------------------------------------------
+//  表示 OFF または値 na の時は描かない。価格帯別出来高の横棒は作らない。
+// ============================================================
+f_vis(bool show, float v) =>
+    show ? v : na
+
+f_bandCol(color c) =>
+    color.new(c, bandTransp)
+
+pc5   = plot(f_vis(sh5,   poc5),   "表示 5m 中心",   color = col5,   linewidth = 2, style = plot.style_steplinebr, display = display.pane)
+pu5   = plot(f_vis(sh5,   up5),    "表示 5m 上限",   color = color.new(col5, 60),   style = plot.style_steplinebr, display = display.pane)
+pl5   = plot(f_vis(sh5,   lo5),    "表示 5m 下限",   color = color.new(col5, 60),   style = plot.style_steplinebr, display = display.pane)
+pc15  = plot(f_vis(sh15,  poc15),  "表示 15m 中心",  color = col15,  linewidth = 2, style = plot.style_steplinebr, display = display.pane)
+pu15  = plot(f_vis(sh15,  up15),   "表示 15m 上限",  color = color.new(col15, 60),  style = plot.style_steplinebr, display = display.pane)
+pl15  = plot(f_vis(sh15,  lo15),   "表示 15m 下限",  color = color.new(col15, 60),  style = plot.style_steplinebr, display = display.pane)
+pc60  = plot(f_vis(sh60,  poc60),  "表示 1H 中心",   color = col60,  linewidth = 2, style = plot.style_steplinebr, display = display.pane)
+pu60  = plot(f_vis(sh60,  up60),   "表示 1H 上限",   color = color.new(col60, 60),  style = plot.style_steplinebr, display = display.pane)
+pl60  = plot(f_vis(sh60,  lo60),   "表示 1H 下限",   color = color.new(col60, 60),  style = plot.style_steplinebr, display = display.pane)
+pc240 = plot(f_vis(sh240, poc240), "表示 4H 中心",   color = col240, linewidth = 2, style = plot.style_steplinebr, display = display.pane)
+pu240 = plot(f_vis(sh240, up240),  "表示 4H 上限",   color = color.new(col240, 60), style = plot.style_steplinebr, display = display.pane)
+pl240 = plot(f_vis(sh240, lo240),  "表示 4H 下限",   color = color.new(col240, 60), style = plot.style_steplinebr, display = display.pane)
+pcD   = plot(f_vis(shD,   pocD),   "表示 日足 中心", color = colD,   linewidth = 2, style = plot.style_steplinebr, display = display.pane)
+puD   = plot(f_vis(shD,   upD),    "表示 日足 上限", color = color.new(colD, 60),   style = plot.style_steplinebr, display = display.pane)
+plD   = plot(f_vis(shD,   loD),    "表示 日足 下限", color = color.new(colD, 60),   style = plot.style_steplinebr, display = display.pane)
+pcW   = plot(f_vis(shW,   pocW),   "表示 週足 中心", color = colW,   linewidth = 2, style = plot.style_steplinebr, display = display.pane)
+puW   = plot(f_vis(shW,   upW),    "表示 週足 上限", color = color.new(colW, 60),   style = plot.style_steplinebr, display = display.pane)
+plW   = plot(f_vis(shW,   loW),    "表示 週足 下限", color = color.new(colW, 60),   style = plot.style_steplinebr, display = display.pane)
+
+fill(pu5,   pl5,   f_bandCol(col5),   "帯 5m")
+fill(pu15,  pl15,  f_bandCol(col15),  "帯 15m")
+fill(pu60,  pl60,  f_bandCol(col60),  "帯 1H")
+fill(pu240, pl240, f_bandCol(col240), "帯 4H")
+fill(puD,   plD,   f_bandCol(colD),   "帯 日足")
+fill(puW,   plW,   f_bandCol(colW),   "帯 週足")
+
+// --- 右端ラベル ---
+f_label(label lb, bool show, float y, float yu, float yl, string txt, color c) =>
+    label out = lb
+    if show and not na(y)
+        string tip = txt + "\n中心: " + str.tostring(y, format.mintick) + "\n上限: " + str.tostring(yu, format.mintick) + "\n下限: " + str.tostring(yl, format.mintick)
+        if na(out)
+            out := label.new(bar_index + labelOffset, y, txt, style = label.style_label_left, color = c, textcolor = color.white, size = size.small, tooltip = tip)
+        else
+            label.set_xy(out, bar_index + labelOffset, y)
+            label.set_tooltip(out, tip)
+    else if not na(out)
+        label.delete(out)
+        out := na
+    out
+
+var label lb5   = na
+var label lb15  = na
+var label lb60  = na
+var label lb240 = na
+var label lbD   = na
+var label lbW   = na
+if barstate.islast
+    lb5   := f_label(lb5,   sh5,   poc5,   up5,   lo5,   "5m POC",   col5)
+    lb15  := f_label(lb15,  sh15,  poc15,  up15,  lo15,  "15m POC",  col15)
+    lb60  := f_label(lb60,  sh60,  poc60,  up60,  lo60,  "1H POC",   col60)
+    lb240 := f_label(lb240, sh240, poc240, up240, lo240, "4H POC",   col240)
+    lbD   := f_label(lbD,   shD,   pocD,   upD,   loD,   "日足 POC", colD)
+    lbW   := f_label(lbW,   shW,   pocW,   upW,   loW,   "週足 POC", colW)
+
+// ============================================================
+//  8. 検証用出力 (Data Window)
+// ------------------------------------------------------------
+//  ・集計ループ実行回数 : 各時間足で確定足ごとに集計ループを実行した回数。
+//      (確定足ごとの「値の更新」とは別。リアルタイム中の上位足コンテキスト
+//       再計算はロールバックされるためこの数には含まれない → 報告参照)
+//  ・値更新回数 : チャート上で POC 中心値が変化した回数。
+//  ・mode : 0=OFF / 1=チャート足 / 2=上位足 / 3=下位足(非対応)
+// ============================================================
+f_chg(float v) =>
+    var int n = 0
+    if not na(v) and v != nz(v[1], -1.0e300)
+        n += 1
+    n
+
+plot(cnt5,   "検証 5m 集計回数",   display = display.data_window)
+plot(cnt15,  "検証 15m 集計回数",  display = display.data_window)
+plot(cnt60,  "検証 1H 集計回数",   display = display.data_window)
+plot(cnt240, "検証 4H 集計回数",   display = display.data_window)
+plot(cntD,   "検証 日足 集計回数", display = display.data_window)
+plot(cntW,   "検証 週足 集計回数", display = display.data_window)
+plot(f_chg(poc5),   "検証 5m 値更新回数",   display = display.data_window)
+plot(f_chg(poc15),  "検証 15m 値更新回数",  display = display.data_window)
+plot(f_chg(poc60),  "検証 1H 値更新回数",   display = display.data_window)
+plot(f_chg(poc240), "検証 4H 値更新回数",   display = display.data_window)
+plot(f_chg(pocD),   "検証 日足 値更新回数", display = display.data_window)
+plot(f_chg(pocW),   "検証 週足 値更新回数", display = display.data_window)
+
+// --- 元 f_poc との比較 (ENG5 原文そのまま。useOrigCompare=ON の時だけ実行) ---
+f_poc(lookback, bins) =>
+    float hi = ta.highest(high, lookback)
+    float lo = ta.lowest(low, lookback)
+    float rangeAll = hi - lo
+    float poc = close
+    if rangeAll > 0 and bins > 0 and bar_index >= lookback
+        array<float> bv = array.new_float(bins, 0.0)
+        float bs = rangeAll / bins
+        for k = 0 to lookback - 1
+            float ch = high[k]
+            float cl = low[k]
+            float cv = volume[k]
+            if not na(ch) and not na(cl) and not na(cv)
+                float crange = ch - cl
+                if crange <= 0
+                    int bidx = math.max(0, math.min(bins - 1, int((cl - lo) / bs)))
+                    array.set(bv, bidx, array.get(bv, bidx) + cv)
+                else
+                    for bi = 0 to bins - 1
+                        float binBot = lo + bi * bs
+                        float binTop = binBot + bs
+                        float ov = math.min(binTop, ch) - math.max(binBot, cl)
+                        if ov > 0
+                            array.set(bv, bi, array.get(bv, bi) + cv * ov / crange)
+        float best = -1.0
+        int   bestI = 0
+        for bi = 0 to bins - 1
+            float v = array.get(bv, bi)
+            if v > best
+                best := v
+                bestI := bi
+        poc := lo + (bestI + 0.5) * bs
+    poc
+
+// 比較対象 = チャート足と同じ時間足のスロット (5分足チャートなら 5m)
+float cmpNew = mode5 == 1 ? poc5 : mode15 == 1 ? poc15 : mode60 == 1 ? poc60 : mode240 == 1 ? poc240 : modeD == 1 ? pocD : modeW == 1 ? pocW : na
+int   cmpLen = mode5 == 1 ? len5 : mode15 == 1 ? len15 : mode60 == 1 ? len60 : mode240 == 1 ? len240 : modeD == 1 ? lenD : modeW == 1 ? lenW : len5
+
+float origPoc  = na
+float cmpDiff  = na
+var int cmpMismatch = 0     // 両方有効で値が異なる回数 (0 であるべき)
+var int cmpInvalid  = 0     // 元は値を返したが新は na にした回数 (無効値処理の改善分)
+if useOrigCompare
+    origPoc := f_poc(cmpLen, vpBins)
+    if barstate.isconfirmed
+        if not na(cmpNew)
+            cmpDiff := cmpNew - origPoc
+            if math.abs(cmpDiff) > syminfo.mintick * 1.0e-6
+                cmpMismatch += 1
+        else if not na(origPoc)
+            cmpInvalid += 1
+
+plot(origPoc,     "検証 元f_poc",           display = display.data_window)
+plot(cmpDiff,     "検証 新−元 差",          display = display.data_window)
+plot(cmpMismatch, "検証 不一致回数",        display = display.data_window)
+plot(cmpInvalid,  "検証 新のみna(改善分)",  display = display.data_window)
+
+// --- デバッグ表 ---
+var table dbg = table.new(position.bottom_right, 4, 7, border_width = 1)
+f_modeTxt(int m) =>
+    m == 0 ? "OFF" : m == 1 ? "チャート足" : m == 2 ? "上位足" : "下位足:非対応"
+
+f_row(int r, string name, int m, float pc, int cnt, color c) =>
+    table.cell(dbg, 0, r, name, text_color = color.white, bgcolor = c, text_size = size.small)
+    table.cell(dbg, 1, r, f_modeTxt(m), text_color = m == 3 ? color.red : color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dbg, 2, r, m == 0 ? "-" : na(pc) ? "na(未計算)" : str.tostring(pc, format.mintick), text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dbg, 3, r, str.tostring(cnt), text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+
+if showDebugTbl and barstate.islast
+    table.cell(dbg, 0, 0, "TF",       text_color = color.white, bgcolor = color.new(color.blue, 0), text_size = size.small)
+    table.cell(dbg, 1, 0, "計算方式", text_color = color.white, bgcolor = color.new(color.blue, 0), text_size = size.small)
+    table.cell(dbg, 2, 0, "POC",      text_color = color.white, bgcolor = color.new(color.blue, 0), text_size = size.small)
+    table.cell(dbg, 3, 0, "集計回数", text_color = color.white, bgcolor = color.new(color.blue, 0), text_size = size.small)
+    f_row(1, "5m",   mode5,   poc5,   cnt5,   col5)
+    f_row(2, "15m",  mode15,  poc15,  cnt15,  col15)
+    f_row(3, "1H",   mode60,  poc60,  cnt60,  col60)
+    f_row(4, "4H",   mode240, poc240, cnt240, col240)
+    f_row(5, "日足", modeD,   pocD,   cntD,   colD)
+    f_row(6, "週足", modeW,   pocW,   cntW,   colW)
