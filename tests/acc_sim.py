@@ -162,6 +162,9 @@ def gate_static():
     except Exception as ex:      # noqa: BLE001
         ok, why = False, repr(ex)
     check("AS-11 the whole logic section is inside the translated Pine subset (no history reference / unsupported syntax)", ok, why)
+    n_plot = len(re.findall(r"^plot\(", code_only(SRC), re.M))
+    check("AS-13 at most 64 plot() calls (TradingView's per-script limit; ACC-5B moved its detail counters to a table)",
+          n_plot <= 64, str(n_plot))
     lg = ap.logic_section(SRC)
     ent = [m.start() for m in re.finditer(r"strategy\.entry\(", lg)]
     conf_at = lg.index("    if barstate.isconfirmed\n")
@@ -1380,6 +1383,25 @@ def gate_acc5b():
     hs = runz(ZB + [ZUP, ZDN, ZBU, ZBU])
     check("AZ-16 realtime ticks: the same bases / detections as on history (decided on the confirmed tick only)",
           dets(rt) == dets(hs) and zbases(rt) == zbases(hs))
+    hbm = [(4280, 4270), (4285, 4275), (4296.5, 4284), (4290, 4280), (4282, 4278)]
+    dvm = {i + 1: {2: (hbm[i][0], hbm[i][1], T0 - (10 - i) * H1)} for i in range(5)}
+    seq19 = ZB + [B(4285, 4297.5, 4284, 4296), ZDN]
+    r = runz(seq19 + [ZBN], dv=dvm)
+    w = [x for x in r["acRts"] if x.side == -1]
+    lb = [d.args[2] for d in r.draws if d.kind == "label" and d.args[0] == 7 and str(d.args[2])[:2] in ("DT", "TT")]
+    check("AZ-19 5M and 1H double tops detected on the same bar (7) on one P5 wait: both kept internally per timeframe (base id, "
+          "level, count, approach / detection bar, own expiry); the representative fields hold the 1H one; one label (1H first, "
+          "the 5M detection listed under it)",
+          len(w) == 1 and w[0].dvIdT[0] == 1 and w[0].dvIdT[2] == 2 and w[0].dvDetT[0] == w[0].dvDetT[2] == 7
+          and w[0].dvExpT[0] == w[0].dvExpT[2] == 12 and w[0].dvLvlT[2] == 4296.5 and w[0].dvTf == 2 and w[0].dvOnT[0] and w[0].dvOnT[2]
+          and lb == ["DT 1H 4296.5 #2\n+ DT 5M 4296 #1"], f"{w} {lb}")
+    r = runz(seq19 + [B(4291, 4295, 4290.5, 4294.5), ZDN, ZBN, ZBN, ZBN], dv=dvm)
+    r13 = runz(seq19 + [B(4291, 4295, 4290.5, 4294.5), ZDN, ZBN, ZBN, ZBN, ZBN], dv=dvm)
+    w, w13 = [x for x in r["acRts"] if x.side == -1][0], [x for x in r13["acRts"] if x.side == -1][0]
+    check("AZ-20 a later 5M triple top (bar 9) updates only the 5M slot (count 3, valid to 14); the 1H slot keeps its bar-7 "
+          "detection (valid to 12): on bar 12 both valid, on bar 13 only the 5M one; the representative is the newest (5M)",
+          (w.dvCntT[0], w.dvDetT[0], w.dvExpT[0]) == (3, 9, 14) and (w.dvCntT[2], w.dvDetT[2], w.dvExpT[2]) == (2, 7, 12)
+          and w.dvOnT[0] and w.dvOnT[2] and w13.dvOnT[0] and not w13.dvOnT[2] and w.dvTf == 0, f"{w} {w13}")
     zb2 = ZB[:5] + [B(4294.8, 4295, 4284, 4285)]
     r = runz(zb2 + [ZUP, ZDN, M])
     check("AZ-18 the bar that confirms a 5M peak (bar 5: high 4295 in the band, bearish) is part of the peak's history: no approach "
@@ -1504,6 +1526,7 @@ MUTATIONS = [
     ("ACC-5B wait one bar longer", "                                else if bar_index >= g.waitEnd", "                                else if bar_index > g.waitEnd"),
     ("ACC-5B no distance needed between approaches", "                                g.away   := false\n", "                                g.away   := true\n"),
     ("ACC-5B skip not counted", "                                g.cnt    += 1\n", "                                g.cnt    += rev ? 1 : 0\n"),
+    ("ACC-5B per-timeframe evidence not kept", "                                            if sId < 0 or sDet < bar_index or g.cnt > array.get(w.dvCntT, g.tf)\n", "                                            if false\n"),
     ("ACC-5B back-dated approach on the delivery bar", "                    if g.aBar < bar_index\n", "                    if g.aBar <= bar_index\n"),
 ]
 

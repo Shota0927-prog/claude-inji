@@ -569,7 +569,7 @@ def make_env(broker, draw_log):
         _UDT=_UDT, _rng=_rng, _na=_na, _int=_int, _float=_float, nz=nz,
         math__max=mmax, math__min=mmin, math__abs=abs, math__floor=math.floor, math__round=_pine_round,
         math__sign=lambda x: (x > 0) - (x < 0),
-        array__new=lambda *a: list(a[1:]) if a else [], array__new_float=lambda n=0, v=None: [v] * n, array__new_int=lambda n=0, v=None: [v] * n,
+        array__new=lambda *a: list(a[1:]) if a else [], array__new_float=lambda n=0, v=None: [v] * n, array__new_int=lambda n=0, v=None: [v] * n, array__new_bool=lambda n=0, v=None: [v] * n,
         array__from=lambda *a: list(a), array__size=len, array__get=_array_get, array__set=_array_set,
         array__push=lambda arr, v: arr.append(v), array__remove=_array_remove, array__shift=_array_shift,
         array__clear=lambda arr: arr.clear(),
