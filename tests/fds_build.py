@@ -19,7 +19,7 @@ REG_BASE = "df9da26"     # the last commit before the FDS-1 registration edits
 
 def ok(path):
     """FDS-1 accounts for this path exactly: one of its new files."""
-    return path in NEW_FILES
+    return path in NEW_FILES or __import__("lfw_build").ok(path)     # the later LFW-1 files: exact
 
 
 F = '__import__("fds_build")'
@@ -52,6 +52,7 @@ def apply_edits(path, text):
 
 def unadapt(path, text):
     """a test file with its FDS-1 edits reverted (all or nothing; unchanged without them; None with only part of them)."""
+    text = __import__("lfw_build").unadapt(path, text)     # the later LFW-1 test edits are reverted first, exactly
     eds = TEST_EDITS.get(path, [])
     if text is None or not eds or all(text.count(new) == 0 for _, new, _ in eds):
         return text
