@@ -142,7 +142,7 @@ def static():
           f_old.count(old_loop) == 1 and f_new == f_old.replace(old_loop, new_loop) and [r[0] for r in reqs] == ["60", "240", "D", "W"]
           and "f_pocCore(enabled, 1, lookback, bins)" in feed and names == want and 'plot(is5m ? 10001 : na, "POC protocol"' in feed
           and all(f'len{k} = input.int(120,' in feed for k in (1, 2, 3, 4)) and 'vpBins = input.int(75,' in feed
-          and "f_pocCore" not in SRC and "f_lbPocHtf" not in SRC
+          and "f_pocCore" not in re.sub(r"//.*", "", SRC) and "f_lbPocHtf" not in SRC
           and all(f'input.source(close, "{n}"' in SRC for n in want[:-1]) and 'input.source(close, "POC protocol (10001)"' in SRC,
           f"{names} {reqs}")
     zs = raw("ZoneStrategyXAU.pine")
@@ -1088,6 +1088,7 @@ def sc_zd_recv():
         rows = flat(3) + [(1990, 1995, 1989, 1991)] + [tc_short(1993)] + flat(6, 1985)
         s2 = Sc(rows)
         poc(s2, 1, 2000.0)
+        s2.hold(1, None, s1h=2000.0, s1ht=T0 - 3600_000)     # a Swing Zone on the same price: candidates exist without the POC
         s2.hold(4, 5, labS1=1993.0)
         for b in s2.bars:
             b.update({k: v for k, v in ov.items() if k in lp.FEED_DEFAULT})
@@ -1104,7 +1105,7 @@ def sc_zd_recv():
           "detection OFF an unconnected feed does not stop entries; a calculation failure / missing history does not stop entries",
           len(entries(ok_run)) == 1 and entries(no_proto) == [] and no_proto["skipN"][7] >= 1 and list(no_proto["lbZdStat"]) == [9, 9, 9, 9]
           and entries(t_close) == [] and t_close["lbZdStat"][1] == 9 and entries(ext_off) == [] and ext_off["lbZdStat"][2] == 8
-          and list(lab_off["lbZdStat"]) == [0, 0, 0, 0] and lab_off["skipN"][7] == 0
+          and list(lab_off["lbZdStat"]) == [0, 0, 0, 0] and lab_off["skipN"][7] == 0 and len(entries(lab_off)) == 1
           and len(entries(neg)) == 1 and neg["lbZdStat"][3] == 2 and len(entries(hist)) == 1 and hist["lbZdStat"][3] == 3
           and not any(z.typ == 3 for z in no_proto["lbZs"]),
           f"{entries(no_proto)} {list(no_proto['lbZdStat'])} {list(t_close['lbZdStat'])} {list(ext_off['lbZdStat'])} {list(lab_off['lbZdStat'])} "
@@ -1149,7 +1150,7 @@ OLD_NEW_STATS = []
 def sc_tp_ref():
     """f_lbTargets (one pass over the three ordered streams) vs a reference: every eligible interval, sorted, merged with the same EPS
     rule, first 3 bands. Random Zone sets with chained overlaps, wide FVGs, both MAs, LONG / SHORT, 0..3+ targets."""
-    r = lp.Runner(overrides=dict(QUIET)).run(Sc(flat(2, 2000)).bars)
+    r = lp.Runner(overrides=dict(QUIET, zbUse1=True, zbUse2=True)).run(Sc(flat(2, 2000)).bars)
     e = r.env
     LbZone = e["LbZone"]
     rnd = random.Random(5)

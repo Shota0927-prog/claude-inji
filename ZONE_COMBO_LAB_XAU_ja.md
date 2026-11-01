@@ -18,7 +18,7 @@ AccumStrategyXAU / MtfPocDetector）と ACC の試験環境は変更していな
 | 部分 | 内容 |
 |---|---|
 | 01 入力 | 検証期間 / Zone 共通幅 / ZA〜ZF の種類・時間足 ON/OFF / TA・TC / 条件（種類・結合・含む/だけ・タイミング・区分） / SL・TP / 建値 / 時間帯 / 資金管理 / 集計 / 表示 |
-| 02 取得 | 確定した上位足の値だけを取得（request.security 18 本）。ロジック区間は履歴参照しない |
+| 02 取得 | 確定した上位足の値だけを取得（request.security 14 本 + ZD は外部インジ MtfPocFeedXAU から input.source 13 系列）。ロジック区間は履歴参照しない |
 | 03 ロジック | `// ==== LAB Logic (begin/end)` の区間。テストはこの区間そのものを変換して実行する |
 | 04 表示 | EMA の線・集計表・Data Window（売買に影響しない） |
 
@@ -32,12 +32,41 @@ AccumStrategyXAU / MtfPocDetector）と ACC の試験環境は変更していな
 | ZA アキュム | AccumStrategyXAU の `f_acAccumBoxCore` / `f_acAccumBoxState` / `f_acConfirmed`（byte 一致: LS-01）・取得 3 本・新 ID / 形成中更新 / 固定の判定 | 固定した上辺・下辺をそれぞれ Zone（辺 ± 共通幅）。**Keep Count・有効期限による削除を撤去** |
 | ZB MA | ZoneStrategyXAU の MA 取得方式（1分足のコンテキストで計算した値を 5分足で読む） | 1分 EMA2000/3000 → **1分 EMA3000 + 5分 EMA3000**。帯 = EMA ± 共通幅（毎足動く） |
 | ZC 水平線 | Library `pivotPack`（ta.pivothigh / pivotlow）+ NR-S1 の確定取得（[1]・lookahead_on） | 5分/15分/1H → **1H / 4H / D / W**、左右 6 本（時間足ごとに変更可）。当日高安・前日高安は対象外。寿命なし。**新しい Pivot はすべて別の Zone**（Library の共通幅以内の重複判定は使わない・古い Zone を上書きしない。同じ Pivot は時刻キーで 1 回） |
-| ZD 出来高 | MtfPocDetector（75 分割版）の `f_pocCore`（byte 一致: LS-02）・1 本前 + lookahead_on の取得 | 帯 = POC 中心 ± 共通幅。元の区画上下限は Zone の情報（infoA / infoB）に保持。POC が変わるたびに別 Zone（過去の帯を残す。同じ時間足で中心が完全に同じなら重ねない）。旧 20 分割・ATR 幅は使わない（LS-02） |
+| ZD 出来高 | **LAB-2**: 計算は外部インジ `MtfPocFeedXAU.pine`（MtfPocDetector 75 分割版の `f_pocCore` を基に、各足の区画の走査範囲だけ軽量化。差分は LS-02 で照合）。取得は 1 本前 + lookahead_on（既存と同じ） | Strategy は 13 系列を受け取って蓄積するだけ（内蔵計算・フォールバックなし）。帯 = 中心（区画下限と上限の中点）± 共通幅。元の区画上下限・対象足時刻・利用可能になった 5分足の時刻を保持。前回の有効値から中心が変わり、同じ時間足に同じ中心の Zone がなければ追加（上書きしない） |
 | ZF FVG | ZoneStrategyXAU FVG Batch A の `f_fvgConfirmed`（byte 一致: LS-03・最小幅 3） | 1H / 4H / D / W。Zone = FVG 本来の上下限（共通幅なし）。**完全埋め削除・寿命・TF ごと 5 件の上限を撤去**し、その時間足の確定終値で反対端を抜けたら iFVG、iFVG を逆方向に抜けたら無効（削除） |
 | TA FVG 吸収 | ACC-5A の形成・監視（方向ごとに最新 1 件・10 本）・吸収（陰線 / 陽線の終値）の式（LS-07） | P5 / P6 への紐付け → 共通の Zone 待機。吸収後の有効期限 5 → **12 本** |
 | TC SATS 反発 | `f_satBand`（byte 一致: LS-04）・`f_satHist`（`close[1]` を前の確定終値 `labC1` に置き換えただけ: LS-05）・近接 1.0 / 陽線陰線 / Nc 1 | Entry A〜D の準備から切り離し、反発の成立足 = 0 本目・12 本有効のタイミング部品。4H・1H 逆方向フィルターは初期 OFF |
 | 数量・時間帯 | ACC `f_qty`（= ZoneStrategyXAU `f_stQty`）・`f_inSession`（byte 一致: LS-06） | なし（300,000 円 × 3 %・0.01 lot 切り捨て・JST 09:00〜翌 02:00） |
 | 注文の処理 | ACC の約定確認・不正な出口の成行決済・管理外建玉 / 2 回実行の停止（ACC-2 の保護）・BEL-1 / BEL-2 のロック | Strong/Weak・Score 優先を廃止。分割利確（段ごとの exit）・動的 TP・変更通知・取引台帳を追加 |
+
+## 2A. LAB-2: 外部 POC（MtfPocFeedXAU）の接続（RE10110 対策）
+
+**貼り付けるもの**: `MtfPocFeedXAU.pine`（インジ）と `ZoneComboLabXAU.pine`（Strategy）を同じ XAUUSD 5分足チャートに追加し、
+Strategy の設定「02d · ZD 出来高 POC」の 13 項目に、MtfPocFeedXAU の同じ名前の系列を選ぶ。
+
+| Strategy の入力（input.source） | 選ぶ系列（MtfPocFeedXAU の plot 名） | 値 |
+|---|---|---|
+| POC protocol (10001) | POC protocol | 常に 10001（5分足以外では na） |
+| POC 1H 区画下限 | POC 1H 区画下限 | 最大出来高区画の下限（計算不能・OFF は na） |
+| POC 1H 区画上限 | POC 1H 区画上限 | 同 上限 |
+| POC 1H 対象足時刻 | POC 1H 対象足時刻 | 確定した 1H 足の開始時刻 time[1]: 正常 = 正 / 計算不能 = 負 / OFF = 0 / 初期で取れない = na |
+| POC 4H 区画下限 / 上限 / 対象足時刻 | POC 4H 区画下限 / 上限 / 対象足時刻 | 同上（4H） |
+| POC 日足 区画下限 / 上限 / 対象足時刻 | POC 日足 区画下限 / 上限 / 対象足時刻 | 同上（日足） |
+| POC 週足 区画下限 / 上限 / 対象足時刻 | POC 週足 区画下限 / 上限 / 対象足時刻 | 同上（週足） |
+
+- 受信状態（時間足ごと・集計表の「ZD 受信」行）: 正常 / 計算不能（時刻 < 0）/ 履歴不足（時刻 na）/ 外部 OFF（時刻 0 なのに Strategy 側が ON）/
+  誤接続（protocol ≠ 10001・時刻が時刻として不自然（|t| < 1e11、現在の 5分足以後、整数でない）・正常なのに上下限が na・上限 <= 下限）。
+  **外部 OFF・誤接続のどれかがあれば新規発注を止める**（見送り理由「ZD 接続」）。計算不能・履歴不足では止めない。close での代用はしない。
+  Strategy 側で ZD の時間足を OFF にした分は判定しない（全部 OFF なら未接続でも止めない）。
+- 「明らかな誤接続」だけを検出する: 例えば区画上限だけを別の価格系列に取り違えた場合などは検出できない（TradingView で接続を確認する）。
+- 集計本数（初期 120）・分割数（初期 75）・時間足ごとの検知 ON/OFF は MtfPocFeedXAU の設定で変える。
+
+**その他の軽量化（売買結果は変えない: LB-44 で変更前と一致）**
+- TP 探索: 共通幅 Zone の下限順索引・FVG の下限順 / 上限順索引・MA 2 本を、LONG は下限の昇順 / SHORT は上限の降順に 1 件ずつ読み、
+  統合中の帯の近端・遠端を更新して 3 つ目の帯が確定したら終了（1 件ごとの全再統合をやめた）。候補評価では方向ごとに 1 回だけ計算して再利用。
+- 待機の検索: 「方向 # 待機キー」の map（待機の配列は評価順のために残し、削除・消費・期限切れ・全消去で map も同期）。
+- AND: 種類ごとの接触の一覧から深さ優先で組合せを選び、方向が揃わない・共通の重なりがない・重なりに接触していない枝を打ち切る
+  （全部を選んだ組合せの条件は途中でも成り立つので有効な組合せは省略しない。列挙順は従来と同じ）。
 
 ## 3. 判定の流れ（確定 5分足ごと）
 
@@ -168,7 +197,7 @@ ACC-5B（別セッション）の変更による失敗はなかった。
 | コンパイルトークン | **未計測**（TradingView で確認）。ファイル約 1,950 行 |
 | 実行時間 | **未計測**（Pine Profiler で確認）。Python の参考値は下 |
 | 参照履歴 | max_bars_back 1100（POC の集計本数の上限 1000 + 1）。5分 EMA3000 は約 10 日、1分 EMA3000 は約 2 日の履歴が必要 |
-| 取得範囲 | request.security 18 本（Accum 3・1分 EMA 1・Swing 4・POC 4・FVG 4・SATS 2）。D / W の POC は 120 本（約半年 / 2.3 年）、W の Swing は 13 週の上位足履歴が必要。届かない間は na のまま（補完しない） |
+| 取得範囲 | request.security 14 本（Accum 3・1分 EMA 1・Swing 4・FVG 4・SATS 2）+ MtfPocFeedXAU 側に 4 本（POC）。D / W の POC は 120 本（約半年 / 2.3 年）、W の Swing は 13 週の上位足履歴が必要。届かない間は na のまま（補完しない） |
 | 内部保持数 | Zone は FVG の無効化以外で削除しない。集計表と Data Window に種類別の保持数、1 本で走査した Zone の最大数、待機・タイミング・組合せの最大数を表示 |
 | 表示件数 | 帯の表示は最新 80 個（入力）、エントリーラベル 50 個。表示を消しても Zone は残る |
 
