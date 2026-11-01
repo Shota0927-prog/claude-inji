@@ -47,10 +47,92 @@ def logic(text):
 # ============================================================================
 # runner: the translated Pine logic
 # ============================================================================
+# ============================================================================
+# eager evaluation (FDS-2): Pine evaluates BOTH operands of and / or (the TradingView error "array.get() index -1" at
+# `while array.size(x) > 0 and array.get(x, array.size(x) - 1) ...` shows it). Python short-circuits, so the plain translation
+# hid that bug. In eager mode and / or / ?: evaluate every operand; an array bounds error (PineRuntimeError) always surfaces;
+# na arithmetic (TypeError in Python, na in Pine) in an operand that does not decide the result is ignored, in one that does
+# it still raises (the harness stays strict about na).
+# ============================================================================
+class EagerParser(ap.ExprParser):
+    def ternary(self):
+        c = self.binary(1)
+        if self.peek()[1] == "?":
+            self.take("?")
+            a = self.ternary()
+            self.take(":")
+            b = self.ternary()
+            return f"_tern(lambda: {c}, lambda: {a}, lambda: {b})"
+        return c
+
+    def binary(self, minp):
+        left = self.unary()
+        while True:
+            op = self.binop()
+            if op is None or ap.BIN_PREC[op] < minp:
+                return left
+            self.take()
+            right = self.binary(ap.BIN_PREC[op] + 1)
+            left = f"_{op}(lambda: {left}, lambda: {right})" if op in ("and", "or") else f"({left} {op} {right})"
+
+
+def _ev(f):
+    try:
+        return f(), None
+    except TypeError as e:          # na arithmetic in Python
+        return None, e
+
+
+def _and(l, r):
+    a, ea = _ev(l)
+    b, eb = _ev(r)                  # evaluated even when a is false (Pine)
+    if ea:
+        raise ea
+    if not a:
+        return False
+    if eb:
+        raise eb
+    return bool(b)
+
+
+def _or(l, r):
+    a, ea = _ev(l)
+    b, eb = _ev(r)
+    if ea:
+        raise ea
+    if a:
+        return True
+    if eb:
+        raise eb
+    return bool(b)
+
+
+def _tern(c, a, b):
+    cv, ec = _ev(c)
+    av, ea = _ev(a)
+    bv, eb = _ev(b)
+    if ec:
+        raise ec
+    v, e = (av, ea) if cv else (bv, eb)
+    if e:
+        raise e
+    return v
+
+
+def translate(text, eager=True):
+    saved = ap.ExprParser
+    if eager:
+        ap.ExprParser = EagerParser
+    try:
+        return ap.Translator().translate(ap.logical_lines(logic(text)))
+    finally:
+        ap.ExprParser = saved
+
+
 class Run:
-    def __init__(self, overrides=None, mt=0.1, text=None):
+    def __init__(self, overrides=None, mt=0.1, text=None, eager=True):
         text = text if text is not None else src()
-        self.code = compile(ap.Translator().translate(ap.logical_lines(logic(text))), "<FDS logic>", "exec")
+        self.code = compile(translate(text, eager), "<FDS logic>", "exec")
         self.inp = ap.inputs(text)
         for k in overrides or {}:
             if k not in self.inp:
@@ -69,6 +151,7 @@ class Run:
                 raise ap.PineRuntimeError("pop on empty")
             return arr.pop()
 
+        env.update(_and=_and, _or=_or, _tern=_tern)
         env.update(array__insert=a_insert, array__pop=a_pop,
                    math__round_to_mintick=lambda x: None if x is None else ap._pine_round(x / mt) * mt)
         env["_VARS"], env["_VARIPS"], env["__first__"] = set(), set(), True
@@ -501,6 +584,93 @@ def gate_cap():
           and r.st(1)["FORM"] + r.st(-1)["FORM"] == 2)
 
 
+OLD_UP = """        int nUp = 0
+        while array.size(wUpKey) > 0 and array.get(wUpKey, array.size(wUpKey) - 1) >= low
+            array.pop(wUpKey)
+            int id = array.pop(wUpId)
+            if open < array.get(fBot, id)
+                f_inc(1, S_UGAP)
+                f_end(id, 3, time)
+            else
+                nUp += 1
+                if f_start(id, high, low, close, time) == 1
+                    array.push(nextA, id)
+"""
+
+
+def gate_empty():
+    """FDS-2: the TradingView runtime error (array.get index -1 on bar 0) and the empty / emptied array cases"""
+    t = src()
+    # 1. the pre-fix loop, run in eager mode, reproduces the TradingView error on bar 0; the plain (short-circuit) mode hid it
+    i = t.index("        //    Pine の and は右辺も評価する")
+    j = t.index("        if nUp >= 2")
+    old = t[:i] + OLD_UP + t[j:]
+    err = None
+    try:
+        Run(text=old).bar(dict(o=100, h=101, l=99, c=100, t=T0))
+    except ap.PineRuntimeError as e:
+        err = str(e)
+    plain_ok = True
+    try:
+        Run(text=old, eager=False).run(timed([B(100, 101, 99, 100)] * 5))
+    except Exception:      # noqa: BLE001
+        plain_ok = False
+    check("FS-90 the pre-fix loop reproduces the TradingView error in eager mode (bar 0: array.get index -1, size 0); the old "
+          "short-circuit translation did not -> this is why FDS-1's tests passed", err is not None and "-1" in err and plain_ok, str(err))
+    # 2. no FVG at all: the first bars and a long flat stretch (no formation) in both modes
+    bad = []
+    for rep in (False, True):
+        try:
+            r = Run(dict(repeatMode=rep)).bar(dict(o=100, h=101, l=99, c=100, t=T0))
+            r = Run(dict(repeatMode=rep)).run(timed([B(100, 101, 99, 100.5), B(100.5, 101.5, 99.5, 100)] * 300))
+            if len(r["fTop"]) != 0 or r["fdsBars"] != 600 or any(r["fdsSt"]):
+                bad.append(("flat", rep))
+        except Exception as e:      # noqa: BLE001
+            bad.append(("flat", rep, repr(e)))
+    check("FS-91 0 FVG from the start: bar 0 alone, and 600 bars without any formation (both modes) run without an array error, "
+          "no FVG, all tallies 0", not bad, str(bad))
+    # 3. waiting list 1 -> 0 (the only FVG is touched and removed), then more bars; bull and bear; both modes
+    bad = []
+    tails = [B(107, 107, 103, 105), B(105, 106, 104.5, 105.5), B(105.5, 106, 105, 105.5)]
+    for rep in (False, True):
+        for name, seq in (("bull", BULL + tails), ("bear", mirror(BULL + tails))):
+            try:
+                r = run(seq, repeatMode=rep)
+                d = 1 if name == "bull" else -1
+                s = r.st(d)
+                if not (s["FORM"] == 1 and s["N"] == 1 and s["R"] == 1 and s["U"] == 0):
+                    bad.append((name, rep, nz_fields(s)))
+                if (not rep) and (r["wUpKey"] or r["wDnKey"] or r["aId"]):
+                    bad.append((name, rep, "lists not empty"))
+            except Exception as e:      # noqa: BLE001
+                bad.append((name, rep, repr(e)))
+        # break empties the list too
+        for name, seq in (("bull break", BULL + [B(107, 107, 99, 99.5), B(99.5, 100, 98, 99)]),
+                          ("bear break", mirror(BULL + [B(107, 107, 99, 99.5), B(99.5, 100, 98, 99)]))):
+            try:
+                r = run(seq, repeatMode=rep)
+                d = 1 if name.startswith("bull") else -1      # the 2nd break bar forms an opposite FVG: check own list only
+                if r[("wUpKey" if d == 1 else "wDnKey")] or r.st(d)["B"] != 1 or r["fState"][0] != 2:
+                    bad.append((name, rep))
+            except Exception as e:      # noqa: BLE001
+                bad.append((name, rep, repr(e)))
+    check("FS-92 waiting list 1 -> 0: the only FVG touched (rebound / break) and removed, then further bars, bull and bear, both "
+          "modes: no array error, lists empty afterwards, tallies correct", not bad, str(bad))
+    # 4. static: Pine for-loops with a size-dependent bound sit inside a size > 0 guard; the logic section has no for-loop
+    lines = t.split("\n")
+    unguarded = []
+    for k, ln in enumerate(lines):
+        m = re.match(r"\s*for \w+ = 0 to array\.size\((\w+)\) - 1", ln)
+        if m and not any(f"array.size({m.group(1)}) > 0" in x for x in lines[max(0, k - 2):k]) \
+                and m.group(1) != "keys":
+            unguarded.append(ln.strip())
+    lg = "\n".join(ap.strip_comment(x) for x in logic(t).split("\n"))
+    and_get = [x.strip() for x in lg.split("\n") if re.search(r"array\.size\([^)]*\)\s*>\s*0\s+and\s+array\.get", x)]
+    check("FS-93 static: no `for i = 0 to array.size(x) - 1` without a preceding size > 0 guard (Pine runs 0 to -1 once, unlike "
+          "Python's range); the logic section has no for-loop and no `size > 0 and array.get` pattern",
+          not unguarded and not re.search(r"^\s*for ", lg, re.M) and not and_get, f"{unguarded} {and_get}")
+
+
 def gate_mutation():
     """the checks above must fail when the logic is changed in plausible wrong ways"""
     t = src()
@@ -509,7 +679,7 @@ def gate_mutation():
         ("break <= bottom", "c < bot ? 2 : 0) : (c < bot", "c <= bot ? 2 : 0) : (c < bot"),
         ("bucket >", "10 * penT >= (b + 1) * widT", "10 * penT > (b + 1) * widT"),
         ("100 % to over", "if penT <= widT", "if penT < widT"),
-        ("touch strict", "array.get(wUpKey, array.size(wUpKey) - 1) >= low", "array.get(wUpKey, array.size(wUpKey) - 1) > low"),
+        ("touch strict", "array.get(wUpKey, array.size(wUpKey) - 1) < low", "array.get(wUpKey, array.size(wUpKey) - 1) <= low"),
         ("no gap check", "if open < array.get(fBot, id)", "if false"),
         ("re-arm same bar", "            array.set(fState, id, 0)\n            array.push(fdsRearm, id)",
          "            f_wait(id)"),
@@ -549,7 +719,7 @@ def gate_mutation():
 
 
 def main():
-    for g in (gate_static, gate_basic, gate_buckets, gate_repeat, gate_unknown, gate_fuzz, gate_recalc, gate_cap, gate_mutation):
+    for g in (gate_static, gate_basic, gate_buckets, gate_repeat, gate_unknown, gate_fuzz, gate_recalc, gate_cap, gate_empty, gate_mutation):
         try:
             g()
         except Exception:      # noqa: BLE001
