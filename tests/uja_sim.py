@@ -51,7 +51,7 @@ def gate_static():
     st = git("status", "--porcelain").split("\n")
     mod = (set(git("diff", "--name-only", B, "--").split()) | {l[3:] for l in st if l.startswith("??")}) - UNTRACKED
     bad = sorted(m for m in mod if m != gb.PATH and m not in gb.NEW_TESTS and m not in __import__("eua_build").NEW_TESTS
-                 and m not in __import__("acc_build").NEW_FILES     # ACC-1 new files
+                 and not __import__("acc_build").ok(m)     # ACC-1 new files (+ later LAB-1 files through acc_build.ok)
                  and not (m in gb.TEST_EDITS and gb.unadapt(m, raw(m)) == gb.show(B, m) and gb.unadapt(m, raw(m)) != raw(m))
                  and not (m == __import__("eua_build").PATH and __import__("eua_build").unapply(m, raw(m)) == gb.show(B, m))     # later EUA-1: exact
                  and not (m in __import__("acc_build").TEST_EDITS and __import__("acc_build").unadapt(m, raw(m)) == gb.show(B, m) and __import__("acc_build").unadapt(m, raw(m)) != raw(m)))     # ACC-1 test edits: exact

@@ -150,9 +150,10 @@ def static():
           and 'fvAbsLife = input.int(12,' in SRC)
     base = git("log", "--format=%H", "-1", "--", "MtfPocDetector.pine").strip()
     normal = ["ZoneStrategyXAU.pine", "ZoneStrategyXAULong.pine", "ZoneEnginePracticalXAUUSD.pine", "AccumStrategyXAU.pine",
-              "MtfPocDetector.pine", "tests/acc_pine.py", "tests/acc_sim.py"]
+              "MtfPocDetector.pine", "tests/acc_pine.py"]     # tests/acc_sim.py: only the recorded LAB-1 edit (LS-11)
     changed = git("diff", "--name-only", "HEAD", "--", *normal).split() + git("diff", "--name-only", "--cached", "--", *normal).split()
-    check("LS-08 the normal Strategy / Engine / Accum / POC detector files and the ACC harness are not modified (working tree == HEAD)",
+    check("LS-08 the normal Strategy / Engine / Accum / POC detector files and the ACC harness are not modified (working tree == HEAD; "
+          "the older fixtures change only by the LAB-1 registration edits, LS-11)",
           not changed and base != "", str(changed))
     code = re.sub(r"//.*", "", SRC)
     n_plot = len(re.findall(r"(?<![\w.])plot\(", code))

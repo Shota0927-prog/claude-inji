@@ -142,7 +142,7 @@ def gate_static():
     mod -= {"tests/__pycache__/"}
     bad = sorted(m for m in mod if m not in mb.FILES and m not in mb.NEW_TESTS and m not in __import__("bel_build").NEW_TESTS
                  and m not in __import__("gja_build").NEW_TESTS and m not in __import__("uja_build").NEW_TESTS
-                 and m not in __import__("eua_build").NEW_TESTS and m not in __import__("acc_build").NEW_FILES     # ACC-1 new files
+                 and m not in __import__("eua_build").NEW_TESTS and not __import__("acc_build").ok(m)     # ACC-1 new files (+ later LAB-1 files through acc_build.ok)
                  and not (m in TEST_EDITS and revert(__import__("bel_build").unadapt(m, raw(m)), TEST_EDITS[m]) == mb.show(B, m))
                  and not (m in __import__("acc_build").TEST_EDITS and __import__("acc_build").unadapt(m, raw(m)) == mb.show(B, m) and __import__("acc_build").unadapt(m, raw(m)) != raw(m)))     # ACC-1 test edits: exact
     check("MS-02 vs a31e934 only the eight Strategies, the new msl_build / msl_sim and the listed test files change; each test file by "

@@ -150,7 +150,7 @@ def gate_static():
     base = lambda m: subprocess.run(["git", "-C", ROOT, "show", f"{BASE_REV}:{m}"], capture_output=True, text=True).stdout
     bad = sorted(m for m in mod if not ab.ok(m)
                  and not (m in ab.TEST_EDITS and ab.unadapt(m, raw(m)) == base(m) and ab.unadapt(m, raw(m)) != raw(m)))
-    pine = sorted(m for m in mod if m.endswith(".pine"))     # ACC-3: + the TradingView probe
+    pine = sorted(m for m in mod if m.endswith(".pine") and not __import__("lab_build").ok(m))     # ACC-3: + the TradingView probe (LAB-1 files: exact)
     check("AS-10 vs 890498e only the ACC files (acc_build.NEW_FILES) are new and only the older fixtures listed in "
           "acc_build.TEST_EDITS change, each by exactly its recorded edit; the only Pine changes are the new AccumStrategyXAU.pine "
           "and the ACC-3 probe AccHistTickProbe.pine "

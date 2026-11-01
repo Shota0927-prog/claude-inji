@@ -19,7 +19,7 @@ NEW_TESTS = NEW_FILES
 
 def ok(path):
     """ACC-1 / ACC-2 account for this path exactly: one of their new files."""
-    return path in NEW_FILES
+    return path in NEW_FILES or __import__("lab_build").ok(path)     # the later LAB-1 files: exact
 
 
 A = '__import__("acc_build")'
@@ -159,6 +159,7 @@ def apply_edits(path, text):
 
 def unadapt(path, text):
     """a test file with its ACC edits reverted (all or nothing; unchanged without them; None with only part of them)."""
+    text = __import__("lab_build").unadapt(path, text)     # the later LAB-1 test edits are reverted first, exactly
     eds = TEST_EDITS.get(path, [])
     if text is None or not eds or all(text.count(new) == 0 for _, new, _ in eds):
         return text
