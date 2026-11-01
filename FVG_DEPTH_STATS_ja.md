@@ -5,7 +5,7 @@
 
 ## 参照元と検知式
 
-- ZF の `f_fvgConfirmed` を参照しています（「Zone Combo Lab XAU」は本リポジトリにないため、同じ関数がそのまま入っている `ZoneStrategyXAU.pine` の 773〜779行で式を照合しました）。
+- 「Zone Combo Lab XAU」（`ZoneComboLabXAU.pine` の439〜445行）にある ZF の `f_fvgConfirmed` を参照しています。この関数は `ZoneStrategyXAU.pine` の同名関数をそのまま写したもので、両方と式が一致することをテスト FS-01 で照合しています。
   - 上昇FVG：`low > high[2]`。範囲は `high[2]`〜`low`
   - 下降FVG：`high < low[2]`。範囲は `high`〜`low[2]`
   - 最小幅：`math.round_to_mintick(top - bottom) >= minWidth`
@@ -77,3 +77,11 @@
   - TradingView でのコンパイル
   - `chart.is_standard`・`timeframe.*`・`timenow`・`barstate` の実際の値
   - ボックスの描画と表
+
+## 既存 fixture への登録
+
+`tests/fds_build.py` で、新しく追加したファイルを既存 fixture の「他のファイルは変わっていない」照合に登録しています（`tests/lab_build.py` と同じ方法です）。
+
+- `tests/lab_build.py` の `ok()` と `unadapt()` に1行ずつ追加しました。
+- `tests/cad_adapt.py` の `LATER_NEW` に新規ファイルを追加しました。
+- これらの編集が記録どおりに入っていることと、元に戻すと編集前のテキストと完全に一致することを、FS-07 で照合しています。
