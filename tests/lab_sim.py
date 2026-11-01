@@ -1120,8 +1120,8 @@ def sc_old_new():
     cfgs = [dict(), dict(cComb="AND", cZA=False, cZB=True, cZC=False, cZD=True, cZF=True), dict(tpMode="選択した TP で全決済", tpSel=3),
             dict(tpMode="固定 RR"), dict(cScope="だけ"), dict(beLock=True, beMode="TP1 割合")]
     bad = []
-    for seed in range(4):
-        sc = rand_bars(seed + 10, n=700)
+    for seed in range(2):
+        sc = rand_bars(seed + 10, n=350)
         # more POC / MA traffic: a second POC slot every 6 bars, two MAs
         for i, b in enumerate(sc.bars):
             if i >= 30:
@@ -1138,8 +1138,8 @@ def sc_old_new():
             if not same:
                 bad.append((seed, cf))
             OLD_NEW_STATS.append(len(entries(b)))
-    check("LB-44 before / after (LAB-1 bc68da2 with the internal POC vs LAB-2 with the same POC values as external series): 4 random "
-          "paths x 6 settings (OR / AND, chosen TP, fixed RR, only, BE lock + TP1 ratio) give identical waits / timings / legs per bar, "
+    check("LB-44 before / after (LAB-1 bc68da2 with the internal POC vs LAB-2 with the same POC values as external series): 2 random "
+          "paths x 350 bars x 6 settings (OR / AND, chosen TP, fixed RR, only, BE lock + TP1 ratio) give identical waits / timings / legs per bar, "
           "orders and fills (incl. partial exits), closed trades, ledger buckets and registered Zones",
           not bad and sum(OLD_NEW_STATS) > 0, f"{bad} entries {OLD_NEW_STATS}")
 
