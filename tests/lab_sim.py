@@ -167,6 +167,26 @@ def static():
           and "ta." not in re.sub(r"//.*", "", logic) and "Keep" not in logic and "expTime" not in logic)
 
 
+REG_BASE = "444e61f"     # the last commit before the LAB-1 registration edits
+
+
+def registration():
+    import lab_build as lb
+    bad = []
+    for path, eds in lb.TEST_EDITS.items():
+        cur = raw(path)
+        if not all(cur.count(new) == cnt for _, new, cnt in eds):
+            bad.append((path, "edit not applied exactly"))
+        elif lb.unadapt(path, cur) != git("show", f"{REG_BASE}:{path}"):
+            bad.append((path, "unadapt != the text before the edits"))
+    missing = [f for f in lb.NEW_FILES if not os.path.exists(os.path.join(ROOT, f))]
+    check("LS-11 registration in the older fixtures (tests/lab_build.py, same method as acc_build): every recorded edit is present "
+          "exactly and lab_build.unadapt() gives the file before the edits byte for byte; acc_build.ok() accepts exactly the LAB-1 new "
+          "files on top of the ACC files; every LAB-1 new file exists",
+          not bad and not missing and all(__import__("acc_build").ok(f) for f in lb.NEW_FILES)
+          and not __import__("acc_build").ok("ZoneStrategyXAU.pine"), f"{bad} {missing}")
+
+
 # ============================================================================
 # scenarios
 # ============================================================================
@@ -511,6 +531,28 @@ def sc_partial():
           and len(ntf) == 1 and ntf[0][0] == 7, f"{[t['legPx'] for t in r.trace[5:12]]} {ntf}")
 
 
+def sc_qty_table():
+    """the Pine f_lbPlan itself (targets stubbed): legs for N = 1..10 lots with 3 / 2 / 1 targets (documented table, 5A)."""
+    import math
+    r = lp.Runner(overrides=dict(QUIET)).run(flat(1, 1985))
+    e = r.env
+    got3, got2, got1, exp3, exp2 = [], [], [], [], []
+    for n in range(1, 11):
+        for tps, out in (([1980.0, 1970.0, 1960.0], got3), ([1980.0, 1970.0], got2), ([1980.0], got1)):
+            o = e["o"]
+            o.side, o.sl, o.lotN, o.closedLots, o.stage = -1, 2000.0, n, 0, 0
+            e["f_lbTargets"] = lambda side, ref, tps=tps: list(tps)
+            e["f_lbPlan"](1990.0, 1990.0)
+            out.append(list(o.legLots))
+        c1, c2 = math.floor(0.6 * n + 1e-9), math.floor(0.8 * n + 1e-9)
+        exp3.append([c1, c2 - c1, n - c2])
+        exp2.append([c1, n - c1, 0])
+    check("LB-40 partial quantities as coded (f_lbPlan): legs = cumulative floor(0.6N) / floor(0.8N) / N for 3 targets, floor(0.6N) / "
+          "rest for 2, N for 1 — e.g. N=1 -> 0/0/1, 2 -> 1/0/1, 3 -> 1/1/1, 6 -> 3/1/2; exact 60/20/20 only for N = 5, 10 (pinned so any "
+          "change of this rule is deliberate)", got3 == exp3 and got2 == exp2 and got1 == [[n, 0, 0] for n in range(1, 11)]
+          and got3[0] == [0, 0, 1] and got3[5] == [3, 1, 2], f"{got3} {got2}")
+
+
 def sc_tp_mixed():
     # SHORT targets: a wide 1H bearish FVG 1940-1975 overlapping POC 1960 (1954-1966) = one band (upper edge 1975), POC 1920 (top 1926)
     after = flat(6, 1998.5)
@@ -840,6 +882,7 @@ def mutation():
 def main():
     t = _time.time()
     static()
+    registration()
     sc_basic()
     sc_windows()
     sc_carry()
@@ -849,6 +892,7 @@ def main():
     sc_fvg()
     sc_partial()
     sc_tp_mixed()
+    sc_qty_table()
     sc_be()
     sc_consume()
     sc_zones()
