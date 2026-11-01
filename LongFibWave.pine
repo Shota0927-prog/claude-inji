@@ -1,0 +1,445 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+
+//@version=5
+// =====================================================================================
+//  Long Fib Wave (LFW-1) — 長期フィボナッチ単体インジケーター（日足・4時間足）
+// -------------------------------------------------------------------------------------
+//  目的 : 各対象時間足の「最新の大きな波」に起点・終点・結ぶ線・フィボ水準を引き、
+//         波の終点から「どこまで戻ってから元の方向へ進むことが多いか」を集計する。
+//  範囲 : 価格帯の検知と統計だけ。エントリー条件・Strong/Weak 判定・Zone 連携は持たない。
+//  詳細 : LONG_FIB_WAVE_ja.md / 検証 : tests/lfw_sim.py（下の Logic 区間をそのまま変換して実行）
+//
+//  ■ データの受け取り（リペイントしない）
+//    request.security(…, "D" / "240", [high[1], low[1], open[1], time[1], ta.atr(len)[1]], lookahead_on)
+//    → 確定した対象時間足 1 本分だけが届く。チャート足が確定した時点（barstate.isconfirmed）で
+//      「新しく届いた確定足」を 1 回だけ処理する。判定・観測の「利用可能時刻」はその チャート足の time_close。
+//
+//  ■ 波（下降波で説明。上昇波は上下対称）
+//    ① 起点高値を保持し、安値（ヒゲ）を更新するたびに終点を更新する
+//    ② 終点からの戻り高値（ヒゲ）が 波幅 × 切替率（既定 0.782）以上 → その戻り高値を次の起点候補として追跡
+//    ③ 戻る前の安値（終点）を割った足で、その戻り高値を新しい起点にして新しい下降波へ切り替える
+//       （切替率に達しただけでは切り替えない）
+//    ④ 起点を厳密に上抜け（高値 > 起点）→ 方向反転：旧終点を起点とする上昇波へ
+//    起点ちょうど（高値 == 起点）は反転ではない（観測上は「全戻し」）。
+//
+//  ■ 戻り観測（統計）
+//    終点からの戻りが 波幅の 10% 以上になった時点で 1 件の正式観測を開始。分母（起点・終点）は開始時に固定。
+//    決着 : 再開（終点を更新）/ 全戻し（起点ちょうど到達）/ 波切替終了（起点を厳密に突破＝方向反転）/
+//           順序不明（同一確定足の中の順序で結果が変わる）。 未決着は「観測中」。観測期限なし。
+//    再開後は新しい終点を基準に、再び 10% 以上戻ったら次の観測（繰り返し観測）。
+// =====================================================================================
+indicator("Long Fib Wave (D / 4H)", "LFW", overlay = true, max_lines_count = 200, max_labels_count = 200)
+
+// ---------------------------------------------------------------- inputs
+grpT = "① 対象時間足"
+lfwOnD          = input.bool(true, "日足 (D) を計算",            group = grpT)
+lfwOn4          = input.bool(true, "4時間足 (240) を計算",       group = grpT)
+
+grpW = "② 波の切替・観測"
+lfwSwitchRatio  = input.float(0.782, "切替率（この戻り率以上の戻り高安を次の起点候補にする）", minval = 0.01, maxval = 1.0, step = 0.001, group = grpW)
+lfwStartRatio   = input.float(0.10,  "観測開始の戻り率",           minval = 0.01, maxval = 1.0, step = 0.01, group = grpW)
+
+grpI = "③ 初期化（最初の波だけに使用）"
+lfwAtrLen       = input.int(14,     "初期化 ATR 期間（対象時間足）", minval = 1,   group = grpI)
+lfwInitAtrMult  = input.float(3.0,  "初期化の最低波幅（ATR 倍率）",  minval = 0.1, step = 0.1, group = grpI)
+lfwExclInit     = input.bool(true,  "初期化波の観測を統計から除外", group = grpI)
+
+grpD = "④ 描画"
+lfwLevelsStr    = input.string("0,0.236,0.382,0.5,0.618,0.79,1", "表示するフィボ水準（0=終点 / 1=起点）", group = grpD)
+lfwShowCand     = input.bool(true,  "切替候補（戻り高安）を表示",  group = grpD)
+lfwColD         = input.color(color.new(color.purple, 0), "日足の色",  group = grpD)
+lfwCol4         = input.color(color.new(color.teal, 0),   "4時間足の色", group = grpD)
+
+grpS = "⑤ 統計表示"
+lfwStatSel      = input.string("4H 下降", "統計表",  options = ["4H 下降", "4H 上昇", "日足 下降", "日足 上昇", "非表示"], group = grpS)
+lfwShowInfo     = input.bool(true,  "波の状態表を表示",            group = grpS)
+lfwMaxRecs      = input.int(1000,   "保存する観測記録の上限（件数集計は上限なし）", minval = 10, group = grpS)
+
+// ---------------------------------------------------------------- confirmed higher-timeframe bars
+lfwChartSec = timeframe.in_seconds()
+lfwOkD = lfwOnD and lfwChartSec <= timeframe.in_seconds("D")
+lfwOk4 = lfwOn4 and lfwChartSec <= timeframe.in_seconds("240")
+
+// チャート足 == 対象時間足 : その足が確定した時点で、その足自身を処理する（1 本遅れにしない）
+lfwSameD = lfwChartSec == timeframe.in_seconds("D")
+lfwSame4 = lfwChartSec == timeframe.in_seconds("240")
+lfwAtrC  = ta.atr(lfwAtrLen)
+
+// チャート足 < 対象時間足 : 確定した対象時間足 1 本分（[1] + lookahead_on）。対象時間足の確定後、最初のチャート足で届く
+[lfwDhS, lfwDlS, lfwDoS, lfwDtS, lfwDatrS] = request.security(syminfo.tickerid, "D",   [high[1], low[1], open[1], time[1], ta.atr(lfwAtrLen)[1]], lookahead = barmerge.lookahead_on)
+[lfw4hS, lfw4lS, lfw4oS, lfw4tS, lfw4atrS] = request.security(syminfo.tickerid, "240", [high[1], low[1], open[1], time[1], ta.atr(lfwAtrLen)[1]], lookahead = barmerge.lookahead_on)
+
+lfwDh   = lfwSameD ? high     : lfwDhS
+lfwDl   = lfwSameD ? low      : lfwDlS
+lfwDo   = lfwSameD ? open     : lfwDoS
+lfwDt   = lfwSameD ? time     : lfwDtS
+lfwDatr = lfwSameD ? lfwAtrC  : lfwDatrS
+lfw4h   = lfwSame4 ? high     : lfw4hS
+lfw4l   = lfwSame4 ? low      : lfw4lS
+lfw4o   = lfwSame4 ? open     : lfw4oS
+lfw4t   = lfwSame4 ? time     : lfw4tS
+lfw4atr = lfwSame4 ? lfwAtrC  : lfw4atrS
+
+// 新しい確定足を処理するチャート足（の確定時）だけ true
+lfwNewD = lfwOkD and barstate.isconfirmed and not na(lfwDt) and (lfwSameD or lfwDtS != nz(lfwDtS[1], -1))
+lfwNew4 = lfwOk4 and barstate.isconfirmed and not na(lfw4t) and (lfwSame4 or lfw4tS != nz(lfw4tS[1], -1))
+
+// ==== LFW Logic (begin) — tests/lfw_sim.py translates and runs this section as is ====
+// 観測の決着区分 (outcome) : 0 再開 / 1 全戻し / 2 波切替終了 / 4 順序不明（3 = 観測中は記録せず、表示時に数える）
+// ビン (bin) : 0..9 = 戻り率 0-10% .. 90-100%（未満）/ 10 = 100%（全戻し）/ 11 = 100% 超（波切替終了）
+type LfwRec
+    int dir
+    int waveId
+    int seq
+    float refO
+    float refE
+    int startAvail
+    int endAvail
+    int outcome
+    float rMax
+    float rAlt
+    int bin
+
+type LfwTf
+    int dir = 0
+    bool isInit = false
+    int waveId = 0
+    float O = na
+    int oT = na
+    int oAvail = na
+    float E = na
+    int eT = na
+    int eAvail = na
+    float rx = na
+    int rxT = na
+    bool obsOn = false
+    bool obsDone = false
+    int obsDir = 0
+    float obsO = na
+    float obsE = na
+    int obsStart = na
+    int obsSeq = 0
+    bool obsInit = false
+    float iHi = na
+    int iHiT = na
+    float iLo = na
+    int iLoT = na
+    float iOp = na
+    float initAtr = na
+    int initAvail = na
+    array<int> cnt
+    array<LfwRec> recs
+    int nExclInit = 0
+    int nStartAmb = 0
+    int nCandAmb = 0
+    int nWaveAmb = 0
+
+lfwNewTf() =>
+    LfwTf.new(cnt = array.new_int(120, 0), recs = array.new<LfwRec>())
+
+lfwIdx(int d, int b, int o) =>
+    ((d == 1 ? 0 : 1) * 12 + b) * 5 + o
+
+lfwBin(float r) =>
+    r > 1.0 ? 11 : r >= 1.0 ? 10 : math.max(0, math.min(9, math.floor(r * 10.0 + 0.000000001)))
+
+// 戻り率 : 終点から価格 p までの戻り ÷ 波幅（上昇波・下降波共通の式）
+lfwRatio(LfwTf S, float p) =>
+    (S.E - p) / (S.E - S.O)
+
+lfwStartObs(LfwTf S, int availT) =>
+    S.obsOn := true
+    S.obsDir := S.dir
+    S.obsO := S.O
+    S.obsE := S.E
+    S.obsStart := availT
+    S.obsSeq := S.obsSeq + 1
+    S.obsInit := S.isInit and lfwExclInit
+    true
+
+lfwRecord(LfwTf S, int outcome, float r, float rAlt, int availT) =>
+    int b = outcome == 1 ? 10 : outcome == 2 ? 11 : lfwBin(r)
+    if S.obsInit
+        S.nExclInit := S.nExclInit + 1
+    else
+        int idx = lfwIdx(S.obsDir, b, outcome)
+        array.set(S.cnt, idx, array.get(S.cnt, idx) + 1)
+        array.push(S.recs, LfwRec.new(S.obsDir, S.waveId, S.obsSeq, S.obsO, S.obsE, S.obsStart, availT, outcome, r, rAlt, b))
+        if array.size(S.recs) > lfwMaxRecs
+            array.shift(S.recs)
+    S.obsOn := false
+    b
+
+lfwNewWave(LfwTf S, int d, float o, int oT, float e, int eT, int availT) =>
+    S.dir := d
+    S.O := o
+    S.oT := oT
+    S.oAvail := availT
+    S.E := e
+    S.eT := eT
+    S.eAvail := availT
+    S.rx := na
+    S.rxT := na
+    S.obsOn := false
+    S.obsDone := false
+    S.obsSeq := 0
+    S.waveId := S.waveId + 1
+    S.isInit := false
+    true
+
+lfwExtend(LfwTf S, float e, int eT, int availT) =>
+    S.E := e
+    S.eT := eT
+    S.eAvail := availT
+    S.rx := na
+    S.rxT := na
+    S.obsDone := false
+    true
+
+// 初期化 : 最初の波だけ。最安・最高の幅が ATR × 倍率 以上になった確定足で、先にできた極値を起点にする
+lfwInitStep(LfwTf S, float h, float l, float op, int t, float atr, int availT) =>
+    if na(S.iHi) or h > S.iHi
+        S.iHi := h
+        S.iHiT := t
+        S.iOp := op
+    if na(S.iLo) or l < S.iLo
+        S.iLo := l
+        S.iLoT := t
+        S.iOp := op
+    if not na(atr) and atr > 0 and S.iHi - S.iLo >= lfwInitAtrMult * atr
+        bool down = S.iHiT < S.iLoT
+        if S.iHiT == S.iLoT
+            // 同じ足に最高値と最安値 : 足内順序の仮定（始値に近い側が先）で、後にできた極値を終点にする
+            down := math.abs(S.iHi - S.iOp) < math.abs(S.iLo - S.iOp)
+        if down
+            lfwNewWave(S, -1, S.iHi, S.iHiT, S.iLo, S.iLoT, availT)
+        else
+            lfwNewWave(S, 1, S.iLo, S.iLoT, S.iHi, S.iHiT, availT)
+        S.isInit := true
+        S.initAtr := atr
+        S.initAvail := availT
+    true
+
+// 確定した対象時間足 1 本の処理
+lfwProcess(LfwTf S, float h, float l, float op, int t, float atr, int availT) =>
+    if S.dir == 0
+        lfwInitStep(S, h, l, op, t, atr, availT)
+    else
+        int s = S.dir
+        float extP = s == 1 ? h : l
+        float retP = s == 1 ? l : h
+        bool X = s * (extP - S.E) > 0
+        bool B = s * (S.O - retP) > 0
+        bool T = retP == S.O
+        float rPrior = na(S.rx) ? 0.0 : lfwRatio(S, S.rx)
+        float rBar = lfwRatio(S, retP)
+        if X and B
+            // 1 本で終点更新と起点突破の両方 : 観測は順序不明。波は足内順序の仮定（始値に近い側が先）で後の極値を終点にする
+            if S.obsOn
+                lfwRecord(S, 4, rPrior, rBar, availT)
+            S.nWaveAmb := S.nWaveAmb + 1
+            bool hiFirst = math.abs(h - op) < math.abs(l - op)
+            bool retFirst = s == 1 ? not hiFirst : hiFirst
+            if retFirst
+                lfwNewWave(S, s, retP, t, extP, t, availT)
+            else
+                lfwNewWave(S, -s, extP, t, retP, t, availT)
+        else if X
+            // 元方向へ終点更新 : 旧観測の決着を先に保存してから、延長または同方向の波切替
+            if S.obsOn
+                if rBar > rPrior and (rBar >= 1.0 or lfwBin(rBar) != lfwBin(rPrior))
+                    lfwRecord(S, 4, rPrior, rBar, availT)
+                else
+                    lfwRecord(S, 0, rPrior, na, availT)
+            else if not S.obsDone and rBar >= lfwStartRatio
+                S.nStartAmb := S.nStartAmb + 1
+            bool candOn = not na(S.rx) and rPrior >= lfwSwitchRatio
+            if rBar > rPrior and rBar >= lfwSwitchRatio
+                S.nCandAmb := S.nCandAmb + 1
+            if candOn
+                lfwNewWave(S, s, S.rx, S.rxT, extP, t, availT)
+            else
+                lfwExtend(S, extP, t, availT)
+        else if B
+            // 起点を厳密に突破 : 方向反転。旧終点が新しい起点
+            if S.obsOn
+                lfwRecord(S, 2, rBar, na, availT)
+            else if not S.obsDone
+                lfwStartObs(S, availT)
+                lfwRecord(S, 2, rBar, na, availT)
+            lfwNewWave(S, -s, S.E, S.eT, retP, t, availT)
+        else
+            // 戻り側だけ : 戻り高安（＝切替候補）を更新し、観測の開始・全戻しを判定
+            if na(S.rx) or rBar > rPrior
+                S.rx := retP
+                S.rxT := t
+            float r = lfwRatio(S, S.rx)
+            if not S.obsOn and not S.obsDone and r >= lfwStartRatio
+                lfwStartObs(S, availT)
+            if S.obsOn and T
+                lfwRecord(S, 1, 1.0, na, availT)
+                S.obsDone := true
+    true
+
+var LfwTf lfwD = lfwNewTf()
+var LfwTf lfw4 = lfwNewTf()
+if lfwNewD
+    lfwProcess(lfwD, lfwDh, lfwDl, lfwDo, lfwDt, lfwDatr, time_close)
+if lfwNew4
+    lfwProcess(lfw4, lfw4h, lfw4l, lfw4o, lfw4t, lfw4atr, time_close)
+// ==== LFW Logic (end) ====
+
+// ---------------------------------------------------------------- display helpers (not part of the logic)
+f_px(float p) =>
+    na(p) ? "-" : str.tostring(p, format.mintick)
+
+f_tm(int t) =>
+    na(t) ? "-" : str.format_time(t, "yyyy-MM-dd HH:mm", syminfo.timezone)
+
+f_levels() =>
+    array<float> out = array.new_float()
+    for s in str.split(lfwLevelsStr, ",")
+        float v = str.tonumber(str.replace_all(s, " ", ""))
+        if not na(v)
+            array.push(out, v)
+    out
+
+// 波の描画 : 最新の波 1 本だけ。位置は極値を含む対象時間足の足（開始時刻）、利用可能時刻は tooltip に別記
+f_draw(LfwTf S, string tag, color col, array<line> lns, array<label> lbs) =>
+    for ln in lns
+        line.delete(ln)
+    for lb in lbs
+        label.delete(lb)
+    array.clear(lns)
+    array.clear(lbs)
+    if S.dir != 0
+        bool dn = S.dir == -1
+        string kind = (dn ? "下降波" : "上昇波") + (S.isInit ? "（初期化波）" : "")
+        array.push(lns, line.new(S.oT, S.O, S.eT, S.E, xloc = xloc.bar_time, color = col, width = 2))
+        array.push(lbs, label.new(S.oT, S.O, tag + " 起点 " + f_px(S.O), xloc = xloc.bar_time, color = col, textcolor = color.white,
+                     style = dn ? label.style_label_down : label.style_label_up, size = size.small,
+                     tooltip = tag + " " + kind + "\n極値の足: " + f_tm(S.oT) + "\n起点として確定・利用可能: " + f_tm(S.oAvail)))
+        array.push(lbs, label.new(S.eT, S.E, tag + " 終点 " + f_px(S.E), xloc = xloc.bar_time, color = col, textcolor = color.white,
+                     style = dn ? label.style_label_up : label.style_label_down, size = size.small,
+                     tooltip = tag + " " + kind + "\n極値の足: " + f_tm(S.eT) + "\n終点として利用可能: " + f_tm(S.eAvail)))
+        array<float> lv = f_levels()
+        for v in lv
+            float p = S.E + v * (S.O - S.E)
+            array.push(lns, line.new(S.oT, p, time, p, xloc = xloc.bar_time, extend = extend.right,
+                         color = color.new(col, 45), style = line.style_dashed))
+            array.push(lbs, label.new(time, p, tag + " " + str.tostring(v) + "  " + f_px(p), xloc = xloc.bar_time,
+                         style = label.style_label_left, color = color.new(col, 85), textcolor = col, size = size.tiny))
+        if lfwShowCand and not na(S.rx)
+            float rr = (S.E - S.rx) / (S.E - S.O)
+            if rr >= lfwSwitchRatio
+                array.push(lns, line.new(S.rxT, S.rx, time, S.rx, xloc = xloc.bar_time, color = color.new(color.orange, 0),
+                             style = line.style_dotted, width = 2))
+                array.push(lbs, label.new(S.rxT, S.rx, tag + " 切替候補 " + f_px(S.rx) + " (" + str.tostring(rr * 100, "#.0") + "%)",
+                             xloc = xloc.bar_time, style = dn ? label.style_label_down : label.style_label_up,
+                             color = color.new(color.orange, 0), textcolor = color.black, size = size.tiny,
+                             tooltip = "終点 " + f_px(S.E) + " を割る（上昇波は超える）と、ここが新しい起点になる"))
+    true
+
+var array<line>  lfwLnD = array.new<line>()
+var array<label> lfwLbD = array.new<label>()
+var array<line>  lfwLn4 = array.new<line>()
+var array<label> lfwLb4 = array.new<label>()
+
+// 各時点で利用できた波（データウィンドウで確認用）
+plot(lfwD.dir != 0 ? lfwD.O : na, "日足 起点", display = display.data_window)
+plot(lfwD.dir != 0 ? lfwD.E : na, "日足 終点", display = display.data_window)
+plot(lfwD.dir, "日足 方向 (1 上昇 / -1 下降 / 0 初期化前)", display = display.data_window)
+plot(lfw4.dir != 0 ? lfw4.O : na, "4H 起点", display = display.data_window)
+plot(lfw4.dir != 0 ? lfw4.E : na, "4H 終点", display = display.data_window)
+plot(lfw4.dir, "4H 方向 (1 上昇 / -1 下降 / 0 初期化前)", display = display.data_window)
+
+// ---------------------------------------------------------------- tables
+f_cell(table tb, int c, int r, string tx, color bg) =>
+    table.cell(tb, c, r, tx, text_color = color.white, bgcolor = bg, text_size = size.small)
+
+f_pct(int n, int d) =>
+    d > 0 ? str.tostring(100.0 * n / d, "#.0") + "%" : "-"
+
+f_stats(table tb, LfwTf S, int d, string title) =>
+    color hd = color.new(color.gray, 20)
+    color bd = color.new(color.black, 30)
+    array<string> heads = array.from("戻り率（最大）", "再開", "全戻し", "波切替終了", "観測中", "順序不明", "計", "構成比", "この率以上の再開率*")
+    for c = 0 to 8
+        f_cell(tb, c, 1, array.get(heads, c), hd)
+    table.merge_cells(tb, 0, 0, 8, 0)
+    f_cell(tb, 0, 0, title + "（正式観測のみ。初期化波の除外 " + str.tostring(S.nExclInit) + " 件）", hd)
+    // 観測中は 1 時間足につき最大 1 件（現在の最大戻り率の段に数える）
+    int liveBin = -1
+    if S.obsOn and not S.obsInit and S.obsDir == d
+        liveBin := lfwBin(lfwRatio(S, S.rx))
+    array<int> tot = array.new_int(6, 0)
+    int nAll = 0
+    for b = 1 to 11
+        for o = 0 to 4
+            nAll += o == 3 ? (b == liveBin ? 1 : 0) : array.get(S.cnt, lfwIdx(d, b, o))
+    for b = 1 to 11
+        int row = b + 1
+        string nm = b <= 9 ? str.tostring(b * 10) + "–" + str.tostring(b * 10 + 10) + "%" : b == 10 ? "100%（起点ちょうど）" : "100% 超（起点突破）"
+        f_cell(tb, 0, row, nm, bd)
+        int rowTot = 0
+        for o = 0 to 4
+            int n = o == 3 ? (b == liveBin ? 1 : 0) : array.get(S.cnt, lfwIdx(d, b, o))
+            rowTot += n
+            array.set(tot, o, array.get(tot, o) + n)
+            f_cell(tb, o + 1, row, str.tostring(n), bd)
+        f_cell(tb, 6, row, str.tostring(rowTot), bd)
+        f_cell(tb, 7, row, f_pct(rowTot, nAll), bd)
+        // 累積 : この段以上の最大戻り率で決着した観測（再開＋全戻し＋波切替終了）のうち再開の割合
+        int cr = 0
+        int cd = 0
+        for bb = b to 11
+            cr += array.get(S.cnt, lfwIdx(d, bb, 0))
+            cd += array.get(S.cnt, lfwIdx(d, bb, 0)) + array.get(S.cnt, lfwIdx(d, bb, 1)) + array.get(S.cnt, lfwIdx(d, bb, 2))
+        f_cell(tb, 8, row, f_pct(cr, cd) + " (" + str.tostring(cr) + "/" + str.tostring(cd) + ")", bd)
+    f_cell(tb, 0, 13, "計（全正式観測 " + str.tostring(nAll) + "）", hd)
+    for o = 0 to 4
+        f_cell(tb, o + 1, 13, str.tostring(array.get(tot, o)) + "（" + f_pct(array.get(tot, o), nAll) + "）", hd)
+    f_cell(tb, 6, 13, str.tostring(nAll), hd)
+    f_cell(tb, 7, 13, nAll > 0 ? "100%" : "-", hd)
+    f_cell(tb, 8, 13, "", hd)
+    table.merge_cells(tb, 0, 14, 8, 14)
+    f_cell(tb, 0, 14, "* 分母 = その段以上で決着した 再開＋全戻し＋波切替終了（観測中・順序不明は分母に入れない。件数と構成比には含む）。"
+         + " 順序不明は確実に到達した最大戻り率の段に計上", bd)
+    true
+
+f_info(table tb, int row, string tag, LfwTf S, bool ok, bool on) =>
+    color bd = color.new(color.black, 30)
+    string st = not on ? "OFF" : not ok ? "チャート足が長すぎるため計算しない" : S.dir == 0 ? "初期化前" :
+         (S.dir == -1 ? "下降波" : "上昇波") + (S.isInit ? "（初期化波）" : "")
+    f_cell(tb, 0, row, tag, bd)
+    f_cell(tb, 1, row, st, bd)
+    f_cell(tb, 2, row, f_px(S.O) + " → " + f_px(S.E), bd)
+    string cand = "-"
+    if S.dir != 0 and not na(S.rx)
+        float rr = lfwRatio(S, S.rx)
+        cand := f_px(S.rx) + " (" + str.tostring(rr * 100, "#.0") + "%" + (rr >= lfwSwitchRatio ? " 候補" : "") + ")"
+    f_cell(tb, 3, row, cand, bd)
+    f_cell(tb, 4, row, S.obsOn ? (S.obsInit ? "観測中（除外）" : "観測中 #" + str.tostring(S.obsSeq)) : "-", bd)
+    f_cell(tb, 5, row, na(S.initAvail) ? "-" : f_tm(S.initAvail) + " / ATR " + f_px(S.initAtr) + " × " + str.tostring(lfwInitAtrMult), bd)
+    f_cell(tb, 6, row, str.tostring(S.nStartAmb) + " / " + str.tostring(S.nCandAmb) + " / " + str.tostring(S.nWaveAmb), bd)
+    true
+
+var table lfwStatTb = table.new(position.bottom_right, 9, 15, border_width = 1)
+var table lfwInfoTb = table.new(position.top_right, 7, 3, border_width = 1)
+
+if barstate.islast
+    f_draw(lfwD, "D", lfwColD, lfwLnD, lfwLbD)
+    f_draw(lfw4, "4H", lfwCol4, lfwLn4, lfwLb4)
+    table.clear(lfwStatTb, 0, 0, 8, 14)
+    if lfwStatSel != "非表示"
+        bool selD = str.startswith(lfwStatSel, "日足")
+        int sd = str.endswith(lfwStatSel, "上昇") ? 1 : -1
+        f_stats(lfwStatTb, selD ? lfwD : lfw4, sd, lfwStatSel)
+    table.clear(lfwInfoTb, 0, 0, 6, 2)
+    if lfwShowInfo
+        color hd = color.new(color.gray, 20)
+        array<string> hs = array.from("時間足", "最新の波", "起点 → 終点", "戻り高安（率）", "観測", "初期化（確定時刻 / 最低波幅）", "順序不明: 開始 / 候補 / 波")
+        for c = 0 to 6
+            f_cell(lfwInfoTb, c, 0, array.get(hs, c), hd)
+        f_info(lfwInfoTb, 1, "日足", lfwD, lfwOkD, lfwOnD)
+        f_info(lfwInfoTb, 2, "4H", lfw4, lfwOk4, lfwOn4)
