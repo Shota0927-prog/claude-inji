@@ -176,6 +176,10 @@ def registration():
     bad = []
     for path, eds in lb.TEST_EDITS.items():
         cur = raw(path)
+        try:     # later layers (e.g. FDS-1 via fds_build) stack their exact edits on top: revert them first, as the unadapt chain does
+            cur = __import__("fds_build").unadapt(path, cur)
+        except ImportError:
+            pass
         if not all(cur.count(new) == cnt for _, new, cnt in eds):
             bad.append((path, "edit not applied exactly"))
         elif lb.unadapt(path, cur) != git("show", f"{REG_BASE}:{path}"):
