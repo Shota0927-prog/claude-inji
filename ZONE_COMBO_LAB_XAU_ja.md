@@ -124,7 +124,7 @@ AccumStrategyXAU / MtfPocDetector）と ACC の試験環境は変更していな
 - 案 C 3 段に分けられない数量（N < 5 など）の扱いを別に決める（例: 段を減らして 60 / 40 にする）。
 - いずれも数量の算出（lot の切り捨て）・SL・TP の価格は変わらず、各 TP で決済する数量だけが変わる。
 
-## 6. テスト（`python3 tests/lab_sim.py` — 53 項目すべて合格・約 90 秒）
+## 6. テスト（`python3 tests/lab_sim.py` — 55 項目すべて合格・約 80 秒）
 
 | 区分 | 内容 |
 |---|---|
@@ -148,8 +148,20 @@ AccumStrategyXAU / MtfPocDetector）と ACC の試験環境は変更していな
 テスト中に見つけて直した不具合: 建値の TP1 割合方式で SHORT の発動価格の符号が逆（エントリー直後に建値へ移る）。試験環境の巻き戻しで
 オブジェクトの共有が切れる問題（`lbZs` と `lbFvgs` が同じ Zone を指すことを再現できていなかった）。
 
-既存の fixture（`tests/*_sim.py` の「他のファイルは変わっていない」照合）はこの環境の clone に古い履歴がないため実行できず（`acc_sim.py` 以外は
-読み込み時に失敗。変更前から同じ）、新しいファイルの登録（ACC の `acc_build.py` 方式）は行っていない。`acc_sim.py` は 161 / 168（変更前と同じ）。
+追加: LS-11（既存 fixture への登録。`tests/lab_build.py` の編集が正確に入り、元に戻すと編集前の 444e61f と一致）、
+LB-40（分割数量の現行規則を N = 1〜10 で固定。5A の表と同じ。規則を変えるときに必ず気付くため）。
+
+### 既存の回帰テスト（59 本 + lab_sim）の状況（完全な履歴を取得して実行）
+
+| 時点 | 結果 | 失敗の原因 |
+|---|---|---|
+| ce1686d（このセッションの変更前） | 59 本すべて合格 | — |
+| 82415e3（MtfPocDetector.pine 追加後・LAB-1 前） | 22 本が未合格（acc / au / bel / btl / cad / eua / gja / msl / pf / sx2s / sxs / uja / ujl / ujt / xa / xaa / xab / xac / xae / xal / xas） | すべて「他のファイルは変わっていない」照合が、登録されていない新規ファイル MtfPocDetector.pine を検出（このセッションの以前の作業による）。この時点で MtfPocDetector.pine だけを除くと全本合格（一時的な確認・push していない） |
+| LAB-1 追加後（登録前） | 同じ 22 本（MtfPocDetector に加え ZoneComboLabXAU などを検出） | 同上 |
+| 登録後（tests/lab_build.py） | **59 本 + lab_sim すべて合格** | — |
+
+以前の「この環境では実行できない」は clone の履歴が浅かったためで、`git fetch --unshallow` で解消した。
+ACC-5B（別セッション）の変更による失敗はなかった。
 
 ## 7. 負荷（区別して記録）
 

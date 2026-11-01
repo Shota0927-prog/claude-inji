@@ -535,7 +535,7 @@ def sc_partial():
 def sc_qty_table():
     """the Pine f_lbPlan itself (targets stubbed): legs for N = 1..10 lots with 3 / 2 / 1 targets (documented table, 5A)."""
     import math
-    r = lp.Runner(overrides=dict(QUIET)).run(flat(1, 1985))
+    r = lp.Runner(overrides=dict(QUIET)).run(Sc(flat(1, 1985)).bars)
     e = r.env
     got3, got2, got1, exp3, exp2 = [], [], [], [], []
     for n in range(1, 11):
