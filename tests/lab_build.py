@@ -23,7 +23,7 @@ NEW_FILES = ("MtfPocDetector.pine", "ZoneComboLabXAU.pine", "ZONE_COMBO_LAB_XAU_
 
 def ok(path):
     """LAB-1 accounts for this path exactly: one of its new files."""
-    return path in NEW_FILES
+    return path in NEW_FILES or __import__("fds_build").ok(path)     # the later FDS-1 files: exact
 
 
 L = '__import__("lab_build")'
@@ -68,6 +68,7 @@ def apply_edits(path, text):
 
 def unadapt(path, text):
     """a test file with its LAB-1 edits reverted (all or nothing; unchanged without them; None with only part of them)."""
+    text = __import__("fds_build").unadapt(path, text)     # the later FDS-1 test edits are reverted first, exactly
     eds = TEST_EDITS.get(path, [])
     if text is None or not eds or all(text.count(new) == 0 for _, new, _ in eds):
         return text

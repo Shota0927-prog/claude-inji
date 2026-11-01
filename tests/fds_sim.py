@@ -248,15 +248,17 @@ def nz_fields(s):
 # ============================================================================
 def gate_static():
     t = src()
-    zx = open(os.path.join(ROOT, "ZoneStrategyXAU.pine"), encoding="utf-8").read()
-    ref_fn = zx[zx.index("f_fvgConfirmed(float minWidth) =>"):]
-    ref_fn = ref_fn[:ref_fn.index("\n\n")]
+    refs = []
+    for p in ("ZoneComboLabXAU.pine", "ZoneStrategyXAU.pine"):
+        zx = open(os.path.join(ROOT, p), encoding="utf-8").read()
+        fn = zx[zx.index("f_fvgConfirmed(float minWidth) =>"):]
+        refs.append(fn[:fn.index("\n\n") if p != "ZoneComboLabXAU.pine" else fn.index("// ==== LAB FVG copy (end)")])
     want = ["bool  _bull = low > high[2]", "bool  _bear = high < low[2]", "float _top  = _bull ? low : _bear ? low[2] : na",
             "float _bot  = _bull ? high[2] : _bear ? high : na",
             "int   _dir  = (_bull or _bear) and math.round_to_mintick(_top - _bot) >= minWidth ? (_bull ? 1 : -1) : 0",
             "[time[1], time_close[1], close[1], _dir[1], _top[1], _bot[1]]"]
-    check("FS-01 reference: ZoneStrategyXAU.pine f_fvgConfirmed has exactly the spec formula (+ the [1] HTF delivery)",
-          all(w in ref_fn for w in want))
+    check("FS-01 reference: ZF f_fvgConfirmed of ZoneComboLabXAU.pine (and its source ZoneStrategyXAU.pine) has exactly the spec "
+          "formula (+ the [1] HTF delivery)", all(w in r for r in refs for w in want))
     lg = logic(t)
     mine = ["bool _bull = low > fdsH2", "bool _bear = high < fdsL2", "float _top = _bull ? low : _bear ? fdsL2 : na",
             "float _bot = _bull ? fdsH2 : _bear ? high : na",
@@ -279,6 +281,20 @@ def gate_static():
     import subprocess
     diff = subprocess.run(["git", "-C", ROOT, "status", "--porcelain", "--"] + others, capture_output=True, text=True).stdout
     check("FS-06 no other Pine file changed", diff.strip() == "", diff)
+    import fds_build as fb
+    bad = []
+    for path, eds in fb.TEST_EDITS.items():
+        cur = open(os.path.join(ROOT, path), encoding="utf-8").read()
+        if not all(cur.count(new) == cnt for _, new, cnt in eds):
+            bad.append((path, "edit not applied exactly"))
+        elif fb.unadapt(path, cur) != subprocess.run(["git", "-C", ROOT, "show", f"{fb.REG_BASE}:{path}"], capture_output=True,
+                                                     text=True).stdout:
+            bad.append((path, "unadapt != the text before the edits"))
+    acc = __import__("acc_build")
+    check("FS-07 registration in the older fixtures (tests/fds_build.py, same method as lab_build): every recorded edit present "
+          "exactly, unadapt() gives the pre-edit text byte for byte, acc_build.ok() accepts exactly the FDS-1 files",
+          not bad and all(acc.ok(f) and os.path.exists(os.path.join(ROOT, f)) for f in fb.NEW_FILES)
+          and not acc.ok("ZoneComboLabXAU.pine.bak"), str(bad))
 
 
 def gate_basic():
