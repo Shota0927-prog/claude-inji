@@ -38,7 +38,7 @@ LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src
              "AccHistTickProbe.pine", "tests/acc3_exp.py",                                   # new in the later layer ACC-3 (probe / experiment)
              "MtfPocDetector.pine", "ZoneComboLabXAU.pine", "ZONE_COMBO_LAB_XAU_ja.md",       # new in the later layer LAB-1
              "tests/lab_pine.py", "tests/lab_sim.py", "tests/lab_load.py", "tests/lab_build.py")  # new in the later layer LAB-1
-LATER_NEW = LATER_NEW + ("MtfPocFeedXAU.pine",)  # new in the later layer LAB-2 (external POC feed)
+LATER_NEW = LATER_NEW + ("MtfPocFeedXAU.pine", "tests/lab2_build.py")  # new in the later layer LAB-2 (external POC feed)
 LATER_NEW = LATER_NEW + ("LongFibWave.pine", "LONG_FIB_WAVE_ja.md", "tests/lfw_sim.py", "tests/lfw_build.py")  # new in the later layer LFW-1
 LATER_NEW = LATER_NEW + ("FVGDepthStats.pine", "FVG_DEPTH_STATS_ja.md", "tests/fds_sim.py", "tests/fds_build.py")  # new in the later layer FDS-1
 NEW_FILES = ("tests/cad_build.py", "tests/cad_adapt.py", "tests/cad_sim.py") + LATER_NEW

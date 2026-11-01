@@ -218,6 +218,25 @@ def registration():
           and not __import__("acc_build").ok("ZoneStrategyXAU.pine"), f"{bad} {missing}")
 
 
+REG2_BASE = "36087d3"     # the last commit before the LAB-2 registration edits
+
+
+def registration2():
+    import lab2_build as l2
+    bad = []
+    for path, eds in l2.TEST_EDITS.items():
+        cur = raw(path)
+        if not all(cur.count(new) == cnt for _, new, cnt in eds):
+            bad.append((path, "edit not applied exactly"))
+        elif l2.unadapt(path, cur) != git("show", f"{REG2_BASE}:{path}"):
+            bad.append((path, "unadapt != the text before the edits"))
+    check("LS-12 LAB-2 registration (tests/lab2_build.py, a layer above LFW-1): every recorded edit is present exactly and "
+          "lab2_build.unadapt() gives the file before the edits byte for byte; acc_build.ok() (through lab / fds / lfw) accepts "
+          "MtfPocFeedXAU.pine and lab2_build.py",
+          not bad and all(__import__("acc_build").ok(f) for f in l2.NEW_FILES) and os.path.exists(os.path.join(ROOT, "MtfPocFeedXAU.pine")),
+          str(bad))
+
+
 # ============================================================================
 # scenarios
 # ============================================================================
@@ -1275,6 +1294,7 @@ def main():
     t = _time.time()
     static()
     registration()
+    registration2()
     sc_basic()
     sc_windows()
     sc_carry()
