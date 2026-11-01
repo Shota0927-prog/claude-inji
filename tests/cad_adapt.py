@@ -37,8 +37,8 @@ LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src
              "tests/acc_sim.py", "tests/acc_build.py", "tests/.gitignore",                   # new in the later layers ACC-1 / ACC-2
              "AccHistTickProbe.pine", "tests/acc3_exp.py",                                   # new in the later layer ACC-3 (probe / experiment)
              "MtfPocDetector.pine", "ZoneComboLabXAU.pine", "ZONE_COMBO_LAB_XAU_ja.md",       # new in the later layer LAB-1
-             "tests/lab_pine.py", "tests/lab_sim.py", "tests/lab_load.py", "tests/lab_build.py",  # new in the later layer LAB-1
-             "FVGDepthStats.pine", "FVG_DEPTH_STATS_ja.md", "tests/fds_sim.py", "tests/fds_build.py")  # new in the later layer FDS-1
+             "tests/lab_pine.py", "tests/lab_sim.py", "tests/lab_load.py", "tests/lab_build.py")  # new in the later layer LAB-1
+LATER_NEW = LATER_NEW + ("FVGDepthStats.pine", "FVG_DEPTH_STATS_ja.md", "tests/fds_sim.py", "tests/fds_build.py")  # new in the later layer FDS-1
 NEW_FILES = ("tests/cad_build.py", "tests/cad_adapt.py", "tests/cad_sim.py") + LATER_NEW
 _rd = lambda p: open(os.path.join(ROOT, p), encoding="utf-8").read()
 
