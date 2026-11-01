@@ -461,6 +461,15 @@ def sc_combo():
     rn = scn.run(**ONLY_TC, **QUIET, **AND)
     check("LB-16b AND needs a real overlap: POC 1994-2006 and Swing 2014-2026 both touched by one bar (high 2015) but not overlapping "
           "-> no AND wait, no entry", rn.trace[3]["waits"] == [] and entries(rn) == [], f"{rn.trace[3]['waits']} {entries(rn)}")
+    rows = [(2003.0, 2004.0, 2002.5, 2003.1), (2003.0, 2004.0, 2002.5, 2003.0), (2003.0, 2003.5, 1989.5, 1990.0),
+            (1990.0, 1995.0, 1989.5, 1991.0)] + flat(6, 1991)
+    scm = Sc(rows)
+    scm.hold(1, None, s1h=1996.0, s1ht=T0 - 3600_000)        # Swing 1990-2002 registered with the close above it (LONG side)
+    poc(scm, 2, 2000.0)                                      # POC 1994-2006 registered with the close below it (SHORT side)
+    rm = scm.run(**ONLY_TC, **QUIET, **AND)
+    wm = rm.trace[3]["waits"]
+    check("LB-16c AND needs one direction: the Swing (price came from above, LONG) and the POC (price below, SHORT) overlap and bar 3 "
+          "touches the overlap, but the directions differ -> no AND wait", wm == [], str(wm))
     check("LB-17 OR with the same two types: the POC-only contact (high 1997) is a wait / entry (SL 2006 + 5)",
           [e[0] for e in entries(r3)] == [4] and r3["o"].sl == 2011.0, f"{entries(r3)}")
     # only vs includes: MA 2000 (1994-2006) alone vs MA + overlapping POC 2009 (2003-2015)
@@ -1098,6 +1107,8 @@ def sc_zd_recv():
     t_close = run_basic(zdT2=1985.1, zdL2=1985.1, zdU2=1985.1)               # one slot left at close
     ext_off = run_basic(zdT3=0.0)                                            # feed side OFF while the lab slot is ON
     lab_off = run_basic(zdProto=1991.0, zdUse1=False, zdUse2=False, zdUse3=False, zdUse4=False, cZD=False, cZC=True)
+    t_only = run_basic(zdT1=1985.1)                                          # only the time series of a valid slot left at close
+    t_future = run_basic(zdT1=float(T0 + 10 * 86_400_000))                   # a "time" after the current 5m bar
     neg = run_basic(zdT4=-(T_HTF + 1.0))                                     # calculation failure (normal connection)
     hist = run_basic(zdT4=None)                                              # history not yet available
     check("LB-43b ZD connection: protocol != 10001 (input left at close), a time series left at close, or the feed's slot OFF (time 0) "
@@ -1105,6 +1116,7 @@ def sc_zd_recv():
           "detection OFF an unconnected feed does not stop entries; a calculation failure / missing history does not stop entries",
           len(entries(ok_run)) == 1 and entries(no_proto) == [] and no_proto["skipN"][7] >= 1 and list(no_proto["lbZdStat"]) == [9, 9, 9, 9]
           and entries(t_close) == [] and t_close["lbZdStat"][1] == 9 and entries(ext_off) == [] and ext_off["lbZdStat"][2] == 8
+          and entries(t_only) == [] and t_only["lbZdStat"][0] == 9 and entries(t_future) == [] and t_future["lbZdStat"][0] == 9
           and list(lab_off["lbZdStat"]) == [0, 0, 0, 0] and lab_off["skipN"][7] == 0 and len(entries(lab_off)) == 1
           and len(entries(neg)) == 1 and neg["lbZdStat"][3] == 2 and len(entries(hist)) == 1 and hist["lbZdStat"][3] == 3
           and not any(z.typ == 3 for z in no_proto["lbZs"]),
@@ -1223,7 +1235,7 @@ MUTANTS = [
     ("o.fill + beRatio / 100.0 * (o.tp1E - o.fill)", "o.fill + o.side * beRatio / 100.0 * (o.tp1E - o.fill)", "BE ratio sign"),
     ("if not na(bestL) and not na(bestS)\n        st.nConflict += 1\n    else if not na(bestL)", "if not na(bestL)", "LONG / SHORT conflict"),
     ("    array.size(tps) >= 3\n", "    array.size(tps) >= 2\n", "TP scan stops after the 3rd band"),
-    ("int ig = side == 1 ? f_lbLower(lbFvgs, ref + EPS) : f_lbLowerT(lbFvgsT, ref - EPS) - 1", "int ig = side == 1 ? f_lbLower(lbFvgs, ref + EPS) : f_lbLower(lbFvgs, ref - EPS) - 1", "SHORT reads FVGs by top"),
+    ("array<LbZone> fArr = side == 1 ? lbFvgs : lbFvgsT", "array<LbZone> fArr = lbFvgs", "SHORT reads FVGs in high order"),
     ("else if side == 1 ? b <= cf + EPS : t >= cf - EPS", "else if false", "overlapping TP Zones merged"),
     ("not f_lbDup(3, k, 0, pc)", "true", "POC exact duplicate"),
     ("if not na(pt) and not na(pv) and (na(lt) or pt != lt)", "if not na(pt) and not na(pv)", "a Swing pivot is registered once"),
