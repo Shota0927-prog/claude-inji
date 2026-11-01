@@ -633,6 +633,61 @@ def sc_be():
           and [e[0] for e in entries(r0)][:2] == [4, 10], f"{ev} clr {r['st'].nLockClr} off {entries(r0)}")
 
 
+def sc_lock_far():
+    # SHORT 4 lots, targets 1966 / 1946 / 1926 (legs 2 / 1 / 1). Bar 6: TP1 filled and BE triggered; bar 7: the 2 remaining lots exit at
+    # the fill (BE) -> lock; the target is the farthest open TP (1926, fixed at the lock start), not the nearest (1946)
+    after = [(1998.0, 1999.0, 1985.0, 1986.0), (1986.0, 1987.0, 1964.0, 1965.0), (1965.0, 1999.0, 1964.0, 1998.5),
+             (1998.5, 1999.0, 1990.0, 1995.0), (1995.0, 1996.0, 1990.0, 1991.0), (1991.0, 1992.0, 1945.0, 1946.0),
+             (1946.0, 1947.0, 1925.0, 1926.0)] + flat(4, 1926)
+    r = partial_setup([(2, 1960.0), (3, 1940.0), (4, 1920.0)], after, beLock=True)
+    lk = [(t["bar"], t["state"]) for t in r.trace]
+    r10 = lp.Runner(overrides=dict(**ONLY_TC, **QUIET, beLock=True))
+    rows = flat(3, 1985) + [(1990.0, 1999.5, 1989.0, 1999.0), (2000.5, 2001.5, 1998.0, 1998.5)] + after
+    sc = Sc(rows)
+    poc(sc, 1, 2000.0)
+    for k, c in [(2, 1960.0), (3, 1940.0), (4, 1920.0)]:
+        poc(sc, 1, c, k=k)
+    sc.set(4, labS1=2001.0)
+    r10.run(sc.bars[:11])
+    r11 = lp.Runner(overrides=dict(**ONLY_TC, **QUIET, beLock=True)).run(sc.bars[:12])
+    cl = [(c["exit_price"], c["qty"]) for c in r.broker.closed]
+    check("LB-28b BE lock target = the final TP (farthest open leg) fixed at the lock start: after TP1 (2 lots at 1966) and the BE exit of "
+          "the other 2 lots (bar 7), lkTP = 1926 (not the nearest open leg 1946); reaching 1946 (bar 10) keeps the lock, reaching 1926 "
+          "(bar 11) releases it", cl == [(1966.0, 2.0), (1998.0, 1.0), (1998.0, 1.0)] and r10["lkTP"] == 1926.0 and r10["lkOn"]
+          and not r11["lkOn"] and r10["lkSL"] == 2011.0, f"{cl} lkTP {r10['lkTP']} on10 {r10['lkOn']} on11 {r11['lkOn']}")
+
+
+def sc_and_only_sel():
+    # #6: AND (POC + Swing) + "だけ": the selected types overlapping each other are not excluded; another type (a 1H FVG 2010-2018)
+    # overlapping the whole selected span 1994-2014 excludes it
+    def mk(fvg):
+        rows = flat(20, 1985)
+        rows[3] = (1988.0, 2003.0, 1987.0, 1989.0)
+        rows[4] = TC_AFTER
+        sc = Sc(rows)
+        poc(sc, 1, 2000.0)
+        sc.hold(1, None, s1h=2008.0, s1ht=T0 - 3600_000)
+        if fvg:
+            sc.hold(1, None, g1k=T0 - 7200_000, g1c=2030.0, g1d=1, g1t=2018.0, g1b=2010.0)
+        sc.set(4, labS1=L_AFTER)
+        return sc.run(**ONLY_TC, **QUIET, cZA=False, cZB=False, cZC=True, cZD=True, cZF=False, cComb="AND", cScope="だけ")
+    a, b = mk(False), mk(True)
+    check("LB-18b AND + 'だけ': POC and Swing (both selected) overlapping each other enter; a non-selected FVG (2010-2018) touching the "
+          "whole selected span (1994-2014, outside the POC / Swing overlap 2002-2006) excludes the wait (skip 'only')",
+          [e[0] for e in entries(a)] == [4] and entries(b) == [] and b["skipN"][1] >= 1, f"{entries(a)} {entries(b)}")
+
+
+def sc_sel_tp():
+    # #12: 'close all at the chosen TP' with TP 3 chosen: 2 targets -> the farthest existing (1946); none -> fixed RR from the fill
+    after = flat(6, 1998.5)
+    r2 = partial_setup([(2, 1960.0), (3, 1940.0)], after, tpMode="選択した TP で全決済", tpSel=3)
+    r0 = partial_setup([], after, tpMode="選択した TP で全決済", tpSel=3)
+    fill = r0.trace[5]["fill"]
+    check("LB-23b chosen TP 3 with only 2 targets -> full exit at the farthest existing target (1946, all 4 lots); no target -> fixed RR "
+          "1.5 from the actual fill", r2.trace[5]["legPx"][0] == 1946.0 and r2.trace[5]["legLots"] == [4, 0, 0]
+          and abs(r0.trace[5]["legPx"][0] - (fill - 1.5 * (2011.0 - fill))) < 1e-9, f"{r2.trace[5]['legPx']} {r0.trace[5]['legPx']}")
+
+
 def sc_consume():
     # two Zones on top of each other: Swing High 2001 (k=1, id 1) and POC 2000 (k=1, id 2); OR -> two waits; one TC -> one entry
     # (the nearer Zone = POC); TP = POC 1960 (k=2) top 1966 (RR 0.96 -> min RR 0.5 for this test) hit on bar 5
@@ -895,13 +950,15 @@ MUTANTS = [
     ("not f_lbDup(3, k, 0, pc)", "true", "POC exact duplicate"),
     ("if not na(pt) and not na(pv) and (na(lt) or pt != lt)", "if not na(pt) and not na(pv)", "a Swing pivot is registered once"),
     ("fakeWin = input.int(0,", "fakeWin = input.int(3,", "fake window default unlimited"),
+    ("        if array.get(o.legLots, k - 1) > 0\n            r := array.get(o.legPx, k - 1)\n    r\n\nf_lbTpText",
+     "        if na(r) and array.get(o.legLots, k - 1) > 0\n            r := array.get(o.legPx, k - 1)\n    r\n\nf_lbTpText", "BE lock target = farthest TP"),
     ("if lkBlk and array.size(lbWaits) > 0", "if false", "waits cleared while locked"),
     ("if xs != 0\n                    array.push(xId, z.id)", "if false\n                    array.push(xId, z.id)", "break cancels the wait"),
 ]
 
 
 def mutation():
-    scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_qty_table, sc_be, sc_consume, sc_zones, sc_dup_swing, sc_ta,
+    scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_qty_table, sc_be, sc_lock_far, sc_and_only_sel, sc_sel_tp, sc_consume, sc_zones, sc_dup_swing, sc_ta,
             sc_session, sc_and_timing, sc_ledger]
     survived = []
     for old, new, what in MUTANTS:
@@ -939,6 +996,9 @@ def main():
     sc_tp_mixed()
     sc_qty_table()
     sc_be()
+    sc_lock_far()
+    sc_and_only_sel()
+    sc_sel_tp()
     sc_consume()
     sc_zones()
     sc_dup_swing()
