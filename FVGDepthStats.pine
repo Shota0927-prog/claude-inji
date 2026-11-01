@@ -1,0 +1,493 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  FVG Depth Stats  —  長期 FVG への接触後「FVG 幅の何 % まで埋めてから反発したか」の分布を観測する統計専用 indicator
+// ============================================================================
+//  ・売買ストラテジー / エントリー条件の検証ではない。注文・売買シグナル・アラートは一切出さない。
+//  ・既存の Zone / Engine / Strategy / Library には依存しない独立ファイル (import なし, request.* なし)。
+//
+//  ■ FVG 検知 (参照: ZF の f_fvgConfirmed。リポジトリ内では ZoneStrategyXAU.pine 等の同名関数と同一の式)
+//      上昇 FVG : low  > high[2]   範囲 high[2] ～ low     (top = low,    bottom = high[2])
+//      下降 FVG : high < low[2]    範囲 high    ～ low[2]  (top = low[2], bottom = high)
+//      最小幅   : math.round_to_mintick(top - bottom) >= minWidth   (銘柄の価格単位。XAUUSD ならドル幅)
+//    元関数の出力の [1] は request.security で上位足の「確定済み」値を受け取るためのもの。本 indicator はチャート足で
+//    直接計算するので [1] は付けない: 形成足 (3 本目) の確定時に、その足で登録する (余分な 1 本遅延なし)。
+//    iFVG 反転・寿命・保存件数・時間帯条件は引き継がない。「TA 5分足 FVG 吸収」とは別物。
+//
+//  ■ 対象: 4 時間足 / 日足 / 週足チャートのみ (チャート足でその足の FVG を直接計算)。標準ローソク以外 (平均足・
+//    練行足など合成 OHLC) や対象外の時間足では集計せず、使用条件を表示する。
+//
+//  ■ 接触と侵入率 (入口側境界 = 0 %, 奥側境界 = 100 %)
+//      下降 FVG : 下から接触。入口 = bottom。侵入率 = (接触中最高値 - bottom) / 固定幅 × 100
+//      上昇 FVG : 上から接触。入口 = top。   侵入率 = (top - 接触中最安値)    / 固定幅 × 100
+//    ヒゲで接触開始 (入口と同値も接触, 0 %)。接触開始足 ～ 決着足の高値 / 安値を使う。境界は形成時の値で固定。
+//  ■ 決着 (同じ時間足の確定終値)
+//      下降: 終値 < bottom → 反発確定 / 終値 > top → 奥側突破 (観測終了)。上昇は対称。境界と同値は未確定 (継続)。
+//      観測期限なし。データ末尾で未決着の接触は「未決着 U」。ヒゲだけ奥側を越えても突破ではない (100 % 超からの反発)。
+//  ■ 初回 / 繰り返し: 初期値は 1 FVG につき最初の接触のみ。繰り返し ON では反発確定足の次の足以降の接触を次の接触と
+//    して数える (反発確定足の中では再接触を数えない)。最大侵入率は接触ごとにリセット。
+//  ■ OHLC で決まらないケース
+//      ・接触前の待機中に、足の始値が奥側の外 (上昇: open < bottom / 下降: open > top) = 窓で FVG を丸ごと飛び越した:
+//        入口側からの接触を確認できない → 接触 N に入れず「不明 FVG (窓越え)」としてその FVG の観測を終了。
+//      ・不正データ足 (OHLC に na / high < low / 実体が高安の外): 接触中の FVG は「判定不能 X」、待機中の FVG は
+//        「不明 FVG (欠損)」としてそれぞれ観測終了。不正足では FVG 形成も判定しない (その足を含む 3 本は対象外)。
+//      ・上記以外は、接触の開始・最大侵入率・決着がすべて確定足の OHLC だけで決まる (開始足の高安は必ず接触後に付く,
+//        決着は終値) ため、足内の順序を推測する場面は生じない。
+//  ■ 空白区間: 前の足の終了時刻から次の足の開始時刻までが設定日数を超えたものを数える。取得データだけでは通常の休場
+//    (週末・祝日) と欠損を識別できないため、検出・表示のみで接触の再分類はしない (表に限界を表示)。
+//  ■ 末尾足: 未確定の足 (リアルタイム足 / 期間途中の最終足) は集計しない。
+//
+//  検証状況: tests/fds_sim.py が下の「FDS Logic」区間を機械翻訳 (tests/acc_pine.py の Pine サブセット翻訳器) で実行
+//  して検証。TradingView 上のコンパイル・描画・表は未検証 (PINE_NOT_VERIFIED)。
+// ============================================================================
+
+//@version=5
+indicator("FVG Depth Stats", shorttitle = "FVG Depth Stats", overlay = true, max_boxes_count = 500)
+
+// ---------------------------------------------------------------------------
+// 設定
+// ---------------------------------------------------------------------------
+minWidth   = input.float(3.0, "FVG 最小幅 (価格単位)", minval = 0.0, step = 0.5, group = "01 · FVG",
+     tooltip = "math.round_to_mintick(top - bottom) >= この値 の FVG だけを登録 (ZF の f_fvgConfirmed と同じ判定)。\n" +
+     "単位は銘柄の価格単位 (XAUUSD ならドル幅)。")
+repeatMode = input.bool(false, "繰り返し接触も数える", group = "01 · FVG",
+     tooltip = "OFF (初期値): 1 つの FVG につき最初の接触だけを数え、その接触の決着で観測終了。\n" +
+     "ON: 反発確定 (入口側の外へ終値で戻る) までを 1 回とし、反発確定足の次の足以降に再び入ったら次の接触として数える。\n" +
+     "奥側への終値突破で観測終了は ON / OFF 共通。")
+gapDays    = input.float(3.0, "空白区間とみなす間隔 (日)", minval = 0.5, step = 0.5, group = "02 · データ",
+     tooltip = "前の足の終了時刻から次の足の開始時刻までがこの日数を超えたら空白区間として数える (表示のみ)。\n" +
+     "通常の休場か欠損かは取得データだけでは識別できないため、接触の再分類はしない。")
+showTable  = input.bool(true, "統計表を表示", group = "03 · 表示")
+tablePos   = input.string("右上", "表の位置", options = ["右上", "右下", "左上", "左下"], group = "03 · 表示")
+drawBoxes  = input.bool(true, "FVG を描画", group = "03 · 表示")
+drawMax    = input.int(50, "描画する FVG の件数 (直近)", minval = 1, maxval = 500, group = "03 · 表示",
+     tooltip = "描画だけの件数制限。統計対象の保持件数とは無関係 (統計は全 FVG を独立に管理する)。")
+
+// ---------------------------------------------------------------------------
+// 使用条件 (4H / D / W の標準ローソクのみ) と、ロジック区間へ渡す系列値
+// ---------------------------------------------------------------------------
+bool fdsTfOk    = (timeframe.isminutes and timeframe.multiplier == 240) or (timeframe.isdaily and timeframe.multiplier == 1)
+     or (timeframe.isweekly and timeframe.multiplier == 1)
+bool fdsChartOk = chart.is_standard
+bool fdsSupported = fdsTfOk and fdsChartOk
+// 確定足だけ集計。履歴上の最終足でも期間が終わっていない足 (例: 市場の一時休止中に見る週足) は集計しない。
+bool fdsConfirmed = barstate.isconfirmed and (barstate.isrealtime or na(time_close) or time_close <= timenow)
+bool fdsRun     = fdsSupported and fdsConfirmed
+bool fdsValid   = not (na(open) or na(high) or na(low) or na(close)) and high >= low and high >= math.max(open, close)
+     and low <= math.min(open, close)
+bool fdsFormOk  = fdsValid and fdsValid[1] and fdsValid[2]
+float fdsH2     = high[2]
+float fdsL2     = low[2]
+int   fdsPrevTc = time_close[1]
+int   fdsT2     = time[2]
+float fdsMt     = syminfo.mintick
+
+// ==== FDS Logic (begin) — tests/fds_sim.py はこの区間をそのまま翻訳して実行する。履歴参照 x[n] は使わない ====
+int ST_N   = 22          // 方向ごとの統計欄の数
+int S_FORM = 0           // 形成 FVG 件数
+int S_TFVG = 1           // 接触した FVG 件数 (FVG 単位, 重複なし)
+int S_N    = 2           // 全接触件数 N
+int S_R    = 3           // 反発確定 R
+int S_B    = 4           // 奥側への終値突破 B
+int S_X    = 5           // 接触後の判定不能 X (不正データ足)
+int S_UGAP = 6           // 不明 FVG: 窓で丸ごと飛び越し (接触を確認できず, N に入れない)
+int S_UDAT = 7           // 不明 FVG: 待機中の不正データ足 (接触有無を確認できず, N に入れない)
+int S_MULT = 8           // 同じ足で 2 個以上の FVG に新規接触した足の数 (各 FVG に 1 件ずつ計上済み)
+int S_GSPN = 9           // 空白区間を跨いだ接触の件数 (参考, 再分類なし)
+int S_BK0  = 10          // 10 % 区間 0..9 = 欄 10..19 (90 % 区間は 100 % ちょうどを含む)
+int S_OVER = 20          // 100 % 超からの反発
+int S_U    = 21          // 未決着 U (現在接触中の件数)
+int FDS_CAP = 90000      // 登録 FVG の上限 (Pine の配列上限 100,000 未満)。到達したら新規登録を停止し、表で明示する
+
+var array<int>   fdsSt    = array.new_int(44, 0)       // 統計: 上昇 = 0..21, 下降 = 22..43
+// FVG ごとの状態 (id = 登録順の添字)。境界は形成時の値で固定。
+var array<float> fTop     = array.new_float(0)
+var array<float> fBot     = array.new_float(0)
+var array<int>   fDir     = array.new_int(0)
+var array<int>   fState   = array.new_int(0)           // 0 待機 (入口側の外) / 1 接触中 / 2 観測終了
+var array<float> fExt     = array.new_float(0)         // 接触中の最安値 (上昇) / 最高値 (下降)
+var array<int>   fNc      = array.new_int(0)           // その FVG の接触回数
+var array<int>   fGsp     = array.new_int(0)           // 現在の接触が空白区間を跨いだか (1 / 0)
+var array<int>   fEndWhy  = array.new_int(0)           // 0 継続 / 1 反発で終了 (初回のみ) / 2 突破 / 3 窓越え / 4 欠損 / 5 判定不能
+var array<int>   fEndT    = array.new_int(0)
+// 待機リスト (接触待ちの FVG)。上昇 = top の昇順, 下降 = -bottom の昇順。末尾から接触したものを取り出す。
+var array<float> wUpKey   = array.new_float(0)
+var array<int>   wUpId    = array.new_int(0)
+var array<float> wDnKey   = array.new_float(0)
+var array<int>   wDnId    = array.new_int(0)
+var array<int>   aId      = array.new_int(0)           // 接触中の FVG
+var array<int>   fdsRearm = array.new_int(0)           // この足で反発確定し、次の足から再び待機する FVG (繰り返し ON)
+var array<int>   fdsEnded = array.new_int(0)           // この足で観測終了した FVG (描画用)
+var int  fdsNewId    = -1                               // この足で登録した FVG (なし = -1)
+var int  fdsBars     = 0                                // 処理した確定足
+var int  fdsValidN   = 0                                // うち有効足
+var int  fdsBadN     = 0                                // 不正データ足
+var int  fdsT0       = na                               // 読み込めた確定足の期間
+var int  fdsT1       = na
+var int  fdsForm0    = na                               // FVG 形成判定を実行した期間
+var int  fdsForm1    = na
+var int  fdsFormBars = 0
+var int  fdsGapN     = 0                                // 空白区間の数
+var int  fdsGapMax   = 0                                // 最長の空白 (ms)
+var bool fdsHalted   = false                            // FDS_CAP 到達で新規登録を停止した
+
+f_si(int d, int k) =>
+    (d == 1 ? 0 : ST_N) + k
+
+f_inc(int d, int k) =>
+    int ix = f_si(d, k)
+    array.set(fdsSt, ix, array.get(fdsSt, ix) + 1)
+
+// 最大侵入の区間 (0..9 = 10 % 区間, 10 = 100 % 超)。tick 単位の整数比較なので境界値が隣へずれない。
+//   10 * pen >= k * wid ⇔ 侵入率 >= 10k %。pen == wid (100 % ちょうど) は 9 (90-100 %)。
+f_bucket(int penT, int widT) =>
+    int b = 10
+    if penT <= widT
+        b := 0
+        while b < 9 and 10 * penT >= (b + 1) * widT
+            b += 1
+    b
+
+// 確定終値による決着: 0 未確定 / 1 反発確定 (入口側の外) / 2 奥側への終値突破。境界と同値は 0。
+f_resolve(int d, float top, float bot, float c) =>
+    d == 1 ? (c > top ? 1 : c < bot ? 2 : 0) : (c < bot ? 1 : c > top ? 2 : 0)
+
+// 昇順の待機リストへ挿入 (同値は後ろ)
+f_insert(array<float> keys, array<int> ids, float key, int id) =>
+    int lo = 0
+    int hi = array.size(keys)
+    while lo < hi
+        int mid = math.floor((lo + hi) / 2)
+        if array.get(keys, mid) <= key
+            lo := mid + 1
+        else
+            hi := mid
+    array.insert(keys, lo, key)
+    array.insert(ids, lo, id)
+    lo
+
+f_wait(int id) =>
+    array.set(fState, id, 0)
+    if array.get(fDir, id) == 1
+        f_insert(wUpKey, wUpId, array.get(fTop, id), id)
+    else
+        f_insert(wDnKey, wDnId, -array.get(fBot, id), id)
+    id
+
+f_end(int id, int why, int t) =>
+    array.set(fState, id, 2)
+    array.set(fEndWhy, id, why)
+    array.set(fEndT, id, t)
+    array.push(fdsEnded, id)
+
+// 接触中の FVG の決着を記録。戻り値 1 = 接触継続。
+f_settle(int id, int res, int t) =>
+    int d = array.get(fDir, id)
+    int keep = 0
+    if res == 0
+        keep := 1
+    else if res == 1
+        float top = array.get(fTop, id)
+        float bot = array.get(fBot, id)
+        float ext = array.get(fExt, id)
+        int widT = math.round((top - bot) / fdsMt)
+        int penT = math.round((d == 1 ? top - ext : ext - bot) / fdsMt)
+        int bk = f_bucket(penT, widT)
+        f_inc(d, S_R)
+        f_inc(d, bk == 10 ? S_OVER : S_BK0 + bk)
+        if repeatMode
+            array.set(fState, id, 0)
+            array.push(fdsRearm, id)
+        else
+            f_end(id, 1, t)
+    else
+        f_inc(d, S_B)
+        f_end(id, 2, t)
+    keep
+
+// 待機中の FVG に新しい接触を開始し、同じ足の終値で決着を見る。戻り値 1 = 接触継続。
+f_start(int id, float h, float l, float c, int t) =>
+    int d = array.get(fDir, id)
+    if array.get(fNc, id) == 0
+        f_inc(d, S_TFVG)
+    array.set(fNc, id, array.get(fNc, id) + 1)
+    f_inc(d, S_N)
+    array.set(fState, id, 1)
+    array.set(fExt, id, d == 1 ? l : h)
+    array.set(fGsp, id, 0)
+    f_settle(id, f_resolve(d, array.get(fTop, id), array.get(fBot, id), c), t)
+
+if fdsRun
+    array.clear(fdsRearm)
+    array.clear(fdsEnded)
+    fdsNewId := -1
+    fdsBars += 1
+    if na(fdsT0)
+        fdsT0 := time
+    fdsT1 := time
+    bool gapNow = false
+    if not na(fdsPrevTc)
+        int gapMs = time - fdsPrevTc
+        if gapMs > gapDays * 86400000
+            gapNow := true
+            fdsGapN += 1
+            fdsGapMax := math.max(fdsGapMax, gapMs)
+    if fdsValid
+        fdsValidN += 1
+        // 1. 接触中の FVG: 高安で最大侵入を更新し、終値で決着
+        array<int> nextA = array.new_int(0)
+        int i = 0
+        while i < array.size(aId)
+            int id = array.get(aId, i)
+            int d = array.get(fDir, id)
+            if gapNow and array.get(fGsp, id) == 0
+                array.set(fGsp, id, 1)
+                f_inc(d, S_GSPN)
+            array.set(fExt, id, d == 1 ? math.min(array.get(fExt, id), low) : math.max(array.get(fExt, id), high))
+            if f_settle(id, f_resolve(d, array.get(fTop, id), array.get(fBot, id), close), time) == 1
+                array.push(nextA, id)
+            i += 1
+        // 2. 待機中の上昇 FVG: top >= low のものが接触 (ヒゲ / 入口と同値を含む)
+        int nUp = 0
+        while array.size(wUpKey) > 0 and array.get(wUpKey, array.size(wUpKey) - 1) >= low
+            array.pop(wUpKey)
+            int id = array.pop(wUpId)
+            if open < array.get(fBot, id)
+                f_inc(1, S_UGAP)
+                f_end(id, 3, time)
+            else
+                nUp += 1
+                if f_start(id, high, low, close, time) == 1
+                    array.push(nextA, id)
+        if nUp >= 2
+            f_inc(1, S_MULT)
+        // 3. 待機中の下降 FVG: bottom <= high のものが接触
+        int nDn = 0
+        while array.size(wDnKey) > 0 and array.get(wDnKey, array.size(wDnKey) - 1) >= -high
+            array.pop(wDnKey)
+            int id = array.pop(wDnId)
+            if open > array.get(fTop, id)
+                f_inc(-1, S_UGAP)
+                f_end(id, 3, time)
+            else
+                nDn += 1
+                if f_start(id, high, low, close, time) == 1
+                    array.push(nextA, id)
+        if nDn >= 2
+            f_inc(-1, S_MULT)
+        aId := nextA
+        // 4. この足で反発確定した FVG は次の足から待機 (反発確定足の中では再接触を数えない)
+        int j = 0
+        while j < array.size(fdsRearm)
+            f_wait(array.get(fdsRearm, j))
+            j += 1
+        // 5. FVG 形成 (ZF f_fvgConfirmed と同じ式, [1] なし)。形成足の確定時に登録し、次の足から接触を見る。
+        if fdsFormOk
+            fdsFormBars += 1
+            if na(fdsForm0)
+                fdsForm0 := time
+            fdsForm1 := time
+            bool _bull = low > fdsH2
+            bool _bear = high < fdsL2
+            float _top = _bull ? low : _bear ? fdsL2 : na
+            float _bot = _bull ? fdsH2 : _bear ? high : na
+            int _dir = (_bull or _bear) and math.round_to_mintick(_top - _bot) >= minWidth ? (_bull ? 1 : -1) : 0
+            if _dir != 0 and math.round((_top - _bot) / fdsMt) >= 1
+                if array.size(fTop) >= FDS_CAP
+                    fdsHalted := true
+                else
+                    int nid = array.size(fTop)
+                    array.push(fTop, _top)
+                    array.push(fBot, _bot)
+                    array.push(fDir, _dir)
+                    array.push(fState, 0)
+                    array.push(fExt, na)
+                    array.push(fNc, 0)
+                    array.push(fGsp, 0)
+                    array.push(fEndWhy, 0)
+                    array.push(fEndT, na)
+                    f_inc(_dir, S_FORM)
+                    f_wait(nid)
+                    fdsNewId := nid
+    else
+        // 不正データ足: 接触中 → 判定不能 X / 待機中 → 不明 FVG (欠損)。補間はしない。
+        fdsBadN += 1
+        int i = 0
+        while i < array.size(aId)
+            int id = array.get(aId, i)
+            f_inc(array.get(fDir, id), S_X)
+            f_end(id, 5, time)
+            i += 1
+        array.clear(aId)
+        int k = 0
+        while k < array.size(wUpId)
+            f_inc(1, S_UDAT)
+            f_end(array.get(wUpId, k), 4, time)
+            k += 1
+        int m = 0
+        while m < array.size(wDnId)
+            f_inc(-1, S_UDAT)
+            f_end(array.get(wDnId, m), 4, time)
+            m += 1
+        array.clear(wUpKey)
+        array.clear(wUpId)
+        array.clear(wDnKey)
+        array.clear(wDnId)
+    // 未決着 U = 現在接触中の件数 (方向別に数え直す。N = R + B + U + X の検算に使う)
+    int uUp = 0
+    int uDn = 0
+    int q = 0
+    while q < array.size(aId)
+        if array.get(fDir, array.get(aId, q)) == 1
+            uUp += 1
+        else
+            uDn += 1
+        q += 1
+    array.set(fdsSt, f_si(1, S_U), uUp)
+    array.set(fdsSt, f_si(-1, S_U), uDn)
+// ==== FDS Logic (end) ====
+
+// ---------------------------------------------------------------------------
+// 描画 (直近 drawMax 件だけ。統計とは無関係)
+// ---------------------------------------------------------------------------
+var array<box> fdsBoxById = array.new_box(0)
+var array<int> fdsDrawn   = array.new_int(0)
+if fdsRun
+    if fdsNewId >= 0
+        box bx = na
+        if drawBoxes
+            bool up = array.get(fDir, fdsNewId) == 1
+            bx := box.new(fdsT2, array.get(fTop, fdsNewId), time, array.get(fBot, fdsNewId), xloc = xloc.bar_time,
+                 extend = extend.right, border_color = up ? color.new(color.teal, 40) : color.new(color.red, 40),
+                 bgcolor = up ? color.new(color.teal, 88) : color.new(color.red, 88))
+            array.push(fdsDrawn, fdsNewId)
+            if array.size(fdsDrawn) > drawMax
+                int oid = array.shift(fdsDrawn)
+                box.delete(array.get(fdsBoxById, oid))
+                array.set(fdsBoxById, oid, na)
+        array.push(fdsBoxById, bx)
+    if drawBoxes and array.size(fdsEnded) > 0
+        for e = 0 to array.size(fdsEnded) - 1
+            int eid = array.get(fdsEnded, e)
+            if eid < array.size(fdsBoxById)
+                box eb = array.get(fdsBoxById, eid)
+                if not na(eb)
+                    box.set_extend(eb, extend.none)
+                    box.set_right(eb, array.get(fEndT, eid))
+
+// ---------------------------------------------------------------------------
+// 統計表
+// ---------------------------------------------------------------------------
+f_tpos(string s) =>
+    s == "右下" ? position.bottom_right : s == "左上" ? position.top_left : s == "左下" ? position.bottom_left : position.top_right
+
+f_pct(int num, int den) =>
+    den == 0 ? "—" : str.tostring(100.0 * num / den, "0.0") + "%"
+
+f_dt(int t) =>
+    na(t) ? "—" : str.format_time(t, "yyyy-MM-dd HH:mm", syminfo.timezone)
+
+f_st(int d, int k) =>
+    array.get(fdsSt, (d == 1 ? 0 : ST_N) + k)
+
+var table fdsTb = na
+if showTable and barstate.islast
+    if not na(fdsTb)
+        table.delete(fdsTb)
+    fdsTb := table.new(f_tpos(tablePos), 7, 40, border_width = 1, frame_color = color.gray, frame_width = 1)
+    color hb = color.new(color.gray, 70)
+    color tx = chart.fg_color
+    if not fdsSupported
+        table.cell(fdsTb, 0, 0, "FVG Depth Stats — 集計していません", text_color = tx, bgcolor = hb, text_size = size.small)
+        table.cell(fdsTb, 0, 1, "使用条件: 4 時間足 / 日足 / 週足 の標準ローソク足チャート", text_color = tx, text_size = size.small)
+        table.cell(fdsTb, 0, 2, "現在: 時間足 " + timeframe.period + (fdsTfOk ? " (対象)" : " (対象外)") +
+             " / チャート種別 " + (fdsChartOk ? "標準" : "合成 OHLC (対象外)"), text_color = tx, text_size = size.small)
+        table.cell(fdsTb, 0, 3, "各時間足の FVG はその時間足のチャートで直接計算します (下位足で上位足を表示しても対象外)",
+             text_color = tx, text_size = size.small)
+    else
+        int r = 0
+        // ---- 観測条件 ----
+        table.cell(fdsTb, 0, r, "FVG Depth Stats", text_color = tx, bgcolor = hb, text_size = size.small)
+        table.merge_cells(fdsTb, 0, r, 6, r)
+        r += 1
+        string tfName = timeframe.isweekly ? "週足 (W)" : timeframe.isdaily ? "日足 (D)" : "4 時間足 (240)"
+        table.cell(fdsTb, 0, r, syminfo.tickerid + "  " + tfName + "  最小幅 " + str.tostring(minWidth) + "  " +
+             (repeatMode ? "繰り返し接触 ON" : "初回接触のみ"), text_color = tx, text_size = size.small)
+        table.merge_cells(fdsTb, 0, r, 6, r)
+        r += 1
+        table.cell(fdsTb, 0, r, "読込確定足 " + f_dt(fdsT0) + " ～ " + f_dt(fdsT1) + "  (" + str.tostring(fdsBars) + " 本, 有効 " +
+             str.tostring(fdsValidN) + " 本)", text_color = tx, text_size = size.small)
+        table.merge_cells(fdsTb, 0, r, 6, r)
+        r += 1
+        table.cell(fdsTb, 0, r, "FVG 形成判定 " + f_dt(fdsForm0) + " ～ " + f_dt(fdsForm1) + "  (" + str.tostring(fdsFormBars) +
+             " 本)  ※読込開始前に形成した FVG は対象外", text_color = tx, text_size = size.small)
+        table.merge_cells(fdsTb, 0, r, 6, r)
+        r += 1
+        table.cell(fdsTb, 0, r, "不正データ足 " + str.tostring(fdsBadN) + "  空白区間 (> " + str.tostring(gapDays) + " 日) " +
+             str.tostring(fdsGapN) + " 回, 最長 " + str.tostring(fdsGapMax / 86400000.0, "0.0") + " 日" +
+             "  ※休場と欠損は識別不能のため検出のみ", text_color = tx, text_size = size.small)
+        table.merge_cells(fdsTb, 0, r, 6, r)
+        r += 1
+        if fdsHalted
+            table.cell(fdsTb, 0, r, "⚠ 登録上限 " + str.tostring(FDS_CAP) + " 件に到達: 以降の新規 FVG を登録していません (統計は不完全)",
+                 text_color = color.red, text_size = size.small)
+            table.merge_cells(fdsTb, 0, r, 6, r)
+            r += 1
+        if not barstate.isconfirmed or not fdsConfirmed
+            table.cell(fdsTb, 0, r, "末尾足は未確定のため未集計", text_color = tx, text_size = size.small)
+            table.merge_cells(fdsTb, 0, r, 6, r)
+            r += 1
+        // ---- 件数 ----
+        table.cell(fdsTb, 0, r, "項目", text_color = tx, bgcolor = hb, text_size = size.small)
+        table.cell(fdsTb, 1, r, "上昇FVG", text_color = tx, bgcolor = hb, text_size = size.small)
+        table.cell(fdsTb, 2, r, "①÷N", text_color = tx, bgcolor = hb, text_size = size.small)
+        table.cell(fdsTb, 3, r, "②÷R", text_color = tx, bgcolor = hb, text_size = size.small)
+        table.cell(fdsTb, 4, r, "下降FVG", text_color = tx, bgcolor = hb, text_size = size.small)
+        table.cell(fdsTb, 5, r, "①÷N", text_color = tx, bgcolor = hb, text_size = size.small)
+        table.cell(fdsTb, 6, r, "②÷R", text_color = tx, bgcolor = hb, text_size = size.small)
+        r += 1
+        array<string> names = array.from("形成FVG", "接触したFVG (重複なし)", "全接触 N", "反発確定 R", "奥側終値突破 B",
+             "未決着 U", "判定不能 X", "不明FVG: 窓越え", "不明FVG: 欠損")
+        array<int> keys = array.from(S_FORM, S_TFVG, S_N, S_R, S_B, S_U, S_X, S_UGAP, S_UDAT)
+        for n = 0 to array.size(keys) - 1
+            int k = array.get(keys, n)
+            table.cell(fdsTb, 0, r, array.get(names, n), text_color = tx, text_size = size.small, text_halign = text.align_left)
+            table.cell(fdsTb, 1, r, str.tostring(f_st(1, k)), text_color = tx, text_size = size.small)
+            table.cell(fdsTb, 4, r, str.tostring(f_st(-1, k)), text_color = tx, text_size = size.small)
+            r += 1
+        // ---- 10 % 区間 ----
+        for b = 0 to 10
+            int k = b == 10 ? S_OVER : S_BK0 + b
+            string lbl = b == 10 ? "100%超から反発" : b == 9 ? "90%以上〜100%以下" :
+                 str.tostring(b * 10) + "%以上〜" + str.tostring(b * 10 + 10) + "%未満"
+            table.cell(fdsTb, 0, r, lbl, text_color = tx, text_size = size.small, text_halign = text.align_left)
+            for s = 0 to 1
+                int d = s == 0 ? 1 : -1
+                int c = f_st(d, k)
+                table.cell(fdsTb, 1 + 3 * s, r, str.tostring(c), text_color = tx, text_size = size.small)
+                table.cell(fdsTb, 2 + 3 * s, r, f_pct(c, f_st(d, S_N)), text_color = tx, text_size = size.small)
+                table.cell(fdsTb, 3 + 3 * s, r, f_pct(c, f_st(d, S_R)), text_color = tx, text_size = size.small)
+            r += 1
+        // ---- 整合性 ----
+        table.cell(fdsTb, 0, r, "検算 N=R+B+U+X / 区間計=R", text_color = tx, bgcolor = hb, text_size = size.small,
+             text_halign = text.align_left)
+        for s = 0 to 1
+            int d = s == 0 ? 1 : -1
+            int sumB = f_st(d, S_OVER)
+            for b = 0 to 9
+                sumB += f_st(d, S_BK0 + b)
+            bool ok1 = f_st(d, S_N) == f_st(d, S_R) + f_st(d, S_B) + f_st(d, S_U) + f_st(d, S_X)
+            bool ok2 = sumB == f_st(d, S_R)
+            table.cell(fdsTb, 1 + 3 * s, r, (ok1 ? "✔" : "✘") + " / " + (ok2 ? "✔" : "✘"),
+                 text_color = ok1 and ok2 ? tx : color.red, bgcolor = hb, text_size = size.small)
+            table.merge_cells(fdsTb, 1 + 3 * s, r, 3 + 3 * s, r)
+        r += 1
+        table.cell(fdsTb, 0, r, "同じ足で複数FVGへ新規接触した足: 上昇 " + str.tostring(f_st(1, S_MULT)) + " / 下降 " +
+             str.tostring(f_st(-1, S_MULT)) + " (FVGごとに1件ずつ計上)。空白を跨いだ接触: 上昇 " + str.tostring(f_st(1, S_GSPN)) +
+             " / 下降 " + str.tostring(f_st(-1, S_GSPN)) + " (参考)", text_color = tx, text_size = size.small)
+        table.merge_cells(fdsTb, 0, r, 6, r)
+        r += 1
+        table.cell(fdsTb, 0, r, "①=区間件数÷N ②=区間件数÷R (Rは100%超を含む)。分母0は「—」。不明FVGはNに含めない。" +
+             "侵入率: 入口側境界0%・奥側境界100%、確定終値で決着", text_color = tx, text_size = size.small)
+        table.merge_cells(fdsTb, 0, r, 6, r)
