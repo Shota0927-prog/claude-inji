@@ -363,13 +363,26 @@ def sc_roles():
     sc.set(7, labS1=1993.0)
     r = sc.run(**ONLY_TC, **QUIET)
     w6 = r.trace[6]["waits"]
-    check("LB-13 ダマシ: up-break on bar 4, close back below the band on bar 6 (2 bars later, <= 24) -> SHORT wait cat 2 starting on "
+    check("LB-13 ダマシ: up-break on bar 4, close back below the band on bar 6 (no window by default) -> SHORT wait cat 2 starting on "
           "bar 6 (no wick contact needed beyond the crossing bar); TC SHORT on bar 7 -> SHORT entry",
           w6 and w6[0][1] == -1 and w6[0][2] == 2 and w6[0][3] == 6 and [(e[0], e[2]) for e in entries(r)] == [(7, -1)], f"{w6} {entries(r)}")
     sc = mk(fk)
     sc.set(7, labS1=1993.0)
     r = sc.run(**ONLY_TC, **QUIET, fakeWin=1)
     w6 = r.trace[6]["waits"]
+    far = {3: TOUCH_A, 4: (1990.0, 2009.0, 1989.0, 2008.0)}
+    for i in range(5, 45):
+        far[i] = (2010.0, 2011.0, 2009.0, 2010.1)
+    far[45] = (2010.0, 2010.5, 1990.0, 1991.0)
+    rows = flat(50, 1985)
+    for i, row in far.items():
+        rows[i] = row
+    scf = Sc(rows)
+    poc(scf, 1, 2000.0)
+    rf = scf.run(**ONLY_TC, **QUIET)
+    wf = rf.trace[45]["waits"]
+    check("LB-13b ダマシ has no window by default (fakeWin 0): the close back below 41 bars after the up-break is still a fake (cat 2), "
+          "independent of the 12-bar wait", wf and wf[0][2] == 2 and wf[0][3] == 45, str(wf))
     sc = mk(fk)
     sc.set(7, labS1=1993.0)
     rb = sc.run(**ONLY_TC, **QUIET, fakeWin=2)
@@ -499,8 +512,9 @@ def sc_partial():
         poc(sc3, 1, c, k=k)
     sc3.set(4, labS1=1993.5)
     r3 = sc3.run(**ONLY_TC, **QUIET)
-    check("LB-21b 3 lots (SL distance 20): cumulative floor(1.8) = 1, floor(2.4) = 2, 3 -> legs 1 / 1 / 1 (rounded down, the remainder "
-          "goes to the next stage)", r3.trace[4]["legLots"] == [1, 1, 1] and r3["o"].lotN == 3, f"{r3.trace[4]['legLots']} {r3['o'].lotN}")
+    check("LB-21b 3 lots (SL distance 20): cumulative round(1.8) = 2, round(2.4) = 2, 3 -> legs 2 / 0 / 1 (the 0 stage has no order; "
+          "total unchanged, the last stage closes the rest)", r3.trace[4]["legLots"] == [2, 0, 1] and r3["o"].lotN == 3,
+          f"{r3.trace[4]['legLots']} {r3['o'].lotN}")
     r2 = partial_setup([(2, 1960.0), (3, 1940.0)], after)
     r1 = partial_setup([(2, 1960.0)], after)
     r0 = partial_setup([], after)
@@ -545,13 +559,21 @@ def sc_qty_table():
             e["f_lbTargets"] = lambda side, ref, tps=tps: list(tps)
             e["f_lbPlan"](1990.0, 1990.0)
             out.append(list(o.legLots))
-        c1, c2 = math.floor(0.6 * n + 1e-9), math.floor(0.8 * n + 1e-9)
+        c1, c2 = math.floor(0.6 * n + 0.5), math.floor(0.8 * n + 0.5)
         exp3.append([c1, c2 - c1, n - c2])
         exp2.append([c1, n - c1, 0])
-    check("LB-40 partial quantities as coded (f_lbPlan): legs = cumulative floor(0.6N) / floor(0.8N) / N for 3 targets, floor(0.6N) / "
-          "rest for 2, N for 1 — e.g. N=1 -> 0/0/1, 2 -> 1/0/1, 3 -> 1/1/1, 6 -> 3/1/2; exact 60/20/20 only for N = 5, 10 (pinned so any "
-          "change of this rule is deliberate)", got3 == exp3 and got2 == exp2 and got1 == [[n, 0, 0] for n in range(1, 11)]
-          and got3[0] == [0, 0, 1] and got3[5] == [3, 1, 2], f"{got3} {got2}")
+    o = e["o"]
+    o.side, o.sl, o.lotN, o.closedLots, o.stage = -1, 2000.0, 10, 0, 0
+    e.update(tpW1=50.0, tpW2=30.0, tpW3=20.0)
+    e["f_lbTargets"] = lambda side, ref: [1980.0, 1970.0, 1960.0]
+    e["f_lbPlan"](1990.0, 1990.0)
+    alt = list(o.legLots)
+    check("LB-40b the ratios stay inputs: 50 / 30 / 20 with 10 lots -> 5 / 3 / 2", alt == [5, 3, 2], str(alt))
+    check("LB-40 partial quantities (plan A, f_lbPlan): legs = differences of the cumulative round(0.6N) / round(0.8N) / N for 3 "
+          "targets, round(0.6N) / rest for 2, N for 1 - e.g. N=1 -> 1/0/0, 2 -> 1/1/0, 3 -> 2/0/1, 6 -> 4/1/1, 10 -> 6/2/2; the sum is "
+          "always N", got3 == exp3 and got2 == exp2 and got1 == [[n, 0, 0] for n in range(1, 11)]
+          and all(sum(g) == n + 1 for n, g in enumerate(got3))
+          and got3[0] == [1, 0, 0] and got3[1] == [1, 1, 0] and got3[2] == [2, 0, 1] and got3[5] == [4, 1, 1], f"{got3} {got2}")
 
 
 def sc_tp_mixed():
@@ -628,6 +650,22 @@ def sc_consume():
           and r.trace[5]["state"] == 0 and r["bkN"][0] >= 1 and r["o"].tmask == 8, f"{ev} {t4['waits']} {t4['tevs']}")
 
 
+def sc_dup_swing():
+    # two 1H Swing Highs at the same price (two pivots) -> two Zones, one contact -> two waits; one TC -> one order, one ledger trade
+    rows = flat(3, 1985) + [TOUCH_A, TC_AFTER] + flat(10, 1988)
+    sc = Sc(rows)
+    sc.hold(1, 2, s1h=2000.0, s1ht=T0 - 7200_000)
+    sc.hold(2, None, s1h=2000.0, s1ht=T0 - 3600_000)
+    sc.set(4, labS1=L_AFTER)
+    r = sc.run(**ONLY_TC, **QUIET)
+    zc = [z for z in r["lbZs"] if z.typ == 2]
+    ev = entries(r)
+    check("LB-41 duplicates: two Swing Zones at the same price both get waits from one contact, but one TC gives one order (bar 4), "
+          "the TC is consumed so the other wait cannot place a second order, and the trade is one ledger entry",
+          len(zc) == 2 and len(r.trace[3]["waits"]) == 2 and [e[0] for e in ev] == [4] and len(r.trace[4]["waits"]) == 1
+          and r.trace[4]["tevs"] == [(2, -1, 4, True)], f"{len(zc)} {r.trace[3]['waits']} {ev}")
+
+
 def sc_zones():
     # ZA: forming -> fixed; no Keep Count (4 Accums on 1H all kept = 8 Zones)
     rows = flat(14, 1900)
@@ -645,8 +683,8 @@ def sc_zones():
     # ZC dedupe (Library rule) / ZD exact-value registration
     sc = Sc(flat(10, 1900))
     sc.hold(1, 3, s1h=2000.0, s1ht=1000)
-    sc.hold(3, 5, s1h=2004.0, s1ht=2000)          # within 6 of 2000 on the same TF / high -> not added
-    sc.hold(5, 7, s1h=2007.0, s1ht=3000)          # 7 away -> added
+    sc.hold(3, 5, s1h=2004.0, s1ht=2000)          # within 6 of 2000 on the same TF / high -> also added (no suppression)
+    sc.hold(5, 7, s1h=2000.0, s1ht=3000)          # the same price again (a new pivot) -> added as its own Zone
     sc.hold(1, None, s2h=2000.0, s2ht=1000, s1l=2000.0, s1lt=1000)
     sc.hold(1, 2, d1c=2000.0, d1u=2000.5, d1l=1999.5)
     sc.hold(2, 3, d1c=2000.0, d1u=2000.5, d1l=1999.5)
@@ -655,9 +693,10 @@ def sc_zones():
     r = sc.run(**QUIET)
     zc = sorted((z.tf, z.sub, z.ctr) for z in r["lbZs"] if z.typ == 2)
     zd = sorted((z.ctr, z.infoA, z.infoB) for z in r["lbZs"] if z.typ == 3)
-    check("LB-31 ZC: a new 1H Swing High within 6 of an existing 1H Swing High is not added (Library duplicate rule), 7 away is; "
-          "the same price on another TF / as a Swing Low is separate", zc == [(0, -1, 2000.0), (0, 1, 2000.0), (0, 1, 2007.0), (1, 1, 2000.0)],
-          str(zc))
+    check("LB-31 ZC: every new Swing pivot (new time key) is its own Zone: a 1H high 4 away from an existing one and a new pivot at the "
+          "same price are added (old Zones kept, not overwritten, no suppression by distance); the same pivot delivered on several bars "
+          "is added once; other TF / Swing Low separate",
+          zc == [(0, -1, 2000.0), (0, 1, 2000.0), (0, 1, 2000.0), (0, 1, 2004.0), (1, 1, 2000.0)], str(zc))
     check("LB-32 ZD: each new POC value is a new Zone (2000, 2001.3), the old band is kept; a value equal to an existing POC Zone of the "
           "same TF (2000 again) is not added twice; na adds nothing; the original bin bounds are kept as info",
           zd == [(2000.0, 1999.5, 2000.5), (2001.3, 2000.8, 2001.8)], str(zd))
@@ -844,20 +883,21 @@ MUTANTS = [
     ("if sameSide and ob <= ot2 + EPS and low <= ot2 + EPS and high >= ob - EPS", "if sameSide", "AND overlap contact"),
     ("else if cScope == \"だけ\" and om != 0", "else if false", "only-scope exclusion"),
     ("if (z.sub == 1 and hc < z.bot) or (z.sub == -1 and hc > z.top)", "if (z.sub == 1 and hc < z.top) or (z.sub == -1 and hc > z.bot)", "iFVG edge"),
-    ("math.floor(cumW / 100.0 * o.lotN + 1e-9)", "math.round(cumW / 100.0 * o.lotN)", "partial lot rounding"),
+    ("math.floor(cumW / 100.0 * o.lotN + 0.5)", "math.floor(cumW / 100.0 * o.lotN + 1e-9)", "partial lot rounding (round, not floor)"),
     ("o.fill + beRatio / 100.0 * (o.tp1E - o.fill)", "o.fill + o.side * beRatio / 100.0 * (o.tp1E - o.fill)", "BE ratio sign"),
     ("if not na(bestL) and not na(bestS)\n        st.nConflict += 1\n    else if not na(bestL)", "if not na(bestL)", "LONG / SHORT conflict"),
     ("    if array.size(fe) >= 4\n", "    if array.size(fe) >= 2\n", "TP cluster scan stops early"),
     ("else if side == 1 ? b <= cf + EPS : t >= cf - EPS", "else if false", "overlapping TP Zones merged"),
-    ("not f_lbDup(2, k, sub, pv, 0)", "true", "Swing duplicate rule"),
-    ("not f_lbDup(3, k, 0, pc, 1)", "true", "POC exact duplicate"),
+    ("not f_lbDup(3, k, 0, pc)", "true", "POC exact duplicate"),
+    ("if not na(pt) and not na(pv) and (na(lt) or pt != lt)", "if not na(pt) and not na(pv)", "a Swing pivot is registered once"),
+    ("fakeWin = input.int(0,", "fakeWin = input.int(3,", "fake window default unlimited"),
     ("if lkBlk and array.size(lbWaits) > 0", "if false", "waits cleared while locked"),
     ("if xs != 0\n                    array.push(xId, z.id)", "if false\n                    array.push(xId, z.id)", "break cancels the wait"),
 ]
 
 
 def mutation():
-    scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_be, sc_consume, sc_zones, sc_ta,
+    scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_qty_table, sc_be, sc_consume, sc_zones, sc_dup_swing, sc_ta,
             sc_session, sc_and_timing, sc_ledger]
     survived = []
     for old, new, what in MUTANTS:
@@ -897,6 +937,7 @@ def main():
     sc_be()
     sc_consume()
     sc_zones()
+    sc_dup_swing()
     sc_ta()
     sc_session()
     sc_and_timing()
