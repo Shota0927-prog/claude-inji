@@ -428,7 +428,7 @@ def consistent(s):
 def gate_fuzz():
     rng = random.Random(20261101)
     bad, n_cmp, tot = [], 0, {f: 0 for f in FIELDS}
-    for it in range(60):
+    for it in range(300):
         rep = it % 2 == 1
         mw = rng.choice([1.0, 3.0, 5.0])
         seq = rand_series(rng, rng.randint(80, 260), bad_p=0.01 if it % 3 == 0 else 0.0, gap_p=0.02 if it % 4 == 0 else 0.0)
@@ -444,7 +444,7 @@ def gate_fuzz():
                                                           for b in seq])
         if mm.st(1) != r.st(-1) or mm.st(-1) != r.st(1):
             bad.append((it, "mirror"))
-    check(f"FS-50 60 random series (both modes, min width 1 / 3 / 5, invalid bars and time gaps): translated Pine == "
+    check(f"FS-50 300 random series (both modes, min width 1 / 3 / 5, invalid bars and time gaps): translated Pine == "
           f"independent reference model in all {n_cmp} direction tallies, N = R + B + U + X and bucket sum = R every time, "
           f"mirror symmetry holds", not bad, str(bad[:3]))
     check("FS-51 the random series exercised every outcome (R, B, U, X, UGAP, UDAT, MULT, OVER, BK0, BK9)",
@@ -509,11 +509,19 @@ def gate_mutation():
         try:
             _src_backup = globals()["src"]
             globals()["src"] = lambda: mt
+            import signal
+
+            def _alarm(*_):
+                raise TimeoutError("mutation made the logic loop forever")
+            signal.signal(signal.SIGALRM, _alarm)
             for g in (gate_basic, gate_buckets, gate_repeat, gate_unknown, gate_fuzz):
+                signal.alarm(20)          # a mutation that hangs (e.g. re-touching on the rebound bar) counts as caught
                 try:
                     g()
                 except Exception:      # noqa: BLE001
                     ok = False
+                finally:
+                    signal.alarm(0)
             ok = ok and all(r[1] for r in RESULTS[before:])
         finally:
             globals()["src"] = _src_backup
