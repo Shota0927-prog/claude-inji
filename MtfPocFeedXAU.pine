@@ -1,0 +1,121 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © ka.mickey15
+//
+// ============================================================
+//  MTF POC Feed XAU (接続用)  —  ZoneComboLabXAU の ZD (出来高 POC) 用の外部出力インジ
+// ------------------------------------------------------------
+//  ・MtfPocDetector (75 分割版) の f_pocCore を基に、1H / 4H / 日足 / 週足 の確定済み上位足の
+//    最大出来高区画を計算し、数値 plot (display.none) で出力するだけ。5分 / 15分は計算しない。
+//  ・取得タイミングは MtfPocDetector の上位足スロットと同じ: request.security(…, lookahead_on) の中で
+//    1 本前 (= 確定済み) の上位足までのデータだけで計算する。
+//  ・【変更点 (計算の軽量化)】各ローソク足の出来高を配る区画を、全区画ではなく
+//      開始 = max(0, floor((安値 − 窓の最安値) / 区画幅) − 1)
+//      終了 = min(分割数 − 1, floor((高値 − 窓の最安値) / 区画幅) + 1)
+//    の範囲だけ昇順に走査する (前後 1 区画は浮動小数の境界対策)。ov の計算・ov > 0 の判定・加算式・
+//    外側の足の走査順・高安幅 0 の処理・同量なら下側の区画・na の扱いは MtfPocDetector と同じ。
+//  ・出力 (合計 13 系列。ZoneComboLabXAU の input.source で同じ名前の系列を選ぶ):
+//      時間足ごとに ① 区画下限 ② 区画上限 ③ 対象足時刻 (= 確定した上位足の開始時刻 time[1])
+//        対象足時刻: 正常 = 正の値 / 計算不能 (履歴不足・値幅 0・欠損・出来高合計 0) = 負の値 (−time[1]) /
+//                    検知 OFF = 0。初期履歴で time[1] 自体が取れない足は na。
+//        区画下限・上限: 正常のときだけ値、計算不能・OFF は na。
+//      POC protocol = 10001 (接続確認用の固定値)
+//  ・表示用の線・ラベル・表は持たない。5分足以外のチャートでは全系列 na。
+// ============================================================
+
+//@version=6
+indicator("MTF POC Feed XAU", shorttitle = "POCFEED", overlay = true, max_bars_back = 1100)
+
+bool is5m = timeframe.isminutes and timeframe.multiplier == 5
+
+grpTF = "時間足 (検知 / 集計本数)"
+use1 = input.bool(true, "1H 検知",   group = grpTF, inline = "t1")
+len1 = input.int(120, "本数", minval = 10, maxval = 1000, group = grpTF, inline = "t1")
+use2 = input.bool(true, "4H 検知",   group = grpTF, inline = "t2")
+len2 = input.int(120, "本数", minval = 10, maxval = 1000, group = grpTF, inline = "t2")
+use3 = input.bool(true, "日足 検知", group = grpTF, inline = "t3")
+len3 = input.int(120, "本数", minval = 10, maxval = 1000, group = grpTF, inline = "t3")
+use4 = input.bool(true, "週足 検知", group = grpTF, inline = "t4")
+len4 = input.int(120, "本数", minval = 10, maxval = 1000, group = grpTF, inline = "t4")
+vpBins = input.int(75, "VP ビン数 (分割数)", minval = 4, maxval = 100, group = "POC 計算")
+
+// MtfPocDetector f_pocCore と同じ (区画の走査範囲だけ変更。tests/lab_sim.py が差分を照合)
+// ==== FEED POC core (begin) ==================================================
+f_pocCore(bool enabled, int off, int lookback, int bins) =>
+    float poc = na
+    float pUp = na
+    float pLo = na
+    if enabled and lookback > 0 and bins > 0 and bar_index - off >= lookback
+        float hi = na
+        float lo = na
+        bool  ok = true
+        for k = off to off + lookback - 1
+            float h = high[k]
+            float l = low[k]
+            float v = volume[k]
+            if na(h) or na(l) or na(v)
+                ok := false
+                break
+            hi := na(hi) ? h : math.max(hi, h)
+            lo := na(lo) ? l : math.min(lo, l)
+        float rangeAll = ok ? hi - lo : na
+        if ok and rangeAll > 0
+            array<float> bv = array.new_float(bins, 0.0)
+            float bs = rangeAll / bins
+            float total = 0.0
+            for k = off to off + lookback - 1
+                float ch = high[k]
+                float cl = low[k]
+                float cv = volume[k]
+                total += cv
+                float crange = ch - cl
+                if crange <= 0
+                    int bidx = math.max(0, math.min(bins - 1, int((cl - lo) / bs)))
+                    array.set(bv, bidx, array.get(bv, bidx) + cv)
+                else
+                    int b0 = math.max(0, math.floor((cl - lo) / bs) - 1)
+                    int b1 = math.min(bins - 1, math.floor((ch - lo) / bs) + 1)
+                    for bi = b0 to b1
+                        float binBot = lo + bi * bs
+                        float binTop = binBot + bs
+                        float ov = math.min(binTop, ch) - math.max(binBot, cl)
+                        if ov > 0
+                            array.set(bv, bi, array.get(bv, bi) + cv * ov / crange)
+            if total > 0
+                float best  = -1.0
+                int   bestI = 0
+                for bi = 0 to bins - 1
+                    float bvv = array.get(bv, bi)
+                    if bvv > best
+                        best  := bvv
+                        bestI := bi
+                pLo := lo + bestI * bs
+                pUp := pLo + bs
+                poc := (pUp + pLo) / 2.0
+    [poc, pUp, pLo]
+// ==== FEED POC core (end) ====================================================
+
+// 上位足の中で評価: 1 本前 (確定済み) の上位足までで計算 → [区画下限, 区画上限, 対象足時刻]
+f_feed(bool enabled, int lookback, int bins) =>
+    [pc, up, lo] = f_pocCore(enabled, 1, lookback, bins)
+    int   tk = time[1]
+    float tOut = not enabled ? 0.0 : na(tk) ? na : na(pc) ? -float(tk) : float(tk)
+    [enabled ? lo : na, enabled ? up : na, tOut]
+
+[l1, u1, t1] = request.security(syminfo.tickerid, "60",  f_feed(use1, len1, vpBins), lookahead = barmerge.lookahead_on)
+[l2, u2, t2] = request.security(syminfo.tickerid, "240", f_feed(use2, len2, vpBins), lookahead = barmerge.lookahead_on)
+[l3, u3, t3] = request.security(syminfo.tickerid, "D",   f_feed(use3, len3, vpBins), lookahead = barmerge.lookahead_on)
+[l4, u4, t4] = request.security(syminfo.tickerid, "W",   f_feed(use4, len4, vpBins), lookahead = barmerge.lookahead_on)
+
+plot(is5m ? l1 : na, "POC 1H 区画下限",   display = display.none)
+plot(is5m ? u1 : na, "POC 1H 区画上限",   display = display.none)
+plot(is5m ? t1 : na, "POC 1H 対象足時刻", display = display.none)
+plot(is5m ? l2 : na, "POC 4H 区画下限",   display = display.none)
+plot(is5m ? u2 : na, "POC 4H 区画上限",   display = display.none)
+plot(is5m ? t2 : na, "POC 4H 対象足時刻", display = display.none)
+plot(is5m ? l3 : na, "POC 日足 区画下限",   display = display.none)
+plot(is5m ? u3 : na, "POC 日足 区画上限",   display = display.none)
+plot(is5m ? t3 : na, "POC 日足 対象足時刻", display = display.none)
+plot(is5m ? l4 : na, "POC 週足 区画下限",   display = display.none)
+plot(is5m ? u4 : na, "POC 週足 区画上限",   display = display.none)
+plot(is5m ? t4 : na, "POC 週足 対象足時刻", display = display.none)
+plot(is5m ? 10001 : na, "POC protocol", display = display.none)

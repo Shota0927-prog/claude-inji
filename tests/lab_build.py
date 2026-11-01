@@ -18,7 +18,8 @@ import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NEW_FILES = ("MtfPocDetector.pine", "ZoneComboLabXAU.pine", "ZONE_COMBO_LAB_XAU_ja.md", "tests/lab_pine.py", "tests/lab_sim.py",
-             "tests/lab_load.py", "tests/lab_build.py")
+             "tests/lab_load.py", "tests/lab_build.py",
+             "MtfPocFeedXAU.pine")     # LAB-2: the external POC feed indicator
 
 
 def ok(path):
@@ -50,7 +51,8 @@ TEST_EDITS = {
         ('             "AccHistTickProbe.pine", "tests/acc3_exp.py")                                   # new in the later layer ACC-3 (probe / experiment)\n',
          '             "AccHistTickProbe.pine", "tests/acc3_exp.py",                                   # new in the later layer ACC-3 (probe / experiment)\n'
          '             "MtfPocDetector.pine", "ZoneComboLabXAU.pine", "ZONE_COMBO_LAB_XAU_ja.md",       # new in the later layer LAB-1\n'
-         '             "tests/lab_pine.py", "tests/lab_sim.py", "tests/lab_load.py", "tests/lab_build.py")  # new in the later layer LAB-1\n', 1)],
+         '             "tests/lab_pine.py", "tests/lab_sim.py", "tests/lab_load.py", "tests/lab_build.py")  # new in the later layer LAB-1\n'
+         'LATER_NEW = LATER_NEW + ("MtfPocFeedXAU.pine",)  # new in the later layer LAB-2 (external POC feed)\n', 1)],
 }
 
 

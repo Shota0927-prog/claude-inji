@@ -34,7 +34,7 @@ for i in range(N):
             seg = rows[(hb - 1) * L: hb * L]
             hi, lo = max(r[1] for r in seg), min(r[2] for r in seg)
             vw = round(sum((r[1] + r[2]) / 2 for r in seg) / len(seg), 2)
-            b.update({f"d{k}c": vw, f"d{k}u": vw + 0.2, f"d{k}l": vw - 0.2})
+            b.update(ls.pocv(k, vw - 0.2, vw + 0.2, ls.T0 + hb * 1000))
             if hb % 7 == 0:
                 b.update({f"s{k}h": hi, f"s{k}ht": ls.T0 + hb * 1000 + k, f"s{k}l": lo, f"s{k}lt": ls.T0 + hb * 1000 + k})
     hb = i // 12

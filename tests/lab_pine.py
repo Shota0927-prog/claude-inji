@@ -26,9 +26,31 @@ import acc_pine as ap     # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PINE = os.path.join(ROOT, "ZoneComboLabXAU.pine")
 LOGIC_BEGIN, LOGIC_END = "// ==== LAB Logic (begin) ", "// ==== LAB Logic (end) "
-ap.NAMESPACES.update({"alert", "extend"})
+ap.NAMESPACES.update({"alert", "extend", "map"})
+# map.new<K, V>() is outside the ACC tokenizer's generic pattern: add it (same form as array.new<T>)
+ap.TOKEN_RE = __import__("re").compile(ap.TOKEN_RE.pattern.replace(r"(?P<gen>array\.new<[\w<>]+>)", r"(?P<gen>(?:array|map)\.new<[\w<>, ]+>)"), ap.re.X)
 M5 = 300_000
 SRC_OVERRIDE = None      # mutation tests: run a modified source instead of the file
+
+
+_tok0 = ap.tokenize
+
+
+def _tokenize(src):
+    """acc_pine.tokenize with map.new<K, V> kept as map.new (acc_pine maps every generic constructor to array.new)."""
+    toks = _tok0(src)
+    gens = [m.group("gen") for m in ap.TOKEN_RE.finditer(src) if m.lastgroup == "gen"]
+    gi = 0
+    res = []
+    for k, v in toks:
+        if k == "id" and v == "array.new" and gi < len(gens):
+            v = "map.new" if gens[gi].startswith("map.") else v
+            gi += 1
+        res.append((k, v))
+    return res
+
+
+ap.tokenize = _tokenize
 
 
 def read_source(path=PINE):
@@ -136,6 +158,10 @@ for _k in (1, 2, 3, 4):
         FEED_DEFAULT[f"d{_k}{_x}"] = None
     for _x in ("k", "kc", "c", "d", "t", "b"):
         FEED_DEFAULT[f"g{_k}{_x}"] = None
+for _k in (1, 2, 3, 4):     # LAB-2: ZD from MtfPocFeedXAU (input.source); the old d* feeds stay for running the LAB-1 source
+    for _x in "LUT":
+        FEED_DEFAULT[f"zd{_x}{_k}"] = None
+FEED_DEFAULT["zdProto"] = 10001.0
 FEED_DEFAULT.update(zbMa1=None, zbMa2=None, labS1=None, labS2=None, labS3=None, satTf4=None, satTf1=None, labRangeOK=True)
 
 
@@ -166,6 +192,9 @@ class Runner:
             return f
         env.update(
             array__insert=self._insert,
+            map__new=lambda *a: {}, map__get=lambda m, k: m.get(k), map__put=lambda m, k, v: m.__setitem__(k, v),
+            map__remove=lambda m, k: m.pop(k, None), map__clear=lambda m: m.clear(), map__size=len,
+            map__contains=lambda m, k: k in m,
             alert=lambda msg, freq=None: self.alerts.append((self.bar_index, msg)), alert__freq_once_per_bar_close="once_per_bar_close",
             extend__right="right", extend__none="none",
             box__set_text=_set("text"), box__set_bgcolor=_set("bgcolor"), box__set_extend=_set("extend"),

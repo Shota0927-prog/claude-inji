@@ -78,9 +78,18 @@ def flat(n, p=1990.0, w=1.0):
     return [(p, p + w, p - w, p + 0.1) for _ in range(n)]
 
 
+T_HTF = T0 - 86_400_000     # a plausible confirmed higher-TF bar time (before every test bar)
+
+
+def pocv(k, lo, up, t=T_HTF):
+    """the values the bar receives for POC slot k (1..4): LAB-2 external series (zdL / zdU / zdT) and, for running the LAB-1
+    source in comparisons, the old internal feed (d*c = (lo + up) / 2 as f_pocCore computes it)."""
+    return {f"zdL{k}": lo, f"zdU{k}": up, f"zdT{k}": t, f"d{k}c": (lo + up) / 2.0, f"d{k}u": up, f"d{k}l": lo}
+
+
 def poc(sc, i0, c, k=1, i1=None):
     """ZD POC zone feed (time frame k = 1..4) with centre c from bar i0."""
-    return sc.hold(i0, i1, **{f"d{k}c": c, f"d{k}u": c + 0.5, f"d{k}l": c - 0.5})
+    return sc.hold(i0, i1, **pocv(k, c - 0.5, c + 0.5))
 
 
 def tc_short(L):
@@ -115,11 +124,27 @@ def static():
           a_lab == a_acc and func_text(SRC, "f_acConfirmed") == func_text(acc, "f_acConfirmed")
           and all(SRC.count(f'request.security(syminfo.tickerid, "{tf}", f_acConfirmed(') == 1 for tf in ("60", "240", "D")))
     mtf = raw("MtfPocDetector.pine")
-    check("LS-02 ZD: f_pocCore byte-identical to MtfPocDetector.pine (the 75-bin latest; the old 20-bin / ATR f_band is absent); "
-          "requested with offset 1 + lookahead_on like f_htfCalc; bins input default 75",
-          func_text(SRC, "f_pocCore") == func_text(mtf, "f_pocCore") and "f_band" not in SRC and "ta.atr(bandAtrLen" not in SRC
-          and "f_pocCore(enabled, 1, lookback, bins)" in SRC and 'vpBins = input.int(75,' in SRC
-          and 'vpBins         = input.int(75,' in mtf)
+    feed = raw("MtfPocFeedXAU.pine")
+    f_new = func_text(feed, "f_pocCore")
+    f_old = func_text(mtf, "f_pocCore")
+    old_loop = ("                else\n"
+                "                    for bi = 0 to bins - 1\n")
+    new_loop = ("                else\n"
+                "                    int b0 = math.max(0, math.floor((cl - lo) / bs) - 1)\n"
+                "                    int b1 = math.min(bins - 1, math.floor((ch - lo) / bs) + 1)\n"
+                "                    for bi = b0 to b1\n")
+    reqs = re.findall(r'request\.security\(syminfo\.tickerid, "(\w+)",\s*f_feed\((use\d), (len\d), vpBins\), lookahead = barmerge\.lookahead_on\)', feed)
+    names = re.findall(r'^plot\(is5m \? [^,]+, "([^"]+)",\s+display = display\.none\)$', feed, re.M)
+    want = [f"POC {tf} {it}" for tf in ("1H", "4H", "日足", "週足") for it in ("区画下限", "区画上限", "対象足時刻")] + ["POC protocol"]
+    check("LS-02 ZD split (LAB-2): MtfPocFeedXAU f_pocCore == MtfPocDetector f_pocCore except the per-candle bin range (only the loop "
+          "header replaced by the b0 / b1 range); 4 requests 1H / 4H / D / W with offset 1 + lookahead_on; 13 plots (display.none, names "
+          "= the lab's 13 input.source titles); 120 bars / 75 bins defaults; the lab has no POC calculation / POC request / fallback",
+          f_old.count(old_loop) == 1 and f_new == f_old.replace(old_loop, new_loop) and [r[0] for r in reqs] == ["60", "240", "D", "W"]
+          and "f_pocCore(enabled, 1, lookback, bins)" in feed and names == want and 'plot(is5m ? 10001 : na, "POC protocol"' in feed
+          and all(f'len{k} = input.int(120,' in feed for k in (1, 2, 3, 4)) and 'vpBins = input.int(75,' in feed
+          and "f_pocCore" not in SRC and "f_lbPocHtf" not in SRC
+          and all(f'input.source(close, "{n}"' in SRC for n in want[:-1]) and 'input.source(close, "POC protocol (10001)"' in SRC,
+          f"{names} {reqs}")
     zs = raw("ZoneStrategyXAU.pine")
     check("LS-03 ZF: f_fvgConfirmed byte-identical to ZoneStrategyXAU FVG Batch A; FVG min width default 3.0",
           func_text(SRC, "f_fvgConfirmed") == func_text(zs, "f_fvgConfirmed") and 'zfMinW = input.float(3.0,' in SRC)
@@ -158,9 +183,10 @@ def static():
     code = re.sub(r"//.*", "", SRC)
     n_plot = len(re.findall(r"(?<![\w.])plot\(", code))
     n_req = len(re.findall(r"request\.security\(", code))
-    check("LS-09 limits: plot() calls <= 64 (14), request.security calls <= 40 (18 = Accum 3 + 1m EMA 1 + Swing 4 + POC 4 + FVG 4 + "
-          "SATS filter 2), no request.security_lower_tf",
-          n_plot <= 64 and n_req == 18 and "security_lower_tf" not in code, f"plot {n_plot} request {n_req}")
+    n_src = len(re.findall(r"input\.source\(", code))
+    check("LS-09 limits: plot() calls <= 64 (14), request.security calls 14 (Accum 3 + 1m EMA 1 + Swing 4 + FVG 4 + SATS filter 2; the 4 "
+          "POC requests moved to MtfPocFeedXAU), 13 input.source, no request.security_lower_tf",
+          n_plot <= 64 and n_req == 14 and n_src == 13 and "security_lower_tf" not in code, f"plot {n_plot} request {n_req} source {n_src}")
     logic = lp.logic_section(SRC)
     check("LS-10 the logic section has no history reference / request / ta.* call (transpiles; series values come from the feed "
           "section) and no Keep Count / expiry / generation pruning of valid Zones",
@@ -538,8 +564,8 @@ def sc_partial():
     sc = Sc(rows)
     poc(sc, 1, 2000.0)
     poc(sc, 1, 1960.0, k=2)
-    sc.hold(7, None, d3c=1975.0, d3u=1975.5, d3l=1974.5)
-    sc.hold(10, None, d4c=1977.0, d4u=1977.5, d4l=1976.5)
+    sc.hold(7, None, **pocv(3, 1974.5, 1975.5))
+    sc.hold(10, None, **pocv(4, 1976.5, 1977.5))
     sc.set(4, labS1=2001.0)
     r = sc.run(**ONLY_TC, **QUIET)
     ntf = [a for a in r.alerts if "TP 変更" in a[1]]
@@ -745,10 +771,10 @@ def sc_zones():
     sc.hold(3, 5, s1h=2004.0, s1ht=2000)          # within 6 of 2000 on the same TF / high -> also added (no suppression)
     sc.hold(5, 7, s1h=2000.0, s1ht=3000)          # the same price again (a new pivot) -> added as its own Zone
     sc.hold(1, None, s2h=2000.0, s2ht=1000, s1l=2000.0, s1lt=1000)
-    sc.hold(1, 2, d1c=2000.0, d1u=2000.5, d1l=1999.5)
-    sc.hold(2, 3, d1c=2000.0, d1u=2000.5, d1l=1999.5)
-    sc.hold(3, 4, d1c=2001.3, d1u=2001.8, d1l=2000.8)
-    sc.hold(4, 5, d1c=2000.0, d1u=2000.5, d1l=1999.5)
+    sc.hold(1, 2, **pocv(1, 1999.5, 2000.5))
+    sc.hold(2, 3, **pocv(1, 1999.5, 2000.5, T_HTF + 3600_000))     # same centre, new target time: not registered again
+    sc.hold(3, 4, **pocv(1, 2000.75, 2001.75))
+    sc.hold(4, 5, **pocv(1, 1999.5, 2000.5))
     r = sc.run(**QUIET)
     zc = sorted((z.tf, z.sub, z.ctr) for z in r["lbZs"] if z.typ == 2)
     zd = sorted((z.ctr, z.infoA, z.infoB) for z in r["lbZs"] if z.typ == 3)
@@ -756,9 +782,9 @@ def sc_zones():
           "same price are added (old Zones kept, not overwritten, no suppression by distance); the same pivot delivered on several bars "
           "is added once; other TF / Swing Low separate",
           zc == [(0, -1, 2000.0), (0, 1, 2000.0), (0, 1, 2000.0), (0, 1, 2004.0), (1, 1, 2000.0)], str(zc))
-    check("LB-32 ZD: each new POC value is a new Zone (2000, 2001.3), the old band is kept; a value equal to an existing POC Zone of the "
+    check("LB-32 ZD: each new POC value is a new Zone (2000, 2001.25; centre = (bin low + bin high) / 2 from the external feed), the old band is kept; a value equal to an existing POC Zone of the "
           "same TF (2000 again) is not added twice; na adds nothing; the original bin bounds are kept as info",
-          zd == [(2000.0, 1999.5, 2000.5), (2001.3, 2000.8, 2001.8)], str(zd))
+          zd == [(2000.0, 1999.5, 2000.5), (2001.25, 2000.75, 2001.75)], str(zd))
     # MA: moving band, snapshot renewed on re-contact (SL from the latest contact)
     rows = flat(12, 1985)
     rows[3] = (1988.0, 1995.0, 1987.0, 1989.0)
@@ -878,7 +904,8 @@ def rand_bars(seed, n=900):
         if hb >= 2:
             seg = rows[(hb - 1) * 12: hb * 12]
             hi, lo = max(r[1] for r in seg), min(r[2] for r in seg)
-            sc.bars[i].update(d1c=round((hi + lo) / 2, 2), d1u=round((hi + lo) / 2 + 0.3, 2), d1l=round((hi + lo) / 2 - 0.3, 2))
+            cc = round((hi + lo) / 2, 2)
+            sc.bars[i].update(**pocv(1, round(cc - 0.3, 2), round(cc + 0.3, 2), T0 + (hb - 1) * 3600_000))
             prev = rows[(hb - 2) * 12: (hb - 1) * 12]
             if min(r[2] for r in seg) > max(r[1] for r in prev) + 3:
                 sc.bars[i].update(g1k=T0 + (hb - 1) * 3600_000, g1c=seg[-1][3], g1d=1, g1t=min(r[2] for r in seg), g1b=max(r[1] for r in prev))
@@ -930,6 +957,251 @@ def sc_random():
 
 RANDOM_STATS = []
 
+
+# ============================================================================
+# LAB-2: POC split / optimisations
+# ============================================================================
+def poc_ref(H, L, V, off, lookback, bins, ranged=False):
+    """Python port of f_pocCore (MtfPocDetector, ranged=False) and of the MtfPocFeedXAU version (ranged=True), statement by statement.
+    H / L / V: lists indexed by the Pine history offset (H[k] = high[k]); None = na."""
+    import math as m
+    bar_index = len(H) - 1
+    poc = pUp = pLo = None
+    if lookback > 0 and bins > 0 and bar_index - off >= lookback:
+        hi = lo = None
+        ok = True
+        for k in range(off, off + lookback):
+            h, l, v = H[k], L[k], V[k]
+            if h is None or l is None or v is None:
+                ok = False
+                break
+            hi = h if hi is None else max(hi, h)
+            lo = l if lo is None else min(lo, l)
+        rangeAll = hi - lo if ok else None
+        if ok and rangeAll > 0:
+            bv = [0.0] * bins
+            bs = rangeAll / bins
+            total = 0.0
+            for k in range(off, off + lookback):
+                ch, cl, cv = H[k], L[k], V[k]
+                total += cv
+                crange = ch - cl
+                if crange <= 0:
+                    bidx = max(0, min(bins - 1, int((cl - lo) / bs)))
+                    bv[bidx] = bv[bidx] + cv
+                else:
+                    rng_ = range(max(0, m.floor((cl - lo) / bs) - 1), min(bins - 1, m.floor((ch - lo) / bs) + 1) + 1) if ranged else range(bins)
+                    for bi in rng_:
+                        binBot = lo + bi * bs
+                        binTop = binBot + bs
+                        ov = min(binTop, ch) - max(binBot, cl)
+                        if ov > 0:
+                            bv[bi] = bv[bi] + cv * ov / crange
+            if total > 0:
+                best, bestI = -1.0, 0
+                for bi in range(bins):
+                    if bv[bi] > best:
+                        best, bestI = bv[bi], bi
+                pLo = lo + bestI * bs
+                pUp = pLo + bs
+                poc = (pUp + pLo) / 2.0
+    return poc, pUp, pLo
+
+
+def sc_poc_opt():
+    rnd = random.Random(11)
+    n = bad = 0
+    for case in range(400):
+        nb = rnd.choice([30, 125, 200])
+        p = 2000.0
+        H, L, V = [], [], []
+        for i in range(nb):
+            o = p
+            c = round(o + rnd.gauss(0, 3), rnd.choice([1, 2]))
+            h = max(o, c) + abs(round(rnd.gauss(0, 1.5), 1))
+            l = min(o, c) - abs(round(rnd.gauss(0, 1.5), 1))
+            r = rnd.random()
+            if r < 0.06:
+                h = l = c                       # zero-range candle
+            elif r < 0.10:
+                h, l = round(h), round(l)       # integer edges (bin-boundary hits)
+            vol = rnd.choice([0, rnd.randint(1, 5000), 1.0])
+            if rnd.random() < 0.01:
+                vol = None
+            H.append(h)
+            L.append(l)
+            V.append(vol)
+            p = c
+        if case % 50 == 0:
+            V = [0] * nb                        # total volume 0 -> na
+        if case % 37 == 0:
+            H = [2000.0] * nb
+            L = [2000.0] * nb                   # range 0 -> na
+        for lb, bins in ((120, 75), (20, 75), (120, 20), (30, 100)):
+            a = poc_ref(H, L, V, 1, lb, bins, ranged=False)
+            b = poc_ref(H, L, V, 1, lb, bins, ranged=True)
+            n += 1
+            if a != b:
+                bad += 1
+    # grid-aligned case: candle edges exactly on bin edges (lo 2000, range 75 -> bin width 1)
+    H = [2075.0] + [2000.0 + (i % 75) + 1 for i in range(130)]
+    L = [2000.0] + [2000.0 + (i % 75) for i in range(130)]
+    V = [100.0] * 131
+    g1, g2 = poc_ref(H, L, V, 1, 120, 75), poc_ref(H, L, V, 1, 120, 75, ranged=True)
+    check("LB-42 POC optimisation: the per-candle bin range (floor-1 .. floor+1) gives exactly the same bin low / high / centre as the "
+          "full 75-bin scan (Python port of both, statement by statement) on 1,600 windows incl. zero-range candles, integer edges, "
+          "volume 0 / na, range 0, 20 / 75 / 100 bins, and candles exactly on bin edges",
+          bad == 0 and g1 == g2 and g1[0] is not None, f"{bad}/{n} {g1} {g2}")
+
+
+def zd_bars(n=12, **feed):
+    sc = Sc(flat(n, 1985))
+    for i in range(n):
+        sc.bars[i].update(feed)
+    return sc
+
+
+def sc_zd_recv():
+    # states and registration from the 13 external series
+    sc = Sc(flat(16, 1985))
+    seq = [None, None, (1999.5, 2000.5, T_HTF), (1999.5, 2000.5, T_HTF), (1999.5, 2000.5, T_HTF + 3600_000), (None, None, None),
+           (1999.5, 2000.5, T_HTF + 7200_000), (None, None, -(T_HTF + 10800_000)), (2009.5, 2010.5, T_HTF + 14400_000),
+           (1999.5, 2000.5, T_HTF + 18000_000)] + [(1999.5, 2000.5, T_HTF + 18000_000)] * 6
+    stats = []
+    for i, v in enumerate(seq):
+        if v is not None:
+            sc.bars[i].update(zdL1=v[0], zdU1=v[1], zdT1=v[2])
+    r = lp.Runner(overrides=dict(QUIET))
+    for b in sc.bars:
+        r.step(b)
+        stats.append(r["lbZdStat"][0])
+    zd = sorted((z.ctr, z.infoA, z.infoB, z.key, z.aTime) for z in r["lbZs"] if z.typ == 3)
+    check("LB-43 ZD reception: history na -> state 3 (no Zone); a value registers once (centre 2000, bin 1999.5-2000.5 kept, target "
+          "time and the 5m availability time kept); the same centre on later bars or with a new target time is not registered again; na "
+          "(state 3) and a calculation failure (negative time, state 2) keep the last valid centre, so the return of 2000 adds nothing; "
+          "2010 is added; 2000 again (already registered) adds nothing; none of these stop entries",
+          stats[:10] == [3, 3, 1, 1, 1, 3, 1, 2, 1, 1] and zd == [(2000.0, 1999.5, 2000.5, T_HTF, sc.bars[2]["t"]),
+                                                                     (2010.0, 2009.5, 2010.5, T_HTF + 14400_000, sc.bars[8]["t"])]
+          and r["skipN"][7] == 0, f"{stats} {zd}")
+    # connection errors: stop new entries only while the lab's ZD detection is ON
+    def run_basic(**ov):
+        rows = flat(3) + [(1990, 1995, 1989, 1991)] + [tc_short(1993)] + flat(6, 1985)
+        s2 = Sc(rows)
+        poc(s2, 1, 2000.0)
+        s2.hold(4, 5, labS1=1993.0)
+        for b in s2.bars:
+            b.update({k: v for k, v in ov.items() if k in lp.FEED_DEFAULT})
+        return s2.run(**ONLY_TC, **QUIET, **{k: v for k, v in ov.items() if k not in lp.FEED_DEFAULT})
+    ok_run = run_basic()
+    no_proto = run_basic(zdProto=1991.0)                                     # unconnected: input.source left at close
+    t_close = run_basic(zdT2=1985.1, zdL2=1985.1, zdU2=1985.1)               # one slot left at close
+    ext_off = run_basic(zdT3=0.0)                                            # feed side OFF while the lab slot is ON
+    lab_off = run_basic(zdProto=1991.0, zdUse1=False, zdUse2=False, zdUse3=False, zdUse4=False, cZD=False, cZC=True)
+    neg = run_basic(zdT4=-(T_HTF + 1.0))                                     # calculation failure (normal connection)
+    hist = run_basic(zdT4=None)                                              # history not yet available
+    check("LB-43b ZD connection: protocol != 10001 (input left at close), a time series left at close, or the feed's slot OFF (time 0) "
+          "while the lab slot is ON -> state 9 / 8, new entries stopped (skip 'ZD 接続'), never replaced by close; with the lab's ZD "
+          "detection OFF an unconnected feed does not stop entries; a calculation failure / missing history does not stop entries",
+          len(entries(ok_run)) == 1 and entries(no_proto) == [] and no_proto["skipN"][7] >= 1 and list(no_proto["lbZdStat"]) == [9, 9, 9, 9]
+          and entries(t_close) == [] and t_close["lbZdStat"][1] == 9 and entries(ext_off) == [] and ext_off["lbZdStat"][2] == 8
+          and list(lab_off["lbZdStat"]) == [0, 0, 0, 0] and lab_off["skipN"][7] == 0
+          and len(entries(neg)) == 1 and neg["lbZdStat"][3] == 2 and len(entries(hist)) == 1 and hist["lbZdStat"][3] == 3
+          and not any(z.typ == 3 for z in no_proto["lbZs"]),
+          f"{entries(no_proto)} {list(no_proto['lbZdStat'])} {list(t_close['lbZdStat'])} {list(ext_off['lbZdStat'])} {list(lab_off['lbZdStat'])} "
+          f"{list(neg['lbZdStat'])} {list(hist['lbZdStat'])}")
+
+
+OLD_REV = "bc68da2"     # LAB-1 last version (internal POC, linear wait search, full AND odometer, iterative TP clustering)
+
+
+def sc_old_new():
+    old_src = git("show", f"{OLD_REV}:ZoneComboLabXAU.pine")
+    cfgs = [dict(), dict(cComb="AND", cZA=False, cZB=True, cZC=False, cZD=True, cZF=True), dict(tpMode="選択した TP で全決済", tpSel=3),
+            dict(tpMode="固定 RR"), dict(cScope="だけ"), dict(beLock=True, beMode="TP1 割合")]
+    bad = []
+    for seed in range(4):
+        sc = rand_bars(seed + 10, n=700)
+        # more POC / MA traffic: a second POC slot every 6 bars, two MAs
+        for i, b in enumerate(sc.bars):
+            if i >= 30:
+                c = round(sum(x["c"] for x in sc.bars[i - 30:i - 24]) / 6, 2)
+                b.update(**pocv(2, round(c - 0.4, 2), round(c + 0.4, 2), T0 + (i // 6) * 1000))
+                b.update(zbMa2=round(sum(x["c"] for x in sc.bars[max(0, i - 120):i + 1]) / min(i + 1, 121), 2))
+        for cf in cfgs:
+            ov = dict(dsZone=False, dsEnt=False, **cf)
+            a = lp.Runner(overrides=ov, src=old_src).run(sc.bars)
+            b = lp.Runner(overrides=ov).run(sc.bars)
+            same = (a.broker.log == b.broker.log and a.broker.closed == b.broker.closed and a.trace == b.trace
+                    and [list(a[k]) for k in ("bkN", "bkW", "bkL", "bkBE", "bkNet", "bkR")] == [list(b[k]) for k in ("bkN", "bkW", "bkL", "bkBE", "bkNet", "bkR")]
+                    and sorted((z.typ, z.tf, z.ctr, z.bot, z.top) for z in a["lbZs"]) == sorted((z.typ, z.tf, z.ctr, z.bot, z.top) for z in b["lbZs"]))
+            if not same:
+                bad.append((seed, cf))
+            OLD_NEW_STATS.append(len(entries(b)))
+    check("LB-44 before / after (LAB-1 bc68da2 with the internal POC vs LAB-2 with the same POC values as external series): 4 random "
+          "paths x 6 settings (OR / AND, chosen TP, fixed RR, only, BE lock + TP1 ratio) give identical waits / timings / legs per bar, "
+          "orders and fills (incl. partial exits), closed trades, ledger buckets and registered Zones",
+          not bad and sum(OLD_NEW_STATS) > 0, f"{bad} entries {OLD_NEW_STATS}")
+
+
+OLD_NEW_STATS = []
+
+
+def sc_tp_ref():
+    """f_lbTargets (one pass over the three ordered streams) vs a reference: every eligible interval, sorted, merged with the same EPS
+    rule, first 3 bands. Random Zone sets with chained overlaps, wide FVGs, both MAs, LONG / SHORT, 0..3+ targets."""
+    r = lp.Runner(overrides=dict(QUIET)).run(Sc(flat(2, 2000)).bars)
+    e = r.env
+    LbZone = e["LbZone"]
+    rnd = random.Random(5)
+    EPS = 1e-7
+    bad, counts = [], [0, 0, 0, 0]
+    for case in range(500):
+        zs, fv = [], []
+        for _ in range(rnd.randint(0, 14)):
+            c = round(2000 + rnd.uniform(-60, 60), rnd.choice([0, 1, 2]))
+            zs.append(LbZone.new(len(zs) + 1, rnd.choice([0, 2, 3]), 0, 0, c, c - 6.0, c + 6.0))
+        for _ in range(rnd.randint(0, 5)):
+            b = round(2000 + rnd.uniform(-70, 60), 1)
+            w = rnd.choice([3.0, 8.5, 25.0, 60.0])
+            fv.append(LbZone.new(100 + len(fv), 4, 0, 1, b + w / 2, b, b + w))
+        if case % 7 == 0 and zs:          # exact touching edges / exact equal bands (EPS rule)
+            z0 = zs[0]
+            zs.append(LbZone.new(99, 2, 0, 0, z0.ctr + 12.0, z0.ctr + 6.0, z0.ctr + 18.0))
+            zs.append(LbZone.new(98, 3, 0, 0, z0.ctr, z0.bot, z0.top))
+        e["lbZs"] = sorted(zs, key=lambda z: z.bot)
+        e["lbFvgs"] = sorted(fv, key=lambda z: z.bot)
+        e["lbFvgsT"] = sorted(fv, key=lambda z: z.top)
+        e["st"].maxW, e["st"].maxWF = 12.0, max([z.top - z.bot for z in fv] + [0.0])
+        mas = [round(2000 + rnd.uniform(-50, 50), 2) if rnd.random() < 0.6 else None for _ in range(2)]
+        e["zbMa1"], e["zbMa2"] = mas
+        e["lbMa1"] = LbZone.new(201, 1, 0, 0, mas[0], mas[0] - 6.0, mas[0] + 6.0) if mas[0] is not None else None
+        e["lbMa2"] = LbZone.new(202, 1, 1, 0, mas[1], mas[1] - 6.0, mas[1] + 6.0) if mas[1] is not None else None
+        ref = round(2000 + rnd.uniform(-20, 20), rnd.choice([0, 1]))
+        for side in (1, -1):
+            iv = [(z.bot, z.top) for z in zs + fv if (z.bot > ref + EPS if side == 1 else z.top < ref - EPS)]
+            iv += [(m - 6.0, m + 6.0) for m in mas if m is not None and ((m - 6.0) > ref + EPS if side == 1 else (m + 6.0) < ref - EPS)]
+            iv.sort(key=lambda x: x[0] if side == 1 else -x[1])
+            out, cn, cf = [], None, None
+            for b, t in iv:
+                if cn is None:
+                    cn, cf = (b, t) if side == 1 else (t, b)
+                elif (b <= cf + EPS) if side == 1 else (t >= cf - EPS):
+                    cf = max(cf, t) if side == 1 else min(cf, b)
+                else:
+                    out.append(cn)
+                    cn, cf = (b, t) if side == 1 else (t, b)
+            if cn is not None:
+                out.append(cn)
+            want = out[:3]
+            got = e["f_lbTargets"](side, ref)
+            counts[min(3, len(want))] += 1
+            if got != want:
+                bad.append((case, side, ref, got, want))
+    check("LB-45 TP search (one pass, LONG by low ascending / SHORT by high descending over the common-width index, the FVG low / high "
+          "indexes and both MAs, stop at the 3rd band) == the reference (all eligible intervals sorted and merged with the same EPS "
+          f"rule) on 1,000 random cases incl. chained overlaps, wide FVGs (up to 60), touching edges; targets 0 / 1 / 2 / 3: {counts}",
+          not bad and all(c > 0 for c in counts), str(bad[:3]))
+
 SCENARIOS = None
 MUTANTS = [
     ("bar_index - w.lBar > waitBars", "bar_index - w.lBar >= waitBars", "wait expiry boundary"),
@@ -939,13 +1211,18 @@ MUTANTS = [
     ("        w.lBar := bar_index\n", "", "re-contact renewal"),
     ("(fakeWin == 0 or bar_index - z.brkBar <= fakeWin)", "(fakeWin == 0 or bar_index - z.brkBar < fakeWin - 1)", "fake window"),
     ("cc := (cs == -1 and z.brk == -1) or (cs == 1 and z.brk == 1) ? 3 : 1", "cc := 1", "role-reversal category"),
-    ("if sameSide and ob <= ot2 + EPS and low <= ot2 + EPS and high >= ob - EPS", "if sameSide", "AND overlap contact"),
+    ("okp := okp and ob <= ot2 + EPS and low <= ot2 + EPS and high >= ob - EPS", "okp := okp", "AND overlap contact (pruning)"),
+    ("okp := array.get(cSide, jz) == array.get(cSide, j0)", "okp := true", "AND same side (pruning)"),
+    ("    map.remove(lbWaitMap, f_wKey(w.side, w.key))\n", "", "waits map kept in sync"),
+    ("                if zdBad\n                    why := 7\n                else if", "                if false\n                    why := 7\n                else if", "ZD misconnection stops entries"),
+    ("            else if math.abs(tt) < 1e11 or math.abs(tt) >= time or tt != math.round(tt)", "            else if false", "ZD time plausibility"),
     ("else if cScope == \"だけ\" and om != 0", "else if false", "only-scope exclusion"),
     ("if (z.sub == 1 and hc < z.bot) or (z.sub == -1 and hc > z.top)", "if (z.sub == 1 and hc < z.top) or (z.sub == -1 and hc > z.bot)", "iFVG edge"),
     ("math.floor(cumW / 100.0 * o.lotN + 0.5)", "math.floor(cumW / 100.0 * o.lotN + 1e-9)", "partial lot rounding (round, not floor)"),
     ("o.fill + beRatio / 100.0 * (o.tp1E - o.fill)", "o.fill + o.side * beRatio / 100.0 * (o.tp1E - o.fill)", "BE ratio sign"),
     ("if not na(bestL) and not na(bestS)\n        st.nConflict += 1\n    else if not na(bestL)", "if not na(bestL)", "LONG / SHORT conflict"),
-    ("    if array.size(fe) >= 4\n", "    if array.size(fe) >= 2\n", "TP cluster scan stops early"),
+    ("    array.size(tps) >= 3\n", "    array.size(tps) >= 2\n", "TP scan stops after the 3rd band"),
+    ("int ig = side == 1 ? f_lbLower(lbFvgs, ref + EPS) : f_lbLowerT(lbFvgsT, ref - EPS) - 1", "int ig = side == 1 ? f_lbLower(lbFvgs, ref + EPS) : f_lbLower(lbFvgs, ref - EPS) - 1", "SHORT reads FVGs by top"),
     ("else if side == 1 ? b <= cf + EPS : t >= cf - EPS", "else if false", "overlapping TP Zones merged"),
     ("not f_lbDup(3, k, 0, pc)", "true", "POC exact duplicate"),
     ("if not na(pt) and not na(pv) and (na(lt) or pt != lt)", "if not na(pt) and not na(pv)", "a Swing pivot is registered once"),
@@ -959,7 +1236,7 @@ MUTANTS = [
 
 def mutation():
     scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_qty_table, sc_be, sc_lock_far, sc_and_only_sel, sc_sel_tp, sc_consume, sc_zones, sc_dup_swing, sc_ta,
-            sc_session, sc_and_timing, sc_ledger]
+            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref]
     survived = []
     for old, new, what in MUTANTS:
         if SRC.count(old) != 1:
@@ -1007,6 +1284,10 @@ def main():
     sc_and_timing()
     sc_ledger()
     sc_random()
+    sc_poc_opt()
+    sc_zd_recv()
+    sc_tp_ref()
+    sc_old_new()
     mutation()
     npass = sum(1 for _, ok, _ in RESULTS if ok)
     for name, ok, detail in RESULTS:
