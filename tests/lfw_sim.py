@@ -1,13 +1,13 @@
 """LFW fixtures — LongFibWave.pine (long-term Fibonacci wave indicator, D / 4H; LFW-3: major highs / lows).
 
-  LS static   : inputs (switch 0.782, start 0.10, pivots D 20/3 and 4H 60/3, ATR 14 x 5.0, display levels with 0.79 / no 0.786,
+  LS static   : inputs (switch D 0.90 / 4H 0.782, start 0.10, pivots D 20/3 and 4H 60/3, ATR 14 x D 7.0 / 4H 6.0, display levels with 0.79 / no 0.786,
                 per-TF display toggles), exactly two request.security calls ("D" / "240", every output [1] + lookahead_on),
                 confirmed-bar processing, no strategy / entry / alert, logic inside the translated subset, no intrabar-order
                 assumption, no ATR x 3 cumulative initialisation, unadopted candidates never drawn, fixture registration
   LW waves    : the LOGIC SECTION OF THE PINE FILE (translated by tests/acc_pine.py) on hand-made confirmed HTF bars: sample shape
                 (both through 0.782 and through major lows / highs), extension, 0.782 candidate + break = same-direction switch,
                 origin touch vs strict break, first wave from a confirmed major high / low
-  LP major    : spec cases A-K (opposite wave from a confirmed pivot + fixed ATR x 5 without breaking the old origin, symmetric,
+  LP major    : spec cases A-K (opposite wave from a confirmed pivot + fixed ATR x the TF multiplier without breaking the old origin, symmetric,
                 right-side confirmation, ATR boundary / fixed at the extreme bar, own opposite wick not used, same-direction pivot
                 ignored, invalidation / replacement / no double adoption / tie at start, unadopted candidate not shown,
                 switch-end below 100 % in its real bin, no retroactive observation, holds evaluated on every candidate)
@@ -108,6 +108,14 @@ class Run:
             self.n += 1
         return self
 
+    def feedBoth(self, bars):
+        for b in bars:
+            i = self.n
+            v = (b["h"], b["l"], tb(i), b.get("atr", BIG))
+            self.exec(av(i), d=v, h4=v)
+            self.n += 1
+        return self
+
     @property
     def S(self):
         return self.env["lfw4"]
@@ -138,7 +146,7 @@ def neg(bars):
     return [dict(h=-b["l"], l=-b["h"], atr=b.get("atr", BIG), **({"o": -b["o"]} if "o" in b else {})) for b in bars]
 
 
-# BASE (default 4H pivots 60 / 3, ATR x 5):
+# BASE (default 4H pivots 60 / 3, ATR x 6; also valid for the daily defaults 20 / 3, ATR x 7):
 #   60 flat bars (equal highs / lows: never a strict pivot), major low 400 (ATR 10) + 3 rising bars -> first wave up 400 -> 800,
 #   major high 1000 (ATR 10) + 3 falling bars down to 0 -> a NON-first down wave 1000 -> 0 adopted from the major high.
 #   After BASE the retracement ratio of a high h is h / 1000 (other bars carry ATR 1000, so no further pivot is adopted).
@@ -178,11 +186,13 @@ def formal(S, d):
 # ============================================================================
 def gate_static():
     inp = ap.inputs(SRC)
-    want = dict(lfwSwitchRatio=0.782, lfwStartRatio=0.10, lfwAtrLen=14, lfwExclInit=True, lfwPivLD=20, lfwPivRD=3, lfwPivMD=5.0,
-                lfwPivL4=60, lfwPivR4=3, lfwPivM4=5.0, lfwShowD=True, lfwShow4=True, lfwOnD=True, lfwOn4=True)
-    check("LS-01 inputs: switch ratio 0.782, observation start 0.10, ATR 14, pivots D 20 / 3 and 4H 60 / 3, ATR x 5.0 for each, "
+    want = dict(lfwSwitchRatioD=0.90, lfwSwitchRatio4=0.782, lfwStartRatio=0.10, lfwAtrLen=14, lfwExclInit=True, lfwPivLD=20,
+                lfwPivRD=3, lfwPivMD=7.0,
+                lfwPivL4=60, lfwPivR4=3, lfwPivM4=6.0, lfwShowD=True, lfwShow4=True, lfwOnD=True, lfwOn4=True)
+    check("LS-01 inputs: switch ratio D 0.90 / 4H 0.782 (separate, no common one), observation start 0.10, ATR 14, pivots D 20 / 3 "
+          "and 4H 60 / 3, ATR x D 7.0 / 4H 6.0, "
           "first-wave exclusion on, per-TF calculation and display toggles",
-          all(inp.get(k) == v for k, v in want.items()) and "lfwInitAtrMult" not in inp,
+          all(inp.get(k) == v for k, v in want.items()) and "lfwInitAtrMult" not in inp and "lfwSwitchRatio" not in inp,
           str({k: inp.get(k) for k in want}))
     check("LS-02 display levels are 0 / 0.236 / 0.382 / 0.5 / 0.618 / 0.79 / 1 and 0.786 appears nowhere",
           inp["lfwLevelsStr"] == "0,0.236,0.382,0.5,0.618,0.79,1" and "0.786" not in SRC, inp["lfwLevelsStr"])
@@ -213,8 +223,8 @@ def gate_static():
     check("LS-07 no intrabar-order assumption in the logic: the open is not used, every bar is processed in both orders "
           "(high -> low and low -> high) and a difference is kept as a hold, never resolved by a choice",
           not re.search(r"\bopen\b|\bop\b|hiFirst|retFirst", lg)
-          and "bool ca = lfwPoint(a, h, t, availT, false)\n    lfwPoint(a, l, t, availT, ca)" in lg
-          and "bool cb = lfwPoint(b, l, t, availT, false)\n    lfwPoint(b, h, t, availT, cb)" in lg
+          and "bool ca = lfwPoint(a, h, t, availT, false, sw)\n    lfwPoint(a, l, t, availT, ca, sw)" in lg
+          and "bool cb = lfwPoint(b, l, t, availT, false, sw)\n    lfwPoint(b, h, t, availT, cb, sw)" in lg
           and "    if not lfwSame(a, b)\n        array.push(out, b)" in lg)
     draw = SRC[SRC.index("f_draw(LfwTf S"):SRC.index("var array<line>  lfwLnD")]
     check("LS-08 no ATR x 3 cumulative initialisation left (no running highest / lowest pair); the chart drawing uses only the "
@@ -249,7 +259,7 @@ def gate_waves():
     r = Run().feed4(BASE[:IR3 + 1])
     q = base_run([])
     check("LW-00 BASE: the first wave is adopted from the confirmed major low 400 when its 3rd right bar closes (up 400 -> 800, "
-          "first wave, ATR 10 stored); the major high 1000 + a fall of 1000 >= 10 x 5 then gives a NON-first down wave 1000 -> 0",
+          "first wave, ATR 10 stored); the major high 1000 + a fall of 1000 >= 10 x 6 then gives a NON-first down wave 1000 -> 0",
           (r.W.dir, r.W.O, r.W.oT, r.W.E, r.W.eT, r.W.init) == (1, 400, tb(IP1), 800, tb(IR3), True)
           and r.S.initAvail == av(IR3) and r.S.initAtr == 10.0
           and (q.W.dir, q.W.O, q.W.oT, q.W.E, q.W.eT, q.W.init) == (-1, 1000, tb(IP2), 0, tb(ID3), False)
@@ -293,7 +303,7 @@ def gate_waves():
     m = Run().feed4(neg(BASE + [B(782, 500), B(600, -10)])).W
     check("LW-10 up / down symmetry of the 0.782 switch (prices negated): up wave -782 -> 10", (m.dir, m.O, m.E) == (1, -782, 10), str(m))
     n = Run().feed4(fill(70, 510, 500) + [B(505, 400), B(600, 450), B(700, 550), B(800, 650), B(900, 300), B(950, 250)])
-    check("LW-11 no wave while no confirmed major high / low reaches its ATR x 5 move (ATR 1000): no ATR x 3 fallback",
+    check("LW-11 no wave while no confirmed major high / low reaches its ATR x 6 move (ATR 1000): no ATR x 3 fallback",
           n.W.dir == 0 and not n.S.hold and n.S.nAdopt == 0, str(n.W))
 
 
@@ -315,15 +325,15 @@ def gate_major():
     base = Run().feed4(UP)
     check("LP-00 UP fixture: up wave 50 -> 300 (origin far below, never broken in the cases below)",
           (base.W.dir, base.W.O, base.W.E) == (1, 50, 300), str(base.W))
-    # A) a confirmed major high + a fall >= its fixed ATR x 5 adopts a down wave although the old origin 50 is not broken
-    rA = Run().feed4(up_with(B(310, 280, atr=4.0), [B(305, 295), B(300, 291), B(298, 288)]))
-    check("LP-A long rise, then the confirmed major high 310 (ATR 4 -> 20) and a fall to 288 (22 >= 20): new down wave "
-          "310 -> 288 adopted on the 3rd right bar (origin 50 never broken); origin / end times = extreme bars, availability = "
-          "adoption bar", (rA.W.dir, rA.W.O, rA.W.oT, rA.W.E, rA.W.eT) == (-1, 310, tb(NU), 288, tb(NU + 3))
+    # A) a confirmed major high + a fall >= its fixed ATR x 6 (4H) adopts a down wave although the old origin 50 is not broken
+    rA = Run().feed4(up_with(B(310, 280, atr=4.0), [B(305, 295), B(300, 291), B(298, 285)]))
+    check("LP-A long rise, then the confirmed major high 310 (ATR 4 x 6 -> 24) and a fall to 285 (25 >= 24): new down wave "
+          "310 -> 285 adopted on the 3rd right bar (origin 50 never broken); origin / end times = extreme bars, availability = "
+          "adoption bar", (rA.W.dir, rA.W.O, rA.W.oT, rA.W.E, rA.W.eT) == (-1, 310, tb(NU), 285, tb(NU + 3))
           and rA.W.oAvail == av(NU + 3) and rA.W.eAvail == av(NU + 3) and not rA.W.init and rA.S.cHi.adopted, str(rA.W))
-    rB = Run().feed4(neg(up_with(B(310, 280, atr=4.0), [B(305, 295), B(300, 291), B(298, 288)])))
-    check("LP-B symmetric: long fall, confirmed major low -310 and a rise to -288 -> up wave -310 -> -288",
-          (rB.W.dir, rB.W.O, rB.W.E) == (1, -310, -288) and rB.S.cLo.adopted, str(rB.W))
+    rB = Run().feed4(neg(up_with(B(310, 280, atr=4.0), [B(305, 295), B(300, 291), B(298, 285)])))
+    check("LP-B symmetric: long fall, confirmed major low -310 and a rise to -285 -> up wave -310 -> -285",
+          (rB.W.dir, rB.W.O, rB.W.E) == (1, -310, -285) and rB.S.cLo.adopted, str(rB.W))
     # C) right side: the fall is already enough on the 1st right bar, but the candidate exists only after the 3rd
     seqC = up_with(B(310, 300, atr=4.0), [B(305, 280), B(300, 285), B(298, 286)])
     c1 = Run().feed4(seqC[:NU + 2])
@@ -335,11 +345,11 @@ def gate_major():
           and (c3.W.dir, c3.W.O, c3.W.E, c3.W.eT, c3.W.oAvail) == (-1, 310, 280, tb(NU + 1), av(NU + 3)), f"{c2.W} {c3.W}")
     # D) ATR boundary and the ATR fixed at the extreme bar
     res = {}
-    for name, low in (("below", 290.01), ("equal", 290.0), ("above", 289.99)):
+    for name, low in (("below", 286.01), ("equal", 286.0), ("above", 285.99)):
         rr = Run().feed4(up_with(B(310, 300, atr=4.0), [B(305, 296, atr=0.1), B(304, 295, atr=50.0), B(303, low, atr=90.0)]))
         res[name] = (rr.W.dir, rr.S.cHi.thr if rr.S.cHi else None)
-    check("LP-D threshold = ATR of the extreme bar x 5 = 20 (fixed: the right bars' ATR 0.1 / 50 / 90 change nothing): a fall of "
-          "19.99 keeps the up wave, exactly 20 and 20.01 adopt the down wave", res["below"] == (1, 20.0) and res["equal"][0] == -1
+    check("LP-D threshold = ATR of the extreme bar x 6 (4H) = 24 (fixed: the right bars' ATR 0.1 / 50 / 90 change nothing): a fall "
+          "of 23.99 keeps the up wave, exactly 24 and 24.01 adopt the down wave", res["below"] == (1, 24.0) and res["equal"][0] == -1
           and res["above"][0] == -1, str(res))
     # E) the extreme bar's own low is not part of the move
     rE = Run().feed4(up_with(B(310, 250, atr=4.0), [B(305, 296), B(304, 295), B(303, 294)]))
@@ -417,7 +427,7 @@ def gate_major():
     check("LP-K1 on hold (down 1100 -> -100 / up -100 -> 1100), a confirmed major high 650 (+fall 550) is adopted only by the up "
           "candidate (the down candidate ignores a same-direction pivot): the two candidates still differ -> still on hold, "
           "nothing chosen", k.S.hold and hy == [(-1, 650, 100), (-1, 1100, -100)], str(hy))
-    vs = [Run().feed4(up_with(B(310, 280, o=o, atr=4.0), [B(305, 295, o=o2), B(300, 291), B(298, 288)]))
+    vs = [Run().feed4(up_with(B(310, 280, o=o, atr=4.0), [B(305, 295, o=o2), B(300, 291), B(298, 285)]))
           for o, o2 in ((309, 304), (281, 296), (295, 300))]
     check("LP-K2 moving only the opens changes nothing in an adoption", all(pine_tuple(v.S) == pine_tuple(vs[0].S) for v in vs))
     kb0 = base_run([B(300, 100), B(1100, -100), B(600, 200), B(500, 250), B(650, 300, atr=10.0), B(600, 100), B(1200, 150)], ov)
@@ -551,7 +561,7 @@ def gate_obs():
           not r.recs() and r.S.nExclInit == 1 and len(q.recs()) == 1 and q.S.nExclInit == 0 and q.recs()[0].outcome == 2
           and q.recs()[0].dir == 1 and not r.W.init, str(q.recs()))
     r = Run({"lfwStartRatio": 0.3}).feed4(BASE + [B(250, 100), B(299, 100)])
-    s2 = Run({"lfwSwitchRatio": 0.5}).feed4(BASE + [B(500, 100), B(300, -1)])
+    s2 = Run({"lfwSwitchRatio4": 0.5}).feed4(BASE + [B(500, 100), B(300, -1)])
     check("LO-14 the start ratio and the switch ratio are inputs (start 0.3: 29.9 % no observation; switch 0.5: 50 % + new low switches)",
           not r.S.obsOn and s2.W.O == 500, f"{r.S} {s2.W}")
     r = base_run([B(300, 100), B(250, 0)])
@@ -570,7 +580,7 @@ def gate_obs():
 # wave = (dir, init, O, oT, E, eT, ret, retT); ret = most retraced price since the end (down: highest high, up: lowest low)
 # candidate = dict(k, p, t, atr, thr, ext, extT, ret, retT, used)
 class Ref:
-    def __init__(self, sw=0.782, st=0.10, excl=True, left=60, right=3, mult=5.0):
+    def __init__(self, sw=0.782, st=0.10, excl=True, left=60, right=3, mult=6.0):
         self.sw, self.st, self.excl, self.left, self.right, self.mult = sw, st, excl, left, right, mult
         self.wave = None
         self.hold = None
@@ -860,7 +870,7 @@ def run_ref(bars, **kw):
 
 
 SETS = [({}, {}),
-        ({"lfwSwitchRatio": 0.5, "lfwStartRatio": 0.2}, {"sw": 0.5, "st": 0.2}),
+        ({"lfwSwitchRatio4": 0.5, "lfwStartRatio": 0.2}, {"sw": 0.5, "st": 0.2}),
         ({"lfwExclInit": False}, {"excl": False}),
         ({"lfwPivL4": 5, "lfwPivR4": 2, "lfwPivM4": 3.0}, {"left": 5, "right": 2, "mult": 3.0}),
         ({"lfwPivL4": 12, "lfwPivR4": 1, "lfwPivM4": 8.0}, {"left": 12, "right": 1, "mult": 8.0})]
@@ -1045,6 +1055,50 @@ def gate_chart():
 
 
 # ============================================================================
+# per-timeframe settings (switch ratio D 0.90 / 4H 0.782, ATR multiplier D 7.0 / 4H 6.0)
+# ============================================================================
+def gate_tf():
+    d848 = Run().feedD(BASE + [B(848, 500), B(600, -10)]).env["lfwD"].w
+    d900 = Run().feedD(BASE + [B(900, 500), B(600, -10)]).env["lfwD"].w
+    check("LT-01 daily: a new low after an 84.8 % rally does NOT switch the origin (daily switch ratio 0.90): down 1000 -> -10 "
+          "extended; exactly 90 % then a new low switches to 900",
+          (d848.dir, d848.O, d848.oT, d848.E) == (-1, 1000, tb(IP2), -10) and (d900.dir, d900.O, d900.E) == (-1, 900, -10),
+          f"{d848} {d900}")
+    h797 = Run().feed4(BASE + [B(797, 500), B(600, -10)]).W
+    h781 = Run().feed4(BASE + [B(781, 500), B(600, -10)]).W
+    check("LT-02 4H as before: a new low after a 79.7 % rally switches the origin to 797 (4H switch ratio 0.782); 78.1 % extends",
+          (h797.dir, h797.O, h797.oT, h797.E) == (-1, 797, tb(X(0)), -10) and h781.O == 1000, f"{h797} {h781}")
+    both = Run().feedBoth(BASE + [B(848, 500), B(600, -10)])
+    sw = Run({"lfwSwitchRatioD": 0.782, "lfwSwitchRatio4": 0.90}).feedBoth(BASE + [B(848, 500), B(600, -10)])
+    d4 = both.env["lfw4"].diag
+    check("LT-03 the same bars on both time frames in one run: daily keeps 1000 (0.848 < 0.90) while 4H switches to 848 "
+          "(0.848 >= 0.782); swapping the two inputs swaps the results (no ratio leaks into the other time frame); the 4H "
+          "diagnostic records the 4H ratio 0.782 it used",
+          both.env["lfwD"].w.O == 1000 and both.env["lfw4"].w.O == 848 and sw.env["lfwD"].w.O == 848 and sw.env["lfw4"].w.O == 1000
+          and both.env["lfwD"].sw == 0.90 and both.env["lfw4"].sw == 0.782 and d4[-1].why == 3 and d4[-1].sw == 0.782
+          and abs(d4[-1].ratio - 0.848) < 1e-12 and len(both.env["lfwD"].diag) == 2, "")
+    pre = BASE + fill(60, 90, 50) + [B(60, 20, atr=10.0)]
+
+    def rise(top):          # 3 right bars after the major low 20 (ATR 10); highest high = top
+        return [B(top - 17.2 if top > 80 else top - 10, 30), B(top - 7.2 if top > 80 else top - 5, 40), B(top, 50)]
+    res = {}
+    for k, top in (("d672", 87.2), ("d700", 90.0), ("h572", 77.2), ("h600", 80.0)):
+        r = Run().feedBoth(pre + rise(top))
+        res[k] = (r.env["lfwD"].w.dir, r.env["lfw4"].w.dir)
+    check("LT-04 rise from a confirmed major low 20 with ATR 10: daily needs 7.0 ATR (70) -> a 6.72 ATR rise (67.2) adopts nothing, "
+          "70 adopts the up wave; 4H needs 6.0 ATR (60) -> a 5.72 ATR rise (57.2) adopts nothing, 60 adopts",
+          res["d672"][0] == -1 and res["d700"][0] == 1 and res["h572"][1] == -1 and res["h600"][1] == 1, str(res))
+    th = Run().feedBoth(pre + rise(90.0))
+    check("LT-05 the required move is the extreme bar's ATR x the time frame's own multiplier (daily 70, 4H 60), in the candidates "
+          "and in the diagnostics", th.env["lfwD"].cLo is not None and th.env["lfwD"].cLo.thr == 70.0
+          and th.env["lfw4"].cLo.thr == 60.0 and th.env["lfwD"].diag[-1].thr == 70.0 and th.env["lfw4"].diag[-1].thr == 60.0, "")
+    draw = SRC[SRC.index("f_draw(LfwTf S"):]
+    check("LT-06 drawing, state table and diagnostics read the time frame's own ratio (S.sw / the recorded d.sw); no common switch "
+          "ratio and no fixed '78.2%' label remain", "lfwSwitchRatio " not in SRC and "lfwSwitchRatio)" not in SRC
+          and "rr >= S.sw" in draw and "(rr >= S.sw ?" in draw and "d.sw * 100" in draw and "78.2% 同方向切替" not in SRC, "")
+
+
+# ============================================================================
 # diagnostics (origin / direction changes)
 # ============================================================================
 def dg(S):
@@ -1057,13 +1111,13 @@ def gate_diag():
     check("LD-01 first wave: one record, reason 'first wave (major high / low)', before = no wave, after = up 400 (its bar) -> 800, "
           "known at the adoption bar; candidate extreme time, fixed ATR 10, required 50, actual move 400",
           len(d) == 1 and (d[0].why, d[0].bDir, d[0].aDir, d[0].aO, d[0].aOT, d[0].aE, d[0].avail) == (1, 0, 1, 400, tb(IP1), 800, av(IR3))
-          and (d[0].candT, d[0].atr, d[0].thr, d[0].move) == (tb(IP1), 10.0, 50.0, 400), str(d))
+          and (d[0].candT, d[0].atr, d[0].thr, d[0].move) == (tb(IP1), 10.0, 60.0, 400), str(d))
     q = base_run([])
     d = q.S.diag
     check("LD-02 the bar that both breaks the up wave's origin and confirms the major high records the branch actually taken: "
           "'major high / low adoption' (not origin break), before up 400 -> 1000, after down 1000 -> 0, ATR 10 / required 50 / move 1000",
           len(d) == 2 and (d[1].why, d[1].bDir, d[1].bO, d[1].bE, d[1].aDir, d[1].aO, d[1].aOT, d[1].aE) == (2, 1, 400, 1000, -1, 1000, tb(IP2), 0)
-          and (d[1].candT, d[1].atr, d[1].thr, d[1].move, d[1].avail) == (tb(IP2), 10.0, 50.0, 1000, av(ID3)), str(d[-1:]))
+          and (d[1].candT, d[1].atr, d[1].thr, d[1].move, d[1].avail) == (tb(IP2), 10.0, 60.0, 1000, av(ID3)), str(d[-1:]))
     a = base_run([B(782, 500), B(600, -10)]).S.diag
     check("LD-03 0.782 switch: reason '78.2 % same-direction switch' with the ratio used (0.782), before down 1000 -> 0, after down "
           "782 (the rally bar) -> -10, known at the break bar",
@@ -1088,10 +1142,10 @@ def gate_diag():
     check("LD-07 a hold whose candidates had different routes (one by a 0.782 switch, one by an origin break) is released by a bar "
           "above both origins: recorded once at the release, route = origin break of that bar (up -150 -> 1200)",
           len(k2) == 3 and k2[2].viaHold and (k2[2].why, k2[2].aDir, k2[2].aO, k2[2].aE) == (4, 1, -150, 1200), str(k2[-1:]))
-    rA = Run().feed4(up_with(B(310, 280, atr=4.0), [B(305, 295), B(300, 291), B(298, 288)])).S.diag
+    rA = Run().feed4(up_with(B(310, 280, atr=4.0), [B(305, 295), B(300, 291), B(298, 285)])).S.diag
     check("LD-08 opposite-wave adoption without breaking the old origin: reason 'major high / low adoption', candidate extreme "
-          "time = the 310 bar, fixed ATR 4, required 20, actual move 22",
-          len(rA) == 2 and (rA[1].why, rA[1].candT, rA[1].atr, rA[1].thr, rA[1].move) == (2, tb(NU), 4.0, 20.0, 22), str(rA[-1:]))
+          "time = the 310 bar, fixed ATR 4, required 24 (x 6), actual move 25",
+          len(rA) == 2 and (rA[1].why, rA[1].candT, rA[1].atr, rA[1].thr, rA[1].move) == (2, tb(NU), 4.0, 24.0, 25), str(rA[-1:]))
     rD = Run().feedD(BASE)
     check("LD-09 daily and 4H records are separate", len(rD.env["lfwD"].diag) == 2 and len(rD.env["lfw4"].diag) == 0)
     # random series: the records are exactly the last 10 changes of the confirmed wave, with consistent reasons
@@ -1141,7 +1195,10 @@ def gate_diag():
 # mutation
 # ============================================================================
 MUTATIONS = [
-    ("switch >= -> >", "if not na(w.rx) and lfwRatio(w, w.rx) >= lfwSwitchRatio", "if not na(w.rx) and lfwRatio(w, w.rx) > lfwSwitchRatio"),
+    ("switch >= -> >", "if not na(w.rx) and lfwRatio(w, w.rx) >= sw\n", "if not na(w.rx) and lfwRatio(w, w.rx) > sw\n"),
+    ("daily uses the 4H switch ratio", "lfwNewTf(lfwPivLD, lfwPivRD, lfwPivMD, lfwSwitchRatioD)", "lfwNewTf(lfwPivLD, lfwPivRD, lfwPivMD, lfwSwitchRatio4)"),
+    ("4H uses the daily switch ratio", "lfwNewTf(lfwPivL4, lfwPivR4, lfwPivM4, lfwSwitchRatio4)", "lfwNewTf(lfwPivL4, lfwPivR4, lfwPivM4, lfwSwitchRatioD)"),
+    ("daily uses the 4H multiplier", "lfwNewTf(lfwPivLD, lfwPivRD, lfwPivMD, lfwSwitchRatioD)", "lfwNewTf(lfwPivLD, lfwPivRD, lfwPivM4, lfwSwitchRatioD)"),
     ("start >= -> >", "if not S.obsOn and not S.obsDone and rNow >= lfwStartRatio", "if not S.obsOn and not S.obsDone and rNow > lfwStartRatio"),
     ("touch = 99.9 %", "                if S.obsOn and T\n", "                if S.obsOn and rBar >= 0.999\n"),
     ("origin break >=", "    else if s * (w.O - p) > 0\n", "    else if s * (w.O - p) >= 0\n"),
@@ -1149,7 +1206,7 @@ MUTATIONS = [
     ("switch origin = old origin", "            w.O := w.rx\n            w.oT := w.rxT\n", "            w.O := w.O\n            w.oT := w.oT\n"),
     ("unknown on any higher high", "lfwBin(rBar) != lfwBin(rPrior))", "rBar != rPrior)"),
     ("order assumed (high first)", "    if not lfwSame(a, b)\n        array.push(out, b)\n", "    if false\n        array.push(out, b)\n"),
-    ("retracement after an end change used", "    lfwPoint(a, l, t, availT, ca)\n", "    lfwPoint(a, l, t, availT, false)\n"),
+    ("retracement after an end change used", "    lfwPoint(a, l, t, availT, ca, sw)\n", "    lfwPoint(a, l, t, availT, false, sw)\n"),
     ("init not excluded", "S.obsInit := S.w.init and lfwExclInit", "S.obsInit := false"),
     ("full keeps observing", "                    S.obsDone := true\n", "                    S.obsDone := false\n"),
     ("hold entry not recorded", "            if S.obsOn\n                lfwRecord(S, 4, rPrior, rBar, availT)\n            S.hold := true\n",
@@ -1179,8 +1236,8 @@ MUTATIONS = [
     ("diag: before / after swapped", "            if newWave\n                lfwLog(S, w, nw, availT, false)\n",
      "            if newWave\n                lfwLog(S, nw, w, availT, false)\n"),
     ("diag: hold release not flagged", "        lfwLog(S, S.w, nw, availT, true)\n", "        lfwLog(S, S.w, nw, availT, false)\n"),
-    ("hold ignores adoption", "    LfwWave a = lfwAdopt(S, w, availT)\n    if not na(a)\n        array.push(out, a)\n    else\n        lfwBarStep(w, h, l, t, availT, out)\n",
-     "    lfwBarStep(w, h, l, t, availT, out)\n"),
+    ("hold ignores adoption", "    LfwWave a = lfwAdopt(S, w, availT)\n    if not na(a)\n        array.push(out, a)\n    else\n        lfwBarStep(w, h, l, t, availT, out, S.sw)\n",
+     "    lfwBarStep(w, h, l, t, availT, out, S.sw)\n"),
 ]
 
 
@@ -1195,7 +1252,7 @@ def gate_mutation():
                 continue
             SRC_OVERRIDE = SRC.replace(old, new)
             RESULTS = []
-            for g in (gate_waves, gate_major, gate_hold, gate_obs, gate_diag):
+            for g in (gate_waves, gate_major, gate_hold, gate_obs, gate_tf, gate_diag):
                 try:
                     g()
                 except Exception:      # noqa: BLE001
@@ -1206,13 +1263,13 @@ def gate_mutation():
                 missed.append(name)
     finally:
         SRC_OVERRIDE, RESULTS = None, keep
-    check(f"LM-01 every one of {len(MUTATIONS)} mutations of the Pine logic makes at least one LW / LP / LH / LO / LD check fail",
+    check(f"LM-01 every one of {len(MUTATIONS)} mutations of the Pine logic makes at least one LW / LP / LH / LO / LT / LD check fail",
           caught == len(MUTATIONS) and not missed, str(missed))
 
 
 def main():
     only = sys.argv[1:]
-    gates = (gate_static, gate_waves, gate_major, gate_hold, gate_obs, gate_diag, gate_random, gate_chart, gate_mutation)
+    gates = (gate_static, gate_waves, gate_major, gate_hold, gate_obs, gate_tf, gate_diag, gate_random, gate_chart, gate_mutation)
     for g in gates:
         if only and g.__name__ not in only:
             continue
