@@ -23,6 +23,7 @@
 Evidence class: PINE_NOT_VERIFIED (TradingView compile / request.security / drawing not reproduced).
 """
 import copy
+import subprocess
 import os
 import random
 import re
@@ -70,6 +71,10 @@ def av(i):
 # runner : executes the translated logic section once per chart execution
 # ============================================================================
 class Run:
+    """LFW-6: the logic section defines the types / functions; the per-TF state is the f_lfwCore var inside request.security.
+    Here each TF has its own LfwTf (lfwNewTf with that TF's inputs) and each of its confirmed bars is processed once, in order
+    (what f_lfwCore does inside request.security, one target-TF bar per execution)."""
+
     def __init__(self, overrides=None, src=None):
         self.src = src if src is not None else (SRC_OVERRIDE or SRC)
         self.code = compile(transpile(self.src), "<LongFibWave logic>", "exec")
@@ -81,18 +86,22 @@ class Run:
         self.env = ap.make_env(ap.Broker(), [])
         self.env.update(inp)
         self.env.update(_VARS=set(), _VARIPS=set(), __first__=True)
+        exec(self.code, self.env)      # types and functions
+        e = self.env
+        # each TF's state is made with the inputs its request.security call passes to f_lfwCore (read from the source)
+        for tf, key in (("D", "lfwD"), ("240", "lfw4")):
+            m = re.search(r'request\.security\(syminfo\.tickerid, "' + tf + r'",\s*f_lfwCore\((\w+), (\w+), (\w+), (\w+), ', self.src)
+            e[key] = e["lfwNewTf"](*(e[m.group(k)] for k in (1, 2, 3, 4)))
         self.n = 0
 
     def exec(self, avail, d=None, h4=None):
-        """one confirmed chart execution; d / h4 = (h, l, t, atr) of a newly delivered confirmed HTF bar or None."""
+        """one processing step; d / h4 = (h, l, t, atr) of a confirmed bar of that TF (or None); avail = its availability time."""
         e = self.env
         e["time_close"] = avail
-        e["lfwNewD"], e["lfwNew4"] = d is not None, h4 is not None
-        for k, v in (("D", d), ("4", h4)):
-            hh, ll, tt, aa = v if v is not None else (None,) * 4
-            e[f"lfw{k}h"], e[f"lfw{k}l"], e[f"lfw{k}t"], e[f"lfw{k}atr"] = hh, ll, tt, aa
-        exec(self.code, e)
-        e["__first__"] = False
+        if d is not None:
+            e["lfwProcess"](e["lfwD"], d[0], d[1], d[2], d[3], avail)
+        if h4 is not None:
+            e["lfwProcess"](e["lfw4"], h4[0], h4[1], h4[2], h4[3], avail)
 
     def feed4(self, bars):
         for b in bars:
@@ -196,21 +205,31 @@ def gate_static():
           str({k: inp.get(k) for k in want}))
     check("LS-02 display levels are 0 / 0.236 / 0.382 / 0.5 / 0.618 / 0.79 / 1 and 0.786 appears nowhere",
           inp["lfwLevelsStr"] == "0,0.236,0.382,0.5,0.618,0.79,1" and "0.786" not in SRC, inp["lfwLevelsStr"])
-    sec = re.findall(r"^\[[^\n]*= request\.security\(([^\n]+)\)$", SRC, re.M)
-    good = len(sec) == 2 and '"D"' in sec[0] and '"240"' in sec[1] and all(
-        "lookahead = barmerge.lookahead_on" in s and s.count("[1]") == 4 and "open" not in s for s in sec)
-    check("LS-03 exactly two request.security calls (D / 240), each output [1] with lookahead_on (confirmed bars only); "
-          "high / low / time / ATR only (the open is not requested)",
-          good and "request.security_lower_tf" not in SRC, str(sec))
-    gate = all(re.search(rf"lfwNew{k} = lfwOk{k} and barstate\.isconfirmed and not na\(lfw{k}t\) and \(lfwSame{k} or "
-                         rf"lfw{k}tS != nz\(lfw{k}tS\[1\], -1\)\)", SRC) for k in ("D", "4"))
-    sel = all(f"lfw{k}{f}{' ' * (4 - len(f))}= lfwSame{k} ? {v}{' ' * (9 - len(v))}: lfw{k}{f}S" in SRC
-              for k in ("D", "4") for f, v in (("h", "high"), ("l", "low"), ("t", "time"), ("atr", "lfwAtrC")))
-    check("LS-04 a confirmed HTF bar is processed once, on a confirmed chart execution, only when the chart TF <= the target TF; "
-          "chart TF == target TF uses the chart bar itself at its close, otherwise the [1] delivery",
-          gate and sel and "lfwOkD = lfwOnD and lfwChartSec <= timeframe.in_seconds(\"D\")" in SRC
-          and "lfwOk4 = lfwOn4 and lfwChartSec <= timeframe.in_seconds(\"240\")" in SRC
-          and 'lfwSameD = lfwChartSec == timeframe.in_seconds("D")' in SRC and 'lfwSame4 = lfwChartSec == timeframe.in_seconds("240")' in SRC)
+    # LFW-6: the waves are computed inside request.security (one call per TF, its own state), results offset 1 for a lower chart TF
+    sec = re.findall(r'^\[(\w+), (\w+), (\w+), (\w+), (\w+), (\w+), (\w+)\] = request\.security\(syminfo\.tickerid, "(D|240)",\n'
+                     r'     f_lfwCore\((\w+), (\w+), (\w+), (\w+), (\w+), (lfwSame[D4]) \? 0 : 1\), lookahead = barmerge\.lookahead_on\)$', SRC, re.M)
+    core = SRC[SRC.index("f_lfwCore(int pl"):SRC.index("[lfwHdS")]
+    good = (len(sec) == 2 and [x[7] for x in sec] == ["D", "240"]
+            and sec[0][8:14] == ("lfwPivLD", "lfwPivRD", "lfwPivMD", "lfwSwitchRatioD", "lfwOkD", "lfwSameD")
+            and sec[1][8:14] == ("lfwPivL4", "lfwPivR4", "lfwPivM4", "lfwSwitchRatio4", "lfwOk4", "lfwSame4")
+            and re.sub(r"//.*", "", SRC).count("request.security(") == 2 and "    var LfwTf S = lfwNewTf(pl, pr, pm, sw)\n" in core
+            and "        lfwProcess(S, high, low, time, atr, time_close)\n" in core and "    float atr = ta.atr(lfwAtrLen)\n" in core
+            and "    [vHold[off], vDir[off], vO[off], vE[off], vId[off], pPrev, pCur]" in core
+            and "barstate.isconfirmed" not in core and "bar_index" not in re.sub(r"//.*", "", SRC) and "high[1]" not in SRC
+            and "low[1]" not in SRC)
+    check("LS-03 the waves are computed inside the target TF (LFW-6): exactly two request.security calls (D / 240), each running f_lfwCore "
+          "with that TF's own inputs and its own var state (no shared state), the TF's high / low / time / ATR / time_close in its own "
+          "history order; numeric results offset by 1 bar for a lower chart TF (0 when chart TF == target TF), lookahead_on; no "
+          "barstate.isconfirmed inside the request, no OHLC request on the chart side, no bar_index anywhere",
+          good, str(sec))
+    recv = SRC[SRC.index("if barstate.isconfirmed\n    lfwHoldD := nz(lfwHdS)"):SRC.index("// ---------------------------------------------------------------- display helpers")]
+    check("LS-04 the chart side only receives: lfwOk* (chart TF <= target TF) gates the calculation, the received values are taken on a "
+          "confirmed chart bar (no switch on an unconfirmed bar), the final-state arrays are kept from the last target-TF bar (before its "
+          "processing for a lower chart TF, after it for the same TF); the old chart-side wave assembly (lfwNew*, lfwProcess on the chart) is gone",
+          "lfwOkD = lfwOnD and lfwChartSec <= timeframe.in_seconds(\"D\")" in SRC and "lfwOk4 = lfwOn4 and lfwChartSec <= timeframe.in_seconds(\"240\")" in SRC
+          and 'lfwSameD = lfwChartSec == timeframe.in_seconds("D")' in SRC and 'lfwSame4 = lfwChartSec == timeframe.in_seconds("240")' in SRC
+          and "array<float> pkD = lfwSameD ? lfwPcD : lfwPpD" in recv and "array<float> pk4 = lfwSame4 ? lfwPc4 : lfwPp4" in recv
+          and "lfwNew" not in SRC.replace("lfwNewTf", "") and SRC.count("lfwProcess(S, ") == 1 and "lfwProcess(lfw" not in SRC)
     check("LS-05 indicator only: no strategy / order / alert calls, no Zone / Engine import",
           SRC.count("indicator(") == 1 and not re.search(r"strategy\.|alertcondition|alert\(|^import ", SRC, re.M))
     try:
@@ -1196,9 +1215,9 @@ def gate_diag():
 # ============================================================================
 MUTATIONS = [
     ("switch >= -> >", "if not na(w.rx) and lfwRatio(w, w.rx) >= sw\n", "if not na(w.rx) and lfwRatio(w, w.rx) > sw\n"),
-    ("daily uses the 4H switch ratio", "lfwNewTf(lfwPivLD, lfwPivRD, lfwPivMD, lfwSwitchRatioD)", "lfwNewTf(lfwPivLD, lfwPivRD, lfwPivMD, lfwSwitchRatio4)"),
-    ("4H uses the daily switch ratio", "lfwNewTf(lfwPivL4, lfwPivR4, lfwPivM4, lfwSwitchRatio4)", "lfwNewTf(lfwPivL4, lfwPivR4, lfwPivM4, lfwSwitchRatioD)"),
-    ("daily uses the 4H multiplier", "lfwNewTf(lfwPivLD, lfwPivRD, lfwPivMD, lfwSwitchRatioD)", "lfwNewTf(lfwPivLD, lfwPivRD, lfwPivM4, lfwSwitchRatioD)"),
+    ("daily uses the 4H switch ratio", "f_lfwCore(lfwPivLD, lfwPivRD, lfwPivMD, lfwSwitchRatioD,", "f_lfwCore(lfwPivLD, lfwPivRD, lfwPivMD, lfwSwitchRatio4,"),
+    ("4H uses the daily switch ratio", "f_lfwCore(lfwPivL4, lfwPivR4, lfwPivM4, lfwSwitchRatio4,", "f_lfwCore(lfwPivL4, lfwPivR4, lfwPivM4, lfwSwitchRatioD,"),
+    ("daily uses the 4H multiplier", "f_lfwCore(lfwPivLD, lfwPivRD, lfwPivMD, lfwSwitchRatioD,", "f_lfwCore(lfwPivLD, lfwPivRD, lfwPivM4, lfwSwitchRatioD,"),
     ("start >= -> >", "if not S.obsOn and not S.obsDone and rNow >= lfwStartRatio", "if not S.obsOn and not S.obsDone and rNow > lfwStartRatio"),
     ("touch = 99.9 %", "                if S.obsOn and T\n", "                if S.obsOn and rBar >= 0.999\n"),
     ("origin break >=", "    else if s * (w.O - p) > 0\n", "    else if s * (w.O - p) >= 0\n"),
@@ -1267,9 +1286,170 @@ def gate_mutation():
           caught == len(MUTATIONS) and not missed, str(missed))
 
 
+# ============================================================================
+# LFW-6 : the calculation inside the target TF (request.security) — core, transfer to the chart, feed
+# ============================================================================
+PRE_CORE = "00ea19b"     # LongFibWave.pine before LFW-6 (chart-side wave assembly from the received OHLC)
+
+
+class OldRun:
+    """the pre-LFW-6 file: its logic section ends with the chart-side driver (lfwNewD / lfwNew4 -> lfwProcess(lfwD / lfw4, …))"""
+
+    def __init__(self, src, overrides=None):
+        self.code = compile(transpile(src), "<LongFibWave logic (old)>", "exec")
+        inp = ap.inputs(src)
+        inp.update(overrides or {})
+        self.env = ap.make_env(ap.Broker(), [])
+        self.env.update(inp)
+        self.env.update(_VARS=set(), _VARIPS=set(), __first__=True)
+
+    def exec(self, avail, d=None, h4=None):
+        e = self.env
+        e["time_close"] = avail
+        e["lfwNewD"], e["lfwNew4"] = d is not None, h4 is not None
+        for k, v in (("D", d), ("4", h4)):
+            hh, ll, tt, aa = v if v is not None else (None,) * 4
+            e[f"lfw{k}h"], e[f"lfw{k}l"], e[f"lfw{k}t"], e[f"lfw{k}atr"] = hh, ll, tt, aa
+        exec(self.code, e)
+        e["__first__"] = False
+
+
+def core_run(**ov):
+    """Run (logic) + the Transfer block (lfwPack / lfwUnpack) + the feed functions (f_fibState / f_fibFeed)"""
+    r = Run(ov)
+    tr = SRC[SRC.index("// ==== LFW Transfer (begin)"):SRC.index("// ==== LFW Transfer (end)")]
+    fb = SRC[SRC.index("// ==== LFW Feed (begin)"):SRC.index("var array<float> lfwFeedD")]
+    # translated together with the logic section (the UDT names are known to the translator from its type blocks)
+    exec(compile(ap.Translator().translate(ap.logical_lines(logic(SRC) + tr + "\n" + fb)), "<LongFibWave logic + transfer + feed>", "exec"), r.env)
+    return r
+
+
+def full_state(S):
+    """everything the waves / statistics / diagnostics consist of (pine_tuple + diagnostics + counts + processing range)"""
+    dg = [tuple(getattr(d, f) for f in d._fields) for d in S.diag]
+    return (pine_tuple(S), dg, list(S.cnt), S.firstT, S.nBars, S.holdAvail, S.initAvail, S.initAtr, S.nReinit, S.obsSeq, S.obsInit, S.obsDir)
+
+
+def view(S):
+    """what the drawing / tables read (the fields lfwPack transfers)"""
+    w = S.w
+    return (S.hold, [(h.O, h.oT, h.E, h.eT) for h in S.hyps], S.holdAvail, (w.dir, w.init, w.O, w.oT, w.oAvail, w.E, w.eT, w.eAvail, w.rx, w.rxT),
+            S.waveId, S.sw, S.obsOn, S.obsInit, S.obsSeq, S.obsDir,
+            [None if c is None else (c.p, c.adopted, c.ext, c.thr) for c in (S.cHi, S.cLo)], S.initAvail, S.initAtr,
+            (S.nAdopt, S.nHold, S.nNoRetro, S.nStartAmb, S.nReinit), list(S.nWaveObs), S.nExclInit, S.nBars, S.firstT, list(S.cnt),
+            [tuple(getattr(d, f) for f in d._fields) for d in S.diag])
+
+
+def gate_core():
+    old_src = subprocess.run(["git", "-C", ROOT, "show", f"{PRE_CORE}:LongFibWave.pine"], capture_output=True, text=True).stdout
+    ser4 = [rand_series(31 + k, n=700) for k in range(3)]
+    serD = [rand_series(41 + k, n=500) for k in range(3)]
+    bar = lambda b, i: (b["h"], b["l"], tb(i), b["atr"] if b["atr"] is not None else BIG)
+    # 1. before / after on the same TF data from the same start: every state after every bar identical
+    bad = []
+    for k in range(3):
+        o, n = OldRun(old_src, {"lfwMaxRecs": 100000}), Run({"lfwMaxRecs": 100000})
+        for i, (b4, bd) in enumerate(zip(ser4[k], serD[k] + [None] * 700)):
+            dv = bar(bd, i) if bd is not None else None
+            o.exec(av(i), d=dv, h4=bar(b4, i))
+            n.exec(av(i), d=dv, h4=bar(b4, i))
+            if full_state(o.env["lfw4"]) != full_state(n.env["lfw4"]) or full_state(o.env["lfwD"]) != full_state(n.env["lfwD"]):
+                bad.append((k, i))
+                break
+    check("LK-01 before / after LFW-6 (same target-TF bars from the same start): after every bar the 4H and daily states are identical "
+          "(wave, hold candidates, wave ID, major candidates, observations / records, counts, diagnostics, processing start and count); "
+          "3 random series x 700 4H + 500 D bars",
+          not bad, str(bad))
+    # 2 / 3. chart TF equivalence: the target-TF calculation does not depend on the chart. The request.security context runs the same
+    # target-TF history in order whatever the chart; a lower chart TF receives the result offset by 1 (after bar k-1 while bar k forms),
+    # the same TF the result at the bar's close. Compared at the same confirmed target-TF bar with its start / count / last bar
+    def deliver(series, chart_rel):
+        r = Run({"lfwMaxRecs": 100000})
+        out = []
+        for i, b in enumerate(series):
+            r.exec(tb(i) + H4, h4=bar(b, i))
+            S = r.env["lfw4"]
+            out.append((S.firstT, S.nBars, i, full_state(S)))   # state after confirmed bar i
+        if chart_rel == "lower":
+            return {k: out[k] for k in range(len(series) - 1)}  # seen during bar k + 1 (offset 1)
+        return {k: out[k] for k in range(len(series))}          # same TF: at bar k's close
+    eq = []
+    for k in range(3):
+        a, b2 = deliver(ser4[k], "lower"), deliver(ser4[k], "same")
+        eq.append(all(a[i] == b2[i] for i in a) and all(a[i][0] == tb(0) and a[i][1] == i + 1 for i in a))
+    # the problem fixed: the old chart-side assembly started at the chart's first bar; two charts with different history start ->
+    # different waves (the new calculation starts at the target TF's own history in both)
+    o1, o2 = OldRun(old_src), OldRun(old_src)
+    for i, b in enumerate(ser4[0]):
+        o1.exec(av(i), h4=bar(b, i))
+        if i >= 150:
+            o2.exec(av(i), h4=bar(b, i))
+    diff_old = wtuple(o1.env["lfw4"].w) != wtuple(o2.env["lfw4"].w) or o1.env["lfw4"].waveId != o2.env["lfw4"].waveId
+    check("LK-02 chart TF equivalence (model of the request.security context): the 4H result reached for the same confirmed 4H bar is the "
+          "same on a 5m / 1H-like lower chart (offset 1) and on a 4H chart (its close), incl. processing start = the first 4H bar, count "
+          "= bars processed, last processed bar; (the daily core is the same function with its own inputs, LC-04). With the old "
+          "chart-side assembly a chart whose history starts 150 bars later gets another wave (the reported symptom)",
+          all(eq) and diff_old, f"{eq} {diff_old}")
+    # 4. independence of D and 4H
+    r_both, r_d, r_4 = Run({"lfwMaxRecs": 100000}), Run({"lfwMaxRecs": 100000}), Run({"lfwMaxRecs": 100000})
+    for i in range(500):
+        dv, hv = bar(serD[1][i], i), bar(ser4[1][i], i)
+        r_both.exec(av(i), d=dv, h4=hv)
+        r_d.exec(av(i), d=dv)
+        r_4.exec(av(i), h4=hv)
+    check("LK-03 daily and 4H are independent: processed together each TF's state == its state processed alone (no shared state, no "
+          "copy between them); on this input the two waves differ (not forced)",
+          full_state(r_both.env["lfwD"]) == full_state(r_d.env["lfwD"]) and full_state(r_both.env["lfw4"]) == full_state(r_4.env["lfw4"])
+          and wtuple(r_both.env["lfwD"].w) != wtuple(r_both.env["lfw4"].w) and r_both.env["lfwD"].pL == 20 and r_both.env["lfw4"].pL == 60)
+    # 5 / 6. transfer: pPrev = the state before the forming bar is processed, unchanged by the forming bar's values; pack -> unpack gives
+    # back every displayed field; the drawn origin / end == the per-bar values the FIB feed reads at the same bar
+    c = core_run(lfwMaxRecs=100000)
+    e = c.env
+    bad5, bad6, n6 = [], [], 0
+    for i, b in enumerate(ser4[2][:400]):
+        S = e["lfw4"]
+        prev = list(e["lfwPack"](S))
+        for var in ((b["h"], b["l"]), (b["h"] + 50, b["l"]), (b["h"], b["l"] - 50)):
+            S2 = copy.deepcopy(S)
+            p2 = list(e["lfwPack"](S2))
+            e["lfwProcess"](S2, var[0], var[1], tb(i), b["atr"] if b["atr"] is not None else BIG, tb(i) + H4)
+            if p2 != prev:
+                bad5.append(i)
+        c.exec(tb(i) + H4, h4=bar(b, i))
+        S = e["lfw4"]
+        U = e["lfwUnpack"](e["lfwPack"](S), 60, 3, 6.0, 0.782)
+        if view(U) != view(S):
+            bad6.append(("unpack", i))
+        hold, dr, O, E, wid = 1.0 if S.hold else 0.0, S.w.dir, S.w.O, S.w.E, S.waveId
+        fd = [None] * 6
+        e["f_fibFeed"](fd, True, hold, dr, O, E, wid)
+        st = e["f_fibState"](True, hold, dr, O, E)
+        n6 += st == 3
+        if st == 3 and (fd[0] != U.w.O or fd[1] != U.w.E or fd[2] != U.w.dir or fd[3] != U.waveId or U.hold):
+            bad6.append(("feed", i))
+    check("LK-04 the forming target-TF bar never changes what is delivered: the final-state array taken before processing it (pPrev) is "
+          "the same whatever its high / low (3 variants x 400 bars); the per-bar values are offset by 1 for a lower chart TF",
+          not bad5, str(bad5[:5]))
+    check("LK-05 transfer and feed agree with the drawing: lfwPack -> lfwUnpack returns every field the drawing / tables read (wave, hold "
+          "candidates, IDs, observation, major candidates, counts, diagnostics, start / count) at every bar; the FIB feed values computed "
+          "from the per-bar results == the drawn origin / end / direction / wave ID of the unpacked state",
+          not bad6 and n6 > 50, f"{bad6[:5]} {n6}")
+    # 7. prefix
+    full = Run({"lfwMaxRecs": 100000})
+    states = []
+    for i, b in enumerate(ser4[0][:500]):
+        full.exec(tb(i) + H4, h4=bar(b, i))
+        states.append(full_state(full.env["lfw4"]))
+    pre = Run({"lfwMaxRecs": 100000})
+    for i, b in enumerate(ser4[0][:300]):
+        pre.exec(tb(i) + H4, h4=bar(b, i))
+    check("LK-06 prefix: the run over the first 300 4H bars equals the full 500-bar run at bar 300",
+          full_state(pre.env["lfw4"]) == states[299])
+
+
 def main():
     only = sys.argv[1:]
-    gates = (gate_static, gate_waves, gate_major, gate_hold, gate_obs, gate_tf, gate_diag, gate_random, gate_chart, gate_mutation)
+    gates = (gate_static, gate_waves, gate_major, gate_hold, gate_obs, gate_tf, gate_diag, gate_random, gate_chart, gate_core, gate_mutation)
     for g in gates:
         if only and g.__name__ not in only:
             continue

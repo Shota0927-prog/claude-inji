@@ -1093,16 +1093,27 @@ ZE_RATIOS = (0.236, 0.382, 0.5, 0.618)
 ONLY_ZE = dict(cZA=False, cZB=False, cZC=False, cZD=False, cZF=False, cZE=True, zeUse=True)
 
 
+class _FeedRun:
+    """LFW-6: the target-TF core (tests/lfw_sim.py Run, one state per TF) + the chart-side feed step (f_fibFeed on the received values
+    at a confirmed chart bar, time_close = that bar's close). The core does nothing while the TF's calculation is OFF"""
+
+    def __init__(self, LF, **ov):
+        self.r = LF.core_run(**ov)
+        self.env = self.r.env
+        self.on = {"D": ov.get("lfwOnD", True), "4": ov.get("lfwOn4", True)}
+        self.env["lfwFeedD"], self.env["lfwFeed4"] = [None] * 6, [None] * 6
+
+    def exec(self, avail, d=None, h4=None):
+        self.r.exec(avail, d=d if self.on["D"] else None, h4=h4 if self.on["4"] else None)
+        e = self.env
+        for k in ("D", "4"):
+            S = e[f"lfw{k}"]
+            e["f_fibFeed"](e[f"lfwFeed{k}"], self.on[k], 1.0 if S.hold else 0.0, S.w.dir, S.w.O, S.w.E, S.waveId)
+
+
 def lfw_feed_runner(**ov):
-    """the LongFibWave logic section + the LFW Feed block, run by the LFW harness (tests/lfw_sim.py)"""
     import lfw_sim as LF
-    src = open(os.path.join(lp.ap.ROOT, "LongFibWave.pine"), encoding="utf-8").read()
-    i, j = src.index("// ==== LFW Feed (begin)"), src.index("// ==== LFW Feed (end)")
-    feed = src[src.index("\n", i) + 1:j]
-    r = LF.Run(overrides=ov, src=src)
-    r.code = compile(lp.ap.Translator().translate(lp.ap.logical_lines(LF.logic(src) + feed)), "<LongFibWave logic + feed>", "exec")
-    r.env.update(barstate__isconfirmed=True, lfwOkD=ov.get("lfwOnD", True), lfwOk4=ov.get("lfwOn4", True))
-    return r, LF
+    return _FeedRun(LF, **ov), LF
 
 
 def fib_ref_state(S, on):
@@ -1116,17 +1127,13 @@ def fib_ref_state(S, on):
 
 def sc_ze_feed():
     src = raw("LongFibWave.pine")
-    old = git("show", f"{LFW_BASE}:LongFibWave.pine")
-    i = src.index("\n// ==== LFW Feed (begin)")
-    j = src.index('plot(array.get(lfwFeedD, 5), "FIB 日足 更新確定時刻", display = display.none)\n') + len(
-        'plot(array.get(lfwFeedD, 5), "FIB 日足 更新確定時刻", display = display.none)\n')
     names = re.findall(r'^plot\([^\n]*?, "(FIB [^"]+)", display = display\.none\)$', src, re.M)
     srcs = re.findall(r'^\w+ = input\.source\(close, "(FIB [^"]+)", group = G_ZE\)$', SRC, re.M)
-    check("LS-13 LongFibWave connection outputs (LAB-4): the file == the LFW-5 version with only the feed block + 13 hidden plots "
-          "inserted after the existing data-window plots of the latest LongFibWave (LFW-5; logic section, existing plots, drawing, diagnostics, tables "
-          "unchanged); plot names = the 13 "
-          "FIB series, the lab's 13 input.source titles are the same names; protocol 20001 on 5m charts only",
-          src[:i] + src[j:] == old and names == FIB_NAMES and sorted(srcs) == sorted(FIB_NAMES)
+    check("LS-13 LongFibWave connection outputs (LAB-4, LFW-6): 13 hidden plots with the FIB names (= the lab's 13 input.source titles), "
+          "protocol 20001 on 5m charts only; the feed reads the received per-TF results the drawing also uses, at confirmed chart bars "
+          "(the waves are computed inside the target TF, tests/lfw_sim.py LS-03 / LC-*)",
+          names == FIB_NAMES and sorted(srcs) == sorted(FIB_NAMES)
+          and "    f_fibFeed(lfwFeedD, lfwOkD, lfwHoldD, lfwDirD, lfwOD, lfwED, lfwIdD)\n    f_fibFeed(lfwFeed4, lfwOk4, lfwHold4, lfwDir4, lfwO4, lfwE4, lfwId4)" in src
           and 'plot(lfwIs5m ? 20001 : na, "FIB protocol", display = display.none)' in src
           and "lfwIs5m = timeframe.isminutes and timeframe.multiplier == 5" in src, f"{names} {srcs}")
     # feed values vs the wave state on random 4H series (with holds), calculation ON / OFF
