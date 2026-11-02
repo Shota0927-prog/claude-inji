@@ -201,6 +201,15 @@ python3 tests/lfw_sim.py gate_major gate_obs
 
 `tests/lfw_build.py` で、LFW の 4 ファイル（`LongFibWave.pine` / `LONG_FIB_WAVE_ja.md` / `tests/lfw_sim.py` / `tests/lfw_build.py`）を既存 fixture の「他のファイルは変わっていない」照合に登録済み（`tests/fds_build.py` / `tests/lab_build.py` と同じ方法）。その上に別作業の LAB-2 層（`tests/lab2_build.py`）が積まれている。今回はファイルを追加していないので、登録は変更していない（LS-09 で照合）。
 
+### 既存の回帰テスト（tests/*_sim.py 全 61 本、完全な履歴で同じ条件で実行）
+
+| 時点 | 結果 |
+|---|---|
+| febee7b（LFW-3 の変更前） | 61 本すべて合格（確認 2,656 件 PASS / 0 FAIL） |
+| 13d85ab（LFW-3） | 61 本すべて合格（確認 2,679 件 PASS / 0 FAIL。差は lfw_sim の 55 → 78 件だけで、他の 60 本は各本の PASS 件数も変更前と同じ） |
+
+変更したファイルは `LongFibWave.pine` / `LONG_FIB_WAVE_ja.md` / `tests/lfw_sim.py` の 3 つだけ（`git diff febee7b 13d85ab --stat`）。既存の売買ロジック・Engine・Zone・他の Pine・登録ファイルは変更していない。
+
 ## 10. 未実装・未確認
 
 - TradingView でのコンパイル、表示、`request.security` の実際の配信タイミング、リプレイでの確認は未実施（ユーザーが確認する）。
