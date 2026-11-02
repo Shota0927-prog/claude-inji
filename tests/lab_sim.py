@@ -983,6 +983,83 @@ def sc_names_labels():
           sorted(g.lb.text for g in e["lbDsG"] if not g.gone) == sorted([swing_poc, "4時間足｜出来高POC", "4時間足｜iFVG"]))
 
 
+def pocs(r, k=None):
+    """the POC Zones in the static index (optionally of TF k = 0..3)"""
+    return [z for z in r["lbZs"] if z.typ == 3 and (k is None or z.tf == k)]
+
+
+def sc_poc_latest():
+    # LAB-3g: one valid POC per TF (latest confirmed). 1H: A 2000 (bars 1-4, time-only update on bar 3), B 2010 (bars 5-8), A again
+    # (bars 9-); 4H POC 2100 alongside. Price below (1985): contact with A on bar 2 -> SHORT wait; kept through the time-only update
+    # (bar 3) ; cancelled when B arrives (bar 5); touching B on its arrival bar is no contact, the next bar's touch is a new wait
+    rows = flat(14, 1985)
+    rows[2] = (1988.0, 1999.0, 1987.0, 1989.0)          # wick into A (1998-2002) from below -> SHORT wait
+    rows[5] = (1990.0, 2009.0, 1989.0, 1990.0)          # wick into B (2008-2012) on B's arrival bar -> no contact (new Zone)
+    rows[6] = (1990.0, 2009.0, 1989.0, 1990.0)          # the same wick on the next bar -> SHORT wait on B
+    sc = Sc(rows)
+    sc.hold(1, 3, **pocv(1, 1999.5, 2000.5, T_HTF))
+    sc.hold(3, 5, **pocv(1, 1999.5, 2000.5, T_HTF + 3600_000))     # time-only update: nothing changes
+    sc.hold(5, 9, **pocv(1, 2009.5, 2010.5, T_HTF + 7200_000))
+    sc.hold(9, None, **pocv(1, 1999.5, 2000.5, T_HTF + 10800_000))  # back to the price of A: adopted as the latest POC
+    sc.hold(1, None, **pocv(2, 2099.5, 2100.5, T_HTF))
+    run = lp.Runner(overrides=dict(**ONLY_TC, **{**QUIET, **NEW, "dsZone": True}))
+    per = []
+    for bar in sc.bars:
+        run.step(bar)
+        per.append([(z.tf, z.ctr, z.id) for z in pocs(run.env)])
+    r = run
+    t = r.trace
+    ids = [p[0][2] for p in per[1:] if p]
+    one = all(len([q for q in p if q[0] == k]) <= 1 for p in per for k in range(4))
+    a1, b, a2 = per[2][0], per[6][0], per[10][0]
+    dsp = [z.id for g in r["lbDsG"] if not g.gone for z in g.mem if z.typ == 3]
+    check("LB-60 POC = latest confirmed per TF: at every bar at most one valid POC per TF (1H and 4H each one); A 2000 -> B 2010 -> "
+          "back to 2000 gives three successive Zones (A again adopted as a new latest POC); the replaced POC leaves the Zone index "
+          "(bot / top orders), the display and is marked dead; a time-only update (bar 3) keeps the same Zone",
+          one and per[2] == per[4] and a1[1] == 2000.0 and b[1] == 2010.0 and a2[1] == 2000.0 and len({a1[2], b[2], a2[2]}) == 3
+          and sorted(q[1] for q in per[-1]) == [2000.0, 2100.0] and len(r["lbZsT"]) == len(r["lbZs"])
+          and sorted(dsp) == sorted(q[2] for q in per[-1]), f"{per[2]} {per[4]} {per[6]} {per[10]} {per[-1]} {dsp}")
+    check("LB-61 waits on a replaced POC: the SHORT wait from the contact with A (bar 2) is kept through the time-only update (bars 3-4) "
+          "and cancelled on bar 5 when B replaces A (nothing carried over to B); B's arrival bar touch is no contact, the next bar's "
+          "touch makes a new wait on B (first contact = bar 6)",
+          len(t[2]["waits"]) == 1 and t[4]["waits"] == t[2]["waits"] and t[5]["waits"] == []
+          and len(t[6]["waits"]) == 1 and t[6]["waits"][0][0] == str(b[2]) and t[6]["waits"][0][3] == 6,
+          f"{t[2]['waits']} {t[4]['waits']} {t[5]['waits']} {t[6]['waits']}")
+    # display: swing 2001 (1999-2003) merged with POC A (1998-2002) -> one band; after B the swing band stays alone and B is apart
+    sc2 = Sc(flat(8, 2050))
+    sw_feed(sc2, 1, 1, True, 2001.0, 1)
+    sc2.hold(1, 4, **pocv(1, 1999.5, 2000.5, T_HTF))
+    sc2.hold(4, None, **pocv(1, 2019.5, 2020.5, T_HTF + 3600_000))
+    run2 = lp.Runner(overrides=dict(**ONLY_TC, **{**QUIET, **NEW, "dsZone": True}))
+    tx = []
+    for bar in sc2.bars:
+        run2.step(bar)
+        tx.append(sorted((g.lb.text, g.bot, g.top) for g in run2.env["lbDsG"] if not g.gone))
+    check("LB-62 display: the replaced POC leaves the merged band and only it (the swing line stays as its own band '1時間足｜水平線'; "
+          "the new POC is its own band)",
+          tx[2] == [("1時間足｜水平線＋出来高POC", 1998.0, 2003.0)]
+          and tx[5] == sorted([("1時間足｜水平線", 1999.0, 2003.0), ("1時間足｜出来高POC", 2018.0, 2022.0)]), f"{tx[2]} {tx[5]}")
+    # holding: SHORT from a swing line 1996 (1994-1998, TOUCH_A high 1995) with TP1 = POC 1960 (1958-1962); the POC is replaced by
+    # 1940 while holding -> no forced close, SL unchanged, TP1 re-planned to the new POC top 1942
+    rows = flat(3, 1985) + [TOUCH_A, TC_AFTER] + flat(8, 1986)
+    sc3 = Sc(rows)
+    sw_feed(sc3, 1, 1, True, 1996.0, 1)
+    sc3.hold(1, 7, **pocv(1, 1959.5, 1960.5, T_HTF))
+    sc3.hold(7, None, **pocv(1, 1939.5, 1940.5, T_HTF + 3600_000))
+    sc3.set(4, labS1=L_AFTER)
+    r3 = sc3.run(**ONLY_TC, **{**QUIET, **NEW})
+    t3 = r3.trace
+    check("LB-63 holding when the POC is replaced: no forced close, the initial SL (swing top 1998 + 5 = 2003) unchanged, TP1 moves from "
+          "the old POC top 1962 to the new POC top 1942 by the normal TP update",
+          [e[0] for e in entries(r3)] == [4] and t3[6]["legPx"][0] == 1962.0 and t3[7]["legPx"][0] == 1942.0 and t3[7]["pos"] != 0
+          and r3["o"].sl == 2003.0 and t3[7]["stop"] == t3[6]["stop"], f"{[x['legPx'] for x in t3[5:9]]} {entries(r3)} {r3['o'].sl}")
+    # causality: the run on the first 7 bars == the first 7 bars of the full run (a later POC never reaches back)
+    rp = lp.Runner(overrides=dict(**ONLY_TC, **{**QUIET, **NEW, "dsZone": True})).run(sc.bars[:7])
+    check("LB-64 causality: the run over bars 0-6 is identical to the first 7 bars of the full run (waits, timings, legs, Zones at bar 6), "
+          "so each bar uses only the latest POC received by then",
+          rp.trace == t[:7] and [(z.tf, z.ctr, z.id) for z in pocs(rp)] == per[6], f"{[(z.tf, z.ctr) for z in pocs(rp)]} {per[6]}")
+
+
 def acc_feed(sc, k, boxes):
     """accum feed for TF k (1..3): boxes = [(i0, i1, u, l, id, forming)] held on bars i0..i1-1"""
     for i0, i1, u, l, aid, a in boxes:
@@ -1713,6 +1790,8 @@ MUTANTS = [
      "    array<LbZone> aArr = lbZs\n    int ia = side == 1 ? f_lbLower(lbZs, ref + EPS) : f_lbLower(lbZs, ref) - 1", "SHORT TP by tops (variable width)"),
     ("pv <= array.max(q.mP) + zcMerge + EPS", "pv < array.max(q.mP) + zcMerge - EPS", "swing merge distance boundary"),
     ("                f_waitMove(b.id, a.id)\n", "", "bridged swing Zone's waits re-keyed"),
+    ("                        oz.dead := true\n                        array.push(lbDeadNow, oz.id)", "                        oz.dead := true",
+     "replaced POC's waits cancelled"),
     ("    if not na(lbMa1) and not p1 and p2\n        f_dsPut(lbMa1, true)", "    if false\n        f_dsPut(lbMa1, true)", "display: MA chained through the other MA"),
     ("            if q.bot <= stp + EPS\n                    array.push(sm, q)", "            if q.bot < stp - EPS\n                    array.push(sm, q)",
      "display: regroup after removal (touching bands)"),
@@ -1721,7 +1800,7 @@ MUTANTS = [
 
 def mutation():
     scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_qty_table, sc_be, sc_lock_far, sc_and_only_sel, sc_sel_tp, sc_consume, sc_zones, sc_acc_keep, sc_dup_swing, sc_ta,
-            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref, sc_display, sc_fvg_display, sc_swing_merge, sc_names_labels]
+            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref, sc_display, sc_fvg_display, sc_swing_merge, sc_names_labels, sc_poc_latest]
     survived = []
     for old, new, what in MUTANTS:
         if SRC.count(old) != 1:
@@ -1771,6 +1850,7 @@ def main():
     sc_dup_swing()
     sc_swing_merge()
     sc_names_labels()
+    sc_poc_latest()
     sc_ta()
     sc_session()
     sc_and_timing()

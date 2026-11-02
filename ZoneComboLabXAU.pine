@@ -18,13 +18,14 @@
 //       【変更】5分 / 15分 / 1H → 1H / 4H / D / W。当日高安・前日高安は対象外。寿命による削除なし。
 //    ZD 出来高 1H / 4H / D / W : 【LAB-2】POC の計算は外部インジ MtfPocFeedXAU (MtfPocDetector 75 分割版の f_pocCore を基に区画の
 //       走査範囲だけ軽量化) で行い、この Strategy は input.source で 13 系列 (時間足ごとの区画下限・上限・対象足時刻 + protocol 10001)
-//       を受け取って蓄積するだけ (内蔵計算・自動フォールバックなし)。帯 = POC 中心 (区画下限と上限の中点) ± 共通幅。元の区画の上下限・
-//       対象足時刻・利用可能になった 5分足の時刻を保持。中心が前回の有効値から変わり、同じ時間足に中心が完全に同じ Zone がなければ
-//       追加 (過去の帯を置き換えない)。未接続・誤接続は集計表に表示し、検知 ON のまま誤接続なら新規発注を止める。
+//       を受け取るだけ (内蔵計算・自動フォールバックなし)。帯 = POC 中心 (区画下限と上限の中点) ± 共通幅。元の区画の上下限・
+//       対象足時刻・利用可能になった 5分足の時刻を保持。【LAB-3g】時間足ごとに最新の確定 POC 1 つだけが有効: 中心が前回の有効値から
+//       変わったら同じ時間足の旧 POC を無効化 (Zone・表示・TP 候補から外し、その待機を解除) して新 POC を登録 (時刻だけの更新では何もしない)。
+//       未接続・誤接続は集計表に表示し、検知 ON のまま誤接続なら新規発注を止める。
 //    ZF FVG 1H / 4H / D / W : Batch A の f_fvgConfirmed (最小幅 3) をそのまま使い、FVG 本来の上下限を Zone にする (共通幅なし)。
 //       【変更】同じ時間足の確定終値で反対端を抜けたら iFVG (反転)、iFVG を同じ時間足の確定終値で逆方向に抜けたら無効 (削除)。
 //       Batch A の完全埋め削除・寿命・TF ごと 5 件の上限は撤去。D / W を追加。
-//    共通幅 (初期 中心から上下 2 ドル。LAB-3e で 6 → 2) は ZA / ZB / ZC / ZD。日数・件数・世代数による有効 Zone の削除はしない (アキュムの箱数の上限だけは LAB-3 の設定)。
+//    共通幅 (初期 中心から上下 2 ドル。LAB-3e で 6 → 2) は ZA / ZB / ZC / ZD。日数・件数・世代数による有効 Zone の削除はしない (アキュムの箱数の上限 (LAB-3) と POC の時間足ごと最新 1 つ (LAB-3g) を除く)。
 //
 //  ■ タイミング (5分足・確定足)
 //    TA FVG 吸収: AccumStrategyXAU ACC-5A の FVG 形成・監視・吸収をそのまま使う。上昇 FVG の陰線吸収 = SHORT、
@@ -564,7 +565,7 @@ type LbZone
     int   brk      = 0        // 直近の突破: 1 上抜け / -1 下抜け / 0 なし
     int   brkBar   = 0
     bool  inv      = false    // ZF: iFVG
-    bool  dead     = false    // ZF: 無効 / 採用件数から外れたアキュムの辺 / 他の水平線 Zone に統合された水平線 Zone
+    bool  dead     = false    // ZF: 無効 / 採用件数から外れたアキュムの辺 / 他の水平線 Zone に統合された水平線 Zone / 更新された旧 POC
     array<float> mP           // ZC: 構成水平線の元価格・時間足・成立時刻 (Pivot 時刻)・ID (水平線の連番。登録順)
     array<int>   mTf
     array<int>   mT
@@ -719,6 +720,7 @@ var array<int>    lbAccLast = array.new_int(3, na)  // 時間足ごとに前回�
 var array<int>    lbPivLastH = array.new_int(4, na)
 var array<int>    lbPivLastL = array.new_int(4, na)
 var array<float>  lbPocLast  = array.new_float(4, na)
+var array<LbZone> lbPocCur   = array.new<LbZone>(4, na)    // 時間足ごとの有効な POC Zone (最新の確定 POC 1 つ)
 var array<int>    lbFvgLast  = array.new_int(4, na)
 var array<int>    lbNZone    = array.new_int(5, 0)   // 種類ごとの保持数 (ZB は 0〜2)
 var array<LbWait> lbWaits = array.new<LbWait>()
@@ -1139,7 +1141,7 @@ f_lbRemove(LbZone z) =>
         array.set(lbNZone, z.typ, array.get(lbNZone, z.typ) - 1)
     done and doneT
 
-// 共通幅の Zone を lbZs / lbZsT から外す (採用件数から外れたアキュムの辺 / 統合で帯が変わる・統合される水平線 Zone)
+// 共通幅の Zone を lbZs / lbZsT から外す (採用件数から外れたアキュムの辺 / 統合で帯が変わる・統合される水平線 Zone / 更新された旧 POC)
 f_lbRemoveS(LbZone z) =>
     int i = f_lbLower(lbZs, z.bot)
     int n = array.size(lbZs)
@@ -1829,7 +1831,8 @@ if lbRun and barstate.isconfirmed
                     int sub = s == 0 ? 1 : -1
                     f_swAdd(k, sub, pv, pt)
     // ZD: 外部 POC (MtfPocFeedXAU) の受信。この 5分足に届いている確定済み上位足の出力を読み、正常な値で中心が前回の有効値から
-    //  変わり、同じ時間足に中心が完全に同じ Zone がなければ追加する (既存 Zone は上書きしない・時刻の更新だけでは登録しない)。
+    //  変わったら、同じ時間足の旧 POC を無効化して新 POC を登録する (時間足ごとに最新の確定 POC 1 つだけが有効。旧 POC は Zone の一覧・
+    //  表示・TP 候補から外し、旧 POC を含む待機は (B3) で解除。時刻の更新だけでは何もしない。前と同じ価格に戻った場合も新 POC として採用)。
     //  状態: 0 検知 OFF / 1 正常 / 2 計算不能 (時刻 < 0) / 3 履歴不足 (時刻 na) / 8 外部側 OFF (時刻 0) / 9 未接続・誤接続
     //  (protocol ≠ 10001、時刻が時刻として不自然、正常なのに上下限が na / 上限 <= 下限)。8 / 9 は新規発注を止める (close で代用しない)
     bool zdProtoOK = not na(zdProto) and zdProto == 10001
@@ -1863,8 +1866,16 @@ if lbRun and barstate.isconfirmed
                 float lp = array.get(lbPocLast, k)
                 if na(lp) or pc != lp
                     array.set(lbPocLast, k, pc)
-                    if not f_lbDup(3, k, 0, pc)
-                        f_lbAdd(f_lbNew(3, k, 0, pc, pc - zHalf, pc + zHalf, lo, up, int(tt)))
+                    LbZone oz = array.get(lbPocCur, k)
+                    if not na(oz)
+                        f_lbRemoveS(oz)
+                        if dsZone
+                            f_dsDel(oz, false)
+                        oz.dead := true
+                        array.push(lbDeadNow, oz.id)
+                    LbZone nzp = f_lbNew(3, k, 0, pc, pc - zHalf, pc + zHalf, lo, up, int(tt))
+                    f_lbAdd(nzp)
+                    array.set(lbPocCur, k, nzp)
         array.set(lbZdStat, k, stt)
         if stt == 8 or stt == 9
             zdBad := true
