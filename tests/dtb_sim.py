@@ -412,9 +412,9 @@ SETTINGS = [
 ]
 
 
-def gate_series():
+def gate_series(scov):
     tot_ev = tot_mis = n_runs = 0
-    covsum = {}
+    covsum = dict(scov)          # coverage of the compared scenario runs (DT-A1) + the random series
     first_bad = ""
     plans = [(61, 40, 0.0, None, 1.0, False, 6), (62, 40, 0.03, None, 1.0, False, 6), (63, 40, 0.0, 0.5, 1.0, False, 2),
              (64, 70, 0.0, None, 1.6, False, 2), (64, 70, 0.0, None, 1.6, True, 1), (65, 70, 0.02, 0.5, 2.2, False, 2)]
@@ -442,12 +442,12 @@ def gate_series():
                       f"to each approach, base annotations at the real pivot bar time (history, missing bars {miss}) and the "
                       f"availability marker at the registration bar, nothing drawn to the right / on an unconfirmed tick",
                       not bad and all(cnt), f"{bad[:3]} counts(det, app, base)={cnt}")
-    print("  [DT coverage of the compared runs]", covsum)
+    print("  [DT coverage of the compared runs (scenarios + series)]", covsum)
     need = [k for k, v in covsum.items() if v == 0 and k != "det_on_reg_bar"]
     check("DT-S1 random series (5 paths incl. missing bars, 0.5 price grid, 2 volatilities; 6 settings): the indicator's detection "
           "events and the full state of every active base equal the original (AccumStrategyXAU.pine) on every bar",
           tot_mis == 0 and tot_ev > 0, f"runs={n_runs} events={tot_ev} mismatching runs={tot_mis} {first_bad}")
-    check("DT-S2 the compared runs cover: all 5 timeframes x top / bottom x double / triple, approach-bar and later detections, the "
+    check("DT-S2 the compared runs (scenarios + random series) cover: all 5 timeframes x top / bottom x double / triple, approach-bar and later detections, the "
           "last bar of the wait, expiry, a 3rd approach after an expired 2nd, invalidation with a reversal bar on the same bar and "
           "while waiting, in-band bars without the distance, multiple timeframes / bases detecting on the same bar",
           not need, f"missing={need}")
@@ -488,6 +488,7 @@ def gate_scenarios():
     ]
     ok_all, bad = True, []
     n_ev = 0
+    scov = {}
     for name, seq, dv, ov in sc:
         bars = az.bars_of(seq, az.FR)
         for i, b in enumerate(bars):
@@ -495,6 +496,8 @@ def gate_scenarios():
         a = run_orig(bars, ov)
         b = run_new(bars, ov)
         n_ev += len(a.events)
+        for k, v in coverage(a, ov).items():
+            scov[k] = scov.get(k, 0) + v
         d = first_diff(a, b)
         if d is not None:
             ok_all = False
@@ -506,7 +509,7 @@ def gate_scenarios():
     check("DT-A2 boundary scenarios behave as the original documents: invalidation wins over a same-bar reversal (no event), a "
           "reversal on the last wait bar (approach + 3) is detected", a.events == [] and [e[0] - e[5] for e in lw.events] == [3],
           f"{a.events} {lw.events}")
-    return n_ev
+    return n_ev, scov
 
 
 def gate_display():
@@ -557,9 +560,14 @@ def gate_display():
     for e in base.events:
         both.setdefault(e[1], set()).add(e[4])
     ids = [g for g, s in both.items() if s == {2, 3}]
-    okb = all(len([d for d in base.draws if d.kind == "label" and not d.deleted and str(d.args[2]).split("\n")[1:2] ==
-                   [f"#{g} {c}回目"]]) == 1 for g in ids[-3:] for c in (2, 3))
-    check("DT-V4 a base with a double and then a triple detection keeps both labels", ids and okb, f"bases with both: {len(ids)}")
+    okb = True
+    for g in ids:
+        lb = [[d for d in base.draws if d.kind == "label" and str(d.args[2]).split("\n")[1:2] == [f"#{g} {c}回目"]
+               and str(d.args[2])[:3] in ("ダブル", "トリプ")] for c in (2, 3)]
+        if not (len(lb[0]) == 1 and len(lb[1]) == 1 and lb[0][0].deleted == lb[1][0].deleted):
+            okb = False
+    check("DT-V4 a base with a double and then a triple detection has both labels (one each), kept or removed together with "
+          "the base's drawings (the double is not replaced by the triple)", ids and okb, f"bases with both: {len(ids)}")
 
 
 def gate_realtime_prefix():
@@ -617,8 +625,8 @@ def gate_static():
 
 def main():
     gate_static()
-    n_sc = gate_scenarios()
-    tot_ev, tot_mis, n_runs = gate_series()
+    n_sc, scov = gate_scenarios()
+    tot_ev, tot_mis, n_runs = gate_series(scov)
     gate_display()
     gate_realtime_prefix()
     ok = 0
