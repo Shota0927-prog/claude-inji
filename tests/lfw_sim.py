@@ -1045,6 +1045,99 @@ def gate_chart():
 
 
 # ============================================================================
+# diagnostics (origin / direction changes)
+# ============================================================================
+def dg(S):
+    return [(d.avail, d.viaHold, d.bDir, d.bO, d.bE, d.aDir, d.aO, d.aOT, d.aE, d.why) for d in S.diag]
+
+
+def gate_diag():
+    r = Run().feed4(BASE[:IR3 + 1])
+    d = r.S.diag
+    check("LD-01 first wave: one record, reason 'first wave (major high / low)', before = no wave, after = up 400 (its bar) -> 800, "
+          "known at the adoption bar; candidate extreme time, fixed ATR 10, required 50, actual move 400",
+          len(d) == 1 and (d[0].why, d[0].bDir, d[0].aDir, d[0].aO, d[0].aOT, d[0].aE, d[0].avail) == (1, 0, 1, 400, tb(IP1), 800, av(IR3))
+          and (d[0].candT, d[0].atr, d[0].thr, d[0].move) == (tb(IP1), 10.0, 50.0, 400), str(d))
+    q = base_run([])
+    d = q.S.diag
+    check("LD-02 the bar that both breaks the up wave's origin and confirms the major high records the branch actually taken: "
+          "'major high / low adoption' (not origin break), before up 400 -> 1000, after down 1000 -> 0, ATR 10 / required 50 / move 1000",
+          len(d) == 2 and (d[1].why, d[1].bDir, d[1].bO, d[1].bE, d[1].aDir, d[1].aO, d[1].aOT, d[1].aE) == (2, 1, 400, 1000, -1, 1000, tb(IP2), 0)
+          and (d[1].candT, d[1].atr, d[1].thr, d[1].move, d[1].avail) == (tb(IP2), 10.0, 50.0, 1000, av(ID3)), str(d[-1:]))
+    a = base_run([B(782, 500), B(600, -10)]).S.diag
+    check("LD-03 0.782 switch: reason '78.2 % same-direction switch' with the ratio used (0.782), before down 1000 -> 0, after down "
+          "782 (the rally bar) -> -10, known at the break bar",
+          len(a) == 3 and (a[2].why, a[2].ratio, a[2].bDir, a[2].bO, a[2].bE, a[2].aDir, a[2].aO, a[2].aOT, a[2].aE, a[2].avail)
+          == (3, 0.782, -1, 1000, 0, -1, 782, tb(X(0)), -10, av(X(1))) and a[2].candT is None, str(a[-1:]))
+    f = base_run([B(300, 100), B(1000.5, 200)]).S.diag
+    check("LD-04 strict origin break: reason 'origin break (reversal)', ratio of the breaking price 100.05 %, after up 0 (old end) -> 1000.5",
+          len(f) == 3 and f[2].why == 4 and abs(f[2].ratio - 1.0005) < 1e-12 and (f[2].aDir, f[2].aO, f[2].aOT, f[2].aE) == (1, 0, tb(ID3), 1000.5),
+          str(f[-1:]))
+    e = base_run([B(781, 500), B(600, -10), B(500, -50), B(1000, 600)])
+    check("LD-05 end-only updates (extension after 78.1 %, another new low) and an origin touch are not recorded",
+          len(e.S.diag) == 2 and e.W.O == 1000, str(dg(e.S)))
+    rd = base_run([B(300, 100), B(1100, -100), B(600, 200), B(500, -150)])
+    h = rd.S.diag
+    check("LD-06 hold release: recorded at the release bar with the hold start, before = the last confirmed wave (down 1000 -> 0), "
+          "after = down 1100 -> -150; the kept candidate's route is the origin break of the hold bar, and the other candidate "
+          "reached the same wave by another route (flagged, display only)",
+          len(h) == 3 and h[2].viaHold and h[2].holdAvail == av(X(1)) and h[2].avail == av(X(3))
+          and (h[2].bDir, h[2].bO, h[2].bE, h[2].aDir, h[2].aO, h[2].aOT, h[2].aE, h[2].why) == (-1, 1000, 0, -1, 1100, tb(X(1)), -150, 4)
+          and h[2].multi, str(h[-1:]))
+    k2 = Run().feed4(BASE + [B(300, 100), B(1100, -100), B(1000, 500), B(400, -150), B(1200, 0)]).S.diag
+    check("LD-07 a hold whose candidates had different routes (one by a 0.782 switch, one by an origin break) is released by a bar "
+          "above both origins: recorded once at the release, route = origin break of that bar (up -150 -> 1200)",
+          len(k2) == 3 and k2[2].viaHold and (k2[2].why, k2[2].aDir, k2[2].aO, k2[2].aE) == (4, 1, -150, 1200), str(k2[-1:]))
+    rA = Run().feed4(up_with(B(310, 280, atr=4.0), [B(305, 295), B(300, 291), B(298, 288)])).S.diag
+    check("LD-08 opposite-wave adoption without breaking the old origin: reason 'major high / low adoption', candidate extreme "
+          "time = the 310 bar, fixed ATR 4, required 20, actual move 22",
+          len(rA) == 2 and (rA[1].why, rA[1].candT, rA[1].atr, rA[1].thr, rA[1].move) == (2, tb(NU), 4.0, 20.0, 22), str(rA[-1:]))
+    rD = Run().feedD(BASE)
+    check("LD-09 daily and 4H records are separate", len(rD.env["lfwD"].diag) == 2 and len(rD.env["lfw4"].diag) == 0)
+    # random series: the records are exactly the last 10 changes of the confirmed wave, with consistent reasons
+    bad = []
+    for seed in range(6):
+        for ov in ({}, {"lfwPivL4": 5, "lfwPivR4": 2, "lfwPivM4": 3.0}):
+            r = Run(dict(ov, lfwMaxRecs=100000))
+            last, events, rel = None, [], set()
+            was_hold = False
+            for i, b in enumerate(rand_series(400 + seed)):
+                r.exec(av(i), h4=(b["h"], b["l"], tb(i), b["atr"]))
+                S = r.S
+                if not S.hold and S.w.dir != 0:
+                    cur = (S.w.dir, S.w.O, S.w.oT)
+                    if last is None or cur[:3] != last[:3]:
+                        events.append((av(i), was_hold, 0 if last is None else last[0], None if last is None else last[1], cur[0], cur[1], cur[2]))
+                    last = cur
+                was_hold = S.hold
+            got = [(x.avail, x.viaHold, x.bDir, x.bO, x.aDir, x.aO, x.aOT) for x in S.diag]
+            if got != events[-10:] or len(S.diag) != min(10, len(events)):
+                bad.append((seed, ov, "records"))
+            for x in S.diag:
+                okr = {1: lambda: x.bDir == 0 and x.move >= x.thr and x.aOT == x.candT,
+                       2: lambda: x.move >= x.thr and x.aOT == x.candT and (x.viaHold or x.aDir == -x.bDir),
+                       3: lambda: x.ratio >= 0.782 and (x.viaHold or (x.aDir == x.bDir and (x.aO, x.aOT) != (x.bO, x.bOT))),
+                       4: lambda: x.ratio > 1 and (x.viaHold or (x.aDir == -x.bDir and x.aO == x.bE))}.get(x.why, lambda: False)()
+                if not okr:
+                    bad.append((seed, ov, "reason", x.why))
+    check("LD-10 random series: the records are exactly the last 10 changes of the confirmed wave's direction / origin (time, "
+          "before, after, hold release), and every reason matches its values (switch ratio >= 0.782, reversal from the old end "
+          "with a ratio > 100 %, adoption move >= required with the candidate's time as origin)", not bad, str(bad[:5]))
+    inert = SRC.replace("    w.dgWhy := why\n    w.dgRatio := ratio\n", "    w.dgWhy := 0\n    w.dgRatio := 0.0\n")
+    inert = inert.replace("                            x.dgMulti := true", "                            x.dgMulti := false")
+    bad = []
+    for seed in range(4):
+        bars = rand_series(500 + seed)
+        ov = {"lfwMaxRecs": 100000, "lfwPivL4": 5, "lfwPivR4": 2, "lfwPivM4": 3.0}
+        if pine_tuple(Run(ov).feed4(bars).S) != pine_tuple(Run(ov, src=inert).feed4(bars).S):
+            bad.append(seed)
+    lg = logic(SRC)
+    same = lg[lg.index("lfwSame(LfwWave a"):lg.index("// 確定足 1 本 = 高値と安値")]
+    check("LD-11 the diagnostics are inert: changing the recorded reasons does not change any wave, hold, candidate or statistic; "
+          "the hold comparison (lfwSame) reads no diagnostic field", not bad and "dg" not in same and inert != SRC, str(bad))
+
+
+# ============================================================================
 # mutation
 # ============================================================================
 MUTATIONS = [
@@ -1082,6 +1175,10 @@ MUTATIONS = [
     ("retroactive observation", "            S.obsDone := true\n            S.nNoRetro := S.nNoRetro + 1\n",
      "            S.obsDone := false\n            S.nNoRetro := S.nNoRetro + 1\n"),
     ("threshold > instead of >=", "            ok := math.abs(c.p - c.ext) >= c.thr\n", "            ok := math.abs(c.p - c.ext) > c.thr\n"),
+    ("diag: reversal recorded as switch", "        lfwDgSet(w, 4, lfwRatio(w, p))\n", "        lfwDgSet(w, 3, lfwRatio(w, p))\n"),
+    ("diag: before / after swapped", "            if newWave\n                lfwLog(S, w, nw, availT, false)\n",
+     "            if newWave\n                lfwLog(S, nw, w, availT, false)\n"),
+    ("diag: hold release not flagged", "        lfwLog(S, S.w, nw, availT, true)\n", "        lfwLog(S, S.w, nw, availT, false)\n"),
     ("hold ignores adoption", "    LfwWave a = lfwAdopt(S, w, availT)\n    if not na(a)\n        array.push(out, a)\n    else\n        lfwBarStep(w, h, l, t, availT, out)\n",
      "    lfwBarStep(w, h, l, t, availT, out)\n"),
 ]
@@ -1098,7 +1195,7 @@ def gate_mutation():
                 continue
             SRC_OVERRIDE = SRC.replace(old, new)
             RESULTS = []
-            for g in (gate_waves, gate_major, gate_hold, gate_obs):
+            for g in (gate_waves, gate_major, gate_hold, gate_obs, gate_diag):
                 try:
                     g()
                 except Exception:      # noqa: BLE001
@@ -1109,13 +1206,13 @@ def gate_mutation():
                 missed.append(name)
     finally:
         SRC_OVERRIDE, RESULTS = None, keep
-    check(f"LM-01 every one of {len(MUTATIONS)} mutations of the Pine logic makes at least one LW / LP / LH / LO check fail",
+    check(f"LM-01 every one of {len(MUTATIONS)} mutations of the Pine logic makes at least one LW / LP / LH / LO / LD check fail",
           caught == len(MUTATIONS) and not missed, str(missed))
 
 
 def main():
     only = sys.argv[1:]
-    gates = (gate_static, gate_waves, gate_major, gate_hold, gate_obs, gate_random, gate_chart, gate_mutation)
+    gates = (gate_static, gate_waves, gate_major, gate_hold, gate_obs, gate_diag, gate_random, gate_chart, gate_mutation)
     for g in gates:
         if only and g.__name__ not in only:
             continue
