@@ -390,7 +390,9 @@ def draw_check(r):
                 bad.append(("approach marker", gid, abar, cnt, [(d.args[:2]) for d in mk]))
             want.append((abar, piv[gid][0], g[3], b["t"], b["h"] if top else b["l"]))
     from collections import Counter
-    got = Counter((d.bar, d.args[0], d.args[1], d.args[2], d.args[3]) for d in lines if d.kw.get("style") == "dashed")
+    # lines drawn on their approach bar (lines drawn again on a late detection after a removal: redraw_check, DTB-2)
+    got = Counter((d.bar, d.args[0], d.args[1], d.args[2], d.args[3]) for d in lines if d.kw.get("style") == "dashed"
+                  and d.args[2] == r.bars[d.bar]["t"])
     if got != Counter(want):
         bad.append(("approach lines", (Counter(want) - got).most_common(2), (got - Counter(want)).most_common(2)))
     for gid, g in bases.items():
@@ -549,6 +551,7 @@ def gate_display():
         if first_diff(base, r) is not None:
             same, det = False, f"{v} {first_diff(base, r)}"
         bad, _ = draw_check(r)
+        bad += redraw_check(r)[0]
         if bad:
             same, det = False, f"{v} drawing {bad[:2]}"
         nl = len([x for x in live(r, "label") if "基準#" in str(x.args[2])])
