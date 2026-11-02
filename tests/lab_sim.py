@@ -994,8 +994,8 @@ def sc_poc_latest():
     # (bar 3) ; cancelled when B arrives (bar 5); touching B on its arrival bar is no contact, the next bar's touch is a new wait
     rows = flat(14, 1985)
     rows[2] = (1988.0, 1999.0, 1987.0, 1989.0)          # wick into A (1998-2002) from below -> SHORT wait
-    rows[5] = (1990.0, 2009.0, 1989.0, 1990.0)          # wick into B (2008-2012) on B's arrival bar -> no contact (new Zone)
-    rows[6] = (1990.0, 2009.0, 1989.0, 1990.0)          # the same wick on the next bar -> SHORT wait on B
+    rows[5] = (1990.0, 2009.0, 1989.0, 1990.0)          # wick into B (2008-2012) on B's arrival bar -> SHORT wait on B (LAB-3h)
+    rows[6] = (1990.0, 2009.0, 1989.0, 1990.0)          # the same wick on the next bar -> the same wait renewed (no duplicate)
     sc = Sc(rows)
     sc.hold(1, 3, **pocv(1, 1999.5, 2000.5, T_HTF))
     sc.hold(3, 5, **pocv(1, 1999.5, 2000.5, T_HTF + 3600_000))     # time-only update: nothing changes
@@ -1020,11 +1020,36 @@ def sc_poc_latest():
           and sorted(q[1] for q in per[-1]) == [2000.0, 2100.0] and len(r["lbZsT"]) == len(r["lbZs"])
           and sorted(dsp) == sorted(q[2] for q in per[-1]), f"{per[2]} {per[4]} {per[6]} {per[10]} {per[-1]} {dsp}")
     check("LB-61 waits on a replaced POC: the SHORT wait from the contact with A (bar 2) is kept through the time-only update (bars 3-4) "
-          "and cancelled on bar 5 when B replaces A (nothing carried over to B); B's arrival bar touch is no contact, the next bar's "
-          "touch makes a new wait on B (first contact = bar 6)",
-          len(t[2]["waits"]) == 1 and t[4]["waits"] == t[2]["waits"] and t[5]["waits"] == []
-          and len(t[6]["waits"]) == 1 and t[6]["waits"][0][0] == str(b[2]) and t[6]["waits"][0][3] == 6,
+          "and cancelled on bar 5 when B replaces A (nothing carried over to B); B is judged from its arrival bar (LAB-3h): the touch on "
+          "bar 5 makes a new wait on B (first contact 5), the touch on bar 6 renews that wait (last contact 6), no duplicate",
+          len(t[2]["waits"]) == 1 and t[4]["waits"] == t[2]["waits"] and len(t[5]["waits"]) == 1
+          and t[5]["waits"][0][0] == str(b[2]) and t[5]["waits"][0][3:] == (5, 5)
+          and len(t[6]["waits"]) == 1 and t[6]["waits"][0][0] == str(b[2]) and t[6]["waits"][0][3:] == (5, 6),
           f"{t[2]['waits']} {t[4]['waits']} {t[5]['waits']} {t[6]['waits']}")
+    # LAB-3h: a POC is judged from the bar it is received on (other types from the next bar). Price below (1985); POC 2000
+    # (1998-2002) first received on bar 3: high 1999 -> SHORT wait on bar 3; high 1997 -> no contact; bar 4 without a touch keeps the
+    # one wait (no duplicate), bar 5 touches again -> the same wait renewed (last contact 5)
+    def recv(h3):
+        rows = flat(8, 1985)
+        rows[3] = (1988.0, h3, 1987.0, 1989.0)
+        rows[5] = (1988.0, 1999.0, 1987.0, 1989.0)
+        sc = Sc(rows)
+        sc.hold(3, None, **pocv(1, 1999.5, 2000.5, T_HTF))
+        return sc.run(**ONLY_TC, **{**QUIET, **NEW})
+    ra, rb_ = recv(1999.0), recv(1997.0)
+    ta, tb = ra.trace, rb_.trace
+    zp = pocs(ra)[0]
+    rs = Sc(flat(8, 1985))
+    rs.bars[3].update(o=1988.0, h=1999.0, l=1987.0, c=1989.0)
+    sw_feed(rs, 3, 1, True, 2000.0, 1)                                 # a swing line registered on the touch bar: still next bar
+    rsw = rs.run(**ONLY_TC, **{**QUIET, **NEW})
+    check("LB-65 POC from its receiving bar: the first POC (1998-2002) received on bar 3 is touched by that bar's high 1999 -> SHORT "
+          "wait on bar 3 (first / last contact 3); high 1997 (not reaching the band) -> no contact; bar 4 without a touch keeps the one "
+          "wait, the touch on bar 5 renews it (3 -> 5), never two waits; a swing line registered on its touch bar is still not contacted "
+          "on that bar (other types unchanged)",
+          [(w[0], w[1], w[3], w[4]) for w in ta[3]["waits"]] == [(str(zp.id), -1, 3, 3)] and tb[3]["waits"] == []
+          and ta[4]["waits"] == ta[3]["waits"] and [(w[3], w[4]) for w in ta[5]["waits"]] == [(3, 5)] and rsw.trace[3]["waits"] == [],
+          f"{ta[3]['waits']} {tb[3]['waits']} {ta[4]['waits']} {ta[5]['waits']} {rsw.trace[3]['waits']}")
     # display: swing 2001 (1999-2003) merged with POC A (1998-2002) -> one band; after B the swing band stays alone and B is apart
     sc2 = Sc(flat(8, 2050))
     sw_feed(sc2, 1, 1, True, 2001.0, 1)
@@ -1817,6 +1842,7 @@ MUTANTS = [
     ("                f_waitMove(b.id, a.id)\n", "", "bridged swing Zone's waits re-keyed"),
     ("                        oz.dead := true\n                        array.push(lbDeadNow, oz.id)", "                        oz.dead := true",
      "replaced POC's waits cancelled"),
+    ("(z.aBar < bar_index or z.typ == 3)", "(z.aBar < bar_index)", "POC judged from its receiving bar"),
     ("    if not na(lbMa1) and not p1 and p2\n        f_dsPut(lbMa1, true)", "    if false\n        f_dsPut(lbMa1, true)", "display: MA chained through the other MA"),
     ("            if q.bot <= stp + EPS\n                    array.push(sm, q)", "            if q.bot < stp - EPS\n                    array.push(sm, q)",
      "display: regroup after removal (touching bands)"),
