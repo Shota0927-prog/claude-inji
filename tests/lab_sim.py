@@ -873,20 +873,35 @@ def sc_swing_merge():
           len(zm) == 1 and (zm[0].bot, zm[0].top) == (1990.0, 2003.0) and [w[0] for w in rm.trace[3]["waits"]] == [str(zm[0].id)]
           and [e[0] for e in entries(rm)] == [4] and rm["o"].sl == 2008.0 and len(ru.trace[3]["waits"]) == 2,
           f"{[(z.bot, z.top) for z in zm]} {rm.trace[3]['waits']} {entries(rm)} {rm['o'].sl} {ru.trace[3]['waits']}")
-    # the merge bar is judged with the band before the merge: price above, Zone 1998-2002; on bar 3 a 2004 pivot widens it to
-    # 1998-2006 and the bar's low 2005 touches only the new part -> no contact on bar 3; the same low on bar 4 -> LONG wait 1998-2006
-    rows = flat(3, 2012) + [(2010.0, 2011.0, 2005.0, 2009.0), (2009.0, 2010.0, 2005.0, 2009.0)] + flat(4, 2012)
-    sc = Sc(rows)
-    sw_feed(sc, 1, 1, False, 2000.0, 1)
-    sw_feed(sc, 3, 2, False, 2004.0, 2)
-    r = sc.run(**ONLY_TC, **dict(QUIET, **NEW))
+    # the merged Zone is used from the merge bar like any Zone (no old-band exception): price above, Zone 1998-2002; on bar 3 a 2004
+    # pivot widens it to 1998-2006 and the bar's low 2005 touches the merged band -> LONG wait on bar 3 (snapshot 1998-2006);
+    # the same merge with a bar whose low (2007) stays above the merged band -> no contact (merging alone is no contact)
+    def merge_bar(low3):
+        rows = flat(3, 2012) + [(2010.0, 2011.0, low3, 2009.0)] + flat(4, 2012)
+        sc = Sc(rows)
+        sw_feed(sc, 1, 1, False, 2000.0, 1)
+        sw_feed(sc, 3, 2, False, 2004.0, 2)
+        return sc.run(**ONLY_TC, **dict(QUIET, **NEW))
+    r, rn = merge_bar(2005.0), merge_bar(2007.0)
     z = swz(r)[0]
-    w4 = r.trace[4]["waits"]
-    lw = [w for w in r["lbWaits"]]
-    check("LB-55 merging alone is no contact: on the merge bar the Zone is judged with its band before the merge (low 2005 vs 1998-2002: "
-          "no wait); from the next bar the merged band 1998-2006 (low 2005 -> LONG wait, snapshot 1998-2006; expiry from that contact)",
-          r.trace[3]["waits"] == [] and len(w4) == 1 and w4[0][1] == 1 and w4[0][3] == 4 and (z.bot, z.top) == (1998.0, 2006.0)
-          and r["st"].nSwMerge == 1, f"{r.trace[3]['waits']} {w4}")
+    w3 = r.trace[3]["waits"]
+    # bridge on the merge bar: A 2000 / B 2009, the 2004.5 pivot on bar 3 bridges them; the bar's low 2010.5 touches only B's former
+    # part -> one LONG wait on the merged Zone (keyed by A, the survivor), not two
+    rows = flat(3, 2020) + [(2020.0, 2021.0, 2010.5, 2019.0)] + flat(4, 2020)
+    sc = Sc(rows)
+    sw_feed(sc, 1, 1, True, 2000.0, 1)
+    sw_feed(sc, 1, 2, True, 2009.0, 2)
+    sw_feed(sc, 3, 3, True, 2004.5, 3)
+    rb = sc.run(**ONLY_TC, **dict(QUIET, **NEW))
+    zb_ = swz(rb)
+    wb = rb.trace[3]["waits"]
+    check("LB-55 the merged swing Zone is judged from the merge bar with its merged band, like any Zone: low 2005 vs 1998-2006 on the "
+          "merge bar -> LONG wait (first / last contact = that bar, snapshot 1998-2006); low 2007 (above the band) -> no contact "
+          "(merging alone is no contact); a bridge on the contact bar gives one wait on the merged Zone 1998-2011 (not one per old Zone)",
+          len(w3) == 1 and w3[0][1] == 1 and w3[0][3] == 3 and w3[0][4] == 3 and (z.bot, z.top) == (1998.0, 2006.0)
+          and r["lbWaits"][0].eBot == 1998.0 and r["lbWaits"][0].eTop == 2006.0 and rn.trace[3]["waits"] == []
+          and len(zb_) == 1 and (zb_[0].bot, zb_[0].top) == (1998.0, 2011.0) and [w[0] for w in wb] == [str(zb_[0].id)] and wb[0][1] == 1,
+          f"{w3} {rn.trace[3]['waits']} {wb} {[(q.bot, q.top) for q in zb_]}")
     # bridge with a pending wait: A 2000 (1998-2002), B 2009 (2007-2011); price above, B touched on bar 3 -> LONG wait (B); on bar 4
     # a 2004.5 pivot bridges A and B -> A absorbs B, the wait is re-keyed to A with its last contact / snapshot / expiry unchanged
     rows = flat(3, 2020) + [(2020.0, 2021.0, 2010.5, 2019.0)] + flat(4, 2020)
@@ -1693,7 +1708,7 @@ MUTANTS = [
     ("                    hit := g.bot <= ng.top + EPS and ng.bot <= g.top + EPS", "                    hit := g.bot < ng.top and ng.bot < g.top",
      "display: merge bands that touch (EPS)"),
     ("f_dsMerge(LbZone z) =>\n    z.typ != 4", "f_dsMerge(LbZone z) =>\n    true", "display: FVG not merged"),
-    ("            if z.mBar == bar_index\n                zb := z.oBot", "            if false\n                zb := z.oBot", "swing merge bar judged with the old band"),
+    ("        st.nSwMerge += 1", "        a.aBar := bar_index\n        st.nSwMerge += 1", "merged swing Zone judged from the merge bar"),
     ("    array<LbZone> aArr = side == 1 ? lbZs : lbZsT\n    int ia = side == 1 ? f_lbLower(lbZs, ref + EPS) : f_lbLowerT(lbZsT, ref - EPS) - 1",
      "    array<LbZone> aArr = lbZs\n    int ia = side == 1 ? f_lbLower(lbZs, ref + EPS) : f_lbLower(lbZs, ref) - 1", "SHORT TP by tops (variable width)"),
     ("pv <= array.max(q.mP) + zcMerge + EPS", "pv < array.max(q.mP) + zcMerge - EPS", "swing merge distance boundary"),
