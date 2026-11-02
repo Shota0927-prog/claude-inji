@@ -887,6 +887,196 @@ def sc_display():
           f"{len(entries(a))} {len(entries(b))}")
 
 
+class _CatGuard(__import__("ast").NodeTransformer):
+    """every + / += of the translated logic goes through _cat, which raises like Pine when a string result is longer than 4096
+    characters (Pine checks each concatenation, so the guard has to come before the concatenation, not after it)"""
+
+    def visit_BinOp(self, n):
+        self.generic_visit(n)
+        A = __import__("ast")
+        if isinstance(n.op, A.Add):
+            return A.copy_location(A.Call(A.Name("_cat", A.Load()), [n.left, n.right], []), n)
+        return n
+
+    def visit_AugAssign(self, n):
+        self.generic_visit(n)
+        A = __import__("ast")
+        if isinstance(n.op, A.Add) and isinstance(n.target, A.Name):
+            return A.copy_location(A.Assign([n.target], A.Call(A.Name("_cat", A.Load()), [A.Name(n.target.id, A.Load()), n.value], [])), n)
+        return n
+
+
+def _cat(a, b):
+    r = a + b
+    if isinstance(r, str) and len(r) > 4096:
+        raise lp.ap.PineRuntimeError(f"String is too long {len(r)}, max allowed length is 4096.")
+    return r
+
+
+def guarded_env(src=None):
+    """a run's env whose functions are re-defined from the translated logic with every concatenation length-checked (4096)"""
+    import ast
+    r = lp.Runner(overrides=dict(QUIET, zbUse1=True, zbUse2=True), src=src).run(Sc(flat(2, 2000)).bars)
+    tree = _CatGuard().visit(ast.parse(lp.transpile(r.src)))
+    ast.fix_missing_locations(tree)
+    e = r.env
+    e["_cat"] = _cat
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            exec(compile(ast.Module([node], []), "<guarded>", "exec"), e)
+    return e
+
+
+def ds_ref(e, zs, lim, nmax):
+    """reference of the display text rule: names per TF (higher first), TF x item once, greedy in order; details greedy up to nmax
+    and lim characters; anything that does not fit is never joined and counted in 'ほか○件'"""
+    rank = lambda z: (5 if z.tf == 0 else 4) if z.typ == 1 else ((3, 2, 1)[z.tf] if z.typ == 0 else (3, 2, 1, 0)[z.tf])
+    tfn = ("週足", "日足", "4時間足", "1時間足", "5分足", "1分足")
+    lines, om = [], 0
+    for r in range(6):
+        its = []
+        for z in zs:
+            if rank(z) == r and e["f_zItem"](z) not in its:
+                its.append(e["f_zItem"](z))
+        if not its:
+            continue
+        cur = "\n".join(lines)
+        room = lim - len(cur) - (1 if lines else 0)
+        ln, k = tfn[r] + "｜", 0
+        for it in its:
+            if len(ln) + (1 if k else 0) + len(it) <= room:
+                ln, k = ln + ("＋" if k else "") + it, k + 1
+            else:
+                om += 1
+        if k:
+            lines.append(ln)
+    tx = "\n".join(lines) + (("\n" if lines else "") + f"ほか{om}件" if om else "")
+    det, dom = [], 0
+    for z in zs:
+        d = (e["f_tfName"](z.typ, z.tf) + " " + e["f_zItem"](z) + f"  #{z.id}  " + e["str__tostring"](z.bot, "#.##") + "〜"
+             + e["str__tostring"](z.top, "#.##")
+             + (f"  (区画 {e['str__tostring'](z.infoA, '#.##')}〜{e['str__tostring'](z.infoB, '#.##')})" if z.typ == 3 else ""))
+        if len(det) < nmax and len("\n".join(det)) + (1 if det else 0) + len(d) <= lim:
+            det.append(d)
+        else:
+            dom += 1
+    tip = "\n".join(det) + (("\n" if det else "") + f"ほか{dom}件" if dom else "")
+    return tx, tip
+
+
+def big_band(e, n, seed=1):
+    """n Zones of every type / TF chained into one overlapping band (bot step 0.5, width 12)"""
+    LbZone = e["LbZone"]
+    rnd = random.Random(seed)
+    zs, fv = [], []
+    for i in range(n):
+        b = 1900.0 + 0.5 * i
+        t = rnd.choice([0, 2, 3, 4])
+        if t == 4:
+            fv.append(LbZone.new(10000 + i, 4, rnd.randint(0, 3), rnd.choice([1, -1]), b + 6, b, b + 12.0))
+            fv[-1].inv = rnd.random() < 0.5
+        else:
+            zs.append(LbZone.new(10000 + i, t, rnd.randint(0, 2 if t == 0 else 3), rnd.choice([1, -1]), b + 6, b, b + 12.0,
+                                 b + 5.5, b + 6.5))
+    e["lbZs"] = sorted(zs, key=lambda z: z.bot)
+    e["lbFvgs"] = sorted(fv, key=lambda z: z.bot)
+    e["zbMa1"], e["zbMa2"] = 1950.0, 1960.0
+    e["lbMa1"] = LbZone.new(201, 1, 0, 0, 1950.0, 1944.0, 1956.0)
+    e["lbMa2"] = LbZone.new(202, 1, 1, 0, 1960.0, 1954.0, 1966.0)
+    return len(zs) + len(fv) + 2
+
+
+def sc_ds_len():
+    # LAB-3b (RE10000 "String is too long 4098" at f_dsText): length guard before every concatenation; many Zones in one band
+    e = guarded_env()
+    n = big_band(e, 600)
+    nz0, nf0 = len(e["lbZs"]), len(e["lbFvgs"])
+    mem, gB, gT, gS, gE = e["f_dsGroups"]()
+    tx, tip = e["f_dsText"](mem, gS[0], gE[0])
+    rtx, rtip = ds_ref(e, mem[gS[0]:gE[0] + 1], 3000, 20)
+    shown = [l for l in tip.split("\n") if "#" in l]
+    lines = tx.split("\n")
+    check("LB-50 many Zones in one band (600 of every type / TF + both MAs chained, the RE10000 case): one display band over the whole "
+          "range with all members (grouping / internal Zones not reduced), name = one line per TF with TF x item once (no 'ほか' needed), "
+          "tooltip = 20 details + 'ほか582件' (exact), every concatenation length-checked (no string over 4096 at any step)",
+          len(gB) == 1 and gB[0] == 1900.0 and gT[0] == 1900.0 + 0.5 * 599 + 12.0 and gE[0] - gS[0] + 1 == n
+          and len(e["lbZs"]) == nz0 and len(e["lbFvgs"]) == nf0 and tx == rtx and tip == rtip and "ほか" not in tx
+          and len(lines) == 6 and len(shown) == 20 and tip.endswith(f"\nほか{n - 20}件") and len(tip) <= 3000 + 12,
+          f"{len(gB)} {n} {tx!r} {tip[-40:]!r}")
+    # the 3000-character limit with real Zones: detail count limit raised so that the character limit binds
+    e["DS_TIP_N"] = 10 ** 6
+    tx2, tip2 = e["f_dsText"](mem, gS[0], gE[0])
+    _, rtip2 = ds_ref(e, mem[gS[0]:gE[0] + 1], 3000, 10 ** 6)
+    body = tip2[:tip2.rindex("\n")]
+    k = len([l for l in tip2.split("\n") if "#" in l])
+    nxt = rtip2  # same rule
+    d_next = mem[gS[0] + k]
+    check("LB-50b body limit 3000 with real Zones (count limit lifted): body <= 3000, the next detail would pass 3000 (checked before "
+          "joining, not cut), 'ほか○件' = all the rest exactly, final text < 4096",
+          tip2 == nxt and len(body) <= 3000 and tip2.endswith(f"\nほか{n - k}件") and len(tip2) < 4096 and k < n
+          and len(body) + 1 + len(e["f_dsDetail"](d_next)[0]) > 3000, f"{k} {len(body)}")
+    e["DS_TIP_N"] = 20
+    # boundaries with Japanese text / line breaks / omission: small limits vs the reference (exact fit, one over, long single details)
+    LbZone = e["LbZone"]
+    rnd = random.Random(5)
+    bad, hit = [], set()
+    for case in range(400):
+        zs = []
+        for i in range(rnd.randint(1, 30)):
+            t = rnd.choice([0, 1, 2, 3, 4])
+            z = LbZone.new(rnd.choice([7, 77, 7777]) + i, t, rnd.randint(0, 1 if t == 1 else 2 if t == 0 else 3), rnd.choice([1, -1]),
+                           2000.0, round(1990 + rnd.uniform(0, 5), rnd.choice([0, 2])), 2010.0, 1999.5, 2000.25)
+            z.inv = rnd.random() < 0.3
+            zs.append(z)
+        lim = rnd.choice([0, 5, 8, 20, 40, 60, 100, 200]) + rnd.randint(-2, 2)
+        nmax = rnd.choice([0, 1, 3, 20])
+        dets = [e["f_dsDetail"](z)[0] for z in zs]
+        if case % 4 == 0:     # exact fit / one over for the first k details
+            kk = rnd.randint(1, len(zs))
+            lim = len("\n".join(dets[:kk])) - rnd.choice([0, 1])
+        e["DS_TXT_MAX"], e["DS_TIP_N"] = lim, nmax
+        got = e["f_dsText"](zs, 0, len(zs) - 1)
+        want = ds_ref(e, zs, lim, nmax)
+        if got != want:
+            bad.append((case, got, want))
+        if "ほか" in got[0]:
+            hit.add("name")
+        if "ほか" in got[1]:
+            hit.add("tip")
+        if got[1].startswith("ほか"):
+            hit.add("tip-none")
+    e["DS_TXT_MAX"], e["DS_TIP_N"] = 3000, 20
+    # exact boundary by hand: three equal details fit exactly at their joined length, one character less drops the third
+    zs = [LbZone.new(11 + i, 2, 1, 1, 2000.0, 1990.0, 2010.0) for i in range(3)]
+    d3 = "\n".join(e["f_dsDetail"](z)[0] for z in zs)
+    e["DS_TXT_MAX"] = len(d3)
+    a = e["f_dsText"](zs, 0, 2)[1]
+    e["DS_TXT_MAX"] = len(d3) - 1
+    b = e["f_dsText"](zs, 0, 2)[1]
+    e["DS_TXT_MAX"] = 3000
+    check("LB-51 display text boundaries (Japanese names, line breaks, omission) == reference over 400 cases with small limits incl. "
+          "exact fit / one character over, details longer than the limit (never joined, only counted), no detail shown "
+          "('ほか○件' alone), names omitted in a line; by hand: 3 details fit at exactly their joined length (3000 rule: <=), "
+          "one character less -> 2 details + 'ほか1件'",
+          not bad and hit == {"name", "tip", "tip-none"} and a == d3 and b == "\n".join(d3.split("\n")[:2]) + "\nほか1件",
+          f"{bad[:1]} {hit}")
+    # the LAB-3 text builder (fa7f17f) fails on the same band under the same length check: the guard really models the error
+    try:
+        eo = guarded_env(src=git("show", DS_OLD_REV + ":ZoneComboLabXAU.pine"))
+        big_band(eo, 600)
+        mo, _, _, so, eo_ = eo["f_dsGroups"]()
+        eo["f_dsText"](mo, so[0], eo_[0])
+        old_err = ""
+    except lp.ap.PineRuntimeError as ex:
+        old_err = str(ex)
+    check("LB-52 the LAB-3 display text (fa7f17f) on the same 600-Zone band raises 'String is too long' under the per-concatenation "
+          "length check (the RE10000 reported on TradingView), the fixed version does not (LB-50)",
+          old_err.startswith("String is too long"), old_err)
+
+
+DS_OLD_REV = "fa7f17f"   # LAB-3 (before the display text length guard)
+
+
 OLD2_REV = "57b7b76"     # LAB-2 (before the display grouping / accum box count)
 
 
@@ -1401,12 +1591,15 @@ MUTANTS = [
      "        if na(r) and array.get(o.legLots, k - 1) > 0\n            r := array.get(o.legPx, k - 1)\n    r\n\nf_lbTpText", "BE lock target = farthest TP"),
     ("if lkBlk and array.size(lbWaits) > 0", "if false", "waits cleared while locked"),
     ("if xs != 0\n                    array.push(xId, z.id)", "if false\n                    array.push(xId, z.id)", "break cancels the wait"),
+    ("            if dOk and f_dsFits(tip, sep, d, DS_TXT_MAX)", "            if dOk", "tooltip length check before joining"),
+    ("                if f_dsFits(ln, sep, it, DS_TXT_MAX - str.length(tx) - str.length(sepL))", "                if true",
+     "name length check before joining"),
 ]
 
 
 def mutation():
     scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_qty_table, sc_be, sc_lock_far, sc_and_only_sel, sc_sel_tp, sc_consume, sc_zones, sc_acc_keep, sc_dup_swing, sc_ta,
-            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref]
+            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref, sc_ds_len]
     survived = []
     for old, new, what in MUTANTS:
         if SRC.count(old) != 1:
@@ -1451,6 +1644,7 @@ def main():
     sc_zones()
     sc_acc_keep()
     sc_display()
+    sc_ds_len()
     sc_old2_new()
     sc_dup_swing()
     sc_ta()

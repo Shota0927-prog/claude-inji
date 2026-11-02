@@ -193,6 +193,7 @@ class Runner:
         env.update(
             array__insert=self._insert,
             array__includes=lambda arr, v: v in arr, array__new_string=lambda n=0, v=None: [v] * n,
+            str__length=len,     # LAB-3b: display text length guard (Japanese text: 1 character each)
             map__new=lambda *a: {}, map__get=lambda m, k: m.get(k), map__put=lambda m, k, v: m.__setitem__(k, v),
             map__remove=lambda m, k: m.pop(k, None), map__clear=lambda m: m.clear(), map__size=len,
             map__contains=lambda m, k: k in m,
