@@ -26,7 +26,7 @@ import acc_pine as ap     # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PINE = os.path.join(ROOT, "ZoneComboLabXAU.pine")
 LOGIC_BEGIN, LOGIC_END = "// ==== LAB Logic (begin) ", "// ==== LAB Logic (end) "
-ap.NAMESPACES.update({"alert", "extend", "map"})
+ap.NAMESPACES.update({"alert", "extend", "map", "text"})
 # map.new<K, V>() is outside the ACC tokenizer's generic pattern: add it (same form as array.new<T>)
 ap.TOKEN_RE = __import__("re").compile(ap.TOKEN_RE.pattern.replace(r"(?P<gen>array\.new<[\w<>]+>)", r"(?P<gen>(?:array|map)\.new<[\w<>, ]+>)"), ap.re.X)
 M5 = 300_000
@@ -165,6 +165,11 @@ FEED_DEFAULT["zdProto"] = 10001.0
 FEED_DEFAULT.update(zbMa1=None, zbMa2=None, labS1=None, labS2=None, labS3=None, satTf4=None, satTf1=None, labRangeOK=True)
 
 
+# LAB-3e: the older scenarios were built for the 6-dollar common width and unmerged swing lines; lab_sim sets
+# LEGACY = dict(zHalf=6.0, zcMerge=-1.0) for them (a negative distance never merges) and the new scenarios override both
+LEGACY = {}
+
+
 class Runner:
     """bars: dicts with t (open time ms), o, h, l, c and any feed variable of FEED_DEFAULT (missing = its default, e.g. na).
     Feed variables persist only for the bar they are given on (request.security delivers a value on every bar: tests that need
@@ -174,6 +179,9 @@ class Runner:
         self.src = src if src is not None else (SRC_OVERRIDE or read_source())
         self.code = compile(transpile(self.src), "<ZoneComboLabXAU logic>", "exec")
         self.inp = ap.inputs(self.src)
+        for k, v in LEGACY.items():     # settings the older scenarios were written for (only inputs this source has)
+            if k in self.inp:
+                self.inp[k] = v
         for k in (overrides or {}):
             if k not in self.inp:
                 raise KeyError("unknown input " + k)
@@ -194,6 +202,8 @@ class Runner:
             array__insert=self._insert,
             array__includes=lambda arr, v: v in arr, array__new_string=lambda n=0, v=None: [v] * n,
             array__join=lambda arr, sep=",": sep.join(arr),
+            array__min=lambda arr: min(arr) if arr else None, array__max=lambda arr: max(arr) if arr else None,
+            label__set_x=_set("x"), label__style_label_left="left", text__align_left="left",
             map__new=lambda *a: {}, map__get=lambda m, k: m.get(k), map__put=lambda m, k, v: m.__setitem__(k, v),
             map__remove=lambda m, k: m.pop(k, None), map__clear=lambda m: m.clear(), map__size=len,
             map__contains=lambda m, k: k in m,

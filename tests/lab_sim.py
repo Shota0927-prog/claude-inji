@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lab_pine as lp     # noqa: E402
+lp.LEGACY = dict(zHalf=6.0, zcMerge=-1.0)     # LAB-3e: the scenarios below were written for these (new scenarios override them)
 
 ROOT = lp.ROOT
 SRC = lp.read_source()
@@ -815,6 +816,157 @@ def sc_dup_swing():
           and r.trace[4]["tevs"] == [(2, -1, 4, True)], f"{len(zc)} {r.trace[3]['waits']} {ev}")
 
 
+NEW = dict(zHalf=2.0, zcMerge=5.0)     # LAB-3e defaults (common width +-2, swing merge distance 5)
+
+
+def sw_feed(sc, i, tf, hi, price, k_off):
+    """one new swing pivot of TF tf (1..4), high (hi=True) or low, registered on bar i (time key = T_HTF - k_off hours)"""
+    s = "h" if hi else "l"
+    sc.set(i, **{f"s{tf}{s}": price, f"s{tf}{s}t": T_HTF - k_off * 3600_000})
+    return sc
+
+
+def swz(r):
+    return [z for z in r["lbZs"] if z.typ == 2]
+
+
+def sc_swing_merge():
+    # distance boundary / chain / bridge (zHalf 2, distance 5): 4300 / 4304 / 4308 -> one Zone 4298-4310
+    def run(pivots, n=8, **ov):
+        sc = Sc(flat(n, 4250))
+        for i, tf, hi, p, ko in pivots:
+            sw_feed(sc, i, tf, hi, p, ko)
+        return sc.run(**ONLY_TC, **dict(QUIET, **NEW, **ov))
+    r1 = run([(1, 1, True, 4300.0, 1), (2, 2, False, 4304.0, 2), (3, 3, True, 4308.0, 3)])
+    z1 = swz(r1)
+    r2 = run([(1, 1, True, 4300.0, 1), (2, 2, True, 4305.0, 2)])
+    r3 = run([(1, 1, True, 4300.0, 1), (2, 2, True, 4305.5, 2)])
+    r4 = run([(1, 1, True, 4300.0, 1), (2, 2, True, 4309.0, 2), (4, 3, False, 4304.5, 3)])
+    z4 = swz(r4)
+    r5 = run([(1, 1, True, 4300.0, 1), (2, 2, True, 4304.0, 2), (3, 3, True, 4308.0, 3)], zHalf=6.0, zcMerge=-1.0)
+    check("LB-53 swing merge (common width 2, distance 5): 4300 (1H high) / 4304 (4H low) / 4308 (D high) chain into one Zone "
+          "4298-4310 that keeps the members' TF / price / pivot time / ID; distance exactly 5 merges, 5.5 does not; a new 4304.5 "
+          "between 4300 and 4309 bridges both into the older Zone (one Zone 4298-4311, the other dead); negative distance = no merge",
+          len(z1) == 1 and (z1[0].bot, z1[0].top) == (4298.0, 4310.0) and list(z1[0].mP) == [4300.0, 4304.0, 4308.0]
+          and list(z1[0].mTf) == [0, 1, 2] and len(set(z1[0].mId)) == 3 and list(z1[0].mT) == [T_HTF - 3600_000, T_HTF - 7200_000, T_HTF - 10800_000]
+          and r1["lbNZone"][2] == 1 and r1["st"].nSwMerge == 2
+          and len(swz(r2)) == 1 and len(swz(r3)) == 2
+          and len(z4) == 1 and (z4[0].bot, z4[0].top) == (4298.0, 4311.0) and sorted(z4[0].mP) == [4300.0, 4304.5, 4309.0]
+          and z4[0].id == min(z.id for z in swz(run([(1, 1, True, 4300.0, 1), (2, 2, True, 4309.0, 2)]))) and r4["lbNZone"][2] == 1
+          and len(swz(r5)) == 3 and [z.id for z in r4["lbZs"]] == [z.id for z in r4["lbZsT"]],
+          f"{[(z.bot, z.top, list(z.mP)) for z in z1]} {len(swz(r2))} {len(swz(r3))} {[(z.bot, z.top) for z in z4]} {len(swz(r5))}")
+    # contact / SL with the merged width: 1992 / 1996.5 / 2001 -> one Zone 1990-2003; TOUCH_A (high 1995) from below -> one SHORT
+    # wait (the members are not separate candidates); TC -> entry, SL = merged top 2003 + 5. Unmerged (distance off): two waits
+    def touch(**ov):
+        rows = flat(3, 1985) + [TOUCH_A, TC_AFTER] + flat(10, 1988)
+        sc = Sc(rows)
+        sw_feed(sc, 1, 1, True, 1992.0, 1)
+        sw_feed(sc, 1, 2, True, 1996.5, 2)
+        sw_feed(sc, 2, 3, False, 2001.0, 3)
+        sc.set(4, labS1=L_AFTER)
+        return sc.run(**ONLY_TC, **dict(QUIET, **NEW, **ov))
+    rm, ru = touch(), touch(zcMerge=-1.0)
+    zm = swz(rm)
+    check("LB-54 the merged swing Zone is the trading Zone: 1992 / 1996.5 / 2001 -> 1990-2003; one contact from below -> one SHORT wait "
+          "keyed by the merged Zone (members never used as separate candidates), TC -> one order with SL = 2003 + 5 = 2008 (variable "
+          "width); with merging off the same bars give two waits (1990-1994 and 1994.5-1998.5)",
+          len(zm) == 1 and (zm[0].bot, zm[0].top) == (1990.0, 2003.0) and [w[0] for w in rm.trace[3]["waits"]] == [str(zm[0].id)]
+          and [e[0] for e in entries(rm)] == [4] and rm["o"].sl == 2008.0 and len(ru.trace[3]["waits"]) == 2,
+          f"{[(z.bot, z.top) for z in zm]} {rm.trace[3]['waits']} {entries(rm)} {rm['o'].sl} {ru.trace[3]['waits']}")
+    # the merge bar is judged with the band before the merge: price above, Zone 1998-2002; on bar 3 a 2004 pivot widens it to
+    # 1998-2006 and the bar's low 2005 touches only the new part -> no contact on bar 3; the same low on bar 4 -> LONG wait 1998-2006
+    rows = flat(3, 2012) + [(2010.0, 2011.0, 2005.0, 2009.0), (2009.0, 2010.0, 2005.0, 2009.0)] + flat(4, 2012)
+    sc = Sc(rows)
+    sw_feed(sc, 1, 1, False, 2000.0, 1)
+    sw_feed(sc, 3, 2, False, 2004.0, 2)
+    r = sc.run(**ONLY_TC, **dict(QUIET, **NEW))
+    z = swz(r)[0]
+    w4 = r.trace[4]["waits"]
+    lw = [w for w in r["lbWaits"]]
+    check("LB-55 merging alone is no contact: on the merge bar the Zone is judged with its band before the merge (low 2005 vs 1998-2002: "
+          "no wait); from the next bar the merged band 1998-2006 (low 2005 -> LONG wait, snapshot 1998-2006; expiry from that contact)",
+          r.trace[3]["waits"] == [] and len(w4) == 1 and w4[0][1] == 1 and w4[0][3] == 4 and (z.bot, z.top) == (1998.0, 2006.0)
+          and r["st"].nSwMerge == 1, f"{r.trace[3]['waits']} {w4}")
+    # bridge with a pending wait: A 2000 (1998-2002), B 2009 (2007-2011); price above, B touched on bar 3 -> LONG wait (B); on bar 4
+    # a 2004.5 pivot bridges A and B -> A absorbs B, the wait is re-keyed to A with its last contact / snapshot / expiry unchanged
+    rows = flat(3, 2020) + [(2020.0, 2021.0, 2010.5, 2019.0)] + flat(4, 2020)
+    sc = Sc(rows)
+    sw_feed(sc, 1, 1, True, 2000.0, 1)
+    sw_feed(sc, 1, 2, True, 2009.0, 2)
+    sw_feed(sc, 4, 3, True, 2004.5, 3)
+    r = sc.run(**ONLY_TC, **dict(QUIET, **NEW))
+    za = swz(r)
+    w3, w4 = r.trace[3]["waits"], r.trace[4]["waits"]
+    check("LB-56 bridging two swing Zones keeps the pending wait: the wait from B's contact (bar 3) is re-keyed to the surviving Zone "
+          "(same side / first and last contact / band snapshot), the waits map follows, nothing is cancelled",
+          len(za) == 1 and len(w3) == 1 and len(w4) == 1 and w4[0][0] == str(za[0].id) and w3[0][0] != w4[0][0]
+          and w4[0][1:] == w3[0][1:] and list(r["lbWaitMap"].keys()) == ["1#" + str(za[0].id)]
+          and r["lbWaits"][0].eBot == 2007.0 and r["lbWaits"][0].eTop == 2011.0, f"{w3} {w4} {[(z.bot, z.top) for z in za]}")
+    # TP with variable widths (SHORT reads the Zones by their tops): swing lows 1952..1978 (step 4) -> one Zone 1950-1980, POC 1955
+    # (1953-1957) inside it, POC 1930 below; SHORT targets from 2000: [1980, 1932] (by bottoms the POC would come first: 1957)
+    sc = Sc(flat(12, 2050))
+    for i, p in enumerate([1952.0, 1956.0, 1960.0, 1964.0, 1968.0, 1972.0, 1976.0, 1978.0]):
+        sw_feed(sc, 1 + i, 1, False, p, 20 - i)
+    poc(sc, 1, 1955.0)
+    poc(sc, 1, 1930.0, k=2)
+    r = sc.run(**ONLY_TC, **dict(QUIET, **NEW))
+    tps = r.env["f_lbTargets"](-1, 2000.0)
+    tpl = r.env["f_lbTargets"](1, 1900.0)
+    check("LB-57 TP search with variable widths: SHORT reads the static Zones by their tops (lbZsT): targets from 2000 = [1980, 1932] "
+          "(merged swing 1950-1980 with the POC 1953-1957 inside = one band); LONG from 1900 = [1928, 1950]",
+          [z.bot for z in swz(r)] == [1950.0] and tps == [1980.0, 1932.0] and tpl == [1928.0, 1950.0], f"{tps} {tpl}")
+    # display ON / OFF with the new defaults on a random path with swing merges
+    sc = rand_bars(5, n=400)
+    a = lp.Runner(overrides=dict(NEW, zbUse2=False, dsZone=True, dsEnt=True)).run(sc.bars)
+    b = lp.Runner(overrides=dict(NEW, zbUse2=False, dsZone=False, dsEnt=False)).run(sc.bars)
+    check("LB-58 new defaults (width 2, distance 5) on a 400-bar random path with swing merges: display ON / OFF gives identical orders, "
+          "fills, waits and ledger",
+          a.broker.log == b.broker.log and a.trace == b.trace and list(a["bkNet"]) == list(b["bkNet"]) and a["st"].nSwMerge > 0
+          and len(entries(a)) > 0, f"{a['st'].nSwMerge} {len(entries(a))}")
+
+
+def sc_names_labels():
+    # names (short) and the right-side labels; POC received normally; MA added / removed on confirmed bars
+    sc = Sc(flat(10, 2050))
+    sw_feed(sc, 1, 1, True, 2000.0, 1)
+    sw_feed(sc, 1, 2, False, 2003.0, 2)          # 1H + 4H swing merged (1998-2005)
+    poc(sc, 1, 2004.0)                            # 1H POC (received normally) 2002-2006: overlaps the swing band
+    poc(sc, 1, 2100.0, k=2)                       # 4H POC alone
+    sc.hold(2, None, g2k=T_HTF, g2c=2061.0, g2d=1, g2t=2040.0, g2b=2030.0)      # 4H bullish FVG 2030-2040
+    zb = {3: 2020.0, 4: 2007.0, 5: 2020.0}
+    for i in range(10):
+        sc.set(i, zbMa1=zb.get(i, 2020.0))
+    run = lp.Runner(overrides=dict(**ONLY_TC, **dict(QUIET, **NEW, zbUse1=True, dsZone=True)))
+    texts = []
+    for i, bar in enumerate(sc.bars):
+        run.step(bar)
+        texts.append(sorted(g.lb.text for g in run.env["lbDsG"] if not g.gone))
+    e = run.env
+    st = e["st"]
+    swing_poc = "4時間足｜水平線\n1時間足｜水平線＋出来高POC"
+    gs = [g for g in e["lbDsG"] if not g.gone]
+    pos_ok = all(g.lb.args[0] == g.lb.x if hasattr(g.lb, "x") else True for g in gs)
+    created = {id(g.lb): g.lb.args[0] for g in gs}
+    e["bar_index"] = 500
+    e["f_dsLblX"]()
+    moved = all(g.lb.x == 503 and g.lb.args[1] == (g.bot + g.top) / 2.0 and g.bx.kw.get("text") is None for g in gs)
+    alive_lb = {id(d) for d in run.draws if d.kind == "label" and not d.deleted}
+    check("LB-59 names: '4時間足｜水平線' / '1時間足｜水平線＋出来高POC' (merged 1H + 4H swing lines with the normally received 1H POC), "
+          "'4時間足｜出来高POC' alone, '4時間足｜FVG'; the 1m MA joins the overlapping band on the confirmed bar where its band overlaps "
+          "(bar 4: '…\n1分足｜MA EMA3000') and leaves on the next confirmed bar it does not (bar 5); one name label per shown band "
+          "(no text in the box) at bar + 3 / mid height, moved to the latest bar + 3 by f_dsLblX, labels of merged / removed bands deleted",
+          texts[3] == sorted([swing_poc, "4時間足｜出来高POC", "4時間足｜FVG"])
+          and texts[4] == sorted([swing_poc + "\n1分足｜MA EMA3000", "4時間足｜出来高POC", "4時間足｜FVG"])
+          and texts[5] == texts[3] and moved and alive_lb == {id(g.lb) for g in gs} and len(gs) == 3,
+          f"{texts[3]} {texts[4]} {texts[5]} {moved} {len(alive_lb)} {len(gs)}")
+    # iFVG name
+    zf = [z for g in gs for z in g.mem if z.typ == 4][0]
+    zf.inv = True
+    e["f_dsRename"](zf)
+    check("LB-59b iFVG name '4時間足｜iFVG' (renamed in place on its own band)",
+          sorted(g.lb.text for g in e["lbDsG"] if not g.gone) == sorted([swing_poc, "4時間足｜出来高POC", "4時間足｜iFVG"]))
+
+
 def acc_feed(sc, k, boxes):
     """accum feed for TF k (1..3): boxes = [(i0, i1, u, l, id, forming)] held on bars i0..i1-1"""
     for i0, i1, u, l, aid, a in boxes:
@@ -1590,6 +1742,8 @@ def main():
     sc_display()
     sc_old2_new()
     sc_dup_swing()
+    sc_swing_merge()
+    sc_names_labels()
     sc_ta()
     sc_session()
     sc_and_timing()

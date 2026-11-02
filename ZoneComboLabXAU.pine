@@ -102,7 +102,7 @@ prStart = input.time(timestamp("2024-01-01T00:00:00+09:00"), "開始", group = G
 prEnd   = input.time(timestamp("2100-01-01T00:00:00+09:00"), "終了 (含まない)", group = G_PR)
 
 var string G_ZW = "02 · Zone 共通"
-zHalf = input.float(6.0, "共通の価格帯幅 (中心から上下 $)", minval = 0.0, step = 0.5, group = G_ZW,
+zHalf = input.float(2.0, "共通の価格帯幅 (中心から上下 $)", minval = 0.0, step = 0.5, group = G_ZW,
      tooltip = "ZA / ZB / ZC / ZD の帯 = 中心 ± この値 (全幅はこの 2 倍)。ZF (FVG) は本来の上下限を使う。")
 
 var string G_ZA = "02a · ZA アキュム (1H / 4H / D)"
@@ -144,6 +144,9 @@ zcPiv3 = input.int(6, "日足 左右の本数", minval = 1, group = G_ZC)
 zcUse4 = input.bool(true, "週足 Swing", group = G_ZC)
 zcPiv4 = input.int(6, "週足 左右の本数", minval = 1, group = G_ZC,
      tooltip = "ta.pivothigh / pivotlow (右側の本数が確定してから)。上位足は確定した足だけ (上位足の中で [1]・lookahead_on)。")
+zcMerge = input.float(5.0, "水平線の統合距離 ($)", minval = 0.0, step = 0.5, group = G_ZC,
+     tooltip = "元の水平線同士の価格差がこの値以内なら同じ水平線 Zone にまとめる (時間足・高値 / 安値を問わず、隣同士が以内で連鎖すればすべて)。\n" +
+     "Zone = 構成水平線の最安値 − 共通幅 〜 最高値 + 共通幅。接触・エントリー・SL・TP 候補・AND・「だけ」の判定にも統合後の Zone を使う。")
 
 var string G_ZD = "02d · ZD 出来高 POC (外部: MtfPocFeedXAU の出力を受信)"
 zdUse1 = input.bool(true, "1H POC", group = G_ZD)
@@ -265,7 +268,7 @@ stBeBand = input.float(1000.0, "建値扱いの上限 (円)", minval = 0.0, step
 
 var string G_DS = "10 · 表示 (売買・内部保持数には影響しない)"
 dsZone    = input.bool(true, "Zone の帯を表示", group = G_DS)
-dsZoneMax = input.int(80, "表示する帯の最大数 (重なりを統合した帯。古い帯から消す)", minval = 1, maxval = 400, group = G_DS)
+dsZoneMax = input.int(80, "表示する帯の最大数 (重なりを統合した帯。古い帯から消す)", minval = 1, maxval = 300, group = G_DS)
 dsEnt     = input.bool(true, "エントリーラベルを表示", group = G_DS)
 dsEntMax  = input.int(50, "エントリーラベルの最大数", minval = 1, maxval = 200, group = G_DS)
 dsTbl     = input.bool(true, "集計表を表示", group = G_DS)
@@ -559,7 +562,14 @@ type LbZone
     int   brk      = 0        // 直近の突破: 1 上抜け / -1 下抜け / 0 なし
     int   brkBar   = 0
     bool  inv      = false    // ZF: iFVG
-    bool  dead     = false    // ZF: 無効 / 採用件数から外れたアキュムの辺
+    bool  dead     = false    // ZF: 無効 / 採用件数から外れたアキュムの辺 / 他の水平線 Zone に統合された水平線 Zone
+    int   mBar     = -1       // ZC: 統合で帯が変わった足 (その足の接触判定は変わる前の帯 oBot〜oTop で行う)
+    float oBot
+    float oTop
+    array<float> mP           // ZC: 構成水平線の元価格・時間足・成立時刻 (Pivot 時刻)・ID (登録順)
+    array<int>   mTf
+    array<int>   mT
+    array<int>   mId
 
 // 形成中の Accum (固定したら Zone にして外す)
 type LbAcc
@@ -677,6 +687,7 @@ type LbSt
     int   nQtyAnom = 0
     int   nIfvg    = 0
     int   nFvgDead = 0
+    int   nSwMerge = 0        // 水平線の統合 (既存の水平線 Zone に新しい水平線を加えた回数)
     int   nAccOut  = 0        // 採用件数から外れたアキュムの辺
     int   nTouch   = 0
     int   nCancel  = 0
@@ -696,6 +707,8 @@ var LbOrd o  = LbOrd.new(legPx = array.new_float(3, na), legLots = array.new_int
 var LbSt  st = LbSt.new()
 var array<LbZone> lbZs   = array.new<LbZone>()     // 帯の幅が共通幅の静的 Zone (ZA / ZC / ZD)。下限の昇順。削除しない
 var array<LbZone> lbFvgs = array.new<LbZone>()     // ZF (本来の上下限・幅はさまざま)。下限の昇順。iFVG の再突破でだけ削除
+var array<LbZone> lbZsT  = array.new<LbZone>()     // lbZs の上限の昇順 (水平線の統合で帯の幅が変わるため、SHORT の TP 探索で上限の降順に読む)
+var array<LbZone> lbSw   = array.new<LbZone>()     // 有効な水平線 Zone (作った順)
 var array<LbZone> lbFvgsT = array.new<LbZone>()    // ZF の上限の昇順 (SHORT の TP 探索で上限の降順に読む。lbFvgs と同じオブジェクト)
 var map<string, LbWait> lbWaitMap = map.new<string, LbWait>()   // "方向#待機キー" → 待機 (lbWaits と同期。評価順は lbWaits)
 var array<int>   lbZdStat = array.new_int(4, 0)     // ZD の受信状態: 0 OFF / 1 正常 / 2 計算不能 / 3 履歴不足 / 8 外部側 OFF / 9 未接続・誤接続
@@ -715,6 +728,7 @@ var LbFvg lbFvDn = na
 // 表示中の帯 (古い順。重なる Zone をまとめた帯 1 つ = 1 個。gone = 無効化した FVG の灰色の帯)。表示だけに使い、売買には使わない
 type LbDsG
     box   bx
+    label lb                  // 名称 (最新足の 3 本先・帯の上下限の中点。帯の中の文字は使わない)
     float bot
     float top
     bool  gone
@@ -772,8 +786,7 @@ f_tfNameR(int r) =>
 // Zone の名称 (時間足を除く)
 f_zItem(LbZone z) =>
     z.typ == 0 ? (z.sub == 1 ? "アキュム上辺" : "アキュム下辺") : z.typ == 1 ? "MA EMA" + str.tostring(z.tf == 0 ? zbLen1 : zbLen2) :
-     z.typ == 2 ? (z.sub == 1 ? "水平線・高値" : "水平線・安値") : z.typ == 3 ? "出来高POC" :
-     z.inv ? (z.sub == 1 ? "iFVG・上昇FVGが反転" : "iFVG・下降FVGが反転") : (z.sub == 1 ? "FVG・上昇" : "FVG・下降")
+     z.typ == 2 ? "水平線" : z.typ == 3 ? "出来高POC" : z.inv ? "iFVG" : "FVG"
 
 f_catName(int c) =>
     c == 1 ? "反発" : c == 2 ? "ダマシ" : "サポレジ"
@@ -796,8 +809,25 @@ f_zfUse(int k) =>
 f_condTyp(int t) =>
     t == 0 ? cZA : t == 1 ? cZB : t == 2 ? cZC : t == 3 ? cZD : cZF
 
+// Zone が時間足の順位 r に当たるか (水平線 Zone は構成水平線のどれかの時間足)
+f_zAtRank(LbZone z, int r) =>
+    bool hit = f_tfRank(z) == r
+    if z.typ == 2 and not na(z.mTf)
+        hit := false
+        for j = 0 to array.size(z.mTf) - 1
+            int tk = array.get(z.mTf, j)
+            if (tk == 0 ? 3 : tk == 1 ? 2 : tk == 2 ? 1 : 0) == r
+                hit := true
+    hit
+
 f_zName(LbZone z) =>
-    f_tfName(z.typ, z.tf) + " " + f_zItem(z)
+    string tn = f_tfName(z.typ, z.tf)
+    if z.typ == 2 and not na(z.mTf)
+        tn := ""
+        for r = 0 to 3
+            if f_zAtRank(z, r)
+                tn := tn + (tn == "" ? "" : "・") + f_tfNameR(r)
+    tn + " " + f_zItem(z)
 
 // 開始時刻を含み、終了時刻を含まない (開始 == 終了 は終日)。AccumStrategyXAU と同じ
 f_inSession(int t) =>
@@ -876,7 +906,7 @@ f_dsName(array<LbZone> mem) =>
             for t = 0 to 4
                 for i = 0 to n - 1
                     LbZone z = array.get(mem, i)
-                    if z.typ == t and f_tfRank(z) == r
+                    if z.typ == t and f_zAtRank(z, r)
                         string it = f_zItem(z)
                         if not array.includes(items, it)
                             array.push(items, it)
@@ -897,13 +927,31 @@ f_dsBox(LbDsG g) =>
             mix := true
     color c = mix ? color.fuchsia : z0.typ == 0 ? color.teal : z0.typ == 1 ? color.blue : z0.typ == 2 ? color.orange : z0.typ == 3 ? color.purple : color.green
     g.bx := box.new(math.max(lft, bar_index - 4999), g.top, bar_index + 1, g.bot, border_color = color.new(c, 40), bgcolor = color.new(c, 88),
-         extend = extend.right, text = f_dsName(g.mem), text_size = size.tiny, text_color = color.new(c, 20))
+         extend = extend.right)
+    g.lb := label.new(bar_index + 3, (g.bot + g.top) / 2.0, f_dsName(g.mem), style = label.style_label_left, color = color.new(c, 75),
+         textcolor = color.new(c, 0), size = size.tiny, textalign = text.align_left)
+    true
+
+// 帯と名称を消す
+f_dsErase(LbDsG g) =>
+    box.delete(g.bx)
+    label.delete(g.lb)
+    true
+
+// 名称を最新足の 3 本先へ (最後の確定履歴足と、その後のリアルタイムの確定足で呼ぶ)
+f_dsLblX() =>
+    int ng = array.size(lbDsG)
+    if ng > 0
+        for i = 0 to ng - 1
+            LbDsG g = array.get(lbDsG, i)
+            if not g.gone
+                label.set_x(g.lb, bar_index + 3)
     true
 
 f_dsCap() =>
     while array.size(lbDsG) > dsZoneMax
         LbDsG og = array.shift(lbDsG)
-        box.delete(og.bx)
+        f_dsErase(og)
     true
 
 // 統合の対象: アキュム・MA・水平線・出来高POC。FVG / iFVG は本来の上下限で個別に表示し、統合にも他の帯のつなぎにも使わない
@@ -915,7 +963,7 @@ f_dsMerge(LbZone z) =>
 f_dsPut(LbZone z, bool needHit) =>
     array<LbZone> mem = array.new<LbZone>()
     array.push(mem, z)
-    LbDsG ng = LbDsG.new(na, z.bot, z.top, false, mem)
+    LbDsG ng = LbDsG.new(na, na, z.bot, z.top, false, mem)
     bool any  = false
     bool more = f_dsMerge(z)
     while more
@@ -933,7 +981,7 @@ f_dsPut(LbZone z, bool needHit) =>
                 ng.top := math.max(ng.top, g.top)
                 for j = 0 to array.size(g.mem) - 1
                     array.push(ng.mem, array.get(g.mem, j))
-                box.delete(g.bx)
+                f_dsErase(g)
                 array.remove(lbDsG, i)
                 more := true
                 any  := true
@@ -969,7 +1017,7 @@ f_dsRename(LbZone z) =>
     int gi = f_dsFind(z)
     if gi >= 0
         LbDsG g = array.get(lbDsG, gi)
-        box.set_text(g.bx, f_dsName(g.mem))
+        label.set_text(g.lb, f_dsName(g.mem))
     gi >= 0
 
 // Zone を帯から外す (無効化した FVG / 採用件数から外れたアキュムの辺): 残りを下限の順に並べ、実際に重なる連鎖ごとに帯を描き直す。
@@ -978,7 +1026,7 @@ f_dsDel(LbZone z, bool grey) =>
     int gi = f_dsFind(z)
     if gi >= 0
         LbDsG g = array.get(lbDsG, gi)
-        box.delete(g.bx)
+        f_dsErase(g)
         array.remove(lbDsG, gi)
         array<LbZone> rest = array.new<LbZone>()
         for j = 0 to array.size(g.mem) - 1
@@ -1018,14 +1066,14 @@ f_dsDel(LbZone z, bool grey) =>
                     go := false
             // MA だけになった部分は帯を作らない (MA は線で表示し、確定足ごとの f_dsMa でまとめ直す)
             if hasS
-                LbDsG sg = LbDsG.new(na, sb, stp, false, sm)
+                LbDsG sg = LbDsG.new(na, na, sb, stp, false, sm)
                 f_dsBox(sg)
                 array.insert(lbDsG, at, sg)
                 at += 1
         if grey
-            LbDsG dg = LbDsG.new(na, z.bot, z.top, true, array.new<LbZone>())
+            LbDsG dg = LbDsG.new(na, na, z.bot, z.top, true, array.new<LbZone>())
             dg.bx := box.new(math.max(z.aBar, bar_index - 4999), z.top, bar_index, z.bot, border_color = color.new(color.green, 40),
-                 bgcolor = color.new(color.gray, 92), extend = extend.none, text = f_zName(z), text_size = size.tiny, text_color = color.new(color.green, 20))
+                 bgcolor = color.new(color.gray, 92), extend = extend.none, text = f_tfName(z.typ, z.tf) + "｜" + f_zItem(z), text_size = size.tiny, text_color = color.new(color.green, 20))
             array.push(lbDsG, dg)
             f_dsCap()
     gi >= 0
@@ -1056,6 +1104,7 @@ f_lbAdd(LbZone z) =>
         array.insert(lbFvgsT, f_lbLowerT(lbFvgsT, z.top), z)
         st.maxWF := math.max(st.maxWF, z.top - z.bot)
     else
+        array.insert(lbZsT, f_lbLowerT(lbZsT, z.top), z)
         st.maxW := math.max(st.maxW, z.top - z.bot)
     array.set(lbNZone, z.typ, array.get(lbNZone, z.typ) + 1)
     if dsZone
@@ -1090,7 +1139,7 @@ f_lbRemove(LbZone z) =>
         array.set(lbNZone, z.typ, array.get(lbNZone, z.typ) - 1)
     done and doneT
 
-// 共通幅の Zone を lbZs から外す (採用件数から外れたアキュムの辺だけに使う)
+// 共通幅の Zone を lbZs / lbZsT から外す (採用件数から外れたアキュムの辺 / 統合で帯が変わる・統合される水平線 Zone)
 f_lbRemoveS(LbZone z) =>
     int i = f_lbLower(lbZs, z.bot)
     int n = array.size(lbZs)
@@ -1103,6 +1152,17 @@ f_lbRemoveS(LbZone z) =>
         else if q.bot > z.bot
             done := true
         i += 1
+    int j = f_lbLowerT(lbZsT, z.top)
+    int nT = array.size(lbZsT)
+    bool doneT = false
+    while j < nT and not doneT
+        LbZone q = array.get(lbZsT, j)
+        if q.id == z.id
+            array.remove(lbZsT, j)
+            doneT := true
+        else if q.top > z.top
+            doneT := true
+        j += 1
     if done
         array.set(lbNZone, z.typ, array.get(lbNZone, z.typ) - 1)
     done
@@ -1167,9 +1227,10 @@ f_lbAccFix(LbAcc q) =>
     true
 
 // 確定足 1 本の Zone の状態更新。戻り値 [接触の方向 (0 なし), 区分, 待機を解除する方向 (0 なし)]
-f_lbStep(LbZone z) =>
-    bool tch = low <= z.top + EPS and high >= z.bot - EPS
-    int  np  = close > z.top + EPS ? 1 : close < z.bot - EPS ? -1 : 0
+//  zb / zt: 判定に使う帯 (通常は Zone の帯。水平線を統合した足は統合前の帯)
+f_lbStep(LbZone z, float zb, float zt) =>
+    bool tch = low <= zt + EPS and high >= zb - EPS
+    int  np  = close > zt + EPS ? 1 : close < zb - EPS ? -1 : 0
     int  cs  = 0
     int  cc  = 0
     int  xs  = 0
@@ -1208,6 +1269,124 @@ f_wKey(int side, string key) =>
 f_waitDel(int i) =>
     LbWait w = array.remove(lbWaits, i)
     map.remove(lbWaitMap, f_wKey(w.side, w.key))
+    true
+
+// 待機の位置 (ID で探す)
+f_waitIdx(int wid) =>
+    int r = -1
+    int n = array.size(lbWaits)
+    if n > 0
+        for i = 0 to n - 1
+            LbWait w = array.get(lbWaits, i)
+            if w.id == wid
+                r := i
+    r
+
+// 待機の Zone ID を付け替える (統合された水平線 Zone → 統合先)。同じ組・同じ方向の待機が既にあれば、最後の接触が新しい方を残す
+//  (最後の接触足・接触時の帯のスナップショット・期限はそのまま)
+f_waitMove(int fromId, int toId) =>
+    int n = array.size(lbWaits)
+    if n > 0
+        for i = n - 1 to 0
+            if i < array.size(lbWaits)
+                LbWait w = array.get(lbWaits, i)
+                if f_waitHas(w, fromId)
+                    array<int> nid = array.new_int()
+                    for j = 0 to array.size(w.ids) - 1
+                        int v = array.get(w.ids, j)
+                        int v2 = v == fromId ? toId : v
+                        if not array.includes(nid, v2)
+                            int p = 0
+                            int ni = array.size(nid)
+                            while p < ni
+                                if array.get(nid, p) > v2
+                                    break
+                                p += 1
+                            array.insert(nid, p, v2)
+                    string nk = ""
+                    for p = 0 to array.size(nid) - 1
+                        nk := nk + (p > 0 ? "|" : "") + str.tostring(array.get(nid, p))
+                    map.remove(lbWaitMap, f_wKey(w.side, w.key))
+                    LbWait o2 = map.get(lbWaitMap, f_wKey(w.side, nk))
+                    bool keepW = true
+                    if not na(o2)
+                        if w.lBar > o2.lBar
+                            array.remove(lbWaits, f_waitIdx(o2.id))
+                            map.remove(lbWaitMap, f_wKey(o2.side, o2.key))
+                        else
+                            keepW := false
+                    if keepW
+                        w.ids := nid
+                        w.key := nk
+                        map.put(lbWaitMap, f_wKey(w.side, nk), w)
+                    else
+                        array.remove(lbWaits, f_waitIdx(w.id))
+    true
+
+// 水平線を 1 本登録する。元の水平線同士の価格差が統合距離以内で連鎖する既存の水平線 Zone (= 構成水平線の最安値 − 距離 〜 最高値 + 距離
+// に入る Zone) があれば、最も古い Zone にまとめる (2 つ以上をつなぐ場合は他の Zone もその Zone へ統合し、待機の ID を付け替える)。
+// 帯 = 構成水平線の最安値 − 共通幅 〜 最高値 + 共通幅。統合した Zone の ID・状態 (位置・突破)・登録足は変えず、統合した足の接触判定は統合前の帯
+f_swAdd(int k, int sub, float pv, int pt) =>
+    st.zSeq += 1
+    int pid = st.zSeq
+    array<LbZone> hit = array.new<LbZone>()
+    int n = array.size(lbSw)
+    if n > 0
+        for i = 0 to n - 1
+            LbZone q = array.get(lbSw, i)
+            if pv >= array.min(q.mP) - zcMerge - EPS and pv <= array.max(q.mP) + zcMerge + EPS
+                array.push(hit, q)
+    if array.size(hit) == 0
+        LbZone z = f_lbNew(2, k, sub, pv, pv - zHalf, pv + zHalf, na, na, pt)
+        z.mP  := array.from(pv)
+        z.mTf := array.from(k)
+        z.mT  := array.from(pt)
+        z.mId := array.from(pid)
+        f_lbAdd(z)
+        array.push(lbSw, z)
+    else
+        LbZone a = array.get(hit, 0)
+        if dsZone
+            f_dsDel(a, false)
+        f_lbRemoveS(a)
+        if a.mBar != bar_index
+            a.mBar := bar_index
+            a.oBot := a.bot
+            a.oTop := a.top
+        array.push(a.mP, pv)
+        array.push(a.mTf, k)
+        array.push(a.mT, pt)
+        array.push(a.mId, pid)
+        int nh = array.size(hit)
+        if nh > 1
+            for h = 1 to nh - 1
+                LbZone b = array.get(hit, h)
+                if dsZone
+                    f_dsDel(b, false)
+                f_lbRemoveS(b)
+                b.dead := true
+                int  ib = 0
+                bool fb = false
+                while not fb
+                    LbZone qb = array.get(lbSw, ib)
+                    if qb.id == b.id
+                        fb := true
+                    else
+                        ib += 1
+                array.remove(lbSw, ib)
+                for j = 0 to array.size(b.mP) - 1
+                    array.push(a.mP, array.get(b.mP, j))
+                    array.push(a.mTf, array.get(b.mTf, j))
+                    array.push(a.mT, array.get(b.mT, j))
+                    array.push(a.mId, array.get(b.mId, j))
+                f_waitMove(b.id, a.id)
+        float pMin = array.min(a.mP)
+        float pMax = array.max(a.mP)
+        a.ctr := (pMin + pMax) / 2.0
+        a.bot := pMin - zHalf
+        a.top := pMax + zHalf
+        f_lbAdd(a)
+        st.nSwMerge += 1
     true
 
 // 待機の作成 / 更新 (同じ組・同じ方向があれば最後の接触足と帯のスナップショットを更新)。検索は map
@@ -1269,7 +1448,7 @@ f_lbFeed(array<float> tps, array<float> cur, int side, float b, float t) =>
     array.size(tps) >= 3
 
 // TP 候補 (最大 3)。LONG = ref より厳密に上の Zone を下限の昇順 / SHORT = ref より厳密に下の Zone を上限の降順に、共通幅の
-// Zone (lbZs: 帯の幅が一定なので下限の順 = 上限の順)・FVG (LONG は lbFvgs、SHORT は lbFvgsT)・MA 2 本の 3 つの流れを合わせて 1 件ずつ読み、
+// Zone (LONG は lbZs、SHORT は lbZsT: 水平線の統合で帯の幅が変わるため)・FVG (LONG は lbFvgs、SHORT は lbFvgsT)・MA 2 本の 3 つの流れを合わせて 1 件ずつ読み、
 // 重なりで統合しながら 3 つ目の帯が確定した時点で終える。全種類 (条件に選ばない種類も) を使う
 f_lbTargets(int side, float ref) =>
     array<float> tps = array.new_float()
@@ -1294,7 +1473,8 @@ f_lbTargets(int side, float ref) =>
     int nA = array.size(lbZs)
     int nG = array.size(fArr)
     int nM = array.size(mb)
-    int ia = side == 1 ? f_lbLower(lbZs, ref + EPS) : f_lbLower(lbZs, ref) - 1
+    array<LbZone> aArr = side == 1 ? lbZs : lbZsT
+    int ia = side == 1 ? f_lbLower(lbZs, ref + EPS) : f_lbLowerT(lbZsT, ref - EPS) - 1
     int ig = side == 1 ? f_lbLower(lbFvgs, ref + EPS) : f_lbLowerT(lbFvgsT, ref - EPS) - 1
     int im = 0
     bool done = false
@@ -1303,7 +1483,7 @@ f_lbTargets(int side, float ref) =>
         LbZone za = na
         LbZone zg = na
         if ia >= 0 and ia < nA
-            za := array.get(lbZs, ia)
+            za := array.get(aArr, ia)
         if ig >= 0 and ig < nG
             zg := array.get(fArr, ig)
         // 3 つの流れの先頭のうち、LONG は下限が最小・SHORT は上限が最大のもの (0 = 共通幅 / 1 = FVG / 2 = MA / -1 = なし)
@@ -1633,7 +1813,7 @@ if lbRun and barstate.isconfirmed
                             if not forming
                                 f_lbAccFix(q)
                                 array.remove(lbAccs, i)
-    // ZC: 新しい Pivot (時刻キーが前回と違う) はすべて登録 (近い価格の既存 Zone で抑制・上書きしない)
+    // ZC: 新しい Pivot (時刻キーが前回と違う) はすべて登録。統合距離以内で連鎖する既存の水平線 Zone があればまとめる (f_swAdd)
     array<float> pH  = array.from(s1h, s2h, s3h, s4h)
     array<int>   pHt = array.from(s1ht, s2ht, s3ht, s4ht)
     array<float> pL  = array.from(s1l, s2l, s3l, s4l)
@@ -1650,7 +1830,7 @@ if lbRun and barstate.isconfirmed
                     else
                         array.set(lbPivLastL, k, pt)
                     int sub = s == 0 ? 1 : -1
-                    f_lbAdd(f_lbNew(2, k, sub, pv, pv - zHalf, pv + zHalf, na, na, pt))
+                    f_swAdd(k, sub, pv, pt)
     // ZD: 外部 POC (MtfPocFeedXAU) の受信。この 5分足に届いている確定済み上位足の出力を読み、正常な値で中心が前回の有効値から
     //  変わり、同じ時間足に中心が完全に同じ Zone がなければ追加する (既存 Zone は上書きしない・時刻の更新だけでは登録しない)。
     //  状態: 0 検知 OFF / 1 正常 / 2 計算不能 (時刻 < 0) / 3 履歴不足 (時刻 na) / 8 外部側 OFF (時刻 0) / 9 未接続・誤接続
@@ -1762,10 +1942,19 @@ if lbRun and barstate.isconfirmed
             if z.bot > rHi + EPS
                 break
             st.iter += 1
-            if z.top >= rLo - EPS and z.aBar < bar_index
-                [cs, cc, xs] = f_lbStep(z)
+            // 水平線を統合した足は、統合前の帯で接触・突破を判定する (統合しただけで接触にしない)。接触の記録も統合前の帯
+            float zb = z.bot
+            float zt = z.top
+            if z.mBar == bar_index
+                zb := z.oBot
+                zt := z.oTop
+            if zt >= rLo - EPS and zb <= rHi + EPS and z.aBar < bar_index
+                [cs, cc, xs] = f_lbStep(z, zb, zt)
                 if cs != 0
-                    array.push(cZ, z)
+                    LbZone zc = z
+                    if z.mBar == bar_index
+                        zc := LbZone.new(z.id, z.typ, z.tf, z.sub, z.ctr, zb, zt, z.infoA, z.infoB, z.key, z.aBar, z.aTime, mTf = z.mTf)
+                    array.push(cZ, zc)
                     array.push(cSide, cs)
                     array.push(cCat, cc)
                 if xs != 0
@@ -1777,7 +1966,7 @@ if lbRun and barstate.isconfirmed
         float  mv = k == 0 ? zbMa1 : zbMa2
         if not na(mz) and not na(mv) and f_zbUse(k)
             if mz.aBar < bar_index
-                [cs, cc, xs] = f_lbStep(mz)
+                [cs, cc, xs] = f_lbStep(mz, mz.bot, mz.top)
                 if cs != 0
                     array.push(cZ, mz)
                     array.push(cSide, cs)
@@ -2167,6 +2356,10 @@ if lbRun and barstate.isconfirmed
 // ============================================================================
 plot(zbUse1 ? zbMa1 : na, "MA 1分足 EMA", color = color.new(color.blue, 30))
 plot(zbUse2 ? zbMa2 : na, "MA 5分足 EMA", color = color.new(color.navy, 30))
+
+// 帯の名称を最新足の右側へ (最後の確定履歴足と、その後のリアルタイムの確定足)
+if lbRun and dsZone and (barstate.islastconfirmedhistory or (barstate.isrealtime and barstate.isconfirmed))
+    f_dsLblX()
 
 f_pct(float a, float b) =>
     b > 0 ? str.tostring(a / b * 100.0, "#.#") + "%" : "-"
