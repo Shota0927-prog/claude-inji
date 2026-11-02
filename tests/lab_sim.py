@@ -188,12 +188,22 @@ def static():
           "POC requests moved to MtfPocFeedXAU), 13 input.source, no request.security_lower_tf",
           n_plot <= 64 and n_req == 14 and n_src == 13 and "security_lower_tf" not in code, f"plot {n_plot} request {n_req} source {n_src}")
     logic = lp.logic_section(SRC)
+    lc = re.sub(r"//.*", "", logic).split("\n")
+    in_ds, draw_ok, fn = False, True, None
+    for k, ln in enumerate(lc):
+        m = re.match(r"^(\w+)\(.*\)\s*=>", ln)
+        if m or (ln and not ln.startswith(" ")):
+            fn = m.group(1) if m else None
+        if "box." in ln and not (fn or "").startswith("f_ds"):
+            draw_ok = False
+        if re.search(r"(?<!\w)f_ds(Add|Del|Rename)\(", ln) and not m and not lc[k - 1].strip() == "if dsZone":
+            draw_ok = False
     check("LS-10 the logic section has no history reference / request / ta.* call (transpiles; series values come from the feed "
-          "section), no expiry / generation pruning of valid Zones except the accum box count (zaKeep), and no Zone drawing (box.* / "
-          "dsZone only in the display section)",
+          "section), no expiry / generation pruning of valid Zones except the accum box count (zaKeep); Zone drawing (box.*) only in "
+          "the f_ds* display functions, each call guarded by 'if dsZone' (as in LAB-2)",
           lp.transpile() and not re.search(r"\w\[\d", re.sub(r"//.*", "", logic).replace("[]", "")) and "request." not in logic
           and "ta." not in re.sub(r"//.*", "", logic) and "Keep" not in logic.replace("zaKeep", "") and "expTime" not in logic
-          and "box." not in re.sub(r"//.*", "", logic) and "dsZone" not in logic)
+          and draw_ok and "barstate.islast" not in logic)
 
 
 REG_BASE = "444e61f"     # the last commit before the LAB-1 registration edits
@@ -538,6 +548,30 @@ def sc_fvg():
           f"inv8 {z8.inv} inv10 {z10.inv} ifvg {r['st'].nIfvg} dead {r['st'].nFvgDead} w10 {r.trace[10]['waits']} w11 {r.trace[11]['waits']}")
 
 
+def sc_fvg_display():
+    # the LB-19/20 FVG with an overlapping 1H POC (1991-2003): one band; iFVG renamed in place; invalid -> it leaves the band (the POC
+    # band is redrawn alone) and stays as a grey ended band (LAB-2 look); trading identical with the display OFF
+    K1, K2, K3, K4 = T0 - 7200_000, T0 + 3600_000, T0 + 7200_000, T0 + 10800_000
+    sc = Sc(flat(14, 2005))
+    sc.hold(1, 5, g1k=K1, g1c=2006.0, g1d=1, g1t=1996.0, g1b=1990.0)
+    sc.hold(5, 9, g1k=K2, g1c=1993.0, g1d=0)
+    sc.hold(9, 11, g1k=K3, g1c=1985.0, g1d=0)
+    sc.hold(11, None, g1k=K4, g1c=1998.0, g1d=0)
+    poc(sc, 1, 1997.0)
+    run = lambda n, ds: lp.Runner(overrides=dict(**ONLY_TC, **dict(QUIET, dsZone=ds))).run(sc.bars[:n])
+    r8, r10, r = run(9, True), run(11, True), run(14, True)
+    off = run(14, False)
+    txt = lambda rr: [g.bx.text for g in rr["lbDsG"] if not g.gone]
+    gone = [g for g in r["lbDsG"] if g.gone]
+    check("LB-20b display of FVG changes: FVG 1990-1996 + 1H POC 1991-2003 shown as one band 1990-2003 ('1時間足｜出来高POC＋FVG・上昇'); "
+          "after the iFVG flip the same band is renamed ('…＋iFVG・上昇FVGが反転'); after the invalidation the POC band is redrawn alone "
+          "(1991-2003) and the FVG stays as a grey ended band (extend none); display OFF gives the same trading",
+          txt(r8) == ["1時間足｜出来高POC＋FVG・上昇"] and ds_groups(r8.env)[0][:2] == (1990.0, 2003.0)
+          and txt(r10) == ["1時間足｜出来高POC＋iFVG・上昇FVGが反転"] and txt(r) == ["1時間足｜出来高POC"]
+          and ds_groups(r.env)[0][:2] == (1991.0, 2003.0) and len(gone) == 1 and gone[0].bx.kw.get("extend") == "none"
+          and r.trace == off.trace and r.broker.log == off.broker.log, f"{txt(r8)} {txt(r10)} {txt(r)} {len(gone)}")
+
+
 def partial_setup(zones, rows_after, **ov):
     """SHORT from POC 2000: contact 3 (close inside 1999), TC 4 (line 2001) -> close 1998.5, SL 2011, slw 12.5 -> 4 lots.
     zones: list of (k, centre) POC Zones below (TP targets)."""
@@ -799,7 +833,7 @@ def sc_acc_keep():
         acc_feed(sc, 1, [(1, 3, 2010.0, 1995.0, 100, 1), (3, 5, 2010.0, 1995.0, 100, 0), (5, 7, 2100.0, 2090.0, 200, 1), (7, None, 2100.0, 2090.0, 200, 0)])
         acc_feed(sc, 2, [(1, 2, 2300.0, 2290.0, 300, 1), (2, 5, 2300.0, 2290.0, 300, 0), (5, 6, 2400.0, 2390.0, 400, 1), (6, None, 2400.0, 2390.0, 400, 0)])
         sc.set(8, labS1=1987.0)
-        return sc.run(**ONLY_TC, **QUIET, zaKeep2=2, **ov)
+        return sc.run(**ONLY_TC, **dict(QUIET, **ov), zaKeep2=2)
     r1, r2 = mk(), mk(zaKeep1=2)
     def keys(r, bar=None):
         return sorted((z.tf, z.key, z.sub) for z in r["lbZs"] if z.typ == 0)
@@ -811,6 +845,14 @@ def sc_acc_keep():
           keys(r1) == [(0, 200, -1), (0, 200, 1), (1, 300, -1), (1, 300, 1), (1, 400, -1), (1, 400, 1)] and r1["st"].nAccOut == 2
           and r1.trace[6]["waits"] and not r1.trace[7]["waits"] and entries(r1) == [] and [e[0] for e in entries(r2)] == [8]
           and len(keys(r2)) == 8, f"{keys(r1)} {r1.trace[6]['waits']} {r1.trace[7]['waits']} {entries(r1)} {entries(r2)}")
+    r1d, r2d = mk(dsZone=True), mk(zaKeep1=2, dsZone=True)
+    shown = lambda r: sorted((z.tf, z.key, z.sub) for g in r["lbDsG"] if not g.gone for z in g.mem)
+    check("LB-46c display of the accum box count: only the kept boxes are shown (1H keep 1: A's two edges leave the bands when B is "
+          "fixed, nothing grey is left for them; 1H keep 2: A still shown; 4H keep 2 both shown); with the same box counts and trading "
+          "settings the display ON gives the same orders / waits / trace as display OFF",
+          shown(r1d) == keys(r1) and shown(r2d) == keys(r2) and (0, 100, 1) in shown(r2d) and (0, 100, 1) not in shown(r1d)
+          and not any(g.gone for g in r1d["lbDsG"]) and r1d.trace == r1.trace and r2d.trace == r2.trace and r1d.broker.log == r1.broker.log
+          and r2d.broker.log == r2.broker.log, f"{shown(r1d)} {shown(r2d)}")
     # TP: SHORT from POC 2000 with the 1H box A (1975 / 1965 -> edges 1969-1981 and 1959-1971, one band, TP1 1981) as the only target;
     # A is retired by B on bar 9 while holding -> the TP moves to the fixed RR from the fill; the SL and the position stay
     after = flat(10, 1998.5)
@@ -827,254 +869,122 @@ def sc_acc_keep():
           and r["o"].sl == 2011.0 and r.trace[9]["pos"] != 0 and r.trace[9]["stop"] == r.trace[8]["stop"], f"{[t['legPx'] for t in r.trace[7:10]]}")
 
 
+TFN = ("週足", "日足", "4時間足", "1時間足", "5分足", "1分足")
+
+
+def ds_rank(z):
+    return (5 if z.tf == 0 else 4) if z.typ == 1 else ((3, 2, 1)[z.tf] if z.typ == 0 else (3, 2, 1, 0)[z.tf])
+
+
+def ds_name_ref(e, zs):
+    """reference band name: one line per TF (higher TF first), TF x item once"""
+    out = []
+    for r in range(6):
+        its = []
+        for z in sorted(zs, key=lambda z: z.typ):     # stable: member order within a type
+            if ds_rank(z) == r and e["f_zItem"](z) not in its:
+                its.append(e["f_zItem"](z))
+        if its:
+            out.append(TFN[r] + "｜" + "＋".join(its))
+    return "\n".join(out)
+
+
+def ds_ref_groups(zs):
+    """reference grouping: only really overlapping bands (EPS), chained -> (bot, top, ids)"""
+    ref = []
+    for z in sorted(zs, key=lambda z: z.bot):
+        if ref and z.bot <= ref[-1][1] + 1e-7:
+            ref[-1] = (ref[-1][0], max(ref[-1][1], z.top), ref[-1][2] + [z.id])
+        else:
+            ref.append((z.bot, z.top, [z.id]))
+    return sorted((b, t, sorted(ids)) for b, t, ids in ref)
+
+
+def ds_groups(e):
+    return sorted((g.bot, g.top, sorted(z.id for z in g.mem)) for g in e["lbDsG"] if not g.gone)
+
+
 def sc_display():
-    # grouping (pure helper f_dsGroups) vs a reference; label text (f_dsText); display ON/OFF does not change trading
-    r = lp.Runner(overrides=dict(QUIET, zbUse1=True, zbUse2=True)).run(Sc(flat(2, 2000)).bars)
+    # LAB-3 display (drawn when a Zone is registered / changed, as in LAB-2): overlapping Zones as one band, Japanese names
+    r = lp.Runner(overrides=dict(QUIET, zbUse1=True, zbUse2=True, dsZone=True, dsZoneMax=400)).run(Sc(flat(2, 2000)).bars)
     e = r.env
     LbZone = e["LbZone"]
     rnd = random.Random(9)
-    bad = []
-    for case in range(300):
-        zs, fv = [], []
-        for _ in range(rnd.randint(0, 12)):
-            c = round(2000 + rnd.uniform(-50, 50), rnd.choice([0, 1]))
-            zs.append(LbZone.new(len(zs) + 1, rnd.choice([0, 2, 3]), rnd.randint(0, 2), rnd.choice([1, -1]), c, c - 6.0, c + 6.0))
-        for _ in range(rnd.randint(0, 4)):
-            b = round(2000 + rnd.uniform(-60, 50), 1)
-            w = rnd.choice([3.0, 20.0, 45.0])
-            fv.append(LbZone.new(100 + len(fv), 4, 0, 1, b + w / 2, b, b + w))
-        e["lbZs"] = sorted(zs, key=lambda z: z.bot)
-        e["lbFvgs"] = sorted(fv, key=lambda z: z.bot)
-        mas = [round(2000 + rnd.uniform(-40, 40), 1) if rnd.random() < 0.5 else None for _ in range(2)]
-        e["zbMa1"], e["zbMa2"] = mas
-        e["lbMa1"] = LbZone.new(201, 1, 0, 0, mas[0], mas[0] - 6.0, mas[0] + 6.0) if mas[0] is not None else None
-        e["lbMa2"] = LbZone.new(202, 1, 1, 0, mas[1], mas[1] - 6.0, mas[1] + 6.0) if mas[1] is not None else None
-        allz = zs + fv + [z for z in (e["lbMa1"], e["lbMa2"]) if z is not None]
-        iv = sorted(allz, key=lambda z: z.bot)
-        ref = []
-        for z in iv:
-            if ref and z.bot <= ref[-1][1] + 1e-7:
-                ref[-1] = (ref[-1][0], max(ref[-1][1], z.top), ref[-1][2] + [z.id])
+    bad, nmerge, nsplit = [], 0, 0
+    for case in range(150):
+        e["lbDsG"] = []
+        n0 = len(r.draws)
+        act, sid = [], 0
+        for step in range(rnd.randint(1, 40)):
+            e["bar_index"] = 1000 + step
+            if act and rnd.random() < 0.3:
+                z = act.pop(rnd.randrange(len(act)))
+                e["f_dsDel"](z, z.typ == 4)
             else:
-                ref.append((z.bot, z.top, [z.id]))
-        mem, gB, gT, gS, gE = e["f_dsGroups"]()
-        got = [(gB[g], gT[g], sorted(mem[i].id for i in range(gS[g], gE[g] + 1))) for g in range(len(gB))]
-        if got != [(b, t, sorted(ids)) for b, t, ids in ref]:
-            bad.append(case)
-    # text: 4H accum lower + 4H swing high + 1m MA overlapping; two 1H POCs (same name once); a separate non-overlapping zone
-    e["lbZs"] = sorted([LbZone.new(1, 0, 1, -1, 2000.0, 1994.0, 2006.0), LbZone.new(2, 2, 1, 1, 2004.0, 1998.0, 2010.0),
-                        LbZone.new(3, 3, 0, 0, 2008.0, 2002.0, 2014.0, 2007.5, 2008.5), LbZone.new(4, 3, 0, 0, 2009.0, 2003.0, 2015.0, 2008.5, 2009.5),
-                        LbZone.new(5, 2, 3, -1, 2040.0, 2034.0, 2046.0)], key=lambda z: z.bot)
-    e["lbFvgs"] = []
-    e["zbMa1"], e["zbMa2"] = 2012.0, None
-    e["lbMa1"], e["lbMa2"] = LbZone.new(201, 1, 0, 0, 2012.0, 2006.0, 2018.0), None
-    mem, gB, gT, gS, gE = e["f_dsGroups"]()
-    tx, tip = e["f_dsText"](mem, gS[0], gE[0])
-    tx2, _ = e["f_dsText"](mem, gS[1], gE[1])
-    want = "4時間足｜アキュム下辺＋水平線・高値\n1時間足｜出来高POC\n1分足｜MA EMA3000"
-    check("LB-47 display grouping (f_dsGroups): only bands that really overlap (EPS, chained) form one display band from the lowest low "
-          "to the highest high, separate bands are never merged for being close (300 random sets incl. wide FVGs and both MAs == "
-          "reference); label: one line per TF, higher TF first, same names once (two 1H POCs -> '出来高POC'), IDs / bounds only in the "
-          "tooltip", not bad and gB == [1994.0, 2034.0] and gT == [2018.0, 2046.0] and tx == want and tx2 == "週足｜水平線・安値"
-          and "#3" in tip and "#4" in tip and "#" not in tx and "区画 2007.5〜2008.5" in tip, f"{bad[:3]} {tx!r} {tx2!r}")
-    # display ON / OFF and entry labels ON / OFF do not change trading (the Zone display is outside the logic section)
+                sid += 1
+                t = rnd.choice([0, 2, 3, 4])
+                c = round(2000 + rnd.uniform(-40, 40), rnd.choice([0, 1]))
+                w = 6.0 if t != 4 else rnd.choice([1.5, 6.0, 20.0])
+                z = LbZone.new(sid, t, rnd.randint(0, 2 if t == 0 else 3), rnd.choice([1, -1]), c, c - w, c + w, c - 0.5, c + 0.5, sid,
+                               1000 + step, 0)
+                ng = len([g for g in e["lbDsG"] if not g.gone])
+                e["f_dsAdd"](z)
+                act.append(z)
+                nmerge += len([g for g in e["lbDsG"] if not g.gone]) < ng
+            groups = [g for g in e["lbDsG"] if not g.gone]
+            alive = {id(d) for d in r.draws[n0:] if d.kind == "box" and not d.deleted}
+            ok = (ds_groups(e) == ds_ref_groups(act) and alive == {id(g.bx) for g in e["lbDsG"]}
+                  and all(g.bx.text == ds_name_ref(e, g.mem) and g.bx.args[1] == g.top and g.bx.args[3] == g.bot for g in groups))
+            if not ok:
+                bad.append((case, step))
+                break
+        nsplit += len(ds_ref_groups(act)) > 1
+    # names: 4H accum lower + 4H swing high + two 1H POCs overlapping -> one band; weekly swing low apart; MA name
+    zs = [LbZone.new(1, 0, 1, -1, 2000.0, 1994.0, 2006.0), LbZone.new(2, 2, 1, 1, 2004.0, 1998.0, 2010.0),
+          LbZone.new(3, 3, 0, 0, 2008.0, 2002.0, 2014.0, 2007.5, 2008.5), LbZone.new(4, 3, 0, 0, 2009.0, 2003.0, 2015.0, 2008.5, 2009.5),
+          LbZone.new(5, 2, 3, -1, 2040.0, 2034.0, 2046.0)]
+    e["lbDsG"] = []
+    for z in zs:
+        z.aBar = 1000
+        e["f_dsAdd"](z)
+    txt = sorted(g.bx.text for g in e["lbDsG"])
+    fv = LbZone.new(6, 4, 1, 1, 2001.0, 1999.0, 2003.0, None, None, 6, 1000, 0)
+    e["f_dsAdd"](fv)
+    fv.inv = True
+    e["f_dsRename"](fv)
+    t_inv = [g.bx.text for g in e["lbDsG"] if any(z.id == 6 for z in g.mem)]
+    ma = LbZone.new(201, 1, 0, 0, 2012.0, 2006.0, 2018.0)
+    check("LB-47 display grouping: Zones are merged into one band only when their ranges really overlap (EPS, chained, incl. a new Zone "
+          "bridging two bands), from the lowest low to the highest high; bands that are only close stay apart; removing a Zone "
+          "re-splits the rest; merged bands' boxes are deleted (one box per band, no duplicate box / text); 150 random add / remove "
+          "sequences == reference after every step. Names: one line per TF, higher TF first, accum / MA / swing / POC / FVG order in a line, same TF x item once: '4時間足｜アキュム下辺"
+          "＋水平線・高値' / '1時間足｜出来高POC' (two POCs once), iFVG renamed in place, MA '1分足｜MA EMA3000'",
+          not bad and nmerge > 50 and nsplit > 50
+          and txt == ["4時間足｜アキュム下辺＋水平線・高値\n1時間足｜出来高POC", "週足｜水平線・安値"]
+          and t_inv == ["4時間足｜アキュム下辺＋水平線・高値＋iFVG・上昇FVGが反転\n1時間足｜出来高POC"]
+          and e["f_dsName"]([ma]) == "1分足｜MA EMA3000", f"{bad[:3]} {nmerge} {nsplit} {txt} {t_inv}")
+    e["lbDsG"], e["dsZoneMax"] = [], 3
+    sep = [LbZone.new(300 + k, 2, 0, 1, 2000.0 + 20 * k, 1994.0 + 20 * k, 2006.0 + 20 * k, None, None, k, 1000, 0) for k in range(5)]
+    for z in sep:
+        e["f_dsAdd"](z)
+    capped = [g.mem[0].id for g in e["lbDsG"]]
+    e["dsZoneMax"] = 400
+    check("LB-47c band count limit (as LAB-2): beyond 'max bands' the oldest band is deleted (the Zones stay internal)",
+          capped == [302, 303, 304] and len(sep) == 5, str(capped))
+    # a real run: the bands on the last bar == grouping of the valid Zones (FVGs that died are grey history bands, not merged)
     sc = rand_bars(3, n=400)
-    a = lp.Runner(overrides=dict(zbUse2=False, dsZone=True, dsEnt=True)).run(sc.bars)
+    a = lp.Runner(overrides=dict(zbUse2=False, dsZone=True, dsEnt=True, dsZoneMax=400)).run(sc.bars)
     b = lp.Runner(overrides=dict(zbUse2=False, dsZone=False, dsEnt=False)).run(sc.bars)
-    check("LB-48 display ON / OFF (Zone bands and entry labels) gives identical orders, fills, waits and ledger (Zone drawing lives only "
-          "in the display section, redrawn on the last bar when the Zone set / MA bands change)",
+    valid = list(a["lbZs"]) + list(a["lbFvgs"])
+    ngone = len([g for g in a["lbDsG"] if g.gone])
+    check("LB-47b real run (400 bars): the bands at the end == the reference grouping of the valid Zones (registered bar by bar, merged "
+          "as they come)",
+          ds_groups(a.env) == ds_ref_groups(valid) and len(valid) > 20 and len(a["lbDsG"]) < 400,
+          f"{len(valid)} {len(a['lbDsG'])} gone {ngone}")
+    check("LB-48 display ON / OFF (Zone bands and entry labels) gives identical orders, fills, waits and ledger (drawing only under "
+          "dsZone / dsEnt, never read by the trading logic)",
           a.broker.log == b.broker.log and a.trace == b.trace and list(a["bkNet"]) == list(b["bkNet"]) and len(entries(a)) > 0,
           f"{len(entries(a))} {len(entries(b))}")
-
-
-class _CatGuard(__import__("ast").NodeTransformer):
-    """every + / += of the translated logic goes through _cat, which raises like Pine when a string result is longer than 4096
-    characters (Pine checks each concatenation, so the guard has to come before the concatenation, not after it)"""
-
-    def visit_BinOp(self, n):
-        self.generic_visit(n)
-        A = __import__("ast")
-        if isinstance(n.op, A.Add):
-            return A.copy_location(A.Call(A.Name("_cat", A.Load()), [n.left, n.right], []), n)
-        return n
-
-    def visit_AugAssign(self, n):
-        self.generic_visit(n)
-        A = __import__("ast")
-        if isinstance(n.op, A.Add) and isinstance(n.target, A.Name):
-            return A.copy_location(A.Assign([n.target], A.Call(A.Name("_cat", A.Load()), [A.Name(n.target.id, A.Load()), n.value], [])), n)
-        return n
-
-
-def _cat(a, b):
-    r = a + b
-    if isinstance(r, str) and len(r) > 4096:
-        raise lp.ap.PineRuntimeError(f"String is too long {len(r)}, max allowed length is 4096.")
-    return r
-
-
-def guarded_env(src=None):
-    """a run's env whose functions are re-defined from the translated logic with every concatenation length-checked (4096)"""
-    import ast
-    r = lp.Runner(overrides=dict(QUIET, zbUse1=True, zbUse2=True), src=src).run(Sc(flat(2, 2000)).bars)
-    tree = _CatGuard().visit(ast.parse(lp.transpile(r.src)))
-    ast.fix_missing_locations(tree)
-    e = r.env
-    e["_cat"] = _cat
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef):
-            exec(compile(ast.Module([node], []), "<guarded>", "exec"), e)
-    return e
-
-
-def ds_ref(e, zs, lim, nmax):
-    """reference of the display text rule: names per TF (higher first), TF x item once, greedy in order; details greedy up to nmax
-    and lim characters; anything that does not fit is never joined and counted in 'ほか○件'"""
-    rank = lambda z: (5 if z.tf == 0 else 4) if z.typ == 1 else ((3, 2, 1)[z.tf] if z.typ == 0 else (3, 2, 1, 0)[z.tf])
-    tfn = ("週足", "日足", "4時間足", "1時間足", "5分足", "1分足")
-    lines, om = [], 0
-    for r in range(6):
-        its = []
-        for z in zs:
-            if rank(z) == r and e["f_zItem"](z) not in its:
-                its.append(e["f_zItem"](z))
-        if not its:
-            continue
-        cur = "\n".join(lines)
-        room = lim - len(cur) - (1 if lines else 0)
-        ln, k = tfn[r] + "｜", 0
-        for it in its:
-            if len(ln) + (1 if k else 0) + len(it) <= room:
-                ln, k = ln + ("＋" if k else "") + it, k + 1
-            else:
-                om += 1
-        if k:
-            lines.append(ln)
-    tx = "\n".join(lines) + (("\n" if lines else "") + f"ほか{om}件" if om else "")
-    det, dom = [], 0
-    for z in zs:
-        d = (e["f_tfName"](z.typ, z.tf) + " " + e["f_zItem"](z) + f"  #{z.id}  " + e["str__tostring"](z.bot, "#.##") + "〜"
-             + e["str__tostring"](z.top, "#.##")
-             + (f"  (区画 {e['str__tostring'](z.infoA, '#.##')}〜{e['str__tostring'](z.infoB, '#.##')})" if z.typ == 3 else ""))
-        if len(det) < nmax and len("\n".join(det)) + (1 if det else 0) + len(d) <= lim:
-            det.append(d)
-        else:
-            dom += 1
-    tip = "\n".join(det) + (("\n" if det else "") + f"ほか{dom}件" if dom else "")
-    return tx, tip
-
-
-def big_band(e, n, seed=1):
-    """n Zones of every type / TF chained into one overlapping band (bot step 0.5, width 12)"""
-    LbZone = e["LbZone"]
-    rnd = random.Random(seed)
-    zs, fv = [], []
-    for i in range(n):
-        b = 1900.0 + 0.5 * i
-        t = rnd.choice([0, 2, 3, 4])
-        if t == 4:
-            fv.append(LbZone.new(10000 + i, 4, rnd.randint(0, 3), rnd.choice([1, -1]), b + 6, b, b + 12.0))
-            fv[-1].inv = rnd.random() < 0.5
-        else:
-            zs.append(LbZone.new(10000 + i, t, rnd.randint(0, 2 if t == 0 else 3), rnd.choice([1, -1]), b + 6, b, b + 12.0,
-                                 b + 5.5, b + 6.5))
-    e["lbZs"] = sorted(zs, key=lambda z: z.bot)
-    e["lbFvgs"] = sorted(fv, key=lambda z: z.bot)
-    e["zbMa1"], e["zbMa2"] = 1950.0, 1960.0
-    e["lbMa1"] = LbZone.new(201, 1, 0, 0, 1950.0, 1944.0, 1956.0)
-    e["lbMa2"] = LbZone.new(202, 1, 1, 0, 1960.0, 1954.0, 1966.0)
-    return len(zs) + len(fv) + 2
-
-
-def sc_ds_len():
-    # LAB-3b (RE10000 "String is too long 4098" at f_dsText): length guard before every concatenation; many Zones in one band
-    e = guarded_env()
-    n = big_band(e, 600)
-    nz0, nf0 = len(e["lbZs"]), len(e["lbFvgs"])
-    mem, gB, gT, gS, gE = e["f_dsGroups"]()
-    tx, tip = e["f_dsText"](mem, gS[0], gE[0])
-    rtx, rtip = ds_ref(e, mem[gS[0]:gE[0] + 1], 3000, 20)
-    shown = [l for l in tip.split("\n") if "#" in l]
-    lines = tx.split("\n")
-    check("LB-50 many Zones in one band (600 of every type / TF + both MAs chained, the RE10000 case): one display band over the whole "
-          "range with all members (grouping / internal Zones not reduced), name = one line per TF with TF x item once (no 'ほか' needed), "
-          "tooltip = 20 details + 'ほか582件' (exact), every concatenation length-checked (no string over 4096 at any step)",
-          len(gB) == 1 and gB[0] == 1900.0 and gT[0] == 1900.0 + 0.5 * 599 + 12.0 and gE[0] - gS[0] + 1 == n
-          and len(e["lbZs"]) == nz0 and len(e["lbFvgs"]) == nf0 and tx == rtx and tip == rtip and "ほか" not in tx
-          and len(lines) == 6 and len(shown) == 20 and tip.endswith(f"\nほか{n - 20}件") and len(tip) <= 3000 + 12,
-          f"{len(gB)} {n} {tx!r} {tip[-40:]!r}")
-    # the 3000-character limit with real Zones: detail count limit raised so that the character limit binds
-    e["DS_TIP_N"] = 10 ** 6
-    tx2, tip2 = e["f_dsText"](mem, gS[0], gE[0])
-    _, rtip2 = ds_ref(e, mem[gS[0]:gE[0] + 1], 3000, 10 ** 6)
-    body = tip2[:tip2.rindex("\n")]
-    k = len([l for l in tip2.split("\n") if "#" in l])
-    nxt = rtip2  # same rule
-    d_next = mem[gS[0] + k]
-    check("LB-50b body limit 3000 with real Zones (count limit lifted): body <= 3000, the next detail would pass 3000 (checked before "
-          "joining, not cut), 'ほか○件' = all the rest exactly, final text < 4096",
-          tip2 == nxt and len(body) <= 3000 and tip2.endswith(f"\nほか{n - k}件") and len(tip2) < 4096 and k < n
-          and len(body) + 1 + len(e["f_dsDetail"](d_next)[0]) > 3000, f"{k} {len(body)}")
-    e["DS_TIP_N"] = 20
-    # boundaries with Japanese text / line breaks / omission: small limits vs the reference (exact fit, one over, long single details)
-    LbZone = e["LbZone"]
-    rnd = random.Random(5)
-    bad, hit = [], set()
-    for case in range(400):
-        zs = []
-        for i in range(rnd.randint(1, 30)):
-            t = rnd.choice([0, 1, 2, 3, 4])
-            z = LbZone.new(rnd.choice([7, 77, 7777]) + i, t, rnd.randint(0, 1 if t == 1 else 2 if t == 0 else 3), rnd.choice([1, -1]),
-                           2000.0, round(1990 + rnd.uniform(0, 5), rnd.choice([0, 2])), 2010.0, 1999.5, 2000.25)
-            z.inv = rnd.random() < 0.3
-            zs.append(z)
-        lim = rnd.choice([0, 5, 8, 20, 40, 60, 100, 200]) + rnd.randint(-2, 2)
-        nmax = rnd.choice([0, 1, 3, 20])
-        dets = [e["f_dsDetail"](z)[0] for z in zs]
-        if case % 4 == 0:     # exact fit / one over for the first k details
-            kk = rnd.randint(1, len(zs))
-            lim = len("\n".join(dets[:kk])) - rnd.choice([0, 1])
-        e["DS_TXT_MAX"], e["DS_TIP_N"] = lim, nmax
-        got = e["f_dsText"](zs, 0, len(zs) - 1)
-        want = ds_ref(e, zs, lim, nmax)
-        if got != want:
-            bad.append((case, got, want))
-        if "ほか" in got[0]:
-            hit.add("name")
-        if "ほか" in got[1]:
-            hit.add("tip")
-        if got[1].startswith("ほか"):
-            hit.add("tip-none")
-    e["DS_TXT_MAX"], e["DS_TIP_N"] = 3000, 20
-    # exact boundary by hand: three equal details fit exactly at their joined length, one character less drops the third
-    zs = [LbZone.new(11 + i, 2, 1, 1, 2000.0, 1990.0, 2010.0) for i in range(3)]
-    d3 = "\n".join(e["f_dsDetail"](z)[0] for z in zs)
-    e["DS_TXT_MAX"] = len(d3)
-    a = e["f_dsText"](zs, 0, 2)[1]
-    e["DS_TXT_MAX"] = len(d3) - 1
-    b = e["f_dsText"](zs, 0, 2)[1]
-    e["DS_TXT_MAX"] = 3000
-    check("LB-51 display text boundaries (Japanese names, line breaks, omission) == reference over 400 cases with small limits incl. "
-          "exact fit / one character over, details longer than the limit (never joined, only counted), no detail shown "
-          "('ほか○件' alone), names omitted in a line; by hand: 3 details fit at exactly their joined length (3000 rule: <=), "
-          "one character less -> 2 details + 'ほか1件'",
-          not bad and hit == {"name", "tip", "tip-none"} and a == d3 and b == "\n".join(d3.split("\n")[:2]) + "\nほか1件",
-          f"{bad[:1]} {hit}")
-    # the LAB-3 text builder (fa7f17f) fails on the same band under the same length check: the guard really models the error
-    try:
-        eo = guarded_env(src=git("show", DS_OLD_REV + ":ZoneComboLabXAU.pine"))
-        big_band(eo, 600)
-        mo, _, _, so, eo_ = eo["f_dsGroups"]()
-        eo["f_dsText"](mo, so[0], eo_[0])
-        old_err = ""
-    except lp.ap.PineRuntimeError as ex:
-        old_err = str(ex)
-    check("LB-52 the LAB-3 display text (fa7f17f) on the same 600-Zone band raises 'String is too long' under the per-concatenation "
-          "length check (the RE10000 reported on TradingView), the fixed version does not (LB-50)",
-          old_err.startswith("String is too long"), old_err)
-
-
-DS_OLD_REV = "fa7f17f"   # LAB-3 (before the display text length guard)
 
 
 OLD2_REV = "57b7b76"     # LAB-2 (before the display grouping / accum box count)
@@ -1591,15 +1501,16 @@ MUTANTS = [
      "        if na(r) and array.get(o.legLots, k - 1) > 0\n            r := array.get(o.legPx, k - 1)\n    r\n\nf_lbTpText", "BE lock target = farthest TP"),
     ("if lkBlk and array.size(lbWaits) > 0", "if false", "waits cleared while locked"),
     ("if xs != 0\n                    array.push(xId, z.id)", "if false\n                    array.push(xId, z.id)", "break cancels the wait"),
-    ("            if dOk and f_dsFits(tip, sep, d, DS_TXT_MAX)", "            if dOk", "tooltip length check before joining"),
-    ("                if f_dsFits(ln, sep, it, DS_TXT_MAX - str.length(tx) - str.length(sepL))", "                if true",
-     "name length check before joining"),
+    ("                more := true\n            else\n                i += 1\n    f_dsBox(ng)", "                more := false\n            else\n                i += 1\n    f_dsBox(ng)",
+     "display: chained merge"),
+    ("            if q.bot <= stp + EPS\n                    array.push(sm, q)", "            if q.bot < stp - EPS\n                    array.push(sm, q)",
+     "display: regroup after removal (touching bands)"),
 ]
 
 
 def mutation():
     scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_qty_table, sc_be, sc_lock_far, sc_and_only_sel, sc_sel_tp, sc_consume, sc_zones, sc_acc_keep, sc_dup_swing, sc_ta,
-            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref, sc_ds_len]
+            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref, sc_display, sc_fvg_display]
     survived = []
     for old, new, what in MUTANTS:
         if SRC.count(old) != 1:
@@ -1633,6 +1544,7 @@ def main():
     sc_roles()
     sc_combo()
     sc_fvg()
+    sc_fvg_display()
     sc_partial()
     sc_tp_mixed()
     sc_qty_table()
@@ -1644,7 +1556,6 @@ def main():
     sc_zones()
     sc_acc_keep()
     sc_display()
-    sc_ds_len()
     sc_old2_new()
     sc_dup_swing()
     sc_ta()
