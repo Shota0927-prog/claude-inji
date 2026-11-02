@@ -1086,7 +1086,8 @@ def sc_poc_latest():
 
 
 # ---------------------------------------------------------------------------- LAB-4: ZE fib (external LongFibWave)
-LFW_BASE = "09da78f"     # the last commit before the LAB-4 connection outputs were added to LongFibWave.pine
+LFW_BASE = "c170e5f"     # LongFibWave.pine before the LAB-4 connection outputs (LFW-5, the latest LongFibWave)
+ZCL_BASE = "09da78f"     # ZoneComboLabXAU.pine before LAB-4 (LAB-3h)
 FIB_NAMES = ["FIB protocol"] + [f"FIB {tf} {it}" for tf in ("4H", "日足") for it in ("起点", "終点", "方向", "波ID", "状態", "更新確定時刻")]
 ZE_RATIOS = (0.236, 0.382, 0.5, 0.618)
 ONLY_ZE = dict(cZA=False, cZB=False, cZC=False, cZD=False, cZF=False, cZE=True, zeUse=True)
@@ -1121,8 +1122,9 @@ def sc_ze_feed():
         'plot(array.get(lfwFeedD, 5), "FIB 日足 更新確定時刻", display = display.none)\n')
     names = re.findall(r'^plot\([^\n]*?, "(FIB [^"]+)", display = display\.none\)$', src, re.M)
     srcs = re.findall(r'^\w+ = input\.source\(close, "(FIB [^"]+)", group = G_ZE\)$', SRC, re.M)
-    check("LS-13 LongFibWave connection outputs (LAB-4): the file == the LAB-3h version with only the feed block + 13 hidden plots "
-          "inserted after the existing data-window plots (logic section, existing plots, drawing, tables unchanged); plot names = the 13 "
+    check("LS-13 LongFibWave connection outputs (LAB-4): the file == the LFW-5 version with only the feed block + 13 hidden plots "
+          "inserted after the existing data-window plots of the latest LongFibWave (LFW-5; logic section, existing plots, drawing, diagnostics, tables "
+          "unchanged); plot names = the 13 "
           "FIB series, the lab's 13 input.source titles are the same names; protocol 20001 on 5m charts only",
           src[:i] + src[j:] == old and names == FIB_NAMES and sorted(srcs) == sorted(FIB_NAMES)
           and 'plot(lfwIs5m ? 20001 : na, "FIB protocol", display = display.none)' in src
@@ -1306,7 +1308,7 @@ def sc_ze():
           got == want and nrep > 5 and any(w_ == [] for w_ in want[50:]), f"{nrep} {[i_ for i_ in range(len(got)) if got[i_] != want[i_]][:5]}")
     # ZE OFF (default) == the version before LAB-4 on random paths (legacy settings, OR / AND / only)
     bad = []
-    prev_src = git("show", f"{LFW_BASE}:ZoneComboLabXAU.pine")
+    prev_src = git("show", f"{ZCL_BASE}:ZoneComboLabXAU.pine")
     for seed in (2, 4):
         scr = rand_bars(seed, n=300)
         for cf in (dict(), dict(cComb="AND", cZA=False, cZB=False, cZC=True, cZD=True, cZF=False), dict(cScope="だけ")):
