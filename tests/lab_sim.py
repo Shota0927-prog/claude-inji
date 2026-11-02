@@ -1261,11 +1261,32 @@ def sc_ze():
     none_on = basic(zeUse=True, ze4S=1.0, ze4I=0.0, ze4D=0.0, zeDS=2.0, zeDI=4.0, zeDD=0.0, ze4T=float(T0), zeDT=float(T0))
     check("LB-72 ZE connection: detection ON with the series left at close (protocol != 20001) or a time series left at close -> state 9 "
           "and new entries stopped (skip 'ZE 接続'), never replaced by close; detection OFF (default) -> no check, no stop; no wave / hold "
-          "are normal invalid states (no stop)",
+          "(and calc OFF, LB-77) are normal invalid states (no stop)",
           len(entries(off)) == 1 and list(off["lbZeStat"]) == [0, 0] and entries(bad_on) == [] and list(bad_on["lbZeStat"]) == [9, 9]
           and bad_on["skipN"][8] >= 1 and entries(bad_t) == [] and bad_t["lbZeStat"][0] == 9 and len(entries(none_on)) == 1
           and list(none_on["lbZeStat"]) == [2, 3] and none_on["skipN"][8] == 0,
           f"{entries(off)} {list(bad_on['lbZeStat'])} {list(bad_t['lbZeStat'])} {list(none_on['lbZeStat'])} {entries(none_on)}")
+    # LAB-4b: the feed's calc OFF (state 0) is a normal invalid state: its Zones and waits go, nothing else stops.
+    # (a) valid 4H wave from bar 1, contact with 0.236 (bar 2) -> wait; state 0 from bar 3 -> Zones and the wait removed, no stop
+    rows = flat(8, 1985)
+    rows[2] = (1985.0, 1986.0, 1978.0, 1985.1)
+    sc6 = Sc(rows)
+    zef(sc6, 1, 3, "4", 1900.0, 2000.0, 1, 1, 3)
+    zef(sc6, 3, None, "4", None, None, 0, 1, 0)
+    r6 = sc6.run(**ONLY_TC, **{**QUIET, **NEW, **ONLY_ZE, "zeUseD": False})
+    # (b) both TFs calc OFF: a POC-only condition still enters; an AND that needs ZE + POC does not (no fib Zone), no 'ZE 接続' stop
+    off0 = dict(zeUse=True, ze4S=0.0, ze4I=0.0, ze4D=0.0, zeDS=0.0, zeDI=0.0, zeDD=0.0, ze4T=float(T0), zeDT=float(T0))
+    p_only = basic(**off0)
+    p_and = basic(**off0, cZE=True, cComb="AND", cZA=False, cZB=False, cZC=False, cZD=True, cZF=False)
+    p_and_on = basic(cZE=False, cComb="AND", cZA=False, cZB=False, cZC=False, cZD=True, cZF=False)     # same AND without ZE: enters
+    check("LB-77 feed calc OFF (state 0) = a normal invalid state: the TF's fib Zones and their waits are removed (bar 3), the state shows "
+          "'外部OFF' without an error; a condition met by other types (POC) still enters; an AND needing ZE has no fib Zone and does not "
+          "form (no order), and nothing is skipped for 'ZE 接続' (unconnected / misconnected still stop: LB-72)",
+          len(r6.trace[2]["waits"]) == 1 and r6.trace[3]["waits"] == [] and zes(r6) == [] and list(r6["lbZeStat"]) == [8, 0]
+          and r6["skipN"][8] == 0 and len(entries(p_only)) == 1 and list(p_only["lbZeStat"]) == [8, 8] and p_only["skipN"][8] == 0
+          and entries(p_and) == [] and p_and["skipN"][8] == 0 and p_and.trace[3]["waits"] == [] and len(entries(p_and_on)) == 1,
+          f"{r6.trace[2]['waits']} {r6.trace[3]['waits']} {list(r6['lbZeStat'])} {entries(p_only)} {list(p_only['lbZeStat'])} "
+          f"{entries(p_and)} {list(p_and['skipN'])}")
     # display: the 0.382 level (1986.2-1990.2) merged with an overlapping POC (1986-1990); a bullish FVG on it stays its own band
     sc4 = Sc(flat(6, 2050))
     zef(sc4, 1, None, "4", 2050.0, 1950.0, -1, 1, 3)
