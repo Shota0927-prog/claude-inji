@@ -13,6 +13,7 @@ bar, wait end) is compared after every 5M bar, so approaches / expiries / invali
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compiler, request.security, drawing limits and rendering not reproduced).
 """
+import copy
 import os
 import random
 import sys
@@ -116,14 +117,37 @@ class DRunner(ap.Runner):
                  line__style_dotted="dotted")
         for k in ("oState", "oSide", "oId", "oSL", "oTP", "oStop", "oBE", "oFill", "oPat", "oTf", "oQty", "oRRPlan", "oRRReal"):
             e.setdefault(k, None)
+        self.seq = 0                              # order of drawing creations / deletions (DTB-2)
         for nm in ("label__new", "line__new"):
             f = e[nm]
 
             def wrap(*a, _f=f, **k):
                 d = _f(*a, **k)
-                d.bar, d.conf = self.bar_index, e["barstate__isconfirmed"]
+                self.seq += 1
+                d.bar, d.conf, d.seq, d.delseq, d.delbar = self.bar_index, e["barstate__isconfirmed"], self.seq, None, None
                 return d
             e[nm] = wrap
+        for nm in ("label__delete", "line__delete"):
+            f = e[nm]
+
+            def wdel(obj, _f=f):
+                if obj is not None and not obj.deleted:
+                    self.seq += 1
+                    obj.delseq, obj.delbar = self.seq, self.bar_index
+                _f(obj)
+            e[nm] = wdel
+
+    # Pine objects are references: the same DvDr is held by dvDrs and dvDrQ. The base Runner deep-copies every var on its
+    # own (shared objects split into separate copies); here all vars are copied in ONE deepcopy so shared references stay
+    # shared after the per-bar snapshot / rollback (DTB-2).
+    def _snapshot(self):
+        return copy.deepcopy({k: self.env[k] for k in self.env["_VARS"]})
+
+    def _rollback(self):
+        if self.committed is not None:
+            self.env.update(copy.deepcopy(self.committed))
+        if self.varip_rollback and self.varip_bar_start is not None:
+            self.env.update(copy.deepcopy(self.varip_bar_start))
 
     def _set_series(self, b, o, h, l, c, confirmed, history=True):
         super()._set_series(b, o, h, l, c, confirmed, history)
@@ -623,12 +647,149 @@ def gate_static():
           f"bases={len(bases)} pTime!=pivot {n_diff} pTime==newest {n_new} naive estimate wrong {naive_bad}")
 
 
+# ============================================================================
+# DTB-2: a base whose drawings were removed by the drawing cap while waiting is redrawn with its approach on a late detection
+# ============================================================================
+def live_at(o, s):
+    return o.seq <= s and (o.delseq is None or o.delseq > s)
+
+
+def redraw_check(r):
+    """for every detection of a shown timeframe, just after its label is created: the base annotation, the availability
+    marker, the marker of THIS approach (approach bar time, its high / low, its count) and the pivot -> approach line are live;
+    markers / lines of one approach are never live twice at the same time, and a marker / line made again is made only on a
+    detection bar of that base after the first one was removed."""
+    bad, n_re, n_det = [], 0, 0
+    shown = [r.inp["dsTf%d" % k] for k in range(5)]
+    piv = pivot_times(r)
+    bases = all_bases(r)
+    labels = [d for d in r.draws if d.kind == "label"]
+    lines = [d for d in r.draws if d.kind == "line"]
+    detbars = {}
+    for e in r.events:
+        detbars.setdefault(e[1], set()).add(e[0])
+    for e in r.events:
+        bar, gid, tf, side, cnt, app, lvl, dapp = e
+        if not shown[tf]:
+            continue
+        n_det += 1
+        top = side == -1
+        g = bases[gid]
+        ab = r.bars[app]
+        ax, ay = ab["t"], ab["h"] if top else ab["l"]
+        dl = [d for d in labels if d.bar == bar and str(d.args[2]).startswith(
+            ("ダブル" if cnt == 2 else "トリプル") + ("トップ" if top else "ボトム") + " " + TFJA[tf] + "\n#" + str(gid) + " ")]
+        if len(dl) != 1:
+            bad.append(("detection label", e))
+            continue
+        sd = dl[0].seq
+        mk = [d for d in labels if d.kw.get("style") == "diamond" and str(d.args[2]).startswith(f"#{gid} {TFJA[tf]} {cnt}回目")]
+        ln = [d for d in lines if d.kw.get("style") == "dashed" and d.args[:4] == (piv[gid][0], g[3], ax, ay)]
+        an = [d for d in labels if str(d.args[2]).startswith(f"基準#{gid} ")]
+        rg = [d for d in labels if str(d.args[2]).startswith(f"#{gid} {TFJA[tf]} 登録")]
+        lm = [d for d in mk if live_at(d, sd)]
+        if len(lm) != 1 or lm[0].args[:2] != (ax, ay) or not (lm[0].text.endswith("\n検知") or dl[0].delseq is not None):
+            bad.append(("approach marker at detection", e, [(d.args[:2], d.seq, d.delseq, d.text) for d in mk]))
+        if len([d for d in ln if live_at(d, sd)]) < 1:
+            bad.append(("approach line at detection", e))
+        if len([d for d in an if live_at(d, sd) and d.args[:2] == (piv[gid][0], g[3])]) != 1:
+            bad.append(("base annotation at detection", e))
+        if len([d for d in rg if live_at(d, sd) and d.args[0] == r.bars[g[5]]["t"]]) != 1:
+            bad.append(("availability marker at detection", e))
+        for grp in (mk, an, rg):
+            ivs = sorted((d.seq, d.delseq or 10 ** 12) for d in grp)
+            if any(ivs[i + 1][0] < ivs[i][1] for i in range(len(ivs) - 1)):
+                bad.append(("drawn twice at the same time", e, ivs))
+        for d in mk[1:]:
+            if d.bar not in detbars[gid]:
+                bad.append(("marker made again off a detection bar", e, d.bar))
+        n_re += sum(1 for d in mk if d.bar == bar and d.bar != app)
+    return bad, n_re, n_det
+
+
+def gate_redraw():
+    B = az.B
+    # bars 0..5 = ZB (5M peak A = 4296 on bar 3, available on bar 5); bar 6 = A's 2nd approach (bullish -> waiting, wait end 9);
+    # bars 7 / 8 bullish below the band (A keeps waiting); bar 6 (4295) is a peak B available on bar 8 (its annotation is drawn
+    # there with "all bases" ON -> with a cap of 1 A's drawings are removed); bar 9 bearish -> A detected on the last wait bar
+    seq = az.ZB + [az.ZUP, B(4290, 4292, 4289, 4291.5), B(4291, 4293, 4290, 4292.5), B(4292.5, 4292.5, 4290, 4290.5), az.M]
+    bars = az.bars_of(seq, az.FR)
+    for b in bars:
+        b["dv"] = {}
+    ov = dict(dsMaxGrp=1, dsAllB=True)
+    o = run_orig(bars)
+    r = run_new(bars, ov)
+    lb = lambda pre: [d for d in r.draws if str(d.args[2]).startswith(pre)]
+    A = [d for d in r.draws if "#1 " in str(d.args[2]) or "基準#1 " in str(d.args[2]) or d.kind == "line" and d.args[1] == 4296.0]
+    s6 = {g[0]: g for g in r.snaps[6]}
+    step2 = s6.get(1) is not None and s6[1][7] == 2 and s6[1][8] is True and s6[1][9] == 6
+    first = [d for d in A if d.bar <= 6]
+    step3 = (first and all(d.delbar == 8 for d in first) and any(str(d.args[2]).startswith("基準#2 ") and d.bar == 8
+                                                                 for d in r.draws))
+    step4 = r.events == [(9, 1, 0, -1, 2, 6, 4296.0, False)] and o.events == r.events and first_diff(o, r) is None
+    t = lambda i: bars[i]["t"]
+    live = [d for d in r.draws if not d.deleted]
+    want = {
+        "base": [d for d in live if str(d.args[2]) == "基準#1 5分足 山 4296" and d.args[:2] == (t(3), 4296.0) and d.bar == 9],
+        "reg": [d for d in live if str(d.args[2]) == "#1 5分 登録" and d.args[:2] == (t(5), 4296.0) and d.bar == 9],
+        "app": [d for d in live if d.kw.get("style") == "diamond" and d.args[:2] == (t(6), 4295) and d.text == "#1 5分 2回目\n検知"
+                and d.bar == 9],
+        "line": [d for d in live if d.kind == "line" and d.args[:4] == (t(3), 4296.0, t(6), 4295) and d.bar == 9],
+        "det": [d for d in live if str(d.args[2]) == "ダブルトップ 5分\n#1 2回目" and d.args[0] == t(9) and d.bar == 9],
+    }
+    step5 = all(len(v) == 1 for v in want.values()) and len([d for d in live if d.kind == "line" and d.args[1] == 4296.0]) == 2
+    check("DT-W1 cap 1: base A approaches (bar 6, waiting), B's drawing on bar 8 removes A's drawings, A detects on bar 9 within "
+          "its wait -> A's base annotation (pivot bar 3, 4296), availability marker (bar 5), approach marker (bar 6, its high 4295, "
+          "2nd, '検知'), pivot -> approach line and the double-top label (bar 9) are all shown again, once each; the events / base "
+          "states equal the original",
+          step2 and step3 and step4 and step5, f"steps 2..5 = {step2, step3, step4, step5} {[(k, len(v)) for k, v in want.items()]}")
+    # the version before DTB-2 misses the marker / line on that redraw (the check would catch it)
+    old_txt = __import__("subprocess").run(["git", "-C", ROOT, "show", "cb44e61:DoubleTripleTopBottomXAU.pine"], capture_output=True,
+                                           text=True).stdout
+    old = DRunner(dict(ov), src=instrument(new_src(old_txt))).run(bars)
+    ob = redraw_check(old)[0]
+    nb = redraw_check(r)[0]
+    check("DT-W2 the same scenario on the previous indicator (cb44e61) lacks the approach marker / line after the redraw (caught "
+          "by the check); the fixed indicator passes it", ob and not nb, f"old={ob[:1]} new={nb[:2]}")
+    # random series: every late detection after a removal redrawn with its approach; no double drawing when nothing was removed;
+    # detection events / base states equal the original and the previous indicator; created drawings only gain the redraws
+    tot_re = tot_det = 0
+    allbad = []
+    same = True
+    for seed, days, miss, cap, allb in ((71, 20, 0.02, 1, False), (71, 20, 0.02, 1, True), (72, 20, 0.0, 3, False),
+                                         (73, 20, 0.03, 40, False)):
+        bars = series(seed, days, miss)
+        o = run_orig(bars)
+        v = dict(dsMaxGrp=cap, dsAllB=allb)
+        r = run_new(bars, v)
+        p = DRunner(dict(v), src=instrument(new_src(old_txt))).run(bars)
+        bad, n_re, n_det = redraw_check(r)
+        allbad += bad
+        tot_re += n_re
+        tot_det += n_det
+        cr, cp = created(r), created(p)
+        extra = [c for c in cr if c not in cp]
+        if first_diff(o, r) is not None or first_diff(p, r) is not None or [c for c in cp if c not in cr] \
+                or any(c[0] == "label" and c[3] and dict(c[3]).get("style") != "diamond" for c in extra) \
+                or any(c[1] not in {e[0] for e in r.events} for c in extra):
+            same = False
+        print(f"  [DT-W3] seed {seed} cap {cap} all-bases {allb}: detections {n_det}, redrawn approaches {n_re}, extra drawings "
+              f"{len(extra)}", flush=True)
+    check("DT-W3 random series (cap 1 / 1 + all bases / 3 / 40): at every detection the base, availability marker, this "
+          "approach's marker and line are live, never twice at once; redraws happen (cap 1) and only on detection bars",
+          not allbad and tot_re > 0, f"redraws={tot_re} detections={tot_det} {allbad[:3]}")
+    check("DT-W4 detection events and active bases unchanged: equal to the original and to the previous indicator; the drawings "
+          "differ from the previous indicator only by the added approach markers / lines on detection bars",
+          same, "")
+
+
 def main():
     gate_static()
     n_sc, scov = gate_scenarios()
     tot_ev, tot_mis, n_runs = gate_series(scov)
     gate_display()
     gate_realtime_prefix()
+    gate_redraw()
     ok = 0
     for name, res, det in RESULTS:
         print(("PASS  " if res else "FAIL  ") + name + ("" if res or not det else "\n      " + str(det)[:600]))
