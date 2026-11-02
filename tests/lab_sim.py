@@ -189,9 +189,11 @@ def static():
           n_plot <= 64 and n_req == 14 and n_src == 13 and "security_lower_tf" not in code, f"plot {n_plot} request {n_req} source {n_src}")
     logic = lp.logic_section(SRC)
     check("LS-10 the logic section has no history reference / request / ta.* call (transpiles; series values come from the feed "
-          "section) and no Keep Count / expiry / generation pruning of valid Zones",
+          "section), no expiry / generation pruning of valid Zones except the accum box count (zaKeep), and no Zone drawing (box.* / "
+          "dsZone only in the display section)",
           lp.transpile() and not re.search(r"\w\[\d", re.sub(r"//.*", "", logic).replace("[]", "")) and "request." not in logic
-          and "ta." not in re.sub(r"//.*", "", logic) and "Keep" not in logic and "expTime" not in logic)
+          and "ta." not in re.sub(r"//.*", "", logic) and "Keep" not in logic.replace("zaKeep", "") and "expTime" not in logic
+          and "box." not in re.sub(r"//.*", "", logic) and "dsZone" not in logic)
 
 
 REG_BASE = "444e61f"     # the last commit before the LAB-1 registration edits
@@ -779,6 +781,140 @@ def sc_dup_swing():
           and r.trace[4]["tevs"] == [(2, -1, 4, True)], f"{len(zc)} {r.trace[3]['waits']} {ev}")
 
 
+def acc_feed(sc, k, boxes):
+    """accum feed for TF k (1..3): boxes = [(i0, i1, u, l, id, forming)] held on bars i0..i1-1"""
+    for i0, i1, u, l, aid, a in boxes:
+        sc.hold(i0, i1, **{f"f{k}u": u, f"f{k}l": l, f"f{k}i": aid, f"f{k}a": a})
+    return sc
+
+
+def sc_acc_keep():
+    # 1H: A (2010 / 1995) fixed on bar 3; B forming on bars 5-6, fixed on bar 7 -> A retired on bar 7 (keep 1).
+    # 4H: C fixed on bar 2, D fixed on bar 6 -> both kept with keep 2 and independent of the 1H rotation
+    def mk(**ov):
+        rows = flat(20, 1985)
+        rows[4] = (1986.0, 1990.0, 1985.0, 1986.0)                  # wick into A's lower edge band (1989-2001) from below -> SHORT wait
+        rows[8] = tc_short(1987.0)
+        sc = Sc(rows)
+        acc_feed(sc, 1, [(1, 3, 2010.0, 1995.0, 100, 1), (3, 5, 2010.0, 1995.0, 100, 0), (5, 7, 2100.0, 2090.0, 200, 1), (7, None, 2100.0, 2090.0, 200, 0)])
+        acc_feed(sc, 2, [(1, 2, 2300.0, 2290.0, 300, 1), (2, 5, 2300.0, 2290.0, 300, 0), (5, 6, 2400.0, 2390.0, 400, 1), (6, None, 2400.0, 2390.0, 400, 0)])
+        sc.set(8, labS1=1987.0)
+        return sc.run(**ONLY_TC, **QUIET, zaKeep2=2, **ov)
+    r1, r2 = mk(), mk(zaKeep1=2)
+    def keys(r, bar=None):
+        return sorted((z.tf, z.key, z.sub) for z in r["lbZs"] if z.typ == 0)
+    p6 = lp.Runner(overrides=dict(**ONLY_TC, **QUIET, zaKeep2=2))
+    rows = None
+    check("LB-46 accum boxes kept per TF (initial 1): the 1H box A is used while B is forming (bars 5-6 not counted) and is retired "
+          "with both edges when B is fixed (bar 7); its SHORT wait from bar 4 is cancelled, so the TC on bar 8 gives no entry (with 2 boxes "
+          "kept: entry on bar 8); the 4H boxes (keep 2) stay independent of the 1H rotation",
+          keys(r1) == [(0, 200, -1), (0, 200, 1), (1, 300, -1), (1, 300, 1), (1, 400, -1), (1, 400, 1)] and r1["st"].nAccOut == 2
+          and r1.trace[6]["waits"] and not r1.trace[7]["waits"] and entries(r1) == [] and [e[0] for e in entries(r2)] == [8]
+          and len(keys(r2)) == 8, f"{keys(r1)} {r1.trace[6]['waits']} {r1.trace[7]['waits']} {entries(r1)} {entries(r2)}")
+    # TP: SHORT from POC 2000 with the 1H box A (1975 / 1965 -> edges 1969-1981 and 1959-1971, one band, TP1 1981) as the only target;
+    # A is retired by B on bar 9 while holding -> the TP moves to the fixed RR from the fill; the SL and the position stay
+    after = flat(10, 1998.5)
+    rows = flat(3, 1985) + [(1990.0, 1999.5, 1989.0, 1999.0), (2000.5, 2001.5, 1998.0, 1998.5)] + after
+    sc = Sc(rows)
+    poc(sc, 1, 2000.0)
+    acc_feed(sc, 1, [(0, 1, 1975.0, 1965.0, 100, 1), (1, 8, 1975.0, 1965.0, 100, 0), (8, 9, 2100.0, 2090.0, 200, 1), (9, None, 2100.0, 2090.0, 200, 0)])
+    sc.set(4, labS1=2001.0)
+    r = sc.run(**ONLY_TC, **QUIET)
+    fill = r.trace[5]["fill"]
+    check("LB-46b a retired box leaves the TP candidates: while holding, TP1 = the box's band edge 1981 (bar 8); after the box is "
+          "replaced on bar 9 the TP is re-planned without it (fixed RR from the fill); the initial SL 2011 and the position are unchanged",
+          r.trace[8]["legPx"][0] == 1981.0 and abs(r.trace[9]["legPx"][0] - (fill - 1.5 * (2011.0 - fill))) < 1e-9
+          and r["o"].sl == 2011.0 and r.trace[9]["pos"] != 0 and r.trace[9]["stop"] == r.trace[8]["stop"], f"{[t['legPx'] for t in r.trace[7:10]]}")
+
+
+def sc_display():
+    # grouping (pure helper f_dsGroups) vs a reference; label text (f_dsText); display ON/OFF does not change trading
+    r = lp.Runner(overrides=dict(QUIET, zbUse1=True, zbUse2=True)).run(Sc(flat(2, 2000)).bars)
+    e = r.env
+    LbZone = e["LbZone"]
+    rnd = random.Random(9)
+    bad = []
+    for case in range(300):
+        zs, fv = [], []
+        for _ in range(rnd.randint(0, 12)):
+            c = round(2000 + rnd.uniform(-50, 50), rnd.choice([0, 1]))
+            zs.append(LbZone.new(len(zs) + 1, rnd.choice([0, 2, 3]), rnd.randint(0, 2), rnd.choice([1, -1]), c, c - 6.0, c + 6.0))
+        for _ in range(rnd.randint(0, 4)):
+            b = round(2000 + rnd.uniform(-60, 50), 1)
+            w = rnd.choice([3.0, 20.0, 45.0])
+            fv.append(LbZone.new(100 + len(fv), 4, 0, 1, b + w / 2, b, b + w))
+        e["lbZs"] = sorted(zs, key=lambda z: z.bot)
+        e["lbFvgs"] = sorted(fv, key=lambda z: z.bot)
+        mas = [round(2000 + rnd.uniform(-40, 40), 1) if rnd.random() < 0.5 else None for _ in range(2)]
+        e["zbMa1"], e["zbMa2"] = mas
+        e["lbMa1"] = LbZone.new(201, 1, 0, 0, mas[0], mas[0] - 6.0, mas[0] + 6.0) if mas[0] is not None else None
+        e["lbMa2"] = LbZone.new(202, 1, 1, 0, mas[1], mas[1] - 6.0, mas[1] + 6.0) if mas[1] is not None else None
+        allz = zs + fv + [z for z in (e["lbMa1"], e["lbMa2"]) if z is not None]
+        iv = sorted(allz, key=lambda z: z.bot)
+        ref = []
+        for z in iv:
+            if ref and z.bot <= ref[-1][1] + 1e-7:
+                ref[-1] = (ref[-1][0], max(ref[-1][1], z.top), ref[-1][2] + [z.id])
+            else:
+                ref.append((z.bot, z.top, [z.id]))
+        mem, gB, gT, gS, gE = e["f_dsGroups"]()
+        got = [(gB[g], gT[g], sorted(mem[i].id for i in range(gS[g], gE[g] + 1))) for g in range(len(gB))]
+        if got != [(b, t, sorted(ids)) for b, t, ids in ref]:
+            bad.append(case)
+    # text: 4H accum lower + 4H swing high + 1m MA overlapping; two 1H POCs (same name once); a separate non-overlapping zone
+    e["lbZs"] = sorted([LbZone.new(1, 0, 1, -1, 2000.0, 1994.0, 2006.0), LbZone.new(2, 2, 1, 1, 2004.0, 1998.0, 2010.0),
+                        LbZone.new(3, 3, 0, 0, 2008.0, 2002.0, 2014.0, 2007.5, 2008.5), LbZone.new(4, 3, 0, 0, 2009.0, 2003.0, 2015.0, 2008.5, 2009.5),
+                        LbZone.new(5, 2, 3, -1, 2040.0, 2034.0, 2046.0)], key=lambda z: z.bot)
+    e["lbFvgs"] = []
+    e["zbMa1"], e["zbMa2"] = 2012.0, None
+    e["lbMa1"], e["lbMa2"] = LbZone.new(201, 1, 0, 0, 2012.0, 2006.0, 2018.0), None
+    mem, gB, gT, gS, gE = e["f_dsGroups"]()
+    tx, tip = e["f_dsText"](mem, gS[0], gE[0])
+    tx2, _ = e["f_dsText"](mem, gS[1], gE[1])
+    want = "4時間足｜アキュム下辺＋水平線・高値\n1時間足｜出来高POC\n1分足｜MA EMA3000"
+    check("LB-47 display grouping (f_dsGroups): only bands that really overlap (EPS, chained) form one display band from the lowest low "
+          "to the highest high, separate bands are never merged for being close (300 random sets incl. wide FVGs and both MAs == "
+          "reference); label: one line per TF, higher TF first, same names once (two 1H POCs -> '出来高POC'), IDs / bounds only in the "
+          "tooltip", not bad and gB == [1994.0, 2034.0] and gT == [2018.0, 2046.0] and tx == want and tx2 == "週足｜水平線・安値"
+          and "#3" in tip and "#4" in tip and "#" not in tx and "区画 2007.5〜2008.5" in tip, f"{bad[:3]} {tx!r} {tx2!r}")
+    # display ON / OFF and entry labels ON / OFF do not change trading (the Zone display is outside the logic section)
+    sc = rand_bars(3, n=400)
+    a = lp.Runner(overrides=dict(zbUse2=False, dsZone=True, dsEnt=True)).run(sc.bars)
+    b = lp.Runner(overrides=dict(zbUse2=False, dsZone=False, dsEnt=False)).run(sc.bars)
+    check("LB-48 display ON / OFF (Zone bands and entry labels) gives identical orders, fills, waits and ledger (Zone drawing lives only "
+          "in the display section, redrawn on the last bar when the Zone set / MA bands change)",
+          a.broker.log == b.broker.log and a.trace == b.trace and list(a["bkNet"]) == list(b["bkNet"]) and len(entries(a)) > 0,
+          f"{len(entries(a))} {len(entries(b))}")
+
+
+OLD2_REV = "57b7b76"     # LAB-2 (before the display grouping / accum box count)
+
+
+def sc_old2_new():
+    old_src = git("show", f"{OLD2_REV}:ZoneComboLabXAU.pine")
+    bad = []
+    n_ent = 0
+    for seed in range(2):
+        sc = rand_bars(seed + 20, n=350)
+        for k, base in ((1, 0), (2, 1), (3, 2)):
+            boxes = []
+            for j in range(6):
+                i0 = 20 + j * 50 + base * 7
+                u = round(sc.bars[i0]["c"] + 4, 1)
+                boxes += [(i0, i0 + 10, u, round(u - 8, 1), 1000 * k + j, 1), (i0 + 10, i0 + 50, u, round(u - 8, 1), 1000 * k + j, 0)]
+            acc_feed(sc, k, boxes)
+        for cf in (dict(), dict(cComb="AND", cZA=True, cZB=False, cZC=True, cZD=True, cZF=False)):
+            ov = dict(zbUse2=False, dsZone=False, dsEnt=False, **cf)
+            a = lp.Runner(overrides=ov, src=old_src).run(sc.bars)
+            b = lp.Runner(overrides=dict(ov, zaKeep1=999, zaKeep2=999, zaKeep3=999)).run(sc.bars)
+            if not (a.broker.log == b.broker.log and a.trace == b.trace and list(a["bkNet"]) == list(b["bkNet"])):
+                bad.append((seed, cf))
+            n_ent += len(entries(b))
+    check("LB-49 with every accum box kept (999), the new version == LAB-2 (57b7b76) on 2 random paths x 350 bars with 1H / 4H / D accum "
+          "feeds (OR and AND): identical orders, fills, waits and ledger (only the box count and the display changed)",
+          not bad and n_ent > 0, f"{bad} {n_ent}")
+
+
 def sc_zones():
     # ZA: forming -> fixed; no Keep Count (4 Accums on 1H all kept = 8 Zones)
     rows = flat(14, 1900)
@@ -787,11 +923,11 @@ def sc_zones():
     sc.hold(3, 5, f1u=2006.0, f1l=1994.0, f1i=100, f1a=0)
     for j, (i0, i1) in enumerate(((5, 7), (7, 9), (9, 11), (11, None))):
         sc.hold(i0, i1, f1u=2100.0 + 30 * j, f1l=2090.0 + 30 * j, f1i=200 + j, f1a=1 if j < 3 else 0)
-    r = sc.run(**QUIET)
+    r = sc.run(**QUIET, zaKeep1=99)
     za = [z for z in r["lbZs"] if z.typ == 0]
     check("LB-30 ZA: a forming Accum is not a Zone; it is fixed when the forming flag turns 0 (bar 3, last bounds 2006 / 1994) -> two "
-          "Zones (upper 2006 +-6, lower 1994 +-6); a new ID fixes the previous unfixed one; 5 Accums on 1H -> 10 Zones (no Keep Count, "
-          "no expiry)", r.trace[2] and len([z for z in r["lbZs"] if z.key == 100]) == 2 and len(za) == 10
+          "Zones (upper 2006 +-6, lower 1994 +-6); a new ID fixes the previous unfixed one; with 99 boxes kept, 5 Accums on 1H -> 10 "
+          "Zones (no expiry)", r.trace[2] and len([z for z in r["lbZs"] if z.key == 100]) == 2 and len(za) == 10
           and sorted(z.ctr for z in za if z.key == 100) == [1994.0, 2006.0], f"{len(za)}")
     # ZC dedupe (Library rule) / ZD exact-value registration
     sc = Sc(flat(10, 1900))
@@ -1162,7 +1298,7 @@ def sc_old_new():
         for cf in cfgs:
             ov = dict(dsZone=False, dsEnt=False, **cf)
             a = lp.Runner(overrides=ov, src=old_src).run(sc.bars)
-            b = lp.Runner(overrides=ov).run(sc.bars)
+            b = lp.Runner(overrides=dict(ov, zaKeep1=999, zaKeep2=999, zaKeep3=999)).run(sc.bars)
             same = (a.broker.log == b.broker.log and a.broker.closed == b.broker.closed and a.trace == b.trace
                     and [list(a[k]) for k in ("bkN", "bkW", "bkL", "bkBE", "bkNet", "bkR")] == [list(b[k]) for k in ("bkN", "bkW", "bkL", "bkBE", "bkNet", "bkR")]
                     and sorted((z.typ, z.tf, z.ctr, z.bot, z.top) for z in a["lbZs"]) == sorted((z.typ, z.tf, z.ctr, z.bot, z.top) for z in b["lbZs"]))
@@ -1257,6 +1393,8 @@ MUTANTS = [
     ("array<LbZone> fArr = side == 1 ? lbFvgs : lbFvgsT", "array<LbZone> fArr = lbFvgs", "SHORT reads FVGs in high order"),
     ("else if side == 1 ? b <= cf + EPS : t >= cf - EPS", "else if false", "overlapping TP Zones merged"),
     ("not f_lbDup(3, k, 0, pc)", "true", "POC exact duplicate"),
+    ("    while nk > 2 * f_zaKeep(q.tf)\n", "    while nk > 2 * f_zaKeep(q.tf) + 2\n", "accum box count"),
+    ("        array.push(lbDeadNow, zo.id)\n", "", "retired box cancels its waits"),
     ("if not na(pt) and not na(pv) and (na(lt) or pt != lt)", "if not na(pt) and not na(pv)", "a Swing pivot is registered once"),
     ("fakeWin = input.int(0,", "fakeWin = input.int(3,", "fake window default unlimited"),
     ("        if array.get(o.legLots, k - 1) > 0\n            r := array.get(o.legPx, k - 1)\n    r\n\nf_lbTpText",
@@ -1267,7 +1405,7 @@ MUTANTS = [
 
 
 def mutation():
-    scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_qty_table, sc_be, sc_lock_far, sc_and_only_sel, sc_sel_tp, sc_consume, sc_zones, sc_dup_swing, sc_ta,
+    scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_qty_table, sc_be, sc_lock_far, sc_and_only_sel, sc_sel_tp, sc_consume, sc_zones, sc_acc_keep, sc_dup_swing, sc_ta,
             sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref]
     survived = []
     for old, new, what in MUTANTS:
@@ -1311,6 +1449,9 @@ def main():
     sc_sel_tp()
     sc_consume()
     sc_zones()
+    sc_acc_keep()
+    sc_display()
+    sc_old2_new()
     sc_dup_swing()
     sc_ta()
     sc_session()
