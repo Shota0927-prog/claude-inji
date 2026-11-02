@@ -562,13 +562,13 @@ def sc_fvg_display():
     run = lambda n, ds: lp.Runner(overrides=dict(**ONLY_TC, **dict(QUIET, dsZone=ds))).run(sc.bars[:n])
     r8, r10, r = run(9, True), run(11, True), run(14, True)
     off = run(14, False)
-    txt = lambda rr: [g.bx.text for g in rr["lbDsG"] if not g.gone]
+    txt = lambda rr: [g.lb.text for g in rr["lbDsG"] if not g.gone]
     gone = [g for g in r["lbDsG"] if g.gone]
     check("LB-20b display of FVG changes: FVG 1990-1996 overlapping a 1H POC 1991-2003 is not merged (FVG on its own band with its own "
-          "bounds); after the iFVG flip its band is renamed ('1時間足｜iFVG・上昇FVGが反転'); after the invalidation it stays as a grey ended "
-          "band (extend none) and the POC band is unchanged; display OFF gives the same trading",
-          sorted(txt(r8)) == ["1時間足｜FVG・上昇", "1時間足｜出来高POC"] and ds_groups(r8.env) == [(1990.0, 1996.0, [ds_groups(r8.env)[0][2][0]]), (1991.0, 2003.0, ds_groups(r8.env)[1][2])]
-          and sorted(txt(r10)) == ["1時間足｜iFVG・上昇FVGが反転", "1時間足｜出来高POC"] and txt(r) == ["1時間足｜出来高POC"]
+          "bounds); after the iFVG flip its band is renamed ('1時間足｜iFVG'); after the invalidation it stays as a grey ended "
+          "band (extend none, its name in the ended band) and the POC band is unchanged; display OFF gives the same trading",
+          sorted(txt(r8)) == ["1時間足｜FVG", "1時間足｜出来高POC"] and ds_groups(r8.env) == [(1990.0, 1996.0, [ds_groups(r8.env)[0][2][0]]), (1991.0, 2003.0, ds_groups(r8.env)[1][2])]
+          and sorted(txt(r10)) == ["1時間足｜iFVG", "1時間足｜出来高POC"] and txt(r) == ["1時間足｜出来高POC"]
           and ds_groups(r.env)[0][:2] == (1991.0, 2003.0) and len(gone) == 1 and gone[0].bx.kw.get("extend") == "none"
           and r.trace == off.trace and r.broker.log == off.broker.log, f"{txt(r8)} {txt(r10)} {txt(r)} {len(gone)}")
 
@@ -836,7 +836,7 @@ def sc_swing_merge():
         sc = Sc(flat(n, 4250))
         for i, tf, hi, p, ko in pivots:
             sw_feed(sc, i, tf, hi, p, ko)
-        return sc.run(**ONLY_TC, **dict(QUIET, **NEW, **ov))
+        return sc.run(**ONLY_TC, **{**QUIET, **NEW, **ov})
     r1 = run([(1, 1, True, 4300.0, 1), (2, 2, False, 4304.0, 2), (3, 3, True, 4308.0, 3)])
     z1 = swz(r1)
     r2 = run([(1, 1, True, 4300.0, 1), (2, 2, True, 4305.0, 2)])
@@ -864,7 +864,7 @@ def sc_swing_merge():
         sw_feed(sc, 1, 2, True, 1996.5, 2)
         sw_feed(sc, 2, 3, False, 2001.0, 3)
         sc.set(4, labS1=L_AFTER)
-        return sc.run(**ONLY_TC, **dict(QUIET, **NEW, **ov))
+        return sc.run(**ONLY_TC, **{**QUIET, **NEW, **ov})
     rm, ru = touch(), touch(zcMerge=-1.0)
     zm = swz(rm)
     check("LB-54 the merged swing Zone is the trading Zone: 1992 / 1996.5 / 2001 -> 1990-2003; one contact from below -> one SHORT wait "
@@ -950,15 +950,16 @@ def sc_names_labels():
     e["bar_index"] = 500
     e["f_dsLblX"]()
     moved = all(g.lb.x == 503 and g.lb.args[1] == (g.bot + g.top) / 2.0 and g.bx.kw.get("text") is None for g in gs)
-    alive_lb = {id(d) for d in run.draws if d.kind == "label" and not d.deleted}
+    # (per-bar state is deep-copied by the harness, so label deletion sync is checked on direct calls in LB-47; here: one label per band)
+    one_lb = all(g.lb is not None and not g.lb.deleted for g in gs) and all(g.lb is None for g in e["lbDsG"] if g.gone)
     check("LB-59 names: '4時間足｜水平線' / '1時間足｜水平線＋出来高POC' (merged 1H + 4H swing lines with the normally received 1H POC), "
           "'4時間足｜出来高POC' alone, '4時間足｜FVG'; the 1m MA joins the overlapping band on the confirmed bar where its band overlaps "
           "(bar 4: '…\n1分足｜MA EMA3000') and leaves on the next confirmed bar it does not (bar 5); one name label per shown band "
           "(no text in the box) at bar + 3 / mid height, moved to the latest bar + 3 by f_dsLblX, labels of merged / removed bands deleted",
           texts[3] == sorted([swing_poc, "4時間足｜出来高POC", "4時間足｜FVG"])
           and texts[4] == sorted([swing_poc + "\n1分足｜MA EMA3000", "4時間足｜出来高POC", "4時間足｜FVG"])
-          and texts[5] == texts[3] and moved and alive_lb == {id(g.lb) for g in gs} and len(gs) == 3,
-          f"{texts[3]} {texts[4]} {texts[5]} {moved} {len(alive_lb)} {len(gs)}")
+          and texts[5] == texts[3] and moved and one_lb and len(gs) == 3,
+          f"{texts[3]} {texts[4]} {texts[5]} {moved} {one_lb} {len(gs)}")
     # iFVG name
     zf = [z for g in gs for z in g.mem if z.typ == 4][0]
     zf.inv = True
@@ -1099,8 +1100,11 @@ def sc_display():
             nma += any(z.typ == 1 for g in e["lbDsG"] if not g.gone for z in g.mem)
             groups = [g for g in e["lbDsG"] if not g.gone]
             alive = {id(d) for d in r.draws[n0:] if d.kind == "box" and not d.deleted}
+            alive_l = {id(d) for d in r.draws[n0:] if d.kind == "label" and not d.deleted}
             ok = (ds_groups(e) == ds_ref_groups(act + [m for m in mas if m is not None]) and alive == {id(g.bx) for g in e["lbDsG"]}
-                  and all(g.bx.text == ds_name_ref(e, g.mem) and g.bx.args[1] == g.top and g.bx.args[3] == g.bot for g in groups))
+                  and alive_l == {id(g.lb) for g in groups}
+                  and all(g.lb.text == ds_name_ref(e, g.mem) and g.bx.args[1] == g.top and g.bx.args[3] == g.bot
+                          and g.lb.args[1] == (g.bot + g.top) / 2.0 for g in groups))
             if not ok:
                 bad.append((case, step))
                 break
@@ -1114,36 +1118,36 @@ def sc_display():
     for z in zs:
         z.aBar = 1000
         e["f_dsAdd"](z)
-    txt = sorted(g.bx.text for g in e["lbDsG"])
+    txt = sorted(g.lb.text for g in e["lbDsG"])
     fv = LbZone.new(6, 4, 1, 1, 2001.0, 1999.0, 2003.0, None, None, 6, 1000, 0)
     e["f_dsAdd"](fv)
     fv.inv = True
     e["f_dsRename"](fv)
-    t_inv = [(g.bx.text, g.bot, g.top) for g in e["lbDsG"] if any(z.id == 6 for z in g.mem)]
-    txt_f = sorted(g.bx.text for g in e["lbDsG"])
+    t_inv = [(g.lb.text, g.bot, g.top) for g in e["lbDsG"] if any(z.id == 6 for z in g.mem)]
+    txt_f = sorted(g.lb.text for g in e["lbDsG"])
     ma = LbZone.new(201, 1, 0, 0, 2012.0, 2006.0, 2018.0, None, None, None, 0, 0)
     e["lbMa1"] = ma
     e["f_dsMa"]()
-    t_ma = sorted((g.bx.text, g.bot, g.top) for g in e["lbDsG"] if not g.gone)
+    t_ma = sorted((g.lb.text, g.bot, g.top) for g in e["lbDsG"] if not g.gone)
     ma.ctr, ma.bot, ma.top = 2080.0, 2074.0, 2086.0     # the MA moves away: back to the band without it, no MA-only band
     e["bar_index"] += 1
     e["f_dsMa"]()
-    t_ma2 = sorted((g.bx.text, g.bot, g.top) for g in e["lbDsG"] if not g.gone)
+    t_ma2 = sorted((g.lb.text, g.bot, g.top) for g in e["lbDsG"] if not g.gone)
     e["lbMa1"] = None
     check("LB-47 display grouping: Zones are merged into one band only when their ranges really overlap (EPS, chained, incl. a new Zone "
           "bridging two bands), from the lowest low to the highest high; bands that are only close stay apart; removing a Zone "
           "re-splits the rest; merged bands' boxes are deleted (one box per band, no duplicate box / text); FVG / iFVG never merged "
           "(own bounds, no bridging); MA bands (moving each bar) merged with overlapping accum / swing / POC bands, MA alone = no band; "
           "150 random add / remove / MA-move sequences == reference after every bar. Names: one line per TF, higher TF first, accum / MA / swing / POC / FVG order in a line, same TF x item once: '4時間足｜アキュム下辺"
-          "＋水平線・高値' / '1時間足｜出来高POC' (two POCs once), iFVG renamed in place, MA '1分足｜MA EMA3000'",
+          "＋水平線' / '1時間足｜出来高POC' (two POCs once), iFVG renamed in place, MA '1分足｜MA EMA3000'",
           not bad and nmerge > 50 and nsplit > 50
-          and txt == ["4時間足｜アキュム下辺＋水平線・高値\n1時間足｜出来高POC", "週足｜水平線・安値"]
-          and t_inv == [("4時間足｜iFVG・上昇FVGが反転", 1999.0, 2003.0)]
-          and txt_f == sorted(["4時間足｜iFVG・上昇FVGが反転", "4時間足｜アキュム下辺＋水平線・高値\n1時間足｜出来高POC", "週足｜水平線・安値"])
-          and t_ma == sorted([("4時間足｜アキュム下辺＋水平線・高値\n1時間足｜出来高POC\n1分足｜MA EMA3000", 1994.0, 2018.0),
-                              ("4時間足｜iFVG・上昇FVGが反転", 1999.0, 2003.0), ("週足｜水平線・安値", 2034.0, 2046.0)])
-          and t_ma2 == sorted([("4時間足｜アキュム下辺＋水平線・高値\n1時間足｜出来高POC", 1994.0, 2015.0),
-                               ("4時間足｜iFVG・上昇FVGが反転", 1999.0, 2003.0), ("週足｜水平線・安値", 2034.0, 2046.0)])
+          and txt == ["4時間足｜アキュム下辺＋水平線\n1時間足｜出来高POC", "週足｜水平線"]
+          and t_inv == [("4時間足｜iFVG", 1999.0, 2003.0)]
+          and txt_f == sorted(["4時間足｜iFVG", "4時間足｜アキュム下辺＋水平線\n1時間足｜出来高POC", "週足｜水平線"])
+          and t_ma == sorted([("4時間足｜アキュム下辺＋水平線\n1時間足｜出来高POC\n1分足｜MA EMA3000", 1994.0, 2018.0),
+                              ("4時間足｜iFVG", 1999.0, 2003.0), ("週足｜水平線", 2034.0, 2046.0)])
+          and t_ma2 == sorted([("4時間足｜アキュム下辺＋水平線\n1時間足｜出来高POC", 1994.0, 2015.0),
+                               ("4時間足｜iFVG", 1999.0, 2003.0), ("週足｜水平線", 2034.0, 2046.0)])
           and nma > 100, f"{bad[:3]} {nmerge} {nsplit} {nma} {txt} {t_inv} {txt_f} {t_ma} {t_ma2}")
     e["lbDsG"], e["dsZoneMax"] = [], 3
     sep = [LbZone.new(300 + k, 2, 0, 1, 2000.0 + 20 * k, 1994.0 + 20 * k, 2006.0 + 20 * k, None, None, k, 1000, 0) for k in range(5)]
@@ -1609,7 +1613,8 @@ def sc_tp_ref():
         zs, fv = [], []
         for _ in range(rnd.randint(0, 14)):
             c = round(2000 + rnd.uniform(-60, 60), rnd.choice([0, 1, 2]))
-            zs.append(LbZone.new(len(zs) + 1, rnd.choice([0, 2, 3]), 0, 0, c, c - 6.0, c + 6.0))
+            hw = 6.0 if rnd.random() < 0.6 else rnd.choice([2.0, 9.0, 15.0])     # LAB-3e: merged swing Zones have other widths
+            zs.append(LbZone.new(len(zs) + 1, rnd.choice([0, 2, 3]), 0, 0, c, c - hw, c + hw))
         for _ in range(rnd.randint(0, 5)):
             b = round(2000 + rnd.uniform(-70, 60), 1)
             w = rnd.choice([3.0, 8.5, 25.0, 60.0])
@@ -1619,9 +1624,10 @@ def sc_tp_ref():
             zs.append(LbZone.new(99, 2, 0, 0, z0.ctr + 12.0, z0.ctr + 6.0, z0.ctr + 18.0))
             zs.append(LbZone.new(98, 3, 0, 0, z0.ctr, z0.bot, z0.top))
         e["lbZs"] = sorted(zs, key=lambda z: z.bot)
+        e["lbZsT"] = sorted(zs, key=lambda z: z.top)
         e["lbFvgs"] = sorted(fv, key=lambda z: z.bot)
         e["lbFvgsT"] = sorted(fv, key=lambda z: z.top)
-        e["st"].maxW, e["st"].maxWF = 12.0, max([z.top - z.bot for z in fv] + [0.0])
+        e["st"].maxW, e["st"].maxWF = max([z.top - z.bot for z in zs] + [0.0]), max([z.top - z.bot for z in fv] + [0.0])
         mas = [round(2000 + rnd.uniform(-50, 50), 2) if rnd.random() < 0.6 else None for _ in range(2)]
         e["zbMa1"], e["zbMa2"] = mas
         e["lbMa1"] = LbZone.new(201, 1, 0, 0, mas[0], mas[0] - 6.0, mas[0] + 6.0) if mas[0] is not None else None
@@ -1649,7 +1655,7 @@ def sc_tp_ref():
                 bad.append((case, side, ref, got, want))
     check("LB-45 TP search (one pass, LONG by low ascending / SHORT by high descending over the common-width index, the FVG low / high "
           "indexes and both MAs, stop at the 3rd band) == the reference (all eligible intervals sorted and merged with the same EPS "
-          f"rule) on 1,000 random cases incl. chained overlaps, wide FVGs (up to 60), touching edges; targets 0 / 1 / 2 / 3: {counts}",
+          f"rule) on 1,000 random cases incl. chained overlaps, wide FVGs (up to 60), common Zones of mixed widths (SHORT by tops: lbZsT), touching edges; targets 0 / 1 / 2 / 3: {counts}",
           not bad and all(c > 0 for c in counts), str(bad[:3]))
 
 SCENARIOS = None
@@ -1663,7 +1669,8 @@ MUTANTS = [
     ("cc := (cs == -1 and z.brk == -1) or (cs == 1 and z.brk == 1) ? 3 : 1", "cc := 1", "role-reversal category"),
     ("okp := okp and ob <= ot2 + EPS and low <= ot2 + EPS and high >= ob - EPS", "okp := okp", "AND overlap contact (pruning)"),
     ("okp := array.get(cSide, jz) == array.get(cSide, j0)", "okp := true", "AND same side (pruning)"),
-    ("    map.remove(lbWaitMap, f_wKey(w.side, w.key))\n", "", "waits map kept in sync"),
+    ("    LbWait w = array.remove(lbWaits, i)\n    map.remove(lbWaitMap, f_wKey(w.side, w.key))\n", "    LbWait w = array.remove(lbWaits, i)\n",
+     "waits map kept in sync"),
     ("                if zdBad\n                    why := 7\n                else if", "                if false\n                    why := 7\n                else if", "ZD misconnection stops entries"),
     ("            else if math.abs(tt) < 1e11 or math.abs(tt) >= time or tt != math.round(tt)", "            else if false", "ZD time plausibility"),
     ("else if cScope == \"だけ\" and om != 0", "else if false", "only-scope exclusion"),
@@ -1686,6 +1693,11 @@ MUTANTS = [
     ("                    hit := g.bot <= ng.top + EPS and ng.bot <= g.top + EPS", "                    hit := g.bot < ng.top and ng.bot < g.top",
      "display: merge bands that touch (EPS)"),
     ("f_dsMerge(LbZone z) =>\n    z.typ != 4", "f_dsMerge(LbZone z) =>\n    true", "display: FVG not merged"),
+    ("            if z.mBar == bar_index\n                zb := z.oBot", "            if false\n                zb := z.oBot", "swing merge bar judged with the old band"),
+    ("    array<LbZone> aArr = side == 1 ? lbZs : lbZsT\n    int ia = side == 1 ? f_lbLower(lbZs, ref + EPS) : f_lbLowerT(lbZsT, ref - EPS) - 1",
+     "    array<LbZone> aArr = lbZs\n    int ia = side == 1 ? f_lbLower(lbZs, ref + EPS) : f_lbLower(lbZs, ref) - 1", "SHORT TP by tops (variable width)"),
+    ("pv <= array.max(q.mP) + zcMerge + EPS", "pv < array.max(q.mP) + zcMerge - EPS", "swing merge distance boundary"),
+    ("                f_waitMove(b.id, a.id)\n", "", "bridged swing Zone's waits re-keyed"),
     ("    if not na(lbMa1) and not p1 and p2\n        f_dsPut(lbMa1, true)", "    if false\n        f_dsPut(lbMa1, true)", "display: MA chained through the other MA"),
     ("            if q.bot <= stp + EPS\n                    array.push(sm, q)", "            if q.bot < stp - EPS\n                    array.push(sm, q)",
      "display: regroup after removal (touching bands)"),
@@ -1694,7 +1706,7 @@ MUTANTS = [
 
 def mutation():
     scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_qty_table, sc_be, sc_lock_far, sc_and_only_sel, sc_sel_tp, sc_consume, sc_zones, sc_acc_keep, sc_dup_swing, sc_ta,
-            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref, sc_display, sc_fvg_display]
+            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref, sc_display, sc_fvg_display, sc_swing_merge, sc_names_labels]
     survived = []
     for old, new, what in MUTANTS:
         if SRC.count(old) != 1:
