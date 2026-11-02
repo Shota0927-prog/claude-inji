@@ -1257,7 +1257,7 @@ def sc_display():
     ngone = len([g for g in a["lbDsG"] if g.gone])
     check("LB-47b real run (400 bars): the bands at the end == the reference grouping of the valid Zones (registered bar by bar, merged "
           "as they come; the 1m MA band merged where it overlaps on the last bar)", 
-          ds_groups(a.env) == ds_ref_groups(valid) and len(valid) > 20 and len(a["lbDsG"]) < 400,
+          ds_groups(a.env) == ds_ref_groups(valid) and len(valid) >= 10 and len(a["lbDsG"]) < 400,
           f"{len(valid)} {len(a['lbDsG'])} gone {ngone}")
     check("LB-48 display ON / OFF (Zone bands and entry labels) gives identical orders, fills, waits and ledger (drawing only under "
           "dsZone / dsEnt, never read by the trading logic)",
@@ -1284,11 +1284,11 @@ def sc_old2_new():
         for cf in (dict(), dict(cComb="AND", cZA=True, cZB=False, cZC=True, cZD=True, cZF=False)):
             ov = dict(zbUse2=False, dsZone=False, dsEnt=False, **cf)
             a = lp.Runner(overrides=ov, src=old_src).run(sc.bars)
-            b = lp.Runner(overrides=dict(ov, zaKeep1=999, zaKeep2=999, zaKeep3=999)).run(sc.bars)
+            b = lp.Runner(overrides=dict(ov, zaKeep1=999, zaKeep2=999, zaKeep3=999), src=src_poc_accum()).run(sc.bars)
             if not (a.broker.log == b.broker.log and a.trace == b.trace and list(a["bkNet"]) == list(b["bkNet"])):
                 bad.append((seed, cf))
             n_ent += len(entries(b))
-    check("LB-49 with every accum box kept (999), the new version == LAB-2 (57b7b76) on 2 random paths x 350 bars with 1H / 4H / D accum "
+    check("LB-49 with every accum box kept (999) and the POC accumulation restored test-side, the new version == LAB-2 (57b7b76) on 2 random paths x 350 bars with 1H / 4H / D accum "
           "feeds (OR and AND): identical orders, fills, waits and ledger (only the box count and the display changed)",
           not bad and n_ent > 0, f"{bad} {n_ent}")
 
@@ -1324,9 +1324,10 @@ def sc_zones():
           "same price are added (old Zones kept, not overwritten, no suppression by distance); the same pivot delivered on several bars "
           "is added once; other TF / Swing Low separate",
           zc == [(0, -1, 2000.0), (0, 1, 2000.0), (0, 1, 2000.0), (0, 1, 2004.0), (1, 1, 2000.0)], str(zc))
-    check("LB-32 ZD: each new POC value is a new Zone (2000, 2001.25; centre = (bin low + bin high) / 2 from the external feed), the old band is kept; a value equal to an existing POC Zone of the "
-          "same TF (2000 again) is not added twice; na adds nothing; the original bin bounds are kept as info",
-          zd == [(2000.0, 1999.5, 2000.5), (2001.25, 2000.75, 2001.75)], str(zd))
+    check("LB-32 ZD (LAB-3g): only the latest POC per TF is valid: 2000 -> 2001.25 (centre = (bin low + bin high) / 2 from the external "
+          "feed) -> 2000 again leaves one 1H POC Zone, 2000 (the return to an earlier price is adopted as the latest); the original "
+          "bin bounds are kept as info",
+          zd == [(2000.0, 1999.5, 2000.5)], str(zd))
     # MA: moving band, snapshot renewed on re-contact (SL from the latest contact)
     rows = flat(12, 1985)
     rows[3] = (1988.0, 1995.0, 1987.0, 1989.0)
@@ -1614,17 +1615,19 @@ def sc_zd_recv():
         if v is not None:
             sc.bars[i].update(zdL1=v[0], zdU1=v[1], zdT1=v[2])
     r = lp.Runner(overrides=dict(QUIET))
+    per = []
     for b in sc.bars:
         r.step(b)
         stats.append(r["lbZdStat"][0])
+        per.append([(z.ctr, z.id) for z in r["lbZs"] if z.typ == 3])
     zd = sorted((z.ctr, z.infoA, z.infoB, z.key, z.aTime) for z in r["lbZs"] if z.typ == 3)
     check("LB-43 ZD reception: history na -> state 3 (no Zone); a value registers once (centre 2000, bin 1999.5-2000.5 kept, target "
-          "time and the 5m availability time kept); the same centre on later bars or with a new target time is not registered again; na "
-          "(state 3) and a calculation failure (negative time, state 2) keep the last valid centre, so the return of 2000 adds nothing; "
-          "2010 is added; 2000 again (already registered) adds nothing; none of these stop entries",
-          stats[:10] == [3, 3, 1, 1, 1, 3, 1, 2, 1, 1] and zd == [(2000.0, 1999.5, 2000.5, T_HTF, sc.bars[2]["t"]),
-                                                                     (2010.0, 2009.5, 2010.5, T_HTF + 14400_000, sc.bars[8]["t"])]
-          and r["skipN"][7] == 0, f"{stats} {zd}")
+          "time and the 5m availability time kept); the same centre on later bars or with a new target time changes nothing (same "
+          "Zone); na (state 3) and a calculation failure (negative time, state 2) keep the current POC, so the return of 2000 changes "
+          "nothing; 2010 replaces it (LAB-3g: one POC per TF); 2000 after that is adopted again as the latest; none of these stop entries",
+          stats[:10] == [3, 3, 1, 1, 1, 3, 1, 2, 1, 1] and per[1] == [] and len(set(map(tuple, per[2:8]))) == 1 and per[2][0][0] == 2000.0
+          and per[8][0][0] == 2010.0 and len(per[8]) == 1 and per[9][0][0] == 2000.0 and per[9][0][1] != per[2][0][1]
+          and zd == [(2000.0, 1999.5, 2000.5, T_HTF + 18000_000, sc.bars[9]["t"])] and r["skipN"][7] == 0, f"{stats} {per[:10]} {zd}")
     # connection errors: stop new entries only while the lab's ZD detection is ON
     def run_basic(**ov):
         rows = flat(3) + [(1990, 1995, 1989, 1991)] + [tc_short(1993)] + flat(6, 1985)
@@ -1657,6 +1660,28 @@ def sc_zd_recv():
           f"{list(neg['lbZdStat'])} {list(hist['lbZdStat'])}")
 
 
+# LAB-3g replaced the POC accumulation by one POC per TF; the before / after comparisons with the LAB-1 / LAB-2 versions run the
+# current source with the accumulation restored (test-side text patch), so everything else is still compared exactly
+POC_NEW = """                    LbZone oz = array.get(lbPocCur, k)
+                    if not na(oz)
+                        f_lbRemoveS(oz)
+                        if dsZone
+                            f_dsDel(oz, false)
+                        oz.dead := true
+                        array.push(lbDeadNow, oz.id)
+                    LbZone nzp = f_lbNew(3, k, 0, pc, pc - zHalf, pc + zHalf, lo, up, int(tt))
+                    f_lbAdd(nzp)
+                    array.set(lbPocCur, k, nzp)"""
+POC_OLD = """                    if not f_lbDup(3, k, 0, pc)
+                        f_lbAdd(f_lbNew(3, k, 0, pc, pc - zHalf, pc + zHalf, lo, up, int(tt)))"""
+
+
+def src_poc_accum():
+    src = lp.read_source()
+    assert src.count(POC_NEW) == 1
+    return src.replace(POC_NEW, POC_OLD)
+
+
 OLD_REV = "bc68da2"     # LAB-1 last version (internal POC, linear wait search, full AND odometer, iterative TP clustering)
 
 
@@ -1676,14 +1701,15 @@ def sc_old_new():
         for cf in cfgs:
             ov = dict(dsZone=False, dsEnt=False, **cf)
             a = lp.Runner(overrides=ov, src=old_src).run(sc.bars)
-            b = lp.Runner(overrides=dict(ov, zaKeep1=999, zaKeep2=999, zaKeep3=999)).run(sc.bars)
+            b = lp.Runner(overrides=dict(ov, zaKeep1=999, zaKeep2=999, zaKeep3=999), src=src_poc_accum()).run(sc.bars)
             same = (a.broker.log == b.broker.log and a.broker.closed == b.broker.closed and a.trace == b.trace
                     and [list(a[k]) for k in ("bkN", "bkW", "bkL", "bkBE", "bkNet", "bkR")] == [list(b[k]) for k in ("bkN", "bkW", "bkL", "bkBE", "bkNet", "bkR")]
                     and sorted((z.typ, z.tf, z.ctr, z.bot, z.top) for z in a["lbZs"]) == sorted((z.typ, z.tf, z.ctr, z.bot, z.top) for z in b["lbZs"]))
             if not same:
                 bad.append((seed, cf))
             OLD_NEW_STATS.append(len(entries(b)))
-    check("LB-44 before / after (LAB-1 bc68da2 with the internal POC vs LAB-2 with the same POC values as external series): 2 random "
+    check("LB-44 before / after (LAB-1 bc68da2 with the internal POC vs the current version with the same POC values as external series "
+          "and the POC accumulation restored test-side for the comparison): 2 random "
           "paths x 350 bars x 6 settings (OR / AND, chosen TP, fixed RR, only, BE lock + TP1 ratio) give identical waits / timings / legs per bar, "
           "orders and fills (incl. partial exits), closed trades, ledger buckets and registered Zones",
           not bad and sum(OLD_NEW_STATS) > 0, f"{bad} entries {OLD_NEW_STATS}")
@@ -1773,7 +1799,6 @@ MUTANTS = [
     ("    array.size(tps) >= 3\n", "    array.size(tps) >= 2\n", "TP scan stops after the 3rd band"),
     ("array<LbZone> fArr = side == 1 ? lbFvgs : lbFvgsT", "array<LbZone> fArr = lbFvgs", "SHORT reads FVGs in high order"),
     ("else if side == 1 ? b <= cf + EPS : t >= cf - EPS", "else if false", "overlapping TP Zones merged"),
-    ("not f_lbDup(3, k, 0, pc)", "true", "POC exact duplicate"),
     ("    while nk > 2 * f_zaKeep(q.tf)\n", "    while nk > 2 * f_zaKeep(q.tf) + 2\n", "accum box count"),
     ("        array.push(lbDeadNow, zo.id)\n", "", "retired box cancels its waits"),
     ("if not na(pt) and not na(pv) and (na(lt) or pt != lt)", "if not na(pt) and not na(pv)", "a Swing pivot is registered once"),
