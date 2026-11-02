@@ -196,7 +196,7 @@ def static():
             fn = m.group(1) if m else None
         if "box." in ln and not (fn or "").startswith("f_ds"):
             draw_ok = False
-        if re.search(r"(?<!\w)f_ds(Add|Del|Rename)\(", ln) and not m and not lc[k - 1].strip() == "if dsZone":
+        if re.search(r"(?<!\w)f_ds(Add|Del|Rename|Ma)\(", ln) and not (fn or "").startswith("f_ds") and not lc[k - 1].strip() == "if dsZone":
             draw_ok = False
     check("LS-10 the logic section has no history reference / request / ta.* call (transpiles; series values come from the feed "
           "section), no expiry / generation pruning of valid Zones except the accum box count (zaKeep); Zone drawing (box.*) only in "
@@ -563,11 +563,11 @@ def sc_fvg_display():
     off = run(14, False)
     txt = lambda rr: [g.bx.text for g in rr["lbDsG"] if not g.gone]
     gone = [g for g in r["lbDsG"] if g.gone]
-    check("LB-20b display of FVG changes: FVG 1990-1996 + 1H POC 1991-2003 shown as one band 1990-2003 ('1時間足｜出来高POC＋FVG・上昇'); "
-          "after the iFVG flip the same band is renamed ('…＋iFVG・上昇FVGが反転'); after the invalidation the POC band is redrawn alone "
-          "(1991-2003) and the FVG stays as a grey ended band (extend none); display OFF gives the same trading",
-          txt(r8) == ["1時間足｜出来高POC＋FVG・上昇"] and ds_groups(r8.env)[0][:2] == (1990.0, 2003.0)
-          and txt(r10) == ["1時間足｜出来高POC＋iFVG・上昇FVGが反転"] and txt(r) == ["1時間足｜出来高POC"]
+    check("LB-20b display of FVG changes: FVG 1990-1996 overlapping a 1H POC 1991-2003 is not merged (FVG on its own band with its own "
+          "bounds); after the iFVG flip its band is renamed ('1時間足｜iFVG・上昇FVGが反転'); after the invalidation it stays as a grey ended "
+          "band (extend none) and the POC band is unchanged; display OFF gives the same trading",
+          sorted(txt(r8)) == ["1時間足｜FVG・上昇", "1時間足｜出来高POC"] and ds_groups(r8.env) == [(1990.0, 1996.0, [ds_groups(r8.env)[0][2][0]]), (1991.0, 2003.0, ds_groups(r8.env)[1][2])]
+          and sorted(txt(r10)) == ["1時間足｜iFVG・上昇FVGが反転", "1時間足｜出来高POC"] and txt(r) == ["1時間足｜出来高POC"]
           and ds_groups(r.env)[0][:2] == (1991.0, 2003.0) and len(gone) == 1 and gone[0].bx.kw.get("extend") == "none"
           and r.trace == off.trace and r.broker.log == off.broker.log, f"{txt(r8)} {txt(r10)} {txt(r)} {len(gone)}")
 
@@ -890,14 +890,17 @@ def ds_name_ref(e, zs):
 
 
 def ds_ref_groups(zs):
-    """reference grouping: only really overlapping bands (EPS), chained -> (bot, top, ids)"""
+    """reference grouping: accum / MA / swing / POC merged only when really overlapping (EPS), chained; groups of MAs only are not
+    drawn (line only); FVG / iFVG each on its own band (never merged, never bridging) -> (bot, top, ids)"""
     ref = []
-    for z in sorted(zs, key=lambda z: z.bot):
+    for z in sorted((z for z in zs if z.typ != 4), key=lambda z: z.bot):
         if ref and z.bot <= ref[-1][1] + 1e-7:
-            ref[-1] = (ref[-1][0], max(ref[-1][1], z.top), ref[-1][2] + [z.id])
+            ref[-1] = (ref[-1][0], max(ref[-1][1], z.top), ref[-1][2] + [z])
         else:
-            ref.append((z.bot, z.top, [z.id]))
-    return sorted((b, t, sorted(ids)) for b, t, ids in ref)
+            ref.append((z.bot, z.top, [z]))
+    out = [(b, t, sorted(q.id for q in m)) for b, t, m in ref if any(q.typ != 1 for q in m)]
+    out += [(z.bot, z.top, [z.id]) for z in zs if z.typ == 4]
+    return sorted(out)
 
 
 def ds_groups(e):
@@ -910,13 +913,22 @@ def sc_display():
     e = r.env
     LbZone = e["LbZone"]
     rnd = random.Random(9)
-    bad, nmerge, nsplit = [], 0, 0
+    bad, nmerge, nsplit, nma = [], 0, 0, 0
     for case in range(150):
         e["lbDsG"] = []
         n0 = len(r.draws)
         act, sid = [], 0
+        mas = [None, None]
+        e["lbMa1"], e["lbMa2"] = None, None
         for step in range(rnd.randint(1, 40)):
             e["bar_index"] = 1000 + step
+            for k in (0, 1):     # the MA bands move (or appear) like EMA bands each bar
+                if rnd.random() < 0.6:
+                    if mas[k] is None:
+                        mas[k] = LbZone.new(500 + k, 1, k, 0, 2000.0, 1994.0, 2006.0, None, None, None, 900, 0)
+                    c = round(2000 + rnd.uniform(-40, 40), rnd.choice([0, 1]))
+                    mas[k].ctr, mas[k].bot, mas[k].top = c, c - 6.0, c + 6.0
+            e["lbMa1"], e["lbMa2"] = mas
             if act and rnd.random() < 0.3:
                 z = act.pop(rnd.randrange(len(act)))
                 e["f_dsDel"](z, z.typ == 4)
@@ -931,14 +943,17 @@ def sc_display():
                 e["f_dsAdd"](z)
                 act.append(z)
                 nmerge += len([g for g in e["lbDsG"] if not g.gone]) < ng
+            e["f_dsMa"]()     # end of the bar's registrations (as in (B1))
+            nma += any(z.typ == 1 for g in e["lbDsG"] if not g.gone for z in g.mem)
             groups = [g for g in e["lbDsG"] if not g.gone]
             alive = {id(d) for d in r.draws[n0:] if d.kind == "box" and not d.deleted}
-            ok = (ds_groups(e) == ds_ref_groups(act) and alive == {id(g.bx) for g in e["lbDsG"]}
+            ok = (ds_groups(e) == ds_ref_groups(act + [m for m in mas if m is not None]) and alive == {id(g.bx) for g in e["lbDsG"]}
                   and all(g.bx.text == ds_name_ref(e, g.mem) and g.bx.args[1] == g.top and g.bx.args[3] == g.bot for g in groups))
             if not ok:
                 bad.append((case, step))
                 break
         nsplit += len(ds_ref_groups(act)) > 1
+    e["lbMa1"], e["lbMa2"] = None, None
     # names: 4H accum lower + 4H swing high + two 1H POCs overlapping -> one band; weekly swing low apart; MA name
     zs = [LbZone.new(1, 0, 1, -1, 2000.0, 1994.0, 2006.0), LbZone.new(2, 2, 1, 1, 2004.0, 1998.0, 2010.0),
           LbZone.new(3, 3, 0, 0, 2008.0, 2002.0, 2014.0, 2007.5, 2008.5), LbZone.new(4, 3, 0, 0, 2009.0, 2003.0, 2015.0, 2008.5, 2009.5),
@@ -952,17 +967,32 @@ def sc_display():
     e["f_dsAdd"](fv)
     fv.inv = True
     e["f_dsRename"](fv)
-    t_inv = [g.bx.text for g in e["lbDsG"] if any(z.id == 6 for z in g.mem)]
-    ma = LbZone.new(201, 1, 0, 0, 2012.0, 2006.0, 2018.0)
+    t_inv = [(g.bx.text, g.bot, g.top) for g in e["lbDsG"] if any(z.id == 6 for z in g.mem)]
+    txt_f = sorted(g.bx.text for g in e["lbDsG"])
+    ma = LbZone.new(201, 1, 0, 0, 2012.0, 2006.0, 2018.0, None, None, None, 0, 0)
+    e["lbMa1"] = ma
+    e["f_dsMa"]()
+    t_ma = sorted((g.bx.text, g.bot, g.top) for g in e["lbDsG"] if not g.gone)
+    ma.ctr, ma.bot, ma.top = 2080.0, 2074.0, 2086.0     # the MA moves away: back to the band without it, no MA-only band
+    e["bar_index"] += 1
+    e["f_dsMa"]()
+    t_ma2 = sorted((g.bx.text, g.bot, g.top) for g in e["lbDsG"] if not g.gone)
+    e["lbMa1"] = None
     check("LB-47 display grouping: Zones are merged into one band only when their ranges really overlap (EPS, chained, incl. a new Zone "
           "bridging two bands), from the lowest low to the highest high; bands that are only close stay apart; removing a Zone "
-          "re-splits the rest; merged bands' boxes are deleted (one box per band, no duplicate box / text); 150 random add / remove "
-          "sequences == reference after every step. Names: one line per TF, higher TF first, accum / MA / swing / POC / FVG order in a line, same TF x item once: '4時間足｜アキュム下辺"
+          "re-splits the rest; merged bands' boxes are deleted (one box per band, no duplicate box / text); FVG / iFVG never merged "
+          "(own bounds, no bridging); MA bands (moving each bar) merged with overlapping accum / swing / POC bands, MA alone = no band; "
+          "150 random add / remove / MA-move sequences == reference after every bar. Names: one line per TF, higher TF first, accum / MA / swing / POC / FVG order in a line, same TF x item once: '4時間足｜アキュム下辺"
           "＋水平線・高値' / '1時間足｜出来高POC' (two POCs once), iFVG renamed in place, MA '1分足｜MA EMA3000'",
           not bad and nmerge > 50 and nsplit > 50
           and txt == ["4時間足｜アキュム下辺＋水平線・高値\n1時間足｜出来高POC", "週足｜水平線・安値"]
-          and t_inv == ["4時間足｜アキュム下辺＋水平線・高値＋iFVG・上昇FVGが反転\n1時間足｜出来高POC"]
-          and e["f_dsName"]([ma]) == "1分足｜MA EMA3000", f"{bad[:3]} {nmerge} {nsplit} {txt} {t_inv}")
+          and t_inv == [("4時間足｜iFVG・上昇FVGが反転", 1999.0, 2003.0)]
+          and txt_f == sorted(["4時間足｜iFVG・上昇FVGが反転", "4時間足｜アキュム下辺＋水平線・高値\n1時間足｜出来高POC", "週足｜水平線・安値"])
+          and t_ma == sorted([("4時間足｜アキュム下辺＋水平線・高値\n1時間足｜出来高POC\n1分足｜MA EMA3000", 1994.0, 2018.0),
+                              ("4時間足｜iFVG・上昇FVGが反転", 1999.0, 2003.0), ("週足｜水平線・安値", 2034.0, 2046.0)])
+          and t_ma2 == sorted([("4時間足｜アキュム下辺＋水平線・高値\n1時間足｜出来高POC", 1994.0, 2015.0),
+                               ("4時間足｜iFVG・上昇FVGが反転", 1999.0, 2003.0), ("週足｜水平線・安値", 2034.0, 2046.0)])
+          and nma > 100, f"{bad[:3]} {nmerge} {nsplit} {nma} {txt} {t_inv} {txt_f} {t_ma} {t_ma2}")
     e["lbDsG"], e["dsZoneMax"] = [], 3
     sep = [LbZone.new(300 + k, 2, 0, 1, 2000.0 + 20 * k, 1994.0 + 20 * k, 2006.0 + 20 * k, None, None, k, 1000, 0) for k in range(5)]
     for z in sep:
@@ -975,10 +1005,10 @@ def sc_display():
     sc = rand_bars(3, n=400)
     a = lp.Runner(overrides=dict(zbUse2=False, dsZone=True, dsEnt=True, dsZoneMax=400)).run(sc.bars)
     b = lp.Runner(overrides=dict(zbUse2=False, dsZone=False, dsEnt=False)).run(sc.bars)
-    valid = list(a["lbZs"]) + list(a["lbFvgs"])
+    valid = list(a["lbZs"]) + list(a["lbFvgs"]) + [a["lbMa1"]]
     ngone = len([g for g in a["lbDsG"] if g.gone])
     check("LB-47b real run (400 bars): the bands at the end == the reference grouping of the valid Zones (registered bar by bar, merged "
-          "as they come)",
+          "as they come; the 1m MA band merged where it overlaps on the last bar)", 
           ds_groups(a.env) == ds_ref_groups(valid) and len(valid) > 20 and len(a["lbDsG"]) < 400,
           f"{len(valid)} {len(a['lbDsG'])} gone {ngone}")
     check("LB-48 display ON / OFF (Zone bands and entry labels) gives identical orders, fills, waits and ledger (drawing only under "
@@ -1501,8 +1531,10 @@ MUTANTS = [
      "        if na(r) and array.get(o.legLots, k - 1) > 0\n            r := array.get(o.legPx, k - 1)\n    r\n\nf_lbTpText", "BE lock target = farthest TP"),
     ("if lkBlk and array.size(lbWaits) > 0", "if false", "waits cleared while locked"),
     ("if xs != 0\n                    array.push(xId, z.id)", "if false\n                    array.push(xId, z.id)", "break cancels the wait"),
-    ("                hit := g.bot <= ng.top + EPS and ng.bot <= g.top + EPS", "                hit := g.bot < ng.top and ng.bot < g.top",
+    ("                    hit := g.bot <= ng.top + EPS and ng.bot <= g.top + EPS", "                    hit := g.bot < ng.top and ng.bot < g.top",
      "display: merge bands that touch (EPS)"),
+    ("f_dsMerge(LbZone z) =>\n    z.typ != 4", "f_dsMerge(LbZone z) =>\n    true", "display: FVG not merged"),
+    ("    if not na(lbMa1) and not p1 and p2\n        f_dsPut(lbMa1, true)", "    if false\n        f_dsPut(lbMa1, true)", "display: MA chained through the other MA"),
     ("            if q.bot <= stp + EPS\n                    array.push(sm, q)", "            if q.bot < stp - EPS\n                    array.push(sm, q)",
      "display: regroup after removal (touching bands)"),
 ]
