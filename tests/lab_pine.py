@@ -162,6 +162,10 @@ for _k in (1, 2, 3, 4):     # LAB-2: ZD from MtfPocFeedXAU (input.source); the o
     for _x in "LUT":
         FEED_DEFAULT[f"zd{_x}{_k}"] = None
 FEED_DEFAULT["zdProto"] = 10001.0
+for _k in ("4", "D"):     # LAB-4: ZE from LongFibWave (input.source); unconnected = na (the lab's ZE detection is OFF by default)
+    for _x in "OEDIST":
+        FEED_DEFAULT[f"ze{_k}{_x}"] = None
+FEED_DEFAULT["zeProto"] = 20001.0
 FEED_DEFAULT.update(zbMa1=None, zbMa2=None, labS1=None, labS2=None, labS3=None, satTf4=None, satTf1=None, labRangeOK=True)
 
 

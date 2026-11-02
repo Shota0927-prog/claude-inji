@@ -186,8 +186,8 @@ def static():
     n_req = len(re.findall(r"request\.security\(", code))
     n_src = len(re.findall(r"input\.source\(", code))
     check("LS-09 limits: plot() calls <= 64 (14), request.security calls 14 (Accum 3 + 1m EMA 1 + Swing 4 + FVG 4 + SATS filter 2; the 4 "
-          "POC requests moved to MtfPocFeedXAU), 13 input.source, no request.security_lower_tf",
-          n_plot <= 64 and n_req == 14 and n_src == 13 and "security_lower_tf" not in code, f"plot {n_plot} request {n_req} source {n_src}")
+          "POC requests moved to MtfPocFeedXAU), 26 input.source (13 POC + 13 FIB, LAB-4), no request.security_lower_tf",
+          n_plot <= 64 and n_req == 14 and n_src == 26 and "security_lower_tf" not in code, f"plot {n_plot} request {n_req} source {n_src}")
     logic = lp.logic_section(SRC)
     lc = re.sub(r"//.*", "", logic).split("\n")
     in_ds, draw_ok, fn = False, True, None
@@ -1085,6 +1085,240 @@ def sc_poc_latest():
           rp.trace == t[:7] and [(z.tf, z.ctr, z.id) for z in pocs(rp)] == per[6], f"{[(z.tf, z.ctr) for z in pocs(rp)]} {per[6]}")
 
 
+# ---------------------------------------------------------------------------- LAB-4: ZE fib (external LongFibWave)
+LFW_BASE = "09da78f"     # the last commit before the LAB-4 connection outputs were added to LongFibWave.pine
+FIB_NAMES = ["FIB protocol"] + [f"FIB {tf} {it}" for tf in ("4H", "日足") for it in ("起点", "終点", "方向", "波ID", "状態", "更新確定時刻")]
+ZE_RATIOS = (0.236, 0.382, 0.5, 0.618)
+ONLY_ZE = dict(cZA=False, cZB=False, cZC=False, cZD=False, cZF=False, cZE=True, zeUse=True)
+
+
+def lfw_feed_runner(**ov):
+    """the LongFibWave logic section + the LFW Feed block, run by the LFW harness (tests/lfw_sim.py)"""
+    import lfw_sim as LF
+    src = open(os.path.join(lp.ap.ROOT, "LongFibWave.pine"), encoding="utf-8").read()
+    i, j = src.index("// ==== LFW Feed (begin)"), src.index("// ==== LFW Feed (end)")
+    feed = src[src.index("\n", i) + 1:j]
+    r = LF.Run(overrides=ov, src=src)
+    r.code = compile(lp.ap.Translator().translate(lp.ap.logical_lines(LF.logic(src) + feed)), "<LongFibWave logic + feed>", "exec")
+    r.env.update(barstate__isconfirmed=True, lfwOkD=ov.get("lfwOnD", True), lfwOk4=ov.get("lfwOn4", True))
+    return r, LF
+
+
+def fib_ref_state(S, on):
+    if not on:
+        return 0
+    if S.hold:
+        return 2
+    w = S.w
+    return 3 if w.dir in (1, -1) and w.O is not None and w.E is not None and w.O != w.E else 1
+
+
+def sc_ze_feed():
+    src = raw("LongFibWave.pine")
+    old = git("show", f"{LFW_BASE}:LongFibWave.pine")
+    i = src.index("\n// ==== LFW Feed (begin)")
+    j = src.index('plot(array.get(lfwFeedD, 5), "FIB 日足 更新確定時刻", display = display.none)\n') + len(
+        'plot(array.get(lfwFeedD, 5), "FIB 日足 更新確定時刻", display = display.none)\n')
+    names = re.findall(r'^plot\([^\n]*?, "(FIB [^"]+)", display = display\.none\)$', src, re.M)
+    srcs = re.findall(r'^\w+ = input\.source\(close, "(FIB [^"]+)", group = G_ZE\)$', SRC, re.M)
+    check("LS-13 LongFibWave connection outputs (LAB-4): the file == the LAB-3h version with only the feed block + 13 hidden plots "
+          "inserted after the existing data-window plots (logic section, existing plots, drawing, tables unchanged); plot names = the 13 "
+          "FIB series, the lab's 13 input.source titles are the same names; protocol 20001 on 5m charts only",
+          src[:i] + src[j:] == old and names == FIB_NAMES and sorted(srcs) == sorted(FIB_NAMES)
+          and 'plot(lfwIs5m ? 20001 : na, "FIB protocol", display = display.none)' in src
+          and "lfwIs5m = timeframe.isminutes and timeframe.multiplier == 5" in src, f"{names} {srcs}")
+    # feed values vs the wave state on random 4H series (with holds), calculation ON / OFF
+    bad, seen = [], set()
+    for seed in range(4):
+        bars = __import__("lfw_sim").rand_series(seed + 3, n=500)
+        for on in (True, False):
+            r, LF = lfw_feed_runner(lfwOn4=on)
+            prev = None
+            for n, b in enumerate(bars):
+                r.exec(LF.av(n), h4=(b["h"], b["l"], LF.tb(n), b["atr"] if b["atr"] is not None else LF.BIG))
+                fd = list(r.env["lfwFeed4"])
+                S = r.env["lfw4"]
+                st = fib_ref_state(S, on)
+                seen.add(st)
+                want = [S.w.O if st == 3 else None, S.w.E if st == 3 else None, S.w.dir if st == 3 else 0, S.waveId, st]
+                tup = tuple(want)
+                tim = LF.av(n) if tup != prev else (fd[5] if prev is not None else None)
+                if fd[:5] != want or (prev is not None and tup == prev and fd[5] != last_t) or (tup != prev and fd[5] != LF.av(n)):
+                    bad.append((seed, on, n, fd, want))
+                    break
+                prev, last_t = tup, fd[5]
+    check("LB-66 LongFibWave feed values: state 0 calc OFF / 1 no wave / 2 hold / 3 valid (dir +-1, both ends, different) exactly as "
+          "the wave state; ends na and direction 0 unless valid; wave ID = waveId; the update time = time_close of the confirmed bar "
+          "where the values or the state changed, kept otherwise (4 random 4H series x 500 bars, ON and OFF; states 0-3 all seen)",
+          not bad and seen == {0, 1, 2, 3}, f"{bad[:2]} {seen}")
+    # levels: the price formula is the display's (E + v x (O - E)) for up and down waves
+    lv = lambda O, E: [E + r_ * (O - E) for r_ in ZE_RATIOS]
+    check("LB-67 level prices = the LongFibWave display formula E + ratio x (O - E): the lab's f_zeSet and LongFibWave f_draw use the "
+          "same expression; up wave O 1900 / E 2000 -> 1976.4 / 1961.8 / 1950 / 1938.2, down wave O 2100 / E 2000 -> 2023.6 / 2038.2 / "
+          "2050 / 2061.8 (checked on registered Zones in LB-68)",
+          "float p = w.E + v * (w.O - w.E)" in src and "        float p = e + r * (o - e)\n" in SRC
+          and [round(x, 6) for x in lv(1900.0, 2000.0)] == [1976.4, 1961.8, 1950.0, 1938.2]
+          and [round(x, 6) for x in lv(2100.0, 2000.0)] == [2023.6, 2038.2, 2050.0, 2061.8])
+
+
+def zef(sc, i0, i1, k, O, E, D, I, S, T=None):
+    """ZE feed for TF k ('4' / 'D') held on bars i0..i1-1; T = update time (default: time_close of bar i0)"""
+    T = T if T is not None else sc.bars[i0]["t"] + M5
+    return sc.hold(i0, i1, **{f"ze{k}O": O, f"ze{k}E": E, f"ze{k}D": D, f"ze{k}I": I, f"ze{k}S": S, f"ze{k}T": T})
+
+
+def zes(r, k=None):
+    return [z for z in r["lbZs"] if z.typ == 5 and (k is None or z.tf == k)]
+
+
+def sc_ze():
+    # replacement sequence (4H): wave 1 up O 1900 / E 2000 (bar 1); no change (bars 2-3); end update E 2001 (bar 4); new wave 2 down
+    # (bar 6); hold (bar 8); wave 3 (bar 10); calc OFF on the feed side (bar 12). Daily wave fixed from bar 1. Price 1985 (above the
+    # 0.236 level 1976.4 = 1974.4-1978.4): bar 2 low 1978 -> LONG wait, kept on bar 3, cancelled by the end update on bar 4
+    rows = flat(14, 1985)
+    rows[2] = (1985.0, 1986.0, 1978.0, 1985.1)
+    sc = Sc(rows)
+    zef(sc, 1, 4, "4", 1900.0, 2000.0, 1, 1, 3)
+    zef(sc, 4, 6, "4", 1900.0, 2001.0, 1, 1, 3)
+    zef(sc, 6, 8, "4", 2100.0, 1990.0, -1, 2, 3)
+    zef(sc, 8, 10, "4", None, None, 0, 2, 2)
+    zef(sc, 10, 12, "4", 1900.0, 2000.0, 1, 3, 3)
+    zef(sc, 12, None, "4", None, None, 0, 3, 0)
+    zef(sc, 1, None, "D", 2200.0, 2100.0, -1, 7, 3)
+    run = lp.Runner(overrides=dict(**ONLY_TC, **{**QUIET, **NEW, **ONLY_ZE, "dsZone": True}))
+    per, perD, stat = [], [], []
+    for bar in sc.bars:
+        run.step(bar)
+        per.append([(round(z.ctr, 6), z.id, z.infoA, z.key) for z in sorted(zes(run.env, 0), key=lambda z: z.infoA)])
+        perD.append([z.id for z in zes(run.env, 1)])
+        stat.append(list(run.env["lbZeStat"]))
+    t = run.trace
+    ids = lambda b: [x[1] for x in per[b]]
+    up = [1976.4, 1961.8, 1950.0, 1938.2]
+    ok_lv = [x[0] for x in per[1]] == up and [x[2] for x in per[1]] == list(ZE_RATIOS) and all(x[3] == 1 for x in per[1])
+    z0 = zes(run.env, 1)
+    check("LB-68 ZE Zones = the latest wave only, 4 levels per TF (ratio / wave ID kept; band = level +- common width): registered on "
+          "the receiving bar; unchanged values keep the same Zones (bars 1-3); the end update (same wave ID) replaces all 4 (bar 4); a "
+          "new wave replaces them (bar 6); hold (bar 8) and calc OFF (bar 12) remove them; a valid wave again (bar 10) registers anew; "
+          "the daily wave stays the same 4 Zones throughout; at most 4 per TF at every bar",
+          ok_lv and ids(1) == ids(3) and set(ids(4)).isdisjoint(ids(3)) and len(per[4]) == 4 and per[4][0][0] == round(2001 - 0.236 * 101, 6)
+          and set(ids(6)).isdisjoint(ids(5)) and per[6][0][0] == round(1990 + 0.236 * 110, 6) and per[8] == [] and per[9] == []
+          and len(per[10]) == 4 and per[12] == [] and all(len(p_) <= 4 for p_ in per) and len(set(map(tuple, perD[1:]))) == 1
+          and len(perD[1]) == 4 and sorted(round(z.ctr, 6) for z in z0) == [2123.6, 2138.2, 2150.0, 2161.8]
+          and all(round(z.top - z.bot, 6) == 4.0 for z in z0),
+          f"{per[1]} {per[4]} {per[6]} {per[8]} {per[10]} {per[12]} {perD[1]}")
+    check("LB-69 ZE waits and states: the LONG wait from the contact with the 0.236 level (bar 2) is kept while nothing changes (bar 3) "
+          "and cancelled when the wave's end is updated (bar 4; nothing carried over to the new Zones); states 1 valid / 3 hold / 8 feed "
+          "calc OFF per TF",
+          len(t[2]["waits"]) == 1 and t[2]["waits"][0][1] == 1 and t[3]["waits"] == t[2]["waits"] and t[4]["waits"] == []
+          and stat[1] == [1, 1] and stat[8] == [3, 1] and stat[10] == [1, 1] and stat[12] == [8, 1], f"{t[2]['waits']} {t[3]['waits']} {t[4]['waits']} {stat}")
+    # registration bar: a new wave whose 0.236 level is touched on its receiving bar -> no contact; the same touch next bar -> wait
+    rows = flat(6, 1985)
+    rows[2] = (1985.0, 1986.0, 1978.0, 1985.1)
+    rows[3] = (1985.0, 1986.0, 1978.0, 1985.1)
+    sc2 = Sc(rows)
+    zef(sc2, 2, None, "4", 1900.0, 2000.0, 1, 1, 3)
+    r2 = sc2.run(**ONLY_TC, **{**QUIET, **NEW, **ONLY_ZE})
+    check("LB-70 a ZE Zone is not contacted on its registration bar (the POC exception does not apply): the touch on the receiving bar "
+          "(2) makes no wait, the same touch on bar 3 makes a LONG wait (first contact 3)",
+          r2.trace[2]["waits"] == [] and [(w[1], w[3]) for w in r2.trace[3]["waits"]] == [(1, 3)], f"{r2.trace[2]['waits']} {r2.trace[3]['waits']}")
+    # entry / TP / ledger: down wave O 2050 / E 1950 -> 0.382 = 1988.2 (1986.2-1990.2), 0.236 = 1973.6 (TP side). TOUCH_A from below
+    # (bar 3) -> SHORT wait on 0.382, TC (bar 4) -> entry, SL 1990.2 + 5, TP1 = 0.236 band top 1975.6; price falls -> closed.
+    # AND with a 1H POC 1988 (1986-1990): one trade counted once in the total, in 'POC 含む' and 'フィボ含む', not in any 'だけ'
+    def trade(**ov):
+        rows = flat(3, 1985) + [TOUCH_A, TC_AFTER] + flat(3, 1980) + flat(6, 1960)
+        sc3 = Sc(rows)
+        zef(sc3, 1, None, "4", 2050.0, 1950.0, -1, 1, 3)
+        sc3.set(4, labS1=L_AFTER)
+        if ov.pop("poc", False):
+            poc(sc3, 1, 1988.0)
+        return sc3.run(**ONLY_TC, **{**QUIET, **NEW, **ONLY_ZE, "zeUseD": False, **ov})
+    ra = trade()
+    rb = trade(poc=True, cZD=True, cComb="AND")
+    nA, nB = list(ra["bkN"]), list(rb["bkN"])
+    check("LB-71 ZE as an entry condition: ZE alone -> SHORT entry on bar 4 from the 0.382 level (SL = 1990.2 + 5 = 1995.2, TP1 = the "
+          "0.236 band top 1975.6); after the close the ledger counts it once in the total, 'フィボ含む' and 'フィボだけ' (no other bucket of "
+          "Zone types); AND with a POC overlapping the level -> one trade counted once in the total, in 'POC 含む' and 'フィボ含む', in no 'だけ'",
+          [e[0] for e in entries(ra)] == [4] and abs(ra["o"].sl - 1995.2) < 1e-9 and abs(ra.trace[4]["legPx"][0] - 1975.6) < 1e-9
+          and nA[0] == 1 and nA[18] == 1 and nA[19] == 1 and sum(nA[1:11]) == 0
+          and [e[0] for e in entries(rb)] == [4] and nB[0] == 1 and nB[4] == 1 and nB[18] == 1 and nB[19] == 0 and sum(nB[6:11]) == 0
+          and sum(nB[1:6]) == 1, f"{entries(ra)} {ra['o'].sl} {ra.trace[4]['legPx']} {nA} {entries(rb)} {nB}")
+    # connection: ZE detection ON with the inputs left at close (protocol != 20001) -> state 9, new entries stopped (skip 'ZE 接続');
+    # ZE detection OFF -> no check, no stop (same trade as without ZE)
+    def basic(**ov):
+        rows = flat(3) + [(1990, 1995, 1989, 1991)] + [tc_short(1993)] + flat(6, 1985)
+        s2 = Sc(rows)
+        poc(s2, 1, 2000.0)
+        s2.hold(4, 5, labS1=1993.0)
+        for b in s2.bars:
+            b.update({k: v for k, v in ov.items() if k in lp.FEED_DEFAULT})
+        return s2.run(**ONLY_TC, **QUIET, **{k: v for k, v in ov.items() if k not in lp.FEED_DEFAULT})
+    off = basic()
+    bad_on = basic(zeUse=True, zeProto=1991.0)
+    bad_t = basic(zeUse=True, ze4S=3.0, ze4I=1.0, ze4D=1.0, ze4O=1900.0, ze4E=2000.0, ze4T=1985.1)
+    none_on = basic(zeUse=True, ze4S=1.0, ze4I=0.0, ze4D=0.0, zeDS=2.0, zeDI=4.0, zeDD=0.0, ze4T=float(T0), zeDT=float(T0))
+    check("LB-72 ZE connection: detection ON with the series left at close (protocol != 20001) or a time series left at close -> state 9 "
+          "and new entries stopped (skip 'ZE 接続'), never replaced by close; detection OFF (default) -> no check, no stop; no wave / hold "
+          "are normal invalid states (no stop)",
+          len(entries(off)) == 1 and list(off["lbZeStat"]) == [0, 0] and entries(bad_on) == [] and list(bad_on["lbZeStat"]) == [9, 9]
+          and bad_on["skipN"][8] >= 1 and entries(bad_t) == [] and bad_t["lbZeStat"][0] == 9 and len(entries(none_on)) == 1
+          and list(none_on["lbZeStat"]) == [2, 3] and none_on["skipN"][8] == 0,
+          f"{entries(off)} {list(bad_on['lbZeStat'])} {list(bad_t['lbZeStat'])} {list(none_on['lbZeStat'])} {entries(none_on)}")
+    # display: the 0.382 level (1986.2-1990.2) merged with an overlapping POC (1986-1990); a bullish FVG on it stays its own band
+    sc4 = Sc(flat(6, 2050))
+    zef(sc4, 1, None, "4", 2050.0, 1950.0, -1, 1, 3)
+    poc(sc4, 1, 1988.0)
+    sc4.hold(2, None, g2k=T_HTF, g2c=2061.0, g2d=1, g2t=1990.0, g2b=1986.0)
+    r4 = sc4.run(**ONLY_TC, **{**QUIET, **NEW, **ONLY_ZE, "dsZone": True, "zeUseD": False})
+    tx = sorted((g.lb.text, g.bot, g.top) for g in r4["lbDsG"] if not g.gone)
+    check("LB-73 ZE display: '4時間足｜フィボ 0.382' merged with the overlapping 1H POC into one band 1986-1990.2 (the levels stay separate "
+          "ZE Zones inside); the FVG on the same prices is not merged; the other levels are their own bands",
+          ("4時間足｜フィボ 0.382\n1時間足｜出来高POC", 1986.0, 1990.2) in [(a, round(b, 6), round(c, 6)) for a, b, c in tx]
+          and ("4時間足｜FVG", 1986.0, 1990.0) in tx and sum(1 for x in tx if x[0].startswith("4時間足｜フィボ")) == 4 and len(tx) == 5, str(tx))
+    # causality: the run over bars 0-6 == the first 7 bars of the full run (replacement sequence above)
+    rp = lp.Runner(overrides=dict(**ONLY_TC, **{**QUIET, **NEW, **ONLY_ZE, "dsZone": True})).run(sc.bars[:7])
+    check("LB-74 causality: the run over bars 0-6 equals the first 7 bars of the full run (waits, timings, legs, ZE Zones at bar 6)",
+          rp.trace == t[:7] and [(round(z.ctr, 6), z.id, z.infoA, z.key) for z in sorted(zes(rp, 0), key=lambda z: z.infoA)] == per[6])
+    # end to end: the LongFibWave feed values bar by bar (random 4H series with holds) drive the lab: at every bar the 4H ZE Zones are
+    # exactly the 4 levels of the wave valid at that bar (none while hold / no wave), replaced only when the feed changed
+    r5, LF = lfw_feed_runner()
+    bars = LF.rand_series(7, n=300)
+    sc5 = Sc(flat(300, 5000))
+    prevT, want = None, []
+    for n, b in enumerate(bars):
+        r5.exec(LF.av(n), h4=(b["h"], b["l"], LF.tb(n), b["atr"] if b["atr"] is not None else LF.BIG))
+        fd = list(r5.env["lfwFeed4"])
+        T = sc5.bars[n]["t"] + M5 if fd[5] != prevT else sc5.bars[n - 1]["_zeT"]
+        prevT = fd[5]
+        sc5.bars[n]["_zeT"] = T
+        sc5.set(n, ze4O=fd[0], ze4E=fd[1], ze4D=fd[2], ze4I=fd[3], ze4S=fd[4], ze4T=T)
+        want.append(sorted(round(fd[1] + r_ * (fd[0] - fd[1]), 6) for r_ in ZE_RATIOS) if fd[4] == 3 else [])
+    for b in sc5.bars:
+        b.pop("_zeT")
+    run5 = lp.Runner(overrides=dict(**ONLY_TC, **{**QUIET, **NEW, **ONLY_ZE, "zeUseD": False}))
+    got, nrep = [], 0
+    for b in sc5.bars:
+        run5.step(b)
+        got.append(sorted(round(z.ctr, 6) for z in zes(run5.env, 0)))
+    nrep = sum(1 for i_ in range(1, len(got)) if got[i_] != got[i_ - 1])
+    check("LB-75 LongFibWave -> lab end to end (300 random 4H bars incl. holds): at every bar the 4H ZE Zones = the 4 levels of the wave "
+          "the feed delivered by that bar (none in hold / no wave); the past uses the values received at the time",
+          got == want and nrep > 5 and any(w_ == [] for w_ in want[50:]), f"{nrep} {[i_ for i_ in range(len(got)) if got[i_] != want[i_]][:5]}")
+    # ZE OFF (default) == the version before LAB-4 on random paths (legacy settings, OR / AND / only)
+    bad = []
+    prev_src = git("show", f"{LFW_BASE}:ZoneComboLabXAU.pine")
+    for seed in (2, 4):
+        scr = rand_bars(seed, n=300)
+        for cf in (dict(), dict(cComb="AND", cZA=False, cZB=False, cZC=True, cZD=True, cZF=False), dict(cScope="だけ")):
+            a = lp.Runner(overrides=cf, src=prev_src).run(scr.bars)
+            b = lp.Runner(overrides=cf).run(scr.bars)
+            if not (a.broker.log == b.broker.log and a.trace == b.trace and list(a["bkNet"]) == list(b["bkNet"])[:18]):
+                bad.append((seed, cf))
+    check("LB-76 with ZE detection OFF (default) the trading equals the LAB-3h version (09da78f) on 2 random paths x 300 bars x OR / "
+          "AND / only: identical orders, fills, waits, timings, legs and ledger buckets (the two new ZE buckets stay 0)",
+          not bad, str(bad))
+
+
 def acc_feed(sc, k, boxes):
     """accum feed for TF k (1..3): boxes = [(i0, i1, u, l, id, forming)] held on bars i0..i1-1"""
     for i0, i1, u, l, aid, a in boxes:
@@ -1843,6 +2077,10 @@ MUTANTS = [
     ("                        oz.dead := true\n                        array.push(lbDeadNow, oz.id)", "                        oz.dead := true",
      "replaced POC's waits cancelled"),
     ("(z.aBar < bar_index or z.typ == 3)", "(z.aBar < bar_index)", "POC judged from its receiving bar"),
+    ("b == 4 ? 16 : 32", "16", "ZE has its own type bit"),
+    ("                if not f_zeSame(k, fo, fe, fd, fi)\n", "                if true\n", "ZE unchanged wave keeps its Zones"),
+    ("            else if stt == 2 or stt == 3 or stt == 8\n                f_zeClear(k)", "            else if stt == 8\n                f_zeClear(k)",
+     "ZE hold / no wave removes the Zones"),
     ("    if not na(lbMa1) and not p1 and p2\n        f_dsPut(lbMa1, true)", "    if false\n        f_dsPut(lbMa1, true)", "display: MA chained through the other MA"),
     ("            if q.bot <= stp + EPS\n                    array.push(sm, q)", "            if q.bot < stp - EPS\n                    array.push(sm, q)",
      "display: regroup after removal (touching bands)"),
@@ -1851,7 +2089,7 @@ MUTANTS = [
 
 def mutation():
     scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_qty_table, sc_be, sc_lock_far, sc_and_only_sel, sc_sel_tp, sc_consume, sc_zones, sc_acc_keep, sc_dup_swing, sc_ta,
-            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref, sc_display, sc_fvg_display, sc_swing_merge, sc_names_labels, sc_poc_latest]
+            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref, sc_display, sc_fvg_display, sc_swing_merge, sc_names_labels, sc_poc_latest, sc_ze]
     survived = []
     for old, new, what in MUTANTS:
         if SRC.count(old) != 1:
@@ -1902,6 +2140,8 @@ def main():
     sc_swing_merge()
     sc_names_labels()
     sc_poc_latest()
+    sc_ze_feed()
+    sc_ze()
     sc_ta()
     sc_session()
     sc_and_timing()
