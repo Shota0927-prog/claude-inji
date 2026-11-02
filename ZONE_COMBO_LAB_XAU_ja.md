@@ -174,7 +174,7 @@ Strategy の設定「02d · ZD 出来高 POC」の 13 項目に、MtfPocFeedXAU 
 
 分割済みの取引で目標数が変わった場合も、累積は元の全数量 N に対して計算し、完了した段は変えない。
 
-## 6. テスト（`python3 tests/lab_sim.py` — 76 項目すべて合格。Python 上の所要時間は TradingView の実行時間ではない）
+## 6. テスト（`python3 tests/lab_sim.py` — 77 項目すべて合格。Python 上の所要時間は TradingView の実行時間ではない）
 
 | 区分 | 内容 |
 |---|---|
