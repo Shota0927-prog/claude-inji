@@ -1501,8 +1501,8 @@ MUTANTS = [
      "        if na(r) and array.get(o.legLots, k - 1) > 0\n            r := array.get(o.legPx, k - 1)\n    r\n\nf_lbTpText", "BE lock target = farthest TP"),
     ("if lkBlk and array.size(lbWaits) > 0", "if false", "waits cleared while locked"),
     ("if xs != 0\n                    array.push(xId, z.id)", "if false\n                    array.push(xId, z.id)", "break cancels the wait"),
-    ("                more := true\n            else\n                i += 1\n    f_dsBox(ng)", "                more := false\n            else\n                i += 1\n    f_dsBox(ng)",
-     "display: chained merge"),
+    ("                hit := g.bot <= ng.top + EPS and ng.bot <= g.top + EPS", "                hit := g.bot < ng.top and ng.bot < g.top",
+     "display: merge bands that touch (EPS)"),
     ("            if q.bot <= stp + EPS\n                    array.push(sm, q)", "            if q.bot < stp - EPS\n                    array.push(sm, q)",
      "display: regroup after removal (touching bands)"),
 ]
