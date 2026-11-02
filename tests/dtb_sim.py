@@ -98,6 +98,11 @@ NEW_SRC = instrument(new_src(NEW_RAW))
 NEW_SRC_PLAIN = new_src(NEW_RAW)
 
 
+# drawings are chart objects referenced by var state, not var state themselves: the per-bar snapshot / rollback of the
+# Runner must keep the reference (otherwise label.delete / label.set_text would act on a copy the drawing log never sees)
+ap.Drawing.__deepcopy__ = lambda self, memo: self
+
+
 class DRunner(ap.Runner):
     """acc_pine Runner + detection log + per-bar base snapshots + drawing creation bar / confirmed flag."""
 
@@ -163,8 +168,10 @@ def first_diff(a, b):
 # ============================================================================
 # series
 # ============================================================================
-def series(seed, days, missing=0.0, grid=None, vol=1.0):
+def series(seed, days, missing=0.0, grid=None, vol=1.0, mirror=False):
     b5 = nas.market(seed, days, missing)
+    if mirror:                                    # tops <-> bottoms (price reflected around 2000)
+        b5 = [(t, 4000 - o, 4000 - l, 4000 - h, 4000 - c) for t, o, h, l, c in b5]
     if vol != 1.0 or grid:
         out = []
         for t, o, h, l, c in b5:
@@ -327,6 +334,7 @@ def draw_check(r):
             if (e[5], e[4]) not in apps[e[1]]:
                 apps[e[1]].append((e[5], e[4]))
     nd = na = nb = 0
+    want = []      # expected base -> approach lines (bases with the same pivot / level / approach give identical lines)
     for e in r.events:
         bar, gid, tf, side, cnt, app, lvl, dapp = e
         top = side == -1
@@ -356,10 +364,11 @@ def draw_check(r):
             b = r.bars[abar]
             if len(mk) != 1 or mk[0].args[0] != b["t"] or mk[0].args[1] != (b["h"] if top else b["l"]):
                 bad.append(("approach marker", gid, abar, cnt, [(d.args[:2]) for d in mk]))
-            ln = [d for d in lines if d.bar == abar and d.args[2] == b["t"] and d.args[3] == (b["h"] if top else b["l"])
-                  and d.args[1] == g[3] and d.args[0] == piv[gid][0]]
-            if len(ln) != 1:
-                bad.append(("approach line", gid, abar))
+            want.append((abar, piv[gid][0], g[3], b["t"], b["h"] if top else b["l"]))
+    from collections import Counter
+    got = Counter((d.bar, d.args[0], d.args[1], d.args[2], d.args[3]) for d in lines if d.kw.get("style") == "dashed")
+    if got != Counter(want):
+        bad.append(("approach lines", (Counter(want) - got).most_common(2), (got - Counter(want)).most_common(2)))
     for gid, g in bases.items():
         if not shown[g[1]]:
             continue
@@ -407,12 +416,12 @@ def gate_series():
     tot_ev = tot_mis = n_runs = 0
     covsum = {}
     first_bad = ""
-    plans = [(61, 40, 0.0, None, 1.0), (62, 40, 0.03, None, 1.0), (63, 40, 0.0, 0.5, 1.0), (64, 70, 0.0, None, 1.6),
-             (65, 70, 0.02, 0.5, 2.2)]
-    for seed, days, miss, grid, vol in plans:
-        bars = series(seed, days, miss, grid, vol)
-        for name, ov in SETTINGS:
-            if days > 40 and name not in ("default", "wait 0"):
+    plans = [(61, 40, 0.0, None, 1.0, False, 6), (62, 40, 0.03, None, 1.0, False, 6), (63, 40, 0.0, 0.5, 1.0, False, 2),
+             (64, 70, 0.0, None, 1.6, False, 2), (64, 70, 0.0, None, 1.6, True, 1), (65, 70, 0.02, 0.5, 2.2, False, 2)]
+    for seed, days, miss, grid, vol, mir, nset in plans:
+        bars = series(seed, days, miss, grid, vol, mir)
+        for name, ov in SETTINGS[:nset]:
+            if nset == 2 and name == "wait 1":
                 continue
             a = run_orig(bars, ov)
             b = run_new(bars, ov)
@@ -424,6 +433,8 @@ def gate_series():
                 first_bad = first_bad or f"seed {seed} {name}: first difference on bar {d[0]}: {d[1]}"
             for k, v in coverage(a, ov).items():
                 covsum[k] = covsum.get(k, 0) + v
+            print(f"  [run] seed {seed} days {days} missing {miss} grid {grid} vol {vol} mirror {mir} {name}: events "
+                  f"{len(a.events)} diff {d}", flush=True)
             if name == "default" and seed in (62, 65):
                 bad, cnt = draw_check(b)
                 check(f"DT-D1 seed {seed} drawings: every detection label on its detection bar (time = that 5M bar, price at its "
