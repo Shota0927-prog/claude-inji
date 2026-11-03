@@ -919,7 +919,7 @@ def gate_maxdist():
     det = []
     n_cut = n_reg = n_ev_on = n_ev_off = 0
     for seed, days, miss, vol, ov in ((81, 30, 0.02, 1.0, {}), (82, 30, 0.0, 1.6, {}), (83, 60, 0.02, 2.2, {}),
-                                      (84, 30, 0.02, 1.6, dict(dvPiv=2, dvD0=6.0, dvMx0=20.0))):
+                                      (84, 30, 0.02, 1.6, dict(dvPiv=2, dvD0=6.0, dvMx0=20.0)), (85, 15, 0.02, 6.0, {})):
         bars = series(seed, days, miss, None, vol)
         r_on = run_new(bars, ov, eq=False)
         r_off = run_new(bars, dict(ov, dvMxUse=False), eq=False)
@@ -960,7 +960,7 @@ def gate_maxdist():
               f"distance {len(cut)} (at registration {sum(1 for g, i in cut.items() if i == all_bases(r_off)[g][5])})", flush=True)
     check("DT-M1 limit OFF: detection events and active-base states equal the previous indicator (5db85fc) at the same settings",
           ok_prev, str(det))
-    check("DT-M3 random series (4 paths, defaults and pivot 2 / max 20): the ON run equals the OFF run with every 5M base cut "
+    check("DT-M3 random series (5 paths incl. a 6x volatility one, defaults and pivot 2 / max 20): the ON run equals the OFF run with every 5M base cut "
           "from the first bar whose max distance since the pivot's next bar (independent oracle from the bars) exceeds the limit "
           "(not registered when that is the availability bar); the stored extreme equals the oracle on every bar",
           ok_or and ok_ext and n_cut > 0 and n_reg > 0 and n_ev_on < n_ev_off,
