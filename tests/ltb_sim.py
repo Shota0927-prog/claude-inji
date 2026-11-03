@@ -438,6 +438,11 @@ def gate_scenarios():
                    base + [(H - B - 1, H - B + 1, H - B - 3, H - B - 2), (H - B - 2, H - B - 1, lowp, lowp + 1),
                            (H - B - 1, H - B + 1, H - B - 3, H - B - 2)],
                    lambda ev: dets(ev) == [(R + 1, 2, 0), (R + 3, 3, 0)] and kinds(ev, "E") == [R + 3])
+            yield ("a left bar with the same high as the peak (tie) -> no base at H, nothing approached / detected",
+                   [r if j != 2 else (H - 6, H, H - 9, H - 7) for j, r in enumerate(base)]
+                   + [(H - B - 1, H - B + 1, H - B - 3, H - B - 2)],
+                   lambda ev: not [e for _, e in ev if e[0] == "R" and e[3] == (H if e[2] == -1 else 4000 - H)]
+                   and not [e for _, e in ev if e[0] == "D"])
             yield ("touch before the minimum distance is reached is not an approach",
                    base[:5] + [(H - 8, H - 6, H - 10, H - 9)] * 4 + [(H - B - 1, H - B + 1, H - B - 3, H - B - 2)] * 2,
                    lambda ev: not kinds(ev, "A") and not dets(ev))
