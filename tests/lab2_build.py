@@ -17,7 +17,7 @@ NEW_FILES = ("MtfPocFeedXAU.pine", "tests/lab2_build.py")
 
 def ok(path):
     """LAB-2 accounts for this path exactly: one of its new files."""
-    return path in NEW_FILES
+    return path in NEW_FILES or __import__("lbs_build").ok(path)     # the later LBS-1 files: exact
 
 
 L2 = '__import__("lab2_build")'
@@ -53,6 +53,7 @@ def apply_edits(path, text):
 
 def unadapt(path, text):
     """a test file with its LAB-2 edits reverted (all or nothing; unchanged without them; None with only part of them)."""
+    text = __import__("lbs_build").unadapt(path, text)     # the later LBS-1 test edits are reverted first, exactly
     eds = TEST_EDITS.get(path, [])
     if text is None or not eds or all(text.count(new) == 0 for _, new, _ in eds):
         return text
