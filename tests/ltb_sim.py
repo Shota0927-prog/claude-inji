@@ -16,6 +16,15 @@
                    events identical on the common range and equal to the detector, received once, never before the source bar
                    closed, realtime ticks / the forming target bar change nothing, display ON / OFF and the drawing cap leave the
                    received events unchanged, gaps counted, drawings restored after the cap removed them
+  LT-K context   : (LTB-2) a resolver applies Pine's request.security rule — the expression AND every calculation it depends on
+                   are evaluated in the requested context — to the source: each call's arguments and the globals they / the core
+                   body / the logic functions reach are evaluated with that TF's built-ins (timeframe.in_seconds() = 14400 inside
+                   "240"); the chart side with the chart's. The chart emulation is driven by those resolved values (not by
+                   constants chosen here). Checks: no chart-dependent dependency, 1H never taken early on 5M / 15M, 1H chart on
+                   the bar's close, 4H / D detectors update, no forming bar taken, common-range events identical; the same
+                   checks run on the previous version (db654f5) must flag its defect
+                   Limit: the rule is applied as documented, to global declarations and the core's arguments; TradingView's own
+                   evaluation is not run
   LT-M mutation  : mutations of the Pine file are caught by at least one check
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile / request.security / drawing limits / rendering not reproduced).
@@ -41,6 +50,9 @@ TF_MS = [H1, H4, DAY]
 TFJA = ["1時間", "4時間", "日足"]
 EPS = 1e-7
 BASE_COMMIT = "2633c84"          # branch tip before LTB-1 (protected files compared with it)
+
+# chart.* / ticker.* built-ins (read by the request.security context resolver) translate like the other namespaces
+ap.NAMESPACES.update({"chart", "ticker"})
 
 # drawings are chart objects referenced by var state: the snapshot / rollback keeps the reference
 ap.Drawing.__deepcopy__ = lambda self, memo: self
@@ -510,20 +522,28 @@ def agg(b5, tf_ms, day=False):
 
 
 class Core:
-    """f_ltCore inside request.security for one TF: its bars in its own history order; out = prevBlk ; blk."""
+    """f_ltCore inside request.security for one call: its bars in its own history order (its own instance / var state).
+    on: the value the call's `on` argument takes IN THE TARGET CONTEXT (LTB-1 had one; LTB-2 has none = always computed).
+    packet = the non-empty blocks of (previous bar, this bar) joined by ';' (both versions' `out` lines reduce to this; a
+    changed line falls back to one block)."""
 
-    def __init__(self, k, htf, ov=None, src=None):
-        self.k, self.htf = k, htf
+    def __init__(self, k, htf, ov=None, src=None, on=True):
+        self.k, self.htf, self.ov, self.on = k, htf, ov, on
         self.det = Det(k, ov, src)
         self.outs = []
-        # the packet = previous block ; this block (as the Pine line reads; a single block if the line was changed)
-        self.pair = 'string out = prevBlk == "" ? blk : blk == "" ? prevBlk : prevBlk + ";" + blk' in self.det.src
+        self.pair = bool(re.search(r'string out = prevBlk == "" \? blk : (?:blk == "" \? prevBlk : )?prevBlk \+ ";" \+ blk',
+                                   self.det.src))
         prev = ""
         for b in htf:
-            blk = self.det.step(b)
-            self.outs.append(blk if (prev == "" or not self.pair) else prev + ";" + blk)
+            blk = self.det.step(b) if on else ""
+            self.outs.append(self._join(prev, blk))
             prev = blk
         self.starts = [b["T"] for b in htf]
+
+    def _join(self, prev, blk):
+        if not self.pair:
+            return blk
+        return ";".join(x for x in (prev, blk) if x != "")
 
     def idx(self, t):
         lo, hi = 0, len(self.starts) - 1
@@ -538,26 +558,169 @@ class Core:
         return lo
 
     def value(self, t, off):
-        """request.security(lookahead_on) on a chart bar starting at t: the target bar containing t, `off` bars back."""
+        """request.security(lookahead_on) on a HISTORICAL chart bar starting at t: the target bar containing t (its final
+        value — the lookahead), `off` bars back."""
         j = self.idx(t) - off
         return self.outs[j] if j >= 0 else None
 
-    def partial_value(self, t, partial_bar):
-        """the forming target bar (realtime): its value computed on a copy of the state from the partial OHLC (off 0)."""
+    def partial_value(self, t, partial_bar, off):
+        """realtime: off 0 -> the forming target bar computed from the partial OHLC on a copy of the state; off >= 1 -> final."""
+        if off >= 1:
+            return self.value(t, off)
         j = self.idx(t)
-        prev = self.det.blocks[j - 1] if j >= 1 else ""
+        prev = (self.det.blocks[j - 1] if j >= 1 else "") if self.on else ""
         blk = self.det.env["ltStep"](copy.deepcopy(self._state_before(j)), partial_bar["o"], partial_bar["h"], partial_bar["l"],
-                                     partial_bar["c"], partial_bar["T"], partial_bar["C"], j)
-        return blk if (prev == "" or not self.pair) else prev + ";" + blk
+                                     partial_bar["c"], partial_bar["T"], partial_bar["C"], j) if self.on else ""
+        return self._join(prev, blk)
 
     def _state_before(self, j):
         if not hasattr(self, "_snaps"):
-            d = Det(self.k, None, self.det.src)
+            d = Det(self.k, self.ov, self.det.src)
             self._snaps = []
             for b in self.htf:
                 self._snaps.append(copy.deepcopy(d.S))
                 d.step(b)
         return self._snaps[j]
+
+
+# ============================================================================
+# request.security context resolver (LTB-2)
+# ============================================================================
+#  Pine evaluates a request.security expression AND every calculation it depends on in the requested context: a global
+#  `x = timeframe.in_seconds()` referenced by the expression is 14400 inside "240", whatever the chart is. The resolver
+#  reads the source, finds each call, and evaluates its arguments and the globals they (and the core's body / the
+#  logic functions) depend on, transitively, with the context's built-ins. The chart side is evaluated with the
+#  chart's built-ins. Nothing here is a constant chosen by the test.
+TF_SECS = {"60": 3600, "240": 14400, "D": 86400, "15": 900, "5": 300}
+CHART_BUILTINS = re.compile(r"\b(timeframe\.\w+|chart\.\w+|barstate\.\w+|syminfo\.\w+|time\b|bar_index\b)")
+SEC_RE = re.compile(r'^string (\w+)\s*=\s*request\.security\((\w+), "(\w+)",\s*f_ltCore\((.*)\), lookahead = barmerge\.(\w+)\)$')
+
+
+def globals_of(src):
+    """level-0 declarations (name -> expression) outside types / functions; request.security results excluded."""
+    out = {}
+    for lvl, x in ap.logical_lines(src):
+        if lvl != 0 or x.startswith(("var ", "if ", "for ", "type ", "//", "indicator(", "plot")) or "=>" in x:
+            continue
+        m = re.match(r"^(?:(?:int|float|bool|string|color)\s+)?([A-Za-z_]\w*)\s*=(?!=)\s*(.+)$", x)
+        if m and "input." not in m.group(2) and "request.security" not in m.group(2):
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def sec_calls(src):
+    out = []
+    for lvl, x in ap.logical_lines(src):
+        m = SEC_RE.match(x) if lvl == 0 else None
+        if m:
+            out.append(dict(var=m.group(1), tick=m.group(2), tf=m.group(3), args=ap.split_top(m.group(4)), look=m.group(5)))
+    return out
+
+
+def core_params(src):
+    m = re.search(r"^f_ltCore\(([^)]*)\) =>", src, re.M)
+    return ap.param_names(m.group(1))
+
+
+def core_body(src):
+    i = src.index("\nf_ltCore(")
+    j = src.index("\nstring ", i)
+    return src[i:j]
+
+
+class Ctx:
+    """evaluation of source globals in one context (secs = timeframe.in_seconds() there; a standard time-based chart)."""
+
+    def __init__(self, src, secs, inp):
+        self.src, self.secs, self.inp = src, secs, inp
+        self.decls = globals_of(src)
+        self.cache, self.deps = {}, {}
+
+    def env(self):
+        secs = self.secs
+        return dict(timeframe__in_seconds=lambda tf=None: secs if tf is None else TF_SECS[tf], timeframe__isticks=False,
+                    chart__is_renko=False, chart__is_kagi=False, chart__is_pnf=False, chart__is_linebreak=False,
+                    chart__is_range=False, chart__is_standard=True, _na=lambda x: x is None, _int=lambda x: None if x is None else int(x))
+
+    def value(self, name):
+        if name in self.inp:
+            return self.inp[name]
+        if name not in self.cache:
+            e = self.decls[name]
+            self.cache[name] = eval(ap.expr(e), self.env(), _Lazy(self))
+        return self.cache[name]
+
+    def eval_expr(self, e):
+        try:
+            return eval(ap.expr(e), self.env(), _Lazy(self))
+        except Exception:
+            return e                                    # not evaluable here (e.g. a ticker string) -> kept as text
+
+    def builtins_used(self, e, seen=None):
+        """chart-dependent built-ins used by an expression, transitively through the globals it references."""
+        seen = set() if seen is None else seen
+        out = set(CHART_BUILTINS.findall(e))
+        for nm in set(re.findall(r"\b[A-Za-z_]\w*\b", e)):
+            if nm in self.decls and nm not in seen:
+                seen.add(nm)
+                out |= self.builtins_used(self.decls[nm], seen)
+        return out
+
+
+class _Lazy(dict):
+    def __init__(self, ctx):
+        super().__init__()
+        self.ctx = ctx
+
+    def __getitem__(self, k):
+        if k in self.ctx.inp or k in self.ctx.decls:
+            return self.ctx.value(k)
+        raise KeyError(k)
+
+    def __contains__(self, k):
+        return k in self.ctx.inp or k in self.ctx.decls
+
+
+def resolve_calls(src, ov=None):
+    """every request.security call -> its core arguments evaluated in ITS context + the chart-dependent built-ins they and the
+    core body / logic functions reach (transitively)."""
+    inp = ap.inputs(src)
+    inp.update(ov or {})
+    params = core_params(src)
+    body = core_body(src) + section(src, LB, LE)
+    out = []
+    for c in sec_calls(src):
+        cx = Ctx(src, TF_SECS[c["tf"]], inp)
+        vals = {p: cx.eval_expr(a) for p, a in zip(params, c["args"])}
+        used = set()
+        for a in c["args"]:
+            used |= cx.builtins_used(a)
+        for nm in set(re.findall(r"\b[A-Za-z_]\w*\b", code_only(body))):
+            if nm in cx.decls:
+                used |= cx.builtins_used(cx.decls[nm])
+        out.append(dict(c, vals=vals, used=sorted(used)))
+    return out
+
+
+class Feeds:
+    """the request.security results of a source: one Core per call (own instance), on / off from the call evaluated in its
+    target context. feeds[k] -> a core of TF k (detector checks)."""
+
+    def __init__(self, htf, ov=None, src=None):
+        self.src = src or SRC
+        self.calls = resolve_calls(self.src, ov)
+        self.items = []
+        for c in self.calls:
+            v = c["vals"]
+            k = int(v["k"])
+            core = Core(k, htf[k], ov, self.src, on=bool(v.get("on", True)))
+            self.items.append(dict(var=c["var"], k=k, off=int(v["off"]), core=core, look=c["look"]))
+
+    def __getitem__(self, k):
+        for it in self.items:
+            if it["k"] == k and it["core"].on:
+                return it["core"]
+        return [it for it in self.items if it["k"] == k][0]["core"]
 
 
 def chart_instrument(src):
@@ -577,33 +740,37 @@ def chart_instrument(src):
 
 
 class Chart:
-    """one chart: its bars (any TF <= 1H) receive the three packets and run the translated CHART section."""
+    """one chart: its bars receive every request.security result (Feeds) and run the translated CHART section; the chart-side
+    globals (ltChSec, ltChartOk, ltSame1, ...) evaluated with THIS chart's built-ins."""
 
-    def __init__(self, cores, chart_ms, ov=None, src=None):
+    def __init__(self, feeds, chart_ms, ov=None, src=None):
         self.src = src or SRC
         self.env = make_env(self.src, ov)
-        self.cores, self.chart_ms = cores, chart_ms
+        self.feeds, self.chart_ms = feeds, chart_ms
         self.code = compile(ap.Translator().translate(ap.logical_lines(chart_instrument(self.src))), "<LTB chart>", "exec")
         self.blocks, self.events = [], []
         e = self.env
         e["runtime__zzblk"] = lambda k, sT: self.blocks.append((k, sT, e["time"], e["time_close"]))
         e["runtime__zzev"] = lambda k, f: self.events.append((k, tuple(f), e["time"], e["time_close"]))
         self.committed = None
-        # the offsets each request.security call passes (evaluated from the source for this chart's TF)
-        m = re.search(r"int  ltOff1 = ltChSec == 3600 \? (\d) : (\d)", self.src)
-        off1 = {"ltOff1": int(m.group(1)) if chart_ms == H1 else int(m.group(2))}
-        self.offs = []
-        for k, (nm, tf) in enumerate((("ltPk1", "60"), ("ltPk4", "240"), ("ltPkD", "D"))):
-            m = re.search(nm + r' = request\.security\(ltTk, "' + tf + r'",\s*f_ltCore\(%d, \w+, \w+, ltChartOk, (\w+)\)' % k, self.src)
-            a = m.group(1)
-            self.offs.append(off1[a] if a in off1 else int(a))
+        inp = ap.inputs(self.src)
+        inp.update(ov or {})
+        cx = Ctx(self.src, chart_ms // 1000, inp)
+        sec = code_only(section(self.src, CB, CE))
+        self.chart_globals = {}
+        for nm in cx.decls:
+            if nm not in ("EPS",) and re.search(r"\b" + nm + r"\b", sec) and nm.startswith("lt"):
+                v = cx.eval_expr(cx.decls[nm])
+                if not isinstance(v, str) or nm == "ltTk":
+                    self.chart_globals[nm] = v
+        e.update(self.chart_globals)
 
     def _exec(self, b, confirmed, pks):
         e = self.env
         if self.committed is not None:
             e.update(copy.deepcopy(self.committed))
         e.update(time=b["T"], time_close=b["C"], high=b["h"], low=b["l"], open=b["o"], close=b["c"], dsAtr=2.0,
-                 barstate__isconfirmed=confirmed, ltChartOk=True, ltPk1=pks[0], ltPk4=pks[1], ltPkD=pks[2])
+                 barstate__isconfirmed=confirmed, **pks)
         exec(self.code, e)
         e["__first__"] = False
         if confirmed:
@@ -611,17 +778,15 @@ class Chart:
 
     def run(self, bars, ticks_from=None):
         for i, b in enumerate(bars):
-            pks = [self.cores[k].value(b["T"], self.offs[k]) for k in range(3)]
+            pks = {it["var"]: it["core"].value(b["T"], it["off"]) for it in self.feeds.items}
             if ticks_from is not None and i >= ticks_from:
-                # realtime: unconfirmed executions (the 1H packet of a 1H chart = the forming 1H bar computed from partial OHLC)
+                # realtime: unconfirmed executions; an offset-0 result is the forming target bar computed from partial OHLC
                 nd = len(self.env["_draws"])
                 nb, ne = len(self.blocks), len(self.events)
                 for frac in (0.3, 0.7):
                     pb = dict(b, h=b["o"] + (b["h"] - b["o"]) * frac, l=b["o"] - (b["o"] - b["l"]) * frac,
                               c=b["o"] + (b["c"] - b["o"]) * frac)
-                    tp = list(pks)
-                    if self.offs[0] == 0:
-                        tp[0] = self.cores[0].partial_value(b["T"], pb)
+                    tp = {it["var"]: it["core"].partial_value(b["T"], pb, it["off"]) for it in self.feeds.items}
                     self._exec(pb, False, tp)
                 if len(self.env["_draws"]) != nd or len(self.blocks) != nb or len(self.events) != ne:
                     self.rt_changed = True
@@ -651,8 +816,7 @@ def det_set(core):
 def build(seed, days=70, scale=1.0, ov=None, src=None):
     b5 = market5(seed, days, scale)
     htf = [agg(b5, H1), agg(b5, H4), agg(b5, DAY, day=True)]
-    cores = [Core(k, htf[k], ov, src) for k in range(3)]
-    return b5, htf, cores
+    return b5, htf, Feeds(htf, ov, src)
 
 
 def gate_chart():
@@ -724,7 +888,7 @@ def gate_chart():
                 ok_disp = False
                 det.append((seed, ov, "drawings with every TF hidden"))
         # display settings never reach the detector: the cores take no display input (static) and give the same blocks
-        cores_off = [Core(k, htf[k], dict(dsTf1=False, dsMaxGrp=1)) for k in range(3)]
+        cores_off = Feeds(htf, dict(dsTf1=False, dsMaxGrp=1))
         if any(cores_off[k].outs != cores[k].outs for k in range(3)):
             ok_disp = False
             det.append((seed, "core outputs changed by display inputs"))
@@ -824,7 +988,7 @@ def gate_draw():
     rows += [(1994, 1995, 1990, 1991)]                                       # A: bearish -> detected (lag 2)
     rows += [(1991, 1992, 1989, 1990)] * 2
     htf = [mk(rows, H1), mk([(2000, 2001, 1999, 2000)] * 3, H4), mk([(2000, 2001, 1999, 2000)] * 2, DAY)]
-    cores = [Core(i, htf[i]) for i in range(3)]
+    cores = Feeds(htf)
     ev = det_events(cores[0].det)[0]
     chart_bars = []
     for b in htf[0]:
@@ -906,7 +1070,7 @@ def gate_draw():
     t0 = 1_790_006_400_000 // H4 * H4
     hx = [mk(r1 + [(1990, 1991, 1989, 1990)] * 4, H1, t0), mk(r4 + [(1990, 1991, 1989, 1990)], H4, t0),
           mk([(1950, 1951, 1949, 1950)] * 3, DAY, t0 - 22 * H1)]
-    cx = [Core(k, hx[k]) for k in range(3)]
+    cx = Feeds(hx)
     cb = []
     for b in hx[1]:
         for s15 in range(16):
@@ -961,24 +1125,30 @@ def code_only(src):
 
 def gate_static():
     s = code_only(SRC)
-    calls = re.findall(r'request\.security\((\w+), "(\w+)",\s*f_ltCore\((\d), (\w+), (\w+), (\w+), (\w+)\), lookahead = barmerge\.lookahead_on\)', s)
-    ok = (len(re.findall(r"request\.security\(", s)) == 3 and [c[1] for c in calls] == ["60", "240", "D"]
-          and all(c[0] == "ltTk" and c[5] == "ltChartOk" for c in calls)
-          and calls[0][6] == "ltOff1" and calls[1][6] == "1" and calls[2][6] == "1"
-          and [c[3:5] for c in calls] == [("dvB1", "dvD1"), ("dvB4", "dvD4"), ("dvBD", "dvDD")]
-          and "ltOff1 = ltChSec == 3600 ? 0 : 1" in s and "ticker.standard(syminfo.tickerid)" in s)
-    check("LT-S1 three request.security calls (60 / 240 / D) of f_ltCore with each TF's own inputs, lookahead_on, ticker.standard; "
-          "offset 0 only for 1H on a 1H chart, else 1", ok)
-    core = s[s.index("f_ltCore(int k"):s.index("string ltPk1")]
+    calls = re.findall(r'string (\w+)\s*= request\.security\((\w+), "(\w+)",\s*f_ltCore\((\d), (\w+), (\w+), (\w+)\), '
+                       r'lookahead = barmerge\.lookahead_on\)', s)
+    ok = (len(re.findall(r"request\.security\(", s)) == 4
+          and [(c[0], c[2], c[3], c[6]) for c in calls] == [("ltPk1N", "60", "0", "0"), ("ltPk1C", "60", "0", "1"),
+                                                             ("ltPk4", "240", "1", "1"), ("ltPkD", "D", "2", "1")]
+          and all(c[1] == "ltTk" for c in calls)
+          and [c[4:6] for c in calls] == [("dvB1", "dvD1"), ("dvB1", "dvD1"), ("dvB4", "dvD4"), ("dvBD", "dvDD")]
+          and "f_ltCore(int k, float buf, float dist, int off) =>" in s
+          and "string ltPk1 = ltSame1 ? ltPk1N : ltPk1C" in s and "bool ltSame1   = ltChSec == 3600" in s
+          and "ticker.standard(syminfo.tickerid)" in s)
+    check("LT-S1 four request.security calls of f_ltCore(k, buf, dist, off) with literal offsets: 1H offset 0 and offset 1 (separate "
+          "calls), 4H / D offset 1; each TF's own inputs, lookahead_on, ticker.standard; the 1H result chosen on the chart side "
+          "(1H chart -> offset 0, else offset 1)", ok)
+    core = s[s.index("f_ltCore(int k"):s.index("string ltPk1N")]
     logic = code_only(section(SRC, LB, LE))
     ok2 = ("var LtTf S = ltNew(k, dvPiv, dvWait, buf, dist)" in core and "out[off]" in core and
            "ltStep(S, open, high, low, close, time, time_close, bar_index)" in core and
-           not re.search(r"\bds\w+", core + logic) and "request.security" not in logic and "ltChartOk" not in logic)
+           not re.search(r"\bds\w+", core + logic) and "request.security" not in logic
+           and not re.search(r"\blt(ChartOk|ChSec|Same1|TimeBar|Off1)\b|timeframe\.|chart\.", core + logic))
     check("LT-S2 the detector runs inside request.security on the target TF's own open / high / low / close / time / bar_index "
-          "(var state per call); no display input reaches it", ok2)
+          "(var state per call), unconditionally; no display input and no chart-TF / chart-support value reaches it", ok2)
     ok3 = ("bool ltChartOk = ltTimeBar and ltChSec <= 3600" in s and "not timeframe.isticks" in s and "chart.is_renko" in s
            and "if barstate.isconfirmed and ltChartOk" in s and "このチャートには対応していません" in s and "1時間足以下" in s)
-    check("LT-S3 chart support: time-based charts <= 1H only; otherwise nothing is computed and the table asks to switch", ok3)
+    check("LT-S3 chart support (chart side): time-based charts <= 1H only; otherwise nothing is taken / drawn and the table asks to switch", ok3)
     inp = ap.inputs(s)
     want = dict(dvPiv=4, dvWait=3, dvB1=5.0, dvD1=15.0, dvB4=10.0, dvD4=30.0, dvBD=20.0, dvDD=60.0, dsTf1=True, dsTf4=False,
                 dsTfD=False)
@@ -1012,11 +1182,15 @@ MUTATIONS = [
     ("expiry one bar late", "else if bi >= g.waitEnd", "else if bi > g.waitEnd"),
     ("expiry not counted", "                        g.cnt    += 1\n", "                        g.cnt    += (S.wait > 0 and not rev ? 0 : 1)\n"),
     ("initial distance from the pivot bar too", "if j > S.piv\n", "if j >= S.piv\n"),
-    ("lower chart gets the forming bar", 'f_ltCore(1, dvB4, dvD4, ltChartOk, 1)', 'f_ltCore(1, dvB4, dvD4, ltChartOk, 0)'),
-    ("1H chart delayed / lower chart early for 1H", "ltOff1 = ltChSec == 3600 ? 0 : 1", "ltOff1 = ltChSec == 3600 ? 1 : 1"),
+    ("lower chart gets the forming 4H bar", 'f_ltCore(1, dvB4, dvD4, 1)', 'f_ltCore(1, dvB4, dvD4, 0)'),
+    ("1H chart takes offset 1 (delayed)", "string ltPk1 = ltSame1 ? ltPk1N : ltPk1C", "string ltPk1 = ltPk1C"),
+    ("lower chart takes the 1H offset 0", "string ltPk1 = ltSame1 ? ltPk1N : ltPk1C", "string ltPk1 = ltPk1N"),
+    ("1H offset chosen inside the requested context (LTB-1 bug)", 'f_ltCore(0, dvB1, dvD1, 1)', 'f_ltCore(0, dvB1, dvD1, ltSame1 ? 0 : 1)'),
+    ("4H detector gated by the chart support (LTB-1 bug)", "    string blk = ltStep(S, open, high, low, close, time, time_close, bar_index)\n",
+     "    string blk = ltChartOk ? ltStep(S, open, high, low, close, time, time_close, bar_index) : \"\"\n"),
     ("no dedupe of received blocks", "take := na(lT) or sT > lT", "take := true"),
     ("chart processes unconfirmed executions", "if barstate.isconfirmed and ltChartOk\n", "if ltChartOk\n"),
-    ("one block per packet", 'string out = prevBlk == "" ? blk : blk == "" ? prevBlk : prevBlk + ";" + blk', "string out = blk"),
+    ("one block per packet", 'string out = prevBlk == "" ? blk : prevBlk + ";" + blk', "string out = blk"),
     ("cap drops the late approach marker", "    if lost\n        ltAppMk(r, \"検知\")\n", ""),
     ("only one detection per bar per side", "    if top\n        array.set(ltStk, 0, sk + 1)\n    else\n        array.set(ltStk, 1, sk + 1)\n", ""),
 ]
@@ -1039,6 +1213,9 @@ def run_quick(src):
             gate_draw()
             gate_gap()
             gate_chart_quick()
+            cur = context_checks(SRC, "mutation")
+            for k, v in cur.items():
+                check("m-" + k, v[0], v[1])
         except Exception as ex:          # a mutation that breaks execution is caught too
             check("m-exc", False, repr(ex))
         return all(r[1] for r in RESULTS)
@@ -1080,8 +1257,103 @@ def gate_mutation():
     check(f"LT-M1 mutations caught {caught}/{len(MUTATIONS)}", not missed, str(missed))
 
 
+def context_checks(src, label):
+    """the request.security context rule applied to `src` (resolver: each call's arguments and the globals reached by them /
+    the core body / the logic functions evaluated in the requested TF; the chart side with the chart's built-ins), then the
+    chart emulation driven by those resolved values. Returns {check: (ok, detail)}."""
+    res = {}
+    calls = resolve_calls(src)
+    inp = ap.inputs(src)
+    # K1 no argument / dependency of any call uses a chart-dependent built-in; its values equal in every chart context
+    bad = [(c["var"], c["tf"], c["used"]) for c in calls if c["used"]]
+    diffv = []
+    for c in calls:
+        for cs in (300, 900, 3600):
+            cx = Ctx(src, cs, inp)
+            chart_vals = {p: cx.eval_expr(a) for p, a in zip(core_params(src), c["args"])}
+            if chart_vals != c["vals"]:
+                diffv.append((c["var"], c["tf"], "chart %ds" % cs, chart_vals, "in context", c["vals"]))
+                break
+    res["K1"] = (not bad and not diffv, str(bad[:4]) + " " + str(diffv[:3]))
+    b5, htf, feeds = build(11, days=45, scale=1.2, src=src)
+    t15 = b5[0]["T"] + 10 * DAY
+    t5 = b5[0]["T"] + 20 * DAY
+    charts = {"1H": (H1, agg(b5, H1)), "15M": (M15, [b for b in agg(b5, M15) if b["T"] >= t15]),
+              "5M": (M5, [b for b in b5 if b["T"] >= t5])}
+    close_of = {(k, b["T"]): b["C"] for k in range(3) for b in htf[k]}
+    k2, k3, k4, k5 = [], [], [], {}
+    for nm, (ms, bars) in charts.items():
+        ch = Chart(feeds, ms, src=src).run(bars, ticks_from=len(bars) - 40)
+        # K2 1H results: lower chart never before the source 1H bar closed; 1H chart on that bar's confirmed execution
+        for key, t, tc in ch.received():
+            if key[0] != 0:
+                continue
+            if (ms == H1 and not (t == key[5] and tc == key[6])) or (ms != H1 and t < key[6]):
+                k2.append((nm, key, t))
+                break
+        if not any(x[0] == 0 for x in [r[0] for r in ch.received()]):
+            k2.append((nm, "no 1H detection received"))
+        # K3 4H / D detectors update: every 4H / D bar that closed inside the chart's range is taken, the last one included
+        for k in (1, 2):
+            taken = sorted(sT for kk, sT, _, _ in ch.blocks if kk == k)
+            want = [b["T"] for b in htf[k] if bars[0]["T"] <= b["C"] <= bars[-1]["T"]]
+            if not want or not set(want) <= set(taken) or taken[-1] != want[-1]:
+                k3.append((nm, TFJA[k], "taken %d / closed %d" % (len(taken), len(want)), taken[-1:] , want[-1:]))
+        # K4 no block taken before its target bar closed (lower charts; the 1H chart takes 1H at the bar's own close)
+        for kk, sT, t, tc in ch.blocks:
+            C = close_of[(kk, sT)]
+            if (ms == TF_MS[kk] and tc != C) or (ms != TF_MS[kk] and t < C):
+                k4.append((nm, TFJA[kk], sT, t))
+                break
+        if getattr(ch, "rt_changed", False):
+            k4.append((nm, "unconfirmed execution changed something"))
+        k5[nm] = sorted(x[0] for x in ch.received() if x[0][5] >= t5 and x[0][6] <= charts["5M"][1][-1]["T"])
+    # reference: each TF's detector run directly on that TF's bars (independent of how the source wires request.security)
+    direct = [Core(k, htf[k], None, src) for k in range(3)]
+    ref = sorted(x[:6] for k in range(3) for x in det_set(direct[k]) if x[5] >= t5 and x[6] <= charts["5M"][1][-1]["T"])
+    res["K2"] = (not k2, str(k2[:3]))
+    res["K3"] = (not k3, str(k3[:4]))
+    res["K4"] = (not k4, str(k4[:3]))
+    res["K5"] = (all([x[:6] for x in v] == ref for v in k5.values()) and len(ref) > 0,
+                 str({nm: len(v) for nm, v in k5.items()}) + " ref %d" % len(ref))
+    print(f"  [LT-K {label}] " + ", ".join(f"{c['var']}@{c['tf']}: " + ", ".join(f"{p}={v}" for p, v in c["vals"].items()
+                                                                                   if p not in ("buf", "dist"))
+                                            for c in calls), flush=True)
+    return res
+
+
+def gate_context():
+    cur = context_checks(SRC, "current")
+    names = {"K1": "every request.security argument, and every global reached from it / the core body / the logic functions, "
+                   "uses no chart-dependent built-in; evaluated in the requested context it equals its value on 5M / 15M / 1H charts",
+             "K2": "5M / 15M charts take a 1H result only on / after the source 1H bar's close; the 1H chart on that bar's confirmed "
+                   "execution",
+             "K3": "4H / D detectors update on 5M / 15M / 1H charts: every 4H / D bar that closed in the chart's range is taken, the "
+                   "last taken bar = the last closed one",
+             "K4": "no block taken before its target bar closed (forming 4H / D / 1H bars never taken; realtime ticks incl. the "
+                   "forming bar's offset-0 value change nothing)",
+             "K5": "original detection events (TF, pivot time, side, count, approach bar, detection bar) identical on 5M / 15M / 1H "
+                   "charts on the common range and equal to the detectors"}
+    for k, nm in names.items():
+        check(f"LT-{k} (context resolver + chart emulation) {nm}", cur[k][0], cur[k][1])
+    # the same checks on the previous version (LTB-1, db654f5) must flag the reported defect
+    try:
+        old = subprocess.run(["git", "show", "db654f5:LongTermDoubleTripleTopBottomXAU.pine"], cwd=ROOT, capture_output=True,
+                             text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as ex:
+        check("LT-K6 previous version flagged", False, str(ex))
+        return
+    o = context_checks(old, "LTB-1 db654f5")
+    flagged = [k for k in ("K1", "K2", "K3", "K4", "K5") if not o[k][0]]
+    print("  [LT-K LTB-1] " + "; ".join(f"{k} {'FAIL' if not o[k][0] else 'pass'}: {o[k][1][:160]}" for k in sorted(o)))
+    check("LT-K6 the same checks on the previous version (db654f5) flag the defect: K1 (ltChartOk / ltOff1 evaluated in the requested "
+          "context), K2 (1H offset 0 on 5M / 15M -> taken before the 1H close), K3 (4H / D detectors never run)",
+          flagged[:3] == ["K1", "K2", "K3"], str(flagged))
+
+
 def main():
     gate_static()
+    gate_context()
     n_ev = gate_reference()
     gate_scenarios()
     gate_chart()
