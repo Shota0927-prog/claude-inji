@@ -1349,6 +1349,69 @@ def sc_ze():
           not bad, str(bad))
 
 
+# ---------------------------------------------------------------------------- LAB-5: Zone touch notification
+NTF = "ZCL Zoneタッチ"
+
+
+def ntf_alerts(r):
+    return [(b, m) for b, m in r.alerts if m.startswith(NTF)]
+
+
+def sc_touch_ntf():
+    # Zones (width 2): A = 1H POC 2000 (1998-2002), B = 4H swing high 2020 (2018-2022), C = daily swing high 2003.5 (2001.5-2005.5, overlaps A)
+    FL = (1990.0, 1991.0, 1989.0, 1990.1)
+    def mk(rows, t0=T0):
+        sc = Sc(rows, t0=t0)
+        poc(sc, 1, 2000.0)
+        sw_feed(sc, 1, 2, True, 2020.0, 2)
+        sw_feed(sc, 1, 3, True, 2003.5, 1)
+        return sc
+    rows = [FL] * 12
+    rows[2] = (1990.0, 1998.5, 1989.0, 1990.0)     # wick into A only (close outside the band)
+    rows[3] = (1990.0, 1997.9, 1989.0, 1990.0)     # just below A: no touch
+    rows[4] = (1990.0, 1999.0, 1989.0, 1990.0)     # A again
+    rows[8] = (2010.0, 2019.0, 2009.0, 2010.0)     # B only
+    rows[9] = (1995.0, 1999.0, 1994.0, 1995.0)     # A again after B
+    rows[10] = (1999.0, 2002.0, 1998.5, 1999.0)    # A + C: only C is new
+    sc = mk(rows)
+    on = sc.run(**ONLY_TC, **{**QUIET, **NEW, "ntfTouch": True})
+    off = sc.run(**ONLY_TC, **{**QUIET, **NEW, "ntfTouch": False})
+    al = ntf_alerts(on)
+    bars = [b for b, _ in al]
+    msg = dict(al)
+    tc = lambda i: datetime.fromtimestamp((sc.bars[i]["t"] + M5) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    check("LB-78 Zone touch notification: a wick into A (close outside) notifies on that confirmed bar; a bar 0.1 below the band does "
+          "not; touching A again (bar 4) and the bars without contact (5-7) do not; B (bar 8) notifies; A after B (bar 9) notifies again; "
+          "a bar touching A and the new C notifies C only (A was just notified); the text has the symbol, the 5m close time and each "
+          "Zone's TF / type / band",
+          bars == [2, 8, 9, 10] and msg[2] == f"{NTF} XAUUSD {tc(2)} (5分足確定)\n1時間足 出来高POC  1998〜2002"
+          and msg[8].endswith("\n4時間足 水平線  2018〜2022") and msg[9].endswith("\n1時間足 出来高POC  1998〜2002")
+          and msg[10].endswith("\n日足 水平線  2001.5〜2005.5") and msg[10].count("\n") == 1 and ntf_alerts(off) == [],
+          str(al))
+    # several new Zones on one bar -> one alert with every Zone; a date change between contacts does not reset (A at 23:55, again at 00:10)
+    rows2 = [FL] * 10
+    rows2[2] = (1990.0, 2002.0, 1989.0, 1990.0)    # A + C together
+    rows2[3] = (1990.0, 1998.5, 1989.0, 1990.0)    # A only (already in the last notification)
+    rows2[7] = (1990.0, 1999.0, 1989.0, 1990.0)    # A after midnight
+    day = int(datetime(2026, 1, 5, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    sc2 = mk(rows2, t0=day - 4 * M5)               # bar 4 opens at 00:00
+    r2 = sc2.run(**ONLY_TC, **{**QUIET, **NEW, "ntfTouch": True})
+    a2 = ntf_alerts(r2)
+    check("LB-79 two new Zones touched on the same bar -> one alert listing both (1H POC and daily swing); then A alone (same bar group as the "
+          "last alert) and A again after the date change -> no alert (no reset by time or by bars without contact)",
+          [b for b, _ in a2] == [2] and "1時間足 出来高POC  1998〜2002" in a2[0][1] and "日足 水平線  2001.5〜2005.5" in a2[0][1]
+          and a2[0][1].count("\n") == 2, str(a2))
+    # ON / OFF: same orders, fills, waits, ledger (random path with the new defaults, Zone bands on)
+    scr = rand_bars(6, n=400)
+    a = lp.Runner(overrides=dict(NEW, zbUse2=False, dsZone=True, ntfTouch=True)).run(scr.bars)
+    b = lp.Runner(overrides=dict(NEW, zbUse2=False, dsZone=True, ntfTouch=False)).run(scr.bars)
+    other = lambda r: [x for x in r.alerts if not x[1].startswith(NTF)]
+    check("LB-80 notification ON / OFF gives identical orders, fills, waits, timings, legs, ledger and the other alerts (400 random bars, "
+          "new defaults); ON produced touch alerts, OFF none",
+          a.broker.log == b.broker.log and a.trace == b.trace and list(a["bkNet"]) == list(b["bkNet"]) and other(a) == other(b)
+          and len(ntf_alerts(a)) > 5 and ntf_alerts(b) == [] and len(entries(a)) > 0, f"{len(ntf_alerts(a))} {len(entries(a))}")
+
+
 def acc_feed(sc, k, boxes):
     """accum feed for TF k (1..3): boxes = [(i0, i1, u, l, id, forming)] held on bars i0..i1-1"""
     for i0, i1, u, l, aid, a in boxes:
@@ -2108,6 +2171,9 @@ MUTANTS = [
      "replaced POC's waits cancelled"),
     ("(z.aBar < bar_index or z.typ == 3)", "(z.aBar < bar_index)", "POC judged from its receiving bar"),
     ("b == 4 ? 16 : 32", "16", "ZE has its own type bit"),
+    ("                if not array.includes(lbNtfIds, z.id)\n", "                if true\n", "touch alert once per Zone"),
+    ("                array.clear(lbNtfIds)\n", "", "touch alert released by another Zone"),
+    ("    low <= z.top + EPS and high >= z.bot - EPS\n\n// この足", "    close <= z.top + EPS and close >= z.bot - EPS\n\n// この足", "touch alert on wicks"),
     ("                if not f_zeSame(k, fo, fe, fd, fi)\n", "                if true\n", "ZE unchanged wave keeps its Zones"),
     ("            else if stt == 2 or stt == 3 or stt == 8\n                f_zeClear(k)", "            else if stt == 8\n                f_zeClear(k)",
      "ZE hold / no wave removes the Zones"),
@@ -2119,7 +2185,7 @@ MUTANTS = [
 
 def mutation():
     scen = [sc_basic, sc_windows, sc_carry, sc_conflict, sc_roles, sc_combo, sc_fvg, sc_partial, sc_tp_mixed, sc_qty_table, sc_be, sc_lock_far, sc_and_only_sel, sc_sel_tp, sc_consume, sc_zones, sc_acc_keep, sc_dup_swing, sc_ta,
-            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref, sc_display, sc_fvg_display, sc_swing_merge, sc_names_labels, sc_poc_latest, sc_ze]
+            sc_session, sc_and_timing, sc_ledger, sc_zd_recv, sc_tp_ref, sc_display, sc_fvg_display, sc_swing_merge, sc_names_labels, sc_poc_latest, sc_ze, sc_touch_ntf]
     survived = []
     for old, new, what in MUTANTS:
         if SRC.count(old) != 1:
@@ -2172,6 +2238,7 @@ def main():
     sc_poc_latest()
     sc_ze_feed()
     sc_ze()
+    sc_touch_ntf()
     sc_ta()
     sc_session()
     sc_and_timing()

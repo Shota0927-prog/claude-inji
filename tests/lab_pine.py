@@ -206,6 +206,7 @@ class Runner:
             array__insert=self._insert,
             array__includes=lambda arr, v: v in arr, array__new_string=lambda n=0, v=None: [v] * n,
             array__join=lambda arr, sep=",": sep.join(arr),
+            syminfo__ticker="XAUUSD", syminfo__timezone="Etc/UTC",
             array__new=lambda n=0, v=None: [v] * n,     # array.new<T>(size, initial)
             array__min=lambda arr: min(arr) if arr else None, array__max=lambda arr: max(arr) if arr else None,
             label__set_x=_set("x"), label__style_label_left="left", text__align_left="left",
