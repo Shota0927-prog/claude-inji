@@ -1033,8 +1033,27 @@ def gate_draw():
         if names != ["ダブルトップ 1時間", "ダブルトップ 4時間", "ダブルトップ 日足"] or len({d.args[1] for d in labx[t]}) != 3:
             ok2 = False
             det2.append(("cross", t, names))
+    # two 1H tops (2000 and 1993) detected on the same bar by the same reversal bar (same body end) -> two labels, stacked
+    two = list(h1_base()) + [bx(1968, 1962), bx(1962, 1958), bx(1958, 1970), bx(1970, 1980), bx(1980, 1990), bx(1990, 1993),
+                             bx(1992, 1980), bx(1980, 1970), bx(1970, 1962), bx(1962, 1960)]
+    two = at(two, 28) + [S_OK, F, F]
+    h2 = [mk(two, H1), mk([flat] * 3, H4), mk([flat] * 3, DAY)]
+    f2 = Feeds(h2)
+    c2 = []
+    for b in h2[0]:
+        for s15 in range(4):
+            T = b["T"] + s15 * M15
+            c2.append(dict(T=T, C=T + M15, o=b["o"], h=b["h"], l=b["l"], c=b["c"]))
+    ch2 = Chart(f2, M15, dict(dsMaxGrp=80)).run(c2)
+    rec2 = [x for x in ch2.received() if x[0][5] == h2[0][28]["T"]]
+    lab2 = [d for d in ch2.env["_draws"] if d.kind == "label" and d.text.startswith("ダブルトップ 1時間")]
+    ok_same = len(rec2) == 2 and len(lab2) == 2 and lab2[0].args[0] == lab2[1].args[0] and lab2[0].args[1] != lab2[1].args[1]
+    if not ok_same:
+        ok2 = False
+        det2.append(("same TF same bar", len(rec2), [(d.args[0], d.args[1]) for d in lab2]))
     check("LT-D2 several detections received on the same chart bar: random series " + str(len(multi)) + " bars; constructed 1H + 4H + D "
-          "on one bar " + str(len(cross)) + " (each with its own settings): one label each with its TF (all kept), stacked at different prices",
+          "on one bar " + str(len(cross)) + " (each with its own settings) and two 1H tops detected by the same reversal bar: one label each "
+          "(all kept), stacked at different prices",
           ok2 and cross, str(det2[:3]))
 
     # label texts / tooltips are Japanese and carry id + TF; pivot note at the real pivot bar time
@@ -1304,6 +1323,11 @@ SCALE = {0: 1.0, 1: 2.0, 2: 4.0}         # 4H / D price settings = 2x / 4x the 1
 PFX = {0: "h1", 1: "h4", 2: "hd"}
 
 
+def fmt2(x):
+    """str.tostring(x, "#.##") as the harness formats it."""
+    return f"{x:.2f}".rstrip("0").rstrip(".")
+
+
 def scale_rows(rows, s):
     return [tuple(P0 + s * (x - P0) for x in r) for r in rows] if s != 1.0 else list(rows)
 
@@ -1519,6 +1543,7 @@ def gate_tf(k):
     lab = [d for d in labs if d.text.startswith(f"トリプルトップ {tfn}")]
     okd = (len(mk2) == 1 and "不採用" in mk2[0].text and "間隔不足" in getattr(mk2[0], "tooltip", mk2[0].kw.get("tooltip", ""))
            and "ヒゲを含む接触" in mk2[0].kw.get("tooltip", "") and f"{tfn}足" in mk2[0].kw.get("tooltip", "")
+           and f"基準帯 {fmt2(P0 - 5 * s_)}〜{fmt2(P0 + 5 * s_)}" in mk2[0].kw.get("tooltip", "")
            and abs(mk2[0].args[1] - s_ok[1]) < 1e-9
            and len(mk3) == 1 and "検知" in mk3[0].text and len(lab) == 1 and "実体による反転検知" in lab[0].kw.get("tooltip", "")
            and f"反転の判定足 ({tfn}足)" in lab[0].kw.get("tooltip", "")
