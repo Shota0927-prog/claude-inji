@@ -37,6 +37,8 @@
                    contact end), one signal per contact, nothing after the 3rd, limit / close first, 4H / D == 34db07f, only the two
                    files changed, 1H drawings (markers incl. ineligible with reasons, labels, restore after the cap)
                    (LTB-3 / LTB-6 1H gates were removed with the 1H rules they tested; LT-C / LT-B / LT-A / LT-D1 now cover 4H / D)
+  LT-W both      : (LTB-8) a 1H bar that is both a body peak and a body trough is not adopted (no base, series unchanged, two ids
+                   used) while existing bases are processed normally on it; mirrored data symmetric; without such a bar == 6c76710
   LT-M mutation  : mutations of the Pine file are caught by at least one check
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile / request.security / drawing limits / rendering not reproduced).
@@ -436,6 +438,11 @@ class Ref1:
             cb, left, right = self.bars[ctr], self.bars[ctr - N:ctr], self.bars[ctr + 1:i + 1]
             peak = all(bt(cb) >= bt(x) for x in left) and all(bt(cb) > bt(x) for x in right)
             trough = all(bb(cb) <= bb(x) for x in left) and all(bb(cb) < bb(x) for x in right)
+            if peak and trough:
+                # LTB-8: a bar that is both a peak and a trough is neither adopted in the series nor a base; both ids are used
+                self.next_id += 2
+                self.c("both_pivot_skipped")
+                peak = trough = False
             for side, ok in ((-1, peak), (1, trough)):
                 if not ok:
                     continue
@@ -1606,6 +1613,9 @@ MUTATIONS = [
     ("1H limit counted from the registration bar", "                if bi - g.pvBar > S.maxN\n", "                if bi - g.aBar > S.maxN\n"),
     ("1H chart: no marker for a contact", "        else if ty == \"C\"\n", "        else if ty == \"Cx\"\n"),
     ("1H chart: reasons not shown", "    out += str.contains(w, \"G\") ? \"／間隔不足\" : \"\"\n", ""),
+    ("1H both-pivot bar processed as a peak then a trough (LTB-7 rule)", "        if isH and isL\n            S.seq += 2\n        else\n",
+     "        if false\n            S.seq += 2\n        else\n"),
+    ("1H both-pivot bar consumes one id", "            S.seq += 2\n", "            S.seq += 1\n"),
     # infrastructure (request.security / chart side)
     ("lower chart gets the forming 4H bar", "f_ltCore(1, dvB4, dvD4, 1)", "f_ltCore(1, dvB4, dvD4, 0)"),
     ("1H chart takes offset 1 (delayed)", "string ltPk1 = ltSame1 ? ltPk1N : ltPk1C", "string ltPk1 = ltPk1C"),
@@ -1640,6 +1650,7 @@ def run_quick(src):
             gate_chart_quick()
             gate_body()
             gate_h1()
+            gate_both()
             cur = context_checks(SRC, "mutation")
             for k, v in cur.items():
                 check("m-" + k, v[0], v[1])
@@ -2142,6 +2153,94 @@ def gate_h1():
           okd and okr, str((okd, okr)))
 
 
+# ============================================================================
+# LTB-8: a 1H bar that is both a body peak and a body trough
+# ============================================================================
+LTB7_COMMIT = "6c76710"
+
+
+def gate_both():
+    base = h1_base()
+    X = bx(2004, 1950, up=1, dn=1)          # gapped open: body top 2004 (highest of +-4), body bottom 1950 (lowest of +-4)
+    rows = at(base, 17) + [X, F, F, F, S_OK, F]
+    ok_sc, det = True, []
+    norm_runs = []
+    for mir in (False, True):
+        rr = mirror(rows) if mir else rows
+        bars = mk(rr, H1)
+        d = Det(0)
+        snaps = []
+        for b in bars:
+            d.step(b)
+            S = d.S
+            snaps.append((S.sSide, S.sP, S.aSide, S.aP, S.seq))
+        r = ref_for(0).run(bars)
+        ev, act = det_events(d)
+        lv = 4000 - P0 if mir else P0
+        side = 1 if mir else -1
+        mine = ev_lv(ev, lv, side)
+        Rx = [e for _, e in ev if e[0] == "R" and e[3] in (2004.0, 1950.0, 1996.0, 2050.0)]
+        exp = ([(i, e[0]) for i, e in mine if e[0] != "R"] == [(17, "C"), (17, "D"), (21, "C"), (21, "E")]
+               and [(e[5], e[8], e[9]) for _, e in mine if e[0] == "C"] == [(2, 1, ""), (3, 0, "G")]
+               and [(e[5], e[8]) for _, e in mine if e[0] == "D"] == [(2, 0)])
+        series_kept = snaps[21][:4] == snaps[20][:4] and snaps[21][4] == snaps[20][4] + 2
+        if not (ev == r.events and act == r.act and exp and not Rx and series_kept and d.S.seq == r.next_id - 1
+                and r.cov.get("both_pivot_skipped") == 1):
+            ok_sc = False
+            det.append((mir, exp, Rx, series_kept, snaps[20], snaps[21], [x for x in mine][:8]))
+        flip = lambda x: x if x is None else 4000 - x                                   # noqa: E731
+        norm_runs.append([(i, e[0], e[1]) + ((e[5], e[8], e[9]) if e[0] == "C" else (e[5], e[8]) if e[0] == "D" else
+                                              (flip(e[3]) if mir else e[3],) if e[0] == "R" else ()) for i, e in ev])
+    sym = norm_runs[0] == norm_runs[1]
+    check("LT-W1 a bar that is both a body peak and a body trough (bar 17, confirmed on bar 21): no base from it and the reference "
+          "series unchanged on bar 21 (only the id counter +2); the existing base still contacts / detects on that bar (2nd, double "
+          "on bar 17) and ends normally on the confirmation bar (3rd contact, gap 4 -> ineligible); == the reference",
+          ok_sc, str(det[:2]))
+    check("LT-W2 the mirrored data gives the mirrored result (same bars / ids / counts / reasons, levels reflected)", sym)
+    # control: the same bar made a peak only (body bottom 1970) -> it is adopted and changes the series
+    rows_c = at(base, 17) + [bx(2004, 1970, up=1, dn=1), F, F, F, S_OK, F]
+    d = Det(0)
+    sn = []
+    for b in mk(rows_c, H1):
+        d.step(b)
+        sn.append((d.S.sSide, d.S.sP))
+    check("LT-W3 control: the same bar as a peak only (body bottom 1970) is adopted on bar 21 (series -> peak 2004)",
+          sn[20] != sn[21] and sn[21] == (-1, 2004.0), str((sn[20], sn[21])))
+    # 4: without such a bar the results equal LTB-7 (6c76710); with one they may differ; 4H / D unchanged
+    prev = prev_src(LTB7_COMMIT)
+    n_same = n_with = n_diff_with = 0
+    ok4 = True
+    for piv in (1, 2, 4):
+        for gp_p in (0.05, 0.6):
+            for seed in range(5):
+                bars = rand_tf(9900 + 100 * piv + seed, 900, H1, 4.0, gaps=True, gap_p=gp_p)
+                ov = dict(h1Piv=piv, h1Dist=10.0)
+                cur = Det(0, ov).run(bars)
+                old = Det(0, ov, prev).run(bars)
+                both = ref_for(0, ov).run(bars).cov.get("both_pivot_skipped", 0)
+                if both == 0:
+                    n_same += 1
+                    if cur.blocks != old.blocks:
+                        ok4 = False
+                else:
+                    n_with += 1
+                    n_diff_with += cur.blocks != old.blocks
+            for seed in range(3):
+                bars = rand_tf(9950 + 100 * piv + seed, 900, H1, 4.0, gaps=False)
+                ov = dict(h1Piv=piv, h1Dist=10.0)
+                n_same += 1
+                if Det(0, ov).run(bars).blocks != Det(0, ov, prev).run(bars).blocks:
+                    ok4 = False
+    for k, (tf, scale) in ((1, (H4, 8.0)), (2, (DAY, 16.0))):
+        for seed in range(3):
+            bars = rand_tf(9990 + 10 * k + seed, 900, tf, scale, gaps=True, gap_p=0.6)
+            if Det(k).run(bars).blocks != Det(k, None, prev).run(bars).blocks:
+                ok4 = False
+    check(f"LT-W4 1H series without a both-peak-and-trough bar == {LTB7_COMMIT} block by block ({n_same} series incl. continuous); "
+          f"series with one: {n_with} ({n_diff_with} differ); 4H / D == {LTB7_COMMIT} on heavily gapped series",
+          ok4 and n_same > 0 and n_with > 0 and n_diff_with > 0)
+
+
 def context_checks(src, label):
     """the request.security context rule applied to `src` (resolver: each call's arguments and the globals reached by them /
     the core body / the logic functions evaluated in the requested TF; the chart side with the chart's built-ins), then the
@@ -2248,6 +2347,7 @@ def main():
     gate_body()
     gate_attrib()
     gate_h1()
+    gate_both()
     if "--no-mutation" not in sys.argv:
         gate_mutation()
     ok = 0
