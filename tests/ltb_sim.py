@@ -25,6 +25,12 @@
                    checks run on the previous version (db654f5) must flag its defect
                    Limit: the rule is applied as documented, to global declarations and the core's arguments; TradingView's own
                    evaluation is not run
+  LT-T max bars  : (LTB-3) 1H maximum monitoring bars counted from the real pivot bar (pivot = 0) in 1H bar_index: ages 23 / 24
+                   allowed, 25 ends the base before any judgement (also while waiting with a reversal), no extension by the 2nd
+                   approach / detection / expiry, 3rd within the same limit, no revival, market gaps counted in 1H bars, limit
+                   below the pivot bars -> not registered with the id consumed, a ~3-month-old base detected with the limit OFF and
+                   excluded with it ON; limit OFF == the previous version (bbea6b1) block by block; 4H / D unchanged with it ON;
+                   drawings made before the end kept, a held waiting marker reads 基準期限切れ; display / cap independent
   LT-M mutation  : mutations of the Pine file are caught by at least one check
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile / request.security / drawing limits / rendering not reproduced).
@@ -107,7 +113,12 @@ class Det:
         m = re.search(r'request\.security\(ltTk, "(?:60|240|D)",\s*f_ltCore\(%d, (\w+), (\w+),' % k, self.src)
         if m:                                             # the inputs the request.security call of this TF passes
             buf, dist = m.group(1), m.group(2)
-        self.S = e["ltNew"](k, e["dvPiv"], e["dvWait"], e[buf], e[dist])
+        # the detector is made as f_ltCore makes it: the arguments of its `var LtTf S = ltNew(...)` evaluated with this call's
+        # k / buf / dist and the inputs (LTB-3: the 1H-only maximum-bars arguments come from this line too)
+        m = re.search(r"var LtTf S = ltNew\((.*)\)", code_only(self.src))
+        loc = dict(k=k, buf=e[buf], dist=e[dist])
+        args = [eval(ap.expr(a), e, loc) for a in ap.split_top(m.group(1))]
+        self.S = e["ltNew"](*args)
         self.k, self.n = k, 0
         self.blocks = []
 
@@ -142,8 +153,8 @@ def norm(f):
         return ("A", int(f[1]), int(f[2]), float(f[3]), int(f[4]), int(f[7]), int(f[8]), float(f[10]), int(f[11]))
     if ty == "D":
         return ("D", int(f[1]), int(f[2]), float(f[3]), int(f[4]), int(f[7]), int(f[8]), int(f[11]), int(f[13]))
-    if ty == "V":
-        return ("V", int(f[1]), int(f[2]))
+    if ty in ("V", "T"):
+        return (ty, int(f[1]), int(f[2]))
     return (ty, int(f[1]))
 
 
@@ -161,8 +172,9 @@ def det_events(d):
 # independent reference (written from the spec, not from the Pine text)
 # ============================================================================
 class Ref:
-    def __init__(self, piv, wait, buf, dist):
+    def __init__(self, piv, wait, buf, dist, max_on=False, max_n=0):
         self.N, self.wait, self.buf, self.dist = piv, wait, buf, dist
+        self.max_on, self.max_n = max_on, max_n          # LTB-3 (1H): age = bars since the pivot bar (pivot = 0)
         self.bars, self.bases, self.next_id = [], [], 1
         self.events, self.act = [], []
         self.cov = {}
@@ -181,15 +193,23 @@ class Ref:
             cb = self.bars[ctr]
             right = self.bars[ctr + 1:i + 1]
             others = [x for j, x in enumerate(win) if j != N]
-            if all(cb["h"] > x["h"] for x in others):
+            # LTB-3: at registration the pivot is already N bars old; a limit below N -> not monitored, its id still used
+            skip = self.max_on and N > self.max_n
+            if all(cb["h"] > x["h"] for x in others) and skip:
+                self.next_id += 1
+                self.c("max_reg_skip")
+            elif all(cb["h"] > x["h"] for x in others):
                 g = dict(id=self.next_id, side=-1, lvl=cb["h"], pvT=cb["T"], cfT=b["T"], cfTc=b["C"], reg=i,
-                         away=cb["h"] - min(x["l"] for x in right) >= self.dist - EPS, cnt=1, wait=False, app=None)
+                         away=cb["h"] - min(x["l"] for x in right) >= self.dist - EPS, cnt=1, wait=False, app=None, pv=ctr)
                 self.next_id += 1
                 self.bases.append(g)
                 out.append(("R", g["id"], -1, g["lvl"], g["pvT"], g["cfT"], g["cfTc"]))
-            if all(cb["l"] < x["l"] for x in others):
+            if all(cb["l"] < x["l"] for x in others) and skip:
+                self.next_id += 1
+                self.c("max_reg_skip")
+            elif all(cb["l"] < x["l"] for x in others):
                 g = dict(id=self.next_id, side=1, lvl=cb["l"], pvT=cb["T"], cfT=b["T"], cfTc=b["C"], reg=i,
-                         away=max(x["h"] for x in right) - cb["l"] >= self.dist - EPS, cnt=1, wait=False, app=None)
+                         away=max(x["h"] for x in right) - cb["l"] >= self.dist - EPS, cnt=1, wait=False, app=None, pv=ctr)
                 self.next_id += 1
                 self.bases.append(g)
                 out.append(("R", g["id"], 1, g["lvl"], g["pvT"], g["cfT"], g["cfTc"]))
@@ -198,6 +218,14 @@ class Ref:
                 self.c("skip_registration_bar")
                 continue
             top = g["side"] == -1
+            if self.max_on and i - g["pv"] > self.max_n:
+                out.append(("T", g["id"], 1 if g["wait"] else 0))
+                self.c("max_end_waiting" if g["wait"] else "max_end")
+                if g["wait"] and ((b["c"] < b["o"]) if top else (b["c"] > b["o"])):
+                    self.c("max_end_over_reversal")
+                self.bases.remove(g)
+                out.append(("E", g["id"]))
+                continue
             # mirror to a "top" view: s = +1 top, prices compared as s * x
             s = 1 if top else -1
             hi, lo = (b["h"], b["l"]) if top else (b["l"], b["h"])     # the extreme toward / away from the level
@@ -278,7 +306,7 @@ def ref_for(k, ov=None):
     inp = ap.inputs(SRC)
     inp.update(ov or {})
     b, d = PARAMS[k]
-    return Ref(inp["dvPiv"], inp["dvWait"], inp[b], inp[d])
+    return Ref(inp["dvPiv"], inp["dvWait"], inp[b], inp[d], k == 0 and inp["dvMxOn1"], inp["dvMxN1"])
 
 
 # ============================================================================
@@ -322,7 +350,8 @@ def gate_reference():
     n_ev = n_det = 0
     bad = []
     settings = [{}, dict(dvWait=0), dict(dvWait=1), dict(dvWait=5), dict(dvPiv=2), dict(dvPiv=6),
-                dict(dvD1=0.0, dvD4=0.0, dvDD=0.0), dict(dvB1=0.0, dvB4=0.0, dvBD=0.0), dict(dvPiv=2, dvWait=2)]
+                dict(dvD1=0.0, dvD4=0.0, dvDD=0.0), dict(dvB1=0.0, dvB4=0.0, dvBD=0.0), dict(dvPiv=2, dvWait=2),
+                dict(dvMxOn1=False), dict(dvMxN1=4), dict(dvMxN1=3), dict(dvMxN1=10, dvWait=5), dict(dvMxN1=1, dvPiv=1)]
     for k, (tf, scale) in enumerate(zip(TF_MS, (4.0, 8.0, 16.0))):
         for si, ov in enumerate(settings):
             for seed in range(3):
@@ -338,10 +367,11 @@ def gate_reference():
     print(f"  [LT-R] events compared {n_ev}, detections {n_det}, mismatches {len(bad)}")
     print("  [LT-R] coverage: " + ", ".join(f"{k}={v}" for k, v in sorted(cov.items())))
     check("LT-R1 1H / 4H / D: translated Pine detector == independent reference on every event and every bar's active-base count "
-          "(9 settings x 3 seeds x float / grid prices x 3 TFs)", not bad and n_det > 0, str(bad[:3]))
+          "(14 settings incl. 1H max bars OFF / 24 / 10 / 4 / 3 / 1 x 3 seeds x float / grid prices x 3 TFs)", not bad and n_det > 0, str(bad[:3]))
     need = ["top_x2", "top_x3", "bot_x2", "bot_x3", "det_app", "det_later", "det_last_wait_bar", "expired_x2", "expired_x3",
             "invalidated", "invalidated_waiting", "invalidation_beats_reversal", "wick_beyond_not_invalid", "skip_registration_bar",
-            "touch_without_separation", "approach_bar_range_not_separation", "ended_after_3rd", "multi_det_same_bar"]
+            "touch_without_separation", "approach_bar_range_not_separation", "ended_after_3rd", "multi_det_same_bar",
+            "max_end", "max_end_waiting", "max_end_over_reversal", "max_reg_skip"]
     miss = [x for x in need if cov.get(x, 0) == 0]
     check("LT-R2 coverage on the random series: every rule occurred (" + ", ".join(need) + ")", not miss, str(miss))
     return n_ev
@@ -1140,7 +1170,7 @@ def gate_static():
           "(1H chart -> offset 0, else offset 1)", ok)
     core = s[s.index("f_ltCore(int k"):s.index("string ltPk1N")]
     logic = code_only(section(SRC, LB, LE))
-    ok2 = ("var LtTf S = ltNew(k, dvPiv, dvWait, buf, dist)" in core and "out[off]" in core and
+    ok2 = ("var LtTf S = ltNew(k, dvPiv, dvWait, buf, dist, k == 0 and dvMxOn1, dvMxN1)" in core and "out[off]" in core and
            "ltStep(S, open, high, low, close, time, time_close, bar_index)" in core and
            not re.search(r"\bds\w+", core + logic) and "request.security" not in logic
            and not re.search(r"\blt(ChartOk|ChSec|Same1|TimeBar|Off1)\b|timeframe\.|chart\.", core + logic))
@@ -1151,10 +1181,11 @@ def gate_static():
     check("LT-S3 chart support (chart side): time-based charts <= 1H only; otherwise nothing is taken / drawn and the table asks to switch", ok3)
     inp = ap.inputs(s)
     want = dict(dvPiv=4, dvWait=3, dvB1=5.0, dvD1=15.0, dvB4=10.0, dvD4=30.0, dvBD=20.0, dvDD=60.0, dsTf1=True, dsTf4=False,
-                dsTfD=False)
-    check("LT-S4 defaults: pivot 4, wait 3, 1H 5 / 15, 4H 10 / 30, D 20 / 60; display 1H ON, 4H OFF, D OFF",
-          all(inp.get(k) == v for k, v in want.items()), str({k: inp.get(k) for k in want}))
-    ok5 = (not re.search(r"dvMx|dvB0|dvD0|最大離れ幅制限|\b15分", s) and "rMin := math.min(rMin, low)" not in s
+                dsTfD=False, dvMxOn1=True, dvMxN1=24)
+    check("LT-S4 defaults: pivot 4, wait 3, 1H 5 / 15, 4H 10 / 30, D 20 / 60; display 1H ON, 4H OFF, D OFF; 1H max bars ON / 24 (min 1)",
+          all(inp.get(k) == v for k, v in want.items()) and 'dvMxN1  = input.int(24, "1時間足の最大監視本数", minval = 1,' in s,
+          str({k: inp.get(k) for k in want}))
+    ok5 = (not re.search(r"dvMxUse|dvMx0|dvB0|dvD0|最大離れ幅制限|\b15分", s) and "rMin := math.min(rMin, low)" not in s
            and "is5mChart" not in s and "dvh1" not in s)
     check("LT-S5 not carried over: 5M base / 15M base / 5M max distance / the chart-bar high-low added to the initial distance / "
           "chart-side accumulation of delivered HTF values", ok5)
@@ -1189,6 +1220,18 @@ MUTATIONS = [
     ("4H detector gated by the chart support (LTB-1 bug)", "    string blk = ltStep(S, open, high, low, close, time, time_close, bar_index)\n",
      "    string blk = ltChartOk ? ltStep(S, open, high, low, close, time, time_close, bar_index) : \"\"\n"),
     ("no dedupe of received blocks", "take := na(lT) or sT > lT", "take := true"),
+    ("max bars counted from the registration bar", "pvBar = bi - S.piv)\n                array.push(S.bases, gh)",
+     "pvBar = bi)\n                array.push(S.bases, gh)"),
+    ("max bars: the 25th bar still allowed", "if S.maxOn and bi - g.pvBar > S.maxN", "if S.maxOn and bi - g.pvBar > S.maxN + 1"),
+    ("max bars: reversal while waiting beats the end", "if S.maxOn and bi - g.pvBar > S.maxN",
+     "if S.maxOn and bi - g.pvBar > S.maxN and not (g.waiting and (top ? c < o : c > o))"),
+    ("max bars extended by an approach", "                        g.appBar := bi\n",
+     "                        g.appBar := bi\n                        g.pvBar := bi\n"),
+    ("max bars applied to 4H / D too", "k == 0 and dvMxOn1, dvMxN1)", "dvMxOn1, dvMxN1)"),
+    ("limit below the pivot bars still registered", "bool mxReg = S.maxOn and S.piv > S.maxN", "bool mxReg = false"),
+    ("id not consumed when not registered", "            S.seq += 1\n            if not mxReg\n                LtBase gh",
+     "            if not mxReg\n                S.seq += 1\n                LtBase gh"),
+    ("held waiting marker not updated on the end", 'ltStat(r, "基準期限切れ")', 'ltStat(r, "反転待ち")'),
     ("chart processes unconfirmed executions", "if barstate.isconfirmed and ltChartOk\n", "if ltChartOk\n"),
     ("one block per packet", 'string out = prevBlk == "" ? blk : prevBlk + ";" + blk', "string out = blk"),
     ("cap drops the late approach marker", "    if lost\n        ltAppMk(r, \"検知\")\n", ""),
@@ -1213,6 +1256,7 @@ def run_quick(src):
             gate_draw()
             gate_gap()
             gate_chart_quick()
+            gate_maxbars()
             cur = context_checks(SRC, "mutation")
             for k, v in cur.items():
                 check("m-" + k, v[0], v[1])
@@ -1255,6 +1299,230 @@ def gate_mutation():
         else:
             caught += 1
     check(f"LT-M1 mutations caught {caught}/{len(MUTATIONS)}", not missed, str(missed))
+
+
+# ============================================================================
+# LTB-3: 1H maximum monitoring bars (from the real pivot bar, 1H bar_index)
+# ============================================================================
+PREV_COMMIT = "bbea6b1"          # LTB-2 (before the maximum bars)
+
+
+def prev_src():
+    return subprocess.run(["git", "show", PREV_COMMIT + ":LongTermDoubleTripleTopBottomXAU.pine"], cwd=ROOT, capture_output=True,
+                          text=True, check=True).stdout
+
+
+def run_rows(rows, ov=None, k=0, src=None, times=None):
+    bars = mk(rows, TF_MS[k]) if times is None else [dict(T=T, C=T + TF_MS[k], o=o, h=h, l=l, c=c)
+                                                    for T, (o, h, l, c) in zip(times, rows)]
+    d = Det(k, ov, src).run(bars)
+    r = ref_for(k, ov).run(bars)
+    ev, act = det_events(d)
+    return ev, (ev == r.events and act == r.act), d
+
+
+def gate_maxbars():
+    inp = ap.inputs(SRC)
+    B, D = inp["dvB1"], inp["dvD1"]
+    H = 2000.0
+    base = top_base(H, D)                    # pivot bar index 4, registration bar 8
+    P = 4
+    F = (1975.0, 1978.0, 1972.0, 1976.0)     # filler: away from the level, no touch, identical bars (no pivots)
+    Ab = (H - B - 1, H - B + 1, H - B - 3, H - B - 2)        # touch + bearish
+    Au = (H - B - 3, H - B + 0.5, H - B - 4, H - B - 1)      # touch + bullish (-> waiting)
+    Wu = (H - B - 2, H - B - 1, H - B - 3, H - B - 1.5)      # no touch, bullish (waiting continues)
+    Wd = (H - B - 1, H - B - 0.5, H - B - 4, H - B - 3)      # no touch, bearish (reversal while waiting)
+    Sep = (H - B - 2, H - B - 1, H - D - 10, H - D - 9)      # re-separation, no touch
+    N = inp["dvMxN1"]
+
+    def at_age(age, pre=()):                                 # rows such that the NEXT appended bar is `age` bars after the pivot bar
+        rows = base + list(pre)
+        rows += [F] * (P + age - len(rows))
+        return rows
+
+    assert len(at_age(N + 1)) - 1 - P == N, "helper: the appended bar is at age N + 1"
+    res = {}
+    det = []
+
+    def case(name, rows, exp_on, exp_off=None, ov_on=None):
+        ok = True
+        for mir in (False, True):
+            rr = mirror(rows) if mir else rows
+            ev_on, same_on, _ = run_rows(rr, ov_on)
+            good = same_on and exp_on(ev_on)
+            if exp_off is not None:
+                ev_off, same_off, _ = run_rows(rr, dict(dvMxOn1=False))
+                good = good and same_off and exp_off(ev_off)
+            if not good:
+                ok = False
+                det.append((name, "bottom" if mir else "top", ev_on[-6:]))
+        res[name] = ok
+
+    last = lambda rows: len(rows) - 1                                                    # noqa: E731
+    # 2 / 3: ages 23 / 24 allowed, 25 ends before the approach; counted from the pivot bar (registration + 21 = age 25)
+    for age in (N - 1, N):
+        r = at_age(age) + [Ab]
+        case(f"approach at age {age} detected", r, lambda ev, r=r: dets(ev) == [(last(r), 2, 0)])
+    r25 = at_age(N + 1) + [Ab]
+    case(f"approach at age {N + 1} not detected, base ended there (registration bar + {N + 1 - 4} < registration + {N})", r25,
+         lambda ev: not dets(ev) and not kinds(ev, "A") and kinds(ev, "T") == [last(r25)] and kinds(ev, "E") == [last(r25)],
+         lambda ev: dets(ev) == [(last(r25), 2, 0)])
+    # 4 / 5: double detected early, re-separation, 3rd at age 24 allowed / at age 25 not
+    pre = [Ab, Sep]
+    r3a = at_age(N, pre) + [Ab]
+    case("double then triple at age 24 detected (no extension by the 2nd)", r3a,
+         lambda ev: dets(ev) == [(9, 2, 0), (last(r3a), 3, 0)])
+    r3b = at_age(N + 1, pre) + [Ab]
+    case("double then 3rd touch at age 25 not detected (the 2nd detection did not extend the limit)", r3b,
+         lambda ev: dets(ev) == [(9, 2, 0)] and kinds(ev, "T") == [last(r3b)],
+         lambda ev: dets(ev) == [(9, 2, 0), (last(r3b), 3, 0)])
+    pre_x = [Au, Wu, Wu, Wu, Sep]                            # 2nd approach expired (no extension by the expiry either)
+    r3c = at_age(N + 1, pre_x) + [Ab]
+    case("2nd expired, 3rd touch at age 25 not detected", r3c,
+         lambda ev: not dets(ev) and kinds(ev, "X") == [12] and kinds(ev, "T") == [last(r3c)])
+    # 6: waiting when the age passes 24; the reversal bar at age 25 -> base ended (waiting flag 1), no detection
+    r6 = at_age(N - 1) + [Au, Wu, Wd]
+    case("waiting: the bar beyond the limit ends the base before the reversal", r6,
+         lambda ev: not dets(ev) and [e for _, e in ev if e[0] == "T" and e[1] == 1] == [("T", 1, 1)],
+         lambda ev: dets(ev) == [(last(r6), 2, 2)])
+    # 8: no revival after the end
+    r8 = at_age(N + 1) + [Ab, Sep, Ab, Ab]
+    case("no revival: touches / reversals after the end give nothing", r8,
+         lambda ev: not [e for i, e in ev if e[1] == 1 and e[0] in ("A", "D", "X", "V") and i > P + N])
+    # market gaps: ages are 1H bars that exist (a 60-hour gap counts as one bar step)
+    rows = at_age(N) + [Ab]
+    times = []
+    t = 1_790_006_400_000
+    for i in range(len(rows)):
+        times.append(t)
+        t += H1 * (60 if i == 12 else 1)
+    ev_g, same_g, _ = run_rows(rows, None, times=times)
+    res["gap: age counted in 1H bars, not hours"] = same_g and dets(ev_g) == [(len(rows) - 1, 2, 0)]
+    # 7: limit below the pivot's right-side bars -> never registered, ids still consumed; limit == pivot bars -> registered
+    ok7 = True
+    for seed in range(3):
+        bars = rand_tf(7000 + seed, 600, H1, 4.0)
+        d3, d4, doff = Det(0, dict(dvMxN1=3)).run(bars), Det(0, dict(dvMxN1=4)).run(bars), Det(0, dict(dvMxOn1=False)).run(bars)
+        e3, e4, eo = (det_events(x)[0] for x in (d3, d4, doff))
+        ids4 = [e[1] for _, e in e4 if e[0] == "R"]
+        idso = [e[1] for _, e in eo if e[0] == "R"]
+        reg4 = {e[1]: i for i, e in e4 if e[0] == "R"}
+        end4 = {e[1]: i for i, e in e4 if e[0] == "E"}
+        if [e for _, e in e3 if e[0] != "B"] or d3.S.seq != doff.S.seq or d3.S.bases or ids4 != idso \
+                or any(end4.get(g, 10 ** 9) > reg4[g] + 1 for g in reg4 if end4.get(g) is not None) \
+                or not all(g in end4 for g in reg4 if reg4[g] < len(bars) - 2):
+            ok7 = False
+            det.append(("limit below pivot bars", seed, d3.S.seq, doff.S.seq, len(ids4), len(idso)))
+    res["limit 3 < pivot 4: nothing registered, ids consumed (seq equal to OFF); limit 4: same ids as OFF, ended 1 bar after registration"] = ok7
+    # months-ago base (about 3 months of 1H bars below, then a return): OFF detects it, ON excludes it
+    far = [(1900.0, 1903.0, 1897.0, 1901.0)] * 1500
+    climb = [(1901 + 10 * j, 1911 + 10 * j, 1900 + 10 * j, 1910 + 10 * j) for j in range(8)]
+    rm = base + far + climb + [Ab]
+    ok_m = True
+    for mir in (False, True):
+        rr = mirror(rm) if mir else rm
+        ev_on, s_on, _ = run_rows(rr)
+        ev_off, s_off, _ = run_rows(rr, dict(dvMxOn1=False))
+        if not (s_on and s_off and dets(ev_off) == [(len(rm) - 1, 2, 0)] and not dets(ev_on) and kinds(ev_on, "T") == [P + N + 1]):
+            ok_m = False
+            det.append(("months ago", mir, dets(ev_off), dets(ev_on), kinds(ev_on, "T")))
+    res["base ~1500 1H bars (about 3 months) old: OFF detects the return, ON ends it at age 25 and detects nothing"] = ok_m
+    for nm, ok in res.items():
+        check("LT-T " + nm, ok, str([x for x in det if x[0] in nm][:2]) if not ok else "")
+
+    # 1: limit OFF == previous version (LTB-2) on events and active counts; 10: 4H / D unchanged with the limit ON
+    try:
+        old = prev_src()
+    except (OSError, subprocess.CalledProcessError) as ex:
+        check("LT-T1 previous version available", False, str(ex))
+        return
+    ok1, ok10, n1 = True, True, 0
+    for k, (tf, scale) in enumerate(zip(TF_MS, (4.0, 8.0, 16.0))):
+        for seed in range(3):
+            for ovx in ({}, dict(dvWait=1, dvPiv=2)):
+                bars = rand_tf(8000 + 10 * k + seed, 900, tf, scale)
+                o = Det(k, ovx or None, old).run(bars)
+                n_off = Det(k, dict(ovx, dvMxOn1=False)).run(bars)
+                n_on = Det(k, ovx or None).run(bars)
+                n1 += len(o.blocks)
+                if n_off.blocks != o.blocks:
+                    ok1 = False
+                if k > 0 and n_on.blocks != o.blocks:
+                    ok10 = False
+    b5, htf, feeds_new = build(12, days=60, scale=1.2)
+    feeds_old = Feeds(htf, None, old)
+    feeds_off = Feeds(htf, dict(dvMxOn1=False))
+    c15 = [b for b in agg(b5, M15) if b["T"] >= b5[0]["T"] + 20 * DAY]
+    ch_new = Chart(feeds_new, M15).run(c15)
+    ch_old = Chart(feeds_old, M15, src=old).run(c15)
+    ch_off = Chart(feeds_off, M15, dict(dvMxOn1=False)).run(c15)
+    rk = lambda ch, ks: [x for x in ch.received() if x[0][0] in ks]                     # noqa: E731
+    ok1 = ok1 and rk(ch_off, (0, 1, 2)) == rk(ch_old, (0, 1, 2))
+    ok10 = ok10 and rk(ch_new, (1, 2)) == rk(ch_old, (1, 2)) and [b for b in ch_new.blocks if b[0] > 0] == [b for b in ch_old.blocks if b[0] > 0]
+    n_cut = len(rk(ch_old, (0,))) - len(rk(ch_new, (0,)))
+    check(f"LT-T1 limit OFF == {PREV_COMMIT} (LTB-2) at the same settings: every block (events + active-base count) of 1H / 4H / D on "
+          f"random series ({n1} bars) and the detections received on a 15M chart", ok1)
+    check(f"LT-T10 limit ON: 4H / D blocks (events + active counts) and received 4H / D detections == {PREV_COMMIT}; on the 1H the "
+          f"limit removed {n_cut} detections in this series", ok10 and n_cut > 0, str(n_cut))
+    ages_ok = True
+    for i, blk in enumerate(feeds_new[0].det.blocks):
+        _, es = parse_block(blk)
+        for e in es:
+            if e[0] == "D":
+                pv_i = next(j for j, b in enumerate(htf[0]) if b["T"] == e[4])
+                if i - pv_i > N:
+                    ages_ok = False
+    check("LT-T11 every 1H detection on the 70-day series lies within 24 1H bars of its pivot bar (1H bar_index, not chart bars / time)",
+          ages_ok)
+
+    # 9: drawings — detections / approach markers / lines made before the end stay; a held waiting marker becomes 基準期限切れ
+    def chart_of(rows, ov=None):
+        # one filler 1H bar after the case, so the case's last 1H block is delivered to the 15M chart
+        hx = [mk(list(rows) + [F], H1), mk([(1950, 1951, 1949, 1950)] * 3, H4), mk([(1950, 1951, 1949, 1950)] * 2, DAY)]
+        fx = Feeds(hx, ov)
+        cb = []
+        for b in hx[0]:
+            for q in range(4):
+                T = b["T"] + q * M15
+                cb.append(dict(T=T, C=T + M15, o=b["o"], h=b["h"], l=b["l"], c=b["c"]))
+        return Chart(fx, M15, ov).run(cb), fx
+
+    ok9 = True
+    chA, fA = chart_of(r3b)
+    live = [d for d in chA.env["_draws"] if not d.deleted]
+    if not (any(d.kind == "label" and d.text.startswith("ダブルトップ 1時間") for d in live)
+            and any(d.kind == "label" and d.text.startswith("1時間#1 2回目") for d in live)
+            and any(d.kind == "line" and d.kw.get("style") == "dashed" for d in live)
+            and not any(d.text.startswith("トリプル") for d in chA.env["_draws"] if d.kind == "label")
+            and chA.env["ltNAct"][0] == det_events(fA[0].det)[1][-2]
+            and 1 not in {g.id for g in fA[0].det.S.bases}):
+        ok9 = False
+        det.append(("history after the end", [d.text[:20] for d in live]))
+    chB, _ = chart_of(r6)
+    mk6 = [d for d in chB.env["_draws"] if d.kind == "label" and d.text.startswith("1時間#1 2回目")]
+    if not (mk6 and not mk6[-1].deleted and mk6[-1].text.endswith("基準期限切れ")):
+        ok9 = False
+        det.append(("waiting marker", [d.text for d in mk6]))
+    # a marker already removed by the cap is not recreated just to show the end
+    chC, _ = chart_of(r6, dict(dsMaxGrp=1, dsAllB=True))
+    mkC = [d for d in chC.env["_draws"] if d.kind == "label" and d.text.startswith("1時間#1 2回目")]
+    if len(mkC) != 1:
+        ok9 = False
+        det.append(("recreated marker", [(d.text, d.deleted) for d in mkC]))
+    check("LT-T9 drawings: the double label, its approach marker and line made before the end stay after the 1H base ends; a held "
+          "waiting marker reads 基準期限切れ; a marker removed by the cap is not recreated; the table's active count excludes ended bases",
+          ok9, str(det[-3:]))
+    # 12: display settings / drawing cap do not change the limit's results
+    ok12 = True
+    for ov in (dict(dsTf1=False), dict(dsMaxGrp=1), dict(dsAllB=True, dsMaxGrp=2)):
+        fz = Feeds(htf, ov)
+        if fz[0].outs != feeds_new[0].outs:
+            ok12 = False
+        chz = Chart(fz, M15, ov).run(c15)
+        if chz.events != ch_new.events or chz.env["ltNAct"] != ch_new.env["ltNAct"]:
+            ok12 = False
+    check("LT-T12 display OFF / cap 1 / all bases + cap 2: 1H blocks (incl. T / E events), received events and active counts unchanged",
+          ok12)
 
 
 def context_checks(src, label):
@@ -1360,6 +1628,7 @@ def main():
     gate_forming()
     gate_gap()
     gate_draw()
+    gate_maxbars()
     if "--no-mutation" not in sys.argv:
         gate_mutation()
     ok = 0
