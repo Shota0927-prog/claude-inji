@@ -1717,7 +1717,7 @@ def gate_body():
     ok6, n6 = True, 0
     for k, (tf, scale) in ((1, (H4, 8.0)), (2, (DAY, 16.0))):           # LTB-7: 4H / D body rules (1H: gate_h1)
         for seed in range(3):
-            for ov in (None, dict(dvMxOn1=False), dict(dvWait=0, dvPiv=2)):
+            for ov in (None, dict(dvWait=0, dvPiv=2), dict(dvWait=1)):
                 bars = rand_tf(9100 + 10 * k + seed, 800, tf, scale, grid=0.5 if seed == 2 else None)
                 rnd = random.Random(seed + 77 * k)
                 alt = [dict(b, h=max(b["o"], b["c"]) + rnd.choice([0.0, rnd.uniform(0, 5 * scale)]),
