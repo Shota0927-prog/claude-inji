@@ -912,8 +912,8 @@ def gate_chart():
         ids = {k: sorted({e[1] for _, e in det_events(cores[k].det)[0] if e[0] == "R"}) for k in range(3)}
         # ids are per TF: 4H / D start at 1; 1H (LTB-7: every confirmed pivot candidate consumes an id) equals the 1H reference
         # run on the 1H bars alone
-        ref1 = sorted({e[1] for _, e in ref_for(0).run(htf[0]).events if e[0] == "R"})
-        if any(ids[k] and ids[k][0] != 1 for k in (1, 2)) or ids[0] != ref1:
+        refs = {k: sorted({e[1] for _, e in ref_for(k).run(htf[k]).events if e[0] == "R"}) for k in range(3)}
+        if any(ids[k] != refs[k] for k in range(3)):
             ok_tf = False
             det.append((seed, "id sequence not per TF"))
         print(f"  [LT-X] seed {seed}: detections 1H {len(full[0])} / 4H {len(full[1])} / D {len(full[2])}; common-range events "
@@ -929,8 +929,8 @@ def gate_chart():
           "no counter, no drawing", ok_rt, str(det[:3]))
     check("LT-X6 display OFF (all TFs), cap 1, all-bases + cap 3: received events and counters unchanged; the detector outputs are "
           "unchanged by display inputs; nothing drawn when every TF is hidden", ok_disp, str(det[:3]))
-    check("LT-X7 TF states not mixed: the 1H detector alone == the 1H detector next to 4H / D; ids per TF (4H / D start at 1, 1H == "
-          "its reference on the 1H bars alone)", ok_tf,
+    check("LT-X7 TF states not mixed: the 1H detector alone == the 1H detector next to 4H / D; ids per TF (each TF's ids == its "
+          "reference run on that TF's bars alone)", ok_tf,
           str(det[:3]))
     check("LT-X8 complete data: no gap counted", ok_gap, str(det[:3]))
 
