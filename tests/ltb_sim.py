@@ -35,6 +35,11 @@
                    reversal colour (never a doji); approach / label prices are body ends; the 1H distance default 30 used at its
                    exact boundary. LT-T1 / T10 compare the previous wick versions (bbea6b1 / d78ebf3) on the same bars without
                    wicks, where the wick and body rules coincide (the differences come from the wicks only)
+  LT-P ties      : (LTB-5) continuous data (every open == the previous close, no added gap): two / three / four equal body ends ->
+                   one base on the last of them, registered N bars later; flat -> none; base -> approach -> detection on continuous
+                   bars; the 1H maximum bars counted from the representative pivot; 1H / 4H / D bases and detections on continuous 5M
+  LT-A attrib    : the difference to the old wick version split into its causes by reducing the current file: wick -> body (equal
+                   to d78ebf3 on bars without wicks), the upper band edge (only on bars with an opening gap), the pivot ties
   LT-M mutation  : mutations of the Pine file are caught by at least one check
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile / request.security / drawing limits / rendering not reproduced).
@@ -207,11 +212,15 @@ class Ref:
             ctr = i - N
             cb = self.bars[ctr]
             right = self.bars[ctr + 1:i + 1]
-            others = self.bars[ctr - N:ctr] + right
+            left = self.bars[ctr - N:ctr]
+            others = left + right
             skip = self.max_on and N > self.max_n          # LTB-3: limit below the pivot's right bars -> id used, not monitored
-            is_top = all(bt(cb) > bt(x) for x in others)
-            is_bot = all(bb(cb) < bb(x) for x in others)
-            if is_top and not all(cb["h"] > x["h"] for x in others):
+            # LTB-5: ties allowed on the left, strict on the right (the last of equal bodies is the pivot)
+            is_top = all(bt(cb) >= bt(x) for x in left) and all(bt(cb) > bt(x) for x in right)
+            is_bot = all(bb(cb) <= bb(x) for x in left) and all(bb(cb) < bb(x) for x in right)
+            if (is_top and any(bt(cb) == bt(x) for x in left)) or (is_bot and any(bb(cb) == bb(x) for x in left)):
+                self.c("left_tie_pivot")
+            if is_top and not all(cb["h"] > x["h"] for x in others):  # noqa: E501
                 self.c("body_pivot_not_wick_pivot")
             for side, ok_side in ((-1, is_top), (1, is_bot)):
                 if not ok_side:
@@ -339,7 +348,7 @@ def ref_for(k, ov=None):
 # ============================================================================
 # series
 # ============================================================================
-def rand_tf(seed, n, tf_ms, scale, grid=None, t0=1_790_000_000_000):
+def rand_tf(seed, n, tf_ms, scale, grid=None, t0=1_790_000_000_000, gaps=True, gap_p=0.05):
     rnd = random.Random(seed)
     p, out = 2000.0, []
     reg, left = 0.0, 0
@@ -347,7 +356,8 @@ def rand_tf(seed, n, tf_ms, scale, grid=None, t0=1_790_000_000_000):
         if left <= 0:
             reg, left = rnd.choice([0.0, 0.0, 0.35, -0.35]) * scale, rnd.randint(10, 80)
         left -= 1
-        o = p + (rnd.gauss(0, 3 * scale) if rnd.random() < 0.05 else 0.0)      # occasional opening gap
+        jump = rnd.gauss(0, 3 * scale) if rnd.random() < gap_p else 0.0
+        o = p + (jump if gaps else 0.0)                                         # occasional opening gap (gaps=False: open == close)
         c = o + reg + rnd.gauss(0, scale)
         h = max(o, c) + abs(rnd.gauss(0, 0.5 * scale))
         l = min(o, c) - abs(rnd.gauss(0, 0.5 * scale))
@@ -383,8 +393,8 @@ def gate_reference():
     for k, (tf, scale) in enumerate(zip(TF_MS, (4.0, 8.0, 16.0))):
         for si, ov in enumerate(settings):
             for seed in range(3):
-                for grid in (None, 0.5 if k == 0 else 1.0):
-                    bars = rand_tf(1000 * k + 10 * si + seed, 900, tf, scale, grid)
+                for grid, gp in ((None, True), (0.5 if k == 0 else 1.0, True), (None, False)):
+                    bars = rand_tf(1000 * k + 10 * si + seed, 900, tf, scale, grid, gaps=gp)
                     ok, why, r, d = compare(k, bars, ov)
                     n_ev += len(r.events)
                     n_det += sum(1 for _, e in r.events if e[0] == "D")
@@ -395,13 +405,13 @@ def gate_reference():
     print(f"  [LT-R] events compared {n_ev}, detections {n_det}, mismatches {len(bad)}")
     print("  [LT-R] coverage: " + ", ".join(f"{k}={v}" for k, v in sorted(cov.items())))
     check("LT-R1 1H / 4H / D: translated Pine detector == independent reference on every event and every bar's active-base count "
-          "(17 settings incl. 1H max bars OFF / 24 / 12 / 10 / 8 / 4 / 3 / 1 and 1H distance 30 / 15 / 10 x 3 seeds x float / grid prices x 3 TFs; body rules)", not bad and n_det > 0, str(bad[:3]))
+          "(17 settings incl. 1H max bars OFF / 24 / 12 / 10 / 8 / 4 / 3 / 1 and 1H distance 30 / 15 / 10 x 3 seeds x float / grid prices with opening gaps + continuous (open == previous close) x 3 TFs; body rules, LTB-5 pivot ties)", not bad and n_det > 0, str(bad[:3]))
     need = ["top_x2", "top_x3", "bot_x2", "bot_x3", "det_app", "det_later", "det_last_wait_bar", "expired_x2", "expired_x3",
             "invalidated", "invalidated_waiting", "invalidation_beats_reversal", "wick_beyond_not_invalid", "skip_registration_bar",
             "touch_without_separation", "approach_bar_range_not_separation", "ended_after_3rd", "multi_det_same_bar",
             "max_end", "max_end_waiting", "max_end_over_reversal", "max_reg_skip",
             "body_pivot_not_wick_pivot", "wick_only_initial_distance", "wick_only_touch", "body_beyond_band_no_approach",
-            "wick_only_separation", "doji_at_approach", "doji_while_waiting"]
+            "wick_only_separation", "doji_at_approach", "doji_while_waiting", "left_tie_pivot"]
     miss = [x for x in need if cov.get(x, 0) == 0]
     check("LT-R2 coverage on the random series: every rule occurred (" + ", ".join(need) + ")", not miss, str(miss))
     return n_ev
@@ -523,10 +533,14 @@ def gate_scenarios():
                    lambda ev: dets(ev) == [(R + 6, 3, 0)] and kinds(ev, "X") == [R + 4] and kinds(ev, "E") == [R + 6])
             yield ("double detected, re-separation, triple detected -> both, base ended on the triple", base + [x.Ab, x.Sep, x.Ab],
                    lambda ev: dets(ev) == [(R + 1, 2, 0), (R + 3, 3, 0)] and kinds(ev, "E") == [R + 3])
-            yield ("a left bar whose body top equals the peak's (tie) -> no base at H",
+            T_of = lambda i: 1_790_006_400_000 + i * TF_MS[k]                                # noqa: E731
+            R_H = lambda ev: [(i, e[4]) for i, e in ev if e[0] == "R" and e[3] == H]             # noqa: E731
+            yield ("LTB-5 left tie (a left bar's body top equals the peak's) -> base at H, pivot bar 4, registered on bar 8",
                    [r if j != 2 else bx(H - 3, H) for j, r in enumerate(base)] + [x.Ab],
-                   lambda ev: not [e for _, e in ev if e[0] == "R" and e[3] == (H if e[2] == -1 else 4000 - H)]
-                   and not [e for _, e in ev if e[0] == "D"])
+                   lambda ev: R_H(ev) == [(R, T_of(4))] and dets(ev) == [(R + 1, 2, 0)])
+            yield ("LTB-5 right tie (a right bar's body top equals the peak's) -> the later bar (6) is the pivot, registered on bar 10",
+                   [r if j != 6 else bx(H - 3, H) for j, r in enumerate(base)] + [x.Sep, x.Sep, x.Ab],
+                   lambda ev: R_H(ev) == [(10, T_of(6))] and [i for i, e in ev if e[0] == "D" and e[3] == H] == [11])
             yield ("initial distance reached by the right bars' wicks only (bodies shallow) -> no approach",
                    base[:5] + [bx(H - 10, H - 12, dn=D + 10)] * 4 + [x.Ab] * 2,
                    lambda ev: not kinds(ev, "A") and not dets(ev))
@@ -591,10 +605,9 @@ def gate_scenarios():
 # ============================================================================
 # chart simulation (request.security emulation + the translated CHART section)
 # ============================================================================
-def market5(seed, days, scale=1.0, gap=0.3):
-    """5M bars; each opens at the previous close plus a small random gap (gauss, gap x scale). LTB-4: with gap 0 (every open ==
-    the previous close) a strict body-top peak / body-bottom trough cannot occur at all (a bar's open is in the left neighbour's
-    body, its close in the right neighbour's), so the chart checks use small realistic opening gaps."""
+def market5(seed, days, scale=1.0, gap=0.0):
+    """5M bars; by default continuous: every bar opens exactly at the previous close (LTB-5: no opening gap is added to make pivots
+    possible; the pivot tie rule handles it). gap > 0 adds a random opening gap (gauss, gap x scale)."""
     rnd = random.Random(seed)
     p, out, t0 = 2000.0, [], 1_790_000_000_000 // DAY * DAY
     reg, left = 0.0, 0
@@ -1281,7 +1294,10 @@ def gate_static():
 # mutations
 # ============================================================================
 MUTATIONS = [
-    ("pivot ties accepted", "isH := isH and mh > array.get(S.hs, j)", "isH := isH and mh >= array.get(S.hs, j)"),
+    ("right-side pivot ties accepted (top)", "isH := isH and mh > array.get(S.hs, j)", "isH := isH and mh >= array.get(S.hs, j)"),
+    ("right-side pivot ties accepted (bottom)", "isL := isL and ml < array.get(S.ls, j)", "isL := isL and ml <= array.get(S.ls, j)"),
+    ("left-side pivot ties rejected (top, LTB-4 rule)", "isH := isH and mh >= array.get(S.hs, j)", "isH := isH and mh > array.get(S.hs, j)"),
+    ("left-side pivot ties rejected (bottom, LTB-4 rule)", "isL := isL and ml <= array.get(S.ls, j)", "isL := isL and ml < array.get(S.ls, j)"),
     ("registration bar not skipped", "if g.aBar < bi", "if g.aBar <= bi"),
     ("approach bar range re-separates", "(na(g.appBar) or g.appBar != bi) and", "true and"),
     ("reversal before invalidation", "if top ? c > g.lvl + S.buf + EPS : c < g.lvl - S.buf - EPS",
@@ -1346,6 +1362,7 @@ def run_quick(src):
             gate_chart_quick()
             gate_maxbars()
             gate_body()
+            gate_ties()
             cur = context_checks(SRC, "mutation")
             for k, v in cur.items():
                 check("m-" + k, v[0], v[1])
@@ -1522,23 +1539,25 @@ def gate_maxbars():
     for nm, ok in res.items():
         check("LT-T " + nm, ok, str([x for x in det if x[0] in nm][:2]) if not ok else "")
 
-    # 1 / 10 (LTB-4): the previous wick versions are compared on the SAME bars with the wicks removed (high = body top, low =
-    # body bottom), where a wick rule and a body rule must coincide: limit OFF == bbea6b1 (LTB-2), limit ON == d78ebf3
-    # (LTB-3), 1H distance 30 given to the old versions. This also shows the difference to them comes from the wicks only.
+    # 1 / 10: the previous wick versions on the SAME bars with the wicks removed equal the current file REDUCED to their
+    # other rules (variant "onesided": strict pivots both sides, approach band without the upper edge — see variants()):
+    # limit OFF == bbea6b1 (LTB-2), limit ON == d78ebf3 (LTB-3), 1H distance 30 given to the old versions. This isolates the
+    # wick -> body part; the upper band edge and the pivot ties are attributed separately in gate_attrib().
     try:
         old2, old3 = prev_src(), prev_src(LTB3_COMMIT)
     except (OSError, subprocess.CalledProcessError) as ex:
         check("LT-T1 previous versions available", False, str(ex))
         return
     ok1, ok10, n1 = True, True, 0
+    VO = variants()["onesided"]
     for k, (tf, scale) in enumerate(zip(TF_MS, (4.0, 8.0, 16.0))):
         for seed in range(3):
             for ovx in ({}, dict(dvWait=1, dvPiv=2)):
                 bars = rand_tf(8000 + 10 * k + seed, 900, tf, scale)
                 o2 = Det(k, dict(ovx, dvD1=30.0), old2).run(wickless(bars))
                 o3 = Det(k, dict(ovx, dvD1=30.0), old3).run(wickless(bars))
-                n_off = Det(k, dict(ovx, dvMxOn1=False)).run(bars)
-                n_on = Det(k, ovx or None).run(bars)
+                n_off = Det(k, dict(ovx, dvMxOn1=False), VO).run(bars)
+                n_on = Det(k, ovx or None, VO).run(bars)
                 n1 += len(bars)
                 if n_off.blocks != o2.blocks:
                     ok1 = False
@@ -1551,19 +1570,22 @@ def gate_maxbars():
     feeds_off = Feeds(htf, dict(dvMxOn1=False))
     c15 = [b for b in agg(b5, M15) if b["T"] >= b5[0]["T"] + 20 * DAY]
     ch_new = Chart(feeds_new, M15).run(c15)
+    ch_vo = Chart(Feeds(htf, None, VO), M15, src=VO).run(c15)
+    ch_vo_off = Chart(Feeds(htf, dict(dvMxOn1=False), VO), M15, dict(dvMxOn1=False), src=VO).run(c15)
     ch_o3 = Chart(feeds_o3, M15, dict(dvD1=30.0), src=old3).run(c15)
     ch_o2 = Chart(feeds_o2, M15, dict(dvD1=30.0), src=old2).run(c15)
     ch_off = Chart(feeds_off, M15, dict(dvMxOn1=False)).run(c15)
     rk = lambda ch, ks: [x for x in ch.received() if x[0][0] in ks]                     # noqa: E731
-    ok1 = ok1 and rk(ch_off, (0, 1, 2)) == rk(ch_o2, (0, 1, 2))
-    ok10 = ok10 and rk(ch_new, (0, 1, 2)) == rk(ch_o3, (0, 1, 2)) and ch_new.blocks == ch_o3.blocks
+    ok1 = ok1 and rk(ch_vo_off, (0, 1, 2)) == rk(ch_o2, (0, 1, 2))
+    ok10 = ok10 and rk(ch_vo, (0, 1, 2)) == rk(ch_o3, (0, 1, 2)) and ch_vo.blocks == ch_o3.blocks
     n_cut = len(rk(ch_off, (0,))) - len(rk(ch_new, (0,)))
     # the limit leaves 4H / D untouched (same bars, limit ON vs OFF)
     ok10 = ok10 and all(feeds_off[k].outs == feeds_new[k].outs for k in (1, 2))
-    check(f"LT-T1 limit OFF == {PREV_COMMIT} (LTB-2, wick rules) on the same bars without wicks, 1H distance 30: every block of "
-          f"1H / 4H / D ({n1} random bars) and the detections received on a 15M chart", ok1)
-    check(f"LT-T10 limit ON == {LTB3_COMMIT} (LTB-3) on the same bars without wicks; 4H / D blocks identical with the 1H limit ON / "
-          f"OFF; the limit removed {n_cut} 1H detections in this series", ok10 and n_cut > 0, str(n_cut))
+    check(f"LT-T1 limit OFF: the current file reduced to strict pivots + one-sided band == {PREV_COMMIT} (LTB-2, wick rules) on the "
+          f"same bars without wicks, 1H distance 30: every block of 1H / 4H / D ({n1} random bars) and the detections received on a "
+          f"15M chart", ok1)
+    check(f"LT-T10 limit ON: the same reduction == {LTB3_COMMIT} (LTB-3) on the same bars without wicks; 4H / D blocks identical "
+          f"with the 1H limit ON / OFF; the limit removed {n_cut} 1H detections in this series", ok10 and n_cut > 0, str(n_cut))
     ages_ok = True
     for i, blk in enumerate(feeds_new[0].det.blocks):
         _, es = parse_block(blk)
@@ -1692,6 +1714,193 @@ def gate_body():
           "below) -> no approach; exactly 30 -> approach and detection (top and bottom)", ok30)
 
 
+# ============================================================================
+# LTB-5: pivot ties on continuous data + attribution of the differences to the old wick version
+# ============================================================================
+STRICT_PIVOT = [("isH := isH and mh >= array.get(S.hs, j)", "isH := isH and mh > array.get(S.hs, j)"),
+                ("isL := isL and ml <= array.get(S.ls, j)", "isL := isL and ml < array.get(S.ls, j)")]
+ONE_SIDED = [("bu >= g.lvl - S.buf - EPS and bu <= g.lvl + S.buf + EPS", "bu >= g.lvl - S.buf - EPS"),
+             ("bd >= g.lvl - S.buf - EPS and bd <= g.lvl + S.buf + EPS)", "bd <= g.lvl + S.buf + EPS)")]
+
+
+def variants():
+    """the current file reduced step by step (text edits of the two rules, in memory):
+       strict   = pivots strict on both sides (the LTB-4 rule; no left ties)
+       onesided = strict + approach band without the upper edge (top: body top >= H - B only; the wick versions' form)"""
+    def edit(src, pairs):
+        for a, b in pairs:
+            assert src.count(a) == 1, a
+            src = src.replace(a, b)
+        return src
+    strict = edit(SRC, STRICT_PIVOT)
+    return dict(current=SRC, strict=strict, onesided=edit(strict, ONE_SIDED))
+
+
+def cont(closes, o0, up=1.0, dn=1.0):
+    """continuous bars: each opens exactly at the previous close (the first at o0)."""
+    rows, o = [], o0
+    for c in closes:
+        rows.append(bx(o, c, up, dn))
+        o = c
+    return rows
+
+
+def is_cont(bars):
+    return all(bars[i]["o"] == bars[i - 1]["c"] for i in range(1, len(bars)))
+
+
+def gate_ties():
+    inp = ap.inputs(SRC)
+    N = inp["dvPiv"]
+    res, det = {}, []
+    k = 0
+    peak = [1970, 1975, 1980, 1985, 1990, 2000, 1990, 1980, 1970, 1960, 1950]      # bars 5 (bullish) / 6 (bearish): body tops 2000
+
+    def one(name, rows, exp, ov=None):
+        ok = True
+        for mir in (False, True):
+            rr = mirror(rows) if mir else rows
+            bars = mk(rr, H1)
+            assert is_cont(bars), name
+            ev, same, _ = run_rows(rr, ov)
+            if not (same and exp(ev, bars, mir)):
+                ok = False
+                det.append((name, mir, [e for e in ev if e[1][0] in ("R", "A", "D", "T")][:6]))
+        res[name] = ok
+
+    lvl = lambda mir: 4000 - 2000 if mir else 2000                                          # noqa: E731
+    R_at = lambda ev, L: [(i, e[4]) for i, e in ev if e[0] == "R" and e[3] == L]          # noqa: E731
+    D_at = lambda ev, L: [(i, e[5], e[8]) for i, e in ev if e[0] == "D" and e[3] == L]    # noqa: E731
+    # 2 / 3 / 6: bullish -> bearish with equal body tops (bottom: the mirror, bearish -> bullish with equal body bottoms)
+    one("2 / 3 / 6: two equal body ends (bullish then bearish; mirrored for the trough) -> one base, pivot = the later bar (6), "
+        "registered exactly N bars after it (bar 10), nothing earlier",
+        cont(peak, 1965), lambda ev, b, m: R_at(ev, lvl(m)) == [(6 + N, b[6]["T"])])
+    # 4: three and four equal body ends (dojis in between) -> one base on the last of them
+    for n_eq in (3, 4):
+        cl = [1970, 1975, 1980, 1985, 1990] + [2000] * (n_eq - 1) + [1990, 1980, 1970, 1960, 1950]
+        lastb = 5 + n_eq - 1
+        one(f"4: {n_eq} equal body ends -> exactly one base, pivot = the last equal bar ({lastb})", cont(cl, 1965),
+            lambda ev, b, m, lastb=lastb: R_at(ev, lvl(m)) == [(lastb + N, b[lastb]["T"])])
+    # 5: flat (all bodies equal, with and without wicks) -> no base at all
+    one("5: flat, every body the same price (dojis) -> no base", cont([2000.0] * 30, 2000.0),
+        lambda ev, b, m: not [e for e in ev if e[1][0] == "R"])
+    one("5: flat with wicks of varying size -> no base", [bx(2000.0, 2000.0, 1 + j % 5, 1 + (j * 3) % 7) for j in range(30)],
+        lambda ev, b, m: not [e for e in ev if e[1][0] == "R"])
+    # 7: continuous double top / bottom: base, approach (bullish bar into the band -> waiting), bearish next bar -> detection
+    dbl = peak + [1955, 1970, 1985, 1997, 1990]
+    one("7: continuous data: base -> approach (bullish into the band, waiting) -> bearish next bar detects (bottom: mirrored)",
+        cont(dbl, 1965), lambda ev, b, m: D_at(ev, lvl(m)) == [(len(dbl) - 1, 2, 1)])
+    # 8: the 1H maximum bars count from the representative pivot (bar 6), not from the first equal bar (5)
+    for m_f, want in ((16, True), (17, False)):
+        cl = peak + [1955] * m_f + [1970, 1985, 1997, 1990]
+        app = 11 + m_f + 2
+        one(f"8: approach at age {app - 6} from bar 6 (age {app - 5} from bar 5), bearish at age {app + 1 - 6} -> "
+            + ("detected" if want else "ended before (T), no detection"), cont(cl, 1965),
+            lambda ev, b, m, want=want, app=app: (D_at(ev, lvl(m)) == [(app + 1, 2, 1)]) if want
+            else (not D_at(ev, lvl(m)) and [i for i, e in ev if e[0] == "T" and e[1] == 1] == [app + 1]))
+    for nm, ok in res.items():
+        check("LT-P " + nm, ok, str([x for x in det if x[0] == nm][:2]) if not ok else "")
+    # 1 / 7 / 9: continuous 5M data -> 1H / 4H / D: bases, approaches and detections of both sides occur on every TF, every
+    # detection bar has the reversal colour, and nothing in it has an opening gap
+    b5, htf, feeds = build(12, days=70, scale=3.0)
+    okc = is_cont(b5) and all(is_cont(h) for h in htf[:2])
+    cnt = {}
+    for kk in range(3):
+        for i, blk in enumerate(feeds[kk].det.blocks):
+            for e in parse_block(blk)[1]:
+                if e[0] in ("R", "A", "D"):
+                    key = (kk, e[0], e[2])
+                    cnt[key] = cnt.get(key, 0) + 1
+                if e[0] == "D":
+                    b = htf[kk][i]
+                    if not ((b["c"] < b["o"]) if e[2] == -1 else (b["c"] > b["o"])):
+                        okc = False
+    need = [(kk, ty, sd) for kk in (0, 1) for ty in ("R", "A", "D") for sd in (-1, 1)] + [(2, "R", -1), (2, "R", 1)]
+    miss = [x for x in need if not cnt.get(x)]
+    summary = ", ".join(f"{TFJA[kk]} R {cnt.get((kk, 'R', -1), 0)}/{cnt.get((kk, 'R', 1), 0)} A {cnt.get((kk, 'A', -1), 0)}/"
+                        f"{cnt.get((kk, 'A', 1), 0)} D {cnt.get((kk, 'D', -1), 0)}/{cnt.get((kk, 'D', 1), 0)}" for kk in range(3))
+    print("  [LT-P] continuous 5M data (open == previous close everywhere), top / bottom counts: " + summary)
+    check("LT-P1/7 continuous data (5M and the 1H / 4H bars: open == previous close everywhere, no added gap): bases, approaches "
+          "and detections of tops and bottoms occur on 1H and 4H (D: bases), every detection with the reversal colour; " + summary,
+          okc and not miss, str(miss))
+
+
+def gate_attrib():
+    """split the difference between the old wick version (d78ebf3 on bars WITHOUT wicks) and the current file into its causes."""
+    V = variants()
+    old3 = prev_src(LTB3_COMMIT)
+    ltb4 = prev_src("0b5b683")
+    rows_out = []
+    ok_eq_old, ok_eq_ltb4, ok_upper_explained = True, True, True
+    stats = {}
+    for gaps, gp in ((True, 0.05), (True, 0.5), (False, 0.0)):
+        st = dict(bars=0, d_old=0, d_onesided=0, d_strict=0, d_cur=0, diff_upper=0, diff_tie=0, R_strict=0, R_cur=0)
+        for k, (tf, scale) in enumerate(zip(TF_MS, (4.0, 8.0, 16.0))):
+            for seed in range(4):
+                bars = rand_tf(9500 + 10 * k + seed, 900, tf, scale, gaps=gaps, gap_p=gp or 0.05)
+                o = Det(k, dict(dvD1=30.0), old3).run(wickless(bars))
+                vo = Det(k, None, V["onesided"]).run(bars)
+                vs = Det(k, None, V["strict"]).run(bars)
+                vc = Det(k, None, V["current"]).run(bars)
+                l4 = Det(k, None, ltb4).run(bars)
+                st["bars"] += len(bars)
+                ev = {nm: det_events(d)[0] for nm, d in (("o", o), ("vo", vo), ("vs", vs), ("vc", vc))}
+                st["d_old"] += sum(1 for _, e in ev["o"] if e[0] == "D")
+                st["d_onesided"] += sum(1 for _, e in ev["vo"] if e[0] == "D")
+                st["d_strict"] += sum(1 for _, e in ev["vs"] if e[0] == "D")
+                st["d_cur"] += sum(1 for _, e in ev["vc"] if e[0] == "D")
+                st["R_strict"] += sum(1 for _, e in ev["vs"] if e[0] == "R")
+                st["R_cur"] += sum(1 for _, e in ev["vc"] if e[0] == "R")
+                if o.blocks != vo.blocks:
+                    ok_eq_old = False
+                if l4.blocks != vs.blocks:
+                    ok_eq_ltb4 = False
+                # the upper band edge: the first bar where onesided and strict differ must have, for some active separated base
+                # not waiting, the judged body end beyond the band while the close stays inside (no invalidation)
+                if vo.blocks != vs.blocks:
+                    st["diff_upper"] += 1
+                    i = next(j for j in range(len(bars)) if vo.blocks[j] != vs.blocks[j])
+                    b = bars[i]
+                    bt, bb = max(b["o"], b["c"]), min(b["o"], b["c"])
+                    B = ap.inputs(SRC)[PARAMS[k][0]]
+                    lv = [(e[2], e[3]) for _, e in ev["vs"] if e[0] == "R"]
+                    if not any((bt > L + B + EPS and b["c"] <= L + B + EPS) if sd == -1 else (bb < L - B - EPS and b["c"] >= L - B - EPS)
+                               for sd, L in lv):
+                        ok_upper_explained = False
+                if vs.blocks != vc.blocks:
+                    st["diff_tie"] += 1
+        stats[("gaps %d%%" % round(gp * 100)) if gaps else "continuous"] = st
+    for nm, st in stats.items():
+        rows_out.append(f"{nm}: {st['bars']} bars, detections old(wickless) {st['d_old']} = onesided {st['d_onesided']} -> "
+                        f"+upper edge {st['d_strict']} -> +left ties {st['d_cur']}; bases strict {st['R_strict']} -> ties {st['R_cur']}; "
+                        f"series changed by the upper edge {st['diff_upper']}, by the ties {st['diff_tie']}")
+    print("  [LT-A] " + "\n  [LT-A] ".join(rows_out))
+    check("LT-A1 wick -> body: the old wick version (d78ebf3) on the bars without wicks == the current file reduced to strict pivots + "
+          "the one-sided band, block by block (gapped and continuous series, 1H / 4H / D)", ok_eq_old)
+    check("LT-A2 the 'strict' reduction == LTB-4 (0b5b683) block by block (the reduction reconstructs the previous version)", ok_eq_ltb4)
+    c = stats["continuous"]
+    check("LT-A3 upper band edge (a separate change, not part of the body switch): every series it changes first differs on a bar whose "
+          "body end passes beyond the band while the close stays inside; on continuous data it changes nothing "
+          f"(gaps on 5% of bars: {stats['gaps 5%']['diff_upper']} / 12 series changed, gaps on 50%: {stats['gaps 50%']['diff_upper']} / 12, "
+          f"continuous: {c['diff_upper']} / 12)",
+          ok_upper_explained and c["diff_upper"] == 0 and stats["gaps 50%"]["diff_upper"] > 0)
+    check(f"LT-A4 pivot ties (LTB-5): on continuous data the strict rule finds no base at all ({c['R_strict']}) and the tie rule finds "
+          f"{c['R_cur']} with {c['d_cur']} detections", c["R_strict"] == 0 and c["R_cur"] > 0 and c["d_cur"] > 0)
+    # constructed: a gapped bearish bar opening above the band and closing inside -> old (one-sided, wickless) detects, current not
+    H, B, D = 2000.0, ap.inputs(SRC)["dvB1"], ap.inputs(SRC)["dvD1"]
+    rows = top_base(H, D) + [bx(H + B + 1, H + B - 1)]
+    ok5 = True
+    for mir in (False, True):
+        rr = mirror(rows) if mir else rows
+        bars = mk(rr, H1)
+        e_old = det_events(Det(0, dict(dvD1=30.0), old3).run(wickless(bars)))[0]
+        e_cur = det_events(Det(0).run(bars))[0]
+        if not (dets(e_old) == [(len(rows) - 1, 2, 0)] and not dets(e_cur)):
+            ok5 = False
+    check("LT-A5 constructed (needs an opening gap): bearish bar opening above H + buffer and closing inside -> the old one-sided rule "
+          "(wickless) detects, the current two-sided band does not (top and bottom)", ok5)
+
+
 def context_checks(src, label):
     """the request.security context rule applied to `src` (resolver: each call's arguments and the globals reached by them /
     the core body / the logic functions evaluated in the requested TF; the chart side with the chart's built-ins), then the
@@ -1797,6 +2006,8 @@ def main():
     gate_draw()
     gate_maxbars()
     gate_body()
+    gate_ties()
+    gate_attrib()
     if "--no-mutation" not in sys.argv:
         gate_mutation()
     ok = 0
