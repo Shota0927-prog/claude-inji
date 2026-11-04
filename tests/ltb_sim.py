@@ -530,6 +530,10 @@ def gate_scenarios():
             yield ("initial distance reached by the right bars' wicks only (bodies shallow) -> no approach",
                    base[:5] + [bx(H - 10, H - 12, dn=D + 10)] * 4 + [x.Ab] * 2,
                    lambda ev: not kinds(ev, "A") and not dets(ev))
+            yield ("the pivot bar's own body (top H down to H - distance - 5) is not part of the initial distance; right bodies "
+                   "shallow -> no approach",
+                   base[:4] + [bx(H, H - D - 5, up=3)] + [bx(H - 10, H - 12)] * 4 + [x.Ab] * 2,
+                   lambda ev: [e for _, e in ev if e[0] == "R" and e[3] == H] and not [e for _, e in ev if e[0] in ("A", "D") and e[3] == H])
             # LTB-4 body rules
             yield ("pivot by the body top: a left bar's wick above H does not prevent the base; level = body top H (not the wick)",
                    [r if j != 2 else bx(H - 27, H - 25, up=40) for j, r in enumerate(base)] + [x.Ab],
