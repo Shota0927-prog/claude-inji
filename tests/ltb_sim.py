@@ -40,6 +40,9 @@
                    bars; the 1H maximum bars counted from the representative pivot; 1H / 4H / D bases and detections on continuous 5M
   LT-A attrib    : the difference to the old wick version split into its causes by reducing the current file: wick -> body (equal
                    to d78ebf3 on bars without wicks), the upper band edge (only on bars with an opening gap), the pivot ties
+  LT-F filters   : (LTB-6) 1H formation width (M bars before the pivot, body ends, >= with EPS, short history / OFF) and minimum
+                   bars from the pivot to an approach (early touch clears the separation without count / wait / event, the early
+                   bar does not re-separate); both OFF == 79f21a3; independence of the two; 4H / D unchanged
   LT-M mutation  : mutations of the Pine file are caught by at least one check
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile / request.security / drawing limits / rendering not reproduced).
@@ -124,7 +127,8 @@ class Det:
             buf, dist = m.group(1), m.group(2)
         # the detector is made as f_ltCore makes it: the arguments of its `var LtTf S = ltNew(...)` evaluated with this call's
         # k / buf / dist and the inputs (LTB-3: the 1H-only maximum-bars arguments come from this line too)
-        m = re.search(r"var LtTf S = ltNew\((.*)\)", code_only(self.src))
+        line = next(x for _, x in ap.logical_lines(self.src) if x.startswith("var LtTf S = ltNew("))
+        m = re.search(r"var LtTf S = ltNew\((.*)\)", line)
         loc = dict(k=k, buf=e[buf], dist=e[dist])
         args = [eval(ap.expr(a), e, loc) for a in ap.split_top(m.group(1))]
         self.S = e["ltNew"](*args)
@@ -184,9 +188,11 @@ class Ref:
     """independent reference (LTB-4 body rules): every price judgement on the target bar's body top max(open, close) /
     body bottom min(open, close); invalidation on the close; reversal = the bar's colour (doji never)."""
 
-    def __init__(self, piv, wait, buf, dist, max_on=False, max_n=0):
+    def __init__(self, piv, wait, buf, dist, max_on=False, max_n=0, frm=None, gap=None):
         self.N, self.wait, self.buf, self.dist = piv, wait, buf, dist
         self.max_on, self.max_n = max_on, max_n          # LTB-3 (1H): age = bars since the pivot bar (pivot = 0)
+        self.frm = frm                                   # LTB-6 (1H): (bars M before the pivot, minimum width) or None
+        self.gap = gap                                   # LTB-6 (1H): minimum bars from the pivot to an approach, or None
         self.bars, self.bases, self.next_id = [], [], 1
         self.events, self.act = [], []
         self.cov = {}
@@ -225,6 +231,20 @@ class Ref:
             for side, ok_side in ((-1, is_top), (1, is_bot)):
                 if not ok_side:
                     continue
+                if self.frm is not None:
+                    M, Wd = self.frm
+                    lb = self.bars[ctr - M:ctr] if ctr - M >= 0 else None          # the M bars just before the pivot bar
+                    if lb is None:
+                        width_ok = False
+                        self.c("frm_short_history")
+                    elif side == -1:
+                        width_ok = bt(cb) - min(bb(x) for x in lb) >= Wd - EPS
+                    else:
+                        width_ok = max(bt(x) for x in lb) - bb(cb) >= Wd - EPS
+                    if not width_ok:
+                        self.next_id += 1
+                        self.c("frm_rejected")
+                        continue
                 if skip:
                     self.next_id += 1
                     self.c("max_reg_skip")
@@ -287,6 +307,10 @@ class Ref:
                 elif g["cnt"] < 3 and in_band:
                     if not g["away"]:
                         self.c("touch_without_separation")
+                    elif self.gap is not None and i - g["pv"] < self.gap:
+                        g["away"] = False                         # too early: no count / wait / event, separation cleared
+                        g["early"] = i
+                        self.c("early_approach")
                     else:
                         g["cnt"] += 1
                         g["away"] = False
@@ -312,8 +336,12 @@ class Ref:
                     self.c(("top" if top else "bot") + f"_x{g['cnt']}")
                 separated = far <= L - dist + EPS if top else far >= L + dist - EPS
                 wick_sep = b["l"] <= L - dist + EPS if top else b["h"] >= L + dist - EPS
-                if not end and g["app"] != i and separated:
+                if not end and g["app"] != i and g.get("early") != i and separated:
                     g["away"] = True
+                    if g.get("early") is not None:
+                        self.c("re_separated_after_early")
+                elif not end and g.get("early") == i and separated:
+                    self.c("early_bar_range_not_separation")
                 elif not end and g["app"] != i and wick_sep and not g["away"]:
                     self.c("wick_only_separation")
                 if not end and g["app"] == i and separated:
@@ -342,7 +370,9 @@ def ref_for(k, ov=None):
     inp = ap.inputs(SRC)
     inp.update(ov or {})
     b, d = PARAMS[k]
-    return Ref(inp["dvPiv"], inp["dvWait"], inp[b], inp[d], k == 0 and inp["dvMxOn1"], inp["dvMxN1"])
+    return Ref(inp["dvPiv"], inp["dvWait"], inp[b], inp[d], k == 0 and inp["dvMxOn1"], inp["dvMxN1"],
+               (inp["dvFrmN1"], inp["dvFrmW1"]) if k == 0 and inp["dvFrmOn1"] else None,
+               inp["dvGapN1"] if k == 0 and inp["dvGapOn1"] else None)
 
 
 # ============================================================================
@@ -389,7 +419,9 @@ def gate_reference():
     settings = [{}, dict(dvWait=0), dict(dvWait=1), dict(dvWait=5), dict(dvPiv=2), dict(dvPiv=6),
                 dict(dvD1=0.0, dvD4=0.0, dvDD=0.0), dict(dvB1=0.0, dvB4=0.0, dvBD=0.0), dict(dvPiv=2, dvWait=2),
                 dict(dvMxOn1=False), dict(dvMxN1=4), dict(dvMxN1=3), dict(dvMxN1=10, dvWait=5), dict(dvMxN1=1, dvPiv=1),
-                dict(dvD1=15.0), dict(dvD1=10.0, dvMxN1=12, dvWait=5), dict(dvD1=10.0, dvMxN1=8, dvWait=6, dvPiv=2)]
+                dict(dvD1=15.0), dict(dvD1=10.0, dvMxN1=12, dvWait=5), dict(dvD1=10.0, dvMxN1=8, dvWait=6, dvPiv=2),
+                dict(dvFrmOn1=False, dvGapOn1=False), dict(dvFrmOn1=False), dict(dvGapOn1=False),
+                dict(dvFrmN1=3, dvFrmW1=2.0, dvGapN1=1), dict(dvFrmN1=15, dvGapN1=20, dvMxOn1=False), dict(dvD1=10.0, dvGapN1=12)]
     for k, (tf, scale) in enumerate(zip(TF_MS, (4.0, 8.0, 16.0))):
         for si, ov in enumerate(settings):
             for seed in range(3):
@@ -411,7 +443,8 @@ def gate_reference():
             "touch_without_separation", "approach_bar_range_not_separation", "ended_after_3rd", "multi_det_same_bar",
             "max_end", "max_end_waiting", "max_end_over_reversal", "max_reg_skip",
             "body_pivot_not_wick_pivot", "wick_only_initial_distance", "wick_only_touch", "body_beyond_band_no_approach",
-            "wick_only_separation", "doji_at_approach", "doji_while_waiting", "left_tie_pivot"]
+            "wick_only_separation", "doji_at_approach", "doji_while_waiting", "left_tie_pivot",
+            "frm_rejected", "frm_short_history", "early_approach", "early_bar_range_not_separation", "re_separated_after_early"]
     miss = [x for x in need if cov.get(x, 0) == 0]
     check("LT-R2 coverage on the random series: every rule occurred (" + ", ".join(need) + ")", not miss, str(miss))
     return n_ev
@@ -459,7 +492,20 @@ class Bars:
         self.WkSep = bx(H - 12, H - 14, dn=D)            # wick only below H - D (body bottom H - 14)
 
 
+# LTB-6: the hand-made scenarios of the earlier rules (4 left bars before the pivot, approaches a few bars after it) run with the
+# two 1H filters OFF; the filters have their own scenarios (gate_filters) with them ON
+FOFF = dict(dvFrmOn1=False, dvGapOn1=False)
+
+
+def legacy(ov=None, src=None):
+    inp = ap.inputs(src or SRC)
+    out = {k: v for k, v in FOFF.items() if k in inp}
+    out.update(ov or {})
+    return out
+
+
 def evs_of(k, rows, ov=None):
+    ov = legacy(ov)
     d = Det(k, ov).run(mk(rows, TF_MS[k]))
     r = ref_for(k, ov).run(mk(rows, TF_MS[k]))
     ev, _ = det_events(d)
@@ -1108,7 +1154,7 @@ def gate_draw():
     rows += [bx(1993.5, 1991)]                                               # A: bearish -> detected (lag 2)
     rows += [bx(1991, 1990)] * 2
     htf = [mk(rows, H1), mk([(2000, 2001, 1999, 2000)] * 3, H4), mk([(2000, 2001, 1999, 2000)] * 2, DAY)]
-    cores = Feeds(htf)
+    cores = Feeds(htf, FOFF)
     ev = det_events(cores[0].det)[0]
     chart_bars = []
     for b in htf[0]:
@@ -1116,7 +1162,7 @@ def gate_draw():
             T = b["T"] + s * M15
             chart_bars.append(dict(T=T, C=T + M15, o=b["o"], h=b["h"], l=b["l"], c=b["c"]))
     chart_bars.append(dict(T=htf[0][-1]["C"], C=htf[0][-1]["C"] + M15, o=2000, h=2000, l=2000, c=2000))
-    ch = Chart(cores, M15, dict(dsMaxGrp=1)).run(chart_bars)
+    ch = Chart(cores, M15, dict(FOFF, dsMaxGrp=1)).run(chart_bars)
     apps = [(i, e) for i, e in ev if e[0] == "A"]
     dts = [(i, e) for i, e in ev if e[0] == "D"]
     dts = [(i, e) for i, e in dts if e[1] == 1]
@@ -1190,13 +1236,13 @@ def gate_draw():
     t0 = 1_790_006_400_000 // H4 * H4
     hx = [mk(r1 + [(1990, 1991, 1989, 1990)] * 4, H1, t0), mk(r4 + [(1990, 1991, 1989, 1990)], H4, t0),
           mk([(1950, 1951, 1949, 1950)] * 3, DAY, t0 - 22 * H1)]
-    cx = Feeds(hx)
+    cx = Feeds(hx, FOFF)
     cb = []
     for b in hx[1]:
         for s15 in range(16):
             T = b["T"] + s15 * M15
             cb.append(dict(T=T, C=T + M15, o=b["o"], h=b["h"], l=b["l"], c=b["c"]))
-    chx = Chart(cx, M15, dict(dsTf4=True, dsMaxGrp=80)).run(cb)
+    chx = Chart(cx, M15, dict(FOFF, dsTf4=True, dsMaxGrp=80)).run(cb)
     byx = {}
     for key, t, tc in chx.received():
         byx.setdefault(t, []).append(key)
@@ -1261,7 +1307,9 @@ def gate_static():
           "(1H chart -> offset 0, else offset 1)", ok)
     core = s[s.index("f_ltCore(int k"):s.index("string ltPk1N")]
     logic = code_only(section(SRC, LB, LE))
-    ok2 = ("var LtTf S = ltNew(k, dvPiv, dvWait, buf, dist, k == 0 and dvMxOn1, dvMxN1)" in core and "out[off]" in core and
+    core_ll = " ".join(x for _, x in ap.logical_lines(core))
+    ok2 = ("var LtTf S = ltNew(k, dvPiv, dvWait, buf, dist, k == 0 and dvMxOn1, dvMxN1, k == 0 and dvFrmOn1, dvFrmN1, dvFrmW1, "
+           "k == 0 and dvGapOn1, dvGapN1)" in core_ll and "out[off]" in core and
            "ltStep(S, open, high, low, close, time, time_close, bar_index)" in core and
            not re.search(r"\bds\w+", core + logic) and "request.security" not in logic
            and not re.search(r"\blt(ChartOk|ChSec|Same1|TimeBar|Off1)\b|timeframe\.|chart\.", core + logic))
@@ -1321,10 +1369,10 @@ MUTATIONS = [
      "if S.maxOn and bi - g.pvBar > S.maxN and not (g.waiting and (top ? c < o : c > o))"),
     ("max bars extended by an approach", "                        g.appBar := bi\n",
      "                        g.appBar := bi\n                        g.pvBar := bi\n"),
-    ("max bars applied to 4H / D too", "k == 0 and dvMxOn1, dvMxN1)", "dvMxOn1, dvMxN1)"),
+    ("max bars applied to 4H / D too", "k == 0 and dvMxOn1, dvMxN1,", "dvMxOn1, dvMxN1,"),
     ("limit below the pivot bars still registered", "bool mxReg = S.maxOn and S.piv > S.maxN", "bool mxReg = false"),
-    ("id not consumed when not registered", "            S.seq += 1\n            if not mxReg\n                LtBase gh",
-     "            if not mxReg\n                S.seq += 1\n                LtBase gh"),
+    ("id not consumed when not registered (bottom)", "            S.seq += 1\n            if not mxReg and frmL\n",
+     "            if not mxReg and frmL\n                S.seq += 1\n"),
     ("held waiting marker not updated on the end", 'ltStat(r, "基準期限切れ")', 'ltStat(r, "反転待ち")'),
     ("pivot by the wick (high)", "    array.push(S.hs, bu)\n", "    array.push(S.hs, h)\n"),
     ("pivot by the wick (low)", "    array.push(S.ls, bd)\n", "    array.push(S.ls, l)\n"),
@@ -1336,6 +1384,17 @@ MUTATIONS = [
     ("approach price at the wick", "g.appP   := top ? bu : bd", "g.appP   := top ? h : l"),
     ("detection label price at the wick", 'str.tostring(bu, "#.########") + "," + str.tostring(bd, "#.########")',
      'str.tostring(h, "#.########") + "," + str.tostring(l, "#.########")'),
+    ("formation width includes the pivot bar", "                for j = 0 to S.frmN - 1\n", "                for j = 0 to S.frmN\n"),
+    ("formation width exactly 10 rejected", "frmH := full and mh - lMin >= S.frmW - EPS", "frmH := full and mh - lMin > S.frmW + EPS"),
+    ("formation short history accepted", "frmH := full and mh - lMin >= S.frmW - EPS", "frmH := (not full) or mh - lMin >= S.frmW - EPS"),
+    ("formation-rejected id not consumed", "            S.seq += 1\n            if not mxReg and frmH\n",
+     "            if not mxReg and frmH\n                S.seq += 1\n"),
+    ("formation filter applied to 4H / D", "k == 0 and dvFrmOn1", "dvFrmOn1"),
+    ("minimum bars counted from the registration bar", "if S.gapOn and bi - g.pvBar < S.gapN", "if S.gapOn and bi - g.aBar < S.gapN"),
+    ("minimum bars: age 8 still excluded", "if S.gapOn and bi - g.pvBar < S.gapN", "if S.gapOn and bi - g.pvBar <= S.gapN"),
+    ("early approach keeps the separation (carried over)", "                            g.away     := false\n", ""),
+    ("early bar's own body re-separates", "(na(g.earlyBar) or g.earlyBar != bi) and", ""),
+    ("minimum bars applied to 4H / D", "k == 0 and dvGapOn1", "dvGapOn1"),
     ("chart processes unconfirmed executions", "if barstate.isconfirmed and ltChartOk\n", "if ltChartOk\n"),
     ("one block per packet", 'string out = prevBlk == "" ? blk : prevBlk + ";" + blk', "string out = blk"),
     ("cap drops the late approach marker", "    if lost\n        ltAppMk(r, \"検知\")\n", ""),
@@ -1363,6 +1422,7 @@ def run_quick(src):
             gate_maxbars()
             gate_body()
             gate_ties()
+            gate_filters()
             cur = context_checks(SRC, "mutation")
             for k, v in cur.items():
                 check("m-" + k, v[0], v[1])
@@ -1427,6 +1487,7 @@ def wickless(bars):
 def run_rows(rows, ov=None, k=0, src=None, times=None):
     bars = mk(rows, TF_MS[k]) if times is None else [dict(T=T, C=T + TF_MS[k], o=o, h=h, l=l, c=c)
                                                     for T, (o, h, l, c) in zip(times, rows)]
+    ov = legacy(ov, src)
     d = Det(k, ov, src).run(bars)
     r = ref_for(k, ov).run(bars)
     ev, act = det_events(d)
@@ -1556,8 +1617,8 @@ def gate_maxbars():
                 bars = rand_tf(8000 + 10 * k + seed, 900, tf, scale)
                 o2 = Det(k, dict(ovx, dvD1=30.0), old2).run(wickless(bars))
                 o3 = Det(k, dict(ovx, dvD1=30.0), old3).run(wickless(bars))
-                n_off = Det(k, dict(ovx, dvMxOn1=False), VO).run(bars)
-                n_on = Det(k, ovx or None, VO).run(bars)
+                n_off = Det(k, dict(ovx, dvMxOn1=False, **FOFF), VO).run(bars)
+                n_on = Det(k, dict(ovx, **FOFF), VO).run(bars)
                 n1 += len(bars)
                 if n_off.blocks != o2.blocks:
                     ok1 = False
@@ -1570,8 +1631,8 @@ def gate_maxbars():
     feeds_off = Feeds(htf, dict(dvMxOn1=False))
     c15 = [b for b in agg(b5, M15) if b["T"] >= b5[0]["T"] + 20 * DAY]
     ch_new = Chart(feeds_new, M15).run(c15)
-    ch_vo = Chart(Feeds(htf, None, VO), M15, src=VO).run(c15)
-    ch_vo_off = Chart(Feeds(htf, dict(dvMxOn1=False), VO), M15, dict(dvMxOn1=False), src=VO).run(c15)
+    ch_vo = Chart(Feeds(htf, FOFF, VO), M15, FOFF, src=VO).run(c15)
+    ch_vo_off = Chart(Feeds(htf, dict(FOFF, dvMxOn1=False), VO), M15, dict(FOFF, dvMxOn1=False), src=VO).run(c15)
     ch_o3 = Chart(feeds_o3, M15, dict(dvD1=30.0), src=old3).run(c15)
     ch_o2 = Chart(feeds_o2, M15, dict(dvD1=30.0), src=old2).run(c15)
     ch_off = Chart(feeds_off, M15, dict(dvMxOn1=False)).run(c15)
@@ -1601,6 +1662,7 @@ def gate_maxbars():
     def chart_of(rows, ov=None):
         # one filler 1H bar after the case, so the case's last 1H block is delivered to the 15M chart
         hx = [mk(list(rows) + [F], H1), mk([(1950, 1951, 1949, 1950)] * 3, H4), mk([(1950, 1951, 1949, 1950)] * 2, DAY)]
+        ov = legacy(ov)
         fx = Feeds(hx, ov)
         cb = []
         for b in hx[0]:
@@ -1826,7 +1888,8 @@ def gate_ties():
 
 
 def gate_attrib():
-    """split the difference between the old wick version (d78ebf3 on bars WITHOUT wicks) and the current file into its causes."""
+    """split the difference between the old wick version (d78ebf3 on bars WITHOUT wicks) and the current file into its causes
+    (the LTB-6 1H filters OFF for the current file and its reductions; they are attributed in gate_filters)."""
     V = variants()
     old3 = prev_src(LTB3_COMMIT)
     ltb4 = prev_src("0b5b683")
@@ -1839,9 +1902,9 @@ def gate_attrib():
             for seed in range(4):
                 bars = rand_tf(9500 + 10 * k + seed, 900, tf, scale, gaps=gaps, gap_p=gp or 0.05)
                 o = Det(k, dict(dvD1=30.0), old3).run(wickless(bars))
-                vo = Det(k, None, V["onesided"]).run(bars)
-                vs = Det(k, None, V["strict"]).run(bars)
-                vc = Det(k, None, V["current"]).run(bars)
+                vo = Det(k, FOFF, V["onesided"]).run(bars)
+                vs = Det(k, FOFF, V["strict"]).run(bars)
+                vc = Det(k, FOFF, V["current"]).run(bars)
                 l4 = Det(k, None, ltb4).run(bars)
                 st["bars"] += len(bars)
                 ev = {nm: det_events(d)[0] for nm, d in (("o", o), ("vo", vo), ("vs", vs), ("vc", vc))}
@@ -1894,11 +1957,172 @@ def gate_attrib():
         rr = mirror(rows) if mir else rows
         bars = mk(rr, H1)
         e_old = det_events(Det(0, dict(dvD1=30.0), old3).run(wickless(bars)))[0]
-        e_cur = det_events(Det(0).run(bars))[0]
+        e_cur = det_events(Det(0, FOFF).run(bars))[0]
         if not (dets(e_old) == [(len(rows) - 1, 2, 0)] and not dets(e_cur)):
             ok5 = False
     check("LT-A5 constructed (needs an opening gap): bearish bar opening above H + buffer and closing inside -> the old one-sided rule "
           "(wickless) detects, the current two-sided band does not (top and bottom)", ok5)
+
+
+# ============================================================================
+# LTB-6: 1H formation-width filter and minimum bars to a re-approach
+# ============================================================================
+LTB5_COMMIT = "79f21a3"
+
+
+def base_f(P, D, w, M=8, piv=4):
+    """M bars before the pivot (bar 0: body bottom P - w = the deepest; the others' bodies within P - 6 .. P - 1.5), the pivot (body
+    top P), piv right bars falling to P - D - 10. Top formation width = w. -> rows (pivot index M, registration index M + piv)"""
+    rows = [bx(P - w + 2, P - w)] + [bx(P - 6 + 0.5 * j, P - 5 + 0.5 * j) for j in range(1, M)]
+    rows.append(bx(P - 3, P, up=2))
+    for j in range(piv):
+        lo = P - 6 - (D + 4) * (j + 1) / piv
+        rows.append(bx(lo + 2, lo))
+    return rows
+
+
+def gate_filters():
+    inp = ap.inputs(SRC)
+    P, B, D = 2000.0, inp["dvB1"], inp["dvD1"]
+    M, GN, N = inp["dvFrmN1"], inp["dvGapN1"], inp["dvMxN1"]
+    res, det = {}, []
+    PV = M                                         # pivot bar index of base_f
+    F = bx(P - D + 2, P - D)                        # separated filler, no touch
+    Ab = bx(P - B + 1, P - B - 2, up=B + 4)         # body top in the band, bearish
+    Sep = bx(P - D - 8, P - D - 10)
+
+    def lv(ev, ty, mir):
+        L = 4000 - P if mir else P
+        side = 1 if mir else -1
+        gids = {e[1] for _, e in ev if e[0] == "R" and e[3] == L and e[2] == side}
+        return [(i, e) for i, e in ev if e[0] == ty and e[1] in gids]
+
+    def case(name, rows, exp, ov=None):
+        ok = True
+        for mir in (False, True):
+            rr = mirror(rows) if mir else rows
+            bars = mk(rr, H1)
+            d = Det(0, ov).run(bars)
+            r = ref_for(0, ov).run(bars)
+            ev, act = det_events(d)
+            if not (ev == r.events and act == r.act and exp(ev, mir, d)):
+                ok = False
+                det.append((name, mir, [x for x in ev if x[1][0] in ("R", "A", "D", "T", "X")][:6]))
+        res[name] = ok
+
+    R_ = lambda ev, m: lv(ev, "R", m)                                                   # noqa: E731
+    A_ = lambda ev, m: [(i, e[5]) for i, e in lv(ev, "A", m)]                           # noqa: E731
+    D_ = lambda ev, m: [(i, e[5], e[8]) for i, e in lv(ev, "D", m)]                     # noqa: E731
+    # 3: width 9.99 rejected / 10 accepted
+    case("3: formation width 9.99 -> not registered", base_f(P, D, 9.99) + [Ab], lambda ev, m, d: not R_(ev, m))
+    case("3: formation width exactly 10 -> registered", base_f(P, D, 10.0) + [Ab], lambda ev, m, d: [i for i, _ in R_(ev, m)] == [PV + 4])
+    # 4: the pivot's own big body and the right side's range do not count
+    rows4 = [bx(P - 6 + 0.5 * j, P - 5 + 0.5 * j) for j in range(M)] + [bx(P - 50, P)] + [bx(P - 55, P - 60)] * 4 + [Ab]
+    case("4: left bodies within 6 $ (pivot body 50 $, right bars 60 $ below) -> not registered", rows4, lambda ev, m, d: not R_(ev, m))
+    # 5: the number of bars changes the judgement; short history; filter OFF
+    rows5 = base_f(P, D, 12.0)
+    case("5: deep bar 8 bars before the pivot, M = 8 -> registered", rows5, lambda ev, m, d: [i for i, _ in R_(ev, m)] == [PV + 4])
+    case("5: the same bars, M = 7 (the deep bar outside) -> not registered", rows5, lambda ev, m, d: not R_(ev, m), dict(dvFrmN1=7))
+    case("5: M = 9 with only 8 bars before the pivot (short history) -> not registered", rows5, lambda ev, m, d: not R_(ev, m),
+         dict(dvFrmN1=9))
+    case("5: M = 9 with one more bar in front -> registered", [bx(P - 5, P - 4)] + rows5,
+         lambda ev, m, d: [i for i, _ in R_(ev, m)] == [PV + 5], dict(dvFrmN1=9))
+    case("5: width 6 and short history registered with the width filter OFF", rows4[-14:-1] + [Ab],
+         lambda ev, m, d: len(R_(ev, m)) == 1, dict(dvFrmOn1=False))
+    # 6: approach at age 7 excluded, age 8 accepted; counted from the pivot bar (not registration / detection)
+    base = base_f(P, D, 12.0)
+
+    def at(age, pre=()):
+        return base + list(pre) + [F] * (PV + age - len(base) - len(pre))
+
+    case("6: approach at age 7 (registration + 3) -> not an approach", at(GN - 1) + [Ab], lambda ev, m, d: not A_(ev, m) and not D_(ev, m))
+    case("6: approach at age 8 (registration + 4; registration-based would exclude it) -> approach and detection",
+         at(GN) + [Ab], lambda ev, m, d: D_(ev, m) == [(PV + GN, 2, 0)])
+    case("6: 3rd approach 2 bars after the 2nd detection (age 10) -> accepted (not counted from the detection bar)",
+         at(GN) + [Ab, Sep, Ab], lambda ev, m, d: D_(ev, m) == [(PV + GN, 2, 0), (PV + GN + 2, 3, 0)])
+    # 7: early approach, then staying in the band -> never carried over to bar 8
+    case("7: early approach at age 7, staying in the band (bearish) at ages 8-10 -> no approach, no detection",
+         at(GN - 1) + [Ab] * 4, lambda ev, m, d: not A_(ev, m) and not D_(ev, m))
+    # 8: early approach, separation on another bar, return -> accepted (count 2)
+    case("8: early approach at age 7, separation at age 8, return at age 9 -> 2nd approach and detection",
+         at(GN - 1) + [Ab, Sep, Ab], lambda ev, m, d: A_(ev, m) == [(PV + GN + 1, 2)] and D_(ev, m) == [(PV + GN + 1, 2, 0)])
+    case("8: the early bar's own body reaching the distance does not re-separate; separation on a later bar does",
+         at(GN - 1) + [bx(P - D - 10, P - B + 0.5), Ab, Sep, Ab],
+         lambda ev, m, d: A_(ev, m) == [(PV + GN + 2, 2)])
+    # 9: no count used, no waiting, no extension of the 24-bar limit
+    case("9: early approach consumes no count, opens no wait (no X), the 1H limit still ends the base at age 25",
+         at(GN - 1) + [Ab, Sep] + [F] * (N + 1 - GN - 1) + [Ab],
+         lambda ev, m, d: not A_(ev, m) and not lv(ev, "X", m) and [i for i, _ in lv(ev, "T", m)] == [PV + N + 1])
+    case("9: early approach then a valid approach at age 24 -> count 2, detected", at(GN - 1) + [Ab, Sep] + [F] * (N - GN - 1) + [Ab],
+         lambda ev, m, d: A_(ev, m) == [(PV + N, 2)] and D_(ev, m) == [(PV + N, 2, 0)])
+    # 10: 24 allowed / 25 ended with both filters ON
+    case("10: approach at age 24 detected (filters ON)", at(N) + [Ab], lambda ev, m, d: D_(ev, m) == [(PV + N, 2, 0)])
+    case("10: approach at age 25 -> ended (T) before it", at(N + 1) + [Ab],
+         lambda ev, m, d: not D_(ev, m) and [i for i, _ in lv(ev, "T", m)] == [PV + N + 1])
+    # LTB-6 state checks on the base after an early approach: still active, not separated, count 1, not waiting
+    rows_s = at(GN - 1) + [Ab]
+    d = Det(0).run(mk(rows_s, H1))
+    g = [x for x in d.S.bases if x.lvl == P and x.side == -1]
+    res["9: after the early approach the base is kept (count 1, not waiting, not separated, the early bar recorded)"] = (
+        len(g) == 1 and g[0].cnt == 1 and not g[0].waiting and not g[0].away and g[0].earlyBar == PV + GN - 1)
+    for nm, ok in res.items():
+        check("LT-F " + nm, ok, str([x for x in det if x[0] == nm][:2]) if not ok else "")
+
+    # 1: both filters OFF == 79f21a3 (LTB-5) block by block; 11: 4H / D with the defaults == 79f21a3
+    prev = prev_src(LTB5_COMMIT)
+    ok1, ok11, n1 = True, True, 0
+    for k, (tf, scale) in enumerate(zip(TF_MS, (4.0, 8.0, 16.0))):
+        for seed in range(3):
+            for gp in (True, False):
+                bars = rand_tf(9700 + 10 * k + seed, 900, tf, scale, gaps=gp)
+                o = Det(k, None, prev).run(bars)
+                n1 += len(bars)
+                if Det(k, FOFF).run(bars).blocks != o.blocks:
+                    ok1 = False
+                if k > 0 and Det(k).run(bars).blocks != o.blocks:
+                    ok11 = False
+    b5, htf, feeds_new = build(12, days=70, scale=3.0)
+    feeds_prev = Feeds(htf, None, prev)
+    c15 = [b for b in agg(b5, M15) if b["T"] >= b5[0]["T"] + 20 * DAY]
+    ch_new = Chart(feeds_new, M15).run(c15)
+    ch_prev = Chart(feeds_prev, M15, src=prev).run(c15)
+    ch_foff = Chart(Feeds(htf, FOFF), M15, FOFF).run(c15)
+    rk = lambda ch, ks: [x for x in ch.received() if x[0][0] in ks]                     # noqa: E731
+    ok1 = ok1 and ch_foff.events == ch_prev.events and ch_foff.env["ltNAct"] == ch_prev.env["ltNAct"]
+    ok11 = ok11 and rk(ch_new, (1, 2)) == rk(ch_prev, (1, 2)) and [x for x in ch_new.blocks if x[0] > 0] == [x for x in ch_prev.blocks if x[0] > 0]
+    check(f"LT-F1 both 1H filters OFF == {LTB5_COMMIT} (LTB-5): every block (events + active-base count) of 1H / 4H / D on gapped and "
+          f"continuous random series ({n1} bars) and every event received on a 15M chart", ok1)
+    check(f"LT-F11 defaults (filters ON): 4H / D blocks and the received 4H / D detections == {LTB5_COMMIT}", ok11)
+
+    # 2: independence. Bases never interact, so a base present in two runs must have identical events in both:
+    #    formation filter only -> a subset of the OFF bases (same ids), their events unchanged; gap filter only -> the same bases;
+    #    both -> the bases of the formation-only run, each with the events of the gap-only run
+    ok2, n_rej, n_early_diff = True, 0, 0
+    for seed in range(4):
+        for gp in (True, False):
+            bars = rand_tf(9900 + seed, 1200, H1, 4.0, gaps=gp)
+            # 1H distance 10 in all four runs (a test setting only: with 30 no random base returns within 8 bars, so the gap
+            # filter would never act here; its 30 $ behaviour is covered by the scenarios above)
+            runs = {nm: det_events(Det(0, dict(ov, dvD1=10.0)).run(bars))[0] for nm, ov in
+                    (("off", FOFF), ("frm", dict(dvGapOn1=False)), ("gap", dict(dvFrmOn1=False)), ("both", {}))}
+
+            def per_base(ev):
+                out = {}
+                for i, e in ev:
+                    out.setdefault(e[1], []).append((i, e))
+                return out
+            pb = {nm: per_base(ev) for nm, ev in runs.items()}
+            reg = {nm: {e[1] for _, e in ev if e[0] == "R"} for nm, ev in runs.items()}
+            if not (reg["frm"] <= reg["off"] and reg["gap"] == reg["off"] and reg["both"] == reg["frm"]):
+                ok2 = False
+            n_rej += len(reg["off"] - reg["frm"])
+            for gid in reg["frm"]:
+                if pb["frm"][gid] != pb["off"][gid] or pb["both"][gid] != pb["gap"][gid]:
+                    ok2 = False
+            n_early_diff += sum(1 for gid in reg["off"] if pb["gap"][gid] != pb["off"][gid])
+    check(f"LT-F2 independence on random 1H series (1H distance 10 in every run): formation filter only -> a subset of the bases ({n_rej} rejected), the kept ones "
+          f"with unchanged events; gap filter only -> the same bases ({n_early_diff} with changed approaches); both -> the formation "
+          f"subset, each with the gap-only events", ok2 and n_rej > 0 and n_early_diff > 0)
 
 
 def context_checks(src, label):
@@ -2008,6 +2232,7 @@ def main():
     gate_body()
     gate_ties()
     gate_attrib()
+    gate_filters()
     if "--no-mutation" not in sys.argv:
         gate_mutation()
     ok = 0
