@@ -198,7 +198,7 @@ def lab_state(r):
     return zs, ma, ds
 
 
-def zsx_state(env, S):
+def zsx_state(env, S, tb=T0):
     zs = sorted((z.id, z.typ, z.tf, z.sub, z.bot, z.top, z.aBar, z.inv) for z in S.zs + S.fvgs)
     ma = [(m.id, m.bot, m.top) if m is not None else None for m in (S.ma1, S.ma2)]
     gf, tk = env["f_zxOut"](S)
@@ -207,7 +207,7 @@ def zsx_state(env, S):
     for i, g in enumerate(S.ds):
         o = i * 9
         name = decode_name(tk, int(gf[o + 7]), int(gf[o + 8]), inp)
-        left = None if g.lab0 is None else (g.lab0 - T0) // M5
+        left = None if g.lab0 is None else (g.lab0 - tb) // M5
         ds.append((g.gone, g.bot, g.top, () if g.gone else tuple(z.id for z in g.mem), name, left))
     return zs, ma, ds
 
@@ -365,7 +365,7 @@ def static():
     own = own_lines(body)
     code = "\n".join(ln.split("//")[0] if not ln.lstrip().startswith("//") else "" for ln in own.split("\n"))
     nreq = len(re.findall(r"request\.security\(", code))
-    i_out = code.index("f_zxEng(), lookahead")
+    i_out = code.index("\"5\", f_zxEng()")
     chart = re.sub(r'"[^"\n]*"', '""', code[i_out:])
     chart_bad = re.findall(r"\b(close|open|high|low|volume|bar_index)\b", chart)
     lab = zb.raw("ZoneComboLabXAU.pine")
@@ -400,6 +400,55 @@ def static():
           and "if barstate.islast or timenow - time_close <= 600000" in eng, "")
 
 
+def run_zsx(bars, raw, ov=None, realtime_from=None):
+    """ZSX alone on bars (indices in vec() relative to the window, like a 5m context that starts at the first given bar)"""
+    env = zsx_env(ov)
+    S = env["f_zxNew"]()
+    prev = None
+    for i, b in enumerate(bars):
+        cur = vec(b, i, raw)
+        env["time_close"] = b["t"] + M5
+        if realtime_from is not None and i >= realtime_from:
+            for _ in range(2):
+                env["f_zxAdvance"](S, prev, cur, False, 0)
+        else:
+            env["f_zxAdvance"](S, prev, cur, True, 0)
+        prev = cur
+    return env, S
+
+
+def signature_checks():
+    """the comparison signature (bands: order / bounds / grey / members / draw start; internal Zones) and the calc_bars_count model:
+    every chart whose fixed 5m request delivers the last N bars computes the same state; a chart cut shorter is flagged"""
+    bars, raw = gen(12, 700)
+    N = 450
+    win = bars[-N:]
+    rw = raw[-N:]
+    e1, S1 = run_zsx(win, rw)
+    hd1, hz1 = e1["f_zxHash"](S1)
+    # the same window processed as realtime from the middle: one bar behind at the end -> after the next (historical) bar the same
+    e2, S2 = run_zsx(win + [], rw, realtime_from=None)
+    hd2, hz2 = e2["f_zxHash"](S2)
+    # a 'monthly chart' that has 100000 bars available but asks for the last N (calc_bars_count) = the same window
+    e3, S3 = run_zsx(bars[len(bars) - N:], raw[len(bars) - N:])
+    hd3, hz3 = e3["f_zxHash"](S3)
+    # a chart whose 5m data is cut shorter (only 300 bars): different state, and flagged (bars < N)
+    e4, S4 = run_zsx(bars[-300:], raw[-300:])
+    hd4, hz4 = e4["f_zxHash"](S4)
+    # a different band set (one bar fewer) changes the band signature
+    e5, S5 = run_zsx(win[:-1], rw[:-1])
+    hd5, _ = e5["f_zxHash"](S5)
+    flag_short = 300 < N
+    lab = lp.Runner(overrides=dict(dsZone=True, dsEnt=False, dsTbl=False, cTA=False, cTC=False)).run(win)
+    lab_eq = lab_state(lab) == zsx_state(e1, S1, win[0]["t"])
+    same = (hd1, hz1) == (hd2, hz2) == (hd3, hz3)
+    check("ZX-08 comparison signature and the fixed bar count: charts whose fixed 5m request delivers the same last N bars give the same "
+          "band / Zone signature (and the same state as the Lab run on those N bars); a chart cut to fewer bars gives a different "
+          "state and is flagged ('5分データ ★指定より少ない'); one more / fewer processed bar changes the band signature",
+          same and lab_eq and (hd4, hz4) != (hd1, hz1) and flag_short and hd5 != hd1,
+          f"same={same} lab={lab_eq} short={(hd4, hz4) != (hd1, hz1)} step={hd5 != hd1}")
+
+
 def main():
     quick = "--quick" in sys.argv
     static()
@@ -423,6 +472,7 @@ def main():
     check("ZX-07 draw start: every displayed band starts at the 5m close since which a band of exactly that shape has been displayed "
           "without a break (merged shapes are not drawn before they exist); grey bands span their FVG from its availability to the "
           "invalidation bar", not diff and not db and grey_ok, f"{diff} {db[:3]} grey={grey_ok}")
+    signature_checks()
     n = sum(ok for _, ok, _ in RESULTS)
     for name, ok, d in RESULTS:
         print(("PASS " if ok else "FAIL ") + name + ("" if ok else "  -- " + d))
