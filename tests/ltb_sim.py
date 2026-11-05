@@ -1921,6 +1921,22 @@ def gate_charts():
           "every tick); the detection taken on bar 18's confirmed execution (its own bar, not the next one); realtime run == history run",
           okf, str(detf))
 
+    # 5 (guard): even if a lower chart were handed the offset-0 packet of 4H / D (the forming target bar, with its final values on
+    # history), the receive guard takes a target bar only once it has closed by the chart bar's close
+    h1g = rand_tf(7790, 24 * 120, H1, 4.0, gaps=False, t0=1_790_006_400_000 // DAY * DAY + 22 * H1)
+    hg = [h1g, agg_day_aligned(h1g, H4), agg_day_aligned(h1g, DAY)]
+    fg = Feeds(hg)
+    for it in fg.items:
+        if it["var"] in ("ltPk4C", "ltPkDC"):
+            it["off"] = 0                                   # simulate the wrong packet arriving (not the source's choice)
+    cg = Chart(fg, H1, dict(dsTf4=True, dsTfD=True)).run(hg[0])
+    close_of = {(k, b["T"]): b["C"] for k in (1, 2) for b in hg[k]}
+    early = [(TFJA[k], sT, t) for k, sT, t, tc in cg.blocks if k > 0 and close_of[(k, sT)] > tc]
+    taken_k = {k: len([x for x in cg.blocks if x[0] == k]) for k in (1, 2)}
+    check("LT-C5g receive guard: a 1H chart handed the 4H / D offset-0 packets (forming bar with its final values) still takes each 4H / D "
+          "bar only on the chart bar whose close reaches that bar's close (no lookahead)", not early and taken_k[1] > 0 and taken_k[2] > 0,
+          str(early[:3]))
+
     # 15: same-bar detections kept; display / cap do not change what is detected (4H chart)
     two = list(h1_base()) + [bx(1968, 1962), bx(1962, 1958), bx(1958, 1970), bx(1970, 1980), bx(1980, 1990), bx(1990, 1993),
                              bx(1992, 1980), bx(1980, 1970), bx(1970, 1962), bx(1962, 1960)]
