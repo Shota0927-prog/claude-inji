@@ -159,7 +159,7 @@ def edits(sym):
 #    LAB-1 edit texts stay byte for byte)
 def ok(p):
     """LBS-1 accounts for this path exactly: one of its new files."""
-    return p in NEW_FILES
+    return p in NEW_FILES or __import__("zsy_build").ok(p)     # the later ZSY files: exact
 
 
 L3 = '__import__("lbs_build")'
@@ -194,6 +194,7 @@ def apply_edits(p, text):
 
 def unadapt(p, text):
     """a test file with its LBS-1 edits reverted (all or nothing; unchanged without them; None with only part of them)."""
+    text = __import__("zsy_build").unadapt(p, text)     # the later ZSY test edits are reverted first, exactly
     eds = TEST_EDITS.get(p, [])
     if text is None or not eds or all(text.count(new) == 0 for _, new, _ in eds):
         return text

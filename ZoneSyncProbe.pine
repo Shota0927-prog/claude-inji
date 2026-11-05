@@ -2,123 +2,1495 @@
 // © shota0927-prog
 //
 // ============================================================================
-//  Zone Sync Probe 5m (ZSP-0)  —  検証専用。Zone は描かない。既存の Lab / Strategy / Feed / LongFibWave は変更しない。
+//  Zone Sync Probe (ZSP-1)  —  検証専用 (Zone は描かない・売買 / アラートなし)。既存の Lab / Strategy / MtfPocFeedXAU / LongFibWave /
+//  ストキャスは変更しない。ZSP-0 の 4 本 (Probe / Nest / Recv / Wrap) をこの 1 本にまとめた。
 // ----------------------------------------------------------------------------
-//  目的: 「5分足を基準に確定した状態」を、チャート足 (5秒〜月足) を変えても同じ値で受け取れるかを TradingView 実機で確かめる。
-//   ・状態は request.security(…, "5", f_zsEng(…)) の 5分コンテキストの中で、5分足を 1 本ずつ進める (チャート足の bar_index・close は使わない)。
-//   ・5分足 t の評価で、その足の値 (time / close) で状態を進め、「t まで」と「t-1 まで」(= [1]) の両方を返す。チャート側は
-//     min(チャート足の time_close, timenow) >= 5分足 t の time_close なら「t まで」、そうでなければ「t-1 まで」を使う
-//     (形成中の 5分足 t の値では切り替えない。週末・再読み込みで次の 5分足がない間も、最後に確定した足まで反映する)。
-//     形成中の 5分足のティックで進んだ分はコンテキスト内の rollback で戻る前提 (表の「逆戻り」「同じ足で変化」で確認)。
-//   ・蓄積開始時刻 (入力) 以後に始まった 5分足だけを数える。5分コンテキストの最初の足がこの時刻より後なら「履歴不足」。
-//   ・チャート足 <= 5分: lookahead_on (そのチャート足を含む 5分足の評価)。チャート足 > 5分: lookahead_off
-//     (チャート足の中の最後の 5分足の評価。リアルタイムの足では最新の 5分足)。
-//  出力 (display.none の数値。ZoneSyncProbeRecv / ZoneSyncProbeWrap の input.source で選ぶ):
-//   ZSP protocol (30001) / 処理済み 5分足数 / チェックサム / 最後に確定した 5分足の開始時刻 / 同 確定時刻 / 5分 EMA (確定値)
-//  表: 5分コンテキストの最初の足・本数、蓄積開始時刻と履歴不足、最後に確定した 5分足、処理数・チェックサム (署名)、5分 EMA、
-//      リアルタイムで観測した 5分更新の回数・飛び・逆戻り、ヒストリカルのチャート足 1 本ずつで観測できなかった 5分更新の数。
-//  手順・記録表: ZONE_SYNC_FEASIBILITY_ja.md (§5)。★ TradingView 実機でのコンパイル・表示は未実施。
+//  内蔵方式 (固定 5分の計算の中で Lab と同じ順序で処理する) が TradingView 実機で成り立つかを、5分足・5秒足・3分足・月足で確かめる。
+//   ・固定 5分の計算: request.security(…, "5", f_zpEng()) の中で 5分足を 1 本ずつ処理する (チャート足の bar_index・close は使わない)。
+//   ・その中の入れ子の取得は Lab / MtfPocFeedXAU / LongFibWave と同じ式・同じ [1]・lookahead (下の「ZSY copy」区間は元ファイルの写し。
+//     tests/zsy_build.py が元ファイルから作り、tests/zsy_sim.py が 1 文字ずつ照合する):
+//       1分 EMA3000 (Lab) / アキュム 1H・4H・D (Lab) / Pivot 1H・4H・D・W (Lab) / FVG 1H・4H・D・W (Lab) /
+//       POC 1H・4H・D・W (MtfPocFeedXAU の f_feed・f_pocCore) / フィボ 4H・D (LongFibWave の f_lfwCore と、5分足チャート側の接続値 f_fibFeed)
+//   ・Zone の登録・更新は「Zone 登録開始時刻」以後の 5分足だけ (Lab の 5分足チャートの最初の足に合わせる)。検出器・EMA の計算履歴は
+//     それぞれの取得の最初の足から (登録開始とは別)。各取得の最初の足を表に出し、Lab 側の値 (5分足チャートで読んだ値) と比べる。
+//   ・5分足 t の評価で「t まで」と「t-1 まで」を返し、チャート側は min(チャート足の time_close, timenow) >= 5分足 t の time_close のときだけ
+//     「t まで」を使う (形成中の 5分足では進めない・休場中も最後の確定 5分足まで反映する)。
+//   ・試験の負荷: Zone の一覧 (最大 300 件) を文字列にして受け渡す (表示帯の一覧の受け渡しを想定)。
+//  この試験の Zone 処理は Lab の一部 (アキュムの固定・Pivot の登録・FVG の反転 / 無効・POC の更新・フィボの更新) だけ。水平線の統合・
+//  表示帯の統合はまだ持たない (表示本体で Lab の処理をそのまま移す)。
+//  手順・返してほしい結果: ZONE_SYNC_FEASIBILITY_ja.md §5。★ TradingView 実機でのコンパイル・表示は未実施。
 // ============================================================================
 
 //@version=5
-indicator("Zone Sync Probe 5m (ZSP-0)", "ZSP0", overlay = true)
+indicator("Zone Sync Probe (ZSP-1)", "ZSP1", overlay = true, max_bars_back = 1100)
 
-zsAnchor = input.time(timestamp("2026-10-26T07:00:00+09:00"), "蓄積開始時刻 (この時刻以後に始まった 5分足だけを数える)",
-     tooltip = "全時間足で同じ値にする。5分足チャートで表示される「5分コンテキストの最初の足」以後の時刻にすると、5分足チャートと同じ開始点になる。")
-zsEmaLen = input.int(3000, "5分足 EMA 本数 (Lab の MA 5分足 EMA と比べる)", minval = 1)
-zsTbl    = input.bool(true, "表を表示")
+var string G_ZP = "01 · 基準 (全時間足で同じ値)"
+zpAnchor = input.time(timestamp("2026-10-26T07:00:00+09:00"), "Zone 登録開始時刻 (= 5分足の Lab の最初の足)", group = G_ZP,
+     tooltip = "5分足チャートにこのインジを追加して表示される「5分」行の最初の足を入れる。この時刻以後に始まった 5分足から Zone を登録・更新する。")
+zpRef1 = input.time(0, "Lab 側 1分の最初の足 (5分足チャートで読んだ値)", group = G_ZP)
+zpRefH = input.time(0, "Lab 側 1H の最初の足", group = G_ZP)
+zpRef4 = input.time(0, "Lab 側 4H の最初の足", group = G_ZP)
+zpRefD = input.time(0, "Lab 側 日足の最初の足", group = G_ZP)
+zpRefW = input.time(0, "Lab 側 週足の最初の足", group = G_ZP,
+     tooltip = "0 = 未設定。設定すると、各取得の最初の足がこの値と同じか (同じ / 遅い = 履歴不足 / 早い = 初期値が異なる可能性) を表示する。")
+zpStrN    = input.int(300, "受け渡す Zone 一覧の最大件数", minval = 1, maxval = 1000, group = G_ZP)
+zpStrDays = input.int(4, "Zone 一覧を作る期間 (直近の日数)", minval = 1, group = G_ZP)
+zpTbl     = input.bool(true, "表を表示", group = G_ZP)
 
-simple bool zsLowTf = timeframe.in_seconds() <= 300
+// ---- Lab と同じ初期値 (ZoneComboLabXAU の入力名・初期値) ----
+var string G_LB = "02 · Lab の検出設定 (初期値 = Lab)"
+zbLen1 = input.int(3000, "1分足 EMA 本数", minval = 1, group = G_LB)
+zbLen2 = input.int(3000, "5分足 EMA 本数", minval = 1, group = G_LB)
+zaKeep1 = input.int(1, "1時間足: 最新から採用する箱数", minval = 1, group = G_LB)
+zaKeep2 = input.int(1, "4時間足: 最新から採用する箱数", minval = 1, group = G_LB)
+zaKeep3 = input.int(1, "日足: 最新から採用する箱数", minval = 1, group = G_LB)
+accumRangeLen        = input.int(10,   "Accum判定レンジ本数",  minval = 6,  group = G_LB)
+accumBaseLen         = input.int(20,   "基準平均本数",         minval = 10, group = G_LB)
+accumAtrLen          = input.int(14,   "ATR本数",             minval = 1,  group = G_LB)
+accumMinUpperCloses  = input.int(4,    "上半分の最低終値本数",  minval = 1,  group = G_LB)
+accumMinLowerCloses  = input.int(4,    "下半分の最低終値本数",  minval = 1,  group = G_LB)
+accumMaxSameColorRun = input.int(4,    "同色連続の上限",       minval = 1,  group = G_LB)
+accumAtrMult         = input.float(2.5,  "Accum レンジ幅 / ATR 上限",    minval = 0.5,  step = 0.1,  group = G_LB)
+accumBarRatioMax     = input.float(0.70, "Accum 平均値幅/基準平均 上限", minval = 0.1,  step = 0.01, group = G_LB)
+accumDriftMax        = input.float(0.30, "Accum ドリフト上限",          minval = 0.05, maxval = 1.0, step = 0.05, group = G_LB)
+zcPiv1 = input.int(6, "1H 左右の本数", minval = 1, group = G_LB)
+zcPiv2 = input.int(6, "4H 左右の本数", minval = 1, group = G_LB)
+zcPiv3 = input.int(6, "日足 左右の本数", minval = 1, group = G_LB)
+zcPiv4 = input.int(6, "週足 左右の本数", minval = 1, group = G_LB)
+zfMinW = input.float(3.0, "FVG 最小幅 ($)", minval = 0.0, step = 0.5, group = G_LB)
 
-// 5分コンテキストの中で 1 本ずつ評価される。戻り値 = [コンテキスト情報, この 5分足の time_close, 「t まで」, 「t-1 まで」]
-f_zsEng(int aT, simple int eLen) =>
-    float e5 = ta.ema(close, eLen)
-    var int ft5 = time            // この 5分コンテキストの最初の足
-    var int n5  = 0               // この 5分コンテキストの本数 (形成中を含む)
-    n5 += 1
-    var int   n     = 0           // 蓄積開始時刻以後に始まった 5分足の数
-    var float ck    = 0.0         // 5分足の終値 (mintick 単位) の順序つきチェックサム
-    var int   lastT = na
-    var int   lastC = na
-    if time >= aT and not na(close)
-        n     += 1
-        ck    := (ck * 131.0 + math.round(close / syminfo.mintick)) % 999983.0
-        lastT := time
-        lastC := time_close
-    [ft5, n5, time_close, n, ck, lastT, lastC, e5, n[1], ck[1], lastT[1], lastC[1], e5[1]]
+// ---- MtfPocFeedXAU と同じ初期値 ----
+var string G_PC = "03 · POC (初期値 = MtfPocFeedXAU)"
+pocUse1 = input.bool(true, "1H 検知", group = G_PC, inline = "p1")
+pocLen1 = input.int(120, "本数", minval = 10, maxval = 1000, group = G_PC, inline = "p1")
+pocUse2 = input.bool(true, "4H 検知", group = G_PC, inline = "p2")
+pocLen2 = input.int(120, "本数", minval = 10, maxval = 1000, group = G_PC, inline = "p2")
+pocUse3 = input.bool(true, "日足 検知", group = G_PC, inline = "p3")
+pocLen3 = input.int(120, "本数", minval = 10, maxval = 1000, group = G_PC, inline = "p3")
+pocUse4 = input.bool(true, "週足 検知", group = G_PC, inline = "p4")
+pocLen4 = input.int(120, "本数", minval = 10, maxval = 1000, group = G_PC, inline = "p4")
+pocBins = input.int(75, "VP ビン数 (分割数)", minval = 4, maxval = 100, group = G_PC)
 
-[zsFt5, zsN5, zsTc5, zsNa, zsCka, zsLastTa, zsLastCa, zsE5a, zsNb, zsCkb, zsLastTb, zsLastCb, zsE5b] = request.security(syminfo.tickerid, "5",
-     f_zsEng(zsAnchor, zsEmaLen), lookahead = zsLowTf ? barmerge.lookahead_on : barmerge.lookahead_off)
+// ---- LongFibWave と同じ入力 (下の行は LongFibWave の入力の写し) ----
+grpW = "04 · フィボ (LongFibWave) 波の切替・観測"
+grpP = "04 · フィボ (LongFibWave) 主要高安"
+grpS = "04 · フィボ (LongFibWave) 統計"
+// ==== ZSY copy LFW_INPUTS begin (from LongFibWave.pine, byte for byte) ====
+lfwSwitchRatioD = input.float(0.90,  "日足: 同方向切替率（この戻り率以上の戻り高安を次の起点候補にする）", minval = 0.01, maxval = 1.0, step = 0.001, group = grpW)
+lfwSwitchRatio4 = input.float(0.782, "4H: 同方向切替率（この戻り率以上の戻り高安を次の起点候補にする）",   minval = 0.01, maxval = 1.0, step = 0.001, group = grpW)
+lfwStartRatio   = input.float(0.10,  "観測開始の戻り率",           minval = 0.01, maxval = 1.0, step = 0.01, group = grpW)
+lfwExclInit     = input.bool(true,  "最初の波の観測を統計から除外", group = grpW)
+lfwAtrLen       = input.int(14,     "ATR 期間（各対象時間足自身）", minval = 1, group = grpP)
+lfwPivLD        = input.int(20,     "日足: 左の本数",               minval = 1, maxval = 200, group = grpP)
+lfwPivRD        = input.int(3,      "日足: 右の本数（確認）",       minval = 1, maxval = 50,  group = grpP)
+lfwPivMD        = input.float(7.0,  "日足: 必要値幅（極値足の ATR 倍率）", minval = 0.1, step = 0.1, group = grpP)
+lfwPivL4        = input.int(60,     "4H: 左の本数",                 minval = 1, maxval = 200, group = grpP)
+lfwPivR4        = input.int(3,      "4H: 右の本数（確認）",         minval = 1, maxval = 50,  group = grpP)
+lfwPivM4        = input.float(6.0,  "4H: 必要値幅（極値足の ATR 倍率）",   minval = 0.1, step = 0.1, group = grpP)
+lfwMaxRecs      = input.int(1000,   "保存する観測記録の上限（件数集計は上限なし）", minval = 10, group = grpS)
+// ==== ZSY copy LFW_INPUTS end ====
 
-// その 5分足が確定済みか: チャート足の終わり (リアルタイムの足では現在時刻) がその 5分足の確定時刻以後
-bool  zsUseCur = not na(zsTc5) and math.min(time_close, timenow) >= zsTc5
-int   zsN      = zsUseCur ? zsNa : zsNb
-float zsCk     = zsUseCur ? zsCka : zsCkb
-int   zsLastT  = zsUseCur ? zsLastTa : zsLastTb
-int   zsLastC  = zsUseCur ? zsLastCa : zsLastCb
-float zsE5     = zsUseCur ? zsE5a : zsE5b
+// ============================================================================
+// 写し (元ファイルから tests/zsy_build.py が作る。手で編集しない)
+// ============================================================================
+// ==== ZSY copy LAB_ACCUM begin (from ZoneComboLabXAU.pine, byte for byte) ====
+// ==== LAB Accum copy (begin) =================================================
+f_acAccumBoxCore(simple int rangeLen, simple int baseLen, simple int atrLen,
+     simple int minUpper, simple int minLower, simple int maxRun,
+     float atrMult, float barRatioMax, float driftMax) =>
+    _atr = ta.atr(atrLen)
 
-// ---- 観測 (表示用。状態には使わない) ----
-// リアルタイム: 受け取った「最後に確定した 5分足」が変わった回数、処理数の飛び (2 以上増えた = 途中の更新を観測できなかった)、逆戻り
-varip int   zsRtTicks = 0
-varip int   zsRtSeen  = 0
-varip int   zsRtJump  = 0
-varip int   zsRtBack  = 0
-varip float zsRtPrevT = na
-varip float zsRtPrevN = na
-if barstate.isrealtime
-    zsRtTicks += 1
-    if not na(zsLastT) and (na(zsRtPrevT) or zsLastT != zsRtPrevT)
-        if not na(zsRtPrevN)
-            if zsN - zsRtPrevN > 1
-                zsRtJump += int(zsN - zsRtPrevN - 1)
-            if zsN < zsRtPrevN or zsLastT < zsRtPrevT
-                zsRtBack += 1
-        zsRtSeen  += 1
-        zsRtPrevT := zsLastT
-        zsRtPrevN := zsN
-// ヒストリカル: チャート足 1 本の値として現れなかった 5分更新の数 (チャート足 > 5分なら原理的に多い。外部接続で受け取れる粒度)
-var int   zsHChg  = 0
-var int   zsHMiss = 0
-var float zsHPrev = na
-if barstate.ishistory and not na(zsN)
-    if not na(zsHPrev) and zsN != zsHPrev
-        zsHChg += 1
-        if zsN - zsHPrev > 1
-            zsHMiss += int(zsN - zsHPrev - 1)
-    zsHPrev := zsN
+    _bodyTop   = math.max(open, close)
+    _bodyBot   = math.min(open, close)
+    _rangeHigh = ta.highest(_bodyTop, rangeLen)
+    _rangeLow  = ta.lowest(_bodyBot, rangeLen)
+    _rangeNow  = _rangeHigh - _rangeLow
+    _rangeMid  = (_rangeHigh + _rangeLow) * 0.5
 
-// ---- 外部接続の試験用の出力 ----
-plot(30001, "ZSP protocol", display = display.none)
-plot(zsN, "ZSP 処理済み5分足数", display = display.none)
-plot(zsCk, "ZSP チェックサム", display = display.none)
-plot(zsLastT, "ZSP 最後に確定した5分足の開始時刻", display = display.none)
-plot(zsLastC, "ZSP 最後に確定した5分足の確定時刻", display = display.none)
-plot(zsE5, "ZSP 5分EMA (確定値)", display = display.none)
-plot(zsE5, "5分 EMA (5分基準・確定値)", color = color.new(color.navy, 30))
+    _upperCloses = 0
+    _lowerCloses = 0
+    _bullRun = 0
+    _bearRun = 0
+    _maxBullRun = 0
+    _maxBearRun = 0
 
-f_zsTm(int t) =>
-    na(t) ? "na" : str.format_time(t, "yyyy-MM-dd HH:mm", syminfo.timezone)
+    for i = 0 to rangeLen - 1
+        _upperCloses += close[i] > _rangeMid ? 1 : 0
+        _lowerCloses += close[i] < _rangeMid ? 1 : 0
+        _isBull = close[i] > open[i]
+        _isBear = close[i] < open[i]
 
-var table zsTb = table.new(position.top_right, 2, 16, border_width = 1)
-f_zsRow(int r, string a, string b) =>
-    table.cell(zsTb, 0, r, a, text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
-    table.cell(zsTb, 1, r, b, text_color = color.white, bgcolor = color.new(color.navy, 20), text_size = size.small)
+        if _isBull
+            _bullRun += 1
+            _bearRun := 0
+        else if _isBear
+            _bearRun += 1
+            _bullRun := 0
+        else
+            _bullRun := 0
+            _bearRun := 0
+
+        _maxBullRun := math.max(_maxBullRun, _bullRun)
+        _maxBearRun := math.max(_maxBearRun, _bearRun)
+
+    _startMid = (open[rangeLen - 1] + close[rangeLen - 1]) * 0.5
+    _endMid   = (open + close) * 0.5
+    _drift    = math.abs(_endMid - _startMid)
+
+    _condAtr = _atr > 0 and _rangeNow <= _atr * atrMult
+
+    _bodyTopNow = math.max(open, close)
+    _bodyBotNow = math.min(open, close)
+    _rangeShort = ta.highest(_bodyTopNow, rangeLen) - ta.lowest(_bodyBotNow, rangeLen)
+    _rangeBase  = ta.highest(_bodyTopNow, baseLen)  - ta.lowest(_bodyBotNow, baseLen)
+
+    _condBar      = _rangeBase > 0 and _rangeShort <= _rangeBase * barRatioMax
+    _condBalance  = _upperCloses >= minUpper and _lowerCloses >= minLower
+    _condDrift    = _rangeNow > 0 and (_drift / _rangeNow) <= driftMax
+    _condColorRun = _maxBullRun <= maxRun and _maxBearRun <= maxRun
+
+    _condAtr and _condBar and _condBalance and _condDrift and _condColorRun
+
+f_acAccumBoxState(simple int rangeLen, simple int baseLen, simple int atrLen,
+     simple int minUpper, simple int minLower, simple int maxRun,
+     float atrMult, float barRatioMax, float driftMax) =>
+    _isAccum   = f_acAccumBoxCore(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
+    _accumHigh = ta.highest(math.max(open, close), rangeLen)
+    _accumLow  = ta.lowest(math.min(open, close), rangeLen)
+    _isStart   = _isAccum and not nz(_isAccum[1], false)
+
+    var float _top = na
+    var float _bot = na
+    var int   _sid = na
+
+    if _isStart
+        _top := _accumHigh
+        _bot := _accumLow
+        _sid := time
+    if _isAccum
+        _bt = math.max(open, close)
+        _bb = math.min(open, close)
+        _top := math.max(nz(_top, _bt), _bt)
+        _bot := math.min(nz(_bot, _bb), _bb)
+
+    [_sid, _top, _bot, _isAccum ? 1 : 0]
+// ==== LAB Accum copy (end) ===================================================
+// ==== ZSY copy LAB_ACCUM end ====
+// ==== ZSY copy LAB_ACCUM_CONF begin (from ZoneComboLabXAU.pine, byte for byte) ====
+f_acConfirmed(simple int rangeLen, simple int baseLen, simple int atrLen,
+     simple int minUpper, simple int minLower, simple int maxRun,
+     float atrMult, float barRatioMax, float driftMax) =>
+    [_i, _u, _l, _a] = f_acAccumBoxState(rangeLen, baseLen, atrLen, minUpper, minLower, maxRun, atrMult, barRatioMax, driftMax)
+    [_u[1], _l[1], _i[1], _a[1]]
+// ==== ZSY copy LAB_ACCUM_CONF end ====
+// ==== ZSY copy LAB_PIVOT begin (from ZoneComboLabXAU.pine, byte for byte) ====
+f_lbPivotConfirmed(simple int len) =>
+    float _ph = ta.pivothigh(high, len, len)
+    float _pl = ta.pivotlow(low,  len, len)
+    int   _pt = na(_ph) ? int(na) : time
+    int   _lt = na(_pl) ? int(na) : time
+    [_ph[1], _pt[1], _pl[1], _lt[1]]
+// ==== ZSY copy LAB_PIVOT end ====
+// ==== ZSY copy LAB_FVG begin (from ZoneComboLabXAU.pine, byte for byte) ====
+// ==== LAB FVG copy (begin) ===================================================
+f_fvgConfirmed(float minWidth) =>
+    bool  _bull = low > high[2]
+    bool  _bear = high < low[2]
+    float _top  = _bull ? low : _bear ? low[2] : na
+    float _bot  = _bull ? high[2] : _bear ? high : na
+    int   _dir  = (_bull or _bear) and math.round_to_mintick(_top - _bot) >= minWidth ? (_bull ? 1 : -1) : 0
+    [time[1], time_close[1], close[1], _dir[1], _top[1], _bot[1]]
+// ==== LAB FVG copy (end) =====================================================
+// ==== ZSY copy LAB_FVG end ====
+// ==== ZSY copy FEED_POC begin (from MtfPocFeedXAU.pine, byte for byte) ====
+// ==== FEED POC core (begin) ==================================================
+f_pocCore(bool enabled, int off, int lookback, int bins) =>
+    float poc = na
+    float pUp = na
+    float pLo = na
+    if enabled and lookback > 0 and bins > 0 and bar_index - off >= lookback
+        float hi = na
+        float lo = na
+        bool  ok = true
+        for k = off to off + lookback - 1
+            float h = high[k]
+            float l = low[k]
+            float v = volume[k]
+            if na(h) or na(l) or na(v)
+                ok := false
+                break
+            hi := na(hi) ? h : math.max(hi, h)
+            lo := na(lo) ? l : math.min(lo, l)
+        float rangeAll = ok ? hi - lo : na
+        if ok and rangeAll > 0
+            array<float> bv = array.new_float(bins, 0.0)
+            float bs = rangeAll / bins
+            float total = 0.0
+            for k = off to off + lookback - 1
+                float ch = high[k]
+                float cl = low[k]
+                float cv = volume[k]
+                total += cv
+                float crange = ch - cl
+                if crange <= 0
+                    int bidx = math.max(0, math.min(bins - 1, int((cl - lo) / bs)))
+                    array.set(bv, bidx, array.get(bv, bidx) + cv)
+                else
+                    int b0 = math.max(0, math.floor((cl - lo) / bs) - 1)
+                    int b1 = math.min(bins - 1, math.floor((ch - lo) / bs) + 1)
+                    for bi = b0 to b1
+                        float binBot = lo + bi * bs
+                        float binTop = binBot + bs
+                        float ov = math.min(binTop, ch) - math.max(binBot, cl)
+                        if ov > 0
+                            array.set(bv, bi, array.get(bv, bi) + cv * ov / crange)
+            if total > 0
+                float best  = -1.0
+                int   bestI = 0
+                for bi = 0 to bins - 1
+                    float bvv = array.get(bv, bi)
+                    if bvv > best
+                        best  := bvv
+                        bestI := bi
+                pLo := lo + bestI * bs
+                pUp := pLo + bs
+                poc := (pUp + pLo) / 2.0
+    [poc, pUp, pLo]
+// ==== FEED POC core (end) ====================================================
+// ==== ZSY copy FEED_POC end ====
+// ==== ZSY copy FEED_FEED begin (from MtfPocFeedXAU.pine, byte for byte) ====
+f_feed(bool enabled, int lookback, int bins) =>
+    [pc, up, lo] = f_pocCore(enabled, 1, lookback, bins)
+    int   tk = time[1]
+    float tOut = not enabled ? 0.0 : na(tk) ? na : na(pc) ? -float(tk) : float(tk)
+    [enabled ? lo : na, enabled ? up : na, tOut]
+// ==== ZSY copy FEED_FEED end ====
+// ==== ZSY copy LFW_LOGIC begin (from LongFibWave.pine, byte for byte) ====
+// ==== LFW Logic (begin) — tests/lfw_sim.py translates and runs this section as is ====
+// 観測の決着区分 (outcome) : 0 再開 / 1 全戻し / 2 波切替終了 / 4 順序不明（3 = 観測中は記録せず、表示時に数える）
+// ビン (bin) : 固定分母での最大戻り率。1..9 = [10,20) .. [90,100) / 10 = 100%（全戻し）/ 11 = 100% 超（起点突破）
+type LfwRec
+    int dir
+    int waveId
+    int seq
+    float refO
+    float refE
+    int startAvail
+    int endAvail
+    int outcome
+    float rMax
+    float rAlt
+    int bin
+
+// 波の状態だけ（観測を含まない）。保留中は候補をこの型で複数持つ
+type LfwWave
+    int dir = 0
+    bool init = false
+    float O = na
+    int oT = na
+    int oAvail = na
+    float E = na
+    int eT = na
+    int eAvail = na
+    float rx = na
+    int rxT = na
+    // 診断専用（判定・保留の比較には使わない）: この波の起点・方向を最後に決めた分岐と、そのとき使った値
+    int dgWhy = 0          // 1 最初の波（主要高安） / 2 主要高安採用 / 3 同方向切替（時間足別の切替率） / 4 起点突破（方向反転）
+    float dgRatio = na     // 3: 判定に使った戻り率 / 4: 突破した価格の戻り率（> 1）
+    float dgSw = na        // 3: 判定に使ったこの時間足の同方向切替率
+    int dgCandT = na       // 1・2: 候補の極値足の時刻
+    float dgAtr = na       // 1・2: 極値足で固定した ATR
+    float dgThr = na       // 1・2: 必要値幅
+    float dgMove = na      // 1・2: 採用時の実値幅
+    bool dgMulti = false   // 保留の解除で、同じ波に至る候補が別の経路を持っていた
+
+// 起点または方向の変更 1 件の診断記録（日足・4H 別に直近 10 件）
+type LfwDiag
+    int avail
+    bool viaHold
+    int holdAvail
+    int bDir
+    float bO
+    int bOT
+    float bE
+    int aDir
+    float aO
+    int aOT
+    float aE
+    int why
+    float ratio
+    int candT
+    float atr
+    float thr
+    float move
+    bool multi
+    float sw
+
+// 主要高安の候補。kind 1 = 主要高値（下降波の候補）/ -1 = 主要安値（上昇波の候補）
+type LfwCand
+    int kind
+    float p
+    int t
+    float atr
+    float thr
+    int avail
+    float ext = na
+    int extT = na
+    float rx = na
+    int rxT = na
+    bool adopted = false
+
+type LfwTf
+    LfwWave w
+    bool hold = false
+    array<LfwWave> hyps
+    int holdAvail = na
+    int waveId = 0
+    bool obsOn = false
+    bool obsDone = false
+    int obsDir = 0
+    float obsO = na
+    float obsE = na
+    int obsStart = na
+    int obsSeq = 0
+    bool obsInit = false
+    int pL = 20
+    int pR = 3
+    float pM = 5.0
+    float sw = 0.782       // この時間足の同方向切替率（入力）
+    array<float> bH
+    array<float> bL
+    array<int> bT
+    array<float> bA
+    LfwCand cHi = na
+    LfwCand cLo = na
+    float initAtr = na
+    int initAvail = na
+    int firstT = na
+    int nBars = 0
+    array<int> cnt
+    array<int> nWaveObs
+    array<LfwRec> recs
+    array<LfwDiag> diag
+    int nExclInit = 0
+    int nStartAmb = 0
+    int nHold = 0
+    int nNoRetro = 0
+    int nReinit = 0
+    int nCandBroken = 0
+    int nAdopt = 0
+
+lfwNewTf(int pl, int pr, float pm, float sw) =>
+    LfwTf.new(w = LfwWave.new(), hyps = array.new<LfwWave>(), pL = pl, pR = pr, pM = pm, sw = sw, bH = array.new_float(),
+     bL = array.new_float(), bT = array.new_int(), bA = array.new_float(), cnt = array.new_int(120, 0),
+     nWaveObs = array.new_int(2, 0), recs = array.new<LfwRec>(), diag = array.new<LfwDiag>())
+
+lfwIdx(int d, int b, int o) =>
+    ((d == 1 ? 0 : 1) * 12 + b) * 5 + o
+
+lfwBin(float r) =>
+    r > 1.0 ? 11 : r >= 1.0 ? 10 : math.max(0, math.min(9, math.floor(r * 10.0 + 0.000000001)))
+
+// 戻り率 : 終点から価格 p までの戻り ÷ 波幅（上昇波・下降波共通の式）
+lfwRatio(LfwWave w, float p) =>
+    (w.E - p) / (w.E - w.O)
+
+// ---------------------------------------------------------------- 主要高安の候補
+// 候補の極値足より後の確定足 1 本で、候補を進める。返り値 false = 候補を後の高値（安値候補は安値）が厳密に超えた（無効）
+// 極値の更新（高値候補なら最安値の更新）があった足の反対側のヒゲは、その後の戻りに使わない
+lfwCandBar(LfwCand c, float h, float l, int t) =>
+    bool ok = true
+    if c.kind == 1
+        if h > c.p
+            ok := false
+        else if na(c.ext) or l < c.ext
+            c.ext := l
+            c.extT := t
+            c.rx := na
+            c.rxT := na
+        else if na(c.rx) or h > c.rx
+            c.rx := h
+            c.rxT := t
+    else
+        if l < c.p
+            ok := false
+        else if na(c.ext) or h > c.ext
+            c.ext := h
+            c.extT := t
+            c.rx := na
+            c.rxT := na
+        else if na(c.rx) or l < c.rx
+            c.rx := l
+            c.rxT := t
+    ok
+
+// 窓の中央の足（左 pL 本・右 pR 本）から候補を作る。右の pR 本で極値より後の動きを初期化する
+lfwMakeCand(LfwTf S, int kind, int c, float a, int availT) =>
+    float p = kind == 1 ? array.get(S.bH, c) : array.get(S.bL, c)
+    LfwCand k = LfwCand.new(kind, p, array.get(S.bT, c), a, a * S.pM, availT)
+    for i = c + 1 to array.size(S.bH) - 1
+        lfwCandBar(k, array.get(S.bH, i), array.get(S.bL, i), array.get(S.bT, i))
+    k
+
+// 確定足 1 本ごと : 既存候補を進め（無効化を含む）、窓に足して、右 pR 本目が確定した足を候補にする
+lfwCandStep(LfwTf S, float h, float l, int t, float atr, int availT) =>
+    if not na(S.cHi)
+        if not lfwCandBar(S.cHi, h, l, t)
+            S.cHi := na
+            S.nCandBroken := S.nCandBroken + 1
+    if not na(S.cLo)
+        if not lfwCandBar(S.cLo, h, l, t)
+            S.cLo := na
+            S.nCandBroken := S.nCandBroken + 1
+    array.push(S.bH, h)
+    array.push(S.bL, l)
+    array.push(S.bT, t)
+    array.push(S.bA, atr)
+    int n = S.pL + S.pR + 1
+    if array.size(S.bH) > n
+        array.shift(S.bH)
+        array.shift(S.bL)
+        array.shift(S.bT)
+        array.shift(S.bA)
+    if array.size(S.bH) == n
+        int c = S.pL
+        float ph = array.get(S.bH, c)
+        float pl = array.get(S.bL, c)
+        bool isH = true
+        bool isL = true
+        for i = 0 to n - 1
+            if i != c
+                if array.get(S.bH, i) >= ph
+                    isH := false
+                if array.get(S.bL, i) <= pl
+                    isL := false
+        float a = array.get(S.bA, c)
+        if not na(a)
+            if a > 0
+                if isH
+                    S.cHi := lfwMakeCand(S, 1, c, a, availT)
+                if isL
+                    S.cLo := lfwMakeCand(S, -1, c, a, availT)
     true
 
-if zsTbl and barstate.islast
-    bool zsShort = not na(zsFt5) and zsFt5 > zsAnchor
-    f_zsRow(0, "チャート足 / 5分の取得 / 使用", timeframe.period + " / " + (zsLowTf ? "lookahead_on" : "lookahead_off") + " / " +
-         (zsUseCur ? "その5分足まで (確定済み)" : "1本前まで (その5分足は形成中)"))
-    f_zsRow(1, "5分コンテキストの最初の足", f_zsTm(zsFt5))
-    f_zsRow(2, "5分コンテキストの本数", str.tostring(zsN5))
-    f_zsRow(3, "蓄積開始時刻", f_zsTm(zsAnchor) + (zsShort ? "  ★履歴不足 (この時刻のデータがない)" : ""))
-    f_zsRow(4, "最後に確定した5分足 (開始)", f_zsTm(zsLastT))
-    f_zsRow(5, "同 確定時刻 (time_close)", f_zsTm(zsLastC))
-    f_zsRow(6, "処理済み5分足数", str.tostring(zsN))
-    f_zsRow(7, "チェックサム", str.tostring(zsCk, "#"))
-    f_zsRow(8, "署名 (全時間足で同じなら一致)", str.tostring(zsN) + "/" + str.tostring(zsCk, "#") + "/" + f_zsTm(zsLastT) + (zsShort ? " (履歴不足)" : ""))
-    f_zsRow(9, "5分 EMA (確定値)", str.tostring(zsE5, format.mintick))
-    f_zsRow(10, "RT: ティック / 5分更新の観測", str.tostring(zsRtTicks) + " / " + str.tostring(zsRtSeen))
-    f_zsRow(11, "RT: 飛び (観測できなかった更新) / 逆戻り", str.tostring(zsRtJump) + " / " + str.tostring(zsRtBack))
-    f_zsRow(12, "履歴: チャート足で見えた更新 / 見えなかった更新", str.tostring(zsHChg) + " / " + str.tostring(zsHMiss))
+// 採用できる候補か（確認済み・未無効化・未採用・極値足より後の値幅が固定閾値以上）
+lfwCandOk(LfwCand c) =>
+    bool ok = false
+    if not na(c)
+        if not c.adopted and not na(c.ext)
+            ok := math.abs(c.p - c.ext) >= c.thr
+    ok
+
+lfwCandWave(LfwCand c, bool init, int availT) =>
+    LfwWave.new(-c.kind, init, c.p, c.t, availT, c.ext, c.extT, availT, c.rx, c.rxT, dgWhy = init ? 1 : 2, dgCandT = c.t,
+     dgAtr = c.atr, dgThr = c.thr, dgMove = math.abs(c.p - c.ext))
+
+// 波 w に対する主要高安の採用。上昇波には主要高値、下降波には主要安値だけ（起点足より新しい極値）。
+// 波がない場合は両方を見て、極値足が新しい方。同じ足なら方向を選べないので採用しない
+lfwAdopt(LfwTf S, LfwWave w, int availT) =>
+    LfwWave res = na
+    if w.dir == 1
+        if lfwCandOk(S.cHi)
+            if S.cHi.t > w.oT
+                res := lfwCandWave(S.cHi, false, availT)
+    else if w.dir == -1
+        if lfwCandOk(S.cLo)
+            if S.cLo.t > w.oT
+                res := lfwCandWave(S.cLo, false, availT)
+    else
+        bool okH = lfwCandOk(S.cHi)
+        bool okL = lfwCandOk(S.cLo)
+        if okH and okL
+            if S.cHi.t > S.cLo.t
+                res := lfwCandWave(S.cHi, true, availT)
+            else if S.cLo.t > S.cHi.t
+                res := lfwCandWave(S.cLo, true, availT)
+        else if okH
+            res := lfwCandWave(S.cHi, true, availT)
+        else if okL
+            res := lfwCandWave(S.cLo, true, availT)
+    res
+
+// 採用した波の起点が候補そのものなら、その候補を採用済みにする（重複採用しない）
+lfwMarkAdopted(LfwTf S, LfwWave w) =>
+    LfwCand ch = S.cHi
+    LfwCand cl = S.cLo
+    if w.dir == -1 and not na(ch)
+        if ch.t == w.oT and ch.p == w.O
+            ch.adopted := true
+    if w.dir == 1 and not na(cl)
+        if cl.t == w.oT and cl.p == w.O
+            cl.adopted := true
+    true
+
+// ---------------------------------------------------------------- 波の状態
+// 診断 : 起点・方向を変える分岐の中で、その分岐の理由と値を波に書く（判定には使わない）
+lfwDgSet(LfwWave w, int why, float ratio) =>
+    w.dgWhy := why
+    w.dgRatio := ratio
+    w.dgCandT := na
+    w.dgAtr := na
+    w.dgThr := na
+    w.dgMove := na
+    w.dgMulti := false
+    w.dgSw := na
+    true
+
+// 価格 1 点の処理（波の状態だけ）。noRet = 同じ足で既に終点が変わった後の点（終点より後とは限らないので戻りに使わない）
+// 返り値 : 終点が変わったか
+lfwPoint(LfwWave w, float p, int t, int availT, bool noRet, float sw) =>
+    int s = w.dir
+    bool changed = false
+    if s * (p - w.E) > 0
+        // 終点更新。切替率以上の戻り高安（候補）があれば、それを新しい起点にする（同方向の波切替）
+        if not na(w.rx) and lfwRatio(w, w.rx) >= sw
+            lfwDgSet(w, 3, lfwRatio(w, w.rx))
+            w.dgSw := sw
+            w.O := w.rx
+            w.oT := w.rxT
+            w.oAvail := availT
+            w.init := false
+        w.E := p
+        w.eT := t
+        w.eAvail := availT
+        w.rx := na
+        w.rxT := na
+        changed := true
+    else if s * (w.O - p) > 0
+        // 起点を厳密に突破 : 方向反転。旧終点が新しい起点
+        lfwDgSet(w, 4, lfwRatio(w, p))
+        w.dir := -s
+        w.O := w.E
+        w.oT := w.eT
+        w.oAvail := availT
+        w.E := p
+        w.eT := t
+        w.eAvail := availT
+        w.rx := na
+        w.rxT := na
+        w.init := false
+        changed := true
+    else if not noRet and (na(w.rx) or lfwRatio(w, p) > lfwRatio(w, w.rx))
+        w.rx := p
+        w.rxT := t
+    changed
+
+lfwSame(LfwWave a, LfwWave b) =>
+    a.dir == b.dir and a.init == b.init and a.O == b.O and a.oT == b.oT and a.E == b.E and a.eT == b.eT and
+     (na(a.rx) ? na(b.rx) : (not na(b.rx) and a.rx == b.rx and a.rxT == b.rxT))
+
+// 確定足 1 本 = 高値と安値（順序は OHLC から分からない）。高値→安値・安値→高値の両方で処理し、
+// 結果が同じなら 1 個、違えば 2 個を out に追加する（どちらかを仮定で選ばない）
+lfwBarStep(LfwWave w, float h, float l, int t, int availT, array<LfwWave> out, float sw) =>
+    LfwWave a = w.copy()
+    bool ca = lfwPoint(a, h, t, availT, false, sw)
+    lfwPoint(a, l, t, availT, ca, sw)
+    LfwWave b = w.copy()
+    bool cb = lfwPoint(b, l, t, availT, false, sw)
+    lfwPoint(b, h, t, availT, cb, sw)
+    array.push(out, a)
+    if not lfwSame(a, b)
+        array.push(out, b)
+    array.size(out)
+
+// 1 つの波（保留中は各候補）の確定足 1 本 : 主要高安の採用が成立すればその 1 つ、なければ従来の処理
+lfwHypStep(LfwTf S, LfwWave w, float h, float l, int t, int availT, array<LfwWave> out) =>
+    LfwWave a = lfwAdopt(S, w, availT)
+    if not na(a)
+        array.push(out, a)
+    else
+        lfwBarStep(w, h, l, t, availT, out, S.sw)
+    array.size(out)
+
+// ---------------------------------------------------------------- 観測
+lfwStartObs(LfwTf S, int availT) =>
+    S.obsOn := true
+    S.obsDir := S.w.dir
+    S.obsO := S.w.O
+    S.obsE := S.w.E
+    S.obsStart := availT
+    S.obsSeq := S.obsSeq + 1
+    S.obsInit := S.w.init and lfwExclInit
+    if not S.obsInit and S.obsSeq == 1
+        int k = S.obsDir == 1 ? 0 : 1
+        array.set(S.nWaveObs, k, array.get(S.nWaveObs, k) + 1)
+    true
+
+// 決着の保存。段は決着理由と別に、固定分母での戻り率 r から決める（主要高安の採用による波切替終了は 100% 未満もある）
+lfwRecord(LfwTf S, int outcome, float r, float rAlt, int availT) =>
+    int b = lfwBin(r)
+    if S.obsInit
+        S.nExclInit := S.nExclInit + 1
+    else
+        int idx = lfwIdx(S.obsDir, b, outcome)
+        array.set(S.cnt, idx, array.get(S.cnt, idx) + 1)
+        array.push(S.recs, LfwRec.new(S.obsDir, S.waveId, S.obsSeq, S.obsO, S.obsE, S.obsStart, availT, outcome, r, rAlt, b))
+        if array.size(S.recs) > lfwMaxRecs
+            array.shift(S.recs)
+    S.obsOn := false
+    b
+
+// 新しい波（起点が変わった・保留が解けた・採用した）: 波番号を進め、観測を新しい波で数え直す
+lfwBook(LfwTf S) =>
+    S.waveId := S.waveId + 1
+    S.obsOn := false
+    S.obsDone := false
+    S.obsSeq := 0
+    true
+
+// 診断 : 起点または方向が変わったときだけ記録する（終点だけの更新は記録しない）。直近 10 件
+lfwLog(LfwTf S, LfwWave b, LfwWave a, int availT, bool viaHold) =>
+    if a.dir != b.dir or a.O != b.O or a.oT != b.oT or na(b.O)
+        array.push(S.diag, LfwDiag.new(availT, viaHold, S.holdAvail, b.dir, b.O, b.oT, b.E, a.dir, a.O, a.oT, a.E, a.dgWhy,
+             a.dgRatio, a.dgCandT, a.dgAtr, a.dgThr, a.dgMove, a.dgMulti, a.dgSw))
+        if array.size(S.diag) > 10
+            array.shift(S.diag)
+    true
+
+// 採用・保留解除より前に起きた戻りからは観測を作らない（この終点が更新されるまで）
+lfwNoRetro(LfwTf S) =>
+    if not na(S.w.rx)
+        if lfwRatio(S.w, S.w.rx) >= lfwStartRatio
+            S.obsDone := true
+            S.nNoRetro := S.nNoRetro + 1
+    true
+
+// 波がない（最初・安全弁の後）: 主要高安＋値幅で最初の波を採用する
+lfwStartFirst(LfwTf S, int availT) =>
+    LfwWave a = lfwAdopt(S, S.w, availT)
+    if not na(a)
+        lfwLog(S, S.w, a, availT, false)
+        S.w := a
+        lfwMarkAdopted(S, a)
+        S.initAvail := availT
+        if a.dir == -1
+            S.initAtr := S.cHi.atr
+        else
+            S.initAtr := S.cLo.atr
+        S.nAdopt := S.nAdopt + 1
+        lfwBook(S)
+        lfwNoRetro(S)
+    true
+
+// 保留中 : 各候補を同じ規則で進め、結果がすべて同じになった確定足で保留を解く（保留中は観測しない）
+lfwHoldStep(LfwTf S, float h, float l, int t, int availT) =>
+    array<LfwWave> nxt = array.new<LfwWave>()
+    for i = 0 to array.size(S.hyps) - 1
+        array<LfwWave> res = array.new<LfwWave>()
+        lfwHypStep(S, array.get(S.hyps, i), h, l, t, availT, res)
+        for k = 0 to array.size(res) - 1
+            LfwWave c = array.get(res, k)
+            bool dup = false
+            if array.size(nxt) > 0
+                for j = 0 to array.size(nxt) - 1
+                    LfwWave x = array.get(nxt, j)
+                    if lfwSame(x, c)
+                        dup := true
+                        // 診断だけ : 同じ波に別の経路で至った候補があったことを残す（判定・解除には使わない）
+                        if x.dgWhy != c.dgWhy or x.oAvail != c.oAvail
+                            x.dgMulti := true
+            if not dup
+                array.push(nxt, c)
+    S.hyps := nxt
+    if array.size(nxt) == 1
+        LfwWave nw = array.get(nxt, 0)
+        // 一意になった時点が、この起点・終点を使える時刻
+        nw.oAvail := availT
+        nw.eAvail := availT
+        lfwLog(S, S.w, nw, availT, true)
+        S.w := nw
+        S.hold := false
+        S.hyps := array.new<LfwWave>()
+        lfwMarkAdopted(S, nw)
+        lfwBook(S)
+        lfwNoRetro(S)
+    else if array.size(nxt) > 16
+        // 候補が増え続ける場合の安全弁 : 波を捨て、主要高安の方式で最初の波からやり直す（件数を表示）
+        S.hold := false
+        S.hyps := array.new<LfwWave>()
+        S.w := LfwWave.new()
+        S.nReinit := S.nReinit + 1
+        lfwStartFirst(S, availT)
+    true
+
+// 確定した対象時間足 1 本の処理
+lfwProcess(LfwTf S, float h, float l, int t, float atr, int availT) =>
+    if na(S.firstT)
+        S.firstT := t
+    S.nBars := S.nBars + 1
+    lfwCandStep(S, h, l, t, atr, availT)
+    if S.hold
+        lfwHoldStep(S, h, l, t, availT)
+    else if S.w.dir == 0
+        lfwStartFirst(S, availT)
+    else
+        LfwWave w = S.w
+        int s = w.dir
+        float extP = s == 1 ? h : l
+        float retP = s == 1 ? l : h
+        bool X = s * (extP - w.E) > 0
+        bool B = s * (w.O - retP) > 0
+        bool T = retP == w.O
+        float rPrior = na(w.rx) ? 0.0 : lfwRatio(w, w.rx)
+        float rBar = lfwRatio(w, retP)
+        LfwWave aw = lfwAdopt(S, w, availT)
+        array<LfwWave> res = array.new<LfwWave>()
+        if na(aw)
+            lfwBarStep(w, h, l, t, availT, res, S.sw)
+        if na(aw) and array.size(res) > 1
+            // 足内の順序で波の状態が変わる : 判定を保留。観測中の観測は順序不明で閉じる
+            if S.obsOn
+                lfwRecord(S, 4, rPrior, rBar, availT)
+            S.hold := true
+            S.hyps := res
+            S.holdAvail := availT
+            S.nHold := S.nHold + 1
+        else
+            // 旧観測を旧分母で先に処理してから、波を更新する
+            if X
+                // 元方向へ終点更新 : 旧観測の決着を旧分母で保存
+                if S.obsOn
+                    if rBar > rPrior and (rBar >= 1.0 or lfwBin(rBar) != lfwBin(rPrior))
+                        lfwRecord(S, 4, rPrior, rBar, availT)
+                    else
+                        lfwRecord(S, 0, rPrior, na, availT)
+                else if not S.obsDone and rBar >= lfwStartRatio
+                    S.nStartAmb := S.nStartAmb + 1
+                S.obsDone := false
+            else if B
+                // 起点を厳密に突破 : 波切替終了（10% 未満から 1 本で突破した場合も、この足で開始して終了）
+                if S.obsOn
+                    lfwRecord(S, 2, rBar, na, availT)
+                else if not S.obsDone
+                    lfwStartObs(S, availT)
+                    lfwRecord(S, 2, rBar, na, availT)
+            else
+                // 戻り側だけ : 最大戻り率を更新し、観測の開始・全戻しを判定
+                float rNow = na(w.rx) ? rBar : math.max(rPrior, rBar)
+                if not S.obsOn and not S.obsDone and rNow >= lfwStartRatio
+                    lfwStartObs(S, availT)
+                if S.obsOn and T
+                    lfwRecord(S, 1, 1.0, na, availT)
+                    S.obsDone := true
+                // それでも観測中のまま主要高安の新しい波へ切り替わる : 旧分母・旧最大戻り率で波切替終了
+                if S.obsOn and not na(aw)
+                    lfwRecord(S, 2, rNow, na, availT)
+            LfwWave nw = aw
+            if na(aw)
+                nw := array.get(res, 0)
+            bool newWave = nw.dir != w.dir or nw.O != w.O or nw.oT != w.oT
+            if newWave
+                lfwLog(S, w, nw, availT, false)
+            S.w := nw
+            if newWave
+                lfwBook(S)
+            if not na(aw)
+                lfwMarkAdopted(S, aw)
+                S.nAdopt := S.nAdopt + 1
+                lfwNoRetro(S)
+    true
+
+// ==== LFW Logic (end) ====
+
+// ==== LFW Transfer (begin) — 対象時間足の中の最終状態（表・描画用）を数値の配列にして渡し、チャート側で表示用の LfwTf に戻す ====
+// 配置: 0 保留 / 1 候補数 / 2 保留開始 / 3 方向 / 4 最初の波 / 5 起点 / 6 起点の足 / 7 起点の利用可能 / 8 終点 / 9 終点の足 / 10 終点の利用可能 /
+//       11 戻り高安 / 12 その足 / 13 波 ID / 14 切替率 / 15 観測中 / 16 最初の波の観測 / 17 観測番号 / 18 観測の方向 /
+//       19〜23 主要高値の候補 (有無, 価格, 採用済, 極値, 閾値) / 24〜28 主要安値の候補 / 29 最初の波の採用時刻 / 30 その ATR /
+//       31〜35 採用 / 保留 / 観測対象外 / 開始の順序不明 / 再初期化 / 36・37 観測のあった波 (上昇 / 下降) / 38 最初の波の除外 /
+//       39 処理本数 / 40 最初に処理した足 / 41〜160 件数 (120) / 161 診断件数 n / 診断 19 × n / 保留候補 4 × 候補数 (起点, その足, 終点, その足)
+lfwPutCand(array<float> a, LfwCand c) =>
+    if na(c)
+        for k = 0 to 4
+            array.push(a, na)
+        array.set(a, array.size(a) - 5, 0)
+    else
+        array.push(a, 1)
+        array.push(a, c.p)
+        array.push(a, c.adopted ? 1 : 0)
+        array.push(a, c.ext)
+        array.push(a, c.thr)
+    true
+
+lfwPack(LfwTf S) =>
+    array<float> a = array.new_float()
+    LfwWave w = S.w
+    array.push(a, S.hold ? 1 : 0)
+    array.push(a, array.size(S.hyps))
+    array.push(a, S.holdAvail)
+    array.push(a, w.dir)
+    array.push(a, w.init ? 1 : 0)
+    array.push(a, w.O)
+    array.push(a, w.oT)
+    array.push(a, w.oAvail)
+    array.push(a, w.E)
+    array.push(a, w.eT)
+    array.push(a, w.eAvail)
+    array.push(a, w.rx)
+    array.push(a, w.rxT)
+    array.push(a, S.waveId)
+    array.push(a, S.sw)
+    array.push(a, S.obsOn ? 1 : 0)
+    array.push(a, S.obsInit ? 1 : 0)
+    array.push(a, S.obsSeq)
+    array.push(a, S.obsDir)
+    lfwPutCand(a, S.cHi)
+    lfwPutCand(a, S.cLo)
+    array.push(a, S.initAvail)
+    array.push(a, S.initAtr)
+    array.push(a, S.nAdopt)
+    array.push(a, S.nHold)
+    array.push(a, S.nNoRetro)
+    array.push(a, S.nStartAmb)
+    array.push(a, S.nReinit)
+    array.push(a, array.get(S.nWaveObs, 0))
+    array.push(a, array.get(S.nWaveObs, 1))
+    array.push(a, S.nExclInit)
+    array.push(a, S.nBars)
+    array.push(a, S.firstT)
+    for k = 0 to 119
+        array.push(a, array.get(S.cnt, k))
+    int nd = array.size(S.diag)
+    array.push(a, nd)
+    if nd > 0
+        for k = 0 to nd - 1
+            LfwDiag d = array.get(S.diag, k)
+            array.push(a, d.avail)
+            array.push(a, d.viaHold ? 1 : 0)
+            array.push(a, d.holdAvail)
+            array.push(a, d.bDir)
+            array.push(a, d.bO)
+            array.push(a, d.bOT)
+            array.push(a, d.bE)
+            array.push(a, d.aDir)
+            array.push(a, d.aO)
+            array.push(a, d.aOT)
+            array.push(a, d.aE)
+            array.push(a, d.why)
+            array.push(a, d.ratio)
+            array.push(a, d.candT)
+            array.push(a, d.atr)
+            array.push(a, d.thr)
+            array.push(a, d.move)
+            array.push(a, d.multi ? 1 : 0)
+            array.push(a, d.sw)
+    int nh = array.size(S.hyps)
+    if nh > 0
+        for k = 0 to nh - 1
+            LfwWave h = array.get(S.hyps, k)
+            array.push(a, h.O)
+            array.push(a, h.oT)
+            array.push(a, h.E)
+            array.push(a, h.eT)
+    a
+
+lfwGetCand(array<float> a, int i, int kind) =>
+    LfwCand c = na
+    if array.get(a, i) == 1
+        c := LfwCand.new(kind, array.get(a, i + 1), na, na, array.get(a, i + 4), na, ext = array.get(a, i + 3), adopted = array.get(a, i + 2) == 1)
+    c
+
+// 表示用の LfwTf (表・描画が読むフィールドだけを戻す。判定には使わない)
+lfwUnpack(array<float> a, int pl, int pr, float pm, float sw) =>
+    LfwTf S = lfwNewTf(pl, pr, pm, sw)
+    if not na(a)
+        S.hold := array.get(a, 0) == 1
+        int nh = int(array.get(a, 1))
+        S.holdAvail := int(array.get(a, 2))
+        S.w := LfwWave.new(int(array.get(a, 3)), array.get(a, 4) == 1, array.get(a, 5), int(array.get(a, 6)), int(array.get(a, 7)),
+             array.get(a, 8), int(array.get(a, 9)), int(array.get(a, 10)), array.get(a, 11), int(array.get(a, 12)))
+        S.waveId := int(array.get(a, 13))
+        S.sw := array.get(a, 14)
+        S.obsOn := array.get(a, 15) == 1
+        S.obsInit := array.get(a, 16) == 1
+        S.obsSeq := int(array.get(a, 17))
+        S.obsDir := int(array.get(a, 18))
+        S.cHi := lfwGetCand(a, 19, 1)
+        S.cLo := lfwGetCand(a, 24, -1)
+        S.initAvail := int(array.get(a, 29))
+        S.initAtr := array.get(a, 30)
+        S.nAdopt := int(array.get(a, 31))
+        S.nHold := int(array.get(a, 32))
+        S.nNoRetro := int(array.get(a, 33))
+        S.nStartAmb := int(array.get(a, 34))
+        S.nReinit := int(array.get(a, 35))
+        array.set(S.nWaveObs, 0, int(array.get(a, 36)))
+        array.set(S.nWaveObs, 1, int(array.get(a, 37)))
+        S.nExclInit := int(array.get(a, 38))
+        S.nBars := int(array.get(a, 39))
+        S.firstT := int(array.get(a, 40))
+        for k = 0 to 119
+            array.set(S.cnt, k, int(array.get(a, 41 + k)))
+        int nd = int(array.get(a, 161))
+        int i = 162
+        if nd > 0
+            for k = 0 to nd - 1
+                array.push(S.diag, LfwDiag.new(int(array.get(a, i)), array.get(a, i + 1) == 1, int(array.get(a, i + 2)), int(array.get(a, i + 3)),
+                     array.get(a, i + 4), int(array.get(a, i + 5)), array.get(a, i + 6), int(array.get(a, i + 7)), array.get(a, i + 8),
+                     int(array.get(a, i + 9)), array.get(a, i + 10), int(array.get(a, i + 11)), array.get(a, i + 12), int(array.get(a, i + 13)),
+                     array.get(a, i + 14), array.get(a, i + 15), array.get(a, i + 16), array.get(a, i + 17) == 1, array.get(a, i + 18)))
+                i += 19
+        if nh > 0
+            for k = 0 to nh - 1
+                array.push(S.hyps, LfwWave.new(O = array.get(a, i), oT = int(array.get(a, i + 1)), E = array.get(a, i + 2), eT = int(array.get(a, i + 3))))
+                i += 4
+    S
+// ==== LFW Transfer (end) ====
+// ==== ZSY copy LFW_LOGIC end ====
+// ==== ZSY copy LFW_CORE begin (from LongFibWave.pine, byte for byte) ====
+f_lfwCore(int pl, int pr, float pm, float sw, bool on, int off) =>
+    var LfwTf S = lfwNewTf(pl, pr, pm, sw)
+    float atr = ta.atr(lfwAtrLen)
+    array<float> pPrev = na
+    if barstate.islast
+        pPrev := lfwPack(S)
+    if on
+        lfwProcess(S, high, low, time, atr, time_close)
+    array<float> pCur = na
+    if barstate.islast
+        pCur := lfwPack(S)
+    float vHold = S.hold ? 1 : 0
+    float vDir  = S.w.dir
+    float vO    = S.w.O
+    float vE    = S.w.E
+    float vId   = S.waveId
+    [vHold[off], vDir[off], vO[off], vE[off], vId[off], pPrev, pCur]
+// ==== ZSY copy LFW_CORE end ====
+// ==== ZSY copy LFW_FIBSTATE begin (from LongFibWave.pine, byte for byte) ====
+f_fibState(bool on, float hold, float dir, float O, float E) =>
+    int st = 0
+    if on
+        st := hold == 1 ? 2 : 1
+        if hold != 1 and (dir == 1 or dir == -1) and not na(O) and not na(E)
+            if O != E
+                st := 3
+    st
+// ==== ZSY copy LFW_FIBSTATE end ====
+// ==== ZSY copy LFW_FIBFEED begin (from LongFibWave.pine, byte for byte) ====
+f_fibFeed(array<float> fd, bool on, float hold, float dir, float O, float E, float wid) =>
+    int   st = f_fibState(on, hold, dir, O, E)
+    float o  = st == 3 ? O : na
+    float e  = st == 3 ? E : na
+    float d  = st == 3 ? dir : 0
+    float id = wid
+    bool chg = na(array.get(fd, 5))
+    if not chg
+        chg := nz(array.get(fd, 0), -1.0) != nz(o, -1.0) or nz(array.get(fd, 1), -1.0) != nz(e, -1.0) or array.get(fd, 2) != d
+             or array.get(fd, 3) != id or array.get(fd, 4) != st
+    if chg
+        array.set(fd, 0, o)
+        array.set(fd, 1, e)
+        array.set(fd, 2, d)
+        array.set(fd, 3, id)
+        array.set(fd, 4, st)
+        array.set(fd, 5, time_close)
+    chg
+// ==== ZSY copy LFW_FIBFEED end ====
+
+// ============================================================================
+// 固定 5分の計算
+// ============================================================================
+// EMA: ta.ema と、指定した時刻から始める 2 つの計算 (S = 最初の len 本の単純平均から / F = 最初の値から)。
+// 5分足チャートで「登録開始 = 最初の足」にしたとき、ta.ema とどちらが同じかで Pine の初期値の決め方を確かめる
+f_zpEmaV(float src, simple int len, int startT) =>
+    float a = 2.0 / (len + 1)
+    var int   c  = 0
+    var float sm = 0.0
+    var float eS = na
+    var float eF = na
+    if time >= startT and not na(src)
+        c += 1
+        if c <= len
+            sm += src
+            if c == len
+                eS := sm / len
+        else
+            eS := a * src + (1 - a) * eS
+        eF := na(eF) ? src : a * src + (1 - a) * eF
+    [ta.ema(src, len), eS, eF]
+
+// 取得の最初の足と本数 (= その時間足で実際に使える計算履歴)
+f_zpCtx() =>
+    var int ft = time
+    var int nb = 0
+    nb += 1
+    [ft, nb]
+
+f_zpMix(float ck, float x) =>
+    (ck * 131.0 + (math.round(x) % 1000003)) % 999983.0
+
+f_zpPx(float p) =>
+    na(p) ? 0.0 : p / syminfo.mintick
+
+f_zpEng() =>
+    // ---- 入れ子の取得 (Lab / MtfPocFeedXAU / LongFibWave と同じ式・同じ lookahead) ----
+    [e1t, e1s, e1f] = request.security(syminfo.tickerid, "1", f_zpEmaV(close, zbLen1, zpRef1), lookahead = barmerge.lookahead_off)
+    [e5t, e5s, e5f] = f_zpEmaV(close, zbLen2, zpAnchor)
+    [f1u, f1l, f1i, f1a] = request.security(syminfo.tickerid, "60", f_acConfirmed(accumRangeLen, accumBaseLen, accumAtrLen,
+         accumMinUpperCloses, accumMinLowerCloses, accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax),
+         lookahead = barmerge.lookahead_on)
+    [f2u, f2l, f2i, f2a] = request.security(syminfo.tickerid, "240", f_acConfirmed(accumRangeLen, accumBaseLen, accumAtrLen,
+         accumMinUpperCloses, accumMinLowerCloses, accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax),
+         lookahead = barmerge.lookahead_on)
+    [f3u, f3l, f3i, f3a] = request.security(syminfo.tickerid, "D", f_acConfirmed(accumRangeLen, accumBaseLen, accumAtrLen,
+         accumMinUpperCloses, accumMinLowerCloses, accumMaxSameColorRun, accumAtrMult, accumBarRatioMax, accumDriftMax),
+         lookahead = barmerge.lookahead_on)
+    [s1h, s1ht, s1l, s1lt] = request.security(syminfo.tickerid, "60",  f_lbPivotConfirmed(zcPiv1), lookahead = barmerge.lookahead_on)
+    [s2h, s2ht, s2l, s2lt] = request.security(syminfo.tickerid, "240", f_lbPivotConfirmed(zcPiv2), lookahead = barmerge.lookahead_on)
+    [s3h, s3ht, s3l, s3lt] = request.security(syminfo.tickerid, "D",   f_lbPivotConfirmed(zcPiv3), lookahead = barmerge.lookahead_on)
+    [s4h, s4ht, s4l, s4lt] = request.security(syminfo.tickerid, "W",   f_lbPivotConfirmed(zcPiv4), lookahead = barmerge.lookahead_on)
+    [g1k, g1kc, g1c, g1d, g1t, g1b] = request.security(syminfo.tickerid, "60",  f_fvgConfirmed(zfMinW), lookahead = barmerge.lookahead_on)
+    [g2k, g2kc, g2c, g2d, g2t, g2b] = request.security(syminfo.tickerid, "240", f_fvgConfirmed(zfMinW), lookahead = barmerge.lookahead_on)
+    [g3k, g3kc, g3c, g3d, g3t, g3b] = request.security(syminfo.tickerid, "D",   f_fvgConfirmed(zfMinW), lookahead = barmerge.lookahead_on)
+    [g4k, g4kc, g4c, g4d, g4t, g4b] = request.security(syminfo.tickerid, "W",   f_fvgConfirmed(zfMinW), lookahead = barmerge.lookahead_on)
+    [d1l, d1u, d1t] = request.security(syminfo.tickerid, "60",  f_feed(pocUse1, pocLen1, pocBins), lookahead = barmerge.lookahead_on)
+    [d2l, d2u, d2t] = request.security(syminfo.tickerid, "240", f_feed(pocUse2, pocLen2, pocBins), lookahead = barmerge.lookahead_on)
+    [d3l, d3u, d3t] = request.security(syminfo.tickerid, "D",   f_feed(pocUse3, pocLen3, pocBins), lookahead = barmerge.lookahead_on)
+    [d4l, d4u, d4t] = request.security(syminfo.tickerid, "W",   f_feed(pocUse4, pocLen4, pocBins), lookahead = barmerge.lookahead_on)
+    // LongFibWave: 5分足チャートでは「チャート足 < 対象時間足」なので 1 本ずらし (off = 1) を lookahead_on で受け取る (LongFibWave と同じ)
+    [lfwHdS, lfwDdS, lfwOdS, lfwEdS, lfwIdS, lfwPpD, lfwPcD] = request.security(syminfo.tickerid, "D",
+         f_lfwCore(lfwPivLD, lfwPivRD, lfwPivMD, lfwSwitchRatioD, true, 1), lookahead = barmerge.lookahead_on)
+    [lfwH4S, lfwD4S, lfwO4S, lfwE4S, lfwI4S, lfwPp4, lfwPc4] = request.security(syminfo.tickerid, "240",
+         f_lfwCore(lfwPivL4, lfwPivR4, lfwPivM4, lfwSwitchRatio4, true, 1), lookahead = barmerge.lookahead_on)
+    [c1T, c1N] = request.security(syminfo.tickerid, "1",   f_zpCtx(), lookahead = barmerge.lookahead_off)
+    [cHT, cHN] = request.security(syminfo.tickerid, "60",  f_zpCtx(), lookahead = barmerge.lookahead_on)
+    [c4T, c4N] = request.security(syminfo.tickerid, "240", f_zpCtx(), lookahead = barmerge.lookahead_on)
+    [cDT, cDN] = request.security(syminfo.tickerid, "D",   f_zpCtx(), lookahead = barmerge.lookahead_on)
+    [cWT, cWN] = request.security(syminfo.tickerid, "W",   f_zpCtx(), lookahead = barmerge.lookahead_on)
+
+    var int ft5 = time
+    var int n5  = 0
+    n5 += 1
+    // ---- 5分足チャート側の状態 (Lab / LongFibWave が 5分足チャートで持つもの)。Zone 登録開始時刻以後に始める ----
+    var int   n     = 0
+    var float ck    = 0.0
+    var int   lastT = na
+    var int   lastC = na
+    var int   evAcc = 0
+    var int   evPiv = 0
+    var int   evFvg = 0
+    var int   evInv = 0
+    var int   evDead = 0
+    var int   evPoc = 0
+    var int   evFib = 0
+    var int   evFibClr = 0
+    var int   lTy  = 0       // 最後の登録・更新: 1 アキュム / 2 水平線 / 3 POC / 4 FVG / 5 iFVG / 6 FVG 無効 / 7 フィボ / 8 フィボ解除
+    var int   lReg = na      // その 5分足の開始時刻 (Lab の登録足)
+    var int   lAv  = na      // その 5分足の確定時刻 (利用可能)
+    var float lSrc = na      // 検出元の時刻 (上位足 / Pivot / FVG 形成足 / POC 対象足 / フィボ更新確定)
+    var array<int>   acLast = array.new_int(3, na)
+    var array<int>   acPend = array.new_int(3, na)
+    var array<float> acPU   = array.new_float(3, na)
+    var array<float> acPL   = array.new_float(3, na)
+    var array<int>   acN    = array.new_int(3, 0)
+    var array<float> acU    = array.new_float(3, na)
+    var array<float> acL    = array.new_float(3, na)
+    var array<int>   acReg  = array.new_int(3, na)
+    var array<float> pvP    = array.new_float()
+    var array<int>   pvTf   = array.new_int()
+    var array<int>   pvReg  = array.new_int()
+    var array<int>   pvLastH = array.new_int(4, na)
+    var array<int>   pvLastL = array.new_int(4, na)
+    var array<int>   fvTf   = array.new_int()
+    var array<int>   fvSub  = array.new_int()
+    var array<int>   fvKey  = array.new_int()
+    var array<float> fvTop  = array.new_float()
+    var array<float> fvBot  = array.new_float()
+    var array<int>   fvSt   = array.new_int()      // 0 FVG / 1 iFVG / 2 無効
+    var array<int>   fvReg  = array.new_int()
+    var array<int>   fvLast = array.new_int(4, na)
+    var array<float> pocC   = array.new_float(4, na)
+    var array<int>   pocReg = array.new_int(4, na)
+    var array<int>   pocSt  = array.new_int(4, 0)
+    var float lfwHoldD = 0
+    var float lfwDirD  = 0
+    var float lfwOD    = na
+    var float lfwED    = na
+    var float lfwIdD   = 0
+    var float lfwHold4 = 0
+    var float lfwDir4  = 0
+    var float lfwO4    = na
+    var float lfwE4    = na
+    var float lfwId4   = 0
+    var array<float> lfwFeedD = array.new_float(6, na)
+    var array<float> lfwFeed4 = array.new_float(6, na)
+    var array<float> zeLast = array.new_float(10, na)
+    var array<int>   zeSt   = array.new_int(2, 0)
+    var array<int>   zeReg  = array.new_int(2, na)
+
+    if time >= zpAnchor
+        n     += 1
+        ck    := f_zpMix(ck, f_zpPx(close))
+        lastT := time
+        lastC := time_close
+        // ZA アキュム (Lab (B1) の規則: 新しい ID で前の形成中を固定、同じ ID は形成中に更新、形成中フラグ 0 で固定)
+        array<float> fU = array.from(f1u, f2u, f3u)
+        array<float> fL = array.from(f1l, f2l, f3l)
+        array<int>   fI = array.from(f1i, f2i, f3i)
+        array<int>   fA = array.from(f1a, f2a, f3a)
+        for k = 0 to 2
+            int   aid = array.get(fI, k)
+            float u   = array.get(fU, k)
+            float l   = array.get(fL, k)
+            if not na(aid) and not na(u) and not na(l)
+                bool forming = array.get(fA, k) == 1
+                int  last    = array.get(acLast, k)
+                int  fixN    = 0
+                float fxU    = na
+                float fxL    = na
+                if na(last) or aid != last
+                    array.set(acLast, k, aid)
+                    if not na(array.get(acPend, k))
+                        fixN += 1
+                        fxU := array.get(acPU, k)
+                        fxL := array.get(acPL, k)
+                        array.set(acPend, k, na)
+                    if forming
+                        array.set(acPend, k, aid)
+                        array.set(acPU, k, u)
+                        array.set(acPL, k, l)
+                    else
+                        fixN += 1
+                        fxU := u
+                        fxL := l
+                else if array.get(acPend, k) == aid
+                    array.set(acPU, k, u)
+                    array.set(acPL, k, l)
+                    if not forming
+                        fixN += 1
+                        fxU := u
+                        fxL := l
+                        array.set(acPend, k, na)
+                if fixN > 0
+                    array.set(acN, k, array.get(acN, k) + fixN)
+                    array.set(acU, k, fxU)
+                    array.set(acL, k, fxL)
+                    array.set(acReg, k, time)
+                    evAcc += fixN
+                    ck   := f_zpMix(ck, 100 + k + f_zpPx(fxU) + f_zpPx(fxL))
+                    lTy  := 1
+                    lReg := time
+                    lAv  := time_close
+                    lSrc := aid
+        // ZC 水平線 (新しい Pivot 時刻ごとに 1 件。統合はこの試験では行わない)
+        array<float> pH  = array.from(s1h, s2h, s3h, s4h)
+        array<int>   pHt = array.from(s1ht, s2ht, s3ht, s4ht)
+        array<float> pL  = array.from(s1l, s2l, s3l, s4l)
+        array<int>   pLt = array.from(s1lt, s2lt, s3lt, s4lt)
+        for k = 0 to 3
+            for s = 0 to 1
+                float pv = s == 0 ? array.get(pH, k) : array.get(pL, k)
+                int   pt = s == 0 ? array.get(pHt, k) : array.get(pLt, k)
+                int   lt = s == 0 ? array.get(pvLastH, k) : array.get(pvLastL, k)
+                if not na(pt) and not na(pv) and (na(lt) or pt != lt)
+                    if s == 0
+                        array.set(pvLastH, k, pt)
+                    else
+                        array.set(pvLastL, k, pt)
+                    array.push(pvP, pv)
+                    array.push(pvTf, k)
+                    array.push(pvReg, time)
+                    evPiv += 1
+                    ck   := f_zpMix(ck, 200 + k * 2 + s + f_zpPx(pv))
+                    lTy  := 2
+                    lReg := time
+                    lAv  := time_close
+                    lSrc := pt
+        // ZD 出来高 POC (Lab の受信規則: 正常で中心が前回の有効値から変わったら新 POC。時刻だけの更新では何もしない)
+        array<float> dL = array.from(d1l, d2l, d3l, d4l)
+        array<float> dU = array.from(d1u, d2u, d3u, d4u)
+        array<float> dT = array.from(d1t, d2t, d3t, d4t)
+        for k = 0 to 3
+            float tt = array.get(dT, k)
+            float lo = array.get(dL, k)
+            float up = array.get(dU, k)
+            int stt = na(tt) ? 3 : tt == 0 ? 8 : math.abs(tt) < 1e11 or math.abs(tt) >= time or tt != math.round(tt) ? 9 : tt < 0 ? 2 :
+                 na(lo) or na(up) ? 9 : up <= lo ? 9 : 1
+            array.set(pocSt, k, stt)
+            if stt == 1
+                float pc = (lo + up) / 2.0
+                float lp = array.get(pocC, k)
+                if na(lp) or pc != lp
+                    array.set(pocC, k, pc)
+                    array.set(pocReg, k, time)
+                    evPoc += 1
+                    ck   := f_zpMix(ck, 300 + k + f_zpPx(pc))
+                    lTy  := 3
+                    lReg := time
+                    lAv  := time_close
+                    lSrc := tt
+        // ZF FVG / iFVG (Lab の規則: 新しい上位足で、同じ時間足の確定終値により反転・無効を判定してから新規登録)
+        array<int>   gK = array.from(g1k, g2k, g3k, g4k)
+        array<float> gC = array.from(g1c, g2c, g3c, g4c)
+        array<int>   gD = array.from(g1d, g2d, g3d, g4d)
+        array<float> gT = array.from(g1t, g2t, g3t, g4t)
+        array<float> gB = array.from(g1b, g2b, g3b, g4b)
+        for k = 0 to 3
+            int key = array.get(gK, k)
+            int lk  = array.get(fvLast, k)
+            if not na(key) and (na(lk) or key != lk)
+                array.set(fvLast, k, key)
+                float hc = array.get(gC, k)
+                int nf = array.size(fvTf)
+                if nf > 0 and not na(hc)
+                    for i = nf - 1 to 0
+                        if array.get(fvTf, i) == k and array.get(fvKey, i) < key and array.get(fvSt, i) < 2
+                            int sb = array.get(fvSub, i)
+                            if array.get(fvSt, i) == 0
+                                if (sb == 1 and hc < array.get(fvBot, i)) or (sb == -1 and hc > array.get(fvTop, i))
+                                    array.set(fvSt, i, 1)
+                                    evInv += 1
+                                    ck   := f_zpMix(ck, 500 + k + i)
+                                    lTy  := 5
+                                    lReg := time
+                                    lAv  := time_close
+                                    lSrc := key
+                            else if (sb == 1 and hc > array.get(fvTop, i)) or (sb == -1 and hc < array.get(fvBot, i))
+                                array.set(fvSt, i, 2)
+                                evDead += 1
+                                ck   := f_zpMix(ck, 600 + k + i)
+                                lTy  := 6
+                                lReg := time
+                                lAv  := time_close
+                                lSrc := key
+                int   gd = array.get(gD, k)
+                float gt = array.get(gT, k)
+                float gb = array.get(gB, k)
+                if not na(gd) and gd != 0 and not na(gt) and not na(gb)
+                    array.push(fvTf, k)
+                    array.push(fvSub, gd)
+                    array.push(fvKey, key)
+                    array.push(fvTop, gt)
+                    array.push(fvBot, gb)
+                    array.push(fvSt, 0)
+                    array.push(fvReg, time)
+                    evFvg += 1
+                    ck   := f_zpMix(ck, 400 + k + f_zpPx(gt) + f_zpPx(gb))
+                    lTy  := 4
+                    lReg := time
+                    lAv  := time_close
+                    lSrc := key
+        // ZE フィボ: LongFibWave の 5分足チャート側 (確定足で受け取り → f_fibFeed、更新確定時刻 = 5分足の time_close) → Lab の受信規則
+        lfwHoldD := nz(lfwHdS)
+        lfwDirD  := nz(lfwDdS)
+        lfwOD    := lfwOdS
+        lfwED    := lfwEdS
+        lfwIdD   := nz(lfwIdS)
+        lfwHold4 := nz(lfwH4S)
+        lfwDir4  := nz(lfwD4S)
+        lfwO4    := lfwO4S
+        lfwE4    := lfwE4S
+        lfwId4   := nz(lfwI4S)
+        f_fibFeed(lfwFeedD, true, lfwHoldD, lfwDirD, lfwOD, lfwED, lfwIdD)
+        f_fibFeed(lfwFeed4, true, lfwHold4, lfwDir4, lfwO4, lfwE4, lfwId4)
+        for k = 0 to 1
+            array<float> fd = k == 0 ? lfwFeed4 : lfwFeedD
+            float fo = array.get(fd, 0)
+            float fe = array.get(fd, 1)
+            float fdr = array.get(fd, 2)
+            float fi = array.get(fd, 3)
+            float fs = array.get(fd, 4)
+            float ft = array.get(fd, 5)
+            int stt = 0
+            if na(fs) or na(fi) or na(ft) or na(fdr)
+                stt := 9
+            else if fs != math.round(fs) or fs < 0 or fs > 3 or fi != math.round(fi) or fi < 0
+                stt := 9
+            else if math.abs(ft) < 1e11 or ft > time_close or ft != math.round(ft)
+                stt := 9
+            else if fs == 3
+                stt := na(fo) or na(fe) ? 9 : fo == fe or not (fdr == 1 or fdr == -1) ? 9 : 1
+            else
+                stt := not na(fo) or not na(fe) or fdr != 0 ? 9 : fs == 0 ? 8 : fs == 1 ? 2 : 3
+            array.set(zeSt, k, stt)
+            int b = k * 5
+            if stt == 1
+                bool same = array.get(zeLast, b + 4) == 1 and array.get(zeLast, b) == fo and array.get(zeLast, b + 1) == fe and
+                     array.get(zeLast, b + 2) == fdr and array.get(zeLast, b + 3) == fi
+                if not same
+                    array.set(zeLast, b, fo)
+                    array.set(zeLast, b + 1, fe)
+                    array.set(zeLast, b + 2, fdr)
+                    array.set(zeLast, b + 3, fi)
+                    array.set(zeLast, b + 4, 1)
+                    array.set(zeReg, k, time)
+                    evFib += 1
+                    ck   := f_zpMix(ck, 700 + k + f_zpPx(fo) + f_zpPx(fe))
+                    lTy  := 7
+                    lReg := time
+                    lAv  := time_close
+                    lSrc := ft
+            else if stt == 2 or stt == 3 or stt == 8
+                if array.get(zeLast, b + 4) == 1
+                    evFibClr += 1
+                    ck   := f_zpMix(ck, 800 + k + stt)
+                    lTy  := 8
+                    lReg := time
+                    lAv  := time_close
+                    lSrc := ft
+                array.set(zeLast, b + 4, stt)
+
+    // ---- 有効数 ----
+    int nAcc = 0
+    for k = 0 to 2
+        nAcc += math.min(array.get(acN, k), k == 0 ? zaKeep1 : k == 1 ? zaKeep2 : zaKeep3)
+    int nFvA = 0
+    int nInv = 0
+    int nDd  = 0
+    int nf2 = array.size(fvSt)
+    if nf2 > 0
+        for i = 0 to nf2 - 1
+            int sx = array.get(fvSt, i)
+            nFvA += sx == 0 ? 1 : 0
+            nInv += sx == 1 ? 1 : 0
+            nDd  += sx == 2 ? 1 : 0
+    int nPoc = 0
+    for k = 0 to 3
+        nPoc += na(array.get(pocC, k)) ? 0 : 1
+    int nFib = (array.get(zeLast, 4) == 1 ? 4 : 0) + (array.get(zeLast, 9) == 1 ? 4 : 0)
+
+    // ---- Zone 一覧の文字列 (受け渡しの負荷試験。直近の期間だけ作る): 種類,時間足,下限,上限,登録 5分足の開始時刻; ----
+    string sc = ""
+    if time >= zpAnchor and time >= timenow - zpStrDays * 86400000
+        int cnt = 0
+        for k = 0 to 2
+            if array.get(acN, k) > 0
+                sc := sc + "A," + str.tostring(k) + "," + str.tostring(array.get(acL, k), format.mintick) + "," +
+                     str.tostring(array.get(acU, k), format.mintick) + "," + str.tostring(array.get(acReg, k)) + ";"
+                cnt += 1
+        for k = 0 to 3
+            if not na(array.get(pocC, k))
+                sc := sc + "D," + str.tostring(k) + "," + str.tostring(array.get(pocC, k), format.mintick) + "," +
+                     str.tostring(array.get(pocReg, k)) + ";"
+                cnt += 1
+        int nfv = array.size(fvSt)
+        if nfv > 0
+            for i = nfv - 1 to 0
+                if cnt < zpStrN and array.get(fvSt, i) < 2 and str.length(sc) < 38000
+                    sc := sc + (array.get(fvSt, i) == 1 ? "I," : "F,") + str.tostring(array.get(fvTf, i)) + "," +
+                         str.tostring(array.get(fvBot, i), format.mintick) + "," + str.tostring(array.get(fvTop, i), format.mintick) + "," +
+                         str.tostring(array.get(fvReg, i)) + ";"
+                    cnt += 1
+        int npv = array.size(pvP)
+        if npv > 0
+            for i = npv - 1 to 0
+                if cnt < zpStrN and str.length(sc) < 38000
+                    sc := sc + "C," + str.tostring(array.get(pvTf, i)) + "," + str.tostring(array.get(pvP, i), format.mintick) + "," +
+                         str.tostring(array.get(pvReg, i)) + ";"
+                    cnt += 1
+    array<float> vc = array.from(float(n), ck, float(nz(lastT)), float(nz(lastC)), e1t, e1s, e1f, e5t, e5s, e5f,
+         float(evAcc), float(evPiv), float(evFvg), float(evInv), float(evDead), float(evPoc), float(evFib), float(evFibClr),
+         float(array.size(pvP)), float(nFvA), float(nInv), float(nDd), float(nPoc), float(nFib), float(nAcc),
+         float(lTy), float(nz(lReg)), float(nz(lAv)), nz(lSrc),
+         float(array.get(pocSt, 0)), float(array.get(pocSt, 1)), float(array.get(pocSt, 2)), float(array.get(pocSt, 3)),
+         float(array.get(zeSt, 0)), float(array.get(zeSt, 1)))
+    // 「t-1 まで」= 1 本前の足で作った値 (リアルタイムの形成中の足は、確定済みの前の足の値に毎ティック戻る)
+    var array<float> vLast = na
+    var string       sLast = ""
+    array<float> vp = vLast
+    string       sp = sLast
+    vLast := vc
+    sLast := sc
+    [ft5, n5, time_close, vc, vp, sc, sp, c1T, c1N, cHT, cHN, c4T, c4N, cDT, cDN, cWT, cWN]
+
+simple bool zpLowTf = timeframe.in_seconds() <= 300
+[zpFt5, zpN5, zpTc5, zpVc, zpVp, zpSc, zpSp, zpC1T, zpC1N, zpCHT, zpCHN, zpC4T, zpC4N, zpCDT, zpCDN, zpCWT, zpCWN] = request.security(
+     syminfo.tickerid, "5", f_zpEng(), lookahead = zpLowTf ? barmerge.lookahead_on : barmerge.lookahead_off)
+
+// その 5分足が確定済みか: チャート足の終わり (リアルタイムの足では現在時刻) がその 5分足の確定時刻以後
+bool zpUseCur = not na(zpTc5) and math.min(time_close, timenow) >= zpTc5
+array<float> zpV = zpUseCur ? zpVc : zpVp
+string       zpS = zpUseCur ? zpSc : zpSp
+
+f_zpV(int i) =>
+    na(zpV) ? na : array.size(zpV) > i ? array.get(zpV, i) : na
+
+float zpN     = f_zpV(0)
+float zpCk    = f_zpV(1)
+float zpLastT = f_zpV(2)
+
+plot(f_zpV(7), "5分 EMA ta.ema (5分基準・確定値)", color = color.new(color.navy, 30))
+plot(f_zpV(4), "1分 EMA ta.ema (5分基準・確定値)", color = color.new(color.blue, 30))
+plot(f_zpV(8), "5分 EMA S (登録開始から)", display = display.data_window)
+plot(f_zpV(9), "5分 EMA F (登録開始から)", display = display.data_window)
+plot(f_zpV(5), "1分 EMA S (Lab 側 1分の最初の足から)", display = display.data_window)
+plot(f_zpV(6), "1分 EMA F (Lab 側 1分の最初の足から)", display = display.data_window)
+
+// ---- 観測 (表示用) ----
+// リアルタイム: 値が変わった回数 / 処理数の飛び (2 以上 = 途中の 5分更新を飛ばした) / 逆戻り / 同じ 5分足で処理数だけ変化 (重複)
+varip int   zpRtTicks = 0
+varip int   zpRtSeen  = 0
+varip int   zpRtJump  = 0
+varip int   zpRtBack  = 0
+varip int   zpRtDup   = 0
+varip float zpRtPrevT = na
+varip float zpRtPrevN = na
+if barstate.isrealtime and not na(zpN) and not na(zpLastT)
+    zpRtTicks += 1
+    if na(zpRtPrevN) or zpN != zpRtPrevN or zpLastT != zpRtPrevT
+        if not na(zpRtPrevN)
+            if zpLastT == zpRtPrevT and zpN != zpRtPrevN
+                zpRtDup += 1
+            if zpN - zpRtPrevN > 1
+                zpRtJump += int(zpN - zpRtPrevN - 1)
+            if zpN < zpRtPrevN or zpLastT < zpRtPrevT
+                zpRtBack += 1
+        zpRtSeen  += 1
+        zpRtPrevT := zpLastT
+        zpRtPrevN := zpN
+
+f_zpTm(float t) =>
+    na(t) or t == 0 ? "na" : str.format_time(int(t), "yyyy-MM-dd HH:mm", syminfo.timezone)
+
+f_zpRefSt(int first, int ref) =>
+    na(first) ? "取得なし" : ref < 1e11 ? "基準未設定" : first == ref ? "同じ" : first > ref ? "★遅い (履歴不足)" : "早い (初期値が異なる可能性)"
+
+f_zpTy(float t) =>
+    t == 1 ? "アキュム固定" : t == 2 ? "水平線" : t == 3 ? "POC 更新" : t == 4 ? "FVG" : t == 5 ? "iFVG" : t == 6 ? "FVG 無効" :
+     t == 7 ? "フィボ更新" : t == 8 ? "フィボ解除" : "なし"
+
+f_zpSt(float s) =>
+    s == 1 ? "正常" : s == 2 ? "計算不能" : s == 3 ? "履歴不足" : s == 8 ? "OFF" : s == 9 ? "異常" : str.tostring(s)
+
+f_zpZe(float s) =>
+    s == 1 ? "有効" : s == 2 ? "波なし" : s == 3 ? "保留中" : s == 8 ? "OFF" : s == 9 ? "異常" : str.tostring(s)
+
+f_zpEq(float a, float b) =>
+    na(a) or na(b) ? "na" : math.abs(a - b) <= 1e-9 * math.max(1.0, math.abs(a)) ? "同じ" : "差 " + str.tostring(a - b, "#.########")
+
+var table zpTb = table.new(position.top_right, 2, 28, border_width = 1)
+f_zpRow(int r, string a, string b) =>
+    table.cell(zpTb, 0, r, a, text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.tiny)
+    table.cell(zpTb, 1, r, b, text_color = color.white, bgcolor = color.new(color.navy, 20), text_size = size.tiny)
+    true
+
+if zpTbl and barstate.islast
+    bool short5 = not na(zpFt5) and zpFt5 > zpAnchor
+    f_zpRow(0, "チャート足 / 5分の取得 / 使用", timeframe.period + " / " + (zpLowTf ? "lookahead_on" : "lookahead_off") + " / " +
+         (zpUseCur ? "その5分足まで (確定済み)" : "1本前まで (その5分足は形成中)"))
+    f_zpRow(1, "最後に反映した確定5分足", f_zpTm(zpLastT) + " (確定 " + f_zpTm(f_zpV(3)) + ")")
+    f_zpRow(2, "署名 (処理数/チェックサム/最後の5分足)", str.tostring(zpN, "#") + "/" + str.tostring(zpCk, "#") + "/" + f_zpTm(zpLastT) +
+         (short5 ? " ★履歴不足" : ""))
+    f_zpRow(3, "Zone 登録開始", f_zpTm(zpAnchor) + (short5 ? " ★5分の履歴がこの時刻より後から" : ""))
+    f_zpRow(4, "5分: 最初の足 / 本数", f_zpTm(zpFt5) + " / " + str.tostring(zpN5) + (short5 ? " ★履歴不足" : " (登録開始以前から)"))
+    f_zpRow(5, "1分: 最初の足 / 本数 / Lab 比", f_zpTm(zpC1T) + " / " + str.tostring(zpC1N) + " / " + f_zpRefSt(zpC1T, zpRef1))
+    f_zpRow(6, "1H: 最初の足 / 本数 / Lab 比", f_zpTm(zpCHT) + " / " + str.tostring(zpCHN) + " / " + f_zpRefSt(zpCHT, zpRefH))
+    f_zpRow(7, "4H: 最初の足 / 本数 / Lab 比", f_zpTm(zpC4T) + " / " + str.tostring(zpC4N) + " / " + f_zpRefSt(zpC4T, zpRef4))
+    f_zpRow(8, "日足: 最初の足 / 本数 / Lab 比", f_zpTm(zpCDT) + " / " + str.tostring(zpCDN) + " / " + f_zpRefSt(zpCDT, zpRefD))
+    f_zpRow(9, "週足: 最初の足 / 本数 / Lab 比", f_zpTm(zpCWT) + " / " + str.tostring(zpCWN) + " / " + f_zpRefSt(zpCWT, zpRefW))
+    f_zpRow(10, "5分 EMA ta.ema / S と比較 / F と比較", str.tostring(f_zpV(7), format.mintick) + " / " + f_zpEq(f_zpV(7), f_zpV(8)) + " / " +
+         f_zpEq(f_zpV(7), f_zpV(9)))
+    f_zpRow(11, "1分 EMA ta.ema / S と比較 / F と比較", str.tostring(f_zpV(4), format.mintick) + " / " + f_zpEq(f_zpV(4), f_zpV(5)) + " / " +
+         f_zpEq(f_zpV(4), f_zpV(6)))
+    f_zpRow(12, "登録・更新の回数 アキュム/水平線/POC", str.tostring(f_zpV(10)) + " / " + str.tostring(f_zpV(11)) + " / " + str.tostring(f_zpV(15)))
+    f_zpRow(13, "FVG 登録/iFVG 化/無効 ・ フィボ 更新/解除", str.tostring(f_zpV(12)) + " / " + str.tostring(f_zpV(13)) + " / " +
+         str.tostring(f_zpV(14)) + " ・ " + str.tostring(f_zpV(16)) + " / " + str.tostring(f_zpV(17)))
+    f_zpRow(14, "有効数 アキュム箱/水平線/POC/フィボ", str.tostring(f_zpV(24)) + " / " + str.tostring(f_zpV(18)) + " / " +
+         str.tostring(f_zpV(22)) + " / " + str.tostring(f_zpV(23)))
+    f_zpRow(15, "FVG / iFVG / 無効", str.tostring(f_zpV(19)) + " / " + str.tostring(f_zpV(20)) + " / " + str.tostring(f_zpV(21)))
+    f_zpRow(16, "最後の登録・更新", f_zpTy(f_zpV(25)) + "  登録 " + f_zpTm(f_zpV(26)) + " / 利用可能 " + f_zpTm(f_zpV(27)) +
+         " / 検出元 " + f_zpTm(f_zpV(28)))
+    f_zpRow(17, "POC 受信 1H/4H/D/W", f_zpSt(f_zpV(29)) + " / " + f_zpSt(f_zpV(30)) + " / " + f_zpSt(f_zpV(31)) + " / " + f_zpSt(f_zpV(32)))
+    f_zpRow(18, "フィボ 4H/D (Lab 初期 OFF・試験では計算)", f_zpZe(f_zpV(33)) + " / " + f_zpZe(f_zpV(34)))
+    f_zpRow(19, "Zone 一覧の文字列 (長さ / 件数)", str.tostring(str.length(zpS)) + " / " + str.tostring(array.size(str.split(zpS, ";")) - 1))
+    f_zpRow(20, "RT: ティック / 5分更新の観測", str.tostring(zpRtTicks) + " / " + str.tostring(zpRtSeen))
+    f_zpRow(21, "RT: 飛び / 逆戻り / 同じ足で処理数だけ変化", str.tostring(zpRtJump) + " / " + str.tostring(zpRtBack) + " / " + str.tostring(zpRtDup))
