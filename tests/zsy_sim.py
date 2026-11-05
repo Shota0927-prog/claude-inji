@@ -179,16 +179,23 @@ def main():
           "f_fibFeed); no placeholder left; build() is a fixed point",
           not bad and set(reg) == set(want) and "@@COPY" not in probe and zb.build(probe) == probe, str(bad))
 
-    # ---- no existing file changed ----
-    st = git("diff", "--name-status", zb.BASE_REV).stdout.split("\n")
-    st += ["A\t" + p for p in git("ls-files", "--others", "--exclude-standard").stdout.split("\n") if p]
-    changed = {ln.split("\t")[-1]: ln.split("\t")[0] for ln in st if ln.strip()}
-    extra = {p: s for p, s in changed.items() if p not in zb.NEW_FILES and p not in zb.TEST_EDITS}
+    # ---- no existing file changed (by ZSY: the files touched by the ZSY commits + uncommitted changes; other layers' commits on the
+    #      same branch are not ZSY changes) ----
+    log = git("log", f"{zb.BASE_REV}..HEAD", "--format=@@%s", "--name-only").stdout
+    touched, cur = set(), False
+    for ln in log.split("\n"):
+        if ln.startswith("@@"):
+            cur = ln[2:].startswith("ZSY")
+        elif ln.strip() and cur:
+            touched.add(ln.strip())
+    touched |= {ln[3:] for ln in git("status", "--porcelain").stdout.split("\n") if ln.strip()}
+    gone_ok = {"ZoneSyncProbeNest.pine", "ZoneSyncProbeRecv.pine", "ZoneSyncProbeWrap.pine"}     # ZSP-0, added and removed by ZSY
+    extra = sorted(p for p in touched if p not in zb.NEW_FILES and p not in zb.TEST_EDITS and p not in gone_ok)
     rev_ok = all(zb.unadapt(p, zb.raw(p)) == git("show", f"{zb.BASE_REV}:{p}").stdout for p in zb.TEST_EDITS)
     src_same = all(zb.raw(p) == git("show", f"{zb.BASE_REV}:{p}").stdout for p in zb.SOURCES + ("StochMtfSignal.pine",))
-    check(f"ZS-02 against {zb.BASE_REV} (before ZSY) only the ZSY files differ; the 2 registration edits revert exactly to the {zb.BASE_REV} "
-          "text; ZoneComboLabXAU / MtfPocFeedXAU / LongFibWave / StochMtfSignal are byte for byte unchanged",
-          not extra and rev_ok and src_same, f"{extra} rev_ok={rev_ok} src_same={src_same}")
+    check(f"ZS-02 the ZSY commits since {zb.BASE_REV} (and uncommitted changes) touch only the ZSY files and the 2 registration edits, which "
+          f"revert exactly to the {zb.BASE_REV} text; ZoneComboLabXAU / MtfPocFeedXAU / LongFibWave / StochMtfSignal are byte for byte unchanged",
+          not extra and rev_ok and src_same and touched, f"{extra} rev_ok={rev_ok} src_same={src_same}")
 
     # ---- registration ----
     acc = __import__("acc_build")
