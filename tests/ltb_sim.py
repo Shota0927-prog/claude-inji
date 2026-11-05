@@ -35,6 +35,11 @@
                    ids) while existing bases are processed normally on it; mirrored data symmetric; random gapped series
   LT-P params    : (LTB-9) 1H == 9951f9b block by block and on the chart; each of the 27 inputs changes its own TF's results and
                    no other TF's; only this indicator and this test differ from 9951f9b
+  LT-C charts    : (LTB-10) 4H and 1D charts: six fixed-offset fetches, chart-side choice (same TF -> offset 0 on the bar's confirmed
+                   execution, higher TF -> offset 1, lower TF -> not taken); 5M / 15M / 1H charts == ba984e3; 4H / D detections on
+                   1H / 4H / D charts == the detector on that TF's own bars (100-day warm-up, no ids); timing, realtime ticks, no
+                   duplicates, lower TFs neither received nor drawn, drawings on the chart's own bars, same-bar labels, unsupported
+                   charts (2H / 12H / weekly)
   LT-M mutation  : mutations of the Pine file are caught by at least one check
 
 Evidence class: PINE_NOT_VERIFIED (TradingView compile / request.security / drawing limits / rendering not reproduced).
@@ -1091,15 +1096,21 @@ def gate_static():
     s = code_only(SRC)
     calls = re.findall(r'string (\w+)\s*= request\.security\((\w+), "(\w+)",\s*f_ltCore\((\d), (\d)\), '
                        r'lookahead = barmerge\.lookahead_on\)', s)
-    ok = (len(re.findall(r"request\.security\(", s)) == 4
+    sec = code_only(section(SRC, CB, CE))
+    ok = (len(re.findall(r"request\.security\(", s)) == 6
           and [(c[0], c[2], c[3], c[4]) for c in calls] == [("ltPk1N", "60", "0", "0"), ("ltPk1C", "60", "0", "1"),
-                                                             ("ltPk4", "240", "1", "1"), ("ltPkD", "D", "2", "1")]
+                                                             ("ltPk4N", "240", "1", "0"), ("ltPk4C", "240", "1", "1"),
+                                                             ("ltPkDN", "D", "2", "0"), ("ltPkDC", "D", "2", "1")]
           and all(c[1] == "ltTk" for c in calls)
           and "f_ltCore(int k, int off) =>" in s
-          and "string ltPk1 = ltSame1 ? ltPk1N : ltPk1C" in s and "bool ltSame1   = ltChSec == 3600" in s
+          and all(x in sec for x in ("string ltPk1 = ltSame1 ? ltPk1N : ltPk1C", "string ltPk4 = ltSame4 ? ltPk4N : ltPk4C",
+                                     "string ltPkD = ltSameD ? ltPkDN : ltPkDC", "if ltTake1", "if ltTake4", "if ltTakeD"))
+          and all(x in s for x in ("bool ltSame1   = ltChSec == 3600", "bool ltSame4   = ltChSec == 14400", "bool ltSameD   = ltChSec == 86400",
+                                   "bool ltTake1   = ltChSec <= 3600", "bool ltTake4   = ltChSec <= 14400", "bool ltTakeD   = ltChSec <= 86400"))
           and "ticker.standard(syminfo.tickerid)" in s)
-    check("LT-S1 four request.security calls of f_ltCore(k, off) with literal TF numbers / offsets: 1H offset 0 and offset 1 (separate "
-          "calls), 4H / D offset 1; lookahead_on, ticker.standard; the 1H result chosen on the chart side (1H chart -> offset 0, else 1)", ok)
+    check("LT-S1 six request.security calls of f_ltCore(k, off) with literal TF numbers / offsets (1H / 4H / D x offset 0 / 1), "
+          "lookahead_on, ticker.standard; the choice on the chart side only: same TF -> offset 0, higher TF -> offset 1, lower TF -> "
+          "not taken", ok)
     core = s[s.index("f_ltCore(int k"):s.index("string ltPk1N")]
     logic = code_only(section(SRC, LB, LE))
     core_ll = " ".join(x for _, x in ap.logical_lines(core))
@@ -1109,13 +1120,14 @@ def gate_static():
            "string blk = ltStep1(S, open, high, low, close, time, time_close, bar_index)" in core_ll and "out[off]" in core and
            "ltStep(" not in logic and "type LtTf" not in logic and
            not re.search(r"\bds\w+", core + logic) and "request.security" not in logic
-           and not re.search(r"\blt(ChartOk|ChSec|Same1|TimeBar|Off1)\b|timeframe\.|chart\.", core + logic))
+           and not re.search(r"\blt(ChartOk|ChSec|Same1|Same4|SameD|Take1|Take4|TakeD|TimeBar|Off1)\b|timeframe\.|chart\.", core + logic))
     check("LT-S2 one detector (LtH / ltStep1) for every TF inside request.security, built from that TF's own nine inputs (var state per "
           "call), on the target TF's own OHLC / time / bar_index; the old 4H / D detector is gone; no display input and no chart-TF / "
           "chart-support value reaches it", ok2)
-    ok3 = ("bool ltChartOk = ltTimeBar and ltChSec <= 3600" in s and "not timeframe.isticks" in s and "chart.is_renko" in s
+    ok3 = ("bool ltChartOk = ltTimeBar and (ltChSec <= 3600 or ltChSec == 14400 or ltChSec == 86400)" in s and "not timeframe.isticks" in s and "chart.is_renko" in s
            and "if barstate.isconfirmed and ltChartOk" in s and "このチャートには対応していません" in s and "1時間足以下" in s)
-    check("LT-S3 chart support (chart side): time-based charts <= 1H only; otherwise nothing is taken / drawn and the table asks to switch", ok3)
+    check("LT-S3 chart support (chart side): time-based charts <= 1H, 4H and 1D; otherwise nothing is taken / drawn and the table asks "
+          "to switch", ok3 and "4時間足・1日足のチャートへ切り替えてください" in s and "チャートより下位のため受信対象外" in s)
     inp = ap.inputs(s)
     want = dict(h1Piv=4, h1Wave=10.0, h1Buf=5.0, h1Dist=30.0, h1Gap=8, h1Body=3.0, h1Ratio=30.0, h1Wait=3, h1Max=24,
                 h4Piv=4, h4Wave=20.0, h4Buf=10.0, h4Dist=60.0, h4Gap=8, h4Body=6.0, h4Ratio=30.0, h4Wait=3, h4Max=24,
@@ -1193,7 +1205,18 @@ MUTATIONS = [
     ("1H offset chosen inside the requested context (LTB-1 bug)", "f_ltCore(0, 1)", "f_ltCore(0, ltSame1 ? 0 : 1)"),
     ("detector gated by the chart support (LTB-1 bug)", "    string blk = ltStep1(S, open, high, low, close, time, time_close, bar_index)\n",
      "    string blk = ltChartOk ? ltStep1(S, open, high, low, close, time, time_close, bar_index) : \"B,0,0,0,0,0\"\n"),
-    ("no dedupe of received blocks", "take := na(lT) or sT > lT", "take := true"),
+    ("no dedupe of received blocks", "take := (na(lT) or sT > lT) and ltInt(f, 2) <= time_close", "take := ltInt(f, 2) <= time_close"),
+    ("blocks of bars not yet closed taken", "take := (na(lT) or sT > lT) and ltInt(f, 2) <= time_close", "take := (na(lT) or sT > lT)"),
+    ("4H chart takes the 4H offset 1 (delayed)", "string ltPk4 = ltSame4 ? ltPk4N : ltPk4C", "string ltPk4 = ltPk4C"),
+    ("lower chart takes the 4H offset 0", "string ltPk4 = ltSame4 ? ltPk4N : ltPk4C", "string ltPk4 = ltPk4N"),
+    ("D chart takes the D offset 1 (delayed)", "string ltPkD = ltSameD ? ltPkDN : ltPkDC", "string ltPkD = ltPkDC"),
+    ("lower chart takes the D offset 0", "string ltPkD = ltSameD ? ltPkDN : ltPkDC", "string ltPkD = ltPkDN"),
+    ("4H / D chart receives the lower 1H", "    if ltTake1\n        ltRecv(0, ltPk1)\n", "    if true\n        ltRecv(0, ltPk1)\n"),
+    ("D chart receives the lower 4H", "    if ltTake4\n        ltRecv(1, ltPk4)\n", "    if true\n        ltRecv(1, ltPk4)\n"),
+    ("4H / D charts unsupported (LTB-9 support)", "bool ltChartOk = ltTimeBar and (ltChSec <= 3600 or ltChSec == 14400 or ltChSec == 86400)",
+     "bool ltChartOk = ltTimeBar and ltChSec <= 3600"),
+    ("2H chart treated as supported", "bool ltChartOk = ltTimeBar and (ltChSec <= 3600 or ltChSec == 14400 or ltChSec == 86400)",
+     "bool ltChartOk = ltTimeBar and (ltChSec <= 14400 or ltChSec == 86400)"),
     ("chart processes unconfirmed executions", "if barstate.isconfirmed and ltChartOk\n", "if ltChartOk\n"),
     ("one block per packet", "string out = prevBlk == \"\" ? blk : prevBlk + \";\" + blk", "string out = blk"),
     ("cap drops the late contact marker", "    if lost\n        ltAppMk(r, \"検知\")\n", ""),
@@ -1221,6 +1244,7 @@ def run_quick(src):
                 gate_tf(k)
             gate_both()
             gate_params()
+            gate_charts()
             cur = context_checks(SRC, "mutation")
             for k, v in cur.items():
                 check("m-" + k, v[0], v[1])
@@ -1700,6 +1724,237 @@ def gate_params():
           f"strategies / Zone / orders unchanged)", ok15, str(changed))
 
 
+# ============================================================================
+# LTB-10: 4H and 1D charts (fetch / receive / draw only)
+# ============================================================================
+LTB9_COMMIT = "ba984e3"
+H2, H12, WEEK = 2 * H1, 12 * H1, 7 * DAY
+
+
+def agg_day_aligned(bars, tf_ms):
+    """4H bars aligned to the 22:00 day boundary (as XAU's 4H bars align with the session), so D closes coincide with 4H closes."""
+    groups = {}
+    for b in bars:
+        groups.setdefault((b["T"] - 22 * H1) // tf_ms, []).append(b)
+    out = []
+    for key in sorted(groups):
+        g = groups[key]
+        T = key * tf_ms + 22 * H1
+        out.append(dict(T=T, C=T + tf_ms, o=g[0]["o"], h=max(x["h"] for x in g), l=min(x["l"] for x in g), c=g[-1]["c"]))
+    return out
+
+
+def det_keys(ch, k, t0=None, t1=None):
+    """original detection events of TF k received by a chart: (TF, pivot time, side, level, count, contact start, decision bar)."""
+    out = []
+    for kk, f, t, tc in ch.events:
+        if kk == k and f[0] == "D":
+            key = (kk, int(float(f[4])), int(f[2]), float(f[3]), int(f[7]), int(float(f[8])), int(float(f[11])))
+            dTc = int(float(f[12]))
+            if (t0 is None or key[6] >= t0) and (t1 is None or dTc <= t1):
+                out.append(key)
+    return sorted(out)
+
+
+def direct_keys(feeds, k, t0=None, t1=None):
+    out = []
+    for i, blk in enumerate(feeds[k].det.blocks):
+        b = feeds[k].htf[i]
+        for e in parse_block(blk)[1]:
+            if e[0] == "D" and (t0 is None or b["T"] >= t0) and (t1 is None or b["C"] <= t1):
+                out.append((k, e[4], e[2], e[3], e[5], e[6], b["T"]))
+    return sorted(out)
+
+
+def gate_charts():
+    prev = prev_src(LTB9_COMMIT)
+    # 1: 5M / 15M / 1H charts unchanged (events incl. ids / counts / reasons, blocks, counters, drawings)
+    b5, htf, feeds = build(12, days=70, scale=3.0)
+    feeds_prev = Feeds(htf, None, prev)
+    ok1, det1 = True, []
+    for nm, ms, bars in (("5M", M5, [b for b in b5 if b["T"] >= b5[0]["T"] + 40 * DAY]),
+                         ("15M", M15, [b for b in agg(b5, M15) if b["T"] >= b5[0]["T"] + 20 * DAY]), ("1H", H1, agg(b5, H1))):
+        a = Chart(feeds, ms, dict(dsTf4=True, dsTfD=True)).run(bars, ticks_from=len(bars) - 30)
+        b = Chart(feeds_prev, ms, dict(dsTf4=True, dsTfD=True), src=prev).run(bars, ticks_from=len(bars) - 30)
+        same = (a.events == b.events and a.blocks == b.blocks and all(a.env[x] == b.env[x] for x in
+                ("ltNAct", "ltNApp", "ltNDet", "ltNGap", "ltNBlk", "ltLastT"))
+                and [(d.kind, d.text, d.args) for d in a.env["_draws"]] == [(d.kind, d.text, d.args) for d in b.env["_draws"]])
+        if not same:
+            ok1 = False
+            det1.append(nm)
+    check(f"LT-C1 5M / 15M / 1H charts == {LTB9_COMMIT}: every received event (ids / contact counts / reasons), block, counter (active "
+          f"bases / contacts / detections / gaps) and drawing (realtime ticks at the end included)", ok1, str(det1))
+
+    # consistent 1H / 4H / D data (4H and D aligned to 22:00); charts start after a 100-day warm-up of the detectors
+    ok9, ok10, okt, okx, ok_once, ok_rt, ok7, ok16, det = True, True, True, True, True, True, True, True, []
+    n4 = nD = 0
+    for seed, gp in ((21, False), (22, True), (23, False)):
+        h1 = rand_tf(7700 + seed, 24 * 420, H1, 4.0, gaps=gp, t0=1_790_006_400_000 // DAY * DAY + 22 * H1)
+        hx = [h1, agg_day_aligned(h1, H4), agg_day_aligned(h1, DAY)]
+        fx = Feeds(hx)
+        T0 = hx[2][100]["T"]
+        T1 = hx[2][-2]["T"]
+        on = dict(dsTf4=True, dsTfD=True)
+        charts = {"1H": Chart(fx, H1, on).run([b for b in hx[0] if b["T"] >= T0], ticks_from=None),
+                  "4H": Chart(fx, H4, on).run([b for b in hx[1] if b["T"] >= T0], ticks_from=len([b for b in hx[1] if b["T"] >= T0]) - 40),
+                  "D": Chart(fx, DAY, on).run([b for b in hx[2] if b["T"] >= T0], ticks_from=len([b for b in hx[2] if b["T"] >= T0]) - 15)}
+        d4, dD = direct_keys(fx, 1, T0, T1), direct_keys(fx, 2, T0, T1)
+        n4 += len(d4)
+        nD += len(dD)
+        # 9 / 10: the same original detections on every chart that takes them and == the detector run on that TF's own bars
+        if not (det_keys(charts["1H"], 1, T0, T1) == det_keys(charts["4H"], 1, T0, T1) == d4):
+            ok9 = False
+            det.append((seed, "4H", len(det_keys(charts["1H"], 1, T0, T1)), len(det_keys(charts["4H"], 1, T0, T1)), len(d4)))
+        if not (det_keys(charts["1H"], 2, T0, T1) == det_keys(charts["4H"], 2, T0, T1) == det_keys(charts["D"], 2, T0, T1) == dD):
+            ok10 = False
+            det.append((seed, "D", len(det_keys(charts["1H"], 2, T0, T1)), len(det_keys(charts["4H"], 2, T0, T1)),
+                        len(det_keys(charts["D"], 2, T0, T1)), len(dD)))
+        # 2 / 3 / 4 / 5: timing — same TF: on the decision bar's own confirmed execution; higher TF: at / after its close
+        for nm, ms in (("1H", H1), ("4H", H4), ("D", DAY)):
+            ch = charts[nm]
+            for k in range(3):
+                for key, t, tc in [(x[0], x[1], x[2]) for x in ch.received() if x[0][0] == k]:
+                    dT, dTc = key[5], key[6]
+                    if TF_MS[k] == ms and not (t == dT and tc == dTc):
+                        okt = False
+                        det.append((nm, TFJA[k], "same TF not on its own bar", dT, t))
+                    if TF_MS[k] > ms and t < dTc:
+                        okt = False
+                        det.append((nm, TFJA[k], "taken before the source bar closed", dTc, t))
+            t_first = ch.blocks[0][2] if ch.blocks else None
+            for kk, sT, t, tc in ch.blocks:
+                if TF_MS[kk] < ms:
+                    ok7 = False
+                # the chart's own TF: the block of the bar itself (on the chart's first bar the packet also carries the bar before)
+                if TF_MS[kk] == ms and sT != t and t != t_first:
+                    okt = False
+                    det.append((nm, TFJA[kk], "same TF block of another bar", sT, t))
+            keys = [x[0] for x in ch.received()]
+            blks = [(x[0], x[1]) for x in ch.blocks]
+            if len(keys) != len(set(keys)) or len(blks) != len(set(blks)):
+                ok_once = False
+            if getattr(ch, "rt_changed", False):
+                ok_rt = False
+        # 7: lower TFs neither received nor drawn
+        for nm, lower in (("4H", (0,)), ("D", (0, 1))):
+            ch = charts[nm]
+            if any(x[0] in lower for x in ch.events) or any(d.text.startswith(tuple(TFJA[k] + "#" for k in lower)) or
+                                                            d.text.startswith(tuple("基準 " + TFJA[k] for k in lower))
+                                                            for d in ch.env["_draws"] if d.kind == "label"):
+                ok7 = False
+                det.append((nm, "lower TF received / drawn"))
+            if any(ch.env["ltNBlk"][k] != 0 or ch.env["ltLastT"][k] is not None for k in lower):
+                ok7 = False
+        # 8: the TFs a chart takes keep being received (every closed target bar in range taken)
+        for nm, ms, ks in (("4H", H4, (1, 2)), ("D", DAY, (2,))):
+            ch = charts[nm]
+            first = [b for b in hx[{H4: 1, DAY: 2}[ms]] if b["T"] >= T0][0]["T"]
+            last = [b for b in hx[{H4: 1, DAY: 2}[ms]] if b["T"] >= T0][-1]
+            for k in ks:
+                taken = sorted(sT for kk, sT, _, _ in ch.blocks if kk == k)
+                # own TF: up to the last chart bar's close; higher TF: delivered by a later chart bar (closed by the last bar's start)
+                lim = last["C"] if TF_MS[k] == ms else last["T"]
+                want = [b["T"] for b in hx[k] if b["T"] >= first and b["C"] <= lim]
+                if not set(want) <= set(taken):
+                    okx = False
+                    det.append((nm, TFJA[k], "not every closed bar taken", len(taken), len(want)))
+        # 16: each chart's drawings sit on its own bars (a fresh run per chart, no coordinates of another chart)
+        for nm, ms in (("4H", H4), ("D", DAY)):
+            ch = charts[nm]
+            tb = {b["T"] for b in hx[{H4: 1, DAY: 2}[ms]]}
+            for d in ch.env["_draws"]:
+                xs = [d.args[0]] + ([d.args[2]] if d.kind == "line" else [])
+                if any(x not in tb for x in xs):
+                    ok16 = False
+                    det.append((nm, "drawing off the chart's bars", d.kind, d.text[:20], xs))
+                    break
+    check(f"LT-C9 4H detections: received on 1H and 4H charts == the 4H detector run on the 4H bars (pivot time, side, TF, level, count, "
+          f"contact start, decision bar; ids not used; 100-day warm-up, common range; {n4} detections)", ok9 and n4 > 0, str(det[:3]))
+    check(f"LT-C10 D detections: received on 1H, 4H and D charts == the D detector run on the D bars ({nD} detections)",
+          ok10 and nD > 0, str(det[:3]))
+    check("LT-C2-5 timing: on the 4H chart 4H results and on the D chart D results are taken on the decision bar's own confirmed "
+          "execution (not one bar later); a higher TF only at / after its source bar closed; blocks of the chart's own TF carry that "
+          "bar's time", okt, str([x for x in det if "same TF" in str(x) or "before" in str(x)][:3]))
+    check("LT-C7 4H chart: no 1H block / event / drawing; D chart: no 1H / 4H; their table rows have no receive time / counts",
+          ok7, str([x for x in det if "lower" in str(x)][:3]))
+    check("LT-C8 the TFs a 4H / D chart takes keep being received (every closed 4H / D bar in range taken)", okx,
+          str([x for x in det if "taken" in str(x)][:3]))
+    check("LT-C13/14 4H / D charts with realtime ticks at the end: unconfirmed executions (incl. the forming bar's offset-0 value) "
+          "take nothing; every block and detection taken once", ok_rt and ok_once)
+    check("LT-C16 4H / D charts: every drawing sits on that chart's own bar times", ok16, str([x for x in det if "drawing" in str(x)][:3]))
+
+    # 2 / 3 / 13: constructed — the forming 4H / D bar of a detection never gives a detection before its close, and the detection is
+    # taken on that bar's confirmed execution (history run == realtime run)
+    okf, detf = True, []
+    for k, ms in ((1, H4), (2, DAY)):
+        rows = scale_rows(at(h1_base(), 17) + [W_BULL, S_OK, F, F], SCALE[k])
+        flat = (1950.0, 1951.0, 1949.0, 1950.0)
+        hx = [mk([flat] * 3, H1), mk([flat] * 3, H4), mk([flat] * 3, DAY)]
+        hx[k] = mk(rows, ms)
+        fx = Feeds(hx)
+        bars = hx[k]
+        show = dict(dsTf4=True, dsTfD=True)
+        hist = Chart(fx, ms, show).run(bars)
+        rt = Chart(fx, ms, show)
+        seen_early = []
+        nev = []
+        for i, b in enumerate(bars):
+            pks = {it["var"]: it["core"].value(b["T"], it["off"]) for it in fx.items}
+            if i >= 15:
+                for frac in (0.3, 0.7, 1.0):
+                    pb = dict(b, h=b["o"] + (b["h"] - b["o"]) * frac, l=b["o"] - (b["o"] - b["l"]) * frac,
+                              c=b["o"] + (b["c"] - b["o"]) * frac)
+                    tp = {it["var"]: it["core"].partial_value(b["T"], pb, it["off"]) for it in fx.items}
+                    before = len(rt.events)
+                    rt._exec(pb, False, tp)
+                    if len(rt.events) != before:
+                        seen_early.append(i)
+            rt._exec(b, True, pks)
+            nev.append(len(rt.events))
+        dk = [x for x in rt.received() if x[0][0] == k]
+        if seen_early or rt.events != hist.events or not dk or dk[0][1] != bars[18]["T"] or dk[0][2] != bars[18]["C"]:
+            okf = False
+            detf.append((TFJA[k], seen_early, len(rt.events), len(hist.events), dk[:1]))
+        # the forming bar's own partial packet did contain the detection at frac 1.0 (so the confirmed-only take is what holds it back)
+        part = fx[k].det
+    check("LT-C2/3/13 constructed 4H / D double tops on a 4H / D chart: nothing taken during the forming bar's ticks (offset 0 changes "
+          "every tick); the detection taken on bar 18's confirmed execution (its own bar, not the next one); realtime run == history run",
+          okf, str(detf))
+
+    # 15: same-bar detections kept; display / cap do not change what is detected (4H chart)
+    two = list(h1_base()) + [bx(1968, 1962), bx(1962, 1958), bx(1958, 1970), bx(1970, 1980), bx(1980, 1990), bx(1990, 1993),
+                             bx(1992, 1980), bx(1980, 1970), bx(1970, 1962), bx(1962, 1960)]
+    rows2 = scale_rows(at(two, 28) + [S_OK, F, F], 2.0)
+    flat = (1950.0, 1951.0, 1949.0, 1950.0)
+    h2 = [mk([flat] * 3, H1), mk(rows2, H4), mk([flat] * 3, DAY)]
+    f2 = Feeds(h2)
+    base_ch = Chart(f2, H4, dict(dsTf4=True, dsMaxGrp=80)).run(h2[1])
+    labs = [d for d in base_ch.env["_draws"] if d.kind == "label" and d.text.startswith("ダブルトップ 4時間")]
+    ok15 = len(labs) == 2 and labs[0].args[0] == labs[1].args[0] == h2[1][28]["T"] and labs[0].args[1] != labs[1].args[1]
+    for ov in (dict(dsTf4=False), dict(dsTf4=True, dsMaxGrp=1), dict(dsTf4=True, dsAllB=True, dsMaxGrp=2)):
+        c = Chart(f2, H4, ov).run(h2[1])
+        if c.events != base_ch.events or any(c.env[x] != base_ch.env[x] for x in ("ltNAct", "ltNApp", "ltNDet")):
+            ok15 = False
+    check("LT-C15 4H chart: two 4H tops detected by the same 4H bar -> two labels on that bar, stacked; display OFF / cap 1 / all-bases "
+          "leave the received events and counters unchanged", ok15)
+
+    # 17: unsupported charts (2H, 12H, weekly) take nothing
+    ok17 = True
+    for ms in (H2, H12, WEEK):
+        bars = agg(b5, ms) if ms != WEEK else agg(b5, WEEK)
+        c = Chart(feeds, ms).run(bars[:40])
+        if c.events or c.blocks or c.chart_globals.get("ltChartOk"):
+            ok17 = False
+    check("LT-C17 2H / 12H / weekly charts: unsupported (ltChartOk false), nothing taken; the table shows the switch guidance", ok17)
+    try:
+        diff = subprocess.run(["git", "diff", "--name-only", LTB9_COMMIT, "--", "."], cwd=ROOT, capture_output=True, text=True)
+        changed = sorted(x for x in diff.stdout.split() if x)
+        ok18 = diff.returncode == 0 and set(changed) <= {"LongTermDoubleTripleTopBottomXAU.pine", "tests/ltb_sim.py"}
+    except OSError as ex:
+        ok18, changed = False, [str(ex)]
+    check(f"LT-C18 only LongTermDoubleTripleTopBottomXAU.pine and tests/ltb_sim.py differ from {LTB9_COMMIT}", ok18, str(changed))
+
+
 def context_checks(src, label):
     """the request.security context rule applied to `src` (resolver: each call's arguments and the globals reached by them /
     the core body / the logic functions evaluated in the requested TF; the chart side with the chart's built-ins), then the
@@ -1806,6 +2061,7 @@ def main():
         gate_tf(k)
     gate_both()
     gate_params()
+    gate_charts()
     if "--no-mutation" not in sys.argv:
         gate_mutation()
     ok = 0
