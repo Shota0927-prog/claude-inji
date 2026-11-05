@@ -1,6 +1,6 @@
 """ZSY — the copied regions of ZoneSyncProbe.pine, and the registration of the ZSY files in the older fixtures.
 
-  python3 tests/zsy_build.py              # (re)write the "ZSY copy" regions of ZoneSyncProbe.pine from the source files
+  python3 tests/zsy_build.py              # (re)write the "ZSY copy" regions of ZoneSyncProbe.pine / ZoneSyncXAU.pine from the sources
   python3 tests/zsy_build.py --register   # the registration edits in the older fixtures (once; idempotent)
 
 Copied regions (byte for byte from the unchanged sources; tests/zsy_sim.py compares them again):
@@ -18,7 +18,9 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROBE = "ZoneSyncProbe.pine"
-NEW_FILES = (PROBE, "ZONE_SYNC_FEASIBILITY_ja.md", "tests/zsy_build.py", "tests/zsy_sim.py", "tests/zsy_exp.py")
+BODY = "ZoneSyncXAU.pine"
+NEW_FILES = (PROBE, "ZONE_SYNC_FEASIBILITY_ja.md", "tests/zsy_build.py", "tests/zsy_sim.py", "tests/zsy_exp.py",
+             BODY, "ZONE_SYNC_XAU_ja.md", "tests/zsx_sim.py")
 BASE_REV = "146f68f"     # the branch before any ZSY file (SMT-1)
 SOURCES = ("ZoneComboLabXAU.pine", "MtfPocFeedXAU.pine", "LongFibWave.pine")
 LFW_INPUT_NAMES = ("lfwSwitchRatioD", "lfwSwitchRatio4", "lfwStartRatio", "lfwExclInit", "lfwAtrLen", "lfwPivLD", "lfwPivRD",
@@ -122,7 +124,8 @@ TEST_EDITS = {
     "tests/cad_adapt.py": [
         (LBS_LINE_HEAD,
          'LATER_NEW = LATER_NEW + ("ZoneSyncProbe.pine", "ZONE_SYNC_FEASIBILITY_ja.md", "tests/zsy_build.py", "tests/zsy_sim.py",\n'
-         '                         "tests/zsy_exp.py")  # new in the later layer ZSY (all-timeframe Zone display, probe)\n' + LBS_LINE_HEAD, 1)],
+         '                         "tests/zsy_exp.py", "ZoneSyncXAU.pine", "ZONE_SYNC_XAU_ja.md", "tests/zsx_sim.py")'
+         '  # new in the later layer ZSY (all-timeframe Zone display: probe and body)\n' + LBS_LINE_HEAD, 1)],
 }
 
 
@@ -160,7 +163,8 @@ if __name__ == "__main__":
                 open(f, "w", encoding="utf-8").write(t2)
                 print("adapted", p)
     else:
-        f = os.path.join(ROOT, PROBE)
-        t = open(f, encoding="utf-8").read()
-        open(f, "w", encoding="utf-8").write(build(t))
-        print("wrote", PROBE)
+        for p in (PROBE, BODY):
+            f = os.path.join(ROOT, p)
+            t = open(f, encoding="utf-8").read()
+            open(f, "w", encoding="utf-8").write(build(t))
+            print("wrote", p)

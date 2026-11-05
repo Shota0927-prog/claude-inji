@@ -3,6 +3,9 @@
 対象: 5分足の `ZoneComboLabXAU.pine`（以下 Lab）を基準に、チャート足（20 時間足）を切り替えても同じ最新 Zone を表示する新規の表示専用インジ。
 既存の Lab・Strategy・`MtfPocFeedXAU.pine`・`LongFibWave.pine`・ストキャス（`StochMtfSignal.pine`）は変更していません（ZS-02 で差分を確認）。
 
+> **2026-11-05 方針変更**: 全 Zone の全件受け渡しの検証は取り下げ、表示専用インジ本体 `ZoneSyncXAU.pine`（`ZONE_SYNC_XAU_ja.md`）へ進んだ。
+> この文書と `ZoneSyncProbe.pine` は記録として残す。
+
 ## 0. 現在の状態
 
 | 区分 | 内容 |
