@@ -1,0 +1,266 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  Stoch MTF Signal (1M)  —  ストキャス・マルチタイム判定の単体インジ (SMT-1)
+//  1分足の通常ローソク足チャート専用。エントリー候補の合図を矢印で表示するだけ。
+//  注文・SL / TP・成績集計・アラートは無い。既存の Zone Lab / Zone Combo Lab / Strategy とは独立。
+//
+//  ストキャス (全時間足共通・MT5 Stochastic Oscillator の計算手順):
+//    LL[i] = 直近 %K期間 本の Low の最小、HH[i] = 直近 %K期間 本の High の最大 (価格フィールド Low/High)
+//    Main[i]   = Σ(Close[k] − LL[k]) / Σ(HH[k] − LL[k]) × 100   (k = i−スローイング+1 .. i、分母 0 なら 100)
+//                ← スローイングは「速い %K の SMA」ではなく、分子・分母それぞれの合計の比
+//    Signal[i] = (Main[i] + Main[i−1] + … + Main[i−%D期間+1]) / %D期間   (Simple)
+//    有効: Main は i >= %K期間+スローイング−2、Signal は i >= %K期間+スローイング+%D期間−3。
+//          MT5 がそれより前の Main に入れる初期化用の 0 は使わない (na のまま、Signal の平均にも入れない)。
+//    5分・15分は request.security の中で、その時間足自身の OHLC から同じ関数で計算する。
+//
+//  上位足の確定値 (判定時刻 T = 1分足の time_close):
+//    request.security(…, lookahead_on) で「1分足を含む上位足」の
+//      [K(その足), K[1], K[2], K[3], time_close(その足), time_close[1]] を取る (すべて上位足自身の足)。
+//    ・1分足の time_close >= 含む上位足の time_close (= 同時に確定) のときだけ、含む上位足の K を最新確定値に使う。
+//      このとき上位足は T に確定しているので、lookahead_on の値はその足の確定値そのもの (未来は含まない)。
+//    ・それ以外は、含む上位足は形成中なので使わない。その 1本前 (K[1]、確定時刻 time_close[1] <= 1分足の time) を使う。
+//    ・選んだ値が na なら合図なし (さらに古い値や形成中の値へは代替しない)。
+//    lookahead_on の「含む上位足の値」は履歴では足全体の最終値になるため、同時確定以外の 1分足では
+//    構造上一度も参照しない (下の f_pick だけが選択する)。リアルタイムでも同じ選択式なので、
+//    履歴・リアルタイム・再読み込み後で参照する上位足が一致する。
+//
+//  判定: 1分足の確定時 (barstate.isconfirmed) に 1回だけ。状態を保存しない (後追いの合図・到達履歴の消費なし)。
+// ============================================================================
+
+//@version=5
+indicator("Stoch MTF Signal (1M)", shorttitle = "STO-MTF", overlay = true, max_bars_back = 1000,
+     max_labels_count = 500)
+
+// ==== 入力 ===================================================================
+G_STO = "ストキャス (1・5・15分共通)"
+G_LV  = "判定"
+G_DBG = "検証"
+iKPer   = input.int(21, "%K期間",        minval = 1, maxval = 500, group = G_STO)
+iDPer   = input.int(3,  "%D期間",        minval = 1, maxval = 100, group = G_STO)
+iSlow   = input.int(3,  "スローイング",  minval = 1, maxval = 100, group = G_STO)
+iUpLv   = input.float(90.0, "上側到達レベル", group = G_LV)
+iLoLv   = input.float(10.0, "下側到達レベル", group = G_LV)
+iReachN = input.int(10, "到達確認本数 (クロス足を含む)", minval = 1, maxval = 500, group = G_LV)
+iMinMv  = input.float(3.0, "1分足クロス足の最低変化幅 (ポイント)", minval = 0.0, group = G_LV,
+     tooltip = "1分足だけに適用。5分・15分には使わない。")
+iDebug  = input.bool(false, "検証表示", group = G_DBG,
+     tooltip = "ON: 全クロスに判定ラベル、右上に最新状態の表、データウィンドウに判定値。判定結果は変わらない。")
+
+// 固定 (今回の仕様)
+float MID   = 50.0
+string TF5  = "5"
+string TF15 = "15"
+
+// ==== SMT Logic (begin) ======================================================
+// MT5 Stochastic Oscillator (Low/High・Simple)。戻り値 [Main, Signal]。データ不足の間は na。
+f_mtStoch(int kPer, int dPer, int slow) =>
+    float ll = ta.lowest(low, kPer)
+    float hh = ta.highest(high, kPer)
+    float mainV = na
+    if bar_index >= kPer + slow - 2
+        float sLow  = 0.0
+        float sHigh = 0.0
+        for j = slow - 1 to 0                       // MT5: k = i−slow+1 .. i (同じ加算順)
+            sLow  += close[j] - ll[j]
+            sHigh += hh[j] - ll[j]
+        mainV := sHigh == 0.0 ? 100.0 : sLow / sHigh * 100
+    float sigV = na
+    if bar_index >= kPer + slow + dPer - 3
+        float s = 0.0
+        for j = 0 to dPer - 1                       // MT5: sum += Main[i−k], k = 0 .. dPer−1
+            s += mainV[j]
+        sigV := s / dPer
+    [mainV, sigV]
+
+// 上位足の中で評価: その時間足自身の足の K と確定時刻
+f_htf(int kPer, int dPer, int slow) =>
+    [m, s] = f_mtStoch(kPer, dPer, slow)
+    [m, m[1], m[2], m[3], time, time_close, time_close[1]]
+
+// 判定時刻 t (1分足の time_close) で使う上位足の値: [K0 (最新確定), K1 (その1本前), K2 (2本前), 確定時刻]
+f_pick(float t, float c0, float c1, float c2, float c3, float hOpen, float hClose, float hClosePrev) =>
+    float k0 = na
+    float k1 = na
+    float k2 = na
+    float rt = na
+    if not na(t) and not na(hOpen) and not na(hClose)
+        if t >= hClose                               // 含む上位足が T に確定 (同時確定)
+            k0 := c0
+            k1 := c1
+            k2 := c2
+            rt := hClose
+        else                                         // 含む上位足は形成中 → 1本前の確定足
+            k0 := c1
+            k1 := c2
+            k2 := c3
+            rt := hClosePrev
+    [k0, k1, k2, rt]
+
+// 1分足
+[k1m, d1m] = f_mtStoch(iKPer, iDPer, iSlow)
+
+// 5分・15分 (各時間足自身の OHLC)
+[a5c0, a5c1, a5c2, a5c3, a5o, a5cl, a5clp] = request.security(syminfo.tickerid, TF5, f_htf(iKPer, iDPer, iSlow),
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[a15c0, a15c1, a15c2, a15c3, a15o, a15cl, a15clp] = request.security(syminfo.tickerid, TF15, f_htf(iKPer, iDPer, iSlow),
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+float tNow = time_close
+[k5, k5p, k5pp, t5ref]      = f_pick(tNow, a5c0, a5c1, a5c2, a5c3, a5o, a5cl, a5clp)
+[k15, k15p, k15pp, t15ref]  = f_pick(tNow, a15c0, a15c1, a15c2, a15c3, a15o, a15cl, a15clp)
+
+// 対象チャート: 1分足の通常ローソク足
+bool chartOK = timeframe.isminutes and timeframe.multiplier == 1 and chart.is_standard
+
+// ---- 1分足 ----
+bool d1Ok = not na(k1m) and not na(k1m[1]) and not na(d1m) and not na(d1m[1])
+float k1Max = na
+float k1Min = na
+bool winOk = true
+for j = 0 to iReachN - 1
+    float v = k1m[j]
+    if na(v)
+        winOk := false
+        break
+    k1Max := na(k1Max) ? v : math.max(k1Max, v)
+    k1Min := na(k1Min) ? v : math.min(k1Min, v)
+bool data1 = d1Ok and winOk
+float k1Chg = k1m - k1m[1]
+
+bool sCross1 = data1 and k1m[1] >= d1m[1] and k1m < d1m
+bool lCross1 = data1 and k1m[1] <= d1m[1] and k1m > d1m
+bool sMove1  = data1 and -k1Chg >= iMinMv
+bool lMove1  = data1 and k1Chg >= iMinMv
+bool sReach1 = data1 and k1Max >= iUpLv
+bool lReach1 = data1 and k1Min <= iLoLv
+
+// ---- 5分足 ----
+bool data5 = not na(k5) and not na(k5p)
+bool s5 = data5 and k5 > MID and k5 < k5p
+bool l5 = data5 and k5 < MID and k5 > k5p
+
+// ---- 15分足 ----
+bool data15 = not na(k15) and not na(k15p) and not na(k15pp)
+float dl0 = k15 - k15p
+float dl1 = k15p - k15pp
+bool s15 = data15 and k15 > MID and (dl0 < 0 or (0 < dl0 and dl0 < dl1))
+bool l15 = data15 and k15 < MID and (dl0 > 0 or (dl1 < dl0 and dl0 < 0))
+
+// ---- 成立 (1分足の確定時に 1回だけ。状態は持たない) ----
+bool evalNow  = chartOK and barstate.isconfirmed
+bool dataAll  = data1 and data5 and data15
+bool shortSig = evalNow and dataAll and sCross1 and sMove1 and sReach1 and s5 and s15
+bool longSig  = evalNow and dataAll and lCross1 and lMove1 and lReach1 and l5 and l15
+// ==== SMT Logic (end) ========================================================
+
+// ==== 通常表示 ===============================================================
+plotshape(shortSig, "ショート", shape.arrowdown, location.abovebar, color.new(color.red, 0),  size = size.normal)
+plotshape(longSig,  "ロング",   shape.arrowup,   location.belowbar, color.new(color.teal, 0), size = size.normal)
+
+if barstate.islast and not chartOK
+    var label offLbl = na
+    label.delete(offLbl)
+    offLbl := label.new(bar_index, high, "STO-MTF: 1分足の通常ローソク足チャート専用。この時間足・チャート種別では合図を停止中。",
+         style = label.style_label_down, color = color.new(color.gray, 0), textcolor = color.white)
+
+// ==== 検証表示 ===============================================================
+f_ox(bool b) => b ? "○" : "×"
+f_t(float t) => na(t) ? "na" : str.format_time(int(t), "yyyy-MM-dd HH:mm", syminfo.timezone)
+f_n(float x) => na(x) ? "na" : str.tostring(x, "#.##")
+// 判定コード: 桁 = [データ][クロス][変化幅][到達][5分][15分]、1 = 成立 / 0 = 不成立 (データ桁 0 = 不足)
+f_code(bool d, bool c, bool m, bool r, bool h5, bool h15) =>
+    (d ? 100000 : 0) + (c ? 10000 : 0) + (m ? 1000 : 0) + (r ? 100 : 0) + (h5 ? 10 : 0) + (h15 ? 1 : 0)
+f_ymdhm(float t) =>
+    float r = na
+    if not na(t)
+        int ti = int(t)
+        r := year(ti, syminfo.timezone) * 100000000.0 + month(ti, syminfo.timezone) * 1000000.0 +
+             dayofmonth(ti, syminfo.timezone) * 10000.0 + hour(ti, syminfo.timezone) * 100.0 + minute(ti, syminfo.timezone)
+    r
+
+string reasonS = (not data1 ? " 1分データ不足" : "") + (not data5 ? " 5分データ不足" : "") + (not data15 ? " 15分データ不足" : "") +
+     (data1 and not sMove1 ? " 変化幅" : "") + (data1 and not sReach1 ? " 到達" : "") +
+     (data5 and not s5 ? " 5分" : "") + (data15 and not s15 ? " 15分" : "")
+string reasonL = (not data1 ? " 1分データ不足" : "") + (not data5 ? " 5分データ不足" : "") + (not data15 ? " 15分データ不足" : "") +
+     (data1 and not lMove1 ? " 変化幅" : "") + (data1 and not lReach1 ? " 到達" : "") +
+     (data5 and not l5 ? " 5分" : "") + (data15 and not l15 ? " 15分" : "")
+
+string detail = "K1 " + f_n(k1m) + " / D1 " + f_n(d1m) + " / 前K1 " + f_n(k1m[1]) + " / 前D1 " + f_n(d1m[1]) +
+     "\n変化 " + f_n(k1Chg) + " / 直近" + str.tostring(iReachN) + "本 最大 " + f_n(k1Max) + " 最小 " + f_n(k1Min) +
+     "\n5分 K " + f_n(k5) + " / 1本前 " + f_n(k5p) + " / 確定 " + f_t(t5ref) +
+     "\n15分 K " + f_n(k15) + " / Δ0 " + f_n(dl0) + " / Δ1 " + f_n(dl1) + " / 確定 " + f_t(t15ref) +
+     "\n判定時刻 " + f_t(tNow)
+
+if iDebug and evalNow
+    bool sx = k1m[1] >= d1m[1] and k1m < d1m        // 検証ラベル用 (判定には使わない)
+    bool lx = k1m[1] <= d1m[1] and k1m > d1m
+    if sx
+        string txtS = "S " + (shortSig ? "成立" : "見送り") + "\n1分" + f_ox(sMove1 and sReach1) + " 5分" + f_ox(s5) + " 15分" + f_ox(s15)
+        string tipS = "ショート " + (shortSig ? "成立" : "不成立:" + reasonS) +
+             "\nクロス" + f_ox(sCross1) + " 変化幅" + f_ox(sMove1) + " 到達" + f_ox(sReach1) + " 5分" + f_ox(s5) + " 15分" + f_ox(s15) + "\n" + detail
+        label.new(bar_index, high, txtS, style = label.style_label_down, size = size.tiny, tooltip = tipS,
+             color = shortSig ? color.new(color.red, 20) : color.new(color.gray, 60), textcolor = color.white)
+    if lx
+        string txtL = "L " + (longSig ? "成立" : "見送り") + "\n1分" + f_ox(lMove1 and lReach1) + " 5分" + f_ox(l5) + " 15分" + f_ox(l15)
+        string tipL = "ロング " + (longSig ? "成立" : "不成立:" + reasonL) +
+             "\nクロス" + f_ox(lCross1) + " 変化幅" + f_ox(lMove1) + " 到達" + f_ox(lReach1) + " 5分" + f_ox(l5) + " 15分" + f_ox(l15) + "\n" + detail
+        label.new(bar_index, low, txtL, style = label.style_label_up, size = size.tiny, tooltip = tipL,
+             color = longSig ? color.new(color.teal, 20) : color.new(color.gray, 60), textcolor = color.white)
+
+var table dbg = table.new(position.top_right, 3, 12, bgcolor = color.new(color.black, 20), border_width = 1)
+if iDebug and barstate.islast
+    table.cell(dbg, 0, 0, "STO-MTF", text_color = color.white)
+    table.cell(dbg, 1, 0, "ショート", text_color = color.white)
+    table.cell(dbg, 2, 0, "ロング", text_color = color.white)
+    table.cell(dbg, 0, 1, "チャート", text_color = color.white)
+    table.cell(dbg, 1, 1, chartOK ? "1分 通常" : "対象外 (停止)", text_color = color.white)
+    table.cell(dbg, 2, 1, barstate.isconfirmed ? "確定足" : "形成中 (判定なし)", text_color = color.white)
+    table.cell(dbg, 0, 2, "1分 K / D", text_color = color.white)
+    table.cell(dbg, 1, 2, f_n(k1m) + " / " + f_n(d1m), text_color = color.white)
+    table.cell(dbg, 2, 2, "変化 " + f_n(k1Chg), text_color = color.white)
+    table.cell(dbg, 0, 3, "1分 クロス", text_color = color.white)
+    table.cell(dbg, 1, 3, f_ox(sCross1), text_color = color.white)
+    table.cell(dbg, 2, 3, f_ox(lCross1), text_color = color.white)
+    table.cell(dbg, 0, 4, "1分 変化幅", text_color = color.white)
+    table.cell(dbg, 1, 4, f_ox(sMove1), text_color = color.white)
+    table.cell(dbg, 2, 4, f_ox(lMove1), text_color = color.white)
+    table.cell(dbg, 0, 5, "1分 到達", text_color = color.white)
+    table.cell(dbg, 1, 5, f_ox(sReach1) + " 最大 " + f_n(k1Max), text_color = color.white)
+    table.cell(dbg, 2, 5, f_ox(lReach1) + " 最小 " + f_n(k1Min), text_color = color.white)
+    table.cell(dbg, 0, 6, "5分 K / 1本前", text_color = color.white)
+    table.cell(dbg, 1, 6, f_ox(s5) + " " + f_n(k5) + " / " + f_n(k5p), text_color = color.white)
+    table.cell(dbg, 2, 6, f_ox(l5), text_color = color.white)
+    table.cell(dbg, 0, 7, "15分 K / Δ0 / Δ1", text_color = color.white)
+    table.cell(dbg, 1, 7, f_ox(s15) + " " + f_n(k15) + " / " + f_n(dl0) + " / " + f_n(dl1), text_color = color.white)
+    table.cell(dbg, 2, 7, f_ox(l15), text_color = color.white)
+    table.cell(dbg, 0, 8, "参照 5分 確定", text_color = color.white)
+    table.cell(dbg, 1, 8, f_t(t5ref), text_color = color.white)
+    table.cell(dbg, 0, 9, "参照 15分 確定", text_color = color.white)
+    table.cell(dbg, 1, 9, f_t(t15ref), text_color = color.white)
+    table.cell(dbg, 0, 10, "不成立理由", text_color = color.white)
+    table.cell(dbg, 1, 10, reasonS == "" ? "-" : reasonS, text_color = color.white)
+    table.cell(dbg, 2, 10, reasonL == "" ? "-" : reasonL, text_color = color.white)
+    table.cell(dbg, 0, 11, "判定時刻", text_color = color.white)
+    table.cell(dbg, 1, 11, f_t(tNow), text_color = color.white)
+
+// データウィンドウ (検証表示 ON のときだけ。過去の足の判定根拠を足ごとに確認する)
+plot(k1m,   "1分 K1",            display = iDebug ? display.data_window : display.none)
+plot(d1m,   "1分 D1",            display = iDebug ? display.data_window : display.none)
+plot(k1Chg, "1分 K1変化",        display = iDebug ? display.data_window : display.none)
+plot(k1Max, "1分 直近K1最大",    display = iDebug ? display.data_window : display.none)
+plot(k1Min, "1分 直近K1最小",    display = iDebug ? display.data_window : display.none)
+plot(k5,    "5分 K5",            display = iDebug ? display.data_window : display.none)
+plot(k5p,   "5分 K5 1本前",      display = iDebug ? display.data_window : display.none)
+plot(k15,   "15分 K15",          display = iDebug ? display.data_window : display.none)
+plot(dl0,   "15分 Δ0",           display = iDebug ? display.data_window : display.none)
+plot(dl1,   "15分 Δ1",           display = iDebug ? display.data_window : display.none)
+plot(f_ymdhm(t5ref),  "5分 参照確定時刻 (yyyymmddhhmm)",  display = iDebug ? display.data_window : display.none, precision = 0)
+plot(f_ymdhm(t15ref), "15分 参照確定時刻 (yyyymmddhhmm)", display = iDebug ? display.data_window : display.none, precision = 0)
+plot(f_code(data1 and data5 and data15, sCross1, sMove1, sReach1, s5, s15), "S判定コード [データ|クロス|変化|到達|5分|15分]",
+     display = iDebug ? display.data_window : display.none, precision = 0)
+plot(f_code(data1 and data5 and data15, lCross1, lMove1, lReach1, l5, l15), "L判定コード [データ|クロス|変化|到達|5分|15分]",
+     display = iDebug ? display.data_window : display.none, precision = 0)
+plot(shortSig ? 1 : 0, "ショート合図", display = iDebug ? display.data_window : display.none, precision = 0)
+plot(longSig ? 1 : 0,  "ロング合図",   display = iDebug ? display.data_window : display.none, precision = 0)
