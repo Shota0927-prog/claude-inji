@@ -108,7 +108,7 @@ def build(text):
 # ---- registration in the older fixtures (a layer above LBS-1; same method as tests/lbs_build.py) ----
 def ok(p):
     """ZSY accounts for this path exactly: one of its new files."""
-    return p in NEW_FILES
+    return p in NEW_FILES or __import__("smt_build").ok(p)     # the later SMT files: exact
 
 
 Z = '__import__("zsy_build")'
@@ -143,6 +143,7 @@ def apply_edits(p, text):
 
 def unadapt(p, text):
     """a test file with its ZSY edits reverted (all or nothing; unchanged without them; None with only part of them)."""
+    text = __import__("smt_build").unadapt(p, text)     # the later SMT test edits are reverted first, exactly
     eds = TEST_EDITS.get(p, [])
     if text is None or not eds or all(text.count(new) == 0 for _, new, _ in eds):
         return text

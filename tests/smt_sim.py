@@ -171,10 +171,10 @@ def htf_tuple(hbars, main, h):
     return [g(0), g(1), g(2), g(3), hbars[h]["t"], hbars[h]["tc"], hbars[h - 1]["tc"] if h >= 1 else None]
 
 
-def f_pick(t, c0, c1, c2, c3, hOpen, hClose, hClosePrev):
+def f_pick(t, conf, c0, c1, c2, c3, hOpen, hClose, hClosePrev):
     k0 = k1 = k2 = rt = None
     if t is not None and hOpen is not None and hClose is not None:
-        if t >= hClose:
+        if conf and t >= hClose:
             k0, k1, k2, rt = c0, c1, c2, hClose
         else:
             k0, k1, k2, rt = c1, c2, c3, hClosePrev
@@ -290,8 +290,8 @@ def pine_run(bars1, sec5, sec15, P=DEF, realtime=False, mut=None):
     out = []
     for i, b in enumerate(bars1):
         t = b["tc"]
-        k5, k5p, k5pp, t5 = f_pick(t, *sec5.at(b, realtime))
-        k15, k15p, k15pp, t15 = f_pick(t, *sec15.at(b, realtime))
+        k5, k5p, k5pp, t5 = f_pick(t, True, *sec5.at(b, realtime))        # evaluated at the 1M bar's confirmed execution
+        k15, k15p, k15pp, t15 = f_pick(t, True, *sec15.at(b, realtime))
         if mut and "late5" in mut:       # one extra higher-timeframe bar of delay ([1] + lookahead_on)
             tup = sec5.at(b, realtime)
             k5, k5p, t5 = tup[1], tup[2], tup[6]
@@ -415,7 +415,9 @@ def static_checks():
         "    if bar_index >= kPer + slow + dPer - 3", "        for j = 0 to dPer - 1", "            s += mainV[j]",
         "        sigV := s / dPer",
         "    [m, m[1], m[2], m[3], time, time_close, time_close[1]]",
-        "    if not na(t) and not na(hOpen) and not na(hClose)", "        if t >= hClose",
+        "    if not na(t) and not na(hOpen) and not na(hClose)", "        if conf and t >= hClose",
+        "[k5, k5p, k5pp, t5ref]      = f_pick(tNow, barstate.isconfirmed, a5c0, a5c1, a5c2, a5c3, a5o, a5cl, a5clp)",
+        "[k15, k15p, k15pp, t15ref]  = f_pick(tNow, barstate.isconfirmed, a15c0, a15c1, a15c2, a15c3, a15o, a15cl, a15clp)",
         "            k0 := c0", "            k1 := c1", "            k2 := c2", "            rt := hClose",
         "            k0 := c1", "            k1 := c2", "            k2 := c3", "            rt := hClosePrev",
         "float tNow = time_close",
@@ -450,7 +452,7 @@ def static_checks():
           not re.search(r"^\s*(var|varip)\b", lg, re.M))
     check("PT-06 the containing-bar value (c0 / a5c0 / a15c0) is read only by f_pick's same-close branch",
           lg.count("c0") == lg.count("a5c0") + lg.count("a15c0") + 2
-          and "float c0, float c1" in lg and lg.count("k0 := c0") == 1 and lg.count("a5c0") == 2 and lg.count("a15c0") == 2,
+          and "bool conf, float c0, float c1" in lg and lg.count("k0 := c0") == 1 and lg.count("a5c0") == 2 and lg.count("a15c0") == 2,
           (lg.count("c0"), lg.count("a5c0"), lg.count("a15c0")))
     plots = re.findall(r"^plotshape\((\w+),", SRC, re.M)
     check("PT-07 arrows: only shortSig (down, above bar) / longSig (up, below bar), distinct colours",
@@ -464,6 +466,24 @@ def static_checks():
           not (set(assigned) & sig_names) and "iDebug" not in lg, assigned)
     check("PT-09 off-chart notice: 1M standard candles only, otherwise a notice and evalNow false",
           "1分足の通常ローソク足チャート専用" in SRC and "if barstate.islast and not chartOK" in SRC)
+    disp = "\n".join(l.split("//")[0] for l in SRC[SRC.index("// ==== SMT Logic (end)"):].split("\n"))
+    raw = re.findall(r"\ba(?:5|15)(?:c\d|o|cl|clp)\b", disp)
+    check("PT-10 arrows / labels / table / Data Window read only the selected values (k5, k5p, k15, dl0, dl1, t5ref, t15ref, "
+          "shortSig / longSig ...): no raw request.security tuple element (a5c0 .. a15clp) after the logic section",
+          not raw and all(x in disp for x in ("f_n(k5)", "f_n(k5p)", "f_n(k15)", "f_n(dl0)", "f_n(dl1)", "f_t(t5ref)", "f_t(t15ref)"))
+          and "plot(k5," in disp and "plot(f_ymdhm(t5ref)" in disp, raw)
+    lbl = re.findall(r"label\.new\(([^,]+),", disp)
+    check("PT-11 nothing is drawn on an earlier bar: label.new only at bar_index (no offset), no label.set_x / set_xy, "
+          "no plot / plotshape offset, labels only inside `if iDebug and evalNow` (confirmed bar) or the last-bar notice",
+          lbl and set(lbl) == {"bar_index"} and "set_x" not in disp and "offset" not in disp
+          and disp.count("label.new(") == 3 and "if iDebug and evalNow" in disp, lbl)
+    tup = re.search(r"f_htf\(int kPer, int dPer, int slow\) =>\n    \[m, s\] = f_mtStoch\(kPer, dPer, slow\)\n    (\[.*\])", lg)
+    check("PT-12 one request.security tuple per timeframe, evaluated on one higher-timeframe bar h: [K(h), K(h-1), K(h-2), K(h-3), "
+          "time(h), time_close(h), time_close(h-1)]; unpacked in the same order (c0..c3, open, close, closePrev)",
+          tup and tup.group(1) == "[m, m[1], m[2], m[3], time, time_close, time_close[1]]"
+          and "[a5c0, a5c1, a5c2, a5c3, a5o, a5cl, a5clp] = request.security(" in lg
+          and "[a15c0, a15c1, a15c2, a15c3, a15o, a15cl, a15clp] = request.security(" in lg
+          and "f_pick(float t, bool conf, float c0, float c1, float c2, float c3, float hOpen, float hClose, float hClosePrev) =>" in lg)
 
 
 def stoch_checks():
@@ -549,9 +569,18 @@ def htf_checks():
     b = next(x for x in bars if hm(x["tc"]) == 14 * 60 + 59)
     tup = s5.at(b, True)
     hist = s5.at(b, False)
-    k5, *_ = f_pick(b["tc"], *tup)
+    k5, *_ = f_pick(b["tc"], True, *tup)
     check("TM-03 forming 5M bar: developing K (realtime) differs from its final K (history), and neither is used at 14:59",
           tup[0] != hist[0] and k5 == tup[1] == hist[1])
+    # realtime forming tick of the 1M bar that closes with the 5M bar (14:59-15:00 bar, close 15:00): not yet confirmed
+    b = next(x for x in bars if hm(x["tc"]) == 15 * 60 + 0)
+    tup = s5.at(b, True)
+    fk0, _, _, frt = f_pick(b["tc"], False, *tup)
+    ck0, _, _, crt = f_pick(b["tc"], True, *tup)
+    h = next(j for j, x in enumerate(h5) if x["tc"] == b["tc"])
+    check("TM-03b realtime forming tick of the 1M bar closing at 15:00: the 5M bar closing at 15:00 is not used yet (K / time = "
+          "the 14:55 bar); at the confirmed execution it is used (K / time = the 15:00 bar)",
+          fk0 == s5.main[h - 1] and hm(frt) == 14 * 60 + 55 and ck0 == s5.main[h] and hm(crt) == 15 * 60 + 0)
     # history vs realtime: same signals and reference times
     for seed, kw in ((21, {}), (22, {"drop": 0.15}), (23, {"gap_every": 1370})):
         bars = gen_bars(40000, seed, **kw)
@@ -755,15 +784,64 @@ def sequence_checks():
 BASE_REV = "35d2ee4"        # the branch head SMT-1 was added on
 
 
+def smt_allowed():
+    sys.path.insert(0, os.path.join(ROOT, "tests"))
+    import smt_build as sb
+    return set(sb.NEW_FILES) | set(sb.TEST_EDITS)
+
+
 def files_check():
-    st = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"], capture_output=True, text=True).stdout.split("\n")
-    mod = set(subprocess.run(["git", "-C", ROOT, "diff", "--name-only", BASE_REV, "--"], capture_output=True, text=True).stdout.split())
-    mod |= {l[3:] for l in st if l.startswith("??")}
-    allowed = {"StochMtfSignal.pine", "STOCH_MTF_SIGNAL_ja.md", "tests/smt_sim.py"}
-    added = set(subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "--diff-filter=A", BASE_REV, "--"],
-                               capture_output=True, text=True).stdout.split()) | {l[3:] for l in st if l.startswith("??")}
-    check(f"FL-01 vs {BASE_REV}: only the new SMT files are added; no existing file (Pine / Strategy / Engine / Visual / "
-          "Zone Combo Lab / test) is changed", mod <= allowed and mod <= added, sorted(mod - allowed))
+    """Our own layer only: every commit after BASE_REV whose subject starts with "SMT-" and the uncommitted changes touch only
+    the SMT files and the registration edits (smt_build.TEST_EDITS, each exactly: smt_build.unadapt gives the previous text).
+    Commits of other layers (e.g. ZSY-0) are not ours and not judged here."""
+    import smt_build as sb
+    git = lambda *a: subprocess.run(["git", "-C", ROOT, *a], capture_output=True, text=True).stdout
+    allowed = smt_allowed()
+    touched, bad = set(), []
+    for line in git("log", "--format=%H %s", f"{BASE_REV}..HEAD").strip().split("\n"):
+        if not line:
+            continue
+        h, subj = line.split(" ", 1)
+        if subj.startswith("SMT-"):
+            names = set(git("show", "--name-only", "--format=", h).split())
+            touched |= names
+            bad += sorted(names - allowed)
+    st = git("status", "--porcelain").split("\n")
+    wt = {l[3:] for l in st if l.strip()}
+    bad += sorted(wt - allowed)
+    # each registration edit: the current text minus exactly the SMT edit == the text before the SMT registration
+    reg_bad = [p for p in sb.TEST_EDITS
+               if sb.unadapt(p, open(os.path.join(ROOT, p), encoding="utf-8").read())
+               != git("show", f"{sb.REG_BASE}:{p}")]
+    check(f"FL-01 SMT commits after {BASE_REV} (+ uncommitted changes) touch only the SMT files and the registration edits; "
+          "each registered older file differs from smt_build.REG_BASE by exactly its recorded SMT edit "
+          "(no Pine / Strategy / Engine / Visual / Zone Combo Lab / order code changed)",
+          not bad and not reg_bad and {"StochMtfSignal.pine", "tests/smt_sim.py"} <= touched | wt, (bad, reg_bad))
+
+
+def registration_check():
+    sys.path.insert(0, os.path.join(ROOT, "tests"))
+    import smt_build as sb
+    acc = __import__("acc_build")
+    cad = __import__("cad_adapt")
+    git = lambda *a: subprocess.run(["git", "-C", ROOT, *a], capture_output=True, text=True).stdout
+    exact = all(sb.unadapt(p, open(os.path.join(ROOT, p), encoding="utf-8").read()) == git("show", f"{sb.REG_BASE}:{p}")
+                and open(os.path.join(ROOT, p), encoding="utf-8").read() != git("show", f"{sb.REG_BASE}:{p}")
+                for p in sb.TEST_EDITS)
+    strays = ["StochMtfSignal2.pine", "Stoch.pine", "tests/smt_sim2.py", "STOCH_MTF_SIGNAL.md", "ZoneStrategyXAU.pine"]
+    check("RG-01 registration (a layer above ZSY): tests/zsy_build.py / tests/cad_adapt.py / tests/zsy_sim.py differ from "
+          "smt_build.REG_BASE by exactly the recorded edits; acc_build.ok() (through lab / fds / lfw / lab2 / lbs / zsy) accepts exactly the "
+          "4 SMT files and no stray name; cad_adapt.LATER_NEW lists them",
+          exact and all(acc.ok(f) and f in cad.LATER_NEW for f in sb.NEW_FILES) and len(sb.NEW_FILES) == 4
+          and set(sb.TEST_EDITS) == {"tests/zsy_build.py", "tests/cad_adapt.py", "tests/zsy_sim.py"}
+          and not any(acc.ok(f) for f in strays))
+    old = git("show", "146f68f:StochMtfSignal.pine")
+    cur = open(PINE, encoding="utf-8").read()
+    one_more = cur.replace("bool evalNow  = chartOK and barstate.isconfirmed", "bool evalNow  = chartOK")
+    check("RG-02 StochMtfSignal.pine == its SMT-1 text (146f68f) with exactly the recorded SMT-2 edits (smt_build.pine_unapply, used by "
+          "zsy_sim ZS-02); any other change is not reverted (mutation: evalNow without isconfirmed -> no match)",
+          sb.pine_unapply("StochMtfSignal.pine", cur) == old and cur != old
+          and sb.pine_unapply("StochMtfSignal.pine", one_more) != old)
 
 
 if __name__ == "__main__":
@@ -773,6 +851,7 @@ if __name__ == "__main__":
     boundary_checks()
     sequence_checks()
     files_check()
+    registration_check()
     n_fail = sum(1 for _, ok in RESULTS if not ok)
     print(f"\n{len(RESULTS) - n_fail} / {len(RESULTS)} passed")
     sys.exit(1 if n_fail else 0)

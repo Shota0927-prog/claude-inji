@@ -1,9 +1,9 @@
-# Stoch MTF Signal (1M) — SMT-1 実装メモ・検証結果
+# Stoch MTF Signal (1M) — SMT-1 / SMT-2 実装メモ・検証結果
 
 | 項目 | 内容 |
 |---|---|
-| 新規ファイル | `StochMtfSignal.pine`（単体インジ・Pine Script v5）、`tests/smt_sim.py`（ローカル検証）、本メモ |
-| 変更しないもの | 既存の Pine（Zone Lab / Zone Combo Lab 系・Strategy・Engine・Visual・注文処理）・既存テスト。すべて変更なし |
+| 新規ファイル | `StochMtfSignal.pine`（単体インジ・Pine Script v5）、`tests/smt_sim.py`（ローカル検証）、`tests/smt_build.py`（既存 fixture への登録・SMT-2）、本メモ |
+| 変更しないもの | 既存の Pine（Zone Lab / Zone Combo Lab 系・Strategy・Engine・Visual・注文処理）。すべて変更なし。既存テストは新規ファイル登録に必要な 2 ファイルの登録行だけ（`tests/lbs_build.py`・`tests/cad_adapt.py`、§6 参照） |
 | 実装しないもの | 売買注文・SL / TP・成績集計・アラート・Zone Combo Lab への接続 |
 | Pine バージョン | **v5**。後で接続する Zone Combo Lab（`ZoneComboLab*.pine`）・Strategy・Engine を含む既存 Pine の大半が `//@version=5` のため、それに合わせた（v6 は `MtfPocDetector.pine` / `MtfPocFeedXAU.pine` の 2 本だけで、Combo Lab とは `input.source` で接続しており版の違いは接続を妨げない）。既存ファイルの移行はしない |
 | 対象チャート | 1分足の通常ローソク足のみ（`timeframe.isminutes and timeframe.multiplier == 1 and chart.is_standard`）。それ以外では合図を止め、最後の足に「1分足の通常ローソク足チャート専用」のラベルを出す |
@@ -34,10 +34,16 @@
 - 5分・15分は `request.security` の中で同じ `f_mtStoch` を評価する。**各時間足自身の OHLC** から計算し、
   1分足に展開した階段状データには適用しない。
 
-**参照元について**: 指定の [MetaQuotes 公式 Stochastic Oscillator](https://www.mql5.com/en/code/50) は、
-この作業環境のネットワーク許可外（`www.mql5.com` 名前解決不可）で取得できなかった。`tests/smt_sim.py` の
-`MT5Stoch` は MetaQuotes 配布の `Stochastic.mq5` の `OnCalculate`（上表の手順・初期化・`prev_calculated − 2` からの再計算）
-を記憶に基づいて行単位で移植したもの。**公式ページの原文との突き合わせは未実施**（要確認事項）。
+**参照元について（照合の範囲）**:
+- [MetaQuotes 公式 Stochastic Oscillator（code/50）](https://www.mql5.com/en/code/50)、[MQL5 記事 3047](https://www.mql5.com/ja/articles/3047)
+  とも、この作業環境のネットワーク許可外（`www.mql5.com` の名前解決不可）で取得できなかった。**掲載コードと実装・参照モデルを
+  直接照合してはいない。**
+- `tests/smt_sim.py` の `MT5Stoch` は、`Stochastic.mq5` の `OnCalculate`（上表の手順・0 初期化・`prev_calculated − 2` からの再計算・
+  最小 / 最大の初期値）を記憶に基づいて行単位で移植したもの。Pine の `f_mtStoch` はこの移植と浮動小数点で完全一致する（ST-01）。
+- ご確認いただいた範囲: 記事 3047 掲載の Stochastic.mq5 の計算部分と、報告した計算手順（上表）が一致。これは手順の一致であり、
+  掲載コードと `MT5Stoch` / `f_mtStoch` のコード全体の照合ではない。
+- 残る確認: 掲載コードの `OnCalculate` を `MT5Stoch.on_calculate` と行単位で照合（特に各ループの開始位置 `K−1` / `K+S−2` / `D−1`、
+  `sum_high == 0.0` の扱い、`rates_total <= K+D+S` の判定、最小 / 最大の初期値）。
 
 ## 2. 上位足（5分・15分）の確定値の取得
 
@@ -46,16 +52,16 @@
 ```
 [c0, c1, c2, c3, open, close, closePrev] = request.security(tf, f_htf(), gaps_off, lookahead_on)
    f_htf() = [K, K[1], K[2], K[3], time, time_close, time_close[1]]   ← すべて上位足自身の足
-f_pick:
-   T >= close   → 含む上位足が T に確定（同時確定）     : K0 = c0, K1 = c1, K2 = c2, 参照確定時刻 = close
-   それ以外     → 含む上位足は形成中なので使わない      : K0 = c1, K1 = c2, K2 = c3, 参照確定時刻 = closePrev
+f_pick(T, 確定実行か, …):
+   確定実行 かつ T >= close → 含む上位足が T に確定（同時確定） : K0 = c0, K1 = c1, K2 = c2, 参照確定時刻 = close
+   それ以外                 → 含む上位足は形成中なので使わない  : K0 = c1, K1 = c2, K2 = c3, 参照確定時刻 = closePrev
 ```
 
 根拠（「[1] と lookahead_on だから安全」ではなく、なぜ未来も遅れも入らないか）:
 
 1. `lookahead_on` は、チャート足を **含む** 上位足の値を返す。履歴ではその上位足の**最終値**（＝未来を含みうる）、
    リアルタイムでは形成中の値。
-2. 含む上位足の値 `c0` は、`T >= その足の time_close` のとき **だけ** 使う。このとき上位足は T 時点で確定済みなので、
+2. 含む上位足の値 `c0` は、1分足の確定実行（`barstate.isconfirmed`）で `T >= その足の time_close` のとき **だけ** 使う。このとき上位足は T 時点で確定済みなので、
    履歴の最終値は T までの情報だけでできている（未来の漏れなし）。リアルタイムでも、その 1分足の確定時点の値＝その上位足の確定値。
 3. それ以外の 1分足では `c0` を一度も読まず、1本前の上位足（`time_close[1] <= 含む足の time <= 1分足の time < T`、確定済み）を使う。
    形成中の上位足は使わない。
@@ -65,6 +71,16 @@ f_pick:
    例: 14:59〜15:00 の 1分足が欠けた場合、14:59 確定の 1分足は 5分 14:55 確定値、次の 15:01 確定の 1分足が 15:00 確定値を使う（TM-05）。
 6. 選んだ値が na（上位足の本数不足など）なら合図を出さない。さらに古い値・形成中の値へ代替しない。
 7. 履歴とリアルタイムで同じ選択式を使うため、再読み込みの前後で参照する上位足と合図が一致する（TM-04: 履歴 / リアルタイム模擬で全足一致）。
+8. （SMT-2）リアルタイムで上位足と同時に確定する 1分足の**途中 tick** では、`T >= close` は既に真だが上位足はまだ形成中。
+   SMT-1 では表・データウィンドウにこの形成中の値が「確定 15:00」として出る余地があった（矢印は `barstate.isconfirmed` で止まるので
+   判定は影響なし）。SMT-2 で確定実行の条件を f_pick に加え、途中 tick では 1本前の確定足を表示する（TM-03b）。履歴の全足と
+   リアルタイムの確定実行では `barstate.isconfirmed` が真なので、判定・合図は SMT-1 と同一。
+9. K とその過去値・確定時刻は、1 回の `request.security` の 1 つのタプルとして同じ上位足 h の上で評価される
+   （`K(h), K(h−1), K(h−2), K(h−3), time(h), time_close(h), time_close(h−1)`）。採用する 3 値は必ず連続する上位足
+   （h, h−1, h−2 または h−1, h−2, h−3）で、確定時刻はその先頭の足のもの（PT-12）。Δ0 / Δ1 もこの 3 値から計算する。
+10. `c0` 系（`a5c0` / `a15c0`）は f_pick の引数以外に現れない（PT-06）。状態変数はない（PT-05）。矢印・ラベル・表・データウィンドウは
+   選択後の値（k5 / k5p / k15 / dl0 / dl1 / t5ref / t15ref と判定 bool）だけを読む（PT-10）。描画は現在足の `bar_index` だけで、
+   過去足への追加（offset / set_x）はない（PT-11）。
 
 例（連続した取引時間）: 14:59 確定 → 5分 14:55・15分 14:45 / 15:00 確定 → 5分 15:00・15分 15:00 / 15:01 確定 → 15:00・15:00（TM-01）。
 
@@ -107,31 +123,47 @@ f_pick:
     判定コード（6 桁 = [データ|クロス|変化|到達|5分|15分]、1 = 成立）/ 合図。過去のクロス足の判定根拠を足ごとに追える。
   - 時刻の表示は `syminfo.timezone`（取引所時間）。
 
-## 6. 検証結果（`python3 tests/smt_sim.py`: 64 / 64 PASS）
+## 6. 検証結果（`python3 tests/smt_sim.py`: 69 / 69 PASS）
 
 | 区分 | 内容 |
 |---|---|
-| PT-01〜09 | Pine 原文の静的照合: v5・indicator・注文 / アラートなし、入力と初期値、Python モデルが写した文が Pine に原文どおり存在、request.security 2本（5 / 15・lookahead_on・各時間足自身の f_htf）、状態変数なし、含む上位足の値は f_pick の同時確定分岐だけが読む、矢印の条件と色、検証表示が判定変数を書き換えない、対象外チャート表示 |
+| PT-01〜12 | Pine 原文の静的照合: v5・indicator・注文 / アラートなし、入力と初期値、Python モデルが写した文が Pine に原文どおり存在、request.security 2本（5 / 15・lookahead_on・各時間足自身の f_htf）、状態変数なし、含む上位足の値は f_pick の同時確定分岐だけが読む、矢印の条件と色、検証表示が判定変数を書き換えない、対象外チャート表示、表示部は選択後の値だけを読む（PT-10）、過去足への描画なし（PT-11）、タプルの並びと受け取り順（PT-12） |
 | ST-01〜05 | 同一 OHLC で MT5 移植（全計算・1本ずつの増分計算）と Pine の f_mtStoch が **浮動小数点で完全一致**（15 通りのデータ×パラメータ、値幅ゼロ区間・欠損足を含む）。初期化の 0 を Pine は na で扱う。TradingView 型 SMA スローイングとは不一致。値幅ゼロで 100。1,000,000 超の価格での MT5 側の制約 |
-| TM-01〜07 | 5分・15分境界とその前後（14:59 / 15:00 / 15:01 / 15:04 / 15:05 / 15:14 / 15:15 / 15:16）の参照足、全足で「確定時刻 ≦ T の最新足」の K を使用、形成中の上位足を使わない、1分足欠損時の実時刻判定、40,000 本×3 系列（欠損 15%・セッションギャップ含む）で履歴 = リアルタイム模擬 = 仕様オラクル（MT5 移植ベース）が全足一致・T より後の上位足を参照しない。`[1]+lookahead_on` の 1本遅れ、形成中足の使用は検出される |
+| TM-01〜07 | 5分・15分境界とその前後（14:59 / 15:00 / 15:01 / 15:04 / 15:05 / 15:14 / 15:15 / 15:16）の参照足、全足で「確定時刻 ≦ T の最新足」の K を使用、形成中の上位足を使わない、同時確定 1分足の途中 tick では 1本前（TM-03b）、1分足欠損時の実時刻判定、40,000 本×3 系列（欠損 15%・セッションギャップ含む）で履歴 = リアルタイム模擬 = 仕様オラクル（MT5 移植ベース）が全足一致・T より後の上位足を参照しない。`[1]+lookahead_on` の 1本遅れ、形成中足の使用は検出される |
 | BD-01〜20 | 90 / 10 ちょうど採用・89.99 / 10.01 除外、10 本窓の最古採用・11 本目除外、変化幅 3 ちょうど採用・2.5 除外、クロス時 K1 が 90 未満 / 10 超でも可、到達に D を使わない、前足同値からのクロス採用・今回同値は除外、5分 50 除外・継続中採用、15分 通常 / 減速採用・横ばい / 加速 / Δ0 = Δ1 / 反転は除外（両方向）、データ不足で不成立、形成中・対象外チャートで不成立 |
 | SQ-01〜04 | クロス後に 5分が揃っても後追いなし、1 回の 90 到達を 2 つの後のクロスがそれぞれ使用、合図は必ずそのクロス足自身、15分の値が揃う前は合図なし |
-| FL-01 | 35d2ee4（リモートのブランチ先頭）との差分は新規 3 ファイルの追加だけ |
+| FL-01 | 35d2ee4 以降の SMT コミット（と未コミット変更）が触るのは SMT の新規ファイルと登録の 2 ファイルだけ、登録の 2 ファイルは記録した編集だけの差 |
+| RG-01 | 登録（LBS-1 の上の層）: `tests/lbs_build.py` / `tests/cad_adapt.py` は `smt_build.REG_BASE`（75137ed）から記録した編集だけの差。`acc_build.ok()` は SMT の 4 ファイルだけを受け付け、似た名前の別ファイルは受け付けない |
 
 TradingView の `request.security` は模擬（履歴 = 含む上位足の最終値、リアルタイム = 1分足確定時点の形成中の値）。
 上位足は 1分足から合成した OHLC をその時間足自身の足として使った（実フィードの 5分・15分足とは別物）。
 
-### 既存テストへの影響
+### 既存テストへの影響（SMT-2: 同じ基点での全 fixture 再実行）
 
-既存の fixture（例 `tests/acc_sim.py` AS-10）は「基準コミットから新しく増えたファイルは登録済みのものだけ」を確認するため、
-本 SMT の新規ファイルを未登録として不合格にする（既存ファイルの内容は変更していない）。
-今回は既存テストを変更しない方針とし、登録（acc_build 方式の追記）は行っていない。
+基点 = 75137ed（リモートのブランチ先頭、SMT-1 を含む）。3 つの作業ツリーで既存の `tests/*_sim.py` 全 64 本を実行した
+（完全な履歴で実行。最初の報告の acc_sim は 52 コミットの浅いクローンで実行しており、`gate_*` 6 件の不合格はそれが原因と
+考えられる。完全な履歴の 75137ed ではこの 6 件は合格。ce1686d での再測定はしていない）。
 
-実測（`python3 tests/acc_sim.py`、作業開始時点の ce1686d の上で）: 変更前 159 / 165、本変更後 158 / 165。
-変更前から `gate_accum` など 6 件が不合格（本変更と無関係・既存の状態）で、増えた 1 件は上記の AS-10 だけ。
-他の既存 fixture は今回実行していない。作業中にリモートのブランチが更新されていた（LTB-10 / Zone Combo Lab ほか）ため、本コミットは最新のリモート（35d2ee4）の上に新規 3 ファイルだけを追加した。その上での既存 fixture の再実行もしていない。
+| ツリー | 内容 | 既存 64 fixture のチェック |
+|---|---|---|
+| A | 75137ed から SMT-1 を revert（SMT なし = 変更前） | 2818 / 2857 PASS（不合格を含む fixture 23 本、うち lab_sim は途中で AssertionError） |
+| B | 75137ed そのまま（SMT-1 のみ・未登録） | dtb_sim / ltb_sim 以外の 62 本で A と比較 |
+| C | SMT-2（登録済み・bf1faa0） | 2818 / 2857 PASS。**A と全 64 本で出力の不合格行が全文一致**（smt_sim を加えて 2887 / 2926） |
+
+- **今回追加された不合格（B − A）**: 12 fixture の 15 チェックで、「基準からの新規ファイルは登録済みのものだけ」の不合格一覧に SMT のファイル
+  （`StochMtfSignal.pine` / `STOCH_MTF_SIGNAL_ja.md` / `tests/smt_sim.py`）が加わった: acc_sim AS-10、bel_sim BS-02、cad_sim CD-06 / CD-07、
+  eua_sim EA-02、gja_sim GA-02、msl_sim MS-02、pf_sim PS-03、uja_sim UA-02、ujl_sim UL-07、ujt_sim UT-05、xa_sim XQ-07 / XT-07、
+  xae_sim XE-10 / XF-07。この 15 チェックは A でも別の未登録ファイル（下記）で不合格なので、合否の件数は変わらず、一覧の中身だけが増えた。
+- **登録後（C）**: 上の一覧から SMT のファイルはすべて消え、A と同一。
+- **変更前からの不合格（A = C）**: 上の 13 チェックの多くは、SMT と関係なく **DTB-1 / LTB-1 / ZSY-0 の未登録ファイル**
+  （`DoubleTripleTopBottomXAU.pine`・`LongTermDoubleTripleTopBottomXAU.pine`・`ZoneSyncProbe*.pine`・`ZONE_SYNC_FEASIBILITY_ja.md`・
+  `tests/dtb_sim.py`・`tests/ltb_sim.py`・`tests/zsy_exp.py`）で不合格のまま。AS-10 も同じ理由で不合格のまま（SMT 分だけを解消）。
+  ほかに au / btl / sx2s / sxs / xaa / xab / xac / xal / xas（XA 系の生成物照合）、ltb LT-P15 / LT-C18、lab_sim の AssertionError が
+  変更前から不合格。これらの原因修正は今回の範囲外。
 
 ## 7. TradingView で確認が必要なこと（未実施）
+
+TradingView（`www.tradingview.com`）はこの作業環境のネットワーク方針で接続不可（CONNECT 403）のため、以下はすべて未実施。
 
 1. コンパイル（v5。`chart.is_standard`・`str.format_time`・`plot(display = 入力依存)`・`precision` の使用を含む）。
 2. 1分足チャートでの矢印の位置・色、検証表示 ON の表 / ラベル / データウィンドウ。

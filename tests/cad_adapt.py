@@ -38,6 +38,7 @@ LATER_NEW = ("tests/xas_sim.py", "tests/sats_src/f_satBand.txt", "tests/sats_src
              "AccHistTickProbe.pine", "tests/acc3_exp.py",                                   # new in the later layer ACC-3 (probe / experiment)
              "MtfPocDetector.pine", "ZoneComboLabXAU.pine", "ZONE_COMBO_LAB_XAU_ja.md",       # new in the later layer LAB-1
              "tests/lab_pine.py", "tests/lab_sim.py", "tests/lab_load.py", "tests/lab_build.py")  # new in the later layer LAB-1
+LATER_NEW = LATER_NEW + ("StochMtfSignal.pine", "STOCH_MTF_SIGNAL_ja.md", "tests/smt_sim.py", "tests/smt_build.py")  # new in the later layer SMT (Stoch MTF Signal)
 LATER_NEW = LATER_NEW + ("ZoneSyncProbe.pine", "ZONE_SYNC_FEASIBILITY_ja.md", "tests/zsy_build.py", "tests/zsy_sim.py",
                          "tests/zsy_exp.py", "ZoneSyncXAU.pine", "ZONE_SYNC_XAU_ja.md", "tests/zsx_sim.py")  # new in the later layer ZSY (all-timeframe Zone display: probe and body)
 LATER_NEW = LATER_NEW + ("ZoneComboLabBTCUSD.pine", "ZoneComboLabGBPJPY.pine", "ZoneComboLabUSDJPY.pine", "ZoneComboLabEURUSD.pine",
