@@ -1,0 +1,124 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  Zone Sync Probe 5m (ZSP-0)  —  検証専用。Zone は描かない。既存の Lab / Strategy / Feed / LongFibWave は変更しない。
+// ----------------------------------------------------------------------------
+//  目的: 「5分足を基準に確定した状態」を、チャート足 (5秒〜月足) を変えても同じ値で受け取れるかを TradingView 実機で確かめる。
+//   ・状態は request.security(…, "5", f_zsEng(…)) の 5分コンテキストの中で、5分足を 1 本ずつ進める (チャート足の bar_index・close は使わない)。
+//   ・5分足 t の評価で、その足の値 (time / close) で状態を進め、「t まで」と「t-1 まで」(= [1]) の両方を返す。チャート側は
+//     min(チャート足の time_close, timenow) >= 5分足 t の time_close なら「t まで」、そうでなければ「t-1 まで」を使う
+//     (形成中の 5分足 t の値では切り替えない。週末・再読み込みで次の 5分足がない間も、最後に確定した足まで反映する)。
+//     形成中の 5分足のティックで進んだ分はコンテキスト内の rollback で戻る前提 (表の「逆戻り」「同じ足で変化」で確認)。
+//   ・蓄積開始時刻 (入力) 以後に始まった 5分足だけを数える。5分コンテキストの最初の足がこの時刻より後なら「履歴不足」。
+//   ・チャート足 <= 5分: lookahead_on (そのチャート足を含む 5分足の評価)。チャート足 > 5分: lookahead_off
+//     (チャート足の中の最後の 5分足の評価。リアルタイムの足では最新の 5分足)。
+//  出力 (display.none の数値。ZoneSyncProbeRecv / ZoneSyncProbeWrap の input.source で選ぶ):
+//   ZSP protocol (30001) / 処理済み 5分足数 / チェックサム / 最後に確定した 5分足の開始時刻 / 同 確定時刻 / 5分 EMA (確定値)
+//  表: 5分コンテキストの最初の足・本数、蓄積開始時刻と履歴不足、最後に確定した 5分足、処理数・チェックサム (署名)、5分 EMA、
+//      リアルタイムで観測した 5分更新の回数・飛び・逆戻り、ヒストリカルのチャート足 1 本ずつで観測できなかった 5分更新の数。
+//  手順・記録表: ZONE_SYNC_FEASIBILITY_ja.md (§5)。★ TradingView 実機でのコンパイル・表示は未実施。
+// ============================================================================
+
+//@version=5
+indicator("Zone Sync Probe 5m (ZSP-0)", "ZSP0", overlay = true)
+
+zsAnchor = input.time(timestamp("2026-10-26T07:00:00+09:00"), "蓄積開始時刻 (この時刻以後に始まった 5分足だけを数える)",
+     tooltip = "全時間足で同じ値にする。5分足チャートで表示される「5分コンテキストの最初の足」以後の時刻にすると、5分足チャートと同じ開始点になる。")
+zsEmaLen = input.int(3000, "5分足 EMA 本数 (Lab の MA 5分足 EMA と比べる)", minval = 1)
+zsTbl    = input.bool(true, "表を表示")
+
+simple bool zsLowTf = timeframe.in_seconds() <= 300
+
+// 5分コンテキストの中で 1 本ずつ評価される。戻り値 = [コンテキスト情報, この 5分足の time_close, 「t まで」, 「t-1 まで」]
+f_zsEng(int aT, simple int eLen) =>
+    float e5 = ta.ema(close, eLen)
+    var int ft5 = time            // この 5分コンテキストの最初の足
+    var int n5  = 0               // この 5分コンテキストの本数 (形成中を含む)
+    n5 += 1
+    var int   n     = 0           // 蓄積開始時刻以後に始まった 5分足の数
+    var float ck    = 0.0         // 5分足の終値 (mintick 単位) の順序つきチェックサム
+    var int   lastT = na
+    var int   lastC = na
+    if time >= aT and not na(close)
+        n     += 1
+        ck    := (ck * 131.0 + math.round(close / syminfo.mintick)) % 999983.0
+        lastT := time
+        lastC := time_close
+    [ft5, n5, time_close, n, ck, lastT, lastC, e5, n[1], ck[1], lastT[1], lastC[1], e5[1]]
+
+[zsFt5, zsN5, zsTc5, zsNa, zsCka, zsLastTa, zsLastCa, zsE5a, zsNb, zsCkb, zsLastTb, zsLastCb, zsE5b] = request.security(syminfo.tickerid, "5",
+     f_zsEng(zsAnchor, zsEmaLen), lookahead = zsLowTf ? barmerge.lookahead_on : barmerge.lookahead_off)
+
+// その 5分足が確定済みか: チャート足の終わり (リアルタイムの足では現在時刻) がその 5分足の確定時刻以後
+bool  zsUseCur = not na(zsTc5) and math.min(time_close, timenow) >= zsTc5
+int   zsN      = zsUseCur ? zsNa : zsNb
+float zsCk     = zsUseCur ? zsCka : zsCkb
+int   zsLastT  = zsUseCur ? zsLastTa : zsLastTb
+int   zsLastC  = zsUseCur ? zsLastCa : zsLastCb
+float zsE5     = zsUseCur ? zsE5a : zsE5b
+
+// ---- 観測 (表示用。状態には使わない) ----
+// リアルタイム: 受け取った「最後に確定した 5分足」が変わった回数、処理数の飛び (2 以上増えた = 途中の更新を観測できなかった)、逆戻り
+varip int   zsRtTicks = 0
+varip int   zsRtSeen  = 0
+varip int   zsRtJump  = 0
+varip int   zsRtBack  = 0
+varip float zsRtPrevT = na
+varip float zsRtPrevN = na
+if barstate.isrealtime
+    zsRtTicks += 1
+    if not na(zsLastT) and (na(zsRtPrevT) or zsLastT != zsRtPrevT)
+        if not na(zsRtPrevN)
+            if zsN - zsRtPrevN > 1
+                zsRtJump += int(zsN - zsRtPrevN - 1)
+            if zsN < zsRtPrevN or zsLastT < zsRtPrevT
+                zsRtBack += 1
+        zsRtSeen  += 1
+        zsRtPrevT := zsLastT
+        zsRtPrevN := zsN
+// ヒストリカル: チャート足 1 本の値として現れなかった 5分更新の数 (チャート足 > 5分なら原理的に多い。外部接続で受け取れる粒度)
+var int   zsHChg  = 0
+var int   zsHMiss = 0
+var float zsHPrev = na
+if barstate.ishistory and not na(zsN)
+    if not na(zsHPrev) and zsN != zsHPrev
+        zsHChg += 1
+        if zsN - zsHPrev > 1
+            zsHMiss += int(zsN - zsHPrev - 1)
+    zsHPrev := zsN
+
+// ---- 外部接続の試験用の出力 ----
+plot(30001, "ZSP protocol", display = display.none)
+plot(zsN, "ZSP 処理済み5分足数", display = display.none)
+plot(zsCk, "ZSP チェックサム", display = display.none)
+plot(zsLastT, "ZSP 最後に確定した5分足の開始時刻", display = display.none)
+plot(zsLastC, "ZSP 最後に確定した5分足の確定時刻", display = display.none)
+plot(zsE5, "ZSP 5分EMA (確定値)", display = display.none)
+plot(zsE5, "5分 EMA (5分基準・確定値)", color = color.new(color.navy, 30))
+
+f_zsTm(int t) =>
+    na(t) ? "na" : str.format_time(t, "yyyy-MM-dd HH:mm", syminfo.timezone)
+
+var table zsTb = table.new(position.top_right, 2, 16, border_width = 1)
+f_zsRow(int r, string a, string b) =>
+    table.cell(zsTb, 0, r, a, text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(zsTb, 1, r, b, text_color = color.white, bgcolor = color.new(color.navy, 20), text_size = size.small)
+    true
+
+if zsTbl and barstate.islast
+    bool zsShort = not na(zsFt5) and zsFt5 > zsAnchor
+    f_zsRow(0, "チャート足 / 5分の取得 / 使用", timeframe.period + " / " + (zsLowTf ? "lookahead_on" : "lookahead_off") + " / " +
+         (zsUseCur ? "その5分足まで (確定済み)" : "1本前まで (その5分足は形成中)"))
+    f_zsRow(1, "5分コンテキストの最初の足", f_zsTm(zsFt5))
+    f_zsRow(2, "5分コンテキストの本数", str.tostring(zsN5))
+    f_zsRow(3, "蓄積開始時刻", f_zsTm(zsAnchor) + (zsShort ? "  ★履歴不足 (この時刻のデータがない)" : ""))
+    f_zsRow(4, "最後に確定した5分足 (開始)", f_zsTm(zsLastT))
+    f_zsRow(5, "同 確定時刻 (time_close)", f_zsTm(zsLastC))
+    f_zsRow(6, "処理済み5分足数", str.tostring(zsN))
+    f_zsRow(7, "チェックサム", str.tostring(zsCk, "#"))
+    f_zsRow(8, "署名 (全時間足で同じなら一致)", str.tostring(zsN) + "/" + str.tostring(zsCk, "#") + "/" + f_zsTm(zsLastT) + (zsShort ? " (履歴不足)" : ""))
+    f_zsRow(9, "5分 EMA (確定値)", str.tostring(zsE5, format.mintick))
+    f_zsRow(10, "RT: ティック / 5分更新の観測", str.tostring(zsRtTicks) + " / " + str.tostring(zsRtSeen))
+    f_zsRow(11, "RT: 飛び (観測できなかった更新) / 逆戻り", str.tostring(zsRtJump) + " / " + str.tostring(zsRtBack))
+    f_zsRow(12, "履歴: チャート足で見えた更新 / 見えなかった更新", str.tostring(zsHChg) + " / " + str.tostring(zsHMiss))
