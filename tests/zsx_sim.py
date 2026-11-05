@@ -425,19 +425,19 @@ def signature_checks():
     win = bars[-N:]
     rw = raw[-N:]
     e1, S1 = run_zsx(win, rw)
-    hd1, hz1 = e1["f_zxHash"](S1)
+    hd1, hz1 = tuple(e1["f_zxHash"](S1)[:2]), tuple(e1["f_zxHash"](S1)[4:])
     # the same window processed as realtime from the middle: one bar behind at the end -> after the next (historical) bar the same
     e2, S2 = run_zsx(win + [], rw, realtime_from=None)
-    hd2, hz2 = e2["f_zxHash"](S2)
+    hd2, hz2 = tuple(e2["f_zxHash"](S2)[:2]), tuple(e2["f_zxHash"](S2)[4:])
     # a 'monthly chart' that has 100000 bars available but asks for the last N (calc_bars_count) = the same window
     e3, S3 = run_zsx(bars[len(bars) - N:], raw[len(bars) - N:])
-    hd3, hz3 = e3["f_zxHash"](S3)
+    hd3, hz3 = tuple(e3["f_zxHash"](S3)[:2]), tuple(e3["f_zxHash"](S3)[4:])
     # a chart whose 5m data is cut shorter (only 300 bars): different state, and flagged (bars < N)
     e4, S4 = run_zsx(bars[-300:], raw[-300:])
-    hd4, hz4 = e4["f_zxHash"](S4)
+    hd4, hz4 = tuple(e4["f_zxHash"](S4)[:2]), tuple(e4["f_zxHash"](S4)[4:])
     # a different band set (one bar fewer) changes the band signature
     e5, S5 = run_zsx(win[:-1], rw[:-1])
-    hd5, _ = e5["f_zxHash"](S5)
+    hd5 = tuple(e5["f_zxHash"](S5)[:2])
     flag_short = 300 < N
     lab = lp.Runner(overrides=dict(dsZone=True, dsEnt=False, dsTbl=False, cTA=False, cTC=False)).run(win)
     lab_eq = lab_state(lab) == zsx_state(e1, S1, win[0]["t"])
