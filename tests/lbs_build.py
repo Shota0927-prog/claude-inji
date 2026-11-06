@@ -1,7 +1,7 @@
 """LBS-1 — the five symbol versions of the Zone Combo Lab (BTCUSD / GBPJPY / USDJPY / EURUSD / GBPUSD), built from the gold
 version ZoneComboLabXAU.pine as of LAB-5 (3be168d) by an exact list of edits (each old text must occur exactly `count` times).
 
-  python3 tests/lbs_build.py              # (re)writes the five files from the pinned gold source
+  python3 tests/lbs_build.py              # (re)writes the five files (and the gold version with the ZG layer) from the pinned gold source
   python3 tests/lbs_build.py --register   # the registration edits in the older fixtures (tests/lab2_build.py, tests/cad_adapt.py)
 
 What the edits change (nothing else; tests/lbs_sim.py LBS-01 rebuilds every file and compares byte for byte):
@@ -214,6 +214,342 @@ def build(sym, gold=None):
     t = gold if gold is not None else gold_source()
     for old, new, count in edits(sym):
         t = _sub(t, old, new, count)
+    for old, new, count in zg_edits(sym):     # the ZG layer (ZG-1 / ZG-2) on top of the symbol edits
+        t = _sub(t, old, new, count)
+    return t
+
+
+# ==== ZG layer (ZG-1 / ZG-2): double / triple top / bottom Zone ==========================================================================
+#  The ZG edits are applied after the LBS-1 edits (symbol versions) and to the pinned gold source for the gold version (build_gold).
+#  The detector is the LongTermDoubleTripleTopBottomXAU detector at ZG_LTB_REV (copied by zg_core with the marked ZG additions).
+#  ZG-2: the reversal is judged from the receiving 5m bar (no next-bar wait); the ZG condition counts only when a ZG "use" is ON
+#  (cZG and (zgUse1 or zgUse4 or zgUseD)) in f_condTyp, nSel and the AND list; cZG default ON for gold / OFF for the symbols.
+import re as _re
+
+ZG_LTB_PATH = "LongTermDoubleTripleTopBottomXAU.pine"
+ZG_LTB_REV = "9e92c02"     # LTB-15
+
+
+def zg_core():
+    """the ZG copy of the LTB detector (LtB1 / LtH / ltNew1 / ltCand1 / ltStep1 / ltRevWhy) with the marked ZG additions"""
+    src = git("show", f"{ZG_LTB_REV}:{ZG_LTB_PATH}")
+    i = src.index("// 監視基準 1 個")
+    j = src.index("// ==== LTB Logic (end)")
+    body = src[i:j].rstrip("\n")
+    body = _re.sub(r"\bEPS\b", "ZG_EPS", body)
+    def rep(a, b):
+        nonlocal body
+        assert body.count(a) == 1, a
+        body = body.replace(a, b)
+    rep("""                              //   C 反転方向の色ではない / B 実体幅不足 / R 実体比率不足 / E 接触終了 / W 反転待ち終了 / V 基準無効化 / T 監視期限終了)
+""", """                              //   C 反転方向の色ではない / B 実体幅不足 / R 実体比率不足 / E 接触終了 / W 反転待ち終了 / V 基準無効化 / T 監視期限終了)
+    float  gx                 // 【ZG 追加】2 回目以後の接触群の実体極値 (トップ = 実体上端の最高 / ボトム = 実体下端の最安。接触開始から検知足まで)
+""")
+    rep("""                        // 反転待ち (接触開始足 = 0 本目〜反転待ちの本数目。接触が続いている足だけ)
+""", """                        // 【ZG 追加】2 回目以後の接触群の実体極値 (検知の判定には使わない)
+                        if g.cnt >= 2
+                            g.gx := na(g.gx) ? (top ? bu : bd) : top ? math.max(g.gx, bu) : math.min(g.gx, bd)
+                        // 反転待ち (接触開始足 = 0 本目〜反転待ちの本数目。接触が続いている足だけ)
+""")
+    rep("""                                     str.tostring(bu, "#.########") + "," + str.tostring(bd, "#.########")
+""", """                                     str.tostring(bu, "#.########") + "," + str.tostring(bd, "#.########") + "," +
+                                     str.tostring(top ? math.max(P, g.gx) : math.min(P, g.gx), "#.########")     // 【ZG 追加】Zone の基準価格
+""")
+    head = """// ==== ZG LTB copy (begin) ===================================================
+//  LongTermDoubleTripleTopBottomXAU.pine (LTB-15, 9e92c02) の検知処理 (LtB1 / LtH / ltNew1 / ltCand1 / ltStep1 / ltRevWhy) の写し。
+//  【変更】EPS → ZG_EPS (この位置で使うため)、基準ごとに 2 回目以後の接触群の実体極値 gx を保持し、検知イベント D の末尾 (16 番目) に
+//  Zone の基準価格 (トップ = max(1 回目の山, gx) / ボトム = min(1 回目の谷, gx)) を加える。検知の判定・接触の数え方は変えない
+float ZG_EPS = 1e-7
+"""
+    return head + body + "\n// ==== ZG LTB copy (end) =====================================================\n"
+
+
+# gold values per TF: piv, wave, buf, dist, gap, body, ratio, wait, max, dir, sep
+GOLD = [
+    (4, 10, 5, 30, 8, 3, 30, 3, 24),
+    (4, 60, 20, 80, 8, 6, 30, 3, 48),
+    (4, 40, 20, 120, 8, 12, 30, 3, 24),
+]
+EXP = [24, 12, 5]
+TFN = ["1時間足", "4時間足", "日足"]
+TFS = ["1", "4", "D"]
+
+def num(x):
+    s = ('%.6f' % x).rstrip('0')
+    return s + '0' if s.endswith('.') else s
+
+def inputs(sym, mul, unit):
+    """sym: True = symbol version (price inputs are XxxIn, converted in LBS Unit)"""
+    sfx = 'In' if sym else ''
+    use = 'false' if sym else 'true'
+    L = []
+    L.append('var string G_ZG = "02g · ZG ダブル / トリプル トップ・ボトム (1H / 4H / D)"')
+    for k in range(3):
+        n = TFN[k]; s = TFS[k]
+        L.append(f'zgUse{s}  = input.bool({use}, "{n}: Strategy で利用", group = G_ZG, inline = "zgu{s}",')
+        L.append(f'     tooltip = "ON: この時間足のダブル / トリプルを Zone の一覧に入れ、エントリー条件・SL・TP 候補・「だけ」の判定・タッチ通知に使う。" +')
+        L.append(f'     "OFF: 使わない (表示 ON なら帯だけ表示)。")')
+        L.append(f'zgShow{s} = input.bool({use}, "表示", group = G_ZG, inline = "zgu{s}",')
+        L.append(f'     tooltip = "ON: 帯を表示 (既存の統合表示に入る)。OFF: 表示しない (利用の判定には影響しない)。")')
+        L.append(f'zgExp{s}  = input.bool(true, "{n}: 時間で消す", group = G_ZG, inline = "zge{s}")')
+        L.append(f'zgExpN{s} = input.int({EXP[k]}, "本数", minval = 1, group = G_ZG, inline = "zge{s}",')
+        L.append(f'     tooltip = "検知足 = 0 本目。この本数の{n}が確定した時点で Zone を消す (経過時間ではなく{n}の本数。検知器の最大監視本数とは別)。")')
+    L.append(f'zgHalf{sfx} = input.float({num(2 * mul)}, "ZG 帯の幅 (基準価格から上下 {unit})", minval = 0.0, step = {num(0.5 * mul)}, group = G_ZG,')
+    L.append(f'     tooltip = "基準価格 = トップは 1 回目の山と 2 回目 (トリプルで初めて発動した場合は 2・3 回目) の接触群の実体上端の高い方、" +')
+    L.append(f'     "ボトムは実体下端の低い方 (ヒゲは使わない。接触群は接触開始から検知足まで)。検知時点で固定。帯 = 基準価格 ± この値。")')
+    L.append(f'zgRev{sfx}  = input.float({num(5 * mul)}, "ZG 逆行で消す幅 ({unit})", minval = 0.0, step = {num(0.5 * mul)}, group = G_ZG,')
+    L.append(f'     tooltip = "検知結果を受け取った確定 5分足 (発動した足) から、トップは max(open, close) > 基準価格 + この値、ボトムは min(open, close) < 基準価格 − この値で消す。" +')
+    L.append(f'     "ヒゲだけの突破・ちょうどの値では消さない。")')
+    for k in range(3):
+        n = TFN[k]; s = TFS[k]
+        piv, wave, buf, dist, gap, body, ratio, wait, mx = GOLD[k]
+        g = f'G_ZG{s}'
+        L.append(f'var string {g} = "02g-{k + 1} · ZG {n}の検知 (LongTermDoubleTripleTopBottomXAU と同じ処理)"')
+        L.append(f'zgPiv{s}   = input.int({piv}, "{n}: Pivot 前後の本数", minval = 1, group = {g})')
+        L.append(f'zgWave{s}{sfx}  = input.float({num(wave * mul)}, "{n}: 最初の波の最低値幅 ({unit})", minval = 0.0, step = {num(0.5 * mul)}, group = {g})')
+        L.append(f'zgBuf{s}{sfx}   = input.float({num(buf * mul)}, "{n}: 接近許容幅 ({unit})", minval = 0.0, step = {num(0.5 * mul)}, group = {g})')
+        L.append(f'zgDist{s}{sfx}  = input.float({num(dist * mul)}, "{n}: 接触間の最低離れ幅 ({unit})", minval = 0.0, step = {num(0.5 * mul)}, group = {g})')
+        L.append(f'zgGap{s}   = input.int({gap}, "{n}: 接触開始足どうしの最低間隔", minval = 1, group = {g})')
+        L.append(f'zgBody{s}{sfx}  = input.float({num(body * mul)}, "{n}: 反転足の最低実体幅 ({unit})", minval = 0.0, step = {num(0.5 * mul)}, group = {g})')
+        L.append(f'zgRatio{s} = input.float({ratio}.0, "{n}: 反転足の最低実体比率 (%)", minval = 0.0, maxval = 100.0, step = 1.0, group = {g})')
+        L.append(f'zgWait{s}  = input.int({wait}, "{n}: 反転待ち (接触足の後の最大本数)", minval = 0, group = {g})')
+        L.append(f'zgMax{s}   = input.int({mx}, "{n}: 基準の最大監視本数", minval = 1, group = {g})')
+        L.append(f'zgDir{s}   = input.bool(false, "{n}: 最初の山・谷の方向フィルターを使う", group = {g})')
+        L.append(f'zgSep{s}   = input.bool(true, "{n}: 最低離れ幅フィルターを使う", group = {g},')
+        L.append(f'     tooltip = "各項目の意味・判定は LongTermDoubleTripleTopBottomXAU と同じ (本数は{n}の bar_index)。検知イベント (反転足の確定) で Zone を発動する。")')
+    return '\n'.join(L) + '\n\n'
+
+def unit_lines():
+    L = ['float zgHalf      = zgHalfIn      * LBS_PIP     // ZG (ダブル / トリプル) の価格設定']
+    L.append('float zgRev       = zgRevIn       * LBS_PIP')
+    for s in TFS:
+        for nm in ('Wave', 'Buf', 'Dist', 'Body'):
+            v = f'zg{nm}{s}'
+            L.append(f'float {v.ljust(11)} = {(v + "In").ljust(13)} * LBS_PIP')
+    return '\n'.join(L) + '\n'
+
+def zg_feed():
+    return '''
+// ---- ZG: ダブル / トリプル トップ・ボトム (LTB 検知器を 1H / 4H / D の中で 1 本ずつ。確定した足の結果だけ: 1 本ずらし・lookahead_on) ----
+''' + zg_core() + '''
+// 対象時間足の中の計算。返すのは確定済みの直前 2 本 (k − 1、k − 2) のブロック (LongTermDoubleTripleTopBottomXAU の f_ltCore のオフセット 1 と同じ)。
+//  on = false (利用・表示とも OFF) なら計算しない
+f_zgCore(int k, bool on) =>
+    var LtH S = k == 0 ? ltNew1(zgPiv1, zgWave1, zgBuf1, zgDist1, zgGap1, zgBody1, zgRatio1 / 100.0, zgWait1, zgMax1, zgDir1, zgSep1) :
+         k == 1 ? ltNew1(zgPiv4, zgWave4, zgBuf4, zgDist4, zgGap4, zgBody4, zgRatio4 / 100.0, zgWait4, zgMax4, zgDir4, zgSep4) :
+         ltNew1(zgPivD, zgWaveD, zgBufD, zgDistD, zgGapD, zgBodyD, zgRatioD / 100.0, zgWaitD, zgMaxD, zgDirD, zgSepD)
+    var string prevBlk = ""
+    string blk = on ? ltStep1(S, open, high, low, close, time, time_close, bar_index) : ""
+    string out = prevBlk == "" ? blk : prevBlk + ";" + blk
+    prevBlk := blk
+    out[1]
+string zgPk1 = request.security(syminfo.tickerid, "60",  f_zgCore(0, zgUse1 or zgShow1), lookahead = barmerge.lookahead_on)
+string zgPk4 = request.security(syminfo.tickerid, "240", f_zgCore(1, zgUse4 or zgShow4), lookahead = barmerge.lookahead_on)
+string zgPkD = request.security(syminfo.tickerid, "D",   f_zgCore(2, zgUseD or zgShowD), lookahead = barmerge.lookahead_on)
+'''
+
+FUNCS = '''
+// ZG: 時間足 0 = 1H / 1 = 4H / 2 = D の設定
+f_zgUse(int k) =>
+    k == 0 ? zgUse1 : k == 1 ? zgUse4 : zgUseD
+
+f_zgShow(int k) =>
+    k == 0 ? zgShow1 : k == 1 ? zgShow4 : zgShowD
+
+f_zgExpOn(int k) =>
+    k == 0 ? zgExp1 : k == 1 ? zgExp4 : zgExpD
+
+f_zgExpN(int k) =>
+    k == 0 ? zgExpN1 : k == 1 ? zgExpN4 : zgExpND
+
+// ZG: 受信した検知器の出力 (「B,対象足 time,time_close,前の time,基準数,bar_index」+ イベント) から、まだ取り込んでいない確定済みの対象足だけを読む
+//  (LongTermDoubleTripleTopBottomXAU の受信と同じ: 対象足の time が前回より新しく、その time_close がこの足の確定までのもの)。
+//  戻り値 [取り込んだ最後の time, 記録]: 記録は 6 個ずつ [0 = 対象足 / 1 = 検知, 対象足の bar_index, 基準 ID, 方向 (-1 トップ / 1 ボトム), 回数, 基準価格]
+f_zgParse(string pk, int lastT, int tcNow) =>
+    array<float> out = array.new_float()
+    int lt = lastT
+    if not na(pk) and pk != ""
+        array<string> evs = str.split(pk, ";")
+        bool take = false
+        float cbi = na
+        for i = 0 to array.size(evs) - 1
+            string e = array.get(evs, i)
+            if e != ""
+                array<string> f = str.split(e, ",")
+                string ty = array.get(f, 0)
+                if ty == "B"
+                    int sT = int(str.tonumber(array.get(f, 1)))
+                    int sC = int(str.tonumber(array.get(f, 2)))
+                    take := not na(sT) and (na(lt) or sT > lt) and not na(sC) and sC <= tcNow
+                    if take
+                        lt  := sT
+                        cbi := str.tonumber(array.get(f, 5))
+                        array.push(out, 0)
+                        array.push(out, cbi)
+                        array.push(out, na)
+                        array.push(out, na)
+                        array.push(out, na)
+                        array.push(out, na)
+                else if take and ty == "D" and array.size(f) > 16
+                    array.push(out, 1)
+                    array.push(out, cbi)
+                    array.push(out, str.tonumber(array.get(f, 1)))
+                    array.push(out, str.tonumber(array.get(f, 2)))
+                    array.push(out, str.tonumber(array.get(f, 7)))
+                    array.push(out, str.tonumber(array.get(f, 16)))
+    [lt, out]
+'''
+
+KILL = '''
+// ZG: Zone を消す (逆行・期限)。利用中なら Zone の一覧・TP 候補から除き、lbDeadNow へ入れて (B3) で待機を解除。表示から外す。
+//  同じ帯の他の根拠 (アキュム・水平線など) は消さない。消した根拠は lbZgUsed に残すので復活しない
+f_zgKill(int i) =>
+    LbZone z = array.remove(lbZgZ, i)
+    if z.zgUse
+        f_lbRemoveS(z)
+        array.push(lbDeadNow, z.id)
+    if dsZone and z.zgShow
+        f_dsDel(z, false)
+    z.dead := true
+    true
+
+'''
+
+B1 = '''    // ZG: ダブル / トリプル トップ・ボトム (1H / 4H / D の検知器の検知イベント = 反転足の確定で発動。接触・Pivot の登録だけでは作らない)。
+    //  根拠 = 時間足 + 基準 ID で 1 回だけ (ダブルで発動した基準のトリプル・消えた基準の後の検知では作らない)。基準価格・幅・期限は発動時に固定。
+    //  期限: 検知足 = 0 本目、その時間足の確定足の bar_index − 検知足 ≥ 本数で消す。逆行: 検知結果を受け取った確定 5分足 (発動した足) から実体端で判定
+    //  (処理順: ZG の登録・期限 → 逆行による消滅 → (B2) 接触・(B3) 待機・(B6) 候補。発動した足で消えた Zone は接触・SL / TP 候補に残らない)
+    array<string> zgPk = array.from(zgPk1, zgPk4, zgPkD)
+    for k = 0 to 2
+        [zlt, zrec] = f_zgParse(array.get(zgPk, k), array.get(lbZgLast, k), time_close)
+        array.set(lbZgLast, k, zlt)
+        int nr = int(array.size(zrec) / 6)
+        if nr > 0
+            for r = 0 to nr - 1
+                int ro  = r * 6
+                int rbi = int(array.get(zrec, ro + 1))
+                if array.get(zrec, ro) == 0
+                    int nzg = array.size(lbZgZ)
+                    if f_zgExpOn(k) and nzg > 0
+                        for i = nzg - 1 to 0
+                            LbZone z = array.get(lbZgZ, i)
+                            if z.tf == k and rbi - int(z.infoB) >= f_zgExpN(k)
+                                f_zgKill(i)
+                else
+                    int   zid  = int(array.get(zrec, ro + 2))
+                    int   zsd  = int(array.get(zrec, ro + 3))
+                    float zcnt = array.get(zrec, ro + 4)
+                    float zp   = array.get(zrec, ro + 5)
+                    int   ukey = zid * 3 + k
+                    if not array.includes(lbZgUsed, ukey) and not na(zp)
+                        array.push(lbZgUsed, ukey)
+                        if f_zgUse(k) or f_zgShow(k)
+                            // sub: 1 トップ (抵抗) / -1 ボトム (支持)。infoA = 回数 (2 ダブル / 3 トリプル)、infoB = 検知足の bar_index、key = 基準 ID
+                            LbZone zz = f_lbNew(6, k, zsd == -1 ? 1 : -1, zp, zp - zgHalf, zp + zgHalf, zcnt, rbi, zid)
+                            zz.zgUse  := f_zgUse(k)
+                            zz.zgShow := f_zgShow(k)
+                            if zz.zgUse
+                                f_lbAdd(zz)
+                            else if dsZone and zz.zgShow
+                                f_dsAdd(zz)
+                            array.push(lbZgZ, zz)
+    int nzg2 = array.size(lbZgZ)
+    if nzg2 > 0
+        for i = nzg2 - 1 to 0
+            LbZone z = array.get(lbZgZ, i)
+            if z.sub == 1 ? math.max(open, close) > z.ctr + zgRev + EPS : math.min(open, close) < z.ctr - zgRev - EPS
+                f_zgKill(i)
+'''
+
+HDR = '''//  ■ ZG ダブル / トリプル トップ・ボトム (ZG-1)
+//    LongTermDoubleTripleTopBottomXAU (LTB-15) と同じ検知処理を 1H / 4H / D の中で動かし (時間足ごとの設定・状態)、確定した検知イベントで
+//    Zone を発動 (接触・Pivot の登録だけでは作らない。ダブル・トリプルとも)。トップ = 抵抗 / ボトム = 支持。基準価格 = 1 回目の山 (谷) と
+//    2 回目 (トリプルで初めて発動ならば 2・3 回目) の接触群の実体上端の高い方 (実体下端の低い方)、検知時点で固定。帯 = 基準価格 ± ZG 幅。
+//    消滅: 確定 5分足の実体端が基準価格 + 逆行幅を超えた (ボトムは − 逆行幅を下回った) / 検知足から期限の本数の対象時間足が確定した。
+//    根拠 (時間足 + 基準 ID) は 1 回だけ (トリプルで追加・復活しない)。「Strategy で利用」OFF は一覧・条件・SL・TP 候補に入れず表示だけ。
+'''
+
+
+def zg_edits(sym=None):
+    """[(old, new, count)] of the ZG layer. sym = None: the gold version / a symbol: applied after edits(sym)"""
+    isSym = sym is not None
+    mul = 10 if sym == "BTCUSD" else 1
+    unit = "$" if (not isSym or sym == "BTCUSD") else "pips"
+    E = []
+    E.append(("//  ★ TradingView 実機でのコンパイル", HDR + "//  ★ TradingView 実機でのコンパイル", 1))
+    E.append(('var string G_TA = "03a · TA 5分足 FVG 吸収 (ACC-5A)"', inputs(isSym, mul, unit) + 'var string G_TA = "03a · TA 5分足 FVG 吸収 (ACC-5A)"', 1))
+    E.append(('cZE = input.bool(false, "ZE フィボ", group = G_EN, inline = "cz2")\n',
+              'cZE = input.bool(false, "ZE フィボ", group = G_EN, inline = "cz2")\n'
+              f'cZG = input.bool({"false" if isSym else "true"}, "ZG ダブル/トリプル", group = G_EN, inline = "cz2",\n'
+              '     tooltip = "条件として使うのは、この設定が ON で、時間足ごとの「Strategy で利用」がどれか ON のときだけ (全 OFF なら OR / AND とも ZG を条件に含めない)。" +\n'
+              '     "対象は利用 ON の Zone だけ (表示 ON は代わりにならない)。OFF でも利用 ON の Zone は SL・TP 候補に使う。")\n', 1))
+    if isSym:
+        E.append(("// ==== LBS Unit (end) =", unit_lines() + "// ==== LBS Unit (end) =", 1))
+    anchor = 'int satTf1 = request.security(syminfo.tickerid, "60",  f_satTfState(), lookahead = barmerge.lookahead_on)\n'
+    E.append((anchor, anchor + zg_feed(), 1))
+    E.append(("""    array<int>   mT
+    array<int>   mId
+
+// 形成中の Accum""", """    array<int>   mT
+    array<int>   mId
+    bool  zgUse    = true     // ZG: Strategy で利用 (false = 表示だけ。Zone の一覧・接触・条件・SL・TP 候補に入れない)
+    bool  zgShow   = true     // ZG: 表示
+
+// 形成中の Accum""", 1))
+    E.append(("// Zone 1 個。typ: 0 ZA / 1 ZB / 2 ZC / 3 ZD / 4 ZF / 5 ZE。", "// Zone 1 個。typ: 0 ZA / 1 ZB / 2 ZC / 3 ZD / 4 ZF / 5 ZE / 6 ZG (tf 0 1H / 1 4H / 2 D)。", 1))
+    E.append(("var array<int>    lbNZone    = array.new_int(6, 0)   // 種類ごとの保持数 (ZB は 0〜2、ZE は 0〜8)",
+              "var array<int>    lbNZone    = array.new_int(7, 0)   // 種類ごとの保持数 (ZB は 0〜2、ZE は 0〜8、ZG は利用中のものだけ)", 1))
+    E.append(("var array<LbZone> lbZeZ      = array.new<LbZone>()      // ZE: 有効なフィボ Zone (時間足ごとに最大 4)\n",
+              "var array<LbZone> lbZeZ      = array.new<LbZone>()      // ZE: 有効なフィボ Zone (時間足ごとに最大 4)\n"
+              "var array<LbZone> lbZgZ      = array.new<LbZone>()      // ZG: 有効なダブル / トリプル Zone (利用 OFF の表示だけのものを含む)\n"
+              "var array<int>    lbZgUsed   = array.new_int()          // ZG: 発動済みの根拠 (基準 ID × 3 + 時間足)。消えた根拠も残して再登録しない\n"
+              "var array<int>    lbZgLast   = array.new_int(3, na)     // ZG: 時間足ごとに取り込んだ最後の対象足の time\n", 1))
+    E.append(("//  18 含む ZE / 19 だけ ZE)", "//  18 含む ZE / 19 だけ ZE / 20 含む ZG / 21 だけ ZG)", 1))
+    E.append(("array.new_int(20, 0)", "array.new_int(22, 0)", 4))
+    E.append(("array.new_float(20, 0.0)", "array.new_float(22, 0.0)", 4))
+    E.append(("    b == 0 ? 1 : b == 1 ? 2 : b == 2 ? 4 : b == 3 ? 8 : b == 4 ? 16 : 32     // ZE = 5 → 32 (FVG の 16 は変えない)",
+              "    b == 0 ? 1 : b == 1 ? 2 : b == 2 ? 4 : b == 3 ? 8 : b == 4 ? 16 : b == 5 ? 32 : 64     // ZE = 5 → 32 (FVG の 16 は変えない)、ZG = 6 → 64", 1))
+    E.append(('    t == 0 ? "アキュム" : t == 1 ? "MA" : t == 2 ? "水平線" : t == 3 ? "出来高POC" : t == 5 ? "フィボ" : "FVG"',
+              '    t == 0 ? "アキュム" : t == 1 ? "MA" : t == 2 ? "水平線" : t == 3 ? "出来高POC" : t == 5 ? "フィボ" : t == 6 ? "ダブル/トリプル" : "FVG"', 1))
+    E.append(('    t == 0 ? (k == 0 ? "1時間足" : k == 1 ? "4時間足" : "日足") : t == 1 ?',
+              '    t == 0 or t == 6 ? (k == 0 ? "1時間足" : k == 1 ? "4時間足" : "日足") : t == 1 ?', 1))
+    E.append(("    z.typ == 1 ? (z.tf == 0 ? 5 : 4) : z.typ == 0 ? (z.tf == 0 ? 3 : z.tf == 1 ? 2 : 1) : z.typ == 5 ? (z.tf == 0 ? 2 : 1) :",
+              "    z.typ == 1 ? (z.tf == 0 ? 5 : 4) : z.typ == 0 or z.typ == 6 ? (z.tf == 0 ? 3 : z.tf == 1 ? 2 : 1) : z.typ == 5 ? (z.tf == 0 ? 2 : 1) :", 1))
+    E.append(('     z.typ == 2 ? "水平線" : z.typ == 3 ? "出来高POC" : z.typ == 5 ? "フィボ " + str.tostring(z.infoA) : z.inv ? "iFVG" : "FVG"',
+              '     z.typ == 2 ? "水平線" : z.typ == 3 ? "出来高POC" : z.typ == 5 ? "フィボ " + str.tostring(z.infoA) :\n'
+              '     z.typ == 6 ? (z.infoA == 3 ? "トリプル" : "ダブル") + (z.sub == 1 ? "トップ" : "ボトム") : z.inv ? "iFVG" : "FVG"', 1))
+    # ZG-2: the ZG condition counts only with a ZG "use" ON (f_condTyp → also the AND list; nSel)
+    E.append(("    t == 0 ? cZA : t == 1 ? cZB : t == 2 ? cZC : t == 3 ? cZD : t == 4 ? cZF : cZE\n",
+              "    t == 0 ? cZA : t == 1 ? cZB : t == 2 ? cZC : t == 3 ? cZD : t == 4 ? cZF : t == 5 ? cZE : cZG and (zgUse1 or zgUse4 or zgUseD)\n" + FUNCS, 1))
+    E.append(("    t < 5 ? 1 + t : 18\n", "    t < 5 ? 1 + t : t == 5 ? 18 : 20\n", 1))
+    E.append(("    t < 5 ? 6 + t : 19\n", "    t < 5 ? 6 + t : t == 5 ? 19 : 21\n", 1))
+    E.append(("            for t = 0 to 5\n                for i = 0 to n - 1", "            for t = 0 to 6\n                for i = 0 to n - 1", 1))
+    E.append(("    for t = 0 to 5\n        if f_bit(o.tmask, t)", "    for t = 0 to 6\n        if f_bit(o.tmask, t)", 1))
+    E.append(("        for t = 0 to 5\n            if f_condTyp(t)", "        for t = 0 to 6\n            if f_condTyp(t)", 1))
+    E.append(("(cZF ? 1 : 0) + (cZE ? 1 : 0)", "(cZF ? 1 : 0) + (cZE ? 1 : 0) + (cZG and (zgUse1 or zgUse4 or zgUseD) ? 1 : 0)", 1))
+    E.append(("         z0.typ == 5 ? color.maroon : color.green", "         z0.typ == 5 ? color.maroon : z0.typ == 6 ? color.olive : color.green", 1))
+    E.append(("    array.set(lbNZone, z.typ, array.get(lbNZone, z.typ) + 1)\n    if dsZone\n        f_dsAdd(z)",
+              "    array.set(lbNZone, z.typ, array.get(lbNZone, z.typ) + 1)\n    if dsZone and z.zgShow\n        f_dsAdd(z)", 1))
+    E.append(("// 静的 Zone で [a, b] と重なるものの中に", KILL.lstrip("\n") + "// 静的 Zone で [a, b] と重なるものの中に", 1))
+    E.append(("    // ZB: EMA ± 共通幅 (毎足動く)。最初に値が出た足で作り、次の足から接触", B1 + "    // ZB: EMA ± 共通幅 (毎足動く)。最初に値が出た足で作り、次の足から接触", 1))
+    # table: two ledger rows (ZG) and the rows below them moved down by 2 (from the bottom so that nothing is moved twice)
+    E.append(('"LONG", "SHORT", "フィボ含む", "フィボだけ")', '"LONG", "SHORT", "フィボ含む", "フィボだけ",\n         "ダブル/トリプル含む", "ダブル/トリプルだけ")', 1))
+    E.append(("var table lbTbl = table.new(position.bottom_right, 8, 28,", "var table lbTbl = table.new(position.bottom_right, 8, 30,", 1))
+    E.append(("    for b = 0 to 19\n", "    for b = 0 to 21\n", 1))
+    for n in range(27, 20, -1):
+        for c in ((0, 1, 2) if n == 21 else (0, 1)):
+            E.append((f"table.cell(lbTbl, {c}, {n},", f"table.cell(lbTbl, {c}, {n + 2},", 1))
+    E.append(('"保持 アキュム/MA/水平線/POC/FVG/フィボ"', '"保持 アキュム/MA/水平線/POC/FVG/フィボ/ダブル・トリプル"', 1))
+    E.append(('"/" + str.tostring(array.get(lbNZone, 5)), text_size = size.tiny)',
+              '"/" + str.tostring(array.get(lbNZone, 5)) + "/" + str.tostring(array.get(lbNZone, 6)), text_size = size.tiny)', 1))
+    return E
+
+
+def build_gold(gold=None):
+    """the gold version: the pinned gold source + the ZG layer"""
+    t = gold if gold is not None else gold_source()
+    for old, new, count in zg_edits(None):
+        t = _sub(t, old, new, count)
     return t
 
 
@@ -236,6 +572,8 @@ if __name__ == "__main__":
     else:
         g = gold_source()
         assert g, "gold source not found (full history needed: git fetch --unshallow)"
+        open(os.path.join(ROOT, GOLD_PATH), "w", encoding="utf-8").write(build_gold(g))     # the gold version with the ZG layer
+        print("wrote", GOLD_PATH)
         for s in SYMBOLS:
             open(os.path.join(ROOT, path(s)), "w", encoding="utf-8").write(build(s, g))
             print("wrote", path(s))

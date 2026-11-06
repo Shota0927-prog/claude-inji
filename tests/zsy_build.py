@@ -7,6 +7,9 @@ Copied regions (byte for byte from the unchanged sources; tests/zsy_sim.py compa
   LAB_ACCUM / LAB_ACCUM_CONF / LAB_PIVOT / LAB_FVG  <- ZoneComboLabXAU.pine
   FEED_POC / FEED_FEED                              <- MtfPocFeedXAU.pine (a version 6 script; the copied lines are also valid version 5)
   LFW_INPUTS / LFW_LOGIC / LFW_CORE / LFW_FIBSTATE / LFW_FIBFEED <- LongFibWave.pine
+  ZG_CORE                                           <- ZoneComboLabXAU.pine (ZG-1: the ZG detector copy; only in ZoneSyncXAU.pine)
+The ZG Zone handling of ZoneSyncXAU.pine (inputs, f_zgCore, the ZSX Logic part: registration / expiry / reversal from the receiving
+5m bar (ZG-2), names / colours) is written in the file itself; build() rewrites only the copied regions, so it is kept as is.
 Registration (same method as tests/lbs_build.py): the previous top layer tests/lbs_build.py accepts the ZSY files through ok()
 and its unadapt() reverts the ZSY edits first; tests/cad_adapt.py LATER_NEW gets the ZSY files as a separate statement before the
 LBS-1 statement. unadapt() reverts these edits exactly (all or nothing).
@@ -73,7 +76,11 @@ def blocks():
         "LFW_CORE":       ("LongFibWave.pine", func_text(lfw, "f_lfwCore")),
         "LFW_FIBSTATE":   ("LongFibWave.pine", func_text(lfw, "f_fibState")),
         "LFW_FIBFEED":    ("LongFibWave.pine", func_text(lfw, "f_fibFeed")),
+        "ZG_CORE":        ("ZoneComboLabXAU.pine", marked(lab, "// ==== ZG LTB copy (begin)", "// ==== ZG LTB copy (end)")),
     }
+
+
+OPTIONAL = ("ZG_CORE",)     # regions only in some files (ZG_CORE: ZoneSyncXAU.pine, not the probe)
 
 
 def begin_line(name, src):
@@ -101,7 +108,7 @@ def build(text):
         else:
             pat = re.compile(r"^// ==== ZSY copy %s begin .*?^// ==== ZSY copy %s end ====$" % (name, name), re.S | re.M)
             text, k = pat.subn(lambda _m: new, text)
-            assert k == 1, name
+            assert k == 1 or (k == 0 and name in OPTIONAL), name
     return text
 
 
