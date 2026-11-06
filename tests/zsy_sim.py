@@ -192,10 +192,12 @@ def main():
     gone_ok = {"ZoneSyncProbeNest.pine", "ZoneSyncProbeRecv.pine", "ZoneSyncProbeWrap.pine"}     # ZSP-0, added and removed by ZSY
     extra = sorted(p for p in touched if p not in zb.NEW_FILES and p not in zb.TEST_EDITS and p not in gone_ok)
     rev_ok = all(zb.unadapt(p, zb.raw(p)) == git("show", f"{zb.BASE_REV}:{p}").stdout for p in zb.TEST_EDITS)
-    src_same = all(__import__("smt_build").pine_unapply(p, zb.raw(p)) == git("show", f"{zb.BASE_REV}:{p}").stdout
-                   for p in zb.SOURCES + ("StochMtfSignal.pine",))     # SMT-2 Pine edits reverted exactly first
+    # the copied sources (Lab / Feed / LongFibWave) are byte for byte unchanged; StochMtfSignal.pine is changed by the SMT layer's own
+    # commits (SMT-2 .. SMT-7), so for it the check is that no ZSY commit touches it
+    src_same = all(zb.raw(p) == git("show", f"{zb.BASE_REV}:{p}").stdout for p in zb.SOURCES) and "StochMtfSignal.pine" not in touched
     check(f"ZS-02 the ZSY commits since {zb.BASE_REV} (and uncommitted changes) touch only the ZSY files and the 2 registration edits, which "
-          f"revert exactly to the {zb.BASE_REV} text; ZoneComboLabXAU / MtfPocFeedXAU / LongFibWave / StochMtfSignal are byte for byte unchanged",
+          f"revert exactly to the {zb.BASE_REV} text; ZoneComboLabXAU / MtfPocFeedXAU / LongFibWave are byte for byte unchanged and no ZSY "
+          "commit touches StochMtfSignal.pine (changed only by the SMT layer)",
           not extra and rev_ok and src_same and touched, f"{extra} rev_ok={rev_ok} src_same={src_same}")
 
     # ---- registration ----
