@@ -114,7 +114,8 @@ def gen(seed, n, ze=False):
                 aid = T0 + (hb // 4) * 4 * B * M5
                 forming = hb % 4 < 2
                 st = acc.setdefault((k, aid), [lw, hi])
-                st[0], st[1] = min(st[0], lw), max(st[1], hi)
+                if forming:
+                    st[0], st[1] = min(st[0], lw), max(st[1], hi)
                 b.update({f"f{q}i": aid, f"f{q}u": round(st[1], 2), f"f{q}l": round(st[0], 2), f"f{q}a": 1 if forming else 0})
         if ze:             # LongFibWave raw outputs (hold, dir, O, E, id) for D (k 1) and 4H (k 0)
             for k, B in ((0, 48), (1, 96)):
@@ -212,7 +213,11 @@ def zsx_state(env, S, tb=T0):
     return zs, ma, ds
 
 
+ZA_OFF = dict(zaUse1=False, zaUse2=False, zaUse3=False)     # ZSX-5: accumulation adoption differs from the Lab on purpose
+
+
 def run_pair(bars, raw, ov, ze=False):
+    ov = {**ZA_OFF, **ov}
     """runs Lab and ZSX bar by bar; returns the first difference (or None) and per-bar ZSX snapshots"""
     if ze:
         lab_feeds_ze(bars, raw)
@@ -273,14 +278,14 @@ def equivalence(quick):
 # ---------------------------------------------------------------------------- timing / confirmation
 def timing(quick):
     bars, raw = gen(8, 300 if quick else 600)
-    lab = lp.Runner(overrides=dict(dsZone=True, dsEnt=False, dsTbl=False, cTA=False, cTC=False))
+    lab = lp.Runner(overrides=dict(dsZone=True, dsEnt=False, dsTbl=False, cTA=False, cTC=False, **ZA_OFF))
     labs = []
     for b in bars:
         lab.step(b)
         labs.append(lab_state(lab))
     bad = []
     for rollback in (True, False):
-        env = zsx_env()
+        env = zsx_env(ZA_OFF)
         S = env["f_zxNew"]()
         prev = None
         for i, b in enumerate(bars):
@@ -307,7 +312,7 @@ def timing(quick):
         if S.lastT != bars[-2]["t"]:
             bad.append((rollback, "last realtime", S.lastT))
     # reload while the market is closed: every bar historical -> through the last bar
-    env = zsx_env()
+    env = zsx_env(ZA_OFF)
     S = env["f_zxNew"]()
     prev = None
     for i, b in enumerate(bars):
@@ -317,7 +322,7 @@ def timing(quick):
         prev = cur
     reload_ok = S.lastT == bars[-1]["t"] and zsx_state(env, S) == labs[-1] and S.n == len(bars)
     # the registration start: bars before it are not processed, the first processed one is the first bar at / after it
-    env = zsx_env()
+    env = zsx_env(ZA_OFF)
     S = env["f_zxNew"]()
     prev = None
     st = bars[50]["t"]
@@ -424,22 +429,22 @@ def signature_checks():
     N = 450
     win = bars[-N:]
     rw = raw[-N:]
-    e1, S1 = run_zsx(win, rw)
+    e1, S1 = run_zsx(win, rw, ZA_OFF)
     hd1, hz1 = tuple(e1["f_zxHash"](S1)[:2]), tuple(e1["f_zxHash"](S1)[4:])
     # the same window processed as realtime from the middle: one bar behind at the end -> after the next (historical) bar the same
-    e2, S2 = run_zsx(win + [], rw, realtime_from=None)
+    e2, S2 = run_zsx(win + [], rw, ZA_OFF, realtime_from=None)
     hd2, hz2 = tuple(e2["f_zxHash"](S2)[:2]), tuple(e2["f_zxHash"](S2)[4:])
     # a 'monthly chart' that has 100000 bars available but asks for the last N (calc_bars_count) = the same window
-    e3, S3 = run_zsx(bars[len(bars) - N:], raw[len(bars) - N:])
+    e3, S3 = run_zsx(bars[len(bars) - N:], raw[len(bars) - N:], ZA_OFF)
     hd3, hz3 = tuple(e3["f_zxHash"](S3)[:2]), tuple(e3["f_zxHash"](S3)[4:])
     # a chart whose 5m data is cut shorter (only 300 bars): different state, and flagged (bars < N)
-    e4, S4 = run_zsx(bars[-300:], raw[-300:])
+    e4, S4 = run_zsx(bars[-300:], raw[-300:], ZA_OFF)
     hd4, hz4 = tuple(e4["f_zxHash"](S4)[:2]), tuple(e4["f_zxHash"](S4)[4:])
     # a different band set (one bar fewer) changes the band signature
-    e5, S5 = run_zsx(win[:-1], rw[:-1])
+    e5, S5 = run_zsx(win[:-1], rw[:-1], ZA_OFF)
     hd5 = tuple(e5["f_zxHash"](S5)[:2])
     flag_short = 300 < N
-    lab = lp.Runner(overrides=dict(dsZone=True, dsEnt=False, dsTbl=False, cTA=False, cTC=False)).run(win)
+    lab = lp.Runner(overrides=dict(dsZone=True, dsEnt=False, dsTbl=False, cTA=False, cTC=False, **ZA_OFF)).run(win)
     lab_eq = lab_state(lab) == zsx_state(e1, S1, win[0]["t"])
     same = (hd1, hz1) == (hd2, hz2) == (hd3, hz3)
     check("ZX-08 comparison signature and the fixed bar count: charts whose fixed 5m request delivers the same last N bars give the same "
@@ -449,11 +454,150 @@ def signature_checks():
           f"same={same} lab={lab_eq} short={(hd4, hz4) != (hd1, hz1)} step={hd5 != hd1}")
 
 
+# ---------------------------------------------------------------------------- ZSX-5 accumulation (adopted while forming, moved in place)
+def ds_invariants(S):
+    """internal price-ordered arrays and display bands consistent: zs sorted by bot / zsT by top with the same Zones, the per-type count,
+    every Zone in at most one live band, every live band = the hull of its members, live merge-type bands never overlap"""
+    bad = []
+    if [z.bot for z in S.zs] != sorted(z.bot for z in S.zs) or [z.top for z in S.zsT] != sorted(z.top for z in S.zsT):
+        bad.append("order")
+    if sorted(id(z) for z in S.zs) != sorted(id(z) for z in S.zsT):
+        bad.append("zsT set")
+    if S.nZone[0] != sum(1 for z in S.zs if z.typ == 0):
+        bad.append("count")
+    seen = set()
+    live = [g for g in S.ds if not g.gone]
+    for g in live:
+        for z in g.mem:
+            if z.id in seen:
+                bad.append(("twice", z.id))
+            seen.add(z.id)
+        if abs(g.bot - min(z.bot for z in g.mem)) > 1e-9 or abs(g.top - max(z.top for z in g.mem)) > 1e-9:
+            bad.append(("hull", g.bot, g.top, [(z.typ, z.bot, z.top) for z in g.mem]))
+    mg = sorted((g.bot, g.top) for g in live if g.mem[0].typ != 4)
+    for a, b in zip(mg, mg[1:]):
+        if b[0] <= a[1] + 1e-7:
+            bad.append(("overlap", a, b))
+    return bad
+
+
+def acc_run(bars, raw, ov, rt_from=None):
+    env = zsx_env(ov)
+    S = env["f_zxNew"]()
+    prev = None
+    bad, snaps = [], []
+    keep = {0: ov.get("zaKeep1", 1), 1: ov.get("zaKeep2", 1), 2: ov.get("zaKeep3", 1)}
+    ids_seen = {0: [], 1: [], 2: []}
+    for i, b in enumerate(bars):
+        cur = vec(b, i, raw)
+        env["time_close"] = b["t"] + M5
+        before = {z.id: (z.tf, z.key, z.ctr) for z in S.zs if z.typ == 0}
+        seq0 = S.zSeq
+        if rt_from is not None and i >= rt_from:
+            for _ in range(2):
+                env["f_zxAdvance"](S, prev, cur, False, 0)
+        else:
+            env["f_zxAdvance"](S, prev, cur, True, 0)
+        prev = cur
+        bad += [(i,) + (x if isinstance(x, tuple) else (x,)) for x in ds_invariants(S)]
+        if rt_from is not None:
+            continue
+        acc = [z for z in S.zs if z.typ == 0]
+        for k in range(3):
+            q = k + 1
+            aid, u, l = b.get(f"f{q}i"), b.get(f"f{q}u"), b.get(f"f{q}l")
+            if aid is None:
+                continue
+            if not ids_seen[k] or ids_seen[k][-1] != aid:
+                ids_seen[k].append(aid)
+            mine = [z for z in acc if z.tf == k and z.key == aid]
+            # the latest box (forming or not) is always shown by its 2 edges at the received bounds
+            if sorted((z.sub, z.ctr) for z in mine) != [(-1, l), (1, u)]:
+                bad.append((i, "latest box", k, aid, [(z.sub, z.ctr) for z in mine], (l, u)))
+            nk = len([z for z in acc if z.tf == k])
+            if nk != 2 * min(len(ids_seen[k]), keep[k]):
+                bad.append((i, "keep", k, nk))
+            # the same box: no new Zone (same ids), only its price moves
+            if ids_seen[k] and len(ids_seen[k]) >= 1:
+                old = {zid for zid, (tf, key, _) in before.items() if tf == k and key == aid}
+                if old and old != {z.id for z in mine}:
+                    bad.append((i, "re-registered", k))
+        new_acc = sum(1 for z in acc if z.id > seq0)
+        n_new_ids = sum(1 for k in range(3) if b.get(f"f{k + 1}i") is not None and
+                        not any(key == b.get(f"f{k + 1}i") and tf == k for tf, key, _ in before.values()))
+        if new_acc != 2 * n_new_ids:
+            bad.append((i, "new accum zones", new_acc, n_new_ids))
+        snaps.append((b["t"] + M5, [(g.gone, g.bot, g.top, tuple(m.id for m in g.mem), g.t0) for g in S.ds]))
+    return env, S, bad, snaps
+
+
+def crafted_acc():
+    """a 1H box forming next to a POC: its upper edge moves into the POC band (merged), then past it (split), then the box ends
+    (no change), then a new box replaces it"""
+    bars, raw = [], []
+    ups = [1990.0] * 5 + [1999.0] * 5 + [2010.0] * 5 + [2010.0] * 5 + [2030.0] * 5
+    form = [1] * 15 + [0] * 5 + [1] * 5
+    ids = [1] * 20 + [2] * 5
+    for i in range(25):
+        b = dict(t=T0 + i * M5, o=1900.0, h=1901.0, l=1899.0, c=1900.5, zdL1=1999.75, zdU1=2000.25, zdT1=float(T0 - 3_600_000),
+                 f1i=T0 - 10**7 * ids[i], f1u=ups[i], f1l=1950.0 if ids[i] == 1 else 1960.0, f1a=form[i])
+        bars.append(b)
+        raw.append({})
+    return bars, raw
+
+
+def acc_checks(quick):
+    bad = []
+    for seed, ov in ((21, {}), (22, dict(zaKeep1=2, zaKeep2=2, zaKeep3=3)), (23, dict(dsZoneMax=6))):
+        bars, raw = gen(seed, 400 if quick else 800)
+        env, S, b1, snaps = acc_run(bars, raw, ov)
+        bad += [("seed", seed) + x for x in b1[:3]]
+        bad += [("t0", seed) + tuple(x) for x in draw_start(snaps)[:3]]
+        # time frame switch / reload model: the same bars processed historically, or as realtime ticks for the last third
+        # (one bar behind), then compared at the same last confirmed bar
+        e2, S2, b2, _ = acc_run(bars[:-1], raw[:-1], ov)
+        e3, S3, b3, _ = acc_run(bars, raw, ov, rt_from=2 * len(bars) // 3)
+        if tuple(e2["f_zxHash"](S2)) != tuple(e3["f_zxHash"](S3)) or b3:
+            bad.append(("reload / realtime", seed))
+    # crafted: merge with the POC, split, end of formation, replacement
+    bars, raw = crafted_acc()
+    env, S, b4, snaps = acc_run(bars, raw, {})
+    bad += [("crafted",) + x for x in b4]
+    trace = []
+    env = zsx_env()
+    S = env["f_zxNew"]()
+    prev = None
+    for i, b in enumerate(bars):
+        cur = vec(b, i, raw)
+        env["time_close"] = b["t"] + M5
+        seq0, ver0 = S.zSeq, S.ver
+        env["f_zxAdvance"](S, prev, cur, True, 0)
+        prev = cur
+        live = [g for g in S.ds if not g.gone]
+        trace.append(dict(seq=S.zSeq - seq0, bands=sorted((g.bot, g.top, tuple(sorted(z.typ for z in g.mem))) for g in live),
+                          t0=sorted(g.t0 for g in live)))
+    t = trace
+    ok = (t[0]["seq"] >= 2 and (1988.0, 1992.0, (0,)) in t[0]["bands"]                                 # forming box shown at once
+          and (1997.0, 2002.0, (0, 3)) in t[5]["bands"]                                                # moved into the POC: merged
+          and (1998.0, 2002.0, (3,)) in t[10]["bands"] and (2008.0, 2012.0, (0,)) in t[10]["bands"]    # moved past it: split
+          and all(t[j]["seq"] == 0 for j in range(16, 20)) and t[15]["bands"] == t[19]["bands"] and t[15]["t0"] == t[19]["t0"]
+          and (2028.0, 2032.0, (0,)) in t[20]["bands"] and (1958.0, 1962.0, (0,)) in t[20]["bands"]    # new box replaces (N = 1)
+          and not any(x[0] in (2008.0, 1948.0) for x in t[20]["bands"]))
+    if not ok:
+        bad.append(("crafted trace", [(j, x["bands"]) for j, x in enumerate(t) if j in (0, 5, 10, 15, 19, 20)]))
+    check("ZX-09 accumulation (ZSX-5, differs from the Lab on purpose): a new box id is shown at once by its 2 edges even while forming; "
+          "the same id moves the same 2 Zones (no new Zone, no duplicate) and they always sit at the received bounds; the end of "
+          "formation adds / changes nothing (no draw-start change); the latest N boxes per TF are kept (N = 1 / 2 / 3, the forming one "
+          "included); price-ordered arrays, counts and display bands stay consistent every bar (one band per Zone, band = hull of its "
+          "members, no overlapping merge-type bands), merged with and split from a POC as the edge moves; moved shapes start at their own "
+          "5m close; realtime ticks / reload reach the same state at the same confirmed bar", not bad, str(bad[:4]))
+
+
 def main():
     quick = "--quick" in sys.argv
     static()
     bad, stats = equivalence(quick)
-    check("ZX-05 equivalence with the Lab (its LOGIC section run unchanged) on the same 5m bars / feeds, after EVERY bar: internal Zones "
+    check("ZX-05 equivalence with the Lab (its LOGIC section run unchanged; accumulation OFF on both sides since ZSX-5) on the same 5m bars / feeds, after EVERY bar: internal Zones "
           "(id / type / TF / sub / bounds / registered bar / iFVG), both MA Zones and the display bands in order (bounds, grey, member "
           "ids, name text = the Lab's label / grey box text, the Lab's left edge) — defaults, display cap 6 / 10, ZE on, 2 accum boxes, "
           "different MA lengths, merge distance 8, width 4, and a crafted case where MA 1 joins only through MA 2's band", not bad, str(bad[:2]))
@@ -473,6 +617,7 @@ def main():
           "without a break (merged shapes are not drawn before they exist); grey bands span their FVG from its availability to the "
           "invalidation bar", not diff and not db and grey_ok, f"{diff} {db[:3]} grey={grey_ok}")
     signature_checks()
+    acc_checks(quick)
     n = sum(ok for _, ok, _ in RESULTS)
     for name, ok, d in RESULTS:
         print(("PASS " if ok else "FAIL ") + name + ("" if ok else "  -- " + d))
