@@ -655,7 +655,8 @@ def gate_static():
         po = re.search(rf"^{nm}\s*=\s*(input\.\w+\(.*)$", o, re.M)
         pn = re.search(rf"^{nm}\s*=\s*(input\.\w+\(.*)$", n, re.M)
         want = po.group(1).replace(*dtb3[nm]) if po and nm in dtb3 else po and po.group(1)
-        if not (po and pn and " ".join(pn.group(1).split()) == " ".join(want.split())):
+        norm = lambda x: " ".join(x.split()).rstrip(",)")       # tooltips (next line) aside
+        if not (po and pn and norm(pn.group(1)) == norm(want)):
             check(f"DT-T2 input {nm} identical", False, f"{po and po.group(1)} | {pn and pn.group(1)}")
             return
     check("DT-T2 detection inputs (pivot bars, wait bars, 5 x buffer / distance: minval, step, labels) identical to the original; "
