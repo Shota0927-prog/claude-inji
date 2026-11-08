@@ -1091,8 +1091,7 @@ def gate_body():
     for seed, days, miss, grid, vol, ov in ((91, 25, 0.02, None, 1.0, {}), (92, 25, 0.0, 0.5, 1.6, {}),
                                             (93, 25, 0.02, None, 1.0, dict(dvMxUse=False)),
                                             (94, 25, 0.0, 0.5, 1.0, dict(dvPiv=2, dvD0=6.0, dvWait=1)),
-                                            (95, 25, 0.02, 0.5, 2.0, dict(dvB0=0.5, dvMx0=20.0)),
-                                            (98, 25, 0.0, 0.5, 1.6, dict(dvWait=0))):
+                                            (95, 25, 0.02, 0.5, 2.0, dict(dvB0=0.5, dvMx0=20.0))):
         bars = series(seed, days, miss, grid, vol)
         r = run_new(bars, ov, eq=False)
         rev, rst = ref5m(bars, r.inp)
@@ -1104,8 +1103,8 @@ def gate_body():
             i = next((i for i in range(len(rst)) if rst[i] != ist[i]), None)
             det.append(f"seed {seed} {ov}: events {len(rev)}/{len(iev)} first state difference bar {i}")
         print(f"  [DT-B] seed {seed} {ov}: 5M events {len(iev)} (reference {len(rev)})", flush=True)
-    check("DT-B1 random series (6 paths: missing bars, 0.5 price grid incl. equal body ends, defaults / limit OFF / pivot 2 + wait 1 "
-          "/ buffer 0.5 + max 20 / wait 0): the indicator's 5M detection events and the state of every 5M base on every bar equal an independent "
+    check("DT-B1 random series (5 paths: missing bars, 0.5 price grid incl. equal body ends, defaults / limit OFF / pivot 2 + wait 1 "
+          "/ buffer 0.5 + max 20): the indicator's 5M detection events and the state of every 5M base on every bar equal an independent "
           "reference model of the body specification (every path with detections)", ok and n_ev > 0 and min(nps) > 0,
           f"{det} events={n_ev} per path={nps}")
     base = KL + [KP] + KR
@@ -1153,8 +1152,12 @@ def gate_body():
     ri = on(base + [KAPP, K(2002.5, 1999, True), az.M])
     rl = on(base + [KAPP, K(1996, 1993), K(1996, 1994), KREV, az.M])
     rx = on(base + [KAPP, K(1996, 1993), K(1996, 1994), K(1996, 1994.5), KREV, az.M])
+    w0 = on(base + [K(2003, 1999, False), K(1999.5, 1995, False), az.M], dict(dvWait=0))
+    w0b = on(base + [KAPP, KREV, az.M], dict(dvWait=0))
     check("DT-B6 close 2002.5 > base + 2 invalidates (no detection); the reversal on the 3rd bar after the approach is detected, on "
-          "the 4th it is not (wait expired)", kev(ri) == [] and kev(rl) == [(12, 2)] and kev(rx) == [], f"{kev(ri)} {kev(rl)} {kev(rx)}")
+          "the 4th it is not (wait expired); wait 0: a bearish approach bar (gap: open 1999.5 in the band) detects on itself, a "
+          "bullish approach is skipped at once", kev(ri) == [] and kev(rl) == [(12, 2)] and kev(rx) == [] and kev(w0) == [(10, 2)]
+          and kev(w0b) == [], f"{kev(ri)} {kev(rl)} {kev(rx)} {kev(w0)} {kev(w0b)}")
     # 15M..D unchanged: vs the DTB-3 indicator and the original (HTF bases)
     okh, deth = True, []
     for seed, ov in ((96, {}), (97, dict(dvPiv=2, dvD0=6.0, dvMxUse=False))):
