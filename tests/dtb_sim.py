@@ -109,6 +109,7 @@ class DRunner(ap.Runner):
 
     def __init__(self, overrides=None, src=None, **kw):
         super().__init__(overrides, src=src, **kw)
+        self.body5 = "bTop" in (src or "")        # DTB-4: 5M bases measured on the body ends
         self.events, self.snaps, self.bars, self.exts = [], [], [], []
         self.atr = None
         e = self.env
@@ -181,18 +182,38 @@ def run_new(bars, ov=None, eq=True, src=None, **kw):
     return DRunner(o, src=src or NEW_SRC, **kw).run(bars)
 
 
-def first_diff(a, b):
-    """first bar where the event list or the base state differs (None = identical)."""
+HTF = (1, 2, 3, 4)
+ALL = (0, 1, 2, 3, 4)
+
+
+def px(r, i, side, tf):
+    """the price a base of timeframe tf uses on bar i: 5M bases of a DTB-4 run = the body end of its side
+    (top: max(open, close) / bottom: min(open, close)); otherwise the high / low."""
+    b = r.bars[i]
+    if tf == 0 and r.body5:
+        return max(b["o"], b["c"]) if side == -1 else min(b["o"], b["c"])
+    return b["h"] if side == -1 else b["l"]
+
+
+def first_diff(a, b, tfs=ALL):
+    """first bar where the event list or the base state (of the timeframes tfs) differs (None = identical).
+    DTB-4 changed the 5M bases on purpose: comparisons with the original / earlier versions use tfs=HTF."""
+    # a subset of timeframes is compared without the base ids (the ids are one counter over all timeframes, so a different
+    # number of 5M bases shifts them); the order of events / bases is kept
+    ev = (lambda e: e) if tfs == ALL else (lambda e: e[:1] + e[2:])
+    gs = (lambda g: g) if tfs == ALL else (lambda g: g[1:])
     ea, eb = {}, {}
     for e in a.events:
-        ea.setdefault(e[0], []).append(e)
+        if e[2] in tfs:
+            ea.setdefault(e[0], []).append(ev(e))
     for e in b.events:
-        eb.setdefault(e[0], []).append(e)
+        if e[2] in tfs:
+            eb.setdefault(e[0], []).append(ev(e))
     for i in range(max(len(a.snaps), len(b.snaps))):
         if ea.get(i, []) != eb.get(i, []):
             return i, f"events {ea.get(i)} != {eb.get(i)}"
-        sa = a.snaps[i] if i < len(a.snaps) else None
-        sb = b.snaps[i] if i < len(b.snaps) else None
+        sa = tuple(gs(g) for g in a.snaps[i] if g[1] in tfs) if i < len(a.snaps) else None
+        sb = tuple(gs(g) for g in b.snaps[i] if g[1] in tfs) if i < len(b.snaps) else None
         if sa != sb:
             return i, f"bases {sa} != {sb}"
     return None
@@ -318,7 +339,7 @@ def pivot_times(r):
             if gid in out:
                 continue
             if tf == 0:
-                out[gid] = (r.bars[abar - piv]["t"], r.bars[abar - piv]["h" if side == -1 else "l"], r.bars[abar]["t"])
+                out[gid] = (r.bars[abar - piv]["t"], px(r, abar - piv, side, 0), r.bars[abar]["t"])
             else:
                 n = at[(tf, abar)]
                 t = deliv[tf][n - 1 - piv]
@@ -395,9 +416,9 @@ def draw_check(r):
                 continue
             na += 1
             b = r.bars[abar]
-            if len(mk) != 1 or mk[0].args[0] != b["t"] or mk[0].args[1] != (b["h"] if top else b["l"]):
+            if len(mk) != 1 or mk[0].args[0] != b["t"] or mk[0].args[1] != px(r, abar, side, tf):
                 bad.append(("approach marker", gid, abar, cnt, [(d.args[:2]) for d in mk]))
-            want.append((abar, piv[gid][0], g[3], b["t"], b["h"] if top else b["l"]))
+            want.append((abar, piv[gid][0], g[3], b["t"], px(r, abar, side, tf)))
     from collections import Counter
     # lines drawn on their approach bar (lines drawn again on a late detection after a removal: redraw_check, DTB-2)
     got = Counter((d.bar, d.args[0], d.args[1], d.args[2], d.args[3]) for d in lines if d.kw.get("style") == "dashed"
@@ -461,8 +482,8 @@ def gate_series(scov):
             a = run_orig(bars, ov)
             b = run_new(bars, ov)
             n_runs += 1
-            tot_ev += len(a.events)
-            d = first_diff(a, b)
+            tot_ev += len([e for e in a.events if e[2] in HTF])
+            d = first_diff(a, b, HTF)
             if d is not None:
                 tot_mis += 1
                 first_bad = first_bad or f"seed {seed} {name}: first difference on bar {d[0]}: {d[1]}"
@@ -479,8 +500,8 @@ def gate_series(scov):
                       not bad and all(cnt), f"{bad[:3]} counts(det, app, base)={cnt}")
     print("  [DT coverage of the compared runs (scenarios + series)]", covsum)
     need = [k for k, v in covsum.items() if v == 0 and k != "det_on_reg_bar"]
-    check("DT-S1 random series (5 paths incl. missing bars, 0.5 price grid, 2 volatilities; 6 settings): the indicator's detection "
-          "events and the full state of every active base equal the original (AccumStrategyXAU.pine) on every bar",
+    check("DT-S1 random series (5 paths incl. missing bars, 0.5 price grid, 2 volatilities; 6 settings): the indicator's 15M..D "
+          "detection events and active bases equal the original (AccumStrategyXAU.pine) on every bar (5M: changed by DTB-4, DT-B*)",
           tot_mis == 0 and tot_ev > 0, f"runs={n_runs} events={tot_ev} mismatching runs={tot_mis} {first_bad}")
     check("DT-S2 the compared runs (scenarios + random series) cover: all 5 timeframes x top / bottom x double / triple, approach-bar and later detections, the "
           "last bar of the wait, expiry, a 3rd approach after an expired 2nd, invalidation with a reversal bar on the same bar and "
@@ -533,14 +554,14 @@ def gate_scenarios():
         n_ev += len(a.events)
         for k, v in coverage(a, ov).items():
             scov[k] = scov.get(k, 0) + v
-        d = first_diff(a, b)
+        d = first_diff(a, b, HTF)
         if d is not None:
             ok_all = False
             bad.append((name, d))
     a = run_orig(az.bars_of(ZB + [ZUP, B(4299.5, 4300, 4298.2, 4298.4)], az.FR))
     lw = run_orig(az.bars_of(ZB + [ZUP, ZBN, ZBN, B(4292.5, 4293, 4291, 4291.5), M], az.FR))
-    check("DT-A1 the ACC-5B scenarios (AZ-01..18 bars) and 2 boundary scenarios give identical events / base states in the "
-          "original and the indicator", ok_all and n_ev > 0, f"{bad} events={n_ev}")
+    check("DT-A1 the ACC-5B scenarios (AZ-01..18 bars, incl. the 1H ones) and 2 boundary scenarios give identical 15M..D events / "
+          "base states in the original and the indicator (5M: DTB-4)", ok_all and n_ev > 0, f"{bad} events={n_ev}")
     check("DT-A2 boundary scenarios behave as the original documents: invalidation wins over a same-bar reversal (no event), a "
           "reversal on the last wait bar (approach + 3) is detected", a.events == [] and [e[0] - e[5] for e in lw.events] == [3],
           f"{a.events} {lw.events}")
@@ -568,7 +589,7 @@ def gate_display():
             same, det = False, f"{v} {nl} base groups live > cap"
     check("DT-V1 display settings (timeframe OFF, all OFF, drawing cap 1 / 80, all-base annotations, label time zone) do not change "
           "any detection event or active base; hidden timeframes draw nothing; at most the cap of base groups stay drawn",
-          same and first_diff(ref, base) is None and base.events, det)
+          same and first_diff(ref, base, HTF) is None and base.events, det)
     r = run_new(bars, dict(dsMaxGrp=1))
     ev_ids = {e[1] for e in r.events}
     act = len(r.env["dvBases"])
@@ -613,7 +634,7 @@ def gate_realtime_prefix():
     ort = run_orig(with_ticks(bars, len(bars) // 2))
     check("DT-R1 realtime ticks on the second half (one execution per tick, state rolled back between ticks): the same events, "
           "base states and drawings as on history, decided on the confirmed tick only; the original under ticks agrees",
-          first_diff(hist, rt) is None and created(hist) == created(rt) and first_diff(ort, rt) is None and hist.events,
+          first_diff(hist, rt) is None and created(hist) == created(rt) and first_diff(ort, rt, HTF) is None and hist.events,
           str(first_diff(hist, rt)))
     cut = len(bars) * 2 // 3
     part = run_new(bars[:cut])
@@ -690,7 +711,7 @@ def redraw_check(r):
         top = side == -1
         g = bases[gid]
         ab = r.bars[app]
-        ax, ay = ab["t"], ab["h"] if top else ab["l"]
+        ax, ay = ab["t"], px(r, app, side, tf)
         dl = [d for d in labels if d.bar == bar and str(d.args[2]).startswith(
             ("ダブル" if cnt == 2 else "トリプル") + ("トップ" if top else "ボトム") + " " + TFJA[tf] + "\n#" + str(gid) + " ")]
         if len(dl) != 1:
@@ -721,52 +742,82 @@ def redraw_check(r):
     return bad, n_re, n_det
 
 
-def gate_redraw():
-    B = az.B
-    # bars 0..5 = ZB (5M peak A = 4296 on bar 3, available on bar 5); bar 6 = A's 2nd approach (bullish -> waiting, wait end 9);
-    # bars 7 / 8 bullish below the band (A keeps waiting); bar 6 (4295) is a peak B available on bar 8 (its annotation is drawn
-    # there with "all bases" ON -> with a cap of 1 A's drawings are removed); bar 9 bearish -> A detected on the last wait bar
-    seq = az.ZB + [az.ZUP, B(4290, 4292, 4289, 4291.5), B(4291, 4293, 4290, 4292.5), B(4292.5, 4292.5, 4290, 4290.5), az.M]
+# ---- DTB-4 body bars --------------------------------------------------------------------------------------
+def K(bt, bb, bull=True, up=0.3, dn=0.3):
+    """a 5M bar with body top bt / body bottom bb (bullish: open bb -> close bt), wicks up / dn."""
+    o, c = (bb, bt) if bull else (bt, bb)
+    return az.B(o, bt + up, bb - dn, c)
+
+
+def kmirror(seq):
+    """tops <-> bottoms around 2000 (a top at 2000 becomes a bottom at 2000)."""
+    return [(4000 - o, 4000 - l, 4000 - h, 4000 - c) for o, h, l, c in seq]
+
+
+# a 5M body top H = 2000 on bar 4 (left body tops 1990 .. 1996, right 1999 / 1995 / 1991 / 1988: 12 below -> distance met),
+# available on bar 8 (pivot bars 4)
+KL = [K(1990, 1985), K(1992, 1987), K(1994, 1989), K(1996, 1991)]
+KP = K(2000, 1996)
+KR = [K(1999, 1995, False), K(1995, 1991, False), K(1991, 1989, False), K(1988, 1986, False)]
+KAPP = K(1999.5, 1993)                 # approach: body top 1999.5 in 2000 +- 2, bullish -> reversal wait
+KREV = K(1999, 1994, False)            # bearish: reversal (body top 1999, not 12 below)
+
+
+def kbars(seq, dv=None):
     bars = az.bars_of(seq, az.FR)
-    for b in bars:
-        b["dv"] = {}
+    for i, b in enumerate(bars):
+        b["dv"] = (dv or {}).get(i, {})
+    return bars
+
+
+def kev(r, side=-1, lvl=2000.0):
+    return [(e[0], e[4]) for e in r.events if e[2] == 0 and e[3] == side and e[6] == lvl]
+
+
+def gate_redraw():
+    # cap 1, all-base annotations: A (5M body top 2000) approaches on bar 9 (bullish -> waiting, wait end 12); bar 10 bullish
+    # below the band; a 1H peak delivered on bar 10 is registered there and its annotation removes A's drawings; bar 11
+    # bearish -> A detected within its wait
+    hb = [2050, 2060, 2070, 2080, 2100, 2090, 2080, 2070, 2060]
+    dv = {2 + i: {2: (h, h - 5, az.T0 - (20 - i) * az.H1)} for i, h in enumerate(hb)}
+    seq = KL + [KP] + KR + [KAPP, K(1996, 1993), KREV, az.M]
+    bars = kbars(seq, dv)
     ov = dict(dsMaxGrp=1, dsAllB=True)
-    o = run_orig(bars)
-    r = run_new(bars, ov)
-    lb = lambda pre: [d for d in r.draws if str(d.args[2]).startswith(pre)]
-    A = [d for d in r.draws if "#1 " in str(d.args[2]) or "基準#1 " in str(d.args[2]) or d.kind == "line" and d.args[1] == 4296.0]
-    s6 = {g[0]: g for g in r.snaps[6]}
-    step2 = s6.get(1) is not None and s6[1][7] == 2 and s6[1][8] is True and s6[1][9] == 6
-    first = [d for d in A if d.bar <= 6]
-    step3 = (first and all(d.delbar == 8 for d in first) and any(str(d.args[2]).startswith("基準#2 ") and d.bar == 8
-                                                                 for d in r.draws))
-    step4 = r.events == [(9, 1, 0, -1, 2, 6, 4296.0, False)] and o.events == r.events and first_diff(o, r) is None
+    r = run_new(bars, ov, eq=False)
+    gid = next(g[0] for g in r.snaps[8] if g[1] == 0 and g[2] == -1 and g[3] == 2000.0)
+    s9 = {g[0]: g for g in r.snaps[9]}
+    step2 = gid in s9 and s9[gid][7] == 2 and s9[gid][8] is True and s9[gid][9] == 9
+    A = [d for d in r.draws if f"#{gid} " in str(d.args[2]) or (d.kind == "line" and d.args[1] == 2000.0)]
+    first = [d for d in A if d.bar <= 9]
+    step3 = first and all(d.delbar is not None and 9 <= d.delbar <= 10 for d in first) and any(
+        str(d.args[2]).startswith("基準#") and "1時間" in str(d.args[2]) and d.bar == 10 for d in r.draws)
+    step4 = [(e[0], e[4], e[5]) for e in r.events if e[1] == gid] == [(11, 2, 9)]
     t = lambda i: bars[i]["t"]
     live = [d for d in r.draws if not d.deleted]
     want = {
-        "base": [d for d in live if str(d.args[2]) == "基準#1 5分足 山 4296" and d.args[:2] == (t(3), 4296.0) and d.bar == 9],
-        "reg": [d for d in live if str(d.args[2]) == "#1 5分 登録" and d.args[:2] == (t(5), 4296.0) and d.bar == 9],
-        "app": [d for d in live if d.kw.get("style") == "diamond" and d.args[:2] == (t(6), 4295) and d.text == "#1 5分 2回目\n検知"
-                and d.bar == 9],
-        "line": [d for d in live if d.kind == "line" and d.args[:4] == (t(3), 4296.0, t(6), 4295) and d.bar == 9],
-        "det": [d for d in live if str(d.args[2]) == "ダブルトップ 5分\n#1 2回目" and d.args[0] == t(9) and d.bar == 9],
+        "base": [d for d in live if str(d.args[2]) == f"基準#{gid} 5分足 山 (実体) 2000" and d.args[:2] == (t(4), 2000.0) and d.bar == 11],
+        "reg": [d for d in live if str(d.args[2]) == f"#{gid} 5分 登録" and d.args[:2] == (t(8), 2000.0) and d.bar == 11],
+        "app": [d for d in live if d.kw.get("style") == "diamond" and d.args[:2] == (t(9), 1999.5) and d.text == f"#{gid} 5分 2回目\n検知"
+                and d.bar == 11],
+        "line": [d for d in live if d.kind == "line" and d.args[:4] == (t(4), 2000.0, t(9), 1999.5) and d.bar == 11],
+        "det": [d for d in live if str(d.args[2]) == f"ダブルトップ 5分\n#{gid} 2回目" and d.args[0] == t(11) and d.bar == 11],
     }
-    step5 = all(len(v) == 1 for v in want.values()) and len([d for d in live if d.kind == "line" and d.args[1] == 4296.0]) == 2
-    check("DT-W1 cap 1: base A approaches (bar 6, waiting), B's drawing on bar 8 removes A's drawings, A detects on bar 9 within "
-          "its wait -> A's base annotation (pivot bar 3, 4296), availability marker (bar 5), approach marker (bar 6, its high 4295, "
-          "2nd, '検知'), pivot -> approach line and the double-top label (bar 9) are all shown again, once each; the events / base "
-          "states equal the original",
-          step2 and step3 and step4 and step5, f"steps 2..5 = {step2, step3, step4, step5} {[(k, len(v)) for k, v in want.items()]}")
-    # the version before DTB-2 misses the marker / line on that redraw (the check would catch it)
+    step5 = all(len(v) == 1 for v in want.values()) and not redraw_check(r)[0]
+    check("DT-W1 cap 1 (body bars): base A (5M body top 2000) approaches on bar 9 (waiting), the 1H base's annotation on bar 10 "
+          "removes A's drawings, A detects on bar 11 within its wait -> A's base annotation (pivot bar 4, 2000), availability marker "
+          "(bar 8), approach marker (bar 9, body top 1999.5, '検知'), pivot -> approach line and the double-top label are shown "
+          "again, once each", step2 and step3 and step4 and step5,
+          f"steps 2..5 = {step2, step3, step4, step5} {[(k, len(v)) for k, v in want.items()]}")
+    # the version before DTB-2 misses the marker / line on a redraw (its own wick scenario)
     old_txt = __import__("subprocess").run(["git", "-C", ROOT, "show", "cb44e61:DoubleTripleTopBottomXAU.pine"], capture_output=True,
                                            text=True).stdout
-    old = DRunner(dict(ov), src=instrument(new_src(old_txt))).run(bars)
+    oseq = az.ZB + [az.ZUP, az.B(4290, 4292, 4289, 4291.5), az.B(4291, 4293, 4290, 4292.5), az.B(4292.5, 4292.5, 4290, 4290.5), az.M]
+    old = DRunner(dict(ov), src=instrument(new_src(old_txt))).run(kbars(oseq))
     ob = redraw_check(old)[0]
-    nb = redraw_check(r)[0]
-    check("DT-W2 the same scenario on the previous indicator (cb44e61) lacks the approach marker / line after the redraw (caught "
-          "by the check); the fixed indicator passes it", ob and not nb, f"old={ob[:1]} new={nb[:2]}")
-    # random series: every late detection after a removal redrawn with its approach; no double drawing when nothing was removed;
-    # detection events / base states equal the original and the previous indicator; created drawings only gain the redraws
+    check("DT-W2 the indicator before DTB-2 (cb44e61) lacks the approach marker / line after a redraw on its scenario (caught by "
+          "the check); the current indicator passes the check (DT-W1, DT-W3)", ob and step5, f"old={ob[:1]}")
+    # random series: every detection has its base / availability / approach marker / line live, never twice at once;
+    # 15M..D events / bases equal the original and the DTB-1 indicator; with 5M hidden the drawings only gain the redraws
     tot_re = tot_det = 0
     allbad = []
     same = True
@@ -776,39 +827,46 @@ def gate_redraw():
         o = run_orig(bars)
         v = dict(dsMaxGrp=cap, dsAllB=allb)
         r = run_new(bars, v)
-        p = DRunner(dict(v), src=instrument(new_src(old_txt))).run(bars)
         bad, n_re, n_det = redraw_check(r)
         allbad += bad
         tot_re += n_re
         tot_det += n_det
-        cr, cp = created(r), created(p)
+        rh = run_new(bars, dict(v, dsTf0=False))
+        p = DRunner(dict(v, dsTf0=False), src=instrument(new_src(old_txt))).run(bars)
+        import re as _re
+        nid = lambda cs: [(c[0], c[1], tuple(_re.sub(r"#\d+", "#", x) if isinstance(x, str) else x for x in c[2]), c[3]) for c in cs]
+        cr, cp = nid(created(rh)), nid(created(p))
         extra = [c for c in cr if c not in cp]
-        if first_diff(o, r) is not None or first_diff(p, r) is not None or [c for c in cp if c not in cr] \
+        if first_diff(o, r, HTF) is not None or first_diff(p, r, HTF) is not None or [c for c in cp if c not in cr] \
                 or any(c[0] == "label" and c[3] and dict(c[3]).get("style") != "diamond" for c in extra) \
-                or any(c[1] not in {e[0] for e in r.events} for c in extra):
+                or any(c[1] not in {e[0] for e in rh.events} for c in extra):
             same = False
-        print(f"  [DT-W3] seed {seed} cap {cap} all-bases {allb}: detections {n_det}, redrawn approaches {n_re}, extra drawings "
-              f"{len(extra)}", flush=True)
-    check("DT-W3 random series (cap 1 / 1 + all bases / 3 / 40): at every detection the base, availability marker, this "
-          "approach's marker and line are live, never twice at once; redraws happen (cap 1) and only on detection bars",
-          not allbad and tot_re > 0, f"redraws={tot_re} detections={tot_det} {allbad[:3]}")
-    check("DT-W4 detection events and active bases unchanged: equal to the original and to the previous indicator; the drawings "
-          "differ from the previous indicator only by the added approach markers / lines on detection bars",
-          same, "")
+        print(f"  [DT-W3] seed {seed} cap {cap} all-bases {allb}: detections {n_det}, redrawn approaches {n_re}", flush=True)
+    check("DT-W3 random series (cap 1 / 1 + all bases / 3 / 40, all timeframes incl. 5M body bases): at every detection the base, "
+          "availability marker, this approach's marker (at its body end for 5M) and line are live, never twice at once; redraws "
+          "happen (cap 1) and only on detection bars", not allbad and tot_re > 0,
+          f"redraws={tot_re} detections={tot_det} {allbad[:3]}")
+    check("DT-W4 15M..D events / bases equal the original and the DTB-1 indicator (cb44e61) (ids aside: one counter over all "
+          "timeframes); with 5M hidden the drawings differ from DTB-1 only by the added approach markers / lines on detection bars "
+          "(id numbers in the texts aside)", same, "")
 
 
 # ============================================================================
-# DTB-3: 5M maximum distance (H - lowest low after the pivot bar / highest high after the pivot bar - L, wicks included)
+# DTB-3 / DTB-4: 5M maximum distance (on the body ends since DTB-4)
 # ============================================================================
 PREV_TXT = __import__("subprocess").run(["git", "-C", ROOT, "show", "5db85fc:DoubleTripleTopBottomXAU.pine"], capture_output=True,
                                         text=True).stdout
 PREV_SRC = instrument(new_src(PREV_TXT))
+DTB3_TXT = __import__("subprocess").run(["git", "-C", ROOT, "show", "84c4a96:DoubleTripleTopBottomXAU.pine"], capture_output=True,
+                                        text=True).stdout
+DTB3_SRC = instrument(new_src(DTB3_TXT))
 OFF = dict(dvMxUse=False)
 
 
 def mx_oracle(r, lim):
     """independent expectation from the bars: for every 5M base the first bar (>= its availability bar) whose max distance since
-    the pivot bar's NEXT bar exceeds lim + EPS (None = never), and the expected extreme on every bar."""
+    the pivot bar's NEXT bar (on px: the body end of its side for DTB-4) exceeds lim + EPS (None = never), and the expected
+    extreme on every bar."""
     piv = r.inp["dvPiv"]
     out, ext = {}, {}
     for gid, g in all_bases(r).items():
@@ -818,7 +876,7 @@ def mx_oracle(r, lim):
         p = g[5] - piv
         e = None
         for i in range(p + 1, len(r.bars)):
-            v = r.bars[i]["l" if top else "h"]
+            v = px(r, i, g[2], 0)
             e = v if e is None else (min(e, v) if top else max(e, v))
             ext[(gid, i)] = e
             if i >= g[5] and gid not in out and ((g[3] - e) if top else (e - g[3])) > lim + 1e-7:
@@ -833,78 +891,68 @@ def expect_on(off, cut):
     return ev, sn
 
 
-def zbars(seq):
-    bars = az.bars_of(seq, az.FR)
-    for b in bars:
-        b["dv"] = {}
-    return bars
-
-
 def gate_maxdist():
-    B, ZB, ZUP, ZDN, M = az.B, az.ZB, az.ZUP, az.ZDN, az.M
-    SC = dict(dvPiv=2, dvD0=6.0, dvMx0=30.0)          # scenario settings (the ACC-5B scenario bars use 2 pivot bars)
-    on = lambda seq, ov=None: run_new(zbars(seq), dict(SC, **(ov or {})), eq=False)
-    off = lambda seq: run_new(zbars(seq), dict(SC, dvMxUse=False), eq=False)
-    A = lambda r: [e for e in r.events if e[1] == 1]                      # base 1 = the 5M peak 4296 (bar 3)
-    Am = lambda r: [e for e in r.events if e[2] == 0 and e[6] == 8550 - 4296]
-    alive = lambda r, i, gid=1: any(g[0] == gid for g in r.snaps[i])
-    # 2. boundary 30 exactly kept / EPS exceeded ended (top and bottom)
-    s1 = lambda low: ZB + [B(4284, 4285, low, 4267), B(4267, 4290, 4266.5, 4289), B(4289, 4295, 4288, 4294), B(4294, 4294.5, 4290, 4291), M]
-    k30, kin, kout = on(s1(4266.0)), on(s1(4266.0 - 5e-8)), on(s1(4266.0 - 1e-6))
-    m30, mout = on(az.zmirror(s1(4266.0))), on(az.zmirror(s1(4266.0 - 1e-6)))
-    check("DT-M2 max distance 30 exactly (H 4296, low 4266) is kept and within EPS too (double top bar 9); 30 + 1e-6 ends the base on "
-          "that bar (no detection); bottoms mirror it",
-          [e[0] for e in A(k30)] == [9] and [e[0] for e in A(kin)] == [9] and A(kout) == [] and not alive(kout, 6) and alive(kout, 5)
-          and [e[0] for e in Am(m30)] == [9] and Am(mout) == [],
-          f"{A(k30)} {A(kin)} {A(kout)} {Am(m30)} {Am(mout)}")
-    # 4. exceeded during the pivot's right-side bars -> never registered (30 exactly -> registered)
-    s2 = lambda low: ZB[:4] + [B(4290, 4291, 4270, 4271), B(4271, 4272, low, 4266)]
-    r2, r2k, r2o = on(s2(4265.0)), on(s2(4266.0)), off(s2(4265.0))
-    has = lambda r: any(g[1] == 0 and g[3] == 4296.0 for sn in r.snaps for g in sn)
-    check("DT-M4 a 5M peak whose right-side bars already went 31 below H is not registered (OFF: registered; 30 exactly: registered)",
-          not has(r2) and has(r2k) and has(r2o), "")
-    # 5. exceeded while waiting, on a bearish (reversal) bar -> ended, no detection, marker '最大離れ幅超過'; approach bar itself
-    r3, r3o = on(ZB + [ZUP, B(4294, 4294.5, 4265, 4266), M]), off(ZB + [ZUP, B(4294, 4294.5, 4265, 4266), M])
-    mk = [d for d in r3.draws if d.kind == "label" and d.kw.get("style") == "diamond" and str(d.args[2]).startswith("#1 5分 2回目")]
-    r3b, r3bo = on(ZB + [B(4285, 4295, 4265, 4270), M]), off(ZB + [B(4285, 4295, 4265, 4270), M])
-    check("DT-M5 waiting base + bar 7 bearish with low 31 below H: the max distance wins (no detection, base ended, the approach "
-          "marker reads '最大離れ幅超過'); OFF detects on bar 7. An approach bar that itself exceeds is not an approach (OFF: "
-          "detected on it)", A(r3) == [] and [e[0] for e in A(r3o)] == [7] and len(mk) == 1 and mk[0].text.endswith("\n最大離れ幅超過")
-          and not alive(r3, 7) and A(r3b) == [] and [e[0] for e in A(r3bo)] == [6], f"{A(r3)} {[m.text for m in mk]} {A(r3bo)}")
+    # body scenarios at the defaults (pivot 4, buffer 2, distance 12, max 30, wait 3); base = 5M body top 2000 (bar 4, available 8)
+    on = lambda seq, ov=None: run_new(kbars(seq), ov, eq=False)
+    off = lambda seq: run_new(kbars(seq), dict(OFF), eq=False)
+    alive = lambda r, i: any(g[1] == 0 and g[2] == -1 and g[3] == 2000.0 for g in r.snaps[i])
+    has = lambda r: any(g[1] == 0 and g[2] == -1 and g[3] == 2000.0 for sn in r.snaps for g in sn)
+    base = KL + [KP] + KR
+    # 2. 30 exactly kept, within EPS kept, 30 + 1e-6 ended (bearish bar: body top = open); a wick 50 below is not a body
+    s1 = lambda bt, dn=0.3: base + [K(bt, bt - 5, False, dn=dn), K(1990, bt - 4), KAPP, KREV, az.M]
+    k30, kin, kout, kwick = on(s1(1970.0)), on(s1(1970.0 - 5e-8)), on(s1(1970.0 - 1e-6)), on(s1(1975.0, 25.0))
+    m30, mout = on(kmirror(s1(1970.0))), on(kmirror(s1(1970.0 - 1e-6)))
+    check("DT-M2 body max distance: body top 1970 (30 exactly) and 30 + 5e-8 (within EPS) are kept (double top bar 12); 30 + 1e-6 "
+          "ends the base on that bar; a lower wick 50 below with the body top 25 below keeps it; bottoms mirror it",
+          kev(k30) == [(12, 2)] and kev(kin) == [(12, 2)] and kev(kout) == [] and not alive(kout, 9) and alive(kout, 8)
+          and kev(kwick) == [(12, 2)] and kev(m30, 1) == [(12, 2)] and kev(mout, 1) == [],
+          f"{kev(k30)} {kev(kin)} {kev(kout)} {kev(kwick)} {kev(m30, 1)} {kev(mout, 1)}")
+    # 4. exceeded in the right-side bars (body top 1969 = 31 below) -> not registered; 1970 -> registered; OFF registered
+    s2 = lambda bt: KL + [KP] + KR[:3] + [K(bt, bt - 3, False)]
+    check("DT-M4 a 5M body top whose right-side bodies already went 31 below is not registered (30 exactly / limit OFF: registered)",
+          not has(on(s2(1969.0))) and has(on(s2(1970.0))) and has(off(s2(1969.0))), "")
+    # 5. waiting + a bearish (reversal) bar whose body top is 31 below -> ended, no detection, marker '最大離れ幅超過'
+    s3 = base + [KAPP, K(1969, 1960, False), az.M]
+    r3, r3o = on(s3), off(s3)
+    mk = [d for d in r3.draws if d.kind == "label" and d.kw.get("style") == "diamond" and "2回目" in str(d.args[2])
+          and str(d.args[2]).startswith("#") and d.args[1] == 1999.5]
+    check("DT-M5 waiting base + bearish bar with body top 31 below: the max distance wins (no detection, base ended, approach "
+          "marker '最大離れ幅超過'); OFF detects on that bar", kev(r3) == [] and kev(r3o) == [(10, 2)] and len(mk) == 1
+          and mk[0].text.endswith("\n最大離れ幅超過") and not alive(r3, 10), f"{kev(r3)} {kev(r3o)} {[m.text for m in mk]}")
     # 6 / 7 / 10. no reset after the 2nd approach; once exceeded never back; the earlier label stays
-    s4 = lambda low: ZB + [ZUP, ZDN, B(4291, 4292, low, low + 1), B(low + 1, 4295, 4288.5, 4294.5), B(4294, 4294.5, 4290, 4291), M]
-    r4, r4x = on(s4(4268.0)), on(s4(4265.0))
-    dl = [d for d in r4x.draws if d.kind == "label" and str(d.args[2]) == "ダブルトップ 5分\n#1 2回目"]
-    check("DT-M6 after the double top (bar 7) the extreme is not reset: low 4268 (28 below) keeps the base and the 3rd approach "
-          "gives a triple top on bar 10; the base's extreme is the lowest low since the pivot",
-          [(e[0], e[4]) for e in A(r4)] == [(7, 2), (10, 3)] and r4.exts[9].get(1) == 4268.0, f"{A(r4)}")
-    check("DT-M7 low 4265 (31 below) after the double top ends the base on bar 8: the return / 3rd approach / bearish bar give "
-          "no detection and the base never comes back", [(e[0], e[4]) for e in A(r4x)] == [(7, 2)]
-          and all(not alive(r4x, i) for i in range(8, len(r4x.snaps))), f"{A(r4x)}")
-    check("DT-M10 the double-top label confirmed before the max-distance end stays (not deleted, still on bar 7)",
-          len(dl) == 1 and not dl[0].deleted and dl[0].bar == 7 and dl[0].args[0] == r4x.bars[7]["t"], "")
-    # the '#4307'-like case at the defaults (pivot 4 / distance 12 / buffer 2 / wait 3 / max 30): peak 3970.89, ~100 down,
-    # back to the peak and a bearish bar -> OFF detects it, ON does not; a 20-wide double bottom is kept by both
+    s4 = lambda bt: base + [KAPP, KREV, K(bt, bt - 4, False), KAPP, KREV, az.M]
+    r4, r4x = on(s4(1972.0)), on(s4(1969.0))
+    dl = [d for d in r4x.draws if d.kind == "label" and str(d.args[2]).startswith("ダブルトップ 5分\n#")]
+    check("DT-M6 after the double top (bar 10) the body extreme is not reset: body top 1972 (28 below) keeps the base and the 3rd "
+          "approach gives a triple top on bar 13; the stored extreme is the lowest body top since the pivot",
+          kev(r4) == [(10, 2), (13, 3)] and [r4.exts[12][g[0]] for g in r4.snaps[12] if g[1] == 0 and g[3] == 2000.0 and g[2] == -1]
+          == [1972.0], f"{kev(r4)}")
+    check("DT-M7 body top 1969 (31 below) after the double top ends the base on bar 11: the 3rd approach / bearish bar give no "
+          "detection and the base never comes back", kev(r4x) == [(10, 2)] and all(not alive(r4x, i) for i in range(11, len(r4x.snaps))),
+          f"{kev(r4x)}")
+    check("DT-M10 the double-top label confirmed before the max-distance end stays (not deleted, still on bar 10)",
+          len(dl) == 1 and not dl[0].deleted and dl[0].bar == 10 and dl[0].args[0] == r4x.bars[10]["t"], "")
+    # '#4307'-like synthetic path at the defaults (body top 3970.89, ~100 down, back, approach + bearish) / a 15.8-wide
+    # double bottom (body bottom 3880.2) kept
+    B = az.B
     seq = [(3950 + i * 2, 3951 + i * 2.2, 3949 + i * 2, 3950.5 + i * 2) for i in range(8)]
-    seq += [(3965, 3970.89, 3964, 3966)]                                                   # pivot bar 8 (H 3970.89)
-    seq += [(3966 - 4 * i, 3967 - 4 * i, 3960 - 4 * i, 3961 - 4 * i) for i in range(4)]    # right bars: low 3948 (22.89)
+    seq += [(3965, 3971.2, 3964, 3970.89)]                                                 # pivot bar 8 (body top 3970.89)
+    seq += [(3966 - 4 * i, 3967 - 4 * i, 3960 - 4 * i, 3961 - 4 * i) for i in range(4)]    # right bodies: top 3954 (16.89)
     seq += [(3949 - 6 * i, 3950 - 6 * i, 3943 - 6 * i, 3944 - 6 * i) for i in range(13)]   # down to ~3871
-    seq += [(3872 + 8 * i, 3880 + 8 * i, 3871 + 8 * i, 3879 + 8 * i) for i in range(11)]   # back up to ~3960
-    seq += [(3958, 3969.5, 3957, 3968), (3968, 3968.5, 3962, 3963), (3963, 3964, 3958, 3959)]   # approach + bearish
-    big = lambda ov: run_new(zbars([B(*x) for x in seq]), ov, eq=False)
+    seq += [(3872 + 8 * i, 3880 + 8 * i, 3871 + 8 * i, 3879 + 8 * i) for i in range(11)]   # back up to ~3959
+    seq += [(3958, 3970, 3957, 3969.5), (3969, 3969.5, 3962, 3963), (3963, 3964, 3958, 3959)]   # approach + bearish
+    big = lambda ov: run_new(kbars([B(*x) for x in seq]), ov, eq=False)
     bon, boff = big({}), big(dict(OFF))
-    pk = lambda r: [e for e in r.events if e[2] == 0 and e[6] == 3970.89]
-    bseq = [(3900 - i, 3901 - i, 3898 - i, 3899 - i) for i in range(6)] + [(3893, 3894, 3880.2, 3881)]   # bottom bar 6 (L 3880.2)
-    bseq += [(3881 + 3 * i, 3885 + 3 * i, 3880.5 + 3 * i, 3884 + 3 * i) for i in range(6)]               # up to ~3900 (20 wide)
+    bseq = [(3900 - i, 3901 - i, 3898 - i, 3899 - i) for i in range(6)] + [(3884, 3885, 3879.9, 3880.2)]  # bottom bar 6
+    bseq += [(3881 + 3 * i, 3885 + 3 * i, 3880.5 + 3 * i, 3884 + 3 * i) for i in range(6)]               # up (body 15.8)
     bseq += [(3898 - 3 * i, 3899 - 3 * i, 3893 - 3 * i, 3894 - 3 * i) for i in range(4)]
-    bseq += [(3884, 3885, 3881.5, 3883), (3883, 3887, 3882.5, 3886), (3886, 3888, 3885, 3887)]           # approach (bearish), bullish
-    gb = lambda ov: run_new(zbars([B(*x) for x in bseq]), ov, eq=False)
+    bseq += [(3884, 3885, 3881, 3881.5), (3883, 3887, 3882.5, 3886), (3886, 3888, 3885, 3887)]            # approach, bullish
+    gb = lambda ov: run_new(kbars([B(*x) for x in bseq]), ov, eq=False)
     gon, goff = gb({}), gb(dict(OFF))
-    bt = lambda r: [e for e in r.events if e[2] == 0 and e[6] == 3880.2]
-    check("DT-M0 defaults: a 5M top 3970.89 that fell ~100 and came back (synthetic '#4307'-like path) is detected only with the "
-          "limit OFF; a 20-wide double bottom (L 3880.2) is detected with and without the limit",
-          pk(bon) == [] and len(pk(boff)) == 1 and len(bt(gon)) == 1 and bt(gon) == bt(goff), f"{pk(boff)} {bt(gon)} {bt(goff)}")
-    # setting conflict: an error, no correction
+    check("DT-M0 defaults (body): a 5M body top 3970.89 that fell ~100 and came back (synthetic '#4307'-like path) is detected only "
+          "with the limit OFF; a 15.8-wide double bottom (body bottom 3880.2) is detected with and without the limit",
+          kev(bon, -1, 3970.89) == [] and len(kev(boff, -1, 3970.89)) == 1 and len(kev(gon, 1, 3880.2)) == 1
+          and kev(gon, 1, 3880.2) == kev(goff, 1, 3880.2), f"{kev(boff, -1, 3970.89)} {kev(gon, 1, 3880.2)}")
     def stops(ov):
         try:
             big(ov)
@@ -913,8 +961,8 @@ def gate_maxdist():
             return "最大離れ幅" in str(ex)
     check("DT-M11 limit ON with max 11.5 < 5M minimum distance 12 stops with an error (no correction); max = 12 and limit OFF with "
           "max 5 run", stops(dict(dvMx0=11.5)) and not stops(dict(dvMx0=12.0)) and not stops(dict(dvMxUse=False, dvMx0=5.0)), "")
-    # random series: ON == OFF truncated by the oracle (3 / 7 / 8), extremes == oracle (3), OFF == previous indicator (1),
-    # higher timeframes untouched (8), display settings irrelevant (9)
+    # random series: ON == OFF truncated by the body oracle, extremes == oracle; 15M..D untouched (limit ON / OFF and vs DTB-3);
+    # display settings irrelevant
     ok_or = ok_ext = ok_prev = ok_htf = ok_disp = True
     det = []
     n_cut = n_reg = n_ev_on = n_ev_off = 0
@@ -923,8 +971,7 @@ def gate_maxdist():
         bars = series(seed, days, miss, None, vol)
         r_on = run_new(bars, ov, eq=False)
         r_off = run_new(bars, dict(ov, dvMxUse=False), eq=False)
-        r_prev = run_new(bars, {k: v for k, v in dict(ov).items() if k != "dvMx0"} or
-                         dict(dvPiv=r_on.inp["dvPiv"], dvD0=r_on.inp["dvD0"]), eq=False, src=PREV_SRC)
+        r_prev = run_new(bars, dict(ov), eq=False, src=DTB3_SRC)
         lim = r_on.inp["dvMx0"]
         cut, ext = mx_oracle(r_off, lim)
         ev, sn = expect_on(r_off, cut)
@@ -940,11 +987,10 @@ def gate_maxdist():
             for gid, v in ex.items():
                 if any(g[0] == gid and g[1] == 0 for g in r_on.snaps[i]) and v != ext[(gid, i)]:
                     ok_ext = False
-        if first_diff(r_prev, r_off) is not None:
+        if first_diff(r_prev, r_on, HTF) is not None:
             ok_prev = False
-            det.append(f"seed {seed}: OFF vs previous {first_diff(r_prev, r_off)}")
-        if [e for e in r_on.events if e[2] > 0] != [e for e in r_off.events if e[2] > 0] or \
-                [tuple(g for g in x if g[1] > 0) for x in r_on.snaps] != [tuple(g for g in x if g[1] > 0) for x in r_off.snaps]:
+            det.append(f"seed {seed}: 15M..D vs DTB-3 {first_diff(r_prev, r_on, HTF)}")
+        if first_diff(r_on, r_off, HTF) is not None:
             ok_htf = False
         if seed == 81:
             for v in (dict(dsTf0=False), dict(dsMaxGrp=1), dict(dsAllB=True, dsMaxGrp=3)):
@@ -958,16 +1004,168 @@ def gate_maxdist():
                 det.append(f"drawings {bad[:2]}")
         print(f"  [DT-M] seed {seed} {ov}: events ON {len(r_on.events)} / OFF {len(r_off.events)}, 5M bases ended by the max "
               f"distance {len(cut)} (at registration {sum(1 for g, i in cut.items() if i == all_bases(r_off)[g][5])})", flush=True)
-    check("DT-M1 limit OFF: detection events and active-base states equal the previous indicator (5db85fc) at the same settings",
+    check("DT-M1 15M..D detection events and bases equal the DTB-3 indicator (84c4a96) at the same settings (5M: DTB-4)",
           ok_prev, str(det))
-    check("DT-M3 random series (5 paths incl. a 6x volatility one, defaults and pivot 2 / max 20): the ON run equals the OFF run with every 5M base cut "
-          "from the first bar whose max distance since the pivot's next bar (independent oracle from the bars) exceeds the limit "
-          "(not registered when that is the availability bar); the stored extreme equals the oracle on every bar",
+    check("DT-M3 random series (5 paths incl. a 6x volatility one, defaults and pivot 2 / max 20): the ON run equals the OFF run "
+          "with every 5M base cut from the first bar whose body max distance since the pivot's next bar (independent oracle) "
+          "exceeds the limit (not registered when that is the availability bar); the stored extreme equals the oracle",
           ok_or and ok_ext and n_cut > 0 and n_reg > 0 and n_ev_on < n_ev_off,
           f"{det} ext={ok_ext} cut={n_cut} at registration={n_reg} events on/off={n_ev_on}/{n_ev_off}")
     check("DT-M8 15M / 1H / 4H / D detections and bases identical with the limit ON and OFF", ok_htf, "")
     check("DT-M9 display settings (5M hidden, cap 1, all bases + cap 3) do not change the ON results; drawings consistent",
           ok_disp, str(det))
+
+
+# ============================================================================
+# DTB-4: 5M bases on the body ends — an independent reference model of the specification
+# ============================================================================
+def ref5m(bars, inp):
+    """the 5M body detector written from the DTB-4 specification (not from the Pine text).
+    returns (events, states): events = [(bar, side, cnt, approach bar, level, on the approach bar)],
+    states[i] = sorted [(side, level, availability bar, away, cnt, waiting, approach bar, wait end)] after bar i."""
+    N, Bf, D, W = inp["dvPiv"], inp["dvB0"], inp["dvD0"], inp["dvWait"]
+    on, Mx, E = inp["dvMxUse"], inp["dvMx0"], 1e-7
+    bt = [max(b["o"], b["c"]) for b in bars]
+    bb = [min(b["o"], b["c"]) for b in bars]
+    bases, events, states = [], [], []
+    for i, b in enumerate(bars):
+        if i >= 2 * N:
+            c = i - N
+            for side, v in ((-1, bt), (1, bb)):
+                lv = v[c]
+                left = all(lv >= v[j] if side == -1 else lv <= v[j] for j in range(c - N, c))
+                right = all(lv > v[j] if side == -1 else lv < v[j] for j in range(c + 1, i + 1))
+                if left and right:
+                    ex = min(v[c + 1:i + 1]) if side == -1 else max(v[c + 1:i + 1])
+                    dist = lv - ex if side == -1 else ex - lv
+                    if not (on and dist > Mx + E):
+                        bases.append(dict(side=side, lvl=lv, a=i, away=dist >= D - E, cnt=1, wait=False, app=None, wend=None, ex=ex))
+        keep = []
+        for g in bases:
+            if g["a"] >= i:
+                keep.append(g)
+                continue
+            top = g["side"] == -1
+            p = bt[i] if top else bb[i]
+            g["ex"] = min(g["ex"], p) if top else max(g["ex"], p)
+            if on and ((g["lvl"] - g["ex"]) if top else (g["ex"] - g["lvl"])) > Mx + E:
+                continue
+            if (b["c"] > g["lvl"] + Bf + E) if top else (b["c"] < g["lvl"] - Bf - E):
+                continue
+            rev = b["c"] < b["o"] if top else b["c"] > b["o"]
+            fin = False
+            if g["wait"]:
+                if rev:
+                    events.append((i, g["side"], g["cnt"], g["app"], g["lvl"], False))
+                    g["wait"] = False
+                elif i >= g["wend"]:
+                    g["wait"] = False
+                fin = not g["wait"] and g["cnt"] >= 3
+            elif g["away"] and g["cnt"] < 3 and g["lvl"] - Bf - E <= p <= g["lvl"] + Bf + E:
+                g["cnt"] += 1
+                g["away"] = False
+                g["app"], g["wend"] = i, i + W
+                if rev:
+                    events.append((i, g["side"], g["cnt"], i, g["lvl"], True))
+                elif W > 0:
+                    g["wait"] = True
+                fin = not g["wait"] and g["cnt"] >= 3
+            if not fin and g["app"] != i and ((p <= g["lvl"] - D + E) if top else (p >= g["lvl"] + D - E)):
+                g["away"] = True
+            if not fin:
+                keep.append(g)
+        bases = keep
+        states.append(sorted((g["side"], g["lvl"], g["a"], g["away"], g["cnt"], g["wait"], g["app"], g["wend"]) for g in bases))
+    return events, states
+
+
+def proj5(r):
+    ev = sorted((e[0], e[3], e[4], e[5], e[6], e[7]) for e in r.events if e[2] == 0)
+    st = [sorted((g[2], g[3], g[5], g[6], g[7], g[8], g[9], g[10]) for g in snap if g[1] == 0) for snap in r.snaps]
+    return ev, st
+
+
+def gate_body():
+    # B1: the indicator's 5M bases == the reference model (events and every base's state on every bar)
+    ok, det, n_ev = True, [], 0
+    for seed, days, miss, grid, vol, ov in ((91, 25, 0.02, None, 1.0, {}), (92, 25, 0.0, 0.5, 1.6, {}),
+                                            (93, 25, 0.02, None, 1.0, dict(dvMxUse=False)),
+                                            (94, 25, 0.0, 0.5, 1.0, dict(dvPiv=2, dvD0=6.0, dvWait=0)),
+                                            (95, 15, 0.02, None, 4.0, dict(dvB0=0.0, dvMx0=20.0))):
+        bars = series(seed, days, miss, grid, vol)
+        r = run_new(bars, ov, eq=False)
+        rev, rst = ref5m(bars, r.inp)
+        iev, ist = proj5(r)
+        n_ev += len(rev)
+        if sorted(rev) != iev or rst != ist:
+            ok = False
+            i = next((i for i in range(len(rst)) if rst[i] != ist[i]), None)
+            det.append(f"seed {seed} {ov}: events {len(rev)}/{len(iev)} first state difference bar {i}")
+        print(f"  [DT-B] seed {seed} {ov}: 5M events {len(iev)} (reference {len(rev)})", flush=True)
+    check("DT-B1 random series (5 paths: missing bars, 0.5 price grid incl. equal body ends, defaults / limit OFF / pivot 2 + wait 0 "
+          "/ buffer 0): the indicator's 5M detection events and the state of every 5M base on every bar equal an independent "
+          "reference model of the body specification", ok and n_ev > 0, f"{det} events={n_ev}")
+    base = KL + [KP] + KR
+    on = lambda seq, ov=None: run_new(kbars(seq), ov, eq=False)
+    bases = lambda r: sorted({(g[2], g[3], g[5]) for sn in r.snaps for g in sn if g[1] == 0})
+    # pivot: equal body tops -> the last one; left equal allowed, right equal not
+    rt = on(KL + [K(2000, 1996), K(2000, 1997)] + KR + [az.M])
+    tops = [x for x in bases(rt) if x[0] == -1 and x[1] == 2000.0]
+    rb = on(kmirror(KL + [K(2000, 1996), K(2000, 1997)] + KR + [az.M]))
+    bots = [x for x in bases(rb) if x[0] == 1 and x[1] == 2000.0]
+    check("DT-B2 equal body tops on bars 4 / 5: the base is the later bar 5 (available on bar 9; bar 4 is not a pivot: its right "
+          "side has an equal, bar 5's left side may); bottoms mirror it", tops == [(-1, 2000.0, 9)] and bots == [(1, 2000.0, 9)],
+          f"{tops} {bots}")
+    # the base level is the body end, not the wick: a 10-long upper wick on the pivot bar
+    rw = on(KL + [K(2000, 1996, up=10)] + KR + [KAPP, KREV, az.M])
+    ann = [d for d in rw.draws if str(d.args[2]).startswith("基準#") and "5分足 山" in str(d.args[2])]
+    mk = [d for d in rw.draws if d.kw.get("style") == "diamond" and "5分 2回目" in str(d.args[2])]
+    check("DT-B3 the base level and annotation sit on the pivot's body top (2000, not its wick high 2010); the approach marker sits "
+          "on the approach bar's body top (1999.5, not its high)", kev(rw) == [(10, 2)] and any(d.args[1] == 2000.0 for d in ann)
+          and all(d.args[1] != 2010.0 for d in ann) and [d.args[1] for d in mk if d.args[0] == rw.bars[9]["t"]] == [1999.5],
+          f"{kev(rw)} {[d.args[:2] for d in ann]} {[d.args[:2] for d in mk]}")
+    # approach band +-2 on the body end
+    QUIET = K(1990, 1985, False)       # bearish, body top 1990: outside the band (would detect a pending wait)
+    cases = {
+        "wick only (high 2001.3, body top 1996, bullish) + bearish": (base + [K(1996, 1990, up=5.3), QUIET, az.M], []),
+        "body top 2003 (bearish, close 1999: not invalidated) then 2001.5": (base + [K(2003, 1999, False), K(2001.5, 1995), KREV, az.M],
+                                                                           [(11, 2)]),
+        "body top 2002 exactly (bullish) + bearish": (base + [K(2002, 1995), KREV, az.M], [(10, 2)]),
+        "body top 1998 exactly (bullish) + bearish": (base + [K(1998, 1993), KREV, az.M], [(10, 2)]),
+        "body top 2002 + 1e-6 (bearish)": (base + [K(2002 + 1e-6, 1995, False), QUIET, az.M], []),
+        "body top 1998 - 1e-6 (bullish) + bearish": (base + [K(1998 - 1e-6, 1993), QUIET, az.M], []),
+    }
+    res = {k: kev(on(v[0])) for k, v in cases.items()}
+    resm = {k: kev(on(kmirror(v[0])), 1) for k, v in cases.items()}
+    check("DT-B4 approach only when the body end is within the base +- 2 (both bounds included, EPS): a wick into the band does not "
+          "count, a body top above +2 does not count (and its close 1999 does not invalidate), 2002 / 1998 count, +-1e-6 beyond "
+          "do not; bottoms mirror it", all(res[k] == v[1] for k, v in cases.items()) and res == resm, f"{res} {resm}")
+    # minimum distance on the body: right-side wicks reach 20 below but the body tops only 10 -> not away; body top 1988 -> away
+    kr2 = [K(1999, 1995, False, dn=5), K(1995, 1991, False, dn=8), K(1993, 1990, False, dn=10), K(1991, 1990.5, False, dn=10)]
+    rd = on(KL + [KP] + kr2 + [KAPP, K(1988, 1985, False), KAPP, KREV, az.M])
+    check("DT-B5 minimum distance on the body: right-side wicks 20 below with body tops only 10 below -> the approach on bar 9 is "
+          "not counted; body top 1988 (12 below) on bar 10 -> the approach on bar 11 counts, bearish bar 12 -> double top",
+          kev(rd) == [(12, 2)], f"{kev(rd)}")
+    # close invalidation and the reversal wait unchanged (on the body base level)
+    ri = on(base + [KAPP, K(2002.5, 1999, True), az.M])
+    rl = on(base + [KAPP, K(1996, 1993), K(1996, 1994), KREV, az.M])
+    rx = on(base + [KAPP, K(1996, 1993), K(1996, 1994), K(1996, 1994.5), KREV, az.M])
+    check("DT-B6 close 2002.5 > base + 2 invalidates (no detection); the reversal on the 3rd bar after the approach is detected, on "
+          "the 4th it is not (wait expired)", kev(ri) == [] and kev(rl) == [(12, 2)] and kev(rx) == [], f"{kev(ri)} {kev(rl)} {kev(rx)}")
+    # 15M..D unchanged: vs the DTB-3 indicator and the original (HTF bases)
+    okh, deth = True, []
+    for seed, ov in ((96, {}), (97, dict(dvPiv=2, dvD0=6.0, dvMxUse=False))):
+        bars = series(seed, 30, 0.02, None, 1.6)
+        r = run_new(bars, ov, eq=False)
+        p = run_new(bars, ov, eq=False, src=DTB3_SRC)
+        if first_diff(p, r, HTF) is not None or not [e for e in r.events if e[2] > 0]:
+            okh = False
+            deth.append((seed, first_diff(p, r, HTF)))
+        if seed == 97 and first_diff(run_orig(bars, dict(dvPiv=2, dvD0=6.0)), r, HTF) is not None:
+            okh = False
+            deth.append("original")
+    check("DT-B7 15M / 1H / 4H / D detections and bases unchanged: equal to the DTB-3 indicator (defaults) and to the original "
+          "(pivot 2 / distance 6)", okh, str(deth))
 
 
 def main():
@@ -978,6 +1176,7 @@ def main():
     gate_realtime_prefix()
     gate_redraw()
     gate_maxdist()
+    gate_body()
     ok = 0
     for name, res, det in RESULTS:
         print(("PASS  " if res else "FAIL  ") + name + ("" if res or not det else "\n      " + str(det)[:600]))
