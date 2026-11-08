@@ -1087,24 +1087,27 @@ def proj5(r):
 
 def gate_body():
     # B1: the indicator's 5M bases == the reference model (events and every base's state on every bar)
-    ok, det, n_ev = True, [], 0
+    ok, det, n_ev, nps = True, [], 0, []
     for seed, days, miss, grid, vol, ov in ((91, 25, 0.02, None, 1.0, {}), (92, 25, 0.0, 0.5, 1.6, {}),
                                             (93, 25, 0.02, None, 1.0, dict(dvMxUse=False)),
-                                            (94, 25, 0.0, 0.5, 1.0, dict(dvPiv=2, dvD0=6.0, dvWait=0)),
-                                            (95, 15, 0.02, None, 4.0, dict(dvB0=0.0, dvMx0=20.0))):
+                                            (94, 25, 0.0, 0.5, 1.0, dict(dvPiv=2, dvD0=6.0, dvWait=1)),
+                                            (95, 25, 0.02, 0.5, 2.0, dict(dvB0=0.5, dvMx0=20.0)),
+                                            (98, 25, 0.0, 0.5, 1.6, dict(dvWait=0))):
         bars = series(seed, days, miss, grid, vol)
         r = run_new(bars, ov, eq=False)
         rev, rst = ref5m(bars, r.inp)
         iev, ist = proj5(r)
         n_ev += len(rev)
+        nps.append(len(rev))
         if sorted(rev) != iev or rst != ist:
             ok = False
             i = next((i for i in range(len(rst)) if rst[i] != ist[i]), None)
             det.append(f"seed {seed} {ov}: events {len(rev)}/{len(iev)} first state difference bar {i}")
         print(f"  [DT-B] seed {seed} {ov}: 5M events {len(iev)} (reference {len(rev)})", flush=True)
-    check("DT-B1 random series (5 paths: missing bars, 0.5 price grid incl. equal body ends, defaults / limit OFF / pivot 2 + wait 0 "
-          "/ buffer 0): the indicator's 5M detection events and the state of every 5M base on every bar equal an independent "
-          "reference model of the body specification", ok and n_ev > 0, f"{det} events={n_ev}")
+    check("DT-B1 random series (6 paths: missing bars, 0.5 price grid incl. equal body ends, defaults / limit OFF / pivot 2 + wait 1 "
+          "/ buffer 0.5 + max 20 / wait 0): the indicator's 5M detection events and the state of every 5M base on every bar equal an independent "
+          "reference model of the body specification (every path with detections)", ok and n_ev > 0 and min(nps) > 0,
+          f"{det} events={n_ev} per path={nps}")
     base = KL + [KP] + KR
     on = lambda seq, ov=None: run_new(kbars(seq), ov, eq=False)
     bases = lambda r: sorted({(g[2], g[3], g[5]) for sn in r.snaps for g in sn if g[1] == 0})
