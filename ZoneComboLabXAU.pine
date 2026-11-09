@@ -1358,6 +1358,7 @@ type LbCand
 // 注文 / ポジション (1 つ) と取引台帳の作業域
 type LbOrd
     int    state    = 0       // 0 なし / 1 entry 発注済み / 2 保有中 / 3 不正な出口のため決済中
+    array<int> exIds          // LAB-12: TP 計算から除く Zone ID (発注時に採用した候補の Zone のコピー。保有中の f_lbPlan でも使う)
     int    n        = 0
     string id       = ""
     int    side     = 0
@@ -2139,6 +2140,18 @@ f_waitIdx(int wid) =>
 
 // 待機の Zone ID を付け替える (統合された水平線 Zone → 統合先)。同じ組・同じ方向の待機が既にあれば、最後の接触が新しい方を残す
 //  (最後の接触足・接触時の帯のスナップショット・期限はそのまま)
+// LAB-12: 保有中の TP 除外 Zone ID を付け替える (統合された水平線 Zone → 統合先。f_waitMove と同じ箇所で呼ぶ)
+f_ordExMove(int fromId, int toId) =>
+    bool hit = false
+    if not na(o.exIds)
+        int ix = array.indexof(o.exIds, fromId)
+        if ix >= 0
+            array.remove(o.exIds, ix)
+            if not array.includes(o.exIds, toId)
+                array.push(o.exIds, toId)
+            hit := true
+    hit
+
 f_waitMove(int fromId, int toId) =>
     int n = array.size(lbWaits)
     if n > 0
@@ -2232,6 +2245,7 @@ f_swAdd(int k, int sub, float pv, int pt) =>
                     array.push(a.mT, array.get(b.mT, j))
                     array.push(a.mId, array.get(b.mId, j))
                 f_waitMove(b.id, a.id)
+                f_ordExMove(b.id, a.id)
         float pMin = array.min(a.mP)
         float pMax = array.max(a.mP)
         a.ctr := (pMin + pMax) / 2.0
@@ -2302,7 +2316,11 @@ f_lbFeed(array<float> tps, array<float> cur, int side, float b, float t) =>
 // TP 候補 (最大 3)。LONG = ref より厳密に上の Zone を下限の昇順 / SHORT = ref より厳密に下の Zone を上限の降順に、共通幅の
 // Zone (LONG は lbZs、SHORT は lbZsT: 水平線の統合で帯の幅が変わるため)・FVG (LONG は lbFvgs、SHORT は lbFvgsT)・MA 2 本の 3 つの流れを合わせて 1 件ずつ読み、
 // 重なりで統合しながら 3 つ目の帯が確定した時点で終える。全種類 (条件に選ばない種類も) を使う
-f_lbTargets(int side, float ref) =>
+// LAB-12: ex = TP から除く Zone ID (na = 除外なし)。通常 Zone・FVG / iFVG・MA とも、f_lbFeed で帯を統合する前に除く
+f_exHas(array<int> ex, int id) =>
+    not na(ex) and array.includes(ex, id)
+
+f_lbTargets(int side, float ref, array<int> ex) =>
     array<float> tps = array.new_float()
     array<float> cur = array.new_float(2, na)
     array<float> mb  = array.new_float()
@@ -2310,7 +2328,7 @@ f_lbTargets(int side, float ref) =>
     for k = 0 to 1
         LbZone mz = k == 0 ? lbMa1 : lbMa2
         float  mv = k == 0 ? zbMa1 : zbMa2
-        if not na(mz) and not na(mv) and f_zbUse(k)
+        if not na(mz) and not na(mv) and f_zbUse(k) and not f_exHas(ex, mz.id)
             if (side == 1 and mz.bot > ref + EPS) or (side == -1 and mz.top < ref - EPS)
                 bool front = false
                 if array.size(mb) == 1
@@ -2369,11 +2387,12 @@ f_lbTargets(int side, float ref) =>
             if pk == 0
                 b := za.bot
                 t := za.top
+                use := not f_exHas(ex, za.id)
                 ia += side == 1 ? 1 : -1
             else if pk == 1
                 b := zg.bot
                 t := zg.top
-                use := not zg.dead
+                use := not zg.dead and not f_exHas(ex, zg.id)
                 ig += side == 1 ? 1 : -1
             else
                 b := array.get(mb, im)
@@ -2393,7 +2412,7 @@ f_legId(int n, int k) =>
 
 // 利確の段の計画 (o.legPx / o.legLots を作り直す。完了した段は変えない)。ref: 目標を探す基準価格、base: 固定 RR の基準
 f_lbPlan(float ref, float base) =>
-    array<float> tps = tpMode == "固定 RR" ? array.new_float() : f_lbTargets(o.side, ref)
+    array<float> tps = tpMode == "固定 RR" ? array.new_float() : f_lbTargets(o.side, ref, o.exIds)
     int nT = array.size(tps)
     for k = 0 to 2
         array.set(o.legPx, k, na)
@@ -3446,13 +3465,18 @@ if lbRun and barstate.isconfirmed
                 else
                     array<float> tps = array.new_float()
                     if tpMode != "固定 RR"
-                        if side == 1
+                        // LAB-12: 候補の Zone (w.ids) を TP から除く。候補の Zone が利益側の TP 候補に入り得る (LONG: 帯全体の上端 > 終値 /
+                        //  SHORT: 下端 < 終値) なら候補ごとに計算し、入り得なければ除外なしと同じなので方向別のキャッシュを使う
+                        bool mayIn = side == 1 ? w.eTop > close + EPS : w.eBot < close - EPS
+                        if mayIn
+                            tps := f_lbTargets(side, close, w.ids)
+                        else if side == 1
                             if na(tpL)
-                                tpL := f_lbTargets(1, close)
+                                tpL := f_lbTargets(1, close, array.new_int())
                             tps := tpL
                         else
                             if na(tpS)
-                                tpS := f_lbTargets(-1, close)
+                                tpS := f_lbTargets(-1, close, array.new_int())
                             tps := tpS
                     nT  := array.size(tps)
                     tp1 := nT > 0 ? array.get(tps, 0) : close + side * fixRR * slw
@@ -3514,6 +3538,7 @@ if lbRun and barstate.isconfirmed
             o.tp1E       := pick.tp1
             o.tp1Fix     := tpMode == "固定 RR" or pick.nT == 0
             o.tmask      := w.tmask
+            o.exIds      := array.copy(w.ids)     // LAB-12: TP から除く Zone (初回発注・保有中の f_lbPlan)
             o.omask      := pick.omask
             o.cReb       := false          // LAB-10: 分類は候補に使わない
             o.cFake      := false
