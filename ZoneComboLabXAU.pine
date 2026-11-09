@@ -1354,6 +1354,7 @@ type LbCand
     int    ie     = -1        // 使う TE の位置
     int    it     = -1        // 使う TD の位置
     LbWait uw                 // LAB-10: 候補の Zone (OR = Zone 1 個 / AND = 重なった組。この足だけの一時オブジェクト)
+    array<int> exIds          // LAB-13: TP から除く Zone ID (候補の Zone とこの足で重なる有効 Zone の連鎖)
 
 // 注文 / ポジション (1 つ) と取引台帳の作業域
 type LbOrd
@@ -2319,6 +2320,70 @@ f_lbFeed(array<float> tps, array<float> cur, int side, float b, float t) =>
 // LAB-12: ex = TP から除く Zone ID (na = 除外なし)。通常 Zone・FVG / iFVG・MA とも、f_lbFeed で帯を統合する前に除く
 f_exHas(array<int> ex, int id) =>
     not na(ex) and array.includes(ex, id)
+
+// LAB-13: 候補 (w.ids が起点。AND は採用した全 Zone) の TP 除外 Zone = 起点と、この足で実際に重なっている有効 Zone の連鎖。
+//  表示の帯と同じ規則: FVG / iFVG は個別の帯 (起点なら自身だけ。他の帯の連鎖にも入れない)、それ以外 (MA を含む) は本来の上下端で
+//  EPS 込みで重なる限り連鎖 (エントリーの許容幅は足さない)。売買用の Zone データ (lbZs / lbFvgs / MA) から求め、表示の ON / OFF・件数には依存しない。
+//  戻り値 [除外 ID, LONG の TP 候補に入り得る Zone を含む, SHORT の TP 候補に入り得る Zone を含む]
+f_lbExZones(LbWait w) =>
+    array<int> ex = array.copy(w.ids)
+    bool  hasL = false
+    bool  hasS = false
+    float eb = na
+    float et = na
+    for g = 0 to 1
+        array<LbZone> arr = g == 0 ? lbZs : lbFvgs
+        int n = array.size(arr)
+        int i = f_lbLower(arr, w.eBot - (g == 0 ? st.maxW : st.maxWF) - EPS)
+        while i < n
+            LbZone z = array.get(arr, i)
+            if z.bot > w.eTop + EPS
+                break
+            if array.includes(w.ids, z.id)
+                hasL := hasL or z.bot > close + EPS
+                hasS := hasS or z.top < close - EPS
+                if z.typ != 4
+                    eb := na(eb) ? z.bot : math.min(eb, z.bot)
+                    et := na(et) ? z.top : math.max(et, z.top)
+            i += 1
+    for k = 0 to 1
+        LbZone mz = k == 0 ? lbMa1 : lbMa2
+        if not na(mz)
+            if array.includes(w.ids, mz.id)
+                hasL := hasL or mz.bot > close + EPS
+                hasS := hasS or mz.top < close - EPS
+                eb := na(eb) ? mz.bot : math.min(eb, mz.bot)
+                et := na(et) ? mz.top : math.max(et, mz.top)
+    if not na(eb)
+        bool more = true
+        while more
+            more := false
+            int n = array.size(lbZs)
+            int i = f_lbLower(lbZs, eb - st.maxW - EPS)
+            while i < n
+                LbZone z = array.get(lbZs, i)
+                if z.bot > et + EPS
+                    break
+                if not z.dead and z.typ != 4 and z.top >= eb - EPS and not array.includes(ex, z.id)
+                    array.push(ex, z.id)
+                    hasL := hasL or z.bot > close + EPS
+                    hasS := hasS or z.top < close - EPS
+                    eb := math.min(eb, z.bot)
+                    et := math.max(et, z.top)
+                    more := true
+                i += 1
+            for k = 0 to 1
+                LbZone mz = k == 0 ? lbMa1 : lbMa2
+                float  mv = k == 0 ? zbMa1 : zbMa2
+                if not na(mz) and not na(mv) and f_zbUse(k)
+                    if mz.bot <= et + EPS and mz.top >= eb - EPS and not array.includes(ex, mz.id)
+                        array.push(ex, mz.id)
+                        hasL := hasL or mz.bot > close + EPS
+                        hasS := hasS or mz.top < close - EPS
+                        eb := math.min(eb, mz.bot)
+                        et := math.max(et, mz.top)
+                        more := true
+    [ex, hasL, hasS]
 
 f_lbTargets(int side, float ref, array<int> ex) =>
     array<float> tps = array.new_float()
@@ -3446,6 +3511,7 @@ if lbRun and barstate.isconfirmed
                 LbWait w = array.get(units, i)
                 st.nCand += 1
                 int why = -1
+                array<int> exIds = w.ids
                 int om  = f_lbOthers(w.eBot, w.eTop, w.tmask)
                 // SL = Zone の外側 + SL 外側幅 と 判断価格 (終値) から最低距離 の遠い方 (LAB-11)
                 float sl  = side == 1 ? math.min(w.eBot - slBuf, close - slMinD) : math.max(w.eTop + slBuf, close + slMinD)
@@ -3464,12 +3530,14 @@ if lbRun and barstate.isconfirmed
                     why := 2
                 else
                     array<float> tps = array.new_float()
+                    // LAB-13: TP 除外 = 候補の Zone から重なりで連鎖する有効 Zone 全体。除外対象のどれかが利益側の TP 候補に入り得る
+                    //  (LONG: 下端 > 終値 / SHORT: 上端 < 終値) なら候補ごとに計算し、入り得なければ除外なしと同じなので方向別のキャッシュを使う
+                    [exI, exL, exS] = f_lbExZones(w)
+                    exIds := exI
                     if tpMode != "固定 RR"
-                        // LAB-12: 候補の Zone (w.ids) を TP から除く。候補の Zone が利益側の TP 候補に入り得る (LONG: 帯全体の上端 > 終値 /
-                        //  SHORT: 下端 < 終値) なら候補ごとに計算し、入り得なければ除外なしと同じなので方向別のキャッシュを使う
-                        bool mayIn = side == 1 ? w.eTop > close + EPS : w.eBot < close - EPS
+                        bool mayIn = side == 1 ? exL : exS
                         if mayIn
-                            tps := f_lbTargets(side, close, w.ids)
+                            tps := f_lbTargets(side, close, exI)
                         else if side == 1
                             if na(tpL)
                                 tpL := f_lbTargets(1, close, array.new_int())
@@ -3499,6 +3567,7 @@ if lbRun and barstate.isconfirmed
                     c.ie := cTE ? ie : -1
                     c.it := cTD ? it : -1
                     c.uw := w
+                    c.exIds := exIds
                     if side == 1
                         if na(bestL)
                             bestL := c
@@ -3538,7 +3607,7 @@ if lbRun and barstate.isconfirmed
             o.tp1E       := pick.tp1
             o.tp1Fix     := tpMode == "固定 RR" or pick.nT == 0
             o.tmask      := w.tmask
-            o.exIds      := array.copy(w.ids)     // LAB-12: TP から除く Zone (初回発注・保有中の f_lbPlan)
+            o.exIds      := array.copy(pick.exIds)     // LAB-13: TP から除く Zone の連鎖 (初回発注・保有中の f_lbPlan)
             o.omask      := pick.omask
             o.cReb       := false          // LAB-10: 分類は候補に使わない
             o.cFake      := false
