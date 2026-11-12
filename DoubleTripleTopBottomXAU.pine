@@ -80,6 +80,11 @@
 //  DTB-11 (5分足のダブルボトムだけ): 2 回目の接近を登録した足が陰線なら、その始値を保存し、反転待ちの間に陽線の確定終値が
 //    その始値を上回った足だけ成立 (同値・下回る陽線は待機を続け、最終足でも満たせば成立)。期限切れ・無効化は従来どおりで、
 //    再接近ではその接近足から取り直す。接近足が陽線・同値なら従来の反転判定。
+//  DTB-12 (5分足の基準だけ): 接近を実体端とヒゲ先の 4 組で判定。左の山・谷は従来どおり実体で確定し、同じ足のヒゲ先 (トップ = 高値 /
+//    ボトム = 安値) も保存する。左 (実体端 / ヒゲ先) × 右 (この足の実体端 / ヒゲ先) のどれか 1 組の差が buffer 以内なら 2 回目の接近。
+//    終値による無効化は左の実体端とヒゲ先で別々に判定し、実体側だけ無効ならヒゲ先で監視を続ける (両方無効で終了)。途中波は確定した
+//    極値の実体端とヒゲ先の両方を見て、どちらかが有効な左の基準の許容幅に入っていれば独立した途中波にしない。接近後の反転待ち・
+//    中央の深さ (DTB-10)・価格差 (DTB-9) は従来どおりで、同じ左の基準からのダブル成立は 1 件 (成立で監視終了)。
 // ============================================================================
 
 //@version=5
@@ -197,6 +202,9 @@ type DvBase
     int   wOT                 // 途中波: 直前に確定した反対側の極値足の time (いま追っている波の区間の始まり)
     bool  wEnd     = false    // 途中波: 独立した山 (トップ) / 谷 (ボトム) が確定した (監視終了)
     float wOX                 // DTB-9: 直前に確定した反対側の極値の実体価格 (wOT の足)
+    float wXW                 // DTB-12: 途中波の今の区間のヒゲ先の極値 (上昇中 = 高値の最高値 / 下降中 = 安値の最安値)
+    float lwk                 // DTB-12 (5分足の基準だけ): 左の山・谷の足のヒゲ先 (トップ = 高値 / ボトム = 安値)
+    bool  bOk      = true     // DTB-12: 左の実体端が終値で無効化されていない (ヒゲ先が有効なら実体側だけ無効でも監視を続ける)
     // DTB-9 (5分足の基準だけ): ダブルの価格比較
     float preX                // 左の Pivot 中央足の時点で確定していた直前の反対側の極値 (ボトム = 直前の山の実体上端 / トップ = 直前の谷の実体下端)
     float rvO                 // DTB-11 (5分足のダブルボトム): 陰線の接近足の始値 (反転の陽線はこの値を上回る終値が必要。陽線・同値の接近なら na)
@@ -233,6 +241,8 @@ var DvBase      dvLw  = DvBase.new(0, 0, 0, na, na, na, false)
 var array<bool> dvWvH = array.new_bool()     // その足の確定時に上昇波の山候補で、直前の谷から dvWaveD0 以上上げていた
 var array<bool> dvWvL = array.new_bool()     // その足の確定時に下降波の谷候補で、直前の山から dvWaveD0 以上下げていた
 var array<float> dvWvO = array.new_float()   // DTB-9: その足の確定時に保持していた直前の反対側の極値の実体価格
+var array<float> dvWkH = array.new_float()   // DTB-12: 5分窓と同じ並びの各足の高値 (左の山のヒゲ先)
+var array<float> dvWkL = array.new_float()   // DTB-12: 5分窓と同じ並びの各足の安値 (左の谷のヒゲ先)
 var array<DvTs>   dvTss   = array.new<DvTs>()     // 描画専用
 var array<DvDr>   dvDrs   = array.new<DvDr>()     // 描画専用 (dvBases と同じ並び)
 var array<DvDr>   dvDrQ   = array.new<DvDr>()     // 描画専用: 描画を保持している基準 (最後に描いた順)
@@ -349,22 +359,30 @@ f_inSeg(int a, int s, int e, int dur) =>
 //  下降中は上下逆。極値を更新した足では確定しないため、確定は極値足より後の足だけ・1 本の足から確定する山谷は最大 1 つ。
 //  基準と同じ側 (トップ = 山 / ボトム = 谷) が確定したとき、基準価格 ± buffer の許容帯の上下どちらかの外側にあり、現在の接近・ダブル成立済みの
 //  2 回目の接触をその波の区間に含まなければ、独立した途中波として wEnd を立てる
-f_wave(DvBase g, float h, float l, int t) =>
+//  DTB-12: hw / lw = その足のヒゲ先 (高値 / 安値。15分足の基準は実体端をそのまま渡す)。区間のヒゲ先の極値 (wXW) も追い、確定した極値の
+//  実体端とヒゲ先のどちらかが、有効な左の基準 (実体端 = bOk のとき / ヒゲ先 = lwk) の許容幅に入っていれば独立した途中波にしない
+f_near(DvBase g, float x, float wB) =>
+    not na(x) and ((g.bOk and math.abs(x - g.lvl) <= wB + EPS) or (not na(g.lwk) and math.abs(x - g.lwk) <= wB + EPS))
+
+f_wave(DvBase g, float h, float l, int t, float hw, float lw) =>
     float wD = g.tf == 0 ? dvWaveD0 : dvD1
     float wB  = g.tf == 0 ? dvB0 : dvB1
     int   dur = g.tf == 0 ? 300000 : 900000
     bool  cf  = false
     float cx  = na
+    float cxW = na
     int   cxT = na
     int   cxS = na
     if g.wUp
         if h >= g.wX
             g.wX  := h
             g.wXT := t
+            g.wXW := na(g.wXW) ? hw : math.max(g.wXW, hw)
         else if l <= g.wX - wD + EPS
             if g.side == -1
                 cf  := true
                 cx  := g.wX
+                cxW := g.wXW
                 cxT := g.wXT
                 cxS := g.wOT
             g.wOT := g.wXT
@@ -372,14 +390,19 @@ f_wave(DvBase g, float h, float l, int t) =>
             g.wUp := false
             g.wX  := l
             g.wXT := t
+            g.wXW := lw
+        else
+            g.wXW := na(g.wXW) ? hw : math.max(g.wXW, hw)
     else
         if l <= g.wX
             g.wX  := l
             g.wXT := t
+            g.wXW := na(g.wXW) ? lw : math.min(g.wXW, lw)
         else if h >= g.wX + wD - EPS
             if g.side == 1
                 cf  := true
                 cx  := g.wX
+                cxW := g.wXW
                 cxT := g.wXT
                 cxS := g.wOT
             g.wOT := g.wXT
@@ -387,8 +410,11 @@ f_wave(DvBase g, float h, float l, int t) =>
             g.wUp := true
             g.wX  := h
             g.wXT := t
+            g.wXW := hw
+        else
+            g.wXW := na(g.wXW) ? lw : math.min(g.wXW, lw)
     if cf
-        bool ind = cx < g.lvl - wB - EPS or cx > g.lvl + wB + EPS
+        bool ind = not f_near(g, cx, wB) and not f_near(g, cxW, wB)
         if ind and not f_inSeg(g.apT, cxS, cxT, dur) and not f_inSeg(g.dbT, cxS, cxT, dur)
             g.wEnd := true
     g.wEnd
@@ -399,16 +425,29 @@ f_waveInit(DvBase g, DvTf tw, DvTs tt, int pvT) =>
     g.wX  := g.lvl
     g.wXT := pvT
     g.wOT := na
-    int n = array.size(tw.hs)
+    g.wXW := na(g.lwk) ? g.lvl : g.lwk
+    bool w5 = g.tf == 0
+    int n = w5 ? math.min(array.size(tw.hs), array.size(dvWkH)) : array.size(tw.hs)
     if n > dvPiv + 1
         for j = dvPiv + 1 to n - 1
-            f_wave(g, array.get(tw.hs, j), array.get(tw.ls, j), array.get(tt.ts, j))
+            float hj = array.get(tw.hs, j)
+            float lj = array.get(tw.ls, j)
+            f_wave(g, hj, lj, array.get(tt.ts, j), w5 ? array.get(dvWkH, j) : hj, w5 ? array.get(dvWkL, j) : lj)
     g.wEnd
 
 // DTB-10: 5分足のダブルトップの最低離れ幅不足 (左の山 − 固定した中央の谷 / 右の山 − 固定した中央の谷 のどちらかが dvD0 未満、
 //  または未取得)。それ以外の基準は常に false
 f_dtNg(DvBase g) =>
     g.tf == 0 and g.side == -1 and not (g.lvl - g.tMid >= dvD0 - EPS and g.tPk - g.tMid >= dvD0 - EPS)
+
+// DTB-12: 5分足の接近。左 (有効な実体端 lvl / ヒゲ先 lwk) × 右 (この足の実体端 rb / ヒゲ先 rw) の 4 組のどれかの差が buffer 以内
+f_apHit(DvBase g, float rb, float rw, float bB) =>
+    bool hit = false
+    if g.bOk
+        hit := math.abs(rb - g.lvl) <= bB + EPS or math.abs(rw - g.lvl) <= bB + EPS
+    if not na(g.lwk)
+        hit := hit or math.abs(rb - g.lwk) <= bB + EPS or math.abs(rw - g.lwk) <= bB + EPS
+    hit
 
 bool acRun = is5mChart
 
@@ -452,15 +491,19 @@ if acRun
                         dvLw.wX  := nh
                         dvLw.wXT := nt
                     else
-                        f_wave(dvLw, nh, nl, nt)
+                        f_wave(dvLw, nh, nl, nt, high, low)
                     bool lwCand = dvLw.wXT == nt and not na(dvLw.wOT)
                     array.push(dvWvH, lwCand and dvLw.wUp)
                     array.push(dvWvL, lwCand and not dvLw.wUp)
                     array.push(dvWvO, dvLw.wOX)
+                    array.push(dvWkH, high)
+                    array.push(dvWkL, low)
                     while array.size(dvWvH) > array.size(tw.hs)
                         array.shift(dvWvH)
                         array.shift(dvWvL)
                         array.shift(dvWvO)
+                        array.shift(dvWkH)
+                        array.shift(dvWkL)
                 // DTB-7: 登録済みの 5分足 / 15分足の基準の途中波を、この時間足の確定足 1 本で更新する (足時刻ごとに 1 回。この後の新規登録は対象外)
                 if k <= 1
                     int nb = array.size(dvBases)
@@ -468,7 +511,7 @@ if acRun
                         for b = 0 to nb - 1
                             DvBase gw = array.get(dvBases, b)
                             if gw.tf == k
-                                f_wave(gw, nh, nl, nt)
+                                f_wave(gw, nh, nl, nt, k == 0 ? high : nh, k == 0 ? low : nl)
                 if array.size(tw.hs) == dvW
                     float mh = array.get(tw.hs, dvPiv)
                     float ml = array.get(tw.ls, dvPiv)
@@ -524,6 +567,7 @@ if acRun
                             if k == 0
                                 gh.preX := array.get(dvWvO, dvPiv)
                                 gh.midX := rMin
+                                gh.lwk  := array.get(dvWkH, dvPiv)     // DTB-12: 左の山の上ヒゲ先
                             // DTB-7: 5分・15分足は途中波を初期化。初期化の時点で独立した山が確定済みなら登録しない
                             if k <= 1
                                 f_waveInit(gh, tw, tt, pvT)
@@ -541,6 +585,7 @@ if acRun
                             if k == 0
                                 gl.preX := array.get(dvWvO, dvPiv)
                                 gl.midX := rMax
+                                gl.lwk  := array.get(dvWkL, dvPiv)     // DTB-12: 左の谷の下ヒゲ先
                             if k <= 1
                                 f_waveInit(gl, tw, tt, pvT)
                             if not gl.wEnd
@@ -576,12 +621,18 @@ if acRun
                         float gMx = g.tf == 0 ? dvMx0 : dvMx1
                         g.ext := top ? math.min(g.ext, pDst) : math.max(g.ext, pDst)
                         mxOut := gOn and (top ? g.lvl - g.ext > gMx + EPS : g.ext - g.lvl > gMx + EPS)
+                    // DTB-12: 5分足の基準は左の実体端とヒゲ先を別々に終値で無効化し、両方が無効になったら終了 (実体側だけなら監視を続ける)
+                    bool b5 = g.tf == 0 and not na(g.lwk)
+                    if b5 and g.bOk and (top ? close > g.lvl + bB + EPS : close < g.lvl - bB - EPS)
+                        g.bOk := false
+                    bool invOut = b5 ? (not g.bOk and (top ? close > g.lwk + bB + EPS : close < g.lwk - bB - EPS)) :
+                         (top ? close > g.lvl + bB + EPS : close < g.lvl - bB - EPS)
                     if mxOut
                         fin := true
                         if dsV and g.waiting
                             f_drStat(r, "最大離れ幅超過")
                     // ① 無効化 (終値が H + B を超える / L − B を下回る。ヒゲ・ちょうどは許容)。反転より優先
-                    else if top ? close > g.lvl + bB + EPS : close < g.lvl - bB - EPS
+                    else if invOut
                         fin := true
                         if dsV and g.waiting
                             f_drStat(r, "無効化")
@@ -614,8 +665,10 @@ if acRun
                                 g.waiting := false
                                 if dsV
                                     f_drStat(r, "期限切れ")
-                        else if g.away and g.cnt < 3 and (top ? pApp >= g.lvl - bB - EPS : pApp <= g.lvl + bB + EPS) and
-                             (not body or (top ? pApp <= g.lvl + bB + EPS : pApp >= g.lvl - bB - EPS))
+                        else if g.away and g.cnt < 3 and (b5 ? f_apHit(g, pApp, top ? high : low, bB) :
+                             (top ? pApp >= g.lvl - bB - EPS : pApp <= g.lvl + bB + EPS) and
+                             (not body or (top ? pApp <= g.lvl + bB + EPS : pApp >= g.lvl - bB - EPS)))
+                            //  DTB-12: 5分足の基準は 左 (有効な実体端 / ヒゲ先) × 右 (この足の実体端 / ヒゲ先) の 4 組のどれかの差が buffer 以内
                             // ③ 接近 (2 回目・3 回目)。接近足が陰線 (陽線) ならこの足で検知、違えば反転待ち
                             //  DTB-10: 5分足のダブルトップは、価格差判定を通った接近でその時点の midX を中央の谷 (tMid) に固定し、
                             //  接近足の実体上端を右の山 (tPk) の初期値にする。最低離れ幅は反転の陰線の確定時に判定 (② / この下)
