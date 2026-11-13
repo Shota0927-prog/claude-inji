@@ -2,7 +2,7 @@
 // © shota0927-prog
 //
 // ============================================================================
-//  SATS Short/Long Signal (15S)  —  サッツバンド 売り・買いタイミング検知の単体インジ (SSS-3)
+//  SATS Short/Long Signal (15S)  —  サッツバンド 売り・買いタイミング検知の単体インジ (SSS-5)
 //  15秒チャート専用。15秒・30秒・1分の「開始時点の帯崩れ」が同じ方向で順に揃ったら SELL / BUY の合図を出す。
 //  上位足の目線はこのインジの外で確認する。注文・SL / TP・アラートは無い (チャート上の検知表示のみ)。
 //  計算の基準は「SAT BAND Reconstruction Test」。f_satBand() は一字一句そのまま (tests/sats_src/f_satBand.txt)。
@@ -27,17 +27,33 @@
 //    BUY : P が赤 (-1)、N の開始時が背景なし (0)、ある線が P で -1 → N 開始で +1 かつその同じ線の開始価格 < open
 //    開始時点で決まり、足の途中で変わらない・取り消さない。
 //
+//  ■ 途中の STB 転換 (SSS-5。15秒 / 30秒 / 1分の各対象足。LINE1 / LINE2 は開始時判定だけ)
+//    ・対象足の間は、直前確定足からの値 (帯、STB 方向、直前 20本 / 9本の高値・安値、LINE1 / LINE2 の開始価格) を固定する。
+//    ・15秒足が確定するたびに、対象足の open からその時点までに確定した 15秒足の高値・安値を累積する
+//      (30秒・1分も、その時点までの 15秒足だけ。対象足の最終高値・安値は先読みしない)。
+//      累積高値 > 直前20本の高値 → STB 青、それ以外で累積安値 < 直前20本の安値 → 赤、どちらもなければ直前確定足の方向
+//      (上下両方を抜いたら高値側 = 青)。STB 価格 = 青なら min(累積安値, 直前9本の安値)、赤なら max(累積高値, 直前9本の高値)。
+//    ・前回の確認時点 (対象足の開始、または前の 15秒確定) から STB の色が変わったときだけ、今回確定した 15秒足の終値で
+//      固定の LINE1 / LINE2 と更新後の STB から帯を判定する:
+//        SELL: 直前確定足が青、STB 青 → 赤、帯は背景なし、赤 STB > 15秒終値
+//        BUY : 直前確定足が赤、STB 赤 → 青、帯は背景なし、青 STB < 15秒終値
+//      同じ方向・同じ対象足では最初の 1 回だけ。開始時に同方向が成立していれば、途中では再成立させない。
+//    ・成立時刻 = 転換を確認した 15秒足の確定時刻 time_close (開始判定の成立時刻は従来どおり対象足の開始時刻)。
+//
 //  ■ 順序 (方向ごとに独立。15秒 → 30秒 → 1分)
 //    t15 <= t30 <= t1m かつ t1m - t15 <= 待ち時間 (分・初期 5 分。ちょうど期限は有効。足数ではなく実時刻差)。
 //    ・直近の有効な 15秒イベントを記録。30秒イベントの時点で有効な 15秒があれば 2 件を「組」にする。組の後の新しい 15秒では
 //      組は変わらない。新しい 30秒イベントで有効な組ができた場合だけ組を更新する。
 //    ・1分イベントで有効な組を使ったら合図を 1 回出し、その方向の待機をリセットする。期限切れの記録は失効させる。
-//    ・同じ時刻は 15秒 → 30秒 → 1分 の順。SELL と BUY の記録は混ざらない。先行足の線が後で戻っても成立記録は有効。
+//    ・成立時刻の順に処理し、同じ時刻は 15秒 → 30秒 → 1分、同じ時間足で閉じる足 (途中 STB) と始まる足 (開始判定) が
+//      同時刻なら閉じる足が先。5分の期限も各イベントの成立時刻で判定する。SELL と BUY の記録は混ざらない。
+//      先行足の線が後で戻っても成立記録は有効。
 //
 //  ■ 取得
 //    15秒はチャート自身。30秒・1分は request.security(同じ銘柄, "30S" / "1", lookahead_on) で、要求先の時間足の
-//    [現在足の開始時刻・開始判定 (SELL / BUY の該当線)、直前足の開始時刻・開始判定] を受け取る。開始判定に使うのは
-//    その足の time / open と直前確定足の値だけ (新しい足の高値・安値・終値・出来高は使わない)。
+//    [現在足の開始時刻・開始判定 (SELL / BUY の該当線)・open・途中 STB 用の固定値、直前足の同じ組] を受け取る。
+//    要求先から使うのはその足の time / open と直前確定足の値だけ (要求先の足の高値・安値・終値・出来高は使わない。
+//    途中の高値・安値はチャートの確定した 15秒足から集計する)。
 //
 //  ■ 処理待ちの行 (SSS-3: 受信順ではなく足の開始時刻順)
 //    ・15秒足ごとに 1 行 (キー = 15秒チャートの time)。15秒の開始判定はその足で 1 回だけ保存する。
@@ -49,13 +65,19 @@
 //      行の中は各イベントの実際の開始時刻 (15秒 tr / 30秒 a30 / 1分 a60) の昇順、同時刻のときだけ 15秒 → 30秒 → 1分
 //      (処理不要の欄は除外、欠落の欄はイベントなし)。5分の期限と順序も各イベントの実際の開始時刻で判定する
 //      (データが届いた時刻は成立判定に使わない)。
+//    ・行には 15秒足の確定値 (time_close / 高値 / 安値 / 終値) も 1 回だけ記録する (確定の更新、取れなければ次の足の [1])。
+//      先頭行の開始イベント → (先頭行の 15秒確定による途中 STB + 次の行の開始イベント) を一緒に並べて処理する。
+//      このため 15秒確定の途中 STB は、同じ時刻に始まる次の 15秒足の開始判定と順序を合わせられるよう、
+//      次の 15秒足が始まって (その行の 30秒 / 1分欄が揃って) から処理する。
 //    ・欠落の確定 (照合の後、未着欄ごと): 取得した直前足の開始時刻が待っている開始時刻を厳密に超えた、または
 //      15秒チャートの time が待っている開始時刻から 3 分以上進んだ。欠落欄はイベントなしとして処理を再開し、
 //      確認表に時間足・開始時刻・理由を出す。3 分は取得待ちの上限 (売買の成立期限は別で初期 5 分)。
 //
 //  ■ 表示
 //    行・待機状態・印の予約は varip で持つ (リアルタイムの更新ごとのロールバックで戻らず、処理済みの行は再処理しない)。
-//    合図は条件が揃った更新で出し、label.new(xloc.bar_time) で 1分足の実際の開始時刻に SELL / BUY を 1 回描く。
+//    合図は条件が揃った更新で出し、label.new(xloc.bar_time) で SELL / BUY を 1 回描く。位置は、1分の開始判定で成立したら
+//    1分足の実際の開始時刻、1分の途中 STB で成立したら転換を確認した 15秒足。単独イベント表示も同じ位置で、ツールチップに
+//    途中 STB は対象足の開始時刻と 15秒足の確定時刻を出す。
 //    (リアルタイムの足の途中で描いたラベルは次の更新のロールバックで消えるため、予約した印はその足が確定するまで
 //    毎更新描き直す。確定後はそのまま残る。) ツールチップには 1分足の開始時刻と、リアルタイムで検知した場合はその検知時刻
 //    (timenow) を出す。履歴の再計算ではデータの遅れが無く、ライブ検知時刻は出さない。再読み込み後も印は 1分足の開始位置。
@@ -260,6 +282,7 @@ f_hms(int t) =>
     na(t) ? "-" : str.format_time(t, "HH:mm:ss", syminfo.timezone)
 
 // ---- 待機 (方向ごとに 1 つ。varip の int 配列: 0 w15T, 1 w15M, 2 p15T, 3 p15M, 4 p30T, 5 p30M) ----------------------------
+//  文字列配列 (0 直近15sの説明, 1 組の15sの説明, 2 組の30sの説明) はツールチップ用。成立判定には使わない。
 f_newSeq() =>
     array<int> a = array.new_int(6, na)
     array.set(a, 1, 0)
@@ -275,7 +298,7 @@ f_seqReset(array<int> s) =>
     array.set(s, 4, na)
     array.set(s, 5, 0)
 
-//  期限切れの失効 (t = 処理中のイベントの開始時刻)
+//  期限切れの失効 (t = 処理中のイベントの成立時刻)
 f_seqExpire(array<int> s, int t, int waitMs) =>
     int w15T = array.get(s, 0)
     int p15T = array.get(s, 2)
@@ -288,14 +311,15 @@ f_seqExpire(array<int> s, int t, int waitMs) =>
         array.set(s, 4, na)
         array.set(s, 5, 0)
 
-f_on15(array<int> s, int t, int m, int waitMs) =>
+f_on15(array<int> s, array<string> sx, int t, int m, int waitMs, string d) =>
     f_seqExpire(s, t, waitMs)
     if m > 0
         array.set(s, 0, t)
         array.set(s, 1, m)
+        array.set(sx, 0, d)
 
 //  30秒イベントの時点で有効な 15秒があれば組を作る / 更新する (無ければ組はそのまま)
-f_on30(array<int> s, int t, int m, int waitMs) =>
+f_on30(array<int> s, array<string> sx, int t, int m, int waitMs, string d) =>
     f_seqExpire(s, t, waitMs)
     int w15T = array.get(s, 0)
     if m > 0 and not na(w15T) and w15T <= t and t - w15T <= waitMs
@@ -303,38 +327,58 @@ f_on30(array<int> s, int t, int m, int waitMs) =>
         array.set(s, 3, array.get(s, 1))
         array.set(s, 4, t)
         array.set(s, 5, m)
+        array.set(sx, 1, array.get(sx, 0))
+        array.set(sx, 2, d)
 
 //  1分イベントで有効な組があれば合図のツールチップを返してリセット。無ければ ""。
 //  liveT = リアルタイムで検知したときの timenow (履歴の再計算では na)。
-f_on60(array<int> s, int t, int m, int waitMs, string dirName, int liveT) =>
+f_on60(array<int> s, array<string> sx, int t, int m, int waitMs, string dirName, string d, int liveT) =>
     f_seqExpire(s, t, waitMs)
     int p15T = array.get(s, 2)
     int p30T = array.get(s, 4)
     string r = ""
     if m > 0 and not na(p15T) and p15T <= p30T and p30T <= t and t - p15T <= waitMs
-        r := dirName + "\n15s " + f_lines(array.get(s, 3)) + " " + f_hms(p15T) + "\n30s " + f_lines(array.get(s, 5)) + " "
-             + f_hms(p30T) + "\n1m " + f_lines(m) + " " + f_hms(t) + "\n1分足の開始 " + f_hms(t)
+        r := dirName + "\n" + array.get(sx, 1) + "\n" + array.get(sx, 2) + "\n" + d
              + (na(liveT) ? "" : "\nライブ検知 " + f_hms(liveT) + (liveT - t >= 15000 ? " (遅れ " + str.tostring(math.floor((liveT - t) / 1000)) + "秒)" : ""))
         f_seqReset(s)
     r
 
+//  イベントの説明。開始判定: 「1m L2 09:01:00 (開始)」。途中 STB: 対象足の開始時刻と、転換を確認した 15秒足の確定時刻。
+f_desc(string tfn, int m, int t, bool mid, int tgt) =>
+    mid ? tfn + " " + f_lines(m) + " " + f_hms(t) + " (途中: 対象足の開始 " + f_hms(tgt) + " / 15秒確定 " + f_hms(t) + ")"
+         : tfn + " " + f_lines(m) + " " + f_hms(t) + " (開始)"
+
 // ---- 取得 (毎足・無条件) --------------------------------------------------------------------------------------------------
-//  その時間足の [現在足 time, SELL mask, BUY mask, 直前足 time, SELL mask, BUY mask, 現在足の開始帯]
-//  直前足の 3 つは、要求先の時間足の中で現在足の組全体を 1 本ずらした値。
+//  その時間足の現在足と直前足 (要求先の時間足の中で組全体を 1 本ずらした値) について
+//  [time, SELL mask, BUY mask, open, 直前確定足の帯, 直前確定足の STB 方向, LINE1 開始価格, LINE2 開始価格,
+//   直前20本の高値, 直前20本の安値, 直前9本の高値, 直前9本の安値] を返す。最後は現在足の開始帯 (表示用)。
 f_satsEvt() =>
     [t, o, okP, st, d1, d2, sd, l1s, l2s, d1s, d2s, hh20, ll20, hh9, ll9] = f_satsStart()
     [ms, mb, stS, sdS, sbS] = f_evt(o, okP, st, d1, d2, sd, l1s, l2s, d1s, d2s, hh20, ll20, hh9, ll9)
-    [t, ms, mb, t[1], ms[1], mb[1], stS]
+    float stP = okP ? st : na
+    float sdP = sd
+    [t, ms, mb, o, stP, sdP, l1s, l2s, hh20, ll20, hh9, ll9,
+         t[1], ms[1], mb[1], o[1], stP[1], sdP[1], l1s[1], l2s[1], hh20[1], ll20[1], hh9[1], ll9[1], stS]
 
-[t15, ms15, mb15, t15p, ms15p, mb15p, ss15] = f_satsEvt()
-[t30, ms30, mb30, t30p, ms30p, mb30p, ss30] = request.security(syminfo.tickerid, "30S", f_satsEvt(), lookahead = barmerge.lookahead_on)
-[t60, ms60, mb60, t60p, ms60p, mb60p, ss60] = request.security(syminfo.tickerid, "1",   f_satsEvt(), lookahead = barmerge.lookahead_on)
+[t15, ms15, mb15, o15, sp15, dp15, l1_15, l2_15, h20_15, w20_15, h9_15, w9_15,
+     t15p, ms15p, mb15p, o15p, sp15p, dp15p, l1_15p, l2_15p, h20_15p, w20_15p, h9_15p, w9_15p, ss15] = f_satsEvt()
+[t30, ms30, mb30, o30, sp30, dp30, l1_30, l2_30, h20_30, w20_30, h9_30, w9_30,
+     t30p, ms30p, mb30p, o30p, sp30p, dp30p, l1_30p, l2_30p, h20_30p, w20_30p, h9_30p, w9_30p, ss30] =
+     request.security(syminfo.tickerid, "30S", f_satsEvt(), lookahead = barmerge.lookahead_on)
+[t60, ms60, mb60, o60, sp60, dp60, l1_60, l2_60, h20_60, w20_60, h9_60, w9_60,
+     t60p, ms60p, mb60p, o60p, sp60p, dp60p, l1_60p, l2_60p, h20_60p, w20_60p, h9_60p, w9_60p, ss60] =
+     request.security(syminfo.tickerid, "1", f_satsEvt(), lookahead = barmerge.lookahead_on)
 
 bool chartOk = timeframe.in_seconds() == 15
 int  need30T = time("30S")
 int  need60T = time("1")
 bool new30   = not na(need30T) and need30T != nz(need30T[1], -1)
 bool new60   = not na(need60T) and need60T != nz(need60T[1], -1)
+//  直前の 15秒足の確定値 (リアルタイムで確定の更新を受け取れなかった行の補完用)
+int   tc1 = time_close[1]
+float h1  = high[1]
+float lw1 = low[1]
+float c1  = close[1]
 
 // ---- 処理待ちの行 (varip。1 行 = 1 本の 15秒足) -----------------------------------------------------------------------------
 //  欄の状態
@@ -342,22 +386,42 @@ int C_NONE = 0   // 処理不要
 int C_WAIT = 1   // 未着
 int C_RCV  = 2   // 受信済み
 int C_LOST = 3   // 欠落
-varip array<int> rT   = array.new_int()    // 15秒足の time (行のキー)
-varip array<int> rS15 = array.new_int()
-varip array<int> rB15 = array.new_int()
-varip array<int> rT30 = array.new_int()    // 取得すべき 30秒足の開始時刻
-varip array<int> rC30 = array.new_int()    // 30秒欄の状態
-varip array<int> rS30 = array.new_int()
-varip array<int> rB30 = array.new_int()
-varip array<int> rT60 = array.new_int()
-varip array<int> rC60 = array.new_int()
-varip array<int> rS60 = array.new_int()
-varip array<int> rB60 = array.new_int()
+int waitMs = waitMin * 60000
+int PK     = 9   // 固定値の組: 0 open, 1 直前確定足の帯, 2 直前確定足の STB 方向, 3 LINE1 開始, 4 LINE2 開始, 5 hh20, 6 ll20, 7 hh9, 8 ll9
+varip array<int>   rT   = array.new_int()    // 15秒足の time (行のキー)
+varip array<int>   rS15 = array.new_int()
+varip array<int>   rB15 = array.new_int()
+varip array<float> rP15 = array.new_float()  // 15秒足の固定値 (PK 個ずつ)
+varip array<int>   rT30 = array.new_int()    // 取得すべき 30秒足の開始時刻
+varip array<int>   rC30 = array.new_int()    // 30秒欄の状態
+varip array<int>   rS30 = array.new_int()
+varip array<int>   rB30 = array.new_int()
+varip array<float> rP30 = array.new_float()
+varip array<int>   rT60 = array.new_int()
+varip array<int>   rC60 = array.new_int()
+varip array<int>   rS60 = array.new_int()
+varip array<int>   rB60 = array.new_int()
+varip array<float> rP60 = array.new_float()
+varip array<int>   rG30 = array.new_int()    // この 15秒足を含む 30秒足の開始時刻 (time("30S"))
+varip array<int>   rG60 = array.new_int()    // この 15秒足を含む 1分足の開始時刻 (time("1"))
+varip array<int>   rCl  = array.new_int()    // 1 = 確定値を記録済み
+varip array<int>   rTc  = array.new_int()    // 15秒足の time_close
+varip array<float> rH   = array.new_float()
+varip array<float> rL   = array.new_float()
+varip array<float> rC   = array.new_float()
+varip array<int>   rSD  = array.new_int()    // 1 = この行の開始イベントを処理済み
 varip int    lastRowT = na
-varip array<int> sqS = f_newSeq()
-varip array<int> sqB = f_newSeq()
+varip array<int>    sqS = f_newSeq()
+varip array<int>    sqB = f_newSeq()
+varip array<string> sxS = array.new_string(3, "")
+varip array<string> sxB = array.new_string(3, "")
 varip int    lostN    = 0
 varip string lostTxt  = ""
+//  処理中の対象足 (0 = 15秒, 1 = 30秒, 2 = 1分。CX 個ずつ):
+//    0 開始時刻, 1 有効 (1/0), 2 直前確定足の帯, 3 直前確定足の STB 方向, 4 LINE1 開始, 5 LINE2 開始, 6 hh20, 7 ll20,
+//    8 hh9, 9 ll9, 10 前回確認時点の STB 方向, 11 累積高値, 12 累積安値, 13 SELL 成立済み, 14 BUY 成立済み
+int CX = 15
+varip array<float> cx = array.new_float(45, na)
 //  印の予約 (描いた足が確定するまで毎更新描き直す)
 varip array<int>    mkBar = array.new_int()     // 予約した 15秒足の time
 varip array<int>    mkX   = array.new_int()     // 描く位置 (xloc.bar_time)
@@ -370,13 +434,37 @@ f_mark(int x, int k, string tip) =>
     array.push(mkK, k)
     array.push(mkTip, tip)
 
+f_pushPack(array<float> pk, float o, float stP, float sdP, float l1s, float l2s, float hh20, float ll20, float hh9, float ll9) =>
+    array.push(pk, o)
+    array.push(pk, stP)
+    array.push(pk, sdP)
+    array.push(pk, l1s)
+    array.push(pk, l2s)
+    array.push(pk, hh20)
+    array.push(pk, ll20)
+    array.push(pk, hh9)
+    array.push(pk, ll9)
+
+f_setPack(array<float> pk, int i, float o, float stP, float sdP, float l1s, float l2s, float hh20, float ll20, float hh9, float ll9) =>
+    int b = i * PK
+    array.set(pk, b, o)
+    array.set(pk, b + 1, stP)
+    array.set(pk, b + 2, sdP)
+    array.set(pk, b + 3, l1s)
+    array.set(pk, b + 4, l2s)
+    array.set(pk, b + 5, hh20)
+    array.set(pk, b + 6, ll20)
+    array.set(pk, b + 7, hh9)
+    array.set(pk, b + 8, ll9)
+
 //  時間足 tf (30 / 60) の開始時刻 t のデータを、一致する未着欄にだけ入れる
-f_recv(int tf, int t, int ms, int mb) =>
+f_recv(int tf, int t, int ms, int mb, float o, float stP, float sdP, float l1s, float l2s, float hh20, float ll20, float hh9, float ll9) =>
     if not na(t)
-        array<int> tt = tf == 30 ? rT30 : rT60
-        array<int> cc = tf == 30 ? rC30 : rC60
-        array<int> ss = tf == 30 ? rS30 : rS60
-        array<int> bb = tf == 30 ? rB30 : rB60
+        array<int>   tt = tf == 30 ? rT30 : rT60
+        array<int>   cc = tf == 30 ? rC30 : rC60
+        array<int>   ss = tf == 30 ? rS30 : rS60
+        array<int>   bb = tf == 30 ? rB30 : rB60
+        array<float> pp = tf == 30 ? rP30 : rP60
         int n = array.size(tt)
         for i = 0 to n - 1
             if i >= n
@@ -385,6 +473,7 @@ f_recv(int tf, int t, int ms, int mb) =>
                 array.set(cc, i, C_RCV)
                 array.set(ss, i, nz(ms))
                 array.set(bb, i, nz(mb))
+                f_setPack(pp, i, o, stP, sdP, l1s, l2s, hh20, ll20, hh9, ll9)
 
 //  未着欄の欠落判定 (現在足・直前足の照合の後)
 f_lost(int tf, int prevT) =>
@@ -419,99 +508,240 @@ f_rowPop() =>
     array.shift(rC60)
     array.shift(rS60)
     array.shift(rB60)
+    array.shift(rG30)
+    array.shift(rG60)
+    array.shift(rCl)
+    array.shift(rTc)
+    array.shift(rH)
+    array.shift(rL)
+    array.shift(rC)
+    array.shift(rSD)
+    for k = 1 to PK
+        array.shift(rP15)
+        array.shift(rP30)
+        array.shift(rP60)
 
-f_evtTip(string tfn, int t, int ms, int mb, int liveT) =>
-    (ms > 0 ? "S " + tfn + " " + f_lines(ms) : "") + (ms > 0 and mb > 0 ? "\n" : "") + (mb > 0 ? "B " + tfn + " " + f_lines(mb) : "")
-     + "\n開始 " + f_hms(t) + (na(liveT) ? "" : "\nライブ検知 " + f_hms(liveT))
+f_evtTip(string d, int ms, int mb, string tfn, int t, bool mid, int tgt, int liveT) =>
+    (ms > 0 ? "S " + f_desc(tfn, ms, t, mid, tgt) : "") + (ms > 0 and mb > 0 ? "\n" : "")
+     + (mb > 0 ? "B " + f_desc(tfn, mb, t, mid, tgt) : "") + (na(liveT) ? "" : "\nライブ検知 " + f_hms(liveT))
 
-int waitMs = waitMin * 60000
+// ---- 対象足の開始と途中 STB ------------------------------------------------------------------------------------------------
+//  対象足の開始: 直前確定足からの固定値をその対象足の間保持し、STB の累積高値・安値を open から始める。
+//  ok = false (欠落) ならその対象足の途中 STB は判定しない。開始時に同方向が成立していれば、その方向は途中で再成立させない。
+f_ctxStart(int i, int t, array<float> pk, int j, bool ok, int ms, int mb) =>
+    int b = i * CX
+    int pb = j * PK
+    bool okC = ok and not na(array.get(pk, pb))
+    array.set(cx, b, t)
+    array.set(cx, b + 1, okC ? 1 : 0)
+    if okC
+        float o = array.get(pk, pb)
+        for k = 0 to 7
+            array.set(cx, b + 2 + k, array.get(pk, pb + 1 + k))
+        float hh20 = array.get(pk, pb + 5)
+        float ll20 = array.get(pk, pb + 6)
+        float sdS = array.get(pk, pb + 2)
+        if not na(hh20) and not na(ll20) and not na(o)
+            if o > hh20
+                sdS := 1
+            else if o < ll20
+                sdS := -1
+        array.set(cx, b + 10, sdS)
+        array.set(cx, b + 11, o)
+        array.set(cx, b + 12, o)
+        array.set(cx, b + 13, ms > 0 ? 1 : 0)
+        array.set(cx, b + 14, mb > 0 ? 1 : 0)
+
+//  対象足の途中で 15秒足が確定したとき: 累積高値・安値で STB の方向と価格を更新し、色が変わったときだけ判定する。
+//  価格は今回確定した 15秒足の終値 c。LINE1 / LINE2 は対象足の開始時の値で固定。成立は STB (mask 4) のみ。
+f_ctxClose(int i, int tgt, float h, float l, float c) =>
+    int b = i * CX
+    int ms = 0
+    int mb = 0
+    if array.get(cx, b + 1) == 1 and array.get(cx, b) == tgt and not na(h) and not na(l) and not na(c)
+        float cumH = math.max(array.get(cx, b + 11), h)
+        float cumL = math.min(array.get(cx, b + 12), l)
+        array.set(cx, b + 11, cumH)
+        array.set(cx, b + 12, cumL)
+        float stP    = array.get(cx, b + 2)
+        float sdP    = array.get(cx, b + 3)
+        float l1s    = array.get(cx, b + 4)
+        float l2s    = array.get(cx, b + 5)
+        float hh20   = array.get(cx, b + 6)
+        float ll20   = array.get(cx, b + 7)
+        float hh9    = array.get(cx, b + 8)
+        float ll9    = array.get(cx, b + 9)
+        float sdLast = array.get(cx, b + 10)
+        // 高値側の突破を先に判定 (上下両方を抜いた場合は青)。どちらもなければ直前確定足の STB 方向
+        float sd = sdP
+        if not na(hh20) and not na(ll20)
+            if cumH > hh20
+                sd := 1
+            else if cumL < ll20
+                sd := -1
+        float stb = sd == 1 ? (na(ll9) ? na : math.min(cumL, ll9)) : (na(hh9) ? na : math.max(cumH, hh9))
+        if not na(sdLast) and sd != sdLast and not na(stb) and not na(l1s) and not na(l2s) and not na(stP)
+            int band = c > l1s and c > l2s and c > stb ? 1 : c < l1s and c < l2s and c < stb ? -1 : 0
+            if band == 0 and stP == 1 and sdLast == 1 and sd == -1 and stb > c and array.get(cx, b + 13) == 0
+                ms := 4
+                array.set(cx, b + 13, 1)
+            if band == 0 and stP == -1 and sdLast == -1 and sd == 1 and stb < c and array.get(cx, b + 14) == 0
+                mb := 4
+                array.set(cx, b + 14, 1)
+        array.set(cx, b + 10, sd)
+    [ms, mb]
+
+//  1 つのイベントを方向別の待機へ渡す。r = 0 15秒 / 1 30秒 / 2 1分。mid = 途中 STB。
+//  sigX = SELL / BUY の印の位置 (開始判定の 1分 = 1分足の開始、途中 STB = 転換を確認した 15秒足)。evX = 単独イベントの位置。
+f_apply(int r, int t, int ms, int mb, bool mid, int tgt, int sigX, int evX, int liveT) =>
+    string tfn = r == 0 ? "15s" : r == 1 ? "30s" : "1m"
+    string dS = f_desc(tfn, ms, t, mid, tgt)
+    string dB = f_desc(tfn, mb, t, mid, tgt)
+    if r == 0
+        f_on15(sqS, sxS, t, ms, waitMs, dS)
+        f_on15(sqB, sxB, t, mb, waitMs, dB)
+    else if r == 1
+        f_on30(sqS, sxS, t, ms, waitMs, dS)
+        f_on30(sqB, sxB, t, mb, waitMs, dB)
+    else
+        string tail = mid ? "\n対象1分足の開始 " + f_hms(tgt) + " / 転換を確認した 15秒足の確定 " + f_hms(t) : "\n1分足の開始 " + f_hms(t)
+        string sigS = f_on60(sqS, sxS, t, ms, waitMs, "SELL", dS + tail, liveT)
+        string sigB = f_on60(sqB, sxB, t, mb, waitMs, "BUY", dB + tail, liveT)
+        if sigS != ""
+            f_mark(sigX, 1, sigS)
+        if sigB != ""
+            f_mark(sigX, -1, sigB)
+    if showEvt and (ms > 0 or mb > 0)
+        f_mark(evX, 0, f_evtTip("", ms, mb, tfn, t, mid, tgt, liveT))
+
+//  イベントの束を (成立時刻, 時間足 15→30→1分, 閉じた足が先) の順に処理する。
+//  closes = 先頭行 (0) の 15秒確定による途中 STB を含める。sr = 開始イベントを処理する行 (0 または 1)。
+f_batch(bool closes, int sr, int liveT) =>
+    array<int> eT = array.new_int()
+    array<int> eR = array.new_int()
+    array<int> eS = array.new_int()     // 0 = 閉じた足 (途中 STB), 1 = 始まる足 (開始判定)
+    if closes
+        int tc = array.get(rTc, 0)
+        for r = 0 to 2
+            array.push(eT, tc)
+            array.push(eR, r)
+            array.push(eS, 0)
+    array.push(eT, array.get(rT, sr))
+    array.push(eR, 0)
+    array.push(eS, 1)
+    if array.get(rC30, sr) != C_NONE
+        array.push(eT, array.get(rT30, sr))
+        array.push(eR, 1)
+        array.push(eS, 1)
+    if array.get(rC60, sr) != C_NONE
+        array.push(eT, array.get(rT60, sr))
+        array.push(eR, 2)
+        array.push(eS, 1)
+    int n = array.size(eT)
+    array<bool> used = array.new_bool(n, false)
+    for k = 0 to n - 1
+        int p = -1
+        for i = 0 to n - 1
+            if not array.get(used, i)
+                if p < 0
+                    p := i
+                else
+                    int ti = array.get(eT, i)
+                    int tp = array.get(eT, p)
+                    int ri = array.get(eR, i)
+                    int rp = array.get(eR, p)
+                    if ti < tp or (ti == tp and (ri < rp or (ri == rp and array.get(eS, i) < array.get(eS, p))))
+                        p := i
+        array.set(used, p, true)
+        int t = array.get(eT, p)
+        int r = array.get(eR, p)
+        if array.get(eS, p) == 0
+            // 途中 STB (先頭行の 15秒足の確定)
+            int tgt = r == 0 ? array.get(rT, 0) : r == 1 ? array.get(rG30, 0) : array.get(rG60, 0)
+            [msC, mbC] = f_ctxClose(r, tgt, array.get(rH, 0), array.get(rL, 0), array.get(rC, 0))
+            f_apply(r, t, msC, mbC, true, tgt, array.get(rT, 0), array.get(rT, 0), liveT)
+        else
+            // 開始判定 (行 sr)
+            int rowT = array.get(rT, sr)
+            if r == 0
+                int ms0 = array.get(rS15, sr)
+                int mb0 = array.get(rB15, sr)
+                f_ctxStart(0, t, rP15, sr, true, ms0, mb0)
+                f_apply(0, t, ms0, mb0, false, t, rowT, rowT, liveT)
+            else
+                int cst = r == 1 ? array.get(rC30, sr) : array.get(rC60, sr)
+                int msH = cst == C_RCV ? (r == 1 ? array.get(rS30, sr) : array.get(rS60, sr)) : 0
+                int mbH = cst == C_RCV ? (r == 1 ? array.get(rB30, sr) : array.get(rB60, sr)) : 0
+                f_ctxStart(r, t, r == 1 ? rP30 : rP60, sr, cst == C_RCV, msH, mbH)
+                f_apply(r, t, msH, mbH, false, t, t, rowT, liveT)
+    array.set(rSD, sr, 1)
 
 if chartOk
     int liveT = barstate.isrealtime ? timenow : na
-    // 1. 行の追加 (15秒足の time ごとに 1 回だけ)
+    // 1. 行の追加 (15秒足の time ごとに 1 回だけ)。前の行が確定値を受け取っていなければ [1] の確定値で補う
     if na(lastRowT) or time != lastRowT
+        int nr = array.size(rT)
+        if nr > 0 and array.get(rCl, nr - 1) == 0
+            array.set(rCl, nr - 1, 1)
+            array.set(rTc, nr - 1, tc1)
+            array.set(rH, nr - 1, h1)
+            array.set(rL, nr - 1, lw1)
+            array.set(rC, nr - 1, c1)
         lastRowT := time
         array.push(rT, time)
         array.push(rS15, ms15)
         array.push(rB15, mb15)
+        f_pushPack(rP15, o15, sp15, dp15, l1_15, l2_15, h20_15, w20_15, h9_15, w9_15)
         array.push(rT30, new30 ? need30T : na)
         array.push(rC30, new30 ? C_WAIT : C_NONE)
         array.push(rS30, 0)
         array.push(rB30, 0)
+        f_pushPack(rP30, na, na, na, na, na, na, na, na, na)
         array.push(rT60, new60 ? need60T : na)
         array.push(rC60, new60 ? C_WAIT : C_NONE)
         array.push(rS60, 0)
         array.push(rB60, 0)
+        f_pushPack(rP60, na, na, na, na, na, na, na, na, na)
+        array.push(rG30, need30T)
+        array.push(rG60, need60T)
+        array.push(rCl, 0)
+        array.push(rTc, na)
+        array.push(rH, na)
+        array.push(rL, na)
+        array.push(rC, na)
+        array.push(rSD, 0)
     // 2. 現在足・直前足の照合 (一致する未着欄だけ。受信済み・欠落は上書きしない)
-    f_recv(30, t30,  ms30,  mb30)
-    f_recv(30, t30p, ms30p, mb30p)
-    f_recv(60, t60,  ms60,  mb60)
-    f_recv(60, t60p, ms60p, mb60p)
+    f_recv(30, t30,  ms30,  mb30,  o30,  sp30,  dp30,  l1_30,  l2_30,  h20_30,  w20_30,  h9_30,  w9_30)
+    f_recv(30, t30p, ms30p, mb30p, o30p, sp30p, dp30p, l1_30p, l2_30p, h20_30p, w20_30p, h9_30p, w9_30p)
+    f_recv(60, t60,  ms60,  mb60,  o60,  sp60,  dp60,  l1_60,  l2_60,  h20_60,  w20_60,  h9_60,  w9_60)
+    f_recv(60, t60p, ms60p, mb60p, o60p, sp60p, dp60p, l1_60p, l2_60p, h20_60p, w20_60p, h9_60p, w9_60p)
     // 3. 欠落判定
     [n30, x30] = f_lost(30, t30p)
     [n60, x60] = f_lost(60, t60p)
     if n30 + n60 > 0
         lostN   += n30 + n60
         lostTxt := x60 != "" ? x60 : x30
-    // 4. 古い行から処理 (先頭に未着があれば止める)。行の中は実際の開始時刻の昇順、同時刻のときだけ 15秒 → 30秒 → 1分
+    // 4. この 15秒足が確定したら確定値を記録 (途中 STB 用。1 行 1 回)
+    int nl = array.size(rT)
+    if barstate.isconfirmed and nl > 0 and array.get(rT, nl - 1) == time and array.get(rCl, nl - 1) == 0
+        array.set(rCl, nl - 1, 1)
+        array.set(rTc, nl - 1, time_close)
+        array.set(rH, nl - 1, high)
+        array.set(rL, nl - 1, low)
+        array.set(rC, nl - 1, close)
+    // 5. 古い行から処理。先頭行の開始イベント → (先頭行の確定 + 次の行の開始イベント) の順。
+    //    先頭行の 15秒確定の途中 STB は、同じ時刻に始まる次の行の開始イベントと順序を合わせるため、次の行が来てから処理する。
     while array.size(rT) > 0
-        int c30 = array.get(rC30, 0)
-        int c60 = array.get(rC60, 0)
-        if c30 == C_WAIT or c60 == C_WAIT
-            break
-        int tr  = array.get(rT, 0)
-        int a30 = array.get(rT30, 0)
-        int a60 = array.get(rT60, 0)
-        int s15 = array.get(rS15, 0)
-        int b15 = array.get(rB15, 0)
-        int s30 = c30 == C_RCV ? array.get(rS30, 0) : 0
-        int b30 = c30 == C_RCV ? array.get(rB30, 0) : 0
-        int s60 = c60 == C_RCV ? array.get(rS60, 0) : 0
-        int b60 = c60 == C_RCV ? array.get(rB60, 0) : 0
-        f_rowPop()
-        // 行の中のイベントを実際の開始時刻の昇順で処理する (15秒 = tr、30秒 = a30、1分 = a60)。同時刻のときだけ
-        // 15秒 → 30秒 → 1分。処理不要の欄は除外、欠落の欄はイベントなし (mask 0) として処理する。
-        // 期限判定は f_on15 / f_on30 / f_on60 に渡す各イベントの開始時刻で行う。
-        bool left15 = true
-        bool left30 = c30 != C_NONE
-        bool left60 = c60 != C_NONE
-        for k = 0 to 2
-            // 未処理の中で開始時刻が最も早いもの (同時刻は短い足を優先: 比較は厳密な < で、15 → 30 → 1分 の順に見る)
-            int pick = -1
-            int pickT = na
-            if left15
-                pick  := 0
-                pickT := tr
-            if left30 and (pick < 0 or a30 < pickT)
-                pick  := 1
-                pickT := a30
-            if left60 and (pick < 0 or a60 < pickT)
-                pick  := 2
-                pickT := a60
-            if pick < 0
+        if array.get(rSD, 0) == 0
+            if array.get(rC30, 0) == C_WAIT or array.get(rC60, 0) == C_WAIT
                 break
-            if pick == 0
-                left15 := false
-                f_on15(sqS, tr, s15, waitMs)
-                f_on15(sqB, tr, b15, waitMs)
-                if showEvt and (s15 > 0 or b15 > 0)
-                    f_mark(tr, 0, f_evtTip("15s", tr, s15, b15, liveT))
-            else if pick == 1
-                left30 := false
-                f_on30(sqS, a30, s30, waitMs)
-                f_on30(sqB, a30, b30, waitMs)
-                if showEvt and (s30 > 0 or b30 > 0)
-                    f_mark(tr, 0, f_evtTip("30s", a30, s30, b30, liveT))
-            else
-                left60 := false
-                string sigS = f_on60(sqS, a60, s60, waitMs, "SELL", liveT)
-                string sigB = f_on60(sqB, a60, b60, waitMs, "BUY", liveT)
-                if sigS != ""
-                    f_mark(a60, 1, sigS)
-                if sigB != ""
-                    f_mark(a60, -1, sigB)
-                if showEvt and (s60 > 0 or b60 > 0)
-                    f_mark(tr, 0, f_evtTip("1m", a60, s60, b60, liveT))
+            f_batch(false, 0, liveT)
+        if array.get(rCl, 0) == 0 or array.size(rT) < 2
+            break
+        if array.get(rC30, 1) == C_WAIT or array.get(rC60, 1) == C_WAIT
+            break
+        f_batch(true, 1, liveT)
+        f_rowPop()
 
 // ---- 印の描画 (予約した足が確定するまで毎更新描き直す。前の足で予約した分は確定済みなので外す) ----------------------------
 while array.size(mkBar) > 0 and array.get(mkBar, 0) < time
