@@ -325,6 +325,64 @@ def sigs(rows, **kw):
     return [((a - t0) // S15, d, tt) for (a, d, tt, _, _) in sig]
 
 
+# ---- the Pine row-processing code itself, run through the mechanical translator of tests/acc_pine.py ------------------------
+def pine_rows_runner(src):
+    """Transpile SatsShortSignal.pine from f_lines() to the start of the '取得' section and from '処理待ちの行' to '印の描画'
+    (wait-state helpers, varip rows, matching, lost check, row processing). Returns run(updates, live) -> (log, marks), where
+    log = [(tf, start_t, chart_t)] in the order Pine calls f_on15 / f_on30 / f_on60, marks = [(x, kind, tooltip)]."""
+    import acc_pine as ap
+    a = src.index("f_lines(int m) =>")
+    b = src.index("// ---- 取得 (毎足")
+    c = src.index("// ---- 処理待ちの行")
+    d = src.index("// ---- 印の描画")
+    py = ap.Translator().translate(ap.logical_lines(src[a:b] + src[c:d]))
+    for f, tag in (("f_on15", 15), ("f_on30", 30), ("f_on60", 60)):
+        py = py.replace(f"def {f}(", f"def _orig_{f}(", 1)
+        py = f"def {f}(*a):\n    LOG.append(({tag}, a[1], time))\n    return _orig_{f}(*a)\n" + py
+    code = compile(py, "SatsShortSignal.pine<rows>", "exec")
+
+    class _NoBroker:
+        def __getattr__(self, k):
+            return lambda *a, **kw: None
+
+    def run(updates, live=False):
+        env = ap.make_env(_NoBroker(), [])
+        env.update(_VARS=set(), _VARIPS=set(), LOG=[], syminfo__timezone="UTC", waitMin=5, showEvt=False, chartOk=True,
+                   timeframe__in_seconds=lambda *x: 15, array__new_string=lambda n=0, v=None: [v] * n,
+                   str__format_time=lambda t, f, tz: f.replace("HH", "%02d" % (t // 3600_000 % 24))
+                   .replace("mm", "%02d" % (t // 60_000 % 60)).replace("ss", "%02d" % (t // 1000 % 60)))
+        first = True
+        for u in updates:
+            env.update(__first__=first, time=u["t"], barstate__isrealtime=live, timenow=u.get("now", u["t"]),
+                       ms15=u["e15"][0], mb15=u["e15"][1],
+                       new30=u.get("need30") is not None, need30T=u.get("need30"),
+                       new60=u.get("need60") is not None, need60T=u.get("need60"))
+            for tf in (30, 60):
+                r = u.get(f"r{tf}") or (None, 0, 0, None, 0, 0)
+                env.update({f"t{tf}": r[0], f"ms{tf}": r[1], f"mb{tf}": r[2], f"t{tf}p": r[3], f"ms{tf}p": r[4], f"mb{tf}p": r[5]})
+            exec(code, env)
+            first = False
+        marks = [(x, k, tip) for x, k, tip in zip(env["mkX"], env["mkK"], env["mkTip"])]
+        return env["LOG"], marks
+    return run
+
+
+def gap_case(d):
+    """SELL ('S') / BUY ('B') regression series: 15s 10:00:00 + 30s 10:00:30 pair, new 15s 10:00:45, next observed 15s bar
+    10:01:45 whose row holds the 1m 10:01:00 and the 30s 10:01:30 (all same direction)."""
+    T = 10 * 3600_000
+    m = (2, 0) if d == "S" else (0, 2)
+    z = (0, 0)
+    u = []
+    u.append(dict(t=T, e15=m, need30=T, need60=T, r30=(T, 0, 0, T - 30_000, 0, 0), r60=(T, 0, 0, T - M, 0, 0)))
+    u.append(dict(t=T + 15_000, e15=z, r30=(T, 0, 0, T - 30_000, 0, 0), r60=(T, 0, 0, T - M, 0, 0)))
+    u.append(dict(t=T + 30_000, e15=z, need30=T + 30_000, r30=(T + 30_000, *m, T, 0, 0), r60=(T, 0, 0, T - M, 0, 0)))
+    u.append(dict(t=T + 45_000, e15=m, r30=(T + 30_000, *m, T, 0, 0), r60=(T, 0, 0, T - M, 0, 0)))
+    u.append(dict(t=T + 105_000, e15=z, need30=T + 90_000, need60=T + M,
+                  r30=(T + 90_000, *m, T + 30_000, *m), r60=(T + M, *m, T, 0, 0)))
+    return T, u
+
+
 RESULTS = []
 
 
@@ -537,6 +595,43 @@ def main():
     sg, lost = chart_run(rows)
     check("several rows released by one update (10:00:45 brings 30s 10:00:00 / 10:00:30 and 1m 10:00:00) -> both the SELL and the BUY marks, at the 1m start",
           sorted(proj(sg)) == [(T1 + M, "BUY", (T1, T1 + 30_000, T1 + M)), (T1 + M, "SELL", (T1, T1, T1 + M))] and not lost)
+
+    # ---- 4e. SSS-4: events inside one row in start-time order (Pine code itself via tests/acc_pine.py) ---------------------
+    import subprocess
+    old_src = subprocess.run(["git", "-C", ROOT, "show", "6b5e516:SatsShortSignal.pine"], capture_output=True, text=True).stdout
+    run_new = pine_rows_runner(pine)
+    run_old = pine_rows_runner(old_src) if old_src else None
+    for d, nm in (("S", "SELL"), ("B", "BUY")):
+        T, ups = gap_case(d)
+        log, marks = run_new(ups)
+        last = [(tf, t - T) for (tf, t, ct) in log if ct == T + 105_000]
+        sig = [(x - T, k, tip.split(chr(10))[1:4]) for (x, k, tip) in marks if k in (1, -1)]
+        k = 1 if d == "S" else -1
+        print(f"   Pine order on the 10:01:45 row ({nm}): {last}")
+        check(f"SSS-4 ({nm}): Pine processes the 10:01:45 row as 1m 10:01:00 -> 30s 10:01:30 -> 15s 10:01:45 (x2: SELL+BUY waits)",
+              last == [(60, 60_000), (60, 60_000), (30, 90_000), (30, 90_000), (15, 105_000), (15, 105_000)])
+        check(f"SSS-4 ({nm}): one {nm} mark at 10:01:00 from the original pair 10:00:00 / 10:00:30",
+              [(x, kk) for (x, kk, _) in sig] == [(60_000, k)] and sig[0][2] == ["15s L2 10:00:00", "30s L2 10:00:30", "1m L2 10:01:00"])
+        sg, _ = chart_run(ups)
+        check(f"SSS-4 ({nm}): Python model agrees (same mark and pair)",
+              [(x[0] - T, x[1], tuple(t - T for t in x[2])) for x in sg] == [(60_000, nm, (0, 30_000, 60_000))])
+        if run_old:
+            log_o, marks_o = run_old(ups)
+            last_o = [(tf, t - T) for (tf, t, ct) in log_o if ct == T + 105_000]
+            print(f"   6b5e516 order on that row ({nm}): {last_o}  marks: {[(x - T, kk) for (x, kk, _) in marks_o if kk in (1, -1)]}")
+            check(f"SSS-4 ({nm}): regression reproduced on 6b5e516 (30s 10:01:30 before 1m 10:01:00, no mark)",
+                  last_o[:2] == [(30, 90_000), (30, 90_000)] and not [m_ for m_ in marks_o if m_[1] in (1, -1)])
+    # the translated Pine rows also reproduce the delivery cases above
+    for nm, ups in (("case 1", build_rows(12, {T1: "S", T1 + 45_000: "S"}, {T1 + 30_000: "S"}, {T1 + M: "S"}, T1,
+                                         delay30={T1 + 30_000: 15_000})),
+                    ("case 2", build_rows(12, {T1: "B"}, {T1: "B"}, {T1: "B"}, T1, delay30={T1: 30_000})),
+                    ("case 3", build_rows(30, {T1: "S"}, {T1 + 2 * M: "S"}, {T1 + 5 * M: "S"}, T1, delay60={T1 + 5 * M: 45_000})),
+                    ("lost", build_rows(30, {T1: "S", T1 + 2 * M: "S"}, {T1 + 30_000: "S", T1 + 2 * M + 30_000: "S"},
+                                        {T1 + 3 * M: "S"}, T1, delay30={T1 + 30_000: 60_000}))):
+        _, marks = run_new(ups)
+        sg, _ = chart_run(ups)
+        check(f"translated Pine == Python model on {nm} (mark positions / direction)",
+              sorted((x, kk) for (x, kk, _) in marks if kk in (1, -1)) == sorted((x[0], 1 if x[1] == "SELL" else -1) for x in sg) and sg)
 
     # ---- 5. random end-to-end (15s -> 30s / 1m aggregation, request [time, evt, time[1], evt[1]] + lookahead_on model) -------
     def e2e(b15, rng=None, max_delay=0):
