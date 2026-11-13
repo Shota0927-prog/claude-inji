@@ -1,0 +1,294 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  SATS Short Signal (15S)  —  サッツバンド 売りタイミング検知の単体インジ (SSS-1)
+//  15秒チャート専用。15秒・30秒・1分の「開始時点の青バンド崩れ」が順に揃ったら売りの合図を出す。
+//  上位足の売り目線はこのインジの外で確認する。注文・SL / TP・アラートは無い (チャート上の検知表示のみ)。
+//  計算の基準は「SAT BAND Reconstruction Test」。f_satBand() は一字一句そのまま (tests/sats_src/f_satBand.txt)。
+//  既存の Zone / Strategy のファイルは編集していない。
+//
+//  ■ 各時間足の開始イベント (15秒 / 30秒 / 1分 共通・同じ関数 f_evt で判定)
+//    新しい足が始まった最初の更新で 1 回だけ評価する。時刻 = 新しい足の開始時刻 time。
+//      1. 直前の確定足の bandState == +1 (青バンド)
+//      2. 新しい足の最初の更新で bandState == 0 (背景なし)。-1 (赤バンド) で始まる足は対象外
+//      3. LINE1 (dir1/line1)・LINE2 (dir2/line2)・STB (stbDir/stb) のうち 1 本以上が
+//         直前確定足で方向 +1 → 最初の更新で -1、かつ最初の更新でその同じ線の価格 > 新しい足の open (同値は対象外)
+//    3 本の線の値が前足・新しい足とも揃っている (na でない) ときだけ判定する。帯の状態は f_satBand() の状態値だけを使う
+//    (表示色・透明度は使わない)。複数の線が同時に該当してもその時間足のイベントは 1 回。
+//    開始時点で成立したイベントは足の途中で取り消さない。途中で初めて条件を満たした足は数えない。
+//
+//  ■ 順序 (15秒 → 30秒 → 1分)
+//    t15 <= t30 <= t1m かつ t1m - t15 <= 待ち時間 (分・初期 5 分。ちょうど期限は有効。足数ではなく実時刻差)。
+//    ・待機中は直近の有効な 15秒イベントを記録する。30秒イベントの時点で有効な 15秒イベントがあればその 2 件を「組」にする。
+//      組ができた後の新しい 15秒イベントでは組は変わらない。新しい 30秒イベントで有効な組ができた場合だけ組を更新する。
+//    ・1分イベントで有効な組を使ったら合図を 1 回出し、待機をすべてリセットする (次は新しい 15秒・30秒・1分が必要)。
+//    ・期限切れの記録 (現在時刻 - t15 > 待ち時間) は失効させる。後から遡って成立させることはない。
+//    ・同じ時刻のイベントは 15秒 → 30秒 → 1分 の順に処理する (3 つが同じ開始時刻なら同じ更新で合図 1 回)。
+//    ・15秒・30秒は成立履歴を使う。成立後に線が青へ戻ったり帯が再点灯しても再判定・取り消しはしない。
+//
+//  ■ 取得
+//    15秒はチャート自身で f_satBand() を計算する。30秒・1分は request.security(同じ銘柄, "30S" / "1", lookahead_off) で
+//    その時間足の f_satBand() を毎足計算し、線・方向・帯状態・始値・時刻と、要求先の式の中で [1] を取った直前確定足の
+//    方向・帯状態・線をまとめて 1 つのタプルで受け取る (チャート側の 15秒系列をずらして代用しない)。
+//    イベント判定はチャート側の barstate.isrealtime and barstate.isnew の実行だけ (要求先の barstate は使わない)。
+//    30秒・1分は、返ってきた現在足の time がチャートの time と一致する 15秒足でだけ処理する。最初の更新でまだ要求先の
+//    値が新しい足に切り替わっていなければ、その足の開始イベントは見送る。
+//    記録・待機・表示フラグは varip に置き、同じ足の 2 回目以降の更新でのロールバックで消えたり二重に出たりしないようにする。
+//
+//  ■ 注意 (リアルタイム観測のみ)
+//    開始時点の VWMA にはその時点までの出来高が入るが、履歴足からは「最初の更新の出来高と値の組」を復元できない。
+//    このため履歴足では一切判定しない (履歴 OHLCV で代用しない・次足の確定結果を開始位置に描かない)。
+//    チャートの再読み込み・設定変更・銘柄切替のあとは、それ以前に観測したマーカー・ラベル・待機状態は復元されない。
+//    インジを読み込んだ時点で途中まで進んでいた 15秒足は最初の更新を観測していないので判定しない。
+//    30秒足・秒足の request.security が使える TradingView のプランが必要。
+// ============================================================================
+//@version=6
+indicator("SATS Short Signal (15S)", "SATS-S", overlay = true, max_labels_count = 500)
+
+// ---- 入力 ----------------------------------------------------------------------------------------------------------------
+int  waitMin  = input.int(5, "待ち時間 (分): 1分の開始 - 15秒の開始 の上限", minval = 1,
+     tooltip = "t1m - t15 がこの時間以内なら成立 (ちょうど期限も有効)。実時刻差で判定する。")
+bool showEvt  = input.bool(true, "確認用: 各時間足の成立イベントを表示 (時間足・該当線・開始時刻)")
+bool showTbl  = input.bool(true, "確認用: 待機状態の表を表示")
+color sellCol = input.color(color.new(color.red, 0), "売り合図の色")
+
+// ---- SAT BAND (移植元の関数をそのまま) --------------------------------------------------------------------------------
+f_satBand() =>
+    // --- 共通 Basis（SMA でも EMA でもなく VWMA。source は hlc3、length は 5） ---
+    float basisV  = ta.vwma(hlc3, 5)
+    float commonV = basisV * 0.5
+
+    // --- ATR（ta.atr() なので内部は RMA。現在足ではなく 1 本前の値） ---
+    float atr50V = ta.atr(50)[1]
+
+    // --- Anchor 共通 source と State 反転判定用の値（いずれも 1 本前の足から） ---
+    float srcV      = close[1] * 0.5
+    float trigLowV  = low[1]   * 0.5
+    float trigHighV = high[1]  * 0.5
+
+    bool readyV = not na(atr50V) and not na(srcV) and not na(trigLowV) and not na(trigHighV)
+
+    // --- LINE1（k = 5.0） ---
+    //   同一バー内で更新済みの anchor / dir を条件判定へ再利用しないよう、
+    //   判定前に prevAnchor / prevDir へ退避してから State を更新する。
+    float k1V = 5.0
+    var float anchor1V = na
+    var int   dir1V    = 1
+    float prevAnchor1V = anchor1V
+    int   prevDir1V    = dir1V
+    if readyV
+        if na(prevAnchor1V)
+            // 初期化：Bull から開始する
+            anchor1V := srcV - k1V * atr50V
+            dir1V    := 1
+        else if prevDir1V == 1
+            if trigLowV < prevAnchor1V
+                // Bull → Bear
+                dir1V    := -1
+                anchor1V := srcV + k1V * atr50V
+            else
+                dir1V    := 1
+                anchor1V := math.max(prevAnchor1V, srcV - k1V * atr50V)
+        else
+            if trigHighV > prevAnchor1V
+                // Bear → Bull
+                dir1V    := 1
+                anchor1V := srcV - k1V * atr50V
+            else
+                dir1V    := -1
+                anchor1V := math.min(prevAnchor1V, srcV + k1V * atr50V)
+    float line1V = commonV + anchor1V
+
+    // --- LINE2（k = 2.5。構造は LINE1 と完全に同じで、違うのは倍率だけ） ---
+    float k2V = 2.5
+    var float anchor2V = na
+    var int   dir2V    = 1
+    float prevAnchor2V = anchor2V
+    int   prevDir2V    = dir2V
+    if readyV
+        if na(prevAnchor2V)
+            // 初期化：Bull から開始する
+            anchor2V := srcV - k2V * atr50V
+            dir2V    := 1
+        else if prevDir2V == 1
+            if trigLowV < prevAnchor2V
+                // Bull → Bear
+                dir2V    := -1
+                anchor2V := srcV + k2V * atr50V
+            else
+                dir2V    := 1
+                anchor2V := math.max(prevAnchor2V, srcV - k2V * atr50V)
+        else
+            if trigHighV > prevAnchor2V
+                // Bear → Bull
+                dir2V    := 1
+                anchor2V := srcV - k2V * atr50V
+            else
+                dir2V    := -1
+                anchor2V := math.min(prevAnchor2V, srcV + k2V * atr50V)
+    float line2V = commonV + anchor2V
+
+    // --- STB（Donchian 構造。LINE1 / LINE2 の State とは完全に独立） ---
+    //   表示用     ： ta.highest(high, 10) / ta.lowest(low, 10)
+    //   方向判定用 ： ta.highest(high, 20)[1] / ta.lowest(low, 20)[1]
+    //   毎バー high breakout を先に判定し、同じ足で上下両方を突破した場合も
+    //   Bull 側（+1）が優先される。どちらも突破していなければ直前の State を維持。
+    float stbUpperV = ta.highest(high, 10)
+    float stbLowerV = ta.lowest(low, 10)
+    float prev20HighV = ta.highest(high, 20)[1]
+    float prev20LowV  = ta.lowest(low, 20)[1]
+    var int stbDirV = 1
+    if not na(prev20HighV) and not na(prev20LowV)
+        if high > prev20HighV
+            stbDirV := 1
+        else if low < prev20LowV
+            stbDirV := -1
+    // UP は下側（lower10）、DOWN は上側（upper10）を表示価格にする
+    float stbV = stbDirV == 1 ? stbLowerV : stbUpperV
+
+    // --- 青バンド / 赤バンド ---
+    //   現在価格と LINE1 / LINE2 / STB の 3 本の位置関係だけで決める。
+    //   各ラインの dir は判定に使わない。
+    int stateV = 0
+    if close > line1V and close > line2V and close > stbV
+        stateV := 1
+    else if close < line1V and close < line2V and close < stbV
+        stateV := -1
+
+    [line1V, line2V, stbV, dir1V, dir2V, stbDirV, stateV, basisV, commonV, atr50V, anchor1V, anchor2V]
+
+// ---- 開始イベント判定 (15秒 / 30秒 / 1分 共通) ----------------------------------------------------------------------------
+//  戻り値 mask: 該当線のビット (1 = LINE1, 2 = LINE2, 4 = STB)。0 ならその足は不成立。
+f_evt(float o, float l1, float l2, float sb, int d1, int d2, int sd, int st,
+      float l1p, float l2p, float sbp, int d1p, int d2p, int sdp, int stp) =>
+    int m = 0
+    bool okV = not na(o) and not na(l1) and not na(l2) and not na(sb) and not na(l1p) and not na(l2p) and not na(sbp)
+         and not na(st) and not na(stp)
+    if okV and stp == 1 and st == 0
+        if d1p == 1 and d1 == -1 and l1 > o
+            m += 1
+        if d2p == 1 and d2 == -1 and l2 > o
+            m += 2
+        if sdp == 1 and sd == -1 and sb > o
+            m += 4
+    m
+
+//  同じ時間足の計算系列から、現在足の値と直前確定足 ([1]) の値をまとめて取り出す。
+//  request.security の中で呼ぶと [1] は要求先の時間足の 1 本前になる。
+f_satsPack() =>
+    [l1, l2, sb, d1, d2, sd, st, b, cm, at, a1, a2] = f_satBand()
+    [time, open, l1, l2, sb, d1, d2, sd, st, l1[1], l2[1], sb[1], d1[1], d2[1], sd[1], st[1]]
+
+f_lines(int m) =>
+    string s = ""
+    if m % 2 == 1
+        s += "L1"
+    if int(m / 2) % 2 == 1
+        s += (s == "" ? "" : "+") + "L2"
+    if m >= 4
+        s += (s == "" ? "" : "+") + "STB"
+    s
+
+f_hms(int t) =>
+    na(t) ? "-" : str.format_time(t, "HH:mm:ss", syminfo.timezone)
+
+// ---- 取得 (毎足・無条件) --------------------------------------------------------------------------------------------------
+[t15, o15, l1_15, l2_15, sb_15, d1_15, d2_15, sd_15, st_15, l1p15, l2p15, sbp15, d1p15, d2p15, sdp15, stp15] = f_satsPack()
+[t30, o30, l1_30, l2_30, sb_30, d1_30, d2_30, sd_30, st_30, l1p30, l2p30, sbp30, d1p30, d2p30, sdp30, stp30] =
+     request.security(syminfo.tickerid, "30S", f_satsPack(), lookahead = barmerge.lookahead_off)
+[t60, o60, l1_60, l2_60, sb_60, d1_60, d2_60, sd_60, st_60, l1p60, l2p60, sbp60, d1p60, d2p60, sdp60, stp60] =
+     request.security(syminfo.tickerid, "1", f_satsPack(), lookahead = barmerge.lookahead_off)
+
+bool chartOk = timeframe.in_seconds() == 15
+
+// ---- 状態 (varip: 同じ足の 2 回目以降の更新でロールバックしない) ----------------------------------------------------------
+varip int    loadBarT = na      // 読込時に途中だった最初のリアルタイム足 (最初の更新を観測していないので判定しない)
+varip bool   rtSeen   = false
+varip int    w15T     = na      // 直近の有効な 15秒イベント
+varip int    w15M     = 0
+varip int    p15T     = na      // 組 (15秒 + 30秒)
+varip int    p15M     = 0
+varip int    p30T     = na
+varip int    p30M     = 0
+varip int    sigT     = na      // 売り合図を出した 15秒足の time
+varip string sigTxt   = ""
+varip int    evtT     = na      // 確認用ラベルを出す 15秒足の time
+varip string evtTxt   = ""
+
+int waitMs = waitMin * 60000
+
+if barstate.isrealtime and not rtSeen
+    rtSeen   := true
+    loadBarT := barstate.isnew ? na : time
+
+if chartOk and barstate.isrealtime and barstate.isnew and time != nz(loadBarT, -1)
+    int now = time
+    string txt = ""
+    // 期限切れの記録を失効
+    if not na(w15T) and now - w15T > waitMs
+        w15T := na
+        w15M := 0
+    if not na(p15T) and now - p15T > waitMs
+        p15T := na
+        p30T := na
+        p15M := 0
+        p30M := 0
+    // 15秒 (チャート自身)
+    int m15 = t15 == now ? f_evt(o15, l1_15, l2_15, sb_15, d1_15, d2_15, sd_15, st_15, l1p15, l2p15, sbp15, d1p15, d2p15, sdp15, stp15) : 0
+    if m15 > 0
+        w15T := now
+        w15M := m15
+        txt += "15s " + f_lines(m15) + " " + f_hms(now)
+    // 30秒 (この 15秒足で 30秒足が始まり、要求先の現在足が切り替わっているときだけ)
+    int m30 = t30 == now ? f_evt(o30, l1_30, l2_30, sb_30, d1_30, d2_30, sd_30, st_30, l1p30, l2p30, sbp30, d1p30, d2p30, sdp30, stp30) : 0
+    if m30 > 0
+        txt += (txt == "" ? "" : "\n") + "30s " + f_lines(m30) + " " + f_hms(now)
+        if not na(w15T) and w15T <= now and now - w15T <= waitMs
+            p15T := w15T
+            p15M := w15M
+            p30T := now
+            p30M := m30
+    // 1分
+    int m60 = t60 == now ? f_evt(o60, l1_60, l2_60, sb_60, d1_60, d2_60, sd_60, st_60, l1p60, l2p60, sbp60, d1p60, d2p60, sdp60, stp60) : 0
+    if m60 > 0
+        txt += (txt == "" ? "" : "\n") + "1m " + f_lines(m60) + " " + f_hms(now)
+        if not na(p15T) and p15T <= p30T and p30T <= now and now - p15T <= waitMs
+            sigT   := now
+            sigTxt := "SELL\n15s " + f_lines(p15M) + " " + f_hms(p15T) + "\n30s " + f_lines(p30M) + " " + f_hms(p30T)
+                 + "\n1m " + f_lines(m60) + " " + f_hms(now)
+            // 待機をリセット (次の合図には新しい 15秒・30秒・1分が必要)
+            w15T := na
+            w15M := 0
+            p15T := na
+            p30T := na
+            p15M := 0
+            p30M := 0
+    if txt != ""
+        evtT   := now
+        evtTxt := txt
+
+// ---- 表示 ----------------------------------------------------------------------------------------------------------------
+//  ラベルは毎実行で描き直す (リアルタイムの 2 回目以降の更新では前回分がロールバックで消えるため)。足の確定後はそのまま残る。
+bool sigBar = not na(sigT) and time == sigT
+plotshape(sigBar, "売り合図", shape.triangledown, location.abovebar, sellCol, size = size.normal)
+if sigBar
+    label.new(bar_index, low, sigTxt, xloc.bar_index, yloc.belowbar, sellCol, label.style_label_up, color.white, size.small)
+if showEvt and not na(evtT) and time == evtT
+    label.new(bar_index, high, evtTxt, xloc.bar_index, yloc.abovebar, color.new(color.orange, 20), label.style_label_down,
+         color.black, size.tiny)
+
+var table tb = table.new(position.top_right, 2, 6, color.new(color.black, 20), border_width = 1)
+if showTbl and barstate.islast
+    table.cell(tb, 0, 0, "SATS-S", text_color = color.white)
+    table.cell(tb, 1, 0, chartOk ? "15秒・リアルタイム観測のみ" : "15秒チャートで使用してください", text_color = chartOk ? color.white : color.red)
+    table.cell(tb, 0, 1, "直近15s", text_color = color.white)
+    table.cell(tb, 1, 1, na(w15T) ? "-" : f_lines(w15M) + " " + f_hms(w15T), text_color = color.white)
+    table.cell(tb, 0, 2, "組 15s/30s", text_color = color.white)
+    table.cell(tb, 1, 2, na(p15T) ? "-" : f_hms(p15T) + " / " + f_hms(p30T), text_color = color.white)
+    table.cell(tb, 0, 3, "1分の期限", text_color = color.white)
+    table.cell(tb, 1, 3, na(p15T) ? "-" : f_hms(p15T + waitMs), text_color = color.white)
+    table.cell(tb, 0, 4, "現在 30s/1m", text_color = color.white)
+    table.cell(tb, 1, 4, "帯 " + str.tostring(st_30) + " / " + str.tostring(st_60), text_color = color.white)
+    table.cell(tb, 0, 5, "最後の合図", text_color = color.white)
+    table.cell(tb, 1, 5, f_hms(sigT), text_color = color.white)
