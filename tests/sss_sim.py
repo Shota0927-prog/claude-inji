@@ -328,7 +328,12 @@ def pine_rows_runner(src):
     c = src.index("// ---- 処理待ちの行")
     d = src.index("// ---- 印の描画")
     py = ap.Translator().translate(ap.logical_lines(src[a:b] + src[c:d]))
-    if "def f_seqEvt(" in py:
+    if "f_seqEvt(int p, int d" in src:
+        # SSS-8: f_seqEvt(p, d, i, t, m, desc, liveT); the order log follows pattern '1分まで' (p = 1)
+        py = py.replace("def f_seqEvt(", "def _orig_f_seqEvt(", 1)
+        py = ("def f_seqEvt(*a):\n    if a[0] == 1:\n        LOG.append(((15, 30, 60, 300)[a[2]], a[3], time, a[4]))\n"
+              "    return _orig_f_seqEvt(*a)\n") + py
+    elif "def f_seqEvt(" in py:
         py = py.replace("def f_seqEvt(", "def _orig_f_seqEvt(", 1)
         py = ("def f_seqEvt(*a):\n    LOG.append(((15, 30, 60)[a[2]], a[3], time, a[4]))\n    return _orig_f_seqEvt(*a)\n") + py
     for f, tag in (("f_on15", 15), ("f_on30", 30), ("f_on60", 60)):
@@ -345,14 +350,15 @@ def pine_rows_runner(src):
 
     NP = (None,) * 10
 
-    def run(updates, live=False, show_evt=False, clr=(True, True, True)):
+    def run(updates, live=False, show_evt=False, clr=(True, True, True, True), pats=(False, True, False)):
         """updates: dicts with t, e15=(ms, mb), need30 / need60 (start time when time("30S") / time("1") switched),
         optional g30 / g60 (time("30S") / time("1") of this bar; default = the aligned start), p15 = 9-value pack of the chart's
         own 15s start data, r30 / r60 = (cur t, ms, mb, prev t, ms, mb) or the full 24-value form
         (t, ms, mb, *pack, prev t, prev ms, prev mb, *prev pack), hlc = (high, low, close) of this 15s bar, conf (default True)."""
         env = ap.make_env(_NoBroker(), [])
         env.update(_VARS=set(), _VARIPS=set(), LOG=[], syminfo__timezone="UTC", waitMin=5, showEvt=show_evt, chartOk=True,
-                   clr15=clr[0], clr30=clr[1], clr60=clr[2],
+                   clr15=clr[0], clr30=clr[1], clr60=clr[2], clr300=clr[3] if len(clr) > 3 else True,
+                   pat30=pats[0], pat1m=pats[1], pat5m=pats[2],
                    timeframe__in_seconds=lambda *x: 15, array__new_string=lambda n=0, v=None: [v] * n,
                    array__new_bool=lambda n=0, v=None: [v] * n,
                    str__format_time=lambda t, f, tz: f.replace("HH", "%02d" % (t // 3600_000 % 24))
@@ -376,8 +382,10 @@ def pine_rows_runner(src):
                        o15=p15[0], sp15=p15[1], dp15=p15[2], l1_15=p15[3], l2_15=p15[4], h20_15=p15[5], w20_15=p15[6],
                        h9_15=p15[7], w9_15=p15[8], tq15=p15[9],
                        new30=u.get("need30") is not None, need30T=g30,
-                       new60=u.get("need60") is not None, need60T=g60)
-            for tf in (30, 60):
+                       new60=u.get("need60") is not None, need60T=g60,
+                       new300=u.get("need300") is not None,
+                       need300T=u.get("need300") if u.get("need300") is not None else u.get("g300", T - T % (5 * M)))
+            for tf in (30, 60, 300):
                 r = u.get(f"r{tf}") or (None, 0, 0, None, 0, 0)
                 if len(r) == 6:
                     r = (r[0], r[1], r[2], *NP, r[3], r[4], r[5], *NP)
@@ -389,7 +397,11 @@ def pine_rows_runner(src):
             first = False
             last_t = T
             last_bar = (T + 15_000, hlc[0], hlc[1], hlc[2])
-        marks = [(x, k, tip) for x, k, tip in zip(env["mkX"], env["mkK"], env["mkTip"])]
+        marks = [(x, k, tip) for x, k, tip in zip(env["mkX"], env["mkK"], env["mkTip"]) if k in (0, 2)]
+        if "smX" in env:
+            marks += [(x, k, txt + "\n" + tip) for x, k, txt, tip in zip(env["smX"], env["smK"], env["smTxt"], env["smTip"])]
+        else:
+            marks += [(x, k, tip) for x, k, tip in zip(env["mkX"], env["mkK"], env["mkTip"]) if k in (1, -1)]
         return env["LOG"], marks
     return run
 
@@ -427,10 +439,37 @@ def tf_packs(ks, bars, ser, step):
     return out
 
 
-def mid_model(T, b15, tfs, wait_min=5, clr=(True, True, True)):
-    """Independent history model: every start event and every mid-bar STB event of every target bar, built from the complete
-    data, sorted by (time, timeframe 15->30->1m, closing bar before starting bar) and fed to the direction waits.
-    tfs = {rank: (starts, packs)}; 15s bars are T / b15. Returns ([(mark_x, dir, (t15, t30, t60))], events)."""
+PNAME = ("30秒まで", "1分まで", "5分まで")
+
+
+class PSeq:
+    """SSS-8 pattern wait: slots for timeframes 0..p+1, latest per timeframe, any order, earliest..latest <= W."""
+    def __init__(self, p):
+        self.n = p + 2
+        self.slot = [None] * self.n
+        self.last_sig = None
+
+    def event(self, rank, t, m, W):
+        for k in range(self.n):
+            if self.slot[k] is not None and t - self.slot[k] > W:
+                self.slot[k] = None
+        if m > 0 and self.last_sig != t:
+            self.slot[rank] = t
+            if None not in self.slot and max(self.slot) - min(self.slot) <= W:
+                r = tuple(self.slot)
+                self.slot = [None] * self.n
+                self.last_sig = t
+                return r
+        return None
+
+
+def mid_model(T, b15, tfs, wait_min=5, clr=(True, True, True, True), pats=(False, True, False), detail=False):
+    """Independent history model: every start event, mid-bar STB event and confirmed-band event of every target bar of every
+    timeframe in tfs, built from the complete data and sorted by (time, confirmed band first, timeframe 15->30->1m->5m,
+    closing bar before starting bar); each ON pattern reads the events of its own timeframes with its own waits.
+    Returns signals [(mark_x, dir, times)] for '1分まで' only when detail is False (backwards compatible), else
+    [(mark_x, dir, pattern, times)]."""
+    clr = tuple(clr) + (True,) * (4 - len(clr))
     ev = []
     for rank, (ks, packs) in tfs.items():
         for j, k in enumerate(ks):
@@ -468,28 +507,43 @@ def mid_model(T, b15, tfs, wait_min=5, clr=(True, True, True)):
                 ev.append((t + S15, rank, 0, xs, xb, t))
     ev.sort(key=lambda e: (e[0], 0 if e[2] == -1 else 1, e[1], e[2]))
     W = wait_min * M
-    sS, sB = Seq(), Seq()
-    sig = []
-    conf = {}
-    for (t, rank, sub, ms, mb, x) in ev:
-        if sub == -1:
-            conf[rank] = (t, ms)
-            if clr[rank] and ms == 1:
-                sS.slot[rank] = None
-            if clr[rank] and ms == -1:
-                sB.slot[rank] = None
+    out = []
+    for p in range(3):
+        if not pats[p]:
             continue
-        if sub == 0 and clr[rank] and conf.get(rank, (None,))[0] == t:
-            if conf[rank][1] == 1:
-                ms = 0
-            if conf[rank][1] == -1:
-                mb = 0
-        rs, rb = sS.event(rank, t, ms, W), sB.event(rank, t, mb, W)
-        if rs:
-            sig.append((x, "SELL", rs))
-        if rb:
-            sig.append((x, "BUY", rb))
-    return sig, ev
+        sS, sB = PSeq(p), PSeq(p)
+        conf = {}
+        for (t, rank, sub, ms, mb, x) in ev:
+            if rank > p + 1:
+                continue
+            if sub == -1:
+                conf[rank] = (t, ms)
+                if clr[rank] and ms == 1:
+                    sS.slot[rank] = None
+                if clr[rank] and ms == -1:
+                    sB.slot[rank] = None
+                continue
+            if sub == 0 and clr[rank] and conf.get(rank, (None,))[0] == t:
+                if conf[rank][1] == 1:
+                    ms = 0
+                if conf[rank][1] == -1:
+                    mb = 0
+            rs, rb = sS.event(rank, t, ms, W), sB.event(rank, t, mb, W)
+            if rs:
+                out.append((x, "SELL", PNAME[p], rs))
+            if rb:
+                out.append((x, "BUY", PNAME[p], rb))
+    if detail:
+        return out, ev
+    return [(x, d, tt) for (x, d, pn, tt) in out if pn == "1分まで"], ev
+
+
+def merged(sig):
+    """labels as the indicator shows them: one per (x, dir) with the pattern names in signal order."""
+    d = {}
+    for (x, dr, pn, tt) in sig:
+        d.setdefault((x, dr), []).append(pn)
+    return sorted((x, dr, "・".join(v)) for (x, dr), v in d.items())
 
 
 def pine_updates(T, b15, tfs, delays=None, realtime=False):
@@ -497,7 +551,7 @@ def pine_updates(T, b15, tfs, delays=None, realtime=False):
     update and a confirming update per bar. delays = {rank: {start: ms}} visibility delay of 30s / 1m bars."""
     import bisect
     feeds = {}
-    for rank in (1, 2):
+    for rank in [r for r in (1, 2, 3) if r in tfs]:
         ks, packs = tfs[rank]
         vis, mx = [], float("-inf")
         for k in ks:
@@ -516,10 +570,12 @@ def pine_updates(T, b15, tfs, delays=None, realtime=False):
     ups = []
     for i, t in enumerate(T):
         base = dict(t=t, e15=(p15[i][1], p15[i][2]), p15=p15[i][3:], hlc=(b15[i]["h"], b15[i]["l"], b15[i]["c"]),
-                    need30=t if t % 30_000 == 0 else None, need60=t if t % M == 0 else None)
+                    need30=t if t % 30_000 == 0 else None, need60=t if t % M == 0 else None,
+                    need300=t if t % (5 * M) == 0 else None)
         moments = [(t, False), (t + S15 - 1, True)] if realtime else [(t, True)]
         for now, conf in moments:
-            u = dict(base, conf=conf, now=now, r30=deliver(1, now), r60=deliver(2, now))
+            u = dict(base, conf=conf, now=now, r30=deliver(1, now), r60=deliver(2, now),
+                     r300=deliver(3, now) if 3 in feeds else None)
             ups.append(u)
     return ups
 
@@ -536,7 +592,7 @@ def series_tfs(T, b15):
         ks = sorted(g)
         return ks, [g[k] for k in ks]
     out = {0: (T, tf_packs(T, b15, sat_series(b15), S15))}
-    for rank, step in ((1, 30_000), (2, M)):
+    for rank, step in ((1, 30_000), (2, M), (3, 5 * M)):
         ks, bars = agg(step)
         out[rank] = (ks, tf_packs(ks, bars, sat_series(bars), step))
     return out
@@ -549,7 +605,7 @@ def hand_case(t0, n, packs, hlc, starts=None):
     b15 = [dict(o=100.0, h=hlc.get(t, (100.0, 100.0, 100.0))[0], l=hlc.get(t, (100.0, 100.0, 100.0))[1],
                 c=hlc.get(t, (100.0, 100.0, 100.0))[2], v=1) for t in T]
     tfs = {}
-    for rank, step in ((0, S15), (1, 30_000), (2, M)):
+    for rank, step in ((0, S15), (1, 30_000), (2, M), (3, 5 * M)):
         ks = sorted({t - t % step for t in T})
         pk = []
         for k in ks:
@@ -617,7 +673,8 @@ def main():
     check("processing is not gated on realtime (barstate.isrealtime only selects the live detection time)",
           code.count("barstate.isrealtime") == 1 and "barstate.isrealtime ? timenow : na" in code)
     check("rows, wait state and mark reservations are varip (no rollback)",
-          all(re.search(r"^varip array<int>\s+" + v + r"\s*=", code, re.M) for v in ("rT", "rC30", "rC60", "sqS", "sqB", "mkBar")))
+          all(re.search(r"^varip array<(?:int|string)>\s+" + v + r"\s*=", code, re.M)
+              for v in ("rT", "cC", "sq", "eT", "mkBar", "smX")))
 
     # ---- 2. start-of-bar formulas vs the f_satBand() port ---------------------------------------------------------------
     rng = random.Random(7)
@@ -787,11 +844,11 @@ def main():
         last = [(tf, t - T) for (tf, t, ct, _m) in log if ct == T + 105_000]
         # the 10:00:45 bar's own close (time_close 10:01:00) is processed in the same batch: 15 / 30 / 1m closes, then the
         # 1m start at 10:01:00 (close before start), then the 30s 10:01:30 start, then the 15s 10:01:45 start.
-        sig = [(x - T, k, tip.split(chr(10))[2:5]) for (x, k, tip) in marks if k in (1, -1)]
+        sig = [(x - T, k, tip.split(chr(10))[3:6]) for (x, k, tip) in marks if k in (1, -1)]
         k = 1 if d == "S" else -1
         print(f"   Pine order on the 10:01:45 row ({nm}): {last}")
         check(f"SSS-4 ({nm}): Pine processes the 10:01:45 row as 1m 10:01:00 -> 30s 10:01:30 -> 15s 10:01:45 (x2: SELL+BUY waits)",
-              last == [(15, 60_000)] * 2 + [(30, 60_000)] * 2 + [(60, 60_000)] * 4 + [(30, 90_000)] * 2 + [(15, 105_000)] * 2)
+              last == [(60, 60_000)] * 2 + [(30, 90_000)] * 2)   # SSS-8: only events carrying a mask are queued
         check(f"SSS-4/6 ({nm}): one {nm} mark at 10:01:00 (latest 15s 10:00:45, 30s 10:00:30, 1m 10:01:00)",
               [(x, kk) for (x, kk, _) in sig] == [(60_000, k)] and sig[0][2] == ["15s L2 10:00:45 (開始)", "30s L2 10:00:30 (開始)", "1m L2 10:01:00 (開始)"])
         sg, _ = chart_run(ups)
@@ -846,7 +903,7 @@ def main():
               sigmarks(marks) == [(hm(9, 27, 15), nm)] and [(x, d) for (x, d, _) in msig] == [(hm(9, 27, 15), nm)])
         check(f"SSS-5 A ({nm}): tooltip shows the target 1m start and the confirming 15s close",
               len(tp) == 1 and "1m STB 09:27:30 (途中: 対象足の開始 09:27:00 / 15秒確定 09:27:30)" in tp[0]
-              and "(3枠目: 1m 09:27:30)" in tp[0])
+              and "(揃った: 1m 09:27:30)" in tp[0])
         ev1m = [(x, tip) for (x, kk, tip) in marks if kk == 0 and "1m STB" in tip]
         check(f"SSS-5 A ({nm}): single 1m event mark on the same 15s bar; the later lower/higher 15s bar adds nothing (no lookahead, no repeat)",
               [x for x, _ in ev1m] == [hm(9, 27, 15)])
@@ -939,7 +996,7 @@ def main():
         tp = tips(marks, 1)
         check(f"SSS-6: {nm} mid STB completes the set -> SELL on the confirming 15s bar 09:27:15, tooltip names the 3rd slot",
               sigmarks(marks) == [(hm(9, 27, 15), "SELL")] and [(x, d) for (x, d, _) in msig] == [(hm(9, 27, 15), "SELL")]
-              and f"(3枠目: {nm} 09:27:30)" in tp[0])
+              and f"(揃った: {nm} 09:27:30)" in tp[0])
 
     # ---- 6c. SSS-7: clearing a slot when the timeframe confirms back in its original band; span in the tooltip ---------------
     def CONF(k, band):
@@ -1015,6 +1072,100 @@ def main():
                             {(0, hm(9, 25)): (2, 0), (1, hm(9, 25, 30)): (2, 0)})
     _, mkA = run_new(pine_updates(T, b15, tfs))
     check("SSS-7: 09:27-like mid-bar case shows '成立幅 2分30秒' (9:25:00 .. 9:27:30)", "成立幅 2分30秒\n" in tips(mkA, 1)[0])
+
+    # ---- 6d. SSS-8: patterns 30秒まで / 1分まで / 5分まで ----------------------------------------------------------------------
+    def plabels(marks):
+        out = []
+        for (x, k, tip) in marks:
+            if k in (1, -1):
+                head = tip.split("\n")[0]
+                out.append((x, head.split(" ")[0], head.split(" ", 1)[1]))
+        return sorted(out)
+
+    def run8(T, b15, tfs, pats, clr=(True, True, True, True), delays=None, realtime=False):
+        _, mk = run_new(pine_updates(T, b15, tfs, delays, realtime), live=realtime, pats=pats, clr=clr)
+        sig, _ = mid_model(T, b15, tfs, clr=clr, pats=pats, detail=True)
+        return plabels(mk), merged(sig), mk, sig
+    ALL = (True, True, True)
+    # 1. 30秒まで alone: 30s first, then 15s -> SELL 30秒まで at the 15s start
+    T, b15, tfs = hand_case(hm(9, 20), 24, {}, {}, {(1, hm(9, 21)): (2, 0), (0, hm(9, 21, 45)): (2, 0)})
+    pl, ml, _, _ = run8(T, b15, tfs, (True, False, False))
+    check("SSS-8: 30秒まで: 30s 9:21:00 then 15s 9:21:45 -> 'SELL 30秒まで' at 9:21:45 (Pine and model)",
+          pl == ml == [(hm(9, 21, 45), "SELL", "30秒まで")])
+    pl, ml, _, _ = run8(T, b15, tfs, (False, True, False))
+    check("SSS-8: same events with only 1分まで ON -> nothing (1m missing)", pl == ml == [])
+    # 2. 5分まで: order 5m -> 1m -> 15s -> 30s, any order; and a 5m mid-bar STB
+    T, b15, tfs = hand_case(hm(9, 15), 40, {}, {}, {(3, hm(9, 15)): (0, 2), (2, hm(9, 16)): (0, 2), (0, hm(9, 17, 15)): (0, 2),
+                                                    (1, hm(9, 18)): (0, 2)})
+    pl, ml, _, _ = run8(T, b15, tfs, (False, False, True))
+    check("SSS-8: 5分まで: 5m 9:15 -> 1m 9:16 -> 15s 9:17:15 -> 30s 9:18 -> 'BUY 5分まで' at 9:18:00",
+          pl == ml == [(hm(9, 18), "BUY", "5分まで")])
+    T, b15, tfs = hand_case(hm(9, 20), 40, {(3, hm(9, 25)): SELLPK}, {hm(9, 26, 15): (100.2, 94.0, 99.0)},
+                            {(0, hm(9, 24)): (2, 0), (1, hm(9, 24, 30)): (2, 0), (2, hm(9, 25)): (2, 0)})
+    pl, ml, mk, _ = run8(T, b15, tfs, ALL)
+    tp = [tip for (x, k, tip) in mk if k == 1]
+    check("SSS-8: 5m mid STB (target 9:25, flip at the 15s close 9:26:30) completes 5分まで on the 15s bar 9:26:15",
+          (hm(9, 26, 15), "SELL", "5分まで") in pl and pl == ml and "5m STB 09:26:30 (途中: 対象足の開始 09:25:00 / 15秒確定 09:26:30)" in tp[-1])
+    # 3. several patterns on the same event -> one label; the same events keep serving the other patterns
+    T, b15, tfs = hand_case(hm(9, 20), 40, {}, {}, {(3, hm(9, 20)): (2, 0), (0, hm(9, 21)): (2, 0), (1, hm(9, 21, 30)): (2, 0),
+                                                    (2, hm(9, 22)): (2, 0)})
+    pl, ml, mk, sig = run8(T, b15, tfs, ALL)
+    check("SSS-8: 30秒まで at 9:21:30; 1分まで and 5分まで both complete at 9:22:00 -> one label 'SELL 1分まで・5分まで'",
+          pl == ml == [(hm(9, 21, 30), "SELL", "30秒まで"), (hm(9, 22), "SELL", "1分まで・5分まで")])
+    tp = [tip for (x, k, tip) in mk if k == 1 and x == hm(9, 22)][0]
+    check("SSS-8: the merged tooltip has one section per pattern with its own span (1分まで 1分 / 5分まで 2分)",
+          "1分まで (揃った: 1m 09:22:00)\n成立幅 1分\n" in tp and "5分まで (揃った: 1m 09:22:00)\n成立幅 2分\n" in tp)
+    # 4. a band-return clear applies to every pattern that has the timeframe
+    T, b15, tfs = hand_case(hm(9, 20), 40, {(1, hm(9, 21, 30)): CONF(hm(9, 21, 30), 1)}, {},
+                            {(3, hm(9, 20)): (2, 0), (0, hm(9, 21)): (2, 0), (1, hm(9, 21)): (2, 0), (2, hm(9, 22)): (2, 0)})
+    pl, ml, _, _ = run8(T, b15, tfs, (False, True, True))
+    check("SSS-8: 30s confirms blue at 9:21:30 -> the SELL 30s slot is cleared in 1分まで and 5分まで (no label)", pl == ml == [])
+    pl, ml, _, _ = run8(T, b15, tfs, (True, True, True))
+    check("SSS-8: ... while 30秒まで had already fired at 9:21:00 before the clear", pl == ml == [(hm(9, 21), "SELL", "30秒まで")])
+    # 5. 5m data late: 30秒まで / 1分まで are not held; 5分まで fires later and merges into the 1分まで label
+    T, b15, tfs = hand_case(hm(9, 20), 48, {}, {}, {(3, hm(9, 20)): (2, 0), (0, hm(9, 21)): (2, 0), (1, hm(9, 21, 30)): (2, 0),
+                                                    (2, hm(9, 22)): (2, 0)})
+    dl = {3: {hm(9, 20): 150_000, hm(9, 25): 150_000}}
+    ups = pine_updates(T, b15, tfs, dl, realtime=True)
+    log, mk = run_new(ups, live=True, pats=ALL)
+    # first moment each label text appears: replay prefixes
+    def labels_at(n):
+        _, m2 = run_new(ups[:n], live=True, pats=ALL)
+        return plabels(m2)
+    i22 = next(n for n, u in enumerate(ups) if u["t"] == hm(9, 22, 15)) + 1
+    i23 = next(n for n, u in enumerate(ups) if u["t"] == hm(9, 22, 30)) + 1
+    check("SSS-8: with the 5m data 150 s late, 1分まで fires at 9:22:00 without waiting for 5m",
+          labels_at(i22) == [(hm(9, 21, 30), "SELL", "30秒まで"), (hm(9, 22), "SELL", "1分まで")])
+    check("SSS-8: when the 5m data arrives (9:22:30), 5分まで fires at the same 9:22:00 and merges into one label",
+          labels_at(i23)[-1] == (hm(9, 22), "SELL", "1分まで・5分まで") and plabels(mk) == run8(T, b15, tfs, ALL)[1])
+    # 6. 5m data lost: only 5分まで is affected; it resumes
+    dl = {3: {hm(9, 20): 10 ** 9}}
+    ups = pine_updates(T, b15, tfs, dl, realtime=True)
+    _, mk = run_new(ups, live=True, pats=ALL)
+    check("SSS-8: 5m feed never arrives -> 30秒まで / 1分まで still fire, 5分まで does not (5m start lost after 3 min)",
+          plabels(mk) == [(hm(9, 21, 30), "SELL", "30秒まで"), (hm(9, 22), "SELL", "1分まで")]
+          and any("5分 開始 09:20:00" in tip for (x, k, tip) in mk if k == 2))
+    # 7. random: all patterns ON, translated Pine vs model; realtime with 5m delays up to 2 min
+    agree8 = rt8 = n8 = 0
+    cnt = {n: 0 for n in PNAME}
+    for seed in (515, 520, 522, 526):
+        rng5 = random.Random(seed)
+        b15 = regime_bars(rng5, 1200, vol=rng5.choice([0.3, 0.8]))
+        T = [T0 + i * S15 for i in range(len(b15))]
+        tfs = series_tfs(T, b15)
+        pl, ml, _, sig = run8(T, b15, tfs, ALL)
+        for x in sig:
+            cnt[x[2]] += 1
+        agree8 += pl == ml
+        n8 += 1
+        if seed in (515, 522):
+            dl = {1: {k: rng5.randint(0, 40_000) for k in tfs[1][0]}, 2: {k: rng5.randint(0, 40_000) for k in tfs[2][0]},
+                  3: {k: rng5.randint(0, 120_000) for k in tfs[3][0]}}
+            pl_rt, _, _, _ = run8(T, b15, tfs, ALL, delays=dl, realtime=True)
+            rt8 += pl_rt == pl
+    print(f"   SSS-8 random (all patterns ON): signals per pattern {cnt}")
+    check(f"SSS-8 random: translated Pine labels (merged) == independent model ({n8} runs)", agree8 == n8)
+    check("SSS-8 random: realtime with 30s/1m delays <= 40 s and 5m delays <= 2 min gives the history labels (2 runs)", rt8 == 2)
 
     # ---- 7. SSS-5 random: translated Pine (history / realtime with delays) vs the independent model -------------------------
     agree = rt_agree = n_mid = n_sig = n_mid_sig = n_clr_diff = 0
