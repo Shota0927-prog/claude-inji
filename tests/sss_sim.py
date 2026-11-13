@@ -374,7 +374,12 @@ def pine_rows_runner(src):
     c = src.index("// ---- 処理待ちの行")
     d = src.index("// ---- 印の描画")
     py = ap.Translator().translate(ap.logical_lines(src[a:b] + src[c:d]))
-    if "f_seqEvt(int d, int i" in src:
+    if "f_seqEvt(int p, int d, int i" in src:
+        # SSS-10: f_seqEvt(p, d, i, t, m, desc, liveT); the order log follows pattern 帯→フラット (p = 0)
+        py = py.replace("def f_seqEvt(", "def _orig_f_seqEvt(", 1)
+        py = ("def f_seqEvt(*a):\n    if a[0] == 0:\n        LOG.append(((15, 30, 60, 300)[a[2]], a[3], time, a[4]))\n"
+              "    return _orig_f_seqEvt(*a)\n") + py
+    elif "f_seqEvt(int d, int i" in src:
         # SSS-9: f_seqEvt(d, i, t, m, desc, liveT)
         py = py.replace("def f_seqEvt(", "def _orig_f_seqEvt(", 1)
         py = ("def f_seqEvt(*a):\n    LOG.append(((15, 30, 60, 300)[a[1]], a[2], time, a[3]))\n"
@@ -399,9 +404,13 @@ def pine_rows_runner(src):
         def __getattr__(self, k):
             return lambda *a, **kw: None
 
-    NP = (None,) * 10
+    NP = (None,) * 13
 
-    def run(updates, live=False, show_evt=False, clr=(True, True, True, True), use=(True, True, True, False)):
+    LABELS = []
+    run_labels = LABELS
+
+    def run(updates, live=False, show_evt=False, clr=(True, True, True, True), use=(True, True, True, False),
+            useB=None):
         """updates: dicts with t, e15=(ms, mb), need30 / need60 (start time when time("30S") / time("1") switched),
         optional g30 / g60 (time("30S") / time("1") of this bar; default = the aligned start), p15 = 9-value pack of the chart's
         own 15s start data, r30 / r60 = (cur t, ms, mb, prev t, ms, mb) or the full 24-value form
@@ -409,7 +418,10 @@ def pine_rows_runner(src):
         env = ap.make_env(_NoBroker(), [])
         env.update(_VARS=set(), _VARIPS=set(), LOG=[], syminfo__timezone="UTC", waitMin=5, showEvt=show_evt, chartOk=True,
                    clr15=clr[0], clr30=clr[1], clr60=clr[2], clr300=clr[3] if len(clr) > 3 else True,
-                   use15=use[0], use30=use[1], use60=use[2], use300=use[3],
+                   use15=use[0], use30=use[1], use60=use[2], use300=use[3], patA=any(use),
+                   patB=useB is not None and any(useB), useB15=bool(useB and useB[0]), useB30=bool(useB and useB[1]),
+                   useB60=bool(useB and useB[2]), useB300=bool(useB and useB[3]),
+                   str__contains=lambda a, b: b in a,
                    timeframe__in_seconds=lambda *x: 15, array__new_string=lambda n=0, v=None: [v] * n,
                    array__new_bool=lambda n=0, v=None: [v] * n,
                    str__format_time=lambda t, f, tz: f.replace("HH", "%02d" % (t // 3600_000 % 24))
@@ -431,7 +443,8 @@ def pine_rows_runner(src):
                        tc1=prev_bar[0], h1=prev_bar[1], lw1=prev_bar[2], c1=prev_bar[3],
                        ms15=u["e15"][0], mb15=u["e15"][1],
                        o15=p15[0], sp15=p15[1], dp15=p15[2], l1_15=p15[3], l2_15=p15[4], h20_15=p15[5], w20_15=p15[6],
-                       h9_15=p15[7], w9_15=p15[8], tq15=p15[9],
+                       h9_15=p15[7], w9_15=p15[8], tq15=p15[9], ss15=p15[10] if len(p15) > 10 else None,
+                       ma15=p15[11] if len(p15) > 11 else 0, mz15=p15[12] if len(p15) > 12 else 0,
                        new30=u.get("need30") is not None, need30T=g30,
                        new60=u.get("need60") is not None, need60T=g60,
                        new300=u.get("need300") is not None,
@@ -440,10 +453,11 @@ def pine_rows_runner(src):
                 r = u.get(f"r{tf}") or (None, 0, 0, None, 0, 0)
                 if len(r) == 6:
                     r = (r[0], r[1], r[2], *NP, r[3], r[4], r[5], *NP)
-                names = ["t", "ms", "mb", "o", "sp", "dp", "l1_", "l2_", "h20_", "w20_", "h9_", "w9_", "tq"]
+                names = ["t", "ms", "mb", "o", "sp", "dp", "l1_", "l2_", "h20_", "w20_", "h9_", "w9_", "tq", "ss", "ma", "mz"]
+                half = len(r) // 2
                 for k, nm in enumerate(names):
-                    env[f"{nm}{tf}"] = r[k]
-                    env[f"{nm}{tf}p"] = r[13 + k]
+                    env[f"{nm}{tf}"] = r[k] if k < half else (0 if nm in ("ma", "mz") else None)
+                    env[f"{nm}{tf}p"] = r[half + k] if k < half else (0 if nm in ("ma", "mz") else None)
             exec(code, env)
             first = False
             last_t = T
@@ -451,9 +465,12 @@ def pine_rows_runner(src):
         marks = [(x, k, tip) for x, k, tip in zip(env["mkX"], env["mkK"], env["mkTip"]) if k in (0, 2)]
         if "smX" in env:
             marks += [(x, k, tip) for x, k, tip in zip(env["smX"], env["smK"], env["smTip"])]
+            LABELS[:] = [(x, txt) for x, txt in zip(env["smX"], env["smTxt"])]
         else:
             marks += [(x, k, tip) for x, k, tip in zip(env["mkX"], env["mkK"], env["mkTip"]) if k in (1, -1)]
         return env["LOG"], marks
+    run.labels = LABELS
+    run.env = None
     return run
 
 
@@ -482,15 +499,78 @@ def tf_packs(ks, bars, ser, step):
     for j, k in enumerate(ks):
         pr = ser[j - 1]["prep"] if j else None
         if pr is None:
-            out.append((k, 0, 0) + (None,) * 10)
+            out.append((k, 0, 0) + (None,) * 10 + (None, 0, 0))
             continue
-        ms, mb = f_evt(bars[j]["o"], pr)[:2]
+        ms, mb, stS, sdS, _ = f_evt(bars[j]["o"], pr)
+        P = ser[j - 1]
+        ma, mz = edge_mask(P["l1"] if pr["okP"] else None, P["l2"], P["stb"], P["d1"], P["d2"], P["sd"], pr["d1s"], pr["d2s"], sdS)
         out.append((k, ms, mb, bars[j]["o"], pr["st"] if pr["okP"] else None, pr["sd"], pr["l1s"], pr["l2s"],
-                    pr["hh20"], pr["ll20"], pr["hh9"], pr["ll9"], ks[j - 1] + step))
+                    pr["hh20"], pr["ll20"], pr["hh9"], pr["ll9"], ks[j - 1] + step, stS, ma, mz))
     return out
 
 
 PNAME = ("30秒まで", "1分まで", "5分まで")
+
+
+def edge_mask(l1P, l2P, sbP, d1, d2, sd, d1s, d2s, sdS):
+    """Python mirror of Pine f_edgeMask (used to build the packs; the Pine function itself is checked separately)."""
+    ms = mb = 0
+    if None not in (l1P, l2P, sbP, sdS):
+        lo, hi = min(l1P, l2P, sbP), max(l1P, l2P, sbP)
+        ms += (1 if l1P == lo and d1 == 1 and d1s == -1 else 0) + (2 if l2P == lo and d2 == 1 and d2s == -1 else 0) \
+            + (4 if sbP == lo and sd == 1 and sdS == -1 else 0)
+        mb += (1 if l1P == hi and d1 == -1 and d1s == 1 else 0) + (2 if l2P == hi and d2 == -1 and d2s == 1 else 0) \
+            + (4 if sbP == hi and sd == -1 and sdS == 1 else 0)
+    return ms, mb
+
+
+def model_b(tfs, useB, wait_min=5):
+    """Independent model of 'フラット→帯＋端の線転換'. Per timeframe the band observations (the previous bar's confirmed band at
+    its time_close, then the new bar's start band) run a state machine: flat -> red arms SELL, flat -> blue arms BUY; flat or the
+    opposite band disarms (and drops that timeframe's events from the candidates); while armed, the first start whose band is still
+    the armed colour and whose edge-line mask is set is that timeframe's event. All events are then sorted (time, drops first,
+    timeframe) and matched in short-to-long order with OSeq. Returns [(mark_x, dir, times)] and the events."""
+    ev = []
+    for rank, (ks, packs) in tfs.items():
+        if not useB[rank]:
+            continue
+        last = None
+        arm = {1: None, -1: None}
+        fired = {1: False, -1: False}
+        had = {1: False, -1: False}
+        for j, k in enumerate(ks):
+            pk = packs[j]
+            stP, tcP, stS, ma, mz = pk[4], pk[12], pk[13], pk[14], pk[15]
+            for (t, b) in ((tcP, stP), (k, stS)):
+                if t is None or b is None:
+                    continue
+                for col in (-1, 1):
+                    if b == col:
+                        if last == 0 and arm[col] is None:
+                            arm[col], fired[col] = t, False
+                    else:
+                        arm[col], fired[col] = None, False
+                        if had[col]:
+                            ev.append((t, 0, rank, col, None))     # drop (col -1 = SELL drop, 1 = BUY drop)
+                            had[col] = False
+                last = b
+            for col, m in ((-1, ma), (1, mz)):
+                if stS == col and arm[col] is not None and not fired[col] and m:
+                    fired[col], had[col] = True, True
+                    ev.append((k, 1, rank, col, (m, arm[col])))
+    ev.sort(key=lambda e: (e[0], e[1], e[2]))
+    W = wait_min * M
+    stages = tuple(i for i in range(4) if useB[i])
+    seq = {-1: OSeq(stages), 1: OSeq(stages)}
+    out = []
+    for (t, g, rank, col, info) in ev:
+        if g == 0:
+            seq[col].drop(rank)
+            continue
+        r = seq[col].event(rank, t, info[0], W)
+        if r:
+            out.append((t, "SELL" if col == -1 else "BUY", r))
+    return out, ev
 
 
 class PSeq:
@@ -525,7 +605,7 @@ def mid_model(T, b15, tfs, wait_min=5, clr=(True, True, True, True), use=(True, 
     for rank, (ks, packs) in tfs.items():
         for j, k in enumerate(ks):
             pk = packs[j]
-            t0, ms, mb, o, stP, sdP, l1s, l2s, hh20, ll20, hh9, ll9, tcP = pk
+            t0, ms, mb, o, stP, sdP, l1s, l2s, hh20, ll20, hh9, ll9, tcP = pk[:13]
             ev.append((k, rank, 1, ms, mb, k))
             if stP is not None and tcP is not None:
                 ev.append((tcP, rank, -1, stP, 0, None))     # confirmed band of the previous bar (sub -1 = before events)
@@ -611,7 +691,7 @@ def pine_updates(T, b15, tfs, delays=None, realtime=False):
         j = bisect.bisect_right(vis, now) - 1
         if j < 0:
             return None
-        prev = packs[j - 1] if j else (None, 0, 0) + (None,) * 10
+        prev = packs[j - 1] if j else (None, 0, 0) + (None,) * 10 + (None, 0, 0)
         return tuple(packs[j]) + tuple(prev)
     ks15, p15 = tfs[0]
     ups = []
@@ -657,9 +737,11 @@ def hand_case(t0, n, packs, hlc, starts=None):
         pk = []
         for k in ks:
             m = (starts or {}).get((rank, k), (0, 0))
-            p = packs.get((rank, k), (k, 0, 0, 100.0, 0, 1, None, None, None, None, None, None, None))
+            p = packs.get((rank, k), (k, 0, 0, 100.0, 0, 1, None, None, None, None, None, None, None, None, 0, 0))
             if len(p) == 12:
                 p = tuple(p) + (None,)
+            if len(p) == 13:
+                p = tuple(p) + (None, 0, 0)
             pk.append((k, m[0], m[1]) + tuple(p[3:]))
         tfs[rank] = (ks, pk)
     return T, b15, tfs
@@ -1153,6 +1235,82 @@ def main():
           "9:25:00 once the data arrives (same as history)",
           sigmarks(mk_a) == [(hm(9, 22), "SELL")] and sigmarks(mk_b) == sigmarks(mk_h) == [(hm(9, 25), "SELL")])
 
+    # ---- 6e. SSS-10: pattern 'フラット→帯＋端の線転換' -------------------------------------------------------------------------
+    import acc_pine as ap
+    fsrc = pine[pine.index("f_edgeMask(float l1P"):pine.index("//  新パターンの説明")]
+    fenv = ap.make_env(type("NB", (), {"__getattr__": lambda self, k: (lambda *a, **kw: None)})(), [])
+    exec(compile(ap.Translator().translate(ap.logical_lines(fsrc)), "f_edgeMask", "exec"), fenv)
+    em = fenv["f_edgeMask"]
+    check("SSS-10 f_edgeMask (Pine): lowest line LINE2 +1 -> -1 -> SELL mask L2", em(105.0, 95.0, 100.0, 1, 1, 1, 1, -1, 1) == (2, 0))
+    check("SSS-10 f_edgeMask (Pine): a non-lowest line flipping does not count", em(105.0, 95.0, 100.0, -1, 1, 1, -1, 1, -1) == (0, 0))
+    check("SSS-10 f_edgeMask (Pine): tie for lowest (L1 = STB), only STB flips -> STB", em(95.0, 100.0, 95.0, 1, 1, 1, 1, 1, -1) == (4, 0))
+    check("SSS-10 f_edgeMask (Pine): tie, both flip -> L1+STB (one event per timeframe)", em(95.0, 100.0, 95.0, 1, 1, 1, -1, 1, -1) == (5, 0))
+    check("SSS-10 f_edgeMask (Pine): highest line STB -1 -> +1 -> BUY mask STB", em(95.0, 100.0, 105.0, 1, 1, -1, 1, 1, 1) == (0, 4))
+    check("SSS-10 f_edgeMask (Pine): a line na -> nothing", em(None, 100.0, 105.0, 1, 1, -1, 1, 1, 1) == (0, 0))
+
+    def BP(k, stP, stS, ma=0, mz=0, tc=None):
+        """pack whose previous bar confirmed with band stP at tc (default k) and whose start band is stS, edge masks ma / mz"""
+        return (k, 0, 0, 100.0, stP, 1, None, None, None, None, None, None, k if tc is None else tc, stS, ma, mz)
+
+    def runB(packs, useB, n=24, t0=None, use=(False, False, False, False), starts=None, delays=None, realtime=False):
+        T, b15, tfs = hand_case(t0 if t0 is not None else hm(9, 20), n, packs, {}, starts or {})
+        _, mk = run_new(pine_updates(T, b15, tfs, delays, realtime), live=realtime, use=use, useB=useB)
+        sigB, _ = model_b(tfs, useB)
+        return sigmarks(mk), sorted((x, d) for (x, d, _) in sigB), mk, list(run_new.labels)
+    U15 = (True, False, False, False)
+    pm, md, mk, _ = runB({(0, hm(9, 21)): BP(hm(9, 21), 0, -1, ma=2)}, U15)
+    check("SSS-10: 15s flat -> red at the start 9:21:00 with the lowest line flipping red at the same start -> SELL",
+          pm == md == [(hm(9, 21), "SELL")] and "15s 帯点灯 09:21:00 / 線転換 09:21:00 L2" in tips(mk, 1)[0])
+    pm, md, mk, _ = runB({(0, hm(9, 21)): BP(hm(9, 21), 0, -1), (0, hm(9, 21, 15)): BP(hm(9, 21, 15), -1, -1, ma=2)}, U15)
+    check("SSS-10: red lights at 9:21:00, the edge line flips at the next start 9:21:15 -> SELL at 9:21:15",
+          pm == md == [(hm(9, 21, 15), "SELL")] and "15s 帯点灯 09:21:00 / 線転換 09:21:15 L2" in tips(mk, 1)[0])
+    pm, md, _, _ = runB({(0, hm(9, 20, 45)): BP(hm(9, 20, 45), 0, 1), (0, hm(9, 21)): BP(hm(9, 21), 1, -1, ma=2)}, U15)
+    check("SSS-10: blue -> red directly (no flat) does not arm -> no SELL", pm == md == [])
+    pm, md, _, _ = runB({(0, hm(9, 21)): BP(hm(9, 21), 0, -1), (0, hm(9, 21, 15)): BP(hm(9, 21, 15), -1, 0),
+                         (0, hm(9, 21, 30)): BP(hm(9, 21, 30), 0, -1, ma=1)}, U15)
+    check("SSS-10: flat at 9:21:15 disarms, flat -> red again at 9:21:30 re-arms -> SELL at 9:21:30", pm == md == [(hm(9, 21, 30), "SELL")])
+    pm, md, _, _ = runB({(0, hm(9, 21)): BP(hm(9, 21), 0, -1, ma=2), (0, hm(9, 21, 15)): BP(hm(9, 21, 15), -1, -1, ma=2)}, U15)
+    check("SSS-10: once per red section (a second edge flip in the same section is ignored)", pm == md == [(hm(9, 21), "SELL")])
+    pm, md, _, _ = runB({(0, hm(9, 21)): BP(hm(9, 21), 0, -1), (0, hm(9, 21, 15)): BP(hm(9, 21, 15), None, None),
+                         (0, hm(9, 21, 30)): BP(hm(9, 21, 30), -1, -1, ma=2)}, U15)
+    check("SSS-10: a missing band value is not treated as flat (stays armed) -> SELL at 9:21:30", pm == md == [(hm(9, 21, 30), "SELL")])
+    pm2, md2, _, _ = runB({(0, hm(9, 21)): BP(hm(9, 21), 0, 0), (0, hm(9, 21, 15)): BP(hm(9, 21, 15), -1, -1, ma=2)}, U15)
+    check("SSS-10: confirmed band red (9:21:15) after a flat start arms at the confirm; the edge flip at the 9:21:15 start fires",
+          pm2 == md2 == [(hm(9, 21, 15), "SELL")])
+    UB = (True, True, True, False)
+    chain = {(0, hm(9, 21)): BP(hm(9, 21), 0, -1, ma=2), (1, hm(9, 21, 30)): BP(hm(9, 21, 30), 0, -1, ma=1),
+             (2, hm(9, 22)): BP(hm(9, 22), 0, -1, ma=4)}
+    pm, md, mk, _ = runB(chain, UB)
+    tp = tips(mk, 1)
+    check("SSS-10: 15s 9:21:00 -> 30s 9:21:30 -> 1m 9:22:00 -> 'SELL フラット→帯＋端の線転換' at 9:22:00 (Pine and model)",
+          pm == md == [(hm(9, 22), "SELL")] and "成立幅 1分" in tp[0]
+          and "30s 帯点灯 09:21:30 / 線転換 09:21:30 L1" in tp[0] and "1m 帯点灯 09:22:00 / 線転換 09:22:00 STB" in tp[0])
+    pm, md, _, _ = runB({**chain, (0, hm(9, 21, 45)): BP(hm(9, 21, 45), -1, 0)}, UB)
+    check("SSS-10: the 15s band turns flat at 9:21:45 -> candidates with that 15s event are dropped -> no SELL", pm == md == [])
+    pm, md, _, _ = runB({**chain, (1, hm(9, 21, 30)): BP(hm(9, 21, 30), 0, -1, ma=1), (0, hm(9, 21, 45)): BP(hm(9, 21, 45), -1, 1)}, UB)
+    check("SSS-10: the 15s band turns to the opposite colour -> dropped as well -> no SELL", pm == md == [])
+    chainB = {(0, hm(9, 21)): BP(hm(9, 21), 0, 1, mz=2), (1, hm(9, 21, 30)): BP(hm(9, 21, 30), 0, 1, mz=1),
+              (2, hm(9, 22)): BP(hm(9, 22), 0, 1, mz=4)}
+    pm, md, _, _ = runB(chainB, UB)
+    check("SSS-10: BUY mirror (flat -> blue, highest line red -> blue) -> BUY at 9:22:00", pm == md == [(hm(9, 22), "BUY")])
+    pm, md, _, _ = runB({(0, hm(9, 21)): BP(hm(9, 21), 0, -1, ma=2), (2, hm(9, 22)): BP(hm(9, 22), 0, -1, ma=4),
+                         (1, hm(9, 22, 30)): BP(hm(9, 22, 30), 0, -1, ma=1)}, UB)
+    check("SSS-10: 15s -> 1m -> 30s: the early 1m is not used for its stage -> no SELL", pm == md == [])
+    # both patterns ON: same position -> one label with both names
+    stA = {(0, hm(9, 21)): (2, 0), (1, hm(9, 21, 30)): (2, 0), (2, hm(9, 22)): (2, 0)}
+    _, _, mk, labels = runB(chain, UB, use=(True, True, True, False), starts=stA)
+    check("SSS-10: both patterns complete at 9:22:00 -> one label 'SELL 帯→フラット・フラット→帯＋端の線転換'",
+          sigmarks(mk) == [(hm(9, 22), "SELL")] and labels == [(hm(9, 22), "SELL 帯→フラット・フラット→帯＋端の線転換")])
+    # data wait per pattern: 帯→フラット uses 5m (late), フラット→帯 uses 15s/30s only -> not held
+    T, b15, tfs = hand_case(hm(9, 20), 48, {(0, hm(9, 21)): BP(hm(9, 21), 0, -1, ma=2), (1, hm(9, 21, 30)): BP(hm(9, 21, 30), 0, -1, ma=1)},
+                            {}, {})
+    dl = {3: {hm(9, 20): 150_000, hm(9, 25): 150_000}}
+    ups = pine_updates(T, b15, tfs, dl, realtime=True)
+    i22 = next(n for n, u in enumerate(ups) if u["t"] == hm(9, 21, 45)) + 1
+    _, mk_a = run_new(ups[:i22], live=True, use=(True, True, True, True), useB=(True, True, False, False))
+    check("SSS-10: with the 5m data late for 帯→フラット, フラット→帯 (15s+30s) still fires at 9:21:30",
+          sigmarks(mk_a) == [(hm(9, 21, 30), "SELL")])
+
     # ---- 7. SSS-5 random: translated Pine (history / realtime with delays) vs the independent model -------------------------
     agree = rt_agree = n_mid = n_sig = n_mid_sig = n_clr_diff = 0
     seeds = [500, 503, 515, 520, 522, 526, 554]   # 515 / 520 / 522 / 526 / 554 contain signals ending on a mid-bar 1m STB
@@ -1197,6 +1355,26 @@ def main():
         _, mk_h = run_new(pine_updates(T, b15, tfs), use=(True, True, True, True))
         rt9 += sigmarks(mk_rt) == sigmarks(mk_h)
     print(f"   SSS-9 random signals per selection: { {''.join('1' if u else '0' for u in k): v for k, v in cnt9.items()} }")
+    agreeB = rtB = nB = 0
+    for seed in (515, 520, 522, 526, 500, 503):
+        rng6 = random.Random(seed)
+        b15 = regime_bars(rng6, 1200, vol=rng6.choice([0.3, 0.8]))
+        T = [T0 + i * S15 for i in range(len(b15))]
+        tfs = series_tfs(T, b15)
+        for useB in ((True, True, True, False), (True, False, False, False), (True, True, False, False)):
+            _, mk = run_new(pine_updates(T, b15, tfs), use=(False, False, False, False), useB=useB)
+            sigB, _ = model_b(tfs, useB)
+            nB += len(sigB)
+            agreeB += sigmarks(mk) == sorted((x, d) for (x, d, _) in sigB)
+        if seed in (515, 522):
+            dl = {1: {k: rng6.randint(0, 40_000) for k in tfs[1][0]}, 2: {k: rng6.randint(0, 40_000) for k in tfs[2][0]},
+                  3: {k: rng6.randint(0, 120_000) for k in tfs[3][0]}}
+            _, mk_rt = run_new(pine_updates(T, b15, tfs, dl, realtime=True), live=True, useB=(True, True, True, True))
+            _, mk_h = run_new(pine_updates(T, b15, tfs), useB=(True, True, True, True))
+            rtB += sigmarks(mk_rt) == sigmarks(mk_h)
+    print(f"   SSS-10 random フラット→帯 signals (3 selections x 6 series): {nB}")
+    check("SSS-10 random: translated Pine == model_b (3 selections x 6 series)", agreeB == 18)
+    check("SSS-10 random: both patterns ON (B all four), realtime with delays == history (2 runs)", rtB == 2)
     check("SSS-9 random: translated Pine == model for 4 selections x 4 series", agree9 == 16)
     check("SSS-9 random: all four ON, realtime with 30s/1m delays <= 40 s and 5m delays <= 2 min == history (4 runs)", rt9 == 4)
 
