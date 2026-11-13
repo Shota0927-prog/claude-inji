@@ -18,6 +18,7 @@
 Evidence class: PINE_NOT_VERIFIED (TradingView compiler, request.security delivery and drawing are not run here).
 """
 import math
+import re
 import os
 import random
 
@@ -178,38 +179,150 @@ class Seq:
         return None
 
 
-def chart_run(rows, wait_min=5):
-    """rows: per 15s chart bar: (t, (ms15, mb15), t30, (ms30, mb30), t60, (ms60, mb60)). Returns list of (bar, dir, times)."""
+NONE, WAIT, RCV, LOST = 0, 1, 2, 3
+
+
+def chart_run(rows, wait_min=5, live=False):
+    """Mirror of the SSS-3 Pine row queue. rows: one dict per chart update (normally one per 15s bar):
+        t (15s bar time), e15=(ms, mb), need30 / need60 (start time if time("30S") / time("1") switched on this bar),
+        r30 / r60 = (cur_t, cur_ms, cur_mb, prev_t, prev_ms, prev_mb) delivered by request.security (or None),
+        now (optional live clock for the tooltip; only used when live=True).
+    Returns (signals, lost): signals = [(mark_x = 1m start, 'SELL'|'BUY', (t15, t30, t60), chart_t_detected, live_t)],
+    lost = [(tf, start_t, reason, chart_t)]."""
     W = wait_min * M
     sS, sB = Seq(), Seq()
-    out = []
-    prev30 = prev60 = None
-    for i, (t, e15, t30, e30, t60, e60) in enumerate(rows):
-        sS.on15(t, e15[0], W); sB.on15(t, e15[1], W)
-        if t30 is not None and t30 != prev30:
-            sS.on30(t30, e30[0], W); sB.on30(t30, e30[1], W)
-        if t60 is not None and t60 != prev60:
-            rs = sS.on60(t60, e60[0], W); rb = sB.on60(t60, e60[1], W)
-            if rs:
-                out.append((i, "SELL", rs))
-            if rb:
-                out.append((i, "BUY", rb))
-        prev30, prev60 = t30, t60
-    return out
+    Q = []  # rows: dict
+    last_row = None
+    sig, lost = [], []
+    for r in rows:
+        T = r["t"]
+        live_t = r.get("now", T) if live else None
+        # 1. add the row once per 15s time
+        if last_row != T:
+            last_row = T
+            Q.append(dict(t=T, s15=r["e15"][0], b15=r["e15"][1],
+                          c={30: [r.get("need30"), WAIT if r.get("need30") is not None else NONE, 0, 0],
+                             60: [r.get("need60"), WAIT if r.get("need60") is not None else NONE, 0, 0]}))
+        # 2. match current and previous bar data into WAIT cells with the same start time only
+        for tf, key in ((30, "r30"), (60, "r60")):
+            d = r.get(key)
+            if not d:
+                continue
+            for (tt, ms, mb) in ((d[0], d[1], d[2]), (d[3], d[4], d[5])):
+                if tt is None:
+                    continue
+                for row in Q:
+                    c = row["c"][tf]
+                    if c[1] == WAIT and c[0] == tt:
+                        c[1], c[2], c[3] = RCV, ms, mb
+        # 3. lost
+        for tf, key in ((30, "r30"), (60, "r60")):
+            d = r.get(key)
+            prv = d[3] if d else None
+            for row in Q:
+                c = row["c"][tf]
+                if c[1] == WAIT:
+                    why = "prev" if (prv is not None and prv > c[0]) else "3min" if T - c[0] >= 180_000 else None
+                    if why:
+                        c[1] = LOST
+                        lost.append((tf, c[0], why, T))
+        # 4. process from the oldest row
+        while Q and all(Q[0]["c"][tf][1] != WAIT for tf in (30, 60)):
+            row = Q.pop(0)
+            tr = row["t"]
+            items = [(tr, 0, row["s15"], row["b15"])]
+            for rank, tf in ((1, 30), (2, 60)):
+                c = row["c"][tf]
+                if c[1] != NONE:
+                    items.append((c[0], rank, c[2] if c[1] == RCV else 0, c[3] if c[1] == RCV else 0))
+            for (t, rank, ms, mb) in sorted(items, key=lambda x: (x[0], x[1])):
+                if rank == 0:
+                    sS.on15(t, ms, W); sB.on15(t, mb, W)
+                elif rank == 1:
+                    sS.on30(t, ms, W); sB.on30(t, mb, W)
+                else:
+                    rs = sS.on60(t, ms, W); rb = sB.on60(t, mb, W)
+                    if rs:
+                        sig.append((t, "SELL", rs, T, live_t))
+                    if rb:
+                        sig.append((t, "BUY", rb, T, live_t))
+    return sig, lost
+
+
+def build_rows(n_bars, ev15, ev30, ev60, t0=10 * M, delay30=None, delay60=None):
+    """Chart rows for scripted cases. ev*: {start_t: 'S'|'B'|'SB'}. delay*: {start_t: ms} visibility delay of that HTF bar
+    (float('inf') = never delivered). Visibility is made monotone (a later bar is never visible before an earlier one), and the
+    request returns the latest visible bar as current and its predecessor as previous."""
+    def mask(ev, t):
+        e = ev.get(t, "")
+        return (2 if "S" in e else 0, 1 if "B" in e else 0)
+    ts = [t0 + i * S15 for i in range(n_bars)]
+
+    def htf(step, ev, delay):
+        starts = sorted({t - t % step for t in ts})
+        vis, mx = [], float("-inf")
+        for k in starts:
+            v = k + (delay or {}).get(k, 0)
+            mx = max(mx, v)
+            vis.append(mx)
+        return starts, vis, [mask(ev, k) for k in starts]
+    h30, h60 = htf(30_000, ev30, delay30), htf(M, ev60, delay60)
+
+    def deliver(h, T):
+        starts, vis, m = h
+        j = max([i for i, v in enumerate(vis) if v <= T], default=None)
+        if j is None:
+            return None
+        pt, pm = (starts[j - 1], m[j - 1]) if j else (None, (0, 0))
+        return (starts[j], m[j][0], m[j][1], pt, pm[0], pm[1])
+    rows = []
+    for i, T in enumerate(ts):
+        rows.append(dict(t=T, e15=mask(ev15, T),
+                         need30=T if T % 30_000 == 0 else None, need60=T if T % M == 0 else None,
+                         r30=deliver(h30, T), r60=deliver(h60, T)))
+    return rows
+
+
+def fast_rows(ts, ev15, ev30, ev60, k30, k60, d30=None, d60=None):
+    """build_rows() for long series (bisect delivery)."""
+    import bisect
+
+    def mask(ev, t):
+        e = ev.get(t, "")
+        return (2 if "S" in e else 0, 1 if "B" in e else 0)
+
+    def htf(starts, ev, delay):
+        vis, mx = [], float("-inf")
+        for k in starts:
+            mx = max(mx, k + (delay or {}).get(k, 0))
+            vis.append(mx)
+        return starts, vis, [mask(ev, k) for k in starts]
+
+    def deliver(h, T):
+        starts, vis, m = h
+        j = bisect.bisect_right(vis, T) - 1
+        if j < 0:
+            return None
+        pt, pm = (starts[j - 1], m[j - 1]) if j else (None, (0, 0))
+        return (starts[j], m[j][0], m[j][1], pt, pm[0], pm[1])
+    h30, h60 = htf(k30, ev30, d30), htf(k60, ev60, d60)
+    return [dict(t=T, e15=mask(ev15, T), need30=T if T % 30_000 == 0 else None, need60=T if T % M == 0 else None,
+                 r30=deliver(h30, T), r60=deliver(h60, T)) for T in ts]
 
 
 def scripted(events, n_bars=60, t0=10 * M):
-    """events: {(tf, t): 'S'|'B'|'SB'} -> rows with the event only on the requested time's first 15s bar."""
-    rows = []
-    for i in range(n_bars):
-        t = t0 + i * S15
-        t30 = t - t % 30_000
-        t60 = t - t % M
-        def m(tf, tt):
-            e = events.get((tf, tt), "")
-            return (2 if "S" in e else 0, 1 if "B" in e else 0)
-        rows.append((t, m(15, t), t30, m(30, t30), t60, m(60, t60)))
-    return rows
+    """events: {(tf, t): 'S'|'B'|'SB'} -> rows without delays (history)."""
+    ev = {15: {}, 30: {}, 60: {}}
+    for (tf, t), e in events.items():
+        ev[tf][t] = e
+    return build_rows(n_bars, ev[15], ev[30], ev[60], t0)
+
+
+def sigs(rows, **kw):
+    """(bar index of the anchor, dir, times) — comparable with the pre-queue expectations."""
+    sig, _ = chart_run(rows, **kw)
+    t0 = rows[0]["t"]
+    return [((a - t0) // S15, d, tt) for (a, d, tt, _, _) in sig]
 
 
 RESULTS = []
@@ -264,7 +377,10 @@ def main():
     pine = open(os.path.join(ROOT, "SatsShortSignal.pine"), encoding="utf-8").read()
     check("f_satBand() byte-identical to the SAT BAND Reconstruction Test source", src in pine)
     code = "\n".join(ln.split("//")[0] for ln in pine.splitlines())
-    check("no realtime-only gate / varip left (code lines)", "barstate.isrealtime" not in code and "varip" not in code)
+    check("processing is not gated on realtime (barstate.isrealtime only selects the live detection time)",
+          code.count("barstate.isrealtime") == 1 and "barstate.isrealtime ? timenow : na" in code)
+    check("rows, wait state and mark reservations are varip (no rollback)",
+          all(re.search(r"^varip array<int>\s+" + v + r"\s*=", code, re.M) for v in ("rT", "rC30", "rC60", "sqS", "sqB", "mkBar")))
 
     # ---- 2. start-of-bar formulas vs the f_satBand() port ---------------------------------------------------------------
     rng = random.Random(7)
@@ -320,38 +436,110 @@ def main():
 
     # ---- 3. sequencing ----------------------------------------------------------------------------------------------------
     T0 = 10 * M
-    r = chart_run(scripted({(15, T0): "S", (30, T0): "S", (60, T0): "S"}))
+    r = sigs(scripted({(15, T0): "S", (30, T0): "S", (60, T0): "S"}))
     check("SELL: 15s/30s/1m at the same start time -> one SELL on that 15s bar", r == [(0, "SELL", (T0, T0, T0))])
-    r = chart_run(scripted({(15, T0): "B", (30, T0): "B", (60, T0): "B"}))
+    r = sigs(scripted({(15, T0): "B", (30, T0): "B", (60, T0): "B"}))
     check("BUY: 15s/30s/1m at the same start time -> one BUY", r == [(0, "BUY", (T0, T0, T0))])
-    r = chart_run(scripted({(15, T0): "S", (30, T0 + 2 * M): "S", (60, T0 + 5 * M): "S"}))
+    r = sigs(scripted({(15, T0): "S", (30, T0 + 2 * M): "S", (60, T0 + 5 * M): "S"}))
     check("1m exactly 5 min after 15s -> SELL (on the 15s bar where the 1m bar starts)", r == [(20, "SELL", (T0, T0 + 2 * M, T0 + 5 * M))])
-    r = chart_run(scripted({(15, T0 + S15): "B", (30, T0 + M): "B", (60, T0 + 6 * M): "B"}, n_bars=30))
+    r = sigs(scripted({(15, T0 + S15): "B", (30, T0 + M): "B", (60, T0 + 6 * M): "B"}, n_bars=30))
     check("1m 5m45s after 15s -> no BUY", r == [])
-    r = chart_run(scripted({(15, T0 + S15): "B", (30, T0 + M): "B", (60, T0 + 6 * M): "B"}, n_bars=30), wait_min=6)
+    r = sigs(scripted({(15, T0 + S15): "B", (30, T0 + M): "B", (60, T0 + 6 * M): "B"}, n_bars=30), wait_min=6)
     check("same with wait 6 -> BUY", len(r) == 1)
-    r = chart_run(scripted({(15, T0): "S", (30, T0 + M): "B", (60, T0 + 2 * M): "S"}))
+    r = sigs(scripted({(15, T0): "S", (30, T0 + M): "B", (60, T0 + 2 * M): "S"}))
     check("SELL 15s + BUY 30s + SELL 1m -> nothing (directions do not mix)", r == [])
-    r = chart_run(scripted({(15, T0): "B", (30, T0 + M): "S", (60, T0 + 2 * M): "B"}))
+    r = sigs(scripted({(15, T0): "B", (30, T0 + M): "S", (60, T0 + 2 * M): "B"}))
     check("BUY 15s + SELL 30s + BUY 1m -> nothing", r == [])
-    r = chart_run(scripted({(15, T0): "S", (15, T0 + S15): "B", (30, T0 + 30_000): "SB", (60, T0 + M): "SB"}))
+    r = sigs(scripted({(15, T0): "S", (15, T0 + S15): "B", (30, T0 + 30_000): "SB", (60, T0 + M): "SB"}))
     check("interleaved SELL and BUY chains -> one SELL and one BUY on the same bar",
           sorted(x[1] for x in r) == ["BUY", "SELL"] and all(x[0] == 4 for x in r))
-    r = chart_run(scripted({(30, T0): "S", (15, T0 + S15): "S", (60, T0 + M): "S"}))
+    r = sigs(scripted({(30, T0): "S", (15, T0 + S15): "S", (60, T0 + M): "S"}))
     check("30s before 15s, no later 30s -> no SELL", r == [])
-    r = chart_run(scripted({(15, T0): "S", (30, T0 + 30_000): "S", (15, T0 + M + S15): "S", (60, T0 + 6 * M): "S"}, n_bars=30))
+    r = sigs(scripted({(15, T0): "S", (30, T0 + 30_000): "S", (15, T0 + M + S15): "S", (60, T0 + 6 * M): "S"}, n_bars=30))
     check("newer 15s does not move the pair's deadline (expires)", r == [])
-    r = chart_run(scripted({(15, T0): "S", (30, T0 + 30_000): "S", (15, T0 + M + S15): "S", (30, T0 + 2 * M): "S",
+    r = sigs(scripted({(15, T0): "S", (30, T0 + 30_000): "S", (15, T0 + M + S15): "S", (30, T0 + 2 * M): "S",
                             (60, T0 + 6 * M): "S"}, n_bars=30))
     check("new 30s with newer valid 15s updates the pair -> SELL", r == [(24, "SELL", (T0 + M + S15, T0 + 2 * M, T0 + 6 * M))])
-    r = chart_run(scripted({(15, T0): "S", (30, T0 + 30_000): "S", (60, T0 + M): "S", (60, T0 + 2 * M): "S"}))
+    r = sigs(scripted({(15, T0): "S", (30, T0 + 30_000): "S", (60, T0 + M): "S", (60, T0 + 2 * M): "S"}))
     check("after a SELL the next 1m needs new 15s/30s", len(r) == 1)
     # a red line turning back blue later: the recorded event is history; nothing re-evaluates it (no event = no change)
-    r = chart_run(scripted({(15, T0): "S", (30, T0 + 30_000): "S", (60, T0 + 3 * M): "S"}))
+    r = sigs(scripted({(15, T0): "S", (30, T0 + 30_000): "S", (60, T0 + 3 * M): "S"}))
     check("intermediate bars without events (line back to blue) keep the record -> SELL", len(r) == 1)
 
-    # ---- 4. random end-to-end (15s -> 30s / 1m aggregation, request [1] + lookahead_on model) ----------------------------
-    def e2e(b15):
+    # ---- 4. delivery order (SSS-3): rows keyed by the 15s time, 30s / 1m cells matched by start time ---------------------------
+    T1 = 10 * 3600_000   # 10:00:00 (UTC-free arithmetic; only differences matter)
+
+    def proj(sg):
+        return [(x[0], x[1], x[2]) for x in sg]
+    # case 1: 15s at 10:00:00; the 30s bar starting 10:00:30 arrives at 10:00:45 with a new 15s event at 10:00:45
+    rows = build_rows(12, {T1: "S", T1 + 45_000: "S"}, {T1 + 30_000: "S"}, {T1 + M: "S"}, T1, delay30={T1 + 30_000: 15_000})
+    sg, lost = chart_run(rows)
+    check("case 1: late 30s (10:00:30, arrives 10:00:45) pairs with the 10:00:00 15s; the 10:00:45 15s does not overwrite it",
+          proj(sg) == [(T1 + M, "SELL", (T1, T1 + 30_000, T1 + M))] and not lost)
+    rows = build_rows(12, {T1: "B", T1 + 45_000: "B"}, {T1 + 30_000: "B"}, {T1 + M: "B"}, T1, delay30={T1 + 30_000: 15_000})
+    check("case 1 (BUY): same pairing", proj(chart_run(rows)[0]) == [(T1 + M, "BUY", (T1, T1 + 30_000, T1 + M))])
+    # case 2: same start time; the 1m data arrives before the 30s data
+    for d, nm in (("S", "SELL"), ("B", "BUY")):
+        rows = build_rows(12, {T1: d}, {T1: d}, {T1: d}, T1, delay30={T1: 30_000})
+        sg, lost = chart_run(rows)
+        check(f"case 2 ({nm}): 1m before 30s at the same start -> one {nm} when the 30s arrives, marked at the 1m start",
+              proj(sg) == [(T1, nm, (T1, T1, T1))] and sg[0][3] == T1 + 30_000 and not lost)
+    # 30s arrives late with NO event: hold released (the following 15s rows are processed)
+    rows = build_rows(12, {T1 + S15: "S"}, {}, {}, T1, delay30={T1: 30_000})
+    Q_after = chart_run(rows)
+    check("case 2: a late 30s without an event is still 'received' and releases the hold (nothing lost)", Q_after[1] == [])
+    # case 3: 1m bar starting exactly 5 min after the 15s event, its data arriving 45 s late
+    for d, nm in (("S", "SELL"), ("B", "BUY")):
+        rows = build_rows(30, {T1: d}, {T1 + 2 * M: d}, {T1 + 5 * M: d}, T1, delay60={T1 + 5 * M: 45_000})
+        for rw in rows:
+            rw["now"] = rw["t"] + 3_000
+        sg, lost = chart_run(rows, live=True)
+        check(f"case 3 ({nm}): late 1m at exactly 5 min is judged by its start time -> {nm} marked at the 1m start, "
+              "live detection 45 s later",
+              proj(sg) == [(T1 + 5 * M, nm, (T1, T1 + 2 * M, T1 + 5 * M))] and sg[0][3] == T1 + 5 * M + 45_000 and not lost)
+        sg_h, _ = chart_run(build_rows(30, {T1: d}, {T1 + 2 * M: d}, {T1 + 5 * M: d}, T1))
+        check(f"case 3 ({nm}): reload (history, no delay) -> same mark at the 1m start, no live detection time",
+              proj(sg_h) == proj(sg) and sg_h[0][4] is None)
+    # case 4a: recovery from the previous-bar data (30s delay crossing the next 30s start)
+    rows = build_rows(12, {T1: "S"}, {T1 + 30_000: "S"}, {T1 + M: "S"}, T1, delay30={T1 + 30_000: 35_000})
+    sg, lost = chart_run(rows)
+    check("case 4: 30s data recovered from the request's previous-bar slot", proj(sg) == [(T1 + M, "SELL", (T1, T1 + 30_000, T1 + M))]
+          and not lost)
+    # case 4b: lost because the previous-bar start strictly passed the waited start; processing resumes
+    rows = build_rows(30, {T1: "S", T1 + 2 * M: "S"}, {T1 + 30_000: "S", T1 + 2 * M + 30_000: "S"}, {T1 + 3 * M: "S"}, T1,
+                      delay30={T1 + 30_000: 60_000})
+    sg, lost = chart_run(rows)
+    check("case 4: request jumps two 30s bars -> 30s 10:00:30 lost by 'previous bar passed', later chain still signals",
+          (30, T1 + 30_000, "prev") in [(x[0], x[1], x[2]) for x in lost]
+          and proj(sg) == [(T1 + 3 * M, "SELL", (T1 + 2 * M, T1 + 2 * M + 30_000, T1 + 3 * M))])
+    # case 4c: lost after 3 minutes of chart time (feed stalls), queue drains; data arriving after the loss is ignored
+    rows = build_rows(40, {T1: "S"}, {T1 + 30_000: "S"}, {}, T1, delay30={T1 + 30_000: float("inf")})
+    sg, lost = chart_run(rows)
+    first = [x for x in lost if x[1] == T1 + 30_000]
+    check("case 4: 30s feed stalls -> lost at exactly 3 min of chart time ('3min'), queue drains",
+          first and first[0][2] == "3min" and first[0][3] - T1 - 30_000 == 180_000)
+    rows = build_rows(40, {T1: "S"}, {T1 + 30_000: "S"}, {T1 + 5 * M: "S"}, T1, delay30={T1 + 30_000: float("inf")})
+    late = dict(rows[20])  # 10:05:00: inject the long-lost 10:00:30 30s data (with an event) as 'previous bar'
+    late["r30"] = (T1 + 5 * M, 0, 0, T1 + 30_000, 2, 0)
+    rows[20] = late
+    sg, lost = chart_run(rows)
+    check("case 4: data for a cell already marked lost is not processed (no SELL from it)", sg == [])
+    # case 4d: duplicate delivery (same start delivered again with different masks on later updates) does not overwrite
+    rows = build_rows(12, {T1: "S"}, {T1 + 30_000: "S"}, {T1 + M: "S"}, T1)
+    dup = dict(rows[3])
+    dup["r30"] = (T1 + 30_000, 0, 1, T1, 0, 0)   # a second update of 10:00:45 claiming the 30s had no SELL
+    rows.insert(4, dup)
+    sg, _ = chart_run(rows)
+    check("case 4: duplicate receipt of an already received 30s cell is ignored", proj(sg) == [(T1 + M, "SELL", (T1, T1 + 30_000, T1 + M))])
+    # several rows processed in one update: all marks shown
+    rows = build_rows(12, {T1: "SB"}, {T1: "S", T1 + 30_000: "B"}, {T1 + M: "SB"}, T1,
+                      delay30={T1: 45_000, T1 + 30_000: 15_000}, delay60={T1: 45_000})
+    sg, lost = chart_run(rows)
+    check("several rows released by one update (10:00:45 brings 30s 10:00:00 / 10:00:30 and 1m 10:00:00) -> both the SELL and the BUY marks, at the 1m start",
+          sorted(proj(sg)) == [(T1 + M, "BUY", (T1, T1 + 30_000, T1 + M)), (T1 + M, "SELL", (T1, T1, T1 + M))] and not lost)
+
+    # ---- 5. random end-to-end (15s -> 30s / 1m aggregation, request [time, evt, time[1], evt[1]] + lookahead_on model) -------
+    def e2e(b15, rng=None, max_delay=0):
         n = len(b15)
         T = [T0 + i * S15 for i in range(n)]
 
@@ -365,48 +553,62 @@ def main():
                     x = g[k]; x["h"] = max(x["h"], b["h"]); x["l"] = min(x["l"], b["l"]); x["c"] = b["c"]; x["v"] += b["v"]
             ks = sorted(g)
             return ks, [g[k] for k in ks]
+
+        def evmap(ks, bars, ser):
+            out = {}
+            for j, k in enumerate(ks):
+                e = f_evt(bars[j]["o"], ser[j - 1]["prep"] if j else None)[:2]
+                out[k] = ("S" if e[0] else "") + ("B" if e[1] else "")
+            return out
         k30, b30 = agg(30_000)
         k60, b60 = agg(M)
-        s15, s30, s60 = sat_series(b15), sat_series(b30), sat_series(b60)
-        i30 = {k: j for j, k in enumerate(k30)}
-        i60 = {k: j for j, k in enumerate(k60)}
-        rows, ev = [], {}
-        for i, t in enumerate(T):
-            e15 = f_evt(b15[i]["o"], s15[i - 1]["prep"] if i else None)[:2]
-            t30 = t - t % 30_000; j = i30[t30]
-            e30 = f_evt(b30[j]["o"], s30[j - 1]["prep"] if j else None)[:2]
-            t60 = t - t % M; q = i60[t60]
-            e60 = f_evt(b60[q]["o"], s60[q - 1]["prep"] if q else None)[:2]
-            rows.append((t, e15, t30, e30, t60, e60))
-            for tf, tt, e in ((15, t, e15), (30, t30, e30), (60, t60, e60)):
-                if e[0]:
-                    ev[(tf, tt, "S")] = 1
-                if e[1]:
-                    ev[(tf, tt, "B")] = 1
-        sig = chart_run(rows)
+        ev15 = evmap(T, b15, sat_series(b15))
+        ev30 = evmap(k30, b30, sat_series(b30))
+        ev60 = evmap(k60, b60, sat_series(b60))
+        d30 = {k: rng.randint(0, max_delay) for k in k30} if rng else None
+        d60 = {k: rng.randint(0, max_delay) for k in k60} if rng else None
+        rows = fast_rows(T, ev15, ev30, ev60, k30, k60, d30, d60)
+        sig, lost = chart_run(rows)
+        ev = {(tf, t, c) for tf, m in ((15, ev15), (30, ev30), (60, ev60)) for t, e in m.items() for c in e}
         bad = 0
-        for (i, d, (a, b_, c)) in sig:
+        for (anc, d, (a, b_, c), det, _) in sig:
             k = "S" if d == "SELL" else "B"
-            ok = a <= b_ <= c and c - a <= 5 * M and T[i] == c and (15, a, k) in ev and (30, b_, k) in ev and (60, c, k) in ev
+            ok = a <= b_ <= c and c - a <= 5 * M and anc == c and det >= c and (15, a, k) in ev and (30, b_, k) in ev and (60, c, k) in ev
             bad += 0 if ok else 1
-        return sig, ev, bad
+        return sig, lost, ev, bad
 
     tot = {"SELL": 0, "BUY": 0}
     evts = {"S": 0, "B": 0}
     bad = 0
-    mir_bad = 0
+    delay_bad = 0
+    lossy_bad = 0
+    n_lost = 0
     for trial in range(40):
         rng2 = random.Random(100 + trial)
         b15 = regime_bars(rng2, 2400, vol=rng2.choice([0.3, 0.8]))
-        sig, ev, bd = e2e(b15)
-        bad += bd
+        sig, lost, ev, bd = e2e(b15)
+        bad += bd + len(lost)
         for (_, _, d) in ev:
             evts[d] += 1
         for x in sig:
             tot[x[1]] += 1
-    print(f"   random: single-TF events S={evts['S']} B={evts['B']}  signals SELL={tot['SELL']} BUY={tot['BUY']}")
-    check("random end-to-end: every signal is a same-direction 15s<=30s<=1m chain within 5 min, on the 1m start bar", bad == 0)
+        key = sorted((x[0], x[1], x[2]) for x in sig)
+        if trial < 15:
+            # realtime with random delivery delays up to 45 s (always recoverable from current / previous bar)
+            sd, ld, _, bd = e2e(b15, random.Random(900 + trial), 45_000)
+            bad += bd
+            if sorted((x[0], x[1], x[2]) for x in sd) != key or ld:
+                delay_bad += 1
+            # delays up to 75 s: some 30s bars become unrecoverable -> lost; remaining signals must be a subset
+            sl, ll, _, bd = e2e(b15, random.Random(1900 + trial), 75_000)
+            bad += bd
+            n_lost += len(ll)
+    print(f"   random: single-TF events S={evts['S']} B={evts['B']}  signals SELL={tot['SELL']} BUY={tot['BUY']}  lost(75s runs)={n_lost}")
+    check("random end-to-end: every signal is a same-direction 15s<=30s<=1m chain within 5 min, marked at the 1m start", bad == 0)
     check("random end-to-end: both SELL and BUY signals appear in history", tot["SELL"] > 0 and tot["BUY"] > 0)
+    check("random delays <= 45 s give exactly the history (reload) signals at the same 1m start bars, nothing lost (15 runs)",
+          delay_bad == 0)
+    check("random delays <= 75 s: unrecoverable items are reported as lost and the queue keeps draining", n_lost > 0)
 
     # BUY is the exact mirror of SELL inside f_evt (random start states; price -> K - price, directions / states negated).
     # (Whole-series mirroring is not exact because f_satBand() itself is asymmetric: dirs start at +1 and STB favours +1 when
