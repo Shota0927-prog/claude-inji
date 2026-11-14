@@ -325,6 +325,58 @@ def main():
     en, _ = entries(cTA=True, cTim="AND")
     check("entry: TC AND TA (no TA on that bar) -> no order", en == [])
 
+    # 7. LAB-18b: the 15s bars for a 30s / 1m mid-bar STB are limited to the target bar's own interval
+    #    end = min(start + 30 / 60 s, next fetched start of the same timeframe, the 5m close); start in [start, end), close <= end
+    prev18 = subprocess.run(["git", "-C", ROOT, "show", "300bf15:ZoneComboLabXAU.pine"], capture_output=True, text=True).stdout
+
+    def drop30(bars, t30):
+        """remove the 30s bar starting t30 from the request.security_lower_tf arrays (not delivered)"""
+        for b in bars:
+            if t30 in (b.get("tq30t") or []):
+                j = b["tq30t"].index(t30)
+                for n in F30:
+                    del b[n][j]
+        return bars
+
+    def run_src(src, bars, **ov):
+        lp.SRC_OVERRIDE = src
+        try:
+            return run_tc(bars, **ov)[0]
+        finally:
+            lp.SRC_OVERRIDE = None
+    SP = (0, 0, 0, 100.0, 1, 1, 90.0, 110.0, 120.0, 95.0, 118.0, 96.0)
+    st7 = {(0, hm(1, 1)): (2, 0), (2, hm(1, 2)): (2, 0)}
+    T, b15, tfs = ss.hand_case(hm(1, 0), 40, {(1, hm(1, 1)): SP}, {hm(1, 1, 30): (100.2, 94.0, 99.0)}, st7)
+    bars7 = drop30(lab_bars(T, b15, tfs), hm(1, 1, 30))
+    got_new = run_src(SRC, bars7)
+    got_old = run_src(prev18, bars7)
+    check("15s window: the 30s bar 01:01:30 is not delivered; the STB flip on the 15s bar 01:01:30 is outside the 01:01:00 30s bar "
+          "(end = 01:01:30) -> no 30s mid STB, no TC (300bf15 used it up to the next fetched start 01:02:00 and gave a TC)",
+          got_new == {} and got_old == {(hm(1, 0), -1): "TC サッツバンド転換 SELL 帯→フラット 01:02:00"})
+    T, b15, tfs = ss.hand_case(hm(1, 0), 40, {(1, hm(1, 1)): SP}, {hm(1, 1, 15): (100.2, 94.0, 99.0)}, st7)
+    bars7b = drop30(lab_bars(T, b15, tfs), hm(1, 1, 30))
+    check("15s window: the flip on the 15s bar 01:01:15 (closing exactly at the 30s bar's end 01:01:30) is used -> TC SELL "
+          "01:02:00 (15s 01:01:00 -> 30s mid 01:01:30 -> 1m 01:02:00)",
+          run_src(SRC, bars7b) == {(hm(1, 0), -1): "TC サッツバンド転換 SELL 帯→フラット 01:02:00"})
+    # a 1m target: the window ends at start + 60 s even when the next 1m bar is missing
+    SP1 = SP
+    st8 = {(0, hm(1, 1)): (2, 0), (1, hm(1, 1, 30)): (2, 0)}
+
+    def drop60(bars, t60):
+        for b in bars:
+            if t60 in (b.get("tq60t") or []):
+                j = b["tq60t"].index(t60)
+                for n in F60:
+                    del b[n][j]
+        return bars
+    T, b15, tfs = ss.hand_case(hm(1, 0), 40, {(2, hm(1, 1)): SP1}, {hm(1, 2, 15): (100.2, 94.0, 99.0)}, st8)
+    bars8 = drop60(lab_bars(T, b15, tfs), hm(1, 2))
+    got8n = run_src(SRC, bars8)
+    got8o = run_src(prev18, bars8)
+    check("15s window: the 1m bar 01:02 is not delivered; the flip on 01:02:15 is outside the 01:01 1m bar (end = 01:02:00) -> "
+          "no TC (300bf15 extended the 01:01 bar to the 5m close and gave a TC)",
+          got8n == {} and got8o == {(hm(1, 0), -1): "TC サッツバンド転換 SELL 帯→フラット 01:02:30"})
+
     bad = [n for n, ok in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(bad)}/{len(RESULTS)} passed")
     return 1 if bad else 0
