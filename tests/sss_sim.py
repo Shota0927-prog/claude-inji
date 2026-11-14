@@ -415,22 +415,40 @@ def pine_rows_runner(src):
     run_labels = LABELS
 
     dsrc = src[src.index("// ---- 印の描画"):src.index("// ---- 確認用の表")] if "// ---- 印の描画" in src else ""
+    dsrc = dsrc.replace("int LBMAX = 500", "int LBMAX = lbmaxEnv")
     dcode = compile(ap.Translator().translate(ap.logical_lines(dsrc)), "draw", "exec") if ("smDirty" in src or "lbDirty" in src) else None
 
     def draw(env):
-        """run the drawing section once (labels: env['LBL']; label.all = labels not deleted)"""
+        """run the drawing section once (labels: env['LBL']; label.all = labels not deleted, oldest first). Like TradingView,
+        labels beyond the maximum (env['lbmaxEnv']) are removed oldest first after the script runs."""
         env["label__all"] = [d for d in env["LBL"] if not d.deleted]
         exec(dcode, env)
+        live = [d for d in env["LBL"] if not d.deleted]
+        for d in live[:max(0, len(live) - env.get("lbmaxEnv", 500))]:
+            d.deleted = True
     run_draw = draw
 
     def run(updates, live=False, show_evt=False, clr=(True, True, True, True), use=(True, True, True, False),
-            useB=None, htf_sel=None, patA=None, patB=None, draw_labels=False):
+            useB=None, htf_sel=None, patA=None, patB=None, draw_labels=False, hooks=None, lbmax=500):
         """updates: dicts with t, e15=(ms, mb), need30 / need60 (start time when time("30S") / time("1") switched),
         optional g30 / g60 (time("30S") / time("1") of this bar; default = the aligned start), p15 = 9-value pack of the chart's
         own 15s start data, r30 / r60 = (cur t, ms, mb, prev t, ms, mb) or the full 24-value form
         (t, ms, mb, *pack, prev t, prev ms, prev mb, *prev pack), hlc = (high, low, close) of this 15s bar, conf (default True)."""
         LBL = []
         env = ap.make_env(_NoBroker(), LBL)
+        TICK = {"new": [], "del": []}
+
+        def _lnew(*a, **k):
+            d = ap.Drawing("label", a, k)
+            LBL.append(d)
+            TICK["new"].append(d)
+            return d
+
+        def _ldel(d):
+            if d is not None and not d.deleted:
+                d.deleted = True
+                TICK["del"].append(d)
+        env.update(label__new=_lnew, label__delete=_ldel, lbmaxEnv=lbmax)
         env.update(LBL=LBL, label__get_x=lambda l: l.args[0], label__get_text=lambda l: l.text,
                    yloc__abovebar="above", yloc__belowbar="below", sellCol="red", buyCol="teal", showSig=True, sigDet=False,
                    showLost=True, high=None, low=None, size__tiny="tiny")
@@ -458,7 +476,9 @@ def pine_rows_runner(src):
                         k += 1
         first = True
         prev_bar = (None, None, None, None)
+        prevT = None
         last_t = None
+        n_upd = 0
         for u in updates:
             T = u["t"]
             if last_t is not None and T != last_t:
@@ -494,9 +514,21 @@ def pine_rows_runner(src):
                 env["patA"] = patA
             if patB is not None:
                 env["patB"] = patB
+            # realtime rollback of the previous tick's label operations within the same bar (varip records are kept)
+            if draw_labels and prevT == T:
+                for d in TICK["new"]:
+                    d.deleted = True
+                    d.rolled = True
+                for d in TICK["del"]:
+                    d.deleted = False
+            TICK["new"], TICK["del"] = [], []
             exec(code, env)
+            if hooks and n_upd in hooks:
+                hooks[n_upd](env)
             if draw_labels and dcode is not None:
                 draw(env)
+            prevT = T
+            n_upd += 1
             first = False
             last_t = T
             last_bar = (T + 15_000, hlc[0], hlc[1], hlc[2])
@@ -1720,6 +1752,69 @@ def main():
           "tooltip keeps the 帯→フラット section and adds the new one",
           len(live) == 1 and live[0].args[0] == hm(9, 21, 30) and live[0].text == "SELL 帯→フラット・フラット→帯＋端の線転換"
           and "成立順: 15s → 30s" in live[0].kw.get("tooltip", "") and "(test section)" in live[0].kw.get("tooltip", ""))
+
+    # ---- SSS-15: label management (previous bar committed before this bar's changes; records kept while the label is shown) -
+    prev15 = subprocess.run(["git", "-C", ROOT, "show", "9f59e2c:SatsShortSignal.pine"], capture_output=True, text=True).stdout
+    run_p15 = pine_rows_runner(prev15) if prev15 else None
+
+    def live_sig(env):
+        return sorted((d.args[0], d.text) for d in env["LBL"] if not d.deleted and d.text.startswith(("SELL", "BUY")))
+    T, b15, tfs = hand_case(hm(9, 20), 16, {}, {}, stS2)
+    upsH = pine_updates(T, b15, tfs, htf=RED)
+    iNext = next(n for n, u in enumerate(upsH) if u["t"] == hm(9, 21, 45))
+    addB = lambda env: env["f_sigMark"](hm(9, 21, 30), 1, 1, "SELL フラット→帯＋端の線転換 (added next bar)", -9)
+    run_new(upsH, htf_sel=mk_sel(), patA=True, draw_labels=True, hooks={iNext: addB})
+    envA = run_new.env
+    lv = live_sig(envA)
+    tipA = [d.kw.get("tooltip", "") for d in envA["LBL"] if not d.deleted and d.text.startswith("SELL")]
+    check("SSS-15: a second pattern added on the next 15s bar merges into one label (names + both tooltip sections)",
+          lv == [(hm(9, 21, 30), "SELL 帯→フラット・フラット→帯＋端の線転換")] and "(added next bar)" in tipA[0]
+          and "成立順: 15s → 30s" in tipA[0])
+    if run_p15:
+        run_p15(upsH, htf_sel=mk_sel(), patA=True, draw_labels=True, hooks={iNext: addB})
+        check("SSS-15: (9f59e2c committed the merged text without drawing it: the chart kept 'SELL 帯→フラット' only)",
+              live_sig(run_p15.env) == [(hm(9, 21, 30), "SELL 帯→フラット")])
+    # realtime: two updates per bar with rollback of label operations between them
+    upsR = pine_updates(T, b15, tfs, None, True, htf=RED)
+    iNr = next(n for n, u in enumerate(upsR) if u["t"] == hm(9, 21, 45))
+    run_new(upsR, live=True, htf_sel=mk_sel(), patA=True, draw_labels=True, hooks={iNr: addB})
+    check("SSS-15: realtime (rollback between updates of the live bar): the change made on the first update stays until the "
+          "bar confirms -> one merged label", live_sig(run_new.env) == [(hm(9, 21, 30), "SELL 帯→フラット・フラット→帯＋端の線転換")])
+    # all patterns withdrawn on the next bar -> the old label is deleted and the record dropped
+    def withdraw(env):
+        env["f_sigUnmark"](0, 1, env["sgSeg"][0])
+    run_new(upsH, htf_sel=mk_sel(), patA=True, draw_labels=True, hooks={iNext: withdraw})
+    check("SSS-15: all patterns withdrawn on the next bar -> the old label is deleted, the record is dropped",
+          live_sig(run_new.env) == [] and len(run_new.env["lbX"]) == 0)
+    # more than 400 labels shown: records are kept while the labels are on the chart, and still merge
+    T, b15, tfs = hand_case(hm(9, 20), 12, {}, {}, {})
+    upsN = pine_updates(T, b15, tfs, htf=RED)
+
+    def many(env):
+        for q in range(410):
+            env["f_sigMark"](hm(8, 0) + q * S15, 1, 0, f"SELL 帯→フラット (#{q})", -11)
+    mergeOld = lambda env: env["f_sigMark"](hm(8, 0), 1, 1, "SELL フラット→帯＋端の線転換 (late)", -12)
+    run_new(upsN, htf_sel=mk_sel(), patA=True, draw_labels=True, hooks={2: many, 6: mergeOld})
+    envN = run_new.env
+    at0 = [d for d in envN["LBL"] if not d.deleted and d.args[0] == hm(8, 0) and d.text.startswith("SELL")]
+    check("SSS-15: 410 labels shown -> all 410 records kept; a later pattern at the oldest one merges into one label",
+          len(envN["lbX"]) == 410 and len(at0) == 1 and at0[0].text == "SELL 帯→フラット・フラット→帯＋端の線転換"
+          and "(#0)" in at0[0].kw.get("tooltip", "") and "(late)" in at0[0].kw.get("tooltip", ""))
+    if run_p15:
+        run_p15(upsN, htf_sel=mk_sel(), patA=True, draw_labels=True, hooks={2: many, 6: mergeOld})
+        at0o = [d for d in run_p15.env["LBL"] if not d.deleted and d.args[0] == hm(8, 0) and d.text.startswith("SELL")]
+        check("SSS-15: (9f59e2c dropped the records beyond 400, so the late pattern made a second label at the same bar)",
+              len(at0o) == 2)
+    # records follow the labels' display: with a label maximum of 30, the oldest labels vanish and their records go too
+    T, b15, tfs = hand_case(hm(9, 20), 60, {}, {}, {})
+    upsL = pine_updates(T, b15, tfs, htf=RED)
+    hk = {n: (lambda q: (lambda env: env["f_sigMark"](hm(8, 0) + q * S15, 1, 0, f"SELL (#{q})", -13)))(n) for n in range(1, 41)}
+    run_new(upsL, htf_sel=mk_sel(), patA=True, draw_labels=True, hooks=hk, lbmax=30)
+    envL = run_new.env
+    liveX = {d.args[0] for d in envL["LBL"] if not d.deleted and d.text.startswith("SELL")}
+    check("SSS-15: label maximum 30 and 40 signals: the 10 oldest labels vanish and only their records are dropped "
+          "(every remaining record has its label on the chart)",
+          len(liveX) == 30 and sorted(envL["lbX"]) == sorted(liveX))
 
     # random: random HTF bands, both patterns, Pine == models; realtime with delays (incl. the HTF switch) == history
     agreeH = rtH = nH = 0
