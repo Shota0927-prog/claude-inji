@@ -1816,6 +1816,54 @@ def main():
           "(every remaining record has its label on the chart)",
           len(liveX) == 30 and sorted(envL["lbX"]) == sorted(liveX))
 
+    # ---- SSS-16: the record clean-up scan resumes where it stopped (wraps at the end, no skip after a removal) ----------------
+    prev16 = subprocess.run(["git", "-C", ROOT, "show", "2617c3a:SatsShortSignal.pine"], capture_output=True, text=True).stdout
+    run_p16 = pine_rows_runner(prev16) if prev16 else None
+    T, b15, tfs = hand_case(hm(9, 20), 80, {}, {}, {})
+    ups16 = pine_updates(T, b15, tfs, htf=RED)
+    X0 = hm(7, 0)
+
+    def put500(env):
+        for q in range(500):
+            env["f_sigMark"](X0 + q * S15, 1, 0, f"SELL 帯→フラット (#{q})", -21)
+
+    def redraw10(env):
+        for q in range(10):
+            env["f_sigMark"](X0 + q * S15, 1, 1, f"SELL フラット→帯＋端の線転換 (#{q} redrawn)", -22)
+    addNew = lambda env: env["f_sigMark"](hm(9, 20, 30), 1, 0, "SELL 帯→フラット (new)", -23)
+    hk16 = {2: put500, 4: redraw10, 6: addNew}
+
+    def state16(env):
+        liveX = sorted(d.args[0] for d in env["LBL"] if not d.deleted and d.text.startswith("SELL"))
+        return liveX, sorted(env["lbX"])
+    run_new(ups16, htf_sel=mk_sel(), patA=True, draw_labels=True, hooks=hk16, lbmax=500)
+    env16 = run_new.env
+    liveX, recX = state16(env16)
+    red10 = [d for d in env16["LBL"] if not d.deleted and d.args[0] < X0 + 10 * S15 and d.text.startswith("SELL")]
+    check("SSS-16: 500 labels, the first 10 redrawn, then a new label -> the oldest remaining label (#10) leaves the chart; "
+          "the scan continues past the first 10 and drops only that record, the 10 redrawn records are kept",
+          liveX == recX and len(recX) == 500 and (X0 + 10 * S15) not in recX and len(red10) == 10
+          and all(d.text == "SELL 帯→フラット・フラット→帯＋端の線転換" for d in red10))
+    if run_p16:
+        run_p16(ups16, htf_sel=mk_sel(), patA=True, draw_labels=True, hooks=hk16, lbmax=500)
+        liveO, recO = state16(run_p16.env)
+        check("SSS-16: (2617c3a always re-checked the first 10 records: the vanished #10 record was never removed)",
+              (X0 + 10 * S15) in recO and (X0 + 10 * S15) not in liveO)
+    # removals do not skip the next record: several consecutive vanished labels are all removed within one pass
+    def put40(env):
+        for q in range(40):
+            env["f_sigMark"](X0 + q * S15, 1, 0, f"SELL (#{q})", -24)
+
+    def kill5(env):
+        for d in env["LBL"]:
+            if not d.deleted and X0 + 3 * S15 <= d.args[0] < X0 + 8 * S15:
+                d.deleted = True
+    T, b15, tfs = hand_case(hm(9, 20), 30, {}, {}, {})
+    run_new(pine_updates(T, b15, tfs, htf=RED), htf_sel=mk_sel(), patA=True, draw_labels=True, hooks={2: put40, 4: kill5}, lbmax=40)
+    liveK, recK = state16(run_new.env)
+    check("SSS-16: 5 consecutive labels (#3-#7) removed from the chart -> all 5 records are dropped (no skipping), the others kept",
+          liveK == recK and len(recK) == 35)
+
     # random: random HTF bands, both patterns, Pine == models; realtime with delays (incl. the HTF switch) == history
     agreeH = rtH = nH = 0
     for seed in (515, 522, 526, 503):
