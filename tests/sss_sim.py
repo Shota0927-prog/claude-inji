@@ -374,7 +374,12 @@ def pine_rows_runner(src):
     c = src.index("// ---- 処理待ちの行")
     d = src.index("// ---- 印の描画")
     py = ap.Translator().translate(ap.logical_lines(src[a:b] + src[c:d]))
-    if "f_seqEvt(int p, int d, int i" in src:
+    if "f_seqEvt(int p, int d, int j, int i" in src:
+        # SSS-12: f_seqEvt(p, d, j, i, t, m, desc, liveT, b); the order log follows pattern 帯→フラット (p = 0)
+        py = py.replace("def f_seqEvt(", "def _orig_f_seqEvt(", 1)
+        py = ("def f_seqEvt(*a):\n    if a[0] == 0:\n        LOG.append(((15, 30, 60, 300)[a[3]], a[4], time, a[5]))\n"
+              "    return _orig_f_seqEvt(*a)\n") + py
+    elif "f_seqEvt(int p, int d, int i" in src:
         # SSS-10: f_seqEvt(p, d, i, t, m, desc, liveT); the order log follows pattern 帯→フラット (p = 0)
         py = py.replace("def f_seqEvt(", "def _orig_f_seqEvt(", 1)
         py = ("def f_seqEvt(*a):\n    if a[0] == 0:\n        LOG.append(((15, 30, 60, 300)[a[2]], a[3], time, a[4]))\n"
@@ -422,7 +427,7 @@ def pine_rows_runner(src):
                    patB=useB is not None and any(useB), useB15=bool(useB and useB[0]), useB30=bool(useB and useB[1]),
                    useB60=bool(useB and useB[2]), useB300=bool(useB and useB[3]),
                    str__contains=lambda a, b: b in a, math__pow=lambda a, b: a ** b,
-                   array__insert=lambda arr, i, v: arr.insert(i, v),
+                   array__insert=lambda arr, i, v: arr.insert(i, v), array__includes=lambda arr, v: v in arr,
                    htfOn=htf_sel is not None, htfTf="60",
                    timeframe__in_seconds=lambda *x: 15, array__new_string=lambda n=0, v=None: [v] * n,
                    array__new_bool=lambda n=0, v=None: [v] * n,
@@ -478,6 +483,7 @@ def pine_rows_runner(src):
             first = False
             last_t = T
             last_bar = (T + 15_000, hlc[0], hlc[1], hlc[2])
+        run.env = env
         marks = [(x, k, tip) for x, k, tip in zip(env["mkX"], env["mkK"], env["mkTip"]) if k in (0, 2)]
         if "smX" in env:
             marks += [(x, k, tip) for x, k, tip in zip(env["smX"], env["smK"], env["smTip"])]
@@ -586,11 +592,21 @@ def model_b(tfs, useB, wait_min=5, htf=None, sel=None):
 
 def band_at(htf, t):
     """htf = sorted [(close_time, band)] of the reference higher timeframe; the band in effect at t (None if none yet)."""
-    b = None
+    return seg_at(htf, t)[1]
+
+
+def seg_at(htf, t):
+    """(segment start, band) in effect at t. A segment starts where the confirmed band's colour actually changes (red -> flat
+    -> red gives three segments; consecutive bars of the same colour stay one segment; an unknown band is its own colour)."""
+    sg, b, prev = None, None, object()
+    cur_seg = None
     for (tc, bb) in htf:
+        if bb != prev:
+            cur_seg = tc
+        prev = bb
         if tc <= t:
-            b = bb
-    return b
+            sg, b = cur_seg, bb
+    return sg, b
 
 
 def seq_dir(events, d, stage_fn, W, htf=None, clr=None):
@@ -605,8 +621,8 @@ def seq_dir(events, d, stage_fn, W, htf=None, clr=None):
     last_sig = None
     conf = {}
     for (t, g, rank, sub, val, x) in events:
-        b = band_at(htf, t) if htf is not None else 0
-        k = (9 if b is None else b) if htf is not None else 0
+        sg, b = seg_at(htf, t) if htf is not None else (0, 0)
+        k = (sg, 9 if b is None else b) if htf is not None else 0
         if k != key:
             if seq is not None:
                 last_sig = seq.last
@@ -1459,6 +1475,65 @@ def main():
     _, mk_a = run_new(ups[:iX], live=True, htf_sel=mk_sel(), patA=True)
     check("SSS-11: under red the SELL column (15s/30s) fires at 9:21:30 although the 1m data is 150 s late",
           sigmarks(mk_a) == [(hm(9, 21, 30), "SELL")])
+    # ---- SSS-12: HTF segments by actual colour change, independent per segment, no 3-minute fill -----------------------
+    RFR = [(hm(9, 18), -1), (hm(9, 20), -1), (hm(9, 22), 0), (hm(9, 24), -1), (hm(9, 26), -1), (hm(9, 40), -1)]
+    RRR = [(hm(9, 18), -1), (hm(9, 20), -1), (hm(9, 22), -1), (hm(9, 24), -1), (hm(9, 26), -1), (hm(9, 40), -1)]
+    stX = {(0, hm(9, 21, 30)): (2, 0), (1, hm(9, 24)): (2, 0)}
+    pm, md, _, _ = runH(RFR, stX)
+    pm2, md2, _, _ = runH(RRR, stX)
+    check("SSS-12: red -> flat -> red (no events in the flat part): the 9:21:30 15s and the 9:24:00 30s are in different "
+          "segments -> no SELL; with red throughout (same segment) -> SELL at 9:24:00",
+          pm == md == [] and pm2 == md2 == [(hm(9, 24), "SELL")])
+    # blue -> red at 9:22: red SELL (15s/30s) is processed although the 5m data used by the blue SELL column is late
+    BR = [(hm(9, 18), 1), (hm(9, 20), 1), (hm(9, 22), -1), (hm(9, 24), -1), (hm(9, 40), -1)]
+    T, b15, tfs = hand_case(hm(9, 20), 40, {}, {}, {(0, hm(9, 21)): (2, 0), (0, hm(9, 22)): (2, 0), (1, hm(9, 22, 30)): (2, 0)})
+    ups = pine_updates(T, b15, tfs, {3: {hm(9, 20): 200_000}}, True, htf=BR)
+    iX = next(n for n, u in enumerate(ups) if u["t"] == hm(9, 22, 45)) + 1
+    _, mk_a = run_new(ups[:iX], live=True, htf_sel=mk_sel(), patA=True)
+    check("SSS-12: blue -> red at 9:22 (a blue 15s at 9:21 waits for the late 5m): the red segment is independent, red SELL "
+          "(15s/30s) fires at 9:22:30 while the blue segment's 5m data is still missing",
+          sigmarks(mk_a) == [(hm(9, 22, 30), "SELL")])
+    # a late event of the old segment completes in its own segment at its original position
+    selBR = mk_sel({(0, 2, 0): (1, 1, 0, 0), (0, 0, 0): (1, 1, 0, 0)})
+    stY = {(0, hm(9, 21)): (2, 0), (1, hm(9, 21, 30)): (2, 0), (0, hm(9, 22)): (2, 0), (1, hm(9, 22, 30)): (2, 0)}
+    pm_h, md_h, _, _ = runH(BR, stY, sel=selBR)
+    pm_rt, _, _, _ = runH(BR, stY, sel=selBR, delays={1: {hm(9, 21, 30): 40_000}}, realtime=True)
+    check("SSS-12: the blue 30s (9:21:30) arrives 40 s late (9:22:10) after the switch to red -> it completes in the blue segment at "
+          "9:21:30, and the red chain gives 9:22:30 (= history, model)",
+          pm_h == md_h == pm_rt == [(hm(9, 21, 30), "SELL"), (hm(9, 22, 30), "SELL")])
+    # HTF data held for 5 minutes: no 3-minute fill; the events wait and resume in time order
+    CH = [(hm(9, 18), 0), (hm(9, 20), 0), (hm(9, 22), -1), (hm(9, 24), -1), (hm(9, 40), -1)]
+    stZ = {(0, hm(9, 22, 15)): (2, 0), (1, hm(9, 22, 30)): (2, 0)}
+    pm_h, md_h, _, _ = runH(CH, stZ, n=48)
+    T, b15, tfs = hand_case(hm(9, 20), 48, {}, {}, stZ)
+    ups = pine_updates(T, b15, tfs, None, True, htf=CH, htf_delay=300_000)
+    iW = next(n for n, u in enumerate(ups) if u["t"] == hm(9, 26)) + 1
+    _, mk_w = run_new(ups[:iW], live=True, htf_sel=mk_sel(), patA=True)
+    env_w = run_new.env
+    tsrc = pine[pine.index("//  方向 d の待機: 有効な成立順"):pine.index("var table tb = table.new")]
+    exec(compile(ap.Translator().translate(ap.logical_lines(tsrc)), "table", "exec"), env_w)
+    cell_wait = env_w["f_cellTxt"](0, 0)
+    _, mk_r = run_new(ups, live=True, htf_sel=mk_sel(), patA=True)
+    check("SSS-12: HTF data 5 min late: nothing is filled in (no SELL yet at 9:26, table '上位足データ待ち'); when it arrives the "
+          "red 15s/30s chain fires at 9:22:30 (= history)",
+          sigmarks(mk_w) == [] and cell_wait == "上位足データ待ち" and sigmarks(mk_r) == pm_h == md_h == [(hm(9, 22, 30), "SELL")])
+    # table after a switch with no lower-timeframe events: the new segment's (empty) state is shown
+    CF = [(hm(9, 18), -1), (hm(9, 20), -1), (hm(9, 22), 0), (hm(9, 24), 0), (hm(9, 40), 0)]
+    T, b15, tfs = hand_case(hm(9, 20), 16, {}, {}, {(0, hm(9, 21)): (2, 0)})
+    _, _ = run_new(pine_updates(T, b15, tfs, htf=CF), htf_sel=mk_sel(), patA=True)
+    env_t = run_new.env
+    exec(compile(ap.Translator().translate(ap.logical_lines(tsrc)), "table", "exec"), env_t)
+    env_t["time"] = hm(9, 21, 45)
+    env_t["time_close"] = hm(9, 22)
+    in_red = env_t["f_cellTxt"](0, 0)
+    env_t["time"] = hm(9, 23)
+    env_t["time_close"] = hm(9, 23, 15)
+    in_flat = env_t["f_cellTxt"](0, 0)
+    check("SSS-12: table: in red it shows the 15s SELL waiting for 30s; after the switch to flat (no new events) it shows the "
+          "flat segment's order with nothing collected yet",
+          "順: 15s → 30s" in in_red and "15s 09:21:00" in in_red and "次: 30s" in in_red
+          and in_flat == "順: 15s → 30s → 1m  待ち: 15s")
+
     # random: random HTF bands, both patterns, Pine == models; realtime with delays (incl. the HTF switch) == history
     agreeH = rtH = nH = 0
     for seed in (515, 522, 526, 503):

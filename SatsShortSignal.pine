@@ -2,7 +2,7 @@
 // © shota0927-prog
 //
 // ============================================================================
-//  SATS Short/Long Signal (15S)  —  サッツバンド 売り・買いタイミング検知の単体インジ (SSS-11)
+//  SATS Short/Long Signal (15S)  —  サッツバンド 売り・買いタイミング検知の単体インジ (SSS-12)
 //  15秒チャート専用。2 つのパターンを個別に ON / OFF し、それぞれ 15秒・30秒・1分・5分のうち ON にした時間足の成立を
 //  同じ方向で短い足から順に揃えたら SELL / BUY を出す (成立記録・待機はパターン別・方向別)。
 //    「帯→フラット」 (初期 ON。時間足は 15秒・30秒・1分 ON、5分 OFF): 帯から開始時点で背景なしになり線が転換 (開始 / 途中 STB)。
@@ -49,12 +49,18 @@
 //      の色 (赤 / フラット / 青) と方向 (SELL / BUY) で、パターンごとの 6 欄 (赤・フラット・青 × SELL・BUY) の時間足を使う。
 //      2 パターンの欄は別々の設定。全部 OFF の欄はその方向の合図なし。上位足の帯が未取得の間は合図なし。
 //    ・各イベントには、受信時点ではなくその成立時刻に有効だった上位足の確定帯 (成立時刻以前に確定した最後の上位足) を使う。
-//      上位足の確定時刻ちょうどのイベントは新しい帯。上位足の帯が変わったら、そのパターン・方向の組み合わせ待機をクリアし、
-//      帯色の変更をまたいで成立記録をつながない (各時間足の帯・線の転換の観測は続ける)。
+//      上位足の確定時刻ちょうどのイベントは新しい帯。
+//    ・区間 (SSS-12): 上位足の確定帯の色が実際に変わった確定時刻で区間を分ける (同色の足が続く間は同じ区間。赤→フラット→赤
+//      のように同じ色へ戻っても別区間。未取得も 1 つの色)。SELL / BUY の候補は区間ごとに持ち、同じ区間内のイベントだけで
+//      揃える (区間をまたいでつながない)。各時間足の帯・線の転換の観測は続ける。
+//    ・区間は互いに独立に処理する: 各区間で待つ下位足は、その区間の色・パターン・方向で ON の足だけ (例: 青→赤で赤 SELL が
+//      15秒・30秒なら、青の区間の 5分足が未着でも赤 SELL は進む)。切り替え前のイベントが遅れて届いたら、そのイベントの
+//      成立時刻の区間で処理し、そこで揃えば元の成立位置にラベルを出す。
 //    ・上位足の確定帯は lookahead_on で [1] / [2] の確定値と現在の上位足の time_close を受け取り、時系列に積む。現在の上位足の
-//      time_close より前の時刻だけ帯が分かっているので、それ以降のイベントは上位足のデータを待つ。上位足のデータが 3 分以上
-//      更新されないときはその区間を未取得 (合図なし) として進める。
-//    ・待機とデータ到着待ちはパターン別・方向別。その時点で該当する欄の時間足だけを待つ。
+//      time_close より前の時刻だけ帯が分かっているので、それ以降のイベントは上位足のデータが届くまで保留し (暫定の値で
+//      埋めない)、届いたら成立時刻順に再開する。待機表は区間が切り替わると新しい区間の状態を出し、上位足の帯が届いていない
+//      ときは「上位足データ待ち」と出す。
+//    ・データ上の帯が na、またはチャートの最初の確定より前の時刻は「未取得」で合図なし。
 //
 //  ■ フラット→帯＋端の線転換 (SSS-10。時間足ごとの成立)
 //    ・帯の観測 = その時間足の「直前確定足の帯 (time_close の時刻)」と「新しい足の開始帯 (開始時刻)」を時刻順に (同時刻は
@@ -505,9 +511,10 @@ array<bool> selArr = array.from(
 //  (この時刻より前の成立には、直近の確定帯が有効)
 varip array<int> hT = array.new_int()
 varip array<int> hB = array.new_int()
+varip array<int> hS = array.new_int()   // その確定帯の区間の開始 (帯の色が実際に変わった確定時刻。同色が続く間は同じ)
 varip int hFront = na
-varip array<int> pBand = array.new_int(4, -99)   // パターン × 方向: 最後に処理したイベントの上位足の帯 (変わったら待機をクリア)
-varip array<int> pLastT = array.new_int(4, na)   // パターン × 方向: 最後に処理したイベントの時刻
+//  候補の区間スロット (パターン × 方向 × 3): そのスロットが受け持つ区間の開始時刻 (上位足で切り替えないときは 0 の 1 区間)
+varip array<int> slSeg = array.new_int(12, na)
 varip array<int>   rT   = array.new_int()    // 15秒足の time (行のキー)
 varip array<int>   rS15 = array.new_int()
 varip array<int>   rB15 = array.new_int()
@@ -552,9 +559,10 @@ varip array<int> eP    = array.new_int()      // パターン (0 帯→フラッ
 //  待機の候補 (方向 d 0 SELL / 1 BUY × 揃った段数 k 1..3 × 段 s 0..3): 各段の成立時刻・該当線・説明。
 //  候補 k は「ON の時間足の短い順に k 段目まで揃った組」。起点 = 段 0 の成立時刻、末尾 = 段 k-1 の成立時刻。
 //  パターン p (0 帯→フラット / 1 フラット→帯) ごとに持つ。
-varip array<int>    cdT  = array.new_int(64, na)
-varip array<int>    cdM  = array.new_int(64, 0)
-varip array<string> cdD  = array.new_string(64, "")
+//  候補は区間スロットごと: レーン L = 方向 d × 3 + スロット j (0..5)。上位足の区間をまたいで候補をつながない。
+varip array<int>    cdT  = array.new_int(192, na)
+varip array<int>    cdM  = array.new_int(192, 0)
+varip array<string> cdD  = array.new_string(192, "")
 varip array<int>    sgLast = array.new_int(4, na)    // パターン × 方向ごとに最後に合図を出した成立時刻 (同時刻の残りを消費)
 //  新パターンの時間足ごとの帯の状態: 最後に見た帯 (na = 未取得)、赤 / 青の点灯 (待機) 開始時刻 (na = 待機なし)、
 //  点灯区間で成立済み (1/0)、最後の解除以降に成立を出したか (解除時に候補を捨てるため)
@@ -666,18 +674,25 @@ f_order(int p, int d, int b) =>
             r += (r == "" ? "" : " → ") + f_tfn(k)
     r == "" ? "なし (全部 OFF)" : r
 
-//  時刻 t に有効な上位足の確定帯 (t 以前に確定した最後の上位足の帯。無ければ na)
-f_htfBandAt(int t) =>
-    int r = na
+//  時刻 t に有効な上位足の確定帯と、その帯の区間の開始 (t 以前に確定した最後の上位足。無ければ [na, na])
+f_segAt(int t) =>
+    int b = na
+    int sg = na
     int n = array.size(hT)
     for k = 0 to n - 1
         if k >= n
             break
         if array.get(hT, k) <= t
-            r := array.get(hB, k)
-    r
+            b := array.get(hB, k)
+            sg := array.get(hS, k)
+    [sg, b]
 
-//  上位足の確定帯を時系列に入れる (同じ確定時刻は 1 回だけ。時刻順)
+f_htfBandAt(int t) =>
+    [sg, b] = f_segAt(t)
+    b
+
+//  上位足の確定帯を時系列に入れる (同じ確定時刻は 1 回だけ。時刻順)。区間の開始は、直前の確定帯と色が同じなら引き継ぎ、
+//  違えば (赤→フラット→赤 のように戻った場合も) その確定時刻。未取得 (na) も 1 つの色として扱う。
 f_htfAdd(int t, int b) =>
     if not na(t)
         int n = array.size(hT)
@@ -694,9 +709,15 @@ f_htfAdd(int t, int b) =>
         if not dup
             array.insert(hT, pos, t)
             array.insert(hB, pos, b)
+            array.insert(hS, pos, t)
+            for k = math.max(pos, 1) to array.size(hT) - 1
+                if k >= 1 and k < array.size(hT)
+                    bool same = nz(array.get(hB, k), 9) == nz(array.get(hB, k - 1), 9)
+                    array.set(hS, k, same ? array.get(hS, k - 1) : array.get(hT, k))
             if array.size(hT) > 20
                 array.shift(hT)
                 array.shift(hB)
+                array.shift(hS)
 
 f_clrOn(int i) =>
     i == 0 ? clr15 : i == 1 ? clr30 : i == 2 ? clr60 : clr300
@@ -722,72 +743,101 @@ f_sigMark(int x, int k, int p, string sec) =>
         array.push(smTip, sec)
 
 // ---- 待機 (パターン別・方向別。ON の時間足を短い順に揃える。揃った段数ごとに候補を 1 件) ------------------------------------
-f_cdIdx(int p, int d, int k, int st) =>
-    ((p * 2 + d) * 4 + k) * 4 + st
+f_cdIdx(int p, int L, int k, int st) =>
+    ((p * 6 + L) * 4 + k) * 4 + st
 
-f_cdClr(int p, int d, int k) =>
+f_cdClr(int p, int L, int k) =>
     for st = 0 to 3
-        array.set(cdT, f_cdIdx(p, d, k, st), na)
-        array.set(cdM, f_cdIdx(p, d, k, st), 0)
-        array.set(cdD, f_cdIdx(p, d, k, st), "")
+        array.set(cdT, f_cdIdx(p, L, k, st), na)
+        array.set(cdM, f_cdIdx(p, L, k, st), 0)
+        array.set(cdD, f_cdIdx(p, L, k, st), "")
+
+//  パターン p・方向 d で区間 seg を受け持つスロット (無ければ -1)
+f_slotFind(int p, int d, int seg) =>
+    int r = -1
+    for j = 0 to 2
+        int sj = array.get(slSeg, (p * 2 + d) * 3 + j)
+        if not na(sj) and sj == seg and r < 0
+            r := j
+    r
+
+//  区間 seg のスロットを返す。無ければ空きスロット、空きが無ければ最も古い区間のスロットを空けて割り当てる
+f_slotFor(int p, int d, int seg) =>
+    int r = f_slotFind(p, d, seg)
+    if r < 0
+        int old = -1
+        for j = 0 to 2
+            int sj = array.get(slSeg, (p * 2 + d) * 3 + j)
+            if na(sj) and r < 0
+                r := j
+            if not na(sj) and (old < 0 or sj < array.get(slSeg, (p * 2 + d) * 3 + old))
+                old := j
+        if r < 0
+            r := old
+        array.set(slSeg, (p * 2 + d) * 3 + r, seg)
+        for kk = 1 to 3
+            f_cdClr(p, d * 3 + r, kk)
+    r
 
 //  候補 k が有効か (起点から t までが待ち時間以内)。期限切れなら消す
-f_cdValid(int p, int d, int k, int t) =>
-    int st0 = array.get(cdT, f_cdIdx(p, d, k, 0))
+f_cdValid(int p, int L, int k, int t) =>
+    int st0 = array.get(cdT, f_cdIdx(p, L, k, 0))
     bool ok = not na(st0) and t - st0 <= waitMs
     if not na(st0) and not ok
-        f_cdClr(p, d, k)
+        f_cdClr(p, L, k)
     ok
 
 //  パターン p・方向 d で時間足 i の成立 (m > 0) を処理する。段 s の成立は「s 段目まで揃った有効な候補」を延長する
-//  (s = 0 は新しい起点)。ON の段がすべて揃ったら合図のツールチップを返し、そのパターン・方向の候補をすべて消す。無ければ ""。
+//  (s = 0 は新しい起点)。ON の段がすべて揃ったら合図のツールチップを返し、その区間の候補をすべて消す。無ければ ""。
+//  j = 上位足の区間のスロット (候補は区間ごと)。
 //  同じ段に候補ができたら、起点が新しい方、起点が同じなら末尾が新しい方を残す (短い足の再成立だけで先の段の候補は消さない)。
-f_seqEvt(int p, int d, int i, int t, int m, string desc, int liveT, int b) =>
+f_seqEvt(int p, int d, int j, int i, int t, int m, string desc, int liveT, int b) =>
     string res = ""
+    int L = d * 3 + j
     int s = f_stage(p, d, b, i)
     int last = array.get(sgLast, p * 2 + d)
     if s >= 0 and m > 0 and not (not na(last) and last == t)
-        bool can = s == 0 ? true : f_cdValid(p, d, s, t)
+        bool can = s == 0 ? true : f_cdValid(p, L, s, t)
         if can
-            int st0 = s == 0 ? t : array.get(cdT, f_cdIdx(p, d, s, 0))
+            int st0 = s == 0 ? t : array.get(cdT, f_cdIdx(p, L, s, 0))
             int k = s + 1
             if k == f_nStg(p, d, b)
                 res := (d == 0 ? "SELL " : "BUY ") + f_pName(p) + (htfOn ? "\n上位足 " + f_htfName() + " " + f_bName(b) : "")
                      + "\n成立順: " + f_order(p, d, b) + "\n成立幅 " + f_span(t - st0)
                 for q = 0 to s - 1
                     if q >= 0 and s > 0
-                        res += "\n" + array.get(cdD, f_cdIdx(p, d, s, q))
+                        res += "\n" + array.get(cdD, f_cdIdx(p, L, s, q))
                 res += "\n" + desc
                 res += na(liveT) ? "" : "\nライブ検知 " + f_hms(liveT) + (liveT - t >= 15000 ? " (遅れ " + str.tostring(math.floor((liveT - t) / 1000)) + "秒)" : "")
                 for kk = 1 to 3
-                    f_cdClr(p, d, kk)
+                    f_cdClr(p, L, kk)
                 array.set(sgLast, p * 2 + d, t)
             else
-                int curS = array.get(cdT, f_cdIdx(p, d, k, 0))
-                bool curOk = f_cdValid(p, d, k, t)
+                int curS = array.get(cdT, f_cdIdx(p, L, k, 0))
+                bool curOk = f_cdValid(p, L, k, t)
                 if not curOk or st0 > curS or st0 == curS
                     // 新しい候補 k = 候補 s の各段 + 今回の成立
                     for q = 0 to 3
                         if q < s
-                            array.set(cdT, f_cdIdx(p, d, k, q), array.get(cdT, f_cdIdx(p, d, s, q)))
-                            array.set(cdM, f_cdIdx(p, d, k, q), array.get(cdM, f_cdIdx(p, d, s, q)))
-                            array.set(cdD, f_cdIdx(p, d, k, q), array.get(cdD, f_cdIdx(p, d, s, q)))
+                            array.set(cdT, f_cdIdx(p, L, k, q), array.get(cdT, f_cdIdx(p, L, s, q)))
+                            array.set(cdM, f_cdIdx(p, L, k, q), array.get(cdM, f_cdIdx(p, L, s, q)))
+                            array.set(cdD, f_cdIdx(p, L, k, q), array.get(cdD, f_cdIdx(p, L, s, q)))
                         else if q == s
-                            array.set(cdT, f_cdIdx(p, d, k, q), t)
-                            array.set(cdM, f_cdIdx(p, d, k, q), m)
-                            array.set(cdD, f_cdIdx(p, d, k, q), desc)
+                            array.set(cdT, f_cdIdx(p, L, k, q), t)
+                            array.set(cdM, f_cdIdx(p, L, k, q), m)
+                            array.set(cdD, f_cdIdx(p, L, k, q), desc)
                         else
-                            array.set(cdT, f_cdIdx(p, d, k, q), na)
-                            array.set(cdM, f_cdIdx(p, d, k, q), 0)
-                            array.set(cdD, f_cdIdx(p, d, k, q), "")
+                            array.set(cdT, f_cdIdx(p, L, k, q), na)
+                            array.set(cdM, f_cdIdx(p, L, k, q), 0)
+                            array.set(cdD, f_cdIdx(p, L, k, q), "")
     res
 
 //  パターン p・方向 d で時間足 i の成立を含む候補 (段数 > 段(i)) を捨てる。その足より前まで揃った候補は残す (b = 上位足の帯)
-f_cdDropTf(int p, int d, int i, int b) =>
+f_cdDropTf(int p, int d, int j, int i, int b) =>
     int s = f_stage(p, d, b, i)
     if s >= 0 and s < 3
         for k = s + 1 to 3
-            f_cdClr(p, d, k)
+            f_cdClr(p, d * 3 + j, k)
 
 // ---- 行・欄の操作 ----------------------------------------------------------------------------------------------------------
 f_pushPack(array<float> pk, float o, float stP, float sdP, float l1s, float l2s, float hh20, float ll20, float hh9, float ll9, int tcP,
@@ -1106,75 +1156,68 @@ f_frontier(int i) =>
 
 //  ON の時間足がすべて積み終わった時刻より前のイベントを、(成立時刻, 確定帯が先, 時間足 15→30→1分→5分, 閉じた足が先)
 //  の順に処理して捨てる。
-//  パターン p・方向 d: 前回処理した時刻から t までに有効だった上位足の帯で使う時間足の集合 (ビット)
-f_reqMask(int p, int d, int t0, int t1) =>
-    int mk = 0
-    if not htfOn
-        for i = 0 to 3
-            if f_sel(p, d, 0, i)
-                mk += int(math.pow(2, i))
-    else
-        int n = array.size(hT)
-        for k = -1 to n - 1
-            if k >= n
-                break
-            int b = na
-            bool use = false
-            if k < 0
-                b := f_htfBandAt(t0)
-                use := true
-            else if array.get(hT, k) > t0 and array.get(hT, k) <= t1
-                b := array.get(hB, k)
-                use := true
-            if use and not na(b)
-                for i = 0 to 3
-                    if f_sel(p, d, b, i) and int(mk / int(math.pow(2, i))) % 2 == 0
-                        mk += int(math.pow(2, i))
-    mk
-
-//  パターン p・方向 d のイベントを (成立時刻, 確定帯 / 解除が先, 時間足 15→30→1分→5分, 閉じた足が先) の順に処理する。
-//  処理できるのは、その時点で使う時間足 (と、上位足で切り替えるときは上位足の帯) が分かっている時刻より前のイベントだけ。
+//  パターン p・方向 d のイベントを、上位足の区間ごとに (成立時刻, 確定帯 / 解除が先, 時間足 15→30→1分→5分, 閉じた足が先)
+//  の順に処理する。区間は独立 (候補を区間ごとに持つ) なので、ある区間が下位足のデータ待ちでも、ほかの区間は進める。
+//  処理できるのは、上位足の帯がその時刻まで分かっていて、その区間の色・パターン・方向で ON の時間足がその時刻までの
+//  イベントを積み終えたイベントだけ。区間内で先頭のイベントが待ちなら、その区間の後ろのイベントも待つ。
 f_seqRun(int p, int d, int liveT) =>
     int bit = d == 0 ? 1 : 2
+    array<int> blocked = array.new_int()
     int guard = 0
     while guard < 5000
         guard += 1
         int n = array.size(eT)
         int pk = -1
+        int pkSeg = na
+        int pkB = na
         for e = 0 to n - 1
             if e >= n
                 break
             if array.get(eP, e) == p and int(array.get(eDone, e) / bit) % 2 == 0
-                if pk < 0
-                    pk := e
-                else
-                    int te = array.get(eT, e)
-                    int tp = array.get(eT, pk)
-                    int gi = array.get(eG, e)
-                    int gp = array.get(eG, pk)
-                    int ri = array.get(eR, e)
-                    int rp = array.get(eR, pk)
-                    bool sub = gi == 1 and gp == 1 and array.get(eSub, e) < array.get(eSub, pk)
-                    if te < tp or (te == tp and (gi < gp or (gi == gp and (ri < rp or (ri == rp and sub)))))
+                int te = array.get(eT, e)
+                int sgE = 0
+                int bE = 0
+                bool known = true
+                if htfOn
+                    if na(hFront) or te >= hFront
+                        known := false
+                    else
+                        [sg1, b1] = f_segAt(te)
+                        sgE := nz(sg1, -1)
+                        bE := b1
+                if known and not array.includes(blocked, sgE)
+                    bool better = pk < 0
+                    if not better
+                        int tp = array.get(eT, pk)
+                        int gi = array.get(eG, e)
+                        int gp = array.get(eG, pk)
+                        int ri = array.get(eR, e)
+                        int rp = array.get(eR, pk)
+                        bool sub = gi == 1 and gp == 1 and array.get(eSub, e) < array.get(eSub, pk)
+                        better := te < tp or (te == tp and (gi < gp or (gi == gp and (ri < rp or (ri == rp and sub)))))
+                    if better
                         pk := e
+                        pkSeg := sgE
+                        pkB := bE
         if pk < 0
             break
         int t = array.get(eT, pk)
-        // 処理してよいか: 上位足の帯が t まで分かっていて、使う時間足がすべて t の時刻までのイベントを積み終えている
-        int t0 = nz(array.get(pLastT, p * 2 + d), t)
-        int mk = f_reqMask(p, d, math.min(t0, t), t)
+        int b = pkB
+        // その区間で使う時間足が t までのイベントを積み終えているか
         bool ready = true
-        if htfOn and (na(hFront) or t >= hFront)
-            ready := false
-        for i = 0 to 3
-            if int(mk / int(math.pow(2, i))) % 2 == 1
-                int fi = f_frontier(i)
-                if na(fi) or t >= fi
-                    ready := false
-        if not htfOn and mk == 0
+        bool any = false
+        if not (htfOn and na(b))
+            for i = 0 to 3
+                if f_sel(p, d, b, i)
+                    any := true
+                    int fi = f_frontier(i)
+                    if na(fi) or t >= fi
+                        ready := false
+        if not htfOn and not any
             ready := false
         if not ready
-            break
+            array.push(blocked, pkSeg)
+            continue
         int i   = array.get(eR, pk)
         int g   = array.get(eG, pk)
         int ms  = array.get(eMS, pk)
@@ -1196,28 +1239,22 @@ f_seqRun(int p, int d, int liveT) =>
             array.remove(eP, pk)
         else
             array.set(eDone, pk, dn)
-        array.set(pLastT, p * 2 + d, t)
-        // 成立時刻に有効だった上位足の帯。前のイベントと違えば、このパターン・方向の組み合わせ待機をクリア
-        int b = htfOn ? f_htfBandAt(t) : 0
-        int bKey = htfOn ? (na(b) ? 9 : b) : 0
-        if bKey != array.get(pBand, p * 2 + d)
-            for kk = 1 to 3
-                f_cdClr(p, d, kk)
-            array.set(pBand, p * 2 + d, bKey)
+        // 上位足の帯が未取得 (データ上 na、またはチャートの最初の確定より前) の区間は合図なし
         if not (htfOn and na(b))
+            int j = f_slotFor(p, d, pkSeg)
             if g == 0
                 // A: 確定帯が元の色 (SELL 青 +1 / BUY 赤 -1)。B: 帯の解除。その時間足の成立を含む候補を捨てる
                 if p == 0
                     array.set(pcT, d * 4 + i, t)
                     array.set(pcB, d * 4 + i, ms)
-                f_cdDropTf(p, d, i, b)
+                f_cdDropTf(p, d, j, i, b)
             else
                 int m = d == 0 ? ms : mb
                 // 対象足の最終 15秒の途中 STB と、その対象足の元の帯への復帰確定が同時なら、その方向は待機に登録しない
                 if p == 0 and mid and f_clrOn(i) and not na(array.get(pcT, d * 4 + i)) and array.get(pcT, d * 4 + i) == t
                     m := 0
                 string dsc = p == 0 ? f_desc(f_tfn(i), m, t, mid, tgt) : f_descB(f_tfn(i), m, t, tgt)
-                string sec = f_seqEvt(p, d, i, t, m, dsc, liveT, b)
+                string sec = f_seqEvt(p, d, j, i, t, m, dsc, liveT, b)
                 if sec != ""
                     f_sigMark(x, d == 0 ? 1 : -1, p, sec)
 
@@ -1267,16 +1304,13 @@ if chartOk
         array.set(rH, nl - 1, high)
         array.set(rL, nl - 1, low)
         array.set(rC, nl - 1, close)
-    // 4b. 参照上位足の確定帯 (直近と 1 本前) を時系列に入れ、帯が分かっている時刻の上限を進める。上位足のデータが
-    //     3 分以上更新されないときは、その区間を「未取得」として進める (合図は出さない。処理待ちが詰まらないように)
+    // 4b. 参照上位足の確定帯 (直近と 1 本前) を時系列に入れ、帯が分かっている時刻の上限を進める。上位足の確定帯が
+    //     届くまで、その時刻以降のイベントは保留 (暫定の値で埋めない)。届いたら成立時刻順に再開する。
     if htfOn
         f_htfAdd(hTc2, hB2)
         f_htfAdd(hTc1, hB1)
         if not na(hCur) and (na(hFront) or hCur > hFront)
             hFront := hCur
-        if not na(hFront) and time - hFront >= 180000
-            f_htfAdd(hFront, na)
-            hFront := time
     // 5. 時間足ごとにイベントを生成 (どちらかのパターンで使う時間足だけ)
     for i = 0 to 3
         if f_need(i)
@@ -1353,15 +1387,19 @@ if showSig
 f_cName(int c) =>
     c == 0 ? "不要" : c == 1 ? "未着" : c == 2 ? "受信" : "欠落"
 
-//  方向 d の待機: 有効な成立順、最も先まで揃った有効な候補の各段と期限、次に待つ足 (b = 現在の上位足の帯)
-f_waitTxt(int p, int d, int b) =>
+//  方向 d の待機: 有効な成立順、現在の区間で最も先まで揃った有効な候補の各段と期限、次に待つ足
+//  (b / seg = 現在の上位足の帯と区間。区間が切り替わって下位足イベントがまだ無ければ、新しい区間の空の状態を出す)
+f_waitTxt(int p, int d, int b, int seg) =>
     string r = "順: " + f_order(p, d, b)
+    int j = f_slotFind(p, d, seg)
+    int L = d * 3 + math.max(j, 0)
     int best = 0
     int n = f_nStg(p, d, b)
-    for k = 1 to 3
-        int st0 = array.get(cdT, f_cdIdx(p, d, k, 0))
-        if not na(st0) and time_close - st0 <= waitMs and k < n
-            best := k
+    if j >= 0
+        for k = 1 to 3
+            int st0 = array.get(cdT, f_cdIdx(p, L, k, 0))
+            if not na(st0) and time_close - st0 <= waitMs and k < n
+                best := k
     if n == 0
         r += "  (合図なし)"
     else if best == 0
@@ -1369,9 +1407,24 @@ f_waitTxt(int p, int d, int b) =>
     else
         r += "  "
         for q = 0 to best - 1
-            int tq = array.get(cdT, f_cdIdx(p, d, best, q))
-            r += (q == 0 ? "" : " / ") + f_tfn(f_stageTf(p, d, b, q)) + " " + f_hms(tq) + " " + f_lines(array.get(cdM, f_cdIdx(p, d, best, q)))
-        r += "  次: " + f_tfn(f_stageTf(p, d, b, best)) + "  期限 " + f_hms(array.get(cdT, f_cdIdx(p, d, best, 0)) + waitMs)
+            int tq = array.get(cdT, f_cdIdx(p, L, best, q))
+            r += (q == 0 ? "" : " / ") + f_tfn(f_stageTf(p, d, b, q)) + " " + f_hms(tq) + " " + f_lines(array.get(cdM, f_cdIdx(p, L, best, q)))
+        r += "  次: " + f_tfn(f_stageTf(p, d, b, best)) + "  期限 " + f_hms(array.get(cdT, f_cdIdx(p, L, best, 0)) + waitMs)
+    r
+
+//  待機表の 1 欄: 上位足で切り替えるとき、現在の時刻の上位足の帯がまだ分からなければ「上位足データ待ち」
+f_cellTxt(int p, int d) =>
+    string r = ""
+    if htfOn and (na(hFront) or time >= hFront)
+        r := "上位足データ待ち"
+    else
+        int segN = 0
+        int bN = 0
+        if htfOn
+            [sg2, b2] = f_segAt(time)
+            segN := nz(sg2, -1)
+            bN := b2
+        r := htfOn and na(bN) ? "上位足の帯 未取得 (合図なし)" : f_waitTxt(p, d, bN, segN)
     r
 
 var table tb = table.new(position.top_right, 3, 8, color.new(color.black, 20), border_width = 1)
@@ -1379,15 +1432,16 @@ if showTbl and barstate.islast
     table.cell(tb, 0, 0, "SATS-SL", text_color = color.white)
     table.cell(tb, 1, 0, "SELL", text_color = sellCol)
     table.cell(tb, 2, 0, "BUY", text_color = buyCol)
-    int bNow = htfOn ? f_htfBandAt(time_close - 1) : 0
+    bool hWait = htfOn and (na(hFront) or time >= hFront)
+    int bNow = htfOn ? f_htfBandAt(time) : 0
     table.cell(tb, 0, 1, "帯→フラット" + (patA ? "" : " (OFF)"), text_color = color.white)
-    table.cell(tb, 1, 1, patA ? f_waitTxt(0, 0, bNow) : "-", text_color = color.white)
-    table.cell(tb, 2, 1, patA ? f_waitTxt(0, 1, bNow) : "-", text_color = color.white)
+    table.cell(tb, 1, 1, patA ? f_cellTxt(0, 0) : "-", text_color = color.white)
+    table.cell(tb, 2, 1, patA ? f_cellTxt(0, 1) : "-", text_color = color.white)
     table.cell(tb, 0, 2, "フラット→帯" + (patB ? "" : " (OFF)"), text_color = color.white)
-    table.cell(tb, 1, 2, patB ? f_waitTxt(1, 0, bNow) : "-", text_color = color.white)
-    table.cell(tb, 2, 2, patB ? f_waitTxt(1, 1, bNow) : "-", text_color = color.white)
+    table.cell(tb, 1, 2, patB ? f_cellTxt(1, 0) : "-", text_color = color.white)
+    table.cell(tb, 2, 2, patB ? f_cellTxt(1, 1) : "-", text_color = color.white)
     table.cell(tb, 0, 3, "期限 " + str.tostring(waitMin) + "分 (最初〜最後)", text_color = color.white)
-    table.cell(tb, 1, 3, htfOn ? "上位足 " + f_htfName() + ": " + f_bName(bNow) : "上位足の切替 OFF", text_color = color.white)
+    table.cell(tb, 1, 3, htfOn ? "上位足 " + f_htfName() + ": " + (hWait ? "上位足データ待ち" : f_bName(bNow)) : "上位足の切替 OFF", text_color = color.white)
     table.cell(tb, 2, 3, htfOn ? "確定 " + f_hms(array.size(hT) > 0 ? array.get(hT, array.size(hT) - 1) : na) : "", text_color = color.white)
     string head = array.size(rT) == 0 ? "" : " 先頭 " + f_hms(array.get(rT, 0)) + " 30s " + f_cName(array.get(cC, 0))
          + " 1m " + f_cName(array.get(cC, 1)) + " 5m " + f_cName(array.get(cC, 2))
