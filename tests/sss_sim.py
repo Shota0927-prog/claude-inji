@@ -414,13 +414,28 @@ def pine_rows_runner(src):
     LABELS = []
     run_labels = LABELS
 
+    dsrc = src[src.index("// ---- 印の描画"):src.index("// ---- 確認用の表")] if "// ---- 印の描画" in src else ""
+    dcode = compile(ap.Translator().translate(ap.logical_lines(dsrc)), "draw", "exec") if "smDirty" in src else None
+
+    def draw(env):
+        """run the drawing section once (labels: env['LBL']; label.all = labels not deleted)"""
+        env["label__all"] = [d for d in env["LBL"] if not d.deleted]
+        exec(dcode, env)
+    run_draw = draw
+
     def run(updates, live=False, show_evt=False, clr=(True, True, True, True), use=(True, True, True, False),
-            useB=None, htf_sel=None, patA=None, patB=None):
+            useB=None, htf_sel=None, patA=None, patB=None, draw_labels=False):
         """updates: dicts with t, e15=(ms, mb), need30 / need60 (start time when time("30S") / time("1") switched),
         optional g30 / g60 (time("30S") / time("1") of this bar; default = the aligned start), p15 = 9-value pack of the chart's
         own 15s start data, r30 / r60 = (cur t, ms, mb, prev t, ms, mb) or the full 24-value form
         (t, ms, mb, *pack, prev t, prev ms, prev mb, *prev pack), hlc = (high, low, close) of this 15s bar, conf (default True)."""
-        env = ap.make_env(_NoBroker(), [])
+        LBL = []
+        env = ap.make_env(_NoBroker(), LBL)
+        env.update(LBL=LBL, label__get_x=lambda l: l.args[0], label__get_text=lambda l: l.text,
+                   yloc__abovebar="above", yloc__belowbar="below", sellCol="red", buyCol="teal", showSig=True, sigDet=False,
+                   showLost=True, high=None, low=None, size__tiny="tiny")
+        import types
+        env["yloc"] = types.SimpleNamespace(abovebar="above", belowbar="below")
         env.update(_VARS=set(), _VARIPS=set(), LOG=[], syminfo__timezone="UTC", waitMin=5, showEvt=show_evt, chartOk=True,
                    clr15=clr[0], clr30=clr[1], clr60=clr[2], clr300=clr[3] if len(clr) > 3 else True,
                    use15=use[0], use30=use[1], use60=use[2], use300=use[3], patA=any(use),
@@ -452,8 +467,8 @@ def pine_rows_runner(src):
             g30 = u.get("need30") if u.get("need30") is not None else u.get("g30", T - T % 30_000)
             g60 = u.get("need60") if u.get("need60") is not None else u.get("g60", T - T % M)
             p15 = u.get("p15", NP)
-            hv = u.get("htf") or (None, None, None, None, None)
-            env.update(hTc1=hv[0], hB1=hv[1], hTc2=hv[2], hB2=hv[3], hCur=hv[4])
+            hv = u.get("htf") or (None,) * 8
+            env.update(hTc1=hv[0], hB1=hv[1], hN1=hv[2], hTc2=hv[3], hB2=hv[4], hN2=hv[5], hCur=hv[6], hNc=hv[7])
             env.update(__first__=first, time=T, time_close=T + 15_000, barstate__isrealtime=live,
                        barstate__isconfirmed=u.get("conf", True), timenow=u.get("now", T),
                        high=hlc[0], low=hlc[1], close=hlc[2],
@@ -480,6 +495,8 @@ def pine_rows_runner(src):
             if patB is not None:
                 env["patB"] = patB
             exec(code, env)
+            if draw_labels and dcode is not None:
+                draw(env)
             first = False
             last_t = T
             last_bar = (T + 15_000, hlc[0], hlc[1], hlc[2])
@@ -492,6 +509,7 @@ def pine_rows_runner(src):
             marks += [(x, k, tip) for x, k, tip in zip(env["mkX"], env["mkK"], env["mkTip"]) if k in (1, -1)]
         return env["LOG"], marks
     run.labels = LABELS
+    run.draw = run_draw
     run.env = None
     return run
 
@@ -595,17 +613,30 @@ def band_at(htf, t):
     return seg_at(htf, t)[1]
 
 
+MISS = "MISS"
+
+
+def hband(bb):
+    """band value of an htf entry: MISS (the bar's confirmed band is never delivered) -> unknown; ('LATE', b) -> b."""
+    if isinstance(bb, tuple):
+        return bb[1]
+    return None if bb == MISS else bb
+
+
 def seg_at(htf, t):
     """(segment start, band) in effect at t. A segment starts where the confirmed band's colour actually changes (red -> flat
-    -> red gives three segments; consecutive bars of the same colour stay one segment; an unknown band is its own colour)."""
+    -> red gives three segments; consecutive bars of the same colour stay one segment; an unknown band, including a bar whose
+    confirmed band never arrives, is its own colour and also breaks the segment)."""
     sg, b, prev = None, None, object()
     cur_seg = None
     for (tc, bb) in htf:
-        if bb != prev:
+        v = hband(bb)
+        key = ("U", tc) if v is None else v
+        if key != prev:
             cur_seg = tc
-        prev = bb
+        prev = key
         if tc <= t:
-            sg, b = cur_seg, bb
+            sg, b = cur_seg, v
     return sg, b
 
 
@@ -748,6 +779,26 @@ def merged(sig):
 
 
 def htf_deliver(htf, now, delay=0):
+    """SSS-13: 8 values (time_close[1], band[1], bar_index[1], time_close[2], band[2], bar_index[2], time_close, bar_index);
+    bar_index = position in htf. A MISS bar is never delivered as [1] / [2]; a ('LATE', b) bar is not delivered as [1] (only
+    later as [2])."""
+    r = _htf_deliver5(htf, now, delay)
+    k = r[5]
+    out = []
+    for slot, j in ((1, k), (2, k - 1)):
+        if j >= 0:
+            bb = htf[j][1]
+            if bb == MISS or (isinstance(bb, tuple) and slot == 1):
+                out += [None, None, None]
+            else:
+                out += [htf[j][0], hband(bb), j]
+        else:
+            out += [None, None, None]
+    out += [r[4], k + 1 if k + 1 < len(htf) else None]
+    return tuple(out)
+
+
+def _htf_deliver5(htf, now, delay=0):
     """request.security(htf, [time_close[1], band[1], time_close[2], band[2], time_close], lookahead_on) as seen at chart time
     `now`: htf = sorted [(close_time, band)] of consecutive HTF bars (bar k closes at htf[k][0]); a bar's switch to the next is
     visible `delay` ms after its close."""
@@ -759,7 +810,7 @@ def htf_deliver(htf, now, delay=0):
     tc1, b1 = (htf[k][0], htf[k][1]) if k >= 0 else (None, None)
     tc2, b2 = (htf[k - 1][0], htf[k - 1][1]) if k >= 1 else (None, None)
     cur = htf[k + 1][0] if k + 1 < len(htf) else None
-    return (tc1, b1, tc2, b2, cur)
+    return (tc1, b1, tc2, b2, cur, k)
 
 
 def pine_updates(T, b15, tfs, delays=None, realtime=False, htf=None, htf_delay=0):
@@ -1056,6 +1107,8 @@ def main():
     import subprocess
     old_src = subprocess.run(["git", "-C", ROOT, "show", "6b5e516:SatsShortSignal.pine"], capture_output=True, text=True).stdout
     run_new = pine_rows_runner(pine)
+    prev_src = subprocess.run(["git", "-C", ROOT, "show", "2207947:SatsShortSignal.pine"], capture_output=True, text=True).stdout
+    run_prev = pine_rows_runner(prev_src) if prev_src else None
     run_old = pine_rows_runner(old_src) if old_src else None
     for d, nm in (("S", "SELL"), ("B", "BUY")):
         T, ups = gap_case(d)
@@ -1534,6 +1587,69 @@ def main():
           "順: 15s → 30s" in in_red and "15s 09:21:00" in in_red and "次: 30s" in in_red
           and in_flat == "順: 15s → 30s → 1m  待ち: 15s")
 
+    # ---- SSS-13: late signals are always drawn; HTF bars counted by bar_index (missing bars = unknown band) ----------------
+    def drawn(env):
+        return sorted((d.args[0], d.text) for d in env["LBL"] if not d.deleted and d.kind == "label" and d.text not in ("•", "欠"))
+    H10 = [(hm(9, 0), -1), (hm(9, 10), -1), (hm(9, 20), -1), (hm(9, 30), -1), (hm(9, 40), -1), (hm(9, 50), -1)]
+    T, b15, tfs = hand_case(hm(9, 20), 90, {}, {}, stS2)
+    _, mk = run_new(pine_updates(T, b15, tfs, htf=H10, htf_delay=20 * M), htf_sel=mk_sel(), patA=True, draw_labels=True)
+    lab = drawn(run_new.env)
+    check("SSS-13: HTF data 20 min late -> the SELL at 9:21:30 is registered at ~9:40 (18.5 min old) and still drawn on its bar",
+          sigmarks(mk) == [(hm(9, 21, 30), "SELL")] and lab == [(hm(9, 21, 30), "SELL 帯→フラット")])
+    if run_prev:
+        _, mk_p = run_prev(pine_updates(T, b15, tfs, htf=H10, htf_delay=20 * M), htf_sel=mk_sel(), patA=True)
+        check("SSS-13: (2207947 for comparison registers the same SELL; its drawing section drops records older than 15 min "
+              "before drawing them, so that SELL never got a label)",
+              sigmarks(mk_p) == [(hm(9, 21, 30), "SELL")])
+    # merge: a second pattern at the same position registered on a later bar replaces the committed label with one merged label
+    env = run_new.env
+    env["time"] = hm(9, 41, 30)
+    env["f_sigMark"](hm(9, 21, 30), 1, 1, "SELL フラット→帯＋端の線転換 (test)")
+    run_new.draw(env)
+    lab2 = drawn(env)
+    check("SSS-13: a later フラット→帯 SELL at the same 9:21:30 deletes the committed label and draws one merged label",
+          lab2 == [(hm(9, 21, 30), "SELL 帯→フラット・フラット→帯＋端の線転換")])
+    # HTF bar missing (its confirmed band never arrives) -> unknown, no signal, no joining across it
+    MS = [(hm(9, 18), -1), (hm(9, 20), -1), (hm(9, 22), MISS), (hm(9, 24), -1), (hm(9, 26), -1), (hm(9, 28), -1), (hm(9, 40), -1)]
+    pm, md, _, _ = runH(MS, {(0, hm(9, 22, 15)): (2, 0), (1, hm(9, 22, 30)): (2, 0)}, n=48)
+    check("SSS-13: the HTF bar closing 9:22 is missing -> 9:22:15 / 9:22:30 events are in an unknown band -> no SELL",
+          pm == md == [])
+    if run_prev:
+        T, b15, tfs = hand_case(hm(9, 20), 48, {}, {}, {(0, hm(9, 22, 15)): (2, 0), (1, hm(9, 22, 30)): (2, 0)})
+        ups_p = pine_updates(T, b15, tfs, htf=MS)
+        _, mk_p = run_prev(ups_p, htf_sel=mk_sel(), patA=True)
+        check("SSS-13: (2207947 carried the 9:20 red band into the missing bar's interval and gave a SELL)",
+              sigmarks(mk_p) == [(hm(9, 22, 30), "SELL")])
+    pm, md, _, _ = runH(MS, {(0, hm(9, 21, 30)): (2, 0), (1, hm(9, 24, 30)): (2, 0)}, n=48)
+    pm2, md2, _, _ = runH(RRR, {(0, hm(9, 21, 30)): (2, 0), (1, hm(9, 24, 30)): (2, 0)}, n=48)
+    check("SSS-13: red before and after the missing bar: 15s 9:21:30 and 30s 9:24:30 are not joined (no SELL); "
+          "without the gap (red throughout) -> SELL at 9:24:30", pm == md == [] and pm2 == md2 == [(hm(9, 24, 30), "SELL")])
+    # market-closed time gap with consecutive bar indices is not a gap
+    WK = [(hm(9, 18), -1), (hm(9, 20), -1), (hm(9, 40), -1), (hm(9, 42), -1), (hm(9, 50), -1)]
+    pm, md, _, _ = runH(WK, stS2)
+    check("SSS-13: HTF time jumps 9:20 -> 9:40 with consecutive bar indices -> band known -> SELL at 9:21:30",
+          pm == md == [(hm(9, 21, 30), "SELL")])
+    # a bar whose [1] is lost but arrives later as [2]: the events wait, then are processed in time order (= history)
+    LT = [(hm(9, 18), -1), (hm(9, 20), -1), (hm(9, 22), ("LATE", -1)), (hm(9, 24), -1), (hm(9, 26), -1), (hm(9, 40), -1)]
+    stL = {(0, hm(9, 22, 15)): (2, 0), (1, hm(9, 22, 30)): (2, 0)}
+    T, b15, tfs = hand_case(hm(9, 20), 48, {}, {}, stL)
+    ups = pine_updates(T, b15, tfs, None, True, htf=LT)
+    i23 = next(n for n, u in enumerate(ups) if u["t"] == hm(9, 23, 45)) + 1
+    _, mk_w = run_new(ups[:i23], live=True, htf_sel=mk_sel(), patA=True)
+    _, mk_r = run_new(ups, live=True, htf_sel=mk_sel(), patA=True)
+    pm_h, md_h, _, _ = runH(LT, stL, n=48)
+    check("SSS-13: the 9:22 HTF bar's [1] is lost; until its [2] arrives (9:24) the 9:22:15 / 9:22:30 events wait (no SELL at "
+          "9:23:45), then SELL at 9:22:30 (= history, model)",
+          sigmarks(mk_w) == [] and sigmarks(mk_r) == pm_h == md_h == [(hm(9, 22, 30), "SELL")])
+    # the segment after a missing bar proceeds on its own while the missing bar's events are still pending
+    stN = {(0, hm(9, 22, 15)): (2, 0), (0, hm(9, 24, 15)): (2, 0), (1, hm(9, 24, 30)): (2, 0)}
+    T, b15, tfs = hand_case(hm(9, 20), 48, {}, {}, stN)
+    ups = pine_updates(T, b15, tfs, None, True, htf=MS)
+    i24 = next(n for n, u in enumerate(ups) if u["t"] == hm(9, 24, 45)) + 1
+    _, mk_a = run_new(ups[:i24], live=True, htf_sel=mk_sel(), patA=True)
+    check("SSS-13: after the missing 9:22 bar, the 9:24 segment (red known) fires at 9:24:30 while the gap's events still wait",
+          sigmarks(mk_a) == [(hm(9, 24, 30), "SELL")])
+
     # random: random HTF bands, both patterns, Pine == models; realtime with delays (incl. the HTF switch) == history
     agreeH = rtH = nH = 0
     for seed in (515, 522, 526, 503):
@@ -1543,6 +1659,7 @@ def main():
         tfs = series_tfs(T, b15)
         per = rng7.choice([3, 4, 7]) * M
         htf = [(T[0] - T[0] % per + k * per, rng7.choice([-1, 0, 1, 1, -1, None if k % 9 == 4 else 0])) for k in range(len(T) * S15 // per + 3)]
+        htf = [(tc, MISS if k % 11 == 6 else ("LATE", bb) if k % 7 == 3 and bb is not None else bb) for k, (tc, bb) in enumerate(htf)]
         sel = [rng7.random() < 0.6 for _ in range(48)]
         _, mk = run_new(pine_updates(T, b15, tfs, htf=htf), htf_sel=sel, patA=True, patB=True, useB=(True, True, True, True))
         md = [(x, d) for (x, d, _) in mid_model(T, b15, tfs, htf=htf, sel=sel)[0]]
