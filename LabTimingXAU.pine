@@ -1,0 +1,1117 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © shota0927-prog
+//
+// ============================================================================
+//  LabTimingXAU (LAB-20)  —  ZoneComboLabXAU.pine のタイミング計算ライブラリ (TC サッツバンド転換 / TD ストキャスMTF)
+//  ZoneComboLabXAU の LAB-19 (606dd47) の該当部分をそのまま移したもの。計算・揃え方・時刻の扱いは同じで、変えたのは次だけ:
+//   ・Lab のグローバル変数 (TC の状態配列) → TcState のフィールド (Lab が var で 1 個持ち、毎回渡す)
+//   ・Lab の入力 → TcCfg のフィールド / tdSig の引数
+//   ・Lab の下位足・現在足の取得結果 (tq15* / tq30* / tq60* / tq5*) → TcLtf / TcCur のフィールド
+//  取得 (request.security / request.security_lower_tf) は Lab 側で行い、その式の中で tcEvt / tcEvt15 / htfBand / tdSig を呼ぶ。
+//  設定入力・Zone 接触後の待機・SL / TP・注文処理は Lab 側のまま。
+// ============================================================================
+
+//@version=6
+library("LabTimingXAU", overlay = true)
+
+// ============================================================================
+// TC サッツバンド転換: 取得式で使う関数 (Lab LAB-19 の写し。f_tcEvt / f_tcEvt15 / f_htfBand を export しただけ)
+// ============================================================================
+
+// ---- TC: SATS (ZoneStrategyXAU の f_satBand = tests/sats_src/f_satBand.txt をそのまま) ----
+// ==== LAB SATS copy (begin) ==================================================
+f_satBand() =>
+    // --- 共通 Basis（SMA でも EMA でもなく VWMA。source は hlc3、length は 5） ---
+    float basisV  = ta.vwma(hlc3, 5)
+    float commonV = basisV * 0.5
+
+    // --- ATR（ta.atr() なので内部は RMA。現在足ではなく 1 本前の値） ---
+    float atr50V = ta.atr(50)[1]
+
+    // --- Anchor 共通 source と State 反転判定用の値（いずれも 1 本前の足から） ---
+    float srcV      = close[1] * 0.5
+    float trigLowV  = low[1]   * 0.5
+    float trigHighV = high[1]  * 0.5
+
+    bool readyV = not na(atr50V) and not na(srcV) and not na(trigLowV) and not na(trigHighV)
+
+    // --- LINE1（k = 5.0） ---
+    //   同一バー内で更新済みの anchor / dir を条件判定へ再利用しないよう、
+    //   判定前に prevAnchor / prevDir へ退避してから State を更新する。
+    float k1V = 5.0
+    var float anchor1V = na
+    var int   dir1V    = 1
+    float prevAnchor1V = anchor1V
+    int   prevDir1V    = dir1V
+    if readyV
+        if na(prevAnchor1V)
+            // 初期化：Bull から開始する
+            anchor1V := srcV - k1V * atr50V
+            dir1V    := 1
+        else if prevDir1V == 1
+            if trigLowV < prevAnchor1V
+                // Bull → Bear
+                dir1V    := -1
+                anchor1V := srcV + k1V * atr50V
+            else
+                dir1V    := 1
+                anchor1V := math.max(prevAnchor1V, srcV - k1V * atr50V)
+        else
+            if trigHighV > prevAnchor1V
+                // Bear → Bull
+                dir1V    := 1
+                anchor1V := srcV - k1V * atr50V
+            else
+                dir1V    := -1
+                anchor1V := math.min(prevAnchor1V, srcV + k1V * atr50V)
+    float line1V = commonV + anchor1V
+
+    // --- LINE2（k = 2.5。構造は LINE1 と完全に同じで、違うのは倍率だけ） ---
+    float k2V = 2.5
+    var float anchor2V = na
+    var int   dir2V    = 1
+    float prevAnchor2V = anchor2V
+    int   prevDir2V    = dir2V
+    if readyV
+        if na(prevAnchor2V)
+            // 初期化：Bull から開始する
+            anchor2V := srcV - k2V * atr50V
+            dir2V    := 1
+        else if prevDir2V == 1
+            if trigLowV < prevAnchor2V
+                // Bull → Bear
+                dir2V    := -1
+                anchor2V := srcV + k2V * atr50V
+            else
+                dir2V    := 1
+                anchor2V := math.max(prevAnchor2V, srcV - k2V * atr50V)
+        else
+            if trigHighV > prevAnchor2V
+                // Bear → Bull
+                dir2V    := 1
+                anchor2V := srcV - k2V * atr50V
+            else
+                dir2V    := -1
+                anchor2V := math.min(prevAnchor2V, srcV + k2V * atr50V)
+    float line2V = commonV + anchor2V
+
+    // --- STB（Donchian 構造。LINE1 / LINE2 の State とは完全に独立） ---
+    //   表示用     ： ta.highest(high, 10) / ta.lowest(low, 10)
+    //   方向判定用 ： ta.highest(high, 20)[1] / ta.lowest(low, 20)[1]
+    //   毎バー high breakout を先に判定し、同じ足で上下両方を突破した場合も
+    //   Bull 側（+1）が優先される。どちらも突破していなければ直前の State を維持。
+    float stbUpperV = ta.highest(high, 10)
+    float stbLowerV = ta.lowest(low, 10)
+    float prev20HighV = ta.highest(high, 20)[1]
+    float prev20LowV  = ta.lowest(low, 20)[1]
+    var int stbDirV = 1
+    if not na(prev20HighV) and not na(prev20LowV)
+        if high > prev20HighV
+            stbDirV := 1
+        else if low < prev20LowV
+            stbDirV := -1
+    // UP は下側（lower10）、DOWN は上側（upper10）を表示価格にする
+    float stbV = stbDirV == 1 ? stbLowerV : stbUpperV
+
+    // --- 青バンド / 赤バンド ---
+    //   現在価格と LINE1 / LINE2 / STB の 3 本の位置関係だけで決める。
+    //   各ラインの dir は判定に使わない。
+    int stateV = 0
+    if close > line1V and close > line2V and close > stbV
+        stateV := 1
+    else if close < line1V and close < line2V and close < stbV
+        stateV := -1
+
+    [line1V, line2V, stbV, dir1V, dir2V, stbDirV, stateV, basisV, commonV, atr50V, anchor1V, anchor2V]
+// ==== LAB SATS copy (end) ====================================================
+
+// ---- TC サッツバンド転換: SatsShortSignal (bea7105) の開始判定の関数 (写し・一字一句そのまま) ----
+// ==== LAB TCS copy (begin) ===================================================
+f_nextAnchor(float prevAnchor, int prevDir, float k, float srcV, float trigLowV, float trigHighV, float atrV) =>
+    float a = prevAnchor
+    int   d = prevDir
+    bool readyV = not na(atrV) and not na(srcV) and not na(trigLowV) and not na(trigHighV)
+    if readyV
+        if na(prevAnchor)
+            a := srcV - k * atrV
+            d := 1
+        else if prevDir == 1
+            if trigLowV < prevAnchor
+                d := -1
+                a := srcV + k * atrV
+            else
+                d := 1
+                a := math.max(prevAnchor, srcV - k * atrV)
+        else
+            if trigHighV > prevAnchor
+                d := 1
+                a := srcV - k * atrV
+            else
+                d := -1
+                a := math.min(prevAnchor, srcV + k * atrV)
+    [a, d]
+
+f_satsPrep() =>
+    [l1, l2, sb, d1, d2, sd, st, b, cm, at, a1, a2] = f_satBand()
+    float atrN = ta.atr(50)
+    [a1n, d1n] = f_nextAnchor(a1, d1, 5.0, close * 0.5, low * 0.5, high * 0.5, atrN)
+    [a2n, d2n] = f_nextAnchor(a2, d2, 2.5, close * 0.5, low * 0.5, high * 0.5, atrN)
+    bool okP = not na(l1) and not na(l2) and not na(sb)
+    [okP, st, d1, d2, sd, cm + a1n, cm + a2n, d1n, d2n, ta.highest(high, 20), ta.lowest(low, 20), ta.highest(high, 9), ta.lowest(low, 9),
+         l1, l2, sb]
+
+f_satsStart() =>
+    [okP, st, d1, d2, sd, l1s, l2s, d1s, d2s, hh20, ll20, hh9, ll9, l1, l2, sb] = f_satsPrep()
+    [time, open, okP[1], st[1], d1[1], d2[1], sd[1], l1s[1], l2s[1], d1s[1], d2s[1], hh20[1], ll20[1], hh9[1], ll9[1],
+         l1[1], l2[1], sb[1]]
+
+f_evt(float o, bool okP, int stP, int d1P, int d2P, int sdP, float l1s, float l2s, int d1s, int d2s,
+      float hh20, float ll20, float hh9, float ll9) =>
+    int sdS = sdP
+    if not na(hh20) and not na(ll20) and not na(o)
+        if o > hh20
+            sdS := 1
+        else if o < ll20
+            sdS := -1
+    float sbS = na(o) ? na : sdS == 1 ? math.min(o, ll9) : math.max(o, hh9)
+    int stS = na
+    int ms = 0
+    int mb = 0
+    if okP and not na(o) and not na(l1s) and not na(l2s) and not na(sbS)
+        stS := o > l1s and o > l2s and o > sbS ? 1 : o < l1s and o < l2s and o < sbS ? -1 : 0
+        if stS == 0 and stP == 1
+            ms += d1P == 1 and d1s == -1 and l1s > o ? 1 : 0
+            ms += d2P == 1 and d2s == -1 and l2s > o ? 2 : 0
+            ms += sdP == 1 and sdS == -1 and sbS > o ? 4 : 0
+        if stS == 0 and stP == -1
+            mb += d1P == -1 and d1s == 1 and l1s < o ? 1 : 0
+            mb += d2P == -1 and d2s == 1 and l2s < o ? 2 : 0
+            mb += sdP == -1 and sdS == 1 and sbS < o ? 4 : 0
+    [ms, mb, stS, sdS, sbS]
+
+f_edgeMask(float l1P, float l2P, float sbP, int d1, int d2, int sd, int d1s, int d2s, int sdS) =>
+    int ms = 0
+    int mb = 0
+    if not na(l1P) and not na(l2P) and not na(sbP) and not na(sdS)
+        float lo = math.min(l1P, math.min(l2P, sbP))
+        float hi = math.max(l1P, math.max(l2P, sbP))
+        ms += l1P == lo and d1 == 1 and d1s == -1 ? 1 : 0
+        ms += l2P == lo and d2 == 1 and d2s == -1 ? 2 : 0
+        ms += sbP == lo and sd == 1 and sdS == -1 ? 4 : 0
+        mb += l1P == hi and d1 == -1 and d1s == 1 ? 1 : 0
+        mb += l2P == hi and d2 == -1 and d2s == 1 ? 2 : 0
+        mb += sbP == hi and sd == -1 and sdS == 1 ? 4 : 0
+    [ms, mb]
+
+// ==== LAB TCS copy (end) =====================================================
+
+//  各足の開始判定データ (SatsShortSignal の f_satsEvt の現在足 16 個と同じ):
+//  [time, SELL mask, BUY mask, open, 直前確定足の帯, 直前確定足の STB 方向, LINE1 開始, LINE2 開始, 直前20本の高値・安値,
+//   直前9本の高値・安値, 直前確定足の time_close, 開始帯, 「フラット→帯」の SELL / BUY 線 mask]。使う新しい足の値は time と open だけ。
+export tcEvt() =>
+    [t, o, okP, st, d1, d2, sd, l1s, l2s, d1s, d2s, hh20, ll20, hh9, ll9, l1P, l2P, sbP] = f_satsStart()
+    [ms, mb, stS, sdS, sbS] = f_evt(o, okP, st, d1, d2, sd, l1s, l2s, d1s, d2s, hh20, ll20, hh9, ll9)
+    float stP = okP ? st : na
+    float sdP = sd
+    int   tcP = time_close[1]
+    [ma, mz] = f_edgeMask(okP ? l1P : na, l2P, sbP, d1, d2, sd, d1s, d2s, sdS)
+    [t, ms, mb, o, stP, sdP, l1s, l2s, hh20, ll20, hh9, ll9, tcP, stS, ma, mz]
+//  15秒足は開始判定データに加えて、その 15秒足の確定値 (途中 STB 用: 高値・安値・終値・time_close)
+export tcEvt15() =>
+    [t, ms, mb, o, stP, sdP, l1s, l2s, hh20, ll20, hh9, ll9, tcP, stS, ma, mz] = tcEvt()
+    [t, ms, mb, o, stP, sdP, l1s, l2s, hh20, ll20, hh9, ll9, tcP, stS, ma, mz, high, low, close, time_close]
+//  参照上位足: 直近確定足 ([1]) と 1 本前 ([2]) の帯・time_close・上位足側の bar_index、現在の上位足の time_close と bar_index
+export htfBand() =>
+    [l1, l2, sb, d1, d2, sd, st, b, cm, at, a1, a2] = f_satBand()
+    int bnd = na(l1) or na(l2) or na(sb) ? na : st
+    [time_close[1], bnd[1], bar_index[1], time_close[2], bnd[2], bar_index[2], time_close, bar_index]
+
+
+// ============================================================================
+// TC サッツバンド転換: 状態・設定・入力
+// ============================================================================
+// @type 確定 5分足の中の下位足 (15秒 / 30秒 / 1分) の開始判定データ。30秒 / 1分の H / L / C / TC は na
+export type TcLtf
+    array<int>   t
+    array<int>   ms
+    array<int>   mb
+    array<float> o
+    array<float> sp
+    array<float> dp
+    array<float> l1
+    array<float> l2
+    array<float> h20
+    array<float> w20
+    array<float> h9
+    array<float> w9
+    array<int>   tc
+    array<int>   ss
+    array<int>   ma
+    array<int>   mz
+    array<float> H
+    array<float> L
+    array<float> C
+    array<int>   TC
+
+// @type このチャート足 (5分足) の開始判定データ (Lab の tq5*)
+export type TcCur
+    int          t
+    int          ms
+    int          mb
+    float        o
+    float        sp
+    float        dp
+    float        l1
+    float        l2
+    float        h20
+    float        w20
+    float        h9
+    float        w9
+    int          tc
+    int          ss
+    int          ma
+    int          mz
+
+// @type TC の入力 (Lab の tcWait / tcPatA ... / tcHtfOn と、上位足切替の 48 欄 tcxA0S0 .. tcxB2B3 をこの順で x に入れる)
+export type TcCfg
+    int  wait
+    bool patA
+    bool u15
+    bool u30
+    bool u60
+    bool u300
+    bool patB
+    bool ub15
+    bool ub30
+    bool ub60
+    bool ub300
+    bool clr15
+    bool clr30
+    bool clr60
+    bool clr300
+    bool htfOn
+    array<bool> x
+
+// @type TC の状態 (Lab LAB-19 のグローバル配列 tcCx / tcBLast / ... / tcSigT と同じ意味。Lab が var で 1 個持つ)
+export type TcState
+    array<float> cx
+    array<int>   bLast
+    array<int>   bArmS
+    array<int>   bArmB
+    array<int>   bFireS
+    array<int>   bFireB
+    array<int>   bHadS
+    array<int>   bHadB
+    array<int>   eT
+    array<int>   eG
+    array<int>   eR
+    array<int>   eSub
+    array<int>   eMS
+    array<int>   eMB
+    array<int>   eTgt
+    array<int>   eDone
+    array<int>   eP
+    array<int>   cdT
+    array<int>   sgLast
+    array<int>   slSeg
+    array<int>   pcT
+    array<int>   pcB
+    array<int>   hN
+    array<int>   hT
+    array<int>   hB
+    array<int>   hHas
+    array<int>   hS
+    int          hFront
+    int          hNcur
+    array<int>   merged
+    array<int>   lgP
+    array<int>   lgD
+    array<int>   lgSeg
+    array<int>   lgT
+    array<int>   lgG
+    array<int>   lgR
+    array<int>   lgSub
+    array<int>   lgMS
+    array<int>   lgMB
+    array<int>   lgTgt
+    array<int>   sigT
+    TcLtf        q15
+    TcLtf        q30
+    TcLtf        q60
+    TcCur        q5
+
+// @function TC の状態を作る (Lab で var lt.TcState s = lt.tcNew())
+export tcNew() =>
+    TcState.new(array.new_float(60, na), array.new_int(4, na), array.new_int(4, na), array.new_int(4, na), array.new_int(4, 0), array.new_int(4, 0),
+         array.new_int(4, 0), array.new_int(4, 0), array.new_int(), array.new_int(), array.new_int(), array.new_int(), array.new_int(), array.new_int(), array.new_int(), array.new_int(), array.new_int(), array.new_int(192, na), array.new_int(4, na), array.new_int(12, na),
+         array.new_int(8, na), array.new_int(8, 0), array.new_int(), array.new_int(), array.new_int(), array.new_int(), array.new_int(), na, na, array.new_int(), array.new_int(), array.new_int(),
+         array.new_int(), array.new_int(), array.new_int(), array.new_int(), array.new_int(), array.new_int(), array.new_int(), array.new_int(), array.new_int(4, na), na, na, na, na)
+
+// ============================================================================
+// TC サッツバンド転換: 検知・揃え方 (Lab LAB-19 の写し。状態・設定・入力を s / c 経由にしただけ)
+// ============================================================================
+//  パターン p (0 帯→フラット / 1 フラット→帯＋端の線転換) の時間足 i (0 15秒 / 1 30秒 / 2 1分 / 3 5分) の設定
+f_tcOnP(TcState tsx, TcCfg tcg, int p, int i) =>
+    p == 0 ? tcg.patA and (i == 0 ? tcg.u15 : i == 1 ? tcg.u30 : i == 2 ? tcg.u60 : tcg.u300) : tcg.patB and (i == 0 ? tcg.ub15 : i == 1 ? tcg.ub30 : i == 2 ? tcg.ub60 : tcg.ub300)
+
+f_tcPOn(TcState tsx, TcCfg tcg, int p) =>
+    p == 0 ? tcg.patA : tcg.patB
+
+f_tcClrOn(TcState tsx, TcCfg tcg, int i) =>
+    i == 0 ? tcg.clr15 : i == 1 ? tcg.clr30 : i == 2 ? tcg.clr60 : tcg.clr300
+
+//  上位足で切り替えるときの欄 (パターン p × 帯 b × 方向 d × 時間足 i)
+f_tcX(TcState tsx, TcCfg tcg, int p, int bi, int d, int i) =>
+    int k = ((p * 3 + bi) * 2 + d) * 4 + i
+    k >= 0 and k < array.size(tcg.x) ? array.get(tcg.x, k) : false
+
+//  パターン p・方向 d・上位足の帯 b で時間足 i を使うか (切替 OFF はパターンの時間足設定、帯が未取得なら使わない)
+f_tcSel(TcState tsx, TcCfg tcg, int p, int d, int b, int i) =>
+    bool r = false
+    if f_tcPOn(tsx, tcg, p)
+        if not tcg.htfOn
+            r := f_tcOnP(tsx, tcg, p, i)
+        else if not na(b)
+            r := f_tcX(tsx, tcg, p, b == -1 ? 0 : b == 0 ? 1 : 2, d, i)
+    r
+
+//  パターン p が時間足 i をどこかで使うか (イベントの生成対象)
+f_tcUseP(TcState tsx, TcCfg tcg, int p, int i) =>
+    bool r = f_tcOnP(tsx, tcg, p, i)
+    if tcg.htfOn
+        r := false
+        if f_tcPOn(tsx, tcg, p)
+            for bi = 0 to 2
+                for d = 0 to 1
+                    if f_tcX(tsx, tcg, p, bi, d, i)
+                        r := true
+    r
+
+f_tcNeed(TcState tsx, TcCfg tcg, int i) =>
+    f_tcUseP(tsx, tcg, 0, i) or f_tcUseP(tsx, tcg, 1, i)
+
+f_tcNStg(TcState tsx, TcCfg tcg, int p, int d, int b) =>
+    int n = 0
+    for i = 0 to 3
+        if f_tcSel(tsx, tcg, p, d, b, i)
+            n += 1
+    n
+
+f_tcStage(TcState tsx, TcCfg tcg, int p, int d, int b, int i) =>
+    int s = -1
+    if f_tcSel(tsx, tcg, p, d, b, i)
+        s := 0
+        for k = 0 to 3
+            if k < i and f_tcSel(tsx, tcg, p, d, b, k)
+                s += 1
+    s
+
+//  上位足の足 n を記録 (単体版 f_htfPut と同じ。先頭の記録の区間の開始は保つ。区間の開始が早まったら古い区間を組み直し対象に)
+f_tcHtfPut(TcState tsx, TcCfg tcg, int n, int tc, int b, bool has) =>
+    if not na(n) and not na(tc)
+        int sz = array.size(tsx.hN)
+        int at = -1
+        int pos = sz
+        for k = sz - 1 to 0
+            if k < 0 or k >= sz
+                continue
+            int nk = array.get(tsx.hN, k)
+            if nk == n
+                at := k
+            if nk > n
+                pos := k
+        if at >= 0
+            array.set(tsx.hT, at, tc)
+            if has and array.get(tsx.hHas, at) == 0
+                array.set(tsx.hB, at, b)
+                array.set(tsx.hHas, at, 1)
+        else
+            array.insert(tsx.hN, pos, n)
+            array.insert(tsx.hT, pos, tc)
+            array.insert(tsx.hB, pos, has ? b : na)
+            array.insert(tsx.hHas, pos, has ? 1 : 0)
+            array.insert(tsx.hS, pos, tc)
+        for k = 1 to array.size(tsx.hN) - 1
+            if k >= 1 and k < array.size(tsx.hN)
+                bool cont = array.get(tsx.hN, k - 1) == array.get(tsx.hN, k) - 1 and array.get(tsx.hHas, k - 1) == 1
+                     and array.get(tsx.hHas, k) == 1 and nz(array.get(tsx.hB, k - 1), 9) == nz(array.get(tsx.hB, k), 9)
+                int oldS = array.get(tsx.hS, k)
+                int newS = cont ? array.get(tsx.hS, k - 1) : array.get(tsx.hT, k)
+                if not na(oldS) and newS < oldS and not array.includes(tsx.merged, oldS)
+                    array.push(tsx.merged, oldS)
+                array.set(tsx.hS, k, newS)
+        if array.size(tsx.hN) > 30
+            array.shift(tsx.hN)
+            array.shift(tsx.hT)
+            array.shift(tsx.hB)
+            array.shift(tsx.hHas)
+            array.shift(tsx.hS)
+
+//  時刻 t の上位足の帯: [区間の開始, 帯, 状態 0 分かっている / 1 まだ届く可能性 (保留) / 2 取得できない (合図なし)] (単体版 f_htfInfo と同じ)
+f_tcHtfInfo(TcState tsx, TcCfg tcg, int t) =>
+    int sz = array.size(tsx.hN)
+    int k = -1
+    for q = 0 to sz - 1
+        if q >= 0 and q < sz and array.get(tsx.hT, q) <= t
+            k := q
+    int sg = na
+    int b = na
+    int st = 2
+    if k >= 0
+        int nk = array.get(tsx.hN, k)
+        bool nextOk = (k + 1 < sz and array.get(tsx.hN, k + 1) == nk + 1) or (k + 1 >= sz and not na(tsx.hNcur) and tsx.hNcur == nk + 1)
+        int need = array.get(tsx.hHas, k) == 0 ? nk : nextOk ? na : nk + 1
+        if na(need)
+            sg := array.get(tsx.hS, k)
+            b := array.get(tsx.hB, k)
+            st := na(b) ? 2 : 0
+        else
+            st := not na(tsx.hNcur) and tsx.hNcur >= need + 3 ? 2 : 1
+    [sg, b, st]
+
+f_tcCdIdx(TcState tsx, TcCfg tcg, int p, int L, int k, int st) =>
+    ((p * 6 + L) * 4 + k) * 4 + st
+
+f_tcCdClr(TcState tsx, TcCfg tcg, int p, int L, int k) =>
+    for st = 0 to 3
+        array.set(tsx.cdT, f_tcCdIdx(tsx, tcg, p, L, k, st), na)
+
+f_tcCdValid(TcState tsx, TcCfg tcg, int p, int L, int k, int t) =>
+    int st0 = array.get(tsx.cdT, f_tcCdIdx(tsx, tcg, p, L, k, 0))
+    bool ok = not na(st0) and t - st0 <= tcg.wait * 60000
+    if not na(st0) and not ok
+        f_tcCdClr(tsx, tcg, p, L, k)
+    ok
+
+f_tcSlotFind(TcState tsx, TcCfg tcg, int p, int d, int seg) =>
+    int r = -1
+    for j = 0 to 2
+        int sj = array.get(tsx.slSeg, (p * 2 + d) * 3 + j)
+        if not na(sj) and sj == seg and r < 0
+            r := j
+    r
+
+f_tcSlotFor(TcState tsx, TcCfg tcg, int p, int d, int seg) =>
+    int r = f_tcSlotFind(tsx, tcg, p, d, seg)
+    if r < 0
+        int old = -1
+        for j = 0 to 2
+            int sj = array.get(tsx.slSeg, (p * 2 + d) * 3 + j)
+            if na(sj) and r < 0
+                r := j
+            if not na(sj) and (old < 0 or sj < array.get(tsx.slSeg, (p * 2 + d) * 3 + old))
+                old := j
+        if r < 0
+            r := old
+        array.set(tsx.slSeg, (p * 2 + d) * 3 + r, seg)
+        for kk = 1 to 3
+            f_tcCdClr(tsx, tcg, p, d * 3 + r, kk)
+    r
+
+//  パターン p・方向 d・区間スロット j で時間足 i の成立 (m > 0) を処理し、選んだ段がすべて揃ったら true (単体版 f_seqEvt と同じ揃え方)
+f_tcSeqEvt(TcState tsx, TcCfg tcg, int p, int d, int j, int i, int t, int m, int b) =>
+    bool fired = false
+    int L = d * 3 + j
+    int s = f_tcStage(tsx, tcg, p, d, b, i)
+    int last = array.get(tsx.sgLast, p * 2 + d)
+    if s >= 0 and m > 0 and not (not na(last) and last == t)
+        bool can = s == 0 ? true : f_tcCdValid(tsx, tcg, p, L, s, t)
+        if can
+            int st0 = s == 0 ? t : array.get(tsx.cdT, f_tcCdIdx(tsx, tcg, p, L, s, 0))
+            int k = s + 1
+            if k == f_tcNStg(tsx, tcg, p, d, b)
+                fired := true
+                for kk = 1 to 3
+                    f_tcCdClr(tsx, tcg, p, L, kk)
+                array.set(tsx.sgLast, p * 2 + d, t)
+            else
+                int curS = array.get(tsx.cdT, f_tcCdIdx(tsx, tcg, p, L, k, 0))
+                bool curOk = f_tcCdValid(tsx, tcg, p, L, k, t)
+                if not curOk or st0 > curS or st0 == curS
+                    for q = 0 to 3
+                        if q < s
+                            array.set(tsx.cdT, f_tcCdIdx(tsx, tcg, p, L, k, q), array.get(tsx.cdT, f_tcCdIdx(tsx, tcg, p, L, s, q)))
+                        else if q == s
+                            array.set(tsx.cdT, f_tcCdIdx(tsx, tcg, p, L, k, q), t)
+                        else
+                            array.set(tsx.cdT, f_tcCdIdx(tsx, tcg, p, L, k, q), na)
+    fired
+
+f_tcCdDropTf(TcState tsx, TcCfg tcg, int p, int d, int j, int i, int b) =>
+    int s = f_tcStage(tsx, tcg, p, d, b, i)
+    if s >= 0 and s < 3
+        for k = s + 1 to 3
+            f_tcCdClr(tsx, tcg, p, d * 3 + j, k)
+
+//  イベントを積む: 成立 (mask あり) と、消去に使う確定帯 / 帯の解除 (SELL 側 1 / BUY 側 -1) だけ
+f_tcEmit(TcState tsx, TcCfg tcg, int p, int t, int g, int i, int sub, int ms, int mb, int tgt) =>
+    bool keep = g == 0 ? ((ms == 1 or ms == -1) and (p == 1 or f_tcClrOn(tsx, tcg, i))) : (ms > 0 or mb > 0)
+    if keep and not na(t)
+        array.push(tsx.eP, p)
+        array.push(tsx.eT, t)
+        array.push(tsx.eG, g)
+        array.push(tsx.eR, i)
+        array.push(tsx.eSub, sub)
+        array.push(tsx.eMS, ms)
+        array.push(tsx.eMB, mb)
+        array.push(tsx.eTgt, tgt)
+        array.push(tsx.eDone, g == 0 ? (ms == 1 ? 2 : 1) : (ms > 0 ? 0 : 1) + (mb > 0 ? 0 : 2))
+
+//  対象足の開始 (単体版 f_ctxStart と同じ。値は直前確定足からの固定値)
+f_tcCtxStart(TcState tsx, TcCfg tcg, int i, int t, float o, float stP, float sdP, float l1s, float l2s, float hh20, float ll20, float hh9, float ll9, bool ok, int ms, int mb) =>
+    int b = i * 15
+    bool okC = ok and not na(o)
+    array.set(tsx.cx, b, t)
+    array.set(tsx.cx, b + 1, okC ? 1 : 0)
+    if okC
+        array.set(tsx.cx, b + 2, stP)
+        array.set(tsx.cx, b + 3, sdP)
+        array.set(tsx.cx, b + 4, l1s)
+        array.set(tsx.cx, b + 5, l2s)
+        array.set(tsx.cx, b + 6, hh20)
+        array.set(tsx.cx, b + 7, ll20)
+        array.set(tsx.cx, b + 8, hh9)
+        array.set(tsx.cx, b + 9, ll9)
+        float sdS = sdP
+        if not na(hh20) and not na(ll20)
+            if o > hh20
+                sdS := 1
+            else if o < ll20
+                sdS := -1
+        array.set(tsx.cx, b + 10, sdS)
+        array.set(tsx.cx, b + 11, o)
+        array.set(tsx.cx, b + 12, o)
+        array.set(tsx.cx, b + 13, ms > 0 ? 1 : 0)
+        array.set(tsx.cx, b + 14, mb > 0 ? 1 : 0)
+
+//  対象足の途中で 15秒足が確定したとき (単体版 f_ctxClose と同じ。成立は STB = mask 4)
+f_tcCtxClose(TcState tsx, TcCfg tcg, int i, int tgt, float h, float l, float c) =>
+    int b = i * 15
+    int ms = 0
+    int mb = 0
+    if array.get(tsx.cx, b + 1) == 1 and array.get(tsx.cx, b) == tgt and not na(h) and not na(l) and not na(c)
+        float cumH = math.max(array.get(tsx.cx, b + 11), h)
+        float cumL = math.min(array.get(tsx.cx, b + 12), l)
+        array.set(tsx.cx, b + 11, cumH)
+        array.set(tsx.cx, b + 12, cumL)
+        float stP    = array.get(tsx.cx, b + 2)
+        float sdP    = array.get(tsx.cx, b + 3)
+        float l1s    = array.get(tsx.cx, b + 4)
+        float l2s    = array.get(tsx.cx, b + 5)
+        float hh20   = array.get(tsx.cx, b + 6)
+        float ll20   = array.get(tsx.cx, b + 7)
+        float hh9    = array.get(tsx.cx, b + 8)
+        float ll9    = array.get(tsx.cx, b + 9)
+        float sdLast = array.get(tsx.cx, b + 10)
+        float sd = sdP
+        if not na(hh20) and not na(ll20)
+            if cumH > hh20
+                sd := 1
+            else if cumL < ll20
+                sd := -1
+        float stb = sd == 1 ? (na(ll9) ? na : math.min(cumL, ll9)) : (na(hh9) ? na : math.max(cumH, hh9))
+        if not na(sdLast) and sd != sdLast and not na(stb) and not na(l1s) and not na(l2s) and not na(stP)
+            int band = c > l1s and c > l2s and c > stb ? 1 : c < l1s and c < l2s and c < stb ? -1 : 0
+            if band == 0 and stP == 1 and sdLast == 1 and sd == -1 and stb > c and array.get(tsx.cx, b + 13) == 0
+                ms := 4
+                array.set(tsx.cx, b + 13, 1)
+            if band == 0 and stP == -1 and sdLast == -1 and sd == 1 and stb < c and array.get(tsx.cx, b + 14) == 0
+                mb := 4
+                array.set(tsx.cx, b + 14, 1)
+        array.set(tsx.cx, b + 10, sd)
+    [ms, mb]
+
+//  「フラット→帯」: 時間足 i の帯を 1 つ観測 (単体版 f_bandObs と同じ)
+f_tcBandObs(TcState tsx, TcCfg tcg, int i, int t, float b) =>
+    if not na(b)
+        int last = array.get(tsx.bLast, i)
+        if b == -1
+            if not na(last) and last == 0 and na(array.get(tsx.bArmS, i))
+                array.set(tsx.bArmS, i, t)
+                array.set(tsx.bFireS, i, 0)
+        else
+            array.set(tsx.bArmS, i, na)
+            array.set(tsx.bFireS, i, 0)
+            if array.get(tsx.bHadS, i) == 1
+                f_tcEmit(tsx, tcg, 1, t, 0, i, 0, 1, 0, t)
+                array.set(tsx.bHadS, i, 0)
+        if b == 1
+            if not na(last) and last == 0 and na(array.get(tsx.bArmB, i))
+                array.set(tsx.bArmB, i, t)
+                array.set(tsx.bFireB, i, 0)
+        else
+            array.set(tsx.bArmB, i, na)
+            array.set(tsx.bFireB, i, 0)
+            if array.get(tsx.bHadB, i) == 1
+                f_tcEmit(tsx, tcg, 1, t, 0, i, 0, -1, 0, t)
+                array.set(tsx.bHadB, i, 0)
+        array.set(tsx.bLast, i, int(b))
+
+//  「フラット→帯」: 足の開始時点 t の端の線の転換 (単体版 f_bandStart と同じ。点灯区間で方向ごとに 1 回)
+f_tcBandStart(TcState tsx, TcCfg tcg, int i, int t, float stS, int ma, int mz) =>
+    int fs = 0
+    int fb = 0
+    if not na(stS) and stS == -1 and not na(array.get(tsx.bArmS, i)) and array.get(tsx.bFireS, i) == 0 and nz(ma) > 0
+        fs := ma
+        array.set(tsx.bFireS, i, 1)
+        array.set(tsx.bHadS, i, 1)
+    if not na(stS) and stS == 1 and not na(array.get(tsx.bArmB, i)) and array.get(tsx.bFireB, i) == 0 and nz(mz) > 0
+        fb := mz
+        array.set(tsx.bFireB, i, 1)
+        array.set(tsx.bHadB, i, 1)
+    if fs > 0
+        f_tcEmit(tsx, tcg, 1, t, 1, i, 1, fs, 0, array.get(tsx.bArmS, i))
+    if fb > 0
+        f_tcEmit(tsx, tcg, 1, t, 1, i, 1, 0, fb, array.get(tsx.bArmB, i))
+
+//  時間足 i の足の開始 (単体版 f_tfRun の開始判定と同じ: 確定帯 → 対象足の開始 → 開始イベント → 「フラット→帯」の帯と線)
+f_tcStart(TcState tsx, TcCfg tcg, int i, int t, int ms, int mb, float o, float stP, float sdP, float l1s, float l2s, float hh20, float ll20, float hh9,
+     float ll9, int tcP, float stS, int ma, int mz) =>
+    bool useA = f_tcUseP(tsx, tcg, 0, i)
+    bool useB = f_tcUseP(tsx, tcg, 1, i)
+    if useA and not na(stP) and not na(tcP)
+        f_tcEmit(tsx, tcg, 0, tcP, 0, i, 0, int(stP), 0, t)
+    f_tcCtxStart(tsx, tcg, i, t, o, stP, sdP, l1s, l2s, hh20, ll20, hh9, ll9, true, nz(ms), nz(mb))
+    if useA
+        f_tcEmit(tsx, tcg, 0, t, 1, i, 1, nz(ms), nz(mb), t)
+    if useB
+        if not na(tcP)
+            f_tcBandObs(tsx, tcg, i, tcP, stP)
+        f_tcBandObs(tsx, tcg, i, t, stS)
+        f_tcBandStart(tsx, tcg, i, t, stS, nz(ma), nz(mz))
+
+//  時間足 i の対象足 (開始 tgt) の途中で、15秒足 r が確定した (途中 STB。帯→フラットだけ)
+f_tcClose(TcState tsx, TcCfg tcg, int i, int tgt, int r) =>
+    [msC, mbC] = f_tcCtxClose(tsx, tcg, i, tgt, array.get(tsx.q15.H, r), array.get(tsx.q15.L, r), array.get(tsx.q15.C, r))
+    if f_tcUseP(tsx, tcg, 0, i)
+        f_tcEmit(tsx, tcg, 0, array.get(tsx.q15.TC, r), 1, i, 0, msC, mbC, tgt)
+
+//  この確定 5分足の中の 15秒・30秒・1分足と 5分足のイベントを、時間足ごとに時刻順に生成する
+f_tcGen(TcState tsx, TcCfg tcg) =>
+    int n15 = na(tsx.q15.t) ? 0 : array.size(tsx.q15.t)
+    for i = 0 to 3
+        if f_tcNeed(tsx, tcg, i)
+            if i == 3
+                f_tcStart(tsx, tcg, 3, tsx.q5.t, tsx.q5.ms, tsx.q5.mb, tsx.q5.o, tsx.q5.sp, tsx.q5.dp, tsx.q5.l1, tsx.q5.l2, tsx.q5.h20, tsx.q5.w20, tsx.q5.h9, tsx.q5.w9, tsx.q5.tc, tsx.q5.ss, tsx.q5.ma, tsx.q5.mz)
+                for r = 0 to n15 - 1
+                    if r >= 0 and r < n15
+                        f_tcClose(tsx, tcg, 3, tsx.q5.t, r)
+            else
+                array<int> aT = i == 0 ? tsx.q15.t : i == 1 ? tsx.q30.t : tsx.q60.t
+                int nb = na(aT) ? 0 : array.size(aT)
+                for j = 0 to nb - 1
+                    if j >= 0 and j < nb
+                        int s0 = array.get(aT, j)
+                        // 対象足の終了 = 開始 + 足の長さ (30秒 / 60秒)・次に取得できた同時間足の開始・親の 5分足の終了 の最も早い時刻
+                        int e0 = math.min(s0 + (i == 1 ? 30000 : 60000), time_close)
+                        if j + 1 < nb
+                            e0 := math.min(e0, array.get(aT, j + 1))
+                        if i == 0
+                            f_tcStart(tsx, tcg, 0, s0, array.get(tsx.q15.ms, j), array.get(tsx.q15.mb, j), array.get(tsx.q15.o, j), array.get(tsx.q15.sp, j), array.get(tsx.q15.dp, j),
+                                 array.get(tsx.q15.l1, j), array.get(tsx.q15.l2, j), array.get(tsx.q15.h20, j), array.get(tsx.q15.w20, j), array.get(tsx.q15.h9, j),
+                                 array.get(tsx.q15.w9, j), array.get(tsx.q15.tc, j), array.get(tsx.q15.ss, j), array.get(tsx.q15.ma, j), array.get(tsx.q15.mz, j))
+                            f_tcClose(tsx, tcg, 0, s0, j)
+                        else
+                            bool h30 = i == 1
+                            f_tcStart(tsx, tcg, i, s0, h30 ? array.get(tsx.q30.ms, j) : array.get(tsx.q60.ms, j), h30 ? array.get(tsx.q30.mb, j) : array.get(tsx.q60.mb, j),
+                                 h30 ? array.get(tsx.q30.o, j) : array.get(tsx.q60.o, j), h30 ? array.get(tsx.q30.sp, j) : array.get(tsx.q60.sp, j),
+                                 h30 ? array.get(tsx.q30.dp, j) : array.get(tsx.q60.dp, j), h30 ? array.get(tsx.q30.l1, j) : array.get(tsx.q60.l1, j),
+                                 h30 ? array.get(tsx.q30.l2, j) : array.get(tsx.q60.l2, j), h30 ? array.get(tsx.q30.h20, j) : array.get(tsx.q60.h20, j),
+                                 h30 ? array.get(tsx.q30.w20, j) : array.get(tsx.q60.w20, j), h30 ? array.get(tsx.q30.h9, j) : array.get(tsx.q60.h9, j),
+                                 h30 ? array.get(tsx.q30.w9, j) : array.get(tsx.q60.w9, j), h30 ? array.get(tsx.q30.tc, j) : array.get(tsx.q60.tc, j),
+                                 h30 ? array.get(tsx.q30.ss, j) : array.get(tsx.q60.ss, j), h30 ? array.get(tsx.q30.ma, j) : array.get(tsx.q60.ma, j),
+                                 h30 ? array.get(tsx.q30.mz, j) : array.get(tsx.q60.mz, j))
+                            for r = 0 to n15 - 1
+                                if r >= 0 and r < n15
+                                    int tr = array.get(tsx.q15.t, r)
+                                    // 途中 STB に使う 15秒足: 開始が対象足の開始以上・終了未満で、確定時刻が対象足の終了以下 (取得が抜けた
+                                    //  区間の 15秒足を前の対象足に含めない)
+                                    if tr >= s0 and tr < e0 and array.get(tsx.q15.TC, r) <= e0
+                                        f_tcClose(tsx, tcg, i, s0, r)
+
+//  パターン p・方向 d のイベントを上位足の区間ごとに成立時刻順に処理する (単体版 f_seqRun と同じ。区間は独立)。
+//  処理できるのはこの 5分足の終了より前の時刻 (それより後・ちょうどのイベントは次の 5分足で処理) で、上位足の帯が分かっているもの。
+//  合図のうち、この 5分足の開始以上・終了未満に成立したものだけを tsx.sigT に残す
+f_tcSeqRun(TcState tsx, TcCfg tcg, int p, int d) =>
+    int bit = d == 0 ? 1 : 2
+    array<int> blocked = array.new_int()
+    int guard = 0
+    while guard < 5000
+        guard += 1
+        int n = array.size(tsx.eT)
+        int pk = -1
+        int pkSeg = na
+        int pkB = na
+        for e = 0 to n - 1
+            if e >= 0 and e < n and array.get(tsx.eP, e) == p and int(array.get(tsx.eDone, e) / bit) % 2 == 0
+                int te = array.get(tsx.eT, e)
+                int sgE = 0
+                int bE = 0
+                bool known = te < time_close
+                if known and tcg.htfOn
+                    if na(tsx.hFront) or te >= tsx.hFront
+                        known := false
+                    else
+                        [sg1, b1, st1] = f_tcHtfInfo(tsx, tcg, te)
+                        known := st1 != 1
+                        sgE := st1 == 0 ? nz(sg1, -1) : -1
+                        bE := st1 == 0 ? b1 : na
+                if known and not array.includes(blocked, sgE)
+                    bool better = pk < 0
+                    if not better
+                        int tp = array.get(tsx.eT, pk)
+                        int gi = array.get(tsx.eG, e)
+                        int gp = array.get(tsx.eG, pk)
+                        int ri = array.get(tsx.eR, e)
+                        int rp = array.get(tsx.eR, pk)
+                        bool sub = gi == 1 and gp == 1 and array.get(tsx.eSub, e) < array.get(tsx.eSub, pk)
+                        better := te < tp or (te == tp and (gi < gp or (gi == gp and (ri < rp or (ri == rp and sub)))))
+                    if better
+                        pk := e
+                        pkSeg := sgE
+                        pkB := bE
+        if pk < 0
+            break
+        int t   = array.get(tsx.eT, pk)
+        int b   = pkB
+        int i   = array.get(tsx.eR, pk)
+        int g   = array.get(tsx.eG, pk)
+        int ms  = array.get(tsx.eMS, pk)
+        int mb  = array.get(tsx.eMB, pk)
+        bool mid = array.get(tsx.eSub, pk) == 0
+        int tgt = array.get(tsx.eTgt, pk)
+        int dn  = array.get(tsx.eDone, pk) + bit
+        if dn == 3
+            array.remove(tsx.eT, pk)
+            array.remove(tsx.eG, pk)
+            array.remove(tsx.eR, pk)
+            array.remove(tsx.eSub, pk)
+            array.remove(tsx.eMS, pk)
+            array.remove(tsx.eMB, pk)
+            array.remove(tsx.eTgt, pk)
+            array.remove(tsx.eDone, pk)
+            array.remove(tsx.eP, pk)
+        else
+            array.set(tsx.eDone, pk, dn)
+        if not (tcg.htfOn and na(b))
+            if tcg.htfOn
+                array.push(tsx.lgP, p)
+                array.push(tsx.lgD, d)
+                array.push(tsx.lgSeg, pkSeg)
+                array.push(tsx.lgT, t)
+                array.push(tsx.lgG, g)
+                array.push(tsx.lgR, i)
+                array.push(tsx.lgSub, mid ? 0 : 1)
+                array.push(tsx.lgMS, ms)
+                array.push(tsx.lgMB, mb)
+                array.push(tsx.lgTgt, tgt)
+                if array.size(tsx.lgP) > 3000
+                    array.shift(tsx.lgP)
+                    array.shift(tsx.lgD)
+                    array.shift(tsx.lgSeg)
+                    array.shift(tsx.lgT)
+                    array.shift(tsx.lgG)
+                    array.shift(tsx.lgR)
+                    array.shift(tsx.lgSub)
+                    array.shift(tsx.lgMS)
+                    array.shift(tsx.lgMB)
+                    array.shift(tsx.lgTgt)
+            int j = f_tcSlotFor(tsx, tcg, p, d, pkSeg)
+            if g == 0
+                if p == 0
+                    array.set(tsx.pcT, d * 4 + i, t)
+                    array.set(tsx.pcB, d * 4 + i, ms)
+                f_tcCdDropTf(tsx, tcg, p, d, j, i, b)
+            else
+                int m = d == 0 ? ms : mb
+                if p == 0 and mid and f_tcClrOn(tsx, tcg, i) and not na(array.get(tsx.pcT, d * 4 + i)) and array.get(tsx.pcT, d * 4 + i) == t
+                    m := 0
+                if f_tcSeqEvt(tsx, tcg, p, d, j, i, t, m, b) and t >= time and t < time_close
+                    int q = p * 2 + d
+                    array.set(tsx.sigT, q, na(array.get(tsx.sigT, q)) ? t : math.max(array.get(tsx.sigT, q), t))
+
+//  欠けていた上位足の帯が届いて区間 seg が前の区間とつながったとき: その区間の処理済みイベントを処理待ちに戻し、候補を消す
+//  (単体版 f_requeueSeg と同じ。組み直しで揃っても、評価済みの 5分足の合図は新規発注に使わない)
+f_tcRequeueSeg(TcState tsx, TcCfg tcg, int seg) =>
+    for p = 0 to 1
+        for d = 0 to 1
+            int minT = na
+            int j = 0
+            while j < array.size(tsx.lgP)
+                if array.get(tsx.lgP, j) == p and array.get(tsx.lgD, j) == d and array.get(tsx.lgSeg, j) == seg
+                    int tj = array.get(tsx.lgT, j)
+                    minT := na(minT) or tj < minT ? tj : minT
+                    array.push(tsx.eP, p)
+                    array.push(tsx.eT, tj)
+                    array.push(tsx.eG, array.get(tsx.lgG, j))
+                    array.push(tsx.eR, array.get(tsx.lgR, j))
+                    array.push(tsx.eSub, array.get(tsx.lgSub, j))
+                    array.push(tsx.eMS, array.get(tsx.lgMS, j))
+                    array.push(tsx.eMB, array.get(tsx.lgMB, j))
+                    array.push(tsx.eTgt, array.get(tsx.lgTgt, j))
+                    array.push(tsx.eDone, d == 0 ? 2 : 1)
+                    array.remove(tsx.lgP, j)
+                    array.remove(tsx.lgD, j)
+                    array.remove(tsx.lgSeg, j)
+                    array.remove(tsx.lgT, j)
+                    array.remove(tsx.lgG, j)
+                    array.remove(tsx.lgR, j)
+                    array.remove(tsx.lgSub, j)
+                    array.remove(tsx.lgMS, j)
+                    array.remove(tsx.lgMB, j)
+                    array.remove(tsx.lgTgt, j)
+                else
+                    j += 1
+            for jj = 0 to 2
+                int q = (p * 2 + d) * 3 + jj
+                if not na(array.get(tsx.slSeg, q)) and array.get(tsx.slSeg, q) == seg
+                    array.set(tsx.slSeg, q, na)
+                    for kk = 1 to 3
+                        f_tcCdClr(tsx, tcg, p, d * 3 + jj, kk)
+            int ls = array.get(tsx.sgLast, p * 2 + d)
+            if not na(minT) and not na(ls) and ls >= minT
+                array.set(tsx.sgLast, p * 2 + d, na)
+
+// @function 確定 5分足 1 本分の TC 処理 (Lab LAB-19 の「参照上位足の取り込み → イベント生成 → パターン・方向ごとの処理」と同じ)。
+//  戻り値 = この確定 5分足の中で成立した合図: パターン × 方向 (p * 2 + d、d 0 SELL / 1 BUY) の最新成立時刻 (なしは na)
+export tcStep(TcState s, TcCfg c, TcLtf q15, TcLtf q30, TcLtf q60, TcCur q5, int h1t, int h1b, int h1n, int h2t, int h2b, int h2n,
+     int hc, int hcn) =>
+    s.q15 := q15
+    s.q30 := q30
+    s.q60 := q60
+    s.q5  := q5
+    if c.htfOn
+        f_tcHtfPut(s, c, h2n, h2t, h2b, true)
+        f_tcHtfPut(s, c, h1n, h1t, h1b, true)
+        f_tcHtfPut(s, c, hcn, hc, na, false)
+        if not na(hcn) and (na(s.hNcur) or hcn > s.hNcur)
+            s.hNcur := hcn
+        if not na(hc) and (na(s.hFront) or hc > s.hFront)
+            s.hFront := hc
+        while array.size(s.merged) > 0
+            f_tcRequeueSeg(s, c, array.shift(s.merged))
+    for q = 0 to 3
+        array.set(s.sigT, q, na)
+    f_tcGen(s, c)
+    for p = 0 to 1
+        for d = 0 to 1
+            f_tcSeqRun(s, c, p, d)
+    s.sigT
+
+// ============================================================================
+// TD ストキャスMTF (Lab LAB-19 の写し。入力を引数にしただけ。1分足のコンテキストで request.security_lower_tf から呼ぶ)
+// ============================================================================
+//  以下の f_tdStoch / TdAgg / f_tdNewAgg / f_tdCurMain / f_tdPush / f_tdStep は StochMtfSignal.pine の f_mtStoch / HtfAgg / f_newAgg /
+//  f_curMain / f_push / f_step の写し (名前だけ変更)。
+// MT5 Stochastic Oscillator (Low/High・Simple)。チャート (1分足) の系列用。戻り値 [Main, Signal]。データ不足の間は na。
+f_tdStoch(int kPer, int dPer, int slow) =>
+    float ll = ta.lowest(low, kPer)
+    float hh = ta.highest(high, kPer)
+    float mainV = na
+    if bar_index >= kPer + slow - 2
+        float sLow  = 0.0
+        float sHigh = 0.0
+        for j = slow - 1 to 0                       // MT5: k = i−slow+1 .. i (同じ加算順)
+            sLow  += close[j] - ll[j]
+            sHigh += hh[j] - ll[j]
+        mainV := sHigh == 0.0 ? 100.0 : sLow / sHigh * 100
+    float sigV = na
+    if bar_index >= kPer + slow + dPer - 3
+        float s = 0.0
+        for j = 0 to dPer - 1                       // MT5: sum += Main[i−k], k = 0 .. dPer−1
+            s += mainV[j]
+        sigV := s / dPer
+    [mainV, sigV]
+
+// ---- 1分足から再現する上位足 ----
+// 確定済み上位足の履歴 (古い順、直近 cap 本) と現在の上位足 1本。
+type TdAgg
+    array<float> hi          // 確定済み上位足の High
+    array<float> lo          // 確定済み上位足の Low
+    array<float> cl          // 確定済み上位足の Close
+    array<float> ll          // 確定済み上位足の LL (完成時の値)
+    array<float> hh          // 確定済み上位足の HH (完成時の値)
+    array<float> mk          // 確定済み上位足の K  (完成時の値)
+    int   nDone              // 採用した確定済み上位足の本数 (= 現在の上位足の通し番号)
+    bool  started            // 1本目の区間を始めたか
+    int   curOpen            // 現在の上位足の開始時刻 (time(tf))
+    int   curClose           // 現在の上位足の終了予定時刻 (time_close(tf))
+    float cO
+    float cH
+    float cL
+    float cC
+    bool  curValid           // 現在の区間を採用するか (読込開始時に途中から始まった最初の区間は false)
+    bool  curFinal           // 現在の区間を登録済みか
+
+f_tdNewAgg() =>
+    TdAgg.new(array.new<float>(), array.new<float>(), array.new<float>(), array.new<float>(), array.new<float>(),
+         array.new<float>(), 0, false, na, na, na, na, na, na, false, false)
+
+// 現在の上位足 (High h / Low l / Close c) の [K, LL, HH]。系列 = 確定済み履歴 + 現在の 1本 (MT5 と同じ式・加算順)。
+f_tdCurMain(TdAgg a, int kPer, int slow, float h, float l, float c) =>
+    int n  = a.nDone
+    int sz = array.size(a.hi)
+    float llv = na
+    float hhv = na
+    float mainv = na
+    if n >= kPer - 1
+        llv := l
+        hhv := h
+        if kPer > 1
+            for j = 1 to kPer - 1
+                llv := math.min(llv, array.get(a.lo, sz - j))
+                hhv := math.max(hhv, array.get(a.hi, sz - j))
+    if n >= kPer + slow - 2
+        float sL = 0.0
+        float sH = 0.0
+        if slow > 1
+            for j = slow - 1 to 1                    // 古い足から (MT5: k = i−slow+1 .. i)
+                sL += array.get(a.cl, sz - j) - array.get(a.ll, sz - j)
+                sH += array.get(a.hh, sz - j) - array.get(a.ll, sz - j)
+        sL += c - llv
+        sH += hhv - llv
+        mainv := sH == 0.0 ? 100.0 : sL / sH * 100
+    [mainv, llv, hhv]
+
+// 現在の上位足を確定済み履歴へ一度だけ登録する
+f_tdPush(TdAgg a, int cap, float m, float llv, float hhv) =>
+    array.push(a.hi, a.cH)
+    array.push(a.lo, a.cL)
+    array.push(a.cl, a.cC)
+    array.push(a.ll, llv)
+    array.push(a.hh, hhv)
+    array.push(a.mk, m)
+    if array.size(a.hi) > cap
+        array.shift(a.hi)
+        array.shift(a.lo)
+        array.shift(a.cl)
+        array.shift(a.ll)
+        array.shift(a.hh)
+        array.shift(a.mk)
+    a.nDone := a.nDone + 1
+    a.curFinal := true
+    true
+
+// 確定した 1分足 1本で上位足を進める。戻り値 [K0, K1, K2, 今回完成したか, 現在の区間を採用しているか]
+f_tdStep(TdAgg a, int tfOpen, int tfClose, int kPer, int slow, int cap) =>
+    float k0 = na
+    float k1 = na
+    float k2 = na
+    bool closedNow = false
+    if not na(tfOpen)
+        if not a.started or tfOpen != a.curOpen
+            // 前の区間が最後の 1分足なしで終わっていた場合: その時点までの値で一度だけ登録
+            if a.started and a.curValid and not a.curFinal
+                [pm, pl, ph] = f_tdCurMain(a, kPer, slow, a.cH, a.cL, a.cC)
+                f_tdPush(a, cap, pm, pl, ph)
+            a.curValid := a.started or time == tfOpen      // 読込開始時の不完全な区間は採用しない
+            a.started  := true
+            a.curOpen  := tfOpen
+            a.curClose := tfClose
+            a.cO := open
+            a.cH := high
+            a.cL := low
+            a.cC := close
+            a.curFinal := false
+        else
+            a.curClose := tfClose
+            a.cH := math.max(a.cH, high)
+            a.cL := math.min(a.cL, low)
+            a.cC := close
+        int sz = array.size(a.mk)
+        k1 := sz >= 1 ? array.get(a.mk, sz - 1) : na
+        k2 := sz >= 2 ? array.get(a.mk, sz - 2) : na
+        closedNow := not na(tfClose) and time_close >= tfClose
+        if a.curValid
+            [cm, cl0, ch0] = f_tdCurMain(a, kPer, slow, a.cH, a.cL, a.cC)
+            k0 := cm
+            if closedNow and not a.curFinal
+                f_tdPush(a, cap, cm, cl0, ch0)               // 区間最後の 1分足: 完成した上位足を登録 (この判定の K0 も同じ足)
+        else if closedNow
+            a.curFinal := true                              // 不採用の区間は登録しない
+    [k0, k1, k2, closedNow, a.curValid]
+
+// 1分足 1本の判定 (StochMtfSignal の 1分・5分・15分・1H / 4H 見送りの条件式と同じ)。戻り値 [方向 (1 / −1 / 0), 1分足の time_close]。
+//  上位足は各 1分足の実行ごとに進める (リクエスト内の barstate.isconfirmed には依存しない。確定チェックは Lab 側の確定 5分足で行う)
+export tdSig(int kPer, int dPer, int slow, float upLv, float loLv, int reachN, float minMv, bool m5Mid, bool m5Decel,
+     bool u15, bool m15Mid, bool m15Decel, bool hfUse, float hfUp, float hfLo, bool rev15, bool rev60) =>
+    [k1m, d1m] = f_tdStoch(kPer, dPer, slow)
+    int hcap = math.max(kPer, slow) + 3
+    var TdAgg agg5   = f_tdNewAgg()
+    var TdAgg agg15  = f_tdNewAgg()
+    var TdAgg agg60  = f_tdNewAgg()
+    var TdAgg agg240 = f_tdNewAgg()
+    [k5_0, k5_1, k5_2, c5Now, v5]          = f_tdStep(agg5,   time("5"),   time_close("5"),   kPer, slow, hcap)
+    [k15_0, k15_1, k15_2, c15Now, v15]     = f_tdStep(agg15,  time("15"),  time_close("15"),  kPer, slow, hcap)
+    [k60_0, k60_1, k60_2, c60Now, v60]     = f_tdStep(agg60,  time("60"),  time_close("60"),  kPer, slow, hcap)
+    [k240_0, k240_1, k240_2, c240Now, v240] = f_tdStep(agg240, time("240"), time_close("240"), kPer, slow, hcap)
+    // ---- 1分足 ----
+    bool d1Ok = not na(k1m) and not na(k1m[1]) and not na(d1m) and not na(d1m[1])
+    float k1Max = na
+    float k1Min = na
+    bool winOk = true
+    for j = 0 to reachN - 1
+        float v = k1m[j]
+        if na(v)
+            winOk := false
+            break
+        k1Max := na(k1Max) ? v : math.max(k1Max, v)
+        k1Min := na(k1Min) ? v : math.min(k1Min, v)
+    bool data1 = d1Ok and winOk
+    float k1Chg = k1m - k1m[1]
+    bool sCross1 = data1 and k1m[1] >= d1m[1] and k1m < d1m
+    bool lCross1 = data1 and k1m[1] <= d1m[1] and k1m > d1m
+    bool sMove1  = data1 and -k1Chg >= minMv
+    bool lMove1  = data1 and k1Chg >= minMv
+    bool sReach1 = data1 and k1Max >= upLv
+    bool lReach1 = data1 and k1Min <= loLv
+    // ---- 5分足 ----
+    bool data5 = not na(k5_0) and not na(k5_1) and (not m5Decel or not na(k5_2))
+    float dl5_0 = k5_0 - k5_1
+    float dl5_1 = k5_1 - k5_2
+    bool s5Mid = not m5Mid or k5_0 > 50.0
+    bool l5Mid = not m5Mid or k5_0 < 50.0
+    bool s5Dir = m5Decel ? (dl5_0 < 0 or (0 < dl5_0 and dl5_0 < dl5_1)) : dl5_0 < 0
+    bool l5Dir = m5Decel ? (dl5_0 > 0 or (dl5_1 < dl5_0 and dl5_0 < 0)) : dl5_0 > 0
+    bool s5 = data5 and s5Mid and s5Dir
+    bool l5 = data5 and l5Mid and l5Dir
+    // ---- 15分足 ----
+    bool data15 = not na(k15_0) and not na(k15_1) and (not m15Decel or not na(k15_2))
+    float dl0 = k15_0 - k15_1
+    float dl1 = k15_1 - k15_2
+    bool s15Mid = not m15Mid or k15_0 > 50.0
+    bool l15Mid = not m15Mid or k15_0 < 50.0
+    bool s15Dir = m15Decel ? (dl0 < 0 or (0 < dl0 and dl0 < dl1)) : dl0 < 0
+    bool l15Dir = m15Decel ? (dl0 > 0 or (dl1 < dl0 and dl0 < 0)) : dl0 > 0
+    bool s15 = data15 and s15Mid and s15Dir
+    bool l15 = data15 and l15Mid and l15Dir
+    bool s15Ok = not u15 or s15
+    bool l15Ok = not u15 or l15
+    // ---- 1時間・4時間の見送りフィルタ ----
+    bool dataLvl = not na(k60_0) and not na(k240_0)
+    bool dataR15 = not na(k15_0) and not na(k15_1)
+    bool dataR60 = not na(k60_0) and not na(k60_1)
+    bool dataHf  = dataLvl and (not rev15 or dataR15) and (not rev60 or dataR60)
+    bool dn15 = dataR15 and k15_0 < k15_1
+    bool up15 = dataR15 and k15_0 > k15_1
+    bool dn60 = dataR60 and k60_0 < k60_1
+    bool up60 = dataR60 and k60_0 > k60_1
+    bool revAny = rev15 or rev60
+    bool lLvlHf = dataLvl and k60_0 >= hfUp and k240_0 >= hfUp
+    bool sLvlHf = dataLvl and k60_0 <= hfLo and k240_0 <= hfLo
+    bool lRevHf = not revAny or (rev15 and dn15) or (rev60 and dn60)
+    bool sRevHf = not revAny or (rev15 and up15) or (rev60 and up60)
+    bool lSkipHf = dataHf and lLvlHf and lRevHf
+    bool sSkipHf = dataHf and sLvlHf and sRevHf
+    bool lHfOk = not hfUse or (dataHf and not lSkipHf)
+    bool sHfOk = not hfUse or (dataHf and not sSkipHf)
+    // ---- 成立 ----
+    bool dataAll  = data1 and data5 and (not u15 or data15) and (not hfUse or dataHf)
+    bool shortSig = dataAll and sCross1 and sMove1 and sReach1 and s5 and s15Ok and sHfOk
+    bool longSig  = dataAll and lCross1 and lMove1 and lReach1 and l5 and l15Ok and lHfOk
+    int dir = longSig ? 1 : shortSig ? -1 : 0
+    // 見送りフィルタだけで止まった候補 (他の条件はすべて成立): 1 / −1 = ロング / ショート見送り、2 / −2 = 上位足データ不足
+    bool lPre = data1 and data5 and (not u15 or data15) and lCross1 and lMove1 and lReach1 and l5 and l15Ok
+    bool sPre = data1 and data5 and (not u15 or data15) and sCross1 and sMove1 and sReach1 and s5 and s15Ok
+    int skip = not hfUse ? 0 : lPre and not dataHf ? 2 : lPre and lSkipHf ? 1 : sPre and not dataHf ? -2 : sPre and sSkipHf ? -1 : 0
+    [dir, time_close, skip]
