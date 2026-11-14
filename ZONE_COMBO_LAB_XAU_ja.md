@@ -35,7 +35,7 @@ AccumStrategyXAU / MtfPocDetector）と ACC の試験環境は変更していな
 | ZD 出来高 | **LAB-2**: 計算は外部インジ `MtfPocFeedXAU.pine`（MtfPocDetector 75 分割版の `f_pocCore` を基に、各足の区画の走査範囲だけ軽量化。差分は LS-02 で照合）。取得は 1 本前 + lookahead_on（既存と同じ） | Strategy は 13 系列を受け取って蓄積するだけ（内蔵計算・フォールバックなし）。帯 = 中心（区画下限と上限の中点）± 共通幅。元の区画上下限・対象足時刻・利用可能になった 5分足の時刻を保持。前回の有効値から中心が変わり、同じ時間足に同じ中心の Zone がなければ追加（上書きしない） |
 | ZF FVG | ZoneStrategyXAU FVG Batch A の `f_fvgConfirmed`（byte 一致: LS-03・最小幅 3） | 1H / 4H / D / W。Zone = FVG 本来の上下限（共通幅なし）。**完全埋め削除・寿命・TF ごと 5 件の上限を撤去**し、その時間足の確定終値で反対端を抜けたら iFVG、iFVG を逆方向に抜けたら無効（削除） |
 | TA FVG 吸収 | ACC-5A の形成・監視（方向ごとに最新 1 件・10 本）・吸収（陰線 / 陽線の終値）の式（LS-07） | P5 / P6 への紐付け → 共通の Zone 待機。吸収後の有効期限 5 → **12 本** |
-| TC SATS 反発 | `f_satBand`（byte 一致: LS-04）・`f_satHist`（`close[1]` を前の確定終値 `labC1` に置き換えただけ: LS-05）・近接 1.0 / 陽線陰線 / Nc 1 | Entry A〜D の準備から切り離し、反発の成立足 = 0 本目・12 本有効のタイミング部品。4H・1H 逆方向フィルターは初期 OFF |
+| TC サッツバンド転換（LAB-18。旧 TC SATS 反発を置き換え） | `f_satBand`（byte 一致）と SatsShortSignal (bea7105) の開始判定の関数（byte 一致: tests/tcs_sim.py）。15秒・30秒・1分は `request.security_lower_tf`、5分はチャート足の始値と直前までの確定値。2 パターン・時間足・待ち時間 5 分・帯への復帰時の解除・上位足の帯色による切替 (48 項目) は単体版と同じ設定と初期値 | 確定 5分足ごとに、その足の開始以上・終了未満に成立した合図だけを方向ごとに 1 件の LbTev (kind 2) にする（この足だけ有効、評価済みの足の合図は持ち越さない）。理由にパターン名と各パターンの最新成立時刻。旧 TC の近接・陽線陰線・反発期限・4H/1H 逆方向フィルターは削除 |
 | 数量・時間帯 | ACC `f_qty`（= ZoneStrategyXAU `f_stQty`）・`f_inSession`（byte 一致: LS-06） | なし（300,000 円 × 3 %・0.01 lot 切り捨て・JST 09:00〜翌 02:00） |
 | 注文の処理 | ACC の約定確認・不正な出口の成行決済・管理外建玉 / 2 回実行の停止（ACC-2 の保護）・BEL-1 / BEL-2 のロック | Strong/Weak・Score 優先を廃止。分割利確（段ごとの exit）・動的 TP・変更通知・取引台帳を追加 |
 
