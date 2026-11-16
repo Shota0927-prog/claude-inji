@@ -487,20 +487,20 @@ cTD = input.bool(false, "TD ストキャスMTF", group = G_EN, inline = "ct")
 cTim = input.string("OR", "タイミングの結合", options = ["OR", "AND"], group = G_EN,
      tooltip = "その確定 5分足で新しく成立したタイミングだけを使う。AND: ON のすべてが同じ足・同方向で成立。OR: ON のうちどれか 1 つが成立。")
 zNear = input.float(5.0, "Zone周辺の許容幅 ($)", minval = 0.0, step = 0.5, group = G_EN,
-     tooltip = "エントリー候補の場所: 対象 Zone (AND は重なり) の 下端 − この値 〜 上端 + この値 (境界を含む) に確定 5分足の終値がある。" +
-     "広げるのはエントリー判定の範囲だけ (SL / TP は Zone 本来の帯)。")
+     tooltip = "LAB-25 から未使用: エントリー候補は Zone 接触後の待機 (待機期限) で決め、合図の足の終値に対する Zone 周辺の制限はない。")
 zMidBuf = input.float(0.0, "Zone中心からのバッファ ($)", minval = 0.0, step = 0.5, group = G_EN,
      tooltip = "LAB-16: 候補ごとの方向条件。Zone の中心 (OR = 個別 Zone / AND = 重なった共通帯) に対し、LONG は確定 5分足の終値 > 中心 + この値、" +
      "SHORT は終値 < 中心 − この値のときだけ候補にする (境界ちょうどは見送り)。")
 catReb  = input.bool(true, "反発", group = G_EN, inline = "cat",
-     tooltip = "LAB-10 以降、反発 / ダマシ / サポレジの分類と待機期限はエントリー候補の条件に使わない (接触・待機の集計だけ)。")
+     tooltip = "反発 / ダマシ / サポレジの分類はエントリー候補の条件に使わない (接触・待機の集計だけ)。待機期限は LAB-25 から候補に使う。")
 catFake = input.bool(true, "ダマシ", group = G_EN, inline = "cat")
 catRole = input.bool(true, "サポレジ転換", group = G_EN, inline = "cat")
 fakeWin = input.int(0, "ダマシ判定の期限 (突破後の本数、0 = 無期限)", minval = 0, group = G_EN,
      tooltip = "初期 0 = 無期限: 直前の突破と逆方向へ終値で抜けて戻ったらダマシ。1 以上: 突破後この本数以内だけダマシ、超えた後の逆方向の突破は新しい突破。\n" +
      "接触後の待機期限 (12 本) とは別。")
 waitBars = input.int(12, "待機期限 (最後の接触から本数)", minval = 0, group = G_EN,
-     tooltip = "最後に接触した足 = 0 本目。この本数目まで待機。再接触で更新。")
+     tooltip = "最後に接触した足 = 0 本目。この本数目まで待機。再接触で更新。LAB-25: B6 のエントリー候補もこの待機 (Zone 接触後、" +
+     "この本数目までにタイミングが成立) で決める。")
 
 var string G_DF = "04a · Zone 候補の方向フィルタ (B6 の新規エントリー候補。ZB / ZC / ZD / ZE だけ)"
 dfBandB = input.bool(false, "ZB MA: 上位足の帯色で方向を制限", group = G_DF, inline = "dfb")
@@ -2586,10 +2586,6 @@ f_lbTim(int kind, int side) =>
                 r := i
     r
 
-// LAB-10: 候補の場所 = 有効でエントリー条件に選んだ Zone の 下端 − 許容幅 〜 上端 + 許容幅 に終値がある (境界を含む)
-f_lbNear(LbZone z) =>
-    not z.dead and (z.aBar < bar_index or z.typ == 3) and f_condTyp(z.typ) and close >= z.bot - zNear - EPS and close <= z.top + zNear + EPS
-
 // LAB-22: Zone 1 個が side の新規エントリー候補を許可するか (ZB / ZC / ZD / ZE だけ判定。他の種類は常に許可)。複数 ON は AND
 //  帯: 赤 (−1) → ショートのみ / 青 (1) → ロングのみ / フラット (0) → 両方向 / na → 見送り
 f_dfBand(string tf) =>
@@ -2628,39 +2624,86 @@ f_dfUnitOk(LbWait w, int side) =>
                     break
     ok
 
-// LAB-10: この足の候補 Zone (OR = 対象 Zone 1 個ずつ / AND = 選んだ種類ごとに 1 個ずつの組で、共通帯 ± 許容幅に終値があるもの)。
-//  LbWait を一時オブジェクトとして使う (cBot / cTop = 帯または共通帯、eBot / eTop = SL 基準の帯全体)。lbWaits には入れない
-f_lbUnits(int nSel) =>
-    array<LbWait> us = array.new<LbWait>()
+// LAB-25: B6 の候補用の待機。Zone に接触して開始し (確定 5分足の高値〜安値が Zone の上下端に重なる。接触足 = 0 本目)、
+//  waitBars 本目まで有効 (同じ Zone / 組への再接触で起点を更新)。OR = Zone 1 個、AND = 選んだ種類ごとに 1 個ずつの組で、その共通帯への接触。
+//  方向は持たない (合図の方向と Zone 中心で B6 が決める)。Zone の無効化・消滅・別 ID への置き換え (lbDeadNow / dead) で解除。
+//  (B2 / B3 の待機 lbWaits とは別。そちらは接触・待機の集計に使う)
+type LbCw
+    string        key        // Zone ID を昇順に "|" で連結
+    array<int>    ids
+    array<LbZone> zs         // 待機に紐づく Zone (候補選択・SL / TP・方向フィルタに使う)
+    int           tmask      // 種類のマスク (2^typ の和)
+    float         cBot       // 最後の接触時の帯 (OR) / 共通帯 (AND)
+    float         cTop
+    int           lBar       // 最後の接触足 (0 本目)
+    string        desc
+
+var array<LbCw> lbCws = array.new<LbCw>()
+
+f_cwZoneOk(LbZone z) =>
+    not z.dead and f_condTyp(z.typ) and (z.typ != 1 or f_zbUse(z.tf))
+
+f_cwTouch(string key, array<int> ids, array<LbZone> zs, int tm, float cb, float ct, string desc) =>
+    int at = -1
+    int n = array.size(lbCws)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(lbCws, i).key == key
+                at := i
+                break
+    if at >= 0
+        LbCw w = array.get(lbCws, at)
+        w.lBar := bar_index
+        w.cBot := cb
+        w.cTop := ct
+        w.zs   := zs
+    else
+        array.push(lbCws, LbCw.new(key, ids, zs, tm, cb, ct, bar_index, desc))
+    true
+
+// この確定 5分足で: 解除 (無効化・消滅・置き換え) → 期限 (最後の接触から waitBars 本を超えたら) → 接触 (作成 / 起点の更新)
+f_cwUpdate(int nSel) =>
+    int n0 = array.size(lbCws)
+    if n0 > 0
+        for i = n0 - 1 to 0
+            LbCw w = array.get(lbCws, i)
+            bool drop = bar_index - w.lBar > waitBars
+            int nzw = array.size(w.zs)
+            if not drop and nzw > 0
+                for k = 0 to nzw - 1
+                    LbZone z = array.get(w.zs, k)
+                    if not f_cwZoneOk(z) or array.includes(lbDeadNow, z.id)
+                        drop := true
+                        break
+            if drop
+                array.remove(lbCws, i)
+    // 接触した Zone (高値〜安値が Zone の上下端に重なる。POC は受信した足から、他の種類は登録の次の足から)
     array<LbZone> nz0 = array.new<LbZone>()
     for g = 0 to 1
         array<LbZone> arr = g == 0 ? lbZs : lbFvgs
         int n = array.size(arr)
-        int i = f_lbLower(arr, close - zNear - (g == 0 ? st.maxW : st.maxWF) - EPS)
+        int i = f_lbLower(arr, low - (g == 0 ? st.maxW : st.maxWF) - EPS)
         while i < n
             LbZone z = array.get(arr, i)
-            if z.bot > close + zNear + EPS
+            if z.bot > high + EPS
                 break
             st.iter += 1
-            if f_lbNear(z)
+            if z.top >= low - EPS and (z.aBar < bar_index or z.typ == 3) and f_cwZoneOk(z)
                 array.push(nz0, z)
             i += 1
     for k = 0 to 1
         LbZone mz = k == 0 ? lbMa1 : lbMa2
         float  mv = k == 0 ? zbMa1 : zbMa2
         if not na(mz) and not na(mv) and f_zbUse(k)
-            if mz.aBar < bar_index and f_condTyp(1) and close >= mz.bot - zNear - EPS and close <= mz.top + zNear + EPS
+            if mz.aBar < bar_index and f_cwZoneOk(mz) and mz.top >= low - EPS and mz.bot <= high + EPS
                 array.push(nz0, mz)
     int nn = array.size(nz0)
     if nn > 0 and (cComb == "OR" or nSel <= 1)
         for j = 0 to nn - 1
             LbZone z = array.get(nz0, j)
-            LbWait uw = LbWait.new(-1, str.tostring(z.id), 0, 0, false, false, false, f_pow2(z.typ), array.from(z.id),
-                 z.bot, z.top, z.bot, z.top, bar_index, bar_index, f_zName(z))
-            uw.zs := array.from(z)
-            array.push(us, uw)
+            f_cwTouch(str.tostring(z.id), array.from(z.id), array.from(z), f_pow2(z.typ), z.bot, z.top, f_zName(z))
     else if nn > 0
-        // AND: 選んだ種類ごとに 1 個ずつの全組合せのうち、共通の重なりがあり、その重なり ± 許容幅に終値があるもの (深さ優先・途中で打ち切り)
+        // AND: 選んだ種類ごとに 1 個ずつの全組合せのうち、共通の重なりがあり、その共通帯にこの足の高値〜安値が重なるもの (深さ優先・途中で打ち切り)
         array<int> tl = array.new_int()
         for t = 0 to 6
             if f_condTyp(t)
@@ -2697,7 +2740,7 @@ f_lbUnits(int nSel) =>
                     LbZone zz = array.get(nz0, array.get(lst, array.get(off, lv) + nxt))
                     float ob  = lv > 0 ? math.max(array.get(pOb, lv - 1), zz.bot) : zz.bot
                     float ot2 = lv > 0 ? math.min(array.get(pOt, lv - 1), zz.top) : zz.top
-                    if ob <= ot2 + EPS and close >= ob - zNear - EPS and close <= ot2 + zNear + EPS
+                    if ob <= ot2 + EPS and low <= ot2 + EPS and high >= ob - EPS
                         array.set(pOb, lv, ob)
                         array.set(pOt, lv, ot2)
                         if lv < nt - 1
@@ -2726,10 +2769,39 @@ f_lbUnits(int nSel) =>
                             string key = ""
                             for p = 0 to array.size(ids) - 1
                                 key := key + (p > 0 ? "|" : "") + str.tostring(array.get(ids, p))
-                            LbWait uw = LbWait.new(-1, key, 0, 0, false, false, false, tm, ids, ob, ot2, eb, et, bar_index, bar_index, desc)
-                            uw.zs := mzs
-                            array.push(us, uw)
+                            f_cwTouch(key, ids, mzs, tm, ob, ot2, desc)
             st.maxCombo := math.max(st.maxCombo, nodes)
+    true
+
+// B6 の候補 (有効な待機ごとに 1 個)。LbWait を一時オブジェクトとして使う: cBot / cTop = 現在の帯 (OR) / 共通帯 (AND。重なりが
+//  無くなっていれば最後の接触時の共通帯)、eBot / eTop = SL 基準の帯全体 (組の Zone 全体)。lbWaits には入れない
+f_cwUnits() =>
+    array<LbWait> us = array.new<LbWait>()
+    int n = array.size(lbCws)
+    if n > 0
+        for i = 0 to n - 1
+            LbCw w = array.get(lbCws, i)
+            float cb = na
+            float ct = na
+            float eb = na
+            float et = na
+            int nzw = array.size(w.zs)
+            for k = 0 to nzw - 1
+                LbZone z = array.get(w.zs, k)
+                cb := na(cb) ? z.bot : math.max(cb, z.bot)
+                ct := na(ct) ? z.top : math.min(ct, z.top)
+                eb := na(eb) ? z.bot : math.min(eb, z.bot)
+                et := na(et) ? z.top : math.max(et, z.top)
+            if na(cb) or na(ct) or cb > ct + EPS
+                cb := w.cBot
+                ct := w.cTop
+            if na(eb) or na(et)
+                eb := w.cBot
+                et := w.cTop
+            LbWait u = LbWait.new(-1, w.key, 0, 0, false, false, false, w.tmask, w.ids, cb, ct, eb, et, w.lBar, w.lBar,
+                 w.desc + " (接触から " + str.tostring(bar_index - w.lBar) + " 本目)")
+            u.zs := w.zs
+            array.push(us, u)
     us
 
 // ---- Zone タッチ通知 (LAB-5)。売買の接触・待機・消費の状態とは別に持ち、売買の判定は読まない・変えない ----
@@ -3273,6 +3345,8 @@ if lbRun and barstate.isconfirmed
         array.clear(lbWaits)
         map.clear(lbWaitMap)
     st.maxWaits := math.max(st.maxWaits, array.size(lbWaits))
+    // LAB-25: B6 の候補用の待機 (接触で開始・waitBars 本目まで・無効化 / 消滅 / 置き換えで解除)
+    f_cwUpdate(nSel)
 
     // ---- (B4) タイミング: TA (ACC-5A と同じ: 期限 → 吸収 → 新しい FVG) / TC (サッツバンド転換) / TE (短期 DTB) / TD (1分ストキャス) / 古いものを外す ----
     //  (v5 由来: and の両辺を評価する前提で、na のオブジェクトのフィールドを読む条件は if を分けている。v6 の短絡評価でも結果は同じ)
@@ -3585,7 +3659,8 @@ if lbRun and barstate.isconfirmed
     LbCand bestS = na
     array<float> tpL = na          // この足の TP 候補 (判断時の基準 = 終値)。方向ごとに必要になった時だけ 1 回計算し、候補間で再利用
     array<float> tpS = na
-    // LAB-10: 方向 = この足で新しく成立したタイミング、場所 = 対象 Zone (AND は共通帯) ± 許容幅に終値。待機・接触・分類は使わない
+    // LAB-25: 方向 = この足で新しく成立したタイミング、場所 = 有効な待機 (Zone 接触から waitBars 本目まで。接触と同じ足は 0 本目)。
+    //  分類 (反発 / ダマシ / サポレジ) は使わない。方向は Zone 中心 ± バッファと終値で決める
     array<LbWait> units = na
     for d = 0 to 1
         int side = d == 0 ? 1 : -1
@@ -3596,8 +3671,7 @@ if lbRun and barstate.isconfirmed
         bool timOK = cTim == "AND" ? ((cTA or cTC or cTE or cTD) and (not cTA or ia >= 0) and (not cTC or ic >= 0) and (not cTE or ie >= 0) and
              (not cTD or it >= 0)) : ((cTA and ia >= 0) or (cTC and ic >= 0) or (cTE and ie >= 0) or (cTD and it >= 0))
         if timOK and na(units)
-            int nSelU = (cZA ? 1 : 0) + (cZB ? 1 : 0) + (cZC ? 1 : 0) + (cZD ? 1 : 0) + (cZF ? 1 : 0) + (cZE ? 1 : 0) + (cZG and (zgUse1 or zgUse4 or zgUseD) ? 1 : 0)
-            units := f_lbUnits(nSelU)
+            units := f_cwUnits()      // LAB-25: 有効な待機 (接触から waitBars 本目まで) ごとの候補。終値の Zone 周辺制限はない
         int nu = timOK ? array.size(units) : 0
         if nu > 0
             for i = 0 to nu - 1
@@ -3750,7 +3824,7 @@ if lbRun and barstate.isconfirmed
                 LbTev et = array.get(lbTevs, pick.it)
                 et.used := true
                 tdesc := tdesc + " " + et.desc + " (この足)"
-            o.desc := (pick.side == 1 ? "LONG " : "SHORT ") + w.desc + "\nZone周辺 ±" + str.tostring(zNear, "#.##") + " / 終値 " +
+            o.desc := (pick.side == 1 ? "LONG " : "SHORT ") + w.desc + "\n終値 " +
                  str.tostring(close, "#.##") + " /" + tdesc +
                  "\n判断 " + str.tostring(close, "#.##") + "  SL " + str.tostring(pick.sl, "#.##") + "  RR(TP1) " + str.tostring(pick.rr, "#.##") +
                  "\n" + f_lbTpText() + (pick.omask != 0 ? "\n他種類の重なりあり" : "")
