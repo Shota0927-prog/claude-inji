@@ -258,18 +258,75 @@ def acceptance():
     r2 = Runner({"hlBreak": 5.003}).run(scenario([(4302, 4303, 4294.99, 4296)]))
     check("A 刻みに乗らない突破幅は次のティックから", r["hcB"][14] == 0 and r2["hcB"][14] == 1, f"{r['hcB'][14]} {r2['hcB'][14]}")
 
+    # ---- HLR-2 regression: invalid confirmed bars ----------------------------------------------------------------
+    pending3 = [(4302, 4303, 4299, 4301)]        # contact from above, $5 / $10 / $20 all pending
+    r0 = Runner().run(scenario(pending3))
+    check("R 前提: 上から接触し 3 目標とも未決着", r0["hcN"][12] == 1 and len(r0["hlPend"]) == 1 and list(r0["hlPend"][0].st) == [0, 0, 0])
+    bars = scenario(pending3) + [dict(t=T0 + 2 * M5, o=4310, h=4304, l=4299, c=4302)]
+    r = Runner().run(bars)
+    st = [r["hcA"][12 + j] for j in range(3)], [r["hcR"][12 + j] for j in range(3)]
+    und = [r["hcN"][12 + j] - r["hcR"][12 + j] - r["hcB"][12 + j] - r["hcA"][12 + j] - r["hcF"][12 + j] for j in range(3)]
+    check("R 不正足 (始値 4310 > 高値 4304) で $5・$10・$20 すべて順序不明・反発 0・未決着 0・不正足 1",
+          st == ([1, 1, 1], [0, 0, 0]) and und == [0, 0, 0] and r["hs"].nBad == 1 and len(r["hlPend"]) == 0
+          and [x[5] for x in r.recs()] == [A, A, A] and sum(r["hcN"]) == 3,
+          f"A/R={st} pending={und} bad={r['hs'].nBad} recs={r.recs()}")
+    bars = scenario(pending3) + [dict(t=T0 + 2 * M5, o=4300.5, h=4304, l=4301, c=4303), bar(3, 4302, 4303, 4299.5, 4302.5)]
+    r = Runner().run(bars)
+    check("R 不正足 (始値 4300.5 < 安値 4301) は離脱扱いせず、直後の有効な接触足も数えない (各目標 N = 1)",
+          [r["hcN"][12 + j] for j in range(3)] == [1, 1, 1] and sum(r["hcN"]) == 3 and r["hs"].nBad == 1 and sum(r["hlUnk"]) == 0,
+          f"N={[r['hcN'][12 + j] for j in range(3)]} total={sum(r['hcN'])} bad={r['hs'].nBad}")
+    # after an invalid bar a valid fully-away bar re-arms as usual
+    bars = scenario(pending3) + [dict(t=T0 + 2 * M5, o=4300.5, h=4304, l=4301, c=4303), bar(3, 4303, 4304, 4301, 4302),
+                                 bar(4, 4302, 4303, 4299.5, 4302.5)]
+    r = Runner().run(bars)
+    check("R 不正足の後でも有効な離脱足があれば再接触を受け付ける", r["hcN"][12] == 2, f"N={r['hcN'][12]}")
+    # na OHLC is an invalid bar; first contact of a line registered before it still counts on the next valid touch
+    bars = [bar(0, 4330, 4332, 4328, 4330, **line_feed(2, 1, 4300.0, KEY)), dict(t=T0 + M5, o=4301, h=None, l=4299, c=4300.5),
+            bar(2, 4300, 4301, 4299, 4300.5)]
+    r = Runner().run(bars)
+    check("R na の足は不正足。直前が不正足なら始値 = 線の到達方向は不明、初回接触は受け付ける",
+          r["hs"].nBad == 1 and sum(r["hcN"]) == 0 and r["hlUnk"][2] == 1 and r["hlAll"][0].hit, f"bad={r['hs'].nBad} unk={r['hlUnk']}")
+    # direction-unknown first contact sets the contacted flag (the next touching bar is not a first contact)
+    bars = [bar(0, 4302, 4302, 4300, 4300, **line_feed(2, 1, 4300.0, KEY)), bar(1, 4300, 4301, 4299, 4300.5), bar(2, 4300.5, 4302, 4299, 4301)]
+    r = Runner().run(bars)
+    check("R 方向不明の初回接触でも接触済みにする", r["hlUnk"][2] == 1 and sum(r["hcN"]) == 0, f"unk={r['hlUnk']} N={sum(r['hcN'])}")
+    # break width -> ticks: max(1, ceil(usd / mintick - 1e-9))
+    tk = {B: Runner({"hlBreak": B}).run(scenario([(4330, 4331, 4329, 4330)]))["hlBT"] for B in (5.0, 0.29, 0.001, 5.003, 0.01)}
+    check("R 突破幅のティック換算 (5→500, 0.29→29, 0.001→1, 5.003→501, 0.01→1)", tk == {5.0: 500, 0.29: 29, 0.001: 1, 5.003: 501, 0.01: 1}, str(tk))
+
 
 # ----------------------------------------------------------------------------------------------------------------
 # C. independent oracle: every line on every bar, per-target classification written from the spec without ticks-index tricks
 def oracle(bars, B=5.0, use=(True, True, True, True)):
     tk = lambda x: int(round(x / MT))   # noqa: E731
-    Bt = math.ceil(B / MT - 1e-6)
+    Bt = max(1, math.ceil(B / MT - 1e-9))
     D = [500, 1000, 2000]
     lines, obs, last = [], [], {}
     cnt = {}
     unk = [0] * 4
     prev = None
+    def register(i, b):
+        for k in range(4):
+            if not use[k]:
+                continue
+            for sd, (pk, tkk) in enumerate(((f"p{k + 1}h", f"p{k + 1}ht"), (f"p{k + 1}l", f"p{k + 1}lt"))):
+                pv, pt = b.get(pk), b.get(tkk)
+                if pv is not None and pt is not None and last.get((k, sd)) != pt:
+                    last[(k, sd)] = pt
+                    lines.append(dict(id=len(lines) + 1, p=tk(pv), tf=k, sub=1 if sd == 0 else -1, key=pt, reg=i, hit=False))
+
+    nbad = 0
     for i, b in enumerate(bars):
+        vals = [b["o"], b["h"], b["l"], b["c"]]
+        if any(v is None for v in vals) or b["h"] < max(b["o"], b["c"]) or b["l"] > min(b["o"], b["c"]):
+            nbad += 1
+            for ob in obs:
+                ob["res"] = [r if r is not None else (3,) for r in ob["res"]]
+                ob["flag"] = [False] * 3
+                ob["done"] = True
+            prev = None
+            register(i, b)
+            continue
         o, h, l, c = tk(b["o"]), tk(b["h"]), tk(b["l"]), tk(b["c"])
         for ob in obs:
             if ob["done"]:
@@ -295,10 +352,13 @@ def oracle(bars, B=5.0, use=(True, True, True, True)):
             ob["done"] = all(x is not None for x in ob["res"])
         for L in lines:
             P = L["p"]
-            if not (l <= P <= h) or L["reg"] >= i:
+            if not (l <= P <= h):
                 continue
-            if L["reg"] != i - 1 and prev[2] <= P <= prev[1]:
+            if not L["hit"] and L["reg"] >= i:
                 continue
+            if L["hit"] and not (prev is not None and (prev[2] > P or prev[1] < P)):
+                continue
+            L["hit"] = True
             s = 1 if o > P else -1 if o < P else (0 if prev is None else 1 if prev[3] > P else -1 if prev[3] < P else 0)
             if s == 0:
                 unk[L["tf"]] += 1
@@ -318,14 +378,7 @@ def oracle(bars, B=5.0, use=(True, True, True, True)):
             ob["M"] = max(0, -ln)
             ob["done"] = all(x is not None for x in ob["res"])
             obs.append(ob)
-        for k in range(4):
-            if not use[k]:
-                continue
-            for sd, (pk, tkk) in enumerate(((f"p{k + 1}h", f"p{k + 1}ht"), (f"p{k + 1}l", f"p{k + 1}lt"))):
-                pv, pt = b.get(pk), b.get(tkk)
-                if pv is not None and pt is not None and last.get((k, sd)) != pt:
-                    last[(k, sd)] = pt
-                    lines.append(dict(id=len(lines) + 1, p=tk(pv), tf=k, sub=1 if sd == 0 else -1, key=pt, reg=i))
+        register(i, b)
         prev = (o, h, l, c)
     # aggregate like the indicator
     agg = dict(N=[0] * 24, R=[0] * 24, B=[0] * 24, A=[0] * 24, F=[0] * 24, S=[0] * 24, Lo=[-1] * 24, Hi=[-1] * 24)
@@ -345,7 +398,7 @@ def oracle(bars, B=5.0, use=(True, True, True, True)):
                 agg["B"][ix] += 1
             else:
                 agg["A"][ix] += 1
-    return agg, unk, lines, obs
+    return agg, unk, lines, obs, nbad
 
 
 def htf_feeds(rows, blocks=(12, 48, 276, 1380), lens=(6, 6, 6, 6), offset=0):
@@ -397,19 +450,30 @@ def random_vs_oracle(seeds):
             p = round(rows[i][3])
             feeds[i].update({"p1h": float(p), "p1ht": T0 + i, "p3l": float(p), "p3lt": T0 + i})
         bars = [bar(i, *rows[i], **feeds[i]) for i in range(len(rows))]
+        rnd = random.Random(seed * 101)
+        for i in range(5, len(bars)):        # invalid confirmed bars (~1.5%): na OHLC / high < max(o, c) / low > min(o, c)
+            if rnd.random() < 0.015:
+                b = bars[i]
+                kind = rnd.randrange(3)
+                if kind == 0:
+                    b[rnd.choice("ohlc")] = None
+                elif kind == 1:
+                    b["h"] = round(max(b["o"], b["c"]) - rnd.choice([0.01, 1.0, 3.0]), 2)
+                else:
+                    b["l"] = round(min(b["o"], b["c"]) + rnd.choice([0.01, 1.0, 3.0]), 2)
         B = (5.0, 3.0, 7.5)[seed % 3]
         r = Runner({"hlBreak": B}, source=big).run(bars)
-        agg, unk, lines, obs = oracle(bars, B)
+        agg, unk, lines, obs, nbad = oracle(bars, B)
         c = r.counters()
         mine = dict(N=c["hcN"], R=c["hcR"], B=c["hcB"], A=c["hcA"], F=c["hcF"], S=c["hcS"], Lo=c["hxLo"], Hi=c["hxHi"])
-        same = mine == agg and c["hlUnk"] == unk and len(r["hlAll"]) == len(lines)
+        same = mine == agg and c["hlUnk"] == unk and len(r["hlAll"]) == len(lines) and r["hs"].nBad == nbad and nbad > 20
         # per observation: every decided (line, contact time, target) of the oracle == the indicator's records
         orec = sorted((ob["t"], ob["p"], ob["dr"], j, ob["res"][j]) for ob in obs for j in range(3) if ob["res"][j] is not None)
         irec = sorted((x.cTime, int(round(x.pf / MT)), x.dr, x.j, (x.res,) if x.res != 1 else (1, x.exL, x.exH)) for x in r["hlRec"])
         nN = sum(agg["N"]) // 3
         nonzero = sum(1 for x in agg["R"] if x) + sum(1 for x in agg["B"] if x)
         check(f"C random seed {seed} (B={B}) == oracle", same and orec == irec and nN > 50 and nonzero > 4,
-              f"contacts={nN} lines={len(lines)} unk={sum(unk)} pending={len(r['hlPend'])} recs={len(irec)} diff_keys="
+              f"contacts={nN} lines={len(lines)} unk={sum(unk)} bad={nbad} pending={len(r['hlPend'])} recs={len(irec)} diff_keys="
               f"{[k for k in agg if agg[k] != mine[k]]}")
         # sum rule per row
         pend_ok = all(c["hcN"][x] - c["hcR"][x] - c["hcB"][x] - c["hcA"][x] >= c["hcF"][x] >= 0 for x in range(24))
@@ -433,8 +497,8 @@ def invariants(bars):
     check("B 未確定の最後の足は集計しない", base.counters() == c0)
     # display / record limits do not change the counters
     s = src()
-    small = Runner({"hlRecN": 0, "hlDrawMax": 1, "hlDraw": False}, source=s.replace("int HL_REC_KEEP = 40", "int HL_REC_KEEP = 1")).run(bars).counters()
-    check("B 表示件数・描画上限・記録件数を変えても集計一致", small == a)
+    small = Runner({"hlView": "直近結果5件"}, source=s.replace("int HL_REC_KEEP = 40", "int HL_REC_KEEP = 1")).run(bars).counters()
+    check("B 表示切替・記録件数を変えても集計一致", small == a)
     # timeframe OFF: those lines are not registered, the others unchanged
     off = Runner({"hlUse1": False}).run(bars).counters()
     check("B 1H OFF は 1H の線だけ除く", off["hlNLine"][0] == 0 and off["hlNLine"][1:] == a["hlNLine"][1:]
@@ -502,6 +566,15 @@ def static():
     check("E Pivot 関数は Lab と同一", fn(s) == fn(lab))
     req = re.findall(r'request\.security\(syminfo\.tickerid, "(\w+)",\s*f_lbPivotConfirmed\(hlPiv(\d)\), lookahead = barmerge\.lookahead_on\)', s)
     check("E 上位足の取得 60 / 240 / D / W・lookahead_on", req == [("60", "1"), ("240", "2"), ("D", "3"), ("W", "4")], str(req))
+    check("E 表示: 右上の 1 表で 集計 (初期値) / 直近結果5件、描画と追加の表示設定なし、日時 Asia/Tokyo・値幅 format.mintick",
+          'hlView = input.string("集計", "表示", options = ["集計", "直近結果5件"]' in code
+          and len(re.findall(r"table\.new\(", code)) == len(re.findall(r"table\.new\(position\.top_right,", code)) == 3
+          and not re.search(r"\b(line|label|box)\.new\(|max_lines_count|syminfo\.timezone|\"#\.##\"", code)
+          and len(re.findall(r"= input\.", code)) == 10 and '"Asia/Tokyo"' in code
+          and 'str.tostring(t * syminfo.mintick, format.mintick)' in code)
+    check("E 突破幅 初期値 $5・最小 $0.01・刻み $0.01、換算 max(1, ceil(usd / mintick - 1e-9))",
+          'hlBreak = input.float(5.0, "突破幅 B ($)", minval = 0.01, step = 0.01,' in code
+          and "math.max(1, math.ceil(usd / syminfo.mintick - 1e-9))" in code)
     ind = [ln for ln in s.split("\n") if ln.strip() and not ln.lstrip().startswith("//")]
     bad = [ln for ln in ind if (len(ln) - len(ln.lstrip(" "))) % 4 not in (0, 1) and not ln.startswith("     ")]
     check("E 継続行以外のインデントは 4 の倍数", not bad, str(bad[:3]))
