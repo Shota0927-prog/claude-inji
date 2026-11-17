@@ -41,6 +41,14 @@ def src():
     return open(PINE, encoding="utf-8").read()
 
 
+def with_keep(n, s=None):
+    """the source with HL_REC_KEEP replaced (fails loudly if the declaration is not the expected 5)"""
+    s = s if s is not None else src()
+    old = "int HL_REC_KEEP = 5 "
+    assert s.count(old) == 1, "HL_REC_KEEP declaration changed"
+    return s.replace(old, f"int HL_REC_KEEP = {n} ")
+
+
 def logic(s):
     i = s.index(BEGIN)
     return s[s.index("\n", i) + 1:s.index(END)]
@@ -82,7 +90,7 @@ class Runner:
         if conf:
             self.bar_index = idx
         e = self.env
-        e.update(open=b["o"], high=b["h"], low=b["l"], close=b["c"], time=b["t"], bar_index=idx,
+        e.update(open=b["o"], high=b["h"], low=b["l"], close=b["c"], time=b["t"], time_close=b["t"] + M5, bar_index=idx,
                  barstate__isconfirmed=conf)
         for f in FEEDS:
             e[f] = b.get(f)
@@ -159,7 +167,7 @@ R, B, A = 1, 2, 3
 def both_ways(name, rows, expect, pend=(), flags=(), n_contacts=1):
     """expect: {target: (res, lo, hi)} for the first observation; pend: targets still pending; flags: pending with the flag"""
     for dr, bars in ((1, scenario(rows)), (-1, mirror_bars(scenario(rows)))):
-        r = Runner().run(bars)
+        r = Runner(source=with_keep(1000)).run(bars)   # every decided record (the default keeps 5)
         got = results(r)
         ok = True
         det = []
@@ -226,7 +234,7 @@ def acceptance():
     check("A 7b 終値だけ離れた足では再開しない", r["hcN"][12] == 1, f"N={r['hcN'][12]}")
     # 7c: the earlier observation breaks on the re-contact bar and the new one starts on the same bar
     rows7c = [(4302, 4303, 4299, 4301), (4301, 4306, 4300.5, 4305), (4301, 4302, 4295, 4296)]
-    r = Runner().run(scenario(rows7c))
+    r = Runner(source=with_keep(1000)).run(scenario(rows7c))
     rr = results(r)
     check("A 7c 再接触足で前回分が突破・今回分が開始", r["hcN"][12] == 2 and rr.get((1, 10)) == [(B, None, None), (B, None, None)]
           and rr.get((1, 5)) == [(R, 1.0, 1.0), (B, None, None)], str(rr))
@@ -290,6 +298,18 @@ def acceptance():
     bars = [bar(0, 4302, 4302, 4300, 4300, **line_feed(2, 1, 4300.0, KEY)), bar(1, 4300, 4301, 4299, 4300.5), bar(2, 4300.5, 4302, 4299, 4301)]
     r = Runner().run(bars)
     check("R 方向不明の初回接触でも接触済みにする", r["hlUnk"][2] == 1 and sum(r["hcN"]) == 0, f"unk={r['hlUnk']} N={sum(r['hcN'])}")
+
+    # ---- HLR-3: record keep 5 / period end = time_close of the last confirmed bar ---------------------------------
+    rows6 = [(4302, 4303, 4299, 4301),          # contact 1 (from above)
+             (4301, 4321, 4300.5, 4320),        # $5 / $10 / $20 rebound (3 results); low > 4300 = away
+             (4301, 4302, 4294, 4295)]          # contact 2: $5 / $10 / $20 break on the contact bar (3 results)
+    r = Runner().run(scenario(rows6))
+    kept = [(x[4], x[5]) for x in r.recs()]
+    check("R 6 件確定 → 記録は最新 5 件、集計は 6 件すべて",
+          r["HL_REC_KEEP"] == 5 and kept == [(1, R), (2, R), (0, B), (1, B), (2, B)] and sum(r["hcR"]) == 3 and sum(r["hcB"]) == 3
+          and [r["hcN"][12 + j] for j in range(3)] == [2, 2, 2] and len(r["hlPend"]) == 0, f"kept={kept} R={sum(r['hcR'])} B={sum(r['hcB'])}")
+    check("R 集計期間 = 最初の足の time ～ 最後の確定足の time_close", r["hs"].firstT == T0 and r["hs"].lastT == T0 + len(rows6) * M5 + M5,
+          f"{r['hs'].firstT} {r['hs'].lastT}")
     # break width -> ticks: max(1, ceil(usd / mintick - 1e-9))
     tk = {B: Runner({"hlBreak": B}).run(scenario([(4330, 4331, 4329, 4330)]))["hlBT"] for B in (5.0, 0.29, 0.001, 5.003, 0.01)}
     check("R 突破幅のティック換算 (5→500, 0.29→29, 0.001→1, 5.003→501, 0.01→1)", tk == {5.0: 500, 0.29: 29, 0.001: 1, 5.003: 501, 0.01: 1}, str(tk))
@@ -441,7 +461,7 @@ def random_bars(seed, n, step=0.01, vol=1.6, gaps=True):
 
 
 def random_vs_oracle(seeds):
-    big = src().replace("int HL_REC_KEEP = 40", "int HL_REC_KEEP = 1000000")
+    big = with_keep(1000000)
     for seed in seeds:
         rows = random_bars(seed, 3000, step=1.0 if seed % 3 == 0 else 0.01)
         feeds = htf_feeds(rows, blocks=(12, 48, 120, 360), lens=(2, 2, 2, 2) if seed % 2 else (6, 3, 2, 1))
@@ -497,7 +517,7 @@ def invariants(bars):
     check("B 未確定の最後の足は集計しない", base.counters() == c0)
     # display / record limits do not change the counters
     s = src()
-    small = Runner({"hlView": "直近結果5件"}, source=s.replace("int HL_REC_KEEP = 40", "int HL_REC_KEEP = 1")).run(bars).counters()
+    small = Runner({"hlView": "直近結果5件"}, source=with_keep(1, s)).run(bars).counters()
     check("B 表示切替・記録件数を変えても集計一致", small == a)
     # timeframe OFF: those lines are not registered, the others unchanged
     off = Runner({"hlUse1": False}).run(bars).counters()
@@ -572,6 +592,12 @@ def static():
           and not re.search(r"\b(line|label|box)\.new\(|max_lines_count|syminfo\.timezone|\"#\.##\"", code)
           and len(re.findall(r"= input\.", code)) == 10 and '"Asia/Tokyo"' in code
           and 'str.tostring(t * syminfo.mintick, format.mintick)' in code)
+    check("E 集計表 10 列 (反発・突破は件数と率、行き過ぎと単一値件数を同じ列、決着例内の反発率を末尾)・直近結果の列順・期間終了 time_close",
+          'table.new(position.top_right, 10, 1 + nTf * 6 + 6' in code
+          and 'array.from("時間足", "到達", "目標", "N (接触数)", "反発先着 件数 (%)", "突破先着 件数 (%)", "順序不明 (内 追跡中)", "未決着", "反発前の最大行き過ぎ (単一値件数)", "決着例内の反発率")' in code
+          and 'array.from("接触時刻 (JST)", "線価格", "時間足", "接触方向", "目標", "結果", "反発前の最大行き過ぎ")' in code
+          and re.search(r"f_cell\(hlTbl, 0, q \+ 1, f_tm\(rc\.cTime\)", code) and re.search(r"f_cell\(hlTbl, 9, row, f_pct\(r, r \+ b\)", code)
+          and not re.search(r"f_cell\(hlTbl, 1[0-2],|, 13,", code) and "hs.lastT := time_close" in code)
     check("E 突破幅 初期値 $5・最小 $0.01・刻み $0.01、換算 max(1, ceil(usd / mintick - 1e-9))",
           'hlBreak = input.float(5.0, "突破幅 B ($)", minval = 0.01, step = 0.01,' in code
           and "math.max(1, math.ceil(usd / syminfo.mintick - 1e-9))" in code)
