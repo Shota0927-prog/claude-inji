@@ -398,7 +398,8 @@ f_bus(int tfId, float payload, int tclose) =>
 //   bit 37-50  : slot の下位 14 bit（META と同じ 5 分足であることの照合用）
 studyLogicStr = input.string("{cfg['labels'][0]}", "診断対象ロジック", options = [{', '.join('"' + l + '"' for l in cfg['labels'])}], group = "⑨ 単体診断（Logic Verifier 用。通常 BUS・判定には影響しない）")
 studyTfStr    = input.string("5M", "診断対象の時間足", options = ["5M", "15M"], group = "⑨ 単体診断（Logic Verifier 用。通常 BUS・判定には影響しない）")
-int  STUDY_LI = array.indexof(array.from({', '.join('"' + l + '"' for l in cfg['labels'])}), studyLogicStr)
+var LABELS = array.from({', '.join('"' + l + '"' for l in cfg['labels'])})
+int  STUDY_LI = array.indexof(LABELS, studyLogicStr)
 int  STUDY_TI = studyTfStr == "5M" ? 0 : 1
 // 元々その TF が対象外の組合せ（EMA ロジックの 15M など）は「対象外」。検知対象は増やさない
 bool STUDY_NA = {cfg['studyna']}
@@ -454,6 +455,30 @@ plot(isChart5M ? bus15 : na, "{S} 15M BUS", display = display.data_window)
 plot(isChart5M ? srcStatus : 3, "{S} STATUS", display = display.data_window)
 plot(isChart5M ? studyData : na, "STUDY DATA BUS", display = display.data_window)
 plot(isChart5M ? studyMeta : na, "STUDY META BUS", display = display.data_window)
+
+// ---- 設定の記録（採用 / 保持本数の比較結果と一緒に控える用。計算には影響しない）-------------------
+// 保持本数の比較は既存の「③ 保持本数」input を 1 ロジック × 1 TF ずつ変えて、履歴再計算で 1 設定ずつ行う
+// （複数候補を同時に計算しない）。本数はその TF 自身の本数（5M の 3 本と 15M の 3 本は同じ経過時間ではない）。
+// 保持本数を変えると準備本数（最大保持本数）も変わる場合があるので、比較は同じ集計期間に揃える。
+recShow = input.bool(false, "設定の記録を表示", group = "⑩ 設定の記録（結果と一緒に控える用）")
+recPos  = input.string(position.top_left, "表示位置", options = [position.top_left, position.middle_left, position.bottom_left, position.top_center, position.bottom_center], group = "⑩ 設定の記録（結果と一緒に控える用）")
+var recTbl = table.new(recPos, 1, 4, border_width = 1)
+if barstate.islast
+    table.clear(recTbl, 0, 0, 0, 3)
+    if recShow
+        string offTxt  = ""
+        string holdTxt = ""
+        for li = 0 to N_LOGIC - 1
+            for ti = 0 to N_TF - 1
+                int  k   = f_idx(li, ti)
+                bool app = not ({cfg['naexpr']})
+                string nm = array.get(LABELS, li) + (ti == 0 ? " 5M" : " 15M")
+                offTxt  += app and not array.get(V2_ADOPT, k) ? (offTxt == "" ? "" : ", ") + nm : ""
+                holdTxt += app and array.get(V2_RULE, li) != 3 and array.get(HOLD_ALL, k) != (ti == 0 ? 6 : 4) ? (holdTxt == "" ? "" : ", ") + nm + "=" + str.tostring(array.get(HOLD_ALL, k)) : ""
+        table.cell(recTbl, 0, 0, "{cfg['short']} 設定（比較元 0e56963 の既定 : 全て採用 / 保持 5M 6・15M 4）", text_color = color.white, bgcolor = color.new(#1e222d, 20), text_size = size.small)
+        table.cell(recTbl, 0, 1, "採用 : " + (adoptAll ? "全て採用" : "カスタム / OFF = " + (offTxt == "" ? "なし" : offTxt)), text_color = color.white, bgcolor = color.new(#1e222d, 20), text_size = size.small)
+        table.cell(recTbl, 0, 2, "保持本数（既定と異なるもの）: " + (holdTxt == "" ? "なし" : holdTxt), text_color = color.white, bgcolor = color.new(#1e222d, 20), text_size = size.small)
+        table.cell(recTbl, 0, 3, "単体診断 : " + studyLogicStr + " " + studyTfStr + "（状態型 SAT は保持本数を使わない）", text_color = color.white, bgcolor = color.new(#1e222d, 20), text_size = size.small)
 """)
     return '\n'.join(o)
 
@@ -520,7 +545,7 @@ XB = ['xC'] + [f'x{n}{d}' for n in range(13, 19) for d in 'LS'] + [f's{n}{d}' fo
 XC = ['xC', 'xH', 'xL', 'x19L', 'x19S', 'x20L', 'x20S']
 
 CFG = [
-    dict(id='A', sid=1, n=12, labels=['Logic01 FVG Abs', 'Logic02 FVG Reb', 'Logic03 Accum Reb', 'Logic04 Accum Brk', 'Logic05 EMA200 Reb', 'Logic06 EMA1000 Reb', 'Logic07 EMA2000 Reb', 'Logic08 EMA3000 Reb', 'Logic09 EMA200 Brk', 'Logic10 EMA1000 Brk', 'Logic11 EMA2000 Brk', 'Logic12 EMA3000 Brk'], goff=0, studyna='STUDY_TI == 1 and STUDY_LI >= 4', nums=list(range(1, 13)), ema=tuple(range(5, 13)), nx=15, xs=XA, tuple=4, eng='f_signalMasksA',
+    dict(id='A', sid=1, n=12, naexpr='ti == 1 and li >= 4', labels=['Logic01 FVG Abs', 'Logic02 FVG Reb', 'Logic03 Accum Reb', 'Logic04 Accum Brk', 'Logic05 EMA200 Reb', 'Logic06 EMA1000 Reb', 'Logic07 EMA2000 Reb', 'Logic08 EMA3000 Reb', 'Logic09 EMA200 Brk', 'Logic10 EMA1000 Brk', 'Logic11 EMA2000 Brk', 'Logic12 EMA3000 Brk'], goff=0, studyna='STUDY_TI == 1 and STUDY_LI >= 4', nums=list(range(1, 13)), ema=tuple(range(5, 13)), nx=15, xs=XA, tuple=4, eng='f_signalMasksA',
          title='POINT MASTER SOURCE A 5M15M', short='PM-A-515', desc='Logic01〜12 : FVG / Accum / EMA',
          map='0〜3 = Logic01〜04 / 4〜11 = Logic05〜12',
          layout='価格帯（Logic01〜04）= bit 3-6 / MA（Logic05〜12）= bit 7-10',
@@ -529,7 +554,7 @@ CFG = [
          pre='0.0', ltfpre='0.0, 0.0, 0.0, 0.0',
          payload='f_fam1(ti, 0, 3, 3) + f_fam1(ti, 4, 11, 7)',
          modules='\n'.join([MOD_A, PACKF, ENG_A, BITONF])),
-    dict(id='B', sid=2, n=6, labels=['Logic13 TL Reb', 'Logic14 TL Brk', 'Logic15 H&S', 'Logic16 DT/DB', 'Logic17 Wedge', 'Logic18 Triangle'], goff=12, studyna='false', nums=list(range(13, 19)), nx=25, xs=XB, tuple=6, eng='f_signalMasksB',
+    dict(id='B', sid=2, n=6, naexpr='false', labels=['Logic13 TL Reb', 'Logic14 TL Brk', 'Logic15 H&S', 'Logic16 DT/DB', 'Logic17 Wedge', 'Logic18 Triangle'], goff=12, studyna='false', nums=list(range(13, 19)), nx=25, xs=XB, tuple=6, eng='f_signalMasksB',
          title='POINT MASTER SOURCE B 5M15M', short='PM-B-515', desc='Logic13〜18 : TL / 三尊 / DTB / ウェッジ / 三角形',
          map='0〜5 = Logic13〜18',
          layout='形状（Logic13〜18）= bit 3-6',
@@ -539,7 +564,7 @@ CFG = [
          ltfpre='nz(array.get(LTF_PLM, _i)), nz(array.get(LTF_PSM, _i)), 0.0, 0.0',
          payload='f_fam1(ti, 0, 5, 3)',
          modules='\n'.join([MOD_B, PACKF, ENG_B, BITONF])),
-    dict(id='C', sid=3, n=7, labels=['Logic19 Horiz Reb', 'Logic20 Horiz Brk', 'Logic21 Fib382', 'Logic22 Fib500', 'Logic23 Fib618', 'Logic24 SAT', 'Logic25 Stoch'], goff=18, studyna='false', nums=list(range(19, 26)), sat=(24,), nx=7, xs=XC, tuple=8, eng='f_signalMasksC',
+    dict(id='C', sid=3, n=7, naexpr='false', labels=['Logic19 Horiz Reb', 'Logic20 Horiz Brk', 'Logic21 Fib382', 'Logic22 Fib500', 'Logic23 Fib618', 'Logic24 SAT', 'Logic25 Stoch'], goff=18, studyna='false', nums=list(range(19, 26)), sat=(24,), nx=7, xs=XC, tuple=8, eng='f_signalMasksC',
          title='POINT MASTER SOURCE C 5M15M', short='PM-C-515', desc='Logic19〜25 : 水平線 / Fib / SAT / ストキャス',
          map='0〜1 = Logic19〜20 / 2〜4 = Logic21〜23 / 5 = Logic24 / 6 = Logic25',
          layout='価格帯（Logic19〜20）= bit 3-6 / Fib = bit 7-10 / SAT = bit 11-16（LONG 確認 11・統合 12-13、SHORT 確認 14・統合 15-16）/ ストキャス = bit 17-20',
