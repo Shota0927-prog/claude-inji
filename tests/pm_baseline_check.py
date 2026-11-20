@@ -34,6 +34,12 @@ ALLOWED_CHANGED = [
     'r := f_v2Row(r, "5M 確認済み点（自 vs 逆）", colTxt,',
     'r := f_v2Row(r, "15M 確認済み点（自 vs 逆）", colTxt,',
     'r := f_v2Row(r, "5M 逆方向 統合点（系統数）", colTxt,',
+    # Stage 5 表示のみ（Weight 後の小数表示・注記。判定には使わない）
+    'str.tostring(array.get(V2B_DIAG, 0), "0") + " vs " + str.tostring(array.get(V2B_DIAG, 1), "0"), colTxt,',
+    'str.tostring(array.get(V2B_DIAG, 6), "0") + " vs " + str.tostring(array.get(V2B_DIAG, 7), "0"), colTxt)',
+    'str.tostring(array.get(V2B_DIAG, 2), "0") + " vs " + str.tostring(array.get(V2B_DIAG, 3), "0"), colTxt,',
+    'str.tostring(array.get(V2B_DIAG, 8), "0") + " vs " + str.tostring(array.get(V2B_DIAG, 9), "0"), colTxt)',
+    'f_v2Cell(0, r + 1, "※点数 = 系統×TF×方向で最大1点（Weight不使用）。基準は確定ピボット基準", color.gray)',
 ]
 
 ok = 0
