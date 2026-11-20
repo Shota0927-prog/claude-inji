@@ -359,4 +359,50 @@ check("verifier: baseline not counted, cont on switch to 1, exit on 3, na resets
       ev == [(3, 'L', 'cont'), (3, 'S', 'cont'), (4, 'L', 'exit'), (8, 'S', 'exit')])
 check("verifier: connected checkbox OFF -> no events", verifier_events(seq, connected=False) == [])
 check("verifier: out-of-range / non-integer / price input -> no events", verifier_events([(2650.0, 1), (1.5, 1), (4, 1), (1, 1)]) == [])
+
+# ---- データ準備 / 更新整合（§12 の時刻確認のモデル）
+def readiness(bars, need=(10, 6, 4)):
+    """bars: [(t, ltf_times, tt5, tt15, vals_ok)]。元版方式で期待される直前 TF 区間と受信時刻を照合。"""
+    c5 = p5 = c15 = p15 = None
+    warm = [0, 0, 0]; last1 = 0; out = []
+    for t, lt, tt5, tt15, vok in bars:
+        b5, b15 = t - t % 300000, t - t % 900000
+        if c5 is None or b5 != c5: p5, c5 = c5, b5
+        if c15 is None or b15 != c15: p15, c15 = c15, b15
+        new1 = [x for x in lt if x > last1]
+        if new1: last1 = new1[-1]
+        warm[0] += len(new1)
+        warm[1] += 1 if tt5 else 0      # TF 確定足の処理（簡略: 毎 5M 足で 5M / 15M 区間が変わった時）
+        if tt15 and (not out or out[-1][1] != tt15): warm[2] += 1
+        m1 = not lt; bad1 = any(x < t or x >= t + 300000 for x in lt) or lt != sorted(set(lt)) or (lt and last1 != lt[-1])
+        m5, m15 = not tt5 or p5 is None, not tt15 or p15 is None
+        bad5, bad15 = (not m5 and tt5 != p5), (not m15 and tt15 != p15)
+        bad = bad1 or bad5 or bad15 or not vok
+        st = 4 if bad else 1 if (m1 or m5 or m15 or warm[0] < need[0] or warm[1] < need[1] or warm[2] < need[2]) else 0
+        if bad1 or m1 or not vok: warm[0] = 0
+        if bad5 or m5 or not vok: warm[1] = 0
+        if bad15 or m15 or not vok: warm[2] = 0
+        out.append((st, tt15))
+    return [o[0] for o in out]
+
+M5, M15, M1 = 300000, 900000, 60000
+T0 = 1_700_000_100_000 - (1_700_000_100_000 % M15)
+def row(t, tt15_override=None, drop1=False, vok=True, tt5=None):
+    lt = [t + i * M1 for i in range(5)][: 4 if drop1 else 5]
+    b15 = t - t % M15
+    return (t, lt, t - M5 if tt5 is None else tt5, b15 - M15 if tt15_override is None else tt15_override, vok)
+bars = [row(T0 + i * M5) for i in range(30)]
+st = readiness(bars)
+check("ready only after 1M/5M/15M warm-up (first bars = 1, later = 0)", st[0] == 1 and st[-1] == 0)
+# 週末ギャップ：直前に足が存在した区間と比べるので不整合にしない
+gap = T0 + 30 * M5 + 2 * 24 * 3600 * 1000
+last_pre = T0 + 29 * M5
+bars2 = bars + [(gap, [gap + i * M1 for i in range(5)], last_pre, last_pre - last_pre % M15, True)] + [row(gap + i * M5, tt15_override=(last_pre - last_pre % M15) if i < 3 else None) for i in range(1, 4)]
+st2 = readiness(bars2)
+check("weekend gap with expected previous TF bars -> stays ready", st2[30:] == [0, 0, 0, 0])
+# 15M が遅れて古い確定足のまま → 不整合
+bars3 = bars[:20] + [row(T0 + 20 * M5, tt15_override=T0 + 20 * M5 - (T0 + 20 * M5) % M15 - 2 * M15)] + bars[21:]
+st3 = readiness(bars3)
+check("stale 15M bar time -> 4 (not ready), then re-warm", st3[20] == 4 and st3[21] == 1)
+check("missing last 1-minute bar tolerated, invalid value -> 4", readiness(bars[:25] + [row(T0 + 25 * M5, drop1=True)])[-1] == 0 and readiness(bars[:25] + [row(T0 + 25 * M5, vok=False)])[-1] == 4)
 print(f"{ok} checks passed (model only; not a Pine run)")
