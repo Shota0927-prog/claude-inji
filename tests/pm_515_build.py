@@ -46,6 +46,20 @@ MOD_C2 = lines(L24, ENGC - 1)
 ENG_C = lines(ENGC, BITON - 1)
 BITONF = lines(BITON, BITON + 2)
 
+# Source A（5分・15分版のみ）: 時刻照合用に、同じ Engine 実行で得た値を UDT の末尾へ追加する（判定には使わない）
+#   time_close / close[1] / EMA A の前足値 / EMA 許容幅用 ATR / EMA 対象 TF フラグ
+old_a = '    float xC  = close\n'
+assert ENG_A.count(old_a) == 1
+ENG_A = ENG_A.replace(old_a, old_a + """    float xTc  = time_close              // ★時刻照合 : この TF 足の確定時刻
+    float xCp  = close[1]                // ★時刻照合 : f_emaEvents が使う前足 close
+    float xEaP = _emaA[1]                // ★時刻照合 : f_emaEvents へ渡した EMA A の前足値
+    float xAtr = _emaAtr                 // ★時刻照合 : f_emaEvents へ渡した ATR（接触許容幅）
+    float xOn  = _emaTfOk ? 1.0 : 0.0    // ★時刻照合 : EMA ロジックの対象 TF か
+""")
+old_ret = '    [lmA, smA, xC, xH, xL, xEa, xEb, xEc, xEd, x01L, x01S, x02L, x02S, x03L, x03S, x04L, x04S]'
+assert ENG_A.count(old_ret) == 1
+ENG_A = ENG_A.replace(old_ret, old_ret[:-1] + ', xTc, xCp, xEaP, xAtr, xOn]')
+
 # Engine B / C の V2 追加出力の先頭に、この TF 足の close（C は high / low も）を加える（判定には使わない）
 old_b = '    [lmB, smB, preLmB, preSmB, x13L,'
 assert ENG_B.count(old_b) == 1
@@ -540,12 +554,12 @@ conflictMode = conflictStr == "LONG優先" ? CONF_LONG : conflictStr == "SHORT�
     return '\n'.join(out) + '\n'
 
 
-XA = ['xC', 'xH', 'xL', 'xEa', 'xEb', 'xEc', 'xEd', 'x01L', 'x01S', 'x02L', 'x02S', 'x03L', 'x03S', 'x04L', 'x04S']
+XA = ['xC', 'xH', 'xL', 'xEa', 'xEb', 'xEc', 'xEd', 'x01L', 'x01S', 'x02L', 'x02S', 'x03L', 'x03S', 'x04L', 'x04S', 'xTc', 'xCp', 'xEaP', 'xAtr', 'xOn']
 XB = ['xC'] + [f'x{n}{d}' for n in range(13, 19) for d in 'LS'] + [f's{n}{d}' for n in range(13, 19) for d in 'LS']
 XC = ['xC', 'xH', 'xL', 'x19L', 'x19S', 'x20L', 'x20S']
 
 CFG = [
-    dict(id='A', sid=1, n=12, naexpr='ti == 1 and li >= 4', labels=['Logic01 FVG Abs', 'Logic02 FVG Reb', 'Logic03 Accum Reb', 'Logic04 Accum Brk', 'Logic05 EMA200 Reb', 'Logic06 EMA1000 Reb', 'Logic07 EMA2000 Reb', 'Logic08 EMA3000 Reb', 'Logic09 EMA200 Brk', 'Logic10 EMA1000 Brk', 'Logic11 EMA2000 Brk', 'Logic12 EMA3000 Brk'], goff=0, studyna='STUDY_TI == 1 and STUDY_LI >= 4', nums=list(range(1, 13)), ema=tuple(range(5, 13)), nx=15, xs=XA, tuple=4, eng='f_signalMasksA',
+    dict(id='A', sid=1, n=12, naexpr='ti == 1 and li >= 4', trace=True, labels=['Logic01 FVG Abs', 'Logic02 FVG Reb', 'Logic03 Accum Reb', 'Logic04 Accum Brk', 'Logic05 EMA200 Reb', 'Logic06 EMA1000 Reb', 'Logic07 EMA2000 Reb', 'Logic08 EMA3000 Reb', 'Logic09 EMA200 Brk', 'Logic10 EMA1000 Brk', 'Logic11 EMA2000 Brk', 'Logic12 EMA3000 Brk'], goff=0, studyna='STUDY_TI == 1 and STUDY_LI >= 4', nums=list(range(1, 13)), ema=tuple(range(5, 13)), nx=20, xs=XA, tuple=4, eng='f_signalMasksA',
          title='POINT MASTER SOURCE A 5M15M', short='PM-A-515', desc='Logic01〜12 : FVG / Accum / EMA',
          map='0〜3 = Logic01〜04 / 4〜11 = Logic05〜12',
          layout='価格帯（Logic01〜04）= bit 3-6 / MA（Logic05〜12）= bit 7-10',
@@ -584,8 +598,27 @@ f_satBits(int ti) =>
     (cL + 2 * qL + 8 * cS + 16 * qS) * math.pow(2, 11)
 '''
 
+TRACE_CAP = """
+    // ★時刻照合（Source A のみ）: f_v2ApplyTf(0) に渡したのと同じ 5M 元足の UDT と開始時刻を保持（判定には使わない）
+    TR_X5   := f_srcArr(ox5)
+    trOpen5 := t5"""
+
+TRACE_NB = """    trNb := array.get(V2_NEWBAR, 0)      // ★時刻照合 : この 5 分足で 5M 元足を処理したか（リセット前に退避）
+    array.fill(V2_NEWBAR, false)"""
+
+TRACE_SEC = open(f'{ROOT}/tests/pm_515_trace_a.pine', encoding='utf-8').read()
+
 for cfg in CFG:
     txt = build(cfg)
+    if cfg.get('trace'):
+        a5 = '    f_v2ApplyTf(0, nz(lm5), nz(sm5), nz(plm5), nz(psm5), nz(im5), nz(sp5), f_srcArr(ox5))'
+        assert txt.count(a5) == 1
+        txt = txt.replace(a5, a5 + TRACE_CAP)
+        txt = txt.replace('int t5  = nz(tt5)', 'var TR_X5   = array.new_float(20, na)   // ★時刻照合（Source A のみ）\nvar int trOpen5 = na\nvar bool trNb  = false\nint t5  = nz(tt5)', 1)
+        nb0 = '    array.fill(V2_NEWBAR, false)'
+        assert txt.count(nb0) == 1
+        txt = txt.replace(nb0, TRACE_NB)
+        txt = txt.rstrip('\n') + '\n\n' + TRACE_SEC
     if cfg['id'] == 'C':
         txt = txt.replace('f_payload(int ti) =>', SAT_BITS.strip('\n') + '\n\nf_payload(int ti) =>')
     open(f'{ROOT}/PointMasterSource{cfg["id"]}5M15M.pine', 'w', encoding='utf-8').write(txt)

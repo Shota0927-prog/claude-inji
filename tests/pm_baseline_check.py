@@ -40,6 +40,11 @@ ALLOWED_CHANGED = [
     'str.tostring(array.get(V2B_DIAG, 2), "0") + " vs " + str.tostring(array.get(V2B_DIAG, 3), "0"), colTxt,',
     'str.tostring(array.get(V2B_DIAG, 8), "0") + " vs " + str.tostring(array.get(V2B_DIAG, 9), "0"), colTxt)',
     'f_v2Cell(0, r + 1, "※点数 = 系統×TF×方向で最大1点（Weight不使用）。基準は確定ピボット基準", color.gray)',
+    # 時刻照合（Source A のみ）: UDT の末尾へフィールドを追加しただけ（既存フィールドの順序・値・request 本数・タプル要素数は同じ）
+    '[lmA, smA, xC, xH, xL, xEa, xEb, xEc, xEd, x01L, x01S, x02L, x02S, x03L, x03S, x04L, x04S]',
+    'array.from(q.f0, q.f1, q.f2, q.f3, q.f4, q.f5, q.f6, q.f7, q.f8, q.f9, q.f10, q.f11, q.f12, q.f13, q.f14)',
+    '[lmRaw, smRaw, xC, xH, xL, xEa, xEb, xEc, xEd, x01L, x01S, x02L, x02S, x03L, x03S, x04L, x04S] = f_signalMasksA()',
+    '[lm[1], sm[1], tt[1], SRCAX.new(xC[1], xH[1], xL[1], xEa[1], xEb[1], xEc[1], xEd[1], x01L[1], x01S[1], x02L[1], x02S[1], x03L[1], x03S[1], x04L[1], x04S[1])]   // ★[1] は必須（外すと未来参照）',
 ]
 
 ok = 0
