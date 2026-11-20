@@ -212,11 +212,18 @@ var V2_PRE   = array.new_float(N_LOGIC * N_TF * 2, 0.0)     // 抑止前 PRE Sta
 var V2_NEG   = array.new_int(N_TF * 2, 0)
 var V2_WARM  = array.new_int(N_TF, 0)
 var V2_BADX  = array.new_bool(N_TF, false)
+// 単体診断（Logic Verifier 用。通常 BUS・判定には使わない。下の f_v2ApplyTf の中で既存の値を記録するだけ）
+var V2_RAW    = array.new_bool(N_LOGIC * N_TF * 2, false)   // その TF 足の生シグナル（裁定・採用設定の前）
+var V2_NEGF   = array.new_bool(N_LOGIC * N_TF * 2, false)   // その TF 足で価格否定により解除
+var V2_EXPF   = array.new_bool(N_LOGIC * N_TF * 2, false)   // その TF 足で期限切れにより解除
+var V2_SINCE  = array.new_int(N_LOGIC * N_TF * 2, -1)       // 最後の生シグナルからのその TF の本数（-1 = 未発生）
+var V2_NEWBAR = array.new_bool(N_TF, false)                 // この 5 分足の間にその TF の新しい確定足を処理した
 
 f_v2ApplyTf(int ti, float lm, float sm, float plm, float psm, float im, float sp, array<float> x) =>
     float tc = array.get(x, 0)
     array.set(V2_WARM, ti, array.get(V2_WARM, ti) + 1)
     array.set(V2_BADX, ti, array.get(V2_BADX, ti) or na(tc))
+    array.set(V2_NEWBAR, ti, true)
     for li = 0 to N_LOGIC - 1
         int  k      = f_idx(li, ti)
         int  rule   = array.get(V2_RULE, li)
@@ -253,6 +260,13 @@ f_v2ApplyTf(int ti, float lm, float sm, float plm, float psm, float im, float sp
             array.set(V2_NEG,   ti * 2 + d, array.get(V2_NEG, ti * 2 + d) + (negd ? 1 : 0))
             // 抑止前 PRE（その TF の確定足1本ぶんの現在値で上書き）
             array.set(V2_PRE, j, {cfg['pre']})
+            // 単体診断（上で計算済みの値を記録するだけ）
+            bool  raw   = d == 0 ? rawL : rawS
+            int   since = array.get(V2_SINCE, j)
+            array.set(V2_RAW,   j, raw)
+            array.set(V2_NEGF,  j, negd)
+            array.set(V2_EXPF,  j, aging and rem1 <= 0 and not reg)
+            array.set(V2_SINCE, j, raw ? 0 : since < 0 ? -1 : since + 1)
     N_LOGIC
 
 // 5M / 15M : その TF の確定足が新しくなった瞬間だけ更新（1 分足あり版と同じタイミング）
@@ -342,6 +356,57 @@ f_bus(int tfId, float payload, int tclose) =>
     bool  ok   = slot >= 0 and slot < BUS_SLOTS and slot == math.floor(slot) and payload >= 0 and payload < 2097152
     ok ? BUS_FORMAT + 4 * {sid} + 16 * tfId + 64 * slot + 268435456.0 * payload : na
 
+// ---- 単体診断 BUS（STUDY DATA BUS / STUDY META BUS）-------------------------------------
+// 選んだ 1 ロジック × 1 TF の、既に計算済みの値を 5 分足の確定時点で整数へ詰める（検知関数・request は呼び直さない）。
+// STUDY META BUS（非負整数 < 2^37）
+//   bit 0-1 format = 1 / bit 2-3 SourceID（1 A / 2 B / 3 C）/ bit 4-5 TFID（1 = 5M / 2 = 15M）/
+//   bit 6-10 ロジック番号（1〜25。元版の Logic 番号）/ bit 11-13 状態（0 出力中 / 1 データ準備中 / 4 更新不整合 / 6 対象外）/
+//   bit 14 採用（1 = B の系統点へ採用中）/ bit 15-36 slot（= 通常 BUS と同じ。2020-01-01 00:05〜2059-11-23 頃の 5 分足）
+//   slot が範囲外の足、5 分足以外のチャートでは na。状態が 0 以外でも META は出す（DATA は na）。
+// STUDY DATA BUS（非負整数 < 2^51。META の状態 0 の足だけ出す）
+//   bit 0 / 1  : 生シグナル LONG / SHORT（その TF の新しい確定足で検知関数が発火。裁定・採用の前）
+//   bit 2 / 3  : 有効な CURRENT LONG / SHORT（価格否定・期限・裁定・採用設定を適用した後）
+//   bit 4-5 / 6-7 : 抑止前 PRE 強度 LONG / SHORT（0〜3 = 0 / 1/3 / 2/3 / 1。丸めなし）
+//   bit 8 / 9  : 価格否定による解除 LONG / SHORT（その TF 足）
+//   bit 10 / 11: 期限切れによる解除 LONG / SHORT（その TF 足。同じ足で同方向に再登録された場合は含めない）
+//   bit 12-17 / 18-23 : 最後の生シグナルからのその TF の本数 LONG / SHORT（0〜61、62 = 62 本以上、63 = 未発生）
+//   bit 24-29 / 30-35 : 有効根拠の経過本数 LONG / SHORT（最後の登録 = 同方向の新シグナルによる期限更新から数え直し。
+//                       0〜61、62 = 62 本以上、63 = 有効根拠なし。状態型 SAT は生シグナルからの本数）
+//   bit 36     : この 5 分足の間に、その TF の新しい確定足を処理した（0 のときは bit 0/1/8〜11 は 0）
+//   bit 37-50  : slot の下位 14 bit（META と同じ 5 分足であることの照合用）
+studyLogicStr = input.string("{cfg['labels'][0]}", "診断対象ロジック", options = [{', '.join('"' + l + '"' for l in cfg['labels'])}], group = "⑨ 単体診断（Logic Verifier 用。通常 BUS・判定には影響しない）")
+studyTfStr    = input.string("5M", "診断対象の時間足", options = ["5M", "15M"], group = "⑨ 単体診断（Logic Verifier 用。通常 BUS・判定には影響しない）")
+int  STUDY_LI = array.indexof(array.from({', '.join('"' + l + '"' for l in cfg['labels'])}), studyLogicStr)
+int  STUDY_TI = studyTfStr == "5M" ? 0 : 1
+// 元々その TF が対象外の組合せ（EMA ロジックの 15M など）は「対象外」。検知対象は増やさない
+bool STUDY_NA = {cfg['studyna']}
+
+f_cap6(int v) =>
+    v < 0 ? 63 : v >= 62 ? 62 : v
+
+f_study(int status, int tclose) =>
+    float slot = (tclose - BUS_BASE) / 300000.0
+    bool  sOk  = slot >= 0 and slot < BUS_SLOTS and slot == math.floor(slot)
+    int   st   = STUDY_NA ? 6 : status
+    int   j    = f_idx(STUDY_LI, STUDY_TI) * 2
+    bool  nb   = array.get(V2_NEWBAR, STUDY_TI)
+    bool  cL   = array.get(V2_VALID, j)     and array.get(V2_PRICE, j)
+    bool  cS   = array.get(V2_VALID, j + 1) and array.get(V2_PRICE, j + 1)
+    bool  isSt = array.get(V2_RULE, STUDY_LI) == 3
+    int   ageL = cL ? (isSt ? array.get(V2_SINCE, j)     : array.get(V2_AGE, j))     : -1
+    int   ageS = cS ? (isSt ? array.get(V2_SINCE, j + 1) : array.get(V2_AGE, j + 1)) : -1
+    float data = (nb and array.get(V2_RAW, j) ? 1 : 0) + (nb and array.get(V2_RAW, j + 1) ? 2 : 0) + (cL ? 4 : 0) + (cS ? 8 : 0) +
+         16 * math.round(array.get(V2_PRE, j) * 3) + 64 * math.round(array.get(V2_PRE, j + 1) * 3) +
+         (nb and array.get(V2_NEGF, j) ? 256 : 0) + (nb and array.get(V2_NEGF, j + 1) ? 512 : 0) +
+         (nb and array.get(V2_EXPF, j) ? 1024 : 0) + (nb and array.get(V2_EXPF, j + 1) ? 2048 : 0) +
+         4096.0 * f_cap6(array.get(V2_SINCE, j)) + 262144.0 * f_cap6(array.get(V2_SINCE, j + 1)) +
+         16777216.0 * f_cap6(ageL) + 1073741824.0 * f_cap6(ageS) + (nb ? 68719476736.0 : 0) +
+         137438953472.0 * (slot % 16384)
+    float meta = 1 + 4 * {sid} + 16 * (STUDY_TI + 1) + 64 * ({cfg['goff']} + STUDY_LI + 1) + 2048 * st + 16384 * 1 + 32768.0 * slot
+    [sOk and st == 0 ? data : na, sOk ? meta : na]
+
+var float studyData = na
+var float studyMeta = na
 var float bus5  = na
 var float bus15 = na
 var int   srcLastBar = 0
@@ -354,12 +419,18 @@ if isChart5M and barstate.isconfirmed and time > srcLastBar
     // BUS の TF ID は 5M = 1 / 15M = 2（内部 index 0 / 1 とは別）
     bus5  := srcStatusNow == 0 ? f_bus(1, f_payload(0), time_close) : na
     bus15 := srcStatusNow == 0 ? f_bus(2, f_payload(1), time_close) : na
+    [sData, sMeta] = f_study(srcStatusNow, time_close)
+    studyData := sData
+    studyMeta := sMeta
     array.fill(V2_NEG, 0)
     array.fill(V2_BADX, false)
+    array.fill(V2_NEWBAR, false)
 
 plot(isChart5M ? bus5  : na, "{S} 5M BUS",  display = display.data_window)
 plot(isChart5M ? bus15 : na, "{S} 15M BUS", display = display.data_window)
 plot(isChart5M ? srcStatus : 3, "{S} STATUS", display = display.data_window)
+plot(isChart5M ? studyData : na, "STUDY DATA BUS", display = display.data_window)
+plot(isChart5M ? studyMeta : na, "STUDY META BUS", display = display.data_window)
 """)
     return '\n'.join(o)
 
@@ -426,7 +497,7 @@ XB = ['xC'] + [f'x{n}{d}' for n in range(13, 19) for d in 'LS'] + [f's{n}{d}' fo
 XC = ['xC', 'xH', 'xL', 'x19L', 'x19S', 'x20L', 'x20S']
 
 CFG = [
-    dict(id='A', sid=1, n=12, nums=list(range(1, 13)), ema=tuple(range(5, 13)), nx=15, xs=XA, tuple=4, eng='f_signalMasksA',
+    dict(id='A', sid=1, n=12, labels=['Logic01 FVG Abs', 'Logic02 FVG Reb', 'Logic03 Accum Reb', 'Logic04 Accum Brk', 'Logic05 EMA200 Reb', 'Logic06 EMA1000 Reb', 'Logic07 EMA2000 Reb', 'Logic08 EMA3000 Reb', 'Logic09 EMA200 Brk', 'Logic10 EMA1000 Brk', 'Logic11 EMA2000 Brk', 'Logic12 EMA3000 Brk'], goff=0, studyna='STUDY_TI == 1 and STUDY_LI >= 4', nums=list(range(1, 13)), ema=tuple(range(5, 13)), nx=15, xs=XA, tuple=4, eng='f_signalMasksA',
          title='POINT MASTER SOURCE A 5M15M', short='PM-A-515', desc='Logic01〜12 : FVG / Accum / EMA',
          map='0〜3 = Logic01〜04 / 4〜11 = Logic05〜12',
          layout='価格帯（Logic01〜04）= bit 3-6 / MA（Logic05〜12）= bit 7-10',
@@ -435,7 +506,7 @@ CFG = [
          pre='0.0', ltfpre='0.0, 0.0, 0.0, 0.0',
          payload='f_fam1(ti, 0, 3, 3) + f_fam1(ti, 4, 11, 7)',
          modules='\n'.join([MOD_A, PACKF, ENG_A, BITONF])),
-    dict(id='B', sid=2, n=6, nums=list(range(13, 19)), nx=25, xs=XB, tuple=6, eng='f_signalMasksB',
+    dict(id='B', sid=2, n=6, labels=['Logic13 TL Reb', 'Logic14 TL Brk', 'Logic15 H&S', 'Logic16 DT/DB', 'Logic17 Wedge', 'Logic18 Triangle'], goff=12, studyna='false', nums=list(range(13, 19)), nx=25, xs=XB, tuple=6, eng='f_signalMasksB',
          title='POINT MASTER SOURCE B 5M15M', short='PM-B-515', desc='Logic13〜18 : TL / 三尊 / DTB / ウェッジ / 三角形',
          map='0〜5 = Logic13〜18',
          layout='形状（Logic13〜18）= bit 3-6',
@@ -445,7 +516,7 @@ CFG = [
          ltfpre='nz(array.get(LTF_PLM, _i)), nz(array.get(LTF_PSM, _i)), 0.0, 0.0',
          payload='f_fam1(ti, 0, 5, 3)',
          modules='\n'.join([MOD_B, PACKF, ENG_B, BITONF])),
-    dict(id='C', sid=3, n=7, nums=list(range(19, 26)), sat=(24,), nx=7, xs=XC, tuple=8, eng='f_signalMasksC',
+    dict(id='C', sid=3, n=7, labels=['Logic19 Horiz Reb', 'Logic20 Horiz Brk', 'Logic21 Fib382', 'Logic22 Fib500', 'Logic23 Fib618', 'Logic24 SAT', 'Logic25 Stoch'], goff=18, studyna='false', nums=list(range(19, 26)), sat=(24,), nx=7, xs=XC, tuple=8, eng='f_signalMasksC',
          title='POINT MASTER SOURCE C 5M15M', short='PM-C-515', desc='Logic19〜25 : 水平線 / Fib / SAT / ストキャス',
          map='0〜1 = Logic19〜20 / 2〜4 = Logic21〜23 / 5 = Logic24 / 6 = Logic25',
          layout='価格帯（Logic19〜20）= bit 3-6 / Fib = bit 7-10 / SAT = bit 11-16（LONG 確認 11・統合 12-13、SHORT 確認 14・統合 15-16）/ ストキャス = bit 17-20',
