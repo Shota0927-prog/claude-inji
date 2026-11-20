@@ -1,0 +1,420 @@
+//@version=6
+// MAR-1: XAUUSD MA 単体の反応検証 (集計専用。注文・売買シグナル・アラートは出さない)
+//
+//  対象: ZoneComboLabXAU.pine の ZB と同じ「1分足 EMA」「5分足 EMA」(初期 3000 本・両方 ON。傾きによる選別なし)。
+//    raw1 = request.security(syminfo.tickerid, "1", ta.ema(close, len1), lookahead = barmerge.lookahead_off) / raw5 = ta.ema(close, len5)
+//  接触価格: 5分足 t では raw1[1] / raw5[1] (この 5分足の開始時に確定していた値。[1] は 5分足側の履歴参照で、request の中に [1] は入れない)。
+//    その足が完成した時点の raw は、その足の接触価格に使わない (足の途中で動かさない)。Lab は各 5分足の確定時に当該足の最新値を使うので
+//    1 本分の時刻差がある。
+//  受付: 系列ごとに接触済みフラグ。初回は raw[1] が有効になった 5分足から (待たせない)。方向不明を含め初回接触で立て、MA が動いても
+//    リセットしない。2 回目以後は直前の 5分足が有効・直前足の接触価格 Pprev も有効で、直前足の low > Pprev または high < Pprev の
+//    ときだけ。今回の接触は今回の Pcurr で判定する。MA が na の足はその系列の新規接触を休み、次足の離脱確認にも使わない
+//    (接触済みフラグと既存の観測は保持。MA の欠落だけでは観測を終了しない)。
+//  毎足の順序: 既存観測を固定 P で更新 → 今回 P で新規接触・接触足判定 (1分 EMA → 5分 EMA) → 次足用の高安・終値・P・有効フラグを保存。
+//  共通 (HorizontalLineReactionStatsXAU 79e8d2f の集計を再利用。観測の判定関数・不正足の処理・集計カウンタは同ファイルの写し):
+//    接触 = 確定 5分足の low <= P <= high (P = 基準価格そのもの。許容幅・帯幅 0)。始値 > P = 上から / < P = 下から /
+//    = P は直前の有効な 5分足の終値と今回の P を比較 (直前足が不正・終値も P と同じ = 方向不明。欄外に計上)。
+//    観測は接触時の P・系列・方向・時刻・ID を保存し、以後は P を固定して $5 / $10 / $20 を個別に追跡 (期限なし)。
+//    反発 = 上からなら P + d / 下からなら P − d、突破 = P −/+ B。反発先着 / 突破先着 / 順序不明 / 未決着、
+//    接触足の可能性フラグ、始値での先着、行き過ぎの下限 / 上限は水平線版と同じ。
+//    不正 OHLC (na / high < max(open, close) / low > min(open, close)): 新規接触 0、追跡中の未確定目標を順序不明で終了。
+//    不正足の高安・終値は次足の再接触・方向判定に使わない。価格はすべて最小ティックの整数で比較。
+//  tests/mar_sim.py がこの Logic 部分そのものを実行して検証する。
+indicator("MaReactionStatsXAU", shorttitle = "MAR XAU", overlay = true)
+
+// ---- 入力 -----------------------------------------------------------------------------------------------------
+var string G_MA = "01 · MA (ZoneComboLabXAU の ZB と同じ式)"
+maUse1 = input.bool(true, "1分足 EMA", group = G_MA)
+maLen1 = input.int(3000, "1分足 EMA 本数", minval = 1, group = G_MA)
+maUse2 = input.bool(true, "5分足 EMA", group = G_MA)
+maLen2 = input.int(3000, "5分足 EMA 本数", minval = 1, group = G_MA,
+     tooltip = "接触価格は各 5分足の開始時に確定していた EMA (raw[1])。接触した観測の基準価格はその値で固定。")
+
+var string G_JD = "02 · 判定"
+hlBreak = input.float(15.0, "突破幅 B ($)", minval = 0.01, step = 0.01, group = G_JD,
+     tooltip = "上からの接触: low <= P − B で突破 / 下からの接触: high >= P + B で突破。反発目標は $5 / $10 / $20 固定。\n" +
+     "境界の同値を含む。最小ティックの整数で比較し、幅は max(1, ceil(幅 / 最小ティック − 1e-9)) ティック。")
+
+var string G_DS = "03 · 表示 (集計値には影響しない)"
+hlView = input.string("集計", "表示", options = ["集計", "直近結果5件"], group = G_DS)
+
+// ---- MA (ZoneComboLabXAU の zbMa1 / zbMa2 と同じ式) と接触価格 ------------------------------------------------------
+float maRaw1 = request.security(syminfo.tickerid, "1", ta.ema(close, maLen1), lookahead = barmerge.lookahead_off)
+float maRaw2 = ta.ema(close, maLen2)
+float maP1 = maRaw1[1]
+float maP2 = maRaw2[1]
+
+// 標準 (通常ローソク足) の 5分チャートでだけ集計する
+bool hlRun = timeframe.isminutes and timeframe.multiplier == 5 and chart.is_standard
+
+// ==== MAR Logic (begin) ======================================================
+//  この区間はテストが Python に機械変換して実行する (履歴参照 x[1] を使わない・na との算術 / 比較をしない)。
+//  価格はすべて syminfo.mintick 単位の整数 (ティック)。観測の tf = 系列番号、sub = 0。
+
+// ==== HLR copy types (begin) — HorizontalLineReactionStatsXAU.pine 79e8d2f と同一 ====
+// 接触 1 回 = 観測 1 件。3 目標の結果を個別に持つ (線の接触受付とは独立)
+type HlObs
+    int   id
+    int   lineId
+    int   p
+    float pf
+    int   tf
+    int   sub
+    int   dr          // 1 上から / -1 下から
+    int   cTime       // 接触足の開始時刻
+    int   cBar
+    int   mx          // 接触以後・現在足より前に観測した最大の逆行幅 (ティック)
+    array<int>  st    // 目標ごと 0 未決着 / 1 反発先着 / 2 突破先着 / 3 順序不明
+    array<bool> fl    // 目標ごと「接触足で接触後に届いた可能性あり」(追跡中)
+    int   left = 3    // 未確定の目標数
+
+// 確定結果の記録 (表示用。直近の一定件数だけ保持し、集計値はカウンタで持つ)
+type HlRec
+    float pf
+    int   tf
+    int   sub
+    int   dr
+    int   cTime
+    int   j
+    int   res
+    int   exL
+    int   exH
+    int   dTime
+// ==== HLR copy types (end) ====
+
+type HlSt
+    int seq     = 0
+    int genSeq  = 0
+    int lastBar = na
+    bool pOk    = false   // 直前の 5分足が有効 (不正足・未処理なら false。pL / pH / pC は有効足のときだけ使う)
+    int pL      = na
+    int pH      = na
+    int pC      = na
+    int firstT  = na
+    int lastT   = na      // 最後の確定 5分足の time_close (集計期間の終了時刻)
+    int nBars   = 0
+    int nBad    = 0       // 不正足の件数
+
+int HL_REC_KEEP = 5       // 直近の確定結果は最新 5 件だけ保持 (集計はカウンタで全件)
+
+var HlSt hs = HlSt.new()
+var array<HlObs>  hlPend = array.new<HlObs>()        // 未確定の目標が残る観測 (観測 ID 順)
+var array<HlRec>  hlRec  = array.new<HlRec>()        // 直近の確定結果
+var array<int>    hlUnk  = array.new_int(2, 0)       // 系列ごとの方向不明接触
+var array<bool>   maHit  = array.new_bool(2, false)  // 接触済み (初回接触で立て、MA が動いてもリセットしない)
+var array<int>    maPrev = array.new_int(2, na)      // 直前の確定 5分足の接触価格 (ティック。na = 無効: MA 欠落・系列 OFF)
+var array<int>    maCur  = array.new_int(2, na)      // この足の接触価格 (ティック)
+var array<float>  maCurF = array.new_float(2, na)    // この足の接触価格 (raw[1] そのもの)
+var array<int>    maMiss = array.new_int(2, 0)       // MA 値が na だった確定足数
+// 集計の添字 = (系列 * 2 + 方向[上から 0 / 下から 1]) * 3 + 目標 (系列 0 = 1分 EMA / 1 = 5分 EMA)
+// ==== HLR copy counters (begin) — HorizontalLineReactionStatsXAU.pine 79e8d2f と同一 ====
+// 集計 (添字 = (時間足 * 2 + 方向[上から 0 / 下から 1]) * 3 + 目標)
+var array<int>    hcN  = array.new_int(24, 0)       // 接触数
+var array<int>    hcR  = array.new_int(24, 0)       // 反発先着
+var array<int>    hcB  = array.new_int(24, 0)       // 突破先着
+var array<int>    hcA  = array.new_int(24, 0)       // 順序不明 (確定)
+var array<int>    hcF  = array.new_int(24, 0)       // 順序不明 (可能性フラグのまま追跡中)
+var array<int>    hcS  = array.new_int(24, 0)       // 反発先着のうち最大行き過ぎが単一値
+var array<int>    hxLo = array.new_int(24, -1)      // 反発先着の行き過ぎ 下限の最大 (-1 = 例なし)
+var array<int>    hxHi = array.new_int(24, -1)      // 同 上限の最大
+// ==== HLR copy counters (end) ====
+
+// ==== HLR copy ticks (begin) — HorizontalLineReactionStatsXAU.pine 79e8d2f と同一 ====
+// 閾値 (ティック。値幅が指定幅以上になる最初のティック)
+f_hlTicks(float usd) =>
+    math.max(1, math.ceil(usd / syminfo.mintick - 1e-9))
+int        hlBT = f_hlTicks(hlBreak)
+array<int> hlDT = array.from(f_hlTicks(5.0), f_hlTicks(10.0), f_hlTicks(20.0))
+// ==== HLR copy ticks (end) ====
+
+f_maUse(int k) =>
+    k == 0 ? maUse1 : maUse2
+
+// ==== HLR copy idx (begin) — HorizontalLineReactionStatsXAU.pine 79e8d2f と同一 ====
+f_hlIdx(int tf, int dr, int j) =>
+    (tf * 2 + (dr == 1 ? 0 : 1)) * 3 + j
+
+f_hlInc(array<int> a, int ix, int v) =>
+    array.set(a, ix, array.get(a, ix) + v)
+    true
+// ==== HLR copy idx (end) ====
+
+// ==== HLR copy core (begin) — HorizontalLineReactionStatsXAU.pine 79e8d2f と同一 ====
+// 目標 j の結果を確定 (確定後は上書きしない)。res 1 反発 (exL..exH = 反発前の最大行き過ぎ) / 2 突破 / 3 順序不明
+f_hlDecide(HlObs ob, int j, int res, int exL, int exH) =>
+    int ix = f_hlIdx(ob.tf, ob.dr, j)
+    if array.get(ob.fl, j)
+        f_hlInc(hcF, ix, -1)
+        array.set(ob.fl, j, false)
+    array.set(ob.st, j, res)
+    ob.left -= 1
+    if res == 1
+        f_hlInc(hcR, ix, 1)
+        array.set(hxLo, ix, math.max(array.get(hxLo, ix), exL))
+        array.set(hxHi, ix, math.max(array.get(hxHi, ix), exH))
+        if exL == exH
+            f_hlInc(hcS, ix, 1)
+    else if res == 2
+        f_hlInc(hcB, ix, 1)
+    else
+        f_hlInc(hcA, ix, 1)
+    array.push(hlRec, HlRec.new(ob.pf, ob.tf, ob.sub, ob.dr, ob.cTime, j, res, exL, exH, time))
+    if array.size(hlRec) > HL_REC_KEEP
+        array.shift(hlRec)
+    true
+
+f_hlFlag(HlObs ob, int j) =>
+    array.set(ob.fl, j, true)
+    f_hlInc(hcF, f_hlIdx(ob.tf, ob.dr, j), 1)
+
+// 接触足。oN / hN / lN / cN = 接触方向に正規化した 始値 / 反発側極値 / 逆行側極値 / 終値 (線からのティック差。反発側が正)
+//  始値が線上 (oN = 0): 観測は始値から。片方だけ届けばその結果、両方なら順序不明。
+//  始値が線の外 (oN > 0): 始値・反発側極値は接触前の可能性あり。突破側だけ = 突破 / 両側 = 順序不明 /
+//   反発側だけ: 終値も目標以上なら反発先着 (接触後に届いたことが確定)、未満なら「接触後に届いた可能性あり」で追跡継続。
+//  接触足で反発先着なら行き過ぎ = 0 〜 この足の逆行側ヒゲ (M = 0 から。線の外の始値は接触前なので下限に入れない)。
+//  決着しない目標が残る場合、この足の逆行側極値は接触以後なので M に入れる。
+f_hlFirst(HlObs ob, int oN, int hN, int lN, int cN) =>
+    int adv = math.max(0, -lN)
+    bool b = lN <= -hlBT
+    for j = 0 to 2
+        int  d = array.get(hlDT, j)
+        bool r = hN >= d
+        if r and b
+            f_hlDecide(ob, j, 3, na, na)
+        else if b
+            f_hlDecide(ob, j, 2, na, na)
+        else if r
+            if oN == 0 or cN >= d
+                f_hlDecide(ob, j, 1, 0, adv)
+            else
+                f_hlFlag(ob, j)
+    ob.mx := adv
+    true
+
+// 接触の次足以降 (未確定の目標だけ)。
+//  始値が既に閾値に届いていれば始値が先 (反発: 行き過ぎ = M、この足のヒゲは入れない / 突破)。
+//  始値が両閾値の間: 片方だけ届けばその結果、両方なら順序不明。反発の行き過ぎ 下限 = max(M, 始値の逆行幅)、上限 = max(下限, 逆行側ヒゲ)。
+//  可能性フラグ付き: 先に突破を観測したら順序不明。確実な反発なら反発先着で下限 0 (上限は上と同じ)。
+f_hlNext(HlObs ob, int oN, int hN, int lN) =>
+    int  adv  = math.max(0, -lN)
+    int  oAdv = math.max(0, -oN)
+    bool b    = lN <= -hlBT
+    for j = 0 to 2
+        if array.get(ob.st, j) == 0
+            int  d = array.get(hlDT, j)
+            bool f = array.get(ob.fl, j)
+            if oN >= d
+                f_hlDecide(ob, j, 1, f ? 0 : ob.mx, ob.mx)
+            else if oN <= -hlBT
+                f_hlDecide(ob, j, f ? 3 : 2, na, na)
+            else
+                bool r = hN >= d
+                if r and b
+                    f_hlDecide(ob, j, 3, na, na)
+                else if r
+                    int lo = math.max(ob.mx, oAdv)
+                    f_hlDecide(ob, j, 1, f ? 0 : lo, math.max(lo, adv))
+                else if b
+                    f_hlDecide(ob, j, f ? 3 : 2, na, na)
+    ob.mx := math.max(ob.mx, adv)
+    true
+// ==== HLR copy core (end) ====
+
+if hlRun and barstate.isconfirmed
+    // ==== HLR copy bar (begin) — HorizontalLineReactionStatsXAU.pine 79e8d2f と同一 ====
+    bool bad = na(open) or na(high) or na(low) or na(close) or high < math.max(open, close) or low > math.min(open, close)
+    int oT = bad ? int(na) : math.round(open  / syminfo.mintick)
+    int hT = bad ? int(na) : math.round(high  / syminfo.mintick)
+    int lT = bad ? int(na) : math.round(low   / syminfo.mintick)
+    int cT = bad ? int(na) : math.round(close / syminfo.mintick)
+
+    if bad
+        // (0) 不正足: 追跡中の未確定目標をすべて順序不明で終了し、新規接触は数えない
+        hs.nBad += 1
+        while array.size(hlPend) > 0
+            HlObs ob = array.shift(hlPend)
+            for j = 0 to 2
+                if array.get(ob.st, j) == 0
+                    f_hlDecide(ob, j, 3, na, na)
+    else
+        // (1) 追跡中の観測をこの足で更新 (前回分の目標と今回の再接触は独立)
+        int i = 0
+        while i < array.size(hlPend)
+            HlObs ob = array.get(hlPend, i)
+            int pp = ob.p
+            if ob.dr == 1
+                f_hlNext(ob, oT - pp, hT - pp, lT - pp)
+            else
+                f_hlNext(ob, pp - oT, pp - lT, pp - hT)
+            if ob.left == 0
+                array.remove(hlPend, i)
+            else
+                i += 1
+    // ==== HLR copy bar (end) ====
+
+    // (2) 今回の接触価格 P = raw[1] で新規接触・接触足判定 (1分 EMA → 5分 EMA)
+    array<float> mv = array.from(maP1, maP2)
+    for k = 0 to 1
+        float pv = f_maUse(k) ? array.get(mv, k) : float(na)
+        int   pp = na(pv) ? int(na) : math.round(pv / syminfo.mintick)
+        if f_maUse(k) and na(pv)
+            f_hlInc(maMiss, k, 1)
+        array.set(maCur, k, pp)
+        array.set(maCurF, k, pv)
+        if not bad and not na(pp)
+            if lT <= pp and pp <= hT
+                // 初回: いつでも (raw[1] が有効な足から)。2 回目以後: 直前足が有効・直前足の P も有効で、直前足が Pprev からまるごと離れている
+                int  pq  = array.get(maPrev, k)
+                bool acc = array.get(maHit, k) ? (hs.pOk and not na(pq) and (hs.pL > pq or hs.pH < pq)) : true
+                if acc
+                    array.set(maHit, k, true)
+                    int dr = oT > pp ? 1 : oT < pp ? -1 : not hs.pOk ? 0 : hs.pC > pp ? 1 : hs.pC < pp ? -1 : 0
+                    if dr == 0
+                        f_hlInc(hlUnk, k, 1)
+                    else
+                        hs.seq += 1
+                        HlObs ob = HlObs.new(hs.seq, k, pp, pv, k, 0, dr, time, bar_index, 0, array.new_int(3, 0), array.new_bool(3, false), 3)
+                        for j = 0 to 2
+                            f_hlInc(hcN, f_hlIdx(k, dr, j), 1)
+                        if dr == 1
+                            f_hlFirst(ob, oT - pp, hT - pp, lT - pp, cT - pp)
+                        else
+                            f_hlFirst(ob, pp - oT, pp - lT, pp - hT, pp - cT)
+                        if ob.left > 0
+                            array.push(hlPend, ob)
+
+    // (3) 次足用
+    for k = 0 to 1
+        array.set(maPrev, k, array.get(maCur, k))
+    // 次足用: この足の高値・安値・終値 (有効足だけ) を保存
+    hs.pOk := not bad
+    hs.pL := lT
+    hs.pH := hT
+    hs.pC := cT
+    hs.lastBar := bar_index
+    if na(hs.firstT)
+        hs.firstT := time
+    hs.lastT := time_close
+    hs.nBars += 1
+// ==== MAR Logic (end) ========================================================
+
+f_serName(int k) =>
+    k == 0 ? "1分EMA" + str.tostring(maLen1) : "5分EMA" + str.tostring(maLen2)
+
+// ---- 表示 (集計値には影響しない。右上の 1 表で「集計」/「直近結果5件」を切り替える) -----------------------------------
+f_usd(int t) =>
+    "$" + str.tostring(t * syminfo.mintick, format.mintick)
+
+f_pct(int a, int n) =>
+    n == 0 ? "—" : str.tostring(100.0 * a / n, "0.0") + "%"
+
+f_tm(int t) =>
+    na(t) ? "—" : str.format_time(t, "yyyy-MM-dd HH:mm", "Asia/Tokyo")
+
+f_resName(int r) =>
+    r == 1 ? "反発先着" : r == 2 ? "突破先着" : r == 3 ? "順序不明" : "未決着"
+
+f_ex(int lo, int hi) =>
+    na(lo) or lo < 0 ? "—" : lo == hi ? f_usd(lo) : f_usd(lo) + "～" + f_usd(hi)
+
+color HL_HEAD = color.new(color.gray, 20)
+color HL_BG   = color.new(color.black, 15)
+color HL_BG2  = color.new(color.navy, 30)
+color HL_TX   = color.white
+
+f_cell(table t, int c, int r, string s, color bg) =>
+    table.cell(t, c, r, s, text_color = HL_TX, bgcolor = bg, text_size = size.small)
+
+f_note(table t, int r, int ncol, string s) =>
+    f_cell(t, 0, r, s, HL_HEAD)
+    if ncol > 1
+        table.merge_cells(t, 0, r, ncol - 1, r)
+    table.cell_set_text_halign(t, 0, r, text.align_left)
+
+var table hlTbl = na
+
+if barstate.islast
+    if not na(hlTbl)
+        table.delete(hlTbl)
+    if not hlRun
+        hlTbl := table.new(position.top_right, 1, 2, border_width = 1)
+        f_cell(hlTbl, 0, 0, "MAR XAU: 集計停止", HL_HEAD)
+        f_cell(hlTbl, 0, 1, "標準5分足で使用してください (XAUUSD の通常ローソク足 5分チャート)。現在: " + timeframe.period + (chart.is_standard ? "" : " (非標準チャート)"), HL_BG)
+    else if hlView == "集計"
+        int nSer = 0
+        for k = 0 to 1
+            nSer += f_maUse(k) ? 1 : 0
+        array<string> notes = array.new_string(0)
+        string unk = "方向不明接触 (表の N に含めない): "
+        int nUnk = 0
+        for k = 0 to 1
+            if f_maUse(k)
+                unk += f_serName(k) + " " + str.tostring(array.get(hlUnk, k)) + "  "
+                nUnk += array.get(hlUnk, k)
+        array.push(notes, unk + "(計 " + str.tostring(nUnk) + ")")
+        array.push(notes, "不正5分足 (OHLC が na / 高値 < max(始値, 終値) / 安値 > min(始値, 終値)): " + str.tostring(hs.nBad) + " 本 (その足の新規接触 0、追跡中の未確定目標は順序不明で終了)   追跡中の観測: " + str.tostring(array.size(hlPend)) + " 件")
+        array.push(notes, "銘柄 " + syminfo.tickerid + "  取得した確定 5分足 " + str.tostring(hs.nBars) + " 本  " + f_tm(hs.firstT) + " ～ " + f_tm(hs.lastT) + " (Asia/Tokyo・最初の time ～ 最後の time_close)")
+        array.push(notes, "突破幅 B = " + f_usd(hlBT) + "  反発目標 $5 / $10 / $20。% の分母 N = 反発先着 + 突破先着 + 順序不明 + 未決着 (方向の分かる全接触)。決着例内反発率 = 反発先着 ÷ (反発先着 + 突破先着)")
+        array.push(notes, "順序不明の (内) = 接触足で届いた可能性が残り追跡中の件数。最大行き過ぎ = 反発先着の各下限の最大～各上限の最大 (括弧内 = 単一値が求まった件数 / 反発先着)")
+        string miss = "MA 値欠落足 (新規接触を休止した確定足): "
+        for k = 0 to 1
+            if f_maUse(k)
+                miss += f_serName(k) + " " + str.tostring(array.get(maMiss, k)) + " 本  "
+        array.push(notes, miss)
+        array.push(notes, "MA接触は5分足開始時の確定値、接触後の基準価格は固定 (5分足 t の接触価格 = raw[1]。Lab が確定時に使う当該足の最新 MA とは 1 本の時刻差)")
+        int nNote = array.size(notes)
+        hlTbl := table.new(position.top_right, 10, 1 + nSer * 6 + nNote, border_width = 1)
+        array<string> hd = array.from("系列", "到達", "目標", "N (接触数)", "反発先着 件数 (%)", "突破先着 件数 (%)", "順序不明 (内 追跡中)", "未決着", "反発前の最大行き過ぎ (単一値件数)", "決着例内反発率")
+        for c = 0 to 9
+            f_cell(hlTbl, c, 0, array.get(hd, c), HL_HEAD)
+        int row = 1
+        for k = 0 to 1
+            if f_maUse(k)
+                for di = 0 to 1
+                    for j = 0 to 2
+                        int ix = (k * 2 + di) * 3 + j
+                        int n  = array.get(hcN, ix)
+                        int r  = array.get(hcR, ix)
+                        int b  = array.get(hcB, ix)
+                        int fa = array.get(hcF, ix)
+                        int a  = array.get(hcA, ix) + fa
+                        int u  = n - r - b - a
+                        color bg = di == 0 ? HL_BG : HL_BG2
+                        f_cell(hlTbl, 0, row, f_serName(k), bg)
+                        f_cell(hlTbl, 1, row, di == 0 ? "上から" : "下から", bg)
+                        f_cell(hlTbl, 2, row, "$" + str.tostring(array.get(array.from(5, 10, 20), j)), bg)
+                        f_cell(hlTbl, 3, row, str.tostring(n), bg)
+                        f_cell(hlTbl, 4, row, str.tostring(r) + " (" + f_pct(r, n) + ")", bg)
+                        f_cell(hlTbl, 5, row, str.tostring(b) + " (" + f_pct(b, n) + ")", bg)
+                        f_cell(hlTbl, 6, row, str.tostring(a) + (fa > 0 ? " (内 " + str.tostring(fa) + ")" : ""), bg)
+                        f_cell(hlTbl, 7, row, str.tostring(u), bg)
+                        f_cell(hlTbl, 8, row, r == 0 ? "—" : f_ex(array.get(hxLo, ix), array.get(hxHi, ix)) + " (" + str.tostring(array.get(hcS, ix)) + "/" + str.tostring(r) + ")", bg)
+                        f_cell(hlTbl, 9, row, f_pct(r, r + b), bg)
+                        row += 1
+        for m = 0 to nNote - 1
+            f_note(hlTbl, row + m, 10, array.get(notes, m))
+    else
+        int nr = math.min(5, array.size(hlRec))
+        hlTbl := table.new(position.top_right, 7, 7, border_width = 1)
+        f_note(hlTbl, 0, 7, "直近の確定結果 5 件 (新しい順・日本時間)")
+        array<string> rh = array.from("接触時刻 (JST)", "基準価格", "系列", "接触方向", "目標", "結果", "反発前の最大行き過ぎ")
+        for c = 0 to 6
+            f_cell(hlTbl, c, 1, array.get(rh, c), HL_HEAD)
+        if nr == 0
+            f_note(hlTbl, 2, 7, "確定した結果はまだありません")
+        else
+            for q = 1 to nr
+                HlRec rc = array.get(hlRec, array.size(hlRec) - q)
+                f_cell(hlTbl, 0, q + 1, f_tm(rc.cTime), HL_BG)
+                f_cell(hlTbl, 1, q + 1, str.tostring(rc.pf, format.mintick), HL_BG)
+                f_cell(hlTbl, 2, q + 1, f_serName(rc.tf), HL_BG)
+                f_cell(hlTbl, 3, q + 1, rc.dr == 1 ? "上から" : "下から", HL_BG)
+                f_cell(hlTbl, 4, q + 1, "$" + str.tostring(array.get(array.from(5, 10, 20), rc.j)), HL_BG)
+                f_cell(hlTbl, 5, q + 1, f_resName(rc.res), HL_BG)
+                f_cell(hlTbl, 6, q + 1, rc.res == 1 ? f_ex(rc.exL, rc.exH) : "—", HL_BG)
+
+int hlTotN = 0
+for x = 0 to 3
+    hlTotN += array.get(hcN, x * 3)
+plot(hlTotN, "接触数 (方向あり・累計)", display = display.data_window)
+plot(array.size(hlPend), "追跡中の観測", display = display.data_window)
