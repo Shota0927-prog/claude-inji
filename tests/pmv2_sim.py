@@ -406,3 +406,90 @@ st3 = readiness(bars3)
 check("stale 15M bar time -> 4 (not ready), then re-warm", st3[20] == 4 and st3[21] == 1)
 check("missing last 1-minute bar tolerated, invalid value -> 4", readiness(bars[:25] + [row(T0 + 25 * M5, drop1=True)])[-1] == 0 and readiness(bars[:25] + [row(T0 + 25 * M5, vok=False)])[-1] == 4)
 print(f"{ok} checks passed (model only; not a Pine run)")
+
+# ---- 関数化・式化（スコープ削減版）が前版の if 版と同じ遷移になるか（ランダム比較）
+def bstep_expr(st, di, close, curT, intT, famT, newPL, newPH, lastPL, lastPLneg, lastPH, lastPHneg, P=(2.0, 2.0, 2, 2)):
+    """PointMasterFvgAbsReboundV2.pine f_v2BStep の式版をそのまま写したもの。st = dict(ep, cau, after, rec, basis, bstat)"""
+    min_pts, warn_pts, warn_fams, N = P
+    D = 1 if di == 0 else -1; od = 1 - di
+    own5, opp5, own15, opp15 = curT[(1, di)], curT[(1, od)], curT[(2, di)], curT[(2, od)]
+    c5 = own5 >= min_pts and own5 > opp5
+    c15 = own15 >= min_pts and own15 > opp15
+    warn = (intT[(0, od)] >= warn_pts and famT[(0, od)] >= warn_fams) or (intT[(1, od)] >= warn_pts and famT[(1, od)] >= warn_fams)
+    ep, cau, after, rec, basis, bstat = st['ep'], st['cau'], st['after'], st['rec'], st['basis'], st['bstat']
+    lt = lambda a, b: a is not None and b is not None and a < b
+    breach = ep and basis is not None and (lt(close, basis) if D == 1 else lt(basis, close))
+    basisUp = (newPL if (newPL is not None and close > newPL and lt(basis, newPL)) else basis) if D == 1 else (newPH if (newPH is not None and close < newPH and lt(newPH, basis)) else basis)
+    lastP = (newPL if newPL is not None else lastPL) if D == 1 else (newPH if newPH is not None else lastPH)
+    lastNeg = (False if newPL is not None else lastPLneg) if D == 1 else (False if newPH is not None else lastPHneg)
+    startOk = lastP is not None and not lastNeg and (lastP < close if D == 1 else lastP > close)
+    cand = c5 and c15 and (ep or startOk) and not warn
+    rc = rec + 1
+    inEp = ep and not breach
+    startNow = (not ep) and cand and ((not after) or rc >= N)
+    code = 3 if breach else ((1 if (not cau or rc >= N) else 2) if cand else 2) if inEp else ((1 if startNow else 2) if cand else (2 if warn else 0))
+    epN = False if breach else True if inEp else startNow
+    cauN = False if breach else ((cau and rc < N) if cand else True) if inEp else False
+    afterN = True if breach else False if startNow else after
+    recN = 0 if breach else (((0 if rc >= N else rc) if cau else rec) if cand else 0) if inEp else ((0 if startNow else rc) if cand else 0)
+    basisN = None if breach else basisUp if inEp else lastP if startNow else basis
+    bstatN = 2 if breach else 1 if startNow else (0 if (not epN and bstat == 1) else bstat)
+    st.update(ep=epN, cau=cauN, after=afterN, rec=recN, basis=basisN, bstat=bstatN)
+    return code
+
+random.seed(11)
+bif = ModeB(); sts = [dict(ep=False, cau=False, after=False, rec=0, basis=None, bstat=0) for _ in (0, 1)]
+lpl = lph = None; lpln = lphn = False
+same = True
+for t in range(1, 3000):
+    c = round(2000 + 25 * math.sin(t / 20) + random.uniform(-4, 4), 2)
+    pts = mkpts(*(random.randint(0, 3) for _ in range(4)), *(random.choice([0, 1.0, 2.0, 2.5]) for _ in range(2)), *(random.randint(0, 3) for _ in range(2)),
+                *(random.choice([0, 1.0, 2.0, 2.5]) for _ in range(2)), *(random.randint(0, 3) for _ in range(2)))
+    npl = round(c - random.uniform(0.5, 8), 2) if random.random() < 0.15 else None
+    nph = round(c + random.uniform(0.5, 8), 2) if random.random() < 0.15 else None
+    # 呼び出し側（Pine の確定足ブロック）と同じ順：直近ピボットの否定 → 判定 → 新ピボット記録
+    lpln = lpln or (lpl is not None and c < lpl); lphn = lphn or (lph is not None and c > lph)
+    e = [bstep_expr(sts[di], di, c, *pts, npl, nph, lpl, lpln, lph, lphn) for di in (0, 1)]
+    lpln = lpln if npl is None else c < npl; lpl = lpl if npl is None else npl
+    lphn = lphn if nph is None else c > nph; lph = lph if nph is None else nph
+    r = bif.bar(t, c, *pts, newPL=npl, newPH=nph)
+    same = same and r == e and all(sts[di]['ep'] == bif.ep[di] and sts[di]['basis'] == bif.basis[di] and sts[di]['rec'] == bif.rec[di] for di in (0, 1))
+check("B expression form (f_v2BStep) == previous if form on 3000 random bars", same)
+
+def apply_expr(v, ti, close, sigs, levels=None, slopes=None, ema=None, hi=None, lo=None, fib_inv=(), hold=6):
+    """f_v2ApplyTf の式版（ロジック × 方向を index で分離）"""
+    levels, slopes = levels or {}, slopes or {}
+    for li in range(N_LOGIC):
+        rule = RULE[li]; isSt = rule == 3
+        sig = sigs.get(li); sigL, sigS = sig == 'L', sig == 'S'
+        fibInv = li in (20, 21, 22) and li in fib_inv
+        for d in (0, 1):
+            e = v.setdefault((li, ti, d), dict(valid=False, price=False, rem=0, age=0, lvl=None, slp=0.0))
+            reg, opp = (sigL, sigS) if d == 0 else (sigS, sigL)
+            aging = e['valid'] and not isSt
+            age1 = e['age'] + (1 if aging else 0); rem1 = e['rem'] - (1 if aging else 0)
+            lv = ema if rule == 1 else (None if e['lvl'] is None else e['lvl'] + e['slp'] * age1)
+            negd = aging and rem1 > 0 and rule != 2 and e['price'] and lv is not None and ((d == 0 and close < lv) or (d == 1 and close > lv))
+            alive = e['valid'] and rem1 > 0 and not negd
+            lvN = (lo if d == 0 else hi) if rule == 4 else levels.get((li, d))
+            pOk = rule == 2 or (ema is not None if rule == 1 else lvN is not None)
+            regNew = reg and not isSt
+            e.update(valid=(reg if isSt else (True if reg else False if opp else alive)) and not fibInv,
+                     price=True if isSt else pOk if regNew else e['price'], rem=hold if regNew else rem1, age=0 if regNew else age1,
+                     lvl=lvN if regNew else e['lvl'], slp=slopes.get((li, d), 0.0) if regNew else e['slp'])
+
+random.seed(5)
+evA = Evidence(hold=6); vB = {}
+same = True
+for t in range(1500):
+    c = 100 + random.uniform(-5, 5)
+    sigs = {li: random.choice('LS') for li in random.sample(range(N_LOGIC), 3)}
+    lv = {(li, 0 if s == 'L' else 1): c + (random.uniform(-3, 0) if s == 'L' else random.uniform(0, 3)) for li, s in sigs.items() if RULE[li] == 0 and random.random() < 0.9}
+    sl = {k: random.uniform(-0.3, 0.3) for k in lv}
+    ema = c + random.uniform(-2, 2)
+    fi = tuple(li for li in (20, 21, 22) if random.random() < 0.05)
+    evA.apply(1, c, sigs, lv, sl, ema, c + 1, c - 1, fi)
+    apply_expr(vB, 1, c, sigs, lv, sl, ema, c + 1, c - 1, fi)
+    same = same and all(evA.cur(li, 1, d) == (vB[(li, 1, d)]['valid'] and vB[(li, 1, d)]['price']) for li in range(N_LOGIC) for d in (0, 1))
+check("evidence expression form (f_v2ApplyTf) == previous if form on 1500 random TF bars", same)
+print(f"{ok} checks passed after refactor comparison (model only; not a Pine run)")
