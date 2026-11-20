@@ -1,0 +1,408 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © point_master
+
+//@version=5
+// =====================================================================================
+// POINT MASTER VERIFIER  ―  HOLD / 手仕舞い 判定の検証（VERIFY V1・read-only）
+// =====================================================================================
+// POINT MASTER FVG ABS REBOUND（元インジ）の判定を、別インジとして検証します。
+// 判定ロジックは一切複製しません。元インジの2出力を input.source で受け取るだけです。
+//   ・PHASE CODE         : 0 NEUTRAL / ±1 HOLD / ±2 CAUTION / ±3 PARTIAL TP / ±4 FULL TP
+//   ・VALIDATED TP CODE  : 0 none / ±1 ARMED / ±2 FULL TP（Signal 足）/ ±3 DONE
+//   （+ = LONG / - = SHORT）
+//
+// 【使い方】
+//   1. 同じ 5分足チャートに「POINT MASTER FVG ABS REBOUND」と、このインジを追加する
+//   2. このインジの設定 ⓪ 接続 で
+//        PHASE CODE 入力        → "POINT MASTER FVG ABS REBOUND: PHASE CODE"
+//        VALIDATED TP CODE 入力 → "POINT MASTER FVG ABS REBOUND: VALIDATED TP CODE"
+//      を選ぶ（未設定 / 範囲外の値では集計せず、テーブルに設定案内を表示）
+//
+// 【検証対象】（PHASE と VALID TP は別判定なので別行・混ぜない）
+//   type 0 : PHASE HOLD        abs(PHASE CODE) == 1
+//   type 1 : PHASE PARTIAL TP  abs(PHASE CODE) == 3
+//   type 2 : PHASE FULL TP     abs(PHASE CODE) == 4
+//   type 3 : VALID FULL TP     abs(VALIDATED TP CODE) == 2
+//   CAUTION / TP ARMED / TP DONE は対象外。「VALID TP が出ていない」ことは HOLD として数えない。
+//
+// 【イベント作成】5分足チャートの確定足（barstate.isconfirmed）だけ
+//   PHASE    : 確定足同士で受信 PHASE CODE を比較し、対象コードへ「切り替わった」足で1件。
+//              同じコードの継続では増えない（HOLD 10本 → 最初の1件のみ）。
+//              CAUTION → HOLD / PARTIAL TP → FULL TP / LONG HOLD → SHORT HOLD はそれぞれ新規1件。
+//              最初に受信できた確定足のコードは比較の基準にするだけ（イベントにしない）。
+//              受信が不正になった足では基準を破棄し、正常に戻った最初の足を新たな基準にする。
+//   VALID TP : 確定足で abs(VALIDATED TP CODE) == 2 の足を1件。
+//   方向 d   : 受信コードの符号（+ = LONG +1 / - = SHORT -1）を保存し、以後変えない。
+//   基準価格 : 判定足の終値 P0 / 発生時刻 = 判定足の確定時刻（time_close）
+//   ※ 評価するのは「5分足確定時点の判定」。元インジの足途中の表示・通知は検証していない。
+//
+// 【観察】判定足の「次の足」から（判定足自身の高安は含めない）
+//   5分後 = 1本 / 15分後 = 3本 / 30分後 = 6本。評価時点 P1 = その本数目の足の終値。
+//   R   = d × (P1 − P0)   >0 順行 / <0 逆行 / =0 変化なし（終点の結果）
+//   MFE = LONG: max(0, 期間高値 − P0)  SHORT: max(0, P0 − 期間安値)
+//   MAE = LONG: max(0, P0 − 期間安値)  SHORT: max(0, 期間高値 − P0)
+//   先着 : P0 ± 先着幅 のどちらへ先に到達したか（順行先 / 逆行先 / 順序不明 / 未到達）。
+//          最初の到達足で両方に触れたら「順序不明」。一度決まった結果は書き換えない。
+//          各観察期間の4区分の分母はその期間の評価済み件数（合計100%）。
+//
+// 【未完了 / 欠損】
+//   ・観察期間の最後の足が確定するまでは「評価待ち」（率の分母に入れない）
+//   ・観察中に5分足の時刻が途切れたら（週末 / 日次休場 / データ欠け）、未評価の期間は「データ欠損」で除外
+//   ・判定が切り替わっても、開始済みイベントは30分後まで個別に追跡を続ける
+//     （観察はこのチャートの OHLC / time だけで行うため、受信値に依存しない）
+//   ・30分後の評価が終わったイベントは追跡配列から削除し、集計値（件数・合計）だけを残す
+//
+// request.* は使いません。表示される率は「読み込めた履歴データの範囲で計測した頻度」であり、
+// 将来の確率を保証しません。
+// =====================================================================================
+indicator(
+     title     = "POINT MASTER VERIFIER",
+     shorttitle = "PM-VERIFY",
+     overlay   = true
+ )
+
+// =====================================================================================
+// §0. 接続（元インジの出力を選択）
+// =====================================================================================
+grpVfIn = "⓪ 接続（元インジの出力を選択）"
+vfSrcPhase = input.source(close, "PHASE CODE 入力", group = grpVfIn,
+     tooltip = "POINT MASTER FVG ABS REBOUND を同じ5分足チャートに追加し、\"PHASE CODE\" を選択してください。" +
+     "未選択（close など）/ -4〜+4 の整数以外では集計しません。")
+vfSrcVt    = input.source(close, "VALIDATED TP CODE 入力", group = grpVfIn,
+     tooltip = "POINT MASTER FVG ABS REBOUND の \"VALIDATED TP CODE\" を選択してください。" +
+     "未選択（close など）/ -3〜+3 の整数以外では集計しません。")
+
+// =====================================================================================
+// §1. 検証設定
+// =====================================================================================
+grpVf = "① HOLD / 手仕舞い 検証"
+vfShow    = input.bool(true, "検証テーブルを表示", group = grpVf)
+vfStart   = input.time(timestamp("01 Jan 2020 00:00 +0000"), "集計開始日時 (判定足の確定時刻)", group = grpVf)
+vfDirMode = input.string("LONG＋SHORT合算", "方向", options = ["LONG＋SHORT合算", "LONGのみ", "SHORTのみ"], group = grpVf)
+vfHzMode  = input.string("全期間", "表示する観察期間", options = ["全期間", "5分", "15分", "30分"], group = grpVf)
+vfView    = input.string("終点", "表示切替", options = ["終点", "最大値幅", "先着"], group = grpVf,
+     tooltip = "終点 = 一定時間後の終値で見た順行率 / 逆行率 / 平均値幅 / 閾値到達率。" +
+     "最大値幅 = 観察期間中の平均MFE / MAE。先着 = 順行幅と逆行幅のどちらへ先に到達したか。")
+vfTh1     = input.float(5.0,  "値幅閾値1 ($)", group = grpVf, inline = "vfth", minval = 0.01, step = 0.5)
+vfTh2     = input.float(10.0, "値幅閾値2 ($)", group = grpVf, inline = "vfth", minval = 0.01, step = 0.5)
+vfRace    = input.float(10.0, "先着判定の値幅 ($)", group = grpVf, minval = 0.01, step = 0.5,
+     tooltip = "XAUUSD の価格差（口座損益ではない）。基準価格から ±この値幅 のどちらへ先に到達したかを判定します。")
+
+grpVfView = "② 表示設定"
+vfPos     = input.string(position.bottom_right, "表示位置", group = grpVfView,
+     options = [position.bottom_right, position.bottom_left, position.middle_right, position.middle_left, position.top_left, position.bottom_center],
+     tooltip = "元インジのテーブルは右上です。重ならない位置を選んでください。")
+tblSize   = input.string(size.small, "文字サイズ", options = [size.tiny, size.small, size.normal, size.large], group = grpVfView)
+colBg     = input.color(color.new(#1e222d, 20), "背景色", group = grpVfView)
+colTxt    = input.color(color.new(#d1d4dc, 0),  "文字色", group = grpVfView)
+
+// =====================================================================================
+// §2. 定数 / 状態
+// =====================================================================================
+bool  isChart5M     = timeframe.isminutes and timeframe.multiplier == 5
+int   VF_NT         = 4        // 判定の種類
+int   VF_NH         = 3        // 観察期間 0 = 5分 / 1 = 15分 / 2 = 30分
+int   VF_NS         = 16       // 1セルあたりの集計項目数
+int   VF_BAR_MS     = 300000   // 5分足1本（ms）
+int   VF_MAX_ACTIVE = 200      // 追跡中イベントの上限（通常は十数件。超過分は欠損扱いで破棄）
+float VF_TOL        = 1e-6     // 閾値比較の浮動小数誤差の許容
+
+// 集計項目（index = f_vfIdx(type, dirIdx, h) + 下記）
+//   0 評価済 / 1 順行 / 2 逆行 / 3 変化なし / 4 R合計 / 5 順行>=閾値1 / 6 順行>=閾値2 /
+//   7 逆行>=閾値1 / 8 逆行>=閾値2 / 9 MFE合計 / 10 MAE合計 /
+//   11 先着:順行先 / 12 先着:逆行先 / 13 先着:順序不明 / 14 先着:未到達 / 15 データ欠損
+var VF_ST = array.new_float(VF_NT * 2 * VF_NH * VF_NS, 0.0)
+
+// 追跡中イベント（並列配列。30分後の評価完了 / 欠損で削除）
+var VF_ETYPE = array.new_int()     // 判定の種類 0〜3
+var VF_EDIR  = array.new_int()     // 判定時の方向 +1 / -1（以後変更しない）
+var VF_EP0   = array.new_float()   // 基準価格 = 判定足の終値
+var VF_ET0   = array.new_int()     // 判定足の開始時刻（time）。k本目の足は ET0 + k × 5分 で始まるはず
+var VF_EK    = array.new_int()     // 処理済みの経過本数（0 = 判定足のみ）
+var VF_EHI   = array.new_float()   // 判定足の次の足からの最高値
+var VF_ELO   = array.new_float()   // 判定足の次の足からの最安値
+var VF_ERACE = array.new_int()     // 先着 0 未決定 / 1 順行先 / 2 逆行先 / 3 順序不明（決定後は不変）
+
+var int vfPrevPhase = na           // 前の確定足の受信 PHASE CODE（na = 基準なし）
+var int vfLastBar   = 0            // 処理済み確定足の time（同じ足を二重集計しない）
+var int vfValidBars = 0            // 受信値が正常だった確定足の本数
+var int vfBadBars   = 0            // 受信値が不正だった確定足の本数
+var int vfEvents    = 0            // 登録したイベント総数
+
+// =====================================================================================
+// §3. 受信値の検査
+// =====================================================================================
+// 整数かつ範囲内のときだけ有効。未選択（既定の close）は XAUUSD の価格なので範囲外 → 無効。
+f_vfCode(float v, int lim) =>
+    bool okv = not na(v) and math.abs(v - math.round(v)) < 1e-6 and math.abs(v) <= lim + 1e-6
+    okv ? int(math.round(v)) : na
+
+int  vfPhaseIn = f_vfCode(vfSrcPhase, 4)
+int  vfVtIn    = f_vfCode(vfSrcVt, 3)
+bool vfInputOk = not na(vfPhaseIn) and not na(vfVtIn)
+
+// =====================================================================================
+// §4. イベント追跡 / 集計
+// =====================================================================================
+// 観察期間 h の本数
+f_vfHBars(int h) =>
+    h == 0 ? 1 : h == 1 ? 3 : 6
+
+// 集計セルの先頭 index（dirIdx 0 = LONG / 1 = SHORT）
+f_vfIdx(int tp, int dirIdx, int h) =>
+    ((tp * 2 + dirIdx) * VF_NH + h) * VF_NS
+
+f_vfAdd(array<float> st, int base, int s, float v) =>
+    array.set(st, base + s, array.get(st, base + s) + v)
+
+// 1イベント × 1観察期間 の確定集計（観察期間の最後の足の確定時に1回だけ呼ぶ）
+f_vfFinalize(array<float> st, int tp, int d, int h, float p0, float p1, float hi, float lo, int race, float th1, float th2) =>
+    int   base = f_vfIdx(tp, d == 1 ? 0 : 1, h)
+    float eps  = syminfo.mintick * 0.5
+    float r    = d * (p1 - p0)
+    float mfe  = d == 1 ? math.max(0.0, hi - p0) : math.max(0.0, p0 - lo)
+    float mae  = d == 1 ? math.max(0.0, p0 - lo) : math.max(0.0, hi - p0)
+    f_vfAdd(st, base, 0, 1.0)
+    f_vfAdd(st, base, r > eps ? 1 : r < -eps ? 2 : 3, 1.0)
+    f_vfAdd(st, base, 4, r)
+    f_vfAdd(st, base, 5, r >= th1 - VF_TOL ? 1.0 : 0.0)
+    f_vfAdd(st, base, 6, r >= th2 - VF_TOL ? 1.0 : 0.0)
+    f_vfAdd(st, base, 7, r <= -th1 + VF_TOL ? 1.0 : 0.0)
+    f_vfAdd(st, base, 8, r <= -th2 + VF_TOL ? 1.0 : 0.0)
+    f_vfAdd(st, base, 9, mfe)
+    f_vfAdd(st, base, 10, mae)
+    // この期間の最後の足までに決まっていた先着結果（未決定 = 未到達）
+    f_vfAdd(st, base, race == 0 ? 14 : 10 + race, 1.0)
+
+// 未評価の観察期間を「データ欠損」として計上（k = 処理済み本数）
+f_vfMissing(array<float> st, int tp, int d, int k) =>
+    for h = 0 to VF_NH - 1
+        if f_vfHBars(h) > k
+            f_vfAdd(st, f_vfIdx(tp, d == 1 ? 0 : 1, h), 15, 1.0)
+    k
+
+f_vfRemove(int i) =>
+    array.remove(VF_ETYPE, i)
+    array.remove(VF_EDIR, i)
+    array.remove(VF_EP0, i)
+    array.remove(VF_ET0, i)
+    array.remove(VF_EK, i)
+    array.remove(VF_EHI, i)
+    array.remove(VF_ELO, i)
+    array.remove(VF_ERACE, i)
+
+f_vfPush(int tp, int d) =>
+    if array.size(VF_ETYPE) >= VF_MAX_ACTIVE
+        f_vfMissing(VF_ST, array.get(VF_ETYPE, 0), array.get(VF_EDIR, 0), array.get(VF_EK, 0))
+        f_vfRemove(0)
+    array.push(VF_ETYPE, tp)
+    array.push(VF_EDIR, d)
+    array.push(VF_EP0, close)
+    array.push(VF_ET0, time)
+    array.push(VF_EK, 0)
+    array.push(VF_EHI, na)
+    array.push(VF_ELO, na)
+    array.push(VF_ERACE, 0)
+
+if vfShow and isChart5M and barstate.isconfirmed and time > vfLastBar
+    vfLastBar := time
+    // ---- ① 追跡中イベントの更新（この足はどのイベントにとっても「判定足より後の足」）----
+    //      新規イベントの登録（②）より先に行うので、判定足自身の高安は観察値に入らない。
+    int vfN = array.size(VF_ETYPE)
+    if vfN > 0
+        for i = vfN - 1 to 0
+            int   eTp  = array.get(VF_ETYPE, i)
+            int   eD   = array.get(VF_EDIR, i)
+            float eP0  = array.get(VF_EP0, i)
+            int   eK   = array.get(VF_EK, i)
+            int   kNow = eK + 1
+            bool  done = false
+            if time != array.get(VF_ET0, i) + kNow * VF_BAR_MS
+                // 5分足の時刻が途切れた（週末・休場・データ欠け）→ 未評価の期間はすべて欠損
+                f_vfMissing(VF_ST, eTp, eD, eK)
+                done := true
+            else
+                float eHi   = eK == 0 ? high : math.max(array.get(VF_EHI, i), high)
+                float eLo   = eK == 0 ? low  : math.min(array.get(VF_ELO, i), low)
+                int   eRace = array.get(VF_ERACE, i)
+                if eRace == 0
+                    float favX   = eD == 1 ? high - eP0 : eP0 - low
+                    float advX   = eD == 1 ? eP0 - low  : high - eP0
+                    bool  favHit = favX >= vfRace - VF_TOL
+                    bool  advHit = advX >= vfRace - VF_TOL
+                    // 同じ足で両方に触れたら順序不明（OHLC では順序が分からないため仮定しない）
+                    eRace := favHit and advHit ? 3 : favHit ? 1 : advHit ? 2 : 0
+                array.set(VF_EK, i, kNow)
+                array.set(VF_EHI, i, eHi)
+                array.set(VF_ELO, i, eLo)
+                array.set(VF_ERACE, i, eRace)
+                for h = 0 to VF_NH - 1
+                    if f_vfHBars(h) == kNow
+                        f_vfFinalize(VF_ST, eTp, eD, h, eP0, close, eHi, eLo, eRace, vfTh1, vfTh2)
+                done := kNow >= f_vfHBars(VF_NH - 1)
+            if done
+                f_vfRemove(i)
+
+    // ---- ② この確定足の受信コードからイベントを登録（受信不正の足では集計しない）----
+    if vfInputOk
+        vfValidBars += 1
+        bool vfInRange = time_close >= vfStart
+        int  vfPh      = vfPhaseIn
+        if not na(vfPrevPhase) and vfPh != vfPrevPhase and vfInRange
+            int vfSev = math.abs(vfPh)
+            int vfTp  = vfSev == 1 ? 0 : vfSev == 3 ? 1 : vfSev == 4 ? 2 : -1
+            if vfTp >= 0
+                f_vfPush(vfTp, vfPh > 0 ? 1 : -1)
+                vfEvents += 1
+        vfPrevPhase := vfPh                 // 初回は基準として保存するだけ
+        if math.abs(vfVtIn) == 2 and vfInRange
+            f_vfPush(3, vfVtIn > 0 ? 1 : -1)
+            vfEvents += 1
+    else
+        // 受信不正：イベントを作らず、PHASE の比較基準も破棄（復帰後の最初の足は基準のみ）
+        vfBadBars += 1
+        vfPrevPhase := na
+
+// 出力（データウィンドウ確認用）
+plot(vfInputOk ? 1 : 0,  "VERIFY INPUT OK",     display = display.data_window)
+plot(vfEvents,           "VERIFY EVENTS",       display = display.data_window)
+plot(array.size(VF_ETYPE), "VERIFY ACTIVE EVENTS", display = display.data_window)
+
+// =====================================================================================
+// §5. 検証テーブル
+// =====================================================================================
+var vfTbl = table.new(vfPos, 13, 16, border_width = 1)
+
+f_vfSum(int tp, int h, int s, string dirMode) =>
+    float v = 0.0
+    if dirMode != "SHORTのみ"
+        v += array.get(VF_ST, f_vfIdx(tp, 0, h) + s)
+    if dirMode != "LONGのみ"
+        v += array.get(VF_ST, f_vfIdx(tp, 1, h) + s)
+    v
+
+f_vfRate(float cnt, float n) =>
+    n > 0 ? str.tostring(cnt / n * 100.0, "0.0") + "%" : "—"
+
+f_vfAvg(float sum, float n, bool signed) =>
+    float a = n > 0 ? sum / n : 0.0
+    n > 0 ? (signed and a > 0 ? "+" : a < 0 ? "-" : "") + str.tostring(math.abs(a), "0.00") : "—"
+
+f_vfCell(int c, int r, string txt, color tc, color bg) =>
+    table.cell(vfTbl, c, r, txt, text_color = tc, bgcolor = bg, text_size = tblSize)
+
+if barstate.islast
+    table.clear(vfTbl, 0, 0, 12, 15)
+    if vfShow and not isChart5M
+        f_vfCell(0, 0, "PM VERIFIER : 5分足チャート専用です", color.new(#FF9800, 0), colBg)
+    else if vfShow and not vfInputOk
+        // ---- 接続未設定 / 不正値：集計せず設定案内だけを表示 ----
+        color vfWarn = color.new(#FF9800, 0)
+        f_vfCell(0, 0, "PM VERIFIER : 入力未接続 / 不正値のため集計していません", vfWarn, colBg)
+        f_vfCell(0, 1, "1. 同じ5分足チャートに POINT MASTER FVG ABS REBOUND を追加", colTxt, colBg)
+        f_vfCell(0, 2, "2. 設定 ⓪ 接続「PHASE CODE 入力」→ 元インジの PHASE CODE を選択", colTxt, colBg)
+        f_vfCell(0, 3, "3. 設定 ⓪ 接続「VALIDATED TP CODE 入力」→ 元インジの VALIDATED TP CODE を選択", colTxt, colBg)
+        string vfRecv = "受信値  PHASE: " + (na(vfSrcPhase) ? "na" : str.tostring(vfSrcPhase)) + (na(vfPhaseIn) ? " ✕" : " ○") +
+             "  /  VALIDATED TP: " + (na(vfSrcVt) ? "na" : str.tostring(vfSrcVt)) + (na(vfVtIn) ? " ✕" : " ○")
+        f_vfCell(0, 4, vfRecv, color.gray, colBg)
+        f_vfCell(0, 5, "（PHASE は -4〜+4、VALIDATED TP は -3〜+3 の整数のみ有効）", color.gray, colBg)
+    else if vfShow
+        color vfHlBg  = color.new(#FF9800, 70)
+        color vfHlTxt = color.new(#FFD54F, 0)
+        string vfTh1S = str.tostring(vfTh1)
+        string vfTh2S = str.tostring(vfTh2)
+        string vfDirS = vfDirMode == "LONGのみ" ? "LONG" : vfDirMode == "SHORTのみ" ? "SHORT" : "L+S"
+        // 評価待ち（追跡中イベントのうち、その観察期間がまだ終わっていないもの）
+        vfPend = array.new_int(VF_NT * 2 * VF_NH, 0)
+        int vfNA = array.size(VF_ETYPE)
+        if vfNA > 0
+            for i = 0 to vfNA - 1
+                int pd = array.get(VF_EDIR, i)
+                if (pd == 1 and vfDirMode != "SHORTのみ") or (pd == -1 and vfDirMode != "LONGのみ")
+                    int pk = array.get(VF_EK, i)
+                    int pj = (array.get(VF_ETYPE, i) * 2 + (pd == 1 ? 0 : 1)) * VF_NH
+                    for h = 0 to VF_NH - 1
+                        if f_vfHBars(h) > pk
+                            array.set(vfPend, pj + h, array.get(vfPend, pj + h) + 1)
+
+        // --- 0行目 : タイトル / 条件 ---
+        string vfNote = "元インジの PHASE CODE / VALIDATED TP CODE を5分足確定時点で受信して記録（足途中の表示・通知は検証対象外）。" +
+             "基準 = 判定足の終値、観察 = 次の足から。率・平均は読み込めた履歴データ上の頻度で、将来の確率を保証しません。" +
+             "受信不正の確定足 " + str.tostring(vfBadBars) + " 本 / 正常 " + str.tostring(vfValidBars) + " 本。"
+        table.cell(vfTbl, 0, 0, "VERIFY (5M確定)", text_color = colTxt, bgcolor = colBg, text_size = tblSize, tooltip = vfNote)
+        f_vfCell(1, 0, vfDirS, colTxt, colBg)
+        f_vfCell(2, 0, "開始 " + str.format_time(vfStart, "yyyy-MM-dd HH:mm", syminfo.timezone), colTxt, colBg)
+        f_vfCell(3, 0, "閾値 " + vfTh1S + "/" + vfTh2S + "$", colTxt, colBg)
+        f_vfCell(4, 0, "先着 ±" + str.tostring(vfRace) + "$", colTxt, colBg)
+        f_vfCell(5, 0, vfView, vfHlTxt, colBg)
+        if vfBadBars > 0
+            f_vfCell(6, 0, "受信不正 " + str.tostring(vfBadBars) + "本", color.new(#FF9800, 0), colBg)
+
+        // --- 1行目 : 見出し ---
+        f_vfCell(0, 1, "判定",   colTxt, colBg)
+        f_vfCell(1, 1, "期間",   colTxt, colBg)
+        f_vfCell(2, 1, "評価済", colTxt, colBg)
+        f_vfCell(3, 1, "待ち",   colTxt, colBg)
+        f_vfCell(4, 1, "欠損",   colTxt, colBg)
+        if vfView == "終点"
+            f_vfCell(5,  1, "順行率",          colTxt, colBg)
+            f_vfCell(6,  1, "逆行率",          colTxt, colBg)
+            f_vfCell(7,  1, "変化なし",        colTxt, colBg)
+            f_vfCell(8,  1, "平均R",           colTxt, colBg)
+            f_vfCell(9,  1, "順≥" + vfTh1S,    colTxt, colBg)
+            f_vfCell(10, 1, "順≥" + vfTh2S,    colTxt, colBg)
+            f_vfCell(11, 1, "逆≥" + vfTh1S,    colTxt, colBg)
+            f_vfCell(12, 1, "逆≥" + vfTh2S,    colTxt, colBg)
+        else if vfView == "最大値幅"
+            f_vfCell(5, 1, "平均MFE", colTxt, colBg)
+            f_vfCell(6, 1, "平均MAE", colTxt, colBg)
+        else
+            f_vfCell(5, 1, "順行先",   colTxt, colBg)
+            f_vfCell(6, 1, "逆行先",   colTxt, colBg)
+            f_vfCell(7, 1, "順序不明", colTxt, colBg)
+            f_vfCell(8, 1, "未到達",   colTxt, colBg)
+
+        // --- 2行目〜 : 判定 × 観察期間 ---
+        //   HOLD 行は「逆行側」（逆行率 / 逆≥閾値 / MAE / 逆行先）、手仕舞い行は「順行側」を強調表示
+        int vfRow = 2
+        for tp = 0 to VF_NT - 1
+            string tpS    = tp == 0 ? "PHASE HOLD" : tp == 1 ? "PHASE PARTIAL TP" : tp == 2 ? "PHASE FULL TP" : "VALID FULL TP"
+            bool   focAdv = tp == 0
+            color  favTc  = focAdv ? colTxt : vfHlTxt
+            color  favBg  = focAdv ? colBg  : vfHlBg
+            color  advTc  = focAdv ? vfHlTxt : colTxt
+            color  advBg  = focAdv ? vfHlBg  : colBg
+            for h = 0 to VF_NH - 1
+                bool shown = vfHzMode == "全期間" or (h == 0 and vfHzMode == "5分") or (h == 1 and vfHzMode == "15分") or (h == 2 and vfHzMode == "30分")
+                if shown
+                    float n    = f_vfSum(tp, h, 0, vfDirMode)
+                    int   pjL  = (tp * 2) * VF_NH + h
+                    int   pjS  = (tp * 2 + 1) * VF_NH + h
+                    int   pend = array.get(vfPend, pjL) + array.get(vfPend, pjS)
+                    f_vfCell(0, vfRow, tpS, colTxt, colBg)
+                    f_vfCell(1, vfRow, h == 0 ? "5分" : h == 1 ? "15分" : "30分", colTxt, colBg)
+                    f_vfCell(2, vfRow, str.tostring(n, "0"), colTxt, colBg)
+                    f_vfCell(3, vfRow, str.tostring(pend), colTxt, colBg)
+                    f_vfCell(4, vfRow, str.tostring(f_vfSum(tp, h, 15, vfDirMode), "0"), colTxt, colBg)
+                    if vfView == "終点"
+                        f_vfCell(5,  vfRow, f_vfRate(f_vfSum(tp, h, 1, vfDirMode), n), favTc, favBg)
+                        f_vfCell(6,  vfRow, f_vfRate(f_vfSum(tp, h, 2, vfDirMode), n), advTc, advBg)
+                        f_vfCell(7,  vfRow, f_vfRate(f_vfSum(tp, h, 3, vfDirMode), n), colTxt, colBg)
+                        f_vfCell(8,  vfRow, f_vfAvg(f_vfSum(tp, h, 4, vfDirMode), n, true), colTxt, colBg)
+                        f_vfCell(9,  vfRow, f_vfRate(f_vfSum(tp, h, 5, vfDirMode), n), favTc, favBg)
+                        f_vfCell(10, vfRow, f_vfRate(f_vfSum(tp, h, 6, vfDirMode), n), favTc, favBg)
+                        f_vfCell(11, vfRow, f_vfRate(f_vfSum(tp, h, 7, vfDirMode), n), advTc, advBg)
+                        f_vfCell(12, vfRow, f_vfRate(f_vfSum(tp, h, 8, vfDirMode), n), advTc, advBg)
+                    else if vfView == "最大値幅"
+                        f_vfCell(5, vfRow, f_vfAvg(f_vfSum(tp, h, 9,  vfDirMode), n, false), favTc, favBg)
+                        f_vfCell(6, vfRow, f_vfAvg(f_vfSum(tp, h, 10, vfDirMode), n, false), advTc, advBg)
+                    else
+                        f_vfCell(5, vfRow, f_vfRate(f_vfSum(tp, h, 11, vfDirMode), n), favTc, favBg)
+                        f_vfCell(6, vfRow, f_vfRate(f_vfSum(tp, h, 12, vfDirMode), n), advTc, advBg)
+                        f_vfCell(7, vfRow, f_vfRate(f_vfSum(tp, h, 13, vfDirMode), n), colTxt, colBg)
+                        f_vfCell(8, vfRow, f_vfRate(f_vfSum(tp, h, 14, vfDirMode), n), colTxt, colBg)
+                    vfRow += 1
+
+        // --- 最終行 : 注記（詳細はタイトルセルのツールチップ）---
+        table.cell(vfTbl, 0, vfRow, "※履歴上の頻度", text_color = color.gray, bgcolor = colBg, text_size = tblSize, tooltip = vfNote)
+        f_vfCell(1, vfRow, "将来保証なし", color.gray, colBg)

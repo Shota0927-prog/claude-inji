@@ -1,4 +1,4 @@
-"""PointMasterFvgAbsRebound.pine §12 (VERIFY V1) のイベント追跡を1対1で写したモデルと確認テスト。
+"""PointMasterVerifier.pine (VERIFY V1) のイベント追跡を1対1で写したモデルと確認テスト。
 Pine の処理順（① 追跡中イベント更新 → ② 新規イベント登録）・集計項目 index をそのまま再現する。"""
 BAR = 300000
 HB = [1, 3, 6]
@@ -39,7 +39,14 @@ class Verify:
             if HB[h] > k:
                 self.cell(tp, d, h)[15] += 1
 
-    def bar(self, t, o, hi, lo, c, phase, vt=False, cur=0):
+    @staticmethod
+    def code(v, lim):
+        if v is None or abs(v - round(v)) >= 1e-6 or abs(v) > lim + 1e-6:
+            return None
+        return int(round(v))
+
+    def bar(self, t, o, hi, lo, c, phase, vtcode=0):
+        # phase / vtcode = 受信値（input.source）。不正値では集計しない
         if t <= self.last:
             return
         self.last = t
@@ -64,14 +71,18 @@ class Verify:
                 done = k >= 6
             if done:
                 self.ev.remove(e)
+        ph, vt = self.code(phase, 4), self.code(vtcode, 3)
+        if ph is None or vt is None:
+            self.prev = None          # 受信不正：集計せず基準を破棄
+            return
         inr = t + BAR >= self.start
-        if self.prev is not None and phase != self.prev and inr:
-            tp = {1: 0, 3: 1, 4: 2}.get(abs(phase), -1)
+        if self.prev is not None and ph != self.prev and inr:
+            tp = {1: 0, 3: 1, 4: 2}.get(abs(ph), -1)
             if tp >= 0:
-                self.push(tp, 1 if phase > 0 else -1, t, c)
-        self.prev = phase
-        if vt and cur != 0 and inr:
-            self.push(3, cur, t, c)
+                self.push(tp, 1 if ph > 0 else -1, t, c)
+        self.prev = ph
+        if abs(vt) == 2 and inr:
+            self.push(3, 1 if vt > 0 else -1, t, c)
 
     def push(self, tp, d, t, c):
         self.ev.append(dict(tp=tp, d=d, p0=c, t0=t, k=0, hi=None, lo=None, race=0))
@@ -117,9 +128,9 @@ p = 2000.0
 for i in range(400):
     o = p; c = p + random.uniform(-6, 6); hi = max(o, c) + random.uniform(0, 5); lo = min(o, c) - random.uniform(0, 5)
     ph = random.choice([1, 1, 1, 2, 3, 4, 0])
-    rowsL.append((o, hi, lo, round(c, 2), ph, random.random() < 0.05, 1))
+    rowsL.append((o, hi, lo, round(c, 2), ph, random.choice([0, 0, 0, 1, 2, 3])))
     M = 4000.0
-    rowsS.append((M - o, M - lo, M - hi, round(M - round(c, 2), 2), -ph, rowsL[-1][5], -1))
+    rowsS.append((M - o, M - lo, M - hi, round(M - round(c, 2), 2), -ph, -rowsL[-1][5]))
     p = round(c, 2)
 vL, vS = run(mk(rowsL)), run(mk(rowsS))
 sym = all(abs(a - b) < 1e-6 for tp in range(4) for h in range(3)
@@ -158,11 +169,26 @@ v = run(b + [b[-1]] + mk([(100, 101, 99, 100, 1)], b[-1][0] + BAR))
 check("same bar not double counted", v.cell(0, 1, 0)[0] == 1)
 
 # 9) VALID TP は PHASE と別。PARTIAL → FULL はそれぞれ1件
-rows = [(100, 100, 100, 100, 0), (100, 100, 100, 100, 3), (100, 100, 100, 100, 4, True, 1)] + [(100, 100, 100, 100, 4)] * 7
+rows = [(100, 100, 100, 100, 0), (100, 100, 100, 100, 3), (100, 100, 100, 100, 4, 2)] + [(100, 100, 100, 100, 4)] * 7
 v = run(mk(rows))
 check("PARTIAL, FULL, VALID each 1", v.cell(1, 1, 2)[0] == 1 and v.cell(2, 1, 2)[0] == 1 and v.cell(3, 1, 2)[0] == 1 and v.cell(0, 1, 2)[0] == 0)
 
 # 10) 先着の4区分合計 = 評価済み件数
 tot = all(sum(vL.cell(tp, d, h)[11:15]) == vL.cell(tp, d, h)[0] for tp in range(4) for d in (1, -1) for h in range(3))
 check("race buckets sum to evaluated count", tot)
+
+# 11) 未接続（既定 close = 価格）/ 範囲外 / 非整数 → 集計しない
+rows = [(2650, 2651, 2649, 2650, 2650.0, 2650.0)] * 3 + [(2650, 2651, 2649, 2650, 1.5, 0)] + [(2650, 2651, 2649, 2650, 5, 0)]
+v = run(mk(rows))
+check("unconnected / out-of-range / non-integer -> no events", not v.ev and not any(sum(c) for c in v.st.values()))
+
+# 12) 不正値の後は基準を作り直す（復帰直後の HOLD は数えない）
+rows = [(100, 100, 100, 100, 0, 0), (100, 100, 100, 100, 1, 0), (100, 100, 100, 100, 2650.0, 0), (100, 100, 100, 100, 1, 0)] + [(100, 100, 100, 100, 1, 0)] * 7
+v = run(mk(rows))
+check("invalid bar resets baseline; ongoing event keeps tracking", v.cell(0, 1, 2)[0] == 1)
+
+# 13) VALID FULL TP の方向はコードの符号 / ±1, ±3 は対象外
+rows = [(100, 100, 100, 100, 0, 0), (100, 100, 100, 100, 0, -2), (100, 100, 100, 100, 0, -3), (100, 100, 100, 100, 0, 1)] + [(100, 100, 100, 100, 0, 0)] * 7
+v = run(mk(rows))
+check("VALID sign -> SHORT, ARMED/DONE ignored", v.cell(3, -1, 2)[0] == 1 and v.cell(3, 1, 2)[0] == 0)
 print(f"{ok} checks passed")
