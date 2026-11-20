@@ -9,7 +9,8 @@ confirmed bar's raw, as Pine's [1] does.
      the Lab's (ZoneComboLabXAU zbMa1 / zbMa2), maP = raw[1], inputs / table layout / notes, no orders / alerts / drawings
   A. the horizontal-line acceptance cases (first-come, possible-reach flag, overshoot, invalid bars, latest 5, denominator)
      on the MA logic, from above and mirrored from below
-  M. MA cases 1-6 of the instruction (6 = raw timing vs a ta.ema model on the Lab's expressions)
+  M. MA cases 1-6 of the instruction (6 = reference timing on an EMA model; numeric agreement with TradingView's ta.ema
+     is NOT verified), fixed-value checks of the EMA model
   C. random paths (moving MA, na stretches, invalid bars, equal MAs) vs an independent oracle (full record sequence)
   B. invariants: display switch / record keep, unconfirmed bar, re-run
   X. mutations of the judgement functions: only the cases that must fail are checked
@@ -462,19 +463,27 @@ def ma_static():
 
 
 def ema_model(src, n):
-    """ta.ema model: na until n values, seeded with the SMA of the first n, then alpha = 2 / (n + 1)"""
+    """EMA model (not TradingView's ta.ema itself): the first valid input is the initial EMA; afterwards
+    EMA = alpha * x + (1 - alpha) * previous EMA with alpha = 2 / (n + 1); a missing input (None) does not update and keeps the
+    previous EMA; None before the first valid input"""
     out, e = [], None
     a = 2.0 / (n + 1)
-    for i, x in enumerate(src):
-        if i + 1 < n:
-            out.append(None)
-            continue
-        e = sum(src[i + 1 - n:i + 1]) / n if e is None else a * x + (1 - a) * e
+    for x in src:
+        if x is not None:
+            e = x if e is None else a * x + (1 - a) * e
         out.append(e)
     return out
 
 
+def ema_model_cases():
+    for src, n, want in (([100, 110, 120], 3, [100, 105, 112.5]), ([100, 110, 120], 1, [100, 110, 120]),
+                         ([None, 100, 110, 120], 3, [None, 100, 105, 112.5]), ([100, None, 110], 3, [100, 100, 105])):
+        got = ema_model(src, n)
+        check(f"M EMA モデル {src}・期間 {n} → {want}", got == want, str(got))
+
+
 def ma_cases():
+    ema_model_cases()
     B5 = {"hlBreak": 5.0}
     # 1: the confirmed EMA of this bar is 4299 but the EMA known at its start is 4305 -> 0 contacts
     r = ma_runner(B5).run([bar(0, 4320, 4322, 4318, 4320, maRaw1=4305.0), bar(1, 4301, 4302, 4298, 4299, maRaw1=4299.0)])
@@ -536,9 +545,10 @@ def ma_cases():
         curf.append(list(r["maCurF"]))
     ok = all(curf[i] == [raw1[i - 1] if i else None, raw5[i - 1] if i else None] for i in range(len(bars)))
     miss = r["maMiss"]
-    check("M 6 Pcurr = 直前 5分足の raw (1分 EMA = 直前 5分足の最後の 1分値、5分 EMA = 直前足の値)・欠落足数",
-          ok and miss == [sum(1 for i in range(len(bars)) if i == 0 or raw1[i - 1] is None), sum(1 for i in range(len(bars)) if i == 0 or raw5[i - 1] is None)]
-          and sum(r["hcN"]) > 0, f"bars={len(bars)} miss={miss} N={sum(r['hcN'])}")
+    check("M 6 モデル上での参照時刻の対応: Pcurr = 直前 5分足の raw (1分 EMA = 直前 5分足の最後の 1分値、5分 EMA = 直前足の値)、"
+          "欠損なしデータでは raw[1] の欠落は両系列とも最初の 1 足だけ (miss = [1, 1])",
+          ok and miss == [1, 1] and all(x is not None for x in raw1 + raw5) and sum(r["hcN"]) > 0,
+          f"bars={len(bars)} miss={miss} N={sum(r['hcN'])}")
 
 
 def ma_random(seeds):
